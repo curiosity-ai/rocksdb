@@ -32,9 +32,9 @@ internal struct CompactionIterationStats
 /// User-defined timestamps: versions of a key with different timestamps are distinct keys unless they are older than
 /// full_history_ts_low, in which case the older ones may be collapsed (rule A) and their sequence number and timestamp
 /// zeroed at the bottommost level.
-/// Blob files (integrated BlobDB): see <see cref="BlobProcessor"/> (extraction, garbage collection, blob values for the
-/// compaction filter and merges). Not ported: snapshot checkers (write-prepared transactions), wide-column
-/// filtering, range-tombstone sentinel keys (range tombstones are handled by the <see cref="RangeDelAggregator"/>
+/// Blob files (integrated BlobDB): see <see cref="BlobProcessor"/> (extraction and garbage collection of values and entity
+/// columns, blob values for the compaction filter and merges). Wide-column entities reach the compaction filter's FilterV3. Not ported:
+/// snapshot checkers (write-prepared transactions), range-tombstone sentinel keys (range tombstones are handled by the <see cref="RangeDelAggregator"/>
 /// and written by the compaction job). Allocation-free per key: the current key lives in an <see cref="IterKey"/>
 /// and values are spans into the input, the merge helper or the filter output.
 /// </para>
@@ -50,6 +50,7 @@ internal sealed class CompactionIterator : IDisposable
         InputPrefix,
         BlobIndex,
         BlobValue,
+        Entity,
     }
 
     private readonly InternalIterator _input;
@@ -161,6 +162,7 @@ internal sealed class CompactionIterator : IDisposable
         ValueSource.InputPrefix => _input.Value[.._valuePrefixLength],
         ValueSource.BlobIndex => BlobProcessor!.BlobIndexOutput,
         ValueSource.BlobValue => BlobProcessor!.BlobValueOutput,
+        ValueSource.Entity => BlobProcessor!.EntityOutput,
         _ => default,
     };
 
@@ -295,17 +297,23 @@ internal sealed class CompactionIterator : IDisposable
         if (FullHistoryTsLow is { } low) _cmpWithHistoryTsLow = _ucmp.CompareTimestamp(ts, low);
     }
 
+    private WideColumns? _filterColumns;
+    private List<WideColumn>? _filterNewColumns;
+
     /// <summary>
-    /// Port of InvokeFilterIfNeeded (plain values, and blob values of the integrated BlobDB: the blob is read and the
-    /// filter sees it as a plain value). Returns false if the iteration must stop with an error.
+    /// Port of InvokeFilterIfNeeded: plain values, blob values of the integrated BlobDB (the blob is read and the filter
+    /// sees it as a plain value) and wide-column entities (FilterV3 with the columns; blob-backed columns are resolved
+    /// eagerly, the FilterV3 compatibility path of FilterV4).
     /// </summary>
     private void InvokeFilterIfNeeded(ref bool needSkip)
     {
-        if (_compactionFilter is null || _ikeyType is not (EntryType.Value or EntryType.BlobIndex)) return;
+        if (_compactionFilter is null || _ikeyType is not (EntryType.Value or EntryType.BlobIndex or EntryType.WideColumnEntity)) return;
         _filterValue.Clear();
         _filterSkipUntil.Clear();
         ReadOnlySpan<byte> userKey = _currentKey.UserKey;
         ReadOnlySpan<byte> existing = _input.Value;
+        CompactionFilterValueType valueType = CompactionFilterValueType.Value;
+        WideColumns? columns = null;
         if (_ikeyType == EntryType.BlobIndex)
         {
             // For the integrated BlobDB the compaction iterator reads the blob (FilterBlobByKey is not ported).
@@ -315,8 +323,25 @@ internal sealed class CompactionIterator : IDisposable
             }
             existing = BlobProcessor!.FetchBlobForFilter(userKey, existing);
         }
-        CompactionFilterDecision decision = _compactionFilter.Filter(_level, userKey, CompactionFilterValueType.Value, existing,
-            _filterValue, _filterSkipUntil);
+        else if (_ikeyType == EntryType.WideColumnEntity)
+        {
+            if (Wide.WideColumnSerialization.HasBlobColumns(existing))
+            {
+                if (BlobProcessor is null)
+                {
+                    ThrowHelper.NotSupported("Blob-backed value filtering requires blob read support in the current table-file creation context");
+                }
+                existing = BlobProcessor!.ResolveEntityForFilter(userKey, existing);
+            }
+            columns = _filterColumns ??= new WideColumns();
+            columns.SetSerialized(existing);
+            existing = default;
+            valueType = CompactionFilterValueType.WideColumnEntity;
+        }
+        List<WideColumn> newColumns = _filterNewColumns ??= new List<WideColumn>();
+        newColumns.Clear();
+        CompactionFilterDecision decision = _compactionFilter.FilterV3(_level, userKey, valueType, existing, columns, _filterValue, newColumns,
+            _filterSkipUntil);
         if (decision == CompactionFilterDecision.RemoveAndSkipUntil && _icmp.CompareUserKey(_filterSkipUntil.WrittenSpan, userKey) <= 0)
         {
             // Can't skip to a key smaller than the current one. Keep the key as per FilterV2 documentation.
@@ -352,6 +377,27 @@ internal sealed class CompactionIterator : IDisposable
                 needSkip = true;
                 _skipUntilKey.SetInternalKey(_filterSkipUntil.WrittenSpan, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
                 break;
+            case CompactionFilterDecision.ChangeWideColumnEntity:
+            {
+                // WideColumnsHelper::SortColumns + WideColumnSerialization::Serialize of the new columns.
+                WideColumn[] sorted = newColumns.ToArray();
+                Wide.WideColumnSerialization.SortColumns(sorted);
+                _filterValue.Clear();
+                Wide.WideColumnSerialization.Serialize(sorted, _filterValue);
+                if (_ikeyType != EntryType.WideColumnEntity)
+                {
+                    _ikeyType = EntryType.WideColumnEntity;
+                    _currentKey.UpdateInternalKey(_ikeySequence, EntryType.WideColumnEntity);
+                }
+                _valueSource = ValueSource.Filter;
+                break;
+            }
+            case CompactionFilterDecision.ChangeBlobIndex:
+                throw new RocksDbException(StatusCode.NotSupported, "Only stacked BlobDB's internal compaction filter can return kChangeBlobIndex.");
+            case CompactionFilterDecision.IOError:
+                throw new RocksDbException(StatusCode.NotSupported, "CompactionFilter for integrated BlobDB should not return kIOError");
+            case CompactionFilterDecision.Undetermined:
+                throw new RocksDbException(StatusCode.NotSupported, "FilterV2/V3/V4 should never return kUndetermined");
             default:
                 throw new RocksDbException(StatusCode.NotSupported, "Compaction filter decision " + decision + " is not supported");
         }
@@ -708,6 +754,11 @@ internal sealed class CompactionIterator : IDisposable
                         _currentKey.UpdateInternalKey(_ikeySequence, _ikeyType);
                     }
                 }
+            }
+            else if (_ikeyType == EntryType.WideColumnEntity)
+            {
+                // GarbageCollectEntityBlobsIfNeeded (blob columns present) / ExtractLargeColumnValuesIfNeeded.
+                if (blob.TryPrepareEntity(_currentKey.UserKey, Value)) _valueSource = ValueSource.Entity;
             }
         }
         // Zeroing out the sequence number leads to better compression. If this is the bottommost level (no files in lower

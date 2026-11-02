@@ -171,10 +171,26 @@ internal sealed partial class DbImpl
                         continue;
                     }
                 }
+                if (_anyBlobDirectWrite && t is null && !TryTransformForBlobDirectWrite(w)) continue;
                 valid++;
                 firstValid ??= w;
                 if (t is null || !t.DisableMemtable) total += (uint)(t?.MemtableBatch ?? w.Batch!).Count;
                 needSync |= w.Sync;
+            }
+            if (_bdwTransformer is { Touched.Count: > 0 } bdw)
+            {
+                // SyncBlobDirectWriteManagers: the blobs must be durable before a sync WAL write references them.
+                try
+                {
+                    if (needSync)
+                    {
+                        foreach (Blob.BlobDirectWriteManager m in bdw.Touched) m.SyncAllOpenFiles();
+                    }
+                }
+                finally
+                {
+                    bdw.ClearTouched();
+                }
             }
             ulong first = Versions.AllocateSequence(total);
             ulong seq = first;
@@ -300,8 +316,55 @@ internal sealed partial class DbImpl
         }
         finally
         {
+            if (_bdwSwapped.Count > 0) RestoreBlobDirectWriteBatches();
             _writeThread.ExitAsBatchGroupLeader(group);
         }
+    }
+
+    // ---- blob direct write (leader-only state) -------------------------------------------------------------
+
+    /// <summary>Some column family uses blob direct write (set once, never reset).</summary>
+    private volatile bool _anyBlobDirectWrite;
+    private Blob.BlobWriteBatchTransformer? _bdwTransformer;
+    private readonly List<(WriteThread.Writer Writer, WriteBatch Original)> _bdwSwapped = new();
+
+    /// <summary>
+    /// MaybeTransformBatchForBlobDirectWrite for one writer of the group (after PreprocessWrite, so the blobs belong to
+    /// the memtable the batch is inserted into): swaps in the transformed batch. Returns false when the writer failed
+    /// (excluded from the group like a failed write callback; its blobs become garbage of their files).
+    /// </summary>
+    private bool TryTransformForBlobDirectWrite(WriteThread.Writer w)
+    {
+        Blob.BlobWriteBatchTransformer tr = _bdwTransformer ??= new Blob.BlobWriteBatchTransformer();
+        WriteBatch? transformed;
+        try
+        {
+            transformed = tr.Transform(w.Batch!, _cfById);
+        }
+        catch (Exception e) when (e is RocksDbException or IOException)
+        {
+            w.Error = e;
+            w.CallbackFailed = true;
+            return false;
+        }
+        if (transformed is not null)
+        {
+            _bdwSwapped.Add((w, w.Batch!));
+            w.Batch = transformed;
+        }
+        return true;
+    }
+
+    private void RestoreBlobDirectWriteBatches()
+    {
+        foreach ((WriteThread.Writer w, WriteBatch original) in _bdwSwapped)
+        {
+            WriteBatch transformed = w.Batch!;
+            original.Sequence = transformed.Sequence;
+            w.Batch = original;
+            transformed.Dispose();
+        }
+        _bdwSwapped.Clear();
     }
 
     private void SyncWalDirIfNeeded()
@@ -413,7 +476,10 @@ internal sealed partial class DbImpl
                 _aliveWals.Add(newLogNumber);
             }
             MemTable mem = cfd.Mem;
-            cfd.Imm.Add(new ImmutableMemTable(mem, newLogNumber) { FlushReason = reason });
+            // RotateCurrentGeneration: the blob direct write files of this memtable are registered by its flush.
+            Blob.BlobDirectWriteGeneration? generation = cfd.BlobDirectWrite?.RotateGeneration();
+            cfd.Imm.Add(new ImmutableMemTable(mem, newLogNumber) { FlushReason = reason, BlobGeneration = generation });
+            if (generation is not null) ProtectBlobDirectWriteFiles(cfd, mem, generation);
             if (HasListeners) EnqueueMemTableSealed(cfd, mem);
             cfd.Mem = cfd.ConstructNewMemtable(Versions.LastSequence);
             if (newLog is not null)
@@ -492,6 +558,7 @@ internal sealed partial class DbImpl
         map[cfd.Id] = cfd;
         Volatile.Write(ref _cfById, map);
         RefreshTimestampSizes(map);
+        if (cfd.BlobDirectWrite is not null) _anyBlobDirectWrite = true;
     }
 
     private void UnregisterCfForWrite(ColumnFamilyData cfd)

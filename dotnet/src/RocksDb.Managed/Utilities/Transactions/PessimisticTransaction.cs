@@ -60,6 +60,7 @@ internal sealed class PessimisticTransaction : Transaction
         _logNumber = 0;
         _readTimestamp = MaxTimestamp;
         _commitTimestamp = MaxTimestamp;
+        _batch.Batch.TrackTimestampSize = options.WriteBatchTrackTimestampSize;
         if (options.SetSnapshot) SetSnapshot();
         if (_expirationTime > 0) _txnDb.InsertExpirableTransaction(_id, this);
     }
@@ -226,11 +227,17 @@ internal sealed class PessimisticTransaction : Transaction
     /// </summary>
     private byte[]? AssignCommitTimestamp()
     {
-        if (!_batch.Wbwi.HasKeyWithTimestamp) return null;
+        // WriteBatchInternal::HasKeyWithTimestamp: placeholder timestamps of the indexed writes, or timestamped writes made
+        // directly to the transaction's WriteBatch.
+        if (!_batch.Wbwi.HasKeyWithTimestamp && !_batch.Batch.HasKeyWithTimestamp) return null;
         if (_commitTimestamp == MaxTimestamp) throw Invalid("Must assign a commit timestamp");
         byte[] ts = new byte[sizeof(ulong)];
         Coding.EncodeFixed64(ts, _commitTimestamp);
-        _batch.Batch.UpdateTimestamps(ts, _db.TimestampSizeOf);
+        WriteBatch wb = _batch.Batch;
+        // The timestamp sizes tracked inside the batch (write_batch_track_timestamp_size) come first, then the column
+        // family's own. Upstream falls back to the WriteBatchWithIndex comparators, which can be wrong for column families
+        // the index has not seen; the column family's actual timestamp size is always right.
+        wb.UpdateTimestamps(ts, cf => wb.TryGetTrackedTimestampSize(cf, out int n) ? n : _db.TimestampSizeOf(cf));
         return ts;
     }
 

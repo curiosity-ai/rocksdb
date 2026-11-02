@@ -216,6 +216,39 @@ public sealed class WriteBatch : IDisposable
         _rep.Advance(HeaderSize);
         _contentFlags = ContentFlags.None;
         _savePointCount = 0;
+        HasKeyWithTimestamp = false;
+        _cfTimestampSizes?.Clear();
+    }
+
+    private Dictionary<uint, int>? _cfTimestampSizes;
+
+    /// <summary>
+    /// WriteBatch::SetTrackTimestampSize (write_batch_track_timestamp_size): record the timestamp size of every column
+    /// family a timestamped write of this batch targets, so that a transaction commit assigning timestamps
+    /// (UpdateTimestamps) uses them for writes made directly to <see cref="Utilities.Transactions.Transaction.WriteBatch"/>.
+    /// </summary>
+    internal bool TrackTimestampSize { get; set; }
+
+    /// <summary>
+    /// True once a key was added with a timestamp by the timestamped overloads (has_key_with_ts_ of
+    /// WriteBatchInternal::HasKeyWithTimestamp); reset by <see cref="Clear"/>.
+    /// </summary>
+    internal bool HasKeyWithTimestamp { get; private set; }
+
+    /// <summary>WriteBatch::MaybeTrackTimestampSize: the first timestamp size seen per column family is kept.</summary>
+    private void MaybeTrackTimestampSize(uint columnFamilyId, int timestampSize)
+    {
+        HasKeyWithTimestamp = true;
+        if (!TrackTimestampSize) return;
+        _cfTimestampSizes ??= new Dictionary<uint, int>();
+        _cfTimestampSizes.TryAdd(columnFamilyId, timestampSize);
+    }
+
+    /// <summary>WriteBatch::GetColumnFamilyToTimestampSize lookup: the tracked timestamp size of a column family.</summary>
+    internal bool TryGetTrackedTimestampSize(uint columnFamilyId, out int timestampSize)
+    {
+        timestampSize = 0;
+        return _cfTimestampSizes is { } m && m.TryGetValue(columnFamilyId, out timestampSize);
     }
 
     /// <summary>Replaces the contents with a copy of <paramref name="rep"/>. Port of <c>WriteBatchInternal::SetContents</c>.</summary>
@@ -322,6 +355,7 @@ public sealed class WriteBatch : IDisposable
     /// </summary>
     public WriteBatch DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey, ReadOnlySpan<byte> timestamp)
     {
+        MaybeTrackTimestampSize(columnFamilyId, timestamp.Length);
         SaveState(out SavePoint save);
         int keyLen = beginKey.Length + timestamp.Length;
         int endLen = endKey.Length + timestamp.Length;
@@ -341,6 +375,7 @@ public sealed class WriteBatch : IDisposable
     private void AppendTimestampedRecord(EntryType defaultCfTag, EntryType cfTag, uint columnFamilyId, ReadOnlySpan<byte> key,
         ReadOnlySpan<byte> timestamp, ReadOnlySpan<byte> value, bool hasValue, ContentFlags flag)
     {
+        MaybeTrackTimestampSize(columnFamilyId, timestamp.Length);
         SaveState(out SavePoint save);
         int keyLen = key.Length + timestamp.Length;
         Span<byte> dst = BeginRecord(defaultCfTag, cfTag, columnFamilyId, keyLen, value.Length, out int p);

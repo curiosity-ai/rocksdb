@@ -65,7 +65,7 @@ public sealed class WideColumnTests
         Assert.AreEqual("a=x;bcd=yz;", Describe(c));
         byte[] blob = (byte[])v2.Clone();
         blob[6] = (byte)EntryType.BlobIndex;
-        Assert.AreEqual(StatusCode.NotSupported, Assert.ThrowsExactly<RocksDbException>(() => c.SetSerialized(blob)).Code);
+        Assert.AreEqual(StatusCode.Corruption, Assert.ThrowsExactly<RocksDbException>(() => c.SetSerialized(blob)).Code);
         var slots = new List<WideColumnSlot>();
         Assert.AreEqual("Corrupt or unsupported wide column version", WideColumnSerialization.TryDeserialize([3, 0], slots, out _));
         Assert.AreEqual("Error decoding wide column version", WideColumnSerialization.TryDeserialize([], slots, out _));

@@ -127,6 +127,15 @@ public sealed class TransactionOptions
 
     /// <summary>Allow <see cref="Transaction.Commit"/> of a named transaction without <see cref="Transaction.Prepare"/> (default true).</summary>
     public bool SkipPrepare { get; set; } = true;
+
+    /// <summary>
+    /// write_batch_track_timestamp_size (upstream: "DO NOT USE", a temporary option for MyRocks): the transaction's
+    /// <see cref="Transaction.WriteBatch"/> records the timestamp size of every column family written to it with a
+    /// timestamp, and the commit timestamp is applied with those sizes first. Supports timestamped writes made directly to
+    /// <see cref="Transaction.WriteBatch"/>, bypassing the transaction's write APIs. The managed commit otherwise uses each
+    /// column family's own timestamp size, so such writes are timestamped correctly either way.
+    /// </summary>
+    public bool WriteBatchTrackTimestampSize { get; set; }
 }
 
 /// <summary>One transaction waiting in a deadlock cycle (DeadlockInfo).</summary>

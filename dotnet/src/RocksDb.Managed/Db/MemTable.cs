@@ -556,7 +556,14 @@ public sealed unsafe class MemTable : IDisposable
         if (_disposed) return;
         _disposed = true;
         _arena.Dispose();
+        Interlocked.Exchange(ref OnDisposed, null)?.Invoke();
     }
+
+    /// <summary>
+    /// Called once when the memtable is disposed (the last reference is gone): releases the blob direct write files it
+    /// references (memtable-held protection of BlobFilePartitionManager).
+    /// </summary>
+    internal Action? OnDisposed;
 }
 
 /// <summary>

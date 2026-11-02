@@ -288,6 +288,35 @@ public sealed class MergeHelper : IDisposable
     public ReadOnlySpan<byte> CompactionFilterSkipUntil => _skipUntil.Key;
 
     /// <summary>
+    /// TimedFullMergeWithEntity into <c>_mergeResult</c>; blob-backed columns of the base entity are resolved first
+    /// (WideColumnSerialization::ResolveEntityForMerge).
+    /// </summary>
+    private void MergeWithEntityBase(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> entity)
+    {
+        PooledBufferWriter? resolvedEntity = null;
+        PooledBufferWriter merged = ObjectPools.RentWriter();
+        try
+        {
+            if (Wide.WideColumnSerialization.HasBlobColumns(entity))
+            {
+                if (BlobProcessor is null) ThrowHelper.Corruption("Cannot resolve blob columns in entity without a blob fetcher");
+                resolvedEntity = ObjectPools.RentWriter();
+                BlobProcessor!.ResolveEntity(userKey, entity, resolvedEntity);
+                entity = resolvedEntity.WrittenSpan;
+            }
+            TimedFullMerge(_mergeOperator, userKey, true, Wide.WideColumnSerialization.GetValueOfDefaultColumn(entity), _operands.AsOperands(), _mergeResult);
+            Wide.WideColumnSerialization.ReplaceDefaultColumn(entity, _mergeResult.WrittenSpan, merged);
+            _mergeResult.Clear();
+            _mergeResult.Write(merged.WrittenSpan);
+        }
+        finally
+        {
+            ObjectPools.ReturnWriter(merged);
+            if (resolvedEntity is not null) ObjectPools.ReturnWriter(resolvedEntity);
+        }
+    }
+
+    /// <summary>
     /// Port of MergeHelper::MergeUntil. PRE: <paramref name="iter"/> is on a merge entry. Consumes the merge chain of
     /// that user key, stopping at a different user key, at an entry with seqno &lt;= <paramref name="stopBefore"/>
     /// (when &gt; 0; visible to an earlier snapshot), or at a put/delete (which is merged in and consumed).
@@ -372,20 +401,7 @@ public sealed class MergeHelper : IDisposable
                 {
                     // TimedFullMergeWithEntity: the operands apply to the default column; the result is the entity with
                     // that column replaced (kTypeWideColumnEntity).
-                    ReadOnlySpan<byte> entity = iter.Value;
-                    TimedFullMerge(_mergeOperator, userKey, true, Wide.WideColumnSerialization.GetValueOfDefaultColumn(entity), _operands.AsOperands(),
-                        _mergeResult);
-                    PooledBufferWriter merged = ObjectPools.RentWriter();
-                    try
-                    {
-                        Wide.WideColumnSerialization.ReplaceDefaultColumn(entity, _mergeResult.WrittenSpan, merged);
-                        _mergeResult.Clear();
-                        _mergeResult.Write(merged.WrittenSpan);
-                    }
-                    finally
-                    {
-                        ObjectPools.ReturnWriter(merged);
-                    }
+                    MergeWithEntityBase(userKey, iter.Value);
                     StoreSingleResult(EntryType.WideColumnEntity);
                     iter.Next();
                     return MergeUntilResult.Ok;

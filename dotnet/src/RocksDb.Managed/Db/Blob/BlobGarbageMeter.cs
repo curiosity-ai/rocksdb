@@ -17,6 +17,18 @@ internal sealed class BlobGarbageMeter
         public ulong InCount, InBytes, OutCount, OutBytes;
     }
 
+    /// <summary>
+    /// Inflow of a whole blob file (all its blobs): with the outflow of a flush output, the garbage of the blob direct
+    /// write files the flush registers is their blobs the output does not reference (dropped hidden versions, failed
+    /// writes).
+    /// </summary>
+    public void AddInFlow(ulong blobFileNumber, ulong count, ulong bytes)
+    {
+        if (!_flows.TryGetValue(blobFileNumber, out Flow? f)) _flows[blobFileNumber] = f = new Flow();
+        f.InCount += count;
+        f.InBytes += bytes;
+    }
+
     /// <summary>BlobGarbageMeter::ProcessInFlow. Throws Corruption for a malformed key or blob index.</summary>
     public void ProcessInFlow(ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value) => ProcessFlow(internalKey, value, isInflow: true);
 
@@ -26,11 +38,26 @@ internal sealed class BlobGarbageMeter
     private void ProcessFlow(ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value, bool isInflow)
     {
         if (!DbFormat.TryParseInternalKey(internalKey, out ParsedInternalKey ikey)) ThrowHelper.Corruption("Corrupted internal key in blob garbage meter");
-        if (ikey.Type != EntryType.BlobIndex) return;
-        BlobIndex index = BlobIndex.Decode(value);
+        if (ikey.Type == EntryType.BlobIndex)
+        {
+            AddFlow(BlobIndex.Decode(value), ikey.UserKeyLength, isInflow);
+        }
+        else if (ikey.Type == EntryType.WideColumnEntity && Wide.WideColumnSerialization.HasBlobColumns(value))
+        {
+            // ProcessEntityBlobReferences: every blob-backed column of an entity is a blob reference.
+            Wide.WideColumnSerialization.GetBlobColumnIndexes(value, _slots);
+            foreach (Wide.WideColumnSlot s in _slots) AddFlow(BlobIndex.Decode(value.Slice(s.ValueOffset, s.ValueLength)), ikey.UserKeyLength, isInflow);
+        }
+    }
+
+    private readonly List<Wide.WideColumnSlot> _slots = new(8);
+
+    /// <summary>GetBlobReferenceDetails + AddFlow.</summary>
+    private void AddFlow(BlobIndex index, int userKeyLength, bool isInflow)
+    {
         if (index.IsInlined || index.HasTtl) ThrowHelper.Corruption("Unexpected TTL/inlined blob index");
         if (index.IsSameFile) return;
-        ulong bytes = index.Size + BlobLogFormat.RecordHeaderAdjustment((ulong)ikey.UserKeyLength);
+        ulong bytes = index.Size + BlobLogFormat.RecordHeaderAdjustment((ulong)userKeyLength);
         if (isInflow)
         {
             if (!_flows.TryGetValue(index.FileNumber, out Flow? f)) _flows[index.FileNumber] = f = new Flow();

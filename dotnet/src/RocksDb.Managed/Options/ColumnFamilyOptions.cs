@@ -201,6 +201,37 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     /// </summary>
     public Cache.BlockCache? BlobCache { get; set; }
 
+    /// <summary>
+    /// enable_blob_direct_write: values (and wide-column entity columns) of at least <see cref="MinBlobSize"/> bytes are
+    /// written to blob files on the write path, before the WAL, and the WAL / memtable get blob references; the blob
+    /// files are registered in the MANIFEST by the flush of the memtable that references them. Requires
+    /// <see cref="EnableBlobFiles"/> (silently disabled otherwise) and <see cref="DbOptions.AllowConcurrentMemtableWrite"/>
+    /// = false; not supported with pipelined / unordered writes, two write queues or user-defined timestamps. Writes of
+    /// transactions and batches with merge operands are not separated. Closing the DB flushes to register the blob files
+    /// (like upstream v1, blob files of a crashed DB that were not registered by a flush are not recovered: the WAL
+    /// references them but they are not part of any version).
+    /// <para>
+    /// Compatibility: an OPTIONS file with this option and DBs holding blob references written this way need RocksDB 11.x
+    /// with blob direct write (librocksdb 11.12 has it; older releases reject the option). Default false. Immutable.
+    /// </para>
+    /// </summary>
+    public bool EnableBlobDirectWrite { get; set; }
+
+    /// <summary>blob_direct_write_partitions: number of blob files written concurrently by blob direct write (0 = 1). Default 1. Immutable.</summary>
+    public uint BlobDirectWritePartitions { get; set; } = 1;
+
+    /// <summary>
+    /// blob_direct_write_partition_strategy: chooses the partition of each direct-written blob (null = round robin). Not
+    /// persisted in OPTIONS files (an application callback, like upstream's kDontSerialize).
+    /// </summary>
+    public BlobDirectWritePartitionStrategy? BlobDirectWritePartitionStrategy { get; set; }
+
+    /// <summary>
+    /// blob_file_writable_file_max_buffer_size: write buffer size of blob file writers (0 = the DB's
+    /// writable_file_max_buffer_size). Mutable.
+    /// </summary>
+    public ulong BlobFileWritableFileMaxBufferSize { get; set; }
+
     private static readonly OptionTable<ColumnFamilyOptions> s_table = new OptionTable<ColumnFamilyOptions>()
         .Add("comparator", static o => o._comparator.Serialize(ComparatorId) ?? BytewiseComparator.ClassName,
             static (o, v) => o._comparator.Parse(v, static n => Managed.Comparator.TryGetBuiltin(n, out Comparator? c) ? c : null, ComparatorId))
@@ -282,7 +313,11 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
             static (o, v) => o.BlobGarbageCollectionForceThreshold = v)
         .UInt64("blob_compaction_readahead_size", static o => o.BlobCompactionReadaheadSize, static (o, v) => o.BlobCompactionReadaheadSize = v)
         .Int32("blob_file_starting_level", static o => o.BlobFileStartingLevel, static (o, v) => o.BlobFileStartingLevel = v)
-        .Enum("prepopulate_blob_cache", OptionEnumMaps.PrepopulateBlobCache, static o => o.PrepopulateBlobCache, static (o, v) => o.PrepopulateBlobCache = v);
+        .Enum("prepopulate_blob_cache", OptionEnumMaps.PrepopulateBlobCache, static o => o.PrepopulateBlobCache, static (o, v) => o.PrepopulateBlobCache = v)
+        .UInt64("blob_file_writable_file_max_buffer_size", static o => o.BlobFileWritableFileMaxBufferSize,
+            static (o, v) => o.BlobFileWritableFileMaxBufferSize = v)
+        .Bool("enable_blob_direct_write", static o => o.EnableBlobDirectWrite, static (o, v) => o.EnableBlobDirectWrite = v)
+        .UInt32("blob_direct_write_partitions", static o => o.BlobDirectWritePartitions, static (o, v) => o.BlobDirectWritePartitions = v);
 
     private static string MergeOperatorId(MergeOperator m) => m.Name;
     private static string ComparatorId(Comparator c) => c.Name;
@@ -307,6 +342,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         c.CompactionOptionsUniversal = CompactionOptionsUniversal.Clone();
         c.TableOptions = TableOptions.Clone();
         c.BlobCache = BlobCache;
+        c.BlobDirectWritePartitionStrategy = BlobDirectWritePartitionStrategy;
         c.OtherTableFactoryOptions = OtherTableFactoryOptions is null ? null : new Dictionary<string, string>(OtherTableFactoryOptions, StringComparer.Ordinal);
         return c;
     }

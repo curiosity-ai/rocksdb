@@ -43,6 +43,14 @@ internal sealed class GetContext
     /// (<see cref="ResolveBlob"/>) while it still holds the version the index was read from.
     /// </summary>
     public bool ValueIsBlobIndex;
+    /// <summary>
+    /// The found value is a version 2 wide-column entity with blob-backed columns: <see cref="ResolveBlob"/> replaces it
+    /// with the resolved (version 1) entity.
+    /// </summary>
+    public bool ValueEntityHasBlobColumns;
+
+    /// <summary>The found value still references blob files (<see cref="ValueIsBlobIndex"/> or <see cref="ValueEntityHasBlobColumns"/>).</summary>
+    public bool NeedsBlobResolution => ValueIsBlobIndex || ValueEntityHasBlobColumns;
     public ulong MaxCoveringTombstoneSeq;
     /// <summary>
     /// Sequence number of the read. With user-defined timestamps table entries with a larger seqno are skipped (they
@@ -106,6 +114,7 @@ internal sealed class GetContext
         FromMemTable = false;
         ValueIsEntity = false;
         ValueIsBlobIndex = false;
+        ValueEntityHasBlobColumns = false;
         MaxCoveringTombstoneSeq = 0;
         ReadSequence = DbFormat.MaxSequenceNumber;
         MergeOperator = mergeOperator;
@@ -127,7 +136,7 @@ internal sealed class GetContext
             if (seq > ReadSequence) return true; // not in the read snapshot: continue to the next entry
             RecordTimestampOfUserKey(DbFormat.ExtractUserKey(internalKey), seq);
             // ukey_with_ts_found_: blob records are keyed (and verified) by the user key with its timestamp.
-            if (type == EntryType.BlobIndex && MaxCoveringTombstoneSeq <= seq)
+            if (type is EntryType.BlobIndex or EntryType.WideColumnEntity && MaxCoveringTombstoneSeq <= seq)
             {
                 _blobUserKey.Clear();
                 _blobUserKey.Write(DbFormat.ExtractUserKey(internalKey));
@@ -154,6 +163,7 @@ internal sealed class GetContext
                 Value.Write(value);
                 ValueIsEntity = type == EntryType.WideColumnEntity;
                 ValueIsBlobIndex = type == EntryType.BlobIndex;
+                ValueEntityHasBlobColumns = ValueIsEntity && Wide.WideColumnSerialization.HasBlobColumns(value);
                 State = GetState.Found;
                 return false;
             case EntryType.ValuePreferredSeqno:
@@ -189,6 +199,7 @@ internal sealed class GetContext
                 Value.Write(value);
                 ValueIsEntity = valueType == EntryType.WideColumnEntity;
                 ValueIsBlobIndex = valueType == EntryType.BlobIndex;
+                ValueEntityHasBlobColumns = ValueIsEntity && Wide.WideColumnSerialization.HasBlobColumns(value);
                 State = GetState.Found;
                 return true;
             case MemTableGetResult.Deleted:
@@ -214,6 +225,11 @@ internal sealed class GetContext
     /// </summary>
     public void ResolveBlob(Blob.BlobSource source, VersionStorageInfo version, ReadOptions? options, ReadOnlySpan<byte> userKey)
     {
+        if (ValueEntityHasBlobColumns)
+        {
+            ResolveEntityBlobColumns(source, version, options, userKey);
+            return;
+        }
         if (!ValueIsBlobIndex) return;
         if (TimestampSize != 0 && _blobUserKey.WrittenCount > 0) userKey = _blobUserKey.WrittenSpan;
         Scratch.Clear();
@@ -227,6 +243,12 @@ internal sealed class GetContext
     public ValueTask ResolveBlobAsync(Blob.BlobSource source, VersionStorageInfo version, ReadOptions? options, ReadOnlyMemory<byte> userKey,
         CancellationToken cancellationToken)
     {
+        if (ValueEntityHasBlobColumns)
+        {
+            // Entity blob columns are resolved with synchronous reads (cache hits are the common case for hot entities).
+            ResolveEntityBlobColumns(source, version, options, userKey.Span);
+            return ValueTask.CompletedTask;
+        }
         if (!ValueIsBlobIndex) return ValueTask.CompletedTask;
         // With user-defined timestamps the blob record is keyed by the user key with the version's timestamp.
         if (TimestampSize != 0 && _blobUserKey.WrittenCount > 0) userKey = _blobUserKey.WrittenMemory;
@@ -239,6 +261,26 @@ internal sealed class GetContext
             return ValueTask.CompletedTask;
         }
         return AwaitBlobAsync(t);
+    }
+
+    private List<Wide.WideColumnSlot>? _slots;
+    private PooledBufferWriter? _entityScratch;
+
+    /// <summary>
+    /// GetContext::SaveValue for a version 2 entity (WideColumnSerialization::ResolveEntityBlobColumns): replaces the
+    /// found entity with its fully resolved version 1 form.
+    /// </summary>
+    private void ResolveEntityBlobColumns(Blob.BlobSource source, VersionStorageInfo version, ReadOptions? options, ReadOnlySpan<byte> userKey)
+    {
+        if (TimestampSize != 0 && _blobUserKey.WrittenCount > 0) userKey = _blobUserKey.WrittenSpan;
+        var fetcher = new Blob.VersionBlobFetcher(source, version, options);
+        Scratch.Clear();
+        _entityScratch ??= new PooledBufferWriter(256);
+        Wide.WideColumnSerialization.ResolveEntityBlobColumns(Value.WrittenSpan, userKey, ref fetcher, _slots ??= new List<Wide.WideColumnSlot>(8),
+            _entityScratch, Scratch);
+        Value.Clear();
+        Value.Write(Scratch.WrittenSpan);
+        ValueEntityHasBlobColumns = false;
     }
 
     private async ValueTask AwaitBlobAsync(ValueTask pending)
@@ -267,7 +309,7 @@ internal sealed class GetContext
                 ThrowHelper.Corruption("corrupted entry type for key");
                 return false;
         }
-        if (ValueIsBlobIndex) ThrowUnresolvedBlob();
+        if (NeedsBlobResolution) ThrowUnresolvedBlob();
         if (MergeContext.Count == 0)
         {
             if (State != GetState.Found) return false;
@@ -311,7 +353,7 @@ internal sealed class GetContext
                 ThrowHelper.Corruption("corrupted entry type for key");
                 return false;
         }
-        if (ValueIsBlobIndex) ThrowUnresolvedBlob();
+        if (NeedsBlobResolution) ThrowUnresolvedBlob();
         if (MergeContext.Count == 0)
         {
             if (State != GetState.Found) return false;
@@ -334,6 +376,20 @@ internal sealed class GetContext
             ObjectPools.ReturnWriter(output);
         }
         return true;
+    }
+
+    /// <summary>
+    /// After a successful <see cref="TryResolve"/>: replaces a found entity in <see cref="Value"/> with the value of its
+    /// default column, for callers that read <see cref="Value"/> directly (MultiGet).
+    /// </summary>
+    public void ReplaceEntityWithDefaultColumn()
+    {
+        if (!ValueIsEntity || State != GetState.Found) return;
+        Scratch.Clear();
+        Scratch.Write(Wide.WideColumnSerialization.GetValueOfDefaultColumn(Value.WrittenSpan));
+        Value.Clear();
+        Value.Write(Scratch.WrittenSpan);
+        ValueIsEntity = false;
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]

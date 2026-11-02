@@ -305,6 +305,12 @@ internal sealed class CompactionJob
             FlushJob.UpdateOldestBlobFileNumber(_meta!, value);
             _blobGarbageMeter?.ProcessOutFlow(key, value);
         }
+        else if (iter.Type == EntryType.WideColumnEntity)
+        {
+            // FileMetaData::UpdateBoundaries / BlobGarbageMeter::ProcessEntityBlobReferences: blob-backed entity columns.
+            FlushJob.UpdateOldestBlobFileNumberForEntity(_meta!, value);
+            _blobGarbageMeter?.ProcessOutFlow(key, value);
+        }
     }
 
     private bool AllTombstonesDroppable()

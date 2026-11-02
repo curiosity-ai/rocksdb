@@ -473,7 +473,7 @@ internal sealed partial class DbImpl
         lock (_mutex) return cfd.CompactionState.Picker.RangeOverlapWithCompaction(smallestUserKey, largestUserKey, level);
     }
 
-    private ulong NewPendingOutputFileNumber()
+    internal ulong NewPendingOutputFileNumber()
     {
         ulong n = Versions.NewFileNumber();
         lock (_mutex) _pendingOutputs.Add(n);

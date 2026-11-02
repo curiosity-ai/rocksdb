@@ -237,8 +237,15 @@ public sealed class TransactionTimestampTests
         txn.Rollback();
     }
 
+    /// <summary>
+    /// Upstream parity: OptimisticTransaction has no timestamp support. SetCommitTimestamp / SetReadTimestampForValidation
+    /// are rocksdb::Transaction's defaults (NotSupported "timestamp not supported", include/rocksdb/utilities/transaction.h);
+    /// writes to a column family with timestamps are buffered with placeholder timestamps, so the commit fails in
+    /// DBImpl::WriteImpl (InvalidArgument "write batch must have timestamp(s) set", db/db_impl/db_impl_write.cc).
+    /// Transactions that only read such a column family (with a read timestamp) or write elsewhere commit normally.
+    /// </summary>
     [TestMethod]
-    public void OptimisticTransactionsRejectTimestampedColumnFamilies()
+    public void OptimisticTransactionsCannotCommitTimestampedWrites()
     {
         MemoryFileSystem fs = NewFs();
         DbOptions o = NewOptions(fs);
@@ -248,9 +255,107 @@ public sealed class TransactionTimestampTests
                 new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, new ColumnFamilyOptions()),
                 new ColumnFamilyDescriptor("test_cf", new ColumnFamilyOptions { Comparator = Comparator.BytewiseWithU64Ts }),
             ]);
-        using Transaction txn = db.BeginTransaction(s_wo);
-        AssertFails(StatusCode.NotSupported, () => txn.Put(db.Database.GetColumnFamily("test_cf"), B("k"), B("v")));
-        AssertFails(StatusCode.NotSupported, () => txn.SetCommitTimestamp(1));
+        ColumnFamily cf = db.Database.GetColumnFamily("test_cf");
+        cf.Put(B("r"), Ts(5), B("db-r"));
+        using (Transaction txn = db.BeginTransaction(s_wo))
+        {
+            var e = Assert.ThrowsExactly<RocksDbException>(() => txn.SetCommitTimestamp(1));
+            Assert.AreEqual(StatusCode.NotSupported, e.Code);
+            StringAssert.Contains(e.Message, "timestamp not supported");
+            AssertFails(StatusCode.NotSupported, () => txn.SetReadTimestampForValidation(1));
+            txn.Put(cf, B("k"), B("v"));
+            Assert.AreEqual("v", S(txn.Get(At(100), cf, B("k")))); // read-your-own-writes through the index
+            e = Assert.ThrowsExactly<RocksDbException>(txn.Commit);
+            Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+            StringAssert.Contains(e.Message, "write batch must have timestamp(s) set");
+        }
+        var v = new ArrayBufferWriter<byte>();
+        Assert.IsFalse(cf.TryGet(At(ulong.MaxValue), B("k"), v));
+        using (Transaction txn = db.BeginTransaction(s_wo))
+        {
+            // Read-only use of the timestamped column family (GetForUpdate tracks the key) plus writes elsewhere.
+            Assert.AreEqual("db-r", S(txn.GetForUpdate(At(10), cf, B("r"), exclusive: true)));
+            txn.Put(B("plain"), B("p"));
+            txn.Commit();
+        }
+        Assert.AreEqual("p", S(db.Database.Get(B("plain"))));
+    }
+
+    /// <summary>
+    /// write_committed_transaction_ts_test.cc GetForUpdate do_validate = false: the key is locked but not validated, so a
+    /// newer committed version does not fail the read; a read timestamp or snapshot is not defined without validation.
+    /// </summary>
+    [TestMethod]
+    public void GetForUpdateWithoutValidation()
+    {
+        MemoryFileSystem fs = NewFs();
+        using TransactionDatabase db = OpenFresh(fs);
+        ColumnFamily cf = Cf(db);
+        cf.Put(B("k"), Ts(20), B("v20"));
+        using (Transaction txn = db.BeginTransaction(s_wo))
+        {
+            // Without validation and without a read timestamp the newest version is read and locked.
+            Assert.AreEqual("v20", S(txn.GetForUpdate(null, cf, B("k"), exclusive: true, doValidate: false)));
+            txn.Put(cf, B("k"), B("v30"));
+            txn.SetCommitTimestamp(30);
+            txn.Commit();
+        }
+        Assert.AreEqual(("v30", 30UL), GetAt(db, "k", 30));
+        using (Transaction txn = db.BeginTransaction(s_wo))
+        {
+            txn.SetReadTimestampForValidation(25);
+            // With validation the version at 30 > read timestamp 25 is a conflict...
+            AssertFails(StatusCode.Busy, () => txn.GetForUpdate(null, cf, B("k"), exclusive: true));
+            // ...and without validation a read timestamp is not defined.
+            var e = Assert.ThrowsExactly<RocksDbException>(() => txn.GetForUpdate(null, cf, B("k"), exclusive: true, doValidate: false));
+            Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+            StringAssert.Contains(e.Message, "If do_validate is false then GetForUpdate with read_timestamp is not defined.");
+        }
+        using (Transaction txn = db.BeginTransaction(s_wo))
+        using (Snapshot snap = db.Database.GetSnapshot())
+        {
+            var e = Assert.ThrowsExactly<RocksDbException>(() => txn.GetForUpdate(new ReadOptions { Snapshot = snap }, db.Database.DefaultColumnFamily, B("x"),
+                exclusive: true, doValidate: false));
+            Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+            StringAssert.Contains(e.Message, "If do_validate is false then GetForUpdate with snapshot is not defined.");
+        }
+        // A shared lock without validation on a missing key; the commit has nothing to apply.
+        using (Transaction txn = db.BeginTransaction(s_wo))
+        {
+            var w = new ArrayBufferWriter<byte>();
+            Assert.IsFalse(txn.TryGetForUpdate(null, db.Database.DefaultColumnFamily, B("other"), w, exclusive: false, doValidate: false));
+            txn.Commit();
+        }
+    }
+
+    /// <summary>
+    /// write_committed_transaction_ts_test.cc WritesBypassTransactionAPIs: timestamped writes made directly to the
+    /// transaction's WriteBatch get the commit timestamp, with and without write_batch_track_timestamp_size.
+    /// </summary>
+    [TestMethod]
+    public void WritesBypassTransactionApis()
+    {
+        MemoryFileSystem fs = NewFs();
+        using TransactionDatabase db = OpenFresh(fs);
+        ColumnFamily cf = Cf(db);
+        foreach (bool track in new[] { true, false })
+        {
+            string tag = track ? "t" : "u";
+            using Transaction txn = db.BeginTransaction(s_wo, new TransactionOptions { WriteBatchTrackTimestampSize = track });
+            txn.Put(B("plain" + tag), B("p"));
+            // Placeholder (zero) timestamp, replaced at commit.
+            txn.WriteBatch.Put(cf.Id, B("foobarbaz" + tag), Ts(0), B("baz_val"));
+            txn.WriteBatch.Put(db.Database.DefaultColumnFamily.Id, B("direct" + tag), B("d"));
+            txn.SetName("txn" + tag);
+            txn.SetCommitTimestamp(2);
+            txn.Prepare();
+            txn.Commit();
+            Assert.AreEqual(("baz_val", 2UL), GetAt(db, "foobarbaz" + tag, 2), tag);
+            Assert.AreEqual("d", S(db.Database.Get(B("direct" + tag))), tag);
+        }
+        db.Database.GetColumnFamily("test_cf").Flush();
+        Assert.AreEqual(("baz_val", 2UL), GetAt(db, "foobarbazt", 3));
+        Assert.AreEqual(("baz_val", 2UL), GetAt(db, "foobarbazu", 3));
     }
 
     [TestMethod]

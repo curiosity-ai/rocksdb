@@ -59,6 +59,12 @@ internal sealed class BlobSource : IDisposable
     /// <summary>The blob cache, or null.</summary>
     public BlockCache? Cache => _cache;
 
+    /// <summary>
+    /// Blob direct write of the column family: blob indexes from memtables may reference its files before a flush
+    /// registers them in a version (BlobFilePartitionManager::ResolveBlobDirectWriteIndex). Null without direct write.
+    /// </summary>
+    public BlobDirectWriteManager? DirectWrite { get; set; }
+
     /// <summary>Number of open blob file readers.</summary>
     public int OpenReaders => _readers.Count;
 
@@ -177,23 +183,46 @@ internal sealed class BlobSource : IDisposable
     /// </summary>
     public void GetBlob(VersionStorageInfo version, ReadOptions? options, ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> blobIndex, IBufferWriter<byte> output)
     {
-        BlobIndex index = DecodeChecked(version, blobIndex);
+        BlobIndex index = DecodeChecked(version, blobIndex, out bool directWrite);
         if (index.IsInlined)
         {
             output.Write(index.InlinedValue);
             return;
         }
+        if (directWrite)
+        {
+            GetDirectWriteBlob(options, userKey, index, output);
+            return;
+        }
         GetBlob(options, userKey, index.FileNumber, index.Offset, index.Size, index.Compression, output);
+    }
+
+    /// <summary>
+    /// ResolveBlobDirectWriteIndex fallback: a blob of a direct-write file the reading version does not know yet (blob
+    /// cache first, then the file itself).
+    /// </summary>
+    private void GetDirectWriteBlob(ReadOptions? options, ReadOnlySpan<byte> userKey, BlobIndex index, IBufferWriter<byte> output)
+    {
+        if (TryGetFromCache(index.FileNumber, index.Offset, output)) return;
+        if (!DirectWrite!.TryGetBlob(options, userKey, index.FileNumber, index.Offset, index.Size, index.Compression, output))
+        {
+            ThrowHelper.Corruption("Invalid blob file number " + index.FileNumber.ToString(CultureInfo.InvariantCulture));
+        }
     }
 
     /// <summary>Async <see cref="GetBlob(VersionStorageInfo, ReadOptions?, ReadOnlySpan{byte}, ReadOnlySpan{byte}, IBufferWriter{byte})"/>; completes synchronously on a cache hit.</summary>
     public ValueTask GetBlobAsync(VersionStorageInfo version, ReadOptions? options, ReadOnlyMemory<byte> userKey, ReadOnlySpan<byte> blobIndex,
         IBufferWriter<byte> output, CancellationToken cancellationToken)
     {
-        BlobIndex index = DecodeChecked(version, blobIndex);
+        BlobIndex index = DecodeChecked(version, blobIndex, out bool directWrite);
         if (index.IsInlined)
         {
             output.Write(index.InlinedValue);
+            return ValueTask.CompletedTask;
+        }
+        if (directWrite)
+        {
+            GetDirectWriteBlob(options, userKey.Span, index, output);
             return ValueTask.CompletedTask;
         }
         if (TryGetFromCache(index.FileNumber, index.Offset, output)) return ValueTask.CompletedTask;
@@ -201,14 +230,22 @@ internal sealed class BlobSource : IDisposable
         return ReadAndCacheAsync(options, userKey, index.FileNumber, index.Offset, index.Size, index.Compression, output, cancellationToken);
     }
 
-    private static BlobIndex DecodeChecked(VersionStorageInfo version, ReadOnlySpan<byte> blobIndex)
+    private BlobIndex DecodeChecked(VersionStorageInfo version, ReadOnlySpan<byte> blobIndex, out bool directWrite)
     {
+        directWrite = false;
         string? err = BlobIndex.TryDecode(blobIndex, out BlobIndex index);
         if (err is not null) ThrowHelper.Corruption(err);
         if (index.IsInlined) return index;
         if (index.HasTtl) ThrowHelper.Corruption("Unexpected TTL blob file");
         if (version.GetBlobFileMetaData(index.FileNumber) is null)
         {
+            // Only files still owned by the blob direct write path fall back to direct reads; once the version knows the
+            // file, every result of the version-backed read stands.
+            if (DirectWrite is { } dw && dw.IsDirectWriteFile(index.FileNumber))
+            {
+                directWrite = true;
+                return index;
+            }
             ThrowHelper.Corruption("Invalid blob file number " + index.FileNumber.ToString(CultureInfo.InvariantCulture));
         }
         return index;
@@ -350,4 +387,14 @@ internal sealed class BlobSource : IDisposable
             _readers.Clear();
         }
     }
+}
+
+/// <summary>
+/// Entity blob column fetcher for reads (Version::GetBlob through the column family's <see cref="BlobSource"/>): the
+/// BlobFetcher of the read paths (GetContext, DBIter).
+/// </summary>
+internal readonly struct VersionBlobFetcher(BlobSource source, VersionStorageInfo version, ReadOptions? options) : Wide.IEntityBlobFetcher
+{
+    public void FetchBlob(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> blobIndex, IBufferWriter<byte> output) =>
+        source.GetBlob(version, options, userKey, blobIndex, output);
 }
