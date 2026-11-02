@@ -39,30 +39,48 @@ The parent `../CLAUDE.md` applies to the C++ code. For work under `dotnet/`, thi
 ```
 dotnet/
   CLAUDE.md, todo.md            this file / progress tracker (update todo.md as you go)
+  README.md                     user-facing overview: compatibility matrix, build, API tour (snippets from samples/QuickStart)
   global.json                   pins the .NET 11 SDK (rollForward latestMajor)
   Directory.Build.props         net10.0;net11.0, nullable, unsafe, central package mgmt
   Directory.Packages.props      ALL package versions live here
   RocksDb.Managed.slnx
+  docs/                         architecture.md, testing.md, benchmarks.md, perf.md (perf log), validation.md (source audit)
   src/RocksDb.Managed/          the port (namespace RocksDb.Managed[.Sub])
-    Core/                       Status/exception types, public API types
+    RocksDatabase*.cs, ColumnFamily*.cs, MultiGetBatch.cs, PooledValue.cs   public DB / column family API
+    Core/                       Status/exception types, DbProperties
     Util/                       coding, crc32c, hashing, pooled buffers, comparators
-    Compression/                snappy/lz4/zstd adapters with RocksDB block compression framing
+    Compression/                snappy/lz4/zstd/zlib adapters with RocksDB block compression framing, dictionaries
     Wal/                        log format reader/writer
     Db/                         dbformat, WriteBatch, memtable, version set, DB impl, flush, compaction
-    Table/                      block-based table builder/reader, blocks, index, filters, footer
+      Compaction/ Iterators/ Blob/ Wide/   pickers + jobs, DBIter/merging/level iterators, BlobDB, wide columns
+    Memtable/, Memory/          InlineSkipList, arenas, block buffer pool
+    Table/                      block-based table builder/reader, blocks, index, footer; Table/Filters/ bloom + ribbon
     Options/                    options model + OPTIONS file read/write
-    Env/                        file system abstraction (async I/O)
-    Cache/                      block cache
-  tests/RocksDb.Managed.Tests/        unit tests (MSTest), pure managed
+    Env/                        file system abstraction (async I/O, preadv2/pwritev2 fast paths, MemoryFileSystem)
+    Cache/                      block cache (LRU, HyperClock)
+    Monitoring/, Logging/       Statistics, internal stats, info LOG
+    Utilities/                  Transactions/, WriteBatchWithIndex/, Backup/
+  src/RocksDb.Managed.Replication/             replication / switchover / Raft cluster layer (ported from rocksdb-sharp), transport-agnostic
+  src/RocksDb.Managed.Replication.MagicOnion/  optional gRPC (MagicOnion) services/clients for it
+  tests/RocksDb.Managed.Tests/        unit tests (MSTest), pure managed (crash consistency, fault injection, concurrency)
   tests/RocksDb.Managed.CompatTests/  binary-compat tests against native RocksDB (in-process)
   tests/RocksDb.Managed.RoundTrip/    managed<->native DB round trips; native side runs in a child process
                                       (the test host re-invokes itself) so native crashes are captured
-  src/RocksDb.Managed.Replication/    replication / switchover / Raft cluster layer (ported from rocksdb-sharp), transport-agnostic
-  src/RocksDb.Managed.Replication.MagicOnion/  optional gRPC (MagicOnion) services/clients for it
   tests/RocksDb.Managed.Replication.Tests/     in-process (in-memory transport), native-replica and gRPC tests
+  samples/QuickStart/                 every README example, runnable; sync-readme.py copies its snippets into README.md
   samples/{ReplicationTest,SwitchoverTest,ClusterTest}/  multi-process gRPC programs (ports of rocksdb-sharp's Tests/*)
-  bench/RocksDb.Managed.Benchmarks/   BenchmarkDotNet: managed port vs native RocksDB
+  bench/RocksDb.Managed.Benchmarks/   db_bench-style runner (dbbench/compare/report) + BenchmarkDotNet micro benchmarks
+  bench/native-c/                     C-API db_bench-style program on the NuGet librocksdb (native baseline)
+  bench/run-all.sh, bench/results/    three-way benchmark matrix and its committed reports
 ```
+
+Documentation: [README.md](README.md) (users), [docs/architecture.md](docs/architecture.md) (module map C++ -> C#,
+threading/async, memory), [docs/testing.md](docs/testing.md) (suites, env vars, adding tests),
+[docs/benchmarks.md](docs/benchmarks.md) (methodology, latest results), [docs/perf.md](docs/perf.md) (perf log),
+[docs/validation.md](docs/validation.md) (audit vs C++), [bench/README.md](bench/README.md) (runner flags),
+[src/RocksDb.Managed.Replication/README.md](src/RocksDb.Managed.Replication/README.md).
+When you change a README example, edit `samples/QuickStart` and run `python3 samples/QuickStart/sync-readme.py`;
+when you change the public API, keep README.md and the docs in sync.
 
 ## Relationship with rocksdb-sharp
 
