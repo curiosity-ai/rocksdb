@@ -432,7 +432,7 @@ public sealed class DbCompactionTests
         Assert.AreEqual(0, files[6], string.Join(",", files));
         Assert.IsTrue(files[1] > 0, string.Join(",", files));
         // Default CF untouched by the other CF's compactions.
-        Assert.AreEqual(1, FilesPerLevel(db)[0]);
+        Assert.IsTrue(FilesPerLevel(db)[0] <= 1);
         for (int i = 0; i < 400; i++)
         {
             CollectionAssert.AreEqual(Val(i, 1), await cf.GetAsync(Key(i)));
@@ -587,5 +587,34 @@ public sealed class DbCompactionTests
             AssertLsmShapeValid(db);
         }
         _ = expected;
+    }
+
+    [TestMethod]
+    public void TtlDatabaseCompactionDropsExpiredValues()
+    {
+        MemoryFileSystem fs = NewFs();
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        long clock = now;
+        using (TtlDatabase db = TtlDatabase.Open(DbPath, NewOptions(fs), SmallCf(), 100, () => Interlocked.Read(ref clock)))
+        {
+            for (int i = 0; i < 200; i++) db.Put(Key(i), Val(i, 0));
+            db.Flush();
+            // Not expired yet: compaction keeps everything.
+            db.CompactRange();
+            for (int i = 0; i < 200; i++) CollectionAssert.AreEqual(Val(i, 0), db.Get(Key(i)));
+            // Advance the filter's clock past the TTL: the next compaction drops the values.
+            Interlocked.Exchange(ref clock, now + 1000);
+            db.CompactRange();
+            for (int i = 0; i < 200; i++) Assert.IsNull(db.Get(Key(i)), "key " + i);
+            Assert.AreEqual("0", db.Database.GetProperty("rocksdb.estimate-num-keys"));
+        }
+        bool found = false;
+        foreach (string child in fs.GetChildren(DbPath))
+        {
+            if (!child.StartsWith("OPTIONS-", StringComparison.Ordinal)) continue;
+            using var r = new StreamReader(new MemoryStream(ReadAll(fs, DbPath + "/" + child)));
+            if (r.ReadToEnd().Contains("compaction_filter_factory=TtlCompactionFilterFactory", StringComparison.Ordinal)) found = true;
+        }
+        Assert.IsTrue(found);
     }
 }

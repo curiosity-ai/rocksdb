@@ -23,6 +23,7 @@ internal sealed partial class DbImpl
     private int _bgCompactionScheduled;   // automatic compactions running (guarded by mutex)
     private int _manualCompactionsRunning; // guarded by mutex
     private int _exclusiveManualCompactions; // guarded by mutex
+    private int _ingestionsRunning;       // guarded by mutex (num_running_ingest_file_)
     private bool _compactionsEnabled;     // set once open completed (guarded by mutex)
     private readonly CancellationTokenSource _bgCancellation = new();
 
@@ -224,6 +225,7 @@ internal sealed partial class DbImpl
     {
         if (!_compactionsEnabled || _shuttingDown || _bgError is not null || _bgCancellation.IsCancellationRequested) return;
         if (_exclusiveManualCompactions > 0) return; // an exclusive manual compaction is pending or running
+        if (_ingestionsRunning > 0) return; // wait for IngestExternalFile() calls to finish before picking compactions
         int limit = BgCompactionLimit();
         int attempts = _compactionQueue.Count;
         while (_bgCompactionScheduled < limit && attempts-- > 0 && _compactionQueue.TryDequeue(out ColumnFamilyData? cfd))
@@ -377,12 +379,6 @@ internal sealed partial class DbImpl
                     cfd.Current.Storage.ComputeCompactionScore();
                     RecalculateWriteStall(cfd);
                 }
-                if (isManual) _manualCompactionsRunning--;
-                else _bgCompactionScheduled--;
-                _backgroundJobs--;
-                if (!cfd.Dropped) SchedulePendingCompaction(cfd);
-                MaybeScheduleCompaction();
-                SignalBackgroundWork();
             }
             if (!ok && job is not null)
             {
@@ -390,11 +386,21 @@ internal sealed partial class DbImpl
             }
             try
             {
+                // Before the job is accounted as finished, so shutdown does not race with file deletion.
                 PurgeObsoleteFiles();
             }
             catch (Exception e) when (e is IOException or RocksDbException)
             {
                 // Deleting obsolete files is best effort.
+            }
+            lock (_mutex)
+            {
+                if (isManual) _manualCompactionsRunning--;
+                else _bgCompactionScheduled--;
+                _backgroundJobs--;
+                if (!cfd.Dropped) SchedulePendingCompaction(cfd);
+                MaybeScheduleCompaction();
+                SignalBackgroundWork();
             }
         }
         if (failure is not null && isManual)
@@ -402,6 +408,28 @@ internal sealed partial class DbImpl
             if (failure is RocksDbException r) throw new RocksDbException(r.Code, r.Message, r.SubCode, r);
             throw RocksDbException.IOError(failure.Message, failure);
         }
+    }
+
+    /// <summary>Ingestion started: no new compaction is picked until it finishes (num_running_ingest_file_).</summary>
+    private void BeginIngestion()
+    {
+        lock (_mutex) _ingestionsRunning++;
+    }
+
+    private void EndIngestion()
+    {
+        lock (_mutex)
+        {
+            _ingestionsRunning--;
+            MaybeScheduleCompaction();
+            SignalBackgroundWork();
+        }
+    }
+
+    /// <summary>True if a running compaction of <paramref name="cfd"/> writes to <paramref name="level"/> within the user key range.</summary>
+    internal bool RangeOverlapsRunningCompaction(ColumnFamilyData cfd, ReadOnlySpan<byte> smallestUserKey, ReadOnlySpan<byte> largestUserKey, int level)
+    {
+        lock (_mutex) return cfd.CompactionState.Picker.RangeOverlapWithCompaction(smallestUserKey, largestUserKey, level);
     }
 
     private ulong NewPendingOutputFileNumber()
@@ -425,12 +453,17 @@ internal sealed partial class DbImpl
     {
         ArgumentNullException.ThrowIfNull(options);
         ThrowIfDisposed();
+        if (_readOnly) ThrowReadOnly();
         if (options.TargetPathId >= DbPaths.Count) ThrowHelper.InvalidArgument("Invalid target path ID");
         CompactionStyle style = cfd.Options.CompactionStyle;
         if (options.ChangeLevel && style == CompactionStyle.Fifo) ThrowHelper.NotSupported("FIFO compaction does not support change_level.");
         if (style == CompactionStyle.None) ThrowHelper.NotSupported("Compaction style None does not support CompactRange");
 
-        await FlushColumnFamilyAsync(cfd, wait: true, synchronous, cancellationToken).ConfigureAwait(false);
+        // Flush first, unless there is nothing in memory (flushing takes write-leadership, which a writer waiting on a
+        // write stop holds; skipping the no-op flush lets a manual compaction resolve the stop).
+        bool flushNeeded;
+        lock (_mutex) flushNeeded = !cfd.Mem.IsEmpty || cfd.Imm.Count > 0;
+        if (flushNeeded) await FlushColumnFamilyAsync(cfd, wait: true, synchronous, cancellationToken).ConfigureAwait(false);
 
         bool exclusive = options.ExclusiveManualCompaction;
         if (exclusive) await BeginExclusiveManualAsync(synchronous, cancellationToken).ConfigureAwait(false);
@@ -613,8 +646,12 @@ internal sealed partial class DbImpl
                         throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
                     if (_bgError is { } e) ThrowBackgroundError(e);
                     if (cfd.Dropped) ThrowDropped(cfd);
-                    c = cfd.CompactionState.Picker.PickCompactionForCompactRange(cfd.Current.Storage, inputLevel, outputLevel, options.MaxSubcompactions,
-                        beginKey, endKey, out compactionEnd, out bool conflict, maxFileNumToIgnore, disallowTrivialMove);
+                    bool conflict = _ingestionsRunning > 0;
+                    if (!conflict)
+                    {
+                        c = cfd.CompactionState.Picker.PickCompactionForCompactRange(cfd.Current.Storage, inputLevel, outputLevel,
+                            options.MaxSubcompactions, beginKey, endKey, out compactionEnd, out conflict, maxFileNumToIgnore, disallowTrivialMove);
+                    }
                     if (!conflict)
                     {
                         if (c is not null)
