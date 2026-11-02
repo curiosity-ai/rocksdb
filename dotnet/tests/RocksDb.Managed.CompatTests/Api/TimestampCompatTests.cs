@@ -560,6 +560,97 @@ public sealed unsafe class TimestampCompatTests
         AssertSameDump(nativeResults, managedResults, "range deletion with timestamps and snapshots");
     }
 
+    /// <summary>
+    /// Timestamped external SST files both ways: the managed SstFileWriter (Put/Delete/DeleteRange with timestamps) is
+    /// ingested by native, the native one (rocksdb_sstfilewriter_put_with_ts / delete_with_ts) by managed; both sides
+    /// then read the same versions at every timestamp.
+    /// </summary>
+    [TestMethod]
+    public void TimestampedSstFilesIngestedBothWays()
+    {
+        using var dir = new TempDir("udt-sst");
+        const int Keys = 140;
+        string managedSst = Path.Combine(dir.Path, "managed.sst"), nativeSst = Path.Combine(dir.Path, "native.sst");
+        string dbPath = Path.Combine(dir.Path, "db");
+
+        // Managed writer: keys 60..99, two versions each, some deletions and a range deletion, ordered key asc / ts desc.
+        var cfo = new ColumnFamilyOptions { Comparator = Comparator.BytewiseWithU64Ts };
+        using (var w = new SstFileWriter(cfo))
+        {
+            w.Open(managedSst);
+            for (int i = 60; i < 100; i++)
+            {
+                if (i % 7 == 0) w.Delete(B(Key(i)), Ts(40));
+                w.Put(B(Key(i)), Ts(35), B("m" + i + "-35"));
+                w.Put(B(Key(i)), Ts(22), B("m" + i + "-22"));
+            }
+            w.DeleteRange(B(Key(80)), B(Key(90)), Ts(30));
+            Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(() => w.Put(B("z"), B("v"))).Code);
+            Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(() => w.Put(B("z"), Ts(1)[..4], B("v"))).Code);
+            w.Finish();
+        }
+
+        List<string> nativeDump;
+        using (RocksDbSharp.RocksDb native = OpenNative(dbPath))
+        {
+            for (int i = 0; i < 60; i++) NativePut(native, Key(i), (ulong)(i % 20 + 1), "n" + i);
+            native.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            native.IngestExternalFiles([managedSst], new RocksDbSharp.IngestExternalFileOptions());
+
+            // Native writer: keys 100..139.
+            var nopts = new RocksDbSharp.ColumnFamilyOptions();
+            N.rocksdb_options_set_comparator(nopts.Handle, s_comparator.Value);
+            s_keepAlive.Add(nopts);
+            using (var nw = new RocksDbSharp.SstFileWriter(new RocksDbSharp.EnvOptions(), nopts))
+            {
+                nw.Open(nativeSst);
+                for (int i = 100; i < Keys; i++)
+                {
+                    byte[] k = B(Key(i)), v = B("n" + i + "-45"), t = Ts(45), dts = Ts(50);
+                    fixed (byte* pk = k)
+                    fixed (byte* pv = v)
+                    fixed (byte* pt = t)
+                    fixed (byte* pd = dts)
+                    {
+                        if (i % 5 == 0)
+                        {
+                            N.rocksdb_sstfilewriter_delete_with_ts(nw.Handle, (IntPtr)pk, (UIntPtr)k.Length, (IntPtr)pd, (UIntPtr)8, out IntPtr derr);
+                            Check(derr);
+                        }
+                        N.rocksdb_sstfilewriter_put_with_ts(nw.Handle, (IntPtr)pk, (UIntPtr)k.Length, (IntPtr)pt, (UIntPtr)8, (IntPtr)pv, (UIntPtr)v.Length, out IntPtr err);
+                        Check(err);
+                    }
+                }
+                nw.Finish();
+            }
+            nativeDump = NativeDump(native, Keys, 0);
+        }
+
+        using (RocksDatabase db = OpenManaged(dbPath))
+        {
+            // Managed reads the native ingestion of the managed SST.
+            List<string> before = NativeDumpFilter(nativeDump, 100);
+            AssertSameDump(before, NativeDumpFilter(ManagedDump(db, Keys, 0), 100), "managed reading native-ingested managed SST");
+            db.IngestExternalFiles([nativeSst], new IngestExternalFileOptions());
+            AssertSameDump(nativeDump.FindAll(static l => !l.Contains("key01", StringComparison.Ordinal)),
+                ManagedDump(db, Keys, 0).FindAll(static l => !l.Contains("key01", StringComparison.Ordinal)), "managed after ingesting native SST");
+            nativeDump = ManagedDump(db, Keys, 0);
+            Assert.IsTrue(nativeDump.Exists(static l => l.Contains("key0105=@50(del)", StringComparison.Ordinal)), "native SST deletion visible");
+        }
+        using (RocksDbSharp.RocksDb native = OpenNative(dbPath))
+        {
+            AssertSameDump(nativeDump, NativeDump(native, Keys, 0), "native reading managed-ingested native SST");
+        }
+    }
+
+    /// <summary>Lines of a dump that do not concern keys &gt;= <paramref name="limit"/>.</summary>
+    private static List<string> NativeDumpFilter(List<string> dump, int limit) =>
+        dump.FindAll(l =>
+        {
+            int k = l.IndexOf(" key", StringComparison.Ordinal);
+            return k < 0 || int.Parse(l.AsSpan(k + 4, 4), System.Globalization.CultureInfo.InvariantCulture) < limit;
+        });
+
     [TestMethod]
     public void WriteBatchWithTimestampsMatchesNativeBytes()
     {

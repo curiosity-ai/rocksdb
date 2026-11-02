@@ -627,6 +627,63 @@ public sealed class DbTimestampTests
         Assert.AreEqual(ulong.MaxValue, GetAt(db.DefaultColumnFamily, "b", 100).Ts);
     }
 
+    /// <summary>
+    /// SstFileWriter with timestamps (Put/Delete/DeleteRange(..., ts)) and ingestion of the file
+    /// (external_sst_file_basic_test.cc timestamp cases): reads see the versions by timestamp, a memtable overlapping
+    /// the file's keys (without timestamps) is rejected instead of flushed, untimestamped calls fail.
+    /// </summary>
+    [TestMethod]
+    public void SstFileWriterWithTimestampsAndIngestion()
+    {
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cfo = UdtOptions(bloom: true);
+        using RocksDatabase db = OpenUdt(fs, cfo);
+        db.Put(B("a"), Ts(5), B("a5"));
+        db.Flush();
+
+        using (var w = new SstFileWriter(cfo, fs))
+        {
+            w.Open("/ext1.sst");
+            Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(() => w.Put(B("b"), B("v"))).Code);
+            Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(() => w.DeleteRange(B("b"), B("c"))).Code);
+            w.Put(B("b"), Ts(20), B("b20"));
+            w.Put(B("b"), Ts(10), B("b10"));
+            w.Delete(B("c"), Ts(30));
+            w.Put(B("c"), Ts(10), B("c10"));
+            w.Put(B("d"), Ts(10), B("d10"));
+            // Keys must be ascending in internal order: an older-then-newer timestamp of one key is out of order.
+            Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(() => w.Put(B("d"), Ts(11), B("x"))).Code);
+            // Like upstream, a range deletion of an ingested file covers DB keys, not the file's own keys (same seqno).
+            w.DeleteRange(B("a"), B("b"), Ts(15));
+            w.Finish();
+        }
+        db.IngestExternalFiles(["/ext1.sst"], new IngestExternalFileOptions());
+        for (int pass = 0; pass < 2; pass++)
+        {
+            CollectionAssert.AreEqual(new[] { "a=a5@5", "b=b10@10", "c=c10@10", "d=d10@10" }, Scan(db, At(12)));
+            CollectionAssert.AreEqual(new[] { "b=b20@20", "c=c10@10", "d=d10@10" }, Scan(db, At(25)));
+            CollectionAssert.AreEqual(new[] { "b=b20@20", "d=d10@10" }, Scan(db, At(35)));
+            Assert.AreEqual((null as string, 30UL), GetAt(db.DefaultColumnFamily, "c", 35));
+            Assert.AreEqual((null as string, 15UL), GetAt(db.DefaultColumnFamily, "a", 16));
+            db.CompactRange();
+        }
+
+        // A memtable holding "b" (any timestamp) overlaps the next file: no flush on its behalf.
+        db.Put(B("b"), Ts(40), B("b40"));
+        using (var w = new SstFileWriter(cfo, fs))
+        {
+            w.Open("/ext2.sst");
+            w.Put(B("b"), Ts(50), B("b50"));
+            w.Finish();
+        }
+        Assert.AreEqual(StatusCode.InvalidArgument,
+            Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles(["/ext2.sst"], new IngestExternalFileOptions())).Code);
+        db.Flush();
+        db.IngestExternalFiles(["/ext2.sst"], new IngestExternalFileOptions());
+        Assert.AreEqual(("b50", 50UL), GetAt(db.DefaultColumnFamily, "b", 60));
+        Assert.AreEqual(("b40", 40UL), GetAt(db.DefaultColumnFamily, "b", 45));
+    }
+
     [TestMethod]
     public void WriteBatchRecordsAppendTimestampToKeys()
     {
