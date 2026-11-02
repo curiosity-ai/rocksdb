@@ -63,7 +63,7 @@ internal static class Maintenance
             await db.CreateCheckpointAsync(checkpointDir);
 
             // Backups: incremental, shared SST files, native-identical layout (native BackupEngine can read them).
-            using BackupEngine backups = BackupEngine.Open(new BackupEngineOptions(backupDir));
+            using BackupEngine backups = BackupEngine.Open(new BackupEngineOptions(backupDir) { MaxBackgroundOperations = 4 });
             uint id = backups.CreateNewBackup(db, flushBeforeBackup: true);
             backups.VerifyBackup(id, verifyWithChecksum: true);
             foreach (BackupInfo info in backups.GetBackupInfo())
@@ -100,6 +100,7 @@ internal static class Maintenance
         }
 
         // ...and ingest it atomically (the file is placed at the lowest level it fits; also works with native SSTs).
+        // Several files may overlap: later files in the list win. IngestBehind = true back-fills below existing data.
         db.IngestExternalFiles([sstPath], new IngestExternalFileOptions { MoveFiles = true });
         // </snippet:sst-ingest>
         Line($"bulk:0042 = {Utf8(db.Get("bulk:0042"u8))}");

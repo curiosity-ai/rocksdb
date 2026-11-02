@@ -96,6 +96,8 @@ internal static class DataModels
         using TtlDatabase db = TtlDatabase.Open(path, new DbOptions { CreateIfMissing = true }, ttlSeconds: 3600);
         db.Put("session"u8, "token"u8);
         Console.WriteLine(System.Text.Encoding.UTF8.GetString(db.Get("session"u8)!));   // token (timestamp stripped)
+        using (Iterator it = db.NewIterator())                                           // iterators strip it too
+            for (it.SeekToFirst(); it.Valid; it.Next()) Console.WriteLine(it.Value.Length); // 5
         db.CompactRange();                                                               // expired entries are removed here
         // </snippet:ttl>
         Check(Utf8(db.Get("session"u8)) == "token", "ttl value");
