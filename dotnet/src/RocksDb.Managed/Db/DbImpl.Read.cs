@@ -249,6 +249,7 @@ internal sealed partial class DbImpl
             Levels = levels,
             TableCache = cfd.TableCache,
             MaxSequentialSkipInIterations = cfd.Options.MaxSequentialSkipInIterations,
+            PrefixExtractor = cfd.Options.PrefixExtractor,
             Cleanup = new SuperVersionRelease(this, sv),
         };
     }

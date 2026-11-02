@@ -47,7 +47,11 @@ internal static class BlockFetcher
 {
     // Block buffers come from BlockBufferPool (fine size classes): an uncompressed block keeps its read buffer for its
     // whole life in the block cache, and its length is what the cache is charged.
-    public static Block ReadBlock(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums)
+    public static Block ReadBlock(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums) =>
+        ReadBlock(file, footer, handle, verifyChecksums, null);
+
+    /// <summary>Reads a block, decompressing with <paramref name="dictionary"/> (data blocks of dictionary-compressed tables).</summary>
+    public static Block ReadBlock(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums, CompressionDictionary? dictionary)
     {
         int n = CheckedLength(handle);
         byte[] buf = BlockBufferPool.Rent(n);
@@ -61,10 +65,14 @@ internal static class BlockFetcher
             BlockBufferPool.Return(buf);
             throw;
         }
-        return ProcessSerialized(buf, footer, handle, verifyChecksums);
+        return ProcessSerialized(buf, footer, handle, verifyChecksums, dictionary);
     }
 
-    public static async ValueTask<Block> ReadBlockAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, bool verifyChecksums, CancellationToken ct)
+    public static ValueTask<Block> ReadBlockAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, bool verifyChecksums, CancellationToken ct) =>
+        ReadBlockAsync(file, footer, handle, verifyChecksums, null, ct);
+
+    public static async ValueTask<Block> ReadBlockAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, bool verifyChecksums,
+        CompressionDictionary? dictionary, CancellationToken ct)
     {
         int n = CheckedLength(handle);
         byte[] buf = BlockBufferPool.Rent(n);
@@ -84,7 +92,7 @@ internal static class BlockFetcher
             BlockBufferPool.Return(buf);
             throw;
         }
-        return ProcessSerialized(buf, footer, handle, verifyChecksums);
+        return ProcessSerialized(buf, footer, handle, verifyChecksums, dictionary);
     }
 
     private static int CheckedLength(BlockHandle handle)
@@ -111,7 +119,7 @@ internal static class BlockFetcher
         ThrowHelper.Corruption("truncated block read from file at offset " + handle.Offset + ", expected " + (handle.Size + BlockBasedTableConstants.BlockTrailerSize) + " bytes, got " + read);
 
     /// <summary>Takes ownership of <paramref name="buf"/> (rented) holding payload + trailer.</summary>
-    private static Block ProcessSerialized(byte[] buf, in Footer footer, BlockHandle handle, bool verifyChecksums)
+    private static Block ProcessSerialized(byte[] buf, in Footer footer, BlockHandle handle, bool verifyChecksums, CompressionDictionary? dictionary)
     {
         int size = (int)handle.Size;
         try
@@ -128,7 +136,7 @@ internal static class BlockFetcher
         if (type == CompressionType.None) return Block.Create(buf, size, rentedFromSharedPool: true);
         try
         {
-            return Decompress(type, buf.AsSpan(0, size), footer.FormatVersion);
+            return Decompress(type, buf.AsSpan(0, size), footer.FormatVersion, dictionary);
         }
         finally
         {
@@ -137,14 +145,18 @@ internal static class BlockFetcher
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    internal static Block Decompress(CompressionType type, ReadOnlySpan<byte> compressed, int formatVersion)
+    internal static Block Decompress(CompressionType type, ReadOnlySpan<byte> compressed, int formatVersion) => Decompress(type, compressed, formatVersion, null);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static Block Decompress(CompressionType type, ReadOnlySpan<byte> compressed, int formatVersion, CompressionDictionary? dictionary)
     {
         // No initial buffer: the decompressors request the exact uncompressed size (stored in the block or the snappy
         // header) with a single GetSpan, so the block gets one right-sized array and no grow-and-copy.
         var w = new RentedBufferWriter(0, blockPool: true);
         try
         {
-            BlockCompression.Decompress(type, compressed, formatVersion, w);
+            BlockCompression.Decompress(type, compressed, formatVersion, w, dictionary);
+
             byte[] arr = w.Detach(out int len);
             return Block.Create(arr, len, rentedFromSharedPool: true);
         }

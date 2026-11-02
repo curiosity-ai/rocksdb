@@ -30,6 +30,26 @@ public sealed class TableInternalIterator : InternalIterator
         _it = lease.Reader.NewIterator(flags);
     }
 
+    /// <summary>
+    /// Iterates <paramref name="lease"/>'s reader in prefix seek mode as configured by <paramref name="readOptions"/>
+    /// and the column family's <paramref name="prefixExtractor"/> (see <see cref="BlockBasedTableReader.GetPrefixOptions"/>).
+    /// </summary>
+    public TableInternalIterator(TableReaderLease lease, TableReadFlags flags, ReadOptions? readOptions, SliceTransform? prefixExtractor)
+    {
+        if (lease.Reader is null) throw new ArgumentException("lease has no reader", nameof(lease));
+        _lease = lease;
+        try
+        {
+            _it = lease.Reader.NewIterator(flags, lease.Reader.GetPrefixOptions(readOptions, prefixExtractor));
+        }
+        catch
+        {
+            lease.Dispose();
+            throw;
+        }
+    }
+
+
     /// <summary>Iterates <paramref name="reader"/> without owning it.</summary>
     public TableInternalIterator(BlockBasedTableReader reader) : this(new TableReaderLease(reader, null, null)) { }
 

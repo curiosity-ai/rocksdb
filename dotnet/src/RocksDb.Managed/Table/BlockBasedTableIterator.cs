@@ -156,7 +156,9 @@ internal sealed class IndexCursor
 
 /// <summary>
 /// Two-level iterator over a block-based table: index → data blocks. Port of BlockBasedTableIterator
-/// (table/block_based/block_based_table_iterator.cc) without readahead, bounds or prefix checks.
+/// (table/block_based/block_based_table_iterator.cc) without readahead or bounds checks. With prefix options
+/// (<see cref="TableIteratorPrefixOptions.CheckFilter"/>), Seek and SeekForPrev first consult the prefix filter
+/// (CheckPrefixMayMatch) and leave the iterator invalid without reading any data block when it excludes the prefix.
 /// <para>
 /// Keys/values are spans into pinned block buffers (or the iterator's key buffer) valid until the next move.
 /// The async variants only await when a data block has to be read from the file (cache hits complete
@@ -169,14 +171,36 @@ public sealed class BlockBasedTableIterator : IDisposable
     private readonly IndexCursor _index = new();
     private readonly BlockIter _data = new();
     private readonly TableReadFlags _flags;
+    private readonly TableIteratorPrefixOptions _prefix;
     private BlockRef _block;
     private BlockHandle _blockHandle;
 
-    internal BlockBasedTableIterator(BlockBasedTableReader reader, TableReadFlags flags)
+    internal BlockBasedTableIterator(BlockBasedTableReader reader, TableReadFlags flags, in TableIteratorPrefixOptions prefixOptions)
     {
         _reader = reader;
         _flags = flags;
+        _prefix = prefixOptions;
         _index.Init(reader, flags);
+    }
+
+    /// <summary>
+    /// Port of CheckPrefixMayMatch: false when the prefix filter rules out <paramref name="target"/>'s prefix (the
+    /// caller then invalidates the iterator).
+    /// </summary>
+    private bool CheckPrefixMayMatch(ReadOnlySpan<byte> target, bool backward)
+    {
+        if (_prefix.NeedUpperBoundCheck && backward)
+        {
+            // Upper bound check isn't sufficient for backward direction to guarantee the same result as total order,
+            // so disable prefix check.
+            return true;
+        }
+        if (_prefix.CheckFilter && !_reader.PrefixRangeMayMatch(target, _prefix, _flags))
+        {
+            _reader.RecordSeekFiltered();
+            return false;
+        }
+        return true;
     }
 
     public bool Valid
@@ -208,6 +232,11 @@ public sealed class BlockBasedTableIterator : IDisposable
     /// <summary>Positions at the first entry with internal key &gt;= <paramref name="target"/>.</summary>
     public void Seek(ReadOnlySpan<byte> target)
     {
+        if (_prefix.CheckFilter && !CheckPrefixMayMatch(target, backward: false))
+        {
+            ReleaseBlock();
+            return;
+        }
         _index.Seek(target);
         if (!LoadCurrentBlock()) return;
         _data.Seek(target);
@@ -217,6 +246,11 @@ public sealed class BlockBasedTableIterator : IDisposable
     /// <summary>Positions at the last entry with internal key &lt;= <paramref name="target"/>.</summary>
     public void SeekForPrev(ReadOnlySpan<byte> target)
     {
+        if (_prefix.CheckFilter && !CheckPrefixMayMatch(target, backward: true))
+        {
+            ReleaseBlock();
+            return;
+        }
         _index.Seek(target);
         if (!_index.Valid) _index.SeekToLast();
         if (!LoadCurrentBlock()) return;
@@ -297,7 +331,13 @@ public sealed class BlockBasedTableIterator : IDisposable
 
     public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
+        if (_prefix.CheckFilter && !CheckPrefixMayMatch(target.Span, backward: false))
+        {
+            ReleaseBlock();
+            return ValueTask.CompletedTask;
+        }
         _index.Seek(target.Span);
+
         return PositionAsync(Op.Seek, target, cancellationToken);
     }
 

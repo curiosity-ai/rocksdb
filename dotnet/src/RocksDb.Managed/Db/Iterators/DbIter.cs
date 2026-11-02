@@ -14,10 +14,12 @@ namespace RocksDb.Managed.Db.Iterators;
 /// FindUserKeyBeforeSavedKey, Seek / SeekForPrev / SeekToFirst / SeekToLast with iterate_lower_bound /
 /// iterate_upper_bound, max_skippable_internal_keys (Incomplete). Range deletions use the pre-7.x scheme: every
 /// visible entry is checked against a <see cref="RangeDelAggregator"/> (see <see cref="MergingIterator"/>).</para>
-/// <para><b>Not ported (yet).</b> Prefix seek / prefix_same_as_start (no prefix extractor exists; total order is
-/// assumed - the hook is <see cref="ReadOptions.PrefixSameAsStart"/>, ignored like upstream without an extractor),
-/// user-defined timestamps, read callbacks, blob values and wide-column entities (NotSupported), statistics/perf
-/// context, tombstone-run conversion, multi-scan.</para>
+/// <para><b>Prefix seek.</b> With a prefix extractor and neither total_order_seek nor auto_prefix_mode, the inner
+/// iterator is in prefix mode (tables skipped by their prefix filter): direction changes re-seek like upstream
+/// (expect_total_order_inner_iter_ false) and the reseek optimization is disabled for SeekToFirst/SeekToLast.
+/// prefix_same_as_start stops iteration at the end of the seek key's prefix (PrefixCheck).</para>
+/// <para><b>Not ported (yet).</b> User-defined timestamps, read callbacks, blob values and wide-column entities
+/// (NotSupported), statistics/perf context, tombstone-run conversion, multi-scan.</para>
 /// <para><b>Errors.</b> Upstream sets status() and invalidates the iterator; here the positioning call throws
 /// <see cref="RocksDbException"/> (Corruption, InvalidArgument for a merge without operator, Incomplete when
 /// max_skippable_internal_keys is exceeded) and the iterator is left invalid.</para>
@@ -40,7 +42,12 @@ public sealed class DbIter : IDisposable
     private readonly ulong _sequence;
     private readonly MergeOperator? _mergeOperator;
     private readonly RangeDelAggregator? _rangeDel;
-    private readonly ulong _maxSkip;
+    private ulong _maxSkip;
+    private readonly SliceTransform? _prefixExtractor;
+    private readonly bool _prefixSameAsStart;
+    private readonly bool _expectTotalOrderInnerIter;
+    private readonly PooledBufferWriter _prefix = new(16);
+    private bool _hasPrefix;
     private readonly ulong _maxSkippableInternalKeys;
     private readonly bool _hasLower;
     private readonly bool _hasUpper;
@@ -78,7 +85,26 @@ public sealed class DbIter : IDisposable
     /// <param name="cleanup">Disposed after the internal iterator (e.g. releases a super version), or null.</param>
     public DbIter(InternalKeyComparator comparator, InternalIterator iter, ulong sequence, ReadOptions? readOptions,
         MergeOperator? mergeOperator, RangeDelAggregator? rangeDel, ulong maxSequentialSkipInIterations, IDisposable? cleanup)
+        : this(comparator, iter, sequence, readOptions, mergeOperator, rangeDel, maxSequentialSkipInIterations, cleanup, prefixExtractor: null)
     {
+    }
+
+    /// <param name="comparator">Internal key comparator of the column family.</param>
+    /// <param name="iter">Internal iterator (ownership transferred: disposed with this iterator).</param>
+    /// <param name="sequence">Snapshot sequence number: entries with a larger seqno are invisible.</param>
+    /// <param name="readOptions">Bounds, skip limits and prefix seek mode (null = defaults).</param>
+    /// <param name="mergeOperator">The column family's merge operator (null: merge entries throw InvalidArgument).</param>
+    /// <param name="rangeDel">Range tombstones to apply (null or empty = none).</param>
+    /// <param name="maxSequentialSkipInIterations">max_sequential_skip_in_iterations (CF option, default 8).</param>
+    /// <param name="cleanup">Disposed after the internal iterator (e.g. releases a super version), or null.</param>
+    /// <param name="prefixExtractor">The column family's prefix extractor (MutableCFOptions::prefix_extractor), or null.</param>
+    public DbIter(InternalKeyComparator comparator, InternalIterator iter, ulong sequence, ReadOptions? readOptions,
+        MergeOperator? mergeOperator, RangeDelAggregator? rangeDel, ulong maxSequentialSkipInIterations, IDisposable? cleanup,
+        SliceTransform? prefixExtractor)
+    {
+        _prefixExtractor = prefixExtractor;
+        _prefixSameAsStart = prefixExtractor is not null && readOptions?.PrefixSameAsStart == true;
+        _expectTotalOrderInnerIter = prefixExtractor is null || readOptions?.TotalOrderSeek == true || readOptions?.AutoPrefixMode == true;
         ArgumentNullException.ThrowIfNull(comparator);
         ArgumentNullException.ThrowIfNull(iter);
         _icmp = comparator;
@@ -214,8 +240,26 @@ public sealed class DbIter : IDisposable
         _seekKey.Advance(DbFormat.AppendInternalKey(dst, userKey, sequence, type));
     }
 
+    /// <summary>Port of DBIter::PrefixCheck: the key has the seek key's prefix (or no prefix is being enforced).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool PrefixCheck(ReadOnlySpan<byte> userKey) =>
+        !_hasPrefix || (_prefixExtractor!.InDomain(userKey) && _prefixExtractor.Transform(userKey).SequenceEqual(_prefix.WrittenSpan));
+
+    /// <summary>
+    /// Port of DBIter::ShouldSetPrefix + prefix_->SetUserKey(Transform(target)): remembers the prefix of
+    /// <paramref name="target"/> for prefix_same_as_start (tombstone-run conversion is not ported).
+    /// </summary>
+    private void MaybeSetPrefix(ReadOnlySpan<byte> target)
+    {
+        if (!_prefixSameAsStart || !_prefixExtractor!.InDomain(target)) return;
+        _prefix.Clear();
+        _prefix.Write(_prefixExtractor.Transform(target));
+        _hasPrefix = true;
+    }
+
     private void ResetSeekState()
     {
+        _hasPrefix = false;
         _numInternalKeysSkipped = 0;
         _isKeySeqnumZero = false;
         _valid = false;
@@ -268,6 +312,13 @@ public sealed class DbIter : IDisposable
 
         if (_hasUpper && _icmp.CompareUserKey(userKey, _upper.Span) >= 0)
         {
+            _valid = false;
+            return StepAction.Done;
+        }
+
+        if (_hasPrefix && !PrefixCheck(userKey))
+        {
+            // Only prefix_same_as_start sets a prefix (tombstone-run conversion is not ported): stop at its end.
             _valid = false;
             return StepAction.Done;
         }
@@ -553,8 +604,10 @@ public sealed class DbIter : IDisposable
         if (!_iter.Valid) return;
         // Now the inner iterator is placed to the target position. From there, we need to find out the next key
         // that is visible to the user.
+        MaybeSetPrefix(target);
         BeginFindNextUserEntry(skippingSavedKey: false);
         RunForward();
+        if (!_valid) _hasPrefix = false;
     }
 
     public void SeekForPrev(ReadOnlySpan<byte> target)
@@ -564,7 +617,9 @@ public sealed class DbIter : IDisposable
         _forward = false;
         _iter.SeekForPrev(_seekKey.WrittenSpan);
         if (!_iter.Valid) return;
+        MaybeSetPrefix(target);
         PrevInternal();
+        if (!_valid) _hasPrefix = false;
     }
 
     public void SeekToFirst()
@@ -574,6 +629,8 @@ public sealed class DbIter : IDisposable
             Seek(_lower.Span);
             return;
         }
+        // Don't use iter_::Seek() if we set a prefix extractor because prefix seek will be used.
+        if (!_expectTotalOrderInnerIter) _maxSkip = ulong.MaxValue;
         ResetSeekState();
         _forward = true;
         _iter.SeekToFirst();
@@ -581,6 +638,7 @@ public sealed class DbIter : IDisposable
         _savedKey.SetUserKey(DbFormat.ExtractUserKey(_iter.Key));
         BeginFindNextUserEntry(skippingSavedKey: false);
         RunForward();
+        if (_valid) MaybeSetPrefix(_savedKey.UserKey);
     }
 
     public void SeekToLast()
@@ -591,10 +649,13 @@ public sealed class DbIter : IDisposable
             SeekForPrev(_upper.Span);
             return;
         }
+        // Don't use iter_::Seek() if we set a prefix extractor because prefix seek will be used.
+        if (!_expectTotalOrderInnerIter) _maxSkip = ulong.MaxValue;
         ResetSeekState();
         _forward = false;
         _iter.SeekToLast();
         PrevInternal();
+        if (_valid) MaybeSetPrefix(_savedKey.UserKey);
     }
 
     /// <summary>Port of SetSavedKeyToSeekTarget (clamped to the lower bound).</summary>
@@ -627,9 +688,14 @@ public sealed class DbIter : IDisposable
         SetSavedKeyToSeekTarget(target.Span);
         _forward = true;
         ValueTask t = _iter.SeekAsync(_seekKey.WrittenMemory, cancellationToken);
-        if (!t.IsCompletedSuccessfully) return AfterSeekSlowAsync(t, false, cancellationToken);
+        if (!t.IsCompletedSuccessfully)
+        {
+            MaybeSetPrefix(target.Span);
+            return AfterSeekSlowAsync(t, false, cancellationToken);
+        }
         t.GetAwaiter().GetResult();
         if (!_iter.Valid) return ValueTask.CompletedTask;
+        MaybeSetPrefix(target.Span);
         BeginFindNextUserEntry(skippingSavedKey: false);
         return RunForwardAsync(cancellationToken);
     }
@@ -638,6 +704,13 @@ public sealed class DbIter : IDisposable
     public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default)
     {
         if (_hasLower) return SeekAsync(_lower, cancellationToken);
+        if (_prefixSameAsStart)
+        {
+            // The prefix is taken from the first key found (rare combination; use the sync path).
+            SeekToFirst();
+            return ValueTask.CompletedTask;
+        }
+        if (!_expectTotalOrderInnerIter) _maxSkip = ulong.MaxValue;
         ResetSeekState();
         _forward = true;
         ValueTask t = _iter.SeekToFirstAsync(cancellationToken);
@@ -725,9 +798,9 @@ public sealed class DbIter : IDisposable
     /// <summary>Port of DBIter::ReverseToForward (total-order inner iterator).</summary>
     private void ReverseToForward()
     {
-        // When moving backwards, iter_ is positioned on the _previous_ key, which may not exist. If that's the case,
-        // seek iter_ to current key.
-        if (!_iter.Valid)
+        // When moving backwards, iter_ is positioned on the _previous_ key, which may not exist or may have different
+        // prefix than the current key(). If that's the case, seek iter_ to current key.
+        if (!_expectTotalOrderInnerIter || !_iter.Valid)
         {
             SetSeekKey(_savedKey.UserKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
             _iter.Seek(_seekKey.WrittenSpan);
@@ -747,11 +820,19 @@ public sealed class DbIter : IDisposable
     {
         // When current_entry_is_merged_ is true, iter_ may be positioned on the next key, which may not exist. If
         // that's the case, seek to saved_key_ (kMaxSequenceNumber + kValueTypeForSeek: strictly before its entries).
-        if (_currentEntryIsMerged && !_iter.Valid)
+        if (_currentEntryIsMerged && (!_expectTotalOrderInnerIter || !_iter.Valid))
         {
             SetSeekKey(_savedKey.UserKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
-            _iter.Seek(_seekKey.WrittenSpan);
-            if (!_iter.Valid) _iter.SeekToLast();
+            if (!_expectTotalOrderInnerIter)
+            {
+                _iter.SeekForPrev(_seekKey.WrittenSpan);
+            }
+            else
+            {
+                // Some iterators may not support SeekForPrev(), so we avoid using it when prefix seek mode is disabled.
+                _iter.Seek(_seekKey.WrittenSpan);
+                if (!_iter.Valid) _iter.SeekToLast();
+            }
         }
         _forward = false;
         FindUserKeyBeforeSavedKey();
@@ -765,6 +846,12 @@ public sealed class DbIter : IDisposable
         while (_iter.Valid)
         {
             _savedKey.SetUserKey(DbFormat.ExtractUserKey(_iter.Key));
+            if (_hasPrefix && !PrefixCheck(_savedKey.UserKey))
+            {
+                // prefix_same_as_start: we've iterated past the seek prefix.
+                _valid = false;
+                return;
+            }
             if (_hasLower && _icmp.CompareUserKey(_savedKey.UserKey, _lower.Span) < 0)
             {
                 // We've iterated earlier than the user-specified lower bound.
@@ -982,12 +1069,20 @@ public sealed class DbIter : IDisposable
 
         // Make sure we leave iter_ in a good state. If it's valid and we don't care about prefixes, that's already
         // good enough. Otherwise it needs to be seeked to the current key.
-        if (!_iter.Valid)
+        if (!_expectTotalOrderInnerIter || !_iter.Valid)
         {
             SetSeekKey(_savedKey.UserKey, _sequence, DbFormat.ValueTypeForSeek);
-            _iter.Seek(_seekKey.WrittenSpan);
-            if (!_iter.Valid) _iter.SeekToLast();
+            if (!_expectTotalOrderInnerIter)
+            {
+                _iter.SeekForPrev(_seekKey.WrittenSpan);
+            }
+            else
+            {
+                _iter.Seek(_seekKey.WrittenSpan);
+                if (!_iter.Valid) _iter.SeekToLast();
+            }
         }
+
         _valid = true;
     }
 
@@ -1030,6 +1125,7 @@ public sealed class DbIter : IDisposable
         _savedKey.Dispose();
         _seekKey.Dispose();
         _pinned.Dispose();
+        _prefix.Dispose();
         _mergeResult.Dispose();
         _operands.Dispose();
     }

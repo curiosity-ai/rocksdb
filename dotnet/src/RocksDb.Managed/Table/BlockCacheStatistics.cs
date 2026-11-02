@@ -27,6 +27,16 @@ public enum BlockCacheCounter
     AddFailure = 9,
     /// <summary>BLOCK_CACHE_BYTES_WRITE: charge of blocks inserted.</summary>
     BytesInserted = 10,
+    /// <summary>BLOOM_FILTER_USEFUL: point lookups the whole-key filter answered negatively (no data block read).</summary>
+    BloomFilterUseful = 11,
+    /// <summary>BLOOM_FILTER_FULL_POSITIVE: point lookups the whole-key filter answered positively.</summary>
+    BloomFilterFullPositive = 12,
+    /// <summary>BLOOM_FILTER_PREFIX_CHECKED: point lookups checked against the prefix filter (whole_key_filtering off).</summary>
+    BloomFilterPrefixChecked = 13,
+    /// <summary>BLOOM_FILTER_PREFIX_USEFUL: point lookups and seeks the prefix filter answered negatively.</summary>
+    BloomFilterPrefixUseful = 14,
+    /// <summary>NON_LAST_LEVEL_SEEK_FILTERED + LAST_LEVEL_SEEK_FILTERED: table seeks skipped by the prefix filter.</summary>
+    SeekFiltered = 15,
 }
 
 /// <summary>

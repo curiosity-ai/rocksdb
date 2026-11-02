@@ -45,6 +45,17 @@ public sealed record TableReaderOptions
     /// a base key unique for the process lifetime is used.
     /// </summary>
     public string? DbSessionId { get; init; }
+    /// <summary>
+    /// pin_top_level_index_and_filter: with <see cref="CacheIndexAndFilterBlocks"/>, the top-level block of a partitioned
+    /// index or filter is inserted into the block cache and also pinned by the reader for its lifetime. Default true.
+    /// </summary>
+    public bool PinTopLevelIndexAndFilter { get; init; } = true;
+    /// <summary>
+    /// The column family's current prefix extractor (MutableCFOptions::prefix_extractor). Point lookups use a table's
+    /// prefix filter (whole_key_filtering off) only when this extractor has the id recorded in the table; prefix seeks
+    /// use the table's own extractor (recreated from its id when it differs, like BlockBasedTable::Open).
+    /// </summary>
+    public SliceTransform? PrefixExtractor { get; init; }
     /// <summary>Current file number of the table (see <see cref="DbSessionId"/>); 0 when unknown.</summary>
     public ulong FileNumber { get; init; }
     /// <summary>Optional block cache hit/miss counters (may be shared by many readers); null disables recording.</summary>
@@ -67,6 +78,32 @@ public readonly record struct TableGetResult(bool Found, ulong Sequence, EntryTy
 /// </summary>
 public delegate bool TableEntryVisitor<TState>(ref TState state, ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value)
     where TState : allows ref struct;
+
+/// <summary>
+/// Per-iterator prefix seek settings derived from <see cref="ReadOptions"/> and the column family's prefix extractor
+/// (the check_filter / need_upper_bound_check / prefix_extractor arguments of BlockBasedTable::NewIterator).
+/// </summary>
+public readonly struct TableIteratorPrefixOptions
+{
+    /// <summary>The column family's current prefix extractor.</summary>
+    public SliceTransform? PrefixExtractor { get; init; }
+    /// <summary>check_filter: consult the prefix filter on Seek / SeekForPrev.</summary>
+    public bool CheckFilter { get; init; }
+    /// <summary>need_upper_bound_check: only filter when [seek key, upper bound) is within one prefix (auto_prefix_mode, changed extractor).</summary>
+    public bool NeedUpperBoundCheck { get; init; }
+    /// <summary>ReadOptions::iterate_upper_bound.</summary>
+    public ReadOnlyMemory<byte>? UpperBound { get; init; }
+}
+
+/// <summary>Kind of filter block in a table.</summary>
+internal enum FilterKind : byte
+{
+    None,
+    /// <summary>"fullfilter.&lt;name&gt;": one filter for the whole table.</summary>
+    Full,
+    /// <summary>"partitionedfilter.&lt;name&gt;": a top-level index over filter partitions.</summary>
+    Partitioned,
+}
 
 /// <summary>Kind of block requested from the cache (BlockType subset): selects the priority and statistics counters.</summary>
 internal enum BlockKind : byte
@@ -153,10 +190,16 @@ public sealed class BlockBasedTableReader : IDisposable
     private readonly Footer _footer;
     private readonly Block? _indexBlock;          // null when the index lives in the block cache
     private readonly Block? _rangeDelBlock;
-    private readonly IFilterBitsReader? _filter;  // pinned filter (null when absent or cached)
+    private readonly IFilterBitsReader? _filter;  // pinned full filter (null when absent or cached)
     private byte[]? _filterBuffer;
     private readonly bool _hasFilter;
-    private readonly BlockHandle _filterHandle;   // used when the filter lives in the block cache
+    private readonly FilterKind _filterKind;
+    private readonly BlockHandle _filterHandle;   // full filter / top-level partition index handle (for the block cache)
+    private readonly Block? _filterIndexBlock;    // pinned top-level filter partition index (null when absent or cached)
+    private readonly PinnedFilterPartitions? _pinnedFilterPartitions;
+    private readonly SliceTransform? _tablePrefixExtractor;
+    private readonly bool _prefixExtractorChanged; // relative to TableReaderOptions.PrefixExtractor
+    private readonly Compression.CompressionDictionary? _compressionDict; // "rocksdb.compression_dict" (data blocks)
     private readonly ulong _tableId;
     private readonly BlockCache? _cache;          // native block cache (null: none or legacy seam)
     private readonly IBlockCache? _legacyCache;   // legacy IBlockCache seam (null: none or native)
@@ -188,8 +231,15 @@ public sealed class BlockBasedTableReader : IDisposable
 
     private BlockBasedTableReader(IRandomAccessFile file, TableReaderOptions options, Footer footer, Dictionary<string, BlockHandle> metaBlocks,
         TableProperties props, BlockHandle indexHandle, Block? indexBlock, Block? rangeDel, IFilterBitsReader? filter, byte[]? filterBuffer,
-        bool hasFilter, BlockHandle filterHandle, in OffsetableCacheKey baseCacheKey, long fileSize)
+        FilterKind filterKind, BlockHandle filterHandle, Block? filterIndexBlock, PinnedFilterPartitions? pinnedFilterPartitions,
+        Compression.CompressionDictionary? compressionDict, in OffsetableCacheKey baseCacheKey, long fileSize)
     {
+        _compressionDict = compressionDict;
+        bool hasFilter = filterKind != FilterKind.None;
+        _filterKind = filterKind;
+        _filterIndexBlock = filterIndexBlock;
+        _pinnedFilterPartitions = pinnedFilterPartitions;
+        _tablePrefixExtractor = ResolveTablePrefixExtractor(props, options.PrefixExtractor, out _prefixExtractorChanged);
         IndexHandle = indexHandle;
         _file = file;
         _options = options;
@@ -211,16 +261,63 @@ public sealed class BlockBasedTableReader : IDisposable
         _metaPriority = MetaPriority(options);
         _stats = options.Statistics;
 
-        IndexType = props.UserCollectedProperties.TryGetValue(TablePropertiesNames.BlockBasedIndexType, out byte[]? it) && it.Length >= 4
-            ? (IndexType)Coding.DecodeFixed32(it)
-            : IndexType.BinarySearch;
-        if (IndexType > IndexType.BinarySearchWithFirstKey) ThrowHelper.Corruption("unknown index type " + (uint)IndexType);
+        IndexType = ReadIndexType(props);
         IndexKeyIncludesSeq = props.IndexKeyIsUserKey == 0;
         IndexValueIsFull = props.IndexValueIsDeltaEncoded == 0;
         WholeKeyFiltering = !props.UserCollectedProperties.TryGetValue(TablePropertiesNames.BlockBasedWholeKeyFiltering, out byte[]? wkf)
             || wkf.AsSpan().SequenceEqual("1"u8);
         GlobalSequenceNumber = ResolveGlobalSeqno(props, options.LargestSeqno);
     }
+
+    private static IndexType ReadIndexType(TableProperties props)
+    {
+        IndexType t = props.UserCollectedProperties.TryGetValue(TablePropertiesNames.BlockBasedIndexType, out byte[]? it) && it.Length >= 4
+            ? (IndexType)Coding.DecodeFixed32(it)
+            : IndexType.BinarySearch;
+        if (t > IndexType.BinarySearchWithFirstKey) ThrowHelper.Corruption("unknown index type " + (uint)t);
+        return t;
+    }
+
+    /// <summary>
+    /// Port of the prefix extractor setup in BlockBasedTable::Open: the configured extractor when its id matches the
+    /// table's "rocksdb.prefix.extractor.name" (PrefixExtractorChangedHelper), else the built-in extractor recreated from
+    /// the recorded id (null when the table has none or it is not a built-in).
+    /// </summary>
+    private static SliceTransform? ResolveTablePrefixExtractor(TableProperties props, SliceTransform? configured, out bool changed)
+    {
+        string name = props.PrefixExtractorName;
+        if (configured is not null && name.Length > 0 && name == configured.AsString())
+        {
+            // Establish fast path for unchanged prefix_extractor
+            changed = false;
+            return configured;
+        }
+        changed = true;
+        return name.Length > 0 ? SliceTransform.CreateFromString(name) : null;
+    }
+
+    /// <summary>
+    /// Port of BlockBasedTable::PrefixExtractorChanged: true unless <paramref name="prefixExtractor"/> has the id the
+    /// table was built with.
+    /// </summary>
+    public bool PrefixExtractorChanged(SliceTransform? prefixExtractor)
+    {
+        if (prefixExtractor is null) return true;
+        if (ReferenceEquals(prefixExtractor, _options.PrefixExtractor)) return _prefixExtractorChanged;
+        if (ReferenceEquals(prefixExtractor, _tablePrefixExtractor)) return false;
+        string name = Properties.PrefixExtractorName;
+        return name.Length == 0 || name != prefixExtractor.AsString();
+    }
+
+    /// <summary>The prefix extractor the table was built with (null when none or not recreatable).</summary>
+    public SliceTransform? TablePrefixExtractor => _tablePrefixExtractor;
+
+    /// <summary>The dictionary data blocks were compressed with (UncompressionDict), or null.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private Compression.CompressionDictionary? DictFor(BlockKind kind) => kind == BlockKind.Data ? _compressionDict : null;
+
+    /// <summary>The table's compression dictionary ("rocksdb.compression_dict"), empty when none.</summary>
+    public ReadOnlySpan<byte> CompressionDictionary => _compressionDict is null ? default : _compressionDict.Data;
 
     // ---------------------------------------------------------------------------------------------
     // Open
@@ -321,13 +418,20 @@ public sealed class BlockBasedTableReader : IDisposable
         Block? indexBlock = BlockFetcher.ReadBlock(file, footer, indexHandle, verify);
         Block? rangeDel = null;
         byte[]? filterBuf = null;
+        Block? filterIndex = null;
+        PinnedFilterPartitions? pinnedParts = null;
+        Compression.CompressionDictionary? compressionDict = null;
+        // pin_top_level_index_and_filter (partitioned index / filter only; unpartitioned ones are not pinned when cached).
+        bool pinTopLevel = options.PinTopLevelIndexAndFilter;
         try
         {
             if (metaCache is not null)
             {
-                // PrefetchIndexAndFilterBlocks with prefetch_index_and_filter_in_cache: warm the cache, don't pin.
+                // PrefetchIndexAndFilterBlocks with prefetch_index_and_filter_in_cache: warm the cache; pin only the top
+                // level of a partitioned index with pin_top_level_index_and_filter.
                 Block b = indexBlock;
-                indexBlock = null;
+                if (pinTopLevel && ReadIndexType(props) == IndexType.TwoLevelIndexSearch) b.AddRef();
+                else indexBlock = null;
                 if (metaCache.Insert(baseCacheKey.WithOffsetForMinSizeRecord(indexHandle.Offset), CacheValue.FromObject(b), b.Charge, metaPriority))
                     RecordAdd(options.Statistics, BlockKind.Index, b.Charge);
             }
@@ -335,16 +439,45 @@ public sealed class BlockBasedTableReader : IDisposable
             if (metaBlocks.TryGetValue(BlockBasedTableConstants.RangeDelBlockName, out BlockHandle rdHandle))
                 rangeDel = BlockFetcher.ReadBlock(file, footer, rdHandle, verify);
 
-            // Port of the filter lookup in BlockBasedTable::PrefetchIndexAndFilterBlocks: the full filter is keyed by the
-            // configured policy's CompatibilityName (no policy -> filters ignored). Partitioned filters are not read yet,
-            // which is safe (no filtering).
+            // Port of the compression dictionary setup (ReadCompressionDictBlock / UncompressionDictReader): pinned by
+            // the reader for its lifetime and used to decompress data blocks.
+            if (metaBlocks.TryGetValue(BlockBasedTableConstants.CompressionDictBlockName, out BlockHandle dictHandle) && dictHandle.Size > 0)
+            {
+                byte[] raw = BlockFetcher.ReadRawPayload(file, footer, dictHandle, verify, out int dictLength);
+                try { compressionDict = new Compression.CompressionDictionary(raw.AsSpan(0, dictLength).ToArray()); }
+                finally { ArrayPool<byte>.Shared.Return(raw); }
+            }
+
+            // Port of the filter lookup in BlockBasedTable::PrefetchIndexAndFilterBlocks: the filter is keyed by the
+            // configured policy's CompatibilityName (no policy -> filters ignored), as a full or a partitioned filter.
             IFilterBitsReader? filter = null;
-            bool hasFilter = false;
+            FilterKind filterKind = FilterKind.None;
             BlockHandle fh = default;
-            if (options.FilterPolicy is { } policy
+            if (options.FilterPolicy is { } ppolicy
+                && metaBlocks.TryGetValue(BlockBasedTableConstants.PartitionedFilterBlockPrefix + ppolicy.CompatibilityName, out fh)
+                && fh.Size > 0)
+            {
+                filterKind = FilterKind.Partitioned;
+                Block top = BlockFetcher.ReadBlock(file, footer, fh, verify);
+                filterIndex = top;
+                if (!options.CacheIndexAndFilterBlocks || metaCache is null)
+                {
+                    // Partition pinning (MetadataCacheOptions kFallback without cache_index_and_filter_blocks):
+                    // PartitionedFilterBlockReader::CacheDependencies loads all partitions up front and keeps them.
+                    pinnedParts = PinnedFilterPartitions.Load(file, footer, verify, ppolicy, top, props, options.Comparator);
+                }
+                if (metaCache is not null)
+                {
+                    if (pinTopLevel) top.AddRef();
+                    else filterIndex = null;
+                    if (metaCache.Insert(baseCacheKey.WithOffsetForMinSizeRecord(fh.Offset), CacheValue.FromObject(top), top.Charge, metaPriority))
+                        RecordAdd(options.Statistics, BlockKind.Filter, top.Charge);
+                }
+            }
+            else if (options.FilterPolicy is { } policy
                 && metaBlocks.TryGetValue(BlockBasedTableConstants.FullFilterBlockPrefix + policy.CompatibilityName, out fh))
             {
-                hasFilter = true;
+                filterKind = FilterKind.Full;
                 filterBuf = BlockFetcher.ReadRawPayload(file, footer, fh, verify, out int flen);
                 filter = CreateFilterReader(policy, filterBuf, flen);
                 if (metaCache is not null)
@@ -357,19 +490,22 @@ public sealed class BlockBasedTableReader : IDisposable
                 }
             }
             return new BlockBasedTableReader(ownedFile ?? file, options, footer, metaBlocks, props, indexHandle, indexBlock, rangeDel, filter, filterBuf,
-                hasFilter, fh, baseCacheKey, fileSize);
+                filterKind, fh, filterIndex, pinnedParts, compressionDict, baseCacheKey, fileSize);
         }
         catch
         {
             indexBlock?.Release();
             rangeDel?.Release();
+            filterIndex?.Release();
+            pinnedParts?.Dispose();
+            compressionDict?.Dispose();
             if (filterBuf is not null) ArrayPool<byte>.Shared.Return(filterBuf);
             throw;
         }
     }
 
     // Any built-in policy reads any built-in filter format (BuiltinFilterPolicy::GetBuiltinFilterBitsReader).
-    private static IFilterBitsReader CreateFilterReader(FilterPolicy policy, byte[] buffer, int length) =>
+    internal static IFilterBitsReader CreateFilterReader(FilterPolicy policy, byte[] buffer, int length) =>
         policy.CompatibilityName == BloomLikeFilterPolicy.BuiltinFilterMetadataName
             ? BuiltinFilterBitsReader.Create(buffer.AsMemory(0, length))
             : policy.CreateReader(buffer.AsMemory(0, length));
@@ -466,14 +602,14 @@ public sealed class BlockBasedTableReader : IDisposable
     private BlockRef ReadAndInsert(BlockCache cache, in CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
         _stats?.Record(MissCounter(kind));
-        Block b = BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums);
+        Block b = BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind));
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
 
     private BlockRef GetBlockRefLegacy(BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
         IBlockCache? legacy = _legacyCache;
-        if (legacy is null) return BlockRef.FromOwned(BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums));
+        if (legacy is null) return BlockRef.FromOwned(BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind)));
         var key = new BlockCacheKey(_tableId, handle.Offset);
         if (legacy.TryGet(key, out Block? b))
         {
@@ -481,7 +617,7 @@ public sealed class BlockBasedTableReader : IDisposable
             return BlockRef.FromOwned(b);
         }
         _stats?.Record(MissCounter(kind));
-        b = BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums);
+        b = BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind));
         if ((flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(key, b);
         return BlockRef.FromOwned(b);
     }
@@ -525,20 +661,20 @@ public sealed class BlockBasedTableReader : IDisposable
             }
             _stats?.Record(MissCounter(kind));
         }
-        return ReadAndInsertLegacyAsync(handle, flags, ct);
+        return ReadAndInsertLegacyAsync(handle, kind, flags, ct);
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<BlockRef> ReadAndInsertAsync(BlockCache cache, CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags, CancellationToken ct)
     {
-        Block b = await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, ct).ConfigureAwait(false);
+        Block b = await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    private async ValueTask<BlockRef> ReadAndInsertLegacyAsync(BlockHandle handle, TableReadFlags flags, CancellationToken ct)
+    private async ValueTask<BlockRef> ReadAndInsertLegacyAsync(BlockHandle handle, BlockKind kind, TableReadFlags flags, CancellationToken ct)
     {
-        Block b = await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, ct).ConfigureAwait(false);
+        Block b = await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false);
         if (_legacyCache is { } legacy && (flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(new BlockCacheKey(_tableId, handle.Offset), b);
         return BlockRef.FromOwned(b);
     }
@@ -579,6 +715,11 @@ public sealed class BlockBasedTableReader : IDisposable
         it.InitializeIndex(block, _icmp, IndexKeyIncludesSeq, IndexValueIsFull, IndexHasFirstKey,
             BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(_footer.FormatVersion), GlobalSequenceNumber);
 
+    /// <summary>Iterator over the top-level filter partition index (NewFilterPartitionIndexIterator: no global seqno, no first key).</summary>
+    private void InitFilterIndexIter(BlockIter it, Block block) =>
+        it.InitializeIndex(block, _icmp, IndexKeyIncludesSeq, IndexValueIsFull, false,
+            BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(_footer.FormatVersion), BlockIter.DisableGlobalSequenceNumber);
+
     /// <summary>The pinned top-level index block (not available when <see cref="IndexAndFilterInCache"/>).</summary>
     internal Block IndexBlock => _indexBlock ?? throw new InvalidOperationException("The index block is held by the block cache (CacheIndexAndFilterBlocks).");
     internal bool IsPartitionedIndex => IndexType == IndexType.TwoLevelIndexSearch;
@@ -587,34 +728,178 @@ public sealed class BlockBasedTableReader : IDisposable
     // Point lookups
 
     /// <summary>
-    /// Whether the filter (if any) says <paramref name="userKey"/> may be present. Port of
-    /// BlockBasedTable::FullFilterKeyMayMatch (whole key filtering only).
+    /// Whether the filter (if any) says <paramref name="userKey"/> may be present (looked up as of the latest sequence
+    /// number). See <see cref="InternalKeyMayMatch(ReadOnlySpan{byte}, TableReadFlags)"/>.
     /// </summary>
     public bool KeyMayMatch(ReadOnlySpan<byte> userKey) => KeyMayMatch(userKey, TableReadFlags.None);
 
     /// <inheritdoc cref="KeyMayMatch(ReadOnlySpan{byte})"/>
+    [SkipLocalsInit]
     public bool KeyMayMatch(ReadOnlySpan<byte> userKey, TableReadFlags flags)
     {
-        if (!WholeKeyFiltering) return true;
-        IFilterBitsReader? f = _filter;
-        if (f is not null) return f.MayMatch(userKey);
-        return !_hasFilter || CachedFilterMayMatch(userKey, flags);
+        if (_filterKind == FilterKind.None) return true;
+        int n = userKey.Length + DbFormat.InternalKeyFooterSize;
+        byte[]? rented = null;
+        Span<byte> ikey = n <= 256 ? stackalloc byte[256] : (rented = ArrayPool<byte>.Shared.Rent(n));
+        try
+        {
+            DbFormat.AppendInternalKey(ikey, userKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
+            return InternalKeyMayMatch(ikey[..n], flags);
+        }
+        finally
+        {
+            if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
-    /// <summary>Filter lookup through the block cache (cache_index_and_filter_blocks). A filter miss is read synchronously.</summary>
-    private bool CachedFilterMayMatch(ReadOnlySpan<byte> userKey, TableReadFlags flags)
+    /// <summary>
+    /// Port of BlockBasedTable::FullFilterKeyMayMatch: with whole_key_filtering, whether the user key of
+    /// <paramref name="internalKey"/> may be present; otherwise, when the configured prefix extractor matches the
+    /// table's, whether its prefix may be present. The internal key selects the partition of a partitioned filter.
+    /// </summary>
+    public bool InternalKeyMayMatch(ReadOnlySpan<byte> internalKey, TableReadFlags flags)
     {
-        BlockCache cache = _cache!;
-        CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(_filterHandle.Offset);
-        if (cache.TryLookup(key, out CachedBlock h))
+        if (_filterKind == FilterKind.None) return true;
+        ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(internalKey);
+        if (WholeKeyFiltering)
         {
-            _stats?.Record(BlockCacheCounter.FilterHit);
-            bool r = Unsafe.As<IFilterBitsReader>(h.Value)!.MayMatch(userKey);
-            h.Dispose();
-            return r;
+            bool mayMatch = FilterMayMatch(userKey, internalKey, flags);
+            _stats?.Record(mayMatch ? BlockCacheCounter.BloomFilterFullPositive : BlockCacheCounter.BloomFilterUseful);
+            return mayMatch;
+        }
+        SliceTransform? pe = _options.PrefixExtractor;
+        if (!_prefixExtractorChanged && pe!.InDomain(userKey))
+        {
+            // FIXME (upstream): there should be no reason for Get() to depend on current prefix_extractor at all.
+            bool mayMatch = FilterMayMatch(pe.Transform(userKey), internalKey, flags);
+            if (_stats is { } s)
+            {
+                s.Record(BlockCacheCounter.BloomFilterPrefixChecked);
+                if (!mayMatch) s.Record(BlockCacheCounter.BloomFilterPrefixUseful);
+            }
+            return mayMatch;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Port of BlockBasedTable::PrefixRangeMayMatch + FilterBlockReaderCommon::RangeMayExist / IsFilterCompatible:
+    /// whether keys with the prefix of the seek key <paramref name="internalKey"/> may exist in the table. With
+    /// <see cref="TableIteratorPrefixOptions.NeedUpperBoundCheck"/>, the filter is only consulted when every key in
+    /// [seek key, upper bound) has the seek key's prefix.
+    /// </summary>
+    internal bool PrefixRangeMayMatch(ReadOnlySpan<byte> internalKey, in TableIteratorPrefixOptions o, TableReadFlags flags)
+    {
+        if (_filterKind == FilterKind.None) return true;
+        SliceTransform? prefixExtractor;
+        if (_tablePrefixExtractor is null)
+        {
+            if (o.NeedUpperBoundCheck) return true;
+            prefixExtractor = o.PrefixExtractor;
+        }
+        else
+        {
+            prefixExtractor = _tablePrefixExtractor;
+        }
+        ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(internalKey);
+        if (prefixExtractor is null || !prefixExtractor.InDomain(userKey)) return true;
+        ReadOnlySpan<byte> prefix = prefixExtractor.Transform(userKey);
+        if (o.NeedUpperBoundCheck && !IsFilterCompatible(o.UpperBound, prefix)) return true;
+        bool mayMatch = FilterMayMatch(prefix, internalKey, flags);
+        if (!mayMatch) _stats?.Record(BlockCacheCounter.BloomFilterPrefixUseful);
+        return mayMatch;
+    }
+
+    /// <summary>
+    /// Port of FilterBlockReaderCommon::IsFilterCompatible: the table's prefix filter can serve a seek whose prefix
+    /// differs from the configured one if [seek key, upper bound) all share <paramref name="prefix"/>.
+    /// </summary>
+    private bool IsFilterCompatible(ReadOnlyMemory<byte>? iterateUpperBound, ReadOnlySpan<byte> prefix)
+    {
+        SliceTransform? pe = _tablePrefixExtractor;
+        if (iterateUpperBound is not ReadOnlyMemory<byte> ubm || pe is null) return false;
+        ReadOnlySpan<byte> upperBound = ubm.Span;
+        if (!pe.InDomain(upperBound)) return false;
+        ReadOnlySpan<byte> upperBoundXform = pe.Transform(upperBound);
+        Comparator ucmp = _icmp.UserComparator;
+        // first check if user_key and upper_bound all share the same prefix
+        if (ucmp.Compare(prefix, upperBoundXform) != 0)
+        {
+            // second check if user_key's prefix is the immediate predecessor of upper_bound and have the same length. If
+            // so, we know for sure all keys in the range [user_key, upper_bound) share the same prefix. Also need to make
+            // sure upper_bound are full length to ensure correctness
+            if (!pe.FullLengthEnabled(out int fullLength) || upperBound.Length != fullLength || !ucmp.IsSameLengthImmediateSuccessor(prefix, upperBound))
+                return false;
+        }
+        return true;
+    }
+
+    internal void RecordSeekFiltered() => _stats?.Record(BlockCacheCounter.SeekFiltered);
+
+    /// <summary>MayMatch of the full filter, or of the partition of a partitioned filter covering <paramref name="internalKey"/>.</summary>
+    private bool FilterMayMatch(ReadOnlySpan<byte> entry, ReadOnlySpan<byte> internalKey, TableReadFlags flags)
+    {
+        if (_filterKind == FilterKind.Full)
+        {
+            IFilterBitsReader? f = _filter;
+            return f is not null ? f.MayMatch(entry) : FilterBlockMayMatch(_filterHandle, entry, flags);
+        }
+        return PartitionedFilterMayMatch(entry, internalKey, flags);
+    }
+
+    /// <summary>
+    /// Port of PartitionedFilterBlockReader::MayMatch: seeks the top-level partition index to the partition covering
+    /// <paramref name="internalKey"/> (the last one if the key is past all partitions) and queries it.
+    /// </summary>
+    private bool PartitionedFilterMayMatch(ReadOnlySpan<byte> entry, ReadOnlySpan<byte> internalKey, TableReadFlags flags)
+    {
+        BlockRef top = _filterIndexBlock is not null ? BlockRef.FromPinned(_filterIndexBlock) : GetBlockRef(_filterHandle, BlockKind.Filter, flags);
+        BlockHandle partition;
+        BlockIter it = IterPool.Rent();
+        try
+        {
+            InitFilterIndexIter(it, top.Block!);
+            it.Seek(internalKey);
+            if (!it.Valid)
+            {
+                // entry is larger than all the keys. However its prefix might still be present in the last partition.
+                it.SeekToLast();
+            }
+            if (!it.Valid) return true;
+            partition = it.BlockHandle;
+        }
+        finally
+        {
+            it.Clear();
+            IterPool.Return(it);
+            top.Release();
+        }
+        if (partition.Size == 0) return false; // key is out of range
+        if (_pinnedFilterPartitions is { } pinned && pinned.TryGet(partition.Offset, out IFilterBitsReader? r)) return r.MayMatch(entry);
+        return FilterBlockMayMatch(partition, entry, flags);
+    }
+
+    /// <summary>
+    /// Filter lookup through the block cache (cache_index_and_filter_blocks, filter partitions). A miss is read
+    /// synchronously; without a block cache the filter is read and discarded.
+    /// </summary>
+    private bool FilterBlockMayMatch(BlockHandle handle, ReadOnlySpan<byte> entry, TableReadFlags flags)
+    {
+        BlockCache? cache = _cache;
+        CacheKey key = default;
+        if (cache is not null)
+        {
+            key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
+            if (cache.TryLookup(key, out CachedBlock h))
+            {
+                _stats?.Record(BlockCacheCounter.FilterHit);
+                bool r = Unsafe.As<IFilterBitsReader>(h.Value)!.MayMatch(entry);
+                h.Dispose();
+                return r;
+            }
         }
         _stats?.Record(BlockCacheCounter.FilterMiss);
-        byte[] buf = BlockFetcher.ReadRawPayload(_file, _footer, _filterHandle, _options.VerifyChecksums, out int len);
+        byte[] buf = BlockFetcher.ReadRawPayload(_file, _footer, handle, _options.VerifyChecksums, out int len);
         IFilterBitsReader reader;
         try
         {
@@ -625,8 +910,8 @@ public sealed class BlockBasedTableReader : IDisposable
             ArrayPool<byte>.Shared.Return(buf);
             throw;
         }
-        bool result = reader.MayMatch(userKey);
-        if ((flags & TableReadFlags.DontFillCache) != 0)
+        bool result = reader.MayMatch(entry);
+        if (cache is null || (flags & TableReadFlags.DontFillCache) != 0)
         {
             ArrayPool<byte>.Shared.Return(buf);
         }
@@ -650,7 +935,7 @@ public sealed class BlockBasedTableReader : IDisposable
         where TState : allows ref struct
     {
         ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(internalKey);
-        if (!KeyMayMatch(userKey, flags)) return;
+        if (!InternalKeyMayMatch(internalKey, flags)) return;
         IndexCursor idx = IndexCursor.Rent(this, flags);
         BlockIter data = IterPool.Rent();
         try
@@ -704,7 +989,7 @@ public sealed class BlockBasedTableReader : IDisposable
     /// <inheritdoc cref="Get(ReadOnlySpan{byte}, IBufferWriter{byte}?)"/>
     public TableGetResult Get(ReadOnlySpan<byte> internalKey, IBufferWriter<byte>? value, TableReadFlags flags)
     {
-        if (!KeyMayMatch(DbFormat.ExtractUserKey(internalKey), flags)) return default;
+        if (!InternalKeyMayMatch(internalKey, flags)) return default;
         IndexCursor idx = IndexCursor.Rent(this, flags);
         BlockIter data = IterPool.Rent();
         try
@@ -744,7 +1029,7 @@ public sealed class BlockBasedTableReader : IDisposable
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<TableGetResult> GetAsync(ReadOnlyMemory<byte> internalKey, IBufferWriter<byte>? value, TableReadFlags flags, CancellationToken cancellationToken)
     {
-        if (!KeyMayMatch(DbFormat.ExtractUserKey(internalKey.Span), flags)) return default;
+        if (!InternalKeyMayMatch(internalKey.Span, flags)) return default;
         IndexCursor idx = IndexCursor.Rent(this, flags);
         BlockIter data = IterPool.Rent();
         try
@@ -806,10 +1091,36 @@ public sealed class BlockBasedTableReader : IDisposable
     // Iterators
 
     /// <summary>Creates a two-level (index → data) iterator over the table's point entries. Dispose when done.</summary>
-    public BlockBasedTableIterator NewIterator() => new(this, TableReadFlags.None);
+    public BlockBasedTableIterator NewIterator() => new(this, TableReadFlags.None, default);
 
     /// <summary>Creates an iterator with explicit read flags (e.g. <see cref="TableReadFlags.DontFillCache"/> for scans/compaction).</summary>
-    public BlockBasedTableIterator NewIterator(TableReadFlags flags) => new(this, flags);
+    public BlockBasedTableIterator NewIterator(TableReadFlags flags) => new(this, flags, default);
+
+    /// <summary>
+    /// Creates an iterator that honours prefix seek (port of BlockBasedTable::NewIterator with a prefix extractor):
+    /// with <see cref="TableIteratorPrefixOptions.CheckFilter"/>, Seek/SeekForPrev to a key whose prefix the filter
+    /// excludes leaves the iterator invalid without reading data blocks.
+    /// </summary>
+    public BlockBasedTableIterator NewIterator(TableReadFlags flags, in TableIteratorPrefixOptions prefixOptions) => new(this, flags, prefixOptions);
+
+    /// <summary>
+    /// Prefix seek settings for an iterator over this table (port of the need_upper_bound_check / check_filter
+    /// computation in BlockBasedTable::NewIterator).
+    /// </summary>
+    public TableIteratorPrefixOptions GetPrefixOptions(ReadOptions? readOptions, SliceTransform? prefixExtractor)
+    {
+        if (prefixExtractor is null || _filterKind == FilterKind.None) return default;
+        bool autoPrefixMode = readOptions?.AutoPrefixMode == true;
+        bool totalOrderSeek = readOptions?.TotalOrderSeek == true;
+        bool prefixSameAsStart = readOptions?.PrefixSameAsStart == true;
+        return new TableIteratorPrefixOptions
+        {
+            PrefixExtractor = prefixExtractor,
+            NeedUpperBoundCheck = autoPrefixMode || PrefixExtractorChanged(prefixExtractor),
+            CheckFilter = !totalOrderSeek || autoPrefixMode || prefixSameAsStart,
+            UpperBound = readOptions?.IterateUpperBound,
+        };
+    }
 
     public bool HasRangeTombstones => _rangeDelBlock is not null;
 
@@ -834,6 +1145,11 @@ public sealed class BlockBasedTableReader : IDisposable
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _indexBlock?.Release();
         _rangeDelBlock?.Release();
+        _filterIndexBlock?.Release();
+        _pinnedFilterPartitions?.Dispose();
+        _compressionDict?.Dispose();
+
+
         byte[]? fb = Interlocked.Exchange(ref _filterBuffer, null);
         if (fb is not null) ArrayPool<byte>.Shared.Return(fb);
         _file.Dispose();

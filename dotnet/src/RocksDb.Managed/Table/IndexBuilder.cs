@@ -4,12 +4,49 @@ using RocksDb.Managed.Util;
 namespace RocksDb.Managed.Table;
 
 /// <summary>
+/// Index builder protocol used by <see cref="BlockBasedTableBuilder"/>. Port of IndexBuilder
+/// (table/block_based/index_builder.h): one index entry per data block, then <see cref="Finish"/> is called until it
+/// reports completion, each call returning one block to write (index partitions first, then the top-level index).
+/// </summary>
+internal abstract class IndexBuilder : IDisposable
+{
+    /// <summary>Called for every key added to a data block (before the block's index entry).</summary>
+    public abstract void OnKeyAdded(ReadOnlySpan<byte> internalKey);
+
+    /// <summary>Adds the index entry of a finished data block; returns the separator key used.</summary>
+    public abstract ReadOnlySpan<byte> AddIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
+        BlockHandle handle);
+
+    /// <summary>"separator_is_key_plus_seq": index keys are internal keys.</summary>
+    public abstract bool SeparatorIsKeyPlusSeq { get; }
+
+    /// <summary>Total (uncompressed) size of all index blocks written; valid after the final <see cref="Finish"/>.</summary>
+    public abstract int IndexSize { get; }
+
+    /// <summary>Number of index partitions (0 unless partitioned).</summary>
+    public virtual int NumPartitions => 0;
+
+    /// <summary>Size of the top-level index block of a partitioned index (0 unless partitioned).</summary>
+    public virtual int TopLevelIndexSize => 0;
+
+    /// <summary>
+    /// Port of IndexBuilder::Finish(IndexBlocks*, last_partition_block_handle): returns the next block to write in
+    /// <paramref name="contents"/> (valid until the next call). <paramref name="lastPartitionHandle"/> is the handle the
+    /// previously returned block was written at (ignored on the first call). Returns true when <paramref name="contents"/>
+    /// is the final (top-level) index block, false (Status::Incomplete upstream) when more blocks follow.
+    /// </summary>
+    public abstract bool Finish(BlockHandle lastPartitionHandle, out ReadOnlySpan<byte> contents);
+
+    public abstract void Dispose();
+}
+
+/// <summary>
 /// Binary-search index builder. Port of ShortenedIndexBuilder (table/block_based/index_builder.{h,cc}).
 /// Builds two index blocks in parallel — one keyed by internal-key separators and one by user-key separators —
 /// and emits the user-key one unless two adjacent data blocks share a boundary user key (or format_version &lt;= 2),
 /// in which case the separator must carry the sequence number ("index_key_is_user_key" = 0).
 /// </summary>
-internal sealed class ShortenedIndexBuilder : IDisposable
+internal sealed class ShortenedIndexBuilder : IndexBuilder
 {
     private readonly InternalKeyComparator _icmp;
     private readonly BlockBuilder _withSeq;
@@ -46,17 +83,31 @@ internal sealed class ShortenedIndexBuilder : IDisposable
     }
 
     /// <summary>"separator_is_key_plus_seq": index keys are internal keys.</summary>
-    public bool SeparatorIsKeyPlusSeq => _mustUseSeparatorWithSeq;
-    public int IndexSize => _indexSize;
+    public override bool SeparatorIsKeyPlusSeq => _mustUseSeparatorWithSeq;
+
+    /// <summary>must_use_separator_with_seq_ (forced by <see cref="PartitionedIndexBuilder"/> for all partitions).</summary>
+    internal bool MustUseSeparatorWithSeq
+    {
+        get => _mustUseSeparatorWithSeq;
+        set => _mustUseSeparatorWithSeq = value;
+    }
+
+    /// <summary>index_block_builder_ (internal-key separators).</summary>
+    internal BlockBuilder WithSeqBuilder => _withSeq;
+    /// <summary>index_block_builder_without_seq_ (user-key separators).</summary>
+    internal BlockBuilder WithoutSeqBuilder => _withoutSeq;
+
+    public override int IndexSize => _indexSize;
     public int CurrentSizeEstimate => _mustUseSeparatorWithSeq ? _withSeq.CurrentSizeEstimate : _withoutSeq.CurrentSizeEstimate;
 
-    public void OnKeyAdded(ReadOnlySpan<byte> internalKey)
+    public override void OnKeyAdded(ReadOnlySpan<byte> internalKey)
     {
         if (_includeFirstKey && _currentBlockFirstKey.WrittenCount == 0) _currentBlockFirstKey.Write(internalKey);
     }
 
     /// <summary>Port of ShortenedIndexBuilder::AddIndexEntry (GetSeparatorWithSeq + AddIndexEntryImpl).</summary>
-    public void AddIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext, BlockHandle handle)
+    public override ReadOnlySpan<byte> AddIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
+        BlockHandle handle)
     {
         ReadOnlySpan<byte> separator;
         if (hasNext)
@@ -96,6 +147,7 @@ internal sealed class ShortenedIndexBuilder : IDisposable
         if (!_mustUseSeparatorWithSeq)
             _withoutSeq.Add(DbFormat.ExtractUserKey(separator), _encoded.WrittenSpan, _deltaEncoded.WrittenSpan, false);
         _currentBlockFirstKey.Clear();
+        return separator;
     }
 
     /// <summary>Finishes and returns the index block contents (valid until disposal).</summary>
@@ -108,7 +160,13 @@ internal sealed class ShortenedIndexBuilder : IDisposable
         return contents;
     }
 
-    public void Dispose()
+    public override bool Finish(BlockHandle lastPartitionHandle, out ReadOnlySpan<byte> contents)
+    {
+        contents = Finish();
+        return true;
+    }
+
+    public override void Dispose()
     {
         _withSeq.Dispose();
         _withoutSeq.Dispose();
@@ -116,5 +174,241 @@ internal sealed class ShortenedIndexBuilder : IDisposable
         _encoded.Dispose();
         _deltaEncoded.Dispose();
         _currentBlockFirstKey.Dispose();
+    }
+}
+
+/// <summary>
+/// Two-level (kTwoLevelIndexSearch) index builder. Port of PartitionedIndexBuilder (table/block_based/index_builder.cc):
+/// index entries go to a sub-index (<see cref="ShortenedIndexBuilder"/>) that is cut into a new partition when the
+/// partition reaches metadata_block_size (FlushBlockBySizePolicy over the partition's index block) or when the
+/// coupled partitioned filter requests a cut. <see cref="Finish"/> returns the partitions one by one and finally the
+/// top-level index (partition separator -&gt; partition handle). Whether separators carry sequence numbers is decided
+/// for the whole table: if any partition needs them, all partitions and the top-level index use them.
+/// </summary>
+internal sealed class PartitionedIndexBuilder : IndexBuilder
+{
+    private sealed class Entry(ShortenedIndexBuilder value)
+    {
+        public readonly PooledBufferWriter Key = new(32);
+        public readonly ShortenedIndexBuilder Value = value;
+    }
+
+    private readonly InternalKeyComparator _icmp;
+    private readonly int _indexBlockRestartInterval;
+    private readonly int _formatVersion;
+    private readonly IndexShorteningMode _shortening;
+    private readonly bool _useValueDeltaEncoding;
+    private readonly bool _valueDeltaEscape;
+    private readonly bool _useCommonPrefixSub;
+    private readonly int _metadataBlockSize;
+    private readonly int _blockSizeDeviationLimit;
+    private readonly BlockBuilder _indexBlockBuilder;
+    private readonly BlockBuilder _indexBlockBuilderWithoutSeq;
+    private readonly List<Entry> _entries = new();
+    private int _front; // entries_.pop_front()
+    private readonly PooledBufferWriter _encoded = new(32);
+    private readonly PooledBufferWriter _deltaEncoded = new(32);
+    private ShortenedIndexBuilder? _subIndexBuilder;
+    private BlockBuilder _flushMonitor = null!;
+    private bool _mustUseSeparatorWithSeq;
+    private bool _partitionCutRequested;
+    private bool _cutFilterBlock;
+    private bool _finishingIndexes;
+    private BlockHandle _lastEncodedHandle;
+    private int _partitionCount;
+    private int _indexSize;
+    private int _topLevelIndexSize;
+
+    public PartitionedIndexBuilder(InternalKeyComparator icmp, int indexBlockRestartInterval, int formatVersion, bool useValueDeltaEncoding,
+        IndexShorteningMode shortening, int metadataBlockSize, int blockSizeDeviation, bool useCommonPrefixTop, bool useCommonPrefixSub)
+    {
+        _icmp = icmp;
+        _indexBlockRestartInterval = indexBlockRestartInterval;
+        _formatVersion = formatVersion;
+        _shortening = shortening;
+        _useValueDeltaEncoding = useValueDeltaEncoding;
+        _valueDeltaEscape = BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(formatVersion);
+        _useCommonPrefixSub = useCommonPrefixSub;
+        _metadataBlockSize = metadataBlockSize;
+        // FlushBlockBySizePolicy: block_size_deviation_limit_ = ((block_size * (100 - deviation)) + 99) / 100.
+        _blockSizeDeviationLimit = (int)(((long)metadataBlockSize * (100 - blockSizeDeviation) + 99) / 100);
+        _indexBlockBuilder = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75,
+            useCommonPrefixTop, isUserKey: false);
+        _indexBlockBuilderWithoutSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75,
+            useCommonPrefixTop, isUserKey: true);
+        // We start by false. After each partition we revise the value based on what the sub_index_builder has decided.
+        _mustUseSeparatorWithSeq = false;
+        MakeNewSubIndexBuilder();
+    }
+
+    public override bool SeparatorIsKeyPlusSeq => _mustUseSeparatorWithSeq;
+    public override int IndexSize => _indexSize;
+    public override int NumPartitions => _partitionCount;
+    public override int TopLevelIndexSize => _topLevelIndexSize;
+
+    private void MakeNewSubIndexBuilder()
+    {
+        var sub = new ShortenedIndexBuilder(_icmp, _indexBlockRestartInterval, _formatVersion, _useValueDeltaEncoding, _shortening,
+            includeFirstKey: false, _useCommonPrefixSub);
+        _subIndexBuilder = sub;
+        // Start next partition entry, where we will modify the key
+        _entries.Add(new Entry(sub));
+        if (_mustUseSeparatorWithSeq)
+        {
+            sub.MustUseSeparatorWithSeq = true;
+            _flushMonitor = sub.WithSeqBuilder;
+        }
+        else
+        {
+            _flushMonitor = sub.WithoutSeqBuilder;
+        }
+        _partitionCutRequested = false;
+    }
+
+    /// <summary>Called when the (coupled) filter partition builder requests cutting the next partition.</summary>
+    public void RequestPartitionCut() => _partitionCutRequested = true;
+
+    /// <summary>Port of ShouldCutFilterBlock: the policy is to align the partitions of index and filters.</summary>
+    public bool ShouldCutFilterBlock()
+    {
+        if (_cutFilterBlock)
+        {
+            _cutFilterBlock = false;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>GetPartitionKey: the separator of the newest index entry (key of the partition being built).</summary>
+    public ReadOnlySpan<byte> PartitionKey => _entries.Count > _front ? _entries[^1].Key.WrittenSpan : default;
+
+    /// <summary>Port of FlushBlockBySizePolicy::Update over the monitored partition index block.</summary>
+    private bool FlushPolicyUpdate(int keyLength, int valueLength)
+    {
+        BlockBuilder b = _flushMonitor;
+        // it makes no sense to flush when the data block is empty
+        if (b.IsEmpty) return false;
+        int currSize = b.CurrentSizeEstimate;
+        if (currSize >= _metadataBlockSize) return true;
+        if (_blockSizeDeviationLimit == 0) return false;
+        int after = b.EstimateSizeAfterKV(keyLength, valueLength);
+        return after > _metadataBlockSize && currSize > _blockSizeDeviationLimit;
+    }
+
+    private void MaybeFlush(ReadOnlySpan<byte> indexKey, BlockHandle indexValue)
+    {
+        bool doFlush = !_subIndexBuilder!.WithSeqBuilder.IsEmpty
+            && (_partitionCutRequested || FlushPolicyUpdate(indexKey.Length, EncodedLength(indexValue)));
+        if (doFlush)
+        {
+            _cutFilterBlock = true;
+            MakeNewSubIndexBuilder();
+        }
+    }
+
+    private static int EncodedLength(BlockHandle h) => Coding.VarintLength(h.Offset) + Coding.VarintLength(h.Size);
+
+    public override void OnKeyAdded(ReadOnlySpan<byte> internalKey) => _subIndexBuilder!.OnKeyAdded(internalKey);
+
+    /// <summary>Port of PartitionedIndexBuilder::AddIndexEntry.</summary>
+    public override ReadOnlySpan<byte> AddIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
+        BlockHandle handle)
+    {
+        // At least when running without parallel compression, maintain behavior of avoiding a last index partition
+        // with just one entry
+        if (hasNext) MaybeFlush(lastKeyInCurrentBlock, handle);
+
+        ShortenedIndexBuilder sub = _subIndexBuilder!;
+        ReadOnlySpan<byte> sep = sub.AddIndexEntry(lastKeyInCurrentBlock, firstKeyInNextBlock, hasNext, handle);
+        PooledBufferWriter key = _entries[^1].Key;
+        key.Clear();
+        key.Write(sep);
+
+        if (!_mustUseSeparatorWithSeq && sub.MustUseSeparatorWithSeq)
+        {
+            // We need to apply !must_use_separator_with_seq to all sub-index builders
+            _mustUseSeparatorWithSeq = true;
+            _flushMonitor = sub.WithSeqBuilder;
+        }
+        if (!hasNext)
+        {
+            // no more keys
+            _cutFilterBlock = true;
+        }
+        return key.WrittenSpan;
+    }
+
+    /// <summary>Port of PartitionedIndexBuilder::Finish.</summary>
+    public override bool Finish(BlockHandle lastPartitionHandle, out ReadOnlySpan<byte> contents)
+    {
+        if (_partitionCount == 0)
+        {
+            _subIndexBuilder = null;
+            if (_entries.Count > _front)
+            {
+                // Remove the last entry if it is empty
+                Entry last = _entries[^1];
+                if (last.Value.WithSeqBuilder.IsEmpty)
+                {
+                    System.Diagnostics.Debug.Assert(last.Key.WrittenCount == 0);
+                    last.Value.Dispose();
+                    last.Key.Dispose();
+                    _entries.RemoveAt(_entries.Count - 1);
+                }
+                _partitionCount = _entries.Count - _front;
+            }
+        }
+        if (_finishingIndexes)
+        {
+            Entry lastEntry = _entries[_front];
+            _encoded.Clear();
+            Coding.PutVarint64(_encoded, lastPartitionHandle.Offset);
+            Coding.PutVarint64(_encoded, lastPartitionHandle.Size);
+            _deltaEncoded.Clear();
+            // Nothing to delta against for the first entry; it is a restart point (shared == 0), so BlockBuilder writes
+            // its value in full and never consults this (empty) delta.
+            if (_useValueDeltaEncoding && !(_lastEncodedHandle.Offset == 0 && _lastEncodedHandle.Size == 0))
+                IndexValue.EncodeDelta(_deltaEncoded, lastPartitionHandle, _lastEncodedHandle, _valueDeltaEscape, false, default);
+            _lastEncodedHandle = lastPartitionHandle;
+            _indexBlockBuilder.Add(lastEntry.Key.WrittenSpan, _encoded.WrittenSpan, _deltaEncoded.WrittenSpan, false);
+            if (!_mustUseSeparatorWithSeq)
+                _indexBlockBuilderWithoutSeq.Add(DbFormat.ExtractUserKey(lastEntry.Key.WrittenSpan), _encoded.WrittenSpan, _deltaEncoded.WrittenSpan, false);
+            lastEntry.Value.Dispose();
+            lastEntry.Key.Dispose();
+            _entries[_front] = null!;
+            _front++;
+        }
+        // If there is no sub_index left, then return the 2nd level index.
+        if (_front >= _entries.Count)
+        {
+            contents = _mustUseSeparatorWithSeq ? _indexBlockBuilder.Finish() : _indexBlockBuilderWithoutSeq.Finish();
+            _topLevelIndexSize = contents.Length;
+            _indexSize += _topLevelIndexSize;
+            return true;
+        }
+        // Finish the next partition index in line and Incomplete() to indicate we expect more calls to Finish
+        Entry entry = _entries[_front];
+        // Apply the policy to all sub-indexes
+        entry.Value.MustUseSeparatorWithSeq = _mustUseSeparatorWithSeq;
+        contents = entry.Value.Finish();
+        _indexSize += contents.Length;
+        _finishingIndexes = true;
+        return false;
+    }
+
+    public override void Dispose()
+    {
+        for (int i = _front; i < _entries.Count; i++)
+        {
+            Entry? e = _entries[i];
+            if (e is null) continue;
+            e.Value.Dispose();
+            e.Key.Dispose();
+        }
+        _entries.Clear();
+        _indexBlockBuilder.Dispose();
+        _indexBlockBuilderWithoutSeq.Dispose();
+        _encoded.Dispose();
+        _deltaEncoded.Dispose();
     }
 }
