@@ -11,13 +11,14 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [x] Verify the native `RocksDB` NuGet package loads in the compat test project (smoke test)
 
 ## Phase 1 — Persistent formats (parallel)
-### A. WAL + WriteBatch  `[~] agent running`
-- [ ] `Wal/LogFormat` — record types, block size 32KiB, header layouts (legacy 7B, recyclable 11B) — `db/log_format.h`
-- [ ] `Wal/LogWriter` — async, pooled, fragmenting records across blocks, recyclable mode — `db/log_writer.cc`
-- [ ] `Wal/LogReader` — checksum verify, fragment reassembly, corruption reporting, recycled-log handling — `db/log_reader.cc`
-- [ ] WAL metadata records: `kSetCompressionType`, user-defined timestamp size, predecessor WAL info
-- [ ] `Db/WriteBatch` — rep format (12B header: seq + count), all record tags, CF variants, iterate/handler, save points — `db/write_batch.cc`
-- [ ] Compat: managed WriteBatch bytes == native `WriteBatch.ToBytes()`; parse native batches from `GetUpdatesSince`
+### A. WAL + WriteBatch  `[x] merged (b001a9c)`
+- [x] `Wal/LogFormat`, `LogWriter` (sync/async, legacy+recyclable, zstd WAL compression), `LogReader` (recovery modes, predecessor WAL info, UnmarkEof tailing)
+- [x] WAL metadata records: compression type, user-defined timestamp size, predecessor WAL info
+- [x] `Db/WriteBatch` (byte-identical rep, pooled `Rent()`, save points, max bytes), `WriteBatchReader` ref struct, `IWriteBatchHandler` (struct, no boxing)
+- [x] Compat: rep bytes == native; parse `GetUpdatesSince`; read native WALs (plain/recyclable/zstd); native replays managed-written WALs
+- [ ] `FragmentBufferedReader` (tolerant tailing reader for replication)
+- [ ] XXH3 per-record checksum, WAL termination point, protection info, timestamps, structured `PutEntity`
+- [ ] Public API: `ColumnFamily` object instead of `uint cfId`
 
 ### B. Block-based table (SST)  `[~] agent running`
 - [ ] `Table/BlockBuilder` + `Table/Block` reader/iterator (restart points, shared-prefix delta encoding) — `table/block_based/block_builder.cc`, `block.cc`
