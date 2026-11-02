@@ -1,3 +1,5 @@
+using RocksDb.Managed.Table;
+
 namespace RocksDb.Managed.Db.Iterators;
 
 /// <summary>
@@ -30,6 +32,13 @@ public sealed class DbIteratorSources
 
     /// <summary>Opens table files; required when <see cref="Levels"/> contains files.</summary>
     public ITableCache? TableCache { get; init; }
+
+    /// <summary>
+    /// The column family's prefix extractor (ColumnFamilyOptions.PrefixExtractor). Unless
+    /// <see cref="ReadOptions.TotalOrderSeek"/> is set, table seeks consult prefix filters and the iterator follows
+    /// prefix seek semantics (see <see cref="DbIter"/>).
+    /// </summary>
+    public SliceTransform? PrefixExtractor { get; init; }
 
     /// <summary>max_sequential_skip_in_iterations (ColumnFamilyOptions, default 8).</summary>
     public ulong MaxSequentialSkipInIterations { get; init; } = 8;
@@ -87,7 +96,7 @@ public static class DbIteratorFactory
 
     private static DbIter Wrap(DbIteratorSources sources, InternalIterator internalIter, RangeDelAggregator? rangeDel) =>
         new(sources.Comparator, internalIter, sources.Sequence, sources.ReadOptions, sources.MergeOperator, rangeDel,
-            sources.MaxSequentialSkipInIterations, sources.Cleanup);
+            sources.MaxSequentialSkipInIterations, sources.Cleanup, sources.PrefixExtractor);
 
     /// <summary>
     /// Builds the merged internal iterator over all sources and adds their range tombstones to
@@ -117,14 +126,20 @@ public static class DbIteratorFactory
                 if (level == 0)
                 {
                     // Merge all level zero files together since they may overlap.
-                    foreach (FileMetaData f in files) children.Add(tc.NewIterator(f));
+                    foreach (FileMetaData f in files)
+                    {
+                        children.Add(sources.PrefixExtractor is null
+                            ? tc.NewIterator(f)
+                            : new TableInternalIterator(tc.GetReader(f), TableReadFlags.None, sources.ReadOptions, sources.PrefixExtractor));
+                    }
                 }
                 else
                 {
                     // For levels > 0, we can use a concatenating iterator that sequentially walks through the
                     // non-overlapping files in the level, opening them lazily.
-                    children.Add(new LevelIterator(tc, sources.Comparator, files, sources.ReadOptions));
+                    children.Add(new LevelIterator(tc, sources.Comparator, files, sources.ReadOptions, sources.PrefixExtractor));
                 }
+
             }
         }
         catch

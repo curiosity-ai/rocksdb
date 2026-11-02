@@ -40,14 +40,24 @@ public sealed class BlockBasedTableBuilder : IDisposable
     private readonly InternalKeyComparator _icmp;
     private readonly BlockBuilder _dataBlock;
     private readonly BlockBuilder _rangeDelBlock;
-    private readonly ShortenedIndexBuilder _indexBuilder;
-    private readonly IFilterBitsBuilder? _filterBuilder;
+    private readonly IndexBuilder _indexBuilder;
+    private readonly FilterBlockBuilder? _filterBuilder;
     private readonly PooledBufferWriter _out = new(OutputFlushThreshold + 64 * 1024);
     private readonly PooledBufferWriter _lastKey = new(64);
     private readonly PooledBufferWriter _compressed = new(4096);
     private readonly TableProperties _props = new();
     private readonly bool _useDeltaEncodingForIndexValues;
     private readonly uint _baseContextChecksum;
+    private readonly SliceTransform? _prefixExtractor;
+    private readonly bool _partitionedFilter;
+    // Dictionary compression (Rep::State kBuffered / kUnbuffered): while buffering, finished data blocks are kept
+    // uncompressed (not yet indexed or filtered) until the dictionary can be built from samples of them.
+    private bool _buffered;
+    private readonly ulong _bufferLimit;
+    private readonly int _maxSampleBytes;
+    private ulong _dataBeginOffset;
+    private readonly List<byte[]> _dataBlockBuffers = new();
+    private CompressionDictionary? _dict;
     private readonly int _blockSizeDeviationLimit;
     private readonly int _compressionLevel;
     private readonly int _maxCompressedBytesPerKb;
@@ -76,18 +86,60 @@ public sealed class BlockBasedTableBuilder : IDisposable
             options.DataBlockHashTableUtilRatio, useCommonPrefix, isUserKey: false);
         _rangeDelBlock = new BlockBuilder(1, true, false, DataBlockIndexType.BinarySearch, 0.75);
         _useDeltaEncodingForIndexValues = options.FormatVersion >= 4;
-        _indexBuilder = new ShortenedIndexBuilder(_icmp, options.IndexBlockRestartInterval, options.FormatVersion, _useDeltaEncodingForIndexValues,
-            options.IndexShortening, options.IndexType == IndexType.BinarySearchWithFirstKey, useCommonPrefix);
+        PartitionedIndexBuilder? partitionedIndex = null;
+        if (options.IndexType == IndexType.TwoLevelIndexSearch)
+        {
+            // PartitionedIndexBuilder::CreateIndexBuilder (use_common_prefix applies to all index tiers).
+            partitionedIndex = new PartitionedIndexBuilder(_icmp, options.IndexBlockRestartInterval, options.FormatVersion, _useDeltaEncodingForIndexValues,
+                options.IndexShortening, options.MetadataBlockSize, options.BlockSizeDeviation, useCommonPrefix, useCommonPrefix);
+            _indexBuilder = partitionedIndex;
+        }
+        else
+        {
+            _indexBuilder = new ShortenedIndexBuilder(_icmp, options.IndexBlockRestartInterval, options.FormatVersion, _useDeltaEncodingForIndexValues,
+                options.IndexShortening, options.IndexType == IndexType.BinarySearchWithFirstKey, useCommonPrefix);
+        }
+        _prefixExtractor = tableBuilderOptions.PrefixExtractor;
         // Port of CreateFilterBlockBuilder: the policy picks the filter implementation from the full building context
         // (format version, level, flush); a built-in policy with &lt; 0.5 bits/key builds no filter at all.
         if (options.FilterPolicy is { } policy && policy is not BloomLikeFilterPolicy { CreatesFilters: false })
         {
-            _filterBuilder = policy.CreateBuilder(new FilterBuildingContext(options.FormatVersion, tableBuilderOptions.LevelAtCreation, tableBuilderOptions.IsFlush));
+            IFilterBitsBuilder bits = policy.CreateBuilder(new FilterBuildingContext(options.FormatVersion, tableBuilderOptions.LevelAtCreation, tableBuilderOptions.IsFlush)
+            {
+                OptimizeFiltersForMemory = options.OptimizeFiltersForMemory,
+            });
+            if (options.PartitionFilters && partitionedIndex is not null)
+            {
+                // Since after partition cut request from filter builder it takes time until index builder actully cuts
+                // the partition, until the end of a data block potentially with many keys, we take the lower bound as
+                // partition size.
+                uint partitionSize = (uint)(((long)options.MetadataBlockSize * (100 - options.BlockSizeDeviation) + 99) / 100);
+                partitionSize = Math.Max(partitionSize, 1u);
+                _filterBuilder = new PartitionedFilterBlockBuilder(_prefixExtractor, options.WholeKeyFiltering, bits, options.IndexBlockRestartInterval,
+                    _useDeltaEncodingForIndexValues, options.FormatVersion, partitionedIndex, partitionSize, options.DecouplePartitionedFilters,
+                    useCommonPrefix);
+                _partitionedFilter = true;
+            }
+            else
+            {
+                _filterBuilder = new FullFilterBlockBuilder(_prefixExtractor, options.WholeKeyFiltering, bits);
+            }
         }
         _compressionLevel = tableBuilderOptions.CompressionOptions.Level;
         // Rep::Rep: max_compressed_bytes_per_kb = min(1023, compression_opts.max_compressed_bytes_per_kb).
         _maxCompressedBytesPerKb = Math.Min(1023, tableBuilderOptions.CompressionOptions.MaxCompressedBytesPerKb);
         _blockSizeDeviationLimit = (int)(((long)options.BlockSize * (100 - options.BlockSizeDeviation) + 99) / 100);
+
+        // Port of the data block dictionary guidance in Rep::Rep (GetDictGuidance of the built-in compressors):
+        // sampling mode buffers data blocks up to buffer_limit before the dictionary is built.
+        _maxSampleBytes = GetMaxSampleBytes(tableBuilderOptions.CompressionType, tableBuilderOptions.CompressionOptions);
+        if (_maxSampleBytes > 0)
+        {
+            _buffered = true;
+            ulong maxDictBufferBytes = tableBuilderOptions.CompressionOptions.MaxDictBufferBytes;
+            ulong targetFileSize = tableBuilderOptions.TargetFileSize;
+            _bufferLimit = targetFileSize == 0 ? maxDictBufferBytes : maxDictBufferBytes == 0 ? targetFileSize : Math.Min(targetFileSize, maxDictBufferBytes);
+        }
 
         _props.ColumnFamilyId = tableBuilderOptions.ColumnFamilyId;
         _props.ColumnFamilyName = tableBuilderOptions.ColumnFamilyName;
@@ -131,6 +183,21 @@ public sealed class BlockBasedTableBuilder : IDisposable
             _ => false,
         };
     }
+
+    /// <summary>
+    /// DictSampling::max_sample_bytes of the built-in compressor for <paramref name="type"/>, 0 when dictionary
+    /// compression is disabled (max_dict_bytes = 0, no compression, or an unsupported type). ZSTD samples up to
+    /// zstd_max_train_bytes when set (training input), other types up to max_dict_bytes (raw dictionary).
+    /// </summary>
+    internal static int GetMaxSampleBytes(CompressionType type, CompressionOptions o)
+    {
+        if (o.MaxDictBytes == 0 || type == CompressionType.None || !BlockCompression.IsSupported(type)) return 0;
+        uint bytes = type == CompressionType.Zstd && o.ZstdMaxTrainBytes > 0 ? o.ZstdMaxTrainBytes : o.MaxDictBytes;
+        return (int)Math.Min(bytes, (uint)int.MaxValue);
+    }
+
+    /// <summary>The data block compression dictionary (after the builder left the buffered state), or null.</summary>
+    public ReadOnlySpan<byte> CompressionDictionary => _dict is null ? default : _dict.Data;
 
     public ulong NumEntries => _props.NumEntries;
     public bool IsEmpty => _props.NumEntries == 0;
@@ -177,12 +244,15 @@ public sealed class BlockBasedTableBuilder : IDisposable
 
             if (ShouldFlush(internalKey.Length, value.Length)) Flush(internalKey, hasNext: true);
 
-            if (_filterBuilder is not null && _options.WholeKeyFiltering) _filterBuilder.AddKey(DbFormat.ExtractUserKey(internalKey));
+            // Note: PartitionedFilterBlockBuilder with decouple_partitioned_filters = false requires key being added
+            // to filter builder after being added to the index builder (in Flush). Buffered keys will be replayed
+            // from the buffered data blocks once the compression dictionary has been finalized.
+            if (!_buffered) _filterBuilder?.Add(DbFormat.ExtractUserKey(internalKey));
 
             _dataBlock.Add(internalKey, value);
             _lastKey.Clear();
             _lastKey.Write(internalKey);
-            _indexBuilder.OnKeyAdded(internalKey);
+            if (!_buffered) _indexBuilder.OnKeyAdded(internalKey);
             if (type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp) _props.NumDeletions++;
             else if (type == EntryType.Merge) _props.NumMergeOperands++;
         }
@@ -206,15 +276,143 @@ public sealed class BlockBasedTableBuilder : IDisposable
         return after > _options.BlockSize && currSize > _blockSizeDeviationLimit;
     }
 
-    /// <summary>Port of BlockBasedTableBuilder::Flush + EmitBlock.</summary>
+    /// <summary>Port of BlockBasedTableBuilder::Flush + EmitBlock (buffering the block while sampling for a dictionary).</summary>
     private void Flush(ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext)
     {
         if (_dataBlock.IsEmpty) return;
         ReadOnlySpan<byte> raw = _dataBlock.Finish();
+        if (_buffered)
+        {
+            _dataBlockBuffers.Add(raw.ToArray());
+            _dataBeginOffset += (ulong)raw.Length;
+            _dataBlock.Reset();
+            MaybeEnterUnbuffered(firstKeyInNextBlock, hasNext);
+            return;
+        }
+        // Increment num_data_blocks when a data block is finalized (Flush's unbuffered branch). Upstream does not count
+        // blocks replayed from the dictionary buffer (EmitBlock), so with dictionary compression "rocksdb.num.data.blocks"
+        // only counts blocks written after the buffer was flushed; matched for identical properties.
         _props.NumDataBlocks++;
-        BlockHandle handle = WriteBlock(raw, isDataBlock: true);
-        _indexBuilder.AddIndexEntry(_lastKey.WrittenSpan, firstKeyInNextBlock, hasNext, handle);
+        EmitBlock(raw, _lastKey.WrittenSpan, firstKeyInNextBlock, hasNext);
         _dataBlock.Reset();
+    }
+
+    private void EmitBlock(ReadOnlySpan<byte> raw, ReadOnlySpan<byte> lastKey, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext)
+    {
+        BlockHandle handle = WriteBlock(raw, isDataBlock: true);
+        _indexBuilder.AddIndexEntry(lastKey, firstKeyInNextBlock, hasNext, handle);
+    }
+
+    /// <summary>
+    /// Port of BlockBasedTableBuilder::MaybeEnterUnbuffered: once the buffered data exceeds buffer_limit (or at the
+    /// end of the file), samples the buffered blocks, builds the dictionary, and replays the buffered blocks through
+    /// the filter and index builders while compressing them with the dictionary.
+    /// </summary>
+    private void MaybeEnterUnbuffered(ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext)
+    {
+        if (hasNext)
+        {
+            bool exceedsBufferLimit = _bufferLimit != 0 && _dataBeginOffset > _bufferLimit;
+            if (!exceedsBufferLimit) return;
+        }
+        // Enter Unbuffered state
+        _buffered = false;
+        int numBlocksBuffered = _dataBlockBuffers.Count;
+        if (numBlocksBuffered == 0) return;
+
+        // A finite cyclic group (the additive group of integers modulo N) can be generated by a number coprime with N;
+        // N varies, so a prime is used (kPrimeGenerator: the next prime after a random number below one trillion).
+        const ulong primeGenerator = 545055921143UL;
+        int primeGeneratorRemainder = (int)(primeGenerator % (ulong)numBlocksBuffered);
+        int bufferIdx = numBlocksBuffered / 2;
+        using var samples = new PooledBufferWriter(Math.Min(_maxSampleBytes, 1 << 20));
+        var sampleLengths = new List<nuint>();
+        for (int i = 0; i < numBlocksBuffered && samples.WrittenCount < _maxSampleBytes; i++)
+        {
+            byte[] block = _dataBlockBuffers[bufferIdx];
+            int copyLength = Math.Min(_maxSampleBytes - samples.WrittenCount, block.Length);
+            samples.Write(block.AsSpan(0, copyLength));
+            sampleLengths.Add((nuint)copyLength);
+            bufferIdx += primeGeneratorRemainder;
+            if (bufferIdx >= numBlocksBuffered) bufferIdx -= numBlocksBuffered;
+        }
+        byte[] dict = BuildDictionary(samples.WrittenSpan, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(sampleLengths));
+        if (dict.Length > 0) _dict = new CompressionDictionary(dict);
+
+        // Replay: keys of each buffered block go to the filter and index builders, then the block is emitted.
+        using var it = new BlockIter();
+        using var next = new BlockIter();
+        using var lastKey = new PooledBufferWriter(64);
+        using var nextFirstKey = new PooledBufferWriter(64);
+        for (int i = 0; i < numBlocksBuffered; i++)
+        {
+            byte[] data = _dataBlockBuffers[i];
+            Block block = Block.CreateCopy(data);
+            try
+            {
+                it.InitializeData(block, _icmp, BlockIter.DisableGlobalSequenceNumber);
+                for (it.SeekToFirst(); it.Valid; it.Next())
+                {
+                    ReadOnlySpan<byte> key = it.Key;
+                    _filterBuilder?.Add(DbFormat.ExtractUserKey(key));
+                    _indexBuilder.OnKeyAdded(key);
+                    lastKey.Clear();
+                    lastKey.Write(key);
+                }
+                it.Clear();
+            }
+            finally
+            {
+                block.Release();
+            }
+            bool blockHasNext;
+            nextFirstKey.Clear();
+            if (i + 1 < numBlocksBuffered)
+            {
+                Block nb = Block.CreateCopy(_dataBlockBuffers[i + 1]);
+                try
+                {
+                    next.InitializeData(nb, _icmp, BlockIter.DisableGlobalSequenceNumber);
+                    next.SeekToFirst();
+                    nextFirstKey.Write(next.Key);
+                    next.Clear();
+                }
+                finally
+                {
+                    nb.Release();
+                }
+                blockHasNext = true;
+            }
+            else
+            {
+                nextFirstKey.Write(firstKeyInNextBlock);
+                blockHasNext = hasNext;
+            }
+            EmitBlock(data, lastKey.WrittenSpan, nextFirstKey.WrittenSpan, blockHasNext);
+        }
+        _dataBlockBuffers.Clear();
+        _dataBeginOffset = 0;
+    }
+
+    /// <summary>
+    /// Port of MaybeCloneSpecialized(DictSamples) of the built-in compressors: ZSTD trains (ZDICT_trainFromBuffer) or
+    /// finalizes (ZDICT_finalizeDictionary) a dictionary when zstd_max_train_bytes is set, otherwise (and for the other
+    /// compression types) the samples are the raw content dictionary. Empty: no dictionary.
+    /// </summary>
+    private byte[] BuildDictionary(ReadOnlySpan<byte> samples, ReadOnlySpan<nuint> sampleLengths)
+    {
+        if (samples.IsEmpty) return [];
+        CompressionOptions o = _tbo.CompressionOptions;
+        if (_tbo.CompressionType == CompressionType.Zstd && o.ZstdMaxTrainBytes > 0)
+        {
+            int maxDictBytes = (int)Math.Min(o.MaxDictBytes, (uint)int.MaxValue);
+            return o.UseZstdDictTrainer
+                ? BlockCompression.ZstdTrainDictionary(samples, sampleLengths, maxDictBytes)
+                : BlockCompression.ZstdFinalizeDictionary(samples, sampleLengths, maxDictBytes, o.Level);
+        }
+        // ZSTD "raw content dictionary" - "Any buffer is a valid raw content dictionary." Or similar for other
+        // compressions.
+        return samples.ToArray();
     }
 
     /// <summary>Port of WriteBlock + CompressAndVerifyBlock (compression via the facade, with the ratio check).</summary>
@@ -226,7 +424,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
         {
             _compressed.Clear();
             long maxCompressed = ((long)_maxCompressedBytesPerKb * raw.Length) >> 10;
-            if (BlockCompression.TryCompress(_tbo.CompressionType, raw, _options.FormatVersion, _compressionLevel, _compressed)
+            if (BlockCompression.TryCompress(_tbo.CompressionType, raw, _options.FormatVersion, _compressionLevel, _maxCompressedBytesPerKb, _compressed,
+                    isDataBlock ? _dict : null)
                 && _compressed.WrittenCount <= maxCompressed)
             {
                 type = _tbo.CompressionType;
@@ -295,38 +494,72 @@ public sealed class BlockBasedTableBuilder : IDisposable
     {
         if (_closed) throw new InvalidOperationException("Table builder already finished.");
         Flush(default, hasNext: false);
+        if (_buffered) MaybeEnterUnbuffered(default, hasNext: false);
         _closed = true;
         _props.TailStartOffset = _offset;
 
         using var metaIndex = new MetaIndexBuilder();
         WriteFilterBlock(metaIndex);
         BlockHandle indexHandle = WriteIndexBlock(metaIndex);
+        WriteCompressionDictBlock(metaIndex);
         WriteRangeDelBlock(metaIndex);
         WritePropertiesBlock(metaIndex);
         BlockHandle metaindexHandle = WriteMaybeCompressedBlock(metaIndex.Finish(), CompressionType.None);
         WriteFooter(metaindexHandle, indexHandle);
     }
 
+    /// <summary>Port of BlockBasedTableBuilder::WriteFilterBlock (full filter, or filter partitions + partition index).</summary>
     private void WriteFilterBlock(MetaIndexBuilder metaIndex)
     {
-        if (_filterBuilder is null || _filterBuilder.EstimatedEntries == 0) return;
-        _props.NumFilterEntries += (ulong)_filterBuilder.EstimatedEntries;
-        using var filter = new PooledBufferWriter(1024);
-        _filterBuilder.Finish(filter);
-        _props.FilterSize += (ulong)filter.WrittenCount;
-        BlockHandle h = WriteMaybeCompressedBlock(filter.WrittenSpan, CompressionType.None);
-        metaIndex.Add(BlockBasedTableConstants.FullFilterBlockPrefix + _options.FilterPolicy!.CompatibilityName, h);
+        if (_filterBuilder is null || _filterBuilder.IsEmpty) return;
+        if (_lastKey.WrittenCount > 0)
+        {
+            // We might have been using AddWithPrevKey, so need PrevKeyBeforeFinish to be safe.
+            _filterBuilder.PrevKeyBeforeFinish(DbFormat.ExtractUserKey(_lastKey.WrittenSpan));
+        }
+        _props.NumFilterEntries += _filterBuilder.EstimateEntriesAdded;
+        BlockHandle h = default;
+        bool done;
+        do
+        {
+            done = _filterBuilder.Finish(h, out ReadOnlySpan<byte> contents);
+            _props.FilterSize += (ulong)contents.Length;
+            h = WriteMaybeCompressedBlock(contents, CompressionType.None);
+        }
+        while (!done);
+        metaIndex.Add((_partitionedFilter ? BlockBasedTableConstants.PartitionedFilterBlockPrefix : BlockBasedTableConstants.FullFilterBlockPrefix)
+            + _options.FilterPolicy!.CompatibilityName, h);
     }
 
+    /// <summary>Port of WriteIndexBlock / BuiltinIndexFactoryBuilder::FinishAndWrite: index partitions, then the (top-level) index.</summary>
     private BlockHandle WriteIndexBlock(MetaIndexBuilder metaIndex)
     {
-        ReadOnlySpan<byte> contents = _indexBuilder.Finish();
-        BlockHandle h = WriteBlock(contents, isDataBlock: false);
+        BlockHandle h = default;
+        bool done;
+        do
+        {
+            done = _indexBuilder.Finish(h, out ReadOnlySpan<byte> contents);
+            h = WriteBlock(contents, isDataBlock: false);
+        }
+        while (!done);
         // index_size reports the logical (uncompressed) index size + trailer.
         _props.IndexSize = (ulong)_indexBuilder.IndexSize + BlockBasedTableConstants.BlockTrailerSize;
+        if (_options.IndexType == IndexType.TwoLevelIndexSearch)
+        {
+            _props.IndexPartitions = (ulong)_indexBuilder.NumPartitions;
+            _props.TopLevelIndexSize = (ulong)_indexBuilder.TopLevelIndexSize;
+        }
         if (!BlockBasedTableConstants.FormatVersionUsesIndexHandleInFooter(_options.FormatVersion))
             metaIndex.Add(BlockBasedTableConstants.IndexBlockName, h);
         return h;
+    }
+
+    /// <summary>Port of WriteCompressionDictBlock: the dictionary used for data blocks, stored uncompressed.</summary>
+    private void WriteCompressionDictBlock(MetaIndexBuilder metaIndex)
+    {
+        if (_dict is null || _dict.Length == 0) return;
+        BlockHandle h = WriteMaybeCompressedBlock(_dict.Data, CompressionType.None);
+        metaIndex.Add(BlockBasedTableConstants.CompressionDictBlockName, h);
     }
 
     private void WriteRangeDelBlock(MetaIndexBuilder metaIndex)
@@ -356,8 +589,9 @@ public sealed class BlockBasedTableBuilder : IDisposable
         Coding.EncodeFixed32(idx, (uint)_options.IndexType);
         pb.Add(TablePropertiesNames.BlockBasedIndexType, idx.ToArray());
         pb.Add(TablePropertiesNames.BlockBasedWholeKeyFiltering, _options.WholeKeyFiltering ? TablePropertiesNames.PropTrue : TablePropertiesNames.PropFalse);
-        pb.Add(TablePropertiesNames.BlockBasedPrefixFiltering, TablePropertiesNames.PropFalse);
-        pb.Add(TablePropertiesNames.BlockBasedDecoupledPartitionedFilters, TablePropertiesNames.PropTrue);
+        pb.Add(TablePropertiesNames.BlockBasedPrefixFiltering, _prefixExtractor is not null ? TablePropertiesNames.PropTrue : TablePropertiesNames.PropFalse);
+        if (_options.DecouplePartitionedFilters) pb.Add(TablePropertiesNames.BlockBasedDecoupledPartitionedFilters, TablePropertiesNames.PropTrue);
+
         if (_tbo.ExternalSstFile)
         {
             byte[] version = new byte[4];
@@ -453,5 +687,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
         _out.Dispose();
         _lastKey.Dispose();
         _compressed.Dispose();
+        _dataBlockBuffers.Clear();
+        _dict?.Dispose();
+
     }
 }

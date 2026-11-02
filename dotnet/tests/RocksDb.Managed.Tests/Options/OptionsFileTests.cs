@@ -75,7 +75,7 @@ public sealed class OptionsFileTests
         Assert.AreEqual(8.5, d.MaxBytesForLevelMultiplier);
         Assert.AreEqual(128UL << 20, d.WriteBufferSize);
         Assert.IsNull(d.MergeOperatorName);
-        Assert.AreEqual("rocksdb.FixedPrefix.4", d.PrefixExtractor);
+        Assert.AreEqual("rocksdb.FixedPrefix.4", d.PrefixExtractor?.AsString());
         Assert.AreEqual(CompactionStyle.Universal, d.CompactionStyle);
         Assert.AreEqual("{reduce_file_locking=true;size_ratio=1;}", d.UnknownOptions["compaction_options_universal"]);
         Assert.AreEqual(16384UL, d.TableOptions.BlockSize);

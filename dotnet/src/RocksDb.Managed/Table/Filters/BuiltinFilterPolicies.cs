@@ -13,6 +13,11 @@ public abstract class BloomLikeFilterPolicy : FilterPolicy
     private readonly int _millibitsPerKey;
     private readonly double _desiredOneInFpRate;
     private readonly int _wholeBitsPerKey;
+    /// <summary>
+    /// aggregate_rounding_balance_: sum over all generated filters f of (estimated FP rate of f - target FP rate of f)
+    /// * 2^32, used by optimize_filters_for_memory to keep the aggregate FP rate on target while rounding sizes.
+    /// </summary>
+    private readonly System.Runtime.CompilerServices.StrongBox<long> _aggregateRoundingBalance = new();
 
     protected BloomLikeFilterPolicy(double bitsPerKey)
     {
@@ -99,9 +104,20 @@ public abstract class BloomLikeFilterPolicy : FilterPolicy
 
     protected IFilterBitsBuilder CreateFastLocalBloomBuilder() => new FastLocalBloomBitsBuilder(_millibitsPerKey);
 
+    /// <summary>FastLocalBloom builder; rounds sizes against this policy's balance when <paramref name="optimizeForMemory"/>.</summary>
+    protected IFilterBitsBuilder CreateFastLocalBloomBuilder(bool optimizeForMemory) =>
+        new FastLocalBloomBitsBuilder(_millibitsPerKey, optimizeForMemory ? _aggregateRoundingBalance : null);
+
     protected IFilterBitsBuilder CreateLegacyBloomBuilder() => new LegacyBloomBitsBuilder(_wholeBitsPerKey);
 
     protected IFilterBitsBuilder CreateStandard128RibbonBuilder() => new Standard128RibbonBitsBuilder(_desiredOneInFpRate, _millibitsPerKey);
+
+    /// <summary>Standard128 Ribbon builder; rounds sizes against this policy's balance when <paramref name="optimizeForMemory"/>.</summary>
+    protected IFilterBitsBuilder CreateStandard128RibbonBuilder(bool optimizeForMemory) =>
+        new Standard128RibbonBitsBuilder(_desiredOneInFpRate, _millibitsPerKey, optimizeForMemory ? _aggregateRoundingBalance : null);
+
+    /// <summary>Current optimize_filters_for_memory FP-rate balance (for tests and diagnostics).</summary>
+    public long AggregateRoundingBalance => Interlocked.Read(ref _aggregateRoundingBalance.Value);
 
     /// <summary>Any built-in filter format can be read regardless of the policy configuration.</summary>
     public sealed override IFilterBitsReader CreateReader(ReadOnlyMemory<byte> contents) => BuiltinFilterBitsReader.Create(contents);
@@ -129,6 +145,13 @@ public sealed class BloomFilterPolicy : BloomLikeFilterPolicy
     {
         ThrowIfNoFilter();
         return formatVersion < 5 ? CreateLegacyBloomBuilder() : CreateFastLocalBloomBuilder();
+    }
+
+    /// <summary>Port of BloomFilterPolicy::GetBuilderWithContext (optimize_filters_for_memory from the context).</summary>
+    public override IFilterBitsBuilder CreateBuilder(in FilterBuildingContext context)
+    {
+        ThrowIfNoFilter();
+        return context.FormatVersion < 5 ? CreateLegacyBloomBuilder() : CreateFastLocalBloomBuilder(context.OptimizeFiltersForMemory);
     }
 }
 
@@ -186,6 +209,8 @@ public sealed class RibbonFilterPolicy : BloomLikeFilterPolicy
                 levelish = context.LevelAtCreation;
             }
         }
-        return levelish < bloomBeforeLevel ? CreateFastLocalBloomBuilder() : CreateStandard128RibbonBuilder();
+        return levelish < bloomBeforeLevel
+            ? CreateFastLocalBloomBuilder(context.OptimizeFiltersForMemory)
+            : CreateStandard128RibbonBuilder(context.OptimizeFiltersForMemory);
     }
 }

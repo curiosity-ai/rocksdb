@@ -34,8 +34,12 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     /// <see cref="CompactionFilterFactoryName"/>. Ignored when <see cref="CompactionFilter"/> is set.
     /// </summary>
     public CompactionFilterFactory? CompactionFilterFactory { get; set; }
-    /// <summary>Serialized prefix extractor id, e.g. "rocksdb.FixedPrefix.4" / "rocksdb.CappedPrefix.8"; null = none.</summary>
-    public string? PrefixExtractor { get; set; }
+    /// <summary>
+    /// prefix_extractor: enables prefix Bloom filters in tables and prefix seek (see <see cref="SliceTransform"/>);
+    /// null = none. Persisted by id (e.g. <c>rocksdb.FixedPrefix.4</c>); only built-in transforms can be recreated when
+    /// an OPTIONS file is parsed (unknown ids parse as null, like upstream with ignore_unsupported_options).
+    /// </summary>
+    public SliceTransform? PrefixExtractor { get; set; }
     public string? MemtableInsertWithHintPrefixExtractor { get; set; }
     public string? SstPartitionerFactoryName { get; set; }
     public string MemtableFactoryName { get; set; } = "SkipListFactory";
@@ -131,7 +135,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .Name("merge_operator", static o => o.MergeOperatorName, static (o, v) => o.MergeOperatorName = v)
         .Name("compaction_filter", static o => o.CompactionFilterName, static (o, v) => o.CompactionFilterName = v)
         .Name("compaction_filter_factory", static o => o.CompactionFilterFactoryName, static (o, v) => o.CompactionFilterFactoryName = v)
-        .Name("prefix_extractor", static o => o.PrefixExtractor, static (o, v) => o.PrefixExtractor = v)
+        .Name("prefix_extractor", static o => o.PrefixExtractor?.AsString(), static (o, v) => o.PrefixExtractor = SliceTransform.CreateFromString(v))
         .Name("memtable_insert_with_hint_prefix_extractor", static o => o.MemtableInsertWithHintPrefixExtractor,
             static (o, v) => o.MemtableInsertWithHintPrefixExtractor = v)
         .Name("sst_partitioner_factory", static o => o.SstPartitionerFactoryName, static (o, v) => o.SstPartitionerFactoryName = v)
@@ -212,6 +216,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         var c = new ColumnFamilyOptions();
         c.CopyFrom(this);
         c.MergeOperator = MergeOperator;
+        c.PrefixExtractor = PrefixExtractor;
         c.CompactionFilter = CompactionFilter;
         c.CompactionFilterFactory = CompactionFilterFactory;
         c.CompactionOptionsFifo = CompactionOptionsFifo.Clone();

@@ -8,6 +8,17 @@ public interface IFilterBitsBuilder : IDisposable
 {
     /// <summary>Adds a key (already prefix-transformed / timestamp-stripped as appropriate). Duplicates of the previous key are ignored.</summary>
     void AddKey(ReadOnlySpan<byte> key);
+    /// <summary>
+    /// Adds a key and an alternate entry (its prefix), de-duplicating both against the previous key and alternate
+    /// (FilterBitsBuilder::AddKeyAndAlt).
+    /// </summary>
+    void AddKeyAndAlt(ReadOnlySpan<byte> key, ReadOnlySpan<byte> alt)
+    {
+        AddKey(alt);
+        AddKey(key);
+    }
+    /// <summary>Approximate number of keys that fit a filter of <paramref name="bytes"/> bytes (for filter partitioning).</summary>
+    ulong ApproximateNumEntries(ulong bytes) => 0;
     int EstimatedEntries { get; }
     /// <summary>Writes the serialized filter (including RocksDB's metadata trailer) to the writer and resets the builder.</summary>
     void Finish(System.Buffers.IBufferWriter<byte> output);
@@ -45,4 +56,11 @@ public abstract class FilterPolicy
 /// policies use. <see cref="LevelAtCreation"/> is -1 when unknown; FIFO / no-compaction callers should
 /// pass -1 (treated as bottommost, like upstream).
 /// </summary>
-public readonly record struct FilterBuildingContext(int FormatVersion, int LevelAtCreation, bool IsFlush);
+public readonly record struct FilterBuildingContext(int FormatVersion, int LevelAtCreation, bool IsFlush)
+{
+    /// <summary>
+    /// BlockBasedTableOptions::optimize_filters_for_memory of the table being built: built-in policies then round filter
+    /// sizes to the allocator's usable size (see <see cref="FilterAllocationModel"/>).
+    /// </summary>
+    public bool OptimizeFiltersForMemory { get; init; }
+}

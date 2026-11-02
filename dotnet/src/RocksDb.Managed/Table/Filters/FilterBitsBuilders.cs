@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Runtime.CompilerServices;
 using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Table.Filters;
@@ -40,6 +41,22 @@ public abstract class XxPh3FilterBitsBuilder : IFilterBitsBuilder
     private ulong[] _entries = [];
     private int _count;
     private ulong? _prevAltHash;
+    /// <summary>
+    /// aggregate_rounding_balance_: the owning policy's balance when optimize_filters_for_memory is on (shared by all
+    /// builders of the policy), else null.
+    /// </summary>
+    private readonly StrongBox<long>? _aggregateRoundingBalance;
+
+    protected XxPh3FilterBitsBuilder() { }
+
+    /// <summary>Builder with optimize_filters_for_memory rounding against <paramref name="aggregateRoundingBalance"/> (null = off).</summary>
+    protected XxPh3FilterBitsBuilder(StrongBox<long>? aggregateRoundingBalance)
+    {
+        _aggregateRoundingBalance = aggregateRoundingBalance;
+    }
+
+    /// <summary>Whether optimize_filters_for_memory rounding is active for this builder.</summary>
+    protected bool OptimizeForMemory => _aggregateRoundingBalance is not null;
 
     public int EstimatedEntries => Volatile.Read(ref _count);
 
@@ -139,6 +156,70 @@ public abstract class XxPh3FilterBitsBuilder : IFilterBitsBuilder
 
     protected abstract ulong RoundDownUsableSpace(ulong availableSize);
 
+    /// <summary>
+    /// Port of XXPH3FilterBitsBuilder::AllocateMaybeRounding (filter_policy.cc): returns the filter length (with
+    /// metadata) to build. With optimize_filters_for_memory and an active <see cref="FilterAllocationModel"/> (upstream:
+    /// builds with ROCKSDB_MALLOC_USABLE_SIZE), a smaller size may be chosen while the policy's FP-rate balance is
+    /// ahead, and the size is rounded up to the allocator's usable size of the (length + block trailer) allocation; the
+    /// FP-rate difference is accumulated in the policy's balance.
+    /// </summary>
+    protected ulong AllocateMaybeRounding(ulong targetLenWithMetadata, ulong numEntries)
+    {
+        // Return value set to a default; overwritten in some cases
+        ulong rv = targetLenWithMetadata;
+        StrongBox<long>? balanceBox = _aggregateRoundingBalance;
+        if (balanceBox is null || !FilterAllocationModel.IsActive) return rv;
+        // Race condition on balance is OK because it can only cause temporary skew in rounding up vs. rounding down,
+        // as long as updates are atomic and relative.
+        long balance = Interlocked.Read(ref balanceBox.Value);
+
+        double targetFpRate = EstimatedFpRate(numEntries, targetLenWithMetadata);
+        double rvFpRate = targetFpRate;
+
+        if (balance < 0)
+        {
+            // See formula for BloomFilterPolicy::aggregate_rounding_balance_
+            double forBalanceFpRate = -balance / (double)0x100000000 + targetFpRate;
+
+            // To simplify, we just try a few modified smaller sizes. This also caps how much we vary filter size vs.
+            // target, to avoid outlier behavior from excessive variance.
+            ulong targetLen = targetLenWithMetadata - BuiltinFilterFormat.MetadataLen;
+            ReadOnlySpan<ulong> candidates = [3 * targetLen / 4, 13 * targetLen / 16, 7 * targetLen / 8, 15 * targetLen / 16];
+            foreach (ulong maybeLenRough in candidates)
+            {
+                ulong maybeLenWithMetadata = RoundDownUsableSpace(maybeLenRough + BuiltinFilterFormat.MetadataLen);
+                double maybeFpRate = EstimatedFpRate(numEntries, maybeLenWithMetadata);
+                if (maybeFpRate <= forBalanceFpRate)
+                {
+                    rv = maybeLenWithMetadata;
+                    rvFpRate = maybeFpRate;
+                    break;
+                }
+            }
+        }
+
+        // Filter blocks are loaded into block cache with their block trailer. We need to make sure that's accounted
+        // for in choosing a fragmentation-friendly size.
+        const ulong extraPadding = BlockBasedTableConstants.BlockTrailerSize;
+        ulong requested = rv + extraPadding;
+        ulong usable = FilterAllocationModel.UsableSize(requested);
+        if (usable - usable / 4 > requested)
+        {
+            // Ratio greater than 4/3 is too much for utilizing, if it's not a buggy or mislinked malloc_usable_size
+            // implementation. Nothing to do.
+        }
+        else if (usable > requested)
+        {
+            rv = RoundDownUsableSpace(usable - extraPadding);
+            rvFpRate = EstimatedFpRate(numEntries, rv);
+        }
+
+        // Update balance
+        long diff = (long)((rvFpRate - targetFpRate) * (double)0x100000000);
+        Interlocked.Add(ref balanceBox.Value, diff);
+        return rv;
+    }
+
     public virtual void Dispose()
     {
         ReturnEntries();
@@ -149,17 +230,35 @@ public abstract class XxPh3FilterBitsBuilder : IFilterBitsBuilder
 
 /// <summary>
 /// Port of FastLocalBloomBitsBuilder (format_version=5 Bloom). Metadata: [-1][0][num_probes][0][0].
-/// optimize_filters_for_memory (malloc_usable_size rounding) is not implemented: sizes always follow
-/// <see cref="CalculateSpace"/>, matching native output with optimize_filters_for_memory=false.
+/// With optimize_filters_for_memory the size may deviate from <see cref="CalculateSpace"/> (see
+/// <see cref="XxPh3FilterBitsBuilder.AllocateMaybeRounding"/>).
 /// </summary>
 public sealed class FastLocalBloomBitsBuilder : XxPh3FilterBitsBuilder
 {
     private readonly int _millibitsPerKey;
 
-    public FastLocalBloomBitsBuilder(int millibitsPerKey)
+    public FastLocalBloomBitsBuilder(int millibitsPerKey) : this(millibitsPerKey, null) { }
+
+    /// <summary>Builder with optimize_filters_for_memory rounding against the policy's balance (null = off).</summary>
+    public FastLocalBloomBitsBuilder(int millibitsPerKey, StrongBox<long>? aggregateRoundingBalance)
+        : base(aggregateRoundingBalance)
     {
         if (millibitsPerKey < 1000) throw new ArgumentOutOfRangeException(nameof(millibitsPerKey));
         _millibitsPerKey = millibitsPerKey;
+    }
+
+    /// <summary>Port of GetNumProbes: num_probes from the actual bits/key after rounding (only with optimize_filters_for_memory).</summary>
+    private int GetNumProbes(ulong keys, ulong lenWithMetadata)
+    {
+        ulong millibits = (lenWithMetadata - BuiltinFilterFormat.MetadataLen) * 8000;
+        int actualMillibitsPerKey = (int)(millibits / Math.Max(keys, 1UL));
+        // BEGIN XXX/TODO(peterd): preserving old/default behavior for now to minimize unit test churn.
+        if (!OptimizeForMemory)
+        {
+            actualMillibitsPerKey = _millibitsPerKey;
+        }
+        // END XXX/TODO
+        return FastLocalBloomImpl.ChooseNumProbes(actualMillibitsPerKey);
     }
 
     public int MillibitsPerKey => _millibitsPerKey;
@@ -174,8 +273,10 @@ public sealed class FastLocalBloomBitsBuilder : XxPh3FilterBitsBuilder
             return;
         }
         ulong lenWithMetadata = CalculateSpace((ulong)numEntries);
+        lenWithMetadata = AllocateMaybeRounding(lenWithMetadata, (ulong)numEntries);
         if (lenWithMetadata > int.MaxValue) ThrowHelper.NotSupported("filter too large");
-        int numProbes = FastLocalBloomImpl.ChooseNumProbes(_millibitsPerKey);
+        // Compute num_probes after any rounding / adjustments
+        int numProbes = GetNumProbes((ulong)numEntries, lenWithMetadata);
         int total = (int)lenWithMetadata;
         int len = total - BuiltinFilterFormat.MetadataLen;
         Span<byte> buf = output.GetSpan(total)[..total];
@@ -225,7 +326,7 @@ public sealed class FastLocalBloomBitsBuilder : XxPh3FilterBitsBuilder
         {
             return keys > 0 ? 1.0 : 0.0;
         }
-        int numProbes = FastLocalBloomImpl.ChooseNumProbes(_millibitsPerKey);
+        int numProbes = GetNumProbes(keys, lenWithMetadata);
         return FastLocalBloomImpl.EstimatedFpRate(keys, lenWithMetadata - BuiltinFilterFormat.MetadataLen, numProbes, /*hash bits*/ 64);
     }
 
@@ -258,11 +359,15 @@ public sealed class Standard128RibbonBitsBuilder : XxPh3FilterBitsBuilder
     private readonly double _desiredOneInFpRate;
     private readonly FastLocalBloomBitsBuilder _bloomFallback;
 
-    public Standard128RibbonBitsBuilder(double desiredOneInFpRate, int bloomMillibitsPerKey)
+    public Standard128RibbonBitsBuilder(double desiredOneInFpRate, int bloomMillibitsPerKey) : this(desiredOneInFpRate, bloomMillibitsPerKey, null) { }
+
+    /// <summary>Builder with optimize_filters_for_memory rounding against the policy's balance (null = off).</summary>
+    public Standard128RibbonBitsBuilder(double desiredOneInFpRate, int bloomMillibitsPerKey, StrongBox<long>? aggregateRoundingBalance)
+        : base(aggregateRoundingBalance)
     {
         if (!(desiredOneInFpRate >= 1.0)) throw new ArgumentOutOfRangeException(nameof(desiredOneInFpRate));
         _desiredOneInFpRate = desiredOneInFpRate;
-        _bloomFallback = new FastLocalBloomBitsBuilder(bloomMillibitsPerKey);
+        _bloomFallback = new FastLocalBloomBitsBuilder(bloomMillibitsPerKey, aggregateRoundingBalance);
     }
 
     public override void Finish(IBufferWriter<byte> output)
@@ -302,6 +407,7 @@ public sealed class Standard128RibbonBitsBuilder : XxPh3FilterBitsBuilder
         ResetEntries();
 
         uint seed = banding.OrdinalSeed;
+        lenWithMetadata = AllocateMaybeRounding(lenWithMetadata, numEntries);
         if (lenWithMetadata > int.MaxValue) ThrowHelper.NotSupported("filter too large");
         int total = (int)lenWithMetadata;
         Span<byte> buf = output.GetSpan(total)[..total];

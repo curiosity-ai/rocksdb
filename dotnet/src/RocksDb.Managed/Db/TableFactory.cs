@@ -67,6 +67,10 @@ public static class TableFactory
             UseDeltaEncoding = options.UseDeltaEncoding,
             OptimizeKeyCommonPrefix = options.OptimizeKeyCommonPrefix,
             EnableIndexCompression = options.EnableIndexCompression,
+            // We do not support partitioned filters without partitioning indexes (InitializeOptions).
+            PartitionFilters = options.PartitionFilters && options.IndexType == IndexType.TwoLevelIndexSearch,
+            DecouplePartitionedFilters = options.DecouplePartitionedFilters,
+            OptimizeFiltersForMemory = options.OptimizeFiltersForMemory,
         };
     }
 
@@ -174,7 +178,7 @@ public static class TableFactory
             CompressionType = compression,
             CompressionOptions = compressionOptions,
             MergeOperatorName = options.MergeOperatorName ?? "nullptr",
-            PrefixExtractorName = options.PrefixExtractor ?? "nullptr",
+            PrefixExtractor = options.PrefixExtractor,
             LevelAtCreation = where.Level,
             IsFlush = where.IsFlush,
         };
@@ -211,7 +215,7 @@ public static class TableFactory
             CompressionType = compression,
             CompressionOptions = compressionOptions,
             MergeOperatorName = options.MergeOperatorName ?? "nullptr",
-            PrefixExtractorName = options.PrefixExtractor ?? "nullptr",
+            PrefixExtractor = options.PrefixExtractor,
             LevelAtCreation = -1,
             IsFlush = false,
             DbId = "SST Writer",
@@ -242,6 +246,8 @@ public static class TableFactory
             VerifyChecksums = format.VerifyChecksums,
             CacheIndexAndFilterBlocks = cache is not null && t.CacheIndexAndFilterBlocks,
             CacheIndexAndFilterBlocksWithHighPriority = t.CacheIndexAndFilterBlocksWithHighPriority,
+            PinTopLevelIndexAndFilter = t.PinTopLevelIndexAndFilter,
+            PrefixExtractor = options.PrefixExtractor,
             DbSessionId = dbSessionId,
         };
         if (cache is not null) r = r with { BlockCache = cache };

@@ -1,3 +1,4 @@
+using RocksDb.Managed.Table;
 using System.Runtime.CompilerServices;
 
 namespace RocksDb.Managed.Db.Iterators;
@@ -23,6 +24,11 @@ public sealed class LevelIterator : InternalIterator
     private readonly FileMetaData[] _files;
     private readonly ReadOnlyMemory<byte>? _lower;
     private readonly ReadOnlyMemory<byte>? _upper;
+    private readonly ReadOptions? _readOptions;
+    /// <summary>The column family's prefix extractor (file iterators consult prefix filters), or null.</summary>
+    private readonly SliceTransform? _prefixExtractor;
+    /// <summary>Non-null in legacy prefix seek mode (no total_order_seek / auto_prefix_mode): Seek invalidates past the prefix.</summary>
+    private readonly SliceTransform? _prefixSeekExtractor;
     private InternalIterator? _fileIter;
     private int _fileIndex = -1;
     private bool _disposed;
@@ -32,7 +38,22 @@ public sealed class LevelIterator : InternalIterator
     /// <param name="files">Files of the level, sorted by smallest key and non-overlapping.</param>
     /// <param name="readOptions">Iterate bounds (may be null).</param>
     public LevelIterator(ITableCache tableCache, InternalKeyComparator comparator, IReadOnlyList<FileMetaData> files, ReadOptions? readOptions)
+        : this(tableCache, comparator, files, readOptions, prefixExtractor: null)
     {
+    }
+
+    /// <param name="tableCache">Opens file iterators.</param>
+    /// <param name="comparator">Internal key comparator.</param>
+    /// <param name="files">Files of the level, sorted by smallest key and non-overlapping.</param>
+    /// <param name="readOptions">Iterate bounds and prefix seek mode (may be null).</param>
+    /// <param name="prefixExtractor">The column family's prefix extractor (null: total order).</param>
+    public LevelIterator(ITableCache tableCache, InternalKeyComparator comparator, IReadOnlyList<FileMetaData> files, ReadOptions? readOptions,
+        SliceTransform? prefixExtractor)
+    {
+        _readOptions = readOptions;
+        _prefixExtractor = prefixExtractor;
+        if (prefixExtractor is not null && readOptions?.TotalOrderSeek != true && readOptions?.AutoPrefixMode != true)
+            _prefixSeekExtractor = prefixExtractor;
         ArgumentNullException.ThrowIfNull(tableCache);
         ArgumentNullException.ThrowIfNull(comparator);
         ArgumentNullException.ThrowIfNull(files);
@@ -102,7 +123,26 @@ public sealed class LevelIterator : InternalIterator
     {
         InitFileIterator(FindFile(target));
         _fileIter?.Seek(target);
-        SkipEmptyFileForward();
+        if (SkipEmptyFileForward()) CheckPrefixAfterSkippedFile(target);
+    }
+
+    /// <summary>
+    /// Port of the prefix check in LevelIterator::Seek: we've skipped the file we initially positioned to. In the prefix
+    /// seek case, it is likely that the file is skipped because of prefix bloom, where more keys are skipped. We then
+    /// check the current key and invalidate the iterator if the prefix is already passed (so the merging iterator
+    /// merges fewer children and results within the prefix stay exact).
+    /// </summary>
+    private void CheckPrefixAfterSkippedFile(ReadOnlySpan<byte> target)
+    {
+        SliceTransform? pe = _prefixSeekExtractor;
+        if (pe is null || _fileIter is null || !_fileIter.Valid) return;
+        ReadOnlySpan<byte> targetUserKey = DbFormat.ExtractUserKey(target);
+        ReadOnlySpan<byte> fileUserKey = DbFormat.ExtractUserKey(_fileIter.Key);
+        if (pe.InDomain(targetUserKey)
+            && (!pe.InDomain(fileUserKey) || _icmp.CompareUserKey(pe.Transform(targetUserKey), pe.Transform(fileUserKey)) != 0))
+        {
+            SetFileIterator(null, -1);
+        }
     }
 
     public override void SeekForPrev(ReadOnlySpan<byte> target)
@@ -126,20 +166,24 @@ public sealed class LevelIterator : InternalIterator
         SkipEmptyFileBackward();
     }
 
-    private void SkipEmptyFileForward()
+    /// <summary>Moves forward to the first non-empty file. Returns true if the current file was empty (seen_empty_file).</summary>
+    private bool SkipEmptyFileForward()
     {
+        bool seenEmptyFile = false;
         while (_fileIter is null || !_fileIter.Valid)
         {
+            seenEmptyFile = true;
             // Move to next file
             int next = _fileIter is null ? _files.Length : _fileIndex + 1;
             if (next >= _files.Length || FileStartsAtOrAfterUpperBound(next))
             {
                 SetFileIterator(null, -1);
-                return;
+                return seenEmptyFile;
             }
             InitFileIterator(next);
             _fileIter!.SeekToFirst();
         }
+        return seenEmptyFile;
     }
 
     private void SkipEmptyFileBackward()
@@ -175,8 +219,13 @@ public sealed class LevelIterator : InternalIterator
         // If the file iterator shows incomplete, we try it again if users seek to the same file, as this time we may
         // go to a different data block which is cached in block cache.
         if (_fileIter is not null && _fileIndex == index) return;
-        SetFileIterator(_tableCache.NewIterator(_files[index]), index);
+        SetFileIterator(NewFileIterator(index), index);
     }
+
+    private InternalIterator NewFileIterator(int index) =>
+        _prefixExtractor is null
+            ? _tableCache.NewIterator(_files[index])
+            : new TableInternalIterator(_tableCache.GetReader(_files[index]), TableReadFlags.None, _readOptions, _prefixExtractor);
 
     private void SetFileIterator(InternalIterator? iter, int index)
     {
@@ -191,8 +240,24 @@ public sealed class LevelIterator : InternalIterator
     public override ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) =>
         PositionAsync(0, default, Op.First, cancellationToken);
 
-    public override ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) =>
-        PositionAsync(FindFile(target.Span), target, Op.Seek, cancellationToken);
+    public override ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
+    {
+        int index = FindFile(target.Span);
+        if (_prefixSeekExtractor is null) return PositionAsync(index, target, Op.Seek, cancellationToken);
+        // Prefix seek: apply LevelIterator::Seek's prefix check when the seek moved past the initial file.
+        ValueTask t = PositionAsync(index, target, Op.Seek, cancellationToken);
+        if (!t.IsCompletedSuccessfully) return SeekPrefixSlowAsync(t, index, target);
+        t.GetAwaiter().GetResult();
+        if (_fileIndex != index) CheckPrefixAfterSkippedFile(target.Span);
+        return ValueTask.CompletedTask;
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask SeekPrefixSlowAsync(ValueTask pending, int index, ReadOnlyMemory<byte> target)
+    {
+        await pending.ConfigureAwait(false);
+        if (_fileIndex != index) CheckPrefixAfterSkippedFile(target.Span);
+    }
 
     public override ValueTask NextAsync(CancellationToken cancellationToken = default)
     {
@@ -238,7 +303,8 @@ public sealed class LevelIterator : InternalIterator
                 // Warm the table cache asynchronously so NewIterator does not block on the table open.
                 using (await _tableCache.GetReaderAsync(_files[index], ct).ConfigureAwait(false))
                 {
-                    SetFileIterator(_tableCache.NewIterator(_files[index]), index);
+                    SetFileIterator(NewFileIterator(index), index);
+
                 }
             }
             InternalIterator it = _fileIter!;

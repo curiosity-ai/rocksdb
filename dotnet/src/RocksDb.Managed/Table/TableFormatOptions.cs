@@ -34,6 +34,16 @@ public sealed record TableFormatOptions
     /// <summary>format_version &gt;= 8 common user-key prefix optimization for data and index blocks.</summary>
     public OptimizeKeyCommonPrefix OptimizeKeyCommonPrefix { get; init; } = OptimizeKeyCommonPrefix.IfFastSeek;
     public bool EnableIndexCompression { get; init; } = true;
+    /// <summary>
+    /// partition_filters: write the filter as partitions with a top-level index ("partitionedfilter.&lt;name&gt;").
+    /// Only effective with <see cref="IndexType.TwoLevelIndexSearch"/> (sanitized away otherwise, like
+    /// BlockBasedTableFactory::InitializeOptions).
+    /// </summary>
+    public bool PartitionFilters { get; init; }
+    /// <summary>decouple_partitioned_filters: cut filter partitions independently of index partitions (default true).</summary>
+    public bool DecouplePartitionedFilters { get; init; } = true;
+    /// <summary>optimize_filters_for_memory: round filter sizes to the allocator's usable size (default true, see <see cref="FilterAllocationModel"/>).</summary>
+    public bool OptimizeFiltersForMemory { get; init; } = true;
     /// <summary>Verify block checksums when reading (ReadOptions::verify_checksums default true).</summary>
     public bool VerifyChecksums { get; init; } = true;
 
@@ -46,7 +56,7 @@ public sealed record TableFormatOptions
         if (BlockRestartInterval < 1 || IndexBlockRestartInterval < 1) ThrowHelper.InvalidArgument("restart interval must be >= 1");
         if (BlockSize <= 0) ThrowHelper.InvalidArgument("block_size must be > 0");
         if (IndexType == IndexType.HashSearch) ThrowHelper.NotSupported("kHashSearch index is not supported for writing");
-        if (IndexType == IndexType.TwoLevelIndexSearch) ThrowHelper.NotSupported("partitioned index (kTwoLevelIndexSearch) is not supported for writing yet");
+        if (MetadataBlockSize <= 0) ThrowHelper.InvalidArgument("metadata_block_size must be > 0");
     }
 }
 
@@ -62,20 +72,31 @@ public sealed record TableBuilderOptions
     /// <summary>
     /// TableBuilderOptions::compression_opts: level (kDefaultCompressionLevel = 32767 means library default) and
     /// max_compressed_bytes_per_kb are used for compression; all fields are persisted in "rocksdb.compression_options".
-    /// Dictionary compression is not implemented: max_dict_bytes etc. are only recorded, not applied.
+    /// max_dict_bytes / zstd_max_train_bytes / max_dict_buffer_bytes / use_zstd_dict_trainer enable dictionary compression.
     /// </summary>
     public CompressionOptions CompressionOptions { get; init; } = new();
     public ulong ColumnFamilyId { get; init; } = TableProperties.UnknownColumnFamily;
     public string ColumnFamilyName { get; init; } = "";
     /// <summary>Persisted as "rocksdb.merge.operator" ("nullptr" when none).</summary>
     public string MergeOperatorName { get; init; } = "nullptr";
-    /// <summary>Persisted as "rocksdb.prefix.extractor.name" ("nullptr" when none). Prefix filtering itself is not implemented.</summary>
-    public string PrefixExtractorName { get; init; } = "nullptr";
+    /// <summary>
+    /// MutableCFOptions::prefix_extractor: prefixes of keys in its domain are added to the filter (in addition to whole
+    /// keys with whole_key_filtering) and its id is persisted as "rocksdb.prefix.extractor.name" ("nullptr" when none).
+    /// </summary>
+    public SliceTransform? PrefixExtractor { get; init; }
+    /// <summary>The "rocksdb.prefix.extractor.name" property value: <see cref="PrefixExtractor"/>'s id or "nullptr".</summary>
+    public string PrefixExtractorName => PrefixExtractor?.AsString() ?? "nullptr";
     /// <summary>
     /// Level the file is created at (FilterBuildingContext::level_at_creation); -1 when unknown (treated as bottommost
     /// by level-aware filter policies such as Ribbon's bloom_before_level).
     /// </summary>
     public int LevelAtCreation { get; init; } = -1;
+    /// <summary>
+    /// TableBuilderOptions::target_file_size: with dictionary compression, data blocks are buffered (for sampling) up to
+    /// min(target_file_size, max_dict_buffer_bytes), either being 0 meaning "no limit" from that source. 0 for flushes
+    /// and external files.
+    /// </summary>
+    public ulong TargetFileSize { get; init; }
     /// <summary>True when the file is written by a memtable flush (TableFileCreationReason::kFlush; Ribbon treats it as level -1).</summary>
     public bool IsFlush { get; init; }
     public ulong OldestKeyTime { get; init; }

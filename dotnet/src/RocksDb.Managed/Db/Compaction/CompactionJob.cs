@@ -273,6 +273,7 @@ internal sealed class CompactionJob
             DbSessionId = _db.Identity.SessionId,
             DbHostId = _db.Identity.HostId,
             CreationTime = oldestAncestor,
+            TargetFileSize = _c.MaxOutputFileSize,
             FileCreationTime = now,
         };
         _meta = new FileMetaData
