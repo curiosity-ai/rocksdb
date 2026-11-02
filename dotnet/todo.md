@@ -215,7 +215,9 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [ ] bottommost files marked for compaction (+ by preserve boundary) (S/M); bottommost_file_compaction_delay (S); persist round-robin cursors to MANIFEST (S); CompactFiles API (M)
   - [ ] write-controller pacing parity (L0 pile-up under free-running load) (M)
 - Transactions
-  - [~] WritePrepared two_write_queues + commit-time batches; per-txn allocations
+  - [x] two_write_queues (second WAL-only write queue, published vs allocated seqno) + commit-time write batches, all policies; compat vs native both ways
+  - [x] steady-state transactions allocate only what the equivalent WriteBatch does (557 B for 4 puts, was 717-1517 B)
+  - [ ] flaky under load? `WriteSlowdownDelaysWrites`, `AutoFlushPreservesGenerationOrderAndOldestBlobFile` (failed once in a loaded full run)
   - [ ] range locks (L); public WAL termination point (S)
 - Wide columns / blob
   - [x] compaction filters on entities (FilterV4 + lazy WideColumnBlobResolver), MultiGetEntity, attribute groups (Put/Get/MultiGet), coalescing + attribute-group iterators, lazy entity reads (GetEntityLazy/MultiGetEntityLazy, ranged blob column reads); compat-tested vs native
