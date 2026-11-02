@@ -14,9 +14,12 @@ namespace RocksDb.Managed.Utilities.Transactions;
 /// <item>Reads see the transaction's own unprepared data (<see cref="WriteUnpreparedTxnReadCallback"/>).</item>
 /// <item>Save points taken before a flush are rolled back by writing the keys' values at the save point
 /// (<c>RollbackToSavePointInternal</c>); a rollback writes the values the transaction's keys had before it.</item>
-/// <item>Commit marks every unprepared batch committed.</item>
+/// <item>Commit marks every unprepared batch committed (WAL-only, with the commit-time batch when
+/// use_only_the_last_commit_time_batch_for_recovery allows one).</item>
+/// <item>With two_write_queues a rollback writes its batch on the main queue and commits it (with the unprepared batches)
+/// by a second, data-less write on the WAL-only queue that publishes the commit sequence.</item>
 /// </list>
-/// Not ported: commit-time batches, two_write_queues, iterator invalidation at the end of the transaction.
+/// Not ported: iterator invalidation at the end of the transaction.
 /// </summary>
 internal sealed class WriteUnpreparedTxn : WritePreparedTxn
 {
@@ -248,8 +251,9 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
     /// <summary>WriteUnpreparedTxn::CommitInternal: a commit marker that commits every unprepared batch.</summary>
     private protected override async ValueTask CommitInternalAsync(bool synchronous, CancellationToken cancellationToken)
     {
-        WriteBatch marker = MarkerBatch();
-        marker.MarkCommit(_nameBytes!);
+        // A commit-time batch that would go to the memtables (includes_data) is refused, so the commit is one write
+        // (do_one_write); with two write queues it runs on the WAL-only queue and its callback publishes the commit.
+        WriteBatch working = CommitMarkerWithCommitTimeBatch();
         _commitEntry.Set(_unprepSeqs, 0);
         _writeContext.Reset();
         _writeContext.DisableMemtable = true;
@@ -257,7 +261,7 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         _writeContext.PreRelease = _commitEntry;
         try
         {
-            ValueTask w = _db.WriteAsync(_writeOptions, marker, validateColumnFamilies: false, _writeContext, synchronous, cancellationToken);
+            ValueTask w = _db.WriteAsync(_writeOptions, working, validateColumnFamilies: false, _writeContext, synchronous, cancellationToken);
             if (!w.IsCompletedSuccessfully) await w.ConfigureAwait(false);
         }
         finally
@@ -282,20 +286,35 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         var callback = new WritePreparedTxnReadCallback();
         callback.Init(_wpDb, DbFormat.MaxSequenceNumber, ReadCallback.MinUnCommittedSeq, SnapshotBackup.BackedByDbSnapshot);
         WriteRollbackKeys(_tracked, includeUntracked: true, rollbackBatch, callback, null);
+        // The Rollback marker will be used as a batch separator
         rollbackBatch.WriteBatch.MarkRollback(_nameBytes!);
+        bool doOneWrite = !TwoWriteQueues;
+        // Rollback batch may contain duplicate keys, because tracked_keys_ is not comparator aware.
         int rollbackBatchCnt = rollbackBatch.SubBatchCount;
         _commitEntry.Set(_unprepSeqs, rollbackBatchCnt);
         _writeContext.Reset();
         _writeContext.BatchCount = rollbackBatchCnt;
-        _writeContext.PreRelease = _commitEntry;
+        // Note: the rollback batch does not need AddPrepared since it is written to DB in one shot.
+        _writeContext.PreRelease = doOneWrite ? _commitEntry : null;
+        ulong prepareSeq;
         try
         {
             ValueTask w = _db.WriteAsync(_writeOptions, rollbackBatch.WriteBatch, validateColumnFamilies: false, _writeContext, synchronous, cancellationToken);
             if (!w.IsCompletedSuccessfully) await w.ConfigureAwait(false);
+            prepareSeq = _writeContext.SequenceUsed;
         }
         finally
         {
             _writeContext.Reset();
+        }
+        if (!doOneWrite)
+        {
+            // Populate unprep_seqs_ with rollback_batch_cnt, since we treat data in the rollback write batch as just
+            // another "unprepared" batch; the 2nd write commits them all and publishes the commit sequence.
+            _unprepSeqs[prepareSeq] = rollbackBatchCnt;
+            _commitEntry.Set(_unprepSeqs, 0);
+            ValueTask c = WriteCommitOnlyAsync(_writeOptions, EmptyBatch(forWal: true), _commitEntry, synchronous, cancellationToken);
+            if (!c.IsCompletedSuccessfully) await c.ConfigureAwait(false);
         }
         foreach (KeyValuePair<ulong, int> seq in _unprepSeqs) _wpDb.RemovePrepared(seq.Key, seq.Value);
         _unprepSeqs.Clear();

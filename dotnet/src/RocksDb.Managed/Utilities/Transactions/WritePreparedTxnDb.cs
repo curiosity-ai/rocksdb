@@ -27,7 +27,8 @@ internal enum SnapshotBackup : byte
 /// <item><see cref="IsInSnapshot"/> combines them; reads go through <see cref="WritePreparedTxnReadCallback"/>,
 /// compaction through <see cref="WritePreparedSnapshotChecker"/>.</item>
 /// </list>
-/// Only the single write queue is ported (two_write_queues = false): publication of sequence numbers is the DB's.
+/// With two_write_queues the commit callbacks run on the WAL-only queue and publish the commit sequence numbers
+/// (SetLastPublishedSequence); see DbImpl.TwoWriteQueues.cs.
 /// </summary>
 internal sealed class WritePreparedTxnDb : SeqPerBatchHooks
 {
@@ -834,23 +835,58 @@ internal sealed class WritePreparedTxnDb : SeqPerBatchHooks
     // Writes without a transaction (WriteInternal)
     // =====================================================================================================
 
-    public override WriteBatch BeginPlainWrite(WriteBatch batch, TransactionWriteContext context)
+    /// <summary>The options of the second write of WriteInternal with two write queues: no WAL, no sync.</summary>
+    private static readonly WriteOptions s_commitOnlyNoWal = new() { DisableWal = true };
+
+    /// <summary>
+    /// WritePreparedTxnDB::WriteInternal for a batch that does not come from a transaction (batch_cnt is computed with
+    /// SubBatchCounter). Without two write queues the batch is committed by its own write (commit-map callback). With
+    /// two write queues the main queue writes it as prepared data (AddPreparedCallback) and an empty, WAL-less write on
+    /// the second queue commits and publishes it.
+    /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    public override async ValueTask WritePlainAsync(WriteOptions? options, WriteBatch batch, bool synchronous, CancellationToken cancellationToken)
     {
-        // WriteInternal: batch_cnt is not provided, compute it (SubBatchCounter); InsertNoop marks the batch boundary.
         int batchCnt = SubBatchCounter.Count(batch, _db);
         RecordTick(Ticker.TxnDuplicateKeyOverhead);
+        bool doOneWrite = !_db.TwoWriteQueues;
         WriteBatch copy = WriteBatch.Rent();
-        copy.SetContents(batch.Data);
-        copy.InsertNoop();
-        var cb = new CommitEntryPreReleaseCallback(this);
-        cb.Set(DbFormat.MaxSequenceNumber, 0, batchCnt);
-        context.Reset();
-        context.BatchCount = batchCnt;
-        context.PreRelease = cb;
-        return copy;
+        try
+        {
+            copy.SetContents(batch.Data);
+            // In the absence of Prepare markers, use Noop as a batch separator
+            copy.InsertNoop();
+            var context = new TransactionWriteContext { BatchCount = batchCnt };
+            if (doOneWrite)
+            {
+                var commit = new CommitEntryPreReleaseCallback(this);
+                commit.Set(DbFormat.MaxSequenceNumber, 0, batchCnt);
+                context.PreRelease = commit;
+            }
+            else
+            {
+                // Since this is not 2pc, there is no need for AddPrepared but having it in the PreReleaseCallback enables
+                // an optimization. Refer to SmallestUnCommittedSeq for more details.
+                var addPrepared = new AddPreparedCallback(this);
+                addPrepared.Set(batchCnt, firstPrepareBatch: false);
+                context.PreRelease = addPrepared;
+            }
+            await _db.WriteAsync(options, copy, validateColumnFamilies: false, context, synchronous, cancellationToken).ConfigureAwait(false);
+            if (doOneWrite) return;
+            // else do the 2nd write for commit: an empty batch on the 2nd queue releases the commit sequence to readers.
+            ulong prepareSeq = context.SequenceUsed;
+            var commitWithPrepare = new CommitEntryPreReleaseCallback(this);
+            commitWithPrepare.Set(prepareSeq, batchCnt, 0);
+            var commitContext = new TransactionWriteContext { DisableMemtable = true, BatchCount = 1, PreRelease = commitWithPrepare };
+            copy.Clear();
+            await _db.WriteAsync(s_commitOnlyNoWal, copy, validateColumnFamilies: false, commitContext, synchronous, cancellationToken).ConfigureAwait(false);
+            // Note: RemovePrepared is called from within PreReleaseCallback
+        }
+        finally
+        {
+            copy.Dispose();
+        }
     }
-
-    public override void EndPlainWrite(WriteBatch written, TransactionWriteContext context) => written.Dispose();
 
     // =====================================================================================================
     // Recovery
@@ -872,7 +908,12 @@ internal sealed class WritePreparedTxnDb : SeqPerBatchHooks
         AdvanceMaxEvictedSeq(prevMax, lastSeq);
         // Create a gap between max and the next snapshot. This simplifies the logic in IsInSnapshot by not having to
         // consider the special case of max == snapshot after recovery. This is tested in IsInSnapshotEmptyMapTest.
-        if (lastSeq != 0) _db.Versions.SetLastSequence(lastSeq + 1);
+        if (lastSeq != 0)
+        {
+            // SetLastAllocatedSequence (raised by SetLastSequence), SetLastSequence, SetLastPublishedSequence.
+            _db.Versions.SetLastSequence(lastSeq + 1);
+            _db.Versions.SetLastPublishedSequence(lastSeq + 1);
+        }
     }
 
     // =====================================================================================================
@@ -994,14 +1035,19 @@ internal sealed class AddPreparedCallback(WritePreparedTxnDb db) : IPreReleaseCa
 }
 
 /// <summary>
-/// Port of WritePreparedCommitEntryPreReleaseCallback: adds the commit entries of a commit (prepared batches and / or
-/// the data written by the commit itself) to the commit cache before the commit is published.
+/// Port of WritePreparedCommitEntryPreReleaseCallback: adds the commit entries of a commit (prepared batches, an
+/// auxiliary batch written before by the main queue, and / or the data written by the commit itself) to the commit
+/// cache before the commit is published. With two write queues it runs on the WAL-only queue only and publishes the
+/// commit sequence, then removes the prepared and auxiliary batches from the prepared heap (RemovePrepared must follow
+/// the publication, or the SmallestUnCommittedSeq optimization breaks).
 /// </summary>
 internal sealed class CommitEntryPreReleaseCallback(WritePreparedTxnDb db) : IPreReleaseCallback
 {
     private ulong _prepSeq;
     private int _prepBatchCnt;
     private int _dataBatchCnt;
+    private ulong _auxSeq = DbFormat.MaxSequenceNumber;
+    private int _auxBatchCnt;
 
     /// <param name="prepSeq">The prepare sequence (<see cref="DbFormat.MaxSequenceNumber"/> = no prepare phase).</param>
     public void Set(ulong prepSeq, int prepBatchCnt, int dataBatchCnt)
@@ -1009,24 +1055,79 @@ internal sealed class CommitEntryPreReleaseCallback(WritePreparedTxnDb db) : IPr
         _prepSeq = prepSeq;
         _prepBatchCnt = prepBatchCnt;
         _dataBatchCnt = dataBatchCnt;
+        _auxSeq = DbFormat.MaxSequenceNumber;
+        _auxBatchCnt = 0;
+    }
+
+    /// <summary>aux_seq / aux_batch_cnt: a batch written before by the main queue that commits with this commit.</summary>
+    public void SetAux(ulong auxSeq, int auxBatchCnt)
+    {
+        _auxSeq = auxSeq;
+        _auxBatchCnt = auxBatchCnt;
     }
 
     public void Callback(ulong commitSeq, bool isMemDisabled, ulong logNumber, int index, int total)
     {
-        // If there is no data, the commit marker uses one sequence number; otherwise the last one of the data.
+        // Data batch is what accompanied with the commit marker and affects the last seq in the commit batch.
         ulong lastCommitSeq = _dataBatchCnt <= 1 ? commitSeq : commitSeq + (ulong)_dataBatchCnt - 1;
         if (_prepSeq != DbFormat.MaxSequenceNumber)
         {
             for (int i = 0; i < _prepBatchCnt; i++) db.AddCommitted(_prepSeq + (ulong)i, lastCommitSeq);
         }
         // else there was no prepare phase
+        for (int i = 0; i < _auxBatchCnt; i++) db.AddCommitted(_auxSeq + (ulong)i, lastCommitSeq);
+        // Commit the data that is accompanied with the commit request.
         for (int i = 0; i < _dataBatchCnt; i++) db.AddCommitted(commitSeq + (ulong)i, lastCommitSeq);
+        if (db.Db.TwoWriteQueues)
+        {
+            // Publish the sequence number. We can do that here assuming the callback is invoked only from one write
+            // queue, which would guarantee that the publish sequence numbers will be in order.
+            db.Db.SetLastPublishedSequence(lastCommitSeq);
+            if (_prepSeq != DbFormat.MaxSequenceNumber) db.RemovePrepared(_prepSeq, _prepBatchCnt);
+            if (_auxBatchCnt > 0) db.RemovePrepared(_auxSeq, _auxBatchCnt);
+        }
+        // else SequenceNumber that is updated as part of the write already does the publishing
     }
 }
 
 /// <summary>
+/// Port of WritePreparedRollbackPreReleaseCallback (write_prepared_txn_db.h): with two write queues, the second write of
+/// a rollback commits both the rolled back prepared batches and the rollback batch, then publishes the sequence.
+/// </summary>
+internal sealed class RollbackPreReleaseCallback(WritePreparedTxnDb db) : IPreReleaseCallback
+{
+    private ulong _prepSeq;
+    private ulong _rollbackSeq;
+    private int _prepBatchCnt;
+
+    public void Set(ulong prepSeq, ulong rollbackSeq, int prepBatchCnt)
+    {
+        _prepSeq = prepSeq;
+        _rollbackSeq = rollbackSeq;
+        _prepBatchCnt = prepBatchCnt;
+    }
+
+    public void Callback(ulong commitSeq, bool isMemDisabled, ulong logNumber, int index, int total)
+    {
+        db.AddCommitted(_rollbackSeq, commitSeq);
+        for (int i = 0; i < _prepBatchCnt; i++) db.AddCommitted(_prepSeq + (ulong)i, commitSeq);
+        db.Db.SetLastPublishedSequence(commitSeq);
+    }
+}
+
+/// <summary>
+/// CommitSubBatchPreReleaseCallback of WritePreparedTxnDB::Initialize: commits one sub-batch of the recoverable state
+/// (the last commit-time batch) when DBImpl::WriteRecoverableState inserts it into the memtables.
+/// </summary>
+internal sealed class CommitSubBatchPreReleaseCallback(WritePreparedTxnDb db) : IPreReleaseCallback
+{
+    public void Callback(ulong commitSeq, bool isMemDisabled, ulong logNumber, int index, int total) => db.AddCommitted(commitSeq, commitSeq);
+}
+
+/// <summary>
 /// Port of WriteUnpreparedCommitEntryPreReleaseCallback (write_unprepared_txn_db.h): commits every unprepared batch of
-/// a WriteUnprepared transaction (and the data of the commit / rollback batch itself).
+/// a WriteUnprepared transaction (and the data of the commit / rollback batch itself); with two write queues it runs
+/// on the WAL-only queue and publishes the commit sequence.
 /// </summary>
 internal sealed class UnpreparedCommitEntryPreReleaseCallback(WritePreparedTxnDb db) : IPreReleaseCallback
 {
@@ -1047,6 +1148,7 @@ internal sealed class UnpreparedCommitEntryPreReleaseCallback(WritePreparedTxnDb
             for (int i = 0; i < s.Value; i++) db.AddCommitted(s.Key + (ulong)i, lastCommitSeq);
         }
         for (int i = 0; i < _dataBatchCnt; i++) db.AddCommitted(commitSeq + (ulong)i, lastCommitSeq);
+        if (db.Db.TwoWriteQueues) db.Db.SetLastPublishedSequence(lastCommitSeq);
     }
 }
 

@@ -157,7 +157,7 @@ internal sealed partial class DbImpl
     /// Port of DBImpl::DelayWrite: sleeps according to the delayed write rate, then waits while writes are stopped.
     /// Async writers await (no thread is blocked); synchronous writers block.
     /// </summary>
-    private async ValueTask DelayWriteAsync(bool noSlowdown, bool synchronous, CancellationToken cancellationToken)
+    private async ValueTask DelayWriteAsync(bool noSlowdown, bool synchronous, CancellationToken cancellationToken, bool countGroupBytes)
     {
         WriteController wc = WriteControllerInstance;
         ulong delayMicros = 0;
@@ -166,8 +166,12 @@ internal sealed partial class DbImpl
             if (IsDbStopped && ErrorHandler.BgError is { } e) ThrowBackgroundError(e);
             if (!wc.IsStopped && wc.NeedsDelay)
             {
+                // The main queue delays by its group's size; the WAL-only queue with num_bytes = 0 (WriteImplWALOnly).
                 ulong bytes = 0;
-                for (int i = 0; i < _group.Count; i++) bytes += (ulong)(_group[i].Batch?.DataSize ?? 0);
+                if (countGroupBytes)
+                {
+                    for (int i = 0; i < _group.Count; i++) bytes += (ulong)(_group[i].Batch?.DataSize ?? 0);
+                }
                 delayMicros = wc.GetDelay(bytes);
             }
         }

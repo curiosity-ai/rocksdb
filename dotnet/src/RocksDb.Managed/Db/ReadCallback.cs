@@ -126,11 +126,9 @@ internal abstract class SeqPerBatchHooks
     public abstract Snapshot GetSnapshot();
 
     /// <summary>
-    /// Prepares a write that did not come from a transaction: returns the batch to write (with the trailing Noop
-    /// boundary, WriteInternal's InsertNoop) and fills <paramref name="context"/> (batch count and commit-map
-    /// callback). Return the batch with <see cref="EndPlainWrite"/>.
+    /// Writes a batch that did not come from a transaction (WritePreparedTxnDB::Write with skip_concurrency_control ->
+    /// WriteInternal): the batch gets its sub-batch count and a trailing Noop boundary, and is committed by the
+    /// write's pre-release callback, or, with two write queues, by a second (WAL-less) write on the WAL-only queue.
     /// </summary>
-    public abstract WriteBatch BeginPlainWrite(WriteBatch batch, TransactionWriteContext context);
-
-    public abstract void EndPlainWrite(WriteBatch written, TransactionWriteContext context);
+    public abstract ValueTask WritePlainAsync(WriteOptions? options, WriteBatch batch, bool synchronous, CancellationToken cancellationToken);
 }

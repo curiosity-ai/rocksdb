@@ -15,7 +15,7 @@ internal sealed partial class DbImpl
     private ulong ReadSequence(ReadOptions? options)
     {
         Snapshot? snap = options?.Snapshot;
-        if (snap is null) return Versions.LastSequence;
+        if (snap is null) return LastPublishedSequence;
         return snap.SequenceNumber;
     }
 

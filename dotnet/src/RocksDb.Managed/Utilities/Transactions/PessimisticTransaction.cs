@@ -29,6 +29,9 @@ internal class PessimisticTransaction : Transaction
     private bool _skipConcurrencyControl;
     private bool _skipPrepare;
     private WriteBatch? _markerBatch;
+    private WriteBatch? _memtableBatch;
+    /// <summary>use_only_the_last_commit_time_batch_for_recovery_.</summary>
+    private protected bool _useOnlyTheLastCommitTimeBatchForRecovery;
     // WriteCommittedTxn::read_timestamp_ / commit_timestamp_ (kMaxTxnTimestamp = unset).
     private ulong _readTimestamp = MaxTimestamp;
     private ulong _commitTimestamp = MaxTimestamp;
@@ -55,6 +58,7 @@ internal class PessimisticTransaction : Transaction
         _deadlockDetectDepth = options.DeadlockDetectDepth;
         _skipConcurrencyControl = options.SkipConcurrencyControl;
         _skipPrepare = options.SkipPrepare;
+        _useOnlyTheLastCommitTimeBatchForRecovery = options.UseOnlyTheLastCommitTimeBatchForRecovery;
         _lockTimeout = ToMicros(options.LockTimeout ?? _txnDb.Options.TransactionLockTimeout);
         _expirationTime = options.Expiration is { } exp && exp >= TimeSpan.Zero ? PointLockManager.NowMicros() + Math.Max(1, (long)(exp.Ticks / 10)) : 0;
         _name = null;
@@ -443,6 +447,7 @@ internal class PessimisticTransaction : Transaction
             // CommitWithoutPrepareInternal: the commit timestamp is checked (and assigned) before anything is written.
             try
             {
+                if (_commitTimeBatch is { Count: > 0 }) throw Invalid("Commit-time batch contains values that will not be committed.");
                 AssignCommitTimestamp();
             }
             catch
@@ -514,11 +519,25 @@ internal class PessimisticTransaction : Transaction
     private protected virtual async ValueTask CommitInternalAsync(bool synchronous, CancellationToken cancellationToken)
     {
         byte[]? commitTs = AssignCommitTimestamp();
-        WriteBatch marker = MarkerBatch();
+        // We take the commit-time batch and append the Commit marker. The Memtable will ignore the Commit marker in
+        // non-recovery mode.
+        WriteBatch marker = WorkingCommitBatch();
         if (commitTs is null) marker.MarkCommit(_nameBytes!);
         else marker.MarkCommitWithTimestamp(_nameBytes!, commitTs);
         _writeContext.Reset();
-        _writeContext.MemtableBatch = _batch.Batch;
+        if (marker.Count == 0)
+        {
+            _writeContext.MemtableBatch = _batch.Batch;
+        }
+        else
+        {
+            // MarkWalTerminationPoint + Append: the WAL gets the commit-time batch and the marker; the memtables get the
+            // commit-time batch followed by the prepared batch (recovery inserts them in the same order).
+            WriteBatch mem = _memtableBatch ??= new WriteBatch();
+            mem.SetContents(marker.Data);
+            WriteBatch.Append(mem, _batch.Batch);
+            _writeContext.MemtableBatch = mem;
+        }
         _writeContext.LogRef = _logNumber;
         try
         {
@@ -545,6 +564,12 @@ internal class PessimisticTransaction : Transaction
         b.Clear();
         return b;
     }
+
+    /// <summary>
+    /// GetCommitTimeWriteBatch as the batch a commit marker is appended to: the commit-time batch when the transaction
+    /// has one, an empty reusable batch otherwise.
+    /// </summary>
+    private protected WriteBatch WorkingCommitBatch() => _commitTimeBatch ?? MarkerBatch();
 
     private protected override async ValueTask RollbackCoreAsync(bool synchronous, CancellationToken cancellationToken)
     {
