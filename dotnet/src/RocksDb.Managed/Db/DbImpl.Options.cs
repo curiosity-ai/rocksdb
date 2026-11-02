@@ -32,6 +32,7 @@ internal sealed partial class DbImpl
         "blob_garbage_collection_force_threshold", "blob_compaction_readahead_size", "blob_file_starting_level", "prepopulate_blob_cache",
         "sample_for_compression", "bottommost_compression", "compression_per_level", "experimental_mempurge_threshold",
         "memtable_protection_bytes_per_key", "block_protection_bytes_per_key", "compression_opts", "bottommost_compression_opts",
+        "compaction_options_fifo", "compaction_options_universal",
     };
 
     /// <summary>db_mutable_options_type_info names supported by the managed options model.</summary>

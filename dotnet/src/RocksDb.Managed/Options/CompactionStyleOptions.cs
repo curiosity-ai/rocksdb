@@ -1,11 +1,15 @@
+using RocksDb.Managed.Options;
+
 namespace RocksDb.Managed;
 
 /// <summary>
 /// Port of rocksdb::CompactionOptionsFIFO (include/rocksdb/advanced_options.h). Used when
-/// <see cref="ColumnFamilyOptions.CompactionStyle"/> is <see cref="CompactionStyle.Fifo"/>.
-/// Not persisted in OPTIONS files by the managed port yet (the raw <c>compaction_options_fifo</c> string is kept).
+/// <see cref="ColumnFamilyOptions.CompactionStyle"/> is <see cref="CompactionStyle.Fifo"/>. Persisted in the OPTIONS
+/// file as the struct value <c>compaction_options_fifo={max_table_files_size=...;allow_compaction=...;}</c>
+/// (fifo_compaction_options_type_info, options/cf_options.cc); members the managed port does not model are preserved
+/// verbatim.
 /// </summary>
-public sealed class CompactionOptionsFifo
+public sealed class CompactionOptionsFifo : PersistedOptions<CompactionOptionsFifo>
 {
     /// <summary>Once the total size of table files reaches this, the oldest table files are deleted. Default 1GB.</summary>
     public ulong MaxTableFilesSize { get; set; } = 1024UL * 1024 * 1024;
@@ -13,7 +17,36 @@ public sealed class CompactionOptionsFifo
     /// <summary>If true, try to do an intra-L0 compaction to reduce the number of files (size-tiered).</summary>
     public bool AllowCompaction { get; set; }
 
-    public CompactionOptionsFifo Clone() => (CompactionOptionsFifo)MemberwiseClone();
+    private static readonly OptionTable<CompactionOptionsFifo> s_table = new OptionTable<CompactionOptionsFifo>()
+        .UInt64("max_table_files_size", static o => o.MaxTableFilesSize, static (o, v) => o.MaxTableFilesSize = v)
+        .Bool("allow_compaction", static o => o.AllowCompaction, static (o, v) => o.AllowCompaction = v);
+
+    internal override OptionTable<CompactionOptionsFifo> OptionTable => s_table;
+
+    public CompactionOptionsFifo Clone()
+    {
+        var c = new CompactionOptionsFifo();
+        c.CopyFrom(this);
+        return c;
+    }
+
+    internal string ToStructString() => OptionStrings.FormatStruct(ToOptionsList());
+
+    /// <summary>
+    /// Parses the struct value. Like upstream's parse function for compaction_options_fifo, a single scalar (no '=')
+    /// is assigned to max_table_files_size.
+    /// </summary>
+    internal static CompactionOptionsFifo ParseStructString(string name, string value)
+    {
+        var c = new CompactionOptionsFifo();
+        if (!value.Contains('=', StringComparison.Ordinal))
+        {
+            c.SetOption("max_table_files_size", value.Trim(), preserveUnknown: false);
+            return c;
+        }
+        c.SetOptions(OptionStrings.ParseStruct(name, value), preserveUnknown: true);
+        return c;
+    }
 }
 
 /// <summary>Mirrors rocksdb::CompactionStopStyle.</summary>
@@ -27,10 +60,11 @@ public enum CompactionStopStyle : byte
 
 /// <summary>
 /// Port of rocksdb::CompactionOptionsUniversal (include/rocksdb/universal_compaction.h). Used when
-/// <see cref="ColumnFamilyOptions.CompactionStyle"/> is <see cref="CompactionStyle.Universal"/>.
-/// Not persisted in OPTIONS files by the managed port yet.
+/// <see cref="ColumnFamilyOptions.CompactionStyle"/> is <see cref="CompactionStyle.Universal"/>. Persisted in the
+/// OPTIONS file as the struct value <c>compaction_options_universal={...}</c> (universal_compaction_options_type_info);
+/// members the managed port does not model (incremental, max_read_amp, reduce_file_locking) are preserved verbatim.
 /// </summary>
-public sealed class CompactionOptionsUniversal
+public sealed class CompactionOptionsUniversal : PersistedOptions<CompactionOptionsUniversal>
 {
     /// <summary>Percentage flexibility while comparing file size (default 1).</summary>
     public uint SizeRatio { get; set; } = 1;
@@ -46,5 +80,30 @@ public sealed class CompactionOptionsUniversal
     /// <summary>Allow trivial moves of non-overlapping files.</summary>
     public bool AllowTrivialMove { get; set; }
 
-    public CompactionOptionsUniversal Clone() => (CompactionOptionsUniversal)MemberwiseClone();
+    private static readonly OptionTable<CompactionOptionsUniversal> s_table = new OptionTable<CompactionOptionsUniversal>()
+        .UInt32("size_ratio", static o => o.SizeRatio, static (o, v) => o.SizeRatio = v)
+        .UInt32("min_merge_width", static o => o.MinMergeWidth, static (o, v) => o.MinMergeWidth = v)
+        .UInt32("max_merge_width", static o => o.MaxMergeWidth, static (o, v) => o.MaxMergeWidth = v)
+        .UInt32("max_size_amplification_percent", static o => o.MaxSizeAmplificationPercent, static (o, v) => o.MaxSizeAmplificationPercent = v)
+        .Int32("compression_size_percent", static o => o.CompressionSizePercent, static (o, v) => o.CompressionSizePercent = v)
+        .Enum("stop_style", OptionEnumMaps.CompactionStopStyle, static o => o.StopStyle, static (o, v) => o.StopStyle = v)
+        .Bool("allow_trivial_move", static o => o.AllowTrivialMove, static (o, v) => o.AllowTrivialMove = v);
+
+    internal override OptionTable<CompactionOptionsUniversal> OptionTable => s_table;
+
+    public CompactionOptionsUniversal Clone()
+    {
+        var c = new CompactionOptionsUniversal();
+        c.CopyFrom(this);
+        return c;
+    }
+
+    internal string ToStructString() => OptionStrings.FormatStruct(ToOptionsList());
+
+    internal static CompactionOptionsUniversal ParseStructString(string name, string value)
+    {
+        var c = new CompactionOptionsUniversal();
+        c.SetOptions(OptionStrings.ParseStruct(name, value), preserveUnknown: true);
+        return c;
+    }
 }

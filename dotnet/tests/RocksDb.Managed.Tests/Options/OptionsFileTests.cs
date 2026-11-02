@@ -78,7 +78,10 @@ public sealed class OptionsFileTests
         Assert.IsNull(d.MergeOperatorName);
         Assert.AreEqual("rocksdb.FixedPrefix.4", d.PrefixExtractor?.AsString());
         Assert.AreEqual(CompactionStyle.Universal, d.CompactionStyle);
-        Assert.AreEqual("{reduce_file_locking=true;size_ratio=1;}", d.UnknownOptions["compaction_options_universal"]);
+        // compaction_options_universal is typed (audit #3); members the port does not model are preserved.
+        Assert.AreEqual(1u, d.CompactionOptionsUniversal.SizeRatio);
+        Assert.AreEqual("true", d.CompactionOptionsUniversal.UnknownOptions["reduce_file_locking"]);
+        Assert.IsFalse(d.UnknownOptions.ContainsKey("compaction_options_universal"));
         Assert.AreEqual(16384UL, d.TableOptions.BlockSize);
         Assert.AreEqual(ChecksumType.Crc32c, d.TableOptions.Checksum);
         Assert.AreEqual(10, Assert.IsInstanceOfType<BloomFilterPolicy>(d.TableOptions.FilterPolicy).WholeBitsPerKey);

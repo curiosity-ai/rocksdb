@@ -73,4 +73,33 @@ public sealed class Audit3RegressionTests
         // Point-in-time recovery stops at the corrupted record: the corrupted value must never be served.
         Assert.IsNull(GetString(db2, "b"));
     }
+
+    [TestMethod]
+    public void CompactionStyleOptionsArePersistedAndMutable()
+    {
+        // options/cf_options.cc: compaction_options_fifo / compaction_options_universal are mutable struct options
+        // written to the OPTIONS file; the port neither persisted nor accepted them in SetOptions.
+        MemoryFileSystem fs = NewFs();
+        var cf = new ColumnFamilyOptions { CompactionStyle = CompactionStyle.Fifo };
+        cf.CompactionOptionsFifo.MaxTableFilesSize = 12345;
+        cf.CompactionOptionsUniversal.SizeRatio = 7;
+        cf.CompactionOptionsUniversal.StopStyle = CompactionStopStyle.SimilarSize;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, new DbOptions { CreateIfMissing = true, FileSystem = fs },
+            [new ColumnFamilyDescriptor("default", cf)]);
+        OptionsFile f = OptionsFile.Load(fs, OptionsFile.FindLatestOptionsFile(fs, DbPath)!, preserveUnknownOptions: true);
+        ColumnFamilyOptions persisted = f.FindColumnFamily("default")!;
+        Assert.AreEqual(12345UL, persisted.CompactionOptionsFifo.MaxTableFilesSize);
+        Assert.AreEqual(7u, persisted.CompactionOptionsUniversal.SizeRatio);
+        Assert.AreEqual(CompactionStopStyle.SimilarSize, persisted.CompactionOptionsUniversal.StopStyle);
+        Assert.AreEqual("{max_table_files_size=12345;allow_compaction=false;}", persisted.GetOption("compaction_options_fifo"));
+
+        // Native struct text (with members the port does not model) and the single-scalar FIFO form.
+        db.SetOptions([new("compaction_options_fifo", "{max_table_files_size=777;allow_compaction=true;age_for_warm=0;}")]);
+        Assert.AreEqual(777UL, db.DefaultColumnFamily.Options.CompactionOptionsFifo.MaxTableFilesSize);
+        Assert.IsTrue(db.DefaultColumnFamily.Options.CompactionOptionsFifo.AllowCompaction);
+        db.SetOptions([new("compaction_options_fifo", "4096")]);
+        Assert.AreEqual(4096UL, db.DefaultColumnFamily.Options.CompactionOptionsFifo.MaxTableFilesSize);
+        f = OptionsFile.Load(fs, OptionsFile.FindLatestOptionsFile(fs, DbPath)!, preserveUnknownOptions: true);
+        Assert.AreEqual(4096UL, f.FindColumnFamily("default")!.CompactionOptionsFifo.MaxTableFilesSize);
+    }
 }
