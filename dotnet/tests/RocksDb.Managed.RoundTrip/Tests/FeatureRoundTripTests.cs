@@ -1,3 +1,4 @@
+using RocksDb.Managed.Compression;
 using System.Globalization;
 using System.Text;
 using RocksDb.Managed.RoundTrip.Engines;
@@ -45,11 +46,11 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
     }
 
     [TestMethod]
-    [DataRow("none", 5, "bloom")]
-    [DataRow("snappy", 6, "ribbon")]
-    [DataRow("lz4", 7, "none")]
-    [DataRow("zstd", 7, "bloom")]
-    public async Task EdgeCaseKeysAndValues_BothWays(string compression, int formatVersion, string filter)
+    [DataRow(CompressionType.None, 5, FilterKind.Bloom)]
+    [DataRow(CompressionType.Snappy, 6, FilterKind.Ribbon)]
+    [DataRow(CompressionType.LZ4, 7, FilterKind.None)]
+    [DataRow(CompressionType.Zstd, 7, FilterKind.Bloom)]
+    public async Task EdgeCaseKeysAndValues_BothWays(CompressionType compression, int formatVersion, FilterKind filter)
     {
         DbSpec spec = DbSpec.Standard(compression, formatVersion, filter, 256UL << 10, false);
         RoundTripHarness h = CreateHarness(spec, $"{compression}-fv{formatVersion}-{filter}");
@@ -100,8 +101,8 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
         EngineKind other = Other(loader);
         int n = LongRuns ? 1_000_000 : 200_000;
         DbSpec spec = new();
-        spec.ColumnFamilies.Add(new CfSpec { Name = "default", Compression = "lz4", FormatVersion = 6, Filter = "bloom", WriteBufferSize = 512UL << 10, Merge = MergeKind.StringAppend });
-        spec.ColumnFamilies.Add(new CfSpec { Name = "counters", Compression = "zstd", FormatVersion = 7, Filter = "ribbon", WriteBufferSize = 256UL << 10, Merge = MergeKind.UInt64Add });
+        spec.ColumnFamilies.Add(new CfSpec { Name = "default", Compression = CompressionType.LZ4, FormatVersion = 6, Filter = FilterKind.Bloom, WriteBufferSize = 512UL << 10, Merge = MergeKind.StringAppend });
+        spec.ColumnFamilies.Add(new CfSpec { Name = "counters", Compression = CompressionType.Zstd, FormatVersion = 7, Filter = FilterKind.Ribbon, WriteBufferSize = 256UL << 10, Merge = MergeKind.UInt64Add });
         RoundTripHarness h = CreateHarness(spec, loader + "-" + n.ToString(CultureInfo.InvariantCulture));
         h.Model.MaxAbsentPerCf = 2000;
 
@@ -161,7 +162,7 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
     public async Task SstFiles_WrittenByOneIngestedByOther(EngineKind sstWriter)
     {
         EngineKind ingester = Other(sstWriter);
-        DbSpec spec = DbSpec.Standard("zstd", 6, "bloom", 1UL << 20, false);
+        DbSpec spec = DbSpec.Standard(CompressionType.Zstd, 6, FilterKind.Bloom, 1UL << 20, false);
         RoundTripHarness h = CreateHarness(spec, $"{sstWriter}-writes");
 
         // The ingesting engine creates the DB with overlapping data, so ingestion needs global sequence numbers.
@@ -216,7 +217,7 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
     public async Task Checkpoint_CreatedByOneOpenedByOther(EngineKind creator)
     {
         EngineKind opener = Other(creator);
-        DbSpec spec = DbSpec.Standard("lz4", 6, "ribbon", 256UL << 10, false);
+        DbSpec spec = DbSpec.Standard(CompressionType.LZ4, 6, FilterKind.Ribbon, 256UL << 10, false);
         RoundTripHarness h = CreateHarness(spec, $"{creator}-creates");
         string ckpt = h.SubDir("checkpoint");
 
@@ -248,7 +249,7 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
     public async Task TtlDatabase_BothWays(EngineKind first)
     {
         var spec = new DbSpec { TtlSeconds = 86400 };
-        spec.ColumnFamilies.Add(new CfSpec { Name = "default", Compression = "snappy", Merge = MergeKind.None, WriteBufferSize = 256UL << 10 });
+        spec.ColumnFamilies.Add(new CfSpec { Name = "default", Compression = CompressionType.Snappy, Merge = MergeKind.None, WriteBufferSize = 256UL << 10 });
         RoundTripHarness h = CreateHarness(spec, first + "-first");
         var gen = new GeneratorOptions
         {
@@ -267,7 +268,7 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
 
         // Opened without TTL, every stored value carries a plausible 4-byte write time suffix.
         using var raw = new ManagedEngine();
-        raw.Open(h.DbPath, new DbSpec { ColumnFamilies = [new CfSpec { Name = "default", Compression = "snappy", Merge = MergeKind.None }] });
+        raw.Open(h.DbPath, new DbSpec { ColumnFamilies = [new CfSpec { Name = "default", Compression = CompressionType.Snappy, Merge = MergeKind.None }] });
         long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         int count = 0;
         foreach (KeyValuePair<byte[], byte[]> kv in raw.Scan("default", null))
@@ -289,7 +290,7 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
     public async Task OptionsFile_WrittenByOneLoadedByOther(EngineKind writer)
     {
         EngineKind loader = Other(writer);
-        DbSpec spec = DbSpec.Standard("zstd", 5, "ribbon", 128UL << 10, false);
+        DbSpec spec = DbSpec.Standard(CompressionType.Zstd, 5, FilterKind.Ribbon, 128UL << 10, false);
         RoundTripHarness h = CreateHarness(spec, $"{writer}-writes");
         var gen = new GeneratorOptions { Ops = 1200, AllowColumnFamilyChanges = false };
 

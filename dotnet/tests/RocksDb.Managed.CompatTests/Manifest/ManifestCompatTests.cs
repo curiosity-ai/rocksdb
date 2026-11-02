@@ -3,6 +3,7 @@ using System.Text;
 using RocksDb.Managed.CompatTests.Infrastructure;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
+using RocksDb.Managed.Table.Filters;
 
 namespace RocksDb.Managed.CompatTests.Manifest;
 
@@ -257,7 +258,7 @@ public sealed class ManifestCompatTests
         var file = new OptionsFile();
         file.DbOptions.CreateIfMissing = true;
         var def = new ColumnFamilyOptions();
-        def.TableOptions.FilterPolicy = "bloomfilter:10:false";
+        def.TableOptions.FilterPolicy = new BloomFilterPolicy(10);
         def.CompressionPerLevel.AddRange([RocksDb.Managed.Compression.CompressionType.None, RocksDb.Managed.Compression.CompressionType.LZ4, RocksDb.Managed.Compression.CompressionType.Zstd]);
         file.ColumnFamilies.Add(new ColumnFamilyDescriptor("default", def));
         var other = new ColumnFamilyOptions { WriteBufferSize = 777777, CompactionStyle = CompactionStyle.Universal };

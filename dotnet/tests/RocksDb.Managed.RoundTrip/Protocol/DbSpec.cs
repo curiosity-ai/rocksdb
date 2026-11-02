@@ -1,3 +1,4 @@
+using RocksDb.Managed.Compression;
 using System.Text.Json;
 
 namespace RocksDb.Managed.RoundTrip.Protocol;
@@ -12,6 +13,16 @@ public enum MergeKind
     StringAppend,
 }
 
+/// <summary>Filter policy configured on a column family (10 bits per key).</summary>
+public enum FilterKind
+{
+    None,
+    /// <summary>Full Bloom filter (NewBloomFilterPolicy(10)).</summary>
+    Bloom,
+    /// <summary>Ribbon filter (NewRibbonFilterPolicy(10), bloom_before_level 0).</summary>
+    Ribbon,
+}
+
 /// <summary>
 /// Options of one column family, expressed engine-neutrally so the parent can hand the same configuration to the
 /// native child (rocksdb-sharp setters) and to the managed engine (<see cref="ColumnFamilyOptions"/>).
@@ -19,11 +30,10 @@ public enum MergeKind
 public sealed class CfSpec
 {
     public string Name { get; set; } = "default";
-    /// <summary>none | snappy | lz4 | zstd.</summary>
-    public string Compression { get; set; } = "lz4";
+    /// <summary>None, Snappy, LZ4 or Zstd.</summary>
+    public CompressionType Compression { get; set; } = CompressionType.LZ4;
     public int FormatVersion { get; set; } = 6;
-    /// <summary>none | bloom | ribbon.</summary>
-    public string Filter { get; set; } = "bloom";
+    public FilterKind Filter { get; set; } = FilterKind.Bloom;
     public ulong BlockSize { get; set; } = 4096;
     public ulong WriteBufferSize { get; set; } = 64UL << 20;
     public bool DisableAutoCompactions { get; set; }
@@ -79,7 +89,7 @@ public sealed class DbSpec
         ?? throw new InvalidDataException("empty DbSpec");
 
     /// <summary>default + three CFs with deliberately different options and merge operators.</summary>
-    public static DbSpec Standard(string compression, int formatVersion, string filter, ulong writeBufferSize, bool disableAutoCompactions)
+    public static DbSpec Standard(CompressionType compression, int formatVersion, FilterKind filter, ulong writeBufferSize, bool disableAutoCompactions)
     {
         var spec = new DbSpec();
         spec.ColumnFamilies.Add(new CfSpec
@@ -89,23 +99,23 @@ public sealed class DbSpec
         });
         spec.ColumnFamilies.Add(new CfSpec
         {
-            Name = "counters", Compression = "zstd", FormatVersion = 5, Filter = "ribbon", BlockSize = 1024,
+            Name = "counters", Compression = CompressionType.Zstd, FormatVersion = 5, Filter = FilterKind.Ribbon, BlockSize = 1024,
             WriteBufferSize = writeBufferSize, DisableAutoCompactions = disableAutoCompactions, Merge = MergeKind.UInt64Add,
         });
         spec.ColumnFamilies.Add(new CfSpec
         {
-            Name = "blobs", Compression = "none", FormatVersion = 7, Filter = "none", BlockSize = 16 * 1024,
+            Name = "blobs", Compression = CompressionType.None, FormatVersion = 7, Filter = FilterKind.None, BlockSize = 16 * 1024,
             WriteBufferSize = Math.Max(writeBufferSize, 256 * 1024), DisableAutoCompactions = disableAutoCompactions, Merge = MergeKind.None,
         });
         spec.ColumnFamilies.Add(new CfSpec
         {
-            Name = "snappy", Compression = "snappy", FormatVersion = 6, Filter = "bloom", BlockSize = 2048,
+            Name = "snappy", Compression = CompressionType.Snappy, FormatVersion = 6, Filter = FilterKind.Bloom, BlockSize = 2048,
             WriteBufferSize = writeBufferSize, DisableAutoCompactions = disableAutoCompactions, Merge = MergeKind.StringAppend,
         });
         // Not created initially: exercised by createcf / dropcf ops.
         spec.ColumnFamilies.Add(new CfSpec
         {
-            Name = "late", Compression = "lz4", FormatVersion = 7, Filter = "ribbon", WriteBufferSize = writeBufferSize,
+            Name = "late", Compression = CompressionType.LZ4, FormatVersion = 7, Filter = FilterKind.Ribbon, WriteBufferSize = writeBufferSize,
             DisableAutoCompactions = disableAutoCompactions, Merge = MergeKind.StringAppend, Initial = false,
         });
         return spec;

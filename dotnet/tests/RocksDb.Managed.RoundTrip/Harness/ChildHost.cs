@@ -19,6 +19,16 @@ internal static class ChildHost
     public const int ExitVerificationFailed = 3;
     public const int ExitError = 4;
 
+    /// <summary>The --engine spelling of an engine (the child protocol's CLI boundary).</summary>
+    public static string EngineArgument(EngineKind engine) => engine == EngineKind.Native ? "native" : "managed";
+
+    private static EngineKind ParseEngine(string name) => name switch
+    {
+        "native" => EngineKind.Native,
+        "managed" => EngineKind.Managed,
+        _ => throw new ArgumentException("unknown engine " + name),
+    };
+
     public static int Run(string[] args)
     {
         string? engineName = null, db = null, specPath = null, scriptPath = null;
@@ -44,11 +54,10 @@ internal static class ChildHost
         TextWriter stdout = Console.Out;
         stdout.WriteLine("CHILD pid=" + Environment.ProcessId.ToString(CultureInfo.InvariantCulture) + " engine=" + engineName);
         stdout.Flush();
-        IEngine engine = engineName switch
+        IEngine engine = ParseEngine(engineName) switch
         {
-            "native" => new NativeEngine(),
-            "managed" => new ManagedEngine(),
-            _ => throw new ArgumentException("unknown engine " + engineName),
+            EngineKind.Native => new NativeEngine(),
+            _ => new ManagedEngine(),
         };
         try
         {

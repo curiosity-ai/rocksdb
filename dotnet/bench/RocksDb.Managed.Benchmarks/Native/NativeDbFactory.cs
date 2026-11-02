@@ -31,13 +31,13 @@ public static class NativeDbFactory
         }
     }
 
-    public static RocksDbSharp.Compression ParseCompression(string name) => name switch
+    public static RocksDbSharp.Compression ToNative(Compression.CompressionType compression) => compression switch
     {
-        "none" or "no" => RocksDbSharp.Compression.No,
-        "snappy" => RocksDbSharp.Compression.Snappy,
-        "lz4" => RocksDbSharp.Compression.Lz4,
-        "zstd" => RocksDbSharp.Compression.Zstd,
-        _ => throw new ArgumentException("unsupported --compression " + name + " (none|snappy|lz4|zstd)"),
+        Compression.CompressionType.None => RocksDbSharp.Compression.No,
+        Compression.CompressionType.Snappy => RocksDbSharp.Compression.Snappy,
+        Compression.CompressionType.LZ4 => RocksDbSharp.Compression.Lz4,
+        Compression.CompressionType.Zstd => RocksDbSharp.Compression.Zstd,
+        _ => throw new ArgumentException("unsupported compression " + compression),
     };
 
     public static RocksDbSharp.DbOptions CreateOptions(EngineOptions options, out RocksDbSharp.Cache? cache, out IntPtr hyperClock,
@@ -53,13 +53,13 @@ public static class NativeDbFactory
         {
             table.SetNoBlockCache(true);
         }
-        else if (options.CacheType == "hyperclock")
+        else if (options.CacheType == DbBench.BlockCacheKind.HyperClock)
         {
             // rocksdb-sharp has no HyperClock factory; use the C API directly (0 = auto-resizing entry charge).
             hyperClock = RocksDbSharp.Native.Instance.rocksdb_cache_create_hyper_clock((UIntPtr)(ulong)options.BlockCacheSize, UIntPtr.Zero);
             RocksDbSharp.Native.Instance.rocksdb_block_based_options_set_block_cache(table.Handle, hyperClock);
         }
-        else if (options.CacheType == "lru")
+        else if (options.CacheType == DbBench.BlockCacheKind.Lru)
         {
             cache = RocksDbSharp.Cache.CreateLru((ulong)options.BlockCacheSize);
             table.SetBlockCache(cache);
@@ -75,7 +75,7 @@ public static class NativeDbFactory
         }
         return new RocksDbSharp.DbOptions()
             .SetCreateIfMissing(true)
-            .SetCompression(ParseCompression(options.Compression))
+            .SetCompression(ToNative(options.Compression))
             .SetWriteBufferSize((ulong)options.WriteBufferSize)
             .SetTargetFileSizeBase((ulong)options.TargetFileSizeBase)
             .SetMaxBytesForLevelBase((ulong)options.MaxBytesForLevelBase)

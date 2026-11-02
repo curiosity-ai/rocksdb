@@ -6,44 +6,93 @@ namespace RocksDb.Managed;
 /// <summary>
 /// Per column family options. Port of rocksdb::ColumnFamilyOptions + AdvancedColumnFamilyOptions
 /// (include/rocksdb/options.h, advanced_options.h) with upstream defaults; OPTIONS-file names and string forms follow
-/// options/cf_options.cc. Pluggable objects (comparator, merge operator, prefix extractor, ...) are referenced by
-/// name here; the objects themselves are resolved by the DB at open time.
+/// options/cf_options.cc. Pluggable components (merge operator, compaction filter, prefix extractor, ...) are typed
+/// objects; OPTIONS files reference them by name.
 /// </summary>
 public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
 {
-    /// <summary>Name of the block-based table factory (TableFactory::Name()).</summary>
-    public const string BlockBasedTableFactoryName = "BlockBasedTable";
+    // ---- pluggable components ----------------------------------------------------------------
+    // The objects are the API; their names are what OPTIONS files and table properties record. Built-in objects
+    // named in a parsed OPTIONS file are recreated (like upstream's ObjectRegistry); other ids are preserved verbatim
+    // and exposed as the *Name properties (see CustomizableOption).
+    private CustomizableOption<MergeOperator> _mergeOperator;
+    private CustomizableOption<CompactionFilter> _compactionFilter;
+    private CustomizableOption<CompactionFilterFactory> _compactionFilterFactory;
+    private CustomizableOption<SliceTransform> _prefixExtractor;
+    private CustomizableOption<SliceTransform> _memtableInsertWithHintPrefixExtractor;
 
-    // ---- named pluggable components ----------------------------------------------------------
+    /// <summary>Persisted name of the comparator (comparator option / MANIFEST).</summary>
     public string ComparatorName { get; set; } = "leveldb.BytewiseComparator";
-    public string? MergeOperatorName { get; set; }
+
     /// <summary>
-    /// The merge operator implementation used by the DB (not persisted). When set, its <see cref="Managed.MergeOperator.Name"/>
-    /// is what the DB records as <see cref="MergeOperatorName"/> in OPTIONS files and table properties.
+    /// The merge operator (thread-safe; used by reads, flush and compaction). Built-ins: <see cref="UInt64AddOperator"/>,
+    /// <see cref="StringAppendOperator"/> (also see <see cref="Managed.MergeOperator.CreateBuiltin"/>). Persisted as its
+    /// <see cref="Managed.MergeOperator.Name"/>; when an OPTIONS file names a built-in operator it is recreated here.
     /// </summary>
-    public MergeOperator? MergeOperator { get; set; }
-    public string? CompactionFilterName { get; set; }
-    public string? CompactionFilterFactoryName { get; set; }
+    public MergeOperator? MergeOperator
+    {
+        get => _mergeOperator.Value;
+        set => _mergeOperator.Set(value);
+    }
+
     /// <summary>
-    /// The compaction filter used by the DB (not persisted; shared by all compactions, so it must be thread-safe). When
-    /// set, its <see cref="Managed.CompactionFilter.Name"/> is recorded as <see cref="CompactionFilterName"/>.
+    /// Name recorded for the merge operator: <see cref="MergeOperator"/>'s name, or the id of a merge operator named in
+    /// a parsed OPTIONS file that has no managed implementation (such a column family cannot merge). Null when none.
     /// </summary>
-    public CompactionFilter? CompactionFilter { get; set; }
+    public string? MergeOperatorName => _mergeOperator.Name(MergeOperatorId);
+
     /// <summary>
-    /// Creates a compaction filter per compaction (not persisted). When set, its name is recorded as
-    /// <see cref="CompactionFilterFactoryName"/>. Ignored when <see cref="CompactionFilter"/> is set.
+    /// The compaction filter used by the DB (shared by all compactions, so it must be thread-safe). Persisted by
+    /// <see cref="Managed.CompactionFilter.Name"/> (compaction_filter).
     /// </summary>
-    public CompactionFilterFactory? CompactionFilterFactory { get; set; }
+    public CompactionFilter? CompactionFilter
+    {
+        get => _compactionFilter.Value;
+        set => _compactionFilter.Set(value);
+    }
+
+    /// <summary>Name recorded for the compaction filter (the object's, or an unresolved id from an OPTIONS file).</summary>
+    public string? CompactionFilterName => _compactionFilter.Name(CompactionFilterId);
+
+    /// <summary>
+    /// Creates a compaction filter per compaction. Persisted by name (compaction_filter_factory). Ignored when
+    /// <see cref="CompactionFilter"/> is set.
+    /// </summary>
+    public CompactionFilterFactory? CompactionFilterFactory
+    {
+        get => _compactionFilterFactory.Value;
+        set => _compactionFilterFactory.Set(value);
+    }
+
+    /// <summary>Name recorded for the compaction filter factory (the object's, or an unresolved id from an OPTIONS file).</summary>
+    public string? CompactionFilterFactoryName => _compactionFilterFactory.Name(CompactionFilterFactoryId);
+
     /// <summary>
     /// prefix_extractor: enables prefix Bloom filters in tables and prefix seek (see <see cref="SliceTransform"/>);
-    /// null = none. Persisted by id (e.g. <c>rocksdb.FixedPrefix.4</c>); only built-in transforms can be recreated when
-    /// an OPTIONS file is parsed (unknown ids parse as null, like upstream with ignore_unsupported_options).
+    /// null = none. Persisted by id (e.g. <c>rocksdb.FixedPrefix.4</c>); built-in transforms named in an OPTIONS file
+    /// are recreated, other ids are preserved verbatim but leave this null.
     /// </summary>
-    public SliceTransform? PrefixExtractor { get; set; }
-    public string? MemtableInsertWithHintPrefixExtractor { get; set; }
+    public SliceTransform? PrefixExtractor
+    {
+        get => _prefixExtractor.Value;
+        set => _prefixExtractor.Set(value);
+    }
+
+    /// <summary>memtable_insert_with_hint_prefix_extractor (persisted only; the managed memtable takes no insert hints).</summary>
+    public SliceTransform? MemtableInsertWithHintPrefixExtractor
+    {
+        get => _memtableInsertWithHintPrefixExtractor.Value;
+        set => _memtableInsertWithHintPrefixExtractor.Set(value);
+    }
+
+    /// <summary>Persisted sst_partitioner_factory id (no managed SST partitioners exist; kept for round trips).</summary>
     public string? SstPartitionerFactoryName { get; set; }
-    public string MemtableFactoryName { get; set; } = "SkipListFactory";
-    public string TableFactoryName { get; set; } = BlockBasedTableFactoryName;
+
+    /// <summary>memtable_factory (the managed port implements the skip list only).</summary>
+    public MemTableFactoryType MemtableFactory { get; set; } = MemTableFactoryType.SkipList;
+
+    /// <summary>table_factory; the managed port reads and writes <see cref="TableFactoryType.BlockBasedTable"/> only.</summary>
+    public TableFactoryType TableFactory { get; set; } = TableFactoryType.BlockBasedTable;
 
     /// <summary>Options of the block-based table factory (the [TableOptions/BlockBasedTable "cf"] section).</summary>
     public BlockBasedTableOptions TableOptions { get; set; } = new();
@@ -132,15 +181,19 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
 
     private static readonly OptionTable<ColumnFamilyOptions> s_table = new OptionTable<ColumnFamilyOptions>()
         .Name("comparator", static o => o.ComparatorName, static (o, v) => o.ComparatorName = v ?? "leveldb.BytewiseComparator")
-        .Name("merge_operator", static o => o.MergeOperatorName, static (o, v) => o.MergeOperatorName = v)
-        .Name("compaction_filter", static o => o.CompactionFilterName, static (o, v) => o.CompactionFilterName = v)
-        .Name("compaction_filter_factory", static o => o.CompactionFilterFactoryName, static (o, v) => o.CompactionFilterFactoryName = v)
-        .Name("prefix_extractor", static o => o.PrefixExtractor?.AsString(), static (o, v) => o.PrefixExtractor = SliceTransform.CreateFromString(v))
-        .Name("memtable_insert_with_hint_prefix_extractor", static o => o.MemtableInsertWithHintPrefixExtractor,
-            static (o, v) => o.MemtableInsertWithHintPrefixExtractor = v)
+        .Add("merge_operator", static o => o._mergeOperator.Serialize(MergeOperatorId) ?? "nullptr",
+            static (o, v) => o._mergeOperator.Parse(v, Managed.MergeOperator.CreateBuiltin, MergeOperatorId))
+        .Add("compaction_filter", static o => o._compactionFilter.Serialize(CompactionFilterId) ?? "nullptr",
+            static (o, v) => o._compactionFilter.Parse(v, static _ => null, CompactionFilterId))
+        .Add("compaction_filter_factory", static o => o._compactionFilterFactory.Serialize(CompactionFilterFactoryId) ?? "nullptr",
+            static (o, v) => o._compactionFilterFactory.Parse(v, static _ => null, CompactionFilterFactoryId))
+        .Add("prefix_extractor", static o => o._prefixExtractor.Serialize(SliceTransformId) ?? "nullptr",
+            static (o, v) => o._prefixExtractor.Parse(v, SliceTransform.CreateFromString, SliceTransformId))
+        .Add("memtable_insert_with_hint_prefix_extractor", static o => o._memtableInsertWithHintPrefixExtractor.Serialize(SliceTransformId) ?? "nullptr",
+            static (o, v) => o._memtableInsertWithHintPrefixExtractor.Parse(v, SliceTransform.CreateFromString, SliceTransformId))
         .Name("sst_partitioner_factory", static o => o.SstPartitionerFactoryName, static (o, v) => o.SstPartitionerFactoryName = v)
-        .Add("memtable_factory", static o => o.MemtableFactoryName, static (o, v) => o.MemtableFactoryName = UnwrapId(v))
-        .Add("table_factory", static o => o.TableFactoryName, static (o, v) => o.TableFactoryName = UnwrapId(v))
+        .EnumId("memtable_factory", OptionEnumMaps.MemTableFactory, static o => o.MemtableFactory, static (o, v) => o.MemtableFactory = v)
+        .EnumId("table_factory", OptionEnumMaps.TableFactory, static o => o.TableFactory, static (o, v) => o.TableFactory = v)
         .UInt64("write_buffer_size", static o => o.WriteBufferSize, static (o, v) => o.WriteBufferSize = v)
         .Int32("max_write_buffer_number", static o => o.MaxWriteBufferNumber, static (o, v) => o.MaxWriteBufferNumber = v)
         .Int32("min_write_buffer_number_to_merge", static o => o.MinWriteBufferNumberToMerge, static (o, v) => o.MinWriteBufferNumberToMerge = v)
@@ -208,6 +261,11 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .Int32("blob_file_starting_level", static o => o.BlobFileStartingLevel, static (o, v) => o.BlobFileStartingLevel = v)
         .Enum("prepopulate_blob_cache", OptionEnumMaps.PrepopulateBlobCache, static o => o.PrepopulateBlobCache, static (o, v) => o.PrepopulateBlobCache = v);
 
+    private static string MergeOperatorId(MergeOperator m) => m.Name;
+    private static string CompactionFilterId(CompactionFilter f) => f.Name;
+    private static string CompactionFilterFactoryId(CompactionFilterFactory f) => f.Name;
+    private static string SliceTransformId(SliceTransform t) => t.AsString();
+
     internal override OptionTable<ColumnFamilyOptions> OptionTable => s_table;
 
     /// <summary>Deep copy (table options and compression options included).</summary>
@@ -215,28 +273,16 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     {
         var c = new ColumnFamilyOptions();
         c.CopyFrom(this);
-        c.MergeOperator = MergeOperator;
-        c.PrefixExtractor = PrefixExtractor;
-        c.CompactionFilter = CompactionFilter;
-        c.CompactionFilterFactory = CompactionFilterFactory;
+        c._mergeOperator = _mergeOperator;
+        c._prefixExtractor = _prefixExtractor;
+        c._memtableInsertWithHintPrefixExtractor = _memtableInsertWithHintPrefixExtractor;
+        c._compactionFilter = _compactionFilter;
+        c._compactionFilterFactory = _compactionFilterFactory;
         c.CompactionOptionsFifo = CompactionOptionsFifo.Clone();
         c.CompactionOptionsUniversal = CompactionOptionsUniversal.Clone();
         c.TableOptions = TableOptions.Clone();
         c.OtherTableFactoryOptions = OtherTableFactoryOptions is null ? null : new Dictionary<string, string>(OtherTableFactoryOptions, StringComparer.Ordinal);
         return c;
-    }
-
-    /// <summary>Customizable ids may be written as "{id=Name;...}"; keep the id only.</summary>
-    private static string UnwrapId(string v)
-    {
-        if (v.Length > 0 && v[0] == '{')
-        {
-            foreach (KeyValuePair<string, string> kv in OptionStrings.ParseStruct("id", v))
-            {
-                if (kv.Key == "id") return kv.Value;
-            }
-        }
-        return v;
     }
 
     private static string FormatCompressionList(List<CompressionType> list)

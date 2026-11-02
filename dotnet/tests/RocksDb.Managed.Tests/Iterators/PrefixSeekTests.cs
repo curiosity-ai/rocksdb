@@ -2,6 +2,7 @@ using System.Text;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Tests.Db;
 using static RocksDb.Managed.Tests.Db.DbTestUtil;
+using RocksDb.Managed.Table.Filters;
 
 namespace RocksDb.Managed.Tests.Iterators;
 
@@ -25,7 +26,7 @@ public sealed class PrefixSeekTests
         MergeOperator = new StringAppendMergeOperator(),
         TableOptions = new BlockBasedTableOptions
         {
-            FilterPolicy = "bloomfilter:10:false",
+            FilterPolicy = new BloomFilterPolicy(10),
             BlockSize = 512,
             IndexType = partitioned ? IndexType.TwoLevelIndexSearch : IndexType.BinarySearch,
             PartitionFilters = partitioned,

@@ -196,7 +196,7 @@ public sealed class RoundTripHarness : IDisposable
         (string spec, string script) = WriteInputs(b, engine);
         Log($"run {b.Tag}: {engine} (child), {b.Ops.Count} ops, db={b.DbPath}");
         ChildResult r = await ChildLauncher.RunAsync(
-            ["--engine", engine == EngineKind.Native ? "native" : "managed", "--db", b.DbPath, "--spec", spec, "--script", script],
+            ["--engine", ChildHost.EngineArgument(engine), "--db", b.DbPath, "--spec", spec, "--script", script],
             timeout, onStdoutLine);
         Log($"  -> {r.ExitDescription} in {r.Elapsed.TotalSeconds.ToString("F1", CultureInfo.InvariantCulture)}s");
         LastOutput.Clear();

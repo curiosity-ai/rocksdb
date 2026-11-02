@@ -1,3 +1,4 @@
+using RocksDb.Managed.Compression;
 using System.Globalization;
 using System.Text;
 using RocksDb.Managed.RoundTrip.Protocol;
@@ -202,9 +203,9 @@ public static class CrashWorkload
     public static DbSpec Spec(ulong writeBufferSize)
     {
         var spec = new DbSpec();
-        spec.ColumnFamilies.Add(new CfSpec { Name = "default", Compression = "lz4", WriteBufferSize = writeBufferSize, Merge = MergeKind.StringAppend });
-        spec.ColumnFamilies.Add(new CfSpec { Name = "counters", Compression = "zstd", FormatVersion = 5, WriteBufferSize = writeBufferSize, Merge = MergeKind.UInt64Add });
-        spec.ColumnFamilies.Add(new CfSpec { Name = "blobs", Compression = "none", Filter = "ribbon", WriteBufferSize = writeBufferSize, Merge = MergeKind.None });
+        spec.ColumnFamilies.Add(new CfSpec { Name = "default", Compression = CompressionType.LZ4, WriteBufferSize = writeBufferSize, Merge = MergeKind.StringAppend });
+        spec.ColumnFamilies.Add(new CfSpec { Name = "counters", Compression = CompressionType.Zstd, FormatVersion = 5, WriteBufferSize = writeBufferSize, Merge = MergeKind.UInt64Add });
+        spec.ColumnFamilies.Add(new CfSpec { Name = "blobs", Compression = CompressionType.None, Filter = FilterKind.Ribbon, WriteBufferSize = writeBufferSize, Merge = MergeKind.None });
         return spec;
     }
 

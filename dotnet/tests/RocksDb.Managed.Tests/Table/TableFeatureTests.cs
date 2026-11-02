@@ -173,7 +173,7 @@ public sealed class TableFeatureTests
             PartitionFilters = partitionFilters,
             DecouplePartitionedFilters = decouple,
             MetadataBlockSize = (ulong)metadataBlockSize,
-            FilterPolicy = "bloomfilter:10:false",
+            FilterPolicy = new BloomFilterPolicy(10),
             WholeKeyFiltering = wholeKey,
         };
         TableFormatOptions format = TableFactory.CreateFormatOptions(bbto);
@@ -255,7 +255,7 @@ public sealed class TableFeatureTests
     public void TablePrefixExtractorRecreatedFromProperties()
     {
         List<byte[]> keys = PrefixKeys(3, 100);
-        TableFormatOptions format = TableFactory.CreateFormatOptions(new BlockBasedTableOptions { FilterPolicy = "bloomfilter:10:false" });
+        TableFormatOptions format = TableFactory.CreateFormatOptions(new BlockBasedTableOptions { FilterPolicy = new BloomFilterPolicy(10) });
         var tbo = new TableBuilderOptions { PrefixExtractor = SliceTransform.CreateFixedPrefix(4) };
         SliceTransform configured = SliceTransform.CreateCappedPrefix(4);
         using BlockBasedTableReader r = Build(keys, format, tbo, new TableReaderOptions { FilterPolicy = format.FilterPolicy, PrefixExtractor = configured }, out _);

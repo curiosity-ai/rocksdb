@@ -5,6 +5,7 @@ using RocksDb.Managed.CompatTests.Infrastructure;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
 using static RocksDb.Managed.CompatTests.Wal.NativeDbHelper;
+using RocksDb.Managed.Table.Filters;
 
 namespace RocksDb.Managed.CompatTests.Api;
 
@@ -268,7 +269,7 @@ public sealed class DbCompatTests
     {
         using var dir = new TempDir("dbcompat-tables");
         var cfo = new ColumnFamilyOptions { Compression = global::RocksDb.Managed.Compression.CompressionType.LZ4 };
-        cfo.TableOptions.FilterPolicy = "bloomfilter:10:false";
+        cfo.TableOptions.FilterPolicy = new BloomFilterPolicy(10);
         cfo.TableOptions.FormatVersion = 6;
         await using (RocksDatabase db = await RocksDatabase.OpenAsync(dir.Path, ManagedOptions(true), cfo))
         {

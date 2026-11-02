@@ -228,45 +228,44 @@ internal sealed partial class DbImpl : IAsyncDisposable
     /// <summary>Port of the supported subset of DB::GetProperty (db/internal_stats.cc).</summary>
     public string? GetProperty(ColumnFamilyData cfd, string property)
     {
-        const string numFilesAtLevel = "rocksdb.num-files-at-level";
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         try
         {
             if (TryGetCompactionProperty(cfd, sv, property, out string? compactionValue)) return compactionValue;
             switch (property)
             {
-                case "rocksdb.num-entries-active-mem-table":
+                case DbProperties.NumEntriesActiveMemTable:
                     return sv.Mem.NumEntries.ToString(CultureInfo.InvariantCulture);
-                case "rocksdb.num-entries-imm-mem-tables":
+                case DbProperties.NumEntriesImmMemTables:
                     {
                         long n = 0;
                         foreach (MemTable m in sv.Imm) n += m.NumEntries;
                         return n.ToString(CultureInfo.InvariantCulture);
                     }
-                case "rocksdb.num-deletes-active-mem-table":
+                case DbProperties.NumDeletesActiveMemTable:
                     return sv.Mem.NumDeletes.ToString(CultureInfo.InvariantCulture);
-                case "rocksdb.num-immutable-mem-table":
+                case DbProperties.NumImmutableMemTable:
                     return sv.Imm.Length.ToString(CultureInfo.InvariantCulture);
-                case "rocksdb.cur-size-active-mem-table":
+                case DbProperties.CurSizeActiveMemTable:
                     return sv.Mem.ApproximateMemoryUsage.ToString(CultureInfo.InvariantCulture);
-                case "rocksdb.estimate-num-keys":
+                case DbProperties.EstimateNumKeys:
                     return EstimateNumKeys(cfd, sv).ToString(CultureInfo.InvariantCulture);
-                case "rocksdb.total-sst-files-size":
-                case "rocksdb.live-sst-files-size":
+                case DbProperties.TotalSstFilesSize:
+                case DbProperties.LiveSstFilesSize:
                     {
                         ulong n = 0;
                         for (int l = 0; l < sv.Current.Storage.NumLevels; l++) n += sv.Current.Storage.NumLevelBytes(l);
                         return n.ToString(CultureInfo.InvariantCulture);
                     }
-                case "rocksdb.levelstats":
+                case DbProperties.LevelStats:
                     return sv.Current.Storage.LevelSummary();
-                case "rocksdb.num-snapshots":
+                case DbProperties.NumSnapshots:
                     return SnapshotCount.ToString(CultureInfo.InvariantCulture);
-                case "rocksdb.is-write-stopped":
+                case DbProperties.IsWriteStopped:
                     lock (_mutex) return IsWriteStalled() ? "1" : "0";
             }
-            if (property.StartsWith(numFilesAtLevel, StringComparison.Ordinal)
-                && int.TryParse(property.AsSpan(numFilesAtLevel.Length), NumberStyles.None, CultureInfo.InvariantCulture, out int level))
+            if (property.StartsWith(DbProperties.NumFilesAtLevelPrefix, StringComparison.Ordinal)
+                && int.TryParse(property.AsSpan(DbProperties.NumFilesAtLevelPrefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out int level))
             {
                 return level < sv.Current.Storage.NumLevels ? sv.Current.Storage.NumLevelFiles(level).ToString(CultureInfo.InvariantCulture) : "0";
             }
