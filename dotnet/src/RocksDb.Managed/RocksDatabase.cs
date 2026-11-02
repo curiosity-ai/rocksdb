@@ -53,13 +53,16 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
         return new RocksDatabase(t.IsCompleted ? t.Result : t.AsTask().GetAwaiter().GetResult());
     }
 
+    /// <summary>Async <see cref="Open(string, DbOptions)"/>: opens the DB with only the default column family.</summary>
     public static ValueTask<RocksDatabase> OpenAsync(string path, DbOptions options, CancellationToken cancellationToken = default) =>
         OpenAsync(path, options, [new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, new ColumnFamilyOptions())], cancellationToken);
 
+    /// <summary>Async <see cref="Open(string, DbOptions, ColumnFamilyOptions)"/>.</summary>
     public static ValueTask<RocksDatabase> OpenAsync(string path, DbOptions options, ColumnFamilyOptions defaultColumnFamilyOptions,
         CancellationToken cancellationToken = default) =>
         OpenAsync(path, options, [new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, defaultColumnFamilyOptions)], cancellationToken);
 
+    /// <summary>Async <see cref="Open(string, DbOptions, IReadOnlyList{ColumnFamilyDescriptor})"/>: recovery reads and writes asynchronously.</summary>
     public static async ValueTask<RocksDatabase> OpenAsync(string path, DbOptions options, IReadOnlyList<ColumnFamilyDescriptor> columnFamilies,
         CancellationToken cancellationToken = default)
     {
@@ -70,6 +73,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     /// <summary>Lists the column families of the DB at <paramref name="path"/> (DB::ListColumnFamilies), in id order.</summary>
     public static List<string> ListColumnFamilies(string path) => ListColumnFamilies(path, LocalFileSystem.Instance);
 
+    /// <summary>Lists the column families of the DB at <paramref name="path"/> on <paramref name="fileSystem"/>, in id order.</summary>
     public static List<string> ListColumnFamilies(string path, IFileSystem fileSystem)
     {
         ArgumentNullException.ThrowIfNull(fileSystem);
@@ -101,6 +105,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     /// <summary>The column family named <paramref name="name"/>; throws InvalidArgument if it doesn't exist.</summary>
     public ColumnFamily GetColumnFamily(string name) => Handle(_db.GetColumnFamilyData(name));
 
+    /// <summary>Gets the column family named <paramref name="name"/>; false if it doesn't exist.</summary>
     public bool TryGetColumnFamily(string name, out ColumnFamily? columnFamily)
     {
         ColumnFamilyData? cfd = _db.TryGetColumnFamilyData(name);
@@ -120,15 +125,24 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Creates a column family (DB::CreateColumnFamily); the change is recorded in the MANIFEST and the OPTIONS file.
+    /// Throws InvalidArgument if a column family with that name exists.
+    /// </summary>
     public ColumnFamily CreateColumnFamily(string name, ColumnFamilyOptions options)
     {
         ValueTask<ColumnFamilyData> t = _db.CreateColumnFamilyAsync(name, options, synchronous: true, CancellationToken.None);
         return Handle(t.IsCompleted ? t.Result : t.AsTask().GetAwaiter().GetResult());
     }
 
+    /// <summary>Async <see cref="CreateColumnFamily"/>.</summary>
     public async ValueTask<ColumnFamily> CreateColumnFamilyAsync(string name, ColumnFamilyOptions options, CancellationToken cancellationToken = default) =>
         Handle(await _db.CreateColumnFamilyAsync(name, options, synchronous: false, cancellationToken).ConfigureAwait(false));
 
+    /// <summary>
+    /// Drops a column family (DB::DropColumnFamily); the drop is recorded in the MANIFEST. Throws InvalidArgument for the
+    /// default column family or a column family that was already dropped.
+    /// </summary>
     public void DropColumnFamily(ColumnFamily columnFamily)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
@@ -156,6 +170,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
         foreach (ColumnFamily h in handles) _db.NotifyOnColumnFamilyHandleDeletionStarted(h);
     }
 
+    /// <summary>Async <see cref="DropColumnFamily"/>.</summary>
     public async ValueTask DropColumnFamilyAsync(ColumnFamily columnFamily, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
@@ -246,6 +261,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(columnFamily);
         return columnFamily.NewIterator(options);
     }
+    /// <summary>Creates an iterator over the default column family; table files are opened asynchronously.</summary>
     public ValueTask<Iterator> NewIteratorAsync(ReadOptions? options, CancellationToken cancellationToken = default) =>
         _default.NewIteratorAsync(options, cancellationToken);
 
@@ -253,6 +269,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     // Default column family data operations (see ColumnFamily for documentation)
     // =====================================================================================================
 
+    /// <summary>Sets <paramref name="key"/> to <paramref name="value"/> in the default column family (overloads: <see cref="ColumnFamily.Put(ReadOnlySpan{byte}, ReadOnlySpan{byte})"/>).</summary>
     public void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => _default.Put(key, value);
     public void Put(WriteOptions options, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => _default.Put(options, key, value);
     public ValueTask PutAsync(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, CancellationToken cancellationToken = default) =>
@@ -260,18 +277,21 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public ValueTask PutAsync(WriteOptions options, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, CancellationToken cancellationToken = default) =>
         _default.PutAsync(options, key, value, cancellationToken);
 
+    /// <summary>Removes <paramref name="key"/> from the default column family (a no-op if it doesn't exist).</summary>
     public void Delete(ReadOnlySpan<byte> key) => _default.Delete(key);
     public void Delete(WriteOptions options, ReadOnlySpan<byte> key) => _default.Delete(options, key);
     public ValueTask DeleteAsync(ReadOnlyMemory<byte> key, CancellationToken cancellationToken = default) => _default.DeleteAsync(key, cancellationToken);
     public ValueTask DeleteAsync(WriteOptions options, ReadOnlyMemory<byte> key, CancellationToken cancellationToken = default) =>
         _default.DeleteAsync(options, key, cancellationToken);
 
+    /// <summary>SingleDelete in the default column family; see <see cref="ColumnFamily.SingleDelete(ReadOnlySpan{byte})"/>.</summary>
     public void SingleDelete(ReadOnlySpan<byte> key) => _default.SingleDelete(key);
     public void SingleDelete(WriteOptions options, ReadOnlySpan<byte> key) => _default.SingleDelete(options, key);
     public ValueTask SingleDeleteAsync(ReadOnlyMemory<byte> key, CancellationToken cancellationToken = default) => _default.SingleDeleteAsync(key, cancellationToken);
     public ValueTask SingleDeleteAsync(WriteOptions options, ReadOnlyMemory<byte> key, CancellationToken cancellationToken = default) =>
         _default.SingleDeleteAsync(options, key, cancellationToken);
 
+    /// <summary>Removes all keys in [<paramref name="beginKey"/>, <paramref name="endKey"/>) from the default column family.</summary>
     public void DeleteRange(ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) => _default.DeleteRange(beginKey, endKey);
     public void DeleteRange(WriteOptions options, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) => _default.DeleteRange(options, beginKey, endKey);
     public ValueTask DeleteRangeAsync(ReadOnlyMemory<byte> beginKey, ReadOnlyMemory<byte> endKey, CancellationToken cancellationToken = default) =>
@@ -279,6 +299,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public ValueTask DeleteRangeAsync(WriteOptions options, ReadOnlyMemory<byte> beginKey, ReadOnlyMemory<byte> endKey, CancellationToken cancellationToken = default) =>
         _default.DeleteRangeAsync(options, beginKey, endKey, cancellationToken);
 
+    /// <summary>Adds a merge operand for <paramref name="key"/> in the default column family (requires a merge operator).</summary>
     public void Merge(ReadOnlySpan<byte> key, ReadOnlySpan<byte> operand) => _default.Merge(key, operand);
     public void Merge(WriteOptions options, ReadOnlySpan<byte> key, ReadOnlySpan<byte> operand) => _default.Merge(options, key, operand);
     public ValueTask MergeAsync(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> operand, CancellationToken cancellationToken = default) =>
@@ -286,37 +307,55 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public ValueTask MergeAsync(WriteOptions options, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> operand, CancellationToken cancellationToken = default) =>
         _default.MergeAsync(options, key, operand, cancellationToken);
 
+    /// <summary>Looks up <paramref name="key"/> in the default column family and appends its value to <paramref name="value"/>. Returns false if not found.</summary>
     public bool TryGet(ReadOnlySpan<byte> key, IBufferWriter<byte> value) => _default.TryGet(key, value);
     public bool TryGet(ReadOptions? options, ReadOnlySpan<byte> key, IBufferWriter<byte> value) => _default.TryGet(options, key, value);
+    /// <summary>
+    /// Looks up <paramref name="key"/> and copies up to <paramref name="destination"/>.Length bytes of its value. Returns
+    /// false if not found; <paramref name="valueLength"/> is the full value length (which may exceed the destination).
+    /// </summary>
     public bool TryGet(ReadOnlySpan<byte> key, Span<byte> destination, out int valueLength) => _default.TryGet(key, destination, out valueLength);
     public bool TryGet(ReadOptions? options, ReadOnlySpan<byte> key, Span<byte> destination, out int valueLength) =>
         _default.TryGet(options, key, destination, out valueLength);
+    /// <summary>
+    /// Zero-copy lookup: calls <paramref name="reader"/> with the value (valid only during the call). Returns false if the
+    /// key was not found.
+    /// </summary>
     public bool TryGet<TState, TResult>(ReadOnlySpan<byte> key, TState state, ReadOnlySpanFunc<TState, TResult> reader, out TResult result) =>
         _default.TryGet(key, state, reader, out result);
     public bool TryGet<TState, TResult>(ReadOptions? options, ReadOnlySpan<byte> key, TState state, ReadOnlySpanFunc<TState, TResult> reader, out TResult result) =>
         _default.TryGet(options, key, state, reader, out result);
+    /// <summary>Zero-copy lookup returning <paramref name="reader"/>'s result, or default if the key was not found.</summary>
     public TResult? Get<TState, TResult>(ReadOnlySpan<byte> key, TState state, ReadOnlySpanFunc<TState, TResult> reader) => _default.Get(key, state, reader);
+    /// <summary>The value of <paramref name="key"/> in a pooled buffer (dispose it to return the buffer), or null if not found.</summary>
     public PooledValue? GetPooled(ReadOnlySpan<byte> key) => _default.GetPooled(key);
     public PooledValue? GetPooled(ReadOptions? options, ReadOnlySpan<byte> key) => _default.GetPooled(options, key);
+    /// <summary>The value of <paramref name="key"/> as a new array, or null if not found. Allocates; see the TryGet overloads.</summary>
     public byte[]? Get(ReadOnlySpan<byte> key) => _default.Get(key);
     public byte[]? Get(ReadOptions? options, ReadOnlySpan<byte> key) => _default.Get(options, key);
     public bool ContainsKey(ReadOnlySpan<byte> key) => _default.ContainsKey(key);
+    /// <summary>Looks up several keys from one consistent view; null entries are keys that were not found. Allocates; see <see cref="MultiGetBatch"/>.</summary>
     public byte[]?[] MultiGet(IReadOnlyList<byte[]> keys) => _default.MultiGet(keys);
     public byte[]?[] MultiGet(ReadOptions? options, IReadOnlyList<byte[]> keys) => _default.MultiGet(options, keys);
+    /// <summary>Runs a reusable <see cref="MultiGetBatch"/> against the default column family (DB::MultiGet).</summary>
     public void MultiGet(MultiGetBatch batch) => _default.MultiGet(batch);
     public void MultiGet(ReadOptions? options, MultiGetBatch batch) => _default.MultiGet(options, batch);
+    /// <summary>Async <see cref="MultiGet(MultiGetBatch)"/>: data blocks missing from the cache are read asynchronously.</summary>
     public ValueTask MultiGetAsync(MultiGetBatch batch, CancellationToken cancellationToken = default) => _default.MultiGetAsync(batch, cancellationToken);
     public ValueTask MultiGetAsync(ReadOptions? options, MultiGetBatch batch, CancellationToken cancellationToken = default) =>
         _default.MultiGetAsync(options, batch, cancellationToken);
 
+    /// <summary>Async <see cref="TryGet(ReadOnlySpan{byte}, IBufferWriter{byte})"/>; completes synchronously on memtable and cache hits.</summary>
     public ValueTask<bool> TryGetAsync(ReadOnlyMemory<byte> key, IBufferWriter<byte> value, CancellationToken cancellationToken = default) =>
         _default.TryGetAsync(key, value, cancellationToken);
     public ValueTask<bool> TryGetAsync(ReadOptions? options, ReadOnlyMemory<byte> key, IBufferWriter<byte> value, CancellationToken cancellationToken = default) =>
         _default.TryGetAsync(options, key, value, cancellationToken);
+    /// <summary>Async <see cref="GetPooled(ReadOnlySpan{byte})"/>.</summary>
     public ValueTask<PooledValue?> GetPooledAsync(ReadOnlyMemory<byte> key, CancellationToken cancellationToken = default) =>
         _default.GetPooledAsync(key, cancellationToken);
     public ValueTask<PooledValue?> GetPooledAsync(ReadOptions? options, ReadOnlyMemory<byte> key, CancellationToken cancellationToken = default) =>
         _default.GetPooledAsync(options, key, cancellationToken);
+    /// <summary>Async <see cref="Get(ReadOnlySpan{byte})"/>.</summary>
     public ValueTask<byte[]?> GetAsync(ReadOnlyMemory<byte> key, CancellationToken cancellationToken = default) => _default.GetAsync(key, cancellationToken);
     public ValueTask<byte[]?> GetAsync(ReadOptions? options, ReadOnlyMemory<byte> key, CancellationToken cancellationToken = default) =>
         _default.GetAsync(options, key, cancellationToken);
