@@ -96,6 +96,13 @@ public sealed class ScriptRunner(IEngine engine, string dbPath, DbSpec spec, Tex
                 break;
             case OpKind.Ingest: engine.Ingest(op.Cf!, op.Arg!.Split('|'), op.N != 0); break;
             case OpKind.Checkpoint: engine.Checkpoint(op.Arg!); break;
+            case OpKind.Backup: engine.Backup(op.Arg!, op.N != 0); break;
+            case OpKind.Restore:
+                {
+                    string[] dirs = op.Arg!.Split('|');
+                    engine.RestoreLatestBackup(dirs[0], dirs[1]);
+                    break;
+                }
             case OpKind.Snap: engine.TakeSnapshot(op.N); break;
             case OpKind.SnapRelease: engine.ReleaseSnapshot(op.N); break;
             case OpKind.SnapVerify: Verify(Contents.Read(op.Arg!), op.N, "snapshot " + op.N); break;

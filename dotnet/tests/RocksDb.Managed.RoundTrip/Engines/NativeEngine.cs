@@ -301,6 +301,46 @@ public sealed class NativeEngine : IEngine
         cp.Save(dir);
     }
 
+    // BackupEngine through the C API (rocksdb_backup_engine_*), default BackupEngineOptions.
+    public void Backup(string backupDir, bool flushBeforeBackup)
+    {
+        N.Native n = N.Native.Instance;
+        var options = new N.DbOptions();
+        IntPtr be = n.rocksdb_backup_engine_open(options.Handle, backupDir);
+        try
+        {
+            n.rocksdb_backup_engine_create_new_backup_flush(be, Db.Handle, flushBeforeBackup ? (byte)1 : (byte)0);
+            IntPtr info = n.rocksdb_backup_engine_get_backup_info(be);
+            uint id;
+            try { id = n.rocksdb_backup_engine_info_backup_id(info, n.rocksdb_backup_engine_info_count(info) - 1); }
+            finally { n.rocksdb_backup_engine_info_destroy(info); }
+            n.rocksdb_backup_engine_verify_backup(be, id);
+        }
+        finally
+        {
+            n.rocksdb_backup_engine_close(be);
+            GC.KeepAlive(options);
+        }
+    }
+
+    public void RestoreLatestBackup(string backupDir, string targetDir)
+    {
+        N.Native n = N.Native.Instance;
+        var options = new N.DbOptions();
+        IntPtr be = n.rocksdb_backup_engine_open(options.Handle, backupDir);
+        IntPtr ro = n.rocksdb_restore_options_create();
+        try
+        {
+            n.rocksdb_backup_engine_restore_db_from_latest_backup(be, targetDir, targetDir, ro);
+        }
+        finally
+        {
+            n.rocksdb_restore_options_destroy(ro);
+            n.rocksdb_backup_engine_close(be);
+            GC.KeepAlive(options);
+        }
+    }
+
     public void TakeSnapshot(long id) => _snapshots.Add(id, Db.CreateSnapshot());
 
     public void ReleaseSnapshot(long id)

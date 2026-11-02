@@ -180,6 +180,19 @@ public sealed class ManagedEngine : IEngine
 
     public void Checkpoint(string dir) => Db.CreateCheckpoint(dir);
 
+    public void Backup(string backupDir, bool flushBeforeBackup)
+    {
+        using var be = Utilities.Backup.BackupEngine.Open(new Utilities.Backup.BackupEngineOptions(backupDir));
+        be.CreateNewBackup(Db, flushBeforeBackup);
+        be.VerifyBackup(be.GetBackupInfo()[^1].BackupId, verifyWithChecksum: true);
+    }
+
+    public void RestoreLatestBackup(string backupDir, string targetDir)
+    {
+        using var be = Utilities.Backup.BackupEngineReadOnly.Open(new Utilities.Backup.BackupEngineOptions(backupDir));
+        be.RestoreDbFromLatestBackup(targetDir, targetDir, new Utilities.Backup.RestoreOptions());
+    }
+
     public void TakeSnapshot(long id) => _snapshots.Add(id, Db.GetSnapshot());
 
     public void ReleaseSnapshot(long id)

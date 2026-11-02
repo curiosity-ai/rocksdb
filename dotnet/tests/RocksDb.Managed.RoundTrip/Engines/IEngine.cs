@@ -43,6 +43,12 @@ public interface IEngine : IDisposable
 
     void Checkpoint(string dir);
 
+    /// <summary>Adds a backup of the DB to the BackupEngine directory <paramref name="backupDir"/> (created if missing).</summary>
+    void Backup(string backupDir, bool flushBeforeBackup);
+
+    /// <summary>Restores the latest backup of <paramref name="backupDir"/> into <paramref name="targetDir"/> (DB and WAL dir).</summary>
+    void RestoreLatestBackup(string backupDir, string targetDir);
+
     void TakeSnapshot(long id);
 
     void ReleaseSnapshot(long id);
