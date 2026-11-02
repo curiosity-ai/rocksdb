@@ -47,6 +47,18 @@ public sealed unsafe class MemTable : IDisposable
     private readonly byte[]? _newestUdt;
     private bool _hasNewestUdt;
     private readonly Lock? _newestUdtLock;
+    // Memtable bloom (bloom_filter_): prefixes of prefix_extractor_ and/or whole user keys (without timestamp).
+    private readonly DynamicBloom? _bloom;
+    private readonly SliceTransform? _prefixExtractor;
+    private readonly bool _wholeKeyFiltering;
+    private readonly int _tsSize;
+    // inplace_update_support: striped reader/writer spin locks (locks_), 0 = free, > 0 = readers, -1 = writer.
+    private readonly int[]? _locks;
+    private readonly InplaceUpdateCallback? _inplaceCallback;
+    // memtable_insert_with_hint_prefix_extractor: per-prefix skiplist splice (insert_hints_), serial inserts only.
+    private readonly SliceTransform? _insertHintExtractor;
+    private Dictionary<ArenaSlice, nint>? _insertHints;
+    [ThreadStatic] private static byte[]? t_inplaceValue;
 
     private int _refs;
     private long _writeBufferSize;
@@ -100,7 +112,29 @@ public sealed unsafe class MemTable : IDisposable
         UpdateFlushState();
         // something went wrong if we need to flush before inserting anything
         Debug.Assert(!ShouldScheduleFlush);
+
+        _tsSize = _ucmp.TimestampSize;
+        _prefixExtractor = options.PrefixExtractor;
+        _wholeKeyFiltering = options.WholeKeyFiltering;
+        // use bloom_filter_ for both whole key and prefix bloom filter
+        if ((_prefixExtractor is not null || _wholeKeyFiltering) && options.PrefixBloomBits > 0)
+            _bloom = new DynamicBloom(_arena, options.PrefixBloomBits, 6 /* hard coded 6 probes */);
+        if (options.InplaceUpdateSupport)
+        {
+            _locks = new int[Math.Max(1, options.InplaceUpdateNumLocks)];
+            _inplaceCallback = options.InplaceCallback;
+        }
+        _insertHintExtractor = options.InsertWithHintPrefixExtractor;
     }
+
+    /// <summary>The memtable bloom filter (memtable_prefix_bloom_size_ratio), or null.</summary>
+    public DynamicBloom? BloomFilter => _bloom;
+
+    /// <summary>Whether entries may be overwritten in place (inplace_update_support): values must be copied under a lock.</summary>
+    public bool InplaceUpdateSupport => _locks is not null;
+
+    /// <summary>inplace_callback captured when the memtable was created (null: plain in-place Update).</summary>
+    public InplaceUpdateCallback? InplaceCallback => _inplaceCallback;
 
     public InternalKeyComparator Comparator => _comparator;
 
@@ -151,6 +185,8 @@ public sealed unsafe class MemTable : IDisposable
     {
         if (!Insert(sequence, type, key, value, concurrent: false, out int encodedLen)) return false;
         if (_newestUdtSize != 0) MaybeUpdateNewestUdt(key);
+        // Range deletions take the concurrent insert path upstream (AddConcurrently on the bloom too).
+        if (_bloom is not null) AddToBloom(key, concurrent: type == EntryType.RangeDeletion);
 
         Interlocked.Increment(ref _numEntries);
         Interlocked.Add(ref _dataSize, encodedLen);
@@ -175,6 +211,7 @@ public sealed unsafe class MemTable : IDisposable
     {
         if (!Insert(sequence, type, key, value, concurrent: true, out int encodedLen)) return false;
         if (_newestUdtSize != 0) MaybeUpdateNewestUdt(key);
+        if (_bloom is not null) AddToBloom(key, concurrent: true);
         postProcessInfo.NumEntries++;
         postProcessInfo.DataSize += encodedLen;
         if (type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp)
@@ -226,7 +263,229 @@ public sealed unsafe class MemTable : IDisposable
         Debug.Assert(p + value.Length == encodedLen);
 
         // Range deletions always insert concurrently-safe (they may race with other range-deletion writers).
-        return concurrent || type == EntryType.RangeDeletion ? table.InsertConcurrently(buf) : table.Insert(buf);
+        if (concurrent || type == EntryType.RangeDeletion) return table.InsertConcurrently(buf);
+        // Extract prefix for insert with hint. Hints are for point key table (`table_`) only.
+        if (_insertHintExtractor is { } hx)
+        {
+            int keyOffset = Coding.VarintLength(internalKeySize);
+            var keySlice = new ReadOnlySpan<byte>(buf + keyOffset, key.Length);
+            if (hx.InDomain(keySlice))
+            {
+                ReadOnlySpan<byte> prefix = hx.Transform(keySlice);
+                // The prefix bytes live in the arena (the inserted entry), so they stay valid as the dictionary key.
+                var slice = new ArenaSlice((byte*)Unsafe.AsPointer(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(prefix)), prefix.Length);
+                ref nint hint = ref System.Runtime.InteropServices.CollectionsMarshal.GetValueRefOrAddDefault(_insertHints ??= new Dictionary<ArenaSlice, nint>(), slice, out _);
+                return table.InsertWithHint(buf, ref hint);
+            }
+        }
+        return table.Insert(buf);
+    }
+
+    /// <summary>MemTable::Add's bloom update: the prefix (if in the extractor's domain) and/or the whole key, without timestamp.</summary>
+    private void AddToBloom(ReadOnlySpan<byte> userKey, bool concurrent)
+    {
+        DynamicBloom bloom = _bloom!;
+        ReadOnlySpan<byte> keyWithoutTs = _tsSize == 0 ? userKey : userKey[..^_tsSize];
+        if (_prefixExtractor is { } pe && pe.InDomain(keyWithoutTs))
+        {
+            if (concurrent) bloom.AddConcurrently(pe.Transform(keyWithoutTs));
+            else bloom.Add(pe.Transform(keyWithoutTs));
+        }
+        if (_wholeKeyFiltering)
+        {
+            if (concurrent) bloom.AddConcurrently(keyWithoutTs);
+            else bloom.Add(keyWithoutTs);
+        }
+    }
+
+    /// <summary>
+    /// The memtable bloom check of MemTable::Get: false when the key (whole-key filtering) or its prefix is definitely
+    /// absent. When both whole-key filtering and a prefix extractor are set, only the whole key is checked for Get.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool BloomMayContain(ReadOnlySpan<byte> userKey)
+    {
+        ReadOnlySpan<byte> keyWithoutTs = _tsSize == 0 ? userKey : userKey[..^_tsSize];
+        if (_wholeKeyFiltering) return _bloom!.MayContain(keyWithoutTs);
+        SliceTransform pe = _prefixExtractor!;
+        return !pe.InDomain(keyWithoutTs) || _bloom!.MayContain(pe.Transform(keyWithoutTs));
+    }
+
+    // ------------------------------------------------------------------ in-place updates
+
+    /// <summary>Result of <see cref="UpdateCallback"/>.</summary>
+    internal enum UpdateCallbackResult : byte
+    {
+        /// <summary>The memtable handled the write (updated in place, added a merged value, or no update).</summary>
+        Done,
+        /// <summary>The newest entry of the key is not a value in this memtable (Status::NotFound).</summary>
+        NotFound,
+        /// <summary>The merged value could not be added (key+seq exists).</summary>
+        AddFailed,
+    }
+
+    private int LockIndex(ReadOnlySpan<byte> userKey) => (int)Hash.FastRange32(Hash.Hash32(userKey, 0), (uint)_locks!.Length);
+
+    private void ReadLock(int i)
+    {
+        var sw = new SpinWait();
+        while (true)
+        {
+            int s = Volatile.Read(ref _locks![i]);
+            if (s >= 0 && Interlocked.CompareExchange(ref _locks[i], s + 1, s) == s) return;
+            sw.SpinOnce();
+        }
+    }
+
+    private void ReadUnlock(int i) => Interlocked.Decrement(ref _locks![i]);
+
+    private void WriteLock(int i)
+    {
+        var sw = new SpinWait();
+        while (Interlocked.CompareExchange(ref _locks![i], -1, 0) != 0) sw.SpinOnce();
+    }
+
+    private void WriteUnlock(int i) => Volatile.Write(ref _locks![i], 0);
+
+    /// <summary>
+    /// Finds the newest entry of <paramref name="userKey"/> visible at <paramref name="sequence"/> (iter-&gt;Seek of a
+    /// LookupKey): the entry's internal key and the pointer to its value-length varint, or false when the newest entry has
+    /// another user key.
+    /// </summary>
+    [SkipLocalsInit]
+    private bool FindLatestEntry(ReadOnlySpan<byte> userKey, ulong sequence, out SkipListKey entryKey)
+    {
+        int n = userKey.Length + DbFormat.InternalKeyFooterSize;
+        byte[]? rented = null;
+        Span<byte> ikey = n <= 256 ? stackalloc byte[n] : (rented = System.Buffers.ArrayPool<byte>.Shared.Rent(n)).AsSpan(0, n);
+        try
+        {
+            userKey.CopyTo(ikey);
+            Coding.EncodeFixed64(ikey[userKey.Length..], DbFormat.PackSequenceAndType(sequence, DbFormat.ValueTypeForSeek));
+            var it = new InlineSkipList<MemTableKeyComparer>.Iterator(_table);
+            fixed (byte* pk = ikey) it.Seek(new SkipListKey(pk, n));
+            entryKey = default;
+            if (!it.Valid) return false;
+            entryKey = MemTableKeyComparer.DecodeEntryKey(it.Key);
+            // Check that it belongs to same user key. We do not check the sequence number since the Seek() call above
+            // should have skipped all entries with overly large sequence numbers.
+            return _ucmp.Equal(new ReadOnlySpan<byte>(entryKey.Ptr, entryKey.Length - DbFormat.InternalKeyFooterSize), userKey);
+        }
+        finally
+        {
+            if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// Port of MemTable::Update (inplace_update_support): if the newest entry of the key is of the same
+    /// <paramref name="type"/> and its value is at least as large as <paramref name="value"/>, the value is overwritten in
+    /// place under the key's write lock (the existing sequence number prevails); otherwise the entry is added. Returns
+    /// false like <see cref="Add"/> when an entry with the same key and sequence number exists. Serial writers only.
+    /// </summary>
+    public bool Update(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+    {
+        if (_locks is not null && FindLatestEntry(key, sequence, out SkipListKey ek))
+        {
+            ulong tag = Coding.DecodeFixed64(new ReadOnlySpan<byte>(ek.Ptr + ek.Length - DbFormat.InternalKeyFooterSize, DbFormat.InternalKeyFooterSize));
+            if ((EntryType)(byte)tag == type)
+            {
+                byte* p = ek.Ptr + ek.Length;
+                int lenBytes = Coding.DecodeVarint32(new ReadOnlySpan<byte>(p, Coding.MaxVarint32Length), out uint prevSize);
+                // Update value, if new value size <= previous value size
+                if ((uint)value.Length <= prevSize)
+                {
+                    int lockIndex = LockIndex(key);
+                    WriteLock(lockIndex);
+                    try
+                    {
+                        int w = Coding.EncodeVarint32(new Span<byte>(p, lenBytes), (uint)value.Length);
+                        value.CopyTo(new Span<byte>(p + w, value.Length));
+                    }
+                    finally
+                    {
+                        WriteUnlock(lockIndex);
+                    }
+                    return true;
+                }
+            }
+        }
+        // The latest value is not value_type or key doesn't exist
+        return Add(sequence, type, key, value);
+    }
+
+    /// <summary>
+    /// Port of MemTable::UpdateCallback (inplace_update_support with inplace_callback): when the newest entry of the key
+    /// is a value, the callback runs on it under the key's write lock and either updates it in place, produces a merged
+    /// value (added as a new entry) or does nothing. <see cref="UpdateCallbackResult.NotFound"/> when the key has no
+    /// value entry here (the caller then reads the DB). Serial writers only.
+    /// </summary>
+    internal UpdateCallbackResult UpdateCallback(ulong sequence, ReadOnlySpan<byte> key, ReadOnlySpan<byte> delta, InplaceUpdateCallback callback)
+    {
+        if (_locks is null || !FindLatestEntry(key, sequence, out SkipListKey ek)) return UpdateCallbackResult.NotFound;
+        ulong tag = Coding.DecodeFixed64(new ReadOnlySpan<byte>(ek.Ptr + ek.Length - DbFormat.InternalKeyFooterSize, DbFormat.InternalKeyFooterSize));
+        if ((EntryType)(byte)tag != EntryType.Value) return UpdateCallbackResult.NotFound;
+        byte* p = ek.Ptr + ek.Length;
+        int lenBytes = Coding.DecodeVarint32(new ReadOnlySpan<byte>(p, Coding.MaxVarint32Length), out uint prevSizeU);
+        int prevSize = (int)prevSizeU;
+        byte* prevBuffer = p + lenBytes;
+        int newPrevSize = prevSize;
+        int lockIndex = LockIndex(key);
+        using var merged = new PooledBufferWriter(0);
+        WriteLock(lockIndex);
+        try
+        {
+            InplaceUpdateStatus status = callback(new Span<byte>(prevBuffer, prevSize), true, ref newPrevSize, delta, merged);
+            if (status == InplaceUpdateStatus.UpdatedInplace)
+            {
+                // Value already updated by callback.
+                if ((uint)newPrevSize > (uint)prevSize) ThrowHelper.InvalidArgument("inplace_callback grew the value in place");
+                if (newPrevSize < prevSize)
+                {
+                    // overwrite the new prev_size
+                    int w = Coding.EncodeVarint32(new Span<byte>(p, lenBytes), (uint)newPrevSize);
+                    // shift the value buffer as well.
+                    if (w < lenBytes) Buffer.MemoryCopy(prevBuffer, p + w, newPrevSize, newPrevSize);
+                }
+                UpdateFlushState();
+                return UpdateCallbackResult.Done;
+            }
+            if (status == InplaceUpdateStatus.Updated)
+            {
+                bool ok = Add(sequence, EntryType.Value, key, merged.WrittenSpan);
+                UpdateFlushState();
+                return ok ? UpdateCallbackResult.Done : UpdateCallbackResult.AddFailed;
+            }
+            // `UPDATE_FAILED` is named incorrectly. It indicates no update happened. It does not indicate a failure.
+            UpdateFlushState();
+            return UpdateCallbackResult.Done;
+        }
+        finally
+        {
+            WriteUnlock(lockIndex);
+        }
+    }
+
+    /// <summary>
+    /// SaveValue's read lock with inplace_update_support: copies the value of <paramref name="ek"/> under the key's read
+    /// lock into a per-thread buffer (valid until the next memtable read on this thread).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private ReadOnlySpan<byte> CopyValueLocked(SkipListKey ek, ReadOnlySpan<byte> userKey)
+    {
+        int lockIndex = LockIndex(userKey);
+        ReadLock(lockIndex);
+        try
+        {
+            ReadOnlySpan<byte> v = EntryValue(ek);
+            byte[] buf = t_inplaceValue is { } b && b.Length >= v.Length ? b : (t_inplaceValue = new byte[Math.Max(64, (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)v.Length))]);
+            v.CopyTo(buf);
+            return new ReadOnlySpan<byte>(buf, 0, v.Length);
+        }
+        finally
+        {
+            ReadUnlock(lockIndex);
+        }
     }
 
     /// <summary>Port of MemTable::MaybeUpdateNewestUDT: tracks the newest timestamp of the user keys added.</summary>
@@ -336,6 +595,10 @@ public sealed unsafe class MemTable : IDisposable
             }
         }
 
+        // iter is null if prefix bloom says the key does not exist (sequence stays kMaxSequenceNumber).
+        if (_bloom is not null && !BloomMayContain(lookupUserKey))
+            return mergeInProgress ? MemTableGetResult.MergeInProgress : MemTableGetResult.NotFound;
+
         ReadOnlySpan<byte> ikey = key.InternalKey;
         var it = new InlineSkipList<MemTableKeyComparer>.Iterator(_table);
         fixed (byte* pk = ikey)
@@ -374,7 +637,7 @@ public sealed unsafe class MemTable : IDisposable
                 case EntryType.Value:
                 case EntryType.BlobIndex:
                 case EntryType.WideColumnEntity:
-                    value = EntryValue(ek);
+                    value = _locks is null ? EntryValue(ek) : CopyValueLocked(ek, entryUserKey);
                     valueType = type;
                     return MemTableGetResult.Found;
                 case EntryType.ValuePreferredSeqno:
@@ -454,6 +717,22 @@ public sealed unsafe class MemTable : IDisposable
 
     /// <summary>Iterator over point entries (internal keys). Allocation-free; valid while the memtable is alive.</summary>
     public MemTableIterator NewIterator() => new(_table);
+
+    /// <summary>
+    /// Iterator over point entries that, when <paramref name="usePrefixBloom"/> and the memtable has a bloom filter, skips
+    /// Seek / SeekForPrev targets whose prefix the bloom excludes (MemTableIterator in prefix mode: prefix_same_as_start,
+    /// or neither total_order_seek nor auto_prefix_mode, with the column family's own prefix extractor).
+    /// </summary>
+    public MemTableIterator NewIterator(bool usePrefixBloom) =>
+        usePrefixBloom && _bloom is not null && _prefixExtractor is not null ? new(_table, _bloom, _prefixExtractor, _tsSize) : new(_table);
+
+    /// <summary>
+    /// Whether a DB iterator with <paramref name="readOptions"/> and the column family extractor
+    /// <paramref name="cfPrefixExtractor"/> uses the prefix bloom (the MemTableIterator constructor's condition).
+    /// </summary>
+    public bool UsesPrefixBloom(ReadOptions? readOptions, SliceTransform? cfPrefixExtractor) =>
+        _bloom is not null && _prefixExtractor is not null && ReferenceEquals(_prefixExtractor, cfPrefixExtractor)
+        && (readOptions?.PrefixSameAsStart == true || (readOptions?.TotalOrderSeek != true && readOptions?.AutoPrefixMode != true));
 
     /// <summary>Iterator over raw range-deletion entries: key = start internal key, value = end user key.</summary>
     public MemTableIterator NewRangeTombstoneEntryIterator() => new(_rangeDelTable);
@@ -607,8 +886,26 @@ public sealed unsafe class MemTable : IDisposable
 public unsafe struct MemTableIterator
 {
     private InlineSkipList<MemTableKeyComparer>.Iterator _it;
+    // Prefix mode (bloom_): Seek/SeekForPrev targets whose prefix the memtable bloom excludes leave the iterator invalid.
+    private readonly DynamicBloom? _bloom;
+    private readonly SliceTransform? _prefixExtractor;
+    private readonly int _tsSize;
 
-    internal MemTableIterator(InlineSkipList<MemTableKeyComparer> list) => _it = new InlineSkipList<MemTableKeyComparer>.Iterator(list);
+    internal MemTableIterator(InlineSkipList<MemTableKeyComparer> list)
+    {
+        _it = new InlineSkipList<MemTableKeyComparer>.Iterator(list);
+        _bloom = null;
+        _prefixExtractor = null;
+        _tsSize = 0;
+    }
+
+    internal MemTableIterator(InlineSkipList<MemTableKeyComparer> list, DynamicBloom bloom, SliceTransform prefixExtractor, int tsSize)
+    {
+        _it = new InlineSkipList<MemTableKeyComparer>.Iterator(list);
+        _bloom = bloom;
+        _prefixExtractor = prefixExtractor;
+        _tsSize = tsSize;
+    }
 
     public readonly bool Valid => _it.Valid;
 
@@ -620,13 +917,31 @@ public unsafe struct MemTableIterator
     /// <summary>Positions at the first entry with internal key &gt;= <paramref name="internalKey"/>.</summary>
     public void Seek(ReadOnlySpan<byte> internalKey)
     {
+        if (_bloom is not null && PrefixExcluded(internalKey))
+        {
+            _it.Invalidate();
+            return;
+        }
         fixed (byte* p = internalKey) _it.Seek(new SkipListKey(p, internalKey.Length));
     }
 
     /// <summary>Positions at the last entry with internal key &lt;= <paramref name="internalKey"/>.</summary>
     public void SeekForPrev(ReadOnlySpan<byte> internalKey)
     {
+        if (_bloom is not null && PrefixExcluded(internalKey))
+        {
+            _it.Invalidate();
+            return;
+        }
         fixed (byte* p = internalKey) _it.SeekForPrev(new SkipListKey(p, internalKey.Length));
+    }
+
+    /// <summary>The iterator only uses the prefix bloom filter (never the whole key).</summary>
+    private readonly bool PrefixExcluded(ReadOnlySpan<byte> internalKey)
+    {
+        ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(internalKey);
+        ReadOnlySpan<byte> keyWithoutTs = _tsSize == 0 ? userKey : userKey[..^_tsSize];
+        return _prefixExtractor!.InDomain(keyWithoutTs) && !_bloom!.MayContain(_prefixExtractor.Transform(keyWithoutTs));
     }
 
     /// <summary>The current internal key. REQUIRES: Valid.</summary>

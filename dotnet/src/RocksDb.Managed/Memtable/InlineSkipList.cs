@@ -340,6 +340,22 @@ public sealed unsafe class InlineSkipList<TComparer> where TComparer : struct, I
     /// </summary>
     public bool Insert(byte* key) => Insert(key, _seqSplice, useCas: false, allowPartialSpliceFix: false);
 
+    /// <summary>
+    /// Port of InlineSkipList::InsertWithHint: like <see cref="Insert"/> but starts the search from the splice cached in
+    /// <paramref name="hint"/> (allocated from the arena on first use, 0 initially), which speeds up runs of inserts at
+    /// nearby positions (e.g. sequential keys of one prefix). Requires external synchronization with other writers.
+    /// </summary>
+    public bool InsertWithHint(byte* key, ref nint hint)
+    {
+        Splice* splice = (Splice*)hint;
+        if (splice == null)
+        {
+            splice = AllocateSplice();
+            hint = (nint)splice;
+        }
+        return Insert(key, splice, useCas: false, allowPartialSpliceFix: true);
+    }
+
     /// <summary>Like <see cref="Insert"/>, but may run concurrently with other <see cref="InsertConcurrently"/> calls.</summary>
     [SkipLocalsInit]
     public bool InsertConcurrently(byte* key)
@@ -594,6 +610,9 @@ public sealed unsafe class InlineSkipList<TComparer> where TComparer : struct, I
         }
 
         public readonly bool Valid => _node != null;
+
+        /// <summary>Makes the iterator invalid (e.g. a prefix bloom filter excluded the seek target).</summary>
+        public void Invalidate() => _node = null;
 
         /// <summary>The stored (encoded) key at the current position. REQUIRES: Valid.</summary>
         public readonly byte* Key

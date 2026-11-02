@@ -96,7 +96,10 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         set => _prefixExtractor.Set(value);
     }
 
-    /// <summary>memtable_insert_with_hint_prefix_extractor (persisted only; the managed memtable takes no insert hints).</summary>
+    /// <summary>
+    /// memtable_insert_with_hint_prefix_extractor: serial memtable inserts of keys with the same prefix (of the user key)
+    /// start their skiplist search from the position of the previous insert with that prefix (InsertWithHint).
+    /// </summary>
     public SliceTransform? MemtableInsertWithHintPrefixExtractor
     {
         get => _memtableInsertWithHintPrefixExtractor.Value;
@@ -154,9 +157,26 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     /// <see cref="WriteBufferSize"/> like SanitizeCfOptions: min(1 MiB, write_buffer_size / 8), 4 KiB aligned.
     /// </summary>
     public ulong ArenaBlockSize { get; set; }
+    /// <summary>
+    /// inplace_update_support: a Put of a key whose newest memtable entry is a value of at least the new size overwrites
+    /// that entry in place (keeping its sequence number) instead of adding a new one, under one of
+    /// <see cref="InplaceUpdateNumLocks"/> striped locks. Readers of older snapshots may then see the new value (as
+    /// upstream); incompatible with concurrent memtable writes. Default false.
+    /// </summary>
     public bool InplaceUpdateSupport { get; set; }
     public ulong InplaceUpdateNumLocks { get; set; } = 10000;
+    /// <summary>
+    /// inplace_callback: with <see cref="InplaceUpdateSupport"/>, Puts are combined with the existing value through this
+    /// callback (see <see cref="InplaceUpdateCallback"/>). Not persisted. Default null.
+    /// </summary>
+    public InplaceUpdateCallback? InplaceCallback { get; set; }
+    /// <summary>
+    /// memtable_prefix_bloom_size_ratio: when &gt; 0 (sanitized to at most 0.25) and a <see cref="PrefixExtractor"/> or
+    /// <see cref="MemtableWholeKeyFiltering"/> is set, each memtable keeps a Bloom filter of write_buffer_size * ratio bytes
+    /// over key prefixes (and whole keys) that lets Get/MultiGet and prefix seeks skip the memtable.
+    /// </summary>
     public double MemtablePrefixBloomSizeRatio { get; set; }
+    /// <summary>memtable_whole_key_filtering: also add whole keys to the memtable bloom (used by Get instead of the prefix).</summary>
     public bool MemtableWholeKeyFiltering { get; set; }
     public ulong MemtableHugePageSize { get; set; }
     public uint BloomLocality { get; set; }
@@ -386,6 +406,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         c.CompactionOptionsFifo = CompactionOptionsFifo.Clone();
         c.CompactionOptionsUniversal = CompactionOptionsUniversal.Clone();
         c.TableOptions = TableOptions.Clone();
+        c.InplaceCallback = InplaceCallback;
         c.TablePropertiesCollectorFactories = new List<TablePropertiesCollectorFactory>(TablePropertiesCollectorFactories);
         c.BlobCache = BlobCache;
         c.BlobDirectWritePartitionStrategy = BlobDirectWritePartitionStrategy;

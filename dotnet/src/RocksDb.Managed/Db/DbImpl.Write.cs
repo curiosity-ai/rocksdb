@@ -754,7 +754,7 @@ internal sealed partial class DbImpl
             // MemTableInserter::DeleteCF: a deletion in a column family with timestamps is kTypeDeletionWithTimestamp.
             if (type == EntryType.Deletion && c.TimestampSize != 0) type = EntryType.DeletionWithTimestamp;
             MemTable mem = c.Mem;
-            while (!mem.Add(Sequence, type, key, value))
+            while (!AddToMemTable(c, mem, type, key, value))
             {
                 // key+seq exists (TryAgain). Without seq_per_batch this can only come from replaying an already applied
                 // batch: ignore it like upstream. With seq_per_batch the key starts a new sub-batch: advance and retry.
@@ -764,6 +764,48 @@ internal sealed partial class DbImpl
             if (LogRef != 0) mem.RefLogContainingPrepSection(LogRef);
             if (mem.ShouldScheduleFlush && mem.MarkFlushScheduled()) _db._flushScheduler.Add(c);
             MaybeAdvanceSeq(batchBoundary: false);
+        }
+
+        /// <summary>
+        /// The memtable write of MemTableInserter::PutCFImpl: plain Add, or with inplace_update_support MemTable::Update
+        /// (Put / PutEntity / PutBlobIndex / TimedPut) and, for Puts with an inplace_callback, MemTable::UpdateCallback with
+        /// the DB read fallback when the memtable has no value for the key. Returns false when the key+seq exists.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private readonly bool AddToMemTable(ColumnFamilyData c, MemTable mem, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            if (!mem.InplaceUpdateSupport || type is not (EntryType.Value or EntryType.WideColumnEntity or EntryType.BlobIndex or EntryType.ValuePreferredSeqno))
+                return mem.Add(Sequence, type, key, value);
+            return AddInplace(c, mem, type, key, value);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private readonly bool AddInplace(ColumnFamilyData c, MemTable mem, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            InplaceUpdateCallback? callback = mem.InplaceCallback;
+            if (callback is null || type != EntryType.Value) return mem.Update(Sequence, type, key, value);
+            switch (mem.UpdateCallback(Sequence, key, value, callback))
+            {
+                case MemTable.UpdateCallbackResult.Done: return true;
+                case MemTable.UpdateCallbackResult.AddFailed: return false;
+            }
+            // key not found in memtable. Do sst get, update, add (reading at the batch's sequence number; not during
+            // recovery, where upstream has no DB to read from).
+            using var prev = new Util.PooledBufferWriter(0);
+            bool found = false;
+            if (_logNumber == 0) found = _db.GetForInplaceCallback(c, key, Sequence, prev);
+            using var merged = new Util.PooledBufferWriter(0);
+            int prevSize = prev.WrittenCount;
+            byte[]? copy = found ? prev.WrittenSpan.ToArray() : null;
+            InplaceUpdateStatus status = callback(copy is null ? default : copy.AsSpan(), found, ref prevSize, value, merged);
+            if (status == InplaceUpdateStatus.UpdatedInplace)
+            {
+                // prev_value is updated in-place with final value.
+                if (copy is null || (uint)prevSize > (uint)copy.Length) ThrowHelper.InvalidArgument("inplace_callback returned UpdatedInplace without a valid existing value");
+                return mem.Add(Sequence, EntryType.Value, key, copy.AsSpan(0, prevSize));
+            }
+            if (status == InplaceUpdateStatus.Updated) return mem.Add(Sequence, EntryType.Value, key, merged.WrittenSpan);
+            return true;
         }
 
         /// <summary>IsDuplicateKeySeq (util/duplicate_detector.h): recovery of a column family whose insert is skipped.</summary>

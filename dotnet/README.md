@@ -36,7 +36,9 @@ while the bytes may differ (for example, because a compressor makes different ch
 | MANIFEST / VersionEdit, `CURRENT`, `IDENTITY`, `LOCK` | yes | yes | every tag in 11.14; native records re-encode byte-identically; the `LOCK` file lock works across engines |
 | `OPTIONS-xxxxxx` files | yes | yes | typed options; unknown or custom ids are kept verbatim |
 | Block-based SST, `format_version` 2-8 | yes | yes | data, index and filter blocks byte-identical to native `SstFileWriter`; checksums crc32c, xxHash, xxHash64, XXH3 |
-| Index types | yes | yes | binary search, delta encoding, first-key index, partitioned (two-level) index; data block hash index |
+| Index types | yes | yes | binary search, delta encoding, first-key index, partitioned (two-level) index, hash index (`kHashSearch`); data block hash index |
+| Optional block layouts | yes | yes | separated key/value data blocks, index `is_uniform` hint, `block_align`, super block alignment; byte-identical to native |
+| User table properties collectors | yes | yes | `TablePropertiesCollector` properties and `rocksdb.property.collectors` as native; `NeedCompact` marks files for compaction |
 | Filters: FastLocalBloom, legacy Bloom, Ribbon (incl. hybrid), prefix, partitioned | yes | yes | byte-identical; with `optimize_filters_for_memory`, Ribbon may differ by 16 bytes depending on heap state (both readable) |
 | Compression: Snappy, LZ4, LZ4HC, ZSTD, Zlib | yes | yes | read + write; ZSTD (with dictionaries) byte-identical; see deviations below |
 | Compression: BZip2, Xpress | no | n/a | a configured BZip2/Xpress type stores blocks uncompressed |
@@ -841,12 +843,11 @@ Not ported yet:
 - Timestamps in optimistic transactions and explicit-timestamp `WriteBatchWithIndex` writes (NotSupported, as upstream).
 - Range locks; for WritePrepared / WriteUnprepared: two_write_queues, commit-time batches, iterator invalidation
   when a WriteUnprepared transaction ends, and user-defined timestamps (NotSupported, as upstream).
-- PlainTable and CuckooTable, separated key/value data blocks, parallel compression, subcompactions, `CompactFiles`,
+- PlainTable and CuckooTable, parallel compression, subcompactions, `CompactFiles`,
   the SST file manager and a rate limiter for flush and compaction.
 - Wide-column entities with blob-backed columns (V2) and blob direct write (forced blob GC is leveled-only, as
   upstream).
-- Concurrent memtable inserts, pipelined writes, the memtable prefix bloom filter and in-place updates. The options are
-  accepted and persisted.
+- Concurrent memtable inserts and pipelined writes. The options are accepted and persisted.
 
 API and behavior differences:
 

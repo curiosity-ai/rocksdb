@@ -138,6 +138,8 @@ internal sealed partial class DbImpl
                 // Derived state (MutableCFOptions::RefreshDerivedOptions, InstallSuperVersionForConfigChange).
                 cfd.MemOptions.WriteBufferSize = (long)Math.Min(live.WriteBufferSize, (ulong)long.MaxValue);
                 cfd.MemOptions.ArenaBlockSize = (int)Math.Min(live.ArenaBlockSize, int.MaxValue / 2);
+                // Memtable bloom / in-place settings take effect for the next memtable (ImmutableMemTableOptions).
+                cfd.MemOptions.ApplyColumnFamilyOptions(live);
                 cfd.Mem.UpdateWriteBufferSize(cfd.MemOptions.WriteBufferSize);
                 cfd.Current.Storage.ComputeCompactionScore();
                 RecalculateWriteStall(cfd);

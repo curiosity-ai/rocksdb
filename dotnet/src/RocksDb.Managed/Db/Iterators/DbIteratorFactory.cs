@@ -127,7 +127,7 @@ public static class DbIteratorFactory
         {
             foreach (MemTable mem in sources.MemTables)
             {
-                children.Add(new MemTableInternalIterator(mem));
+                children.Add(new MemTableInternalIterator(mem, sources.ReadOptions, sources.PrefixExtractor));
                 if (rangeDel is not null && mem.NumRangeDeletes > 0) rangeDel.AddTombstones(mem.GetFragmentedRangeTombstones());
             }
 
