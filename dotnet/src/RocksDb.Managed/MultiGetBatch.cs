@@ -248,6 +248,8 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
             {
                 if (ctx.TryResolve(UserKey(i), out _))
                 {
+                    // MultiGet returns the default column of an entity (GetContext::SaveValue, kTypeWideColumnEntity).
+                    ctx.ReplaceEntityWithDefaultColumn();
                     _status[i] = MultiGetStatus.Found;
                     found++;
                 }

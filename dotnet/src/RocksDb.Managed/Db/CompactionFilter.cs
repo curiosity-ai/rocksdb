@@ -38,7 +38,10 @@ public enum CompactionFilterDecision : byte
     IOError = 5,
     /// <summary>Convert a plain value into a SingleDelete tombstone. Not supported for merge operands.</summary>
     Purge = 6,
-    /// <summary>Not supported yet in the managed port.</summary>
+    /// <summary>
+    /// Replace the entry with a wide-column entity made of the columns added to the <c>newColumns</c> list (any order,
+    /// unique names). Only from <see cref="CompactionFilter.FilterV3"/>.
+    /// </summary>
     ChangeWideColumnEntity = 7,
     /// <summary>Only meaningful for blob-by-key filtering; not supported from <see cref="CompactionFilter.Filter"/>.</summary>
     Undetermined = 8,
@@ -71,6 +74,28 @@ public abstract class CompactionFilter
     /// <param name="existingValue">Value or merge operand.</param>
     public abstract CompactionFilterDecision Filter(int level, ReadOnlySpan<byte> key, CompactionFilterValueType valueType,
         ReadOnlySpan<byte> existingValue, IBufferWriter<byte> newValue, IBufferWriter<byte> skipUntil);
+
+    /// <summary>
+    /// Port of FilterV3: called during compaction for plain values (blob values are read first) and wide-column
+    /// entities. For <see cref="CompactionFilterValueType.Value"/>, <paramref name="existingValue"/> is the value and
+    /// <paramref name="existingColumns"/> is null; for <see cref="CompactionFilterValueType.WideColumnEntity"/>,
+    /// <paramref name="existingColumns"/> holds the entity's columns (blob-backed columns already resolved; valid only
+    /// during the call) and <paramref name="existingValue"/> is empty. Besides the <see cref="Filter"/> decisions it may
+    /// return <see cref="CompactionFilterDecision.ChangeValue"/> (the entry becomes a plain value written to
+    /// <paramref name="newValue"/>) or <see cref="CompactionFilterDecision.ChangeWideColumnEntity"/> (the entry becomes
+    /// an entity of the columns added to <paramref name="newColumns"/>). Merge operands still go to <see cref="Filter"/>.
+    /// <para>
+    /// The default implementation keeps entities (like upstream's default FilterV3) and forwards plain values to
+    /// <see cref="Filter"/>. Override it to filter entities.
+    /// </para>
+    /// </summary>
+    public virtual CompactionFilterDecision FilterV3(int level, ReadOnlySpan<byte> key, CompactionFilterValueType valueType,
+        ReadOnlySpan<byte> existingValue, WideColumns? existingColumns, IBufferWriter<byte> newValue, List<WideColumn> newColumns,
+        IBufferWriter<byte> skipUntil)
+    {
+        if (valueType == CompactionFilterValueType.WideColumnEntity) return CompactionFilterDecision.Keep;
+        return Filter(level, key, valueType, existingValue, newValue, skipUntil);
+    }
 
     /// <summary>
     /// Port of IgnoreSnapshots. Upstream only supports true (filtering may hide versions still visible to snapshots).

@@ -244,10 +244,43 @@ public sealed class DbIter : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void SetValueKind(EntryType type)
     {
+        _entityResolved = false;
         _valueIsEntity = type == EntryType.WideColumnEntity;
         _valueIsBlob = type == EntryType.BlobIndex;
         _blobFetched = false;
         if (_valueIsBlob && _blobSource is null) ThrowNotSupportedType(type);
+    }
+
+    private PooledBufferWriter? _resolvedEntity;
+    private PooledBufferWriter? _entityFetchScratch;
+    private List<Wide.WideColumnSlot>? _entitySlots;
+    private bool _entityResolved;
+
+    /// <summary>
+    /// DBIter::SetValueAndColumnsFromEntity for a version 2 entity with blob-backed columns: the entity with its blob
+    /// columns resolved (WideColumnSerialization::ResolveEntityBlobColumns), computed once per position;
+    /// <paramref name="raw"/> itself when it has no blob columns.
+    /// </summary>
+    private ReadOnlySpan<byte> ResolveEntity(ReadOnlySpan<byte> raw)
+    {
+        if (_entityResolved) return _resolvedEntity!.WrittenSpan;
+        if (!Wide.WideColumnSerialization.HasBlobColumns(raw)) return raw;
+        if (_blobSource is null) ThrowHelper.Corruption("Cannot resolve blob columns in entity without a blob fetcher");
+        PooledBufferWriter dst = _resolvedEntity ??= new PooledBufferWriter(256);
+        dst.Clear();
+        var fetcher = new Blob.VersionBlobFetcher(_blobSource!, _blobVersion!, _readOptions);
+        try
+        {
+            Wide.WideColumnSerialization.ResolveEntityBlobColumns(raw, _savedKey.UserKey, ref fetcher, _entitySlots ??= new List<Wide.WideColumnSlot>(8),
+                _entityFetchScratch ??= new PooledBufferWriter(256), dst);
+        }
+        catch
+        {
+            _valid = false;
+            throw;
+        }
+        _entityResolved = true;
+        return dst.WrittenSpan;
     }
 
     /// <summary>Reads the blob of a blob index into a scratch buffer (merge base values).</summary>
@@ -308,9 +341,10 @@ public sealed class DbIter : IDisposable
             if (_valueIsBlob) return BlobValue();
             switch (_valueSource)
             {
-                case ValueSource.Iter: return _valueIsEntity ? Wide.WideColumnSerialization.GetValueOfDefaultColumn(_iter.Value) : _iter.Value;
+                case ValueSource.Iter: return _valueIsEntity ? Wide.WideColumnSerialization.GetValueOfDefaultColumn(ResolveEntity(_iter.Value)) : _iter.Value;
                 case ValueSource.IterPacked: return ParsePackedValueForValue(_iter.Value);
-                case ValueSource.Pinned: return _valueIsEntity ? Wide.WideColumnSerialization.GetValueOfDefaultColumn(_pinned.WrittenSpan) : _pinned.WrittenSpan;
+                case ValueSource.Pinned:
+                    return _valueIsEntity ? Wide.WideColumnSerialization.GetValueOfDefaultColumn(ResolveEntity(_pinned.WrittenSpan)) : _pinned.WrittenSpan;
                 case ValueSource.Merged: return _mergeResult.WrittenSpan;
                 default: return ReadOnlySpan<byte>.Empty;
             }
@@ -326,8 +360,8 @@ public sealed class DbIter : IDisposable
     /// <summary>The serialized wide-column entity of the current entry. REQUIRES: <see cref="IsEntity"/>.</summary>
     public ReadOnlySpan<byte> SerializedEntity => _valueSource switch
     {
-        ValueSource.Iter => _iter.Value,
-        ValueSource.Pinned => _pinned.WrittenSpan,
+        ValueSource.Iter => ResolveEntity(_iter.Value),
+        ValueSource.Pinned => ResolveEntity(_pinned.WrittenSpan),
         ValueSource.Merged => _mergedEntity!.WrittenSpan,
         _ => default,
     };
@@ -507,6 +541,7 @@ public sealed class DbIter : IDisposable
         _valueSource = ValueSource.None;
         _valueIsEntity = false;
         _valueIsBlob = false;
+        _entityResolved = false;
     }
 
     private void MergeWithNoBaseValue()
@@ -538,6 +573,8 @@ public sealed class DbIter : IDisposable
     private void MergeWithEntityBaseValue(ReadOnlySpan<byte> entity)
     {
         _valid = false;
+        // MergeWithWideColumnBaseValue -> ResolveEntityForMerge: blob-backed columns are resolved first.
+        entity = ResolveEntity(entity);
         _mergeResult.Clear();
         MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, true, Wide.WideColumnSerialization.GetValueOfDefaultColumn(entity),
             _operands.AsOperands(), _mergeResult);
@@ -547,6 +584,7 @@ public sealed class DbIter : IDisposable
         _valueSource = ValueSource.Merged;
         _valueIsEntity = true;
         _valueIsBlob = false;
+        _entityResolved = false;
         _valid = true;
     }
 
@@ -1491,5 +1529,7 @@ public sealed class DbIter : IDisposable
         _operands.Dispose();
         _blobValue?.Dispose();
         _blobKey?.Dispose();
+        _resolvedEntity?.Dispose();
+        _entityFetchScratch?.Dispose();
     }
 }

@@ -3,17 +3,38 @@ using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Db.Wide;
 
-/// <summary>Position of one column inside a serialized entity (offsets into the entity bytes).</summary>
-internal readonly record struct WideColumnSlot(int NameOffset, int NameLength, int ValueOffset, int ValueLength);
+/// <summary>
+/// Position of one column inside a serialized entity (offsets into the entity bytes). <see cref="IsBlobIndex"/>: the
+/// column's value is a serialized blob index (version 2 column type kTypeBlobIndex) instead of the value itself.
+/// </summary>
+internal readonly record struct WideColumnSlot(int NameOffset, int NameLength, int ValueOffset, int ValueLength, bool IsBlobIndex);
+
+/// <summary>
+/// Reads the blob a blob-backed entity column references (rocksdb::BlobFetcher as used by
+/// WideColumnSerialization::ResolveEntityBlobColumns). Implemented by structs so resolution does not allocate.
+/// </summary>
+internal interface IEntityBlobFetcher
+{
+    /// <summary>Appends the blob referenced by the serialized, non-inlined blob index <paramref name="blobIndex"/> to <paramref name="output"/>.</summary>
+    void FetchBlob(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> blobIndex, IBufferWriter<byte> output);
+}
 
 /// <summary>
 /// Wide-column entity encoding. Port of WideColumnSerialization (db/wide/wide_column_serialization.{h,cc}).
 /// <para>
-/// Writes version 1 (what native RocksDB writes for entities without blob columns):
+/// Version 1 (entities without blob columns):
 /// <c>varint32 version=1 | varint32 N | N x (varint32 name size, name, varint32 value size) | N values</c>.
-/// Reads version 1 and version 2 (header, skip info, column types, name sizes, value sizes, names, values); version 2
-/// entities with blob-index columns are rejected with NotSupported (blob files are not ported). Column names are
-/// strictly increasing in bytewise order; the default column has the empty name and sorts first.
+/// Version 2 (entities with blob-backed columns, written by flush/compaction value separation and blob direct write):
+/// <c>varint32 version=2 | varint32 N | varint32 name_sizes_bytes | varint32 value_sizes_bytes | varint32 names_bytes |
+/// N column types (kTypeValue 0x01 / kTypeBlobIndex 0x11) | N varint32 name sizes | N varint32 value sizes | names |
+/// values</c>; the value of a kTypeBlobIndex column is a serialized blob index. Like upstream, version 2 is written only
+/// when at least one column is blob-backed. Column names are strictly increasing in bytewise order; the default column
+/// has the empty name and sorts first.
+/// </para>
+/// <para>
+/// Readers that consume column values (<see cref="Deserialize"/>, <see cref="GetValueOfDefaultColumn"/>) need a fully
+/// resolved entity and report a blob reference as Corruption, like upstream's Deserialize(..., blob_columns = nullptr);
+/// the read paths resolve blob columns first with <see cref="ResolveEntityBlobColumns{TFetcher}"/>.
 /// </para>
 /// </summary>
 internal static class WideColumnSerialization
@@ -98,14 +119,230 @@ internal static class WideColumnSerialization
     }
 
     /// <summary>
-    /// Port of WideColumnSerialization::Deserialize: decodes the column positions of <paramref name="entity"/> into
-    /// <paramref name="slots"/> (cleared first). Corruption on malformed input; NotSupported for blob-index columns.
+    /// Port of WideColumnSerialization::Deserialize(input, columns, blob_columns = nullptr): decodes the column positions
+    /// of a fully resolved <paramref name="entity"/> into <paramref name="slots"/> (cleared first). Corruption on
+    /// malformed input and for blob-backed columns.
     /// </summary>
     public static void Deserialize(ReadOnlySpan<byte> entity, List<WideColumnSlot> slots)
     {
         string? error = TryDeserialize(entity, slots, out bool hasBlob);
         if (error is not null) ThrowHelper.Corruption(error);
-        if (hasBlob) ThrowHelper.NotSupported("Wide column entities with blob references are not supported (blob files are not ported)");
+        if (hasBlob) ThrowHelper.Corruption("Wide column blob reference in a context where it is not expected.");
+    }
+
+    /// <summary>
+    /// Port of WideColumnSerialization::Deserialize(input, columns, blob_columns): like <see cref="Deserialize"/> but
+    /// blob-backed columns are allowed (<see cref="WideColumnSlot.IsBlobIndex"/>; their blob indexes are validated).
+    /// Returns whether any column is blob-backed.
+    /// </summary>
+    public static bool DeserializeWithBlobColumns(ReadOnlySpan<byte> entity, List<WideColumnSlot> slots)
+    {
+        string? error = TryDeserialize(entity, slots, out bool hasBlob);
+        if (error is not null) ThrowHelper.Corruption(error);
+        if (!hasBlob) return false;
+        foreach (WideColumnSlot s in slots)
+        {
+            if (!s.IsBlobIndex) continue;
+            if (s.ValueLength == 0) ThrowHelper.Corruption("Empty blob index in wide column");
+            if (Blob.BlobIndex.TryDecode(entity.Slice(s.ValueOffset, s.ValueLength), out _) is not null)
+            {
+                ThrowHelper.Corruption("Error decoding blob index in wide column");
+            }
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Port of WideColumnSerialization::HasBlobColumns: true for a version 2 entity with at least one kTypeBlobIndex
+    /// column. Only the header and the column types are read. Corruption on decode errors.
+    /// </summary>
+    public static bool HasBlobColumns(ReadOnlySpan<byte> entity)
+    {
+        int pos = 0;
+        if (!TryGetVarint32(entity, ref pos, out uint version)) ThrowHelper.Corruption("Error decoding wide column version");
+        if (version < Version2) return false;
+        if (version > Version2) ThrowHelper.Corruption("Corrupt or unsupported wide column version");
+        if (!TryGetVarint32(entity, ref pos, out uint numColumns)) ThrowHelper.Corruption("Error decoding number of wide columns");
+        if (numColumns == 0) return false;
+        if (!TryGetVarint32(entity, ref pos, out _) || !TryGetVarint32(entity, ref pos, out _) || !TryGetVarint32(entity, ref pos, out _))
+        {
+            ThrowHelper.Corruption("Error decoding wide column skip info");
+        }
+        if ((uint)(entity.Length - pos) < numColumns) ThrowHelper.Corruption("Error decoding wide column types");
+        bool any = false;
+        for (int i = 0; i < numColumns; i++)
+        {
+            var t = (EntryType)entity[pos + i];
+            if (t == EntryType.BlobIndex) any = true;
+            else if (t != EntryType.Value) ThrowHelper.Corruption("Unsupported wide column ValueType");
+        }
+        return any;
+    }
+
+    /// <summary>
+    /// Port of WideColumnSerialization::ForEachBlobFileNumber: the blob indexes of the blob-backed columns of
+    /// <paramref name="entity"/> (none for version 1). <paramref name="slots"/> is scratch. Corruption on decode errors.
+    /// </summary>
+    public static void GetBlobColumnIndexes(ReadOnlySpan<byte> entity, List<WideColumnSlot> slots)
+    {
+        if (!HasBlobColumns(entity))
+        {
+            slots.Clear();
+            return;
+        }
+        DeserializeWithBlobColumns(entity, slots);
+        // Keep only the blob columns.
+        int w = 0;
+        for (int i = 0; i < slots.Count; i++)
+        {
+            if (slots[i].IsBlobIndex) slots[w++] = slots[i];
+        }
+        slots.RemoveRange(w, slots.Count - w);
+    }
+
+    /// <summary>
+    /// Port of WideColumnSerialization::ResolveEntityBlobColumns: fetches the blobs of the blob-backed columns of
+    /// <paramref name="entity"/> (inlined blob indexes yield their value) and writes the fully resolved entity as
+    /// version 1 to <paramref name="output"/>. Returns false (and writes nothing) when the entity has no blob columns.
+    /// <paramref name="slots"/> and <paramref name="scratch"/> are reusable scratch buffers.
+    /// </summary>
+    public static bool ResolveEntityBlobColumns<TFetcher>(ReadOnlySpan<byte> entity, ReadOnlySpan<byte> userKey, ref TFetcher fetcher,
+        List<WideColumnSlot> slots, PooledBufferWriter scratch, IBufferWriter<byte> output)
+        where TFetcher : struct, IEntityBlobFetcher
+    {
+        if (!HasBlobColumns(entity)) return false;
+        DeserializeWithBlobColumns(entity, slots);
+        int n = slots.Count;
+        // Fetched values go to scratch; remember their (offset, length) in place of the slot's value position.
+        scratch.Clear();
+        Span<long> resolved = n <= 64 ? stackalloc long[n] : new long[n];
+        for (int i = 0; i < n; i++)
+        {
+            WideColumnSlot s = slots[i];
+            if (!s.IsBlobIndex) continue;
+            ReadOnlySpan<byte> idx = entity.Slice(s.ValueOffset, s.ValueLength);
+            Blob.BlobIndex bi = Blob.BlobIndex.Decode(idx);
+            int start = scratch.WrittenCount;
+            if (bi.IsInlined) scratch.Write(bi.InlinedValue);
+            else fetcher.FetchBlob(userKey, idx, scratch);
+            resolved[i] = ((long)start << 32) | (uint)(scratch.WrittenCount - start);
+        }
+        ReadOnlySpan<byte> fetched = scratch.WrittenSpan;
+        long total = Coding.VarintLength(Version1) + Coding.VarintLength((ulong)n);
+        for (int i = 0; i < n; i++)
+        {
+            int vlen = slots[i].IsBlobIndex ? (int)(uint)resolved[i] : slots[i].ValueLength;
+            total += Coding.VarintLength((ulong)slots[i].NameLength) + slots[i].NameLength + Coding.VarintLength((ulong)vlen) + vlen;
+        }
+        if (total > int.MaxValue) ThrowHelper.InvalidArgument("Wide column entity too large");
+        Span<byte> dst = output.GetSpan((int)total);
+        int p = Coding.EncodeVarint32(dst, Version1);
+        p += Coding.EncodeVarint32(dst[p..], (uint)n);
+        for (int i = 0; i < n; i++)
+        {
+            WideColumnSlot s = slots[i];
+            p += Coding.EncodeVarint32(dst[p..], (uint)s.NameLength);
+            entity.Slice(s.NameOffset, s.NameLength).CopyTo(dst[p..]);
+            p += s.NameLength;
+            p += Coding.EncodeVarint32(dst[p..], (uint)(s.IsBlobIndex ? (int)(uint)resolved[i] : s.ValueLength));
+        }
+        for (int i = 0; i < n; i++)
+        {
+            WideColumnSlot s = slots[i];
+            ReadOnlySpan<byte> v = s.IsBlobIndex ? fetched.Slice((int)(resolved[i] >> 32), (int)(uint)resolved[i]) : entity.Slice(s.ValueOffset, s.ValueLength);
+            v.CopyTo(dst[p..]);
+            p += v.Length;
+        }
+        output.Advance(p);
+        return true;
+    }
+
+    /// <summary>
+    /// Port of WideColumnSerialization::SerializeV2: writes the columns of <paramref name="columns"/> (sorted, unique
+    /// names) as a version 2 entity. Columns with <see cref="EntityColumnList.IsBlobIndex"/> get type kTypeBlobIndex
+    /// and their value (a serialized blob index) as payload. Corruption "Wide columns out of order" like upstream.
+    /// </summary>
+    public static void SerializeV2(EntityColumnList columns, IBufferWriter<byte> output)
+    {
+        int n = columns.Count;
+        long nameSizesBytes = 0, valueSizesBytes = 0, namesBytes = 0, valuesBytes = 0;
+        for (int i = 0; i < n; i++)
+        {
+            ReadOnlySpan<byte> name = columns.GetName(i);
+            if (i > 0 && columns.GetName(i - 1).SequenceCompareTo(name) >= 0) ThrowHelper.Corruption("Wide columns out of order");
+            int vlen = columns.GetValue(i).Length;
+            nameSizesBytes += Coding.VarintLength((ulong)name.Length);
+            namesBytes += name.Length;
+            valueSizesBytes += Coding.VarintLength((ulong)vlen);
+            valuesBytes += vlen;
+        }
+        if (nameSizesBytes > uint.MaxValue || valueSizesBytes > uint.MaxValue) ThrowHelper.InvalidArgument("Wide column metadata too large");
+        if (namesBytes > uint.MaxValue) ThrowHelper.InvalidArgument("Wide column names too large");
+        if (valuesBytes > uint.MaxValue) ThrowHelper.InvalidArgument("Wide column values too large");
+        long total = Coding.VarintLength(Version2) + Coding.VarintLength((ulong)n) + n + Coding.VarintLength((ulong)nameSizesBytes)
+                     + Coding.VarintLength((ulong)valueSizesBytes) + Coding.VarintLength((ulong)namesBytes) + nameSizesBytes + valueSizesBytes
+                     + namesBytes + valuesBytes;
+        if (total > int.MaxValue) ThrowHelper.InvalidArgument("Wide column entity too large");
+        Span<byte> dst = output.GetSpan((int)total);
+        int p = Coding.EncodeVarint32(dst, Version2);
+        p += Coding.EncodeVarint32(dst[p..], (uint)n);
+        p += Coding.EncodeVarint32(dst[p..], (uint)nameSizesBytes);
+        p += Coding.EncodeVarint32(dst[p..], (uint)valueSizesBytes);
+        p += Coding.EncodeVarint32(dst[p..], (uint)namesBytes);
+        for (int i = 0; i < n; i++) dst[p++] = (byte)(columns.IsBlobIndex(i) ? EntryType.BlobIndex : EntryType.Value);
+        int s4 = p, s5 = s4 + (int)nameSizesBytes, s6 = s5 + (int)valueSizesBytes, s7 = s6 + (int)namesBytes;
+        for (int i = 0; i < n; i++)
+        {
+            ReadOnlySpan<byte> name = columns.GetName(i);
+            ReadOnlySpan<byte> value = columns.GetValue(i);
+            s4 += Coding.EncodeVarint32(dst[s4..], (uint)name.Length);
+            s5 += Coding.EncodeVarint32(dst[s5..], (uint)value.Length);
+            name.CopyTo(dst[s6..]);
+            s6 += name.Length;
+            value.CopyTo(dst[s7..]);
+            s7 += value.Length;
+        }
+        output.Advance(s7);
+    }
+
+    /// <summary>
+    /// Writes <paramref name="columns"/> as version 2 when a column is blob-backed and as version 1 otherwise (the
+    /// choice upstream's flush/compaction extraction, GC and blob direct write make).
+    /// </summary>
+    public static void Serialize(EntityColumnList columns, IBufferWriter<byte> output)
+    {
+        if (columns.HasBlobColumns)
+        {
+            SerializeV2(columns, output);
+            return;
+        }
+        int n = columns.Count;
+        long total = Coding.VarintLength(Version1) + Coding.VarintLength((ulong)n);
+        for (int i = 0; i < n; i++)
+        {
+            int nl = columns.GetName(i).Length, vl = columns.GetValue(i).Length;
+            total += Coding.VarintLength((ulong)nl) + nl + Coding.VarintLength((ulong)vl) + vl;
+        }
+        if (total > int.MaxValue) ThrowHelper.InvalidArgument("Wide column entity too large");
+        Span<byte> dst = output.GetSpan((int)total);
+        int p = Coding.EncodeVarint32(dst, Version1);
+        p += Coding.EncodeVarint32(dst[p..], (uint)n);
+        for (int i = 0; i < n; i++)
+        {
+            ReadOnlySpan<byte> name = columns.GetName(i);
+            if (i > 0 && columns.GetName(i - 1).SequenceCompareTo(name) >= 0) ThrowHelper.Corruption("Wide columns out of order");
+            p += Coding.EncodeVarint32(dst[p..], (uint)name.Length);
+            name.CopyTo(dst[p..]);
+            p += name.Length;
+            p += Coding.EncodeVarint32(dst[p..], (uint)columns.GetValue(i).Length);
+        }
+        for (int i = 0; i < n; i++)
+        {
+            ReadOnlySpan<byte> v = columns.GetValue(i);
+            v.CopyTo(dst[p..]);
+            p += v.Length;
+        }
+        output.Advance(p);
     }
 
     /// <summary>Non-throwing <see cref="Deserialize"/>: returns the Corruption message, or null.</summary>
@@ -157,7 +394,7 @@ internal static class WideColumnSerialization
         for (int i = 0; i < numColumns; i++)
         {
             if (dataPos + valueSizes[i] > input.Length) return "Error decoding wide column value payload";
-            slots.Add(new WideColumnSlot(nameOffsets[i], nameLengths[i], (int)dataPos, (int)valueSizes[i]));
+            slots.Add(new WideColumnSlot(nameOffsets[i], nameLengths[i], (int)dataPos, (int)valueSizes[i], IsBlobIndex: false));
             dataPos += valueSizes[i];
         }
         if (dataPos != input.Length) return "Unexpected trailing data after wide column entity";
@@ -178,6 +415,7 @@ internal static class WideColumnSerialization
             if (t == EntryType.BlobIndex) hasBlobColumns = true;
             else if (t != EntryType.Value) return "Unsupported wide column ValueType";
         }
+        int types = pos;
         pos += (int)numColumns;
         long metadataSize = (long)nameSizesBytes + valueSizesBytes + namesBytes;
         if (input.Length - pos < metadataSize) return "Error decoding wide column sections";
@@ -200,7 +438,7 @@ internal static class WideColumnSerialization
                 }
             }
             if (s7 + valuePos + vs > input.Length) return "Error decoding wide column value payload";
-            slots.Add(new WideColumnSlot(s6 + (int)namePos, (int)ns, s7 + (int)valuePos, (int)vs));
+            slots.Add(new WideColumnSlot(s6 + (int)namePos, (int)ns, s7 + (int)valuePos, (int)vs, input[types + i] == (byte)EntryType.BlobIndex));
             namePos += ns;
             valuePos += vs;
         }

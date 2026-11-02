@@ -26,11 +26,26 @@ internal sealed class BlobGarbageMeter
     private void ProcessFlow(ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value, bool isInflow)
     {
         if (!DbFormat.TryParseInternalKey(internalKey, out ParsedInternalKey ikey)) ThrowHelper.Corruption("Corrupted internal key in blob garbage meter");
-        if (ikey.Type != EntryType.BlobIndex) return;
-        BlobIndex index = BlobIndex.Decode(value);
+        if (ikey.Type == EntryType.BlobIndex)
+        {
+            AddFlow(BlobIndex.Decode(value), ikey.UserKeyLength, isInflow);
+        }
+        else if (ikey.Type == EntryType.WideColumnEntity && Wide.WideColumnSerialization.HasBlobColumns(value))
+        {
+            // ProcessEntityBlobReferences: every blob-backed column of an entity is a blob reference.
+            Wide.WideColumnSerialization.GetBlobColumnIndexes(value, _slots);
+            foreach (Wide.WideColumnSlot s in _slots) AddFlow(BlobIndex.Decode(value.Slice(s.ValueOffset, s.ValueLength)), ikey.UserKeyLength, isInflow);
+        }
+    }
+
+    private readonly List<Wide.WideColumnSlot> _slots = new(8);
+
+    /// <summary>GetBlobReferenceDetails + AddFlow.</summary>
+    private void AddFlow(BlobIndex index, int userKeyLength, bool isInflow)
+    {
         if (index.IsInlined || index.HasTtl) ThrowHelper.Corruption("Unexpected TTL/inlined blob index");
         if (index.IsSameFile) return;
-        ulong bytes = index.Size + BlobLogFormat.RecordHeaderAdjustment((ulong)ikey.UserKeyLength);
+        ulong bytes = index.Size + BlobLogFormat.RecordHeaderAdjustment((ulong)userKeyLength);
         if (isInflow)
         {
             if (!_flows.TryGetValue(index.FileNumber, out Flow? f)) _flows[index.FileNumber] = f = new Flow();

@@ -222,7 +222,7 @@ internal sealed partial class DbImpl
                     if (await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false)) break;
                 }
             }
-            if (ctx.ValueIsBlobIndex) await ctx.ResolveBlobAsync(cfd.BlobSource, s, options, key, cancellationToken).ConfigureAwait(false);
+            if (ctx.NeedsBlobResolution) await ctx.ResolveBlobAsync(cfd.BlobSource, s, options, key, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -297,7 +297,7 @@ internal sealed partial class DbImpl
                 if (CompareFileBoundary(ucmp, tsSize, DbFormat.ExtractUserKey(ikey.Span), f.Smallest) < 0) continue;
                 done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);
             }
-            if (ctx.ValueIsBlobIndex) await ctx.ResolveBlobAsync(cfd.BlobSource, s, options, key, cancellationToken).ConfigureAwait(false);
+            if (ctx.NeedsBlobResolution) await ctx.ResolveBlobAsync(cfd.BlobSource, s, options, key, cancellationToken).ConfigureAwait(false);
         }
         finally
         {

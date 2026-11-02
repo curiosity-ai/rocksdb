@@ -138,20 +138,23 @@ internal static class FlushJob
     {
         Util.PooledBufferWriter? blobIndex = blobBuilder is null ? null : new Util.PooledBufferWriter(Blob.BlobIndex.MaxEncodedLength);
         Util.PooledBufferWriter? blobKey = blobBuilder is null ? null : new Util.PooledBufferWriter(64);
+        Blob.EntityBlobRewriter? entities = blobBuilder is null ? null : new Blob.EntityBlobRewriter();
         try
         {
-            AddPointEntries(builder, icmp, mems, meta, snapshots, dropHidden, blobBuilder, blobIndex, blobKey);
+            AddPointEntries(builder, icmp, mems, meta, snapshots, dropHidden, blobBuilder, blobIndex, blobKey, entities);
         }
         finally
         {
             blobIndex?.Dispose();
             blobKey?.Dispose();
+            entities?.Dispose();
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
-        ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder, Util.PooledBufferWriter? blobIndex, Util.PooledBufferWriter? blobKey)
+        ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder, Util.PooledBufferWriter? blobIndex, Util.PooledBufferWriter? blobKey,
+        Blob.EntityBlobRewriter? entities)
     {
         int n = mems.Count;
         var its = new MemTableIterator[n];
@@ -204,6 +207,10 @@ internal static class FlushJob
                     builder.Add(key, its[best].Value);
                 }
             }
+            else if (type == EntryType.WideColumnEntity)
+            {
+                AddEntity(builder, meta, key, its[best].Value, blobBuilder, entities);
+            }
             else
             {
                 builder.Add(key, its[best].Value);
@@ -247,6 +254,7 @@ internal static class FlushJob
         using var key = new Util.PooledBufferWriter(64);
         using var lastUserKey = new Util.PooledBufferWriter(64);
         using var blobIndex = new Util.PooledBufferWriter(Blob.BlobIndex.MaxEncodedLength);
+        using var entities = new Blob.EntityBlobRewriter();
         bool haveLast = false;
         ulong lastStripe = 0;
         EntryType lastType = EntryType.Value;
@@ -311,6 +319,10 @@ internal static class FlushJob
                     builder.Add(key.WrittenSpan, value);
                 }
             }
+            else if (type == EntryType.WideColumnEntity)
+            {
+                AddEntity(builder, meta, key.WrittenSpan, value, blobBuilder, entities);
+            }
             else
             {
                 builder.Add(key.WrittenSpan, value);
@@ -371,6 +383,32 @@ internal static class FlushJob
         {
             meta.OldestBlobFileNumber = index.FileNumber;
         }
+    }
+
+    [ThreadStatic] private static List<Wide.WideColumnSlot>? t_entitySlots;
+
+    /// <summary>
+    /// Adds an entity to the flush output: CompactionIterator::ExtractLargeColumnValuesIfNeeded when the output gets
+    /// blob files (flush runs through a CompactionIterator upstream), then the blob part of UpdateBoundaries.
+    /// </summary>
+    private static void AddEntity(BlockBasedTableBuilder builder, FileMetaData meta, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity,
+        Blob.BlobFileBuilder? blobBuilder, Blob.EntityBlobRewriter? entities)
+    {
+        if (blobBuilder is not null && entities!.TryExtract(blobBuilder, DbFormat.ExtractUserKey(key), entity)) entity = entities.Output;
+        builder.Add(key, entity);
+        UpdateOldestBlobFileNumberForEntity(meta, entity);
+    }
+
+    /// <summary>
+    /// The entity part of FileMetaData::UpdateBoundaries (WideColumnSerialization::ForEachBlobFileNumber): tracks the
+    /// oldest blob file referenced by the blob-backed columns of <paramref name="entity"/>.
+    /// </summary>
+    internal static void UpdateOldestBlobFileNumberForEntity(FileMetaData meta, ReadOnlySpan<byte> entity)
+    {
+        if (!Wide.WideColumnSerialization.HasBlobColumns(entity)) return;
+        List<Wide.WideColumnSlot> slots = t_entitySlots ??= new List<Wide.WideColumnSlot>(8);
+        Wide.WideColumnSerialization.GetBlobColumnIndexes(entity, slots);
+        foreach (Wide.WideColumnSlot s in slots) UpdateOldestBlobFileNumber(meta, entity.Slice(s.ValueOffset, s.ValueLength));
     }
 
     /// <summary>

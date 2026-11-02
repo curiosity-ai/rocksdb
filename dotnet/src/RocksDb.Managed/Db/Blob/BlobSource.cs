@@ -351,3 +351,13 @@ internal sealed class BlobSource : IDisposable
         }
     }
 }
+
+/// <summary>
+/// Entity blob column fetcher for reads (Version::GetBlob through the column family's <see cref="BlobSource"/>): the
+/// BlobFetcher of the read paths (GetContext, DBIter).
+/// </summary>
+internal readonly struct VersionBlobFetcher(BlobSource source, VersionStorageInfo version, ReadOptions? options) : Wide.IEntityBlobFetcher
+{
+    public void FetchBlob(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> blobIndex, IBufferWriter<byte> output) =>
+        source.GetBlob(version, options, userKey, blobIndex, output);
+}

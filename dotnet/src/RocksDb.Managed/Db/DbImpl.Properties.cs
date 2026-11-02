@@ -621,7 +621,7 @@ internal sealed partial class DbImpl
                 {
                     if (ctx.State is GetContext.GetState.Deleted) return false;
                     // A blob reference would need blob file I/O: the key exists but its value is not returned.
-                    if (ctx.State is GetContext.GetState.Found && value is not null && !ctx.ValueIsBlobIndex && ctx.TryResolve(key, out ReadOnlySpan<byte> v))
+                    if (ctx.State is GetContext.GetState.Found && value is not null && !ctx.NeedsBlobResolution && ctx.TryResolve(key, out ReadOnlySpan<byte> v))
                     {
                         value.Write(v);
                         valueFound = true;

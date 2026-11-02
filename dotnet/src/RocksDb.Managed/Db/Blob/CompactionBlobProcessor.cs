@@ -21,6 +21,9 @@ internal sealed class CompactionBlobProcessor : IDisposable
     private readonly PooledBufferWriter _blobIndex = new(BlobIndex.MaxEncodedLength);
     private readonly PooledBufferWriter _blobValue = new(256);
     private readonly PooledBufferWriter _filterValue = new(256);
+    private readonly EntityBlobRewriter _entity = new();
+    private readonly List<Wide.WideColumnSlot> _slots = new(8);
+    private readonly PooledBufferWriter _fetchScratch = new(256);
 
     /// <param name="builder">Blob output (null when the output level does not get blob files).</param>
     /// <param name="source">The column family's blob source.</param>
@@ -88,6 +91,35 @@ internal sealed class CompactionBlobProcessor : IDisposable
         return true;
     }
 
+    /// <summary>The entity written by the last successful <see cref="TryPrepareEntity"/>.</summary>
+    public ReadOnlySpan<byte> EntityOutput => _entity.Output;
+
+    /// <summary>
+    /// PrepareOutput for kTypeWideColumnEntity: GarbageCollectEntityBlobsIfNeeded for entities with blob columns,
+    /// ExtractLargeColumnValuesIfNeeded otherwise. True if <see cref="EntityOutput"/> holds the rewritten entity.
+    /// </summary>
+    public bool TryPrepareEntity(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> entity) =>
+        _entity.Prepare(_builder, _source, userKey, entity, _gcCutoffFileNumber);
+
+    /// <summary>
+    /// WideColumnSerialization::ResolveEntityForMerge / the entity read of the compaction filter: appends
+    /// <paramref name="entity"/> with its blob columns resolved (version 1) to <paramref name="output"/>; the entity
+    /// itself when it has none.
+    /// </summary>
+    public void ResolveEntity(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> entity, IBufferWriter<byte> output)
+    {
+        var fetcher = new VersionBlobFetcher(_source, _inputVersion, s_readOptions);
+        if (!Wide.WideColumnSerialization.ResolveEntityBlobColumns(entity, userKey, ref fetcher, _slots, _fetchScratch, output)) output.Write(entity);
+    }
+
+    /// <summary>Resolves an entity for the compaction filter (valid until the next call).</summary>
+    public ReadOnlySpan<byte> ResolveEntityForFilter(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> entity)
+    {
+        _filterValue.Clear();
+        ResolveEntity(userKey, entity, _filterValue);
+        return _filterValue.WrittenSpan;
+    }
+
     /// <summary>Reads the blob of <paramref name="blobIndexValue"/> for the compaction filter (valid until the next call).</summary>
     public ReadOnlySpan<byte> FetchBlobForFilter(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> blobIndexValue)
     {
@@ -106,5 +138,7 @@ internal sealed class CompactionBlobProcessor : IDisposable
         _blobIndex.Dispose();
         _blobValue.Dispose();
         _filterValue.Dispose();
+        _entity.Dispose();
+        _fetchScratch.Dispose();
     }
 }
