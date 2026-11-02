@@ -76,7 +76,9 @@ public sealed class LocalFileSystem : IFileSystem
     {
         try
         {
-            File.Move(source, target, overwrite: true);
+            // rename(2) also renames directories (used by Checkpoint to publish its temporary directory).
+            if (Directory.Exists(source)) Directory.Move(source, target);
+            else File.Move(source, target, overwrite: true);
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
@@ -175,6 +177,15 @@ public sealed class LocalFileSystem : IFileSystem
 
     /// <summary>fsync the directory (PosixDirectory::Fsync). No-op on Windows.</summary>
     public void SyncDirectory(string path) => UnixNative.FsyncDirectory(path);
+
+    /// <summary>Hard link (link(2) / CreateHardLinkW). Cross-device links throw NotSupported.</summary>
+    public void LinkFile(string source, string target) => UnixNative.Link(source, target);
+
+    public DateTimeOffset GetFileModificationTime(string path)
+    {
+        if (!File.Exists(path)) throw MapException("while stat a file for modification time", path, new FileNotFoundException(path));
+        return new DateTimeOffset(File.GetLastWriteTimeUtc(path), TimeSpan.Zero);
+    }
 
     internal static RocksDbException MapException(string context, string path, Exception e)
     {

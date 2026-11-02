@@ -6,7 +6,7 @@ namespace RocksDb.Managed.Benchmarks.DbBench;
 /// <see cref="IKeyValueEngine"/> over the managed <see cref="RocksDatabase"/>, configured like
 /// <see cref="Native.NativeDbFactory"/>: no compression, format_version 6, optional full bloom filter, WAL/sync per
 /// <see cref="EngineOptions"/>. Uses the synchronous, allocation-free APIs (Put via a pooled batch, TryGet into a span).
-/// TODO(block cache): apply <see cref="EngineOptions.BlockCacheSize"/> once the table reader takes a block cache.
+/// Block cache: HyperClock sized by <see cref="EngineOptions.BlockCacheSize"/> (native uses its default LRU of the same size).
 /// </summary>
 public sealed class ManagedEngine : IKeyValueEngine
 {
@@ -23,6 +23,8 @@ public sealed class ManagedEngine : IKeyValueEngine
         };
         cfo.TableOptions.BlockSize = (ulong)options.BlockSize;
         cfo.TableOptions.FormatVersion = 6;
+        if (options.BlockCacheSize > 0) cfo.TableOptions.BlockCache = Cache.BlockCache.CreateDefault(options.BlockCacheSize, options.BlockSize);
+        else cfo.TableOptions.NoBlockCache = true;
         if (options.BloomBitsPerKey > 0) cfo.TableOptions.FilterPolicy = "bloomfilter:" + options.BloomBitsPerKey + ":false";
         var dbo = new DbOptions { CreateIfMissing = true, FileSystem = LocalFileSystem.Instance };
         _db = RocksDatabase.Open(path, dbo, cfo);

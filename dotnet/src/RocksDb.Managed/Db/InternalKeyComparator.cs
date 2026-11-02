@@ -14,7 +14,7 @@ namespace RocksDb.Managed.Db;
 /// </summary>
 /// <remarks>
 /// Hot path: the built-in bytewise / reverse-bytewise user comparators are detected once (via the non-virtual
-/// <see cref="Comparator.Kind"/>) and compared with an inlined vectorized <c>SequenceCompareTo</c> instead of a
+/// <see cref="Comparator.Kind"/>) and compared with the inlined <see cref="ByteCompare"/> instead of a
 /// virtual call. Thread-safe and immutable.
 /// </remarks>
 public sealed class InternalKeyComparator
@@ -47,8 +47,8 @@ public sealed class InternalKeyComparator
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int CompareUserKey(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
     {
-        if (_kind == ComparatorKind.Bytewise) return a.SequenceCompareTo(b);
-        if (_kind == ComparatorKind.ReverseBytewise) return b.SequenceCompareTo(a);
+        if (_kind == ComparatorKind.Bytewise) return ByteCompare.Compare(a, b);
+        if (_kind == ComparatorKind.ReverseBytewise) return ByteCompare.Compare(b, a);
         return _user.Compare(a, b);
     }
 

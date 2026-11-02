@@ -221,14 +221,30 @@ public static class TableFactory
 
     /// <summary>Reader options for tables of the column family (comparator and the configured filter policy).</summary>
     public static TableReaderOptions CreateReaderOptions(ColumnFamilyOptions options, TableFormatOptions format)
+        => CreateReaderOptions(options, format, defaultBlockCache: null, dbSessionId: null);
+
+    /// <summary>
+    /// Reader options for a column family. The block cache is <c>TableOptions.BlockCache</c> if set, else
+    /// <paramref name="defaultBlockCache"/> (unless <c>no_block_cache</c>). <paramref name="dbSessionId"/> seeds cache keys
+    /// for files whose properties lack a session id (BlockBasedTable::SetupBaseCacheKey).
+    /// </summary>
+    public static TableReaderOptions CreateReaderOptions(ColumnFamilyOptions options, TableFormatOptions format,
+        Cache.BlockCache? defaultBlockCache, string? dbSessionId)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(format);
-        return new TableReaderOptions
+        BlockBasedTableOptions t = options.TableOptions;
+        Cache.BlockCache? cache = t.NoBlockCache ? null : (t.BlockCache ?? defaultBlockCache);
+        TableReaderOptions r = new()
         {
             Comparator = ResolveComparator(options.ComparatorName),
             FilterPolicy = format.FilterPolicy,
             VerifyChecksums = format.VerifyChecksums,
+            CacheIndexAndFilterBlocks = cache is not null && t.CacheIndexAndFilterBlocks,
+            CacheIndexAndFilterBlocksWithHighPriority = t.CacheIndexAndFilterBlocksWithHighPriority,
+            DbSessionId = dbSessionId,
         };
+        if (cache is not null) r = r with { BlockCache = cache };
+        return r;
     }
 }

@@ -11,10 +11,16 @@ namespace RocksDb.Managed.Table;
 /// <para>
 /// Lifetime: blocks are reference counted so a block cache and any number of iterators can share one instance.
 /// A new block starts with a reference count of 1 owned by the creator. When the count reaches 0 the buffer is
-/// returned to <see cref="ArrayPool{T}.Shared"/> (if it was rented) and the object is recycled.
+/// returned to its pool (if it was rented: <see cref="ArrayPool{T}.Shared"/> or the internal block buffer pool, routed
+/// by length) and the object is recycled.
+/// </para>
+/// <para>
+/// <see cref="IDisposable.Dispose"/> (explicit) releases one reference, so a block can be handed to a
+/// <see cref="Cache.BlockCache"/> as <c>CacheValue.FromObject(block)</c>: the cache owns that reference and releases it
+/// when the entry is freed.
 /// </para>
 /// </summary>
-public sealed class Block
+public sealed class Block : IDisposable
 {
     private const uint HashIndexBit = 1u << 31;
     private const uint ExtendedMetadataBit = 1u << 30;
@@ -55,7 +61,8 @@ public sealed class Block
     /// <summary>
     /// Wraps <paramref name="buffer"/>[0..<paramref name="length"/>) as a block with entries + restart array.
     /// If <paramref name="rentedFromSharedPool"/> the block takes ownership and returns the array to
-    /// <see cref="ArrayPool{T}.Shared"/> when released. Throws Corruption for a malformed block.
+    /// <see cref="ArrayPool{T}.Shared"/> (or, for the non-power-of-two sizes the table reader rents, to the internal
+    /// block buffer pool) when released. Throws Corruption for a malformed block.
     /// </summary>
     public static Block Create(byte[] buffer, int length, bool rentedFromSharedPool)
     {
@@ -136,9 +143,12 @@ public sealed class Block
         bool rented = _rented;
         _buffer = [];
         _length = 0;
-        if (rented && buf.Length > 0) ArrayPool<byte>.Shared.Return(buf);
+        if (rented && buf.Length > 0) RocksDb.Managed.Memory.BlockBufferPool.Return(buf);
         ReturnObject(this);
     }
+
+    /// <summary>Releases one reference (same as <see cref="Release"/>); used by the block cache when an entry is freed.</summary>
+    void IDisposable.Dispose() => Release();
 
     private static Block RentObject()
     {

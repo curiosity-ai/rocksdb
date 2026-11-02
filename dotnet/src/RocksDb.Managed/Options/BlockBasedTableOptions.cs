@@ -32,6 +32,12 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
     public bool PinL0FilterAndIndexBlocksInCache { get; set; }
     public bool PinTopLevelIndexAndFilter { get; set; } = true;
     public bool NoBlockCache { get; set; }
+    /// <summary>
+    /// Block cache shared by readers using these options (port of <c>BlockBasedTableOptions::block_cache</c>; not persisted).
+    /// When null and <see cref="NoBlockCache"/> is false, the database supplies a default 32 MiB HyperClock cache shared by
+    /// all column families of that database.
+    /// </summary>
+    public Cache.BlockCache? BlockCache { get; set; }
     public bool BlockAlign { get; set; }
     public bool EnableIndexCompression { get; set; } = true;
     public bool UseDeltaEncoding { get; set; } = true;
@@ -89,6 +95,7 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
     {
         var c = new BlockBasedTableOptions();
         c.CopyFrom(this);
+        c.BlockCache = BlockCache;
         return c;
     }
 }

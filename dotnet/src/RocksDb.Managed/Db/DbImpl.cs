@@ -64,6 +64,25 @@ internal sealed partial class DbImpl : IAsyncDisposable
     public string WalDir { get; }
     public IReadOnlyList<string> DbPaths { get; }
     public VersionSet Versions { get; }
+    private Cache.BlockCache? _defaultBlockCache;
+    private readonly Lock _defaultBlockCacheLock = new();
+
+    /// <summary>Default block cache capacity when <c>BlockBasedTableOptions.BlockCache</c> is not set (upstream: 32 MiB).</summary>
+    internal const long DefaultBlockCacheCapacity = 32L << 20;
+
+    /// <summary>
+    /// The DB-wide default block cache (HyperClock, 32 MiB) used by column families that don't configure their own;
+    /// created lazily and shared so that all column families compete for one budget.
+    /// </summary>
+    internal Cache.BlockCache? GetDefaultBlockCache(BlockBasedTableOptions tableOptions)
+    {
+        if (tableOptions.NoBlockCache || tableOptions.BlockCache is not null) return null;
+        lock (_defaultBlockCacheLock)
+        {
+            return _defaultBlockCache ??= Cache.BlockCache.CreateDefault(DefaultBlockCacheCapacity, (int)Math.Min(tableOptions.BlockSize, int.MaxValue));
+        }
+    }
+
     public DbIdentity Identity { get; private set; }
     public Lock Mutex => _mutex;
 
@@ -359,6 +378,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
         var manifests = new List<ulong>();
         lock (_mutex)
         {
+            // DisableFileDeletions: keep everything queued until deletions are re-enabled (FindObsoleteFiles).
+            if (FileDeletionsDisabled || _readOnly) return;
             Versions.TakeObsoleteFiles(tables);
             ulong minLog = Versions.MinLogNumberWithUnflushedData(null);
             for (int i = 0; i < _aliveWals.Count;)
@@ -379,8 +400,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
             t.Cfd.TableCache.Evict(t.Meta.FileNumber);
             TryDeleteFile(FileNames.TableFileName(DbPaths, t.Meta.FileNumber, t.Meta.PathId));
         }
-        foreach (ulong n in wals) TryDeleteFile(FileNames.LogFileName(WalDir, n));
+        foreach (ulong n in wals) DeleteOrArchiveWal(n);
         foreach (ulong n in manifests) TryDeleteFile(FileNames.DescriptorFileName(DbName, n));
+        PurgeObsoleteWalFiles(force: false);
     }
 
     /// <summary>
@@ -391,8 +413,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
     {
         var toDelete = new List<string>();
         var options = new List<(ulong Number, string Path)>();
+        var walsToDelete = new List<ulong>();
         lock (_mutex)
         {
+            if (FileDeletionsDisabled || _readOnly) return;
             ulong minLog = Versions.MinLogNumberWithUnflushedData(null);
             var dirs = new List<string>(DbPaths);
             if (!dirs.Contains(WalDir)) dirs.Add(WalDir);
@@ -419,7 +443,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                         case FileType.WalFile:
                             if (dir == WalDir && number < minLog && number != _logNumber)
                             {
-                                toDelete.Add(full);
+                                walsToDelete.Add(number);
                                 _aliveWals.Remove(number);
                             }
                             break;
@@ -433,6 +457,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
         options.Sort(static (a, b) => b.Number.CompareTo(a.Number));
         for (int i = 2; i < options.Count; i++) toDelete.Add(options[i].Path);
         foreach (string p in toDelete) TryDeleteFile(p);
+        foreach (ulong n in walsToDelete) DeleteOrArchiveWal(n);
+        PurgeObsoleteWalFiles(force: true);
     }
 
     private void TryDeleteFile(string path)
@@ -474,6 +500,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             _writeThread.ExitAsLeader();
             return;
         }
+        NotifySequenceWaiters(); // wake WAL tailers so they observe the close
         try
         {
             lock (_mutex) _shuttingDown = true;
@@ -499,6 +526,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             _groupBatch.Dispose();
             _dbLock?.Dispose();
             _dbLock = null;
+            if (_secondary) DisposeSecondaryReaders();
         }
     }
 

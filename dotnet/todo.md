@@ -69,7 +69,7 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [x] `LocalFileSystem` hardened: pooled growing write buffer, fdatasync, dir fsync, fallocate, direct I/O (Linux), OFD LOCK interoperating with native RocksDB; `MemoryFileSystem` with crash simulation; `FilePrefetchBuffer`
 - [x] Block cache: sharded LRU (+priority pools, strict capacity) and HyperClock; `OffsetableCacheKey`; `CachedBlock` ref-counted handles — recommendation: HyperClock default
 - [x] db_bench-style runner (`-- dbbench --engine native ...`) + `IKeyValueEngine`; native baseline recorded below
-- [ ] Wire block cache into `BlockBasedTableReader` (replace `Table.IBlockCache` seam with `Cache.BlockCache`/`CachedBlock`)
+- [x] Block cache wired into `BlockBasedTableReader` (parsed blocks cached, index/filter high priority, per-file OffsetableCacheKey, stats) — see docs/perf.md
 - [ ] Rate limiter implementation; hard links (Checkpoint); non-blocking SyncAsync; auto-resizing HyperClock
 
 Native baseline (200k ops, 16B key / 100B value, shared noisy 4-core box): fillseq 3.9–9.1 µs/op, fillrandom 7.1–8.0, readrandom memtable 4.8, readrandom SST 15.4, readmissing 4.0.
@@ -87,7 +87,8 @@ P = perf + block cache wiring (Table/, Cache/, Memtable/, Util/).
 - [x] Flush: background flush jobs, L0 build with tombstones + unique ids, MANIFEST rollover; `FlushAsync`
 - [x] Snapshots, GetProperty subset, GetLiveFilesMetadata, NewIterator via DbIteratorFactory
 - [x] Compat: native→managed→native and managed→native→managed round trips with CFs/merges/range deletes/WAL-only data
-- [ ] Shared bounded table cache across CFs; block cache passed to readers
+- [x] Block cache passed to readers: `BlockBasedTableOptions.BlockCache` or DB-wide default 32 MiB HyperClock shared across CFs
+- [ ] Shared bounded table cache across CFs
 - [ ] Concurrent memtable insert, pipelined write, `max_total_wal_size`, lazy WAL sync on rotation
 - [ ] Read-only open, custom comparators, KeyMayExist, WAL tracking in MANIFEST, keep dropped CF readable while handle alive
 - [x] Iterators: MergingIterator, LevelIterator, DBIter, public `Iterator` (+foreach, ScanAsync), `DbIteratorFactory` — matches native exactly on multi-level DB with snapshots/bounds
@@ -96,10 +97,18 @@ P = perf + block cache wiring (Table/, Cache/, Memtable/, Util/).
 - [ ] Compaction: leveled (picker + job), universal later; compaction filter; background scheduling
 - [x] Range deletions (DeleteRange) end-to-end (memtable, flush, SST, Get, iterators)
 - [x] Single delete (read path)
-- [ ] TTL (OpenWithTtl)
+- [x] TTL value format + `TtlDatabase` (compatible with native OpenWithTtl)
+- [ ] Wire `TtlCompactionFilter` into compaction; TTL iterator wrapper
+- [ ] Bug: small WriteBufferSize with default ArenaBlockSize trips Debug.Assert in memtable ctor (sanitize like upstream)
 - [x] GetLiveFilesMetadata
-- [ ] Checkpoint, GetUpdatesSince (WAL tailing), IngestExternalFiles, SstFileWriter public API
-- [ ] Read-only and secondary open
+- [x] GetUpdatesSince (`TransactionLogIterator`, `TailUpdatesAsync` signalled by write path, WAL archival, FragmentBufferedLogReader) — identical sequences/bytes to native both ways
+- [x] Checkpoint (hard links via `IFileSystem.LinkFile`), Disable/EnableFileDeletions, GetLiveFiles, GetSortedWalFiles, FlushWal/SyncWal
+- [x] SstFileWriter public API + IngestExternalFiles (level picking, global seqno in MANIFEST) — compat both ways
+- [x] Replication round trip (checkpoint + tail into managed and native replicas)
+- [ ] Ingestion: WriteGlobalSeqno, IngestBehind, overlapping files in one call, running-compaction checks
+- [ ] Port rocksdb-sharp Replication/ layer onto the new API (mapping in phase-2b report: checkpoint seq + TailUpdatesAsync replaces WalTailer)
+- [x] Read-only and secondary open (+TryCatchUpWithPrimary over a live native primary)
+- [ ] Secondary: tail MANIFEST incrementally instead of re-reading
 - [x] GetProperty (subset)
 - [ ] Statistics
 
@@ -111,6 +120,16 @@ First managed vs native db_bench (200k ops, 16B/100B, shared box; managed has no
 | readrandom (memtable) | 4.19 | 2.80 | 0 |
 | readrandom (after flush) | 6.90 | 4.92 | ~3 B (table open) |
 | flush | 214 ms | 398 ms | |
+
+With block cache (8 MiB both engines, 200k ops, data > cache):
+| benchmark | native µs/op | managed µs/op | managed alloc/op |
+|---|---|---|---|
+| fillrandom | 8.37 | 5.80 | ~0 steady |
+| flush | 210 ms | 470 ms | 6 MB/flush |
+| readrandom (SST, cache misses) | 7.74 | 6.69 | 44 B (cache-miss path) |
+
+Perf follow-ups: flush is ~2x slower than native and allocates 6 MB; cache-miss read path allocates ~44 B/op;
+HyperClock slots as array-of-structs; single-threaded cached table Get +18% vs plain dictionary.
 
 ## Phase 3 — Compat + performance
 - [x] Full-DB compat: native writes DB → managed opens/reads/writes → native reopens & verifies (and reverse)

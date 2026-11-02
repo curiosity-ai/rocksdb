@@ -121,6 +121,25 @@ public sealed class SstCompatTests
         }
         Assert.IsFalse(reader.Get(LookupKey("key"u8.ToArray()), null).Found);
         Assert.IsFalse(reader.Get(LookupKey("zzz"u8.ToArray()), null).Found);
+
+        // Same file through a small shared HyperClock cache (index partitions and data blocks cached and evicted;
+        // the top-level index in the cache too), twice so the second pass hits.
+        var cache = RocksDb.Managed.Cache.BlockCache.CreateHyperClock(new RocksDb.Managed.Cache.HyperClockCacheOptions { Capacity = 32 << 10, EstimatedEntryCharge = 1024 });
+        var stats = new BlockCacheStatistics();
+        using var cached = BlockBasedTableReader.Open(LocalFileSystem.Instance.OpenRandomAccess(path),
+            new TableReaderOptions { BlockCache = cache, CacheIndexAndFilterBlocks = true, Statistics = stats });
+        for (int pass = 0; pass < 2; pass++)
+        {
+            for (int i = 0; i < count; i += 7)
+            {
+                value.Clear();
+                TableGetResult r = cached.Get(LookupKey(Key(i)), value);
+                Assert.IsTrue(r.Found);
+                if (r.Type == EntryType.Value) CollectionAssert.AreEqual(Val(i, seed), value.WrittenSpan.ToArray());
+            }
+        }
+        Assert.IsTrue(stats.DataHits > 0 && stats.DataMisses > 0 && stats.IndexHits > 0);
+        Assert.AreEqual(0, cache.PinnedUsage);
     }
 
     private static byte[] LookupKey(byte[] userKey)
