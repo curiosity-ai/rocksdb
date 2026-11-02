@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>RocksDb.Managed.Replication</RootNamespace>
+    <AssemblyName>RocksDb.Managed.Replication</AssemblyName>
+    <IsAotCompatible>true</IsAotCompatible>
+    <Description>Replication (checkpoint + WAL streaming), planned switchover and a Raft cluster layer for RocksDb.Managed. Transport-agnostic.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\RocksDb.Managed\RocksDb.Managed.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="RocksDb.Managed.Replication.Tests" />
+  </ItemGroup>
+</Project>

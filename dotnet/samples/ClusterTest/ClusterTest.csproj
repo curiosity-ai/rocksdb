@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Multi-process Raft cluster over gRPC (port of rocksdb-sharp's Tests/ClusterTest onto RocksDb.Managed). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RocksDb.Managed.Replication.MagicOnion\RocksDb.Managed.Replication.MagicOnion.csproj" />
+  </ItemGroup>
+</Project>

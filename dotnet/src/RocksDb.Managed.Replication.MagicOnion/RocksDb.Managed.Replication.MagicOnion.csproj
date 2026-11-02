@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Optional gRPC (MagicOnion) hosting of RocksDb.Managed.Replication: services, clients and a small Kestrel bootstrap.
+       The core replication library stays transport-agnostic. -->
+  <PropertyGroup>
+    <RootNamespace>RocksDb.Managed.Replication.MagicOnion</RootNamespace>
+    <AssemblyName>RocksDb.Managed.Replication.MagicOnion</AssemblyName>
+    <Description>gRPC (MagicOnion) transport and hosting for RocksDb.Managed.Replication: replication, switchover pair and Raft cluster services.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="MagicOnion.Server" />
+    <PackageReference Include="MagicOnion.Client" />
+    <PackageReference Include="MessagePack" />
+    <ProjectReference Include="..\RocksDb.Managed\RocksDb.Managed.csproj" />
+    <ProjectReference Include="..\RocksDb.Managed.Replication\RocksDb.Managed.Replication.csproj" />
+  </ItemGroup>
+</Project>

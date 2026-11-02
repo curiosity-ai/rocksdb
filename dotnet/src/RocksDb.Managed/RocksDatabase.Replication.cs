@@ -151,6 +151,16 @@ public sealed partial class RocksDatabase
         return _db.GetSortedWalFiles(includeArchived: true);
     }
 
+    /// <summary>
+    /// Deletes the archived WAL <paramref name="logNumber"/> (DB::DeleteFile("/archive/NNNNNN.log")). Lets a
+    /// replication source retire archived WALs once every replica has consumed them, instead of relying on
+    /// <see cref="DbOptions.WalTtlSeconds"/> alone. Throws NotSupported for a live WAL and NotFound if the file is gone.
+    /// </summary>
+    public void DeleteArchivedWalFile(ulong logNumber) => _db.DeleteArchivedWalFile(logNumber);
+
+    /// <summary>The file system the DB was opened with (<see cref="DbOptions.FileSystem"/>); checkpoints are written through it.</summary>
+    public Env.IFileSystem FileSystem => _db.FileSystem;
+
     /// <summary>The WAL currently being written (DB::GetCurrentWalFile).</summary>
     public WalFileInfo GetCurrentWalFile() => _db.GetCurrentWalFile();
 

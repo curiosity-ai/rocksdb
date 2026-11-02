@@ -5,6 +5,11 @@
     <PackageVersion Include="Snappier" Version="1.3.1" />
     <PackageVersion Include="K4os.Compression.LZ4" Version="1.3.8" />
     <PackageVersion Include="ZstdSharp.Port" Version="0.8.8" />
+    <!-- Optional gRPC hosting of the replication layer (same versions as rocksdb-sharp's Tests/ReplicationTest etc.). -->
+    <PackageVersion Include="MagicOnion.Server" Version="7.10.0" />
+    <PackageVersion Include="MagicOnion.Client" Version="7.10.0" />
+    <!-- Pinned above MagicOnion's transitive 3.1.4, which has published advisories (NU1902). -->
+    <PackageVersion Include="MessagePack" Version="3.1.12" />
     <!-- Tests / benchmarks -->
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
     <PackageVersion Include="MSTest" Version="4.5.2" />
