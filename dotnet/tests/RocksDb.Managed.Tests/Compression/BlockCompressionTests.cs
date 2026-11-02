@@ -45,8 +45,8 @@ public sealed class BlockCompressionTests
                 if (!ok)
                 {
                     Assert.AreEqual(0, compressed.WrittenCount, type + " wrote output despite rejecting");
-                    // Only tiny inputs, or zlib above 16 KiB, may be rejected for this data
-                    Assert.IsTrue(size < 100 || (type == CompressionType.Zlib && size > 16384), type + " rejected size " + size);
+                    // Only tiny inputs may be rejected for this data
+                    Assert.IsTrue(size < 100, type + " rejected size " + size);
                     continue;
                 }
                 Assert.IsTrue(BlockCompression.IsGoodCompressionRatio(compressed.WrittenCount, raw.Length), type + " " + size);

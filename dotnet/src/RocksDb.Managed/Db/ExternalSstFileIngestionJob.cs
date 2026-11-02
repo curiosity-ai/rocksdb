@@ -76,12 +76,17 @@ internal sealed class ExternalSstFileIngestionJob
         _files.Sort((a, b) => icmp.Compare(a.SmallestInternalKey, b.SmallestInternalKey));
         for (int i = 1; i < _files.Count; i++)
         {
-            if (_cfd.UserComparator.Compare(_files[i - 1].LargestUserKey, _files[i].SmallestUserKey) >= 0)
+            if (_cfd.UserComparator.CompareWithoutTimestamp(_files[i - 1].LargestUserKey, _files[i].SmallestUserKey) >= 0)
             {
                 FilesOverlap = true;
             }
         }
-        if (FilesOverlap) ThrowHelper.NotSupported("Files have overlapping ranges");
+        if (FilesOverlap)
+        {
+            ThrowHelper.NotSupported(_cfd.TimestampSize > 0
+                ? "Files with overlapping ranges cannot be ingested to column family with user-defined timestamp enabled."
+                : "Files have overlapping ranges");
+        }
 
         // Copy/link the files into the DB.
         foreach (IngestedFileInfo f in _files)
@@ -183,6 +188,9 @@ internal sealed class ExternalSstFileIngestionJob
                 ReadOnlySpan<byte> start = rit.Key[..pk.UserKeyLength];
                 byte[] startKey = new InternalKey(start, 0, EntryType.RangeDeletion).Encoded.ToArray();
                 byte[] endKey = new InternalKey(rit.Value, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion).Encoded.ToArray();
+                // RangeTombstone::SerializeEndKey: with user-defined timestamps the end key carries the maximum timestamp.
+                int tsSize = _cfd.TimestampSize;
+                if (tsSize > 0 && rit.Value.Length >= tsSize) endKey.AsSpan(rit.Value.Length - tsSize, tsSize).Fill(0xff);
                 if (smallest is null || _cfd.Icmp.Compare(startKey, smallest) < 0) smallest = startKey;
                 if (largest is null || _cfd.Icmp.Compare(endKey, largest) > 0) largest = endKey;
             }
@@ -197,7 +205,8 @@ internal sealed class ExternalSstFileIngestionJob
     {
         if (!DbFormat.TryParseInternalKey(internalKey, out ParsedInternalKey pk)) ThrowHelper.Corruption("external file has corrupted keys");
         if (pk.Sequence != 0) ThrowHelper.Corruption("External file has non zero sequence number");
-        if (pk.Type is not (EntryType.Value or EntryType.Merge or EntryType.Deletion or EntryType.SingleDeletion))
+        if (pk.Type is not (EntryType.Value or EntryType.Merge or EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp
+                or EntryType.WideColumnEntity))
         {
             ThrowHelper.Corruption("External file has a key with unsupported type " + (byte)pk.Type);
         }
@@ -222,9 +231,20 @@ internal sealed class ExternalSstFileIngestionJob
         if (mem.IsEmpty) return false;
         if (mem.NumRangeDeletes > 0) return true; // conservative
         MemTableIterator it = mem.NewIterator();
-        var seek = new InternalKey(f.SmallestUserKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
-        it.Seek(seek.Encoded);
-        return it.Valid && _cfd.UserComparator.Compare(DbFormat.ExtractUserKey(it.Key), f.LargestUserKey) <= 0;
+        it.Seek(SeekKey(f));
+        return it.Valid && _cfd.UserComparator.CompareWithoutTimestamp(DbFormat.ExtractUserKey(it.Key), f.LargestUserKey) <= 0;
+    }
+
+    /// <summary>
+    /// Seek target for the file's smallest key: newest possible entry of it (with user-defined timestamps every version
+    /// of the key, whatever its timestamp, counts as an overlap: the maximum timestamp sorts first).
+    /// </summary>
+    private byte[] SeekKey(IngestedFileInfo f)
+    {
+        byte[] seek = new InternalKey(f.SmallestUserKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek).Encoded.ToArray();
+        int ts = _cfd.TimestampSize;
+        if (ts > 0 && f.SmallestUserKey.Length >= ts) seek.AsSpan(f.SmallestUserKey.Length - ts, ts).Fill(0xff);
+        return seek;
     }
 
     /// <summary>
@@ -303,19 +323,20 @@ internal sealed class ExternalSstFileIngestionJob
     /// <summary>Version::OverlapWithLevelIterator: does level <paramref name="level"/> contain a key in the file's range?</summary>
     private bool OverlapWithLevel(VersionStorageInfo vstorage, int level, IngestedFileInfo f)
     {
+        // AfterFile / BeforeFile / OverlapWithIterator compare user keys without timestamps.
         Comparator ucmp = _cfd.UserComparator;
-        var seek = new InternalKey(f.SmallestUserKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
+        byte[] seek = SeekKey(f);
         foreach (FileMetaData lf in vstorage.LevelFiles(level))
         {
-            if (ucmp.Compare(DbFormat.ExtractUserKey(lf.Largest), f.SmallestUserKey) < 0 ||
-                ucmp.Compare(DbFormat.ExtractUserKey(lf.Smallest), f.LargestUserKey) > 0)
+            if (ucmp.CompareWithoutTimestamp(DbFormat.ExtractUserKey(lf.Largest), f.SmallestUserKey) < 0 ||
+                ucmp.CompareWithoutTimestamp(DbFormat.ExtractUserKey(lf.Smallest), f.LargestUserKey) > 0)
             {
                 continue;
             }
             if (_cfd.TableCache.GetRangeTombstones(lf) is not null) return true; // conservative
             using Iterators.InternalIterator it = _cfd.TableCache.NewIterator(lf);
-            it.Seek(seek.Encoded);
-            if (it.Valid && ucmp.Compare(DbFormat.ExtractUserKey(it.Key), f.LargestUserKey) <= 0) return true;
+            it.Seek(seek);
+            if (it.Valid && ucmp.CompareWithoutTimestamp(DbFormat.ExtractUserKey(it.Key), f.LargestUserKey) <= 0) return true;
         }
         return false;
     }
@@ -327,8 +348,8 @@ internal sealed class ExternalSstFileIngestionJob
         Comparator ucmp = _cfd.UserComparator;
         foreach (FileMetaData lf in vstorage.LevelFiles(level))
         {
-            if (ucmp.Compare(DbFormat.ExtractUserKey(lf.Largest), f.SmallestUserKey) < 0 ||
-                ucmp.Compare(DbFormat.ExtractUserKey(lf.Smallest), f.LargestUserKey) > 0)
+            if (ucmp.CompareWithoutTimestamp(DbFormat.ExtractUserKey(lf.Largest), f.SmallestUserKey) < 0 ||
+                ucmp.CompareWithoutTimestamp(DbFormat.ExtractUserKey(lf.Smallest), f.LargestUserKey) > 0)
             {
                 continue;
             }

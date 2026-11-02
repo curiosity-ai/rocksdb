@@ -317,7 +317,7 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
         OpGenerator.Generate(b, new GeneratorOptions { Ops = 200, AllowColumnFamilyChanges = false, AllowFlush = false });
         b.Verify();
         await h.RunAsync(first, b);
-        SkipIfNativeMetaIsEmpty(backupDir);
+        AssertNativeMetaIsNotEmpty(backupDir);
         ReferenceModel backup1 = ReferenceModel.FromContents(spec, h.Model.Backups[backupDir]);
 
         // 2. second engine restores it (from a script on the source DB), opens the restored DB, extends it and adds an
@@ -330,7 +330,7 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
         e.Add(Op.Backup(backupDir, flush: true));
         e.Verify();
         await h.RunAsync(second, e);
-        SkipIfNativeMetaIsEmpty(backupDir);
+        AssertNativeMetaIsNotEmpty(backupDir);
         ReferenceModel backup2 = ReferenceModel.FromContents(spec, backup1.Backups[backupDir]);
 
         // 3. first engine restores the incremental backup and verifies it.
@@ -343,15 +343,16 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
     }
 
     /// <summary>
-    /// librocksdb 11.12 writes empty backup meta files when hosted by .NET 11 (see the compat tests); such a run is
-    /// inconclusive.
+    /// librocksdb 11.12 wrote empty backup meta files under a .NET 11 apphost until libstdc++ was made globally visible
+    /// (tests/Shared/NativeStdCxxPreload.cs); fail clearly if that regresses.
     /// </summary>
-    private static void SkipIfNativeMetaIsEmpty(string backupDir)
+    private static void AssertNativeMetaIsNotEmpty(string backupDir)
     {
         uint id = NativeEngine.LatestBackupId(backupDir);
         if (new FileInfo(Path.Combine(backupDir, "meta", id.ToString(CultureInfo.InvariantCulture))).Length == 0)
         {
-            Assert.Inconclusive("native BackupEngine wrote an empty meta file (librocksdb 11.12 hosted by .NET " + Environment.Version + ")");
+            Assert.Fail("native BackupEngine wrote an empty meta file (librocksdb 11.12 hosted by .NET " + Environment.Version +
+                "): is libstdc++.so.6 preloaded globally (NativeStdCxxPreload)?");
         }
     }
 

@@ -115,13 +115,48 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     }
 
     /// <summary>Adds a Put entry (SstFileWriter::Put). Keys must be strictly increasing.</summary>
-    public SstFileWriter Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => AddImpl(key, value, EntryType.Value);
+    public SstFileWriter Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Add(key, value, EntryType.Value);
 
     /// <summary>Adds a Merge entry (SstFileWriter::Merge).</summary>
-    public SstFileWriter Merge(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => AddImpl(key, value, EntryType.Merge);
+    public SstFileWriter Merge(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Add(key, value, EntryType.Merge);
 
     /// <summary>Adds a point deletion (SstFileWriter::Delete).</summary>
-    public SstFileWriter Delete(ReadOnlySpan<byte> key) => AddImpl(key, default, EntryType.Deletion);
+    public SstFileWriter Delete(ReadOnlySpan<byte> key) => Add(key, default, EntryType.Deletion);
+
+    /// <summary>
+    /// Adds a Put of <paramref name="key"/> at <paramref name="timestamp"/> (SstFileWriter::Put(user_key, timestamp,
+    /// value)) for a comparator with user-defined timestamps. Entries are ordered by key, then newest timestamp first.
+    /// </summary>
+    public SstFileWriter Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp, ReadOnlySpan<byte> value) =>
+        AddWithTimestamp(key, timestamp, value, EntryType.Value);
+
+    /// <summary>Adds a deletion of <paramref name="key"/> at <paramref name="timestamp"/> (kTypeDeletionWithTimestamp).</summary>
+    public SstFileWriter Delete(ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp) =>
+        AddWithTimestamp(key, timestamp, default, EntryType.DeletionWithTimestamp);
+
+    /// <summary>Rep::Add without a timestamp: the comparator must not carry one.</summary>
+    private SstFileWriter Add(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, EntryType type)
+    {
+        if (_ucmp.TimestampSize != 0) ThrowHelper.InvalidArgument("Timestamp size mismatch");
+        return AddImpl(key, value, type);
+    }
+
+    /// <summary>Rep::Add(user_key, timestamp, ...): appends the timestamp to the key.</summary>
+    private SstFileWriter AddWithTimestamp(ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp, ReadOnlySpan<byte> value, EntryType type)
+    {
+        if (_ucmp.TimestampSize != timestamp.Length) ThrowHelper.InvalidArgument("Timestamp size mismatch");
+        byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(key.Length + timestamp.Length);
+        try
+        {
+            key.CopyTo(rented);
+            timestamp.CopyTo(rented.AsSpan(key.Length));
+            return AddImpl(rented.AsSpan(0, key.Length + timestamp.Length), value, type);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
 
     /// <summary>Port of SstFileWriter::Rep::AddImpl.</summary>
     private SstFileWriter AddImpl(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> value, EntryType type)
@@ -148,8 +183,31 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     /// <summary>Adds a range deletion [<paramref name="beginKey"/>, <paramref name="endKey"/>) (SstFileWriter::DeleteRange).</summary>
     public SstFileWriter DeleteRange(ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey)
     {
+        if (_ucmp.TimestampSize != 0) ThrowHelper.InvalidArgument("Timestamp size mismatch");
+        return DeleteRangeImpl(beginKey, endKey);
+    }
+
+    /// <summary>
+    /// Adds a range deletion [<paramref name="beginKey"/>, <paramref name="endKey"/>) at <paramref name="timestamp"/>
+    /// (SstFileWriter::DeleteRange(begin, end, ts)); both keys are given without the timestamp.
+    /// </summary>
+    public SstFileWriter DeleteRange(ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey, ReadOnlySpan<byte> timestamp)
+    {
+        if (_ucmp.TimestampSize != timestamp.Length) ThrowHelper.InvalidArgument("Timestamp size mismatch");
+        byte[] b = new byte[beginKey.Length + timestamp.Length];
+        byte[] e = new byte[endKey.Length + timestamp.Length];
+        beginKey.CopyTo(b);
+        timestamp.CopyTo(b.AsSpan(beginKey.Length));
+        endKey.CopyTo(e);
+        timestamp.CopyTo(e.AsSpan(endKey.Length));
+        return DeleteRangeImpl(b, e);
+    }
+
+    /// <summary>Port of Rep::DeleteRangeImpl (keys with their timestamp when the comparator has one).</summary>
+    private SstFileWriter DeleteRangeImpl(ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey)
+    {
         BlockBasedTableBuilder builder = _builder ?? throw RocksDbException.InvalidArgument("File is not opened");
-        int c = _ucmp.Compare(beginKey, endKey);
+        int c = _ucmp.CompareWithoutTimestamp(beginKey, endKey);
         if (c > 0) ThrowHelper.InvalidArgument("end key comes before start key");
         if (c == 0) return this; // empty range: nothing to record (upstream skips it as well)
         if (_numRangeDelEntries == 0)

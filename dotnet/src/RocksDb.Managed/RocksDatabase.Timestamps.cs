@@ -21,6 +21,8 @@ public sealed partial class RocksDatabase
 
     /// <summary>Merge operand for <paramref name="key"/> at <paramref name="timestamp"/> in the default column family.</summary>
     public void Merge(ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp, ReadOnlySpan<byte> operand) => _default.Merge(key, timestamp, operand);
+    /// <inheritdoc cref="ColumnFamily.DeleteRange(ReadOnlySpan{byte}, ReadOnlySpan{byte}, ReadOnlySpan{byte})"/>
+    public void DeleteRange(ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey, ReadOnlySpan<byte> timestamp) => _default.DeleteRange(beginKey, endKey, timestamp);
 
     /// <inheritdoc cref="ColumnFamily.TryGet(ReadOptions, ReadOnlySpan{byte}, IBufferWriter{byte}, IBufferWriter{byte})"/>
     public bool TryGet(ReadOptions options, ReadOnlySpan<byte> key, IBufferWriter<byte> value, IBufferWriter<byte> timestamp) =>

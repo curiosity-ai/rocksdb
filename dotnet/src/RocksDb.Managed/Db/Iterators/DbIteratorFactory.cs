@@ -77,7 +77,10 @@ public static class DbIteratorFactory
     public static DbIter CreateDbIter(DbIteratorSources sources)
     {
         ArgumentNullException.ThrowIfNull(sources);
-        RangeDelAggregator? rangeDel = sources.ReadOptions?.IgnoreRangeDeletions == true ? null : new RangeDelAggregator(sources.Comparator, sources.Sequence);
+        // Range tombstones are bounded by the read timestamp (NewRangeTombstoneIterator(read_options, ...) ts_upper_bound).
+        RangeDelAggregator? rangeDel = sources.ReadOptions?.IgnoreRangeDeletions == true
+            ? null
+            : new RangeDelAggregator(sources.Comparator, sources.Sequence, sources.ReadOptions?.Timestamp is { } ts ? ts.Span : default);
         InternalIterator internalIter = NewInternalIterator(sources, rangeDel);
         return Wrap(sources, internalIter, rangeDel);
     }

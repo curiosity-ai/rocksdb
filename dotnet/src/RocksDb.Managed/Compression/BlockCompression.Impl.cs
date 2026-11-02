@@ -19,10 +19,13 @@ namespace RocksDb.Managed.Compression;
 ///   level picks fast vs HC exactly like upstream. LZ4 fast acceleration &gt; 1 (level &lt; -1) is not exposed by
 ///   K4os, so it compresses with acceleration 1 (output still fully compatible).</item>
 /// <item>ZSTD: ZstdSharp, a plain zstd frame (ZSTD_compress2) with pooled thread-local contexts.</item>
-/// <item>Zlib: raw deflate (window_bits = -14). .NET's deflater uses a 32 KiB window, which a native inflater
-///   with window_bits -14 could reject, so blocks larger than 16 KiB are not zlib-compressed (TryCompress
-///   returns false). Decompression accepts any raw deflate stream. Zlib (de)compression allocates a stream
-///   object per call (rarely used codec).</item>
+/// <item>Zlib: raw deflate (window_bits = -14). .NET's deflater (both target frameworks) uses a 32 KiB window,
+///   which a native inflater with window_bits -14 rejects as soon as a match reaches back more than 16 KiB. Inputs
+///   up to 16 KiB are one deflate stream; larger inputs are deflated in independent 16 KiB chunks, each ending
+///   with a sync flush (byte aligned, no final block) and starting with an empty history, so no match crosses a
+///   chunk start; an empty final fixed-Huffman block (0x03 0x00) ends the stream. Any inflater with a 16 KiB
+///   window reads it (the ratio is slightly worse than zlib's own, the format is the same). Decompression accepts
+///   any raw deflate stream. Zlib (de)compression allocates a stream object per call / chunk (rarely used codec).</item>
 /// <item>BZip2/Xpress: NotSupported.</item>
 /// </list>
 /// Dictionary compression is not supported yet.
@@ -108,7 +111,7 @@ public static partial class BlockCompression
     /// <summary>
     /// Port of LegacyForceBuiltinCompression (util/compression.cc), used for blob values: compresses with format-2
     /// framing and keeps the result even when it is larger than the input. Throws NotSupported when the type cannot be
-    /// produced (BZip2/Xpress, or zlib above 16 KiB, see the class remarks).
+    /// produced (BZip2/Xpress).
     /// </summary>
     internal static void CompressForced(CompressionType type, ReadOnlySpan<byte> raw, int level, IBufferWriter<byte> output)
     {
@@ -199,11 +202,11 @@ public static partial class BlockCompression
 
     private static bool TryCompressZlib(ReadOnlySpan<byte> raw, int level, int maxSize, IBufferWriter<byte> output)
     {
+        int zlevel = level == DefaultCompressionLevel ? -1 /* Z_DEFAULT_COMPRESSION */ : Math.Clamp(level, -1, 9);
         if (raw.Length > ZlibMaxBlockSize)
         {
-            return false;
+            return TryCompressZlibChunked(raw, zlevel, maxSize, output);
         }
-        int zlevel = level == DefaultCompressionLevel ? -1 /* Z_DEFAULT_COMPRESSION */ : Math.Clamp(level, -1, 9);
         byte[] buffer = ArrayPool<byte>.Shared.Rent(maxSize);
         try
         {
@@ -229,6 +232,38 @@ public static partial class BlockCompression
         {
             ArrayPool<byte>.Shared.Return(buffer);
         }
+    }
+
+    /// <summary>
+    /// Raw deflate of an input above 16 KiB that a 16 KiB-window inflater accepts (see the class remarks): independent
+    /// 16 KiB chunks, each sync-flushed (the deflater's final block is discarded), then an empty final block.
+    /// </summary>
+    private static bool TryCompressZlibChunked(ReadOnlySpan<byte> raw, int zlevel, int maxSize, IBufferWriter<byte> output)
+    {
+        Span<byte> header = stackalloc byte[Coding.MaxVarint32Length];
+        int headerLen = Coding.EncodeVarint32(header, (uint)raw.Length);
+        int limit = maxSize - headerLen - 2;
+        if (limit <= 0) return false;
+        var ms = new MemoryStream(Math.Min(limit, raw.Length / 2 + 64));
+        var options = new ZLibCompressionOptions { CompressionLevel = zlevel };
+        for (int offset = 0; offset < raw.Length; offset += ZlibMaxBlockSize)
+        {
+            ReadOnlySpan<byte> chunk = raw.Slice(offset, Math.Min(ZlibMaxBlockSize, raw.Length - offset));
+            var deflate = new DeflateStream(ms, options, leaveOpen: true);
+            deflate.Write(chunk);
+            deflate.Flush(); // Z_SYNC_FLUSH: everything so far, ending byte aligned with an empty stored block
+            long end = ms.Position;
+            deflate.Dispose(); // writes the (unwanted) final block after `end`: cut it off
+            ms.SetLength(end);
+            ms.Position = end;
+            if (end > limit) return false;
+        }
+        // Empty final block with fixed Huffman codes: BFINAL=1, BTYPE=01, end-of-block code 0000000.
+        ms.WriteByte(0x03);
+        ms.WriteByte(0x00);
+        output.Write(header[..headerLen]);
+        output.Write(ms.GetBuffer().AsSpan(0, (int)ms.Length));
+        return true;
     }
 
     // ---- Decompression -------------------------------------------------------------------------

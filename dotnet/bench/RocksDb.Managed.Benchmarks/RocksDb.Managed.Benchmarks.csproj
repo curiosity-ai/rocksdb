@@ -10,4 +10,8 @@
     <PackageReference Include="RocksDB" />
     <PackageReference Include="BenchmarkDotNet" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- librocksdb under a .NET 11 apphost: see the file's remarks. -->
+    <Compile Include="..\..\tests\Shared\NativeStdCxxPreload.cs" Link="NativeStdCxxPreload.cs" />
+  </ItemGroup>
 </Project>

@@ -66,6 +66,47 @@ public sealed class DbBlobTests
         }
     }
 
+    /// <summary>
+    /// Blob file readers are bounded by max_open_files (BlobFileCache over the table cache, capacity
+    /// max_open_files - 10): least recently used idle readers are closed and reopened on demand.
+    /// </summary>
+    [TestMethod]
+    public async Task BlobReadersBoundedByMaxOpenFiles()
+    {
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cf = BlobOptions();
+        DbOptions options = NewOptions(fs);
+        options.MaxOpenFiles = 25; // capacity 20 (the minimum)
+        using RocksDatabase db = RocksDatabase.Open(DbPath, options, cf);
+        const int Files = 30;
+        for (int f = 0; f < Files; f++)
+        {
+            for (int i = 0; i < 5; i++) db.Put(Key(f * 5 + i), B(BigValue(f * 5 + i, "v")));
+            db.Flush();
+        }
+        Assert.AreEqual((ulong)Files, IntProperty(db, DbProperties.NumBlobFiles));
+        BlobSource source = db.DefaultColumnFamily.Data.BlobSource;
+        for (int round = 0; round < 3; round++)
+        {
+            for (int k = 0; k < Files * 5; k++)
+            {
+                Assert.AreEqual(BigValue(k, "v"), round == 1 ? S(await db.GetAsync(Key(k))) : GetString(db, S(Key(k))!));
+                Assert.IsTrue(source.OpenReaders <= 20, "open blob readers: " + source.OpenReaders);
+            }
+        }
+        // Concurrent readers never use a closed reader.
+        await Parallel.ForAsync(0, 8, async (t, ct) =>
+        {
+            var rnd = new Random(t);
+            for (int n = 0; n < 400; n++)
+            {
+                int k = rnd.Next(Files * 5);
+                Assert.AreEqual(BigValue(k, "v"), n % 2 == 0 ? S(await db.GetAsync(Key(k), ct)) : GetString(db, S(Key(k))!));
+            }
+        });
+        Assert.IsTrue(source.OpenReaders <= 20 + 8, "open blob readers: " + source.OpenReaders);
+    }
+
     [TestMethod]
     public async Task AsyncGetMultiGetAndIterators()
     {
