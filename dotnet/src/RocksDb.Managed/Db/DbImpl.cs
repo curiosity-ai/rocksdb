@@ -506,7 +506,11 @@ internal sealed partial class DbImpl : IAsyncDisposable
         try
         {
             LogInfo("Shutdown: canceling all background work");
-            lock (_mutex) _shuttingDown = true;
+            lock (_mutex)
+            {
+                _shuttingDown = true;
+                SignalBackgroundWork(); // wake flush waiters: no more flushes will be scheduled
+            }
             CancelBackgroundCompactions();
             await WaitForBackgroundWorkAsync(synchronous).ConfigureAwait(false);
             LogWriter? log = _log;

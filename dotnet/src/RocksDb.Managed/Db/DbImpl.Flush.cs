@@ -210,6 +210,8 @@ internal sealed partial class DbImpl
                 if (target.FlushCompleted || !cfd.Imm.Contains(target)) return;
                 if (_bgError is { } e) ThrowBackgroundError(e);
                 if (cfd.Dropped) ThrowDropped(cfd);
+                // WaitForFlushMemTables: no flush is scheduled once shutdown started (upstream returns ShutdownInProgress).
+                if (_shuttingDown) ThrowDisposed();
                 signal = _bgSignal.Task;
             }
             if (synchronous) signal.Wait(cancellationToken);
