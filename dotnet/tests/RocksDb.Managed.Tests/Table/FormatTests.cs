@@ -125,10 +125,10 @@ public sealed class FormatTests
     public void BytewiseShortestSeparator(string start, string limit, string expected)
     {
         using var w = new RocksDb.Managed.Util.PooledBufferWriter();
-        InternalKeyOrdering.BytewiseFindShortestSeparator(Latin1(start), Latin1(limit), w);
+        Comparator.Bytewise.FindShortestSeparator(Latin1(start), Latin1(limit), w);
         CollectionAssert.AreEqual(Latin1(expected), w.WrittenSpan.ToArray());
         w.Clear();
-        InternalKeyOrdering.BytewiseFindShortSuccessor(Latin1("\u00ff\u00ffabc"), w);
+        Comparator.Bytewise.FindShortSuccessor(Latin1("\u00ff\u00ffabc"), w);
         CollectionAssert.AreEqual(Latin1("\u00ff\u00ffb"), w.WrittenSpan.ToArray());
     }
 

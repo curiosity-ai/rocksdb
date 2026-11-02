@@ -46,7 +46,7 @@ public sealed class BlockTests
         foreach (byte[] k in keys) { byte[] v = new byte[rnd.Next(0, 40)]; rnd.NextBytes(v); values.Add(v); }
         Block block = BuildBlock(keys, values, restartInterval);
         using var it = new BlockIter();
-        it.InitializeData(block, Comparator.Bytewise, BlockIter.DisableGlobalSequenceNumber);
+        it.InitializeData(block, InternalKeyComparator.Bytewise, BlockIter.DisableGlobalSequenceNumber);
 
         int idx = 0;
         for (it.SeekToFirst(); it.Valid; it.Next(), idx++)
@@ -102,7 +102,7 @@ public sealed class BlockTests
         Assert.AreEqual(8, contents.Length); // one restart (0) + count (1)
         Block block = Block.CreateCopy(contents);
         using var it = new BlockIter();
-        it.InitializeData(block, Comparator.Bytewise, BlockIter.DisableGlobalSequenceNumber);
+        it.InitializeData(block, InternalKeyComparator.Bytewise, BlockIter.DisableGlobalSequenceNumber);
         it.SeekToFirst();
         Assert.IsFalse(it.Valid);
         it.SeekToLast();
@@ -136,7 +136,7 @@ public sealed class BlockTests
         Assert.IsTrue(block.HasHashIndex);
         Assert.AreEqual(1, block.HashNumBuckets % 2);
         using var it = new BlockIter();
-        it.InitializeData(block, Comparator.Bytewise, BlockIter.DisableGlobalSequenceNumber);
+        it.InitializeData(block, InternalKeyComparator.Bytewise, BlockIter.DisableGlobalSequenceNumber);
         for (int i = 0; i < keys.Count; i++)
         {
             byte[] lookup = IKey(DbFormat.ExtractUserKey(keys[i]), DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
@@ -152,22 +152,6 @@ public sealed class BlockTests
             if (it.SeekForGet(lookup) && it.Valid) Assert.IsFalse(DbFormat.ExtractUserKey(it.Key).SequenceEqual(uk));
         }
         block.Release();
-    }
-
-    [TestMethod]
-    public void LegacyHashMatchesUpstream()
-    {
-        // Values from util/hash_test.cc (Hash with seed 0xbc9f1d34), incl. sign-extended tail bytes.
-        const uint seed = 0xbc9f1d34;
-        Assert.AreEqual(3164544308u, DataBlockHashIndex.LegacyHash([], seed));
-        Assert.AreEqual(422599524u, DataBlockHashIndex.LegacyHash([0x08], seed));
-        Assert.AreEqual(3195034349u, DataBlockHashIndex.LegacyHash([0x9a], seed));
-        Assert.AreEqual(31066776u, DataBlockHashIndex.LegacyHash([0x91, 0xf7], seed));
-        Assert.AreEqual(2469105222u, DataBlockHashIndex.LegacyHash([0x6a, 0xb5, 0xf4], seed));
-        Assert.AreEqual(447346355u, DataBlockHashIndex.LegacyHash([0x46, 0xdc, 0x54, 0xbe], seed));
-        Assert.AreEqual(2177978500u, DataBlockHashIndex.LegacyHash([0x6c, 0xa8, 0xbc, 0xe5, 0x99], seed));
-        Assert.AreEqual(2030937252u, DataBlockHashIndex.LegacyHash([0xd3, 0xa5, 0x7c, 0x0e, 0xc0, 0x02, 0x07], seed));
-        Assert.AreEqual(2706087434u, DataBlockHashIndex.LegacyHash([0x1a, 0xb5, 0xd0, 0xfe, 0xab, 0xc3, 0x61, 0xb2, 0x99], seed));
     }
 
     [TestMethod]
@@ -199,7 +183,7 @@ public sealed class BlockTests
         }
         Block block = Block.CreateCopy(b.Finish());
         using var it = new BlockIter();
-        it.InitializeIndex(block, Comparator.Bytewise, keyIncludesSeq: true, valueIsFull: !deltaEncoded, haveFirstKey: false, BlockIter.DisableGlobalSequenceNumber);
+        it.InitializeIndex(block, InternalKeyComparator.Bytewise, keyIncludesSeq: true, valueIsFull: !deltaEncoded, haveFirstKey: false, BlockIter.DisableGlobalSequenceNumber);
         int n = 0;
         for (it.SeekToFirst(); it.Valid; it.Next(), n++)
         {
@@ -235,7 +219,7 @@ public sealed class BlockTests
         var values = new List<byte[]> { new byte[] { 1 }, new byte[] { 2 }, Array.Empty<byte>() };
         Block block = BuildBlock(keys, values, 2);
         using var it = new BlockIter();
-        it.InitializeData(block, Comparator.Bytewise, 42);
+        it.InitializeData(block, InternalKeyComparator.Bytewise, 42);
         int n = 0;
         for (it.SeekToFirst(); it.Valid; it.Next(), n++)
         {

@@ -10,10 +10,11 @@ internal static class NativeSst
     public static byte[] Value(int i) => System.Text.Encoding.ASCII.GetBytes("value-" + i.ToString(System.Globalization.CultureInfo.InvariantCulture) + "-the-quick-brown-fox-jumps-over-the-lazy-dog");
 
     /// <summary>
-    /// Writes keys [0, count) with <see cref="Value"/>, flushes once and returns the parsed SST.
+    /// Writes keys [0, count) with <see cref="Value"/>, flushes once and opens the SST with the managed reader.
     /// <paramref name="filterPolicy"/> is a native rocksdb_filterpolicy_t* (ownership passes to the table options) or zero.
     /// </summary>
-    public static TestSstParser Build(TempDir dir, IntPtr filterPolicy, int formatVersion, RocksDbSharp.Compression compression, int count)
+    public static SstFile Build(TempDir dir, IntPtr filterPolicy, int formatVersion, RocksDbSharp.Compression compression, int count,
+        RocksDb.Managed.Table.TableReaderOptions readerOptions)
     {
         var native = RocksDbSharp.Native.Instance;
         var bbto = new RocksDbSharp.BlockBasedTableOptions();
@@ -38,6 +39,6 @@ internal static class NativeSst
             }
             db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
         }
-        return TestSstParser.Open(dir.Path);
+        return SstFile.OpenSingle(dir.Path, readerOptions);
     }
 }

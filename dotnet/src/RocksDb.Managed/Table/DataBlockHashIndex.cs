@@ -19,42 +19,6 @@ internal static class DataBlockHashIndex
     public const int MaxBlockSizeSupportedByHashIndex = 1 << 16;
     public const double DefaultUtilRatio = 0.75;
 
-    /// <summary>
-    /// GetSliceHash = Hash(data, n, 397) from util/hash.cc (MurmurHash1 variant). Part of the on-disk format.
-    /// Kept private to the table module; stream C owns the general-purpose hash helpers.
-    /// </summary>
-    public static uint GetSliceHash(ReadOnlySpan<byte> data) => LegacyHash(data, 397);
-
-    /// <summary>Port of rocksdb::Hash (util/hash.cc), including sign-extension of trailing bytes.</summary>
-    public static uint LegacyHash(ReadOnlySpan<byte> data, uint seed)
-    {
-        const uint m = 0xc6a4a793;
-        const int r = 24;
-        uint h = seed ^ (uint)((ulong)data.Length * m);
-        int i = 0;
-        for (; i + 4 <= data.Length; i += 4)
-        {
-            h += Coding.DecodeFixed32(data[i..]);
-            h *= m;
-            h ^= h >> 16;
-        }
-        switch (data.Length - i)
-        {
-            case 3:
-                h += (uint)(sbyte)data[i + 2] << 16;
-                goto case 2;
-            case 2:
-                h += (uint)(sbyte)data[i + 1] << 8;
-                goto case 1;
-            case 1:
-                h += (uint)(sbyte)data[i];
-                h *= m;
-                h ^= h >> r;
-                break;
-        }
-        return h;
-    }
-
     /// <summary>Port of DataBlockHashIndex::Initialize. <paramref name="size"/> = bytes preceding the packed footer word.</summary>
     public static bool TryInitialize(ReadOnlySpan<byte> block, int size, out int mapOffset, out int numBuckets)
     {
@@ -71,7 +35,7 @@ internal static class DataBlockHashIndex
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static byte Lookup(ReadOnlySpan<byte> block, int mapOffset, int numBuckets, ReadOnlySpan<byte> userKey)
     {
-        uint h = GetSliceHash(userKey);
+        uint h = Hash.GetSliceHash(userKey); // GetSliceHash = Hash(data, n, 397), util/hash.h
         return block[mapOffset + (int)(h % (uint)numBuckets)];
     }
 }
@@ -101,7 +65,7 @@ internal sealed class DataBlockHashIndexBuilder
             _valid = false;
             return;
         }
-        uint hash = DataBlockHashIndex.GetSliceHash(userKey);
+        uint hash = Hash.GetSliceHash(userKey);
         if (_count == _pairs.Length)
         {
             ulong[] n = ArrayPool<ulong>.Shared.Rent(Math.Max(64, _count * 2));

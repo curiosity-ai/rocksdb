@@ -11,7 +11,7 @@ namespace RocksDb.Managed.Table;
 /// </summary>
 internal sealed class ShortenedIndexBuilder : IDisposable
 {
-    private readonly Comparator _ucmp;
+    private readonly InternalKeyComparator _icmp;
     private readonly BlockBuilder _withSeq;
     private readonly BlockBuilder _withoutSeq;
     private readonly bool _useValueDeltaEncoding;
@@ -27,10 +27,10 @@ internal sealed class ShortenedIndexBuilder : IDisposable
     private int _indexSize;
     private bool _finished;
 
-    public ShortenedIndexBuilder(Comparator ucmp, int indexBlockRestartInterval, int formatVersion, bool useValueDeltaEncoding,
+    public ShortenedIndexBuilder(InternalKeyComparator icmp, int indexBlockRestartInterval, int formatVersion, bool useValueDeltaEncoding,
         IndexShorteningMode shortening, bool includeFirstKey)
     {
-        _ucmp = ucmp;
+        _icmp = icmp;
         _withSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75);
         _withoutSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75);
         _useValueDeltaEncoding = useValueDeltaEncoding;
@@ -55,18 +55,21 @@ internal sealed class ShortenedIndexBuilder : IDisposable
         ReadOnlySpan<byte> separator;
         if (hasNext)
         {
+            _scratch.Clear();
             if (_shortening != IndexShorteningMode.NoShortening
-                && InternalKeyOrdering.TryFindShortestSeparator(_ucmp, lastKeyInCurrentBlock, firstKeyInNextBlock, _scratch))
+                && _icmp.FindShortestSeparator(lastKeyInCurrentBlock, firstKeyInNextBlock, _scratch))
                 separator = _scratch.WrittenSpan;
             else
                 separator = lastKeyInCurrentBlock;
-            if (!_mustUseSeparatorWithSeq && _ucmp.Compare(DbFormat.ExtractUserKey(lastKeyInCurrentBlock), DbFormat.ExtractUserKey(firstKeyInNextBlock)) == 0)
+            // ShouldUseKeyPlusSeqAsSeparator: adjacent blocks share a boundary user key.
+            if (!_mustUseSeparatorWithSeq && _icmp.EqualUserKey(DbFormat.ExtractUserKey(lastKeyInCurrentBlock), DbFormat.ExtractUserKey(firstKeyInNextBlock)))
                 _mustUseSeparatorWithSeq = true;
         }
         else
         {
+            _scratch.Clear();
             if (_shortening == IndexShorteningMode.ShortenSeparatorsAndSuccessor
-                && InternalKeyOrdering.TryFindShortSuccessor(_ucmp, lastKeyInCurrentBlock, _scratch))
+                && _icmp.FindShortSuccessor(lastKeyInCurrentBlock, _scratch))
                 separator = _scratch.WrittenSpan;
             else
                 separator = lastKeyInCurrentBlock;

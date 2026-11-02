@@ -56,17 +56,16 @@ public sealed class BlockIter : IDisposable
     private int _firstKeyLength;
 
     private BlockIterKind _kind;
-    private Comparator _ucmp = Comparator.Bytewise;
-    private bool _bytewise = true;
+    private InternalKeyComparator _icmp = InternalKeyComparator.Bytewise;
     private bool _keysAreInternal;
     private bool _valueDeltaEncoded;
     private bool _haveFirstKey;
     private ulong _globalSeqno = DisableGlobalSequenceNumber;
 
-    /// <summary>Iterator for a data or range-deletion block (internal keys ordered by <paramref name="userComparator"/>).</summary>
-    public void InitializeData(Block block, Comparator userComparator, ulong globalSeqno)
+    /// <summary>Iterator for a data or range-deletion block (internal keys ordered by <paramref name="comparator"/>).</summary>
+    public void InitializeData(Block block, InternalKeyComparator comparator, ulong globalSeqno)
     {
-        Reset(block, BlockIterKind.Data, userComparator);
+        Reset(block, BlockIterKind.Data, comparator);
         _keysAreInternal = true;
         _globalSeqno = globalSeqno;
         _hashMapOffset = block.HashMapOffset;
@@ -78,9 +77,9 @@ public sealed class BlockIter : IDisposable
     /// <paramref name="valueIsFull"/> = !index_value_is_delta_encoded; <paramref name="haveFirstKey"/> for
     /// kBinarySearchWithFirstKey.
     /// </summary>
-    public void InitializeIndex(Block block, Comparator userComparator, bool keyIncludesSeq, bool valueIsFull, bool haveFirstKey, ulong globalSeqno)
+    public void InitializeIndex(Block block, InternalKeyComparator comparator, bool keyIncludesSeq, bool valueIsFull, bool haveFirstKey, ulong globalSeqno)
     {
-        Reset(block, BlockIterKind.Index, userComparator);
+        Reset(block, BlockIterKind.Index, comparator);
         _keysAreInternal = keyIncludesSeq;
         _valueDeltaEncoded = !valueIsFull;
         _haveFirstKey = haveFirstKey;
@@ -90,18 +89,17 @@ public sealed class BlockIter : IDisposable
     /// <summary>Iterator for a metaindex or properties block (bytewise ordered keys).</summary>
     public void InitializeMeta(Block block)
     {
-        Reset(block, BlockIterKind.Meta, Comparator.Bytewise);
+        Reset(block, BlockIterKind.Meta, InternalKeyComparator.Bytewise);
         _keysAreInternal = false;
     }
 
-    private void Reset(Block block, BlockIterKind kind, Comparator ucmp)
+    private void Reset(Block block, BlockIterKind kind, InternalKeyComparator icmp)
     {
         _kind = kind;
         _data = block.Buffer;
         _restarts = block.RestartOffset;
         _numRestarts = block.NumRestarts;
-        _ucmp = ucmp;
-        _bytewise = ReferenceEquals(ucmp, Comparator.Bytewise);
+        _icmp = icmp;
         _hashMapOffset = -1;
         _hashNumBuckets = 0;
         _valueDeltaEncoded = false;
@@ -296,11 +294,12 @@ public sealed class BlockIter : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int CompareKey(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
     {
-        if (_keysAreInternal) return InternalKeyOrdering.Compare(_ucmp, _bytewise, a, b);
-        return _bytewise ? a.SequenceCompareTo(b) : _ucmp.Compare(a, b);
+        // InternalKeyComparator devirtualizes the built-in (reverse) bytewise user comparators.
+        return _keysAreInternal ? _icmp.Compare(a, b) : _icmp.CompareUserKey(a, b);
     }
 
-    private bool UserKeyEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) => _bytewise ? a.SequenceEqual(b) : _ucmp.Equal(a, b);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool UserKeyEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) => _icmp.EqualUserKey(a, b);
 
     /// <summary>Decodes the entry header at <paramref name="p"/>; returns the key-delta offset or -1 on error. Port of DecodeEntry / DecodeEntryV4.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

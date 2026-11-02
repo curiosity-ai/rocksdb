@@ -1,4 +1,6 @@
 using RocksDb.Managed.CompatTests.Infrastructure;
+using RocksDb.Managed.Db;
+using RocksDb.Managed.Table;
 using RocksDb.Managed.Table.Filters;
 using RocksDb.Managed.Util;
 
@@ -17,25 +19,38 @@ public sealed class FilterCompatTests
     private static void RunCase(Func<IntPtr> nativePolicy, BloomLikeFilterPolicy managedPolicy, int formatVersion, Type expectedReader)
     {
         using var dir = new TempDir("filter");
-        TestSstParser sst = NativeSst.Build(dir, nativePolicy(), formatVersion, RocksDbSharp.Compression.No, KeyCount);
-        Assert.AreEqual((uint)formatVersion, sst.FormatVersion);
-        var handle = sst.FindMeta(FilterBlockName);
+        using SstFile sst = NativeSst.Build(dir, nativePolicy(), formatVersion, RocksDbSharp.Compression.No, KeyCount,
+            new TableReaderOptions { FilterPolicy = managedPolicy });
+        Assert.AreEqual(formatVersion, sst.FormatVersion);
+        BlockHandle? handle = sst.FindMeta(FilterBlockName);
         Assert.IsNotNull(handle, "no " + FilterBlockName + " in metaindex");
         Assert.AreEqual(RocksDb.Managed.Compression.CompressionType.None, sst.BlockCompressionType(handle.Value));
         byte[] nativeFilter = sst.RawBlock(handle.Value);
 
-        // (i) managed reader over native filter
+        // (i) managed reader over native filter, standalone and through the table reader
         IFilterBitsReader reader = managedPolicy.CreateReader(nativeFilter);
         Assert.IsInstanceOfType(reader, expectedReader);
+        Assert.IsTrue(sst.Reader.HasFilter);
+        using var value = new PooledBufferWriter();
         for (int i = 0; i < KeyCount; i++)
         {
             Assert.IsTrue(reader.MayMatch(NativeSst.Key(i)), "false negative for key " + i);
+            Assert.IsTrue(sst.Reader.KeyMayMatch(NativeSst.Key(i)), "table false negative for key " + i);
+            if (i % 97 == 0)
+            {
+                value.Clear();
+                Assert.IsTrue(sst.Reader.Get(LookupKey(NativeSst.Key(i)), value).Found);
+                CollectionAssert.AreEqual(NativeSst.Value(i), value.WrittenSpan.ToArray());
+            }
         }
         int fp = 0;
         const int probes = 20000;
         for (int i = 0; i < probes; i++)
         {
-            if (reader.MayMatch(NativeSst.Key(KeyCount + 1000 + i))) fp++;
+            byte[] absent = NativeSst.Key(KeyCount + 1000 + i);
+            if (reader.MayMatch(absent)) fp++;
+            Assert.AreEqual(reader.MayMatch(absent), sst.Reader.KeyMayMatch(absent));
+            if (i % 101 == 0) Assert.IsFalse(sst.Reader.Get(LookupKey(absent), null).Found);
         }
         // ~1% at 10 bits/key, ~3% at 7.5
         double maxFpRate = managedPolicy.MillibitsPerKey >= 10000 ? 0.02 : 0.05;
@@ -50,6 +65,13 @@ public sealed class FilterCompatTests
         using var w = new PooledBufferWriter();
         builder.Finish(w);
         CollectionAssert.AreEqual(nativeFilter, w.WrittenSpan.ToArray(), "managed filter differs from native");
+    }
+
+    private static byte[] LookupKey(byte[] userKey)
+    {
+        byte[] k = new byte[userKey.Length + 8];
+        DbFormat.AppendInternalKey(k, userKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
+        return k;
     }
 
     [TestMethod]

@@ -7,6 +7,7 @@ using RocksDb.Managed.Env;
 using RocksDb.Managed.Table.Filters;
 using RocksDb.Managed.Util;
 using EntryType = RocksDb.Managed.Db.EntryType;
+using CompressionOptions = RocksDb.Managed.CompressionOptions;
 
 namespace RocksDb.Managed.Table;
 
@@ -36,7 +37,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
     private readonly TableFormatOptions _options;
     private readonly TableBuilderOptions _tbo;
     private readonly Comparator _ucmp;
-    private readonly bool _bytewise;
+    private readonly InternalKeyComparator _icmp;
     private readonly BlockBuilder _dataBlock;
     private readonly BlockBuilder _rangeDelBlock;
     private readonly ShortenedIndexBuilder _indexBuilder;
@@ -48,6 +49,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
     private readonly bool _useDeltaEncodingForIndexValues;
     private readonly uint _baseContextChecksum;
     private readonly int _blockSizeDeviationLimit;
+    private readonly int _compressionLevel;
+    private readonly int _maxCompressedBytesPerKb;
     private ulong _offset;
     private uint _compressionTypesUsed; // bitset over CompressionType values (< 32)
     private bool _closed;
@@ -64,14 +67,22 @@ public sealed class BlockBasedTableBuilder : IDisposable
         _options = options;
         _tbo = tableBuilderOptions;
         _ucmp = tableBuilderOptions.Comparator;
-        _bytewise = ReferenceEquals(_ucmp, Comparator.Bytewise);
+        _icmp = _ucmp.Kind == ComparatorKind.Bytewise ? InternalKeyComparator.Bytewise : new InternalKeyComparator(_ucmp);
         _offset = (ulong)file.Size;
         _dataBlock = new BlockBuilder(options.BlockRestartInterval, options.UseDeltaEncoding, false, options.DataBlockIndexType, options.DataBlockHashTableUtilRatio);
         _rangeDelBlock = new BlockBuilder(1, true, false, DataBlockIndexType.BinarySearch, 0.75);
         _useDeltaEncodingForIndexValues = options.FormatVersion >= 4;
-        _indexBuilder = new ShortenedIndexBuilder(_ucmp, options.IndexBlockRestartInterval, options.FormatVersion, _useDeltaEncodingForIndexValues,
+        _indexBuilder = new ShortenedIndexBuilder(_icmp, options.IndexBlockRestartInterval, options.FormatVersion, _useDeltaEncodingForIndexValues,
             options.IndexShortening, options.IndexType == IndexType.BinarySearchWithFirstKey);
-        if (options.FilterPolicy is not null) _filterBuilder = options.FilterPolicy.CreateBuilder(options.FormatVersion);
+        // Port of CreateFilterBlockBuilder: the policy picks the filter implementation from the full building context
+        // (format version, level, flush); a built-in policy with &lt; 0.5 bits/key builds no filter at all.
+        if (options.FilterPolicy is { } policy && policy is not BloomLikeFilterPolicy { CreatesFilters: false })
+        {
+            _filterBuilder = policy.CreateBuilder(new FilterBuildingContext(options.FormatVersion, tableBuilderOptions.LevelAtCreation, tableBuilderOptions.IsFlush));
+        }
+        _compressionLevel = tableBuilderOptions.CompressionOptions.Level;
+        // Rep::Rep: max_compressed_bytes_per_kb = min(1023, compression_opts.max_compressed_bytes_per_kb).
+        _maxCompressedBytesPerKb = Math.Min(1023, tableBuilderOptions.CompressionOptions.MaxCompressedBytesPerKb);
         _blockSizeDeviationLimit = (int)(((long)options.BlockSize * (100 - options.BlockSizeDeviation) + 99) / 100);
 
         _props.ColumnFamilyId = tableBuilderOptions.ColumnFamilyId;
@@ -139,7 +150,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
         else
         {
             if (!IsValueType(type)) ThrowHelper.InvalidArgument("BlockBasedBuilder::Add() received a key with invalid value type " + (byte)type);
-            if (_lastKey.WrittenCount > 0 && InternalKeyOrdering.Compare(_ucmp, _bytewise, internalKey, _lastKey.WrittenSpan) <= 0)
+            if (_lastKey.WrittenCount > 0 && _icmp.Compare(internalKey, _lastKey.WrittenSpan) <= 0)
                 ThrowHelper.InvalidArgument("keys must be added in strictly increasing internal key order");
 
             if (ShouldFlush(internalKey.Length, value.Length)) Flush(internalKey, hasNext: true);
@@ -192,8 +203,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
         if (compress)
         {
             _compressed.Clear();
-            long maxCompressed = ((long)Math.Min(1023, _tbo.MaxCompressedBytesPerKb) * raw.Length) >> 10;
-            if (BlockCompression.TryCompress(_tbo.CompressionType, raw, _options.FormatVersion, _tbo.CompressionLevel, _compressed)
+            long maxCompressed = ((long)_maxCompressedBytesPerKb * raw.Length) >> 10;
+            if (BlockCompression.TryCompress(_tbo.CompressionType, raw, _options.FormatVersion, _compressionLevel, _compressed)
                 && _compressed.WrittenCount <= maxCompressed)
             {
                 type = _tbo.CompressionType;
@@ -305,7 +316,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
 
     private void WritePropertiesBlock(MetaIndexBuilder metaIndex)
     {
-        _props.FilterPolicyName = _options.FilterPolicy?.CompatibilityName ?? "";
+        // WritePropertiesBlock: the policy's Name(), even when it built no filter.
+        _props.FilterPolicyName = _options.FilterPolicy?.Name ?? "";
         _props.ComparatorName = _ucmp.Name;
         _props.MergeOperatorName = _tbo.MergeOperatorName;
         _props.PrefixExtractorName = _tbo.PrefixExtractorName;
@@ -371,13 +383,27 @@ public sealed class BlockBasedTableBuilder : IDisposable
         _ => "Reserved" + ((byte)t).ToString("X2", System.Globalization.CultureInfo.InvariantCulture),
     };
 
-    /// <summary>Port of CompressionOptionsToString (util/compression.cc) + the "_type=" suffix, for default CompressionOptions.</summary>
+    /// <summary>
+    /// Port of CompressionOptionsToString (util/compression.cc) plus the "_type=" pseudo-option appended by
+    /// Rep::Rep (block_based_table_builder.cc). parallel_threads is skipped upstream; auto_skip is not supported.
+    /// </summary>
     private string BuildCompressionOptions()
     {
         var ci = System.Globalization.CultureInfo.InvariantCulture;
-        return "window_bits=-14; level=" + _tbo.CompressionLevel.ToString(ci) + "; strategy=0; max_dict_bytes=0; zstd_max_train_bytes=0; enabled=0; "
-            + "max_dict_buffer_bytes=0; use_zstd_dict_trainer=1; max_compressed_bytes_per_kb=" + Math.Min(1023, _tbo.MaxCompressedBytesPerKb).ToString(ci) + "; "
-            + "checksum=0; _type=" + ((int)_tbo.CompressionType).ToString(ci) + "; ";
+        CompressionOptions o = _tbo.CompressionOptions;
+        var sb = new StringBuilder(256);
+        sb.Append("window_bits=").Append(o.WindowBits.ToString(ci)).Append("; ");
+        sb.Append("level=").Append(o.Level.ToString(ci)).Append("; ");
+        sb.Append("strategy=").Append(o.Strategy.ToString(ci)).Append("; ");
+        sb.Append("max_dict_bytes=").Append(o.MaxDictBytes.ToString(ci)).Append("; ");
+        sb.Append("zstd_max_train_bytes=").Append(o.ZstdMaxTrainBytes.ToString(ci)).Append("; ");
+        sb.Append("enabled=").Append(o.Enabled ? '1' : '0').Append("; ");
+        sb.Append("max_dict_buffer_bytes=").Append(o.MaxDictBufferBytes.ToString(ci)).Append("; ");
+        sb.Append("use_zstd_dict_trainer=").Append(o.UseZstdDictTrainer ? '1' : '0').Append("; ");
+        sb.Append("max_compressed_bytes_per_kb=").Append(o.MaxCompressedBytesPerKb.ToString(ci)).Append("; ");
+        sb.Append("checksum=").Append(o.Checksum ? '1' : '0').Append("; ");
+        sb.Append("_type=").Append(((int)_tbo.CompressionType).ToString(ci)).Append("; ");
+        return sb.ToString();
     }
 
     private void WriteFooter(BlockHandle metaindexHandle, BlockHandle indexHandle)

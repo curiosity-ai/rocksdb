@@ -69,7 +69,7 @@ public class TableBenchmarks
         _block = Block.CreateCopy(bb.Finish());
         _blockKeys = keys.ToArray();
         _blockIter = new BlockIter();
-        _blockIter.InitializeData(_block, Comparator.Bytewise, BlockIter.DisableGlobalSequenceNumber);
+        _blockIter.InitializeData(_block, InternalKeyComparator.Bytewise, BlockIter.DisableGlobalSequenceNumber);
         // Warm the cache.
         for (int i = 0; i < NumEntries; i += 10) _cachedReader.Get(_lookupKeys[i % _lookupKeys.Length], null);
         for (_tableIter.SeekToFirst(); _tableIter.Valid; _tableIter.Next()) { }
