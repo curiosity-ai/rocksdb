@@ -235,6 +235,8 @@ public static class TableFactory
             LevelAtCreation = where.Level,
             IsFlush = where.IsFlush,
             PersistUserDefinedTimestamps = options.PersistUserDefinedTimestamps,
+            TablePropertiesCollectorFactories = options.TablePropertiesCollectorFactories.ToArray(),
+            NumLevels = options.NumLevels,
         };
     }
 
@@ -275,6 +277,8 @@ public static class TableFactory
             DbId = "SST Writer",
             ExternalSstFile = true,
             PersistUserDefinedTimestamps = options.PersistUserDefinedTimestamps,
+            TablePropertiesCollectorFactories = options.TablePropertiesCollectorFactories.ToArray(),
+            NumLevels = options.NumLevels,
         };
     }
 

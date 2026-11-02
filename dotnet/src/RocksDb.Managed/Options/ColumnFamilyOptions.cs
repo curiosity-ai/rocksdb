@@ -104,6 +104,15 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     }
 
     /// <summary>
+    /// table_properties_collector_factories: a <see cref="TablePropertiesCollector"/> of each factory runs on every table
+    /// file written for this column family (flush, compaction, <see cref="SstFileWriter"/>); their properties are stored
+    /// in the file and the factory names in "rocksdb.property.collectors". A collector reporting
+    /// <see cref="TablePropertiesCollector.NeedCompact"/> marks the file for compaction. Not persisted in OPTIONS files
+    /// (like upstream). Empty by default.
+    /// </summary>
+    public List<TablePropertiesCollectorFactory> TablePropertiesCollectorFactories { get; set; } = new();
+
+    /// <summary>
     /// sst_partitioner_factory: decides additional cut points of compaction output files (for example
     /// <see cref="SstPartitionerFixedPrefixFactory"/>). Default null. The OPTIONS file records it by id (with its
     /// options); an id the managed port does not know is preserved as <see cref="SstPartitionerFactoryName"/> and has no
@@ -377,6 +386,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         c.CompactionOptionsFifo = CompactionOptionsFifo.Clone();
         c.CompactionOptionsUniversal = CompactionOptionsUniversal.Clone();
         c.TableOptions = TableOptions.Clone();
+        c.TablePropertiesCollectorFactories = new List<TablePropertiesCollectorFactory>(TablePropertiesCollectorFactories);
         c.BlobCache = BlobCache;
         c.BlobDirectWritePartitionStrategy = BlobDirectWritePartitionStrategy;
         c.OtherTableFactoryOptions = OtherTableFactoryOptions is null ? null : new Dictionary<string, string>(OtherTableFactoryOptions, StringComparer.Ordinal);

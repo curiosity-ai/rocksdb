@@ -79,6 +79,13 @@ public sealed class BlockBasedTableBuilder : IDisposable
     private CompressionDictionary? _dict;
     private readonly int _blockSizeDeviationLimit;
     private readonly int _alignment;
+    private readonly TablePropertiesCollectors? _collectors;
+
+    /// <summary>
+    /// Port of BlockBasedTableBuilder::NeedCompact: a user table properties collector asks for the file to be compacted
+    /// (sets FileMetaData::marked_for_compaction). Valid after <see cref="Finish"/>.
+    /// </summary>
+    public bool NeedCompact => _collectors is not null && _collectors.NeedCompact;
     private readonly int _compressionLevel;
     private readonly int _maxCompressedBytesPerKb;
     private ulong _offset;
@@ -185,6 +192,10 @@ public sealed class BlockBasedTableBuilder : IDisposable
             _bufferLimit = targetFileSize == 0 ? maxDictBufferBytes : maxDictBufferBytes == 0 ? targetFileSize : Math.Min(targetFileSize, maxDictBufferBytes);
         }
 
+        // Rep::Rep: one collector per configured factory (a factory may decline with null).
+        _collectors = TablePropertiesCollectors.Create(tableBuilderOptions.TablePropertiesCollectorFactories,
+            new TablePropertiesCollectorContext((uint)Math.Min(tableBuilderOptions.ColumnFamilyId, uint.MaxValue), tableBuilderOptions.LevelAtCreation,
+                tableBuilderOptions.NumLevels, tableBuilderOptions.LastLevelInclusiveMaxSeqnoThreshold));
         _props.ColumnFamilyId = tableBuilderOptions.ColumnFamilyId;
         _props.ColumnFamilyName = tableBuilderOptions.ColumnFamilyName;
         _props.OldestKeyTime = tableBuilderOptions.OldestKeyTime;
@@ -303,12 +314,14 @@ public sealed class BlockBasedTableBuilder : IDisposable
         if (type == EntryType.RangeDeletion)
         {
             // RangeDelBlockBuilder: without persisted timestamps the end key (value) is stored without its timestamp.
+            ReadOnlySpan<byte> endKey = value;
             if (_stripTsSize != 0)
             {
                 if (value.Length < _stripTsSize) ThrowHelper.InvalidArgument("range tombstone end key too short for its timestamp");
-                value = value[..^_stripTsSize];
+                endKey = value[..^_stripTsSize];
             }
-            _rangeDelBlock.Add(internalKey, value);
+            _rangeDelBlock.Add(internalKey, endKey);
+            _collectors?.Add(internalKey, value, _offset);
             _props.NumDeletions++;
             _props.NumRangeDeletions++;
         }
@@ -329,6 +342,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
             _lastKey.Clear();
             _lastKey.Write(internalKey);
             if (!_buffered) _indexBuilder.OnKeyAdded(internalKey);
+            // NotifyCollectTableCollectorsOnAdd (file_size: the offset after the data blocks written so far).
+            _collectors?.Add(internalKey, value, _offset);
             if (type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp) _props.NumDeletions++;
             else if (type == EntryType.Merge) _props.NumMergeOperands++;
         }
@@ -362,6 +377,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
     {
         if (_dataBlock.IsEmpty) return;
         ReadOnlySpan<byte> raw = _dataBlock.Finish();
+        // NotifyCollectTableCollectorsOnBlockAdd (no compression sampling: estimated compressed sizes are 0).
+        _collectors?.BlockAdd((ulong)raw.Length);
         if (_buffered)
         {
             _dataBlockBuffers.Add(raw.ToArray());
@@ -742,7 +759,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
         _props.ComparatorName = _ucmp.Name;
         _props.MergeOperatorName = _tbo.MergeOperatorName;
         _props.PrefixExtractorName = _tbo.PrefixExtractorName;
-        _props.PropertyCollectorsNames = "[]";
+        _props.PropertyCollectorsNames = TablePropertiesCollectors.Names(_tbo.TablePropertiesCollectorFactories);
         _props.IndexKeyIsUserKey = _indexBuilder.SeparatorIsKeyPlusSeq ? 0UL : 1UL;
         _props.IndexValueIsDeltaEncoded = _useDeltaEncodingForIndexValues ? 1UL : 0UL;
         _props.CompressionName = BuildCompressionName();
@@ -752,6 +769,18 @@ public sealed class BlockBasedTableBuilder : IDisposable
 
         using var pb = new PropertyBlockBuilder();
         _props.AddTo(pb);
+        // NotifyCollectTableCollectorsOnFinish: user collectors come first in the collector list, so on a name clash
+        // their properties win over the internal collectors' (std::map insert keeps the first).
+        if (_collectors is not null)
+        {
+            var user = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+            _collectors.Finish(user);
+            foreach (KeyValuePair<string, byte[]> kv in user)
+            {
+                pb.Add(kv.Key, kv.Value);
+                _props.UserCollectedProperties.TryAdd(kv.Key, kv.Value);
+            }
+        }
         // Internal collectors (BlockBasedTablePropertiesCollector and, for external files, SstFileWriterPropertiesCollector).
         Span<byte> idx = stackalloc byte[4];
         Coding.EncodeFixed32(idx, (uint)_options.IndexType);

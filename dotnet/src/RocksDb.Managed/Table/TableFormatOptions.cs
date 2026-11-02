@@ -147,4 +147,13 @@ public sealed record TableBuilderOptions
     /// comparators without timestamps.
     /// </summary>
     public bool PersistUserDefinedTimestamps { get; init; } = true;
+    /// <summary>
+    /// ImmutableOptions::table_properties_collector_factories: user collectors run on this table; their names are
+    /// recorded in "rocksdb.property.collectors" (written as "[]" when empty).
+    /// </summary>
+    public IReadOnlyList<TablePropertiesCollectorFactory> TablePropertiesCollectorFactories { get; init; } = [];
+    /// <summary>ImmutableOptions::num_levels for TablePropertiesCollectorFactory::Context (-1 unknown).</summary>
+    public int NumLevels { get; init; } = -1;
+    /// <summary>TableBuilderOptions::last_level_inclusive_max_seqno_threshold (kMaxSequenceNumber: tiering disabled).</summary>
+    public ulong LastLevelInclusiveMaxSeqnoThreshold { get; init; } = Db.DbFormat.MaxSequenceNumber;
 }

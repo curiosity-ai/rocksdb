@@ -558,6 +558,8 @@ internal sealed class CompactionJob
                 // ExtractTimestampFromTableProperties (db/builder.cc).
                 meta.MinTimestamp = builder.TimestampMin;
                 meta.MaxTimestamp = builder.TimestampMax;
+                // CompactionOutputs::Finish: meta->marked_for_compaction = builder_->NeedCompact().
+                meta.MarkedForCompaction = builder.NeedCompact;
                 Stats.NumOutputRangeDeletions += (long)builder.Properties.NumRangeDeletions;
                 keep = true;
             }

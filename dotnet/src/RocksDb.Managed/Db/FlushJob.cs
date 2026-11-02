@@ -117,6 +117,8 @@ internal static class FlushJob
                     // ExtractTimestampFromTableProperties (db/builder.cc).
                     meta.MinTimestamp = builder.TimestampMin;
                     meta.MaxTimestamp = builder.TimestampMax;
+                    // BuildTable: meta->marked_for_compaction = builder->NeedCompact() (table properties collectors).
+                    meta.MarkedForCompaction = builder.NeedCompact;
                     keep = true;
                 }
             }
