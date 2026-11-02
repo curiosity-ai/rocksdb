@@ -61,6 +61,9 @@ public sealed class FileMetaData
     /// <summary>Opaque file system metadata used to accelerate file opening (kFileOpenMetadata).</summary>
     public byte[] FileOpenMetadata { get; set; } = [];
 
+    /// <summary>In-memory only (FileMetaData::being_compacted): the file is an input of a running compaction. Guarded by the DB mutex.</summary>
+    internal bool BeingCompacted { get; set; }
+
     /// <summary>PackFileNumberAndPathId.</summary>
     public ulong PackedNumberAndPathId => PackFileNumberAndPathId(FileNumber, PathId);
 
@@ -69,6 +72,7 @@ public sealed class FileMetaData
     public FileMetaData Clone()
     {
         var c = (FileMetaData)MemberwiseClone();
+        c.BeingCompacted = false;
         return c; // byte[] members are treated as immutable once assigned
     }
 

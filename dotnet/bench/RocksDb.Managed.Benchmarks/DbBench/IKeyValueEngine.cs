@@ -18,6 +18,12 @@ public interface IKeyValueEngine : IDisposable
 
     /// <summary>Flushes memtables to SST files and waits for completion.</summary>
     void Flush();
+
+    /// <summary>Waits until no flush or compaction is running or pending.</summary>
+    void WaitForCompaction();
+
+    /// <summary>DB::GetProperty on the default column family (null if unknown).</summary>
+    string? GetProperty(string name);
 }
 
 /// <summary>Engine-independent DB configuration, mirroring the db_bench flags the runner supports.</summary>
@@ -40,6 +46,21 @@ public sealed record EngineOptions
 
     /// <summary>--block_size (4 KiB).</summary>
     public int BlockSize { get; init; } = 4096;
+
+    /// <summary>--target_file_size_base (64 MiB).</summary>
+    public long TargetFileSizeBase { get; init; } = 64L << 20;
+
+    /// <summary>--max_bytes_for_level_base (256 MiB).</summary>
+    public long MaxBytesForLevelBase { get; init; } = 256L << 20;
+
+    /// <summary>--level0_file_num_compaction_trigger (4).</summary>
+    public int Level0FileNumCompactionTrigger { get; init; } = 4;
+
+    /// <summary>--disable_auto_compactions.</summary>
+    public bool DisableAutoCompactions { get; init; }
+
+    /// <summary>--max_background_jobs (2).</summary>
+    public int MaxBackgroundJobs { get; init; } = 2;
 
     /// <summary>Compression is always "none" for now so that compression codecs don't dominate comparisons.</summary>
     public string Compression { get; init; } = "none";

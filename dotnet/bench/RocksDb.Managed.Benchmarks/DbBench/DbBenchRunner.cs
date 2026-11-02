@@ -10,7 +10,8 @@ namespace RocksDb.Managed.Benchmarks.DbBench;
 /// dotnet run -c Release --project bench/RocksDb.Managed.Benchmarks -f net10.0 -- dbbench \
 ///     --engine native --benchmarks fillseq,fillrandom,readrandom --num 1000000 --value_size 100
 /// </code>
-/// Supported benchmarks: fillseq, fillrandom, overwrite, readrandom, readmissing, deleterandom, flush.
+/// Supported benchmarks: fillseq, fillrandom, overwrite, readrandom, readmissing, deleterandom, flush, waitforcompaction,
+/// stats (LSM shape and write amplification).
 /// Keys follow db_bench's GenerateKeyFromInt (8-byte big-endian number zero-padded to --key_size); values come from
 /// a pre-generated random buffer (compression is off, so compressibility doesn't matter).
 /// Like db_bench, fill benchmarks start from a fresh DB (--use_existing_db=false), others reuse it.
@@ -88,6 +89,11 @@ public static class DbBenchRunner
         byte[] readBuffer = new byte[Math.Max(f.ValueSize, 1) * 2];
         long ops = name is "readrandom" or "readmissing" && f.Reads >= 0 ? f.Reads : f.Num;
         long bytes = 0, found = 0;
+        if (name == "stats")
+        {
+            PrintStats(engine);
+            return;
+        }
         int valuePos = 0;
 
         long allocBefore = GC.GetTotalAllocatedBytes(precise: true);
@@ -107,6 +113,7 @@ public static class DbBenchRunner
                     valuePos += f.ValueSize;
                     bytes += f.KeySize + f.ValueSize;
                 }
+                s_userBytesWritten += bytes;
                 break;
             case "readrandom":
             case "readmissing":
@@ -132,6 +139,10 @@ public static class DbBenchRunner
                 engine.Flush();
                 ops = 1;
                 break;
+            case "waitforcompaction":
+                engine.WaitForCompaction();
+                ops = 1;
+                break;
             default:
                 throw new ArgumentException("unknown benchmark " + name);
         }
@@ -149,6 +160,36 @@ public static class DbBenchRunner
         // Managed allocations (all threads) per operation; native engines only allocate in unmanaged memory.
         line += string.Format(CultureInfo.InvariantCulture, " alloc {0:F1} B/op gen0 {1}", allocated / (double)Math.Max(ops, 1), gen0);
         Console.WriteLine(line);
+    }
+
+    private static long s_userBytesWritten;
+
+    /// <summary>
+    /// Prints the LSM shape (files per level), the cumulative flush+compaction bytes written (from "rocksdb.stats") and
+    /// the resulting write amplification relative to the user bytes written so far.
+    /// </summary>
+    private static void PrintStats(IKeyValueEngine engine)
+    {
+        var levels = new System.Text.StringBuilder();
+        for (int l = 0; l < 7; l++)
+        {
+            if (l > 0) levels.Append(' ');
+            levels.Append(engine.GetProperty("rocksdb.num-files-at-level" + l.ToString(CultureInfo.InvariantCulture)) ?? "?");
+        }
+        Console.WriteLine("files per level: [" + levels + "]");
+        string stats = engine.GetProperty("rocksdb.stats") ?? "";
+        const string marker = "Cumulative compaction: ";
+        int i = stats.IndexOf(marker, StringComparison.Ordinal);
+        if (i >= 0)
+        {
+            int end = stats.IndexOf(" GB write", i, StringComparison.Ordinal);
+            string gb = stats[(i + marker.Length)..end];
+            double written = double.Parse(gb, CultureInfo.InvariantCulture) * 1073741824.0;
+            Console.WriteLine(stats[i..stats.IndexOf('\n', i)]);
+            Console.WriteLine(string.Format(CultureInfo.InvariantCulture, "user bytes written: {0:F1} MB; flush+compaction bytes written: {1:F1} MB; write-amp {2:F2}",
+                s_userBytesWritten / 1048576.0, written / 1048576.0, written / Math.Max(1, s_userBytesWritten)));
+        }
+        Console.WriteLine("estimate-pending-compaction-bytes: " + engine.GetProperty("rocksdb.estimate-pending-compaction-bytes"));
     }
 
     /// <summary>db_bench GenerateKeyFromInt without prefixes: big-endian 8 bytes, zero padded.</summary>
@@ -205,6 +246,11 @@ public static class DbBenchRunner
                 case "write_buffer_size": o = o with { WriteBufferSize = long.Parse(value, CultureInfo.InvariantCulture) }; break;
                 case "block_size": o = o with { BlockSize = int.Parse(value, CultureInfo.InvariantCulture) }; break;
                 case "compression_type": o = o with { Compression = value }; break;
+                case "target_file_size_base": o = o with { TargetFileSizeBase = long.Parse(value, CultureInfo.InvariantCulture) }; break;
+                case "max_bytes_for_level_base": o = o with { MaxBytesForLevelBase = long.Parse(value, CultureInfo.InvariantCulture) }; break;
+                case "level0_file_num_compaction_trigger": o = o with { Level0FileNumCompactionTrigger = int.Parse(value, CultureInfo.InvariantCulture) }; break;
+                case "disable_auto_compactions": o = o with { DisableAutoCompactions = ParseBool(value) }; break;
+                case "max_background_jobs": o = o with { MaxBackgroundJobs = int.Parse(value, CultureInfo.InvariantCulture) }; break;
                 default: throw new ArgumentException("unknown flag --" + name);
             }
         }

@@ -237,33 +237,14 @@ internal sealed partial class DbImpl
             }
             _flushScheduler.Clear();
         }
-        while (_maybeStalled)
-        {
-            Task wait;
-            lock (_mutex)
-            {
-                if (_bgError is { } e) ThrowBackgroundError(e);
-                if (!IsWriteStalled()) return;
-                wait = _bgSignal.Task;
-            }
-            if (noSlowdown) throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Write stall");
-            if (synchronous) wait.Wait(cancellationToken);
-            else await wait.WaitAsync(cancellationToken).ConfigureAwait(false);
-        }
+        if (_maybeStalled) await DelayWriteAsync(noSlowdown, synchronous, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// WriteStallCondition::kStopped caused by too many memtables (ColumnFamilyData::RecalculateWriteStallConditions).
-    /// L0 file count triggers are not applied until compaction exists. REQUIRES: mutex.
+    /// Writes are stopped or delayed (memtable count, L0 file count, pending compaction bytes; see
+    /// <see cref="RecalculateWriteStall"/>). REQUIRES: mutex.
     /// </summary>
-    private bool IsWriteStalled()
-    {
-        foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
-        {
-            if (cfd.NumNotFlushed >= Math.Max(2, cfd.Options.MaxWriteBufferNumber)) return true;
-        }
-        return false;
-    }
+    private bool IsWriteStalled() => IsWriteStoppedOrDelayed();
 
     // ---- memtable switch --------------------------------------------------------------------------------
 

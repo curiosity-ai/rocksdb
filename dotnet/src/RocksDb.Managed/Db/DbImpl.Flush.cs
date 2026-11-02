@@ -119,7 +119,11 @@ internal sealed partial class DbImpl
         string path = FileNames.TableFileName(DbPaths, fileNumber, 0);
         FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, mems, fileNumber, epoch, Identity, synchronous, CancellationToken.None)
             .ConfigureAwait(false);
-        if (meta is not null) FileSystem.SyncDirectory(DbPaths[0]);
+        if (meta is not null)
+        {
+            FileSystem.SyncDirectory(DbPaths[0]);
+            RecordFlushBytes(meta.FileSize);
+        }
 
         var edit = new VersionEdit
         {

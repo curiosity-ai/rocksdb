@@ -20,13 +20,17 @@ public sealed class ManagedEngine : IKeyValueEngine
         {
             WriteBufferSize = (ulong)options.WriteBufferSize,
             Compression = Compression.CompressionType.None,
+            TargetFileSizeBase = (ulong)options.TargetFileSizeBase,
+            MaxBytesForLevelBase = (ulong)options.MaxBytesForLevelBase,
+            Level0FileNumCompactionTrigger = options.Level0FileNumCompactionTrigger,
+            DisableAutoCompactions = options.DisableAutoCompactions,
         };
         cfo.TableOptions.BlockSize = (ulong)options.BlockSize;
         cfo.TableOptions.FormatVersion = 6;
         if (options.BlockCacheSize > 0) cfo.TableOptions.BlockCache = Cache.BlockCache.CreateDefault(options.BlockCacheSize, options.BlockSize);
         else cfo.TableOptions.NoBlockCache = true;
         if (options.BloomBitsPerKey > 0) cfo.TableOptions.FilterPolicy = "bloomfilter:" + options.BloomBitsPerKey + ":false";
-        var dbo = new DbOptions { CreateIfMissing = true, FileSystem = LocalFileSystem.Instance };
+        var dbo = new DbOptions { CreateIfMissing = true, FileSystem = LocalFileSystem.Instance, MaxBackgroundJobs = options.MaxBackgroundJobs };
         _db = RocksDatabase.Open(path, dbo, cfo);
         _writeOptions = new WriteOptions { Sync = options.Sync, DisableWal = options.DisableWal };
     }
@@ -40,6 +44,10 @@ public sealed class ManagedEngine : IKeyValueEngine
     public void Delete(ReadOnlySpan<byte> key) => _db.Delete(_writeOptions, key);
 
     public void Flush() => _db.Flush();
+
+    public void WaitForCompaction() => _db.WaitForCompact();
+
+    public string? GetProperty(string name) => _db.GetProperty(name);
 
     public void Dispose() => _db.Dispose();
 }

@@ -30,6 +30,7 @@ internal sealed partial class DbImpl
         if (files.Count == 0) ThrowHelper.InvalidArgument("The list of files is empty");
         var job = new ExternalSstFileIngestionJob(this, cfd, options);
         bool success = false;
+        BeginIngestion();
         try
         {
             await job.PrepareAsync(files, synchronous, ct).ConfigureAwait(false);
@@ -85,6 +86,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
+            EndIngestion();
             if (!success)
             {
                 job.DeleteInternalFiles();

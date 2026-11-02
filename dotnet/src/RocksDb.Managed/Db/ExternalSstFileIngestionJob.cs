@@ -328,7 +328,8 @@ internal sealed class ExternalSstFileIngestionJob
             }
             return false; // File overlap with another files in this level, we cannot add it to this level
         }
-        return true;
+        // File overlaps the output of a running compaction to this level (cfd->RangeOverlapWithCompaction).
+        return !_db.RangeOverlapsRunningCompaction(_cfd, f.SmallestUserKey, f.LargestUserKey, level);
     }
 
     /// <summary>Port of ExternalSstFileIngestionJob::AssignGlobalSeqnoForIngestedFile (MANIFEST-only global seqno).</summary>

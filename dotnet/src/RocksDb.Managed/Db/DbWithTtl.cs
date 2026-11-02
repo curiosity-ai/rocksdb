@@ -109,33 +109,64 @@ public sealed class TtlCompactionFilter : CompactionFilter
 /// A database whose values expire after a TTL (DBWithTTL::Open, utilities/ttl/db_ttl_impl.cc). Values are stored
 /// with the 4-byte write-time suffix of <see cref="TtlValue"/>, so the directory is interchangeable with native
 /// <c>DBWithTTL</c>. Reads strip the suffix (expired values remain readable until a compaction removes them, like
-/// upstream). Expired values are dropped by <see cref="CompactionFilter"/>, which the caller installs on the
-/// column family once compaction filters are wired (the options record its name).
+/// upstream). Expired values are dropped by compactions through a <see cref="TtlCompactionFilterFactory"/> installed
+/// on the default column family (the OPTIONS file records <c>compaction_filter_factory=TtlCompactionFilterFactory</c>).
 /// </summary>
 public sealed class TtlDatabase : IDisposable, IAsyncDisposable
 {
     private readonly RocksDatabase _db;
 
-    private TtlDatabase(RocksDatabase db, int ttlSeconds)
+    private TtlDatabase(RocksDatabase db, int ttlSeconds, TtlCompactionFilterFactory factory)
     {
         _db = db;
         TtlSeconds = ttlSeconds;
-        CompactionFilter = new TtlCompactionFilter(ttlSeconds, null);
+        CompactionFilter = factory.Filter;
     }
 
     /// <summary>Opens (creating if allowed) a TTL database (DBWithTTL::Open). A non-positive TTL means "never expire".</summary>
-    public static async ValueTask<TtlDatabase> OpenAsync(string path, DbOptions options, int ttlSeconds, CancellationToken cancellationToken = default)
+    public static ValueTask<TtlDatabase> OpenAsync(string path, DbOptions options, int ttlSeconds, CancellationToken cancellationToken = default) =>
+        OpenAsync(path, options, new ColumnFamilyOptions(), ttlSeconds, cancellationToken);
+
+    /// <summary>
+    /// Opens a TTL database whose default column family uses <paramref name="columnFamilyOptions"/>; its compaction
+    /// filter factory is replaced by the TTL one (a user <see cref="ColumnFamilyOptions.CompactionFilter"/> runs after
+    /// the TTL check on unexpired values, like DBWithTTLImpl::SanitizeOptions).
+    /// </summary>
+    public static async ValueTask<TtlDatabase> OpenAsync(string path, DbOptions options, ColumnFamilyOptions columnFamilyOptions, int ttlSeconds,
+        CancellationToken cancellationToken = default)
     {
-        var cf = new ColumnFamilyOptions { CompactionFilterFactoryName = "TtlCompactionFilterFactory" };
+        (ColumnFamilyOptions cf, TtlCompactionFilterFactory factory) = Sanitize(columnFamilyOptions, ttlSeconds, null);
         RocksDatabase db = await RocksDatabase.OpenAsync(path, options, cf, cancellationToken).ConfigureAwait(false);
-        return new TtlDatabase(db, ttlSeconds);
+        return new TtlDatabase(db, ttlSeconds, factory);
     }
 
-    public static TtlDatabase Open(string path, DbOptions options, int ttlSeconds)
+    public static TtlDatabase Open(string path, DbOptions options, int ttlSeconds) => Open(path, options, new ColumnFamilyOptions(), ttlSeconds);
+
+    public static TtlDatabase Open(string path, DbOptions options, ColumnFamilyOptions columnFamilyOptions, int ttlSeconds) =>
+        Open(path, options, columnFamilyOptions, ttlSeconds, null);
+
+    /// <summary>Test hook: <paramref name="clock"/> supplies the current unix time used by the compaction filter.</summary>
+    internal static TtlDatabase Open(string path, DbOptions options, ColumnFamilyOptions columnFamilyOptions, int ttlSeconds, Func<long>? clock)
     {
-        var cf = new ColumnFamilyOptions { CompactionFilterFactoryName = "TtlCompactionFilterFactory" };
-        return new TtlDatabase(RocksDatabase.Open(path, options, cf), ttlSeconds);
+        (ColumnFamilyOptions cf, TtlCompactionFilterFactory factory) = Sanitize(columnFamilyOptions, ttlSeconds, clock);
+        return new TtlDatabase(RocksDatabase.Open(path, options, cf), ttlSeconds, factory);
     }
+
+    private static (ColumnFamilyOptions, TtlCompactionFilterFactory) Sanitize(ColumnFamilyOptions o, int ttlSeconds, Func<long>? clock)
+    {
+        ArgumentNullException.ThrowIfNull(o);
+        ColumnFamilyOptions cf = o.Clone();
+        var filter = clock is null ? new TtlCompactionFilter(ttlSeconds, cf.CompactionFilter) : new TtlCompactionFilter(ttlSeconds, cf.CompactionFilter, clock);
+        var factory = new TtlCompactionFilterFactory(filter);
+        cf.CompactionFilter = null;
+        cf.CompactionFilterFactory = factory;
+        return (cf, factory);
+    }
+
+    /// <summary>Compacts the whole key space, dropping expired values (DB::CompactRange).</summary>
+    public void CompactRange() => _db.CompactRange();
+
+    public ValueTask CompactRangeAsync(CancellationToken cancellationToken = default) => _db.CompactRangeAsync(cancellationToken);
 
     public int TtlSeconds { get; }
     /// <summary>The underlying database (values carry the timestamp suffix).</summary>
@@ -255,4 +286,24 @@ public sealed class TtlDatabase : IDisposable, IAsyncDisposable
             ThrowHelper.NotSupported("Two-phase commit is not supported by TTL databases");
         public void MarkRollback(ReadOnlySpan<byte> xid) => ThrowHelper.NotSupported("Two-phase commit is not supported by TTL databases");
     }
+}
+
+/// <summary>
+/// Port of TtlCompactionFilterFactory (utilities/ttl/db_ttl_impl.h): hands the TTL filter to every compaction. The
+/// name is what native DBWithTTL records in the OPTIONS file.
+/// </summary>
+public sealed class TtlCompactionFilterFactory : CompactionFilterFactory
+{
+    public TtlCompactionFilterFactory(TtlCompactionFilter filter)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        Filter = filter;
+    }
+
+    /// <summary>The (thread-safe) filter shared by all compactions.</summary>
+    public TtlCompactionFilter Filter { get; }
+
+    public override string Name => "TtlCompactionFilterFactory";
+
+    public override CompactionFilter? CreateCompactionFilter(in CompactionFilterContext context) => Filter;
 }
