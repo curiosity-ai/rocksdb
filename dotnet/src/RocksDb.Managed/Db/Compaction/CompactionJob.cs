@@ -95,6 +95,9 @@ internal sealed class CompactionJob
 
         public InternalIterator NewIterator(FileMetaData file) => new TableInternalIterator(inner.GetReader(file), TableReadFlags.DontFillCache);
 
+        public InternalIterator NewIterator(FileMetaData file, InternalIterator? reuse) =>
+            TableCache.Recycle(reuse, inner.GetReader(file), TableReadFlags.DontFillCache);
+
         public void Evict(ulong fileNumber) => inner.Evict(fileNumber);
     }
 

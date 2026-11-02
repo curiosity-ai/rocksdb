@@ -27,6 +27,7 @@ public sealed class TableInternalIterator : InternalIterator
     {
         if (lease.Reader is null) throw new ArgumentException("lease has no reader", nameof(lease));
         _lease = lease;
+        Flags = flags;
         _it = lease.Reader.NewIterator(flags);
     }
 
@@ -38,6 +39,7 @@ public sealed class TableInternalIterator : InternalIterator
     {
         if (lease.Reader is null) throw new ArgumentException("lease has no reader", nameof(lease));
         _lease = lease;
+        Flags = flags;
         try
         {
             _it = lease.Reader.NewIterator(flags, lease.Reader.GetPrefixOptions(readOptions, prefixExtractor));
@@ -68,6 +70,47 @@ public sealed class TableInternalIterator : InternalIterator
     public override ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) => _it.SeekToFirstAsync(cancellationToken);
     public override ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) => _it.SeekAsync(target, cancellationToken);
     public override ValueTask NextAsync(CancellationToken cancellationToken = default) => _it.NextAsync(cancellationToken);
+
+    /// <summary>The block-cache flags this iterator reads with.</summary>
+    internal TableReadFlags Flags { get; private set; }
+
+    /// <summary>
+    /// Re-points this iterator at <paramref name="lease"/>'s table (same flags; prefix options recomputed from
+    /// <paramref name="readOptions"/> / <paramref name="prefixExtractor"/> when given) and releases the previous lease.
+    /// Lets <see cref="LevelIterator"/> move between the files of a level without allocating a new iterator per file.
+    /// </summary>
+    internal void Retarget(TableReaderLease lease, ReadOptions? readOptions, SliceTransform? prefixExtractor)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        TableReaderLease old = _lease;
+        try
+        {
+            TableIteratorPrefixOptions prefix = prefixExtractor is null && readOptions is null
+                ? default
+                : lease.Reader.GetPrefixOptions(readOptions, prefixExtractor);
+            _it.Retarget(lease.Reader, prefix);
+        }
+        catch
+        {
+            lease.Dispose();
+            throw;
+        }
+        _lease = lease;
+        old.Dispose();
+    }
+
+    /// <summary>
+    /// Releases the blocks and the reader lease but keeps the iterator objects for a later <see cref="Retarget"/>
+    /// (invalid until then).
+    /// </summary>
+    internal void Park()
+    {
+        if (_disposed) return;
+        _it.Detach();
+        TableReaderLease l = _lease;
+        _lease = default;
+        l.Dispose();
+    }
 
     protected override void Dispose(bool disposing)
     {

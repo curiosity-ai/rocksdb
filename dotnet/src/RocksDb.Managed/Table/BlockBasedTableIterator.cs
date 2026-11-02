@@ -167,11 +167,11 @@ internal sealed class IndexCursor
 /// </summary>
 public sealed class BlockBasedTableIterator : IDisposable
 {
-    private readonly BlockBasedTableReader _reader;
+    private BlockBasedTableReader _reader;
     private readonly IndexCursor _index = new();
     private readonly BlockIter _data = new();
     private readonly TableReadFlags _flags;
-    private readonly TableIteratorPrefixOptions _prefix;
+    private TableIteratorPrefixOptions _prefix;
     private BlockRef _block;
     private BlockHandle _blockHandle;
 
@@ -386,6 +386,25 @@ public sealed class BlockBasedTableIterator : IDisposable
         if (_data.Valid) return;
         _index.Next();
         await PositionAsync(Op.First, default, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Re-points this iterator (invalid afterwards) at another table with the same read flags, reusing its index and
+    /// block iterators and their key buffers: a level iterator moving between files does not allocate.
+    /// </summary>
+    /// <summary>Releases the current data block and the index blocks (the iterator is invalid until <see cref="Retarget"/>).</summary>
+    internal void Detach()
+    {
+        ReleaseBlock();
+        _index.Reset();
+    }
+
+    internal void Retarget(BlockBasedTableReader reader, in TableIteratorPrefixOptions prefixOptions)
+    {
+        ReleaseBlock();
+        _reader = reader;
+        _prefix = prefixOptions;
+        _index.Init(reader, _flags);
     }
 
     public void Dispose()

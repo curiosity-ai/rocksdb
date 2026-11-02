@@ -14,6 +14,15 @@ public interface ITableCache
     TableReaderLease GetReader(FileMetaData file);
     /// <summary>Creates an internal iterator over the file; disposing the iterator releases the reader.</summary>
     InternalIterator NewIterator(FileMetaData file);
+    /// <summary>
+    /// Like <see cref="NewIterator(FileMetaData)"/>, but may recycle <paramref name="reuse"/> (an iterator previously
+    /// returned by this cache, which the caller gives up) instead of creating a new one. The default disposes it.
+    /// </summary>
+    InternalIterator NewIterator(FileMetaData file, InternalIterator? reuse)
+    {
+        reuse?.Dispose();
+        return NewIterator(file);
+    }
     /// <summary>Drops the cached reader for a deleted file.</summary>
     void Evict(ulong fileNumber);
 }

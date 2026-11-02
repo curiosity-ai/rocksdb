@@ -30,6 +30,7 @@ public sealed class LevelIterator : InternalIterator
     /// <summary>Non-null in legacy prefix seek mode (no total_order_seek / auto_prefix_mode): Seek invalidates past the prefix.</summary>
     private readonly SliceTransform? _prefixSeekExtractor;
     private InternalIterator? _fileIter;
+    private InternalIterator? _spare; // a file iterator parked for reuse while the level iterator is exhausted
     private int _fileIndex = -1;
     private bool _disposed;
 
@@ -219,20 +220,53 @@ public sealed class LevelIterator : InternalIterator
         // If the file iterator shows incomplete, we try it again if users seek to the same file, as this time we may
         // go to a different data block which is cached in block cache.
         if (_fileIter is not null && _fileIndex == index) return;
-        SetFileIterator(NewFileIterator(index), index);
+        // The current file's iterator is recycled for the new file (no allocation per file switch).
+        InternalIterator? old = _fileIter ?? _spare;
+        if (_fileIter is not null) _spare?.Dispose();
+        _fileIter = null;
+        _spare = null;
+        _fileIndex = -1;
+        try
+        {
+            _fileIter = NewFileIterator(index, old);
+        }
+        catch
+        {
+            // Opening the file failed; the old iterator was not recycled (Dispose is idempotent).
+            old?.Dispose();
+            throw;
+        }
+        _fileIndex = index;
     }
 
-    private InternalIterator NewFileIterator(int index) =>
-        _prefixExtractor is null
-            ? _tableCache.NewIterator(_files[index])
-            : new TableInternalIterator(_tableCache.GetReader(_files[index]), TableReadFlags.None, _readOptions, _prefixExtractor);
+    private InternalIterator NewFileIterator(int index, InternalIterator? reuse)
+    {
+        if (_prefixExtractor is null) return _tableCache.NewIterator(_files[index], reuse);
+        TableReaderLease lease = _tableCache.GetReader(_files[index]);
+        if (reuse is TableInternalIterator t && t.Flags == TableReadFlags.None)
+        {
+            t.Retarget(lease, _readOptions, _prefixExtractor);
+            return t;
+        }
+        reuse?.Dispose();
+        return new TableInternalIterator(lease, TableReadFlags.None, _readOptions, _prefixExtractor);
+    }
 
     private void SetFileIterator(InternalIterator? iter, int index)
     {
         InternalIterator? old = _fileIter;
         _fileIter = iter;
         _fileIndex = index;
-        old?.Dispose();
+        if (old is null || ReferenceEquals(old, iter)) return;
+        if (iter is null && !_disposed && _spare is null && old is TableInternalIterator t)
+        {
+            // Keep the objects for the next file (see InitFileIterator) but release the file now, like upstream's
+            // LevelIterator dropping file_iter_.
+            t.Park();
+            _spare = t;
+            return;
+        }
+        old.Dispose();
     }
 
     // ------------------------------------------------------------------ async
@@ -303,7 +337,7 @@ public sealed class LevelIterator : InternalIterator
                 // Warm the table cache asynchronously so NewIterator does not block on the table open.
                 using (await _tableCache.GetReaderAsync(_files[index], ct).ConfigureAwait(false))
                 {
-                    SetFileIterator(NewFileIterator(index), index);
+                    InitFileIterator(index);
 
                 }
             }
@@ -326,5 +360,7 @@ public sealed class LevelIterator : InternalIterator
         if (_disposed) return;
         _disposed = true;
         SetFileIterator(null, -1);
+        _spare?.Dispose();
+        _spare = null;
     }
 }
