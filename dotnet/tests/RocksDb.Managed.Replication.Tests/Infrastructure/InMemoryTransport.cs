@@ -202,6 +202,8 @@ public sealed class InMemoryPairClient(InMemoryNetwork network, string from, str
 
     public async Task<PromoteResult?> PromoteAsync(PromoteRequest request, CancellationToken cancellationToken)
     {
+        // Faults apply to real promote requests, not to the warm-up probe sent before writes are held.
+        if (request.IsProbe) return await network.Require<PairNodeHost>(from, to).HandlePromoteAsync(request);
         TimeSpan delay = DelayNextPromote;
         DelayNextPromote = TimeSpan.Zero;
         if (delay > TimeSpan.Zero)
