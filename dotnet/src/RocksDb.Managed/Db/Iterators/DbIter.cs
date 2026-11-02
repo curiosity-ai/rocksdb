@@ -420,11 +420,18 @@ public sealed class DbIter : IDisposable
         throw new RocksDbException(StatusCode.InvalidArgument, "Invalid argument: merge_operator_ must be set.");
     }
 
-    /// <summary>Port of DBIter::IsVisible (no read callback): sequence and timestamp range.</summary>
+    /// <summary>The read callback (read_callback_) of a WritePrepared / WriteUnprepared read, or null.</summary>
+    private ReadCallback? _readCallback;
+
+    /// <summary>Sets the read callback before the first positioning call.</summary>
+    internal void SetReadCallback(ReadCallback callback) => _readCallback = callback;
+
+    /// <summary>Port of DBIter::IsVisible: sequence (or read callback) and timestamp range.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool IsVisible(ulong sequence, ReadOnlySpan<byte> userKey)
     {
         if (sequence > _sequence) return false;
+        if (_readCallback is not null && !_readCallback.IsVisible(sequence)) return false;
         if (_tsSize == 0) return true;
         return IsTimestampVisible(DbFormat.ExtractTimestampFromUserKey(userKey, _tsSize));
     }

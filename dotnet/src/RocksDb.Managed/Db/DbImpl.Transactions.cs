@@ -6,24 +6,56 @@ using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Db;
 
-/// <summary>A prepared transaction rebuilt from the WAL during recovery (DBImpl::RecoveredTransaction, WriteCommitted).</summary>
+/// <summary>
+/// A prepared (or, for WriteUnprepared, partially written) transaction rebuilt from the WAL during recovery
+/// (DBImpl::RecoveredTransaction, db/db_impl/db_impl.h). WriteCommitted and WritePrepared transactions have one batch;
+/// WriteUnprepared ones have one batch per unprepared / prepared section, keyed by the sequence number of its first key.
+/// </summary>
 internal sealed class RecoveredTransaction
 {
-    public RecoveredTransaction(string name, ulong logNumber, WriteBatch batch, ulong sequence)
+    /// <summary>One section of the transaction (RecoveredTransaction::BatchInfo).</summary>
+    internal readonly record struct BatchInfo(ulong LogNumber, WriteBatch Batch, int BatchCount);
+
+    private readonly SortedList<ulong, BatchInfo> _batches = new();
+
+    public RecoveredTransaction(string name, ulong logNumber, WriteBatch batch, ulong sequence, int batchCount, bool unprepared)
     {
         Name = name;
-        LogNumber = logNumber;
-        Batch = batch;
-        Sequence = sequence;
+        Unprepared = unprepared;
+        _batches.Add(sequence, new BatchInfo(logNumber, batch, batchCount));
     }
 
     public string Name { get; }
-    /// <summary>The WAL holding the prepared section.</summary>
-    public ulong LogNumber { get; }
-    /// <summary>The prepared writes (no markers).</summary>
-    public WriteBatch Batch { get; }
-    /// <summary>The sequence number the inserter was at when the section began.</summary>
-    public ulong Sequence { get; }
+
+    /// <summary>unprepared_: the last section seen was unprepared (the transaction was never prepared).</summary>
+    public bool Unprepared { get; private set; }
+
+    /// <summary>The sections by first sequence number (batches_).</summary>
+    public IList<ulong> Sequences => _batches.Keys;
+
+    public IList<BatchInfo> Batches => _batches.Values;
+
+    /// <summary>The WAL holding the (first) prepared section.</summary>
+    public ulong LogNumber => _batches.Values[0].LogNumber;
+
+    /// <summary>The prepared writes of the (first) section (no markers).</summary>
+    public WriteBatch Batch => _batches.Values[0].Batch;
+
+    /// <summary>The sequence number the inserter was at when the (first) section began.</summary>
+    public ulong Sequence => _batches.Keys[0];
+
+    /// <summary>RecoveredTransaction::AddBatch (WriteUnprepared: the prepare batch must be the last batch).</summary>
+    public void AddBatch(ulong sequence, ulong logNumber, WriteBatch batch, int batchCount, bool unprepared)
+    {
+        if (!Unprepared) ThrowHelper.Corruption("WAL: a prepared transaction has another section: " + Name);
+        _batches[sequence] = new BatchInfo(logNumber, batch, batchCount);
+        Unprepared = unprepared;
+    }
+
+    public void Dispose()
+    {
+        foreach (BatchInfo b in _batches.Values) b.Batch.Dispose();
+    }
 }
 
 /// <summary>
@@ -55,13 +87,25 @@ internal sealed partial class DbImpl
     /// <summary>Transaction names are stored in the WAL as their UTF-8 bytes.</summary>
     internal static string DecodeXid(ReadOnlySpan<byte> xid) => Encoding.UTF8.GetString(xid);
 
-    private void InsertRecoveredTransaction(ulong logNumber, ReadOnlySpan<byte> xid, WriteBatch batch, ulong sequence)
+    /// <summary>
+    /// DBImpl::InsertRecoveredTransaction: for WriteUnprepared it is called for every unprepared batch of the
+    /// transaction; if the transaction is prepared, the last call has <paramref name="unprepared"/> = false.
+    /// </summary>
+    private void InsertRecoveredTransaction(ulong logNumber, ReadOnlySpan<byte> xid, WriteBatch batch, ulong sequence, int batchCount, bool unprepared)
     {
         string name = DecodeXid(xid);
         lock (_mutex)
         {
-            if (_recoveredTransactions.Remove(name, out RecoveredTransaction? old)) old.Batch.Dispose();
-            _recoveredTransactions[name] = new RecoveredTransaction(name, logNumber, batch, sequence);
+            if (_recoveredTransactions.TryGetValue(name, out RecoveredTransaction? rtxn) && rtxn.Unprepared)
+            {
+                rtxn.AddBatch(sequence, logNumber, batch, batchCount, unprepared);
+            }
+            else
+            {
+                // A name reused after its transaction finished (or a duplicate prepare in a corrupted WAL) replaces it.
+                if (_recoveredTransactions.Remove(name, out RecoveredTransaction? old)) old.Dispose();
+                _recoveredTransactions[name] = new RecoveredTransaction(name, logNumber, batch, sequence, batchCount, unprepared);
+            }
         }
     }
 
@@ -74,7 +118,7 @@ internal sealed partial class DbImpl
     private void DeleteRecoveredTransaction(RecoveredTransaction trx)
     {
         lock (_mutex) _recoveredTransactions.Remove(trx.Name);
-        trx.Batch.Dispose();
+        trx.Dispose();
     }
 
     /// <summary>
@@ -98,7 +142,10 @@ internal sealed partial class DbImpl
     {
         lock (_mutex)
         {
-            foreach (RecoveredTransaction t in _recoveredTransactions.Values) MarkLogAsContainingPrepSection(t.LogNumber);
+            foreach (RecoveredTransaction t in _recoveredTransactions.Values)
+            {
+                foreach (RecoveredTransaction.BatchInfo b in t.Batches) MarkLogAsContainingPrepSection(b.LogNumber);
+            }
         }
     }
 
@@ -350,6 +397,32 @@ internal sealed partial class DbImpl
             conflict = view.Cfd.UserComparator.CompareTimestamp(readTimestamp, ts) < 0;
         }
         return conflict ? new RocksDbException(StatusCode.Busy, "Resource busy: ") : null;
+    }
+
+    /// <summary>
+    /// TransactionUtil::CheckKey with a read callback (WritePrepared / WriteUnprepared): the newest entry of the key is
+    /// a conflict unless the callback sees it; entries below <paramref name="minUncommitted"/> are committed, so the
+    /// memtables must reach back to it.
+    /// </summary>
+    internal RocksDbException? CheckKey(in ConflictCheckView view, ReadOnlySpan<byte> key, ulong snapSeq, ReadCallback snapChecker, ulong minUncommitted,
+        bool cacheOnly)
+    {
+        bool needToReadSst = false;
+        ulong earliest = view.EarliestSequence;
+        if (earliest == DbFormat.MaxSequenceNumber || snapSeq < earliest || minUncommitted <= earliest)
+        {
+            // The memtables do not contain a long enough history to check for writes after snapSeq (or, with
+            // min_uncommitted, for uncommitted writes since min_uncommitted).
+            needToReadSst = true;
+            if (cacheOnly) return TryAgainNoHistory(snapSeq, earliest);
+        }
+        // When min_uncommitted != kMaxSequenceNumber, keys lower than min_uncommitted will not trigger conflicts, while
+        // keys larger than min_uncommitted might create conflicts, so we need to read them out from the DB, and call
+        // the callback's IsVisibleFullCheck() to determine whether conflicts exist.
+        ulong lowerBoundSeq = minUncommitted == DbFormat.MaxSequenceNumber ? snapSeq : minUncommitted;
+        GetLatestSequenceForKey(view, key, !needToReadSst, lowerBoundSeq, out ulong seq, out bool found);
+        if (!found) return null;
+        return !snapChecker.IsVisible(seq) ? new RocksDbException(StatusCode.Busy, "Resource busy: ") : null;
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]

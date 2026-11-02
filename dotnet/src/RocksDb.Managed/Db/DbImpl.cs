@@ -58,7 +58,41 @@ internal sealed partial class DbImpl : IAsyncDisposable
         _maxBackgroundFlushes = Math.Max(1, maxFlushes);
         string host = options.DbHostId == "__hostname__" ? Environment.MachineName : options.DbHostId;
         Identity = new DbIdentity("", GenerateDbSessionId(), host);
+        _seqPerBatch = options.SeqPerBatch;
+        _batchPerTxn = options.BatchPerTxn;
     }
+
+    // ---- WritePrepared / WriteUnprepared support (seq_per_batch_, batch_per_txn_, use_custom_gc_) ---------
+
+    /// <summary>seq_per_batch_: one sequence number per sub-batch (WritePrepared / WriteUnprepared).</summary>
+    private readonly bool _seqPerBatch;
+    /// <summary>batch_per_txn_: false for WriteUnprepared (write_before_prepare).</summary>
+    private readonly bool _batchPerTxn;
+    /// <summary>Hooks of the sequence-per-batch transaction DB (null otherwise). Set once after open.</summary>
+    private SeqPerBatchHooks? _txnHooks;
+
+    internal bool SeqPerBatch => _seqPerBatch;
+    internal bool BatchPerTxn => _batchPerTxn;
+    internal SeqPerBatchHooks? TxnHooks => _txnHooks;
+
+    /// <summary>
+    /// DBImpl::SetSnapshotChecker + the WritePreparedTxnDB read / write overrides. Called once by the transaction DB
+    /// after open (before it is handed to the application).
+    /// </summary>
+    internal void SetSeqPerBatchHooks(SeqPerBatchHooks hooks)
+    {
+        lock (_mutex)
+        {
+            if (_txnHooks is not null) throw new InvalidOperationException("snapshot checker already set");
+            _txnHooks = hooks;
+        }
+    }
+
+    /// <summary>
+    /// The snapshot checker for flush / compaction (InitSnapshotContext): the transaction DB's, or
+    /// <see cref="DisableGcSnapshotChecker"/> for a sequence-per-batch DB before it is installed (use_custom_gc_).
+    /// </summary>
+    internal SnapshotChecker? CurrentSnapshotChecker => _txnHooks?.SnapshotChecker ?? (_seqPerBatch ? DisableGcSnapshotChecker.Instance : null);
 
     public string DbName { get; }
     public DbOptions Options { get; }
@@ -194,6 +228,13 @@ internal sealed partial class DbImpl : IAsyncDisposable
 
     public Snapshot GetSnapshot()
     {
+        if (_txnHooks is { } hooks) return hooks.GetSnapshot();
+        return GetSnapshotImpl();
+    }
+
+    /// <summary>DBImpl::GetSnapshotImpl: a snapshot at the last sequence (without transaction-DB enhancements).</summary>
+    internal Snapshot GetSnapshotImpl()
+    {
         ThrowIfDisposed();
         lock (_mutex)
         {
@@ -206,6 +247,12 @@ internal sealed partial class DbImpl : IAsyncDisposable
     internal void ReleaseSnapshot(Snapshot s)
     {
         lock (_mutex) _snapshots.Remove(s);
+    }
+
+    /// <summary>The live snapshots with a sequence number &lt;= <paramref name="max"/>, ascending (LoadSnapshots).</summary>
+    internal void GetSnapshotSequences(List<ulong> into, ulong max)
+    {
+        lock (_mutex) _snapshots.GetAll(into, max);
     }
 
     /// <summary>Sequence numbers of live snapshots, oldest first (for compaction / diagnostics).</summary>

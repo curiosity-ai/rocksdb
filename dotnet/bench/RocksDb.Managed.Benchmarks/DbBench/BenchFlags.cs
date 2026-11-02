@@ -36,6 +36,13 @@ public enum DbBenchmark
     TxnOptimistic,
     /// <summary>Pessimistic (WriteCommitted TransactionDB) transactions of --txn_puts random puts each.</summary>
     TxnPessimistic,
+    /// <summary>The txnpessimistic workload on a WritePrepared TransactionDB.</summary>
+    TxnWritePrepared,
+    /// <summary>
+    /// The txnpessimistic workload on a WriteUnprepared TransactionDB: named transactions whose batch is written to the DB
+    /// as an unprepared batch once it holds half of the transaction's puts (write_batch_flush_threshold).
+    /// </summary>
+    TxnWriteUnprepared,
 }
 
 /// <summary>Block cache implementation (--cache_type).</summary>
@@ -59,6 +66,7 @@ public static class BenchFlags
         ("deleterandom", DbBenchmark.DeleteRandom), ("flush", DbBenchmark.Flush), ("compact", DbBenchmark.Compact),
         ("waitforcompaction", DbBenchmark.WaitForCompaction), ("stats", DbBenchmark.Stats),
         ("txnoptimistic", DbBenchmark.TxnOptimistic), ("txnpessimistic", DbBenchmark.TxnPessimistic),
+        ("txnwriteprepared", DbBenchmark.TxnWritePrepared), ("txnwriteunprepared", DbBenchmark.TxnWriteUnprepared),
     ];
 
     /// <summary>All benchmark names, in the order of <see cref="DbBenchmark"/>.</summary>

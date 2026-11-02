@@ -200,12 +200,23 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
 
     internal override OptionTable<DbOptions> OptionTable => s_table;
 
+    /// <summary>
+    /// DBImpl's seq_per_batch (not persisted): one sequence number per (sub-)batch instead of per key. Set by
+    /// WritePrepared / WriteUnprepared transaction databases (TransactionDB::Open use_seq_per_batch).
+    /// </summary>
+    internal bool SeqPerBatch { get; set; }
+
+    /// <summary>DBImpl's batch_per_txn (not persisted): false for WriteUnprepared (a transaction writes several batches).</summary>
+    internal bool BatchPerTxn { get; set; } = true;
+
     public DbOptions Clone()
     {
         var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir, FileSystem = FileSystem, Statistics = Statistics, InfoLog = InfoLog };
         c.DbPaths.AddRange(DbPaths);
         c.Listeners.AddRange(Listeners);
         c.CopyFrom(this);
+        c.SeqPerBatch = SeqPerBatch;
+        c.BatchPerTxn = BatchPerTxn;
         return c;
     }
 }

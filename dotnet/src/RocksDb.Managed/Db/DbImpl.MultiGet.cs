@@ -21,6 +21,12 @@ internal sealed partial class DbImpl
         // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
         // in between could drop the versions visible at that sequence (no snapshot protects them).
         ValidateReadSnapshot(options);
+        if (_txnHooks is not null)
+        {
+            // WritePreparedTxnDB::MultiGet: one GetImpl (with its read callback) per key.
+            MultiGetWithTxnHooks(cfd, options, batch);
+            return;
+        }
         Statistics? st = Stats;
         long t0 = st is null ? 0 : st.StartTimer();
         SuperVersion sv = GetReferencedSuperVersion(cfd);
@@ -223,6 +229,24 @@ internal sealed partial class DbImpl
             try
             {
                 GetWithSuperVersion(cfd, sv, snapshot, options, batch.UserKey(k), batch.Context(k));
+            }
+            catch (RocksDbException e)
+            {
+                batch.SetError(k, e);
+            }
+        }
+        batch.FinishRun();
+    }
+
+    /// <summary>MultiGet of a WritePrepared / WriteUnprepared DB: point reads with the transaction DB's read callback.</summary>
+    private void MultiGetWithTxnHooks(ColumnFamilyData cfd, ReadOptions? options, MultiGetBatch batch)
+    {
+        batch.BeginRun(cfd.MergeOperator, ReadSequence(options), cfd.UserComparator);
+        for (int k = 0; k < batch.Count; k++)
+        {
+            try
+            {
+                Get(cfd, options, batch.UserKey(k), batch.Context(k));
             }
             catch (RocksDbException e)
             {

@@ -28,14 +28,22 @@ public enum OccValidationPolicy : byte
     ValidateParallel = 1,
 }
 
-/// <summary>How a pessimistic transaction DB writes data (TxnDBWritePolicy). Only <see cref="WriteCommitted"/> is supported.</summary>
+/// <summary>How a pessimistic transaction DB writes data (TxnDBWritePolicy, include/rocksdb/utilities/transaction_db.h).</summary>
 public enum TransactionWritePolicy : byte
 {
     /// <summary>Data is written to the memtables only at commit (the prepared section is WAL-only).</summary>
     WriteCommitted = 0,
-    /// <summary>Not supported by the managed port.</summary>
+    /// <summary>
+    /// Data is written to the memtables at prepare (commit-without-prepare writes it at commit); readers consult an
+    /// in-memory commit cache to know whether the data of a sequence number is committed in their snapshot. Commits are
+    /// cheap (a commit marker), prepared transactions are large in memory only while uncommitted.
+    /// </summary>
     WritePrepared = 1,
-    /// <summary>Not supported by the managed port.</summary>
+    /// <summary>
+    /// Like <see cref="WritePrepared"/>, but a transaction whose batch exceeds
+    /// <see cref="TransactionOptions.WriteBatchFlushThreshold"/> writes it to the DB before prepare as an unprepared
+    /// batch (large transactions do not keep their writes in memory).
+    /// </summary>
     WriteUnprepared = 2,
 }
 
@@ -78,8 +86,33 @@ public sealed class TransactionDbOptions
     /// <summary>Lock wait timeout of writes made directly on the <see cref="TransactionDatabase"/> (default_lock_timeout, default 1 s).</summary>
     public TimeSpan DefaultLockTimeout { get; set; } = TimeSpan.FromMilliseconds(1000);
 
-    /// <summary>Write policy; only <see cref="TransactionWritePolicy.WriteCommitted"/> is supported.</summary>
+    /// <summary>
+    /// Write policy (write_policy). The policy is not persisted: it is implied by the WAL contents, and a DB whose WAL
+    /// holds prepared sections of another policy fails to open with NotSupported (empty the WAL, e.g. by committing or
+    /// rolling back the prepared transactions and flushing, before changing it).
+    /// </summary>
     public TransactionWritePolicy WritePolicy { get; set; } = TransactionWritePolicy.WriteCommitted;
+
+    /// <summary>
+    /// WritePrepared / WriteUnprepared: when a transaction is rolled back, also restore the keys it only merged
+    /// (rollback_merge_operands; default false: merge operands are left in place).
+    /// </summary>
+    public bool RollbackMergeOperands { get; set; }
+
+    /// <summary>
+    /// WriteUnprepared: default <see cref="TransactionOptions.WriteBatchFlushThreshold"/> of transactions that do not
+    /// set one (default_write_batch_flush_threshold; 0 = never flush before prepare).
+    /// </summary>
+    public long DefaultWriteBatchFlushThreshold { get; set; }
+
+    /// <summary>WritePrepared / WriteUnprepared: log2 of the snapshot cache size (wp_snapshot_cache_bits, default 7).</summary>
+    public int WpSnapshotCacheBits { get; set; } = 7;
+
+    /// <summary>
+    /// WritePrepared / WriteUnprepared: log2 of the commit cache size (wp_commit_cache_bits, default 23: 8M entries,
+    /// 64 MB). Smaller caches evict commit entries sooner (more snapshot bookkeeping).
+    /// </summary>
+    public int WpCommitCacheBits { get; set; } = 23;
 
     /// <summary>
     /// Skip locking for writes made directly on the <see cref="TransactionDatabase"/> (skip_concurrency_control). Only
@@ -127,6 +160,13 @@ public sealed class TransactionOptions
 
     /// <summary>Allow <see cref="Transaction.Commit"/> of a named transaction without <see cref="Transaction.Prepare"/> (default true).</summary>
     public bool SkipPrepare { get; set; } = true;
+
+    /// <summary>
+    /// WriteUnprepared: once the transaction's batch is larger than this many bytes, it is written to the DB as an
+    /// unprepared batch before the next write (write_batch_flush_threshold; the transaction must be named). Negative
+    /// uses <see cref="TransactionDbOptions.DefaultWriteBatchFlushThreshold"/>; 0 never flushes.
+    /// </summary>
+    public long WriteBatchFlushThreshold { get; set; } = -1;
 
     /// <summary>
     /// write_batch_track_timestamp_size (upstream: "DO NOT USE", a temporary option for MyRocks): the transaction's

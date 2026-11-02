@@ -8,16 +8,26 @@ namespace RocksDb.Managed.Tests.Transactions;
 
 /// <summary>Ports of utilities/transactions/transaction_test.cc (WriteCommitted policy) and 2PC recovery cases.</summary>
 [TestClass]
-public sealed class TransactionTests
+public class TransactionTests
 {
+    /// <summary>The write policy the suite runs with (transaction_test.cc is parameterized over the write policies).</summary>
+    protected virtual TransactionWritePolicy Policy => TransactionWritePolicy.WriteCommitted;
+
     private static readonly WriteOptions s_wo = new();
     private static readonly WriteOptions s_sync = new() { Sync = true };
     private static readonly TimeSpan s_short = TimeSpan.FromMilliseconds(50);
 
-    private static TransactionDbOptions TxnDbOptions() => new() { TransactionLockTimeout = s_short, DefaultLockTimeout = s_short };
+    private TransactionDbOptions TxnDbOptions() => WithPolicy(new() { TransactionLockTimeout = s_short, DefaultLockTimeout = s_short });
 
-    private static TransactionDatabase Open(MemoryFileSystem fs, TransactionDbOptions? options = null, ColumnFamilyOptions? cfo = null) =>
-        TransactionDatabase.Open(DbPath, NewOptions(fs), options ?? TxnDbOptions(),
+    private TransactionDbOptions WithPolicy(TransactionDbOptions o)
+    {
+        o.WritePolicy = Policy;
+        o.WpCommitCacheBits = 10; // small commit cache: exercises eviction and keeps the per-DB memory low
+        return o;
+    }
+
+    private TransactionDatabase Open(MemoryFileSystem fs, TransactionDbOptions? options = null, ColumnFamilyOptions? cfo = null) =>
+        TransactionDatabase.Open(DbPath, NewOptions(fs), options is null ? TxnDbOptions() : WithPolicy(options),
             [new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, cfo ?? new ColumnFamilyOptions())]);
 
     /// <summary>
@@ -376,7 +386,8 @@ public sealed class TransactionTests
             Transaction txn = prepared[0];
             Assert.AreEqual("xid#1", txn.Name);
             Assert.AreEqual(TransactionState.Prepared, txn.State);
-            Assert.AreEqual(3, txn.Count);
+            // WriteUnprepared keeps the recovered data in the DB only (the rebuilt batch is cleared).
+            Assert.AreEqual(Policy == TransactionWritePolicy.WriteUnprepared ? 0 : 3, txn.Count);
             txn.Commit();
             Assert.AreEqual("bar", GetString(db.Database, "foo"));
             Assert.IsNull(GetString(db.Database, "before"));
@@ -472,9 +483,23 @@ public sealed class TransactionTests
         }
         var e = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbPath, NewOptions(fs)).Dispose());
         Assert.AreEqual(StatusCode.NotSupported, e.Code);
-        // allow_2pc on a plain DB recovers (and ignores) the prepared section
         DbOptions o = NewOptions(fs);
         o.Allow2Pc = true;
+        if (Policy != TransactionWritePolicy.WriteCommitted)
+        {
+            // A plain DB (write-after-commit) refuses WritePrepared / WriteUnprepared sections (WriteBatch::Iterate's
+            // write-policy check), and so does a TransactionDB with another write policy.
+            e = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbPath, o).Dispose());
+            Assert.AreEqual(StatusCode.NotSupported, e.Code);
+            StringAssert.Contains(e.Message, "WritePolicy");
+            e = Assert.ThrowsExactly<RocksDbException>(() =>
+                TransactionDatabase.Open(DbPath, NewOptions(fs), new TransactionDbOptions { WritePolicy = TransactionWritePolicy.WriteCommitted }).Dispose());
+            Assert.AreEqual(StatusCode.NotSupported, e.Code);
+            using TransactionDatabase same = Open(fs);
+            Assert.AreEqual(1, same.GetAllPreparedTransactions().Count);
+            return;
+        }
+        // allow_2pc on a plain DB recovers (and ignores) the prepared section
         using RocksDatabase plain = RocksDatabase.Open(DbPath, o);
         Assert.IsNull(GetString(plain, "foo"));
     }
@@ -506,9 +531,10 @@ public sealed class TransactionTests
         }
         using TransactionDatabase db2 = Open(fs);
         for (int i = 0; i < 20; i++) Assert.AreEqual(S(Value(i, 0)), GetString(db2.Database, S(Key(i))!));
-        // Sequence numbers after recovery do not reuse those consumed by commits
+        // Sequence numbers after recovery do not reuse those consumed by commits. WritePrepared / WriteUnprepared use one
+        // sequence number per batch (prepare, commit marker, plain write) and advance by one after recovery.
         ulong seq = db2.Database.GetLatestSequenceNumber();
-        Assert.AreEqual(20UL + 10UL, seq);
+        Assert.AreEqual(Policy == TransactionWritePolicy.WriteCommitted ? 20UL + 10UL : 10UL * 3 + 10UL + 1UL, seq);
     }
 
     /// <summary>Test-only view of the internal pessimistic transaction.</summary>
@@ -519,4 +545,18 @@ public sealed class TransactionTests
         public ulong LogNumber => Impl.LogNumber;
         public IReadOnlyList<ulong> WaitingFor() => Impl.GetWaitingTransactions(out _, out _);
     }
+}
+
+/// <summary>The transaction_test.cc ports with the WritePrepared policy (TransactionTest instantiated with WRITE_PREPARED).</summary>
+[TestClass]
+public sealed class WritePreparedPolicyTransactionTests : TransactionTests
+{
+    protected override TransactionWritePolicy Policy => TransactionWritePolicy.WritePrepared;
+}
+
+/// <summary>The transaction_test.cc ports with the WriteUnprepared policy.</summary>
+[TestClass]
+public sealed class WriteUnpreparedPolicyTransactionTests : TransactionTests
+{
+    protected override TransactionWritePolicy Policy => TransactionWritePolicy.WriteUnprepared;
 }

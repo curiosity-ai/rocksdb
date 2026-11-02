@@ -164,11 +164,10 @@ public static class DbBenchRunner
                 // previous benchmark, the report formatting) are compiled by the tiering background thread; let that
                 // finish before the measurement starts. The C leg pauses the same 200 ms (without a JIT to wait for).
                 if (f.Warmup) WaitForJitQuiescence(stableMs: SettleMs, maxMs: 5_000);
-                if (bench is DbBenchmark.TxnOptimistic or DbBenchmark.TxnPessimistic)
+                if (TxnEngineFactory.KindOf(bench) is { } kind)
                 {
                     // Transactions run against their own (fresh) transactional DB next to the main one.
-                    TxnKind kind = bench == DbBenchmark.TxnOptimistic ? TxnKind.Optimistic : TxnKind.Pessimistic;
-                    using ITxnEngine txnEngine = TxnEngineFactory.Open(f.Engine, kind, f.Db + "-" + BenchFlags.Name(bench), f.Options);
+                    using ITxnEngine txnEngine = TxnEngineFactory.Open(f.Engine, kind, f.Db + "-" + BenchFlags.Name(bench), f.Options, f.TxnPuts * (f.KeySize + f.ValueSize));
                     new BenchRun(engine, f, values, bench, index) { Txn = txnEngine }.Execute();
                     continue;
                 }
@@ -270,10 +269,10 @@ public static class DbBenchRunner
                 }
                 ITxnEngine? txn = null;
                 string? txnPath = null;
-                if (bench is DbBenchmark.TxnOptimistic or DbBenchmark.TxnPessimistic)
+                if (TxnEngineFactory.KindOf(bench) is { } kind)
                 {
                     txnPath = w.Db + "-" + BenchFlags.Name(bench);
-                    txn = TxnEngineFactory.Open(w.Engine, bench == DbBenchmark.TxnOptimistic ? TxnKind.Optimistic : TxnKind.Pessimistic, txnPath, w.Options);
+                    txn = TxnEngineFactory.Open(w.Engine, kind, txnPath, w.Options, w.TxnPuts * (w.KeySize + w.ValueSize));
                 }
                 try
                 {
@@ -422,7 +421,8 @@ public static class DbBenchRunner
             {
                 DbBenchmark.FillSync => Math.Max(nominal / 1000, 1),
                 // one op = one transaction of --txn_puts puts (as many puts in total as fillrandom)
-                DbBenchmark.TxnOptimistic or DbBenchmark.TxnPessimistic => Math.Max(nominal / f.TxnPuts, 1),
+                DbBenchmark.TxnOptimistic or DbBenchmark.TxnPessimistic or DbBenchmark.TxnWritePrepared or DbBenchmark.TxnWriteUnprepared =>
+                    Math.Max(nominal / f.TxnPuts, 1),
                 _ => nominal,
             };
             int n = f.Threads + (bench == DbBenchmark.ReadWhileWriting ? 1 : 0);
@@ -556,6 +556,8 @@ public static class DbBenchRunner
                     break;
                 case DbBenchmark.TxnOptimistic:
                 case DbBenchmark.TxnPessimistic:
+                case DbBenchmark.TxnWritePrepared:
+                case DbBenchmark.TxnWriteUnprepared:
                     DoTransactions(w, n, ref rng);
                     break;
             }
@@ -828,6 +830,8 @@ public static class DbBenchRunner
                     break;
                 case DbBenchmark.TxnOptimistic:
                 case DbBenchmark.TxnPessimistic:
+                case DbBenchmark.TxnWritePrepared:
+                case DbBenchmark.TxnWriteUnprepared:
                     await TransactionsAsync(w, n, rng).ConfigureAwait(false);
                     break;
             }

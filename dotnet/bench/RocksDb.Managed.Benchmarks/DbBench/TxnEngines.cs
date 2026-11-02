@@ -9,6 +9,10 @@ public enum TxnKind
     Optimistic,
     /// <summary>TransactionDB, WriteCommitted (per-key locks taken by each put).</summary>
     Pessimistic,
+    /// <summary>TransactionDB, WritePrepared.</summary>
+    WritePrepared,
+    /// <summary>TransactionDB, WriteUnprepared (named transactions flushed to the DB at half of their puts).</summary>
+    WriteUnprepared,
 }
 
 /// <summary>A transactional DB opened for the txnoptimistic / txnpessimistic benchmarks.</summary>
@@ -30,14 +34,25 @@ public interface ITxnSession : IDisposable
 
 public static class TxnEngineFactory
 {
-    public static ITxnEngine Open(EngineKind engine, TxnKind kind, string path, EngineOptions options)
+    /// <summary>The transaction kind of a transaction benchmark, or null.</summary>
+    public static TxnKind? KindOf(DbBenchmark bench) => bench switch
+    {
+        DbBenchmark.TxnOptimistic => TxnKind.Optimistic,
+        DbBenchmark.TxnPessimistic => TxnKind.Pessimistic,
+        DbBenchmark.TxnWritePrepared => TxnKind.WritePrepared,
+        DbBenchmark.TxnWriteUnprepared => TxnKind.WriteUnprepared,
+        _ => null,
+    };
+
+    /// <param name="txnBytes">Approximate size of one transaction's batch (WriteUnprepared flushes at half of it).</param>
+    public static ITxnEngine Open(EngineKind engine, TxnKind kind, string path, EngineOptions options, long txnBytes)
     {
         if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
         Directory.CreateDirectory(path);
         return engine switch
         {
-            EngineKind.Managed => new ManagedTxnEngine(kind, path, options),
-            EngineKind.RocksDbSharp => new NativeTxnEngine(kind, path, options),
+            EngineKind.Managed => new ManagedTxnEngine(kind, path, options, txnBytes / 2),
+            EngineKind.RocksDbSharp => new NativeTxnEngine(kind, path, options, txnBytes / 2),
             _ => throw new ArgumentException("engine " + BenchFlags.Name(engine) + " is not an in-process engine"),
         };
     }
@@ -49,13 +64,37 @@ internal sealed class ManagedTxnEngine : ITxnEngine
     private readonly OptimisticTransactionDatabase? _occ;
     private readonly TransactionDatabase? _pessimistic;
     private readonly WriteOptions _wo;
+    private readonly TransactionOptions _txnOptions;
+    private readonly bool _named;
+    private int _sessions;
 
-    public ManagedTxnEngine(TxnKind kind, string path, EngineOptions options)
+    public ManagedTxnEngine(TxnKind kind, string path, EngineOptions options, long flushThreshold)
     {
         (DbOptions dbo, ColumnFamilyOptions cfo) = ManagedEngine.BuildOptions(options);
         ColumnFamilyDescriptor[] cfs = [new(ColumnFamilyDescriptor.DefaultColumnFamilyName, cfo)];
-        if (kind == TxnKind.Optimistic) _occ = OptimisticTransactionDatabase.Open(path, dbo, new OptimisticTransactionDbOptions(), cfs);
-        else _pessimistic = TransactionDatabase.Open(path, dbo, new TransactionDbOptions(), cfs);
+        _txnOptions = new TransactionOptions();
+        if (kind == TxnKind.Optimistic)
+        {
+            _occ = OptimisticTransactionDatabase.Open(path, dbo, new OptimisticTransactionDbOptions(), cfs);
+        }
+        else
+        {
+            var tdo = new TransactionDbOptions
+            {
+                WritePolicy = kind switch
+                {
+                    TxnKind.WritePrepared => TransactionWritePolicy.WritePrepared,
+                    TxnKind.WriteUnprepared => TransactionWritePolicy.WriteUnprepared,
+                    _ => TransactionWritePolicy.WriteCommitted,
+                },
+            };
+            if (kind == TxnKind.WriteUnprepared)
+            {
+                _txnOptions.WriteBatchFlushThreshold = Math.Max(flushThreshold, 1);
+                _named = true; // unprepared batches can only be written by named transactions
+            }
+            _pessimistic = TransactionDatabase.Open(path, dbo, tdo, cfs);
+        }
         _wo = new WriteOptions { Sync = options.Sync, DisableWal = options.DisableWal };
     }
 
@@ -70,14 +109,16 @@ internal sealed class ManagedTxnEngine : ITxnEngine
     private sealed class Session(ManagedTxnEngine e) : ITxnSession
     {
         private static readonly OptimisticTransactionOptions s_occOptions = new();
-        private static readonly TransactionOptions s_txnOptions = new();
         private Transaction? _txn;
+        private readonly string _name = "s" + Interlocked.Increment(ref e._sessions).ToString(System.Globalization.CultureInfo.InvariantCulture);
 
         private Transaction Begin()
         {
             if (e._occ is { } occ) return _txn = _txn is null ? occ.BeginTransaction(e._wo, s_occOptions) : occ.BeginTransaction(e._wo, s_occOptions, _txn);
             TransactionDatabase db = e._pessimistic!;
-            return _txn = _txn is null ? db.BeginTransaction(e._wo, s_txnOptions) : db.BeginTransaction(e._wo, s_txnOptions, _txn);
+            _txn = _txn is null ? db.BeginTransaction(e._wo, e._txnOptions) : db.BeginTransaction(e._wo, e._txnOptions, _txn);
+            if (e._named) _txn.SetName(_name);
+            return _txn;
         }
 
         public bool Run(ReadOnlySpan<byte> keys, int count, int keySize, ReadOnlySpan<byte> value)
@@ -129,8 +170,10 @@ internal sealed unsafe class NativeTxnEngine : ITxnEngine
     private readonly RocksDbSharp.WriteOptions _wo;
     private readonly IntPtr _txnDbOptions, _otxnOptions, _txnOptions;
     private readonly IntPtr _db;
+    private readonly bool _named;
+    private int _sessions;
 
-    public NativeTxnEngine(TxnKind kind, string path, EngineOptions options)
+    public NativeTxnEngine(TxnKind kind, string path, EngineOptions options, long flushThreshold)
     {
         _kind = kind;
         _options = Native.NativeDbFactory.CreateOptions(options, out _cache, out _hyperClock, out _bloom, out _table);
@@ -145,6 +188,18 @@ internal sealed unsafe class NativeTxnEngine : ITxnEngine
         {
             _txnDbOptions = N.rocksdb_transactiondb_options_create();
             _txnOptions = N.rocksdb_transaction_options_create();
+            // TxnDBWritePolicy: WRITE_COMMITTED = 0, WRITE_PREPARED = 1, WRITE_UNPREPARED = 2.
+            N.rocksdb_transactiondb_options_set_write_policy(_txnDbOptions, kind switch
+            {
+                TxnKind.WritePrepared => 1,
+                TxnKind.WriteUnprepared => 2,
+                _ => 0,
+            });
+            if (kind == TxnKind.WriteUnprepared)
+            {
+                N.rocksdb_transaction_options_set_write_batch_flush_threshold(_txnOptions, Math.Max(flushThreshold, 1));
+                _named = true;
+            }
             _db = N.rocksdb_transactiondb_open(_options.Handle, _txnDbOptions, path);
         }
     }
@@ -173,6 +228,7 @@ internal sealed unsafe class NativeTxnEngine : ITxnEngine
     private sealed class Session(NativeTxnEngine e) : ITxnSession
     {
         private IntPtr _txn;
+        private readonly byte[] _name = System.Text.Encoding.ASCII.GetBytes("s" + Interlocked.Increment(ref e._sessions).ToString(System.Globalization.CultureInfo.InvariantCulture));
 
         public bool Run(ReadOnlySpan<byte> keys, int count, int keySize, ReadOnlySpan<byte> value)
         {
@@ -180,6 +236,10 @@ internal sealed unsafe class NativeTxnEngine : ITxnEngine
                 ? N.rocksdb_optimistictransaction_begin(e._db, e._wo.Handle, e._otxnOptions, _txn)
                 : N.rocksdb_transaction_begin(e._db, e._wo.Handle, e._txnOptions, _txn);
             IntPtr err = IntPtr.Zero;
+            if (e._named)
+            {
+                fixed (byte* nm = _name) N.rocksdb_transaction_set_name(_txn, (IntPtr)nm, (UIntPtr)_name.Length, out err);
+            }
             fixed (byte* k = keys)
             fixed (byte* v = value)
             {

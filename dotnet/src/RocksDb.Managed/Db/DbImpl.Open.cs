@@ -509,7 +509,7 @@ internal sealed partial class DbImpl
         if (_cfTimestampSizes is not null || recordedTs.Count > 0) reconciled = HandleRecoveredBatchTimestampSizes(record, recordedTs);
         if (reconciled is not null) record = reconciled;
         var inserter = new MemTableInserter(this, walNumber, ignoreMissingColumnFamilies: true) { Sequence = seq };
-        WriteBatch.Iterate(record, ref inserter);
+        inserter.Run(record);
         // next_sequence comes from the inserter, not the record header: a prepared section counts its entries but
         // consumes no sequence numbers, and a commit marker consumes those of the prepared batch it applies.
         ulong next = inserter.Sequence;
@@ -537,7 +537,7 @@ internal sealed partial class DbImpl
         FileMetaData? meta;
         try
         {
-            meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, [], blobBuilder, null, synchronous, ct)
+            meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, [], CurrentSnapshotChecker, blobBuilder, null, synchronous, ct)
                 .ConfigureAwait(false);
         }
         catch

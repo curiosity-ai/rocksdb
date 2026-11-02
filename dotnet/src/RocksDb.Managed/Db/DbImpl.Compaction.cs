@@ -253,6 +253,16 @@ internal sealed partial class DbImpl
         }
     }
 
+    /// <summary>The snapshot list with the job snapshot (taken last, so not smaller than any) added.</summary>
+    private static ulong[] WithJobSnapshot(ulong[] snapshots, ulong jobSnapshot)
+    {
+        if (snapshots.Length > 0 && snapshots[^1] >= jobSnapshot) return snapshots;
+        var a = new ulong[snapshots.Length + 1];
+        snapshots.CopyTo(a, 0);
+        a[^1] = jobSnapshot;
+        return a;
+    }
+
     /// <summary>Live snapshot sequence numbers, ascending. REQUIRES: mutex.</summary>
     private ulong[] SnapshotsForCompaction()
     {
@@ -335,8 +345,24 @@ internal sealed partial class DbImpl
             }
             else
             {
-                job = new CompactionJob(this, cfd, c, snapshots, NewPendingOutputFileNumber, ct);
-                job.RunAsync(synchronous: true).GetAwaiter().GetResult();
+                // InitSnapshotContext: with a snapshot checker the inputs may contain values not visible to a snapshot
+                // taken after the job starts; take one so that it appears in the snapshot list.
+                SnapshotChecker? checker = CurrentSnapshotChecker;
+                Snapshot? jobSnapshot = checker is null ? null : GetSnapshotImpl();
+                try
+                {
+                    ulong[] jobSnapshots = jobSnapshot is null ? snapshots : WithJobSnapshot(snapshots, jobSnapshot.SequenceNumber);
+                    job = new CompactionJob(this, cfd, c, jobSnapshots, NewPendingOutputFileNumber, ct)
+                    {
+                        SnapshotChecker = checker,
+                        JobSnapshot = jobSnapshot?.SequenceNumber ?? 0,
+                    };
+                    job.RunAsync(synchronous: true).GetAwaiter().GetResult();
+                }
+                finally
+                {
+                    jobSnapshot?.Dispose();
+                }
                 c.AddInputDeletions(edit);
                 foreach (FileMetaData f in job.Outputs) edit.AddFile(c.OutputLevel, f);
                 edit.BlobFileAdditions.AddRange(job.BlobFileAdditions);

@@ -51,6 +51,13 @@ internal sealed partial class DbImpl
             ValidateColumnFamilies(batch, options?.IgnoreMissingColumnFamilies ?? false);
             if (txn?.MemtableBatch is { } mb) ValidateColumnFamilies(mb, options?.IgnoreMissingColumnFamilies ?? false);
         }
+        if (_seqPerBatch && (txn is null || txn.BatchCount == 0))
+        {
+            // WritePreparedTxnDB::Write (skip_concurrency_control) -> WriteInternal: a write that does not come from a
+            // transaction gets its sub-batch count, a trailing Noop boundary and a commit-map update.
+            await WritePlainSeqPerBatchAsync(options, batch, txn, synchronous, cancellationToken).ConfigureAwait(false);
+            return;
+        }
         Statistics? stats = Options.Statistics;
         long writeStart = stats?.StartTimer() ?? 0;
         WriteThread.Writer w = WriteThread.Rent(synchronous);
@@ -84,6 +91,28 @@ internal sealed partial class DbImpl
         {
             WriteThread.Return(w, synchronous);
             stats?.RecordElapsedMicros(Histogram.DbWrite, writeStart);
+        }
+    }
+
+    /// <summary>A plain write into a sequence-per-batch DB (see <see cref="SeqPerBatchHooks.BeginPlainWrite"/>).</summary>
+    private async ValueTask WritePlainSeqPerBatchAsync(WriteOptions? options, WriteBatch batch, TransactionWriteContext? txn, bool synchronous,
+        CancellationToken cancellationToken)
+    {
+        SeqPerBatchHooks hooks = _txnHooks ?? throw new InvalidOperationException("WritePrepared/WriteUnprepared DB written before its transaction layer was initialized");
+        if (batch.Count == 0) return; // WriteInternal: nothing to write
+        if (txn is not null && (txn.Callback is not null || txn.MemtableBatch is not null || txn.DisableMemtable))
+        {
+            throw new InvalidOperationException("transaction writes into a sequence-per-batch DB must give their batch count");
+        }
+        var ctx = new TransactionWriteContext();
+        WriteBatch toWrite = hooks.BeginPlainWrite(batch, ctx);
+        try
+        {
+            await WriteAsync(options, toWrite, validateColumnFamilies: false, ctx, synchronous, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            hooks.EndPlainWrite(toWrite, ctx);
         }
     }
 
@@ -174,7 +203,9 @@ internal sealed partial class DbImpl
                 if (_anyBlobDirectWrite && t is null && !TryTransformForBlobDirectWrite(w)) continue;
                 valid++;
                 firstValid ??= w;
-                if (t is null || !t.DisableMemtable) total += (uint)(t?.MemtableBatch ?? w.Batch!).Count;
+                // seq_per_batch_: every valid writer consumes its batch_cnt sequence numbers, also with disable_memtable.
+                if (_seqPerBatch) total += (uint)t!.BatchCount;
+                else if (t is null || !t.DisableMemtable) total += (uint)(t?.MemtableBatch ?? w.Batch!).Count;
                 needSync |= w.Sync;
             }
             if (_bdwTransformer is { Touched.Count: > 0 } bdw)
@@ -201,7 +232,12 @@ internal sealed partial class DbImpl
                 TransactionWriteContext? t = w.Txn;
                 WriteBatch b = w.Batch!;
                 b.Sequence = seq;
-                if (t is not null)
+                if (_seqPerBatch)
+                {
+                    t!.SequenceUsed = seq;
+                    seq += (uint)t.BatchCount;
+                }
+                else if (t is not null)
                 {
                     t.SequenceUsed = seq;
                     if (t.MemtableBatch is { } mb) mb.Sequence = seq;
@@ -283,6 +319,23 @@ internal sealed partial class DbImpl
                 Volatile.Write(ref _hasUnpersistedData, true);
             }
 
+            if (_seqPerBatch && valid > 0)
+            {
+                // PreReleaseCallback: called after the WAL write and before the memtable write, in sequence order.
+                int callbacks = 0;
+                for (int i = 0; i < group.Count; i++)
+                {
+                    if (group[i] is { CallbackFailed: false, Txn.PreRelease: not null }) callbacks++;
+                }
+                int index = 0;
+                for (int i = 0; i < group.Count && callbacks > 0; i++)
+                {
+                    WriteThread.Writer w = group[i];
+                    if (w.CallbackFailed || w.Txn is not { PreRelease: { } cb } t) continue;
+                    cb.Callback(t.SequenceUsed, t.DisableMemtable, leader.DisableWal ? 0 : _logNumber, index++, callbacks);
+                }
+            }
+
             var inserter = new MemTableInserter(this, logNumber: 0, ignoreMissingColumnFamilies: false);
             for (int i = 0; i < group.Count; i++)
             {
@@ -291,12 +344,14 @@ internal sealed partial class DbImpl
                 TransactionWriteContext? t = w.Txn;
                 if (t is { DisableMemtable: true }) continue;
                 WriteBatch mb = t?.MemtableBatch ?? w.Batch!;
-                inserter.Sequence = mb.Sequence;
+                inserter.Sequence = _seqPerBatch ? t!.SequenceUsed : mb.Sequence;
+                if (_seqPerBatch) mb.Sequence = inserter.Sequence;
                 inserter.IgnoreMissingColumnFamilies = w.IgnoreMissingColumnFamilies;
                 inserter.LogRef = t?.LogRef ?? 0;
                 try
                 {
-                    WriteBatch.Iterate(mb.Data, ref inserter);
+                    inserter.Run(mb.Data);
+                    Debug.Assert(!_seqPerBatch || inserter.Sequence - t!.SequenceUsed == (ulong)t.BatchCount, "sub-batch count mismatch");
                 }
                 catch (Exception e)
                 {
@@ -604,13 +659,20 @@ internal sealed partial class DbImpl
 
     /// <summary>
     /// Applies WriteBatch records to memtables. Port of MemTableInserter (db/write_batch.cc), sequential (not concurrent)
-    /// insertion, one sequence number per key, write-after-commit (WriteCommitted) 2PC semantics:
+    /// insertion:
     /// <list type="bullet">
-    /// <item>Live writes (<c>logNumber == 0</c>) ignore the 2PC markers and insert the values.</item>
-    /// <item>Recovery rebuilds each prepared section into a recovered transaction (no memtable insert, no sequence
-    /// numbers consumed), applies it when its commit marker is replayed, and drops it on a rollback marker.</item>
+    /// <item>Without seq_per_batch (WriteCommitted / plain DB) every key gets its own sequence number and 2PC uses
+    /// write-after-commit: live writes ignore the markers; recovery rebuilds each prepared section into a recovered
+    /// transaction (no memtable insert, no sequence numbers consumed), applies it when its commit marker is replayed,
+    /// and drops it on a rollback marker.</item>
+    /// <item>With seq_per_batch (WritePrepared / WriteUnprepared) all keys of a (sub-)batch share one sequence number:
+    /// the sequence advances at batch boundaries (end-prepare, commit, rollback and non-leading Noop markers) and when a
+    /// key repeats within the sub-batch (the memtable refuses a duplicate key+seq, MemTable::Add's TryAgain). Prepared
+    /// and unprepared sections are inserted at prepare time and, during recovery, also rebuilt into recovered
+    /// transactions with their sub-batch count; commit markers then only drop the recovered transaction.</item>
     /// <item><see cref="LogRef"/> makes the memtables keep the WAL holding the prepared section alive.</item>
     /// </list>
+    /// Begin-prepare markers of another write policy fail with NotSupported (WriteBatchInternal::Iterate checks).
     /// </summary>
     private struct MemTableInserter : IWriteBatchHandler
     {
@@ -620,9 +682,15 @@ internal sealed partial class DbImpl
         public bool IgnoreMissingColumnFamilies;
         /// <summary>log_number_ref_: WAL with the prepared section of the data being inserted (0 = none).</summary>
         public ulong LogRef;
-        // rebuilding_trx_ / rebuilding_trx_seq_ (recovery only).
+        // rebuilding_trx_ / rebuilding_trx_seq_ / unprepared_batch_ (recovery only).
         private WriteBatch? _rebuilding;
         private ulong _rebuildingSeq;
+        private bool _unpreparedBatch;
+        // seq_per_batch_ / write_after_commit_ / write_before_prepare_ (as a marker policy).
+        private readonly bool _seqPerBatch;
+        private readonly bool _writeAfterCommit;
+        private readonly WriteBatch.TxnMarkerPolicy _policy;
+        private DuplicateDetector? _dupDetector;
 
         public MemTableInserter(DbImpl db, ulong logNumber, bool ignoreMissingColumnFamilies)
         {
@@ -633,45 +701,92 @@ internal sealed partial class DbImpl
             LogRef = 0;
             _rebuilding = null;
             _rebuildingSeq = 0;
+            _unpreparedBatch = false;
+            _seqPerBatch = db._seqPerBatch;
+            // Write after commit currently uses one seq per key (instead of per batch). So seq_per_batch being false
+            // indicates write_after_commit approach; batch_per_txn being false indicates write_before_prepare.
+            _writeAfterCommit = !_seqPerBatch;
+            _policy = !_seqPerBatch ? WriteBatch.TxnMarkerPolicy.WriteCommitted
+                : db._batchPerTxn ? WriteBatch.TxnMarkerPolicy.WritePrepared : WriteBatch.TxnMarkerPolicy.WriteUnprepared;
+            _dupDetector = null;
         }
 
+        /// <summary>Iterates <paramref name="rep"/> into the memtables (WriteBatch::Iterate with this handler's option states).</summary>
+        public void Run(ReadOnlySpan<byte> rep) => WriteBatch.Iterate(rep, ref this, _policy);
+
         public readonly bool Continue() => true;
+
+        /// <summary>
+        /// MaybeAdvanceSeq: within a batch the sequence advances per key (default) or, with seq_per_batch, only at batch
+        /// boundaries.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void MaybeAdvanceSeq(bool batchBoundary)
+        {
+            if (batchBoundary == _seqPerBatch) Sequence++;
+        }
+
+        /// <summary>Recovery of a WriteCommitted prepared section: the records only go to the rebuilt batch.</summary>
+        private readonly bool RebuildOnly
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get => _rebuilding is not null && _writeAfterCommit;
+        }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void Add(uint cf, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
         {
             ColumnFamilyData? c = _db.CfForInsert(cf, _logNumber, IgnoreMissingColumnFamilies);
-            if (c is not null)
+            if (c is null)
             {
-                // MemTableInserter::DeleteCF: a deletion in a column family with timestamps is kTypeDeletionWithTimestamp.
-                if (type == EntryType.Deletion && c.TimestampSize != 0) type = EntryType.DeletionWithTimestamp;
-                MemTable mem = c.Mem;
-                // A duplicate key+seq can only come from replaying an already applied batch; ignore it like upstream's
-                // TryAgain handling for non-seq-per-batch writes.
-                mem.Add(Sequence, type, key, value);
-                if (LogRef != 0) mem.RefLogContainingPrepSection(LogRef);
-                if (mem.ShouldScheduleFlush && mem.MarkFlushScheduled()) _db._flushScheduler.Add(c);
+                if (_rebuilding is not null && !_writeAfterCommit)
+                {
+                    // The CF is probably flushed and hence no need for insert but we still need to keep track of the keys
+                    // for upcoming rollback/commit (the caller adds the key to the rebuilt batch).
+                    MaybeAdvanceSeq(IsDuplicateKeySeq(cf, key));
+                }
+                else
+                {
+                    MaybeAdvanceSeq(batchBoundary: false);
+                }
+                return;
             }
-            Sequence++;
+            // MemTableInserter::DeleteCF: a deletion in a column family with timestamps is kTypeDeletionWithTimestamp.
+            if (type == EntryType.Deletion && c.TimestampSize != 0) type = EntryType.DeletionWithTimestamp;
+            MemTable mem = c.Mem;
+            while (!mem.Add(Sequence, type, key, value))
+            {
+                // key+seq exists (TryAgain). Without seq_per_batch this can only come from replaying an already applied
+                // batch: ignore it like upstream. With seq_per_batch the key starts a new sub-batch: advance and retry.
+                if (!_seqPerBatch) break;
+                MaybeAdvanceSeq(batchBoundary: true);
+            }
+            if (LogRef != 0) mem.RefLogContainingPrepSection(LogRef);
+            if (mem.ShouldScheduleFlush && mem.MarkFlushScheduled()) _db._flushScheduler.Add(c);
+            MaybeAdvanceSeq(batchBoundary: false);
         }
+
+        /// <summary>IsDuplicateKeySeq (util/duplicate_detector.h): recovery of a column family whose insert is skipped.</summary>
+        private bool IsDuplicateKeySeq(uint cf, ReadOnlySpan<byte> key) => (_dupDetector ??= new DuplicateDetector()).IsDuplicateKeySeq(cf, key, Sequence);
 
         public void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
         {
             // optimize for non-recovery mode
-            if (_rebuilding is not null)
+            if (RebuildOnly)
             {
-                _rebuilding.Put(columnFamilyId, key, value);
+                _rebuilding!.Put(columnFamilyId, key, value);
                 return;
             }
             Add(columnFamilyId, EntryType.Value, key, value);
+            _rebuilding?.Put(columnFamilyId, key, value);
         }
 
         [SkipLocalsInit]
         public void TimedPut(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong writeUnixTime)
         {
-            if (_rebuilding is not null)
+            if (RebuildOnly)
             {
-                _rebuilding.TimedPut(columnFamilyId, key, value, writeUnixTime);
+                _rebuilding!.TimedPut(columnFamilyId, key, value, writeUnixTime);
                 return;
             }
             // PackValueAndWriteTime: value | fixed64(write_unix_time), stored as kTypeValuePreferredSeqno.
@@ -686,111 +801,142 @@ internal sealed partial class DbImpl
             {
                 System.Buffers.ArrayPool<byte>.Shared.Return(buf);
             }
+            _rebuilding?.TimedPut(columnFamilyId, key, value, writeUnixTime);
         }
 
         public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity)
         {
-            if (_rebuilding is not null)
+            if (RebuildOnly)
             {
-                _rebuilding.PutEntitySerialized(columnFamilyId, key, entity);
+                _rebuilding!.PutEntitySerialized(columnFamilyId, key, entity);
                 return;
             }
             Add(columnFamilyId, EntryType.WideColumnEntity, key, entity);
+            _rebuilding?.PutEntitySerialized(columnFamilyId, key, entity);
         }
 
         public void Delete(uint columnFamilyId, ReadOnlySpan<byte> key)
         {
-            if (_rebuilding is not null)
+            if (RebuildOnly)
             {
-                _rebuilding.Delete(columnFamilyId, key);
+                _rebuilding!.Delete(columnFamilyId, key);
                 return;
             }
             Add(columnFamilyId, EntryType.Deletion, key, default);
+            _rebuilding?.Delete(columnFamilyId, key);
         }
 
         public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key)
         {
-            if (_rebuilding is not null)
+            if (RebuildOnly)
             {
-                _rebuilding.SingleDelete(columnFamilyId, key);
+                _rebuilding!.SingleDelete(columnFamilyId, key);
                 return;
             }
             Add(columnFamilyId, EntryType.SingleDeletion, key, default);
+            _rebuilding?.SingleDelete(columnFamilyId, key);
         }
 
         public void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey)
         {
-            if (_rebuilding is not null)
+            if (RebuildOnly)
             {
-                _rebuilding.DeleteRange(columnFamilyId, beginKey, endKey);
+                _rebuilding!.DeleteRange(columnFamilyId, beginKey, endKey);
                 return;
             }
             Add(columnFamilyId, EntryType.RangeDeletion, beginKey, endKey);
+            _rebuilding?.DeleteRange(columnFamilyId, beginKey, endKey);
         }
 
         public void Merge(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
         {
-            if (_rebuilding is not null)
+            if (RebuildOnly)
             {
-                _rebuilding.Merge(columnFamilyId, key, value);
+                _rebuilding!.Merge(columnFamilyId, key, value);
                 return;
             }
             Add(columnFamilyId, EntryType.Merge, key, value);
+            _rebuilding?.Merge(columnFamilyId, key, value);
         }
 
         /// <summary>MemTableInserter::PutBlobIndexCF: the blob index is stored as a kTypeBlobIndex entry.</summary>
         public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex)
         {
-            if (_rebuilding is not null)
+            if (RebuildOnly)
             {
-                _rebuilding.PutBlobIndex(columnFamilyId, key, blobIndex);
+                _rebuilding!.PutBlobIndex(columnFamilyId, key, blobIndex);
                 return;
             }
             Add(columnFamilyId, EntryType.BlobIndex, key, blobIndex);
+            _rebuilding?.PutBlobIndex(columnFamilyId, key, blobIndex);
         }
 
         public readonly void LogData(ReadOnlySpan<byte> blob) { }
 
+        /// <summary>The batch iteration calls MarkBeginPrepare with unprepare set for a kTypeBeginUnprepareXID marker.</summary>
         public void MarkBeginPrepare(bool unprepare)
         {
             if (_logNumber == 0) return;
             // during recovery we rebuild a hollow transaction from all encountered prepare sections of the wal
             if (!_db.Options.Allow2Pc) ThrowHelper.NotSupported("WAL contains prepared transactions. Open with TransactionDB::Open().");
-            if (unprepare) ThrowHelper.NotSupported("WAL contains WriteUnprepared transactions, which are not supported");
             if (_rebuilding is not null) ThrowHelper.Corruption("WAL: nested begin-prepare marker");
+            // we are now iterating through a prepared section
             _rebuilding = new WriteBatch();
             _rebuildingSeq = Sequence;
+            _unpreparedBatch = unprepare;
         }
 
         public void MarkEndPrepare(ReadOnlySpan<byte> xid)
         {
-            if (_logNumber == 0) return;
-            if (_rebuilding is null) ThrowHelper.Corruption("WAL: end-prepare marker without a begin-prepare marker");
-            _db.InsertRecoveredTransaction(_logNumber, xid, _rebuilding!, _rebuildingSeq);
-            _rebuilding = null;
+            if (_logNumber != 0)
+            {
+                if (_rebuilding is null) ThrowHelper.Corruption("WAL: end-prepare marker without a begin-prepare marker");
+                // 0 will disable further checks (write after commit)
+                int batchCnt = _writeAfterCommit ? 0 : (int)(Sequence - _rebuildingSeq + 1);
+                _db.InsertRecoveredTransaction(_logNumber, xid, _rebuilding!, _rebuildingSeq, batchCnt, _unpreparedBatch);
+                _unpreparedBatch = false;
+                _rebuilding = null;
+            }
+            MaybeAdvanceSeq(batchBoundary: true);
         }
 
-        public readonly void MarkNoop(bool emptyBatch) { }
+        public void MarkNoop(bool emptyBatch)
+        {
+            // A hack in pessimistic transaction could result into a noop at the start of the write batch, that should be
+            // ignored. In the absence of Prepare markers, a kTypeNoop tag indicates the end of a batch (a write batch
+            // that commits skipping the prepare phase).
+            if (!emptyBatch) MaybeAdvanceSeq(batchBoundary: true);
+        }
 
         public void MarkCommit(ReadOnlySpan<byte> xid)
         {
-            if (_logNumber == 0) return; // live writes: the prepared batch is inserted by the commit write itself
-            // in recovery when we encounter a commit marker we lookup this transaction in our set of rebuilt
-            // transactions and commit. The log containing the prepared section may have been released in the last
-            // incarnation because the data was flushed to L0.
-            RecoveredTransaction? trx = _db.GetRecoveredTransaction(xid);
-            if (trx is null) return;
-            // all inserts must reference this trx log number; CF log numbers prevent duplicate re-insertion.
-            LogRef = trx.LogNumber;
-            try
+            if (_logNumber != 0)
             {
-                WriteBatch.Iterate(trx.Batch.Data, ref this);
+                // in recovery when we encounter a commit marker we lookup this transaction in our set of rebuilt
+                // transactions and commit. The log containing the prepared section may have been released in the last
+                // incarnation because the data was flushed to L0.
+                RecoveredTransaction? trx = _db.GetRecoveredTransaction(xid);
+                if (trx is not null)
+                {
+                    if (_writeAfterCommit)
+                    {
+                        // all inserts must reference this trx log number; CF log numbers prevent duplicate re-insertion.
+                        LogRef = trx.LogNumber;
+                        try
+                        {
+                            WriteBatch.Iterate(trx.Batch.Data, ref this);
+                        }
+                        finally
+                        {
+                            LogRef = 0;
+                        }
+                    }
+                    // else the values are already inserted before the commit
+                    _db.DeleteRecoveredTransaction(trx);
+                }
             }
-            finally
-            {
-                LogRef = 0;
-            }
-            _db.DeleteRecoveredTransaction(trx);
+            // Live write-after-commit writes: the prepared batch is inserted by the commit write itself.
+            MaybeAdvanceSeq(batchBoundary: true);
         }
 
         /// <summary>
@@ -800,28 +946,75 @@ internal sealed partial class DbImpl
         /// </summary>
         public void MarkCommitWithTimestamp(ReadOnlySpan<byte> xid, ReadOnlySpan<byte> commitTimestamp)
         {
-            if (_logNumber == 0) return;
-            RecoveredTransaction? trx = _db.GetRecoveredTransaction(xid);
-            if (trx is null) return;
-            trx.Batch.UpdateTimestamps(commitTimestamp, _db.TimestampSizeOf);
-            LogRef = trx.LogNumber;
-            try
+            if (_logNumber != 0)
             {
-                WriteBatch.Iterate(trx.Batch.Data, ref this);
+                RecoveredTransaction? trx = _db.GetRecoveredTransaction(xid);
+                if (trx is not null)
+                {
+                    if (_writeAfterCommit)
+                    {
+                        trx.Batch.UpdateTimestamps(commitTimestamp, _db.TimestampSizeOf);
+                        LogRef = trx.LogNumber;
+                        try
+                        {
+                            WriteBatch.Iterate(trx.Batch.Data, ref this);
+                        }
+                        finally
+                        {
+                            LogRef = 0;
+                        }
+                    }
+                    _db.DeleteRecoveredTransaction(trx);
+                }
             }
-            finally
-            {
-                LogRef = 0;
-            }
-            _db.DeleteRecoveredTransaction(trx);
+            MaybeAdvanceSeq(batchBoundary: true);
         }
 
-        public readonly void MarkRollback(ReadOnlySpan<byte> xid)
+        public void MarkRollback(ReadOnlySpan<byte> xid)
         {
-            if (_logNumber == 0) return; // in non recovery we simply ignore this tag
-            // the log containing the transactions prep section may have been released in the previous incarnation
-            // because we knew it had been rolled back
-            if (_db.GetRecoveredTransaction(xid) is { } trx) _db.DeleteRecoveredTransaction(trx);
+            // In non recovery we simply ignore this tag. The log containing the transaction's prep section may have been
+            // released in the previous incarnation because we knew it had been rolled back.
+            if (_logNumber != 0 && _db.GetRecoveredTransaction(xid) is { } trx) _db.DeleteRecoveredTransaction(trx);
+            MaybeAdvanceSeq(batchBoundary: true);
+        }
+    }
+
+    /// <summary>
+    /// Port of DuplicateDetector (util/duplicate_detector.h): detects a key repeated within the current sub-batch
+    /// sequence number (recovery of a column family whose memtable insert is skipped). Keys are compared bytewise.
+    /// </summary>
+    private sealed class DuplicateDetector
+    {
+        private ulong _batchSeq;
+        private readonly Dictionary<uint, HashSet<byte[]>> _keys = new();
+
+        public bool IsDuplicateKeySeq(uint cf, ReadOnlySpan<byte> key, ulong seq)
+        {
+            if (_batchSeq != seq)
+            {
+                // it is a new batch
+                _keys.Clear();
+            }
+            _batchSeq = seq;
+            if (!_keys.TryGetValue(cf, out HashSet<byte[]>? set)) _keys[cf] = set = new HashSet<byte[]>(ByteArrayContentComparer.Instance);
+            if (set.Add(key.ToArray())) return false;
+            _keys.Clear();
+            _keys[cf] = new HashSet<byte[]>(ByteArrayContentComparer.Instance) { key.ToArray() };
+            return true;
+        }
+    }
+
+    private sealed class ByteArrayContentComparer : IEqualityComparer<byte[]>
+    {
+        public static readonly ByteArrayContentComparer Instance = new();
+
+        public bool Equals(byte[]? x, byte[]? y) => x.AsSpan().SequenceEqual(y);
+
+        public int GetHashCode(byte[] obj)
+        {
+            var h = new HashCode();
+            h.AddBytes(obj);
+            return h.ToHashCode();
         }
     }
 }

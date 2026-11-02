@@ -19,18 +19,56 @@ internal sealed class NativeTxnDb : IDisposable
     private readonly RocksDbSharp.ReadOptions _ro = new();
     public IntPtr Handle { get; private set; }
 
-    public NativeTxnDb(string path)
+    public NativeTxnDb(string path) : this(path, TransactionWritePolicy.WriteCommitted)
+    {
+    }
+
+    /// <summary>Opens a TransactionDB with <paramref name="policy"/> (rocksdb_transactiondb_options_set_write_policy).</summary>
+    public NativeTxnDb(string path, TransactionWritePolicy policy)
     {
         _options = new RocksDbSharp.DbOptions().SetCreateIfMissing(true);
         _txnDbOptions = N.rocksdb_transactiondb_options_create();
-        Handle = N.rocksdb_transactiondb_open(_options.Handle, _txnDbOptions, path);
+        // TxnDBWritePolicy: WRITE_COMMITTED = 0, WRITE_PREPARED = 1, WRITE_UNPREPARED = 2 (same values as the managed enum)
+        N.rocksdb_transactiondb_options_set_write_policy(_txnDbOptions, (int)policy);
+        try
+        {
+            Handle = N.rocksdb_transactiondb_open(_options.Handle, _txnDbOptions, path);
+        }
+        catch
+        {
+            N.rocksdb_transactiondb_options_destroy(_txnDbOptions);
+            throw;
+        }
     }
 
-    public IntPtr Begin()
+    public IntPtr Begin() => Begin(0);
+
+    /// <summary>A transaction with write_batch_flush_threshold (WriteUnprepared; 0 = the DB default).</summary>
+    public IntPtr Begin(long writeBatchFlushThreshold)
     {
         IntPtr o = N.rocksdb_transaction_options_create();
-        try { return N.rocksdb_transaction_begin(Handle, _wo.Handle, o, IntPtr.Zero); }
+        try
+        {
+            if (writeBatchFlushThreshold != 0) N.rocksdb_transaction_options_set_write_batch_flush_threshold(o, writeBatchFlushThreshold);
+            return N.rocksdb_transaction_begin(Handle, _wo.Handle, o, IntPtr.Zero);
+        }
         finally { N.rocksdb_transaction_options_destroy(o); }
+    }
+
+    public static void Merge(IntPtr txn, string k, string v)
+    {
+        byte[] kb = Encoding.UTF8.GetBytes(k), vb = Encoding.UTF8.GetBytes(v);
+        N.rocksdb_transaction_merge(txn, kb, (UIntPtr)kb.Length, vb, (UIntPtr)vb.Length);
+    }
+
+    /// <summary>rocksdb_transaction_get: the transaction's view of the key.</summary>
+    public string? TxnGet(IntPtr txn, string k)
+    {
+        byte[] kb = Encoding.UTF8.GetBytes(k);
+        IntPtr v = N.rocksdb_transaction_get(txn, _ro.Handle, kb, (UIntPtr)kb.Length, out UIntPtr vlen);
+        if (v == IntPtr.Zero) return null;
+        try { return Marshal.PtrToStringUTF8(v, (int)vlen); }
+        finally { N.rocksdb_free(v); }
     }
 
     public static void SetName(IntPtr txn, string name)

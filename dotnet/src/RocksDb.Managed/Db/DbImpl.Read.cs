@@ -33,12 +33,18 @@ internal sealed partial class DbImpl
     /// </summary>
     public void Get(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, GetContext ctx)
     {
+        if (_txnHooks is not null && ctx.Callback is null)
+        {
+            GetWithTxnHooks(cfd, options, key, ctx);
+            return;
+        }
         // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
         // in between could drop the versions visible at that sequence (no snapshot protects them).
         ValidateReadSnapshot(options);
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         TestHooks.Invoke("DBImpl::GetImpl:AfterSuperVersion");
         ulong snapshot = ReadSequence(options);
+        if (ctx.Callback is { } cb) snapshot = ApplyReadCallback(cb, options, snapshot);
         try
         {
             GetWithSuperVersion(cfd, sv, snapshot, options, key, ctx);
@@ -46,6 +52,111 @@ internal sealed partial class DbImpl
         finally
         {
             ReturnSuperVersion(sv);
+        }
+    }
+
+    /// <summary>
+    /// DBImpl::GetImpl with a read callback: with a snapshot the read sequence is the larger of the snapshot and the
+    /// callback's max visible sequence (WriteUnprepared reads its own newer writes); without one the callback is
+    /// refreshed with the latest sequence.
+    /// </summary>
+    private static ulong ApplyReadCallback(ReadCallback cb, ReadOptions? options, ulong snapshot)
+    {
+        if (options?.Snapshot is not null) return Math.Max(snapshot, cb.MaxVisibleSeq);
+        cb.Refresh(snapshot);
+        return snapshot;
+    }
+
+    /// <summary>
+    /// A point read of a WritePrepared / WriteUnprepared DB through the plain API (WritePreparedTxnDB::GetImpl): the
+    /// read uses the transaction DB's read callback and fails with TryAgain when its snapshot could not be validated.
+    /// </summary>
+    private void GetWithTxnHooks(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, GetContext ctx)
+    {
+        SeqPerBatchHooks hooks = _txnHooks!;
+        ReadCallback cb = hooks.BeginRead(options?.Snapshot);
+        ctx.Callback = cb;
+        try
+        {
+            Get(cfd, options, key, ctx);
+        }
+        catch
+        {
+            ctx.Callback = null;
+            hooks.EndRead(cb, validate: false);
+            throw;
+        }
+        ctx.Callback = null;
+        hooks.EndRead(cb, validate: true);
+    }
+
+    /// <summary>Async <see cref="GetWithTxnHooks"/>; <paramref name="key"/> must stay valid until completion.</summary>
+    private async ValueTask GetWithTxnHooksAsync(ColumnFamilyData cfd, ReadOptions? options, ReadOnlyMemory<byte> key, GetContext ctx,
+        CancellationToken cancellationToken)
+    {
+        SeqPerBatchHooks hooks = _txnHooks!;
+        ReadCallback cb = hooks.BeginRead(options?.Snapshot);
+        ctx.Callback = cb;
+        try
+        {
+            await GetWithTimestampAsync(cfd, options, key, ctx, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            ctx.Callback = null;
+            hooks.EndRead(cb, validate: false);
+            throw;
+        }
+        ctx.Callback = null;
+        hooks.EndRead(cb, validate: true);
+    }
+
+    /// <summary>
+    /// DBImpl::GetImpl with an explicit read callback (WritePrepared / WriteUnprepared transactions): the resolved value
+    /// is written to <paramref name="value"/>; returns false if the key does not exist.
+    /// </summary>
+    internal bool GetWithCallback(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, ReadCallback callback, System.Buffers.IBufferWriter<byte> value)
+    {
+        ThrowIfDisposed();
+        GetContext ctx = GetContext.Rent(cfd.MergeOperator);
+        try
+        {
+            ctx.Callback = callback;
+            Get(cfd, options, key, ctx);
+            if (!ctx.TryResolve(key, out ReadOnlySpan<byte> result)) return false;
+            System.Buffers.BuffersExtensions.Write(value, result);
+            return true;
+        }
+        finally
+        {
+            GetContext.Return(ctx);
+        }
+    }
+
+    /// <summary>An iterator reading through <paramref name="callback"/> up to <paramref name="sequence"/> (NewIteratorImpl with a read callback).</summary>
+    internal Iterator NewIteratorWithCallback(ColumnFamilyData cfd, ReadOptions? options, ReadCallback callback, ulong sequence, Snapshot? ownedSnapshot)
+    {
+        ThrowIfDisposed();
+        DbIteratorSources sources;
+        try
+        {
+            sources = NewIteratorSources(cfd, options, callback, sequence, ownedSnapshot);
+        }
+        catch
+        {
+            ownedSnapshot?.Dispose();
+            throw;
+        }
+        try
+        {
+            Iterator it = DbIteratorFactory.Create(sources);
+            it.Statistics = Stats;
+            return it;
+        }
+        catch
+        {
+            sources.Cleanup?.Dispose();
+            throw;
         }
     }
 
@@ -86,12 +197,13 @@ internal sealed partial class DbImpl
     private static bool GetFromMemTables(SuperVersion sv, scoped in LookupKey lkey, GetContext ctx)
     {
         GetContext? tsSink = ctx.TimestampSize != 0 ? ctx : null;
-        MemTableGetResult r = sv.Mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink);
+        ReadCallback? cb = ctx.Callback;
+        MemTableGetResult r = sv.Mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb);
         if (ctx.ApplyMemTableResult(r, v, t)) return true;
         MemTable[] imm = sv.Imm;
         for (int i = 0; i < imm.Length; i++)
         {
-            r = imm[i].Get(lkey, out v, out t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink);
+            r = imm[i].Get(lkey, out v, out t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb);
             if (ctx.ApplyMemTableResult(r, v, t)) return true;
         }
         return false;
@@ -171,8 +283,14 @@ internal sealed partial class DbImpl
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     public async ValueTask GetAsync(ColumnFamilyData cfd, ReadOptions? options, ReadOnlyMemory<byte> key, GetContext ctx, CancellationToken cancellationToken)
     {
-        if (cfd.TimestampSize != 0)
+        if (_txnHooks is not null && ctx.Callback is null)
         {
+            await GetWithTxnHooksAsync(cfd, options, key, ctx, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+        if (cfd.TimestampSize != 0 || ctx.Callback is not null)
+        {
+            // Timestamps and read callbacks visit every version of the key (the visitor path).
             await GetWithTimestampAsync(cfd, options, key, ctx, cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -243,6 +361,7 @@ internal sealed partial class DbImpl
         ValidateReadSnapshot(options);
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         ulong snapshot = ReadSequence(options);
+        if (ctx.Callback is { } cb) snapshot = ApplyReadCallback(cb, options, snapshot);
         try
         {
             await GetWithSuperVersionAsync(cfd, sv, snapshot, options, key, ctx, cancellationToken).ConfigureAwait(false);
@@ -426,11 +545,41 @@ internal sealed partial class DbImpl
     /// </summary>
     public DbIteratorSources NewIteratorSources(ColumnFamilyData cfd, ReadOptions? options)
     {
+        if (_txnHooks is { } hooks)
+        {
+            // WritePreparedTxnDB::NewIterator: the iterator reads at a snapshot (its own when none is given, released
+            // with the iterator) through a read callback backed by that snapshot.
+            Snapshot? own = options?.Snapshot is null ? hooks.GetSnapshot() : null;
+            Snapshot snap = options?.Snapshot ?? own!;
+            try
+            {
+                return NewIteratorSources(cfd, options, hooks.NewIteratorCallback(snap), snap.SequenceNumber, own);
+            }
+            catch
+            {
+                own?.Dispose();
+                throw;
+            }
+        }
+        return NewIteratorSources(cfd, options, null, DbFormat.MaxSequenceNumber, null);
+    }
+
+    /// <summary>
+    /// DBImpl::NewIteratorImpl with a read callback: <paramref name="sequence"/> is the largest visible sequence
+    /// (<see cref="DbFormat.MaxSequenceNumber"/> = the snapshot's or the latest); <paramref name="ownedSnapshot"/> is
+    /// released with the iterator.
+    /// </summary>
+    internal DbIteratorSources NewIteratorSources(ColumnFamilyData cfd, ReadOptions? options, ReadCallback? callback, ulong sequence, Snapshot? ownedSnapshot)
+    {
         // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
         // in between could drop the versions visible at that sequence (no snapshot protects them).
         ValidateReadSnapshot(options);
         SuperVersion sv = GetReferencedSuperVersion(cfd);
-        ulong sequence = ReadSequence(options);
+        if (sequence == DbFormat.MaxSequenceNumber)
+        {
+            sequence = ReadSequence(options);
+            if (callback is not null) sequence = ApplyReadCallback(callback, options, sequence);
+        }
         try
         {
             GetReadTimestamp(cfd, options);
@@ -460,18 +609,26 @@ internal sealed partial class DbImpl
             BlobSource = cfd.BlobSource,
             BlobVersion = s,
             PrefixExtractor = cfd.Options.PrefixExtractor,
-            Cleanup = new SuperVersionRelease(this, sv),
+            ReadCallback = callback,
+            Cleanup = new SuperVersionRelease(this, sv, ownedSnapshot),
         };
     }
 
-    /// <summary>Releases an iterator's super version reference (CleanupSuperVersionHandle).</summary>
-    private sealed class SuperVersionRelease(DbImpl db, SuperVersion sv) : IDisposable
+    /// <summary>
+    /// Releases an iterator's super version reference (CleanupSuperVersionHandle) and the snapshot it owns
+    /// (WritePreparedTxnDB::IteratorState).
+    /// </summary>
+    private sealed class SuperVersionRelease(DbImpl db, SuperVersion sv, Snapshot? ownedSnapshot) : IDisposable
     {
         private int _done;
 
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _done, 1) == 0) db.ReturnSuperVersion(sv);
+            if (Interlocked.Exchange(ref _done, 1) == 0)
+            {
+                db.ReturnSuperVersion(sv);
+                ownedSnapshot?.Dispose();
+            }
         }
     }
 }

@@ -178,8 +178,20 @@ public abstract class Transaction : IDisposable
     private void Write(WriteOp op, ColumnFamilyData cfd, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool untracked)
     {
         ThrowIfDisposed();
+        BeforeWrite();
         ThrowIfError(WaitSync(TryLock(cfd, key, readOnly: false, exclusive: true, doValidate: !untracked, synchronous: true, CancellationToken.None)));
         Apply(op, cfd, key, value);
+        AfterWrite();
+    }
+
+    /// <summary>Called before a write locks its key (WriteUnpreparedTxn::HandleWrite flushes a large batch to the DB).</summary>
+    private protected virtual void BeforeWrite()
+    {
+    }
+
+    /// <summary>Called after a successful write (WriteUnpreparedTxn::HandleWrite tracks the largest validated sequence).</summary>
+    private protected virtual void AfterWrite()
+    {
     }
 
     private ValueTask WriteAsync(WriteOp op, ColumnFamilyData cfd, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, CancellationToken cancellationToken) =>
@@ -192,11 +204,13 @@ public abstract class Transaction : IDisposable
     private ValueTask WriteAsync(WriteOp op, ColumnFamilyData cfd, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, bool untracked, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        BeforeWrite();
         ValueTask<RocksDbException?> t = TryLock(cfd, key.Span, readOnly: false, exclusive: true, doValidate: !untracked, synchronous: false, cancellationToken);
         if (t.IsCompletedSuccessfully)
         {
             ThrowIfError(t.Result);
             Apply(op, cfd, key.Span, value.Span);
+            AfterWrite();
             return default;
         }
         return CompleteWriteAsync(t, op, cfd, key, value);
@@ -206,6 +220,7 @@ public abstract class Transaction : IDisposable
     {
         ThrowIfError(await t.ConfigureAwait(false));
         Apply(op, cfd, key.Span, value.Span);
+        AfterWrite();
     }
 
     private void Apply(WriteOp op, ColumnFamilyData cfd, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
@@ -424,7 +439,7 @@ public abstract class Transaction : IDisposable
         ColumnFamilyData cfd = Cfd(columnFamily);
         SetSnapshotIfNeeded();
         ColumnFamily handle = columnFamily ?? _database.DefaultColumnFamily;
-        return new TransactionIterator(handle.NewIterator(options), _batch, cfd, options);
+        return new TransactionIterator(NewDbIterator(handle, cfd, options), _batch, cfd, options);
     }
 
     private bool GetFromBatchAndDb(ReadOptions? options, ColumnFamilyData cfd, ReadOnlySpan<byte> key, IBufferWriter<byte> value)
@@ -442,7 +457,7 @@ public abstract class Transaction : IDisposable
                 PooledBufferWriter scratch = ObjectPools.RentWriter();
                 try
                 {
-                    bool has = ColumnFamilyHandle(cfd).TryGet(options, key, scratch);
+                    bool has = GetFromDb(options, cfd, key, scratch);
                     return _batch.ComputeValue(idx, cfd.MergeOperator, has, scratch.WrittenSpan, value);
                 }
                 finally
@@ -451,9 +466,24 @@ public abstract class Transaction : IDisposable
                 }
             }
             default:
-                return ColumnFamilyHandle(cfd).TryGet(options, key, value);
+                return GetFromDb(options, cfd, key, value);
         }
     }
+
+    /// <summary>
+    /// The DB part of GetFromBatchAndDB. WriteUnprepared transactions read with a read callback that also sees their
+    /// own unprepared writes.
+    /// </summary>
+    private protected virtual bool GetFromDb(ReadOptions? options, ColumnFamilyData cfd, ReadOnlySpan<byte> key, IBufferWriter<byte> value) =>
+        ColumnFamilyHandle(cfd).TryGet(options, key, value);
+
+    /// <summary>Async <see cref="GetFromDb"/>.</summary>
+    private protected virtual ValueTask<bool> GetFromDbAsync(ReadOptions? options, ColumnFamilyData cfd, ReadOnlyMemory<byte> key, IBufferWriter<byte> value,
+        CancellationToken cancellationToken) =>
+        ColumnFamilyHandle(cfd).TryGetAsync(options, key, value, cancellationToken);
+
+    /// <summary>The DB iterator of <see cref="NewIterator(ColumnFamily, ReadOptions?)"/> (GetIterator's db_iter).</summary>
+    private protected virtual Iterator NewDbIterator(ColumnFamily handle, ColumnFamilyData cfd, ReadOptions? options) => handle.NewIterator(options);
 
     /// <summary>WriteBatchWithIndex::GetFromBatchAndDB: reads of a column family with timestamps need a read timestamp.</summary>
     private static void RequireReadTimestamp(ReadOptions? options, ColumnFamilyData cfd)
@@ -475,7 +505,7 @@ public abstract class Transaction : IDisposable
             case BatchLookupResult.MergeInProgress:
                 return MergeWithDbAsync(options, cfd, key, value, cancellationToken);
             default:
-                return ColumnFamilyHandle(cfd).TryGetAsync(options, key, value, cancellationToken);
+                return GetFromDbAsync(options, cfd, key, value, cancellationToken);
         }
     }
 
@@ -485,7 +515,7 @@ public abstract class Transaction : IDisposable
         PooledBufferWriter scratch = ObjectPools.RentWriter();
         try
         {
-            bool has = await ColumnFamilyHandle(cfd).TryGetAsync(options, key, scratch, cancellationToken).ConfigureAwait(false);
+            bool has = await GetFromDbAsync(options, cfd, key, scratch, cancellationToken).ConfigureAwait(false);
             // Re-resolve: the batch is not modified concurrently (transactions are single-flow), but the index may move.
             int idx = _batch.Find(cfd.Id, key.Span);
             if (idx < 0) return has && Copy(scratch.WrittenSpan, value);
@@ -510,7 +540,7 @@ public abstract class Transaction : IDisposable
     // =====================================================================================================
 
     /// <summary>Records the current state; <see cref="RollbackToSavePoint"/> undoes everything done after it (SetSavePoint).</summary>
-    public void SetSavePoint()
+    public virtual void SetSavePoint()
     {
         ThrowIfDisposed();
         (_savePoints ??= new List<SavePoint>()).Add(new SavePoint { Snapshot = _snapshot, SnapshotNeeded = _snapshotNeeded });
@@ -541,8 +571,14 @@ public abstract class Transaction : IDisposable
         return true;
     }
 
+    /// <summary>Number of save points (save_points_ size).</summary>
+    private protected int SavePointCount => _savePoints?.Count ?? 0;
+
+    /// <summary>The keys tracked since the most recent save point (save_points_->top().new_locks_). REQUIRES: a save point.</summary>
+    private protected LockTracker TopSavePointLocks => _savePoints![^1].NewLocks;
+
     /// <summary>Removes the most recent save point without rolling back (PopSavePoint). Returns false if there is none.</summary>
-    public bool PopSavePoint()
+    public virtual bool PopSavePoint()
     {
         ThrowIfDisposed();
         if (_savePoints is not { Count: > 0 } sps) return false;

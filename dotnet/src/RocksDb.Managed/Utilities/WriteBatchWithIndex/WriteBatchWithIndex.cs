@@ -161,6 +161,8 @@ public sealed class WriteBatchWithIndex : IDisposable
         _batch.Clear();
         if (_withNoop) _batch.InsertNoop();
         _index.Clear();
+        _lastSubBatchOffset = 0;
+        _subBatchCount = 1;
         _hasKeyWithTimestamp = false;
     }
 
@@ -210,7 +212,7 @@ public sealed class WriteBatchWithIndex : IDisposable
         // MakeEntry: the index holds the user key without its timestamp.
         int tsSize = TimestampSizeOf(cf);
         if (tsSize > 0 && keySize >= tsSize) keySize -= tsSize;
-        if (OverwriteKey && type != WriteType.Merge)
+        if (OverwriteKey)
         {
             ReadOnlySpan<byte> key = _batch.Data.Slice(keyOffset, keySize);
             // Seek() finds the first entry with key == `key`: the most recent update.
@@ -218,12 +220,32 @@ public sealed class WriteBatchWithIndex : IDisposable
             if (node >= 0 && _index.ColumnFamily(node) == cf &&
                 _index.GetComparator(cf).CompareWithoutTimestamp(_index.Key(node), false, key, false) == 0)
             {
-                _index.UpdateOffset(node, recordOffset);
-                return;
+                // A sub-batch starts right before inserting a key that is a duplicate of a key in the last sub-batch.
+                if (_lastSubBatchOffset <= _index.RecordOffset(node))
+                {
+                    _lastSubBatchOffset = recordOffset;
+                    _subBatchCount++;
+                }
+                if (type != WriteType.Merge)
+                {
+                    _index.UpdateOffset(node, recordOffset);
+                    return;
+                }
             }
         }
         _index.Insert(cf, recordOffset, keyOffset, keySize);
     }
+
+    // Rep::last_sub_batch_offset / sub_batch_cnt: the starting offset of the last sub-batch (0 = no duplicate key so far)
+    // and the number of sub-batches (overwrite_key mode only).
+    private int _lastSubBatchOffset;
+    private int _subBatchCount = 1;
+
+    /// <summary>
+    /// SubBatchCnt: the number of sub-batches of the batch (a new one starts at each key that repeats a key of the
+    /// current sub-batch). WritePrepared / WriteUnprepared transactions consume one sequence number per sub-batch.
+    /// </summary>
+    internal int SubBatchCount => _subBatchCount;
 
     /// <summary>ReadKeyFromWriteBatchEntry: the position of the key of the record at <paramref name="offset"/>.</summary>
     private static void DecodeKeyPosition(ReadOnlySpan<byte> rep, int offset, out int keyOffset, out int keySize)
@@ -245,6 +267,8 @@ public sealed class WriteBatchWithIndex : IDisposable
     private void RebuildIndex()
     {
         _index.Clear();
+        _lastSubBatchOffset = 0;
+        _subBatchCount = 1;
         ReadOnlySpan<byte> rep = _batch.Data;
         int pos = WriteBatch.HeaderSize;
         while (pos < rep.Length)

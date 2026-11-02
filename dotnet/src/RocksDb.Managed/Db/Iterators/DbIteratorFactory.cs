@@ -46,6 +46,9 @@ public sealed class DbIteratorSources
     /// <summary>Disposed when the iterator is disposed, after its internal iterators (e.g. unrefs the super version).</summary>
     public IDisposable? Cleanup { get; init; }
 
+    /// <summary>Read callback of a WritePrepared / WriteUnprepared read (DBIter's read_callback_), or null.</summary>
+    internal ReadCallback? ReadCallback { get; init; }
+
     /// <summary>Reads the blobs of blob-index entries (the column family's blob source); null = blob values are NotSupported.</summary>
     internal Blob.BlobSource? BlobSource { get; init; }
 
@@ -107,6 +110,7 @@ public static class DbIteratorFactory
     {
         var it = new DbIter(sources.Comparator, internalIter, sources.Sequence, sources.ReadOptions, sources.MergeOperator, rangeDel,
             sources.MaxSequentialSkipInIterations, sources.Cleanup, sources.PrefixExtractor);
+        if (sources.ReadCallback is { } cb) it.SetReadCallback(cb);
         if (sources.BlobSource is not null && sources.BlobVersion is not null) it.SetBlobSource(sources.BlobSource, sources.BlobVersion);
         return it;
     }

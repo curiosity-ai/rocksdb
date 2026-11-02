@@ -44,6 +44,12 @@ internal sealed class IndexedWriteBatch : IDisposable
 
     public int Count => _wbwi.Count;
 
+    /// <summary>WriteBatchWithIndex::SubBatchCnt.</summary>
+    public int SubBatchCount => _wbwi.SubBatchCount;
+
+    /// <summary>Bytes in the batch rep (GetDataSize).</summary>
+    public int DataSize => _wbwi.DataSize;
+
     private void Register(uint cf)
     {
         if (cf < 64 && (_registered & (1UL << (int)cf)) != 0) return;

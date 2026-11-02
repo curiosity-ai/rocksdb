@@ -26,6 +26,12 @@ namespace RocksDb.Managed
         /// <summary>The sequence number this snapshot reads at.</summary>
         public ulong SequenceNumber { get; }
 
+        /// <summary>
+        /// SnapshotImpl::min_uncommitted_ (WritePrepared / WriteUnprepared transactions): every sequence number below it
+        /// is committed. <see cref="ReadCallback.MinUnCommittedSeq"/> by default.
+        /// </summary>
+        internal ulong MinUncommitted = ReadCallback.MinUnCommittedSeq;
+
         /// <summary>Creation time (Unix seconds).</summary>
         public long UnixTime { get; }
 

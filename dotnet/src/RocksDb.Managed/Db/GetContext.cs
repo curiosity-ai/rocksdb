@@ -59,6 +59,11 @@ internal sealed class GetContext
     public ulong ReadSequence = DbFormat.MaxSequenceNumber;
     public MergeOperator? MergeOperator;
     /// <summary>
+    /// Read callback (GetContext::callback_, WritePrepared / WriteUnprepared transactions): entries it reports as
+    /// invisible are skipped (CheckCallback). Null for plain reads.
+    /// </summary>
+    public ReadCallback? Callback;
+    /// <summary>
     /// User-defined timestamp size of the column family being read (0 = timestamps disabled). When non-zero, the
     /// timestamp of the first (newest visible) entry matched is captured (GetContext::SaveValue, timestamp_).
     /// </summary>
@@ -118,6 +123,7 @@ internal sealed class GetContext
         MaxCoveringTombstoneSeq = 0;
         ReadSequence = DbFormat.MaxSequenceNumber;
         MergeOperator = mergeOperator;
+        Callback = null;
         TimestampSize = 0;
         HasTimestamp = false;
         _tsFromRangeTombstone = false;
@@ -131,6 +137,7 @@ internal sealed class GetContext
     public bool SaveValue(ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value)
     {
         DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(internalKey), out ulong seq, out EntryType type);
+        if (Callback is { } cb && !cb.IsVisible(seq)) return true; // CheckCallback: continue to the next (older) entry
         if (TimestampSize != 0)
         {
             if (seq > ReadSequence) return true; // not in the read snapshot: continue to the next entry
@@ -425,6 +432,7 @@ internal sealed class GetContext
     public static void Return(GetContext c)
     {
         c.MergeOperator = null;
+        c.Callback = null;
         if (c.Value.Capacity > 1 << 20 || c.MergeContext.Count > 64)
         {
             return; // let oversized contexts go

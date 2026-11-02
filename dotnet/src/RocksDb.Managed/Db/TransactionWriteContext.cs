@@ -41,6 +41,15 @@ internal sealed class TransactionWriteContext
     /// <summary>Records the WAL that received the record as containing an outstanding prepared section.</summary>
     public bool MarkLogContainingPrepSection;
 
+    /// <summary>
+    /// batch_cnt of DBImpl::WriteImpl: the number of sub-batches (sequence numbers) the write consumes in a
+    /// sequence-per-batch DB (WritePrepared / WriteUnprepared). 0 = not given (the write is not from a transaction).
+    /// </summary>
+    public int BatchCount;
+
+    /// <summary>Run after the WAL write and before the memtable insert / sequence publication (pre_release_callback).</summary>
+    public IPreReleaseCallback? PreRelease;
+
     /// <summary>Output: the WAL number the record was written to (log_used).</summary>
     public ulong LogUsed;
 
@@ -56,5 +65,7 @@ internal sealed class TransactionWriteContext
         MarkLogContainingPrepSection = false;
         LogUsed = 0;
         SequenceUsed = 0;
+        BatchCount = 0;
+        PreRelease = null;
     }
 }

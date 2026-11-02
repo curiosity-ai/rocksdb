@@ -730,6 +730,75 @@ public sealed class WriteBatch : IDisposable
         IterateRecords(rep[HeaderSize..], wholeBatch: true, Coding.DecodeFixed32(rep[8..]), ref handler);
     }
 
+    /// <summary>
+    /// The 2PC marker types a handler accepts (WriteBatch::Handler::WriteAfterCommit / WriteBeforePrepare option
+    /// states). <see cref="TxnMarkerPolicy.Any"/> = kUnknown (no check).
+    /// </summary>
+    internal enum TxnMarkerPolicy : byte
+    {
+        Any = 0,
+        /// <summary>write_after_commit enabled, write_before_prepare disabled (WriteCommitted / plain DB).</summary>
+        WriteCommitted = 1,
+        /// <summary>write_after_commit and write_before_prepare disabled (WritePrepared).</summary>
+        WritePrepared = 2,
+        /// <summary>write_after_commit disabled, write_before_prepare enabled (WriteUnprepared).</summary>
+        WriteUnprepared = 3,
+    }
+
+    /// <summary>
+    /// <see cref="Iterate{THandler}(ReadOnlySpan{byte}, ref THandler)"/> that refuses begin-prepare markers of another
+    /// write policy with NotSupported, like WriteBatchInternal::Iterate for a handler with known option states (the
+    /// memtable inserter of a DB opened with a given write policy).
+    /// </summary>
+    internal static void Iterate<THandler>(ReadOnlySpan<byte> rep, ref THandler handler, TxnMarkerPolicy policy) where THandler : IWriteBatchHandler
+    {
+        if (rep.Length < HeaderSize) ThrowHelper.Corruption("malformed WriteBatch (too small)");
+        IterateRecords(rep[HeaderSize..], wholeBatch: true, Coding.DecodeFixed32(rep[8..]), ref handler, policy);
+    }
+
+    /// <summary>The NotSupported status of WriteBatchInternal::Iterate for a begin-prepare marker the handler's policy refuses, or null.</summary>
+    private static string? CheckBeginPrepareMarker(EntryType type, TxnMarkerPolicy policy)
+    {
+        bool writeAfterCommit = policy == TxnMarkerPolicy.WriteCommitted;
+        bool writeBeforePrepare = policy == TxnMarkerPolicy.WriteUnprepared;
+        string? s = null;
+        switch (type)
+        {
+            case EntryType.BeginPrepareXID:
+                if (!writeAfterCommit)
+                {
+                    s = "WriteCommitted txn tag when write_after_commit_ is disabled (in WritePrepared/WriteUnprepared mode). If it is not due to "
+                        + "corruption, the WAL must be emptied before changing the WritePolicy.";
+                }
+                if (writeBeforePrepare)
+                {
+                    s = "WriteCommitted txn tag when write_before_prepare_ is enabled (in WriteUnprepared mode). If it is not due to corruption, the "
+                        + "WAL must be emptied before changing the WritePolicy.";
+                }
+                break;
+            case EntryType.BeginPersistedPrepareXID:
+                if (writeAfterCommit)
+                {
+                    s = "WritePrepared/WriteUnprepared txn tag when write_after_commit_ is enabled (in default WriteCommitted mode). If it is not due "
+                        + "to corruption, the WAL must be emptied before changing the WritePolicy.";
+                }
+                break;
+            case EntryType.BeginUnprepareXID:
+                if (writeAfterCommit)
+                {
+                    s = "WriteUnprepared txn tag when write_after_commit_ is enabled (in default WriteCommitted mode). If it is not due to corruption, "
+                        + "the WAL must be emptied before changing the WritePolicy.";
+                }
+                if (!writeBeforePrepare)
+                {
+                    s = "WriteUnprepared txn tag when write_before_prepare_ is disabled (in WriteCommitted/WritePrepared mode). If it is not due to "
+                        + "corruption, the WAL must be emptied before changing the WritePolicy.";
+                }
+                break;
+        }
+        return s;
+    }
+
     /// <summary>Iterates a sub-range [<paramref name="begin"/>, <paramref name="end"/>) of the rep without count validation.</summary>
     internal void Iterate<THandler>(int begin, int end, ref THandler handler) where THandler : IWriteBatchHandler
     {
@@ -740,6 +809,10 @@ public sealed class WriteBatch : IDisposable
     }
 
     private static void IterateRecords<THandler>(ReadOnlySpan<byte> input, bool wholeBatch, uint count, ref THandler handler)
+        where THandler : IWriteBatchHandler =>
+        IterateRecords(input, wholeBatch, count, ref handler, TxnMarkerPolicy.Any);
+
+    private static void IterateRecords<THandler>(ReadOnlySpan<byte> input, bool wholeBatch, uint count, ref THandler handler, TxnMarkerPolicy policy)
         where THandler : IWriteBatchHandler
     {
         // Sometimes a sub-batch starts with a Noop. We want to exclude such Noops as the batch boundary symbols
@@ -796,10 +869,12 @@ public sealed class WriteBatch : IDisposable
                     break;
                 case EntryType.BeginPrepareXID:
                 case EntryType.BeginPersistedPrepareXID:
+                    if (policy != TxnMarkerPolicy.Any && CheckBeginPrepareMarker(e.Type, policy) is { } bad) ThrowHelper.NotSupported(bad);
                     handler.MarkBeginPrepare(false);
                     emptyBatch = false;
                     break;
                 case EntryType.BeginUnprepareXID:
+                    if (policy != TxnMarkerPolicy.Any && CheckBeginPrepareMarker(e.Type, policy) is { } badU) ThrowHelper.NotSupported(badU);
                     handler.MarkBeginPrepare(true);
                     emptyBatch = false;
                     break;

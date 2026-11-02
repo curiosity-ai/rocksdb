@@ -301,7 +301,13 @@ public sealed unsafe class MemTable : IDisposable
     /// <param name="timestampSink">When non-null with a non-zero <see cref="GetContext.TimestampSize"/>, receives the
     /// timestamp of the first entry of the key that is matched (SaveValue, s->timestamp).</param>
     internal MemTableGetResult Get(scoped in LookupKey key, out ReadOnlySpan<byte> value, out EntryType valueType, out ulong sequence,
-        MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq, GetContext? timestampSink)
+        MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq, GetContext? timestampSink) =>
+        Get(key, out value, out valueType, out sequence, mergeContext, ref maxCoveringTombstoneSeq, timestampSink, null);
+
+    /// <inheritdoc cref="Get(in LookupKey, out ReadOnlySpan{byte}, out EntryType, out ulong, MergeContext?, ref ulong)"/>
+    /// <param name="callback">Read callback (SaveValue's CheckCallback): entries it reports as invisible are skipped.</param>
+    internal MemTableGetResult Get(scoped in LookupKey key, out ReadOnlySpan<byte> value, out EntryType valueType, out ulong sequence,
+        MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq, GetContext? timestampSink, ReadCallback? callback)
     {
         value = default;
         valueType = EntryType.Value;
@@ -343,6 +349,7 @@ public sealed unsafe class MemTable : IDisposable
 
             ulong tag = Coding.DecodeFixed64(new ReadOnlySpan<byte>(ek.Ptr + userKeyLen, DbFormat.InternalKeyFooterSize));
             ulong seq = tag >> 8;
+            if (callback is not null && !callback.IsVisible(seq)) continue; // CheckCallback: to continue to the next seq
             // With user-defined timestamps older timestamps sort after the lookup key whatever their seqno: entries
             // newer than the read snapshot are skipped (native returns NotFound for keys written after the snapshot).
             if (tsSize != 0 && seq > lookupSeq) continue;

@@ -33,8 +33,11 @@ internal struct CompactionIterationStats
 /// full_history_ts_low, in which case the older ones may be collapsed (rule A) and their sequence number and timestamp
 /// zeroed at the bottommost level.
 /// Blob files (integrated BlobDB): see <see cref="BlobProcessor"/> (extraction and garbage collection of values and entity
-/// columns, blob values for the compaction filter and merges). Wide-column entities reach the compaction filter's FilterV3. Not ported:
-/// snapshot checkers (write-prepared transactions), range-tombstone sentinel keys (range tombstones are handled by the <see cref="RangeDelAggregator"/>
+/// columns, blob values for the compaction filter and merges). Wide-column entities reach the compaction filter's FilterV3.
+/// Snapshot checkers (WritePrepared / WriteUnprepared transactions): keys not committed in the job snapshot are output as
+/// they are (KeyCommitted) and snapshot visibility is decided by the checker (DefinitelyInSnapshot /
+/// findEarliestVisibleSnapshot with released snapshots). Not ported: range-tombstone sentinel keys (range tombstones are
+/// handled by the <see cref="RangeDelAggregator"/>
 /// and written by the compaction job). Allocation-free per key: the current key lives in an <see cref="IterKey"/>
 /// and values are spans into the input, the merge helper or the filter output.
 /// </para>
@@ -99,6 +102,18 @@ internal sealed class CompactionIterator : IDisposable
     private readonly byte[]? _currTs;
     private bool _hasCurrTs;
     private int _cmpWithHistoryTsLow;
+
+    /// <summary>snapshot_checker_: decides visibility of possibly uncommitted data (null: everything is committed).</summary>
+    internal SnapshotChecker? SnapshotChecker { get; init; }
+
+    /// <summary>job_snapshot_: the snapshot taken for the job when there is a snapshot checker.</summary>
+    internal ulong JobSnapshot { get; init; }
+
+    /// <summary>current_key_committed_: whether the current version of the user key is committed in the job snapshot.</summary>
+    private bool _currentKeyCommitted;
+
+    /// <summary>released_snapshots_: snapshots the checker reported as released.</summary>
+    private HashSet<ulong>? _releasedSnapshots;
 
     /// <summary>full_history_ts_low of the compaction (null: all timestamp history is preserved).</summary>
     public byte[]? FullHistoryTsLow { get; init; }
@@ -237,15 +252,24 @@ internal sealed class CompactionIterator : IDisposable
         _valueSource = ValueSource.Merge;
     }
 
+    /// <summary>DataIsDefinitelyInSnapshot (utilities/transactions/snapshot_checker.cc).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool DefinitelyInSnapshot(ulong seq, ulong snapshot) => seq <= snapshot;
+    private bool DefinitelyInSnapshot(ulong seq, ulong snapshot) =>
+        seq <= snapshot && (SnapshotChecker is null || SnapshotChecker.CheckInSnapshot(seq, snapshot) == SnapshotCheckerResult.InSnapshot);
 
+    /// <summary>DataIsDefinitelyNotInSnapshot.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool DefinitelyNotInSnapshot(ulong seq, ulong snapshot) => seq > snapshot;
+    private bool DefinitelyNotInSnapshot(ulong seq, ulong snapshot) =>
+        seq > snapshot || (SnapshotChecker is not null && SnapshotChecker.CheckInSnapshot(seq, snapshot) == SnapshotCheckerResult.NotInSnapshot);
+
+    /// <summary>KeyCommitted: committed in the job snapshot.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool KeyCommitted(ulong seq) => SnapshotChecker is null || SnapshotChecker.CheckInSnapshot(seq, JobSnapshot) == SnapshotCheckerResult.InSnapshot;
 
     /// <summary>Port of findEarliestVisibleSnapshot: the earliest snapshot that can see <paramref name="seq"/>.</summary>
     private ulong FindEarliestVisibleSnapshot(ulong seq, out ulong prevSnapshot)
     {
+        if (SnapshotChecker is not null) return FindEarliestVisibleSnapshotWithChecker(seq, out prevSnapshot);
         ulong[] s = _snapshots;
         int lo = 0, hi = s.Length;
         while (lo < hi)
@@ -256,6 +280,31 @@ internal sealed class CompactionIterator : IDisposable
         }
         prevSnapshot = lo == 0 ? 0 : s[lo - 1];
         return lo < s.Length ? s[lo] : DbFormat.MaxSequenceNumber;
+    }
+
+    /// <summary>findEarliestVisibleSnapshot with a snapshot checker: the first snapshot the checker places the sequence in.</summary>
+    private ulong FindEarliestVisibleSnapshotWithChecker(ulong seq, out ulong prevSnapshot)
+    {
+        ulong[] s = _snapshots;
+        int lo = 0, hi = s.Length;
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >>> 1;
+            if (s[mid] < seq) lo = mid + 1;
+            else hi = mid;
+        }
+        prevSnapshot = lo == 0 ? 0 : s[lo - 1];
+        for (; lo < s.Length; lo++)
+        {
+            ulong cur = s[lo];
+            // Skip if cur is in released_snapshots.
+            if (_releasedSnapshots is { } released && released.Contains(cur)) continue;
+            SnapshotCheckerResult res = SnapshotChecker!.CheckInSnapshot(seq, cur);
+            if (res == SnapshotCheckerResult.InSnapshot) return cur;
+            if (res == SnapshotCheckerResult.SnapshotReleased) (_releasedSnapshots ??= new HashSet<ulong>()).Add(cur);
+            prevSnapshot = cur;
+        }
+        return DbFormat.MaxSequenceNumber;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -463,13 +512,29 @@ internal sealed class CompactionIterator : IDisposable
                 }
                 _hasOutputtedKey = false;
                 _lastKeySeqZeroed = false;
+                _currentKeyCommitted = KeyCommitted(_ikeySequence);
                 // Apply the compaction filter to the first committed version of the user key.
-                InvokeFilterIfNeeded(ref needSkip);
+                if (_currentKeyCommitted) InvokeFilterIfNeeded(ref needSkip);
             }
             else
             {
                 // Update the current key to reflect the new sequence number/type without copying the user key.
                 _currentKey.UpdateInternalKey(_ikeySequence, _ikeyType);
+                // Note that newer version of a key is ordered before older versions. If a newer version of a key is
+                // committed, so as the older version. No need to query snapshot_checker_ in that case.
+                if (!_currentKeyCommitted)
+                {
+                    _currentKeyCommitted = KeyCommitted(_ikeySequence);
+                    // Apply the compaction filter to the first committed version of the user key.
+                    if (_currentKeyCommitted) InvokeFilterIfNeeded(ref needSkip);
+                }
+            }
+
+            if (!_currentKeyCommitted)
+            {
+                // kCurrentKeyUncommitted: output the uncommitted version as it is.
+                _valid = true;
+                break;
             }
 
             // If there are no snapshots, then this kv affect visibility at tip. Otherwise, search though all existing

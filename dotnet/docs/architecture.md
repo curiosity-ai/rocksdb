@@ -102,6 +102,9 @@ Paths on the left are relative to the repository root (C++). Paths on the right 
 |---|---|
 | `utilities/transactions/optimistic_transaction*.cc` | `Utilities/Transactions/OptimisticTransactionDatabase.cs` |
 | `pessimistic_transaction*.cc`, `lock/point/*`, `transaction_base.cc` | `Utilities/Transactions/TransactionDatabase.cs`, `PessimisticTransaction.cs`, `PointLockManager.cs`, `LockTracker.cs`, `Transaction.cs`, `TransactionIterator.cs` |
+| `write_prepared_txn_db.cc`, `write_prepared_txn.cc`, `snapshot_checker.cc` | `Utilities/Transactions/WritePreparedTxnDb.cs` (commit cache, prepared heap, old_commit_map, read callback, snapshot checker), `WritePreparedTxn.cs` |
+| `write_unprepared_txn.cc`, `write_unprepared_txn_db.cc` | `Utilities/Transactions/WriteUnpreparedTxn.cs`, recovery in `TransactionDatabase.cs` |
+| `db/read_callback.h`, `db/snapshot_checker.h`, `db/pre_release_callback.h` | `Db/ReadCallback.cs` (`ReadCallback`, `SnapshotChecker`, `IPreReleaseCallback`, `SeqPerBatchHooks`) |
 | `utilities/write_batch_with_index/*` | `Utilities/WriteBatchWithIndex/*` |
 | `utilities/backup/backup_engine.cc` | `Utilities/Backup/*` |
 
@@ -135,7 +138,9 @@ Followers wait in one of two ways:
 "Unbatched" writers (memtable switches and other exclusive operations) form a group of their own. Write stalls and
 delayed writes (`Db/Compaction/WriteController.cs`) delay the leader with a token bucket, as upstream does.
 Transactions add a write callback for conflict validation and prepared-section tracking
-(`Db/TransactionWriteContext.cs`).
+(`Db/TransactionWriteContext.cs`). WritePrepared / WriteUnprepared DBs (`seq_per_batch`) consume one sequence number
+per sub-batch and run a pre-release callback per writer after the WAL write (commit cache / prepared heap updates);
+their reads carry a `ReadCallback` and their flushes / compactions a `SnapshotChecker` (`Db/ReadCallback.cs`).
 
 ### Background work
 

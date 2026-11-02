@@ -8,18 +8,20 @@ namespace RocksDb.Managed.Utilities.Transactions;
 /// Port of PessimisticTransaction / WriteCommittedTxn (utilities/transactions/pessimistic_transaction.cc): keys are
 /// locked when read for update or written; with a snapshot, locking a key also validates that it was not written
 /// after the snapshot. Commit writes the batch (or, after <see cref="Transaction.Prepare"/>, a commit marker to the WAL
-/// with the prepared batch applied to the memtables).
+/// with the prepared batch applied to the memtables). The write policy specific parts (PrepareInternal,
+/// CommitWithoutPrepareInternal, CommitInternal, RollbackInternal, ValidateSnapshot) are virtual and overridden by
+/// <see cref="WritePreparedTxn"/> / <see cref="WriteUnpreparedTxn"/>.
 /// </summary>
-internal sealed class PessimisticTransaction : Transaction
+internal class PessimisticTransaction : Transaction
 {
     private static long s_txnIdCounter;
 
-    private readonly TransactionDatabase _txnDb;
+    private protected readonly TransactionDatabase _txnDb;
     private int _state; // TransactionState (CAS for expiration / lock stealing)
     private ulong _id;
-    private string? _name;
-    private byte[]? _nameBytes;
-    private ulong _logNumber;
+    private protected string? _name;
+    private protected byte[]? _nameBytes;
+    private protected ulong _logNumber;
     private long _expirationTime; // µs (PointLockManager.NowMicros); 0 = none
     private long _lockTimeout;    // µs; < 0 = infinite
     private bool _deadlockDetect;
@@ -45,7 +47,7 @@ internal sealed class PessimisticTransaction : Transaction
         Initialize(options);
     }
 
-    private void Initialize(TransactionOptions options)
+    private protected virtual void Initialize(TransactionOptions options)
     {
         _id = (ulong)Interlocked.Increment(ref s_txnIdCounter);
         _state = (int)TransactionState.Started;
@@ -96,7 +98,7 @@ internal sealed class PessimisticTransaction : Transaction
     private bool CasState(TransactionState expected, TransactionState value) =>
         Interlocked.CompareExchange(ref _state, (int)value, (int)expected) == (int)expected;
 
-    private void SetState(TransactionState s) => Volatile.Write(ref _state, (int)s);
+    private protected void SetState(TransactionState s) => Volatile.Write(ref _state, (int)s);
 
     /// <summary>TryStealingLocks: an expired transaction gives up its locks (STARTED -> LOCKS_STOLEN).</summary>
     internal bool TryStealingLocks() => CasState(TransactionState.Started, TransactionState.LocksStolen);
@@ -151,7 +153,7 @@ internal sealed class PessimisticTransaction : Transaction
         }
     }
 
-    private static RocksDbException Invalid(string msg) => new(StatusCode.InvalidArgument, "Invalid argument: " + msg);
+    private protected static RocksDbException Invalid(string msg) => new(StatusCode.InvalidArgument, "Invalid argument: " + msg);
 
     // ---- locking ------------------------------------------------------------------------------------------
 
@@ -315,7 +317,7 @@ internal sealed class PessimisticTransaction : Transaction
     /// PessimisticTransaction::ValidateSnapshot: OK if the key has not been modified more recently than the
     /// transaction's snapshot (memtables and, if needed, table files).
     /// </summary>
-    private RocksDbException? ValidateSnapshot(ColumnFamilyData cfd, ReadOnlySpan<byte> key, ref ulong trackedAtSeq)
+    private protected virtual RocksDbException? ValidateSnapshot(ColumnFamilyData cfd, ReadOnlySpan<byte> key, ref ulong trackedAtSeq)
     {
         ulong snapSeq;
         if (Snapshot is { } snapshot)
@@ -371,9 +373,18 @@ internal sealed class PessimisticTransaction : Transaction
         if (_expirationTime > 0) _txnDb.RemoveExpirableTransaction(_id);
         _expirationTime = 0;
 
-        // WriteCommittedTxn::PrepareInternal: the batch's leading Noop becomes the begin-prepare marker, an end-prepare
-        // marker with the name is appended, and the batch is written to the WAL only; the WAL is marked as holding an
-        // outstanding prepared section before the write is released.
+        ValueTask p = PrepareInternalAsync(synchronous, cancellationToken);
+        if (!p.IsCompletedSuccessfully) await p.ConfigureAwait(false);
+        SetState(TransactionState.Prepared);
+    }
+
+    /// <summary>
+    /// WriteCommittedTxn::PrepareInternal: the batch's leading Noop becomes the begin-prepare marker, an end-prepare
+    /// marker with the name is appended, and the batch is written to the WAL only; the WAL is marked as holding an
+    /// outstanding prepared section before the write is released. Sets the log number.
+    /// </summary>
+    private protected virtual async ValueTask PrepareInternalAsync(bool synchronous, CancellationToken cancellationToken)
+    {
         _batch.Batch.MarkEndPrepare(_nameBytes!, writeAfterCommit: true, unpreparedBatch: false);
         WriteOptions wo = _writeOptions.DisableWal ? CloneWithWal(_writeOptions) : _writeOptions;
         _writeContext.Reset();
@@ -389,10 +400,9 @@ internal sealed class PessimisticTransaction : Transaction
         {
             _writeContext.Reset();
         }
-        SetState(TransactionState.Prepared);
     }
 
-    private static WriteOptions CloneWithWal(WriteOptions o) => new()
+    private protected static WriteOptions CloneWithWal(WriteOptions o) => new()
     {
         Sync = o.Sync,
         DisableWal = false,
@@ -403,7 +413,7 @@ internal sealed class PessimisticTransaction : Transaction
         ProtectionBytesPerKey = o.ProtectionBytesPerKey,
     };
 
-    private static RocksDbException Expired() => new(StatusCode.Expired, "Operation expired: ");
+    private protected static RocksDbException Expired() => new(StatusCode.Expired, "Operation expired: ");
 
     private protected override async ValueTask CommitCoreAsync(bool synchronous, CancellationToken cancellationToken)
     {
@@ -444,7 +454,7 @@ internal sealed class PessimisticTransaction : Transaction
             if (_logNumber > 0) _db.MarkLogAsHavingPrepSectionFlushed(_logNumber);
             try
             {
-                ValueTask w = _db.WriteAsync(_writeOptions, _batch.Batch, validateColumnFamilies: true, txn: null, synchronous, cancellationToken);
+                ValueTask w = CommitWithoutPrepareInternalAsync(synchronous, cancellationToken);
                 if (!w.IsCompletedSuccessfully) await w.ConfigureAwait(false);
             }
             finally
@@ -461,20 +471,10 @@ internal sealed class PessimisticTransaction : Transaction
         }
         else if (commitPrepared)
         {
-            // WriteCommittedTxn::CommitInternal: the commit marker goes to the WAL; the prepared batch is inserted into
-            // the memtables (they keep the WAL with the prepared section alive until flushed). With timestamps the marker
-            // carries the commit timestamp (recovery assigns it to the prepared batch) and the batch gets it now.
-            byte[]? commitTs = AssignCommitTimestamp();
             SetState(TransactionState.AwaitingCommit);
-            WriteBatch marker = MarkerBatch();
-            if (commitTs is null) marker.MarkCommit(_nameBytes!);
-            else marker.MarkCommitWithTimestamp(_nameBytes!, commitTs);
-            _writeContext.Reset();
-            _writeContext.MemtableBatch = _batch.Batch;
-            _writeContext.LogRef = _logNumber;
             try
             {
-                ValueTask w = _db.WriteAsync(_writeOptions, marker, validateColumnFamilies: true, _writeContext, synchronous, cancellationToken);
+                ValueTask w = CommitInternalAsync(synchronous, cancellationToken);
                 if (!w.IsCompletedSuccessfully) await w.ConfigureAwait(false);
             }
             catch
@@ -482,10 +482,6 @@ internal sealed class PessimisticTransaction : Transaction
                 // Keep the transaction rollbackable after the commit marker write fails.
                 SetState(TransactionState.Prepared);
                 throw;
-            }
-            finally
-            {
-                _writeContext.Reset();
             }
             // FindObsoleteFiles must now look to the memtables to determine what prep logs must be kept around, not the
             // prep section heap.
@@ -506,7 +502,44 @@ internal sealed class PessimisticTransaction : Transaction
         }
     }
 
-    private WriteBatch MarkerBatch()
+    /// <summary>WriteCommittedTxn::CommitWithoutPrepareInternal: writes the batch.</summary>
+    private protected virtual ValueTask CommitWithoutPrepareInternalAsync(bool synchronous, CancellationToken cancellationToken) =>
+        _db.WriteAsync(_writeOptions, _batch.Batch, validateColumnFamilies: true, txn: null, synchronous, cancellationToken);
+
+    /// <summary>
+    /// WriteCommittedTxn::CommitInternal: the commit marker goes to the WAL; the prepared batch is inserted into the
+    /// memtables (they keep the WAL with the prepared section alive until flushed). With timestamps the marker carries
+    /// the commit timestamp (recovery assigns it to the prepared batch) and the batch gets it now.
+    /// </summary>
+    private protected virtual async ValueTask CommitInternalAsync(bool synchronous, CancellationToken cancellationToken)
+    {
+        byte[]? commitTs = AssignCommitTimestamp();
+        WriteBatch marker = MarkerBatch();
+        if (commitTs is null) marker.MarkCommit(_nameBytes!);
+        else marker.MarkCommitWithTimestamp(_nameBytes!, commitTs);
+        _writeContext.Reset();
+        _writeContext.MemtableBatch = _batch.Batch;
+        _writeContext.LogRef = _logNumber;
+        try
+        {
+            ValueTask w = _db.WriteAsync(_writeOptions, marker, validateColumnFamilies: true, _writeContext, synchronous, cancellationToken);
+            if (!w.IsCompletedSuccessfully) await w.ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeContext.Reset();
+        }
+    }
+
+    /// <summary>WriteCommittedTxn::RollbackInternal: writes the rollback marker.</summary>
+    private protected virtual ValueTask RollbackInternalAsync(bool synchronous, CancellationToken cancellationToken)
+    {
+        WriteBatch marker = MarkerBatch();
+        marker.MarkRollback(_nameBytes!);
+        return _db.WriteAsync(_writeOptions, marker, validateColumnFamilies: false, txn: null, synchronous, cancellationToken);
+    }
+
+    private protected WriteBatch MarkerBatch()
     {
         WriteBatch b = _markerBatch ??= new WriteBatch();
         b.Clear();
@@ -520,11 +553,9 @@ internal sealed class PessimisticTransaction : Transaction
         if (state == TransactionState.Prepared)
         {
             SetState(TransactionState.AwaitingRollback);
-            WriteBatch marker = MarkerBatch();
-            marker.MarkRollback(_nameBytes!);
             try
             {
-                ValueTask w = _db.WriteAsync(_writeOptions, marker, validateColumnFamilies: false, txn: null, synchronous, cancellationToken);
+                ValueTask w = RollbackInternalAsync(synchronous, cancellationToken);
                 if (!w.IsCompletedSuccessfully) await w.ConfigureAwait(false);
             }
             catch
@@ -540,6 +571,13 @@ internal sealed class PessimisticTransaction : Transaction
         }
         else if (state == TransactionState.Started)
         {
+            if (_logNumber > 0)
+            {
+                // WriteUnprepared: unprepared batches were written to the DB.
+                ValueTask w = RollbackInternalAsync(synchronous, cancellationToken);
+                if (!w.IsCompletedSuccessfully) await w.ConfigureAwait(false);
+                _db.MarkLogAsHavingPrepSectionFlushed(_logNumber);
+            }
             // prepare couldn't have taken place
             Clear();
         }
@@ -557,6 +595,11 @@ internal sealed class PessimisticTransaction : Transaction
     {
         if (State != TransactionState.Started) throw Invalid("Transaction is beyond state for rollback.");
         return base.RollbackToSavePoint();
+    }
+
+    /// <summary>Write-policy cleanup when the transaction is disposed (WriteUnprepared rolls back unprepared data).</summary>
+    private protected virtual void DisposeWritePolicy()
+    {
     }
 
     /// <summary>PessimisticTransaction::Clear: releases the locks, then drops the writes.</summary>
@@ -636,7 +679,7 @@ internal sealed class PessimisticTransaction : Transaction
     /// Turns this new transaction into a recovered prepared one (PessimisticTransactionDB::Initialize: SetLogNumber,
     /// SetName, RebuildFromWriteBatch, SetState(PREPARED)).
     /// </summary>
-    internal void RebuildPrepared(RecoveredTransaction recovered)
+    internal virtual void RebuildPrepared(RecoveredTransaction recovered)
     {
         SetName(recovered.Name);
         _logNumber = recovered.LogNumber;
@@ -645,7 +688,7 @@ internal sealed class PessimisticTransaction : Transaction
         SetState(TransactionState.Prepared);
     }
 
-    private readonly struct RebuildHandler(IndexedWriteBatch batch) : IWriteBatchHandler
+    private protected readonly struct RebuildHandler(IndexedWriteBatch batch) : IWriteBatchHandler
     {
         public bool Continue() => true;
         public void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => batch.Put(columnFamilyId, key, value);
@@ -670,6 +713,7 @@ internal sealed class PessimisticTransaction : Transaction
 
     private protected override void DisposeCore()
     {
+        DisposeWritePolicy();
         _txnDb.LockManager.UnLock(this, _tracked);
         if (_expirationTime > 0) _txnDb.RemoveExpirableTransaction(_id);
         if (_name is not null && State != TransactionState.Committed) _txnDb.UnregisterTransaction(this);

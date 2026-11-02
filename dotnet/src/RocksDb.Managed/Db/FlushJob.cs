@@ -36,8 +36,15 @@ internal static class FlushJob
     /// the caller deletes the builder's files. <paramref name="snapshots"/> are the live snapshot sequence numbers
     /// (ascending) when the flush job was created (FlushJob's existing_snapshots_).
     /// </summary>
+    /// <remarks>
+    /// <paramref name="snapshotChecker"/> is the DB's snapshot checker (WritePrepared / WriteUnprepared, or
+    /// DisableGCSnapshotChecker for a sequence-per-batch DB being recovered). With a checker the memtables may hold
+    /// uncommitted data, so no version is dropped as hidden (the managed flush does not evaluate the checker; keeping
+    /// every version is always correct and leaves the garbage collection to compaction, which does).
+    /// </remarks>
     public static async ValueTask<FileMetaData?> WriteLevel0TableAsync(IFileSystem fs, string path, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
-        ulong fileNumber, ulong epochNumber, DbIdentity identity, ulong[] snapshots, Blob.BlobFileBuilder? blobBuilder, Blob.BlobGarbageMeter? blobOutflow,
+        ulong fileNumber, ulong epochNumber, DbIdentity identity, ulong[] snapshots, SnapshotChecker? snapshotChecker, Blob.BlobFileBuilder? blobBuilder,
+        Blob.BlobGarbageMeter? blobOutflow,
         bool synchronous, CancellationToken cancellationToken)
     {
         bool stripTimestamps = cfd.TimestampsInMemtableOnly;
@@ -79,7 +86,7 @@ internal static class FlushJob
                 {
                     // Collapsing versions of a key compares user keys without their timestamp and needs full_history_ts_low;
                     // with persisted user-defined timestamps every version is kept (always correct).
-                    AddPointEntries(builder, cfd.Icmp, mems, meta, snapshots, dropHidden: cfd.TimestampSize == 0, blobBuilder, blobOutflow);
+                    AddPointEntries(builder, cfd.Icmp, mems, meta, snapshots, dropHidden: cfd.TimestampSize == 0 && snapshotChecker is null, blobBuilder, blobOutflow);
                 }
                 blobBuilder?.Finish();
                 if (tombstones is not null) AddRangeTombstones(builder, cfd, tombstones, meta);

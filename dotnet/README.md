@@ -48,10 +48,11 @@ while the bytes may differ (for example, because a compressor makes different ch
 | User-defined timestamps in memtable only (`persist_user_defined_timestamps = false`) | yes | yes | tables/MANIFEST without timestamps, WAL with them; flush cutoff and postponement; enabling/disabling UDT on an existing column family |
 | Transactions with user-defined timestamps (commit timestamps, read-timestamp validation) | yes | yes | plain and 2PC commits (`kTypeCommitXIDAndTimestamp`) recover across engines; `GetForUpdate` with `doValidate: false`; optimistic transactions cannot commit timestamped writes (as upstream) |
 | Transactions: 2PC prepare/commit/rollback WAL markers | yes | yes | byte-identical; prepared transactions recover across engines |
+| WritePrepared / WriteUnprepared transactions (`kTypeBeginPersistedPrepareXID`, `kTypeBeginUnprepareXID`, sequence per sub-batch) | yes | yes | WAL records byte-identical; committed, rolled back and prepared (also multi-batch unprepared) transactions recover across engines; other write policies refuse the WAL like upstream |
 | `DBWithTTL` value format | yes | yes | |
 | BackupEngine directory layout and meta files | yes | yes | incremental backups across engines |
 | Checkpoints, external SST ingestion | yes | yes | |
-| PlainTable / CuckooTable, WritePrepared / WriteUnprepared transactions | no | no | option names round-trip only |
+| PlainTable / CuckooTable | no | no | option names round-trip only |
 
 Supported features: column families, point reads (`Get`, `MultiGet`), iterators (bounds, prefix seek, reverse,
 tailing), snapshots, merge operators, single delete, range deletion, leveled / universal / FIFO compaction with
@@ -438,8 +439,11 @@ string? stats = db.GetProperty(DbProperties.Stats);                             
 ### Transactions
 
 `OptimisticTransactionDatabase` validates at commit time, either serially or in parallel (the upstream default).
-`TransactionDatabase` takes point locks (WriteCommitted) and supports lock timeouts, deadlock detection, expiration
-and two-phase commit. Both expose the underlying `RocksDatabase` as `Database`.
+`TransactionDatabase` takes point locks and supports lock timeouts, deadlock detection, expiration and two-phase
+commit. Both expose the underlying `RocksDatabase` as `Database`. `TransactionDbOptions.WritePolicy` selects
+WriteCommitted (default), WritePrepared (data goes to the memtables at prepare; readers use a commit cache) or
+WriteUnprepared (large transactions are written to the DB before prepare once their batch exceeds
+`TransactionOptions.WriteBatchFlushThreshold`); with the latter two, reads through `Database` see committed data only.
 
 <!-- snippet:optimistic-transactions -->
 ```csharp
@@ -835,7 +839,8 @@ Format-level deviations (the output is always readable by native RocksDB):
 Not ported yet:
 
 - Timestamps in optimistic transactions and explicit-timestamp `WriteBatchWithIndex` writes (NotSupported, as upstream).
-- WritePrepared / WriteUnprepared transactions and range locks.
+- Range locks; for WritePrepared / WriteUnprepared: two_write_queues, commit-time batches, iterator invalidation
+  when a WriteUnprepared transaction ends, and user-defined timestamps (NotSupported, as upstream).
 - PlainTable and CuckooTable, separated key/value data blocks, parallel compression, subcompactions, `CompactFiles`,
   the SST file manager and a rate limiter for flush and compaction.
 - Wide-column entities with blob-backed columns (V2) and blob direct write (forced blob GC is leveled-only, as

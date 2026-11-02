@@ -219,6 +219,9 @@ public sealed class MergeHelper : IDisposable
         _level = level;
     }
 
+    /// <summary>The DB's snapshot checker (WritePrepared / WriteUnprepared), or null.</summary>
+    internal SnapshotChecker? SnapshotChecker { get; set; }
+
     /// <summary>Resolves blob base values in <see cref="MergeUntil"/> (the compaction's BlobFetcher); null = NotSupported.</summary>
     internal Blob.CompactionBlobProcessor? BlobProcessor { get; set; }
 
@@ -369,7 +372,8 @@ public sealed class MergeHelper : IDisposable
                 hitTheNextUserKey = true;
                 break;
             }
-            else if (stopBefore > 0 && ikey.Sequence <= stopBefore)
+            else if (stopBefore > 0 && ikey.Sequence <= stopBefore
+                     && (SnapshotChecker is null || SnapshotChecker.CheckInSnapshot(ikey.Sequence, stopBefore) != SnapshotCheckerResult.NotInSnapshot))
             {
                 // hit an entry that's possibly visible by the previous snapshot, can't touch that
                 break;

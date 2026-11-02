@@ -19,6 +19,12 @@ namespace RocksDb.Managed.Utilities.Transactions;
 /// </list>
 /// Opening enables <c>allow_2pc</c> and memtable history (<c>max_write_buffer_size_to_maintain</c> = -1 when 0), like
 /// TransactionDB::Open. Dispose closes the database; prepared transactions stay in the WAL.
+/// <para>
+/// <see cref="TransactionDbOptions.WritePolicy"/> selects WriteCommitted (default), WritePrepared or WriteUnprepared
+/// (write_prepared_txn_db.cc, write_unprepared_txn_db.cc): the latter two write data to the memtables before commit, and
+/// all reads through <see cref="Database"/> then go through the commit bookkeeping (a read callback), so that
+/// uncommitted data stays invisible.
+/// </para>
 /// </summary>
 public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
 {
@@ -28,13 +34,26 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     private readonly Lock _nameMapLock = new();
     private readonly Dictionary<ulong, PessimisticTransaction> _expirable = new();
     private readonly Lock _expirableLock = new();
+    private readonly WritePreparedTxnDb? _wpDb;
 
     private TransactionDatabase(RocksDatabase db, TransactionDbOptions options)
     {
         _db = db;
         _options = options;
         LockManager = new PointLockManager(this, options);
+        if (options.WritePolicy != TransactionWritePolicy.WriteCommitted) _wpDb = new WritePreparedTxnDb(db.Impl, this, options);
     }
+
+    /// <summary>The WritePrepared / WriteUnprepared commit bookkeeping (null for WriteCommitted).</summary>
+    internal WritePreparedTxnDb? WritePreparedDb => _wpDb;
+
+    /// <summary>A new transaction of this database's write policy (WritePreparedTxnDB / WriteUnpreparedTxnDB::BeginTransaction).</summary>
+    private PessimisticTransaction NewTransaction(WriteOptions? writeOptions, TransactionOptions options) => _options.WritePolicy switch
+    {
+        TransactionWritePolicy.WritePrepared => new WritePreparedTxn(this, _wpDb!, writeOptions, options),
+        TransactionWritePolicy.WriteUnprepared => new WriteUnpreparedTxn(this, _wpDb!, writeOptions, options),
+        _ => new PessimisticTransaction(this, writeOptions, options),
+    };
 
     /// <summary>The underlying database (reads, column families, flush...). Writes made there bypass the transaction locks.</summary>
     public RocksDatabase Database => _db;
@@ -79,12 +98,13 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(transactionDbOptions);
-        if (transactionDbOptions.WritePolicy != TransactionWritePolicy.WriteCommitted)
-        {
-            throw new RocksDbException(StatusCode.NotSupported, "Not implemented: only the WriteCommitted transaction write policy is supported");
-        }
+        if (!Enum.IsDefined(transactionDbOptions.WritePolicy)) throw new ArgumentOutOfRangeException(nameof(transactionDbOptions), "unknown write policy");
         DbOptions o = options.Clone();
         o.Allow2Pc = true;
+        // TransactionDB::Open: use_seq_per_batch for WritePrepared / WriteUnprepared, use_batch_per_txn except for
+        // WriteUnprepared.
+        o.SeqPerBatch = transactionDbOptions.WritePolicy != TransactionWritePolicy.WriteCommitted;
+        o.BatchPerTxn = transactionDbOptions.WritePolicy != TransactionWritePolicy.WriteUnprepared;
         return o;
     }
 
@@ -94,21 +114,12 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     /// </summary>
     private static TransactionDatabase Initialize(RocksDatabase db, TransactionDbOptions options)
     {
-        var txnDb = new TransactionDatabase(db, options);
+        TransactionDatabase txnDb;
         try
         {
-            foreach (RecoveredTransaction r in db.Impl.TakeRecoveredTransactions())
-            {
-                try
-                {
-                    var txn = new PessimisticTransaction(txnDb, new WriteOptions { Sync = true }, new TransactionOptions { SkipConcurrencyControl = true });
-                    txn.RebuildPrepared(r);
-                }
-                finally
-                {
-                    r.Batch.Dispose();
-                }
-            }
+            txnDb = new TransactionDatabase(db, options);
+            if (txnDb._wpDb is { } wp) txnDb.InitializeWritePrepared(wp);
+            else txnDb.RebuildRecoveredTransactions();
         }
         catch
         {
@@ -116,6 +127,146 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
             throw;
         }
         return txnDb;
+    }
+
+    /// <summary>PessimisticTransactionDB::Initialize: recovered prepared transactions become real ones (WriteCommitted).</summary>
+    private void RebuildRecoveredTransactions()
+    {
+        foreach (RecoveredTransaction r in _db.Impl.TakeRecoveredTransactions())
+        {
+            try
+            {
+                PessimisticTransaction txn = NewTransaction(new WriteOptions { Sync = true }, new TransactionOptions { SkipConcurrencyControl = true });
+                txn.RebuildPrepared(r);
+            }
+            finally
+            {
+                r.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// WritePreparedTxnDB::Initialize / WriteUnpreparedTxnDB::Initialize: installs the snapshot checker and read hooks,
+    /// rebuilds the recovered prepared transactions, adds their batches to the prepared heap, considers everything else
+    /// committed (AdvanceMaxEvictedSeq to the last sequence) and, for WriteUnprepared, rolls back the transactions that
+    /// were never prepared.
+    /// </summary>
+    private void InitializeWritePrepared(WritePreparedTxnDb wp)
+    {
+        DbImpl impl = _db.Impl;
+        impl.SetSeqPerBatchHooks(wp);
+        List<RecoveredTransaction> recovered = impl.TakeRecoveredTransactions();
+        try
+        {
+            var orderedSeqCnt = new SortedDictionary<ulong, int>();
+            var unprepared = new List<RecoveredTransaction>();
+            foreach (RecoveredTransaction r in recovered)
+            {
+                if (r.Unprepared)
+                {
+                    // Never prepared: rolled back below (WriteUnprepared only; WritePrepared refuses such WALs).
+                    unprepared.Add(r);
+                    continue;
+                }
+                var t_options = new TransactionOptions { SkipConcurrencyControl = _options.WritePolicy == TransactionWritePolicy.WritePrepared };
+                PessimisticTransaction txn = NewTransaction(new WriteOptions { Sync = true }, t_options);
+                txn.RebuildPrepared(r);
+                for (int i = 0; i < r.Batches.Count; i++)
+                {
+                    int cnt = r.Batches[i].BatchCount;
+                    orderedSeqCnt[r.Sequences[i]] = cnt != 0 ? cnt : 1;
+                }
+            }
+            wp.InitializeAfterRecovery(orderedSeqCnt);
+            foreach (RecoveredTransaction r in unprepared) RollbackRecoveredTransaction(wp, r);
+        }
+        finally
+        {
+            foreach (RecoveredTransaction r in recovered) r.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// WriteUnpreparedTxnDB::RollbackRecoveredTransaction: for each unprepared batch (newest first) writes the values its
+    /// keys had before the batch (read at the batch's sequence - 1) and a rollback marker.
+    /// </summary>
+    private void RollbackRecoveredTransaction(WritePreparedTxnDb wp, RecoveredTransaction rtxn)
+    {
+        DbImpl impl = _db.Impl;
+        byte[] name = System.Text.Encoding.UTF8.GetBytes(rtxn.Name);
+        for (int i = rtxn.Batches.Count - 1; i >= 0; i--)
+        {
+            ulong lastVisibleTxn = rtxn.Sequences[i] - 1;
+            WriteBatch batch = rtxn.Batches[i].Batch;
+            using var rollbackBatch = new WriteBatch();
+            var callback = new InvalidSnapshotReadCallback(lastVisibleTxn);
+            var builder = new RecoveredRollbackBuilder(impl, rollbackBatch, callback, _options.RollbackMergeOperands);
+            batch.Iterate(ref builder);
+            rollbackBatch.MarkRollback(name);
+            // The rollback batch is committed when written (upstream relies on min_uncommitted for its visibility).
+            var commit = new CommitEntryPreReleaseCallback(wp);
+            commit.Set(DbFormat.MaxSequenceNumber, 0, 1);
+            var ctx = new TransactionWriteContext { BatchCount = 1, PreRelease = commit };
+            impl.WriteAsync(new WriteOptions(), rollbackBatch, validateColumnFamilies: false, ctx, synchronous: true, CancellationToken.None)
+                .GetAwaiter().GetResult();
+        }
+    }
+
+    /// <summary>InvalidSnapshotReadCallback: everything up to the snapshot is visible (a plain read at that sequence).</summary>
+    private sealed class InvalidSnapshotReadCallback : ReadCallback
+    {
+        public InvalidSnapshotReadCallback(ulong snapshot) => _maxVisibleSeq = snapshot;
+
+        protected override bool IsVisibleFullCheck(ulong seq) => true;
+
+        public override void Refresh(ulong seq)
+        {
+        }
+    }
+
+    /// <summary>RollbackWriteBatchBuilder of RollbackRecoveredTransaction (always Delete, no SingleDelete callback).</summary>
+    private struct RecoveredRollbackBuilder(DbImpl db, WriteBatch dst, ReadCallback callback, bool rollbackMergeOperands) : IWriteBatchHandler
+    {
+        private Dictionary<uint, HashSet<byte[]>>? _keys;
+
+        private void Rollback(uint cf, ReadOnlySpan<byte> key)
+        {
+            _keys ??= new Dictionary<uint, HashSet<byte[]>>();
+            if (!_keys.TryGetValue(cf, out HashSet<byte[]>? set)) _keys[cf] = set = new HashSet<byte[]>(ByteKeyComparer.Instance);
+            if (!set.Add(key.ToArray())) return;
+            ColumnFamilyData cfd = db.GetColumnFamilyDataById(cf);
+            Util.PooledBufferWriter value = Util.ObjectPools.RentWriter();
+            try
+            {
+                if (db.GetWithCallback(cfd, null, key, callback, value)) dst.Put(cf, key, value.WrittenSpan);
+                else dst.Delete(cf, key);
+            }
+            finally
+            {
+                Util.ObjectPools.ReturnWriter(value);
+            }
+        }
+
+        public readonly bool Continue() => true;
+        public void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Rollback(columnFamilyId, key);
+        public void TimedPut(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong writeUnixTime) => Rollback(columnFamilyId, key);
+        public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) => Rollback(columnFamilyId, key);
+        public void Delete(uint columnFamilyId, ReadOnlySpan<byte> key) => Rollback(columnFamilyId, key);
+        public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key) => Rollback(columnFamilyId, key);
+        public readonly void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) { }
+        public void Merge(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            if (rollbackMergeOperands) Rollback(columnFamilyId, key);
+        }
+        public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex) => Rollback(columnFamilyId, key);
+        public readonly void LogData(ReadOnlySpan<byte> blob) { }
+        public readonly void MarkBeginPrepare(bool unprepare) => ThrowHelper.InvalidArgument("unexpected marker in a recovered batch");
+        public readonly void MarkEndPrepare(ReadOnlySpan<byte> xid) => ThrowHelper.InvalidArgument("unexpected marker in a recovered batch");
+        public readonly void MarkNoop(bool emptyBatch) => ThrowHelper.InvalidArgument("unexpected marker in a recovered batch");
+        public readonly void MarkCommit(ReadOnlySpan<byte> xid) => ThrowHelper.InvalidArgument("unexpected marker in a recovered batch");
+        public readonly void MarkCommitWithTimestamp(ReadOnlySpan<byte> xid, ReadOnlySpan<byte> commitTimestamp) => ThrowHelper.InvalidArgument("unexpected marker in a recovered batch");
+        public readonly void MarkRollback(ReadOnlySpan<byte> xid) => ThrowHelper.InvalidArgument("unexpected marker in a recovered batch");
     }
 
     // =====================================================================================================
@@ -128,7 +279,7 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     public Transaction BeginTransaction(WriteOptions writeOptions, TransactionOptions transactionOptions)
     {
         ArgumentNullException.ThrowIfNull(transactionOptions);
-        return new PessimisticTransaction(this, writeOptions, transactionOptions);
+        return NewTransaction(writeOptions, transactionOptions);
     }
 
     /// <summary>
@@ -272,7 +423,7 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     /// <summary>BeginInternalTransaction: wraps a direct write; uses the default (not the transaction) lock timeout.</summary>
     private PessimisticTransaction BeginInternalTransaction(WriteOptions? options)
     {
-        var txn = new PessimisticTransaction(this, options, new TransactionOptions());
+        PessimisticTransaction txn = NewTransaction(options, new TransactionOptions());
         txn.SetLockTimeout(_options.DefaultLockTimeout);
         return txn;
     }

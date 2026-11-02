@@ -30,6 +30,9 @@ public sealed class Iterator : IDisposable
     private readonly InternalKeyComparator _icmp;
     private bool _disposed;
 
+    /// <summary>Whether the iterator was disposed (WriteUnprepared transactions track their active iterators).</summary>
+    internal bool IsDisposed => _disposed;
+
     /// <summary>Wraps a <see cref="DbIter"/> (ownership transferred). Normally created by <see cref="DbIteratorFactory"/>.</summary>
     public Iterator(DbIter iter)
     {

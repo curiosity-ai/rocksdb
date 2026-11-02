@@ -288,7 +288,7 @@ internal sealed partial class DbImpl
                 ulong seq = Util.Coding.DecodeFixed64(record);
                 uint count = Util.Coding.DecodeFixed32(record[8..]);
                 var inserter = new MemTableInserter(this, walNumber, ignoreMissingColumnFamilies: true) { Sequence = seq };
-                WriteBatch.Iterate(record, ref inserter);
+                inserter.Run(record);
                 _flushScheduler.Clear();
                 // The inserter's next sequence (not the header count): prepared sections consume no sequence numbers.
                 if (count > 0 && inserter.Sequence > seq) last = Math.Max(last, inserter.Sequence - 1);

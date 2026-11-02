@@ -68,6 +68,12 @@ internal sealed class CompactionJob
 
     private bool _firstOutput = true;
 
+    /// <summary>The DB's snapshot checker (WritePrepared / WriteUnprepared), or null.</summary>
+    internal SnapshotChecker? SnapshotChecker { get; init; }
+
+    /// <summary>The snapshot taken for this job when there is a snapshot checker (job_snapshot).</summary>
+    internal ulong JobSnapshot { get; init; }
+
     public CompactionJob(DbImpl db, ColumnFamilyData cfd, Compaction compaction, ulong[] snapshots, Func<ulong> newFileNumber,
         CancellationToken cancellation)
     {
@@ -225,12 +231,18 @@ internal sealed class CompactionJob
         ulong latestSnapshot = _snapshots.Length == 0 ? 0 : _snapshots[^1];
         MergeHelper? merge = mergeOperator is null ? null : new MergeHelper(_icmp, mergeOperator, filter, latestSnapshot, _c.StartLevel);
         ulong earliestWriteConflict = DbFormat.MaxSequenceNumber;
-        if (merge is not null) merge.FullHistoryTsLow = fullHistoryTsLow;
+        if (merge is not null)
+        {
+            merge.FullHistoryTsLow = fullHistoryTsLow;
+            merge.SnapshotChecker = SnapshotChecker;
+        }
         var iter = new CompactionIterator(input, _icmp, merge, _snapshots, earliestWriteConflict, rangeDel, _c, filter,
             _db.Options.EnforceSingleDelContracts, _cancellation)
         {
             FullHistoryTsLow = fullHistoryTsLow,
             BlobProcessor = _blob,
+            SnapshotChecker = SnapshotChecker,
+            JobSnapshot = JobSnapshot,
         };
         if (merge is not null) merge.BlobProcessor = _blob;
         try
