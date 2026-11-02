@@ -147,7 +147,13 @@ internal sealed partial class DbImpl
         lock (_mutex)
         {
             if (cfd.Dropped) ThrowDropped(cfd);
-            if (Versions.ColumnFamilies.Count > 1)
+            if (Options.Allow2Pc)
+            {
+                // In 2PC mode the WALs holding outstanding prepared sections (or prepared sections of committed data
+                // still in memtables) must survive (PrecomputeMinLogNumberToKeep2PC).
+                edit.MinLogNumberToKeep = PrecomputeMinLogNumberToKeep2PC(cfd, edit.LogNumber.Value, picked);
+            }
+            else if (Versions.ColumnFamilies.Count > 1)
             {
                 // PrecomputeMinLogNumberToKeepNon2PC: minimum of the other CFs' log numbers and this edit's.
                 edit.MinLogNumberToKeep = Math.Min(Versions.MinLogNumberWithUnflushedData(cfd), edit.LogNumber.Value);
@@ -162,7 +168,7 @@ internal sealed partial class DbImpl
             {
                 m.FlushCompleted = true;
                 // A drop that committed right after our MANIFEST write already released the list's references.
-                if (cfd.Imm.Remove(m) && m.Mem.Unref()) m.Mem.Dispose();
+                if (cfd.Imm.Remove(m)) RetireFlushedMemTable(cfd, m.Mem);
             }
             if (cfd.Dropped) return;
             InstallSuperVersion(cfd);

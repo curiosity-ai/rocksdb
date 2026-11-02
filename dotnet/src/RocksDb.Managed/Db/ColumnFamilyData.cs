@@ -117,6 +117,11 @@ internal sealed class ColumnFamilyData
     public MemTable Mem { get; set; } = null!;
     /// <summary>Immutable memtables, oldest first.</summary>
     public List<ImmutableMemTable> Imm { get; } = new();
+    /// <summary>
+    /// Flushed memtables kept for transaction conflict checking (MemTableList history,
+    /// max_write_buffer_size_to_maintain), oldest first; each holds a reference. Guarded by the DB mutex.
+    /// </summary>
+    public List<MemTable> History { get; } = new();
     public DbVersion Current { get; set; } = null!;
     private SuperVersion? _super;
     public SuperVersion Super => Volatile.Read(ref _super)!;

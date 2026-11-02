@@ -43,6 +43,7 @@ public static class DbBenchRunner
         public int BatchSize = 1;
         public int MultiGetSize = 16;
         public int SeekNexts = 10;
+        public int TxnPuts = 10;
         public double CompressionRatio = 0.5;
         public string Db = Path.Combine(Path.GetTempPath(), "rocksdb-managed-dbbench");
         public bool UseExistingDb;
@@ -109,6 +110,14 @@ public static class DbBenchRunner
                     PrintStats(engine, f);
                     continue;
                 }
+                if (bench is DbBenchmark.TxnOptimistic or DbBenchmark.TxnPessimistic)
+                {
+                    // Transactions run against their own (fresh) transactional DB next to the main one.
+                    TxnKind kind = bench == DbBenchmark.TxnOptimistic ? TxnKind.Optimistic : TxnKind.Pessimistic;
+                    using ITxnEngine txnEngine = TxnEngineFactory.Open(f.Engine, kind, f.Db + "-" + BenchFlags.Name(bench), f.Options);
+                    new BenchRun(engine, f, values, bench, index) { Txn = txnEngine }.Execute();
+                    continue;
+                }
                 new BenchRun(engine, f, values, bench, index).Execute();
             }
         }
@@ -139,6 +148,10 @@ public static class DbBenchRunner
         private long _totalOps;
         private int _readersDone;
         private long _writerOps;
+        private long _txnRetries;
+
+        /// <summary>The transactional DB of txnoptimistic / txnpessimistic.</summary>
+        public ITxnEngine? Txn { get; init; }
 
         public void Execute()
         {
@@ -171,6 +184,8 @@ public static class DbBenchRunner
             {
                 DbBenchmark.FillSync => Math.Max(f.Num / 1000, 1),
                 DbBenchmark.ReadRandom or DbBenchmark.ReadMissing or DbBenchmark.ReadSeq or DbBenchmark.ReadReverse or DbBenchmark.SeekRandom or DbBenchmark.MultiReadRandom or DbBenchmark.ReadWhileWriting => f.Reads,
+                // one op = one transaction of --txn_puts puts (as many puts in total as fillrandom)
+                DbBenchmark.TxnOptimistic or DbBenchmark.TxnPessimistic => Math.Max(f.Num / f.TxnPuts, 1),
                 _ => f.Num,
             };
             int n = f.Threads + (bench == DbBenchmark.ReadWhileWriting ? 1 : 0);
@@ -192,7 +207,8 @@ public static class DbBenchRunner
                 bytes += w.Bytes;
                 found += w.Found;
             }
-            string extra = bench == DbBenchmark.ReadWhileWriting ? "(writer: " + Interlocked.Read(ref _writerOps) + " puts)" : "";
+            string extra = bench == DbBenchmark.ReadWhileWriting ? "(writer: " + Interlocked.Read(ref _writerOps) + " puts)"
+                : Txn is not null ? "(" + f.TxnPuts + " puts/txn, " + Interlocked.Read(ref _txnRetries) + " retries)" : "";
             if (bench is DbBenchmark.FillSeq or DbBenchmark.FillRandom or DbBenchmark.Overwrite or DbBenchmark.FillSync) s_userBytesWritten += bytes;
             else if (bench == DbBenchmark.ReadWhileWriting) s_userBytesWritten += Interlocked.Read(ref _writerOps) * (f.KeySize + f.ValueSize);
             Report(ops, Clock.ToNs(end - start) / 1e9, bytes, found, merged, allocBefore, g0, g1, g2, extra);
@@ -298,7 +314,56 @@ public static class DbBenchRunner
                 case DbBenchmark.DeleteRandom:
                     DoDeletes(w, n, ref rng);
                     break;
+                case DbBenchmark.TxnOptimistic:
+                case DbBenchmark.TxnPessimistic:
+                    DoTransactions(w, n, ref rng);
+                    break;
             }
+        }
+
+        /// <summary>txnoptimistic / txnpessimistic: n transactions of --txn_puts random puts; conflicts are retried.</summary>
+        private void DoTransactions(Worker w, long n, ref SplitMix64 rng)
+        {
+            bool hist = f.Histogram;
+            int ks = f.KeySize, vs = f.ValueSize, puts = f.TxnPuts;
+            ulong num = (ulong)f.Num;
+            byte[] keys = new byte[ks * puts];
+            var vc = new ValueCursor(values);
+            using ITxnSession session = Txn!.CreateSession();
+            long retries = 0;
+            for (long i = 0; i < n; i++)
+            {
+                for (int j = 0; j < puts; j++) KeyFormat.Make(keys.AsSpan(j * ks, ks), rng.Uniform(num));
+                ReadOnlySpan<byte> value = vc.Next(vs).Span;
+                long t0 = Clock.Now();
+                while (!session.Run(keys, puts, ks, value)) retries++;
+                if (hist) w.Hist.Add(Clock.ElapsedNs(t0));
+            }
+            Interlocked.Add(ref _txnRetries, retries);
+            w.Ops = n;
+            w.Bytes = n * puts * (ks + vs);
+        }
+
+        private async Task TransactionsAsync(Worker w, long n, SplitMix64 rng)
+        {
+            bool hist = f.Histogram;
+            int ks = f.KeySize, vs = f.ValueSize, puts = f.TxnPuts;
+            ulong num = (ulong)f.Num;
+            byte[] keys = new byte[ks * puts];
+            var vc = new ValueCursor(values);
+            using ITxnSession session = Txn!.CreateSession();
+            long retries = 0;
+            for (long i = 0; i < n; i++)
+            {
+                for (int j = 0; j < puts; j++) KeyFormat.Make(keys.AsSpan(j * ks, ks), rng.Uniform(num));
+                ReadOnlyMemory<byte> value = vc.Next(vs);
+                long t0 = Clock.Now();
+                while (!await session.RunAsync(keys, puts, ks, value).ConfigureAwait(false)) retries++;
+                if (hist) w.Hist.Add(Clock.ElapsedNs(t0));
+            }
+            Interlocked.Add(ref _txnRetries, retries);
+            w.Ops = n;
+            w.Bytes = n * puts * (ks + vs);
         }
 
         private void DoWrites(Worker w, long n, ref SplitMix64 rng)
@@ -521,6 +586,10 @@ public static class DbBenchRunner
                 case DbBenchmark.DeleteRandom:
                     await DeletesAsync(me, w, n, rng).ConfigureAwait(false);
                     break;
+                case DbBenchmark.TxnOptimistic:
+                case DbBenchmark.TxnPessimistic:
+                    await TransactionsAsync(w, n, rng).ConfigureAwait(false);
+                    break;
             }
         }
 
@@ -701,6 +770,7 @@ public static class DbBenchRunner
                 case "batch_size": f.BatchSize = Math.Max(1, int.Parse(value, ci)); break;
                 case "multiget_size": f.MultiGetSize = Math.Max(1, int.Parse(value, ci)); break;
                 case "seek_nexts": f.SeekNexts = int.Parse(value, ci); break;
+                case "txn_puts": f.TxnPuts = Math.Max(1, int.Parse(value, ci)); break;
                 case "compression_ratio": f.CompressionRatio = double.Parse(value, ci); break;
                 case "db": f.Db = value; break;
                 case "use_existing_db": f.UseExistingDb = ParseBool(value); break;
@@ -776,7 +846,7 @@ public static class DbBenchRunner
     private static void PrintUsage()
     {
         Console.Error.WriteLine("usage: dbbench [--engine rocksdb-sharp|managed|c-native] [--async] [--benchmarks a,b,...] [--num N] [--reads N]");
-        Console.Error.WriteLine("               [--key_size 16] [--value_size 100] [--threads 1] [--batch_size 1] [--multiget_size 16] [--seek_nexts 10]");
+        Console.Error.WriteLine("               [--key_size 16] [--value_size 100] [--threads 1] [--batch_size 1] [--multiget_size 16] [--seek_nexts 10] [--txn_puts 10]");
         Console.Error.WriteLine("               [--disable_wal] [--sync] [--cache_size BYTES] [--cache_type lru|hyperclock] [--bloom_bits 10]");
         Console.Error.WriteLine("               [--write_buffer_size BYTES] [--block_size 4096] [--compression none|snappy|lz4|zstd] [--compression_ratio 0.5]");
         Console.Error.WriteLine("               [--target_file_size_base BYTES] [--max_bytes_for_level_base BYTES] [--level0_file_num_compaction_trigger 4]");

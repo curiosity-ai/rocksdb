@@ -17,7 +17,8 @@ public sealed class ManagedEngine : IKeyValueEngine
     private readonly WriteOptions _writeOptions;
     private readonly WriteOptions _syncWriteOptions;
 
-    public ManagedEngine(string path, EngineOptions options)
+    /// <summary>The DB and column family options for <paramref name="options"/> (shared with the transaction engines).</summary>
+    internal static (DbOptions Db, ColumnFamilyOptions Cf) BuildOptions(EngineOptions options)
     {
         var cfo = new ColumnFamilyOptions
         {
@@ -39,6 +40,12 @@ public sealed class ManagedEngine : IKeyValueEngine
         };
         if (options.BloomBitsPerKey > 0) cfo.TableOptions.FilterPolicy = new BloomFilterPolicy(options.BloomBitsPerKey);
         var dbo = new DbOptions { CreateIfMissing = true, FileSystem = LocalFileSystem.Instance, MaxBackgroundJobs = options.MaxBackgroundJobs };
+        return (dbo, cfo);
+    }
+
+    public ManagedEngine(string path, EngineOptions options)
+    {
+        (DbOptions dbo, ColumnFamilyOptions cfo) = BuildOptions(options);
         _db = RocksDatabase.Open(path, dbo, cfo);
         _writeOptions = new WriteOptions { Sync = options.Sync, DisableWal = options.DisableWal };
         _syncWriteOptions = new WriteOptions { Sync = true };

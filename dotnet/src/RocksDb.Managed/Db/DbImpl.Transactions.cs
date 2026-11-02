@@ -1,0 +1,466 @@
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Text;
+using RocksDb.Managed.Table;
+using RocksDb.Managed.Util;
+
+namespace RocksDb.Managed.Db;
+
+/// <summary>A prepared transaction rebuilt from the WAL during recovery (DBImpl::RecoveredTransaction, WriteCommitted).</summary>
+internal sealed class RecoveredTransaction
+{
+    public RecoveredTransaction(string name, ulong logNumber, WriteBatch batch, ulong sequence)
+    {
+        Name = name;
+        LogNumber = logNumber;
+        Batch = batch;
+        Sequence = sequence;
+    }
+
+    public string Name { get; }
+    /// <summary>The WAL holding the prepared section.</summary>
+    public ulong LogNumber { get; }
+    /// <summary>The prepared writes (no markers).</summary>
+    public WriteBatch Batch { get; }
+    /// <summary>The sequence number the inserter was at when the section began.</summary>
+    public ulong Sequence { get; }
+}
+
+/// <summary>
+/// DB-layer support for transactions:
+/// <list type="bullet">
+/// <item>2PC bookkeeping: recovered prepared transactions (DBImpl::InsertRecoveredTransaction & co.), the WALs holding
+/// outstanding prepared sections (db/logs_with_prep_tracker.cc) and the 2PC minimum WAL to keep
+/// (PrecomputeMinLogNumberToKeep2PC / FindMinPrepLogReferencedByMemTable, db/db_impl/db_impl_files.cc).</item>
+/// <item>Memtable history for conflict checks (MemTableList history trimmed to max_write_buffer_size_to_maintain).</item>
+/// <item>Conflict checks: DBImpl::GetEarliestMemTableSequenceNumber / GetLatestSequenceForKey (db/db_impl/db_impl.cc)
+/// and TransactionUtil::CheckKey (utilities/transactions/transaction_util.cc).</item>
+/// </list>
+/// </summary>
+internal sealed partial class DbImpl
+{
+    /// <summary>The live column family with id <paramref name="id"/> (throws InvalidArgument for unknown / dropped ids).</summary>
+    internal ColumnFamilyData GetColumnFamilyDataById(uint id)
+    {
+        ColumnFamilyData?[] map = Volatile.Read(ref _cfById);
+        ColumnFamilyData? c = id < (uint)map.Length ? map[id] : null;
+        if (c is null || c.Dropped) ThrowHelper.InvalidArgument("Invalid column family specified in write batch");
+        return c!;
+    }
+
+    // ---- recovered transactions (guarded by the DB mutex; written during Open only) ----------------------
+
+    private readonly Dictionary<string, RecoveredTransaction> _recoveredTransactions = new(StringComparer.Ordinal);
+
+    /// <summary>Transaction names are stored in the WAL as their UTF-8 bytes.</summary>
+    internal static string DecodeXid(ReadOnlySpan<byte> xid) => Encoding.UTF8.GetString(xid);
+
+    private void InsertRecoveredTransaction(ulong logNumber, ReadOnlySpan<byte> xid, WriteBatch batch, ulong sequence)
+    {
+        string name = DecodeXid(xid);
+        lock (_mutex)
+        {
+            if (_recoveredTransactions.Remove(name, out RecoveredTransaction? old)) old.Batch.Dispose();
+            _recoveredTransactions[name] = new RecoveredTransaction(name, logNumber, batch, sequence);
+        }
+    }
+
+    private RecoveredTransaction? GetRecoveredTransaction(ReadOnlySpan<byte> xid)
+    {
+        string name = DecodeXid(xid);
+        lock (_mutex) return _recoveredTransactions.GetValueOrDefault(name);
+    }
+
+    private void DeleteRecoveredTransaction(RecoveredTransaction trx)
+    {
+        lock (_mutex) _recoveredTransactions.Remove(trx.Name);
+        trx.Batch.Dispose();
+    }
+
+    /// <summary>
+    /// Hands the prepared transactions recovered from the WAL to the caller (TransactionDB initialization) and forgets
+    /// them (DBImpl::recovered_transactions + DeleteAllRecoveredTransactions). Their WALs stay marked as containing
+    /// outstanding prepared sections until the caller commits or rolls them back.
+    /// </summary>
+    internal List<RecoveredTransaction> TakeRecoveredTransactions()
+    {
+        lock (_mutex)
+        {
+            var list = new List<RecoveredTransaction>(_recoveredTransactions.Values);
+            _recoveredTransactions.Clear();
+            list.Sort(static (a, b) => a.Sequence.CompareTo(b.Sequence));
+            return list;
+        }
+    }
+
+    /// <summary>Called at the end of WAL recovery: the WALs of recovered prepared sections must be kept.</summary>
+    private void MarkRecoveredPrepSections()
+    {
+        lock (_mutex)
+        {
+            foreach (RecoveredTransaction t in _recoveredTransactions.Values) MarkLogAsContainingPrepSection(t.LogNumber);
+        }
+    }
+
+    // ---- LogsWithPrepTracker ------------------------------------------------------------------------------
+
+    private readonly Dictionary<ulong, int> _logsWithPrep = new(); // WAL -> outstanding prepared sections
+    private readonly Lock _prepLock = new();
+
+    /// <summary>LogsWithPrepTracker::MarkLogAsContainingPrepSection.</summary>
+    internal void MarkLogAsContainingPrepSection(ulong log)
+    {
+        lock (_prepLock)
+        {
+            _logsWithPrep.TryGetValue(log, out int n);
+            _logsWithPrep[log] = n + 1;
+        }
+    }
+
+    /// <summary>LogsWithPrepTracker::MarkLogAsHavingPrepSectionFlushed: the prepared section was committed or rolled back.</summary>
+    internal void MarkLogAsHavingPrepSectionFlushed(ulong log)
+    {
+        lock (_prepLock)
+        {
+            if (!_logsWithPrep.TryGetValue(log, out int n)) return;
+            if (n <= 1) _logsWithPrep.Remove(log);
+            else _logsWithPrep[log] = n - 1;
+        }
+    }
+
+    /// <summary>LogsWithPrepTracker::FindMinLogContainingOutstandingPrep: 0 if none.</summary>
+    internal ulong FindMinLogContainingOutstandingPrep()
+    {
+        lock (_prepLock)
+        {
+            ulong min = 0;
+            foreach (ulong log in _logsWithPrep.Keys)
+            {
+                if (min == 0 || log < min) min = log;
+            }
+            return min;
+        }
+    }
+
+    /// <summary>
+    /// FindMinPrepLogReferencedByMemTable: the oldest WAL holding a prepared section whose committed data is still only
+    /// in memtables (excluding <paramref name="beingFlushed"/>). 0 if none. REQUIRES: mutex.
+    /// </summary>
+    private ulong FindMinPrepLogReferencedByMemTable(List<ImmutableMemTable>? beingFlushed)
+    {
+        ulong min = 0;
+        foreach (ColumnFamilyData c in Versions.ColumnFamilies)
+        {
+            if (c.Dropped) continue;
+            foreach (ImmutableMemTable m in c.Imm)
+            {
+                if (m.FlushCompleted || (beingFlushed is not null && beingFlushed.Contains(m))) continue;
+                ulong log = m.Mem.MinLogContainingPrepSection;
+                if (log > 0 && (min == 0 || log < min)) min = log;
+            }
+            ulong l = c.Mem.MinLogContainingPrepSection;
+            if (l > 0 && (min == 0 || l < min)) min = l;
+        }
+        return min;
+    }
+
+    /// <summary>
+    /// The smallest WAL number that must be kept (DBImpl::MinLogNumberToKeep for deletion): WALs with unflushed data
+    /// and, with allow_2pc, WALs holding outstanding prepared sections or prepared sections of committed data that is
+    /// still in memtables. REQUIRES: mutex.
+    /// </summary>
+    internal ulong MinLogNumberToKeepLive()
+    {
+        ulong min = Versions.MinLogNumberWithUnflushedData(null);
+        if (!Options.Allow2Pc) return min;
+        ulong prep = FindMinLogContainingOutstandingPrep();
+        if (prep != 0 && prep < min) min = prep;
+        ulong mem = FindMinPrepLogReferencedByMemTable(null);
+        if (mem != 0 && mem < min) min = mem;
+        return min;
+    }
+
+    /// <summary>
+    /// PrecomputeMinLogNumberToKeep2PC for a flush of <paramref name="picked"/> of <paramref name="cfd"/> whose edit
+    /// sets the CF log number to <paramref name="editLogNumber"/>. REQUIRES: mutex.
+    /// </summary>
+    private ulong PrecomputeMinLogNumberToKeep2PC(ColumnFamilyData cfd, ulong editLogNumber, List<ImmutableMemTable> picked)
+    {
+        ulong min = Math.Min(Versions.MinLogNumberWithUnflushedData(cfd), editLogNumber);
+        // We must check min logs with outstanding prep before we check logs referenced by memtables because a log
+        // referenced by the first data structure could transition to the second under us.
+        ulong prep = FindMinLogContainingOutstandingPrep();
+        if (prep != 0 && prep < min) min = prep;
+        ulong mem = FindMinPrepLogReferencedByMemTable(picked);
+        if (mem != 0 && mem < min) min = mem;
+        return min;
+    }
+
+    // ---- memtable history (max_write_buffer_size_to_maintain) ---------------------------------------------
+
+    /// <summary>
+    /// A flushed memtable left the immutable list: keep it as history for conflict checking when the CF maintains
+    /// history, otherwise release the list's reference. REQUIRES: mutex.
+    /// </summary>
+    private void RetireFlushedMemTable(ColumnFamilyData cfd, MemTable mem)
+    {
+        if (cfd.Options.MaxWriteBufferSizeToMaintain > 0 && !cfd.Dropped)
+        {
+            cfd.History.Add(mem); // keeps the list's reference
+            TrimMemTableHistory(cfd);
+            return;
+        }
+        if (mem.Unref()) mem.Dispose();
+    }
+
+    /// <summary>
+    /// MemTableList::TrimHistory: drops the oldest history memtables while the memory of the mutable memtable,
+    /// the immutable memtables and the history (excluding the oldest) reaches max_write_buffer_size_to_maintain.
+    /// REQUIRES: mutex.
+    /// </summary>
+    internal void TrimMemTableHistory(ColumnFamilyData cfd)
+    {
+        List<MemTable> history = cfd.History;
+        if (history.Count == 0) return;
+        long maintain = cfd.Options.MaxWriteBufferSizeToMaintain;
+        long usage = cfd.Mem.ApproximateMemoryUsageFast;
+        foreach (ImmutableMemTable m in cfd.Imm) usage += m.Mem.ApproximateMemoryUsageFast;
+        for (int i = 1; i < history.Count; i++) usage += history[i].ApproximateMemoryUsageFast;
+        while (history.Count > 0 && (maintain <= 0 || usage >= maintain))
+        {
+            MemTable oldest = history[0];
+            history.RemoveAt(0);
+            if (history.Count > 0) usage -= history[0].ApproximateMemoryUsageFast;
+            if (oldest.Unref()) oldest.Dispose();
+        }
+    }
+
+    /// <summary>Releases the CF's history memtables. REQUIRES: mutex.</summary>
+    private static void ReleaseMemTableHistory(ColumnFamilyData cfd)
+    {
+        foreach (MemTable m in cfd.History)
+        {
+            if (m.Unref()) m.Dispose();
+        }
+        cfd.History.Clear();
+    }
+
+    // ---- conflict checking ---------------------------------------------------------------------------------
+
+    /// <summary>
+    /// A referenced view of one column family's memtables (super version + history snapshot) used to check a set of
+    /// keys for conflicts. Dispose to release the references.
+    /// </summary>
+    internal readonly struct ConflictCheckView : IDisposable
+    {
+        private readonly DbImpl _db;
+        public readonly ColumnFamilyData Cfd;
+        public readonly SuperVersion Sv;
+        /// <summary>History memtables, newest first (referenced); null if none.</summary>
+        public readonly MemTable[]? History;
+        /// <summary>GetEarliestMemTableSequenceNumber(sv, include_history = true).</summary>
+        public readonly ulong EarliestSequence;
+
+        public ConflictCheckView(DbImpl db, ColumnFamilyData cfd, SuperVersion sv, MemTable[]? history, ulong earliest)
+        {
+            _db = db;
+            Cfd = cfd;
+            Sv = sv;
+            History = history;
+            EarliestSequence = earliest;
+        }
+
+        public void Dispose()
+        {
+            if (_db is null) return;
+            if (History is not null)
+            {
+                lock (_db._mutex)
+                {
+                    foreach (MemTable m in History)
+                    {
+                        if (m.Unref()) m.Dispose();
+                    }
+                }
+            }
+            _db.ReturnSuperVersion(Sv);
+        }
+    }
+
+    /// <summary>References the CF's memtables for conflict checks (GetAndRefSuperVersion + history).</summary>
+    internal ConflictCheckView AcquireConflictCheckView(ColumnFamilyData cfd)
+    {
+        SuperVersion sv = GetReferencedSuperVersion(cfd);
+        MemTable[]? history = null;
+        lock (_mutex)
+        {
+            int n = cfd.History.Count;
+            if (n > 0)
+            {
+                history = new MemTable[n];
+                for (int i = 0; i < n; i++)
+                {
+                    MemTable m = cfd.History[n - 1 - i];
+                    m.Ref();
+                    history[i] = m;
+                }
+            }
+        }
+        // Find the earliest sequence number that we know we can rely on reading from the memtable without needing to
+        // check sst files (the oldest memtable's earliest sequence number).
+        ulong earliest = sv.Mem.EarliestSequenceNumber;
+        if (sv.Imm.Length > 0) earliest = Math.Min(earliest, sv.Imm[^1].EarliestSequenceNumber);
+        if (history is not null) earliest = Math.Min(earliest, history[^1].EarliestSequenceNumber);
+        return new ConflictCheckView(this, cfd, sv, history, earliest);
+    }
+
+    /// <summary>
+    /// Port of TransactionUtil::CheckKey: returns null if <paramref name="key"/> was not written after
+    /// <paramref name="snapSeq"/>, Busy if it was, TryAgain if the memtables do not hold enough history to tell and
+    /// <paramref name="cacheOnly"/> is set (otherwise the table files are checked too).
+    /// </summary>
+    internal RocksDbException? CheckKey(in ConflictCheckView view, ReadOnlySpan<byte> key, ulong snapSeq, bool cacheOnly)
+    {
+        bool needToReadSst = false;
+        ulong earliest = view.EarliestSequence;
+        if (earliest == DbFormat.MaxSequenceNumber || snapSeq < earliest)
+        {
+            // The memtables do not contain a long enough history to check for writes after snapSeq.
+            needToReadSst = true;
+            if (cacheOnly) return TryAgainNoHistory(snapSeq, earliest);
+        }
+        GetLatestSequenceForKey(view, key, !needToReadSst, snapSeq, out ulong seq, out bool found);
+        if (found && snapSeq < seq) return new RocksDbException(StatusCode.Busy, "Resource busy: ");
+        return null;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static RocksDbException TryAgainNoHistory(ulong snapSeq, ulong earliest) =>
+        new(StatusCode.TryAgain, earliest == DbFormat.MaxSequenceNumber
+            ? "Operation failed. Try again.: Transaction could not check for conflicts as the MemTable does not contain a long enough history to check write at SequenceNumber: " + snapSeq
+            : "Operation failed. Try again.: Transaction could not check for conflicts for operation at SequenceNumber " + snapSeq +
+              " as the MemTable only contains changes newer than SequenceNumber " + earliest +
+              ".  Increasing the value of the max_write_buffer_size_to_maintain option could reduce the frequency of this error.");
+
+    /// <summary>
+    /// Port of DBImpl::GetLatestSequenceForKey: the sequence number of the newest entry for <paramref name="key"/>
+    /// (point entry or covering range tombstone) in the memtables, the history and, unless <paramref name="cacheOnly"/>,
+    /// the table files. Sources older than <paramref name="lowerBoundSeq"/> are skipped once a memtable proves there
+    /// is no newer entry.
+    /// </summary>
+    [SkipLocalsInit]
+    internal void GetLatestSequenceForKey(in ConflictCheckView view, ReadOnlySpan<byte> key, bool cacheOnly, ulong lowerBoundSeq, out ulong seq, out bool found)
+    {
+        SuperVersion sv = view.Sv;
+        ulong currentSeq = Versions.LastSequence;
+        Span<byte> scratch = stackalloc byte[LookupKey.StackBufferSize];
+        var lkey = new LookupKey(key, currentSeq, scratch);
+        try
+        {
+            seq = DbFormat.MaxSequenceNumber;
+            found = false;
+            // Check if there is a record for this key in the latest memtable
+            if (MemTableSeq(sv.Mem, lkey, out seq)) { found = true; return; }
+            ulong lowerInMem = sv.Mem.EarliestSequenceNumber;
+            if (lowerInMem != DbFormat.MaxSequenceNumber && lowerInMem < lowerBoundSeq) return;
+            // Check if there is a record for this key in the immutable memtables
+            MemTable[] imm = sv.Imm;
+            for (int i = 0; i < imm.Length; i++)
+            {
+                if (MemTableSeq(imm[i], lkey, out seq)) { found = true; return; }
+            }
+            if (imm.Length > 0)
+            {
+                ulong lowerInImm = imm[^1].EarliestSequenceNumber;
+                if (lowerInImm != DbFormat.MaxSequenceNumber && lowerInImm < lowerBoundSeq) return;
+            }
+            if (view.History is { } history)
+            {
+                for (int i = 0; i < history.Length; i++)
+                {
+                    if (MemTableSeq(history[i], lkey, out seq)) { found = true; return; }
+                }
+            }
+            if (cacheOnly) return;
+            // Check tables
+            found = TableSeq(view.Cfd, sv.Current, lkey.InternalKey, key, currentSeq, out seq);
+        }
+        finally
+        {
+            lkey.Dispose();
+        }
+    }
+
+    private static bool MemTableSeq(MemTable mem, scoped in LookupKey lkey, out ulong seq)
+    {
+        ulong cov = 0;
+        mem.Get(lkey, out _, out _, out seq, mergeContext: null, ref cov);
+        if (seq != DbFormat.MaxSequenceNumber) return true;
+        if (cov > 0)
+        {
+            seq = cov;
+            return true;
+        }
+        return false;
+    }
+
+    private struct SeqVisitorState
+    {
+        public ulong Seq;
+    }
+
+    private static readonly TableEntryVisitor<SeqVisitorState> s_recordSeq = static (ref SeqVisitorState s, ReadOnlySpan<byte> ikey, ReadOnlySpan<byte> value) =>
+    {
+        DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(ikey), out ulong seq, out _);
+        s.Seq = seq;
+        return false;
+    };
+
+    /// <summary>Version::Get with a sequence output: newest entry (or covering tombstone) of the key in the table files.</summary>
+    private static bool TableSeq(ColumnFamilyData cfd, DbVersion v, ReadOnlySpan<byte> ikey, ReadOnlySpan<byte> userKey, ulong snapshot, out ulong seq)
+    {
+        VersionStorageInfo s = v.Storage;
+        Comparator ucmp = cfd.UserComparator;
+        ulong cov = 0;
+        for (int level = 0; level < s.NumLevels; level++)
+        {
+            ReadOnlySpan<FileMetaData> files = s.LevelFiles(level);
+            if (files.Length == 0) continue;
+            int start = 0, end = files.Length;
+            if (level > 0)
+            {
+                start = s.FindFile(level, ikey);
+                if (start >= files.Length) continue;
+                end = start + 1;
+            }
+            for (int i = start; i < end; i++)
+            {
+                FileMetaData f = files[i];
+                if (ucmp.Compare(userKey, DbFormat.ExtractUserKey(f.Smallest)) < 0 || ucmp.Compare(userKey, DbFormat.ExtractUserKey(f.Largest)) > 0) continue;
+                var state = new SeqVisitorState { Seq = DbFormat.MaxSequenceNumber };
+                TableReaderLease lease = cfd.TableCache.GetReader(f, out FragmentedRangeTombstoneList? rangeDels);
+                try
+                {
+                    if (rangeDels is not null)
+                    {
+                        ulong c = rangeDels.MaxCoveringTombstoneSeqnum(userKey, snapshot);
+                        if (c > cov) cov = c;
+                    }
+                    lease.Reader.Get(ikey, ref state, s_recordSeq);
+                }
+                finally
+                {
+                    lease.Dispose();
+                }
+                if (state.Seq != DbFormat.MaxSequenceNumber)
+                {
+                    seq = Math.Max(state.Seq, cov);
+                    return true;
+                }
+            }
+        }
+        seq = cov > 0 ? cov : DbFormat.MaxSequenceNumber;
+        Debug.Assert(cov == 0 || seq == cov);
+        return cov > 0;
+    }
+}

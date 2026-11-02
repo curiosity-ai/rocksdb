@@ -68,6 +68,7 @@ typedef struct {
   int64_t seed;
   const char* db;
   bool histogram;
+  int txn_puts;
 } Flags;
 
 static Flags FLAGS = {
@@ -98,6 +99,7 @@ static Flags FLAGS = {
     .seed = 301,
     .db = "/tmp/rocksdb-c-bench",
     .histogram = true,
+    .txn_puts = 10,
 };
 
 static void usage(void) {
@@ -105,7 +107,7 @@ static void usage(void) {
           "usage: rocksdb_bench [--benchmarks a,b,...] [--num N] [--reads N] "
           "[--key_size 16] [--value_size 100]\n"
           "  [--threads 1] [--batch_size 1] [--multiget_size 16] "
-          "[--seek_nexts 10] [--disable_wal] [--sync]\n"
+          "[--seek_nexts 10] [--txn_puts 10] [--disable_wal] [--sync]\n"
           "  [--cache_size BYTES] [--cache_type lru|hyperclock] [--bloom_bits "
           "10] [--write_buffer_size BYTES]\n"
           "  [--block_size 4096] [--compression none|snappy|lz4|zstd] "
@@ -118,7 +120,7 @@ static void usage(void) {
           "readmissing readseq readreverse\n"
           "            seekrandom multireadrandom readwhilewriting "
           "deleterandom flush compact\n"
-          "            waitforcompaction stats\n");
+          "            waitforcompaction stats txnoptimistic txnpessimistic\n");
 }
 
 static bool parse_bool(const char* v) {
@@ -187,6 +189,7 @@ static void parse_flags(int argc, char** argv) {
     else if (FLAG("seed")) FLAGS.seed = strtoll(value, NULL, 10);
     else if (FLAG("db")) FLAGS.db = value;
     else if (FLAG("histogram")) FLAGS.histogram = parse_bool(value);
+    else if (FLAG("txn_puts")) FLAGS.txn_puts = atoi(value);
     else if (FLAG("engine") || FLAG("async")) { /* accepted for runner parity */ }
     else {
       fprintf(stderr, "unknown flag --%s\n", name);
@@ -202,6 +205,7 @@ static void parse_flags(int argc, char** argv) {
   if (FLAGS.threads < 1) FLAGS.threads = 1;
   if (FLAGS.batch_size < 1) FLAGS.batch_size = 1;
   if (FLAGS.multiget_size < 1) FLAGS.multiget_size = 1;
+  if (FLAGS.txn_puts < 1) FLAGS.txn_puts = 1;
   if (FLAGS.reads < 0) FLAGS.reads = FLAGS.num;
 }
 
@@ -463,6 +467,8 @@ typedef enum {
   B_COMPACT,
   B_WAITFORCOMPACTION,
   B_STATS,
+  B_TXNOPTIMISTIC,
+  B_TXNPESSIMISTIC,
   B_UNKNOWN
 } BenchId;
 
@@ -470,7 +476,8 @@ static const char* kBenchNames[] = {
     "fillseq",     "fillrandom",   "overwrite",       "fillsync",
     "readrandom",  "readmissing",  "readseq",         "readreverse",
     "seekrandom",  "multireadrandom", "readwhilewriting", "deleterandom",
-    "flush",       "compact",      "waitforcompaction", "stats"};
+    "flush",       "compact",      "waitforcompaction", "stats",
+    "txnoptimistic", "txnpessimistic"};
 
 static BenchId bench_from_name(const char* n) {
   for (int i = 0; i < B_UNKNOWN; i++)
@@ -684,6 +691,90 @@ static void do_multiget(ThreadState* t, int64_t n, uint64_t* rng) {
   t->ops = n;
 }
 
+// ---------------------------------------------------------------- transactions
+
+// txnoptimistic / txnpessimistic run against their own fresh transactional DB
+// (<db>-<benchmark>): OptimisticTransactionDB or TransactionDB (WriteCommitted).
+static rocksdb_optimistictransactiondb_t* g_otxn_db;
+static rocksdb_transactiondb_t* g_txn_db;
+static rocksdb_transactiondb_options_t* g_txn_db_options;
+static rocksdb_transaction_options_t* g_txn_options;
+static rocksdb_optimistictransaction_options_t* g_otxn_options;
+
+static void open_txn_db(BenchId b, const char* name) {
+  char path[1024];
+  snprintf(path, sizeof(path), "%s-%s", FLAGS.db, name);
+  nftw(path, rm_cb, 64, FTW_DEPTH | FTW_PHYS);
+  mkdir(path, 0755);
+  char* err = NULL;
+  if (b == B_TXNOPTIMISTIC) {
+    g_otxn_options = rocksdb_optimistictransaction_options_create();
+    g_otxn_db = rocksdb_optimistictransactiondb_open(g_options, path, &err);
+    check(err, "rocksdb_optimistictransactiondb_open");
+  } else {
+    g_txn_db_options = rocksdb_transactiondb_options_create();
+    g_txn_options = rocksdb_transaction_options_create();
+    g_txn_db = rocksdb_transactiondb_open(g_options, g_txn_db_options, path, &err);
+    check(err, "rocksdb_transactiondb_open");
+  }
+}
+
+static void close_txn_db(void) {
+  if (g_otxn_db != NULL) {
+    rocksdb_optimistictransactiondb_close(g_otxn_db);
+    rocksdb_optimistictransaction_options_destroy(g_otxn_options);
+    g_otxn_db = NULL;
+  }
+  if (g_txn_db != NULL) {
+    rocksdb_transactiondb_close(g_txn_db);
+    rocksdb_transaction_options_destroy(g_txn_options);
+    rocksdb_transactiondb_options_destroy(g_txn_db_options);
+    g_txn_db = NULL;
+  }
+}
+
+static atomic_llong g_txn_retries;
+
+// One op = one transaction of --txn_puts random puts; conflicts (Busy /
+// TryAgain / TimedOut) are rolled back and retried.
+static void do_txns(ThreadState* t, BenchId b, int64_t n, uint64_t* rng) {
+  int ks = FLAGS.key_size, vs = FLAGS.value_size, puts = FLAGS.txn_puts;
+  char* keys = (char*)malloc((size_t)ks * (size_t)puts);
+  ValueGen vg = {0};
+  rocksdb_transaction_t* txn = NULL;
+  int64_t retries = 0;
+  for (int64_t i = 0; i < n; i++) {
+    for (int j = 0; j < puts; j++)
+      make_key(keys + (size_t)j * (size_t)ks, ks,
+               rng_uniform(rng, (uint64_t)FLAGS.num));
+    const char* v = next_value(&vg, vs);
+    uint64_t t0 = now_ns();
+    for (;;) {
+      txn = b == B_TXNOPTIMISTIC
+                ? rocksdb_optimistictransaction_begin(g_otxn_db, g_wo,
+                                                      g_otxn_options, txn)
+                : rocksdb_transaction_begin(g_txn_db, g_wo, g_txn_options, txn);
+      char* err = NULL;
+      for (int j = 0; j < puts && err == NULL; j++)
+        rocksdb_transaction_put(txn, keys + (size_t)j * (size_t)ks, (size_t)ks,
+                                v, (size_t)vs, &err);
+      if (err == NULL) rocksdb_transaction_commit(txn, &err);
+      if (err == NULL) break;
+      rocksdb_free(err);
+      err = NULL;
+      rocksdb_transaction_rollback(txn, &err);
+      if (err != NULL) rocksdb_free(err);
+      retries++;
+    }
+    if (FLAGS.histogram) hist_add(&t->hist, now_ns() - t0);
+  }
+  if (txn != NULL) rocksdb_transaction_destroy(txn);
+  free(keys);
+  atomic_fetch_add(&g_txn_retries, retries);
+  t->ops = n;
+  t->bytes = n * puts * (ks + vs);
+}
+
 // readwhilewriting: the writer (tid == threads) writes random keys until all
 // readers are done.
 static void do_background_writer(ThreadState* t, uint64_t* rng) {
@@ -746,6 +837,10 @@ static void* thread_main(void* arg) {
     case B_DELETERANDOM:
       do_deletes(t, n, &rng);
       break;
+    case B_TXNOPTIMISTIC:
+    case B_TXNPESSIMISTIC:
+      do_txns(t, s->bench, n, &rng);
+      break;
     default:
       break;
   }
@@ -802,6 +897,12 @@ static void run_threaded(BenchId b, int bench_index, const char* name) {
     case B_READWHILEWRITING:
       s.total_ops = FLAGS.reads;
       break;
+    case B_TXNOPTIMISTIC:
+    case B_TXNPESSIMISTIC:
+      // one op = one transaction (as many puts in total as fillrandom)
+      s.total_ops = FLAGS.num / FLAGS.txn_puts > 0 ? FLAGS.num / FLAGS.txn_puts : 1;
+      atomic_store(&g_txn_retries, 0);
+      break;
     default:
       s.total_ops = FLAGS.num;
       break;
@@ -840,6 +941,9 @@ static void run_threaded(BenchId b, int bench_index, const char* name) {
   if (b == B_READWHILEWRITING)
     snprintf(extra, sizeof(extra), "(writer: %lld puts)",
              (long long)atomic_load(&s.writer_ops));
+  if (b == B_TXNOPTIMISTIC || b == B_TXNPESSIMISTIC)
+    snprintf(extra, sizeof(extra), "(%d puts/txn, %lld retries)",
+             FLAGS.txn_puts, (long long)atomic_load(&g_txn_retries));
   if (b == B_FILLSEQ || b == B_FILLRANDOM || b == B_OVERWRITE ||
       b == B_FILLSYNC)
     g_user_bytes_written += bytes;
@@ -973,6 +1077,11 @@ int main(int argc, char** argv) {
     if (b == B_STATS) print_stats();
     else if (b == B_FLUSH || b == B_COMPACT || b == B_WAITFORCOMPACTION)
       run_single(b, name);
+    else if (b == B_TXNOPTIMISTIC || b == B_TXNPESSIMISTIC) {
+      open_txn_db(b, name);
+      run_threaded(b, index, name);
+      close_txn_db();
+    }
     else run_threaded(b, index, name);
   }
   free(list);

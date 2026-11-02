@@ -146,7 +146,8 @@ Write-amp: fill 3.42 native vs 3.24 managed; overwrite 4.12 vs 4.17.
 ## Phase 3 — Compat + performance
 - [~] Features: WriteBatchWithIndex, SetOptions/SetDBOptions, custom comparators e2e, KeyMayExist/approx sizes/properties, Statistics, info LOG, wide columns (agent running)
 - [~] Perf #2 (agent running)
-- [~] Transactions (pessimistic + optimistic TransactionDB) (agent running)
+- [x] Transactions: `OptimisticTransactionDatabase` (serial + parallel validation), `TransactionDatabase` (WriteCommitted, point locks, timeouts, deadlock detection, expiration, 2PC prepare/commit/rollback + recovery); 2PC WAL records byte-identical to native, prepared txns recover across engines; fixed recovery last-sequence bug for 2PC records; dbbench txnoptimistic/txnpessimistic on all engines
+- [ ] Transactions gaps: WritePrepared/WriteUnprepared, range locks, UDT; unify IndexedWriteBatch with public WriteBatchWithIndex; pool lock entries/tracked keys (~1.8–2.3 KB/txn)
 - [x] Replaced stringy enums: typed FilterPolicy/MergeOperator/CompactionFilter/SliceTransform options (persisted text preserved byte-for-byte), MemTableFactoryType/TableFactoryType/FlushBlockPolicyType, `DbProperties` constants, `AppendEntriesRejectReason`, bench EngineKind/DbBenchmark/CompressionType flags, round-trip FilterKind
 - [ ] `ColumnFamilyOptions.ComparatorName` → typed Comparator (features agent)
 - [x] Fixed intermittent hang (CloseRacingWritersAndFlushes): FlushAsync/WaitForCompact waiters slept forever when close stopped scheduling a queued flush; shutdown now signals waiters, which fail with ObjectDisposed/ShutdownInProgress

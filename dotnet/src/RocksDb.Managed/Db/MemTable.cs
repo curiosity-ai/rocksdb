@@ -106,6 +106,28 @@ public sealed unsafe class MemTable : IDisposable
 
     public int RefCount => Volatile.Read(ref _refs);
 
+    // ------------------------------------------------------------------ 2PC
+
+    private long _minPrepLog; // 0 = no committed 2PC data in this memtable
+
+    /// <summary>
+    /// Records that this memtable holds committed data whose prepared section is in WAL <paramref name="log"/>
+    /// (MemTable::RefLogContainingPrepSection): that WAL must stay until the memtable is flushed.
+    /// </summary>
+    public void RefLogContainingPrepSection(ulong log)
+    {
+        long cur = Volatile.Read(ref _minPrepLog);
+        while (cur == 0 || (ulong)cur > log)
+        {
+            long o = Interlocked.CompareExchange(ref _minPrepLog, (long)log, cur);
+            if (o == cur) return;
+            cur = o;
+        }
+    }
+
+    /// <summary>MemTable::GetMinLogContainingPrepSection: 0 if none.</summary>
+    public ulong MinLogContainingPrepSection => (ulong)Volatile.Read(ref _minPrepLog);
+
     // ------------------------------------------------------------------ writes
 
     /// <summary>

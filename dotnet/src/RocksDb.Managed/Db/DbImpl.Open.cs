@@ -360,8 +360,17 @@ internal sealed partial class DbImpl
     {
         var edits = new Dictionary<uint, VersionEdit>();
         ulong minLog;
-        lock (_mutex) minLog = Versions.MinLogNumberWithUnflushedData(null);
-        minLog = Math.Max(minLog, Versions.MinLogNumberToKeep);
+        if (Options.Allow2Pc)
+        {
+            // In 2PC mode WALs below the CFs' log numbers may still hold prepared sections: start at the persisted
+            // min_log_number_to_keep (DBImpl::SetupLogFilesRecovery).
+            minLog = Versions.MinLogNumberToKeep;
+        }
+        else
+        {
+            lock (_mutex) minLog = Versions.MinLogNumberWithUnflushedData(null);
+            minLog = Math.Max(minLog, Versions.MinLogNumberToKeep);
+        }
 
         var wals = new List<ulong>();
         foreach (string child in FileSystem.GetChildren(WalDir))
@@ -446,7 +455,9 @@ internal sealed partial class DbImpl
             foreach (ColumnFamilyData cfd in GetColumnFamilies())
             {
                 if (cfd.Mem.IsEmpty) continue;
-                if (Options.AvoidFlushDuringRecovery)
+                // Force flush on DB open if 2PC is enabled, since with 2PC we have no guarantee that consecutive log
+                // files have consecutive sequence id, which make recovery complicated (SanitizeOptions).
+                if (Options.AvoidFlushDuringRecovery && !Options.Allow2Pc)
                 {
                     // Keep the data in the memtable; the WALs stay alive until it is flushed.
                     continue;
@@ -458,6 +469,7 @@ internal sealed partial class DbImpl
         {
             foreach (ulong n in wals) _aliveWals.Add(n);
         }
+        MarkRecoveredPrepSections();
         return edits;
     }
 
@@ -491,11 +503,14 @@ internal sealed partial class DbImpl
         }
         var inserter = new MemTableInserter(this, walNumber, ignoreMissingColumnFamilies: true) { Sequence = seq };
         WriteBatch.Iterate(record, ref inserter);
-        progress.NextSequence = seq + count;
-        if (count > 0)
+        // next_sequence comes from the inserter, not the record header: a prepared section counts its entries but
+        // consumes no sequence numbers, and a commit marker consumes those of the prepared batch it applies.
+        ulong next = inserter.Sequence;
+        progress.NextSequence = next;
+        if (count > 0 || next > seq) progress.AnyData = true;
+        if (next > seq)
         {
-            progress.AnyData = true;
-            ulong last = seq + count - 1;
+            ulong last = next - 1;
             if (last > progress.LastSequence) progress.LastSequence = last;
         }
         return true;
