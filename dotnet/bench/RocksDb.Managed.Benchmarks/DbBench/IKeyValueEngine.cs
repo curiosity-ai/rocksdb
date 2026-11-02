@@ -1,9 +1,10 @@
 namespace RocksDb.Managed.Benchmarks.DbBench;
 
 /// <summary>
-/// Minimal key-value engine abstraction used by the db_bench-style runner so the native RocksDB (via rocksdb-sharp)
-/// and the managed port can be measured with identical workloads. Implementations are used from one thread unless
-/// stated otherwise.
+/// Key-value engine abstraction used by the db_bench-style runner and the head-to-head micro benchmarks so the native
+/// RocksDB (via rocksdb-sharp) and the managed port are measured with identical workloads. Every member is safe to call
+/// from several threads at once (like the underlying DBs); the objects it creates (batches, iterators, MultiGet
+/// contexts) belong to one thread.
 /// </summary>
 public interface IKeyValueEngine : IDisposable
 {
@@ -11,13 +12,62 @@ public interface IKeyValueEngine : IDisposable
 
     void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value);
 
+    /// <summary>Put that always fsyncs the WAL (fillsync), independently of <see cref="EngineOptions.Sync"/>.</summary>
+    void PutSync(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value);
+
     /// <summary>Point lookup. Copies up to <paramref name="valueBuffer"/>.Length bytes; returns false if not found.</summary>
     bool TryGet(ReadOnlySpan<byte> key, Span<byte> valueBuffer, out int valueLength);
 
     void Delete(ReadOnlySpan<byte> key);
 
+    IEngineWriteBatch CreateWriteBatch();
+
+    void Write(IEngineWriteBatch batch);
+
+    IEngineIterator NewIterator();
+
+    IMultiGetContext CreateMultiGetContext(int maxKeys, int keySize);
+
     /// <summary>Flushes memtables to SST files and waits for completion.</summary>
     void Flush();
+
+    /// <summary>Full-range manual compaction; returns false if the engine doesn't support it.</summary>
+    bool TryCompactRange();
+}
+
+/// <summary>A reusable write batch owned by one thread.</summary>
+public interface IEngineWriteBatch : IDisposable
+{
+    void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value);
+
+    void Clear();
+}
+
+/// <summary>A forward/backward iterator owned by one thread. Key/Value spans are valid until the next move.</summary>
+public interface IEngineIterator : IDisposable
+{
+    bool Valid { get; }
+    ReadOnlySpan<byte> Key { get; }
+    ReadOnlySpan<byte> Value { get; }
+
+    void SeekToFirst();
+
+    void SeekToLast();
+
+    void Seek(ReadOnlySpan<byte> key);
+
+    void Next();
+
+    void Prev();
+}
+
+/// <summary>Batched point lookups: fill <see cref="Key"/>(0..count-1), then call <see cref="Run"/>.</summary>
+public interface IMultiGetContext : IDisposable
+{
+    Span<byte> Key(int index);
+
+    /// <summary>Looks up the first <paramref name="count"/> keys; returns the number found and the total value bytes.</summary>
+    int Run(int count, out long valueBytes);
 }
 
 /// <summary>Engine-independent DB configuration, mirroring the db_bench flags the runner supports.</summary>
@@ -32,6 +82,9 @@ public sealed record EngineOptions
     /// <summary>--cache_size (db_bench default 8 MiB).</summary>
     public long BlockCacheSize { get; init; } = 8L << 20;
 
+    /// <summary>--cache_type: lru (RocksDB's default, used by all engines by default) or hyperclock.</summary>
+    public string CacheType { get; init; } = "lru";
+
     /// <summary>--bloom_bits (db_bench default -1 = none; we default to 10 for realistic point lookups).</summary>
     public int BloomBitsPerKey { get; init; } = 10;
 
@@ -41,7 +94,7 @@ public sealed record EngineOptions
     /// <summary>--block_size (4 KiB).</summary>
     public int BlockSize { get; init; } = 4096;
 
-    /// <summary>Compression is always "none" for now so that compression codecs don't dominate comparisons.</summary>
+    /// <summary>--compression: none, snappy, lz4 or zstd (all levels).</summary>
     public string Compression { get; init; } = "none";
 }
 
@@ -54,9 +107,9 @@ public static class EngineFactory
         Directory.CreateDirectory(path);
         return engine switch
         {
-            "native" => new Native.NativeKeyValueEngine(path, options),
+            "native" or "rocksdb-sharp" => new Native.NativeKeyValueEngine(path, options),
             "managed" => new ManagedEngine(path, options),
-            _ => throw new ArgumentException("unknown engine '" + engine + "' (expected native|managed)"),
+            _ => throw new ArgumentException("unknown engine '" + engine + "' (expected rocksdb-sharp|native|managed|c-native)"),
         };
     }
 }
