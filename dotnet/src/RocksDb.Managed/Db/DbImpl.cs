@@ -64,6 +64,15 @@ internal sealed partial class DbImpl : IAsyncDisposable
         Identity = new DbIdentity("", GenerateDbSessionId(), host);
         _seqPerBatch = options.SeqPerBatch;
         _batchPerTxn = options.BatchPerTxn;
+        _twoWriteQueues = options.TwoWriteQueues;
+        // last_seq_same_as_publish_seq_ (db_impl.cc): only the WAL-only writes of a seq_per_batch DB consume sequence
+        // numbers on the second queue, so only then is the published sequence maintained separately.
+        _lastSeqSameAsPublishSeq = !(_seqPerBatch && _twoWriteQueues);
+        if (_twoWriteQueues)
+        {
+            _nonmemWriteThread = new WriteThread(options.MaxWriteBatchGroupSizeBytes);
+            _walWriteLock = new SemaphoreSlim(1, 1);
+        }
     }
 
     // ---- WritePrepared / WriteUnprepared support (seq_per_batch_, batch_per_txn_, use_custom_gc_) ---------
@@ -242,7 +251,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         ThrowIfDisposed();
         lock (_mutex)
         {
-            var s = new Snapshot(this, Versions.LastSequence, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            var s = new Snapshot(this, LastPublishedSequence, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
             _snapshots.Add(s);
             return s;
         }
@@ -612,7 +621,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         WriteThread.Writer w = await EnterUnbatchedCoreAsync(synchronous).ConfigureAwait(false);
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
-            _writeThread.ExitAsLeader();
+            ExitUnbatchedQueues();
             return;
         }
         NotifySequenceWaiters(); // wake WAL tailers so they observe the close
@@ -650,9 +659,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
         finally
         {
-            _writeThread.ExitAsLeader();
+            ExitUnbatchedQueues();
             WriteThread.Return(w, synchronous);
             _groupBatch.Dispose();
+            _nonmemGroupBatch.Dispose();
             try { ShutdownMonitoring(); } catch (Exception e) when (e is IOException or RocksDbException) { }
             _dbLock?.Dispose();
             _dbLock = null;

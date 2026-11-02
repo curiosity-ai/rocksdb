@@ -522,6 +522,8 @@ internal sealed partial class DbImpl
         bool anyData = progress.AnyData;
 
         Versions.SetLastSequence(lastSequence);
+        // RecoverLogFiles: last_allocated_sequence_ and last_published_sequence_ follow the recovered last sequence.
+        Versions.SetLastPublishedSequence(lastSequence);
         if (anyData)
         {
             Versions.MarkFileNumberUsed(wals[^1] + 1);

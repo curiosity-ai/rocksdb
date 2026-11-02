@@ -876,8 +876,8 @@ Format-level deviations (the output is always readable by native RocksDB):
 Not ported yet:
 
 - Timestamps in optimistic transactions and explicit-timestamp `WriteBatchWithIndex` writes (NotSupported, as upstream).
-- Range locks; for WritePrepared / WriteUnprepared: two_write_queues, commit-time batches, iterator invalidation
-  when a WriteUnprepared transaction ends, and user-defined timestamps (NotSupported, as upstream).
+- Range locks; for WritePrepared / WriteUnprepared: iterator invalidation when a WriteUnprepared transaction ends, and
+  user-defined timestamps (NotSupported, as upstream).
 - PlainTable and CuckooTable, parallel compression, subcompactions, `CompactFiles`,
   the SST file manager and a rate limiter for flush and compaction.
 - Wide-column entities with blob-backed columns (V2) and blob direct write (forced blob GC is leveled-only, as

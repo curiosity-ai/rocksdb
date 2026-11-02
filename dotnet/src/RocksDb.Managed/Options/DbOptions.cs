@@ -109,6 +109,12 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     public bool AvoidFlushDuringRecovery { get; set; }
     public bool AvoidFlushDuringShutdown { get; set; }
     public bool AllowIngestBehind { get; set; }
+    /// <summary>
+    /// two_write_queues: writes that only go to the WAL (2PC prepares of WriteCommitted transactions, commit and
+    /// rollback markers of WritePrepared / WriteUnprepared transactions) use a second write queue instead of waiting
+    /// behind memtable writes. WritePrepared / WriteUnprepared commits without prepare then take two writes (the data,
+    /// then a WAL-less commit on the second queue). Default false.
+    /// </summary>
     public bool TwoWriteQueues { get; set; }
     public bool ManualWalFlush { get; set; }
     public CompressionType WalCompression { get; set; } = CompressionType.None;

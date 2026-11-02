@@ -24,9 +24,18 @@ internal sealed class NativeTxnDb : IDisposable
     }
 
     /// <summary>Opens a TransactionDB with <paramref name="policy"/> (rocksdb_transactiondb_options_set_write_policy).</summary>
-    public NativeTxnDb(string path, TransactionWritePolicy policy)
+    public NativeTxnDb(string path, TransactionWritePolicy policy) : this(path, policy, twoWriteQueues: false)
+    {
+    }
+
+    /// <summary>
+    /// Opens a TransactionDB with <paramref name="policy"/> (rocksdb_transactiondb_options_set_write_policy) and
+    /// two_write_queues (rocksdb_options_set_two_write_queues).
+    /// </summary>
+    public NativeTxnDb(string path, TransactionWritePolicy policy, bool twoWriteQueues)
     {
         _options = new RocksDbSharp.DbOptions().SetCreateIfMissing(true);
+        if (twoWriteQueues) N.rocksdb_options_set_two_write_queues(_options.Handle, 1);
         _txnDbOptions = N.rocksdb_transactiondb_options_create();
         // TxnDBWritePolicy: WRITE_COMMITTED = 0, WRITE_PREPARED = 1, WRITE_UNPREPARED = 2 (same values as the managed enum)
         N.rocksdb_transactiondb_options_set_write_policy(_txnDbOptions, (int)policy);

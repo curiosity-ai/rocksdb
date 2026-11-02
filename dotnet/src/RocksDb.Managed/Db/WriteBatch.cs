@@ -217,8 +217,18 @@ public sealed class WriteBatch : IDisposable
         _contentFlags = ContentFlags.None;
         _savePointCount = 0;
         HasKeyWithTimestamp = false;
+        IsLatestPersistentState = false;
         _cfTimestampSizes?.Clear();
     }
+
+    /// <summary>
+    /// is_latest_persistent_state_ (WriteBatchInternal::SetAsLatestPersistentState): the batch is a commit-time batch
+    /// of a WritePrepared / WriteUnprepared transaction with use_only_the_last_commit_time_batch_for_recovery. Only its
+    /// last occurrence matters for recovery, so the DB caches the last such WAL record and writes it to the memtables
+    /// before a memtable switch (the WAL holding it may be deleted after the flush). Not persisted; reset by
+    /// <see cref="Clear"/>.
+    /// </summary>
+    internal bool IsLatestPersistentState { get; set; }
 
     private Dictionary<uint, int>? _cfTimestampSizes;
 

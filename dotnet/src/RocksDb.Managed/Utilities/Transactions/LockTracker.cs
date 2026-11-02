@@ -22,19 +22,51 @@ internal enum UntrackStatus : byte
     Removed,
 }
 
-/// <summary>The keys tracked in one column family.</summary>
+/// <summary>
+/// The keys tracked in one column family. Keys live in buffers recycled by the column family's table, so tracking and
+/// clearing keys allocates nothing once the table and its buffer pool have grown to the transaction's size.
+/// </summary>
 internal sealed class TrackedColumnFamily
 {
+    private KeyBufferPool _buffers;
+
     public TrackedColumnFamily(ColumnFamilyData cfd)
     {
         Cfd = cfd;
-        Keys = new Dictionary<byte[], TrackedKeyInfo>(ByteKeyComparer.Instance);
+        Keys = new Dictionary<PooledKey, TrackedKeyInfo>(PooledKeyComparer.Instance);
         Lookup = Keys.GetAlternateLookup<ReadOnlySpan<byte>>();
     }
 
     public ColumnFamilyData Cfd { get; }
-    public Dictionary<byte[], TrackedKeyInfo> Keys { get; }
-    public Dictionary<byte[], TrackedKeyInfo>.AlternateLookup<ReadOnlySpan<byte>> Lookup { get; }
+    public Dictionary<PooledKey, TrackedKeyInfo> Keys { get; }
+    public Dictionary<PooledKey, TrackedKeyInfo>.AlternateLookup<ReadOnlySpan<byte>> Lookup { get; }
+
+    /// <summary>The tracking state of <paramref name="key"/>, added (zeroed, with a recycled key buffer) if absent.</summary>
+    public ref TrackedKeyInfo GetOrAdd(ReadOnlySpan<byte> key, out bool exists)
+    {
+        ref TrackedKeyInfo info = ref CollectionsMarshal.GetValueRefOrNullRef(Lookup, key);
+        if (!Unsafe.IsNullRef(ref info))
+        {
+            exists = true;
+            return ref info;
+        }
+        exists = false;
+        return ref CollectionsMarshal.GetValueRefOrAddDefault(Keys, _buffers.Rent(key), out _);
+    }
+
+    /// <summary>Untracks <paramref name="key"/> and recycles its buffer.</summary>
+    public void Remove(ReadOnlySpan<byte> key)
+    {
+        if (Lookup.Remove(key, out PooledKey actual, out _)) _buffers.Return(actual);
+    }
+
+    /// <summary>Untracks every key (the table and the key buffers are kept for reuse).</summary>
+    public void Clear()
+    {
+        if (Keys.Count == 0) return;
+        foreach (PooledKey k in Keys.Keys) _buffers.Return(k);
+        Keys.Clear();
+    }
 }
 
 /// <summary>
@@ -95,7 +127,7 @@ internal sealed class LockTracker
     public void Track(ColumnFamilyData cfd, ReadOnlySpan<byte> key, ulong seq, bool readOnly, bool exclusive)
     {
         TrackedColumnFamily c = GetOrAdd(cfd);
-        ref TrackedKeyInfo info = ref CollectionsMarshal.GetValueRefOrAddDefault(c.Lookup, key, out bool exists);
+        ref TrackedKeyInfo info = ref c.GetOrAdd(key, out bool exists);
         if (!exists)
         {
             info.Seq = seq;
@@ -131,7 +163,7 @@ internal sealed class LockTracker
         if (info.NumReads > 0) info.NumReads--;
         if (info.NumReads == 0 && info.NumWrites == 0)
         {
-            c.Lookup.Remove(key);
+            c.Remove(key);
             return UntrackStatus.Removed;
         }
         return UntrackStatus.Untracked;
@@ -144,9 +176,9 @@ internal sealed class LockTracker
         {
             TrackedColumnFamily o = other.GetColumnFamily(i);
             TrackedColumnFamily c = GetOrAdd(o.Cfd);
-            foreach (KeyValuePair<byte[], TrackedKeyInfo> kv in o.Keys)
+            foreach (KeyValuePair<PooledKey, TrackedKeyInfo> kv in o.Keys)
             {
-                ref TrackedKeyInfo info = ref CollectionsMarshal.GetValueRefOrAddDefault(c.Keys, kv.Key, out bool exists);
+                ref TrackedKeyInfo info = ref c.GetOrAdd(kv.Key.Span, out bool exists);
                 if (!exists || kv.Value.Seq < info.Seq) info.Seq = kv.Value.Seq;
                 info.NumReads += kv.Value.NumReads;
                 info.NumWrites += kv.Value.NumWrites;
@@ -167,28 +199,29 @@ internal sealed class LockTracker
             TrackedColumnFamily s = since.GetColumnFamily(i);
             TrackedColumnFamily? c = Find(s.Cfd.Id);
             if (c is null) continue;
-            foreach (KeyValuePair<byte[], TrackedKeyInfo> kv in s.Keys)
+            foreach (KeyValuePair<PooledKey, TrackedKeyInfo> kv in s.Keys)
             {
-                ref TrackedKeyInfo info = ref CollectionsMarshal.GetValueRefOrNullRef(c.Keys, kv.Key);
+                ReadOnlySpan<byte> key = kv.Key.Span;
+                ref TrackedKeyInfo info = ref CollectionsMarshal.GetValueRefOrNullRef(c.Lookup, key);
                 if (Unsafe.IsNullRef(ref info)) continue;
                 info.NumReads = info.NumReads >= kv.Value.NumReads ? info.NumReads - kv.Value.NumReads : 0;
                 info.NumWrites = info.NumWrites >= kv.Value.NumWrites ? info.NumWrites - kv.Value.NumWrites : 0;
                 if (info.NumReads == 0 && info.NumWrites == 0)
                 {
-                    c.Keys.Remove(kv.Key);
-                    untracked?.Add((c.Cfd, kv.Key));
+                    c.Remove(key);
+                    untracked?.Add((c.Cfd, key.ToArray()));
                 }
             }
         }
     }
 
-    /// <summary>Untracks everything (the per-CF tables are kept for reuse).</summary>
+    /// <summary>Untracks everything (the per-CF tables and key buffers are kept for reuse).</summary>
     public void Clear()
     {
-        _first?.Keys.Clear();
+        _first?.Clear();
         if (_more is not null)
         {
-            foreach (TrackedColumnFamily c in _more) c.Keys.Clear();
+            foreach (TrackedColumnFamily c in _more) c.Clear();
         }
     }
 }

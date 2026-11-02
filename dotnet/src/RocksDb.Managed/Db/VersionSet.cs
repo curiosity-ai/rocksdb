@@ -34,8 +34,11 @@ internal sealed class VersionSet : IAsyncDisposable
     private readonly List<ObsoleteBlobFile> _obsoleteBlobFiles = new();
 
     private ulong _nextFileNumber = 2;
-    private ulong _lastSequence;          // last published sequence (visible to readers)
-    private ulong _lastAllocatedSequence; // last sequence handed out to a write group
+    // last_sequence_ <= last_published_sequence_ <= last_allocated_sequence_ (db/version_set.h). Without two write
+    // queues (or without seq_per_batch) the last sequence is also the last published one.
+    private ulong _lastSequence;          // last sequence in the memtables (maintained by the main write queue)
+    private ulong _lastAllocatedSequence; // last sequence handed out to a write group (atomic with two write queues)
+    private ulong _lastPublishedSequence; // last sequence visible to readers when it differs from _lastSequence
     private ulong _versionNumber;
     private ulong _descriptorLastSequence; // last_sequence recorded in the MANIFEST so far (descriptor_last_sequence_), guarded by _manifestLock
     private ManifestLogWriter? _manifestLog;
@@ -82,25 +85,69 @@ internal sealed class VersionSet : IAsyncDisposable
 
     public void SetNextFileNumber(ulong value) => Volatile.Write(ref _nextFileNumber, value);
 
-    /// <summary>The last sequence number visible to readers (LastSequence / LastPublishedSequence).</summary>
+    /// <summary>
+    /// The last sequence number written to the memtables (VersionSet::LastSequence). It is also the last sequence
+    /// visible to readers unless the DB has two write queues with seq_per_batch (see
+    /// <see cref="LastPublishedSequence"/>).
+    /// </summary>
     public ulong LastSequence => Volatile.Read(ref _lastSequence);
 
-    /// <summary>Publishes <paramref name="s"/> to readers (SetLastSequence). Only the write leader calls this.</summary>
+    /// <summary>
+    /// Sets the last sequence number (SetLastSequence). Only the main write queue's leader (or a writer that blocked both
+    /// queues) calls this. Also raises the last allocated sequence when it is behind (recovery, ingestion).
+    /// </summary>
     public void SetLastSequence(ulong s)
     {
         Volatile.Write(ref _lastSequence, s);
-        if (s > _lastAllocatedSequence) _lastAllocatedSequence = s;
+        ulong cur = Volatile.Read(ref _lastAllocatedSequence);
+        while (cur < s)
+        {
+            ulong o = Interlocked.CompareExchange(ref _lastAllocatedSequence, s, cur);
+            if (o == cur) break;
+            cur = o;
+        }
     }
 
-    /// <summary>Allocates <paramref name="count"/> sequence numbers; returns the first. Write leader only.</summary>
-    public ulong AllocateSequence(ulong count)
+    /// <summary>
+    /// Allocates <paramref name="count"/> sequence numbers; returns the first. Thread-safe (FetchAddLastAllocatedSequence
+    /// + 1): with two write queues both leaders allocate concurrently.
+    /// </summary>
+    public ulong AllocateSequence(ulong count) => Interlocked.Add(ref _lastAllocatedSequence, count) - count + 1;
+
+    /// <summary>LastAllocatedSequence: the last sequence handed out (&gt;= <see cref="LastSequence"/>).</summary>
+    public ulong LastAllocatedSequence => Volatile.Read(ref _lastAllocatedSequence);
+
+    /// <summary>
+    /// LastPublishedSequence: the last sequence visible to readers when the DB has two write queues and seq_per_batch
+    /// (WritePrepared / WriteUnprepared), published by the commit callbacks of the second queue.
+    /// </summary>
+    public ulong LastPublishedSequence => Volatile.Read(ref _lastPublishedSequence);
+
+    /// <summary>
+    /// SetLastPublishedSequence. Callers publish in increasing order (the WAL-only queue publishes); a smaller value
+    /// (a callback run at open time from the main queue) never moves the published sequence back.
+    /// </summary>
+    public void SetLastPublishedSequence(ulong s)
     {
-        ulong first = _lastAllocatedSequence + 1;
-        _lastAllocatedSequence += count;
-        return first;
+        ulong cur = Volatile.Read(ref _lastPublishedSequence);
+        while (cur < s)
+        {
+            ulong o = Interlocked.CompareExchange(ref _lastPublishedSequence, s, cur);
+            if (o == cur) return;
+            cur = o;
+        }
     }
 
-    public ulong LastAllocatedSequence => _lastAllocatedSequence;
+    /// <summary>
+    /// SyncLastSequenceWithAllocated: raises the last sequence to the last allocated one. REQUIRES: no write in
+    /// progress on either queue (sequence numbers allocated by WAL-only writes of the second queue are accounted for in
+    /// new memtables / MANIFEST state).
+    /// </summary>
+    public void SyncLastSequenceWithAllocated()
+    {
+        ulong alloc = LastAllocatedSequence;
+        if (alloc > LastSequence) Volatile.Write(ref _lastSequence, alloc);
+    }
 
     // ---- column families ------------------------------------------------------------------------
 
@@ -502,6 +549,7 @@ internal sealed class VersionSet : IAsyncDisposable
         MarkFileNumberUsed(manifestFileNumber);
         _lastSequence = state.LastSequence;
         _lastAllocatedSequence = state.LastSequence;
+        _lastPublishedSequence = state.LastSequence;
         _descriptorLastSequence = state.LastSequence;
         ManifestFileNumber = manifestFileNumber;
     }
