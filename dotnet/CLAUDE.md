@@ -119,6 +119,7 @@ compat tests pass.
   failures (NotFound, truncated input). Corruption/IO errors throw `RocksDbException` with the
   matching `StatusCode`. Keep throw sites in `ThrowHelper` so hot methods stay inlinable.
 - **Naming**: the DB class is `RocksDatabase` (a class named `RocksDb` breaks `RocksDb.Managed.*` qualified names); C++ `Version` is `DbVersion`; C++ `ValueType` is `Db.EntryType` (avoids clashing with `System.ValueType`). Public user-facing options live in `Options/` (`RocksDb.Managed.*Options`); runtime/resolved settings used internally by a subsystem get distinct names (e.g. `Table.TableFormatOptions`). Enums are defined once.
+- **No stringy enums**: closed sets of values are C# enums (or typed objects for extensible identities like filter policies, comparators, merge operators). Strings appear only at boundaries (OPTIONS file text, CLI flags, text protocols) and are parsed into enums immediately; the enum ↔ native string mapping must stay byte-identical.
 - **Encoding helpers**: use `Util.Coding` (varints/fixed LE) and `Util.Crc32C` — don't re-implement.
 - **No LINQ, no closures, no boxing, no `params` arrays, no string formatting** on hot paths.
   Prefer `sealed` classes, `readonly struct`, `static` lambdas, `[SkipLocalsInit]` where it helps.

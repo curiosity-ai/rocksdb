@@ -146,7 +146,9 @@ Write-amp: fill 3.42 native vs 3.24 managed; overwrite 4.12 vs 4.17.
 ## Phase 3 — Compat + performance
 - [~] Features: WriteBatchWithIndex, SetOptions/SetDBOptions, custom comparators e2e, KeyMayExist/approx sizes/properties, Statistics, info LOG, wide columns (agent running)
 - [~] Perf #2 (agent running)
-- [ ] Transactions (pessimistic + optimistic TransactionDB)
+- [~] Transactions (pessimistic + optimistic TransactionDB) (agent running)
+- [~] Replace stringy enums with enums/typed objects across src/samples/bench/tests (agent running)
+- [ ] Investigate intermittent hang in the unit test suite (one run timed out at 20 min; others pass in ~46 s)
 Goal: finish implementation, validate vs C++ source, comprehensive tests (unit/integration/round-trip) and benchmarks (managed vs rocksdb-sharp vs pure C native).
 - [x] Source audit #1 vs C++ (`docs/validation.md`): ~90 files (formats/util/table/wal/options/memtable/iterators); fixed memtable range-tombstone publish race, ArenaBlockSize default (0 → derived), internal-key type validation; added db_iter_test vectors
 - [x] Source audit #2 (DB layer): 11 fixes (CF-drop vs MANIFEST, torn MANIFEST continuation, PIT WAL recovery resume, Get sequence/super-version order, ingestion seqno publish, CF drop during flush, cancellation tearing WAL, WAL handle leak on switch failure, writes racing close, option sanitization, snapshot ref leak); `TestHooks`, `FaultInjectionFileSystem`, ~300-point crash sweep, concurrent stress
