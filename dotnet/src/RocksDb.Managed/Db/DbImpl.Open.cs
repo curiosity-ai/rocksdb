@@ -197,6 +197,7 @@ internal sealed partial class DbImpl
         DeleteObsoleteFilesFullScan();
         await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
         DeleteObsoleteFilesFullScan();
+        EnableBackgroundCompactions();
     }
 
     /// <summary>Resolves the pluggable objects of a CF's options for this DB (merge operator name). Returns a copy.</summary>
@@ -204,6 +205,8 @@ internal sealed partial class DbImpl
     {
         ColumnFamilyOptions o = options.Clone();
         if (o.MergeOperator is not null) o.MergeOperatorName = o.MergeOperator.Name;
+        if (o.CompactionFilter is not null) o.CompactionFilterName = o.CompactionFilter.Name;
+        if (o.CompactionFilterFactory is not null) o.CompactionFilterFactoryName = o.CompactionFilterFactory.Name;
         return o;
     }
 

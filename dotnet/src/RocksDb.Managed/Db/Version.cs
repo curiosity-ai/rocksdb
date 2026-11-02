@@ -7,16 +7,15 @@ namespace RocksDb.Managed.Db;
 /// VersionStorageInfo (db/version_set.h). L0 files are ordered newest first (NewestFirstByEpochNumber); files on
 /// other levels are non-overlapping and ordered by smallest key. Immutable once built.
 /// <para>
-/// Compaction scoring (ComputeCompactionScore, base level, dynamic level bytes) belongs to the next wave; the
-/// per-level byte totals and target sizes needed for it are maintained here.
+/// Compaction state (level targets incl. dynamic level bytes, scores, files by compaction priority) lives in
+/// <c>Compaction/VersionStorageInfo.Compaction.cs</c>.
 /// </para>
 /// </summary>
-internal sealed class VersionStorageInfo
+internal sealed partial class VersionStorageInfo
 {
     private static readonly FileMetaData[] s_empty = [];
     private readonly FileMetaData[][] _files;
     private readonly ulong[] _levelBytes;
-    private readonly ulong[] _levelMaxBytes;
 
     public VersionStorageInfo(InternalKeyComparator icmp, int numLevels, ColumnFamilyOptions options, FileMetaData[][]? files)
     {
@@ -31,21 +30,8 @@ internal sealed class VersionStorageInfo
             foreach (FileMetaData f in _files[l]) bytes += f.FileSize;
             _levelBytes[l] = bytes;
         }
-        // Static (non-dynamic) level targets, port of VersionStorageInfo::CalculateBaseBytes for
-        // level_compaction_dynamic_level_bytes == false. TODO(compaction): dynamic level bytes / base level.
-        _levelMaxBytes = new ulong[numLevels];
-        double cur = options.MaxBytesForLevelBase;
-        for (int l = 1; l < numLevels; l++)
-        {
-            if (l > 1)
-            {
-                double additional = l - 1 < options.MaxBytesForLevelMultiplierAdditional.Count
-                    ? options.MaxBytesForLevelMultiplierAdditional[l - 1]
-                    : 1;
-                cur = cur * options.MaxBytesForLevelMultiplier * additional;
-            }
-            _levelMaxBytes[l] = cur >= ulong.MaxValue ? ulong.MaxValue : (ulong)cur;
-        }
+        // Level targets, compaction scores, files by compaction priority (VersionStorageInfo::PrepareForVersionAppend).
+        InitializeCompactionState(options);
     }
 
     public InternalKeyComparator Icmp { get; }
@@ -55,8 +41,6 @@ internal sealed class VersionStorageInfo
     internal FileMetaData[] LevelFilesArray(int level) => _files[level];
     public int NumLevelFiles(int level) => _files[level].Length;
     public ulong NumLevelBytes(int level) => _levelBytes[level];
-    /// <summary>MaxBytesForLevel (static targets; L0 is governed by file count).</summary>
-    public ulong MaxBytesForLevel(int level) => _levelMaxBytes[level];
 
     public int NumFiles
     {

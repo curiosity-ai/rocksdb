@@ -166,6 +166,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         SuperVersion? old = cfd.SuperOrNull();
         cfd.SetSuper(sv);
         if (old is not null && old.Unref()) CleanupSuperVersion(old);
+        OnSuperVersionInstalled(cfd);
     }
 
     // ---- snapshots --------------------------------------------------------------------------------------
@@ -211,6 +212,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         try
         {
+            if (TryGetCompactionProperty(cfd, sv, property, out string? compactionValue)) return compactionValue;
             switch (property)
             {
                 case "rocksdb.num-entries-active-mem-table":
@@ -475,6 +477,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         try
         {
             lock (_mutex) _shuttingDown = true;
+            CancelBackgroundCompactions();
             await WaitForBackgroundWorkAsync(synchronous).ConfigureAwait(false);
             LogWriter? log = _log;
             _log = null;

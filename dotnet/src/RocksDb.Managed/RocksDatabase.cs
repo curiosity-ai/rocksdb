@@ -170,6 +170,25 @@ public sealed class RocksDatabase : IDisposable, IAsyncDisposable
     public ValueTask FlushAsync(CancellationToken cancellationToken = default) => _default.FlushAsync(cancellationToken);
     public ValueTask FlushAsync(FlushOptions options, CancellationToken cancellationToken = default) => _default.FlushAsync(options, cancellationToken);
 
+    /// <summary>Compacts all data of the default column family (see <see cref="ColumnFamily.CompactRange()"/>).</summary>
+    public void CompactRange() => _default.CompactRange();
+    public void CompactRange(byte[]? begin, byte[]? end) => _default.CompactRange(begin, end);
+    public void CompactRange(CompactRangeOptions options, byte[]? begin, byte[]? end) => _default.CompactRange(options, begin, end);
+    public ValueTask CompactRangeAsync(CancellationToken cancellationToken = default) => _default.CompactRangeAsync(cancellationToken);
+    public ValueTask CompactRangeAsync(byte[]? begin, byte[]? end, CancellationToken cancellationToken = default) =>
+        _default.CompactRangeAsync(begin, end, cancellationToken);
+    public ValueTask CompactRangeAsync(CompactRangeOptions options, byte[]? begin, byte[]? end, CancellationToken cancellationToken = default) =>
+        _default.CompactRangeAsync(options, begin, end, cancellationToken);
+
+    /// <summary>
+    /// Waits until all scheduled flushes and compactions (of every column family) have finished and no automatic
+    /// compaction is pending (DB::WaitForCompact with default options).
+    /// </summary>
+    public void WaitForCompact() => _db.WaitForCompactAsync(synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+
+    /// <summary>Async <see cref="WaitForCompact"/>.</summary>
+    public ValueTask WaitForCompactAsync(CancellationToken cancellationToken = default) => _db.WaitForCompactAsync(synchronous: false, cancellationToken);
+
     /// <summary>
     /// A DB property of the default column family, or null if unknown. Supported: rocksdb.num-entries-active-mem-table,
     /// rocksdb.num-entries-imm-mem-tables, rocksdb.num-deletes-active-mem-table, rocksdb.num-immutable-mem-table,
