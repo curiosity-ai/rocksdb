@@ -144,6 +144,7 @@ With compaction (1M ops, 16B/100B, 4MB write buffer, no compression, shared box)
 Write-amp: fill 3.42 native vs 3.24 managed; overwrite 4.12 vs 4.17.
 
 ## Phase 3 — Compat + performance
+Final completeness wave (agents running): BlobDB integrated blob files; user-defined timestamps; background error recovery + EventListener + BackupEngine; perf #3 flush/compaction throughput.
 - [x] Features: WriteBatchWithIndex (+BaseDeltaIterator; transactions now use it), SetOptions/SetDBOptions (+typed), custom comparators e2e (+MANIFEST comparator/num_levels validation), KeyMayExist/GetApproximateSizes/memtable stats/int+map properties/table properties, Statistics (all upstream tickers/histograms, native ToString), info LOG (+rotation), wide columns (PutEntity/GetEntity/iterator columns, merge/compaction) — all compat-tested vs native
 - [ ] Features gaps: compaction filters on entities, blob columns/attribute groups/MultiGetEntity, per-SuperVersion options snapshot, mutable block-based table options, KeyMayExist doing filter I/O on cache miss, cfstats interval/file-read histograms, per-level GET_HIT stats, WBWI MultiGetFromBatchAndDB
 - [ ] Flaky? `PrefixSeekTests.PrefixSameAsStartMatchesModel` failed once on net11.0 (sorted-run file count precondition); 10/10 reruns pass
