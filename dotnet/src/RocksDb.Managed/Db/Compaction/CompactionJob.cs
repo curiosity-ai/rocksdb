@@ -362,6 +362,8 @@ internal sealed class CompactionJob
             EpochNumber = _c.MinInputFileEpochNumber(),
             OldestAncestorTime = oldestAncestor,
             FileCreationTime = now,
+            // user_defined_timestamps_persisted (persist_user_defined_timestamps): the outputs strip timestamps too.
+            UserDefinedTimestampsPersisted = !_cfd.TimestampsInMemtableOnly,
         };
         var fileOptions = new WritableFileOptions
         {

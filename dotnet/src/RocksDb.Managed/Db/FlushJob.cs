@@ -17,6 +17,13 @@ internal readonly record struct DbIdentity(string DbId, string SessionId, string
 /// versions invisible to all snapshots; keeping them is always correct). Also used for recovery flushes
 /// (WriteLevel0TableForRecovery).
 /// </para>
+/// <para>
+/// With user-defined timestamps in memtable only (persist_user_defined_timestamps = false) the memtables are read
+/// through upstream's TimestampStrippingIterator view: every timestamp is replaced by the minimum timestamp, the table
+/// builder strips it from the persisted keys, and versions of a key that collapse onto one key are dropped like the
+/// flush-time CompactionIterator does (rule A: a newer version in the same snapshot stripe hides older ones; merge
+/// operands and single deletes keep what follows them).
+/// </para>
 /// </summary>
 internal static class FlushJob
 {
@@ -29,8 +36,10 @@ internal static class FlushJob
     /// the caller deletes the builder's files.
     /// </summary>
     public static async ValueTask<FileMetaData?> WriteLevel0TableAsync(IFileSystem fs, string path, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
-        ulong fileNumber, ulong epochNumber, DbIdentity identity, Blob.BlobFileBuilder? blobBuilder, bool synchronous, CancellationToken cancellationToken)
+        ulong fileNumber, ulong epochNumber, DbIdentity identity, Blob.BlobFileBuilder? blobBuilder, IReadOnlyList<ulong> snapshots, bool synchronous,
+        CancellationToken cancellationToken)
     {
+        bool stripTimestamps = cfd.TimestampsInMemtableOnly;
         ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         TableBuilderOptions tbo = TableFactory.CreateBuilderOptions(cfd.Options, TableFileLevel.Flush) with
         {
@@ -51,6 +60,8 @@ internal static class FlushJob
             EpochNumber = epochNumber,
             FileCreationTime = now,
             OldestAncestorTime = now,
+            // FileMetaData::user_defined_timestamps_persisted: the MANIFEST then stores the boundaries without timestamps.
+            UserDefinedTimestampsPersisted = !stripTimestamps,
         };
         IWritableFile file = fs.CreateWritable(path, truncate: true);
         bool keep = false;
@@ -58,9 +69,11 @@ internal static class FlushJob
         {
             using (var builder = new BlockBasedTableBuilder(file, cfd.Format, tbo))
             {
-                AddPointEntries(builder, cfd.Icmp, mems, meta, blobBuilder);
+                FragmentedRangeTombstoneList? tombstones = FragmentRangeTombstones(cfd, mems, stripTimestamps);
+                if (stripTimestamps) AddPointEntriesWithMinTimestamp(builder, cfd, mems, meta, blobBuilder, snapshots, tombstones);
+                else AddPointEntries(builder, cfd.Icmp, mems, meta, blobBuilder);
                 blobBuilder?.Finish();
-                AddRangeTombstones(builder, cfd, mems, meta);
+                if (tombstones is not null) AddRangeTombstones(builder, cfd, tombstones, meta);
                 if (builder.IsEmpty && meta.Smallest.Length == 0)
                 {
                     builder.Abandon();
@@ -183,6 +196,137 @@ internal static class FlushJob
     }
 
     /// <summary>
+    /// Flush with timestamps in memtable only: the k-way merge of <see cref="AddPointEntries(BlockBasedTableBuilder, InternalKeyComparator, IReadOnlyList{MemTable}, FileMetaData, Blob.BlobFileBuilder?)"/>
+    /// over upstream's TimestampStrippingIterator (each key's timestamp replaced by the minimum timestamp,
+    /// ReplaceInternalKeyWithMinTimestamp) followed by the hidden-version rule of the flush-time CompactionIterator.
+    /// <paramref name="snapshots"/> are the live snapshot sequence numbers, ascending. Cold path (allocates per flush).
+    /// </summary>
+    private static void AddPointEntriesWithMinTimestamp(BlockBasedTableBuilder builder, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
+        FileMetaData meta, Blob.BlobFileBuilder? blobBuilder, IReadOnlyList<ulong> snapshots, FragmentedRangeTombstoneList? tombstones)
+    {
+        InternalKeyComparator icmp = cfd.Icmp;
+        int ts = cfd.TimestampSize;
+        int n = mems.Count;
+        var its = new MemTableIterator[n];
+        for (int i = 0; i < n; i++)
+        {
+            its[i] = mems[i].NewIterator();
+            its[i].SeekToFirst();
+        }
+        using var key = new Util.PooledBufferWriter(64);
+        using var lastUserKey = new Util.PooledBufferWriter(64);
+        using var blobIndex = new Util.PooledBufferWriter(Blob.BlobIndex.MaxEncodedLength);
+        bool haveLast = false;
+        ulong lastStripe = 0;
+        EntryType lastType = EntryType.Value;
+        bool first = true;
+        while (true)
+        {
+            int best = -1;
+            for (int i = 0; i < n; i++)
+            {
+                if (!its[i].Valid) continue;
+                if (best < 0 || icmp.Compare(its[i].Key, its[best].Key) < 0) best = i;
+            }
+            if (best < 0) break;
+            ReadOnlySpan<byte> original = its[best].Key;
+            ReadOnlySpan<byte> value = its[best].Value;
+            ulong footer = DbFormat.ExtractFooter(original);
+            var type = (EntryType)(byte)footer;
+            ulong seq = footer >> 8;
+            int userLen = original.Length - DbFormat.InternalKeyFooterSize;
+            if (userLen < ts) ThrowHelper.Corruption("user key too short for its timestamp");
+            ReadOnlySpan<byte> userKeyWithoutTs = original[..(userLen - ts)];
+            ulong stripe = EarliestVisibleSnapshot(snapshots, seq);
+            bool sameKey = haveLast && cfd.UserComparator.CompareWithoutTimestamp(userKeyWithoutTs, false, lastUserKey.WrittenSpan, false) == 0;
+            if (sameKey && lastType is not (EntryType.Merge or EntryType.SingleDeletion) && stripe == lastStripe)
+            {
+                // CompactionIterator rule (A): hidden by a newer version visible to the same snapshots.
+                its[best].Next();
+                continue;
+            }
+            if (!sameKey)
+            {
+                lastUserKey.Clear();
+                lastUserKey.Write(userKeyWithoutTs);
+                haveLast = true;
+            }
+            lastStripe = stripe;
+            lastType = type;
+
+            // ReplaceInternalKeyWithMinTimestamp (the minimum u64 timestamp is all zeros).
+            key.Clear();
+            key.Write(userKeyWithoutTs);
+            key.GetSpan(ts)[..ts].Clear();
+            key.Advance(ts);
+            key.Write(original[userLen..]);
+            if (tombstones is not null && CoveredInSameStripe(tombstones, DbFormat.ExtractUserKey(key.WrittenSpan), seq, stripe, snapshots))
+            {
+                // CompactionRangeDelAggregator::ShouldDelete: covered by a newer tombstone of the same snapshot stripe.
+                its[best].Next();
+                continue;
+            }
+            if (blobBuilder is not null && type == EntryType.Value)
+            {
+                blobIndex.Clear();
+                if (blobBuilder.Add(DbFormat.ExtractUserKey(key.WrittenSpan), value, blobIndex))
+                {
+                    Util.Coding.EncodeFixed64(key.WrittenSpanMutable[^DbFormat.InternalKeyFooterSize..], (footer & ~0xFFUL) | (byte)EntryType.BlobIndex);
+                    builder.Add(key.WrittenSpan, blobIndex.WrittenSpan);
+                    UpdateOldestBlobFileNumber(meta, blobIndex.WrittenSpan);
+                }
+                else
+                {
+                    builder.Add(key.WrittenSpan, value);
+                }
+            }
+            else
+            {
+                builder.Add(key.WrittenSpan, value);
+                if (type == EntryType.BlobIndex) UpdateOldestBlobFileNumber(meta, value);
+            }
+            if (seq < meta.SmallestSeqno) meta.SmallestSeqno = seq;
+            if (seq > meta.LargestSeqno) meta.LargestSeqno = seq;
+            if (first)
+            {
+                meta.Smallest = key.WrittenSpan.ToArray();
+                first = false;
+            }
+            meta.Largest = key.WrittenSpan.ToArray();
+            its[best].Next();
+        }
+    }
+
+    private static bool CoveredInSameStripe(FragmentedRangeTombstoneList tombstones, ReadOnlySpan<byte> userKey, ulong seq, ulong stripe,
+        IReadOnlyList<ulong> snapshots)
+    {
+        int f = tombstones.FindCovering(userKey);
+        if (f < 0) return false;
+        foreach (ulong s in tombstones.GetSequences(f))
+        {
+            if (s <= seq) break; // newest first
+            if (EarliestVisibleSnapshot(snapshots, s) == stripe) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// The snapshot stripe of <paramref name="seq"/>: the oldest snapshot that sees it, or MaxSequenceNumber
+    /// (CompactionIterator::findEarliestVisibleSnapshot without the snapshot checker).
+    /// </summary>
+    private static ulong EarliestVisibleSnapshot(IReadOnlyList<ulong> snapshots, ulong seq)
+    {
+        int lo = 0, hi = snapshots.Count;
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >>> 1;
+            if (snapshots[mid] < seq) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo < snapshots.Count ? snapshots[lo] : DbFormat.MaxSequenceNumber;
+    }
+
+    /// <summary>
     /// The blob part of FileMetaData::UpdateBoundaries: tracks the oldest blob file referenced by the table. Inlined and
     /// TTL indexes are not tracked (stacked BlobDB). Throws Corruption for a malformed index.
     /// </summary>
@@ -201,20 +345,43 @@ internal static class FlushJob
     /// Writes the fragmented range tombstones of all memtables (every fragment with every covering sequence number,
     /// in internal key order) and extends the file boundaries like FileMetaData::UpdateBoundariesForRange.
     /// </summary>
-    private static void AddRangeTombstones(BlockBasedTableBuilder builder, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems, FileMetaData meta)
+    /// <summary>
+    /// The fragmented range tombstones of all memtables (null when there are none); with <paramref name="minTimestamps"/>
+    /// read through NewTimestampStrippingRangeTombstoneIterator.
+    /// </summary>
+    private static FragmentedRangeTombstoneList? FragmentRangeTombstones(ColumnFamilyData cfd, IReadOnlyList<MemTable> mems, bool minTimestamps)
     {
         List<FragmentedRangeTombstoneList.Tombstone>? raw = null;
+        int tsSz = cfd.TimestampSize;
         foreach (MemTable m in mems)
         {
             if (m.NumRangeDeletes == 0) continue;
             MemTableIterator it = m.NewRangeTombstoneEntryIterator();
             for (it.SeekToFirst(); it.Valid; it.Next())
             {
-                (raw ??= new()).Add(new FragmentedRangeTombstoneList.Tombstone(it.UserKey.ToArray(), it.Value.ToArray(), it.Sequence));
+                byte[] start = it.UserKey.ToArray();
+                byte[] end = it.Value.ToArray();
+                if (minTimestamps)
+                {
+                    // NewTimestampStrippingRangeTombstoneIterator: start and end keys get the minimum timestamp.
+                    if (start.Length < tsSz || end.Length < tsSz) ThrowHelper.Corruption("range tombstone key too short for its timestamp");
+                    start.AsSpan(start.Length - tsSz).Clear();
+                    end.AsSpan(end.Length - tsSz).Clear();
+                }
+                (raw ??= new()).Add(new FragmentedRangeTombstoneList.Tombstone(start, end, it.Sequence));
             }
         }
-        if (raw is null) return;
+        if (raw is null) return null;
         FragmentedRangeTombstoneList frag = FragmentedRangeTombstoneList.Build(cfd.UserComparator, raw);
+        return frag.IsEmpty ? null : frag;
+    }
+
+    /// <summary>
+    /// Writes the fragmented range tombstones (every fragment with every covering sequence number, in internal key order)
+    /// and extends the file boundaries like FileMetaData::UpdateBoundariesForRange.
+    /// </summary>
+    private static void AddRangeTombstones(BlockBasedTableBuilder builder, ColumnFamilyData cfd, FragmentedRangeTombstoneList frag, FileMetaData meta)
+    {
         InternalKeyComparator icmp = cfd.Icmp;
         int tsSize = frag.TimestampSize;
         for (int i = 0; i < frag.Count; i++)

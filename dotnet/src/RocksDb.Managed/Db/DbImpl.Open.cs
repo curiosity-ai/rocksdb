@@ -502,7 +502,9 @@ internal sealed partial class DbImpl
             else return true; // dropped
         }
         IReadOnlyDictionary<uint, int> recordedTs = reader.RecordedTimestampSizes;
-        if (_cfTimestampSizes is not null || recordedTs.Count > 0) CheckRecoveredBatchTimestampSizes(record, recordedTs);
+        byte[]? reconciled = null;
+        if (_cfTimestampSizes is not null || recordedTs.Count > 0) reconciled = HandleRecoveredBatchTimestampSizes(record, recordedTs);
+        if (reconciled is not null) record = reconciled;
         var inserter = new MemTableInserter(this, walNumber, ignoreMissingColumnFamilies: true) { Sequence = seq };
         WriteBatch.Iterate(record, ref inserter);
         // next_sequence comes from the inserter, not the record header: a prepared section counts its entries but
@@ -532,7 +534,7 @@ internal sealed partial class DbImpl
         FileMetaData? meta;
         try
         {
-            meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, blobBuilder, synchronous, ct)
+            meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, blobBuilder, [], synchronous, ct)
                 .ConfigureAwait(false);
         }
         catch
@@ -556,6 +558,12 @@ internal sealed partial class DbImpl
             if (blobBuilder is not null) edit.BlobFileAdditions.AddRange(blobBuilder.Additions);
             // Keep the obsolete-file scan from deleting the new (not yet installed) file.
             lock (_mutex) _pendingOutputs.Add(fileNumber);
+            // WriteLevel0TableForRecovery: with UDT in memtable only, move the cutoff timestamp up whenever a flush happens.
+            if (GetFullHistoryTsLowAboveCutoffUdt(cfd, [mem]) is { } low
+                && (edit.FullHistoryTsLow is not { } prev || cfd.UserComparator.CompareTimestamp(low, prev) > 0))
+            {
+                edit.FullHistoryTsLow = low;
+            }
         }
         lock (_mutex)
         {

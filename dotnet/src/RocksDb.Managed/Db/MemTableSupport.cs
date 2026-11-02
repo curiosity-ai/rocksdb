@@ -25,6 +25,13 @@ public sealed class MemTableOptions
     /// <summary>memtable_max_range_deletions: flush once this many range deletions were added (0 = disabled).</summary>
     public long MaxRangeDeletions { get; set; }
 
+    /// <summary>
+    /// Timestamp size of the column family when its user-defined timestamps are not persisted
+    /// (persist_user_defined_timestamps = false), else 0: the memtable then tracks the newest timestamp it holds
+    /// (MemTable::MaybeUpdateNewestUDT / GetNewestUDT).
+    /// </summary>
+    public int TrackNewestTimestampSize { get; set; }
+
     /// <summary>Port of the arena_block_size sanitization in db/column_family.cc (SanitizeCfOptions).</summary>
     public int GetEffectiveArenaBlockSize()
     {

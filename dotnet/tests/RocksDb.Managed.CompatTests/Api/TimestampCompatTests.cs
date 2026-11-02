@@ -18,7 +18,7 @@ namespace RocksDb.Managed.CompatTests.Api;
 /// after managed writes on top.
 /// </summary>
 [TestClass]
-public sealed unsafe class TimestampCompatTests
+public sealed unsafe partial class TimestampCompatTests
 {
     private static readonly RocksDbSharp.Native N = RocksDbSharp.Native.Instance;
     private static readonly ulong[] s_readTimestamps = [0, 5, 10, 15, 20, 25, 30, 45, 60, 75, 100, 150, ulong.MaxValue];

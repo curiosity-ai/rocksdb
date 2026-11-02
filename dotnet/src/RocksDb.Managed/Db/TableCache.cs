@@ -216,7 +216,9 @@ internal sealed class TableCache : ITableCache, IDisposable
                     list.Add(new FragmentedRangeTombstoneList.Tombstone(k[..pk.UserKeyLength].ToArray(), it.Value.ToArray(), pk.Sequence));
                 }
             }
-            FragmentedRangeTombstoneList frag = FragmentedRangeTombstoneList.Build(_readerOptions.Comparator, list);
+            // Tables without persisted timestamps: the start keys come back padded, the end keys (values) without a
+            // timestamp (tombstone_end_include_ts = false).
+            FragmentedRangeTombstoneList frag = FragmentedRangeTombstoneList.Build(_readerOptions.Comparator, list, endIncludesTimestamp: reader.PadTimestampSize == 0);
             h.RangeDels = frag.IsEmpty ? null : frag;
         }
     }

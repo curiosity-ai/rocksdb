@@ -227,6 +227,15 @@ public sealed partial class BlockBasedTableReader : IDisposable
     public bool IndexAndFilterInCache => _indexBlock is null;
     /// <summary>Effective global sequence number (external files), or <see cref="BlockIter.DisableGlobalSequenceNumber"/>.</summary>
     public ulong GlobalSequenceNumber { get; }
+    /// <summary>
+    /// Size of the minimum timestamp padded into every key read from this file (pad_min_timestamp_), 0 when the keys
+    /// are stored with their timestamps. Non-zero for files written with persist_user_defined_timestamps = false
+    /// ("rocksdb.user.defined.timestamps.persisted" = 0) and for files written without timestamps by the comparator
+    /// this column family's timestamp comparator extends (UDT enabled on an existing column family, ".u64ts" suffix).
+    /// Deviation: upstream takes this from FileMetaData::user_defined_timestamps_persisted; the file's own properties
+    /// give the same answer for every file the toggling rules (ValidateUserDefinedTimestampsOptions) accept.
+    /// </summary>
+    public int PadTimestampSize { get; }
     public long FileSize { get; }
     internal InternalKeyComparator InternalComparator => _icmp;
     internal IRandomAccessFile File => _file;
@@ -270,7 +279,23 @@ public sealed partial class BlockBasedTableReader : IDisposable
         WholeKeyFiltering = !props.UserCollectedProperties.TryGetValue(TablePropertiesNames.BlockBasedWholeKeyFiltering, out byte[]? wkf)
             || wkf.AsSpan().SequenceEqual("1"u8);
         GlobalSequenceNumber = ResolveGlobalSeqno(props, options.LargestSeqno);
+        PadTimestampSize = TimestampsStripped(props, options.Comparator) ? _tsSize : 0;
     }
+
+    /// <summary>True when the keys of a table with <paramref name="props"/> are stored without the timestamps of <paramref name="ucmp"/>.</summary>
+    internal static bool TimestampsStripped(TableProperties props, Comparator ucmp)
+    {
+        if (ucmp.TimestampSize == 0) return false;
+        if (props.UserDefinedTimestampsPersisted == 0) return true;
+        // CompareComparator (util/udt_util.cc) == kEnableUDT: written by "<name>", read by "<name>.u64ts".
+        string running = ucmp.Name;
+        string written = props.ComparatorName;
+        return written.Length > 0 && running.Length == written.Length + UdtComparatorSuffix.Length
+            && running.StartsWith(written, StringComparison.Ordinal) && running.EndsWith(UdtComparatorSuffix, StringComparison.Ordinal);
+    }
+
+    /// <summary>kUDTSuffix of util/udt_util.cc.</summary>
+    internal const string UdtComparatorSuffix = ".u64ts";
 
     private static IndexType ReadIndexType(TableProperties props)
     {
@@ -716,12 +741,12 @@ public sealed partial class BlockBasedTableReader : IDisposable
 
     internal void InitIndexIter(BlockIter it, Block block) =>
         it.InitializeIndex(block, _icmp, IndexKeyIncludesSeq, IndexValueIsFull, IndexHasFirstKey,
-            BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(_footer.FormatVersion), GlobalSequenceNumber);
+            BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(_footer.FormatVersion), GlobalSequenceNumber, PadTimestampSize);
 
     /// <summary>Iterator over the top-level filter partition index (NewFilterPartitionIndexIterator: no global seqno, no first key).</summary>
     private void InitFilterIndexIter(BlockIter it, Block block) =>
         it.InitializeIndex(block, _icmp, IndexKeyIncludesSeq, IndexValueIsFull, false,
-            BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(_footer.FormatVersion), BlockIter.DisableGlobalSequenceNumber);
+            BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(_footer.FormatVersion), BlockIter.DisableGlobalSequenceNumber, PadTimestampSize);
 
     /// <summary>The pinned top-level index block (not available when <see cref="IndexAndFilterInCache"/>).</summary>
     internal Block IndexBlock => _indexBlock ?? throw new InvalidOperationException("The index block is held by the block cache (CacheIndexAndFilterBlocks).");
@@ -994,7 +1019,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
                 BlockRef block = GetBlockRef(idx.Handle, BlockKind.Data, flags);
                 try
                 {
-                    data.InitializeData(block.Block!, _icmp, GlobalSequenceNumber);
+                    data.InitializeData(block.Block!, _icmp, GlobalSequenceNumber, PadTimestampSize);
                     if (first)
                     {
                         if (!SeekForGet(data, internalKey)) return;
@@ -1113,7 +1138,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     private int ScanBlockForGet(BlockIter data, Block block, ReadOnlySpan<byte> internalKey, bool first, IBufferWriter<byte>? value, out TableGetResult result)
     {
         result = default;
-        data.InitializeData(block, _icmp, GlobalSequenceNumber);
+        data.InitializeData(block, _icmp, GlobalSequenceNumber, PadTimestampSize);
         if (first)
         {
             if (!SeekForGet(data, internalKey)) return -1;
@@ -1197,7 +1222,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     {
         if (_rangeDelBlock is null) return null;
         var it = new BlockIter();
-        it.InitializeData(_rangeDelBlock, _icmp, GlobalSequenceNumber);
+        it.InitializeData(_rangeDelBlock, _icmp, GlobalSequenceNumber, PadTimestampSize);
         return it;
     }
 

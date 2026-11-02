@@ -45,6 +45,7 @@ public sealed class BlockIter : IDisposable
     private int _hashNumBuckets;
     private int _prefixLength;     // common user-key prefix stored at [0, _prefixLength) (format_version >= 8)
     private byte[] _restartKeyBuf = [];
+    private byte[] _restartPadBuf = [];
 
     private byte[] _keyBuf = [];
     private int _keyLen;
@@ -74,6 +75,19 @@ public sealed class BlockIter : IDisposable
     private bool _haveFirstKey;
     private ulong _globalSeqno = DisableGlobalSequenceNumber;
 
+    // persist_user_defined_timestamps = false (pad_min_timestamp_): keys are stored without their user-defined timestamp
+    // of _padTsSize bytes; the stored ("raw") key is kept in _rawKeyBuf as the delta base and the exposed key in _keyBuf
+    // carries the minimum timestamp (UpdateRawKeyAndMaybePadMinTimestamp / TrimAppendWithTimestamp).
+    private int _padTsSize;
+    private byte[] _rawKeyBuf = [];
+    private int _rawKeyLen;
+    private byte[] _firstKeyPadBuf = [];
+    private int _firstKeyPadLen;
+    // Entries need the generic decoder (value delta encoding or timestamp padding).
+    private bool _slowParse;
+    // Restart keys need rewriting before comparisons (global seqno or timestamp padding).
+    private bool _restartKeyFixup;
+
     /// <summary>Iterator for a data or range-deletion block (internal keys ordered by <paramref name="comparator"/>).</summary>
     public void InitializeData(Block block, InternalKeyComparator comparator, ulong globalSeqno)
     {
@@ -82,6 +96,18 @@ public sealed class BlockIter : IDisposable
         _globalSeqno = globalSeqno;
         _hashMapOffset = block.HashMapOffset;
         _hashNumBuckets = block.HashNumBuckets;
+        UpdateModes();
+    }
+
+    /// <summary>
+    /// <see cref="InitializeData(Block, InternalKeyComparator, ulong)"/> for a block whose keys were stored without their
+    /// user-defined timestamp of <paramref name="padTimestampSize"/> bytes (user_defined_timestamps_persisted = false):
+    /// every key is exposed with the minimum timestamp. 0 behaves like the overload without it.
+    /// </summary>
+    public void InitializeData(Block block, InternalKeyComparator comparator, ulong globalSeqno, int padTimestampSize)
+    {
+        InitializeData(block, comparator, globalSeqno);
+        if (padTimestampSize != 0) EnablePadding(padTimestampSize);
     }
 
     /// <summary>
@@ -99,6 +125,35 @@ public sealed class BlockIter : IDisposable
         _valueDeltaEscape = valueDeltaEscape;
         _haveFirstKey = haveFirstKey;
         _globalSeqno = globalSeqno;
+        UpdateModes();
+    }
+
+    /// <summary>
+    /// <see cref="InitializeIndex(Block, InternalKeyComparator, bool, bool, bool, bool, ulong)"/> for an index block whose
+    /// keys (and first keys) were stored without their user-defined timestamp of <paramref name="padTimestampSize"/>
+    /// bytes; they are exposed with the minimum timestamp. 0 behaves like the overload without it.
+    /// </summary>
+    public void InitializeIndex(Block block, InternalKeyComparator comparator, bool keyIncludesSeq, bool valueIsFull, bool haveFirstKey,
+        bool valueDeltaEscape, ulong globalSeqno, int padTimestampSize)
+    {
+        InitializeIndex(block, comparator, keyIncludesSeq, valueIsFull, haveFirstKey, valueDeltaEscape, globalSeqno);
+        if (padTimestampSize != 0) EnablePadding(padTimestampSize);
+    }
+
+    private void EnablePadding(int padTimestampSize)
+    {
+        // The common-prefix feature is never combined with stripped timestamps (BlockBuilder ctor assert).
+        if (_prefixLength != 0) ThrowHelper.Corruption("block with a common key prefix cannot have stripped timestamps");
+        _padTsSize = padTimestampSize;
+        // The hash index hashes user keys with their timestamp (upstream TODO: make UDT work with the hash index).
+        _hashMapOffset = -1;
+        UpdateModes();
+    }
+
+    private void UpdateModes()
+    {
+        _slowParse = _valueDeltaEncoded || _padTsSize != 0;
+        _restartKeyFixup = _padTsSize != 0 || (_globalSeqno != DisableGlobalSequenceNumber && _keysAreInternal);
     }
 
     /// <summary>Iterator for a metaindex or properties block (bytewise ordered keys).</summary>
@@ -106,6 +161,7 @@ public sealed class BlockIter : IDisposable
     {
         Reset(block, BlockIterKind.Meta, InternalKeyComparator.Bytewise);
         _keysAreInternal = false;
+        UpdateModes();
     }
 
     private void Reset(Block block, BlockIterKind kind, InternalKeyComparator icmp)
@@ -122,6 +178,10 @@ public sealed class BlockIter : IDisposable
         _valueDeltaEscape = false;
         _haveFirstKey = false;
         _globalSeqno = DisableGlobalSequenceNumber;
+        _padTsSize = 0;
+        _rawKeyLen = 0;
+        _slowParse = false;
+        _restartKeyFixup = false;
         _handle = default;
         _keyLen = 0;
         _keyInBuf = true;
@@ -165,7 +225,8 @@ public sealed class BlockIter : IDisposable
     public BlockHandle BlockHandle => _handle;
 
     /// <summary>Index blocks with kBinarySearchWithFirstKey: first internal key of the referenced data block.</summary>
-    public ReadOnlySpan<byte> FirstInternalKey => new(_data, _firstKeyOffset, _firstKeyLength);
+    public ReadOnlySpan<byte> FirstInternalKey =>
+        _padTsSize == 0 ? new(_data, _firstKeyOffset, _firstKeyLength) : new(_firstKeyPadBuf, 0, _firstKeyPadLen);
 
     /// <summary>Offset of the current entry's value within the block (port of ValueOffset, used for global seqno patching).</summary>
     public int ValueOffsetInBlock => _valueOffset;
@@ -205,7 +266,9 @@ public sealed class BlockIter : IDisposable
     public void Prev()
     {
         System.Diagnostics.Debug.Assert(Valid);
-        if (_kind != BlockIterKind.Index && _prevIdx > 0 && _prevEntries[_prevIdx].Offset == _current)
+        // The prev cache holds exposed keys; with timestamp padding the delta base differs, so it is not used.
+        bool useCache = _kind != BlockIterKind.Index && _padTsSize == 0;
+        if (useCache && _prevIdx > 0 && _prevEntries[_prevIdx].Offset == _current)
         {
             PrevFromCache();
             return;
@@ -225,7 +288,7 @@ public sealed class BlockIter : IDisposable
             _restartIndex--;
         }
         SeekToRestartPoint(_restartIndex);
-        if (_kind == BlockIterKind.Index)
+        if (!useCache)
         {
             // Loop until end of current entry hits the start of original entry
             while (ParseNextKey() && _next < original)
@@ -391,6 +454,7 @@ public sealed class BlockIter : IDisposable
     private void SeekToRestartPoint(int index)
     {
         _keyLen = 0;
+        _rawKeyLen = 0;
         _keyInBuf = true;
         _restartIndex = index;
         // _current is fixed by ParseNextKey; set _next so the next parse starts at the restart point.
@@ -482,7 +546,7 @@ public sealed class BlockIter : IDisposable
         }
         // Fast path: data/meta entry whose three header varints are single bytes (keeps the header in registers;
         // the out-parameter decoder below forces them to the stack).
-        if (!_valueDeltaEncoded && limit - cur >= 3)
+        if (!_slowParse && limit - cur >= 3)
         {
             ref byte d = ref MemoryMarshal.GetArrayDataReference(_data);
             uint shared = Unsafe.Add(ref d, (uint)cur);
@@ -498,7 +562,95 @@ public sealed class BlockIter : IDisposable
     {
         int p = DecodeEntry(cur, limit, out uint shared, out uint nonShared, out uint valueLength);
         if (p < 0) return CorruptionError();
+        if (_padTsSize != 0) return ParseEntryPadded(p, limit, shared, nonShared, valueLength);
         return ParseEntry(p, limit, shared, nonShared, valueLength);
+    }
+
+    /// <summary>
+    /// ParseEntry for blocks with stripped timestamps: the stored key is rebuilt in <see cref="_rawKeyBuf"/> (delta
+    /// base) and exposed with the minimum timestamp inserted before the footer (internal keys) or appended (user keys).
+    /// Port of the pad_min_timestamp_ paths of BlockIter::ParseNextKey (UpdateRawKeyAndMaybePadMinTimestamp,
+    /// IterKey::TrimAppendWithTimestamp) and IndexBlockIter::DecodeCurrentValue (first_internal_key padding).
+    /// </summary>
+    private bool ParseEntryPadded(int p, int limit, uint shared, uint nonShared, uint valueLength)
+    {
+        if ((uint)_rawKeyLen < shared) return CorruptionError();
+        ulong entryLength = (ulong)nonShared + valueLength;
+        if (entryLength > (ulong)(limit - p)) return CorruptionError();
+        int rawLen = (int)(shared + nonShared);
+        if (_rawKeyBuf.Length < rawLen)
+        {
+            byte[] n = ArrayPool<byte>.Shared.Rent(Math.Max(rawLen, 64));
+            _rawKeyBuf.AsSpan(0, _rawKeyLen).CopyTo(n);
+            if (_rawKeyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_rawKeyBuf);
+            _rawKeyBuf = n;
+        }
+        Buffer.BlockCopy(_data, p, _rawKeyBuf, (int)shared, (int)nonShared);
+        _rawKeyLen = rawLen;
+        if (shared == 0)
+        {
+            while (_restartIndex + 1 < _numRestarts && GetRestartPoint(_restartIndex + 1) < (uint)_current) _restartIndex++;
+        }
+        int padded = PadMinTimestamp(new ReadOnlySpan<byte>(_rawKeyBuf, 0, rawLen), ref _keyBuf);
+        if (padded < 0) return CorruptionError();
+        _keyLen = padded;
+        _keyInBuf = true;
+
+        int valueStart = p + (int)nonShared;
+        if (_kind == BlockIterKind.Index)
+        {
+            DecodeIndexValue(valueStart, shared != 0, valueLength);
+            _firstKeyPadLen = 0;
+            if (_haveFirstKey && _firstKeyLength > 0)
+            {
+                int n = PadMinTimestampInternal(new ReadOnlySpan<byte>(_data, _firstKeyOffset, _firstKeyLength), ref _firstKeyPadBuf);
+                if (n < 0) return CorruptionError();
+                _firstKeyPadLen = n;
+            }
+        }
+        else
+        {
+            _valueOffset = valueStart;
+            _valueLength = (int)valueLength;
+            _next = valueStart + (int)valueLength;
+        }
+        if (_globalSeqno != DisableGlobalSequenceNumber && _keysAreInternal) ApplyGlobalSeqno();
+        return true;
+    }
+
+    /// <summary>Writes <paramref name="stored"/> padded with the minimum timestamp into <paramref name="dst"/>; returns its length (-1 if malformed).</summary>
+    private int PadMinTimestamp(ReadOnlySpan<byte> stored, ref byte[] dst) =>
+        _keysAreInternal ? PadMinTimestampInternal(stored, ref dst) : PadMinTimestampUser(stored, ref dst);
+
+    /// <summary>PadInternalKeyWithMinTimestamp: user key | min ts | footer. The minimum (u64) timestamp is all zeros.</summary>
+    private int PadMinTimestampInternal(ReadOnlySpan<byte> stored, ref byte[] dst)
+    {
+        if (stored.Length < DbFormat.InternalKeyFooterSize) return -1;
+        int len = stored.Length + _padTsSize;
+        GrowScratch(ref dst, len);
+        int userLen = stored.Length - DbFormat.InternalKeyFooterSize;
+        stored[..userLen].CopyTo(dst);
+        dst.AsSpan(userLen, _padTsSize).Clear();
+        stored[userLen..].CopyTo(dst.AsSpan(userLen + _padTsSize));
+        return len;
+    }
+
+    /// <summary>AppendKeyWithMinTimestamp: user key | min ts.</summary>
+    private int PadMinTimestampUser(ReadOnlySpan<byte> stored, ref byte[] dst)
+    {
+        int len = stored.Length + _padTsSize;
+        GrowScratch(ref dst, len);
+        stored.CopyTo(dst);
+        dst.AsSpan(stored.Length, _padTsSize).Clear();
+        return len;
+    }
+
+    /// <summary>Grows a pooled scratch buffer whose contents are rewritten whole (nothing is preserved).</summary>
+    private static void GrowScratch(ref byte[] buf, int len)
+    {
+        if (buf.Length >= len) return;
+        if (buf.Length > 0) ArrayPool<byte>.Shared.Return(buf);
+        buf = ArrayPool<byte>.Shared.Rent(Math.Max(len, 64));
     }
 
     /// <summary>Applies a decoded entry header at key-delta offset <paramref name="p"/>.</summary>
@@ -659,6 +811,17 @@ public sealed class BlockIter : IDisposable
 
     private int CompareRestartKey(ReadOnlySpan<byte> restartKey, ReadOnlySpan<byte> target)
     {
+        if (!_restartKeyFixup) return CompareKey(restartKey, target);
+        if (_padTsSize != 0)
+        {
+            int n = PadMinTimestamp(restartKey, ref _restartPadBuf);
+            if (n < 0)
+            {
+                CorruptionError();
+                return 0;
+            }
+            restartKey = new ReadOnlySpan<byte>(_restartPadBuf, 0, n);
+        }
         if (_globalSeqno != DisableGlobalSequenceNumber && _keysAreInternal && restartKey.Length >= DbFormat.InternalKeyFooterSize)
         {
             // Compare as if the footer carried the global seqno.
@@ -720,6 +883,12 @@ public sealed class BlockIter : IDisposable
         _restartKeyBuf = [];
         if (_prevKeyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_prevKeyBuf);
         _prevKeyBuf = [];
+        if (_rawKeyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_rawKeyBuf);
+        _rawKeyBuf = [];
+        if (_firstKeyPadBuf.Length > 0) ArrayPool<byte>.Shared.Return(_firstKeyPadBuf);
+        _firstKeyPadBuf = [];
+        if (_restartPadBuf.Length > 0) ArrayPool<byte>.Shared.Return(_restartPadBuf);
+        _restartPadBuf = [];
         _keyLen = 0;
         _keyInBuf = true;
     }

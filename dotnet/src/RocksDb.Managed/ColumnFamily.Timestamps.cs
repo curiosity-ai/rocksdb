@@ -177,15 +177,15 @@ public sealed partial class ColumnFamily
     }
 
     /// <summary>
-    /// Port of DB::GetNewestUserDefinedTimestamp: only defined when user-defined timestamps are not persisted
-    /// (persist_user_defined_timestamps = false, memtable-only timestamps), which this port does not support; throws
-    /// InvalidArgument without timestamps and NotSupported otherwise (as upstream does for persisted timestamps).
+    /// Port of DB::GetNewestUserDefinedTimestamp: the newest timestamp this column family has seen (mutable memtable,
+    /// then immutable memtables, then full_history_ts_low - 1 when only table files remain), empty when none. Only
+    /// defined when user-defined timestamps are not persisted (persist_user_defined_timestamps = false); throws
+    /// InvalidArgument without timestamps and NotSupported for persisted timestamps.
     /// </summary>
     public byte[] GetNewestUserDefinedTimestamp()
     {
         _db.ThrowIfDisposed();
-        if (_cfd.TimestampSize == 0) ThrowHelper.InvalidArgument("Timestamp is not enabled in this column family");
-        throw RocksDbException.NotSupported("GetNewestUserDefinedTimestamp doesn't support the case when user defined timestamps are persisted.");
+        return _db.GetNewestUserDefinedTimestamp(_cfd);
     }
 
     /// <summary>Async <see cref="IncreaseFullHistoryTsLow"/>.</summary>

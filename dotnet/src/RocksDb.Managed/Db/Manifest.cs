@@ -238,7 +238,7 @@ public sealed class ManifestReplayer
             {
                 ThrowHelper.Corruption("MANIFEST record referencing unknown column family");
             }
-            ApplyFileChanges(cf, edit);
+            ApplyFileChanges(cf, edit, RecordedTimestampSize(cf));
         }
         ExtractInfo(cf, edit);
         EditsApplied++;
@@ -315,8 +315,68 @@ public sealed class ManifestReplayer
         if (remove is not null) foreach (ulong n in remove) _state.Wals.Remove(n);
     }
 
-    private static void ApplyFileChanges(ColumnFamilyVersion cf, VersionEdit edit)
+    /// <summary>Timestamp size of the comparator recorded for <paramref name="cf"/> (0 when unknown or without timestamps).</summary>
+    private int RecordedTimestampSize(ColumnFamilyVersion cf) =>
+        cf.ComparatorName is not null && _comparatorResolver?.Invoke(cf.ComparatorName) is { } c ? c.TimestampSize : 0;
+
+    /// <summary>
+    /// Port of VersionEditHandler::MaybeHandleFileBoundariesForNewFiles: boundaries of files written without persisted
+    /// timestamps are stored without them; they get the minimum timestamp back (the maximum one for a range tombstone
+    /// sentinel largest key). All new files of one edit must agree on user_defined_timestamps_persisted.
+    /// </summary>
+    internal static void PadFileBoundaries(FileMetaData meta, int tsSize)
     {
+        meta.Smallest = PadInternalKey(meta.Smallest, tsSize, 0);
+        ulong largestFooter = meta.Largest.Length >= DbFormat.InternalKeyFooterSize ? DbFormat.ExtractFooter(meta.Largest) : 0;
+        bool sentinel = largestFooter == DbFormat.PackSequenceAndType(DbFormat.MaxSequenceNumber, EntryType.RangeDeletion);
+        meta.Largest = PadInternalKey(meta.Largest, tsSize, sentinel ? (byte)0xff : (byte)0);
+    }
+
+    /// <summary>Reverse of <see cref="PadFileBoundaries"/> (UDT disabled on a column family whose files were written without timestamps).</summary>
+    internal static void StripFileBoundaries(FileMetaData meta, int tsSize)
+    {
+        meta.Smallest = StripInternalKey(meta.Smallest, tsSize);
+        meta.Largest = StripInternalKey(meta.Largest, tsSize);
+    }
+
+    /// <summary>PadInternalKeyWithMinTimestamp / PadInternalKeyWithMaxTimestamp.</summary>
+    private static byte[] PadInternalKey(byte[] key, int tsSize, byte fill)
+    {
+        if (key.Length < DbFormat.InternalKeyFooterSize) ThrowHelper.Corruption("bad file boundary key in MANIFEST");
+        int userLen = key.Length - DbFormat.InternalKeyFooterSize;
+        byte[] r = new byte[key.Length + tsSize];
+        key.AsSpan(0, userLen).CopyTo(r);
+        r.AsSpan(userLen, tsSize).Fill(fill);
+        key.AsSpan(userLen).CopyTo(r.AsSpan(userLen + tsSize));
+        return r;
+    }
+
+    private static byte[] StripInternalKey(byte[] key, int tsSize)
+    {
+        if (key.Length < DbFormat.InternalKeyFooterSize + tsSize) ThrowHelper.Corruption("bad file boundary key in MANIFEST");
+        int userLen = key.Length - DbFormat.InternalKeyFooterSize - tsSize;
+        byte[] r = new byte[key.Length - tsSize];
+        key.AsSpan(0, userLen).CopyTo(r);
+        key.AsSpan(key.Length - DbFormat.InternalKeyFooterSize).CopyTo(r.AsSpan(userLen));
+        return r;
+    }
+
+    private static void ApplyFileChanges(ColumnFamilyVersion cf, VersionEdit edit, int recordedTimestampSize)
+    {
+        if (recordedTimestampSize > 0 && edit.NewFiles.Count > 0)
+        {
+            bool needsHandling = false;
+            foreach (NewFileEntry nf in edit.NewFiles)
+            {
+                if (nf.Meta.UserDefinedTimestampsPersisted)
+                {
+                    if (needsHandling) ThrowHelper.Corruption("New files in one VersionEdit has different user_defined_timestamps_persisted value.");
+                    break;
+                }
+                needsHandling = true;
+                PadFileBoundaries(nf.Meta, recordedTimestampSize);
+            }
+        }
         foreach (BlobFileAddition a in edit.BlobFileAdditions)
         {
             if (cf.BlobFiles.ContainsKey(a.BlobFileNumber))
