@@ -27,11 +27,12 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [x] Metaindex + properties (match native incl. compression name/options), range-del block
 - [x] `BlockBasedTableBuilder` (sync/async, external SST mode for ingestion), `BlockBasedTableReader` (+Get visitor for merge chains), `BlockBasedTableIterator`
 - [x] Compat: native SstFileWriter/flush → managed read (fv2..7 × 5 checksums, partitioned index); managed → native ingest
-- [ ] format_version 8 (newer than native 11.12 package? check) 
+- [x] format_version 8 read+write (common key prefix, delta escape, metaindex gap) — byte-identical to native
 - [ ] Partitioned index/filter writing; partitioned filter reading; prefix extractor/prefix filters; compression dictionaries; UDT; property collectors
-- [ ] Integration: use stream E's `InternalKeyComparator` + comparator separators (remove local copies in `InternalKeyOrdering.cs`), stream C's `Hash` (remove `DataBlockHashIndex.LegacyHash`), call `FilterPolicy.CreateBuilder(in FilterBuildingContext)`
-- [ ] Compat with compression (snappy/lz4/zstd) + native bloom/ribbon filters end-to-end; replace C's test-only `TestSstParser`
-- [ ] Map public `RocksDb.Managed.BlockBasedTableOptions` (options model) → `Table.TableFormatOptions` (runtime)
+- [x] Integration: InternalKeyComparator/separators, Util.Hash, level-aware filter builders — index & data blocks byte-identical to native SstFileWriter (fv2..8)
+- [x] Compat with snappy/lz4/lz4hc/zstd/zlib and bloom/ribbon filters both directions
+- [x] `Db/TableFactory`: options model → TableFormatOptions/TableBuilderOptions/reader options, filter policy ids, per-level compression
+- [ ] Separated key/value data blocks, uniform block hint, super_block_alignment writing, dictionary compression
 
 ### C. Hashing, filters, compression  `[x] merged (cffc808)`
 - [x] Hashes: `Hash()`, BloomHash, XXPH3-based `Hash64`/`GetSliceHash64` (RocksDB's frozen pre-release XXH3 — NOT System.IO.Hashing.XxHash3), Hash128/Hash2x64, checksum wrappers
@@ -39,7 +40,7 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [ ] `optimize_filters_for_memory` rounding on build side
 - [ ] Partitioned filters (reader) — with stream B's table reader
 - [x] Compression: Snappy, LZ4/LZ4HC, ZSTD (pooled ctx), Zlib (raw deflate, <=16KiB blocks); BZip2/Xpress NotSupported
-- [ ] Verify managed-compressed blocks are readable natively (needs SST builder → native ingest)
+- [x] Managed-compressed blocks readable natively (managed SST → native ingest)
 - [ ] Dictionary compression
 - Note: `FilterPolicy.CreateBuilder(in FilterBuildingContext)` added (level/flush aware, needed for ribbon `bloom_before_level`) — table builder must call it
 
@@ -48,7 +49,7 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [x] `VersionEdit` encode/decode, all tags in this tree; byte-identical re-encode of native MANIFEST records
 - [x] `ManifestReader`/`ManifestReplayer` (atomic groups, CF add/drop, WALs) → `RecoveredVersionState`; `ManifestWriter` (native opens managed-written MANIFEST)
 - [x] Options model (`DbOptions`, `ColumnFamilyOptions`, `BlockBasedTableOptions`, `ReadOptions`, `WriteOptions`, ...) + `OptionsFile` parse/serialize, native loads our OPTIONS
-- [ ] Wire MANIFEST seam (`IManifestRecordReader/Writer`) to `Wal.LogReader/LogWriter`; drop test-only `TestLogFormat.cs`
+- [x] `ManifestLogReader/Writer` over Wal.LogReader/LogWriter
 - [ ] Comparator/num_levels validation on replay, UDT boundary padding, point-in-time/best-efforts recovery
 - [ ] Type `compaction_options_universal/fifo`, `block_cache` etc. (kept as raw strings)
 - [ ] `ReadOptions.Snapshot`; a named static for sync writes (e.g. `WriteOptions.SyncWrites`)
@@ -61,7 +62,7 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [x] `MemTable`: add/concurrent add, get (merge operand collection), iterator, range tombstones + fragmenter, flush triggers
 - [ ] Memtable extras: bloom filter, in-place updates, insert hints, protection bytes, wide columns/blob, read callback
 - [ ] `MemTableList` (immutable memtables), snapshot-striped tombstone fragmenter
-- [ ] Verify index separators against a native SST index block (needs stream B reader)
+- [x] Index separators byte-identical to native index blocks
 - [x] Renamed `Db.ValueType` → `Db.EntryType` (clashed with `System.ValueType`)
 
 ### F. Infrastructure  `[x] merged (8d7a3d0)`
@@ -74,6 +75,11 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 Native baseline (200k ops, 16B key / 100B value, shared noisy 4-core box): fillseq 3.9–9.1 µs/op, fillrandom 7.1–8.0, readrandom memtable 4.8, readrandom SST 15.4, readmissing 4.0.
 
 ## Phase 2 — DB core
+Contracts added: `Db/Iterators/InternalIterator.cs`, `Db/MergeOperator.cs` (+`MergeOperands`), `Db/ITableCache.cs`.
+Wave 2a agents: S = DB spine (open/recover, VersionSet, write path, Get, flush, CFs, snapshots, TableCache);
+I = iterators + merge (MergingIterator, LevelIterator, DBIter, MergeHelper, range-del aggregation);
+P = perf + block cache wiring (Table/, Cache/, Memtable/, Util/).
+
 - [ ] `RocksDb.OpenAsync`: create/recover DB (CURRENT→MANIFEST→VersionSet, replay WALs into memtables)
 - [ ] Column families (create/drop/list, per-CF options)
 - [ ] Write path: async group commit (leader/follower via channel), WAL append + sync, memtable insert, sequence numbers
