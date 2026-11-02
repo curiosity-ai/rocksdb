@@ -74,7 +74,7 @@ Flags (same for all engines): `--num`, `--reads` (default num), `--key_size` (16
 `--level0_file_num_compaction_trigger` (4), `--disable_auto_compactions`, `--max_background_jobs` (2), `--use_existing_db`,
 `--seed` (301), `--db`, `--histogram` (1). `--async` (managed only) runs each worker as a task over
 `PutAsync`/`TryGetAsync`/`DeleteAsync`/`WriteAsync` and the async iterator, and `flush`/`compact`/`waitforcompaction` over
-`FlushAsync`/`CompactRangeAsync`/`WaitForCompactAsync` (`multireadrandom` stays synchronous: there is no `MultiGetAsync`).
+`FlushAsync`/`CompactRangeAsync`/`WaitForCompactAsync`, and `multireadrandom` over `MultiGetAsync`.
 
 `stats` prints, for every engine through `GetProperty` (`rocksdb_property_value` in C):
 
@@ -153,8 +153,18 @@ dotnet run -c Release --project bench/RocksDb.Managed.Benchmarks -f net10.0 -- -
 ```
 
 They use the same `IKeyValueEngine` adapters as the dbbench runner (interface dispatch costs ~1 ns per call on both
-sides). The `Allocated` column should be `-` for both engines except managed `MultiGet` (the managed API returns a new
-`byte[]?[]` with one array per found value).
+sides). The `Allocated` column should be `-` for both engines (managed `MultiGet` uses a reusable `MultiGetBatch`).
+
+### Managed sync vs async (`DbAsyncBenchmarks.cs`, category `DbAsync`)
+
+Put / TryGet / Seek + 10 Next / MultiGet(16) through the synchronous and the `ValueTask` API of RocksDb.Managed, with
+`Blocks` = `BlockCache` (64 MiB cache, all blocks resident) or `PageCache` (1 MiB cache: most lookups read the block
+from the file, which is in the OS page cache). `Allocated` should be `-` everywhere and async within a few percent of
+sync (see `docs/perf.md`).
+
+```bash
+dotnet run -c Release --project bench/RocksDb.Managed.Benchmarks -f net10.0 -- --anyCategories DbAsync --job short
+```
 
 ### Component benchmarks
 

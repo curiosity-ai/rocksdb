@@ -48,6 +48,13 @@ public sealed class BlockIter : IDisposable
 
     private byte[] _keyBuf = [];
     private int _keyLen;
+
+    // Prev cache (data / meta blocks): entries of the restart interval scanned by the last uncached Prev.
+    private PrevEntry[] _prevEntries = [];
+    private int _prevCount;
+    private int _prevIdx = -1;
+    private byte[] _prevKeyBuf = [];
+    private int _prevKeyBytes;
     private bool _keyInBuf;
     private int _keyBlockOffset;
 
@@ -118,6 +125,8 @@ public sealed class BlockIter : IDisposable
         _handle = default;
         _keyLen = 0;
         _keyInBuf = true;
+        _prevIdx = -1;
+        _prevCount = 0;
         Invalidate();
     }
 
@@ -129,6 +138,8 @@ public sealed class BlockIter : IDisposable
         _numRestarts = 0;
         _current = 0;
         _next = 0;
+        _prevIdx = -1;
+        _prevCount = 0;
     }
 
     public bool Valid
@@ -185,10 +196,22 @@ public sealed class BlockIter : IDisposable
         ParseNextKey();
     }
 
-    /// <summary>Port of BlockIter::PrevImpl (scan forward from the preceding restart point).</summary>
+    /// <summary>
+    /// Port of BlockIter::PrevImpl / DataBlockIter::PrevImpl: scans forward from the preceding restart point. For data
+    /// and meta blocks the entries decoded by that scan are cached (DataBlockIter's prev_entries_), so a run of Prev
+    /// calls decodes each restart interval once instead of once per entry.
+    /// </summary>
     public void Prev()
     {
         System.Diagnostics.Debug.Assert(Valid);
+        if (_kind != BlockIterKind.Index && _prevIdx > 0 && _prevEntries[_prevIdx].Offset == _current)
+        {
+            PrevFromCache();
+            return;
+        }
+        _prevIdx = -1;
+        _prevCount = 0;
+        _prevKeyBytes = 0;
         int original = _current;
         while (GetRestartPoint(_restartIndex) >= (uint)original)
         {
@@ -201,10 +224,82 @@ public sealed class BlockIter : IDisposable
             _restartIndex--;
         }
         SeekToRestartPoint(_restartIndex);
-        // Loop until end of current entry hits the start of original entry
-        while (ParseNextKey() && _next < original)
+        if (_kind == BlockIterKind.Index)
         {
+            // Loop until end of current entry hits the start of original entry
+            while (ParseNextKey() && _next < original)
+            {
+            }
+            return;
         }
+        while (ParseNextKey())
+        {
+            CachePrevEntry();
+            if (_next >= original) break;
+        }
+        _prevIdx = _prevCount - 1;
+    }
+
+    private void CachePrevEntry()
+    {
+        if (_prevCount == _prevEntries.Length) Array.Resize(ref _prevEntries, Math.Max(16, _prevCount * 2));
+        ref PrevEntry e = ref _prevEntries[_prevCount++];
+        e.Offset = _current;
+        e.Next = _next;
+        e.ValueOffset = _valueOffset;
+        e.ValueLength = _valueLength;
+        e.KeyLength = _keyLen;
+        e.KeyInBlock = !_keyInBuf;
+        if (!_keyInBuf)
+        {
+            e.KeyOffset = _keyBlockOffset;
+            return;
+        }
+        // Delta-encoded key: keep a copy (the key buffer is overwritten by the next entry).
+        if (_prevKeyBuf.Length - _prevKeyBytes < _keyLen)
+        {
+            byte[] bigger = ArrayPool<byte>.Shared.Rent(Math.Max(256, (_prevKeyBytes + _keyLen) * 2));
+            _prevKeyBuf.AsSpan(0, _prevKeyBytes).CopyTo(bigger);
+            if (_prevKeyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_prevKeyBuf);
+            _prevKeyBuf = bigger;
+        }
+        _keyBuf.AsSpan(0, _keyLen).CopyTo(_prevKeyBuf.AsSpan(_prevKeyBytes));
+        e.KeyOffset = _prevKeyBytes;
+        _prevKeyBytes += _keyLen;
+    }
+
+    private void PrevFromCache()
+    {
+        ref PrevEntry e = ref _prevEntries[--_prevIdx];
+        _current = e.Offset;
+        _next = e.Next;
+        _valueOffset = e.ValueOffset;
+        _valueLength = e.ValueLength;
+        _keyLen = e.KeyLength;
+        if (e.KeyInBlock)
+        {
+            _keyInBuf = false;
+            _keyBlockOffset = e.KeyOffset;
+        }
+        else
+        {
+            // Copied back so that a following Next can delta-decode against it.
+            if (_keyBuf.Length < e.KeyLength) EnsureKeyCapacity(e.KeyLength);
+            _prevKeyBuf.AsSpan(e.KeyOffset, e.KeyLength).CopyTo(_keyBuf);
+            _keyInBuf = true;
+        }
+    }
+
+    /// <summary>An entry decoded by the restart-interval scan of <see cref="Prev"/> (CachedPrevEntry).</summary>
+    private struct PrevEntry
+    {
+        public int Offset;
+        public int Next;
+        public int KeyOffset;   // block offset (KeyInBlock) or offset in _prevKeyBuf
+        public int KeyLength;
+        public int ValueOffset;
+        public int ValueLength;
+        public bool KeyInBlock;
     }
 
     /// <summary>Positions at the first entry with key &gt;= target.</summary>
@@ -621,6 +716,8 @@ public sealed class BlockIter : IDisposable
         _keyBuf = [];
         if (_restartKeyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_restartKeyBuf);
         _restartKeyBuf = [];
+        if (_prevKeyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_prevKeyBuf);
+        _prevKeyBuf = [];
         _keyLen = 0;
         _keyInBuf = true;
     }

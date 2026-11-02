@@ -280,6 +280,11 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public bool ContainsKey(ReadOnlySpan<byte> key) => _default.ContainsKey(key);
     public byte[]?[] MultiGet(IReadOnlyList<byte[]> keys) => _default.MultiGet(keys);
     public byte[]?[] MultiGet(ReadOptions? options, IReadOnlyList<byte[]> keys) => _default.MultiGet(options, keys);
+    public void MultiGet(MultiGetBatch batch) => _default.MultiGet(batch);
+    public void MultiGet(ReadOptions? options, MultiGetBatch batch) => _default.MultiGet(options, batch);
+    public ValueTask MultiGetAsync(MultiGetBatch batch, CancellationToken cancellationToken = default) => _default.MultiGetAsync(batch, cancellationToken);
+    public ValueTask MultiGetAsync(ReadOptions? options, MultiGetBatch batch, CancellationToken cancellationToken = default) =>
+        _default.MultiGetAsync(options, batch, cancellationToken);
 
     public ValueTask<bool> TryGetAsync(ReadOnlyMemory<byte> key, IBufferWriter<byte> value, CancellationToken cancellationToken = default) =>
         _default.TryGetAsync(key, value, cancellationToken);

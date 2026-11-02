@@ -327,6 +327,105 @@ internal static partial class UnixNative
         throw IOErrorFromErrno("while link file to " + target, source, errno);
     }
 
+    // ---- non-blocking page cache I/O (preadv2 / pwritev2 with RWF_NOWAIT) ----------------------------------
+
+    private const int RWF_NOWAIT = 0x8;
+    private const int ENOSYS = 38;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private unsafe struct IoVec
+    {
+        public void* Base;
+        public nuint Length;
+    }
+
+    [LibraryImport(LibC, SetLastError = true)]
+    private static unsafe partial nint preadv2(int fd, IoVec* iov, int iovcnt, long offset, int flags);
+
+    [LibraryImport(LibC, SetLastError = true)]
+    private static unsafe partial nint pwritev2(int fd, IoVec* iov, int iovcnt, long offset, int flags);
+
+    private static volatile bool s_noWaitReadUnavailable = !(OperatingSystem.IsLinux() && Environment.Is64BitProcess);
+    private static volatile bool s_noWaitWriteUnavailable = !(OperatingSystem.IsLinux() && Environment.Is64BitProcess);
+
+    /// <summary>True while <see cref="TryReadNoWait"/> may succeed (Linux, preadv2 available).</summary>
+    public static bool NoWaitReadSupported => !s_noWaitReadUnavailable;
+
+    /// <summary>True while <see cref="TryWriteNoWait"/> may succeed (Linux, pwritev2 + RWF_NOWAIT accepted).</summary>
+    public static bool NoWaitWriteSupported => !s_noWaitWriteUnavailable;
+
+    /// <summary>
+    /// preadv2(RWF_NOWAIT): reads from the page cache without blocking on the device. Returns the number of bytes read
+    /// (possibly short when only part of the range is cached; 0 at EOF), or -1 when the read would block, was interrupted
+    /// or is unsupported (the caller then issues a regular, possibly asynchronous read). Lets async readers complete
+    /// synchronously on a page cache hit instead of paying a thread pool round trip per block.
+    /// </summary>
+    public static unsafe int TryReadNoWait(SafeFileHandle handle, Span<byte> destination, long offset)
+    {
+        if (s_noWaitReadUnavailable) return -1;
+        bool addRef = false;
+        try
+        {
+            handle.DangerousAddRef(ref addRef);
+            fixed (byte* p = destination)
+            {
+                IoVec v;
+                v.Base = p;
+                v.Length = (nuint)destination.Length;
+                nint n = preadv2((int)handle.DangerousGetHandle(), &v, 1, offset, RWF_NOWAIT);
+                if (n >= 0) return (int)n;
+            }
+            int errno = Marshal.GetLastPInvokeError();
+            if (errno == ENOSYS || errno == EOPNOTSUPP_LINUX || errno == EINVAL) s_noWaitReadUnavailable = true;
+            return -1;
+        }
+        catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException)
+        {
+            s_noWaitReadUnavailable = true;
+            return -1;
+        }
+        finally
+        {
+            if (addRef) handle.DangerousRelease();
+        }
+    }
+
+    /// <summary>
+    /// pwritev2(RWF_NOWAIT): a buffered write into the page cache that fails instead of blocking (dirty page
+    /// throttling, block allocation on file systems that cannot do it without blocking). Returns the number of bytes
+    /// written (possibly short) or -1 when the write would block or is unsupported (the caller then issues a regular
+    /// write for the remainder).
+    /// </summary>
+    public static unsafe int TryWriteNoWait(SafeFileHandle handle, ReadOnlySpan<byte> data, long offset)
+    {
+        if (s_noWaitWriteUnavailable) return -1;
+        bool addRef = false;
+        try
+        {
+            handle.DangerousAddRef(ref addRef);
+            fixed (byte* p = data)
+            {
+                IoVec v;
+                v.Base = p;
+                v.Length = (nuint)data.Length;
+                nint n = pwritev2((int)handle.DangerousGetHandle(), &v, 1, offset, RWF_NOWAIT);
+                if (n >= 0) return (int)n;
+            }
+            int errno = Marshal.GetLastPInvokeError();
+            if (errno == ENOSYS || errno == EOPNOTSUPP_LINUX || errno == EINVAL) s_noWaitWriteUnavailable = true;
+            return -1;
+        }
+        catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException)
+        {
+            s_noWaitWriteUnavailable = true;
+            return -1;
+        }
+        finally
+        {
+            if (addRef) handle.DangerousRelease();
+        }
+    }
+
     public static RocksDbException IOErrorFromErrno(string context, string path, int errno) =>
         RocksDbException.IOError(context + ": " + path + ": " + Marshal.GetPInvokeErrorMessage(errno) + " (errno " + errno + ")");
 }

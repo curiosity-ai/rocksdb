@@ -77,6 +77,9 @@ public sealed class ManagedEngine : IKeyValueEngine
 
     public IMultiGetContext CreateMultiGetContext(int maxKeys, int keySize) => new MultiGet(_db, maxKeys, keySize);
 
+    /// <summary>Runs an async MultiGet on a context created by <see cref="CreateMultiGetContext"/>.</summary>
+    public static ValueTask<(int Found, long Bytes)> MultiGetAsync(IMultiGetContext context, int count) => ((MultiGet)context).RunAsync(count);
+
     public void Flush() => _db.Flush();
 
     public void CompactRange() => _db.CompactRange();
@@ -118,34 +121,50 @@ public sealed class ManagedEngine : IKeyValueEngine
     }
 
     /// <summary>
-    /// <see cref="RocksDatabase.MultiGet(IReadOnlyList{byte[]})"/> is the managed batched API; it takes a list of key
-    /// arrays and returns a new array of value arrays (allocates per call; see the alloc column).
+    /// <see cref="RocksDatabase.MultiGet(MultiGetBatch)"/>: the keys are copied into a reusable batch which also holds
+    /// the per-key status and values (no allocation per call).
     /// </summary>
     private sealed class MultiGet : IMultiGetContext
     {
         private readonly RocksDatabase _db;
         private readonly byte[][] _keys;
-        private readonly PrefixList _list;
+        private readonly MultiGetBatch _batch;
 
         public MultiGet(RocksDatabase db, int maxKeys, int keySize)
         {
             _db = db;
             _keys = new byte[maxKeys][];
             for (int i = 0; i < maxKeys; i++) _keys[i] = new byte[keySize];
-            _list = new PrefixList(_keys);
+            _batch = new MultiGetBatch(maxKeys);
         }
 
         public Span<byte> Key(int index) => _keys[index];
 
         public int Run(int count, out long valueBytes)
         {
-            _list.Count = count;
-            byte[]?[] values = _db.MultiGet(_list);
+            _batch.Clear();
+            for (int i = 0; i < count; i++) _batch.Add(_keys[i]);
+            _db.MultiGet(_batch);
+            return Collect(_batch, count, out valueBytes);
+        }
+
+        /// <summary>Async variant (--async): <see cref="RocksDatabase.MultiGetAsync(MultiGetBatch, CancellationToken)"/>.</summary>
+        public async ValueTask<(int Found, long Bytes)> RunAsync(int count)
+        {
+            _batch.Clear();
+            for (int i = 0; i < count; i++) _batch.Add(_keys[i]);
+            await _db.MultiGetAsync(_batch).ConfigureAwait(false);
+            int found = Collect(_batch, count, out long bytes);
+            return (found, bytes);
+        }
+
+        private static int Collect(MultiGetBatch batch, int count, out long valueBytes)
+        {
             int found = 0;
             long bytes = 0;
             for (int i = 0; i < count; i++)
             {
-                if (values[i] is { } v)
+                if (batch.TryGetValue(i, out ReadOnlySpan<byte> v))
                 {
                     found++;
                     bytes += v.Length;
@@ -155,23 +174,6 @@ public sealed class ManagedEngine : IKeyValueEngine
             return found;
         }
 
-        public void Dispose()
-        {
-        }
-    }
-
-    /// <summary>The first <see cref="Count"/> arrays of a fixed array, without copying.</summary>
-    private sealed class PrefixList(byte[][] items) : IReadOnlyList<byte[]>
-    {
-        public int Count { get; set; } = items.Length;
-
-        public byte[] this[int index] => (uint)index < (uint)Count ? items[index] : throw new ArgumentOutOfRangeException(nameof(index));
-
-        public IEnumerator<byte[]> GetEnumerator()
-        {
-            for (int i = 0; i < Count; i++) yield return items[i];
-        }
-
-        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+        public void Dispose() => _batch.Dispose();
     }
 }

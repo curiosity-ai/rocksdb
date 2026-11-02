@@ -126,6 +126,21 @@ internal sealed class TableCache : ITableCache, IDisposable
     /// <summary>Iterator over the table; disposing it releases the reader lease.</summary>
     public InternalIterator NewIterator(FileMetaData file) => new TableInternalIterator(GetReader(file));
 
+    /// <summary>Recycles <paramref name="reuse"/> when it is a table iterator with default flags (no allocation per file).</summary>
+    public InternalIterator NewIterator(FileMetaData file, InternalIterator? reuse) => Recycle(reuse, GetReader(file), TableReadFlags.None);
+
+    /// <summary>Retargets <paramref name="reuse"/> to <paramref name="lease"/> if it is a table iterator with <paramref name="flags"/>; otherwise disposes it and creates a new one.</summary>
+    internal static InternalIterator Recycle(InternalIterator? reuse, TableReaderLease lease, TableReadFlags flags)
+    {
+        if (reuse is TableInternalIterator t && t.Flags == flags)
+        {
+            t.Retarget(lease, null, null);
+            return t;
+        }
+        reuse?.Dispose();
+        return new TableInternalIterator(lease, flags);
+    }
+
     /// <summary>Port of TableCache::FindTable: returns a referenced, opened handle.</summary>
     private Handle FindTable(FileMetaData file)
     {
