@@ -17,10 +17,11 @@ namespace RocksDb.Managed.Db.Blob;
 /// of the reading version).
 /// <para>
 /// Cache entries hold the uncompressed blob, keyed by <c>OffsetableCacheKey(db_id, db_session_id, file_number)
-/// .WithOffset(offset)</c> like upstream. Unlike upstream's BlobFileCache, readers are not limited by
-/// <c>max_open_files</c>: a reader stays open until its blob file is obsolete or the column family is closed. A reader
-/// is only evicted once no version references its file, so in-flight reads (which hold a version) never race with the
-/// eviction.
+/// .WithOffset(offset)</c> like upstream. Open readers are bounded like upstream's BlobFileCache (which shares the
+/// table cache, capacity <c>max_open_files - 10</c>): when a new reader would exceed the capacity, the least recently
+/// used readers not in use are closed (they are reopened on demand). Deviation: the bound applies to the blob readers
+/// of the column family on their own, not to table and blob readers together. Readers in use are reference counted, so
+/// an eviction never closes a reader under an in-flight read; obsolete blob files are evicted right away.
 /// </para>
 /// Thread-safe.
 /// </summary>
@@ -33,14 +34,19 @@ internal sealed class BlobSource : IDisposable
     private readonly string _dbId;
     private readonly string _dbSessionId;
     private readonly Statistics? _stats;
-    private readonly ConcurrentDictionary<ulong, BlobFileReader> _readers = new();
+    private readonly ConcurrentDictionary<ulong, ReaderEntry> _readers = new();
+    private readonly int _capacity;
     // Base cache keys per blob file (OffsetableCacheKey derivation hashes the ids: computed once per file).
     private readonly ConcurrentDictionary<ulong, OffsetableCacheKey> _baseKeys = new();
     private readonly Lock _openLock = new();
     private bool _disposed;
 
-    public BlobSource(IFileSystem fs, string blobDir, uint columnFamilyId, BlockCache? blobCache, string dbId, string dbSessionId, Statistics? stats)
+    /// <param name="maxOpenFiles">DbOptions.max_open_files (-1 = readers stay open until their file is obsolete).</param>
+    public BlobSource(IFileSystem fs, string blobDir, uint columnFamilyId, BlockCache? blobCache, string dbId, string dbSessionId, Statistics? stats,
+        int maxOpenFiles)
     {
+        // table_cache_size = max_open_files - kNumNonTableCacheFiles (db/db_impl/db_impl.cc), as in TableCache.
+        _capacity = maxOpenFiles < 0 ? int.MaxValue : Math.Max(maxOpenFiles - 10, 20);
         _fs = fs;
         _blobDir = blobDir;
         _columnFamilyId = columnFamilyId;
@@ -66,24 +72,100 @@ internal sealed class BlobSource : IDisposable
         return baseKey.WithOffset(offset);
     }
 
-    /// <summary>BlobFileCache::GetBlobFileReader.</summary>
-    private BlobFileReader GetReader(ulong fileNumber)
+    /// <summary>
+    /// An open reader with the number of reads using it. <see cref="Dead"/> = removed from the cache: the reader is
+    /// closed by whoever drops the last reference.
+    /// </summary>
+    private sealed class ReaderEntry(BlobFileReader reader)
     {
-        if (_readers.TryGetValue(fileNumber, out BlobFileReader? r)) return r;
+        public readonly BlobFileReader Reader = reader;
+        public int Refs;
+        public int Dead;
+        public long LastUse;
+        private int _closed;
+
+        public void Close()
+        {
+            if (Interlocked.Exchange(ref _closed, 1) == 0) Reader.Dispose();
+        }
+
+        /// <summary>Marks the entry dead; closes the reader now if it is not in use.</summary>
+        public void Kill()
+        {
+            Interlocked.Exchange(ref Dead, 1); // full fence before reading Refs (pairs with Acquire's increment)
+            if (Volatile.Read(ref Refs) == 0) Close();
+        }
+
+        public void Release()
+        {
+            if (Interlocked.Decrement(ref Refs) == 0 && Volatile.Read(ref Dead) != 0) Close();
+        }
+    }
+
+    /// <summary>BlobFileCache::GetBlobFileReader: a referenced reader; the caller releases it.</summary>
+    private ReaderEntry AcquireReader(ulong fileNumber)
+    {
+        if (_readers.TryGetValue(fileNumber, out ReaderEntry? e))
+        {
+            Interlocked.Increment(ref e.Refs);
+            if (Volatile.Read(ref e.Dead) == 0)
+            {
+                Volatile.Write(ref e.LastUse, Environment.TickCount64);
+                return e;
+            }
+            e.Release(); // evicted concurrently: open it again
+        }
         lock (_openLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_readers.TryGetValue(fileNumber, out r)) return r;
-            r = BlobFileReader.Open(_fs, FileNames.BlobFileName(_blobDir, fileNumber), _columnFamilyId, _stats);
-            _readers[fileNumber] = r;
-            return r;
+            if (_readers.TryGetValue(fileNumber, out e) && Volatile.Read(ref e.Dead) == 0)
+            {
+                Interlocked.Increment(ref e.Refs);
+                Volatile.Write(ref e.LastUse, Environment.TickCount64);
+                return e;
+            }
+            if (_readers.Count >= _capacity) EvictUnused(_readers.Count - _capacity + 1);
+            e = new ReaderEntry(BlobFileReader.Open(_fs, FileNames.BlobFileName(_blobDir, fileNumber), _columnFamilyId, _stats))
+            {
+                Refs = 1,
+                LastUse = Environment.TickCount64,
+            };
+            _readers[fileNumber] = e;
+            return e;
+        }
+    }
+
+    /// <summary>Closes up to <paramref name="count"/> least recently used readers that are not in use. REQUIRES: _openLock.</summary>
+    private void EvictUnused(int count)
+    {
+        // Cold path (only when the capacity is reached): a linear scan per eviction round.
+        while (count-- > 0)
+        {
+            ulong victim = 0;
+            ReaderEntry? oldest = null;
+            foreach (KeyValuePair<ulong, ReaderEntry> kv in _readers)
+            {
+                ReaderEntry c = kv.Value;
+                if (Volatile.Read(ref c.Refs) != 0) continue;
+                if (oldest is null || Volatile.Read(ref c.LastUse) < Volatile.Read(ref oldest.LastUse))
+                {
+                    oldest = c;
+                    victim = kv.Key;
+                }
+            }
+            if (oldest is null) return; // every reader is in use: exceed the capacity temporarily
+            _readers.TryRemove(victim, out _);
+            oldest.Kill();
         }
     }
 
     /// <summary>BlobFileCache::Evict: closes the reader of an obsolete blob file.</summary>
     public void Evict(ulong fileNumber)
     {
-        if (_readers.TryRemove(fileNumber, out BlobFileReader? r)) r.Dispose();
+        lock (_openLock)
+        {
+            if (_readers.TryRemove(fileNumber, out ReaderEntry? e)) e.Kill();
+        }
         _baseKeys.TryRemove(fileNumber, out _);
     }
 
@@ -148,22 +230,30 @@ internal sealed class BlobSource : IDisposable
         if (TryGetFromCache(fileNumber, offset, output)) return 0;
         CheckCanRead(options);
         bool verify = options?.VerifyChecksums ?? true;
-        BlobFileReader reader = GetReader(fileNumber);
-        if (_cache is null || options?.FillCache == false)
-        {
-            return reader.GetBlob(userKey, offset, size, compression, verify, output);
-        }
-        PooledBufferWriter tmp = ObjectPools.RentWriter();
+        ReaderEntry entry = AcquireReader(fileNumber);
         try
         {
-            ulong read = reader.GetBlob(userKey, offset, size, compression, verify, tmp);
-            output.Write(tmp.WrittenSpan);
-            InsertIntoCache(fileNumber, offset, tmp.WrittenSpan);
-            return read;
+            BlobFileReader reader = entry.Reader;
+            if (_cache is null || options?.FillCache == false)
+            {
+                return reader.GetBlob(userKey, offset, size, compression, verify, output);
+            }
+            PooledBufferWriter tmp = ObjectPools.RentWriter();
+            try
+            {
+                ulong read = reader.GetBlob(userKey, offset, size, compression, verify, tmp);
+                output.Write(tmp.WrittenSpan);
+                InsertIntoCache(fileNumber, offset, tmp.WrittenSpan);
+                return read;
+            }
+            finally
+            {
+                ObjectPools.ReturnWriter(tmp);
+            }
         }
         finally
         {
-            ObjectPools.ReturnWriter(tmp);
+            entry.Release();
         }
     }
 
@@ -172,22 +262,30 @@ internal sealed class BlobSource : IDisposable
         CompressionType compression, IBufferWriter<byte> output, CancellationToken cancellationToken)
     {
         bool verify = options?.VerifyChecksums ?? true;
-        BlobFileReader reader = GetReader(fileNumber);
-        if (_cache is null || options?.FillCache == false)
-        {
-            await reader.GetBlobAsync(userKey, offset, size, compression, verify, output, cancellationToken).ConfigureAwait(false);
-            return;
-        }
-        PooledBufferWriter tmp = ObjectPools.RentWriter();
+        ReaderEntry entry = AcquireReader(fileNumber);
         try
         {
-            await reader.GetBlobAsync(userKey, offset, size, compression, verify, tmp, cancellationToken).ConfigureAwait(false);
-            output.Write(tmp.WrittenSpan);
-            InsertIntoCache(fileNumber, offset, tmp.WrittenSpan);
+            BlobFileReader reader = entry.Reader;
+            if (_cache is null || options?.FillCache == false)
+            {
+                await reader.GetBlobAsync(userKey, offset, size, compression, verify, output, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            PooledBufferWriter tmp = ObjectPools.RentWriter();
+            try
+            {
+                await reader.GetBlobAsync(userKey, offset, size, compression, verify, tmp, cancellationToken).ConfigureAwait(false);
+                output.Write(tmp.WrittenSpan);
+                InsertIntoCache(fileNumber, offset, tmp.WrittenSpan);
+            }
+            finally
+            {
+                ObjectPools.ReturnWriter(tmp);
+            }
         }
         finally
         {
-            ObjectPools.ReturnWriter(tmp);
+            entry.Release();
         }
     }
 
@@ -248,7 +346,7 @@ internal sealed class BlobSource : IDisposable
         lock (_openLock)
         {
             _disposed = true;
-            foreach (BlobFileReader r in _readers.Values) r.Dispose();
+            foreach (ReaderEntry e in _readers.Values) e.Kill();
             _readers.Clear();
         }
     }

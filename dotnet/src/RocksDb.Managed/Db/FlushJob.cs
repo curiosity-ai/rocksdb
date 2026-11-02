@@ -259,14 +259,25 @@ internal static class FlushJob
         if (raw is null) return;
         FragmentedRangeTombstoneList frag = FragmentedRangeTombstoneList.Build(cfd.UserComparator, raw);
         InternalKeyComparator icmp = cfd.Icmp;
+        int tsSize = frag.TimestampSize;
         for (int i = 0; i < frag.Count; i++)
         {
             ReadOnlySpan<byte> start = frag.GetStart(i);
             ReadOnlySpan<byte> end = frag.GetEnd(i);
-            foreach (ulong seq in frag.GetSequences(i))
+            ReadOnlySpan<ulong> seqs = frag.GetSequences(i);
+            for (int k = 0; k < seqs.Length; k++)
             {
-                var startKey = new InternalKey(start, seq, EntryType.RangeDeletion);
-                builder.Add(startKey.Encoded, end);
+                ulong seq = seqs[k];
+                ReadOnlySpan<byte> tStart = start, tEnd = end;
+                if (tsSize != 0)
+                {
+                    // RangeTombstone(start, end, seq, ts): both keys carry the tombstone's timestamp; the end key used
+                    // for the file boundary keeps the maximum timestamp (SerializeEndKey).
+                    tStart = ReplaceTimestamp(start, frag.GetTimestamp(i, k));
+                    tEnd = ReplaceTimestamp(end, frag.GetTimestamp(i, k));
+                }
+                var startKey = new InternalKey(tStart, seq, EntryType.RangeDeletion);
+                builder.Add(startKey.Encoded, tEnd);
                 // UpdateBoundariesForRange(start = tombstone.SerializeKey(), end = tombstone.SerializeEndKey()).
                 if (meta.Smallest.Length == 0 || icmp.Compare(startKey.Encoded, meta.Smallest) < 0) meta.Smallest = startKey.Encoded.ToArray();
                 var endKey = new InternalKey(end, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion);
@@ -275,5 +286,16 @@ internal static class FlushJob
                 if (seq > meta.LargestSeqno) meta.LargestSeqno = seq;
             }
         }
+    }
+
+    /// <summary>
+    /// <paramref name="keyWithTs"/> with its trailing timestamp replaced by <paramref name="ts"/>
+    /// (AppendUserKeyWithDifferentTimestamp). Cold path (range tombstones only).
+    /// </summary>
+    internal static byte[] ReplaceTimestamp(ReadOnlySpan<byte> keyWithTs, ReadOnlySpan<byte> ts)
+    {
+        byte[] r = keyWithTs.ToArray();
+        ts.CopyTo(r.AsSpan(r.Length - ts.Length));
+        return r;
     }
 }

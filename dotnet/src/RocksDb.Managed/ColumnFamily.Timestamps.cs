@@ -84,8 +84,8 @@ public sealed partial class ColumnFamily
                 b.Merge(id, key, timestamp, value);
                 break;
             default:
-                // Range tombstones with timestamps are not supported by the managed read path yet.
-                ThrowHelper.NotSupported("DeleteRange with user-defined timestamps");
+                // DeleteRange: both bounds carry the timestamp (value = end key).
+                b.DeleteRange(id, key, value, timestamp);
                 break;
         }
     }
@@ -110,6 +110,19 @@ public sealed partial class ColumnFamily
     public void SingleDelete(ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp) => WriteOneWithTimestamp(null, Op.SingleDelete, key, timestamp, default);
     public void SingleDelete(WriteOptions options, ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp) =>
         WriteOneWithTimestamp(options, Op.SingleDelete, key, timestamp, default);
+
+    /// <summary>
+    /// Deletes the keys in [<paramref name="beginKey"/>, <paramref name="endKey"/>) at <paramref name="timestamp"/>
+    /// (DB::DeleteRange(cf, begin, end, ts)): reads at a timestamp &gt;= <paramref name="timestamp"/> no longer see the
+    /// versions written before the deletion.
+    /// </summary>
+    public void DeleteRange(ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey, ReadOnlySpan<byte> timestamp) =>
+        WriteOneWithTimestamp(null, Op.DeleteRange, beginKey, timestamp, endKey);
+    public void DeleteRange(WriteOptions options, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey, ReadOnlySpan<byte> timestamp) =>
+        WriteOneWithTimestamp(options, Op.DeleteRange, beginKey, timestamp, endKey);
+    public ValueTask DeleteRangeAsync(ReadOnlyMemory<byte> beginKey, ReadOnlyMemory<byte> endKey, ReadOnlyMemory<byte> timestamp,
+        CancellationToken cancellationToken = default) =>
+        WriteOneWithTimestampAsync(null, Op.DeleteRange, beginKey, timestamp, endKey, cancellationToken);
 
     /// <summary>Adds a merge operand for <paramref name="key"/> at <paramref name="timestamp"/> (DB::Merge(cf, key, ts, value)).</summary>
     public void Merge(ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp, ReadOnlySpan<byte> operand) => WriteOneWithTimestamp(null, Op.Merge, key, timestamp, operand);

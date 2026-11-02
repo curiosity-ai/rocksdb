@@ -350,6 +350,61 @@ public sealed class BlobCompatTests
         }
     }
 
+    /// <summary>Compressible but not trivial value of <paramref name="size"/> bytes.</summary>
+    private static byte[] LargeValue(int i, int size)
+    {
+        var rnd = new Random(i);
+        byte[] v = new byte[size];
+        for (int p = 0; p < size; p++) v[p] = (byte)('a' + (rnd.Next(8) == 0 ? rnd.Next(26) : (p / 7 + i) % 26));
+        return v;
+    }
+
+    /// <summary>
+    /// zlib blobs and data blocks above 16 KiB (raw deflate read by native with window_bits -14): managed writes,
+    /// native reads, compacts with relocation and writes more; managed reads native's large zlib blobs.
+    /// </summary>
+    [TestMethod]
+    public void LargeZlibBlobsAndBlocksReadableBothWays()
+    {
+        using var dir = new TempDir("blob-zlib");
+        int[] sizes = [100, 16 * 1024, 16 * 1024 + 1, 20_000, 40_000, 70_000, 150_000];
+        var cfo = ManagedCf(CompressionType.Zlib, gc: false);
+        cfo.MergeOperator = null;
+        cfo.Compression = CompressionType.Zlib;
+        cfo.TableOptions.BlockSize = 64 * 1024;
+        using (RocksDatabase db = RocksDatabase.Open(dir.Path, new DbOptions { CreateIfMissing = true }, cfo))
+        {
+            for (int i = 0; i < sizes.Length; i++) db.Put(U("m" + i), LargeValue(i, sizes[i]));
+            // Small values land in 64 KiB zlib data blocks.
+            for (int i = 0; i < 3000; i++) db.Put(U("s" + i.ToString("D5")), U(Val(i, "small")));
+            db.Flush();
+        }
+        Assert.IsTrue(Directory.GetFiles(dir.Path, "*.blob").Length >= 1);
+
+        var options = new RocksDbSharp.DbOptions();
+        SetNativeBlobOptions(options.Handle, CompressionType.Zlib, gc: true, 1.0);
+        RocksDbSharp.Native.Instance.rocksdb_options_set_compression(options.Handle, (int)CompressionType.Zlib);
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(options, dir.Path))
+        {
+            for (int i = 0; i < sizes.Length; i++) CollectionAssert.AreEqual(LargeValue(i, sizes[i]), db.Get(U("m" + i)), "managed zlib blob " + sizes[i]);
+            for (int i = 0; i < 3000; i++) Assert.AreEqual(Val(i, "small"), Encoding.UTF8.GetString(db.Get(U("s" + i.ToString("D5")))));
+            for (int i = 0; i < sizes.Length; i++) db.Put(U("n" + i), LargeValue(100 + i, sizes[i]));
+            db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            db.CompactRange((byte[]?)null, null); // relocates every blob (age cutoff 1.0)
+        }
+        GC.KeepAlive(options);
+
+        using (RocksDatabase db = RocksDatabase.Open(dir.Path, new DbOptions(), cfo))
+        {
+            for (int i = 0; i < sizes.Length; i++)
+            {
+                CollectionAssert.AreEqual(LargeValue(i, sizes[i]), db.Get(U("m" + i)), "native-rewritten zlib blob " + sizes[i]);
+                CollectionAssert.AreEqual(LargeValue(100 + i, sizes[i]), db.Get(U("n" + i)), "native zlib blob " + sizes[i]);
+            }
+            for (int i = 0; i < 3000; i++) Assert.AreEqual(Val(i, "small"), Encoding.UTF8.GetString(db.Get(U("s" + i.ToString("D5")))!));
+        }
+    }
+
     [TestMethod]
     [DataRow(CompressionType.None)]
     [DataRow(CompressionType.LZ4)]

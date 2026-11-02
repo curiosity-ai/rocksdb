@@ -114,15 +114,16 @@ public sealed class BackupCompatTests
     }
 
     /// <summary>
-    /// The native BackupEngine (librocksdb 11.12 from the RocksDB NuGet package) writes empty <c>meta/&lt;id&gt;</c> files when
-    /// it runs inside a .NET 11 process (observed on linux-x64; the same calls produce valid meta files under .NET 10),
-    /// so such backups are unreadable by native and managed alike. Gate on the symptom rather than on the runtime.
+    /// The native BackupEngine (librocksdb 11.12 from the RocksDB NuGet package) wrote empty <c>meta/&lt;id&gt;</c> files
+    /// under a .NET 11 apphost: its statically linked libstdc++ throws std::bad_cast on numeric ostream insertion unless
+    /// the system libstdc++.so.6 is globally visible (tests/Shared/NativeStdCxxPreload.cs). Fail clearly if that regresses.
     /// </summary>
-    internal static void SkipIfNativeMetaIsEmpty(string backupDir, uint id)
+    internal static void AssertNativeMetaIsNotEmpty(string backupDir, uint id)
     {
         if (new FileInfo(Path.Combine(backupDir, "meta", id.ToString())).Length == 0)
         {
-            Assert.Inconclusive("native BackupEngine wrote an empty meta file (librocksdb 11.12 hosted by .NET " + Environment.Version + ")");
+            Assert.Fail("native BackupEngine wrote an empty meta file (librocksdb 11.12 hosted by .NET " + Environment.Version +
+                "): is libstdc++.so.6 preloaded globally (NativeStdCxxPreload)?");
         }
     }
 
@@ -158,7 +159,7 @@ public sealed class BackupCompatTests
             using var nbe = new NativeBackupEngine(backupDir);
             nbe.CreateNewBackup(db, flush: false);
         }
-        SkipIfNativeMetaIsEmpty(backupDir, 1);
+        AssertNativeMetaIsNotEmpty(backupDir, 1);
         Func<int, string> v1 = i => i < 200 ? V(i, "a") : i < 450 ? V(i, "b") : V(i, "c");
 
         using (BackupEngine be = BackupEngine.Open(new BackupEngineOptions(backupDir)))
@@ -242,7 +243,7 @@ public sealed class BackupCompatTests
             nbe.CreateNewBackup(db, flush: true);
             nbe.Purge(2); // drops backup 1
         }
-        SkipIfNativeMetaIsEmpty(backupDir, 3);
+        AssertNativeMetaIsNotEmpty(backupDir, 3);
         using (BackupEngine be = BackupEngine.Open(new BackupEngineOptions(backupDir)))
         {
             List<BackupInfo> infos = be.GetBackupInfo();

@@ -121,8 +121,10 @@ amplification), not with assertions. The known deviations are listed in the READ
 [validation.md](validation.md).
 
 Tests that cannot run in an environment end with `Assert.Inconclusive` instead of failing: `LOCK` interop is
-implemented on Linux and Windows only, native rounds filter sizes with `malloc_usable_size` only on Linux, and native
-BackupEngine 11.12 writes empty meta files when hosted by .NET 11. A test that depends on a format newer than the NuGet
+implemented on Linux and Windows only, and native rounds filter sizes with `malloc_usable_size` only on Linux. (The
+native-backup tests used to be inconclusive under .NET 11: the packaged librocksdb needs `libstdc++.so.6` in the global
+symbol scope, which `tests/Shared/NativeStdCxxPreload.cs` now provides in every executable that loads it; see the
+backups section of validation.md.) A test that depends on a format newer than the NuGet
 package's 11.12 (the C++ tree is 11.14) must be gated the same way.
 
 ## Round-trip tests (`tests/RocksDb.Managed.RoundTrip`)

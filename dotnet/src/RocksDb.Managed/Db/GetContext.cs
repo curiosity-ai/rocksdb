@@ -44,6 +44,11 @@ internal sealed class GetContext
     /// </summary>
     public bool ValueIsBlobIndex;
     public ulong MaxCoveringTombstoneSeq;
+    /// <summary>
+    /// Sequence number of the read. With user-defined timestamps table entries with a larger seqno are skipped (they
+    /// sort after the lookup key when their timestamp is older).
+    /// </summary>
+    public ulong ReadSequence = DbFormat.MaxSequenceNumber;
     public MergeOperator? MergeOperator;
     /// <summary>
     /// User-defined timestamp size of the column family being read (0 = timestamps disabled). When non-zero, the
@@ -59,14 +64,38 @@ internal sealed class GetContext
     /// <summary>Timestamp of the newest visible entry of the key. REQUIRES: <see cref="HasTimestamp"/>.</summary>
     public ReadOnlySpan<byte> FoundTimestamp => _timestamp.AsSpan(0, TimestampSize);
 
-    /// <summary>Records the timestamp of the first matched entry (later calls are ignored).</summary>
-    public void RecordTimestampOfUserKey(ReadOnlySpan<byte> userKeyWithTimestamp)
+    /// <summary>The timestamp in <see cref="FoundTimestamp"/> is the one of a covering range tombstone (ts_from_rangetombstone_).</summary>
+    private bool _tsFromRangeTombstone;
+
+    /// <summary>
+    /// Records the timestamp of the first matched entry (GetContext::SaveValue, timestamp_): later entries are ignored,
+    /// except that the first entry newer than the covering range tombstone replaces a timestamp taken from it.
+    /// </summary>
+    public void RecordTimestampOfUserKey(ReadOnlySpan<byte> userKeyWithTimestamp, ulong sequence)
     {
-        if (HasTimestamp) return;
         int n = TimestampSize;
+        if (HasTimestamp)
+        {
+            if (!_tsFromRangeTombstone || sequence <= MaxCoveringTombstoneSeq) return;
+            _tsFromRangeTombstone = false;
+        }
         if (_timestamp.Length < n) _timestamp = new byte[n];
         userKeyWithTimestamp[^n..].CopyTo(_timestamp);
         HasTimestamp = true;
+    }
+
+    /// <summary>
+    /// A range tombstone newer than anything seen so far covers the key: its timestamp is reported unless a point entry
+    /// with a higher seqno is found (GetContext::SetTimestampFromRangeTombstone).
+    /// </summary>
+    public void SetTimestampFromRangeTombstone(ReadOnlySpan<byte> timestamp)
+    {
+        int n = TimestampSize;
+        if (n == 0 || timestamp.Length != n) return;
+        if (_timestamp.Length < n) _timestamp = new byte[n];
+        timestamp.CopyTo(_timestamp);
+        HasTimestamp = true;
+        _tsFromRangeTombstone = true;
     }
 
     public void Reset(MergeOperator? mergeOperator)
@@ -78,9 +107,11 @@ internal sealed class GetContext
         ValueIsEntity = false;
         ValueIsBlobIndex = false;
         MaxCoveringTombstoneSeq = 0;
+        ReadSequence = DbFormat.MaxSequenceNumber;
         MergeOperator = mergeOperator;
         TimestampSize = 0;
         HasTimestamp = false;
+        _tsFromRangeTombstone = false;
         _blobUserKey.Clear();
     }
 
@@ -93,7 +124,8 @@ internal sealed class GetContext
         DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(internalKey), out ulong seq, out EntryType type);
         if (TimestampSize != 0)
         {
-            RecordTimestampOfUserKey(DbFormat.ExtractUserKey(internalKey));
+            if (seq > ReadSequence) return true; // not in the read snapshot: continue to the next entry
+            RecordTimestampOfUserKey(DbFormat.ExtractUserKey(internalKey), seq);
             // ukey_with_ts_found_: blob records are keyed (and verified) by the user key with its timestamp.
             if (type == EntryType.BlobIndex && MaxCoveringTombstoneSeq <= seq)
             {

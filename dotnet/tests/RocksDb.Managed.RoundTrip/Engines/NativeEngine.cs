@@ -331,8 +331,8 @@ public sealed class NativeEngine : IEngine
         try
         {
             n.rocksdb_backup_engine_create_new_backup_flush(be, Db.Handle, flushBeforeBackup ? (byte)1 : (byte)0);
-            // Under .NET 11 the native engine writes empty meta files (see BackupCompatTests.SkipIfNativeMetaIsEmpty);
-            // the test detects that and is inconclusive, so only verify a readable backup.
+            // An empty meta file (librocksdb under a .NET 11 apphost without NativeStdCxxPreload) is reported by the
+            // test (AssertNativeMetaIsNotEmpty) with a clearer message than the verify error.
             uint id = LatestBackupId(backupDir);
             if (new FileInfo(Path.Combine(backupDir, "meta", id.ToString(System.Globalization.CultureInfo.InvariantCulture))).Length > 0)
             {

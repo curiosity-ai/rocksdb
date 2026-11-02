@@ -271,10 +271,19 @@ public sealed unsafe class MemTable : IDisposable
 
         ReadOnlySpan<byte> lookupUserKey = key.UserKey;
         ulong lookupSeq = key.Sequence;
+        int tsSize = _ucmp.TimestampSize;
         if (Volatile.Read(ref _isRangeDelTableEmpty) == 0)
         {
-            ulong covering = GetFragmentedRangeTombstones().MaxCoveringTombstoneSeqnum(lookupUserKey, lookupSeq);
-            if (covering > maxCoveringTombstoneSeq) maxCoveringTombstoneSeq = covering;
+            // With user-defined timestamps the lookup key carries the read timestamp, which bounds the visible
+            // tombstones (NewRangeTombstoneIterator(read_opts, ...) with read_opts.timestamp).
+            ReadOnlySpan<byte> readTs = tsSize == 0 ? default : lookupUserKey[^tsSize..];
+            ulong covering = GetFragmentedRangeTombstones().MaxCoveringTombstoneSeqnum(lookupUserKey, lookupSeq, readTs, out ReadOnlySpan<byte> tombstoneTs);
+            if (covering > maxCoveringTombstoneSeq)
+            {
+                maxCoveringTombstoneSeq = covering;
+                // Overwritten in SaveValue if there is a point key with a higher seqno.
+                if (timestampSink is { TimestampSize: not 0 }) timestampSink.SetTimestampFromRangeTombstone(tombstoneTs);
+            }
         }
 
         ReadOnlySpan<byte> ikey = key.InternalKey;
@@ -292,9 +301,12 @@ public sealed unsafe class MemTable : IDisposable
             bool same = _bytewise ? entryUserKey.SequenceEqual(lookupUserKey) : _ucmp.EqualWithoutTimestamp(entryUserKey, lookupUserKey);
             if (!same) break;
 
-            if (timestampSink is { TimestampSize: not 0 }) timestampSink.RecordTimestampOfUserKey(entryUserKey);
             ulong tag = Coding.DecodeFixed64(new ReadOnlySpan<byte>(ek.Ptr + userKeyLen, DbFormat.InternalKeyFooterSize));
             ulong seq = tag >> 8;
+            // With user-defined timestamps older timestamps sort after the lookup key whatever their seqno: entries
+            // newer than the read snapshot are skipped (native returns NotFound for keys written after the snapshot).
+            if (tsSize != 0 && seq > lookupSeq) continue;
+            if (timestampSink is { TimestampSize: not 0 }) timestampSink.RecordTimestampOfUserKey(entryUserKey, seq);
             var type = (EntryType)(byte)tag;
             if (sequence == DbFormat.MaxSequenceNumber)
             {
