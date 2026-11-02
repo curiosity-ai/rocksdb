@@ -20,6 +20,7 @@ internal sealed class LevelCompactionPicker : CompactionPicker
         if (vstorage.ExpiredTtlFiles.Count > 0) return true;
         if (vstorage.FilesMarkedForPeriodicCompaction.Count > 0) return true;
         if (vstorage.FilesMarkedForCompaction.Count > 0) return true;
+        if (vstorage.FilesMarkedForForcedBlobGC.Count > 0) return true;
         for (int i = 0; i <= vstorage.MaxInputLevel && i < vstorage.NumLevels - 1; i++)
         {
             if (vstorage.CompactionScore(i) >= 1) return true;
@@ -186,7 +187,15 @@ internal sealed class LevelCompactionPicker : CompactionPicker
             // Periodic Compaction
             PickFileToCompact(_vstorage.FilesMarkedForPeriodicCompaction,
                 _o.LevelCompactionDynamicLevelBytes ? CompactToNextLevel.Yes : CompactToNextLevel.No);
-            if (!_startLevelInputs.IsEmpty) _reason = CompactionReason.PeriodicCompaction;
+            if (!_startLevelInputs.IsEmpty)
+            {
+                _reason = CompactionReason.PeriodicCompaction;
+                return;
+            }
+
+            // Forced blob garbage collection
+            PickFileToCompact(_vstorage.FilesMarkedForForcedBlobGC, CompactToNextLevel.No);
+            if (!_startLevelInputs.IsEmpty) _reason = CompactionReason.ForcedBlobGC;
         }
 
         private bool SetupOtherL0FilesIfNeeded()

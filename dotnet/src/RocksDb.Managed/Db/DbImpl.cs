@@ -375,6 +375,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     internal void PurgeObsoleteFiles()
     {
         var tables = new List<ObsoleteTableFile>();
+        var blobs = new List<ObsoleteBlobFile>();
         var wals = new List<ulong>();
         var manifests = new List<ulong>();
         lock (_mutex)
@@ -382,6 +383,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             // DisableFileDeletions: keep everything queued until deletions are re-enabled (FindObsoleteFiles).
             if (FileDeletionsDisabled || _readOnly) return;
             Versions.TakeObsoleteFiles(tables);
+            Versions.TakeObsoleteBlobFiles(blobs);
             ulong minLog = MinLogNumberToKeepLive();
             for (int i = 0; i < _aliveWals.Count;)
             {
@@ -400,6 +402,12 @@ internal sealed partial class DbImpl : IAsyncDisposable
         {
             t.Cfd.TableCache.Evict(t.Meta.FileNumber);
             TryDeleteFile(FileNames.TableFileName(DbPaths, t.Meta.FileNumber, t.Meta.PathId));
+        }
+        foreach (ObsoleteBlobFile b in blobs)
+        {
+            // The SharedBlobFileMetaData deleter: evict the reader, then delete the file (AddObsoleteBlobFile).
+            b.Cfd.BlobSource.Evict(b.BlobFileNumber);
+            TryDeleteFile(FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber));
         }
         foreach (ulong n in wals) DeleteOrArchiveWal(n);
         foreach (ulong n in manifests) TryDeleteFile(FileNames.DescriptorFileName(DbName, n));
@@ -434,6 +442,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
                     {
                         case FileType.TableFile:
                             if (!Versions.IsLiveFile(number) && !_pendingOutputs.Contains(number)) toDelete.Add(full);
+                            break;
+                        case FileType.BlobFile:
+                            if (!Versions.IsLiveBlobFile(number) && !_pendingOutputs.Contains(number)) toDelete.Add(full);
                             break;
                         case FileType.DescriptorFile:
                             if (dir == DbName && number != Versions.ManifestFileNumber) toDelete.Add(full);
@@ -525,7 +536,11 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 foreach (ColumnFamilyData cfd in Versions.ColumnFamilies) ReleaseColumnFamilyResources(cfd);
                 // Dropped column families keep their table cache open until close: readers and background jobs that
                 // still hold one of their versions read through it (their files are evicted as they become obsolete).
-                foreach (ColumnFamilyData cfd in _droppedColumnFamilies) cfd.TableCache.Dispose();
+                foreach (ColumnFamilyData cfd in _droppedColumnFamilies)
+                {
+                    cfd.TableCache.Dispose();
+                    cfd.BlobSource.Dispose();
+                }
                 _droppedColumnFamilies.Clear();
             }
         }
@@ -546,6 +561,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     {
         ReleaseColumnFamilyMemTables(cfd);
         cfd.TableCache.Dispose();
+        cfd.BlobSource.Dispose();
     }
 
     /// <summary>

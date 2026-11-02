@@ -63,6 +63,8 @@ typedef struct {
   int64_t max_bytes_for_level_base;
   int level0_file_num_compaction_trigger;
   bool disable_auto_compactions;
+  bool enable_blob_files;
+  uint64_t min_blob_size;
   int max_background_jobs;
   bool use_existing_db;
   int64_t seed;
@@ -94,6 +96,8 @@ static Flags FLAGS = {
     .max_bytes_for_level_base = 256 << 20,
     .level0_file_num_compaction_trigger = 4,
     .disable_auto_compactions = false,
+    .enable_blob_files = false,
+    .min_blob_size = 0,
     .max_background_jobs = 2,
     .use_existing_db = false,
     .seed = 301,
@@ -115,6 +119,7 @@ static void usage(void) {
           "  [--target_file_size_base BYTES] [--max_bytes_for_level_base BYTES] "
           "[--level0_file_num_compaction_trigger 4]\n"
           "  [--disable_auto_compactions] [--max_background_jobs 2]\n"
+          "  [--enable_blob_files] [--min_blob_size 0]\n"
           "  [--use_existing_db] [--seed 301] [--db PATH] [--histogram 1]\n"
           "benchmarks: fillseq fillrandom overwrite fillsync readrandom "
           "readmissing readseq readreverse\n"
@@ -183,6 +188,10 @@ static void parse_flags(int argc, char** argv) {
       FLAGS.level0_file_num_compaction_trigger = atoi(value);
     else if (FLAG("disable_auto_compactions"))
       FLAGS.disable_auto_compactions = parse_bool(value);
+    else if (FLAG("enable_blob_files"))
+      FLAGS.enable_blob_files = parse_bool(value);
+    else if (FLAG("min_blob_size"))
+      FLAGS.min_blob_size = strtoull(value, NULL, 10);
     else if (FLAG("max_background_jobs"))
       FLAGS.max_background_jobs = atoi(value);
     else if (FLAG("use_existing_db")) FLAGS.use_existing_db = parse_bool(value);
@@ -410,6 +419,8 @@ static void build_options(void) {
       g_options, FLAGS.level0_file_num_compaction_trigger);
   rocksdb_options_set_disable_auto_compactions(g_options,
                                                FLAGS.disable_auto_compactions);
+  rocksdb_options_set_enable_blob_files(g_options, FLAGS.enable_blob_files);
+  rocksdb_options_set_min_blob_size(g_options, FLAGS.min_blob_size);
   rocksdb_options_set_max_background_jobs(g_options,
                                           FLAGS.max_background_jobs);
   rocksdb_options_set_block_based_table_factory(g_options, g_table_options);
@@ -1046,6 +1057,8 @@ static void print_header(void) {
          FLAGS.target_file_size_base, FLAGS.max_bytes_for_level_base,
          FLAGS.level0_file_num_compaction_trigger,
          FLAGS.disable_auto_compactions, FLAGS.max_background_jobs);
+  printf("Blob files:  enable_blob_files=%d min_blob_size=%" PRIu64 "\n",
+         FLAGS.enable_blob_files, FLAGS.min_blob_size);
   printf("DB path:     %s\n", FLAGS.db);
   printf("Kernel:      %s %s\n", u.sysname, u.release);
   printf("------------------------------------------------\n");

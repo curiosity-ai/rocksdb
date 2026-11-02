@@ -91,6 +91,14 @@ internal sealed partial class DbImpl
                     pending = RemoveDone(batch, order, pending);
                 }
             }
+            // Blob indexes are resolved while the super version (and so its blob files) is referenced.
+            for (int k = 0; k < n; k++)
+            {
+                GetContext ctx = batch.Context(k);
+                if (!ctx.ValueIsBlobIndex) continue;
+                if (synchronous) ctx.ResolveBlob(cfd.BlobSource, sv.Current.Storage, options, batch.UserKey(k));
+                else await ctx.ResolveBlobAsync(cfd.BlobSource, sv.Current.Storage, options, batch.UserKeyMemory(k), cancellationToken).ConfigureAwait(false);
+            }
             batch.FinishRun();
             if (st is not null) RecordMultiGet(st, batch, t0);
         }

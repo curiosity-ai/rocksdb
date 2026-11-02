@@ -79,6 +79,17 @@ public sealed class NativeEngine : IEngine
         o.SetWriteBufferSize(s.WriteBufferSize)
          .SetCompression(Compression(s.Compression))
          .SetDisableAutoCompactions(s.DisableAutoCompactions ? 1 : 0);
+        if (s.EnableBlobFiles)
+        {
+            // Blob options through the C API (rocksdb_options_set_*blob*), not wrapped by rocksdb-sharp.
+            N.Native n = N.Native.Instance;
+            n.rocksdb_options_set_enable_blob_files(o.Handle, 1);
+            n.rocksdb_options_set_min_blob_size(o.Handle, s.MinBlobSize);
+            n.rocksdb_options_set_blob_file_size(o.Handle, s.BlobFileSize);
+            n.rocksdb_options_set_blob_compression_type(o.Handle, (int)s.BlobCompression);
+            n.rocksdb_options_set_enable_blob_gc(o.Handle, s.EnableBlobGc ? (byte)1 : (byte)0);
+            n.rocksdb_options_set_blob_gc_age_cutoff(o.Handle, s.BlobGcAgeCutoff);
+        }
         var table = Keep(new N.BlockBasedTableOptions())
             .SetFormatVersion(s.FormatVersion)
             .SetBlockSize(s.BlockSize);

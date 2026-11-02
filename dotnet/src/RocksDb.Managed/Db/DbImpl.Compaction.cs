@@ -329,6 +329,8 @@ internal sealed partial class DbImpl
                 job.RunAsync(synchronous: true).GetAwaiter().GetResult();
                 c.AddInputDeletions(edit);
                 foreach (FileMetaData f in job.Outputs) edit.AddFile(c.OutputLevel, f);
+                edit.BlobFileAdditions.AddRange(job.BlobFileAdditions);
+                edit.BlobFileGarbages.AddRange(job.BlobFileGarbages);
                 if (job.Outputs.Count > 0) FileSystem.SyncDirectory(DbPaths[(int)Math.Min(c.OutputPathId, (uint)(DbPaths.Count - 1))]);
             }
             lock (_mutex)
@@ -337,6 +339,8 @@ internal sealed partial class DbImpl
             }
             ct.ThrowIfCancellationRequested();
             TestHooks.Invoke("DBImpl::RunCompaction:BeforeLogAndApply");
+            // From here on a failure may still have made the edit durable: leave the blob files to the obsolete-file scan.
+            if (job?.BlobBuilder is { } blobOut) blobOut.Committed = true;
             Versions.LogAndApplyAsync(cfd, edit, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
             lock (_mutex)
             {
@@ -388,6 +392,12 @@ internal sealed partial class DbImpl
             if (!ok && job is not null)
             {
                 foreach (ulong n in job.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
+            }
+            if (job?.BlobBuilder is { } blobBuilder)
+            {
+                // Unregisters the pending blob outputs; a job that failed before its MANIFEST write deletes its blob files.
+                ReleaseBlobOutputs(blobBuilder);
+                blobBuilder.Dispose();
             }
             try
             {
@@ -661,6 +671,8 @@ internal sealed partial class DbImpl
                     {
                         if (c is not null)
                         {
+                            c.BlobGarbageCollectionPolicy = options.BlobGarbageCollectionPolicy;
+                            c.BlobGarbageCollectionAgeCutoffOverride = options.BlobGarbageCollectionAgeCutoff;
                             c.InputVersion = cfd.Current;
                             cfd.Current.Ref();
                             snapshots = SnapshotsForCompaction();

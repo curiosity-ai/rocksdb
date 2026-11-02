@@ -128,12 +128,27 @@ internal sealed partial class DbImpl
         foreach (ImmutableMemTable m in picked) mems.Add(m.Mem);
         OnFlushStarted(cfd, jobId, mems);
         string path = FileNames.TableFileName(DbPaths, fileNumber, 0);
-        FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, mems, fileNumber, epoch, Identity, synchronous, CancellationToken.None)
+        using Blob.BlobFileBuilder? blobBuilder = CreateBlobFileBuilder(cfd, outputLevel: 0, Blob.BlobFileCreationReason.Flush);
+        try
+        {
+            await FlushAndInstallAsync(cfd, picked, fileNumber, epoch, synchronous, jobId, flushStart, mems, path, blobBuilder).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (blobBuilder is not null) ReleaseBlobOutputs(blobBuilder);
+        }
+    }
+
+    private async ValueTask FlushAndInstallAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch, bool synchronous,
+        int jobId, long flushStart, List<MemTable> mems, string path, Blob.BlobFileBuilder? blobBuilder)
+    {
+        FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, mems, fileNumber, epoch, Identity, blobBuilder, synchronous,
+                CancellationToken.None)
             .ConfigureAwait(false);
         if (meta is not null)
         {
             FileSystem.SyncDirectory(DbPaths[0]);
-            RecordFlushBytes(meta.FileSize);
+            RecordFlushBytes(meta.FileSize + BlobBytesWritten(blobBuilder));
         }
 
         var edit = new VersionEdit
@@ -143,7 +158,11 @@ internal sealed partial class DbImpl
             // The CF's data in WALs below the next log number of the newest flushed memtable is now persisted.
             LogNumber = picked[^1].NextLogNumber,
         };
-        if (meta is not null) edit.AddFile(0, meta);
+        if (meta is not null)
+        {
+            edit.AddFile(0, meta);
+            if (blobBuilder is not null) edit.BlobFileAdditions.AddRange(blobBuilder.Additions);
+        }
         lock (_mutex)
         {
             if (cfd.Dropped) ThrowDropped(cfd);
@@ -160,6 +179,8 @@ internal sealed partial class DbImpl
             }
         }
         TestHooks.Invoke("DBImpl::FlushMemTables:BeforeLogAndApply");
+        // From here on a failure may still have made the edit durable: leave the blob files to the obsolete-file scan.
+        if (blobBuilder is not null) blobBuilder.Committed = true;
         await Versions.LogAndApplyAsync(cfd, edit, synchronous, CancellationToken.None).ConfigureAwait(false);
 
         lock (_mutex)
@@ -174,7 +195,7 @@ internal sealed partial class DbImpl
             InstallSuperVersion(cfd);
             _maybeStalled = IsWriteStalled();
         }
-        OnFlushCompleted(cfd, jobId, meta, flushStart);
+        OnFlushCompleted(cfd, jobId, meta, BlobBytesWritten(blobBuilder), flushStart);
     }
 
     /// <summary>
@@ -239,6 +260,47 @@ internal sealed partial class DbImpl
             }
             if (synchronous) signal.Wait();
             else await signal.ConfigureAwait(false);
+        }
+    }
+
+    // ---- blob files (shared by flush, recovery flush and compaction) -----------------------------------
+
+    /// <summary>
+    /// A blob file builder for output to <paramref name="outputLevel"/> when the column family writes blob files there
+    /// (enable_blob_files and output level &gt;= blob_file_starting_level), else null. Its file numbers are registered as
+    /// pending outputs until <see cref="ReleaseBlobOutputs"/>.
+    /// </summary>
+    internal Blob.BlobFileBuilder? CreateBlobFileBuilder(ColumnFamilyData cfd, int outputLevel, Blob.BlobFileCreationReason reason)
+    {
+        ColumnFamilyOptions o = cfd.Options;
+        if (!o.EnableBlobFiles || outputLevel < o.BlobFileStartingLevel) return null;
+        var fileOptions = new Env.WritableFileOptions
+        {
+            BytesPerSync = (long)Math.Min(Options.BytesPerSync, long.MaxValue),
+            MaxBufferSize = (int)Math.Clamp(Options.WritableFileMaxBufferSize, 64 * 1024, int.MaxValue),
+        };
+        return new Blob.BlobFileBuilder(FileSystem, DbPaths[0], NewPendingOutputFileNumber, o, cfd.Id, reason, cfd.BlobSource, Stats, fileOptions);
+    }
+
+    /// <summary>Total size of the blob files a builder finished (bytes_written_blob).</summary>
+    internal static ulong BlobBytesWritten(Blob.BlobFileBuilder? builder)
+    {
+        ulong n = 0;
+        if (builder is null) return 0;
+        foreach (BlobFileAddition a in builder.Additions) n += a.TotalBlobBytes + Blob.BlobLogFormat.HeaderSize + Blob.BlobLogFormat.FooterSize;
+        return n;
+    }
+
+    /// <summary>
+    /// Unregisters the builder's pending blob outputs; deletes its files unless the job's version edit was committed
+    /// (<see cref="Blob.BlobFileBuilder.Committed"/>).
+    /// </summary>
+    internal void ReleaseBlobOutputs(Blob.BlobFileBuilder builder)
+    {
+        if (!builder.Committed) builder.DeleteCreatedFiles();
+        lock (_mutex)
+        {
+            foreach (ulong n in builder.CreatedFileNumbers) _pendingOutputs.Remove(n);
         }
     }
 }

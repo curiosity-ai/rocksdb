@@ -40,6 +40,12 @@ public sealed class ManagedEngine : IEngine
         Compression = s.Compression,
         DisableAutoCompactions = s.DisableAutoCompactions,
         MergeOperator = MergeOperatorFor(s.Merge),
+        EnableBlobFiles = s.EnableBlobFiles,
+        MinBlobSize = s.MinBlobSize,
+        BlobFileSize = s.BlobFileSize,
+        BlobCompressionType = s.BlobCompression,
+        EnableBlobGarbageCollection = s.EnableBlobGc,
+        BlobGarbageCollectionAgeCutoff = s.BlobGcAgeCutoff,
         TableOptions = new BlockBasedTableOptions
         {
             FormatVersion = (uint)s.FormatVersion,

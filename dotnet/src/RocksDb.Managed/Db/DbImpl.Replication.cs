@@ -408,7 +408,7 @@ internal sealed partial class DbImpl
 
     /// <summary>
     /// Port of DBImpl::GetLiveFiles: optionally flushes all column families, then returns the names (relative to the
-    /// DB directory, starting with '/') of the live table files, CURRENT, the MANIFEST and the latest OPTIONS file,
+    /// DB directory, starting with '/') of the live table and blob files, CURRENT, the MANIFEST and the latest OPTIONS file,
     /// plus the MANIFEST size consistent with the table set. Callers that copy the files should disable file
     /// deletions first.
     /// </summary>
@@ -444,6 +444,11 @@ internal sealed partial class DbImpl
                     {
                         if (seen.Add(f.FileNumber)) ret.Add("/" + FileNames.MakeTableFileName(f.FileNumber));
                     }
+                }
+                // Blob files of the current version (GetLiveFiles: BlobFileName("", number)).
+                foreach (Blob.BlobFileMetaData b in s.BlobFiles)
+                {
+                    if (seen.Add(b.BlobFileNumber)) ret.Add(FileNames.BlobFileName("", b.BlobFileNumber));
                 }
             }
             (manifestNumber, manifestSize) = Versions.InstalledManifest;

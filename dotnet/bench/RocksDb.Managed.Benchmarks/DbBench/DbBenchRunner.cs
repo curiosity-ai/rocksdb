@@ -811,6 +811,8 @@ public static class DbBenchRunner
                 case "max_bytes_for_level_base": o = o with { MaxBytesForLevelBase = long.Parse(value, ci) }; break;
                 case "level0_file_num_compaction_trigger": o = o with { Level0FileNumCompactionTrigger = int.Parse(value, ci) }; break;
                 case "disable_auto_compactions": o = o with { DisableAutoCompactions = ParseBool(value) }; break;
+                case "enable_blob_files": o = o with { EnableBlobFiles = ParseBool(value) }; break;
+                case "min_blob_size": o = o with { MinBlobSize = ulong.Parse(value, ci) }; break;
                 case "max_background_jobs": o = o with { MaxBackgroundJobs = int.Parse(value, ci) }; break;
                 default: throw new ArgumentException("unknown flag --" + name);
             }
@@ -871,7 +873,7 @@ public static class DbBenchRunner
         Console.Error.WriteLine("               [--disable_wal] [--sync] [--cache_size BYTES] [--cache_type lru|hyperclock] [--bloom_bits 10]");
         Console.Error.WriteLine("               [--write_buffer_size BYTES] [--block_size 4096] [--compression none|snappy|lz4|zstd] [--compression_ratio 0.5]");
         Console.Error.WriteLine("               [--target_file_size_base BYTES] [--max_bytes_for_level_base BYTES] [--level0_file_num_compaction_trigger 4]");
-        Console.Error.WriteLine("               [--disable_auto_compactions] [--max_background_jobs 2]");
+        Console.Error.WriteLine("               [--disable_auto_compactions] [--max_background_jobs 2] [--enable_blob_files] [--min_blob_size 0]");
         Console.Error.WriteLine("               [--use_existing_db] [--seed 301] [--db PATH] [--histogram 1] [--c_bench PATH-TO-rocksdb_bench]");
         Console.Error.WriteLine("benchmarks: " + string.Join(' ', BenchFlags.AllBenchmarkNames));
     }

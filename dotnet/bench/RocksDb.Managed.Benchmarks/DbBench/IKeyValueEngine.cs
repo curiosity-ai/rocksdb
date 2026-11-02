@@ -113,6 +113,12 @@ public sealed record EngineOptions
     /// <summary>--disable_auto_compactions.</summary>
     public bool DisableAutoCompactions { get; init; }
 
+    /// <summary>--enable_blob_files: integrated BlobDB (values of at least --min_blob_size bytes go to blob files).</summary>
+    public bool EnableBlobFiles { get; init; }
+
+    /// <summary>--min_blob_size (0).</summary>
+    public ulong MinBlobSize { get; init; }
+
     /// <summary>--max_background_jobs (2).</summary>
     public int MaxBackgroundJobs { get; init; } = 2;
 
