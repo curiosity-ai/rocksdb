@@ -96,8 +96,12 @@ $B report --csv out.csv --out out.md
 - **LSM shape / write-amp** (compaction configuration): files per level from `rocksdb.num-files-at-level<N>`, and
   flush + compaction bytes written divided by user bytes. The WAL is not counted. The written bytes have a resolution
   of 0.01 GB.
-- **`flush` and `compact` include JIT warm-up for managed**: each runs once in a fresh process, and the first
-  compaction of a process is 2.5-3.5x slower than later ones (see "Perf pass #3" in [perf.md](perf.md)).
+- **Warm code only.** Benchmarks must measure warm code (CLAUDE.md): the runner is getting a `--warmup` pass that
+  runs every workload on a throwaway DB, including flush and compaction, and reports how many methods are
+  JIT-compiled during the measured run (this should be about 0). Reports produced before that change, including the
+  ones summarized below, ran `flush` and `compact` once in a fresh process, so their managed numbers include JIT
+  warm-up. The first compaction of a process is 2.5-3.5x slower than later ones (see "Perf pass #3" in
+  [perf.md](perf.md)). Treat those cells as cold-start numbers, not steady-state performance.
 - **`fillsync`** measures the device's fsync latency more than the engine. Expect large swings between runs.
 
 **Noise caveat.** The committed results come from a shared 4-vCPU cloud VM (KVM, Intel Xeon @ 2.80 GHz, 15 GiB)
@@ -136,7 +140,7 @@ Takeaways:
   `seekrandom` 0.33x). With 1 KiB values and 4 threads they are slower (`readrandom` 2.6x, `readreverse` 3.8x); this
   configuration has the widest run-to-run spread and needs a quiet re-run.
 - **Async** costs about the same as sync, because calls complete synchronously when nothing waits.
-- **Flush and compaction** in a fresh process are mostly slower than C: one flush is 0.7-2.0x without compression and
+- **Flush and compaction** in a fresh process (cold, see "Warm code only" above) are mostly slower than C: one flush is 0.7-2.0x without compression and
   2.7-3.2x with LZ4, where the LZ4 codec's JIT warm-up dominates, and one full compaction is 0.96-2.35x. Later flushes
   and compactions in the same process are at or below native cost ([perf.md](perf.md), perf pass #3).
 - **LSM shape** in the compaction-heavy configuration is close to native: write-amp 3.24-3.33 managed against 2.96 for
