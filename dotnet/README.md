@@ -41,10 +41,12 @@ while the bytes may differ (for example, because a compressor makes different ch
 | Compression: Snappy, LZ4, LZ4HC, ZSTD, Zlib | yes | yes | read + write; ZSTD (with dictionaries) byte-identical; see deviations below |
 | Compression: BZip2, Xpress | no | n/a | a configured BZip2/Xpress type stores blocks uncompressed |
 | Integrated BlobDB (blob files, blob GC) | yes | yes | blob files byte-identical |
-| Wide columns (`PutEntity`, V1 entities) | yes | yes | V2 entities with blob columns: NotSupported |
+| Wide columns (`PutEntity`, V1 entities) | yes | yes | compaction filters on entities (`FilterV3`, `kChangeWideColumnEntity`) |
+| Wide-column entities with blob-backed columns (V2 entities) | yes | yes | written by flush/compaction value separation and blob direct write; blob GC and garbage accounting of entity columns |
+| Blob direct write (`enable_blob_direct_write`, partitions) | yes | yes | needs RocksDB with blob direct write (librocksdb 11.12 has it); off by default; like upstream v1, blob files not registered by a flush before a crash are not recovered |
 | User-defined timestamps (persisted) | yes | yes | timestamped writes byte-identical; `full_history_ts_low` GC; timestamped range deletions and `SstFileWriter` files |
 | User-defined timestamps in memtable only (`persist_user_defined_timestamps = false`) | yes | yes | tables/MANIFEST without timestamps, WAL with them; flush cutoff and postponement; enabling/disabling UDT on an existing column family |
-| Transactions with user-defined timestamps (commit timestamps, read-timestamp validation) | yes | yes | plain and 2PC commits (`kTypeCommitXIDAndTimestamp`) recover across engines |
+| Transactions with user-defined timestamps (commit timestamps, read-timestamp validation) | yes | yes | plain and 2PC commits (`kTypeCommitXIDAndTimestamp`) recover across engines; `GetForUpdate` with `doValidate: false`; optimistic transactions cannot commit timestamped writes (as upstream) |
 | Transactions: 2PC prepare/commit/rollback WAL markers | yes | yes | byte-identical; prepared transactions recover across engines |
 | `DBWithTTL` value format | yes | yes | |
 | BackupEngine directory layout and meta files | yes | yes | incremental backups across engines |

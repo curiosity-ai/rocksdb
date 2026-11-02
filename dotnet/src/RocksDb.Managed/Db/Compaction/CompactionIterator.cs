@@ -32,9 +32,9 @@ internal struct CompactionIterationStats
 /// User-defined timestamps: versions of a key with different timestamps are distinct keys unless they are older than
 /// full_history_ts_low, in which case the older ones may be collapsed (rule A) and their sequence number and timestamp
 /// zeroed at the bottommost level.
-/// Blob files (integrated BlobDB): see <see cref="BlobProcessor"/> (extraction, garbage collection, blob values for the
-/// compaction filter and merges). Not ported: snapshot checkers (write-prepared transactions), wide-column
-/// filtering, range-tombstone sentinel keys (range tombstones are handled by the <see cref="RangeDelAggregator"/>
+/// Blob files (integrated BlobDB): see <see cref="BlobProcessor"/> (extraction and garbage collection of values and entity
+/// columns, blob values for the compaction filter and merges). Wide-column entities reach the compaction filter's FilterV3. Not ported:
+/// snapshot checkers (write-prepared transactions), range-tombstone sentinel keys (range tombstones are handled by the <see cref="RangeDelAggregator"/>
 /// and written by the compaction job). Allocation-free per key: the current key lives in an <see cref="IterKey"/>
 /// and values are spans into the input, the merge helper or the filter output.
 /// </para>
