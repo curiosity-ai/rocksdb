@@ -54,8 +54,7 @@ internal sealed class CompactionInputFiles
 /// A picked compaction: inputs per level, output level and the settings for its outputs. Port of rocksdb::Compaction
 /// (db/compaction/compaction.{h,cc}): bottommost detection (IsBottommostLevel), IsTrivialMove,
 /// KeyNotExistsBeyondOutputLevel / KeyRangeNotExistsBeyondOutputLevel, input deletions, being-compacted marking.
-/// Proximal-level output (per-key placement), blob files, subcompaction boundaries and SST partitioners are not
-/// ported.
+/// Proximal-level output (per-key placement) and subcompaction boundaries are not ported.
 /// </summary>
 internal sealed class Compaction
 {
@@ -120,6 +119,24 @@ internal sealed class Compaction
     public bool IsTrivialMoveForced { get; init; }
     /// <summary>Universal/manual: never trivially move.</summary>
     public bool DisallowTrivialMove { get; init; }
+    /// <summary>
+    /// False when the picker disabled compression of the outputs (universal compression_size_percent: the output holds
+    /// newer data than the compressed share). <see cref="OutputCompression"/> is then <c>None</c>.
+    /// </summary>
+    public bool EnableCompression { get; init; } = true;
+    /// <summary>
+    /// Compaction::output_split_key_: with leveled round-robin compaction, the output level's compact cursor when it falls
+    /// inside the compaction's key range; the first output is cut before it. Set by the picker.
+    /// </summary>
+    public byte[]? OutputSplitKey { get; set; }
+
+    /// <summary>Port of Compaction::CreateSstPartitioner: the column family's partitioner for this compaction, or null.</summary>
+    public SstPartitioner? CreateSstPartitioner() =>
+        Options.SstPartitionerFactory?.CreatePartitioner(new SstPartitionerContext(IsFullCompaction, IsManual, OutputLevel, _smallestUserKey,
+            _largestUserKey));
+
+    /// <summary>Temperature recorded for the output files (Compaction::output_temperature; FIFO kChangeTemperature).</summary>
+    public Temperature OutputTemperature { get; init; } = Temperature.Unknown;
 
     /// <summary>Manual compaction override of blob garbage collection (CompactRangeOptions::blob_garbage_collection_policy).</summary>
     public BlobGarbageCollectionPolicy BlobGarbageCollectionPolicy { get; set; } = BlobGarbageCollectionPolicy.UseDefault;
@@ -270,13 +287,20 @@ internal sealed class Compaction
             return false;
         if (OutputLevel + 1 < NumberLevels)
         {
+            SstPartitioner? partitioner = CreateSstPartitioner();
             var grandparents = new List<FileMetaData>();
             foreach (FileMetaData file in _inputs[0].Files)
             {
+                grandparents.Clear();
                 InputStorage.GetOverlappingInputs(OutputLevel + 1, file.Smallest, file.Largest, grandparents);
                 ulong size = file.FileSize;
                 foreach (FileMetaData g in grandparents) size += g.FileSize;
                 if (size > MaxCompactionBytes) return false;
+                if (partitioner is not null
+                    && !partitioner.CanDoTrivialMove(DbFormat.ExtractUserKey(file.Smallest), DbFormat.ExtractUserKey(file.Largest)))
+                {
+                    return false;
+                }
             }
         }
         return true;

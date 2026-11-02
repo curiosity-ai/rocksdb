@@ -242,6 +242,7 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
                 continue;
             }
             UpdateCurrentWriteBatch(record);
+            if (_status is not null) return;
             if (_currentLastSeq >= _startingSequenceNumber)
             {
                 if (strict && _currentBatchSeq != _startingSequenceNumber)
@@ -354,16 +355,11 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
         // If the iterator has started, then confirm that we get continuous batches.
         if (_started && !IsBatchExpected(batchSeq, expectedSeq))
         {
-            // Seek to the batch having expected sequence number.
-            if (expectedSeq < _files[_currentFileIndex].StartSequence)
-            {
-                // Expected batch must lie in the previous log file. Avoid underflow.
-                if (_currentFileIndex != 0) _currentFileIndex--;
-            }
-            _startingSequenceNumber = expectedSeq;
-            // currentStatus_ will be set to Ok if reseek succeeds.
+            // A run is contiguous, so a discontinuity ends it (WalIteratorImpl::UpdateCurrentWriteBatch). Note that this
+            // is a normal consequence of writes that bypass the WAL (WriteOptions.DisableWal, IngestExternalFile), not
+            // necessarily of data loss. The iterator is spent: Next does nothing; open a new one at NextSequence.
+            _isValid = false;
             _status = new RocksDbException(StatusCode.NotFound, "NotFound: Gap in sequence numbers");
-            SeekToStartSequence(_currentFileIndex, strict: true);
             return;
         }
         _currentBatchSeq = batchSeq;

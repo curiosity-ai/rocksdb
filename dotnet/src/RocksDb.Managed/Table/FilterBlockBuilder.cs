@@ -22,6 +22,33 @@ internal abstract class FilterBlockBuilder : IDisposable
     /// <summary>EstimateEntriesAdded: number of (de-duplicated) hash entries added, including finished partitions.</summary>
     public abstract ulong EstimateEntriesAdded { get; }
 
+    /// <summary>
+    /// CurrentFilterSizeEstimate (UpdateFilterSizeEstimate), computed on demand: the filter size for the entries added so
+    /// far plus room for about two more data blocks. The managed bits builders do not expose CalculateSpace, so the size
+    /// per entry is derived from <see cref="IFilterBitsBuilder.ApproximateNumEntries"/> (an approximation of the same
+    /// quantity: within a few bytes for bloom, slightly larger for ribbon).
+    /// </summary>
+    public ulong CurrentFilterSizeEstimate(ulong numDataBlocks)
+    {
+        ulong entries = EstimateEntriesAdded;
+        if (entries == 0) return 0;
+        ulong filterSize = EstimateSpace(entries);
+        // Reserve filter space for next data block ~2x the average.
+        return numDataBlocks > 0 ? filterSize + filterSize / numDataBlocks * 2 : filterSize;
+    }
+
+    /// <summary>Approximate filter bytes for <paramref name="entries"/> keys.</summary>
+    protected abstract ulong EstimateSpace(ulong entries);
+
+    /// <summary>Bytes for <paramref name="entries"/> keys from the builder's keys-per-byte ratio over a 1 MiB filter.</summary>
+    private protected static ulong EstimateSpaceFromRatio(IFilterBitsBuilder bits, ulong entries)
+    {
+        const ulong Probe = 1UL << 20;
+        ulong perMiB = bits.ApproximateNumEntries(Probe);
+        // 2 bytes per entry (about 15 bits per key) when the builder cannot tell (upstream's partitioned fallback).
+        return perMiB == 0 ? entries * 2 : (ulong)((double)entries * Probe / perMiB);
+    }
+
     /// <summary>PrevKeyBeforeFinish: called once with the last key added before the first <see cref="Finish"/>.</summary>
     public virtual void PrevKeyBeforeFinish(ReadOnlySpan<byte> prevKeyWithoutTs) { }
 
@@ -72,6 +99,7 @@ internal sealed class FullFilterBlockBuilder : FilterBlockBuilder
 
     public override bool IsEmpty => _bits.EstimatedEntries == 0;
     public override ulong EstimateEntriesAdded => (ulong)_bits.EstimatedEntries;
+    protected override ulong EstimateSpace(ulong entries) => EstimateSpaceFromRatio(_bits, entries);
 
     public override bool Finish(BlockHandle lastPartitionHandle, out ReadOnlySpan<byte> contents)
     {
@@ -173,6 +201,7 @@ internal sealed class PartitionedFilterBlockBuilder : FilterBlockBuilder
 
     public override bool IsEmpty => _bits.EstimatedEntries == 0 && _filters.Count == 0;
     public override ulong EstimateEntriesAdded => _totalAddedInBuilt + (ulong)_bits.EstimatedEntries;
+    protected override ulong EstimateSpace(ulong entries) => EstimateSpaceFromRatio(_bits, entries);
 
     private bool DecideCutAFilterBlock()
     {

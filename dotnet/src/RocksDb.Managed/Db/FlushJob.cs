@@ -49,6 +49,12 @@ internal static class FlushJob
     {
         bool stripTimestamps = cfd.TimestampsInMemtableOnly;
         ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        // FlushJob::WriteLevel0Table: oldest_key_time = mems_.front()->ApproximateOldestKeyTime() (the oldest memtable,
+        // whose first insert precedes every insert into the later ones: the minimum over all of them). It is not
+        // always available (no insert), in which case the oldest ancestor time is the current time.
+        ulong oldestKeyTime = ulong.MaxValue;
+        foreach (MemTable m in mems) oldestKeyTime = Math.Min(oldestKeyTime, m.ApproximateOldestKeyTime);
+        ulong oldestAncestorTime = Math.Min(now, oldestKeyTime);
         TableBuilderOptions tbo = TableFactory.CreateBuilderOptions(cfd.Options, TableFileLevel.Flush) with
         {
             ColumnFamilyId = cfd.Id,
@@ -57,8 +63,10 @@ internal static class FlushJob
             DbId = identity.DbId,
             DbSessionId = identity.SessionId,
             DbHostId = identity.HostId,
-            CreationTime = now,
-            OldestKeyTime = now,
+            // BuildTable -> SetSeqnoTimeTableProperties: rocksdb.creation.time is the oldest ancestor time (the file
+            // creation time with FIFO compaction).
+            CreationTime = cfd.Options.CompactionStyle == CompactionStyle.Fifo ? now : oldestAncestorTime,
+            OldestKeyTime = oldestKeyTime,
             NewestKeyTime = now, // FlushJob::WriteLevel0Table: current_time /* newest_key_time */
             FileCreationTime = now,
         };
@@ -68,8 +76,10 @@ internal static class FlushJob
             FileNumber = fileNumber,
             EpochNumber = epochNumber,
             FileCreationTime = now,
-            OldestAncestorTime = now,
+            OldestAncestorTime = oldestAncestorTime,
             NewestKeyTime = now,
+            // FlushJob::WriteLevel0Table: meta_.temperature = default_write_temperature.
+            Temperature = cfd.Options.DefaultWriteTemperature,
             // FileMetaData::user_defined_timestamps_persisted: the MANIFEST then stores the boundaries without timestamps.
             UserDefinedTimestampsPersisted = !stripTimestamps,
         };

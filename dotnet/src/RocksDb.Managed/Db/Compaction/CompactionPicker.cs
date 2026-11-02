@@ -372,6 +372,9 @@ internal abstract class CompactionPicker
         return t == CompressionType.DisableCompressionOption ? CompressionType.None : t;
     }
 
+    /// <summary>The compact cursor of <paramref name="level"/> (VersionStorageInfo::GetCompactCursors), or null.</summary>
+    protected virtual byte[]? GetCompactCursor(int level) => null;
+
     /// <summary>Port of LevelCompactionBuilder::GetPathId (single path when db_paths has one entry).</summary>
     public virtual uint GetPathId(int level) => 0;
 
@@ -380,13 +383,45 @@ internal abstract class CompactionPicker
         ulong maxCompactionBytes, uint pathId, List<FileMetaData> grandparents, CompactionReason reason, double score, bool l0FilesMightOverlap,
         bool isManual, bool isDeletion = false, bool trivialMoveForced = false, bool disallowTrivialMove = false)
     {
+        return NewCompaction(vstorage, inputs, outputLevel, maxOutputFileSize, maxCompactionBytes, pathId, grandparents, reason, score,
+            l0FilesMightOverlap, isManual, isDeletion, trivialMoveForced, disallowTrivialMove, enableCompression: true, Temperature.Unknown);
+    }
+
+    /// <summary>
+    /// <see cref="NewCompaction(VersionStorageInfo, CompactionInputFiles[], int, ulong, ulong, uint, List{FileMetaData}, CompactionReason, double, bool, bool, bool, bool, bool)"/>
+    /// with an explicit output compression switch (GetCompressionType's enable_compression) and output temperature.
+    /// </summary>
+    protected Compaction NewCompaction(VersionStorageInfo vstorage, CompactionInputFiles[] inputs, int outputLevel, ulong maxOutputFileSize,
+        ulong maxCompactionBytes, uint pathId, List<FileMetaData> grandparents, CompactionReason reason, double score, bool l0FilesMightOverlap,
+        bool isManual, bool isDeletion, bool trivialMoveForced, bool disallowTrivialMove, bool enableCompression, Temperature outputTemperature)
+    {
+        CompressionType compression = enableCompression
+            ? GetCompressionType(vstorage, Options, outputLevel, Math.Max(1, vstorage.BaseLevel))
+            : CompressionType.None;
         var c = new Compaction(vstorage, Options, inputs, outputLevel, maxOutputFileSize, maxCompactionBytes, pathId,
-            GetCompressionType(vstorage, Options, outputLevel, Math.Max(1, vstorage.BaseLevel)), grandparents, reason, score, l0FilesMightOverlap, isManual)
+            compression, grandparents, reason, score, l0FilesMightOverlap, isManual)
         {
             IsDeletionCompaction = isDeletion,
             IsTrivialMoveForced = trivialMoveForced,
             DisallowTrivialMove = disallowTrivialMove,
+            EnableCompression = enableCompression,
+            OutputTemperature = outputTemperature,
         };
+        // Compaction::Compaction: every compaction regardless of any compaction reason may respect the existing compact
+        // cursor in the output level to split output files (leveled kRoundRobin), if it is inside the user-key range.
+        if (Options.CompactionStyle == CompactionStyle.Level && Options.CompactionPri == CompactionPri.RoundRobin)
+        {
+            byte[]? cursor = GetCompactCursor(outputLevel);
+            if (cursor is { Length: > 0 })
+            {
+                ReadOnlySpan<byte> cursorUserKey = DbFormat.ExtractUserKey(cursor);
+                if (VersionStorageInfo.CompareWithoutTimestamp(Icmp, cursorUserKey, c.SmallestUserKey) > 0
+                    && VersionStorageInfo.CompareWithoutTimestamp(Icmp, cursorUserKey, c.LargestUserKey) <= 0)
+                {
+                    c.OutputSplitKey = cursor;
+                }
+            }
+        }
         RegisterCompaction(c);
         // Creating a compaction influences the compaction score because the score takes running compactions into
         // account (by skipping files that are already being compacted).

@@ -238,8 +238,7 @@ internal sealed partial class DbImpl
     /// Port of SanitizeCfOptions (db/column_family.cc), in place: clamps the options the engine relies on to their valid
     /// ranges exactly like upstream, so that the same (possibly out-of-range) user options behave the same way in both
     /// implementations and the OPTIONS file records the sanitized values. Not ported: memtable factory / prefix bloom
-    /// adjustments for unsupported memtables, ttl / periodic compaction defaults (the managed defaults are already the
-    /// sanitized values).
+    /// adjustments for unsupported memtables; the ttl default is already the sanitized value (30 days).
     /// </summary>
     internal static void SanitizeCfOptions(ColumnFamilyOptions result, bool allowIngestBehind, int numDbPaths)
     {
@@ -298,8 +297,43 @@ internal sealed partial class DbImpl
         }
         if (result.MaxCompactionBytes == 0)
         {
-            result.MaxCompactionBytes = result.TargetFileSizeBase * 25;
+            // For FIFO with use_kv_ratio_compaction, leave max_compaction_bytes as 0 to signal "auto-calculate target
+            // from capacity and SST/blob ratio".
+            if (result.CompactionStyle != CompactionStyle.Fifo || !result.CompactionOptionsFifo.UseKvRatioCompaction)
+            {
+                result.MaxCompactionBytes = result.TargetFileSizeBase * 25;
+            }
         }
+        // periodic_compaction_seconds defaults (the managed port only has block-based tables).
+        const ulong adjustedPeriodicCompSecs = 30UL * 24 * 60 * 60;
+        if (result.CompactionStyle == CompactionStyle.Level)
+        {
+            if ((result.CompactionFilter is not null || result.CompactionFilterFactory is not null)
+                && result.PeriodicCompactionSeconds == ColumnFamilyOptions.DefaultPeriodicCompactionSeconds)
+            {
+                result.PeriodicCompactionSeconds = adjustedPeriodicCompSecs;
+            }
+        }
+        else if (result.CompactionStyle == CompactionStyle.Universal)
+        {
+            if (result.PeriodicCompactionSeconds == ColumnFamilyOptions.DefaultPeriodicCompactionSeconds)
+            {
+                result.PeriodicCompactionSeconds = adjustedPeriodicCompSecs;
+            }
+        }
+        else if (result.CompactionStyle == CompactionStyle.Fifo)
+        {
+            // "last_level_temperature is ignored with FIFO compaction. Consider
+            // CompactionOptionsFIFO::file_temperature_age_thresholds."
+            result.LastLevelTemperature = Temperature.Unknown;
+        }
+        // For universal compaction, `ttl` and `periodic_compaction_seconds` mean the same thing, take the stricter value.
+        if (result.CompactionStyle == CompactionStyle.Universal)
+        {
+            if (result.PeriodicCompactionSeconds == 0) result.PeriodicCompactionSeconds = result.Ttl;
+            else if (result.Ttl != 0) result.PeriodicCompactionSeconds = Math.Min(result.Ttl, result.PeriodicCompactionSeconds);
+        }
+        if (result.PeriodicCompactionSeconds == ColumnFamilyOptions.DefaultPeriodicCompactionSeconds) result.PeriodicCompactionSeconds = 0;
         // "enable_blob_direct_write requires enable_blob_files=true. Disabling blob direct write."
         if (result.EnableBlobDirectWrite && !result.EnableBlobFiles) result.EnableBlobDirectWrite = false;
         if (result.BlobDirectWritePartitions == 0) result.BlobDirectWritePartitions = 1;

@@ -81,4 +81,12 @@ public delegate TResult ReadOnlySpanFunc<in TState, out TResult>(ReadOnlySpan<by
 /// <param name="LargestSeqno">Largest sequence number in the file.</param>
 /// <param name="EpochNumber">Epoch number (L0 ordering).</param>
 public sealed record LiveFileMetadata(string Name, string Directory, ulong FileNumber, string ColumnFamilyName, int Level, ulong Size,
-    byte[] SmallestKey, byte[] LargestKey, ulong SmallestSeqno, ulong LargestSeqno, ulong EpochNumber);
+    byte[] SmallestKey, byte[] LargestKey, ulong SmallestSeqno, ulong LargestSeqno, ulong EpochNumber)
+{
+    /// <summary>File temperature recorded in the MANIFEST (SstFileMetaData::temperature).</summary>
+    public Temperature Temperature { get; init; }
+    /// <summary>Oldest ancestor time (oldest_ancester_time), unix seconds; 0 = unknown.</summary>
+    public ulong OldestAncestorTime { get; init; }
+    /// <summary>File creation time, unix seconds; 0 = unknown.</summary>
+    public ulong FileCreationTime { get; init; }
+}

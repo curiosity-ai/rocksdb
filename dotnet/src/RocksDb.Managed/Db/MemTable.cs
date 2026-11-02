@@ -57,6 +57,8 @@ public sealed unsafe class MemTable : IDisposable
     private long _approximateMemoryUsage;
     private ulong _firstSeqno;
     private ulong _earliestSeqno;
+    // Unix seconds of the first insert (MemTable::oldest_key_time_); 0 = no insert yet (upstream: uint64 max).
+    private long _oldestKeyTime;
     private int _flushState;
     private int _isRangeDelTableEmpty = 1;
     private bool _disposed;
@@ -256,6 +258,8 @@ public sealed unsafe class MemTable : IDisposable
 
     private void AfterInsert(ulong s, EntryType type)
     {
+        // MemTable::UpdateOldestKeyTime: set once, by the first insert. One relaxed load per insert afterwards.
+        if (Volatile.Read(ref _oldestKeyTime) == 0) UpdateOldestKeyTime();
         // Atomically update first_seqno_ and earliest_seqno_.
         ulong cur = Volatile.Read(ref _firstSeqno);
         while (cur == 0 || s < cur)
@@ -488,6 +492,28 @@ public sealed unsafe class MemTable : IDisposable
 
     /// <summary>Sequence number of the first element added (0 if empty). In concurrent mode, the smallest.</summary>
     public ulong FirstSequenceNumber => Volatile.Read(ref _firstSeqno);
+
+    /// <summary>
+    /// Port of MemTable::ApproximateOldestKeyTime: unix seconds of the first insert into this memtable, or
+    /// <see cref="ulong.MaxValue"/> if nothing was inserted yet (upstream's initial value).
+    /// </summary>
+    public ulong ApproximateOldestKeyTime
+    {
+        get
+        {
+            long t = Volatile.Read(ref _oldestKeyTime);
+            return t == 0 ? ulong.MaxValue : (ulong)t;
+        }
+    }
+
+    /// <summary>Port of MemTable::UpdateOldestKeyTime (kept out of line: runs once per memtable).</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void UpdateOldestKeyTime()
+    {
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        // If the exchange fails, a concurrent writer already set the time.
+        if (now > 0) Interlocked.CompareExchange(ref _oldestKeyTime, now, 0);
+    }
 
     /// <summary>Lower bound on the sequence numbers that are or will be in this memtable.</summary>
     public ulong EarliestSequenceNumber => Volatile.Read(ref _earliestSeqno);

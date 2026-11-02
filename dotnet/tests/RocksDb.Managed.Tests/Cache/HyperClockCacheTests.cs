@@ -198,6 +198,9 @@ public sealed class HyperClockCacheTests
         Assert.ThrowsExactly<InvalidOperationException>(() => copy.Dispose());
     }
 
+    /// <summary>FixedHyperClockTable: GetTableSize() * sizeof(HandleImpl) per shard under kFullChargeCacheMetadata.</summary>
+    private static long TableMetadataCharge(HyperClockCache c) => (long)HyperClockCache.SlotMetadataCharge * c.TableSize * c.NumShards;
+
     [TestMethod]
     public void PooledBuffersAndEraseUnreferenced()
     {
@@ -212,11 +215,13 @@ public sealed class HyperClockCacheTests
         Assert.AreEqual(7, h.Span[0]);
         c.EraseUnreferencedEntries();
         Assert.AreEqual(1, c.Count);
-        Assert.AreEqual(4096 + LruCache.EntryMetadataCharge, c.Usage);
+        // Full metadata charging charges the slot table (64 bytes per slot) up front, not each entry.
+        long tableCharge = TableMetadataCharge(c);
+        Assert.AreEqual(4096 + tableCharge, c.Usage);
         h.Dispose();
         c.EraseUnreferencedEntries();
         Assert.AreEqual(0, c.Count);
-        Assert.AreEqual(0, c.Usage);
+        Assert.AreEqual(tableCharge, c.Usage);
     }
 
     [TestMethod]
@@ -296,6 +301,6 @@ public sealed class HyperClockCacheTests
         Assert.AreEqual(0, c.PinnedUsage);
         c.EraseUnreferencedEntries();
         Assert.AreEqual(0, c.Count);
-        Assert.AreEqual(0, c.Usage);
+        Assert.AreEqual(TableMetadataCharge(c), c.Usage);
     }
 }

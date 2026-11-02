@@ -283,8 +283,16 @@ internal sealed partial class VersionStorageInfo
                 }
                 if (CompactionStyle == CompactionStyle.Fifo)
                 {
-                    ulong maxSize = FifoMaxTableFilesSize(_options);
-                    score = (double)totalSize / Math.Max(1UL, maxSize);
+                    CompactionOptionsFifo fifo = _options.CompactionOptionsFifo;
+                    ulong effectiveSize = totalSize;
+                    ulong effectiveMax = fifo.MaxTableFilesSize;
+                    if (fifo.MaxDataFilesSize > 0)
+                    {
+                        // Blob-aware: include blob file sizes in the total.
+                        effectiveSize += TotalBlobFileSize();
+                        effectiveMax = fifo.MaxDataFilesSize;
+                    }
+                    score = (double)effectiveSize / Math.Max(1UL, effectiveMax);
                     if (score < 1 && FifoAllowCompaction(_options))
                     {
                         score = Math.Max((double)numSortedRuns / Math.Max(1, _options.Level0FileNumCompactionTrigger), score);
@@ -293,6 +301,8 @@ internal sealed partial class VersionStorageInfo
                     {
                         score = Math.Max(GetExpiredTtlFilesCount(_files[0]), score);
                     }
+                    // For FIFO, just need a large enough score to trigger compaction.
+                    if (score < 1 && ShouldChangeFileTemperature(_files[0])) score = 1.1;
                 }
                 else
                 {
@@ -411,6 +421,60 @@ internal sealed partial class VersionStorageInfo
     }
 
     internal static ulong FifoMaxTableFilesSize(ColumnFamilyOptions o) => o.CompactionOptionsFifo.MaxTableFilesSize;
+
+    /// <summary>GetBlobStats().total_file_size: the on-disk size of the live blob files (header + blobs + footer).</summary>
+    public ulong TotalBlobFileSize()
+    {
+        ulong total = 0;
+        foreach (Blob.BlobFileMetaData b in BlobFiles) total += b.TotalBlobBytes + Blob.BlobLogFormat.HeaderSize + Blob.BlobLogFormat.FooterSize;
+        return total;
+    }
+
+    /// <summary>
+    /// Port of FileMetaData::TryGetNewestKeyTime(prev_file): the file's newest key time (table property), else the
+    /// oldest ancestor time of the next newer file (<paramref name="prevFile"/>), else 0 (unknown).
+    /// </summary>
+    internal static ulong TryGetNewestKeyTime(FileMetaData f, FileMetaData? prevFile)
+    {
+        if (f.NewestKeyTime != 0) return f.NewestKeyTime;
+        if (prevFile is not null && prevFile.OldestAncestorTime != 0) return prevFile.OldestAncestorTime;
+        return 0;
+    }
+
+    /// <summary>
+    /// The temperature a FIFO file whose newest key time is <paramref name="estNewestKeyTime"/> belongs to under
+    /// file_temperature_age_thresholds (the oldest threshold it passed).
+    /// </summary>
+    internal static Temperature FifoTargetTemperature(List<FileTemperatureAge> ages, ulong currentTime, ulong estNewestKeyTime)
+    {
+        Temperature target = ages[0].Temperature;
+        for (int i = 1; i < ages.Count; i++)
+        {
+            if (currentTime >= ages[i].Age && estNewestKeyTime <= currentTime - ages[i].Age) target = ages[i].Temperature;
+        }
+        return target;
+    }
+
+    /// <summary>Port of ShouldChangeFileTemperature (db/version_set.cc): same walk as PickTemperatureChangeCompaction.</summary>
+    private bool ShouldChangeFileTemperature(FileMetaData[] files)
+    {
+        List<FileTemperatureAge> ages = _options.CompactionOptionsFifo.FileTemperatureAgeThresholds;
+        if (ages.Count == 0 || files.Length == 0) return false;
+        ulong currentTime = (ulong)NowSeconds();
+        if (currentTime < ages[0].Age) return false;
+        ulong createTimeThreshold = currentTime - ages[0].Age;
+        for (int index = files.Length; index >= 1; --index)
+        {
+            FileMetaData cur = files[index - 1];
+            if (cur.BeingCompacted) continue;
+            ulong est = TryGetNewestKeyTime(cur, index < 2 ? null : files[index - 2]);
+            // Newer file could have newest_key_time populated
+            if (est == 0) continue;
+            if (est > createTimeThreshold) return false;
+            if (cur.Temperature != FifoTargetTemperature(ages, currentTime, est)) return true;
+        }
+        return false;
+    }
     internal static bool FifoAllowCompaction(ColumnFamilyOptions o) => o.CompactionOptionsFifo.AllowCompaction;
 
     private static long NowSeconds() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -488,8 +552,10 @@ internal sealed partial class VersionStorageInfo
             foreach (FileMetaData f in _files[level])
             {
                 if (f.BeingCompacted) continue;
-                // Compute a file's modification time in the following order: oldest ancestor time, file creation time.
-                ulong t = f.OldestAncestorTime != 0 ? f.OldestAncestorTime : f.FileCreationTime;
+                // Compute a file's modification time in the following order: 1. file_creation_time if it is > 0,
+                // 2. oldest_ancestor_time if it is > 0 (upstream then falls back to the file's mtime; the port skips
+                // such files, which only exist in DBs written before file_creation_time was recorded).
+                ulong t = f.FileCreationTime != 0 ? f.FileCreationTime : f.OldestAncestorTime;
                 if (t > 0 && t < allowedTimeLimit) _filesMarkedForPeriodicCompaction.Add((level, f));
             }
         }

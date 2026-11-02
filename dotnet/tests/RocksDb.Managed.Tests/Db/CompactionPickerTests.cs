@@ -14,6 +14,7 @@ public sealed class CompactionPickerTests
     {
         public readonly ColumnFamilyOptions Options;
         public readonly List<FileMetaData>[] Files;
+        public readonly List<RocksDb.Managed.Db.Blob.BlobFileMetaData> BlobFiles = new();
         private ulong _epoch = 1000;
 
         public Fixture(int numLevels, CompactionStyle style = CompactionStyle.Level, bool dynamic = false)
@@ -66,8 +67,15 @@ public sealed class CompactionPickerTests
                 else files.Sort((a, b) => icmp.Compare(a.Smallest, b.Smallest));
                 arrays[l] = files.ToArray();
             }
-            return new VersionStorageInfo(icmp, Files.Length, Options, arrays);
+            return new VersionStorageInfo(icmp, Files.Length, Options, arrays, BlobFiles.ToArray());
         }
+
+        /// <summary>CompactionPickerTestBase::AddBlobFile (one blob, no garbage, no linked SSTs).</summary>
+        public void AddBlobFile(ulong number, ulong totalBlobBytes) =>
+            BlobFiles.Add(new RocksDb.Managed.Db.Blob.BlobFileMetaData(new BlobFileAddition(number, 1, totalBlobBytes, "", []), 0, 0, []));
+
+        public UniversalCompactionPicker UniversalPicker() => new(Options, InternalKeyComparator.Bytewise);
+        public FifoCompactionPicker FifoPicker() => new(Options, InternalKeyComparator.Bytewise);
 
         public LevelCompactionPicker LevelPicker() => new(Options, InternalKeyComparator.Bytewise);
     }
@@ -525,5 +533,446 @@ public sealed class CompactionPickerTests
         vs = fx.Build();
         c = new FifoCompactionPicker(fx.Options, InternalKeyComparator.Bytewise).PickCompaction(vs, []);
         Assert.IsNull(c, "the compacted file (oldest) still holds keys newer than ttl");
+    }
+    // ---- universal (compaction_picker_test.cc) ----
+
+    private const ulong FileSize = 100000;
+
+    /// <summary>A universal fixture as in the upstream cases (5 levels, periodic compaction 1000 s when asked).</summary>
+    private static Fixture Universal(int numLevels, bool periodic = false)
+    {
+        var fx = new Fixture(numLevels, CompactionStyle.Universal);
+        if (periodic) fx.Options.PeriodicCompactionSeconds = 1000;
+        return fx;
+    }
+
+    [TestMethod]
+    public void UniversalPeriodicCompaction1()
+    {
+        // The case where universal periodic compaction can be picked with some newer files being compacted.
+        Fixture fx = Universal(5, periodic: true);
+        fx.Add(0, 1, "150", "200", FileSize, 500, 550);
+        fx.Add(0, 2, "201", "250", FileSize, 401, 450).BeingCompacted = true;
+        fx.Add(0, 4, "260", "300", FileSize, 260, 300);
+        fx.Add(3, 5, "010", "080", FileSize, 200, 251);
+        FileMetaData f3 = fx.Add(4, 3, "301", "350", FileSize, 101, 150);
+        fx.Add(4, 6, "501", "750", FileSize, 101, 150);
+        VersionStorageInfo vs = fx.Build();
+        vs.FilesMarkedForPeriodicCompaction.Add((4, f3));
+        Compaction? c = fx.UniversalPicker().PickCompaction(vs, []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.PeriodicCompaction, c.Reason);
+        Assert.AreEqual(4, c.OutputLevel);
+        Assert.AreEqual(0, c.StartLevel);
+        Assert.AreEqual(1, c.NumInputFiles(0));
+    }
+
+    [TestMethod]
+    public void UniversalPeriodicCompaction2()
+    {
+        // Universal periodic compaction does not pick up only the last level if it doesn't cover any marked file.
+        Fixture fx = Universal(5, periodic: true);
+        FileMetaData f1 = fx.Add(0, 1, "150", "200", FileSize, 500, 550);
+        fx.Add(3, 5, "010", "080", FileSize, 200, 251).BeingCompacted = true;
+        fx.Add(4, 3, "301", "350", FileSize, 101, 150);
+        fx.Add(4, 6, "501", "750", FileSize, 101, 150);
+        VersionStorageInfo vs = fx.Build();
+        vs.FilesMarkedForPeriodicCompaction.Add((0, f1));
+        Assert.IsNull(fx.UniversalPicker().PickCompaction(vs, []));
+    }
+
+    [TestMethod]
+    public void UniversalPeriodicCompaction3()
+    {
+        // ... nor only the last sorted run when it is an L0 file that isn't marked.
+        Fixture fx = Universal(5, periodic: true);
+        FileMetaData f1 = fx.Add(0, 1, "150", "200", FileSize, 500, 550);
+        fx.Add(0, 5, "010", "080", FileSize, 200, 251).BeingCompacted = true;
+        fx.Add(0, 6, "501", "750", FileSize, 101, 150);
+        VersionStorageInfo vs = fx.Build();
+        vs.FilesMarkedForPeriodicCompaction.Add((0, f1));
+        Assert.IsNull(fx.UniversalPicker().PickCompaction(vs, []));
+    }
+
+    [TestMethod]
+    public void UniversalPeriodicCompaction5()
+    {
+        // Single L0 file periodic compaction.
+        Fixture fx = Universal(5, periodic: true);
+        FileMetaData f6 = fx.Add(0, 6, "150", "200", FileSize, 500, 550);
+        VersionStorageInfo vs = fx.Build();
+        vs.FilesMarkedForPeriodicCompaction.Add((0, f6));
+        UniversalCompactionPicker picker = fx.UniversalPicker();
+        Assert.IsTrue(picker.NeedsCompaction(vs));
+        Compaction? c = picker.PickCompaction(vs, []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(0, c.StartLevel);
+        Assert.AreEqual(1, c.NumInputFiles(0));
+        Assert.AreEqual(6UL, c.Input(0, 0).FileNumber);
+        Assert.AreEqual(4, c.OutputLevel);
+        // As upstream (Compaction::IsTrivialMove), a single non-overlapping L0 file may still move; the next periodic
+        // pick then rewrites the single L4 run in place (UniversalPeriodicCompaction6).
+        Assert.IsTrue(c.IsTrivialMove());
+    }
+
+    [TestMethod]
+    public void UniversalPeriodicCompaction6()
+    {
+        // Single sorted run non-L0 periodic compaction.
+        Fixture fx = Universal(5, periodic: true);
+        fx.Add(4, 5, "150", "200", FileSize, 500, 550);
+        FileMetaData f6 = fx.Add(4, 6, "350", "400", FileSize, 500, 550);
+        VersionStorageInfo vs = fx.Build();
+        vs.FilesMarkedForPeriodicCompaction.Add((4, f6));
+        Compaction? c = fx.UniversalPicker().PickCompaction(vs, []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(4, c.StartLevel);
+        Assert.AreEqual(2, c.NumInputFiles(0));
+        Assert.AreEqual(5UL, c.Input(0, 0).FileNumber);
+        Assert.AreEqual(6UL, c.Input(0, 1).FileNumber);
+        Assert.AreEqual(4, c.OutputLevel);
+    }
+
+    [TestMethod]
+    public void UniversalIncrementalSpace1()
+    {
+        Fixture fx = Universal(5);
+        fx.Options.MaxCompactionBytes = 555555;
+        fx.Options.CompactionOptionsUniversal.Incremental = true;
+        fx.Options.CompactionOptionsUniversal.MaxSizeAmplificationPercent = 30;
+        fx.Add(0, 1, "150", "200", FileSize, 500, 550);
+        fx.Add(2, 2, "010", "080", FileSize, 200, 251);
+        fx.Add(3, 5, "310", "380", FileSize, 200, 251);
+        fx.Add(3, 6, "410", "880", FileSize, 200, 251);
+        fx.Add(3, 7, "910", "980", 1, 200, 251);
+        fx.Add(4, 10, "201", "250", FileSize, 101, 150);
+        fx.Add(4, 11, "301", "350", FileSize, 101, 150);
+        fx.Add(4, 12, "401", "450", FileSize, 101, 150);
+        fx.Add(4, 13, "501", "750", FileSize, 101, 150);
+        fx.Add(4, 14, "801", "850", FileSize, 101, 150);
+        fx.Add(4, 15, "901", "950", FileSize, 101, 150);
+        Compaction? c = fx.UniversalPicker().PickCompaction(fx.Build(), []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.UniversalSizeAmplification, c.Reason);
+        Assert.AreEqual(4, c.OutputLevel);
+        Assert.AreEqual(3, c.StartLevel);
+        CollectionAssert.AreEqual(new List<ulong> { 5, 6 }, Numbers(c.Inputs(0)));
+        CollectionAssert.AreEqual(new List<ulong> { 11, 12, 13, 14 }, Numbers(c.Inputs(1)));
+        Assert.AreEqual(fx.Options.TargetFileSizeBase / 2 * 3, c.MaxCompactionBytes, "GetMaxOverlappingBytes");
+    }
+
+    [TestMethod]
+    public void UniversalMarkedL0NoOverlap()
+    {
+        // A delete triggered compaction in single-level universal compacts from the marked file to the oldest run.
+        Fixture fx = Universal(1);
+        fx.Add(0, 4, "260", "300", 1 * FileSize, 260, 300).MarkedForCompaction = true;
+        fx.Add(0, 5, "240", "290", 2 * FileSize, 201, 250);
+        fx.Add(0, 3, "301", "350", 4 * FileSize, 101, 150);
+        fx.Add(0, 6, "501", "750", 8 * FileSize, 50, 100);
+        VersionStorageInfo vs = fx.Build();
+        UniversalCompactionPicker picker = fx.UniversalPicker();
+        Assert.IsTrue(picker.NeedsCompaction(vs));
+        Compaction? c = picker.PickCompaction(vs, []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.FilesMarkedForCompaction, c.Reason);
+        Assert.AreEqual(0, c.OutputLevel);
+        Assert.AreEqual(0, c.StartLevel);
+        Assert.AreEqual(4, c.NumInputFiles(0));
+        foreach (FileMetaData f in c.Inputs(0).Files) Assert.IsTrue(f.BeingCompacted);
+    }
+
+    [TestMethod]
+    public void UniversalMarkedL0WithOverlap()
+    {
+        // ... and stops at the first file being compacted.
+        Fixture fx = Universal(1);
+        fx.Add(0, 4, "260", "300", 1 * FileSize, 260, 300).MarkedForCompaction = true;
+        fx.Add(0, 5, "240", "290", 2 * FileSize, 201, 250);
+        FileMetaData f3 = fx.Add(0, 3, "301", "350", 4 * FileSize, 101, 150);
+        fx.Add(0, 6, "501", "750", 8 * FileSize, 50, 100);
+        VersionStorageInfo vs = fx.Build();
+        f3.BeingCompacted = true;
+        Compaction? c = fx.UniversalPicker().PickCompaction(vs, []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.FilesMarkedForCompaction, c.Reason);
+        Assert.AreEqual(0, c.OutputLevel);
+        CollectionAssert.AreEqual(new List<ulong> { 4, 5 }, Numbers(c.Inputs(0)));
+    }
+
+    [TestMethod]
+    public void UniversalMarkedFileInMultiLevelGoesToNextNonEmptyLevel()
+    {
+        // BuildCompactionToNextLevel: an L0 file marked for compaction (CompactOnDeletionCollector) is compacted with
+        // the overlapping files of the first non-empty level; the last level is never a start level.
+        Fixture fx = Universal(5);
+        fx.Options.Level0FileNumCompactionTrigger = 4;
+        fx.Add(0, 1, "150", "200", FileSize, 500, 550).MarkedForCompaction = true;
+        fx.Add(3, 5, "100", "180", FileSize, 200, 251);
+        fx.Add(3, 6, "300", "400", FileSize, 200, 251);
+        fx.Add(4, 3, "100", "400", 8 * FileSize, 101, 150);
+        VersionStorageInfo vs = fx.Build();
+        Assert.AreEqual(1, vs.FilesMarkedForCompaction.Count);
+        UniversalCompactionPicker picker = fx.UniversalPicker();
+        Assert.IsTrue(picker.NeedsCompaction(vs));
+        Compaction? c = picker.PickCompaction(vs, []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.FilesMarkedForCompaction, c.Reason);
+        Assert.AreEqual(0, c.StartLevel);
+        Assert.AreEqual(3, c.OutputLevel);
+        CollectionAssert.AreEqual(new List<ulong> { 1 }, Numbers(c.Inputs(0)));
+        CollectionAssert.AreEqual(new List<ulong> { 5 }, Numbers(c.Inputs(1)));
+        CollectionAssert.AreEqual(new List<ulong> { 3 }, Numbers(new CompactionInputFiles(4, c.Grandparents)));
+    }
+
+    [TestMethod]
+    public void UniversalCompressionSizePercentDisablesCompressionOfNewerRuns()
+    {
+        // PickCompactionToReduceSortedRuns: with compression_size_percent, the output is compressed only if the older
+        // runs (not compacted) hold less than that percentage of the data.
+        Fixture fx = Universal(5);
+        fx.Options.Level0FileNumCompactionTrigger = 2;
+        fx.Options.Compression = RocksDb.Managed.Compression.CompressionType.Snappy;
+        fx.Options.CompactionOptionsUniversal.CompressionSizePercent = 50;
+        fx.Options.CompactionOptionsUniversal.MaxSizeAmplificationPercent = 10000;
+        fx.Add(0, 1, "100", "200", 10, 300, 300);
+        fx.Add(0, 2, "100", "200", 10, 200, 200);
+        fx.Add(4, 3, "100", "200", 1000, 1, 100);
+        Compaction? c = fx.UniversalPicker().PickCompaction(fx.Build(), []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.UniversalSizeRatio, c.Reason);
+        Assert.AreEqual(3, c.OutputLevel);
+        Assert.IsFalse(c.EnableCompression);
+        Assert.AreEqual(RocksDb.Managed.Compression.CompressionType.None, c.OutputCompression);
+        // Universal flushes are not compressed with compression_size_percent >= 0 (GetCompressionFlush).
+        Assert.AreEqual(RocksDb.Managed.Compression.CompressionType.None, TableFactory.GetCompressionFlush(fx.Options));
+
+        fx.Options.CompactionOptionsUniversal.CompressionSizePercent = 99;
+        foreach (List<FileMetaData> l in fx.Files) foreach (FileMetaData f in l) f.BeingCompacted = false;
+        c = fx.UniversalPicker().PickCompaction(fx.Build(), []);
+        Assert.IsNotNull(c);
+        Assert.IsTrue(c.EnableCompression);
+        Assert.AreEqual(RocksDb.Managed.Compression.CompressionType.Snappy, c.OutputCompression);
+    }
+
+    [TestMethod]
+    public void UniversalMaxReadAmpLimitsSortedRuns()
+    {
+        // max_read_amp N > trigger: the sorted-run-count compaction only starts above N runs.
+        Fixture fx = Universal(5);
+        fx.Options.Level0FileNumCompactionTrigger = 2;
+        fx.Options.CompactionOptionsUniversal.MaxReadAmp = 4;
+        fx.Options.CompactionOptionsUniversal.SizeRatio = 0;
+        fx.Options.CompactionOptionsUniversal.MaxSizeAmplificationPercent = 10000;
+        // Sizes doubling from newest to oldest: no size-ratio compaction (each run larger than all newer ones).
+        fx.Add(0, 1, "100", "200", 10, 400, 400);
+        fx.Add(0, 2, "100", "200", 21, 300, 300);
+        fx.Add(0, 3, "100", "200", 43, 200, 200);
+        fx.Add(0, 4, "100", "200", 87, 100, 100);
+        Assert.IsNull(fx.UniversalPicker().PickCompaction(fx.Build(), []), "4 runs <= max_read_amp");
+        fx.Add(0, 5, "100", "200", 175, 50, 50);
+        Compaction? c = fx.UniversalPicker().PickCompaction(fx.Build(), []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.UniversalSortedRunNum, c.Reason);
+        Assert.AreEqual(2, c.NumInputFiles(0), "5 runs - 4 + 1");
+    }
+
+    // ---- FIFO (compaction_picker_test.cc) ----
+
+    [TestMethod]
+    public void FifoToCold()
+    {
+        // FIFOToCold1: the oldest file passed the cold threshold; with an unknown newest key time the next newer file's
+        // oldest ancestor time is the estimate.
+        foreach (bool newestKeyTimeKnown in new[] { false, true })
+        {
+            var fx = new Fixture(1, CompactionStyle.Fifo);
+            const ulong ColdThreshold = 2000;
+            fx.Options.CompactionOptionsFifo.MaxTableFilesSize = FileSize * 100000;
+            fx.Options.CompactionOptionsFifo.FileTemperatureAgeThresholds = [new FileTemperatureAge(Temperature.Cold, ColdThreshold)];
+            fx.Options.Level0FileNumCompactionTrigger = 100;
+            ulong thresholdTime = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds() - ColdThreshold;
+            FileMetaData f4 = fx.Add(0, 4, "260", "300", FileSize, 2500, 2600);
+            FileMetaData f3 = fx.Add(0, 3, "200", "300", 4 * FileSize, 2300, 2400);
+            if (newestKeyTimeKnown)
+            {
+                f4.NewestKeyTime = thresholdTime - 2000;
+                f3.NewestKeyTime = thresholdTime - 3000;
+            }
+            else
+            {
+                f4.OldestAncestorTime = thresholdTime - 2000;
+                f3.OldestAncestorTime = thresholdTime - 3000;
+            }
+            VersionStorageInfo vs = fx.Build();
+            FifoCompactionPicker picker = fx.FifoPicker();
+            Assert.IsTrue(picker.NeedsCompaction(vs));
+            Compaction? c = picker.PickCompaction(vs, []);
+            Assert.IsNotNull(c);
+            Assert.AreEqual(CompactionReason.ChangeTemperature, c.Reason);
+            Assert.AreEqual(Temperature.Cold, c.OutputTemperature);
+            CollectionAssert.AreEqual(new List<ulong> { 3 }, Numbers(c.Inputs(0)));
+            Assert.IsFalse(c.IsTrivialMove());
+        }
+    }
+
+    [TestMethod]
+    public void FifoToHotAndWarm()
+    {
+        // Multiple thresholds: the oldest file that needs a change gets the temperature of the oldest threshold it passed.
+        var fx = new Fixture(1, CompactionStyle.Fifo);
+        const ulong WarmThreshold = 10000, HotThreshold = 2000;
+        fx.Options.CompactionOptionsFifo.MaxTableFilesSize = FileSize * 100000;
+        fx.Options.CompactionOptionsFifo.FileTemperatureAgeThresholds =
+            [new FileTemperatureAge(Temperature.Hot, HotThreshold), new FileTemperatureAge(Temperature.Warm, WarmThreshold)];
+        fx.Options.Level0FileNumCompactionTrigger = 100;
+        ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        ulong hot = now - HotThreshold, warm = now - WarmThreshold;
+        fx.Add(0, 6, "240", "290", 2 * FileSize, 2900, 3000).NewestKeyTime = now - 100;
+        fx.Add(0, 5, "240", "290", 2 * FileSize, 2700, 2800).NewestKeyTime = hot + 100;
+        fx.Add(0, 4, "260", "300", 1 * FileSize, 2500, 2600).NewestKeyTime = hot - 200;
+        fx.Add(0, 3, "200", "300", 4 * FileSize, 2300, 2400).NewestKeyTime = warm - 100;
+        fx.Add(0, 2, "200", "300", 4 * FileSize, 2100, 2200).NewestKeyTime = warm - 4000;
+        fx.Add(0, 1, "200", "300", 4 * FileSize, 2000, 2100).NewestKeyTime = warm - 5000;
+        Compaction? c = fx.FifoPicker().PickCompaction(fx.Build(), []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.ChangeTemperature, c.Reason);
+        Assert.AreEqual(Temperature.Warm, c.OutputTemperature);
+        CollectionAssert.AreEqual(new List<ulong> { 1 }, Numbers(c.Inputs(0)));
+    }
+
+    /// <summary>SetupFIFORatioBased.</summary>
+    private static Fixture FifoRatioBased(ulong maxTableFilesSize, ulong maxDataFilesSize, int trigger, bool useKvRatio = true)
+    {
+        var fx = new Fixture(1, CompactionStyle.Fifo);
+        fx.Options.CompactionOptionsFifo.MaxTableFilesSize = maxTableFilesSize;
+        fx.Options.CompactionOptionsFifo.MaxDataFilesSize = maxDataFilesSize;
+        fx.Options.CompactionOptionsFifo.AllowCompaction = true;
+        fx.Options.CompactionOptionsFifo.UseKvRatioCompaction = useKvRatio;
+        fx.Options.Level0FileNumCompactionTrigger = trigger;
+        // max_compaction_bytes = 0: auto-calculate the target (SanitizeCfOptions keeps 0 with use_kv_ratio_compaction).
+        fx.Options.MaxCompactionBytes = 0;
+        return fx;
+    }
+
+    [TestMethod]
+    public void FifoRatioBasedCompactionFileCountThreshold()
+    {
+        // Fewer than trigger: no compaction.
+        Fixture fx = FifoRatioBased(10 << 20, 1UL << 30, 4);
+        fx.Add(0, 1, "100", "200", 64 * 1024);
+        fx.Add(0, 2, "200", "300", 64 * 1024);
+        fx.Add(0, 3, "300", "400", 64 * 1024);
+        for (ulong i = 0; i < 3; i++) fx.AddBlobFile(100 + i, 64UL << 20);
+        Assert.IsNull(fx.FifoPicker().PickCompaction(fx.Build(), []));
+
+        // Exactly trigger: compaction fires (sst_ratio ~ 240KB/256MB, target ~ 250KB).
+        fx = FifoRatioBased(10 << 20, 1UL << 30, 4);
+        fx.Add(0, 1, "100", "200", 64 * 1024);
+        fx.Add(0, 2, "200", "300", 32 * 1024);
+        fx.Add(0, 3, "300", "400", 48 * 1024);
+        fx.Add(0, 4, "400", "500", 96 * 1024);
+        for (ulong i = 0; i < 4; i++) fx.AddBlobFile(100 + i, 64UL << 20);
+        Compaction? c = fx.FifoPicker().PickCompaction(fx.Build(), []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.FifoReduceNumFiles, c.Reason);
+        Assert.AreEqual(0, c.OutputLevel);
+
+        // More than trigger.
+        fx = FifoRatioBased(100 << 20, 500UL << 20, 4);
+        string[] k = ["100", "200", "300", "400", "500", "600", "700", "800"];
+        ulong[] sizes = [64, 32, 48, 96, 64, 48, 64, 64];
+        for (int i = 0; i < 8; i++) fx.Add(0, (ulong)i + 1, k[i], k[i][0] + "99", sizes[i] * 1024);
+        for (ulong i = 0; i < 8; i++) fx.AddBlobFile(100 + i, 50UL << 20);
+        c = fx.FifoPicker().PickCompaction(fx.Build(), []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.FifoReduceNumFiles, c.Reason);
+        Assert.IsTrue(c.NumInputFiles(0) >= 2);
+    }
+
+    [TestMethod]
+    public void FifoBlobAwareSizeDropping()
+    {
+        // SST = 200KB, blob = 500MB, limit = 200MB: effective size ~500MB, drops from L0.
+        Fixture fx = FifoRatioBased(200UL << 20, 200UL << 20, 4, useKvRatio: false);
+        for (int i = 0; i < 5; i++) fx.Add(0, (ulong)i + 1, (100 * (i + 1)).ToString(System.Globalization.CultureInfo.InvariantCulture), (100 * (i + 1) + 99).ToString(System.Globalization.CultureInfo.InvariantCulture), 40 * 1024);
+        for (ulong i = 0; i < 5; i++) fx.AddBlobFile(100 + i, 100UL << 20);
+        VersionStorageInfo vs = fx.Build();
+        Assert.IsTrue(vs.CompactionScore(0) > 1, "FIFOBlobAwareScoreComputation: blob files count towards the score");
+        Compaction? c = fx.FifoPicker().PickCompaction(vs, []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.FifoMaxSize, c.Reason);
+        Assert.IsTrue(c.NumInputFiles(0) >= 1);
+        Assert.IsTrue(c.IsDeletionCompaction);
+
+        // Without max_data_files_size only the 200KB of SSTs count: nothing to drop.
+        fx.Options.CompactionOptionsFifo.MaxDataFilesSize = 0;
+        foreach (FileMetaData f in fx.Files[0]) f.BeingCompacted = false;
+        Assert.IsNull(fx.FifoPicker().PickCompaction(fx.Build(), []));
+    }
+
+    // ---- output cutting ----
+
+    [TestMethod]
+    public void RoundRobinCompactionSetsOutputSplitKey()
+    {
+        // Compaction::Compaction: with kRoundRobin, the output level's compact cursor inside the compaction's user-key
+        // range becomes the output split key (CompactionOutputs cuts the first output before it).
+        var fx = new Fixture(6);
+        fx.Options.CompactionPri = CompactionPri.RoundRobin;
+        fx.Options.Level0FileNumCompactionTrigger = 2;
+        fx.Add(0, 1, "150", "200");
+        fx.Add(0, 2, "200", "250");
+        fx.Add(1, 3, "100", "300");
+        LevelCompactionPicker picker = fx.LevelPicker();
+        byte[] cursor = new byte[3 + 8];
+        DbFormat.AppendInternalKey(cursor, "180"u8, 100, EntryType.Value);
+        picker.CompactCursors[1] = cursor;
+        Compaction? c = picker.PickCompaction(fx.Build(), []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(1, c.OutputLevel);
+        Assert.AreSame(cursor, c.OutputSplitKey);
+
+        // A cursor outside the range is ignored.
+        var fx2 = new Fixture(6);
+        fx2.Options.CompactionPri = CompactionPri.RoundRobin;
+        fx2.Options.Level0FileNumCompactionTrigger = 2;
+        fx2.Add(0, 1, "150", "200");
+        fx2.Add(0, 2, "200", "250");
+        LevelCompactionPicker picker2 = fx2.LevelPicker();
+        byte[] outside = new byte[3 + 8];
+        DbFormat.AppendInternalKey(outside, "900"u8, 100, EntryType.Value);
+        picker2.CompactCursors[1] = outside;
+        c = picker2.PickCompaction(fx2.Build(), []);
+        Assert.IsNotNull(c);
+        Assert.IsNull(c.OutputSplitKey);
+    }
+
+    [TestMethod]
+    public void FilesToCutForTtlAreOldLargeOutputLevelInputs()
+    {
+        // CompactionOutputs::FillFilesToCutForTtl: leveled + kMinOverlappingRatio + ttl, non-bottommost: output-level
+        // inputs older than ttl/2 and larger than target_file_size_base/2.
+        var fx = new Fixture(6);
+        fx.Options.Ttl = 1000;
+        fx.Options.TargetFileSizeBase = 100;
+        ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        FileMetaData l1 = fx.Add(1, 1, "100", "500", 100);
+        l1.OldestAncestorTime = now;
+        FileMetaData oldBig = fx.Add(2, 2, "100", "200", 200);
+        oldBig.OldestAncestorTime = now - 900;
+        FileMetaData oldSmall = fx.Add(2, 3, "210", "300", 10);
+        oldSmall.OldestAncestorTime = now - 900;
+        FileMetaData young = fx.Add(2, 4, "310", "400", 200);
+        young.OldestAncestorTime = now - 100;
+        fx.Add(3, 5, "100", "900", 1000); // below: not bottommost
+        VersionStorageInfo vs = fx.Build();
+        var c = new Compaction(vs, fx.Options, [new CompactionInputFiles(1, [l1]), new CompactionInputFiles(2, [oldBig, oldSmall, young])], 2, 100,
+            ulong.MaxValue, 0, RocksDb.Managed.Compression.CompressionType.None, [], CompactionReason.LevelMaxLevelSize, 1, false, false);
+        List<FileMetaData>? cut = CompactionJob.FillFilesToCutForTtl(c);
+        Assert.IsNotNull(cut);
+        CollectionAssert.AreEqual(new List<ulong> { 2 }, Numbers(new CompactionInputFiles(2, cut)));
+        fx.Options.CompactionPri = CompactionPri.OldestLargestSeqFirst;
+        Assert.IsNull(CompactionJob.FillFilesToCutForTtl(c));
     }
 }

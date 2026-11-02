@@ -80,7 +80,7 @@ public sealed class OptionsFileTests
         Assert.AreEqual(CompactionStyle.Universal, d.CompactionStyle);
         // compaction_options_universal is typed (audit #3); members the port does not model are preserved.
         Assert.AreEqual(1u, d.CompactionOptionsUniversal.SizeRatio);
-        Assert.AreEqual("true", d.CompactionOptionsUniversal.UnknownOptions["reduce_file_locking"]);
+        Assert.IsTrue(d.CompactionOptionsUniversal.ReduceFileLocking);
         Assert.IsFalse(d.UnknownOptions.ContainsKey("compaction_options_universal"));
         Assert.AreEqual(16384UL, d.TableOptions.BlockSize);
         Assert.AreEqual(ChecksumType.Crc32c, d.TableOptions.Checksum);

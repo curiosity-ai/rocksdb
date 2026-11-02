@@ -885,8 +885,9 @@ internal sealed partial class DbImpl
             case DbProperties.CompactionPending:
                 lock (_mutex)
                 {
-                    // 1 if at least one compaction is pending (HandleCompactionPending).
-                    bool pending = !cfd.Dropped && !cfd.Options.DisableAutoCompactions && cfd.CompactionState.Picker.NeedsCompaction(cfd.Current.Storage);
+                    // 1 if the system already determines at least one compaction is needed (HandleCompactionPending:
+                    // the picker's NeedsCompaction, also with disable_auto_compactions).
+                    bool pending = !cfd.Dropped && cfd.CompactionState.Picker.NeedsCompaction(cfd.Current.Storage);
                     value = pending ? "1" : "0";
                 }
                 return true;

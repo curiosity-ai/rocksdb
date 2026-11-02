@@ -160,8 +160,13 @@ public static class TableFactory
     public static CompressionType GetCompressionFlush(ColumnFamilyOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
-        // Upstream also disables flush compression for universal compaction with compression_size_percent >= 0;
-        // compaction_options_universal is not modeled yet (default compression_size_percent = -1 compresses).
+        // Port of GetCompressionFlush (db/db_impl/db_impl.cc): compressing memtable flushes might not help unless the
+        // sequential load optimization is used for leveled compaction (universal with compression_size_percent >= 0
+        // compresses only the oldest data).
+        if (options.CompactionStyle == CompactionStyle.Universal && options.CompactionOptionsUniversal.CompressionSizePercent >= 0)
+        {
+            return CompressionType.None;
+        }
         return options.CompressionPerLevel.Count == 0 ? options.Compression : options.CompressionPerLevel[0];
     }
 

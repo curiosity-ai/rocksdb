@@ -225,6 +225,28 @@ public sealed class BlockBasedTableBuilder : IDisposable
     public bool IsEmpty => _props.NumEntries == 0;
     /// <summary>Size of the file generated so far (final size after <see cref="Finish"/>).</summary>
     public ulong FileSize => _offset;
+
+    /// <summary>
+    /// Port of BlockBasedTableBuilder::EstimatedTailSize: the index and filter estimates, the compression dictionary,
+    /// the range deletion block, conservative properties (2 KiB) and metaindex (1 KiB) sizes and the footer. Used by
+    /// compaction with target_file_size_is_upper_bound. Upstream refreshes the index/filter estimates once per data
+    /// block; the port caches the result per data block count.
+    /// </summary>
+    public ulong EstimatedTailSize()
+    {
+        ulong blocks = _props.NumDataBlocks;
+        if (_tailEstimateBlocks == blocks && _tailEstimate != 0) return _tailEstimate;
+        ulong estimate = _indexBuilder.CurrentIndexSizeEstimate(blocks);
+        if (_filterBuilder is not null) estimate += _filterBuilder.CurrentFilterSizeEstimate(blocks);
+        if (_dict is not null) estimate += (ulong)_dict.Data.Length;
+        if (!_rangeDelBlock.IsEmpty) estimate += (ulong)_rangeDelBlock.CurrentSizeEstimate;
+        estimate += 2048 + 1024 + Footer.EncodedLength;
+        _tailEstimateBlocks = blocks;
+        _tailEstimate = estimate;
+        return estimate;
+    }
+    private ulong _tailEstimateBlocks;
+    private ulong _tailEstimate;
     /// <summary>Properties of the table (complete after <see cref="Finish"/>).</summary>
     public TableProperties Properties => _props;
     /// <summary>The base context checksum written to the footer (format_version &gt;= 6).</summary>

@@ -11,6 +11,9 @@ Status values:
 - **line-by-line (feature audit: ...)**: compared when the feature was ported. The findings are in the named section of
   validation.md: "Background errors, listeners and backups", "Transactions", "User features", "User-defined
   timestamps" or "Integrated BlobDB". Audit #3 re-checked defaults and constants where noted.
+- **compaction-features pass**: the pass that ported audit #3's remaining compaction deviations (validation.md,
+  "Compaction features (audit #3 remaining deviations)"); the named functions were compared with `main` and with the
+  11.12 sources (identical except where noted).
 - **managed-only, design-reviewed (#3)**: no C++ counterpart. This covers the I/O layer, pooling, test hooks and the
   replication layer ported from rocksdb-sharp. These were reviewed for durability protocol, concurrency and resource
   handling instead.
@@ -18,14 +21,15 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (220 files, about 67,000 lines):
+Summary (221 files, about 68,000 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
 | line-by-line (feature audits) | 49 |
-| line-by-line (#3) | 18 |
+| line-by-line (#3) | 17 |
+| line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
 | API wrapper, design-reviewed | 5 |
 
@@ -63,8 +67,8 @@ changes there need their own review.
 | `RocksDb.Managed.Replication/Switchover/SwitchoverNode.cs` | 542 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
 | `Cache/BlockCache.cs` | 327 | include/rocksdb/advanced_cache.h | line-by-line (#1) |
 | `Cache/CacheKey.cs` | 231 | cache/cache_key.h, cache/cache_key.{h,cc}, table/unique_id.cc | line-by-line (#1) |
-| `Cache/HyperClockCache.cs` | 736 | include/rocksdb/cache.h, cache/clock_cache.{h,cc} | line-by-line (#3): FixedHyperClockTable / BaseClockTable (meta word, probing, eviction, strict/non-strict charging, standalone) |
-| `Cache/LruCache.cs` | 742 | include/rocksdb/cache.h, cache/lru_cache.{h,cc}, cache/sharded_cache.{h,cc} | line-by-line (#3): LRUCacheShard / LRUHandleTable (insert, release, pools, eviction) |
+| `Cache/HyperClockCache.cs` | 796 | include/rocksdb/cache.h, cache/clock_cache.{h,cc} | line-by-line (#3): FixedHyperClockTable / BaseClockTable (meta word, probing, eviction, strict/non-strict charging, standalone); compaction-features pass: eviction_effort_cap, CalcHashBits overshoot clamp, table metadata charged up front |
+| `Cache/LruCache.cs` | 748 | include/rocksdb/cache.h, cache/lru_cache.{h,cc}, cache/sharded_cache.{h,cc} | line-by-line (#3): LRUCacheShard / LRUHandleTable (insert, release, pools, eviction); metadata charge = CalcuMetaCharge with glibc malloc_usable_size (88) |
 | `ColumnFamily.Entities.cs` | 146 | include/rocksdb/db.h | line-by-line (feature audit: user features (wide columns)) |
 | `ColumnFamily.Options.cs` | 87 | include/rocksdb/db.h (SetOptions) | API wrapper, design-reviewed (#3): delegates to audited DbImpl |
 | `ColumnFamily.Properties.cs` | 145 | include/rocksdb/db.h (GetProperty, GetApproximateSizes, ...) | API wrapper, design-reviewed (#3): delegates to audited DbImpl |
@@ -87,14 +91,14 @@ changes there need their own review.
 | `Db/Blob/CompactionBlobProcessor.cs` | 110 | db/compaction/compaction_iterator.cc, db/blob/blob_fetcher.cc | line-by-line (feature audit: integrated BlobDB) |
 | `Db/ColumnFamilyData.cs` | 257 | db/memtable_list.h, db/column_family.h, db/column_family.cc | line-by-line (#2) |
 | `Db/Compaction/ColumnFamilyCompactionState.cs` | 34 | db/compaction/compaction_picker.h (NullCompactionPicker), db/column_family.h | line-by-line (#2) |
-| `Db/Compaction/Compaction.cs` | 422 | include/rocksdb/listener.h, db/compaction/compaction.{h,cc} | line-by-line (#2); #3: MaxOutputFileSize, MaxInputFileNewestKeyTime (new), MinInputFileOldestAncestorTime |
+| `Db/Compaction/Compaction.cs` | 446 | include/rocksdb/listener.h, db/compaction/compaction.{h,cc} | line-by-line (#2); #3: MaxOutputFileSize, MaxInputFileNewestKeyTime (new), MinInputFileOldestAncestorTime; compaction-features pass: output_split_key_, CreateSstPartitioner, IsTrivialMove partitioner check, GetOutputTemperature inputs |
 | `Db/Compaction/CompactionIterator.cs` | 762 | db/compaction/compaction_iteration_stats.h, db/compaction/compaction_iterator.cc | line-by-line (#3): NextFromInput / InvokeFilterIfNeeded / PrepareOutput / findEarliestVisibleSnapshot vs compaction_iterator.cc (main) |
-| `Db/Compaction/CompactionJob.cs` | 687 | db/compaction/compaction_job.cc, db/compaction/compaction_outputs.cc | line-by-line (#2); #3: ShouldStopBefore / grandparent boundaries, output time properties (fixed newest_key_time) |
-| `Db/Compaction/CompactionPicker.cs` | 557 | db/compaction/compaction_picker.{h,cc} | line-by-line (#2) |
-| `Db/Compaction/FifoCompactionPicker.cs` | 136 | db/compaction/compaction_picker_fifo.cc | line-by-line (#3): PickTTL/Size/IntraL0/PickCompaction; **fixed** TTL expiry by newest key time |
-| `Db/Compaction/LevelCompactionPicker.cs` | 509 | db/compaction/compaction_picker_level.cc | line-by-line (#2) |
-| `Db/Compaction/UniversalCompactionPicker.cs` | 231 | db/compaction/compaction_picker_universal.cc | line-by-line (#3): CalculateSortedRuns, size amp, size ratio, sorted-run count |
-| `Db/Compaction/VersionStorageInfo.Compaction.cs` | 908 | db/version_set.cc | line-by-line (#2); #3: FIFO score / GetExpiredTtlFilesCount |
+| `Db/Compaction/CompactionJob.cs` | 885 | db/compaction/compaction_job.cc, db/compaction/compaction_outputs.cc | line-by-line (#2); #3: ShouldStopBefore / grandparent boundaries, output time properties (fixed newest_key_time); compaction-features pass: full ShouldStopBefore (TTL cuts, partitioner, upper-bound size, round-robin split), GetOutputTemperature, compression switch |
+| `Db/Compaction/CompactionPicker.cs` | 592 | db/compaction/compaction_picker.{h,cc} | line-by-line (#2); compaction-features pass: enable_compression / output temperature / output split key in NewCompaction |
+| `Db/Compaction/FifoCompactionPicker.cs` | 311 | db/compaction/compaction_picker_fifo.cc | line-by-line (#3): PickTTL/Size/IntraL0/PickCompaction; **fixed** TTL expiry by newest key time; compaction-features pass: whole file (blob-aware sizing, PickRatioBasedIntraL0Compaction, PickTemperatureChangeCompaction) |
+| `Db/Compaction/LevelCompactionPicker.cs` | 511 | db/compaction/compaction_picker_level.cc | line-by-line (#2) |
+| `Db/Compaction/UniversalCompactionPicker.cs` | 680 | db/compaction/compaction_picker_universal.cc | line-by-line (compaction-features pass): whole file except read-triggered compaction (periodic, size amp with MightExcludeNewL0sToReduceWriteStop and incremental mode, size ratio, max_read_amp, delete-triggered, compression_size_percent) |
+| `Db/Compaction/VersionStorageInfo.Compaction.cs` | 974 | db/version_set.cc | line-by-line (#2); #3: FIFO score / GetExpiredTtlFilesCount; compaction-features pass: blob-aware FIFO score, ShouldChangeFileTemperature, **fixed** periodic-compaction file age (file_creation_time first) |
 | `Db/Compaction/WriteController.cs` | 307 | db/write_controller.{h,cc} | line-by-line (#2) |
 | `Db/CompactionFilter.cs` | 95 | include/rocksdb/compaction_filter.h | line-by-line (#3): compaction_filter.h decisions / value types |
 | `Db/DbFormat.cs` | 158 | db/dbformat.h | line-by-line (#1) |
@@ -123,7 +127,7 @@ changes there need their own review.
 | `Db/ExternalSstFileIngestionJob.cs` | 428 | db/external_sst_file_ingestion_job.h, db/external_sst_file_ingestion_job.cc | line-by-line (#2) |
 | `Db/FileMetaData.cs` | 253 | table/unique_id_impl.h, db/version_edit.h, include/rocksdb/file_checksum.h | line-by-line (#1); #3: in-memory NewestKeyTime |
 | `Db/FileNames.cs` | 458 | include/rocksdb/types.h, include/rocksdb/transaction_log.h, file/filename.{h,cc} | line-by-line (#1) |
-| `Db/FlushJob.cs` | 455 | db/flush_job.cc, db/builder.cc | line-by-line (#2); #3: table time properties (fixed newest_key_time) |
+| `Db/FlushJob.cs` | 516 | db/flush_job.cc, db/builder.cc | line-by-line (#2); #3: table time properties (fixed newest_key_time); compaction-features pass: oldest_key_time / oldest_ancestor_time from the memtable first-insert time, rocksdb.creation.time, default_write_temperature |
 | `Db/GetContext.cs` | 387 | table/get_context.cc, db/db_impl/db_impl.cc | line-by-line (#1) |
 | `Db/ITableCache.cs` | 45 | db/table_cache.h | line-by-line (#2) |
 | `Db/IWriteBatchHandler.cs` | 36 | include/rocksdb/write_batch.h | line-by-line (#3): write_batch.h Handler |
@@ -140,7 +144,7 @@ changes there need their own review.
 | `Db/Iterators/TableInternalIterator.cs` | 126 | table/block_based/block_based_table_iterator.cc | line-by-line (#1) |
 | `Db/Manifest.cs` | 608 | db/log_reader.cc, db/log_writer.cc, db/blob/blob_file_meta.h | line-by-line (#1) |
 | `Db/ManifestLog.cs` | 84 | db/version_set.cc | line-by-line (#1) |
-| `Db/MemTable.cs` | 633 | db/memtable.h, db/memtable.cc, memtable/skiplistrep.cc | line-by-line (#1) |
+| `Db/MemTable.cs` | 673 | db/memtable.h, db/memtable.cc, memtable/skiplistrep.cc | line-by-line (#1); compaction-features pass: UpdateOldestKeyTime / ApproximateOldestKeyTime |
 | `Db/MemTableRangeTombstones.cs` | 291 | db/range_tombstone_fragmenter.{h,cc} | line-by-line (#1) |
 | `Db/MemTableSupport.cs` | 185 | db/memtable.cc, db/column_family.cc, db/merge_context.h | line-by-line (#1) |
 | `Db/MergeHelper.BuiltinOperators.cs` | 85 | utilities/merge_operators/uint64add.cc, utilities/merge_operators/string_append/stringappend.cc | line-by-line (#1) |
@@ -152,7 +156,7 @@ changes there need their own review.
 | `Db/TableCache.cs` | 263 | db/table_cache.cc, db/db_impl/db_impl.cc | line-by-line (#2); #3: records newest_key_time from opened readers |
 | `Db/TableFactory.cs` | 300 | table/table_builder.h, table/block_based/block_based_table_factory.cc, table/block_based/filter_policy.cc | line-by-line (feature audit: table prefix / comparators) |
 | `Db/TestHooks.cs` | 46 | test_util/sync_point.h (lite) | managed-only, design-reviewed (#3): TEST_SYNC_POINT lite (DEBUG only) |
-| `Db/TransactionLogIterator.cs` | 400 | db/transaction_log_impl.cc | line-by-line (#3): wal_iterator_impl.cc (renamed from transaction_log_impl.cc) |
+| `Db/TransactionLogIterator.cs` | 396 | db/transaction_log_impl.cc | line-by-line (#3): wal_iterator_impl.cc (renamed from transaction_log_impl.cc); compaction-features pass: **fixed** sequence gap ends the run with NotFound (identical in 11.12) |
 | `Db/TransactionWriteContext.cs` | 60 | db/write_callback.h, db/db_impl/db_impl_write.cc | line-by-line (feature audit: transactions) |
 | `Db/Version.cs` | 199 | db/version_set.h, db/version_set.cc, db/version_builder.cc | line-by-line (#2) |
 | `Db/VersionEdit.cs` | 805 | db/version_edit.h, db/version_edit.{h,cc} | line-by-line (#1) |
@@ -180,8 +184,8 @@ changes there need their own review.
 | `Monitoring/StatisticsNames.g.cs` | 1075 | monitoring/statistics.cc, include/rocksdb/statistics.h | line-by-line (feature audit: user features (statistics; generated from TickersNameMap)) |
 | `MultiGetBatch.cs` | 332 | db/db_impl/db_impl.cc (MultiGet key context), table/multiget_context.h | line-by-line (feature audit: UDT / MultiGet) |
 | `Options/BlockBasedTableOptions.cs` | 125 | include/rocksdb/table.h, table/block_based/block_based_table_factory.cc | line-by-line (#1) |
-| `Options/ColumnFamilyOptions.cs` | 332 | include/rocksdb/options.h, options/cf_options.cc | line-by-line (#3): defaults vs advanced_options.h/options.h; **fixed** compaction_options_* persistence |
-| `Options/CompactionStyleOptions.cs` | 109 | include/rocksdb/advanced_options.h, options/cf_options.cc, include/rocksdb/universal_compaction.h | line-by-line (#3): universal_compaction.h / advanced_options.h defaults; **fixed** OPTIONS struct |
+| `Options/ColumnFamilyOptions.cs` | 400 | include/rocksdb/options.h, options/cf_options.cc | line-by-line (#3): defaults vs advanced_options.h/options.h; **fixed** compaction_options_* persistence; compaction-features pass: sst_partitioner_factory object, target_file_size_is_upper_bound |
+| `Options/CompactionStyleOptions.cs` | 240 | include/rocksdb/advanced_options.h, options/cf_options.cc, include/rocksdb/universal_compaction.h | line-by-line (#3): universal_compaction.h / advanced_options.h defaults; **fixed** OPTIONS struct; compaction-features pass: every member typed (FileTemperatureAge vector format) |
 | `Options/CompressionOptions.cs` | 57 | include/rocksdb/advanced_compression.h | line-by-line (#3): defaults vs advanced_compression.h |
 | `Options/CustomizableOption.cs` | 66 | options/customizable.cc | line-by-line (#3): customizable ids (options/customizable.cc) |
 | `Options/DbOptions.cs` | 211 | include/rocksdb/options.h, options/db_options.cc | line-by-line (#3): defaults vs options.h |
@@ -191,13 +195,14 @@ changes there need their own review.
 | `Options/OptionTypeInfo.cs` | 484 | options/cf_options.cc, options/db_options.cc, table/block_based/block_based_table_factory.cc | line-by-line (#1) |
 | `Options/OptionsBase.cs` | 77 | options/options_helper.cc (unknown-option preservation) | managed-only, design-reviewed (#3): OPTIONS round-trip plumbing |
 | `Options/OptionsFile.cs` | 408 | options/options_parser.cc, include/rocksdb/version.h | line-by-line (#1) |
+| `Options/SstPartitioner.cs` | 166 | include/rocksdb/sst_partitioner.h, db/compaction/sst_partitioner.cc | line-by-line (compaction-features pass): SstPartitioner / factory / fixed prefix, ShouldPartitionByPrefix, OPTIONS id form |
 | `Options/SliceTransform.cs` | 180 | include/rocksdb/slice_transform.h, util/slice.cc | line-by-line (feature audit: table prefix (prefix extractor)) |
-| `PooledValue.cs` | 84 | include/rocksdb/metadata.h | managed-only, design-reviewed (#3): pooled Get results / LiveFileMetadata record |
+| `PooledValue.cs` | 92 | include/rocksdb/metadata.h | managed-only, design-reviewed (#3): pooled Get results / LiveFileMetadata record |
 | `RocksDatabase.Replication.cs` | 295 | db/db_impl/db_impl_readonly.cc, db/db_impl/db_impl_secondary.cc | API wrapper, design-reviewed (#3): delegates to audited DbImpl |
 | `RocksDatabase.Timestamps.cs` | 43 | include/rocksdb/db.h (timestamp APIs) | line-by-line (feature audit: user-defined timestamps) |
 | `RocksDatabase.cs` | 408 | include/rocksdb/db.h | API wrapper, design-reviewed (#3): delegates to audited DbImpl |
 | `Table/Block.cs` | 170 | table/block_based/block.{h,cc}, table/block_based/data_block_footer.cc | line-by-line (#1) |
-| `Table/BlockBasedTableBuilder.cs` | 762 | table/block_based/block_based_table_builder.cc | line-by-line (#1) |
+| `Table/BlockBasedTableBuilder.cs` | 784 | table/block_based/block_based_table_builder.cc | line-by-line (#1); compaction-features pass: EstimatedTailSize |
 | `Table/BlockBasedTableIterator.cs` | 420 | table/block_based/partitioned_index_iterator.cc, table/block_based/block_based_table_iterator.cc | line-by-line (#1) |
 | `Table/BlockBasedTableReader.MultiGet.cs` | 138 | table/block_based/block_based_table_reader_sync_and_async.h | line-by-line (#1) |
 | `Table/BlockBasedTableReader.cs` | 1393 | table/block_based/block_based_table_reader.{h,cc}, meta_blocks.cc | line-by-line (#1) |
@@ -209,7 +214,7 @@ changes there need their own review.
 | `Table/BlockIter.cs` | 895 | table/block_based/block.{h,cc}, block_util.h | line-by-line (#1) |
 | `Table/ChecksumType.cs` | 11 | include/rocksdb/table.h | line-by-line (#1) |
 | `Table/DataBlockHashIndex.cs` | 120 | table/block_based/data_block_hash_index.{h,cc}, util/hash.h | line-by-line (#1) |
-| `Table/FilterBlockBuilder.cs` | 348 | table/block_based/filter_block.h, table/block_based/full_filter_block.cc, table/block_based/partitioned_filter_block.cc | line-by-line (#1) |
+| `Table/FilterBlockBuilder.cs` | 377 | table/block_based/filter_block.h, table/block_based/full_filter_block.cc, table/block_based/partitioned_filter_block.cc | line-by-line (#1); compaction-features pass: CurrentFilterSizeEstimate (approximated space) |
 | `Table/Filters/BloomImpl.cs` | 198 | util/bloom_impl.h | line-by-line (#1) |
 | `Table/Filters/BuiltinFilterPolicies.cs` | 216 | table/block_based/filter_policy.cc | line-by-line (#1) |
 | `Table/Filters/FilterAllocationModel.cs` | 66 | table/block_based/filter_policy.cc | line-by-line (#1) |
@@ -218,7 +223,7 @@ changes there need their own review.
 | `Table/Filters/FilterContracts.cs` | 66 | table/block_based/filter_policy_internal.h, include/rocksdb/filter_policy.h | line-by-line (#1) |
 | `Table/Filters/Standard128Ribbon.cs` | 509 | util/ribbon_impl.h, util/ribbon_alg.h, util/ribbon_config.cc | line-by-line (#1) |
 | `Table/Footer.cs` | 220 | table/format.h, table/block_based/block_based_table_reader.h, table/format.cc | line-by-line (#1) |
-| `Table/IndexBuilder.cs` | 437 | table/block_based/index_builder.h, table/block_based/index_builder.{h,cc} | line-by-line (#1) |
+| `Table/IndexBuilder.cs` | 480 | table/block_based/index_builder.h, table/block_based/index_builder.{h,cc} | line-by-line (#1); compaction-features pass: UpdateIndexSizeEstimate (shortened, partitioned) |
 | `Table/PinnedFilterPartitions.cs` | 56 | table/block_based/partitioned_filter_block.cc | line-by-line (#1) |
 | `Table/TableFormatOptions.cs` | 122 | include/rocksdb/table.h, table/table_builder.h | line-by-line (#1) |
 | `Table/TableProperties.cs` | 373 | table/table_properties.cc, table/sst_file_writer.cc, include/rocksdb/table_properties.h | line-by-line (#1) |

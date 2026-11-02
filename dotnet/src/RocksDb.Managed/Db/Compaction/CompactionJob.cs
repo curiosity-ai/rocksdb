@@ -23,7 +23,8 @@ internal sealed class CompactionJobStats
 
 /// <summary>
 /// Runs a picked compaction: merges the input files through a <see cref="CompactionIterator"/>, writes the outputs
-/// (split at the target file size and at grandparent boundaries, with range tombstones assigned to the overlapping
+/// (cut by CompactionOutputs::ShouldStopBefore: max output size, optionally including the estimated tail, grandparent
+/// boundaries, TTL cuts, the SST partitioner and the round-robin split key; with range tombstones assigned to the overlapping
 /// outputs and file boundaries extended for them) and returns the outputs' <see cref="FileMetaData"/>. Port of
 /// CompactionJob::ProcessKeyValueCompaction / FinishCompactionOutputFile (db/compaction/compaction_job.cc),
 /// CompactionOutputs::ShouldStopBefore / AddRangeDels / UpdateGrandparentBoundaryInfo
@@ -68,6 +69,25 @@ internal sealed class CompactionJob
 
     private bool _firstOutput = true;
 
+    // SST partitioner (CompactionOutputs::partitioner_): the prefix fast path (ShouldPartitionByPrefix) or the per-key
+    // ShouldPartition fallback with the previous output key.
+    private readonly SstPartitioner? _partitioner;
+    private byte[] _partitionerPrefix = [];
+    private int _partitionerPrefixLength;
+    private bool _partitionerPrefixValid;
+    private readonly PooledBufferWriter? _lastKeyForPartitioner;
+
+    // TTL-based cuts (CompactionOutputs::FillFilesToCutForTtl / UpdateFilesToCutForTTLStates).
+    private readonly List<FileMetaData>? _filesToCutForTtl;
+    private int _curFilesToCutForTtl = -1;
+    private int _nextFilesToCutForTtl;
+
+    // Round-robin split key (CompactionOutputs::local_output_split_key_ / is_split_).
+    private readonly byte[]? _outputSplitKey;
+    private bool _isSplit;
+
+    private readonly bool _targetFileSizeIsUpperBound;
+
     /// <summary>The DB's snapshot checker (WritePrepared / WriteUnprepared), or null.</summary>
     internal SnapshotChecker? SnapshotChecker { get; init; }
 
@@ -87,6 +107,47 @@ internal sealed class CompactionJob
         _icmp = cfd.Icmp;
         _rangeDelLevelPtrs = new int[compaction.NumberLevels];
         _noFillCache = new NoFillTableCache(cfd.TableCache);
+        // CompactionOutputs::CompactionOutputs: no partitioner and no TTL cuts for outputs to level 0.
+        if (compaction.OutputLevel != 0)
+        {
+            _partitioner = compaction.CreateSstPartitioner();
+            if (_partitioner is not null) _lastKeyForPartitioner = new PooledBufferWriter(64);
+            _filesToCutForTtl = FillFilesToCutForTtl(compaction);
+        }
+        // SetOutputSlitKey with a single subcompaction (no boundaries): the compaction's split key as is.
+        _outputSplitKey = compaction.OutputSplitKey;
+        _targetFileSizeIsUpperBound = compaction.Options.TargetFileSizeIsUpperBound;
+    }
+
+    /// <summary>
+    /// Port of CompactionOutputs::FillFilesToCutForTtl: with leveled kMinOverlappingRatio compaction and a TTL, the
+    /// non-small output-level inputs older than ttl / 2 are listed so that the outputs are cut at their boundaries (the
+    /// new data of a mostly-old range then lands in separate files that TTL compaction can pick without the old data).
+    /// Null when there is nothing to cut.
+    /// </summary>
+    internal static List<FileMetaData>? FillFilesToCutForTtl(Compaction c)
+    {
+        ColumnFamilyOptions o = c.Options;
+        if (o.CompactionStyle != CompactionStyle.Level || o.CompactionPri != CompactionPri.MinOverlappingRatio || o.Ttl == 0
+            || c.NumInputLevels < 2 || c.BottommostLevel)
+        {
+            return null;
+        }
+        // We define new file with the oldest ancestor time to be younger than 1/4 TTL, and an old one to be older than
+        // 1/2 TTL time.
+        ulong currentTime = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (currentTime < o.Ttl) return null;
+        ulong oldAgeThres = currentTime - o.Ttl / 2;
+        List<FileMetaData>? result = null;
+        foreach (FileMetaData file in c.Inputs(c.NumInputLevels - 1).Files)
+        {
+            // We put old files if they are not too small to prevent a flood of small files.
+            if (file.OldestAncestorTime < oldAgeThres && file.FileSize > o.TargetFileSizeBase / 2)
+            {
+                (result ??= new List<FileMetaData>()).Add(file);
+            }
+        }
+        return result;
     }
 
     /// <summary>
@@ -288,6 +349,7 @@ internal sealed class CompactionJob
             BlobBuilder?.Abandon();
             input.Dispose();
             _largestKey.Dispose();
+            _lastKeyForPartitioner?.Dispose();
             if (_builder is not null)
             {
                 _builder.Abandon();
@@ -306,10 +368,19 @@ internal sealed class CompactionJob
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void AddToOutput(CompactionIterator iter)
     {
-        if (_builder is null) OpenOutput();
         ReadOnlySpan<byte> key = iter.Key;
+        if (_builder is null)
+        {
+            OpenOutput();
+            if (_partitioner is not null) PrepareNewOutputForFirstKey(DbFormat.ExtractUserKey(key));
+        }
         ReadOnlySpan<byte> value = iter.Value;
         _builder!.Add(key, value);
+        if (_partitioner is not null && !_partitionerPrefixValid)
+        {
+            _lastKeyForPartitioner!.Clear();
+            _lastKeyForPartitioner.Write(DbFormat.ExtractUserKey(key));
+        }
         Stats.NumOutputRecords++;
         UpdateBoundaries(key, iter.Sequence);
         if (iter.Type == EntryType.BlobIndex)
@@ -375,6 +446,11 @@ internal sealed class CompactionJob
             FileCreationTime = now,
             NewestKeyTime = newestKeyTime,
         };
+        if (!_c.EnableCompression)
+        {
+            // GetCompressionType / GetCompressionOptions with enable_compression = false.
+            tbo = tbo with { CompressionType = Compression.CompressionType.None, CompressionOptions = _cfd.Options.CompressionOpts };
+        }
         _meta = new FileMetaData
         {
             FileNumber = fileNumber,
@@ -383,6 +459,7 @@ internal sealed class CompactionJob
             OldestAncestorTime = oldestAncestor,
             NewestKeyTime = newestKeyTime,
             FileCreationTime = now,
+            Temperature = GetOutputTemperature(),
             // user_defined_timestamps_persisted (persist_user_defined_timestamps): the outputs strip timestamps too.
             UserDefinedTimestampsPersisted = !_cfd.TimestampsInMemtableOnly,
         };
@@ -395,6 +472,36 @@ internal sealed class CompactionJob
         _builder = new BlockBasedTableBuilder(_file, _cfd.Format, tbo);
         _hasPointKey = false;
         _largestKey.Clear();
+    }
+
+    /// <summary>
+    /// Port of CompactionOutputs::PrepareNewOutputForFirstKey: a new output file starts a fresh partition window; cache
+    /// the partitioner's prefix for this file's first key when it can express its next boundary as one.
+    /// </summary>
+    private void PrepareNewOutputForFirstKey(ReadOnlySpan<byte> userKey)
+    {
+        int len = _partitioner!.ShouldPartitionByPrefix(userKey);
+        _partitionerPrefixValid = len >= 0;
+        if (_partitionerPrefixValid)
+        {
+            if (len > userKey.Length) throw new InvalidOperationException("SstPartitioner.ShouldPartitionByPrefix returned a length beyond the key");
+            if (_partitionerPrefix.Length < len) _partitionerPrefix = new byte[Math.Max(len, 16)];
+            userKey[..len].CopyTo(_partitionerPrefix);
+            _partitionerPrefixLength = len;
+        }
+    }
+
+    /// <summary>
+    /// Port of Compaction::GetOutputTemperature (no proximal-level output): the picker's override (FIFO
+    /// kChangeTemperature), else last_level_temperature on the last level, else default_write_temperature. The managed
+    /// file system has a single tier, so the temperature is metadata only (MANIFEST, GetLiveFilesMetaData).
+    /// </summary>
+    private Temperature GetOutputTemperature()
+    {
+        if (_c.OutputTemperature != Temperature.Unknown) return _c.OutputTemperature;
+        ColumnFamilyOptions o = _c.Options;
+        if (_c.OutputLevel == _c.NumberLevels - 1 && o.LastLevelTemperature != Temperature.Unknown) return o.LastLevelTemperature;
+        return o.DefaultWriteTemperature;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -665,20 +772,80 @@ internal sealed class CompactionJob
         return overlapped;
     }
 
-    /// <summary>Port of CompactionOutputs::ShouldStopBefore (no TTL cuts, partitioner or round-robin split key).</summary>
+    /// <summary>Port of CompactionOutputs::UpdateFilesToCutForTTLStates: true at the boundaries of old output-level files.</summary>
+    private bool UpdateFilesToCutForTtlStates(ReadOnlySpan<byte> internalKey)
+    {
+        List<FileMetaData> files = _filesToCutForTtl!;
+        if (_curFilesToCutForTtl != -1)
+        {
+            // Previous key is inside the range of a file
+            if (_icmp.Compare(internalKey, files[_curFilesToCutForTtl].Largest) > 0)
+            {
+                _nextFilesToCutForTtl = _curFilesToCutForTtl + 1;
+                _curFilesToCutForTtl = -1;
+                return true;
+            }
+        }
+        else
+        {
+            // Look for the key position
+            while (_nextFilesToCutForTtl < files.Count)
+            {
+                if (_icmp.Compare(internalKey, files[_nextFilesToCutForTtl].Smallest) >= 0)
+                {
+                    if (_icmp.Compare(internalKey, files[_nextFilesToCutForTtl].Largest) <= 0)
+                    {
+                        // With in the current file
+                        _curFilesToCutForTtl = _nextFilesToCutForTtl;
+                        return true;
+                    }
+                    // Beyond the current file
+                    _nextFilesToCutForTtl++;
+                }
+                else
+                {
+                    // Still fall into the gap
+                    break;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Port of CompactionOutputs::ShouldStopBefore: TTL cuts, SST partitioner (prefix fast path or ShouldPartition),
+    /// max output file size (with the estimated tail under target_file_size_is_upper_bound), round-robin split key,
+    /// and the grandparent rules (max_compaction_bytes, skippable grandparent files, pre-cut at grandparent boundaries).
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private bool ShouldStopBefore(ReadOnlySpan<byte> internalKey)
     {
         ulong previousOverlappedBytes = _grandparentOverlappedBytes;
         int numGrandparentBoundariesCrossed = 0;
-        // Always update grandparent information like overlapped file number, size etc.
-        if (_c.OutputLevel > 0) numGrandparentBoundariesCrossed = UpdateGrandparentBoundaryInfo(internalKey);
+        bool shouldStopForTtl = false;
+        // Always update grandparent information like overlapped file number, size etc., and TTL states.
+        if (_c.OutputLevel > 0)
+        {
+            numGrandparentBoundariesCrossed = UpdateGrandparentBoundaryInfo(internalKey);
+            if (_filesToCutForTtl is not null) shouldStopForTtl = UpdateFilesToCutForTtlStates(internalKey);
+        }
         if (_builder is null) return false;
+        if (shouldStopForTtl) return true;
+        if (_partitioner is not null && ShouldPartition(internalKey)) return true;
         // files output to Level 0 won't be split
         if (_c.OutputLevel == 0) return false;
         ulong currentOutputFileSize = _builder.FileSize;
         // reach the max file size
-        if (currentOutputFileSize >= _c.MaxOutputFileSize) return true;
+        ulong estimatedFileSize = currentOutputFileSize;
+        if (_targetFileSizeIsUpperBound) estimatedFileSize += _builder.EstimatedTailSize();
+        if (estimatedFileSize >= _c.MaxOutputFileSize) return true;
+        // Check if it needs to split for RoundRobin. A null split key means we do not need to split.
+        if (_outputSplitKey is not null && !_isSplit && _icmp.Compare(internalKey, _outputSplitKey) >= 0)
+        {
+            // Split occurs when the next key is larger than/equal to the cursor.
+            _isSplit = true;
+            return true;
+        }
         // only check if the current key is going to cross the grandparents file boundary (either the file beginning or ending).
         if (numGrandparentBoundariesCrossed > 0)
         {
@@ -701,5 +868,19 @@ internal sealed class CompactionJob
             }
         }
         return false;
+    }
+
+    /// <summary>The partitioner part of ShouldStopBefore (kept out of the per-key method's body).</summary>
+    private bool ShouldPartition(ReadOnlySpan<byte> internalKey)
+    {
+        ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(internalKey);
+        if (_partitionerPrefixValid)
+        {
+            // Fast path: a partition is requested at the first key that no longer shares the established prefix. An
+            // empty prefix means no further partitions (every key "starts with" it).
+            return !userKey.StartsWith(_partitionerPrefix.AsSpan(0, _partitionerPrefixLength));
+        }
+        // Slow path: per-key callback.
+        return _partitioner!.ShouldPartition(_lastKeyForPartitioner!.WrittenSpan, userKey, _builder!.FileSize) == PartitionerResult.Required;
     }
 }

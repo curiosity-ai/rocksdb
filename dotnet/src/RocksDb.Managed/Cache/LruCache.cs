@@ -37,8 +37,14 @@ public sealed class LruCacheOptions
 /// </summary>
 public sealed class LruCache : BlockCache
 {
-    /// <summary>Metadata charge per entry under <see cref="CacheMetadataChargePolicy.FullCharge"/> (approx. object size).</summary>
-    public const int EntryMetadataCharge = 112;
+    /// <summary>
+    /// Metadata charge per entry under <see cref="CacheMetadataChargePolicy.FullCharge"/>: LRUHandle::CalcuMetaCharge,
+    /// malloc_usable_size of the handle allocation, sizeof(LRUHandle) - 1 + key_length = 72 - 1 + 16 (block cache keys
+    /// are 16 bytes) = 87 bytes, which glibc's malloc serves with 88 usable bytes (jemalloc: 96; builds without
+    /// malloc_usable_size charge 87). The managed entry object's real size differs; the constant mirrors native
+    /// accounting so the same capacity holds the same number of blocks.
+    /// </summary>
+    public const int EntryMetadataCharge = 88;
 
     private const long MinShardSize = 512 * 1024;
 

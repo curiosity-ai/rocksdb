@@ -372,7 +372,12 @@ internal sealed partial class DbImpl : IAsyncDisposable
                             DbFormat.ExtractUserKey(f.Largest).ToArray(),
                             f.SmallestSeqno,
                             f.LargestSeqno,
-                            f.EpochNumber));
+                            f.EpochNumber)
+                        {
+                            Temperature = f.Temperature,
+                            OldestAncestorTime = f.OldestAncestorTime,
+                            FileCreationTime = f.FileCreationTime,
+                        });
                     }
                 }
             }

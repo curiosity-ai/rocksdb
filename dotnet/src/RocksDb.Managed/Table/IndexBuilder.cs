@@ -23,6 +23,13 @@ internal abstract class IndexBuilder : IDisposable
     /// <summary>Total (uncompressed) size of all index blocks written; valid after the final <see cref="Finish"/>.</summary>
     public abstract int IndexSize { get; }
 
+    /// <summary>
+    /// CurrentIndexSizeEstimate (UpdateIndexSizeEstimate): approximate size of the index built so far, used to estimate
+    /// the table's tail for target_file_size_is_upper_bound. <paramref name="numDataBlocks"/> is the number of index
+    /// entries added so far.
+    /// </summary>
+    public abstract ulong CurrentIndexSizeEstimate(ulong numDataBlocks);
+
     /// <summary>Number of index partitions (0 unless partitioned).</summary>
     public virtual int NumPartitions => 0;
 
@@ -105,6 +112,14 @@ internal sealed class ShortenedIndexBuilder : IndexBuilder
 
     public override int IndexSize => _indexSize;
     public int CurrentSizeEstimate => _mustUseSeparatorWithSeq ? _withSeq.CurrentSizeEstimate : _withoutSeq.CurrentSizeEstimate;
+
+    /// <summary>Port of ShortenedIndexBuilder::UpdateIndexSizeEstimate (computed on demand).</summary>
+    public override ulong CurrentIndexSizeEstimate(ulong numDataBlocks)
+    {
+        ulong currentSize = (ulong)CurrentSizeEstimate;
+        // Add buffer to generously account (in most cases) for the next index entry.
+        return numDataBlocks > 0 ? currentSize + 2 * (currentSize / numDataBlocks) : currentSize;
+    }
 
     public override void OnKeyAdded(ReadOnlySpan<byte> internalKey)
     {
@@ -268,6 +283,34 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
     public override int IndexSize => _indexSize;
     public override int NumPartitions => _partitionCount;
     public override int TopLevelIndexSize => _topLevelIndexSize;
+
+    /// <summary>
+    /// Port of PartitionedIndexBuilder::UpdateIndexSizeEstimate (computed on demand): completed partitions (their
+    /// block builders' current sizes) plus the active one, ~70 bytes per top-level entry and a buffer for the next
+    /// partition and top-level entry.
+    /// </summary>
+    public override ulong CurrentIndexSizeEstimate(ulong numDataBlocks)
+    {
+        // Ignore last entry which is a placeholder for the partition being built.
+        int live = _entries.Count - _front;
+        ulong completedPartitions = live > 0 ? (ulong)(live - 1) : 0;
+        ulong completedSize = 0;
+        for (int i = _front; i < _entries.Count - 1; i++) completedSize += (ulong)_entries[i].Value.CurrentSizeEstimate;
+        ulong currentSub = _subIndexBuilder is null ? 0 : _subIndexBuilder.CurrentIndexSizeEstimate(0);
+        ulong total = completedSize + currentSub;
+        if (completedPartitions > 0)
+        {
+            ulong estimatedTopLevelSize = completedPartitions * 70;
+            total += estimatedTopLevelSize;
+            total += 2 * (completedSize / completedPartitions + estimatedTopLevelSize / completedPartitions);
+        }
+        else if (_subIndexBuilder is not null)
+        {
+            // For the first partition, estimate using the current partition's state.
+            total += 2 * currentSub;
+        }
+        return total;
+    }
 
     private void MakeNewSubIndexBuilder()
     {

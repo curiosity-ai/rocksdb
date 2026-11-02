@@ -569,6 +569,23 @@ reads). Flush and compaction write blobs through the same buffered `IWritableFil
 Open follow-ups: blob prefetching for compaction (`blob_compaction_readahead_size` is recorded only), batched blob reads
 for MultiGet (one read per blob today), avoiding the extra blob copy in Get (swap the scratch and value buffers).
 
+## Compaction features (audit #3 remaining deviations): no leveled regression
+
+The universal / FIFO picker ports, the complete ShouldStopBefore (TTL cuts, partitioner, upper-bound size, round-robin
+split; each behind a predictable per-key branch that is off by default), the memtable first-insert time (one relaxed
+load per insert once set) and the HyperClock eviction cap do not change the leveled path. Deterministic check: the
+lock-step parity test still matches native on all 60 LSM shapes and every compaction (write-amp 4.321 vs native
+4.322). Warm compaction-heavy dbbench (managed only, num 500k, 4 MiB memtable / target, 16 MiB level base, three
+alternating runs of the previous build and this one on the shared 4-core VM, µs/op):
+
+| | fillrandom | overwrite | readrandom | seekrandom | write-amp |
+|---|---|---|---|---|---|
+| before (3 runs) | 3.29 / 3.95 / 3.25 | 3.86 / 3.39 / 3.24 | 8.41 / 6.88 / 7.35 | 27.8 / 11.9 / 18.8 | 2.87 / 3.24 / 3.05 |
+| after (3 runs) | 2.99 / 2.91 / 3.08 | 3.33 / 3.56 / 2.85 | 7.94 / 7.59 / 7.24 | 18.8 / 24.3 / 15.3 | 3.15 / 3.05 / 3.15 |
+
+The spread between runs of the same build is larger than any difference (the free-running write-amp depends on how far
+compactions fall behind the writer, see "Compaction-picking parity").
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).

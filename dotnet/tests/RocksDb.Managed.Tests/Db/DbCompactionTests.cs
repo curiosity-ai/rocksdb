@@ -674,8 +674,8 @@ public sealed class DbCompactionTests
             for (int i = 0; i < 100; i++) db.Put(Key(i), Val(i, round));
             db.Flush();
         }
-        // Auto compactions are disabled: nothing pending.
-        Assert.AreEqual("0", db.GetProperty("rocksdb.compaction-pending"));
+        // HandleCompactionPending reports the picker's NeedsCompaction also when auto compactions are disabled.
+        Assert.AreEqual("1", db.GetProperty("rocksdb.compaction-pending"));
         Assert.AreNotEqual("0", db.GetProperty("rocksdb.estimate-pending-compaction-bytes"));
         StringAssert.Contains(db.GetProperty("rocksdb.levelstats"), "Level Files Size(MB)");
         db.CompactRange();

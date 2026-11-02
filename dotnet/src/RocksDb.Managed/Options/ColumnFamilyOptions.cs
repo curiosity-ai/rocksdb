@@ -20,6 +20,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     private CustomizableOption<CompactionFilterFactory> _compactionFilterFactory;
     private CustomizableOption<SliceTransform> _prefixExtractor;
     private CustomizableOption<SliceTransform> _memtableInsertWithHintPrefixExtractor;
+    private CustomizableOption<SstPartitionerFactory> _sstPartitionerFactory;
 
     private CustomizableOption<Comparator> _comparator;
 
@@ -102,8 +103,26 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         set => _memtableInsertWithHintPrefixExtractor.Set(value);
     }
 
-    /// <summary>Persisted sst_partitioner_factory id (no managed SST partitioners exist; kept for round trips).</summary>
-    public string? SstPartitionerFactoryName { get; set; }
+    /// <summary>
+    /// sst_partitioner_factory: decides additional cut points of compaction output files (for example
+    /// <see cref="SstPartitionerFixedPrefixFactory"/>). Default null. The OPTIONS file records it by id (with its
+    /// options); an id the managed port does not know is preserved as <see cref="SstPartitionerFactoryName"/> and has no
+    /// effect.
+    /// </summary>
+    public SstPartitionerFactory? SstPartitionerFactory
+    {
+        get => _sstPartitionerFactory.Value;
+        set => _sstPartitionerFactory.Set(value);
+    }
+
+    /// <summary>The persisted sst_partitioner_factory id (also for ids that could not be resolved), or null.</summary>
+    public string? SstPartitionerFactoryName => _sstPartitionerFactory.Name(SstPartitionerFactoryId);
+
+    /// <summary>
+    /// target_file_size_is_upper_bound: compaction includes the estimated table tail (index, filter, meta blocks) when
+    /// deciding to cut an output file, so outputs come close to the target file size without exceeding it. Default false.
+    /// </summary>
+    public bool TargetFileSizeIsUpperBound { get; set; }
 
     /// <summary>memtable_factory (the managed port implements the skip list only).</summary>
     public MemTableFactoryType MemtableFactory { get; set; } = MemTableFactoryType.SkipList;
@@ -174,7 +193,15 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public bool ReportBgIoStats { get; set; }
     /// <summary>Seconds; default 30 days (0xfffffffffffffffe "auto" resolves to this for leveled compaction).</summary>
     public ulong Ttl { get; set; } = 30UL * 24 * 60 * 60;
-    public ulong PeriodicCompactionSeconds { get; set; }
+    /// <summary>
+    /// Seconds; default 0xfffffffffffffffe ("auto"): resolved when the column family is opened to 30 days for universal
+    /// compaction and for leveled compaction with a compaction filter, else 0 (disabled), as upstream SanitizeCfOptions.
+    /// With universal compaction <see cref="Ttl"/> and this option mean the same thing; the stricter one is used.
+    /// </summary>
+    public ulong PeriodicCompactionSeconds { get; set; } = DefaultPeriodicCompactionSeconds;
+
+    /// <summary>kDefaultPeriodicCompSecs (db/column_family.cc).</summary>
+    internal const ulong DefaultPeriodicCompactionSeconds = 0xfffffffffffffffe;
     public ulong PrecludeLastLevelDataSeconds { get; set; }
     public ulong PreserveInternalTimeSeconds { get; set; }
     public Temperature LastLevelTemperature { get; set; } = Temperature.Unknown;
@@ -245,7 +272,8 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
             static (o, v) => o._prefixExtractor.Parse(v, SliceTransform.CreateFromString, SliceTransformId))
         .Add("memtable_insert_with_hint_prefix_extractor", static o => o._memtableInsertWithHintPrefixExtractor.Serialize(SliceTransformId) ?? "nullptr",
             static (o, v) => o._memtableInsertWithHintPrefixExtractor.Parse(v, SliceTransform.CreateFromString, SliceTransformId))
-        .Name("sst_partitioner_factory", static o => o.SstPartitionerFactoryName, static (o, v) => o.SstPartitionerFactoryName = v)
+        .Add("sst_partitioner_factory", static o => o._sstPartitionerFactory.Serialize(SstPartitionerFactoryOptionString) ?? "nullptr",
+            static (o, v) => o._sstPartitionerFactory.Parse(v, Managed.SstPartitionerFactory.CreateFromString, SstPartitionerFactoryOptionString))
         .EnumId("memtable_factory", OptionEnumMaps.MemTableFactory, static o => o.MemtableFactory, static (o, v) => o.MemtableFactory = v)
         .EnumId("table_factory", OptionEnumMaps.TableFactory, static o => o.TableFactory, static (o, v) => o.TableFactory = v)
         .UInt64("write_buffer_size", static o => o.WriteBufferSize, static (o, v) => o.WriteBufferSize = v)
@@ -277,6 +305,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .Int32("level0_stop_writes_trigger", static o => o.Level0StopWritesTrigger, static (o, v) => o.Level0StopWritesTrigger = v)
         .UInt64("target_file_size_base", static o => o.TargetFileSizeBase, static (o, v) => o.TargetFileSizeBase = v)
         .Int32("target_file_size_multiplier", static o => o.TargetFileSizeMultiplier, static (o, v) => o.TargetFileSizeMultiplier = v)
+        .Bool("target_file_size_is_upper_bound", static o => o.TargetFileSizeIsUpperBound, static (o, v) => o.TargetFileSizeIsUpperBound = v)
         .UInt64("max_bytes_for_level_base", static o => o.MaxBytesForLevelBase, static (o, v) => o.MaxBytesForLevelBase = v)
         .Double("max_bytes_for_level_multiplier", static o => o.MaxBytesForLevelMultiplier, static (o, v) => o.MaxBytesForLevelMultiplier = v)
         .Add("max_bytes_for_level_multiplier_additional", static o => OptionStrings.FormatIntArray(o.MaxBytesForLevelMultiplierAdditional),
@@ -328,6 +357,8 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     private static string CompactionFilterId(CompactionFilter f) => f.Name;
     private static string CompactionFilterFactoryId(CompactionFilterFactory f) => f.Name;
     private static string SliceTransformId(SliceTransform t) => t.AsString();
+    private static string SstPartitionerFactoryId(SstPartitionerFactory f) => f.Name;
+    private static string SstPartitionerFactoryOptionString(SstPartitionerFactory f) => f.ToOptionString();
 
     internal override OptionTable<ColumnFamilyOptions> OptionTable => s_table;
 
@@ -340,6 +371,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         c._mergeOperator = _mergeOperator;
         c._prefixExtractor = _prefixExtractor;
         c._memtableInsertWithHintPrefixExtractor = _memtableInsertWithHintPrefixExtractor;
+        c._sstPartitionerFactory = _sstPartitionerFactory;
         c._compactionFilter = _compactionFilter;
         c._compactionFilterFactory = _compactionFilterFactory;
         c.CompactionOptionsFifo = CompactionOptionsFifo.Clone();

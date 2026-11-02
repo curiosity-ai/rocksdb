@@ -20,7 +20,20 @@ public sealed class HyperClockCacheOptions
 
     public bool StrictCapacityLimit { get; init; }
 
+    /// <summary>
+    /// Metadata charging: with <see cref="CacheMetadataChargePolicy.FullCharge"/> the slot table itself
+    /// (<see cref="HyperClockCache.SlotMetadataCharge"/> bytes per slot, the size of upstream's cache-line sized
+    /// HandleImpl) is charged to the usage when the cache is created, and entries are charged their own charge only.
+    /// </summary>
     public CacheMetadataChargePolicy MetadataChargePolicy { get; init; } = CacheMetadataChargePolicy.FullCharge;
+
+    /// <summary>
+    /// eviction_effort_cap: when nearly all entries are pinned (referenced), an eviction gives up once it has seen this
+    /// many pinned entries per entry it could free (plus a start-up allowance), and the cache may exceed its capacity
+    /// instead of burning CPU (non-strict limit only; a strict capacity limit implies no cap). Values below 1 are
+    /// treated as 1. Default 30.
+    /// </summary>
+    public int EvictionEffortCap { get; init; } = 30;
 }
 
 /// <summary>
@@ -37,6 +50,9 @@ public sealed class HyperClockCacheOptions
 public sealed class HyperClockCache : BlockCache
 {
     private const long MinShardSize = 32L * 1024 * 1024;
+
+    /// <summary>sizeof(FixedHyperClockTable::HandleImpl): the per-slot metadata charge (static_assert'ed to 64 upstream).</summary>
+    public const int SlotMetadataCharge = 64;
 
     private readonly ClockShard[] _shards;
     private readonly uint _shardMask;
@@ -57,7 +73,8 @@ public sealed class HyperClockCache : BlockCache
         long perShard = (options.Capacity + numShards - 1) / numShards;
         _shards = new ClockShard[numShards];
         for (int i = 0; i < numShards; i++)
-            _shards[i] = new ClockShard(perShard, options.EstimatedEntryCharge, options.StrictCapacityLimit, options.MetadataChargePolicy);
+            _shards[i] = new ClockShard(perShard, options.EstimatedEntryCharge, options.StrictCapacityLimit, options.MetadataChargePolicy,
+                options.EvictionEffortCap);
     }
 
     public override string Name => "HyperClockCache";
@@ -101,6 +118,17 @@ public sealed class HyperClockCache : BlockCache
         {
             long sum = 0;
             foreach (ClockShard s in _shards) sum += s.ComputePinnedUsage();
+            return sum;
+        }
+    }
+
+    /// <summary>Number of evictions that stopped because the eviction effort cap was exceeded (all shards).</summary>
+    public long EvictionEffortExceededCount
+    {
+        get
+        {
+            long sum = 0;
+            foreach (ClockShard s in _shards) sum += s.EvictionEffortExceededCount;
             return sum;
         }
     }
@@ -256,7 +284,8 @@ internal sealed class ClockShard
     private readonly int _lengthBits;
     private readonly int _lengthMask;
     private readonly long _occupancyLimit;
-    private readonly CacheMetadataChargePolicy _metadataChargePolicy;
+    private readonly uint _evictionEffortCap;
+    private long _evictionEffortExceededCount;
     private long _capacity;
     private bool _strict;
     private long _usage;
@@ -264,37 +293,49 @@ internal sealed class ClockShard
     private long _occupancy;
     private long _clockPointer;
 
-    public ClockShard(long capacity, long estimatedEntryCharge, bool strict, CacheMetadataChargePolicy policy)
+    public ClockShard(long capacity, long estimatedEntryCharge, bool strict, CacheMetadataChargePolicy policy, int evictionEffortCap)
     {
         _capacity = capacity;
         _strict = strict;
-        _metadataChargePolicy = policy;
+        // SanitizeEvictionEffortCap
+        _evictionEffortCap = (uint)Math.Max(1, evictionEffortCap);
         _lengthBits = CalcHashBits(capacity, estimatedEntryCharge, policy);
         _array = new ClockSlot[1 << _lengthBits];
         for (int i = 0; i < _array.Length; i++) _array[i] = new ClockSlot(this, standalone: false);
         _lengthMask = _array.Length - 1;
         _occupancyLimit = (long)(_array.Length * StrictLoadFactor);
+        // FixedHyperClockTable::FixedHyperClockTable: the table's metadata is charged up front.
+        if (policy == CacheMetadataChargePolicy.FullCharge) _usage = (long)_array.Length * HyperClockCache.SlotMetadataCharge;
     }
+
+    public long EvictionEffortExceededCount => Volatile.Read(ref _evictionEffortExceededCount);
 
     public int TableSize => _array.Length;
     public long Usage => Volatile.Read(ref _usage);
     public long Occupancy => Volatile.Read(ref _occupancy);
 
-    // FixedHyperClockTable::CalcHashBits
-    private static int CalcHashBits(long capacity, long estimatedEntryCharge, CacheMetadataChargePolicy policy)
+    /// <summary>
+    /// Port of FixedHyperClockTable::CalcHashBits. With full metadata charging, for very small estimated value sizes
+    /// the table could overshoot the capacity: the table is shrunk until its metadata fits. The managed port also caps
+    /// the table at 2^28 slots (array size).
+    /// </summary>
+    internal static int CalcHashBits(long capacity, long estimatedEntryCharge, CacheMetadataChargePolicy policy)
     {
         double averageSlotCharge = estimatedEntryCharge * LoadFactor;
-        if (policy == CacheMetadataChargePolicy.FullCharge) averageSlotCharge += LruCache.EntryMetadataCharge;
+        if (policy == CacheMetadataChargePolicy.FullCharge) averageSlotCharge += HyperClockCache.SlotMetadataCharge;
         ulong numSlots = (ulong)(capacity / averageSlotCharge + 0.999999);
-        int hashBits = numSlots <= 1 ? 0 : BitOperations.Log2((numSlots << 1) - 1);
-        return Math.Clamp(hashBits, 1, 28);
+        int hashBits = numSlots == 0 ? 0 : BitOperations.Log2((numSlots << 1) - 1);
+        if (policy == CacheMetadataChargePolicy.FullCharge)
+        {
+            // For very small estimated value sizes, it's possible to overshoot.
+            while (hashBits > 0 && ((ulong)HyperClockCache.SlotMetadataCharge << hashBits) > (ulong)capacity) hashBits--;
+        }
+        return Math.Min(hashBits, 28);
     }
 
     public void SetCapacity(long capacity) => Volatile.Write(ref _capacity, capacity);
 
     public void SetStrictCapacityLimit(bool strict) => Volatile.Write(ref _strict, strict);
-
-    private long MetadataCharge => _metadataChargePolicy == CacheMetadataChargePolicy.FullCharge ? LruCache.EntryMetadataCharge : 0;
 
     // ---- probing ----
 
@@ -371,7 +412,8 @@ internal sealed class ClockShard
     public ClockSlot? Insert(in CacheKey key, ulong h1, ulong h2, in CacheValue value, long charge, CachePriority priority, bool wantHandle)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(charge);
-        long totalCharge = charge + MetadataCharge;
+        // ClockCacheShard::Insert: total_charge = charge (the slot metadata is charged with the table).
+        long totalCharge = charge;
         ulong initialCountdown = priority switch
         {
             CachePriority.High => ClockSlot.HighCountdown,
@@ -562,14 +604,19 @@ internal sealed class ClockShard
         const int stepSize = 4;
         freedCharge = 0;
         freedCount = 0;
+        ulong seenPinnedCount = 0;
         ulong oldClockPointer = unchecked((ulong)Interlocked.Add(ref _clockPointer, stepSize) - stepSize);
+        // Cap the eviction effort at this thread (along with those operating in parallel) circling through the whole
+        // structure kMaxCountdown times.
         ulong maxClockPointer = oldClockPointer + (ClockSlot.MaxCountdown << _lengthBits);
+        // EecAndScl::GetEffectiveEvictionEffortCap: strict_capacity_limit (the top bit) implies an infinite cap.
+        ulong effectiveCap = Volatile.Read(ref _strict) ? _evictionEffortCap | 0x80000000u : _evictionEffortCap;
         while (true)
         {
             for (int i = 0; i < stepSize; i++)
             {
                 ClockSlot h = _array[(int)((oldClockPointer + (ulong)i) & (ulong)_lengthMask)];
-                if (ClockUpdate(h))
+                if (ClockUpdate(h, ref seenPinnedCount))
                 {
                     freedCharge += h.TotalCharge;
                     freedCount++;
@@ -579,18 +626,31 @@ internal sealed class ClockShard
             }
             if (freedCharge >= requestedCharge) return;
             if (oldClockPointer >= maxClockPointer) return;
+            // BaseClockTable::IsEvictionEffortExceeded: the ratio of useful effort to wasted effort is too low, with a
+            // start-up allowance for wasted effort before any useful effort.
+            if (((ulong)freedCount + 1) * effectiveCap <= seenPinnedCount)
+            {
+                Interlocked.Increment(ref _evictionEffortExceededCount);
+                return;
+            }
             oldClockPointer = unchecked((ulong)Interlocked.Add(ref _clockPointer, stepSize) - stepSize);
         }
     }
 
     // ClockUpdate: age unreferenced visible entries; take ownership of expired or invisible unreferenced ones.
-    private static bool ClockUpdate(ClockSlot h)
+    // Referenced (pinned) entries are counted in seenPinnedCount (EvictionData::seen_pinned_count).
+    private static bool ClockUpdate(ClockSlot h, ref ulong seenPinnedCount)
     {
         ulong meta = h.LoadMeta();
         if (((meta >> ClockSlot.StateShift) & ClockSlot.StateShareableBit) == 0) return false;
         ulong acquireCount = (meta >> ClockSlot.AcquireCounterShift) & ClockSlot.CounterMask;
         ulong releaseCount = (meta >> ClockSlot.ReleaseCounterShift) & ClockSlot.CounterMask;
-        if (acquireCount != releaseCount) return false; // referenced
+        if (acquireCount != releaseCount)
+        {
+            // Only clock update entries with no outstanding refs.
+            seenPinnedCount++;
+            return false;
+        }
         if (ClockSlot.State(meta) == ClockSlot.StateVisible && acquireCount > 0)
         {
             // Decrement clock (not aggressively: a failed CAS just means the entry was used).

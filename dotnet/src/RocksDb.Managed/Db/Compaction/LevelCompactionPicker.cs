@@ -15,6 +15,8 @@ internal sealed class LevelCompactionPicker : CompactionPicker
     /// <summary>Round-robin cursors per level (compact_cursor_), carried across versions in memory.</summary>
     public byte[]?[] CompactCursors { get; } = new byte[]?[64];
 
+    protected override byte[]? GetCompactCursor(int level) => (uint)level < (uint)CompactCursors.Length ? CompactCursors[level] : null;
+
     public override bool NeedsCompaction(VersionStorageInfo vstorage)
     {
         if (vstorage.ExpiredTtlFiles.Count > 0) return true;

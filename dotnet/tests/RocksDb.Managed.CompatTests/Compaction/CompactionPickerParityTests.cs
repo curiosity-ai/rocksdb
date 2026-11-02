@@ -140,7 +140,15 @@ public sealed class CompactionPickerParityTests
 
     private static readonly System.Collections.Concurrent.ConcurrentBag<object> s_keepAlive = new();
 
-    private static Run RunNative(string path, int steps, int putsPerStep, ulong keySpace, ulong seed)
+    private static Run RunNative(string path, int steps, int putsPerStep, ulong keySpace, ulong seed) =>
+        RunNative(path, steps, putsPerStep, keySpace, seed, static (_, _) => { });
+
+    /// <summary>
+    /// Native run; <paramref name="configure"/> adjusts the base options (it gets the C options handle for settings
+    /// rocksdb-sharp has no wrapper for, and must keep any native objects it creates alive).
+    /// </summary>
+    private static Run RunNative(string path, int steps, int putsPerStep, ulong keySpace, ulong seed,
+        Action<RocksDbSharp.DbOptions, RocksDbSharp.Native> configure)
     {
         RocksDbSharp.Native native = RocksDbSharp.Native.Instance;
         var table = new RocksDbSharp.BlockBasedTableOptions().SetBlockSize(4096).SetFormatVersion(6)
@@ -154,6 +162,7 @@ public sealed class CompactionPickerParityTests
             .SetLevel0FileNumCompactionTrigger(4)
             .SetBlockBasedTableFactory(table);
         native.rocksdb_options_set_max_background_jobs(options.Handle, 1);
+        configure(options, native);
         s_keepAlive.Add(table);
         s_keepAlive.Add(options);
         var wo = new RocksDbSharp.WriteOptions().DisableWal(1);
@@ -199,7 +208,11 @@ public sealed class CompactionPickerParityTests
         return run;
     }
 
-    private static Run RunManaged(string path, int steps, int putsPerStep, ulong keySpace, ulong seed)
+    private static Run RunManaged(string path, int steps, int putsPerStep, ulong keySpace, ulong seed) =>
+        RunManaged(path, steps, putsPerStep, keySpace, seed, static _ => { });
+
+    /// <summary>Managed run; <paramref name="configure"/> adjusts the base column family options.</summary>
+    private static Run RunManaged(string path, int steps, int putsPerStep, ulong keySpace, ulong seed, Action<ColumnFamilyOptions> configure)
     {
         var cf = new ColumnFamilyOptions
         {
@@ -212,6 +225,7 @@ public sealed class CompactionPickerParityTests
         cf.TableOptions.BlockSize = 4096;
         cf.TableOptions.FormatVersion = 6;
         cf.TableOptions.FilterPolicy = new RocksDb.Managed.Table.Filters.BloomFilterPolicy(10);
+        configure(cf);
         var wo = new WriteOptions { DisableWal = true };
         Run run;
         using (RocksDatabase db = RocksDatabase.Open(path, new DbOptions { CreateIfMissing = true, MaxBackgroundJobs = 1 }, cf))
@@ -311,5 +325,90 @@ public sealed class CompactionPickerParityTests
         }
         double ratio = managed.WriteAmp / native.WriteAmp;
         Assert.IsTrue(ratio is > 0.95 and < 1.05, $"write-amp native {native.WriteAmp:F3} managed {managed.WriteAmp:F3}\n{trace}");
+    }
+    /// <summary>
+    /// Runs the lock-step workload on both engines with the given style configuration and requires identical LSM
+    /// shapes after every step and the same sequence of compactions.
+    /// </summary>
+    private void AssertLockStepParity(string name, int steps, int putsPerStep, ulong keySpace, ulong seed,
+        Action<RocksDbSharp.DbOptions, RocksDbSharp.Native> configureNative, Action<ColumnFamilyOptions> configureManaged)
+    {
+        using var nativeDir = new TempDir(name + "-native");
+        using var managedDir = new TempDir(name + "-managed");
+        Run native = RunNative(nativeDir.Path, steps, putsPerStep, keySpace, seed, configureNative);
+        Run managed = RunManaged(managedDir.Path, steps, putsPerStep, keySpace, seed, configureManaged);
+        string trace = Trace(native, managed, out int firstShape, out int firstCompaction);
+        TestContext.WriteLine(trace);
+        if (Environment.GetEnvironmentVariable("PARITY_TRACE") is { Length: > 0 } traceFile) File.WriteAllText(traceFile + "." + name, trace);
+        Assert.AreEqual(-1, firstShape, "first differing LSM shape\n" + trace);
+        Assert.AreEqual(-1, firstCompaction, "first differing compaction\n" + trace);
+        Assert.IsTrue(native.Compactions.Count > 0, "the workload should compact\n" + trace);
+        double ratio = managed.WriteAmp / native.WriteAmp;
+        Assert.IsTrue(ratio is > 0.98 and < 1.02, $"write-amp native {native.WriteAmp:F3} managed {managed.WriteAmp:F3}\n{trace}");
+    }
+
+    /// <summary>
+    /// Universal compaction (compaction_picker_universal.cc): sorted-run count, size ratio and size amplification
+    /// picking, output levels and trivial-move decisions must match native step by step.
+    /// </summary>
+    [TestMethod]
+    public void LockStepUniversalMatchesNative()
+    {
+        AssertLockStepParity("parity-universal", steps: 40, putsPerStep: 2200, keySpace: 60000, seed: 401,
+            static (o, _) => o.SetCompactionStyle(RocksDbSharp.Compaction.Universal),
+            static cf => cf.CompactionStyle = CompactionStyle.Universal);
+    }
+
+    /// <summary>
+    /// Universal compaction with max_read_amp auto-tuning (0), a larger size ratio and trivial moves: exercises
+    /// GetMaxNumFilesToCompactBasedOnMaxReadAmp, the similar-size stop style is not used by native's default.
+    /// </summary>
+    [TestMethod]
+    public void LockStepUniversalMaxReadAmpMatchesNative()
+    {
+        AssertLockStepParity("parity-universal-readamp", steps: 40, putsPerStep: 2200, keySpace: 60000, seed: 402,
+            static (o, native) =>
+            {
+                o.SetCompactionStyle(RocksDbSharp.Compaction.Universal);
+                IntPtr uco = native.rocksdb_universal_compaction_options_create();
+                native.rocksdb_universal_compaction_options_set_size_ratio(uco, 20);
+                native.rocksdb_universal_compaction_options_set_max_read_amp(uco, 0);
+                native.rocksdb_universal_compaction_options_set_allow_trivial_move(uco, 1);
+                o.SetUniversalCompactionOptions(uco); // copied into the options
+                native.rocksdb_universal_compaction_options_destroy(uco);
+            },
+            static cf =>
+            {
+                cf.CompactionStyle = CompactionStyle.Universal;
+                cf.CompactionOptionsUniversal.SizeRatio = 20;
+                cf.CompactionOptionsUniversal.MaxReadAmp = 0;
+                cf.CompactionOptionsUniversal.AllowTrivialMove = true;
+            });
+    }
+
+    /// <summary>
+    /// FIFO compaction (compaction_picker_fifo.cc) with intra-L0 compaction: size-based deletion of the oldest files
+    /// and cost-based intra-L0 merging must match native step by step.
+    /// </summary>
+    [TestMethod]
+    public void LockStepFifoMatchesNative()
+    {
+        const ulong MaxTableFilesSize = 3 * 1024 * 1024;
+        AssertLockStepParity("parity-fifo", steps: 40, putsPerStep: 2200, keySpace: 60000, seed: 403,
+            static (o, native) =>
+            {
+                o.SetCompactionStyle(RocksDbSharp.Compaction.Fifo);
+                IntPtr fifo = native.rocksdb_fifo_compaction_options_create();
+                native.rocksdb_fifo_compaction_options_set_max_table_files_size(fifo, MaxTableFilesSize);
+                native.rocksdb_fifo_compaction_options_set_allow_compaction(fifo, 1);
+                o.SetFifoCompactionOptions(fifo); // copied into the options
+                native.rocksdb_fifo_compaction_options_destroy(fifo);
+            },
+            static cf =>
+            {
+                cf.CompactionStyle = CompactionStyle.Fifo;
+                cf.CompactionOptionsFifo.MaxTableFilesSize = MaxTableFilesSize;
+                cf.CompactionOptionsFifo.AllowCompaction = true;
+            });
     }
 }
