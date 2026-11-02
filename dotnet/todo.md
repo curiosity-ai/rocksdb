@@ -97,10 +97,18 @@ P = perf + block cache wiring (Table/, Cache/, Memtable/, Util/).
 - [ ] Compaction: leveled (picker + job), universal later; compaction filter; background scheduling
 - [x] Range deletions (DeleteRange) end-to-end (memtable, flush, SST, Get, iterators)
 - [x] Single delete (read path)
-- [ ] TTL (OpenWithTtl)
+- [x] TTL value format + `TtlDatabase` (compatible with native OpenWithTtl)
+- [ ] Wire `TtlCompactionFilter` into compaction; TTL iterator wrapper
+- [ ] Bug: small WriteBufferSize with default ArenaBlockSize trips Debug.Assert in memtable ctor (sanitize like upstream)
 - [x] GetLiveFilesMetadata
-- [ ] Checkpoint, GetUpdatesSince (WAL tailing), IngestExternalFiles, SstFileWriter public API
-- [ ] Read-only and secondary open
+- [x] GetUpdatesSince (`TransactionLogIterator`, `TailUpdatesAsync` signalled by write path, WAL archival, FragmentBufferedLogReader) — identical sequences/bytes to native both ways
+- [x] Checkpoint (hard links via `IFileSystem.LinkFile`), Disable/EnableFileDeletions, GetLiveFiles, GetSortedWalFiles, FlushWal/SyncWal
+- [x] SstFileWriter public API + IngestExternalFiles (level picking, global seqno in MANIFEST) — compat both ways
+- [x] Replication round trip (checkpoint + tail into managed and native replicas)
+- [ ] Ingestion: WriteGlobalSeqno, IngestBehind, overlapping files in one call, running-compaction checks
+- [ ] Port rocksdb-sharp Replication/ layer onto the new API (mapping in phase-2b report: checkpoint seq + TailUpdatesAsync replaces WalTailer)
+- [x] Read-only and secondary open (+TryCatchUpWithPrimary over a live native primary)
+- [ ] Secondary: tail MANIFEST incrementally instead of re-reading
 - [x] GetProperty (subset)
 - [ ] Statistics
 
