@@ -8,6 +8,9 @@ internal readonly record struct ObsoleteTableFile(FileMetaData Meta, ColumnFamil
 /// <summary>A blob file that no live version references any more (VersionSet obsolete_blob_files_ / ObsoleteBlobFileInfo).</summary>
 internal readonly record struct ObsoleteBlobFile(ulong BlobFileNumber, ColumnFamilyData Cfd);
 
+/// <summary>One edit of a VersionSet::LogAndApply batch and the column family it applies to (null for DB-wide edits).</summary>
+internal readonly record struct ManifestEditEntry(ColumnFamilyData? Cfd, VersionEdit Edit);
+
 /// <summary>
 /// The set of column families with their current versions, plus the DB-wide counters persisted in the MANIFEST
 /// (next file number, last sequence, min log number to keep) and the MANIFEST writer. Port of rocksdb::VersionSet
@@ -39,6 +42,9 @@ internal sealed class VersionSet : IAsyncDisposable
     private ulong _versionNumber;
     private ulong _descriptorLastSequence; // last_sequence recorded in the MANIFEST so far (descriptor_last_sequence_), guarded by _manifestLock
     private ManifestLogWriter? _manifestLog;
+    // VersionSet::wals_ (WalSet): WALs tracked in the MANIFEST with track_and_verify_wals_in_manifest. Guarded by the DB mutex.
+    private readonly SortedDictionary<ulong, ulong?> _wals = new();
+    private ulong _minWalNumberToKeep;
     private ManifestWriter? _manifest;
 
     public VersionSet(DbImpl db, IFileSystem fs, string dbname)
@@ -51,6 +57,12 @@ internal sealed class VersionSet : IAsyncDisposable
     public string? DbId { get; set; }
     public uint MaxColumnFamily { get; set; }
     public ulong MinLogNumberToKeep { get; private set; }
+
+    /// <summary>WalSet::GetMinWalNumberToKeep. REQUIRES: DB mutex.</summary>
+    public ulong MinWalNumberToKeep => _minWalNumberToKeep;
+
+    /// <summary>The WALs tracked in the MANIFEST (WalSet::GetWals). REQUIRES: DB mutex.</summary>
+    public IReadOnlyDictionary<ulong, ulong?> TrackedWals => _wals;
     public ulong ManifestFileNumber { get; private set; }
     public ulong PrevLogNumber { get; set; }
     /// <summary>
@@ -267,47 +279,87 @@ internal sealed class VersionSet : IAsyncDisposable
     /// For column family creation the caller passes the new <paramref name="cfd"/>; it is registered after the
     /// MANIFEST write succeeds.
     /// </summary>
-    public async ValueTask LogAndApplyAsync(ColumnFamilyData? cfd, VersionEdit edit, bool synchronous, CancellationToken cancellationToken)
+    public ValueTask LogAndApplyAsync(ColumnFamilyData? cfd, VersionEdit edit, bool synchronous, CancellationToken cancellationToken) =>
+        LogAndApplyAsync([new ManifestEditEntry(cfd, edit)], atomicGroup: false, synchronous, cancellationToken);
+
+    /// <summary>
+    /// Port of the multi-edit form of VersionSet::LogAndApply (one ProcessManifestWrites batch): writes all
+    /// <paramref name="edits"/> to the MANIFEST with a single sync and installs them together. With
+    /// <paramref name="atomicGroup"/> (and more than one edit) they are written as an atomic group, so recovery applies
+    /// all of them or none (used by atomic flushes, e.g. WAL write error recovery). Column family additions and drops
+    /// cannot be batched. At most one edit per column family may change files.
+    /// </summary>
+    public async ValueTask LogAndApplyAsync(IReadOnlyList<ManifestEditEntry> edits, bool atomicGroup, bool synchronous, CancellationToken cancellationToken)
     {
+        int n = edits.Count;
+        if (n == 0) return;
+        if (n > 1)
+        {
+            foreach (ManifestEditEntry e in edits)
+            {
+                if (e.Edit.IsColumnFamilyAdd || e.Edit.IsColumnFamilyDrop) ThrowHelper.InvalidArgument("column family add/drop cannot be batched");
+            }
+        }
         if (synchronous) _manifestLock.Wait(cancellationToken);
         else await _manifestLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             RecoveredVersionState? snapshot = null;
-            FileMetaData[][]? newFiles = null;
-            Blob.BlobFileMetaData[]? newBlobFiles = null;
+            var newFiles = new FileMetaData[n][][];
+            var newBlobFiles = new Blob.BlobFileMetaData[n][];
+            var editList = new VersionEdit[n];
+            var tsSizes = new int[n];
             bool newManifest;
             lock (_db.Mutex)
             {
-                // ProcessManifestWrites: edits of a column family dropped meanwhile are not written (a later edit for a
-                // dropped CF id would make the MANIFEST unrecoverable: "MANIFEST record referencing unknown column family").
-                // The drop itself is applied under _manifestLock, so this check cannot race with it.
-                if (cfd is not null && cfd.Dropped && !edit.IsColumnFamilyAdd)
+                ulong lastSeq = Math.Max(LastSequence, _descriptorLastSequence);
+                for (int i = 0; i < n; i++)
                 {
-                    throw new RocksDbException(StatusCode.ColumnFamilyDropped, "Column family drop: column family " + cfd.Name + " was dropped");
-                }
-                if (edit.IsColumnFamilyAdd)
-                {
-                    edit.MaxColumnFamily = Math.Max(MaxColumnFamily, edit.ColumnFamily);
-                }
-                else if (cfd is not null && !edit.IsColumnFamilyDrop && (edit.NewFiles.Count > 0 || edit.DeletedFiles.Count > 0 ||
-                                                                         edit.BlobFileAdditions.Count > 0 || edit.BlobFileGarbages.Count > 0))
-                {
-                    VersionStorageInfo cur = cfd.Current.Storage;
-                    newFiles = cur.ApplyEdit(edit, cfd.NumLevels);
-                    newBlobFiles = Blob.BlobFileMetaData.Build(cur.BlobFiles, edit, newFiles);
+                    ColumnFamilyData? cfd = edits[i].Cfd;
+                    VersionEdit edit = edits[i].Edit;
+                    editList[i] = edit;
+                    // ProcessManifestWrites: edits of a column family dropped meanwhile are not written (a later edit for
+                    // a dropped CF id would make the MANIFEST unrecoverable: "MANIFEST record referencing unknown column
+                    // family"). The drop itself is applied under _manifestLock, so this check cannot race with it.
+                    if (cfd is not null && cfd.Dropped && !edit.IsColumnFamilyAdd)
+                    {
+                        throw new RocksDbException(StatusCode.ColumnFamilyDropped, "Column family drop: column family " + cfd.Name + " was dropped");
+                    }
+                    if (edit.IsColumnFamilyAdd)
+                    {
+                        edit.MaxColumnFamily = Math.Max(MaxColumnFamily, edit.ColumnFamily);
+                    }
+                    else if (cfd is not null && !edit.IsColumnFamilyDrop && (edit.NewFiles.Count > 0 || edit.DeletedFiles.Count > 0 ||
+                                                                             edit.BlobFileAdditions.Count > 0 || edit.BlobFileGarbages.Count > 0))
+                    {
+                        for (int j = 0; j < i; j++)
+                        {
+                            if (edits[j].Cfd == cfd && newFiles[j] is not null) ThrowHelper.InvalidArgument("two file edits of one column family in a batch");
+                        }
+                        VersionStorageInfo cur = cfd.Current.Storage;
+                        newFiles[i] = cur.ApplyEdit(edit, cfd.NumLevels);
+                        newBlobFiles[i] = Blob.BlobFileMetaData.Build(cur.BlobFiles, edit, newFiles[i]);
+                    }
+                    // WalSet::AddWal fails for a WAL created twice: check before anything is written.
+                    foreach (WalAddition w in edit.WalAdditions)
+                    {
+                        if (w.SyncedSizeInBytes is null && w.LogNumber >= _minWalNumberToKeep && _wals.ContainsKey(w.LogNumber))
+                        {
+                            ThrowHelper.Corruption("WalSet::AddWal: WAL " + w.LogNumber + " is created more than once");
+                        }
+                    }
+                    // Like LogAndApplyHelper: last_sequence never goes backwards and covers the largest seqno of the files
+                    // an edit adds (ingested files are assigned a seqno above the published last sequence, which is only
+                    // advanced after the edit is durable).
+                    if (edit.LastSequence is ulong own && own > lastSeq) lastSeq = own;
+                    tsSizes[i] = TimestampSizeOfEdit(edit);
                 }
                 newManifest = _manifest is null || (ulong)_manifestLog!.Log.File!.Size >= _db.Options.MaxManifestFileSize;
                 if (newManifest)
                 {
                     snapshot = BuildSnapshotState();
                 }
-                // Like ProcessManifestWrites / LogAndApplyHelper: the edit carries next_file_number and a last_sequence that
-                // never goes backwards and covers the largest seqno of the files it adds (ingested files are assigned a
-                // seqno above the published last sequence, which is only advanced after this edit is durable).
-                ulong lastSeq = Math.Max(LastSequence, _descriptorLastSequence);
-                if (edit.LastSequence is ulong own && own > lastSeq) lastSeq = own;
-                edit.LastSequence = lastSeq;
+                for (int i = 0; i < n; i++) editList[i].LastSequence = lastSeq;
                 _descriptorLastSequence = lastSeq;
             }
 
@@ -325,8 +377,9 @@ internal sealed class VersionSet : IAsyncDisposable
                     var writer = new ManifestWriter(newLog);
                     // WriteCurrentStateToManifest (synced at the end).
                     await Await(writer.WriteSnapshotAsync(snapshot, TimestampSizeOfColumnFamily, cancellationToken), synchronous).ConfigureAwait(false);
-                    edit.NextFileNumber = CurrentNextFileNumber;
-                    await Await(writer.AddEditAsync(edit, TimestampSizeOfEdit(edit), sync: true, cancellationToken), synchronous).ConfigureAwait(false);
+                    ulong next = CurrentNextFileNumber;
+                    foreach (VersionEdit e in editList) e.NextFileNumber = next;
+                    await Await(writer.AddEditsAsync(editList, tsSizes, atomicGroup, cancellationToken), synchronous).ConfigureAwait(false);
                     newManifestWritten = true;
                     await Await(FileNames.SetCurrentFileAsync(_fs, _dbname, manifestNumber, syncDirectory: true, cancellationToken), synchronous)
                         .ConfigureAwait(false);
@@ -342,8 +395,9 @@ internal sealed class VersionSet : IAsyncDisposable
                 }
                 else
                 {
-                    edit.NextFileNumber = CurrentNextFileNumber;
-                    await Await(_manifest!.AddEditAsync(edit, TimestampSizeOfEdit(edit), sync: true, cancellationToken), synchronous).ConfigureAwait(false);
+                    ulong next = CurrentNextFileNumber;
+                    foreach (VersionEdit e in editList) e.NextFileNumber = next;
+                    await Await(_manifest!.AddEditsAsync(editList, tsSizes, atomicGroup, cancellationToken), synchronous).ConfigureAwait(false);
                 }
             }
             catch (Exception writeError)
@@ -381,43 +435,52 @@ internal sealed class VersionSet : IAsyncDisposable
             lock (_db.Mutex)
             {
                 InstalledManifest = (ManifestFileNumber, (ulong)_manifestLog!.Log.File!.Size);
-                if (edit.MinLogNumberToKeep is ulong minLog && minLog > MinLogNumberToKeep) MinLogNumberToKeep = minLog;
-                if (edit.IsColumnFamilyAdd)
-                {
-                    if (cfd is not null)
-                    {
-                        if (edit.LogNumber is ulong ln) cfd.LogNumber = ln;
-                        AddColumnFamily(cfd, null);
-                    }
-                }
-                else if (edit.IsColumnFamilyDrop)
-                {
-                    if (cfd is not null)
-                    {
-                        cfd.Dropped = true;
-                        _cfs.Remove(cfd.Id);
-                    }
-                }
-                else if (cfd is not null)
-                {
-                    if (newFiles is not null)
-                    {
-                        var storage = new VersionStorageInfo(cfd.Icmp, newFiles.Length, cfd.Options, newFiles, newBlobFiles ?? []);
-                        InstallVersion(cfd, new DbVersion(cfd, storage, ++_versionNumber));
-                    }
-                    if (edit.LogNumber is ulong ln && ln > cfd.LogNumber) cfd.LogNumber = ln;
-                    if (edit.FullHistoryTsLow is { Length: > 0 } tsLow && (cfd.FullHistoryTsLow is not { } cur
-                        || cfd.UserComparator.CompareTimestamp(tsLow, cur) > 0))
-                    {
-                        // ColumnFamilyData::SetFullHistoryTsLow (only increases).
-                        cfd.FullHistoryTsLow = tsLow;
-                    }
-                }
+                for (int i = 0; i < n; i++) InstallEdit(edits[i].Cfd, editList[i], newFiles[i], newBlobFiles[i]);
             }
         }
         finally
         {
             _manifestLock.Release();
+        }
+    }
+
+    /// <summary>Installs one written edit (the in-memory part of ProcessManifestWrites). REQUIRES: DB mutex.</summary>
+    private void InstallEdit(ColumnFamilyData? cfd, VersionEdit edit, FileMetaData[][]? newFiles, Blob.BlobFileMetaData[]? newBlobFiles)
+    {
+        if (edit.MinLogNumberToKeep is ulong minLog && minLog > MinLogNumberToKeep) MinLogNumberToKeep = minLog;
+        // VersionSet::wals_ (ProcessManifestWrites: AddWals / DeleteWalsBefore after the write succeeded).
+        foreach (WalAddition w in edit.WalAdditions) WalSet.AddWal(_wals, _minWalNumberToKeep, w);
+        if (edit.IsWalDeletion) WalSet.DeleteWalsBefore(_wals, ref _minWalNumberToKeep, edit.WalDeletionBefore);
+        if (edit.IsColumnFamilyAdd)
+        {
+            if (cfd is not null)
+            {
+                if (edit.LogNumber is ulong ln) cfd.LogNumber = ln;
+                AddColumnFamily(cfd, null);
+            }
+        }
+        else if (edit.IsColumnFamilyDrop)
+        {
+            if (cfd is not null)
+            {
+                cfd.Dropped = true;
+                _cfs.Remove(cfd.Id);
+            }
+        }
+        else if (cfd is not null)
+        {
+            if (newFiles is not null)
+            {
+                var storage = new VersionStorageInfo(cfd.Icmp, newFiles.Length, cfd.Options, newFiles, newBlobFiles ?? []);
+                InstallVersion(cfd, new DbVersion(cfd, storage, ++_versionNumber));
+            }
+            if (edit.LogNumber is ulong ln && ln > cfd.LogNumber) cfd.LogNumber = ln;
+            if (edit.FullHistoryTsLow is { Length: > 0 } tsLow && (cfd.FullHistoryTsLow is not { } cur
+                || cfd.UserComparator.CompareTimestamp(tsLow, cur) > 0))
+            {
+                // ColumnFamilyData::SetFullHistoryTsLow (only increases).
+                cfd.FullHistoryTsLow = tsLow;
+            }
         }
     }
 
@@ -451,7 +514,9 @@ internal sealed class VersionSet : IAsyncDisposable
             MaxColumnFamily = MaxColumnFamily,
             MinLogNumberToKeep = MinLogNumberToKeep,
             PrevLogNumber = PrevLogNumber,
+            MinWalNumberToKeep = _minWalNumberToKeep,
         };
+        foreach (KeyValuePair<ulong, ulong?> w in _wals) state.Wals[w.Key] = w.Value;
         state.ColumnFamilies.Clear();
         var ids = new List<uint>(_cfs.Keys);
         ids.Sort();
@@ -504,6 +569,9 @@ internal sealed class VersionSet : IAsyncDisposable
         _lastAllocatedSequence = state.LastSequence;
         _descriptorLastSequence = state.LastSequence;
         ManifestFileNumber = manifestFileNumber;
+        _wals.Clear();
+        foreach (KeyValuePair<ulong, ulong?> w in state.Wals) _wals[w.Key] = w.Value;
+        _minWalNumberToKeep = state.MinWalNumberToKeep;
     }
 
     public async ValueTask DisposeAsync()

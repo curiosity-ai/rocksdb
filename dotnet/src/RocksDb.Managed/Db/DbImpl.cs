@@ -456,6 +456,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         var manifests = new List<ulong>();
         List<(ColumnFamilyData Cfd, ulong Number)>? releasedBlobs = null;
         TestHooks.Invoke("DBImpl::PurgeObsoleteFiles:Start");
+        ulong minLog;
         lock (_mutex)
         {
             // DisableFileDeletions: keep everything queued until deletions are re-enabled (FindObsoleteFiles).
@@ -468,7 +469,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 blobs.RemoveAll(b => _pendingOutputs.Contains(b.BlobFileNumber));
                 releasedBlobs = TakeReleasedBlobDirectWriteFiles();
             }
-            ulong minLog = MinLogNumberToKeepLive();
+            minLog = MinLogNumberToKeepLive();
             for (int i = 0; i < _aliveWals.Count;)
             {
                 ulong n = _aliveWals[i];
@@ -503,6 +504,12 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 TryDeleteFile(FileNames.BlobFileName(DbPaths[0], n));
             }
         }
+        if (wals.Count > 0 && !TryPersistWalDeletion(minLog))
+        {
+            // The MANIFEST still tracks them: keep the WALs until a later purge records their deletion.
+            lock (_mutex) _aliveWals.AddRange(wals);
+            wals.Clear();
+        }
         foreach (ulong n in wals) DeleteOrArchiveWal(n);
         foreach (ulong n in manifests) TryDeleteFile(FileNames.DescriptorFileName(DbName, n));
         PurgeObsoleteWalFiles(force: false);
@@ -517,10 +524,11 @@ internal sealed partial class DbImpl : IAsyncDisposable
         var toDelete = new List<string>();
         var options = new List<(ulong Number, string Path)>();
         var walsToDelete = new List<ulong>();
+        ulong minLog;
         lock (_mutex)
         {
             if (FileDeletionsDisabled || _readOnly) return;
-            ulong minLog = MinLogNumberToKeepLive();
+            minLog = MinLogNumberToKeepLive();
             var dirs = new List<string>(DbPaths);
             if (!dirs.Contains(WalDir)) dirs.Add(WalDir);
             foreach (string dir in dirs)
@@ -563,6 +571,11 @@ internal sealed partial class DbImpl : IAsyncDisposable
         options.Sort(static (a, b) => b.Number.CompareTo(a.Number));
         for (int i = 2; i < options.Count; i++) toDelete.Add(options[i].Path);
         foreach (string p in toDelete) TryDeleteFile(p);
+        if (walsToDelete.Count > 0 && !TryPersistWalDeletion(minLog))
+        {
+            lock (_mutex) _aliveWals.AddRange(walsToDelete);
+            walsToDelete.Clear();
+        }
         foreach (ulong n in walsToDelete) DeleteOrArchiveWal(n);
         PurgeObsoleteWalFiles(force: true);
     }

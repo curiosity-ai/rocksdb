@@ -135,11 +135,24 @@ public sealed class ManifestReplayer
     private readonly List<VersionEdit> _atomicGroup = new();
     private int _atomicGroupSize;
     private bool _hasLogNumber, _hasNextFile, _hasLastSequence;
+    private readonly PointInTimeTracker? _pit;
+
+    /// <summary>Point-in-time replay found missing or corrupted files (VersionEditHandlerPointInTime::HasMissingFiles).</summary>
+    public bool HasMissingFiles => _pit?.HasMissingFiles ?? false;
 
     /// <param name="comparatorResolver">Maps a comparator name to an implementation used to order non-L0 files;
     /// null or an unknown name falls back to bytewise ordering.</param>
-    public ManifestReplayer(Func<string, Comparator?>? comparatorResolver)
+    public ManifestReplayer(Func<string, Comparator?>? comparatorResolver) : this(comparatorResolver, null)
     {
+    }
+
+    /// <param name="comparatorResolver">See <see cref="ManifestReplayer(Func{string, Comparator?}?)"/>.</param>
+    /// <param name="pointInTimeVerifier">When set, replays like VersionEditHandlerPointInTime (best_efforts_recovery): the
+    /// files each edit adds are verified, and every column family ends at its latest point in time whose files are all
+    /// present (or only miss a suffix of the newest L0 files).</param>
+    public ManifestReplayer(Func<string, Comparator?>? comparatorResolver, IRecoveryFileVerifier? pointInTimeVerifier)
+    {
+        _pit = pointInTimeVerifier is null ? null : new PointInTimeTracker(pointInTimeVerifier);
         _comparatorResolver = comparatorResolver;
         // VersionEditHandler::Initialize: the default column family always exists.
         _state.ColumnFamilies[0] = new ColumnFamilyVersion { Id = 0, Name = "default" };
@@ -158,7 +171,9 @@ public sealed class ManifestReplayer
             if (_atomicGroup.Count + edit.RemainingEntries != _atomicGroupSize) ThrowHelper.Corruption("corrupted atomic group");
             if (_atomicGroup.Count == _atomicGroupSize)
             {
+                _pit?.OnAtomicGroupBegin(_state);
                 foreach (VersionEdit e in _atomicGroup) ApplyVersionEdit(e);
+                _pit?.OnAtomicGroupEnd();
                 _atomicGroup.Clear();
                 _atomicGroupSize = 0;
             }
@@ -185,6 +200,7 @@ public sealed class ManifestReplayer
             msg.Append(" entry in MANIFEST");
             ThrowHelper.Corruption(msg.ToString());
         }
+        _pit?.Finish(_state);
         foreach (ColumnFamilyVersion cf in _state.ColumnFamilies.Values)
         {
             SortLevels(cf);
@@ -223,6 +239,7 @@ public sealed class ManifestReplayer
         else if (edit.IsColumnFamilyDrop)
         {
             if (!_state.ColumnFamilies.Remove(edit.ColumnFamily)) ThrowHelper.Corruption("MANIFEST - dropping non-existing column family");
+            _pit?.OnColumnFamilyDrop(edit.ColumnFamily);
         }
         else if (edit.IsWalAddition)
         {
@@ -238,7 +255,9 @@ public sealed class ManifestReplayer
             {
                 ThrowHelper.Corruption("MANIFEST record referencing unknown column family");
             }
+            _pit?.BeforeApply(cf, edit);
             ApplyFileChanges(cf, edit, RecordedTimestampSize(cf));
+            _pit?.AfterApply(cf, edit);
         }
         ExtractInfo(cf, edit);
         EditsApplied++;
@@ -283,36 +302,13 @@ public sealed class ManifestReplayer
         if (edit.CommittedOptionsFileNumber is ulong opts) _state.CommittedOptionsFileNumber = opts;
     }
 
-    // WalSet::AddWal
-    private void AddWal(WalAddition wal)
-    {
-        if (wal.LogNumber < _state.MinWalNumberToKeep) return; // already obsolete
-        if (!_state.Wals.TryGetValue(wal.LogNumber, out ulong? existing))
-        {
-            _state.Wals[wal.LogNumber] = wal.SyncedSizeInBytes;
-            return;
-        }
-        if (wal.SyncedSizeInBytes is not ulong size)
-        {
-            ThrowHelper.Corruption("WalSet::AddWal: WAL " + wal.LogNumber.ToString(CultureInfo.InvariantCulture) + " is created more than once");
-            return;
-        }
-        if (existing is ulong old && size <= old) return; // out-of-order sync records
-        _state.Wals[wal.LogNumber] = size;
-    }
+    private void AddWal(WalAddition wal) => WalSet.AddWal(_state.Wals, _state.MinWalNumberToKeep, wal);
 
-    // WalSet::DeleteWalsBefore
     private void DeleteWalsBefore(ulong number)
     {
-        if (number <= _state.MinWalNumberToKeep) return;
-        _state.MinWalNumberToKeep = number;
-        List<ulong>? remove = null;
-        foreach (ulong n in _state.Wals.Keys)
-        {
-            if (n >= number) break;
-            (remove ??= new()).Add(n);
-        }
-        if (remove is not null) foreach (ulong n in remove) _state.Wals.Remove(n);
+        ulong min = _state.MinWalNumberToKeep;
+        WalSet.DeleteWalsBefore(_state.Wals, ref min, number);
+        _state.MinWalNumberToKeep = min;
     }
 
     /// <summary>Timestamp size of the comparator recorded for <paramref name="cf"/> (0 when unknown or without timestamps).</summary>
@@ -457,7 +453,7 @@ public sealed class ManifestReplayer
         }
     }
 
-    private static int CompareNewestFirst(FileMetaData a, FileMetaData b)
+    internal static int CompareNewestFirst(FileMetaData a, FileMetaData b)
     {
         if (a.EpochNumber != b.EpochNumber) return b.EpochNumber.CompareTo(a.EpochNumber);
         if (a.LargestSeqno != b.LargestSeqno) return b.LargestSeqno.CompareTo(a.LargestSeqno);
@@ -501,6 +497,44 @@ public static class ManifestReader
         string path = FileNames.GetCurrentManifestPath(fs, dbname, out manifestFileNumber);
         using ManifestLogReader reader = ManifestLogReader.Open(fs, path);
         return Recover(reader, comparatorResolver);
+    }
+
+    /// <summary>
+    /// Best-efforts recovery (VersionSet::TryRecover / TryRecoverFromOneManifest, db/version_set.cc): CURRENT is ignored;
+    /// the MANIFEST files in <paramref name="dbname"/> are tried newest first (ManifestPicker) and the first one that
+    /// replays without error gives the state, with every column family at its latest valid point in time
+    /// (<see cref="IRecoveryFileVerifier"/>). Throws Corruption("Cannot locate MANIFEST file in ...") when there is none,
+    /// otherwise the error of the oldest MANIFEST tried.
+    /// </summary>
+    public static RecoveredVersionState TryRecoverPointInTime(IFileSystem fs, string dbname, Func<string, Comparator?>? comparatorResolver,
+        IRecoveryFileVerifier verifier, out ulong manifestFileNumber, out bool hasMissingFiles)
+    {
+        var manifests = new List<ulong>();
+        foreach (string child in fs.GetChildren(dbname))
+        {
+            if (FileNames.TryParseFileName(child, out ulong n, out FileType t) && t == FileType.DescriptorFile) manifests.Add(n);
+        }
+        if (manifests.Count == 0) ThrowHelper.Corruption("Cannot locate MANIFEST file in " + dbname);
+        manifests.Sort(static (a, b) => b.CompareTo(a));
+        Exception? last = null;
+        foreach (ulong n in manifests)
+        {
+            try
+            {
+                using ManifestLogReader reader = ManifestLogReader.Open(fs, FileNames.DescriptorFileName(dbname, n));
+                var replayer = new ManifestReplayer(comparatorResolver, verifier);
+                while (reader.TryReadRecord(out ReadOnlySpan<byte> record)) replayer.Apply(VersionEdit.DecodeFrom(record));
+                RecoveredVersionState state = replayer.Finish();
+                manifestFileNumber = n;
+                hasMissingFiles = replayer.HasMissingFiles;
+                return state;
+            }
+            catch (Exception e) when (e is RocksDbException or IOException)
+            {
+                last = e;
+            }
+        }
+        throw last!;
     }
 
     /// <summary>Decodes all edits of a MANIFEST without replaying them (diagnostics, ldb manifest_dump).</summary>
@@ -604,5 +638,86 @@ public sealed class ManifestWriter
         _buffer.Clear();
         if (!edit.TryEncodeTo(_buffer, timestampSize)) ThrowHelper.Corruption("Unable to Encode VersionEdit:" + edit);
         return _sink.AddRecordAsync(_buffer.WrittenMemory, cancellationToken);
+    }
+
+    /// <summary>
+    /// Appends <paramref name="edits"/> (one record each, encoded with the matching <paramref name="timestampSizes"/>) and
+    /// syncs once at the end, like one ProcessManifestWrites batch. With <paramref name="atomicGroup"/> and more than one
+    /// edit they are marked as an atomic group (kInAtomicGroup with descending remaining-entry counts).
+    /// </summary>
+    public async ValueTask AddEditsAsync(IReadOnlyList<VersionEdit> edits, IReadOnlyList<int> timestampSizes, bool atomicGroup, CancellationToken cancellationToken)
+    {
+        for (int i = 0; i < edits.Count; i++)
+        {
+            if (atomicGroup && edits.Count > 1) edits[i].MarkAtomicGroup((uint)(edits.Count - 1 - i));
+            await AddRecordAsync(edits[i], timestampSizes[i], cancellationToken).ConfigureAwait(false);
+        }
+        await _sink.SyncAsync(cancellationToken).ConfigureAwait(false);
+    }
+}
+
+/// <summary>
+/// Port of rocksdb::WalSet (db/wal_edit.cc): the WALs tracked in the MANIFEST (track_and_verify_wals_in_manifest) as a
+/// map from log number to synced size (null = created, size unknown), plus the minimum WAL number to keep. Shared by
+/// MANIFEST replay (<see cref="ManifestReplayer"/>) and the live <c>VersionSet</c>.
+/// </summary>
+public static class WalSet
+{
+    /// <summary>WalSet::AddWal. Throws Corruption when a WAL without synced size is added twice.</summary>
+    public static void AddWal(SortedDictionary<ulong, ulong?> wals, ulong minWalNumberToKeep, WalAddition wal)
+    {
+        if (wal.LogNumber < minWalNumberToKeep) return; // already obsolete
+        if (!wals.TryGetValue(wal.LogNumber, out ulong? existing))
+        {
+            wals[wal.LogNumber] = wal.SyncedSizeInBytes;
+            return;
+        }
+        if (wal.SyncedSizeInBytes is not ulong size)
+        {
+            ThrowHelper.Corruption("WalSet::AddWal: WAL " + wal.LogNumber.ToString(CultureInfo.InvariantCulture) + " is created more than once");
+            return;
+        }
+        // Edits with different synced sizes of one WAL can be committed out of order: keep the largest.
+        if (existing is ulong old && size <= old) return;
+        wals[wal.LogNumber] = size;
+    }
+
+    /// <summary>WalSet::DeleteWalsBefore.</summary>
+    public static void DeleteWalsBefore(SortedDictionary<ulong, ulong?> wals, ref ulong minWalNumberToKeep, ulong number)
+    {
+        if (number <= minWalNumberToKeep) return;
+        minWalNumberToKeep = number;
+        List<ulong>? remove = null;
+        foreach (ulong n in wals.Keys)
+        {
+            if (n >= number) break;
+            (remove ??= new()).Add(n);
+        }
+        if (remove is not null) foreach (ulong n in remove) wals.Remove(n);
+    }
+
+    /// <summary>
+    /// Port of WalSet::CheckWals: every tracked WAL with a synced size must exist in <paramref name="walsOnDisk"/>
+    /// (number -> path) and be at least that large. WALs without a synced size are skipped (their directory entry may not
+    /// be durable). Throws Corruption with upstream's messages.
+    /// </summary>
+    public static void CheckWals(IReadOnlyDictionary<ulong, ulong?> wals, IReadOnlyDictionary<ulong, string> walsOnDisk, Func<string, long> fileSize)
+    {
+        foreach (KeyValuePair<ulong, ulong?> w in wals)
+        {
+            if (w.Value is not ulong synced) continue;
+            if (!walsOnDisk.TryGetValue(w.Key, out string? path))
+            {
+                ThrowHelper.Corruption("Missing WAL with log number: " + w.Key.ToString(CultureInfo.InvariantCulture) + ".");
+                return;
+            }
+            ulong actual = (ulong)fileSize(path);
+            if (actual < synced)
+            {
+                ThrowHelper.Corruption("Size mismatch: WAL (log number: " + w.Key.ToString(CultureInfo.InvariantCulture) + ") in MANIFEST is " +
+                                       synced.ToString(CultureInfo.InvariantCulture) + " bytes , but actually is " +
+                                       actual.ToString(CultureInfo.InvariantCulture) + " bytes on disk.");
+            }
+        }
     }
 }

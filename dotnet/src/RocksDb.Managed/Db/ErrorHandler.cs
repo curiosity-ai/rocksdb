@@ -719,6 +719,13 @@ internal sealed partial class DbImpl
             }
             try
             {
+                if (walError && Versions.LastAllocatedSequence > Versions.LastSequence)
+                {
+                    // ResumeImpl: the failed WAL write may have reached storage before its sequence range was published.
+                    // Publish the reservation so later writes cannot reuse an ambiguous sequence; the recovery flush
+                    // edits below persist it (their last_sequence covers it).
+                    Versions.SetLastSequence(Versions.LastAllocatedSequence);
+                }
                 foreach (ColumnFamilyData cfd in cfds)
                 {
                     if (cfd.Dropped) continue;
@@ -734,22 +741,44 @@ internal sealed partial class DbImpl
                 ExitUnbatched(w, synchronous: false);
             }
         }
-        foreach (ColumnFamilyData cfd in cfds)
+        var members = new List<ColumnFamilyData>();
+        lock (_mutex)
         {
-            lock (_mutex)
+            foreach (ColumnFamilyData cfd in cfds)
             {
                 if (cfd.Dropped || cfd.FlushRunning || !cfd.HasPendingFlush) continue;
                 cfd.FlushRunning = true;
                 _runningFlushes++;
                 _backgroundJobs++;
-            }
-            await BackgroundFlushAsync(cfd).ConfigureAwait(false);
-            lock (_mutex)
-            {
-                if (ErrorHandler.RecoveryError is { } re) return re;
-                if (_shuttingDown) return new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
+                members.Add(cfd);
             }
         }
+        if (retryOnly)
+        {
+            foreach (ColumnFamilyData cfd in members)
+            {
+                await BackgroundFlushAsync(cfd).ConfigureAwait(false);
+                lock (_mutex)
+                {
+                    if (ErrorHandler.RecoveryError is { } re) return re;
+                    if (_shuttingDown) return new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
+                }
+            }
+            return null;
+        }
+        // FlushAllColumnFamilies with force_atomic_flush: the per-CF flush results (and with them the WAL replay
+        // boundaries) are committed as one MANIFEST atomic group, so a crash in between cannot recover only part of a
+        // write batch that spans column families.
+        var group = new AtomicFlushGroup(this, members);
+        var tasks = new Task[members.Count];
+        for (int i = 0; i < members.Count; i++) tasks[i] = BackgroundFlushAsync(members[i], group);
+        await Task.WhenAll(tasks).ConfigureAwait(false);
+        lock (_mutex)
+        {
+            if (ErrorHandler.RecoveryError is { } re) return re;
+            if (_shuttingDown) return new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
+        }
+        if (group.Completion.IsFaulted) return RocksDbException.FromException(group.Completion.Exception!.InnerException!);
         return null;
     }
 }

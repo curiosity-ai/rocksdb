@@ -83,7 +83,8 @@ internal sealed partial class DbImpl
         }
 
         InitInfoLog();
-        bool exists = FileSystem.FileExists(FileNames.CurrentFilePath(DbName));
+        // Best-efforts recovery ignores CURRENT: any non-empty MANIFEST means the DB exists.
+        bool exists = Options.BestEffortsRecovery ? HasNonEmptyManifest() : FileSystem.FileExists(FileNames.CurrentFilePath(DbName));
         if (!exists)
         {
             if (!Options.CreateIfMissing) ThrowHelper.InvalidArgument(DbName + ": does not exist (create_if_missing is false)");
@@ -96,7 +97,18 @@ internal sealed partial class DbImpl
 
         // ---- MANIFEST (VersionSet::Recover) ----
         SetComparatorResolver(descriptors);
-        RecoveredVersionState state = ManifestReader.RecoverFromDirectory(FileSystem, DbName, _comparatorResolver, out ulong manifestNumber);
+        RecoveredVersionState state;
+        ulong manifestNumber;
+        if (Options.BestEffortsRecovery)
+        {
+            state = ManifestReader.TryRecoverPointInTime(FileSystem, DbName, _comparatorResolver, new RecoveryFileVerifier(this, descriptors), out manifestNumber,
+                out bool hasMissingFiles);
+            if (hasMissingFiles) LogWarn("Best-efforts recovery: some table or blob files are missing or corrupted; recovered to the latest consistent point in time");
+        }
+        else
+        {
+            state = ManifestReader.RecoverFromDirectory(FileSystem, DbName, _comparatorResolver, out manifestNumber);
+        }
         Versions.RecoverFrom(state, manifestNumber);
 
         // Missing descriptors for existing CFs ("Column families not opened").
@@ -154,7 +166,7 @@ internal sealed partial class DbImpl
                 foreach (FileMetaData f in s.LevelFiles(l))
                 {
                     string p = FileNames.TableFileName(DbPaths, f.FileNumber, f.PathId);
-                    if (!FileSystem.FileExists(p)) ThrowHelper.Corruption("IO error: No such file or directory: While open a file for random read: " + p);
+                    if (!Options.BestEffortsRecovery && !FileSystem.FileExists(p)) ThrowHelper.Corruption("IO error: No such file or directory: While open a file for random read: " + p);
                 }
             }
             // The FIFO TTL picker needs the newest key time of every L0 file (upstream: max_open_files = -1 pins every
@@ -168,6 +180,9 @@ internal sealed partial class DbImpl
             }
         }
 
+        // ---- WALs tracked in the MANIFEST (DBImpl::Recover: WalSet::CheckWals) ----
+        VersionEdit? untrackWals = VerifyTrackedWalsAtOpen();
+
         // ---- WAL replay (DBImpl::RecoverLogFiles) ----
         Dictionary<uint, VersionEdit> recoveryEdits = await RecoverLogFilesAsync(synchronous, ct).ConfigureAwait(false);
 
@@ -178,8 +193,10 @@ internal sealed partial class DbImpl
         lock (_mutex)
         {
             _logNumber = newLogNumber;
+            _walTrackingStart = newLogNumber;
             _aliveWals.Add(newLogNumber);
         }
+        if (untrackWals is not null) await Versions.LogAndApplyAsync(null, untrackWals, synchronous, ct).ConfigureAwait(false);
         foreach (ColumnFamilyData cfd in GetColumnFamilies())
         {
             if (!recoveryEdits.TryGetValue(cfd.Id, out VersionEdit? edit))
@@ -440,7 +457,9 @@ internal sealed partial class DbImpl
             }
         }
         wals.Sort();
-        if (wals.Count == 0) return edits;
+        // Best-efforts recovery does not replay WALs (DBImpl::Recover does not list the WAL directory); their numbers are
+        // still marked used, and they become obsolete once the recovery edits advance every column family.
+        if (wals.Count == 0 || Options.BestEffortsRecovery) return edits;
 
         var progress = new ReplayProgress { LastSequence = Versions.LastSequence };
         WalRecoveryMode mode = Options.WalRecoveryMode;

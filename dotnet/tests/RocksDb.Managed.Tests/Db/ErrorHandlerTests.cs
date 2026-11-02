@@ -296,6 +296,51 @@ public sealed class ErrorHandlerTests
         Assert.AreEqual("v-x", GetString(db2.GetColumnFamily("other"), "x"));
     }
 
+    /// <summary>
+    /// ResumeImpl after a WAL write error flushes every column family with force_atomic_flush: the per-CF flush edits are
+    /// one MANIFEST atomic group, and the sequence range of the failed write is reserved (never reused).
+    /// </summary>
+    [TestMethod]
+    public void WalErrorRecoveryFlushEditsAreOneAtomicGroup()
+    {
+        (FaultInjectionFileSystem fs, DbOptions options, ErrorListener listener) = Setup();
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, options))
+        {
+            ColumnFamily cf = db.CreateColumnFamily("other", new ColumnFamilyOptions());
+            Put(db, "a");
+            cf.Put(B("x"), B("v-x"));
+            ulong before = db.GetLatestSequenceNumber();
+            fs.FailMatching(".log", FaultOps.Append, 1, InjectedFaultKind.Retryable);
+            Assert.ThrowsExactly<RocksDbException>(() => Put(db, "lost"));
+            Assert.IsNull(listener.WaitForRecoveryEnd().NewBackgroundError);
+            Assert.AreEqual(before + 1, db.GetLatestSequenceNumber(), "the failed write's sequence is reserved");
+            Put(db, "b");
+            Assert.AreEqual(before + 2, db.GetLatestSequenceNumber());
+        }
+        string manifest = FileNames.GetCurrentManifestPath(fs, DbPath, out _);
+        List<VersionEdit> edits;
+        using (ManifestLogReader r = ManifestLogReader.Open(fs, manifest)) edits = ManifestReader.ReadAllEdits(r);
+        // The recovery flush: one atomic group holding a file edit for each column family that had data.
+        int groupStart = edits.FindIndex(e => e.IsInAtomicGroup);
+        Assert.IsTrue(groupStart >= 0, "no atomic group in the MANIFEST");
+        int size = (int)edits[groupStart].RemainingEntries + 1;
+        Assert.IsTrue(size >= 2);
+        var flushedCfs = new HashSet<uint>();
+        for (int i = groupStart; i < groupStart + size; i++)
+        {
+            Assert.IsTrue(edits[i].IsInAtomicGroup);
+            Assert.AreEqual((uint)(groupStart + size - 1 - i), edits[i].RemainingEntries);
+            if (edits[i].NewFiles.Count > 0) flushedCfs.Add(edits[i].ColumnFamily);
+        }
+        Assert.AreEqual(2, flushedCfs.Count);
+        using RocksDatabase db2 = RocksDatabase.Open(DbPath, new DbOptions { FileSystem = fs },
+            [new ColumnFamilyDescriptor("default", new ColumnFamilyOptions()), new ColumnFamilyDescriptor("other", new ColumnFamilyOptions())]);
+        Assert.AreEqual("v-a", GetString(db2, "a"));
+        Assert.AreEqual("v-b", GetString(db2, "b"));
+        Assert.IsNull(GetString(db2, "lost"));
+        Assert.AreEqual("v-x", GetString(db2.GetColumnFamily("other"), "x"));
+    }
+
     [TestMethod]
     public void WalSyncNoSpaceErrorManualResume()
     {

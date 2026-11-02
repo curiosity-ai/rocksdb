@@ -51,8 +51,15 @@ internal sealed partial class DbImpl
     /// immutable memtables of the CF that are not being flushed into one L0 file, records it in the MANIFEST together
     /// with the CF's new log number, then drops the memtables and deletes obsolete WALs.
     /// </summary>
-    private async Task BackgroundFlushAsync(ColumnFamilyData cfd)
+    private Task BackgroundFlushAsync(ColumnFamilyData cfd) => BackgroundFlushAsync(cfd, null);
+
+    /// <summary>
+    /// <see cref="BackgroundFlushAsync(ColumnFamilyData)"/> as a member of <paramref name="group"/> (an atomic flush:
+    /// the flush result is committed to the MANIFEST together with the other members' results), or alone when null.
+    /// </summary>
+    private async Task BackgroundFlushAsync(ColumnFamilyData cfd, AtomicFlushGroup? group)
     {
+        Exception? failure = null;
         var picked = new List<ImmutableMemTable>();
         ulong fileNumber;
         ulong epoch;
@@ -78,10 +85,13 @@ internal sealed partial class DbImpl
         }
         try
         {
-            if (picked.Count > 0) await FlushMemTablesAsync(cfd, picked, fileNumber, epoch, synchronous: false).ConfigureAwait(false);
+            // SyncClosedWals + ApplyWALToManifest (FlushMemTableToOutputFile): record the synced sizes of closed WALs.
+            await TrackClosedWalsAsync().ConfigureAwait(false);
+            if (picked.Count > 0) await FlushMemTablesAsync(cfd, picked, fileNumber, epoch, synchronous: false, group).ConfigureAwait(false);
         }
         catch (RocksDbException e) when (e.Code == StatusCode.ColumnFamilyDropped || cfd.Dropped)
         {
+            failure = e;
             lock (_mutex)
             {
                 foreach (ImmutableMemTable m in picked) m.FlushInProgress = false;
@@ -90,6 +100,7 @@ internal sealed partial class DbImpl
         }
         catch (Exception e)
         {
+            failure = e;
             lock (_mutex)
             {
                 foreach (ImmutableMemTable m in picked) m.FlushInProgress = false;
@@ -103,6 +114,8 @@ internal sealed partial class DbImpl
         }
         finally
         {
+            // A member that failed or had nothing to flush leaves the atomic flush (a failure fails the whole group).
+            group?.Leave(cfd, failure);
             lock (_mutex)
             {
                 foreach (ImmutableMemTable m in picked)
@@ -135,7 +148,7 @@ internal sealed partial class DbImpl
 
     /// <summary>Builds the L0 file for <paramref name="picked"/> and installs the result (FlushJob::Run + install).</summary>
     private async ValueTask FlushMemTablesAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch,
-        bool synchronous)
+        bool synchronous, AtomicFlushGroup? group)
     {
         TestHooks.Invoke("DBImpl::FlushMemTables:Start");
         long flushStart = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -149,7 +162,7 @@ internal sealed partial class DbImpl
         using Blob.BlobFileBuilder? blobBuilder = CreateBlobFileBuilder(cfd, outputLevel: 0, Blob.BlobFileCreationReason.Flush);
         try
         {
-            await FlushAndInstallAsync(cfd, picked, fileNumber, epoch, synchronous, jobId, flushStart, mems, path, blobBuilder, reason)
+            await FlushAndInstallAsync(cfd, picked, fileNumber, epoch, synchronous, jobId, flushStart, mems, path, blobBuilder, reason, group)
                 .ConfigureAwait(false);
         }
         finally
@@ -160,7 +173,7 @@ internal sealed partial class DbImpl
 
     private async ValueTask FlushAndInstallAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch,
         bool synchronous, int jobId, long flushStart, List<MemTable> mems, string path, Blob.BlobFileBuilder? blobBuilder,
-        FlushReason reason)
+        FlushReason reason, AtomicFlushGroup? group)
     {
         ulong[] snapshots;
         lock (_mutex) snapshots = SnapshotsForCompaction();
@@ -198,25 +211,48 @@ internal sealed partial class DbImpl
         // FlushJob::MaybeIncreaseFullHistoryTsLowToAboveCutoffUDT (written in the flush's own edit instead of a separate
         // MANIFEST record before it; recovery applies both the same way).
         if (GetFullHistoryTsLowAboveCutoffUdt(cfd, mems) is { } newTsLow) edit.FullHistoryTsLow = newTsLow;
+        VersionEdit? walDeletion = null;
         lock (_mutex)
         {
             if (cfd.Dropped) ThrowDropped(cfd);
+            ulong minWalToKeep;
             if (Options.Allow2Pc)
             {
                 // In 2PC mode the WALs holding outstanding prepared sections (or prepared sections of committed data
                 // still in memtables) must survive (PrecomputeMinLogNumberToKeep2PC).
-                edit.MinLogNumberToKeep = PrecomputeMinLogNumberToKeep2PC(cfd, edit.LogNumber.Value, picked);
+                minWalToKeep = PrecomputeMinLogNumberToKeep2PC(cfd, edit.LogNumber.Value, picked);
+                edit.MinLogNumberToKeep = minWalToKeep;
             }
-            else if (Versions.ColumnFamilies.Count > 1)
+            else
             {
-                // PrecomputeMinLogNumberToKeepNon2PC: minimum of the other CFs' log numbers and this edit's.
-                edit.MinLogNumberToKeep = Math.Min(Versions.MinLogNumberWithUnflushedData(cfd), edit.LogNumber.Value);
+                // PrecomputeMinLogNumberToKeepNon2PC: minimum of the other CFs' log numbers and this edit's (an atomic
+                // flush computes it over all its members when it commits).
+                minWalToKeep = Math.Min(Versions.MinLogNumberWithUnflushedData(cfd), edit.LogNumber.Value);
+                if (Versions.ColumnFamilies.Count > 1 && group is null) edit.MinLogNumberToKeep = minWalToKeep;
+            }
+            // GetDBRecoveryEditForObsoletingMemTables: with track_and_verify_wals_in_manifest the WALs the flush makes
+            // obsolete are recorded as deleted in a separate edit of the same MANIFEST write.
+            if (group is null && Options.TrackAndVerifyWalsInManifest && minWalToKeep > Versions.MinWalNumberToKeep)
+            {
+                walDeletion = new VersionEdit { WalDeletionBefore = minWalToKeep };
             }
         }
         TestHooks.Invoke("DBImpl::FlushMemTables:BeforeLogAndApply");
         // From here on a failure may still have made the edit durable: leave the blob files to the obsolete-file scan.
         if (blobBuilder is not null) blobBuilder.Committed = true;
-        await Versions.LogAndApplyAsync(cfd, edit, synchronous, CancellationToken.None).ConfigureAwait(false);
+        if (group is not null)
+        {
+            await group.CommitAsync(cfd, edit).ConfigureAwait(false);
+        }
+        else if (walDeletion is not null)
+        {
+            await Versions.LogAndApplyAsync([new ManifestEditEntry(cfd, edit), new ManifestEditEntry(null, walDeletion)], atomicGroup: false, synchronous,
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        else
+        {
+            await Versions.LogAndApplyAsync(cfd, edit, synchronous, CancellationToken.None).ConfigureAwait(false);
+        }
 
         lock (_mutex)
         {
