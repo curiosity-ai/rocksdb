@@ -94,7 +94,9 @@ P = perf + block cache wiring (Table/, Cache/, Memtable/, Util/).
 - [x] Iterators: MergingIterator, LevelIterator, DBIter, public `Iterator` (+foreach, ScanAsync), `DbIteratorFactory` — matches native exactly on multi-level DB with snapshots/bounds
 - [ ] Iterators: range tombstones in heap (skip deleted ranges), prefix seek, async reverse movement, blob/wide columns
 - [x] Merge: `MergeHelper` (TimedFullMerge, MergeUntil), `UInt64AddOperator`, `StringAppendOperator`; `RangeDelAggregator` (read + compaction w/ snapshot stripes); `CompactionFilter` contract
-- [ ] Compaction: leveled (picker + job), universal later; compaction filter; background scheduling
+- [x] Compaction: leveled (dynamic level bytes, all compaction pris, trivial move, intra-L0, TTL/periodic), CompactionIterator, CompactionJob, scheduling, write stalls + delayed-write token bucket, CompactRange/WaitForCompact, compaction filters (+TTL), universal (size-amp/ratio/count), FIFO (TTL/size/intra-L0)
+- [x] Compat: managed-compacted DB valid & readable natively, native multi-level DB compacted by managed, randomized differential vs native
+- [ ] Compaction gaps: subcompactions, async input reads, compensated size (deletion boost), bottommost files marked for compaction, persist round-robin cursors, universal periodic/delete-triggered/incremental, FIFO temperature/kv-ratio, persist universal/fifo options to OPTIONS, CompactFiles, drop CF waits for running compaction
 - [x] Range deletions (DeleteRange) end-to-end (memtable, flush, SST, Get, iterators)
 - [x] Single delete (read path)
 - [x] TTL value format + `TtlDatabase` (compatible with native OpenWithTtl)
@@ -130,6 +132,14 @@ With block cache (8 MiB both engines, 200k ops, data > cache):
 
 Perf follow-ups: flush is ~2x slower than native and allocates 6 MB; cache-miss read path allocates ~44 B/op;
 HyperClock slots as array-of-structs; single-threaded cached table Get +18% vs plain dictionary.
+
+With compaction (1M ops, 16B/100B, 4MB write buffer, no compression, shared box):
+| | native µs/op | managed µs/op | managed alloc/op |
+|---|---|---|---|
+| fillrandom | 7.12 | 4.06 | 35 B (per-file, not per-key) |
+| readrandom | 15.08 | 8.26 | 8.8 B |
+| overwrite | 6.26 | 3.72 | 75 B |
+Write-amp: fill 3.42 native vs 3.24 managed; overwrite 4.12 vs 4.17.
 
 ## Phase 3 — Compat + performance
 Goal: finish implementation, validate vs C++ source, comprehensive tests (unit/integration/round-trip) and benchmarks (managed vs rocksdb-sharp vs pure C native).
