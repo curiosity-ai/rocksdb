@@ -51,6 +51,8 @@ internal sealed partial class DbImpl
             ValidateColumnFamilies(batch, options?.IgnoreMissingColumnFamilies ?? false);
             if (txn?.MemtableBatch is { } mb) ValidateColumnFamilies(mb, options?.IgnoreMissingColumnFamilies ?? false);
         }
+        Statistics? stats = Options.Statistics;
+        long writeStart = stats?.StartTimer() ?? 0;
         WriteThread.Writer w = WriteThread.Rent(synchronous);
         w.Prepare(batch, options, synchronous);
         w.Txn = txn;
@@ -81,6 +83,7 @@ internal sealed partial class DbImpl
         finally
         {
             WriteThread.Return(w, synchronous);
+            stats?.RecordElapsedMicros(Histogram.DbWrite, writeStart);
         }
     }
 
@@ -285,6 +288,7 @@ internal sealed partial class DbImpl
                 Versions.SetLastSequence(last);
                 NotifySequenceWaiters();
             }
+            RecordWriteGroup(group, total, leader.DisableWal ? 0 : (group.Count == 1 ? leader.Batch!.DataSize : _groupBatch.DataSize), !leader.DisableWal, needSync);
         }
         catch (Exception e)
         {
@@ -321,7 +325,12 @@ internal sealed partial class DbImpl
             }
             _flushScheduler.Clear();
         }
-        if (_maybeStalled) await DelayWriteAsync(noSlowdown, synchronous, cancellationToken).ConfigureAwait(false);
+        if (_maybeStalled)
+        {
+            long stallStart = Stopwatch.GetTimestamp();
+            await DelayWriteAsync(noSlowdown, synchronous, cancellationToken).ConfigureAwait(false);
+            RecordWriteStall(stallStart);
+        }
     }
 
     /// <summary>
@@ -487,8 +496,7 @@ internal sealed partial class DbImpl
         public bool Continue() => true;
         public void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Check(columnFamilyId);
         public void TimedPut(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong writeUnixTime) => Check(columnFamilyId);
-        public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) =>
-            ThrowHelper.NotSupported("PutEntity (wide columns) is not supported yet");
+        public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) => Check(columnFamilyId);
         public void Delete(uint columnFamilyId, ReadOnlySpan<byte> key) => Check(columnFamilyId);
         public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key) => Check(columnFamilyId);
         public void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) => Check(columnFamilyId);
@@ -589,8 +597,15 @@ internal sealed partial class DbImpl
             }
         }
 
-        public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) =>
-            ThrowHelper.NotSupported("PutEntity (wide columns) is not supported yet");
+        public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity)
+        {
+            if (_rebuilding is not null)
+            {
+                _rebuilding.PutEntitySerialized(columnFamilyId, key, entity);
+                return;
+            }
+            Add(columnFamilyId, EntryType.WideColumnEntity, key, entity);
+        }
 
         public void Delete(uint columnFamilyId, ReadOnlySpan<byte> key)
         {

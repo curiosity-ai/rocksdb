@@ -47,7 +47,19 @@ internal sealed class WriteController
         _delayedWriteRate = delayedWriteRate;
     }
 
-    public ulong MaxDelayedWriteRate { get; }
+    public ulong MaxDelayedWriteRate { get; private set; }
+
+    /// <summary>WriteController::set_max_delayed_write_rate (SetDBOptions delayed_write_rate).</summary>
+    public void SetMaxDelayedWriteRate(ulong writeRate)
+    {
+        lock (_lock)
+        {
+            // avoid divide 0
+            if (writeRate == 0) writeRate = 1;
+            MaxDelayedWriteRate = writeRate;
+            Volatile.Write(ref _delayedWriteRate, writeRate);
+        }
+    }
     public ulong DelayedWriteRate => Volatile.Read(ref _delayedWriteRate);
 
     public bool IsStopped => Volatile.Read(ref _totalStopped) > 0;

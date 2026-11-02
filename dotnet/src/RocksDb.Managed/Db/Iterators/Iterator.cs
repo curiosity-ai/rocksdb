@@ -51,20 +51,117 @@ public sealed class Iterator : IDisposable
     /// <summary>Current value. REQUIRES: <see cref="Valid"/>. Valid until the iterator moves.</summary>
     public ReadOnlySpan<byte> Value => _it.Value;
 
+    /// <summary>True if the current entry is a wide-column entity (PutEntity). REQUIRES: <see cref="Valid"/>.</summary>
+    public bool IsEntity => _it.IsEntity;
+
+    private WideColumns? _columns;
+    private Util.PooledBufferWriter? _columnsScratch;
+
+    /// <summary>
+    /// The wide columns of the current entry (Iterator::columns): the entity's columns, or a single default column
+    /// holding <see cref="Value"/> for a plain value. REQUIRES: <see cref="Valid"/>. The returned object is reused and
+    /// refilled on every access; it stays readable after the iterator moves until the next access.
+    /// </summary>
+    public WideColumns Columns
+    {
+        get
+        {
+            WideColumns c = _columns ??= new WideColumns();
+            if (_it.IsEntity)
+            {
+                c.SetSerialized(_it.SerializedEntity);
+            }
+            else
+            {
+                Util.PooledBufferWriter w = _columnsScratch ??= new Util.PooledBufferWriter(64);
+                w.Clear();
+                Db.Wide.WideColumnSerialization.SerializeDefaultColumn(_it.Value, w);
+                c.SetSerialized(w.WrittenSpan);
+            }
+            return c;
+        }
+    }
+
     /// <summary>Sequence number of the snapshot the iterator reads.</summary>
     public ulong Sequence => _it.Sequence;
 
     /// <summary>The user comparator ordering the keys.</summary>
     public Comparator Comparator => _icmp.UserComparator;
 
-    public void SeekToFirst() => _it.SeekToFirst();
-    public void SeekToLast() => _it.SeekToLast();
+    public void SeekToFirst()
+    {
+        long t0 = _stats?.StartTimer() ?? 0;
+        _it.SeekToFirst();
+        if (_stats is not null) RecordSeek(t0);
+    }
+
+    public void SeekToLast()
+    {
+        long t0 = _stats?.StartTimer() ?? 0;
+        _it.SeekToLast();
+        if (_stats is not null) RecordSeek(t0);
+    }
+
     /// <summary>Positions at the first key &gt;= <paramref name="target"/>.</summary>
-    public void Seek(ReadOnlySpan<byte> target) => _it.Seek(target);
+    public void Seek(ReadOnlySpan<byte> target)
+    {
+        long t0 = _stats?.StartTimer() ?? 0;
+        _it.Seek(target);
+        if (_stats is not null) RecordSeek(t0);
+    }
+
     /// <summary>Positions at the last key &lt;= <paramref name="target"/>.</summary>
-    public void SeekForPrev(ReadOnlySpan<byte> target) => _it.SeekForPrev(target);
-    public void Next() => _it.Next();
-    public void Prev() => _it.Prev();
+    public void SeekForPrev(ReadOnlySpan<byte> target)
+    {
+        long t0 = _stats?.StartTimer() ?? 0;
+        _it.SeekForPrev(target);
+        if (_stats is not null) RecordSeek(t0);
+    }
+
+    public void Next()
+    {
+        _it.Next();
+        if (_stats is not null) RecordStep(Ticker.NumberDbNext, Ticker.NumberDbNextFound);
+    }
+
+    public void Prev()
+    {
+        _it.Prev();
+        if (_stats is not null) RecordStep(Ticker.NumberDbPrev, Ticker.NumberDbPrevFound);
+    }
+
+    // ---- statistics (DBIter::Seek / Next / Prev RecordTick calls) ----
+
+    private Statistics? _stats;
+
+    /// <summary>Statistics to record NUMBER_DB_SEEK / NEXT / PREV (+ FOUND), ITER_BYTES_READ and DB_SEEK into.</summary>
+    internal Statistics? Statistics
+    {
+        get => _stats;
+        set
+        {
+            _stats = value;
+            value?.RecordTick(Ticker.NoIteratorCreated);
+        }
+    }
+
+    private void RecordSeek(long startTimestamp)
+    {
+        Statistics st = _stats!;
+        st.RecordElapsedMicros(Histogram.DbSeek, startTimestamp);
+        RecordStep(Ticker.NumberDbSeek, Ticker.NumberDbSeekFound);
+    }
+
+    private void RecordStep(Ticker step, Ticker found)
+    {
+        Statistics st = _stats!;
+        st.RecordTick(step);
+        if (_it.Valid)
+        {
+            st.RecordTick(found);
+            st.RecordTick(Ticker.IterBytesRead, (ulong)(_it.Key.Length + _it.Value.Length));
+        }
+    }
 
     public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) => _it.SeekToFirstAsync(cancellationToken);
     public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default) => _it.SeekToLastAsync(cancellationToken);
@@ -260,6 +357,8 @@ public sealed class Iterator : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _stats?.RecordTick(Ticker.NoIteratorDeleted);
+        _columnsScratch?.Dispose();
         _it.Dispose();
     }
 }

@@ -65,6 +65,8 @@ internal sealed partial class DbImpl
         }
         if (!descriptors.ContainsKey(DefaultColumnFamilyName)) descriptors[DefaultColumnFamilyName] = new ColumnFamilyOptions();
         if (_secondaryPath is not null) FileSystem.CreateDirectoryIfMissing(_secondaryPath);
+        _infoLog = Options.InfoLog; // read-only and secondary instances don't create a LOG file
+        SetComparatorResolver(descriptors);
 
         if (!FileSystem.FileExists(FileNames.CurrentFilePath(DbName)))
         {
@@ -90,10 +92,7 @@ internal sealed partial class DbImpl
                 // Read-only and secondary instances may open a subset of the column families.
                 if (!descriptors.TryGetValue(cf.Name, out ColumnFamilyOptions? cfOptions)) continue;
                 ColumnFamilyOptions opts = PrepareCfOptions(cfOptions);
-                if (cf.ComparatorName is not null && cf.ComparatorName != opts.ComparatorName)
-                {
-                    ThrowHelper.InvalidArgument(opts.ComparatorName + " does not match existing comparator " + cf.ComparatorName);
-                }
+                ValidateRecoveredColumnFamily(cf, opts);
                 var cfd = new ColumnFamilyData(cf.Id, cf.Name, opts, this) { LogNumber = cf.LogNumber };
                 Versions.AddColumnFamily(cfd, ToFileArrays(cf));
                 cfd.RecoverEpochNumbers();
@@ -176,8 +175,7 @@ internal sealed partial class DbImpl
         {
             try
             {
-                return ManifestReader.RecoverFromDirectory(FileSystem, DbName,
-                    static name => Comparator.TryGetBuiltin(name, out Comparator? c) ? c : null, out manifestNumber);
+                return ManifestReader.RecoverFromDirectory(FileSystem, DbName, _comparatorResolver, out manifestNumber);
             }
             catch (RocksDbException) when (_secondary && attempt < 5)
             {

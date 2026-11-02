@@ -535,8 +535,7 @@ internal sealed class PessimisticTransaction : Transaction
         public void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => batch.Put(columnFamilyId, key, value);
         public void TimedPut(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong writeUnixTime) =>
             ThrowHelper.NotSupported("TimedPut in a recovered transaction is not supported");
-        public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) =>
-            ThrowHelper.NotSupported("PutEntity (wide columns) is not supported yet");
+        public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) => batch.PutEntitySerialized(columnFamilyId, key, entity);
         public void Delete(uint columnFamilyId, ReadOnlySpan<byte> key) => batch.Delete(columnFamilyId, key);
         public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key) => batch.SingleDelete(columnFamilyId, key);
         public void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) =>

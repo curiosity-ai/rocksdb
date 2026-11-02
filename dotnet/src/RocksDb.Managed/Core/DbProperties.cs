@@ -12,9 +12,9 @@ public static class DbProperties
 {
     /// <summary>"rocksdb.num-files-at-level&lt;N&gt;" prefix (kNumFilesAtLevelPrefix); see <see cref="NumFilesAtLevel"/>.</summary>
     public const string NumFilesAtLevelPrefix = "rocksdb.num-files-at-level";
-    /// <summary>Multi-line LSM statistics (kStats; the managed port returns the level summary plus compaction totals).</summary>
+    /// <summary>Multi-line statistics (kStats): <see cref="DbStats"/> + <see cref="CfStats"/> + the managed compaction totals.</summary>
     public const string Stats = "rocksdb.stats";
-    /// <summary>Column family statistics (kCFStats; same text as <see cref="Stats"/> in the managed port).</summary>
+    /// <summary>Column family statistics (kCFStats): the per-level compaction table and flush / compaction totals; map form via GetMapProperty.</summary>
     public const string CfStats = "rocksdb.cfstats";
     /// <summary>Files and bytes per level (kLevelStats).</summary>
     public const string LevelStats = "rocksdb.levelstats";
@@ -48,6 +48,49 @@ public static class DbProperties
     public const string ActualDelayedWriteRate = "rocksdb.actual-delayed-write-rate";
     /// <summary>1 if writes are stopped, else 0 (kIsWriteStopped).</summary>
     public const string IsWriteStopped = "rocksdb.is-write-stopped";
+
+    /// <summary>Same as <see cref="CfStats"/> (kCFStatsNoFileHistogram).</summary>
+    public const string CfStatsNoFileHistogram = "rocksdb.cfstats-no-file-histogram";
+    /// <summary>DB-wide write / WAL / stall statistics (kDBStats); map form via GetMapProperty.</summary>
+    public const string DbStats = "rocksdb.dbstats";
+    /// <summary>The files of every level with key ranges and sequence numbers (kSSTables, Version::DebugString).</summary>
+    public const string SsTables = "rocksdb.sstables";
+    /// <summary>Estimated size of the live data (kEstimateLiveDataSize).</summary>
+    public const string EstimateLiveDataSize = "rocksdb.estimate-live-data-size";
+    /// <summary>Approximate size of the active and unflushed immutable memtables (kCurSizeAllMemTables).</summary>
+    public const string CurSizeAllMemTables = "rocksdb.cur-size-all-mem-tables";
+    /// <summary>Approximate size of all memtables (kSizeAllMemTables).</summary>
+    public const string SizeAllMemTables = "rocksdb.size-all-mem-tables";
+    /// <summary>Block cache capacity (kBlockCacheCapacity).</summary>
+    public const string BlockCacheCapacity = "rocksdb.block-cache-capacity";
+    /// <summary>Block cache usage (kBlockCacheUsage).</summary>
+    public const string BlockCacheUsage = "rocksdb.block-cache-usage";
+    /// <summary>Pinned block cache usage (kBlockCachePinnedUsage).</summary>
+    public const string BlockCachePinnedUsage = "rocksdb.block-cache-pinned-usage";
+    /// <summary>Block cache capacity / usage map (kBlockCacheEntryStats, map property; subset).</summary>
+    public const string BlockCacheEntryStats = "rocksdb.block-cache-entry-stats";
+    /// <summary>Number of live versions (kNumLiveVersions).</summary>
+    public const string NumLiveVersions = "rocksdb.num-live-versions";
+    /// <summary>Number of the current super version (kCurrentSuperVersionNumber).</summary>
+    public const string CurrentSuperVersionNumber = "rocksdb.current-super-version-number";
+    /// <summary>Unix time of the oldest snapshot, 0 if none (kOldestSnapshotTime).</summary>
+    public const string OldestSnapshotTime = "rocksdb.oldest-snapshot-time";
+    /// <summary>Sequence number of the oldest snapshot, 0 if none (kOldestSnapshotSequence).</summary>
+    public const string OldestSnapshotSequence = "rocksdb.oldest-snapshot-sequence";
+    /// <summary>Number of running flushes (kNumRunningFlushes).</summary>
+    public const string NumRunningFlushes = "rocksdb.num-running-flushes";
+    /// <summary>1 if a memtable flush is pending (kMemTableFlushPending).</summary>
+    public const string MemTableFlushPending = "rocksdb.mem-table-flush-pending";
+    /// <summary>Delete entries in the unflushed immutable memtables (kNumDeletesImmMemTables).</summary>
+    public const string NumDeletesImmMemTables = "rocksdb.num-deletes-imm-mem-tables";
+    /// <summary>1 if a background error occurred (kBackgroundErrors; the managed port reports 0/1).</summary>
+    public const string BackgroundErrors = "rocksdb.background-errors";
+    /// <summary>Aggregated table properties of all files (kAggregatedTableProperties); map form via GetMapProperty.</summary>
+    public const string AggregatedTableProperties = "rocksdb.aggregated-table-properties";
+    /// <summary>Prefix of the per-level aggregated table properties (kAggregatedTablePropertiesAtLevel).</summary>
+    public const string AggregatedTablePropertiesAtLevelPrefix = "rocksdb.aggregated-table-properties-at-level";
+    /// <summary>The Statistics text, if statistics are enabled (kOptionsStatistics).</summary>
+    public const string OptionsStatistics = "rocksdb.options-statistics";
 
     /// <summary>"rocksdb.num-files-at-level&lt;level&gt;": number of files at <paramref name="level"/>.</summary>
     public static string NumFilesAtLevel(int level)

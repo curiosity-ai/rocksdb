@@ -51,6 +51,7 @@ internal sealed partial class DbImpl
         {
         }
         _groupBatch.Dispose();
+        try { ShutdownMonitoring(); } catch (Exception e) when (e is IOException or RocksDbException) { }
         _dbLock?.Dispose();
         _dbLock = null;
     }
@@ -81,6 +82,7 @@ internal sealed partial class DbImpl
             throw RocksDbException.InvalidArgument(DbName + ": does not exist (create_if_missing is false)");
         }
 
+        InitInfoLog();
         bool exists = FileSystem.FileExists(FileNames.CurrentFilePath(DbName));
         if (!exists)
         {
@@ -93,8 +95,8 @@ internal sealed partial class DbImpl
         }
 
         // ---- MANIFEST (VersionSet::Recover) ----
-        RecoveredVersionState state = ManifestReader.RecoverFromDirectory(FileSystem, DbName,
-            static name => Comparator.TryGetBuiltin(name, out Comparator? c) ? c : null, out ulong manifestNumber);
+        SetComparatorResolver(descriptors);
+        RecoveredVersionState state = ManifestReader.RecoverFromDirectory(FileSystem, DbName, _comparatorResolver, out ulong manifestNumber);
         Versions.RecoverFrom(state, manifestNumber);
 
         // Missing descriptors for existing CFs ("Column families not opened").
@@ -128,10 +130,7 @@ internal sealed partial class DbImpl
             foreach (ColumnFamilyVersion cf in state.ColumnFamilies.Values)
             {
                 ColumnFamilyOptions opts = PrepareCfOptions(descriptors[cf.Name]);
-                if (cf.ComparatorName is not null && cf.ComparatorName != opts.ComparatorName)
-                {
-                    ThrowHelper.InvalidArgument(opts.ComparatorName + " does not match existing comparator " + cf.ComparatorName);
-                }
+                ValidateRecoveredColumnFamily(cf, opts);
                 var cfd = new ColumnFamilyData(cf.Id, cf.Name, opts, this) { LogNumber = cf.LogNumber };
                 var files = new FileMetaData[cf.NumLevels][];
                 for (int l = 0; l < cf.NumLevels; l++)
@@ -197,6 +196,9 @@ internal sealed partial class DbImpl
         DeleteObsoleteFilesFullScan();
         await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
         DeleteObsoleteFilesFullScan();
+        LogOpenSummary();
+        LogInfo("DB pointer " + GetHashCode().ToString("x", CultureInfo.InvariantCulture) + " opened " + DbName);
+        StartStatsDump();
         EnableBackgroundCompactions();
     }
 

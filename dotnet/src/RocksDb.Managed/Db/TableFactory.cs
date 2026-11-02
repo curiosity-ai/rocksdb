@@ -146,6 +146,16 @@ public static class TableFactory
         throw RocksDbException.InvalidArgument("Unknown comparator '" + name + "' (only built-in comparators can be resolved by name)");
     }
 
+    /// <summary>
+    /// The user comparator of a column family: <see cref="ColumnFamilyOptions.Comparator"/>; InvalidArgument when the
+    /// options only name a comparator (parsed from an OPTIONS file) that is not built in.
+    /// </summary>
+    public static Comparator ResolveComparator(ColumnFamilyOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return options.Comparator ?? ResolveComparator(options.ComparatorName);
+    }
+
     /// <summary>Port of GetCompressionFlush (db/db_impl/db_impl.cc), leveled/FIFO styles.</summary>
     public static CompressionType GetCompressionFlush(ColumnFamilyOptions options)
     {
@@ -206,7 +216,7 @@ public static class TableFactory
         if (compression == CompressionType.DisableCompressionOption) compression = CompressionType.None;
         return new TableBuilderOptions
         {
-            Comparator = ResolveComparator(options.ComparatorName),
+            Comparator = ResolveComparator(options),
             CompressionType = compression,
             CompressionOptions = compressionOptions,
             MergeOperatorName = options.MergeOperatorName ?? "nullptr",
@@ -243,7 +253,7 @@ public static class TableFactory
         if (compression == CompressionType.DisableCompressionOption) compression = CompressionType.None;
         return new TableBuilderOptions
         {
-            Comparator = ResolveComparator(options.ComparatorName),
+            Comparator = ResolveComparator(options),
             CompressionType = compression,
             CompressionOptions = compressionOptions,
             MergeOperatorName = options.MergeOperatorName ?? "nullptr",
@@ -273,7 +283,7 @@ public static class TableFactory
         Cache.BlockCache? cache = t.NoBlockCache ? null : (t.BlockCache ?? defaultBlockCache);
         TableReaderOptions r = new()
         {
-            Comparator = ResolveComparator(options.ComparatorName),
+            Comparator = ResolveComparator(options),
             FilterPolicy = format.FilterPolicy,
             VerifyChecksums = format.VerifyChecksums,
             CacheIndexAndFilterBlocks = cache is not null && t.CacheIndexAndFilterBlocks,

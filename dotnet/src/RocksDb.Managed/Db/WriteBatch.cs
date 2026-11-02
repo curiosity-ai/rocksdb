@@ -291,6 +291,33 @@ public sealed class WriteBatch : IDisposable
         return this;
     }
 
+    /// <summary>Stores a wide-column entity in the default column family (see <see cref="PutEntity(uint, ReadOnlySpan{byte}, ReadOnlySpan{WideColumn})"/>).</summary>
+    public WriteBatch PutEntity(ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns) => PutEntity(0, key, columns);
+
+    /// <summary>
+    /// Stores a wide-column entity (WriteBatch::PutEntity): the columns are sorted by name and serialized
+    /// (wide-column format version 1). Duplicate column names fail with Corruption ("Wide columns out of order") like
+    /// upstream. Port of WriteBatchInternal::PutEntity (db/write_batch.cc).
+    /// </summary>
+    public WriteBatch PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns)
+    {
+        WideColumn[] sorted = System.Buffers.ArrayPool<WideColumn>.Shared.Rent(Math.Max(1, columns.Length));
+        PooledBufferWriter entity = ObjectPools.RentWriter();
+        try
+        {
+            columns.CopyTo(sorted);
+            Span<WideColumn> s = sorted.AsSpan(0, columns.Length);
+            Wide.WideColumnSerialization.SortColumns(s);
+            Wide.WideColumnSerialization.Serialize(s, entity);
+            return PutEntitySerialized(columnFamilyId, key, entity.WrittenSpan);
+        }
+        finally
+        {
+            ObjectPools.ReturnWriter(entity);
+            System.Buffers.ArrayPool<WideColumn>.Shared.Return(sorted, clearArray: true);
+        }
+    }
+
     /// <summary>
     /// Put with an associated write time (<c>kTypeValuePreferredSeqno</c>). A write time of <see cref="ulong.MaxValue"/>
     /// means "unknown" and degrades to a plain Put. Port of <c>WriteBatchInternal::TimedPut</c>.

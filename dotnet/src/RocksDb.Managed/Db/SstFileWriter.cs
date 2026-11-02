@@ -65,7 +65,7 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(fileSystem);
         _options = options;
         _fs = fileSystem;
-        _ucmp = TableFactory.ResolveComparator(options.ComparatorName);
+        _ucmp = TableFactory.ResolveComparator(options);
         _icmp = _ucmp.Kind == ComparatorKind.Bytewise ? InternalKeyComparator.Bytewise : new InternalKeyComparator(_ucmp);
         _format = TableFactory.CreateFormatOptions(options.TableOptions);
         _columnFamilyName = columnFamily?.Name ?? "";
