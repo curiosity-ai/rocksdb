@@ -16,4 +16,8 @@
     <ProjectReference Include="..\..\src\RocksDb.Managed\RocksDb.Managed.csproj" />
     <PackageReference Include="RocksDB" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- librocksdb under a .NET 11 apphost: see the file's remarks. -->
+    <Compile Include="..\Shared\NativeStdCxxPreload.cs" Link="NativeStdCxxPreload.cs" />
+  </ItemGroup>
 </Project>
