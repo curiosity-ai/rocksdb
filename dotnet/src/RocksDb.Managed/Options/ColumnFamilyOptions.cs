@@ -21,8 +21,25 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     private CustomizableOption<SliceTransform> _prefixExtractor;
     private CustomizableOption<SliceTransform> _memtableInsertWithHintPrefixExtractor;
 
-    /// <summary>Persisted name of the comparator (comparator option / MANIFEST).</summary>
-    public string ComparatorName { get; set; } = "leveldb.BytewiseComparator";
+    private CustomizableOption<Comparator> _comparator;
+
+    /// <summary>
+    /// The user key comparator (rocksdb::ColumnFamilyOptions::comparator; default <see cref="Managed.Comparator.Bytewise"/>).
+    /// A custom comparator must define a total order, be thread-safe, and keep its <see cref="Managed.Comparator.Name"/>
+    /// and ordering stable for the life of the data: the name is recorded in the MANIFEST, OPTIONS files and table
+    /// properties, and opening an existing column family with a comparator of a different name fails with
+    /// InvalidArgument. Built-in comparators named in a parsed OPTIONS file are recreated; another (custom) name leaves
+    /// this null and is preserved as <see cref="ComparatorName"/> (a DB cannot be opened with such options until the
+    /// comparator object is supplied).
+    /// </summary>
+    public Comparator? Comparator
+    {
+        get => _comparator.Value ?? (_comparator.UnresolvedText is null ? Managed.Comparator.Bytewise : null);
+        set => _comparator.Set(value);
+    }
+
+    /// <summary>Persisted name of the comparator (comparator option / MANIFEST): <see cref="Comparator"/>'s name or an unresolved id.</summary>
+    public string ComparatorName => _comparator.Name(ComparatorId) ?? BytewiseComparator.ClassName;
 
     /// <summary>
     /// The merge operator (thread-safe; used by reads, flush and compaction). Built-ins: <see cref="UInt64AddOperator"/>,
@@ -180,7 +197,8 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public PrepopulateBlobCache PrepopulateBlobCache { get; set; } = PrepopulateBlobCache.Disable;
 
     private static readonly OptionTable<ColumnFamilyOptions> s_table = new OptionTable<ColumnFamilyOptions>()
-        .Name("comparator", static o => o.ComparatorName, static (o, v) => o.ComparatorName = v ?? "leveldb.BytewiseComparator")
+        .Add("comparator", static o => o._comparator.Serialize(ComparatorId) ?? BytewiseComparator.ClassName,
+            static (o, v) => o._comparator.Parse(v, static n => Managed.Comparator.TryGetBuiltin(n, out Comparator? c) ? c : null, ComparatorId))
         .Add("merge_operator", static o => o._mergeOperator.Serialize(MergeOperatorId) ?? "nullptr",
             static (o, v) => o._mergeOperator.Parse(v, Managed.MergeOperator.CreateBuiltin, MergeOperatorId))
         .Add("compaction_filter", static o => o._compactionFilter.Serialize(CompactionFilterId) ?? "nullptr",
@@ -262,6 +280,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .Enum("prepopulate_blob_cache", OptionEnumMaps.PrepopulateBlobCache, static o => o.PrepopulateBlobCache, static (o, v) => o.PrepopulateBlobCache = v);
 
     private static string MergeOperatorId(MergeOperator m) => m.Name;
+    private static string ComparatorId(Comparator c) => c.Name;
     private static string CompactionFilterId(CompactionFilter f) => f.Name;
     private static string CompactionFilterFactoryId(CompactionFilterFactory f) => f.Name;
     private static string SliceTransformId(SliceTransform t) => t.AsString();
@@ -273,6 +292,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     {
         var c = new ColumnFamilyOptions();
         c.CopyFrom(this);
+        c._comparator = _comparator;
         c._mergeOperator = _mergeOperator;
         c._prefixExtractor = _prefixExtractor;
         c._memtableInsertWithHintPrefixExtractor = _memtableInsertWithHintPrefixExtractor;

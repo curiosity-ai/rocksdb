@@ -297,10 +297,12 @@ internal sealed partial class DbImpl
         bool ok = false;
         CompactionJob? job = null;
         Exception? failure = null;
+        long compactionStart = 0;
         try
         {
             CancellationToken ct = _bgCancellation.Token;
             TestHooks.Invoke("DBImpl::RunCompaction:Start");
+            compactionStart = System.Diagnostics.Stopwatch.GetTimestamp();
             ct.ThrowIfCancellationRequested();
             var edit = new VersionEdit { ColumnFamily = cfd.Id };
             if (c.IsDeletionCompaction)
@@ -348,6 +350,7 @@ internal sealed partial class DbImpl
                 Interlocked.Add(ref _statCompactionBytesWritten, (long)job.Stats.BytesWritten);
                 Interlocked.Add(ref _statCompactionMicros, (long)job.Stats.Elapsed.TotalMicroseconds);
             }
+            OnCompactionCompleted(cfd, c, job, NewJobId(), compactionStart);
         }
         catch (OperationCanceledException e)
         {

@@ -19,6 +19,7 @@ internal sealed partial class DbImpl
         ArgumentException.ThrowIfNullOrEmpty(name);
         ArgumentNullException.ThrowIfNull(options);
         ColumnFamilyOptions opts = PrepareCfOptions(options);
+        RegisterComparator(opts);
         WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
         ColumnFamilyData cfd;
         try

@@ -148,7 +148,7 @@ public sealed class TableFactoryTests
     {
         var cf = new ColumnFamilyOptions
         {
-            ComparatorName = "rocksdb.ReverseBytewiseComparator",
+            Comparator = Comparator.ReverseBytewise,
             MergeOperator = new StringAppendOperator(),
             Compression = CompressionType.LZ4,
             BottommostCompression = CompressionType.Zstd,

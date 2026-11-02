@@ -350,9 +350,31 @@ public sealed class MergeHelper : IDisposable
                     ReadOnlySpan<byte> v = iter.Value;
                     TimedFullMerge(_mergeOperator, userKey, true, v[..^sizeof(ulong)], _operands.AsOperands(), _mergeResult);
                 }
-                else if (ikey.Type is EntryType.BlobIndex or EntryType.WideColumnEntity)
+                else if (ikey.Type == EntryType.WideColumnEntity)
                 {
-                    ThrowHelper.NotSupported("merge on top of blob index / wide-column entity");
+                    // TimedFullMergeWithEntity: the operands apply to the default column; the result is the entity with
+                    // that column replaced (kTypeWideColumnEntity).
+                    ReadOnlySpan<byte> entity = iter.Value;
+                    TimedFullMerge(_mergeOperator, userKey, true, Wide.WideColumnSerialization.GetValueOfDefaultColumn(entity), _operands.AsOperands(),
+                        _mergeResult);
+                    PooledBufferWriter merged = ObjectPools.RentWriter();
+                    try
+                    {
+                        Wide.WideColumnSerialization.ReplaceDefaultColumn(entity, _mergeResult.WrittenSpan, merged);
+                        _mergeResult.Clear();
+                        _mergeResult.Write(merged.WrittenSpan);
+                    }
+                    finally
+                    {
+                        ObjectPools.ReturnWriter(merged);
+                    }
+                    StoreSingleResult(EntryType.WideColumnEntity);
+                    iter.Next();
+                    return MergeUntilResult.Ok;
+                }
+                else if (ikey.Type is EntryType.BlobIndex)
+                {
+                    ThrowHelper.NotSupported("merge on top of blob index");
                 }
                 else
                 {
@@ -419,11 +441,13 @@ public sealed class MergeHelper : IDisposable
     }
 
     /// <summary>keys_ = { newest key with type kTypeValue }, operands = { merge result }.</summary>
-    private void StoreSingleResult()
+    private void StoreSingleResult() => StoreSingleResult(EntryType.Value);
+
+    private void StoreSingleResult(EntryType resultType)
     {
         _origKey.SetInternalKey(_keys.GetNewestFirst(0));
         ulong seq = DbFormat.ExtractFooter(_origKey.Key) >> 8;
-        _origKey.UpdateInternalKey(seq, EntryType.Value);
+        _origKey.UpdateInternalKey(seq, resultType);
         _keys.Reset(_origKey.Key);
         _operands.Reset(_mergeResult.WrittenSpan);
     }

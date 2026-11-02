@@ -231,6 +231,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         try
         {
+            if (TryGetExtendedProperty(cfd, sv, property, out string? extendedValue)) return extendedValue;
             if (TryGetCompactionProperty(cfd, sv, property, out string? compactionValue)) return compactionValue;
             switch (property)
             {
@@ -381,7 +382,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             // DisableFileDeletions: keep everything queued until deletions are re-enabled (FindObsoleteFiles).
             if (FileDeletionsDisabled || _readOnly) return;
             Versions.TakeObsoleteFiles(tables);
-            ulong minLog = Versions.MinLogNumberWithUnflushedData(null);
+            ulong minLog = MinLogNumberToKeepLive();
             for (int i = 0; i < _aliveWals.Count;)
             {
                 ulong n = _aliveWals[i];
@@ -417,7 +418,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         lock (_mutex)
         {
             if (FileDeletionsDisabled || _readOnly) return;
-            ulong minLog = Versions.MinLogNumberWithUnflushedData(null);
+            ulong minLog = MinLogNumberToKeepLive();
             var dirs = new List<string>(DbPaths);
             if (!dirs.Contains(WalDir)) dirs.Add(WalDir);
             foreach (string dir in dirs)
@@ -503,6 +504,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         NotifySequenceWaiters(); // wake WAL tailers so they observe the close
         try
         {
+            LogInfo("Shutdown: canceling all background work");
             lock (_mutex)
             {
                 _shuttingDown = true;
@@ -532,6 +534,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             _writeThread.ExitAsLeader();
             WriteThread.Return(w, synchronous);
             _groupBatch.Dispose();
+            try { ShutdownMonitoring(); } catch (Exception e) when (e is IOException or RocksDbException) { }
             _dbLock?.Dispose();
             _dbLock = null;
             if (_secondary) DisposeSecondaryReaders();
@@ -559,6 +562,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             if (m.Mem.Unref()) m.Mem.Dispose();
         }
         cfd.Imm.Clear();
+        ReleaseMemTableHistory(cfd);
     }
 
     public ValueTask DisposeAsync() => CloseAsync(synchronous: false);

@@ -53,6 +53,10 @@ internal sealed class WriteThread
         public bool IsSyncWaiter;
         public Exception? Error;
         public Writer? Next;
+        /// <summary>Transaction extras (callback, memtable batch, prepared-section WAL tracking); null for plain writes.</summary>
+        public TransactionWriteContext? Txn;
+        /// <summary>The write callback failed: the writer is excluded from the WAL record and the memtables.</summary>
+        public bool CallbackFailed;
 
         public void Prepare(WriteBatch? batch, WriteOptions? options, bool syncWaiter)
         {
@@ -64,6 +68,8 @@ internal sealed class WriteThread
             IsSyncWaiter = syncWaiter;
             Error = null;
             Next = null;
+            Txn = null;
+            CallbackFailed = false;
             if (syncWaiter)
             {
                 _syncState = 0;
@@ -154,6 +160,7 @@ internal sealed class WriteThread
             while (_head is { } w)
             {
                 if (w.IsUnbatched) break;
+                if (w.Txn?.Callback is { AllowWriteBatching: false }) break; // dont batch writes that don't want to be batched
                 if (w.Sync && !leader.Sync) break; // Do not include a sync write into a batch handled by a non-sync write.
                 if (w.DisableWal != leader.DisableWal) break;
                 if (w.NoSlowdown != leader.NoSlowdown) break;
@@ -229,6 +236,7 @@ internal sealed class WriteThread
         w.Batch = null;
         w.Error = null;
         w.Next = null;
+        w.Txn = null;
         if (synchronous)
         {
             t_syncWriter = w;

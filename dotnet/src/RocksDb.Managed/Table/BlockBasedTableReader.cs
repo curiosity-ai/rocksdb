@@ -728,6 +728,49 @@ public sealed partial class BlockBasedTableReader : IDisposable
     // Point lookups
 
     /// <summary>
+    /// Port of BlockBasedTable::ApproximateOffsetOf: approximate file offset of the data for <paramref name="internalKey"/>
+    /// (the offset of the data block the index points to, pro-rated over the whole file to account for metadata).
+    /// </summary>
+    public ulong ApproximateOffsetOf(ReadOnlySpan<byte> internalKey)
+    {
+        ulong dataSize = Properties.DataSize;
+        // Hmm. Let's just split in half to avoid skewing one way or another, since we don't know whether we're
+        // operating on lower bound or upper bound.
+        if (dataSize == 0) return (ulong)FileSize / 2;
+        ulong offset = ApproximateDataOffsetOf(internalKey, dataSize);
+        // Pro-rate file metadata (incl filters) size-proportionally across data blocks.
+        double sizeRatio = (double)offset / dataSize;
+        return (ulong)(sizeRatio * FileSize);
+    }
+
+    /// <summary>Port of BlockBasedTable::ApproximateSize: approximate bytes of the data between two internal keys.</summary>
+    public ulong ApproximateSize(ReadOnlySpan<byte> startInternalKey, ReadOnlySpan<byte> endInternalKey)
+    {
+        ulong dataSize = Properties.DataSize;
+        // Hmm. Assume whole file is involved, since we have lower and upper bound.
+        if (dataSize == 0) return (ulong)FileSize;
+        ulong startOffset = ApproximateDataOffsetOf(startInternalKey, dataSize);
+        ulong endOffset = ApproximateDataOffsetOf(endInternalKey, dataSize);
+        double sizeRatio = (double)(endOffset - Math.Min(startOffset, endOffset)) / dataSize;
+        return (ulong)(sizeRatio * FileSize);
+    }
+
+    /// <summary>ApproximateDataOffsetOf: the offset of the data block holding the key, or the data size past the end.</summary>
+    private ulong ApproximateDataOffsetOf(ReadOnlySpan<byte> internalKey, ulong dataSize)
+    {
+        IndexCursor cursor = IndexCursor.Rent(this, TableReadFlags.DontFillCache);
+        try
+        {
+            cursor.Seek(internalKey);
+            return cursor.Valid ? cursor.Handle.Offset : dataSize;
+        }
+        finally
+        {
+            cursor.Return();
+        }
+    }
+
+    /// <summary>
     /// Whether the filter (if any) says <paramref name="userKey"/> may be present (looked up as of the latest sequence
     /// number). See <see cref="InternalKeyMayMatch(ReadOnlySpan{byte}, TableReadFlags)"/>.
     /// </summary>

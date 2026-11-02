@@ -19,6 +19,18 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     public Env.IFileSystem FileSystem { get; set; } = Env.LocalFileSystem.Instance;
     /// <summary>Additional data paths (path, target size) for SST files. Not persisted.</summary>
     public List<(string Path, ulong TargetSize)> DbPaths { get; } = new();
+    /// <summary>
+    /// Statistics collector (rocksdb::DBOptions::statistics): tickers and histograms recorded by the DB; null (the default)
+    /// disables statistics. One instance may be shared by several DBs. Not persisted.
+    /// </summary>
+    public Statistics? Statistics { get; set; }
+    /// <summary>
+    /// Receiver of the DB's informational log (rocksdb::DBOptions::info_log). Null (the default) makes the DB write its
+    /// own <c>LOG</c> file in the DB directory (or <see cref="DbLogDir"/>), rolled per <see cref="MaxLogFileSize"/> /
+    /// <see cref="LogFileTimeToRoll"/> and trimmed to <see cref="KeepLogFileNum"/> old files. A supplied logger is not
+    /// disposed by the DB. Not persisted.
+    /// </summary>
+    public InfoLogger? InfoLog { get; set; }
 
     // ---- persisted ---------------------------------------------------------------------------
     public bool CreateIfMissing { get; set; }
@@ -180,7 +192,7 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
 
     public DbOptions Clone()
     {
-        var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir, FileSystem = FileSystem };
+        var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir, FileSystem = FileSystem, Statistics = Statistics, InfoLog = InfoLog };
         c.DbPaths.AddRange(DbPaths);
         c.CopyFrom(this);
         return c;

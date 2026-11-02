@@ -59,6 +59,8 @@ public sealed class DbIter : IDisposable
     private readonly PooledBufferWriter _seekKey = new(64);
     private readonly PooledBufferWriter _pinned = new(128);
     private readonly PooledBufferWriter _mergeResult = new(128);
+    private PooledBufferWriter? _mergedEntity;      // entity produced by a merge on top of a wide-column entity
+    private bool _valueIsEntity;                    // the current value is a wide-column entity (Value = its default column)
     private readonly MergeOperandBuffer _operands = new();
 
     private bool _valid;
@@ -151,14 +153,29 @@ public sealed class DbIter : IDisposable
             Debug.Assert(_valid);
             switch (_valueSource)
             {
-                case ValueSource.Iter: return _iter.Value;
+                case ValueSource.Iter: return _valueIsEntity ? Wide.WideColumnSerialization.GetValueOfDefaultColumn(_iter.Value) : _iter.Value;
                 case ValueSource.IterPacked: return ParsePackedValueForValue(_iter.Value);
-                case ValueSource.Pinned: return _pinned.WrittenSpan;
+                case ValueSource.Pinned: return _valueIsEntity ? Wide.WideColumnSerialization.GetValueOfDefaultColumn(_pinned.WrittenSpan) : _pinned.WrittenSpan;
                 case ValueSource.Merged: return _mergeResult.WrittenSpan;
                 default: return ReadOnlySpan<byte>.Empty;
             }
         }
     }
+
+    /// <summary>
+    /// True if the current entry is a wide-column entity (written with PutEntity); <see cref="Value"/> is then the value
+    /// of its default column and <see cref="SerializedEntity"/> holds all columns. REQUIRES: <see cref="Valid"/>.
+    /// </summary>
+    public bool IsEntity => _valueIsEntity;
+
+    /// <summary>The serialized wide-column entity of the current entry. REQUIRES: <see cref="IsEntity"/>.</summary>
+    public ReadOnlySpan<byte> SerializedEntity => _valueSource switch
+    {
+        ValueSource.Iter => _iter.Value,
+        ValueSource.Pinned => _pinned.WrittenSpan,
+        ValueSource.Merged => _mergedEntity!.WrittenSpan,
+        _ => default,
+    };
 
     /// <summary>The internal key comparator (its user comparator orders <see cref="Key"/>).</summary>
     public InternalKeyComparator Comparator => _icmp;
@@ -204,7 +221,7 @@ public sealed class DbIter : IDisposable
     private void ThrowNotSupportedType(EntryType type)
     {
         _valid = false;
-        ThrowHelper.NotSupported(type == EntryType.BlobIndex ? "blob values are not supported by the iterator yet" : "wide-column entities are not supported by the iterator yet");
+        ThrowHelper.NotSupported("blob values are not supported by the iterator yet (entry type " + ((int)type).ToString(System.Globalization.CultureInfo.InvariantCulture) + ")");
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -266,6 +283,7 @@ public sealed class DbIter : IDisposable
         _merging = false;
         _currentEntryIsMerged = false;
         _valueSource = ValueSource.None;
+        _valueIsEntity = false;
     }
 
     private void MergeWithNoBaseValue()
@@ -274,6 +292,7 @@ public sealed class DbIter : IDisposable
         _mergeResult.Clear();
         MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, false, default, _operands.AsOperands(), _mergeResult);
         _valueSource = ValueSource.Merged;
+        _valueIsEntity = false;
         _valid = true;
     }
 
@@ -283,6 +302,25 @@ public sealed class DbIter : IDisposable
         _mergeResult.Clear();
         MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, true, value, _operands.AsOperands(), _mergeResult);
         _valueSource = ValueSource.Merged;
+        _valueIsEntity = false;
+        _valid = true;
+    }
+
+    /// <summary>
+    /// Port of DBIter::MergeWithWideColumnBaseValue: the operands are applied to the entity's default column; the result
+    /// is the entity with that column replaced (Value = the merged default column).
+    /// </summary>
+    private void MergeWithEntityBaseValue(ReadOnlySpan<byte> entity)
+    {
+        _valid = false;
+        _mergeResult.Clear();
+        MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, true, Wide.WideColumnSerialization.GetValueOfDefaultColumn(entity),
+            _operands.AsOperands(), _mergeResult);
+        _mergedEntity ??= new PooledBufferWriter(128);
+        _mergedEntity.Clear();
+        Wide.WideColumnSerialization.ReplaceDefaultColumn(entity, _mergeResult.WrittenSpan, _mergedEntity);
+        _valueSource = ValueSource.Merged;
+        _valueIsEntity = true;
         _valid = true;
     }
 
@@ -356,8 +394,9 @@ public sealed class DbIter : IDisposable
                             _skipping = true;
                             break;
                         }
-                        if (type is EntryType.BlobIndex or EntryType.WideColumnEntity) ThrowNotSupportedType(type);
+                        if (type is EntryType.BlobIndex) ThrowNotSupportedType(type);
                         _valueSource = type == EntryType.ValuePreferredSeqno ? ValueSource.IterPacked : ValueSource.Iter;
+                        _valueIsEntity = type == EntryType.WideColumnEntity;
                         _valid = true;
                         return StepAction.Done;
                     case EntryType.Merge:
@@ -474,8 +513,13 @@ public sealed class DbIter : IDisposable
                     MergeWithNoBaseValue();
                     return StepAction.NextThenDone;
                 }
-                ThrowNotSupportedType(type);
-                return StepAction.Done;
+                if (type == EntryType.BlobIndex)
+                {
+                    ThrowNotSupportedType(type);
+                    return StepAction.Done;
+                }
+                MergeWithEntityBaseValue(_iter.Value);
+                return StepAction.NextThenDone;
             default:
                 _merging = false;
                 ThrowUnknownType(type);
@@ -925,7 +969,7 @@ public sealed class DbIter : IDisposable
                         _operands.Clear();
                         break;
                     }
-                    if (type is EntryType.BlobIndex or EntryType.WideColumnEntity) ThrowNotSupportedType(type);
+                    if (type is EntryType.BlobIndex) ThrowNotSupportedType(type);
                     // The child iterator moves on: keep a copy (upstream pins the block instead).
                     ReadOnlySpan<byte> v = _iter.Value;
                     _pinned.Clear();
@@ -976,10 +1020,12 @@ public sealed class DbIter : IDisposable
             case EntryType.Merge:
                 _currentEntryIsMerged = true;
                 if (lastNotMergeType is EntryType.Value or EntryType.ValuePreferredSeqno) MergeWithPlainBaseValue(_pinned.WrittenSpan);
+                else if (lastNotMergeType == EntryType.WideColumnEntity) MergeWithEntityBaseValue(_pinned.WrittenSpan);
                 else MergeWithNoBaseValue();
                 return;
-            default: // Value / ValuePreferredSeqno
+            default: // Value / ValuePreferredSeqno / WideColumnEntity
                 _valueSource = ValueSource.Pinned;
+                _valueIsEntity = lastKeyEntryType == EntryType.WideColumnEntity;
                 _valid = true;
                 return;
         }
@@ -1022,16 +1068,17 @@ public sealed class DbIter : IDisposable
             _valid = false;
             return;
         }
-        if (type is EntryType.Value or EntryType.ValuePreferredSeqno)
+        if (type is EntryType.Value or EntryType.ValuePreferredSeqno or EntryType.WideColumnEntity)
         {
             ReadOnlySpan<byte> v = _iter.Value;
             _pinned.Clear();
             _pinned.Write(type == EntryType.ValuePreferredSeqno ? ParsePackedValueForValue(v) : v);
             _valueSource = ValueSource.Pinned;
+            _valueIsEntity = type == EntryType.WideColumnEntity;
             _valid = true;
             return;
         }
-        if (type is EntryType.BlobIndex or EntryType.WideColumnEntity) ThrowNotSupportedType(type);
+        if (type is EntryType.BlobIndex) ThrowNotSupportedType(type);
         if (type != EntryType.Merge) ThrowUnknownType(type);
 
         // kTypeMerge. We need to collect all kTypeMerge values and save them in operands.
@@ -1061,7 +1108,12 @@ public sealed class DbIter : IDisposable
                 _operands.PushOlder(_iter.Value);
                 continue;
             }
-            if (type is EntryType.BlobIndex or EntryType.WideColumnEntity) ThrowNotSupportedType(type);
+            if (type == EntryType.WideColumnEntity)
+            {
+                MergeWithEntityBaseValue(_iter.Value);
+                return;
+            }
+            if (type is EntryType.BlobIndex) ThrowNotSupportedType(type);
             ThrowUnknownType(type);
         }
 

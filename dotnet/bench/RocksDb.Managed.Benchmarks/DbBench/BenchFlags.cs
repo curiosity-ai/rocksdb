@@ -32,6 +32,10 @@ public enum DbBenchmark
     Compact,
     WaitForCompaction,
     Stats,
+    /// <summary>Optimistic transactions of --txn_puts random puts each (separate OptimisticTransactionDB).</summary>
+    TxnOptimistic,
+    /// <summary>Pessimistic (WriteCommitted TransactionDB) transactions of --txn_puts random puts each.</summary>
+    TxnPessimistic,
 }
 
 /// <summary>Block cache implementation (--cache_type).</summary>
@@ -54,6 +58,7 @@ public static class BenchFlags
         ("multireadrandom", DbBenchmark.MultiReadRandom), ("readwhilewriting", DbBenchmark.ReadWhileWriting),
         ("deleterandom", DbBenchmark.DeleteRandom), ("flush", DbBenchmark.Flush), ("compact", DbBenchmark.Compact),
         ("waitforcompaction", DbBenchmark.WaitForCompaction), ("stats", DbBenchmark.Stats),
+        ("txnoptimistic", DbBenchmark.TxnOptimistic), ("txnpessimistic", DbBenchmark.TxnPessimistic),
     ];
 
     /// <summary>All benchmark names, in the order of <see cref="DbBenchmark"/>.</summary>

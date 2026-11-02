@@ -74,11 +74,12 @@ internal sealed class ColumnFamilyData
         Id = id;
         Name = name;
         Options = options;
-        Comparator ucmp = TableFactory.ResolveComparator(options.ComparatorName);
+        Comparator ucmp = TableFactory.ResolveComparator(options);
         Icmp = ucmp.Kind == ComparatorKind.Bytewise ? InternalKeyComparator.Bytewise : new InternalKeyComparator(ucmp);
         MergeOperator = options.MergeOperator;
         Format = TableFactory.CreateFormatOptions(options.TableOptions);
         ReaderOptions = TableFactory.CreateReaderOptions(options, Format, db.GetDefaultBlockCache(options.TableOptions), db.Identity.SessionId);
+        if (db.Options.Statistics is { } statistics) ReaderOptions = ReaderOptions with { Statistics = statistics.BlockCacheCounters };
         NumLevels = Math.Max(1, options.NumLevels);
         MemOptions = new MemTableOptions
         {
@@ -87,7 +88,14 @@ internal sealed class ColumnFamilyData
         };
         TableCache = new TableCache(db.FileSystem, db.DbPaths, ReaderOptions, db.Options.MaxOpenFiles);
         CompactionState = new ColumnFamilyCompactionState(options, Icmp);
+        Stats = new InternalStats(NumLevels);
     }
+
+    /// <summary>Versions of this column family still referenced ("rocksdb.num-live-versions"). Guarded by the DB mutex.</summary>
+    public int LiveVersions;
+
+    /// <summary>Cumulative flush / compaction statistics ("rocksdb.cfstats").</summary>
+    public InternalStats Stats { get; }
 
     public uint Id { get; }
     public string Name { get; }
@@ -109,6 +117,11 @@ internal sealed class ColumnFamilyData
     public MemTable Mem { get; set; } = null!;
     /// <summary>Immutable memtables, oldest first.</summary>
     public List<ImmutableMemTable> Imm { get; } = new();
+    /// <summary>
+    /// Flushed memtables kept for transaction conflict checking (MemTableList history,
+    /// max_write_buffer_size_to_maintain), oldest first; each holds a reference. Guarded by the DB mutex.
+    /// </summary>
+    public List<MemTable> History { get; } = new();
     public DbVersion Current { get; set; } = null!;
     private SuperVersion? _super;
     public SuperVersion Super => Volatile.Read(ref _super)!;

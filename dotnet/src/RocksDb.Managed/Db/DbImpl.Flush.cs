@@ -3,7 +3,7 @@ namespace RocksDb.Managed.Db;
 internal sealed partial class DbImpl
 {
     private readonly Queue<ColumnFamilyData> _flushQueue = new(); // guarded by mutex
-    private readonly int _maxBackgroundFlushes;
+    private int _maxBackgroundFlushes; // changed by SetDBOptions under the mutex
     private int _runningFlushes;   // guarded by mutex
     private int _backgroundJobs;   // guarded by mutex
     private bool _shuttingDown;    // guarded by mutex
@@ -122,8 +122,11 @@ internal sealed partial class DbImpl
     private async ValueTask FlushMemTablesAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch, bool synchronous)
     {
         TestHooks.Invoke("DBImpl::FlushMemTables:Start");
+        long flushStart = System.Diagnostics.Stopwatch.GetTimestamp();
+        int jobId = NewJobId();
         var mems = new List<MemTable>(picked.Count);
         foreach (ImmutableMemTable m in picked) mems.Add(m.Mem);
+        OnFlushStarted(cfd, jobId, mems);
         string path = FileNames.TableFileName(DbPaths, fileNumber, 0);
         FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, mems, fileNumber, epoch, Identity, synchronous, CancellationToken.None)
             .ConfigureAwait(false);
@@ -144,7 +147,13 @@ internal sealed partial class DbImpl
         lock (_mutex)
         {
             if (cfd.Dropped) ThrowDropped(cfd);
-            if (Versions.ColumnFamilies.Count > 1)
+            if (Options.Allow2Pc)
+            {
+                // In 2PC mode the WALs holding outstanding prepared sections (or prepared sections of committed data
+                // still in memtables) must survive (PrecomputeMinLogNumberToKeep2PC).
+                edit.MinLogNumberToKeep = PrecomputeMinLogNumberToKeep2PC(cfd, edit.LogNumber.Value, picked);
+            }
+            else if (Versions.ColumnFamilies.Count > 1)
             {
                 // PrecomputeMinLogNumberToKeepNon2PC: minimum of the other CFs' log numbers and this edit's.
                 edit.MinLogNumberToKeep = Math.Min(Versions.MinLogNumberWithUnflushedData(cfd), edit.LogNumber.Value);
@@ -159,12 +168,13 @@ internal sealed partial class DbImpl
             {
                 m.FlushCompleted = true;
                 // A drop that committed right after our MANIFEST write already released the list's references.
-                if (cfd.Imm.Remove(m) && m.Mem.Unref()) m.Mem.Dispose();
+                if (cfd.Imm.Remove(m)) RetireFlushedMemTable(cfd, m.Mem);
             }
             if (cfd.Dropped) return;
             InstallSuperVersion(cfd);
             _maybeStalled = IsWriteStalled();
         }
+        OnFlushCompleted(cfd, jobId, meta, flushStart);
     }
 
     /// <summary>

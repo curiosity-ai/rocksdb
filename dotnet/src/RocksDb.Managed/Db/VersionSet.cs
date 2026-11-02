@@ -124,6 +124,7 @@ internal sealed class VersionSet : IAsyncDisposable
     {
         RefFiles(v);
         v.Ref();
+        cfd.LiveVersions++;
         DbVersion? old = cfd.Current;
         cfd.Current = v;
         if (old is not null) UnrefVersion(old);
@@ -145,6 +146,7 @@ internal sealed class VersionSet : IAsyncDisposable
     public void UnrefVersion(DbVersion v)
     {
         if (!v.Unref()) return;
+        v.Cfd.LiveVersions--;
         VersionStorageInfo s = v.Storage;
         for (int l = 0; l < s.NumLevels; l++)
         {
