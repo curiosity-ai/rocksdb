@@ -499,4 +499,65 @@ public sealed class CompactionFeatureTests
         for (it.SeekToFirst(); it.Valid; it.Next()) n++;
         return n;
     }
+    // ---- CompactRange first-level selection (DBImpl::CompactRangeInternal, Version::OverlapWithLevelIterator) --------
+
+    /// <summary>One L0 file with the keys "001" and "111"; CompactRange("011", "101") with an optional partitioner.</summary>
+    private static List<LiveFileMetadata> CompactRangeInsideFileGap(SstPartitionerFactory? partitioner, string begin, string end)
+    {
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cf = Leveled();
+        cf.SstPartitionerFactory = partitioner;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cf);
+        db.Put(B("001"), B("a"));
+        db.Put(B("111"), B("b"));
+        db.Flush();
+        db.CompactRange(B(begin), B(end));
+        Assert.AreEqual("a", GetString(db, "001"));
+        Assert.AreEqual("b", GetString(db, "111"));
+        return db.GetLiveFilesMetadata();
+    }
+
+    [TestMethod]
+    public void CompactRangeChecksKeysWithinFiles()
+    {
+        // No key of the file is inside ["011", "101"]: nothing is compacted (the file range alone overlaps).
+        List<LiveFileMetadata> files = CompactRangeInsideFileGap(null, "011", "101");
+        Assert.AreEqual(1, files.Count);
+        Assert.AreEqual(0, files[0].Level);
+        // A range holding a key compacts the file.
+        files = CompactRangeInsideFileGap(null, "100", "200");
+        Assert.AreEqual(1, files.Count);
+        Assert.AreNotEqual(0, files[0].Level);
+    }
+
+    [TestMethod]
+    public void CompactRangeWithPartitionBoundaryInRangeUsesFileOverlap()
+    {
+        // The range contains the partition boundary between prefixes "0" and "1": the file straddling it is compacted
+        // although none of its keys is inside the range (moved to the last level: Compaction::IsTrivialMove does not
+        // consult the partitioner for the last level).
+        List<LiveFileMetadata> files = CompactRangeInsideFileGap(new SstPartitionerFixedPrefixFactory(1), "011", "101");
+        Assert.AreEqual(1, files.Count);
+        foreach (LiveFileMetadata f in files) Assert.AreNotEqual(0, f.Level);
+        // No boundary inside ["011", "055"]: keys within the file are checked, nothing to compact.
+        files = CompactRangeInsideFileGap(new SstPartitionerFixedPrefixFactory(1), "011", "055");
+        Assert.AreEqual(1, files.Count);
+        Assert.AreEqual(0, files[0].Level);
+    }
+
+    [TestMethod]
+    public void CompactRangeSeesRangeTombstonesWithinFiles()
+    {
+        // A range tombstone inside the range counts as overlap (RangeDelAggregator::IsRangeOverlapped).
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), Leveled());
+        db.Put(B("001"), B("a"));
+        db.Put(B("111"), B("b"));
+        db.DeleteRange(B("050"), B("060"));
+        db.Flush();
+        db.CompactRange(B("011"), B("101"));
+        List<LiveFileMetadata> files = db.GetLiveFilesMetadata();
+        Assert.AreEqual(1, files.Count);
+        Assert.AreNotEqual(0, files[0].Level);
+    }
 }

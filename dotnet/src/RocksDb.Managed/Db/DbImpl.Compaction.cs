@@ -365,6 +365,52 @@ internal sealed partial class DbImpl
         }
     }
 
+    /// <summary>
+    /// Port of Version::OverlapWithLevelIterator + OverlapWithIterator (db/version_set.cc): does <paramref name="level"/>
+    /// hold a key (or a range tombstone) in the user key range [<paramref name="smallestUserKey"/>,
+    /// <paramref name="largestUserKey"/>]? L0: every file whose range overlaps is searched; sorted levels: the first key
+    /// at or after the start decides, like a LevelIterator seek (empty files are skipped). Tombstones of the visited
+    /// files are checked afterwards (RangeDelAggregator::IsRangeOverlapped). Returns false when a file cannot be read,
+    /// so the caller falls back to file metadata.
+    /// </summary>
+    private static bool TryOverlapWithLevelIterator(ColumnFamilyData cfd, VersionStorageInfo vs, byte[] smallestUserKey, byte[] largestUserKey,
+        int level, out bool overlap)
+    {
+        overlap = false;
+        Comparator ucmp = cfd.UserComparator;
+        var rangeDel = new RangeDelAggregator(cfd.Icmp, DbFormat.MaxSequenceNumber);
+        var rangeStart = new byte[smallestUserKey.Length + DbFormat.InternalKeyFooterSize];
+        DbFormat.AppendInternalKey(rangeStart, smallestUserKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
+        try
+        {
+            ReadOnlySpan<FileMetaData> files = vs.LevelFiles(level);
+            int first = level == 0 ? 0 : vs.FindFile(level, rangeStart);
+            for (int i = first; i < files.Length; i++)
+            {
+                FileMetaData f = files[i];
+                // AfterFile / BeforeFile
+                if (ucmp.CompareWithoutTimestamp(smallestUserKey, DbFormat.ExtractUserKey(f.Largest)) > 0
+                    || ucmp.CompareWithoutTimestamp(largestUserKey, DbFormat.ExtractUserKey(f.Smallest)) < 0)
+                {
+                    if (level == 0) continue;
+                    break; // sorted level: this and the following files start after the range
+                }
+                if (cfd.TableCache.GetRangeTombstones(f) is { } tombstones) rangeDel.AddTombstones(tombstones);
+                using Iterators.InternalIterator it = cfd.TableCache.NewIterator(f);
+                it.Seek(rangeStart);
+                if (!it.Valid) continue; // empty past the start: the level iterator moves to the next file
+                overlap = ucmp.CompareWithoutTimestamp(DbFormat.ExtractUserKey(it.Key), largestUserKey) <= 0;
+                if (overlap || level != 0) break;
+            }
+        }
+        catch (Exception e) when (e is RocksDbException or IOException)
+        {
+            return false;
+        }
+        if (!overlap && rangeDel.IsRangeOverlapped(smallestUserKey, largestUserKey, endExclusive: false)) overlap = true;
+        return true;
+    }
+
     /// <summary>The snapshot list with the job snapshot (taken last, so not smaller than any) added.</summary>
     private static ulong[] WithJobSnapshot(ulong[] snapshots, ulong jobSnapshot)
     {
@@ -676,9 +722,38 @@ internal sealed partial class DbImpl
                 try
                 {
                     VersionStorageInfo vs = sv.Current.Storage;
+                    // Might need to query the partitioner
+                    SstPartitioner? partitioner = null;
+                    if (cfd.Options.SstPartitionerFactory is { } partitionerFactory && begin is not null && end is not null)
+                    {
+                        // Small lies about compaction range (output level unknown).
+                        partitioner = partitionerFactory.CreatePartitioner(new SstPartitionerContext(IsFullCompaction: false, IsManualCompaction: true,
+                            OutputLevel: -1, begin, end));
+                    }
                     for (int level = 0; level < vs.NumNonEmptyLevels; level++)
                     {
-                        if (vs.OverlapInLevel(level, begin, begin is not null, end, end is not null))
+                        bool overlap = true;
+                        // Whether to look at specific keys within files for overlap with the compaction range, other
+                        // than the largest and smallest keys of the files known in the version metadata.
+                        bool checkOverlapWithinFile = false;
+                        if (begin is not null && end is not null)
+                        {
+                            // Typically checking overlap within files in this case (WART upstream: not in one-sided
+                            // bound cases). With user-defined timestamps the managed port keeps the file-level check.
+                            checkOverlapWithinFile = cfd.TimestampSize == 0;
+                            // Especially if the partitioner is new, the manual compaction might be used to enforce the
+                            // partitioning: checking overlap within files could miss files that straddle a partition
+                            // boundary inside the range (file "001".."111", range ["011", "101"], boundary "100"), so
+                            // file-level overlap is used whenever the range contains a boundary. Hypothetical trivial
+                            // move query: `begin` and `end` are both INCLUSIVE bounds here.
+                            if (partitioner is not null && !partitioner.CanDoTrivialMove(begin, end)) checkOverlapWithinFile = false;
+                        }
+                        if (checkOverlapWithinFile && !TryOverlapWithLevelIterator(cfd, vs, begin!, end!, level, out overlap))
+                        {
+                            checkOverlapWithinFile = false;
+                        }
+                        if (!checkOverlapWithinFile) overlap = vs.OverlapInLevel(level, begin, begin is not null, end, end is not null);
+                        if (overlap)
                         {
                             firstOverlappedLevel = level;
                             break;

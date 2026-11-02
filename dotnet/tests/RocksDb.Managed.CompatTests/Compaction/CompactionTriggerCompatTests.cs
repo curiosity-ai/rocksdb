@@ -165,4 +165,58 @@ public sealed class CompactionTriggerCompatTests
         Assert.AreEqual(threshold, t);
         Assert.AreEqual(3600UL, wakeup);
     }
+    // ---- CompactRange with an SST partitioner ---------------------------------------------------------------------
+
+    /// <summary>
+    /// One L0 file with the keys "001" and "111", then CompactRange(begin, end) with an optional fixed-prefix
+    /// partitioner (length 1), on both engines: the resulting level of every file must match.
+    /// </summary>
+    [TestMethod]
+    [DataRow(0, "011", "101", DisplayName = "no partitioner, gap inside the file")]
+    [DataRow(0, "100", "200", DisplayName = "no partitioner, key in range")]
+    [DataRow(1, "011", "101", DisplayName = "partition boundary in range")]
+    [DataRow(1, "011", "055", DisplayName = "no partition boundary in range")]
+    public void CompactRangePartitionStraddleMatchesNative(int prefixLength, string begin, string end)
+    {
+        using var nativeDir = new TempDir("cr-native");
+        using var managedDir = new TempDir("cr-managed");
+        RocksDbSharp.Native native = RocksDbSharp.Native.Instance;
+        var o = new RocksDbSharp.DbOptions().SetCreateIfMissing(true).SetCompression(RocksDbSharp.Compression.No);
+        native.rocksdb_options_set_disable_auto_compactions(o.Handle, 1);
+        IntPtr factory = IntPtr.Zero;
+        if (prefixLength > 0)
+        {
+            factory = native.rocksdb_sst_partitioner_fixed_prefix_factory_create((UIntPtr)prefixLength);
+            native.rocksdb_options_set_sst_partitioner_factory(o.Handle, factory);
+        }
+        s_keepAlive.Add(o);
+        List<(int, ulong)> nativeLevels;
+        try
+        {
+            using RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(o, nativeDir.Path);
+            db.Put(U("001"), U("a"));
+            db.Put(U("111"), U("b"));
+            db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            db.CompactRange(U(begin), U(end));
+            nativeLevels = NativeLevels(db);
+        }
+        finally
+        {
+            if (factory != IntPtr.Zero) native.rocksdb_sst_partitioner_factory_destroy(factory);
+        }
+        var cf = new ColumnFamilyOptions
+        {
+            DisableAutoCompactions = true,
+            Compression = RocksDb.Managed.Compression.CompressionType.None,
+            SstPartitionerFactory = prefixLength > 0 ? new SstPartitionerFixedPrefixFactory(prefixLength) : null,
+        };
+        using (RocksDatabase db = RocksDatabase.Open(managedDir.Path, new DbOptions { CreateIfMissing = true }, cf))
+        {
+            db.Put(U("001"), U("a"));
+            db.Put(U("111"), U("b"));
+            db.Flush();
+            db.CompactRange(U(begin), U(end));
+            AssertSameLevels(nativeLevels, ManagedLevels(db), "after CompactRange");
+        }
+    }
 }
