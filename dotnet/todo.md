@@ -28,7 +28,8 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [x] `BlockBasedTableBuilder` (sync/async, external SST mode for ingestion), `BlockBasedTableReader` (+Get visitor for merge chains), `BlockBasedTableIterator`
 - [x] Compat: native SstFileWriter/flush → managed read (fv2..7 × 5 checksums, partitioned index); managed → native ingest
 - [x] format_version 8 read+write (common key prefix, delta escape, metaindex gap) — byte-identical to native
-- [ ] Partitioned index/filter writing; partitioned filter reading; prefix extractor/prefix filters; compression dictionaries; UDT; property collectors
+- [x] Prefix extractor + prefix seek/filters, partitioned index+filters (write/read, byte-identical), optimize_filters_for_memory (bloom byte-identical; ribbon may differ by 16 B with glibc heap state), dictionary compression (zstd byte-identical; zlib/lz4hc dict write deviations)
+- [ ] Parallel compression, memtable prefix bloom, hash index, UDT, property collectors
 - [x] Integration: InternalKeyComparator/separators, Util.Hash, level-aware filter builders — index & data blocks byte-identical to native SstFileWriter (fv2..8)
 - [x] Compat with snappy/lz4/lz4hc/zstd/zlib and bloom/ribbon filters both directions
 - [x] `Db/TableFactory`: options model → TableFormatOptions/TableBuilderOptions/reader options, filter policy ids, per-level compression
@@ -143,13 +144,17 @@ With compaction (1M ops, 16B/100B, 4MB write buffer, no compression, shared box)
 Write-amp: fill 3.42 native vs 3.24 managed; overwrite 4.12 vs 4.17.
 
 ## Phase 3 — Compat + performance
+- [~] Features: WriteBatchWithIndex, SetOptions/SetDBOptions, custom comparators e2e, KeyMayExist/approx sizes/properties, Statistics, info LOG, wide columns (agent running)
+- [~] Perf #2 (agent running)
+- [ ] Transactions (pessimistic + optimistic TransactionDB)
 Goal: finish implementation, validate vs C++ source, comprehensive tests (unit/integration/round-trip) and benchmarks (managed vs rocksdb-sharp vs pure C native).
 - [x] Source audit #1 vs C++ (`docs/validation.md`): ~90 files (formats/util/table/wal/options/memtable/iterators); fixed memtable range-tombstone publish race, ArenaBlockSize default (0 → derived), internal-key type validation; added db_iter_test vectors
-- [ ] Source audit #2: DB layer (DbImpl*, VersionSet/Version, Compaction/*, FlushJob, WriteThread, recovery, ingestion, checkpoint, secondary)
+- [x] Source audit #2 (DB layer): 11 fixes (CF-drop vs MANIFEST, torn MANIFEST continuation, PIT WAL recovery resume, Get sequence/super-version order, ingestion seqno publish, CF drop during flush, cancellation tearing WAL, WAL handle leak on switch failure, writes racing close, option sanitization, snapshot ref leak); `TestHooks`, `FaultInjectionFileSystem`, ~300-point crash sweep, concurrent stress
+- [ ] Background error auto-recovery (DB stays read-only after failed flush/MANIFEST write until reopen)
 - [x] Three-way benchmark suite: C benchmark on librocksdb (`bench/native-c`), dbbench runner with full workload list + percentiles + async, `bench/run-all.sh`, `compare`/`report`, `DbHeadToHeadBenchmarks` (results in `bench/results/`)
 - [x] Bench follow-up: compaction flags/stats/waitforcompaction/compact on all 3 engines; compaction-heavy config (`results/2026-11-02-vm-compaction.md`): LSM shape & write-amp match native (2.96 vs 3.05)
 - [ ] Perf #2 (from 3-way results): async API allocations (150–300 B/write, ~230 B/TryGetAsync, 0.8–2.9 KB/async seek); span-based MultiGet (130–930 B/key); reverse iteration 1.3–4.6x slower than C; iteration/seek with 1 KiB values 2–5x; flush 1.3–3x slower + 2–8 MB allocs; fillseq 1 KiB allocs ~1.1 KB/op; overwrite under compaction 2.2x C (write stalls: background compaction keeps up less well — 0.83 s pending vs ~0); re-run matrix on a quiet machine
-- [~] `tests/RocksDb.Managed.RoundTrip`: crash-isolated managed↔native round trips (test exe re-invokes itself as a child for native/managed sides; captures crashes, hangs, unclean shutdown) (agent running)
+- [x] `tests/RocksDb.Managed.RoundTrip`: 35 crash-isolated managed↔native scenarios (self-invoking child; signals/timeouts decoded; failure state preserved): alternations ×6 option variants, managed-first, unclean shutdown both ways, edge keys/values, 200k–1M keys across levels, SST ingest, checkpoints, TTL, OPTIONS files; long mode `ROUNDTRIP_LONG=1` passes (20 alternations × 6,000 ops × 6 variants). Found/fixed: arena default, native struct-form filter policy in OPTIONS
 - [x] Full-DB compat: native writes DB → managed opens/reads/writes → native reopens & verifies (and reverse)
 - [ ] Randomized differential test vs native (same op stream, compare results)
 - [ ] Benchmarks vs native: fillseq, fillrandom, readrandom, readseq, seekrandom, multiget; allocation report
