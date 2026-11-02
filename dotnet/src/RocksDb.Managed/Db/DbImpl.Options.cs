@@ -139,6 +139,7 @@ internal sealed partial class DbImpl
                 cfd.MemOptions.WriteBufferSize = (long)Math.Min(live.WriteBufferSize, (ulong)long.MaxValue);
                 cfd.MemOptions.ArenaBlockSize = (int)Math.Min(live.ArenaBlockSize, int.MaxValue / 2);
                 cfd.Mem.UpdateWriteBufferSize(cfd.MemOptions.WriteBufferSize);
+                RecomputeMaxTotalInMemoryState();
                 cfd.Current.Storage.ComputeCompactionScore();
                 RecalculateWriteStall(cfd);
                 InstallSuperVersion(cfd);
