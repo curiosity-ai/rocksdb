@@ -48,11 +48,16 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [ ] `Options/OptionsFile` — parse & write `OPTIONS-*` (INI-like) — `options/options_parser.cc`
 - [ ] Compat: decode native MANIFEST & OPTIONS files of a natively created DB
 
-### E. Memtable  `[~] agent running`
-- [ ] `InternalKeyComparator`, `BytewiseComparator`, `ReverseBytewiseComparator` — `util/comparator.cc`, `db/dbformat.cc`
-- [ ] Arena-like pooled slab allocator for memtable entries — `memory/arena.cc`
-- [ ] Concurrent `InlineSkipList` (lock-free reads, concurrent inserts) — `memtable/inlineskiplist.h`
-- [ ] `MemTable` add/get/iterator, range tombstones, memtable entry encoding — `db/memtable.cc`
+### E. Memtable  `[x] merged (2fb2ccb)`
+- [x] Bytewise/ReverseBytewise (+u64ts) comparators with exact separator/successor ports; `ComparatorKind` fast path
+- [x] `InternalKeyComparator`, `InternalKey`, `LookupKey` (stackalloc), `IterKey`
+- [x] `Arena`/`ConcurrentArena` on pinned-object-heap slabs, pooled (cap 256MB)
+- [x] `InlineSkipList<TComparer>` (struct comparer, lock-free reads, CAS concurrent insert)
+- [x] `MemTable`: add/concurrent add, get (merge operand collection), iterator, range tombstones + fragmenter, flush triggers
+- [ ] Memtable extras: bloom filter, in-place updates, insert hints, protection bytes, wide columns/blob, read callback
+- [ ] `MemTableList` (immutable memtables), snapshot-striped tombstone fragmenter
+- [ ] Verify index separators against a native SST index block (needs stream B reader)
+- [ ] Rename `Db.ValueType` (clashes with `System.ValueType`) once A/B/D are merged — e.g. `EntryType`
 
 ### F. Infrastructure  `[~] agent running`
 - [ ] `Env/` file abstraction: async sequential writer (`WritableFileWriter`), random-access reader (`RandomAccessFileReader`), `LOCK` file
