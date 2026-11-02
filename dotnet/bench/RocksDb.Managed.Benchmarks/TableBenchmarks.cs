@@ -150,7 +150,7 @@ public class TableBenchmarks
         return n;
     }
 
-    private sealed class MemFile(byte[] data) : IRandomAccessFile
+    internal sealed class MemFile(byte[] data) : IRandomAccessFile
     {
         public long Length => data.Length;
         public int Read(long offset, Span<byte> destination)
@@ -163,7 +163,7 @@ public class TableBenchmarks
         public void Dispose() { }
     }
 
-    private sealed class MemWritableFile : IWritableFile
+    internal sealed class MemWritableFile : IWritableFile
     {
         private readonly MemoryStream _ms = new();
         public long Size => _ms.Length;
@@ -179,7 +179,7 @@ public class TableBenchmarks
     }
 
     /// <summary>Minimal lock-protected cache standing in for stream F's block cache.</summary>
-    private sealed class SimpleBlockCache : IBlockCache
+    internal sealed class SimpleBlockCache : IBlockCache
     {
         private readonly Dictionary<BlockCacheKey, Block> _map = new();
         private readonly Lock _lock = new();
