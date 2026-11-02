@@ -74,6 +74,7 @@ internal sealed partial class DbImpl
     {
         // Each writer gets its own exception object (the original may be shared by the whole group).
         if (e is RocksDbException r) throw new RocksDbException(r.Code, r.Message, r.SubCode, r);
+        if (e is ObjectDisposedException) ThrowDisposed();
         throw RocksDbException.IOError(e.Message, e);
     }
 
@@ -82,6 +83,19 @@ internal sealed partial class DbImpl
     /// until <see cref="WriteThread.ExitAsLeader"/> is called.
     /// </summary>
     internal async ValueTask<WriteThread.Writer> EnterUnbatchedAsync(bool synchronous, CancellationToken cancellationToken)
+    {
+        WriteThread.Writer w = await EnterUnbatchedCoreAsync(synchronous).ConfigureAwait(false);
+        if (IsDisposed)
+        {
+            // The DB was closed while this operation waited for its turn: the WAL and MANIFEST are gone.
+            ExitUnbatched(w, synchronous);
+            ThrowDisposed();
+        }
+        return w;
+    }
+
+    /// <summary>EnterUnbatched without the closed-DB check (used by close itself).</summary>
+    private async ValueTask<WriteThread.Writer> EnterUnbatchedCoreAsync(bool synchronous)
     {
         WriteThread.Writer w = WriteThread.Rent(synchronous);
         w.Prepare(null, null, synchronous);
@@ -113,6 +127,8 @@ internal sealed partial class DbImpl
         _writeThread.EnterAsBatchGroupLeader(leader, group);
         try
         {
+            // Writers that queued before the DB was closed get leadership after close released it.
+            if (IsDisposed) ThrowDisposed();
             ValueTask pre = PreprocessWriteAsync(leader.NoSlowdown, synchronous, cancellationToken);
             if (!pre.IsCompletedSuccessfully) await pre.ConfigureAwait(false);
 
@@ -160,16 +176,18 @@ internal sealed partial class DbImpl
                     }
                     else
                     {
-                        await log.AddRecordAsync(record, last, cancellationToken).ConfigureAwait(false);
+                        // No cancellation once the group is being committed: an abandoned AddRecord would leave a torn
+                        // record in the middle of the WAL (and fail followers that did not ask for cancellation).
+                        await log.AddRecordAsync(record, last, CancellationToken.None).ConfigureAwait(false);
                         if (needSync)
                         {
-                            await log.SyncAsync(cancellationToken).ConfigureAwait(false);
+                            await log.SyncAsync(CancellationToken.None).ConfigureAwait(false);
                             SyncWalDirIfNeeded();
                         }
                     }
                     _logEmpty = false;
                 }
-                catch (Exception e) when (e is not OperationCanceledException)
+                catch (Exception e)
                 {
                     // A failed WAL write leaves the WAL in an unknown state: stop accepting writes (bg error).
                     SetBackgroundError(e);
@@ -260,22 +278,38 @@ internal sealed partial class DbImpl
         if (!_logEmpty || _log is null)
         {
             newLogNumber = Versions.NewFileNumber();
-            newLog = CreateWal(newLogNumber);
-            LogWriter? old = _log;
-            if (old is not null)
+            try
             {
-                // Make the old WAL durable before writes continue in the new one, so a crash can't lose its tail while
-                // keeping later writes (upstream syncs closed WALs on the next sync write instead).
-                if (synchronous)
+                newLog = CreateWal(newLogNumber);
+                LogWriter? old = _log;
+                if (old is not null)
                 {
-                    old.Sync();
-                    old.Dispose();
+                    // Make the old WAL durable before writes continue in the new one, so a crash can't lose its tail while
+                    // keeping later writes (upstream syncs closed WALs on the next sync write instead). Not cancellable:
+                    // the old WAL is closed only after it was synced.
+                    if (synchronous)
+                    {
+                        old.Sync();
+                        old.Dispose();
+                    }
+                    else
+                    {
+                        await old.SyncAsync(CancellationToken.None).ConfigureAwait(false);
+                        await old.DisposeAsync().ConfigureAwait(false);
+                    }
                 }
-                else
+            }
+            catch (Exception e)
+            {
+                // SwitchMemtable: a failure to create the new WAL or to make the old one durable stops writes (bg error).
+                if (newLog is not null)
                 {
-                    await old.SyncAsync(cancellationToken).ConfigureAwait(false);
-                    await old.DisposeAsync().ConfigureAwait(false);
+                    try { newLog.Dispose(); }
+                    catch (Exception de) when (de is IOException or RocksDbException) { }
+                    TryDeleteFile(FileNames.LogFileName(WalDir, newLogNumber));
                 }
+                SetBackgroundError(e);
+                throw;
             }
         }
         lock (_mutex)

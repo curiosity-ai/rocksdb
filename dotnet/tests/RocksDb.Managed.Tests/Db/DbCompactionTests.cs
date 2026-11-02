@@ -562,20 +562,55 @@ public sealed class DbCompactionTests
         db.Dispose();
 
         cfo.DisableAutoCompactions = false;
-        cfo.Level0FileNumCompactionTrigger = 100; // keep compaction from running on its own
-        using RocksDatabase db2 = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
-        // 5 L0 files >= stop trigger (4): writes stop.
-        Assert.AreEqual("1", db2.GetProperty("rocksdb.is-write-stopped"));
-        var ex = Assert.ThrowsExactly<RocksDbException>(() => db2.Put(new WriteOptions { NoSlowdown = true }, Key(11), Val(11, 0)));
-        Assert.AreEqual(StatusCode.Incomplete, ex.Code);
-        // A blocked writer resumes once a (manual) compaction reduces L0.
-        Task writer = Task.Run(() => db2.Put(Key(12), Val(12, 0)));
-        Assert.IsFalse(writer.Wait(200));
-        db2.CompactRange();
-        Assert.IsTrue(writer.Wait(10000));
-        Assert.AreEqual("0", db2.GetProperty("rocksdb.is-write-stopped"));
-        CollectionAssert.AreEqual(Val(12, 0), db2.Get(Key(12)));
-        for (int round = 0; round < 4; round++) CollectionAssert.AreEqual(Val(round, round), db2.Get(Key(round)));
+        // Keep compactions from finishing until released (upstream tests use a sleeping background task). The L0
+        // triggers must stay ordered: out-of-order values are sanitized at open like upstream's SanitizeCfOptions.
+        using var gate = new ManualResetEventSlim(false);
+        TestHooks.Set("DBImpl::RunCompaction:Start", () => gate.Wait());
+        try
+        {
+            using RocksDatabase db2 = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+            // 5 L0 files >= stop trigger (4): writes stop.
+            Assert.AreEqual("1", db2.GetProperty("rocksdb.is-write-stopped"));
+            var ex = Assert.ThrowsExactly<RocksDbException>(() => db2.Put(new WriteOptions { NoSlowdown = true }, Key(11), Val(11, 0)));
+            Assert.AreEqual(StatusCode.Incomplete, ex.Code);
+            // A blocked writer resumes once a compaction reduces L0.
+            Task writer = Task.Run(() => db2.Put(Key(12), Val(12, 0)));
+            Assert.IsFalse(writer.Wait(200));
+            gate.Set();
+            db2.CompactRange();
+            Assert.IsTrue(writer.Wait(10000));
+            Assert.AreEqual("0", db2.GetProperty("rocksdb.is-write-stopped"));
+            CollectionAssert.AreEqual(Val(12, 0), db2.Get(Key(12)));
+            for (int round = 0; round < 4; round++) CollectionAssert.AreEqual(Val(round, round), db2.Get(Key(round)));
+        }
+        finally
+        {
+            gate.Set();
+            TestHooks.ClearAll();
+        }
+    }
+
+    [TestMethod]
+    public void OutOfOrderL0TriggersAreSanitizedAtOpen()
+    {
+        // SanitizeCfOptions: level0_stop >= level0_slowdown >= level0_file_num_compaction_trigger, and the OPTIONS
+        // file records the sanitized values.
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cfo = SmallCf();
+        cfo.Level0FileNumCompactionTrigger = 100;
+        cfo.Level0SlowdownWritesTrigger = 3;
+        cfo.Level0StopWritesTrigger = 4;
+        cfo.MaxWriteBufferNumber = 1;
+        cfo.WriteBufferSize = 1024;
+        cfo.NumLevels = 1;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+        Assert.AreEqual(3, cfo.Level0SlowdownWritesTrigger, "caller's options are not modified");
+        ColumnFamilyOptions effective = db.GetColumnFamily("default").Data.Options;
+        Assert.AreEqual(100, effective.Level0SlowdownWritesTrigger);
+        Assert.AreEqual(100, effective.Level0StopWritesTrigger);
+        Assert.AreEqual(2, effective.MaxWriteBufferNumber);
+        Assert.AreEqual(64UL << 10, effective.WriteBufferSize);
+        Assert.AreEqual(2, effective.NumLevels);
     }
 
     [TestMethod]
@@ -593,24 +628,36 @@ public sealed class DbCompactionTests
             }
         }
         cfo.DisableAutoCompactions = false;
-        cfo.Level0FileNumCompactionTrigger = 100;
+        cfo.Level0FileNumCompactionTrigger = 3;
         cfo.Level0SlowdownWritesTrigger = 3;
         cfo.Level0StopWritesTrigger = 100;
         DbOptions dbo = NewOptions(fs);
         dbo.DelayedWriteRate = 100 * 1024; // 100 KB/s
-        using RocksDatabase db2 = RocksDatabase.Open(DbPath, dbo, cfo);
-        Assert.AreEqual("0", db2.GetProperty("rocksdb.is-write-stopped"));
-        Assert.AreNotEqual("0", db2.GetProperty("rocksdb.actual-delayed-write-rate"));
-        var ex = Assert.ThrowsExactly<RocksDbException>(() =>
+        // Keep the triggered compaction from finishing until released.
+        using var gate = new ManualResetEventSlim(false);
+        TestHooks.Set("DBImpl::RunCompaction:Start", () => gate.Wait());
+        try
         {
-            for (int i = 0; i < 100; i++) db2.Put(new WriteOptions { NoSlowdown = true }, Key(100 + i), new byte[4096]);
-        });
-        Assert.AreEqual(StatusCode.Incomplete, ex.Code);
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        for (int i = 0; i < 10; i++) db2.Put(Key(200 + i), new byte[4096]); // 40KB at 100KB/s
-        Assert.IsTrue(sw.ElapsedMilliseconds >= 150, "elapsed " + sw.ElapsedMilliseconds);
-        db2.CompactRange();
-        Assert.AreEqual("0", db2.GetProperty("rocksdb.actual-delayed-write-rate"));
+            using RocksDatabase db2 = RocksDatabase.Open(DbPath, dbo, cfo);
+            Assert.AreEqual("0", db2.GetProperty("rocksdb.is-write-stopped"));
+            Assert.AreNotEqual("0", db2.GetProperty("rocksdb.actual-delayed-write-rate"));
+            var ex = Assert.ThrowsExactly<RocksDbException>(() =>
+            {
+                for (int i = 0; i < 100; i++) db2.Put(new WriteOptions { NoSlowdown = true }, Key(100 + i), new byte[4096]);
+            });
+            Assert.AreEqual(StatusCode.Incomplete, ex.Code);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < 10; i++) db2.Put(Key(200 + i), new byte[4096]); // 40KB at 100KB/s
+            Assert.IsTrue(sw.ElapsedMilliseconds >= 150, "elapsed " + sw.ElapsedMilliseconds);
+            gate.Set();
+            db2.CompactRange();
+            Assert.AreEqual("0", db2.GetProperty("rocksdb.actual-delayed-write-rate"));
+        }
+        finally
+        {
+            gate.Set();
+            TestHooks.ClearAll();
+        }
     }
 
     [TestMethod]

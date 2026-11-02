@@ -31,6 +31,7 @@ internal sealed class VersionSet : IAsyncDisposable
     private ulong _lastSequence;          // last published sequence (visible to readers)
     private ulong _lastAllocatedSequence; // last sequence handed out to a write group
     private ulong _versionNumber;
+    private ulong _descriptorLastSequence; // last_sequence recorded in the MANIFEST so far (descriptor_last_sequence_), guarded by _manifestLock
     private ManifestLogWriter? _manifestLog;
     private ManifestWriter? _manifest;
 
@@ -206,6 +207,13 @@ internal sealed class VersionSet : IAsyncDisposable
             bool newManifest;
             lock (_db.Mutex)
             {
+                // ProcessManifestWrites: edits of a column family dropped meanwhile are not written (a later edit for a
+                // dropped CF id would make the MANIFEST unrecoverable: "MANIFEST record referencing unknown column family").
+                // The drop itself is applied under _manifestLock, so this check cannot race with it.
+                if (cfd is not null && cfd.Dropped && !edit.IsColumnFamilyAdd)
+                {
+                    throw new RocksDbException(StatusCode.ColumnFamilyDropped, "Column family drop: column family " + cfd.Name + " was dropped");
+                }
                 if (edit.IsColumnFamilyAdd)
                 {
                     edit.MaxColumnFamily = Math.Max(MaxColumnFamily, edit.ColumnFamily);
@@ -219,12 +227,19 @@ internal sealed class VersionSet : IAsyncDisposable
                 {
                     snapshot = BuildSnapshotState();
                 }
-                // Like ProcessManifestWrites: the last edit of a batch carries next_file_number and last_sequence.
-                edit.LastSequence = LastSequence;
+                // Like ProcessManifestWrites / LogAndApplyHelper: the edit carries next_file_number and a last_sequence that
+                // never goes backwards and covers the largest seqno of the files it adds (ingested files are assigned a
+                // seqno above the published last sequence, which is only advanced after this edit is durable).
+                ulong lastSeq = Math.Max(LastSequence, _descriptorLastSequence);
+                if (edit.LastSequence is ulong own && own > lastSeq) lastSeq = own;
+                edit.LastSequence = lastSeq;
+                _descriptorLastSequence = lastSeq;
             }
 
+            TestHooks.Invoke("VersionSet::LogAndApply:BeforeManifestWrite");
             ulong manifestNumber = 0;
             ManifestLogWriter? newLog = null;
+            bool newManifestWritten = false;
             try
             {
                 if (newManifest)
@@ -237,6 +252,7 @@ internal sealed class VersionSet : IAsyncDisposable
                     await Await(writer.WriteSnapshotAsync(snapshot, static _ => 0, cancellationToken), synchronous).ConfigureAwait(false);
                     edit.NextFileNumber = CurrentNextFileNumber;
                     await Await(writer.AddEditAsync(edit, 0, sync: true, cancellationToken), synchronous).ConfigureAwait(false);
+                    newManifestWritten = true;
                     await Await(FileNames.SetCurrentFileAsync(_fs, _dbname, manifestNumber, syncDirectory: true, cancellationToken), synchronous)
                         .ConfigureAwait(false);
                     ManifestLogWriter? old = _manifestLog;
@@ -245,8 +261,9 @@ internal sealed class VersionSet : IAsyncDisposable
                     newLog = null;
                     ulong oldNumber = ManifestFileNumber;
                     ManifestFileNumber = manifestNumber;
-                    old?.Dispose();
                     if (oldNumber != 0) _db.ScheduleDeleteObsoleteManifest(oldNumber);
+                    try { old?.Dispose(); }
+                    catch (Exception e) when (e is IOException or RocksDbException) { }
                 }
                 else
                 {
@@ -256,12 +273,28 @@ internal sealed class VersionSet : IAsyncDisposable
             }
             catch
             {
+                // If the MANIFEST append failed for whatever reason, the file could be corrupted (torn record), and after a
+                // failed CURRENT update it is unknown which MANIFEST CURRENT names. Force the next version update to start a
+                // new MANIFEST and point CURRENT at it (ProcessManifestWrites: descriptor_log_.reset()).
+                if (_manifestLog is not null)
+                {
+                    try { _manifestLog.Dispose(); }
+                    catch (Exception e) when (e is IOException or RocksDbException) { }
+                    _manifestLog = null;
+                    _manifest = null;
+                }
                 if (newLog is not null)
                 {
-                    newLog.Dispose();
-                    try { _fs.DeleteFile(FileNames.DescriptorFileName(_dbname, manifestNumber)); }
-                    catch (IOException) { }
-                    catch (RocksDbException) { }
+                    try { newLog.Dispose(); }
+                    catch (Exception e) when (e is IOException or RocksDbException) { }
+                    // Only delete the new MANIFEST if writing it failed: if only the CURRENT update failed, CURRENT may
+                    // already name it (e.g. rename done, directory fsync failed), so it must stay.
+                    if (!newManifestWritten)
+                    {
+                        try { _fs.DeleteFile(FileNames.DescriptorFileName(_dbname, manifestNumber)); }
+                        catch (IOException) { }
+                        catch (RocksDbException) { }
+                    }
                 }
                 throw;
             }
@@ -365,6 +398,7 @@ internal sealed class VersionSet : IAsyncDisposable
         MarkFileNumberUsed(manifestFileNumber);
         _lastSequence = state.LastSequence;
         _lastAllocatedSequence = state.LastSequence;
+        _descriptorLastSequence = state.LastSequence;
         ManifestFileNumber = manifestFileNumber;
     }
 

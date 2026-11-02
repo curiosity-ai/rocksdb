@@ -470,10 +470,10 @@ internal sealed partial class DbImpl
             }
             else
             {
-                await log.WriteBufferAsync(ct).ConfigureAwait(false);
+                await log.WriteBufferAsync(CancellationToken.None).ConfigureAwait(false);
                 if (sync)
                 {
-                    await log.SyncAsync(ct).ConfigureAwait(false);
+                    await log.SyncAsync(CancellationToken.None).ConfigureAwait(false);
                     SyncWalDirIfNeeded();
                 }
             }

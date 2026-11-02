@@ -115,7 +115,7 @@ internal sealed partial class DbImpl
             {
                 ThrowHelper.InvalidArgument("Write Ahead Log file in " + WalDir + " exists, but error_if_wal_file_exists is true");
             }
-            ulong last = Versions.LastSequence;
+            var progress = new ReplayProgress { LastSequence = Versions.LastSequence };
             foreach (ulong walNumber in wals)
             {
                 string fname = FileNames.LogFileName(WalDir, walNumber);
@@ -124,8 +124,6 @@ internal sealed partial class DbImpl
                 {
                     RecoveryMode = Options.WalRecoveryMode,
                 };
-                var progress = new ReplayProgress { LastSequence = last };
-                bool stop = false;
                 while (true)
                 {
                     bool got = ReplayNextRecord(reader, reporter, walNumber, progress);
@@ -133,14 +131,18 @@ internal sealed partial class DbImpl
                     if (reporter.Error is { } err)
                     {
                         if (Options.WalRecoveryMode == WalRecoveryMode.SkipAnyCorruptedRecords) reporter.Error = null;
-                        else if (Options.WalRecoveryMode == WalRecoveryMode.PointInTimeRecovery) stop = true;
+                        else if (Options.WalRecoveryMode == WalRecoveryMode.PointInTimeRecovery && err.Code != StatusCode.IOError)
+                        {
+                            // Like the primary: drop records until the sequence continues (MaybeReviseStopReplayForCorruption).
+                            reporter.Error = null;
+                            progress.StopReplay = true;
+                        }
                         else throw err;
                     }
-                    if (!got || stop) break;
+                    if (!got) break;
                 }
-                last = Math.Max(last, progress.LastSequence);
-                if (stop) break;
             }
+            ulong last = progress.LastSequence;
             Versions.SetLastSequence(last);
             lock (_mutex)
             {
