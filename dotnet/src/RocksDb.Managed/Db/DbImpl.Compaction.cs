@@ -666,6 +666,7 @@ internal sealed partial class DbImpl
                         }
                         break;
                     }
+                    if (_shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
                     wait = _bgSignal.Task;
                 }
                 if (synchronous) wait.Wait(cancellationToken);
@@ -791,6 +792,7 @@ internal sealed partial class DbImpl
                     // Pending work that cannot be scheduled (e.g. picker found nothing to do).
                     return;
                 }
+                if (_shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
                 wait = _bgSignal.Task;
             }
             if (synchronous) wait.Wait(cancellationToken);
