@@ -96,8 +96,8 @@ public sealed class CompactionPickerParityTests
     }
 
     // The plain-text LOG lines both engines write (flush_job.cc, compaction_job.cc, db_impl_compaction_flush.cc). The
-    // EVENT_LOG_v1 JSON records are not used: the native library's JSON writer emits only the first field when the
-    // host runs on .NET 11.
+    // EVENT_LOG_v1 JSON records are not used: in a .NET 11 apphost without the libstdc++ preload (tests/Shared/
+    // NativeStdCxxPreload.cs) the native JSON writer loses every number after the first field.
     private static readonly Regex s_flush = new(@"\] Level-0 flush table #\d+: (\d+) bytes OK", RegexOptions.CultureInvariant);
     private static readonly Regex s_compacting = new(@"\] Compacting (.+) files to L(\d+), score", RegexOptions.CultureInvariant);
     private static readonly Regex s_generated = new(@"\] Generated table #\d+: (?:\d+ keys, )?(\d+) bytes", RegexOptions.CultureInvariant);

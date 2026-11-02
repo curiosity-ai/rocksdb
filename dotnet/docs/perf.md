@@ -395,8 +395,8 @@ file size, 1 MiB level base, dynamic level bytes, no compression, `max_backgroun
 both engines flush and `WaitForCompact`, so the LSM shapes depend only on flush / picker / output-cutting logic, and
 both LOGs ("Compacting N@L + M@L' files to Lx", "Moved #...", flush and output table sizes) give the compaction
 sequence and the bytes written. Managed now writes the upstream lines (`OnCompactionStarted`, "Generated table",
-"Moved #", "Level-0 flush table"). The EVENT_LOG JSON is not usable for the native side under .NET 11 (the native
-JSON writer stops after the first field there), so the test parses the plain-text lines.
+"Moved #", "Level-0 flush table"). The test parses these plain-text lines rather than the EVENT_LOG JSON, which the native
+library writes without its numbers in a .NET 11 apphost unless libstdc++ is preloaded (`tests/Shared/NativeStdCxxPreload.cs`).
 
 No picker or scoring change separates the native 11.12 from the 11.14 sources (`git log` of `db/compaction/`,
 `db/version_set.cc`, `db_impl_compaction_flush.cc` since 2026-09-25, HISTORY.md 11.13); the scores, base level and
