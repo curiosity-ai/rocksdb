@@ -107,6 +107,19 @@ internal sealed class CompactionJob
     /// <summary>File numbers of outputs created so far (also failed ones, for cleanup).</summary>
     public List<ulong> CreatedFileNumbers { get; } = new();
 
+    // Blob files (integrated BlobDB): output builder, GC/extraction and the garbage meter over the input.
+    private Blob.CompactionBlobProcessor? _blob;
+    private Blob.BlobGarbageMeter? _blobGarbageMeter;
+
+    /// <summary>The blob file builder of this job (null when the output level gets no blob files). Released by the DB.</summary>
+    public Blob.BlobFileBuilder? BlobBuilder { get; private set; }
+
+    /// <summary>Blob files written by the compaction (for the version edit).</summary>
+    public List<BlobFileAddition> BlobFileAdditions { get; } = new();
+
+    /// <summary>Additional garbage in preexisting blob files (for the version edit).</summary>
+    public List<BlobFileGarbage> BlobFileGarbages { get; } = new();
+
     // ---------------------------------------------------------------------------------------------------------
     // input
 
@@ -177,6 +190,19 @@ internal sealed class CompactionJob
         RangeDelAggregator rangeDel = RangeDelAggregator.ForCompaction(_icmp, _snapshots);
         var raw = new List<FragmentedRangeTombstoneList.Tombstone>();
         InternalIterator input = MakeInputIterator(rangeDel, raw);
+        // CompactionJob::ProcessKeyValueCompaction: a BlobCountingIterator measures the blob inflow when the input
+        // references blob files (DoesInputReferenceBlobFiles).
+        if (_c.DoesInputReferenceBlobFiles())
+        {
+            _blobGarbageMeter = new Blob.BlobGarbageMeter();
+            input = new Blob.BlobCountingIterator(input, _blobGarbageMeter);
+        }
+        BlobBuilder = _db.CreateBlobFileBuilder(_cfd, _c.OutputLevel, Blob.BlobFileCreationReason.Compaction);
+        bool enableGc = _c.EnableBlobGarbageCollection;
+        if (BlobBuilder is not null || enableGc || _c.InputStorage.BlobFiles.Length > 0)
+        {
+            _blob = new Blob.CompactionBlobProcessor(BlobBuilder, _cfd.BlobSource, _c.InputStorage, enableGc, _c.BlobGarbageCollectionAgeCutoff);
+        }
         if (raw.Count > 0)
         {
             FragmentedRangeTombstoneList frag = FragmentedRangeTombstoneList.Build(_cfd.UserComparator, raw);
@@ -192,7 +218,11 @@ internal sealed class CompactionJob
         if (merge is not null) merge.FullHistoryTsLow = fullHistoryTsLow;
         var iter = new CompactionIterator(input, _icmp, merge, _snapshots, earliestWriteConflict, rangeDel, _c, filter,
             _db.Options.EnforceSingleDelContracts, _cancellation)
-        { FullHistoryTsLow = fullHistoryTsLow };
+        {
+            FullHistoryTsLow = fullHistoryTsLow,
+            BlobProcessor = _blob,
+        };
+        if (merge is not null) merge.BlobProcessor = _blob;
         try
         {
             input.SeekToFirst();
@@ -216,11 +246,24 @@ internal sealed class CompactionJob
                 OpenOutput();
             }
             if (_builder is not null) await FinishOutputAsync(ReadOnlySpan<byte>.Empty, synchronous).ConfigureAwait(false);
+            if (BlobBuilder is not null)
+            {
+                BlobBuilder.Finish();
+                BlobFileAdditions.AddRange(BlobBuilder.Additions);
+                // bytes_written_blob is part of the compaction's write volume (write amplification).
+                foreach (BlobFileAddition a in BlobBuilder.Additions)
+                {
+                    Stats.BytesWritten += a.TotalBlobBytes + Blob.BlobLogFormat.HeaderSize + Blob.BlobLogFormat.FooterSize;
+                }
+            }
+            _blobGarbageMeter?.AddGarbageTo(BlobFileGarbages);
         }
         finally
         {
             iter.Dispose();
             merge?.Dispose();
+            _blob?.Dispose();
+            BlobBuilder?.Abandon();
             input.Dispose();
             _largestKey.Dispose();
             if (_builder is not null)
@@ -242,9 +285,15 @@ internal sealed class CompactionJob
     {
         if (_builder is null) OpenOutput();
         ReadOnlySpan<byte> key = iter.Key;
-        _builder!.Add(key, iter.Value);
+        ReadOnlySpan<byte> value = iter.Value;
+        _builder!.Add(key, value);
         Stats.NumOutputRecords++;
         UpdateBoundaries(key, iter.Sequence);
+        if (iter.Type == EntryType.BlobIndex)
+        {
+            FlushJob.UpdateOldestBlobFileNumber(_meta!, value);
+            _blobGarbageMeter?.ProcessOutFlow(key, value);
+        }
     }
 
     private bool AllTombstonesDroppable()

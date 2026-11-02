@@ -67,7 +67,11 @@ public sealed class PrefixSeekTests
             if (phase == 0)
             {
                 db.Flush();
-                db.CompactRange();
+                // Force the bottommost level to be rewritten: depending on background flush timing, phase 0 may end up
+                // in a single L0 file (several immutable memtables flushed by one job), which a plain CompactRange
+                // trivially moves down as one sorted-run file. Rewriting it cuts outputs at target_file_size_base, so
+                // the LSM shape (several sorted-run files) is deterministic.
+                db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
             }
             else if (phase == 1)
             {

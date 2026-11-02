@@ -26,7 +26,6 @@ internal sealed class GetContext
         Deleted,
         Corrupt,
         Merge,
-        UnexpectedBlobIndex,
     }
 
     public readonly MergeContext MergeContext = new();
@@ -39,6 +38,11 @@ internal sealed class GetContext
     public bool FromMemTable;
     /// <summary>The found value (<see cref="Value"/>) is a serialized wide-column entity.</summary>
     public bool ValueIsEntity;
+    /// <summary>
+    /// The found value (<see cref="Value"/>) is a blob index: the read path replaces it with the blob
+    /// (<see cref="ResolveBlob"/>) while it still holds the version the index was read from.
+    /// </summary>
+    public bool ValueIsBlobIndex;
     public ulong MaxCoveringTombstoneSeq;
     public MergeOperator? MergeOperator;
     /// <summary>
@@ -46,6 +50,8 @@ internal sealed class GetContext
     /// timestamp of the first (newest visible) entry matched is captured (GetContext::SaveValue, timestamp_).
     /// </summary>
     public int TimestampSize;
+    /// <summary>User key with timestamp of the blob index found (timestamped lookups only).</summary>
+    private readonly PooledBufferWriter _blobUserKey = new(32);
     /// <summary>True once <see cref="FoundTimestamp"/> holds the timestamp of the first matched entry.</summary>
     public bool HasTimestamp;
     private byte[] _timestamp = new byte[8];
@@ -70,10 +76,12 @@ internal sealed class GetContext
         State = GetState.NotFound;
         FromMemTable = false;
         ValueIsEntity = false;
+        ValueIsBlobIndex = false;
         MaxCoveringTombstoneSeq = 0;
         MergeOperator = mergeOperator;
         TimestampSize = 0;
         HasTimestamp = false;
+        _blobUserKey.Clear();
     }
 
     /// <summary>
@@ -83,7 +91,16 @@ internal sealed class GetContext
     public bool SaveValue(ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value)
     {
         DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(internalKey), out ulong seq, out EntryType type);
-        if (TimestampSize != 0) RecordTimestampOfUserKey(DbFormat.ExtractUserKey(internalKey));
+        if (TimestampSize != 0)
+        {
+            RecordTimestampOfUserKey(DbFormat.ExtractUserKey(internalKey));
+            // ukey_with_ts_found_: blob records are keyed (and verified) by the user key with its timestamp.
+            if (type == EntryType.BlobIndex && MaxCoveringTombstoneSeq <= seq)
+            {
+                _blobUserKey.Clear();
+                _blobUserKey.Write(DbFormat.ExtractUserKey(internalKey));
+            }
+        }
         return SaveEntry(seq, type, value);
     }
 
@@ -99,9 +116,12 @@ internal sealed class GetContext
         {
             case EntryType.Value:
             case EntryType.WideColumnEntity:
+            case EntryType.BlobIndex:
+                // A blob index is kept as the found value and resolved (also as a merge base value) by the read path.
                 Value.Clear();
                 Value.Write(value);
                 ValueIsEntity = type == EntryType.WideColumnEntity;
+                ValueIsBlobIndex = type == EntryType.BlobIndex;
                 State = GetState.Found;
                 return false;
             case EntryType.ValuePreferredSeqno:
@@ -119,9 +139,6 @@ internal sealed class GetContext
                 State = GetState.Merge;
                 MergeContext.PushOperand(value);
                 return true;
-            case EntryType.BlobIndex:
-                State = GetState.UnexpectedBlobIndex;
-                return false;
             default:
                 State = GetState.Corrupt;
                 return false;
@@ -136,14 +153,10 @@ internal sealed class GetContext
         switch (r)
         {
             case MemTableGetResult.Found:
-                if (valueType is EntryType.BlobIndex)
-                {
-                    State = GetState.UnexpectedBlobIndex;
-                    return true;
-                }
                 Value.Clear();
                 Value.Write(value);
                 ValueIsEntity = valueType == EntryType.WideColumnEntity;
+                ValueIsBlobIndex = valueType == EntryType.BlobIndex;
                 State = GetState.Found;
                 return true;
             case MemTableGetResult.Deleted:
@@ -160,7 +173,52 @@ internal sealed class GetContext
         }
     }
 
-    public bool Done => State is GetState.Found or GetState.Deleted or GetState.Corrupt or GetState.UnexpectedBlobIndex;
+    public bool Done => State is GetState.Found or GetState.Deleted or GetState.Corrupt;
+
+    /// <summary>
+    /// GetContext::GetBlobValue: replaces a found blob index with the blob it references, read through
+    /// <paramref name="source"/> from <paramref name="version"/> (the version the lookup read). No-op unless
+    /// <see cref="ValueIsBlobIndex"/>.
+    /// </summary>
+    public void ResolveBlob(Blob.BlobSource source, VersionStorageInfo version, ReadOptions? options, ReadOnlySpan<byte> userKey)
+    {
+        if (!ValueIsBlobIndex) return;
+        if (TimestampSize != 0 && _blobUserKey.WrittenCount > 0) userKey = _blobUserKey.WrittenSpan;
+        Scratch.Clear();
+        source.GetBlob(version, options, userKey, Value.WrittenSpan, Scratch);
+        Value.Clear();
+        Value.Write(Scratch.WrittenSpan);
+        ValueIsBlobIndex = false;
+    }
+
+    /// <summary>Async <see cref="ResolveBlob"/>; <paramref name="userKey"/> must stay valid until completion.</summary>
+    public ValueTask ResolveBlobAsync(Blob.BlobSource source, VersionStorageInfo version, ReadOptions? options, ReadOnlyMemory<byte> userKey,
+        CancellationToken cancellationToken)
+    {
+        if (!ValueIsBlobIndex) return ValueTask.CompletedTask;
+        Scratch.Clear();
+        ValueTask t = source.GetBlobAsync(version, options, userKey, Value.WrittenSpan, Scratch, cancellationToken);
+        if (t.IsCompletedSuccessfully)
+        {
+            t.GetAwaiter().GetResult();
+            FinishBlob();
+            return ValueTask.CompletedTask;
+        }
+        return AwaitBlobAsync(t);
+    }
+
+    private async ValueTask AwaitBlobAsync(ValueTask pending)
+    {
+        await pending.ConfigureAwait(false);
+        FinishBlob();
+    }
+
+    private void FinishBlob()
+    {
+        Value.Clear();
+        Value.Write(Scratch.WrittenSpan);
+        ValueIsBlobIndex = false;
+    }
 
     /// <summary>
     /// Final step: throws for corruption / unsupported entries, applies merge operands, and returns the final value
@@ -174,10 +232,8 @@ internal sealed class GetContext
             case GetState.Corrupt:
                 ThrowHelper.Corruption("corrupted entry type for key");
                 return false;
-            case GetState.UnexpectedBlobIndex:
-                ThrowHelper.NotSupported("Encounter unexpected blob index. Blob files are not supported yet.");
-                return false;
         }
+        if (ValueIsBlobIndex) ThrowUnresolvedBlob();
         if (MergeContext.Count == 0)
         {
             if (State != GetState.Found) return false;
@@ -220,10 +276,8 @@ internal sealed class GetContext
             case GetState.Corrupt:
                 ThrowHelper.Corruption("corrupted entry type for key");
                 return false;
-            case GetState.UnexpectedBlobIndex:
-                ThrowHelper.NotSupported("Encounter unexpected blob index. Blob files are not supported yet.");
-                return false;
         }
+        if (ValueIsBlobIndex) ThrowUnresolvedBlob();
         if (MergeContext.Count == 0)
         {
             if (State != GetState.Found) return false;
@@ -247,6 +301,10 @@ internal sealed class GetContext
         }
         return true;
     }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowUnresolvedBlob() =>
+        throw new InvalidOperationException("Internal error: a blob index was not resolved by the read path (GetContext.ResolveBlob).");
 
     // ---- pooling ----------------------------------------------------------------------------------------
 

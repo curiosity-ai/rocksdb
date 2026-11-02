@@ -32,6 +32,10 @@
 #   COMPACTION_NUM=$NUM  COMPACTION_THREADS=1  COMPACTION_COMPRESSION=none  COMPACTION_VALUE_SIZE=100
 #   COMPACTION_BENCHMARKS=fillrandom,overwrite,waitforcompaction,stats,readrandom,seekrandom
 #   COMPACTION_ARGS="--write_buffer_size 4194304 --target_file_size_base 4194304 --max_bytes_for_level_base 16777216"
+#   RUN_BLOB=0                   run one integrated BlobDB configuration (label "blob"): values in blob files
+#   BLOB_NUM=$NUM  BLOB_VALUE_SIZE=1024  BLOB_THREADS=1  BLOB_COMPRESSION=none
+#   BLOB_BENCHMARKS=fillrandom,overwrite,flush,waitforcompaction,stats,readrandom,multireadrandom,seekrandom,readseq,compact,readrandom
+#   BLOB_ARGS="--enable_blob_files 1 --min_blob_size 512 --write_buffer_size 16777216"
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,6 +69,13 @@ COMPACTION_COMPRESSION="${COMPACTION_COMPRESSION:-none}"
 COMPACTION_VALUE_SIZE="${COMPACTION_VALUE_SIZE:-100}"
 COMPACTION_BENCHMARKS="${COMPACTION_BENCHMARKS:-fillrandom,overwrite,waitforcompaction,stats,readrandom,seekrandom}"
 COMPACTION_ARGS="${COMPACTION_ARGS:---write_buffer_size 4194304 --target_file_size_base 4194304 --max_bytes_for_level_base 16777216}"
+RUN_BLOB="${RUN_BLOB:-0}"
+BLOB_NUM="${BLOB_NUM:-${NUM}}"
+BLOB_VALUE_SIZE="${BLOB_VALUE_SIZE:-1024}"
+BLOB_THREADS="${BLOB_THREADS:-1}"
+BLOB_COMPRESSION="${BLOB_COMPRESSION:-none}"
+BLOB_BENCHMARKS="${BLOB_BENCHMARKS:-fillrandom,overwrite,flush,waitforcompaction,stats,readrandom,multireadrandom,seekrandom,readseq,compact,readrandom}"
+BLOB_ARGS="${BLOB_ARGS:---enable_blob_files 1 --min_blob_size 512 --write_buffer_size 16777216}"
 
 echo "== building (Release)"
 dotnet build -c Release bench/RocksDb.Managed.Benchmarks -f "${TFM}" -v quiet -nologo | tail -3
@@ -122,6 +133,14 @@ if [[ "${RUN_COMPACTION}" == 1 ]]; then
     --threads "${COMPACTION_THREADS}" --compression "${COMPACTION_COMPRESSION}" ${COMPACTION_ARGS} ${EXTRA_ARGS} \
     | grep -E '^(====|[a-z]+ +: |Cumulative compaction)' || true
 fi
+if [[ "${RUN_BLOB}" == 1 ]]; then
+  echo "== blob: num=${BLOB_NUM} value_size=${BLOB_VALUE_SIZE} compression=${BLOB_COMPRESSION} threads=${BLOB_THREADS} ${BLOB_ARGS}"
+  # shellcheck disable=SC2086
+  "${RUNNER[@]}" compare --engines "${ENGINES}" --db_base "${DB_BASE}" --csv "${CSV}" --label blob -- \
+    --benchmarks "${BLOB_BENCHMARKS}" --num "${BLOB_NUM}" --value_size "${BLOB_VALUE_SIZE}" \
+    --threads "${BLOB_THREADS}" --compression "${BLOB_COMPRESSION}" ${BLOB_ARGS} ${EXTRA_ARGS} \
+    | grep -E '^(====|[a-z]+ +: |Cumulative compaction)' || true
+fi
 END=$(date +%s)
 echo "Load average at end: $(cut -d' ' -f1-3 /proc/loadavg); total runtime $(( (END - START) / 60 )) min $(( (END - START) % 60 )) s" >> "${MACHINE}"
 
@@ -140,6 +159,14 @@ echo "Load average at end: $(cut -d' ' -f1-3 /proc/loadavg); total runtime $(( (
     echo "block cache, 10-bit full bloom filter, 4 KiB blocks, format_version 6, WAL on, no sync, and the engines' default leveled"
     echo "compaction (dynamic level bytes, level0_file_num_compaction_trigger 4, 2 background jobs). Benchmarks \`${COMPACTION_BENCHMARKS}\`."
     echo "fillrandom and overwrite run with background flushes and compactions; waitforcompaction waits until none is pending."
+  fi
+  if [[ "${RUN_BLOB}" == 1 ]]; then
+    if [[ "${RUN_MATRIX}" == 1 || "${RUN_COMPACTION}" == 1 ]]; then echo; fi
+    echo "Integrated BlobDB configuration (label \`blob\`): num=${BLOB_NUM}, value ${BLOB_VALUE_SIZE} B, threads ${BLOB_THREADS},"
+    echo "compression ${BLOB_COMPRESSION}, \`${BLOB_ARGS}\` (values of at least min_blob_size bytes are written to blob files by"
+    echo "flush and compaction; reads resolve blob indexes through the blob file readers; no blob cache, no blob GC); otherwise"
+    echo "16-byte keys, values 50% compressible, 8 MiB LRU block cache, 10-bit full bloom filter, 4 KiB blocks, format_version 6,"
+    echo "WAL on, no sync. Benchmarks \`${BLOB_BENCHMARKS}\`."
   fi
   if [[ -n "${NOTES:-}" ]]; then echo; echo "${NOTES}"; fi
 } > "${NOTES_FILE}"

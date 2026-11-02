@@ -439,7 +439,7 @@ public sealed partial class ColumnFamily
     public void Flush(FlushOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
-        _db.FlushColumnFamilyAsync(_cfd, options.Wait, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        _db.FlushColumnFamilyAsync(_cfd, options.Wait, FlushReason.ManualFlush, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
     }
 
     public ValueTask FlushAsync(CancellationToken cancellationToken = default) => FlushAsync(s_waitFlush, cancellationToken);
@@ -447,7 +447,7 @@ public sealed partial class ColumnFamily
     public ValueTask FlushAsync(FlushOptions options, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(options);
-        return _db.FlushColumnFamilyAsync(_cfd, options.Wait, synchronous: false, cancellationToken);
+        return _db.FlushColumnFamilyAsync(_cfd, options.Wait, FlushReason.ManualFlush, synchronous: false, cancellationToken);
     }
 
     private static readonly FlushOptions s_waitFlush = new() { Wait = true };

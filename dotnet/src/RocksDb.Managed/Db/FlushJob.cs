@@ -22,9 +22,13 @@ internal static class FlushJob
     /// <summary>
     /// Builds table file #<paramref name="fileNumber"/> from <paramref name="mems"/> (any order). Returns null (and
     /// deletes the file) if the memtables contain nothing. With <paramref name="synchronous"/>, all I/O is blocking.
+    /// With a <paramref name="blobBuilder"/> (enable_blob_files), plain values of at least min_blob_size bytes are written
+    /// to blob files and replaced by blob indexes (BuildTable with a BlobFileBuilder); the builder is finished here and
+    /// its <see cref="Blob.BlobFileBuilder.Additions"/> belong in the same version edit as the table file. On failure
+    /// the caller deletes the builder's files.
     /// </summary>
     public static async ValueTask<FileMetaData?> WriteLevel0TableAsync(IFileSystem fs, string path, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
-        ulong fileNumber, ulong epochNumber, DbIdentity identity, bool synchronous, CancellationToken cancellationToken)
+        ulong fileNumber, ulong epochNumber, DbIdentity identity, Blob.BlobFileBuilder? blobBuilder, bool synchronous, CancellationToken cancellationToken)
     {
         ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         TableBuilderOptions tbo = TableFactory.CreateBuilderOptions(cfd.Options, TableFileLevel.Flush) with
@@ -53,7 +57,8 @@ internal static class FlushJob
         {
             using (var builder = new BlockBasedTableBuilder(file, cfd.Format, tbo))
             {
-                AddPointEntries(builder, cfd.Icmp, mems, meta);
+                AddPointEntries(builder, cfd.Icmp, mems, meta, blobBuilder);
+                blobBuilder?.Finish();
                 AddRangeTombstones(builder, cfd, mems, meta);
                 if (builder.IsEmpty && meta.Smallest.Length == 0)
                 {
@@ -96,7 +101,24 @@ internal static class FlushJob
     }
 
     /// <summary>K-way merge of the memtables' point entries (few inputs: linear minimum selection).</summary>
-    private static void AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta)
+    private static void AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
+        Blob.BlobFileBuilder? blobBuilder)
+    {
+        Util.PooledBufferWriter? blobIndex = blobBuilder is null ? null : new Util.PooledBufferWriter(Blob.BlobIndex.MaxEncodedLength);
+        Util.PooledBufferWriter? blobKey = blobBuilder is null ? null : new Util.PooledBufferWriter(64);
+        try
+        {
+            AddPointEntries(builder, icmp, mems, meta, blobBuilder, blobIndex, blobKey);
+        }
+        finally
+        {
+            blobIndex?.Dispose();
+            blobKey?.Dispose();
+        }
+    }
+
+    private static void AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
+        Blob.BlobFileBuilder? blobBuilder, Util.PooledBufferWriter? blobIndex, Util.PooledBufferWriter? blobKey)
     {
         int n = mems.Count;
         var its = new MemTableIterator[n];
@@ -118,8 +140,31 @@ internal static class FlushJob
             }
             if (best < 0) break;
             ReadOnlySpan<byte> key = its[best].Key;
-            builder.Add(key, its[best].Value);
-            ulong seq = DbFormat.ExtractFooter(key) >> 8;
+            ulong footer = DbFormat.ExtractFooter(key);
+            var type = (EntryType)(byte)footer;
+            if (blobBuilder is not null && type == EntryType.Value)
+            {
+                // CompactionIterator::ExtractLargeValueIfNeeded (flush runs through a CompactionIterator upstream).
+                blobIndex!.Clear();
+                if (blobBuilder.Add(DbFormat.ExtractUserKey(key), its[best].Value, blobIndex))
+                {
+                    blobKey!.Clear();
+                    blobKey.Write(key);
+                    Util.Coding.EncodeFixed64(blobKey.WrittenSpanMutable[^DbFormat.InternalKeyFooterSize..], (footer & ~0xFFUL) | (byte)EntryType.BlobIndex);
+                    builder.Add(blobKey.WrittenSpan, blobIndex.WrittenSpan);
+                    UpdateOldestBlobFileNumber(meta, blobIndex.WrittenSpan);
+                }
+                else
+                {
+                    builder.Add(key, its[best].Value);
+                }
+            }
+            else
+            {
+                builder.Add(key, its[best].Value);
+                if (type == EntryType.BlobIndex) UpdateOldestBlobFileNumber(meta, its[best].Value);
+            }
+            ulong seq = footer >> 8;
             if (seq < meta.SmallestSeqno) meta.SmallestSeqno = seq;
             if (seq > meta.LargestSeqno) meta.LargestSeqno = seq;
             if (first)
@@ -133,6 +178,21 @@ internal static class FlushJob
             its[best].Next();
         }
         if (!first) meta.Largest = lastKey.AsSpan(0, lastLen).ToArray();
+    }
+
+    /// <summary>
+    /// The blob part of FileMetaData::UpdateBoundaries: tracks the oldest blob file referenced by the table. Inlined and
+    /// TTL indexes are not tracked (stacked BlobDB). Throws Corruption for a malformed index.
+    /// </summary>
+    internal static void UpdateOldestBlobFileNumber(FileMetaData meta, ReadOnlySpan<byte> value)
+    {
+        Blob.BlobIndex index = Blob.BlobIndex.Decode(value);
+        if (index.IsInlined || index.HasTtl) return;
+        if (index.FileNumber == FileMetaData.InvalidBlobFileNumber) ThrowHelper.Corruption("Invalid blob file number");
+        if (meta.OldestBlobFileNumber == FileMetaData.InvalidBlobFileNumber || index.FileNumber < meta.OldestBlobFileNumber)
+        {
+            meta.OldestBlobFileNumber = index.FileNumber;
+        }
     }
 
     /// <summary>

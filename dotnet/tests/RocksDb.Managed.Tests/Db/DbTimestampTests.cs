@@ -391,6 +391,37 @@ public sealed class DbTimestampTests
             Assert.ThrowsExactly<RocksDbException>(() => db.CompactRange(new CompactRangeOptions { FullHistoryTsLow = Ts(40) }, B("a"), B("z"))).Code);
     }
 
+    /// <summary>Blob files with timestamps: blob records are keyed by the user key with its timestamp (GetContext ukey_with_ts_found_).</summary>
+    [TestMethod]
+    public async Task BlobValuesWithTimestamps()
+    {
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cfo = UdtOptions(bloom: true);
+        cfo.EnableBlobFiles = true;
+        cfo.MinBlobSize = 1;
+        cfo.EnableBlobGarbageCollection = true;
+        cfo.BlobGarbageCollectionAgeCutoff = 1.0;
+        cfo.MergeOperator = new StringAppendMergeOperator();
+        using RocksDatabase db = OpenUdt(fs, cfo);
+        WriteHistory(db);
+        db.Merge(B("k3"), Ts(40), B("m"));
+        db.Flush();
+        for (int pass = 0; pass < 2; pass++)
+        {
+            Assert.AreEqual("a", ValueAt(db, "k1", 15));
+            Assert.AreEqual("b", ValueAt(db, "k1", 25));
+            Assert.AreEqual("z,m", ValueAt(db, "k3", 45));
+            Assert.AreEqual("z", ValueAt(db, "k3", 39));
+            Assert.AreEqual("x", S(await db.DefaultColumnFamily.GetAsync(At(20), B("k2"))));
+            CollectionAssert.AreEqual(new[] { "k1=b@20", "k2=x@15", "k3=y@25" }, Scan(db, At(25)));
+            CollectionAssert.AreEqual(new[] { "k3=y@25", "k2=x@15", "k1=b@20" }, ScanReverse(db, At(25)));
+            CollectionAssert.AreEqual(new[] { "k1=b@20", "k1=a@10", "k2=x@15", "k3=y@25" },
+                Scan(db, new ReadOptions { Timestamp = Ts(26), IterStartTs = Ts(0) }));
+            // Compaction relocates every blob (age cutoff 1.0) and keeps all timestamped versions readable.
+            db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+        }
+    }
+
     [TestMethod]
     public void SstFileCarriesTimestampPropertiesAndFileMetadata()
     {

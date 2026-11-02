@@ -189,6 +189,12 @@ public sealed class Iterator : IDisposable
     public ValueTask NextAsync(CancellationToken cancellationToken = default) => _it.NextAsync(cancellationToken);
     public ValueTask PrevAsync(CancellationToken cancellationToken = default) => _it.PrevAsync(cancellationToken);
 
+    /// <summary>
+    /// Reads the current value with async I/O if it is still pending (a value stored in a blob file is otherwise read
+    /// synchronously on first access to <c>Value</c>). Iterator::PrepareValue.
+    /// </summary>
+    public ValueTask PrepareValueAsync(CancellationToken cancellationToken = default) => _it.PrepareValueAsync(cancellationToken);
+
     // ------------------------------------------------------------------ foreach over a range (ref struct)
 
     /// <summary><c>foreach</c> over all entries (in key order) from the first.</summary>
@@ -327,6 +333,13 @@ public sealed class Iterator : IDisposable
             }
             if (!t.IsCompletedSuccessfully) return MoveNextSlowAsync(t);
             t.GetAwaiter().GetResult();
+            // A value in a blob file is read with async I/O before it is captured.
+            if (_iterator._it.Valid)
+            {
+                t = _iterator._it.PrepareValueAsync(_ct);
+                if (!t.IsCompletedSuccessfully) return MoveNextSlowAsync(t);
+                t.GetAwaiter().GetResult();
+            }
             return new ValueTask<bool>(Capture());
         }
 
@@ -334,6 +347,7 @@ public sealed class Iterator : IDisposable
         private async ValueTask<bool> MoveNextSlowAsync(ValueTask pending)
         {
             await pending.ConfigureAwait(false);
+            if (_iterator._it.Valid) await _iterator._it.PrepareValueAsync(_ct).ConfigureAwait(false);
             return Capture();
         }
 

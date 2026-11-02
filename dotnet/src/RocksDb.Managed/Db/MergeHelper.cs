@@ -219,6 +219,9 @@ public sealed class MergeHelper : IDisposable
         _level = level;
     }
 
+    /// <summary>Resolves blob base values in <see cref="MergeUntil"/> (the compaction's BlobFetcher); null = NotSupported.</summary>
+    internal Blob.CompactionBlobProcessor? BlobProcessor { get; set; }
+
     // ------------------------------------------------------------------ TimedFullMerge
 
     /// <summary>
@@ -389,7 +392,18 @@ public sealed class MergeHelper : IDisposable
                 }
                 else if (ikey.Type is EntryType.BlobIndex)
                 {
-                    ThrowHelper.NotSupported("merge on top of blob index");
+                    // MergeUntil with a blob base value: fetch it through the compaction's BlobFetcher.
+                    if (BlobProcessor is null) ThrowHelper.NotSupported("merge on top of blob index");
+                    PooledBufferWriter blob = ObjectPools.RentWriter();
+                    try
+                    {
+                        BlobProcessor!.FetchBlob(userKey, iter.Value, blob);
+                        TimedFullMerge(_mergeOperator, userKey, true, blob.WrittenSpan, _operands.AsOperands(), _mergeResult);
+                    }
+                    finally
+                    {
+                        ObjectPools.ReturnWriter(blob);
+                    }
                 }
                 else
                 {

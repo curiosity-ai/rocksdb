@@ -32,7 +32,8 @@ internal struct CompactionIterationStats
 /// User-defined timestamps: versions of a key with different timestamps are distinct keys unless they are older than
 /// full_history_ts_low, in which case the older ones may be collapsed (rule A) and their sequence number and timestamp
 /// zeroed at the bottommost level.
-/// Not ported: snapshot checkers (write-prepared transactions), blob files, wide-column
+/// Blob files (integrated BlobDB): see <see cref="BlobProcessor"/> (extraction, garbage collection, blob values for the
+/// compaction filter and merges). Not ported: snapshot checkers (write-prepared transactions), wide-column
 /// filtering, range-tombstone sentinel keys (range tombstones are handled by the <see cref="RangeDelAggregator"/>
 /// and written by the compaction job). Allocation-free per key: the current key lives in an <see cref="IterKey"/>
 /// and values are spans into the input, the merge helper or the filter output.
@@ -47,6 +48,8 @@ internal sealed class CompactionIterator : IDisposable
         Filter,
         Merge,
         InputPrefix,
+        BlobIndex,
+        BlobValue,
     }
 
     private readonly InternalIterator _input;
@@ -99,6 +102,12 @@ internal sealed class CompactionIterator : IDisposable
     /// <summary>full_history_ts_low of the compaction (null: all timestamp history is preserved).</summary>
     public byte[]? FullHistoryTsLow { get; init; }
 
+    /// <summary>
+    /// Blob extraction and garbage collection for the output (null: blob values pass through unchanged). Set before
+    /// the first positioning call.
+    /// </summary>
+    public Blob.CompactionBlobProcessor? BlobProcessor { get; set; }
+
     /// <param name="input">Merged input, positioned by <see cref="SeekToFirst"/>.</param>
     /// <param name="icmp">Internal key comparator.</param>
     /// <param name="mergeHelper">Merge helper (null when the column family has no merge operator).</param>
@@ -150,6 +159,8 @@ internal sealed class CompactionIterator : IDisposable
         ValueSource.Filter => _filterValue.WrittenSpan,
         ValueSource.Merge => _mergeHelper!.GetOutputValue(_mergeOutIndex),
         ValueSource.InputPrefix => _input.Value[.._valuePrefixLength],
+        ValueSource.BlobIndex => BlobProcessor!.BlobIndexOutput,
+        ValueSource.BlobValue => BlobProcessor!.BlobValueOutput,
         _ => default,
     };
 
@@ -279,14 +290,27 @@ internal sealed class CompactionIterator : IDisposable
         if (FullHistoryTsLow is { } low) _cmpWithHistoryTsLow = _ucmp.CompareTimestamp(ts, low);
     }
 
-    /// <summary>Port of InvokeFilterIfNeeded (plain values only). Returns false if the iteration must stop with an error.</summary>
+    /// <summary>
+    /// Port of InvokeFilterIfNeeded (plain values, and blob values of the integrated BlobDB: the blob is read and the
+    /// filter sees it as a plain value). Returns false if the iteration must stop with an error.
+    /// </summary>
     private void InvokeFilterIfNeeded(ref bool needSkip)
     {
-        if (_compactionFilter is null || _ikeyType != EntryType.Value) return;
+        if (_compactionFilter is null || _ikeyType is not (EntryType.Value or EntryType.BlobIndex)) return;
         _filterValue.Clear();
         _filterSkipUntil.Clear();
         ReadOnlySpan<byte> userKey = _currentKey.UserKey;
-        CompactionFilterDecision decision = _compactionFilter.Filter(_level, userKey, CompactionFilterValueType.Value, _input.Value,
+        ReadOnlySpan<byte> existing = _input.Value;
+        if (_ikeyType == EntryType.BlobIndex)
+        {
+            // For the integrated BlobDB the compaction iterator reads the blob (FilterBlobByKey is not ported).
+            if (BlobProcessor is null)
+            {
+                ThrowHelper.NotSupported("Blob-backed value filtering requires blob read support in the current table-file creation context");
+            }
+            existing = BlobProcessor!.FetchBlobForFilter(userKey, existing);
+        }
+        CompactionFilterDecision decision = _compactionFilter.Filter(_level, userKey, CompactionFilterValueType.Value, existing,
             _filterValue, _filterSkipUntil);
         if (decision == CompactionFilterDecision.RemoveAndSkipUntil && _icmp.CompareUserKey(_filterSkipUntil.WrittenSpan, userKey) <= 0)
         {
@@ -312,6 +336,11 @@ internal sealed class CompactionIterator : IDisposable
                 Stats.NumRecordDropUser++;
                 break;
             case CompactionFilterDecision.ChangeValue:
+                if (_ikeyType != EntryType.Value)
+                {
+                    _ikeyType = EntryType.Value;
+                    _currentKey.UpdateInternalKey(_ikeySequence, EntryType.Value);
+                }
                 _valueSource = ValueSource.Filter;
                 break;
             case CompactionFilterDecision.RemoveAndSkipUntil:
@@ -641,6 +670,36 @@ internal sealed class CompactionIterator : IDisposable
     /// <summary>Port of CompactionIterator::PrepareOutput: zeroes the sequence number at the bottommost level when safe.</summary>
     private void PrepareOutput()
     {
+        if (_valid && BlobProcessor is { } blob)
+        {
+            if (_ikeyType == EntryType.Value)
+            {
+                // ExtractLargeValueIfNeeded
+                if (blob.TryExtract(_currentKey.UserKey, Value))
+                {
+                    _valueSource = ValueSource.BlobIndex;
+                    _ikeyType = EntryType.BlobIndex;
+                    _currentKey.UpdateInternalKey(_ikeySequence, _ikeyType);
+                }
+            }
+            else if (_ikeyType == EntryType.BlobIndex)
+            {
+                // GarbageCollectBlobIfNeeded
+                if (blob.TryRelocate(_currentKey.UserKey, Value, out bool extracted))
+                {
+                    if (extracted)
+                    {
+                        _valueSource = ValueSource.BlobIndex;
+                    }
+                    else
+                    {
+                        _valueSource = ValueSource.BlobValue;
+                        _ikeyType = EntryType.Value;
+                        _currentKey.UpdateInternalKey(_ikeySequence, _ikeyType);
+                    }
+                }
+            }
+        }
         // Zeroing out the sequence number leads to better compression. If this is the bottommost level (no files in lower
         // levels) and the earliest snapshot is larger than this seqno and the userkey differs from the last userkey in
         // compaction then we can squash the seqno to zero.

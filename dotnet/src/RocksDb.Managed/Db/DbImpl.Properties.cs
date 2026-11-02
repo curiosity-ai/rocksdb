@@ -61,6 +61,53 @@ internal sealed partial class DbImpl
                     value = v.ToString(CultureInfo.InvariantCulture);
                     return true;
                 }
+            case DbProperties.NumBlobFiles:
+                value = sv.Current.Storage.BlobFiles.Length.ToString(CultureInfo.InvariantCulture);
+                return true;
+            case DbProperties.BlobStats:
+                {
+                    // InternalStats::HandleBlobStats of the current version.
+                    VersionStorageInfo cur;
+                    lock (_mutex) cur = cfd.Current.Storage;
+                    (ulong total, ulong garbage) = cur.GetBlobStats();
+                    double spaceAmp = total > garbage ? (double)total / (total - garbage) : 0.0;
+                    value = "Number of blob files: " + cur.BlobFiles.Length.ToString(CultureInfo.InvariantCulture) +
+                            "\nTotal size of blob files: " + total.ToString(CultureInfo.InvariantCulture) +
+                            "\nTotal size of garbage in blob files: " + garbage.ToString(CultureInfo.InvariantCulture) +
+                            "\nBlob file space amplification: " + spaceAmp.ToString(CultureInfo.InvariantCulture) + "\n";
+                    return true;
+                }
+            case DbProperties.TotalBlobFileSize:
+                lock (_mutex) value = Versions.TotalBlobFileSize(cfd).ToString(CultureInfo.InvariantCulture);
+                return true;
+            case DbProperties.LiveBlobFileSize:
+            case DbProperties.LiveBlobFileGarbageSize:
+                {
+                    VersionStorageInfo cur;
+                    lock (_mutex) cur = cfd.Current.Storage;
+                    (ulong total, ulong garbage) = cur.GetBlobStats();
+                    value = (property == DbProperties.LiveBlobFileSize ? total : garbage).ToString(CultureInfo.InvariantCulture);
+                    return true;
+                }
+            case DbProperties.BlobCacheCapacity:
+            case DbProperties.BlobCacheUsage:
+            case DbProperties.BlobCachePinnedUsage:
+                {
+                    Cache.BlockCache? cache = cfd.BlobSource.Cache;
+                    if (cache is null)
+                    {
+                        value = null;
+                        return true;
+                    }
+                    long v = property switch
+                    {
+                        DbProperties.BlobCacheUsage => cache.Usage,
+                        DbProperties.BlobCacheCapacity => cache.Capacity,
+                        _ => cache.PinnedUsage,
+                    };
+                    value = v.ToString(CultureInfo.InvariantCulture);
+                    return true;
+                }
             case DbProperties.NumLiveVersions:
                 lock (_mutex) value = cfd.LiveVersions.ToString(CultureInfo.InvariantCulture);
                 return true;
@@ -90,7 +137,7 @@ internal sealed partial class DbImpl
                 value = "0";
                 return true;
             case DbProperties.BackgroundErrors:
-                value = BackgroundError is null ? "0" : "1";
+                value = ErrorHandler.ErrorCount.ToString(CultureInfo.InvariantCulture);
                 return true;
             case DbProperties.CfStats:
             case DbProperties.CfStatsNoFileHistogram:
@@ -573,7 +620,8 @@ internal sealed partial class DbImpl
                 if (GetFromMemTables(sv, lkey, ctx))
                 {
                     if (ctx.State is GetContext.GetState.Deleted) return false;
-                    if (ctx.State is GetContext.GetState.Found && value is not null && ctx.TryResolve(key, out ReadOnlySpan<byte> v))
+                    // A blob reference would need blob file I/O: the key exists but its value is not returned.
+                    if (ctx.State is GetContext.GetState.Found && value is not null && !ctx.ValueIsBlobIndex && ctx.TryResolve(key, out ReadOnlySpan<byte> v))
                     {
                         value.Write(v);
                         valueFound = true;

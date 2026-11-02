@@ -3,7 +3,7 @@ using System.Diagnostics;
 namespace RocksDb.Managed.Db;
 
 /// <summary>Port of rocksdb::WriteStallCondition.</summary>
-internal enum WriteStallCondition : byte
+public enum WriteStallCondition : byte
 {
     Normal,
     Delayed,

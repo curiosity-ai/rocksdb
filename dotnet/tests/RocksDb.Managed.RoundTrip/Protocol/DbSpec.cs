@@ -47,11 +47,20 @@ public sealed class CfSpec
     /// Range deletions and SST ingestion are not used on such CFs.
     /// </summary>
     public bool UserTimestamps { get; set; }
+    /// <summary>Integrated BlobDB: values of at least <see cref="MinBlobSize"/> bytes go to blob files.</summary>
+    public bool EnableBlobFiles { get; set; }
+    public ulong MinBlobSize { get; set; }
+    public ulong BlobFileSize { get; set; } = 256UL << 20;
+    /// <summary>None, Snappy, LZ4 or Zstd.</summary>
+    public CompressionType BlobCompression { get; set; } = CompressionType.None;
+    public bool EnableBlobGc { get; set; }
+    public double BlobGcAgeCutoff { get; set; } = 0.25;
 
     public CfSpec Clone() => (CfSpec)MemberwiseClone();
 
     public override string ToString() =>
-        $"{Name}[{Compression},fv{FormatVersion},{Filter},bs{BlockSize},wb{WriteBufferSize},{(DisableAutoCompactions ? "noauto" : "auto")},{Merge}{(UserTimestamps ? ",u64ts" : "")}]";
+        $"{Name}[{Compression},fv{FormatVersion},{Filter},bs{BlockSize},wb{WriteBufferSize},{(DisableAutoCompactions ? "noauto" : "auto")},{Merge}" +
+        (EnableBlobFiles ? $",blob>={MinBlobSize},{BlobCompression}{(EnableBlobGc ? ",gc" + BlobGcAgeCutoff : "")}" : "") + (UserTimestamps ? ",u64ts" : "") + "]";
 }
 
 /// <summary>How a database is opened by either engine. Serialized as JSON for the child process.</summary>

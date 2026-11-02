@@ -19,6 +19,9 @@ public sealed class ReferenceModel
     public Contents Current { get; } = new();
     public Dictionary<string, Contents> Checkpoints { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>Contents of the latest backup added to each backup directory.</summary>
+    public Dictionary<string, Contents> Backups { get; } = new(StringComparer.Ordinal);
+
     /// <summary>Upper bound on remembered deleted keys per CF (they become "must be absent" checks).</summary>
     public int MaxAbsentPerCf { get; set; } = 4096;
 
@@ -99,6 +102,7 @@ public sealed class ReferenceModel
                 foreach (string file in op.Arg!.Split('|')) Ingest(op.Cf!, _sstFiles[file]);
                 break;
             case OpKind.Checkpoint: Checkpoints[op.Arg!] = Current.Clone(); break;
+            case OpKind.Backup: Backups[op.Arg!] = Current.Clone(); break;
             case OpKind.Snap: _snapshots[op.N] = Current.Clone(); break;
             case OpKind.SnapRelease: _snapshots.Remove(op.N); break;
             default: break; // control / verification ops don't change contents

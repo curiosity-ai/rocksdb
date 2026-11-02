@@ -31,6 +31,7 @@ internal sealed partial class VersionStorageInfo
     private readonly List<(int Level, FileMetaData File)> _filesMarkedForCompaction = new();
     private readonly List<(int Level, FileMetaData File)> _expiredTtlFiles = new();
     private readonly List<(int Level, FileMetaData File)> _filesMarkedForPeriodicCompaction = new();
+    private readonly List<(int Level, FileMetaData File)> _filesMarkedForForcedBlobGC = new();
 
     /// <summary>The column family options this version was built with.</summary>
     public ColumnFamilyOptions Options => _options;
@@ -59,6 +60,8 @@ internal sealed partial class VersionStorageInfo
     public List<(int Level, FileMetaData File)> FilesMarkedForCompaction => _filesMarkedForCompaction;
     public List<(int Level, FileMetaData File)> ExpiredTtlFiles => _expiredTtlFiles;
     public List<(int Level, FileMetaData File)> FilesMarkedForPeriodicCompaction => _filesMarkedForPeriodicCompaction;
+    /// <summary>Table files linked to the oldest blob files when their garbage ratio reaches the force threshold.</summary>
+    public List<(int Level, FileMetaData File)> FilesMarkedForForcedBlobGC => _filesMarkedForForcedBlobGC;
 
     /// <summary>MaxBytesForLevel: target size of a level (L0 is governed by file count).</summary>
     public ulong MaxBytesForLevel(int level) => _levelMaxBytes[level];
@@ -364,7 +367,47 @@ internal sealed partial class VersionStorageInfo
         ComputeFilesMarkedForCompaction(maxOutputLevel);
         ComputeExpiredTtlFiles();
         ComputeFilesMarkedForPeriodicCompaction(maxOutputLevel);
+        ComputeFilesMarkedForForcedBlobGC(_options.BlobGarbageCollectionAgeCutoff, _options.BlobGarbageCollectionForceThreshold,
+            _options.EnableBlobGarbageCollection);
         EstimateCompactionBytesNeeded();
+    }
+
+    /// <summary>
+    /// Port of ComputeFilesMarkedForForcedBlobGC: if the garbage ratio of the blob files eligible for GC by age
+    /// (the oldest age_cutoff fraction) reaches the force threshold, the table files linked to the oldest blob file are
+    /// marked so a compaction relocates its blobs.
+    /// </summary>
+    private void ComputeFilesMarkedForForcedBlobGC(double ageCutoff, double forceThreshold, bool enableGc)
+    {
+        _filesMarkedForForcedBlobGC.Clear();
+        if (!(enableGc && ageCutoff > 0.0 && forceThreshold < 1.0)) return;
+        Blob.BlobFileMetaData[] blobFiles = BlobFiles;
+        if (blobFiles.Length == 0) return;
+        // Number of blob files eligible for GC based on age
+        int cutoffCount = (int)(ageCutoff * blobFiles.Length);
+        if (cutoffCount == 0) return;
+        Blob.BlobFileMetaData oldest = blobFiles[0];
+        ulong sumTotal = oldest.TotalBlobBytes;
+        ulong sumGarbage = oldest.GarbageBlobBytes;
+        for (int count = 1; count < cutoffCount; count++)
+        {
+            sumTotal += blobFiles[count].TotalBlobBytes;
+            sumGarbage += blobFiles[count].GarbageBlobBytes;
+        }
+        if (sumGarbage < forceThreshold * sumTotal) return;
+        foreach (ulong sst in oldest.LinkedSsts)
+        {
+            for (int level = 0; level < NumLevels; level++)
+            {
+                foreach (FileMetaData f in _files[level])
+                {
+                    if (f.FileNumber != sst) continue;
+                    if (!f.BeingCompacted) _filesMarkedForForcedBlobGC.Add((level, f));
+                    goto next;
+                }
+            }
+            next:;
+        }
     }
 
     internal static ulong FifoMaxTableFilesSize(ColumnFamilyOptions o) => o.CompactionOptionsFifo.MaxTableFilesSize;

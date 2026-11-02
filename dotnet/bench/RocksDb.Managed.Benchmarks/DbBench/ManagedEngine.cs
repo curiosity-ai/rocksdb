@@ -28,6 +28,8 @@ public sealed class ManagedEngine : IKeyValueEngine
             MaxBytesForLevelBase = (ulong)options.MaxBytesForLevelBase,
             Level0FileNumCompactionTrigger = options.Level0FileNumCompactionTrigger,
             DisableAutoCompactions = options.DisableAutoCompactions,
+            EnableBlobFiles = options.EnableBlobFiles,
+            MinBlobSize = options.MinBlobSize,
         };
         cfo.TableOptions.BlockSize = (ulong)options.BlockSize;
         cfo.TableOptions.FormatVersion = 6;

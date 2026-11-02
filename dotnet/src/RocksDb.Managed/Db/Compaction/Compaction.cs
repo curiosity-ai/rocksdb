@@ -5,7 +5,7 @@ using RocksDb.Managed.Compression;
 namespace RocksDb.Managed.Db;
 
 /// <summary>Port of rocksdb::CompactionReason (include/rocksdb/listener.h).</summary>
-internal enum CompactionReason
+public enum CompactionReason
 {
     Unknown = 0,
     LevelL0FilesNum,
@@ -116,6 +116,37 @@ internal sealed class Compaction
     public bool IsTrivialMoveForced { get; init; }
     /// <summary>Universal/manual: never trivially move.</summary>
     public bool DisallowTrivialMove { get; init; }
+
+    /// <summary>Manual compaction override of blob garbage collection (CompactRangeOptions::blob_garbage_collection_policy).</summary>
+    public BlobGarbageCollectionPolicy BlobGarbageCollectionPolicy { get; set; } = BlobGarbageCollectionPolicy.UseDefault;
+    /// <summary>Manual compaction override of the age cutoff (outside [0, 1] = use the column family option).</summary>
+    public double BlobGarbageCollectionAgeCutoffOverride { get; set; } = -1;
+
+    /// <summary>Compaction::enable_blob_garbage_collection().</summary>
+    public bool EnableBlobGarbageCollection => BlobGarbageCollectionPolicy switch
+    {
+        BlobGarbageCollectionPolicy.Force => true,
+        BlobGarbageCollectionPolicy.Disable => false,
+        _ => Options.EnableBlobGarbageCollection,
+    };
+
+    /// <summary>Compaction::blob_garbage_collection_age_cutoff().</summary>
+    public double BlobGarbageCollectionAgeCutoff =>
+        BlobGarbageCollectionAgeCutoffOverride is < 0 or > 1 ? Options.BlobGarbageCollectionAgeCutoff : BlobGarbageCollectionAgeCutoffOverride;
+
+    /// <summary>Compaction::DoesInputReferenceBlobFiles.</summary>
+    public bool DoesInputReferenceBlobFiles()
+    {
+        if (InputStorage.BlobFiles.Length == 0) return false;
+        foreach (CompactionInputFiles l in _inputs)
+        {
+            foreach (FileMetaData f in l.Files)
+            {
+                if (f.OldestBlobFileNumber != FileMetaData.InvalidBlobFileNumber) return true;
+            }
+        }
+        return false;
+    }
 
     public int NumInputLevels => _inputs.Length;
     public CompactionInputFiles Inputs(int which) => _inputs[which];

@@ -63,6 +63,8 @@ internal sealed partial class DbImpl
             if (GetFromMemTables(sv, lkey, ctx))
             {
                 ctx.FromMemTable = true;
+                // A blob index is resolved while the super version (and so its blob files) is referenced.
+                ctx.ResolveBlob(cfd.BlobSource, sv.Current.Storage, options, key);
                 return;
             }
             if (options?.ReadTier == ReadTier.MemtableTier)
@@ -71,6 +73,7 @@ internal sealed partial class DbImpl
                 ThrowHelper.Corruption("Incomplete: merge operands not all in memtables");
             }
             GetFromVersion(cfd, sv.Current, lkey.InternalKey, lkey.UserKey, snapshot, ctx);
+            ctx.ResolveBlob(cfd.BlobSource, sv.Current.Storage, options, key);
         }
         finally
         {
@@ -178,6 +181,7 @@ internal sealed partial class DbImpl
             if (GetFromMemTables(sv, key.Span, snapshot, ctx))
             {
                 ctx.FromMemTable = true;
+                await ctx.ResolveBlobAsync(cfd.BlobSource, sv.Current.Storage, options, key, cancellationToken).ConfigureAwait(false);
                 return;
             }
             if (options?.ReadTier == ReadTier.MemtableTier)
@@ -197,18 +201,22 @@ internal sealed partial class DbImpl
             {
                 FileMetaData f = l0[i];
                 if (!UserKeyInFileRange(ucmp, key.Span, f)) continue;
-                if (await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false)) return;
+                if (await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false)) break;
             }
-            for (int level = 1; level < s.NumLevels; level++)
+            if (!ctx.Done)
             {
-                if (s.NumLevelFiles(level) == 0) continue;
-                int idx = s.FindFile(level, ikey.Span);
-                FileMetaData[] files = s.LevelFilesArray(level);
-                if (idx >= files.Length) continue;
-                FileMetaData f = files[idx];
-                if (ucmp.Compare(key.Span, DbFormat.ExtractUserKey(f.Smallest)) < 0) continue;
-                if (await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false)) return;
+                for (int level = 1; level < s.NumLevels; level++)
+                {
+                    if (s.NumLevelFiles(level) == 0) continue;
+                    int idx = s.FindFile(level, ikey.Span);
+                    FileMetaData[] files = s.LevelFilesArray(level);
+                    if (idx >= files.Length) continue;
+                    FileMetaData f = files[idx];
+                    if (ucmp.Compare(key.Span, DbFormat.ExtractUserKey(f.Smallest)) < 0) continue;
+                    if (await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false)) break;
+                }
             }
+            if (ctx.ValueIsBlobIndex) await ctx.ResolveBlobAsync(cfd.BlobSource, s, options, key, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -309,6 +317,8 @@ internal sealed partial class DbImpl
             Levels = levels,
             TableCache = cfd.TableCache,
             MaxSequentialSkipInIterations = cfd.Options.MaxSequentialSkipInIterations,
+            BlobSource = cfd.BlobSource,
+            BlobVersion = s,
             PrefixExtractor = cfd.Options.PrefixExtractor,
             Cleanup = new SuperVersionRelease(this, sv),
         };
