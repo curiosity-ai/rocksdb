@@ -124,11 +124,8 @@ internal sealed class TableCache : ITableCache, IDisposable
         return r;
     }
 
-    public InternalIterator NewIterator(FileMetaData file)
-    {
-        Handle h = FindTable(file);
-        return new LeasedTableIterator(h);
-    }
+    /// <summary>Iterator over the table; disposing it releases the reader lease.</summary>
+    public InternalIterator NewIterator(FileMetaData file) => new TableInternalIterator(GetReader(file));
 
     /// <summary>Port of TableCache::FindTable: returns a referenced, opened handle.</summary>
     private Handle FindTable(FileMetaData file)
@@ -242,43 +239,6 @@ internal sealed class TableCache : ITableCache, IDisposable
         foreach (KeyValuePair<ulong, Handle> kv in _handles)
         {
             if (_handles.TryRemove(kv.Key, out Handle? h)) h.Release();
-        }
-    }
-
-    /// <summary>
-    /// <see cref="InternalIterator"/> over a cached table that holds the reader reference until disposed.
-    /// TODO(iterators): consolidate with agent I's table iterator adapter.
-    /// </summary>
-    private sealed class LeasedTableIterator : InternalIterator
-    {
-        private Handle? _handle;
-        private readonly BlockBasedTableIterator _it;
-
-        public LeasedTableIterator(Handle h)
-        {
-            _handle = h;
-            _it = h.Reader!.NewIterator();
-        }
-
-        public override bool Valid => _it.Valid;
-        public override ReadOnlySpan<byte> Key => _it.Key;
-        public override ReadOnlySpan<byte> Value => _it.Value;
-        public override void SeekToFirst() => _it.SeekToFirst();
-        public override void SeekToLast() => _it.SeekToLast();
-        public override void Seek(ReadOnlySpan<byte> target) => _it.Seek(target);
-        public override void SeekForPrev(ReadOnlySpan<byte> target) => _it.SeekForPrev(target);
-        public override void Next() => _it.Next();
-        public override void Prev() => _it.Prev();
-        public override ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) => _it.SeekToFirstAsync(cancellationToken);
-        public override ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) => _it.SeekAsync(target, cancellationToken);
-        public override ValueTask NextAsync(CancellationToken cancellationToken = default) => _it.NextAsync(cancellationToken);
-
-        protected override void Dispose(bool disposing)
-        {
-            Handle? h = Interlocked.Exchange(ref _handle, null);
-            if (h is null) return;
-            _it.Dispose();
-            h.Release();
         }
     }
 }

@@ -156,6 +156,23 @@ public sealed class DbCompatTests
             byte[]? v = i++ % 2 == 0 ? cf.Get(U(kv.Key.Key)) : await cf.GetAsync(U(kv.Key.Key));
             Assert.AreEqual(kv.Value, v is null ? null : Encoding.UTF8.GetString(v), "managed: " + kv.Key);
         }
+        // A full scan of each column family yields exactly the live keys, in order.
+        foreach (string cfName in s_cfs)
+        {
+            var expected = new SortedDictionary<string, string>(StringComparer.Ordinal);
+            foreach (KeyValuePair<(string Cf, string Key), string?> kv in m.Data)
+            {
+                if (kv.Key.Cf == cfName && kv.Value is not null) expected[kv.Key.Key] = kv.Value;
+            }
+            var actual = new List<string>();
+            using (Iterator it = db.GetColumnFamily(cfName).NewIterator(null))
+            {
+                for (it.SeekToFirst(); it.Valid; it.Next()) actual.Add(Encoding.UTF8.GetString(it.Key) + "=" + Encoding.UTF8.GetString(it.Value));
+            }
+            var exp = new List<string>();
+            foreach (KeyValuePair<string, string> kv in expected) exp.Add(kv.Key + "=" + kv.Value);
+            CollectionAssert.AreEqual(exp, actual, "scan of " + cfName);
+        }
     }
 
     private static RocksDbSharp.RocksDb OpenNative(string path, RocksDbSharp.MergeOperator merge) =>

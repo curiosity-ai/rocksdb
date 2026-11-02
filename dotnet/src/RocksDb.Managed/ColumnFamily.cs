@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Runtime.CompilerServices;
 using RocksDb.Managed.Db;
+using RocksDb.Managed.Db.Iterators;
 
 namespace RocksDb.Managed;
 
@@ -426,7 +427,44 @@ public sealed class ColumnFamily
         return _db.GetProperty(_cfd, property);
     }
 
-    // TODO(iterators): NewIterator(ReadOptions) / ScanAsync -- wire agent I's DBIter over the memtable and table
-    // iterators of a referenced SuperVersion (see DbImpl.GetReferencedSuperVersion; the iterator must hold the
-    // super version reference until disposed and read at DbImpl.ReadSequence(options)).
+    // =====================================================================================================
+    // Iterators
+    // =====================================================================================================
+
+    /// <summary>
+    /// Creates an iterator over this column family (DB::NewIterator), reading at <see cref="ReadOptions.Snapshot"/> or the
+    /// latest state, honoring the iterate bounds. Dispose it to release the memtables/files it pins.
+    /// </summary>
+    public Iterator NewIterator() => NewIterator(null);
+
+    public Iterator NewIterator(ReadOptions? options)
+    {
+        _db.ThrowIfDisposed();
+        DbIteratorSources sources = _db.NewIteratorSources(_cfd, options);
+        try
+        {
+            return DbIteratorFactory.Create(sources);
+        }
+        catch
+        {
+            sources.Cleanup?.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>Async <see cref="NewIterator(ReadOptions?)"/>: table files are opened with async I/O.</summary>
+    public async ValueTask<Iterator> NewIteratorAsync(ReadOptions? options, CancellationToken cancellationToken = default)
+    {
+        _db.ThrowIfDisposed();
+        DbIteratorSources sources = _db.NewIteratorSources(_cfd, options);
+        try
+        {
+            return await DbIteratorFactory.CreateAsync(sources, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            sources.Cleanup?.Dispose();
+            throw;
+        }
+    }
 }

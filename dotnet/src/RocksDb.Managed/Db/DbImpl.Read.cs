@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using RocksDb.Managed.Db.Iterators;
 using RocksDb.Managed.Table;
 using RocksDb.Managed.Util;
 
@@ -220,5 +221,46 @@ internal sealed partial class DbImpl
             lease.Dispose();
         }
         return ctx.Done;
+    }
+
+    // ---- iterators --------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Port of DBImpl::NewIterator: a DBIter over the memtables and table files of a referenced super version, read at
+    /// the snapshot (or latest) sequence. The super version reference is released when the iterator is disposed.
+    /// </summary>
+    public DbIteratorSources NewIteratorSources(ColumnFamilyData cfd, ReadOptions? options)
+    {
+        ulong sequence = ReadSequence(options);
+        SuperVersion sv = GetReferencedSuperVersion(cfd);
+        var mems = new MemTable[1 + sv.Imm.Length];
+        mems[0] = sv.Mem;
+        sv.Imm.CopyTo(mems, 1);
+        VersionStorageInfo s = sv.Current.Storage;
+        var levels = new IReadOnlyList<FileMetaData>[s.NumLevels];
+        for (int l = 0; l < levels.Length; l++) levels[l] = s.LevelFilesArray(l);
+        return new DbIteratorSources
+        {
+            Comparator = cfd.Icmp,
+            ReadOptions = options,
+            Sequence = sequence,
+            MergeOperator = cfd.MergeOperator,
+            MemTables = mems,
+            Levels = levels,
+            TableCache = cfd.TableCache,
+            MaxSequentialSkipInIterations = cfd.Options.MaxSequentialSkipInIterations,
+            Cleanup = new SuperVersionRelease(this, sv),
+        };
+    }
+
+    /// <summary>Releases an iterator's super version reference (CleanupSuperVersionHandle).</summary>
+    private sealed class SuperVersionRelease(DbImpl db, SuperVersion sv) : IDisposable
+    {
+        private int _done;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _done, 1) == 0) db.ReturnSuperVersion(sv);
+        }
     }
 }

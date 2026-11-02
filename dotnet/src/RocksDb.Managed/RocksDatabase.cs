@@ -195,7 +195,16 @@ public sealed class RocksDatabase : IDisposable, IAsyncDisposable
     /// <summary>The id of this DB session (written into table properties).</summary>
     public string DbSessionId => _db.Identity.SessionId;
 
-    // TODO(iterators): NewIterator(ReadOptions) / ScanAsync -- coordinator wires agent I's DBIter (see ColumnFamily).
+    /// <summary>Iterator over the default column family (DB::NewIterator). See <see cref="ColumnFamily.NewIterator(ReadOptions?)"/>.</summary>
+    public Iterator NewIterator() => _default.NewIterator(null);
+    public Iterator NewIterator(ReadOptions? options) => _default.NewIterator(options);
+    public Iterator NewIterator(ColumnFamily columnFamily, ReadOptions? options)
+    {
+        ArgumentNullException.ThrowIfNull(columnFamily);
+        return columnFamily.NewIterator(options);
+    }
+    public ValueTask<Iterator> NewIteratorAsync(ReadOptions? options, CancellationToken cancellationToken = default) =>
+        _default.NewIteratorAsync(options, cancellationToken);
 
     // =====================================================================================================
     // Default column family data operations (see ColumnFamily for documentation)

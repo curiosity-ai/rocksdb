@@ -509,4 +509,55 @@ public sealed class DbBasicTests
         allocated = GC.GetAllocatedBytesForCurrentThread() - before;
         Assert.AreEqual(0L, allocated, "bytes allocated by 2000 TryGet (memtable)");
     }
+
+    private static List<string> Scan(Iterator it)
+    {
+        var list = new List<string>();
+        for (it.SeekToFirst(); it.Valid; it.Next()) list.Add(S(it.Key.ToArray()) + "=" + S(it.Value.ToArray()));
+        return list;
+    }
+
+    [TestMethod]
+    public async Task IteratorsOverMemtablesAndTables()
+    {
+        MemoryFileSystem fs = NewFs();
+        var cfo = new ColumnFamilyOptions { MergeOperator = new StringAppendMergeOperator() };
+        await using RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs), cfo);
+        db.Put(B("a"), B("1"));
+        db.Put(B("b"), B("2"));
+        db.Put(B("c"), B("3"));
+        db.Merge(B("m"), B("x"));
+        db.Flush();
+        db.Delete(B("b"));
+        db.Merge(B("m"), B("y"));
+        db.Put(B("d"), B("4"));
+        using Snapshot snap = db.GetSnapshot();
+        db.DeleteRange(B("c"), B("d"));
+        db.Put(B("e"), B("5"));
+        using (Iterator it = db.NewIterator())
+        {
+            CollectionAssert.AreEqual(new[] { "a=1", "d=4", "e=5", "m=x,y" }, Scan(it));
+            it.Seek(B("b"));
+            Assert.IsTrue(it.Valid);
+            Assert.AreEqual("d", S(it.Key.ToArray()));
+            it.Prev();
+            Assert.AreEqual("a", S(it.Key.ToArray()));
+        }
+        // The iterator keeps reading its own view across later writes and flushes.
+        Iterator pinned = db.NewIterator(new ReadOptions { Snapshot = snap });
+        db.Put(B("f"), B("6"));
+        db.Flush();
+        CollectionAssert.AreEqual(new[] { "a=1", "c=3", "d=4", "m=x,y" }, Scan(pinned));
+        pinned.Dispose();
+        using (Iterator it = db.NewIterator(new ReadOptions { IterateLowerBound = B("b"), IterateUpperBound = B("f") }))
+        {
+            CollectionAssert.AreEqual(new[] { "d=4", "e=5" }, Scan(it));
+        }
+        using (Iterator it = await db.NewIteratorAsync(null))
+        {
+            var keys = new List<string>();
+            await foreach (KeyValue kv in it.ScanAsync()) keys.Add(S(kv.Key.ToArray())!);
+            CollectionAssert.AreEqual(new[] { "a", "d", "e", "f", "m" }, keys);
+        }
+    }
 }

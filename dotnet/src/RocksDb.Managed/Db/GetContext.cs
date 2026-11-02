@@ -13,7 +13,7 @@ namespace RocksDb.Managed.Db;
 /// Values found in table files are copied into <see cref="Value"/> (the visitor's spans are only valid during the
 /// callback). Merge operands are collected newest first into a <see cref="MergeContext"/> and combined with
 /// <see cref="Managed.MergeOperator.FullMerge"/> at the end.
-/// TODO(merge): consolidate the final merge step with agent I's MergeHelper (db/merge_helper.cc TimedFullMerge).
+/// The final merge uses <see cref="MergeHelper.TimedFullMerge(MergeOperator, ReadOnlySpan{byte}, bool, ReadOnlySpan{byte}, MergeContext, IBufferWriter{byte})"/>.
 /// </para>
 /// Instances are pooled (<see cref="Rent"/>/<see cref="Return"/>) and not thread-safe.
 /// </summary>
@@ -33,8 +33,6 @@ internal sealed class GetContext
     public readonly PooledBufferWriter Value = new(256);
     /// <summary>Scratch output for async table lookups.</summary>
     public readonly PooledBufferWriter Scratch = new(256);
-    private readonly PooledBufferWriter _operandScratch = new(256);
-    private int[] _offsets = new int[9];
 
     public GetState State;
     public ulong MaxCoveringTombstoneSeq;
@@ -157,23 +155,10 @@ internal sealed class GetContext
         // Merge operands present: combine with the base value (if found) or with no base (deleted / nothing older).
         if (MergeOperator is null) throw RocksDbException.InvalidArgument("merge_operator is not properly initialized.");
         bool hasBase = State == GetState.Found;
-        int n = MergeContext.Count;
-        if (_offsets.Length < n + 1) _offsets = new int[Math.Max(n + 1, _offsets.Length * 2)];
-        _operandScratch.Clear();
-        _offsets[0] = 0;
-        for (int i = 0; i < n; i++)
-        {
-            _operandScratch.Write(MergeContext.GetOperand(i)); // oldest first
-            _offsets[i + 1] = _operandScratch.WrittenCount;
-        }
-        var operands = new MergeOperands(_operandScratch.WrittenSpan, _offsets.AsSpan(0, n + 1));
         PooledBufferWriter output = ObjectPools.RentWriter();
         try
         {
-            if (!MergeOperator.FullMerge(userKey, hasBase, hasBase ? Value.WrittenSpan : default, operands, output))
-            {
-                throw new RocksDbException(StatusCode.Corruption, "Corruption: Error: Could not perform merge.", StatusSubCode.MergeOperatorFailed);
-            }
+            MergeHelper.TimedFullMerge(MergeOperator, userKey, hasBase, hasBase ? Value.WrittenSpan : default, MergeContext, output);
             Value.Clear();
             Value.Write(output.WrittenSpan);
         }
