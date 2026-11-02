@@ -490,6 +490,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 {
                     wals.Add(n);
                     _aliveWals.RemoveAt(i);
+                    ForgetAliveWalSize(n);
                 }
                 else i++;
             }
@@ -565,6 +566,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                             {
                                 walsToDelete.Add(number);
                                 _aliveWals.Remove(number);
+                                ForgetAliveWalSize(number);
                             }
                             break;
                         case FileType.OptionsFile:
@@ -579,6 +581,12 @@ internal sealed partial class DbImpl : IAsyncDisposable
         foreach (string p in toDelete) TryDeleteFile(p);
         foreach (ulong n in walsToDelete) DeleteOrArchiveWal(n);
         PurgeObsoleteWalFiles(force: true);
+    }
+
+    /// <summary>A WAL left alive_wal_files_: its size leaves wals_total_size_. REQUIRES: mutex.</summary>
+    private void ForgetAliveWalSize(ulong number)
+    {
+        if (_aliveWalSizes.Remove(number, out long size)) Interlocked.Add(ref _walsTotalSize, -size);
     }
 
     private void TryDeleteFile(string path)
@@ -635,12 +643,34 @@ internal sealed partial class DbImpl : IAsyncDisposable
             }
             CancelBackgroundCompactions();
             await WaitForBackgroundWorkAsync(synchronous).ConfigureAwait(false);
+            // logs_.clear() (ClearWriter): closed WALs not synced yet are closed without a sync, like the current one.
+            foreach (LogWriter closed in _closedWalsToSync) CloseQuietly(closed);
+            _closedWalsToSync.Clear();
             LogWriter? log = _log;
             _log = null;
             if (log is not null)
             {
                 if (synchronous) log.Dispose();
                 else await log.DisposeAsync().ConfigureAwait(false);
+            }
+            // ~ColumnFamilyHandleImpl of dropped column families (their handles live as long as the DB): release their
+            // memtables and current version; their table files become obsolete and are deleted now.
+            bool releasedDropped = false;
+            lock (_mutex)
+            {
+                foreach (ColumnFamilyData cfd in _droppedColumnFamilies)
+                {
+                    if (cfd.Current is not { } v) continue;
+                    ReleaseColumnFamilyMemTables(cfd);
+                    cfd.Current = null!;
+                    Versions.UnrefVersion(v);
+                    releasedDropped = true;
+                }
+            }
+            if (releasedDropped)
+            {
+                try { PurgeObsoleteFiles(); }
+                catch (Exception e) when (e is IOException or RocksDbException) { }
             }
             await Versions.DisposeAsync().ConfigureAwait(false);
             lock (_mutex)

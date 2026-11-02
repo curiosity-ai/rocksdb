@@ -477,7 +477,7 @@ internal sealed partial class DbImpl
     private bool ShouldForwardToBottomPriorityPool(ColumnFamilyData cfd, Compaction c) =>
         Options.BottomPriorityBackgroundThreads > 0 && !c.IsDeletionCompaction && !c.IsTrivialMove()
         && Compaction.OutputToNonZeroMaxOutputLevel(c.OutputLevel,
-            cfd.Current.Storage.MaxOutputLevel(cfd.Options.CfAllowIngestBehind || Options.AllowIngestBehind));
+            cfd.Current.Storage.MaxOutputLevel(cfd.Options.AllowIngestBehind));
 
     /// <summary>
     /// Forwards <paramref name="c"/> to the bottom-priority pool (DBImpl::BackgroundCompaction). If
@@ -709,7 +709,15 @@ internal sealed partial class DbImpl
                         SnapshotChecker = checker,
                         JobSnapshot = jobSnapshot?.SequenceNumber ?? 0,
                     };
-                    job.RunAsync(synchronous: true).GetAwaiter().GetResult();
+                    int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadCompactionMicros);
+                    try
+                    {
+                        job.RunAsync(synchronous: true).GetAwaiter().GetResult();
+                    }
+                    finally
+                    {
+                        Monitoring.FileReadActivity.Exit(activity);
+                    }
                 }
                 finally
                 {
@@ -910,7 +918,7 @@ internal sealed partial class DbImpl
             {
                 // Always compact all files together.
                 finalOutputLevel = cfd.NumLevels - 1;
-                if (cfd.Options.CfAllowIngestBehind) finalOutputLevel--;
+                if (cfd.Options.AllowIngestBehind) finalOutputLevel--;
                 await RunManualCompactionAsync(cfd, CompactionPicker.CompactAllLevels, finalOutputLevel, options, null, null, false, ulong.MaxValue,
                     synchronous, cancellationToken).ConfigureAwait(false);
             }

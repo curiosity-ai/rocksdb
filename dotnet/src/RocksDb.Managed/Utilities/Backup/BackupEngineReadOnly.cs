@@ -301,6 +301,7 @@ public class BackupEngineReadOnly : IDisposable
             NumberFiles = meta.NumberFiles,
             AppMetadata = Encoding.UTF8.GetString(meta.AppMetadata),
             FileDetails = details,
+            ExcludedFiles = includeFileDetails ? meta.ExcludedFiles.ToArray() : null,
             NameForOpen = includeFileDetails ? dir : null,
         };
     }
@@ -405,14 +406,35 @@ public class BackupEngineReadOnly : IDisposable
         {
             if (backupId == 0) backupId = _latestValidBackupId;
             BackupMeta backup = FindValidBackup(backupId);
-            if (backup.ExcludedFiles.Count > 0) ThrowHelper.NotSupported("Restoring backups with excluded files (alternate_dirs) is not supported");
             LogInfo("Restoring backup id " + backupId);
             LogInfo("keep_log_files: " + (options.KeepLogFiles ? 1 : 0));
             // just in case. Ignore errors
             TryIgnore(() => _dbFs.CreateDirectoryIfMissing(dbDir));
             TryIgnore(() => _dbFs.CreateDirectoryIfMissing(walDir));
 
-            HashSet<ulong> filesToKeep = await InferDbFilesToRetainAsync(backup, dbDir, options.Mode, synchronous, ct).ConfigureAwait(false);
+            // Files to restore, and from where (taking into account excluded files): an excluded file comes from the
+            // first of options.alternate_dirs that knows it.
+            var restoreFiles = new List<(BackupEngineReadOnly From, BackupFileEntry File)>(backup.Files.Count + backup.ExcludedFiles.Count);
+            foreach (string excluded in backup.ExcludedFiles)
+            {
+                bool found = false;
+                foreach (BackupEngineReadOnly be in options.AlternateDirs)
+                {
+                    if (be._backupedFileInfos.TryGetValue(excluded, out BackupFileEntry? info))
+                    {
+                        restoreFiles.Add((be, info));
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                {
+                    ThrowHelper.InvalidArgument("Excluded file " + excluded + " not found in any of " + options.AlternateDirs.Count + " backup directories!");
+                }
+            }
+            foreach (BackupFileEntry f in backup.Files) restoreFiles.Add((this, f));
+
+            HashSet<ulong> filesToKeep = await InferDbFilesToRetainAsync(restoreFiles, dbDir, options.Mode, synchronous, ct).ConfigureAwait(false);
             if (options.KeepLogFiles)
             {
                 // Delete non-matching files in db_dir, but keep all the log files.
@@ -437,7 +459,8 @@ public class BackupEngineReadOnly : IDisposable
 
             string? temporaryCurrent = null, finalCurrent = null;
             bool syncDbDir = false, syncWalDir = false;
-            foreach (BackupFileEntry f in backup.Files)
+            var copies = new List<(BackupEngineReadOnly From, BackupFileEntry File, string Dst)>(restoreFiles.Count);
+            foreach ((BackupEngineReadOnly from, BackupFileEntry f) in restoreFiles)
             {
                 string dst = f.GetDbFileName();
                 if (!FileNames.TryParseFileName(dst, out ulong number, out FileType type)) ThrowHelper.Corruption("Backup corrupted: Fail to parse filename " + dst);
@@ -458,15 +481,21 @@ public class BackupEngineReadOnly : IDisposable
                     finalCurrent = dst;
                     dst = temporaryCurrent = dst + ".tmp";
                 }
+                copies.Add((from, f, dst));
+            }
+            // The copies run on up to max_background_operations workers (RestoreFileWorkItems on the copy engine).
+            await RunParallelAsync(copies.Count, async (i, sync, token) =>
+            {
+                (BackupEngineReadOnly from, BackupFileEntry f, string dst) = copies[i];
                 LogInfo("Restoring " + f.Filename + " to " + dst);
-                uint crc = await CopyFileAsync(_backupFs, GetAbsolutePath(f.Filename), _dbFs, dst, f.Size, _options.Sync, _options.RestoreRateLimiter, null,
-                    synchronous, ct).ConfigureAwait(false);
+                uint crc = await CopyFileAsync(from._backupFs, from.GetAbsolutePath(f.Filename), _dbFs, dst, f.Size, _options.Sync, _options.RestoreRateLimiter, null,
+                    sync, token).ConfigureAwait(false);
                 if (f.Crc32c is uint expected && expected != crc)
                 {
                     ThrowHelper.Corruption("While restoring " + f.Filename + " -> " + dst + ": expected checksum is " + ChecksumToHex(expected) +
                         " while computed checksum is " + ChecksumToHex(crc));
                 }
-            }
+            }, synchronous, ct).ConfigureAwait(false);
             // The first fsync makes sure all files are persisted before renaming CURRENT.tmp.
             if (syncDbDir) _dbFs.SyncDirectory(dbDir);
             if (syncWalDir && walDir != dbDir) _dbFs.SyncDirectory(walDir);
@@ -508,22 +537,24 @@ public class BackupEngineReadOnly : IDisposable
     /// Port of InferDBFilesToRetainInRestore: in the incremental restore modes, table files (and blob files with
     /// kVerifyChecksum) of the destination identical to the backup's are kept.
     /// </summary>
-    private async ValueTask<HashSet<ulong>> InferDbFilesToRetainAsync(BackupMeta backup, string dbDir, RestoreMode mode, bool synchronous, CancellationToken ct)
+    private async ValueTask<HashSet<ulong>> InferDbFilesToRetainAsync(List<(BackupEngineReadOnly From, BackupFileEntry File)> files, string dbDir,
+        RestoreMode mode, bool synchronous, CancellationToken ct)
     {
         var keep = new HashSet<ulong>();
         if (mode == RestoreMode.PurgeAllFiles) return keep;
-        var byNumber = new Dictionary<ulong, BackupFileEntry>();
-        foreach (BackupFileEntry f in backup.Files)
+        var byNumber = new Dictionary<ulong, (BackupEngineReadOnly From, BackupFileEntry File)>();
+        foreach ((BackupEngineReadOnly from, BackupFileEntry f) in files)
         {
             if (!FileNames.TryParseFileName(f.GetDbFileName(), out ulong number, out FileType type)) continue;
-            if (type == FileType.TableFile || (type == FileType.BlobFile && mode == RestoreMode.VerifyChecksum)) byNumber[number] = f;
+            if (type == FileType.TableFile || (type == FileType.BlobFile && mode == RestoreMode.VerifyChecksum)) byNumber[number] = (from, f);
         }
         foreach (string child in TryGetChildren(_dbFs, dbDir) ?? [])
         {
             if (!FileNames.TryParseFileName(child, out ulong number, out FileType type)) continue;
             if (type != FileType.TableFile && type != FileType.BlobFile) continue;
             if (type == FileType.BlobFile && mode != RestoreMode.VerifyChecksum) continue;
-            if (!byNumber.TryGetValue(number, out BackupFileEntry? bf)) continue;
+            if (!byNumber.TryGetValue(number, out (BackupEngineReadOnly From, BackupFileEntry File) entry)) continue;
+            BackupFileEntry bf = entry.File;
             string path = dbDir + "/" + child;
             ulong size;
             try { size = (ulong)_dbFs.GetFileSize(path); }
@@ -535,8 +566,8 @@ public class BackupEngineReadOnly : IDisposable
             }
             else
             {
-                uint expected = bf.Crc32c ?? await ComputeChecksumAsync(_backupFs, GetAbsolutePath(bf.Filename), 0, _options.RestoreRateLimiter, synchronous, ct)
-                    .ConfigureAwait(false);
+                uint expected = bf.Crc32c ?? await ComputeChecksumAsync(entry.From._backupFs, entry.From.GetAbsolutePath(bf.Filename), 0,
+                    _options.RestoreRateLimiter, synchronous, ct).ConfigureAwait(false);
                 uint actual = await ComputeChecksumAsync(_dbFs, path, 0, _options.RestoreRateLimiter, synchronous, ct).ConfigureAwait(false);
                 if (actual == expected) keep.Add(number);
             }
@@ -659,6 +690,48 @@ public class BackupEngineReadOnly : IDisposable
                 else await dstFile.DisposeAsync().ConfigureAwait(false);
             }
         }
+    }
+
+    /// <summary>
+    /// Runs <paramref name="work"/> for 0 .. <paramref name="count"/> - 1 on up to
+    /// <see cref="BackupEngineOptions.MaxBackgroundOperations"/> concurrent workers (the copy engine's threads,
+    /// utilities/backup/backup_engine.cc). The first failure is rethrown once the started items finished; items not
+    /// started yet are skipped.
+    /// </summary>
+    private protected async ValueTask RunParallelAsync(int count, Func<int, bool, CancellationToken, ValueTask> work, bool synchronous, CancellationToken ct)
+    {
+        int workers = Math.Min(Math.Max(1, _options.MaxBackgroundOperations), count);
+        if (workers <= 1)
+        {
+            for (int i = 0; i < count; i++) await work(i, synchronous, ct).ConfigureAwait(false);
+            return;
+        }
+        int next = -1;
+        Exception? failure = null;
+        // Synchronous callers block on thread-pool workers doing synchronous I/O; async callers get async workers.
+        var tasks = new Task[workers];
+        for (int w = 0; w < workers; w++)
+        {
+            tasks[w] = Task.Run(async () =>
+            {
+                while (Volatile.Read(ref failure) is null)
+                {
+                    int i = Interlocked.Increment(ref next);
+                    if (i >= count) return;
+                    try
+                    {
+                        await work(i, synchronous, ct).ConfigureAwait(false);
+                    }
+                    catch (Exception e)
+                    {
+                        Interlocked.CompareExchange(ref failure, e, null);
+                    }
+                }
+            }, CancellationToken.None);
+        }
+        if (synchronous) Task.WaitAll(tasks, CancellationToken.None);
+        else await Task.WhenAll(tasks).ConfigureAwait(false);
+        if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(failure);
     }
 
     private static void InvokeProgress(Action progress)

@@ -259,7 +259,7 @@ internal sealed partial class VersionStorageInfo
     {
         double totalDowncompactBytes = 0.0;
         const double ScoreScale = 10.0;
-        int maxOutputLevel = MaxOutputLevel(_options.CfAllowIngestBehind);
+        int maxOutputLevel = MaxOutputLevel(_options.AllowIngestBehind);
         int scored = _compactionScore.Length;
         Array.Clear(_compactionScore);
         for (int i = 0; i < scored; i++) _compactionLevel[i] = i;

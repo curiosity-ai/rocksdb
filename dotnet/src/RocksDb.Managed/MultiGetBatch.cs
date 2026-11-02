@@ -280,6 +280,34 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
         if (n > 1) SortOrder(_order.AsSpan(0, n), new KeyOrder(this, userComparator));
     }
 
+    /// <summary>
+    /// Starts a run whose results are computed outside the DB lookup (WriteBatchWithIndex::MultiGetFromBatchAndDB):
+    /// resets the per-key state; results are then set with <see cref="SetExternalResult"/> / <see cref="SetError"/>.
+    /// </summary>
+    internal void BeginExternalRun(Comparator userComparator)
+    {
+        BeginRun(null, 0, userComparator);
+        FoundCount = 0;
+        _hasResults = true;
+    }
+
+    /// <summary>Records the outcome of <paramref name="key"/> for an external run (value copied into the batch).</summary>
+    internal void SetExternalResult(int key, bool found, ReadOnlySpan<byte> value)
+    {
+        GetContext ctx = _contexts[key]!;
+        ctx.Value.Clear();
+        if (found)
+        {
+            ctx.Value.Write(value);
+            _status[key] = MultiGetStatus.Found;
+            FoundCount++;
+        }
+        else
+        {
+            _status[key] = MultiGetStatus.NotFound;
+        }
+    }
+
     /// <summary>Records a per-key failure.</summary>
     internal void SetError(int key, RocksDbException error)
     {

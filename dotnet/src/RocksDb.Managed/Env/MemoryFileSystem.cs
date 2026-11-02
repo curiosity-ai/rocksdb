@@ -235,6 +235,15 @@ public sealed class MemoryFileSystem : IFileSystem
         }
     }
 
+    /// <summary>Random write + sync of an existing file (FSRandomRWFile).</summary>
+    public void WriteAt(string path, long offset, ReadOnlySpan<byte> data)
+    {
+        ThrowIfInactive();
+        MemFile f = GetFile(path, "While open file for random read/write");
+        f.Write(offset, data);
+        f.MarkSynced();
+    }
+
     public DateTimeOffset GetFileModificationTime(string path) => GetFile(path, "while stat a file for modification time").LastModified;
 
     public IDisposable LockFile(string path)

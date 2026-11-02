@@ -238,7 +238,7 @@ using (WriteBatch batch = db.CreateWriteBatch())               // pooled; Dispos
     batch.Put("k1"u8, "v1"u8)
          .Delete("stale"u8)
          .DeleteRange("tmp:"u8, "tmp;"u8)                      // [begin, end)
-         .Put(audit.Id, "k1"u8, "created"u8);                  // other column family by id
+         .Put(audit, "k1"u8, "created"u8);                     // another column family
     db.Write(batch);                                           // atomic
 }
 
@@ -248,8 +248,15 @@ using (WriteBatch batch = db.CreateWriteBatch())
     batch.SetSavePoint();
     batch.Put("k3"u8, "oops"u8);
     batch.RollbackToSavePoint();                               // drops k3
-    await db.WriteAsync(new WriteOptions { Sync = true }, batch);   // fsync the WAL before completing
+    await db.WriteAsync(WriteOptions.SyncWrites, batch);       // fsync the WAL before completing
     Console.WriteLine(batch.Count);                            // 1
+}
+using (WriteBatch batch = db.CreateWriteBatch())
+{
+    batch.Put("logged"u8, "1"u8);
+    batch.MarkWalTerminationPoint();                           // later records skip the WAL (memtable only)
+    batch.Put("cache-only"u8, "2"u8);
+    db.Write(batch);
 }
 // The batch representation (batch.Data) is byte-identical to native rocksdb::WriteBatch::Data().
 ```
@@ -651,6 +658,8 @@ Console.WriteLine(db.Get("big"u8)!.Length);                          // 4096, re
 using TtlDatabase db = TtlDatabase.Open(path, new DbOptions { CreateIfMissing = true }, ttlSeconds: 3600);
 db.Put("session"u8, "token"u8);
 Console.WriteLine(System.Text.Encoding.UTF8.GetString(db.Get("session"u8)!));   // token (timestamp stripped)
+using (Iterator it = db.NewIterator())                                           // iterators strip it too
+    for (it.SeekToFirst(); it.Valid; it.Next()) Console.WriteLine(it.Value.Length); // 5
 db.CompactRange();                                                               // expired entries are removed here
 ```
 
@@ -666,7 +675,7 @@ using (RocksDatabase db = RocksDatabase.Open(path, new DbOptions { CreateIfMissi
     await db.CreateCheckpointAsync(checkpointDir);
 
     // Backups: incremental, shared SST files, native-identical layout (native BackupEngine can read them).
-    using BackupEngine backups = BackupEngine.Open(new BackupEngineOptions(backupDir));
+    using BackupEngine backups = BackupEngine.Open(new BackupEngineOptions(backupDir) { MaxBackgroundOperations = 4 });
     uint id = backups.CreateNewBackup(db, flushBeforeBackup: true);
     backups.VerifyBackup(id, verifyWithChecksum: true);
     foreach (BackupInfo info in backups.GetBackupInfo())
@@ -682,7 +691,8 @@ using RocksDatabase fromCheckpoint = RocksDatabase.Open(checkpointDir, new DbOpt
 ```
 
 `BackupEngine` also supports app metadata, progress callbacks, rate limiting (`BackupRateLimiter`), `DeleteBackup`,
-`GarbageCollect` and `StopBackup`. Every operation that does I/O has an async version.
+`GarbageCollect`, `StopBackup`, parallel copies (`MaxBackgroundOperations`) and excluding shared files known to live in
+another backup directory (`CreateBackupOptions.ExcludeFilesCallback`, restored with `RestoreOptions.AlternateDirs`). Every operation that does I/O has an async version.
 
 ### SstFileWriter and ingestion
 
@@ -701,6 +711,7 @@ using (SstFileWriter writer = db.CreateSstFileWriter(db.DefaultColumnFamily))   
 }
 
 // ...and ingest it atomically (the file is placed at the lowest level it fits; also works with native SSTs).
+// Several files may overlap: later files in the list win. IngestBehind = true back-fills below existing data.
 db.IngestExternalFiles([sstPath], new IngestExternalFileOptions { MoveFiles = true });
 ```
 

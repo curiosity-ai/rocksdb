@@ -56,16 +56,46 @@ public sealed class ReadOptions
 /// <summary>Options for write operations. Port of rocksdb::WriteOptions with upstream defaults. Not persisted.</summary>
 public sealed class WriteOptions
 {
+    private bool _sync, _disableWal, _ignoreMissingColumnFamilies, _noSlowdown, _lowPri, _memtableInsertHintPerBatch;
+    private ulong _protectionBytesPerKey;
+    private readonly bool _readOnly;
+
+    public WriteOptions()
+    {
+    }
+
+    private WriteOptions(bool sync)
+    {
+        _sync = sync;
+        _readOnly = true;
+    }
+
+    /// <summary>
+    /// Shared read-only options with <see cref="Sync"/> = true (the WAL is fsynced before the write is acknowledged),
+    /// e.g. <c>db.Write(batch, WriteOptions.SyncWrites)</c>. Setting a property of this instance throws
+    /// <see cref="InvalidOperationException"/>.
+    /// </summary>
+    public static WriteOptions SyncWrites { get; } = new(sync: true);
+
+    /// <summary>True for the shared <see cref="SyncWrites"/> instance, whose properties cannot be changed.</summary>
+    public bool IsReadOnly => _readOnly;
+
     /// <summary>fsync the WAL before acknowledging the write (default false).</summary>
-    public bool Sync { get; set; }
+    public bool Sync { get => _sync; set => _sync = Settable(value); }
     /// <summary>Skip the WAL (data may be lost on crash).</summary>
-    public bool DisableWal { get; set; }
-    public bool IgnoreMissingColumnFamilies { get; set; }
+    public bool DisableWal { get => _disableWal; set => _disableWal = Settable(value); }
+    public bool IgnoreMissingColumnFamilies { get => _ignoreMissingColumnFamilies; set => _ignoreMissingColumnFamilies = Settable(value); }
     /// <summary>Fail with Incomplete instead of waiting when writes are stalled.</summary>
-    public bool NoSlowdown { get; set; }
-    public bool LowPri { get; set; }
-    public bool MemtableInsertHintPerBatch { get; set; }
-    public ulong ProtectionBytesPerKey { get; set; }
+    public bool NoSlowdown { get => _noSlowdown; set => _noSlowdown = Settable(value); }
+    public bool LowPri { get => _lowPri; set => _lowPri = Settable(value); }
+    public bool MemtableInsertHintPerBatch { get => _memtableInsertHintPerBatch; set => _memtableInsertHintPerBatch = Settable(value); }
+    public ulong ProtectionBytesPerKey { get => _protectionBytesPerKey; set => _protectionBytesPerKey = Settable(value); }
+
+    private T Settable<T>(T value)
+    {
+        if (_readOnly) throw new InvalidOperationException("WriteOptions.SyncWrites is shared and read-only; create a new WriteOptions instead.");
+        return value;
+    }
 }
 
 /// <summary>Options for manual flush. Port of rocksdb::FlushOptions.</summary>

@@ -142,6 +142,7 @@ internal sealed partial class DbImpl
                 // Memtable bloom / in-place settings take effect for the next memtable (ImmutableMemTableOptions).
                 cfd.MemOptions.ApplyColumnFamilyOptions(live);
                 cfd.Mem.UpdateWriteBufferSize(cfd.MemOptions.WriteBufferSize);
+                RecomputeMaxTotalInMemoryState();
                 cfd.Current.Storage.ComputeCompactionScore();
                 RecalculateWriteStall(cfd);
                 InstallSuperVersion(cfd);

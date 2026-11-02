@@ -59,7 +59,26 @@ public sealed class Iterator : IDisposable
     public ReadOnlySpan<byte> Key => _it.Key;
 
     /// <summary>Current value. REQUIRES: <see cref="Valid"/>. Valid until the iterator moves.</summary>
-    public ReadOnlySpan<byte> Value => _it.Value;
+    public ReadOnlySpan<byte> Value
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            ReadOnlySpan<byte> v = _it.Value;
+            int strip = _valueSuffixLength;
+            if (strip == 0) return v;
+            if (v.Length < strip) ThrowHelper.Corruption("Error: value's length less than timestamp's\n");
+            return v[..^strip];
+        }
+    }
+
+    /// <summary>
+    /// Bytes removed from the end of every value (TtlIterator::value() of utilities/ttl/db_ttl_impl.h strips the 4-byte
+    /// write time of TTL databases); 0 = none. Set once by the creator before the iterator is handed out.
+    /// </summary>
+    private int _valueSuffixLength;
+
+    internal void StripValueSuffix(int length) => _valueSuffixLength = length;
 
     /// <summary>
     /// User-defined timestamp of the current entry (Iterator::timestamp()) for column families with timestamps; empty
@@ -97,7 +116,7 @@ public sealed class Iterator : IDisposable
             {
                 Util.PooledBufferWriter w = _columnsScratch ??= new Util.PooledBufferWriter(64);
                 w.Clear();
-                Db.Wide.WideColumnSerialization.SerializeDefaultColumn(_it.Value, w);
+                Db.Wide.WideColumnSerialization.SerializeDefaultColumn(Value, w);
                 c.SetSerialized(w.WrittenSpan);
             }
             return c;
@@ -112,44 +131,122 @@ public sealed class Iterator : IDisposable
 
     public void SeekToFirst()
     {
-        long t0 = _stats?.StartTimer() ?? 0;
-        _it.SeekToFirst();
-        if (_stats is not null) RecordSeek(t0);
+        if (_stats is null)
+        {
+            _it.SeekToFirst();
+            return;
+        }
+        long t0 = _stats.StartTimer();
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
+        try
+        {
+            _it.SeekToFirst();
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
+        RecordSeek(t0);
     }
 
     public void SeekToLast()
     {
-        long t0 = _stats?.StartTimer() ?? 0;
-        _it.SeekToLast();
-        if (_stats is not null) RecordSeek(t0);
+        if (_stats is null)
+        {
+            _it.SeekToLast();
+            return;
+        }
+        long t0 = _stats.StartTimer();
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
+        try
+        {
+            _it.SeekToLast();
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
+        RecordSeek(t0);
     }
 
     /// <summary>Positions at the first key &gt;= <paramref name="target"/>.</summary>
     public void Seek(ReadOnlySpan<byte> target)
     {
-        long t0 = _stats?.StartTimer() ?? 0;
-        _it.Seek(target);
-        if (_stats is not null) RecordSeek(t0);
+        if (_stats is null)
+        {
+            _it.Seek(target);
+            return;
+        }
+        long t0 = _stats.StartTimer();
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
+        try
+        {
+            _it.Seek(target);
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
+        RecordSeek(t0);
     }
 
     /// <summary>Positions at the last key &lt;= <paramref name="target"/>.</summary>
     public void SeekForPrev(ReadOnlySpan<byte> target)
     {
-        long t0 = _stats?.StartTimer() ?? 0;
-        _it.SeekForPrev(target);
-        if (_stats is not null) RecordSeek(t0);
+        if (_stats is null)
+        {
+            _it.SeekForPrev(target);
+            return;
+        }
+        long t0 = _stats.StartTimer();
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
+        try
+        {
+            _it.SeekForPrev(target);
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
+        RecordSeek(t0);
     }
 
     public void Next()
     {
-        _it.Next();
-        if (_stats is not null) RecordStep(Ticker.NumberDbNext, Ticker.NumberDbNextFound);
+        if (_stats is null)
+        {
+            _it.Next();
+            return;
+        }
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
+        try
+        {
+            _it.Next();
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
+        RecordStep(Ticker.NumberDbNext, Ticker.NumberDbNextFound);
     }
 
     public void Prev()
     {
-        _it.Prev();
-        if (_stats is not null) RecordStep(Ticker.NumberDbPrev, Ticker.NumberDbPrevFound);
+        if (_stats is null)
+        {
+            _it.Prev();
+            return;
+        }
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
+        try
+        {
+            _it.Prev();
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
+        RecordStep(Ticker.NumberDbPrev, Ticker.NumberDbPrevFound);
     }
 
     // ---- statistics (DBIter::Seek / Next / Prev RecordTick calls) ----
@@ -363,7 +460,7 @@ public sealed class Iterator : IDisposable
                 _current = default;
                 return false;
             }
-            ReadOnlySpan<byte> k = it.Key, v = it.Value;
+            ReadOnlySpan<byte> k = it.Key, v = _iterator.Value;
             int need = k.Length + v.Length;
             if (_buffer.Length < need)
             {

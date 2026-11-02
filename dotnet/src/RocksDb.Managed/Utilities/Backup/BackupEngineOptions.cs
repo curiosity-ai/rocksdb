@@ -88,6 +88,11 @@ public sealed class BackupEngineOptions
     /// <summary>Buffer size for file copies (io_buffer_size); 0 uses 5 MiB like upstream's default.</summary>
     public int IoBufferSize { get; set; }
 
+    /// <summary>
+    /// Number of files copied concurrently while creating a backup or restoring (max_background_operations). Default 1.
+    /// </summary>
+    public int MaxBackgroundOperations { get; set; } = 1;
+
     /// <summary>Informational logger (info_log). Default null.</summary>
     public InfoLogger? InfoLog { get; set; }
 
@@ -105,6 +110,31 @@ public sealed class CreateBackupOptions
     /// callback aborts the backup (Aborted).
     /// </summary>
     public Action? ProgressCallback { get; set; }
+
+    /// <summary>
+    /// Selects shared files to leave out of this backup (exclude_files_callback), e.g. because they are known to exist
+    /// in another backup directory. The callback receives the sharable files that would be copied into
+    /// <c>shared_checksum/</c> and sets <see cref="MaybeExcludeBackupFile.ExcludeDecision"/> for those to exclude; the
+    /// backup's meta file then lists them as excluded (requires <see cref="BackupEngineOptions.SchemaVersion"/> &gt;= 2)
+    /// and restoring needs <see cref="RestoreOptions.AlternateDirs"/> holding them. An exception thrown by the callback
+    /// fails the backup with Aborted. Advanced: the caller is trusted to keep the excluded files available.
+    /// </summary>
+    public Action<IReadOnlyList<MaybeExcludeBackupFile>>? ExcludeFilesCallback { get; set; }
+}
+
+/// <summary>
+/// A shared backup file that <see cref="CreateBackupOptions.ExcludeFilesCallback"/> may exclude (MaybeExcludeBackupFile /
+/// BackupExcludedFileInfo).
+/// </summary>
+public sealed class MaybeExcludeBackupFile
+{
+    internal MaybeExcludeBackupFile(string relativeFile) => RelativeFile = relativeFile;
+
+    /// <summary>File name and path relative to the backup directory, e.g. <c>shared_checksum/000007_s..._1234.sst</c>.</summary>
+    public string RelativeFile { get; }
+
+    /// <summary>Set to true to exclude the file from this backup.</summary>
+    public bool ExcludeDecision { get; set; }
 }
 
 /// <summary>Port of RestoreOptions::Mode.</summary>
@@ -131,6 +161,12 @@ public sealed class RestoreOptions
 
     /// <summary>Restore mode. Default <see cref="RestoreMode.PurgeAllFiles"/>.</summary>
     public RestoreMode Mode { get; set; } = RestoreMode.PurgeAllFiles;
+
+    /// <summary>
+    /// Backup engines on other backup directories searched, in order, for the files a backup excluded with
+    /// <see cref="CreateBackupOptions.ExcludeFilesCallback"/> (alternate_dirs). Default empty.
+    /// </summary>
+    public IList<BackupEngineReadOnly> AlternateDirs { get; } = new List<BackupEngineReadOnly>();
 }
 
 /// <summary>A file of a backup (BackupFileInfo / FileStorageInfo).</summary>
@@ -158,6 +194,11 @@ public sealed class BackupInfo
     public required string AppMetadata { get; init; }
     /// <summary>File details, with include_file_details only.</summary>
     public IReadOnlyList<BackupFileInfo>? FileDetails { get; init; }
+    /// <summary>
+    /// Shared files excluded from the backup with <see cref="CreateBackupOptions.ExcludeFilesCallback"/>, relative to the
+    /// backup directory (only with file details).
+    /// </summary>
+    public IReadOnlyList<string>? ExcludedFiles { get; init; }
     /// <summary>The backup's private directory (name_for_open), with include_file_details only.</summary>
     public string? NameForOpen { get; init; }
 }

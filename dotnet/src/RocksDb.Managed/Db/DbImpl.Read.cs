@@ -248,7 +248,11 @@ internal sealed partial class DbImpl
             if (sample) FileReadSample.SampleFileReadInc(f);
             bool done = GetFromFile(cfd, f, ikey, userKey, snapshot, ctx);
             if (sample) SampleCollapsibleRead(f, ctx);
-            if (done) return;
+            if (done)
+            {
+                ctx.HitLevel = 0;
+                return;
+            }
         }
         for (int level = 1; level < s.NumLevels; level++)
         {
@@ -261,7 +265,11 @@ internal sealed partial class DbImpl
             if (sample) FileReadSample.SampleFileReadInc(f);
             bool done = GetFromFile(cfd, f, ikey, userKey, snapshot, ctx);
             if (sample) SampleCollapsibleRead(f, ctx);
-            if (done) return;
+            if (done)
+            {
+                ctx.HitLevel = level;
+                return;
+            }
         }
     }
 
@@ -371,7 +379,11 @@ internal sealed partial class DbImpl
                 if (sample) FileReadSample.SampleFileReadInc(f);
                 bool done = await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false);
                 if (sample) SampleCollapsibleRead(f, ctx);
-                if (done) break;
+                if (done)
+                {
+                    ctx.HitLevel = 0;
+                    break;
+                }
             }
             if (!ctx.Done)
             {
@@ -386,7 +398,11 @@ internal sealed partial class DbImpl
                     if (sample) FileReadSample.SampleFileReadInc(f);
                     bool done = await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false);
                     if (sample) SampleCollapsibleRead(f, ctx);
-                    if (done) break;
+                    if (done)
+                    {
+                        ctx.HitLevel = level;
+                        break;
+                    }
                 }
             }
             if (ctx.NeedsBlobResolution) await ctx.ResolveBlobAsync(cfd.BlobSource, s, options, key, cancellationToken).ConfigureAwait(false);
@@ -457,6 +473,7 @@ internal sealed partial class DbImpl
                 if (sample) FileReadSample.SampleFileReadInc(f);
                 done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);
                 if (sample) SampleCollapsibleRead(f, ctx);
+                if (done) ctx.HitLevel = 0;
             }
             for (int level = 1; level < s.NumLevels && !done; level++)
             {
@@ -469,6 +486,7 @@ internal sealed partial class DbImpl
                 if (sample) FileReadSample.SampleFileReadInc(f);
                 done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);
                 if (sample) SampleCollapsibleRead(f, ctx);
+                if (done) ctx.HitLevel = level;
             }
             if (ctx.NeedsBlobResolution) await ctx.ResolveBlobAsync(cfd.BlobSource, s, options, key, cancellationToken).ConfigureAwait(false);
         }

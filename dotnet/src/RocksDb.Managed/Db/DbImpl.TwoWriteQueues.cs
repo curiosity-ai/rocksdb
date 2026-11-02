@@ -203,19 +203,20 @@ internal sealed partial class DbImpl
                 try
                 {
                     ulong first = AssignWalOnlySequences(group, seqInc);
+                    // MergeBatch: WAL parts only (WriteBatchInternal::Append(wal_only = true), WAL termination points).
                     ReadOnlyMemory<byte> record;
-                    if (valid == 1)
+                    if (valid == 1 && !firstValid!.Batch!.HasWalTerminationPoint)
                     {
-                        record = firstValid!.Batch!.DataMemory;
+                        record = firstValid.Batch.DataMemory;
                     }
                     else
                     {
-                        _nonmemGroupBatch.SetContents(firstValid!.Batch!.Data);
+                        _nonmemGroupBatch.SetContentsWalOnly(firstValid!.Batch!);
                         for (int i = 0; i < group.Count; i++)
                         {
                             WriteThread.Writer w = group[i];
                             if (w == firstValid || w.CallbackFailed) continue;
-                            WriteBatch.Append(_nonmemGroupBatch, w.Batch!);
+                            WriteBatch.Append(_nonmemGroupBatch, w.Batch!, walOnly: true);
                         }
                         record = _nonmemGroupBatch.DataMemory;
                     }
@@ -231,7 +232,9 @@ internal sealed partial class DbImpl
                             if (needSync)
                             {
                                 // Requesting sync with two_write_queues is expected to be very rare (upstream calls
-                                // SyncWAL); the record is synced while the WAL write lock is held.
+                                // SyncWAL); the record is synced while the WAL write lock is held, after the closed WALs
+                                // (every logs_ entry, oldest first).
+                                if (_closedWalsToSync.Count > 0) SyncClosedWalsAsync(synchronous: true).GetAwaiter().GetResult();
                                 log.Sync();
                                 SyncWalDirIfNeeded();
                             }
@@ -241,11 +244,15 @@ internal sealed partial class DbImpl
                             await log.AddRecordAsync(record, last, CancellationToken.None).ConfigureAwait(false);
                             if (needSync)
                             {
+                                if (_closedWalsToSync.Count > 0) await SyncClosedWalsAsync(synchronous: false).ConfigureAwait(false);
                                 await log.SyncAsync(CancellationToken.None).ConfigureAwait(false);
                                 SyncWalDirIfNeeded();
                             }
                         }
                         _logEmpty = false;
+                        // wals_total_size_ (both queues write the WAL under the WAL write lock).
+                        _currentWalSize += record.Length;
+                        Interlocked.Add(ref _walsTotalSize, record.Length);
                         if (_seqPerBatch) CacheRecoverableStateOf(group);
                     }
                     catch (Exception e)

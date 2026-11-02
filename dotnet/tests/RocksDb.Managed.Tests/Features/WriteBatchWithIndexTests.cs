@@ -123,6 +123,60 @@ public sealed class WriteBatchWithIndexTests
         Assert.AreEqual("mem,n1", GetString(db, "n"));
     }
 
+    /// <summary>WriteBatchWithIndexTest.MultiGetFromBatchAndDB-style cases: batch values, deletes, merges over DB values.</summary>
+    [TestMethod]
+    public void TestMultiGetFromBatchAndDB()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = OpenDb(fs);
+        db.Put(B("a"), B("a"));
+        db.Put(B("b"), B("b"));
+        db.Put(B("c"), B("c"));
+        db.Put(B("m"), B("base"));
+        db.Flush();
+        db.Put(B("n"), B("mem"));
+        using var batch = new WriteBatchWithIndex();
+        batch.Put(B("a"), B("batch.a")).Delete(B("b"));
+        batch.Merge(db.DefaultColumnFamily, B("m"), B("m1")).Merge(db.DefaultColumnFamily, B("m"), B("m2"));
+        batch.Merge(db.DefaultColumnFamily, B("n"), B("n1"));
+        batch.Merge(db.DefaultColumnFamily, B("new"), B("only"));
+        batch.Delete(B("d")).Merge(db.DefaultColumnFamily, B("d"), B("after-delete"));
+        string[] keys = ["a", "b", "c", "x", "m", "n", "new", "d", "a"];
+        string?[] expected = ["batch.a", null, "c", null, "base,m1,m2", "mem,n1", "only", "after-delete", "batch.a"];
+        using var multi = new MultiGetBatch();
+        foreach (string k in keys) multi.Add(B(k));
+        for (int round = 0; round < 2; round++)
+        {
+            batch.MultiGetFromBatchAndDB(db, multi);
+            for (int i = 0; i < keys.Length; i++)
+            {
+                Assert.AreEqual(expected[i], multi.TryGetValue(i, out ReadOnlySpan<byte> v) ? Encoding.UTF8.GetString(v) : null, keys[i]);
+                Assert.AreEqual(S(batch.GetFromBatchAndDB(db, B(keys[i]))), expected[i], "single get " + keys[i]);
+            }
+            Assert.AreEqual(expected.Count(e => e is not null), multi.FoundCount);
+        }
+        // The DB part honors the snapshot of the read options.
+        using Snapshot snap = db.GetSnapshot();
+        db.Put(B("c"), B("c2"));
+        db.Put(B("m"), B("base2"));
+        batch.MultiGetFromBatchAndDB(db, new ReadOptions { Snapshot = snap }, null, multi);
+        Assert.AreEqual("c", S(multi.GetValue(2).ToArray()));
+        Assert.AreEqual("base,m1,m2", S(multi.GetValue(4).ToArray()));
+        batch.MultiGetFromBatchAndDB(db, multi);
+        Assert.AreEqual("c2", S(multi.GetValue(2).ToArray()));
+        Assert.AreEqual("base2,m1,m2", S(multi.GetValue(4).ToArray()));
+
+        // Merges without a merge operator fail per key; other keys are still answered.
+        using RocksDatabase plain = RocksDatabase.Open("/plain", NewOptions(fs));
+        using var b2 = new WriteBatchWithIndex();
+        b2.Merge(plain.DefaultColumnFamily, B("k"), B("v")).Put(B("p"), B("1"));
+        using var m2 = new MultiGetBatch();
+        m2.Add(B("k")).Add(B("p"));
+        b2.MultiGetFromBatchAndDB(plain, m2);
+        Assert.AreEqual(MultiGetStatus.Error, m2.GetStatus(0));
+        Assert.AreEqual(MultiGetStatus.Found, m2.GetStatus(1));
+    }
+
     [TestMethod]
     public void TestIteratorWithBase()
     {
