@@ -5,7 +5,7 @@ using RocksDb.Managed.Compression;
 namespace RocksDb.Managed.Db;
 
 /// <summary>Port of rocksdb::CompactionReason (include/rocksdb/listener.h).</summary>
-internal enum CompactionReason
+public enum CompactionReason
 {
     Unknown = 0,
     LevelL0FilesNum,

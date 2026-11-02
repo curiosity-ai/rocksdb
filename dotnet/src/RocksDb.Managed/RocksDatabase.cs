@@ -28,6 +28,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     {
         _db = db;
         _default = Handle(db.GetColumnFamilyData(ColumnFamilyDescriptor.DefaultColumnFamilyName));
+        db.Owner = this;
     }
 
     // =====================================================================================================
@@ -132,12 +133,34 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
         _db.DropColumnFamilyAsync(columnFamily.Data, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        ReleaseHandle(columnFamily);
     }
 
-    public ValueTask DropColumnFamilyAsync(ColumnFamily columnFamily, CancellationToken cancellationToken = default)
+    /// <summary>Forgets a dropped column family's handle (OnColumnFamilyHandleDeletionStarted).</summary>
+    private void ReleaseHandle(ColumnFamily columnFamily)
+    {
+        lock (_handlesLock)
+        {
+            if (!_handles.TryGetValue(columnFamily.Data.Id, out ColumnFamily? h) || h != columnFamily) return;
+            _handles.Remove(columnFamily.Data.Id);
+        }
+        _db.NotifyOnColumnFamilyHandleDeletionStarted(columnFamily);
+    }
+
+    /// <summary>Close: every remaining handle is released (OnColumnFamilyHandleDeletionStarted).</summary>
+    private void ReleaseAllHandles()
+    {
+        if (!_db.HasListeners || _db.IsDisposed) return;
+        List<ColumnFamily> handles;
+        lock (_handlesLock) handles = new List<ColumnFamily>(_handles.Values);
+        foreach (ColumnFamily h in handles) _db.NotifyOnColumnFamilyHandleDeletionStarted(h);
+    }
+
+    public async ValueTask DropColumnFamilyAsync(ColumnFamily columnFamily, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
-        return _db.DropColumnFamilyAsync(columnFamily.Data, synchronous: false, cancellationToken);
+        await _db.DropColumnFamilyAsync(columnFamily.Data, synchronous: false, cancellationToken).ConfigureAwait(false);
+        ReleaseHandle(columnFamily);
     }
 
     // =====================================================================================================
@@ -299,16 +322,48 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
         _default.GetAsync(options, key, cancellationToken);
 
     // =====================================================================================================
+    // Background errors
+    // =====================================================================================================
+
+    /// <summary>
+    /// The current background error (a failed flush, compaction, WAL or MANIFEST write), with its
+    /// <see cref="RocksDbException.Severity"/>, or null. With a hard (or worse) error writes fail with it; see
+    /// <see cref="Resume"/>.
+    /// </summary>
+    public RocksDbException? BackgroundError => _db.BackgroundError;
+
+    /// <summary>
+    /// Recovers from a background error (DB::Resume): flushes the memtables (replacing a failed WAL or MANIFEST) and
+    /// clears the error so writes and background work continue. Does nothing when there is no error that stops writes
+    /// or background work. Throws the error if recovery is impossible (fatal or unrecoverable errors require reopening
+    /// the DB) or failed again, Busy while an automatic recovery is running.
+    /// </summary>
+    public void Resume()
+    {
+        ValueTask t = _db.ResumeAsync(synchronous: true);
+        if (!t.IsCompleted) t.AsTask().GetAwaiter().GetResult();
+        else t.GetAwaiter().GetResult();
+    }
+
+    /// <inheritdoc cref="Resume"/>
+    public ValueTask ResumeAsync() => _db.ResumeAsync(synchronous: false);
+
+    // =====================================================================================================
     // Close
     // =====================================================================================================
 
     /// <summary>Closes the DB (DB::Close): waits for writes and background flushes, closes the WAL/MANIFEST, releases LOCK.</summary>
     public void Dispose()
     {
+        ReleaseAllHandles();
         ValueTask t = _db.CloseAsync(synchronous: true);
         if (!t.IsCompleted) t.AsTask().GetAwaiter().GetResult();
         else t.GetAwaiter().GetResult();
     }
 
-    public ValueTask DisposeAsync() => _db.CloseAsync(synchronous: false);
+    public ValueTask DisposeAsync()
+    {
+        ReleaseAllHandles();
+        return _db.CloseAsync(synchronous: false);
+    }
 }

@@ -83,7 +83,7 @@ public static class DbProperties
     public const string MemTableFlushPending = "rocksdb.mem-table-flush-pending";
     /// <summary>Delete entries in the unflushed immutable memtables (kNumDeletesImmMemTables).</summary>
     public const string NumDeletesImmMemTables = "rocksdb.num-deletes-imm-mem-tables";
-    /// <summary>1 if a background error occurred (kBackgroundErrors; the managed port reports 0/1).</summary>
+    /// <summary>Number of background errors reported since open (kBackgroundErrors).</summary>
     public const string BackgroundErrors = "rocksdb.background-errors";
     /// <summary>Aggregated table properties of all files (kAggregatedTableProperties); map form via GetMapProperty.</summary>
     public const string AggregatedTableProperties = "rocksdb.aggregated-table-properties";

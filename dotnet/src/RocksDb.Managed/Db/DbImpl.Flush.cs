@@ -32,7 +32,7 @@ internal sealed partial class DbImpl
     /// </summary>
     private void MaybeScheduleFlush()
     {
-        if (_shuttingDown || _bgError is not null) return;
+        if (_shuttingDown || IsBgWorkStopped) return;
         int attempts = _flushQueue.Count;
         while (_runningFlushes < _maxBackgroundFlushes && attempts-- > 0 && _flushQueue.TryDequeue(out ColumnFamilyData? cfd))
         {
@@ -89,7 +89,12 @@ internal sealed partial class DbImpl
             {
                 foreach (ImmutableMemTable m in picked) m.FlushInProgress = false;
             }
-            SetBackgroundError(e);
+            // The output is left for the full scan at the next open: after a failed MANIFEST write it may already be
+            // referenced by a MANIFEST that CURRENT names (upstream quarantines such files).
+            // FlushMemTableToOutputFile: the WAL is synced at memtable switch, so a failed MANIFEST write maps to
+            // kManifestWriteNoWAL and any other failure (table file write) to kFlushNoWAL.
+            SetBackgroundError(e, Versions.IoStatus is not null ? BackgroundErrorReason.ManifestWriteNoWal : BackgroundErrorReason.FlushNoWal,
+                walRelated: false);
         }
         finally
         {
@@ -128,6 +133,8 @@ internal sealed partial class DbImpl
         foreach (ImmutableMemTable m in picked) mems.Add(m.Mem);
         OnFlushStarted(cfd, jobId, mems);
         string path = FileNames.TableFileName(DbPaths, fileNumber, 0);
+        FlushReason reason = picked[^1].FlushReason;
+        NotifyOnFlushBegin(cfd, jobId, fileNumber, path, mems, reason);
         FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, mems, fileNumber, epoch, Identity, synchronous, CancellationToken.None)
             .ConfigureAwait(false);
         if (meta is not null)
@@ -175,13 +182,14 @@ internal sealed partial class DbImpl
             _maybeStalled = IsWriteStalled();
         }
         OnFlushCompleted(cfd, jobId, meta, flushStart);
+        NotifyOnFlushCompleted(cfd, jobId, meta, path, mems, reason);
     }
 
     /// <summary>
     /// Manual flush (DBImpl::FlushMemTable): switches the CF's memtable if it holds data, schedules the flush and, with
     /// <paramref name="wait"/>, waits until every memtable that existed at the call has been flushed.
     /// </summary>
-    internal async ValueTask FlushColumnFamilyAsync(ColumnFamilyData cfd, bool wait, bool synchronous, CancellationToken cancellationToken)
+    internal async ValueTask FlushColumnFamilyAsync(ColumnFamilyData cfd, bool wait, FlushReason reason, bool synchronous, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
@@ -189,12 +197,14 @@ internal sealed partial class DbImpl
         ImmutableMemTable? target = null;
         try
         {
-            RocksDbException? bg = BackgroundError;
-            if (bg is not null) ThrowBackgroundError(bg);
+            lock (_mutex)
+            {
+                if (IsBgWorkStopped && ErrorHandler.BgError is { } bg) ThrowBackgroundError(bg);
+            }
             if (cfd.Dropped) ThrowDropped(cfd);
             if (!cfd.Mem.IsEmpty)
             {
-                await SwitchMemtableAsync(cfd, synchronous, cancellationToken).ConfigureAwait(false);
+                await SwitchMemtableAsync(cfd, reason, synchronous, cancellationToken).ConfigureAwait(false);
             }
             lock (_mutex)
             {
@@ -214,7 +224,7 @@ internal sealed partial class DbImpl
             lock (_mutex)
             {
                 if (target.FlushCompleted || !cfd.Imm.Contains(target)) return;
-                if (_bgError is { } e) ThrowBackgroundError(e);
+                if (IsBgWorkStopped && ErrorHandler.BgError is { } e) ThrowBackgroundError(e);
                 if (cfd.Dropped) ThrowDropped(cfd);
                 // Close stops scheduling flushes: a flush that was queued but never started will not complete, so
                 // waiters must not sleep past shutdown (CloseAsync signals after setting _shuttingDown).

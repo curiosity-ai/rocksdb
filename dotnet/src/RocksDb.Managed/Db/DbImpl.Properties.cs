@@ -90,7 +90,7 @@ internal sealed partial class DbImpl
                 value = "0";
                 return true;
             case DbProperties.BackgroundErrors:
-                value = BackgroundError is null ? "0" : "1";
+                value = ErrorHandler.ErrorCount.ToString(CultureInfo.InvariantCulture);
                 return true;
             case DbProperties.CfStats:
             case DbProperties.CfStatsNoFileHistogram:

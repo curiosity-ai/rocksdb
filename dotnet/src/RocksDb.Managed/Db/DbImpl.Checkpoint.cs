@@ -146,7 +146,7 @@ internal sealed partial class DbImpl
                 if (cfd.Dropped) continue;
                 try
                 {
-                    await FlushColumnFamilyAsync(cfd, wait: true, synchronous, ct).ConfigureAwait(false);
+                    await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.GetLiveFiles, synchronous, ct).ConfigureAwait(false);
                 }
                 catch (RocksDbException e) when (e.Code == StatusCode.ColumnFamilyDropped)
                 {

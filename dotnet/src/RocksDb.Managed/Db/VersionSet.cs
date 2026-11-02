@@ -190,6 +190,14 @@ internal sealed class VersionSet : IAsyncDisposable
 
     // ---- MANIFEST -------------------------------------------------------------------------------
 
+    private RocksDbException? _ioError;
+
+    /// <summary>
+    /// The error of the last failed MANIFEST (or CURRENT) write, cleared by the next successful one (VersionSet::io_status).
+    /// While set, the next edit starts a new MANIFEST.
+    /// </summary>
+    public RocksDbException? IoStatus => Volatile.Read(ref _ioError);
+
     /// <summary>
     /// Applies <paramref name="edit"/> to <paramref name="cfd"/> (null for DB-wide edits), records it in the MANIFEST
     /// (rolling to a new MANIFEST with a full snapshot when there is none yet or it exceeds max_manifest_file_size) and
@@ -273,8 +281,11 @@ internal sealed class VersionSet : IAsyncDisposable
                     await Await(_manifest!.AddEditAsync(edit, 0, sync: true, cancellationToken), synchronous).ConfigureAwait(false);
                 }
             }
-            catch
+            catch (Exception writeError)
             {
+                // VersionSet::io_status_: remembered so the error handler can classify the failure as a MANIFEST write
+                // error and recovery forces a new MANIFEST.
+                if (writeError is not OperationCanceledException) Volatile.Write(ref _ioError, RocksDbException.FromException(writeError));
                 // If the MANIFEST append failed for whatever reason, the file could be corrupted (torn record), and after a
                 // failed CURRENT update it is unknown which MANIFEST CURRENT names. Force the next version update to start a
                 // new MANIFEST and point CURRENT at it (ProcessManifestWrites: descriptor_log_.reset()).
@@ -301,6 +312,7 @@ internal sealed class VersionSet : IAsyncDisposable
                 throw;
             }
 
+            Volatile.Write(ref _ioError, null);
             lock (_db.Mutex)
             {
                 InstalledManifest = (ManifestFileNumber, (ulong)_manifestLog!.Log.File!.Size);
