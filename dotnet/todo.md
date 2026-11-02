@@ -80,23 +80,40 @@ Wave 2a agents: S = DB spine (open/recover, VersionSet, write path, Get, flush, 
 I = iterators + merge (MergingIterator, LevelIterator, DBIter, MergeHelper, range-del aggregation);
 P = perf + block cache wiring (Table/, Cache/, Memtable/, Util/).
 
-- [ ] `RocksDb.OpenAsync`: create/recover DB (CURRENT→MANIFEST→VersionSet, replay WALs into memtables)
-- [ ] Column families (create/drop/list, per-CF options)
-- [ ] Write path: async group commit (leader/follower via channel), WAL append + sync, memtable insert, sequence numbers
-- [ ] Read path: memtable → immutable memtables → L0..Ln with filter + block cache; snapshots
+- [x] `RocksDatabase.Open/OpenAsync`: create (IDENTITY/MANIFEST/CURRENT/OPTIONS/LOCK), recover (MANIFEST + WAL replay, all recovery modes, flush on recovery), obsolete file deletion
+- [x] Column families (create/drop/list, per-CF memtables/versions, CF-aware WAL replay)
+- [x] Write path: async group commit (`WriteThread`, pooled ValueTask sources, sync callers lead on own thread), memtable switch, max_write_buffer_number stall
+- [x] Read path: memtable → imm → L0 → Ln with snapshots, range tombstones, merges; TryGet/Get callback/GetPooled/MultiGet + async
+- [x] Flush: background flush jobs, L0 build with tombstones + unique ids, MANIFEST rollover; `FlushAsync`
+- [x] Snapshots, GetProperty subset, GetLiveFilesMetadata, NewIterator via DbIteratorFactory
+- [x] Compat: native→managed→native and managed→native→managed round trips with CFs/merges/range deletes/WAL-only data
+- [ ] Shared bounded table cache across CFs; block cache passed to readers
+- [ ] Concurrent memtable insert, pipelined write, `max_total_wal_size`, lazy WAL sync on rotation
+- [ ] Read-only open, custom comparators, KeyMayExist, WAL tracking in MANIFEST, keep dropped CF readable while handle alive
 - [x] Iterators: MergingIterator, LevelIterator, DBIter, public `Iterator` (+foreach, ScanAsync), `DbIteratorFactory` — matches native exactly on multi-level DB with snapshots/bounds
 - [ ] Iterators: range tombstones in heap (skip deleted ranges), prefix seek, async reverse movement, blob/wide columns
 - [x] Merge: `MergeHelper` (TimedFullMerge, MergeUntil), `UInt64AddOperator`, `StringAppendOperator`; `RangeDelAggregator` (read + compaction w/ snapshot stripes); `CompactionFilter` contract
-- [ ] Flush: memtable → L0 SST, MANIFEST update, WAL obsoletion
 - [ ] Compaction: leveled (picker + job), universal later; compaction filter; background scheduling
-- [ ] Range deletions (DeleteRange) end-to-end
-- [ ] Single delete, TTL
-- [ ] Checkpoint, GetUpdatesSince (WAL tailing), GetLiveFilesMetadata, IngestExternalFiles, SstFileWriter public API
+- [x] Range deletions (DeleteRange) end-to-end (memtable, flush, SST, Get, iterators)
+- [x] Single delete (read path)
+- [ ] TTL (OpenWithTtl)
+- [x] GetLiveFilesMetadata
+- [ ] Checkpoint, GetUpdatesSince (WAL tailing), IngestExternalFiles, SstFileWriter public API
 - [ ] Read-only and secondary open
-- [ ] GetProperty (subset), statistics
+- [x] GetProperty (subset)
+- [ ] Statistics
+
+First managed vs native db_bench (200k ops, 16B/100B, shared box; managed has no block cache yet):
+| benchmark | native µs/op | managed µs/op | managed alloc/op |
+|---|---|---|---|
+| fillseq | 4.06 | 3.31 | 0 steady (arena warmup) |
+| fillrandom | 6.22 | 4.75 | 0 |
+| readrandom (memtable) | 4.19 | 2.80 | 0 |
+| readrandom (after flush) | 6.90 | 4.92 | ~3 B (table open) |
+| flush | 214 ms | 398 ms | |
 
 ## Phase 3 — Compat + performance
-- [ ] Full-DB compat: native writes DB → managed opens/reads/writes → native reopens & verifies (and reverse)
+- [x] Full-DB compat: native writes DB → managed opens/reads/writes → native reopens & verifies (and reverse)
 - [ ] Randomized differential test vs native (same op stream, compare results)
 - [ ] Benchmarks vs native: fillseq, fillrandom, readrandom, readseq, seekrandom, multiget; allocation report
 - [ ] Profile & optimize hot paths (block decoding, skiplist, crc, compaction loop)
