@@ -610,7 +610,11 @@ public sealed unsafe class InlineSkipList<TComparer> where TComparer : struct, I
         public void Next()
         {
             Debug.Assert(Valid);
-            _node = InlineSkipList<TComparer>.Next(_node, 0);
+            byte* n = InlineSkipList<TComparer>.Next(_node, 0);
+            _node = n;
+            // Nodes of a randomly filled list are scattered over the arena: start loading the following node while the
+            // caller processes this one (a flush iterates the whole list).
+            if (n != null) Prefetch(NoBarrierNext(n, 0));
         }
 
         public void Prev()

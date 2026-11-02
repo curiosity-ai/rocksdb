@@ -52,13 +52,13 @@ public sealed class MergingIterator : InternalIterator
     public override ReadOnlySpan<byte> Key
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _children[_current].Key;
+        get => ChildKey(_current);
     }
 
     public override ReadOnlySpan<byte> Value
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _children[_current].Value;
+        get => ChildValue(_current);
     }
 
     // ------------------------------------------------------------------ positioning
@@ -111,6 +111,7 @@ public sealed class MergingIterator : InternalIterator
         _current = Top();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public override void Next()
     {
         Debug.Assert(Valid);
@@ -118,7 +119,7 @@ public sealed class MergingIterator : InternalIterator
         // already true for all of the non-current children since current_ is the smallest child and key() ==
         // current_->key(). Otherwise, we explicitly position the non-current children.
         if (!_forward) SwitchToForward();
-        _children[_current].Next();
+        ChildNext(_current);
         AfterCurrentMoved();
     }
 
@@ -130,11 +131,11 @@ public sealed class MergingIterator : InternalIterator
         AfterCurrentMoved();
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     private void AfterCurrentMoved()
     {
         Debug.Assert(_heapSize > 0 && _heap[0] == _current);
-        if (_children[_current].Valid)
+        if (ChildValid(_current))
         {
             // current is still valid after the move: fix the heap position.
             if (_heapSize > 1) SiftDown(0);
@@ -246,6 +247,48 @@ public sealed class MergingIterator : InternalIterator
         AfterCurrentMoved();
     }
 
+    // ------------------------------------------------------------------ children
+    // The children are almost always table iterators (L0 files) and level iterators: test for those sealed types so
+    // the per-key calls are direct (and inlined) instead of virtual, independent of the JIT's profile-guided
+    // devirtualization (which the AggressiveOptimization methods here do not get). Upstream caches the child key in
+    // IteratorWrapper for the same reason.
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ReadOnlySpan<byte> ChildKey(int i)
+    {
+        InternalIterator c = _children[i];
+        if (c is TableInternalIterator t) return t.Key;
+        if (c is LevelIterator l) return l.Key;
+        return c.Key;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ReadOnlySpan<byte> ChildValue(int i)
+    {
+        InternalIterator c = _children[i];
+        if (c is TableInternalIterator t) return t.Value;
+        if (c is LevelIterator l) return l.Value;
+        return c.Value;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool ChildValid(int i)
+    {
+        InternalIterator c = _children[i];
+        if (c is TableInternalIterator t) return t.Valid;
+        if (c is LevelIterator l) return l.Valid;
+        return c.Valid;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ChildNext(int i)
+    {
+        InternalIterator c = _children[i];
+        if (c is TableInternalIterator t) t.Next();
+        else if (c is LevelIterator l) l.Next();
+        else c.Next();
+    }
+
     // ------------------------------------------------------------------ heap (port of util/heap.h BinaryHeap)
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -263,7 +306,7 @@ public sealed class MergingIterator : InternalIterator
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool Before(int a, int b)
     {
-        int c = _icmp.Compare(_children[a].Key, _children[b].Key);
+        int c = _icmp.Compare(ChildKey(a), ChildKey(b));
         return _forward ? c < 0 : c > 0;
     }
 
@@ -281,6 +324,7 @@ public sealed class MergingIterator : InternalIterator
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void PopTop()
     {
         _heapSize--;
@@ -291,6 +335,7 @@ public sealed class MergingIterator : InternalIterator
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void SiftDown(int index)
     {
         int[] heap = _heap;

@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using RocksDb.Managed.Cache;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Table;
@@ -117,6 +118,7 @@ internal static class FlushJob
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
         Blob.BlobFileBuilder? blobBuilder, Util.PooledBufferWriter? blobIndex, Util.PooledBufferWriter? blobKey)
     {

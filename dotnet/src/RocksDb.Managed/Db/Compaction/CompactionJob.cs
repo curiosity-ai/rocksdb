@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using RocksDb.Managed.Cache;
 using RocksDb.Managed.Db.Iterators;
 using RocksDb.Managed.Env;
@@ -281,6 +282,7 @@ internal sealed class CompactionJob
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void AddToOutput(CompactionIterator iter)
     {
         if (_builder is null) OpenOutput();
@@ -351,6 +353,7 @@ internal sealed class CompactionJob
         _largestKey.Clear();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void UpdateBoundaries(ReadOnlySpan<byte> key, ulong seq)
     {
         FileMetaData meta = _meta!;
@@ -597,6 +600,7 @@ internal sealed class CompactionJob
     }
 
     /// <summary>Port of CompactionOutputs::ShouldStopBefore (no TTL cuts, partitioner or round-robin split key).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private bool ShouldStopBefore(ReadOnlySpan<byte> internalKey)
     {
         ulong previousOverlappedBytes = _grandparentOverlappedBytes;

@@ -156,7 +156,7 @@ public sealed class BlockIter : IDisposable
     }
 
     /// <summary>Raw value (for index blocks: the encoded index value bytes).</summary>
-    public ReadOnlySpan<byte> Value => new(_data, _valueOffset, _valueLength);
+    public ReadOnlySpan<byte> Value { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => new(_data, _valueOffset, _valueLength); }
 
     /// <summary>Raw value as memory over the block buffer (valid while the block is alive).</summary>
     public ReadOnlyMemory<byte> ValueMemory => new(_data, _valueOffset, _valueLength);
@@ -190,6 +190,7 @@ public sealed class BlockIter : IDisposable
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Next()
     {
         System.Diagnostics.Debug.Assert(Valid);
@@ -468,6 +469,7 @@ public sealed class BlockIter : IDisposable
     }
 
     /// <summary>Port of BlockIter::ParseNextKey (+ IndexBlockIter::DecodeCurrentValue / global seqno handling).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private bool ParseNextKey()
     {
         int cur = _next;

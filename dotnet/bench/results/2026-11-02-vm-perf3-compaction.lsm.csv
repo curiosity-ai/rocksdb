@@ -1,0 +1,5 @@
+label,engine,num,value_size,threads,compression,files_per_level,user_bytes,written_bytes,write_amp,pending_compaction_bytes
+compaction,c-native,500000,100,1,none,3 0 0 0 0 4 15,116000000,343597384,2.96,0
+compaction,rocksdb-sharp,500000,100,1,none,2 0 0 0 0 4 15,116000000,354334802,3.05,0
+compaction,managed,500000,100,1,none,0 0 0 0 0 3 16,116000000,386547057,3.33,0
+compaction,managed-async,500000,100,1,none,1 0 0 0 0 5 16,116000000,375809638,3.24,0

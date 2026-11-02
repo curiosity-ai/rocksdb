@@ -28,7 +28,12 @@ After the matrix, `run-all.sh` runs one **compaction-heavy** configuration (labe
 `fillrandom,overwrite,waitforcompaction,stats,readrandom,seekrandom`, so the fills run against background flushes and
 compactions, the reads hit a multi-level LSM tree, and `stats` records the LSM shape and write amplification of every
 engine (knobs `COMPACTION_NUM`, `COMPACTION_ARGS`, `COMPACTION_BENCHMARKS`, ... in the header of `run-all.sh`). Results:
-`results/2026-11-02-vm-compaction.md`.
+`results/2026-11-02-vm-compaction.md`, then `-vm-perf2-compaction.md` and `-vm-perf3-compaction.md` after perf passes #2
+and #3 (`docs/perf.md`).
+
+The `flush` and `compact` benchmarks run one flush / one full compaction in a fresh process, so for the managed engines
+they include JIT warm-up of the flush / compaction code (the first compaction of a process is 2.5 - 3.5x slower than
+the following ones; see "Perf pass #3" in `docs/perf.md`).
 
 `RUN_BLOB=1` adds one **integrated BlobDB** configuration (label `blob`): 1 KiB values written to blob files
 (`--enable_blob_files 1 --min_blob_size 512`, 16 MiB write buffer), benchmarks
