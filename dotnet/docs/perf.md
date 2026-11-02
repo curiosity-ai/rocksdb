@@ -144,6 +144,27 @@ which PGO guarded-devirtualizes. ReadyToRun is a property of the consuming appli
 (`PublishReadyToRun`), so it is not set in the library project; applications that care about startup can enable it
 — R2R code is still re-jitted at tier 1 for hot methods. `TieredCompilation=false` is not recommended (loses PGO).
 
+## Prefix seek, partitioned index/filters, dictionary compression (table features round)
+
+These touch the read hot paths: the table Get filter check (now `InternalKeyMayMatch`: a switch on the filter
+kind, optional prefix path), the table iterator Seek (one `CheckFilter` branch), `DbIter`'s forward step (one
+`_hasPrefix` branch) and `BlockFetcher` (dictionary argument). Two alternated runs each of `TableBenchmarks` and
+`IteratorBenchmarks` (before = `acd00d9`, same window, `--job short --iterationCount 8`) show every difference within
+the box's noise (the unchanged `Block:` benchmarks moved by up to ±20% between runs of the same build):
+
+| Benchmark | before (run 1 / run 2) | after (run 1 / run 2) |
+|---|---:|---:|
+| Table: Get (cached blocks) | 989 / 1774 ns | 1194 / 1144 ns |
+| Table: Get (block read+checksum per op) | 1382 / 1961 ns | 1447 / 1487 ns |
+| Table: Seek + 100 x Next (cached) | 7282 / 8981 ns | 7879 / 7991 ns |
+| Index: Seek | 335 / 391 ns | 385 / 379 ns |
+| IteratorBenchmarks ManagedSeekNext100 | 36430 / 32147 ns | 30012 / 32603 ns |
+| IteratorBenchmarks ManagedFullScan | 244 / 193 ns | 193 / 224 ns |
+
+All hot paths still report `Allocated = -`. Dictionary compression allocates per table (buffered block copies,
+samples) and per data block with LZ4 dictionaries (a native LZ4 stream context); ZSTD dictionaries are digested once
+per table (CDict / DDict) and use thread-local contexts.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
