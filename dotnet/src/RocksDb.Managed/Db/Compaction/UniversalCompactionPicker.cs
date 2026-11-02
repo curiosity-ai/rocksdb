@@ -137,6 +137,10 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         return c;
     }
 
+    /// <summary>UniversalCompactionBuilder::ShouldSkipLastSortedRunForSizeAmpCompaction.</summary>
+    private bool ShouldSkipLastSortedRunForSizeAmpCompaction(List<SortedRun> runs) =>
+        Options.PrecludeLastLevelDataSeconds > 0 && Options.NumLevels > 2 && runs[^1].Level == Options.NumLevels - 1 && runs.Count > 1;
+
     /// <summary>Port of GetMaxNumFilesToCompactBasedOnMaxReadAmp.</summary>
     private uint GetMaxNumFilesToCompactBasedOnMaxReadAmp(Builder b, int fileNumCompactionTrigger, uint ratio)
     {
@@ -273,7 +277,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
             grandparents.AddRange(vstorage.LevelFiles(runs[firstIndexAfter].Level).ToArray());
         }
         // intra L0 compactions outputs could have overlap
-        if (outputLevel != 0 && FilesRangeOverlapWithCompaction(inputs, outputLevel)) return null;
+        if (outputLevel != 0 && FilesRangeOverlapWithCompaction(b.Vstorage, inputs, outputLevel)) return null;
         CompactionReason reason = maxNumberOfFilesToCompact == uint.MaxValue ? CompactionReason.UniversalSizeRatio : CompactionReason.UniversalSortedRunNum;
         return Create(b, inputs, outputLevel, grandparents, reason, enableCompression);
     }
@@ -286,9 +290,9 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
     private Compaction? PickCompactionToReduceSizeAmp(Builder b)
     {
         List<SortedRun> runs = b.Runs;
-        // ShouldSkipLastSortedRunForSizeAmpCompaction needs preclude_last_level_data_seconds (per-key placement), which
-        // the port does not act on: the end is always the last run.
-        int endIndex = runs.Count - 1;
+        // ShouldSkipLastSortedRunForSizeAmpCompaction: with per-key placement the last sorted run (the last level) is
+        // left out, the size amplification compaction then ends at the proximal level.
+        int endIndex = ShouldSkipLastSortedRunForSizeAmpCompaction(runs) ? runs.Count - 2 : runs.Count - 1;
         if (runs[endIndex].BeingCompacted) return null;
         ulong baseSrSize = runs[endIndex].Size;
         int startIndex = endIndex;
@@ -482,7 +486,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         // The start level is the first non-empty input (the job and the compaction read the first input as the start).
         while (inputs.Count > 1 && inputs[0].IsEmpty) inputs.RemoveAt(0);
         // intra L0 compactions outputs could have overlap
-        if (outputLevel != 0 && FilesRangeOverlapWithCompaction(inputs, outputLevel)) return null;
+        if (outputLevel != 0 && FilesRangeOverlapWithCompaction(b.Vstorage, inputs, outputLevel)) return null;
         return Create(b, DropEmptyInnerLevels(inputs), outputLevel, new List<FileMetaData>(), CompactionReason.UniversalSizeAmplification, true);
     }
 
@@ -602,7 +606,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
             if (!SetupOtherInputs(vstorage, startLevelInputs, outputLevelInputs, ref parentIndex, -1, false)) return null;
             inputs.Add(startLevelInputs);
             if (!outputLevelInputs.IsEmpty) inputs.Add(outputLevelInputs);
-            if (FilesRangeOverlapWithCompaction(inputs, outputLevel)) return null;
+            if (FilesRangeOverlapWithCompaction(b.Vstorage, inputs, outputLevel)) return null;
             GetGrandparents(vstorage, startLevelInputs, outputLevelInputs, grandparents);
         }
         else
@@ -662,7 +666,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         int outputLevel = endIndex == runs.Count - 1 ? maxOutputLevel : runs[endIndex + 1].Level - 1;
         if (!b.MeetsOutputLevelRequirements(outputLevel, maxOutputLevel)) return null;
         // intra L0 compactions outputs could have overlap
-        if (outputLevel != 0 && FilesRangeOverlapWithCompaction(inputs, outputLevel)) return null;
+        if (outputLevel != 0 && FilesRangeOverlapWithCompaction(b.Vstorage, inputs, outputLevel)) return null;
         // We never check size for compaction_options_universal.compression_size_percent, because we always compact all
         // the files, so always compress.
         return Create(b, inputs, outputLevel, new List<FileMetaData>(), reason, true);

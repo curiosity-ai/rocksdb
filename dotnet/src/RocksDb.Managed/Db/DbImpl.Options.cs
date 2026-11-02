@@ -151,6 +151,8 @@ internal sealed partial class DbImpl
                 MaybeScheduleCompaction();
                 SignalBackgroundWork();
             }
+            lock (_mutex) EnsureSeqnoToTimeMapping(cfd.Options);
+            RegisterRecordSeqnoTimeWorker();
             RescheduleCompactionTrigger();
             LogInfo("SetOptions() on column family [" + cfd.Name + "], inputs:" + description);
             await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);

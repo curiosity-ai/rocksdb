@@ -212,7 +212,22 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
 
     /// <summary>kDefaultPeriodicCompSecs (db/column_family.cc).</summary>
     internal const ulong DefaultPeriodicCompactionSeconds = 0xfffffffffffffffe;
+    /// <summary>
+    /// preclude_last_level_data_seconds (EXPERIMENTAL): data written within this many seconds is kept out of the last
+    /// level. Compactions to the last level of leveled or universal compaction place each entry by its estimated write
+    /// time (per-key placement): newer entries go to the level above (the proximal level). Write times come from the
+    /// DB's sequence-number-to-time mapping, which is recorded while the option is set and persisted in each table
+    /// (<c>rocksdb.seqno.time.map</c>); a DB created with the option gets 100 pre-allocated sequence numbers mapped back
+    /// over the window. Implies <see cref="PreserveInternalTimeSeconds"/> for that duration. 0 (default) disables it.
+    /// Dynamically changeable through SetOptions.
+    /// </summary>
     public ulong PrecludeLastLevelDataSeconds { get; set; }
+
+    /// <summary>
+    /// preserve_internal_time_seconds (EXPERIMENTAL): keep the write-time information (sequence numbers and the
+    /// sequence-number-to-time mapping) of data written within this many seconds; such data is not given sequence
+    /// number 0 by bottommost compactions. 0 (default) disables it. Dynamically changeable through SetOptions.
+    /// </summary>
     public ulong PreserveInternalTimeSeconds { get; set; }
     public Temperature LastLevelTemperature { get; set; } = Temperature.Unknown;
     public Temperature DefaultTemperature { get; set; } = Temperature.Unknown;

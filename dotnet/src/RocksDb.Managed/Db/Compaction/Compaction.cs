@@ -56,7 +56,8 @@ internal sealed class CompactionInputFiles
 /// A picked compaction: inputs per level, output level and the settings for its outputs. Port of rocksdb::Compaction
 /// (db/compaction/compaction.{h,cc}): bottommost detection (IsBottommostLevel), IsTrivialMove,
 /// KeyNotExistsBeyondOutputLevel / KeyRangeNotExistsBeyondOutputLevel, input deletions, being-compacted marking.
-/// Proximal-level output (per-key placement) and subcompaction boundaries are not ported.
+/// Per-key placement (preclude_last_level_data_seconds): EvaluateProximalLevel, PopulateProximalLevelOutputRange,
+/// OverlapProximalLevelOutputRange and GetKeepInLastLevelThroughSeqno. Subcompaction boundaries are not ported.
 /// </summary>
 internal sealed class Compaction
 {
@@ -91,7 +92,166 @@ internal sealed class Compaction
         MaxOutputFileSize = BottommostLevel || grandparents.Count == 0 ? targetFileSize
             : targetFileSize > ulong.MaxValue / 2 ? ulong.MaxValue : 2 * targetFileSize;
         IsFullCompaction = IsFullCompactionOf(vstorage, inputs);
+        // For simplicity, we don't support the concept of "proximal level" with kExternalSstIngestion / kRefitLevel.
+        ProximalLevel = reason is CompactionReason.ExternalSstIngestion or CompactionReason.RefitLevel
+            ? InvalidLevel
+            : EvaluateProximalLevel(vstorage, options, StartLevel, outputLevel);
+        PopulateProximalLevelOutputRange();
         MarkFilesBeingCompacted(true);
+    }
+
+    /// <summary>Compaction::kInvalidLevel.</summary>
+    public const int InvalidLevel = -1;
+
+    /// <summary>
+    /// GetProximalLevel(): the level above the last one that receives the entries too new for the last level with
+    /// per-key placement (preclude_last_level_data_seconds), or <see cref="InvalidLevel"/>.
+    /// </summary>
+    public int ProximalLevel { get; }
+
+    /// <summary>SupportsPerKeyPlacement().</summary>
+    public bool SupportsPerKeyPlacement => ProximalLevel != InvalidLevel;
+
+    /// <summary>
+    /// GetKeepInLastLevelThroughSeqno(): entries with seqnos up to this stay in the last level (the proximal output range
+    /// does not cover the whole last-level input, so last-level data must not move up); 0 with a full range.
+    /// </summary>
+    public ulong KeepInLastLevelThroughSeqno { get; private set; } = DbFormat.MaxSequenceNumber;
+
+    private byte[] _proximalLevelSmallest = [];
+    private byte[] _proximalLevelLargest = [];
+
+    /// <summary>
+    /// Port of Compaction::EvaluateProximalLevel: with leveled or universal compaction to the last level and
+    /// preclude_last_level_data_seconds set, the level above it (not L0); a compaction starting at the last level only
+    /// in universal compaction when the proximal level is empty.
+    /// </summary>
+    public static int EvaluateProximalLevel(VersionStorageInfo vstorage, ColumnFamilyOptions options, int startLevel, int outputLevel)
+    {
+        // TODO upstream: currently per_key_placement feature only support level and universal compaction
+        if (options.CompactionStyle is not (CompactionStyle.Level or CompactionStyle.Universal)) return InvalidLevel;
+        if (outputLevel != options.NumLevels - 1) return InvalidLevel;
+        int proximalLevel = outputLevel - 1;
+        if (proximalLevel <= 0) return InvalidLevel;
+        // If the proximal level is not within input level -> output level range check if the proximal output level is
+        // empty, if it's empty, it could also be locked for the proximal output.
+        if (startLevel == options.NumLevels - 1
+            && (options.CompactionStyle != CompactionStyle.Universal || vstorage.NumLevelFiles(proximalLevel) != 0))
+        {
+            return InvalidLevel;
+        }
+        bool supportsPerKeyPlacement = options.PrecludeLastLevelDataSeconds > 0 || TestForcePerKeyPlacement;
+        return supportsPerKeyPlacement ? proximalLevel : InvalidLevel;
+    }
+
+    /// <summary>Test override (sync point Compaction::SupportsPerKeyPlacement:Enabled).</summary>
+    internal static bool TestForcePerKeyPlacement;
+
+    /// <summary>Port of Compaction::PopulateProximalLevelOutputRange.</summary>
+    private void PopulateProximalLevelOutputRange()
+    {
+        if (!SupportsPerKeyPlacement) return;
+        // exclude the last level, the range of all input levels is the safe range of keys that can be moved up.
+        int excludeLevel = NumberLevels - 1;
+        bool fullRange = false;
+        // For universal compaction, the proximal output range could be extended if all proximal level files are included
+        // in the compaction (which includes the case that the proximal level is empty).
+        if (Options.CompactionStyle == CompactionStyle.Universal)
+        {
+            excludeLevel = InvalidLevel;
+            fullRange = true;
+            var proximalInputs = new HashSet<ulong>();
+            foreach (CompactionInputFiles l in _inputs)
+            {
+                if (l.Level != ProximalLevel) continue;
+                foreach (FileMetaData f in l.Files) proximalInputs.Add(f.FileNumber);
+            }
+            foreach (FileMetaData f in InputStorage.LevelFiles(ProximalLevel))
+            {
+                if (!proximalInputs.Contains(f.FileNumber))
+                {
+                    excludeLevel = NumberLevels - 1;
+                    fullRange = false;
+                    break;
+                }
+            }
+        }
+        // FIXME upstream: when the last level's input range does not overlap with the proximal level, and the proximal
+        // level input is empty, the range stays unset and no key is compacted up.
+        GetBoundaryInternalKeys(InputStorage.Icmp, _inputs, excludeLevel, out _proximalLevelSmallest, out _proximalLevelLargest);
+        if (!fullRange)
+        {
+            // If not full range in proximal level, must keep everything already in the last level there, because moving
+            // it back up might cause overlap/placement issues that are difficult to resolve properly in the presence of
+            // range deletes.
+            ulong maxLastLevelSeqno = 0;
+            foreach (CompactionInputFiles l in _inputs)
+            {
+                if (l.Level != OutputLevel) continue;
+                foreach (FileMetaData f in l.Files) maxLastLevelSeqno = Math.Max(maxLastLevelSeqno, f.LargestSeqno);
+            }
+            KeepInLastLevelThroughSeqno = maxLastLevelSeqno;
+        }
+        else
+        {
+            KeepInLastLevelThroughSeqno = 0;
+        }
+    }
+
+    /// <summary>Port of Compaction::GetBoundaryInternalKeys (internal keys; levels equal to <paramref name="excludeLevel"/> skipped).</summary>
+    private static void GetBoundaryInternalKeys(InternalKeyComparator icmp, CompactionInputFiles[] inputs, int excludeLevel, out byte[] smallest,
+        out byte[] largest)
+    {
+        byte[]? s = null, l = null;
+        foreach (CompactionInputFiles level in inputs)
+        {
+            if (level.IsEmpty || level.Level == excludeLevel) continue;
+            if (level.Level == 0)
+            {
+                foreach (FileMetaData f in level.Files)
+                {
+                    if (s is null || icmp.Compare(f.Smallest, s) < 0) s = f.Smallest;
+                    if (l is null || icmp.Compare(f.Largest, l) > 0) l = f.Largest;
+                }
+            }
+            else
+            {
+                if (s is null || icmp.Compare(level.Files[0].Smallest, s) < 0) s = level.Files[0].Smallest;
+                if (l is null || icmp.Compare(level.Files[^1].Largest, l) > 0) l = level.Files[^1].Largest;
+            }
+        }
+        smallest = s ?? [];
+        largest = l ?? [];
+    }
+
+    /// <summary>
+    /// Port of Compaction::OverlapProximalLevelOutputRange: does the user key range overlap the range this compaction
+    /// may write to its proximal level?
+    /// </summary>
+    public bool OverlapProximalLevelOutputRange(ReadOnlySpan<byte> smallestUserKey, ReadOnlySpan<byte> largestUserKey)
+    {
+        if (!SupportsPerKeyPlacement) return false;
+        // See FIXME in PopulateProximalLevelOutputRange: we do not compact any key up in this case.
+        if (_proximalLevelSmallest.Length == 0 || _proximalLevelLargest.Length == 0) return false;
+        return VersionStorageInfo.CompareWithoutTimestamp(InputStorage.Icmp, smallestUserKey, DbFormat.ExtractUserKey(_proximalLevelLargest)) <= 0
+            && VersionStorageInfo.CompareWithoutTimestamp(InputStorage.Icmp, largestUserKey, DbFormat.ExtractUserKey(_proximalLevelSmallest)) >= 0;
+    }
+
+    /// <summary>Whether a user key lies within the proximal level output range (TEST_AssertWithinProximalLevelOutputRange).</summary>
+    internal bool WithinProximalLevelOutputRange(ReadOnlySpan<byte> userKey) =>
+        _proximalLevelSmallest.Length > 0 && _proximalLevelLargest.Length > 0
+        && InputStorage.Icmp.CompareUserKey(userKey, DbFormat.ExtractUserKey(_proximalLevelSmallest)) >= 0
+        && InputStorage.Icmp.CompareUserKey(userKey, DbFormat.ExtractUserKey(_proximalLevelLargest)) <= 0;
+
+    /// <summary>
+    /// Port of Compaction::GetOutputTemperature: the picker's override (FIFO kChangeTemperature), else
+    /// last_level_temperature for last-level (not proximal) outputs, else default_write_temperature.
+    /// </summary>
+    public Temperature GetOutputTemperature(bool isProximalLevel)
+    {
+        if (OutputTemperature != Temperature.Unknown) return OutputTemperature;
+        if (OutputLevel == NumberLevels - 1 && !isProximalLevel && Options.LastLevelTemperature != Temperature.Unknown) return Options.LastLevelTemperature;
+        return Options.DefaultWriteTemperature;
     }
 
     public VersionStorageInfo InputStorage { get; }
@@ -308,6 +468,8 @@ internal sealed class Compaction
                 }
             }
         }
+        // PerKeyPlacement compaction should never be trivial move.
+        if (SupportsPerKeyPlacement) return false;
         return true;
     }
 

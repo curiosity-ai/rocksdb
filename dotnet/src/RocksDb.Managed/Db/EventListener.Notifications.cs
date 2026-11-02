@@ -189,7 +189,7 @@ internal sealed partial class DbImpl
         ulong outputBytes = 0;
         if (job is not null && failure is null)
         {
-            foreach (FileMetaData f in job.Outputs)
+            foreach (FileMetaData f in job.AllOutputs)
             {
                 outputs.Add(FileNames.TableFileName(DbPaths, f.FileNumber, f.PathId));
                 outputBytes += f.FileSize;
@@ -256,7 +256,7 @@ internal sealed partial class DbImpl
         if (!HasListeners) return;
         if (job is not null && failure is null)
         {
-            foreach (FileMetaData f in job.Outputs)
+            foreach (FileMetaData f in job.AllOutputs)
             {
                 NotifyOnTableFileCreated(cfd, jobId, FileNames.TableFileName(DbPaths, f.FileNumber, f.PathId), f.FileSize,
                     TableFileCreationReason.Compaction, null, TryGetTableProperties(cfd, f));

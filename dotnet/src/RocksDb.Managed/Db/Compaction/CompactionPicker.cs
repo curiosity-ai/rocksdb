@@ -185,14 +185,41 @@ internal abstract class CompactionPicker
             {
                 return true;
             }
+            if (c.SupportsPerKeyPlacement && c.OverlapProximalLevelOutputRange(smallestUserKey, largestUserKey)) return true;
         }
         return false;
     }
 
-    /// <summary>Port of CompactionPicker::FilesRangeOverlapWithCompaction (no proximal level).</summary>
-    public bool FilesRangeOverlapWithCompaction(IReadOnlyList<CompactionInputFiles> inputs, int level)
+    /// <summary>
+    /// Port of CompactionPicker::FilesRangeOverlapWithCompaction with the proximal level the compaction would write
+    /// (Compaction::EvaluateProximalLevel of the inputs' start level and <paramref name="level"/>).
+    /// </summary>
+    public bool FilesRangeOverlapWithCompaction(VersionStorageInfo vstorage, IReadOnlyList<CompactionInputFiles> inputs, int level)
     {
+        int startLevel = -1;
+        foreach (CompactionInputFiles i in inputs)
+        {
+            if (!i.IsEmpty)
+            {
+                startLevel = i.Level;
+                break;
+            }
+        }
+        if (startLevel < 0) return false; // No files in inputs
         if (!GetRange(inputs, out byte[] smallest, out byte[] largest, -1)) return false;
+        int proximalLevel = Compaction.EvaluateProximalLevel(vstorage, Options, startLevel, level);
+        if (proximalLevel != Compaction.InvalidLevel)
+        {
+            if (Options.CompactionStyle == CompactionStyle.Universal)
+            {
+                if (RangeOverlapWithCompaction(DbFormat.ExtractUserKey(smallest), DbFormat.ExtractUserKey(largest), proximalLevel)) return true;
+            }
+            else if (GetRange(inputs, out byte[] proximalSmallest, out byte[] proximalLargest, level)
+                     && RangeOverlapWithCompaction(DbFormat.ExtractUserKey(proximalSmallest), DbFormat.ExtractUserKey(proximalLargest), proximalLevel))
+            {
+                return true;
+            }
+        }
         return RangeOverlapWithCompaction(DbFormat.ExtractUserKey(smallest), DbFormat.ExtractUserKey(largest), level);
     }
 
@@ -477,7 +504,7 @@ internal abstract class CompactionPicker
                     return null;
                 }
             }
-            if (FilesRangeOverlapWithCompaction(all, outputLevel))
+            if (FilesRangeOverlapWithCompaction(vstorage, all, outputLevel))
             {
                 manualConflict = true;
                 return null;
@@ -585,7 +612,7 @@ internal abstract class CompactionPicker
             }
         }
         // Two non-exclusive manual compactions could run at the same time producing overlapping outputs in the same level.
-        if (FilesRangeOverlapWithCompaction(compactionInputs, outputLevel))
+        if (FilesRangeOverlapWithCompaction(vstorage, compactionInputs, outputLevel))
         {
             manualConflict = true;
             return null;

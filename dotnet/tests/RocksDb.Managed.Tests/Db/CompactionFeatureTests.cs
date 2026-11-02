@@ -240,11 +240,13 @@ public sealed class CompactionFeatureTests
         Assert.AreEqual(0, first.Level);
         WaitUntilUnixSecondPasses(first.FileCreationTime + 1);
         db.Put(B("b"), B("2"));
-        db.Flush(); // the next pick sees the old file marked for periodic compaction
+        // The next pick (or already the periodic compaction trigger, whose period is 1 s here) sees the old file marked
+        // for periodic compaction.
+        db.Flush();
         db.WaitForCompact();
         List<LiveFileMetadata> files = db.GetLiveFilesMetadata();
-        Assert.AreEqual(1, files.Count);
-        Assert.AreEqual(cf.NumLevels - 1, files[0].Level);
+        Assert.IsFalse(files.Exists(f => f.FileNumber == first.FileNumber), "the old file was rewritten");
+        Assert.IsTrue(files.Exists(f => f.Level == cf.NumLevels - 1 && f.SmallestKey[0] == (byte)'a'), "into the last level");
         Assert.AreEqual("1", GetString(db, "a"));
         Assert.AreEqual("2", GetString(db, "b"));
     }

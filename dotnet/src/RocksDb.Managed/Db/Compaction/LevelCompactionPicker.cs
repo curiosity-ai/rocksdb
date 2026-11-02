@@ -253,7 +253,7 @@ internal sealed class LevelCompactionPicker : CompactionPicker
                 FileMetaData f = levelFiles[i];
                 if (f.BeingCompacted) return;
                 tmp.Files.Add(f);
-                if (!_picker.ExpandInputsToCleanCut(_vstorage, tmp) || _picker.FilesRangeOverlapWithCompaction([tmp], _outputLevel)) return;
+                if (!_picker.ExpandInputsToCleanCut(_vstorage, tmp) || _picker.FilesRangeOverlapWithCompaction(_vstorage, [tmp], _outputLevel)) return;
                 ulong currBytes = CompactionPicker.TotalFileSize(tmp.Files);
                 _picker.GetRange(tmp, out smallest, out largest);
                 _vstorage.GetOverlappingInputs(_outputLevel, smallest, largest, outputLevelInputs.Files);
@@ -283,7 +283,7 @@ internal sealed class LevelCompactionPicker : CompactionPicker
                 _compactionInputs.Add(_startLevelInputs);
                 if (!_outputLevelInputs.IsEmpty) _compactionInputs.Add(_outputLevelInputs);
                 // Disallow compactions whose output could overlap a running compaction's output in the same level.
-                if (_picker.FilesRangeOverlapWithCompaction(_compactionInputs, _outputLevel)) return false;
+                if (_picker.FilesRangeOverlapWithCompaction(_vstorage, _compactionInputs, _outputLevel)) return false;
                 if (!_isL0TrivialMove) _picker.GetGrandparents(_vstorage, _startLevelInputs, _outputLevelInputs, _grandparents);
             }
             else
@@ -443,7 +443,7 @@ internal sealed class LevelCompactionPicker : CompactionPicker
                 }
                 _startLevelInputs.Files.Add(f);
                 if (!_picker.ExpandInputsToCleanCut(_vstorage, _startLevelInputs)
-                    || _picker.FilesRangeOverlapWithCompaction([_startLevelInputs], _outputLevel))
+                    || _picker.FilesRangeOverlapWithCompaction(_vstorage, [_startLevelInputs], _outputLevel))
                 {
                     // A locked (pending compaction) input-level file was pulled in due to user-key overlap.
                     _startLevelInputs.Clear();

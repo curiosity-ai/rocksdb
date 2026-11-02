@@ -209,6 +209,7 @@ internal sealed partial class DbImpl
     private void CancelBackgroundCompactions()
     {
         StopCompactionTrigger();
+        StopRecordSeqnoTimeWorker();
         try
         {
             _bgCancellation.Cancel();
@@ -712,9 +713,11 @@ internal sealed partial class DbImpl
                 }
                 c.AddInputDeletions(edit);
                 foreach (FileMetaData f in job.Outputs) edit.AddFile(c.OutputLevel, f);
+                // Per-key placement: entries too new for the last level were written to the proximal level.
+                foreach (FileMetaData f in job.ProximalOutputs) edit.AddFile(c.ProximalLevel, f);
                 edit.BlobFileAdditions.AddRange(job.BlobFileAdditions);
                 edit.BlobFileGarbages.AddRange(job.BlobFileGarbages);
-                if (job.Outputs.Count > 0) FileSystem.SyncDirectory(DbPaths[(int)Math.Min(c.OutputPathId, (uint)(DbPaths.Count - 1))]);
+                if (job.Outputs.Count + job.ProximalOutputs.Count > 0) FileSystem.SyncDirectory(DbPaths[(int)Math.Min(c.OutputPathId, (uint)(DbPaths.Count - 1))]);
             }
             lock (_mutex)
             {
