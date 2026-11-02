@@ -27,6 +27,9 @@ internal sealed partial class DbImpl
     private bool _compactionsEnabled;     // set once open completed (guarded by mutex)
     private readonly CancellationTokenSource _bgCancellation = new();
 
+    /// <summary>Pause of a background compaction thread after a failure (1 s upstream); tests shorten it.</summary>
+    internal static TimeSpan CompactionErrorRetryDelay { get; set; } = TimeSpan.FromSeconds(1);
+
     // Cumulative statistics (Interlocked).
     private long _statCompactions;
     private long _statTrivialMoves;
@@ -76,6 +79,7 @@ internal sealed partial class DbImpl
     {
         lock (_mutex)
         {
+            ErrorHandler.EnableAutoRecovery();
             _compactionsEnabled = true;
             foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
             {
@@ -108,6 +112,7 @@ internal sealed partial class DbImpl
     {
         WriteController wc = WriteControllerInstance;
         ColumnFamilyCompactionState state = cfd.CompactionState;
+        WriteStallCondition previous = state.Stall.Condition;
         if (cfd.Dropped || cfd.Current is null)
         {
             state.Stall.Release(wc);
@@ -117,6 +122,7 @@ internal sealed partial class DbImpl
         {
             state.Stall.Recalculate(wc, cfd.NumNotFlushed, cfd.Current.Storage, cfd.Options);
             _stallTokenHolders.Add(cfd);
+            MaybeEnqueueStallNotification(cfd, previous, state.Stall.Condition);
         }
         _maybeStalled = wc.IsStopped || wc.NeedsDelay;
     }
@@ -157,7 +163,7 @@ internal sealed partial class DbImpl
         ulong delayMicros = 0;
         lock (_mutex)
         {
-            if (_bgError is { } e) ThrowBackgroundError(e);
+            if (IsDbStopped && ErrorHandler.BgError is { } e) ThrowBackgroundError(e);
             if (!wc.IsStopped && wc.NeedsDelay)
             {
                 ulong bytes = 0;
@@ -177,7 +183,7 @@ internal sealed partial class DbImpl
             Task wait;
             lock (_mutex)
             {
-                if (_bgError is { } e) ThrowBackgroundError(e);
+                if (IsDbStopped && ErrorHandler.BgError is { } e) ThrowBackgroundError(e);
                 if (!wc.IsStopped) return;
                 if (_shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
                 wait = _bgSignal.Task;
@@ -223,7 +229,7 @@ internal sealed partial class DbImpl
     /// </summary>
     private void MaybeScheduleCompaction()
     {
-        if (!_compactionsEnabled || _shuttingDown || _bgError is not null || _bgCancellation.IsCancellationRequested) return;
+        if (!_compactionsEnabled || _shuttingDown || IsBgWorkStopped || _bgCancellation.IsCancellationRequested) return;
         if (_exclusiveManualCompactions > 0) return; // an exclusive manual compaction is pending or running
         if (_ingestionsRunning > 0) return; // wait for IngestExternalFile() calls to finish before picking compactions
         int limit = BgCompactionLimit();
@@ -298,10 +304,13 @@ internal sealed partial class DbImpl
         CompactionJob? job = null;
         Exception? failure = null;
         long compactionStart = 0;
+        int jobId = 0;
         try
         {
             CancellationToken ct = _bgCancellation.Token;
             TestHooks.Invoke("DBImpl::RunCompaction:Start");
+            jobId = NewJobId();
+            NotifyOnCompactionBegin(cfd, c, jobId);
             compactionStart = System.Diagnostics.Stopwatch.GetTimestamp();
             ct.ThrowIfCancellationRequested();
             var edit = new VersionEdit { ColumnFamily = cfd.Id };
@@ -354,7 +363,7 @@ internal sealed partial class DbImpl
                 Interlocked.Add(ref _statCompactionBytesWritten, (long)job.Stats.BytesWritten);
                 Interlocked.Add(ref _statCompactionMicros, (long)job.Stats.Elapsed.TotalMicroseconds);
             }
-            OnCompactionCompleted(cfd, c, job, NewJobId(), compactionStart);
+            OnCompactionCompleted(cfd, c, job, jobId, compactionStart);
         }
         catch (OperationCanceledException e)
         {
@@ -371,10 +380,26 @@ internal sealed partial class DbImpl
         catch (Exception e)
         {
             failure = e;
-            SetBackgroundError(e);
+            SetBackgroundError(e, BackgroundErrorReason.Compaction, walRelated: false);
+            if (!isManual)
+            {
+                // BackgroundCallCompaction: wait a little bit before retrying in case this is an environmental problem
+                // (a retryable error is not recorded and the compaction is picked again).
+                _bgCancellation.Token.WaitHandle.WaitOne(CompactionErrorRetryDelay);
+            }
         }
         finally
         {
+            if (jobId != 0)
+            {
+                try
+                {
+                    NotifyOnCompactionCompleted(cfd, c, job, jobId, ok ? null : failure ?? new RocksDbException(StatusCode.Incomplete, "Incomplete"));
+                }
+                catch (Exception e) when (e is IOException or RocksDbException or ObjectDisposedException)
+                {
+                }
+            }
             lock (_mutex)
             {
                 if (job is not null)
@@ -420,7 +445,7 @@ internal sealed partial class DbImpl
         }
         if (failure is not null && isManual)
         {
-            if (failure is RocksDbException r) throw new RocksDbException(r.Code, r.Message, r.SubCode, r);
+            if (failure is RocksDbException r) throw r.Rethrowable();
             throw RocksDbException.IOError(failure.Message, failure);
         }
     }
@@ -478,7 +503,7 @@ internal sealed partial class DbImpl
         // write stop holds; skipping the no-op flush lets a manual compaction resolve the stop).
         bool flushNeeded;
         lock (_mutex) flushNeeded = !cfd.Mem.IsEmpty || cfd.Imm.Count > 0;
-        if (flushNeeded) await FlushColumnFamilyAsync(cfd, wait: true, synchronous, cancellationToken).ConfigureAwait(false);
+        if (flushNeeded) await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.ManualCompaction, synchronous, cancellationToken).ConfigureAwait(false);
 
         bool exclusive = options.ExclusiveManualCompaction;
         if (exclusive) await BeginExclusiveManualAsync(synchronous, cancellationToken).ConfigureAwait(false);
@@ -659,7 +684,7 @@ internal sealed partial class DbImpl
                 {
                     if (_shuttingDown || _bgCancellation.IsCancellationRequested || IsDisposed)
                         throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
-                    if (_bgError is { } e) ThrowBackgroundError(e);
+                    if (IsBgWorkStopped && ErrorHandler.BgError is { } e) ThrowBackgroundError(e);
                     if (cfd.Dropped) ThrowDropped(cfd);
                     bool conflict = _ingestionsRunning > 0;
                     if (!conflict)
@@ -791,7 +816,7 @@ internal sealed partial class DbImpl
             Task wait;
             lock (_mutex)
             {
-                if (_bgError is { } e) ThrowBackgroundError(e);
+                if (IsBgWorkStopped && ErrorHandler.BgError is { } e) ThrowBackgroundError(e);
                 bool pending = false;
                 if (_compactionsEnabled && !_shuttingDown)
                 {

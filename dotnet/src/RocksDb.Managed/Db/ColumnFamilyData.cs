@@ -17,6 +17,8 @@ internal sealed class ImmutableMemTable
     public MemTable Mem { get; }
     /// <summary>The WAL created when this memtable was switched out: once flushed, WALs below it hold no data of this CF.</summary>
     public ulong NextLogNumber { get; }
+    /// <summary>Why the memtable was switched out (reported to listeners).</summary>
+    public FlushReason FlushReason { get; init; }
     public bool FlushInProgress { get; set; }
     public bool FlushCompleted { get; set; }
 }

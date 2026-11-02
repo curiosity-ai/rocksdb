@@ -293,6 +293,68 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
         await h.RunAsync(first, h.NewScript($"{first}-checkpoint", ckpt, spec, ckptModel));
     }
 
+    // backups
+
+    /// <summary>
+    /// BackupEngine interoperability: <paramref name="first"/> backs up the DB, the other engine restores it, extends the
+    /// restored DB and adds an incremental backup to the same backup directory, and the first engine restores that.
+    /// </summary>
+    [TestMethod]
+    [DataRow(EngineKind.Managed)]
+    [DataRow(EngineKind.Native)]
+    public async Task Backup_RestoredAndExtendedByOther(EngineKind first)
+    {
+        EngineKind second = Other(first);
+        DbSpec spec = DbSpec.Standard(CompressionType.LZ4, 6, FilterKind.Bloom, 256UL << 10, false);
+        RoundTripHarness h = CreateHarness(spec, $"{first}-first");
+        string backupDir = h.SubDir("backup");
+        string restore1 = h.SubDir("restore1"), restore2 = h.SubDir("restore2");
+
+        // 1. first engine: write (flushes leave SSTs, the tail stays in the WAL), back up without flushing, keep writing.
+        ScriptBuilder b = h.NewScript($"{first}-write-backup");
+        OpGenerator.Generate(b, new GeneratorOptions { Ops = 1500, AllowColumnFamilyChanges = false });
+        b.Add(Op.Backup(backupDir, flush: false));
+        OpGenerator.Generate(b, new GeneratorOptions { Ops = 200, AllowColumnFamilyChanges = false, AllowFlush = false });
+        b.Verify();
+        await h.RunAsync(first, b);
+        SkipIfNativeMetaIsEmpty(backupDir);
+        ReferenceModel backup1 = ReferenceModel.FromContents(spec, h.Model.Backups[backupDir]);
+
+        // 2. second engine restores it (from a script on the source DB), opens the restored DB, extends it and adds an
+        //    incremental backup (flushed) to the same backup directory.
+        ScriptBuilder r = h.NewScriptWithoutVerify($"{second}-restore", h.DbPath, spec, h.Model);
+        r.Add(Op.Restore(backupDir, restore1));
+        await h.RunAsync(second, r);
+        ScriptBuilder e = h.NewScript($"{second}-extend-backup", restore1, spec, backup1);
+        OpGenerator.Generate(e, new GeneratorOptions { Ops = 800, AllowColumnFamilyChanges = false });
+        e.Add(Op.Backup(backupDir, flush: true));
+        e.Verify();
+        await h.RunAsync(second, e);
+        SkipIfNativeMetaIsEmpty(backupDir);
+        ReferenceModel backup2 = ReferenceModel.FromContents(spec, backup1.Backups[backupDir]);
+
+        // 3. first engine restores the incremental backup and verifies it.
+        ScriptBuilder r2 = h.NewScriptWithoutVerify($"{first}-restore", h.DbPath, spec, h.Model);
+        r2.Add(Op.Restore(backupDir, restore2));
+        await h.RunAsync(first, r2);
+        ScriptBuilder v = h.NewScript($"{first}-verify-restored", restore2, spec, backup2);
+        v.Verify().Dump();
+        await h.RunAsync(first, v);
+    }
+
+    /// <summary>
+    /// librocksdb 11.12 writes empty backup meta files when hosted by .NET 11 (see the compat tests); such a run is
+    /// inconclusive.
+    /// </summary>
+    private static void SkipIfNativeMetaIsEmpty(string backupDir)
+    {
+        uint id = NativeEngine.LatestBackupId(backupDir);
+        if (new FileInfo(Path.Combine(backupDir, "meta", id.ToString(CultureInfo.InvariantCulture))).Length == 0)
+        {
+            Assert.Inconclusive("native BackupEngine wrote an empty meta file (librocksdb 11.12 hosted by .NET " + Environment.Version + ")");
+        }
+    }
+
     // ---------------------------------------------------------------------------------------------------------
     // TTL
 
