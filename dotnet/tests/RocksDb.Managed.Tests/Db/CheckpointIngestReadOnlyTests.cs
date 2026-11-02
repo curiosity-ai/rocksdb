@@ -166,10 +166,10 @@ public sealed class CheckpointIngestReadOnlyTests
         Assert.AreEqual("d70", GetString(db, S(Key(70))!));
         Assert.AreEqual("0", db.GetProperty("rocksdb.num-entries-active-mem-table"));
 
-        // Overlapping files in one call are rejected; no global seqno allowed but needed -> rejected.
-        e = Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles(
-            [WriteSst(fs, "/ext/5.sst", 400, 410, "e"), WriteSst(fs, "/ext/6.sst", 405, 420, "f")], new IngestExternalFileOptions()));
-        Assert.AreEqual(StatusCode.NotSupported, e.Code);
+        // Overlapping files in one call: the later file wins; no global seqno allowed but needed -> rejected.
+        db.IngestExternalFiles([WriteSst(fs, "/ext/5.sst", 400, 410, "e"), WriteSst(fs, "/ext/6.sst", 405, 420, "f")], new IngestExternalFileOptions());
+        Assert.AreEqual("e400", GetString(db, S(Key(400))!));
+        Assert.AreEqual("f405", GetString(db, S(Key(405))!));
         e = Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles(
             [WriteSst(fs, "/ext/7.sst", 0, 10, "g")], new IngestExternalFileOptions { AllowGlobalSeqNo = false }));
         Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
@@ -190,7 +190,7 @@ public sealed class CheckpointIngestReadOnlyTests
         {
             for (it.SeekToFirst(); it.Valid; it.Next()) count++;
         }
-        Assert.AreEqual(100 + 100 + 1 + 10 + 10, count);
+        Assert.AreEqual(100 + 100 + 1 + 20 + 10 + 10, count);
     }
 
     // ---- read-only / secondary ---------------------------------------------------------------------------

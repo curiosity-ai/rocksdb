@@ -216,9 +216,26 @@ public sealed class WriteBatch : IDisposable
         _rep.Advance(HeaderSize);
         _contentFlags = ContentFlags.None;
         _savePointCount = 0;
+        _walTermPoint = default;
         HasKeyWithTimestamp = false;
         _cfTimestampSizes?.Clear();
     }
+
+    // ---- WAL termination point (WriteBatch::MarkWalTerminationPoint, db/write_batch.cc) ------------------------
+
+    /// <summary>wal_term_point_: Size 0 = cleared (SavePoint::is_cleared).</summary>
+    private SavePoint _walTermPoint;
+
+    /// <summary>
+    /// Marks the current end of the batch as the last record written to the WAL (WriteBatch::MarkWalTerminationPoint):
+    /// records added afterwards are applied to the memtables but not logged, so they are lost if the process crashes
+    /// before they are flushed. Has no effect when the write disables the WAL. Calling it again moves the point;
+    /// <see cref="Clear"/> removes it.
+    /// </summary>
+    public void MarkWalTerminationPoint() => _walTermPoint = new SavePoint(_rep.WrittenCount, (uint)Count, _contentFlags);
+
+    /// <summary>True if <see cref="MarkWalTerminationPoint"/> was called since the last <see cref="Clear"/>.</summary>
+    public bool HasWalTerminationPoint => _walTermPoint.Size != 0;
 
     private Dictionary<uint, int>? _cfTimestampSizes;
 
@@ -259,6 +276,9 @@ public sealed class WriteBatch : IDisposable
         _rep.Write(rep);
         _contentFlags = ContentFlags.Deferred;
         _savePointCount = 0;
+        // Upstream's SetContents is internal and keeps wal_term_point_; a public rep replacement must not keep a point
+        // beyond (or inside) the new contents.
+        _walTermPoint = default;
     }
 
     /// <summary>Stores <paramref name="key"/> -> <paramref name="value"/> in the default column family.</summary>
@@ -312,6 +332,59 @@ public sealed class WriteBatch : IDisposable
     {
         AppendKeyValueRecord(EntryType.Merge, EntryType.ColumnFamilyMerge, columnFamilyId, key, value, ContentFlags.HasMerge);
         return this;
+    }
+
+    // ---- Column family handle overloads (WriteBatch::Put(ColumnFamilyHandle*, ...)) -------------------------
+    // The batch records the column family id only; it must be written to the database the handle belongs to.
+
+    /// <summary>Stores <paramref name="key"/> -> <paramref name="value"/> in <paramref name="columnFamily"/>.</summary>
+    public WriteBatch Put(ColumnFamily columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Put(IdOf(columnFamily), key, value);
+
+    /// <summary>Removes the mapping for <paramref name="key"/> in <paramref name="columnFamily"/>, if any.</summary>
+    public WriteBatch Delete(ColumnFamily columnFamily, ReadOnlySpan<byte> key) => Delete(IdOf(columnFamily), key);
+
+    /// <summary>SingleDelete of <paramref name="key"/> in <paramref name="columnFamily"/>.</summary>
+    public WriteBatch SingleDelete(ColumnFamily columnFamily, ReadOnlySpan<byte> key) => SingleDelete(IdOf(columnFamily), key);
+
+    /// <summary>Removes keys in [<paramref name="beginKey"/>, <paramref name="endKey"/>) of <paramref name="columnFamily"/>.</summary>
+    public WriteBatch DeleteRange(ColumnFamily columnFamily, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) =>
+        DeleteRange(IdOf(columnFamily), beginKey, endKey);
+
+    /// <summary>Merges <paramref name="value"/> into <paramref name="key"/> of <paramref name="columnFamily"/>.</summary>
+    public WriteBatch Merge(ColumnFamily columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Merge(IdOf(columnFamily), key, value);
+
+    /// <summary>Put at <paramref name="timestamp"/> in <paramref name="columnFamily"/> (see <see cref="Put(uint, ReadOnlySpan{byte}, ReadOnlySpan{byte}, ReadOnlySpan{byte})"/>).</summary>
+    public WriteBatch Put(ColumnFamily columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp, ReadOnlySpan<byte> value) =>
+        Put(IdOf(columnFamily), key, timestamp, value);
+
+    /// <summary>Delete at <paramref name="timestamp"/> in <paramref name="columnFamily"/>.</summary>
+    public WriteBatch Delete(ColumnFamily columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp) =>
+        Delete(IdOf(columnFamily), key, timestamp);
+
+    /// <summary>SingleDelete at <paramref name="timestamp"/> in <paramref name="columnFamily"/>.</summary>
+    public WriteBatch SingleDelete(ColumnFamily columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp) =>
+        SingleDelete(IdOf(columnFamily), key, timestamp);
+
+    /// <summary>Merge operand at <paramref name="timestamp"/> in <paramref name="columnFamily"/>.</summary>
+    public WriteBatch Merge(ColumnFamily columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp, ReadOnlySpan<byte> value) =>
+        Merge(IdOf(columnFamily), key, timestamp, value);
+
+    /// <summary>Range deletion at <paramref name="timestamp"/> in <paramref name="columnFamily"/>.</summary>
+    public WriteBatch DeleteRange(ColumnFamily columnFamily, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey, ReadOnlySpan<byte> timestamp) =>
+        DeleteRange(IdOf(columnFamily), beginKey, endKey, timestamp);
+
+    /// <summary>Wide-column entity in <paramref name="columnFamily"/> (see <see cref="PutEntity(uint, ReadOnlySpan{byte}, ReadOnlySpan{WideColumn})"/>).</summary>
+    public WriteBatch PutEntity(ColumnFamily columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns) =>
+        PutEntity(IdOf(columnFamily), key, columns);
+
+    /// <summary>TimedPut in <paramref name="columnFamily"/> (see <see cref="TimedPut(uint, ReadOnlySpan{byte}, ReadOnlySpan{byte}, ulong)"/>).</summary>
+    public WriteBatch TimedPut(ColumnFamily columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong writeUnixTime) =>
+        TimedPut(IdOf(columnFamily), key, value, writeUnixTime);
+
+    private static uint IdOf(ColumnFamily columnFamily)
+    {
+        ArgumentNullException.ThrowIfNull(columnFamily);
+        return columnFamily.Id;
     }
 
     // ---- User-defined timestamps (WriteBatch::Put/Delete/SingleDelete/DeleteRange/Merge with ts) ---------------
@@ -580,13 +653,45 @@ public sealed class WriteBatch : IDisposable
     /// Appends the records of <paramref name="src"/> to <paramref name="dst"/> (used to merge batches for group
     /// commit). Port of <c>WriteBatchInternal::Append</c> (without WAL termination points).
     /// </summary>
-    internal static void Append(WriteBatch dst, WriteBatch src)
+    internal static void Append(WriteBatch dst, WriteBatch src) => Append(dst, src, walOnly: false);
+
+    /// <summary>
+    /// WriteBatchInternal::Append(dst, src, wal_only): with <paramref name="walOnly"/> and a WAL termination point in
+    /// <paramref name="src"/>, only the records before that point are appended.
+    /// </summary>
+    internal static void Append(WriteBatch dst, WriteBatch src, bool walOnly)
     {
-        ContentFlags srcFlags = src._contentFlags;
-        int srcCount = src.Count;
-        dst.SetCount((uint)(dst.Count + srcCount));
-        dst._rep.Write(src._rep.WrittenSpan[HeaderSize..]);
+        int srcLen;
+        uint srcCount;
+        ContentFlags srcFlags;
+        SavePoint batchEnd = src._walTermPoint;
+        if (walOnly && batchEnd.Size != 0)
+        {
+            srcLen = batchEnd.Size - HeaderSize;
+            srcCount = batchEnd.Count;
+            srcFlags = batchEnd.Flags;
+        }
+        else
+        {
+            srcLen = src._rep.WrittenCount - HeaderSize;
+            srcCount = (uint)src.Count;
+            srcFlags = src._contentFlags;
+        }
+        dst.SetCount((uint)dst.Count + srcCount);
+        dst._rep.Write(src._rep.WrittenSpan.Slice(HeaderSize, srcLen));
         dst._contentFlags |= srcFlags;
+    }
+
+    /// <summary>
+    /// Replaces the contents of this batch with the WAL part of <paramref name="src"/> (its header, then the records
+    /// before its WAL termination point, see <see cref="Append(WriteBatch, WriteBatch, bool)"/>).
+    /// </summary>
+    internal void SetContentsWalOnly(WriteBatch src)
+    {
+        SetContents(src._rep.WrittenSpan[..HeaderSize]);
+        SetCount(0);
+        _contentFlags = ContentFlags.None;
+        Append(this, src, walOnly: true);
     }
 
     /// <summary>WriteBatchInternal::AppendedByteSize.</summary>

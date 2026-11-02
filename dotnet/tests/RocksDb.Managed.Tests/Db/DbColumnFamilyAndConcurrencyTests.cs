@@ -56,8 +56,8 @@ public sealed class DbColumnFamilyAndConcurrencyTests
             Assert.AreEqual(50UL, BitConverter.ToUInt64(counters.Get(B("c"))!));
             db.DropColumnFamily(users);
             Assert.IsTrue(users.IsDropped);
-            RocksDbException d = Assert.ThrowsExactly<RocksDbException>(() => users.Get(B("k")));
-            Assert.AreEqual(StatusCode.ColumnFamilyDropped, d.Code);
+            // Like upstream, the handle of a dropped column family still reads its data.
+            Assert.AreEqual("users2", GetString(users, "k2"));
             Assert.IsFalse(db.TryGetColumnFamily("users", out _));
             Assert.AreEqual(2, db.ColumnFamilies.Count);
             RocksDbException dropDefault = Assert.ThrowsExactly<RocksDbException>(() => db.DropColumnFamily(db.DefaultColumnFamily));

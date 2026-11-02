@@ -628,6 +628,25 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 if (synchronous) log.Dispose();
                 else await log.DisposeAsync().ConfigureAwait(false);
             }
+            // ~ColumnFamilyHandleImpl of dropped column families (their handles live as long as the DB): release their
+            // memtables and current version; their table files become obsolete and are deleted now.
+            bool releasedDropped = false;
+            lock (_mutex)
+            {
+                foreach (ColumnFamilyData cfd in _droppedColumnFamilies)
+                {
+                    if (cfd.Current is not { } v) continue;
+                    ReleaseColumnFamilyMemTables(cfd);
+                    cfd.Current = null!;
+                    Versions.UnrefVersion(v);
+                    releasedDropped = true;
+                }
+            }
+            if (releasedDropped)
+            {
+                try { PurgeObsoleteFiles(); }
+                catch (Exception e) when (e is IOException or RocksDbException) { }
+            }
             await Versions.DisposeAsync().ConfigureAwait(false);
             lock (_mutex)
             {

@@ -548,7 +548,7 @@ internal sealed partial class DbImpl
             {
                 // Always compact all files together.
                 finalOutputLevel = cfd.NumLevels - 1;
-                if (cfd.Options.CfAllowIngestBehind) finalOutputLevel--;
+                if (cfd.Options.AllowIngestBehind) finalOutputLevel--;
                 await RunManualCompactionAsync(cfd, CompactionPicker.CompactAllLevels, finalOutputLevel, options, null, null, false, ulong.MaxValue,
                     synchronous, cancellationToken).ConfigureAwait(false);
             }

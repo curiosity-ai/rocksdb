@@ -450,7 +450,7 @@ internal abstract class CompactionPicker
         if (inputLevel == CompactAllLevels)
         {
             // Universal compaction with more than one level always compacts all the files together to the last level.
-            int maxOutputLevel = vstorage.MaxOutputLevel(Options.CfAllowIngestBehind);
+            int maxOutputLevel = vstorage.MaxOutputLevel(Options.AllowIngestBehind);
             int startLevel = 0;
             for (; startLevel <= maxOutputLevel && vstorage.NumLevelFiles(startLevel) == 0; startLevel++) { }
             if (startLevel > maxOutputLevel) return null;

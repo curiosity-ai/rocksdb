@@ -251,24 +251,28 @@ internal sealed partial class DbImpl
             }
             ulong last = seq - 1;
 
+            int walRecordBytes = 0;
             if (!leader.DisableWal && valid > 0)
             {
+                // DBImpl::MergeBatch: a single batch without a WAL termination point is logged as is; otherwise the WAL
+                // parts of the batches (WriteBatchInternal::Append(wal_only = true)) are flattened into one record.
                 ReadOnlyMemory<byte> record;
-                if (valid == 1)
+                if (valid == 1 && !firstValid!.Batch!.HasWalTerminationPoint)
                 {
-                    record = firstValid!.Batch!.DataMemory;
+                    record = firstValid.Batch.DataMemory;
                 }
                 else
                 {
-                    _groupBatch.SetContents(firstValid!.Batch!.Data);
+                    _groupBatch.SetContentsWalOnly(firstValid!.Batch!);
                     for (int i = 0; i < group.Count; i++)
                     {
                         WriteThread.Writer w = group[i];
                         if (w == firstValid || w.CallbackFailed) continue;
-                        WriteBatch.Append(_groupBatch, w.Batch!);
+                        WriteBatch.Append(_groupBatch, w.Batch!, walOnly: true);
                     }
                     record = _groupBatch.DataMemory;
                 }
+                walRecordBytes = record.Length;
                 try
                 {
                     LogWriter log = _log!;
@@ -363,7 +367,7 @@ internal sealed partial class DbImpl
                 Versions.SetLastSequence(last);
                 NotifySequenceWaiters();
             }
-            RecordWriteGroup(group, total, leader.DisableWal ? 0 : (group.Count == 1 ? leader.Batch!.DataSize : _groupBatch.DataSize), !leader.DisableWal, needSync);
+            RecordWriteGroup(group, total, walRecordBytes, !leader.DisableWal, needSync);
         }
         catch (Exception e)
         {

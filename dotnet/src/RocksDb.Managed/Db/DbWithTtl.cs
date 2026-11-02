@@ -109,8 +109,8 @@ public sealed class TtlCompactionFilter : CompactionFilter
 /// <summary>
 /// A database whose values expire after a TTL (DBWithTTL::Open, utilities/ttl/db_ttl_impl.cc). Values are stored
 /// with the 4-byte write-time suffix of <see cref="TtlValue"/>, so the directory is interchangeable with native
-/// <c>DBWithTTL</c>. Reads strip the suffix (expired values remain readable until a compaction removes them, like
-/// upstream). Expired values are dropped by compactions through a <see cref="TtlCompactionFilterFactory"/> installed
+/// <c>DBWithTTL</c>. Reads and iterators strip the suffix (expired values remain readable until a compaction removes
+/// them, like upstream). Expired values are dropped by compactions through a <see cref="TtlCompactionFilterFactory"/> installed
 /// on the default column family (the OPTIONS file records <c>compaction_filter_factory=TtlCompactionFilterFactory</c>).
 /// </summary>
 public sealed class TtlDatabase : IDisposable, IAsyncDisposable
@@ -240,8 +240,21 @@ public sealed class TtlDatabase : IDisposable, IAsyncDisposable
         return TryGet(key, w) ? w.WrittenSpan.ToArray() : null;
     }
 
-    /// <summary>Iterator over the raw (timestamped) values; use <see cref="TtlValue.Strip"/> on <see cref="Iterator.Value"/>.</summary>
-    public Iterator NewIterator() => _db.NewIterator();
+    /// <summary>
+    /// Iterator whose <see cref="Iterator.Value"/> is the user value without its write-time suffix (port of TtlIterator,
+    /// utilities/ttl/db_ttl_impl.h). Like upstream, expired entries stay visible until a compaction removes them (the
+    /// iterator does not check the TTL); a value shorter than the suffix fails with Corruption.
+    /// </summary>
+    public Iterator NewIterator() => WrapIterator(_db.NewIterator());
+
+    /// <summary>TtlIterator over <paramref name="options"/> (see <see cref="NewIterator()"/>).</summary>
+    public Iterator NewIterator(ReadOptions? options) => WrapIterator(_db.NewIterator(options));
+
+    private static Iterator WrapIterator(Iterator it)
+    {
+        it.StripValueSuffix(TtlValue.TimestampLength);
+        return it;
+    }
 
     public void Flush() => _db.Flush();
 

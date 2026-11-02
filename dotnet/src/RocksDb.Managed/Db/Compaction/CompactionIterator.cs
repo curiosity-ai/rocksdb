@@ -148,7 +148,7 @@ internal sealed class CompactionIterator : IDisposable
         _rangeDelAgg = rangeDelAgg;
         _compaction = compaction;
         _compactionFilter = compactionFilter;
-        _bottommostLevel = compaction is not null && compaction.BottommostLevel && !compaction.Options.CfAllowIngestBehind;
+        _bottommostLevel = compaction is not null && compaction.BottommostLevel && !compaction.Options.AllowIngestBehind;
         _enforceSingleDelContracts = enforceSingleDelContracts;
         _level = compaction?.StartLevel ?? 0;
         _levelPtrs = new int[compaction?.NumberLevels ?? 0];
@@ -576,7 +576,7 @@ internal sealed class CompactionIterator : IDisposable
                 _input.Next();
             }
             else if (_compaction is not null && (_ikeyType == EntryType.Deletion || (_ikeyType == EntryType.DeletionWithTimestamp && _cmpWithHistoryTsLow < 0))
-                     && !_compaction.Options.CfAllowIngestBehind
+                     && !_compaction.Options.AllowIngestBehind
                      && DefinitelyInSnapshot(_ikeySequence, _earliestSnapshot)
                      && _compaction.KeyNotExistsBeyondOutputLevel(_currentKey.UserKey, _levelPtrs))
             {
@@ -765,7 +765,7 @@ internal sealed class CompactionIterator : IDisposable
             // possibly exists beyond the current output level. Set has_current_user_key to false so that if the iterator
             // is at the next key, we do not compare it again against the previous key at the next iteration.
             _hasCurrentUserKey = false;
-            if (_compaction is not null && !_compaction.Options.CfAllowIngestBehind && DefinitelyInSnapshot(_ikeySequence, _earliestSnapshot)
+            if (_compaction is not null && !_compaction.Options.AllowIngestBehind && DefinitelyInSnapshot(_ikeySequence, _earliestSnapshot)
                 && _compaction.KeyNotExistsBeyondOutputLevel(_currentKey.UserKey, _levelPtrs) && isTimestampEligibleForGc)
             {
                 // Key doesn't exist outside of this range. Can compact out this SingleDelete.

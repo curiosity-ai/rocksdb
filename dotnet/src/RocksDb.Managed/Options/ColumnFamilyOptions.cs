@@ -211,6 +211,18 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public bool PersistUserDefinedTimestamps { get; set; } = true;
     public bool CfAllowIngestBehind { get; set; }
 
+    /// <summary>
+    /// The deprecated DBOptions::allow_ingest_behind, copied in by the DB's option sanitization (not persisted in the
+    /// column family section of the OPTIONS file).
+    /// </summary>
+    internal bool DbAllowIngestBehind { get; set; }
+
+    /// <summary>
+    /// cf_allow_ingest_behind || DBOptions::allow_ingest_behind (ColumnFamilyData::AllowIngestBehind): the last level is
+    /// reserved for files ingested with <see cref="IngestExternalFileOptions.IngestBehind"/>.
+    /// </summary>
+    internal bool AllowIngestBehind => CfAllowIngestBehind || DbAllowIngestBehind;
+
     // ---- blob files --------------------------------------------------------------------------
     public bool EnableBlobFiles { get; set; }
     public ulong MinBlobSize { get; set; }
@@ -374,6 +386,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         c._sstPartitionerFactory = _sstPartitionerFactory;
         c._compactionFilter = _compactionFilter;
         c._compactionFilterFactory = _compactionFilterFactory;
+        c.DbAllowIngestBehind = DbAllowIngestBehind;
         c.CompactionOptionsFifo = CompactionOptionsFifo.Clone();
         c.CompactionOptionsUniversal = CompactionOptionsUniversal.Clone();
         c.TableOptions = TableOptions.Clone();

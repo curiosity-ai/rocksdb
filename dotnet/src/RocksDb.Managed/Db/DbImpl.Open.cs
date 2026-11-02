@@ -249,6 +249,7 @@ internal sealed partial class DbImpl
         if (result.MinWriteBufferNumberToMerge < 1) result.MinWriteBufferNumberToMerge = 1;
         if (result.NumLevels < 1) result.NumLevels = 1;
         if (result.CompactionStyle == CompactionStyle.Level && result.NumLevels < 2) result.NumLevels = 2;
+        result.DbAllowIngestBehind = allowIngestBehind;
         if (result.CompactionStyle == CompactionStyle.Universal && (allowIngestBehind || result.CfAllowIngestBehind) && result.NumLevels < 3)
         {
             result.NumLevels = 3;
