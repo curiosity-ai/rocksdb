@@ -53,6 +53,15 @@ public sealed class Block : IDisposable
     /// optimize_key_common_prefix): restarts[0] when non-zero. Restart entries store their key without it.
     /// </summary>
     public int CommonPrefixLength { get; private set; }
+    /// <summary>
+    /// Separated key/value storage (separate_key_value_in_data_block): offset of the values section, which is also the
+    /// end of the keys section; -1 for blocks with inline values.
+    /// </summary>
+    public int ValuesSectionOffset { get; private set; }
+    /// <summary>End of the entries (keys) section: <see cref="ValuesSectionOffset"/> when separated, else <see cref="RestartOffset"/>.</summary>
+    public int KeysEndOffset => ValuesSectionOffset >= 0 ? ValuesSectionOffset : RestartOffset;
+    /// <summary>The "is_uniform" footer hint (uniform_cv_threshold): keys are roughly uniformly distributed.</summary>
+    public bool IsUniform { get; private set; }
     /// <summary>Approximate memory charged for this block (for cache accounting).</summary>
     public int Charge => _buffer.Length;
 
@@ -91,20 +100,33 @@ public sealed class Block : IDisposable
         return Create(buf, contents.Length, true);
     }
 
+    /// <summary>Port of Block::Block's footer handling (DataBlockFooter::DecodeFrom + restart validation).</summary>
     private void Parse()
     {
         HashMapOffset = -1;
         HashNumBuckets = 0;
+        ValuesSectionOffset = -1;
         if (_length < 2 * sizeof(uint)) ThrowHelper.Corruption("bad block contents");
         ReadOnlySpan<byte> data = Data;
         uint packed = Coding.DecodeFixed32(data[(_length - 4)..]);
         bool hash = (packed & HashIndexBit) != 0;
         packed &= ~HashIndexBit;
-        if ((packed & SeparatedKvBit) != 0) ThrowHelper.NotSupported("separated key/value data blocks (separate_key_value_in_data_block) are not supported");
-        packed &= ~UniformKeysBit; // informational only
+        bool separatedKv = (packed & SeparatedKvBit) != 0;
+        packed &= ~SeparatedKvBit;
+        IsUniform = (packed & UniformKeysBit) != 0;
+        packed &= ~UniformKeysBit;
+        // Reserved "extended metadata" escape (bit 30): no feature defines it yet.
         if ((packed & ExtendedMetadataBit) != 0) ThrowHelper.Corruption("Unsupported extended block metadata (reserved bit set)");
         if (packed > MaxNumRestarts) ThrowHelper.Corruption("Unrecognized feature in block footer (reserved bits set)");
         int size = _length - 4;
+        uint valuesSectionOffset = 0;
+        if (separatedKv)
+        {
+            // values_section_offset precedes the packed footer word.
+            if (size < sizeof(uint)) ThrowHelper.Corruption("Block too small for separated KV values section offset");
+            valuesSectionOffset = Coding.DecodeFixed32(data[(size - 4)..]);
+            size -= 4;
+        }
         int numRestarts = (int)packed;
         if (hash)
         {
@@ -116,17 +138,23 @@ public sealed class Block : IDisposable
         if ((long)numRestarts * 4 > size) ThrowHelper.Corruption("bad block contents: too many restarts");
         RestartOffset = size - numRestarts * 4;
         NumRestarts = numRestarts;
+        if (separatedKv)
+        {
+            if (valuesSectionOffset > (uint)RestartOffset) ThrowHelper.Corruption("bad block contents: values section offset");
+            ValuesSectionOffset = (int)valuesSectionOffset;
+        }
         // Validate restart offsets: empty blocks have one restart at 0; otherwise strictly increasing within keys.
+        int keysEnd = KeysEndOffset;
         uint prev = 0;
         for (int i = 0; i < numRestarts; i++)
         {
             uint r = Coding.DecodeFixed32(data[(RestartOffset + i * 4)..]);
-            if ((RestartOffset == 0 && (i != 0 || r != 0)) || (RestartOffset > 0 && r >= (uint)RestartOffset) || (i > 0 && r <= prev))
+            if ((keysEnd == 0 && (i != 0 || r != 0)) || (keysEnd > 0 && r >= (uint)keysEnd) || (i > 0 && r <= prev))
                 ThrowHelper.Corruption("bad block restart offset");
             prev = r;
         }
         // A non-zero restarts[0] self-signals the common-prefix section [0, restarts[0]) (no footer bit).
-        CommonPrefixLength = numRestarts > 0 && RestartOffset > 0 ? (int)Coding.DecodeFixed32(data[RestartOffset..]) : 0;
+        CommonPrefixLength = numRestarts > 0 && keysEnd > 0 ? (int)Coding.DecodeFixed32(data[RestartOffset..]) : 0;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

@@ -13,9 +13,11 @@ using CompressionOptions = RocksDb.Managed.CompressionOptions;
 namespace RocksDb.Managed.Table;
 
 /// <summary>
-/// Builds a block-based table (SST file). Port of BlockBasedTableBuilder (table/block_based/block_based_table_builder.cc)
-/// — the single-threaded, unbuffered path (no parallel compression, no dictionary compression, no partitioned
-/// index/filters on the write side).
+/// Builds a block-based table (SST file). Port of BlockBasedTableBuilder (table/block_based/block_based_table_builder.cc):
+/// the single-threaded emit path (no parallel compression) with dictionary compression (buffered state), all index
+/// types (binary search, with first key, partitioned, kHashSearch), full and partitioned filters, separated key/value
+/// data blocks, the index "is_uniform" hint, block_align and super block alignment, plus user table properties
+/// collectors (<see cref="TablePropertiesCollector"/>).
 /// <para>
 /// Keys are internal keys (user key + 8-byte packed sequence/type) added in strictly increasing internal-key order;
 /// range deletions (<see cref="EntryType.RangeDeletion"/>) may be interleaved and go to the "rocksdb.range_del" meta block.
@@ -76,6 +78,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
     private readonly List<byte[]> _dataBlockBuffers = new();
     private CompressionDictionary? _dict;
     private readonly int _blockSizeDeviationLimit;
+    private readonly int _alignment;
     private readonly int _compressionLevel;
     private readonly int _maxCompressedBytesPerKb;
     private ulong _offset;
@@ -99,26 +102,45 @@ public sealed class BlockBasedTableBuilder : IDisposable
         _icmp = _ucmp.Kind == ComparatorKind.Bytewise ? InternalKeyComparator.Bytewise : new InternalKeyComparator(_ucmp);
         _offset = (ulong)file.Size;
         bool useCommonPrefix = UseCommonPrefix(options, _ucmp);
+        // UseCommonPrefixForIndex: super block alignment triggers skip_delta_encoding on index entries, which stores a
+        // non-restart key with shared == 0 that the reader cannot distinguish from a stripped restart key.
+        bool useCommonPrefixIndex = useCommonPrefix && options.SuperBlockAlignmentSize == 0;
+        // Rep::alignment: block_align pads data blocks to min(block_size, kDefaultPageSize).
+        _alignment = options.BlockAlign ? Math.Min(options.BlockSize, TableFormatOptions.DefaultPageSize) : 0;
+        if (_alignment > 0 && tableBuilderOptions.CompressionType != CompressionType.None)
+            ThrowHelper.InvalidArgument("Enable block_align, but compression enabled");
         // The hash index needs keys whose bytes determine equality (CanKeysWithDifferentByteContentsBeEqual).
         _dataBlock = new BlockBuilder(options.BlockRestartInterval, options.UseDeltaEncoding, false,
             _ucmp.CanKeysWithDifferentByteContentsBeEqual ? DataBlockIndexType.BinarySearch : options.DataBlockIndexType,
-            options.DataBlockHashTableUtilRatio, useCommonPrefix, isUserKey: false, _stripTsSize);
+            options.DataBlockHashTableUtilRatio, useCommonPrefix, isUserKey: false, _stripTsSize,
+            options.SeparateKeyValueInDataBlock, uniformCvThreshold: -1.0);
         // RangeDelBlockBuilder(ts_sz, persist_user_defined_timestamps): the start keys are stripped by the block
         // builder, the end keys (values) in AddCore.
         _rangeDelBlock = new BlockBuilder(1, true, false, DataBlockIndexType.BinarySearch, 0.75, useCommonPrefix: false, isUserKey: false, _stripTsSize);
-        _useDeltaEncodingForIndexValues = options.FormatVersion >= 4;
+        _useDeltaEncodingForIndexValues = options.FormatVersion >= 4 && !options.BlockAlign;
         PartitionedIndexBuilder? partitionedIndex = null;
         if (options.IndexType == IndexType.TwoLevelIndexSearch)
         {
             // PartitionedIndexBuilder::CreateIndexBuilder (use_common_prefix applies to all index tiers).
             partitionedIndex = new PartitionedIndexBuilder(_icmp, options.IndexBlockRestartInterval, options.FormatVersion, _useDeltaEncodingForIndexValues,
-                options.IndexShortening, options.MetadataBlockSize, options.BlockSizeDeviation, useCommonPrefix, useCommonPrefix, _stripTsSize);
+                options.IndexShortening, options.MetadataBlockSize, options.BlockSizeDeviation, useCommonPrefixIndex, useCommonPrefixIndex, _stripTsSize,
+                options.UniformCvThreshold);
             _indexBuilder = partitionedIndex;
+        }
+        else if (options.IndexType == IndexType.HashSearch)
+        {
+            // BlockBasedTableFactory::ValidateOptions: kHashSearch requires a prefix extractor. Currently kHashSearch is
+            // incompatible with index_block_restart_interval > 1 (sanitized to 1 by InitializeOptions).
+            if (tableBuilderOptions.PrefixExtractor is null)
+                ThrowHelper.InvalidArgument("Hash index is specified for block-based table, but prefix_extractor is not given");
+            _indexBuilder = new HashIndexBuilder(_icmp, tableBuilderOptions.PrefixExtractor, 1, options.FormatVersion, _useDeltaEncodingForIndexValues,
+                options.IndexShortening, useCommonPrefixIndex, _stripTsSize, options.UniformCvThreshold);
         }
         else
         {
             _indexBuilder = new ShortenedIndexBuilder(_icmp, options.IndexBlockRestartInterval, options.FormatVersion, _useDeltaEncodingForIndexValues,
-                options.IndexShortening, options.IndexType == IndexType.BinarySearchWithFirstKey, useCommonPrefix, _stripTsSize);
+                options.IndexShortening, options.IndexType == IndexType.BinarySearchWithFirstKey, useCommonPrefixIndex, _stripTsSize,
+                options.UniformCvThreshold);
         }
         _prefixExtractor = tableBuilderOptions.PrefixExtractor;
         // Port of CreateFilterBlockBuilder: the policy picks the filter implementation from the full building context
@@ -176,6 +198,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
         _props.FormatVersion = (ulong)options.FormatVersion;
         _props.DataBlockRestartInterval = (ulong)options.BlockRestartInterval;
         _props.IndexBlockRestartInterval = (ulong)options.IndexBlockRestartInterval;
+        _props.SeparateKeyValueInDataBlock = options.SeparateKeyValueInDataBlock ? 1UL : 0UL;
         _props.KeyLargestSeqno = 0;
         _props.KeySmallestSeqno = ulong.MaxValue;
 
@@ -191,7 +214,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
     /// <summary>
     /// Port of UseCommonPrefixForDataBlock / UseCommonPrefixForIndex (block_based_table_builder.cc): format_version
     /// &gt;= 8, delta encoding, no user-defined timestamps; kIfFastSeek only for the (reverse-)bytewise comparators.
-    /// (super_block_alignment_size is not supported, so the index gate is the same as the data block gate.)
+    /// UseCommonPrefixForIndex additionally requires super_block_alignment_size == 0.
     /// </summary>
     internal static bool UseCommonPrefix(TableFormatOptions options, Comparator ucmp)
     {
@@ -328,6 +351,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
         if (currSize >= _options.BlockSize) return true;
         if (_blockSizeDeviationLimit == 0) return false;
         int after = _dataBlock.EstimateSizeAfterKV(keyLength, valueLength);
+        // block_align: the block plus its trailer must fit the (aligned) block size.
+        if (_alignment > 0) return after + BlockBasedTableConstants.BlockTrailerSize > _options.BlockSize;
         return after > _options.BlockSize && currSize > _blockSizeDeviationLimit;
     }
 
@@ -356,8 +381,10 @@ public sealed class BlockBasedTableBuilder : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void EmitBlock(ReadOnlySpan<byte> raw, ReadOnlySpan<byte> lastKey, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext)
     {
-        BlockHandle handle = WriteBlock(raw, isDataBlock: true);
-        _indexBuilder.AddIndexEntry(lastKey, firstKeyInNextBlock, hasNext, handle);
+        // When data blocks are aligned with super block alignment, delta encoding needs to be skipped for the first block
+        // after padding.
+        BlockHandle handle = WriteBlock(raw, isDataBlock: true, out bool skipDeltaEncoding);
+        _indexBuilder.AddIndexEntry(lastKey, firstKeyInNextBlock, hasNext, handle, skipDeltaEncoding);
     }
 
     /// <summary>
@@ -474,7 +501,10 @@ public sealed class BlockBasedTableBuilder : IDisposable
 
     /// <summary>Port of WriteBlock + CompressAndVerifyBlock (compression via the facade, with the ratio check).</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private BlockHandle WriteBlock(ReadOnlySpan<byte> raw, bool isDataBlock)
+    private BlockHandle WriteBlock(ReadOnlySpan<byte> raw, bool isDataBlock) => WriteBlock(raw, isDataBlock, out _);
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private BlockHandle WriteBlock(ReadOnlySpan<byte> raw, bool isDataBlock, out bool skipDeltaEncoding)
     {
         CompressionType type = CompressionType.None;
         bool compress = _tbo.CompressionType != CompressionType.None && (isDataBlock || _options.EnableIndexCompression) && raw.Length < CompressionSizeLimit;
@@ -493,7 +523,9 @@ public sealed class BlockBasedTableBuilder : IDisposable
                 _props.NumDataBlocksCompressionRejected++;
             }
         }
-        BlockHandle h = type == CompressionType.None ? WriteMaybeCompressedBlock(raw, type) : WriteMaybeCompressedBlock(_compressed.WrittenSpan, type);
+        BlockHandle h = type == CompressionType.None
+            ? WriteMaybeCompressedBlock(raw, type, isDataBlock, out skipDeltaEncoding)
+            : WriteMaybeCompressedBlock(_compressed.WrittenSpan, type, isDataBlock, out skipDeltaEncoding);
         if (isDataBlock)
         {
             _props.DataSize = _offset;
@@ -502,10 +534,37 @@ public sealed class BlockBasedTableBuilder : IDisposable
         return h;
     }
 
-    /// <summary>Port of WriteMaybeCompressedBlockImpl: payload + trailer (type byte, checksum with context).</summary>
+    /// <summary>WriteMaybeCompressedBlockImpl for meta blocks (no alignment).</summary>
+    private BlockHandle WriteMaybeCompressedBlock(ReadOnlySpan<byte> contents, CompressionType type) =>
+        WriteMaybeCompressedBlock(contents, type, isDataBlock: false, out _);
+
+    /// <summary>
+    /// Port of WriteMaybeCompressedBlockImpl: payload + trailer (type byte, checksum with context). Data blocks may be
+    /// preceded by super block alignment padding (<paramref name="skipDeltaEncoding"/> = true) and followed by block_align
+    /// padding; padding is zero bytes (WritableFileWriter::Pad).
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private BlockHandle WriteMaybeCompressedBlock(ReadOnlySpan<byte> contents, CompressionType type)
+    private BlockHandle WriteMaybeCompressedBlock(ReadOnlySpan<byte> contents, CompressionType type, bool isDataBlock, out bool skipDeltaEncoding)
     {
+        skipDeltaEncoding = false;
+        // try to align the data block page to the super alignment size, if enabled
+        long superSize = _options.SuperBlockAlignmentSize;
+        if (superSize != 0 && isDataBlock && _options.SuperBlockAlignmentSpaceOverheadRatio != 0)
+        {
+            ulong mask = (ulong)superSize - 1;
+            if ((_offset & ~mask) != ((_offset + (ulong)contents.Length) & ~mask))
+            {
+                ulong allowedMaxPaddingSize = (ulong)superSize / (ulong)_options.SuperBlockAlignmentSpaceOverheadRatio;
+                // new block would cross the super block boundary
+                ulong padBytes = (ulong)superSize - (_offset & mask);
+                if (padBytes < allowedMaxPaddingSize)
+                {
+                    Pad((int)padBytes);
+                    // Skip delta encoding in index block builder when a super block alignment padding is added for data block.
+                    skipDeltaEncoding = true;
+                }
+            }
+        }
         var handle = new BlockHandle(_offset, (ulong)contents.Length);
         _compressionTypesUsed |= 1u << ((int)type & 31);
         _out.Write(contents);
@@ -515,7 +574,22 @@ public sealed class BlockBasedTableBuilder : IDisposable
         Coding.EncodeFixed32(trailer[1..], checksum);
         _out.Advance(BlockBasedTableConstants.BlockTrailerSize);
         _offset += (ulong)contents.Length + BlockBasedTableConstants.BlockTrailerSize;
+        if (_alignment > 0 && isDataBlock)
+        {
+            int padBytes = (_alignment - ((contents.Length + BlockBasedTableConstants.BlockTrailerSize) & (_alignment - 1))) & (_alignment - 1);
+            Pad(padBytes);
+        }
         return handle;
+    }
+
+    /// <summary>WritableFileWriter::Pad: <paramref name="padBytes"/> zero bytes.</summary>
+    private void Pad(int padBytes)
+    {
+        if (padBytes <= 0) return;
+        Span<byte> pad = _out.GetSpan(padBytes)[..padBytes];
+        pad.Clear();
+        _out.Advance(padBytes);
+        _offset += (ulong)padBytes;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -596,12 +670,22 @@ public sealed class BlockBasedTableBuilder : IDisposable
     {
         BlockHandle h = default;
         bool done;
+        bool first = true;
         do
         {
             done = _indexBuilder.Finish(h, out ReadOnlySpan<byte> contents);
+            if (first && _indexBuilder is HashIndexBuilder hash)
+            {
+                // Auxiliary meta blocks first (IndexBlocks::meta_blocks is a std::map: "metadata" < "prefixes"), written
+                // like index blocks (compressible).
+                metaIndex.Add(BlockBasedTableConstants.HashIndexPrefixesMetadataBlockName, WriteBlock(hash.PrefixesMetadataBlock, isDataBlock: false));
+                metaIndex.Add(BlockBasedTableConstants.HashIndexPrefixesBlockName, WriteBlock(hash.PrefixesBlock, isDataBlock: false));
+            }
+            first = false;
             h = WriteBlock(contents, isDataBlock: false);
         }
         while (!done);
+        _props.NumUniformBlocks = _indexBuilder.NumUniformIndexBlocks;
         // index_size reports the logical (uncompressed) index size + trailer.
         _props.IndexSize = (ulong)_indexBuilder.IndexSize + BlockBasedTableConstants.BlockTrailerSize;
         if (_options.IndexType == IndexType.TwoLevelIndexSearch)

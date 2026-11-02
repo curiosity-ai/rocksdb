@@ -101,7 +101,7 @@ public sealed partial class BlockBasedTableReader
     }
 
     private static void SeekIndex<TBatch>(IndexCursor idx, TBatch batch, int key) where TBatch : class, ITableMultiGetBatch =>
-        idx.Seek(batch.InternalKey(key));
+        idx.SeekForGet(batch.InternalKey(key));
 
     /// <summary>
     /// Visits the entries of <paramref name="key"/> in <paramref name="block"/>. Returns 1 when the key's entries may

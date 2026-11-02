@@ -25,9 +25,10 @@ public sealed class BlockTests
     }
 
     private static Block BuildBlock(List<byte[]> keys, List<byte[]> values, int restartInterval, DataBlockIndexType indexType = DataBlockIndexType.BinarySearch,
-        bool commonPrefix = false)
+        bool commonPrefix = false, bool separatedKv = false)
     {
-        using var b = new BlockBuilder(restartInterval, true, false, indexType, 0.75, commonPrefix, isUserKey: false);
+        using var b = new BlockBuilder(restartInterval, true, false, indexType, 0.75, commonPrefix, isUserKey: false, stripTimestampSize: 0,
+            useSeparatedKvStorage: separatedKv, uniformCvThreshold: -1);
         for (int i = 0; i < keys.Count; i++) b.Add(keys[i], values[i]);
         return Block.CreateCopy(b.Finish());
     }
@@ -41,7 +42,12 @@ public sealed class BlockTests
     [DataRow(16, "common/prefix/", true)]
     [DataRow(1000, "p", true)]
     [DataRow(16, "", true)] // common-prefix builder whose keys happen to share little or nothing
-    public void DataBlockRoundTripSeekAndPrev(int restartInterval, string prefix, bool commonPrefix)
+    [DataRow(1, "", false, true)]
+    [DataRow(3, "", false, true)]
+    [DataRow(16, "", false, true)]
+    [DataRow(16, "common/prefix/", true, true)]
+    [DataRow(1000, "p", true, true)]
+    public void DataBlockRoundTripSeekAndPrev(int restartInterval, string prefix, bool commonPrefix, bool separatedKv = false)
     {
         int seed = Environment.TickCount;
         string trace = "seed=" + seed;
@@ -49,7 +55,8 @@ public sealed class BlockTests
         List<byte[]> keys = SortedInternalKeys(500, rnd, 24, prefix);
         var values = new List<byte[]>();
         foreach (byte[] k in keys) { byte[] v = new byte[rnd.Next(0, 40)]; rnd.NextBytes(v); values.Add(v); }
-        Block block = BuildBlock(keys, values, restartInterval, DataBlockIndexType.BinarySearch, commonPrefix);
+        Block block = BuildBlock(keys, values, restartInterval, DataBlockIndexType.BinarySearch, commonPrefix, separatedKv);
+        Assert.AreEqual(separatedKv, block.ValuesSectionOffset >= 0, trace);
         if (prefix.Length > 0) Assert.IsTrue(block.CommonPrefixLength >= prefix.Length, trace);
         if (!commonPrefix) Assert.AreEqual(0, block.CommonPrefixLength, trace);
         using var it = new BlockIter();
@@ -119,6 +126,115 @@ public sealed class BlockTests
         it.SeekForPrev(IKey("a", 1));
         Assert.IsFalse(it.Valid);
         block.Release();
+    }
+
+    /// <summary>separate_key_value_in_data_block layout (DataBlockFooter with values_section_offset and bit 28).</summary>
+    [TestMethod]
+    public void KnownEncodingSeparatedKv()
+    {
+        using var b = new BlockBuilder(1, true, false, DataBlockIndexType.BinarySearch, 0.75, false, false, 0, useSeparatedKvStorage: true, uniformCvThreshold: -1);
+        b.Add("abc"u8, "1"u8);
+        b.Add("abd"u8, "22"u8);
+        // keys: <shared><non_shared><value_size><value_offset><key> per restart entry; then values "1" "22"; restarts
+        // [0, 7]; values_section_offset 14; packed = 2 | 1 << 28.
+        byte[] expected =
+        [
+            0, 3, 1, 0, (byte)'a', (byte)'b', (byte)'c',
+            0, 3, 2, 1, (byte)'a', (byte)'b', (byte)'d',
+            (byte)'1', (byte)'2', (byte)'2',
+            0, 0, 0, 0, 7, 0, 0, 0,
+            14, 0, 0, 0,
+            2, 0, 0, 0x10,
+        ];
+        CollectionAssert.AreEqual(expected, b.Finish().ToArray());
+        Block block = Block.CreateCopy(expected);
+        Assert.AreEqual(14, block.ValuesSectionOffset);
+        using var it = new BlockIter();
+        it.InitializeMeta(block);
+        it.SeekToLast();
+        CollectionAssert.AreEqual("abd"u8.ToArray(), it.Key.ToArray());
+        CollectionAssert.AreEqual("22"u8.ToArray(), it.Value.ToArray());
+        it.Prev();
+        CollectionAssert.AreEqual("1"u8.ToArray(), it.Value.ToArray());
+        block.Release();
+
+        // A values section offset beyond the restart array is corruption.
+        byte[] bad = (byte[])expected.Clone();
+        bad[^8] = 40;
+        var ex = Assert.ThrowsExactly<RocksDbException>(() => Block.CreateCopy(bad));
+        Assert.AreEqual(StatusCode.Corruption, ex.Code);
+    }
+
+    [TestMethod]
+    public void EmptySeparatedKvBlock()
+    {
+        using var b = new BlockBuilder(16, true, false, DataBlockIndexType.BinarySearch, 0.75, false, false, 0, useSeparatedKvStorage: true, uniformCvThreshold: -1);
+        Assert.AreEqual(12, b.CurrentSizeEstimate);
+        ReadOnlySpan<byte> contents = b.Finish();
+        Assert.AreEqual(12, contents.Length);
+        Block block = Block.CreateCopy(contents);
+        using var it = new BlockIter();
+        it.InitializeData(block, InternalKeyComparator.Bytewise, BlockIter.DisableGlobalSequenceNumber);
+        it.SeekToFirst();
+        Assert.IsFalse(it.Valid);
+        it.Seek(IKey("a", 1));
+        Assert.IsFalse(it.Valid);
+        block.Release();
+    }
+
+    /// <summary>Data block hash index over a separated key/value block (point lookups through SeekForGet).</summary>
+    [TestMethod]
+    public void HashIndexWithSeparatedKv()
+    {
+        var rnd = new Random(42);
+        List<byte[]> keys = SortedInternalKeys(300, rnd);
+        var values = new List<byte[]>();
+        foreach (byte[] k in keys) values.Add([.. k, .. "#v"u8]);
+        Block block = BuildBlock(keys, values, 4, DataBlockIndexType.BinaryAndHash, separatedKv: true);
+        Assert.IsTrue(block.HasHashIndex);
+        Assert.IsTrue(block.ValuesSectionOffset > 0);
+        using var it = new BlockIter();
+        it.InitializeData(block, InternalKeyComparator.Bytewise, BlockIter.DisableGlobalSequenceNumber);
+        for (int i = 0; i < keys.Count; i++)
+        {
+            Assert.IsTrue(it.SeekForGet(keys[i]));
+            CollectionAssert.AreEqual(keys[i], it.Key.ToArray());
+            CollectionAssert.AreEqual(values[i], it.Value.ToArray());
+        }
+        block.Release();
+    }
+
+    /// <summary>uniform_cv_threshold: evenly spaced index keys get the "is_uniform" bit (bit 29), skewed keys do not.</summary>
+    [TestMethod]
+    public void UniformHint()
+    {
+        static Block Build(Func<int, ulong> key, double threshold)
+        {
+            using var b = new BlockBuilder(1, true, true, DataBlockIndexType.BinarySearch, 0.75, false, isUserKey: true, 0, false, threshold);
+            byte[] handle = [1, 2];
+            for (int i = 0; i < 100; i++)
+            {
+                byte[] k = new byte[8];
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt64BigEndian(k, key(i));
+                b.Add(k, handle, handle, false);
+            }
+            ReadOnlySpan<byte> contents = b.Finish();
+            Assert.AreEqual(b.IsUniform, (Coding.DecodeFixed32(contents[^4..]) & (1u << 29)) != 0);
+            return Block.CreateCopy(contents);
+        }
+        Block uniform = Build(static i => 1000 + (ulong)i * 977, 0.1);
+        Assert.IsTrue(uniform.IsUniform);
+        Assert.AreEqual(100, uniform.NumRestarts);
+        uniform.Release();
+        Block skewed = Build(static i => (ulong)i * (ulong)i * (ulong)i * 1_000_003, 0.1);
+        Assert.IsFalse(skewed.IsUniform);
+        skewed.Release();
+        Block disabled = Build(static i => 1000 + (ulong)i * 977, -1);
+        Assert.IsFalse(disabled.IsUniform);
+        disabled.Release();
+
+        Assert.AreEqual(0x0102000000000000UL, BlockBuilder.ReadBe64FromKey([0xff, 1, 2], isUserKey: true, offset: 1));
+        Assert.AreEqual(0x0102030405060708UL, BlockBuilder.ReadBe64FromKey([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0], isUserKey: false, offset: 1));
     }
 
     [TestMethod]

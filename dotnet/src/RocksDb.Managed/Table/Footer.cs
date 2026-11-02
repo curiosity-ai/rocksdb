@@ -23,6 +23,10 @@ public static class BlockBasedTableConstants
     public const string IndexBlockName = "rocksdb.index";
     public const string CompressionDictBlockName = "rocksdb.compression_dict";
     public const string RangeDelBlockName = "rocksdb.range_del";
+    /// <summary>kHashIndexPrefixesBlock (kHashSearch index): all distinct key prefixes, concatenated.</summary>
+    public const string HashIndexPrefixesBlockName = "rocksdb.hashindex.prefixes";
+    /// <summary>kHashIndexPrefixesMetadataBlock: per prefix varint32 (length, first data block index, number of blocks).</summary>
+    public const string HashIndexPrefixesMetadataBlockName = "rocksdb.hashindex.metadata";
     public const string FullFilterBlockPrefix = "fullfilter.";
     public const string PartitionedFilterBlockPrefix = "partitionedfilter.";
     /// <summary>Old (pre-6.x) block-based filter prefix, unsupported.</summary>

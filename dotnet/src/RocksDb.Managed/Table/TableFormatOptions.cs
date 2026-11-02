@@ -46,8 +46,30 @@ public sealed record TableFormatOptions
     public bool OptimizeFiltersForMemory { get; init; } = true;
     /// <summary>Verify block checksums when reading (ReadOptions::verify_checksums default true).</summary>
     public bool VerifyChecksums { get; init; } = true;
+    /// <summary>
+    /// separate_key_value_in_data_block: data blocks store all keys first and the values after them (a value-offset varint
+    /// per restart interval). Readable by RocksDB 11.x with the feature (recorded in "rocksdb.separate.key.value.in.data.block").
+    /// </summary>
+    public bool SeparateKeyValueInDataBlock { get; init; }
+    /// <summary>
+    /// uniform_cv_threshold: index blocks whose restart-key gaps have a coefficient of variation below this get the
+    /// "is_uniform" footer hint (counted in "rocksdb.num.uniform.blocks"). Negative (default -1) disables it.
+    /// </summary>
+    public double UniformCvThreshold { get; init; } = -1;
+    /// <summary>block_align: pad every data block (+ trailer) to min(block_size, 4 KiB); block_size must be a power of 2 and compression disabled.</summary>
+    public bool BlockAlign { get; init; }
+    /// <summary>
+    /// super_block_alignment_size: pad before a data block that would straddle a boundary of this power-of-two size, when the
+    /// padding is below size / <see cref="SuperBlockAlignmentSpaceOverheadRatio"/>. 0 (default) disables it.
+    /// </summary>
+    public long SuperBlockAlignmentSize { get; init; }
+    /// <summary>super_block_alignment_space_overhead_ratio (default 128; 0 disables super block alignment; else &gt;= 4).</summary>
+    public long SuperBlockAlignmentSpaceOverheadRatio { get; init; } = 128;
 
     public static TableFormatOptions Default { get; } = new();
+
+    /// <summary>kDefaultPageSize (table/block_based/block_based_table_builder.cc): the block_align upper bound.</summary>
+    internal const int DefaultPageSize = 4 * 1024;
 
     internal void Validate()
     {
@@ -55,8 +77,14 @@ public sealed record TableFormatOptions
             ThrowHelper.InvalidArgument("Unsupported BlockBasedTable format_version " + FormatVersion);
         if (BlockRestartInterval < 1 || IndexBlockRestartInterval < 1) ThrowHelper.InvalidArgument("restart interval must be >= 1");
         if (BlockSize <= 0) ThrowHelper.InvalidArgument("block_size must be > 0");
-        if (IndexType == IndexType.HashSearch) ThrowHelper.NotSupported("kHashSearch index is not supported for writing");
         if (MetadataBlockSize <= 0) ThrowHelper.InvalidArgument("metadata_block_size must be > 0");
+        // BlockBasedTableFactory::ValidateOptions.
+        if (BlockAlign && (BlockSize & (BlockSize - 1)) != 0) ThrowHelper.InvalidArgument("Block alignment requested but block size is not a power of 2");
+        if (SuperBlockAlignmentSize < 0 || (SuperBlockAlignmentSize & (SuperBlockAlignmentSize - 1)) != 0)
+            ThrowHelper.InvalidArgument("Super Block alignment requested but super block alignment size is not a power of 2");
+        if (SuperBlockAlignmentSize > uint.MaxValue) ThrowHelper.InvalidArgument("Super block alignment size exceeds maximum number (4GiB) allowed");
+        if (SuperBlockAlignmentSpaceOverheadRatio < 0 || (SuperBlockAlignmentSpaceOverheadRatio > 0 && SuperBlockAlignmentSpaceOverheadRatio < 4))
+            ThrowHelper.InvalidArgument("Super block alignment space overhead is too high");
     }
 }
 

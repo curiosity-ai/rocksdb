@@ -73,6 +73,12 @@ public static class TableFactory
             PartitionFilters = options.PartitionFilters && options.IndexType == IndexType.TwoLevelIndexSearch,
             DecouplePartitionedFilters = options.DecouplePartitionedFilters,
             OptimizeFiltersForMemory = options.OptimizeFiltersForMemory,
+            SeparateKeyValueInDataBlock = options.SeparateKeyValueInDataBlock,
+            UniformCvThreshold = options.UniformCvThreshold,
+            BlockAlign = options.BlockAlign,
+            SuperBlockAlignmentSize = options.SuperBlockAlignmentSize > long.MaxValue ? long.MaxValue : (long)options.SuperBlockAlignmentSize,
+            SuperBlockAlignmentSpaceOverheadRatio = options.SuperBlockAlignmentSpaceOverheadRatio > long.MaxValue
+                ? long.MaxValue : (long)options.SuperBlockAlignmentSpaceOverheadRatio,
         };
     }
 
