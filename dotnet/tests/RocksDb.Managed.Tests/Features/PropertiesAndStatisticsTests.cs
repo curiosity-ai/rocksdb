@@ -13,7 +13,7 @@ public sealed class PropertiesAndStatisticsTests
     private static ColumnFamilyOptions BloomCf() => new()
     {
         Compression = RocksDb.Managed.Compression.CompressionType.None,
-        TableOptions = new BlockBasedTableOptions { FilterPolicy = "bloomfilter:10:false" },
+        TableOptions = new BlockBasedTableOptions { FilterPolicy = new RocksDb.Managed.Table.Filters.BloomFilterPolicy(10) },
     };
 
     private static void FillAndFlush(RocksDatabase db, int n, int valueSize)

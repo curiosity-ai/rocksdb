@@ -78,18 +78,6 @@ public sealed partial class ColumnFamily
 
     // ---- properties --------------------------------------------------------------------------------------
 
-    /// <summary>
-    /// The integer value of a numeric property (DB::GetIntProperty), e.g. "rocksdb.estimate-num-keys",
-    /// "rocksdb.cur-size-all-mem-tables", "rocksdb.estimate-live-data-size", "rocksdb.block-cache-usage". Returns false
-    /// for unknown or non-numeric properties.
-    /// </summary>
-    public bool TryGetIntProperty(string property, out ulong value)
-    {
-        ArgumentNullException.ThrowIfNull(property);
-        _db.ThrowIfDisposed();
-        return _db.TryGetIntProperty(_cfd, property, out value);
-    }
-
     /// <summary>The integer value of a numeric property, or null (see <see cref="TryGetIntProperty"/>).</summary>
     public ulong? GetIntProperty(string property) => TryGetIntProperty(property, out ulong v) ? v : null;
 
@@ -133,8 +121,6 @@ public sealed partial class RocksDatabase
 
     public (ulong Count, ulong Size) GetApproximateMemTableStats(ReadOnlySpan<byte> start, ReadOnlySpan<byte> limit) =>
         _default.GetApproximateMemTableStats(start, limit);
-
-    public bool TryGetIntProperty(string property, out ulong value) => _default.TryGetIntProperty(property, out value);
 
     public ulong? GetIntProperty(string property) => _default.GetIntProperty(property);
 

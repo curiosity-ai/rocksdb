@@ -32,9 +32,9 @@ public static class DbBenchRunner
 {
     public sealed class Flags
     {
-        public string Engine = "rocksdb-sharp";
+        public EngineKind Engine = EngineKind.RocksDbSharp;
         public bool Async;
-        public string[] Benchmarks = ["fillseq", "fillrandom", "readrandom"];
+        public DbBenchmark[] Benchmarks = [DbBenchmark.FillSeq, DbBenchmark.FillRandom, DbBenchmark.ReadRandom];
         public long Num = 1_000_000;
         public long Reads = -1;
         public int KeySize = 16;
@@ -51,19 +51,8 @@ public static class DbBenchRunner
         public string? CBenchPath;
         public EngineOptions Options = new();
 
-        public string EngineLabel => Engine switch
-        {
-            "native" => "rocksdb-sharp",
-            "managed" when Async => "managed-async",
-            _ => Engine,
-        };
+        public string EngineLabel => Engine == EngineKind.Managed && Async ? "managed-async" : BenchFlags.Name(Engine);
     }
-
-    public static readonly string[] AllBenchmarks =
-    [
-        "fillseq", "fillrandom", "overwrite", "fillsync", "readrandom", "readmissing", "readseq", "readreverse",
-        "seekrandom", "multireadrandom", "readwhilewriting", "deleterandom", "flush", "compact", "waitforcompaction", "stats",
-    ];
 
     /// <summary>
     /// User bytes (key + value) written by the fill/overwrite benchmarks and the readwhilewriting writer since the DB
@@ -85,8 +74,8 @@ public static class DbBenchRunner
             return 1;
         }
 
-        if (f.Engine == "c-native") return CNativeBench.Run(f, args);
-        if (f.Async && f.Engine != "managed")
+        if (f.Engine == EngineKind.CNative) return CNativeBench.Run(f, args);
+        if (f.Async && f.Engine != EngineKind.Managed)
         {
             Console.Error.WriteLine("--async is only supported by --engine managed");
             return 1;
@@ -107,21 +96,20 @@ public static class DbBenchRunner
         {
             for (int index = 0; index < f.Benchmarks.Length; index++)
             {
-                string name = f.Benchmarks[index];
-                if (Array.IndexOf(AllBenchmarks, name) < 0) throw new ArgumentException("unknown benchmark " + name);
-                bool fresh = !f.UseExistingDb && name is "fillseq" or "fillrandom" or "fillsync";
+                DbBenchmark bench = f.Benchmarks[index];
+                bool fresh = !f.UseExistingDb && bench is DbBenchmark.FillSeq or DbBenchmark.FillRandom or DbBenchmark.FillSync;
                 if (engine is null || fresh)
                 {
                     engine?.Dispose();
                     engine = EngineFactory.Open(f.Engine, f.Db, f.Options, destroyExisting: fresh);
                     if (fresh) s_userBytesWritten = 0;
                 }
-                if (name == "stats")
+                if (bench == DbBenchmark.Stats)
                 {
                     PrintStats(engine, f);
                     continue;
                 }
-                new BenchRun(engine, f, values, name, index).Execute();
+                new BenchRun(engine, f, values, bench, index).Execute();
             }
         }
         catch (Exception e) when (e is NotSupportedException or ArgumentException)
@@ -145,8 +133,9 @@ public static class DbBenchRunner
     }
 
     /// <summary>One benchmark execution: spawns the workers, merges and reports.</summary>
-    private sealed class BenchRun(IKeyValueEngine engine, Flags f, ValueBuffer values, string name, int index)
+    private sealed class BenchRun(IKeyValueEngine engine, Flags f, ValueBuffer values, DbBenchmark bench, int index)
     {
+        private readonly string _name = BenchFlags.Name(bench);
         private long _totalOps;
         private int _readersDone;
         private long _writerOps;
@@ -156,35 +145,35 @@ public static class DbBenchRunner
             long allocBefore = GC.GetTotalAllocatedBytes(precise: true);
             int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
 
-            if (name is "flush" or "compact" or "waitforcompaction")
+            if (bench is DbBenchmark.Flush or DbBenchmark.Compact or DbBenchmark.WaitForCompaction)
             {
                 long t0 = Clock.Now();
                 if (f.Async)
                 {
                     RocksDatabase db = ((ManagedEngine)engine).Db;
-                    ValueTask op = name switch
+                    ValueTask op = bench switch
                     {
-                        "flush" => db.FlushAsync(),
-                        "compact" => db.CompactRangeAsync(),
+                        DbBenchmark.Flush => db.FlushAsync(),
+                        DbBenchmark.Compact => db.CompactRangeAsync(),
                         _ => db.WaitForCompactAsync(),
                     };
                     op.AsTask().GetAwaiter().GetResult();
                 }
-                else if (name == "flush") engine.Flush();
-                else if (name == "compact") engine.CompactRange();
+                else if (bench == DbBenchmark.Flush) engine.Flush();
+                else if (bench == DbBenchmark.Compact) engine.CompactRange();
                 else engine.WaitForCompaction();
                 double secs = Clock.ElapsedNs(t0) / 1e9;
                 Report(1, secs, 0, 0, null, allocBefore, g0, g1, g2, "");
                 return;
             }
 
-            _totalOps = name switch
+            _totalOps = bench switch
             {
-                "fillsync" => Math.Max(f.Num / 1000, 1),
-                "readrandom" or "readmissing" or "readseq" or "readreverse" or "seekrandom" or "multireadrandom" or "readwhilewriting" => f.Reads,
+                DbBenchmark.FillSync => Math.Max(f.Num / 1000, 1),
+                DbBenchmark.ReadRandom or DbBenchmark.ReadMissing or DbBenchmark.ReadSeq or DbBenchmark.ReadReverse or DbBenchmark.SeekRandom or DbBenchmark.MultiReadRandom or DbBenchmark.ReadWhileWriting => f.Reads,
                 _ => f.Num,
             };
-            int n = f.Threads + (name == "readwhilewriting" ? 1 : 0);
+            int n = f.Threads + (bench == DbBenchmark.ReadWhileWriting ? 1 : 0);
             var workers = new Worker[n];
             for (int i = 0; i < n; i++) workers[i] = new Worker(i);
 
@@ -203,9 +192,9 @@ public static class DbBenchRunner
                 bytes += w.Bytes;
                 found += w.Found;
             }
-            string extra = name == "readwhilewriting" ? "(writer: " + Interlocked.Read(ref _writerOps) + " puts)" : "";
-            if (name is "fillseq" or "fillrandom" or "overwrite" or "fillsync") s_userBytesWritten += bytes;
-            else if (name == "readwhilewriting") s_userBytesWritten += Interlocked.Read(ref _writerOps) * (f.KeySize + f.ValueSize);
+            string extra = bench == DbBenchmark.ReadWhileWriting ? "(writer: " + Interlocked.Read(ref _writerOps) + " puts)" : "";
+            if (bench is DbBenchmark.FillSeq or DbBenchmark.FillRandom or DbBenchmark.Overwrite or DbBenchmark.FillSync) s_userBytesWritten += bytes;
+            else if (bench == DbBenchmark.ReadWhileWriting) s_userBytesWritten += Interlocked.Read(ref _writerOps) * (f.KeySize + f.ValueSize);
             Report(ops, Clock.ToNs(end - start) / 1e9, bytes, found, merged, allocBefore, g0, g1, g2, extra);
         }
 
@@ -226,9 +215,9 @@ public static class DbBenchRunner
             }
             var ci = CultureInfo.InvariantCulture;
             string line = string.Format(ci, "{0,-17} : {1,11:F3} micros/op {2,10:F0} ops/sec {3,9:F3} seconds {4,10} operations; {5,8:F1} MB/s",
-                name, microsPerOp, opsPerSec, seconds, ops, mbs);
+                _name, microsPerOp, opsPerSec, seconds, ops, mbs);
             if (hasHist) line += string.Format(ci, " | p50 {0:F3} p99 {1:F3} p99.9 {2:F3} us", p50, p99, p999);
-            if (name is "readrandom" or "readmissing" or "multireadrandom" or "readwhilewriting" or "seekrandom")
+            if (bench is DbBenchmark.ReadRandom or DbBenchmark.ReadMissing or DbBenchmark.MultiReadRandom or DbBenchmark.ReadWhileWriting or DbBenchmark.SeekRandom)
                 line += " (" + found + " of " + ops + " found)";
             if (extra.Length > 0) line += " " + extra;
             double allocPerOp = allocated / (double)Math.Max(ops, 1);
@@ -236,7 +225,7 @@ public static class DbBenchRunner
             line += string.Format(ci, " alloc {0:F1} B/op gc {1}/{2}/{3}", allocPerOp, d0, d1, d2);
             Console.WriteLine(line);
             Console.WriteLine(string.Format(ci, "RESULT,{0},{1},{2},{3},{4:F6},{5:F4},{6:F1},{7:F2},{8:F4},{9:F4},{10:F4},{11},{12:F1},{13},{14},{15}",
-                f.EngineLabel, name, f.Threads, ops, seconds, microsPerOp, opsPerSec, mbs, p50, p99, p999, found, allocPerOp, d0, d1, d2));
+                f.EngineLabel, _name, f.Threads, ops, seconds, microsPerOp, opsPerSec, mbs, p50, p99, p999, found, allocPerOp, d0, d1, d2));
             Console.Out.Flush();
         }
 
@@ -273,19 +262,19 @@ public static class DbBenchRunner
         {
             var rng = SplitMix64.ForThread(f.Seed, index, w.Tid);
             long n = ThreadOps(_totalOps, f.Threads, w.Tid);
-            switch (name)
+            switch (bench)
             {
-                case "fillseq":
-                case "fillrandom":
-                case "overwrite":
-                case "fillsync":
+                case DbBenchmark.FillSeq:
+                case DbBenchmark.FillRandom:
+                case DbBenchmark.Overwrite:
+                case DbBenchmark.FillSync:
                     DoWrites(w, n, ref rng);
                     break;
-                case "readrandom":
-                case "readmissing":
-                    DoReads(w, n, ref rng, name == "readmissing");
+                case DbBenchmark.ReadRandom:
+                case DbBenchmark.ReadMissing:
+                    DoReads(w, n, ref rng, bench == DbBenchmark.ReadMissing);
                     break;
-                case "readwhilewriting":
+                case DbBenchmark.ReadWhileWriting:
                     if (w.Tid == f.Threads)
                     {
                         BackgroundWriter(ref rng);
@@ -296,17 +285,17 @@ public static class DbBenchRunner
                         Interlocked.Increment(ref _readersDone);
                     }
                     break;
-                case "readseq":
-                case "readreverse":
-                    DoScan(w, n, name == "readreverse");
+                case DbBenchmark.ReadSeq:
+                case DbBenchmark.ReadReverse:
+                    DoScan(w, n, bench == DbBenchmark.ReadReverse);
                     break;
-                case "seekrandom":
+                case DbBenchmark.SeekRandom:
                     DoSeeks(w, n, ref rng);
                     break;
-                case "multireadrandom":
+                case DbBenchmark.MultiReadRandom:
                     DoMultiGet(w, n, ref rng);
                     break;
-                case "deleterandom":
+                case DbBenchmark.DeleteRandom:
                     DoDeletes(w, n, ref rng);
                     break;
             }
@@ -314,7 +303,7 @@ public static class DbBenchRunner
 
         private void DoWrites(Worker w, long n, ref SplitMix64 rng)
         {
-            bool seq = name == "fillseq", sync = name == "fillsync", hist = f.Histogram;
+            bool seq = bench == DbBenchmark.FillSeq, sync = bench == DbBenchmark.FillSync, hist = f.Histogram;
             int ks = f.KeySize, vs = f.ValueSize;
             ulong num = (ulong)f.Num;
             long first = ThreadFirst(_totalOps, f.Threads, w.Tid);
@@ -496,19 +485,19 @@ public static class DbBenchRunner
             var me = (ManagedEngine)engine;
             var rng = SplitMix64.ForThread(f.Seed, index, w.Tid);
             long n = ThreadOps(_totalOps, f.Threads, w.Tid);
-            switch (name)
+            switch (bench)
             {
-                case "fillseq":
-                case "fillrandom":
-                case "overwrite":
-                case "fillsync":
+                case DbBenchmark.FillSeq:
+                case DbBenchmark.FillRandom:
+                case DbBenchmark.Overwrite:
+                case DbBenchmark.FillSync:
                     await WritesAsync(me, w, n, rng).ConfigureAwait(false);
                     break;
-                case "readrandom":
-                case "readmissing":
-                    await ReadsAsync(me, w, n, rng, name == "readmissing").ConfigureAwait(false);
+                case DbBenchmark.ReadRandom:
+                case DbBenchmark.ReadMissing:
+                    await ReadsAsync(me, w, n, rng, bench == DbBenchmark.ReadMissing).ConfigureAwait(false);
                     break;
-                case "readwhilewriting":
+                case DbBenchmark.ReadWhileWriting:
                     if (w.Tid == f.Threads)
                     {
                         await BackgroundWriterAsync(me, rng).ConfigureAwait(false);
@@ -519,17 +508,17 @@ public static class DbBenchRunner
                         Interlocked.Increment(ref _readersDone);
                     }
                     break;
-                case "readseq":
-                case "readreverse":
-                    await ScanAsync(me, w, n, name == "readreverse").ConfigureAwait(false);
+                case DbBenchmark.ReadSeq:
+                case DbBenchmark.ReadReverse:
+                    await ScanAsync(me, w, n, bench == DbBenchmark.ReadReverse).ConfigureAwait(false);
                     break;
-                case "seekrandom":
+                case DbBenchmark.SeekRandom:
                     await SeeksAsync(me, w, n, rng).ConfigureAwait(false);
                     break;
-                case "multireadrandom":
+                case DbBenchmark.MultiReadRandom:
                     DoMultiGet(w, n, ref rng); // no MultiGetAsync in the managed API
                     break;
-                case "deleterandom":
+                case DbBenchmark.DeleteRandom:
                     await DeletesAsync(me, w, n, rng).ConfigureAwait(false);
                     break;
             }
@@ -537,7 +526,7 @@ public static class DbBenchRunner
 
         private async Task WritesAsync(ManagedEngine me, Worker w, long n, SplitMix64 rng)
         {
-            bool seq = name == "fillseq", sync = name == "fillsync", hist = f.Histogram;
+            bool seq = bench == DbBenchmark.FillSeq, sync = bench == DbBenchmark.FillSync, hist = f.Histogram;
             int ks = f.KeySize, vs = f.ValueSize;
             ulong num = (ulong)f.Num;
             long first = ThreadFirst(_totalOps, f.Threads, w.Tid);
@@ -699,9 +688,11 @@ public static class DbBenchRunner
             var ci = CultureInfo.InvariantCulture;
             switch (name)
             {
-                case "engine": f.Engine = value; break;
+                case "engine": f.Engine = BenchFlags.ParseEngine(value); break;
                 case "async": f.Async = ParseBool(value); break;
-                case "benchmarks": f.Benchmarks = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries); break;
+                case "benchmarks":
+                    f.Benchmarks = Array.ConvertAll(value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries), BenchFlags.ParseBenchmark);
+                    break;
                 case "num": f.Num = long.Parse(value, ci); break;
                 case "reads": f.Reads = long.Parse(value, ci); break;
                 case "key_size": f.KeySize = int.Parse(value, ci); break;
@@ -719,12 +710,12 @@ public static class DbBenchRunner
                 case "disable_wal": o = o with { DisableWal = ParseBool(value) }; break;
                 case "sync": o = o with { Sync = ParseBool(value) }; break;
                 case "cache_size": o = o with { BlockCacheSize = long.Parse(value, ci) }; break;
-                case "cache_type": o = o with { CacheType = value }; break;
+                case "cache_type": o = o with { CacheType = BenchFlags.ParseCacheType(value) }; break;
                 case "bloom_bits": o = o with { BloomBitsPerKey = int.Parse(value, ci) }; break;
                 case "write_buffer_size": o = o with { WriteBufferSize = long.Parse(value, ci) }; break;
                 case "block_size": o = o with { BlockSize = int.Parse(value, ci) }; break;
                 case "compression":
-                case "compression_type": o = o with { Compression = value }; break;
+                case "compression_type": o = o with { Compression = BenchFlags.ParseCompression(value) }; break;
                 case "target_file_size_base": o = o with { TargetFileSizeBase = long.Parse(value, ci) }; break;
                 case "max_bytes_for_level_base": o = o with { MaxBytesForLevelBase = long.Parse(value, ci) }; break;
                 case "level0_file_num_compaction_trigger": o = o with { Level0FileNumCompactionTrigger = int.Parse(value, ci) }; break;
@@ -758,10 +749,10 @@ public static class DbBenchRunner
         for (int l = 0; l < 7; l++)
         {
             if (l > 0) levels.Append(' ');
-            levels.Append(engine.GetProperty("rocksdb.num-files-at-level" + l.ToString(ci)) ?? "?");
+            levels.Append(engine.GetProperty(DbProperties.NumFilesAtLevel(l)) ?? "?");
         }
         Console.WriteLine(string.Format(ci, "{0,-17} : files per level [{1}]", "stats", levels));
-        string stats = engine.GetProperty("rocksdb.stats") ?? "";
+        string stats = engine.GetProperty(DbProperties.Stats) ?? "";
         const string marker = "Cumulative compaction: ";
         double written = -1;
         int i = stats.IndexOf(marker, StringComparison.Ordinal);
@@ -773,7 +764,7 @@ public static class DbBenchRunner
             if (end > marker.Length && double.TryParse(line[marker.Length..end], NumberStyles.Float, ci, out double gb)) written = gb * 1073741824.0;
             Console.WriteLine(line);
         }
-        string pending = engine.GetProperty("rocksdb.estimate-pending-compaction-bytes") ?? "?";
+        string pending = engine.GetProperty(DbProperties.EstimatePendingCompactionBytes) ?? "?";
         long user = s_userBytesWritten;
         double amp = written >= 0 && user > 0 ? written / user : 0;
         Console.WriteLine(string.Format(ci, "{0,-17} : user {1:F1} MB, flush+compaction written {2:F1} MB, write-amp {3:F2}, pending compaction {4} bytes",
@@ -791,7 +782,7 @@ public static class DbBenchRunner
         Console.Error.WriteLine("               [--target_file_size_base BYTES] [--max_bytes_for_level_base BYTES] [--level0_file_num_compaction_trigger 4]");
         Console.Error.WriteLine("               [--disable_auto_compactions] [--max_background_jobs 2]");
         Console.Error.WriteLine("               [--use_existing_db] [--seed 301] [--db PATH] [--histogram 1] [--c_bench PATH-TO-rocksdb_bench]");
-        Console.Error.WriteLine("benchmarks: " + string.Join(' ', AllBenchmarks));
+        Console.Error.WriteLine("benchmarks: " + string.Join(' ', BenchFlags.AllBenchmarkNames));
     }
 }
 

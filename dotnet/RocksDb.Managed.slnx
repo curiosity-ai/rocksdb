@@ -7,6 +7,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/RocksDb.Managed.Tests/RocksDb.Managed.Tests.csproj" />
     <Project Path="tests/RocksDb.Managed.CompatTests/RocksDb.Managed.CompatTests.csproj" />
+    <Project Path="tests/RocksDb.Managed.RoundTrip/RocksDb.Managed.RoundTrip.csproj" />
     <Project Path="tests/RocksDb.Managed.Replication.Tests/RocksDb.Managed.Replication.Tests.csproj" />
   </Folder>
   <Folder Name="/samples/">

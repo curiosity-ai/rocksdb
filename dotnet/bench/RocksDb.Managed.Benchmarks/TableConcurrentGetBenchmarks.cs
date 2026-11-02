@@ -19,8 +19,17 @@ public class TableConcurrentGetBenchmarks
     private BlockBasedTableReader _reader = null!;
     private byte[][] _lookupKeys = null!;
 
-    [Params("hyperclock", "lru", "dictionary")]
-    public string CacheType { get; set; } = "hyperclock";
+    /// <summary>Block cache under test.</summary>
+    public enum CacheKind
+    {
+        HyperClock,
+        Lru,
+        /// <summary>A plain locked dictionary (<see cref="TableBenchmarks.SimpleBlockCache"/>).</summary>
+        Dictionary,
+    }
+
+    [Params(CacheKind.HyperClock, CacheKind.Lru, CacheKind.Dictionary)]
+    public CacheKind CacheType { get; set; } = CacheKind.HyperClock;
 
     private static byte[] Key(int i, ulong seq, EntryType t)
     {
@@ -46,8 +55,8 @@ public class TableConcurrentGetBenchmarks
         }
         IBlockCache cache = CacheType switch
         {
-            "hyperclock" => Cache.BlockCache.CreateDefault(64L << 20, 4096),
-            "lru" => Cache.BlockCache.CreateLru(64L << 20),
+            CacheKind.HyperClock => Cache.BlockCache.CreateDefault(64L << 20, 4096),
+            CacheKind.Lru => Cache.BlockCache.CreateLru(64L << 20),
             _ => new TableBenchmarks.SimpleBlockCache(),
         };
         _reader = BlockBasedTableReader.Open(new TableBenchmarks.MemFile(file.ToArray()), new TableReaderOptions { BlockCache = cache });

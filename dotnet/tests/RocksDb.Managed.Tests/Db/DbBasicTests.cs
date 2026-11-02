@@ -3,6 +3,7 @@ using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Util;
 using static RocksDb.Managed.Tests.Db.DbTestUtil;
+using RocksDb.Managed.Table.Filters;
 
 namespace RocksDb.Managed.Tests.Db;
 
@@ -156,7 +157,7 @@ public sealed class DbBasicTests
         MemoryFileSystem fs = NewFs();
         DbOptions o = NewOptions(fs);
         var cfo = new ColumnFamilyOptions();
-        cfo.TableOptions.FilterPolicy = "bloomfilter:10:false";
+        cfo.TableOptions.FilterPolicy = new BloomFilterPolicy(10);
         using (RocksDatabase db = RocksDatabase.Open(DbPath, o, cfo))
         {
             for (int i = 0; i < 1000; i++) db.Put(Key(i), Value(i, 0));

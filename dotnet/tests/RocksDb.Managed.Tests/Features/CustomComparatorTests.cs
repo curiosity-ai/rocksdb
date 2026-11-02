@@ -111,8 +111,11 @@ public sealed class CustomComparatorTests
         Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
         StringAssert.Contains(e.Message, "does not match existing comparator test.NumericComparator");
         // The right name without a comparator object cannot be resolved.
-        e = Assert.ThrowsExactly<RocksDbException>(() =>
-            RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { ComparatorName = "test.NumericComparator" }));
+        var named = new ColumnFamilyOptions();
+        named.SetOption("comparator", "test.NumericComparator", preserveUnknown: false); // e.g. from an OPTIONS file
+        Assert.IsNull(named.Comparator);
+        Assert.AreEqual("test.NumericComparator", named.ComparatorName);
+        e = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbPath, NewOptions(fs), named));
         Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
         // Bytewise DB opened with a custom comparator.
         MemoryFileSystem fs2 = NewFs();

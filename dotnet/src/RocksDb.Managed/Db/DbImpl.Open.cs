@@ -203,15 +203,12 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
-    /// Resolves the pluggable objects of a CF's options for this DB (merge operator name) and sanitizes them
+    /// Copies a CF's options for this DB and sanitizes them
     /// (<see cref="SanitizeCfOptions"/>). Returns a copy; the caller's object is not modified.
     /// </summary>
     private ColumnFamilyOptions PrepareCfOptions(ColumnFamilyOptions options)
     {
         ColumnFamilyOptions o = options.Clone();
-        if (o.MergeOperator is not null) o.MergeOperatorName = o.MergeOperator.Name;
-        if (o.CompactionFilter is not null) o.CompactionFilterName = o.CompactionFilter.Name;
-        if (o.CompactionFilterFactory is not null) o.CompactionFilterFactoryName = o.CompactionFilterFactory.Name;
         SanitizeCfOptions(o, Options.AllowIngestBehind, DbPaths.Count);
         return o;
     }

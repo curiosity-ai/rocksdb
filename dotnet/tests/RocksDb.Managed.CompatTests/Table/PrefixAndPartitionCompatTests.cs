@@ -85,7 +85,7 @@ public sealed class PrefixAndPartitionCompatTests
             BlockBasedTableOptions t = cf.TableOptions;
             t.FormatVersion = (uint)FormatVersion;
             t.BlockSize = 256;
-            t.FilterPolicy = FilterId;
+            t.FilterPolicy = TableFactory.CreateFilterPolicy(FilterId);
             t.OptimizeFiltersForMemory = OptimizeFiltersForMemory;
             t.WholeKeyFiltering = WholeKeyFiltering;
             t.IndexType = IndexType;

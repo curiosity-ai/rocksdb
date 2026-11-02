@@ -25,7 +25,7 @@ public sealed class TableFactoryTests
             BlockSize = 16384, BlockSizeDeviation = 5, BlockRestartInterval = 4, IndexBlockRestartInterval = 2, MetadataBlockSize = 8192,
             FormatVersion = 5, Checksum = ChecksumType.Crc32c, IndexType = IndexType.BinarySearchWithFirstKey,
             IndexShortening = IndexShorteningMode.ShortenSeparatorsAndSuccessor, DataBlockIndexType = DataBlockIndexType.BinaryAndHash,
-            DataBlockHashTableUtilRatio = 0.5, FilterPolicy = "bloomfilter:10:false", WholeKeyFiltering = false, UseDeltaEncoding = false,
+            DataBlockHashTableUtilRatio = 0.5, FilterPolicy = new BloomFilterPolicy(10), WholeKeyFiltering = false, UseDeltaEncoding = false,
             EnableIndexCompression = false,
         };
         TableFormatOptions f = TableFactory.CreateFormatOptions(o);
@@ -70,6 +70,10 @@ public sealed class TableFactoryTests
     [DataRow("ribbonfilter:10:-1", "ribbonfilter:10:-1", 10000)]
     [DataRow("ribbonfilter:8.5", "ribbonfilter:8.5:0", 8500)]
     [DataRow("rocksdb.RibbonFilter:10:3", "ribbonfilter:10:3", 10000)]
+    // Struct form native writes after loading a policy from an OPTIONS file (id + the object's options).
+    [DataRow("{id=ribbonfilter:10:0;bloom_before_level=0;}", "ribbonfilter:10:0", 10000)]
+    [DataRow("{id=ribbonfilter:10:0;bloom_before_level=2;}", "ribbonfilter:10:2", 10000)]
+    [DataRow("{id=bloomfilter:10:false;}", "bloomfilter:10:false", 10000)]
     public void FilterPolicyIds(string id, string canonical, int millibits)
     {
         var p = (BloomLikeFilterPolicy)TableFactory.CreateFilterPolicy(id)!;
@@ -84,15 +88,21 @@ public sealed class TableFactoryTests
     [DataRow(null)]
     [DataRow("")]
     [DataRow("nullptr")]
+    // Bare class names (what native writes for C API filter policies) load as "no filter", like upstream's
+    // LoadLatestOptions with the default ignore_unsupported_options.
+    [DataRow("bloomfilter")]
+    [DataRow("ribbonfilter")]
+    [DataRow("rocksdb.BloomFilter")]
     public void NoFilterPolicy(string? id) => Assert.IsNull(TableFactory.CreateFilterPolicy(id));
 
     [TestMethod]
-    [DataRow("bloomfilter")]
     [DataRow("bloomfilter:x:false")]
     [DataRow("bloomfilter:10:maybe")]
     [DataRow("ribbonfilter:10:x")]
     [DataRow("cuckoofilter:10")]
     [DataRow("ribbonfilter:10:1:2")]
+    [DataRow("{id=ribbonfilter:10:0;unknown_option=1;}")]
+    [DataRow("{bloom_before_level=1;}")]
     public void BadFilterPolicyIds(string id) =>
         Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(() => TableFactory.CreateFilterPolicy(id)).Code);
 
@@ -138,13 +148,13 @@ public sealed class TableFactoryTests
     {
         var cf = new ColumnFamilyOptions
         {
-            ComparatorName = "rocksdb.ReverseBytewiseComparator",
-            MergeOperatorName = "StringAppendOperator",
+            Comparator = Comparator.ReverseBytewise,
+            MergeOperator = new StringAppendOperator(),
             Compression = CompressionType.LZ4,
             BottommostCompression = CompressionType.Zstd,
         };
         cf.CompressionOpts.Level = 3;
-        cf.TableOptions.FilterPolicy = "ribbonfilter:10:1";
+        cf.TableOptions.FilterPolicy = new RibbonFilterPolicy(10, 1);
 
         TableBuilderOptions flush = TableFactory.CreateBuilderOptions(cf, TableFileLevel.Flush);
         Assert.AreSame(Comparator.ReverseBytewise, flush.Comparator);

@@ -22,10 +22,10 @@ internal sealed partial class DbImpl
     {
         switch (property)
         {
-            case "rocksdb.estimate-live-data-size":
+            case DbProperties.EstimateLiveDataSize:
                 value = EstimateLiveDataSize(cfd, sv.Current.Storage).ToString(CultureInfo.InvariantCulture);
                 return true;
-            case "rocksdb.cur-size-all-mem-tables":
+            case DbProperties.CurSizeAllMemTables:
                 {
                     // Active + unflushed immutable memtables.
                     long n = sv.Mem.ApproximateMemoryUsage;
@@ -33,7 +33,7 @@ internal sealed partial class DbImpl
                     value = n.ToString(CultureInfo.InvariantCulture);
                     return true;
                 }
-            case "rocksdb.size-all-mem-tables":
+            case DbProperties.SizeAllMemTables:
                 {
                     // Active + immutable memtables (flushed ones are released immediately by the managed port, so this
                     // equals cur-size-all-mem-tables).
@@ -42,9 +42,9 @@ internal sealed partial class DbImpl
                     value = n.ToString(CultureInfo.InvariantCulture);
                     return true;
                 }
-            case "rocksdb.block-cache-usage":
-            case "rocksdb.block-cache-capacity":
-            case "rocksdb.block-cache-pinned-usage":
+            case DbProperties.BlockCacheUsage:
+            case DbProperties.BlockCacheCapacity:
+            case DbProperties.BlockCachePinnedUsage:
                 {
                     Cache.BlockCache? cache = BlockCacheOf(cfd);
                     if (cache is null)
@@ -61,25 +61,25 @@ internal sealed partial class DbImpl
                     value = v.ToString(CultureInfo.InvariantCulture);
                     return true;
                 }
-            case "rocksdb.num-live-versions":
+            case DbProperties.NumLiveVersions:
                 lock (_mutex) value = cfd.LiveVersions.ToString(CultureInfo.InvariantCulture);
                 return true;
-            case "rocksdb.current-super-version-number":
+            case DbProperties.CurrentSuperVersionNumber:
                 value = sv.Number.ToString(CultureInfo.InvariantCulture);
                 return true;
-            case "rocksdb.oldest-snapshot-time":
+            case DbProperties.OldestSnapshotTime:
                 lock (_mutex) value = (_snapshots.IsEmpty ? 0 : _snapshots.Oldest.UnixTime).ToString(CultureInfo.InvariantCulture);
                 return true;
-            case "rocksdb.oldest-snapshot-sequence":
+            case DbProperties.OldestSnapshotSequence:
                 lock (_mutex) value = (_snapshots.IsEmpty ? 0 : _snapshots.Oldest.SequenceNumber).ToString(CultureInfo.InvariantCulture);
                 return true;
-            case "rocksdb.num-running-flushes":
+            case DbProperties.NumRunningFlushes:
                 lock (_mutex) value = _runningFlushes.ToString(CultureInfo.InvariantCulture);
                 return true;
-            case "rocksdb.mem-table-flush-pending":
+            case DbProperties.MemTableFlushPending:
                 lock (_mutex) value = cfd.HasPendingFlush ? "1" : "0";
                 return true;
-            case "rocksdb.num-deletes-imm-mem-tables":
+            case DbProperties.NumDeletesImmMemTables:
                 {
                     long n = 0;
                     foreach (MemTable m in sv.Imm) n += m.NumDeletes;
@@ -89,31 +89,31 @@ internal sealed partial class DbImpl
             case "rocksdb.estimate-table-readers-mem":
                 value = "0";
                 return true;
-            case "rocksdb.background-errors":
+            case DbProperties.BackgroundErrors:
                 value = BackgroundError is null ? "0" : "1";
                 return true;
-            case "rocksdb.cfstats":
-            case "rocksdb.cfstats-no-file-histogram":
+            case DbProperties.CfStats:
+            case DbProperties.CfStatsNoFileHistogram:
                 value = cfd.Stats.Dump(cfd.Name, sv.Current.Storage);
                 return true;
-            case "rocksdb.dbstats":
+            case DbProperties.DbStats:
                 value = _writeStats.Dump();
                 return true;
-            case "rocksdb.stats":
+            case DbProperties.Stats:
                 // DB stats, the CF stats, then the managed port's cumulative compaction summary (incl. trivial moves).
                 value = _writeStats.Dump() + cfd.Stats.Dump(cfd.Name, sv.Current.Storage) + CompactionStatsString(sv);
                 return true;
-            case "rocksdb.sstables":
+            case DbProperties.SsTables:
                 value = VersionDebugString(sv.Current);
                 return true;
-            case "rocksdb.aggregated-table-properties":
+            case DbProperties.AggregatedTableProperties:
                 value = TablePropertiesToString(AggregateTableProperties(cfd, sv.Current, -1), "; ", "=");
                 return true;
-            case "rocksdb.options-statistics":
+            case DbProperties.OptionsStatistics:
                 value = Stats?.ToString();
                 return true;
         }
-        const string aggregatedAtLevel = "rocksdb.aggregated-table-properties-at-level";
+        const string aggregatedAtLevel = DbProperties.AggregatedTablePropertiesAtLevelPrefix;
         if (property.StartsWith(aggregatedAtLevel, StringComparison.Ordinal)
             && int.TryParse(property.AsSpan(aggregatedAtLevel.Length), NumberStyles.None, CultureInfo.InvariantCulture, out int level))
         {
@@ -150,9 +150,9 @@ internal sealed partial class DbImpl
         {
             switch (property)
             {
-                case "rocksdb.cfstats":
+                case DbProperties.CfStats:
                     return cfd.Stats.ToMap(sv.Current.Storage);
-                case "rocksdb.dbstats":
+                case DbProperties.DbStats:
                     {
                         DbWriteStats w = _writeStats;
                         return new Dictionary<string, string>(StringComparer.Ordinal)
@@ -167,9 +167,9 @@ internal sealed partial class DbImpl
                             ["db.user_write_stall_micros"] = Interlocked.Read(ref w.WriteStallMicros).ToString(CultureInfo.InvariantCulture),
                         };
                     }
-                case "rocksdb.aggregated-table-properties":
+                case DbProperties.AggregatedTableProperties:
                     return TablePropertiesToMap(AggregateTableProperties(cfd, sv.Current, -1));
-                case "rocksdb.block-cache-entry-stats":
+                case DbProperties.BlockCacheEntryStats:
                     {
                         Cache.BlockCache? cache = BlockCacheOf(cfd);
                         if (cache is null) return null;
@@ -181,7 +181,7 @@ internal sealed partial class DbImpl
                         };
                     }
             }
-            const string aggregatedAtLevel = "rocksdb.aggregated-table-properties-at-level";
+            const string aggregatedAtLevel = DbProperties.AggregatedTablePropertiesAtLevelPrefix;
             if (property.StartsWith(aggregatedAtLevel, StringComparison.Ordinal)
                 && int.TryParse(property.AsSpan(aggregatedAtLevel.Length), NumberStyles.None, CultureInfo.InvariantCulture, out int level)
                 && level < sv.Current.Storage.NumLevels)

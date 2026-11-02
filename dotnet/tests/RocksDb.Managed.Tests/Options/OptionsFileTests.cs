@@ -1,5 +1,6 @@
 using RocksDb.Managed.Compression;
 using RocksDb.Managed.Table;
+using RocksDb.Managed.Table.Filters;
 
 namespace RocksDb.Managed.Tests.Options;
 
@@ -80,7 +81,8 @@ public sealed class OptionsFileTests
         Assert.AreEqual("{reduce_file_locking=true;size_ratio=1;}", d.UnknownOptions["compaction_options_universal"]);
         Assert.AreEqual(16384UL, d.TableOptions.BlockSize);
         Assert.AreEqual(ChecksumType.Crc32c, d.TableOptions.Checksum);
-        Assert.AreEqual("bloomfilter:10:false", d.TableOptions.FilterPolicy);
+        Assert.AreEqual(10, Assert.IsInstanceOfType<BloomFilterPolicy>(d.TableOptions.FilterPolicy).WholeBitsPerKey);
+        Assert.AreEqual("bloomfilter:10:false", d.TableOptions.GetOption("filter_policy"));
         Assert.AreEqual(IndexType.TwoLevelIndexSearch, d.TableOptions.IndexType);
 
         Assert.AreEqual("my cf#1", f.ColumnFamilies[1].Name);

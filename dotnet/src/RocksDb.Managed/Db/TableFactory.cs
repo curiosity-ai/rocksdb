@@ -62,7 +62,9 @@ public static class TableFactory
             IndexShortening = options.IndexShortening,
             DataBlockIndexType = options.DataBlockIndexType,
             DataBlockHashTableUtilRatio = options.DataBlockHashTableUtilRatio,
-            FilterPolicy = CreateFilterPolicy(options.FilterPolicy),
+            // An unresolved OPTIONS-file id fails here like FilterPolicy::CreateFromString (or means "no filter" for
+            // the bare class names written by the C API).
+            FilterPolicy = options.FilterPolicy ?? CreateFilterPolicy(options.UnresolvedFilterPolicyId),
             WholeKeyFiltering = options.WholeKeyFiltering,
             UseDeltaEncoding = options.UseDeltaEncoding,
             OptimizeKeyCommonPrefix = options.OptimizeKeyCommonPrefix,
@@ -84,10 +86,16 @@ public static class TableFactory
     public static FilterPolicy? CreateFilterPolicy(string? id)
     {
         if (string.IsNullOrEmpty(id) || id == "nullptr") return null;
+        if (id.Length >= 2 && id[0] == '{' && id[^1] == '}') return CreateFilterPolicyFromStruct(id);
         string[] parts = id.Split(':');
         string name = parts[0];
         bool bloom = name is BloomFilterPolicy.ClassName or BloomFilterPolicy.NickName;
         bool ribbon = name is RibbonFilterPolicy.ClassName or RibbonFilterPolicy.NickName;
+        // A bare class name without bits-per-key is what native RocksDB writes to OPTIONS files for filter policies
+        // created through the C API (rocksdb_filterpolicy_create_*), whose wrapper's id is just Name(). Upstream's
+        // registry doesn't match it (the ":bits" part is mandatory, filter_policy.cc FilterPatternEntryWithBits) and
+        // LoadLatestOptions' default ignore_unsupported_options turns that NotSupported into "no filter policy".
+        if ((bloom || ribbon) && parts.Length == 1) return null;
         if ((bloom || ribbon) && parts.Length is 2 or 3
             && double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out double bitsPerKey))
         {
@@ -106,6 +114,30 @@ public static class TableFactory
         throw RocksDbException.InvalidArgument("Unsupported filter policy: " + id);
     }
 
+    /// <summary>
+    /// The struct form native RocksDB writes to OPTIONS files for a configured filter policy, e.g.
+    /// <c>{id=ribbonfilter:10:0;bloom_before_level=0;}</c> (Customizable serialization: the id plus the object's
+    /// options). Port of the GetOptionsMap + ConfigureNewObject steps of FilterPolicy::CreateFromString
+    /// (table/block_based/filter_policy.cc); <c>bloom_before_level</c> is the only option of the built-in policies.
+    /// </summary>
+    private static FilterPolicy? CreateFilterPolicyFromStruct(string value)
+    {
+        string? id = null;
+        int? bloomBeforeLevel = null;
+        foreach (string part in value[1..^1].Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            int eq = part.IndexOf('=');
+            string key = eq < 0 ? part : part[..eq], v = eq < 0 ? "" : part[(eq + 1)..];
+            if (key == "id") id = v;
+            else if (key == "bloom_before_level" && int.TryParse(v, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out int l)) bloomBeforeLevel = l;
+            else throw RocksDbException.InvalidArgument("Unsupported filter policy option '" + part + "' in " + value);
+        }
+        if (string.IsNullOrEmpty(id) || id[0] == '{') throw RocksDbException.InvalidArgument("Unsupported filter policy: " + value);
+        FilterPolicy? policy = CreateFilterPolicy(id);
+        if (bloomBeforeLevel is int level && policy is RibbonFilterPolicy ribbon) ribbon.BloomBeforeLevel = level;
+        return policy;
+    }
+
     /// <summary>Resolves a built-in comparator by its persisted name; custom comparators must be supplied by the caller.</summary>
     public static Comparator ResolveComparator(string name)
     {
@@ -115,16 +147,13 @@ public static class TableFactory
     }
 
     /// <summary>
-    /// The user comparator of a column family: <see cref="ColumnFamilyOptions.Comparator"/> when set (its name must equal
-    /// <see cref="ColumnFamilyOptions.ComparatorName"/>, which the DB derives from it), else the built-in comparator
-    /// named <see cref="ColumnFamilyOptions.ComparatorName"/>.
+    /// The user comparator of a column family: <see cref="ColumnFamilyOptions.Comparator"/>; InvalidArgument when the
+    /// options only name a comparator (parsed from an OPTIONS file) that is not built in.
     /// </summary>
     public static Comparator ResolveComparator(ColumnFamilyOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
-        Comparator? c = options.Comparator;
-        if (c is not null && c.Name == options.ComparatorName) return c;
-        return ResolveComparator(options.ComparatorName);
+        return options.Comparator ?? ResolveComparator(options.ComparatorName);
     }
 
     /// <summary>Port of GetCompressionFlush (db/db_impl/db_impl.cc), leveled/FIFO styles.</summary>

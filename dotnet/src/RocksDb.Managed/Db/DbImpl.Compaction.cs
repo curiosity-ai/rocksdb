@@ -669,6 +669,7 @@ internal sealed partial class DbImpl
                         }
                         break;
                     }
+                    if (_shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
                     wait = _bgSignal.Task;
                 }
                 if (synchronous) wait.Wait(cancellationToken);
@@ -794,6 +795,7 @@ internal sealed partial class DbImpl
                     // Pending work that cannot be scheduled (e.g. picker found nothing to do).
                     return;
                 }
+                if (_shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
                 wait = _bgSignal.Task;
             }
             if (synchronous) wait.Wait(cancellationToken);
@@ -809,7 +811,7 @@ internal sealed partial class DbImpl
     {
         switch (property)
         {
-            case "rocksdb.compaction-pending":
+            case DbProperties.CompactionPending:
                 lock (_mutex)
                 {
                     // 1 if at least one compaction is pending (HandleCompactionPending).
@@ -817,26 +819,26 @@ internal sealed partial class DbImpl
                     value = pending ? "1" : "0";
                 }
                 return true;
-            case "rocksdb.num-running-compactions":
+            case DbProperties.NumRunningCompactions:
                 value = NumRunningCompactions.ToString(CultureInfo.InvariantCulture);
                 return true;
-            case "rocksdb.estimate-pending-compaction-bytes":
+            case DbProperties.EstimatePendingCompactionBytes:
                 lock (_mutex) value = sv.Current.Storage.EstimatedCompactionNeededBytes.ToString(CultureInfo.InvariantCulture);
                 return true;
-            case "rocksdb.levelstats":
+            case DbProperties.LevelStats:
                 lock (_mutex) value = sv.Current.Storage.LevelStats();
                 return true;
-            case "rocksdb.base-level":
+            case DbProperties.BaseLevel:
                 value = sv.Current.Storage.BaseLevel.ToString(CultureInfo.InvariantCulture);
                 return true;
-            case "rocksdb.actual-delayed-write-rate":
+            case DbProperties.ActualDelayedWriteRate:
                 value = (WriteControllerInstance.NeedsDelay ? WriteControllerInstance.DelayedWriteRate : 0).ToString(CultureInfo.InvariantCulture);
                 return true;
-            case "rocksdb.is-write-stopped":
+            case DbProperties.IsWriteStopped:
                 value = WriteControllerInstance.IsStopped ? "1" : "0";
                 return true;
-            case "rocksdb.stats":
-            case "rocksdb.cfstats":
+            case DbProperties.Stats:
+            case DbProperties.CfStats:
                 value = CompactionStatsString(sv);
                 return true;
         }
