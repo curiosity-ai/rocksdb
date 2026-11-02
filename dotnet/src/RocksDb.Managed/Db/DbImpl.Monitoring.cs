@@ -37,6 +37,7 @@ internal sealed partial class DbImpl
     /// </summary>
     private void InitInfoLog()
     {
+        if (Environment.GetEnvironmentVariable("RDB_NOLOG") == "1") return; // TEMP
         if (Options.InfoLog is { } user)
         {
             _infoLog = user;

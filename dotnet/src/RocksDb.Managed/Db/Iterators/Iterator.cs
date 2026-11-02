@@ -51,6 +51,37 @@ public sealed class Iterator : IDisposable
     /// <summary>Current value. REQUIRES: <see cref="Valid"/>. Valid until the iterator moves.</summary>
     public ReadOnlySpan<byte> Value => _it.Value;
 
+    /// <summary>True if the current entry is a wide-column entity (PutEntity). REQUIRES: <see cref="Valid"/>.</summary>
+    public bool IsEntity => _it.IsEntity;
+
+    private WideColumns? _columns;
+    private Util.PooledBufferWriter? _columnsScratch;
+
+    /// <summary>
+    /// The wide columns of the current entry (Iterator::columns): the entity's columns, or a single default column
+    /// holding <see cref="Value"/> for a plain value. REQUIRES: <see cref="Valid"/>. The returned object is reused and
+    /// refilled on every access; it stays readable after the iterator moves until the next access.
+    /// </summary>
+    public WideColumns Columns
+    {
+        get
+        {
+            WideColumns c = _columns ??= new WideColumns();
+            if (_it.IsEntity)
+            {
+                c.SetSerialized(_it.SerializedEntity);
+            }
+            else
+            {
+                Util.PooledBufferWriter w = _columnsScratch ??= new Util.PooledBufferWriter(64);
+                w.Clear();
+                Db.Wide.WideColumnSerialization.SerializeDefaultColumn(_it.Value, w);
+                c.SetSerialized(w.WrittenSpan);
+            }
+            return c;
+        }
+    }
+
     /// <summary>Sequence number of the snapshot the iterator reads.</summary>
     public ulong Sequence => _it.Sequence;
 
@@ -327,6 +358,7 @@ public sealed class Iterator : IDisposable
         if (_disposed) return;
         _disposed = true;
         _stats?.RecordTick(Ticker.NoIteratorDeleted);
+        _columnsScratch?.Dispose();
         _it.Dispose();
     }
 }

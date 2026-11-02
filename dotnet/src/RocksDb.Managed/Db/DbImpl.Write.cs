@@ -429,8 +429,7 @@ internal sealed partial class DbImpl
         public bool Continue() => true;
         public void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Check(columnFamilyId);
         public void TimedPut(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong writeUnixTime) => Check(columnFamilyId);
-        public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) =>
-            ThrowHelper.NotSupported("PutEntity (wide columns) is not supported yet");
+        public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) => Check(columnFamilyId);
         public void Delete(uint columnFamilyId, ReadOnlySpan<byte> key) => Check(columnFamilyId);
         public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key) => Check(columnFamilyId);
         public void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) => Check(columnFamilyId);
@@ -503,7 +502,7 @@ internal sealed partial class DbImpl
         }
 
         public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) =>
-            ThrowHelper.NotSupported("PutEntity (wide columns) is not supported yet");
+            Add(columnFamilyId, EntryType.WideColumnEntity, key, entity);
 
         public void Delete(uint columnFamilyId, ReadOnlySpan<byte> key) => Add(columnFamilyId, EntryType.Deletion, key, default);
         public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key) => Add(columnFamilyId, EntryType.SingleDeletion, key, default);

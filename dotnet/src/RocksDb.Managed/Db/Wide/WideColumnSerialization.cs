@@ -1,0 +1,264 @@
+using System.Buffers;
+using RocksDb.Managed.Util;
+
+namespace RocksDb.Managed.Db.Wide;
+
+/// <summary>Position of one column inside a serialized entity (offsets into the entity bytes).</summary>
+internal readonly record struct WideColumnSlot(int NameOffset, int NameLength, int ValueOffset, int ValueLength);
+
+/// <summary>
+/// Wide-column entity encoding. Port of WideColumnSerialization (db/wide/wide_column_serialization.{h,cc}).
+/// <para>
+/// Writes version 1 (what native RocksDB writes for entities without blob columns):
+/// <c>varint32 version=1 | varint32 N | N x (varint32 name size, name, varint32 value size) | N values</c>.
+/// Reads version 1 and version 2 (header, skip info, column types, name sizes, value sizes, names, values); version 2
+/// entities with blob-index columns are rejected with NotSupported (blob files are not ported). Column names are
+/// strictly increasing in bytewise order; the default column has the empty name and sorts first.
+/// </para>
+/// </summary>
+internal static class WideColumnSerialization
+{
+    public const uint Version1 = 1;
+    public const uint Version2 = 2;
+
+    /// <summary>Exact size of the version 1 encoding (SerializedSizeV1).</summary>
+    public static int SerializedSizeV1(ReadOnlySpan<WideColumn> sortedColumns)
+    {
+        long size = Coding.VarintLength(Version1) + Coding.VarintLength((ulong)sortedColumns.Length);
+        foreach (WideColumn c in sortedColumns)
+        {
+            size += Coding.VarintLength((ulong)c.Name.Length) + c.Name.Length + Coding.VarintLength((ulong)c.Value.Length) + c.Value.Length;
+        }
+        if (size > int.MaxValue) ThrowHelper.InvalidArgument("Wide column entity too large");
+        return (int)size;
+    }
+
+    /// <summary>
+    /// Port of WideColumnSerialization::Serialize (version 1). The columns must be sorted by name
+    /// (<see cref="SortColumns"/>); duplicate or out-of-order names fail with Corruption ("Wide columns out of order")
+    /// like upstream.
+    /// </summary>
+    public static void Serialize(ReadOnlySpan<WideColumn> sortedColumns, IBufferWriter<byte> output)
+    {
+        int total = SerializedSizeV1(sortedColumns);
+        Span<byte> dst = output.GetSpan(total);
+        int p = Coding.EncodeVarint32(dst, Version1);
+        p += Coding.EncodeVarint32(dst[p..], (uint)sortedColumns.Length);
+        for (int i = 0; i < sortedColumns.Length; i++)
+        {
+            ReadOnlySpan<byte> name = sortedColumns[i].Name.Span;
+            if (i > 0 && sortedColumns[i - 1].Name.Span.SequenceCompareTo(name) >= 0) ThrowHelper.Corruption("Wide columns out of order");
+            p += Coding.EncodeVarint32(dst[p..], (uint)name.Length);
+            name.CopyTo(dst[p..]);
+            p += name.Length;
+            p += Coding.EncodeVarint32(dst[p..], (uint)sortedColumns[i].Value.Length);
+        }
+        foreach (WideColumn c in sortedColumns)
+        {
+            c.Value.Span.CopyTo(dst[p..]);
+            p += c.Value.Length;
+        }
+        output.Advance(p);
+    }
+
+    /// <summary>WideColumnsHelper::SortColumns: stable order by column name (bytewise).</summary>
+    public static void SortColumns(Span<WideColumn> columns)
+    {
+        if (columns.Length < 2) return;
+        // Insertion sort for the common small case; Sort otherwise.
+        if (columns.Length <= 16)
+        {
+            for (int i = 1; i < columns.Length; i++)
+            {
+                WideColumn c = columns[i];
+                int j = i - 1;
+                while (j >= 0 && columns[j].Name.Span.SequenceCompareTo(c.Name.Span) > 0)
+                {
+                    columns[j + 1] = columns[j];
+                    j--;
+                }
+                columns[j + 1] = c;
+            }
+            return;
+        }
+        columns.Sort(static (a, b) => a.Name.Span.SequenceCompareTo(b.Name.Span));
+    }
+
+    /// <summary>Serializes an entity holding only the default column (a plain value as an entity).</summary>
+    public static void SerializeDefaultColumn(ReadOnlySpan<byte> value, IBufferWriter<byte> output)
+    {
+        int total = Coding.VarintLength(Version1) + Coding.VarintLength(1) + Coding.VarintLength(0) + Coding.VarintLength((ulong)value.Length) + value.Length;
+        Span<byte> dst = output.GetSpan(total);
+        int p = Coding.EncodeVarint32(dst, Version1);
+        p += Coding.EncodeVarint32(dst[p..], 1);
+        p += Coding.EncodeVarint32(dst[p..], 0);
+        p += Coding.EncodeVarint32(dst[p..], (uint)value.Length);
+        value.CopyTo(dst[p..]);
+        output.Advance(p + value.Length);
+    }
+
+    /// <summary>
+    /// Port of WideColumnSerialization::Deserialize: decodes the column positions of <paramref name="entity"/> into
+    /// <paramref name="slots"/> (cleared first). Corruption on malformed input; NotSupported for blob-index columns.
+    /// </summary>
+    public static void Deserialize(ReadOnlySpan<byte> entity, List<WideColumnSlot> slots)
+    {
+        string? error = TryDeserialize(entity, slots, out bool hasBlob);
+        if (error is not null) ThrowHelper.Corruption(error);
+        if (hasBlob) ThrowHelper.NotSupported("Wide column entities with blob references are not supported (blob files are not ported)");
+    }
+
+    /// <summary>Non-throwing <see cref="Deserialize"/>: returns the Corruption message, or null.</summary>
+    public static string? TryDeserialize(ReadOnlySpan<byte> entity, List<WideColumnSlot> slots, out bool hasBlobColumns)
+    {
+        slots.Clear();
+        hasBlobColumns = false;
+        int pos = 0;
+        if (!TryGetVarint32(entity, ref pos, out uint version)) return "Error decoding wide column version";
+        if (version > Version2) return "Corrupt or unsupported wide column version";
+        if (!TryGetVarint32(entity, ref pos, out uint numColumns)) return "Error decoding number of wide columns";
+        return version < Version2
+            ? DeserializeV1(entity, pos, numColumns, slots)
+            : DeserializeV2(entity, pos, numColumns, slots, out hasBlobColumns);
+    }
+
+    private static bool TryGetVarint32(ReadOnlySpan<byte> input, ref int pos, out uint value)
+    {
+        if (pos >= input.Length)
+        {
+            value = 0;
+            return false;
+        }
+        int n = Coding.DecodeVarint32(input[pos..], out value);
+        if (n <= 0) return false;
+        pos += n;
+        return true;
+    }
+
+    private static string? DeserializeV1(ReadOnlySpan<byte> input, int pos, uint numColumns, List<WideColumnSlot> slots)
+    {
+        if (numColumns > (uint)(input.Length - pos)) return "Error decoding wide column name"; // each column needs >= 2 bytes
+        Span<uint> valueSizes = numColumns <= 64 ? stackalloc uint[(int)numColumns] : new uint[numColumns];
+        Span<int> nameOffsets = numColumns <= 64 ? stackalloc int[(int)numColumns] : new int[numColumns];
+        Span<int> nameLengths = numColumns <= 64 ? stackalloc int[(int)numColumns] : new int[numColumns];
+        for (int i = 0; i < numColumns; i++)
+        {
+            if (!TryGetVarint32(input, ref pos, out uint nameLen) || nameLen > (uint)(input.Length - pos)) return "Error decoding wide column name";
+            nameOffsets[i] = pos;
+            nameLengths[i] = (int)nameLen;
+            pos += (int)nameLen;
+            if (i > 0 && input.Slice(nameOffsets[i - 1], nameLengths[i - 1]).SequenceCompareTo(input.Slice(nameOffsets[i], nameLengths[i])) >= 0)
+            {
+                return "Wide columns out of order";
+            }
+            if (!TryGetVarint32(input, ref pos, out valueSizes[i])) return "Error decoding wide column value size";
+        }
+        long dataPos = pos;
+        for (int i = 0; i < numColumns; i++)
+        {
+            if (dataPos + valueSizes[i] > input.Length) return "Error decoding wide column value payload";
+            slots.Add(new WideColumnSlot(nameOffsets[i], nameLengths[i], (int)dataPos, (int)valueSizes[i]));
+            dataPos += valueSizes[i];
+        }
+        if (dataPos != input.Length) return "Unexpected trailing data after wide column entity";
+        return null;
+    }
+
+    private static string? DeserializeV2(ReadOnlySpan<byte> input, int pos, uint numColumns, List<WideColumnSlot> slots, out bool hasBlobColumns)
+    {
+        hasBlobColumns = false;
+        if (!TryGetVarint32(input, ref pos, out uint nameSizesBytes)) return "Error decoding wide column name sizes bytes";
+        if (!TryGetVarint32(input, ref pos, out uint valueSizesBytes)) return "Error decoding wide column value sizes bytes";
+        if (!TryGetVarint32(input, ref pos, out uint namesBytes)) return "Error decoding wide column names bytes";
+        if ((uint)(input.Length - pos) < numColumns) return "Error decoding wide column types";
+        for (int i = 0; i < numColumns; i++)
+        {
+            var t = (EntryType)input[pos + i];
+            // IsValidColumnValueType: kTypeValue or kTypeBlobIndex.
+            if (t == EntryType.BlobIndex) hasBlobColumns = true;
+            else if (t != EntryType.Value) return "Unsupported wide column ValueType";
+        }
+        pos += (int)numColumns;
+        long metadataSize = (long)nameSizesBytes + valueSizesBytes + namesBytes;
+        if (input.Length - pos < metadataSize) return "Error decoding wide column sections";
+        int s4 = pos, s4Limit = s4 + (int)nameSizesBytes;
+        int s5 = s4Limit, s5Limit = s5 + (int)valueSizesBytes;
+        int s6 = s5Limit;
+        int s7 = s6 + (int)namesBytes;
+        long namePos = 0, valuePos = 0;
+        for (int i = 0; i < numColumns; i++)
+        {
+            if (!TryGetVarint32(input[..s4Limit], ref s4, out uint ns)) return "Error decoding wide column name size";
+            if (!TryGetVarint32(input[..s5Limit], ref s5, out uint vs)) return "Error decoding wide column value size";
+            if (namePos + ns > namesBytes) return "Error decoding wide column name";
+            if (i > 0)
+            {
+                WideColumnSlot prev = slots[^1];
+                if (input.Slice(prev.NameOffset, prev.NameLength).SequenceCompareTo(input.Slice(s6 + (int)namePos, (int)ns)) >= 0)
+                {
+                    return "Wide columns out of order";
+                }
+            }
+            if (s7 + valuePos + vs > input.Length) return "Error decoding wide column value payload";
+            slots.Add(new WideColumnSlot(s6 + (int)namePos, (int)ns, s7 + (int)valuePos, (int)vs));
+            namePos += ns;
+            valuePos += vs;
+        }
+        long totalValuesBytes = input.Length - s7;
+        if (s4 != s4Limit || s5 != s5Limit || namePos != namesBytes || valuePos != totalValuesBytes) return "Wide column section size mismatch";
+        return null;
+    }
+
+    /// <summary>
+    /// Port of WideColumnSerialization::GetValueOfDefaultColumn: the value of the column with the empty name, or an
+    /// empty span when the entity has none.
+    /// </summary>
+    public static ReadOnlySpan<byte> GetValueOfDefaultColumn(ReadOnlySpan<byte> entity)
+    {
+        List<WideColumnSlot> slots = t_slots ??= new List<WideColumnSlot>(8);
+        Deserialize(entity, slots);
+        if (slots.Count == 0 || slots[0].NameLength != 0) return default;
+        WideColumnSlot s = slots[0];
+        return entity.Slice(s.ValueOffset, s.ValueLength);
+    }
+
+    [ThreadStatic] private static List<WideColumnSlot>? t_slots;
+
+    /// <summary>
+    /// Writes <paramref name="entity"/> with its default column replaced by <paramref name="newDefault"/> (added when
+    /// missing). Used for merges on top of an entity (MergeHelper::TimedFullMergeWithEntity).
+    /// </summary>
+    public static void ReplaceDefaultColumn(ReadOnlySpan<byte> entity, ReadOnlySpan<byte> newDefault, IBufferWriter<byte> output)
+    {
+        var slots = new List<WideColumnSlot>(8);
+        Deserialize(entity, slots);
+        bool hasDefault = slots.Count > 0 && slots[0].NameLength == 0;
+        int n = slots.Count + (hasDefault ? 0 : 1);
+        long total = Coding.VarintLength(Version1) + Coding.VarintLength((ulong)n);
+        total += Coding.VarintLength(0) + Coding.VarintLength((ulong)newDefault.Length) + newDefault.Length;
+        for (int i = hasDefault ? 1 : 0; i < slots.Count; i++)
+        {
+            total += Coding.VarintLength((ulong)slots[i].NameLength) + slots[i].NameLength + Coding.VarintLength((ulong)slots[i].ValueLength) + slots[i].ValueLength;
+        }
+        Span<byte> dst = output.GetSpan((int)total);
+        int p = Coding.EncodeVarint32(dst, Version1);
+        p += Coding.EncodeVarint32(dst[p..], (uint)n);
+        p += Coding.EncodeVarint32(dst[p..], 0);
+        p += Coding.EncodeVarint32(dst[p..], (uint)newDefault.Length);
+        for (int i = hasDefault ? 1 : 0; i < slots.Count; i++)
+        {
+            p += Coding.EncodeVarint32(dst[p..], (uint)slots[i].NameLength);
+            entity.Slice(slots[i].NameOffset, slots[i].NameLength).CopyTo(dst[p..]);
+            p += slots[i].NameLength;
+            p += Coding.EncodeVarint32(dst[p..], (uint)slots[i].ValueLength);
+        }
+        newDefault.CopyTo(dst[p..]);
+        p += newDefault.Length;
+        for (int i = hasDefault ? 1 : 0; i < slots.Count; i++)
+        {
+            entity.Slice(slots[i].ValueOffset, slots[i].ValueLength).CopyTo(dst[p..]);
+            p += slots[i].ValueLength;
+        }
+        output.Advance(p);
+    }
+}
