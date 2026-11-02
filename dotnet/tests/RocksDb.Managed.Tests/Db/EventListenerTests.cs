@@ -14,15 +14,12 @@ public sealed class EventListenerTests
     /// <summary>Records every callback as a line, in order.</summary>
     private sealed class RecordingListener : EventListener
     {
-        public readonly ConcurrentQueue<string> Events = new();
-        public readonly ConcurrentQueue<object> Infos = new();
+        // One queue of (event, info) pairs: callbacks arrive concurrently (flush thread vs. the ordered notification
+        // queue), so separate name/info queues could interleave and misalign.
+        private readonly ConcurrentQueue<(string Event, object Info)> _entries = new();
         public RocksDatabase? LastDb;
 
-        private void Add(string e, object info)
-        {
-            Events.Enqueue(e);
-            Infos.Enqueue(info);
-        }
+        private void Add(string e, object info) => _entries.Enqueue((e, info));
 
         public override void OnFlushBegin(RocksDatabase? db, FlushJobInfo info)
         {
@@ -40,17 +37,21 @@ public sealed class EventListenerTests
         public override void OnColumnFamilyHandleDeletionStarted(ColumnFamily handle) => Add("HandleDeletion:" + handle.Name, handle);
         public override void OnExternalFileIngested(RocksDatabase? db, ExternalFileIngestionInfo info) => Add("Ingested:" + info.ColumnFamilyName, info);
 
-        public List<string> Snapshot() => new(Events);
+        public List<string> Snapshot()
+        {
+            var list = new List<string>();
+            foreach ((string e, _) in _entries) list.Add(e);
+            return list;
+        }
 
         public T Single<T>(string prefix)
         {
-            string[] ev = Events.ToArray();
-            object[] infos = Infos.ToArray();
-            for (int i = 0; i < ev.Length; i++)
+            (string Event, object Info)[] entries = _entries.ToArray();
+            foreach ((string e, object info) in entries)
             {
-                if (ev[i].StartsWith(prefix, StringComparison.Ordinal)) return (T)infos[i];
+                if (e.StartsWith(prefix, StringComparison.Ordinal)) return (T)info;
             }
-            Assert.Fail("no event " + prefix + " in " + string.Join(", ", ev));
+            Assert.Fail("no event " + prefix + " in " + string.Join(", ", Snapshot()));
             return default!;
         }
     }
