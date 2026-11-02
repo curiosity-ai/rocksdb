@@ -26,6 +26,11 @@
 #   OUT_DIR=bench/results        TFM=net10.0     EXTRA_ARGS="--cache_size 8388608 ..." (passed to every engine)
 #   OUT_NAME=<date>-<host>       base name of the output files
 #   NOTES="free text added to the report"
+#   WARMUP=true                  warm-up phase in every engine (all three legs, same workload): every benchmark of the
+#                                list runs on a separate temporary DB first, so the .NET engines are measured with
+#                                JIT-compiled, tiered-up code (see "Warm-up" in bench/README.md); false = cold process
+#   WARMUP_OPS=                  --warmup_ops (default max(50k, num/10), <= 200k, <= num)
+#   WARMUP_MIN_MS=               --warmup_min_ms (default 1000)
 #   RUN_MATRIX=1                 run the matrix above
 #   RUN_COMPACTION=1             also run one compaction-heavy configuration (label "compaction"): small memtables and
 #                                SST files so the LSM tree gets several levels; reports LSM shape + write amplification
@@ -61,6 +66,10 @@ DB_BASE="${DB_BASE:-/tmp/rocksdb-bench}"
 OUT_DIR="${OUT_DIR:-${SCRIPT_DIR}/results}"
 TFM="${TFM:-net10.0}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+WARMUP="${WARMUP:-true}"
+WARMUP_ARGS="--warmup ${WARMUP}"
+if [[ -n "${WARMUP_OPS:-}" ]]; then WARMUP_ARGS="${WARMUP_ARGS} --warmup_ops ${WARMUP_OPS}"; fi
+if [[ -n "${WARMUP_MIN_MS:-}" ]]; then WARMUP_ARGS="${WARMUP_ARGS} --warmup_min_ms ${WARMUP_MIN_MS}"; fi
 RUN_MATRIX="${RUN_MATRIX:-1}"
 RUN_COMPACTION="${RUN_COMPACTION:-1}"
 COMPACTION_NUM="${COMPACTION_NUM:-${NUM}}"
@@ -119,8 +128,8 @@ for vs in ${VALUE_SIZES}; do
       # shellcheck disable=SC2086
       "${RUNNER[@]}" compare --engines "${ENGINES}" --db_base "${DB_BASE}" --csv "${CSV}" -- \
         --benchmarks "${BENCHMARKS}" --num "${num}" --reads "${reads}" --value_size "${vs}" \
-        --threads "${th}" --compression "${comp}" ${EXTRA_ARGS} \
-        | grep -E '^(====|[a-z]+ +: )' || true
+        --threads "${th}" --compression "${comp}" ${WARMUP_ARGS} ${EXTRA_ARGS} \
+        | grep -E '^(====|[a-z]+ +: )' | grep -vE '^warmup +: ([a-z]+ [0-9]+ reps|reopen|start)' || true
     done
   done
 done
@@ -130,16 +139,16 @@ if [[ "${RUN_COMPACTION}" == 1 ]]; then
   # shellcheck disable=SC2086
   "${RUNNER[@]}" compare --engines "${ENGINES}" --db_base "${DB_BASE}" --csv "${CSV}" --label compaction -- \
     --benchmarks "${COMPACTION_BENCHMARKS}" --num "${COMPACTION_NUM}" --value_size "${COMPACTION_VALUE_SIZE}" \
-    --threads "${COMPACTION_THREADS}" --compression "${COMPACTION_COMPRESSION}" ${COMPACTION_ARGS} ${EXTRA_ARGS} \
-    | grep -E '^(====|[a-z]+ +: |Cumulative compaction)' || true
+    --threads "${COMPACTION_THREADS}" --compression "${COMPACTION_COMPRESSION}" ${COMPACTION_ARGS} ${WARMUP_ARGS} ${EXTRA_ARGS} \
+    | grep -E '^(====|[a-z]+ +: |Cumulative compaction)' | grep -vE '^warmup +: ([a-z]+ [0-9]+ reps|reopen|start)' || true
 fi
 if [[ "${RUN_BLOB}" == 1 ]]; then
   echo "== blob: num=${BLOB_NUM} value_size=${BLOB_VALUE_SIZE} compression=${BLOB_COMPRESSION} threads=${BLOB_THREADS} ${BLOB_ARGS}"
   # shellcheck disable=SC2086
   "${RUNNER[@]}" compare --engines "${ENGINES}" --db_base "${DB_BASE}" --csv "${CSV}" --label blob -- \
     --benchmarks "${BLOB_BENCHMARKS}" --num "${BLOB_NUM}" --value_size "${BLOB_VALUE_SIZE}" \
-    --threads "${BLOB_THREADS}" --compression "${BLOB_COMPRESSION}" ${BLOB_ARGS} ${EXTRA_ARGS} \
-    | grep -E '^(====|[a-z]+ +: |Cumulative compaction)' || true
+    --threads "${BLOB_THREADS}" --compression "${BLOB_COMPRESSION}" ${BLOB_ARGS} ${WARMUP_ARGS} ${EXTRA_ARGS} \
+    | grep -E '^(====|[a-z]+ +: |Cumulative compaction)' | grep -vE '^warmup +: ([a-z]+ [0-9]+ reps|reopen|start)' || true
 fi
 END=$(date +%s)
 echo "Load average at end: $(cut -d' ' -f1-3 /proc/loadavg); total runtime $(( (END - START) / 60 )) min $(( (END - START) % 60 )) s" >> "${MACHINE}"
@@ -167,6 +176,16 @@ echo "Load average at end: $(cut -d' ' -f1-3 /proc/loadavg); total runtime $(( (
     echo "flush and compaction; reads resolve blob indexes through the blob file readers; no blob cache, no blob GC); otherwise"
     echo "16-byte keys, values 50% compressible, 8 MiB LRU block cache, 10-bit full bloom filter, 4 KiB blocks, format_version 6,"
     echo "WAL on, no sync. Benchmarks \`${BLOB_BENCHMARKS}\`."
+  fi
+  echo
+  if [[ "${WARMUP}" == true || "${WARMUP}" == 1 ]]; then
+    echo "Warm-up on for every engine (\`${WARMUP_ARGS}\`): before the measured run, each process runs every benchmark of the list"
+    echo "on a separate temporary DB (same options, max(50k, num/10) <= 200k keys unless --warmup_ops; repeated benchmarks for >= 32"
+    echo "repetitions, >= warmup_ops ops and >= 1 s each) plus 3 reopen + flush/compaction cycles, deletes it, and (.NET) waits for"
+    echo "the JIT to quiesce; every measured benchmark starts after a settle pause (JIT quiet for 200 ms; the C leg sleeps 200 ms)."
+    echo "The measured run starts on a fresh DB and block cache. The jit columns show the methods compiled during each measurement."
+  else
+    echo "Warm-up off: every engine is measured from a cold process (the .NET engines include JIT compilation and tier-0 code)."
   fi
   if [[ -n "${NOTES:-}" ]]; then echo; echo "${NOTES}"; fi
 } > "${NOTES_FILE}"

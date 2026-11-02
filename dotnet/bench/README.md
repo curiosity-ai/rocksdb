@@ -29,11 +29,13 @@ After the matrix, `run-all.sh` runs one **compaction-heavy** configuration (labe
 compactions, the reads hit a multi-level LSM tree, and `stats` records the LSM shape and write amplification of every
 engine (knobs `COMPACTION_NUM`, `COMPACTION_ARGS`, `COMPACTION_BENCHMARKS`, ... in the header of `run-all.sh`). Results:
 `results/2026-11-02-vm-compaction.md`, then `-vm-perf2-compaction.md` and `-vm-perf3-compaction.md` after perf passes #2
-and #3 (`docs/perf.md`).
+and #3 (`docs/perf.md`), all cold; with the warm-up: `-vm-warm-compaction.md` (cold counterpart from the same session:
+`-vm-cold-compaction.md`). Reduced matrix with the warm-up: `results/2026-11-02-vm-warm.md` (cold: `-vm-cold.md`).
 
-The `flush` and `compact` benchmarks run one flush / one full compaction in a fresh process, so for the managed engines
-they include JIT warm-up of the flush / compaction code (the first compaction of a process is 2.5 - 3.5x slower than
-the following ones; see "Perf pass #3" in `docs/perf.md`).
+All engines run a **warm-up phase** before the measurement (default on, `WARMUP=false` for cold-process numbers; see
+"Warm-up" below), so the .NET engines are not measured while the JIT is still compiling and tiering up. Results before
+`2026-11-02-vm-warm*.md` were measured cold: their `flush` / `compact` rows (one flush / one full compaction per process)
+include the JIT of the flush / compaction code for the managed engines.
 
 `RUN_BLOB=1` adds one **integrated BlobDB** configuration (label `blob`): 1 KiB values written to blob files
 (`--enable_blob_files 1 --min_blob_size 512`, 16 MiB write buffer), benchmarks
@@ -55,6 +57,63 @@ $B compare --engines c-native,rocksdb-sharp,managed,managed-async --db_base /tmp
     --benchmarks fillrandom,readrandom --num 1000000 --threads 4 --compression lz4
 $B report --csv out.csv --out out.md
 ```
+
+## Warm-up
+
+.NET compiles every method on first call (tier 0, unoptimized), patches hot loops to optimized code on stack (OSR), and
+recompiles methods called 30+ times with full optimizations and Dynamic PGO (tier 1) in a background thread, after a
+~100 ms delay that restarts whenever new tier-0 methods appear. A cold process therefore measures JIT time and tier-0
+code: the first flush / compaction of a process is 2.5 - 3.5x slower than the following ones (`docs/perf.md`, perf
+pass #3). rocksdb-sharp is affected too (its P/Invoke stubs and managed wrapper code are jitted). So the dbbench
+runner (both .NET engines, sync and async) warms up first, and `native-c/rocksdb_bench` runs the identical warm-up
+workload (no JIT there, but the page cache, allocator and file system then start from the same state in all three legs):
+
+1. The whole `--benchmarks` list runs on a **separate DB** `<db>-warmup` with the same options and a key range of
+   `--warmup_ops` keys (default max(50k, num/10), at most 200k and at most num); a fillrandom is prepended if the list
+   does not start with a fill, `stats` is skipped.
+2. Every benchmark except flush / compact / waitforcompaction is **repeated** in chunks of `warmup_ops / 32` ops until
+   it has run >= 32 repetitions, >= `warmup_ops` ops and >= `--warmup_min_ms` (default 1000) ms, each repetition with
+   a different random key stream. 32 repetitions get the per-run harness and engine methods (iterator / MultiGet
+   context creation, ...) over the tier-1 call count; the minimum time keeps the per-op methods running well past the
+   tiering delay so they are promoted (with Dynamic PGO) during the warm-up, not during the measurement.
+3. Then 4 **flush / compaction cycles**: reopen the DB (and let the JIT quiesce), 16 x (overwrite of `warmup_ops / 50`
+   keys + flush), waitforcompaction, compact. The 64 small flushes and the automatic compactions they trigger push the
+   methods that run once per flush / table file / compaction / DB open through tier 0 -> instrumented -> tier 1 (each
+   step needs ~30 calls), even when the list has no flush or compaction.
+4. The warm-up DB (and its `-txn*` siblings) is deleted; C rebuilds its options, so the measured DB starts with a fresh
+   block cache in every leg. .NET: a full blocking GC, then the runner waits until
+   `JitInfo.GetCompiledMethodCount` has been stable for 200 ms.
+5. Every **measured** benchmark starts after a settle pause: the .NET runner waits until the JIT has been quiet for
+   200 ms (methods that reached their call count during the DB open or the previous benchmark are compiled then), the
+   C leg sleeps 200 ms.
+
+The .NET runner prints the JIT statistics of the warm-up (`warmup : done in ... s; JIT during warm-up N methods X ms,
+while quiescing ...`) and, for every measured benchmark, the methods compiled while it was being timed (all threads,
+including the tiering background compiler): `... alloc 3.1 B/op gc 0/0/0 jit 0 methods 0.0 ms`, and the `jit_methods`,
+`jit_ms` columns of the RESULT line / CSV. The report shows them per benchmark (`jit` columns) and summarized per
+engine. With the default settings they are 0 - a few methods (< 15 ms of JIT) per benchmark; `--warmup_min_ms 100`
+is visibly too short (dozens of methods per read benchmark).
+
+Flags (all engines, also passed by `compare` / `run-all.sh`): `--warmup true|false` (default true), `--warmup_ops N`,
+`--warmup_min_ms MS`; `run-all.sh`: `WARMUP=true|false`, `WARMUP_OPS`, `WARMUP_MIN_MS`. A warm-up adds roughly
+(benchmarks x 1 s + 2 - 3 s) per engine and configuration.
+
+Runtime settings: the benchmark project keeps the .NET defaults (`<TieredPGO>true</TieredPGO>`, tiered compilation,
+quick JIT for loops with OSR, ReadyToRun code of the framework used as the first tier), because that is what an
+application gets. The warm-up makes the measurement steady-state under those settings. Knobs for experiments
+(environment variables of the measured process; not set by any script):
+
+| variable | effect |
+|---|---|
+| `DOTNET_TieredCompilation=0` | every method is compiled once, fully optimized, without Dynamic PGO (no guarded devirtualization); less warm-up needed, usually slower steady state |
+| `DOTNET_TC_QuickJitForLoops=0` | methods with loops skip tier 0 / OSR and are compiled optimized on first call |
+| `DOTNET_TieredPGO=0` | tiering without instrumentation (no Dynamic PGO) |
+| `DOTNET_ReadyToRun=0` | ignore the precompiled framework code (more JIT at startup) |
+| `DOTNET_TC_CallCountThreshold`, `DOTNET_TC_CallCountingDelayMs` | tier-1 call count (30) and tiering delay (100 ms) |
+
+BenchmarkDotNet (below) does its own warm-up: every job runs pilot and warm-up iterations before the measured ones,
+including `--job short` used in the commands of this file and `docs/perf.md`. `--job dry` / `RunStrategy.ColdStart`
+measure single cold invocations and are only useful as smoke tests (no class in this project uses them).
 
 ## db_bench-style runner
 
@@ -84,7 +143,7 @@ Flags (same for all engines): `--num`, `--reads` (default num), `--key_size` (16
 `--compression_ratio` (0.5), `--target_file_size_base` (64 MiB), `--max_bytes_for_level_base` (256 MiB),
 `--level0_file_num_compaction_trigger` (4), `--disable_auto_compactions`, `--max_background_jobs` (2),
 `--enable_blob_files` / `--min_blob_size` (0) (integrated BlobDB; set through the C API for c-native and rocksdb-sharp), `--use_existing_db`,
-`--seed` (301), `--db`, `--histogram` (1). `--async` (managed only) runs each worker as a task over
+`--seed` (301), `--db`, `--histogram` (1), `--warmup` (true) / `--warmup_ops` / `--warmup_min_ms` (1000) (see "Warm-up"). `--async` (managed only) runs each worker as a task over
 `PutAsync`/`TryGetAsync`/`DeleteAsync`/`WriteAsync` and the async iterator, and `flush`/`compact`/`waitforcompaction` over
 `FlushAsync`/`CompactRangeAsync`/`WaitForCompactAsync`, and `multireadrandom` over `MultiGetAsync`.
 
@@ -115,10 +174,11 @@ Equivalence guarantees (see `DbBench/Workload.cs` and `native-c/rocksdb_bench.c`
   block_size, LRU (or HyperClock) block cache, full bloom filter (`bloomfilter:N:false`), WAL/sync from flags; all
   other options are the engines' defaults;
 - output: `name : X micros/op Y ops/sec Z seconds N operations; M MB/s | p50 p99 p99.9 us`, then a
-  machine-readable `RESULT,engine,benchmark,threads,ops,seconds,micros_per_op,ops_per_sec,mb_per_sec,p50_us,p99_us,p999_us,found,alloc_b_per_op,gc0,gc1,gc2`
+  machine-readable `RESULT,engine,benchmark,threads,ops,seconds,micros_per_op,ops_per_sec,mb_per_sec,p50_us,p99_us,p999_us,found,alloc_b_per_op,gc0,gc1,gc2,jit_methods,jit_ms`
   line. µs/op = wall time / total ops (like db_bench); percentiles come from a per-operation latency histogram
   (log-linear buckets, <= 1.6% error; per batch for `multireadrandom` and batched writes). The managed runner adds
-  allocated bytes per op (all threads, `GC.GetTotalAllocatedBytes`) and gen0/1/2 collection counts.
+  allocated bytes per op (all threads, `GC.GetTotalAllocatedBytes`), gen0/1/2 collection counts and the methods
+  JIT-compiled during the measurement (`System.Runtime.JitInfo`, all threads); the C leg leaves these columns empty.
 
 The C leg uses `rocksdb_get` (+ `rocksdb_free`) for point reads, like rocksdb-sharp's span `Get`, and
 `rocksdb_batched_multi_get_cf` with pinnable slices for MultiGet, which rocksdb-sharp also calls (through
