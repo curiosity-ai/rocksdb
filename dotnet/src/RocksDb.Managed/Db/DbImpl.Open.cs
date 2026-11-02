@@ -219,6 +219,18 @@ internal sealed partial class DbImpl
     {
         ColumnFamilyOptions o = options.Clone();
         SanitizeCfOptions(o, Options.AllowIngestBehind, DbPaths.Count);
+        // ColumnFamilyData::ValidateOptions (DB::Open / CreateColumnFamily): blob garbage collection ranges.
+        if (o.EnableBlobGarbageCollection)
+        {
+            if (o.BlobGarbageCollectionAgeCutoff is < 0 or > 1)
+            {
+                ThrowHelper.InvalidArgument("The age cutoff for blob garbage collection should be in the range [0.0, 1.0].");
+            }
+            if (o.BlobGarbageCollectionForceThreshold is < 0 or > 1)
+            {
+                ThrowHelper.InvalidArgument("The garbage ratio threshold for forcing blob garbage collection should be in the range [0.0, 1.0].");
+            }
+        }
         return o;
     }
 

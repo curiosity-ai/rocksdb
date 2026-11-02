@@ -102,4 +102,24 @@ public sealed class Audit3RegressionTests
         f = OptionsFile.Load(fs, OptionsFile.FindLatestOptionsFile(fs, DbPath)!, preserveUnknownOptions: true);
         Assert.AreEqual(4096UL, f.FindColumnFamily("default")!.CompactionOptionsFifo.MaxTableFilesSize);
     }
+
+    [TestMethod]
+    public void OpenValidatesBlobGarbageCollectionRanges()
+    {
+        // ColumnFamilyData::ValidateOptions runs at DB::Open: out-of-range blob GC settings fail with InvalidArgument
+        // when GC is enabled (the port only checked them in SetOptions, and regardless of enable_blob_garbage_collection).
+        MemoryFileSystem fs = NewFs();
+        var bad = new ColumnFamilyOptions { EnableBlobFiles = true, EnableBlobGarbageCollection = true, BlobGarbageCollectionAgeCutoff = 1.5 };
+        RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() =>
+            RocksDatabase.Open(DbPath, new DbOptions { CreateIfMissing = true, FileSystem = fs }, [new ColumnFamilyDescriptor("default", bad)]).Dispose());
+        Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+        StringAssert.Contains(e.Message, "age cutoff");
+
+        // Not validated while garbage collection is disabled (upstream gates the check on enable_blob_garbage_collection).
+        var off = new ColumnFamilyOptions { BlobGarbageCollectionForceThreshold = 2.0 };
+        using RocksDatabase db = RocksDatabase.Open(DbPath, new DbOptions { CreateIfMissing = true, FileSystem = fs }, [new ColumnFamilyDescriptor("default", off)]);
+        db.SetOptions([new("blob_garbage_collection_age_cutoff", "3.0")]);
+        e = Assert.ThrowsExactly<RocksDbException>(() => db.SetOptions([new("enable_blob_garbage_collection", "true")]));
+        Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+    }
 }

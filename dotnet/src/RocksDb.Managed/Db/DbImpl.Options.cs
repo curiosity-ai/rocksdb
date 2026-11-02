@@ -167,11 +167,11 @@ internal sealed partial class DbImpl
         if (o.TargetFileSizeBase == 0) ThrowHelper.InvalidArgument("target_file_size_base must be > 0");
         if (o.TargetFileSizeMultiplier <= 0) ThrowHelper.InvalidArgument("target_file_size_multiplier must be > 0");
         if (o.MaxBytesForLevelBase == 0) ThrowHelper.InvalidArgument("max_bytes_for_level_base must be > 0");
-        if (o.BlobGarbageCollectionAgeCutoff is < 0 or > 1)
+        if (o.EnableBlobGarbageCollection && o.BlobGarbageCollectionAgeCutoff is < 0 or > 1)
         {
             ThrowHelper.InvalidArgument("The age cutoff for blob garbage collection should be in the range [0.0, 1.0].");
         }
-        if (o.BlobGarbageCollectionForceThreshold is < 0 or > 1)
+        if (o.EnableBlobGarbageCollection && o.BlobGarbageCollectionForceThreshold is < 0 or > 1)
         {
             ThrowHelper.InvalidArgument("The garbage ratio threshold for forcing blob garbage collection should be in the range [0.0, 1.0].");
         }
