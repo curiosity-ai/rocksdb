@@ -180,7 +180,7 @@ internal sealed partial class DbImpl
                 manifestNumber = Versions.ManifestFileNumber;
                 manifestSize = (ulong)FileSystem.GetFileSize(FileNames.DescriptorFileName(DbName, manifestNumber));
             }
-            minLogNum = Versions.MinLogNumberWithUnflushedData(null);
+            minLogNum = MinLogNumberToKeepLive();
             maxLogNum = _logNumber == 0 ? ulong.MaxValue : _logNumber;
         }
 

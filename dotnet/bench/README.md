@@ -61,10 +61,13 @@ Benchmarks: `fillseq`, `fillrandom`, `overwrite`, `fillsync` (num/1000 synced pu
 `readseq`, `readreverse`, `seekrandom` (Seek + `--seek_nexts` Next), `multireadrandom` (batched MultiGet of
 `--multiget_size` keys), `readwhilewriting` (`--threads` readers + 1 writer), `deleterandom`, `flush`, `compact`
 (full-range CompactRange), `waitforcompaction` (DB::WaitForCompact with default options: `rocksdb_wait_for_compact` in C and
-rocksdb-sharp, `WaitForCompact` in managed), `stats` (see below).
+rocksdb-sharp, `WaitForCompact` in managed), `stats` (see below), `txnoptimistic` / `txnpessimistic` (num/txn_puts
+transactions of `--txn_puts` random puts each, default 10, on a fresh OptimisticTransactionDB (parallel validation, the
+upstream default) / TransactionDB (WriteCommitted) at `<db>-<benchmark>`; one op = one transaction, so micros/op is µs per
+transaction; conflicts are rolled back and retried and counted in the output).
 
 Flags (same for all engines): `--num`, `--reads` (default num), `--key_size` (16), `--value_size` (100), `--threads`,
-`--batch_size` (puts per WriteBatch in fill benchmarks, default 1 = Put), `--multiget_size` (16), `--seek_nexts` (10),
+`--batch_size` (puts per WriteBatch in fill benchmarks, default 1 = Put), `--multiget_size` (16), `--seek_nexts` (10), `--txn_puts` (10),
 `--disable_wal`, `--sync`, `--cache_size` (8 MiB), `--cache_type` (lru|hyperclock), `--bloom_bits` (10),
 `--write_buffer_size` (64 MiB), `--block_size` (4096), `--compression` (none|snappy|lz4|zstd),
 `--compression_ratio` (0.5), `--target_file_size_base` (64 MiB), `--max_bytes_for_level_base` (256 MiB),
