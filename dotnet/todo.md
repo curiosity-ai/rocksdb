@@ -217,8 +217,8 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [~] WritePrepared two_write_queues + commit-time batches; per-txn allocations
   - [ ] range locks (L); public WAL termination point (S)
 - Wide columns / blob
-  - [~] compaction filters on entities, FilterV4 blob resolver, attribute groups / MultiGetEntity, lazy entity
-  - [ ] WBWI MultiGetFromBatchAndDB (S/M)
+  - [x] compaction filters on entities (FilterV4 + lazy WideColumnBlobResolver), MultiGetEntity, attribute groups (Put/Get/MultiGet), coalescing + attribute-group iterators, lazy entity reads (GetEntityLazy/MultiGetEntityLazy, ranged blob column reads); compat-tested vs native
+  - [ ] WBWI MultiGetFromBatchAndDB, GetEntityFromBatchAndDB / MultiGetEntityFromBatchAndDB, txn entity APIs (S/M); lazy MultiResolve (S)
 - Table format / options / API
   - [ ] hash index write (M); separated key/value data blocks (M); uniform block hint (S); super_block_alignment (S)
   - [ ] user table-properties collectors (M); parallel compression (M); memtable prefix bloom (M); in-place updates (M); insert hints (S)
