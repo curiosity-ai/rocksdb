@@ -42,7 +42,7 @@ while the bytes may differ (for example, because a compressor makes different ch
 | Compression: BZip2, Xpress | no | n/a | a configured BZip2/Xpress type stores blocks uncompressed |
 | Integrated BlobDB (blob files, blob GC) | yes | yes | blob files byte-identical |
 | Wide columns (`PutEntity`, V1 entities) | yes | yes | V2 entities with blob columns: NotSupported |
-| User-defined timestamps (persisted) | yes | yes | timestamped writes byte-identical; `full_history_ts_low` GC |
+| User-defined timestamps (persisted) | yes | yes | timestamped writes byte-identical; `full_history_ts_low` GC; timestamped range deletions and `SstFileWriter` files |
 | Transactions: 2PC prepare/commit/rollback WAL markers | yes | yes | byte-identical; prepared transactions recover across engines |
 | `DBWithTTL` value format | yes | yes | |
 | BackupEngine directory layout and meta files | yes | yes | incremental backups across engines |
@@ -822,7 +822,8 @@ The port aims for upstream behavior. The differences below are intentional or no
 Format-level deviations (the output is always readable by native RocksDB):
 
 - Compression: LZ4 acceleration > 1 runs with acceleration 1; LZ4HC with a dictionary compresses with fast LZ4; zlib
-  compresses only blocks of 16 KiB or less and writes without a dictionary; the ZSTD frame checksum option is ignored;
+  deflates inputs above 16 KiB in independent 16 KiB chunks (so native's 16 KiB inflate window accepts them; not
+  byte-identical) and writes without a dictionary; the ZSTD frame checksum option is ignored;
   BZip2 and Xpress blocks are stored uncompressed (the codecs cannot be read either).
 - Ribbon filters with `optimize_filters_for_memory` can differ from native by up to 16 bytes.
 - Flush does not drop entries (upstream may drop overwritten entries that no snapshot needs at flush time).
@@ -830,13 +831,12 @@ Format-level deviations (the output is always readable by native RocksDB):
 
 Not ported yet:
 
-- `persist_user_defined_timestamps = false`, timestamped range deletions on the read path, and timestamps in
-  transactions, `WriteBatchWithIndex` and `SstFileWriter`.
+- `persist_user_defined_timestamps = false`, and timestamps in transactions and `WriteBatchWithIndex`.
 - WritePrepared / WriteUnprepared transactions and range locks.
 - PlainTable and CuckooTable, separated key/value data blocks, parallel compression, subcompactions, `CompactFiles`,
   the SST file manager and a rate limiter for flush and compaction.
-- Wide-column entities with blob-backed columns (V2), blob direct write, and blob GC for universal and FIFO
-  compaction.
+- Wide-column entities with blob-backed columns (V2) and blob direct write (forced blob GC is leveled-only, as
+  upstream).
 - Concurrent memtable inserts, pipelined writes, the memtable prefix bloom filter and in-place updates. The options are
   accepted and persisted.
 
