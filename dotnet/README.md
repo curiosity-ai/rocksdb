@@ -828,7 +828,6 @@ Format-level deviations (the output is always readable by native RocksDB):
   byte-identical) and writes without a dictionary; the ZSTD frame checksum option is ignored;
   BZip2 and Xpress blocks are stored uncompressed (the codecs cannot be read either).
 - Ribbon filters with `optimize_filters_for_memory` can differ from native by up to 16 bytes.
-- Flush does not drop entries (upstream may drop overwritten entries that no snapshot needs at flush time).
   Compaction drops them later, so the data is the same.
 
 Not ported yet:
