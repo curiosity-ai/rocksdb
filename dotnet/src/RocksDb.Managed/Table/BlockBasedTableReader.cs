@@ -959,6 +959,8 @@ public sealed partial class BlockBasedTableReader : IDisposable
     /// </summary>
     private bool PartitionedFilterMayMatch(ReadOnlySpan<byte> entry, ReadOnlySpan<byte> internalKey, TableReadFlags flags)
     {
+        // kBlockCacheTier: the partition index would have to be read (conservatively "may match").
+        if (_filterIndexBlock is null && (flags & TableReadFlags.BlockCacheTier) != 0) return true;
         BlockRef top = _filterIndexBlock is not null ? BlockRef.FromPinned(_filterIndexBlock) : GetBlockRef(_filterHandle, BlockKind.Filter, flags);
         BlockHandle partition;
         BlockIter it = IterPool.Rent();
@@ -1005,6 +1007,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
             }
         }
         _stats?.Record(BlockCacheCounter.FilterMiss);
+        if ((flags & TableReadFlags.BlockCacheTier) != 0) return true; // no I/O allowed: Incomplete -> may match
         byte[] buf = BlockFetcher.ReadRawPayload(_file, _footer, handle, _options.VerifyChecksums, out int len);
         IFilterBitsReader reader;
         try

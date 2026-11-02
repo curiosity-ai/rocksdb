@@ -357,7 +357,15 @@ internal sealed partial class DbImpl
                         SnapshotChecker = checker,
                         JobSnapshot = jobSnapshot?.SequenceNumber ?? 0,
                     };
-                    job.RunAsync(synchronous: true).GetAwaiter().GetResult();
+                    int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadCompactionMicros);
+                    try
+                    {
+                        job.RunAsync(synchronous: true).GetAwaiter().GetResult();
+                    }
+                    finally
+                    {
+                        Monitoring.FileReadActivity.Exit(activity);
+                    }
                 }
                 finally
                 {

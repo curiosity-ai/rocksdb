@@ -93,7 +93,7 @@ internal sealed class ColumnFamilyData
             ArenaBlockSize = (int)Math.Min(options.ArenaBlockSize, int.MaxValue / 2),
             TrackNewestTimestampSize = options.PersistUserDefinedTimestamps ? 0 : TimestampSize,
         };
-        TableCache = new TableCache(db.FileSystem, db.DbPaths, ReaderOptions, db.Options.MaxOpenFiles);
+        TableCache = new TableCache(db.FileSystem, db.DbPaths, ReaderOptions, db.Options.MaxOpenFiles) { Statistics = db.Options.Statistics };
         // Blob files live in cf_paths.front() (the first DB path); readers and the optional blob cache are per CF.
         BlobSource = new Blob.BlobSource(db.FileSystem, db.DbPaths[0], id, options.BlobCache, db.Identity.DbId, db.Identity.SessionId, db.Options.Statistics,
             db.Options.MaxOpenFiles);

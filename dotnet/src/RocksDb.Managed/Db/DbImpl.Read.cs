@@ -223,7 +223,11 @@ internal sealed partial class DbImpl
         {
             FileMetaData f = l0[i];
             if (CompareFileBoundary(ucmp, tsSize, userKey, f.Smallest) < 0 || CompareFileBoundary(ucmp, tsSize, userKey, f.Largest) > 0) continue;
-            if (GetFromFile(cfd, f, ikey, userKey, snapshot, ctx)) return;
+            if (GetFromFile(cfd, f, ikey, userKey, snapshot, ctx))
+            {
+                ctx.HitLevel = 0;
+                return;
+            }
         }
         for (int level = 1; level < s.NumLevels; level++)
         {
@@ -233,7 +237,11 @@ internal sealed partial class DbImpl
             if (idx >= files.Length) continue;
             FileMetaData f = files[idx];
             if (CompareFileBoundary(ucmp, tsSize, userKey, f.Smallest) < 0) continue;
-            if (GetFromFile(cfd, f, ikey, userKey, snapshot, ctx)) return;
+            if (GetFromFile(cfd, f, ikey, userKey, snapshot, ctx))
+            {
+                ctx.HitLevel = level;
+                return;
+            }
         }
     }
 
@@ -325,7 +333,11 @@ internal sealed partial class DbImpl
             {
                 FileMetaData f = l0[i];
                 if (!UserKeyInFileRange(ucmp, key.Span, f)) continue;
-                if (await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false)) break;
+                if (await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false))
+                {
+                    ctx.HitLevel = 0;
+                    break;
+                }
             }
             if (!ctx.Done)
             {
@@ -337,7 +349,11 @@ internal sealed partial class DbImpl
                     if (idx >= files.Length) continue;
                     FileMetaData f = files[idx];
                     if (ucmp.Compare(key.Span, DbFormat.ExtractUserKey(f.Smallest)) < 0) continue;
-                    if (await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false)) break;
+                    if (await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false))
+                    {
+                        ctx.HitLevel = level;
+                        break;
+                    }
                 }
             }
             if (ctx.NeedsBlobResolution) await ctx.ResolveBlobAsync(cfd.BlobSource, s, options, key, cancellationToken).ConfigureAwait(false);
@@ -405,6 +421,7 @@ internal sealed partial class DbImpl
                 FileMetaData f = l0[i];
                 if (!UserKeyInFileRangeWithoutTimestamp(ucmp, tsSize, ikey, f)) continue;
                 done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);
+                if (done) ctx.HitLevel = 0;
             }
             for (int level = 1; level < s.NumLevels && !done; level++)
             {
@@ -415,6 +432,7 @@ internal sealed partial class DbImpl
                 FileMetaData f = files[idx];
                 if (CompareFileBoundary(ucmp, tsSize, DbFormat.ExtractUserKey(ikey.Span), f.Smallest) < 0) continue;
                 done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);
+                if (done) ctx.HitLevel = level;
             }
             if (ctx.NeedsBlobResolution) await ctx.ResolveBlobAsync(cfd.BlobSource, s, options, key, cancellationToken).ConfigureAwait(false);
         }

@@ -77,6 +77,10 @@ public sealed class BackupEngine : BackupEngineReadOnly
         ThrowIfDisposed();
         if (_stopBackup) throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Backup stopped");
         CheckAppMetadata(appMetadata);
+        if (options.ExcludeFilesCallback is not null && _options.SchemaVersion < 2)
+        {
+            ThrowHelper.InvalidArgument("exclude_files_callback requires schema_version >= 2");
+        }
         DbImpl db = database.Impl;
         db.ThrowIfDisposed();
         await AcquireAsync(synchronous, ct).ConfigureAwait(false);
@@ -117,6 +121,10 @@ public sealed class BackupEngine : BackupEngineReadOnly
                         if (dir is null) dir = info.Directory;
                         else if (dir != info.Directory) ThrowHelper.NotSupported("db_paths / cf_paths not supported for Checkpoint nor BackupEngine");
                     }
+                    // Decide every file's destination first (sequential: the reuse checks read the backup directory
+                    // state); then the copies run on max_background_operations workers.
+                    var items = new List<BackupWorkItem>(infos.Count);
+                    var excludable = new List<BackupWorkItem>();
                     foreach (LiveFileStorageInfo info in infos)
                     {
                         if (info.FileType == FileType.WalFile && !_options.BackupLogFiles) continue;
@@ -124,15 +132,51 @@ public sealed class BackupEngine : BackupEngineReadOnly
                         if (info.ReplacementContents is not null)
                         {
                             if (info.Size != (ulong)info.ReplacementContents.Length) ThrowHelper.Corruption("Inconsistent size metadata for " + info.RelativeFileName);
-                            await CreatePrivateFileAsync(meta, newId, info.RelativeFileName, info.ReplacementContents, liveDstPaths, synchronous, ct)
-                                .ConfigureAwait(false);
+                            BackupFileEntry created = await CreatePrivateFileAsync(newId, info.RelativeFileName, info.ReplacementContents, liveDstPaths,
+                                synchronous, ct).ConfigureAwait(false);
+                            items.Add(new BackupWorkItem { Done = created });
                             continue;
                         }
                         bool sharable = info.FileType is FileType.TableFile or FileType.BlobFile;
                         ulong sizeBytes = sharable ? (ulong)db.FileSystem.GetFileSize(info.Directory + "/" + info.RelativeFileName) : info.Size;
-                        await AddBackupFileAsync(meta, newId, liveDstPaths, _options.ShareTableFiles && sharable, info.Directory, info.RelativeFileName,
-                            db.FileSystem, info.FileType, sizeBytes, info.Size, _options.ShareFilesWithChecksum && sharable, options.ProgressCallback,
-                            synchronous, ct).ConfigureAwait(false);
+                        bool sharedChecksum = _options.ShareFilesWithChecksum && sharable;
+                        BackupWorkItem item = await PrepareBackupFileAsync(newId, liveDstPaths, _options.ShareTableFiles && sharable, info.Directory,
+                            info.RelativeFileName, db.FileSystem, info.FileType, sizeBytes, info.Size, sharedChecksum, synchronous, ct).ConfigureAwait(false);
+                        // AddBackupFileWorkItem: with an exclude_files_callback, shared_checksum files that need a copy are
+                        // excludable and only dispatched after the callback.
+                        if (options.ExcludeFilesCallback is not null && item.Shared && sharedChecksum && item.NeedToCopy) excludable.Add(item);
+                        else items.Add(item);
+                    }
+                    if (options.ExcludeFilesCallback is { } exclude && excludable.Count > 0)
+                    {
+                        var maybe = new MaybeExcludeBackupFile[excludable.Count];
+                        for (int i = 0; i < maybe.Length; i++) maybe[i] = new MaybeExcludeBackupFile(excludable[i].DstRelative);
+                        try
+                        {
+                            exclude(maybe);
+                        }
+                        catch (Exception e) when (e is not OutOfMemoryException)
+                        {
+                            throw new RocksDbException(StatusCode.Aborted, "Operation aborted: Exception in exclude_files_callback: " + e.Message, StatusSubCode.None, e);
+                        }
+                        for (int i = 0; i < maybe.Length; i++)
+                        {
+                            if (maybe[i].ExcludeDecision) meta.AddExcludedFile(excludable[i].DstRelative);
+                            else items.Add(excludable[i]);
+                        }
+                    }
+                    Action progress = options.ProgressCallback ?? NoProgress;
+                    await RunParallelAsync(items.Count, (i, sync, token) => CopyBackupFileAsync(items[i], progress, sync, token), synchronous, ct)
+                        .ConfigureAwait(false);
+                    // BackupAfterCopyOrCreateWorkItem, in dispatch order: install shared copies and record the files.
+                    foreach (BackupWorkItem item in items)
+                    {
+                        if (item.Done is null)
+                        {
+                            if (item.Shared && item.NeedToCopy) _backupFs.RenameFile(item.CopyDestPath, item.FinalDestPath);
+                            item.Done = new BackupFileEntry(item.DstRelative, item.Size, item.Crc, item.DbSessionId);
+                        }
+                        meta.AddFile(item.Done);
                     }
                     meta.SequenceNumber = sequenceNumber;
                 }
@@ -184,7 +228,7 @@ public sealed class BackupEngine : BackupEngineReadOnly
     }
 
     /// <summary>The create_file_cb of the backup (CURRENT): written to the private directory from its contents.</summary>
-    private async ValueTask CreatePrivateFileAsync(BackupMeta meta, uint backupId, string fname, string contents, HashSet<string> liveDstPaths,
+    private async ValueTask<BackupFileEntry> CreatePrivateFileAsync(uint backupId, string fname, string contents, HashSet<string> liveDstPaths,
         bool synchronous, CancellationToken ct)
     {
         string rel = GetPrivateFileRel(backupId, false, fname);
@@ -210,7 +254,25 @@ public sealed class BackupEngine : BackupEngineReadOnly
             if (synchronous) f.Dispose();
             else await f.DisposeAsync().ConfigureAwait(false);
         }
-        meta.AddFile(new BackupFileEntry(rel, (ulong)bytes.Length, Crc32C.Value(bytes), ""));
+        return new BackupFileEntry(rel, (ulong)bytes.Length, Crc32C.Value(bytes), "");
+    }
+
+    /// <summary>One file of a backup being created (CopyOrCreateWorkItem + BackupAfterCopyOrCreateWorkItem).</summary>
+    private sealed class BackupWorkItem
+    {
+        public string SrcPath = "";
+        public IFileSystem? SrcFs;
+        public string DstRelative = "";
+        public string CopyDestPath = "";
+        public string FinalDestPath = "";
+        public ulong SizeLimit;
+        public ulong Size;
+        public uint? Crc;
+        public string DbSessionId = "";
+        public bool Shared;
+        public bool NeedToCopy;
+        /// <summary>Set for items that need no copy step (created files).</summary>
+        public BackupFileEntry? Done;
     }
 
     private ShareFilesNaming NamingNoFlags => _options.ShareFilesWithChecksumNaming & ShareFilesNaming.MaskNoNamingFlags;
@@ -235,12 +297,12 @@ public sealed class BackupEngine : BackupEngineReadOnly
     }
 
     /// <summary>
-    /// Port of BackupEngineImpl::AddBackupFileWorkItem + the after-copy step: picks the destination (shared_checksum,
-    /// shared or private), skips files the backup directory already holds (reusing their known checksum), copies the
-    /// others (shared ones through a temporary name renamed into place) and records the file in the backup.
+    /// Port of BackupEngineImpl::AddBackupFileWorkItem (decision part): picks the destination (shared_checksum, shared or
+    /// private) and skips files the backup directory already holds (reusing their known checksum). The copy runs later
+    /// (<see cref="CopyBackupFileAsync"/>), shared ones through a temporary name renamed into place afterwards.
     /// </summary>
-    private async ValueTask AddBackupFileAsync(BackupMeta meta, uint backupId, HashSet<string> liveDstPaths, bool shared, string srcDir, string fname,
-        IFileSystem srcFs, FileType fileType, ulong sizeBytes, ulong sizeLimit, bool sharedChecksum, Action? progress, bool synchronous, CancellationToken ct)
+    private async ValueTask<BackupWorkItem> PrepareBackupFileAsync(uint backupId, HashSet<string> liveDstPaths, bool shared, string srcDir, string fname,
+        IFileSystem srcFs, FileType fileType, ulong sizeBytes, ulong sizeLimit, bool sharedChecksum, bool synchronous, CancellationToken ct)
     {
         string srcPath = srcDir + "/" + fname;
         uint? crc = null;
@@ -296,30 +358,36 @@ public sealed class BackupEngine : BackupEngineReadOnly
             }
         }
         liveDstPaths.Add(finalDestPath);
-
-        ulong size = sizeBytes;
-        if (needToCopy)
+        return new BackupWorkItem
         {
-            LogInfo("Copying " + fname + " to " + copyDestPath);
-            (uint copiedCrc, ulong copied) = await CopyFileWithSizeAsync(srcFs, srcPath, copyDestPath, sizeLimit, progress, synchronous, ct).ConfigureAwait(false);
-            if (crc is uint expected && expected != copiedCrc)
-            {
-                ThrowHelper.Corruption("Checksum mismatch after copying " + srcPath + ": expected " + BackupEngineReadOnly.ChecksumToHex(expected) + ", got " +
-                    BackupEngineReadOnly.ChecksumToHex(copiedCrc));
-            }
-            crc = copiedCrc;
-            size = copied;
-            if (shared) _backupFs.RenameFile(copyDestPath, finalDestPath);
-        }
-        meta.AddFile(new BackupFileEntry(dstRelative, size, crc, dbSessionId));
+            SrcPath = srcPath,
+            SrcFs = srcFs,
+            DstRelative = dstRelative,
+            CopyDestPath = copyDestPath,
+            FinalDestPath = finalDestPath,
+            SizeLimit = sizeLimit,
+            Size = sizeBytes,
+            Crc = crc,
+            DbSessionId = dbSessionId,
+            Shared = shared,
+            NeedToCopy = needToCopy,
+        };
     }
 
-    private async ValueTask<(uint Crc, ulong Size)> CopyFileWithSizeAsync(IFileSystem srcFs, string src, string dst, ulong sizeLimit, Action? progress,
-        bool synchronous, CancellationToken ct)
+    /// <summary>The copy step of a work item (CopyOrCreateFile), run by one of the copy workers.</summary>
+    private async ValueTask CopyBackupFileAsync(BackupWorkItem item, Action progress, bool synchronous, CancellationToken ct)
     {
-        uint crc = await CopyFileAsync(srcFs, src, _backupFs, dst, sizeLimit, _options.Sync, _options.BackupRateLimiter, progress ?? NoProgress, synchronous, ct)
-            .ConfigureAwait(false);
-        return (crc, (ulong)_backupFs.GetFileSize(dst));
+        if (item.Done is not null || !item.NeedToCopy) return;
+        LogInfo("Copying " + item.SrcPath + " to " + item.CopyDestPath);
+        uint copiedCrc = await CopyFileAsync(item.SrcFs!, item.SrcPath, _backupFs, item.CopyDestPath, item.SizeLimit, _options.Sync, _options.BackupRateLimiter,
+            progress, synchronous, ct).ConfigureAwait(false);
+        if (item.Crc is uint expected && expected != copiedCrc)
+        {
+            ThrowHelper.Corruption("Checksum mismatch after copying " + item.SrcPath + ": expected " + BackupEngineReadOnly.ChecksumToHex(expected) + ", got " +
+                BackupEngineReadOnly.ChecksumToHex(copiedCrc));
+        }
+        item.Crc = copiedCrc;
+        item.Size = (ulong)_backupFs.GetFileSize(item.CopyDestPath);
     }
 
     private static readonly Action NoProgress = static () => { };

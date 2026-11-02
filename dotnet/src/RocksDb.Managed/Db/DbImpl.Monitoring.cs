@@ -347,11 +347,18 @@ internal sealed partial class DbImpl
         }
     }
 
-    /// <summary>NUMBER_KEYS_READ, BYTES_READ, MEMTABLE_HIT / MISS, BYTES_PER_READ and DB_GET for one point lookup.</summary>
+    /// <summary>
+    /// NUMBER_KEYS_READ, BYTES_READ, MEMTABLE_HIT / MISS, GET_HIT_L0 / L1 / L2_AND_UP (Version::Get, kFound in a table
+    /// file), BYTES_PER_READ and DB_GET for one point lookup.
+    /// </summary>
     internal static void RecordGet(Statistics st, GetContext ctx, long startTimestamp)
     {
         st.RecordTick(Ticker.NumberKeysRead);
         st.RecordTick(ctx.FromMemTable ? Ticker.MemtableHit : Ticker.MemtableMiss);
+        if (ctx.HitLevel >= 0 && ctx.State == GetContext.GetState.Found)
+        {
+            st.RecordTick(ctx.HitLevel switch { 0 => Ticker.GetHitL0, 1 => Ticker.GetHitL1, _ => Ticker.GetHitL2AndUp });
+        }
         if (ctx.State == GetContext.GetState.Found || ctx.MergeContext.Count > 0)
         {
             int n = ctx.Value.WrittenCount;
@@ -388,7 +395,7 @@ internal sealed partial class DbImpl
                 SuperVersion sv = GetReferencedSuperVersion(cfd);
                 try
                 {
-                    sb.Append(cfd.Stats.Dump(cfd.Name, sv.Current.Storage));
+                    sb.Append(cfd.Stats.Dump(cfd.Name, sv.Current.Storage, isPeriodic: true));
                 }
                 finally
                 {

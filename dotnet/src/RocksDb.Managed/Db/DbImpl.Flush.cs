@@ -172,6 +172,11 @@ internal sealed partial class DbImpl
             .ConfigureAwait(false);
         if (meta is not null)
         {
+            // BuildTable: "Verify that the table is usable" (table_cache->NewIterator): the new table is opened and stays
+            // in the table cache, so lookups that must not do file I/O (KeyMayExist, kBlockCacheTier) can use it.
+            using (cfd.TableCache.GetReader(meta))
+            {
+            }
             FileSystem.SyncDirectory(DbPaths[0]);
             RecordFlushBytes(meta.FileSize + BlobBytesWritten(blobBuilder));
             // FlushJob::WriteLevel0Table logs this before the result is installed (and compactions are scheduled).

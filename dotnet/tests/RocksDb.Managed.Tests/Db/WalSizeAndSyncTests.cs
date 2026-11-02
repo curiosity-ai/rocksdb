@@ -106,7 +106,6 @@ public sealed class WalSizeAndSyncTests
         db.DefaultColumnFamily.Db.SwitchMemtableForTest();
         db.Put(B("b"), B("1")); // second WAL, not synced
         fs.SimulateCrash();
-        RocksDb.Managed.Db.TestHooks.ClearAll(); // new flushes run; the crashed instance's stay held
         using (RocksDatabase re = RocksDatabase.Open(DbPath, NewOptions(fs)))
         {
             Assert.IsNull(GetString(re, "a"));
@@ -132,7 +131,6 @@ public sealed class WalSizeAndSyncTests
             if (viaSyncWal) db.SyncWal();
             else db.Put(WriteOptions.SyncWrites, B("s"), B("1"));
             fs.SimulateCrash();
-            RocksDb.Managed.Db.TestHooks.ClearAll(); // new flushes run; the crashed instance's stay held
             using (RocksDatabase re = RocksDatabase.Open(DbPath, NewOptions(fs)))
             {
                 Assert.AreEqual("1", GetString(re, "a"), "viaSyncWal=" + viaSyncWal);
@@ -155,7 +153,6 @@ public sealed class WalSizeAndSyncTests
         db.Put(B("d"), B("1"));
         db.Flush(); // "d" is in a table file: the WAL holding the matching "c" must be durable
         fs.SimulateCrash();
-        RocksDb.Managed.Db.TestHooks.ClearAll(); // new flushes run; the crashed instance's stay held
         using (RocksDatabase re = RocksDatabase.Open(DbPath, NewOptions(fs), [new("default", new ColumnFamilyOptions()), new("cold", new ColumnFamilyOptions())]))
         {
             Assert.AreEqual("1", GetString(re, "d"));

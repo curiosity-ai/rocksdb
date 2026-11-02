@@ -299,8 +299,20 @@ public sealed partial class ColumnFamily
         ArgumentNullException.ThrowIfNull(batch);
         _db.ThrowIfDisposed();
         if (batch.Count == 0) return;
-        ValueTask t = _db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None);
-        t.GetAwaiter().GetResult();
+        if (_db.Stats is null)
+        {
+            _db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+            return;
+        }
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadMultigetMicros);
+        try
+        {
+            _db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
     }
 
     /// <summary>Async <see cref="MultiGet(MultiGetBatch)"/>: data blocks missing from the block cache are read with async I/O.</summary>
@@ -330,7 +342,15 @@ public sealed partial class ColumnFamily
             else
             {
                 long t0 = st.StartTimer();
-                _db.Get(_cfd, options, key, ctx);
+                int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadGetMicros);
+                try
+                {
+                    _db.Get(_cfd, options, key, ctx);
+                }
+                finally
+                {
+                    Monitoring.FileReadActivity.Exit(activity);
+                }
                 DbImpl.RecordGet(st, ctx, t0);
             }
         }

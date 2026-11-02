@@ -131,44 +131,122 @@ public sealed class Iterator : IDisposable
 
     public void SeekToFirst()
     {
-        long t0 = _stats?.StartTimer() ?? 0;
-        _it.SeekToFirst();
-        if (_stats is not null) RecordSeek(t0);
+        if (_stats is null)
+        {
+            _it.SeekToFirst();
+            return;
+        }
+        long t0 = _stats.StartTimer();
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
+        try
+        {
+            _it.SeekToFirst();
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
+        RecordSeek(t0);
     }
 
     public void SeekToLast()
     {
-        long t0 = _stats?.StartTimer() ?? 0;
-        _it.SeekToLast();
-        if (_stats is not null) RecordSeek(t0);
+        if (_stats is null)
+        {
+            _it.SeekToLast();
+            return;
+        }
+        long t0 = _stats.StartTimer();
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
+        try
+        {
+            _it.SeekToLast();
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
+        RecordSeek(t0);
     }
 
     /// <summary>Positions at the first key &gt;= <paramref name="target"/>.</summary>
     public void Seek(ReadOnlySpan<byte> target)
     {
-        long t0 = _stats?.StartTimer() ?? 0;
-        _it.Seek(target);
-        if (_stats is not null) RecordSeek(t0);
+        if (_stats is null)
+        {
+            _it.Seek(target);
+            return;
+        }
+        long t0 = _stats.StartTimer();
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
+        try
+        {
+            _it.Seek(target);
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
+        RecordSeek(t0);
     }
 
     /// <summary>Positions at the last key &lt;= <paramref name="target"/>.</summary>
     public void SeekForPrev(ReadOnlySpan<byte> target)
     {
-        long t0 = _stats?.StartTimer() ?? 0;
-        _it.SeekForPrev(target);
-        if (_stats is not null) RecordSeek(t0);
+        if (_stats is null)
+        {
+            _it.SeekForPrev(target);
+            return;
+        }
+        long t0 = _stats.StartTimer();
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
+        try
+        {
+            _it.SeekForPrev(target);
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
+        RecordSeek(t0);
     }
 
     public void Next()
     {
-        _it.Next();
-        if (_stats is not null) RecordStep(Ticker.NumberDbNext, Ticker.NumberDbNextFound);
+        if (_stats is null)
+        {
+            _it.Next();
+            return;
+        }
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
+        try
+        {
+            _it.Next();
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
+        RecordStep(Ticker.NumberDbNext, Ticker.NumberDbNextFound);
     }
 
     public void Prev()
     {
-        _it.Prev();
-        if (_stats is not null) RecordStep(Ticker.NumberDbPrev, Ticker.NumberDbPrevFound);
+        if (_stats is null)
+        {
+            _it.Prev();
+            return;
+        }
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
+        try
+        {
+            _it.Prev();
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
+        RecordStep(Ticker.NumberDbPrev, Ticker.NumberDbPrevFound);
     }
 
     // ---- statistics (DBIter::Seek / Next / Prev RecordTick calls) ----

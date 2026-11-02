@@ -36,6 +36,8 @@ internal sealed class GetContext
     public GetState State;
     /// <summary>The lookup finished in a memtable (MEMTABLE_HIT statistics).</summary>
     public bool FromMemTable;
+    /// <summary>Level of the table file that produced a kFound result (FilePicker::GetHitFileLevel); -1 otherwise.</summary>
+    public int HitLevel = -1;
     /// <summary>The found value (<see cref="Value"/>) is a serialized wide-column entity.</summary>
     public bool ValueIsEntity;
     /// <summary>
@@ -117,6 +119,7 @@ internal sealed class GetContext
         Value.Clear();
         State = GetState.NotFound;
         FromMemTable = false;
+        HitLevel = -1;
         ValueIsEntity = false;
         ValueIsBlobIndex = false;
         ValueEntityHasBlobColumns = false;
