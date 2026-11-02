@@ -144,12 +144,14 @@ With compaction (1M ops, 16B/100B, 4MB write buffer, no compression, shared box)
 Write-amp: fill 3.42 native vs 3.24 managed; overwrite 4.12 vs 4.17.
 
 ## Phase 3 — Compat + performance
-- [~] Features: WriteBatchWithIndex, SetOptions/SetDBOptions, custom comparators e2e, KeyMayExist/approx sizes/properties, Statistics, info LOG, wide columns (agent running)
+- [x] Features: WriteBatchWithIndex (+BaseDeltaIterator; transactions now use it), SetOptions/SetDBOptions (+typed), custom comparators e2e (+MANIFEST comparator/num_levels validation), KeyMayExist/GetApproximateSizes/memtable stats/int+map properties/table properties, Statistics (all upstream tickers/histograms, native ToString), info LOG (+rotation), wide columns (PutEntity/GetEntity/iterator columns, merge/compaction) — all compat-tested vs native
+- [ ] Features gaps: compaction filters on entities, blob columns/attribute groups/MultiGetEntity, per-SuperVersion options snapshot, mutable block-based table options, KeyMayExist doing filter I/O on cache miss, cfstats interval/file-read histograms, per-level GET_HIT stats, WBWI MultiGetFromBatchAndDB
+- [ ] Flaky? `PrefixSeekTests.PrefixSameAsStartMatchesModel` failed once on net11.0 (sorted-run file count precondition); 10/10 reruns pass
 - [~] Perf #2 (agent running)
 - [x] Transactions: `OptimisticTransactionDatabase` (serial + parallel validation), `TransactionDatabase` (WriteCommitted, point locks, timeouts, deadlock detection, expiration, 2PC prepare/commit/rollback + recovery); 2PC WAL records byte-identical to native, prepared txns recover across engines; fixed recovery last-sequence bug for 2PC records; dbbench txnoptimistic/txnpessimistic on all engines
 - [ ] Transactions gaps: WritePrepared/WriteUnprepared, range locks, UDT; unify IndexedWriteBatch with public WriteBatchWithIndex; pool lock entries/tracked keys (~1.8–2.3 KB/txn)
 - [x] Replaced stringy enums: typed FilterPolicy/MergeOperator/CompactionFilter/SliceTransform options (persisted text preserved byte-for-byte), MemTableFactoryType/TableFactoryType/FlushBlockPolicyType, `DbProperties` constants, `AppendEntriesRejectReason`, bench EngineKind/DbBenchmark/CompressionType flags, round-trip FilterKind
-- [ ] `ColumnFamilyOptions.ComparatorName` → typed Comparator (features agent)
+- [x] `ColumnFamilyOptions.Comparator` typed (ComparatorName derived/persisted)
 - [x] Fixed intermittent hang (CloseRacingWritersAndFlushes): FlushAsync/WaitForCompact waiters slept forever when close stopped scheduling a queued flush; shutdown now signals waiters, which fail with ObjectDisposed/ShutdownInProgress
 Goal: finish implementation, validate vs C++ source, comprehensive tests (unit/integration/round-trip) and benchmarks (managed vs rocksdb-sharp vs pure C native).
 - [x] Source audit #1 vs C++ (`docs/validation.md`): ~90 files (formats/util/table/wal/options/memtable/iterators); fixed memtable range-tombstone publish race, ArenaBlockSize default (0 → derived), internal-key type validation; added db_iter_test vectors
