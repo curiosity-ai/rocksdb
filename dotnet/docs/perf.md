@@ -284,6 +284,109 @@ releases its file (`Park` drops the lease and the blocks and keeps the objects).
 Remaining gaps: flush / compaction CPU per entry 1.4 - 2x native; background compaction throughput under sustained
 writes; `fillsync` and `flush` in the matrix carry first-run effects; reverse iteration copies values (no block pinning).
 
+## Perf pass #3 (flush and compaction throughput)
+
+Inputs: alternated runs of the pre-pass build (`ed896fe`, copied aside) / the new build / c-native in the same window,
+medians reported; the shared 4-vCPU VM had load 3-14 from other agents throughout, so single runs vary by +-30%. New
+three-way results: `bench/results/2026-11-02-vm-perf3.md` (reduced matrix) and `-vm-perf3-compaction.md`.
+
+Profiling notes. EventPipe sampling (`dotnet-trace`, BenchmarkDotNet `--profiler EP`) is badly biased on Linux: threads
+are sampled at GC safe points, so native calls (`pread`, `pwrite`, large `memmove`) dominate the profile (pass #2 saw
+"page cache writes behind dirty WAL pages" this way; the actual cause was elsewhere, see 1). This pass used `perf record`
+with `DOTNET_PerfMapEnabled=1 DOTNET_EnableWriteXorExecute=0` (perf from `linux-tools-6.8.0-*-oem` works in the VM),
+windowed with `--control=fifo` to the compaction under test, `getrusage(RUSAGE_THREAD)` around it, and a TraceEvent
+reader for allocation-tick stacks and JIT events. In-process probes repeated one flush / one compaction N times so the
+first run (what the matrix measures) and the steady state could be separated.
+
+Findings:
+- In steady state the managed builder and compaction are already at or below native cost: building a 400k-entry table
+  through `SstFileWriter` takes 0.45 - 0.55 µs/entry managed vs 0.46 - 0.8 µs native; a full `CompactRange` of 9 L0
+  files (58 MB) repeated in one process takes 230 - 280 ms managed vs 400 - 600 ms for c-native's (only) run.
+- The first flush / compaction of a process is 2.5 - 3.5x slower than the following ones: ~1100 methods are JIT
+  compiled during the first compaction and the per-entry code runs as tier-0 / instrumented code until tiering catches
+  up (the call-counting delay keeps being extended while new methods are jitted). On the compaction thread: user CPU
+  785 ms on the first run vs 130 ms on later runs, perf shows 20% libclrjit + 15% libcoreclr. ReadyToRun or
+  `TieredCompilation=0` remove only part of it (610 - 750 ms) - type loading, first-touch of pooled buffers and the JIT
+  of methods R2R cannot precompile remain.
+- The WAL-on flush gap was ours: see 1.
+- Under sustained writes, every new output file allocated large arrays (LOH) that `ArrayPool<T>.Shared` failed to
+  hand back across the flush / compaction threads: 51 - 60 B per put and 2 gen2 GCs per 500k puts.
+
+### 1. WAL writeback before the rotation sync
+
+`SwitchMemtableAsync` fdatasyncs the closed WAL before writes continue in the new one (the port's stronger-than-upstream
+guarantee). With 50 MB of WAL that had never been written back, this sync took ~155 ms on the write path, and the
+`flush` benchmark (which includes the switch) paid for it. A WAL now starts writeback every 1 MiB with
+`sync_file_range(SYNC_FILE_RANGE_WRITE)` when `wal_bytes_per_sync` is 0 (`DbImpl.CreateWal`; it does not wait, like
+upstream's `wal_bytes_per_sync`), so the rotation sync only waits for the tail: 155 ms -> 10 - 66 ms. Durability
+semantics are unchanged.
+
+### 2. No large allocations per output file
+
+- `LocalWritableFile.Append`: an append at least as large as the buffer is written through. The table builder stages
+  256 KiB of blocks and used to grow the file buffer 64 KiB -> 1 MiB per file (renting each size) and copy the staged
+  bytes once more; now its staged chunks go straight to `pwrite` (block -> staging buffer -> page cache, one copy like
+  upstream's block -> `WritableFileWriter` buffer).
+- `FilterEntryPool` (filter hash entries) and a dedicated `ArrayPool.Create` pool for the builder's staging buffer
+  replace `ArrayPool.Shared` for these large arrays; a new filter builder starts with the largest retained array, so it
+  normally never grows.
+
+| compaction-heavy probe (4 MiB memtables, 500k random puts after 500k fill) | before | after |
+|---|---:|---:|
+| allocated per put, steady phase | 59.6 B | 5.5 B |
+| gen0/1/2 GCs, steady phase | 2/2/2 | 0/0/0 |
+| run-all compaction config, managed alloc fillrandom / overwrite | 50.5 / 18.1 B/op | 26.8 / 6.7 B/op (rest: memtable arena warm-up) |
+
+### 3. First-run code quality: AggressiveOptimization on the per-entry methods
+
+The per-entry methods of flush and compaction (`FlushJob.AddPointEntries`, `CompactionIterator` Next/NextFromInput/...,
+`CompactionJob` per-key helpers, `MergingIterator` Next/heap, `TableInternalIterator` / `BlockBasedTableIterator` /
+`BlockIter` Next and accessors, `BlockBasedTableBuilder` Add/Flush/WriteBlock, `BlockBuilder` Add/Finish) are
+`[MethodImpl(MethodImplOptions.AggressiveOptimization)]`: compiled once, fully optimized, on first call. That gives up
+Dynamic PGO for them, whose main benefit there was guarded devirtualization of the child iterator calls, so
+`MergingIterator` and `LevelIterator` now call their children through sealed-type checks (`TableInternalIterator`,
+`LevelIterator`; other types fall back to the virtual call), the managed equivalent of upstream caching the child key
+in `IteratorWrapper`. In-process `CompactRange` of the 9-file DB, 3 alternated runs each:
+
+| | first compaction in the process | steady state (median of runs 3-6) |
+|---|---:|---:|
+| without AggressiveOptimization | 920 / 1084 / 922 ms | 239 / 270 / 257 ms |
+| with (+ sealed-type dispatch) | 673 / 633 / 680 ms | 265 / 256 / 270 ms |
+
+First table build of a process (in-process probe, 400k entries): 455 - 500 ms -> 355 - 386 ms, steady state unchanged.
+The skiplist iterator also prefetches the following node (flush walks a randomly ordered list).
+
+### Before / after (alternated, medians)
+
+| | before | after | c-native | after / C |
+|---|---:|---:|---:|---:|
+| fillrandom 400k + `flush`, WAL on (5 runs) | 1081 ms | 555 ms | 467 ms | 1.19x (was 2.31x) |
+| fillrandom 400k + `flush`, WAL off (3 runs) | 601 ms | 533 ms | 378 ms | 1.41x (was 1.59x) |
+| `compact`: CompactRange of 9 L0 files (58 MB), fresh process (5 runs) | 1259 ms | 898 ms | 546 ms | 1.64x (was 2.31x) |
+| compaction-heavy config: compaction time per input record (3 runs) | 2.62 µs | 2.22 µs | 1.70 µs | 1.31x (was 1.54x) |
+| compaction-heavy config: total compaction time (3 runs) | 6087 ms | 4908 ms | 3811 ms | 1.29x |
+
+`run-all.sh` compaction config (`-vm-perf3-compaction.md`): managed / C geometric mean 0.62x (perf #2: 0.63x), with
+fillrandom 4.67 vs 5.02 µs, overwrite 4.03 vs 5.84 µs, readrandom 0.70x, seekrandom 0.33x. Reduced matrix
+(`-vm-perf3.md`): this run had about twice the background load of the perf #2 run (load 7-10), which shows in the
+read benchmarks this pass did not touch: their ratios moved in both directions by up to 2x (readseq 100 B / 1 thread /
+lz4 1.37x -> 0.64x, 1 KiB / 4 threads / lz4 1.46x -> 2.76x), so the summary rows of that file mostly measure noise; its
+`flush` / `compact` rows (single first-in-process runs) moved from 1.11 - 5.8x / 0.7 - 2.2x to 0.7 - 3.2x / 0.96 - 2.35x.
+
+Remaining gaps:
+- First-run JIT: a single flush / compaction per process (the matrix's `flush` and `compact`) still costs 1.5 - 2x
+  native; steady-state flush / compaction CPU per entry is at or below native.
+- LZ4 flushes: K4os LZ4's compressor is JIT compiled (82 ms of JIT for `LZ4_compress_generic` instantiations / OSR
+  variants) and runs as tier-0 code during the first flush; fillrandom 300k + flush with LZ4 is 720 - 845 ms vs
+  290 - 343 ms native. Not addressed (third-party code; a warm-up or an in-house LZ4 encoder would be needed).
+- Compaction picking under sustained writes: managed lets L5 grow to 9 - 10 files before L5 -> L6 compactions while
+  native 11.12 keeps it at 4 - 6, so managed L0 -> L5 compactions read ~1.4x more L5 data (write-amp 3.05 - 3.33 vs
+  2.96) and more work is left at the end of the writes (`waitforcompaction` 0.3 - 1.7 s vs 0.02 - 0.25 s). Needs a
+  picker fidelity check against the native release (scores are ported from `ComputeCompactionScore`, so the difference
+  is likely in the inputs / timing).
+- Range-partitioned subcompactions (`max_subcompactions`) are not implemented; native defaults to 1, so they would not
+  change the comparison.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
