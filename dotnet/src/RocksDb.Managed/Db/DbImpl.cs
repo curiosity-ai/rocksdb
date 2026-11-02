@@ -232,6 +232,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         try
         {
+            if (TryGetExtendedProperty(cfd, sv, property, out string? extendedValue)) return extendedValue;
             if (TryGetCompactionProperty(cfd, sv, property, out string? compactionValue)) return compactionValue;
             switch (property)
             {
@@ -504,6 +505,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         NotifySequenceWaiters(); // wake WAL tailers so they observe the close
         try
         {
+            LogInfo("Shutdown: canceling all background work");
             lock (_mutex) _shuttingDown = true;
             CancelBackgroundCompactions();
             await WaitForBackgroundWorkAsync(synchronous).ConfigureAwait(false);
@@ -529,6 +531,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             _writeThread.ExitAsLeader();
             WriteThread.Return(w, synchronous);
             _groupBatch.Dispose();
+            try { ShutdownMonitoring(); } catch (Exception e) when (e is IOException or RocksDbException) { }
             _dbLock?.Dispose();
             _dbLock = null;
             if (_secondary) DisposeSecondaryReaders();

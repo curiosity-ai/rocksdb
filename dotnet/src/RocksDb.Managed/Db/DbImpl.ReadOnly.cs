@@ -65,6 +65,7 @@ internal sealed partial class DbImpl
         }
         if (!descriptors.ContainsKey(DefaultColumnFamilyName)) descriptors[DefaultColumnFamilyName] = new ColumnFamilyOptions();
         if (_secondaryPath is not null) FileSystem.CreateDirectoryIfMissing(_secondaryPath);
+        _infoLog = Options.InfoLog; // read-only and secondary instances don't create a LOG file
         SetComparatorResolver(descriptors);
 
         if (!FileSystem.FileExists(FileNames.CurrentFilePath(DbName)))

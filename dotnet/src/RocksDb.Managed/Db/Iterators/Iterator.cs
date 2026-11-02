@@ -57,14 +57,80 @@ public sealed class Iterator : IDisposable
     /// <summary>The user comparator ordering the keys.</summary>
     public Comparator Comparator => _icmp.UserComparator;
 
-    public void SeekToFirst() => _it.SeekToFirst();
-    public void SeekToLast() => _it.SeekToLast();
+    public void SeekToFirst()
+    {
+        long t0 = _stats?.StartTimer() ?? 0;
+        _it.SeekToFirst();
+        if (_stats is not null) RecordSeek(t0);
+    }
+
+    public void SeekToLast()
+    {
+        long t0 = _stats?.StartTimer() ?? 0;
+        _it.SeekToLast();
+        if (_stats is not null) RecordSeek(t0);
+    }
+
     /// <summary>Positions at the first key &gt;= <paramref name="target"/>.</summary>
-    public void Seek(ReadOnlySpan<byte> target) => _it.Seek(target);
+    public void Seek(ReadOnlySpan<byte> target)
+    {
+        long t0 = _stats?.StartTimer() ?? 0;
+        _it.Seek(target);
+        if (_stats is not null) RecordSeek(t0);
+    }
+
     /// <summary>Positions at the last key &lt;= <paramref name="target"/>.</summary>
-    public void SeekForPrev(ReadOnlySpan<byte> target) => _it.SeekForPrev(target);
-    public void Next() => _it.Next();
-    public void Prev() => _it.Prev();
+    public void SeekForPrev(ReadOnlySpan<byte> target)
+    {
+        long t0 = _stats?.StartTimer() ?? 0;
+        _it.SeekForPrev(target);
+        if (_stats is not null) RecordSeek(t0);
+    }
+
+    public void Next()
+    {
+        _it.Next();
+        if (_stats is not null) RecordStep(Ticker.NumberDbNext, Ticker.NumberDbNextFound);
+    }
+
+    public void Prev()
+    {
+        _it.Prev();
+        if (_stats is not null) RecordStep(Ticker.NumberDbPrev, Ticker.NumberDbPrevFound);
+    }
+
+    // ---- statistics (DBIter::Seek / Next / Prev RecordTick calls) ----
+
+    private Statistics? _stats;
+
+    /// <summary>Statistics to record NUMBER_DB_SEEK / NEXT / PREV (+ FOUND), ITER_BYTES_READ and DB_SEEK into.</summary>
+    internal Statistics? Statistics
+    {
+        get => _stats;
+        set
+        {
+            _stats = value;
+            value?.RecordTick(Ticker.NoIteratorCreated);
+        }
+    }
+
+    private void RecordSeek(long startTimestamp)
+    {
+        Statistics st = _stats!;
+        st.RecordElapsedMicros(Histogram.DbSeek, startTimestamp);
+        RecordStep(Ticker.NumberDbSeek, Ticker.NumberDbSeekFound);
+    }
+
+    private void RecordStep(Ticker step, Ticker found)
+    {
+        Statistics st = _stats!;
+        st.RecordTick(step);
+        if (_it.Valid)
+        {
+            st.RecordTick(found);
+            st.RecordTick(Ticker.IterBytesRead, (ulong)(_it.Key.Length + _it.Value.Length));
+        }
+    }
 
     public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) => _it.SeekToFirstAsync(cancellationToken);
     public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default) => _it.SeekToLastAsync(cancellationToken);
@@ -260,6 +326,7 @@ public sealed class Iterator : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _stats?.RecordTick(Ticker.NoIteratorDeleted);
         _it.Dispose();
     }
 }

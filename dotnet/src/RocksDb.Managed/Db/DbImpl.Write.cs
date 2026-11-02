@@ -38,6 +38,8 @@ internal sealed partial class DbImpl
         if (options is { Sync: true, DisableWal: true }) ThrowHelper.InvalidArgument("Sync writes has to enable WAL.");
         if (batch.DataSize < WriteBatch.HeaderSize) ThrowHelper.Corruption("malformed WriteBatch (too small)");
         if (validateColumnFamilies) ValidateColumnFamilies(batch, options?.IgnoreMissingColumnFamilies ?? false);
+        Statistics? stats = Options.Statistics;
+        long writeStart = stats?.StartTimer() ?? 0;
         WriteThread.Writer w = WriteThread.Rent(synchronous);
         w.Prepare(batch, options, synchronous);
         try
@@ -67,6 +69,7 @@ internal sealed partial class DbImpl
         finally
         {
             WriteThread.Return(w, synchronous);
+            stats?.RecordElapsedMicros(Histogram.DbWrite, writeStart);
         }
     }
 
@@ -219,6 +222,7 @@ internal sealed partial class DbImpl
                 Versions.SetLastSequence(last);
                 NotifySequenceWaiters();
             }
+            RecordWriteGroup(group, total, leader.DisableWal ? 0 : (group.Count == 1 ? leader.Batch!.DataSize : _groupBatch.DataSize), !leader.DisableWal, needSync);
         }
         catch (Exception e)
         {
@@ -255,7 +259,12 @@ internal sealed partial class DbImpl
             }
             _flushScheduler.Clear();
         }
-        if (_maybeStalled) await DelayWriteAsync(noSlowdown, synchronous, cancellationToken).ConfigureAwait(false);
+        if (_maybeStalled)
+        {
+            long stallStart = Stopwatch.GetTimestamp();
+            await DelayWriteAsync(noSlowdown, synchronous, cancellationToken).ConfigureAwait(false);
+            RecordWriteStall(stallStart);
+        }
     }
 
     /// <summary>

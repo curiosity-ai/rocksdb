@@ -35,6 +35,8 @@ internal sealed class GetContext
     public readonly PooledBufferWriter Scratch = new(256);
 
     public GetState State;
+    /// <summary>The lookup finished in a memtable (MEMTABLE_HIT statistics).</summary>
+    public bool FromMemTable;
     public ulong MaxCoveringTombstoneSeq;
     public MergeOperator? MergeOperator;
 
@@ -43,6 +45,7 @@ internal sealed class GetContext
         MergeContext.Clear();
         Value.Clear();
         State = GetState.NotFound;
+        FromMemTable = false;
         MaxCoveringTombstoneSeq = 0;
         MergeOperator = mergeOperator;
     }

@@ -51,6 +51,7 @@ internal sealed partial class DbImpl
         {
         }
         _groupBatch.Dispose();
+        try { ShutdownMonitoring(); } catch (Exception e) when (e is IOException or RocksDbException) { }
         _dbLock?.Dispose();
         _dbLock = null;
     }
@@ -81,6 +82,7 @@ internal sealed partial class DbImpl
             throw RocksDbException.InvalidArgument(DbName + ": does not exist (create_if_missing is false)");
         }
 
+        InitInfoLog();
         bool exists = FileSystem.FileExists(FileNames.CurrentFilePath(DbName));
         if (!exists)
         {
@@ -194,6 +196,9 @@ internal sealed partial class DbImpl
         DeleteObsoleteFilesFullScan();
         await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
         DeleteObsoleteFilesFullScan();
+        LogOpenSummary();
+        LogInfo("DB pointer " + GetHashCode().ToString("x", CultureInfo.InvariantCulture) + " opened " + DbName);
+        StartStatsDump();
         EnableBackgroundCompactions();
     }
 

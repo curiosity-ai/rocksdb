@@ -16,7 +16,7 @@ namespace RocksDb.Managed;
 /// and are batched with concurrent writers (group commit).
 /// </para>
 /// </summary>
-public sealed class ColumnFamily
+public sealed partial class ColumnFamily
 {
     private readonly DbImpl _db;
     private readonly ColumnFamilyData _cfd;
@@ -302,7 +302,17 @@ public sealed class ColumnFamily
         GetContext ctx = GetContext.Rent(_cfd.MergeOperator);
         try
         {
-            _db.Get(_cfd, options, key, ctx);
+            Statistics? st = _db.Stats;
+            if (st is null)
+            {
+                _db.Get(_cfd, options, key, ctx);
+            }
+            else
+            {
+                long t0 = st.StartTimer();
+                _db.Get(_cfd, options, key, ctx);
+                DbImpl.RecordGet(st, ctx, t0);
+            }
         }
         catch
         {
@@ -386,7 +396,10 @@ public sealed class ColumnFamily
         GetContext ctx = GetContext.Rent(_cfd.MergeOperator);
         try
         {
+            Statistics? st = _db.Stats;
+            long t0 = st?.StartTimer() ?? 0;
             await _db.GetAsync(_cfd, options, key, ctx, ct).ConfigureAwait(false);
+            if (st is not null) DbImpl.RecordGet(st, ctx, t0);
         }
         catch
         {
@@ -480,7 +493,9 @@ public sealed class ColumnFamily
         DbIteratorSources sources = _db.NewIteratorSources(_cfd, options);
         try
         {
-            return DbIteratorFactory.Create(sources);
+            Iterator it = DbIteratorFactory.Create(sources);
+            it.Statistics = _db.Stats;
+            return it;
         }
         catch
         {
@@ -496,7 +511,9 @@ public sealed class ColumnFamily
         DbIteratorSources sources = _db.NewIteratorSources(_cfd, options);
         try
         {
-            return await DbIteratorFactory.CreateAsync(sources, cancellationToken).ConfigureAwait(false);
+            Iterator it = await DbIteratorFactory.CreateAsync(sources, cancellationToken).ConfigureAwait(false);
+            it.Statistics = _db.Stats;
+            return it;
         }
         catch
         {

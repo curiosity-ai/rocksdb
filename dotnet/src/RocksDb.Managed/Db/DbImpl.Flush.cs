@@ -3,7 +3,7 @@ namespace RocksDb.Managed.Db;
 internal sealed partial class DbImpl
 {
     private readonly Queue<ColumnFamilyData> _flushQueue = new(); // guarded by mutex
-    private readonly int _maxBackgroundFlushes;
+    private int _maxBackgroundFlushes; // changed by SetDBOptions under the mutex
     private int _runningFlushes;   // guarded by mutex
     private int _backgroundJobs;   // guarded by mutex
     private bool _shuttingDown;    // guarded by mutex
@@ -122,8 +122,11 @@ internal sealed partial class DbImpl
     private async ValueTask FlushMemTablesAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch, bool synchronous)
     {
         TestHooks.Invoke("DBImpl::FlushMemTables:Start");
+        long flushStart = System.Diagnostics.Stopwatch.GetTimestamp();
+        int jobId = NewJobId();
         var mems = new List<MemTable>(picked.Count);
         foreach (ImmutableMemTable m in picked) mems.Add(m.Mem);
+        OnFlushStarted(cfd, jobId, mems);
         string path = FileNames.TableFileName(DbPaths, fileNumber, 0);
         FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, mems, fileNumber, epoch, Identity, synchronous, CancellationToken.None)
             .ConfigureAwait(false);
@@ -165,6 +168,7 @@ internal sealed partial class DbImpl
             InstallSuperVersion(cfd);
             _maybeStalled = IsWriteStalled();
         }
+        OnFlushCompleted(cfd, jobId, meta, flushStart);
     }
 
     /// <summary>

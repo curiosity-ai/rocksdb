@@ -46,7 +46,11 @@ internal sealed partial class DbImpl
             var lkey = new LookupKey(key, snapshot, scratch);
             try
             {
-                if (GetFromMemTables(sv, lkey, ctx)) return;
+                if (GetFromMemTables(sv, lkey, ctx))
+                {
+                    ctx.FromMemTable = true;
+                    return;
+                }
                 if (options?.ReadTier == ReadTier.MemtableTier)
                 {
                     if (ctx.State == GetContext.GetState.NotFound) return;
@@ -146,7 +150,11 @@ internal sealed partial class DbImpl
         PooledBufferWriter ikeyBuf = ObjectPools.RentWriter();
         try
         {
-            if (GetFromMemTables(sv, key.Span, snapshot, ctx)) return;
+            if (GetFromMemTables(sv, key.Span, snapshot, ctx))
+            {
+                ctx.FromMemTable = true;
+                return;
+            }
             if (options?.ReadTier == ReadTier.MemtableTier)
             {
                 if (ctx.State == GetContext.GetState.NotFound) return;
