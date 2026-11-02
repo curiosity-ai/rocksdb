@@ -144,6 +144,12 @@ With compaction (1M ops, 16B/100B, 4MB write buffer, no compression, shared box)
 Write-amp: fill 3.42 native vs 3.24 managed; overwrite 4.12 vs 4.17.
 
 ## Phase 3 — Compat + performance
+Remaining-gap wave (agents running):
+- [~] WritePrepared / WriteUnprepared transaction policies (+ read callbacks, SnapshotChecker, recovery)
+- [~] Blob direct write, V2 entity blob columns, compaction filters on entities/blobs; optimistic-txn UDT parity check; remaining UDT txn overloads
+- [~] Audit #3: line-by-line coverage of every remaining file (`docs/validation-coverage.md`)
+- [~] rocksdb-sharp: full native build with codecs + export/loader verification (PR #98)
+- [ ] After the above: repeated benchmark runs (≥3 repetitions, medians + spread) on a quiet machine
 Final completeness wave (all merged):
 - [x] Integrated BlobDB: blob file format/builder/reader/cache/GC, versions & MANIFEST, Get/MultiGet/iterators/merges, checkpoint/GetLiveFiles; blob files byte-identical to native; native↔managed both ways; blob dbbench (`results/2026-11-02-vm-blob.md`: managed 0.55x C)
 - [x] Blob: zlib >16 KiB (16 KiB independent chunks; readable by native), blob readers bounded by max_open_files; forced GC universal/FIFO = parity (upstream leveled-only)
