@@ -56,7 +56,8 @@ public static class TtlValue
         if (ttlSeconds <= 0) return false; // Data is fresh if TTL is non-positive
         if (valueWithTimestamp.Length < TimestampLength) return false;
         // int32_t may overflow when timestamp_value + ttl: use int64.
-        long timestamp = GetTimestamp(valueWithTimestamp);
+        // int64_t timestamp_value = DecodeFixed32(...): the suffix is zero-extended here (unlike SanityCheckTimestamp).
+        long timestamp = Coding.DecodeFixed32(valueWithTimestamp[^TimestampLength..]);
         return timestamp + ttlSeconds < nowUnixSeconds;
     }
 }

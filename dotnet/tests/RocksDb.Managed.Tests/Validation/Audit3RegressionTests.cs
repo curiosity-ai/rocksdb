@@ -122,4 +122,16 @@ public sealed class Audit3RegressionTests
         e = Assert.ThrowsExactly<RocksDbException>(() => db.SetOptions([new("enable_blob_garbage_collection", "true")]));
         Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
     }
+
+    [TestMethod]
+    public void TtlIsStaleZeroExtendsTheTimestampSuffix()
+    {
+        // DBWithTTLImpl::IsStale: int64_t timestamp_value = DecodeFixed32(...) (unsigned, zero-extended). A suffix at or
+        // above 2^31 (writes after January 2038) is in the future, not stale; the port decoded it as a negative int32
+        // and compactions dropped such values.
+        byte[] v = new byte[3 + TtlValue.TimestampLength];
+        RocksDb.Managed.Util.Coding.EncodeFixed32(v.AsSpan(3), 0x80000000u);
+        Assert.IsFalse(TtlValue.IsStale(v, 10, 2_000_000_000L));
+        Assert.IsTrue(TtlValue.IsStale(v, 10, 0x80000000L + 11));
+    }
 }
