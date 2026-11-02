@@ -146,11 +146,13 @@ Write-amp: fill 3.42 native vs 3.24 managed; overwrite 4.12 vs 4.17.
 ## Phase 3 — Compat + performance
 Final completeness wave:
 - [x] Integrated BlobDB: blob file format/builder/reader/cache/GC, versions & MANIFEST, Get/MultiGet/iterators/merges, checkpoint/GetLiveFiles; blob files byte-identical to native; native↔managed both ways; blob dbbench (`results/2026-11-02-vm-blob.md`: managed 0.55x C)
-- [ ] Blob gaps: V2 entity blob columns, blob direct write, forced GC in universal/FIFO, zlib >16 KiB, max_open_files for blob readers
+- [x] Blob: zlib >16 KiB (16 KiB independent chunks; readable by native), blob readers bounded by max_open_files; forced GC universal/FIFO = parity (upstream leveled-only)
+- [ ] Blob gaps: V2 entity blob columns (native 11.12 never writes them), blob direct write
 - [x] Background errors: ErrorHandler (severity maps, soft/hard/fatal, auto-resume, retryable IO errors, new MANIFEST/WAL on recovery), `Resume()`, `EventListener`; BackupEngine + BackupEngineReadOnly (native-identical layout & meta; incremental backups across engines)
-- [ ] Backup/error gaps: SstFileManager (no-space auto recovery), atomic WAL-error recovery edits, exclude_files_callback, parallel copies; native BackupEngine writes empty meta files when hosted by .NET 11 (tests inconclusive there — investigate)
+- [ ] Backup/error gaps: SstFileManager (no-space auto recovery), atomic WAL-error recovery edits, exclude_files_callback, parallel copies; native-under-.NET-11 empty backup meta FIXED: librocksdb.so (NuGet) statically links libstdc++ but exports std:: symbols; the .NET 11 apphost doesn't load libstdc++.so.6 globally → std::bad_cast on numeric stream writes inside native. Tests/bench preload libstdc++ (`tests/Shared/NativeStdCxxPreload.cs`). NOTE: affects any rocksdb-sharp app hosted by a .NET 11 apphost
 - [x] User-defined timestamps (persisted mode): timestamped writes/WriteBatch (byte-identical), Get/MultiGet/iterators (+IterStartTs), filters on key w/o ts, ts min/max properties, full_history_ts_low GC + MANIFEST; compat both ways incl. blob values with timestamps; round-trip scenario
-- [ ] UDT gaps: persist_user_defined_timestamps=false, range deletions with timestamps (native DBs with timestamped range tombstones misread), UDT in transactions/WBWI/SstFileWriter, async timestamped Get uses sync path
+- [x] UDT range deletions (native timestamped range tombstones read correctly; flush/compaction/full_history_ts_low; fixed snapshot×timestamp point lookup), SstFileWriter with timestamps + ingestion
+- [ ] UDT gaps: persist_user_defined_timestamps=false, UDT in transactions/WBWI, async timestamped Get uses sync path
 - [x] Fixed flaky `PrefixSameAsStartMatchesModel` (forced bottommost compaction for a deterministic LSM shape)
 - [x] Perf #3: flush WAL-on 2.31x → 1.19x native (WAL writeback during switch), no large per-file allocations (59.6 → 5.5 B/put, no gen2 GCs), first-run AggressiveOptimization on per-entry paths; steady-state flush/compaction ≤ native; compaction-heavy config managed 0.62x native geomean (`results/2026-11-02-vm-perf3*.md`)
 - [ ] Compaction picking diverges from native under sustained writes (L5 grows to 9–10 files vs 4–6; write-amp 3.05–3.33 vs 2.96; more pending work at end) — verify picker inputs/timing vs 11.12
