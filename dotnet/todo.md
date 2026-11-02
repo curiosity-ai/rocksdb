@@ -101,7 +101,7 @@ P = perf + block cache wiring (Table/, Cache/, Memtable/, Util/).
 - [x] Single delete (read path)
 - [x] TTL value format + `TtlDatabase` (compatible with native OpenWithTtl)
 - [ ] Wire `TtlCompactionFilter` into compaction; TTL iterator wrapper
-- [ ] Bug: small WriteBufferSize with default ArenaBlockSize trips Debug.Assert in memtable ctor (sanitize like upstream)
+- [x] Bug: small WriteBufferSize with default ArenaBlockSize (fixed: default 0 → derived like upstream)
 - [x] GetLiveFilesMetadata
 - [x] GetUpdatesSince (`TransactionLogIterator`, `TailUpdatesAsync` signalled by write path, WAL archival, FragmentBufferedLogReader) — identical sequences/bytes to native both ways
 - [x] Checkpoint (hard links via `IFileSystem.LinkFile`), Disable/EnableFileDeletions, GetLiveFiles, GetSortedWalFiles, FlushWal/SyncWal
@@ -143,7 +143,8 @@ Write-amp: fill 3.42 native vs 3.24 managed; overwrite 4.12 vs 4.17.
 
 ## Phase 3 — Compat + performance
 Goal: finish implementation, validate vs C++ source, comprehensive tests (unit/integration/round-trip) and benchmarks (managed vs rocksdb-sharp vs pure C native).
-- [~] Source audit vs C++ (`docs/validation.md`) for formats/util/table/wal/options/memtable/cache/env/iterators (agent running)
+- [x] Source audit #1 vs C++ (`docs/validation.md`): ~90 files (formats/util/table/wal/options/memtable/iterators); fixed memtable range-tombstone publish race, ArenaBlockSize default (0 → derived), internal-key type validation; added db_iter_test vectors
+- [ ] Source audit #2: DB layer (DbImpl*, VersionSet/Version, Compaction/*, FlushJob, WriteThread, recovery, ingestion, checkpoint, secondary)
 - [~] Three-way benchmark suite: C benchmark on librocksdb (`bench/native-c`), extended dbbench runner, `bench/run-all.sh`, micro head-to-heads (agent running)
 - [~] `tests/RocksDb.Managed.RoundTrip`: crash-isolated managed↔native round trips (test exe re-invokes itself as a child for native/managed sides; captures crashes, hangs, unclean shutdown) (agent running)
 - [x] Full-DB compat: native writes DB → managed opens/reads/writes → native reopens & verifies (and reverse)
