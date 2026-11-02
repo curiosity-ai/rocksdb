@@ -554,7 +554,10 @@ internal sealed class CompactionIterator : IDisposable
             else
             {
                 // 1. new user key -OR- 2. different snapshot stripe
-                if (_rangeDelAgg.ShouldDelete(_currentKey.UserKey, _ikeySequence))
+                // With user-defined timestamps only keys below full_history_ts_low are considered for GC (the
+                // aggregator only considers tombstones at or below it).
+                if ((_tsSize == 0 || (FullHistoryTsLow is not null && _cmpWithHistoryTsLow < 0))
+                    && _rangeDelAgg.ShouldDelete(_currentKey.UserKey, _ikeySequence))
                 {
                     Stats.NumRecordDropHidden++;
                     Stats.NumRecordDropRangeDel++;

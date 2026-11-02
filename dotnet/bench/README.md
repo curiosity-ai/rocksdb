@@ -1,5 +1,8 @@
 # Benchmarks
 
+Reference for the benchmark runner. [docs/benchmarks.md](../docs/benchmarks.md) explains the methodology, how to
+read a report and the latest results.
+
 Three ways to measure RocksDb.Managed against native RocksDB:
 
 | leg | what | where |
@@ -29,8 +32,9 @@ After the matrix, `run-all.sh` runs one **compaction-heavy** configuration (labe
 compactions, the reads hit a multi-level LSM tree, and `stats` records the LSM shape and write amplification of every
 engine (knobs `COMPACTION_NUM`, `COMPACTION_ARGS`, `COMPACTION_BENCHMARKS`, ... in the header of `run-all.sh`). Results:
 `results/2026-11-02-vm-compaction.md`, then `-vm-perf2-compaction.md` and `-vm-perf3-compaction.md` after perf passes #2
-and #3 (`docs/perf.md`), all cold; with the warm-up: `-vm-warm-compaction.md` (cold counterpart from the same session:
-`-vm-cold-compaction.md`). Reduced matrix with the warm-up: `results/2026-11-02-vm-warm.md` (cold: `-vm-cold.md`).
+and #3, and `-vm-picker-compaction.md` after the compaction-picking parity fixes (`docs/perf.md`), all cold; with the
+warm-up: `-vm-warm-compaction.md` (alternated with cold runs: `-vm-cold-compaction.md`). Reduced matrix with the warm-up:
+`results/2026-11-02-vm-warm.md` (cold counterpart from the same session: `-vm-cold.md`).
 
 All engines run a **warm-up phase** before the measurement (default on, `WARMUP=false` for cold-process numbers; see
 "Warm-up" below), so the .NET engines are not measured while the JIT is still compiling and tiering up. Results before

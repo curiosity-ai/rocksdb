@@ -79,6 +79,12 @@ internal sealed partial class DbImpl
                 }
                 if (success) break;
                 if (!options.AllowBlockingFlush) ThrowHelper.InvalidArgument("External file requires flush");
+                if (cfd.TimestampSize > 0)
+                {
+                    // ExternalSstFileIngestionJob::NeedsFlush: no flush on behalf of a timestamped ingestion.
+                    ThrowHelper.InvalidArgument("Column family enables user-defined timestamps, please make sure the key range (without timestamp) " +
+                                                "of external file does not overlap with key range in the memtables.");
+                }
                 if (attempt >= 8) throw new RocksDbException(StatusCode.TryAgain, "Operation failed. Try again.: memtable keeps overlapping the ingested files");
                 await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.ExternalFileIngestion, synchronous, ct).ConfigureAwait(false);
             }

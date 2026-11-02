@@ -73,7 +73,6 @@ internal sealed class Compaction
         StartLevel = inputs[0].Level;
         OutputLevel = outputLevel;
         NumberLevels = vstorage.NumLevels;
-        MaxOutputFileSize = targetFileSize;
         TargetOutputFileSize = targetFileSize;
         MaxCompactionBytes = maxCompactionBytes;
         OutputPathId = outputPathId;
@@ -85,6 +84,11 @@ internal sealed class Compaction
         IsManual = isManual;
         GetBoundaryUserKeys(vstorage.Icmp, inputs, out _smallestUserKey, out _largestUserKey);
         BottommostLevel = IsBottommostLevelOf(outputLevel, vstorage, inputs);
+        // For the non-bottommost levels, it tries to build files matching the target file size, but not guaranteed:
+        // an output may grow to 2x the target size (the grandparent-boundary cuts of ShouldStopBefore normally end it
+        // between 50% and 90% of the target).
+        MaxOutputFileSize = BottommostLevel || grandparents.Count == 0 ? targetFileSize
+            : targetFileSize > ulong.MaxValue / 2 ? ulong.MaxValue : 2 * targetFileSize;
         IsFullCompaction = IsFullCompactionOf(vstorage, inputs);
         MarkFilesBeingCompacted(true);
     }

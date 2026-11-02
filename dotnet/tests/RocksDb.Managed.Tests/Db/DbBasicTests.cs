@@ -188,6 +188,55 @@ public sealed class DbBasicTests
         }
     }
 
+    /// <summary>
+    /// The flush drops versions hidden by a newer version of the same key in the same snapshot stripe (rule (A) of the
+    /// flush-time CompactionIterator), keeps one version per stripe, and keeps single deletes with their puts.
+    /// </summary>
+    [TestMethod]
+    public void FlushDropsVersionsHiddenInTheSameSnapshotStripe()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        db.Put(B("a"), B("1"));
+        db.Put(B("a"), B("2"));
+        using Snapshot snap = db.GetSnapshot();
+        db.Put(B("a"), B("3"));
+        db.Put(B("a"), B("4"));
+        db.Put(B("b"), B("1"));
+        db.Delete(B("b"));
+        db.Put(B("c"), B("1"));
+        db.Put(B("c"), B("2"));
+        db.Put(B("d"), B("1"));
+        db.SingleDelete(B("d"));
+        // A single delete hidden by a newer put is kept: dropping it would let the next single delete (which cancels
+        // the newer put) resurface the older put.
+        db.Put(B("e"), B("1"));
+        db.SingleDelete(B("e"));
+        db.Put(B("e"), B("2"));
+        db.Flush();
+
+        ulong entries = 0, deletions = 0;
+        foreach (RocksDb.Managed.Table.TableProperties p in db.GetPropertiesOfAllTables().Values)
+        {
+            entries += p.NumEntries;
+            deletions += p.NumDeletions;
+        }
+        // a@2 (visible to the snapshot), a@4, the deletion of b, c@2, d's put and single delete, all three entries of e.
+        Assert.AreEqual(9UL, entries);
+        Assert.AreEqual(3UL, deletions);
+        CollectionAssert.AreEqual(B("4"), db.Get(B("a")));
+        CollectionAssert.AreEqual(B("2"), db.Get(new ReadOptions { Snapshot = snap }, B("a")));
+        Assert.IsNull(db.Get(B("b")));
+        Assert.IsNull(db.Get(new ReadOptions { Snapshot = snap }, B("b")));
+        CollectionAssert.AreEqual(B("2"), db.Get(B("c")));
+        Assert.IsNull(db.Get(B("d")));
+        CollectionAssert.AreEqual(B("2"), db.Get(B("e")));
+        db.SingleDelete(B("e"));
+        db.Flush();
+        db.CompactRange();
+        Assert.IsNull(db.Get(B("e")));
+    }
+
     [TestMethod]
     public void AutomaticFlushOnFullMemtable()
     {

@@ -45,6 +45,9 @@ public sealed class RangeDelAggregator
     private readonly InternalKeyComparator _icmp;
     private readonly ulong _readSequence;
     private readonly ulong[]? _snapshots;
+    /// <summary>Timestamp upper bound of the visible tombstones (null = none): the read timestamp, or for compactions
+    /// full_history_ts_low (CompactionRangeDelAggregator ts_upper_bound_).</summary>
+    private readonly byte[]? _tsUpperBound;
     private Source[] _sources = new Source[4];
     private int _count;
 
@@ -56,11 +59,22 @@ public sealed class RangeDelAggregator
         _readSequence = readSequence;
     }
 
-    private RangeDelAggregator(InternalKeyComparator comparator, ulong[] snapshots)
+    /// <summary>
+    /// Read-path aggregator with a user-defined timestamp upper bound (ReadOptions::timestamp): tombstones with a
+    /// seqno &gt; <paramref name="readSequence"/> or a timestamp &gt; <paramref name="readTimestamp"/> are invisible.
+    /// </summary>
+    public RangeDelAggregator(InternalKeyComparator comparator, ulong readSequence, ReadOnlySpan<byte> readTimestamp)
+        : this(comparator, readSequence)
+    {
+        if (!readTimestamp.IsEmpty && comparator.UserComparator.TimestampSize != 0) _tsUpperBound = readTimestamp.ToArray();
+    }
+
+    private RangeDelAggregator(InternalKeyComparator comparator, ulong[] snapshots, byte[]? tsUpperBound)
     {
         _icmp = comparator;
         _readSequence = DbFormat.MaxSequenceNumber;
         _snapshots = snapshots;
+        _tsUpperBound = tsUpperBound;
     }
 
     /// <summary>
@@ -72,7 +86,20 @@ public sealed class RangeDelAggregator
         ArgumentNullException.ThrowIfNull(comparator);
         ulong[] s = snapshots.ToArray();
         Array.Sort(s);
-        return new RangeDelAggregator(comparator, s);
+        return new RangeDelAggregator(comparator, s, null);
+    }
+
+    /// <summary>
+    /// Compaction aggregator for a column family with user-defined timestamps: only tombstones whose timestamp is
+    /// &lt;= <paramref name="fullHistoryTsLow"/> delete keys (null = no bound). Keys covered by newer tombstones must
+    /// survive, a reader may use a timestamp between the tombstone and the key (CompactionRangeDelAggregator).
+    /// </summary>
+    public static RangeDelAggregator ForCompaction(InternalKeyComparator comparator, ReadOnlySpan<ulong> snapshots, byte[]? fullHistoryTsLow)
+    {
+        ArgumentNullException.ThrowIfNull(comparator);
+        ulong[] s = snapshots.ToArray();
+        Array.Sort(s);
+        return new RangeDelAggregator(comparator, s, comparator.UserComparator.TimestampSize != 0 ? fullHistoryTsLow : null);
     }
 
     public InternalKeyComparator Comparator => _icmp;
@@ -163,14 +190,8 @@ public sealed class RangeDelAggregator
             if (!InBounds(ref s, userKey, sequence)) continue;
             int f = Locate(ref s, userKey);
             if (f < 0) continue;
-            foreach (ulong t in s.List.GetSequences(f))
-            {
-                if (t <= upper)
-                {
-                    if (t > sequence) return true;
-                    break;
-                }
-            }
+            int k = s.List.VisibleIndex(f, upper, _tsUpperBound);
+            if (k >= 0 && s.List.GetSequences(f)[k] > sequence) return true;
         }
         return false;
     }
@@ -194,14 +215,8 @@ public sealed class RangeDelAggregator
             }
             int f = Locate(ref s, userKey);
             if (f < 0) continue;
-            foreach (ulong t in s.List.GetSequences(f))
-            {
-                if (t <= _readSequence)
-                {
-                    if (t > best) best = t;
-                    break;
-                }
-            }
+            int k = s.List.VisibleIndex(f, _readSequence, _tsUpperBound);
+            if (k >= 0 && s.List.GetSequences(f)[k] > best) best = s.List.GetSequences(f)[k];
         }
         return best;
     }
@@ -219,16 +234,7 @@ public sealed class RangeDelAggregator
             FragmentedRangeTombstoneList list = s.List;
             for (int f = 0; f < list.Count; f++)
             {
-                bool visible = false;
-                foreach (ulong t in list.GetSequences(f))
-                {
-                    if (t <= _readSequence)
-                    {
-                        visible = true;
-                        break;
-                    }
-                }
-                if (!visible) continue;
+                if (list.VisibleIndex(f, _readSequence, _tsUpperBound) < 0) continue;
                 ReadOnlySpan<byte> fs = list.GetStart(f), fe = list.GetEnd(f);
                 if (s.Smallest is not null && _icmp.CompareUserKey(fs, DbFormat.ExtractUserKey(s.Smallest)) < 0) fs = DbFormat.ExtractUserKey(s.Smallest);
                 bool feInclusive = false;

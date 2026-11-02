@@ -14,4 +14,8 @@
     <ProjectReference Include="..\..\src\RocksDb.Managed.Replication\RocksDb.Managed.Replication.csproj" />
     <ProjectReference Include="..\..\src\RocksDb.Managed.Replication.MagicOnion\RocksDb.Managed.Replication.MagicOnion.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- librocksdb under a .NET 11 apphost: see the file's remarks. -->
+    <Compile Include="..\Shared\NativeStdCxxPreload.cs" Link="NativeStdCxxPreload.cs" />
+  </ItemGroup>
 </Project>

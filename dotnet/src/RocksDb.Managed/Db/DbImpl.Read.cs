@@ -56,6 +56,7 @@ internal sealed partial class DbImpl
         // User-defined timestamps: the lookup key is key | read timestamp (validated here, after the SV reference).
         ReadOnlySpan<byte> ts = GetReadTimestamp(cfd, options);
         ctx.TimestampSize = cfd.TimestampSize;
+        ctx.ReadSequence = snapshot;
         Span<byte> scratch = stackalloc byte[LookupKey.StackBufferSize];
         var lkey = new LookupKey(key, snapshot, ts, scratch);
         try
@@ -140,8 +141,14 @@ internal sealed partial class DbImpl
         {
             if (rangeDels is not null)
             {
-                ulong cov = rangeDels.MaxCoveringTombstoneSeqnum(userKey, snapshot);
-                if (cov > ctx.MaxCoveringTombstoneSeq) ctx.MaxCoveringTombstoneSeq = cov;
+                // With user-defined timestamps the user key carries the read timestamp: it bounds the visible tombstones.
+                int tsSize = ctx.TimestampSize;
+                ulong cov = rangeDels.MaxCoveringTombstoneSeqnum(userKey, snapshot, tsSize == 0 ? default : userKey[^tsSize..], out ReadOnlySpan<byte> tombstoneTs);
+                if (cov > ctx.MaxCoveringTombstoneSeq)
+                {
+                    ctx.MaxCoveringTombstoneSeq = cov;
+                    if (tsSize != 0) ctx.SetTimestampFromRangeTombstone(tombstoneTs);
+                }
             }
             lease.Reader.Get(ikey, ref ctx, s_saveValue);
         }
