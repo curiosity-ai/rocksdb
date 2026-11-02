@@ -289,7 +289,8 @@ internal sealed partial class DbImpl
                 var inserter = new MemTableInserter(this, walNumber, ignoreMissingColumnFamilies: true) { Sequence = seq };
                 WriteBatch.Iterate(record, ref inserter);
                 _flushScheduler.Clear();
-                if (count > 0) last = Math.Max(last, seq + count - 1);
+                // The inserter's next sequence (not the header count): prepared sections consume no sequence numbers.
+                if (count > 0 && inserter.Sequence > seq) last = Math.Max(last, inserter.Sequence - 1);
             }
         }
         Versions.SetLastSequence(last);

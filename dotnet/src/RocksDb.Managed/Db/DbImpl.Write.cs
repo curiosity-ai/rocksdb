@@ -29,17 +29,31 @@ internal sealed partial class DbImpl
     /// Writes a batch (DBImpl::WriteImpl). With <paramref name="synchronous"/> the returned task is always complete:
     /// the caller blocks only while waiting for its turn, and performs the group's I/O itself when it leads.
     /// </summary>
+    public ValueTask WriteAsync(WriteOptions? options, WriteBatch batch, bool validateColumnFamilies, bool synchronous, CancellationToken cancellationToken) =>
+        WriteAsync(options, batch, validateColumnFamilies, txn: null, synchronous, cancellationToken);
+
+    /// <summary>
+    /// <see cref="WriteAsync(WriteOptions?, WriteBatch, bool, bool, CancellationToken)"/> with the transaction extras of
+    /// DBImpl::WriteImpl (write callback, disable_memtable, log_ref, log_used, WAL-only commit marker). See
+    /// <see cref="TransactionWriteContext"/>.
+    /// </summary>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    public async ValueTask WriteAsync(WriteOptions? options, WriteBatch batch, bool validateColumnFamilies, bool synchronous, CancellationToken cancellationToken)
+    internal async ValueTask WriteAsync(WriteOptions? options, WriteBatch batch, bool validateColumnFamilies, TransactionWriteContext? txn, bool synchronous,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(batch);
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
         if (options is { Sync: true, DisableWal: true }) ThrowHelper.InvalidArgument("Sync writes has to enable WAL.");
         if (batch.DataSize < WriteBatch.HeaderSize) ThrowHelper.Corruption("malformed WriteBatch (too small)");
-        if (validateColumnFamilies) ValidateColumnFamilies(batch, options?.IgnoreMissingColumnFamilies ?? false);
+        if (validateColumnFamilies)
+        {
+            ValidateColumnFamilies(batch, options?.IgnoreMissingColumnFamilies ?? false);
+            if (txn?.MemtableBatch is { } mb) ValidateColumnFamilies(mb, options?.IgnoreMissingColumnFamilies ?? false);
+        }
         WriteThread.Writer w = WriteThread.Rent(synchronous);
         w.Prepare(batch, options, synchronous);
+        w.Txn = txn;
         try
         {
             if (!_writeThread.JoinBatchGroup(w))
@@ -132,34 +146,72 @@ internal sealed partial class DbImpl
             ValueTask pre = PreprocessWriteAsync(leader.NoSlowdown, synchronous, cancellationToken);
             if (!pre.IsCompletedSuccessfully) await pre.ConfigureAwait(false);
 
+            // WriteCallbacks (WriteThread::Writer::CheckCallback) run once PreprocessWrite is done, before sequence
+            // allocation: a failed callback excludes its writer from the WAL record and the memtables.
             ulong total = 0;
             bool needSync = false;
+            int valid = 0;
+            WriteThread.Writer? firstValid = null;
             for (int i = 0; i < group.Count; i++)
             {
-                total += (uint)group[i].Batch!.Count;
-                needSync |= group[i].Sync;
+                WriteThread.Writer w = group[i];
+                TransactionWriteContext? t = w.Txn;
+                if (t?.Callback is { } cb)
+                {
+                    RocksDbException? err;
+                    try { err = cb.Check(this); }
+                    catch (RocksDbException e) { err = e; }
+                    if (err is not null)
+                    {
+                        w.Error = err;
+                        w.CallbackFailed = true;
+                        continue;
+                    }
+                }
+                valid++;
+                firstValid ??= w;
+                if (t is null || !t.DisableMemtable) total += (uint)(t?.MemtableBatch ?? w.Batch!).Count;
+                needSync |= w.Sync;
             }
             ulong first = Versions.AllocateSequence(total);
             ulong seq = first;
             for (int i = 0; i < group.Count; i++)
             {
-                WriteBatch b = group[i].Batch!;
+                WriteThread.Writer w = group[i];
+                if (w.CallbackFailed) continue;
+                TransactionWriteContext? t = w.Txn;
+                WriteBatch b = w.Batch!;
                 b.Sequence = seq;
-                seq += (uint)b.Count;
-            }
-            ulong last = seq - 1;
-
-            if (!leader.DisableWal)
-            {
-                ReadOnlyMemory<byte> record;
-                if (group.Count == 1)
+                if (t is not null)
                 {
-                    record = leader.Batch!.DataMemory;
+                    t.SequenceUsed = seq;
+                    if (t.MemtableBatch is { } mb) mb.Sequence = seq;
+                    if (t.DisableMemtable) continue; // a prepare consumes no sequence numbers
+                    seq += (uint)(t.MemtableBatch ?? b).Count;
                 }
                 else
                 {
-                    _groupBatch.SetContents(leader.Batch!.Data);
-                    for (int i = 1; i < group.Count; i++) WriteBatch.Append(_groupBatch, group[i].Batch!);
+                    seq += (uint)b.Count;
+                }
+            }
+            ulong last = seq - 1;
+
+            if (!leader.DisableWal && valid > 0)
+            {
+                ReadOnlyMemory<byte> record;
+                if (valid == 1)
+                {
+                    record = firstValid!.Batch!.DataMemory;
+                }
+                else
+                {
+                    _groupBatch.SetContents(firstValid!.Batch!.Data);
+                    for (int i = 0; i < group.Count; i++)
+                    {
+                        WriteThread.Writer w = group[i];
+                        if (w == firstValid || w.CallbackFailed) continue;
+                        WriteBatch.Append(_groupBatch, w.Batch!);
+                    }
                     record = _groupBatch.DataMemory;
                 }
                 try
@@ -193,6 +245,15 @@ internal sealed partial class DbImpl
                     SetBackgroundError(e);
                     throw;
                 }
+                for (int i = 0; i < group.Count; i++)
+                {
+                    // PreReleaseCallback of WriteCommittedTxn::PrepareInternal (MarkLogCallback) + log_used.
+                    if (group[i] is { CallbackFailed: false, Txn: { } t })
+                    {
+                        t.LogUsed = _logNumber;
+                        if (t.MarkLogContainingPrepSection) MarkLogAsContainingPrepSection(_logNumber);
+                    }
+                }
             }
             else if (total > 0)
             {
@@ -203,11 +264,16 @@ internal sealed partial class DbImpl
             for (int i = 0; i < group.Count; i++)
             {
                 WriteThread.Writer w = group[i];
-                inserter.Sequence = w.Batch!.Sequence;
+                if (w.CallbackFailed) continue;
+                TransactionWriteContext? t = w.Txn;
+                if (t is { DisableMemtable: true }) continue;
+                WriteBatch mb = t?.MemtableBatch ?? w.Batch!;
+                inserter.Sequence = mb.Sequence;
                 inserter.IgnoreMissingColumnFamilies = w.IgnoreMissingColumnFamilies;
+                inserter.LogRef = t?.LogRef ?? 0;
                 try
                 {
-                    WriteBatch.Iterate(w.Batch.Data, ref inserter);
+                    WriteBatch.Iterate(mb.Data, ref inserter);
                 }
                 catch (Exception e)
                 {
@@ -335,6 +401,7 @@ internal sealed partial class DbImpl
                 }
             }
             InstallSuperVersion(cfd);
+            TrimMemTableHistory(cfd);
             _maybeStalled = IsWriteStalled();
             EnqueueFlush(cfd);
             MaybeScheduleFlush();
@@ -429,18 +496,24 @@ internal sealed partial class DbImpl
         public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex) =>
             ThrowHelper.NotSupported("Blob files are not supported yet");
         public void LogData(ReadOnlySpan<byte> blob) { }
-        public void MarkBeginPrepare(bool unprepare) => ThrowHelper.NotSupported("Two-phase commit is not supported yet");
-        public void MarkEndPrepare(ReadOnlySpan<byte> xid) => ThrowHelper.NotSupported("Two-phase commit is not supported yet");
+        public void MarkBeginPrepare(bool unprepare) { }
+        public void MarkEndPrepare(ReadOnlySpan<byte> xid) { }
         public void MarkNoop(bool emptyBatch) { }
-        public void MarkCommit(ReadOnlySpan<byte> xid) => ThrowHelper.NotSupported("Two-phase commit is not supported yet");
+        public void MarkCommit(ReadOnlySpan<byte> xid) { }
         public void MarkCommitWithTimestamp(ReadOnlySpan<byte> xid, ReadOnlySpan<byte> commitTimestamp) =>
-            ThrowHelper.NotSupported("Two-phase commit is not supported yet");
-        public void MarkRollback(ReadOnlySpan<byte> xid) => ThrowHelper.NotSupported("Two-phase commit is not supported yet");
+            ThrowHelper.NotSupported("Commit timestamps (user-defined timestamps) are not supported yet");
+        public void MarkRollback(ReadOnlySpan<byte> xid) { }
     }
 
     /// <summary>
     /// Applies WriteBatch records to memtables. Port of MemTableInserter (db/write_batch.cc), sequential (not concurrent)
-    /// insertion, one sequence number per key.
+    /// insertion, one sequence number per key, write-after-commit (WriteCommitted) 2PC semantics:
+    /// <list type="bullet">
+    /// <item>Live writes (<c>logNumber == 0</c>) ignore the 2PC markers and insert the values.</item>
+    /// <item>Recovery rebuilds each prepared section into a recovered transaction (no memtable insert, no sequence
+    /// numbers consumed), applies it when its commit marker is replayed, and drops it on a rollback marker.</item>
+    /// <item><see cref="LogRef"/> makes the memtables keep the WAL holding the prepared section alive.</item>
+    /// </list>
     /// </summary>
     private struct MemTableInserter : IWriteBatchHandler
     {
@@ -448,6 +521,11 @@ internal sealed partial class DbImpl
         private readonly ulong _logNumber;
         public ulong Sequence;
         public bool IgnoreMissingColumnFamilies;
+        /// <summary>log_number_ref_: WAL with the prepared section of the data being inserted (0 = none).</summary>
+        public ulong LogRef;
+        // rebuilding_trx_ / rebuilding_trx_seq_ (recovery only).
+        private WriteBatch? _rebuilding;
+        private ulong _rebuildingSeq;
 
         public MemTableInserter(DbImpl db, ulong logNumber, bool ignoreMissingColumnFamilies)
         {
@@ -455,6 +533,9 @@ internal sealed partial class DbImpl
             _logNumber = logNumber;
             IgnoreMissingColumnFamilies = ignoreMissingColumnFamilies;
             Sequence = 0;
+            LogRef = 0;
+            _rebuilding = null;
+            _rebuildingSeq = 0;
         }
 
         public readonly bool Continue() => true;
@@ -469,16 +550,31 @@ internal sealed partial class DbImpl
                 // A duplicate key+seq can only come from replaying an already applied batch; ignore it like upstream's
                 // TryAgain handling for non-seq-per-batch writes.
                 mem.Add(Sequence, type, key, value);
+                if (LogRef != 0) mem.RefLogContainingPrepSection(LogRef);
                 if (mem.ShouldScheduleFlush && mem.MarkFlushScheduled()) _db._flushScheduler.Add(c);
             }
             Sequence++;
         }
 
-        public void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Add(columnFamilyId, EntryType.Value, key, value);
+        public void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            // optimize for non-recovery mode
+            if (_rebuilding is not null)
+            {
+                _rebuilding.Put(columnFamilyId, key, value);
+                return;
+            }
+            Add(columnFamilyId, EntryType.Value, key, value);
+        }
 
         [SkipLocalsInit]
         public void TimedPut(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong writeUnixTime)
         {
+            if (_rebuilding is not null)
+            {
+                _rebuilding.TimedPut(columnFamilyId, key, value, writeUnixTime);
+                return;
+            }
             // PackValueAndWriteTime: value | fixed64(write_unix_time), stored as kTypeValuePreferredSeqno.
             byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(value.Length + 8);
             try
@@ -496,22 +592,107 @@ internal sealed partial class DbImpl
         public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) =>
             ThrowHelper.NotSupported("PutEntity (wide columns) is not supported yet");
 
-        public void Delete(uint columnFamilyId, ReadOnlySpan<byte> key) => Add(columnFamilyId, EntryType.Deletion, key, default);
-        public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key) => Add(columnFamilyId, EntryType.SingleDeletion, key, default);
-        public void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) =>
+        public void Delete(uint columnFamilyId, ReadOnlySpan<byte> key)
+        {
+            if (_rebuilding is not null)
+            {
+                _rebuilding.Delete(columnFamilyId, key);
+                return;
+            }
+            Add(columnFamilyId, EntryType.Deletion, key, default);
+        }
+
+        public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key)
+        {
+            if (_rebuilding is not null)
+            {
+                _rebuilding.SingleDelete(columnFamilyId, key);
+                return;
+            }
+            Add(columnFamilyId, EntryType.SingleDeletion, key, default);
+        }
+
+        public void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey)
+        {
+            if (_rebuilding is not null)
+            {
+                _rebuilding.DeleteRange(columnFamilyId, beginKey, endKey);
+                return;
+            }
             Add(columnFamilyId, EntryType.RangeDeletion, beginKey, endKey);
-        public void Merge(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Add(columnFamilyId, EntryType.Merge, key, value);
+        }
+
+        public void Merge(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            if (_rebuilding is not null)
+            {
+                _rebuilding.Merge(columnFamilyId, key, value);
+                return;
+            }
+            Add(columnFamilyId, EntryType.Merge, key, value);
+        }
 
         public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex) =>
             ThrowHelper.NotSupported("Blob files are not supported yet");
 
         public readonly void LogData(ReadOnlySpan<byte> blob) { }
-        public readonly void MarkBeginPrepare(bool unprepare) => ThrowHelper.NotSupported("Two-phase commit is not supported yet");
-        public readonly void MarkEndPrepare(ReadOnlySpan<byte> xid) => ThrowHelper.NotSupported("Two-phase commit is not supported yet");
+
+        public void MarkBeginPrepare(bool unprepare)
+        {
+            if (_logNumber == 0) return;
+            // during recovery we rebuild a hollow transaction from all encountered prepare sections of the wal
+            if (!_db.Options.Allow2Pc) ThrowHelper.NotSupported("WAL contains prepared transactions. Open with TransactionDB::Open().");
+            if (unprepare) ThrowHelper.NotSupported("WAL contains WriteUnprepared transactions, which are not supported");
+            if (_rebuilding is not null) ThrowHelper.Corruption("WAL: nested begin-prepare marker");
+            _rebuilding = new WriteBatch();
+            _rebuildingSeq = Sequence;
+        }
+
+        public void MarkEndPrepare(ReadOnlySpan<byte> xid)
+        {
+            if (_logNumber == 0) return;
+            if (_rebuilding is null) ThrowHelper.Corruption("WAL: end-prepare marker without a begin-prepare marker");
+            _db.InsertRecoveredTransaction(_logNumber, xid, _rebuilding!, _rebuildingSeq);
+            _rebuilding = null;
+        }
+
         public readonly void MarkNoop(bool emptyBatch) { }
-        public readonly void MarkCommit(ReadOnlySpan<byte> xid) => ThrowHelper.NotSupported("Two-phase commit is not supported yet");
-        public readonly void MarkCommitWithTimestamp(ReadOnlySpan<byte> xid, ReadOnlySpan<byte> commitTimestamp) =>
-            ThrowHelper.NotSupported("Two-phase commit is not supported yet");
-        public readonly void MarkRollback(ReadOnlySpan<byte> xid) => ThrowHelper.NotSupported("Two-phase commit is not supported yet");
+
+        public void MarkCommit(ReadOnlySpan<byte> xid)
+        {
+            if (_logNumber == 0) return; // live writes: the prepared batch is inserted by the commit write itself
+            // in recovery when we encounter a commit marker we lookup this transaction in our set of rebuilt
+            // transactions and commit. The log containing the prepared section may have been released in the last
+            // incarnation because the data was flushed to L0.
+            RecoveredTransaction? trx = _db.GetRecoveredTransaction(xid);
+            if (trx is null) return;
+            // all inserts must reference this trx log number; CF log numbers prevent duplicate re-insertion.
+            LogRef = trx.LogNumber;
+            try
+            {
+                WriteBatch.Iterate(trx.Batch.Data, ref this);
+            }
+            finally
+            {
+                LogRef = 0;
+            }
+            _db.DeleteRecoveredTransaction(trx);
+        }
+
+        public readonly void MarkCommitWithTimestamp(ReadOnlySpan<byte> xid, ReadOnlySpan<byte> commitTimestamp)
+        {
+            if (_logNumber != 0 && _db.GetRecoveredTransaction(xid) is not null)
+            {
+                ThrowHelper.NotSupported("Commit timestamps (user-defined timestamps) are not supported yet");
+            }
+        }
+
+        public readonly void MarkRollback(ReadOnlySpan<byte> xid)
+        {
+            if (_logNumber == 0) return; // in non recovery we simply ignore this tag
+            // the log containing the transactions prep section may have been released in the previous incarnation
+            // because we knew it had been rolled back
+            if (_db.GetRecoveredTransaction(xid) is { } trx) _db.DeleteRecoveredTransaction(trx);
+        }
     }
 }
