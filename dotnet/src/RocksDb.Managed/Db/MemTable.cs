@@ -58,8 +58,9 @@ public sealed unsafe class MemTable : IDisposable
 
     // Range tombstone cache: rebuilt lazily when _rangeDelVersion moves (see GetFragmentedRangeTombstones).
     private int _rangeDelVersion;
-    private FragmentedRangeTombstoneList? _rangeDelCache;
-    private int _rangeDelCacheVersion = -1;
+    // (version, list) published together as one immutable object: reading the list and its version separately could
+    // pair a stale list with a newer version under a concurrent rebuild and miss a visible tombstone.
+    private RangeDelCacheEntry? _rangeDelCache;
     private readonly Lock _rangeDelLock = new();
 
     /// <param name="comparator">Internal key comparator (wrapping the column family's user comparator).</param>
@@ -335,13 +336,15 @@ public sealed unsafe class MemTable : IDisposable
     public FragmentedRangeTombstoneList GetFragmentedRangeTombstones()
     {
         int version = Volatile.Read(ref _rangeDelVersion);
-        FragmentedRangeTombstoneList? cache = Volatile.Read(ref _rangeDelCache);
-        if (cache is not null && Volatile.Read(ref _rangeDelCacheVersion) == version) return cache;
+        RangeDelCacheEntry? cache = Volatile.Read(ref _rangeDelCache);
+        if (cache is not null && cache.Version == version) return cache.List;
         lock (_rangeDelLock)
         {
             version = Volatile.Read(ref _rangeDelVersion);
-            if (_rangeDelCache is not null && _rangeDelCacheVersion == version) return _rangeDelCache;
-            // Every insert that incremented the version up to `version` is visible to this scan.
+            cache = _rangeDelCache;
+            if (cache is not null && cache.Version == version) return cache.List;
+            // Every insert that incremented the version up to `version` is visible to this scan (the version is
+            // bumped after the skiplist insert).
             var list = new List<FragmentedRangeTombstoneList.Tombstone>();
             MemTableIterator it = NewRangeTombstoneEntryIterator();
             for (it.SeekToFirst(); it.Valid; it.Next())
@@ -349,14 +352,12 @@ public sealed unsafe class MemTable : IDisposable
                 list.Add(new FragmentedRangeTombstoneList.Tombstone(it.UserKey.ToArray(), it.Value.ToArray(), it.Sequence));
             }
             FragmentedRangeTombstoneList built = FragmentedRangeTombstoneList.Build(_ucmp, list);
-            // Publish list before version so a reader that sees the new version also sees the list... readers check
-            // both under the same version read above, so a mismatch only causes a rebuild under the lock.
-            Volatile.Write(ref _rangeDelCacheVersion, -1);
-            Volatile.Write(ref _rangeDelCache, built);
-            Volatile.Write(ref _rangeDelCacheVersion, version);
+            Volatile.Write(ref _rangeDelCache, new RangeDelCacheEntry(version, built));
             return built;
         }
     }
+
+    private sealed record RangeDelCacheEntry(int Version, FragmentedRangeTombstoneList List);
 
     /// <summary>Iterator over point entries (internal keys). Allocation-free; valid while the memtable is alive.</summary>
     public MemTableIterator NewIterator() => new(_table);

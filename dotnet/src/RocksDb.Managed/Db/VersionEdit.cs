@@ -775,9 +775,7 @@ public sealed class VersionEdit
     public static bool IsValidInternalKey(ReadOnlySpan<byte> internalKey)
     {
         if (internalKey.Length < DbFormat.InternalKeyFooterSize) return false;
-        var t = (EntryType)internalKey[^DbFormat.InternalKeyFooterSize];
-        return t <= EntryType.Merge || t == EntryType.SingleDeletion || t == EntryType.BlobIndex || t == EntryType.DeletionWithTimestamp ||
-               t == EntryType.WideColumnEntity || t == EntryType.ValuePreferredSeqno || t == EntryType.RangeDeletion || t == EntryType.MaxValid;
+        return DbFormat.IsExtendedValueType((EntryType)internalKey[^DbFormat.InternalKeyFooterSize]);
     }
 
     public override string ToString()
