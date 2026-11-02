@@ -144,7 +144,13 @@ With compaction (1M ops, 16B/100B, 4MB write buffer, no compression, shared box)
 Write-amp: fill 3.42 native vs 3.24 managed; overwrite 4.12 vs 4.17.
 
 ## Phase 3 — Compat + performance
-Final completeness wave (agents running): BlobDB integrated blob files; user-defined timestamps; background error recovery + EventListener + BackupEngine; perf #3 flush/compaction throughput.
+Final completeness wave:
+- [x] Integrated BlobDB: blob file format/builder/reader/cache/GC, versions & MANIFEST, Get/MultiGet/iterators/merges, checkpoint/GetLiveFiles; blob files byte-identical to native; native↔managed both ways; blob dbbench (`results/2026-11-02-vm-blob.md`: managed 0.55x C)
+- [ ] Blob gaps: V2 entity blob columns, blob direct write, forced GC in universal/FIFO, zlib >16 KiB, max_open_files for blob readers
+- [x] Background errors: ErrorHandler (severity maps, soft/hard/fatal, auto-resume, retryable IO errors, new MANIFEST/WAL on recovery), `Resume()`, `EventListener`; BackupEngine + BackupEngineReadOnly (native-identical layout & meta; incremental backups across engines)
+- [ ] Backup/error gaps: SstFileManager (no-space auto recovery), atomic WAL-error recovery edits, exclude_files_callback, parallel copies; native BackupEngine writes empty meta files when hosted by .NET 11 (tests inconclusive there — investigate)
+- [~] User-defined timestamps (persisted mode): done in branch; its agent is resolving merge conflicts with the blob work
+- [~] Perf #3 flush/compaction throughput (agent running)
 - [x] Features: WriteBatchWithIndex (+BaseDeltaIterator; transactions now use it), SetOptions/SetDBOptions (+typed), custom comparators e2e (+MANIFEST comparator/num_levels validation), KeyMayExist/GetApproximateSizes/memtable stats/int+map properties/table properties, Statistics (all upstream tickers/histograms, native ToString), info LOG (+rotation), wide columns (PutEntity/GetEntity/iterator columns, merge/compaction) — all compat-tested vs native
 - [ ] Features gaps: compaction filters on entities, blob columns/attribute groups/MultiGetEntity, per-SuperVersion options snapshot, mutable block-based table options, KeyMayExist doing filter I/O on cache miss, cfstats interval/file-read histograms, per-level GET_HIT stats, WBWI MultiGetFromBatchAndDB
 - [ ] Flaky? `PrefixSeekTests.PrefixSameAsStartMatchesModel` failed once on net11.0 (sorted-run file count precondition); 10/10 reruns pass
