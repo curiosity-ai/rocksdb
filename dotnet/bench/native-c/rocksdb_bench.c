@@ -59,6 +59,11 @@ typedef struct {
   int block_size;
   const char* compression;  // none | snappy | lz4 | zstd
   double compression_ratio;
+  int64_t target_file_size_base;
+  int64_t max_bytes_for_level_base;
+  int level0_file_num_compaction_trigger;
+  bool disable_auto_compactions;
+  int max_background_jobs;
   bool use_existing_db;
   int64_t seed;
   const char* db;
@@ -84,6 +89,11 @@ static Flags FLAGS = {
     .block_size = 4096,
     .compression = "none",
     .compression_ratio = 0.5,
+    .target_file_size_base = 64 << 20,
+    .max_bytes_for_level_base = 256 << 20,
+    .level0_file_num_compaction_trigger = 4,
+    .disable_auto_compactions = false,
+    .max_background_jobs = 2,
     .use_existing_db = false,
     .seed = 301,
     .db = "/tmp/rocksdb-c-bench",
@@ -100,11 +110,15 @@ static void usage(void) {
           "10] [--write_buffer_size BYTES]\n"
           "  [--block_size 4096] [--compression none|snappy|lz4|zstd] "
           "[--compression_ratio 0.5]\n"
+          "  [--target_file_size_base BYTES] [--max_bytes_for_level_base BYTES] "
+          "[--level0_file_num_compaction_trigger 4]\n"
+          "  [--disable_auto_compactions] [--max_background_jobs 2]\n"
           "  [--use_existing_db] [--seed 301] [--db PATH] [--histogram 1]\n"
           "benchmarks: fillseq fillrandom overwrite fillsync readrandom "
           "readmissing readseq readreverse\n"
           "            seekrandom multireadrandom readwhilewriting "
-          "deleterandom flush compact\n");
+          "deleterandom flush compact\n"
+          "            waitforcompaction stats\n");
 }
 
 static bool parse_bool(const char* v) {
@@ -159,6 +173,16 @@ static void parse_flags(int argc, char** argv) {
       FLAGS.compression = value;
     else if (FLAG("compression_ratio"))
       FLAGS.compression_ratio = strtod(value, NULL);
+    else if (FLAG("target_file_size_base"))
+      FLAGS.target_file_size_base = strtoll(value, NULL, 10);
+    else if (FLAG("max_bytes_for_level_base"))
+      FLAGS.max_bytes_for_level_base = strtoll(value, NULL, 10);
+    else if (FLAG("level0_file_num_compaction_trigger"))
+      FLAGS.level0_file_num_compaction_trigger = atoi(value);
+    else if (FLAG("disable_auto_compactions"))
+      FLAGS.disable_auto_compactions = parse_bool(value);
+    else if (FLAG("max_background_jobs"))
+      FLAGS.max_background_jobs = atoi(value);
     else if (FLAG("use_existing_db")) FLAGS.use_existing_db = parse_bool(value);
     else if (FLAG("seed")) FLAGS.seed = strtoll(value, NULL, 10);
     else if (FLAG("db")) FLAGS.db = value;
@@ -374,6 +398,16 @@ static void build_options(void) {
                                   compression_from_name(FLAGS.compression));
   rocksdb_options_set_write_buffer_size(g_options,
                                         (size_t)FLAGS.write_buffer_size);
+  rocksdb_options_set_target_file_size_base(
+      g_options, (uint64_t)FLAGS.target_file_size_base);
+  rocksdb_options_set_max_bytes_for_level_base(
+      g_options, (uint64_t)FLAGS.max_bytes_for_level_base);
+  rocksdb_options_set_level0_file_num_compaction_trigger(
+      g_options, FLAGS.level0_file_num_compaction_trigger);
+  rocksdb_options_set_disable_auto_compactions(g_options,
+                                               FLAGS.disable_auto_compactions);
+  rocksdb_options_set_max_background_jobs(g_options,
+                                          FLAGS.max_background_jobs);
   rocksdb_options_set_block_based_table_factory(g_options, g_table_options);
 
   g_wo = rocksdb_writeoptions_create();
@@ -427,6 +461,8 @@ typedef enum {
   B_DELETERANDOM,
   B_FLUSH,
   B_COMPACT,
+  B_WAITFORCOMPACTION,
+  B_STATS,
   B_UNKNOWN
 } BenchId;
 
@@ -434,7 +470,7 @@ static const char* kBenchNames[] = {
     "fillseq",     "fillrandom",   "overwrite",       "fillsync",
     "readrandom",  "readmissing",  "readseq",         "readreverse",
     "seekrandom",  "multireadrandom", "readwhilewriting", "deleterandom",
-    "flush",       "compact"};
+    "flush",       "compact",      "waitforcompaction", "stats"};
 
 static BenchId bench_from_name(const char* n) {
   for (int i = 0; i < B_UNKNOWN; i++)
@@ -447,6 +483,11 @@ static inline uint64_t now_ns(void) {
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
+
+// User bytes (key + value) written by the fill/overwrite benchmarks and the
+// readwhilewriting writer since the DB was created; the denominator of the
+// write amplification printed by the stats benchmark.
+static int64_t g_user_bytes_written;
 
 typedef struct {
   BenchId bench;
@@ -799,6 +840,12 @@ static void run_threaded(BenchId b, int bench_index, const char* name) {
   if (b == B_READWHILEWRITING)
     snprintf(extra, sizeof(extra), "(writer: %lld puts)",
              (long long)atomic_load(&s.writer_ops));
+  if (b == B_FILLSEQ || b == B_FILLRANDOM || b == B_OVERWRITE ||
+      b == B_FILLSYNC)
+    g_user_bytes_written += bytes;
+  else if (b == B_READWHILEWRITING)
+    g_user_bytes_written += (int64_t)atomic_load(&s.writer_ops) *
+                            (FLAGS.key_size + FLAGS.value_size);
   report(name, ops, (double)(end - start) / 1e9, bytes, found, show_found,
          merged, extra);
   free(merged);
@@ -815,11 +862,59 @@ static void run_single(BenchId b, const char* name) {
     rocksdb_flush(g_db, fo, &err);
     rocksdb_flushoptions_destroy(fo);
     check(err, "flush");
-  } else {
+  } else if (b == B_COMPACT) {
     rocksdb_compact_range(g_db, NULL, 0, NULL, 0);
+  } else {
+    rocksdb_wait_for_compact_options_t* wo =
+        rocksdb_wait_for_compact_options_create();
+    rocksdb_wait_for_compact(g_db, wo, &err);
+    rocksdb_wait_for_compact_options_destroy(wo);
+    check(err, "wait_for_compact");
   }
   double seconds = (double)(now_ns() - t0) / 1e9;
   report(name, 1, seconds, 0, 0, false, NULL, "");
+}
+
+// The stats benchmark; same output as PrintStats in DbBenchRunner.cs.
+static void print_stats(void) {
+  char levels[256] = "";
+  size_t len = 0;
+  for (int l = 0; l < 7; l++) {
+    char prop[64];
+    snprintf(prop, sizeof(prop), "rocksdb.num-files-at-level%d", l);
+    char* v = rocksdb_property_value(g_db, prop);
+    len += (size_t)snprintf(levels + len, sizeof(levels) - len, "%s%s",
+                            l > 0 ? " " : "", v != NULL ? v : "?");
+    rocksdb_free(v);
+  }
+  printf("%-17s : files per level [%s]\n", "stats", levels);
+  double written = -1;
+  char* stats = rocksdb_property_value(g_db, "rocksdb.stats");
+  static const char kMarker[] = "Cumulative compaction: ";
+  const char* line = stats != NULL ? strstr(stats, kMarker) : NULL;
+  if (line != NULL) {
+    const char* nl = strchr(line, '\n');
+    int n = nl != NULL ? (int)(nl - line) : (int)strlen(line);
+    char* end = NULL;
+    double gb = strtod(line + sizeof(kMarker) - 1, &end);
+    if (end != NULL && strncmp(end, " GB write", 9) == 0)
+      written = gb * 1073741824.0;
+    printf("%.*s\n", n, line);
+  }
+  rocksdb_free(stats);
+  char* pending =
+      rocksdb_property_value(g_db, "rocksdb.estimate-pending-compaction-bytes");
+  int64_t user = g_user_bytes_written;
+  double amp = written >= 0 && user > 0 ? written / (double)user : 0;
+  if (written < 0) written = 0;
+  printf("%-17s : user %.1f MB, flush+compaction written %.1f MB, write-amp "
+         "%.2f, pending compaction %s bytes\n",
+         "stats", (double)user / 1048576.0, written / 1048576.0, amp,
+         pending != NULL ? pending : "?");
+  printf("STATS,%s,%s,%" PRId64 ",%.0f,%.2f,%s\n", kEngineName, levels, user,
+         written, amp, pending != NULL ? pending : "?");
+  rocksdb_free(pending);
+  fflush(stdout);
 }
 
 static void print_header(void) {
@@ -840,6 +935,13 @@ static void print_header(void) {
          FLAGS.bloom_bits, FLAGS.write_buffer_size, FLAGS.block_size,
          FLAGS.batch_size, FLAGS.multiget_size, FLAGS.seek_nexts,
          FLAGS.disable_wal, FLAGS.sync);
+  printf("Compaction:  target_file_size_base=%" PRId64
+         " max_bytes_for_level_base=%" PRId64
+         " level0_file_num_compaction_trigger=%d disable_auto_compactions=%d "
+         "max_background_jobs=%d\n",
+         FLAGS.target_file_size_base, FLAGS.max_bytes_for_level_base,
+         FLAGS.level0_file_num_compaction_trigger,
+         FLAGS.disable_auto_compactions, FLAGS.max_background_jobs);
   printf("DB path:     %s\n", FLAGS.db);
   printf("Kernel:      %s %s\n", u.sysname, u.release);
   printf("------------------------------------------------\n");
@@ -864,8 +966,13 @@ int main(int argc, char** argv) {
     }
     bool fresh = !FLAGS.use_existing_db &&
                  (b == B_FILLSEQ || b == B_FILLRANDOM || b == B_FILLSYNC);
-    if (g_db == NULL || fresh) open_db(fresh);
-    if (b == B_FLUSH || b == B_COMPACT) run_single(b, name);
+    if (g_db == NULL || fresh) {
+      open_db(fresh);
+      if (fresh) g_user_bytes_written = 0;
+    }
+    if (b == B_STATS) print_stats();
+    else if (b == B_FLUSH || b == B_COMPACT || b == B_WAITFORCOMPACTION)
+      run_single(b, name);
     else run_threaded(b, index, name);
   }
   free(list);

@@ -8,7 +8,8 @@ namespace RocksDb.Managed.Benchmarks.DbBench;
 /// <summary>
 /// Three-way comparison driver.
 /// <para><c>compare</c>: runs one dbbench configuration on several engines (each in its own process, on a fresh DB
-/// directory under --db_base) and appends their RESULT lines to a CSV:</para>
+/// directory under --db_base) and appends their RESULT lines to a CSV, and the STATS lines of the <c>stats</c> benchmark
+/// (LSM shape, write amplification) to the companion <c>&lt;csv&gt;.lsm.csv</c>:</para>
 /// <code>
 /// RocksDb.Managed.Benchmarks compare --engines c-native,rocksdb-sharp,managed,managed-async --db_base /tmp/bench \
 ///     --csv results.csv [--label X] -- --benchmarks fillseq,readrandom --num 1000000 --value_size 100 --threads 4
@@ -22,6 +23,11 @@ public static class CompareRunner
 {
     public const string CsvHeader =
         "label,engine,benchmark,num,value_size,threads,compression,ops,seconds,micros_per_op,ops_per_sec,mb_per_sec,p50_us,p99_us,p999_us,found,alloc_b_per_op,gc0,gc1,gc2";
+
+    public const string LsmCsvHeader = "label,engine,num,value_size,threads,compression,files_per_level,user_bytes,written_bytes,write_amp,pending_compaction_bytes";
+
+    /// <summary>The companion CSV holding STATS rows: results.csv -> results.lsm.csv.</summary>
+    public static string LsmCsvPath(string csv) => Path.ChangeExtension(csv, null) + ".lsm.csv";
 
     public static readonly string[] DefaultEngines = ["c-native", "rocksdb-sharp", "managed", "managed-async"];
 
@@ -57,13 +63,14 @@ public static class CompareRunner
         label ??= "";
 
         Directory.CreateDirectory(dbBase);
-        StreamWriter? writer = null;
+        StreamWriter? writer = null, lsmWriter = null;
         if (csv is not null)
         {
             bool exists = File.Exists(csv) && new FileInfo(csv).Length > 0;
             writer = new StreamWriter(csv, append: true);
             if (!exists) writer.WriteLine(CsvHeader);
         }
+        string context = label + "," + flags.Num + "," + flags.ValueSize + "," + flags.Threads + "," + flags.Options.Compression;
         int failures = 0;
         try
         {
@@ -102,6 +109,25 @@ public static class CompareRunner
                             writer.Flush();
                         }
                     }
+                    else if (line.StartsWith("STATS,", StringComparison.Ordinal))
+                    {
+                        // STATS,engine,files_per_level,user_bytes,written_bytes,write_amp,pending
+                        Console.WriteLine(line);
+                        if (csv is not null)
+                        {
+                            if (lsmWriter is null)
+                            {
+                                string lsm = LsmCsvPath(csv);
+                                bool lsmExists = File.Exists(lsm) && new FileInfo(lsm).Length > 0;
+                                lsmWriter = new StreamWriter(lsm, append: true);
+                                if (!lsmExists) lsmWriter.WriteLine(LsmCsvHeader);
+                            }
+                            string[] c = line.Split(',');
+                            int comma = context.IndexOf(',');
+                            lsmWriter.WriteLine(context[..comma] + "," + c[1] + context[comma..] + "," + string.Join(',', c, 2, c.Length - 2));
+                            lsmWriter.Flush();
+                        }
+                    }
                     else
                     {
                         Console.WriteLine(line);
@@ -119,6 +145,7 @@ public static class CompareRunner
         finally
         {
             writer?.Dispose();
+            lsmWriter?.Dispose();
         }
         return failures == 0 ? 0 : 3;
     }
@@ -228,6 +255,7 @@ public static class CompareRunner
 
         // Summary: geometric mean of ratios vs c-native per configuration.
         md.AppendLine("## Summary (geometric mean of µs/op ratio vs c-native over the benchmarks of each configuration)").AppendLine();
+        md.AppendLine("`waitforcompaction` is left out: its time is the background work that happened to be left over, not the speed of an operation.").AppendLine();
         md.Append("| configuration |");
         foreach (string e in engines) if (e != "c-native") md.Append(' ').Append(e).Append(" / c-native |");
         md.AppendLine();
@@ -244,6 +272,7 @@ public static class CompareRunner
                 int count = 0;
                 foreach (string b in benchOrder)
                 {
+                    if (b == "waitforcompaction") continue;
                     Row? c = Find(rows, cfg, "c-native", b), x = Find(rows, cfg, e, b);
                     if (c is { Available: true } && x is { Available: true } && c.Micros > 0 && x.Micros > 0)
                     {
@@ -303,12 +332,43 @@ public static class CompareRunner
             md.AppendLine();
         }
 
+        var lsmFiles = new List<string>();
+        foreach (string csv in csvs) if (File.Exists(LsmCsvPath(csv))) lsmFiles.Add(LsmCsvPath(csv));
+        if (lsmFiles.Count > 0) AppendLsm(md, lsmFiles);
+
         md.Append("Raw data: ");
         foreach (string c in csvs) md.Append('`').Append(Path.GetFileName(c)).Append("` ");
+        foreach (string c in lsmFiles) md.Append('`').Append(Path.GetFileName(c)).Append("` ");
         md.AppendLine();
         if (output is null) Console.Write(md.ToString());
         else File.WriteAllText(output, md.ToString());
         return 0;
+    }
+
+    /// <summary>"LSM shape and write amplification" section from the STATS rows of the <c>stats</c> benchmark.</summary>
+    private static void AppendLsm(StringBuilder md, List<string> lsmFiles)
+    {
+        var ci = CultureInfo.InvariantCulture;
+        md.AppendLine("## LSM shape and write amplification (`stats` benchmark)").AppendLine();
+        md.AppendLine("files per level = rocksdb.num-files-at-level0..6; written = flush + compaction output bytes from the "
+            + "\"Cumulative compaction: X GB write\" line of rocksdb.stats (0.01 GB resolution); user = key + value bytes written by the "
+            + "benchmarks since the DB was created; write-amp = written / user (WAL not included).").AppendLine();
+        md.AppendLine("| configuration | engine | files per level (L0..L6) | user MB | written MB | write-amp | pending compaction bytes |");
+        md.AppendLine("|---|---|---|---:|---:|---:|---:|");
+        foreach (string file in lsmFiles)
+        {
+            foreach (string line in File.ReadLines(file))
+            {
+                if (line.Length == 0 || line.StartsWith("label,", StringComparison.Ordinal)) continue;
+                string[] c = line.Split(',');
+                if (c.Length < 11) continue;
+                var cfg = (c[0], L(c[2]), (int)L(c[3]), (int)L(c[4]), c[5]);
+                md.Append("| ").Append(ConfigName(cfg)).Append(" | ").Append(c[1]).Append(" | `").Append(c[6]).Append("` | ")
+                  .Append((D(c[7]) / 1048576.0).ToString("F1", ci)).Append(" | ").Append((D(c[8]) / 1048576.0).ToString("F1", ci)).Append(" | ")
+                  .Append(c[9]).Append(" | ").Append(c[10]).AppendLine(" |");
+            }
+        }
+        md.AppendLine();
     }
 
     private static string ConfigName((string Label, long Num, int ValueSize, int Threads, string Compression) c) =>

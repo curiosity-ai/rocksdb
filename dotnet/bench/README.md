@@ -19,12 +19,21 @@ All commands below run from `dotnet/` with `export PATH=/root/.dotnet:$PATH DOTN
 bench/run-all.sh
 # smaller / custom matrix:
 NUM=200000 READS=100000 NUM_LARGE=50000 THREADS_LIST="1 4" COMPRESSIONS="none lz4" VALUE_SIZES="100 1024" bench/run-all.sh
+# only the compaction-heavy configuration:
+RUN_MATRIX=0 NUM=500000 ENGINES=c-native,rocksdb-sharp,managed bench/run-all.sh
 ```
+
+After the matrix, `run-all.sh` runs one **compaction-heavy** configuration (label `compaction`, `RUN_COMPACTION=0` to skip):
+4 MiB write buffer and target file size, 16 MiB `max_bytes_for_level_base`, benchmarks
+`fillrandom,overwrite,waitforcompaction,stats,readrandom,seekrandom`, so the fills run against background flushes and
+compactions, the reads hit a multi-level LSM tree, and `stats` records the LSM shape and write amplification of every
+engine (knobs `COMPACTION_NUM`, `COMPACTION_ARGS`, `COMPACTION_BENCHMARKS`, ... in the header of `run-all.sh`). Results:
+`results/2026-11-02-vm-compaction.md`.
 
 Builds the benchmark project (Release) and `native-c`, runs every configuration on every engine (each engine in its
 own process on a fresh DB directory under `DB_BASE`, deleted afterwards), and writes
 `bench/results/<date>-<host>.md` (summary + per-configuration tables with µs/op, ratios vs c-native, p99 and managed
-allocations, machine info) and the raw `.csv`. See the header of `run-all.sh` for all knobs (`ENGINES`, `BENCHMARKS`,
+allocations, LSM shape / write amplification, machine info), the raw `.csv` and the `stats` rows in `.lsm.csv`. See the header of `run-all.sh` for all knobs (`ENGINES`, `BENCHMARKS`,
 `EXTRA_ARGS`, `TFM`, ...).
 
 The two building blocks can also be used directly:
@@ -51,15 +60,31 @@ bench/native-c/rocksdb_bench --benchmarks fillrandom,readrandom --num 1000000   
 Benchmarks: `fillseq`, `fillrandom`, `overwrite`, `fillsync` (num/1000 synced puts), `readrandom`, `readmissing`,
 `readseq`, `readreverse`, `seekrandom` (Seek + `--seek_nexts` Next), `multireadrandom` (batched MultiGet of
 `--multiget_size` keys), `readwhilewriting` (`--threads` readers + 1 writer), `deleterandom`, `flush`, `compact`
-(full-range CompactRange; reported as `n/a` while the managed engine has no compaction).
+(full-range CompactRange), `waitforcompaction` (DB::WaitForCompact with default options: `rocksdb_wait_for_compact` in C and
+rocksdb-sharp, `WaitForCompact` in managed), `stats` (see below).
 
 Flags (same for all engines): `--num`, `--reads` (default num), `--key_size` (16), `--value_size` (100), `--threads`,
 `--batch_size` (puts per WriteBatch in fill benchmarks, default 1 = Put), `--multiget_size` (16), `--seek_nexts` (10),
 `--disable_wal`, `--sync`, `--cache_size` (8 MiB), `--cache_type` (lru|hyperclock), `--bloom_bits` (10),
 `--write_buffer_size` (64 MiB), `--block_size` (4096), `--compression` (none|snappy|lz4|zstd),
-`--compression_ratio` (0.5), `--use_existing_db`, `--seed` (301), `--db`, `--histogram` (1). `--async` (managed only)
-runs each worker as a task over `PutAsync`/`TryGetAsync`/`DeleteAsync`/`WriteAsync` and the async iterator
-(`multireadrandom` stays synchronous: there is no `MultiGetAsync`).
+`--compression_ratio` (0.5), `--target_file_size_base` (64 MiB), `--max_bytes_for_level_base` (256 MiB),
+`--level0_file_num_compaction_trigger` (4), `--disable_auto_compactions`, `--max_background_jobs` (2), `--use_existing_db`,
+`--seed` (301), `--db`, `--histogram` (1). `--async` (managed only) runs each worker as a task over
+`PutAsync`/`TryGetAsync`/`DeleteAsync`/`WriteAsync` and the async iterator, and `flush`/`compact`/`waitforcompaction` over
+`FlushAsync`/`CompactRangeAsync`/`WaitForCompactAsync` (`multireadrandom` stays synchronous: there is no `MultiGetAsync`).
+
+`stats` prints, for every engine through `GetProperty` (`rocksdb_property_value` in C):
+
+```
+stats             : files per level [3 0 0 0 0 4 15]            rocksdb.num-files-at-level0..6
+Cumulative compaction: 0.32 GB write, ...                       verbatim from rocksdb.stats (flush + compaction output)
+stats             : user 110.6 MB, flush+compaction written 327.7 MB, write-amp 2.96, pending compaction 0 bytes
+STATS,c-native,3 0 0 0 0 4 15,116000000,343597384,2.96,0        machine-readable (compare -> <csv>.lsm.csv)
+```
+
+`user` = key + value bytes written by `fillseq`/`fillrandom`/`overwrite`/`fillsync` and the `readwhilewriting` writer
+since the DB was created; write-amp = flush + compaction bytes written / user bytes (the WAL is not counted). The written
+bytes come from the "Cumulative compaction: X GB write" line, i.e. have a resolution of 0.01 GB.
 
 Equivalence guarantees (see `DbBench/Workload.cs` and `native-c/rocksdb_bench.c`, which must stay in sync):
 
