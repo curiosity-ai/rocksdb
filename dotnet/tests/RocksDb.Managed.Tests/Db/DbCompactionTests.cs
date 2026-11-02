@@ -244,6 +244,83 @@ public sealed class DbCompactionTests
     [TestMethod]
     public void RandomizedModelLeveledNoMergeOperator() => RunRandomizedModel(777, withMerge: false, CompactionStyle.Level);
 
+    [TestMethod]
+    public void RandomizedModelUniversal()
+    {
+        RunRandomizedModel(Environment.TickCount & 0x7fffffff, withMerge: true, CompactionStyle.Universal);
+        RunRandomizedModel(99, withMerge: true, CompactionStyle.Universal);
+    }
+
+    [TestMethod]
+    public void UniversalCompactionBoundsSortedRuns()
+    {
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cfo = SmallCf();
+        cfo.CompactionStyle = CompactionStyle.Universal;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+        var rnd = new Random(5);
+        var model = new Dictionary<int, int>();
+        for (int i = 0; i < 20000; i++)
+        {
+            int k = rnd.Next(4000);
+            db.Put(Key(k), Val(k, i));
+            model[k] = i;
+        }
+        db.WaitForCompact();
+        int[] files = FilesPerLevel(db);
+        int runs = files[0];
+        for (int l = 1; l < 7; l++) runs += files[l] > 0 ? 1 : 0;
+        Assert.IsTrue(runs <= cfo.Level0FileNumCompactionTrigger, "sorted runs: " + string.Join(",", files));
+        foreach ((int k, int round) in model) CollectionAssert.AreEqual(Val(k, round), db.Get(Key(k)));
+        db.CompactRange();
+        files = FilesPerLevel(db);
+        for (int l = 0; l < 6; l++) Assert.AreEqual(0, files[l], string.Join(",", files));
+        foreach ((int k, int round) in model) CollectionAssert.AreEqual(Val(k, round), db.Get(Key(k)));
+    }
+
+    [TestMethod]
+    public void FifoCompactionDeletesOldestFiles()
+    {
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cfo = SmallCf();
+        cfo.CompactionStyle = CompactionStyle.Fifo;
+        cfo.CompactionOptionsFifo = new CompactionOptionsFifo { MaxTableFilesSize = 200 * 1024 };
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+        for (int round = 0; round < 20; round++)
+        {
+            for (int i = 0; i < 300; i++) db.Put(Key(round * 1000 + i), Val(i, round));
+            db.Flush();
+            db.WaitForCompact();
+        }
+        ulong total = ulong.Parse(db.GetProperty("rocksdb.total-sst-files-size")!, System.Globalization.CultureInfo.InvariantCulture);
+        Assert.IsTrue(total <= 200 * 1024, "total " + total);
+        // The newest data survives, the oldest was dropped.
+        for (int i = 0; i < 300; i++) CollectionAssert.AreEqual(Val(i, 19), db.Get(Key(19 * 1000 + i)));
+        Assert.IsNull(db.Get(Key(0)));
+        foreach (LiveFileMetadata f in db.GetLiveFilesMetadata()) Assert.AreEqual(0, f.Level);
+    }
+
+    [TestMethod]
+    public void FifoIntraL0CompactionReducesFileCount()
+    {
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cfo = SmallCf();
+        cfo.CompactionStyle = CompactionStyle.Fifo;
+        cfo.CompactionOptionsFifo = new CompactionOptionsFifo { MaxTableFilesSize = 64UL << 20, AllowCompaction = true };
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+        for (int round = 0; round < 12; round++)
+        {
+            for (int i = 0; i < 20; i++) db.Put(Key(round * 1000 + i), Val(i, round));
+            db.Flush();
+            db.WaitForCompact();
+        }
+        Assert.IsTrue(FilesPerLevel(db)[0] < 12, "L0 files " + FilesPerLevel(db)[0]);
+        for (int round = 0; round < 12; round++)
+        {
+            for (int i = 0; i < 20; i++) CollectionAssert.AreEqual(Val(i, round), db.Get(Key(round * 1000 + i)));
+        }
+    }
+
     // ---------------------------------------------------------------------------------------------------------
     // deterministic cases
 
