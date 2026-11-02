@@ -217,7 +217,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
         cfd.Mem.Ref();
         cfd.Current.Ref();
-        var sv = new SuperVersion(cfd.Mem, imm, cfd.Current, ++_superVersionNumber);
+        var sv = new SuperVersion(cfd.Mem, imm, cfd.Current, ++_superVersionNumber, cfd.OptionsSnapshot);
         SuperVersion? old = cfd.SuperOrNull();
         cfd.SetSuper(sv);
         if (old is not null && old.Unref()) CleanupSuperVersion(old);

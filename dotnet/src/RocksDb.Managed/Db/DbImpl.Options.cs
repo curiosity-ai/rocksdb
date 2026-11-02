@@ -10,9 +10,12 @@ namespace RocksDb.Managed.Db;
 /// Changes are validated on a copy of the current options (including the same sanitization as at open), then copied
 /// into the live options object under the DB mutex, the derived state is refreshed (memtable size, compaction score,
 /// write stall, background job limits, delayed write rate, stats dump period), a new super version is installed,
-/// pending flushes/compactions are scheduled and a new OPTIONS file is written. Known deviation: upstream readers take
-/// an immutable MutableCFOptions snapshot from the super version; managed readers read the live options object, so a
-/// concurrent reader may briefly observe a mix of old and new values of different options.
+/// pending flushes/compactions are scheduled and a new OPTIONS file is written. Every super version carries an
+/// immutable snapshot of the options (SuperVersion::mutable_cf_options) that readers use. Block-based table options that
+/// only affect how new tables are built can be changed too ("table_factory.block_size", or
+/// "block_based_table_factory" = "{block_size=...;...}"; TableFactoryParseFn / CloneTableFactoryForOptionsUpdate in
+/// options/cf_options.cc); they take effect for the next flush or compaction output. Known deviation: background jobs
+/// read the live options object (changed under the DB mutex), not a copy taken when the job starts.
 /// </para>
 /// </summary>
 internal sealed partial class DbImpl
@@ -45,6 +48,76 @@ internal sealed partial class DbImpl
         "max_manifest_file_size", "manifest_preallocation_size",
     };
 
+    /// <summary>
+    /// Block-based table options SetOptions can change: the ones that only affect how new tables are built (readers,
+    /// caches and filters are configured when a column family is created). Upstream clones the table factory for any
+    /// field; the others are refused here ("Option not changeable").
+    /// </summary>
+    internal static readonly HashSet<string> MutableTableOptionNames = new(StringComparer.Ordinal)
+    {
+        "block_size", "block_size_deviation", "block_restart_interval", "index_block_restart_interval", "metadata_block_size",
+        "format_version", "checksum", "data_block_index_type", "data_block_hash_table_util_ratio", "optimize_filters_for_memory",
+        "detect_filter_construct_corruption", "block_align", "super_block_alignment_size", "super_block_alignment_space_overhead_ratio",
+        "separate_key_value_in_data_block", "uniform_cv_threshold", "enable_index_compression", "use_delta_encoding", "index_shortening",
+        "optimize_key_common_prefix", "verify_compression",
+    };
+
+    /// <summary>
+    /// Applies a table factory option of SetOptions (TableFactoryParseFn): "table_factory.NAME" /
+    /// "block_based_table_factory.NAME" set one field, "block_based_table_factory" a "{a=b;c=d}" list. Returns false when
+    /// <paramref name="name"/> is not a table factory option.
+    /// </summary>
+    private static bool TrySetTableOption(ColumnFamilyOptions candidate, string name, string value)
+    {
+        const string tablePrefix = "table_factory.";
+        const string blockBasedPrefix = "block_based_table_factory.";
+        if (name == "table_factory")
+        {
+            if (value != candidate.GetOption("table_factory")) ThrowHelper.InvalidArgument("Option not changeable: table_factory");
+            return true;
+        }
+        if (name == "block_based_table_factory")
+        {
+            string body = value.Trim();
+            if (body.StartsWith('{') && body.EndsWith('}')) body = body[1..^1];
+            foreach (string part in body.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                int eq = part.IndexOf('=', StringComparison.Ordinal);
+                if (eq <= 0) ThrowHelper.InvalidArgument("Error parsing block_based_table_factory: " + value);
+                SetTableOption(candidate.TableOptions, part[..eq].Trim(), part[(eq + 1)..].Trim());
+            }
+            return true;
+        }
+        if (name.StartsWith(tablePrefix, StringComparison.Ordinal))
+        {
+            SetTableOption(candidate.TableOptions, name[tablePrefix.Length..], value);
+            return true;
+        }
+        if (name.StartsWith(blockBasedPrefix, StringComparison.Ordinal))
+        {
+            SetTableOption(candidate.TableOptions, name[blockBasedPrefix.Length..], value);
+            return true;
+        }
+        return false;
+    }
+
+    private static void SetTableOption(BlockBasedTableOptions options, string name, string value)
+    {
+        if (!MutableTableOptionNames.Contains(name))
+        {
+            if (options.GetOption(name) is null) ThrowHelper.InvalidArgument("Unrecognized option: table_factory." + name);
+            ThrowHelper.InvalidArgument("Option not changeable: table_factory." + name);
+        }
+        try
+        {
+            options.SetOption(name, value, preserveUnknown: false);
+        }
+        catch (Exception e) when (e is FormatException or ArgumentException or OverflowException)
+        {
+            throw RocksDbException.InvalidArgument("Error parsing table_factory." + name + ": " + e.Message);
+        }
+    }
+
     private readonly SemaphoreSlim _setOptionsLock = new(1, 1);
 
     /// <summary>
@@ -67,6 +140,7 @@ internal sealed partial class DbImpl
         ColumnFamilyOptions candidate = cfd.Options.Clone();
         foreach (KeyValuePair<string, string> kv in list)
         {
+            if (TrySetTableOption(candidate, kv.Key, kv.Value)) continue;
             if (!MutableCfOptionNames.Contains(kv.Key))
             {
                 if (candidate.GetOption(kv.Key) is null) ThrowHelper.InvalidArgument("Unrecognized option: " + kv.Key);
@@ -106,6 +180,12 @@ internal sealed partial class DbImpl
             candidate.SetOption(kv.Key, kv.Value, preserveUnknown: false);
             changed.Add(kv);
         }
+        foreach (KeyValuePair<string, string> kv in newOptions.TableOptions.ToOptionsList())
+        {
+            if (current.TableOptions.GetOption(kv.Key) == kv.Value) continue;
+            SetTableOption(candidate.TableOptions, kv.Key, kv.Value);
+            changed.Add(new KeyValuePair<string, string>("table_factory." + kv.Key, kv.Value));
+        }
         if (newOptions.PrefixExtractor is not null && !ReferenceEquals(newOptions.PrefixExtractor, current.PrefixExtractor)
             && newOptions.PrefixExtractor.AsString() == current.PrefixExtractor?.AsString())
         {
@@ -135,6 +215,10 @@ internal sealed partial class DbImpl
                     if (v is not null && v != live.GetOption(name)) live.SetOption(name, v, preserveUnknown: false);
                 }
                 live.PrefixExtractor = candidate.PrefixExtractor;
+                // The table options are replaced, not modified: running flushes and compactions keep the settings they
+                // started with (CloneTableFactoryForOptionsUpdate).
+                live.TableOptions = candidate.TableOptions.Clone();
+                cfd.OnOptionsChanged();
                 // Derived state (MutableCFOptions::RefreshDerivedOptions, InstallSuperVersionForConfigChange).
                 cfd.MemOptions.WriteBufferSize = (long)Math.Min(live.WriteBufferSize, (ulong)long.MaxValue);
                 cfd.MemOptions.ArenaBlockSize = (int)Math.Min(live.ArenaBlockSize, int.MaxValue / 2);
