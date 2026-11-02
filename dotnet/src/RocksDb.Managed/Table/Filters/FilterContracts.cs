@@ -25,6 +25,19 @@ public abstract class FilterPolicy
     /// <summary>Name persisted in table properties (e.g. "rocksdb.BuiltinBloomFilter").</summary>
     public abstract string CompatibilityName { get; }
     public abstract IFilterBitsBuilder CreateBuilder(int formatVersion);
+    /// <summary>
+    /// Creates a builder with full table-building context (port of GetBuilderWithContext). Policies whose
+    /// choice depends on the level (e.g. Ribbon's bloom_before_level) override this; the default ignores
+    /// everything but the format version.
+    /// </summary>
+    public virtual IFilterBitsBuilder CreateBuilder(in FilterBuildingContext context) => CreateBuilder(context.FormatVersion);
     /// <summary>Creates a reader over filter contents; the reader may reference <paramref name="contents"/> (no copy).</summary>
     public abstract IFilterBitsReader CreateReader(ReadOnlyMemory<byte> contents);
 }
+
+/// <summary>
+/// Port of the parts of rocksdb::FilterBuildingContext (include/rocksdb/filter_policy.h) that built-in
+/// policies use. <see cref="LevelAtCreation"/> is -1 when unknown; FIFO / no-compaction callers should
+/// pass -1 (treated as bottommost, like upstream).
+/// </summary>
+public readonly record struct FilterBuildingContext(int FormatVersion, int LevelAtCreation, bool IsFlush);
