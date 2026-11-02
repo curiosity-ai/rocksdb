@@ -97,6 +97,9 @@ cd dotnet
 dotnet build RocksDb.Managed.slnx
 dotnet test --project tests/RocksDb.Managed.Tests -f net10.0
 dotnet test --project tests/RocksDb.Managed.CompatTests -f net10.0
+dotnet test --project tests/RocksDb.Managed.RoundTrip -f net10.0   # env: ROUNDTRIP_SEED=n (replay), ROUNDTRIP_LONG=1,
+                                                                    # ROUNDTRIP_MANAGED_IN_CHILD=1; failures keep their
+                                                                    # DB + scripts in bin/.../TestResults/roundtrip-failures/
 dotnet run -c Release --project bench/RocksDb.Managed.Benchmarks -f net10.0 -- --filter '*'
 ```
 
