@@ -31,13 +31,15 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [ ] Range deletion meta block
 - [ ] Compat: native `SstFileWriter` → managed reader; managed builder → native `IngestExternalFiles` / read back
 
-### C. Hashing, filters, compression  `[~] agent running`
-- [ ] Hashes: `Hash()` (util/hash.cc), xxhash32/64, XXH3 (System.IO.Hashing), `Lower32of64`, `BloomHash`
-- [ ] Filters: FastLocalBloom (format_version 5 full filter) builder+reader — `util/bloom_impl.h`, `table/block_based/filter_policy.cc`
-- [ ] Legacy Bloom full filter reader; Ribbon (Standard128Ribbon) builder+reader — `util/ribbon_*.h`
-- [ ] Partitioned filters (reader)
-- [ ] Compression adapters with RocksDB framing (format_version 2+ varint32 uncompressed-size prefix): Snappy (Snappier), LZ4/LZ4HC (K4os), ZSTD (ZstdSharp) — `util/compression.h`
-- [ ] Compat: filters built natively answer identically in managed reader (via SST round trip)
+### C. Hashing, filters, compression  `[x] merged (cffc808)`
+- [x] Hashes: `Hash()`, BloomHash, XXPH3-based `Hash64`/`GetSliceHash64` (RocksDB's frozen pre-release XXH3 — NOT System.IO.Hashing.XxHash3), Hash128/Hash2x64, checksum wrappers
+- [x] Filters: FastLocalBloom, legacy Bloom, Standard128Ribbon builder+reader; byte-identical to native for fv4/5/6 + ribbon hybrid
+- [ ] `optimize_filters_for_memory` rounding on build side
+- [ ] Partitioned filters (reader) — with stream B's table reader
+- [x] Compression: Snappy, LZ4/LZ4HC, ZSTD (pooled ctx), Zlib (raw deflate, <=16KiB blocks); BZip2/Xpress NotSupported
+- [ ] Verify managed-compressed blocks are readable natively (needs SST builder → native ingest)
+- [ ] Dictionary compression
+- Note: `FilterPolicy.CreateBuilder(in FilterBuildingContext)` added (level/flush aware, needed for ribbon `bloom_before_level`) — table builder must call it
 
 ### D. Version metadata & files  `[~] agent running`
 - [ ] `Db/FileNames` — `file/filename.cc` (LOG, MANIFEST-, CURRENT, IDENTITY, .sst, .log, OPTIONS-)
