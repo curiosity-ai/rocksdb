@@ -197,10 +197,42 @@ public struct CachedBlock : IDisposable
 /// Block cache API (port of the rocksdb::Cache interface, include/rocksdb/advanced_cache.h, restricted to what
 /// the managed port needs). Keys are 16-byte <see cref="CacheKey"/>s; values are <see cref="CacheValue"/>s.
 /// All members are thread-safe. Hit paths (<see cref="TryLookup"/> + release) do not allocate.
+/// <para>
+/// A <see cref="BlockCache"/> can be assigned directly to <see cref="Table.TableReaderOptions.BlockCache"/>: the table
+/// reader detects it and uses it natively (per-file <see cref="OffsetableCacheKey"/>s, handles, priorities). The
+/// explicit <see cref="Table.IBlockCache"/> implementation only exists for that assignment (and other legacy callers).
+/// </para>
 /// </summary>
-public abstract class BlockCache
+public abstract class BlockCache : Table.IBlockCache
 {
     private long _lastId;
+
+    // Legacy seam keys: (per-reader table id, offset) tagged in the top bit so they cannot meet OffsetableCacheKey keys
+    // of the same process in practice.
+    private static CacheKey LegacyKey(in Table.BlockCacheKey key) => new(key.TableId | (1UL << 63), key.Offset);
+
+    bool Table.IBlockCache.TryGet(in Table.BlockCacheKey key, [NotNullWhen(true)] out Table.Block? block)
+    {
+        if (TryLookup(LegacyKey(key), out CachedBlock h))
+        {
+            if (h.Value is Table.Block b)
+            {
+                b.AddRef();
+                h.Dispose();
+                block = b;
+                return true;
+            }
+            h.Dispose();
+        }
+        block = null;
+        return false;
+    }
+
+    void Table.IBlockCache.Insert(in Table.BlockCacheKey key, Table.Block block)
+    {
+        block.AddRef();
+        Insert(LegacyKey(key), CacheValue.FromObject(block), block.Charge, CachePriority.Low);
+    }
 
     /// <summary>Implementation name ("LRUCache", "HyperClockCache").</summary>
     public abstract string Name { get; }
@@ -257,6 +289,26 @@ public abstract class BlockCache
 
     /// <summary>Creates a lock-free HyperClockCache (HyperClockCacheOptions::MakeSharedCache).</summary>
     public static BlockCache CreateHyperClock(HyperClockCacheOptions options) => new HyperClockCache(options);
+
+    /// <summary>
+    /// The recommended block cache for a DB: a <see cref="HyperClockCache"/> of <paramref name="capacity"/> bytes whose
+    /// table is sized for blocks of the column families' <c>block_size</c> (see <see cref="EstimateBlockCharge"/>).
+    /// HyperClock lookups are lock-free and scale with concurrent readers, unlike the mutex-per-shard LRU.
+    /// </summary>
+    public static BlockCache CreateDefault(long capacity, int blockSize) =>
+        new HyperClockCache(new HyperClockCacheOptions { Capacity = capacity, EstimatedEntryCharge = EstimateBlockCharge(blockSize) });
+
+    /// <summary>
+    /// Typical charge of one cached data block for a table <c>block_size</c>: the table reader charges the pooled
+    /// buffer holding the block (payload, which usually ends slightly past block_size, plus the 5-byte trailer,
+    /// rounded up to the buffer pool's size class), i.e. the per-entry charge to pass as
+    /// <see cref="HyperClockCacheOptions.EstimatedEntryCharge"/>.
+    /// </summary>
+    public static long EstimateBlockCharge(int blockSize)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockSize);
+        return RocksDb.Managed.Memory.BlockBufferPool.RoundUp((int)Math.Min(int.MaxValue / 2, (long)blockSize + 6));
+    }
 
     /// <summary>
     /// Number of shard bits for a capacity (sharded_cache.cc GetDefaultCacheShardBits): one shard per

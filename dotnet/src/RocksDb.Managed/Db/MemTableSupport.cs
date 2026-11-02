@@ -158,8 +158,8 @@ public readonly unsafe struct MemTableKeyComparer : ISkipListComparer
         SkipListKey a = DecodeEntryKey(encodedKey);
         if (_bytewise)
         {
-            int r = new ReadOnlySpan<byte>(a.Ptr, a.Length - DbFormat.InternalKeyFooterSize)
-                .SequenceCompareTo(new ReadOnlySpan<byte>(decoded.Ptr, decoded.Length - DbFormat.InternalKeyFooterSize));
+            int r = ByteCompare.Compare(new ReadOnlySpan<byte>(a.Ptr, a.Length - DbFormat.InternalKeyFooterSize),
+                new ReadOnlySpan<byte>(decoded.Ptr, decoded.Length - DbFormat.InternalKeyFooterSize));
             if (r != 0) return r;
             // Shift the number to exclude the last byte which contains the value type.
             ulong anum = Unsafe.ReadUnaligned<ulong>(a.Ptr + a.Length - DbFormat.InternalKeyFooterSize);

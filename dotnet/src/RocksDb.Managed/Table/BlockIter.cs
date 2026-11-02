@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Util;
 using EntryType = RocksDb.Managed.Db.EntryType;
@@ -28,6 +29,7 @@ public enum BlockIterKind : byte
 /// </para>
 /// <para>Corrupted block contents surface as <see cref="RocksDbException"/> with <see cref="StatusCode.Corruption"/>.</para>
 /// </summary>
+[SkipLocalsInit]
 public sealed class BlockIter : IDisposable
 {
     /// <summary>kDisableGlobalSequenceNumber.</summary>
@@ -313,22 +315,51 @@ public sealed class BlockIter : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int DecodeEntry(int p, int limit, out uint shared, out uint nonShared, out uint valueLength)
     {
-        byte[] d = _data;
+        // Invariant: 0 <= p and limit <= _restarts <= _data.Length (Block.Parse validated the restart array), so after
+        // the length check the three header bytes are in bounds; read them without per-byte bounds checks.
+        ref byte d = ref MemoryMarshal.GetArrayDataReference(_data);
         if (_valueDeltaEncoded)
         {
             valueLength = 0;
             if (limit - p < 3) { shared = nonShared = 0; return -1; }
-            shared = d[p];
-            nonShared = d[p + 1];
+            shared = Unsafe.Add(ref d, (uint)p);
+            nonShared = Unsafe.Add(ref d, (uint)p + 1);
             if ((shared | nonShared) < 128) return p + 2;
             return DecodeVarints(p, limit, 2, out shared, out nonShared, out _);
         }
         if (limit - p < 3) { shared = nonShared = valueLength = 0; return -1; }
-        shared = d[p];
-        nonShared = d[p + 1];
-        valueLength = d[p + 2];
+        shared = Unsafe.Add(ref d, (uint)p);
+        nonShared = Unsafe.Add(ref d, (uint)p + 1);
+        valueLength = Unsafe.Add(ref d, (uint)p + 2);
         if ((shared | nonShared | valueLength) < 128) return p + 3;
         return DecodeVarints(p, limit, 3, out shared, out nonShared, out valueLength);
+    }
+
+    /// <summary>
+    /// Copies <paramref name="n"/> bytes between non-overlapping buffers; short copies (the usual key delta) are done
+    /// with two possibly-overlapping word moves instead of a memmove call.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void CopyKeyBytes(ref byte dst, ref byte src, uint n)
+    {
+        if (n >= 8 && n <= 16)
+        {
+            ulong a = Unsafe.ReadUnaligned<ulong>(ref src);
+            ulong b = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref src, n - 8));
+            Unsafe.WriteUnaligned(ref dst, a);
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst, n - 8), b);
+        }
+        else if (n >= 4 && n < 8)
+        {
+            uint a = Unsafe.ReadUnaligned<uint>(ref src);
+            uint b = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref src, n - 4));
+            Unsafe.WriteUnaligned(ref dst, a);
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst, n - 4), b);
+        }
+        else
+        {
+            Unsafe.CopyBlockUnaligned(ref dst, ref src, n);
+        }
     }
 
     private int DecodeVarints(int p, int limit, int count, out uint a, out uint b, out uint c)
@@ -344,15 +375,40 @@ public sealed class BlockIter : IDisposable
     /// <summary>Port of BlockIter::ParseNextKey (+ IndexBlockIter::DecodeCurrentValue / global seqno handling).</summary>
     private bool ParseNextKey()
     {
-        _current = _next;
+        int cur = _next;
+        _current = cur;
         int limit = _restarts;
-        if (_current >= limit)
+        if (cur >= limit)
         {
             Invalidate();
             return false;
         }
-        int p = DecodeEntry(_current, limit, out uint shared, out uint nonShared, out uint valueLength);
-        if (p < 0 || (uint)_keyLen < shared) return CorruptionError();
+        // Fast path: data/meta entry whose three header varints are single bytes (keeps the header in registers;
+        // the out-parameter decoder below forces them to the stack).
+        if (!_valueDeltaEncoded && limit - cur >= 3)
+        {
+            ref byte d = ref MemoryMarshal.GetArrayDataReference(_data);
+            uint shared = Unsafe.Add(ref d, (uint)cur);
+            uint nonShared = Unsafe.Add(ref d, (uint)cur + 1);
+            uint valueLength = Unsafe.Add(ref d, (uint)cur + 2);
+            if ((shared | nonShared | valueLength) < 128) return ParseEntry(cur + 3, limit, shared, nonShared, valueLength);
+        }
+        return ParseNextKeySlow(cur, limit);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private bool ParseNextKeySlow(int cur, int limit)
+    {
+        int p = DecodeEntry(cur, limit, out uint shared, out uint nonShared, out uint valueLength);
+        if (p < 0) return CorruptionError();
+        return ParseEntry(p, limit, shared, nonShared, valueLength);
+    }
+
+    /// <summary>Applies a decoded entry header at key-delta offset <paramref name="p"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool ParseEntry(int p, int limit, uint shared, uint nonShared, uint valueLength)
+    {
+        if ((uint)_keyLen < shared) return CorruptionError();
         ulong entryLength = (ulong)nonShared + valueLength;
         if (entryLength > (ulong)(limit - p)) return CorruptionError();
 
@@ -370,8 +426,10 @@ public sealed class BlockIter : IDisposable
                 // Restart key stored without the block's common prefix: full key = prefix + stored bytes.
                 int newLen = _prefixLength + (int)nonShared;
                 EnsureKeyCapacity(newLen);
-                Buffer.BlockCopy(_data, 0, _keyBuf, 0, _prefixLength);
-                Buffer.BlockCopy(_data, p, _keyBuf, _prefixLength, (int)nonShared);
+                ref byte kb = ref MemoryMarshal.GetArrayDataReference(_keyBuf);
+                ref byte db = ref MemoryMarshal.GetArrayDataReference(_data);
+                CopyKeyBytes(ref kb, ref db, (uint)_prefixLength);
+                CopyKeyBytes(ref Unsafe.Add(ref kb, (uint)_prefixLength), ref Unsafe.Add(ref db, (uint)p), nonShared);
                 _keyInBuf = true;
                 _keyLen = newLen;
             }
@@ -381,13 +439,16 @@ public sealed class BlockIter : IDisposable
         else
         {
             int newLen = (int)(shared + nonShared);
-            EnsureKeyCapacity(newLen);
+            if (_keyBuf.Length < newLen) EnsureKeyCapacity(newLen);
+            // Bounds: shared <= _keyLen (checked above) and p + nonShared <= limit (entry length check).
+            ref byte kb = ref MemoryMarshal.GetArrayDataReference(_keyBuf);
+            ref byte db = ref MemoryMarshal.GetArrayDataReference(_data);
             if (!_keyInBuf)
             {
-                Buffer.BlockCopy(_data, _keyBlockOffset, _keyBuf, 0, (int)shared);
+                CopyKeyBytes(ref kb, ref Unsafe.Add(ref db, (uint)_keyBlockOffset), shared);
                 _keyInBuf = true;
             }
-            Buffer.BlockCopy(_data, p, _keyBuf, (int)shared, (int)nonShared);
+            CopyKeyBytes(ref Unsafe.Add(ref kb, shared), ref Unsafe.Add(ref db, (uint)p), nonShared);
             _keyLen = newLen;
         }
 

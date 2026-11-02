@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace RocksDb.Managed.Util;
 
@@ -124,6 +125,29 @@ public static class Coding
 
     private static int DecodeVarint32Slow(ReadOnlySpan<byte> input, out uint value)
     {
+        if (input.Length >= MaxVarint32Length)
+        {
+            // Unrolled, bounds-check free (the whole maximal encoding is in range). Same truncation semantics as the
+            // loop below (and util/coding.h): bits beyond 32 in the fifth byte are dropped.
+            ref byte p = ref MemoryMarshal.GetReference(input);
+            uint b = p;
+            uint r = b & 0x7F;
+            if (b < 0x80) { value = r; return 1; }
+            b = Unsafe.Add(ref p, 1);
+            r |= (b & 0x7F) << 7;
+            if (b < 0x80) { value = r; return 2; }
+            b = Unsafe.Add(ref p, 2);
+            r |= (b & 0x7F) << 14;
+            if (b < 0x80) { value = r; return 3; }
+            b = Unsafe.Add(ref p, 3);
+            r |= (b & 0x7F) << 21;
+            if (b < 0x80) { value = r; return 4; }
+            b = Unsafe.Add(ref p, 4);
+            r |= b << 28;
+            if (b < 0x80) { value = r; return 5; }
+            value = 0;
+            return 0;
+        }
         uint result = 0;
         int limit = Math.Min(input.Length, MaxVarint32Length);
         for (int i = 0, shift = 0; i < limit; i++, shift += 7)
@@ -145,8 +169,37 @@ public static class Coding
     }
 
     /// <summary>Decodes a varint64 without advancing. Returns bytes consumed, or 0 on error.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int DecodeVarint64(ReadOnlySpan<byte> input, out ulong value)
     {
+        if (input.Length > 0 && input[0] < 0x80)
+        {
+            value = input[0];
+            return 1;
+        }
+        return DecodeVarint64Slow(input, out value);
+    }
+
+    private static int DecodeVarint64Slow(ReadOnlySpan<byte> input, out ulong value)
+    {
+        if (input.Length >= MaxVarint64Length)
+        {
+            // Bounds-check free loop over the in-range maximal encoding.
+            ref byte p = ref MemoryMarshal.GetReference(input);
+            ulong r = 0;
+            for (int i = 0, shift = 0; i < MaxVarint64Length; i++, shift += 7)
+            {
+                ulong b = Unsafe.Add(ref p, i);
+                if (b < 0x80)
+                {
+                    value = r | (b << shift);
+                    return i + 1;
+                }
+                r |= (b & 0x7F) << shift;
+            }
+            value = 0;
+            return 0;
+        }
         ulong result = 0;
         int limit = Math.Min(input.Length, MaxVarint64Length);
         for (int i = 0, shift = 0; i < limit; i++, shift += 7)
@@ -176,6 +229,7 @@ public static class Coding
         return true;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool GetVarint64(ref ReadOnlySpan<byte> input, out ulong value)
     {
         int n = DecodeVarint64(input, out value);

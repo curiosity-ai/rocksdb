@@ -3,6 +3,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using RocksDb.Managed.Compression;
 using RocksDb.Managed.Env;
+using RocksDb.Managed.Memory;
 
 namespace RocksDb.Managed.Table;
 
@@ -44,10 +45,12 @@ public sealed class NoBlockCache : IBlockCache
 /// </summary>
 internal static class BlockFetcher
 {
+    // Block buffers come from BlockBufferPool (fine size classes): an uncompressed block keeps its read buffer for its
+    // whole life in the block cache, and its length is what the cache is charged.
     public static Block ReadBlock(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums)
     {
         int n = CheckedLength(handle);
-        byte[] buf = ArrayPool<byte>.Shared.Rent(n);
+        byte[] buf = BlockBufferPool.Rent(n);
         try
         {
             int read = ReadFully(file, (long)handle.Offset, buf.AsSpan(0, n));
@@ -55,7 +58,7 @@ internal static class BlockFetcher
         }
         catch
         {
-            ArrayPool<byte>.Shared.Return(buf);
+            BlockBufferPool.Return(buf);
             throw;
         }
         return ProcessSerialized(buf, footer, handle, verifyChecksums);
@@ -64,7 +67,7 @@ internal static class BlockFetcher
     public static async ValueTask<Block> ReadBlockAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, bool verifyChecksums, CancellationToken ct)
     {
         int n = CheckedLength(handle);
-        byte[] buf = ArrayPool<byte>.Shared.Rent(n);
+        byte[] buf = BlockBufferPool.Rent(n);
         try
         {
             int total = 0;
@@ -78,7 +81,7 @@ internal static class BlockFetcher
         }
         catch
         {
-            ArrayPool<byte>.Shared.Return(buf);
+            BlockBufferPool.Return(buf);
             throw;
         }
         return ProcessSerialized(buf, footer, handle, verifyChecksums);
@@ -118,7 +121,7 @@ internal static class BlockFetcher
         }
         catch
         {
-            ArrayPool<byte>.Shared.Return(buf);
+            BlockBufferPool.Return(buf);
             throw;
         }
         var type = (CompressionType)buf[size];
@@ -129,14 +132,16 @@ internal static class BlockFetcher
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buf);
+            BlockBufferPool.Return(buf);
         }
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     internal static Block Decompress(CompressionType type, ReadOnlySpan<byte> compressed, int formatVersion)
     {
-        var w = new RentedBufferWriter(Math.Max(compressed.Length * 2, 256));
+        // No initial buffer: the decompressors request the exact uncompressed size (stored in the block or the snappy
+        // header) with a single GetSpan, so the block gets one right-sized array and no grow-and-copy.
+        var w = new RentedBufferWriter(0, blockPool: true);
         try
         {
             BlockCompression.Decompress(type, compressed, formatVersion, w);
@@ -167,7 +172,7 @@ internal static class BlockFetcher
                 length = size;
                 return buf;
             }
-            var w = new RentedBufferWriter(size * 2);
+            var w = new RentedBufferWriter(size * 2, blockPool: false);
             try
             {
                 BlockCompression.Decompress(type, buf.AsSpan(0, size), footer.FormatVersion, w);
@@ -188,13 +193,31 @@ internal static class BlockFetcher
     }
 }
 
-/// <summary>Minimal growable writer over a rented array whose buffer can be detached (ownership transfer).</summary>
+/// <summary>
+/// Minimal growable writer over a rented array whose buffer can be detached (ownership transfer). Arrays come from
+/// <see cref="BlockBufferPool"/> (<paramref name="blockPool"/>, for buffers that become <see cref="Block"/>s) or from
+/// <see cref="ArrayPool{T}.Shared"/> (buffers handed to code that returns them there, e.g. cached filters).
+/// </summary>
 internal sealed class RentedBufferWriter : IBufferWriter<byte>, IDisposable
 {
     private byte[] _buffer;
     private int _written;
+    private readonly bool _blockPool;
 
-    public RentedBufferWriter(int initialCapacity) => _buffer = ArrayPool<byte>.Shared.Rent(Math.Max(initialCapacity, 16));
+    public RentedBufferWriter(int initialCapacity, bool blockPool)
+    {
+        _blockPool = blockPool;
+        _buffer = initialCapacity <= 0 ? [] : RentArray(Math.Max(initialCapacity, 16));
+    }
+
+    private byte[] RentArray(int n) => _blockPool ? BlockBufferPool.Rent(n) : ArrayPool<byte>.Shared.Rent(n);
+
+    private void ReturnArray(byte[] a)
+    {
+        if (a.Length == 0) return;
+        if (_blockPool) BlockBufferPool.Return(a);
+        else ArrayPool<byte>.Shared.Return(a);
+    }
 
     public void Advance(int count)
     {
@@ -217,9 +240,9 @@ internal sealed class RentedBufferWriter : IBufferWriter<byte>, IDisposable
     private void Ensure(int sizeHint)
     {
         if (_buffer.Length - _written >= Math.Max(sizeHint, 1)) return;
-        byte[] n = ArrayPool<byte>.Shared.Rent(Math.Max(_written + Math.Max(sizeHint, 1), _buffer.Length * 2));
+        byte[] n = RentArray(Math.Max(_written + Math.Max(sizeHint, 1), _buffer.Length * 2));
         _buffer.AsSpan(0, _written).CopyTo(n);
-        ArrayPool<byte>.Shared.Return(_buffer);
+        ReturnArray(_buffer);
         _buffer = n;
     }
 
@@ -234,7 +257,7 @@ internal sealed class RentedBufferWriter : IBufferWriter<byte>, IDisposable
 
     public void Dispose()
     {
-        if (_buffer.Length > 0) ArrayPool<byte>.Shared.Return(_buffer);
+        ReturnArray(_buffer);
         _buffer = [];
     }
 }
