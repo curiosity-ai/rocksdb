@@ -43,6 +43,8 @@ while the bytes may differ (for example, because a compressor makes different ch
 | Integrated BlobDB (blob files, blob GC) | yes | yes | blob files byte-identical |
 | Wide columns (`PutEntity`, V1 entities) | yes | yes | V2 entities with blob columns: NotSupported |
 | User-defined timestamps (persisted) | yes | yes | timestamped writes byte-identical; `full_history_ts_low` GC; timestamped range deletions and `SstFileWriter` files |
+| User-defined timestamps in memtable only (`persist_user_defined_timestamps = false`) | yes | yes | tables/MANIFEST without timestamps, WAL with them; flush cutoff and postponement; enabling/disabling UDT on an existing column family |
+| Transactions with user-defined timestamps (commit timestamps, read-timestamp validation) | yes | yes | plain and 2PC commits (`kTypeCommitXIDAndTimestamp`) recover across engines |
 | Transactions: 2PC prepare/commit/rollback WAL markers | yes | yes | byte-identical; prepared transactions recover across engines |
 | `DBWithTTL` value format | yes | yes | |
 | BackupEngine directory layout and meta files | yes | yes | incremental backups across engines |
@@ -831,7 +833,7 @@ Format-level deviations (the output is always readable by native RocksDB):
 
 Not ported yet:
 
-- `persist_user_defined_timestamps = false`, and timestamps in transactions and `WriteBatchWithIndex`.
+- Timestamps in optimistic transactions and explicit-timestamp `WriteBatchWithIndex` writes (NotSupported, as upstream).
 - WritePrepared / WriteUnprepared transactions and range locks.
 - PlainTable and CuckooTable, separated key/value data blocks, parallel compression, subcompactions, `CompactFiles`,
   the SST file manager and a rate limiter for flush and compaction.

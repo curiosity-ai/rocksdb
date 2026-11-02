@@ -115,6 +115,12 @@ public sealed class BaseDeltaIterator : IDisposable
     /// <summary>The current key.</summary>
     public ReadOnlySpan<byte> Key => _currentAtBase ? _base.Key : _delta.Key;
 
+    /// <summary>
+    /// BaseDeltaIterator::timestamp: the base iterator's timestamp when positioned on a DB entry, empty for an entry
+    /// of the batch (its timestamp is assigned at commit).
+    /// </summary>
+    public ReadOnlySpan<byte> Timestamp => _currentAtBase ? _base.Timestamp : default;
+
     /// <summary>The current value (the default column for entities).</summary>
     public ReadOnlySpan<byte> Value
     {

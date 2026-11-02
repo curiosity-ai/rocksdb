@@ -86,6 +86,13 @@ public sealed class TransactionDbOptions
     /// safe when the application guarantees no conflicts with concurrent transactions.
     /// </summary>
     public bool SkipConcurrencyControl { get; set; }
+
+    /// <summary>
+    /// enable_udt_validation: whether transactions on column families with user-defined timestamps validate keys
+    /// against <see cref="Transaction.SetReadTimestampForValidation"/> (a key whose newest version has a newer timestamp
+    /// is a conflict). When disabled, setting a read timestamp is an error. Default true.
+    /// </summary>
+    public bool EnableUdtValidation { get; set; } = true;
 }
 
 /// <summary>Options of <see cref="TransactionDatabase.BeginTransaction(WriteOptions, TransactionOptions)"/> (TransactionOptions).</summary>

@@ -531,8 +531,7 @@ internal sealed partial class DbImpl
         public void MarkEndPrepare(ReadOnlySpan<byte> xid) { }
         public void MarkNoop(bool emptyBatch) { }
         public void MarkCommit(ReadOnlySpan<byte> xid) { }
-        public void MarkCommitWithTimestamp(ReadOnlySpan<byte> xid, ReadOnlySpan<byte> commitTimestamp) =>
-            ThrowHelper.NotSupported("Commit timestamps (user-defined timestamps) are not supported yet");
+        public void MarkCommitWithTimestamp(ReadOnlySpan<byte> xid, ReadOnlySpan<byte> commitTimestamp) { }
         public void MarkRollback(ReadOnlySpan<byte> xid) { }
     }
 
@@ -727,12 +726,27 @@ internal sealed partial class DbImpl
             _db.DeleteRecoveredTransaction(trx);
         }
 
-        public readonly void MarkCommitWithTimestamp(ReadOnlySpan<byte> xid, ReadOnlySpan<byte> commitTimestamp)
+        /// <summary>
+        /// MemTableInserter::MarkCommitWithTimestamp: in recovery the rebuilt prepared batch gets the commit timestamp
+        /// (UpdateTimestamps with the running column families' timestamp sizes) and is inserted like
+        /// <see cref="MarkCommit"/>; live writes ignore the marker.
+        /// </summary>
+        public void MarkCommitWithTimestamp(ReadOnlySpan<byte> xid, ReadOnlySpan<byte> commitTimestamp)
         {
-            if (_logNumber != 0 && _db.GetRecoveredTransaction(xid) is not null)
+            if (_logNumber == 0) return;
+            RecoveredTransaction? trx = _db.GetRecoveredTransaction(xid);
+            if (trx is null) return;
+            trx.Batch.UpdateTimestamps(commitTimestamp, _db.TimestampSizeOf);
+            LogRef = trx.LogNumber;
+            try
             {
-                ThrowHelper.NotSupported("Commit timestamps (user-defined timestamps) are not supported yet");
+                WriteBatch.Iterate(trx.Batch.Data, ref this);
             }
+            finally
+            {
+                LogRef = 0;
+            }
+            _db.DeleteRecoveredTransaction(trx);
         }
 
         public readonly void MarkRollback(ReadOnlySpan<byte> xid)

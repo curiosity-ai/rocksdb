@@ -319,7 +319,17 @@ internal sealed partial class DbImpl
     /// <paramref name="snapSeq"/>, Busy if it was, TryAgain if the memtables do not hold enough history to tell and
     /// <paramref name="cacheOnly"/> is set (otherwise the table files are checked too).
     /// </summary>
-    internal RocksDbException? CheckKey(in ConflictCheckView view, ReadOnlySpan<byte> key, ulong snapSeq, bool cacheOnly)
+    internal RocksDbException? CheckKey(in ConflictCheckView view, ReadOnlySpan<byte> key, ulong snapSeq, bool cacheOnly) =>
+        CheckKey(view, key, snapSeq, default, enableUdtValidation: false, cacheOnly);
+
+    /// <summary>
+    /// <see cref="CheckKey(in ConflictCheckView, ReadOnlySpan{byte}, ulong, bool)"/> with timestamp-based conflict
+    /// checking (TransactionUtil::CheckKey with read_ts): with <paramref name="enableUdtValidation"/> and a non-empty
+    /// <paramref name="readTimestamp"/>, a key whose newest version has a newer timestamp than the read timestamp is a
+    /// write conflict even when its sequence number is not newer than <paramref name="snapSeq"/>.
+    /// </summary>
+    internal RocksDbException? CheckKey(in ConflictCheckView view, ReadOnlySpan<byte> key, ulong snapSeq, ReadOnlySpan<byte> readTimestamp,
+        bool enableUdtValidation, bool cacheOnly)
     {
         bool needToReadSst = false;
         ulong earliest = view.EarliestSequence;
@@ -329,9 +339,17 @@ internal sealed partial class DbImpl
             needToReadSst = true;
             if (cacheOnly) return TryAgainNoHistory(snapSeq, earliest);
         }
-        GetLatestSequenceForKey(view, key, !needToReadSst, snapSeq, out ulong seq, out bool found);
-        if (found && snapSeq < seq) return new RocksDbException(StatusCode.Busy, "Resource busy: ");
-        return null;
+        int tsSize = view.Cfd.TimestampSize;
+        Span<byte> ts = stackalloc byte[tsSize];
+        GetLatestSequenceForKey(view, key, !needToReadSst, snapSeq, out ulong seq, out bool found, ts, out bool hasTs);
+        if (!found) return null;
+        bool conflict = snapSeq < seq;
+        if (!conflict && enableUdtValidation && !readTimestamp.IsEmpty && hasTs)
+        {
+            // Write conflict if read_ts < timestamp.
+            conflict = view.Cfd.UserComparator.CompareTimestamp(readTimestamp, ts) < 0;
+        }
+        return conflict ? new RocksDbException(StatusCode.Busy, "Resource busy: ") : null;
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -348,26 +366,45 @@ internal sealed partial class DbImpl
     /// the table files. Sources older than <paramref name="lowerBoundSeq"/> are skipped once a memtable proves there
     /// is no newer entry.
     /// </summary>
+    internal void GetLatestSequenceForKey(in ConflictCheckView view, ReadOnlySpan<byte> key, bool cacheOnly, ulong lowerBoundSeq, out ulong seq, out bool found) =>
+        GetLatestSequenceForKey(view, key, cacheOnly, lowerBoundSeq, out seq, out found, default, out _);
+
+    /// <summary>
+    /// <see cref="GetLatestSequenceForKey(in ConflictCheckView, ReadOnlySpan{byte}, bool, ulong, out ulong, out bool)"/>
+    /// that also reports the timestamp of the newest version for column families with user-defined timestamps (the
+    /// lookup uses the maximum timestamp; <paramref name="timestamp"/> must be timestamp-size long).
+    /// </summary>
     [SkipLocalsInit]
-    internal void GetLatestSequenceForKey(in ConflictCheckView view, ReadOnlySpan<byte> key, bool cacheOnly, ulong lowerBoundSeq, out ulong seq, out bool found)
+    internal void GetLatestSequenceForKey(in ConflictCheckView view, ReadOnlySpan<byte> key, bool cacheOnly, ulong lowerBoundSeq, out ulong seq, out bool found,
+        Span<byte> timestamp, out bool hasTimestamp)
     {
         SuperVersion sv = view.Sv;
         ulong currentSeq = Versions.LastSequence;
+        int tsSize = view.Cfd.TimestampSize;
+        Span<byte> maxTs = stackalloc byte[tsSize];
+        maxTs.Fill(0xff);
         Span<byte> scratch = stackalloc byte[LookupKey.StackBufferSize];
-        var lkey = new LookupKey(key, currentSeq, scratch);
+        var lkey = new LookupKey(key, currentSeq, maxTs, scratch);
+        GetContext? tsSink = null;
+        hasTimestamp = false;
+        if (tsSize != 0)
+        {
+            tsSink = GetContext.Rent(null);
+            tsSink.TimestampSize = tsSize;
+        }
         try
         {
             seq = DbFormat.MaxSequenceNumber;
             found = false;
             // Check if there is a record for this key in the latest memtable
-            if (MemTableSeq(sv.Mem, lkey, out seq)) { found = true; return; }
+            if (MemTableSeq(sv.Mem, lkey, out seq, tsSink)) { found = true; return; }
             ulong lowerInMem = sv.Mem.EarliestSequenceNumber;
             if (lowerInMem != DbFormat.MaxSequenceNumber && lowerInMem < lowerBoundSeq) return;
             // Check if there is a record for this key in the immutable memtables
             MemTable[] imm = sv.Imm;
             for (int i = 0; i < imm.Length; i++)
             {
-                if (MemTableSeq(imm[i], lkey, out seq)) { found = true; return; }
+                if (MemTableSeq(imm[i], lkey, out seq, tsSink)) { found = true; return; }
             }
             if (imm.Length > 0)
             {
@@ -378,23 +415,32 @@ internal sealed partial class DbImpl
             {
                 for (int i = 0; i < history.Length; i++)
                 {
-                    if (MemTableSeq(history[i], lkey, out seq)) { found = true; return; }
+                    if (MemTableSeq(history[i], lkey, out seq, tsSink)) { found = true; return; }
                 }
             }
             if (cacheOnly) return;
             // Check tables
-            found = TableSeq(view.Cfd, sv.Current, lkey.InternalKey, key, currentSeq, out seq);
+            found = TableSeq(view.Cfd, sv.Current, lkey.InternalKey, lkey.UserKey, currentSeq, out seq, tsSink);
         }
         finally
         {
             lkey.Dispose();
+            if (tsSink is not null)
+            {
+                if (tsSink.HasTimestamp && timestamp.Length == tsSize)
+                {
+                    tsSink.FoundTimestamp.CopyTo(timestamp);
+                    hasTimestamp = true;
+                }
+                GetContext.Return(tsSink);
+            }
         }
     }
 
-    private static bool MemTableSeq(MemTable mem, scoped in LookupKey lkey, out ulong seq)
+    private static bool MemTableSeq(MemTable mem, scoped in LookupKey lkey, out ulong seq, GetContext? tsSink)
     {
         ulong cov = 0;
-        mem.Get(lkey, out _, out _, out seq, mergeContext: null, ref cov);
+        mem.Get(lkey, out _, out _, out seq, mergeContext: null, ref cov, tsSink);
         if (seq != DbFormat.MaxSequenceNumber) return true;
         if (cov > 0)
         {
@@ -407,20 +453,27 @@ internal sealed partial class DbImpl
     private struct SeqVisitorState
     {
         public ulong Seq;
+        public GetContext? TimestampSink;
     }
 
     private static readonly TableEntryVisitor<SeqVisitorState> s_recordSeq = static (ref SeqVisitorState s, ReadOnlySpan<byte> ikey, ReadOnlySpan<byte> value) =>
     {
         DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(ikey), out ulong seq, out _);
         s.Seq = seq;
+        s.TimestampSink?.RecordTimestampOfUserKey(DbFormat.ExtractUserKey(ikey), seq);
         return false;
     };
 
-    /// <summary>Version::Get with a sequence output: newest entry (or covering tombstone) of the key in the table files.</summary>
-    private static bool TableSeq(ColumnFamilyData cfd, DbVersion v, ReadOnlySpan<byte> ikey, ReadOnlySpan<byte> userKey, ulong snapshot, out ulong seq)
+    /// <summary>
+    /// Version::Get with a sequence output: newest entry (or covering tombstone) of the key in the table files.
+    /// <paramref name="userKey"/> carries the lookup timestamp when the column family has timestamps.
+    /// </summary>
+    private static bool TableSeq(ColumnFamilyData cfd, DbVersion v, ReadOnlySpan<byte> ikey, ReadOnlySpan<byte> userKey, ulong snapshot, out ulong seq,
+        GetContext? tsSink)
     {
         VersionStorageInfo s = v.Storage;
         Comparator ucmp = cfd.UserComparator;
+        int tsSize = cfd.TimestampSize;
         ulong cov = 0;
         for (int level = 0; level < s.NumLevels; level++)
         {
@@ -436,15 +489,20 @@ internal sealed partial class DbImpl
             for (int i = start; i < end; i++)
             {
                 FileMetaData f = files[i];
-                if (ucmp.Compare(userKey, DbFormat.ExtractUserKey(f.Smallest)) < 0 || ucmp.Compare(userKey, DbFormat.ExtractUserKey(f.Largest)) > 0) continue;
-                var state = new SeqVisitorState { Seq = DbFormat.MaxSequenceNumber };
+                if (CompareFileBoundary(ucmp, tsSize, userKey, f.Smallest) < 0 || CompareFileBoundary(ucmp, tsSize, userKey, f.Largest) > 0) continue;
+                var state = new SeqVisitorState { Seq = DbFormat.MaxSequenceNumber, TimestampSink = tsSink };
                 TableReaderLease lease = cfd.TableCache.GetReader(f, out FragmentedRangeTombstoneList? rangeDels);
                 try
                 {
                     if (rangeDels is not null)
                     {
-                        ulong c = rangeDels.MaxCoveringTombstoneSeqnum(userKey, snapshot);
-                        if (c > cov) cov = c;
+                        ulong c = rangeDels.MaxCoveringTombstoneSeqnum(userKey, snapshot, tsSize == 0 ? default : userKey[^tsSize..],
+                            out ReadOnlySpan<byte> tombstoneTs);
+                        if (c > cov)
+                        {
+                            cov = c;
+                            tsSink?.SetTimestampFromRangeTombstone(tombstoneTs);
+                        }
                     }
                     lease.Reader.Get(ikey, ref state, s_recordSeq);
                 }
