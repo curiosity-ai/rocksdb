@@ -119,7 +119,7 @@ internal sealed partial class DbImpl
             {
                 string fname = FileNames.LogFileName(WalDir, walNumber);
                 var reporter = new WalRecoveryReporter { FileName = fname };
-                using var reader = new LogReader(FileSystem.OpenSequential(fname), reporter, checksum: Options.ParanoidChecks, walNumber)
+                using var reader = new LogReader(FileSystem.OpenSequential(fname), reporter, checksum: true, walNumber) // InitializeLogReader: always, even without paranoid_checks
                 {
                     RecoveryMode = Options.WalRecoveryMode,
                 };

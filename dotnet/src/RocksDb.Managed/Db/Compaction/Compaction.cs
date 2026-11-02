@@ -375,6 +375,20 @@ internal sealed class Compaction
         return min;
     }
 
+    /// <summary>
+    /// Port of Compaction::MaxInputFileNewestKeyTime (whole compaction; 0 = unknown): the newest key time recorded for
+    /// the outputs, so a FIFO TTL compaction never drops an output before its newest input has expired.
+    /// </summary>
+    public ulong MaxInputFileNewestKeyTime()
+    {
+        ulong max = 0;
+        foreach (CompactionInputFiles l in _inputs)
+        {
+            foreach (FileMetaData f in l.Files) max = Math.Max(max, f.NewestKeyTime);
+        }
+        return max;
+    }
+
     /// <summary>Port of Compaction::MinInputFileEpochNumber.</summary>
     public ulong MinInputFileEpochNumber()
     {

@@ -204,6 +204,8 @@ internal sealed class TableCache : ITableCache, IDisposable
             throw;
         }
         h.Reader = reader;
+        // FileMetaData::TryGetNewestKeyTime reads the pinned reader's properties; remember it for the FIFO TTL picker.
+        if (file.NewestKeyTime == 0) file.NewestKeyTime = reader.Properties.NewestKeyTime;
         if (reader.HasRangeTombstones)
         {
             var list = new List<FragmentedRangeTombstoneList.Tombstone>();

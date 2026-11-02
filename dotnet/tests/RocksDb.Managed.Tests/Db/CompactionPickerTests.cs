@@ -493,4 +493,37 @@ public sealed class CompactionPickerTests
         // The oldest file (file 3, smallest epoch) is dropped.
         CollectionAssert.AreEqual(new List<ulong> { 3 }, Numbers(c.Inputs(0)));
     }
+
+    [TestMethod]
+    public void FifoTtlUsesNewestKeyTime()
+    {
+        // Audit #3 (compaction_picker_fifo.cc PickTTLCompaction): a file expires when its newest key time
+        // (TryGetNewestKeyTime) is older than ttl, not its oldest ancestor time. An intra-L0 compaction output holds
+        // keys as new as its newest input; it must not be dropped once only its oldest input has expired.
+        var fx = new Fixture(1, CompactionStyle.Fifo);
+        fx.Options.Ttl = 1000;
+        ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        FileMetaData compacted = fx.Add(0, 1, "100", "200", 100, 1, 1);
+        compacted.OldestAncestorTime = now - 5000;
+        compacted.NewestKeyTime = now - 10;
+        FileMetaData expired = fx.Add(0, 2, "100", "200", 100, 2, 2);
+        expired.OldestAncestorTime = now - 4000;
+        expired.NewestKeyTime = now - 3000;
+        // Make file 2 the oldest (rightmost) L0 file.
+        compacted.EpochNumber = 10;
+        expired.EpochNumber = 5;
+        VersionStorageInfo vs = fx.Build();
+        var picker = new FifoCompactionPicker(fx.Options, InternalKeyComparator.Bytewise);
+        Compaction? c = picker.PickCompaction(vs, []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.FifoTtl, c.Reason);
+        CollectionAssert.AreEqual(new List<ulong> { 2 }, Numbers(c.Inputs(0)));
+
+        // Both expired by oldest ancestor time but the newer one is still live by its newest key time.
+        compacted.EpochNumber = 5;
+        expired.EpochNumber = 10;
+        vs = fx.Build();
+        c = new FifoCompactionPicker(fx.Options, InternalKeyComparator.Bytewise).PickCompaction(vs, []);
+        Assert.IsNull(c, "the compacted file (oldest) still holds keys newer than ttl");
+    }
 }
