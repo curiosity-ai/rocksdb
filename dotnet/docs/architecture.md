@@ -67,7 +67,7 @@ Paths on the left are relative to the repository root (C++). Paths on the right 
 | `db/external_sst_file_ingestion_job.cc`, `table/sst_file_writer.cc` | `Db/ExternalSstFileIngestionJob.cs`, `Db/DbImpl.Ingest.cs`, `Db/SstFileWriter.cs` |
 | `db/transaction_log_impl.cc`, `wal_manager.cc` | `Db/TransactionLogIterator.cs`, `Db/DbImpl.Replication.cs` |
 | `utilities/checkpoint/checkpoint_impl.cc` | `Db/DbImpl.Checkpoint.cs` |
-| `db_impl_readonly.cc`, `db_impl_secondary.cc` | `Db/DbImpl.ReadOnly.cs` |
+| `db_impl_readonly.cc`, `db_impl_secondary.cc`, `ReactiveVersionSet` / `ManifestTailer` (`version_set.cc`, `version_edit_handler.h`) | `Db/DbImpl.ReadOnly.cs` |
 | `db/error_handler.cc`, `db/event_helpers.cc`, `include/rocksdb/listener.h` | `Db/ErrorHandler.cs`, `Db/EventListener.cs`, `Db/EventListener.Notifications.cs` |
 | `db/blob/*` | `Db/Blob/*` |
 | `db/wide/*` | `Db/Wide/*`, `ColumnFamily.Entities.cs` |
