@@ -1134,6 +1134,70 @@ public sealed partial class BlockBasedTableReader : IDisposable
         }
     }
 
+    /// <summary>
+    /// Async <see cref="Get{TState}(ReadOnlySpan{byte}, ref TState, TableEntryVisitor{TState}, TableReadFlags)"/>: the
+    /// visitor sees every entry of the lookup key's user key in order (for user-defined timestamps, every version)
+    /// while data blocks are read with async I/O; completes synchronously on cache hits. <paramref name="state"/> is a
+    /// reference type, so the visitor's updates survive the awaits.
+    /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    public async ValueTask GetAsync<TState>(ReadOnlyMemory<byte> internalKey, TState state, TableEntryVisitor<TState> visitor, TableReadFlags flags,
+        CancellationToken cancellationToken) where TState : class
+    {
+        if (!InternalKeyMayMatch(internalKey.Span, flags)) return;
+        IndexCursor idx = IndexCursor.Rent(this, flags);
+        BlockIter data = IterPool.Rent();
+        try
+        {
+            idx.Seek(internalKey.Span);
+            bool first = true;
+            while (idx.Valid)
+            {
+                ValueTask<BlockRef> pending = GetBlockRefAsync(idx.Handle, BlockKind.Data, flags, cancellationToken);
+                BlockRef block = pending.IsCompletedSuccessfully ? pending.Result : await pending.ConfigureAwait(false);
+                try
+                {
+                    if (!VisitBlockForGet(data, block.Block!, internalKey.Span, first, state, visitor)) return;
+                    first = false;
+                }
+                finally
+                {
+                    data.Clear();
+                    block.Release();
+                }
+                idx.Next();
+            }
+        }
+        finally
+        {
+            IterPool.Return(data);
+            idx.Return();
+        }
+    }
+
+    /// <summary>The per-block part of the visitor Get; returns false when the lookup is done.</summary>
+    private bool VisitBlockForGet<TState>(BlockIter data, Block block, ReadOnlySpan<byte> internalKey, bool first, TState state,
+        TableEntryVisitor<TState> visitor)
+    {
+        ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(internalKey);
+        data.InitializeData(block, _icmp, GlobalSequenceNumber, PadTimestampSize);
+        if (first)
+        {
+            if (!SeekForGet(data, internalKey)) return false;
+        }
+        else
+        {
+            data.SeekToFirst();
+        }
+        for (; data.Valid; data.Next())
+        {
+            ReadOnlySpan<byte> k = data.Key;
+            if (!UserKeyEquals(DbFormat.ExtractUserKey(k), userKey)) return false;
+            if (!visitor(ref state, k, data.Value)) return false;
+        }
+        return true;
+    }
+
     /// <summary>Returns 1 = found, -1 = definitely absent, 0 = continue with the next block.</summary>
     private int ScanBlockForGet(BlockIter data, Block block, ReadOnlySpan<byte> internalKey, bool first, IBufferWriter<byte>? value, out TableGetResult result)
     {

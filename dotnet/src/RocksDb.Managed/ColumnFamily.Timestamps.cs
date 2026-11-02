@@ -155,6 +155,31 @@ public sealed partial class ColumnFamily
     }
 
     /// <summary>
+    /// Async <see cref="TryGet(ReadOptions, ReadOnlySpan{byte}, IBufferWriter{byte}, IBufferWriter{byte})"/>: table data
+    /// blocks are read with async I/O (completes synchronously when everything is cached or in memtables).
+    /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<bool> TryGetAsync(ReadOptions options, ReadOnlyMemory<byte> key, IBufferWriter<byte> value, IBufferWriter<byte> timestamp,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(value);
+        ArgumentNullException.ThrowIfNull(timestamp);
+        GetContext ctx = await LookupAsync(options, key, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (ctx.HasTimestamp) timestamp.Write(ctx.FoundTimestamp);
+            if (!ctx.TryResolve(key.Span, out ReadOnlySpan<byte> v)) return false;
+            value.Write(v);
+            return true;
+        }
+        finally
+        {
+            GetContext.Return(ctx);
+        }
+    }
+
+    /// <summary>
     /// The current full_history_ts_low of this column family (DB::GetFullHistoryTsLow), or null when it was never set.
     /// Reads with a timestamp below it fail with InvalidArgument; compaction may collapse versions older than it.
     /// </summary>

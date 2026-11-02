@@ -493,6 +493,73 @@ public sealed class DbTimestampMemtableOnlyTests
         }
     }
 
+    /// <summary>
+    /// Async timestamped Get / MultiGet (data blocks read with async I/O, no block cache) agree with the synchronous
+    /// lookups on every key and read timestamp, for persisted and memtable-only timestamps, across memtables, flushed
+    /// and compacted files with point and range deletions.
+    /// </summary>
+    [TestMethod]
+    public async Task AsyncTimestampedGetAndMultiGetMatchSync()
+    {
+        foreach (bool memtableOnly in new[] { false, true })
+        {
+            MemoryFileSystem fs = NewFs();
+            ColumnFamilyOptions cfo = memtableOnly ? MemOnlyOptions() : new ColumnFamilyOptions { Comparator = Comparator.BytewiseWithU64Ts, DisableAutoCompactions = true };
+            cfo.TableOptions.BlockSize = 128;
+            cfo.TableOptions.NoBlockCache = true;
+            using RocksDatabase db = Open(fs, cfo);
+            var rnd = new Random(77);
+            const int Keys = 60;
+            ulong ts = 1;
+            for (int round = 0; round < 3; round++)
+            {
+                for (int i = 0; i < 150; i++)
+                {
+                    string k = "k" + rnd.Next(Keys).ToString("D2", System.Globalization.CultureInfo.InvariantCulture);
+                    int op = rnd.Next(10);
+                    if (op == 0) db.Delete(B(k), Ts(ts));
+                    else if (op == 1)
+                    {
+                        int a = rnd.Next(Keys);
+                        db.DeleteRange(B("k" + a.ToString("D2", System.Globalization.CultureInfo.InvariantCulture)),
+                            B("k" + Math.Min(Keys, a + 3).ToString("D2", System.Globalization.CultureInfo.InvariantCulture)), Ts(ts));
+                    }
+                    else db.Put(B(k), Ts(ts), B(k + "@" + ts));
+                    ts++;
+                }
+                if (round < 2) db.Flush();
+                if (round == 1) db.CompactRange();
+            }
+            ulong low = FullHistoryTsLow(db) ?? 0;
+            for (ulong readTs = Math.Max(low, 1); readTs <= ts + 1; readTs += 37)
+            {
+                using var batch = new MultiGetBatch();
+                for (int i = 0; i < Keys; i++) batch.Add(B("k" + i.ToString("D2", System.Globalization.CultureInfo.InvariantCulture)));
+                using var batchAsync = new MultiGetBatch();
+                for (int i = 0; i < Keys; i++) batchAsync.Add(B("k" + i.ToString("D2", System.Globalization.CultureInfo.InvariantCulture)));
+                db.MultiGet(At(readTs), batch);
+                await db.MultiGetAsync(At(readTs), batchAsync);
+                for (int i = 0; i < Keys; i++)
+                {
+                    string k = "k" + i.ToString("D2", System.Globalization.CultureInfo.InvariantCulture);
+                    var v1 = new ArrayBufferWriter<byte>();
+                    var t1 = new ArrayBufferWriter<byte>();
+                    var v2 = new ArrayBufferWriter<byte>();
+                    var t2 = new ArrayBufferWriter<byte>();
+                    bool f1 = db.TryGet(At(readTs), B(k), v1, t1);
+                    bool f2 = await db.TryGetAsync(At(readTs), B(k), v2, t2);
+                    string what = k + "@" + readTs + (memtableOnly ? " memonly" : "");
+                    Assert.AreEqual(f1, f2, what);
+                    CollectionAssert.AreEqual(v1.WrittenSpan.ToArray(), v2.WrittenSpan.ToArray(), what);
+                    CollectionAssert.AreEqual(t1.WrittenSpan.ToArray(), t2.WrittenSpan.ToArray(), what);
+                    Assert.AreEqual(batch.GetStatus(i), batchAsync.GetStatus(i), what);
+                    CollectionAssert.AreEqual(batch.GetValue(i).ToArray(), batchAsync.GetValue(i).ToArray(), what);
+                    Assert.AreEqual(f1, batch.GetStatus(i) == MultiGetStatus.Found, what);
+                }
+            }
+        }
+    }
+
     [TestMethod]
     public void PersistedTimestampsCannotBeDisabled()
     {
