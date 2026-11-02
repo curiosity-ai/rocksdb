@@ -11,7 +11,7 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [x] Verify the native `RocksDB` NuGet package loads in the compat test project (smoke test)
 
 ## Phase 1 — Persistent formats (parallel)
-### A. WAL + WriteBatch
+### A. WAL + WriteBatch  `[~] agent running`
 - [ ] `Wal/LogFormat` — record types, block size 32KiB, header layouts (legacy 7B, recyclable 11B) — `db/log_format.h`
 - [ ] `Wal/LogWriter` — async, pooled, fragmenting records across blocks, recyclable mode — `db/log_writer.cc`
 - [ ] `Wal/LogReader` — checksum verify, fragment reassembly, corruption reporting, recycled-log handling — `db/log_reader.cc`
@@ -19,7 +19,7 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [ ] `Db/WriteBatch` — rep format (12B header: seq + count), all record tags, CF variants, iterate/handler, save points — `db/write_batch.cc`
 - [ ] Compat: managed WriteBatch bytes == native `WriteBatch.ToBytes()`; parse native batches from `GetUpdatesSince`
 
-### B. Block-based table (SST)
+### B. Block-based table (SST)  `[~] agent running`
 - [ ] `Table/BlockBuilder` + `Table/Block` reader/iterator (restart points, shared-prefix delta encoding) — `table/block_based/block_builder.cc`, `block.cc`
 - [ ] Data block hash index (`data_block_hash_index.cc`) — reader at least
 - [ ] `Table/BlockHandle`, `Footer` (legacy + format_version 1..7, checksum types, magic numbers) — `table/format.cc`
@@ -31,7 +31,7 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [ ] Range deletion meta block
 - [ ] Compat: native `SstFileWriter` → managed reader; managed builder → native `IngestExternalFiles` / read back
 
-### C. Hashing, filters, compression
+### C. Hashing, filters, compression  `[~] agent running`
 - [ ] Hashes: `Hash()` (util/hash.cc), xxhash32/64, XXH3 (System.IO.Hashing), `Lower32of64`, `BloomHash`
 - [ ] Filters: FastLocalBloom (format_version 5 full filter) builder+reader — `util/bloom_impl.h`, `table/block_based/filter_policy.cc`
 - [ ] Legacy Bloom full filter reader; Ribbon (Standard128Ribbon) builder+reader — `util/ribbon_*.h`
@@ -39,20 +39,20 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [ ] Compression adapters with RocksDB framing (format_version 2+ varint32 uncompressed-size prefix): Snappy (Snappier), LZ4/LZ4HC (K4os), ZSTD (ZstdSharp) — `util/compression.h`
 - [ ] Compat: filters built natively answer identically in managed reader (via SST round trip)
 
-### D. Version metadata & files
+### D. Version metadata & files  `[~] agent running`
 - [ ] `Db/FileNames` — `file/filename.cc` (LOG, MANIFEST-, CURRENT, IDENTITY, .sst, .log, OPTIONS-)
 - [ ] `Db/VersionEdit` encode/decode, all tags incl. new-file custom fields, blob files, WAL additions/deletions — `db/version_edit.cc`
 - [ ] MANIFEST read/write via log format; `CURRENT` atomic update
 - [ ] `Options/OptionsFile` — parse & write `OPTIONS-*` (INI-like) — `options/options_parser.cc`
 - [ ] Compat: decode native MANIFEST & OPTIONS files of a natively created DB
 
-### E. Memtable
+### E. Memtable  `[~] agent running`
 - [ ] `InternalKeyComparator`, `BytewiseComparator`, `ReverseBytewiseComparator` — `util/comparator.cc`, `db/dbformat.cc`
 - [ ] Arena-like pooled slab allocator for memtable entries — `memory/arena.cc`
 - [ ] Concurrent `InlineSkipList` (lock-free reads, concurrent inserts) — `memtable/inlineskiplist.h`
 - [ ] `MemTable` add/get/iterator, range tombstones, memtable entry encoding — `db/memtable.cc`
 
-### F. Infrastructure
+### F. Infrastructure  `[~] agent running`
 - [ ] `Env/` file abstraction: async sequential writer (`WritableFileWriter`), random-access reader (`RandomAccessFileReader`), `LOCK` file
 - [ ] Block cache (sharded LRU first, HyperClock later) with ref-counted pooled blocks — `cache/`
 - [ ] Benchmark harness: managed vs native for each component + db_bench-like workloads (fillseq, fillrandom, readrandom, seekrandom)
