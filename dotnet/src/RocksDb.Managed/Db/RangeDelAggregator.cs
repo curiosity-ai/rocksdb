@@ -358,6 +358,6 @@ public static class RangeDelTableTombstones
                 list.Add(new FragmentedRangeTombstoneList.Tombstone(k[..p.UserKeyLength].ToArray(), it.Value.ToArray(), p.Sequence));
             }
         }
-        return FragmentedRangeTombstoneList.Build(reader.InternalComparator.UserComparator, list);
+        return FragmentedRangeTombstoneList.Build(reader.InternalComparator.UserComparator, list, endIncludesTimestamp: reader.PadTimestampSize == 0);
     }
 }

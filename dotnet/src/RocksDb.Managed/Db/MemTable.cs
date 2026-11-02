@@ -42,6 +42,11 @@ public sealed unsafe class MemTable : IDisposable
     private readonly InlineSkipList<MemTableKeyComparer> _rangeDelTable;
     private readonly long _maxRangeDeletions;
     private readonly ulong _creationSeq;
+    // newest_udt_ (persist_user_defined_timestamps = false only): the newest timestamp added, guarded by _newestUdtLock.
+    private readonly int _newestUdtSize;
+    private readonly byte[]? _newestUdt;
+    private bool _hasNewestUdt;
+    private readonly Lock? _newestUdtLock;
 
     private int _refs;
     private long _writeBufferSize;
@@ -84,6 +89,12 @@ public sealed unsafe class MemTable : IDisposable
         _maxRangeDeletions = options.MaxRangeDeletions;
         _earliestSeqno = latestSequence;
         _creationSeq = latestSequence;
+        _newestUdtSize = options.TrackNewestTimestampSize;
+        if (_newestUdtSize > 0)
+        {
+            _newestUdt = new byte[_newestUdtSize];
+            _newestUdtLock = new Lock();
+        }
         UpdateFlushState();
         // something went wrong if we need to flush before inserting anything
         Debug.Assert(!ShouldScheduleFlush);
@@ -137,6 +148,7 @@ public sealed unsafe class MemTable : IDisposable
     public bool Add(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         if (!Insert(sequence, type, key, value, concurrent: false, out int encodedLen)) return false;
+        if (_newestUdtSize != 0) MaybeUpdateNewestUdt(key);
 
         Interlocked.Increment(ref _numEntries);
         Interlocked.Add(ref _dataSize, encodedLen);
@@ -160,6 +172,7 @@ public sealed unsafe class MemTable : IDisposable
     public bool AddConcurrently(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ref MemTablePostProcessInfo postProcessInfo)
     {
         if (!Insert(sequence, type, key, value, concurrent: true, out int encodedLen)) return false;
+        if (_newestUdtSize != 0) MaybeUpdateNewestUdt(key);
         postProcessInfo.NumEntries++;
         postProcessInfo.DataSize += encodedLen;
         if (type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp)
@@ -212,6 +225,33 @@ public sealed unsafe class MemTable : IDisposable
 
         // Range deletions always insert concurrently-safe (they may race with other range-deletion writers).
         return concurrent || type == EntryType.RangeDeletion ? table.InsertConcurrently(buf) : table.Insert(buf);
+    }
+
+    /// <summary>Port of MemTable::MaybeUpdateNewestUDT: tracks the newest timestamp of the user keys added.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void MaybeUpdateNewestUdt(ReadOnlySpan<byte> userKey)
+    {
+        if (userKey.Length < _newestUdtSize) return;
+        ReadOnlySpan<byte> udt = userKey[^_newestUdtSize..];
+        lock (_newestUdtLock!)
+        {
+            if (_hasNewestUdt && _ucmp.CompareTimestamp(udt, _newestUdt) <= 0) return;
+            udt.CopyTo(_newestUdt);
+            _hasNewestUdt = true;
+        }
+    }
+
+    /// <summary>
+    /// Port of MemTable::GetNewestUDT: a copy of the newest timestamp added, or null when the memtable holds no entry
+    /// (or timestamps are persisted: only tracked with persist_user_defined_timestamps = false).
+    /// </summary>
+    public byte[]? GetNewestUdt()
+    {
+        if (_newestUdtSize == 0) return null;
+        lock (_newestUdtLock!)
+        {
+            return _hasNewestUdt ? (byte[])_newestUdt!.Clone() : null;
+        }
     }
 
     private void AfterInsert(ulong s, EntryType type)

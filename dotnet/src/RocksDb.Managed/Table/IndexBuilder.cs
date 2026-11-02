@@ -56,24 +56,30 @@ internal sealed class ShortenedIndexBuilder : IndexBuilder
     private readonly bool _useCommonPrefix;
     private readonly bool _includeFirstKey;
     private readonly IndexShorteningMode _shortening;
+    // ts_sz_ when user-defined timestamps are not persisted (persist_user_defined_timestamps = false), else 0.
+    private readonly int _stripTsSize;
     private readonly PooledBufferWriter _scratch = new(64);
     private readonly PooledBufferWriter _encoded = new(64);
     private readonly PooledBufferWriter _deltaEncoded = new(64);
     private readonly PooledBufferWriter _currentBlockFirstKey = new(64);
+    private readonly PooledBufferWriter _firstKeyStripped = new(64);
     private bool _mustUseSeparatorWithSeq;
     private bool _hasLastHandle;
     private BlockHandle _lastHandle;
     private int _indexSize;
     private bool _finished;
 
+    /// <param name="stripTimestampSize">Timestamp size stripped from every index key and first key
+    /// (persist_user_defined_timestamps = false), 0 to keep keys whole.</param>
     public ShortenedIndexBuilder(InternalKeyComparator icmp, int indexBlockRestartInterval, int formatVersion, bool useValueDeltaEncoding,
-        IndexShorteningMode shortening, bool includeFirstKey, bool useCommonPrefix)
+        IndexShorteningMode shortening, bool includeFirstKey, bool useCommonPrefix, int stripTimestampSize)
     {
         _icmp = icmp;
+        _stripTsSize = stripTimestampSize;
         _withSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75,
-            useCommonPrefix, isUserKey: false);
+            useCommonPrefix, isUserKey: false, stripTimestampSize);
         _withoutSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75,
-            useCommonPrefix, isUserKey: true);
+            useCommonPrefix, isUserKey: true, stripTimestampSize);
         _useValueDeltaEscape = BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(formatVersion);
         _useCommonPrefix = useCommonPrefix;
         _useValueDeltaEncoding = useValueDeltaEncoding;
@@ -118,8 +124,9 @@ internal sealed class ShortenedIndexBuilder : IndexBuilder
                 separator = _scratch.WrittenSpan;
             else
                 separator = lastKeyInCurrentBlock;
-            // ShouldUseKeyPlusSeqAsSeparator: adjacent blocks share a boundary user key.
-            if (!_mustUseSeparatorWithSeq && _icmp.EqualUserKey(DbFormat.ExtractUserKey(lastKeyInCurrentBlock), DbFormat.ExtractUserKey(firstKeyInNextBlock)))
+            // ShouldUseKeyPlusSeqAsSeparator: adjacent blocks share a boundary user key. Without persisted timestamps all
+            // user keys act as if they had the minimum timestamp, so they must differ without their timestamps.
+            if (!_mustUseSeparatorWithSeq && SameBoundaryUserKey(DbFormat.ExtractUserKey(lastKeyInCurrentBlock), DbFormat.ExtractUserKey(firstKeyInNextBlock)))
                 _mustUseSeparatorWithSeq = true;
         }
         else
@@ -135,6 +142,15 @@ internal sealed class ShortenedIndexBuilder : IndexBuilder
         }
 
         ReadOnlySpan<byte> firstKey = _includeFirstKey ? _currentBlockFirstKey.WrittenSpan : default;
+        if (_includeFirstKey && _stripTsSize != 0 && firstKey.Length >= _stripTsSize + DbFormat.InternalKeyFooterSize)
+        {
+            // GetFirstInternalKey: the first internal key inside IndexValue is stripped here (block builders only strip
+            // the entry keys).
+            _firstKeyStripped.Clear();
+            _firstKeyStripped.Write(firstKey[..^(DbFormat.InternalKeyFooterSize + _stripTsSize)]);
+            _firstKeyStripped.Write(firstKey[^DbFormat.InternalKeyFooterSize..]);
+            firstKey = _firstKeyStripped.WrittenSpan;
+        }
         _encoded.Clear();
         IndexValue.EncodeFull(_encoded, handle, _includeFirstKey, firstKey);
         _deltaEncoded.Clear();
@@ -149,6 +165,9 @@ internal sealed class ShortenedIndexBuilder : IndexBuilder
         _currentBlockFirstKey.Clear();
         return separator;
     }
+
+    private bool SameBoundaryUserKey(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) =>
+        _stripTsSize == 0 ? _icmp.EqualUserKey(a, b) : _icmp.UserComparator.CompareWithoutTimestamp(a, true, b, true) == 0;
 
     /// <summary>Finishes and returns the index block contents (valid until disposal).</summary>
     public ReadOnlySpan<byte> Finish()
@@ -174,6 +193,7 @@ internal sealed class ShortenedIndexBuilder : IndexBuilder
         _encoded.Dispose();
         _deltaEncoded.Dispose();
         _currentBlockFirstKey.Dispose();
+        _firstKeyStripped.Dispose();
     }
 }
 
@@ -200,6 +220,7 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
     private readonly bool _useValueDeltaEncoding;
     private readonly bool _valueDeltaEscape;
     private readonly bool _useCommonPrefixSub;
+    private readonly int _stripTsSize;
     private readonly int _metadataBlockSize;
     private readonly int _blockSizeDeviationLimit;
     private readonly BlockBuilder _indexBlockBuilder;
@@ -220,9 +241,11 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
     private int _topLevelIndexSize;
 
     public PartitionedIndexBuilder(InternalKeyComparator icmp, int indexBlockRestartInterval, int formatVersion, bool useValueDeltaEncoding,
-        IndexShorteningMode shortening, int metadataBlockSize, int blockSizeDeviation, bool useCommonPrefixTop, bool useCommonPrefixSub)
+        IndexShorteningMode shortening, int metadataBlockSize, int blockSizeDeviation, bool useCommonPrefixTop, bool useCommonPrefixSub,
+        int stripTimestampSize)
     {
         _icmp = icmp;
+        _stripTsSize = stripTimestampSize;
         _indexBlockRestartInterval = indexBlockRestartInterval;
         _formatVersion = formatVersion;
         _shortening = shortening;
@@ -233,9 +256,9 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
         // FlushBlockBySizePolicy: block_size_deviation_limit_ = ((block_size * (100 - deviation)) + 99) / 100.
         _blockSizeDeviationLimit = (int)(((long)metadataBlockSize * (100 - blockSizeDeviation) + 99) / 100);
         _indexBlockBuilder = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75,
-            useCommonPrefixTop, isUserKey: false);
+            useCommonPrefixTop, isUserKey: false, stripTimestampSize);
         _indexBlockBuilderWithoutSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75,
-            useCommonPrefixTop, isUserKey: true);
+            useCommonPrefixTop, isUserKey: true, stripTimestampSize);
         // We start by false. After each partition we revise the value based on what the sub_index_builder has decided.
         _mustUseSeparatorWithSeq = false;
         MakeNewSubIndexBuilder();
@@ -249,7 +272,7 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
     private void MakeNewSubIndexBuilder()
     {
         var sub = new ShortenedIndexBuilder(_icmp, _indexBlockRestartInterval, _formatVersion, _useValueDeltaEncoding, _shortening,
-            includeFirstKey: false, _useCommonPrefixSub);
+            includeFirstKey: false, _useCommonPrefixSub, _stripTsSize);
         _subIndexBuilder = sub;
         // Start next partition entry, where we will modify the key
         _entries.Add(new Entry(sub));

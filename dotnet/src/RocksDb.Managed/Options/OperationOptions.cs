@@ -8,6 +8,9 @@ public sealed class ReadOptions
 {
     /// <summary>Read as of this snapshot (null = the latest state). See <see cref="RocksDatabase.GetSnapshot"/>.</summary>
     public Snapshot? Snapshot { get; set; }
+
+    /// <summary>A shallow copy (the snapshot and bounds are shared).</summary>
+    internal ReadOptions Clone() => (ReadOptions)MemberwiseClone();
     /// <summary>Verify block checksums on reads (default true).</summary>
     public bool VerifyChecksums { get; set; } = true;
     /// <summary>Insert blocks read by this operation into the block cache (default true).</summary>

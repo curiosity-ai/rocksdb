@@ -173,8 +173,7 @@ internal sealed partial class DbImpl
     {
         if (cfd.TimestampSize != 0)
         {
-            // Timestamped lookups take the synchronous path (the async table lookup does not report the entry's key).
-            Get(cfd, options, key.Span, ctx);
+            await GetWithTimestampAsync(cfd, options, key, ctx, cancellationToken).ConfigureAwait(false);
             return;
         }
         // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
@@ -229,6 +228,140 @@ internal sealed partial class DbImpl
         {
             ObjectPools.ReturnWriter(ikeyBuf);
             ReturnSuperVersion(sv);
+        }
+    }
+
+    /// <summary>
+    /// Async point lookup on a column family with user-defined timestamps: <see cref="GetWithSuperVersion"/> with the
+    /// table lookups of <see cref="GetFromVersion"/> done by the async visitor Get (every version of the key is visited,
+    /// like the synchronous path; data blocks are read with async I/O).
+    /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask GetWithTimestampAsync(ColumnFamilyData cfd, ReadOptions? options, ReadOnlyMemory<byte> key, GetContext ctx,
+        CancellationToken cancellationToken)
+    {
+        ValidateReadSnapshot(options);
+        SuperVersion sv = GetReferencedSuperVersion(cfd);
+        ulong snapshot = ReadSequence(options);
+        try
+        {
+            await GetWithSuperVersionAsync(cfd, sv, snapshot, options, key, ctx, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            ReturnSuperVersion(sv);
+        }
+    }
+
+    /// <summary>
+    /// Async <see cref="GetWithSuperVersion"/> for column families with user-defined timestamps (also used by the async
+    /// timestamped MultiGet): memtables synchronously, table files with async data block reads.
+    /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask GetWithSuperVersionAsync(ColumnFamilyData cfd, SuperVersion sv, ulong snapshot, ReadOptions? options, ReadOnlyMemory<byte> key,
+        GetContext ctx, CancellationToken cancellationToken)
+    {
+        PooledBufferWriter ikeyBuf = ObjectPools.RentWriter();
+        try
+        {
+            if (LookupMemTablesWithTimestamp(cfd, sv, snapshot, options, key.Span, ctx, ikeyBuf))
+            {
+                ctx.FromMemTable = true;
+                await ctx.ResolveBlobAsync(cfd.BlobSource, sv.Current.Storage, options, key, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            if (options?.ReadTier == ReadTier.MemtableTier)
+            {
+                if (ctx.State == GetContext.GetState.NotFound) return;
+                ThrowHelper.Corruption("Incomplete: merge operands not all in memtables");
+            }
+            ReadOnlyMemory<byte> ikey = ikeyBuf.WrittenMemory;
+            VersionStorageInfo s = sv.Current.Storage;
+            Comparator ucmp = cfd.UserComparator;
+            int tsSize = cfd.TimestampSize;
+            FileMetaData[] l0 = s.LevelFilesArray(0);
+            bool done = false;
+            for (int i = 0; i < l0.Length && !done; i++)
+            {
+                FileMetaData f = l0[i];
+                if (!UserKeyInFileRangeWithoutTimestamp(ucmp, tsSize, ikey, f)) continue;
+                done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);
+            }
+            for (int level = 1; level < s.NumLevels && !done; level++)
+            {
+                if (s.NumLevelFiles(level) == 0) continue;
+                int idx = s.FindFile(level, ikey.Span);
+                FileMetaData[] files = s.LevelFilesArray(level);
+                if (idx >= files.Length) continue;
+                FileMetaData f = files[idx];
+                if (CompareFileBoundary(ucmp, tsSize, DbFormat.ExtractUserKey(ikey.Span), f.Smallest) < 0) continue;
+                done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);
+            }
+            if (ctx.ValueIsBlobIndex) await ctx.ResolveBlobAsync(cfd.BlobSource, s, options, key, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            ObjectPools.ReturnWriter(ikeyBuf);
+        }
+    }
+
+    /// <summary>
+    /// Synchronous memtable part of <see cref="GetWithTimestampAsync"/>; leaves the internal lookup key
+    /// (key | read ts | snapshot, kValueTypeForSeek) in <paramref name="ikeyBuf"/>. Returns true if a final result was found.
+    /// </summary>
+    [SkipLocalsInit]
+    private static bool LookupMemTablesWithTimestamp(ColumnFamilyData cfd, SuperVersion sv, ulong snapshot, ReadOptions? options, ReadOnlySpan<byte> key,
+        GetContext ctx, PooledBufferWriter ikeyBuf)
+    {
+        ReadOnlySpan<byte> ts = GetReadTimestamp(cfd, options);
+        ctx.TimestampSize = cfd.TimestampSize;
+        ctx.ReadSequence = snapshot;
+        Span<byte> scratch = stackalloc byte[LookupKey.StackBufferSize];
+        var lkey = new LookupKey(key, snapshot, ts, scratch);
+        try
+        {
+            ikeyBuf.Write(lkey.InternalKey);
+            return GetFromMemTables(sv, lkey, ctx);
+        }
+        finally
+        {
+            lkey.Dispose();
+        }
+    }
+
+    private static bool UserKeyInFileRangeWithoutTimestamp(Comparator ucmp, int tsSize, ReadOnlyMemory<byte> ikey, FileMetaData f)
+    {
+        ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(ikey.Span);
+        return CompareFileBoundary(ucmp, tsSize, userKey, f.Smallest) >= 0 && CompareFileBoundary(ucmp, tsSize, userKey, f.Largest) <= 0;
+    }
+
+    /// <summary>Async <see cref="GetFromFile"/> (TableCache::Get with the read timestamp bounding the range tombstones).</summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private static async ValueTask<bool> GetFromFileWithTimestampAsync(ColumnFamilyData cfd, FileMetaData f, ReadOnlyMemory<byte> ikey, ulong snapshot,
+        GetContext ctx, CancellationToken cancellationToken)
+    {
+        TableReaderLease lease = await cfd.TableCache.GetReaderAsync(f, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ApplyFileRangeTombstones(cfd.TableCache.GetRangeTombstones(f), DbFormat.ExtractUserKey(ikey.Span), snapshot, ctx);
+            await lease.Reader.GetAsync(ikey, ctx, s_saveValue, TableReadFlags.None, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            lease.Dispose();
+        }
+        return ctx.Done;
+    }
+
+    private static void ApplyFileRangeTombstones(FragmentedRangeTombstoneList? rangeDels, ReadOnlySpan<byte> userKey, ulong snapshot, GetContext ctx)
+    {
+        if (rangeDels is null) return;
+        int tsSize = ctx.TimestampSize;
+        ulong cov = rangeDels.MaxCoveringTombstoneSeqnum(userKey, snapshot, tsSize == 0 ? default : userKey[^tsSize..], out ReadOnlySpan<byte> tombstoneTs);
+        if (cov > ctx.MaxCoveringTombstoneSeq)
+        {
+            ctx.MaxCoveringTombstoneSeq = cov;
+            if (tsSize != 0) ctx.SetTimestampFromRangeTombstone(tombstoneTs);
         }
     }
 

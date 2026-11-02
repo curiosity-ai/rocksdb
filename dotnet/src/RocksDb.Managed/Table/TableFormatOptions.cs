@@ -113,4 +113,10 @@ public sealed record TableBuilderOptions
     /// "rocksdb.external_sst_file.global_seqno" = 0), required by IngestExternalFile.
     /// </summary>
     public bool ExternalSstFile { get; init; }
+    /// <summary>
+    /// persist_user_defined_timestamps: false strips the user-defined timestamp from every persisted key (the table is
+    /// read back with the minimum timestamp padded in; "rocksdb.user.defined.timestamps.persisted" = 0). Ignored by
+    /// comparators without timestamps.
+    /// </summary>
+    public bool PersistUserDefinedTimestamps { get; init; } = true;
 }

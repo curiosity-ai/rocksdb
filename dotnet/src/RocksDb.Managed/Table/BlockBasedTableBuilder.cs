@@ -40,6 +40,11 @@ public sealed class BlockBasedTableBuilder : IDisposable
     private readonly Comparator _ucmp;
     /// <summary>User-defined timestamp size (ts_sz): filters get user keys without it; min/max timestamps are collected.</summary>
     private readonly int _tsSize;
+    /// <summary>
+    /// _tsSize when user-defined timestamps are not persisted (persist_user_defined_timestamps = false, Rep's
+    /// persist_user_defined_timestamps): every block builder strips the timestamp from its keys; else 0.
+    /// </summary>
+    private readonly int _stripTsSize;
     // TimestampTablePropertiesCollector state ("rocksdb.timestamp_min" / "rocksdb.timestamp_max").
     private byte[]? _timestampMin;
     private byte[]? _timestampMax;
@@ -90,27 +95,30 @@ public sealed class BlockBasedTableBuilder : IDisposable
         _tbo = tableBuilderOptions;
         _ucmp = tableBuilderOptions.Comparator;
         _tsSize = _ucmp.TimestampSize;
+        _stripTsSize = tableBuilderOptions.PersistUserDefinedTimestamps ? 0 : _tsSize;
         _icmp = _ucmp.Kind == ComparatorKind.Bytewise ? InternalKeyComparator.Bytewise : new InternalKeyComparator(_ucmp);
         _offset = (ulong)file.Size;
         bool useCommonPrefix = UseCommonPrefix(options, _ucmp);
         // The hash index needs keys whose bytes determine equality (CanKeysWithDifferentByteContentsBeEqual).
         _dataBlock = new BlockBuilder(options.BlockRestartInterval, options.UseDeltaEncoding, false,
             _ucmp.CanKeysWithDifferentByteContentsBeEqual ? DataBlockIndexType.BinarySearch : options.DataBlockIndexType,
-            options.DataBlockHashTableUtilRatio, useCommonPrefix, isUserKey: false);
-        _rangeDelBlock = new BlockBuilder(1, true, false, DataBlockIndexType.BinarySearch, 0.75);
+            options.DataBlockHashTableUtilRatio, useCommonPrefix, isUserKey: false, _stripTsSize);
+        // RangeDelBlockBuilder(ts_sz, persist_user_defined_timestamps): the start keys are stripped by the block
+        // builder, the end keys (values) in AddCore.
+        _rangeDelBlock = new BlockBuilder(1, true, false, DataBlockIndexType.BinarySearch, 0.75, useCommonPrefix: false, isUserKey: false, _stripTsSize);
         _useDeltaEncodingForIndexValues = options.FormatVersion >= 4;
         PartitionedIndexBuilder? partitionedIndex = null;
         if (options.IndexType == IndexType.TwoLevelIndexSearch)
         {
             // PartitionedIndexBuilder::CreateIndexBuilder (use_common_prefix applies to all index tiers).
             partitionedIndex = new PartitionedIndexBuilder(_icmp, options.IndexBlockRestartInterval, options.FormatVersion, _useDeltaEncodingForIndexValues,
-                options.IndexShortening, options.MetadataBlockSize, options.BlockSizeDeviation, useCommonPrefix, useCommonPrefix);
+                options.IndexShortening, options.MetadataBlockSize, options.BlockSizeDeviation, useCommonPrefix, useCommonPrefix, _stripTsSize);
             _indexBuilder = partitionedIndex;
         }
         else
         {
             _indexBuilder = new ShortenedIndexBuilder(_icmp, options.IndexBlockRestartInterval, options.FormatVersion, _useDeltaEncodingForIndexValues,
-                options.IndexShortening, options.IndexType == IndexType.BinarySearchWithFirstKey, useCommonPrefix);
+                options.IndexShortening, options.IndexType == IndexType.BinarySearchWithFirstKey, useCommonPrefix, _stripTsSize);
         }
         _prefixExtractor = tableBuilderOptions.PrefixExtractor;
         // Port of CreateFilterBlockBuilder: the policy picks the filter implementation from the full building context
@@ -130,7 +138,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
                 partitionSize = Math.Max(partitionSize, 1u);
                 _filterBuilder = new PartitionedFilterBlockBuilder(_prefixExtractor, options.WholeKeyFiltering, bits, options.IndexBlockRestartInterval,
                     _useDeltaEncodingForIndexValues, options.FormatVersion, partitionedIndex, partitionSize, options.DecouplePartitionedFilters,
-                    useCommonPrefix)
+                    useCommonPrefix, _stripTsSize)
                 { TimestampSize = _tsSize };
                 _partitionedFilter = true;
             }
@@ -245,10 +253,16 @@ public sealed class BlockBasedTableBuilder : IDisposable
         DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(internalKey), out ulong seq, out EntryType type);
         if (seq > _props.KeyLargestSeqno) _props.KeyLargestSeqno = seq;
         if (seq < _props.KeySmallestSeqno) _props.KeySmallestSeqno = seq;
-        if (_tsSize != 0) CollectTimestamp(internalKey);
+        if (_tsSize != 0 && _stripTsSize == 0) CollectTimestamp(internalKey);
 
         if (type == EntryType.RangeDeletion)
         {
+            // RangeDelBlockBuilder: without persisted timestamps the end key (value) is stored without its timestamp.
+            if (_stripTsSize != 0)
+            {
+                if (value.Length < _stripTsSize) ThrowHelper.InvalidArgument("range tombstone end key too short for its timestamp");
+                value = value[..^_stripTsSize];
+            }
             _rangeDelBlock.Add(internalKey, value);
             _props.NumDeletions++;
             _props.NumRangeDeletions++;
@@ -274,7 +288,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
             else if (type == EntryType.Merge) _props.NumMergeOperands++;
         }
         _props.NumEntries++;
-        _props.RawKeySize += (ulong)internalKey.Length;
+        // raw_key_size excludes the stripped timestamp (persist_user_defined_timestamps = false).
+        _props.RawKeySize += (ulong)(internalKey.Length - _stripTsSize);
         _props.RawValueSize += (ulong)value.Length;
     }
 
@@ -370,7 +385,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
             Block block = Block.CreateCopy(data);
             try
             {
-                it.InitializeData(block, _icmp, BlockIter.DisableGlobalSequenceNumber);
+                it.InitializeData(block, _icmp, BlockIter.DisableGlobalSequenceNumber, _stripTsSize);
                 for (it.SeekToFirst(); it.Valid; it.Next())
                 {
                     ReadOnlySpan<byte> key = it.Key;
@@ -392,7 +407,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
                 Block nb = Block.CreateCopy(_dataBlockBuffers[i + 1]);
                 try
                 {
-                    next.InitializeData(nb, _icmp, BlockIter.DisableGlobalSequenceNumber);
+                    next.InitializeData(nb, _icmp, BlockIter.DisableGlobalSequenceNumber, _stripTsSize);
                     next.SeekToFirst();
                     nextFirstKey.Write(next.Key);
                     next.Clear();
@@ -626,6 +641,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
         _props.IndexValueIsDeltaEncoded = _useDeltaEncodingForIndexValues ? 1UL : 0UL;
         _props.CompressionName = BuildCompressionName();
         _props.CompressionOptions = BuildCompressionOptions();
+        // rep_->props.user_defined_timestamps_persisted (written only when 0).
+        _props.UserDefinedTimestampsPersisted = _stripTsSize == 0 ? 1UL : 0UL;
 
         using var pb = new PropertyBlockBuilder();
         _props.AddTo(pb);
@@ -636,9 +653,9 @@ public sealed class BlockBasedTableBuilder : IDisposable
         pb.Add(TablePropertiesNames.BlockBasedWholeKeyFiltering, _options.WholeKeyFiltering ? TablePropertiesNames.PropTrue : TablePropertiesNames.PropFalse);
         pb.Add(TablePropertiesNames.BlockBasedPrefixFiltering, _prefixExtractor is not null ? TablePropertiesNames.PropTrue : TablePropertiesNames.PropFalse);
         if (_options.DecouplePartitionedFilters) pb.Add(TablePropertiesNames.BlockBasedDecoupledPartitionedFilters, TablePropertiesNames.PropTrue);
-        if (_tsSize > 0)
+        if (_tsSize > 0 && _stripTsSize == 0)
         {
-            // TimestampTablePropertiesCollector::Finish (only when timestamps are persisted).
+            // TimestampTablePropertiesCollector::Finish (only added when timestamps are persisted).
             pb.Add(TablePropertiesNames.TimestampMin, TimestampMin);
             pb.Add(TablePropertiesNames.TimestampMax, TimestampMax);
         }

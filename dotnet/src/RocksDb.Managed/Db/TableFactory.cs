@@ -223,6 +223,7 @@ public static class TableFactory
             PrefixExtractor = options.PrefixExtractor,
             LevelAtCreation = where.Level,
             IsFlush = where.IsFlush,
+            PersistUserDefinedTimestamps = options.PersistUserDefinedTimestamps,
         };
     }
 
@@ -262,6 +263,7 @@ public static class TableFactory
             IsFlush = false,
             DbId = "SST Writer",
             ExternalSstFile = true,
+            PersistUserDefinedTimestamps = options.PersistUserDefinedTimestamps,
         };
     }
 

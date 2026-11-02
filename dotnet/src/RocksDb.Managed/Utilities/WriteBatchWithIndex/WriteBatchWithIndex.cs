@@ -101,10 +101,7 @@ public sealed class WriteBatchWithIndex : IDisposable
 
     public WriteBatchWithIndex Put(ColumnFamily? columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
-        uint cf = CfId(columnFamily);
-        int offset = _batch.DataSize;
-        _batch.Put(cf, key, value);
-        AddOrUpdateIndex(cf, WriteType.Put, offset);
+        Put(CfId(columnFamily), key, value);
         return this;
     }
 
@@ -113,6 +110,7 @@ public sealed class WriteBatchWithIndex : IDisposable
     public WriteBatchWithIndex PutEntity(ColumnFamily? columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns)
     {
         uint cf = CfId(columnFamily);
+        if (TimestampSizeOf(cf) != 0) ThrowHelper.NotSupported("PutEntity on a column family with user-defined timestamps in WriteBatchWithIndex");
         int offset = _batch.DataSize;
         _batch.PutEntity(cf, key, columns);
         AddOrUpdateIndex(cf, WriteType.PutEntity, offset);
@@ -123,10 +121,7 @@ public sealed class WriteBatchWithIndex : IDisposable
 
     public WriteBatchWithIndex Delete(ColumnFamily? columnFamily, ReadOnlySpan<byte> key)
     {
-        uint cf = CfId(columnFamily);
-        int offset = _batch.DataSize;
-        _batch.Delete(cf, key);
-        AddOrUpdateIndex(cf, WriteType.Delete, offset);
+        Delete(CfId(columnFamily), key);
         return this;
     }
 
@@ -134,10 +129,7 @@ public sealed class WriteBatchWithIndex : IDisposable
 
     public WriteBatchWithIndex SingleDelete(ColumnFamily? columnFamily, ReadOnlySpan<byte> key)
     {
-        uint cf = CfId(columnFamily);
-        int offset = _batch.DataSize;
-        _batch.SingleDelete(cf, key);
-        AddOrUpdateIndex(cf, WriteType.SingleDelete, offset);
+        SingleDelete(CfId(columnFamily), key);
         return this;
     }
 
@@ -145,10 +137,7 @@ public sealed class WriteBatchWithIndex : IDisposable
 
     public WriteBatchWithIndex Merge(ColumnFamily? columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
-        uint cf = CfId(columnFamily);
-        int offset = _batch.DataSize;
-        _batch.Merge(cf, key, value);
-        AddOrUpdateIndex(cf, WriteType.Merge, offset);
+        Merge(CfId(columnFamily), key, value);
         return this;
     }
 
@@ -172,6 +161,7 @@ public sealed class WriteBatchWithIndex : IDisposable
         _batch.Clear();
         if (_withNoop) _batch.InsertNoop();
         _index.Clear();
+        _hasKeyWithTimestamp = false;
     }
 
     /// <summary>Records the current state; see <see cref="RollbackToSavePoint"/>.</summary>
@@ -191,10 +181,35 @@ public sealed class WriteBatchWithIndex : IDisposable
     /// <summary>Removes the most recent save point. Returns false when there is none.</summary>
     public bool PopSavePoint() => _batch.PopSavePoint();
 
+    /// <summary>User-defined timestamp size of column family <paramref name="cf"/> (its index comparator's).</summary>
+    private int TimestampSizeOf(uint cf) => _index.GetComparator(cf).TimestampSize;
+
+    /// <summary>
+    /// WriteBatch::Put(column_family, key, value) on a column family with timestamps: the key gets a dummy (all-zero)
+    /// timestamp that the commit replaces (needs_in_place_update_ts_ / UpdateTimestamps).
+    /// </summary>
+    private ReadOnlySpan<byte> PlaceholderTimestamp(uint cf)
+    {
+        _hasKeyWithTimestamp = true;
+        return s_zeroTimestamp.AsSpan(0, TimestampSizeOf(cf));
+    }
+
+    private static readonly byte[] s_zeroTimestamp = new byte[64];
+    private bool _hasKeyWithTimestamp;
+
+    /// <summary>
+    /// True when a key of a column family with user-defined timestamps was added with a placeholder timestamp
+    /// (WriteBatchInternal::HasKeyWithTimestamp): the batch must get its timestamps (commit timestamp) before it is written.
+    /// </summary>
+    internal bool HasKeyWithTimestamp => _hasKeyWithTimestamp;
+
     /// <summary>Rep::AddOrUpdateIndexWithCfId (+ UpdateExistingEntryWithCfId in overwrite_key mode).</summary>
     private void AddOrUpdateIndex(uint cf, WriteType type, int recordOffset)
     {
         DecodeKeyPosition(_batch.Data, recordOffset, out int keyOffset, out int keySize);
+        // MakeEntry: the index holds the user key without its timestamp.
+        int tsSize = TimestampSizeOf(cf);
+        if (tsSize > 0 && keySize >= tsSize) keySize -= tsSize;
         if (OverwriteKey && type != WriteType.Merge)
         {
             ReadOnlySpan<byte> key = _batch.Data.Slice(keyOffset, keySize);
@@ -264,6 +279,9 @@ public sealed class WriteBatchWithIndex : IDisposable
         string? error = WriteBatchReader.TryReadRecord(rep, ref pos, out WriteBatchEntry e);
         if (error is not null) ThrowHelper.Corruption(error);
         key = e.Key;
+        // WBWIIteratorImpl::Entry: the entry key never includes the user-defined timestamp.
+        int tsSize = TimestampSizeOf(e.ColumnFamilyId);
+        if (tsSize > 0 && key.Length >= tsSize) key = key[..^tsSize];
         value = e.Value;
         return e.Type switch
         {
@@ -288,12 +306,14 @@ public sealed class WriteBatchWithIndex : IDisposable
     internal void Put(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         int offset = _batch.DataSize;
-        _batch.Put(cf, key, value);
+        if (TimestampSizeOf(cf) != 0) _batch.Put(cf, key, PlaceholderTimestamp(cf), value);
+        else _batch.Put(cf, key, value);
         AddOrUpdateIndex(cf, WriteType.Put, offset);
     }
 
     internal void PutEntitySerialized(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity)
     {
+        if (TimestampSizeOf(cf) != 0) ThrowHelper.NotSupported("PutEntity on a column family with user-defined timestamps in WriteBatchWithIndex");
         int offset = _batch.DataSize;
         _batch.PutEntitySerialized(cf, key, entity);
         AddOrUpdateIndex(cf, WriteType.PutEntity, offset);
@@ -302,21 +322,24 @@ public sealed class WriteBatchWithIndex : IDisposable
     internal void Delete(uint cf, ReadOnlySpan<byte> key)
     {
         int offset = _batch.DataSize;
-        _batch.Delete(cf, key);
+        if (TimestampSizeOf(cf) != 0) _batch.Delete(cf, key, PlaceholderTimestamp(cf));
+        else _batch.Delete(cf, key);
         AddOrUpdateIndex(cf, WriteType.Delete, offset);
     }
 
     internal void SingleDelete(uint cf, ReadOnlySpan<byte> key)
     {
         int offset = _batch.DataSize;
-        _batch.SingleDelete(cf, key);
+        if (TimestampSizeOf(cf) != 0) _batch.SingleDelete(cf, key, PlaceholderTimestamp(cf));
+        else _batch.SingleDelete(cf, key);
         AddOrUpdateIndex(cf, WriteType.SingleDelete, offset);
     }
 
     internal void Merge(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         int offset = _batch.DataSize;
-        _batch.Merge(cf, key, value);
+        if (TimestampSizeOf(cf) != 0) _batch.Merge(cf, key, PlaceholderTimestamp(cf), value);
+        else _batch.Merge(cf, key, value);
         AddOrUpdateIndex(cf, WriteType.Merge, offset);
     }
 
@@ -592,6 +615,7 @@ public sealed class WriteBatchWithIndex : IDisposable
         ArgumentNullException.ThrowIfNull(value);
         ColumnFamily cfh = columnFamily ?? db.DefaultColumnFamily;
         uint cf = CfId(cfh);
+        if (cfh.Data.TimestampSize > 0 && options?.Timestamp is null) ThrowHelper.InvalidArgument("Must specify timestamp");
         LookupResult r = FindLatestUpdate(cf, ComparatorOf(cfh), key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
         MergeOperator? op = cfh.Data.MergeOperator;
         switch (r)

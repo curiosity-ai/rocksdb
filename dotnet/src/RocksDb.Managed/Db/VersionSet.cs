@@ -324,9 +324,9 @@ internal sealed class VersionSet : IAsyncDisposable
                     newLog = ManifestLogWriter.Create(_fs, FileNames.DescriptorFileName(_dbname, manifestNumber));
                     var writer = new ManifestWriter(newLog);
                     // WriteCurrentStateToManifest (synced at the end).
-                    await Await(writer.WriteSnapshotAsync(snapshot, static _ => 0, cancellationToken), synchronous).ConfigureAwait(false);
+                    await Await(writer.WriteSnapshotAsync(snapshot, TimestampSizeOfColumnFamily, cancellationToken), synchronous).ConfigureAwait(false);
                     edit.NextFileNumber = CurrentNextFileNumber;
-                    await Await(writer.AddEditAsync(edit, 0, sync: true, cancellationToken), synchronous).ConfigureAwait(false);
+                    await Await(writer.AddEditAsync(edit, TimestampSizeOfEdit(edit), sync: true, cancellationToken), synchronous).ConfigureAwait(false);
                     newManifestWritten = true;
                     await Await(FileNames.SetCurrentFileAsync(_fs, _dbname, manifestNumber, syncDirectory: true, cancellationToken), synchronous)
                         .ConfigureAwait(false);
@@ -343,7 +343,7 @@ internal sealed class VersionSet : IAsyncDisposable
                 else
                 {
                     edit.NextFileNumber = CurrentNextFileNumber;
-                    await Await(_manifest!.AddEditAsync(edit, 0, sync: true, cancellationToken), synchronous).ConfigureAwait(false);
+                    await Await(_manifest!.AddEditAsync(edit, TimestampSizeOfEdit(edit), sync: true, cancellationToken), synchronous).ConfigureAwait(false);
                 }
             }
             catch (Exception writeError)
@@ -431,6 +431,15 @@ internal sealed class VersionSet : IAsyncDisposable
         }
         return t;
     }
+
+    /// <summary>
+    /// The running timestamp size of a column family, used to encode file boundaries (VersionEdit::EncodeTo(dst, ts_sz)):
+    /// files that do not persist timestamps (persist_user_defined_timestamps = false) store their boundaries without them.
+    /// </summary>
+    private int TimestampSizeOfColumnFamily(ColumnFamilyVersion cf) => _cfs.TryGetValue(cf.Id, out ColumnFamilyData? c) ? c.TimestampSize : 0;
+
+    private int TimestampSizeOfEdit(VersionEdit edit) =>
+        edit.NewFiles.Count > 0 && _cfs.TryGetValue(edit.ColumnFamily, out ColumnFamilyData? c) ? c.TimestampSize : 0;
 
     /// <summary>Builds the state written at the start of a new MANIFEST (WriteCurrentStateToManifest). REQUIRES: DB mutex.</summary>
     private RecoveredVersionState BuildSnapshotState()

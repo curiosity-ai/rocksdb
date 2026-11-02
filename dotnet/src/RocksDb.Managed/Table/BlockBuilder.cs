@@ -28,6 +28,10 @@ public sealed class BlockBuilder : IDisposable
     private readonly DataBlockHashIndexBuilder? _hashIndexBuilder;
     private readonly bool _useCommonPrefix;
     private readonly bool _isUserKey;
+    // strip_ts_sz_: user-defined timestamp size removed from every key before it is persisted
+    // (persist_user_defined_timestamps = false); 0 keeps keys as given.
+    private readonly int _stripTsSize;
+    private readonly PooledBufferWriter? _stripBuf;
     private PooledBufferWriter _buffer;
     private readonly PooledBufferWriter _lastKey;
     // Common-prefix feature: the first key's user key and the running common prefix length (first_key_prefix_).
@@ -60,10 +64,33 @@ public sealed class BlockBuilder : IDisposable
     /// <param name="isUserKey">Keys are user keys (index without sequence numbers) rather than internal keys.</param>
     public BlockBuilder(int restartInterval, bool useDeltaEncoding, bool useValueDeltaEncoding, DataBlockIndexType indexType, double hashTableUtilRatio,
         bool useCommonPrefix, bool isUserKey)
+        : this(restartInterval, useDeltaEncoding, useValueDeltaEncoding, indexType, hashTableUtilRatio, useCommonPrefix, isUserKey, stripTimestampSize: 0)
+    {
+    }
+
+    /// <param name="restartInterval">Number of keys between restart points (&gt;= 1).</param>
+    /// <param name="useDeltaEncoding">Share key prefixes with the previous key.</param>
+    /// <param name="useValueDeltaEncoding">Index blocks with format_version &gt;= 4: omit value length; non-restart entries store the caller's delta value.</param>
+    /// <param name="indexType">Data blocks may append a hash index (keys must be internal keys).</param>
+    /// <param name="hashTableUtilRatio">data_block_hash_table_util_ratio.</param>
+    /// <param name="useCommonPrefix">Store the block's common user-key prefix once (format_version &gt;= 8; requires delta encoding).</param>
+    /// <param name="isUserKey">Keys are user keys (index without sequence numbers) rather than internal keys.</param>
+    /// <param name="stripTimestampSize">
+    /// Port of strip_ts_sz_ (persist_user_defined_timestamps = false): the trailing user-defined timestamp of this many
+    /// bytes is removed from every key before it is written (MaybeStripTimestampFromKey); 0 keeps keys whole. The data
+    /// block hash index still hashes the user key with its timestamp, like upstream.
+    /// </param>
+    public BlockBuilder(int restartInterval, bool useDeltaEncoding, bool useValueDeltaEncoding, DataBlockIndexType indexType, double hashTableUtilRatio,
+        bool useCommonPrefix, bool isUserKey, int stripTimestampSize)
     {
         if (useCommonPrefix && !useDeltaEncoding) throw new ArgumentException("the common-prefix feature requires delta encoding", nameof(useCommonPrefix));
+        // The common-prefix feature requires user keys without stripped timestamps (BlockBuilder ctor assert).
+        if (useCommonPrefix && stripTimestampSize != 0) throw new ArgumentException("the common-prefix feature cannot strip timestamps", nameof(useCommonPrefix));
+        ArgumentOutOfRangeException.ThrowIfNegative(stripTimestampSize);
         _useCommonPrefix = useCommonPrefix;
         _isUserKey = isUserKey;
+        _stripTsSize = stripTimestampSize;
+        if (stripTimestampSize != 0) _stripBuf = new PooledBufferWriter(64);
         if (useCommonPrefix)
         {
             _firstKeyPrefix = new PooledBufferWriter(64);
@@ -131,7 +158,7 @@ public sealed class BlockBuilder : IDisposable
     public int EstimateSizeAfterKV(int keyLength, int valueLength)
     {
         int estimate = CurrentSizeEstimate;
-        estimate += keyLength;
+        estimate += keyLength - _stripTsSize;
         estimate += !_useValueDeltaEncoding || _counter >= _restartInterval ? valueLength : valueLength / 2;
         if (_counter >= _restartInterval) estimate += sizeof(uint);
         estimate += sizeof(int); // varint for shared prefix length (imprecise)
@@ -151,6 +178,41 @@ public sealed class BlockBuilder : IDisposable
     public void Add(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ReadOnlySpan<byte> deltaValue, bool skipDeltaEncoding)
     {
         System.Diagnostics.Debug.Assert(!_finished);
+        if (_stripTsSize != 0)
+        {
+            AddStripped(key, value, deltaValue, skipDeltaEncoding);
+            return;
+        }
+        AddCore(key, key, value, deltaValue, skipDeltaEncoding);
+    }
+
+    /// <summary>MaybeStripTimestampFromKey: persists the key without its timestamp (hash index keeps the original).</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void AddStripped(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ReadOnlySpan<byte> deltaValue, bool skipDeltaEncoding)
+    {
+        int ts = _stripTsSize;
+        PooledBufferWriter b = _stripBuf!;
+        b.Clear();
+        if (_isUserKey)
+        {
+            if (key.Length < ts) ThrowHelper.InvalidArgument("key too short for its timestamp");
+            b.Write(key[..^ts]);
+        }
+        else
+        {
+            // StripTimestampFromInternalKey: user key without timestamp + footer.
+            if (key.Length < ts + Db.DbFormat.InternalKeyFooterSize) ThrowHelper.InvalidArgument("key too short for its timestamp");
+            int userLen = key.Length - Db.DbFormat.InternalKeyFooterSize - ts;
+            b.Write(key[..userLen]);
+            b.Write(key[^Db.DbFormat.InternalKeyFooterSize..]);
+        }
+        AddCore(b.WrittenSpan, key, value, deltaValue, skipDeltaEncoding);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void AddCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> originalKey, ReadOnlySpan<byte> value, ReadOnlySpan<byte> deltaValue,
+        bool skipDeltaEncoding)
+    {
         int bufferSize = _buffer.WrittenCount;
         int shared = 0;
         if (_counter >= _restartInterval)
@@ -204,7 +266,7 @@ public sealed class BlockBuilder : IDisposable
 
         if (_hashIndexBuilder is { Valid: true })
         {
-            _hashIndexBuilder.Add(key[..^Db.DbFormat.InternalKeyFooterSize], _numRestarts - 1);
+            _hashIndexBuilder.Add(originalKey[..^Db.DbFormat.InternalKeyFooterSize], _numRestarts - 1);
         }
 
         if (_useDeltaEncoding)
@@ -291,6 +353,7 @@ public sealed class BlockBuilder : IDisposable
     {
         _buffer.Dispose();
         _lastKey.Dispose();
+        _stripBuf?.Dispose();
         _firstKeyPrefix?.Dispose();
         _rewriteBuffer?.Dispose();
         _hashIndexBuilder?.Release();

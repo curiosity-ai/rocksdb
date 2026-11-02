@@ -145,6 +145,11 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     private SstFileWriter AddWithTimestamp(ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp, ReadOnlySpan<byte> value, EntryType type)
     {
         if (_ucmp.TimestampSize != timestamp.Length) ThrowHelper.InvalidArgument("Timestamp size mismatch");
+        if (StripTimestamp && !IsMinTimestamp(timestamp))
+        {
+            // Rep::AddImpl (strip_timestamp): in this mode, users always provide a min timestamp.
+            ThrowHelper.InvalidArgument("persist_user_defined_timestamps flag is set to false, only minimum timestamp is accepted.");
+        }
         byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(key.Length + timestamp.Length);
         try
         {
@@ -194,6 +199,10 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     public SstFileWriter DeleteRange(ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey, ReadOnlySpan<byte> timestamp)
     {
         if (_ucmp.TimestampSize != timestamp.Length) ThrowHelper.InvalidArgument("Timestamp size mismatch");
+        if (StripTimestamp && !IsMinTimestamp(timestamp))
+        {
+            ThrowHelper.InvalidArgument("persist_user_defined_timestamps flag is set to false, only minimum timestamp is accepted for start key.");
+        }
         byte[] b = new byte[beginKey.Length + timestamp.Length];
         byte[] e = new byte[endKey.Length + timestamp.Length];
         beginKey.CopyTo(b);
@@ -260,8 +269,37 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
         }
     }
 
-    private ExternalSstFileInfo MakeInfo(BlockBasedTableBuilder builder) =>
-        new(_path, _smallestKey, _largestKey.WrittenSpan.ToArray(), _smallestRangeDel, _largestRangeDel, 0, builder.FileSize, _numEntries, _numRangeDelEntries, 2);
+    /// <summary>
+    /// Rep::strip_timestamp: user-defined timestamps are not persisted (persist_user_defined_timestamps = false), so only
+    /// the minimum timestamp is accepted and the file stores keys without it.
+    /// </summary>
+    private bool StripTimestamp => _ucmp.TimestampSize > 0 && !_options.PersistUserDefinedTimestamps;
+
+    /// <summary>CompareTimestamp(ts, MinU64Ts()) == 0 (the minimum u64 timestamp is all zeros).</summary>
+    private static bool IsMinTimestamp(ReadOnlySpan<byte> timestamp) => !timestamp.ContainsAnyExcept((byte)0);
+
+    private ExternalSstFileInfo MakeInfo(BlockBasedTableBuilder builder)
+    {
+        byte[] smallest = _smallestKey;
+        byte[] largest = _largestKey.WrittenSpan.ToArray();
+        byte[] smallestRangeDel = _smallestRangeDel;
+        byte[] largestRangeDel = _largestRangeDel;
+        if (StripTimestamp)
+        {
+            // SstFileWriter::Finish: the file info keys are reported without the (stripped) timestamp.
+            int ts = _ucmp.TimestampSize;
+            smallest = StripUserKey(smallest, ts);
+            largest = StripUserKey(largest, ts);
+            if (_numRangeDelEntries > 0)
+            {
+                smallestRangeDel = StripUserKey(smallestRangeDel, ts);
+                largestRangeDel = StripUserKey(largestRangeDel, ts);
+            }
+        }
+        return new(_path, smallest, largest, smallestRangeDel, largestRangeDel, 0, builder.FileSize, _numEntries, _numRangeDelEntries, 2);
+    }
+
+    private static byte[] StripUserKey(byte[] key, int ts) => key.Length >= ts ? key.AsSpan(0, key.Length - ts).ToArray() : key;
 
     private void Close()
     {

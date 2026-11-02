@@ -228,6 +228,8 @@ internal sealed class GetContext
         CancellationToken cancellationToken)
     {
         if (!ValueIsBlobIndex) return ValueTask.CompletedTask;
+        // With user-defined timestamps the blob record is keyed by the user key with the version's timestamp.
+        if (TimestampSize != 0 && _blobUserKey.WrittenCount > 0) userKey = _blobUserKey.WrittenMemory;
         Scratch.Clear();
         ValueTask t = source.GetBlobAsync(version, options, userKey, Value.WrittenSpan, Scratch, cancellationToken);
         if (t.IsCompletedSuccessfully)

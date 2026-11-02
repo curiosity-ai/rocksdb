@@ -110,7 +110,7 @@ public sealed partial class BlockBasedTableReader
     private int VisitBlock<TBatch>(TBatch batch, int key, BlockIter data, Block block, bool first) where TBatch : class, ITableMultiGetBatch
     {
         ReadOnlySpan<byte> internalKey = batch.InternalKey(key);
-        data.InitializeData(block, _icmp, GlobalSequenceNumber);
+        data.InitializeData(block, _icmp, GlobalSequenceNumber, PadTimestampSize);
         try
         {
             if (first)
