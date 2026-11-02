@@ -467,6 +467,166 @@ public sealed class DbTimestampTests
 
     // ---- WriteBatch (write_batch_test.cc timestamp cases) --------------------------------------------------------
 
+    private static string K3(int i) => "k" + i.ToString("D3", System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// Port of DeleteRangeWithTimestampTableOptions.BasicReadAndIterate (persisted timestamps): half of the keys are
+    /// written before a range tombstone at ts 100 over [50, 150), half after; only covered keys older than the
+    /// tombstone are deleted, Get reports the tombstone's timestamp, and compaction keeps the tombstone.
+    /// </summary>
+    [TestMethod]
+    public void DeleteRangeWithTimestampBasicReadAndIterate()
+    {
+        const int Num = 200, RangeBegin = 50, RangeEnd = 150, NumPerFile = 25;
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = OpenUdt(fs, UdtOptions(bloom: true));
+        for (int i = 0; i < Num; i++)
+        {
+            if (i == Num / 2) db.DeleteRange(B(K3(RangeBegin)), B(K3(RangeEnd)), Ts((ulong)i));
+            db.Put(B(K3(i)), Ts((ulong)i), B("val" + i));
+            if (i % NumPerFile == NumPerFile - 1 && i < Num - NumPerFile) db.Flush();
+        }
+
+        for (int pass = 0; pass < 2; pass++)
+        {
+            ReadOptions ro = At(Num);
+            using (Iterator it = db.NewIterator(ro))
+            {
+                int expected = 0;
+                for (it.SeekToFirst(); it.Valid; it.Next())
+                {
+                    Assert.AreEqual(K3(expected), S(it.Key.ToArray()));
+                    expected = expected == RangeBegin - 1 ? Num / 2 : expected + 1;
+                }
+                Assert.AreEqual(Num, expected);
+                expected = Num / 2;
+                for (it.Seek(B(K3(Num / 2))); it.Valid; it.Next()) Assert.AreEqual(K3(expected++), S(it.Key.ToArray()));
+                Assert.AreEqual(Num, expected);
+                expected = RangeBegin - 1;
+                for (it.SeekForPrev(B(K3(Num / 2 - 1))); it.Valid; it.Prev()) Assert.AreEqual(K3(expected--), S(it.Key.ToArray()));
+                Assert.AreEqual(-1, expected);
+            }
+            // At ts 0 only key 0 exists.
+            CollectionAssert.AreEqual(new[] { "k000=val0@0" }, Scan(db, At(0)));
+
+            for (int i = 0; i < Num; i++)
+            {
+                (string? v, ulong t) = GetAt(db.DefaultColumnFamily, K3(i), Num);
+                if (i >= RangeBegin && i < Num / 2)
+                {
+                    Assert.IsNull(v, K3(i));
+                    Assert.AreEqual((ulong)(Num / 2), t, "timestamp of the covering tombstone for " + K3(i));
+                }
+                else
+                {
+                    Assert.AreEqual("val" + i, v);
+                    Assert.AreEqual((ulong)i, t);
+                }
+            }
+            byte[][] keys = new byte[Num][];
+            for (int i = 0; i < Num; i++) keys[i] = B(K3(i));
+            byte[]?[] mg = db.MultiGet(ro, keys);
+            for (int i = 0; i < Num; i++) Assert.AreEqual(i >= RangeBegin && i < Num / 2 ? null : "val" + i, S(mg[i]));
+            // Before the tombstone everything written so far is visible.
+            Assert.AreEqual("val60", GetAt(db.DefaultColumnFamily, K3(60), 99).Value);
+
+            db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+        }
+    }
+
+    /// <summary>
+    /// Port of DBBasicTestWithTimestamp.DeleteRangeGetIteratorWithSnapshot: a tombstone [1, 3) at ts 1 is only visible
+    /// to reads whose snapshot and timestamp are both at or after it.
+    /// </summary>
+    [TestMethod]
+    public void DeleteRangeWithTimestampAndSnapshots()
+    {
+        const int Num = 4;
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = OpenUdt(fs, UdtOptions());
+        Snapshot? before = null;
+        for (int i = 0; i < Num; i++)
+        {
+            db.Put(B(K3(i)), Ts((ulong)i), B("val" + i));
+            if (i == 1)
+            {
+                before = db.GetSnapshot();
+                db.DeleteRange(B(K3(1)), B(K3(3)), Ts(1));
+            }
+            if (i == Num / 2) db.Flush();
+        }
+        using Snapshot after = db.GetSnapshot();
+        using Snapshot beforeSnap = before!;
+
+        void Verify(Snapshot snap, ulong readTs, string?[] expected)
+        {
+            var ro = new ReadOptions { Snapshot = snap, Timestamp = Ts(readTs) };
+            var keys = new byte[Num][];
+            var scan = new List<string>();
+            for (int i = 0; i < Num; i++)
+            {
+                keys[i] = B(K3(i));
+                var v = new ArrayBufferWriter<byte>();
+                bool found = db.DefaultColumnFamily.TryGet(ro, keys[i], v, new ArrayBufferWriter<byte>());
+                Assert.AreEqual(expected[i], found ? S(v.WrittenSpan.ToArray()) : null, K3(i) + " at ts " + readTs);
+                if (expected[i] is not null) scan.Add(K3(i) + "=" + expected[i] + "@" + i);
+            }
+            byte[]?[] mg = db.MultiGet(ro, keys);
+            for (int i = 0; i < Num; i++) Assert.AreEqual(expected[i], S(mg[i]));
+            CollectionAssert.AreEqual(scan, Scan(db, ro));
+            scan.Reverse();
+            CollectionAssert.AreEqual(scan, ScanReverse(db, ro));
+        }
+
+        Verify(beforeSnap, 0, ["val0", null, null, null]);
+        Verify(beforeSnap, Num, ["val0", "val1", null, null]);
+        Verify(after, 0, ["val0", null, null, null]);
+        Verify(after, Num, ["val0", null, "val2", "val3"]);
+    }
+
+    /// <summary>
+    /// Range tombstones are bounded by full_history_ts_low in compactions: keys covered by a tombstone above it survive
+    /// (a reader may use a timestamp between them), tombstones and covered keys below it are dropped at the bottommost
+    /// level (CompactionRangeDelAggregator ts_upper_bound_, CompactionOutputs::AddRangeDels).
+    /// </summary>
+    [TestMethod]
+    public void DeleteRangeWithTimestampCompactionHonorsFullHistoryTsLow()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = OpenUdt(fs, UdtOptions());
+        db.Put(B("a"), Ts(10), B("a10"));
+        db.Put(B("b"), Ts(10), B("b10"));
+        db.DeleteRange(B("a"), B("c"), Ts(20));
+        db.Put(B("b"), Ts(30), B("b30"));
+        db.DeleteRange(B("b"), B("d"), Ts(40));
+        db.Put(B("c"), Ts(50), B("c50"));
+        db.Flush();
+        // Every stored version, ignoring the tombstones, shows what compaction physically kept.
+        var raw = new ReadOptions { Timestamp = Ts(ulong.MaxValue), IterStartTs = Ts(0), IgnoreRangeDeletions = true };
+        CollectionAssert.AreEqual(new[] { "a=a10@10", "b=b30@30", "b=b10@10", "c=c50@50" }, Scan(db, raw));
+        CollectionAssert.AreEqual(new[] { "c=c50@50" }, Scan(db, At(100)));
+        CollectionAssert.AreEqual(new[] { "b=b30@30" }, Scan(db, At(35)));
+        CollectionAssert.AreEqual(new[] { "a=a10@10", "b=b10@10" }, Scan(db, At(15)));
+
+        // Without full_history_ts_low nothing is dropped.
+        db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+        CollectionAssert.AreEqual(new[] { "a=a10@10", "b=b30@30", "b=b10@10", "c=c50@50" }, Scan(db, raw));
+        CollectionAssert.AreEqual(new[] { "a=a10@10", "b=b10@10" }, Scan(db, At(15)));
+
+        // full_history_ts_low = 25: only the tombstone at 20 may delete keys; a10 and b10 (below 25) go away.
+        db.CompactRange(new CompactRangeOptions { FullHistoryTsLow = Ts(25), BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+        CollectionAssert.AreEqual(new[] { "b=b30@30", "c=c50@50" }, Scan(db, raw));
+        CollectionAssert.AreEqual(new[] { "b=b30@30" }, Scan(db, At(35)));
+        CollectionAssert.AreEqual(new[] { "c=c50@50" }, Scan(db, At(100)));
+        Assert.AreEqual(40UL, GetAt(db.DefaultColumnFamily, "b", 45).Ts);
+
+        // full_history_ts_low = 45: the tombstone at 40 removes b30, then is dropped itself.
+        db.CompactRange(new CompactRangeOptions { FullHistoryTsLow = Ts(45), BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+        CollectionAssert.AreEqual(new[] { "c=c50@50" }, Scan(db, raw));
+        CollectionAssert.AreEqual(new[] { "c=c50@50" }, Scan(db, At(100)));
+        Assert.AreEqual(ulong.MaxValue, GetAt(db.DefaultColumnFamily, "b", 100).Ts);
+    }
+
     [TestMethod]
     public void WriteBatchRecordsAppendTimestampToKeys()
     {

@@ -48,6 +48,7 @@ internal sealed class CompactionJob
 
     // Range tombstones to write (fragmented over all inputs, truncated to input file boundaries at user-key level).
     private FragmentedRangeTombstoneList? _outputTombstones;
+    private byte[]? _fullHistoryTsLow;
     private readonly int[] _rangeDelLevelPtrs;
 
     // Current output.
@@ -172,7 +173,13 @@ internal sealed class CompactionJob
             if (f.Largest.Length > 0 && _icmp.CompareUserKey(e, hi) > 0) e = hi;
             if (_icmp.CompareUserKey(s, e) >= 0) continue;
             byte[] sa = s.ToArray(), ea = e.ToArray();
-            foreach (ulong seq in list.GetSequences(i)) into.Add(new FragmentedRangeTombstoneList.Tombstone(sa, ea, seq));
+            ReadOnlySpan<ulong> seqs = list.GetSequences(i);
+            for (int k = 0; k < seqs.Length; k++)
+            {
+                // With timestamps the clipped keys may carry another timestamp: pass the tombstone's explicitly.
+                byte[]? ts = list.TimestampSize == 0 ? null : list.GetTimestamp(i, k).ToArray();
+                into.Add(new FragmentedRangeTombstoneList.Tombstone(sa, ea, seqs[k], ts));
+            }
         }
     }
 
@@ -188,7 +195,11 @@ internal sealed class CompactionJob
         long start = System.Diagnostics.Stopwatch.GetTimestamp();
         Stats.NumInputFiles = _c.TotalInputFiles;
         Stats.BytesRead = _c.TotalInputBytes;
-        RangeDelAggregator rangeDel = RangeDelAggregator.ForCompaction(_icmp, _snapshots);
+        // full_history_ts_low of the column family at the time the job runs (CompactionJob: cfd->GetFullHistoryTsLow()).
+        byte[]? fullHistoryTsLow = _cfd.TimestampSize != 0 ? _cfd.FullHistoryTsLow : null;
+        _fullHistoryTsLow = fullHistoryTsLow;
+        // With user-defined timestamps only tombstones at or below full_history_ts_low delete keys.
+        RangeDelAggregator rangeDel = RangeDelAggregator.ForCompaction(_icmp, _snapshots, fullHistoryTsLow);
         var raw = new List<FragmentedRangeTombstoneList.Tombstone>();
         InternalIterator input = MakeInputIterator(rangeDel, raw);
         // CompactionJob::ProcessKeyValueCompaction: a BlobCountingIterator measures the blob inflow when the input
@@ -214,8 +225,6 @@ internal sealed class CompactionJob
         ulong latestSnapshot = _snapshots.Length == 0 ? 0 : _snapshots[^1];
         MergeHelper? merge = mergeOperator is null ? null : new MergeHelper(_icmp, mergeOperator, filter, latestSnapshot, _c.StartLevel);
         ulong earliestWriteConflict = DbFormat.MaxSequenceNumber;
-        // full_history_ts_low of the column family at the time the job runs (CompactionJob: cfd->GetFullHistoryTsLow()).
-        byte[]? fullHistoryTsLow = _cfd.TimestampSize != 0 ? _cfd.FullHistoryTsLow : null;
         if (merge is not null) merge.FullHistoryTsLow = fullHistoryTsLow;
         var iter = new CompactionIterator(input, _icmp, merge, _snapshots, earliestWriteConflict, rangeDel, _c, filter,
             _db.Options.EnforceSingleDelContracts, _cancellation)
@@ -303,12 +312,24 @@ internal sealed class CompactionJob
         FragmentedRangeTombstoneList t = _outputTombstones!;
         for (int i = 0; i < t.Count; i++)
         {
-            foreach (ulong seq in t.GetSequences(i))
+            ReadOnlySpan<ulong> seqs = t.GetSequences(i);
+            for (int k = 0; k < seqs.Length; k++)
             {
-                if (seq > _earliestSnapshot) return false;
+                if (!TombstoneConsiderDrop(t, i, k)) return false;
             }
         }
         return true;
+    }
+
+    /// <summary>
+    /// consider_drop of AddRangeDels: the tombstone is visible to no snapshot and, with user-defined timestamps, its
+    /// timestamp is below full_history_ts_low.
+    /// </summary>
+    private bool TombstoneConsiderDrop(FragmentedRangeTombstoneList t, int i, int k)
+    {
+        if (t.GetSequences(i)[k] > _earliestSnapshot) return false;
+        if (t.TimestampSize == 0) return true;
+        return _fullHistoryTsLow is not null && _cfd.UserComparator.CompareTimestamp(t.GetTimestamp(i, k), _fullHistoryTsLow) < 0;
     }
 
     private void OpenOutput()
@@ -465,10 +486,17 @@ internal sealed class CompactionJob
             // There is another file coming whose coverage will begin at next_table_min_key. The current file needs to
             // extend range tombstone coverage through its own keys and through user keys preceding next_table_min_key's.
             ReadOnlySpan<byte> nextUser = DbFormat.ExtractUserKey(nextTableMinKey);
-            if (meta.Largest.Length > 0 && _icmp.EqualUserKey(DbFormat.ExtractUserKey(meta.Largest), nextUser)) upperBound = meta.Largest;
-            else upperBound = MakeInternalKey(nextUser, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion);
+            if (meta.Largest.Length > 0 && _cfd.UserComparator.EqualWithoutTimestamp(DbFormat.ExtractUserKey(meta.Largest), nextUser)) upperBound = meta.Largest;
+            else
+            {
+                // SetMaxSeqAndTs: next user key with the maximum timestamp, kMaxSequenceNumber, kTypeRangeDeletion.
+                upperBound = MakeInternalKey(nextUser, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion);
+                int ts = _cfd.TimestampSize;
+                if (ts != 0) upperBound.AsSpan(nextUser.Length - ts, ts).Fill(0xff);
+            }
         }
         if (lowerBound is not null && upperBound is not null && _icmp.Compare(lowerBound, upperBound) > 0) return;
+        int tsSize = tombstones.TimestampSize;
 
         for (int i = 0; i < tombstones.Count; i++)
         {
@@ -478,24 +506,32 @@ internal sealed class CompactionJob
             if (lowerBound is not null && _icmp.Compare(lowerBound, fEnd, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion) >= 0) continue;
             ulong prevKeptStripe = ulong.MaxValue;
             bool stop = false;
-            foreach (ulong seq in tombstones.GetSequences(i))
+            ReadOnlySpan<ulong> seqs = tombstones.GetSequences(i);
+            for (int k = 0; k < seqs.Length; k++)
             {
-                // Only the newest tombstone of each snapshot stripe matters (CompactionRangeDelAggregator).
-                ulong stripe = StripeOf(seq);
-                if (stripe == prevKeptStripe) continue;
-                prevKeptStripe = stripe;
+                ulong seq = seqs[k];
+                // Only the newest tombstone of each snapshot stripe matters (CompactionRangeDelAggregator). With
+                // user-defined timestamps every tombstone is kept (FragmentTombstones drops none for compaction).
+                if (tsSize == 0)
+                {
+                    ulong stripe = StripeOf(seq);
+                    if (stripe == prevKeptStripe) continue;
+                    prevKeptStripe = stripe;
+                }
+                ReadOnlySpan<byte> ts = tsSize == 0 ? default : tombstones.GetTimestamp(i, k);
 
-                bool considerDrop = seq <= _earliestSnapshot;
+                bool considerDrop = TombstoneConsiderDrop(tombstones, i, k);
                 if (considerDrop && bottommost)
                 {
                     Stats.IterStats.NumRangeDelDropObsolete++;
                     continue;
                 }
-                // tombstone_start (user key raised to the lower bound's) / truncated to [lower, upper].
-                ReadOnlySpan<byte> startUser = fStart;
-                if (lowerBound is not null && _icmp.CompareUserKey(startUser, DbFormat.ExtractUserKey(lowerBound)) < 0)
+                // tombstone_start (user key raised to the lower bound's) / truncated to [lower, upper]. With timestamps
+                // the start key carries the tombstone's timestamp, also when raised (the timestamp goes with the seqno).
+                ReadOnlySpan<byte> startUser = tsSize == 0 ? fStart : FlushJob.ReplaceTimestamp(fStart, ts);
+                if (lowerBound is not null && _cfd.UserComparator.CompareWithoutTimestamp(startUser, DbFormat.ExtractUserKey(lowerBound)) < 0)
                 {
-                    startUser = DbFormat.ExtractUserKey(lowerBound);
+                    startUser = tsSize == 0 ? DbFormat.ExtractUserKey(lowerBound) : FlushJob.ReplaceTimestamp(DbFormat.ExtractUserKey(lowerBound), ts);
                 }
                 if (upperBound is not null && _icmp.Compare(upperBound, startUser, seq, EntryType.RangeDeletion) < 0)
                 {
@@ -512,8 +548,15 @@ internal sealed class CompactionJob
                     continue;
                 }
                 // The file stores the untruncated fragment; its boundaries do the truncation on read.
-                byte[] fragKey = MakeInternalKey(fStart, seq, EntryType.RangeDeletion);
-                builder.Add(fragKey, fEnd);
+                if (tsSize == 0)
+                {
+                    builder.Add(MakeInternalKey(fStart, seq, EntryType.RangeDeletion), fEnd);
+                }
+                else
+                {
+                    byte[] fragKey = MakeInternalKey(FlushJob.ReplaceTimestamp(fStart, ts), seq, EntryType.RangeDeletion);
+                    builder.Add(fragKey, FlushJob.ReplaceTimestamp(fEnd, ts));
+                }
                 // FileMetaData::UpdateBoundariesForRange
                 if (meta.Smallest.Length == 0 || _icmp.Compare(tStart, meta.Smallest) < 0) meta.Smallest = tStart;
                 if (meta.Largest.Length == 0 || _icmp.Compare(meta.Largest, tEnd) < 0) meta.Largest = tEnd;

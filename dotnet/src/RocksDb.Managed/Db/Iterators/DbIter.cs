@@ -597,6 +597,12 @@ public sealed class DbIter : IDisposable
             {
                 _numSkipped++; // skip this entry
             }
+            else if (_tsSize != 0 && IsCoveredByRangeTombstone(userKey, seq))
+            {
+                // With user-defined timestamps an older version of the key may have a higher seqno than a newer one, so
+                // a covered entry does not hide the next one: drop just this entry, like upstream's MergingIterator.
+                return StepAction.Next;
+            }
             else
             {
                 _numSkipped = 0;
@@ -1207,6 +1213,13 @@ public sealed class DbIter : IDisposable
                 // timestamp. Therefore, we are done with the current user key.
                 break;
             }
+            if (visible && _tsSize != 0 && IsCoveredByRangeTombstone(userKey, seq))
+            {
+                // Dropped like by upstream's MergingIterator (see FindNextUserEntryStep).
+                _iter.Prev();
+                ++numSkipped;
+                continue;
+            }
             SaveTimestamp(userKey);
 
             TooManyInternalKeysSkipped(true);
@@ -1338,7 +1351,7 @@ public sealed class DbIter : IDisposable
                 _valid = false;
                 return;
             }
-            if (IsVisible(seq, userKey)) break;
+            if (IsVisible(seq, userKey) && (_tsSize == 0 || !IsCoveredByRangeTombstone(userKey, seq))) break;
             _iter.Next();
         }
 

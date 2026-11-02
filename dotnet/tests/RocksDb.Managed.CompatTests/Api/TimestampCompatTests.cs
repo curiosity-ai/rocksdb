@@ -103,6 +103,38 @@ public sealed unsafe class TimestampCompatTests
         }
     }
 
+    /// <summary>
+    /// DeleteRange with a timestamp (the C API has no such call): the batch is built by the managed WriteBatch, whose
+    /// rep is byte-identical to native WriteBatch::DeleteRange(cf, begin, end, ts), and written as is.
+    /// </summary>
+    private static void NativeDeleteRange(RocksDbSharp.RocksDb db, string begin, string end, ulong ts)
+    {
+        using var mb = new WriteBatch();
+        mb.DeleteRange(0, B(begin), B(end), Ts(ts));
+        byte[] rep = mb.Data.ToArray();
+        IntPtr wb = N.rocksdb_writebatch_create_from(rep, (UIntPtr)rep.Length);
+        try
+        {
+            N.rocksdb_write(db.Handle, s_nativeWrite.Handle, wb, out IntPtr err);
+            Check(err);
+        }
+        finally
+        {
+            N.rocksdb_writebatch_destroy(wb);
+        }
+    }
+
+    /// <summary>A few range deletions over [0, keys) at timestamps around <paramref name="baseTs"/>.</summary>
+    private static void WriteRangeDeletions(int keys, ulong baseTs, Action<string, string, ulong> deleteRange)
+    {
+        var rnd = new Random(4321 + (int)baseTs);
+        for (int r = 0; r < 4; r++)
+        {
+            int a = rnd.Next(keys), b = a + rnd.Next(1, keys / 4);
+            deleteRange(Key(a), Key(b), baseTs + (ulong)rnd.Next(5, 40));
+        }
+    }
+
     private static void NativeCompact(RocksDbSharp.RocksDb db, ulong? tsLow)
     {
         IntPtr opt = N.rocksdb_compactoptions_create();
@@ -248,7 +280,12 @@ public sealed unsafe class TimestampCompatTests
     {
         for (int i = 0; i < Math.Min(expected.Count, actual.Count); i++)
         {
-            if (expected[i] != actual[i]) Assert.Fail(what + ": first difference at line " + i + ": expected '" + expected[i] + "', actual '" + actual[i] + "'");
+            if (expected[i] != actual[i])
+            {
+                var ctx = new StringBuilder();
+                for (int j = Math.Max(0, i - 6); j < Math.Min(Math.Min(expected.Count, actual.Count), i + 6); j++) ctx.Append("\n  ").Append(expected[j]).Append("  |  ").Append(actual[j]);
+                Assert.Fail(what + ": first difference at line " + i + ": expected '" + expected[i] + "', actual '" + actual[i] + "'" + ctx);
+            }
         }
         Assert.AreEqual(expected.Count, actual.Count, what + ": line count");
     }
@@ -350,6 +387,177 @@ public sealed unsafe class TimestampCompatTests
         {
             AssertSameDump(managedDump, ManagedDump(db, Keys, 60), "managed reading native-compacted DB");
         }
+    }
+
+    [TestMethod]
+    public void NativeRangeDeletionsWithTimestampsReadIdenticallyBothWays()
+    {
+        using var dir = new TempDir("udt-rdel");
+        const int Keys = 120;
+        List<string> nativeDump;
+        using (RocksDbSharp.RocksDb native = OpenNative(dir.Path))
+        {
+            WriteHistory(Keys, 0, (k, t, v) => NativePut(native, k, t, v), (k, t) => NativeDelete(native, k, t));
+            WriteRangeDeletions(Keys, 0, (b, e, t) => NativeDeleteRange(native, b, e, t));
+            native.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            WriteHistory(Keys, 30, (k, t, v) => NativePut(native, k, t, v), (k, t) => NativeDelete(native, k, t));
+            WriteRangeDeletions(Keys, 30, (b, e, t) => NativeDeleteRange(native, b, e, t));
+            native.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            // Compaction keeping every version (no full_history_ts_low): the tombstones are rewritten.
+            NativeCompact(native, null);
+            WriteHistory(Keys, 60, (k, t, v) => NativePut(native, k, t, v), (k, t) => NativeDelete(native, k, t));
+            WriteRangeDeletions(Keys, 60, (b, e, t) => NativeDeleteRange(native, b, e, t));
+            native.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            WriteRangeDeletions(Keys, 90, (b, e, t) => NativeDeleteRange(native, b, e, t)); // memtable / WAL only
+            nativeDump = NativeDump(native, Keys, 0);
+        }
+        using (RocksDatabase db = OpenManaged(dir.Path))
+        {
+            AssertSameDump(nativeDump, ManagedDump(db, Keys, 0), "managed reading native range deletions (WAL + files)");
+            db.Flush();
+            AssertSameDump(nativeDump, ManagedDump(db, Keys, 0), "managed after flushing the recovered range deletions");
+            db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+            AssertSameDump(nativeDump, ManagedDump(db, Keys, 0), "managed after compacting native range deletions");
+        }
+        using (RocksDbSharp.RocksDb native = OpenNative(dir.Path))
+        {
+            AssertSameDump(nativeDump, NativeDump(native, Keys, 0), "native reading managed-rewritten range deletions");
+            // GC with full_history_ts_low: tombstones and covered versions below it may be dropped by native.
+            NativeCompact(native, 70);
+            nativeDump = NativeDump(native, Keys, 70);
+        }
+        using (RocksDatabase db = OpenManaged(dir.Path))
+        {
+            AssertSameDump(nativeDump, ManagedDump(db, Keys, 70), "managed reading native GC of range deletions");
+        }
+    }
+
+    [TestMethod]
+    public void ManagedRangeDeletionsWithTimestampsReadIdenticallyInNative()
+    {
+        using var dir = new TempDir("udt-rdel-m");
+        const int Keys = 120;
+        List<string> managedDump;
+        using (RocksDatabase db = OpenManaged(dir.Path))
+        {
+            WriteHistory(Keys, 0, (k, t, v) => db.Put(B(k), Ts(t), B(v)), (k, t) => db.Delete(B(k), Ts(t)));
+            WriteRangeDeletions(Keys, 0, (b, e, t) => db.DeleteRange(B(b), B(e), Ts(t)));
+            db.Flush();
+            WriteHistory(Keys, 30, (k, t, v) => db.Put(B(k), Ts(t), B(v)), (k, t) => db.Delete(B(k), Ts(t)));
+            WriteRangeDeletions(Keys, 30, (b, e, t) => db.DeleteRange(B(b), B(e), Ts(t)));
+            db.Flush();
+            db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+            WriteHistory(Keys, 60, (k, t, v) => db.Put(B(k), Ts(t), B(v)), (k, t) => db.Delete(B(k), Ts(t)));
+            WriteRangeDeletions(Keys, 60, (b, e, t) => db.DeleteRange(B(b), B(e), Ts(t)));
+            db.Flush();
+            db.CompactRange(new CompactRangeOptions { FullHistoryTsLow = Ts(50), BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+            WriteRangeDeletions(Keys, 90, (b, e, t) => db.DeleteRange(B(b), B(e), Ts(t)));
+            managedDump = ManagedDump(db, Keys, 50);
+            Assert.IsTrue(managedDump.Exists(static l => l.EndsWith(" -", StringComparison.Ordinal)));
+        }
+        using (RocksDbSharp.RocksDb native = OpenNative(dir.Path))
+        {
+            AssertSameDump(managedDump, NativeDump(native, Keys, 50), "native reading managed range deletions (WAL + files)");
+            native.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            NativeCompact(native, null);
+            AssertSameDump(managedDump, NativeDump(native, Keys, 50), "native after compacting managed range deletions");
+        }
+    }
+
+    /// <summary>
+    /// DeleteRangeGetIteratorWithSnapshot across implementations: keys k0..k3 at ts 0..3, a tombstone [k1, k3) at ts 1
+    /// written between k1 and k2, a snapshot before and after it, a flush in the middle. Native and managed must
+    /// return the same Get / scan results for every (snapshot, read timestamp) pair.
+    /// </summary>
+    [TestMethod]
+    public void RangeDeletionWithTimestampAndSnapshotsMatchesNative()
+    {
+        using var dir = new TempDir("udt-rdel-snap");
+        var nativeResults = new List<string>();
+        var managedResults = new List<string>();
+        using (RocksDbSharp.RocksDb native = OpenNative(dir.Path))
+        {
+            IntPtr before = IntPtr.Zero;
+            for (int i = 0; i < 4; i++)
+            {
+                NativePut(native, Key(i), (ulong)i, "val" + i);
+                if (i == 1)
+                {
+                    before = N.rocksdb_create_snapshot(native.Handle);
+                    NativeDeleteRange(native, Key(1), Key(3), 1);
+                }
+                if (i == 2) native.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            }
+            IntPtr after = N.rocksdb_create_snapshot(native.Handle);
+            IntPtr tsBuf = Marshal.AllocHGlobal(8);
+            try
+            {
+                foreach (IntPtr snap in new[] { before, after })
+                {
+                    foreach (ulong readTs in new ulong[] { 0, 1, 2, 4 })
+                    {
+                        Ts(readTs).CopyTo(new Span<byte>((void*)tsBuf, 8));
+                        var ro = new RocksDbSharp.ReadOptions();
+                        N.rocksdb_readoptions_set_timestamp(ro.Handle, tsBuf, (UIntPtr)8);
+                        N.rocksdb_readoptions_set_snapshot(ro.Handle, snap);
+                        string tag = (snap == before ? "before" : "after") + "@" + readTs + " ";
+                        for (int i = 0; i < 4; i++)
+                        {
+                            byte[] k = B(Key(i));
+                            IntPtr tsOut = IntPtr.Zero;
+                            IntPtr v = N.rocksdb_get_with_ts(native.Handle, ro.Handle, k, (UIntPtr)k.Length, out UIntPtr vlen, (IntPtr)(&tsOut), out UIntPtr tslen, out IntPtr err);
+                            Check(err);
+                            nativeResults.Add(tag + "get " + Key(i) + " " + (v == IntPtr.Zero ? "-" : Encoding.UTF8.GetString(new ReadOnlySpan<byte>((void*)v, (int)vlen))));
+                            if (v != IntPtr.Zero) N.rocksdb_free(v);
+                            if (tsOut != IntPtr.Zero) N.rocksdb_free(tsOut);
+                        }
+                        using RocksDbSharp.Iterator it = native.NewIterator(null, ro);
+                        for (it.SeekToFirst(); it.Valid(); it.Next()) nativeResults.Add(tag + "fwd " + Entry(it.Key(), it.Value(), NativeIterTs(it), false));
+                        for (it.SeekToLast(); it.Valid(); it.Prev()) nativeResults.Add(tag + "rev " + Entry(it.Key(), it.Value(), NativeIterTs(it), false));
+                    }
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(tsBuf);
+                N.rocksdb_release_snapshot(native.Handle, before);
+                N.rocksdb_release_snapshot(native.Handle, after);
+            }
+        }
+        using (var dir2 = new TempDir("udt-rdel-snap-m"))
+        using (RocksDatabase db = OpenManaged(dir2.Path))
+        {
+            Snapshot? before = null;
+            for (int i = 0; i < 4; i++)
+            {
+                db.Put(B(Key(i)), Ts((ulong)i), B("val" + i));
+                if (i == 1)
+                {
+                    before = db.GetSnapshot();
+                    db.DeleteRange(B(Key(1)), B(Key(3)), Ts(1));
+                }
+                if (i == 2) db.Flush();
+            }
+            using Snapshot after = db.GetSnapshot();
+            using Snapshot b = before!;
+            foreach (Snapshot snap in new[] { b, after })
+            {
+                foreach (ulong readTs in new ulong[] { 0, 1, 2, 4 })
+                {
+                    var ro = new ReadOptions { Snapshot = snap, Timestamp = Ts(readTs) };
+                    string tag = (snap == b ? "before" : "after") + "@" + readTs + " ";
+                    for (int i = 0; i < 4; i++)
+                    {
+                        byte[]? v = db.Get(ro, B(Key(i)));
+                        managedResults.Add(tag + "get " + Key(i) + " " + (v is null ? "-" : Encoding.UTF8.GetString(v)));
+                    }
+                    using Iterator it = db.NewIterator(ro);
+                    for (it.SeekToFirst(); it.Valid; it.Next()) managedResults.Add(tag + "fwd " + Entry(it.Key, it.Value, it.Timestamp, false));
+                    for (it.SeekToLast(); it.Valid; it.Prev()) managedResults.Add(tag + "rev " + Entry(it.Key, it.Value, it.Timestamp, false));
+                }
+            }
+        }
+        AssertSameDump(nativeResults, managedResults, "range deletion with timestamps and snapshots");
     }
 
     [TestMethod]
