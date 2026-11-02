@@ -250,6 +250,38 @@ public sealed class CheckpointIngestReadOnlyTests
         }
         Assert.AreEqual(StatusCode.NotSupported, Assert.ThrowsExactly<RocksDbException>(() => sec.Put(B("a"), B("b"))).Code);
     }
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task SecondaryOpenedOnEmptyWalCatchesUpLaterWrites(bool localFs)
+    {
+        // Regression: a secondary that opens while the primary's current WAL is still empty (e.g. right after Flush)
+        // must pick up records appended to that WAL later.
+        string root = localFs ? Path.Combine(Path.GetTempPath(), "rocksdb-managed-sec-" + Guid.NewGuid().ToString("N")) : "";
+        RocksDb.Managed.Env.IFileSystem fs = localFs ? RocksDb.Managed.Env.LocalFileSystem.Instance : NewFs();
+        string dbPath = localFs ? root + "/db" : DbPath;
+        string secPath = localFs ? root + "/sec" : "/sec-empty";
+        try
+        {
+            await using RocksDatabase primary = await RocksDatabase.OpenAsync(dbPath, new DbOptions { CreateIfMissing = true, FileSystem = fs });
+            for (int i = 0; i < 20; i++) primary.Put(Key(i), Value(i, 0));
+            await primary.FlushAsync(); // the current WAL is now empty
+            await using RocksDatabase sec = await RocksDatabase.OpenAsSecondaryAsync(dbPath, secPath, new DbOptions { FileSystem = fs });
+            Assert.AreEqual(S(Value(3, 0)), GetString(sec, S(Key(3))!));
+            for (int round = 1; round <= 3; round++)
+            {
+                for (int i = 100 * round; i < 100 * round + 10; i++) primary.Put(Key(i), Value(i, round));
+                await sec.TryCatchUpWithPrimaryAsync();
+                Assert.AreEqual(primary.GetLatestSequenceNumber(), sec.GetLatestSequenceNumber(), "round " + round);
+                Assert.AreEqual(S(Value(100 * round + 5, round)), GetString(sec, S(Key(100 * round + 5))!), "round " + round);
+            }
+        }
+        finally
+        {
+            if (localFs) try { Directory.Delete(root, recursive: true); } catch (IOException) { }
+        }
+    }
+
     // ---- TTL -----------------------------------------------------------------------------------------------
 
     [TestMethod]
