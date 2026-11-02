@@ -129,6 +129,16 @@ internal sealed class CompactionBlobProcessor : IDisposable
         return _filterValue.WrittenSpan;
     }
 
+    /// <summary>
+    /// BlobFetcher::FetchBlob for the compaction filter's lazy resolver: appends the blob of
+    /// <paramref name="blobIndexValue"/> (inlined indexes yield their value) and counts the read.
+    /// </summary>
+    public void FetchBlobCounted(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> blobIndexValue, IBufferWriter<byte> output)
+    {
+        FetchBlob(userKey, blobIndexValue, output);
+        NumBlobsRead++;
+    }
+
     /// <summary>BlobFetcher::FetchBlob for a merge base value: appends the blob of <paramref name="blobIndexValue"/>.</summary>
     public void FetchBlob(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> blobIndexValue, IBufferWriter<byte> output) =>
         _source.GetBlob(_inputVersion, s_readOptions, userKey, blobIndexValue, output);

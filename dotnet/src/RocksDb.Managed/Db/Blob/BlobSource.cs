@@ -294,6 +294,26 @@ internal sealed class BlobSource : IDisposable
         }
     }
 
+    /// <summary>
+    /// Partial read of an uncompressed blob of a version's blob file (lazy wide columns): copies the value bytes
+    /// [<paramref name="rangeOffset"/>, + <paramref name="destination"/>.Length) without checksum verification and
+    /// without populating the blob cache. Incomplete when <c>read_tier</c> is kBlockCacheTier.
+    /// </summary>
+    public ulong ReadBlobRange(ReadOptions? options, ReadOnlySpan<byte> userKey, ulong fileNumber, ulong offset, ulong size, ulong rangeOffset,
+        Span<byte> destination)
+    {
+        CheckCanRead(options);
+        ReaderEntry entry = AcquireReader(fileNumber);
+        try
+        {
+            return entry.Reader.ReadValueRange(userKey.Length, offset, size, rangeOffset, destination);
+        }
+        finally
+        {
+            entry.Release();
+        }
+    }
+
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private async ValueTask ReadAndCacheAsync(ReadOptions? options, ReadOnlyMemory<byte> userKey, ulong fileNumber, ulong offset, ulong size,
         CompressionType compression, IBufferWriter<byte> output, CancellationToken cancellationToken)

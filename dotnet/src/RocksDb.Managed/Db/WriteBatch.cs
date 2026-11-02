@@ -438,6 +438,23 @@ public sealed class WriteBatch : IDisposable
     public WriteBatch PutEntity(ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns) => PutEntity(0, key, columns);
 
     /// <summary>
+    /// Stores the attribute groups of <paramref name="key"/>: one entity per group, in the group's column family
+    /// (WriteBatch::PutEntity(key, attribute_groups), db/write_batch.cc). InvalidArgument when
+    /// <paramref name="attributeGroups"/> is empty.
+    /// </summary>
+    public WriteBatch PutAttributeGroups(ReadOnlySpan<byte> key, ReadOnlySpan<AttributeGroup> attributeGroups)
+    {
+        if (attributeGroups.IsEmpty) ThrowHelper.InvalidArgument("Cannot call this method with empty attribute groups");
+        for (int gi = 0; gi < attributeGroups.Length; gi++)
+        {
+            AttributeGroup ag = attributeGroups[gi];
+            if (ag.ColumnFamily is null) ThrowHelper.InvalidArgument("Cannot call this method without a column family handle");
+            PutEntity(ag.ColumnFamily.Id, key, ag.Columns.Span);
+        }
+        return this;
+    }
+
+    /// <summary>
     /// Stores a wide-column entity (WriteBatch::PutEntity): the columns are sorted by name and serialized
     /// (wide-column format version 1). Duplicate column names fail with Corruption ("Wide columns out of order") like
     /// upstream. Port of WriteBatchInternal::PutEntity (db/write_batch.cc).

@@ -40,10 +40,13 @@ public enum CompactionFilterDecision : byte
     Purge = 6,
     /// <summary>
     /// Replace the entry with a wide-column entity made of the columns added to the <c>newColumns</c> list (any order,
-    /// unique names). Only from <see cref="CompactionFilter.FilterV3"/>.
+    /// unique names). Only from <see cref="CompactionFilter.FilterV3"/> / <see cref="CompactionFilter.FilterV4"/>.
     /// </summary>
     ChangeWideColumnEntity = 7,
-    /// <summary>Only meaningful for blob-by-key filtering; not supported from <see cref="CompactionFilter.Filter"/>.</summary>
+    /// <summary>
+    /// Only from <see cref="CompactionFilter.FilterBlobByKey"/> ("read the blob and decide by value"); returning it from
+    /// Filter / FilterV3 / FilterV4 fails the compaction.
+    /// </summary>
     Undetermined = 8,
 }
 
@@ -54,8 +57,8 @@ public enum CompactionFilterDecision : byte
 /// <para>
 /// Implementations must be thread-safe unless they are created per compaction by a factory, and must not throw
 /// (an exception aborts the compaction). The <see cref="Name"/> is persisted in the OPTIONS file
-/// (<c>compaction_filter</c>). Compaction itself is not implemented yet; <see cref="Db.MergeHelper"/> already calls
-/// <see cref="Filter"/> for merge operands (FilterMerge).
+/// (<c>compaction_filter</c>). Entry points, most specific first: <see cref="FilterV4"/> (all value types, lazy blob
+/// columns) -&gt; <see cref="FilterV3"/> (entities) -&gt; <see cref="Filter"/> (FilterV2: plain values and merge operands).
 /// </para>
 /// </summary>
 public abstract class CompactionFilter
@@ -98,6 +101,40 @@ public abstract class CompactionFilter
     }
 
     /// <summary>
+    /// Port of FilterV4: <see cref="FilterV3"/> plus lazy loading of blob-backed entity columns. Called for plain values
+    /// (blob values are read first), merge operands and wide-column entities.
+    /// <para>
+    /// <paramref name="blobResolver"/> is non-null only when <see cref="SupportsFilterV4"/> is true and the entity has
+    /// blob-backed columns (written by flush/compaction value separation or blob direct write). Then
+    /// <paramref name="existingColumns"/> holds all columns, but a blob-backed column's value is its serialized blob
+    /// reference: use <see cref="WideColumnBlobResolver.IsBlobColumn"/> and
+    /// <see cref="WideColumnBlobResolver.ResolveColumn"/> to read only the blobs the filter needs. Otherwise (and for
+    /// all filters that do not opt in) every column value is already resolved.
+    /// </para>
+    /// <para>The default implementation delegates to <see cref="FilterV3"/>.</para>
+    /// </summary>
+    public virtual CompactionFilterDecision FilterV4(int level, ReadOnlySpan<byte> key, CompactionFilterValueType valueType,
+        ReadOnlySpan<byte> existingValue, WideColumns? existingColumns, IBufferWriter<byte> newValue, List<WideColumn> newColumns,
+        IBufferWriter<byte> skipUntil, WideColumnBlobResolver? blobResolver) =>
+        FilterV3(level, key, valueType, existingValue, existingColumns, newValue, newColumns, skipUntil);
+
+    /// <summary>
+    /// Port of SupportsFilterV4: true if the filter overrides <see cref="FilterV4"/> and handles a
+    /// <see cref="WideColumnBlobResolver"/> (lazy blob loading). When false (default), blob-backed entity columns are
+    /// resolved before the filter is called, so FilterV3-only filters see the actual values.
+    /// </summary>
+    public virtual bool SupportsFilterV4 => false;
+
+    /// <summary>
+    /// Port of FilterBlobByKey: for a plain value stored in a blob file, a chance to decide from the key alone without
+    /// reading the blob. Return <see cref="CompactionFilterDecision.Undetermined"/> (the default) to have the blob read
+    /// and passed to <see cref="FilterV4"/> as a <see cref="CompactionFilterValueType.Value"/>; any other decision is
+    /// final (<paramref name="newValue"/> / <paramref name="skipUntil"/> as for <see cref="Filter"/>).
+    /// </summary>
+    public virtual CompactionFilterDecision FilterBlobByKey(int level, ReadOnlySpan<byte> key, IBufferWriter<byte> newValue,
+        IBufferWriter<byte> skipUntil) => CompactionFilterDecision.Undetermined;
+
+    /// <summary>
     /// Port of IgnoreSnapshots. Upstream only supports true (filtering may hide versions still visible to snapshots).
     /// </summary>
     public virtual bool IgnoreSnapshots => true;
@@ -117,4 +154,28 @@ public abstract class CompactionFilterFactory
 
     /// <summary>Port of ShouldFilterTableFileCreation: by default only compactions (not flushes) are filtered.</summary>
     public virtual bool ShouldFilterTableFileCreation(bool isFlush) => !isFlush;
+}
+
+/// <summary>
+/// Port of rocksdb::WideColumnBlobResolver (include/rocksdb/compaction_filter.h): lazily reads the blob-backed columns of
+/// the entity passed to <see cref="CompactionFilter.FilterV4"/>, so a filter only pays the I/O for the columns it
+/// inspects. Valid only during that call; used by the compaction thread only.
+/// </summary>
+public abstract class WideColumnBlobResolver
+{
+    /// <summary>The number of columns of the entity (NumColumns).</summary>
+    public abstract int ColumnCount { get; }
+
+    /// <summary>True if column <paramref name="columnIndex"/> is stored in a blob file; false when out of range.</summary>
+    public abstract bool IsBlobColumn(int columnIndex);
+
+    /// <summary>
+    /// The value of column <paramref name="columnIndex"/>: the blob for a blob-backed column (read once and cached),
+    /// the inline value otherwise. The span stays valid until <see cref="CompactionFilter.FilterV4"/> returns, so several
+    /// columns can be resolved and compared without copying. Throws <see cref="RocksDbException"/> (InvalidArgument
+    /// for an index out of range, Corruption / IOError for blob read failures). After a failed read the filter should
+    /// stop and return <see cref="CompactionFilterDecision.Keep"/>: the compaction fails with that error once the filter
+    /// returns, even if the filter caught it.
+    /// </summary>
+    public abstract ReadOnlySpan<byte> ResolveColumn(int columnIndex);
 }

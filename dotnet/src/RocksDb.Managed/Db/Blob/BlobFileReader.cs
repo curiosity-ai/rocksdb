@@ -161,6 +161,23 @@ internal sealed class BlobFileReader : IDisposable
         return (ulong)recordSize;
     }
 
+    /// <summary>
+    /// Partial read of an uncompressed blob (the lazy wide-column range read of db/wide/read_path_blob_resolver.cc):
+    /// copies bytes [<paramref name="rangeOffset"/>, <paramref name="rangeOffset"/> + <paramref name="destination"/>.Length)
+    /// of the value of the record at <paramref name="offset"/> into <paramref name="destination"/>. The record checksum is
+    /// not verified (a sub-range cannot be). Returns the bytes read from the file.
+    /// </summary>
+    public ulong ReadValueRange(int keySize, ulong offset, ulong valueSize, ulong rangeOffset, Span<byte> destination)
+    {
+        Prepare(keySize, offset, valueSize, CompressionType.None, verifyChecksums: false, out _, out _, out _);
+        if (rangeOffset > valueSize || (ulong)destination.Length > valueSize - rangeOffset)
+        {
+            ThrowHelper.InvalidArgument("Blob range out of bounds");
+        }
+        ReadExactly(_file, _path, (long)(offset + rangeOffset), destination, _stats);
+        return (ulong)destination.Length;
+    }
+
     /// <summary>Async <see cref="GetBlob"/>. <paramref name="userKey"/> must stay valid until completion.</summary>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<ulong> GetBlobAsync(ReadOnlyMemory<byte> userKey, ulong offset, ulong valueSize, CompressionType compression, bool verifyChecksums,
