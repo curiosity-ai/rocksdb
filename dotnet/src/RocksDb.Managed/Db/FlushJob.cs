@@ -59,6 +59,7 @@ internal static class FlushJob
             DbHostId = identity.HostId,
             CreationTime = now,
             OldestKeyTime = now,
+            NewestKeyTime = now, // FlushJob::WriteLevel0Table: current_time /* newest_key_time */
             FileCreationTime = now,
         };
 
@@ -68,6 +69,7 @@ internal static class FlushJob
             EpochNumber = epochNumber,
             FileCreationTime = now,
             OldestAncestorTime = now,
+            NewestKeyTime = now,
             // FileMetaData::user_defined_timestamps_persisted: the MANIFEST then stores the boundaries without timestamps.
             UserDefinedTimestampsPersisted = !stripTimestamps,
         };

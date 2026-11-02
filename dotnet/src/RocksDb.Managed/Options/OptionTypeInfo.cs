@@ -165,6 +165,12 @@ internal static class OptionEnumMaps
         ("kCompactionStyleNone", Managed.CompactionStyle.None),
     ]);
 
+    public static readonly EnumMap<CompactionStopStyle> CompactionStopStyle = new(
+    [
+        ("kCompactionStopStyleSimilarSize", Managed.CompactionStopStyle.SimilarSize),
+        ("kCompactionStopStyleTotalSize", Managed.CompactionStopStyle.TotalSize),
+    ]);
+
     public static readonly EnumMap<CompactionPri> CompactionPri = new(
     [
         ("kByCompensatedSize", Managed.CompactionPri.ByCompensatedSize),

@@ -61,6 +61,18 @@ public sealed class FileMetaData
     /// <summary>Opaque file system metadata used to accelerate file opening (kFileOpenMetadata).</summary>
     public byte[] FileOpenMetadata { get; set; } = [];
 
+    /// <summary>
+    /// In-memory only: the table property <c>rocksdb.newest.key.time</c> (0 = unknown). Upstream reads it from the
+    /// pinned table reader (FileMetaData::TryGetNewestKeyTime); here it is set for flush / compaction outputs and when
+    /// the table cache opens the file.
+    /// </summary>
+    internal ulong NewestKeyTime
+    {
+        get => Volatile.Read(ref _newestKeyTime);
+        set => Volatile.Write(ref _newestKeyTime, value);
+    }
+    private ulong _newestKeyTime;
+
     /// <summary>In-memory only (FileMetaData::being_compacted): the file is an input of a running compaction. Guarded by the DB mutex.</summary>
     internal bool BeingCompacted { get; set; }
 

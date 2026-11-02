@@ -288,6 +288,10 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .Bool("disable_auto_compactions", static o => o.DisableAutoCompactions, static (o, v) => o.DisableAutoCompactions = v)
         .Enum("compaction_style", OptionEnumMaps.CompactionStyle, static o => o.CompactionStyle, static (o, v) => o.CompactionStyle = v)
         .Enum("compaction_pri", OptionEnumMaps.CompactionPri, static o => o.CompactionPri, static (o, v) => o.CompactionPri = v)
+        .Add("compaction_options_fifo", static o => o.CompactionOptionsFifo.ToStructString(),
+            static (o, v) => o.CompactionOptionsFifo = CompactionOptionsFifo.ParseStructString("compaction_options_fifo", v))
+        .Add("compaction_options_universal", static o => o.CompactionOptionsUniversal.ToStructString(),
+            static (o, v) => o.CompactionOptionsUniversal = CompactionOptionsUniversal.ParseStructString("compaction_options_universal", v))
         .UInt64("max_sequential_skip_in_iterations", static o => o.MaxSequentialSkipInIterations, static (o, v) => o.MaxSequentialSkipInIterations = v)
         .Bool("optimize_filters_for_hits", static o => o.OptimizeFiltersForHits, static (o, v) => o.OptimizeFiltersForHits = v)
         .Bool("paranoid_file_checks", static o => o.ParanoidFileChecks, static (o, v) => o.ParanoidFileChecks = v)

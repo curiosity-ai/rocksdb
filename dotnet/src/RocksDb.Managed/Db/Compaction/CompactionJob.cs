@@ -358,6 +358,7 @@ internal sealed class CompactionJob
         ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         ulong oldestAncestor = _c.MinInputFileOldestAncestorTime();
         if (oldestAncestor == ulong.MaxValue) oldestAncestor = now;
+        ulong newestKeyTime = _c.MaxInputFileNewestKeyTime();
         VersionStorageInfo vs = _c.InputStorage;
         bool bottommostCompression = _c.OutputLevel >= vs.NumNonEmptyLevels - 1;
         TableBuilderOptions tbo = TableFactory.CreateBuilderOptions(_cfd.Options,
@@ -372,6 +373,7 @@ internal sealed class CompactionJob
             CreationTime = oldestAncestor,
             TargetFileSize = _c.MaxOutputFileSize,
             FileCreationTime = now,
+            NewestKeyTime = newestKeyTime,
         };
         _meta = new FileMetaData
         {
@@ -379,6 +381,7 @@ internal sealed class CompactionJob
             PathId = _c.OutputPathId,
             EpochNumber = _c.MinInputFileEpochNumber(),
             OldestAncestorTime = oldestAncestor,
+            NewestKeyTime = newestKeyTime,
             FileCreationTime = now,
             // user_defined_timestamps_persisted (persist_user_defined_timestamps): the outputs strip timestamps too.
             UserDefinedTimestampsPersisted = !_cfd.TimestampsInMemtableOnly,

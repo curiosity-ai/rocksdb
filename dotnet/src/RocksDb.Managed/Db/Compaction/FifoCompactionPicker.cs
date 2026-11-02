@@ -35,7 +35,10 @@ internal sealed class FifoCompactionPicker : CompactionPicker
             for (int i = levelFiles.Length - 1; i >= 0; i--)
             {
                 FileMetaData f = levelFiles[i];
-                ulong estNewestKeyTime = f.OldestAncestorTime != 0 ? f.OldestAncestorTime : f.FileCreationTime;
+                // FileMetaData::TryGetNewestKeyTime, else the oldest ancestor time (the table property upstream; the
+                // MANIFEST field, falling back to the file creation time, here).
+                ulong estNewestKeyTime = f.NewestKeyTime != 0 ? f.NewestKeyTime
+                    : f.OldestAncestorTime != 0 ? f.OldestAncestorTime : f.FileCreationTime;
                 if (estNewestKeyTime == 0 || estNewestKeyTime >= currentTime - ttl) break;
                 totalSize -= f.FileSize;
                 inputs.Files.Add(f);

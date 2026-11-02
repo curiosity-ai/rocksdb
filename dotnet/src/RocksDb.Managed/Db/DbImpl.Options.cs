@@ -32,6 +32,7 @@ internal sealed partial class DbImpl
         "blob_garbage_collection_force_threshold", "blob_compaction_readahead_size", "blob_file_starting_level", "prepopulate_blob_cache", "blob_file_writable_file_max_buffer_size",
         "sample_for_compression", "bottommost_compression", "compression_per_level", "experimental_mempurge_threshold",
         "memtable_protection_bytes_per_key", "block_protection_bytes_per_key", "compression_opts", "bottommost_compression_opts",
+        "compaction_options_fifo", "compaction_options_universal",
     };
 
     /// <summary>db_mutable_options_type_info names supported by the managed options model.</summary>
@@ -166,11 +167,11 @@ internal sealed partial class DbImpl
         if (o.TargetFileSizeBase == 0) ThrowHelper.InvalidArgument("target_file_size_base must be > 0");
         if (o.TargetFileSizeMultiplier <= 0) ThrowHelper.InvalidArgument("target_file_size_multiplier must be > 0");
         if (o.MaxBytesForLevelBase == 0) ThrowHelper.InvalidArgument("max_bytes_for_level_base must be > 0");
-        if (o.BlobGarbageCollectionAgeCutoff is < 0 or > 1)
+        if (o.EnableBlobGarbageCollection && o.BlobGarbageCollectionAgeCutoff is < 0 or > 1)
         {
             ThrowHelper.InvalidArgument("The age cutoff for blob garbage collection should be in the range [0.0, 1.0].");
         }
-        if (o.BlobGarbageCollectionForceThreshold is < 0 or > 1)
+        if (o.EnableBlobGarbageCollection && o.BlobGarbageCollectionForceThreshold is < 0 or > 1)
         {
             ThrowHelper.InvalidArgument("The garbage ratio threshold for forcing blob garbage collection should be in the range [0.0, 1.0].");
         }

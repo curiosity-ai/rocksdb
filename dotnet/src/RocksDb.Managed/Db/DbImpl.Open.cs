@@ -157,6 +157,15 @@ internal sealed partial class DbImpl
                     if (!FileSystem.FileExists(p)) ThrowHelper.Corruption("IO error: No such file or directory: While open a file for random read: " + p);
                 }
             }
+            // The FIFO TTL picker needs the newest key time of every L0 file (upstream: max_open_files = -1 pins every
+            // reader at open, LoadTableHandlers); opening the readers here records it in FileMetaData.NewestKeyTime.
+            if (cfd.Options.CompactionStyle == CompactionStyle.Fifo && cfd.Options.Ttl > 0)
+            {
+                foreach (FileMetaData f in s.LevelFiles(0))
+                {
+                    using TableReaderLease lease = cfd.TableCache.GetReader(f);
+                }
+            }
         }
 
         // ---- WAL replay (DBImpl::RecoverLogFiles) ----
@@ -210,6 +219,18 @@ internal sealed partial class DbImpl
     {
         ColumnFamilyOptions o = options.Clone();
         SanitizeCfOptions(o, Options.AllowIngestBehind, DbPaths.Count);
+        // ColumnFamilyData::ValidateOptions (DB::Open / CreateColumnFamily): blob garbage collection ranges.
+        if (o.EnableBlobGarbageCollection)
+        {
+            if (o.BlobGarbageCollectionAgeCutoff is < 0 or > 1)
+            {
+                ThrowHelper.InvalidArgument("The age cutoff for blob garbage collection should be in the range [0.0, 1.0].");
+            }
+            if (o.BlobGarbageCollectionForceThreshold is < 0 or > 1)
+            {
+                ThrowHelper.InvalidArgument("The garbage ratio threshold for forcing blob garbage collection should be in the range [0.0, 1.0].");
+            }
+        }
         return o;
     }
 
@@ -394,7 +415,7 @@ internal sealed partial class DbImpl
         {
             string fname = FileNames.LogFileName(WalDir, walNumber);
             var reporter = new WalRecoveryReporter { FileName = fname };
-            using var reader = new LogReader(FileSystem.OpenSequential(fname), reporter, checksum: Options.ParanoidChecks, walNumber)
+            using var reader = new LogReader(FileSystem.OpenSequential(fname), reporter, checksum: true, walNumber) // InitializeLogReader: always, even without paranoid_checks
             {
                 RecoveryMode = mode,
             };
