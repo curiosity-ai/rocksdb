@@ -96,12 +96,13 @@ $B report --csv out.csv --out out.md
 - **LSM shape / write-amp** (compaction configuration): files per level from `rocksdb.num-files-at-level<N>`, and
   flush + compaction bytes written divided by user bytes. The WAL is not counted. The written bytes have a resolution
   of 0.01 GB.
-- **Warm code only.** Benchmarks must measure warm code (CLAUDE.md): the runner is getting a `--warmup` pass that
-  runs every workload on a throwaway DB, including flush and compaction, and reports how many methods are
-  JIT-compiled during the measured run (this should be about 0). Reports produced before that change, including the
-  ones summarized below, ran `flush` and `compact` once in a fresh process, so their managed numbers include JIT
-  warm-up. The first compaction of a process is 2.5-3.5x slower than later ones (see "Perf pass #3" in
-  [perf.md](perf.md)). Treat those cells as cold-start numbers, not steady-state performance.
+- **Warm code only.** Benchmarks must measure warm code (CLAUDE.md). Every engine runs a warm-up first (`--warmup`,
+  default on; see "Warm-up" in `bench/README.md`): the whole workload on a throwaway DB, including flushes and
+  compactions, then the measurement on a fresh DB. The `jit` columns show how many methods were JIT-compiled while
+  each benchmark was timed (0 - a few after the warm-up; a few hundred in the compaction-heavy fills). Reports before
+  `2026-11-02-vm-warm*.md` (and the `-vm-cold*.md` counterparts) were measured cold: their managed numbers include
+  JIT and tier-0 code, e.g. the first compaction of a process is 2.5-3.5x slower than later ones. See "Benchmark
+  warm-up" in [perf.md](perf.md) for cold vs warm.
 - **`fillsync`** measures the device's fsync latency more than the engine. Expect large swings between runs.
 
 **Noise caveat.** The committed results come from a shared 4-vCPU cloud VM (KVM, Intel Xeon @ 2.80 GHz, 15 GiB)
@@ -111,46 +112,50 @@ from one cell.
 
 ## Latest results
 
-The source is `bench/results/2026-11-02-vm-perf3.md`, `-vm-perf3-compaction.md` and `-vm-blob.md` (after perf
-pass #3, .NET 10.0.14, librocksdb 11.12). Matrix sizes were reduced: num=300k with 200k reads for 100-byte values,
-and 60k entries for 1 KiB values. All runs were on the noisy shared VM described above.
+The source is `bench/results/2026-11-02-vm-warm.md` and `-vm-warm-compaction.md` (warm-up on, after perf pass #3 and
+the compaction-picking parity fixes, .NET 10.0.14, librocksdb 11.12) and `-vm-blob.md` (cold, before the warm-up).
+Matrix sizes were reduced: num=300k with 200k reads for 100-byte values, and 60k entries (200k reads) for 1 KiB
+values. All runs were on the shared VM described above (load 1 - 7 for the warm runs).
 
 Geometric mean of µs/op relative to c-native (lower is better; below 1.00x is faster than C):
 
 | configuration | rocksdb-sharp | managed | managed-async |
 |---|---:|---:|---:|
-| 100 B, 1 thread, no compression | 1.48x | 1.37x | 1.33x |
-| 100 B, 4 threads, no compression | 0.85x | 0.67x | 0.76x |
-| 100 B, 1 thread, LZ4 | 1.14x | 0.98x | 1.04x |
-| 100 B, 4 threads, LZ4 | 0.73x | 0.73x | 0.74x |
-| 1 KiB, 1 thread, no compression | 0.91x | 0.77x | 0.84x |
-| 1 KiB, 4 threads, no compression | 1.04x | 1.36x | 1.25x |
-| 1 KiB, 1 thread, LZ4 | 1.10x | 1.03x | 1.15x |
-| 1 KiB, 4 threads, LZ4 | 1.06x | 1.73x | 2.07x |
-| compaction-heavy (500k x 100 B, 1 thread) | 1.14x | 0.62x | 0.78x |
-| integrated BlobDB (200k x 1 KiB, 1 thread) | 0.84x | 0.55x | 0.53x |
+| 100 B, 1 thread, no compression | 0.98x | 0.52x | 0.66x |
+| 100 B, 4 threads, no compression | 1.05x | 0.60x | 0.63x |
+| 100 B, 1 thread, LZ4 | 1.19x | 0.63x | 0.68x |
+| 100 B, 4 threads, LZ4 | 1.10x | 0.61x | 0.59x |
+| 1 KiB, 1 thread, no compression | 0.90x | 0.50x | 0.48x |
+| 1 KiB, 4 threads, no compression | 0.99x | 0.73x | 0.72x |
+| 1 KiB, 1 thread, LZ4 | 1.09x | 0.67x | 0.73x |
+| 1 KiB, 4 threads, LZ4 | 0.89x | 0.81x | 0.72x |
+| compaction-heavy (500k x 100 B, 1 thread; median of 3 runs) | 1.02x | 0.57x | 0.68x |
+| integrated BlobDB (200k x 1 KiB, 1 thread; cold) | 0.84x | 0.55x | 0.53x |
 
 Takeaways:
 
-- **Writes** (`fillrandom`, `overwrite`, `deleterandom`) are at parity with C or faster in most configurations. For
-  example, `fillrandom` with 100 B values and 1 thread is 0.69x, and with the compaction-heavy configuration
-  `overwrite` is 0.69x. Writes allocate nothing per operation beyond the memtable arena.
-- **Point reads and seeks** are close to C for 100 B values (`readrandom` 0.69-1.26x, `readmissing` 0.33-0.65x,
-  `seekrandom` 0.46-0.93x). On the multi-level compaction-heavy tree they are faster (`readrandom` 0.70x,
-  `seekrandom` 0.33x). With 1 KiB values and 4 threads they are slower (`readrandom` 2.6x, `readreverse` 3.8x); this
-  configuration has the widest run-to-run spread and needs a quiet re-run.
+- **Writes** (`fillseq`, `fillrandom`, `overwrite`, `deleterandom`) are faster than C single-threaded (0.45-0.76x)
+  and around parity with 4 threads (0.5-1.5x; `fillrandom` / `overwrite` with 1 KiB values and 4 threads are
+  1.2-1.5x). In the compaction-heavy configuration `fillrandom` is 0.61x and `overwrite` 0.53x (medians of 3 runs).
+  Writes allocate nothing per operation beyond the memtable arena.
+- **Point reads, seeks and scans** are faster than C in every configuration of the warm matrix except a few
+  4-thread cells near 1.0-1.3x: `readrandom` 0.63-0.95x, `multireadrandom` 0.46-0.84x, `seekrandom` 0.58-0.77x,
+  `readseq` 0.35-0.95x, `readreverse` 0.30-0.86x; on the multi-level compaction-heavy tree `readrandom` 0.63x and
+  `seekrandom` 0.50x. (The cold reports showed 1 KiB / 4-thread reads at 2.6-3.8x: mostly JIT and noise.)
 - **Async** costs about the same as sync, because calls complete synchronously when nothing waits.
-- **Flush and compaction** in a fresh process (cold, see "Warm code only" above) are mostly slower than C: one flush is 0.7-2.0x without compression and
-  2.7-3.2x with LZ4, where the LZ4 codec's JIT warm-up dominates, and one full compaction is 0.96-2.35x. Later flushes
-  and compactions in the same process are at or below native cost ([perf.md](perf.md), perf pass #3).
+- **Flush and compaction** of a warm process are at or below native cost: one flush 0.28-0.97x without compression
+  (0.76-1.21x with LZ4, where the K4os LZ4 encoder is slower than native's), one full compaction 0.27-0.93x. Cold
+  (first in the process) they were 0.4-2.0x and 0.6-1.9x ([perf.md](perf.md), "Benchmark warm-up"). Single-shot rows
+  vary by +-50% between runs, also for c-native.
 - **LSM shape** in the compaction-heavy configuration: with flushes and compactions in lock step the managed engine
   produces the same LSM shapes, compactions and write-amp as native (`CompactionPickerParityTests`). Free-running,
   write-amp is 2.96-3.24 managed against 2.96 for c-native and 2.96-3.05 for rocksdb-sharp
   (`bench/results/2026-11-02-vm-picker-compaction.md`): the managed writer is faster, so its single compaction thread
   falls further behind (`waitforcompaction` 0.5-1.2 s against 0-0.4 s). See "Compaction-picking parity" in
-  [perf.md](perf.md).
-- **rocksdb-sharp** pays 10-50% over c-native on single-threaded small operations (P/Invoke and copies), and much
-  more on `readseq` (2.4x).
+  [perf.md](perf.md). The 6 cold / warm runs of the warm-up comparison give 2.96-3.15 managed and 2.87-3.05
+  managed-async against 2.96 native.
+- **rocksdb-sharp** pays 0-50% over c-native on single-threaded small operations (P/Invoke and copies), up to
+  2.3-2.5x on 4-thread `readseq` / `readreverse` with 100 B values.
 
 Older reports in `bench/results/` (`2026-11-02-vm*.md` before perf pass #2, `-vm-perf2*.md` after it) show how the
 numbers changed with each optimization pass.
