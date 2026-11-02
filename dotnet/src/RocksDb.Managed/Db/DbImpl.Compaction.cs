@@ -300,6 +300,7 @@ internal sealed partial class DbImpl
         try
         {
             CancellationToken ct = _bgCancellation.Token;
+            TestHooks.Invoke("DBImpl::RunCompaction:Start");
             ct.ThrowIfCancellationRequested();
             var edit = new VersionEdit { ColumnFamily = cfd.Id };
             if (c.IsDeletionCompaction)
@@ -333,6 +334,7 @@ internal sealed partial class DbImpl
                 if (cfd.Dropped) ThrowDropped(cfd);
             }
             ct.ThrowIfCancellationRequested();
+            TestHooks.Invoke("DBImpl::RunCompaction:BeforeLogAndApply");
             Versions.LogAndApplyAsync(cfd, edit, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
             lock (_mutex)
             {

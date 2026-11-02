@@ -200,14 +200,86 @@ internal sealed partial class DbImpl
         EnableBackgroundCompactions();
     }
 
-    /// <summary>Resolves the pluggable objects of a CF's options for this DB (merge operator name). Returns a copy.</summary>
-    private static ColumnFamilyOptions PrepareCfOptions(ColumnFamilyOptions options)
+    /// <summary>
+    /// Resolves the pluggable objects of a CF's options for this DB (merge operator name) and sanitizes them
+    /// (<see cref="SanitizeCfOptions"/>). Returns a copy; the caller's object is not modified.
+    /// </summary>
+    private ColumnFamilyOptions PrepareCfOptions(ColumnFamilyOptions options)
     {
         ColumnFamilyOptions o = options.Clone();
         if (o.MergeOperator is not null) o.MergeOperatorName = o.MergeOperator.Name;
         if (o.CompactionFilter is not null) o.CompactionFilterName = o.CompactionFilter.Name;
         if (o.CompactionFilterFactory is not null) o.CompactionFilterFactoryName = o.CompactionFilterFactory.Name;
+        SanitizeCfOptions(o, Options.AllowIngestBehind, DbPaths.Count);
         return o;
+    }
+
+    /// <summary>
+    /// Port of SanitizeCfOptions (db/column_family.cc), in place: clamps the options the engine relies on to their valid
+    /// ranges exactly like upstream, so that the same (possibly out-of-range) user options behave the same way in both
+    /// implementations and the OPTIONS file records the sanitized values. Not ported: memtable factory / prefix bloom
+    /// adjustments for unsupported memtables, ttl / periodic compaction defaults (the managed defaults are already the
+    /// sanitized values).
+    /// </summary>
+    internal static void SanitizeCfOptions(ColumnFamilyOptions result, bool allowIngestBehind, int numDbPaths)
+    {
+        // ClipToRange(&write_buffer_size, 64 KiB, 64 GiB)
+        result.WriteBufferSize = Math.Clamp(result.WriteBufferSize, 64UL << 10, 64UL << 30);
+        // arena_block_size <= 0 is derived from write_buffer_size by MemTableOptions.GetEffectiveArenaBlockSize.
+        result.MinWriteBufferNumberToMerge = Math.Min(result.MinWriteBufferNumberToMerge, result.MaxWriteBufferNumber - 1);
+        if (result.MinWriteBufferNumberToMerge < 1) result.MinWriteBufferNumberToMerge = 1;
+        if (result.NumLevels < 1) result.NumLevels = 1;
+        if (result.CompactionStyle == CompactionStyle.Level && result.NumLevels < 2) result.NumLevels = 2;
+        if (result.CompactionStyle == CompactionStyle.Universal && (allowIngestBehind || result.CfAllowIngestBehind) && result.NumLevels < 3)
+        {
+            result.NumLevels = 3;
+        }
+        if (result.MaxWriteBufferNumber < 2) result.MaxWriteBufferNumber = 2;
+        if (result.MaxWriteBufferSizeToMaintain < 0)
+        {
+            result.MaxWriteBufferSizeToMaintain = result.MaxWriteBufferNumber * (long)result.WriteBufferSize;
+        }
+        // bloom filter size shouldn't exceed 1/4 of memtable size.
+        if (result.MemtablePrefixBloomSizeRatio > 0.25) result.MemtablePrefixBloomSizeRatio = 0.25;
+        else if (result.MemtablePrefixBloomSizeRatio < 0) result.MemtablePrefixBloomSizeRatio = 0;
+        if (result.CompactionStyle == CompactionStyle.Fifo)
+        {
+            // since we delete level0 files in FIFO compaction when there are too many of them, these options don't
+            // really mean anything
+            result.Level0SlowdownWritesTrigger = int.MaxValue;
+            result.Level0StopWritesTrigger = int.MaxValue;
+        }
+        if (result.MaxBytesForLevelMultiplier <= 0) result.MaxBytesForLevelMultiplier = 1;
+        if (result.Level0FileNumCompactionTrigger == 0) result.Level0FileNumCompactionTrigger = 1;
+        if (result.Level0StopWritesTrigger < result.Level0SlowdownWritesTrigger
+            || result.Level0SlowdownWritesTrigger < result.Level0FileNumCompactionTrigger)
+        {
+            if (result.Level0SlowdownWritesTrigger < result.Level0FileNumCompactionTrigger)
+            {
+                result.Level0SlowdownWritesTrigger = result.Level0FileNumCompactionTrigger;
+            }
+            if (result.Level0StopWritesTrigger < result.Level0SlowdownWritesTrigger)
+            {
+                result.Level0StopWritesTrigger = result.Level0SlowdownWritesTrigger;
+            }
+        }
+        if (result.SoftPendingCompactionBytesLimit == 0)
+        {
+            result.SoftPendingCompactionBytesLimit = result.HardPendingCompactionBytesLimit;
+        }
+        else if (result.HardPendingCompactionBytesLimit > 0 && result.SoftPendingCompactionBytesLimit > result.HardPendingCompactionBytesLimit)
+        {
+            result.SoftPendingCompactionBytesLimit = result.HardPendingCompactionBytesLimit;
+        }
+        if (result.LevelCompactionDynamicLevelBytes)
+        {
+            // only makes sense for level-based compaction; can't be used with multiple db_paths (cf_paths default to them)
+            if (result.CompactionStyle != CompactionStyle.Level || numDbPaths > 1) result.LevelCompactionDynamicLevelBytes = false;
+        }
+        if (result.MaxCompactionBytes == 0)
+        {
+            result.MaxCompactionBytes = result.TargetFileSizeBase * 25;
+        }
     }
 
     private static ValueTask AwaitIo(ValueTask t, bool synchronous)
@@ -305,11 +377,10 @@ internal sealed partial class DbImpl
         if (wals.Count == 0) return edits;
 
         var progress = new ReplayProgress { LastSequence = Versions.LastSequence };
-        bool stopReplay = false;
         WalRecoveryMode mode = Options.WalRecoveryMode;
+        ulong corruptedWal = 0;
         foreach (ulong walNumber in wals)
         {
-            if (stopReplay) break;
             string fname = FileNames.LogFileName(WalDir, walNumber);
             var reporter = new WalRecoveryReporter { FileName = fname };
             using var reader = new LogReader(FileSystem.OpenSequential(fname), reporter, checksum: Options.ParanoidChecks, walNumber)
@@ -336,14 +407,34 @@ internal sealed partial class DbImpl
                             reporter.Error = null;
                             break;
                         case WalRecoveryMode.PointInTimeRecovery:
-                            // We should ignore the error but not continue replaying.
-                            stopReplay = true;
+                            if (err.Code == StatusCode.IOError) throw err; // likely loss of synced WAL: recovery fails
+                            // We should ignore the error but not continue replaying (HandleNonOkStatusOrOldLogRecord).
+                            // Records are still read: replay resumes if a later record continues the sequence
+                            // (MaybeReviseStopReplayForCorruption), e.g. writes made after an earlier PIT recovery.
+                            reporter.Error = null;
+                            if (!progress.StopReplay) corruptedWal = walNumber;
+                            progress.StopReplay = true;
                             break;
                         default:
                             throw err;
                     }
                 }
-                if (!got || stopReplay) break;
+                if (!got) break;
+            }
+        }
+        if (progress.StopReplay && mode is WalRecoveryMode.PointInTimeRecovery or WalRecoveryMode.TolerateCorruptedTailRecords)
+        {
+            // MaybeHandleStopReplayForCorruptionForInconsistency: a CF that already flushed data beyond the point of
+            // corruption cannot be made consistent with the others.
+            foreach (ColumnFamilyData cfd in GetColumnFamilies())
+            {
+                ulong liveBytes = 0;
+                VersionStorageInfo vs = cfd.Current.Storage;
+                for (int l = 0; l < vs.NumLevels; l++) liveBytes += vs.NumLevelBytes(l);
+                if (cfd.LogNumber > corruptedWal && liveBytes > 0)
+                {
+                    ThrowHelper.Corruption("Column family inconsistency: SST file contains data beyond the point of corruption in CF " + cfd.Name);
+                }
             }
         }
         ulong lastSequence = progress.LastSequence;
@@ -375,6 +466,10 @@ internal sealed partial class DbImpl
     {
         public ulong LastSequence;
         public bool AnyData;
+        /// <summary>Sequence the next record must start with to resume after a corruption (next_sequence), or MaxValue.</summary>
+        public ulong NextSequence = ulong.MaxValue;
+        /// <summary>Point-in-time recovery hit a corruption: records are dropped until the sequence continues.</summary>
+        public bool StopReplay;
     }
 
     /// <summary>Reads one WAL record and inserts it into the memtables. Returns false at the end of the WAL.</summary>
@@ -388,8 +483,16 @@ internal sealed partial class DbImpl
         }
         ulong seq = Util.Coding.DecodeFixed64(record);
         uint count = Util.Coding.DecodeFixed32(record[8..]);
+        if (progress.StopReplay)
+        {
+            // MaybeReviseStopReplayForCorruption: in point-in-time recovery mode, if sequence ids are consecutive we
+            // continue recovery despite the corruption.
+            if (Options.WalRecoveryMode == WalRecoveryMode.PointInTimeRecovery && seq == progress.NextSequence) progress.StopReplay = false;
+            else return true; // dropped
+        }
         var inserter = new MemTableInserter(this, walNumber, ignoreMissingColumnFamilies: true) { Sequence = seq };
         WriteBatch.Iterate(record, ref inserter);
+        progress.NextSequence = seq + count;
         if (count > 0)
         {
             progress.AnyData = true;

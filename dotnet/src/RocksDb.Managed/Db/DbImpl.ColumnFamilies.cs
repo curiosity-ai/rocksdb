@@ -77,7 +77,10 @@ internal sealed partial class DbImpl
             lock (_mutex)
             {
                 DbVersion current = cfd.Current;
-                ReleaseColumnFamilyResources(cfd);
+                // Readers holding a super version and running flushes / compactions may still read the CF's memtables
+                // and table files: memtables are reference counted, the table cache is closed at shutdown.
+                ReleaseColumnFamilyMemTables(cfd);
+                _droppedColumnFamilies.Add(cfd);
                 Versions.UnrefVersion(current);
                 _maybeStalled = IsWriteStalled();
                 SignalBackgroundWork();
