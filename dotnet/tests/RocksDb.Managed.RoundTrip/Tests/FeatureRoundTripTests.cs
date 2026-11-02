@@ -88,18 +88,24 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
 
     private static byte[] ManyValue(int i, int gen) => Filled((int)(((long)i * 7919 + gen * 31) % 160), (byte)(i + gen));
 
+    /// <summary>
+    /// The loader writes n keys in random order with small write buffers and auto compaction, so the data spreads over
+    /// L0..Ln (asserted); the other engine verifies, updates a slice and compacts; the loader reads it back.
+    /// </summary>
     [TestMethod]
-    public async Task ManyKeysAcrossLevels_NativeToManagedToNative()
+    [DataRow(EngineKind.Native)]
+    [DataRow(EngineKind.Managed)]
+    public async Task ManyKeysAcrossLevels(EngineKind loader)
     {
+        EngineKind other = Other(loader);
         int n = LongRuns ? 1_000_000 : 200_000;
         DbSpec spec = new();
         spec.ColumnFamilies.Add(new CfSpec { Name = "default", Compression = "lz4", FormatVersion = 6, Filter = "bloom", WriteBufferSize = 512UL << 10, Merge = MergeKind.StringAppend });
         spec.ColumnFamilies.Add(new CfSpec { Name = "counters", Compression = "zstd", FormatVersion = 7, Filter = "ribbon", WriteBufferSize = 256UL << 10, Merge = MergeKind.UInt64Add });
-        RoundTripHarness h = CreateHarness(spec, n.ToString(CultureInfo.InvariantCulture));
+        RoundTripHarness h = CreateHarness(spec, loader + "-" + n.ToString(CultureInfo.InvariantCulture));
         h.Model.MaxAbsentPerCf = 2000;
 
-        // Native: n keys in shuffled order with small write buffers and auto compaction -> data spread over L0..Ln.
-        ScriptBuilder b = h.NewScript("native-load");
+        ScriptBuilder b = h.NewScript(loader + "-load");
         int[] order = new int[n];
         for (int i = 0; i < n; i++) order[i] = i;
         h.Random.Shuffle(order);
@@ -115,7 +121,7 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
             b.Batch(false, ops);
         }
         b.Add(Op.Flush("default")).Add(Op.Props("default")).Verify();
-        await h.RunAsync(EngineKind.Native, b);
+        await h.RunAsync(loader, b);
         int deeper = 0;
         foreach (string line in h.LastOutput)
         {
@@ -124,10 +130,10 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
             if (f.Length == 4 && f[0] == "PROP" && f[2] != "files-at-level0") deeper += int.Parse(f[3], CultureInfo.InvariantCulture);
             if (f.Length == 4 && f[0] == "PROP") h.Log(line);
         }
-        Assert.IsTrue(deeper > 0, "native should have compacted data below L0: " + string.Join(" | ", h.LastOutput));
+        Assert.IsTrue(deeper > 0, $"{loader} should have compacted data below L0: " + string.Join(" | ", h.LastOutput));
 
-        // Managed: verify everything, overwrite / delete / range-delete a slice, flush part of it.
-        ScriptBuilder m = h.NewScript("managed-update");
+        // The other engine: verify everything, overwrite / delete / range-delete a slice, flush part of it, compact.
+        ScriptBuilder m = h.NewScript(other + "-update");
         for (int k = 0; k < n; k += 10)
         {
             if (k % 30 == 0) m.Add(Op.Delete("default", ManyKey(k)));
@@ -135,14 +141,15 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
         }
         m.Add(Op.DeleteRange("default", ManyKey(n / 2), ManyKey(n / 2 + 777)))
          .Add(Op.Merge("counters", ManyKey(3), ReferenceModel.U64(1)))
-         .Add(Op.Flush("default"));
+         .Add(Op.Flush("default"))
+         .Add(Op.Compact("counters"));
         for (int k = 1; k < n; k += 1000) m.Add(Op.Put("default", ManyKey(k), ManyValue(k, 2))); // stays in the WAL
         m.Verify();
-        await h.RunAsync(EngineKind.Managed, m);
+        await h.RunAsync(other, m);
 
-        // Native reads the managed result back (and compacts it), managed verifies once more.
-        await h.RunAsync(EngineKind.Native, h.NewScript("native-verify").Add(Op.Compact("default")).Verify());
-        await h.RunAsync(EngineKind.Managed, h.NewScript("managed-final"));
+        // The loader reads the result back and compacts it fully; the other engine verifies once more.
+        await h.RunAsync(loader, h.NewScript(loader + "-verify").Add(Op.Compact("default")).Verify());
+        await h.RunAsync(other, h.NewScript(other + "-final"));
     }
 
     // ---------------------------------------------------------------------------------------------------------
@@ -303,18 +310,5 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
         // And back: the writer opens what the loader wrote using the loader's OPTIONS file.
         await h.RunAsync(writer, h.NewScript($"{writer}-options-back", h.DbPath, fromFile, h.Model));
         await h.RunAsync(writer, h.NewScript($"{writer}-own-options"));
-    }
-
-    // ---------------------------------------------------------------------------------------------------------
-    // managed compaction
-
-    [TestMethod]
-    public void ManagedCompactRange_NativeReads()
-    {
-        bool available = typeof(RocksDatabase).GetMethods().Any(mi => mi.Name.StartsWith("CompactRange", StringComparison.Ordinal))
-            || typeof(ColumnFamily).GetMethods().Any(mi => mi.Name.StartsWith("CompactRange", StringComparison.Ordinal));
-        Assert.Inconclusive(available
-            ? "RocksDatabase/ColumnFamily now expose CompactRange: wire it into ManagedEngine.CompactRange so the alternating tests compact with the managed engine too"
-            : "the managed port has no public CompactRange yet (compaction is in progress); managed runs skip compact ops (logged as SKIP)");
     }
 }

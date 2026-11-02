@@ -9,7 +9,7 @@ public sealed class GeneratorOptions
     public int Ops { get; set; } = 1500;
     public int KeySpace { get; set; } = 3000;
     public bool AllowFlush { get; set; } = true;
-    public bool AllowCompact { get; set; }
+    public bool AllowCompact { get; set; } = true;
     public bool AllowSnapshots { get; set; } = true;
     public bool AllowColumnFamilyChanges { get; set; } = true;
     public bool AllowSingleDelete { get; set; } = true;

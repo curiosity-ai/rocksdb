@@ -41,9 +41,9 @@ public sealed class AlternatingRoundTripTests : RoundTripTestBase
             {
                 Ops = opsPerRun,
                 AllowFlush = !walOnly,
-                // Manual compaction only where it exists (native); a full-range CompactRange also moves data to the
-                // bottom levels so the next managed run reads L1+ files.
-                AllowCompact = engine == EngineKind.Native && !walOnly,
+                // Full-range CompactRange by both engines: the other engine then reads (and compacts) bottom-level
+                // files the first one wrote.
+                AllowCompact = !walOnly,
             });
             if (i % 3 == 2) b.Add(Op.Reopen()); // recovery from WAL in the middle of a run
             b.Verify().Dump();

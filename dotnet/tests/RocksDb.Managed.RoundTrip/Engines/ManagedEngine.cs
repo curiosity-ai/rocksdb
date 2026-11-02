@@ -182,8 +182,11 @@ public sealed class ManagedEngine : IEngine
 
     public void Flush(string cf) => Cf(cf).Flush();
 
-    /// <summary>The managed port has no public CompactRange yet (compaction is being implemented separately).</summary>
-    public bool CompactRange(string cf) => false;
+    public bool CompactRange(string cf)
+    {
+        Cf(cf).CompactRange();
+        return true;
+    }
 
     public void CreateColumnFamily(string cf) => Db.CreateColumnFamily(cf, CfOptions(_spec.Cf(cf)));
 
