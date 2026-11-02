@@ -16,7 +16,7 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [x] WAL metadata records: compression type, user-defined timestamp size, predecessor WAL info
 - [x] `Db/WriteBatch` (byte-identical rep, pooled `Rent()`, save points, max bytes), `WriteBatchReader` ref struct, `IWriteBatchHandler` (struct, no boxing)
 - [x] Compat: rep bytes == native; parse `GetUpdatesSince`; read native WALs (plain/recyclable/zstd); native replays managed-written WALs
-- [ ] `FragmentBufferedReader` (tolerant tailing reader for replication)
+- [x] `FragmentBufferedReader` (tolerant tailing reader for replication)
 - [ ] XXH3 per-record checksum, WAL termination point, protection info, timestamps, structured `PutEntity`
 - [ ] Public API: `ColumnFamily` object instead of `uint cfId`
 
@@ -38,11 +38,11 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 ### C. Hashing, filters, compression  `[x] merged (cffc808)`
 - [x] Hashes: `Hash()`, BloomHash, XXPH3-based `Hash64`/`GetSliceHash64` (RocksDB's frozen pre-release XXH3 — NOT System.IO.Hashing.XxHash3), Hash128/Hash2x64, checksum wrappers
 - [x] Filters: FastLocalBloom, legacy Bloom, Standard128Ribbon builder+reader; byte-identical to native for fv4/5/6 + ribbon hybrid
-- [ ] `optimize_filters_for_memory` rounding on build side
-- [ ] Partitioned filters (reader) — with stream B's table reader
+- [x] `optimize_filters_for_memory` rounding on build side
+- [x] Partitioned filters (reader) — with stream B's table reader
 - [x] Compression: Snappy, LZ4/LZ4HC, ZSTD (pooled ctx), Zlib (raw deflate, <=16KiB blocks); BZip2/Xpress NotSupported
 - [x] Managed-compressed blocks readable natively (managed SST → native ingest)
-- [ ] Dictionary compression
+- [x] Dictionary compression
 - Note: `FilterPolicy.CreateBuilder(in FilterBuildingContext)` added (level/flush aware, needed for ribbon `bloom_before_level`) — table builder must call it
 
 ### D. Version metadata & files  `[x] merged (2d9abdd)`
@@ -52,7 +52,7 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [x] Options model (`DbOptions`, `ColumnFamilyOptions`, `BlockBasedTableOptions`, `ReadOptions`, `WriteOptions`, ...) + `OptionsFile` parse/serialize, native loads our OPTIONS
 - [x] `ManifestLogReader/Writer` over Wal.LogReader/LogWriter
 - [ ] Comparator/num_levels validation on replay, UDT boundary padding, point-in-time/best-efforts recovery
-- [ ] Type `compaction_options_universal/fifo`, `block_cache` etc. (kept as raw strings)
+- [x] Type `compaction_options_universal/fifo`, `block_cache` etc. (kept as raw strings)
 - [ ] `ReadOptions.Snapshot`; a named static for sync writes (e.g. `WriteOptions.SyncWrites`)
 
 ### E. Memtable  `[x] merged (2fb2ccb)`
@@ -114,7 +114,7 @@ P = perf + block cache wiring (Table/, Cache/, Memtable/, Util/).
 - [x] Read-only and secondary open (+TryCatchUpWithPrimary over a live native primary)
 - [ ] Secondary: tail MANIFEST incrementally instead of re-reading
 - [x] GetProperty (subset)
-- [ ] Statistics
+- [x] Statistics
 
 First managed vs native db_bench (200k ops, 16B/100B, shared box; managed has no block cache yet):
 | benchmark | native µs/op | managed µs/op | managed alloc/op |
@@ -161,13 +161,13 @@ Remaining-gap wave (agents running):
 Final completeness wave (all merged):
 - [x] Integrated BlobDB: blob file format/builder/reader/cache/GC, versions & MANIFEST, Get/MultiGet/iterators/merges, checkpoint/GetLiveFiles; blob files byte-identical to native; native↔managed both ways; blob dbbench (`results/2026-11-02-vm-blob.md`: managed 0.55x C)
 - [x] Blob: zlib >16 KiB (16 KiB independent chunks; readable by native), blob readers bounded by max_open_files; forced GC universal/FIFO = parity (upstream leveled-only)
-- [ ] Blob gaps: V2 entity blob columns (native 11.12 never writes them), blob direct write
+- [x] Blob gaps: V2 entity blob columns (native 11.12 never writes them), blob direct write
 - [x] Background errors: ErrorHandler (severity maps, soft/hard/fatal, auto-resume, retryable IO errors, new MANIFEST/WAL on recovery), `Resume()`, `EventListener`; BackupEngine + BackupEngineReadOnly (native-identical layout & meta; incremental backups across engines)
 - [ ] Backup/error gaps: SstFileManager (no-space auto recovery), atomic WAL-error recovery edits, exclude_files_callback, parallel copies; native-under-.NET-11 empty backup meta FIXED: librocksdb.so (NuGet) statically links libstdc++ but exports std:: symbols; the .NET 11 apphost doesn't load libstdc++.so.6 globally → std::bad_cast on numeric stream writes inside native. Tests/bench preload libstdc++ (`tests/Shared/NativeStdCxxPreload.cs`). NOTE: affects any rocksdb-sharp app hosted by a .NET 11 apphost
 - [x] User-defined timestamps (persisted mode): timestamped writes/WriteBatch (byte-identical), Get/MultiGet/iterators (+IterStartTs), filters on key w/o ts, ts min/max properties, full_history_ts_low GC + MANIFEST; compat both ways incl. blob values with timestamps; round-trip scenario
 - [x] UDT range deletions (native timestamped range tombstones read correctly; flush/compaction/full_history_ts_low; fixed snapshot×timestamp point lookup), SstFileWriter with timestamps + ingestion
 - [x] UDT completion: persist_user_defined_timestamps=false (strip/pad, flush postponement, MANIFEST boundaries, toggling on reopen; compat both ways), UDT in WBWI + WriteCommitted transactions (commit ts, validation, 2PC commit-with-ts recovery; compat both ways), truly async timestamped Get/MultiGet
-- [ ] UDT leftovers: optimistic txn with UDT (upstream refuses too), do_validate=false GetForUpdate overloads, write_batch_track_timestamp_size
+- [x] UDT leftovers: optimistic txn with UDT (upstream refuses too), do_validate=false GetForUpdate overloads, write_batch_track_timestamp_size
 - [x] Fixed flaky `PrefixSameAsStartMatchesModel` (forced bottommost compaction for a deterministic LSM shape)
 - [x] Perf #3: flush WAL-on 2.31x → 1.19x native (WAL writeback during switch), no large per-file allocations (59.6 → 5.5 B/put, no gen2 GCs), first-run AggressiveOptimization on per-entry paths; steady-state flush/compaction ≤ native; compaction-heavy config managed 0.62x native geomean (`results/2026-11-02-vm-perf3*.md`)
 - [x] Compaction picking parity: root causes were flush keeping hidden versions (now applies upstream rule A per snapshot stripe) and max output size cap (2x target above bottommost). Lock-step harness: all 60 LSM shapes and compaction sequence identical to native; write-amp 4.321 vs 4.322. Compat test `CompactionPickerParityTests`
@@ -179,7 +179,7 @@ Final completeness wave (all merged):
 - [ ] First flush/compaction in a fresh process 1.4–1.64x native (JIT warm-up; affects cold-start only); LZ4 flushes 2.5x (K4os JIT/unoptimized) — consider ReadyToRun guidance or a faster LZ4 path
 - [x] Features: WriteBatchWithIndex (+BaseDeltaIterator; transactions now use it), SetOptions/SetDBOptions (+typed), custom comparators e2e (+MANIFEST comparator/num_levels validation), KeyMayExist/GetApproximateSizes/memtable stats/int+map properties/table properties, Statistics (all upstream tickers/histograms, native ToString), info LOG (+rotation), wide columns (PutEntity/GetEntity/iterator columns, merge/compaction) — all compat-tested vs native
 - [ ] Features gaps: compaction filters on entities, blob columns/attribute groups/MultiGetEntity, per-SuperVersion options snapshot, mutable block-based table options, KeyMayExist doing filter I/O on cache miss, cfstats interval/file-read histograms, per-level GET_HIT stats, WBWI MultiGetFromBatchAndDB
-- [ ] Flaky? `PrefixSeekTests.PrefixSameAsStartMatchesModel` failed once on net11.0 (sorted-run file count precondition); 10/10 reruns pass
+- [x] Flaky? `PrefixSeekTests.PrefixSameAsStartMatchesModel` failed once on net11.0 (sorted-run file count precondition); 10/10 reruns pass
 - [x] Perf #2: async fast paths (preadv2/pwritev2 RWF_NOWAIT, pooled builders) → async ≈ sync, 0 B/op reads/seeks; batched `MultiGetBatch` (+async, 0 B/op); BlockIter.Prev cache (~30% faster reverse); LevelIterator reuses table iterators (0 B/op seeks in multi-level LSM); managed overwrite under compaction now 3.4 vs C 5.1 µs. Three-way geomean vs C: managed 0.69–1.17×, async 0.64–1.17×, rocksdb-sharp 0.85–1.33× (`bench/results/2026-11-02-vm-perf2*.md`)
 - [ ] Flush/compaction per-entry cost still 1.4–2x native; background compaction lags under sustained writes (waitforcompaction 0.6–0.8 s vs 0.02–0.18 s); reverse iteration copies values (pin blocks instead)
 - [x] Transactions: `OptimisticTransactionDatabase` (serial + parallel validation), `TransactionDatabase` (WriteCommitted, point locks, timeouts, deadlock detection, expiration, 2PC prepare/commit/rollback + recovery); 2PC WAL records byte-identical to native, prepared txns recover across engines; fixed recovery last-sequence bug for 2PC records; dbbench txnoptimistic/txnpessimistic on all engines
@@ -190,16 +190,51 @@ Final completeness wave (all merged):
 Goal: finish implementation, validate vs C++ source, comprehensive tests (unit/integration/round-trip) and benchmarks (managed vs rocksdb-sharp vs pure C native).
 - [x] Source audit #1 vs C++ (`docs/validation.md`): ~90 files (formats/util/table/wal/options/memtable/iterators); fixed memtable range-tombstone publish race, ArenaBlockSize default (0 → derived), internal-key type validation; added db_iter_test vectors
 - [x] Source audit #2 (DB layer): 11 fixes (CF-drop vs MANIFEST, torn MANIFEST continuation, PIT WAL recovery resume, Get sequence/super-version order, ingestion seqno publish, CF drop during flush, cancellation tearing WAL, WAL handle leak on switch failure, writes racing close, option sanitization, snapshot ref leak); `TestHooks`, `FaultInjectionFileSystem`, ~300-point crash sweep, concurrent stress
-- [ ] Background error auto-recovery (DB stays read-only after failed flush/MANIFEST write until reopen)
+- [x] Background error auto-recovery (DB stays read-only after failed flush/MANIFEST write until reopen)
 - [x] Three-way benchmark suite: C benchmark on librocksdb (`bench/native-c`), dbbench runner with full workload list + percentiles + async, `bench/run-all.sh`, `compare`/`report`, `DbHeadToHeadBenchmarks` (results in `bench/results/`)
 - [x] Bench follow-up: compaction flags/stats/waitforcompaction/compact on all 3 engines; compaction-heavy config (`results/2026-11-02-vm-compaction.md`): LSM shape & write-amp match native (2.96 vs 3.05)
 - [ ] Perf #2 (from 3-way results): async API allocations (150–300 B/write, ~230 B/TryGetAsync, 0.8–2.9 KB/async seek); span-based MultiGet (130–930 B/key); reverse iteration 1.3–4.6x slower than C; iteration/seek with 1 KiB values 2–5x; flush 1.3–3x slower + 2–8 MB allocs; fillseq 1 KiB allocs ~1.1 KB/op; overwrite under compaction 2.2x C (write stalls: background compaction keeps up less well — 0.83 s pending vs ~0); re-run matrix on a quiet machine
 - [x] `tests/RocksDb.Managed.RoundTrip`: 35 crash-isolated managed↔native scenarios (self-invoking child; signals/timeouts decoded; failure state preserved): alternations ×6 option variants, managed-first, unclean shutdown both ways, edge keys/values, 200k–1M keys across levels, SST ingest, checkpoints, TTL, OPTIONS files; long mode `ROUNDTRIP_LONG=1` passes (20 alternations × 6,000 ops × 6 variants). Found/fixed: arena default, native struct-form filter policy in OPTIONS
 - [x] Full-DB compat: native writes DB → managed opens/reads/writes → native reopens & verifies (and reverse)
-- [ ] Randomized differential test vs native (same op stream, compare results)
-- [ ] Benchmarks vs native: fillseq, fillrandom, readrandom, readseq, seekrandom, multiget; allocation report
-- [ ] Profile & optimize hot paths (block decoding, skiplist, crc, compaction loop)
+- [x] Randomized differential test vs native (same op stream, compare results)
+- [x] Benchmarks vs native: fillseq, fillrandom, readrandom, readseq, seekrandom, multiget; allocation report
+- [x] Profile & optimize hot paths (block decoding, skiplist, crc, compaction loop)
 
 ## Notes / decisions
 - Native reference: `RocksDB` NuGet 11.12.0.7385 (rocksdb-sharp). C++ tree is 11.14.
 - .NET SDKs: 10.0.403 and 11.0.100-rc.3 in `/root/.dotnet` (cloud container).
+
+## Remaining gaps (triage 2026-11-02, evidence-based; supersedes the unchecked items above)
+
+Legend: S/M/L = rough size. [~] = agent working on it.
+
+- Compaction
+  - [~] read-triggered compaction, reduce_file_locking, preclude_last_level_data_seconds, CompactRange partition-straddle
+  - [ ] subcompactions (L); async compaction input reads (M); compensated size with point-deletion boost (M)
+  - [ ] bottommost files marked for compaction (S/M); persist round-robin cursors to MANIFEST (S); CompactFiles API (M)
+  - [ ] write-controller pacing parity (L0 pile-up under free-running load) (M)
+- Transactions
+  - [~] WritePrepared two_write_queues + commit-time batches; per-txn allocations
+  - [ ] range locks (L); public WAL termination point (S)
+- Wide columns / blob
+  - [~] compaction filters on entities, FilterV4 blob resolver, attribute groups / MultiGetEntity, lazy entity
+  - [ ] WBWI MultiGetFromBatchAndDB (S/M)
+- Table format / options / API
+  - [ ] hash index write (M); separated key/value data blocks (M); uniform block hint (S); super_block_alignment (S)
+  - [ ] user table-properties collectors (M); parallel compression (M); memtable prefix bloom (M); in-place updates (M); insert hints (S)
+  - [ ] per-key protection info (L); per-SuperVersion options snapshot (M); mutable block-based table options (M)
+  - [ ] WriteBatch ColumnFamily overloads (S); WriteOptions sync static (S); max_total_wal_size (S/M); lazy WAL sync on rotation (S)
+  - [ ] shared table cache across CFs (S/M); best_efforts_recovery (M); WAL tracking in MANIFEST emit+verify (M); reads on dropped CF handle (S)
+  - [ ] auto-resizing HyperClock (M); DB-wide rate limiter for flush/compaction (M)
+- Write path / iterators perf
+  - [ ] 4-thread sync random writes, 4-thread readmissing (see final benchmarks)
+  - [ ] reverse iteration pins blocks instead of copying (M); async reverse movement (M); range tombstones in iterator heap (M/L)
+  - [ ] concurrent memtable insert (M); pipelined write (L); non-blocking SyncAsync (S); LZ4 encoder / cold-start JIT (M)
+- Ingestion / TTL / stats
+  - [ ] write_global_seqno (S); ingest_behind (M); overlapping files in one call (M); allow_db_generated_files (S)
+  - [ ] TTL iterator wrapper (S); per-level GET_HIT, file-read histograms, cfstats interval (S/M); KeyMayExist filter I/O on miss (S)
+- Replication / secondary
+  - [ ] network-partition cluster test (S/M); handoff latency investigation (S/M); replication benchmarks (M); incremental MANIFEST tailing (M)
+- Backup / error handling
+  - [ ] SstFileManager + no-space auto recovery (M); atomic WAL-error recovery edits (M); backup exclude_files_callback (S); parallel copies (S/M)
+- Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)
