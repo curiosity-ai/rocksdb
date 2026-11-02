@@ -381,11 +381,55 @@ Remaining gaps:
   290 - 343 ms native. Not addressed (third-party code; a warm-up or an in-house LZ4 encoder would be needed).
 - Compaction picking under sustained writes: managed lets L5 grow to 9 - 10 files before L5 -> L6 compactions while
   native 11.12 keeps it at 4 - 6, so managed L0 -> L5 compactions read ~1.4x more L5 data (write-amp 3.05 - 3.33 vs
-  2.96) and more work is left at the end of the writes (`waitforcompaction` 0.3 - 1.7 s vs 0.02 - 0.25 s). Needs a
-  picker fidelity check against the native release (scores are ported from `ComputeCompactionScore`, so the difference
-  is likely in the inputs / timing).
+  2.96) and more work is left at the end of the writes (`waitforcompaction` 0.3 - 1.7 s vs 0.02 - 0.25 s). Fixed
+  where it was a fidelity problem, see "Compaction-picking parity" below.
 - Range-partitioned subcompactions (`max_subcompactions`) are not implemented; native defaults to 1, so they would not
   change the comparison.
+
+## Compaction-picking parity (compaction-heavy configuration)
+
+Follow-up of the last gap of perf pass #3. Method: a lock-step harness
+(`tests/RocksDb.Managed.CompatTests/Compaction/CompactionPickerParityTests.cs`) runs the same seeded random-write stream
+on native (rocksdb-sharp) and managed with the compaction-heavy options scaled down 16x (256 KiB memtable = target
+file size, 1 MiB level base, dynamic level bytes, no compression, `max_background_jobs = 1`). After every memtable
+both engines flush and `WaitForCompact`, so the LSM shapes depend only on flush / picker / output-cutting logic, and
+both LOGs ("Compacting N@L + M@L' files to Lx", "Moved #...", flush and output table sizes) give the compaction
+sequence and the bytes written. Managed now writes the upstream lines (`OnCompactionStarted`, "Generated table",
+"Moved #", "Level-0 flush table"). The EVENT_LOG JSON is not usable for the native side under .NET 11 (the native
+JSON writer stops after the first field there), so the test parses the plain-text lines.
+
+No picker or scoring change separates the native 11.12 from the 11.14 sources (`git log` of `db/compaction/`,
+`db/version_set.cc`, `db_impl_compaction_flush.cc` since 2026-09-25, HISTORY.md 11.13); the scores, base level and
+level targets, file ordering (kMinOverlappingRatio), L0 -> Lbase vs intra-L0, trivial moves, grandparent cuts and the
+compaction limit (2 jobs -> 1 flush + 1 compaction, speed-up only with write pressure) were already faithful. The
+harness diverged at step 11 (first L0 -> L5) and found two real differences:
+
+1. **The flush kept every version.** Upstream's flush runs a CompactionIterator, which drops versions hidden by a
+   newer version in the same snapshot stripe (rule (A)). The managed L0 files had ~2% more entries for this workload,
+   and duplicated user keys at block boundaries also made the index ~45% larger (1820 vs 1256 bytes), so every L0
+   file was 2% larger and so was every compaction. `FlushJob` now drops them for Put / Delete / blob index / entity
+   (merge operands, single deletes, TimedPut values and CFs with user-defined timestamps keep every version; single
+   deletes are never dropped), with the snapshots taken when the flush starts. Flushed files now match native in
+   entries, data, index and filter size.
+2. **Max output file size.** Upstream lets outputs of non-bottommost compactions with grandparents grow to 2x
+   `target_file_size` (`Compaction::max_output_file_size_`; the grandparent-boundary cuts normally end them at 50 - 90%
+   of the target). The port capped them at 1x, so L0 -> L5 compactions wrote more, smaller L5 files.
+
+| lock-step parity test (60 steps, 15.3 MB written by the user) | native | managed before | managed after |
+|---|---:|---:|---:|
+| first differing LSM shape / compaction | - | step 11 | none (all 60 steps and all compactions identical) |
+| write amplification | 4.322 | 4.554 (+5.4%) | 4.321 |
+
+Free-running compaction-heavy config (`bench/results/2026-11-02-vm-picker-compaction.md`, num=500k, three engines,
+plus three more runs not committed): native 2.96 every run (`3 0 0 0 0 4 15`), rocksdb-sharp 2.96 - 3.05, managed
+2.96 / 3.15 / 3.15 / 3.24 (perf #3: 3.24 - 3.33), and the peak L5 file count during the writes (from the LOG of one
+run each) dropped from 9 - 12 to 7 (native 7). What remains is pace, not picking: with one compaction thread the LSM shape depends on how
+far compactions fall behind the writer, and managed ingests 1.3 - 1.6x faster than native (overwrite 3.4 - 5.3 vs
+5.4 - 7.4 µs/op) while its first compactions run cold (JIT, see perf pass #3). More L0 files then pile up during each
+L0 -> L5 compaction (up to 10 vs 5 - 6), the L0 score keeps L5 -> L6 compactions waiting, and the final
+`waitforcompaction` has more left (0.5 - 1.2 s vs 0 - 0.4 s). Given the same LSM state the managed picker chooses
+the same compactions (same inputs in the LOG comparison of the two engines), and the lock-step test shows identical
+results. The managed timings of these runs are cold (fresh process, no warm-up pass).
 
 ## Integrated BlobDB (blob files)
 

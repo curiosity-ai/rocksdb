@@ -15,8 +15,8 @@ ships prebuilt libraries for Linux, macOS and Windows, so no C++ build is needed
 
 | Project | Tests (net10.0) | Native code | What it covers |
 |---|---:|---|---|
-| `tests/RocksDb.Managed.Tests` | 855 | none | formats, data structures, DB behavior, crash consistency, fault injection, concurrency, upstream test vectors |
-| `tests/RocksDb.Managed.CompatTests` | 218 | in process | byte-level and file-level compatibility with `librocksdb` |
+| `tests/RocksDb.Managed.Tests` | 861 | none | formats, data structures, DB behavior, crash consistency, fault injection, concurrency, upstream test vectors |
+| `tests/RocksDb.Managed.CompatTests` | 219 | in process | byte-level and file-level compatibility with `librocksdb` |
 | `tests/RocksDb.Managed.RoundTrip` | 41 | child process | whole-DB managed and native alternation, crashes, features |
 | `tests/RocksDb.Managed.Replication.Tests` | 30 | in process (one test) | replication, switchover, Raft cluster, gRPC transport, native replica |
 
@@ -101,7 +101,8 @@ it (`RocksDbSharp.RocksDb`) to avoid clashing with the managed types. Each test 
 
 The folders follow the formats: `Wal` (WAL and WriteBatch), `Table` (SST, prefix and partitioned indexes and filters,
 table integration), `Filters`, `Compression` (all codecs plus dictionaries), `Manifest`, `Memtable`, `Iterators`,
-`Compaction` (DBs compacted by the other engine; a randomized differential against native), `Env` (the `LOCK` file
+`Compaction` (DBs compacted by the other engine; a randomized differential against native; a lock-step LSM-shape and
+write-amp parity test, `PARITY_TRACE=<file>` keeps its side-by-side trace), `Env` (the `LOCK` file
 across engines), and `Api` (backup, BlobDB, custom comparators, properties and statistics, replication, `SetOptions`,
 timestamps, transactions, wide columns, `WriteBatchWithIndex`).
 
