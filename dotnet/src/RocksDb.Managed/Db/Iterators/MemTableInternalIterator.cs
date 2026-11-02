@@ -21,6 +21,17 @@ public sealed class MemTableInternalIterator : InternalIterator
         _it = memtable.NewIterator();
     }
 
+    /// <summary>
+    /// Iterator that consults the memtable prefix bloom on Seek / SeekForPrev when the read options select prefix mode
+    /// and <paramref name="cfPrefixExtractor"/> is the memtable's extractor (MemTable::NewIterator).
+    /// </summary>
+    public MemTableInternalIterator(MemTable memtable, ReadOptions? readOptions, SliceTransform? cfPrefixExtractor)
+    {
+        ArgumentNullException.ThrowIfNull(memtable);
+        _memtable = memtable;
+        _it = memtable.NewIterator(memtable.UsesPrefixBloom(readOptions, cfPrefixExtractor));
+    }
+
     /// <summary>Re-targets this iterator at another memtable (unpositioned).</summary>
     public void Reset(MemTable memtable)
     {

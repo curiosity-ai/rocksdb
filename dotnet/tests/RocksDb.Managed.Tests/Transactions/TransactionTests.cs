@@ -537,6 +537,97 @@ public class TransactionTests
         Assert.AreEqual(Policy == TransactionWritePolicy.WriteCommitted ? 20UL + 10UL : 10UL * 3 + 10UL + 1UL, seq);
     }
 
+    // ---- recycled lock entries / tracked keys ------------------------------------------------------------
+
+    [TestMethod]
+    public void RecycledLockEntriesAndTrackedKeysKeepTheirKeys()
+    {
+        // Lock entries and tracked-key buffers are recycled: keys of growing and shrinking lengths must never see bytes of
+        // a previous, longer key (the recycled buffers are larger than the key).
+        using TransactionDatabase db = Open(NewFs());
+        Transaction? txn = null;
+        string[] keys = ["a", new string('b', 40), "cc", new string('d', 17), "e", new string('f', 100), "g"];
+        for (int round = 0; round < 4; round++)
+        {
+            txn = txn is null ? db.BeginTransaction(s_wo) : db.BeginTransaction(s_wo, new TransactionOptions(), txn);
+            foreach (string k in keys) txn.Put(B(k + round), B("v" + round));
+            var locked = new HashSet<string>();
+            foreach (KeyLockInfo l in db.GetLockStatusData()) locked.Add(S(l.Key)!);
+            foreach (string k in keys) Assert.IsTrue(locked.Contains(k + round), "lock on " + k + round);
+            Assert.AreEqual(keys.Length, locked.Count);
+            // a second transaction cannot take any of them, but can take their prefixes
+            using (Transaction other = db.BeginTransaction(s_wo, new TransactionOptions { LockTimeout = TimeSpan.Zero }))
+            {
+                foreach (string k in keys) AssertFails(StatusCode.TimedOut, () => other.Put(B(k + round), B("x")), StatusSubCode.LockTimeout);
+                other.Put(B(keys[1][..10]), B("x"));
+                other.Rollback();
+            }
+            txn.SetSavePoint();
+            txn.Put(B("sp-" + new string('z', 30 - round)), B("1"));
+            Assert.IsTrue(txn.RollbackToSavePoint());
+            Assert.AreEqual(keys.Length, db.GetLockStatusData().Count, "the save point's key is unlocked");
+            if (round % 2 == 0) txn.Commit();
+            else txn.Rollback();
+            Assert.AreEqual(0, db.GetLockStatusData().Count);
+        }
+        for (int round = 0; round < 4; round++)
+        {
+            foreach (string k in keys) Assert.AreEqual(round % 2 == 0 ? "v" + round : null, S(db.Database.Get(B(k + round))));
+        }
+        txn!.Dispose();
+    }
+
+    [TestMethod]
+    public void SteadyStateTransactionsAllocateNothing()
+    {
+        // Begin (reusing the transaction object) + puts + rollback touches locks, tracked keys and the indexed batch but
+        // not the memtables: it must not allocate once warm. A commit allocates what the same plain batch write does.
+        var wo = new WriteOptions { DisableWal = true };
+        using TransactionDatabase db = Open(NewFs(), cfo: new ColumnFamilyOptions { WriteBufferSize = 256UL << 20 });
+        byte[][] keys = new byte[32][];
+        for (int i = 0; i < keys.Length; i++) keys[i] = B("key" + i.ToString("D8", System.Globalization.CultureInfo.InvariantCulture));
+        byte[] value = new byte[64];
+        var options = new TransactionOptions();
+        Transaction txn = db.BeginTransaction(wo, options);
+        using var batch = new WriteBatch();
+        int next = 0;
+        long Run(int count, int mode)
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int t = 0; t < count; t++)
+            {
+                if (mode == 2)
+                {
+                    batch.Clear();
+                    for (int i = 0; i < 4; i++) batch.Put(keys[next++ & 31], value);
+                    db.Database.Write(wo, batch);
+                    continue;
+                }
+                txn = db.BeginTransaction(wo, options, txn);
+                for (int i = 0; i < 4; i++) txn.Put(keys[next++ & 31], value);
+                if (mode == 0) txn.Rollback();
+                else txn.Commit();
+            }
+            return GC.GetAllocatedBytesForCurrentThread() - before;
+        }
+        Run(2000, 0);
+        Run(2000, 1);
+        Run(2000, 2);
+        long rollback = Run(2000, 0);
+        long commit = Run(2000, 1), plain = Run(2000, 2);
+#if !DEBUG
+        Assert.AreEqual(0L, rollback, "begin + put + rollback");
+        // The memtable arena grows in blocks: allow one block of difference.
+        Assert.IsTrue(commit <= plain + (64 << 10), "commit " + commit + " B vs plain batch " + plain + " B");
+#else
+        // Debug builds compile async state machines as classes, so the shared sync/async paths allocate there.
+        _ = rollback;
+        _ = commit;
+        _ = plain;
+#endif
+        txn.Dispose();
+    }
+
     /// <summary>Test-only view of the internal pessimistic transaction.</summary>
     private readonly struct PessimisticTransactionView(Transaction txn)
     {

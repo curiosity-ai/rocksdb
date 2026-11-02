@@ -298,6 +298,7 @@ public sealed partial class ColumnFamily
     {
         ArgumentNullException.ThrowIfNull(batch);
         _db.ThrowIfDisposed();
+        batch.EntityRun = false;
         if (batch.Count == 0) return;
         if (_db.Stats is null)
         {
@@ -323,6 +324,7 @@ public sealed partial class ColumnFamily
     {
         ArgumentNullException.ThrowIfNull(batch);
         _db.ThrowIfDisposed();
+        batch.EntityRun = false;
         if (batch.Count == 0) return ValueTask.CompletedTask;
         return _db.MultiGetAsync(_cfd, options, batch, synchronous: false, cancellationToken);
     }

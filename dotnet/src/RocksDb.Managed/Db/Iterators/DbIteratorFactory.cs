@@ -127,7 +127,7 @@ public static class DbIteratorFactory
         {
             foreach (MemTable mem in sources.MemTables)
             {
-                children.Add(new MemTableInternalIterator(mem));
+                children.Add(new MemTableInternalIterator(mem, sources.ReadOptions, sources.PrefixExtractor));
                 if (rangeDel is not null && mem.NumRangeDeletes > 0) rangeDel.AddTombstones(mem.GetFragmentedRangeTombstones());
             }
 
@@ -143,11 +143,15 @@ public static class DbIteratorFactory
                 if (level == 0)
                 {
                     // Merge all level zero files together since they may overlap.
+                    bool shouldSample = FileReadSample.ShouldSampleFileRead();
                     foreach (FileMetaData f in files)
                     {
                         children.Add(sources.PrefixExtractor is null
                             ? tc.NewIterator(f)
                             : new TableInternalIterator(tc.GetReader(f), TableReadFlags.None, sources.ReadOptions, sources.PrefixExtractor));
+                        // Count once for every L0 file. This is done per iterator creation rather than Seek(), while
+                        // files in other levels are sampled on seek/next/prev (Version::AddIteratorsForLevel).
+                        if (shouldSample) FileReadSample.SampleFileReadInc(f);
                     }
                 }
                 else

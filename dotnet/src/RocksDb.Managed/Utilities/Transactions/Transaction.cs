@@ -79,6 +79,26 @@ public abstract class Transaction : IDisposable
     /// <summary>The write batch holding the transaction's writes. Do not modify it.</summary>
     public WriteBatch WriteBatch => _batch.Batch;
 
+    private protected WriteBatch? _commitTimeBatch;
+
+    /// <summary>
+    /// The commit-time write batch (Transaction::GetCommitTimeWriteBatch): writes added to it are written by the commit
+    /// of a prepared (2PC) pessimistic transaction, atomically with the commit marker, without concurrency control (no
+    /// locks, no conflict checks), so use it with great caution. It is cleared when the transaction finishes.
+    /// <list type="bullet">
+    /// <item>WriteCommitted: the batch is written to the WAL with the commit marker and inserted into the memtables
+    /// before the transaction's writes. Committing an unprepared transaction with a non-empty commit-time batch fails
+    /// with InvalidArgument.</item>
+    /// <item>WritePrepared / WriteUnprepared: only allowed with
+    /// <see cref="TransactionOptions.UseOnlyTheLastCommitTimeBatchForRecovery"/> (otherwise the commit fails with
+    /// InvalidArgument). The batch then only goes to the WAL; the DB keeps the last such batch and writes it to the
+    /// memtables before the next memtable switch, so it is visible after a flush or a reopen (e.g. a replication
+    /// position), not right after the commit.</item>
+    /// <item>Optimistic transactions ignore it.</item>
+    /// </list>
+    /// </summary>
+    public WriteBatch GetCommitTimeWriteBatch() => _commitTimeBatch ??= new WriteBatch();
+
     /// <summary>The write options used at commit.</summary>
     public WriteOptions WriteOptions
     {
@@ -670,6 +690,7 @@ public abstract class Transaction : IDisposable
         _savePoints?.Clear();
         _batch.Clear();
         _tracked.Clear();
+        _commitTimeBatch?.Clear();
     }
 
     private protected ColumnFamilyData Cfd(ColumnFamily? columnFamily)

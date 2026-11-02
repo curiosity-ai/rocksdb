@@ -21,13 +21,13 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (221 files, about 68,000 lines):
+Summary (229 files, about 70,400 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
-| line-by-line (feature audits) | 49 |
+| line-by-line (feature audits) | 57 |
 | line-by-line (#3) | 17 |
 | line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
@@ -65,6 +65,7 @@ changes there need their own review.
 | `RocksDb.Managed.Replication/Switchover/PrimaryWriteGate.cs` | 124 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
 | `RocksDb.Managed.Replication/Switchover/ReplicationRoleState.cs` | 227 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
 | `RocksDb.Managed.Replication/Switchover/SwitchoverNode.cs` | 542 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
+| `AttributeGroups.cs` | 286 | include/rocksdb/attribute_groups.h, db/db_impl/db_impl.cc, db/db_impl/db_impl_write.cc | line-by-line (feature audit: user features (wide-column APIs)) |
 | `Cache/BlockCache.cs` | 327 | include/rocksdb/advanced_cache.h | line-by-line (#1) |
 | `Cache/CacheKey.cs` | 231 | cache/cache_key.h, cache/cache_key.{h,cc}, table/unique_id.cc | line-by-line (#1) |
 | `Cache/HyperClockCache.cs` | 796 | include/rocksdb/cache.h, cache/clock_cache.{h,cc} | line-by-line (#3): FixedHyperClockTable / BaseClockTable (meta word, probing, eviction, strict/non-strict charging, standalone); compaction-features pass: eviction_effort_cap, CalcHashBits overshoot clamp, table metadata charged up front |
@@ -89,6 +90,7 @@ changes there need their own review.
 | `Db/Blob/BlobLogFormat.cs` | 130 | db/blob/blob_log_format.{h,cc} | line-by-line (feature audit: integrated BlobDB (+ #3 re-check)) |
 | `Db/Blob/BlobSource.cs` | 353 | db/blob/blob_source.cc, db/blob/blob_file_cache.cc, db/version_set.cc | line-by-line (feature audit: integrated BlobDB) |
 | `Db/Blob/CompactionBlobProcessor.cs` | 110 | db/compaction/compaction_iterator.cc, db/blob/blob_fetcher.cc | line-by-line (feature audit: integrated BlobDB) |
+| `Db/Blob/CompactionBlobResolver.cs` | 97 | db/compaction/compaction_iterator.{h,cc} (CompactionBlobResolver) | line-by-line (feature audit: user features (wide-column APIs)) |
 | `Db/ColumnFamilyData.cs` | 257 | db/memtable_list.h, db/column_family.h, db/column_family.cc | line-by-line (#2) |
 | `Db/Compaction/ColumnFamilyCompactionState.cs` | 34 | db/compaction/compaction_picker.h (NullCompactionPicker), db/column_family.h | line-by-line (#2) |
 | `Db/Compaction/Compaction.cs` | 446 | include/rocksdb/listener.h, db/compaction/compaction.{h,cc} | line-by-line (#2); #3: MaxOutputFileSize, MaxInputFileNewestKeyTime (new), MinInputFileOldestAncestorTime; compaction-features pass: output_split_key_, CreateSstPartitioner, IsTrivialMove partitioner check, GetOutputTemperature inputs |
@@ -97,7 +99,7 @@ changes there need their own review.
 | `Db/Compaction/CompactionPicker.cs` | 592 | db/compaction/compaction_picker.{h,cc} | line-by-line (#2); compaction-features pass: enable_compression / output temperature / output split key in NewCompaction |
 | `Db/Compaction/FifoCompactionPicker.cs` | 311 | db/compaction/compaction_picker_fifo.cc | line-by-line (#3): PickTTL/Size/IntraL0/PickCompaction; **fixed** TTL expiry by newest key time; compaction-features pass: whole file (blob-aware sizing, PickRatioBasedIntraL0Compaction, PickTemperatureChangeCompaction) |
 | `Db/Compaction/LevelCompactionPicker.cs` | 511 | db/compaction/compaction_picker_level.cc | line-by-line (#2) |
-| `Db/Compaction/UniversalCompactionPicker.cs` | 680 | db/compaction/compaction_picker_universal.cc | line-by-line (compaction-features pass): whole file except read-triggered compaction (periodic, size amp with MightExcludeNewL0sToReduceWriteStop and incremental mode, size ratio, max_read_amp, delete-triggered, compression_size_percent) |
+| `Db/Compaction/UniversalCompactionPicker.cs` | 680 | db/compaction/compaction_picker_universal.cc | line-by-line (compaction-features pass): whole file (read-triggered compaction, require_max_output_level and ShouldSkipLastSortedRunForSizeAmpCompaction added in the tiering pass; periodic, size amp with MightExcludeNewL0sToReduceWriteStop and incremental mode, size ratio, max_read_amp, delete-triggered, compression_size_percent) |
 | `Db/Compaction/VersionStorageInfo.Compaction.cs` | 974 | db/version_set.cc | line-by-line (#2); #3: FIFO score / GetExpiredTtlFilesCount; compaction-features pass: blob-aware FIFO score, ShouldChangeFileTemperature, **fixed** periodic-compaction file age (file_creation_time first) |
 | `Db/Compaction/WriteController.cs` | 307 | db/write_controller.{h,cc} | line-by-line (#2) |
 | `Db/CompactionFilter.cs` | 95 | include/rocksdb/compaction_filter.h | line-by-line (#3): compaction_filter.h decisions / value types |
@@ -108,6 +110,7 @@ changes there need their own review.
 | `Db/DbImpl.Comparators.cs` | 136 | db/version_edit_handler.cc, db/version_builder.cc, util/udt_util.cc | line-by-line (feature audit: user features (comparators) + UDT memtable-only) |
 | `Db/DbImpl.Flush.cs` | 418 | db/db_impl/db_impl_compaction_flush.cc (flush), db/flush_job.cc | line-by-line (#2) |
 | `Db/DbImpl.Ingest.cs` | 107 | db/db_impl/db_impl.cc | line-by-line (#2) |
+| `Db/DbImpl.LazyEntity.cs` | 34 | db/db_impl/db_impl.cc (GetEntityLazyImpl / GetEntityLazyForBatch) | line-by-line (feature audit: user features (wide-column APIs)) |
 | `Db/DbImpl.Monitoring.cs` | 420 | db/event_helpers.cc | line-by-line (feature audit: user features (LOG)) |
 | `Db/DbImpl.MultiGet.cs` | 234 | db/db_impl/db_impl.cc, db/version_set.cc | line-by-line (feature audit: UDT / MultiGet (+ #3 read-sequence rule)) |
 | `Db/DbImpl.Open.cs` | 596 | db/db_impl/db_impl_open.cc | line-by-line (#2); #3: fixed WAL checksum, blob GC option validation, FIFO TTL reader preload |
@@ -115,6 +118,7 @@ changes there need their own review.
 | `Db/DbImpl.Properties.cs` | 657 | db/internal_stats.cc, db/db_impl/db_impl.cc | line-by-line (feature audit: user features (properties)) |
 | `Db/DbImpl.Read.cs` | 477 | db/db_impl/db_impl.cc (GetImpl, NewIterator), db/version_set.cc (Version::Get) | line-by-line (#2) |
 | `Db/DbImpl.ReadOnly.cs` | 330 | db/db_impl/db_impl_readonly.cc, db/db_impl/db_impl_secondary.cc | line-by-line (#3): db_impl_readonly.cc / db_impl_secondary.cc; **fixed** WAL checksum |
+| `Db/DbImpl.SeqnoTime.cs` | 165 | db/db_impl/db_impl.cc, db/db_impl/db_impl_open.cc (seqno-to-time recording) | line-by-line (tiering pass: validation.md "Compaction triggers and tiering") |
 | `Db/DbImpl.Replication.cs` | 539 | db/db_impl/db_impl_files.cc, db/wal_manager.cc, db/db_filesnapshot.cc | line-by-line (#2) |
 | `Db/DbImpl.Timestamps.cs` | 295 | db/db_impl/db_impl.h, db/db_impl/db_impl_compaction_flush.cc | line-by-line (feature audit: user-defined timestamps) |
 | `Db/DbImpl.Transactions.cs` | 524 | db/logs_with_prep_tracker.cc, db/db_impl/db_impl_files.cc, db/db_impl/db_impl.cc | line-by-line (feature audit: transactions) |
@@ -141,6 +145,7 @@ changes there need their own review.
 | `Db/Iterators/LevelIterator.cs` | 384 | db/version_set.cc | line-by-line (#1) |
 | `Db/Iterators/MemTableInternalIterator.cs` | 45 | db/memtable.cc | line-by-line (#1) |
 | `Db/Iterators/MergingIterator.cs` | 363 | table/merging_iterator.cc | line-by-line (#1) |
+| `Db/Iterators/MultiCfIterator.cs` | 335 | db/multi_cf_iterator_impl.h, db/coalescing_iterator.{h,cc}, db/attribute_group_iterator_impl.{h,cc} | line-by-line (feature audit: user features (wide-column APIs)) |
 | `Db/Iterators/TableInternalIterator.cs` | 126 | table/block_based/block_based_table_iterator.cc | line-by-line (#1) |
 | `Db/Manifest.cs` | 608 | db/log_reader.cc, db/log_writer.cc, db/blob/blob_file_meta.h | line-by-line (#1) |
 | `Db/ManifestLog.cs` | 84 | db/version_set.cc | line-by-line (#1) |
@@ -151,6 +156,7 @@ changes there need their own review.
 | `Db/MergeHelper.cs` | 517 | db/merge_context.h | line-by-line (#1) |
 | `Db/MergeOperator.cs` | 88 | include/rocksdb/merge_operator.h, utilities/merge_operators.cc | line-by-line (#1) |
 | `Db/RangeDelAggregator.cs` | 363 | db/range_del_aggregator.{h,cc}, db/dbformat.h | line-by-line (#1) |
+| `Db/SeqnoToTimeMapping.cs` | 485 | db/seqno_to_time_mapping.{h,cc} | line-by-line (tiering pass: validation.md "Compaction triggers and tiering") |
 | `Db/Snapshot.cs` | 101 | include/rocksdb/snapshot.h, db/snapshot_impl.h | line-by-line (#2) |
 | `Db/SstFileWriter.cs` | 329 | include/rocksdb/sst_file_writer.h, table/sst_file_writer.cc | line-by-line (#2) |
 | `Db/TableCache.cs` | 263 | db/table_cache.cc, db/db_impl/db_impl.cc | line-by-line (#2); #3: records newest_key_time from opened readers |
@@ -173,12 +179,14 @@ changes there need their own review.
 | `Env/LocalFileSystem.cs` | 1021 | env/fs_posix.cc, env/io_posix.cc, file/writable_file_writer.cc | managed-only, design-reviewed (#3): POSIX/Windows file system: rename(2) overwrite, fdatasync, dir fsync, OFD LOCK, truncate-on-close |
 | `Env/MemoryFileSystem.cs` | 491 | env/mock_env.cc, utilities/fault_injection_fs.{h,cc} | managed-only, design-reviewed (#3): in-memory FS for tests (mock_env idea), crash simulation |
 | `Env/UnixNative.cs` | 431 | env/io_posix.cc, env/fs_posix.cc | managed-only, design-reviewed (#3): P/Invoke (fdatasync, fsync dir, OFD locks, preadv2/pwritev2) |
+| `LazyWideColumns.cs` | 483 | include/rocksdb/lazy_wide_columns.h, db/wide/lazy_wide_columns.cc, db/wide/read_path_blob_resolver.cc | line-by-line (feature audit: user features (wide-column APIs)) |
 | `Logging/FileInfoLogger.cs` | 233 | logging/auto_roll_logger.cc, logging/env_logger.h | line-by-line (feature audit: user features (LOG)) |
 | `Logging/InfoLogger.cs` | 72 | include/rocksdb/env.h, env/env.cc | line-by-line (feature audit: user features (LOG)) |
 | `Memory/Arena.cs` | 225 | memory/allocator.h, memory/arena.h, memory/arena.cc | line-by-line (#1) |
 | `Memory/BlockBufferPool.cs` | 114 | (managed buffer pool) | managed-only, design-reviewed (#3): pooled block buffers |
 | `Memory/ConcurrentArena.cs` | 235 | memory/concurrent_arena.h, memory/concurrent_arena.cc | line-by-line (#1) |
 | `Memtable/InlineSkipList.cs` | 649 | memtable/inlineskiplist.h | line-by-line (#1) |
+| `Monitoring/FileReadSample.cs` | 86 | monitoring/file_read_sample.h | line-by-line (tiering pass: validation.md "Compaction triggers and tiering") |
 | `Monitoring/InternalStats.cs` | 345 | db/internal_stats.h, db/internal_stats.{h,cc} | line-by-line (feature audit: user features (properties)) |
 | `Monitoring/Statistics.cs` | 456 | include/rocksdb/statistics.h, monitoring/statistics.cc, monitoring/histogram.cc | line-by-line (feature audit: user features (statistics)) |
 | `Monitoring/StatisticsNames.g.cs` | 1075 | monitoring/statistics.cc, include/rocksdb/statistics.h | line-by-line (feature audit: user features (statistics; generated from TickersNameMap)) |

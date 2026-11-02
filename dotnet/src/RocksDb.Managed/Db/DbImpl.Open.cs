@@ -190,9 +190,22 @@ internal sealed partial class DbImpl
             if (cfd.Mem.IsEmpty && cfd.Imm.Count == 0) edit.LogNumber = Math.Max(cfd.LogNumber, newLogNumber);
             await Versions.LogAndApplyAsync(cfd, edit, synchronous, ct).ConfigureAwait(false);
         }
+        // After reaching the post-recovery seqno but before creating SuperVersions ensure seqno to time mapping is
+        // pre-populated as needed (a new DB with preserve / preclude set on any column family it is opened with).
+        if (!exists)
+        {
+            var preserveInfo = new MinAndMaxPreserveSeconds();
+            foreach (ColumnFamilyOptions o in descriptors.Values) preserveInfo.Combine(o);
+            if (preserveInfo.IsEnabled) await PrepopulateSeqnoToTimeMappingAsync(preserveInfo, synchronous, ct).ConfigureAwait(false);
+        }
         lock (_mutex)
         {
-            foreach (ColumnFamilyData cfd in Versions.ColumnFamilies) InstallSuperVersion(cfd);
+            foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
+            {
+                // InstallSuperVersionForConfigChange
+                EnsureSeqnoToTimeMapping(cfd.Options);
+                InstallSuperVersion(cfd);
+            }
             _pendingOutputs.Clear();
         }
 
@@ -209,6 +222,7 @@ internal sealed partial class DbImpl
         LogInfo("DB pointer " + GetHashCode().ToString("x", CultureInfo.InvariantCulture) + " opened " + DbName);
         StartStatsDump();
         EnableBackgroundCompactions();
+        RegisterRecordSeqnoTimeWorker();
     }
 
     /// <summary>
@@ -231,6 +245,7 @@ internal sealed partial class DbImpl
                 ThrowHelper.InvalidArgument("The garbage ratio threshold for forcing blob garbage collection should be in the range [0.0, 1.0].");
             }
         }
+        ValidateReadTriggeredCompactionThreshold(o);
         return o;
     }
 
@@ -508,6 +523,8 @@ internal sealed partial class DbImpl
         bool anyData = progress.AnyData;
 
         Versions.SetLastSequence(lastSequence);
+        // RecoverLogFiles: last_allocated_sequence_ and last_published_sequence_ follow the recovered last sequence.
+        Versions.SetLastPublishedSequence(lastSequence);
         if (anyData)
         {
             Versions.MarkFileNumberUsed(wals[^1] + 1);
@@ -602,7 +619,10 @@ internal sealed partial class DbImpl
         FileMetaData? meta;
         try
         {
-            meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, [], CurrentSnapshotChecker, blobBuilder, null, synchronous, ct)
+            SeqnoToTimeMapping? seqnoToTime;
+            lock (_mutex) seqnoToTime = CopySeqnoToTimeMapping(cfd);
+            meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, [], CurrentSnapshotChecker, blobBuilder, null,
+                    seqnoToTime, synchronous, ct)
                 .ConfigureAwait(false);
         }
         catch

@@ -33,6 +33,7 @@ internal sealed partial class DbImpl
         "sample_for_compression", "bottommost_compression", "compression_per_level", "experimental_mempurge_threshold",
         "memtable_protection_bytes_per_key", "block_protection_bytes_per_key", "compression_opts", "bottommost_compression_opts",
         "compaction_options_fifo", "compaction_options_universal", "target_file_size_is_upper_bound",
+        "read_triggered_compaction_threshold",
     };
 
     /// <summary>db_mutable_options_type_info names supported by the managed options model.</summary>
@@ -42,7 +43,7 @@ internal sealed partial class DbImpl
         "writable_file_max_buffer_size", "delayed_write_rate", "max_total_wal_size", "delete_obsolete_files_period_micros",
         "stats_dump_period_sec", "stats_persist_period_sec", "stats_history_buffer_size", "max_open_files", "bytes_per_sync",
         "wal_bytes_per_sync", "strict_bytes_per_sync", "compaction_readahead_size", "max_background_flushes",
-        "max_manifest_file_size", "manifest_preallocation_size",
+        "max_manifest_file_size", "manifest_preallocation_size", "max_compaction_trigger_wakeup_seconds",
     };
 
     private readonly SemaphoreSlim _setOptionsLock = new(1, 1);
@@ -138,6 +139,8 @@ internal sealed partial class DbImpl
                 // Derived state (MutableCFOptions::RefreshDerivedOptions, InstallSuperVersionForConfigChange).
                 cfd.MemOptions.WriteBufferSize = (long)Math.Min(live.WriteBufferSize, (ulong)long.MaxValue);
                 cfd.MemOptions.ArenaBlockSize = (int)Math.Min(live.ArenaBlockSize, int.MaxValue / 2);
+                // Memtable bloom / in-place settings take effect for the next memtable (ImmutableMemTableOptions).
+                cfd.MemOptions.ApplyColumnFamilyOptions(live);
                 cfd.Mem.UpdateWriteBufferSize(cfd.MemOptions.WriteBufferSize);
                 RecomputeMaxTotalInMemoryState();
                 cfd.Current.Storage.ComputeCompactionScore();
@@ -151,6 +154,9 @@ internal sealed partial class DbImpl
                 MaybeScheduleCompaction();
                 SignalBackgroundWork();
             }
+            lock (_mutex) EnsureSeqnoToTimeMapping(cfd.Options);
+            RegisterRecordSeqnoTimeWorker();
+            RescheduleCompactionTrigger();
             LogInfo("SetOptions() on column family [" + cfd.Name + "], inputs:" + description);
             await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
             LogInfo("[" + cfd.Name + "] SetOptions() succeeded");
@@ -175,6 +181,16 @@ internal sealed partial class DbImpl
         if (o.EnableBlobGarbageCollection && o.BlobGarbageCollectionForceThreshold is < 0 or > 1)
         {
             ThrowHelper.InvalidArgument("The garbage ratio threshold for forcing blob garbage collection should be in the range [0.0, 1.0].");
+        }
+        ValidateReadTriggeredCompactionThreshold(o);
+    }
+
+    /// <summary>ColumnFamilyData::ValidateOptions: read_triggered_compaction_threshold must be &gt;= 0 and finite.</summary>
+    internal static void ValidateReadTriggeredCompactionThreshold(ColumnFamilyOptions o)
+    {
+        if (!(o.ReadTriggeredCompactionThreshold >= 0.0) || double.IsInfinity(o.ReadTriggeredCompactionThreshold))
+        {
+            ThrowHelper.InvalidArgument("read_triggered_compaction_threshold must be >= 0.0 and finite. Use 0.0 to disable.");
         }
     }
 
@@ -265,6 +281,7 @@ internal sealed partial class DbImpl
                 _statsDumpTimer = null;
                 StartStatsDump();
             }
+            RescheduleCompactionTrigger();
             LogInfo("SetDBOptions(), inputs:" + description);
             await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
             LogInfo("SetDBOptions() succeeded");

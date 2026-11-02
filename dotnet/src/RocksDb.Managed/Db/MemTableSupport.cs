@@ -32,6 +32,55 @@ public sealed class MemTableOptions
     /// </summary>
     public int TrackNewestTimestampSize { get; set; }
 
+    /// <summary>MutableCFOptions::prefix_extractor: prefixes go to the memtable bloom (with <see cref="PrefixBloomBits"/> &gt; 0).</summary>
+    public SliceTransform? PrefixExtractor { get; set; }
+
+    /// <summary>
+    /// ImmutableMemTableOptions::memtable_prefix_bloom_bits = write_buffer_size * memtable_prefix_bloom_size_ratio * 8
+    /// (0: no memtable bloom). See <see cref="ComputePrefixBloomBits"/>.
+    /// </summary>
+    public uint PrefixBloomBits { get; set; }
+
+    /// <summary>memtable_whole_key_filtering: whole user keys (without timestamp) are added to the memtable bloom too.</summary>
+    public bool WholeKeyFiltering { get; set; }
+
+    /// <summary>inplace_update_support (see <see cref="MemTable.Update"/>).</summary>
+    public bool InplaceUpdateSupport { get; set; }
+
+    /// <summary>inplace_update_num_locks: number of striped locks guarding in-place updates.</summary>
+    public int InplaceUpdateNumLocks { get; set; } = 10000;
+
+    /// <summary>inplace_callback (see <see cref="MemTable.UpdateCallback"/>).</summary>
+    public InplaceUpdateCallback? InplaceCallback { get; set; }
+
+    /// <summary>memtable_insert_with_hint_prefix_extractor: serial point inserts use a per-prefix skiplist splice hint.</summary>
+    public SliceTransform? InsertWithHintPrefixExtractor { get; set; }
+
+    /// <summary>
+    /// Port of the memtable_prefix_bloom_bits computation of ImmutableMemTableOptions (db/memtable.cc):
+    /// static_cast&lt;uint32_t&gt;(write_buffer_size * memtable_prefix_bloom_size_ratio) * 8.
+    /// </summary>
+    public static uint ComputePrefixBloomBits(ulong writeBufferSize, double ratio)
+    {
+        double bytes = writeBufferSize * ratio;
+        uint b = bytes <= 0 ? 0u : bytes >= uint.MaxValue ? uint.MaxValue : (uint)bytes;
+        return unchecked(b * 8u);
+    }
+
+    /// <summary>Copies the memtable-related settings of a column family's options (sanitized like SanitizeCfOptions).</summary>
+    public void ApplyColumnFamilyOptions(ColumnFamilyOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        double ratio = Math.Clamp(options.MemtablePrefixBloomSizeRatio, 0, 0.25);
+        PrefixExtractor = options.PrefixExtractor;
+        PrefixBloomBits = ComputePrefixBloomBits(options.WriteBufferSize, ratio);
+        WholeKeyFiltering = options.MemtableWholeKeyFiltering;
+        InplaceUpdateSupport = options.InplaceUpdateSupport;
+        InplaceUpdateNumLocks = (int)Math.Clamp(options.InplaceUpdateNumLocks, 1UL, 1UL << 24);
+        InplaceCallback = options.InplaceCallback;
+        InsertWithHintPrefixExtractor = options.MemtableInsertWithHintPrefixExtractor;
+    }
+
     /// <summary>Port of the arena_block_size sanitization in db/column_family.cc (SanitizeCfOptions).</summary>
     public int GetEffectiveArenaBlockSize()
     {

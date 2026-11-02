@@ -209,19 +209,23 @@ Goal: finish implementation, validate vs C++ source, comprehensive tests (unit/i
 Legend: S/M/L = rough size. [~] = agent working on it.
 
 - Compaction
-  - [~] read-triggered compaction, reduce_file_locking, preclude_last_level_data_seconds, CompactRange partition-straddle
+  - [x] read-triggered compaction (read sampling), periodic compaction trigger, reduce_file_locking (bottom-priority pool), preclude_last_level_data_seconds (seqno-to-time mapping, per-key placement), CompactRange partition-straddle; lock-step/compat vs native
+  - [ ] perf check of read-sampling overhead on the next quiet benchmark run (S)
   - [ ] subcompactions (L); async compaction input reads (M); compensated size with point-deletion boost (M)
-  - [ ] bottommost files marked for compaction (S/M); persist round-robin cursors to MANIFEST (S); CompactFiles API (M)
+  - [ ] bottommost files marked for compaction (+ by preserve boundary) (S/M); bottommost_file_compaction_delay (S); persist round-robin cursors to MANIFEST (S); CompactFiles API (M)
   - [ ] write-controller pacing parity (L0 pile-up under free-running load) (M)
 - Transactions
-  - [~] WritePrepared two_write_queues + commit-time batches; per-txn allocations
+  - [x] two_write_queues (second WAL-only write queue, published vs allocated seqno) + commit-time write batches, all policies; compat vs native both ways
+  - [x] steady-state transactions allocate only what the equivalent WriteBatch does (557 B for 4 puts, was 717-1517 B)
+  - [ ] flaky under load? `WriteSlowdownDelaysWrites`, `AutoFlushPreservesGenerationOrderAndOldestBlobFile` (failed once in a loaded full run)
   - [ ] range locks (L); public WAL termination point (S)
 - Wide columns / blob
-  - [~] compaction filters on entities, FilterV4 blob resolver, attribute groups / MultiGetEntity, lazy entity
-  - [ ] WBWI MultiGetFromBatchAndDB (S/M)
+  - [x] compaction filters on entities (FilterV4 + lazy WideColumnBlobResolver), MultiGetEntity, attribute groups (Put/Get/MultiGet), coalescing + attribute-group iterators, lazy entity reads (GetEntityLazy/MultiGetEntityLazy, ranged blob column reads); compat-tested vs native
+  - [ ] WBWI MultiGetFromBatchAndDB, GetEntityFromBatchAndDB / MultiGetEntityFromBatchAndDB, txn entity APIs (S/M); lazy MultiResolve (S)
 - Table format / options / API
-  - [ ] hash index write (M); separated key/value data blocks (M); uniform block hint (S); super_block_alignment (S)
-  - [ ] user table-properties collectors (M); parallel compression (M); memtable prefix bloom (M); in-place updates (M); insert hints (S)
+  - [x] hash index (kHashSearch) read+write, separated key/value data blocks, uniform index hint, block_align, super_block_alignment (byte-identical vs native SstFileWriter)
+  - [x] user table-properties collectors (+ CompactOnDeletionCollector, NeedCompact), memtable prefix bloom, insert hints, in-place updates (+ callback)
+  - [ ] parallel compression (throughput only; output identical) (M); is_uniform hint used for index search on read (S); CompactForTieringCollector (S)
   - [ ] per-key protection info (L); per-SuperVersion options snapshot (M); mutable block-based table options (M)
   - [ ] WriteBatch ColumnFamily overloads (S); WriteOptions sync static (S); max_total_wal_size (S/M); lazy WAL sync on rotation (S)
   - [ ] shared table cache across CFs (S/M); best_efforts_recovery (M); WAL tracking in MANIFEST emit+verify (M); reads on dropped CF handle (S)

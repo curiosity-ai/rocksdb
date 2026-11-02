@@ -69,6 +69,13 @@ internal sealed partial class DbImpl
             ValidateColumnFamilies(batch, options?.IgnoreMissingColumnFamilies ?? false);
             if (txn?.MemtableBatch is { } mb) ValidateColumnFamilies(mb, options?.IgnoreMissingColumnFamilies ?? false);
         }
+        if (_twoWriteQueues && txn is { DisableMemtable: true })
+        {
+            // two_write_queues: WAL-only writes (2PC prepare of WriteCommitted, commit markers of WritePrepared /
+            // WriteUnprepared) go to the second queue (DBImpl::WriteImpl -> WriteImplWALOnly).
+            await WriteWalOnlyAsync(options, batch, txn, synchronous, cancellationToken).ConfigureAwait(false);
+            return;
+        }
         if (_seqPerBatch && (txn is null || txn.BatchCount == 0))
         {
             // WritePreparedTxnDB::Write (skip_concurrency_control) -> WriteInternal: a write that does not come from a
@@ -112,26 +119,17 @@ internal sealed partial class DbImpl
         }
     }
 
-    /// <summary>A plain write into a sequence-per-batch DB (see <see cref="SeqPerBatchHooks.BeginPlainWrite"/>).</summary>
-    private async ValueTask WritePlainSeqPerBatchAsync(WriteOptions? options, WriteBatch batch, TransactionWriteContext? txn, bool synchronous,
+    /// <summary>A plain write into a sequence-per-batch DB (see <see cref="SeqPerBatchHooks.WritePlainAsync"/>).</summary>
+    private ValueTask WritePlainSeqPerBatchAsync(WriteOptions? options, WriteBatch batch, TransactionWriteContext? txn, bool synchronous,
         CancellationToken cancellationToken)
     {
         SeqPerBatchHooks hooks = _txnHooks ?? throw new InvalidOperationException("WritePrepared/WriteUnprepared DB written before its transaction layer was initialized");
-        if (batch.Count == 0) return; // WriteInternal: nothing to write
+        if (batch.Count == 0) return default; // WriteInternal: nothing to write
         if (txn is not null && (txn.Callback is not null || txn.MemtableBatch is not null || txn.DisableMemtable))
         {
             throw new InvalidOperationException("transaction writes into a sequence-per-batch DB must give their batch count");
         }
-        var ctx = new TransactionWriteContext();
-        WriteBatch toWrite = hooks.BeginPlainWrite(batch, ctx);
-        try
-        {
-            await WriteAsync(options, toWrite, validateColumnFamilies: false, ctx, synchronous, cancellationToken).ConfigureAwait(false);
-        }
-        finally
-        {
-            hooks.EndPlainWrite(toWrite, ctx);
-        }
+        return hooks.WritePlainAsync(options, batch, synchronous, cancellationToken);
     }
 
     private static void ThrowWriteError(Exception e)
@@ -158,7 +156,10 @@ internal sealed partial class DbImpl
         return w;
     }
 
-    /// <summary>EnterUnbatched without the closed-DB check (used by close itself).</summary>
+    /// <summary>
+    /// EnterUnbatched without the closed-DB check (used by close itself). With two write queues the second queue is
+    /// entered too (after the main one), so no WAL write of either queue is in progress.
+    /// </summary>
     private async ValueTask<WriteThread.Writer> EnterUnbatchedCoreAsync(bool synchronous)
     {
         WriteThread.Writer w = WriteThread.Rent(synchronous);
@@ -168,12 +169,13 @@ internal sealed partial class DbImpl
             int state = synchronous ? w.WaitSync() : await w.WaitAsync().ConfigureAwait(false);
             Debug.Assert(state == WriteThread.StateGroupLeader);
         }
+        if (_twoWriteQueues) await EnterNonMemUnbatchedAsync(synchronous).ConfigureAwait(false);
         return w;
     }
 
     internal void ExitUnbatched(WriteThread.Writer w, bool synchronous)
     {
-        _writeThread.ExitAsLeader();
+        ExitUnbatchedQueues();
         WriteThread.Return(w, synchronous);
     }
 
@@ -241,109 +243,127 @@ internal sealed partial class DbImpl
                     bdw.ClearTouched();
                 }
             }
-            ulong first = Versions.AllocateSequence(total);
-            ulong seq = first;
-            for (int i = 0; i < group.Count; i++)
+            // two_write_queues: the WAL is shared with the WAL-only queue, so the sequence numbers are allocated and the
+            // record is written under the WAL write lock: WAL order matches sequence order (ConcurrentWriteGroupToWAL).
+            bool walLocked = false;
+            if (_twoWriteQueues && !leader.DisableWal && valid > 0)
             {
-                WriteThread.Writer w = group[i];
-                if (w.CallbackFailed) continue;
-                TransactionWriteContext? t = w.Txn;
-                WriteBatch b = w.Batch!;
-                b.Sequence = seq;
-                if (_seqPerBatch)
-                {
-                    t!.SequenceUsed = seq;
-                    seq += (uint)t.BatchCount;
-                }
-                else if (t is not null)
-                {
-                    t.SequenceUsed = seq;
-                    if (t.MemtableBatch is { } mb) mb.Sequence = seq;
-                    if (t.DisableMemtable) continue; // a prepare consumes no sequence numbers
-                    seq += (uint)(t.MemtableBatch ?? b).Count;
-                }
-                else
-                {
-                    seq += (uint)b.Count;
-                }
+                ValueTask l = AcquireWalWriteLockAsync(synchronous);
+                if (!l.IsCompletedSuccessfully) await l.ConfigureAwait(false);
+                walLocked = true;
             }
-            ulong last = seq - 1;
-
+            ulong last;
             int walRecordBytes = 0;
-            if (!leader.DisableWal && valid > 0)
+            try
             {
-                // DBImpl::MergeBatch: a single batch without a WAL termination point is logged as is; otherwise the WAL
-                // parts of the batches (WriteBatchInternal::Append(wal_only = true)) are flattened into one record.
-                ReadOnlyMemory<byte> record;
-                if (valid == 1 && !firstValid!.Batch!.HasWalTerminationPoint)
+                ulong first = Versions.AllocateSequence(total);
+                ulong seq = first;
+                for (int i = 0; i < group.Count; i++)
                 {
-                    record = firstValid.Batch.DataMemory;
-                }
-                else
-                {
-                    _groupBatch.SetContentsWalOnly(firstValid!.Batch!);
-                    for (int i = 0; i < group.Count; i++)
+                    WriteThread.Writer w = group[i];
+                    if (w.CallbackFailed) continue;
+                    TransactionWriteContext? t = w.Txn;
+                    WriteBatch b = w.Batch!;
+                    b.Sequence = seq;
+                    if (_seqPerBatch)
                     {
-                        WriteThread.Writer w = group[i];
-                        if (w == firstValid || w.CallbackFailed) continue;
-                        WriteBatch.Append(_groupBatch, w.Batch!, walOnly: true);
+                        t!.SequenceUsed = seq;
+                        seq += (uint)t.BatchCount;
                     }
-                    record = _groupBatch.DataMemory;
-                }
-                walRecordBytes = record.Length;
-                try
-                {
-                    LogWriter log = _log!;
-                    // DBImpl::WriteToWAL: record the timestamp sizes of column families with timestamps not yet recorded
-                    // in this WAL (recovery uses them to reconcile timestamp-size changes).
-                    if (_cfTimestampSizes is { } tsSizes) log.MaybeAddUserDefinedTimestampSizeRecord(tsSizes);
-                    if (synchronous)
+                    else if (t is not null)
                     {
-                        log.AddRecord(record.Span, last);
-                        if (needSync)
-                        {
-                            // WriteToWAL with need_log_sync: every WAL in logs_ is synced, oldest first.
-                            if (_closedWalsToSync.Count > 0) SyncClosedWalsAsync(synchronous: true).GetAwaiter().GetResult();
-                            log.Sync();
-                            SyncWalDirIfNeeded();
-                        }
+                        t.SequenceUsed = seq;
+                        if (t.MemtableBatch is { } mb) mb.Sequence = seq;
+                        if (t.DisableMemtable) continue; // a prepare consumes no sequence numbers
+                        seq += (uint)(t.MemtableBatch ?? b).Count;
                     }
                     else
                     {
-                        // No cancellation once the group is being committed: an abandoned AddRecord would leave a torn
-                        // record in the middle of the WAL (and fail followers that did not ask for cancellation).
-                        await log.AddRecordAsync(record, last, CancellationToken.None).ConfigureAwait(false);
-                        if (needSync)
+                        seq += (uint)b.Count;
+                    }
+                }
+                last = seq - 1;
+
+                if (!leader.DisableWal && valid > 0)
+                {
+                    // DBImpl::MergeBatch: a single batch without a WAL termination point is logged as is; otherwise the
+                    // WAL parts of the batches (WriteBatchInternal::Append(wal_only = true)) are flattened into one record.
+                    ReadOnlyMemory<byte> record;
+                    if (valid == 1 && !firstValid!.Batch!.HasWalTerminationPoint)
+                    {
+                        record = firstValid.Batch.DataMemory;
+                    }
+                    else
+                    {
+                        _groupBatch.SetContentsWalOnly(firstValid!.Batch!);
+                        for (int i = 0; i < group.Count; i++)
                         {
-                            if (_closedWalsToSync.Count > 0) await SyncClosedWalsAsync(synchronous: false).ConfigureAwait(false);
-                            await log.SyncAsync(CancellationToken.None).ConfigureAwait(false);
-                            SyncWalDirIfNeeded();
+                            WriteThread.Writer w = group[i];
+                            if (w == firstValid || w.CallbackFailed) continue;
+                            WriteBatch.Append(_groupBatch, w.Batch!, walOnly: true);
+                        }
+                        record = _groupBatch.DataMemory;
+                    }
+                    walRecordBytes = record.Length;
+                    try
+                    {
+                        LogWriter log = _log!;
+                        // DBImpl::WriteToWAL: record the timestamp sizes of column families with timestamps not yet recorded
+                        // in this WAL (recovery uses them to reconcile timestamp-size changes).
+                        if (_cfTimestampSizes is { } tsSizes) log.MaybeAddUserDefinedTimestampSizeRecord(tsSizes);
+                        if (synchronous)
+                        {
+                            log.AddRecord(record.Span, last);
+                            if (needSync)
+                            {
+                                // WriteToWAL with need_log_sync: every WAL in logs_ is synced, oldest first.
+                                if (_closedWalsToSync.Count > 0) SyncClosedWalsAsync(synchronous: true).GetAwaiter().GetResult();
+                                log.Sync();
+                                SyncWalDirIfNeeded();
+                            }
+                        }
+                        else
+                        {
+                            // No cancellation once the group is being committed: an abandoned AddRecord would leave a torn
+                            // record in the middle of the WAL (and fail followers that did not ask for cancellation).
+                            await log.AddRecordAsync(record, last, CancellationToken.None).ConfigureAwait(false);
+                            if (needSync)
+                            {
+                                if (_closedWalsToSync.Count > 0) await SyncClosedWalsAsync(synchronous: false).ConfigureAwait(false);
+                                await log.SyncAsync(CancellationToken.None).ConfigureAwait(false);
+                                SyncWalDirIfNeeded();
+                            }
+                        }
+                        _logEmpty = false;
+                        _currentWalSize += record.Length;
+                        Interlocked.Add(ref _walsTotalSize, record.Length);
+                        if (_seqPerBatch) CacheRecoverableStateOf(group);
+                    }
+                    catch (Exception e)
+                    {
+                        // A failed WAL write leaves the WAL in an unknown state: stop accepting writes (bg error). The recovery
+                        // replaces the WAL and never writes to or syncs the failed one again.
+                        SetBackgroundError(e, BackgroundErrorReason.WriteCallback, walRelated: true);
+                        throw;
+                    }
+                    for (int i = 0; i < group.Count; i++)
+                    {
+                        // PreReleaseCallback of WriteCommittedTxn::PrepareInternal (MarkLogCallback) + log_used.
+                        if (group[i] is { CallbackFailed: false, Txn: { } t })
+                        {
+                            t.LogUsed = _logNumber;
+                            if (t.MarkLogContainingPrepSection) MarkLogAsContainingPrepSection(_logNumber);
                         }
                     }
-                    _logEmpty = false;
-                    _currentWalSize += record.Length;
-                    Interlocked.Add(ref _walsTotalSize, record.Length);
                 }
-                catch (Exception e)
+                else if (total > 0)
                 {
-                    // A failed WAL write leaves the WAL in an unknown state: stop accepting writes (bg error). The recovery
-                    // replaces the WAL and never writes to or syncs the failed one again.
-                    SetBackgroundError(e, BackgroundErrorReason.WriteCallback, walRelated: true);
-                    throw;
-                }
-                for (int i = 0; i < group.Count; i++)
-                {
-                    // PreReleaseCallback of WriteCommittedTxn::PrepareInternal (MarkLogCallback) + log_used.
-                    if (group[i] is { CallbackFailed: false, Txn: { } t })
-                    {
-                        t.LogUsed = _logNumber;
-                        if (t.MarkLogContainingPrepSection) MarkLogAsContainingPrepSection(_logNumber);
-                    }
+                    Volatile.Write(ref _hasUnpersistedData, true);
                 }
             }
-            else if (total > 0)
+            finally
             {
-                Volatile.Write(ref _hasUnpersistedData, true);
+                if (walLocked) _walWriteLock!.Release();
             }
 
             if (_seqPerBatch && valid > 0)
@@ -359,7 +379,7 @@ internal sealed partial class DbImpl
                 {
                     WriteThread.Writer w = group[i];
                     if (w.CallbackFailed || w.Txn is not { PreRelease: { } cb } t) continue;
-                    cb.Callback(t.SequenceUsed, t.DisableMemtable, leader.DisableWal ? 0 : _logNumber, index++, callbacks);
+                    cb.Callback(t.SequenceUsed, t.DisableMemtable, leader.DisableWal ? 0 : t.LogUsed, index++, callbacks);
                 }
             }
 
@@ -480,7 +500,7 @@ internal sealed partial class DbImpl
         if (_maybeStalled)
         {
             long stallStart = Stopwatch.GetTimestamp();
-            await DelayWriteAsync(noSlowdown, synchronous, cancellationToken).ConfigureAwait(false);
+            await DelayWriteAsync(noSlowdown, synchronous, cancellationToken, countGroupBytes: true).ConfigureAwait(false);
             RecordWriteStall(stallStart);
         }
     }
@@ -499,6 +519,30 @@ internal sealed partial class DbImpl
     /// </summary>
     internal async ValueTask SwitchMemtableAsync(ColumnFamilyData cfd, FlushReason reason, bool synchronous, CancellationToken cancellationToken)
     {
+        // two_write_queues: the WAL-only queue may be appending to the current WAL; the WAL is replaced under the WAL
+        // write lock (logs_ / cur_wal_number_ are guarded by wal_write_mutex_ upstream).
+        bool walLocked = false;
+        if (_twoWriteQueues)
+        {
+            ValueTask l = AcquireWalWriteLockAsync(synchronous);
+            if (!l.IsCompletedSuccessfully) await l.ConfigureAwait(false);
+            walLocked = true;
+        }
+        try
+        {
+            await SwitchMemtableCoreAsync(cfd, reason, synchronous).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (walLocked) _walWriteLock!.Release();
+        }
+    }
+
+    private async ValueTask SwitchMemtableCoreAsync(ColumnFamilyData cfd, FlushReason reason, bool synchronous)
+    {
+        // Recoverable state is persisted in WAL. After memtable switch, WAL might be deleted, so we write the state to
+        // memtable to be persisted as well.
+        WriteRecoverableState();
         LogWriter? newLog = null;
         ulong newLogNumber;
         bool walFailed;
@@ -930,7 +974,7 @@ internal sealed partial class DbImpl
             // MemTableInserter::DeleteCF: a deletion in a column family with timestamps is kTypeDeletionWithTimestamp.
             if (type == EntryType.Deletion && c.TimestampSize != 0) type = EntryType.DeletionWithTimestamp;
             MemTable mem = c.Mem;
-            while (!mem.Add(Sequence, type, key, value))
+            while (!AddToMemTable(c, mem, type, key, value))
             {
                 // key+seq exists (TryAgain). Without seq_per_batch this can only come from replaying an already applied
                 // batch: ignore it like upstream. With seq_per_batch the key starts a new sub-batch: advance and retry.
@@ -940,6 +984,48 @@ internal sealed partial class DbImpl
             if (LogRef != 0) mem.RefLogContainingPrepSection(LogRef);
             if (mem.ShouldScheduleFlush && mem.MarkFlushScheduled()) _db._flushScheduler.Add(c);
             MaybeAdvanceSeq(batchBoundary: false);
+        }
+
+        /// <summary>
+        /// The memtable write of MemTableInserter::PutCFImpl: plain Add, or with inplace_update_support MemTable::Update
+        /// (Put / PutEntity / PutBlobIndex / TimedPut) and, for Puts with an inplace_callback, MemTable::UpdateCallback with
+        /// the DB read fallback when the memtable has no value for the key. Returns false when the key+seq exists.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private readonly bool AddToMemTable(ColumnFamilyData c, MemTable mem, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            if (!mem.InplaceUpdateSupport || type is not (EntryType.Value or EntryType.WideColumnEntity or EntryType.BlobIndex or EntryType.ValuePreferredSeqno))
+                return mem.Add(Sequence, type, key, value);
+            return AddInplace(c, mem, type, key, value);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private readonly bool AddInplace(ColumnFamilyData c, MemTable mem, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            InplaceUpdateCallback? callback = mem.InplaceCallback;
+            if (callback is null || type != EntryType.Value) return mem.Update(Sequence, type, key, value);
+            switch (mem.UpdateCallback(Sequence, key, value, callback))
+            {
+                case MemTable.UpdateCallbackResult.Done: return true;
+                case MemTable.UpdateCallbackResult.AddFailed: return false;
+            }
+            // key not found in memtable. Do sst get, update, add (reading at the batch's sequence number; not during
+            // recovery, where upstream has no DB to read from).
+            using var prev = new Util.PooledBufferWriter(0);
+            bool found = false;
+            if (_logNumber == 0) found = _db.GetForInplaceCallback(c, key, Sequence, prev);
+            using var merged = new Util.PooledBufferWriter(0);
+            int prevSize = prev.WrittenCount;
+            byte[]? copy = found ? prev.WrittenSpan.ToArray() : null;
+            InplaceUpdateStatus status = callback(copy is null ? default : copy.AsSpan(), found, ref prevSize, value, merged);
+            if (status == InplaceUpdateStatus.UpdatedInplace)
+            {
+                // prev_value is updated in-place with final value.
+                if (copy is null || (uint)prevSize > (uint)copy.Length) ThrowHelper.InvalidArgument("inplace_callback returned UpdatedInplace without a valid existing value");
+                return mem.Add(Sequence, EntryType.Value, key, copy.AsSpan(0, prevSize));
+            }
+            if (status == InplaceUpdateStatus.Updated) return mem.Add(Sequence, EntryType.Value, key, merged.WrittenSpan);
+            return true;
         }
 
         /// <summary>IsDuplicateKeySeq (util/duplicate_detector.h): recovery of a column family whose insert is skipped.</summary>

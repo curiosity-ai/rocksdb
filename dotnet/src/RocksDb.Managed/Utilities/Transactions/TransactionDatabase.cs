@@ -156,6 +156,8 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     {
         DbImpl impl = _db.Impl;
         impl.SetSeqPerBatchHooks(wp);
+        // A callback to commit a single sub-batch of the recoverable state (WritePreparedTxnDB::Initialize).
+        impl.RecoverableStatePreReleaseCallback = new CommitSubBatchPreReleaseCallback(wp);
         List<RecoveredTransaction> recovered = impl.TakeRecoveredTransactions();
         try
         {

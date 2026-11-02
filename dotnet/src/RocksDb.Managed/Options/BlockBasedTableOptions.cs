@@ -56,7 +56,25 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
     /// all column families of that database.
     /// </summary>
     public Cache.BlockCache? BlockCache { get; set; }
+    /// <summary>block_align: pad data blocks to min(block_size, 4 KiB) (block_size must be a power of 2; requires no compression).</summary>
     public bool BlockAlign { get; set; }
+    /// <summary>
+    /// super_block_alignment_size: avoid a data block straddling a boundary of this power-of-two size by padding (at most
+    /// size / <see cref="SuperBlockAlignmentSpaceOverheadRatio"/> bytes per block). 0 (default) disables it.
+    /// </summary>
+    public ulong SuperBlockAlignmentSize { get; set; }
+    /// <summary>super_block_alignment_space_overhead_ratio (default 128; 0 disables super block alignment).</summary>
+    public ulong SuperBlockAlignmentSpaceOverheadRatio { get; set; } = 128;
+    /// <summary>
+    /// separate_key_value_in_data_block: data blocks store the keys first and the values after them, which can improve
+    /// read performance and compression at a cost of a varint per restart interval. Default false.
+    /// </summary>
+    public bool SeparateKeyValueInDataBlock { get; set; }
+    /// <summary>
+    /// uniform_cv_threshold: index blocks whose key gaps have a coefficient of variation below this get the "is_uniform"
+    /// hint in their footer (used by native readers with index_block_search_type = kAuto). -1 (default) disables it.
+    /// </summary>
+    public double UniformCvThreshold { get; set; } = -1;
     public bool EnableIndexCompression { get; set; } = true;
     public bool UseDeltaEncoding { get; set; } = true;
     public IndexShorteningMode IndexShortening { get; set; } = IndexShorteningMode.ShortenSeparators;
@@ -96,6 +114,11 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
         .Bool("pin_top_level_index_and_filter", static o => o.PinTopLevelIndexAndFilter, static (o, v) => o.PinTopLevelIndexAndFilter = v)
         .Bool("no_block_cache", static o => o.NoBlockCache, static (o, v) => o.NoBlockCache = v)
         .Bool("block_align", static o => o.BlockAlign, static (o, v) => o.BlockAlign = v)
+        .UInt64("super_block_alignment_size", static o => o.SuperBlockAlignmentSize, static (o, v) => o.SuperBlockAlignmentSize = v)
+        .UInt64("super_block_alignment_space_overhead_ratio", static o => o.SuperBlockAlignmentSpaceOverheadRatio,
+            static (o, v) => o.SuperBlockAlignmentSpaceOverheadRatio = v)
+        .Bool("separate_key_value_in_data_block", static o => o.SeparateKeyValueInDataBlock, static (o, v) => o.SeparateKeyValueInDataBlock = v)
+        .Double("uniform_cv_threshold", static o => o.UniformCvThreshold, static (o, v) => o.UniformCvThreshold = v)
         .Bool("enable_index_compression", static o => o.EnableIndexCompression, static (o, v) => o.EnableIndexCompression = v)
         .Bool("use_delta_encoding", static o => o.UseDeltaEncoding, static (o, v) => o.UseDeltaEncoding = v)
         .Enum("index_shortening", OptionEnumMaps.IndexShortening, static o => o.IndexShortening, static (o, v) => o.IndexShortening = v)

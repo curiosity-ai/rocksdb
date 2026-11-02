@@ -218,6 +218,7 @@ public sealed class WriteBatch : IDisposable
         _savePointCount = 0;
         _walTermPoint = default;
         HasKeyWithTimestamp = false;
+        IsLatestPersistentState = false;
         _cfTimestampSizes?.Clear();
     }
 
@@ -236,6 +237,15 @@ public sealed class WriteBatch : IDisposable
 
     /// <summary>True if <see cref="MarkWalTerminationPoint"/> was called since the last <see cref="Clear"/>.</summary>
     public bool HasWalTerminationPoint => _walTermPoint.Size != 0;
+
+    /// <summary>
+    /// is_latest_persistent_state_ (WriteBatchInternal::SetAsLatestPersistentState): the batch is a commit-time batch
+    /// of a WritePrepared / WriteUnprepared transaction with use_only_the_last_commit_time_batch_for_recovery. Only its
+    /// last occurrence matters for recovery, so the DB caches the last such WAL record and writes it to the memtables
+    /// before a memtable switch (the WAL holding it may be deleted after the flush). Not persisted; reset by
+    /// <see cref="Clear"/>.
+    /// </summary>
+    internal bool IsLatestPersistentState { get; set; }
 
     private Dictionary<uint, int>? _cfTimestampSizes;
 
@@ -509,6 +519,23 @@ public sealed class WriteBatch : IDisposable
 
     /// <summary>Stores a wide-column entity in the default column family (see <see cref="PutEntity(uint, ReadOnlySpan{byte}, ReadOnlySpan{WideColumn})"/>).</summary>
     public WriteBatch PutEntity(ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns) => PutEntity(0, key, columns);
+
+    /// <summary>
+    /// Stores the attribute groups of <paramref name="key"/>: one entity per group, in the group's column family
+    /// (WriteBatch::PutEntity(key, attribute_groups), db/write_batch.cc). InvalidArgument when
+    /// <paramref name="attributeGroups"/> is empty.
+    /// </summary>
+    public WriteBatch PutAttributeGroups(ReadOnlySpan<byte> key, ReadOnlySpan<AttributeGroup> attributeGroups)
+    {
+        if (attributeGroups.IsEmpty) ThrowHelper.InvalidArgument("Cannot call this method with empty attribute groups");
+        for (int gi = 0; gi < attributeGroups.Length; gi++)
+        {
+            AttributeGroup ag = attributeGroups[gi];
+            if (ag.ColumnFamily is null) ThrowHelper.InvalidArgument("Cannot call this method without a column family handle");
+            PutEntity(ag.ColumnFamily.Id, key, ag.Columns.Span);
+        }
+        return this;
+    }
 
     /// <summary>
     /// Stores a wide-column entity (WriteBatch::PutEntity): the columns are sorted by name and serialized

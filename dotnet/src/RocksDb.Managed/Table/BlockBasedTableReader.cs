@@ -280,6 +280,56 @@ public sealed partial class BlockBasedTableReader : IDisposable
             || wkf.AsSpan().SequenceEqual("1"u8);
         GlobalSequenceNumber = ResolveGlobalSeqno(props, options.LargestSeqno);
         PadTimestampSize = TimestampsStripped(props, options.Comparator) ? _tsSize : 0;
+        if (IndexType == IndexType.HashSearch && _tablePrefixExtractor is not null) _prefixIndex = TryCreatePrefixIndex(file, footer, metaBlocks, options.VerifyChecksums);
+    }
+
+    /// <summary>
+    /// Port of HashIndexReader::Create (table/block_based/hash_index_reader.cc): builds the <see cref="BlockPrefixIndex"/>
+    /// from the hash index meta blocks. Failure to create the prefix hash index is not a hard error; the index is then
+    /// searched with binary search (null).
+    /// </summary>
+    private static BlockPrefixIndex? TryCreatePrefixIndex(IRandomAccessFile file, in Footer footer, Dictionary<string, BlockHandle> metaBlocks, bool verify)
+    {
+        if (!metaBlocks.TryGetValue(BlockBasedTableConstants.HashIndexPrefixesBlockName, out BlockHandle prefixesHandle)
+            || !metaBlocks.TryGetValue(BlockBasedTableConstants.HashIndexPrefixesMetadataBlockName, out BlockHandle metaHandle))
+            return null;
+        byte[]? prefixes = null, meta = null;
+        try
+        {
+            prefixes = BlockFetcher.ReadRawPayload(file, footer, prefixesHandle, verify, out int prefixesLength);
+            meta = BlockFetcher.ReadRawPayload(file, footer, metaHandle, verify, out int metaLength);
+            return BlockPrefixIndex.Create(prefixes.AsSpan(0, prefixesLength), meta.AsSpan(0, metaLength));
+        }
+        catch (RocksDbException)
+        {
+            return null;
+        }
+        finally
+        {
+            if (prefixes is { Length: > 0 }) ArrayPool<byte>.Shared.Return(prefixes);
+            if (meta is { Length: > 0 }) ArrayPool<byte>.Shared.Return(meta);
+        }
+    }
+
+    private readonly BlockPrefixIndex? _prefixIndex;
+
+    /// <summary>The kHashSearch prefix index (null unless the table has a hash index and its prefix extractor is known).</summary>
+    public BlockPrefixIndex? PrefixIndex => _prefixIndex;
+
+    /// <summary>
+    /// The candidate data blocks for the prefix of <paramref name="internalKey"/>'s user key when point lookups can use the
+    /// hash index (prefix extractor unchanged and the key in its domain); false to use binary search.
+    /// </summary>
+    internal bool TryGetPrefixBlocks(ReadOnlySpan<byte> internalKey, out ReadOnlySpan<uint> blocks)
+    {
+        blocks = default;
+        BlockPrefixIndex? pi = _prefixIndex;
+        if (pi is null || _prefixExtractorChanged) return false;
+        ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(internalKey);
+        SliceTransform pe = _tablePrefixExtractor!;
+        if (!pe.InDomain(userKey)) return false;
+        blocks = pi.GetBlocks(pe.Transform(userKey));
+        return true;
     }
 
     /// <summary>True when the keys of a table with <paramref name="props"/> are stored without the timestamps of <paramref name="ucmp"/>.</summary>
@@ -1049,7 +1099,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         BlockIter data = IterPool.Rent();
         try
         {
-            idx.Seek(internalKey);
+            idx.SeekForGet(internalKey);
             bool first = true;
             while (idx.Valid)
             {
@@ -1103,7 +1153,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         BlockIter data = IterPool.Rent();
         try
         {
-            idx.Seek(internalKey);
+            idx.SeekForGet(internalKey);
             bool first = true;
             while (idx.Valid)
             {
@@ -1143,7 +1193,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         BlockIter data = IterPool.Rent();
         try
         {
-            idx.Seek(internalKey.Span);
+            idx.SeekForGet(internalKey.Span);
             bool first = true;
             while (idx.Valid)
             {
@@ -1186,7 +1236,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         BlockIter data = IterPool.Rent();
         try
         {
-            idx.Seek(internalKey.Span);
+            idx.SeekForGet(internalKey.Span);
             bool first = true;
             while (idx.Valid)
             {

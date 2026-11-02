@@ -149,4 +149,67 @@ public sealed class WideColumnCompatTests
             Assert.AreEqual("=dw;c=3;", Describe(db.GetEntity(U("wal"))!));
         }
     }
+
+    /// <summary>
+    /// Attribute groups are per-column-family entities in one write batch (WriteBatch::PutEntity(key, attribute_groups)):
+    /// the managed batch rep is accepted by native, native reads each group's default column per column family, and
+    /// managed reads the native-stored groups back with GetAttributeGroups, MultiGetAttributeGroups and the
+    /// coalescing / attribute-group iterators (after native flushed and compacted them).
+    /// </summary>
+    [TestMethod]
+    public void AttributeGroupsAcrossImplementations()
+    {
+        using var dir = new TempDir("wide-ag");
+        var cfo = new ColumnFamilyOptions { MergeOperator = new StringAppend() };
+        using (RocksDatabase mdb = RocksDatabase.Open(dir.Path, new DbOptions { CreateIfMissing = true, CreateMissingColumnFamilies = true },
+                   [new("default", cfo), new("one", cfo), new("two", cfo)]))
+        {
+            // Managed write: groups in "one" and "two".
+            mdb.PutAttributeGroups(U("m"), [new AttributeGroup(mdb.GetColumnFamily("one"), new[] { C("", "m1"), C("x", "mx") }),
+                new AttributeGroup(mdb.GetColumnFamily("two"), new[] { C("x", "shadow"), C("y", "my") })]);
+        }
+        RocksDbSharp.MergeOperator op = CreateConcatMergeOperator();
+        using (RocksDbSharp.RocksDb db = Open(dir.Path, new RocksDbSharp.DbOptions(), op))
+        {
+            RocksDbSharp.ColumnFamilyHandle one = db.GetColumnFamily("one"), two = db.GetColumnFamily("two");
+            Assert.AreEqual("m1", Encoding.UTF8.GetString(db.Get(U("m"), one)));
+            Assert.AreEqual("", Encoding.UTF8.GetString(db.Get(U("m"), two)));
+            // A native-applied attribute-group batch (built by the managed WriteBatch, ids from native handles).
+            using (WriteBatch b = new())
+            {
+                b.PutEntity(CfId(one), U("n"), [C("", "n1"), C("a", "1")]);
+                b.PutEntity(CfId(two), U("n"), [C("a", "2"), C("b", "3")]);
+                using var nb = new RocksDbSharp.WriteBatch(b.Data.ToArray());
+                db.Write(nb);
+            }
+            db.CompactRange((byte[]?)null, null, one); // flushes "one" first
+            db.CompactRange((byte[]?)null, null, two);
+            Assert.AreEqual("n1", Encoding.UTF8.GetString(db.Get(U("n"), one)));
+        }
+        using (RocksDatabase mdb = RocksDatabase.Open(dir.Path, new DbOptions(), [new("default", cfo), new("one", cfo), new("two", cfo)]))
+        {
+            ColumnFamily one = mdb.GetColumnFamily("one"), two = mdb.GetColumnFamily("two");
+            PinnableAttributeGroup[] groups = [new(one), new(two), new(mdb.DefaultColumnFamily)];
+            mdb.GetAttributeGroups(null, U("n"), groups);
+            Assert.AreEqual("=n1;a=1;", Describe(groups[0].Columns));
+            Assert.AreEqual("a=2;b=3;", Describe(groups[1].Columns));
+            Assert.AreEqual(MultiGetStatus.NotFound, groups[2].Status);
+            PinnableAttributeGroup[][] results = [[new(one), new(two)], [new(two)]];
+            mdb.MultiGetAttributeGroups(null, [U("m"), U("n")], results);
+            Assert.AreEqual("=m1;x=mx;", Describe(results[0][0].Columns));
+            Assert.AreEqual("x=shadow;y=my;", Describe(results[0][1].Columns));
+            Assert.AreEqual("a=2;b=3;", Describe(results[1][0].Columns));
+            using CoalescingIterator it = mdb.NewCoalescingIterator(null, [one, two]);
+            it.SeekToFirst();
+            Assert.AreEqual("m", Encoding.UTF8.GetString(it.Key));
+            Assert.AreEqual("=m1;x=shadow;y=my;", Describe(it.Columns));
+            it.Next();
+            Assert.AreEqual("=n1;a=2;b=3;", Describe(it.Columns));
+            using AttributeGroupIterator ag = mdb.NewAttributeGroupIterator(null, [two, one]);
+            ag.SeekToLast();
+            Assert.AreEqual("n", Encoding.UTF8.GetString(ag.Key));
+            Assert.AreEqual("two", ag.AttributeGroups[0].ColumnFamily.Name);
+            Assert.AreEqual("=n1;a=1;", Describe(ag.AttributeGroups[1].Columns));
+        }
+    }
 }

@@ -33,6 +33,48 @@ internal static class DataModels
         return Task.CompletedTask;
     }
 
+    public static Task AttributeGroups(string path)
+    {
+        using RocksDatabase db = RocksDatabase.Open(path, new DbOptions { CreateIfMissing = true, CreateMissingColumnFamilies = true },
+            [new("default", new ColumnFamilyOptions()), new("profile", new ColumnFamilyOptions()),
+             new("media", new ColumnFamilyOptions { EnableBlobFiles = true, MinBlobSize = 1024 })]);
+        ColumnFamily profile = db.GetColumnFamily("profile"), media = db.GetColumnFamily("media");
+
+        // <snippet:attribute-groups>
+        // One logical row split across column families, written atomically.
+        db.PutAttributeGroups("user:1"u8,
+        [
+            new AttributeGroup(profile, new[] { new WideColumn("name"u8.ToArray(), "alice"u8.ToArray()) }),
+            new AttributeGroup(media, new[] { new WideColumn("avatar"u8.ToArray(), new byte[4096]) }),
+        ]);
+
+        // Read the groups back (one consistent view); the result objects are reusable.
+        PinnableAttributeGroup[] groups = [new(profile), new(media)];
+        db.GetAttributeGroups(null, "user:1"u8, groups);
+        Console.WriteLine(groups[1].Columns.Count);                        // 1
+
+        // Batched entity reads on one column family.
+        using var batch = new MultiGetBatch();
+        batch.Add("user:1"u8);
+        var columns = new WideColumns();
+        profile.MultiGetEntity(batch);
+        if (batch.TryGetEntity(0, columns)) Console.WriteLine(columns.Count);   // 1
+
+        // Iterate rows across column families: columns of later families shadow earlier ones.
+        using (CoalescingIterator rows = db.NewCoalescingIterator(null, [profile, media]))
+            for (rows.SeekToFirst(); rows.Valid; rows.Next())
+                Console.WriteLine(rows.Columns.Count);                     // 2
+
+        // Lazy read: blob-backed columns are fetched only when pulled, in whole or by byte range.
+        media.Flush();
+        using LazyWideColumns? lazy = media.GetEntityLazy(null, "user:1"u8);
+        Span<byte> header = stackalloc byte[16];
+        int read = lazy!.ReadColumnRange(lazy.IndexOf("avatar"u8), 0, header);   // reads 16 bytes, not 4 KiB
+        // </snippet:attribute-groups>
+        Check(groups[0].Status == MultiGetStatus.Found && read == 16 && lazy.IsReference(0), "attribute groups and lazy read");
+        return Task.CompletedTask;
+    }
+
     public static Task UserDefinedTimestamps(string path)
     {
         // <snippet:user-defined-timestamps>

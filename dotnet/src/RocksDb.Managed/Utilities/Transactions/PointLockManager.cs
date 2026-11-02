@@ -39,25 +39,68 @@ internal sealed class PointLockManager
         _maxDeadlocks = Math.Max(0, options.MaxNumDeadlocks);
     }
 
+    /// <summary>A locked key (LockInfo). Recycled by its stripe together with its key buffer.</summary>
     private sealed class LockInfo
     {
         public bool Exclusive;
         public readonly List<ulong> TxnIds = new(1);
         /// <summary>Microseconds (<see cref="NowMicros"/>); 0 = never expires.</summary>
         public long ExpirationTime;
+        /// <summary>Storage of the key (the dictionary key points into it).</summary>
+        public byte[] KeyBuffer = [];
+        /// <summary>Next entry of the stripe's free list.</summary>
+        public LockInfo? NextFree;
     }
 
     private sealed class Stripe
     {
+        /// <summary>Recycled lock entries kept per stripe (the lock table's steady-state size).</summary>
+        private const int MaxFree = 256;
+
         public readonly Lock Mutex = new();
-        public readonly Dictionary<byte[], LockInfo> Keys;
-        public readonly Dictionary<byte[], LockInfo>.AlternateLookup<ReadOnlySpan<byte>> Lookup;
+        public readonly Dictionary<PooledKey, LockInfo> Keys;
+        public readonly Dictionary<PooledKey, LockInfo>.AlternateLookup<ReadOnlySpan<byte>> Lookup;
         public readonly List<TaskCompletionSource> Waiters = new();
+        private LockInfo? _free;
+        private int _freeCount;
 
         public Stripe()
         {
-            Keys = new Dictionary<byte[], LockInfo>(ByteKeyComparer.Instance);
+            Keys = new Dictionary<PooledKey, LockInfo>(PooledKeyComparer.Instance);
             Lookup = Keys.GetAlternateLookup<ReadOnlySpan<byte>>();
+        }
+
+        /// <summary>Adds a lock entry for <paramref name="key"/> (a recycled one when available). REQUIRES: <see cref="Mutex"/>.</summary>
+        public LockInfo Add(ReadOnlySpan<byte> key, ulong txnId, bool exclusive, long expirationTime)
+        {
+            LockInfo? li = _free;
+            if (li is not null)
+            {
+                _free = li.NextFree;
+                li.NextFree = null;
+                _freeCount--;
+            }
+            else
+            {
+                li = new LockInfo();
+            }
+            if (li.KeyBuffer.Length < key.Length) li.KeyBuffer = new byte[Math.Max(16, (key.Length + 15) & ~15)];
+            key.CopyTo(li.KeyBuffer);
+            li.Exclusive = exclusive;
+            li.ExpirationTime = expirationTime;
+            li.TxnIds.Clear();
+            li.TxnIds.Add(txnId);
+            Keys.Add(new PooledKey(li.KeyBuffer, key.Length), li);
+            return li;
+        }
+
+        /// <summary>Removes the lock entry of <paramref name="key"/> and recycles it. REQUIRES: <see cref="Mutex"/>.</summary>
+        public void Remove(ReadOnlySpan<byte> key)
+        {
+            if (!Lookup.Remove(key, out _, out LockInfo? li) || _freeCount >= MaxFree) return;
+            li.NextFree = _free;
+            _free = li;
+            _freeCount++;
         }
     }
 
@@ -241,9 +284,7 @@ internal sealed class PointLockManager
         {
             return new RocksDbException(StatusCode.Busy, "Resource busy: Lock limit", StatusSubCode.LockLimit);
         }
-        var li = new LockInfo { Exclusive = exclusive, ExpirationTime = txnExpiration };
-        li.TxnIds.Add(txnId);
-        stripe.Keys.Add(key.ToArray(), li);
+        stripe.Add(key, txnId, exclusive, txnExpiration);
         // Maintain lock count if there is a limit on the number of locks
         if (_maxNumLocks > 0) Interlocked.Increment(ref map.LockedKeyCount);
         return null;
@@ -306,7 +347,7 @@ internal sealed class PointLockManager
         for (int i = 0; i < tracker.ColumnFamilyCount; i++)
         {
             TrackedColumnFamily c = tracker.GetColumnFamily(i);
-            foreach (byte[] key in c.Keys.Keys) UnLock(txn, c.Cfd.Id, key);
+            foreach (PooledKey key in c.Keys.Keys) UnLock(txn, c.Cfd.Id, key.Span);
         }
     }
 
@@ -318,7 +359,7 @@ internal sealed class PointLockManager
         if (i < 0) return;
         if (txns.Count == 1)
         {
-            stripe.Lookup.Remove(key);
+            stripe.Remove(key);
         }
         else
         {
@@ -453,9 +494,9 @@ internal sealed class PointLockManager
             {
                 lock (s.Mutex)
                 {
-                    foreach (KeyValuePair<byte[], LockInfo> k in s.Keys)
+                    foreach (KeyValuePair<PooledKey, LockInfo> k in s.Keys)
                     {
-                        result.Add(new KeyLockInfo(kv.Key, (byte[])k.Key.Clone(), k.Value.TxnIds.ToArray(), k.Value.Exclusive));
+                        result.Add(new KeyLockInfo(kv.Key, k.Key.Span.ToArray(), k.Value.TxnIds.ToArray(), k.Value.Exclusive));
                     }
                 }
             }

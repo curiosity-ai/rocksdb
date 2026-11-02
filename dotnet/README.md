@@ -36,12 +36,14 @@ while the bytes may differ (for example, because a compressor makes different ch
 | MANIFEST / VersionEdit, `CURRENT`, `IDENTITY`, `LOCK` | yes | yes | every tag in 11.14; native records re-encode byte-identically; the `LOCK` file lock works across engines |
 | `OPTIONS-xxxxxx` files | yes | yes | typed options; unknown or custom ids are kept verbatim |
 | Block-based SST, `format_version` 2-8 | yes | yes | data, index and filter blocks byte-identical to native `SstFileWriter`; checksums crc32c, xxHash, xxHash64, XXH3 |
-| Index types | yes | yes | binary search, delta encoding, first-key index, partitioned (two-level) index; data block hash index |
+| Index types | yes | yes | binary search, delta encoding, first-key index, partitioned (two-level) index, hash index (`kHashSearch`); data block hash index |
+| Optional block layouts | yes | yes | separated key/value data blocks, index `is_uniform` hint, `block_align`, super block alignment; byte-identical to native |
+| User table properties collectors | yes | yes | `TablePropertiesCollector` properties and `rocksdb.property.collectors` as native; `NeedCompact` marks files for compaction |
 | Filters: FastLocalBloom, legacy Bloom, Ribbon (incl. hybrid), prefix, partitioned | yes | yes | byte-identical; with `optimize_filters_for_memory`, Ribbon may differ by 16 bytes depending on heap state (both readable) |
 | Compression: Snappy, LZ4, LZ4HC, ZSTD, Zlib | yes | yes | read + write; ZSTD (with dictionaries) byte-identical; see deviations below |
 | Compression: BZip2, Xpress | no | n/a | a configured BZip2/Xpress type stores blocks uncompressed |
 | Integrated BlobDB (blob files, blob GC) | yes | yes | blob files byte-identical |
-| Wide columns (`PutEntity`, V1 entities) | yes | yes | compaction filters on entities (`FilterV3`, `kChangeWideColumnEntity`) |
+| Wide columns (`PutEntity`, V1 entities) | yes | yes | compaction filters on entities (`FilterV3`, `FilterV4` with a lazy blob resolver, `kChangeWideColumnEntity`); `MultiGetEntity`, attribute groups, coalescing / attribute-group iterators, lazy entity reads (`GetEntityLazy`) |
 | Wide-column entities with blob-backed columns (V2 entities) | yes | yes | written by flush/compaction value separation and blob direct write; blob GC and garbage accounting of entity columns |
 | Blob direct write (`enable_blob_direct_write`, partitions) | yes | yes | needs RocksDB with blob direct write (librocksdb 11.12 has it); off by default; like upstream v1, blob files not registered by a flush before a crash are not recovered |
 | User-defined timestamps (persisted) | yes | yes | timestamped writes byte-identical; `full_history_ts_low` GC; timestamped range deletions and `SstFileWriter` files |
@@ -563,6 +565,41 @@ for (it.SeekToFirst(); it.Valid; it.Next())
     if (it.IsEntity) Console.WriteLine(it.Columns.Count);           // 3
 ```
 
+### Attribute groups, MultiGetEntity and lazy entity reads
+
+<!-- snippet:attribute-groups -->
+```csharp
+// One logical row split across column families, written atomically.
+db.PutAttributeGroups("user:1"u8,
+[
+    new AttributeGroup(profile, new[] { new WideColumn("name"u8.ToArray(), "alice"u8.ToArray()) }),
+    new AttributeGroup(media, new[] { new WideColumn("avatar"u8.ToArray(), new byte[4096]) }),
+]);
+
+// Read the groups back (one consistent view); the result objects are reusable.
+PinnableAttributeGroup[] groups = [new(profile), new(media)];
+db.GetAttributeGroups(null, "user:1"u8, groups);
+Console.WriteLine(groups[1].Columns.Count);                        // 1
+
+// Batched entity reads on one column family.
+using var batch = new MultiGetBatch();
+batch.Add("user:1"u8);
+var columns = new WideColumns();
+profile.MultiGetEntity(batch);
+if (batch.TryGetEntity(0, columns)) Console.WriteLine(columns.Count);   // 1
+
+// Iterate rows across column families: columns of later families shadow earlier ones.
+using (CoalescingIterator rows = db.NewCoalescingIterator(null, [profile, media]))
+    for (rows.SeekToFirst(); rows.Valid; rows.Next())
+        Console.WriteLine(rows.Columns.Count);                     // 2
+
+// Lazy read: blob-backed columns are fetched only when pulled, in whole or by byte range.
+media.Flush();
+using LazyWideColumns? lazy = media.GetEntityLazy(null, "user:1"u8);
+Span<byte> header = stackalloc byte[16];
+int read = lazy!.ReadColumnRange(lazy.IndexOf("avatar"u8), 0, header);   // reads 16 bytes, not 4 KiB
+```
+
 ### User-defined timestamps
 
 <!-- snippet:user-defined-timestamps -->
@@ -850,14 +887,13 @@ Format-level deviations (the output is always readable by native RocksDB):
 Not ported yet:
 
 - Timestamps in optimistic transactions and explicit-timestamp `WriteBatchWithIndex` writes (NotSupported, as upstream).
-- Range locks; for WritePrepared / WriteUnprepared: two_write_queues, commit-time batches, iterator invalidation
-  when a WriteUnprepared transaction ends, and user-defined timestamps (NotSupported, as upstream).
-- PlainTable and CuckooTable, separated key/value data blocks, parallel compression, subcompactions, `CompactFiles`,
+- Range locks; for WritePrepared / WriteUnprepared: iterator invalidation when a WriteUnprepared transaction ends, and
+  user-defined timestamps (NotSupported, as upstream).
+- PlainTable and CuckooTable, parallel compression, subcompactions, `CompactFiles`,
   the SST file manager and a rate limiter for flush and compaction.
 - Wide-column entities with blob-backed columns (V2) and blob direct write (forced blob GC is leveled-only, as
   upstream).
-- Concurrent memtable inserts, pipelined writes, the memtable prefix bloom filter and in-place updates. The options are
-  accepted and persisted.
+- Concurrent memtable inserts and pipelined writes. The options are accepted and persisted.
 
 API and behavior differences:
 

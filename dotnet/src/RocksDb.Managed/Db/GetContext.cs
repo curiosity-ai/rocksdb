@@ -53,6 +53,11 @@ internal sealed class GetContext
 
     /// <summary>The found value still references blob files (<see cref="ValueIsBlobIndex"/> or <see cref="ValueEntityHasBlobColumns"/>).</summary>
     public bool NeedsBlobResolution => ValueIsBlobIndex || ValueEntityHasBlobColumns;
+    /// <summary>
+    /// Lazy entity reads (DB::GetEntityLazy): leave a found version 2 entity's blob columns unresolved when no merge
+    /// operand applies to it; the caller then reads <see cref="Value"/> as the serialized (version 2) entity.
+    /// </summary>
+    public bool DeferEntityBlobColumns;
     public ulong MaxCoveringTombstoneSeq;
     /// <summary>
     /// Sequence number of the read. With user-defined timestamps table entries with a larger seqno are skipped (they
@@ -123,6 +128,7 @@ internal sealed class GetContext
         ValueIsEntity = false;
         ValueIsBlobIndex = false;
         ValueEntityHasBlobColumns = false;
+        DeferEntityBlobColumns = false;
         MaxCoveringTombstoneSeq = 0;
         ReadSequence = DbFormat.MaxSequenceNumber;
         MergeOperator = mergeOperator;
@@ -237,6 +243,7 @@ internal sealed class GetContext
     {
         if (ValueEntityHasBlobColumns)
         {
+            if (DeferEntityBlobColumns && MergeContext.Count == 0 && State == GetState.Found) return;
             ResolveEntityBlobColumns(source, version, options, userKey);
             return;
         }

@@ -163,15 +163,40 @@ public sealed class ReplicationRoleState
     {
         lock (_gate)
         {
-            var kept = new RaftLogTerms();
-            foreach ((ulong start, long e) in _epochs.GetRanges())
-            {
-                if (start < startSeq) kept.Record(start, e);
-            }
-            if (!kept.Record(startSeq, epoch)) throw new InvalidOperationException("epoch " + epoch + " is not newer than the epochs already recorded");
-            _epochs = kept;
+            _epochs = WithEpochStart(startSeq, epoch);
             FileSystemHelpers.AtomicWrite(_fs, _epochsPath, _epochs.Serialize());
         }
+    }
+
+    /// <summary>
+    /// <see cref="StartEpoch"/> followed by <see cref="Set(long, ReplicationRole, string?)"/> for a node becoming primary
+    /// in <paramref name="epoch"/>, persisted together (one directory fsync instead of two): this runs while the old
+    /// primary holds writes. The epoch map is renamed into place before the role, as with the two separate calls.
+    /// </summary>
+    public void BecomePrimary(ulong startSeq, long epoch, string nodeId)
+    {
+        lock (_gate)
+        {
+            if (epoch < _epoch) throw new InvalidOperationException("epoch may not go backwards (" + _epoch + " -> " + epoch + ")");
+            RaftLogTerms epochs = WithEpochStart(startSeq, epoch);
+            _epochs = epochs;
+            _epoch = epoch;
+            _role = ReplicationRole.Primary;
+            _primaryId = nodeId;
+            _handoffTarget = null;
+            FileSystemHelpers.AtomicWriteBoth(_fs, _epochsPath, _epochs.Serialize(), _statePath, SerializeState());
+        }
+    }
+
+    private RaftLogTerms WithEpochStart(ulong startSeq, long epoch)
+    {
+        var kept = new RaftLogTerms();
+        foreach ((ulong start, long e) in _epochs.GetRanges())
+        {
+            if (start < startSeq) kept.Record(start, e);
+        }
+        if (!kept.Record(startSeq, epoch)) throw new InvalidOperationException("epoch " + epoch + " is not newer than the epochs already recorded");
+        return kept;
     }
 
     /// <summary>
@@ -199,7 +224,9 @@ public sealed class ReplicationRoleState
         }
     }
 
-    private void Persist()
+    private void Persist() => FileSystemHelpers.AtomicWrite(_fs, _statePath, SerializeState());
+
+    private string SerializeState()
     {
         var sb = new StringBuilder();
         sb.Append(_epoch.ToString(CultureInfo.InvariantCulture)).Append('\n');
@@ -207,7 +234,7 @@ public sealed class ReplicationRoleState
         sb.Append(_primaryId ?? string.Empty).Append('\n');
         sb.Append(_handoffTarget ?? string.Empty).Append('\n');
         sb.Append(_promisedEpoch.ToString(CultureInfo.InvariantCulture)).Append('\n');
-        FileSystemHelpers.AtomicWrite(_fs, _statePath, sb.ToString());
+        return sb.ToString();
     }
 
     private void Load()

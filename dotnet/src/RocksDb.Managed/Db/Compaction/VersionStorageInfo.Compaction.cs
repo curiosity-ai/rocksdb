@@ -32,6 +32,7 @@ internal sealed partial class VersionStorageInfo
     private readonly List<(int Level, FileMetaData File)> _expiredTtlFiles = new();
     private readonly List<(int Level, FileMetaData File)> _filesMarkedForPeriodicCompaction = new();
     private readonly List<(int Level, FileMetaData File)> _filesMarkedForForcedBlobGC = new();
+    private readonly List<(int Level, FileMetaData File)> _readTriggeredCompactionFiles = new();
 
     /// <summary>The column family options this version was built with.</summary>
     public ColumnFamilyOptions Options => _options;
@@ -62,6 +63,11 @@ internal sealed partial class VersionStorageInfo
     public List<(int Level, FileMetaData File)> FilesMarkedForPeriodicCompaction => _filesMarkedForPeriodicCompaction;
     /// <summary>Table files linked to the oldest blob files when their garbage ratio reaches the force threshold.</summary>
     public List<(int Level, FileMetaData File)> FilesMarkedForForcedBlobGC => _filesMarkedForForcedBlobGC;
+    /// <summary>
+    /// ReadTriggeredCompactionFiles(): files whose sampled collapsible-entry reads per byte exceed
+    /// read_triggered_compaction_threshold, hottest first.
+    /// </summary>
+    public List<(int Level, FileMetaData File)> ReadTriggeredCompactionFiles => _readTriggeredCompactionFiles;
 
     /// <summary>MaxBytesForLevel: target size of a level (L0 is governed by file count).</summary>
     public ulong MaxBytesForLevel(int level) => _levelMaxBytes[level];
@@ -379,7 +385,55 @@ internal sealed partial class VersionStorageInfo
         ComputeFilesMarkedForPeriodicCompaction(maxOutputLevel);
         ComputeFilesMarkedForForcedBlobGC(_options.BlobGarbageCollectionAgeCutoff, _options.BlobGarbageCollectionForceThreshold,
             _options.EnableBlobGarbageCollection);
+        ComputeFilesMarkedForReadTriggeredCompaction(_options.ReadTriggeredCompactionThreshold, CompactionStyle);
         EstimateCompactionBytesNeeded();
+    }
+
+    /// <summary>
+    /// Port of VersionStorageInfo::ComputeFilesMarkedForReadTriggeredCompaction: files (not being compacted, not on the
+    /// last non-empty level unless on L0) whose sampled collapsible-entry reads (tombstones, merge operands, misses) per
+    /// byte exceed <paramref name="threshold"/>, sorted by that ratio descending. FIFO never marks files.
+    /// </summary>
+    internal void ComputeFilesMarkedForReadTriggeredCompaction(double threshold, CompactionStyle compactionStyle)
+    {
+        _readTriggeredCompactionFiles.Clear();
+        if (threshold <= 0.0 || compactionStyle == CompactionStyle.Fifo) return;
+        // Skip files at the last non-empty level -- there is no lower level to compact into. Exception: L0 files are
+        // allowed even when L0 is the last non-empty level, because in single-level universal or FIFO compaction, L0
+        // files can be compacted together (L0 -> L0).
+        int lastNonEmpty = NumNonEmptyLevels - 1;
+        List<double>? ratios = null;
+        for (int level = 0; level < NumLevels; level++)
+        {
+            if (level >= lastNonEmpty && level != 0) continue;
+            foreach (FileMetaData f in _files[level])
+            {
+                if (f.BeingCompacted) continue;
+                ulong fileSize = f.FileSize;
+                if (fileSize == 0) continue;
+                // Snapshot reads_per_byte for each file so the sort sees stable values.
+                double readsPerByte = (double)f.NumCollapsibleEntryReadsSampled / fileSize;
+                if (readsPerByte > threshold)
+                {
+                    _readTriggeredCompactionFiles.Add((level, f));
+                    (ratios ??= new List<double>()).Add(readsPerByte);
+                }
+            }
+        }
+        if (ratios is null || ratios.Count < 2) return;
+        // Sort by reads_per_byte descending so the hottest files are picked first. std::sort is not stable; a stable
+        // order (level, then key order) is used for equal ratios.
+        var keys = ratios.ToArray();
+        var items = _readTriggeredCompactionFiles.ToArray();
+        var order = new int[keys.Length];
+        for (int i = 0; i < order.Length; i++) order[i] = i;
+        Array.Sort(order, (a, b) =>
+        {
+            int c = keys[b].CompareTo(keys[a]);
+            return c != 0 ? c : a.CompareTo(b);
+        });
+        _readTriggeredCompactionFiles.Clear();
+        foreach (int i in order) _readTriggeredCompactionFiles.Add(items[i]);
     }
 
     /// <summary>

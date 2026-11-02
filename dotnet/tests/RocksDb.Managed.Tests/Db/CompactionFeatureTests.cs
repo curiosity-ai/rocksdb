@@ -1,4 +1,5 @@
 using RocksDb.Managed.Cache;
+using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Options;
 using RocksDb.Managed.Table;
@@ -239,11 +240,13 @@ public sealed class CompactionFeatureTests
         Assert.AreEqual(0, first.Level);
         WaitUntilUnixSecondPasses(first.FileCreationTime + 1);
         db.Put(B("b"), B("2"));
-        db.Flush(); // the next pick sees the old file marked for periodic compaction
+        // The next pick (or already the periodic compaction trigger, whose period is 1 s here) sees the old file marked
+        // for periodic compaction.
+        db.Flush();
         db.WaitForCompact();
         List<LiveFileMetadata> files = db.GetLiveFilesMetadata();
-        Assert.AreEqual(1, files.Count);
-        Assert.AreEqual(cf.NumLevels - 1, files[0].Level);
+        Assert.IsFalse(files.Exists(f => f.FileNumber == first.FileNumber), "the old file was rewritten");
+        Assert.IsTrue(files.Exists(f => f.Level == cf.NumLevels - 1 && f.SmallestKey[0] == (byte)'a'), "into the last level");
         Assert.AreEqual("1", GetString(db, "a"));
         Assert.AreEqual("2", GetString(db, "b"));
     }
@@ -317,5 +320,351 @@ public sealed class CompactionFeatureTests
         var big = new HyperClockCache(new HyperClockCacheOptions { Capacity = 1 << 20, EstimatedEntryCharge = 4096, NumShardBits = 0 });
         // capacity / (4096 * 0.7 + 64) = 357 slots -> 512
         Assert.AreEqual(512, big.TableSize);
+    }
+    // ---- read-triggered compaction (db_compaction_test.cc ReadTriggeredCompaction, monitoring/file_read_sample.h) -----
+
+    /// <summary>
+    /// num_levels 3: keys 0..9 at L2, a tombstone file for keys 0..4 in L0 (not the last non-empty level).
+    /// </summary>
+    private static RocksDatabase OpenWithTombstoneFile(MemoryFileSystem fs, ColumnFamilyOptions cf, DbOptions? options = null)
+    {
+        RocksDatabase db = RocksDatabase.Open(DbPath, options ?? NewOptions(fs), cf);
+        for (int i = 0; i < 10; i++) db.Put(Key(i), B(new string('v', 1024)));
+        db.Flush();
+        db.CompactRange();
+        Assert.AreEqual(1, FilesAt(db, 2).Count);
+        for (int i = 0; i < 5; i++) db.Delete(Key(i));
+        db.Flush();
+        Assert.AreEqual(1, FilesAt(db, 0).Count);
+        return db;
+    }
+
+    /// <summary>Point lookups of the deleted keys with every read sampled (sync point should_sample_file_read:override).</summary>
+    private static void ReadDeletedKeysSampled(RocksDatabase db, int rounds)
+    {
+        int old = Interlocked.Exchange(ref FileReadSample.TestOverride, 1);
+        try
+        {
+            for (int r = 0; r < rounds; r++)
+            {
+                for (int i = 0; i < 5; i++) Assert.IsNull(db.Get(Key(i)));
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref FileReadSample.TestOverride, old);
+        }
+    }
+
+    private static ColumnFamilyOptions ReadTriggered(double threshold) => new()
+    {
+        NumLevels = 3,
+        Level0FileNumCompactionTrigger = 10,
+        ReadTriggeredCompactionThreshold = threshold,
+        DisableAutoCompactions = true,
+        Compression = RocksDb.Managed.Compression.CompressionType.None,
+    };
+
+    [TestMethod]
+    public void SampledReadsOfTombstonesTriggerCompaction()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = OpenWithTombstoneFile(fs, ReadTriggered(0.001));
+        Assert.AreEqual(0UL, FilesAt(db, 0)[0].NumReadsSampled);
+        ReadDeletedKeysSampled(db, 1);
+        // Every lookup of a deleted key read the L0 file and found a tombstone there (kDeleted).
+        Assert.AreEqual(5UL * FileReadSample.SampleRate, FilesAt(db, 0)[0].NumReadsSampled);
+        // Enabling auto compactions recomputes the score: the L0 file is marked and compacted to the next level.
+        db.DefaultColumnFamily.SetOptions(new Dictionary<string, string> { ["disable_auto_compactions"] = "false" });
+        db.WaitForCompact();
+        Assert.AreEqual(0, FilesAt(db, 0).Count);
+        Assert.AreEqual(5, CountKeys(db));
+        for (int i = 5; i < 10; i++) Assert.IsNotNull(db.Get(Key(i)));
+    }
+
+    [TestMethod]
+    public void ReadTriggeredCompactionNeedsSampledCollapsibleReads()
+    {
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cf = ReadTriggered(0.001);
+        cf.DisableAutoCompactions = false;
+        using RocksDatabase db = OpenWithTombstoneFile(fs, cf);
+        // Reads of live keys find values in L2 (the L0 lookup is a miss there: collapsible for L0 only).
+        int old = Interlocked.Exchange(ref FileReadSample.TestOverride, -1);
+        try
+        {
+            for (int r = 0; r < 100; r++) Assert.IsNull(db.Get(Key(0)));
+        }
+        finally
+        {
+            Volatile.Write(ref FileReadSample.TestOverride, old);
+        }
+        Assert.AreEqual(0UL, FilesAt(db, 0)[0].NumReadsSampled, "no read sampled");
+        db.Flush();
+        db.WaitForCompact();
+        Assert.AreEqual(1, FilesAt(db, 0).Count, "nothing marked without sampled reads");
+    }
+
+    [TestMethod]
+    public void PeriodicTriggerPicksReadTriggeredFilesWithoutWrites()
+    {
+        // TriggerPeriodicCompaction (max_compaction_trigger_wakeup_seconds): a DB that only serves reads re-evaluates
+        // its files and compacts the hot tombstone file.
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cf = ReadTriggered(0.001);
+        cf.DisableAutoCompactions = false;
+        DbOptions options = NewOptions(fs);
+        options.MaxCompactionTriggerWakeupSeconds = 0; // polls every second
+        using RocksDatabase db = OpenWithTombstoneFile(fs, cf, options);
+        ReadDeletedKeysSampled(db, 1);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (FilesAt(db, 0).Count != 0 && sw.Elapsed < TimeSpan.FromSeconds(20)) Thread.Sleep(50);
+        db.WaitForCompact();
+        Assert.AreEqual(0, FilesAt(db, 0).Count, "the periodic trigger compacted the read-hot file");
+        Assert.AreEqual(5, CountKeys(db));
+    }
+
+    [TestMethod]
+    public void IteratorSamplesFileReads()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = OpenWithTombstoneFile(fs, ReadTriggered(0));
+        int old = Interlocked.Exchange(ref FileReadSample.TestOverride, 1);
+        try
+        {
+            using Iterator it = db.NewIterator();
+            it.Seek(Key(0));
+            Assert.IsTrue(it.Valid);
+        }
+        finally
+        {
+            Volatile.Write(ref FileReadSample.TestOverride, old);
+        }
+        // L0: once per iterator creation; L2 (LevelIterator): the seek.
+        Assert.IsTrue(FilesAt(db, 0)[0].NumReadsSampled >= FileReadSample.SampleRate);
+        Assert.IsTrue(FilesAt(db, 2)[0].NumReadsSampled >= FileReadSample.SampleRate);
+    }
+
+    [TestMethod]
+    public void ReadTriggeredCompactionThresholdIsValidatedAndPersisted()
+    {
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions bad = Leveled();
+        bad.ReadTriggeredCompactionThreshold = -1;
+        var ex = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbPath, NewOptions(fs), bad).Dispose());
+        Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
+        bad.ReadTriggeredCompactionThreshold = double.PositiveInfinity;
+        ex = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbPath, NewOptions(fs), bad).Dispose());
+        Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
+
+        ColumnFamilyOptions cf = Leveled();
+        cf.ReadTriggeredCompactionThreshold = 0.01;
+        DbOptions options = NewOptions(fs);
+        options.MaxCompactionTriggerWakeupSeconds = 600;
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, options, cf))
+        {
+            ex = Assert.ThrowsExactly<RocksDbException>(() =>
+                db.DefaultColumnFamily.SetOptions(new Dictionary<string, string> { ["read_triggered_compaction_threshold"] = "-0.5" }));
+            Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
+            db.DefaultColumnFamily.SetOptions(new Dictionary<string, string> { ["read_triggered_compaction_threshold"] = "0.02" });
+        }
+        OptionsFile f = OptionsFile.Load(fs, OptionsFile.FindLatestOptionsFile(fs, DbPath)!, preserveUnknownOptions: false);
+        Assert.AreEqual(0.02, f.FindColumnFamily("default")!.ReadTriggeredCompactionThreshold);
+        Assert.AreEqual(600UL, f.DbOptions.MaxCompactionTriggerWakeupSeconds);
+    }
+
+    [TestMethod]
+    public void TriggerCompactionPeriodFollowsUpstream()
+    {
+        // ComputeTriggerCompactionPeriod: min(max wakeup, stats periods, min time-based interval / 5), at least 1.
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cf = Leveled();
+        cf.Ttl = 0;
+        cf.PeriodicCompactionSeconds = 0;
+        DbOptions options = NewOptions(fs);
+        options.StatsDumpPeriodSec = 0;
+        options.StatsPersistPeriodSec = 0;
+        options.MaxCompactionTriggerWakeupSeconds = 43200;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, options, cf);
+        RocksDb.Managed.Db.DbImpl impl = db.DefaultColumnFamily.Db;
+        Assert.AreEqual(43200UL, impl.ComputeTriggerCompactionPeriod());
+        db.DefaultColumnFamily.SetOptions(new Dictionary<string, string> { ["periodic_compaction_seconds"] = "1000" });
+        Assert.AreEqual(200UL, impl.ComputeTriggerCompactionPeriod());
+        db.SetDBOptions(new Dictionary<string, string> { ["max_compaction_trigger_wakeup_seconds"] = "0" });
+        Assert.AreEqual(1UL, impl.ComputeTriggerCompactionPeriod());
+    }
+
+    private static int CountKeys(RocksDatabase db)
+    {
+        int n = 0;
+        using Iterator it = db.NewIterator();
+        for (it.SeekToFirst(); it.Valid; it.Next()) n++;
+        return n;
+    }
+    // ---- CompactRange first-level selection (DBImpl::CompactRangeInternal, Version::OverlapWithLevelIterator) --------
+
+    /// <summary>One L0 file with the keys "001" and "111"; CompactRange("011", "101") with an optional partitioner.</summary>
+    private static List<LiveFileMetadata> CompactRangeInsideFileGap(SstPartitionerFactory? partitioner, string begin, string end)
+    {
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cf = Leveled();
+        cf.SstPartitionerFactory = partitioner;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cf);
+        db.Put(B("001"), B("a"));
+        db.Put(B("111"), B("b"));
+        db.Flush();
+        db.CompactRange(B(begin), B(end));
+        Assert.AreEqual("a", GetString(db, "001"));
+        Assert.AreEqual("b", GetString(db, "111"));
+        return db.GetLiveFilesMetadata();
+    }
+
+    [TestMethod]
+    public void CompactRangeChecksKeysWithinFiles()
+    {
+        // No key of the file is inside ["011", "101"]: nothing is compacted (the file range alone overlaps).
+        List<LiveFileMetadata> files = CompactRangeInsideFileGap(null, "011", "101");
+        Assert.AreEqual(1, files.Count);
+        Assert.AreEqual(0, files[0].Level);
+        // A range holding a key compacts the file.
+        files = CompactRangeInsideFileGap(null, "100", "200");
+        Assert.AreEqual(1, files.Count);
+        Assert.AreNotEqual(0, files[0].Level);
+    }
+
+    [TestMethod]
+    public void CompactRangeWithPartitionBoundaryInRangeUsesFileOverlap()
+    {
+        // The range contains the partition boundary between prefixes "0" and "1": the file straddling it is compacted
+        // although none of its keys is inside the range (moved to the last level: Compaction::IsTrivialMove does not
+        // consult the partitioner for the last level).
+        List<LiveFileMetadata> files = CompactRangeInsideFileGap(new SstPartitionerFixedPrefixFactory(1), "011", "101");
+        Assert.AreEqual(1, files.Count);
+        foreach (LiveFileMetadata f in files) Assert.AreNotEqual(0, f.Level);
+        // No boundary inside ["011", "055"]: keys within the file are checked, nothing to compact.
+        files = CompactRangeInsideFileGap(new SstPartitionerFixedPrefixFactory(1), "011", "055");
+        Assert.AreEqual(1, files.Count);
+        Assert.AreEqual(0, files[0].Level);
+    }
+
+    [TestMethod]
+    public void CompactRangeSeesRangeTombstonesWithinFiles()
+    {
+        // A range tombstone inside the range counts as overlap (RangeDelAggregator::IsRangeOverlapped).
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), Leveled());
+        db.Put(B("001"), B("a"));
+        db.Put(B("111"), B("b"));
+        db.DeleteRange(B("050"), B("060"));
+        db.Flush();
+        db.CompactRange(B("011"), B("101"));
+        List<LiveFileMetadata> files = db.GetLiveFilesMetadata();
+        Assert.AreEqual(1, files.Count);
+        Assert.AreNotEqual(0, files[0].Level);
+    }
+    // ---- bottom-priority pool and reduce_file_locking (db_universal_compaction_test.cc ConcurrentBottomPriLowPri...) ---
+
+    private static int CountBeingCompacted(RocksDatabase db, int level)
+    {
+        lock (db.DefaultColumnFamily.Db.MutexForTests)
+        {
+            int n = 0;
+            foreach (FileMetaData f in db.DefaultColumnFamily.Data.Current.Storage.LevelFiles(level)) n += f.BeingCompacted ? 1 : 0;
+            return n;
+        }
+    }
+
+    /// <summary>
+    /// A full universal compaction (to the last level) is forwarded to the bottom-priority pool. While it waits for the
+    /// bottom thread, reduce_file_locking = true reserves only the oldest L0 file (the intended compaction of
+    /// CreateIntendedCompactionForwardedToBottomPriorityPool) and the bottom thread repicks; with false every input
+    /// file stays reserved. Both end with one sorted run in the last level.
+    /// </summary>
+    [TestMethod]
+    public void BottomPriorityPoolReservesFilesPerReduceFileLocking()
+    {
+        foreach (bool reduceFileLocking in new[] { true, false })
+        {
+            using var entered = new ManualResetEventSlim(false);
+            using var gate = new ManualResetEventSlim(false);
+            TestHooks.Set("DBImpl::BGWorkBottomCompaction", () =>
+            {
+                entered.Set();
+                gate.Wait(TimeSpan.FromSeconds(30));
+            });
+            try
+            {
+                MemoryFileSystem fs = NewFs();
+                DbOptions options = NewOptions(fs);
+                options.BottomPriorityBackgroundThreads = 1;
+                var cf = new ColumnFamilyOptions
+                {
+                    CompactionStyle = CompactionStyle.Universal,
+                    NumLevels = 3,
+                    Level0FileNumCompactionTrigger = 3,
+                    Compression = RocksDb.Managed.Compression.CompressionType.None,
+                };
+                cf.CompactionOptionsUniversal.ReduceFileLocking = reduceFileLocking;
+                using RocksDatabase db = RocksDatabase.Open(DbPath, options, cf);
+                for (int f = 0; f < 3; f++)
+                {
+                    for (int i = 0; i < 100; i++) db.Put(Key(i), Value(i, f));
+                    db.Flush();
+                }
+                Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(20)), "forwarded to the bottom-priority pool");
+                Assert.AreEqual(3, FilesAt(db, 0).Count);
+                Assert.AreEqual(reduceFileLocking ? 1 : 3, CountBeingCompacted(db, 0), "reduce_file_locking=" + reduceFileLocking);
+                gate.Set();
+                db.WaitForCompact();
+                Assert.AreEqual(0, FilesAt(db, 0).Count);
+                Assert.AreNotEqual(0, FilesAt(db, 2).Count);
+                Assert.AreEqual(0, CountBeingCompacted(db, 2));
+                for (int i = 0; i < 100; i++) Assert.AreEqual(S(Value(i, 2)), GetString(db, S(Key(i))!));
+            }
+            finally
+            {
+                gate.Set();
+                TestHooks.Set("DBImpl::BGWorkBottomCompaction", null);
+            }
+        }
+    }
+
+    [TestMethod]
+    public void UniversalRequireMaxOutputLevelPicksOnlyLastLevelCompactions()
+    {
+        // MeetsOutputLevelRequirements: the bottom-priority repick ignores compactions that do not output to the
+        // non-zero max output level.
+        var o = new ColumnFamilyOptions { CompactionStyle = CompactionStyle.Universal, NumLevels = 3, Level0FileNumCompactionTrigger = 2 };
+        o.CompactionOptionsUniversal.MaxSizeAmplificationPercent = 1000000;
+        var picker = new UniversalCompactionPicker(o, InternalKeyComparator.Bytewise);
+        static FileMetaData F(ulong n, ulong epoch, ulong seq) => new()
+        {
+            FileNumber = n,
+            FileSize = 1000,
+            Smallest = MakeIKey("a", seq),
+            Largest = MakeIKey("z", seq),
+            SmallestSeqno = seq,
+            LargestSeqno = seq,
+            EpochNumber = epoch,
+        };
+        // Two small L0 runs above a large last level: size ratio picks the two L0 files into L0... L1 (not the last).
+        FileMetaData big = F(1, 0, 1);
+        big.FileSize = 1000000;
+        FileMetaData[][] files = [[F(3, 3, 30), F(2, 2, 20)], [], [big]];
+        var vs = new VersionStorageInfo(InternalKeyComparator.Bytewise, 3, o, files);
+        Compaction? c = picker.PickCompaction(vs, [], requireMaxOutputLevel: false);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(1, c.OutputLevel);
+        picker.ReleaseCompactionFiles(c, succeeded: false);
+        vs.ComputeCompactionScore();
+        Assert.IsNull(picker.PickCompaction(vs, [], requireMaxOutputLevel: true));
+    }
+
+    private static byte[] MakeIKey(string user, ulong seq)
+    {
+        byte[] u = B(user);
+        var k = new byte[u.Length + 8];
+        DbFormat.AppendInternalKey(k, u, seq, EntryType.Value);
+        return k;
     }
 }

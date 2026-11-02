@@ -50,6 +50,8 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
     private int[] _sub = [];
     private bool[] _mayMatch = [];
     private bool _hasResults;
+    // The last run was a MultiGetEntity: found values hold the serialized entity.
+    private bool _entityResults;
     private bool _disposed;
 
     /// <summary>Creates an empty batch.</summary>
@@ -118,24 +120,71 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
         return index < _status.Length ? _status[index] : MultiGetStatus.NotFound;
     }
 
-    /// <summary>True if the key at <paramref name="index"/> was found; <paramref name="value"/> is then its value.</summary>
+    /// <summary>
+    /// True if the key at <paramref name="index"/> was found; <paramref name="value"/> is then its value (after
+    /// <see cref="ColumnFamily.MultiGetEntity(MultiGetBatch)"/>: the value of the entity's default column).
+    /// </summary>
     public bool TryGetValue(int index, out ReadOnlySpan<byte> value)
     {
         if (GetStatus(index) == MultiGetStatus.Found)
         {
-            value = _contexts[index]!.Value.WrittenSpan;
+            value = _entityResults
+                ? Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(_contexts[index]!.Value.WrittenSpan)
+                : _contexts[index]!.Value.WrittenSpan;
             return true;
         }
         value = default;
         return false;
     }
 
+    /// <summary>
+    /// After <see cref="ColumnFamily.MultiGetEntity(MultiGetBatch)"/> (DB::MultiGetEntity): true if the key at
+    /// <paramref name="index"/> was found, its columns then copied into <paramref name="columns"/> (a reusable
+    /// <see cref="WideColumns"/>; a plain value reads as an entity with only the default column). False (and
+    /// <paramref name="columns"/> emptied) if the key was not found or failed (see <see cref="GetError"/>).
+    /// Throws InvalidOperationException if the last run was a plain <see cref="ColumnFamily.MultiGet(MultiGetBatch)"/>.
+    /// </summary>
+    public bool TryGetEntity(int index, WideColumns columns)
+    {
+        ArgumentNullException.ThrowIfNull(columns);
+        if (GetStatus(index) == MultiGetStatus.Found)
+        {
+            if (!_entityResults) ThrowNotEntityRun();
+            columns.SetSerialized(_contexts[index]!.Value.WrittenSpan);
+            return true;
+        }
+        columns.Clear();
+        return false;
+    }
+
+    /// <summary>
+    /// After <see cref="ColumnFamily.MultiGetEntity(MultiGetBatch)"/>: the serialized entity of the key at
+    /// <paramref name="index"/> (wide-column format version 1; empty if not found). Valid until the batch is cleared, run
+    /// again or disposed.
+    /// </summary>
+    public ReadOnlySpan<byte> GetSerializedEntity(int index)
+    {
+        if (GetStatus(index) != MultiGetStatus.Found) return default;
+        if (!_entityResults) ThrowNotEntityRun();
+        return _contexts[index]!.Value.WrittenSpan;
+    }
+
+    private static void ThrowNotEntityRun() => throw new InvalidOperationException("The batch was not run with MultiGetEntity.");
+
     /// <summary>The value of the key at <paramref name="index"/> (empty if it was not found).</summary>
     public ReadOnlySpan<byte> GetValue(int index) => TryGetValue(index, out ReadOnlySpan<byte> v) ? v : default;
 
     /// <summary>The value of the key at <paramref name="index"/> as memory (empty if it was not found).</summary>
-    public ReadOnlyMemory<byte> GetValueMemory(int index) =>
-        GetStatus(index) == MultiGetStatus.Found ? _contexts[index]!.Value.WrittenMemory : default;
+    public ReadOnlyMemory<byte> GetValueMemory(int index)
+    {
+        if (GetStatus(index) != MultiGetStatus.Found) return default;
+        ReadOnlyMemory<byte> all = _contexts[index]!.Value.WrittenMemory;
+        if (!_entityResults) return all;
+        ReadOnlySpan<byte> v = Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(all.Span);
+        if (v.IsEmpty) return default;
+        all.Span.Overlaps(v, out int offset);
+        return all.Slice(offset, v.Length);
+    }
 
     /// <summary>The error of the key at <paramref name="index"/> (status <see cref="MultiGetStatus.Error"/>), else null.</summary>
     public RocksDbException? GetError(int index)
@@ -179,6 +228,9 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
 
     // ---- run (used by DbImpl.MultiGetAsync) ----------------------------------------------------------------
 
+    /// <summary>Set by the caller before a run: whether it is a MultiGetEntity (results are entities).</summary>
+    internal bool EntityRun { get; set; }
+
     internal int[] Order => _order;
     internal int[] Sub => _sub;
     internal bool[] MayMatch => _mayMatch;
@@ -193,6 +245,7 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
     internal void BeginRun(MergeOperator? mergeOperator, ulong sequence, Comparator userComparator)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        _entityResults = EntityRun;
         int n = _count;
         if (_contexts.Length < n)
         {
@@ -274,7 +327,23 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
             GetContext ctx = _contexts[i]!;
             try
             {
-                if (ctx.TryResolve(UserKey(i), out _))
+                if (_entityResults)
+                {
+                    // MultiGetEntity: the entity (a plain value as a default-column entity, merges applied).
+                    ctx.Scratch.Clear();
+                    if (ctx.TryResolveEntity(UserKey(i), ctx.Scratch))
+                    {
+                        ctx.Value.Clear();
+                        ctx.Value.Write(ctx.Scratch.WrittenSpan);
+                        _status[i] = MultiGetStatus.Found;
+                        found++;
+                    }
+                    else
+                    {
+                        _status[i] = MultiGetStatus.NotFound;
+                    }
+                }
+                else if (ctx.TryResolve(UserKey(i), out _))
                 {
                     // MultiGet returns the default column of an entity (GetContext::SaveValue, kTypeWideColumnEntity).
                     ctx.ReplaceEntityWithDefaultColumn();

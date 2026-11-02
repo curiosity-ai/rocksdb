@@ -635,6 +635,31 @@ a cached block / a missing key, 0.26x / 0.21x for Seek + 10 / 100 Next and 0.52x
 `DbAsync`: async costs 0-20% over sync when calls complete synchronously (TryGet 1.31 vs 1.60 µs, MultiGet(16)
 19.1 vs 19.1 µs).
 
+## Transactions: per-transaction allocations
+
+BenchmarkDotNet `TransactionBenchmarks` (`--anyCategories Txn`, short job, net10.0, shared 4-vCPU container, one run
+before and one after; times are noisy, compare allocations). Begin reusing the previous transaction object, 4 puts
+(16 B keys, 100 B values), Commit; the baseline is the same 4-put WriteBatch written directly, whose 557 B are the
+memtable arena growth for the data.
+
+| Kind | Allocated before | Allocated after | Mean before | Mean after | plain batch (after) |
+|---|---:|---:|---:|---:|---:|
+| Optimistic | 717 B | 557 B | 32.7 µs | 31.8 µs | 24.0 µs |
+| Pessimistic (WriteCommitted) | 1325 B | 557 B | 25.7 µs | 25.5 µs | 23.6 µs |
+| WritePrepared | 1325 B | 557 B | 22.8 µs | 25.0 µs | 21.5 µs |
+| WritePrepared, two_write_queues | 1325 B | 557 B | 26.5 µs | 25.8 µs | 24.6 µs |
+| plain WriteBatch into a WritePrepared DB | 1397 B | 557 B | 22.1 µs | 21.5 µs | |
+| plain WriteBatch into a WritePrepared DB, two_write_queues | 1397 B | 557 B | 23.2 µs | 24.6 µs | |
+
+After: the async variant (PutAsync / CommitAsync) and a named 2PC cycle (SetName, Prepare, Commit) also allocate only
+the memtable data, for every pessimistic policy. What changed: lock-table entries (LockInfo + key buffer) are recycled
+per stripe; tracked keys live in recycled buffers (`PooledKey`, span lookups) instead of one `byte[]` per key; a lambda
+in `AssignCommitTimestamp` allocated its closure on every commit (C# creates the display class on entry to the scope
+that declares the captured variables, before the early return); the commit / prepare async methods use
+`PoolingAsyncValueTaskMethodBuilder`; a reused transaction keeps the UTF-8 encoding of its name; plain writes into a
+WritePrepared DB reuse their WriteInternal state and count sub-batches of bytewise column families in a reusable
+byte-equality set.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).

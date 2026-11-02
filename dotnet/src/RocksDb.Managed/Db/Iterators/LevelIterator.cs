@@ -121,6 +121,7 @@ public sealed class LevelIterator : InternalIterator
         InitFileIterator(0);
         _fileIter?.SeekToFirst();
         SkipEmptyFileForward();
+        SampleRead(isSeek: true);
     }
 
     public override void SeekToLast()
@@ -128,6 +129,7 @@ public sealed class LevelIterator : InternalIterator
         InitFileIterator(_files.Length - 1);
         _fileIter?.SeekToLast();
         SkipEmptyFileBackward();
+        SampleRead(isSeek: true);
     }
 
     public override void Seek(ReadOnlySpan<byte> target)
@@ -135,6 +137,33 @@ public sealed class LevelIterator : InternalIterator
         InitFileIterator(FindFile(target));
         _fileIter?.Seek(target);
         if (SkipEmptyFileForward()) CheckPrefixAfterSkippedFile(target);
+        SampleRead(isSeek: true);
+    }
+
+    /// <summary>
+    /// LevelIterator::SampleRead (db/version_set.cc): a sampled seek (1/1024) or step (1/65536) counts as a read of the
+    /// current file, and as a collapsible-entry read when the entry is a deletion, single deletion or merge operand.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void SampleRead(bool isSeek)
+    {
+        bool sampled = isSeek ? FileReadSample.ShouldSampleFileRead() : FileReadSample.ShouldSampleFileReadNext();
+        if (sampled) SampleCurrentFile();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void SampleCurrentFile()
+    {
+        if ((uint)_fileIndex >= (uint)_files.Length || _fileIter is null || !_fileIter.Valid) return;
+        FileMetaData meta = _files[_fileIndex];
+        FileReadSample.SampleFileReadInc(meta);
+        ReadOnlySpan<byte> key = _fileIter.Key;
+        if (key.Length < DbFormat.InternalKeyFooterSize) return;
+        var type = (EntryType)key[^DbFormat.InternalKeyFooterSize];
+        if (type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp or EntryType.Merge)
+        {
+            FileReadSample.SampleCollapsibleEntryFileReadInc(meta);
+        }
     }
 
     /// <summary>
@@ -163,6 +192,7 @@ public sealed class LevelIterator : InternalIterator
         InitFileIterator(index);
         _fileIter?.SeekForPrev(target);
         SkipEmptyFileBackward();
+        SampleRead(isSeek: true);
     }
 
     public override void Next()
@@ -170,12 +200,14 @@ public sealed class LevelIterator : InternalIterator
         if (_fileIter is TableInternalIterator t) t.Next();
         else _fileIter!.Next();
         SkipEmptyFileForward();
+        SampleRead(isSeek: false);
     }
 
     public override void Prev()
     {
         _fileIter!.Prev();
         SkipEmptyFileBackward();
+        SampleRead(isSeek: false);
     }
 
     /// <summary>Moves forward to the first non-empty file. Returns true if the current file was empty (seen_empty_file).</summary>
@@ -289,26 +321,41 @@ public sealed class LevelIterator : InternalIterator
 
     // ------------------------------------------------------------------ async
 
-    public override ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) =>
-        PositionAsync(0, default, Op.First, cancellationToken);
+    public override ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default)
+    {
+        ValueTask t = PositionAsync(0, default, Op.First, cancellationToken);
+        if (!t.IsCompletedSuccessfully) return SampleAfterAsync(t, isSeek: true);
+        t.GetAwaiter().GetResult();
+        SampleRead(isSeek: true);
+        return ValueTask.CompletedTask;
+    }
+
+    /// <summary>Awaits <paramref name="pending"/>, then <see cref="SampleRead"/>.</summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask SampleAfterAsync(ValueTask pending, bool isSeek)
+    {
+        await pending.ConfigureAwait(false);
+        SampleRead(isSeek);
+    }
 
     public override ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
         int index = FindFile(target.Span);
-        if (_prefixSeekExtractor is null) return PositionAsync(index, target, Op.Seek, cancellationToken);
-        // Prefix seek: apply LevelIterator::Seek's prefix check when the seek moved past the initial file.
         ValueTask t = PositionAsync(index, target, Op.Seek, cancellationToken);
-        if (!t.IsCompletedSuccessfully) return SeekPrefixSlowAsync(t, index, target);
+        if (!t.IsCompletedSuccessfully) return SeekSlowAsync(t, index, target);
         t.GetAwaiter().GetResult();
-        if (_fileIndex != index) CheckPrefixAfterSkippedFile(target.Span);
+        // Prefix seek: apply LevelIterator::Seek's prefix check when the seek moved past the initial file.
+        if (_prefixSeekExtractor is not null && _fileIndex != index) CheckPrefixAfterSkippedFile(target.Span);
+        SampleRead(isSeek: true);
         return ValueTask.CompletedTask;
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    private async ValueTask SeekPrefixSlowAsync(ValueTask pending, int index, ReadOnlyMemory<byte> target)
+    private async ValueTask SeekSlowAsync(ValueTask pending, int index, ReadOnlyMemory<byte> target)
     {
         await pending.ConfigureAwait(false);
-        if (_fileIndex != index) CheckPrefixAfterSkippedFile(target.Span);
+        if (_prefixSeekExtractor is not null && _fileIndex != index) CheckPrefixAfterSkippedFile(target.Span);
+        SampleRead(isSeek: true);
     }
 
     public override ValueTask NextAsync(CancellationToken cancellationToken = default)
@@ -316,8 +363,16 @@ public sealed class LevelIterator : InternalIterator
         ValueTask t = _fileIter!.NextAsync(cancellationToken);
         if (!t.IsCompletedSuccessfully) return NextSlowAsync(t, cancellationToken);
         t.GetAwaiter().GetResult();
-        if (_fileIter.Valid) return ValueTask.CompletedTask;
-        return AdvanceFileAsync(cancellationToken);
+        if (_fileIter.Valid)
+        {
+            SampleRead(isSeek: false);
+            return ValueTask.CompletedTask;
+        }
+        t = AdvanceFileAsync(cancellationToken);
+        if (!t.IsCompletedSuccessfully) return SampleAfterAsync(t, isSeek: false);
+        t.GetAwaiter().GetResult();
+        SampleRead(isSeek: false);
+        return ValueTask.CompletedTask;
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
@@ -325,6 +380,7 @@ public sealed class LevelIterator : InternalIterator
     {
         await pending.ConfigureAwait(false);
         if (!_fileIter!.Valid) await AdvanceFileAsync(ct).ConfigureAwait(false);
+        SampleRead(isSeek: false);
     }
 
     private ValueTask AdvanceFileAsync(CancellationToken ct)

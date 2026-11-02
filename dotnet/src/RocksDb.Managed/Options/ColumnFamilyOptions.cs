@@ -96,12 +96,24 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         set => _prefixExtractor.Set(value);
     }
 
-    /// <summary>memtable_insert_with_hint_prefix_extractor (persisted only; the managed memtable takes no insert hints).</summary>
+    /// <summary>
+    /// memtable_insert_with_hint_prefix_extractor: serial memtable inserts of keys with the same prefix (of the user key)
+    /// start their skiplist search from the position of the previous insert with that prefix (InsertWithHint).
+    /// </summary>
     public SliceTransform? MemtableInsertWithHintPrefixExtractor
     {
         get => _memtableInsertWithHintPrefixExtractor.Value;
         set => _memtableInsertWithHintPrefixExtractor.Set(value);
     }
+
+    /// <summary>
+    /// table_properties_collector_factories: a <see cref="TablePropertiesCollector"/> of each factory runs on every table
+    /// file written for this column family (flush, compaction, <see cref="SstFileWriter"/>); their properties are stored
+    /// in the file and the factory names in "rocksdb.property.collectors". A collector reporting
+    /// <see cref="TablePropertiesCollector.NeedCompact"/> marks the file for compaction. Not persisted in OPTIONS files
+    /// (like upstream). Empty by default.
+    /// </summary>
+    public List<TablePropertiesCollectorFactory> TablePropertiesCollectorFactories { get; set; } = new();
 
     /// <summary>
     /// sst_partitioner_factory: decides additional cut points of compaction output files (for example
@@ -145,9 +157,26 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     /// <see cref="WriteBufferSize"/> like SanitizeCfOptions: min(1 MiB, write_buffer_size / 8), 4 KiB aligned.
     /// </summary>
     public ulong ArenaBlockSize { get; set; }
+    /// <summary>
+    /// inplace_update_support: a Put of a key whose newest memtable entry is a value of at least the new size overwrites
+    /// that entry in place (keeping its sequence number) instead of adding a new one, under one of
+    /// <see cref="InplaceUpdateNumLocks"/> striped locks. Readers of older snapshots may then see the new value (as
+    /// upstream); incompatible with concurrent memtable writes. Default false.
+    /// </summary>
     public bool InplaceUpdateSupport { get; set; }
     public ulong InplaceUpdateNumLocks { get; set; } = 10000;
+    /// <summary>
+    /// inplace_callback: with <see cref="InplaceUpdateSupport"/>, Puts are combined with the existing value through this
+    /// callback (see <see cref="InplaceUpdateCallback"/>). Not persisted. Default null.
+    /// </summary>
+    public InplaceUpdateCallback? InplaceCallback { get; set; }
+    /// <summary>
+    /// memtable_prefix_bloom_size_ratio: when &gt; 0 (sanitized to at most 0.25) and a <see cref="PrefixExtractor"/> or
+    /// <see cref="MemtableWholeKeyFiltering"/> is set, each memtable keeps a Bloom filter of write_buffer_size * ratio bytes
+    /// over key prefixes (and whole keys) that lets Get/MultiGet and prefix seeks skip the memtable.
+    /// </summary>
     public double MemtablePrefixBloomSizeRatio { get; set; }
+    /// <summary>memtable_whole_key_filtering: also add whole keys to the memtable bloom (used by Get instead of the prefix).</summary>
     public bool MemtableWholeKeyFiltering { get; set; }
     public ulong MemtableHugePageSize { get; set; }
     public uint BloomLocality { get; set; }
@@ -164,6 +193,16 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     /// <summary>Per-level compression; empty means use <see cref="Compression"/> everywhere.</summary>
     public List<CompressionType> CompressionPerLevel { get; set; } = new();
     public ulong SampleForCompression { get; set; }
+
+    /// <summary>
+    /// read_triggered_compaction_threshold (EXPERIMENTAL): a file whose sampled reads that found a tombstone, a merge
+    /// operand or nothing (collapsible-entry reads), per byte of file size, exceed this ratio is compacted to the next
+    /// level (leveled and universal; FIFO ignores it). Must be &gt;= 0 and finite; 0 (default) disables it. A starting
+    /// point upstream recommends is 0.01. Files are re-evaluated when a new version is installed and by the periodic
+    /// compaction trigger (<see cref="DbOptions.MaxCompactionTriggerWakeupSeconds"/>), so a DB that only serves reads
+    /// picks them up within that period. Dynamically changeable through SetOptions.
+    /// </summary>
+    public double ReadTriggeredCompactionThreshold { get; set; }
 
     // ---- LSM shape / compaction --------------------------------------------------------------
     public int NumLevels { get; set; } = 7;
@@ -202,7 +241,22 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
 
     /// <summary>kDefaultPeriodicCompSecs (db/column_family.cc).</summary>
     internal const ulong DefaultPeriodicCompactionSeconds = 0xfffffffffffffffe;
+    /// <summary>
+    /// preclude_last_level_data_seconds (EXPERIMENTAL): data written within this many seconds is kept out of the last
+    /// level. Compactions to the last level of leveled or universal compaction place each entry by its estimated write
+    /// time (per-key placement): newer entries go to the level above (the proximal level). Write times come from the
+    /// DB's sequence-number-to-time mapping, which is recorded while the option is set and persisted in each table
+    /// (<c>rocksdb.seqno.time.map</c>); a DB created with the option gets 100 pre-allocated sequence numbers mapped back
+    /// over the window. Implies <see cref="PreserveInternalTimeSeconds"/> for that duration. 0 (default) disables it.
+    /// Dynamically changeable through SetOptions.
+    /// </summary>
     public ulong PrecludeLastLevelDataSeconds { get; set; }
+
+    /// <summary>
+    /// preserve_internal_time_seconds (EXPERIMENTAL): keep the write-time information (sequence numbers and the
+    /// sequence-number-to-time mapping) of data written within this many seconds; such data is not given sequence
+    /// number 0 by bottommost compactions. 0 (default) disables it. Dynamically changeable through SetOptions.
+    /// </summary>
     public ulong PreserveInternalTimeSeconds { get; set; }
     public Temperature LastLevelTemperature { get; set; } = Temperature.Unknown;
     public Temperature DefaultTemperature { get; set; } = Temperature.Unknown;
@@ -311,6 +365,8 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .Add("compression_per_level", static o => FormatCompressionList(o.CompressionPerLevel),
             static (o, v) => o.CompressionPerLevel = ParseCompressionList(v))
         .UInt64("sample_for_compression", static o => o.SampleForCompression, static (o, v) => o.SampleForCompression = v)
+        .Double("read_triggered_compaction_threshold", static o => o.ReadTriggeredCompactionThreshold,
+            static (o, v) => o.ReadTriggeredCompactionThreshold = v)
         .Int32("num_levels", static o => o.NumLevels, static (o, v) => o.NumLevels = v)
         .Int32("level0_file_num_compaction_trigger", static o => o.Level0FileNumCompactionTrigger, static (o, v) => o.Level0FileNumCompactionTrigger = v)
         .Int32("level0_slowdown_writes_trigger", static o => o.Level0SlowdownWritesTrigger, static (o, v) => o.Level0SlowdownWritesTrigger = v)
@@ -390,6 +446,8 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         c.CompactionOptionsFifo = CompactionOptionsFifo.Clone();
         c.CompactionOptionsUniversal = CompactionOptionsUniversal.Clone();
         c.TableOptions = TableOptions.Clone();
+        c.InplaceCallback = InplaceCallback;
+        c.TablePropertiesCollectorFactories = new List<TablePropertiesCollectorFactory>(TablePropertiesCollectorFactories);
         c.BlobCache = BlobCache;
         c.BlobDirectWritePartitionStrategy = BlobDirectWritePartitionStrategy;
         c.OtherTableFactoryOptions = OtherTableFactoryOptions is null ? null : new Dictionary<string, string>(OtherTableFactoryOptions, StringComparer.Ordinal);
