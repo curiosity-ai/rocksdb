@@ -159,8 +159,11 @@ internal sealed partial class DbImpl
     {
         ulong[] snapshots;
         lock (_mutex) snapshots = SnapshotsForCompaction();
-        FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, mems, fileNumber, epoch, Identity, snapshots, blobBuilder, synchronous,
-                CancellationToken.None)
+        // PrepareFlushAdditions: the blob direct write files of the flushed memtables are sealed and registered with the
+        // table file; their blobs the output does not reference (hidden versions, failed writes) are garbage.
+        (List<BlobFileAddition> Additions, Blob.BlobGarbageMeter Meter)? directWrite = PrepareBlobDirectWriteFlush(cfd, picked);
+        FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, mems, fileNumber, epoch, Identity, snapshots, blobBuilder,
+                directWrite?.Meter, synchronous, CancellationToken.None)
             .ConfigureAwait(false);
         if (meta is not null)
         {
@@ -181,6 +184,11 @@ internal sealed partial class DbImpl
         {
             edit.AddFile(0, meta);
             if (blobBuilder is not null) edit.BlobFileAdditions.AddRange(blobBuilder.Additions);
+        }
+        if (directWrite is { } dw)
+        {
+            edit.BlobFileAdditions.AddRange(dw.Additions);
+            dw.Meter.AddGarbageTo(edit.BlobFileGarbages);
         }
         // FlushJob::MaybeIncreaseFullHistoryTsLowToAboveCutoffUDT (written in the flush's own edit instead of a separate
         // MANIFEST record before it; recovery applies both the same way).
@@ -386,13 +394,20 @@ internal sealed partial class DbImpl
     {
         ColumnFamilyOptions o = cfd.Options;
         if (!o.EnableBlobFiles || outputLevel < o.BlobFileStartingLevel) return null;
-        var fileOptions = new Env.WritableFileOptions
-        {
-            BytesPerSync = (long)Math.Min(Options.BytesPerSync, long.MaxValue),
-            MaxBufferSize = (int)Math.Clamp(Options.WritableFileMaxBufferSize, 64 * 1024, int.MaxValue),
-        };
-        return new Blob.BlobFileBuilder(FileSystem, DbPaths[0], NewPendingOutputFileNumber, o, cfd.Id, reason, cfd.BlobSource, Stats, fileOptions);
+        return new Blob.BlobFileBuilder(FileSystem, DbPaths[0], NewPendingOutputFileNumber, o, cfd.Id, reason, cfd.BlobSource, Stats,
+            BlobFileWriteOptions(o));
     }
+
+    /// <summary>
+    /// Write options of blob files: bytes_per_sync and the max buffer size (blob_file_writable_file_max_buffer_size when
+    /// set, else writable_file_max_buffer_size).
+    /// </summary>
+    internal Env.WritableFileOptions BlobFileWriteOptions(ColumnFamilyOptions o) => new()
+    {
+        BytesPerSync = (long)Math.Min(Options.BytesPerSync, long.MaxValue),
+        MaxBufferSize = (int)Math.Clamp(o.BlobFileWritableFileMaxBufferSize != 0 ? o.BlobFileWritableFileMaxBufferSize : Options.WritableFileMaxBufferSize,
+            64 * 1024, int.MaxValue),
+    };
 
     /// <summary>Total size of the blob files a builder finished (bytes_written_blob).</summary>
     internal static ulong BlobBytesWritten(Blob.BlobFileBuilder? builder)

@@ -37,8 +37,8 @@ internal static class FlushJob
     /// (ascending) when the flush job was created (FlushJob's existing_snapshots_).
     /// </summary>
     public static async ValueTask<FileMetaData?> WriteLevel0TableAsync(IFileSystem fs, string path, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
-        ulong fileNumber, ulong epochNumber, DbIdentity identity, ulong[] snapshots, Blob.BlobFileBuilder? blobBuilder, bool synchronous,
-        CancellationToken cancellationToken)
+        ulong fileNumber, ulong epochNumber, DbIdentity identity, ulong[] snapshots, Blob.BlobFileBuilder? blobBuilder, Blob.BlobGarbageMeter? blobOutflow,
+        bool synchronous, CancellationToken cancellationToken)
     {
         bool stripTimestamps = cfd.TimestampsInMemtableOnly;
         ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -79,7 +79,7 @@ internal static class FlushJob
                 {
                     // Collapsing versions of a key compares user keys without their timestamp and needs full_history_ts_low;
                     // with persisted user-defined timestamps every version is kept (always correct).
-                    AddPointEntries(builder, cfd.Icmp, mems, meta, snapshots, dropHidden: cfd.TimestampSize == 0, blobBuilder);
+                    AddPointEntries(builder, cfd.Icmp, mems, meta, snapshots, dropHidden: cfd.TimestampSize == 0, blobBuilder, blobOutflow);
                 }
                 blobBuilder?.Finish();
                 if (tombstones is not null) AddRangeTombstones(builder, cfd, tombstones, meta);
@@ -134,14 +134,14 @@ internal static class FlushJob
     /// own branch before rule (A) upstream), and keys covered by range tombstones of the same flush are kept.
     /// </summary>
     private static void AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
-        ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder)
+        ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder, Blob.BlobGarbageMeter? blobOutflow)
     {
         Util.PooledBufferWriter? blobIndex = blobBuilder is null ? null : new Util.PooledBufferWriter(Blob.BlobIndex.MaxEncodedLength);
         Util.PooledBufferWriter? blobKey = blobBuilder is null ? null : new Util.PooledBufferWriter(64);
         Blob.EntityBlobRewriter? entities = blobBuilder is null ? null : new Blob.EntityBlobRewriter();
         try
         {
-            AddPointEntries(builder, icmp, mems, meta, snapshots, dropHidden, blobBuilder, blobIndex, blobKey, entities);
+            AddPointEntries(builder, icmp, mems, meta, snapshots, dropHidden, blobBuilder, blobIndex, blobKey, entities, blobOutflow);
         }
         finally
         {
@@ -154,7 +154,7 @@ internal static class FlushJob
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
         ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder, Util.PooledBufferWriter? blobIndex, Util.PooledBufferWriter? blobKey,
-        Blob.EntityBlobRewriter? entities)
+        Blob.EntityBlobRewriter? entities, Blob.BlobGarbageMeter? blobOutflow)
     {
         int n = mems.Count;
         var its = new MemTableIterator[n];
@@ -210,11 +210,17 @@ internal static class FlushJob
             else if (type == EntryType.WideColumnEntity)
             {
                 AddEntity(builder, meta, key, its[best].Value, blobBuilder, entities);
+                blobOutflow?.ProcessOutFlow(key, its[best].Value);
             }
             else
             {
                 builder.Add(key, its[best].Value);
-                if (type == EntryType.BlobIndex) UpdateOldestBlobFileNumber(meta, its[best].Value);
+                if (type == EntryType.BlobIndex)
+                {
+                    UpdateOldestBlobFileNumber(meta, its[best].Value);
+                    // Blob direct write: the flush output's references to the files of the flushed generations.
+                    blobOutflow?.ProcessOutFlow(key, its[best].Value);
+                }
             }
             if (seq < meta.SmallestSeqno) meta.SmallestSeqno = seq;
             if (seq > meta.LargestSeqno) meta.LargestSeqno = seq;

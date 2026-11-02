@@ -16,16 +16,59 @@ internal sealed class BlobFileReader : IDisposable
 {
     private readonly IRandomAccessFile _file;
     private readonly string _path;
-    private readonly ulong _fileSize;
+    private ulong _fileSize;
+    private readonly bool _hasFooter;
     private readonly Statistics? _stats;
 
-    private BlobFileReader(IRandomAccessFile file, string path, ulong fileSize, CompressionType compression, Statistics? stats)
+    private BlobFileReader(IRandomAccessFile file, string path, ulong fileSize, CompressionType compression, Statistics? stats, bool hasFooter)
     {
         _file = file;
         _path = path;
         _fileSize = fileSize;
         Compression = compression;
         _stats = stats;
+        _hasFooter = hasFooter;
+    }
+
+    /// <summary>
+    /// BlobFileReader::Create with skip_footer_validation (the footer-skip retry of BlobFileCache for blob direct write
+    /// files still being written): validates the header only. Readable bytes are those made visible with
+    /// <see cref="ExtendVisibleSize"/> (no footer is assumed: IsValidBlobOffset with has_footer = false).
+    /// </summary>
+    public static BlobFileReader OpenUnsealed(IFileSystem fs, string path, uint columnFamilyId, Statistics? stats)
+    {
+        IRandomAccessFile file = fs.OpenRandomAccess(path);
+        try
+        {
+            if ((ulong)file.Length < BlobLogFormat.HeaderSize) ThrowHelper.Corruption("Malformed blob file");
+            Span<byte> buf = stackalloc byte[BlobLogFormat.HeaderSize];
+            ReadExactly(file, path, 0, buf, stats);
+            BlobLogFormat.Header header = BlobLogFormat.DecodeHeader(buf);
+            if (header.HasTtl || header.ExpirationFirst != 0 || header.ExpirationSecond != 0) ThrowHelper.Corruption("Unexpected TTL blob file");
+            if (header.ColumnFamilyId != columnFamilyId) ThrowHelper.Corruption("Column family ID mismatch");
+            if (header.Compression != CompressionType.None && !BlockCompression.IsSupported(header.Compression))
+            {
+                ThrowHelper.NotSupported("Blob compression type " + header.Compression.ToString() + " is not supported");
+            }
+            return new BlobFileReader(file, path, (ulong)file.Length, header.Compression, stats, hasFooter: false);
+        }
+        catch
+        {
+            file.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>For an unsealed reader: the file holds at least <paramref name="size"/> bytes (only grows).</summary>
+    public void ExtendVisibleSize(ulong size)
+    {
+        ulong cur = Volatile.Read(ref _fileSize);
+        while (size > cur)
+        {
+            ulong prev = Interlocked.CompareExchange(ref _fileSize, size, cur);
+            if (prev == cur) return;
+            cur = prev;
+        }
     }
 
     /// <summary>The compression type of every blob of the file (from the header).</summary>
@@ -53,7 +96,7 @@ internal sealed class BlobFileReader : IDisposable
             {
                 ThrowHelper.NotSupported("Blob compression type " + header.Compression.ToString() + " is not supported");
             }
-            return new BlobFileReader(file, path, fileSize, header.Compression, stats);
+            return new BlobFileReader(file, path, fileSize, header.Compression, stats, hasFooter: true);
         }
         catch
         {
@@ -78,11 +121,12 @@ internal sealed class BlobFileReader : IDisposable
     private void Prepare(int keySize, ulong offset, ulong valueSize, CompressionType compression, bool verifyChecksums,
         out long recordOffset, out int recordSize, out int adjustment)
     {
-        if (!BlobLogFormat.IsValidBlobOffset(offset, (ulong)keySize, valueSize, _fileSize))
+        ulong fileSize = Volatile.Read(ref _fileSize);
+        if (!BlobLogFormat.IsValidBlobOffset(offset, (ulong)keySize, valueSize, _hasFooter ? fileSize : fileSize + BlobLogFormat.FooterSize))
         {
             ThrowHelper.Corruption("Invalid blob offset " + offset.ToString(CultureInfo.InvariantCulture) + " for value size " +
                                    valueSize.ToString(CultureInfo.InvariantCulture) + " in " + _path + " (file size " +
-                                   _fileSize.ToString(CultureInfo.InvariantCulture) + ")");
+                                   fileSize.ToString(CultureInfo.InvariantCulture) + ")");
         }
         if (compression != Compression) ThrowHelper.Corruption("Compression type mismatch when reading blob");
         // With verify_checksums the whole record is read (the index offset points at the value).

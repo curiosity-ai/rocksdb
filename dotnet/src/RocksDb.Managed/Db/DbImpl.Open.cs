@@ -279,6 +279,9 @@ internal sealed partial class DbImpl
         {
             result.MaxCompactionBytes = result.TargetFileSizeBase * 25;
         }
+        // "enable_blob_direct_write requires enable_blob_files=true. Disabling blob direct write."
+        if (result.EnableBlobDirectWrite && !result.EnableBlobFiles) result.EnableBlobDirectWrite = false;
+        if (result.BlobDirectWritePartitions == 0) result.BlobDirectWritePartitions = 1;
     }
 
     private static ValueTask AwaitIo(ValueTask t, bool synchronous)
@@ -534,7 +537,7 @@ internal sealed partial class DbImpl
         FileMetaData? meta;
         try
         {
-            meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, [], blobBuilder, synchronous, ct)
+            meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, [], blobBuilder, null, synchronous, ct)
                 .ConfigureAwait(false);
         }
         catch

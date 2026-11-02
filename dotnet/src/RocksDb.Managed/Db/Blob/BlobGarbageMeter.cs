@@ -17,6 +17,18 @@ internal sealed class BlobGarbageMeter
         public ulong InCount, InBytes, OutCount, OutBytes;
     }
 
+    /// <summary>
+    /// Inflow of a whole blob file (all its blobs): with the outflow of a flush output, the garbage of the blob direct
+    /// write files the flush registers is their blobs the output does not reference (dropped hidden versions, failed
+    /// writes).
+    /// </summary>
+    public void AddInFlow(ulong blobFileNumber, ulong count, ulong bytes)
+    {
+        if (!_flows.TryGetValue(blobFileNumber, out Flow? f)) _flows[blobFileNumber] = f = new Flow();
+        f.InCount += count;
+        f.InBytes += bytes;
+    }
+
     /// <summary>BlobGarbageMeter::ProcessInFlow. Throws Corruption for a malformed key or blob index.</summary>
     public void ProcessInFlow(ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value) => ProcessFlow(internalKey, value, isInflow: true);
 

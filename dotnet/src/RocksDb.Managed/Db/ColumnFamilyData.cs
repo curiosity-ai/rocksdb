@@ -21,6 +21,8 @@ internal sealed class ImmutableMemTable
     public FlushReason FlushReason { get; init; }
     public bool FlushInProgress { get; set; }
     public bool FlushCompleted { get; set; }
+    /// <summary>Blob files written by blob direct write while this memtable was mutable (registered by its flush).</summary>
+    public Blob.BlobDirectWriteGeneration? BlobGeneration { get; init; }
 }
 
 /// <summary>
@@ -97,7 +99,38 @@ internal sealed class ColumnFamilyData
             db.Options.MaxOpenFiles);
         CompactionState = new ColumnFamilyCompactionState(options, Icmp);
         Stats = new InternalStats(NumLevels);
+        if (options.EnableBlobDirectWrite && options.EnableBlobFiles && !db.IsReadOnly)
+        {
+            // DBImpl::MaybeInitBlobDirectWriteColumnFamily.
+            ValidateBlobDirectWrite(options, ucmp, db.Options);
+            BlobDirectWrite = new Blob.BlobDirectWriteManager(db.FileSystem, db.DbPaths[0], db.NewPendingOutputFileNumber, options, db.Options.Statistics)
+            {
+                ColumnFamilyId = id,
+                BlobFileSize = options.BlobFileSize,
+                FileOptions = db.BlobFileWriteOptions(options),
+            };
+            BlobSource.DirectWrite = BlobDirectWrite;
+        }
     }
+
+    /// <summary>
+    /// The blob direct write checks of ColumnFamilyData::ValidateOptions (db/column_family.cc); messages copied verbatim.
+    /// </summary>
+    private static void ValidateBlobDirectWrite(ColumnFamilyOptions options, Comparator ucmp, DbOptions dbOptions)
+    {
+        if (dbOptions.EnablePipelinedWrite) ThrowHelper.NotSupported("Blob direct write v1 does not support pipelined writes.");
+        if (dbOptions.AllowConcurrentMemtableWrite) ThrowHelper.NotSupported("Blob direct write v1 does not support concurrent memtable writes.");
+        if (dbOptions.UnorderedWrite) ThrowHelper.NotSupported("Blob direct write v1 does not support unordered writes.");
+        if (dbOptions.TwoWriteQueues) ThrowHelper.NotSupported("Blob direct write v1 does not support two write queues.");
+        if (options.ExperimentalMempurgeThreshold > 0.0) ThrowHelper.NotSupported("Blob direct write does not support MemPurge.");
+        if (ucmp.TimestampSize > 0) ThrowHelper.NotSupported("Blob direct write does not support user-defined timestamps.");
+    }
+
+    /// <summary>
+    /// Blob direct write of this column family (enable_blob_direct_write with enable_blob_files; null otherwise and for
+    /// read-only DBs).
+    /// </summary>
+    public Blob.BlobDirectWriteManager? BlobDirectWrite { get; }
 
     /// <summary>
     /// The persist_user_defined_timestamps = false checks of ColumnFamilyData::ValidateOptions (db/column_family.cc):

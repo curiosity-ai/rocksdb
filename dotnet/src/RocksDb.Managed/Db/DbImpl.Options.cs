@@ -29,7 +29,7 @@ internal sealed partial class DbImpl
         "prefix_extractor", "ttl", "periodic_compaction_seconds", "preclude_last_level_data_seconds", "preserve_internal_time_seconds",
         "last_level_temperature", "default_write_temperature", "enable_blob_files", "min_blob_size", "blob_file_size",
         "blob_compression_type", "enable_blob_garbage_collection", "blob_garbage_collection_age_cutoff",
-        "blob_garbage_collection_force_threshold", "blob_compaction_readahead_size", "blob_file_starting_level", "prepopulate_blob_cache",
+        "blob_garbage_collection_force_threshold", "blob_compaction_readahead_size", "blob_file_starting_level", "prepopulate_blob_cache", "blob_file_writable_file_max_buffer_size",
         "sample_for_compression", "bottommost_compression", "compression_per_level", "experimental_mempurge_threshold",
         "memtable_protection_bytes_per_key", "block_protection_bytes_per_key", "compression_opts", "bottommost_compression_opts",
     };
