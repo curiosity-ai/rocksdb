@@ -1,179 +1,951 @@
+using System.Buffers;
+using System.Runtime.CompilerServices;
 using Microsoft.Win32.SafeHandles;
 
 namespace RocksDb.Managed.Env;
 
 /// <summary>
-/// Minimal working <see cref="IFileSystem"/> over <see cref="RandomAccess"/>/<see cref="SafeFileHandle"/>, so that
-/// other streams can do real file I/O immediately. Stream F replaces/extends it (write buffering policy, direct I/O,
-/// rate limiting, proper fdatasync, directory fsync, readahead).
+/// <see cref="IFileSystem"/> over the local disk using <see cref="RandomAccess"/> on <see cref="SafeFileHandle"/>.
+/// Port of env/fs_posix.cc (PosixFileSystem) and env/io_posix.cc (PosixWritableFile, PosixRandomAccessFile,
+/// PosixSequentialFile, PosixDirectory), with the buffering of file/writable_file_writer.cc.
+/// <list type="bullet">
+/// <item>Errors surface as <see cref="RocksDbException"/> with <see cref="StatusCode.IOError"/> (sub code
+/// <see cref="StatusSubCode.PathNotFound"/> for missing files/directories), like IOError() in io_posix.cc.</item>
+/// <item><see cref="LockFile"/>: exclusive whole-file lock compatible with native RocksDB's
+/// fcntl(F_SETLK) lock on Linux (via OFD locks), plus a process-wide set of locked paths like PosixFileSystem's
+/// <c>lockedFiles</c>, so two opens of the same DB in this process fail as well.</item>
+/// <item><see cref="SyncDirectory"/>: open + fsync of the directory on Unix; no-op on Windows.</item>
+/// </list>
 /// </summary>
 public sealed class LocalFileSystem : IFileSystem
 {
     public static readonly LocalFileSystem Instance = new();
 
-    public IWritableFile CreateWritable(string path, bool truncate = true) => new LocalWritableFile(path, truncate);
-    public IRandomAccessFile OpenRandomAccess(string path) => new LocalRandomAccessFile(path);
-    public ISequentialFile OpenSequential(string path) => new LocalSequentialFile(path);
+    // Process-wide set of locked files (PosixFileSystem's static lockedFiles). Guarded by s_lockedFilesLock.
+    private static readonly HashSet<string> s_lockedFiles = new(StringComparer.Ordinal);
+    private static readonly Lock s_lockedFilesLock = new();
+
+    public IWritableFile CreateWritable(string path, bool truncate = true) =>
+        new LocalWritableFile(path, truncate ? FileMode.Create : FileMode.OpenOrCreate, WritableFileOptions.Default, append: false);
+
+    public IWritableFile CreateWritable(string path, bool truncate, WritableFileOptions options) =>
+        new LocalWritableFile(path, truncate ? FileMode.Create : FileMode.OpenOrCreate, options, append: false);
+
+    public IWritableFile ReopenWritable(string path, WritableFileOptions options) =>
+        new LocalWritableFile(path, FileMode.OpenOrCreate, options, append: true);
+
+    public IRandomAccessFile OpenRandomAccess(string path) => new LocalRandomAccessFile(path, RandomAccessFileOptions.Default);
+
+    public IRandomAccessFile OpenRandomAccess(string path, RandomAccessFileOptions options) => new LocalRandomAccessFile(path, options);
+
+    public ISequentialFile OpenSequential(string path) => new LocalSequentialFile(path, SequentialFileOptions.Default);
+
+    public ISequentialFile OpenSequential(string path, SequentialFileOptions options) => new LocalSequentialFile(path, options);
+
     public bool FileExists(string path) => File.Exists(path);
-    public long GetFileSize(string path) => new FileInfo(path).Length;
-    public void DeleteFile(string path) => File.Delete(path);
-    public void RenameFile(string source, string target) => File.Move(source, target, overwrite: true);
-    public void CreateDirectoryIfMissing(string path) => Directory.CreateDirectory(path);
-    public IEnumerable<string> GetChildren(string directory) => Directory.EnumerateFileSystemEntries(directory).Select(Path.GetFileName)!;
-    public IDisposable LockFile(string path) => new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-    public void SyncDirectory(string path) { /* TODO(stream F): fsync directory on Unix */ }
+
+    public bool DirectoryExists(string path) => Directory.Exists(path);
+
+    public long GetFileSize(string path)
+    {
+        try
+        {
+            return new FileInfo(path).Length;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            throw MapException("while stat a file for size", path, e);
+        }
+    }
+
+    /// <summary>Deletes a file. Like File.Delete, deleting a missing file is not an error.</summary>
+    public void DeleteFile(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            throw MapException("while unlink() file", path, e);
+        }
+    }
+
+    /// <summary>Atomically renames <paramref name="source"/> over <paramref name="target"/> (rename(2)).</summary>
+    public void RenameFile(string source, string target)
+    {
+        try
+        {
+            File.Move(source, target, overwrite: true);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            throw MapException("While renaming a file to " + target, source, e);
+        }
+    }
+
+    public void CreateDirectoryIfMissing(string path)
+    {
+        try
+        {
+            Directory.CreateDirectory(path);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            throw MapException("While mkdir if missing", path, e);
+        }
+    }
+
+    public void DeleteDirectory(string path)
+    {
+        try
+        {
+            Directory.Delete(path, recursive: false);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            throw MapException("While rmdir", path, e);
+        }
+    }
+
+    /// <summary>Names (not paths) of the entries in <paramref name="directory"/>.</summary>
+    public IEnumerable<string> GetChildren(string directory)
+    {
+        List<string> result = [];
+        try
+        {
+            foreach (string entry in Directory.EnumerateFileSystemEntries(directory))
+                result.Add(Path.GetFileName(entry));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            throw MapException("While opendir", directory, e);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Acquires the DB "LOCK" (PosixFileSystem::LockFile). Fails with IOError if the lock is held by this process
+    /// (any <see cref="LocalFileSystem"/>), by another process using this port, or by native RocksDB (Linux: OFD
+    /// locks conflict with RocksDB's fcntl locks even within one process; Windows: exclusive share mode).
+    /// On macOS only flock(2) is used, which does not exclude a native RocksDB process.
+    /// </summary>
+    public IDisposable LockFile(string path)
+    {
+        string key = Path.GetFullPath(path);
+        lock (s_lockedFilesLock)
+        {
+            if (!s_lockedFiles.Add(key))
+                throw RocksDbException.IOError("lock hold by current process: " + path + ": No locks available");
+        }
+
+        SafeFileHandle? handle = null;
+        FileStream? stream = null;
+        try
+        {
+            if (OperatingSystem.IsLinux())
+            {
+                handle = File.OpenHandle(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+                int rc = UnixNative.TryOfdLock(handle);
+                if (rc > 0) throw UnixNative.IOErrorFromErrno("While lock file", path, rc);
+                if (rc < 0)
+                {
+                    // No OFD locks (old kernel): FileStream.Lock uses fcntl(F_SETLK), which still excludes other processes.
+                    stream = new FileStream(handle, FileAccess.ReadWrite);
+                    stream.Lock(0, 0);
+                }
+            }
+            else
+            {
+                // Windows: exclusive share mode (like WinFileSystem::LockFile). macOS/BSD: .NET takes flock(LOCK_EX).
+                handle = File.OpenHandle(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            return new FileLock(key, handle, stream);
+        }
+        catch (Exception e)
+        {
+            stream?.Dispose();
+            handle?.Dispose();
+            lock (s_lockedFilesLock) s_lockedFiles.Remove(key);
+            if (e is RocksDbException) throw;
+            if (e is IOException or UnauthorizedAccessException) throw RocksDbException.IOError("While lock file: " + path + ": " + e.Message, e);
+            throw;
+        }
+    }
+
+    /// <summary>fsync the directory (PosixDirectory::Fsync). No-op on Windows.</summary>
+    public void SyncDirectory(string path) => UnixNative.FsyncDirectory(path);
+
+    internal static RocksDbException MapException(string context, string path, Exception e)
+    {
+        StatusSubCode sub = e is FileNotFoundException or DirectoryNotFoundException ? StatusSubCode.PathNotFound : StatusSubCode.None;
+        return new RocksDbException(StatusCode.IOError, "IO error: " + context + ": " + path + ": " + e.Message, sub, e);
+    }
+
+    internal static SafeFileHandle OpenHandle(string path, FileMode mode, FileAccess access, FileShare share, FileOptions options)
+    {
+        try
+        {
+            return File.OpenHandle(path, mode, access, share, options);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            throw MapException("While open a file", path, e);
+        }
+    }
+
+    private sealed class FileLock(string key, SafeFileHandle handle, FileStream? stream) : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            // Closing the descriptor releases the OFD/fcntl/flock lock (PosixFileSystem::UnlockFile).
+            stream?.Dispose();
+            handle.Dispose();
+            lock (s_lockedFilesLock) s_lockedFiles.Remove(key);
+        }
+    }
 }
 
+/// <summary>
+/// Port of PosixRandomAccessFile (env/io_posix.cc) + the read loop of RandomAccessFileReader. Positional reads
+/// (pread) are thread-safe and may run concurrently. With direct I/O, reads are widened to aligned boundaries
+/// through a pooled aligned bounce buffer.
+/// </summary>
 internal sealed class LocalRandomAccessFile : IRandomAccessFile
 {
     private readonly SafeFileHandle _handle;
-    public LocalRandomAccessFile(string path)
+    private readonly string _path;
+    private readonly int _alignment; // 0 when not using direct I/O
+
+    public LocalRandomAccessFile(string path, RandomAccessFileOptions options)
     {
-        _handle = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, FileOptions.RandomAccess | FileOptions.Asynchronous);
-        Length = RandomAccess.GetLength(_handle);
+        _path = path;
+        _handle = LocalFileSystem.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, FileOptions.RandomAccess | FileOptions.Asynchronous);
+        try
+        {
+            if (options.UseDirectIO)
+            {
+                UnixNative.EnableDirectIO(_handle, path);
+                _alignment = options.DirectIOAlignment;
+            }
+            Length = RandomAccess.GetLength(_handle);
+        }
+        catch
+        {
+            _handle.Dispose();
+            throw;
+        }
     }
+
     public long Length { get; }
+
     public int Read(long offset, Span<byte> destination)
     {
-        int total = 0;
-        while (total < destination.Length)
+        if (_alignment != 0) return ReadDirect(offset, destination);
+        try
         {
-            int n = RandomAccess.Read(_handle, destination[total..], offset + total);
-            if (n == 0) break;
-            total += n;
+            int total = 0;
+            while (total < destination.Length)
+            {
+                int n = RandomAccess.Read(_handle, destination[total..], offset + total);
+                if (n == 0) break;
+                total += n;
+            }
+            return total;
         }
-        return total;
+        catch (IOException e)
+        {
+            throw LocalFileSystem.MapException("While pread offset " + offset + " len " + destination.Length, _path, e);
+        }
     }
-    public async ValueTask<int> ReadAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken = default)
+
+    public ValueTask<int> ReadAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken = default)
     {
-        int total = 0;
-        while (total < destination.Length)
+        if (_alignment != 0) return ReadDirectAsync(offset, destination, cancellationToken);
+        ValueTask<int> first;
+        try
         {
-            int n = await RandomAccess.ReadAsync(_handle, destination[total..], offset + total, cancellationToken).ConfigureAwait(false);
-            if (n == 0) break;
-            total += n;
+            first = RandomAccess.ReadAsync(_handle, destination, offset, cancellationToken);
         }
-        return total;
+        catch (IOException e)
+        {
+            return ValueTask.FromException<int>(LocalFileSystem.MapException("While pread", _path, e));
+        }
+        if (first.IsCompletedSuccessfully)
+        {
+            // A ValueTask may be consumed only once: continue from the known count instead of re-awaiting it.
+            int n = first.Result;
+            if (n == destination.Length || n == 0) return new ValueTask<int>(n);
+            return ReadAsyncSlow(default, n, offset, destination, cancellationToken);
+        }
+        return ReadAsyncSlow(first, -1, offset, destination, cancellationToken);
     }
+
+    /// <summary>Completes a short read. Exactly one of <paramref name="first"/> (pending) or
+    /// <paramref name="alreadyRead"/> (&gt;= 0) describes the first read.</summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<int> ReadAsyncSlow(ValueTask<int> first, int alreadyRead, long offset, Memory<byte> destination, CancellationToken cancellationToken)
+    {
+        try
+        {
+            int total = alreadyRead >= 0 ? alreadyRead : await first.ConfigureAwait(false);
+            if (total == 0) return 0;
+            while (total < destination.Length)
+            {
+                int n = await RandomAccess.ReadAsync(_handle, destination[total..], offset + total, cancellationToken).ConfigureAwait(false);
+                if (n == 0) break;
+                total += n;
+            }
+            return total;
+        }
+        catch (IOException e)
+        {
+            throw LocalFileSystem.MapException("While pread offset " + offset + " len " + destination.Length, _path, e);
+        }
+    }
+
+    private int ReadDirect(long offset, Span<byte> destination)
+    {
+        if (destination.Length == 0) return 0;
+        long alignedOffset = AlignedBuffer.RoundDown(offset, _alignment);
+        int skip = (int)(offset - alignedOffset);
+        int alignedLen = AlignedBuffer.RoundUp(skip + destination.Length, _alignment);
+        AlignedBuffer buffer = AlignedBufferPool.Rent(alignedLen, _alignment);
+        try
+        {
+            Span<byte> span = buffer.Span[..alignedLen];
+            int total = 0;
+            while (total < alignedLen)
+            {
+                int n = RandomAccess.Read(_handle, span[total..], alignedOffset + total);
+                if (n == 0) break;
+                total += n;
+                if ((n & (_alignment - 1)) != 0) break; // short read: EOF
+            }
+            int available = Math.Max(0, Math.Min(total - skip, destination.Length));
+            span.Slice(skip, available).CopyTo(destination);
+            return available;
+        }
+        catch (IOException e)
+        {
+            throw LocalFileSystem.MapException("While pread (direct) offset " + offset, _path, e);
+        }
+        finally
+        {
+            AlignedBufferPool.Return(buffer);
+        }
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<int> ReadDirectAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken)
+    {
+        if (destination.Length == 0) return 0;
+        long alignedOffset = AlignedBuffer.RoundDown(offset, _alignment);
+        int skip = (int)(offset - alignedOffset);
+        int alignedLen = AlignedBuffer.RoundUp(skip + destination.Length, _alignment);
+        AlignedBuffer buffer = AlignedBufferPool.Rent(alignedLen, _alignment);
+        try
+        {
+            Memory<byte> mem = buffer.Memory[..alignedLen];
+            int total = 0;
+            while (total < alignedLen)
+            {
+                int n = await RandomAccess.ReadAsync(_handle, mem[total..], alignedOffset + total, cancellationToken).ConfigureAwait(false);
+                if (n == 0) break;
+                total += n;
+                if ((n & (_alignment - 1)) != 0) break;
+            }
+            int available = Math.Max(0, Math.Min(total - skip, destination.Length));
+            mem.Slice(skip, available).CopyTo(destination);
+            return available;
+        }
+        catch (IOException e)
+        {
+            throw LocalFileSystem.MapException("While pread (direct) offset " + offset, _path, e);
+        }
+        finally
+        {
+            AlignedBufferPool.Return(buffer);
+        }
+    }
+
     public void Dispose() => _handle.Dispose();
 }
 
+/// <summary>
+/// Port of PosixSequentialFile + SequentialFileReader (file/sequence_file_reader.cc), including the optional
+/// readahead wrapper (ReadaheadSequentialFile). Not thread-safe (single reader).
+/// </summary>
 internal sealed class LocalSequentialFile : ISequentialFile
 {
     private readonly SafeFileHandle _handle;
-    private long _position;
-    public LocalSequentialFile(string path) =>
-        _handle = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, FileOptions.SequentialScan | FileOptions.Asynchronous);
+    private readonly string _path;
+    private long _position;          // file offset of the next byte returned to the caller
+    private byte[]? _buffer;         // readahead buffer (null when readahead is off)
+    private int _bufferStart;        // index in _buffer of the byte at _position
+    private int _bufferEnd;          // number of valid bytes in _buffer
+
+    public LocalSequentialFile(string path, SequentialFileOptions options)
+    {
+        _path = path;
+        _handle = LocalFileSystem.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, FileOptions.SequentialScan | FileOptions.Asynchronous);
+        if (options.ReadaheadSize > 0) _buffer = ArrayPool<byte>.Shared.Rent(options.ReadaheadSize);
+    }
+
+    private int Buffered => _bufferEnd - _bufferStart;
+
     public int Read(Span<byte> destination)
     {
-        int n = RandomAccess.Read(_handle, destination, _position);
-        _position += n;
-        return n;
-    }
-    public async ValueTask<int> ReadAsync(Memory<byte> destination, CancellationToken cancellationToken = default)
-    {
-        int n = await RandomAccess.ReadAsync(_handle, destination, _position, cancellationToken).ConfigureAwait(false);
-        _position += n;
-        return n;
-    }
-    public void Skip(long bytes) => _position += bytes;
-    public void Dispose() => _handle.Dispose();
-}
-
-internal sealed class LocalWritableFile : IWritableFile
-{
-    private const int BufferSize = 64 * 1024;
-    private readonly SafeFileHandle _handle;
-    private readonly byte[] _buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(BufferSize);
-    private int _buffered;
-    private long _flushedOffset;
-
-    public LocalWritableFile(string path, bool truncate) =>
-        _handle = File.OpenHandle(path, truncate ? FileMode.Create : FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read | FileShare.Delete, FileOptions.Asynchronous);
-
-    public long Size => _flushedOffset + _buffered;
-
-    public void Append(ReadOnlySpan<byte> data)
-    {
-        if (data.Length > _buffer.Length - _buffered)
+        try
         {
-            Flush();
-            if (data.Length >= _buffer.Length)
+            if (_buffer is null)
             {
-                RandomAccess.Write(_handle, data, _flushedOffset);
-                _flushedOffset += data.Length;
-                return;
+                int n = RandomAccess.Read(_handle, destination, _position);
+                _position += n;
+                return n;
+            }
+            int total = 0;
+            while (total < destination.Length)
+            {
+                if (Buffered == 0)
+                {
+                    int remaining = destination.Length - total;
+                    if (remaining >= _buffer.Length)
+                    {
+                        int d = RandomAccess.Read(_handle, destination[total..], _position);
+                        _position += d;
+                        return total + d;
+                    }
+                    _bufferStart = 0;
+                    _bufferEnd = RandomAccess.Read(_handle, _buffer, _position);
+                    if (_bufferEnd == 0) break;
+                }
+                int take = Math.Min(Buffered, destination.Length - total);
+                _buffer.AsSpan(_bufferStart, take).CopyTo(destination[total..]);
+                _bufferStart += take;
+                _position += take;
+                total += take;
+            }
+            return total;
+        }
+        catch (IOException e)
+        {
+            throw LocalFileSystem.MapException("While reading file sequentially", _path, e);
+        }
+    }
+
+    public ValueTask<int> ReadAsync(Memory<byte> destination, CancellationToken cancellationToken = default)
+    {
+        if (_buffer is not null && Buffered >= destination.Length)
+        {
+            _buffer.AsSpan(_bufferStart, destination.Length).CopyTo(destination.Span);
+            _bufferStart += destination.Length;
+            _position += destination.Length;
+            return new ValueTask<int>(destination.Length);
+        }
+        return ReadAsyncSlow(destination, cancellationToken);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<int> ReadAsyncSlow(Memory<byte> destination, CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (_buffer is null)
+            {
+                int n = await RandomAccess.ReadAsync(_handle, destination, _position, cancellationToken).ConfigureAwait(false);
+                _position += n;
+                return n;
+            }
+            int total = 0;
+            while (total < destination.Length)
+            {
+                if (Buffered == 0)
+                {
+                    int remaining = destination.Length - total;
+                    if (remaining >= _buffer.Length)
+                    {
+                        int d = await RandomAccess.ReadAsync(_handle, destination[total..], _position, cancellationToken).ConfigureAwait(false);
+                        _position += d;
+                        return total + d;
+                    }
+                    _bufferStart = 0;
+                    _bufferEnd = await RandomAccess.ReadAsync(_handle, _buffer, _position, cancellationToken).ConfigureAwait(false);
+                    if (_bufferEnd == 0) break;
+                }
+                int take = Math.Min(Buffered, destination.Length - total);
+                _buffer.AsMemory(_bufferStart, take).CopyTo(destination[total..]);
+                _bufferStart += take;
+                _position += take;
+                total += take;
+            }
+            return total;
+        }
+        catch (IOException e)
+        {
+            throw LocalFileSystem.MapException("While reading file sequentially", _path, e);
+        }
+    }
+
+    public void Skip(long bytes)
+    {
+        if (_buffer is not null)
+        {
+            if (bytes <= Buffered)
+            {
+                _bufferStart += (int)bytes;
+            }
+            else
+            {
+                _bufferStart = _bufferEnd = 0;
             }
         }
-        data.CopyTo(_buffer.AsSpan(_buffered));
-        _buffered += data.Length;
+        _position += bytes;
+    }
+
+    public void Dispose()
+    {
+        _handle.Dispose();
+        byte[]? b = _buffer;
+        _buffer = null;
+        if (b is not null) ArrayPool<byte>.Shared.Return(b);
+    }
+}
+
+/// <summary>
+/// Port of WritableFileWriter (file/writable_file_writer.cc) over PosixWritableFile (env/io_posix.cc).
+/// <list type="bullet">
+/// <item>Buffered mode: a pooled buffer that grows from <see cref="WritableFileOptions.InitialBufferSize"/> up to
+/// <see cref="WritableFileOptions.MaxBufferSize"/>; appends larger than the buffer are written through.</item>
+/// <item>Direct mode: aligned native buffer; whole pages are written and the partial tail page is kept and
+/// rewritten on the next flush (WriteDirect); the file is truncated to its logical size on close.</item>
+/// <item><see cref="Sync"/> = flush + fdatasync on Linux (fsync/F_FULLFSYNC elsewhere).</item>
+/// <item>Optional fallocate preallocation, bytes_per_sync range syncs and a rate limiter hook.</item>
+/// </list>
+/// Not thread-safe: a writable file has a single writer, as in RocksDB.
+/// Async methods complete synchronously while data fits in the buffer; slow paths use pooled state machines.
+/// </summary>
+internal sealed class LocalWritableFile : IWritableFile
+{
+    private readonly SafeFileHandle _handle;
+    private readonly string _path;
+    private readonly WritableFileOptions _options;
+    private readonly int _alignment;           // 0 when not using direct I/O
+    private byte[]? _array;                    // buffered mode
+    private AlignedBuffer? _aligned;           // direct mode
+    private int _capacity;
+    private int _buffered;
+    private long _filePos;                     // buffered: bytes handed to the OS; direct: aligned offset of buffer[0]
+    private long _preallocatedEnd;
+    private long _lastRangeSync;
+    private bool _preallocationFailed;
+    private bool _disposed;
+
+    public LocalWritableFile(string path, FileMode mode, WritableFileOptions options, bool append)
+    {
+        _path = path;
+        _options = options;
+        _handle = LocalFileSystem.OpenHandle(path, mode, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete, FileOptions.Asynchronous);
+        try
+        {
+            if (append) _filePos = RandomAccess.GetLength(_handle);
+            if (options.UseDirectIO)
+            {
+                UnixNative.EnableDirectIO(_handle, path);
+                _alignment = options.DirectIOAlignment;
+                _capacity = AlignedBuffer.RoundUp(Math.Max(options.InitialBufferSize, _alignment), _alignment);
+                _aligned = new AlignedBuffer(_capacity, _alignment);
+                if (append && (_filePos & (_alignment - 1)) != 0)
+                {
+                    // Re-read the partial tail page so that it can be rewritten in full.
+                    long alignedPos = AlignedBuffer.RoundDown(_filePos, _alignment);
+                    int tail = (int)(_filePos - alignedPos);
+                    int read = RandomAccess.Read(_handle, _aligned.Span[.._alignment], alignedPos);
+                    if (read < tail) ThrowHelper.Corruption("short read of tail page while reopening " + path);
+                    _filePos = alignedPos;
+                    _buffered = tail;
+                }
+            }
+            else
+            {
+                _capacity = Math.Max(1, Math.Min(options.InitialBufferSize, options.MaxBufferSize));
+                _array = ArrayPool<byte>.Shared.Rent(_capacity);
+                _capacity = _array.Length;
+            }
+            _lastRangeSync = _filePos;
+            _preallocatedEnd = _filePos;
+        }
+        catch
+        {
+            _handle.Dispose();
+            if (_aligned is not null) ((IDisposable)_aligned).Dispose();
+            throw;
+        }
+    }
+
+    public long Size => _filePos + _buffered;
+
+    private Span<byte> BufferSpan => _array is not null ? _array.AsSpan(0, _capacity) : _aligned!.Span;
+    private Memory<byte> BufferMemory => _array is not null ? _array.AsMemory(0, _capacity) : _aligned!.Memory;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Append(ReadOnlySpan<byte> data)
+    {
+        if (data.Length <= _capacity - _buffered)
+        {
+            data.CopyTo(BufferSpan[_buffered..]);
+            _buffered += data.Length;
+            return;
+        }
+        AppendSlow(data);
+    }
+
+    private void AppendSlow(ReadOnlySpan<byte> data)
+    {
+        ThrowIfDisposed();
+        if (TryGrowBuffer(data.Length))
+        {
+            data.CopyTo(BufferSpan[_buffered..]);
+            _buffered += data.Length;
+            return;
+        }
+        if (_alignment != 0)
+        {
+            while (!data.IsEmpty)
+            {
+                int n = Math.Min(data.Length, _capacity - _buffered);
+                data[..n].CopyTo(BufferSpan[_buffered..]);
+                _buffered += n;
+                data = data[n..];
+                if (_buffered == _capacity) FlushDirect();
+            }
+            return;
+        }
+        Flush();
+        if (data.Length >= _capacity)
+        {
+            WriteRaw(data, _filePos);
+            _filePos += data.Length;
+        }
+        else
+        {
+            data.CopyTo(BufferSpan);
+            _buffered = data.Length;
+        }
     }
 
     public ValueTask AppendAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
-        if (data.Length <= _buffer.Length - _buffered)
+        if (data.Length <= _capacity - _buffered)
         {
-            data.Span.CopyTo(_buffer.AsSpan(_buffered));
+            data.Span.CopyTo(BufferSpan[_buffered..]);
+            _buffered += data.Length;
+            return ValueTask.CompletedTask;
+        }
+        if (_alignment == 0 && TryGrowBuffer(data.Length))
+        {
+            data.Span.CopyTo(BufferSpan[_buffered..]);
             _buffered += data.Length;
             return ValueTask.CompletedTask;
         }
         return AppendSlowAsync(data, cancellationToken);
     }
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private async ValueTask AppendSlowAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
     {
-        await FlushAsync(cancellationToken).ConfigureAwait(false);
-        if (data.Length >= _buffer.Length)
+        ThrowIfDisposed();
+        if (_alignment != 0)
         {
-            await RandomAccess.WriteAsync(_handle, data, _flushedOffset, cancellationToken).ConfigureAwait(false);
-            _flushedOffset += data.Length;
+            while (!data.IsEmpty)
+            {
+                int n = Math.Min(data.Length, _capacity - _buffered);
+                data[..n].CopyTo(BufferMemory[_buffered..]);
+                _buffered += n;
+                data = data[n..];
+                if (_buffered == _capacity) await FlushDirectAsync(cancellationToken).ConfigureAwait(false);
+            }
+            return;
+        }
+        await FlushAsync(cancellationToken).ConfigureAwait(false);
+        if (data.Length >= _capacity)
+        {
+            await WriteRawAsync(data, _filePos, cancellationToken).ConfigureAwait(false);
+            _filePos += data.Length;
         }
         else
         {
-            data.Span.CopyTo(_buffer);
+            data.CopyTo(BufferMemory);
             _buffered = data.Length;
         }
+    }
+
+    /// <summary>Grows the pooled buffer (buffered mode only) so that <paramref name="needed"/> more bytes fit.</summary>
+    private bool TryGrowBuffer(int needed)
+    {
+        if (_array is null || _capacity >= _options.MaxBufferSize) return false;
+        long target = (long)_buffered + needed;
+        if (target > _options.MaxBufferSize) return false;
+        int newSize = _capacity;
+        while (newSize < target) newSize = (int)Math.Min((long)newSize * 2, _options.MaxBufferSize);
+        byte[] bigger = ArrayPool<byte>.Shared.Rent(newSize);
+        _array.AsSpan(0, _buffered).CopyTo(bigger);
+        ArrayPool<byte>.Shared.Return(_array);
+        _array = bigger;
+        _capacity = bigger.Length;
+        return true;
     }
 
     public void Flush()
     {
         if (_buffered == 0) return;
-        RandomAccess.Write(_handle, _buffer.AsSpan(0, _buffered), _flushedOffset);
-        _flushedOffset += _buffered;
+        ThrowIfDisposed();
+        if (_alignment != 0)
+        {
+            FlushDirect();
+            return;
+        }
+        WriteRaw(_array.AsSpan(0, _buffered), _filePos);
+        _filePos += _buffered;
         _buffered = 0;
+        MaybeRangeSync();
     }
 
-    public async ValueTask FlushAsync(CancellationToken cancellationToken = default)
+    public ValueTask FlushAsync(CancellationToken cancellationToken = default)
+    {
+        if (_buffered == 0) return ValueTask.CompletedTask;
+        return FlushSlowAsync(cancellationToken);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask FlushSlowAsync(CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        if (_alignment != 0)
+        {
+            await FlushDirectAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
+        await WriteRawAsync(_array.AsMemory(0, _buffered), _filePos, cancellationToken).ConfigureAwait(false);
+        _filePos += _buffered;
+        _buffered = 0;
+        MaybeRangeSync();
+    }
+
+    // Direct mode: write every page that holds buffered data (zero padding the last one), then keep the
+    // partial tail page at the start of the buffer (WritableFileWriter::WriteDirect).
+    private int PrepareDirectWrite(out int fileAdvance, out int leftover)
+    {
+        fileAdvance = (int)AlignedBuffer.RoundDown(_buffered, _alignment);
+        leftover = _buffered - fileAdvance;
+        int writeLen = AlignedBuffer.RoundUp(_buffered, _alignment);
+        BufferSpan[_buffered..writeLen].Clear();
+        return writeLen;
+    }
+
+    private void FinishDirectWrite(int fileAdvance, int leftover)
+    {
+        if (leftover > 0) BufferSpan.Slice(fileAdvance, leftover).CopyTo(BufferSpan);
+        _filePos += fileAdvance;
+        _buffered = leftover;
+        MaybeRangeSync();
+    }
+
+    private void FlushDirect()
     {
         if (_buffered == 0) return;
-        await RandomAccess.WriteAsync(_handle, _buffer.AsMemory(0, _buffered), _flushedOffset, cancellationToken).ConfigureAwait(false);
-        _flushedOffset += _buffered;
-        _buffered = 0;
+        int writeLen = PrepareDirectWrite(out int fileAdvance, out int leftover);
+        WriteRaw(BufferSpan[..writeLen], _filePos);
+        FinishDirectWrite(fileAdvance, leftover);
+    }
+
+    private async ValueTask FlushDirectAsync(CancellationToken cancellationToken)
+    {
+        if (_buffered == 0) return;
+        int writeLen = PrepareDirectWrite(out int fileAdvance, out int leftover);
+        await WriteRawAsync(BufferMemory[..writeLen], _filePos, cancellationToken).ConfigureAwait(false);
+        FinishDirectWrite(fileAdvance, leftover);
+    }
+
+    private void WriteRaw(ReadOnlySpan<byte> data, long offset)
+    {
+        Preallocate(offset + data.Length);
+        try
+        {
+            IRateLimiter? limiter = _options.RateLimiter;
+            if (limiter is null)
+            {
+                RandomAccess.Write(_handle, data, offset);
+                return;
+            }
+            while (!data.IsEmpty)
+            {
+                int chunk = (int)Math.Min(data.Length, Math.Max(1, limiter.SingleBurstBytes));
+                if (_alignment != 0) chunk = Math.Max(_alignment, (int)AlignedBuffer.RoundDown(chunk, _alignment));
+                chunk = Math.Min(chunk, data.Length);
+                limiter.Request(chunk, _options.IoPriority);
+                RandomAccess.Write(_handle, data[..chunk], offset);
+                offset += chunk;
+                data = data[chunk..];
+            }
+        }
+        catch (IOException e)
+        {
+            throw LocalFileSystem.MapException("While appending to file", _path, e);
+        }
+    }
+
+    private async ValueTask WriteRawAsync(ReadOnlyMemory<byte> data, long offset, CancellationToken cancellationToken)
+    {
+        Preallocate(offset + data.Length);
+        try
+        {
+            IRateLimiter? limiter = _options.RateLimiter;
+            if (limiter is null)
+            {
+                await RandomAccess.WriteAsync(_handle, data, offset, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            while (!data.IsEmpty)
+            {
+                int chunk = (int)Math.Min(data.Length, Math.Max(1, limiter.SingleBurstBytes));
+                if (_alignment != 0) chunk = Math.Max(_alignment, (int)AlignedBuffer.RoundDown(chunk, _alignment));
+                chunk = Math.Min(chunk, data.Length);
+                await limiter.RequestAsync(chunk, _options.IoPriority, cancellationToken).ConfigureAwait(false);
+                await RandomAccess.WriteAsync(_handle, data[..chunk], offset, cancellationToken).ConfigureAwait(false);
+                offset += chunk;
+                data = data[chunk..];
+            }
+        }
+        catch (IOException e)
+        {
+            throw LocalFileSystem.MapException("While appending to file", _path, e);
+        }
+    }
+
+    // PosixWritableFile::PrepareWrite: reserve whole preallocation blocks covering the write.
+    private void Preallocate(long end)
+    {
+        long block = _options.PreallocationBlockSize;
+        if (block <= 0 || _preallocationFailed || end <= _preallocatedEnd) return;
+        long newEnd = (end + block - 1) / block * block;
+        if (UnixNative.TryAllocate(_handle, _preallocatedEnd, newEnd - _preallocatedEnd))
+            _preallocatedEnd = newEnd;
+        else
+            _preallocationFailed = true;
+    }
+
+    // WritableFileWriter: bytes_per_sync => RangeSync(last_sync_size_, offset_sync_to - last_sync_size_).
+    private void MaybeRangeSync()
+    {
+        long bps = _options.BytesPerSync;
+        if (bps <= 0) return;
+        long syncTo = AlignedBuffer.RoundDown(_filePos, 4096);
+        if (syncTo - _lastRangeSync >= bps)
+        {
+            UnixNative.TryRangeSync(_handle, _lastRangeSync, syncTo - _lastRangeSync);
+            _lastRangeSync = syncTo;
+        }
     }
 
     public void Sync()
     {
         Flush();
-        RandomAccess.FlushToDisk(_handle);
+        UnixNative.DataSync(_handle, _path);
     }
 
-    public async ValueTask SyncAsync(CancellationToken cancellationToken = default)
+    public ValueTask SyncAsync(CancellationToken cancellationToken = default)
+    {
+        if (_buffered == 0)
+        {
+            try
+            {
+                ThrowIfDisposed();
+                UnixNative.DataSync(_handle, _path);
+                return ValueTask.CompletedTask;
+            }
+            catch (Exception e)
+            {
+                return ValueTask.FromException(e);
+            }
+        }
+        return SyncSlowAsync(cancellationToken);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask SyncSlowAsync(CancellationToken cancellationToken)
     {
         await FlushAsync(cancellationToken).ConfigureAwait(false);
-        RandomAccess.FlushToDisk(_handle);
+        UnixNative.DataSync(_handle, _path);
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (_disposed) ThrowHelper.InvalidArgument("file already closed: " + _path);
+    }
+
+    // PosixWritableFile::Close: trim to the logical size when the tail was padded (direct I/O) or blocks were
+    // preallocated past EOF.
+    private void TruncateOnClose()
+    {
+        if (_alignment != 0 || _preallocatedEnd > Size)
+        {
+            try
+            {
+                RandomAccess.SetLength(_handle, Size);
+            }
+            catch (IOException e)
+            {
+                throw LocalFileSystem.MapException("While ftruncate", _path, e);
+            }
+        }
+    }
+
+    private void ReleaseResources()
+    {
+        _disposed = true;
+        _handle.Dispose();
+        if (_array is not null)
+        {
+            ArrayPool<byte>.Shared.Return(_array);
+            _array = null;
+        }
+        if (_aligned is not null)
+        {
+            ((IDisposable)_aligned).Dispose();
+            _aligned = null;
+        }
+        _capacity = 0;
     }
 
     public void Dispose()
     {
-        Flush();
-        _handle.Dispose();
-        System.Buffers.ArrayPool<byte>.Shared.Return(_buffer);
+        if (_disposed) return;
+        try
+        {
+            Flush();
+            TruncateOnClose();
+        }
+        finally
+        {
+            ReleaseResources();
+        }
     }
 
     public async ValueTask DisposeAsync()
     {
-        await FlushAsync().ConfigureAwait(false);
-        _handle.Dispose();
-        System.Buffers.ArrayPool<byte>.Shared.Return(_buffer);
+        if (_disposed) return;
+        try
+        {
+            await FlushAsync().ConfigureAwait(false);
+            TruncateOnClose();
+        }
+        finally
+        {
+            ReleaseResources();
+        }
     }
 }

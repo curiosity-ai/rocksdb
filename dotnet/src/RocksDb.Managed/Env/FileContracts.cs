@@ -54,4 +54,30 @@ public interface IFileSystem
     IDisposable LockFile(string path);
     /// <summary>fsync a directory so that renames/creates are durable (no-op where unsupported).</summary>
     void SyncDirectory(string path);
+
+    // ---- Additions (stream F). Default implementations keep third-party implementations source compatible. ----
+
+    /// <summary>Creates a writable file with explicit buffering/sync/direct-I/O options.</summary>
+    IWritableFile CreateWritable(string path, bool truncate, WritableFileOptions options) => CreateWritable(path, truncate);
+
+    /// <summary>
+    /// Opens an existing file (creating it if missing) for appending at its current end
+    /// (FileSystem::ReopenWritableFile).
+    /// </summary>
+    IWritableFile ReopenWritable(string path, WritableFileOptions options) =>
+        throw RocksDbException.NotSupported("ReopenWritable is not supported by " + GetType().Name);
+
+    /// <summary>Opens a random-access file with explicit options (e.g. direct I/O).</summary>
+    IRandomAccessFile OpenRandomAccess(string path, RandomAccessFileOptions options) => OpenRandomAccess(path);
+
+    /// <summary>Opens a sequential file with explicit options (e.g. readahead).</summary>
+    ISequentialFile OpenSequential(string path, SequentialFileOptions options) => OpenSequential(path);
+
+    /// <summary>True if <paramref name="path"/> names an existing directory.</summary>
+    bool DirectoryExists(string path) =>
+        throw RocksDbException.NotSupported("DirectoryExists is not supported by " + GetType().Name);
+
+    /// <summary>Deletes an empty directory (FileSystem::DeleteDir).</summary>
+    void DeleteDirectory(string path) =>
+        throw RocksDbException.NotSupported("DeleteDirectory is not supported by " + GetType().Name);
 }
