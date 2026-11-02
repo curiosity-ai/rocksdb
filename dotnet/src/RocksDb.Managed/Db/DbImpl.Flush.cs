@@ -149,13 +149,17 @@ internal sealed partial class DbImpl
     private async ValueTask FlushAndInstallAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch, bool synchronous,
         int jobId, long flushStart, List<MemTable> mems, string path, Blob.BlobFileBuilder? blobBuilder, FlushReason reason)
     {
-        FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, mems, fileNumber, epoch, Identity, blobBuilder, synchronous,
+        ulong[] snapshots;
+        lock (_mutex) snapshots = SnapshotsForCompaction();
+        FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, mems, fileNumber, epoch, Identity, snapshots, blobBuilder, synchronous,
                 CancellationToken.None)
             .ConfigureAwait(false);
         if (meta is not null)
         {
             FileSystem.SyncDirectory(DbPaths[0]);
             RecordFlushBytes(meta.FileSize + BlobBytesWritten(blobBuilder));
+            // FlushJob::WriteLevel0Table logs this before the result is installed (and compactions are scheduled).
+            LogInfo("[" + cfd.Name + "] [JOB " + jobId + "] Level-0 flush table #" + meta.FileNumber + ": " + meta.FileSize + " bytes OK");
         }
 
         var edit = new VersionEdit
