@@ -121,6 +121,8 @@ dotnet test --project tests/RocksDb.Managed.RoundTrip -f net10.0   # env: ROUNDT
 dotnet run -c Release --project bench/RocksDb.Managed.Benchmarks -f net10.0 -- --filter '*'
 ```
 
+Benchmarks must measure warm code: the dbbench runner warms every workload on a throwaway DB (incl. flush and compaction) before the measured run and reports JIT-compiled methods during measurement (should be ~0); BenchmarkDotNet's default warm-up is used for micro-benchmarks. Never report cold (Tier-0/JIT) timings as steady-state performance.
+
 Before committing: the solution builds with **zero warnings** in new code on both TFMs, and unit +
 compat tests pass.
 
