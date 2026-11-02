@@ -17,6 +17,8 @@ internal sealed class CompactionJobStats
     public long NumInputRecords;
     public long NumOutputRecords;
     public long NumOutputRangeDeletions;
+    /// <summary>Output files written to the proximal level (per-key placement).</summary>
+    public int NumProximalOutputFiles;
     public CompactionIterationStats IterStats;
     public TimeSpan Elapsed;
 }
@@ -50,41 +52,18 @@ internal sealed class CompactionJob
     // Range tombstones to write (fragmented over all inputs, truncated to input file boundaries at user-key level).
     private FragmentedRangeTombstoneList? _outputTombstones;
     private byte[]? _fullHistoryTsLow;
-    private readonly int[] _rangeDelLevelPtrs;
 
-    // Current output.
-    private IWritableFile? _file;
-    private BlockBasedTableBuilder? _builder;
-    private FileMetaData? _meta;
-    private string? _path;
-    private readonly PooledBufferWriter _largestKey = new(64);
-    private bool _hasPointKey;
+    // The outputs to the output level and, with per-key placement, to the proximal level (CompactionOutputs of
+    // SubcompactionState); _out is the group the current key goes to (current_outputs_).
+    private readonly OutputGroup _lastLevelOutputs;
+    private readonly OutputGroup? _proximalOutputs;
+    private OutputGroup _out;
 
-    // Grandparent tracking (CompactionOutputs).
-    private int _grandparentIndex;
-    private bool _beingGrandparentGap = true;
-    private ulong _grandparentOverlappedBytes;
-    private int _grandparentBoundarySwitchedNum;
-    private bool _seenKey;
-
-    private bool _firstOutput = true;
-
-    // SST partitioner (CompactionOutputs::partitioner_): the prefix fast path (ShouldPartitionByPrefix) or the per-key
-    // ShouldPartition fallback with the previous output key.
-    private readonly SstPartitioner? _partitioner;
-    private byte[] _partitionerPrefix = [];
-    private int _partitionerPrefixLength;
-    private bool _partitionerPrefixValid;
-    private readonly PooledBufferWriter? _lastKeyForPartitioner;
-
-    // TTL-based cuts (CompactionOutputs::FillFilesToCutForTtl / UpdateFilesToCutForTTLStates).
-    private readonly List<FileMetaData>? _filesToCutForTtl;
-    private int _curFilesToCutForTtl = -1;
-    private int _nextFilesToCutForTtl;
-
-    // Round-robin split key (CompactionOutputs::local_output_split_key_ / is_split_).
-    private readonly byte[]? _outputSplitKey;
-    private bool _isSplit;
+    // CompactionJob::PrepareTimes: the seqno-to-time mapping of the inputs, the seqno up to which write times need not be
+    // preserved, and the seqno above which entries go to the proximal level.
+    private SeqnoToTimeMapping? _seqnoToTimeMapping;
+    private ulong _preserveSeqnoAfter;
+    private ulong _proximalAfterSeqno = DbFormat.MaxSequenceNumber;
 
     private readonly bool _targetFileSizeIsUpperBound;
 
@@ -105,18 +84,97 @@ internal sealed class CompactionJob
         _newFileNumber = newFileNumber;
         _cancellation = cancellation;
         _icmp = cfd.Icmp;
-        _rangeDelLevelPtrs = new int[compaction.NumberLevels];
         _noFillCache = new NoFillTableCache(cfd.TableCache);
-        // CompactionOutputs::CompactionOutputs: no partitioner and no TTL cuts for outputs to level 0.
-        if (compaction.OutputLevel != 0)
-        {
-            _partitioner = compaction.CreateSstPartitioner();
-            if (_partitioner is not null) _lastKeyForPartitioner = new PooledBufferWriter(64);
-            _filesToCutForTtl = FillFilesToCutForTtl(compaction);
-        }
-        // SetOutputSlitKey with a single subcompaction (no boundaries): the compaction's split key as is.
-        _outputSplitKey = compaction.OutputSplitKey;
+        _lastLevelOutputs = new OutputGroup(compaction, isProximalLevel: false);
+        _proximalOutputs = compaction.SupportsPerKeyPlacement ? new OutputGroup(compaction, isProximalLevel: true) : null;
+        _out = _lastLevelOutputs;
         _targetFileSizeIsUpperBound = compaction.Options.TargetFileSizeIsUpperBound;
+        _preserveSeqnoAfter = _earliestSnapshot;
+    }
+
+    /// <summary>
+    /// The output files of one output level (CompactionOutputs, db/compaction/compaction_outputs.{h,cc}): the open file
+    /// and builder, the grandparent / TTL / partitioner / split-key state of ShouldStopBefore, the range-del level
+    /// pointers and the finished outputs.
+    /// </summary>
+    private sealed class OutputGroup
+    {
+        public OutputGroup(Compaction compaction, bool isProximalLevel)
+        {
+            IsProximalLevel = isProximalLevel;
+            Level = isProximalLevel ? compaction.ProximalLevel : compaction.OutputLevel;
+            RangeDelLevelPtrs = new int[compaction.NumberLevels];
+            // CompactionOutputs::CompactionOutputs: no partitioner and no TTL cuts for outputs to level 0.
+            if (compaction.OutputLevel != 0)
+            {
+                Partitioner = compaction.CreateSstPartitioner();
+                if (Partitioner is not null) LastKeyForPartitioner = new PooledBufferWriter(64);
+                FilesToCutForTtl = FillFilesToCutForTtl(compaction);
+            }
+            // SetOutputSlitKey with a single subcompaction (no boundaries): the compaction's split key as is.
+            OutputSplitKey = compaction.OutputSplitKey;
+        }
+
+        public readonly bool IsProximalLevel;
+        /// <summary>The level the files are added to.</summary>
+        public readonly int Level;
+        public readonly List<FileMetaData> Outputs = new();
+
+        // Current output.
+        public IWritableFile? File;
+        public BlockBasedTableBuilder? Builder;
+        public FileMetaData? Meta;
+        public string? Path;
+        public readonly PooledBufferWriter LargestKey = new(64);
+        public bool HasPointKey;
+        public ulong SmallestPreferredSeqno = DbFormat.MaxSequenceNumber;
+
+        // Grandparent tracking.
+        public int GrandparentIndex;
+        public bool BeingGrandparentGap = true;
+        public ulong GrandparentOverlappedBytes;
+        public int GrandparentBoundarySwitchedNum;
+        public bool SeenKey;
+
+        public bool FirstOutput = true;
+
+        // SST partitioner (CompactionOutputs::partitioner_): the prefix fast path (ShouldPartitionByPrefix) or the
+        // per-key ShouldPartition fallback with the previous output key.
+        public readonly SstPartitioner? Partitioner;
+        public byte[] PartitionerPrefix = [];
+        public int PartitionerPrefixLength;
+        public bool PartitionerPrefixValid;
+        public readonly PooledBufferWriter? LastKeyForPartitioner;
+
+        // TTL-based cuts (CompactionOutputs::FillFilesToCutForTtl / UpdateFilesToCutForTTLStates).
+        public readonly List<FileMetaData>? FilesToCutForTtl;
+        public int CurFilesToCutForTtl = -1;
+        public int NextFilesToCutForTtl;
+
+        // Round-robin split key (CompactionOutputs::local_output_split_key_ / is_split_).
+        public readonly byte[]? OutputSplitKey;
+        public bool IsSplit;
+
+        // Level pointers of KeyRangeNotExistsBeyondOutputLevel in AddRangeDels.
+        public readonly int[] RangeDelLevelPtrs;
+
+        /// <summary>Releases the open output (on failure) and the pooled buffers.</summary>
+        public void Release()
+        {
+            LargestKey.Dispose();
+            LastKeyForPartitioner?.Dispose();
+            if (Builder is not null)
+            {
+                Builder.Abandon();
+                Builder.Dispose();
+                Builder = null;
+            }
+            if (File is not null)
+            {
+                File.Dispose();
+                File = null;
+            }
+        }
     }
 
     /// <summary>
@@ -170,7 +228,26 @@ internal sealed class CompactionJob
         public void Evict(ulong fileNumber) => inner.Evict(fileNumber);
     }
 
-    public List<FileMetaData> Outputs { get; } = new();
+    /// <summary>The output files of the output level.</summary>
+    public List<FileMetaData> Outputs => _lastLevelOutputs.Outputs;
+
+    /// <summary>With per-key placement: the output files of the proximal level (<see cref="Compaction.ProximalLevel"/>).</summary>
+    public List<FileMetaData> ProximalOutputs => _proximalOutputs?.Outputs ?? s_noOutputs;
+
+    private static readonly List<FileMetaData> s_noOutputs = new();
+
+    /// <summary>The output files of both levels (output level first).</summary>
+    public IEnumerable<FileMetaData> AllOutputs
+    {
+        get
+        {
+            foreach (FileMetaData f in Outputs) yield return f;
+            foreach (FileMetaData f in ProximalOutputs) yield return f;
+        }
+    }
+
+    /// <summary>The seqno above which entries were placed on the proximal level (proximal_after_seqno_).</summary>
+    internal ulong ProximalAfterSeqno => _proximalAfterSeqno;
     public CompactionJobStats Stats { get; } = new();
 
     /// <summary>File numbers of outputs created so far (also failed ones, for cleanup).</summary>
@@ -297,6 +374,7 @@ internal sealed class CompactionJob
             merge.FullHistoryTsLow = fullHistoryTsLow;
             merge.SnapshotChecker = SnapshotChecker;
         }
+        PrepareTimes();
         var iter = new CompactionIterator(input, _icmp, merge, _snapshots, earliestWriteConflict, rangeDel, _c, filter,
             _db.Options.EnforceSingleDelContracts, _cancellation)
         {
@@ -304,6 +382,7 @@ internal sealed class CompactionJob
             BlobProcessor = _blob,
             SnapshotChecker = SnapshotChecker,
             JobSnapshot = JobSnapshot,
+            PreserveSeqnoAfter = _preserveSeqnoAfter,
         };
         if (merge is not null) merge.BlobProcessor = _blob;
         try
@@ -311,24 +390,34 @@ internal sealed class CompactionJob
             input.SeekToFirst();
             for (iter.SeekToFirst(); iter.Valid; iter.Next())
             {
+                // Per-key placement: entries newer than proximal_after_seqno_ go to the proximal level
+                // (SubcompactionState::AddToOutput switches current_outputs_).
+                if (_proximalOutputs is not null) _out = iter.Sequence > _proximalAfterSeqno ? _proximalOutputs : _lastLevelOutputs;
                 // (The iterator is not moved across the await, so iter.Key stays valid.)
-                if (ShouldStopBefore(iter.Key) && _builder is not null)
+                if (ShouldStopBefore(iter.Key) && _out.Builder is not null)
                 {
                     await FinishOutputAsync(iter.Key, synchronous).ConfigureAwait(false);
                     // reset grandparent information
-                    _grandparentBoundarySwitchedNum = 0;
-                    _grandparentOverlappedBytes = GetCurrentKeyGrandparentOverlappedBytes(iter.Key);
+                    _out.GrandparentBoundarySwitchedNum = 0;
+                    _out.GrandparentOverlappedBytes = GetCurrentKeyGrandparentOverlappedBytes(iter.Key);
                 }
                 AddToOutput(iter);
             }
             Stats.IterStats = iter.Stats;
             Stats.NumInputRecords = iter.Stats.NumInputRecords;
-            if (_builder is null && _outputTombstones is not null && !(_c.BottommostLevel && AllTombstonesDroppable()))
+            // SubcompactionState::CloseCompactionFiles: the output level's outputs, then the proximal level's.
+            for (int g = 0; g < 2; g++)
             {
-                // Only range tombstones: they still need an output file.
-                OpenOutput();
+                OutputGroup? group = g == 0 ? _lastLevelOutputs : _proximalOutputs;
+                if (group is null) continue;
+                _out = group;
+                if (_out.Builder is null && _outputTombstones is not null && !(_c.BottommostLevel && AllTombstonesDroppable()))
+                {
+                    // Only range tombstones: they still need an output file.
+                    OpenOutput();
+                }
+                if (_out.Builder is not null) await FinishOutputAsync(ReadOnlySpan<byte>.Empty, synchronous).ConfigureAwait(false);
             }
-            if (_builder is not null) await FinishOutputAsync(ReadOnlySpan<byte>.Empty, synchronous).ConfigureAwait(false);
             if (BlobBuilder is not null)
             {
                 BlobBuilder.Finish();
@@ -348,50 +437,108 @@ internal sealed class CompactionJob
             _blob?.Dispose();
             BlobBuilder?.Abandon();
             input.Dispose();
-            _largestKey.Dispose();
-            _lastKeyForPartitioner?.Dispose();
-            if (_builder is not null)
-            {
-                _builder.Abandon();
-                _builder.Dispose();
-                _builder = null;
-            }
-            if (_file is not null)
-            {
-                _file.Dispose();
-                _file = null;
-            }
+            _lastLevelOutputs.Release();
+            _proximalOutputs?.Release();
             Stats.Elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(start);
         }
     }
+
+    /// <summary>
+    /// Port of CompactionJob::PrepareTimes (single subcompaction): with preserve_internal_time_seconds /
+    /// preclude_last_level_data_seconds the seqno-to-time mappings of the inputs (table property rocksdb.seqno.time.map)
+    /// are merged and give the cutoffs: sequence numbers above <see cref="_preserveSeqnoAfter"/> keep their value at the
+    /// bottommost level, and entries above <see cref="_proximalAfterSeqno"/> (also any visible to a snapshot when
+    /// precluding) are placed on the proximal level.
+    /// </summary>
+    private void PrepareTimes()
+    {
+        ulong preserveTimeMinSeqno = DbFormat.MaxSequenceNumber;
+        ulong precludeLastLevelMinSeqno = DbFormat.MaxSequenceNumber;
+        ColumnFamilyOptions o = _c.Options;
+        ulong preserveTimeDuration = new MinAndMaxPreserveSeconds(o).MaxPreserveSeconds;
+        if (preserveTimeDuration > 0)
+        {
+            var mapping = new SeqnoToTimeMapping();
+            // Setup seqno_to_time_mapping_ with relevant time range.
+            mapping.SetMaxTimeSpan(preserveTimeDuration);
+            for (int which = 0; which < _c.NumInputLevels; which++)
+            {
+                foreach (FileMetaData f in _c.Inputs(which).Files)
+                {
+                    try
+                    {
+                        using TableReaderLease lease = _cfd.TableCache.GetReader(f);
+                        string? error = mapping.DecodeFrom(lease.Reader.Properties.SequenceNumberTimeMapping);
+                        if (error is not null) _db.LogWarn("Problem reading or processing seqno-to-time mapping: Corruption: " + error);
+                    }
+                    catch (RocksDbException e)
+                    {
+                        _db.LogWarn("Problem reading or processing seqno-to-time mapping: " + e.Message);
+                    }
+                }
+            }
+            ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            mapping.Enforce(now);
+            mapping.GetCurrentTieringCutoffSeqnos(now, o.PreserveInternalTimeSeconds, o.PrecludeLastLevelDataSeconds,
+                ref preserveTimeMinSeqno, ref precludeLastLevelMinSeqno);
+            // For accuracy of the GetProximalSeqnoBeforeTime queries above, we only limit the capacity after them.
+            mapping.SetCapacity(SeqnoToTimeMapping.MaxSeqnoToTimeEntries);
+            _seqnoToTimeMapping = mapping;
+        }
+        if (preserveTimeDuration > 0 && TestPrecludeLastLevelMinSeqno is { } forced) precludeLastLevelMinSeqno = forced(precludeLastLevelMinSeqno);
+        // Restore the invariant preserve_time_min_seqno <= preclude_last_level_min_seqno (test override).
+        preserveTimeMinSeqno = Math.Min(precludeLastLevelMinSeqno, preserveTimeMinSeqno);
+        // Preserve sequence numbers for preserved write times and snapshots, though the specific sequence number of the
+        // earliest snapshot can be zeroed.
+        _preserveSeqnoAfter = Math.Min(Math.Max(preserveTimeMinSeqno, 1UL) - 1, _earliestSnapshot);
+        // If using preclude feature, also preclude snapshots from last level, just because they are heuristically more
+        // likely to be accessed than non-snapshot data.
+        if (precludeLastLevelMinSeqno < DbFormat.MaxSequenceNumber && _earliestSnapshot < precludeLastLevelMinSeqno)
+        {
+            precludeLastLevelMinSeqno = _earliestSnapshot;
+        }
+        // Combine what we would like to preclude from last level with what we can safely support without moving data
+        // back up the LSM tree (entries already in the last level outside the proximal output range stay there).
+        _proximalAfterSeqno = _c.SupportsPerKeyPlacement
+            ? Math.Max(precludeLastLevelMinSeqno, _c.KeepInLastLevelThroughSeqno)
+            : DbFormat.MaxSequenceNumber;
+    }
+
+    /// <summary>Test hook (sync point CompactionJob::PrepareTimes():preclude_last_level_min_seqno): overrides the cutoff.</summary>
+    internal static Func<ulong, ulong>? TestPrecludeLastLevelMinSeqno;
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void AddToOutput(CompactionIterator iter)
     {
         ReadOnlySpan<byte> key = iter.Key;
-        if (_builder is null)
+        if (_out.Builder is null)
         {
             OpenOutput();
-            if (_partitioner is not null) PrepareNewOutputForFirstKey(DbFormat.ExtractUserKey(key));
+            if (_out.Partitioner is not null) PrepareNewOutputForFirstKey(DbFormat.ExtractUserKey(key));
         }
         ReadOnlySpan<byte> value = iter.Value;
-        _builder!.Add(key, value);
-        if (_partitioner is not null && !_partitionerPrefixValid)
+        _out.Builder!.Add(key, value);
+        if (_out.Partitioner is not null && !_out.PartitionerPrefixValid)
         {
-            _lastKeyForPartitioner!.Clear();
-            _lastKeyForPartitioner.Write(DbFormat.ExtractUserKey(key));
+            _out.LastKeyForPartitioner!.Clear();
+            _out.LastKeyForPartitioner.Write(DbFormat.ExtractUserKey(key));
         }
         Stats.NumOutputRecords++;
         UpdateBoundaries(key, iter.Sequence);
+        if (iter.Type == EntryType.ValuePreferredSeqno && value.Length >= 8)
+        {
+            // CompactionOutputs::AddToOutput: the mapping written with the output must cover the preferred seqnos.
+            _out.SmallestPreferredSeqno = Math.Min(_out.SmallestPreferredSeqno, Coding.DecodeFixed64(value[^8..]));
+        }
         if (iter.Type == EntryType.BlobIndex)
         {
-            FlushJob.UpdateOldestBlobFileNumber(_meta!, value);
+            FlushJob.UpdateOldestBlobFileNumber(_out.Meta!, value);
             _blobGarbageMeter?.ProcessOutFlow(key, value);
         }
         else if (iter.Type == EntryType.WideColumnEntity)
         {
             // FileMetaData::UpdateBoundaries / BlobGarbageMeter::ProcessEntityBlobReferences: blob-backed entity columns.
-            FlushJob.UpdateOldestBlobFileNumberForEntity(_meta!, value);
+            FlushJob.UpdateOldestBlobFileNumberForEntity(_out.Meta!, value);
             _blobGarbageMeter?.ProcessOutFlow(key, value);
         }
     }
@@ -425,7 +572,7 @@ internal sealed class CompactionJob
     {
         ulong fileNumber = _newFileNumber();
         CreatedFileNumbers.Add(fileNumber);
-        _path = FileNames.TableFileName(_db.DbPaths, fileNumber, _c.OutputPathId);
+        _out.Path = FileNames.TableFileName(_db.DbPaths, fileNumber, _c.OutputPathId);
         ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         ulong oldestAncestor = _c.MinInputFileOldestAncestorTime();
         if (oldestAncestor == ulong.MaxValue) oldestAncestor = now;
@@ -451,7 +598,7 @@ internal sealed class CompactionJob
             // GetCompressionType / GetCompressionOptions with enable_compression = false.
             tbo = tbo with { CompressionType = Compression.CompressionType.None, CompressionOptions = _cfd.Options.CompressionOpts };
         }
-        _meta = new FileMetaData
+        _out.Meta = new FileMetaData
         {
             FileNumber = fileNumber,
             PathId = _c.OutputPathId,
@@ -459,7 +606,7 @@ internal sealed class CompactionJob
             OldestAncestorTime = oldestAncestor,
             NewestKeyTime = newestKeyTime,
             FileCreationTime = now,
-            Temperature = GetOutputTemperature(),
+            Temperature = _c.GetOutputTemperature(_out.IsProximalLevel),
             // user_defined_timestamps_persisted (persist_user_defined_timestamps): the outputs strip timestamps too.
             UserDefinedTimestampsPersisted = !_cfd.TimestampsInMemtableOnly,
         };
@@ -468,10 +615,10 @@ internal sealed class CompactionJob
             BytesPerSync = (long)Math.Min(_db.Options.BytesPerSync, long.MaxValue),
             MaxBufferSize = (int)Math.Clamp(_db.Options.WritableFileMaxBufferSize, 64 * 1024, int.MaxValue),
         };
-        _file = _db.FileSystem.CreateWritable(_path, truncate: true, fileOptions);
-        _builder = new BlockBasedTableBuilder(_file, _cfd.Format, tbo);
-        _hasPointKey = false;
-        _largestKey.Clear();
+        _out.File = _db.FileSystem.CreateWritable(_out.Path, truncate: true, fileOptions);
+        _out.Builder = new BlockBasedTableBuilder(_out.File, _cfd.Format, tbo);
+        _out.HasPointKey = false;
+        _out.LargestKey.Clear();
     }
 
     /// <summary>
@@ -480,41 +627,28 @@ internal sealed class CompactionJob
     /// </summary>
     private void PrepareNewOutputForFirstKey(ReadOnlySpan<byte> userKey)
     {
-        int len = _partitioner!.ShouldPartitionByPrefix(userKey);
-        _partitionerPrefixValid = len >= 0;
-        if (_partitionerPrefixValid)
+        int len = _out.Partitioner!.ShouldPartitionByPrefix(userKey);
+        _out.PartitionerPrefixValid = len >= 0;
+        if (_out.PartitionerPrefixValid)
         {
             if (len > userKey.Length) throw new InvalidOperationException("SstPartitioner.ShouldPartitionByPrefix returned a length beyond the key");
-            if (_partitionerPrefix.Length < len) _partitionerPrefix = new byte[Math.Max(len, 16)];
-            userKey[..len].CopyTo(_partitionerPrefix);
-            _partitionerPrefixLength = len;
+            if (_out.PartitionerPrefix.Length < len) _out.PartitionerPrefix = new byte[Math.Max(len, 16)];
+            userKey[..len].CopyTo(_out.PartitionerPrefix);
+            _out.PartitionerPrefixLength = len;
         }
-    }
-
-    /// <summary>
-    /// Port of Compaction::GetOutputTemperature (no proximal-level output): the picker's override (FIFO
-    /// kChangeTemperature), else last_level_temperature on the last level, else default_write_temperature. The managed
-    /// file system has a single tier, so the temperature is metadata only (MANIFEST, GetLiveFilesMetaData).
-    /// </summary>
-    private Temperature GetOutputTemperature()
-    {
-        if (_c.OutputTemperature != Temperature.Unknown) return _c.OutputTemperature;
-        ColumnFamilyOptions o = _c.Options;
-        if (_c.OutputLevel == _c.NumberLevels - 1 && o.LastLevelTemperature != Temperature.Unknown) return o.LastLevelTemperature;
-        return o.DefaultWriteTemperature;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void UpdateBoundaries(ReadOnlySpan<byte> key, ulong seq)
     {
-        FileMetaData meta = _meta!;
-        if (!_hasPointKey)
+        FileMetaData meta = _out.Meta!;
+        if (!_out.HasPointKey)
         {
             if (meta.Smallest.Length == 0 || _icmp.Compare(key, meta.Smallest) < 0) meta.Smallest = key.ToArray();
-            _hasPointKey = true;
+            _out.HasPointKey = true;
         }
-        _largestKey.Clear();
-        _largestKey.Write(key);
+        _out.LargestKey.Clear();
+        _out.LargestKey.Write(key);
         if (seq < meta.SmallestSeqno) meta.SmallestSeqno = seq;
         if (seq > meta.LargestSeqno) meta.LargestSeqno = seq;
     }
@@ -533,13 +667,13 @@ internal sealed class CompactionJob
 
     private async ValueTask FinishOutputCoreAsync(ReadOnlyMemory<byte> nextTableMinKey, bool synchronous)
     {
-        FileMetaData meta = _meta!;
-        if (_hasPointKey) meta.Largest = _largestKey.WrittenSpan.ToArray();
+        FileMetaData meta = _out.Meta!;
+        if (_out.HasPointKey) meta.Largest = _out.LargestKey.WrittenSpan.ToArray();
         if (_outputTombstones is not null) AddRangeDels(nextTableMinKey.Span);
-        BlockBasedTableBuilder builder = _builder!;
-        IWritableFile file = _file!;
-        _builder = null;
-        _file = null;
+        BlockBasedTableBuilder builder = _out.Builder!;
+        IWritableFile file = _out.File!;
+        _out.Builder = null;
+        _out.File = null;
         bool keep = false;
         try
         {
@@ -549,6 +683,13 @@ internal sealed class CompactionJob
             }
             else
             {
+                // CompactionOutputs::Finish -> SetSeqnoTimeTableProperties: the part of the inputs' seqno-to-time mapping
+                // relevant to this output.
+                if (_seqnoToTimeMapping is not null)
+                {
+                    builder.Properties.SequenceNumberTimeMapping = FlushJob.RelevantSeqnoToTimeMapping(_seqnoToTimeMapping,
+                        Math.Min(_out.SmallestPreferredSeqno, meta.SmallestSeqno), meta.LargestSeqno, 0);
+                }
                 if (synchronous) builder.Finish();
                 else await builder.FinishAsync(_cancellation).ConfigureAwait(false);
                 if (synchronous) file.Sync();
@@ -571,20 +712,21 @@ internal sealed class CompactionJob
             else await file.DisposeAsync().ConfigureAwait(false);
             if (!keep)
             {
-                try { _db.FileSystem.DeleteFile(_path!); }
+                try { _db.FileSystem.DeleteFile(_out.Path!); }
                 catch (IOException) { }
                 catch (RocksDbException) { }
             }
         }
-        _firstOutput = false;
+        _out.FirstOutput = false;
         if (!keep) return;
+        if (_out.IsProximalLevel) Stats.NumProximalOutputFiles++;
         DbIdentity id = _db.Identity;
         if (id.DbId.Length > 0 && id.SessionId.Length > 0)
         {
             OffsetableCacheKey.GetSstInternalUniqueId(id.DbId, id.SessionId, meta.FileNumber, out ulong id0, out ulong id1);
             meta.UniqueId = new UniqueId64x2(id0, id1);
         }
-        Outputs.Add(meta);
+        _out.Outputs.Add(meta);
         Stats.NumOutputFiles++;
         Stats.BytesWritten += meta.FileSize;
     }
@@ -602,12 +744,12 @@ internal sealed class CompactionJob
     private void AddRangeDels(ReadOnlySpan<byte> nextTableMinKey)
     {
         FragmentedRangeTombstoneList tombstones = _outputTombstones!;
-        FileMetaData meta = _meta!;
-        BlockBasedTableBuilder builder = _builder!;
+        FileMetaData meta = _out.Meta!;
+        BlockBasedTableBuilder builder = _out.Builder!;
         bool bottommost = _c.BottommostLevel;
 
         // Lower bound: none for the first output; otherwise the previous output's upper bound or this file's smallest.
-        byte[]? lowerBound = _firstOutput || meta.Smallest.Length == 0 ? null : meta.Smallest;
+        byte[]? lowerBound = _out.FirstOutput || meta.Smallest.Length == 0 ? null : meta.Smallest;
         byte[]? upperBound;
         if (nextTableMinKey.Length == 0)
         {
@@ -650,6 +792,13 @@ internal sealed class CompactionJob
                     if (stripe == prevKeptStripe) continue;
                     prevKeptStripe = stripe;
                 }
+                // Filter out by seqno for per-key placement (keep_seqno_range): range tombstones are split at the next
+                // seqno after proximal_after_seqno_, like the point entries.
+                if (_proximalOutputs is not null)
+                {
+                    ulong split = _proximalAfterSeqno < DbFormat.MaxSequenceNumber ? _proximalAfterSeqno + 1 : _proximalAfterSeqno;
+                    if (_out.IsProximalLevel ? seq < split : seq >= split) continue;
+                }
                 ReadOnlySpan<byte> ts = tsSize == 0 ? default : tombstones.GetTimestamp(i, k);
 
                 bool considerDrop = TombstoneConsiderDrop(tombstones, i, k);
@@ -674,7 +823,7 @@ internal sealed class CompactionJob
                 if (lowerBound is not null && _icmp.Compare(tStart, lowerBound) < 0) tStart = lowerBound;
                 byte[] endBuf = MakeInternalKey(fEnd, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion);
                 byte[] tEnd = upperBound is not null && _icmp.Compare(upperBound, endBuf) < 0 ? upperBound : endBuf;
-                if (considerDrop && _c.KeyRangeNotExistsBeyondOutputLevel(DbFormat.ExtractUserKey(tStart), DbFormat.ExtractUserKey(tEnd), _rangeDelLevelPtrs))
+                if (considerDrop && _c.KeyRangeNotExistsBeyondOutputLevel(DbFormat.ExtractUserKey(tStart), DbFormat.ExtractUserKey(tEnd), _out.RangeDelLevelPtrs))
                 {
                     Stats.IterStats.NumRangeDelDropObsolete++;
                     continue;
@@ -723,51 +872,51 @@ internal sealed class CompactionJob
         if (grandparents.Count == 0) return 0;
         // Move the grandparent_index_ to the file containing the current user_key. If there are multiple files
         // containing the same user_key, make sure the index points to the last file containing the key.
-        while (_grandparentIndex < grandparents.Count)
+        while (_out.GrandparentIndex < grandparents.Count)
         {
-            if (_beingGrandparentGap)
+            if (_out.BeingGrandparentGap)
             {
-                if (VersionStorageInfo.SstableKeyCompare(_icmp, internalKey, grandparents[_grandparentIndex].Smallest) < 0) break;
-                if (_seenKey)
+                if (VersionStorageInfo.SstableKeyCompare(_icmp, internalKey, grandparents[_out.GrandparentIndex].Smallest) < 0) break;
+                if (_out.SeenKey)
                 {
                     switched++;
-                    _grandparentOverlappedBytes += grandparents[_grandparentIndex].FileSize;
-                    _grandparentBoundarySwitchedNum++;
+                    _out.GrandparentOverlappedBytes += grandparents[_out.GrandparentIndex].FileSize;
+                    _out.GrandparentBoundarySwitchedNum++;
                 }
-                _beingGrandparentGap = false;
+                _out.BeingGrandparentGap = false;
             }
             else
             {
-                int cmp = VersionStorageInfo.SstableKeyCompare(_icmp, internalKey, grandparents[_grandparentIndex].Largest);
-                if (cmp < 0 || (cmp == 0 && (_grandparentIndex == grandparents.Count - 1
-                                             || VersionStorageInfo.SstableKeyCompare(_icmp, internalKey, grandparents[_grandparentIndex + 1].Smallest) < 0)))
+                int cmp = VersionStorageInfo.SstableKeyCompare(_icmp, internalKey, grandparents[_out.GrandparentIndex].Largest);
+                if (cmp < 0 || (cmp == 0 && (_out.GrandparentIndex == grandparents.Count - 1
+                                             || VersionStorageInfo.SstableKeyCompare(_icmp, internalKey, grandparents[_out.GrandparentIndex + 1].Smallest) < 0)))
                 {
                     break;
                 }
-                if (_seenKey)
+                if (_out.SeenKey)
                 {
                     switched++;
-                    _grandparentBoundarySwitchedNum++;
+                    _out.GrandparentBoundarySwitchedNum++;
                 }
-                _beingGrandparentGap = true;
-                _grandparentIndex++;
+                _out.BeingGrandparentGap = true;
+                _out.GrandparentIndex++;
             }
         }
         // If the first key is in the middle of a grandparent file, adding it to the overlap.
-        if (!_seenKey && !_beingGrandparentGap) _grandparentOverlappedBytes = GetCurrentKeyGrandparentOverlappedBytes(internalKey);
-        _seenKey = true;
+        if (!_out.SeenKey && !_out.BeingGrandparentGap) _out.GrandparentOverlappedBytes = GetCurrentKeyGrandparentOverlappedBytes(internalKey);
+        _out.SeenKey = true;
         return switched;
     }
 
     /// <summary>Port of GetCurrentKeyGrandparentOverlappedBytes.</summary>
     private ulong GetCurrentKeyGrandparentOverlappedBytes(ReadOnlySpan<byte> internalKey)
     {
-        if (_beingGrandparentGap) return 0;
+        if (_out.BeingGrandparentGap) return 0;
         List<FileMetaData> grandparents = _c.Grandparents;
-        if (_grandparentIndex >= grandparents.Count) return 0;
-        ulong overlapped = grandparents[_grandparentIndex].FileSize;
+        if (_out.GrandparentIndex >= grandparents.Count) return 0;
+        ulong overlapped = grandparents[_out.GrandparentIndex].FileSize;
         // go backwards to find all overlapped files, one key can overlap multiple files.
-        for (int i = _grandparentIndex - 1; i >= 0 && VersionStorageInfo.SstableKeyCompare(_icmp, internalKey, grandparents[i].Largest) == 0; i--)
+        for (int i = _out.GrandparentIndex - 1; i >= 0 && VersionStorageInfo.SstableKeyCompare(_icmp, internalKey, grandparents[i].Largest) == 0; i--)
         {
             overlapped += grandparents[i].FileSize;
         }
@@ -777,32 +926,32 @@ internal sealed class CompactionJob
     /// <summary>Port of CompactionOutputs::UpdateFilesToCutForTTLStates: true at the boundaries of old output-level files.</summary>
     private bool UpdateFilesToCutForTtlStates(ReadOnlySpan<byte> internalKey)
     {
-        List<FileMetaData> files = _filesToCutForTtl!;
-        if (_curFilesToCutForTtl != -1)
+        List<FileMetaData> files = _out.FilesToCutForTtl!;
+        if (_out.CurFilesToCutForTtl != -1)
         {
             // Previous key is inside the range of a file
-            if (_icmp.Compare(internalKey, files[_curFilesToCutForTtl].Largest) > 0)
+            if (_icmp.Compare(internalKey, files[_out.CurFilesToCutForTtl].Largest) > 0)
             {
-                _nextFilesToCutForTtl = _curFilesToCutForTtl + 1;
-                _curFilesToCutForTtl = -1;
+                _out.NextFilesToCutForTtl = _out.CurFilesToCutForTtl + 1;
+                _out.CurFilesToCutForTtl = -1;
                 return true;
             }
         }
         else
         {
             // Look for the key position
-            while (_nextFilesToCutForTtl < files.Count)
+            while (_out.NextFilesToCutForTtl < files.Count)
             {
-                if (_icmp.Compare(internalKey, files[_nextFilesToCutForTtl].Smallest) >= 0)
+                if (_icmp.Compare(internalKey, files[_out.NextFilesToCutForTtl].Smallest) >= 0)
                 {
-                    if (_icmp.Compare(internalKey, files[_nextFilesToCutForTtl].Largest) <= 0)
+                    if (_icmp.Compare(internalKey, files[_out.NextFilesToCutForTtl].Largest) <= 0)
                     {
                         // With in the current file
-                        _curFilesToCutForTtl = _nextFilesToCutForTtl;
+                        _out.CurFilesToCutForTtl = _out.NextFilesToCutForTtl;
                         return true;
                     }
                     // Beyond the current file
-                    _nextFilesToCutForTtl++;
+                    _out.NextFilesToCutForTtl++;
                 }
                 else
                 {
@@ -822,30 +971,30 @@ internal sealed class CompactionJob
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private bool ShouldStopBefore(ReadOnlySpan<byte> internalKey)
     {
-        ulong previousOverlappedBytes = _grandparentOverlappedBytes;
+        ulong previousOverlappedBytes = _out.GrandparentOverlappedBytes;
         int numGrandparentBoundariesCrossed = 0;
         bool shouldStopForTtl = false;
         // Always update grandparent information like overlapped file number, size etc., and TTL states.
         if (_c.OutputLevel > 0)
         {
             numGrandparentBoundariesCrossed = UpdateGrandparentBoundaryInfo(internalKey);
-            if (_filesToCutForTtl is not null) shouldStopForTtl = UpdateFilesToCutForTtlStates(internalKey);
+            if (_out.FilesToCutForTtl is not null) shouldStopForTtl = UpdateFilesToCutForTtlStates(internalKey);
         }
-        if (_builder is null) return false;
+        if (_out.Builder is null) return false;
         if (shouldStopForTtl) return true;
-        if (_partitioner is not null && ShouldPartition(internalKey)) return true;
+        if (_out.Partitioner is not null && ShouldPartition(internalKey)) return true;
         // files output to Level 0 won't be split
         if (_c.OutputLevel == 0) return false;
-        ulong currentOutputFileSize = _builder.FileSize;
+        ulong currentOutputFileSize = _out.Builder.FileSize;
         // reach the max file size
         ulong estimatedFileSize = currentOutputFileSize;
-        if (_targetFileSizeIsUpperBound) estimatedFileSize += _builder.EstimatedTailSize();
+        if (_targetFileSizeIsUpperBound) estimatedFileSize += _out.Builder.EstimatedTailSize();
         if (estimatedFileSize >= _c.MaxOutputFileSize) return true;
         // Check if it needs to split for RoundRobin. A null split key means we do not need to split.
-        if (_outputSplitKey is not null && !_isSplit && _icmp.Compare(internalKey, _outputSplitKey) >= 0)
+        if (_out.OutputSplitKey is not null && !_out.IsSplit && _icmp.Compare(internalKey, _out.OutputSplitKey) >= 0)
         {
             // Split occurs when the next key is larger than/equal to the cursor.
-            _isSplit = true;
+            _out.IsSplit = true;
             return true;
         }
         // only check if the current key is going to cross the grandparents file boundary (either the file beginning or ending).
@@ -853,18 +1002,18 @@ internal sealed class CompactionJob
         {
             // Cut the file before the current key if the size of the current output file + its overlapped grandparent
             // files is bigger than max_compaction_bytes.
-            if (_grandparentOverlappedBytes + currentOutputFileSize > _c.MaxCompactionBytes) return true;
+            if (_out.GrandparentOverlappedBytes + currentOutputFileSize > _c.MaxCompactionBytes) return true;
             // Cut the file if including the key is going to add a skippable file on the grandparent level AND its size is
             // reasonably big (1/8 of target file size).
-            int numSkippableBoundariesCrossed = _beingGrandparentGap ? 2 : 3;
+            int numSkippableBoundariesCrossed = _out.BeingGrandparentGap ? 2 : 3;
             if (_c.Options.CompactionStyle == CompactionStyle.Level && numGrandparentBoundariesCrossed >= numSkippableBoundariesCrossed
-                && _grandparentOverlappedBytes - previousOverlappedBytes > _c.TargetOutputFileSize / 8)
+                && _out.GrandparentOverlappedBytes - previousOverlappedBytes > _c.TargetOutputFileSize / 8)
             {
                 return true;
             }
             // Pre-cut the output file if it's reaching a certain size AND it's at the boundary of a grandparent file.
             if (_c.Options.CompactionStyle == CompactionStyle.Level
-                && currentOutputFileSize >= (_c.TargetOutputFileSize + 99) / 100 * (ulong)(50 + Math.Min(_grandparentBoundarySwitchedNum * 5, 40)))
+                && currentOutputFileSize >= (_c.TargetOutputFileSize + 99) / 100 * (ulong)(50 + Math.Min(_out.GrandparentBoundarySwitchedNum * 5, 40)))
             {
                 return true;
             }
@@ -876,13 +1025,13 @@ internal sealed class CompactionJob
     private bool ShouldPartition(ReadOnlySpan<byte> internalKey)
     {
         ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(internalKey);
-        if (_partitionerPrefixValid)
+        if (_out.PartitionerPrefixValid)
         {
             // Fast path: a partition is requested at the first key that no longer shares the established prefix. An
             // empty prefix means no further partitions (every key "starts with" it).
-            return !userKey.StartsWith(_partitionerPrefix.AsSpan(0, _partitionerPrefixLength));
+            return !userKey.StartsWith(_out.PartitionerPrefix.AsSpan(0, _out.PartitionerPrefixLength));
         }
         // Slow path: per-key callback.
-        return _partitioner!.ShouldPartition(_lastKeyForPartitioner!.WrittenSpan, userKey, _builder!.FileSize) == PartitionerResult.Required;
+        return _out.Partitioner!.ShouldPartition(_out.LastKeyForPartitioner!.WrittenSpan, userKey, _out.Builder!.FileSize) == PartitionerResult.Required;
     }
 }

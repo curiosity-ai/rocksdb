@@ -975,4 +975,156 @@ public sealed class CompactionPickerTests
         fx.Options.CompactionPri = CompactionPri.OldestLargestSeqFirst;
         Assert.IsNull(CompactionJob.FillFilesToCutForTtl(c));
     }
+    // ---- read-triggered compaction (compaction_picker_test.cc ReadTriggered*) -------------------------------------
+
+    private static void SetCollapsibleReads(FileMetaData f, uint n) => f.AddCollapsibleEntryReadsSampled(n);
+
+    [TestMethod]
+    public void ReadTriggeredCompactionDisabled()
+    {
+        var fx = new Fixture(6);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.0; // threshold=0 means disabled, no files should be marked
+        SetCollapsibleReads(fx.Add(0, 1, "100", "200", 1000), 999999);
+        Assert.AreEqual(0, fx.Build().ReadTriggeredCompactionFiles.Count);
+    }
+
+    [TestMethod]
+    public void ReadTriggeredCompactionBelowThreshold()
+    {
+        var fx = new Fixture(6);
+        fx.Options.ReadTriggeredCompactionThreshold = 1.0;
+        // file_size=1000, reads=500 => reads_per_byte=0.5 < 1.0
+        SetCollapsibleReads(fx.Add(0, 1, "100", "200", 1000), 500);
+        Assert.AreEqual(0, fx.Build().ReadTriggeredCompactionFiles.Count);
+    }
+
+    [TestMethod]
+    public void ReadTriggeredCompactionAboveThreshold()
+    {
+        var fx = new Fixture(6);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.5;
+        SetCollapsibleReads(fx.Add(0, 1, "100", "200", 1000), 600); // 0.6 > 0.5
+        SetCollapsibleReads(fx.Add(1, 2, "300", "400", 1000), 300); // 0.3 < 0.5 (not marked)
+        SetCollapsibleReads(fx.Add(2, 3, "500", "600", 1000), 800); // 0.8 > 0.5 (hottest)
+        fx.Add(4, 4, "700", "800", 1000); // L2 is not the last non-empty level
+        List<(int Level, FileMetaData File)> marked = fx.Build().ReadTriggeredCompactionFiles;
+        Assert.AreEqual(2, marked.Count);
+        // Sorted by reads_per_byte descending: file 3 (0.8) then file 1 (0.6)
+        Assert.AreEqual(3UL, marked[0].File.FileNumber);
+        Assert.AreEqual(1UL, marked[1].File.FileNumber);
+    }
+
+    [TestMethod]
+    public void ReadTriggeredCompactionIgnoresFifoAndFilesBeingCompacted()
+    {
+        var fx = new Fixture(1, CompactionStyle.Fifo);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.1;
+        SetCollapsibleReads(fx.Add(0, 1, "100", "200", 1000), 5000);
+        Assert.AreEqual(0, fx.Build().ReadTriggeredCompactionFiles.Count);
+
+        var lv = new Fixture(6);
+        lv.Options.ReadTriggeredCompactionThreshold = 0.1;
+        FileMetaData busy = lv.Add(1, 1, "100", "200", 1000);
+        SetCollapsibleReads(busy, 5000);
+        lv.Add(3, 2, "300", "400", 1000);
+        busy.BeingCompacted = true;
+        Assert.AreEqual(0, lv.Build().ReadTriggeredCompactionFiles.Count);
+    }
+
+    [TestMethod]
+    public void NeedsCompactionReadTriggered()
+    {
+        var fx = new Fixture(6);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.1;
+        SetCollapsibleReads(fx.Add(1, 1, "100", "200", 1000), 500);
+        fx.Add(3, 2, "300", "400", 1000);
+        VersionStorageInfo vs = fx.Build();
+        Assert.AreNotEqual(0, vs.ReadTriggeredCompactionFiles.Count);
+        Assert.IsTrue(fx.LevelPicker().NeedsCompaction(vs));
+    }
+
+    [TestMethod]
+    public void ReadTriggeredPicksFile()
+    {
+        var fx = new Fixture(6);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.1;
+        SetCollapsibleReads(fx.Add(1, 1, "100", "200", 1000), 500);
+        fx.Add(3, 2, "300", "400", 1000);
+        Compaction? c = fx.LevelPicker().PickCompaction(fx.Build(), []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.ReadTriggered, c.Reason);
+        Assert.AreEqual(1, c.StartLevel);
+        Assert.AreEqual(2, c.OutputLevel);
+    }
+
+    [TestMethod]
+    public void UniversalReadTriggeredCompaction()
+    {
+        const ulong FileSize = 100000;
+        var fx = new Fixture(5, CompactionStyle.Universal);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.001;
+        // Set trigger high so size amp / sorted run pickers don't fire
+        fx.Options.Level0FileNumCompactionTrigger = 10;
+        // Hot file at L2 with data at L4 below it
+        fx.Add(0, 1, "150", "200", FileSize, 500, 550);
+        SetCollapsibleReads(fx.Add(2, 2, "301", "350", FileSize, 201, 250), (uint)FileSize);
+        fx.Add(4, 3, "301", "400", FileSize, 101, 150);
+        VersionStorageInfo vs = fx.Build();
+        UniversalCompactionPicker picker = fx.UniversalPicker();
+        Assert.IsTrue(picker.NeedsCompaction(vs));
+        Compaction? c = picker.PickCompaction(vs, []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.ReadTriggered, c.Reason);
+        Assert.AreEqual(2, c.StartLevel);
+        Assert.AreEqual(4, c.OutputLevel);
+    }
+
+    [TestMethod]
+    public void ReadTriggeredSkipsLastLevel()
+    {
+        const ulong FileSize = 100000;
+        var fx = new Fixture(5, CompactionStyle.Universal);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.001;
+        fx.Options.Level0FileNumCompactionTrigger = 10;
+        fx.Add(0, 1, "150", "200", FileSize, 500, 550);
+        // File 3 is at the last non-empty level -- should NOT be marked for read-triggered compaction.
+        SetCollapsibleReads(fx.Add(4, 3, "301", "350", FileSize, 101, 150), (uint)FileSize);
+        Assert.AreEqual(0, fx.Build().ReadTriggeredCompactionFiles.Count);
+    }
+
+    [TestMethod]
+    public void UniversalReadTriggeredNoPickWhenNotMarked()
+    {
+        const ulong FileSize = 100000;
+        var fx = new Fixture(5, CompactionStyle.Universal);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.001;
+        fx.Add(0, 1, "150", "200", FileSize, 500, 550);
+        fx.Add(4, 3, "301", "350", FileSize, 101, 150);
+        VersionStorageInfo vs = fx.Build();
+        Assert.AreEqual(0, vs.ReadTriggeredCompactionFiles.Count);
+        // Not enough sorted runs to trigger compaction either
+        Assert.IsFalse(fx.UniversalPicker().NeedsCompaction(vs));
+    }
+
+    [TestMethod]
+    public void UniversalReadTriggeredIntraL0()
+    {
+        const ulong FileSize = 100000;
+        var fx = new Fixture(1, CompactionStyle.Universal);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.001;
+        fx.Options.Level0FileNumCompactionTrigger = 10;
+        // Single-level universal with overlapping L0 files; file 1 is hot.
+        SetCollapsibleReads(fx.Add(0, 1, "100", "300", FileSize, 500, 550), (uint)FileSize);
+        fx.Add(0, 2, "200", "400", FileSize, 400, 450);
+        VersionStorageInfo vs = fx.Build();
+        Assert.AreNotEqual(0, vs.ReadTriggeredCompactionFiles.Count);
+        UniversalCompactionPicker picker = fx.UniversalPicker();
+        Assert.IsTrue(picker.NeedsCompaction(vs));
+        Compaction? c = picker.PickCompaction(vs, []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.ReadTriggered, c.Reason);
+        Assert.AreEqual(0, c.StartLevel);
+        Assert.AreEqual(0, c.OutputLevel);
+        Assert.AreEqual(2, c.Inputs(0).Count);
+    }
 }

@@ -109,6 +109,12 @@ internal sealed class CompactionIterator : IDisposable
     /// <summary>job_snapshot_: the snapshot taken for the job when there is a snapshot checker.</summary>
     internal ulong JobSnapshot { get; init; }
 
+    /// <summary>
+    /// preserve_seqno_after_: sequence numbers above this are not zeroed at the bottommost level (their write time is
+    /// preserved for preserve_internal_time_seconds / preclude_last_level_data_seconds). Null: the earliest snapshot.
+    /// </summary>
+    internal ulong? PreserveSeqnoAfter { get; init; }
+
     /// <summary>current_key_committed_: whether the current version of the user key is committed in the job snapshot.</summary>
     private bool _currentKeyCommitted;
 
@@ -879,9 +885,10 @@ internal sealed class CompactionIterator : IDisposable
         // levels) and the earliest snapshot is larger than this seqno and the userkey differs from the last userkey in
         // compaction then we can squash the seqno to zero.
         if (_valid && _bottommostLevel && DefinitelyInSnapshot(_ikeySequence, _earliestSnapshot) && _ikeyType != EntryType.Merge
+            && _ikeySequence <= (PreserveSeqnoAfter ?? _earliestSnapshot)
             && _ikeyType != EntryType.Deletion && (_ikeyType != EntryType.SingleDeletion || _tsSize != 0))
         {
-            // BottommostSeqnoCanBeZeroed: seq <= preserve_seqno_after_ (= earliest snapshot without time preservation);
+            // BottommostSeqnoCanBeZeroed: seq <= preserve_seqno_after_ (the earliest snapshot without time preservation);
             // with user-defined timestamps only below full_history_ts_low.
             if (_tsSize == 0)
             {

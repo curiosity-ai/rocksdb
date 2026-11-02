@@ -28,6 +28,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
     private const string DefaultColumnFamilyName = ColumnFamilyDescriptor.DefaultColumnFamilyName;
 
     private readonly Lock _mutex = new();
+
+    /// <summary>The DB mutex, for tests that inspect state guarded by it.</summary>
+    internal Lock MutexForTests => _mutex;
+
     private readonly SnapshotList _snapshots = new();
     private readonly List<ulong> _aliveWals = new();          // WAL numbers that may still hold unflushed data (guarded by mutex)
     private readonly List<ulong> _obsoleteManifests = new();  // guarded by mutex
@@ -377,6 +381,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                             Temperature = f.Temperature,
                             OldestAncestorTime = f.OldestAncestorTime,
                             FileCreationTime = f.FileCreationTime,
+                            NumReadsSampled = f.NumReadsSampled,
                         });
                     }
                 }

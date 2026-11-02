@@ -254,7 +254,7 @@ internal sealed partial class DbImpl
         else
         {
             ls.BytesWritten = job.Stats.BytesWritten;
-            ls.NumOutputFiles = job.Outputs.Count;
+            ls.NumOutputFiles = job.Outputs.Count + job.ProximalOutputs.Count;
             ls.NumInputRecords = (ulong)job.Stats.NumInputRecords;
             ls.NumDroppedRecords = (ulong)Math.Max(0, job.Stats.NumInputRecords - job.Stats.NumOutputRecords);
         }
@@ -277,7 +277,7 @@ internal sealed partial class DbImpl
         if (_infoLog is null) return;
         if (job is not null)
         {
-            foreach (FileMetaData meta in job.Outputs)
+            foreach (FileMetaData meta in job.AllOutputs)
             {
                 LogInfo("[" + cfd.Name + "] [JOB " + jobId + "] Generated table #" + meta.FileNumber + ": " + meta.FileSize + " bytes");
                 LogEvent("\"cf_name\": " + Json(cfd.Name) + ", \"job\": " + jobId + ", \"event\": \"table_file_creation\", \"file_number\": " +
@@ -411,6 +411,8 @@ internal sealed partial class DbImpl
     {
         _statsDumpTimer?.Dispose();
         _statsDumpTimer = null;
+        StopCompactionTrigger();
+        StopRecordSeqnoTimeWorker();
         InfoLogger? log = _infoLog;
         if (log is null) return;
         LogInfo("Shutdown complete");

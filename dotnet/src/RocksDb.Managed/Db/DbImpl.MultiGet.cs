@@ -78,6 +78,7 @@ internal sealed partial class DbImpl
                     }
                     if (m == 0) continue;
                     await MultiGetFromFileAsync(cfd, f, batch, m, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
+                    SampleMultiGetReads(f, batch, m);
                     pending = RemoveDone(batch, order, pending);
                 }
                 // Sorted levels: one file per key (FindFile on the lookup key); consecutive keys of a file are grouped.
@@ -100,6 +101,7 @@ internal sealed partial class DbImpl
                         }
                         if (m == 0) continue;
                         await MultiGetFromFileAsync(cfd, f, batch, m, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
+                        SampleMultiGetReads(f, batch, m);
                     }
                     pending = RemoveDone(batch, order, pending);
                 }
@@ -132,6 +134,22 @@ internal sealed partial class DbImpl
         st.RecordTick(Ticker.NumberMultigetBytesRead, bytes);
         st.RecordInHistogram(Histogram.BytesPerMultiget, bytes);
         st.RecordElapsedMicros(Histogram.DbMultiget, startTimestamp);
+    }
+
+    /// <summary>
+    /// The read sampling of Version::MultiGetFromSST (version_set_sync_and_async.h) for the keys batch.Sub[0..count) just
+    /// looked up in <paramref name="f"/>. Upstream decides once per key (GetContext::sample_); a fresh draw per key and
+    /// file has the same rate.
+    /// </summary>
+    private static void SampleMultiGetReads(FileMetaData f, MultiGetBatch batch, int count)
+    {
+        int[] sub = batch.Sub;
+        for (int i = 0; i < count; i++)
+        {
+            if (!FileReadSample.ShouldSampleFileRead()) continue;
+            FileReadSample.SampleFileReadInc(f);
+            SampleCollapsibleRead(f, batch.Context(sub[i]));
+        }
     }
 
     /// <summary>Drops the keys whose lookup finished from the front <paramref name="pending"/> entries of <paramref name="order"/>.</summary>
