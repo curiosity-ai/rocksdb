@@ -417,13 +417,19 @@ internal sealed partial class DbImpl
         }
     }
 
+    /// <summary>Writeback granularity of a WAL without wal_bytes_per_sync (see <see cref="CreateWal"/>).</summary>
+    private const long WalWritebackBytes = 1 << 20;
+
     /// <summary>Creates WAL #<paramref name="number"/> (DBImpl::CreateWAL).</summary>
     private LogWriter CreateWal(ulong number)
     {
         string path = FileNames.LogFileName(WalDir, number);
         var fileOptions = new WritableFileOptions
         {
-            BytesPerSync = (long)Math.Min(Options.WalBytesPerSync, long.MaxValue),
+            // The WAL is fdatasync'ed when a memtable switch closes it (SwitchMemtableAsync), on the write path. Without
+            // wal_bytes_per_sync, its writeback is still started every WalWritebackBytes (sync_file_range WRITE, which
+            // does not wait) so that this sync only has to wait for the last chunk instead of the whole file.
+            BytesPerSync = Options.WalBytesPerSync != 0 ? (long)Math.Min(Options.WalBytesPerSync, long.MaxValue) : WalWritebackBytes,
             MaxBufferSize = (int)Math.Clamp(Options.WritableFileMaxBufferSize, 64 * 1024, int.MaxValue),
         };
         IWritableFile file = FileSystem.CreateWritable(path, truncate: true, fileOptions);

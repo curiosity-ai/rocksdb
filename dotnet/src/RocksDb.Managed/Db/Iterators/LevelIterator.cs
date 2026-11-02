@@ -74,11 +74,21 @@ public sealed class LevelIterator : InternalIterator
     public override bool Valid
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _fileIter is not null && _fileIter.Valid;
+        get => _fileIter is TableInternalIterator t ? t.Valid : _fileIter is not null && _fileIter.Valid;
     }
 
-    public override ReadOnlySpan<byte> Key => _fileIter!.Key;
-    public override ReadOnlySpan<byte> Value => _fileIter!.Value;
+    // File iterators are table iterators (unless a table cache returns another type): direct, inlinable calls.
+    public override ReadOnlySpan<byte> Key
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _fileIter is TableInternalIterator t ? t.Key : _fileIter!.Key;
+    }
+
+    public override ReadOnlySpan<byte> Value
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _fileIter is TableInternalIterator t ? t.Value : _fileIter!.Value;
+    }
 
     /// <summary>
     /// Port of FindFile (db/version_set.cc): index of the first file whose largest key is &gt;= <paramref name="key"/>,
@@ -157,7 +167,8 @@ public sealed class LevelIterator : InternalIterator
 
     public override void Next()
     {
-        _fileIter!.Next();
+        if (_fileIter is TableInternalIterator t) t.Next();
+        else _fileIter!.Next();
         SkipEmptyFileForward();
     }
 

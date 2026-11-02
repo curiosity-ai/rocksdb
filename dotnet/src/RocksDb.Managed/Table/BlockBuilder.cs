@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Buffers;
 using RocksDb.Managed.Util;
 
@@ -109,6 +110,7 @@ public sealed class BlockBuilder : IDisposable
 
     public int NumEntriesInCurrentRestart => _counter;
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Reset()
     {
         _buffer.Clear();
@@ -125,6 +127,7 @@ public sealed class BlockBuilder : IDisposable
     }
 
     /// <summary>Port of EstimateSizeAfterKV.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public int EstimateSizeAfterKV(int keyLength, int valueLength)
     {
         int estimate = CurrentSizeEstimate;
@@ -144,6 +147,7 @@ public sealed class BlockBuilder : IDisposable
     /// added key. <paramref name="deltaValue"/> is used instead of <paramref name="value"/> for non-restart entries
     /// with value delta encoding. <paramref name="skipDeltaEncoding"/> forces a full key (shared = 0).
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Add(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ReadOnlySpan<byte> deltaValue, bool skipDeltaEncoding)
     {
         System.Diagnostics.Debug.Assert(!_finished);
@@ -213,6 +217,7 @@ public sealed class BlockBuilder : IDisposable
     }
 
     /// <summary>Finishes building the block and returns its contents (valid until Reset/Dispose).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public ReadOnlySpan<byte> Finish()
     {
         if (_useCommonPrefix && _buffer.WrittenCount > 0 && _prefixLength > 0) RewriteRestartKeysStrippingPrefix();

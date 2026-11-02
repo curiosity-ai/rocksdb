@@ -72,7 +72,7 @@ internal sealed class IndexCursor
     }
 
     public BlockHandle Handle => _partitioned ? _part.BlockHandle : _top.BlockHandle;
-    public ReadOnlySpan<byte> Key => _partitioned ? _part.Key : _top.Key;
+    public ReadOnlySpan<byte> Key { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _partitioned ? _part.Key : _top.Key; }
 
     public void Seek(ReadOnlySpan<byte> target)
     {
@@ -104,6 +104,7 @@ internal sealed class IndexCursor
         SkipEmptyBackward();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Next()
     {
         if (!_partitioned) { _top.Next(); return; }
@@ -210,8 +211,8 @@ public sealed class BlockBasedTableIterator : IDisposable
     }
 
     /// <summary>Current internal key.</summary>
-    public ReadOnlySpan<byte> Key => _data.Key;
-    public ReadOnlySpan<byte> Value => _data.Value;
+    public ReadOnlySpan<byte> Key { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _data.Key; }
+    public ReadOnlySpan<byte> Value { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _data.Value; }
 
     public void SeekToFirst()
     {
@@ -258,6 +259,7 @@ public sealed class BlockBasedTableIterator : IDisposable
         FindKeyBackward();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Next()
     {
         System.Diagnostics.Debug.Assert(Valid);
@@ -272,6 +274,7 @@ public sealed class BlockBasedTableIterator : IDisposable
         FindKeyBackward();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void FindKeyForward()
     {
         while (!_data.Valid)
@@ -293,6 +296,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     }
 
     /// <summary>Loads the data block at the index position (keeps the current one if unchanged). False when the index is exhausted.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private bool LoadCurrentBlock()
     {
         if (!_index.Valid)

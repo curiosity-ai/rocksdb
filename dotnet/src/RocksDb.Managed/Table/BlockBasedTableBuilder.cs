@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Buffers;
 using System.Security.Cryptography;
 using System.Text;
@@ -209,6 +210,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
     public uint BaseContextChecksum => _baseContextChecksum;
 
     /// <summary>Port of BlockBasedTableBuilder::Add. May synchronously append staged output to the file.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Add(ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value)
     {
         AddCore(internalKey, value);
@@ -222,6 +224,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
         return _out.WrittenCount >= OutputFlushThreshold ? DrainOutputAsync(cancellationToken) : ValueTask.CompletedTask;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void AddCore(ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value)
     {
         if (_closed) throw new InvalidOperationException("Table builder already finished.");
@@ -266,6 +269,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
             or EntryType.DeletionWithTimestamp or EntryType.WideColumnEntity or EntryType.ValuePreferredSeqno;
 
     /// <summary>Port of FlushBlockBySizePolicy::Update.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private bool ShouldFlush(int keyLength, int valueLength)
     {
         if (_dataBlock.IsEmpty) return false;
@@ -277,6 +281,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
     }
 
     /// <summary>Port of BlockBasedTableBuilder::Flush + EmitBlock (buffering the block while sampling for a dictionary).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void Flush(ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext)
     {
         if (_dataBlock.IsEmpty) return;
@@ -297,6 +302,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
         _dataBlock.Reset();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void EmitBlock(ReadOnlySpan<byte> raw, ReadOnlySpan<byte> lastKey, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext)
     {
         BlockHandle handle = WriteBlock(raw, isDataBlock: true);
@@ -416,6 +422,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
     }
 
     /// <summary>Port of WriteBlock + CompressAndVerifyBlock (compression via the facade, with the ratio check).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private BlockHandle WriteBlock(ReadOnlySpan<byte> raw, bool isDataBlock)
     {
         CompressionType type = CompressionType.None;
@@ -445,6 +452,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
     }
 
     /// <summary>Port of WriteMaybeCompressedBlockImpl: payload + trailer (type byte, checksum with context).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private BlockHandle WriteMaybeCompressedBlock(ReadOnlySpan<byte> contents, CompressionType type)
     {
         var handle = new BlockHandle(_offset, (ulong)contents.Length);
@@ -459,6 +467,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
         return handle;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void DrainOutput()
     {
         if (_out.WrittenCount == 0) return;

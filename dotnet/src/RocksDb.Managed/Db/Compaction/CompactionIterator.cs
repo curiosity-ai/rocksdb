@@ -120,9 +120,9 @@ internal sealed class CompactionIterator : IDisposable
     public bool Valid => _valid;
 
     /// <summary>The current (output) internal key.</summary>
-    public ReadOnlySpan<byte> Key => _currentKey.Key;
+    public ReadOnlySpan<byte> Key { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _currentKey.Key; }
 
-    public ReadOnlySpan<byte> UserKey => _currentKey.UserKey;
+    public ReadOnlySpan<byte> UserKey { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _currentKey.UserKey; }
 
     public ulong Sequence => _ikeySequence;
 
@@ -143,12 +143,14 @@ internal sealed class CompactionIterator : IDisposable
         PrepareOutputIfNeeded();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Next()
     {
         NextImpl();
         PrepareOutputIfNeeded();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void PrepareOutputIfNeeded()
     {
         if (!_outputPrepared)
@@ -158,6 +160,7 @@ internal sealed class CompactionIterator : IDisposable
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void NextImpl()
     {
         _outputPrepared = false;
@@ -225,6 +228,7 @@ internal sealed class CompactionIterator : IDisposable
         return lo < s.Length ? s[lo] : DbFormat.MaxSequenceNumber;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private bool ParseInput(out ulong seq, out EntryType type, out int userKeyLength)
     {
         if (!DbFormat.TryParseInternalKey(_input.Key, out ParsedInternalKey p))
@@ -240,6 +244,7 @@ internal sealed class CompactionIterator : IDisposable
         return true;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private bool InputHasSameUserKey(out ulong seq, out EntryType type)
     {
         if (!_input.Valid || !ParseInput(out seq, out type, out int ukLen))
@@ -296,6 +301,7 @@ internal sealed class CompactionIterator : IDisposable
     }
 
     /// <summary>Port of CompactionIterator::NextFromInput.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void NextFromInput()
     {
         _atNext = false;
@@ -580,6 +586,7 @@ internal sealed class CompactionIterator : IDisposable
     }
 
     /// <summary>Port of CompactionIterator::PrepareOutput: zeroes the sequence number at the bottommost level when safe.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void PrepareOutput()
     {
         // Zeroing out the sequence number leads to better compression. If this is the bottommost level (no files in lower

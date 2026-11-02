@@ -32,6 +32,64 @@ public static class BuiltinFilterFormat
 }
 
 /// <summary>
+/// Keeps the hash-entry arrays of finished filter builders for the next builder. There is one builder per table file
+/// being written and its array grows to the file's key count (hundreds of KiB to MiBs, i.e. large object heap arrays).
+/// <see cref="ArrayPool{T}.Shared"/> did not keep these across the flush and compaction threads, so output files
+/// reallocated their array (and the doubling chain before it), which triggered gen2 collections under sustained
+/// writes. <see cref="Rent"/> hands out the largest retained array, so a new builder normally never grows.
+/// </summary>
+internal static class FilterEntryPool
+{
+    private const int MaxRetained = 8;
+    /// <summary>Arrays longer than this (8M entries = 64 MiB) are left to the GC.</summary>
+    private const int MaxRetainedLength = 8 << 20;
+    private static readonly ulong[]?[] s_items = new ulong[MaxRetained][];
+    private static readonly Lock s_gate = new();
+
+    /// <summary>An array of at least <paramref name="minLength"/> entries: the largest retained one if it is large enough.</summary>
+    public static ulong[] Rent(int minLength)
+    {
+        lock (s_gate)
+        {
+            int best = -1;
+            for (int i = 0; i < s_items.Length; i++)
+            {
+                ulong[]? a = s_items[i];
+                if (a is not null && a.Length >= minLength && (best < 0 || a.Length > s_items[best]!.Length)) best = i;
+            }
+            if (best >= 0)
+            {
+                ulong[] a = s_items[best]!;
+                s_items[best] = null;
+                return a;
+            }
+        }
+        return GC.AllocateUninitializedArray<ulong>(minLength);
+    }
+
+    /// <summary>Retains <paramref name="array"/>, replacing the smallest retained array when all slots are taken.</summary>
+    public static void Return(ulong[] array)
+    {
+        if (array.Length > MaxRetainedLength) return;
+        lock (s_gate)
+        {
+            int slot = -1;
+            for (int i = 0; i < s_items.Length; i++)
+            {
+                ulong[]? a = s_items[i];
+                if (a is null)
+                {
+                    slot = i;
+                    break;
+                }
+                if (a.Length < array.Length && (slot < 0 || a.Length < s_items[slot]!.Length)) slot = i;
+            }
+            if (slot >= 0) s_items[slot] = array;
+        }
+    }
+}
+
+/// <summary>
 /// Base for builders hashing keys with <see cref="Hash.GetSliceHash64"/> (port of XXPH3FilterBitsBuilder in
 /// table/block_based/filter_policy.cc). Hash entries are kept in a pooled growable buffer.
 /// Not thread-safe (like upstream, except <see cref="EstimatedEntries"/> which is a plain read).
@@ -114,7 +172,7 @@ public abstract class XxPh3FilterBitsBuilder : IFilterBitsBuilder
 
     private void Grow()
     {
-        ulong[] bigger = ArrayPool<ulong>.Shared.Rent(Math.Max(256, _entries.Length * 2));
+        ulong[] bigger = FilterEntryPool.Rent(Math.Max(256, _entries.Length * 2));
         _entries.AsSpan(0, _count).CopyTo(bigger);
         ReturnEntries();
         _entries = bigger;
@@ -122,7 +180,7 @@ public abstract class XxPh3FilterBitsBuilder : IFilterBitsBuilder
 
     private void ReturnEntries()
     {
-        if (_entries.Length > 0) ArrayPool<ulong>.Shared.Return(_entries);
+        if (_entries.Length > 0) FilterEntryPool.Return(_entries);
         _entries = [];
     }
 

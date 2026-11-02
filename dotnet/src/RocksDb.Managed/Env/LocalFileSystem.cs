@@ -625,6 +625,16 @@ internal sealed class LocalWritableFile : IWritableFile
     private void AppendSlow(ReadOnlySpan<byte> data)
     {
         ThrowIfDisposed();
+        if (_alignment == 0 && data.Length >= _capacity)
+        {
+            // An append at least as large as the buffer (e.g. the table builder's staged blocks) is written through
+            // instead of growing the buffer and copying it once more.
+            Flush();
+            WriteRaw(data, _filePos);
+            _filePos += data.Length;
+            MaybeRangeSync();
+            return;
+        }
         if (TryGrowBuffer(data.Length))
         {
             data.CopyTo(BufferSpan[_buffered..]);
@@ -664,7 +674,7 @@ internal sealed class LocalWritableFile : IWritableFile
             _buffered += data.Length;
             return ValueTask.CompletedTask;
         }
-        if (_alignment == 0 && TryGrowBuffer(data.Length))
+        if (_alignment == 0 && data.Length < _capacity && TryGrowBuffer(data.Length))
         {
             data.Span.CopyTo(BufferSpan[_buffered..]);
             _buffered += data.Length;

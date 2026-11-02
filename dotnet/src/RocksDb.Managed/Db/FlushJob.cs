@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using RocksDb.Managed.Cache;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Table;
@@ -93,6 +94,7 @@ internal static class FlushJob
     }
 
     /// <summary>K-way merge of the memtables' point entries (few inputs: linear minimum selection).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta)
     {
         int n = mems.Count;

@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using RocksDb.Managed.Table;
 
 namespace RocksDb.Managed.Db.Iterators;
@@ -57,13 +58,14 @@ public sealed class TableInternalIterator : InternalIterator
 
     public BlockBasedTableReader Reader => _lease.Reader;
 
-    public override bool Valid => _it.Valid;
-    public override ReadOnlySpan<byte> Key => _it.Key;
-    public override ReadOnlySpan<byte> Value => _it.Value;
+    public override bool Valid { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _it.Valid; }
+    public override ReadOnlySpan<byte> Key { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _it.Key; }
+    public override ReadOnlySpan<byte> Value { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _it.Value; }
     public override void SeekToFirst() => _it.SeekToFirst();
     public override void SeekToLast() => _it.SeekToLast();
     public override void Seek(ReadOnlySpan<byte> target) => _it.Seek(target);
     public override void SeekForPrev(ReadOnlySpan<byte> target) => _it.SeekForPrev(target);
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public override void Next() => _it.Next();
     public override void Prev() => _it.Prev();
 
