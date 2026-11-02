@@ -57,7 +57,10 @@ dotnet/
   tests/RocksDb.Managed.CompatTests/  binary-compat tests against native RocksDB (in-process)
   tests/RocksDb.Managed.RoundTrip/    managed<->native DB round trips; native side runs in a child process
                                       (the test host re-invokes itself) so native crashes are captured
-  src/RocksDb.Managed.Replication/    replication / switchover / Raft cluster layer (ported from rocksdb-sharp)
+  src/RocksDb.Managed.Replication/    replication / switchover / Raft cluster layer (ported from rocksdb-sharp), transport-agnostic
+  src/RocksDb.Managed.Replication.MagicOnion/  optional gRPC (MagicOnion) services/clients for it
+  tests/RocksDb.Managed.Replication.Tests/     in-process (in-memory transport), native-replica and gRPC tests
+  samples/{ReplicationTest,SwitchoverTest,ClusterTest}/  multi-process gRPC programs (ports of rocksdb-sharp's Tests/*)
   bench/RocksDb.Managed.Benchmarks/   BenchmarkDotNet: managed port vs native RocksDB
 ```
 

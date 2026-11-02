@@ -174,6 +174,25 @@ internal sealed partial class DbImpl
         }
     }
 
+    /// <summary>
+    /// Port of the archived-WAL branch of DBImpl::DeleteFile + WalManager::DeleteFile: deletes the archived WAL
+    /// <paramref name="number"/> and forgets its cached first sequence. Live WALs cannot be deleted
+    /// (upstream: "Delete only supported for archived logs").
+    /// </summary>
+    public void DeleteArchivedWalFile(ulong number)
+    {
+        ThrowIfDisposed();
+        if (_readOnly) ThrowHelper.NotSupported("DeleteFile is not supported in read-only mode");
+        string path = FileNames.ArchivedLogFileName(WalDir, number);
+        if (!FileSystem.FileExists(path))
+        {
+            if (FileSystem.FileExists(FileNames.LogFileName(WalDir, number))) ThrowHelper.NotSupported("Delete only supported for archived logs");
+            throw new RocksDbException(StatusCode.NotFound, "NotFound: " + path);
+        }
+        FileSystem.DeleteFile(path);
+        lock (_readFirstRecordCache) _readFirstRecordCache.Remove(number);
+    }
+
     // ---- sorted WAL files ------------------------------------------------------------------------------
 
     /// <summary>
@@ -470,10 +489,10 @@ internal sealed partial class DbImpl
             }
             else
             {
-                await log.WriteBufferAsync(ct).ConfigureAwait(false);
+                await log.WriteBufferAsync(CancellationToken.None).ConfigureAwait(false);
                 if (sync)
                 {
-                    await log.SyncAsync(ct).ConfigureAwait(false);
+                    await log.SyncAsync(CancellationToken.None).ConfigureAwait(false);
                     SyncWalDirIfNeeded();
                 }
             }

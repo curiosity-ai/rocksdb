@@ -16,8 +16,15 @@ internal sealed partial class DbImpl
     {
         Snapshot? snap = options?.Snapshot;
         if (snap is null) return Versions.LastSequence;
-        if (snap.Owner != this) ThrowHelper.InvalidArgument("snapshot does not belong to this DB or was released");
         return snap.SequenceNumber;
+    }
+
+    /// <summary>Validates the snapshot of <paramref name="options"/> (before any reference is taken).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ValidateReadSnapshot(ReadOptions? options)
+    {
+        Snapshot? snap = options?.Snapshot;
+        if (snap is not null && snap.Owner != this) ThrowHelper.InvalidArgument("snapshot does not belong to this DB or was released");
     }
 
     /// <summary>
@@ -27,8 +34,12 @@ internal sealed partial class DbImpl
     [SkipLocalsInit]
     public void Get(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, GetContext ctx)
     {
-        ulong snapshot = ReadSequence(options);
+        // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
+        // in between could drop the versions visible at that sequence (no snapshot protects them).
+        ValidateReadSnapshot(options);
         SuperVersion sv = GetReferencedSuperVersion(cfd);
+        TestHooks.Invoke("DBImpl::GetImpl:AfterSuperVersion");
+        ulong snapshot = ReadSequence(options);
         try
         {
             Span<byte> scratch = stackalloc byte[LookupKey.StackBufferSize];
@@ -127,8 +138,11 @@ internal sealed partial class DbImpl
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     public async ValueTask GetAsync(ColumnFamilyData cfd, ReadOptions? options, ReadOnlyMemory<byte> key, GetContext ctx, CancellationToken cancellationToken)
     {
-        ulong snapshot = ReadSequence(options);
+        // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
+        // in between could drop the versions visible at that sequence (no snapshot protects them).
+        ValidateReadSnapshot(options);
         SuperVersion sv = GetReferencedSuperVersion(cfd);
+        ulong snapshot = ReadSequence(options);
         PooledBufferWriter ikeyBuf = ObjectPools.RentWriter();
         try
         {
@@ -231,8 +245,11 @@ internal sealed partial class DbImpl
     /// </summary>
     public DbIteratorSources NewIteratorSources(ColumnFamilyData cfd, ReadOptions? options)
     {
-        ulong sequence = ReadSequence(options);
+        // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
+        // in between could drop the versions visible at that sequence (no snapshot protects them).
+        ValidateReadSnapshot(options);
         SuperVersion sv = GetReferencedSuperVersion(cfd);
+        ulong sequence = ReadSequence(options);
         var mems = new MemTable[1 + sv.Imm.Length];
         mems[0] = sv.Mem;
         sv.Imm.CopyTo(mems, 1);

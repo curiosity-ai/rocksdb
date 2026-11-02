@@ -124,6 +124,72 @@ test vectors added by this audit:
 | `Cache/CacheKey.cs`, `Cache/BlockCache.cs` | `cache/cache_key.cc`, `include/rocksdb/cache.h` | verified (existing tests) |
 | `Env/*` | `env/`, `file/` | reviewed for protocol (rename plus directory fsync, OFD LOCK interop is compat-tested). Not a persisted format. |
 
+## Db: database layer (audit #2)
+
+Audit of the DB layer against `db/db_impl/*.cc`, `db/version_set.cc`, `db/version_builder.cc`, `db/column_family.cc`,
+`db/write_thread.cc`, `db/flush_job.cc`, `db/memtable_list.cc`, `db/table_cache.cc`, `db/compaction/*`,
+`db/external_sst_file_ingestion_job.cc`, `db/transaction_log_impl.cc`, `db/wal_manager.cc`, `utilities/checkpoint` and
+`db/db_impl/db_impl_secondary.cc`. The focus was durability ordering, crash consistency, concurrency and semantics
+rather than formats (audit #1). Regression tests are in `tests/RocksDb.Managed.Tests/Db/DbLayerAuditTests.cs` and
+`Db/DbCrashConsistencyTests.cs` unless noted.
+
+New test infrastructure:
+
+- `Db/TestHooks.cs` (src): a lite TEST_SYNC_POINT. Named callbacks, invoked only in DEBUG builds
+  (`[Conditional("DEBUG")]`), at `DBImpl::RunCompaction:Start` / `:BeforeLogAndApply`,
+  `DBImpl::FlushMemTables:Start` / `:BeforeLogAndApply`, `VersionSet::LogAndApply:BeforeManifestWrite` and
+  `DBImpl::GetImpl:AfterSuperVersion`.
+- `tests/.../Db/FaultInjectionFileSystem.cs`: wraps `MemoryFileSystem`. It fails the N-th mutating operation (and
+  every later one, or only that one), optionally with a torn append, can fail the next append to a named file, and
+  counts open file handles and locks for leak checks.
+- `DbCrashConsistencyTests`: a deterministic workload (puts, deletes, range deletes, sync writes, manual flushes,
+  background flushes and compactions, two column families) crashed at about 300 operation indices. It covers power
+  loss (unsynced data and directory entries dropped) and process kill with torn writes. After each crash the test
+  checks that the DB reopens, that synced (or, for a kill, all acknowledged) writes survive, that the state equals
+  some prefix of the issued writes in both CFs, that Get and the iterator agree, and that the DB keeps working
+  afterwards. It also asserts that no file handle or LOCK leaks after a failed close or a failed open.
+- `ConcurrentStressWithInvariants` runs 2 x 2.5 s. Writers (async and batched) overwrite keys while readers do Get,
+  snapshot re-reads and full scans, a thread runs flushes and CompactRange, and another creates, flushes and drops
+  column families while one of their iterators is open. It checks that a key is never missing or mis-valued, that
+  a snapshot's view does not change, that iterator counts are right, that no background error occurs, and that
+  everything survives a reopen.
+
+| Area (managed) | C++ source(s) | Status |
+|---|---|---|
+| `VersionSet.LogAndApplyAsync`: edits for dropped column families | `version_set.cc` ProcessManifestWrites / LogAndApply (`IsDropped` -> ColumnFamilyDropped) | **fixed (high).** A flush or compaction that checked `Dropped` before calling LogAndApply could append its edit after the drop record. The next open then failed with "MANIFEST record referencing unknown column family", making the DB unopenable. LogAndApply now rejects the edit under the MANIFEST lock, which also serializes drops. |
+| `VersionSet.LogAndApplyAsync`: failed MANIFEST write | ProcessManifestWrites (`descriptor_log_.reset()`, keep the new MANIFEST when only the CURRENT update failed) | **fixed (high).** After a failed, possibly torn, append, later edits were appended to the same MANIFEST behind the torn record, and recovery dropped them (a column family created afterwards was lost). The next edit now rolls to a new MANIFEST. If writing a new MANIFEST succeeded but the CURRENT update failed, that MANIFEST is no longer deleted, since CURRENT may already name it. |
+| `VersionSet` last_sequence in edits | LogAndApplyHelper (`max_last_sequence` / `descriptor_last_sequence_`) | **fixed (medium, with ingestion below).** The recorded last sequence never decreases and covers the largest seqno of the added files. |
+| `DbImpl.Ingest` sequence publication | `DBImpl::IngestExternalFiles` (SetLastSequence after LogAndApply) | **fixed (medium).** The last sequence was published before the MANIFEST write, so a snapshot taken during that window had the ingested seqno but did not see the files, and its view changed once they were installed. It is now published together with the super version install. |
+| `DbImpl.Read` Get / GetAsync / NewIterator | `DBImpl::GetImpl`, `NewIteratorImpl` (reference SV, then read the sequence) | **fixed (medium).** The read sequence was taken before the super version. A flush followed by a (non-bottommost) compaction in between could drop the version visible at that sequence, so a Get returned an older, overwritten value. The deterministic test reproduces this: it returned `v0` after `v1` and `v2` were written. Snapshot validation now also happens before the reference, so a bad snapshot no longer leaks a super version reference. |
+| Drop CF during flush | `DBImpl::DropColumnFamilyImpl`, MemTableList refs, FlushJob | **fixed (medium).** Drop released the CF's immutable memtables while a flush still read them (arena freed under the reader). It also disposed the CF's table cache under readers, iterators and compactions that still held its versions. The flush also unreferenced the memtables a second time, which tripped an assert in debug builds. Now the flush holds its own memtable references, a drop that commits right after the flush's MANIFEST write is detected, and dropped CFs keep their table cache until close (their files are evicted as they become obsolete). |
+| `DbImpl.Open` WAL replay, point-in-time recovery | `RecoverLogFiles` / `MaybeReviseStopReplayForCorruption` / `MaybeHandleStopReplayForCorruptionForInconsistency` | **fixed (high).** After a corrupted record, PIT recovery stopped reading every later WAL. Upstream keeps reading and resumes when a record continues the sequence, which is the case for writes made after an earlier PIT recovery with `avoid_flush_during_recovery`. Those synced writes were lost on the next restart. An IO error is now fatal in PIT mode, and the "SST file contains data beyond the point of corruption" consistency check was added. Read-only open follows the same rules. |
+| `DbImpl.Write` group commit: cancellation | WriteImpl (no cancellation) | **fixed (medium).** The leader passed its own CancellationToken to the WAL append and sync. Cancelling the leader's call could abandon a half-written group record in the middle of the WAL (subsequent records then follow a torn one) and failed followers that never asked to be cancelled. WAL I/O is no longer cancellable once the group is committed, and FlushWAL is likewise not cancellable. |
+| `DbImpl.Write` SwitchMemtable failure | `DBImpl::SwitchMemtable` (SetBGError on failure) | **fixed (medium).** A failure creating the new WAL or syncing the old one leaked the new WAL's file handle and left writes enabled. The handle is now closed, the file deleted, and a background error set. Found by the crash sweep's handle-leak check. |
+| Close vs queued writers / unbatched operations | `DBImpl::CloseHelper`, WriteThread | **fixed (medium).** A writer or flush queued behind close became leader after close. Writers failed with a NullReferenceException wrapped as IOError (and set a background error); a queued flush could create a new WAL after the LOCK was released. Both now fail with ObjectDisposedException. |
+| `DbImpl.Open` column family options | `SanitizeCfOptions` (db/column_family.cc) | **fixed (medium).** Out-of-range options were used as given. They are now sanitized like upstream: write_buffer_size clipped to [64 KiB, 64 GiB], max_write_buffer_number >= 2, min_write_buffer_number_to_merge, num_levels (>= 2 for leveled, >= 3 for universal with ingest-behind), level0 trigger ordering (stop >= slowdown >= compaction trigger), FIFO L0 triggers, max_bytes_for_level_multiplier, soft/hard pending-compaction limits, dynamic level bytes only for leveled with one path, and max_compaction_bytes = 25 x target. The OPTIONS file records the sanitized values, like native. Two existing stall tests relied on unsanitized triggers and now block compaction with a test hook instead. Not ported: memtable factory and ttl/periodic adjustments (the managed defaults are already the sanitized values). |
+| WAL sync, MANIFEST + CURRENT ordering | `DBImpl::WriteToWAL`, `SyncWAL`, `SetCurrentFile`, `ProcessManifestWrites` | verified. The WAL is synced (plus a directory fsync for a new WAL) before a sync write is acknowledged. Unlike upstream, the managed SwitchMemtable syncs the old WAL eagerly instead of on the next sync write (stricter). A MANIFEST edit is synced before its version is installed. A new MANIFEST is fully written and synced, then CURRENT is written to a temp file, synced, renamed, and the directory fsynced. Table files are synced, and their directory fsynced, before the MANIFEST edit that adds them. |
+| Obsolete file deletion | `FindObsoleteFiles` / `PurgeObsoleteFiles` | verified. Table files become obsolete only when the last version referencing them is released, which happens after the MANIFEST edit that dropped them is durable and every reader (super version, iterator, compaction input version) is gone. A file moved trivially is referenced before the old version is released. WALs are deleted only below the minimum log number of all live CFs, never the current WAL. MANIFESTs are deleted only after the new one is installed. Deletions are deferred while `DisableFileDeletions` is in effect (checkpoints). |
+| `min_log_number_to_keep` (multi-CF, non-2PC) | `PrecomputeMinLogNumberToKeepNon2PC`, SwitchMemtable empty-CF log number bump | verified. Matches upstream, including the in-memory-only log number advance of empty CFs. Covered by the two-CF crash sweep. |
+| Sequence publication vs memtable visibility | WriteImpl (non-pipelined), `SetLastSequence` | verified. Sequences are allocated before the WAL write and published only after every memtable insert of the group, so readers never see a partial group. After recovery the last sequence is the maximum of the MANIFEST value and the last replayed record. |
+| Torn MANIFEST / WAL tails | `log::Reader`, VersionSet::Recover | verified by the process-kill sweep (torn appends at about 120 points). |
+| `WriteThread` | `db/write_thread.cc` | verified. Grouping rules match: no sync write under a non-sync leader, no mixing WAL-disabled or no_slowdown writers, size cap of leader size + 128 KiB. Leader handoff and pooled writers are correct. Known deviation: a leader that is cancelled while delayed by a write stall fails its whole group with OperationCanceledException (upstream has no cancellation). |
+| `FlushJob`, recovery flush | `flush_job.cc`, `builder.cc`, `WriteLevel0TableForRecovery` | verified. Known deviation (from audit #1): no entries are dropped at flush time. Recovery writes the L0 file and the new log number in one edit per CF; a crash between CFs is handled because each CF skips WALs below its own log number. |
+| `TableCache` | `db/table_cache.cc` | verified. Ref-counted handles: eviction and Evict on deletion close a reader only after the last lease is returned. Failed opens are not cached. |
+| `GetFromFile` unclipped tombstones | `TableCache::Get` | verified. Upstream also applies a file's tombstones unclipped for keys inside the file's range. Compaction outputs and the iterator/compaction aggregators truncate (`CompactionJob.CollectTruncated` at user-key granularity, which is equivalent for outputs because the point keys at the boundary are resolved by the seq-1 truncated aggregator). |
+| Compaction | `compaction_job.cc`, `compaction_outputs.cc`, `compaction_iterator.cc` | spot-checked: snapshots captured at pick time, input version referenced, outputs pending until installed and deleted on failure, edits refused for dropped CFs (above). Not re-audited line by line: the CompactionIterator rules (covered by existing tests). |
+| `ExternalSstFileIngestionJob` | `external_sst_file_ingestion_job.cc` | verified: level and seqno assignment (overlap means a new seqno; L0 for overlapping files), memtable overlap check with blocking flush, writes stopped during Run. Sequence publication was fixed (above). |
+| Checkpoint | `checkpoint_impl.cc`, `db_filesnapshot.cc` | verified: file deletions are disabled during the copy, the MANIFEST is trimmed to the installed size, CURRENT is replacement contents, the last WAL is trimmed, and the tmp directory is renamed with directory fsyncs. |
+
+Remaining risks:
+
+- The read-sequence race is fixed in DbImpl.Read.cs, which is currently the only place that computes a read
+  sequence. New read paths (for example a MultiGet batch, or prefix-seek iterators) must keep the same order:
+  super version first, then the sequence.
+- Close does not fsync the WAL (like upstream). Unsynced writes acknowledged before a close can be lost on power loss.
+- No automatic recovery from background errors (ErrorHandler auto-resume). After a failed flush or MANIFEST write
+  the DB stays read-only until it is reopened.
+- Secondary instances re-read the MANIFEST in full on every catch-up.
+
 ## Findings in out-of-scope files (for the coordinator)
 
 1. `Db/ColumnFamilyData.cs` passes `ColumnFamilyOptions.ArenaBlockSize` straight into `MemTableOptions`. With the new
