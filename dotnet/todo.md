@@ -220,8 +220,9 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [x] compaction filters on entities (FilterV4 + lazy WideColumnBlobResolver), MultiGetEntity, attribute groups (Put/Get/MultiGet), coalescing + attribute-group iterators, lazy entity reads (GetEntityLazy/MultiGetEntityLazy, ranged blob column reads); compat-tested vs native
   - [ ] WBWI MultiGetFromBatchAndDB, GetEntityFromBatchAndDB / MultiGetEntityFromBatchAndDB, txn entity APIs (S/M); lazy MultiResolve (S)
 - Table format / options / API
-  - [ ] hash index write (M); separated key/value data blocks (M); uniform block hint (S); super_block_alignment (S)
-  - [ ] user table-properties collectors (M); parallel compression (M); memtable prefix bloom (M); in-place updates (M); insert hints (S)
+  - [x] hash index (kHashSearch) read+write, separated key/value data blocks, uniform index hint, block_align, super_block_alignment (byte-identical vs native SstFileWriter)
+  - [x] user table-properties collectors (+ CompactOnDeletionCollector, NeedCompact), memtable prefix bloom, insert hints, in-place updates (+ callback)
+  - [ ] parallel compression (throughput only; output identical) (M); is_uniform hint used for index search on read (S); CompactForTieringCollector (S)
   - [ ] per-key protection info (L); per-SuperVersion options snapshot (M); mutable block-based table options (M)
   - [ ] WriteBatch ColumnFamily overloads (S); WriteOptions sync static (S); max_total_wal_size (S/M); lazy WAL sync on rotation (S)
   - [ ] shared table cache across CFs (S/M); best_efforts_recovery (M); WAL tracking in MANIFEST emit+verify (M); reads on dropped CF handle (S)
