@@ -17,7 +17,7 @@ namespace RocksDb.Managed;
 /// </para>
 /// Thread-safe. Dispose (preferably <see cref="DisposeAsync"/>) to close it and release the LOCK file.
 /// </summary>
-public sealed class RocksDatabase : IDisposable, IAsyncDisposable
+public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
 {
     private readonly DbImpl _db;
     private readonly ColumnFamily _default;

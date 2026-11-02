@@ -134,9 +134,47 @@ public sealed class MemoryFileSystem : IFileSystem
         string s = Normalize(source), t = Normalize(target);
         lock (_lock)
         {
+            if (_directories.Contains(s) && !_files.ContainsKey(s))
+            {
+                RenameDirectoryLocked(s, t);
+                return;
+            }
             if (!_files.Remove(s, out MemFile? f)) throw NotFound("While renaming a file to " + target, source);
             EnsureParentExists(t);
             _files[t] = f;
+        }
+    }
+
+    /// <summary>rename(2) of a directory: moves every file and subdirectory below it. Caller holds _lock.</summary>
+    private void RenameDirectoryLocked(string s, string t)
+    {
+        if (_directories.Contains(t) || _files.ContainsKey(t))
+            throw new RocksDbException(StatusCode.IOError, "IO error: While renaming a directory to " + t + ": " + s + ": target exists");
+        EnsureParentExists(t);
+        string prefix = s + Path.DirectorySeparatorChar;
+        var dirs = new List<string>();
+        foreach (string d in _directories)
+            if (d == s || d.StartsWith(prefix, StringComparison.Ordinal)) dirs.Add(d);
+        foreach (string d in dirs)
+        {
+            _directories.Remove(d);
+            _directories.Add(t + d[s.Length..]);
+        }
+        var files = new List<KeyValuePair<string, MemFile>>();
+        foreach (KeyValuePair<string, MemFile> kv in _files)
+            if (kv.Key.StartsWith(prefix, StringComparison.Ordinal)) files.Add(kv);
+        foreach (KeyValuePair<string, MemFile> kv in files)
+        {
+            _files.Remove(kv.Key);
+            _files[t + kv.Key[s.Length..]] = kv.Value;
+        }
+        var listings = new List<KeyValuePair<string, Dictionary<string, MemFile>>>();
+        foreach (KeyValuePair<string, Dictionary<string, MemFile>> kv in _durableListings)
+            if (kv.Key == s || kv.Key.StartsWith(prefix, StringComparison.Ordinal)) listings.Add(kv);
+        foreach (KeyValuePair<string, Dictionary<string, MemFile>> kv in listings)
+        {
+            _durableListings.Remove(kv.Key);
+            _durableListings[t + kv.Key[s.Length..]] = kv.Value;
         }
     }
 
@@ -182,6 +220,22 @@ public sealed class MemoryFileSystem : IFileSystem
         }
         return result;
     }
+
+    /// <summary>Hard link: both paths name the same file object afterwards (FileSystem::LinkFile).</summary>
+    public void LinkFile(string source, string target)
+    {
+        ThrowIfInactive();
+        string s = Normalize(source), t = Normalize(target);
+        lock (_lock)
+        {
+            if (!_files.TryGetValue(s, out MemFile? f)) throw NotFound("while link file to " + target, source);
+            EnsureParentExists(t);
+            if (_files.ContainsKey(t)) throw new RocksDbException(StatusCode.IOError, "IO error: while link file to " + target + ": " + source + ": File exists");
+            _files[t] = f;
+        }
+    }
+
+    public DateTimeOffset GetFileModificationTime(string path) => GetFile(path, "while stat a file for modification time").LastModified;
 
     public IDisposable LockFile(string path)
     {
@@ -267,6 +321,7 @@ public sealed class MemoryFileSystem : IFileSystem
     {
         public readonly Lock Lock = new();
         public byte[] Data = [];
+        public DateTimeOffset LastModified = DateTimeOffset.UtcNow;
         private long _length;
         private long _synced;
 
@@ -289,6 +344,7 @@ public sealed class MemoryFileSystem : IFileSystem
                 if (offset > _length) Data.AsSpan((int)_length, (int)(offset - _length)).Clear();
                 data.CopyTo(Data.AsSpan((int)offset));
                 if (end > _length) _length = end;
+                LastModified = DateTimeOffset.UtcNow;
             }
         }
 

@@ -34,6 +34,7 @@ internal sealed partial class DbImpl
     {
         ArgumentNullException.ThrowIfNull(batch);
         ThrowIfDisposed();
+        if (_readOnly) ThrowReadOnly();
         if (options is { Sync: true, DisableWal: true }) ThrowHelper.InvalidArgument("Sync writes has to enable WAL.");
         if (batch.DataSize < WriteBatch.HeaderSize) ThrowHelper.Corruption("malformed WriteBatch (too small)");
         if (validateColumnFamilies) ValidateColumnFamilies(batch, options?.IgnoreMissingColumnFamilies ?? false);
@@ -195,7 +196,11 @@ internal sealed partial class DbImpl
                     w.Error = e;
                 }
             }
-            if (total > 0) Versions.SetLastSequence(last);
+            if (total > 0)
+            {
+                Versions.SetLastSequence(last);
+                NotifySequenceWaiters();
+            }
         }
         catch (Exception e)
         {
