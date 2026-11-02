@@ -191,7 +191,8 @@ public sealed class DbBasicTests
     public void AutomaticFlushOnFullMemtable()
     {
         MemoryFileSystem fs = NewFs();
-        var cfo = new ColumnFamilyOptions { WriteBufferSize = 64 * 1024, ArenaBlockSize = 8 * 1024, MaxWriteBufferNumber = 3 };
+        // Auto compactions off so the flushed files stay in L0.
+        var cfo = new ColumnFamilyOptions { WriteBufferSize = 64 * 1024, ArenaBlockSize = 8 * 1024, MaxWriteBufferNumber = 3, DisableAutoCompactions = true };
         using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfo))
         {
             for (int i = 0; i < 5000; i++) db.Put(Key(i), Value(i, 0));

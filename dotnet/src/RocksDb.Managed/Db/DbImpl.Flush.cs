@@ -62,6 +62,9 @@ internal sealed partial class DbImpl
             {
                 if (m.FlushInProgress || m.FlushCompleted) continue;
                 m.FlushInProgress = true;
+                // The flush reads the memtable without the mutex: keep it alive even if the CF is dropped meanwhile
+                // (DropColumnFamily releases the CF's memtable references).
+                m.Mem.Ref();
                 picked.Add(m);
             }
             fileNumber = Versions.NewFileNumber();
@@ -92,6 +95,10 @@ internal sealed partial class DbImpl
         {
             lock (_mutex)
             {
+                foreach (ImmutableMemTable m in picked)
+                {
+                    if (m.Mem.Unref()) m.Mem.Dispose();
+                }
                 _pendingOutputs.Remove(fileNumber);
                 cfd.FlushRunning = false;
                 _runningFlushes--;
@@ -114,12 +121,17 @@ internal sealed partial class DbImpl
     /// <summary>Builds the L0 file for <paramref name="picked"/> and installs the result (FlushJob::Run + install).</summary>
     private async ValueTask FlushMemTablesAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch, bool synchronous)
     {
+        TestHooks.Invoke("DBImpl::FlushMemTables:Start");
         var mems = new List<MemTable>(picked.Count);
         foreach (ImmutableMemTable m in picked) mems.Add(m.Mem);
         string path = FileNames.TableFileName(DbPaths, fileNumber, 0);
         FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, mems, fileNumber, epoch, Identity, synchronous, CancellationToken.None)
             .ConfigureAwait(false);
-        if (meta is not null) FileSystem.SyncDirectory(DbPaths[0]);
+        if (meta is not null)
+        {
+            FileSystem.SyncDirectory(DbPaths[0]);
+            RecordFlushBytes(meta.FileSize);
+        }
 
         var edit = new VersionEdit
         {
@@ -138,6 +150,7 @@ internal sealed partial class DbImpl
                 edit.MinLogNumberToKeep = Math.Min(Versions.MinLogNumberWithUnflushedData(cfd), edit.LogNumber.Value);
             }
         }
+        TestHooks.Invoke("DBImpl::FlushMemTables:BeforeLogAndApply");
         await Versions.LogAndApplyAsync(cfd, edit, synchronous, CancellationToken.None).ConfigureAwait(false);
 
         lock (_mutex)
@@ -145,9 +158,10 @@ internal sealed partial class DbImpl
             foreach (ImmutableMemTable m in picked)
             {
                 m.FlushCompleted = true;
-                cfd.Imm.Remove(m);
-                if (m.Mem.Unref()) m.Mem.Dispose();
+                // A drop that committed right after our MANIFEST write already released the list's references.
+                if (cfd.Imm.Remove(m) && m.Mem.Unref()) m.Mem.Dispose();
             }
+            if (cfd.Dropped) return;
             InstallSuperVersion(cfd);
             _maybeStalled = IsWriteStalled();
         }

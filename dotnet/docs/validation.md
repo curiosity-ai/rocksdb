@@ -1,0 +1,202 @@
+# Validation of RocksDb.Managed against the C++ sources
+
+Audit of the managed port (`src/RocksDb.Managed`) against the C++ tree in the repository root (RocksDB 11.14, `main`).
+Each managed file was read side by side with the C++ files it cites. The audit checked:
+
+- on-disk constants, magic numbers, tags and enum values
+- byte order and field order
+- boundary conditions: empty input, truncated input, overflow
+- error paths: every C++ `Corruption` / `InvalidArgument` path has a managed equivalent
+- option defaults against `include/rocksdb/*options*.h` and `table.h`
+- algorithm fidelity
+- concurrency
+
+Status values used in the tables:
+
+- **verified**: matches upstream. Any differences are listed and harmless.
+- **fixed**: a discrepancy was found and corrected in this audit (regression tests in
+  `tests/RocksDb.Managed.Tests/Validation/AuditRegressionTests.cs` unless noted).
+- **known deviation**: intentional or accepted difference, with the reason.
+- **not ported**: an upstream feature a user could hit that the port lacks.
+
+The existing tests and the native compat tests back many "verified" entries. These include the byte-identical
+WriteBatch, SST, MANIFEST and filter comparisons and the WAL read/write tests in both directions. Ports of upstream
+test vectors added by this audit:
+
+- `db/db_iter_test.cc`: DBIterator1..14, SeekToLastOccurrenceSeq0, the lower-bound tests and a SeekForPrev
+  upper-bound clamp. See `Iterators/DbIterUpstreamTests.cs`.
+- `util/coding_test.cc`: fixed-width encodings, varints, overflow and truncation, length-prefixed slices, zigzag.
+- `db/dbformat_test.cc`: value-type validation in ParseInternalKey.
+
+## Util
+
+| Managed file | C++ source(s) | Status |
+|---|---|---|
+| `Util/Coding.cs` | `util/coding.h`, `util/coding_lean.h` | verified. Varint32 5th-byte truncation, overflow and truncation failures, and zigzag all match. Upstream coding_test vectors ported. |
+| `Util/Crc32C.cs` | `util/crc32c.{h,cc}` | verified (Mask/Unmask delta `0xa282ead8`, 3-way interleave equals the serial CRC; existing tests cover every length and alignment) |
+| `Util/Hash.cs` | `util/hash.{h,cc}`, `util/fastrange.h` | verified. `Hash()` sign-extends the tail bytes, seeds 0xbc9f1d34 / 397, Bijective(Un)Hash2x64 constants match. |
+| `Util/HashXxph3.cs` | `util/xxph3.h` | verified by upstream `hash_test.cc` vectors (existing tests) |
+| `Util/Comparator.cs`, `Util/Comparators.cs` | `include/rocksdb/comparator.h`, `util/comparator.cc` | verified. Bytewise and reverse separator/successor match line by line, as do IsSameLengthImmediateSuccessor and the u64ts ordering. |
+| `Util/ByteCompare.cs` | (memcmp) | verified (sign-equivalent to `SequenceCompareTo`, tested) |
+| `Util/PooledBufferWriter.cs` | (std::string buffers) | verified (no format impact) |
+
+## Compression
+
+| Managed file | C++ source(s) | Status |
+|---|---|---|
+| `Compression/CompressionType.cs` | `include/rocksdb/compression_type.h` | verified (byte values) |
+| `Compression/BlockCompression*.cs` | `util/compression.{h,cc}` (BuiltinCompressionManagerV2, StartCompressBlockV2, ExtractUncompressedSize), `block_based_table_builder.cc` (max_compressed_bytes_per_kb capped at 1023) | verified for framing, level sanitization and the LZ4/LZ4HC level mapping. Known deviations: (1) a configured BZip2/Xpress type stores blocks uncompressed, where upstream falls back to the default compressor; (2) LZ4 acceleration > 1 runs with acceleration 1; (3) zlib only compresses blocks of 16 KiB or less (.NET's 32 KiB deflate window); (4) the ZSTD frame checksum option is ignored. All output stays readable by native. **Not ported:** dictionary compression and parallel compression. |
+
+## WAL
+
+| Managed file | C++ source(s) | Status |
+|---|---|---|
+| `Wal/LogFormat.cs` | `db/log_format.h` | verified (record types 0..11, 130, 131; header sizes 7/11; safe-ignore mask) |
+| `Wal/LogWriter.cs` | `db/log_writer.{h,cc}` | verified. The fragmentation loop, the trailer, the legacy vs recyclable header choice (SetCompressionType always uses the legacy header) and the metadata records with MaybeSwitchToNewBlock all match. |
+| `Wal/LogReader.cs` | `db/log_reader.{h,cc}` (Reader) | verified. ReadPhysicalRecord, the per-recovery-mode corruption reporting, recycled-log handling, the uncompress loop, UnmarkEOF and predecessor-WAL verification all match. Upstream `log_test.cc` was already ported (47 tests). **Not ported:** XXH3 `record_checksum` output. |
+| `Wal/FragmentBufferedLogReader.cs` | `db/log_reader.cc` (FragmentBufferedReader) | verified (record-type switch and recycled-log handling) |
+| `Wal/WalMetadataRecords.cs` | `util/compression.h` (CompressionTypeRecord), `util/udt_util.h`, `db/dbformat.h` (PredecessorWALInfo) | verified |
+| `Wal/WalStreamingCompression.cs` | `util/compression.cc` (ZSTDStreamingCompress/Uncompress) | verified (`ZSTD_e_end` with the checksum flag on; same output loop condition) |
+
+## Table and filters
+
+| Managed file | C++ source(s) | Status |
+|---|---|---|
+| `Table/BlockBuilder.cs` | `table/block_based/block_builder.{h,cc}` | verified, including the fv8 common-prefix rewrite and the size estimate. **Not ported:** separated KV storage and the uniformity bit (both off by default). |
+| `Table/Block.cs` | `block.cc` (Block ctor), `data_block_footer.cc` | verified (footer bits 28..31, restart validation). A separated-KV block raises NotSupported. |
+| `Table/BlockIter.cs` | `block.cc`, `block_util.h` (DecodeEntry / DecodeKeyV4) | verified (3-byte minimum, shared/non-shared bounds, value-delta decoding) |
+| `Table/BlockHandle.cs` | `table/format.cc` (BlockHandle, IndexValue incl. fv8 escape) | verified |
+| `Table/Footer.cs` | `table/format.{h,cc}` (Footer, FooterBuilder) | verified (fv2..8, extended magic, context checksum, metaindex gap, legacy magic is NotSupported) |
+| `Table/BlockChecksum.cs` | `table/format.cc`, `reader_common.cc` | verified (XXH3 last-byte modifier, context modifier) |
+| `Table/BlockFetcher.cs` | `table/block_fetcher.cc` | verified (truncated read and checksum mismatch raise Corruption) |
+| `Table/DataBlockHashIndex.cs` | `data_block_hash_index.{h,cc}` | verified (sentinels 255/254, odd bucket count, Initialize bounds) |
+| `Table/IndexBuilder.cs` | `index_builder.{h,cc}` | verified by the byte-identical index-block compat tests. **Not ported:** partitioned index writing and hash index. |
+| `Table/TableProperties.cs` | `table/table_properties.cc`, `table/meta_blocks.cc` | verified. Property names match, unsorted keys raise Corruption, and malformed u64 values are skipped. Trivial difference: a malformed `rocksdb.deleted.keys` value is not copied to the user properties. |
+| `Table/BlockBasedTableBuilder.cs`, `BlockBasedTableReader.cs`, `BlockBasedTableIterator.cs`, `TableFormatOptions.cs`, `BlockCacheStatistics.cs` | `block_based_table_{builder,reader,iterator}.cc` | verified at the format level by the byte-identical SST compat tests (fv2..8 × checksums × compressions). **Not ported:** prefix extractor and prefix filters, partitioned filters, dictionary compression, user-defined timestamps, property collectors, super_block_alignment. |
+| `Table/Filters/FilterBitsReaders.cs` | `filter_policy.cc` (GetBuiltinFilterBitsReader) | verified. Every reserved or unknown encoding maps to AlwaysTrue, and an empty filter maps to AlwaysFalse. A Ribbon filter shorter than its metadata raises Corruption (undefined behavior upstream). |
+| `Table/Filters/BloomImpl.cs`, `FilterBitsBuilders.cs`, `Standard128Ribbon.cs`, `BuiltinFilterPolicies.cs`, `FilterContracts.cs` | `util/bloom_impl.h`, `filter_policy.cc`, `util/ribbon_*.h` | verified by the byte-identical filter compat tests. **Not ported:** `optimize_filters_for_memory` rounding on the build side. |
+
+## Db: formats, metadata and the memtable
+
+| Managed file | C++ source(s) | Status |
+|---|---|---|
+| `Db/DbFormat.cs` | `db/dbformat.{h,cc}` | **fixed.** `TryParseInternalKey` accepted every type below `kTypeMaxValid`, including the WAL-only types (LogData, ColumnFamily*, XID markers), and rejected `kTypeMaxValid`. It now implements `IsExtendedValueType` exactly, and `IsValueType` / `IsExtendedValueType` helpers were added. (low) |
+| `Db/InternalKey.cs` (InternalKey, LookupKey, IterKey) | `db/dbformat.h`, `db/lookup_key.h` | verified. `InternalKey.Valid` inherits the fix above. |
+| `Db/InternalKeyComparator.cs` | `db/dbformat.{h,cc}`, `index_builder.cc` (FindShortestInternalKeySeparator) | verified |
+| `Db/VersionEdit.cs` | `db/version_edit.{h,cc}`, `db/wal_edit.cc` | verified. All tags match, as do the NewFile4 custom-tag order, the forward-compat masks (`1<<13` and custom `1<<6`), the signed path_id, the u64 kNewFile seqno defaults and the error messages. `IsValidInternalKey` now delegates to `DbFormat.IsExtendedValueType`. Known deviation: string fields (db id, comparator, CF name) go through UTF-8, so CF names containing invalid UTF-8 bytes would not round-trip byte for byte. |
+| `Db/FileMetaData.cs` (+ BlobFileAddition/Garbage, WalAddition) | `db/version_edit.h`, `db/blob/blob_file_{addition,garbage}.cc`, `db/wal_edit.cc` | verified |
+| `Db/FileNames.cs` | `file/filename.cc`, `util/string_util.cc` (ConsumeDecimalNumber), `db/manifest_ops.cc` | verified (ParseFileName branch for branch, SetCurrentFile protocol, CURRENT parsing). The deviation for an info-log prefix match is documented in the file. |
+| `Db/Manifest.cs`, `Db/ManifestLog.cs` | `db/version_edit_handler.cc`, `db/version_set.cc` (AtomicGroupReadBuffer), `db/version_builder.cc`, `db/wal_edit.cc` (WalSet) | verified (atomic groups, CF add/drop, monotonic per-CF log numbers, max min-log, NewestFirstByEpochNumber and BySmallestKey). **Not ported:** comparator/num_levels validation, UDT boundary padding, point-in-time and best-efforts recovery (already in todo). |
+| `Db/WriteBatch.cs`, `Db/WriteBatchReader.cs`, `Db/IWriteBatchHandler.cs` | `db/write_batch.cc` | verified. Every tag and error string of ReadRecordFromWriteBatch is covered, along with the count check and TimedPut unpacking. A TimedPut value shorter than 8 bytes raises Corruption (undefined behavior upstream). |
+| `Db/MemTable.cs` | `db/memtable.{h,cc}` | **fixed.** Concurrency (medium): the fragmented range-tombstone cache published the list and its version as two separate fields. A reader racing a rebuild could pair the previous list with the new version and miss a tombstone visible to its snapshot (a deleted key could reappear). The list and version are now published together as one immutable object. The regression test is a stress test, so it may not catch the race on every run. Get/SaveValue and ShouldFlushNow were checked and match. |
+| `Db/MemTableSupport.cs`, `Db/MemTableRangeTombstones.cs` | `db/column_family.cc` (arena sanitize), `db/range_tombstone_fragmenter.cc` | verified. The fragmenter is a simplified port that keeps every seqno and applies snapshot striping at query time. |
+| `Db/GetContext.cs` | `table/get_context.cc` | verified (range-deletion override of value types) |
+| `Db/MergeHelper.cs`, `Db/MergeOperator.cs` | `db/merge_helper.{h,cc}`, `db/merge_context.h` | verified. Key choice and type rewrite after a full merge, the PartialMergeMulti fold, compaction-filter skip-until and the range-delete check per operand all match. **Not ported:** OpFailureScope::kMustMerge, blob and wide-column base values. |
+| `Db/MergeHelper.BuiltinOperators.cs` | `utilities/merge_operators/uint64add.cc`, `string_append/stringappend.cc`, `db/merge_operator.cc` | verified (names, malformed values count as 0, ',' delimiter) |
+| `Db/RangeDelAggregator.cs` | `db/range_del_aggregator.{h,cc}` (incl. TruncatedRangeDelIterator) | verified (truncation with kTypeMaxValid and seq-1, read and compaction stripes) |
+| `Memtable/InlineSkipList.cs` | `memtable/inlineskiplist.h` | verified. Node layout, splice logic and CAS insert match, with acquire/release on links. The random height uses 32-bit xorshift; this only affects performance. |
+| `Memory/Arena.cs`, `ConcurrentArena.cs`, `BlockBufferPool.cs` | `memory/arena.{h,cc}`, `memory/concurrent_arena.{h,cc}` | verified (OptimizeBlockSize clamp and alignment) |
+
+## Db: iterators
+
+| Managed file | C++ source(s) | Status |
+|---|---|---|
+| `Db/Iterators/DbIter.cs` | `db/db_iter.cc` | verified. FindNextUserEntry with the reseek, MergeValuesNewToOld, ReverseToForward / ReverseToBackward, PrevInternal, FindValueForCurrentKey(+UsingSeek), FindUserKeyBeforeSavedKey and bounds clamping were compared line by line, and 14 upstream tests were added. Known deviation: range tombstones use the pre-7.x ShouldDelete-per-entry scheme instead of tombstones in the merging heap; results are the same, but long deleted ranges are slower. **Not ported:** prefix seek, UDT, blob and wide columns, read callbacks. |
+| `Db/Iterators/MergingIterator.cs` | `table/merging_iterator.cc`, `util/heap.h` | verified (SwitchToForward / SwitchToBackward protocol) |
+| `Db/Iterators/LevelIterator.cs` | `db/version_set.cc` (LevelIterator) | verified. SeekForPrev before the first file reads file 0 instead of returning early; the result is the same. |
+| `Db/Iterators/Iterator.cs`, `DbIteratorFactory.cs`, `InternalIterator.cs`, `EmptyIterator.cs`, `MemTableInternalIterator.cs`, `TableInternalIterator.cs` | `db/arena_wrapped_db_iter.cc`, `table/internal_iterator.h` | verified (wrappers) |
+
+## Options
+
+| Managed file | C++ source(s) | Status |
+|---|---|---|
+| `Options/ColumnFamilyOptions.cs` | `include/rocksdb/{options,advanced_options}.h`, `db/column_family.cc` | **fixed.** `ArenaBlockSize` defaulted to 1 MiB, while upstream defaults to 0 and derives min(1 MiB, write_buffer_size/8), 4 KiB aligned. With a small `WriteBufferSize` a fresh memtable already asked for a flush: this is the todo item "small WriteBufferSize with default ArenaBlockSize trips Debug.Assert", and in release builds it caused flush churn. The default is now 0, which `MemTableOptions.GetEffectiveArenaBlockSize` already maps to the upstream derivation. (medium) Known deviation: OPTIONS files now carry `arena_block_size=0` (native writes the sanitized value); both sides load it. Other defaults checked: LZ4 compression, level0 20/36 triggers, 64 MiB target file size, 256 MiB level base, dynamic level bytes, max_sequential_skip 8. `ttl` stores the sanitized 30 days instead of the `0xfffffffffffffffe` sentinel. |
+| `Options/BlockBasedTableOptions.cs` | `include/rocksdb/table.h` | verified (fv7, XXH3, 4 KiB blocks, restart 16/1, decouple_partitioned_filters, optimize_filters_for_memory, readahead sizes) |
+| `Options/DbOptions.cs`, `CompressionOptions.cs`, `OperationOptions.cs`, `IngestExternalFileOptions.cs`, `OptionEnums.cs`, `OptionsBase.cs` | `include/rocksdb/options.h`, `compression_type.h` | verified (spot-checked defaults; enum values) |
+| `Options/OptionsFile.cs`, `OptionTypeInfo.cs` | `options/options_parser.cc`, `util/string_util.cc` (Escape/UnescapeOptionString) | verified (comment and escape handling, section rules, duplicate statements keep the first) |
+
+## Cache and Env
+
+| Managed file | C++ source(s) | Status |
+|---|---|---|
+| `Cache/LruCache.cs` | `cache/lru_cache.{h,cc}`, `cache/sharded_cache.cc` | verified (Release/Erase ref-count transitions, per-shard capacity rounding) |
+| `Cache/HyperClockCache.cs` | `cache/clock_cache.{h,cc}` (fixed table) | spot-checked: meta-word layout and the acquire/release counters. Covered by existing tests, not audited line by line. |
+| `Cache/CacheKey.cs`, `Cache/BlockCache.cs` | `cache/cache_key.cc`, `include/rocksdb/cache.h` | verified (existing tests) |
+| `Env/*` | `env/`, `file/` | reviewed for protocol (rename plus directory fsync, OFD LOCK interop is compat-tested). Not a persisted format. |
+
+## Db: database layer (audit #2)
+
+Audit of the DB layer against `db/db_impl/*.cc`, `db/version_set.cc`, `db/version_builder.cc`, `db/column_family.cc`,
+`db/write_thread.cc`, `db/flush_job.cc`, `db/memtable_list.cc`, `db/table_cache.cc`, `db/compaction/*`,
+`db/external_sst_file_ingestion_job.cc`, `db/transaction_log_impl.cc`, `db/wal_manager.cc`, `utilities/checkpoint` and
+`db/db_impl/db_impl_secondary.cc`. The focus was durability ordering, crash consistency, concurrency and semantics
+rather than formats (audit #1). Regression tests are in `tests/RocksDb.Managed.Tests/Db/DbLayerAuditTests.cs` and
+`Db/DbCrashConsistencyTests.cs` unless noted.
+
+New test infrastructure:
+
+- `Db/TestHooks.cs` (src): a lite TEST_SYNC_POINT. Named callbacks, invoked only in DEBUG builds
+  (`[Conditional("DEBUG")]`), at `DBImpl::RunCompaction:Start` / `:BeforeLogAndApply`,
+  `DBImpl::FlushMemTables:Start` / `:BeforeLogAndApply`, `VersionSet::LogAndApply:BeforeManifestWrite` and
+  `DBImpl::GetImpl:AfterSuperVersion`.
+- `tests/.../Db/FaultInjectionFileSystem.cs`: wraps `MemoryFileSystem`. It fails the N-th mutating operation (and
+  every later one, or only that one), optionally with a torn append, can fail the next append to a named file, and
+  counts open file handles and locks for leak checks.
+- `DbCrashConsistencyTests`: a deterministic workload (puts, deletes, range deletes, sync writes, manual flushes,
+  background flushes and compactions, two column families) crashed at about 300 operation indices. It covers power
+  loss (unsynced data and directory entries dropped) and process kill with torn writes. After each crash the test
+  checks that the DB reopens, that synced (or, for a kill, all acknowledged) writes survive, that the state equals
+  some prefix of the issued writes in both CFs, that Get and the iterator agree, and that the DB keeps working
+  afterwards. It also asserts that no file handle or LOCK leaks after a failed close or a failed open.
+- `ConcurrentStressWithInvariants` runs 2 x 2.5 s. Writers (async and batched) overwrite keys while readers do Get,
+  snapshot re-reads and full scans, a thread runs flushes and CompactRange, and another creates, flushes and drops
+  column families while one of their iterators is open. It checks that a key is never missing or mis-valued, that
+  a snapshot's view does not change, that iterator counts are right, that no background error occurs, and that
+  everything survives a reopen.
+
+| Area (managed) | C++ source(s) | Status |
+|---|---|---|
+| `VersionSet.LogAndApplyAsync`: edits for dropped column families | `version_set.cc` ProcessManifestWrites / LogAndApply (`IsDropped` -> ColumnFamilyDropped) | **fixed (high).** A flush or compaction that checked `Dropped` before calling LogAndApply could append its edit after the drop record. The next open then failed with "MANIFEST record referencing unknown column family", making the DB unopenable. LogAndApply now rejects the edit under the MANIFEST lock, which also serializes drops. |
+| `VersionSet.LogAndApplyAsync`: failed MANIFEST write | ProcessManifestWrites (`descriptor_log_.reset()`, keep the new MANIFEST when only the CURRENT update failed) | **fixed (high).** After a failed, possibly torn, append, later edits were appended to the same MANIFEST behind the torn record, and recovery dropped them (a column family created afterwards was lost). The next edit now rolls to a new MANIFEST. If writing a new MANIFEST succeeded but the CURRENT update failed, that MANIFEST is no longer deleted, since CURRENT may already name it. |
+| `VersionSet` last_sequence in edits | LogAndApplyHelper (`max_last_sequence` / `descriptor_last_sequence_`) | **fixed (medium, with ingestion below).** The recorded last sequence never decreases and covers the largest seqno of the added files. |
+| `DbImpl.Ingest` sequence publication | `DBImpl::IngestExternalFiles` (SetLastSequence after LogAndApply) | **fixed (medium).** The last sequence was published before the MANIFEST write, so a snapshot taken during that window had the ingested seqno but did not see the files, and its view changed once they were installed. It is now published together with the super version install. |
+| `DbImpl.Read` Get / GetAsync / NewIterator | `DBImpl::GetImpl`, `NewIteratorImpl` (reference SV, then read the sequence) | **fixed (medium).** The read sequence was taken before the super version. A flush followed by a (non-bottommost) compaction in between could drop the version visible at that sequence, so a Get returned an older, overwritten value. The deterministic test reproduces this: it returned `v0` after `v1` and `v2` were written. Snapshot validation now also happens before the reference, so a bad snapshot no longer leaks a super version reference. |
+| Drop CF during flush | `DBImpl::DropColumnFamilyImpl`, MemTableList refs, FlushJob | **fixed (medium).** Drop released the CF's immutable memtables while a flush still read them (arena freed under the reader). It also disposed the CF's table cache under readers, iterators and compactions that still held its versions. The flush also unreferenced the memtables a second time, which tripped an assert in debug builds. Now the flush holds its own memtable references, a drop that commits right after the flush's MANIFEST write is detected, and dropped CFs keep their table cache until close (their files are evicted as they become obsolete). |
+| `DbImpl.Open` WAL replay, point-in-time recovery | `RecoverLogFiles` / `MaybeReviseStopReplayForCorruption` / `MaybeHandleStopReplayForCorruptionForInconsistency` | **fixed (high).** After a corrupted record, PIT recovery stopped reading every later WAL. Upstream keeps reading and resumes when a record continues the sequence, which is the case for writes made after an earlier PIT recovery with `avoid_flush_during_recovery`. Those synced writes were lost on the next restart. An IO error is now fatal in PIT mode, and the "SST file contains data beyond the point of corruption" consistency check was added. Read-only open follows the same rules. |
+| `DbImpl.Write` group commit: cancellation | WriteImpl (no cancellation) | **fixed (medium).** The leader passed its own CancellationToken to the WAL append and sync. Cancelling the leader's call could abandon a half-written group record in the middle of the WAL (subsequent records then follow a torn one) and failed followers that never asked to be cancelled. WAL I/O is no longer cancellable once the group is committed, and FlushWAL is likewise not cancellable. |
+| `DbImpl.Write` SwitchMemtable failure | `DBImpl::SwitchMemtable` (SetBGError on failure) | **fixed (medium).** A failure creating the new WAL or syncing the old one leaked the new WAL's file handle and left writes enabled. The handle is now closed, the file deleted, and a background error set. Found by the crash sweep's handle-leak check. |
+| Close vs queued writers / unbatched operations | `DBImpl::CloseHelper`, WriteThread | **fixed (medium).** A writer or flush queued behind close became leader after close. Writers failed with a NullReferenceException wrapped as IOError (and set a background error); a queued flush could create a new WAL after the LOCK was released. Both now fail with ObjectDisposedException. |
+| `DbImpl.Open` column family options | `SanitizeCfOptions` (db/column_family.cc) | **fixed (medium).** Out-of-range options were used as given. They are now sanitized like upstream: write_buffer_size clipped to [64 KiB, 64 GiB], max_write_buffer_number >= 2, min_write_buffer_number_to_merge, num_levels (>= 2 for leveled, >= 3 for universal with ingest-behind), level0 trigger ordering (stop >= slowdown >= compaction trigger), FIFO L0 triggers, max_bytes_for_level_multiplier, soft/hard pending-compaction limits, dynamic level bytes only for leveled with one path, and max_compaction_bytes = 25 x target. The OPTIONS file records the sanitized values, like native. Two existing stall tests relied on unsanitized triggers and now block compaction with a test hook instead. Not ported: memtable factory and ttl/periodic adjustments (the managed defaults are already the sanitized values). |
+| WAL sync, MANIFEST + CURRENT ordering | `DBImpl::WriteToWAL`, `SyncWAL`, `SetCurrentFile`, `ProcessManifestWrites` | verified. The WAL is synced (plus a directory fsync for a new WAL) before a sync write is acknowledged. Unlike upstream, the managed SwitchMemtable syncs the old WAL eagerly instead of on the next sync write (stricter). A MANIFEST edit is synced before its version is installed. A new MANIFEST is fully written and synced, then CURRENT is written to a temp file, synced, renamed, and the directory fsynced. Table files are synced, and their directory fsynced, before the MANIFEST edit that adds them. |
+| Obsolete file deletion | `FindObsoleteFiles` / `PurgeObsoleteFiles` | verified. Table files become obsolete only when the last version referencing them is released, which happens after the MANIFEST edit that dropped them is durable and every reader (super version, iterator, compaction input version) is gone. A file moved trivially is referenced before the old version is released. WALs are deleted only below the minimum log number of all live CFs, never the current WAL. MANIFESTs are deleted only after the new one is installed. Deletions are deferred while `DisableFileDeletions` is in effect (checkpoints). |
+| `min_log_number_to_keep` (multi-CF, non-2PC) | `PrecomputeMinLogNumberToKeepNon2PC`, SwitchMemtable empty-CF log number bump | verified. Matches upstream, including the in-memory-only log number advance of empty CFs. Covered by the two-CF crash sweep. |
+| Sequence publication vs memtable visibility | WriteImpl (non-pipelined), `SetLastSequence` | verified. Sequences are allocated before the WAL write and published only after every memtable insert of the group, so readers never see a partial group. After recovery the last sequence is the maximum of the MANIFEST value and the last replayed record. |
+| Torn MANIFEST / WAL tails | `log::Reader`, VersionSet::Recover | verified by the process-kill sweep (torn appends at about 120 points). |
+| `WriteThread` | `db/write_thread.cc` | verified. Grouping rules match: no sync write under a non-sync leader, no mixing WAL-disabled or no_slowdown writers, size cap of leader size + 128 KiB. Leader handoff and pooled writers are correct. Known deviation: a leader that is cancelled while delayed by a write stall fails its whole group with OperationCanceledException (upstream has no cancellation). |
+| `FlushJob`, recovery flush | `flush_job.cc`, `builder.cc`, `WriteLevel0TableForRecovery` | verified. Known deviation (from audit #1): no entries are dropped at flush time. Recovery writes the L0 file and the new log number in one edit per CF; a crash between CFs is handled because each CF skips WALs below its own log number. |
+| `TableCache` | `db/table_cache.cc` | verified. Ref-counted handles: eviction and Evict on deletion close a reader only after the last lease is returned. Failed opens are not cached. |
+| `GetFromFile` unclipped tombstones | `TableCache::Get` | verified. Upstream also applies a file's tombstones unclipped for keys inside the file's range. Compaction outputs and the iterator/compaction aggregators truncate (`CompactionJob.CollectTruncated` at user-key granularity, which is equivalent for outputs because the point keys at the boundary are resolved by the seq-1 truncated aggregator). |
+| Compaction | `compaction_job.cc`, `compaction_outputs.cc`, `compaction_iterator.cc` | spot-checked: snapshots captured at pick time, input version referenced, outputs pending until installed and deleted on failure, edits refused for dropped CFs (above). Not re-audited line by line: the CompactionIterator rules (covered by existing tests). |
+| `ExternalSstFileIngestionJob` | `external_sst_file_ingestion_job.cc` | verified: level and seqno assignment (overlap means a new seqno; L0 for overlapping files), memtable overlap check with blocking flush, writes stopped during Run. Sequence publication was fixed (above). |
+| Checkpoint | `checkpoint_impl.cc`, `db_filesnapshot.cc` | verified: file deletions are disabled during the copy, the MANIFEST is trimmed to the installed size, CURRENT is replacement contents, the last WAL is trimmed, and the tmp directory is renamed with directory fsyncs. |
+
+Remaining risks:
+
+- The read-sequence race is fixed in DbImpl.Read.cs, which is currently the only place that computes a read
+  sequence. New read paths (for example a MultiGet batch, or prefix-seek iterators) must keep the same order:
+  super version first, then the sequence.
+- Close does not fsync the WAL (like upstream). Unsynced writes acknowledged before a close can be lost on power loss.
+- No automatic recovery from background errors (ErrorHandler auto-resume). After a failed flush or MANIFEST write
+  the DB stays read-only until it is reopened.
+- Secondary instances re-read the MANIFEST in full on every catch-up.
+
+## Findings in out-of-scope files (for the coordinator)
+
+1. `Db/ColumnFamilyData.cs` passes `ColumnFamilyOptions.ArenaBlockSize` straight into `MemTableOptions`. With the new
+   default of 0, the derivation happens in `MemTableOptions.GetEffectiveArenaBlockSize`, so no change is required.
+   The todo item "small WriteBufferSize with default ArenaBlockSize trips Debug.Assert" can be closed.
+2. `Db/DbImpl.Read.cs` `GetFromFile`: the file's range tombstones are applied without truncating them to the file
+   boundaries. This matches upstream TableCache::Get, so no change; it is noted for when range-tombstone truncation
+   in iterators is revisited.
+3. Callers of `DbFormat.TryParseInternalKey` (ExternalSstFileIngestionJob, TableCache range-del loading) now reject
+   WAL-only value types as corruption, as upstream does. No call sites needed changes.

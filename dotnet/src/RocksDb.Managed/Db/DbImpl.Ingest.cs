@@ -30,6 +30,7 @@ internal sealed partial class DbImpl
         if (files.Count == 0) ThrowHelper.InvalidArgument("The list of files is empty");
         var job = new ExternalSstFileIngestionJob(this, cfd, options);
         bool success = false;
+        BeginIngestion();
         try
         {
             await job.PrepareAsync(files, synchronous, ct).ConfigureAwait(false);
@@ -52,14 +53,15 @@ internal sealed partial class DbImpl
                             bool hasSnapshots = SnapshotCount > 0;
                             ulong last = Versions.LastSequence;
                             VersionEdit edit = job.Run(sv, last, hasSnapshots, out bool consumed);
-                            if (consumed)
-                            {
-                                Versions.AllocateSequence(1);
-                                Versions.SetLastSequence(last + 1);
-                            }
-                            await Versions.LogAndApplyAsync(cfd, edit, synchronous, ct).ConfigureAwait(false);
+                            if (consumed) Versions.AllocateSequence(1);
+                            // The MANIFEST edit records the files' largest seqno itself (VersionEdit.AddFile), so the last
+                            // sequence is published only once the files are installed: a snapshot taken while the MANIFEST
+                            // is written must not get the ingested files' seqno before they are visible (DBImpl::
+                            // IngestExternalFiles updates the last seqno after LogAndApply for the same reason).
+                            await Versions.LogAndApplyAsync(cfd, edit, synchronous, CancellationToken.None).ConfigureAwait(false);
                             lock (_mutex)
                             {
+                                if (consumed) Versions.SetLastSequence(last + 1);
                                 InstallSuperVersion(cfd);
                                 foreach (IngestedFileInfo f in job.Files) _pendingOutputs.Remove(f.FileNumber);
                             }
@@ -85,6 +87,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
+            EndIngestion();
             if (!success)
             {
                 job.DeleteInternalFiles();

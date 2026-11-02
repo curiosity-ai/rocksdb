@@ -24,6 +24,16 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public MergeOperator? MergeOperator { get; set; }
     public string? CompactionFilterName { get; set; }
     public string? CompactionFilterFactoryName { get; set; }
+    /// <summary>
+    /// The compaction filter used by the DB (not persisted; shared by all compactions, so it must be thread-safe). When
+    /// set, its <see cref="Managed.CompactionFilter.Name"/> is recorded as <see cref="CompactionFilterName"/>.
+    /// </summary>
+    public CompactionFilter? CompactionFilter { get; set; }
+    /// <summary>
+    /// Creates a compaction filter per compaction (not persisted). When set, its name is recorded as
+    /// <see cref="CompactionFilterFactoryName"/>. Ignored when <see cref="CompactionFilter"/> is set.
+    /// </summary>
+    public CompactionFilterFactory? CompactionFilterFactory { get; set; }
     /// <summary>Serialized prefix extractor id, e.g. "rocksdb.FixedPrefix.4" / "rocksdb.CappedPrefix.8"; null = none.</summary>
     public string? PrefixExtractor { get; set; }
     public string? MemtableInsertWithHintPrefixExtractor { get; set; }
@@ -41,9 +51,10 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public int MaxWriteBufferNumber { get; set; } = 2;
     public int MinWriteBufferNumberToMerge { get; set; } = 1;
     public long MaxWriteBufferSizeToMaintain { get; set; }
-    /// <summary>arena_block_size. 0 (the upstream default) derives it from <see cref="WriteBufferSize"/> when the column
-    /// family is opened: min(1 MiB, write_buffer_size / 8) aligned up to 4 KiB (SanitizeCfOptions in
-    /// db/column_family.cc). A fixed 1 MiB default made memtables with a small write buffer "full" on creation.</summary>
+    /// <summary>
+    /// arena_block_size. 0 (the default, as in include/rocksdb/advanced_options.h) derives it from
+    /// <see cref="WriteBufferSize"/> like SanitizeCfOptions: min(1 MiB, write_buffer_size / 8), 4 KiB aligned.
+    /// </summary>
     public ulong ArenaBlockSize { get; set; }
     public bool InplaceUpdateSupport { get; set; }
     public ulong InplaceUpdateNumLocks { get; set; } = 10000;
@@ -82,6 +93,10 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public bool DisableAutoCompactions { get; set; }
     public CompactionStyle CompactionStyle { get; set; } = CompactionStyle.Level;
     public CompactionPri CompactionPri { get; set; } = CompactionPri.MinOverlappingRatio;
+    /// <summary>FIFO compaction options (not persisted by the managed port yet).</summary>
+    public CompactionOptionsFifo CompactionOptionsFifo { get; set; } = new();
+    /// <summary>Universal compaction options (not persisted by the managed port yet).</summary>
+    public CompactionOptionsUniversal CompactionOptionsUniversal { get; set; } = new();
     public ulong MaxSequentialSkipInIterations { get; set; } = 8;
     public bool OptimizeFiltersForHits { get; set; }
     public bool ParanoidFileChecks { get; set; }
@@ -197,6 +212,10 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         var c = new ColumnFamilyOptions();
         c.CopyFrom(this);
         c.MergeOperator = MergeOperator;
+        c.CompactionFilter = CompactionFilter;
+        c.CompactionFilterFactory = CompactionFilterFactory;
+        c.CompactionOptionsFifo = CompactionOptionsFifo.Clone();
+        c.CompactionOptionsUniversal = CompactionOptionsUniversal.Clone();
         c.TableOptions = TableOptions.Clone();
         c.OtherTableFactoryOptions = OtherTableFactoryOptions is null ? null : new Dictionary<string, string>(OtherTableFactoryOptions, StringComparer.Ordinal);
         return c;

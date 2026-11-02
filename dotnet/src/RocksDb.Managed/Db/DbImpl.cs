@@ -32,6 +32,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     private readonly List<ulong> _aliveWals = new();          // WAL numbers that may still hold unflushed data (guarded by mutex)
     private readonly List<ulong> _obsoleteManifests = new();  // guarded by mutex
     private readonly HashSet<ulong> _pendingOutputs = new();  // table files being written (guarded by mutex)
+    private readonly List<ColumnFamilyData> _droppedColumnFamilies = new(); // table caches closed at shutdown (guarded by mutex)
     private IDisposable? _dbLock;
     private int _disposed;
 
@@ -185,6 +186,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         SuperVersion? old = cfd.SuperOrNull();
         cfd.SetSuper(sv);
         if (old is not null && old.Unref()) CleanupSuperVersion(old);
+        OnSuperVersionInstalled(cfd);
     }
 
     // ---- snapshots --------------------------------------------------------------------------------------
@@ -230,6 +232,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         try
         {
+            if (TryGetCompactionProperty(cfd, sv, property, out string? compactionValue)) return compactionValue;
             switch (property)
             {
                 case "rocksdb.num-entries-active-mem-table":
@@ -492,7 +495,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             }
         }
         // Become the (last) write leader so no write is in flight.
-        WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, CancellationToken.None).ConfigureAwait(false);
+        WriteThread.Writer w = await EnterUnbatchedCoreAsync(synchronous).ConfigureAwait(false);
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             _writeThread.ExitAsLeader();
@@ -502,6 +505,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         try
         {
             lock (_mutex) _shuttingDown = true;
+            CancelBackgroundCompactions();
             await WaitForBackgroundWorkAsync(synchronous).ConfigureAwait(false);
             LogWriter? log = _log;
             _log = null;
@@ -514,6 +518,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
             lock (_mutex)
             {
                 foreach (ColumnFamilyData cfd in Versions.ColumnFamilies) ReleaseColumnFamilyResources(cfd);
+                // Dropped column families keep their table cache open until close: readers and background jobs that
+                // still hold one of their versions read through it (their files are evicted as they become obsolete).
+                foreach (ColumnFamilyData cfd in _droppedColumnFamilies) cfd.TableCache.Dispose();
+                _droppedColumnFamilies.Clear();
             }
         }
         finally
@@ -530,6 +538,16 @@ internal sealed partial class DbImpl : IAsyncDisposable
     /// <summary>Drops the CF's references on its super version, memtables and version and closes its table cache. REQUIRES: mutex.</summary>
     private void ReleaseColumnFamilyResources(ColumnFamilyData cfd)
     {
+        ReleaseColumnFamilyMemTables(cfd);
+        cfd.TableCache.Dispose();
+    }
+
+    /// <summary>
+    /// Drops the CF's references on its super version and memtables (memtables still referenced by readers or a running
+    /// flush stay alive until those release them). REQUIRES: mutex.
+    /// </summary>
+    private void ReleaseColumnFamilyMemTables(ColumnFamilyData cfd)
+    {
         SuperVersion? sv = cfd.SuperOrNull();
         if (sv is not null && sv.Unref()) CleanupSuperVersion(sv);
         if (cfd.Mem is not null && cfd.Mem.Unref()) cfd.Mem.Dispose();
@@ -538,7 +556,6 @@ internal sealed partial class DbImpl : IAsyncDisposable
             if (m.Mem.Unref()) m.Mem.Dispose();
         }
         cfd.Imm.Clear();
-        cfd.TableCache.Dispose();
     }
 
     public ValueTask DisposeAsync() => CloseAsync(synchronous: false);

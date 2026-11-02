@@ -419,6 +419,43 @@ public sealed class ColumnFamily
 
     private static readonly FlushOptions s_waitFlush = new() { Wait = true };
 
+    /// <summary>
+    /// Compacts all data of this column family (DB::CompactRange with null bounds and default options): flushes the
+    /// memtable and compacts every level down to the last one. Blocks the caller for the duration.
+    /// </summary>
+    public void CompactRange() => CompactRange(s_defaultCompactRange, null, null);
+
+    /// <summary>Compacts the user key range [<paramref name="begin"/>, <paramref name="end"/>] (null = unbounded).</summary>
+    public void CompactRange(byte[]? begin, byte[]? end) => CompactRange(s_defaultCompactRange, begin, end);
+
+    /// <summary>
+    /// Port of DB::CompactRange: compacts [<paramref name="begin"/>, <paramref name="end"/>] (null = unbounded) honoring
+    /// <see cref="CompactRangeOptions"/> (bottommost level compaction, exclusive manual compaction, change level /
+    /// target level).
+    /// </summary>
+    public void CompactRange(CompactRangeOptions options, byte[]? begin, byte[]? end)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        _db.CompactRangeAsync(_cfd, begin, end, options, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+    }
+
+    /// <summary>Async <see cref="CompactRange()"/>: the compaction runs on a background thread.</summary>
+    public ValueTask CompactRangeAsync(CancellationToken cancellationToken = default) =>
+        CompactRangeAsync(s_defaultCompactRange, null, null, cancellationToken);
+
+    /// <summary>Async <see cref="CompactRange(byte[], byte[])"/>.</summary>
+    public ValueTask CompactRangeAsync(byte[]? begin, byte[]? end, CancellationToken cancellationToken = default) =>
+        CompactRangeAsync(s_defaultCompactRange, begin, end, cancellationToken);
+
+    /// <summary>Async <see cref="CompactRange(CompactRangeOptions, byte[], byte[])"/>.</summary>
+    public ValueTask CompactRangeAsync(CompactRangeOptions options, byte[]? begin, byte[]? end, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return _db.CompactRangeAsync(_cfd, begin, end, options, synchronous: false, cancellationToken);
+    }
+
+    private static readonly CompactRangeOptions s_defaultCompactRange = new();
+
     /// <summary>A DB property of this column family (DB::GetProperty), or null if unknown. See <see cref="RocksDatabase.GetProperty(string)"/>.</summary>
     public string? GetProperty(string property)
     {

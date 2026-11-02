@@ -25,8 +25,13 @@ public sealed record WalFileInfo(ulong LogNumber, WalFileType Type, ulong StartS
 /// </summary>
 public readonly struct WalBatch
 {
-    internal WalBatch(ReadOnlyMemory<byte> data)
+    /// <summary>
+    /// Wraps a serialized WriteBatch (e.g. one received over a replication transport). <paramref name="data"/> must hold
+    /// at least the 12-byte header (sequence, count).
+    /// </summary>
+    public WalBatch(ReadOnlyMemory<byte> data)
     {
+        if (data.Length < WriteBatch.HeaderSize) ThrowHelper.InvalidArgument("a serialized write batch has at least a 12-byte header");
         Data = data;
     }
 

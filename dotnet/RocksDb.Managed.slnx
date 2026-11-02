@@ -1,11 +1,19 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/RocksDb.Managed/RocksDb.Managed.csproj" />
+    <Project Path="src/RocksDb.Managed.Replication/RocksDb.Managed.Replication.csproj" />
+    <Project Path="src/RocksDb.Managed.Replication.MagicOnion/RocksDb.Managed.Replication.MagicOnion.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/RocksDb.Managed.Tests/RocksDb.Managed.Tests.csproj" />
     <Project Path="tests/RocksDb.Managed.CompatTests/RocksDb.Managed.CompatTests.csproj" />
     <Project Path="tests/RocksDb.Managed.RoundTrip/RocksDb.Managed.RoundTrip.csproj" />
+    <Project Path="tests/RocksDb.Managed.Replication.Tests/RocksDb.Managed.Replication.Tests.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/ReplicationTest/ReplicationTest.csproj" />
+    <Project Path="samples/SwitchoverTest/SwitchoverTest.csproj" />
+    <Project Path="samples/ClusterTest/ClusterTest.csproj" />
   </Folder>
   <Folder Name="/bench/">
     <Project Path="bench/RocksDb.Managed.Benchmarks/RocksDb.Managed.Benchmarks.csproj" />

@@ -86,6 +86,7 @@ internal sealed class ColumnFamilyData
             ArenaBlockSize = (int)Math.Min(options.ArenaBlockSize, int.MaxValue / 2),
         };
         TableCache = new TableCache(db.FileSystem, db.DbPaths, ReaderOptions, db.Options.MaxOpenFiles);
+        CompactionState = new ColumnFamilyCompactionState(options, Icmp);
     }
 
     public uint Id { get; }
@@ -99,6 +100,8 @@ internal sealed class ColumnFamilyData
     public MemTableOptions MemOptions { get; }
     public TableCache TableCache { get; }
     public int NumLevels { get; }
+    /// <summary>Compaction picker, write-stall token and compaction queue flag (guarded by the DB mutex).</summary>
+    public ColumnFamilyCompactionState CompactionState { get; }
 
     /// <summary>The public handle (created lazily).</summary>
     public ColumnFamily? Handle { get; set; }

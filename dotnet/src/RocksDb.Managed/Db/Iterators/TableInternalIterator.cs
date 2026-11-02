@@ -20,11 +20,14 @@ public sealed class TableInternalIterator : InternalIterator
     private bool _disposed;
 
     /// <summary>Iterates <paramref name="lease"/>'s reader; the lease is disposed with the iterator.</summary>
-    public TableInternalIterator(TableReaderLease lease)
+    public TableInternalIterator(TableReaderLease lease) : this(lease, TableReadFlags.None) { }
+
+    /// <summary>Iterates <paramref name="lease"/>'s reader with block-cache <paramref name="flags"/> (e.g. no cache fill for compaction).</summary>
+    public TableInternalIterator(TableReaderLease lease, TableReadFlags flags)
     {
         if (lease.Reader is null) throw new ArgumentException("lease has no reader", nameof(lease));
         _lease = lease;
-        _it = lease.Reader.NewIterator();
+        _it = lease.Reader.NewIterator(flags);
     }
 
     /// <summary>Iterates <paramref name="reader"/> without owning it.</summary>

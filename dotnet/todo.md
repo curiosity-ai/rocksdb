@@ -94,19 +94,22 @@ P = perf + block cache wiring (Table/, Cache/, Memtable/, Util/).
 - [x] Iterators: MergingIterator, LevelIterator, DBIter, public `Iterator` (+foreach, ScanAsync), `DbIteratorFactory` — matches native exactly on multi-level DB with snapshots/bounds
 - [ ] Iterators: range tombstones in heap (skip deleted ranges), prefix seek, async reverse movement, blob/wide columns
 - [x] Merge: `MergeHelper` (TimedFullMerge, MergeUntil), `UInt64AddOperator`, `StringAppendOperator`; `RangeDelAggregator` (read + compaction w/ snapshot stripes); `CompactionFilter` contract
-- [ ] Compaction: leveled (picker + job), universal later; compaction filter; background scheduling
+- [x] Compaction: leveled (dynamic level bytes, all compaction pris, trivial move, intra-L0, TTL/periodic), CompactionIterator, CompactionJob, scheduling, write stalls + delayed-write token bucket, CompactRange/WaitForCompact, compaction filters (+TTL), universal (size-amp/ratio/count), FIFO (TTL/size/intra-L0)
+- [x] Compat: managed-compacted DB valid & readable natively, native multi-level DB compacted by managed, randomized differential vs native
+- [ ] Compaction gaps: subcompactions, async input reads, compensated size (deletion boost), bottommost files marked for compaction, persist round-robin cursors, universal periodic/delete-triggered/incremental, FIFO temperature/kv-ratio, persist universal/fifo options to OPTIONS, CompactFiles, drop CF waits for running compaction
 - [x] Range deletions (DeleteRange) end-to-end (memtable, flush, SST, Get, iterators)
 - [x] Single delete (read path)
 - [x] TTL value format + `TtlDatabase` (compatible with native OpenWithTtl)
 - [ ] Wire `TtlCompactionFilter` into compaction; TTL iterator wrapper
-- [ ] Bug: small WriteBufferSize with default ArenaBlockSize trips Debug.Assert in memtable ctor (sanitize like upstream)
+- [x] Bug: small WriteBufferSize with default ArenaBlockSize (fixed: default 0 → derived like upstream)
 - [x] GetLiveFilesMetadata
 - [x] GetUpdatesSince (`TransactionLogIterator`, `TailUpdatesAsync` signalled by write path, WAL archival, FragmentBufferedLogReader) — identical sequences/bytes to native both ways
 - [x] Checkpoint (hard links via `IFileSystem.LinkFile`), Disable/EnableFileDeletions, GetLiveFiles, GetSortedWalFiles, FlushWal/SyncWal
 - [x] SstFileWriter public API + IngestExternalFiles (level picking, global seqno in MANIFEST) — compat both ways
 - [x] Replication round trip (checkpoint + tail into managed and native replicas)
 - [ ] Ingestion: WriteGlobalSeqno, IngestBehind, overlapping files in one call, running-compaction checks
-- [ ] Port rocksdb-sharp Replication/ layer onto the new API (mapping in phase-2b report: checkpoint seq + TailUpdatesAsync replaces WalTailer)
+- [x] Ported rocksdb-sharp Replication/ + Switchover/ + Cluster/ (Raft) into `src/RocksDb.Managed.Replication` (transport-agnostic, no polling, pooled WalBatch, IFileSystem-aware) + `src/RocksDb.Managed.Replication.MagicOnion` (gRPC) + `samples/` — 30 tests incl. gRPC on localhost and a native replica
+- [ ] Replication: network-partition cluster test; handoff hold 100–220 ms vs 10–50 ms reported by rocksdb-sharp (investigate); replication benchmarks
 - [x] Read-only and secondary open (+TryCatchUpWithPrimary over a live native primary)
 - [ ] Secondary: tail MANIFEST incrementally instead of re-reading
 - [x] GetProperty (subset)
@@ -131,7 +134,22 @@ With block cache (8 MiB both engines, 200k ops, data > cache):
 Perf follow-ups: flush is ~2x slower than native and allocates 6 MB; cache-miss read path allocates ~44 B/op;
 HyperClock slots as array-of-structs; single-threaded cached table Get +18% vs plain dictionary.
 
+With compaction (1M ops, 16B/100B, 4MB write buffer, no compression, shared box):
+| | native µs/op | managed µs/op | managed alloc/op |
+|---|---|---|---|
+| fillrandom | 7.12 | 4.06 | 35 B (per-file, not per-key) |
+| readrandom | 15.08 | 8.26 | 8.8 B |
+| overwrite | 6.26 | 3.72 | 75 B |
+Write-amp: fill 3.42 native vs 3.24 managed; overwrite 4.12 vs 4.17.
+
 ## Phase 3 — Compat + performance
+Goal: finish implementation, validate vs C++ source, comprehensive tests (unit/integration/round-trip) and benchmarks (managed vs rocksdb-sharp vs pure C native).
+- [x] Source audit #1 vs C++ (`docs/validation.md`): ~90 files (formats/util/table/wal/options/memtable/iterators); fixed memtable range-tombstone publish race, ArenaBlockSize default (0 → derived), internal-key type validation; added db_iter_test vectors
+- [ ] Source audit #2: DB layer (DbImpl*, VersionSet/Version, Compaction/*, FlushJob, WriteThread, recovery, ingestion, checkpoint, secondary)
+- [x] Three-way benchmark suite: C benchmark on librocksdb (`bench/native-c`), dbbench runner with full workload list + percentiles + async, `bench/run-all.sh`, `compare`/`report`, `DbHeadToHeadBenchmarks` (results in `bench/results/`)
+- [x] Bench follow-up: compaction flags/stats/waitforcompaction/compact on all 3 engines; compaction-heavy config (`results/2026-11-02-vm-compaction.md`): LSM shape & write-amp match native (2.96 vs 3.05)
+- [ ] Perf #2 (from 3-way results): async API allocations (150–300 B/write, ~230 B/TryGetAsync, 0.8–2.9 KB/async seek); span-based MultiGet (130–930 B/key); reverse iteration 1.3–4.6x slower than C; iteration/seek with 1 KiB values 2–5x; flush 1.3–3x slower + 2–8 MB allocs; fillseq 1 KiB allocs ~1.1 KB/op; overwrite under compaction 2.2x C (write stalls: background compaction keeps up less well — 0.83 s pending vs ~0); re-run matrix on a quiet machine
+- [~] `tests/RocksDb.Managed.RoundTrip`: crash-isolated managed↔native round trips (test exe re-invokes itself as a child for native/managed sides; captures crashes, hangs, unclean shutdown) (agent running)
 - [x] Full-DB compat: native writes DB → managed opens/reads/writes → native reopens & verifies (and reverse)
 - [ ] Randomized differential test vs native (same op stream, compare results)
 - [ ] Benchmarks vs native: fillseq, fillrandom, readrandom, readseq, seekrandom, multiget; allocation report
