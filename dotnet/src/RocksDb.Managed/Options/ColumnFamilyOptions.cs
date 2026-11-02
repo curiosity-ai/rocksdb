@@ -195,6 +195,11 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public ulong BlobCompactionReadaheadSize { get; set; }
     public int BlobFileStartingLevel { get; set; }
     public PrepopulateBlobCache PrepopulateBlobCache { get; set; } = PrepopulateBlobCache.Disable;
+    /// <summary>
+    /// Cache for uncompressed blob values (blob_cache; null = no blob cache). It may be the block cache. Not persisted in
+    /// OPTIONS files (like upstream's kDontSerialize).
+    /// </summary>
+    public Cache.BlockCache? BlobCache { get; set; }
 
     private static readonly OptionTable<ColumnFamilyOptions> s_table = new OptionTable<ColumnFamilyOptions>()
         .Add("comparator", static o => o._comparator.Serialize(ComparatorId) ?? BytewiseComparator.ClassName,
@@ -301,6 +306,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         c.CompactionOptionsFifo = CompactionOptionsFifo.Clone();
         c.CompactionOptionsUniversal = CompactionOptionsUniversal.Clone();
         c.TableOptions = TableOptions.Clone();
+        c.BlobCache = BlobCache;
         c.OtherTableFactoryOptions = OtherTableFactoryOptions is null ? null : new Dictionary<string, string>(OtherTableFactoryOptions, StringComparer.Ordinal);
         return c;
     }

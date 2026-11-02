@@ -17,6 +17,8 @@ internal sealed class ImmutableMemTable
     public MemTable Mem { get; }
     /// <summary>The WAL created when this memtable was switched out: once flushed, WALs below it hold no data of this CF.</summary>
     public ulong NextLogNumber { get; }
+    /// <summary>Why the memtable was switched out (reported to listeners).</summary>
+    public FlushReason FlushReason { get; init; }
     public bool FlushInProgress { get; set; }
     public bool FlushCompleted { get; set; }
 }
@@ -87,6 +89,8 @@ internal sealed class ColumnFamilyData
             ArenaBlockSize = (int)Math.Min(options.ArenaBlockSize, int.MaxValue / 2),
         };
         TableCache = new TableCache(db.FileSystem, db.DbPaths, ReaderOptions, db.Options.MaxOpenFiles);
+        // Blob files live in cf_paths.front() (the first DB path); readers and the optional blob cache are per CF.
+        BlobSource = new Blob.BlobSource(db.FileSystem, db.DbPaths[0], id, options.BlobCache, db.Identity.DbId, db.Identity.SessionId, db.Options.Statistics);
         CompactionState = new ColumnFamilyCompactionState(options, Icmp);
         Stats = new InternalStats(NumLevels);
     }
@@ -107,6 +111,8 @@ internal sealed class ColumnFamilyData
     public TableReaderOptions ReaderOptions { get; }
     public MemTableOptions MemOptions { get; }
     public TableCache TableCache { get; }
+    /// <summary>Blob file readers and the blob cache of this column family (BlobFileCache + BlobSource).</summary>
+    public Blob.BlobSource BlobSource { get; }
     public int NumLevels { get; }
     /// <summary>Compaction picker, write-stall token and compaction queue flag (guarded by the DB mutex).</summary>
     public ColumnFamilyCompactionState CompactionState { get; }

@@ -40,6 +40,12 @@ public sealed class ManagedEngine : IEngine
         Compression = s.Compression,
         DisableAutoCompactions = s.DisableAutoCompactions,
         MergeOperator = MergeOperatorFor(s.Merge),
+        EnableBlobFiles = s.EnableBlobFiles,
+        MinBlobSize = s.MinBlobSize,
+        BlobFileSize = s.BlobFileSize,
+        BlobCompressionType = s.BlobCompression,
+        EnableBlobGarbageCollection = s.EnableBlobGc,
+        BlobGarbageCollectionAgeCutoff = s.BlobGcAgeCutoff,
         TableOptions = new BlockBasedTableOptions
         {
             FormatVersion = (uint)s.FormatVersion,
@@ -179,6 +185,19 @@ public sealed class ManagedEngine : IEngine
         Db.IngestExternalFiles(Cf(cf), files, new IngestExternalFileOptions { MoveFiles = move });
 
     public void Checkpoint(string dir) => Db.CreateCheckpoint(dir);
+
+    public void Backup(string backupDir, bool flushBeforeBackup)
+    {
+        using var be = Utilities.Backup.BackupEngine.Open(new Utilities.Backup.BackupEngineOptions(backupDir));
+        be.CreateNewBackup(Db, flushBeforeBackup);
+        be.VerifyBackup(be.GetBackupInfo()[^1].BackupId, verifyWithChecksum: true);
+    }
+
+    public void RestoreLatestBackup(string backupDir, string targetDir)
+    {
+        using var be = Utilities.Backup.BackupEngineReadOnly.Open(new Utilities.Backup.BackupEngineOptions(backupDir));
+        be.RestoreDbFromLatestBackup(targetDir, targetDir, new Utilities.Backup.RestoreOptions());
+    }
 
     public void TakeSnapshot(long id) => _snapshots.Add(id, Db.GetSnapshot());
 

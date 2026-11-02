@@ -120,7 +120,7 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
-    /// Port of DBImpl::GetLiveFilesStorageInfo (without checksums): table files, MANIFEST (trimmed to the size
+    /// Port of DBImpl::GetLiveFilesStorageInfo (without checksums): table and blob files, MANIFEST (trimmed to the size
     /// matching the captured versions), CURRENT (replacement contents), OPTIONS and the live WALs (the last one
     /// trimmed to its current size).
     /// </summary>
@@ -146,7 +146,7 @@ internal sealed partial class DbImpl
                 if (cfd.Dropped) continue;
                 try
                 {
-                    await FlushColumnFamilyAsync(cfd, wait: true, synchronous, ct).ConfigureAwait(false);
+                    await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.GetLiveFiles, synchronous, ct).ConfigureAwait(false);
                 }
                 catch (RocksDbException e) when (e.Code == StatusCode.ColumnFamilyDropped)
                 {
@@ -171,6 +171,13 @@ internal sealed partial class DbImpl
                         results.Add(new LiveFileStorageInfo(directory, FileNames.MakeTableFileName(meta.FileNumber), meta.FileNumber, FileType.TableFile,
                             meta.FileSize, TrimToSize: false, null));
                     }
+                }
+                // Blob files live in cf_paths.front() (GetLiveFilesStorageInfo: blob_files of the current version).
+                foreach (Blob.BlobFileMetaData b in vsi.BlobFiles)
+                {
+                    if (!seen.Add(b.BlobFileNumber)) continue;
+                    results.Add(new LiveFileStorageInfo(DbPaths[0], FileNames.BlobFileName(b.BlobFileNumber), b.BlobFileNumber, FileType.BlobFile,
+                        b.TotalBlobBytes + Blob.BlobLogFormat.HeaderSize + Blob.BlobLogFormat.FooterSize, TrimToSize: false, null));
                 }
             }
             (manifestNumber, manifestSize) = Versions.InstalledManifest;

@@ -90,7 +90,7 @@ internal sealed partial class DbImpl
     private static void ThrowWriteError(Exception e)
     {
         // Each writer gets its own exception object (the original may be shared by the whole group).
-        if (e is RocksDbException r) throw new RocksDbException(r.Code, r.Message, r.SubCode, r);
+        if (e is RocksDbException r) throw r.Rethrowable();
         if (e is ObjectDisposedException) ThrowDisposed();
         throw RocksDbException.IOError(e.Message, e);
     }
@@ -244,8 +244,9 @@ internal sealed partial class DbImpl
                 }
                 catch (Exception e)
                 {
-                    // A failed WAL write leaves the WAL in an unknown state: stop accepting writes (bg error).
-                    SetBackgroundError(e);
+                    // A failed WAL write leaves the WAL in an unknown state: stop accepting writes (bg error). The recovery
+                    // replaces the WAL and never writes to or syncs the failed one again.
+                    SetBackgroundError(e, BackgroundErrorReason.WriteCallback, walRelated: true);
                     throw;
                 }
                 for (int i = 0; i < group.Count; i++)
@@ -313,15 +314,14 @@ internal sealed partial class DbImpl
     /// </summary>
     private async ValueTask PreprocessWriteAsync(bool noSlowdown, bool synchronous, CancellationToken cancellationToken)
     {
-        RocksDbException? bg = Volatile.Read(ref _bgError);
-        if (bg is not null) ThrowBackgroundError(bg);
+        ThrowIfDbStopped();
         if (_flushScheduler.Count > 0)
         {
             for (int i = 0; i < _flushScheduler.Count; i++)
             {
                 ColumnFamilyData cfd = _flushScheduler[i];
                 if (cfd.Dropped || cfd.Mem.IsEmpty) continue;
-                await SwitchMemtableAsync(cfd, synchronous, cancellationToken).ConfigureAwait(false);
+                await SwitchMemtableAsync(cfd, FlushReason.WriteBufferFull, synchronous, cancellationToken).ConfigureAwait(false);
             }
             _flushScheduler.Clear();
         }
@@ -345,19 +345,31 @@ internal sealed partial class DbImpl
     /// Port of DBImpl::SwitchMemtable: makes the CF's mutable memtable immutable, starts a new WAL (unless the current
     /// one is empty) and schedules a flush. REQUIRES: caller is the write leader (batched or unbatched).
     /// </summary>
-    internal async ValueTask SwitchMemtableAsync(ColumnFamilyData cfd, bool synchronous, CancellationToken cancellationToken)
+    internal async ValueTask SwitchMemtableAsync(ColumnFamilyData cfd, FlushReason reason, bool synchronous, CancellationToken cancellationToken)
     {
         LogWriter? newLog = null;
         ulong newLogNumber;
-        lock (_mutex) newLogNumber = _logNumber;
-        if (!_logEmpty || _log is null)
+        bool walFailed;
+        lock (_mutex)
+        {
+            newLogNumber = _logNumber;
+            // A WAL whose write or sync failed is replaced and never written or synced again (WAL write error recovery).
+            walFailed = _log is not null && _logNumber <= _failedWalNumber;
+        }
+        if (!_logEmpty || _log is null || walFailed)
         {
             newLogNumber = Versions.NewFileNumber();
             try
             {
                 newLog = CreateWal(newLogNumber);
                 LogWriter? old = _log;
-                if (old is not null)
+                if (old is not null && walFailed)
+                {
+                    // Its data is in the memtables, which the recovery flushes.
+                    try { old.Dispose(); }
+                    catch (Exception de) when (de is IOException or RocksDbException) { }
+                }
+                else if (old is not null)
                 {
                     // Make the old WAL durable before writes continue in the new one, so a crash can't lose its tail while
                     // keeping later writes (upstream syncs closed WALs on the next sync write instead). Not cancellable:
@@ -383,7 +395,7 @@ internal sealed partial class DbImpl
                     catch (Exception de) when (de is IOException or RocksDbException) { }
                     TryDeleteFile(FileNames.LogFileName(WalDir, newLogNumber));
                 }
-                SetBackgroundError(e);
+                SetBackgroundError(e, BackgroundErrorReason.MemTable, walRelated: true);
                 throw;
             }
         }
@@ -398,7 +410,8 @@ internal sealed partial class DbImpl
                 _aliveWals.Add(newLogNumber);
             }
             MemTable mem = cfd.Mem;
-            cfd.Imm.Add(new ImmutableMemTable(mem, newLogNumber));
+            cfd.Imm.Add(new ImmutableMemTable(mem, newLogNumber) { FlushReason = reason });
+            if (HasListeners) EnqueueMemTableSealed(cfd, mem);
             cfd.Mem = cfd.ConstructNewMemtable(Versions.LastSequence);
             if (newLog is not null)
             {
@@ -507,8 +520,7 @@ internal sealed partial class DbImpl
         public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key) => Check(columnFamilyId);
         public void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) => Check(columnFamilyId);
         public void Merge(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Check(columnFamilyId);
-        public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex) =>
-            ThrowHelper.NotSupported("Blob files are not supported yet");
+        public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex) => Check(columnFamilyId);
         public void LogData(ReadOnlySpan<byte> blob) { }
         public void MarkBeginPrepare(bool unprepare) { }
         public void MarkEndPrepare(ReadOnlySpan<byte> xid) { }
@@ -653,8 +665,16 @@ internal sealed partial class DbImpl
             Add(columnFamilyId, EntryType.Merge, key, value);
         }
 
-        public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex) =>
-            ThrowHelper.NotSupported("Blob files are not supported yet");
+        /// <summary>MemTableInserter::PutBlobIndexCF: the blob index is stored as a kTypeBlobIndex entry.</summary>
+        public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex)
+        {
+            if (_rebuilding is not null)
+            {
+                _rebuilding.PutBlobIndex(columnFamilyId, key, blobIndex);
+                return;
+            }
+            Add(columnFamilyId, EntryType.BlobIndex, key, blobIndex);
+        }
 
         public readonly void LogData(ReadOnlySpan<byte> blob) { }
 

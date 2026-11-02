@@ -31,6 +31,11 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     /// disposed by the DB. Not persisted.
     /// </summary>
     public InfoLogger? InfoLog { get; set; }
+    /// <summary>
+    /// Event listeners notified of flushes, compactions, table file creation/deletion, write stalls and background
+    /// errors (rocksdb::DBOptions::listeners). Not persisted.
+    /// </summary>
+    public List<EventListener> Listeners { get; } = new();
 
     // ---- persisted ---------------------------------------------------------------------------
     public bool CreateIfMissing { get; set; }
@@ -103,7 +108,12 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     public bool WriteIdentityFile { get; set; } = true;
     public ulong LogReadaheadSize { get; set; }
     public bool BestEffortsRecovery { get; set; }
+    /// <summary>
+    /// Maximum number of automatic resume attempts after a retryable background I/O error (max_bgerror_resume_count);
+    /// 0 or less disables automatic recovery (the DB then waits for <see cref="RocksDatabase.Resume"/>).
+    /// </summary>
     public int MaxBgErrorResumeCount { get; set; } = int.MaxValue;
+    /// <summary>Microseconds between automatic resume attempts (bgerror_resume_retry_interval).</summary>
     public ulong BgErrorResumeRetryInterval { get; set; } = 1000000;
     public bool AllowDataInErrors { get; set; }
     /// <summary>"__hostname__" is replaced by the host name when written to table properties.</summary>
@@ -194,6 +204,7 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     {
         var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir, FileSystem = FileSystem, Statistics = Statistics, InfoLog = InfoLog };
         c.DbPaths.AddRange(DbPaths);
+        c.Listeners.AddRange(Listeners);
         c.CopyFrom(this);
         return c;
     }

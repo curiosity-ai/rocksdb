@@ -241,6 +241,121 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
     }
 
     // ---------------------------------------------------------------------------------------------------------
+    // integrated BlobDB
+
+    /// <summary>
+    /// Blob DB both ways: the first engine writes with blob files enabled on two CFs (one with blob compression and
+    /// garbage collection), flushing and compacting (relocating blobs); the other engine verifies, extends, compacts
+    /// and checkpoints; the first reads everything back, including the checkpoint.
+    /// </summary>
+    [TestMethod]
+    [DataRow(EngineKind.Native)]
+    [DataRow(EngineKind.Managed)]
+    public async Task BlobDb_BothWays(EngineKind first)
+    {
+        EngineKind other = Other(first);
+        DbSpec spec = DbSpec.Standard(CompressionType.LZ4, 6, FilterKind.Bloom, 128UL << 10, false);
+        CfSpec d = spec.Cf("default");
+        d.EnableBlobFiles = true;
+        d.MinBlobSize = 64;
+        d.BlobFileSize = 256UL << 10;
+        CfSpec blobs = spec.Cf("blobs");
+        blobs.EnableBlobFiles = true;
+        blobs.MinBlobSize = 16;
+        blobs.BlobCompression = CompressionType.Zstd;
+        blobs.EnableBlobGc = true;
+        blobs.BlobGcAgeCutoff = 0.5;
+        RoundTripHarness h = CreateHarness(spec, $"{first}-first");
+        string ckpt = h.SubDir("checkpoint");
+        var gen = new GeneratorOptions { Ops = 2500, AllowColumnFamilyChanges = false, LargeValueRate = 0.01 };
+
+        ScriptBuilder b = h.NewScript($"{first}-write");
+        OpGenerator.Generate(b, gen);
+        b.Add(Op.Flush("default")).Add(Op.Flush("blobs")).Add(Op.Compact("blobs"));
+        OpGenerator.Generate(b, new GeneratorOptions { Ops = 500, AllowColumnFamilyChanges = false, AllowFlush = false, AllowCompact = false });
+        b.Verify().Dump();
+        await h.RunAsync(first, b);
+
+        ScriptBuilder o = h.NewScript($"{other}-extend");
+        OpGenerator.Generate(o, gen);
+        o.Add(Op.Compact("default")).Add(Op.Compact("blobs")).Add(Op.Checkpoint(ckpt));
+        OpGenerator.Generate(o, new GeneratorOptions { Ops = 300, AllowColumnFamilyChanges = false, AllowFlush = false, AllowCompact = false });
+        o.Add(Op.Reopen()).Verify().Dump();
+        await h.RunAsync(other, o);
+
+        ScriptBuilder back = h.NewScript($"{first}-back");
+        OpGenerator.Generate(back, new GeneratorOptions { Ops = 800, AllowColumnFamilyChanges = false });
+        back.Add(Op.Compact("blobs")).Verify().Dump();
+        await h.RunAsync(first, back);
+        await h.RunAsync(other, h.NewScript($"{other}-final"));
+
+        ReferenceModel ckptModel = ReferenceModel.FromContents(spec, h.Model.Checkpoints[ckpt]);
+        await h.RunAsync(first, h.NewScript($"{first}-checkpoint", ckpt, spec, ckptModel));
+    }
+
+    // backups
+
+    /// <summary>
+    /// BackupEngine interoperability: <paramref name="first"/> backs up the DB, the other engine restores it, extends the
+    /// restored DB and adds an incremental backup to the same backup directory, and the first engine restores that.
+    /// </summary>
+    [TestMethod]
+    [DataRow(EngineKind.Managed)]
+    [DataRow(EngineKind.Native)]
+    public async Task Backup_RestoredAndExtendedByOther(EngineKind first)
+    {
+        EngineKind second = Other(first);
+        DbSpec spec = DbSpec.Standard(CompressionType.LZ4, 6, FilterKind.Bloom, 256UL << 10, false);
+        RoundTripHarness h = CreateHarness(spec, $"{first}-first");
+        string backupDir = h.SubDir("backup");
+        string restore1 = h.SubDir("restore1"), restore2 = h.SubDir("restore2");
+
+        // 1. first engine: write (flushes leave SSTs, the tail stays in the WAL), back up without flushing, keep writing.
+        ScriptBuilder b = h.NewScript($"{first}-write-backup");
+        OpGenerator.Generate(b, new GeneratorOptions { Ops = 1500, AllowColumnFamilyChanges = false });
+        b.Add(Op.Backup(backupDir, flush: false));
+        OpGenerator.Generate(b, new GeneratorOptions { Ops = 200, AllowColumnFamilyChanges = false, AllowFlush = false });
+        b.Verify();
+        await h.RunAsync(first, b);
+        SkipIfNativeMetaIsEmpty(backupDir);
+        ReferenceModel backup1 = ReferenceModel.FromContents(spec, h.Model.Backups[backupDir]);
+
+        // 2. second engine restores it (from a script on the source DB), opens the restored DB, extends it and adds an
+        //    incremental backup (flushed) to the same backup directory.
+        ScriptBuilder r = h.NewScriptWithoutVerify($"{second}-restore", h.DbPath, spec, h.Model);
+        r.Add(Op.Restore(backupDir, restore1));
+        await h.RunAsync(second, r);
+        ScriptBuilder e = h.NewScript($"{second}-extend-backup", restore1, spec, backup1);
+        OpGenerator.Generate(e, new GeneratorOptions { Ops = 800, AllowColumnFamilyChanges = false });
+        e.Add(Op.Backup(backupDir, flush: true));
+        e.Verify();
+        await h.RunAsync(second, e);
+        SkipIfNativeMetaIsEmpty(backupDir);
+        ReferenceModel backup2 = ReferenceModel.FromContents(spec, backup1.Backups[backupDir]);
+
+        // 3. first engine restores the incremental backup and verifies it.
+        ScriptBuilder r2 = h.NewScriptWithoutVerify($"{first}-restore", h.DbPath, spec, h.Model);
+        r2.Add(Op.Restore(backupDir, restore2));
+        await h.RunAsync(first, r2);
+        ScriptBuilder v = h.NewScript($"{first}-verify-restored", restore2, spec, backup2);
+        v.Verify().Dump();
+        await h.RunAsync(first, v);
+    }
+
+    /// <summary>
+    /// librocksdb 11.12 writes empty backup meta files when hosted by .NET 11 (see the compat tests); such a run is
+    /// inconclusive.
+    /// </summary>
+    private static void SkipIfNativeMetaIsEmpty(string backupDir)
+    {
+        uint id = NativeEngine.LatestBackupId(backupDir);
+        if (new FileInfo(Path.Combine(backupDir, "meta", id.ToString(CultureInfo.InvariantCulture))).Length == 0)
+        {
+            Assert.Inconclusive("native BackupEngine wrote an empty meta file (librocksdb 11.12 hosted by .NET " + Environment.Version + ")");
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
     // TTL
 
     [TestMethod]

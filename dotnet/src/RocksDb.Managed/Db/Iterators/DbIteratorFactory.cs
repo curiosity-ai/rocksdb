@@ -45,6 +45,12 @@ public sealed class DbIteratorSources
 
     /// <summary>Disposed when the iterator is disposed, after its internal iterators (e.g. unrefs the super version).</summary>
     public IDisposable? Cleanup { get; init; }
+
+    /// <summary>Reads the blobs of blob-index entries (the column family's blob source); null = blob values are NotSupported.</summary>
+    internal Blob.BlobSource? BlobSource { get; init; }
+
+    /// <summary>The version the table files come from (blob files must belong to it).</summary>
+    internal VersionStorageInfo? BlobVersion { get; init; }
 }
 
 /// <summary>
@@ -94,9 +100,13 @@ public static class DbIteratorFactory
         return CreateDbIter(sources);
     }
 
-    private static DbIter Wrap(DbIteratorSources sources, InternalIterator internalIter, RangeDelAggregator? rangeDel) =>
-        new(sources.Comparator, internalIter, sources.Sequence, sources.ReadOptions, sources.MergeOperator, rangeDel,
+    private static DbIter Wrap(DbIteratorSources sources, InternalIterator internalIter, RangeDelAggregator? rangeDel)
+    {
+        var it = new DbIter(sources.Comparator, internalIter, sources.Sequence, sources.ReadOptions, sources.MergeOperator, rangeDel,
             sources.MaxSequentialSkipInIterations, sources.Cleanup, sources.PrefixExtractor);
+        if (sources.BlobSource is not null && sources.BlobVersion is not null) it.SetBlobSource(sources.BlobSource, sources.BlobVersion);
+        return it;
+    }
 
     /// <summary>
     /// Builds the merged internal iterator over all sources and adds their range tombstones to

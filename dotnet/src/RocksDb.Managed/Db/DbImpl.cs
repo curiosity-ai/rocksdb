@@ -50,6 +50,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
         DbPaths = paths;
         Versions = new VersionSet(this, FileSystem, dbname);
+        ErrorHandler = new ErrorHandler(this);
         _writeThread = new WriteThread(options.MaxWriteBatchGroupSizeBytes);
         // GetBGJobLimits (db/db_impl/db_impl_compaction_flush.cc).
         int maxFlushes = options.MaxBackgroundFlushes;
@@ -336,30 +337,53 @@ internal sealed partial class DbImpl : IAsyncDisposable
         return result;
     }
 
-    // ---- background error -------------------------------------------------------------------------------
+    // ---- background error ----------------------------------------------------------------------------------
 
-    private RocksDbException? _bgError;
+    private ulong _failedWalNumber; // newest WAL whose write/sync failed (guarded by mutex)
 
-    /// <summary>Records a background error; writes fail with it afterwards (ErrorHandler::SetBGError, no auto-resume).</summary>
-    internal void SetBackgroundError(Exception e)
+    /// <summary>The background error handler (error_handler_).</summary>
+    internal ErrorHandler ErrorHandler { get; }
+
+    /// <summary>
+    /// Records a background error for <paramref name="reason"/> (ErrorHandler::SetBGError): depending on its severity
+    /// writes stop, background work pauses and automatic recovery starts. Called without the mutex.
+    /// </summary>
+    internal void SetBackgroundError(Exception e, BackgroundErrorReason reason, bool walRelated)
     {
-        lock (_mutex)
+        if (walRelated)
         {
-            _bgError ??= e as RocksDbException ?? RocksDbException.IOError(e.Message, e);
-            SignalBackgroundWork();
+            lock (_mutex) _failedWalNumber = Math.Max(_failedWalNumber, _logNumber);
         }
+        ErrorHandler.SetBgError(e, reason, walRelated);
+        lock (_mutex) SignalBackgroundWork();
     }
 
+    /// <summary>The current background error (with its severity), or null.</summary>
     internal RocksDbException? BackgroundError
     {
         get
         {
-            lock (_mutex) return _bgError;
+            lock (_mutex) return ErrorHandler.BgError;
         }
     }
 
-    private static void ThrowBackgroundError(RocksDbException e) =>
-        throw new RocksDbException(e.Code, e.Message, e.SubCode, e);
+    /// <summary>Writes are stopped by a background error (hard or worse).</summary>
+    internal bool IsDbStopped => ErrorHandler.IsDbStopped;
+
+    /// <summary>Background flushes and compactions are stopped by a background error. REQUIRES: mutex.</summary>
+    private bool IsBgWorkStopped => ErrorHandler.IsBgWorkStopped;
+
+    private static void ThrowBackgroundError(RocksDbException e) => throw e.Rethrowable();
+
+    /// <summary>Throws the background error if writes are stopped (PreprocessWrite's IsDBStopped check). Lock-free.</summary>
+    private void ThrowIfDbStopped()
+    {
+        if (ErrorHandler.IsDbStopped)
+        {
+            RocksDbException? bg = BackgroundError;
+            if (bg is not null) ThrowBackgroundError(bg);
+        }
+    }
 
     // ---- obsolete files ---------------------------------------------------------------------------------
 
@@ -375,6 +399,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     internal void PurgeObsoleteFiles()
     {
         var tables = new List<ObsoleteTableFile>();
+        var blobs = new List<ObsoleteBlobFile>();
         var wals = new List<ulong>();
         var manifests = new List<ulong>();
         lock (_mutex)
@@ -382,6 +407,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             // DisableFileDeletions: keep everything queued until deletions are re-enabled (FindObsoleteFiles).
             if (FileDeletionsDisabled || _readOnly) return;
             Versions.TakeObsoleteFiles(tables);
+            Versions.TakeObsoleteBlobFiles(blobs);
             ulong minLog = MinLogNumberToKeepLive();
             for (int i = 0; i < _aliveWals.Count;)
             {
@@ -399,7 +425,13 @@ internal sealed partial class DbImpl : IAsyncDisposable
         foreach (ObsoleteTableFile t in tables)
         {
             t.Cfd.TableCache.Evict(t.Meta.FileNumber);
-            TryDeleteFile(FileNames.TableFileName(DbPaths, t.Meta.FileNumber, t.Meta.PathId));
+            DeleteObsoleteTableFile(FileNames.TableFileName(DbPaths, t.Meta.FileNumber, t.Meta.PathId));
+        }
+        foreach (ObsoleteBlobFile b in blobs)
+        {
+            // The SharedBlobFileMetaData deleter: evict the reader, then delete the file (AddObsoleteBlobFile).
+            b.Cfd.BlobSource.Evict(b.BlobFileNumber);
+            TryDeleteFile(FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber));
         }
         foreach (ulong n in wals) DeleteOrArchiveWal(n);
         foreach (ulong n in manifests) TryDeleteFile(FileNames.DescriptorFileName(DbName, n));
@@ -434,6 +466,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
                     {
                         case FileType.TableFile:
                             if (!Versions.IsLiveFile(number) && !_pendingOutputs.Contains(number)) toDelete.Add(full);
+                            break;
+                        case FileType.BlobFile:
+                            if (!Versions.IsLiveBlobFile(number) && !_pendingOutputs.Contains(number)) toDelete.Add(full);
                             break;
                         case FileType.DescriptorFile:
                             if (dir == DbName && number != Versions.ManifestFileNumber) toDelete.Add(full);
@@ -480,13 +515,15 @@ internal sealed partial class DbImpl : IAsyncDisposable
     public async ValueTask CloseAsync(bool synchronous)
     {
         if (Volatile.Read(ref _disposed) != 0) return;
+        // CancelErrorRecoveryForShutDown: stop automatic recovery first (it needs the write thread and background work).
+        await ErrorHandler.EndAutoRecoveryAsync(synchronous).ConfigureAwait(false);
         if (!Options.AvoidFlushDuringShutdown && Volatile.Read(ref _hasUnpersistedData) && BackgroundError is null)
         {
             try
             {
                 foreach (ColumnFamilyData cfd in GetColumnFamilies())
                 {
-                    await FlushColumnFamilyAsync(cfd, wait: true, synchronous, CancellationToken.None).ConfigureAwait(false);
+                    await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.ShutDown, synchronous, CancellationToken.None).ConfigureAwait(false);
                 }
             }
             catch (RocksDbException)
@@ -525,7 +562,11 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 foreach (ColumnFamilyData cfd in Versions.ColumnFamilies) ReleaseColumnFamilyResources(cfd);
                 // Dropped column families keep their table cache open until close: readers and background jobs that
                 // still hold one of their versions read through it (their files are evicted as they become obsolete).
-                foreach (ColumnFamilyData cfd in _droppedColumnFamilies) cfd.TableCache.Dispose();
+                foreach (ColumnFamilyData cfd in _droppedColumnFamilies)
+                {
+                    cfd.TableCache.Dispose();
+                    cfd.BlobSource.Dispose();
+                }
                 _droppedColumnFamilies.Clear();
             }
         }
@@ -546,6 +587,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     {
         ReleaseColumnFamilyMemTables(cfd);
         cfd.TableCache.Dispose();
+        cfd.BlobSource.Dispose();
     }
 
     /// <summary>

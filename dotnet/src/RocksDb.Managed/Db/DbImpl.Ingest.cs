@@ -41,8 +41,7 @@ internal sealed partial class DbImpl
                 bool needFlush;
                 try
                 {
-                    RocksDbException? bg = BackgroundError;
-                    if (bg is not null) ThrowBackgroundError(bg);
+                    ThrowIfDbStopped();
                     if (cfd.Dropped) ThrowDropped(cfd);
                     SuperVersion sv = GetReferencedSuperVersion(cfd);
                     try
@@ -81,9 +80,10 @@ internal sealed partial class DbImpl
                 if (success) break;
                 if (!options.AllowBlockingFlush) ThrowHelper.InvalidArgument("External file requires flush");
                 if (attempt >= 8) throw new RocksDbException(StatusCode.TryAgain, "Operation failed. Try again.: memtable keeps overlapping the ingested files");
-                await FlushColumnFamilyAsync(cfd, wait: true, synchronous, ct).ConfigureAwait(false);
+                await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.ExternalFileIngestion, synchronous, ct).ConfigureAwait(false);
             }
             job.DeleteExternalLinks();
+            NotifyOnExternalFileIngested(cfd, job);
         }
         finally
         {

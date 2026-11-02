@@ -105,6 +105,27 @@ public static partial class BlockCompression
         };
     }
 
+    /// <summary>
+    /// Port of LegacyForceBuiltinCompression (util/compression.cc), used for blob values: compresses with format-2
+    /// framing and keeps the result even when it is larger than the input. Throws NotSupported when the type cannot be
+    /// produced (BZip2/Xpress, or zlib above 16 KiB, see the class remarks).
+    /// </summary>
+    internal static void CompressForced(CompressionType type, ReadOnlySpan<byte> raw, int level, IBufferWriter<byte> output)
+    {
+        // Reliable upper bound on the compressed size: ((19 * n) >> 4) + 604.
+        long bound = ((19L * raw.Length) >> 4) + 604;
+        int maxSize = (int)Math.Min(bound, int.MaxValue);
+        bool ok = type switch
+        {
+            CompressionType.Snappy => TryCompressSnappy(raw, int.MaxValue, output),
+            CompressionType.LZ4 or CompressionType.LZ4HC => TryCompressLz4(type, raw, level, int.MaxValue, output),
+            CompressionType.Zstd => TryCompressZstd(raw, level, maxSize, output),
+            CompressionType.Zlib => TryCompressZlib(raw, level, maxSize, output),
+            _ => false,
+        };
+        if (!ok) ThrowHelper.NotSupported("Compression type " + type.ToString() + " cannot compress this blob in this build");
+    }
+
     private static bool TryCompressSnappy(ReadOnlySpan<byte> raw, int maxSize, IBufferWriter<byte> output)
     {
         Span<byte> dst = output.GetSpan(Snappier.Snappy.GetMaxCompressedLength(raw.Length));

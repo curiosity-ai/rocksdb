@@ -35,6 +35,12 @@ The `flush` and `compact` benchmarks run one flush / one full compaction in a fr
 they include JIT warm-up of the flush / compaction code (the first compaction of a process is 2.5 - 3.5x slower than
 the following ones; see "Perf pass #3" in `docs/perf.md`).
 
+`RUN_BLOB=1` adds one **integrated BlobDB** configuration (label `blob`): 1 KiB values written to blob files
+(`--enable_blob_files 1 --min_blob_size 512`, 16 MiB write buffer), benchmarks
+`fillrandom,overwrite,flush,waitforcompaction,stats,readrandom,multireadrandom,seekrandom,readseq,compact,readrandom`
+(knobs `BLOB_NUM`, `BLOB_VALUE_SIZE`, `BLOB_ARGS`, `BLOB_BENCHMARKS`, ...). Results: `results/2026-11-02-vm-blob.md`
+(`RUN_MATRIX=0 RUN_COMPACTION=0 RUN_BLOB=1 NUM=200000 bench/run-all.sh`).
+
 Builds the benchmark project (Release) and `native-c`, runs every configuration on every engine (each engine in its
 own process on a fresh DB directory under `DB_BASE`, deleted afterwards), and writes
 `bench/results/<date>-<host>.md` (summary + per-configuration tables with µs/op, ratios vs c-native, p99 and managed
@@ -76,7 +82,8 @@ Flags (same for all engines): `--num`, `--reads` (default num), `--key_size` (16
 `--disable_wal`, `--sync`, `--cache_size` (8 MiB), `--cache_type` (lru|hyperclock), `--bloom_bits` (10),
 `--write_buffer_size` (64 MiB), `--block_size` (4096), `--compression` (none|snappy|lz4|zstd),
 `--compression_ratio` (0.5), `--target_file_size_base` (64 MiB), `--max_bytes_for_level_base` (256 MiB),
-`--level0_file_num_compaction_trigger` (4), `--disable_auto_compactions`, `--max_background_jobs` (2), `--use_existing_db`,
+`--level0_file_num_compaction_trigger` (4), `--disable_auto_compactions`, `--max_background_jobs` (2),
+`--enable_blob_files` / `--min_blob_size` (0) (integrated BlobDB; set through the C API for c-native and rocksdb-sharp), `--use_existing_db`,
 `--seed` (301), `--db`, `--histogram` (1). `--async` (managed only) runs each worker as a task over
 `PutAsync`/`TryGetAsync`/`DeleteAsync`/`WriteAsync` and the async iterator, and `flush`/`compact`/`waitforcompaction` over
 `FlushAsync`/`CompactRangeAsync`/`WaitForCompactAsync`, and `multireadrandom` over `MultiGetAsync`.

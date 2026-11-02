@@ -153,10 +153,11 @@ internal sealed partial class DbImpl
     /// After a flush installed its result: InternalStats (BYTES_FLUSHED, L0 compaction stats), FLUSH_WRITE_BYTES /
     /// FLUSH_TIME statistics and the "table_file_creation" / "flush_finished" events.
     /// </summary>
-    internal void OnFlushCompleted(ColumnFamilyData cfd, int jobId, FileMetaData? meta, long startTimestamp)
+    internal void OnFlushCompleted(ColumnFamilyData cfd, int jobId, FileMetaData? meta, ulong blobBytes, long startTimestamp)
     {
         TimeSpan elapsed = Stopwatch.GetElapsedTime(startTimestamp);
-        ulong bytes = meta?.FileSize ?? 0;
+        // Table file plus the blob files the flush wrote (bytes_written + bytes_written_blob).
+        ulong bytes = (meta?.FileSize ?? 0) + blobBytes;
         cfd.Stats.AddFlush(bytes, (long)elapsed.TotalMicroseconds);
         if (Stats is { } st)
         {

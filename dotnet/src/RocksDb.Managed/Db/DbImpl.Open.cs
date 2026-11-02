@@ -138,7 +138,7 @@ internal sealed partial class DbImpl
                     var list = new List<FileMetaData>(cf.Levels[l]);
                     files[l] = list.ToArray();
                 }
-                Versions.AddColumnFamily(cfd, files);
+                Versions.AddColumnFamily(cfd, files, cf.BlobFiles.Values);
                 cfd.RecoverEpochNumbers();
                 cfd.Mem = cfd.ConstructNewMemtable(state.LastSequence);
                 InstallSuperVersion(cfd);
@@ -524,8 +524,24 @@ internal sealed partial class DbImpl
         if (mem.IsEmpty) return;
         ulong fileNumber = Versions.NewFileNumber();
         string path = FileNames.TableFileName(DbPaths, fileNumber, 0);
-        FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, synchronous, ct)
-            .ConfigureAwait(false);
+        // WriteLevel0TableForRecovery writes blob files too (BlobFileCreationReason::kRecovery). The blob files stay
+        // registered as pending outputs, like the table file, until the recovery edits are installed.
+        Blob.BlobFileBuilder? blobBuilder = CreateBlobFileBuilder(cfd, outputLevel: 0, Blob.BlobFileCreationReason.Recovery);
+        FileMetaData? meta;
+        try
+        {
+            meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, blobBuilder, synchronous, ct)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            if (blobBuilder is not null) ReleaseBlobOutputs(blobBuilder);
+            throw;
+        }
+        finally
+        {
+            blobBuilder?.Dispose();
+        }
         if (!edits.TryGetValue(cfd.Id, out VersionEdit? edit))
         {
             edit = new VersionEdit { ColumnFamily = cfd.Id };
@@ -535,6 +551,7 @@ internal sealed partial class DbImpl
         {
             FileSystem.SyncDirectory(DbPaths[0]);
             edit.AddFile(0, meta);
+            if (blobBuilder is not null) edit.BlobFileAdditions.AddRange(blobBuilder.Additions);
             // Keep the obsolete-file scan from deleting the new (not yet installed) file.
             lock (_mutex) _pendingOutputs.Add(fileNumber);
         }

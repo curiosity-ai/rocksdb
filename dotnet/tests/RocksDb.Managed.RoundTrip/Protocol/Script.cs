@@ -22,6 +22,10 @@ public enum OpKind
     Ingest,
     /// <summary>Creates a checkpoint in directory <see cref="Op.Arg"/>.</summary>
     Checkpoint,
+    /// <summary>Adds a backup of the DB to the BackupEngine directory <see cref="Op.Arg"/>; N = 1 flushes first.</summary>
+    Backup,
+    /// <summary>Restores the latest backup of <see cref="Op.Arg"/> = "backupDir|targetDir" into targetDir (the open DB is untouched).</summary>
+    Restore,
     /// <summary>Takes snapshot number <see cref="Op.N"/>.</summary>
     Snap,
     /// <summary>Verifies the DB as of snapshot <see cref="Op.N"/> against the expected-contents file <see cref="Op.Arg"/>.</summary>
@@ -73,6 +77,8 @@ public sealed record Op(OpKind Kind, string? Cf, byte[]? Key, byte[]? Value, str
     public static Op SstEnd() => new(OpKind.SstEnd, null, null, null, null, 0);
     public static Op Ingest(string cf, IEnumerable<string> files, bool move) => new(OpKind.Ingest, cf, null, null, string.Join('|', files), move ? 1 : 0);
     public static Op Checkpoint(string dir) => new(OpKind.Checkpoint, null, null, null, dir, 0);
+    public static Op Backup(string backupDir, bool flush) => new(OpKind.Backup, null, null, null, backupDir, flush ? 1 : 0);
+    public static Op Restore(string backupDir, string targetDir) => new(OpKind.Restore, null, null, null, backupDir + "|" + targetDir, 0);
     public static Op Snap(long id) => new(OpKind.Snap, null, null, null, null, id);
     public static Op SnapVerify(long id, string expectedFile) => new(OpKind.SnapVerify, null, null, null, expectedFile, id);
     public static Op SnapRelease(long id) => new(OpKind.SnapRelease, null, null, null, null, id);
