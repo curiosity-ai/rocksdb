@@ -132,6 +132,9 @@ Perf follow-ups: flush is ~2x slower than native and allocates 6 MB; cache-miss 
 HyperClock slots as array-of-structs; single-threaded cached table Get +18% vs plain dictionary.
 
 ## Phase 3 — Compat + performance
+Goal: finish implementation, validate vs C++ source, comprehensive tests (unit/integration/round-trip) and benchmarks (managed vs rocksdb-sharp vs pure C native).
+- [~] Source audit vs C++ (`docs/validation.md`) for formats/util/table/wal/options/memtable/cache/env/iterators (agent running)
+- [~] Three-way benchmark suite: C benchmark on librocksdb (`bench/native-c`), extended dbbench runner, `bench/run-all.sh`, micro head-to-heads (agent running)
 - [~] `tests/RocksDb.Managed.RoundTrip`: crash-isolated managed↔native round trips (test exe re-invokes itself as a child for native/managed sides; captures crashes, hangs, unclean shutdown) (agent running)
 - [x] Full-DB compat: native writes DB → managed opens/reads/writes → native reopens & verifies (and reverse)
 - [ ] Randomized differential test vs native (same op stream, compare results)
