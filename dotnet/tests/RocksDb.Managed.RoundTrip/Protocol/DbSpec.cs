@@ -40,11 +40,20 @@ public sealed class CfSpec
     public MergeKind Merge { get; set; } = MergeKind.StringAppend;
     /// <summary>Created when the DB is first created (others are only created by a createcf op).</summary>
     public bool Initial { get; set; } = true;
+    /// <summary>Integrated BlobDB: values of at least <see cref="MinBlobSize"/> bytes go to blob files.</summary>
+    public bool EnableBlobFiles { get; set; }
+    public ulong MinBlobSize { get; set; }
+    public ulong BlobFileSize { get; set; } = 256UL << 20;
+    /// <summary>None, Snappy, LZ4 or Zstd.</summary>
+    public CompressionType BlobCompression { get; set; } = CompressionType.None;
+    public bool EnableBlobGc { get; set; }
+    public double BlobGcAgeCutoff { get; set; } = 0.25;
 
     public CfSpec Clone() => (CfSpec)MemberwiseClone();
 
     public override string ToString() =>
-        $"{Name}[{Compression},fv{FormatVersion},{Filter},bs{BlockSize},wb{WriteBufferSize},{(DisableAutoCompactions ? "noauto" : "auto")},{Merge}]";
+        $"{Name}[{Compression},fv{FormatVersion},{Filter},bs{BlockSize},wb{WriteBufferSize},{(DisableAutoCompactions ? "noauto" : "auto")},{Merge}" +
+        (EnableBlobFiles ? $",blob>={MinBlobSize},{BlobCompression}{(EnableBlobGc ? ",gc" + BlobGcAgeCutoff : "")}" : "") + "]";
 }
 
 /// <summary>How a database is opened by either engine. Serialized as JSON for the child process.</summary>

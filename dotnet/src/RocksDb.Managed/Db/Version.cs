@@ -18,8 +18,15 @@ internal sealed partial class VersionStorageInfo
     private readonly ulong[] _levelBytes;
 
     public VersionStorageInfo(InternalKeyComparator icmp, int numLevels, ColumnFamilyOptions options, FileMetaData[][]? files)
+        : this(icmp, numLevels, options, files, [])
+    {
+    }
+
+    /// <param name="blobFiles">Live blob files of the version ordered by number (see <see cref="Blob.BlobFileMetaData.Build"/>).</param>
+    public VersionStorageInfo(InternalKeyComparator icmp, int numLevels, ColumnFamilyOptions options, FileMetaData[][]? files, Blob.BlobFileMetaData[] blobFiles)
     {
         Icmp = icmp;
+        BlobFiles = blobFiles;
         NumLevels = numLevels;
         _files = new FileMetaData[numLevels][];
         _levelBytes = new ulong[numLevels];
@@ -36,6 +43,37 @@ internal sealed partial class VersionStorageInfo
 
     public InternalKeyComparator Icmp { get; }
     public int NumLevels { get; }
+
+    /// <summary>Live blob files ordered by number (VersionStorageInfo::GetBlobFiles).</summary>
+    public Blob.BlobFileMetaData[] BlobFiles { get; }
+
+    /// <summary>VersionStorageInfo::GetBlobFileMetaData: the blob file with the given number, or null.</summary>
+    public Blob.BlobFileMetaData? GetBlobFileMetaData(ulong blobFileNumber)
+    {
+        Blob.BlobFileMetaData[] b = BlobFiles;
+        int lo = 0, hi = b.Length;
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >>> 1;
+            ulong n = b[mid].BlobFileNumber;
+            if (n == blobFileNumber) return b[mid];
+            if (n < blobFileNumber) lo = mid + 1;
+            else hi = mid;
+        }
+        return null;
+    }
+
+    /// <summary>VersionStorageInfo::GetBlobStats: total size and garbage of the live blob files.</summary>
+    public (ulong TotalFileSize, ulong TotalGarbageSize) GetBlobStats()
+    {
+        ulong total = 0, garbage = 0;
+        foreach (Blob.BlobFileMetaData b in BlobFiles)
+        {
+            total += b.TotalBlobBytes + Blob.BlobLogFormat.HeaderSize + Blob.BlobLogFormat.FooterSize;
+            garbage += b.GarbageBlobBytes;
+        }
+        return (total, garbage);
+    }
 
     public ReadOnlySpan<FileMetaData> LevelFiles(int level) => _files[level];
     internal FileMetaData[] LevelFilesArray(int level) => _files[level];

@@ -113,6 +113,17 @@ public enum ReadTier : byte
     MemtableTier = 0x3,
 }
 
+/// <summary>Mirrors rocksdb::BlobGarbageCollectionPolicy (manual compaction override of blob garbage collection).</summary>
+public enum BlobGarbageCollectionPolicy : byte
+{
+    /// <summary>Force blob file garbage collection.</summary>
+    Force = 0,
+    /// <summary>Skip blob file garbage collection.</summary>
+    Disable = 1,
+    /// <summary>Inherit the policy from the column family options.</summary>
+    UseDefault = 2,
+}
+
 /// <summary>Mirrors rocksdb::BottommostLevelCompaction.</summary>
 public enum BottommostLevelCompaction : byte
 {

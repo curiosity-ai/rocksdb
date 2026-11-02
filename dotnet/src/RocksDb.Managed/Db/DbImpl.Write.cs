@@ -501,8 +501,7 @@ internal sealed partial class DbImpl
         public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key) => Check(columnFamilyId);
         public void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) => Check(columnFamilyId);
         public void Merge(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Check(columnFamilyId);
-        public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex) =>
-            ThrowHelper.NotSupported("Blob files are not supported yet");
+        public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex) => Check(columnFamilyId);
         public void LogData(ReadOnlySpan<byte> blob) { }
         public void MarkBeginPrepare(bool unprepare) { }
         public void MarkEndPrepare(ReadOnlySpan<byte> xid) { }
@@ -647,8 +646,16 @@ internal sealed partial class DbImpl
             Add(columnFamilyId, EntryType.Merge, key, value);
         }
 
-        public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex) =>
-            ThrowHelper.NotSupported("Blob files are not supported yet");
+        /// <summary>MemTableInserter::PutBlobIndexCF: the blob index is stored as a kTypeBlobIndex entry.</summary>
+        public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex)
+        {
+            if (_rebuilding is not null)
+            {
+                _rebuilding.PutBlobIndex(columnFamilyId, key, blobIndex);
+                return;
+            }
+            Add(columnFamilyId, EntryType.BlobIndex, key, blobIndex);
+        }
 
         public readonly void LogData(ReadOnlySpan<byte> blob) { }
 

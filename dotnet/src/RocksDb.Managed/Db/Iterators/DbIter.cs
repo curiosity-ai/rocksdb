@@ -18,8 +18,11 @@ namespace RocksDb.Managed.Db.Iterators;
 /// iterator is in prefix mode (tables skipped by their prefix filter): direction changes re-seek like upstream
 /// (expect_total_order_inner_iter_ false) and the reseek optimization is disabled for SeekToFirst/SeekToLast.
 /// prefix_same_as_start stops iteration at the end of the seek key's prefix (PrefixCheck).</para>
-/// <para><b>Not ported (yet).</b> User-defined timestamps, read callbacks, blob values and wide-column entities
-/// (NotSupported), statistics/perf context, tombstone-run conversion, multi-scan.</para>
+/// <para><b>Blob values</b> (integrated BlobDB, DBIter::SetValueAndColumnsFromBlob): a blob-index entry is resolved
+/// lazily, when <see cref="Value"/> is first read (like allow_unprepared_value = true followed by PrepareValue), or
+/// with async I/O by <see cref="PrepareValueAsync"/>; merges on top of a blob read the blob synchronously.</para>
+/// <para><b>Not ported (yet).</b> User-defined timestamps, read callbacks, statistics/perf context, tombstone-run
+/// conversion, multi-scan.</para>
 /// <para><b>Errors.</b> Upstream sets status() and invalidates the iterator; here the positioning call throws
 /// <see cref="RocksDbException"/> (Corruption, InvalidArgument for a merge without operator, Incomplete when
 /// max_skippable_internal_keys is exceeded) and the iterator is left invalid.</para>
@@ -61,6 +64,13 @@ public sealed class DbIter : IDisposable
     private readonly PooledBufferWriter _mergeResult = new(128);
     private PooledBufferWriter? _mergedEntity;      // entity produced by a merge on top of a wide-column entity
     private bool _valueIsEntity;                    // the current value is a wide-column entity (Value = its default column)
+    private bool _valueIsBlob;                      // the current value source holds a blob index (Value = the blob)
+    private bool _blobFetched;                      // _blobValue holds the blob of the current entry
+    private PooledBufferWriter? _blobValue;
+    private PooledBufferWriter? _blobKey;
+    private Blob.BlobSource? _blobSource;
+    private VersionStorageInfo? _blobVersion;
+    private readonly ReadOptions? _readOptions;
     private readonly MergeOperandBuffer _operands = new();
 
     private bool _valid;
@@ -112,6 +122,7 @@ public sealed class DbIter : IDisposable
         _icmp = comparator;
         _iter = iter;
         _sequence = sequence;
+        _readOptions = readOptions;
         _mergeOperator = mergeOperator;
         _maxSkip = maxSequentialSkipInIterations;
         _cleanup = cleanup;
@@ -135,6 +146,108 @@ public sealed class DbIter : IDisposable
 
     public bool Valid => _valid;
 
+    /// <summary>Enables blob values: blob indexes are resolved through <paramref name="source"/> against <paramref name="version"/>.</summary>
+    internal void SetBlobSource(Blob.BlobSource source, VersionStorageInfo version)
+    {
+        _blobSource = source;
+        _blobVersion = version;
+    }
+
+    /// <summary>The raw value of the current entry before blob resolution (the blob index when <see cref="_valueIsBlob"/>).</summary>
+    private ReadOnlySpan<byte> RawValue => _valueSource switch
+    {
+        ValueSource.Iter => _iter.Value,
+        ValueSource.Pinned => _pinned.WrittenSpan,
+        _ => default,
+    };
+
+    /// <summary>The blob of the current blob-index entry, read on first use (DBIter::SetValueAndColumnsFromBlob).</summary>
+    private ReadOnlySpan<byte> BlobValue()
+    {
+        if (!_blobFetched)
+        {
+            PooledBufferWriter buf = _blobValue ??= new PooledBufferWriter(256);
+            buf.Clear();
+            try
+            {
+                _blobSource!.GetBlob(_blobVersion!, _readOptions, _savedKey.UserKey, RawValue, buf);
+            }
+            catch
+            {
+                _valid = false;
+                throw;
+            }
+            _blobFetched = true;
+        }
+        return _blobValue!.WrittenSpan;
+    }
+
+    /// <summary>
+    /// Reads the value of the current entry if it is still pending (a blob not read yet; Iterator::PrepareValue) with
+    /// async I/O. Completes synchronously when nothing is pending or the blob is cached. REQUIRES: <see cref="Valid"/>.
+    /// </summary>
+    public ValueTask PrepareValueAsync(CancellationToken cancellationToken = default)
+    {
+        if (!_valid || !_valueIsBlob || _blobFetched) return ValueTask.CompletedTask;
+        PooledBufferWriter buf = _blobValue ??= new PooledBufferWriter(256);
+        buf.Clear();
+        // The key must outlive the await: copy it into a reusable buffer.
+        PooledBufferWriter key = _blobKey ??= new PooledBufferWriter(64);
+        key.Clear();
+        key.Write(_savedKey.UserKey);
+        ValueTask t = _blobSource!.GetBlobAsync(_blobVersion!, _readOptions, key.WrittenMemory, RawValue, buf, cancellationToken);
+        if (t.IsCompletedSuccessfully)
+        {
+            t.GetAwaiter().GetResult();
+            _blobFetched = true;
+            return ValueTask.CompletedTask;
+        }
+        return AwaitBlobAsync(t);
+    }
+
+    private async ValueTask AwaitBlobAsync(ValueTask pending)
+    {
+        try
+        {
+            await pending.ConfigureAwait(false);
+        }
+        catch
+        {
+            _valid = false;
+            throw;
+        }
+        _blobFetched = true;
+    }
+
+    /// <summary>Marks the current value as a blob index (or not) of the given entry type.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void SetValueKind(EntryType type)
+    {
+        _valueIsEntity = type == EntryType.WideColumnEntity;
+        _valueIsBlob = type == EntryType.BlobIndex;
+        _blobFetched = false;
+        if (_valueIsBlob && _blobSource is null) ThrowNotSupportedType(type);
+    }
+
+    /// <summary>Reads the blob of a blob index into a scratch buffer (merge base values).</summary>
+    private ReadOnlySpan<byte> FetchBlobForMerge(ReadOnlySpan<byte> blobIndex)
+    {
+        if (_blobSource is null) ThrowNotSupportedType(EntryType.BlobIndex);
+        PooledBufferWriter buf = _blobValue ??= new PooledBufferWriter(256);
+        buf.Clear();
+        try
+        {
+            _blobSource!.GetBlob(_blobVersion!, _readOptions, _savedKey.UserKey, blobIndex, buf);
+        }
+        catch
+        {
+            _valid = false;
+            throw;
+        }
+        _blobFetched = false;
+        return buf.WrittenSpan;
+    }
+
     /// <summary>The current user key. REQUIRES: <see cref="Valid"/>. Valid until the next positioning call.</summary>
     public ReadOnlySpan<byte> Key
     {
@@ -151,6 +264,7 @@ public sealed class DbIter : IDisposable
         get
         {
             Debug.Assert(_valid);
+            if (_valueIsBlob) return BlobValue();
             switch (_valueSource)
             {
                 case ValueSource.Iter: return _valueIsEntity ? Wide.WideColumnSerialization.GetValueOfDefaultColumn(_iter.Value) : _iter.Value;
@@ -221,7 +335,7 @@ public sealed class DbIter : IDisposable
     private void ThrowNotSupportedType(EntryType type)
     {
         _valid = false;
-        ThrowHelper.NotSupported("blob values are not supported by the iterator yet (entry type " + ((int)type).ToString(System.Globalization.CultureInfo.InvariantCulture) + ")");
+        ThrowHelper.NotSupported("blob values need a blob source (entry type " + ((int)type).ToString(System.Globalization.CultureInfo.InvariantCulture) + ")");
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -284,6 +398,7 @@ public sealed class DbIter : IDisposable
         _currentEntryIsMerged = false;
         _valueSource = ValueSource.None;
         _valueIsEntity = false;
+        _valueIsBlob = false;
     }
 
     private void MergeWithNoBaseValue()
@@ -293,6 +408,7 @@ public sealed class DbIter : IDisposable
         MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, false, default, _operands.AsOperands(), _mergeResult);
         _valueSource = ValueSource.Merged;
         _valueIsEntity = false;
+        _valueIsBlob = false;
         _valid = true;
     }
 
@@ -303,6 +419,7 @@ public sealed class DbIter : IDisposable
         MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, true, value, _operands.AsOperands(), _mergeResult);
         _valueSource = ValueSource.Merged;
         _valueIsEntity = false;
+        _valueIsBlob = false;
         _valid = true;
     }
 
@@ -321,6 +438,7 @@ public sealed class DbIter : IDisposable
         Wide.WideColumnSerialization.ReplaceDefaultColumn(entity, _mergeResult.WrittenSpan, _mergedEntity);
         _valueSource = ValueSource.Merged;
         _valueIsEntity = true;
+        _valueIsBlob = false;
         _valid = true;
     }
 
@@ -394,9 +512,8 @@ public sealed class DbIter : IDisposable
                             _skipping = true;
                             break;
                         }
-                        if (type is EntryType.BlobIndex) ThrowNotSupportedType(type);
                         _valueSource = type == EntryType.ValuePreferredSeqno ? ValueSource.IterPacked : ValueSource.Iter;
-                        _valueIsEntity = type == EntryType.WideColumnEntity;
+                        SetValueKind(type);
                         _valid = true;
                         return StepAction.Done;
                     case EntryType.Merge:
@@ -515,8 +632,8 @@ public sealed class DbIter : IDisposable
                 }
                 if (type == EntryType.BlobIndex)
                 {
-                    ThrowNotSupportedType(type);
-                    return StepAction.Done;
+                    MergeWithPlainBaseValue(FetchBlobForMerge(_iter.Value));
+                    return StepAction.NextThenDone;
                 }
                 MergeWithEntityBaseValue(_iter.Value);
                 return StepAction.NextThenDone;
@@ -969,7 +1086,6 @@ public sealed class DbIter : IDisposable
                         _operands.Clear();
                         break;
                     }
-                    if (type is EntryType.BlobIndex) ThrowNotSupportedType(type);
                     // The child iterator moves on: keep a copy (upstream pins the block instead).
                     ReadOnlySpan<byte> v = _iter.Value;
                     _pinned.Clear();
@@ -1020,12 +1136,13 @@ public sealed class DbIter : IDisposable
             case EntryType.Merge:
                 _currentEntryIsMerged = true;
                 if (lastNotMergeType is EntryType.Value or EntryType.ValuePreferredSeqno) MergeWithPlainBaseValue(_pinned.WrittenSpan);
+                else if (lastNotMergeType == EntryType.BlobIndex) MergeWithPlainBaseValue(FetchBlobForMerge(_pinned.WrittenSpan));
                 else if (lastNotMergeType == EntryType.WideColumnEntity) MergeWithEntityBaseValue(_pinned.WrittenSpan);
                 else MergeWithNoBaseValue();
                 return;
-            default: // Value / ValuePreferredSeqno / WideColumnEntity
+            default: // Value / ValuePreferredSeqno / WideColumnEntity / BlobIndex
                 _valueSource = ValueSource.Pinned;
-                _valueIsEntity = lastKeyEntryType == EntryType.WideColumnEntity;
+                SetValueKind(lastKeyEntryType);
                 _valid = true;
                 return;
         }
@@ -1068,17 +1185,16 @@ public sealed class DbIter : IDisposable
             _valid = false;
             return;
         }
-        if (type is EntryType.Value or EntryType.ValuePreferredSeqno or EntryType.WideColumnEntity)
+        if (type is EntryType.Value or EntryType.ValuePreferredSeqno or EntryType.WideColumnEntity or EntryType.BlobIndex)
         {
             ReadOnlySpan<byte> v = _iter.Value;
             _pinned.Clear();
             _pinned.Write(type == EntryType.ValuePreferredSeqno ? ParsePackedValueForValue(v) : v);
             _valueSource = ValueSource.Pinned;
-            _valueIsEntity = type == EntryType.WideColumnEntity;
+            SetValueKind(type);
             _valid = true;
             return;
         }
-        if (type is EntryType.BlobIndex) ThrowNotSupportedType(type);
         if (type != EntryType.Merge) ThrowUnknownType(type);
 
         // kTypeMerge. We need to collect all kTypeMerge values and save them in operands.
@@ -1113,7 +1229,11 @@ public sealed class DbIter : IDisposable
                 MergeWithEntityBaseValue(_iter.Value);
                 return;
             }
-            if (type is EntryType.BlobIndex) ThrowNotSupportedType(type);
+            if (type is EntryType.BlobIndex)
+            {
+                MergeWithPlainBaseValue(FetchBlobForMerge(_iter.Value));
+                return;
+            }
             ThrowUnknownType(type);
         }
 
@@ -1180,5 +1300,7 @@ public sealed class DbIter : IDisposable
         _prefix.Dispose();
         _mergeResult.Dispose();
         _operands.Dispose();
+        _blobValue?.Dispose();
+        _blobKey?.Dispose();
     }
 }

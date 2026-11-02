@@ -241,6 +241,59 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
     }
 
     // ---------------------------------------------------------------------------------------------------------
+    // integrated BlobDB
+
+    /// <summary>
+    /// Blob DB both ways: the first engine writes with blob files enabled on two CFs (one with blob compression and
+    /// garbage collection), flushing and compacting (relocating blobs); the other engine verifies, extends, compacts
+    /// and checkpoints; the first reads everything back, including the checkpoint.
+    /// </summary>
+    [TestMethod]
+    [DataRow(EngineKind.Native)]
+    [DataRow(EngineKind.Managed)]
+    public async Task BlobDb_BothWays(EngineKind first)
+    {
+        EngineKind other = Other(first);
+        DbSpec spec = DbSpec.Standard(CompressionType.LZ4, 6, FilterKind.Bloom, 128UL << 10, false);
+        CfSpec d = spec.Cf("default");
+        d.EnableBlobFiles = true;
+        d.MinBlobSize = 64;
+        d.BlobFileSize = 256UL << 10;
+        CfSpec blobs = spec.Cf("blobs");
+        blobs.EnableBlobFiles = true;
+        blobs.MinBlobSize = 16;
+        blobs.BlobCompression = CompressionType.Zstd;
+        blobs.EnableBlobGc = true;
+        blobs.BlobGcAgeCutoff = 0.5;
+        RoundTripHarness h = CreateHarness(spec, $"{first}-first");
+        string ckpt = h.SubDir("checkpoint");
+        var gen = new GeneratorOptions { Ops = 2500, AllowColumnFamilyChanges = false, LargeValueRate = 0.01 };
+
+        ScriptBuilder b = h.NewScript($"{first}-write");
+        OpGenerator.Generate(b, gen);
+        b.Add(Op.Flush("default")).Add(Op.Flush("blobs")).Add(Op.Compact("blobs"));
+        OpGenerator.Generate(b, new GeneratorOptions { Ops = 500, AllowColumnFamilyChanges = false, AllowFlush = false, AllowCompact = false });
+        b.Verify().Dump();
+        await h.RunAsync(first, b);
+
+        ScriptBuilder o = h.NewScript($"{other}-extend");
+        OpGenerator.Generate(o, gen);
+        o.Add(Op.Compact("default")).Add(Op.Compact("blobs")).Add(Op.Checkpoint(ckpt));
+        OpGenerator.Generate(o, new GeneratorOptions { Ops = 300, AllowColumnFamilyChanges = false, AllowFlush = false, AllowCompact = false });
+        o.Add(Op.Reopen()).Verify().Dump();
+        await h.RunAsync(other, o);
+
+        ScriptBuilder back = h.NewScript($"{first}-back");
+        OpGenerator.Generate(back, new GeneratorOptions { Ops = 800, AllowColumnFamilyChanges = false });
+        back.Add(Op.Compact("blobs")).Verify().Dump();
+        await h.RunAsync(first, back);
+        await h.RunAsync(other, h.NewScript($"{other}-final"));
+
+        ReferenceModel ckptModel = ReferenceModel.FromContents(spec, h.Model.Checkpoints[ckpt]);
+        await h.RunAsync(first, h.NewScript($"{first}-checkpoint", ckpt, spec, ckptModel));
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
     // TTL
 
     [TestMethod]

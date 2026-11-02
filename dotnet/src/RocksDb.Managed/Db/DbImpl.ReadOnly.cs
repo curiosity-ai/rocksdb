@@ -94,7 +94,7 @@ internal sealed partial class DbImpl
                 ColumnFamilyOptions opts = PrepareCfOptions(cfOptions);
                 ValidateRecoveredColumnFamily(cf, opts);
                 var cfd = new ColumnFamilyData(cf.Id, cf.Name, opts, this) { LogNumber = cf.LogNumber };
-                Versions.AddColumnFamily(cfd, ToFileArrays(cf));
+                Versions.AddColumnFamily(cfd, ToFileArrays(cf), cf.BlobFiles.Values);
                 cfd.RecoverEpochNumbers();
                 cfd.Mem = cfd.ConstructNewMemtable(state.LastSequence);
                 RegisterCfForWrite(cfd);
@@ -212,6 +212,7 @@ internal sealed partial class DbImpl
         ct.ThrowIfCancellationRequested();
         bool resetMemtables = false;
         var obsolete = new List<ObsoleteTableFile>();
+        var obsoleteBlobs = new List<ObsoleteBlobFile>();
         lock (_mutex)
         {
             foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
@@ -224,7 +225,7 @@ internal sealed partial class DbImpl
                 if (cf is null) continue; // dropped by the primary: keep serving the last state
                 if (!SameFiles(cfd.Current.Storage, cf))
                 {
-                    Versions.AddColumnFamily(cfd, ToFileArrays(cf)); // installs a new current version
+                    Versions.AddColumnFamily(cfd, ToFileArrays(cf), cf.BlobFiles.Values); // installs a new current version
                 }
                 if (cf.LogNumber != cfd.LogNumber)
                 {
@@ -234,6 +235,7 @@ internal sealed partial class DbImpl
             }
             // Never delete the primary's files: just drop cached readers of files no version uses any more.
             Versions.TakeObsoleteFiles(obsolete);
+            Versions.TakeObsoleteBlobFiles(obsoleteBlobs);
             if (resetMemtables)
             {
                 foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
@@ -245,6 +247,7 @@ internal sealed partial class DbImpl
             }
         }
         foreach (ObsoleteTableFile t in obsolete) t.Cfd.TableCache.Evict(t.Meta.FileNumber);
+        foreach (ObsoleteBlobFile b in obsoleteBlobs) b.Cfd.BlobSource.Evict(b.BlobFileNumber);
         if (resetMemtables) DisposeSecondaryReaders();
 
         ulong minLog;

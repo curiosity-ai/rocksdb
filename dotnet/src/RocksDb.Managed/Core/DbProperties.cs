@@ -69,6 +69,22 @@ public static class DbProperties
     public const string BlockCachePinnedUsage = "rocksdb.block-cache-pinned-usage";
     /// <summary>Block cache capacity / usage map (kBlockCacheEntryStats, map property; subset).</summary>
     public const string BlockCacheEntryStats = "rocksdb.block-cache-entry-stats";
+    /// <summary>Number of blob files in the current version (kNumBlobFiles).</summary>
+    public const string NumBlobFiles = "rocksdb.num-blob-files";
+    /// <summary>Blob file count, size, garbage and space amplification of the current version (kBlobStats).</summary>
+    public const string BlobStats = "rocksdb.blob-stats";
+    /// <summary>Total size of the blob files of all live versions (kTotalBlobFileSize).</summary>
+    public const string TotalBlobFileSize = "rocksdb.total-blob-file-size";
+    /// <summary>Total size of the blob files of the current version (kLiveBlobFileSize).</summary>
+    public const string LiveBlobFileSize = "rocksdb.live-blob-file-size";
+    /// <summary>Total garbage in the blob files of the current version (kLiveBlobFileGarbageSize).</summary>
+    public const string LiveBlobFileGarbageSize = "rocksdb.live-blob-file-garbage-size";
+    /// <summary>Blob cache capacity (kBlobCacheCapacity).</summary>
+    public const string BlobCacheCapacity = "rocksdb.blob-cache-capacity";
+    /// <summary>Blob cache usage (kBlobCacheUsage).</summary>
+    public const string BlobCacheUsage = "rocksdb.blob-cache-usage";
+    /// <summary>Pinned blob cache usage (kBlobCachePinnedUsage).</summary>
+    public const string BlobCachePinnedUsage = "rocksdb.blob-cache-pinned-usage";
     /// <summary>Number of live versions (kNumLiveVersions).</summary>
     public const string NumLiveVersions = "rocksdb.num-live-versions";
     /// <summary>Number of the current super version (kCurrentSuperVersionNumber).</summary>

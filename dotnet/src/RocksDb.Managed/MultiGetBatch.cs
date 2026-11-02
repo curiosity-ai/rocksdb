@@ -184,6 +184,7 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
     internal bool[] MayMatch => _mayMatch;
     internal GetContext Context(int key) => _contexts[key]!;
     internal ReadOnlySpan<byte> UserKey(int key) => _keyBytes.AsSpan(_keyOffsets[key], _keyLengths[key]);
+    internal ReadOnlyMemory<byte> UserKeyMemory(int key) => _keyBytes.AsMemory(_keyOffsets[key], _keyLengths[key]);
 
     /// <summary>
     /// Prepares a run: resets the per-key lookup state, builds the lookup keys at <paramref name="sequence"/> and sorts

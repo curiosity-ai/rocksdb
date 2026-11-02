@@ -73,6 +73,8 @@ public sealed class CompactRangeOptions
     public bool AllowWriteStall { get; set; }
     /// <summary>0 means use DbOptions.MaxSubcompactions.</summary>
     public uint MaxSubcompactions { get; set; }
-    /// <summary>-1 means use the column family setting.</summary>
+    /// <summary>Overrides enable_blob_garbage_collection for this compaction (default: use the column family setting).</summary>
+    public BlobGarbageCollectionPolicy BlobGarbageCollectionPolicy { get; set; } = BlobGarbageCollectionPolicy.UseDefault;
+    /// <summary>Overrides blob_garbage_collection_age_cutoff; values outside [0, 1] (default -1) use the column family setting.</summary>
     public double BlobGarbageCollectionAgeCutoff { get; set; } = -1;
 }

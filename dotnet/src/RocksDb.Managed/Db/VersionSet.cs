@@ -5,6 +5,9 @@ namespace RocksDb.Managed.Db;
 /// <summary>A file that no live version references any more (VersionSet obsolete_files_ / ObsoleteFileInfo).</summary>
 internal readonly record struct ObsoleteTableFile(FileMetaData Meta, ColumnFamilyData Cfd);
 
+/// <summary>A blob file that no live version references any more (VersionSet obsolete_blob_files_ / ObsoleteBlobFileInfo).</summary>
+internal readonly record struct ObsoleteBlobFile(ulong BlobFileNumber, ColumnFamilyData Cfd);
+
 /// <summary>
 /// The set of column families with their current versions, plus the DB-wide counters persisted in the MANIFEST
 /// (next file number, last sequence, min log number to keep) and the MANIFEST writer. Port of rocksdb::VersionSet
@@ -26,6 +29,9 @@ internal sealed class VersionSet : IAsyncDisposable
     private readonly Dictionary<uint, ColumnFamilyData> _cfs = new();
     private readonly Dictionary<ulong, int> _fileRefs = new();
     private readonly List<ObsoleteTableFile> _obsoleteFiles = new();
+    // Blob files: references from live versions (the shared_ptr<SharedBlobFileMetaData> counts upstream).
+    private readonly Dictionary<ulong, (int Refs, ulong FileSize, ColumnFamilyData Cfd)> _blobFileRefs = new();
+    private readonly List<ObsoleteBlobFile> _obsoleteBlobFiles = new();
 
     private ulong _nextFileNumber = 2;
     private ulong _lastSequence;          // last published sequence (visible to readers)
@@ -110,11 +116,24 @@ internal sealed class VersionSet : IAsyncDisposable
     }
 
     /// <summary>Registers a column family with an initial version built from <paramref name="files"/>. REQUIRES: DB mutex.</summary>
-    public void AddColumnFamily(ColumnFamilyData cfd, FileMetaData[][]? files)
+    public void AddColumnFamily(ColumnFamilyData cfd, FileMetaData[][]? files) => AddColumnFamily(cfd, files, null);
+
+    /// <summary>
+    /// Registers a column family with an initial version built from <paramref name="files"/> and the recovered
+    /// <paramref name="blobFiles"/> (null = none). REQUIRES: DB mutex.
+    /// </summary>
+    public void AddColumnFamily(ColumnFamilyData cfd, FileMetaData[][]? files, IEnumerable<BlobFileState>? blobFiles)
     {
         _cfs[cfd.Id] = cfd;
         if (cfd.Id > MaxColumnFamily) MaxColumnFamily = cfd.Id;
-        var storage = new VersionStorageInfo(cfd.Icmp, Math.Max(cfd.NumLevels, files?.Length ?? 0), cfd.Options, files);
+        Blob.BlobFileMetaData[] blobs = [];
+        if (blobFiles is not null)
+        {
+            var baseList = new List<Blob.BlobFileMetaData>();
+            foreach (BlobFileState b in blobFiles) baseList.Add(new Blob.BlobFileMetaData(b.Addition, b.GarbageBlobCount, b.GarbageBlobBytes, []));
+            blobs = Blob.BlobFileMetaData.Build(baseList, null, files ?? []);
+        }
+        var storage = new VersionStorageInfo(cfd.Icmp, Math.Max(cfd.NumLevels, files?.Length ?? 0), cfd.Options, files, blobs);
         var v = new DbVersion(cfd, storage, ++_versionNumber);
         InstallVersion(cfd, v);
     }
@@ -140,6 +159,11 @@ internal sealed class VersionSet : IAsyncDisposable
                 _fileRefs[f.FileNumber] = _fileRefs.GetValueOrDefault(f.FileNumber) + 1;
             }
         }
+        foreach (Blob.BlobFileMetaData b in s.BlobFiles)
+        {
+            int refs = _blobFileRefs.TryGetValue(b.BlobFileNumber, out var e) ? e.Refs : 0;
+            _blobFileRefs[b.BlobFileNumber] = (refs + 1, b.TotalBlobBytes + Blob.BlobLogFormat.HeaderSize + Blob.BlobLogFormat.FooterSize, v.Cfd);
+        }
     }
 
     /// <summary>Drops a version reference; files no longer referenced become obsolete. REQUIRES: DB mutex.</summary>
@@ -164,6 +188,43 @@ internal sealed class VersionSet : IAsyncDisposable
                 }
             }
         }
+        foreach (Blob.BlobFileMetaData b in s.BlobFiles)
+        {
+            var e = _blobFileRefs[b.BlobFileNumber];
+            if (e.Refs == 1)
+            {
+                _blobFileRefs.Remove(b.BlobFileNumber);
+                _obsoleteBlobFiles.Add(new ObsoleteBlobFile(b.BlobFileNumber, v.Cfd));
+            }
+            else
+            {
+                _blobFileRefs[b.BlobFileNumber] = (e.Refs - 1, e.FileSize, e.Cfd);
+            }
+        }
+    }
+
+    /// <summary>
+    /// ColumnFamilyData::GetTotalBlobFileSize: total size of the blob files referenced by any live version of
+    /// <paramref name="cfd"/>. REQUIRES: DB mutex.
+    /// </summary>
+    public ulong TotalBlobFileSize(ColumnFamilyData cfd)
+    {
+        ulong total = 0;
+        foreach (var e in _blobFileRefs.Values)
+        {
+            if (e.Cfd == cfd) total += e.FileSize;
+        }
+        return total;
+    }
+
+    /// <summary>True if some live version references the blob file. REQUIRES: DB mutex.</summary>
+    public bool IsLiveBlobFile(ulong blobFileNumber) => _blobFileRefs.ContainsKey(blobFileNumber);
+
+    /// <summary>Moves the obsolete blob files to <paramref name="into"/>. REQUIRES: DB mutex.</summary>
+    public void TakeObsoleteBlobFiles(List<ObsoleteBlobFile> into)
+    {
+        into.AddRange(_obsoleteBlobFiles);
+        _obsoleteBlobFiles.Clear();
     }
 
     /// <summary>True if some live version references the table file. REQUIRES: DB mutex.</summary>
@@ -206,6 +267,7 @@ internal sealed class VersionSet : IAsyncDisposable
         {
             RecoveredVersionState? snapshot = null;
             FileMetaData[][]? newFiles = null;
+            Blob.BlobFileMetaData[]? newBlobFiles = null;
             bool newManifest;
             lock (_db.Mutex)
             {
@@ -220,9 +282,12 @@ internal sealed class VersionSet : IAsyncDisposable
                 {
                     edit.MaxColumnFamily = Math.Max(MaxColumnFamily, edit.ColumnFamily);
                 }
-                else if (cfd is not null && !edit.IsColumnFamilyDrop && (edit.NewFiles.Count > 0 || edit.DeletedFiles.Count > 0))
+                else if (cfd is not null && !edit.IsColumnFamilyDrop && (edit.NewFiles.Count > 0 || edit.DeletedFiles.Count > 0 ||
+                                                                         edit.BlobFileAdditions.Count > 0 || edit.BlobFileGarbages.Count > 0))
                 {
-                    newFiles = cfd.Current.Storage.ApplyEdit(edit, cfd.NumLevels);
+                    VersionStorageInfo cur = cfd.Current.Storage;
+                    newFiles = cur.ApplyEdit(edit, cfd.NumLevels);
+                    newBlobFiles = Blob.BlobFileMetaData.Build(cur.BlobFiles, edit, newFiles);
                 }
                 newManifest = _manifest is null || (ulong)_manifestLog!.Log.File!.Size >= _db.Options.MaxManifestFileSize;
                 if (newManifest)
@@ -325,7 +390,7 @@ internal sealed class VersionSet : IAsyncDisposable
                 {
                     if (newFiles is not null)
                     {
-                        var storage = new VersionStorageInfo(cfd.Icmp, newFiles.Length, cfd.Options, newFiles);
+                        var storage = new VersionStorageInfo(cfd.Icmp, newFiles.Length, cfd.Options, newFiles, newBlobFiles ?? []);
                         InstallVersion(cfd, new DbVersion(cfd, storage, ++_versionNumber));
                     }
                     if (edit.LogNumber is ulong ln && ln > cfd.LogNumber) cfd.LogNumber = ln;
@@ -380,6 +445,15 @@ internal sealed class VersionSet : IAsyncDisposable
             {
                 List<FileMetaData> level = cv.MutableLevel(l);
                 foreach (FileMetaData f in s.LevelFiles(l)) level.Add(f);
+            }
+            foreach (Blob.BlobFileMetaData b in s.BlobFiles)
+            {
+                cv.BlobFiles[b.BlobFileNumber] = new BlobFileState
+                {
+                    Addition = b.Addition,
+                    GarbageBlobCount = b.GarbageBlobCount,
+                    GarbageBlobBytes = b.GarbageBlobBytes,
+                };
             }
             state.ColumnFamilies[c.Id] = cv;
         }

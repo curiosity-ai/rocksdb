@@ -284,6 +284,25 @@ releases its file (`Park` drops the lease and the blocks and keeps the objects).
 Remaining gaps: flush / compaction CPU per entry 1.4 - 2x native; background compaction throughput under sustained
 writes; `fillsync` and `flush` in the matrix carry first-run effects; reverse iteration copies values (no block pinning).
 
+## Integrated BlobDB (blob files)
+
+`bench/results/2026-11-02-vm-blob.md`: num=200k, 1 KiB values, `--enable_blob_files 1 --min_blob_size 512`, 16 MiB
+write buffer, single thread, shared 4-vCPU VM under load (load average 6-10; noisy). Geometric mean of the µs/op ratio vs
+c-native: rocksdb-sharp 0.84x, managed 0.55x, managed-async 0.53x. Per benchmark (managed / C): fillrandom 0.44x,
+overwrite 0.50x, flush 0.41x, readrandom 0.69x, multireadrandom 0.66x, seekrandom 0.45x, readseq 0.77x, compact 0.57x.
+The LSM shape after the fills is identical for all engines (`2 0 0 0 0 0 1`); write amplification 1.11 (managed) vs
+1.08 (native; the managed flush keeps every version, see the validation notes).
+
+Hot-path notes: a Get of a blob value reads the record into an `ArrayPool` buffer (the record header is verified with
+verify_checksums, like upstream), decompresses or copies it into the lookup's scratch buffer and then into the value
+buffer (one extra copy of the blob compared with native's pinned slice); steady state allocates nothing beyond the
+existing Get path (31.5 B/op is the benchmark harness, as in the non-blob runs). Blob cache keys are derived once per
+blob file. Iterators read a blob on the first `Value` access (sync I/O; `ScanAsync` / `PrepareValueAsync` use async
+reads). Flush and compaction write blobs through the same buffered `IWritableFile` as table files.
+
+Open follow-ups: blob prefetching for compaction (`blob_compaction_readahead_size` is recorded only), batched blob reads
+for MultiGet (one read per blob today), avoiding the extra blob copy in Get (swap the scratch and value buffers).
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
