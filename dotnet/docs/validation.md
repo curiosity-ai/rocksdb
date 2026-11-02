@@ -190,7 +190,9 @@ Remaining risks:
   super version first, then the sequence.
 - Close does not fsync the WAL (like upstream). Unsynced writes acknowledged before a close can be lost on power loss.
 - ~~No automatic recovery from background errors~~: ported, see "Background errors, listeners and backups" below.
-- Secondary instances re-read the MANIFEST in full on every catch-up.
+- ~~Secondary instances re-read the MANIFEST in full on every catch-up~~: they tail it (ReactiveVersionSet /
+  ManifestTailer port in `Db/DbImpl.ReadOnly.cs`) and replay a MANIFEST from its start only when CURRENT names a new
+  one. Remaining difference: new versions are installed without the point-in-time check that their table files exist.
 
 ## Background errors, listeners and backups
 
