@@ -288,13 +288,47 @@ public abstract class Transaction : IDisposable
     public bool TryGetForUpdate(ReadOptions? options, ReadOnlySpan<byte> key, IBufferWriter<byte> value) =>
         TryGetForUpdate(options, null!, key, value, exclusive: true);
 
-    public bool TryGetForUpdate(ReadOptions? options, ColumnFamily columnFamily, ReadOnlySpan<byte> key, IBufferWriter<byte> value, bool exclusive)
+    public bool TryGetForUpdate(ReadOptions? options, ColumnFamily columnFamily, ReadOnlySpan<byte> key, IBufferWriter<byte> value, bool exclusive) =>
+        TryGetForUpdate(options, columnFamily, key, value, exclusive, doValidate: true);
+
+    /// <summary>
+    /// GetForUpdate with <c>do_validate</c>: when <paramref name="doValidate"/> is false the key is locked (pessimistic)
+    /// but not validated against the transaction's snapshot or read timestamp, and an optimistic transaction does not
+    /// track it for the commit-time conflict check. Without validation, a snapshot in <paramref name="options"/> or a
+    /// read timestamp set with <see cref="SetReadTimestampForValidation"/> is an error (InvalidArgument), like upstream.
+    /// </summary>
+    public bool TryGetForUpdate(ReadOptions? options, ColumnFamily columnFamily, ReadOnlySpan<byte> key, IBufferWriter<byte> value, bool exclusive,
+        bool doValidate)
     {
         ThrowIfDisposed();
+        CheckDoValidate(options, doValidate);
         ColumnFamilyData cfd = Cfd(columnFamily);
-        options = PrepareGetForUpdateOptions(options, cfd, doValidate: true);
-        ThrowIfError(WaitSync(TryLock(cfd, key, readOnly: true, exclusive, doValidate: true, synchronous: true, CancellationToken.None)));
+        options = PrepareGetForUpdateOptions(options, cfd, doValidate);
+        ThrowIfError(WaitSync(TryLock(cfd, key, readOnly: true, exclusive, doValidate, synchronous: true, CancellationToken.None)));
         return value is null ? false : GetFromBatchAndDb(options, cfd, key, value);
+    }
+
+    /// <summary>TransactionBaseImpl::GetForUpdate: do_validate = false is not defined with a snapshot.</summary>
+    private static void CheckDoValidate(ReadOptions? options, bool doValidate)
+    {
+        if (!doValidate && options?.Snapshot is not null)
+        {
+            ThrowHelper.InvalidArgument("If do_validate is false then GetForUpdate with snapshot is not defined.");
+        }
+    }
+
+    /// <summary>GetForUpdate with <c>do_validate</c> (see <see cref="TryGetForUpdate(ReadOptions?, ColumnFamily, ReadOnlySpan{byte}, IBufferWriter{byte}, bool, bool)"/>).</summary>
+    public byte[]? GetForUpdate(ReadOptions? options, ColumnFamily columnFamily, ReadOnlySpan<byte> key, bool exclusive, bool doValidate)
+    {
+        PooledBufferWriter w = ObjectPools.RentWriter();
+        try
+        {
+            return TryGetForUpdate(options, columnFamily, key, w, exclusive, doValidate) ? w.WrittenSpan.ToArray() : null;
+        }
+        finally
+        {
+            ObjectPools.ReturnWriter(w);
+        }
     }
 
     public byte[]? GetForUpdate(ReadOnlySpan<byte> key) => GetForUpdate(null, null!, key, exclusive: true);
@@ -316,13 +350,19 @@ public abstract class Transaction : IDisposable
         TryGetForUpdateAsync(options, null!, key, value, exclusive: true, cancellationToken);
 
     public ValueTask<bool> TryGetForUpdateAsync(ReadOptions? options, ColumnFamily columnFamily, ReadOnlyMemory<byte> key, IBufferWriter<byte> value, bool exclusive,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        TryGetForUpdateAsync(options, columnFamily, key, value, exclusive, doValidate: true, cancellationToken);
+
+    /// <summary>Async GetForUpdate with <c>do_validate</c> (see <see cref="TryGetForUpdate(ReadOptions?, ColumnFamily, ReadOnlySpan{byte}, IBufferWriter{byte}, bool, bool)"/>).</summary>
+    public ValueTask<bool> TryGetForUpdateAsync(ReadOptions? options, ColumnFamily columnFamily, ReadOnlyMemory<byte> key, IBufferWriter<byte> value, bool exclusive,
+        bool doValidate, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(value);
+        CheckDoValidate(options, doValidate);
         ColumnFamilyData cfd = Cfd(columnFamily);
-        options = PrepareGetForUpdateOptions(options, cfd, doValidate: true);
-        ValueTask<RocksDbException?> t = TryLock(cfd, key.Span, readOnly: true, exclusive, doValidate: true, synchronous: false, cancellationToken);
+        options = PrepareGetForUpdateOptions(options, cfd, doValidate);
+        ValueTask<RocksDbException?> t = TryLock(cfd, key.Span, readOnly: true, exclusive, doValidate, synchronous: false, cancellationToken);
         if (t.IsCompletedSuccessfully)
         {
             ThrowIfError(t.Result);
@@ -624,14 +664,14 @@ public abstract class Transaction : IDisposable
     /// with user-defined timestamps must not have a version newer than <paramref name="timestamp"/>. Cannot decrease.
     /// Only supported by pessimistic (WriteCommitted) transactions.
     /// </summary>
-    public virtual void SetReadTimestampForValidation(ulong timestamp) => ThrowHelper.NotSupported("SetReadTimestampForValidation");
+    public virtual void SetReadTimestampForValidation(ulong timestamp) => ThrowHelper.NotSupported("timestamp not supported");
 
     /// <summary>
     /// Transaction::SetCommitTimestamp: the timestamp assigned at commit to every write of this transaction on column
     /// families with user-defined timestamps (required when there are such writes). Only supported by pessimistic
     /// (WriteCommitted) transactions.
     /// </summary>
-    public virtual void SetCommitTimestamp(ulong timestamp) => ThrowHelper.NotSupported("SetCommitTimestamp");
+    public virtual void SetCommitTimestamp(ulong timestamp) => ThrowHelper.NotSupported("timestamp not supported");
 
     /// <summary>The commit timestamp (<see cref="MaxTimestamp"/> when not set).</summary>
     public virtual ulong CommitTimestamp => MaxTimestamp;

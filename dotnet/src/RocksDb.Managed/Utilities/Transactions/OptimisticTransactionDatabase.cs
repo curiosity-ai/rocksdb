@@ -125,6 +125,14 @@ internal sealed class OptimisticTransaction : Transaction, IWriteCallback
 
     internal OptimisticTransactionDatabase Owner => _owner;
 
+    /// <summary>
+    /// Like upstream, an optimistic transaction accepts operations on column families with user-defined timestamps (the
+    /// write batch gets placeholder timestamps), but it cannot assign a commit timestamp (SetCommitTimestamp is
+    /// NotSupported "timestamp not supported", the default of rocksdb::Transaction), so a commit with such writes fails in
+    /// DBImpl::WriteImpl with InvalidArgument "write batch must have timestamp(s) set".
+    /// </summary>
+    private protected override bool SupportsUserDefinedTimestamps => true;
+
     public override TransactionState State => _state;
 
     internal void Reinitialize(WriteOptions? writeOptions, OptimisticTransactionOptions options)
@@ -151,6 +159,8 @@ internal sealed class OptimisticTransaction : Transaction, IWriteCallback
     private protected override ValueTask CommitCoreAsync(bool synchronous, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        // DBImpl::WriteImpl: WriteBatchInternal::TimestampsUpdateNeeded (placeholder timestamps never replaced).
+        if (_batch.Wbwi.HasKeyWithTimestamp) ThrowHelper.InvalidArgument("write batch must have timestamp(s) set");
         // Like upstream, an optimistic transaction can keep being used (and committed) after a commit or rollback.
         return _owner.ValidatePolicy == OccValidationPolicy.ValidateSerial
             ? CommitWithSerialValidateAsync(synchronous, cancellationToken)
