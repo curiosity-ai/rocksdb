@@ -349,4 +349,162 @@ public sealed class TableFeatureTests
             FilterAllocationModel.Allocator = saved;
         }
     }
+
+    // ------------------------------------------------------------------------------------------- format features
+
+    /// <summary>Keys "pNNN/xxxxx" with ~100 prefixes spanning one or several data blocks.</summary>
+    private static List<(byte[] Key, byte[] Value)> PrefixEntries(int seed)
+    {
+        var rnd = new Random(seed);
+        var set = new SortedSet<string>(StringComparer.Ordinal);
+        for (int p = 0; p < 100; p++)
+        {
+            int prefix = rnd.Next(1000), n = 1 + rnd.Next(60);
+            for (int i = 0; i < n; i++) set.Add("p" + prefix.ToString("D3") + "/" + rnd.Next(100000).ToString("D5"));
+        }
+        var list = new List<(byte[], byte[])>();
+        foreach (string k in set) list.Add((TableTestUtil.IKey(k, 5), Encoding.ASCII.GetBytes("value-of-" + k)));
+        return list;
+    }
+
+    /// <summary>
+    /// kHashSearch: the hash index meta blocks are written, the reader builds the prefix index and point lookups through
+    /// it agree with binary search (present keys, absent keys in present prefixes, absent prefixes).
+    /// </summary>
+    [TestMethod]
+    [DataRow(5, false)]
+    [DataRow(7, true)]
+    [DataRow(8, false)]
+    public void HashIndexRoundTrip(int formatVersion, bool separatedKv)
+    {
+        List<(byte[] Key, byte[] Value)> entries = PrefixEntries(formatVersion);
+        SliceTransform pe = SliceTransform.CreateFixedPrefix(4);
+        var format = new TableFormatOptions
+        {
+            FormatVersion = formatVersion,
+            BlockSize = 256,
+            IndexType = IndexType.HashSearch,
+            SeparateKeyValueInDataBlock = separatedKv,
+        };
+        byte[] file = TableTestUtil.BuildTable(entries, format, new TableBuilderOptions { PrefixExtractor = pe });
+        using BlockBasedTableReader hashed = TableTestUtil.Open(file, new TableReaderOptions { PrefixExtractor = pe });
+        using BlockBasedTableReader plain = TableTestUtil.Open(file, TableReaderOptions.Default);
+        Assert.AreEqual(IndexType.HashSearch, hashed.IndexType);
+        Assert.IsNotNull(hashed.PrefixIndex);
+        // Built from the recreated table extractor too, but unused for lookups (prefix extractor changed).
+        Assert.IsNotNull(plain.PrefixIndex);
+        Assert.IsTrue(hashed.MetaBlocks.ContainsKey(BlockBasedTableConstants.HashIndexPrefixesBlockName));
+        Assert.IsTrue(hashed.MetaBlocks.ContainsKey(BlockBasedTableConstants.HashIndexPrefixesMetadataBlockName));
+        using var value = new PooledBufferWriter();
+        foreach ((byte[] k, byte[] v) in entries)
+        {
+            string uk = TableTestUtil.UserKeyOf(k);
+            value.Clear();
+            TableGetResult r = hashed.Get(TableTestUtil.LookupKey(uk), value);
+            Assert.IsTrue(r.Found, uk);
+            CollectionAssert.AreEqual(v, value.WrittenSpan.ToArray());
+            foreach (string probe in new[] { uk + "0", uk[..4] + "/", uk[..4] + "~", "a" + uk[1..], "z" + uk[1..] })
+                Assert.AreEqual(plain.Get(TableTestUtil.LookupKey(probe), null).Found, hashed.Get(TableTestUtil.LookupKey(probe), null).Found, probe);
+        }
+        // Without a prefix extractor the table cannot be written.
+        var ex = Assert.ThrowsExactly<RocksDbException>(() => TableTestUtil.BuildTable(entries, format));
+        Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
+    }
+
+    [TestMethod]
+    public void BlockPrefixIndexBuckets()
+    {
+        // Prefix "aa" spans blocks 0..1, "ab" block 1, "ac" blocks 3..5 (varint32 length, first block, number of blocks).
+        byte[] prefixes = "aaabac"u8.ToArray();
+        byte[] meta = [2, 0, 2, 2, 1, 1, 2, 3, 3];
+        BlockPrefixIndex idx = BlockPrefixIndex.Create(prefixes, meta);
+        Assert.AreEqual(4, idx.NumBuckets);
+        CollectionAssert.IsSubsetOf(new uint[] { 0, 1 }, idx.GetBlocks("aa"u8).ToArray());
+        CollectionAssert.Contains(idx.GetBlocks("ab"u8).ToArray(), 1u);
+        CollectionAssert.IsSubsetOf(new uint[] { 3, 4, 5 }, idx.GetBlocks("ac"u8).ToArray());
+        uint[] blocks = idx.GetBlocks("ac"u8).ToArray();
+        for (int i = 1; i < blocks.Length; i++) Assert.IsTrue(blocks[i - 1] < blocks[i], "ascending");
+        Assert.AreEqual(StatusCode.Corruption, Assert.ThrowsExactly<RocksDbException>(() => BlockPrefixIndex.Create("aa"u8, [3, 0, 1])).Code);
+        Assert.AreEqual(StatusCode.Corruption, Assert.ThrowsExactly<RocksDbException>(() => BlockPrefixIndex.Create("aab"u8, [2, 0, 1])).Code);
+    }
+
+    /// <summary>block_align and super block alignment: padding only between data blocks, every key still readable.</summary>
+    [TestMethod]
+    [DataRow(true, 0L, 7)]
+    [DataRow(false, 4096L, 7)]
+    [DataRow(false, 4096L, 8)]
+    [DataRow(false, 2048L, 4)]
+    public void AlignedTablesRoundTrip(bool blockAlign, long superBlock, int formatVersion)
+    {
+        List<(byte[] Key, byte[] Value)> entries = TableTestUtil.MakeEntries(3000, 3, 120);
+        var format = new TableFormatOptions
+        {
+            FormatVersion = formatVersion,
+            BlockSize = 1024,
+            BlockAlign = blockAlign,
+            SuperBlockAlignmentSize = superBlock,
+            SuperBlockAlignmentSpaceOverheadRatio = 4,
+        };
+        byte[] file = TableTestUtil.BuildTable(entries, format);
+        using BlockBasedTableReader r = TableTestUtil.Open(file);
+        using (BlockIter idx = new())
+        {
+            r.InitIndexIter(idx, r.IndexBlock);
+            bool padded = false;
+            ulong expectedNext = 0;
+            for (idx.SeekToFirst(); idx.Valid; idx.Next())
+            {
+                BlockHandle h = idx.BlockHandle;
+                if (blockAlign) Assert.AreEqual(0UL, h.Offset % 1024, "block_align offset");
+                if (superBlock > 0)
+                    Assert.AreEqual(h.Offset / (ulong)superBlock, (h.Offset + h.Size - 1) / (ulong)superBlock, "block straddles a super block");
+                padded |= h.Offset != expectedNext;
+                expectedNext = h.Offset + h.Size + BlockBasedTableConstants.BlockTrailerSize;
+            }
+            Assert.IsTrue(padded, "expected padding");
+        }
+        using var value = new PooledBufferWriter();
+        foreach ((byte[] k, byte[] v) in entries)
+        {
+            value.Clear();
+            Assert.IsTrue(r.Get(TableTestUtil.LookupKey(TableTestUtil.UserKeyOf(k)), value).Found);
+            CollectionAssert.AreEqual(v, value.WrittenSpan.ToArray());
+        }
+    }
+
+    [TestMethod]
+    public void AlignmentOptionsAreValidated()
+    {
+        List<(byte[] Key, byte[] Value)> entries = TableTestUtil.MakeEntries(10, 1);
+        Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(
+            () => TableTestUtil.BuildTable(entries, new TableFormatOptions { BlockAlign = true, BlockSize = 1000 })).Code);
+        Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(
+            () => TableTestUtil.BuildTable(entries, new TableFormatOptions { BlockAlign = true }, new TableBuilderOptions { CompressionType = CompressionType.Snappy })).Code);
+        Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(
+            () => TableTestUtil.BuildTable(entries, new TableFormatOptions { SuperBlockAlignmentSize = 3000 })).Code);
+        Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(
+            () => TableTestUtil.BuildTable(entries, new TableFormatOptions { SuperBlockAlignmentSize = 4096, SuperBlockAlignmentSpaceOverheadRatio = 2 })).Code);
+    }
+
+    [TestMethod]
+    public void NewTableOptionsRoundTripThroughOptionsFile()
+    {
+        var t = new BlockBasedTableOptions
+        {
+            SeparateKeyValueInDataBlock = true,
+            UniformCvThreshold = 0.25,
+            SuperBlockAlignmentSize = 1 << 20,
+            SuperBlockAlignmentSpaceOverheadRatio = 64,
+            IndexType = IndexType.HashSearch,
+        };
+        TableFormatOptions f = TableFactory.CreateFormatOptions(t);
+        Assert.IsTrue(f.SeparateKeyValueInDataBlock);
+        Assert.AreEqual(0.25, f.UniformCvThreshold);
+        Assert.AreEqual(1L << 20, f.SuperBlockAlignmentSize);
+        Assert.AreEqual(64L, f.SuperBlockAlignmentSpaceOverheadRatio);
+        var copy = t.Clone();
+        Assert.IsTrue(copy.SeparateKeyValueInDataBlock);
+        Assert.AreEqual(0.25, copy.UniformCvThreshold);
+        Assert.AreEqual((ulong)(1 << 20), copy.SuperBlockAlignmentSize);
+    }
 }

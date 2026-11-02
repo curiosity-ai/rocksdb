@@ -82,6 +82,9 @@ internal sealed class ColumnFamilyData
         Icmp = ucmp.Kind == ComparatorKind.Bytewise ? InternalKeyComparator.Bytewise : new InternalKeyComparator(ucmp);
         TimestampSize = ucmp.TimestampSize;
         if (TimestampSize > 0 && !options.PersistUserDefinedTimestamps) ValidateMemtableOnlyTimestamps(ucmp, db.Options);
+        // ColumnFamilyData::ValidateOptions / CheckConcurrentWritesSupported (db/column_family.cc).
+        if (db.Options.AllowConcurrentMemtableWrite && options.InplaceUpdateSupport)
+            ThrowHelper.InvalidArgument("In-place memtable updates (inplace_update_support) is not compatible with concurrent writes (allow_concurrent_memtable_write)");
         MergeOperator = options.MergeOperator;
         Format = TableFactory.CreateFormatOptions(options.TableOptions);
         ReaderOptions = TableFactory.CreateReaderOptions(options, Format, db.GetDefaultBlockCache(options.TableOptions), db.Identity.SessionId);
@@ -93,6 +96,7 @@ internal sealed class ColumnFamilyData
             ArenaBlockSize = (int)Math.Min(options.ArenaBlockSize, int.MaxValue / 2),
             TrackNewestTimestampSize = options.PersistUserDefinedTimestamps ? 0 : TimestampSize,
         };
+        MemOptions.ApplyColumnFamilyOptions(options);
         TableCache = new TableCache(db.FileSystem, db.DbPaths, ReaderOptions, db.Options.MaxOpenFiles);
         // Blob files live in cf_paths.front() (the first DB path); readers and the optional blob cache are per CF.
         BlobSource = new Blob.BlobSource(db.FileSystem, db.DbPaths[0], id, options.BlobCache, db.Identity.DbId, db.Identity.SessionId, db.Options.Statistics,

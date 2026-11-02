@@ -115,6 +115,27 @@ internal sealed partial class DbImpl
     /// DBImpl::GetImpl with an explicit read callback (WritePrepared / WriteUnprepared transactions): the resolved value
     /// is written to <paramref name="value"/>; returns false if the key does not exist.
     /// </summary>
+    /// <summary>
+    /// The DB read of MemTableInserter::PutCFImpl for an inplace_callback whose key is not in the memtable: a Get at
+    /// <paramref name="sequence"/> (an unregistered snapshot) without filling the block cache. Returns false if absent.
+    /// </summary>
+    internal bool GetForInplaceCallback(ColumnFamilyData cfd, ReadOnlySpan<byte> key, ulong sequence, System.Buffers.IBufferWriter<byte> value)
+    {
+        var options = new ReadOptions { Snapshot = new Snapshot(this, sequence, 0), FillCache = false };
+        GetContext ctx = GetContext.Rent(cfd.MergeOperator);
+        try
+        {
+            Get(cfd, options, key, ctx);
+            if (!ctx.TryResolve(key, out ReadOnlySpan<byte> result)) return false;
+            System.Buffers.BuffersExtensions.Write(value, result);
+            return true;
+        }
+        finally
+        {
+            GetContext.Return(ctx);
+        }
+    }
+
     internal bool GetWithCallback(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, ReadCallback callback, System.Buffers.IBufferWriter<byte> value)
     {
         ThrowIfDisposed();

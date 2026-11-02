@@ -13,9 +13,15 @@ internal abstract class IndexBuilder : IDisposable
     /// <summary>Called for every key added to a data block (before the block's index entry).</summary>
     public abstract void OnKeyAdded(ReadOnlySpan<byte> internalKey);
 
-    /// <summary>Adds the index entry of a finished data block; returns the separator key used.</summary>
+    /// <summary>
+    /// Adds the index entry of a finished data block; returns the separator key used. <paramref name="skipDeltaEncoding"/>
+    /// is set when super block alignment padding precedes the block (its handle is not contiguous with the previous one).
+    /// </summary>
     public abstract ReadOnlySpan<byte> AddIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
-        BlockHandle handle);
+        BlockHandle handle, bool skipDeltaEncoding);
+
+    /// <summary>NumUniformIndexBlocks: index blocks written with the "is_uniform" hint ("rocksdb.num.uniform.blocks").</summary>
+    public abstract ulong NumUniformIndexBlocks { get; }
 
     /// <summary>"separator_is_key_plus_seq": index keys are internal keys.</summary>
     public abstract bool SeparatorIsKeyPlusSeq { get; }
@@ -74,19 +80,21 @@ internal sealed class ShortenedIndexBuilder : IndexBuilder
     private bool _hasLastHandle;
     private BlockHandle _lastHandle;
     private int _indexSize;
+    private bool _isUniform;
     private bool _finished;
 
     /// <param name="stripTimestampSize">Timestamp size stripped from every index key and first key
     /// (persist_user_defined_timestamps = false), 0 to keep keys whole.</param>
+    /// <param name="uniformCvThreshold">uniform_cv_threshold for the index block (negative: never "is_uniform").</param>
     public ShortenedIndexBuilder(InternalKeyComparator icmp, int indexBlockRestartInterval, int formatVersion, bool useValueDeltaEncoding,
-        IndexShorteningMode shortening, bool includeFirstKey, bool useCommonPrefix, int stripTimestampSize)
+        IndexShorteningMode shortening, bool includeFirstKey, bool useCommonPrefix, int stripTimestampSize, double uniformCvThreshold)
     {
         _icmp = icmp;
         _stripTsSize = stripTimestampSize;
         _withSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75,
-            useCommonPrefix, isUserKey: false, stripTimestampSize);
+            useCommonPrefix, isUserKey: false, stripTimestampSize, useSeparatedKvStorage: false, uniformCvThreshold);
         _withoutSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75,
-            useCommonPrefix, isUserKey: true, stripTimestampSize);
+            useCommonPrefix, isUserKey: true, stripTimestampSize, useSeparatedKvStorage: false, uniformCvThreshold);
         _useValueDeltaEscape = BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(formatVersion);
         _useCommonPrefix = useCommonPrefix;
         _useValueDeltaEncoding = useValueDeltaEncoding;
@@ -111,6 +119,7 @@ internal sealed class ShortenedIndexBuilder : IndexBuilder
     internal BlockBuilder WithoutSeqBuilder => _withoutSeq;
 
     public override int IndexSize => _indexSize;
+    public override ulong NumUniformIndexBlocks => _isUniform ? 1UL : 0UL;
     public int CurrentSizeEstimate => _mustUseSeparatorWithSeq ? _withSeq.CurrentSizeEstimate : _withoutSeq.CurrentSizeEstimate;
 
     /// <summary>Port of ShortenedIndexBuilder::UpdateIndexSizeEstimate (computed on demand).</summary>
@@ -128,7 +137,7 @@ internal sealed class ShortenedIndexBuilder : IndexBuilder
 
     /// <summary>Port of ShortenedIndexBuilder::AddIndexEntry (GetSeparatorWithSeq + AddIndexEntryImpl).</summary>
     public override ReadOnlySpan<byte> AddIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
-        BlockHandle handle)
+        BlockHandle handle, bool skipDeltaEncoding)
     {
         ReadOnlySpan<byte> separator;
         if (hasNext)
@@ -169,14 +178,18 @@ internal sealed class ShortenedIndexBuilder : IndexBuilder
         _encoded.Clear();
         IndexValue.EncodeFull(_encoded, handle, _includeFirstKey, firstKey);
         _deltaEncoded.Clear();
-        if (_useValueDeltaEncoding && _hasLastHandle)
+        // Under format_version >= 8, a non-contiguous handle (skip_delta_encoding) is expressed with the in-value escape,
+        // so the value is still delta-encoded AND the key stays delta-encoded. Under format_version <= 7,
+        // skip_delta_encoding forces both a full value and a full (shared == 0) key.
+        bool forceFullKey = skipDeltaEncoding && !_useValueDeltaEscape;
+        if (_useValueDeltaEncoding && _hasLastHandle && (_useValueDeltaEscape || !skipDeltaEncoding))
             IndexValue.EncodeDelta(_deltaEncoded, handle, _lastHandle, _useValueDeltaEscape, _includeFirstKey, firstKey);
         _lastHandle = handle;
         _hasLastHandle = true;
 
-        _withSeq.Add(separator, _encoded.WrittenSpan, _deltaEncoded.WrittenSpan, false);
+        _withSeq.Add(separator, _encoded.WrittenSpan, _deltaEncoded.WrittenSpan, forceFullKey);
         if (!_mustUseSeparatorWithSeq)
-            _withoutSeq.Add(DbFormat.ExtractUserKey(separator), _encoded.WrittenSpan, _deltaEncoded.WrittenSpan, false);
+            _withoutSeq.Add(DbFormat.ExtractUserKey(separator), _encoded.WrittenSpan, _deltaEncoded.WrittenSpan, forceFullKey);
         _currentBlockFirstKey.Clear();
         return separator;
     }
@@ -189,7 +202,9 @@ internal sealed class ShortenedIndexBuilder : IndexBuilder
     {
         System.Diagnostics.Debug.Assert(!_finished);
         _finished = true;
-        ReadOnlySpan<byte> contents = _mustUseSeparatorWithSeq ? _withSeq.Finish() : _withoutSeq.Finish();
+        BlockBuilder b = _mustUseSeparatorWithSeq ? _withSeq : _withoutSeq;
+        ReadOnlySpan<byte> contents = b.Finish();
+        _isUniform = b.IsUniform;
         _indexSize = contents.Length;
         return contents;
     }
@@ -236,6 +251,8 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
     private readonly bool _valueDeltaEscape;
     private readonly bool _useCommonPrefixSub;
     private readonly int _stripTsSize;
+    private readonly double _uniformCvThreshold;
+    private ulong _numUniformIndexBlocks;
     private readonly int _metadataBlockSize;
     private readonly int _blockSizeDeviationLimit;
     private readonly BlockBuilder _indexBlockBuilder;
@@ -257,10 +274,11 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
 
     public PartitionedIndexBuilder(InternalKeyComparator icmp, int indexBlockRestartInterval, int formatVersion, bool useValueDeltaEncoding,
         IndexShorteningMode shortening, int metadataBlockSize, int blockSizeDeviation, bool useCommonPrefixTop, bool useCommonPrefixSub,
-        int stripTimestampSize)
+        int stripTimestampSize, double uniformCvThreshold)
     {
         _icmp = icmp;
         _stripTsSize = stripTimestampSize;
+        _uniformCvThreshold = uniformCvThreshold;
         _indexBlockRestartInterval = indexBlockRestartInterval;
         _formatVersion = formatVersion;
         _shortening = shortening;
@@ -283,6 +301,7 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
     public override int IndexSize => _indexSize;
     public override int NumPartitions => _partitionCount;
     public override int TopLevelIndexSize => _topLevelIndexSize;
+    public override ulong NumUniformIndexBlocks => _numUniformIndexBlocks;
 
     /// <summary>
     /// Port of PartitionedIndexBuilder::UpdateIndexSizeEstimate (computed on demand): completed partitions (their
@@ -315,7 +334,7 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
     private void MakeNewSubIndexBuilder()
     {
         var sub = new ShortenedIndexBuilder(_icmp, _indexBlockRestartInterval, _formatVersion, _useValueDeltaEncoding, _shortening,
-            includeFirstKey: false, _useCommonPrefixSub, _stripTsSize);
+            includeFirstKey: false, _useCommonPrefixSub, _stripTsSize, _uniformCvThreshold);
         _subIndexBuilder = sub;
         // Start next partition entry, where we will modify the key
         _entries.Add(new Entry(sub));
@@ -378,14 +397,14 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
 
     /// <summary>Port of PartitionedIndexBuilder::AddIndexEntry.</summary>
     public override ReadOnlySpan<byte> AddIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
-        BlockHandle handle)
+        BlockHandle handle, bool skipDeltaEncoding)
     {
         // At least when running without parallel compression, maintain behavior of avoiding a last index partition
         // with just one entry
         if (hasNext) MaybeFlush(lastKeyInCurrentBlock, handle);
 
         ShortenedIndexBuilder sub = _subIndexBuilder!;
-        ReadOnlySpan<byte> sep = sub.AddIndexEntry(lastKeyInCurrentBlock, firstKeyInNextBlock, hasNext, handle);
+        ReadOnlySpan<byte> sep = sub.AddIndexEntry(lastKeyInCurrentBlock, firstKeyInNextBlock, hasNext, handle, skipDeltaEncoding);
         PooledBufferWriter key = _entries[^1].Key;
         key.Clear();
         key.Write(sep);
@@ -447,7 +466,9 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
         // If there is no sub_index left, then return the 2nd level index.
         if (_front >= _entries.Count)
         {
-            contents = _mustUseSeparatorWithSeq ? _indexBlockBuilder.Finish() : _indexBlockBuilderWithoutSeq.Finish();
+            BlockBuilder top = _mustUseSeparatorWithSeq ? _indexBlockBuilder : _indexBlockBuilderWithoutSeq;
+            contents = top.Finish();
+            _numUniformIndexBlocks += top.IsUniform ? 1UL : 0UL;
             _topLevelIndexSize = contents.Length;
             _indexSize += _topLevelIndexSize;
             return true;
@@ -457,6 +478,7 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
         // Apply the policy to all sub-indexes
         entry.Value.MustUseSeparatorWithSeq = _mustUseSeparatorWithSeq;
         contents = entry.Value.Finish();
+        _numUniformIndexBlocks += entry.Value.NumUniformIndexBlocks;
         _indexSize += contents.Length;
         _finishingIndexes = true;
         return false;
@@ -476,5 +498,115 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
         _indexBlockBuilderWithoutSeq.Dispose();
         _encoded.Dispose();
         _deltaEncoded.Dispose();
+    }
+}
+
+/// <summary>
+/// kHashSearch index builder. Port of HashIndexBuilder (table/block_based/index_builder.h): a binary-searchable primary
+/// index (<see cref="ShortenedIndexBuilder"/>) plus two meta blocks describing, for every distinct key prefix (in key
+/// order), the data blocks it spans: "rocksdb.hashindex.prefixes" (the prefixes concatenated) and
+/// "rocksdb.hashindex.metadata" (varint32 prefix length, index of the first data block, number of data blocks). The
+/// reader turns them into a <see cref="BlockPrefixIndex"/>.
+/// </summary>
+internal sealed class HashIndexBuilder : IndexBuilder
+{
+    private readonly ShortenedIndexBuilder _primary;
+    private readonly SliceTransform _hashKeyExtractor;
+    // stores a sequence of prefixes
+    private readonly PooledBufferWriter _prefixBlock = new(1024);
+    // stores the metadata of prefixes
+    private readonly PooledBufferWriter _prefixMetaBlock = new(256);
+    // The following 3 variables keep the unflushed prefix and its metadata.
+    private uint _pendingBlockNum;
+    private uint _pendingEntryIndex;
+    private readonly PooledBufferWriter _pendingEntryPrefix = new(32);
+    private ulong _currentRestartIndex;
+
+    public HashIndexBuilder(InternalKeyComparator icmp, SliceTransform hashKeyExtractor, int indexBlockRestartInterval, int formatVersion,
+        bool useValueDeltaEncoding, IndexShorteningMode shortening, bool useCommonPrefix, int stripTimestampSize, double uniformCvThreshold)
+    {
+        _primary = new ShortenedIndexBuilder(icmp, indexBlockRestartInterval, formatVersion, useValueDeltaEncoding, shortening, includeFirstKey: false,
+            useCommonPrefix, stripTimestampSize, uniformCvThreshold);
+        _hashKeyExtractor = hashKeyExtractor;
+    }
+
+    public override bool SeparatorIsKeyPlusSeq => _primary.SeparatorIsKeyPlusSeq;
+    public override int IndexSize => _primary.IndexSize + _prefixBlock.WrittenCount + _prefixMetaBlock.WrittenCount;
+    public override ulong NumUniformIndexBlocks => _primary.NumUniformIndexBlocks;
+    // Upstream returns 0 (no tail size estimate for kHashSearch).
+    public override ulong CurrentIndexSizeEstimate(ulong numDataBlocks) => 0;
+
+    /// <summary>"rocksdb.hashindex.prefixes" contents (after <see cref="Finish"/>).</summary>
+    public ReadOnlySpan<byte> PrefixesBlock => _prefixBlock.WrittenSpan;
+    /// <summary>"rocksdb.hashindex.metadata" contents (after <see cref="Finish"/>).</summary>
+    public ReadOnlySpan<byte> PrefixesMetadataBlock => _prefixMetaBlock.WrittenSpan;
+
+    public override ReadOnlySpan<byte> AddIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
+        BlockHandle handle, bool skipDeltaEncoding)
+    {
+        ++_currentRestartIndex;
+        return _primary.AddIndexEntry(lastKeyInCurrentBlock, firstKeyInNextBlock, hasNext, handle, skipDeltaEncoding);
+    }
+
+    public override void OnKeyAdded(ReadOnlySpan<byte> internalKey)
+    {
+        ReadOnlySpan<byte> keyPrefix = Prefix(internalKey);
+        bool isFirstEntry = _pendingBlockNum == 0;
+        // Keys may share the prefix
+        if (isFirstEntry || !_pendingEntryPrefix.WrittenSpan.SequenceEqual(keyPrefix))
+        {
+            if (!isFirstEntry) FlushPendingPrefix();
+            _pendingEntryPrefix.Clear();
+            _pendingEntryPrefix.Write(keyPrefix);
+            _pendingBlockNum = 1;
+            _pendingEntryIndex = (uint)_currentRestartIndex;
+        }
+        else
+        {
+            // entry number increments when keys share the prefix reside in different data blocks.
+            ulong lastRestartIndex = (ulong)_pendingEntryIndex + _pendingBlockNum - 1;
+            System.Diagnostics.Debug.Assert(lastRestartIndex <= _currentRestartIndex);
+            if (lastRestartIndex != _currentRestartIndex) ++_pendingBlockNum;
+        }
+    }
+
+    /// <summary>
+    /// InternalKeySliceTransform::Transform: the prefix of the user key. Upstream applies the extractor without an InDomain
+    /// check; a fixed-length extractor then reads its length from the internal key (running into the footer for short user
+    /// keys), which is reproduced here for byte-identical output. Other out-of-domain keys use the whole user key.
+    /// </summary>
+    private ReadOnlySpan<byte> Prefix(ReadOnlySpan<byte> internalKey)
+    {
+        ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(internalKey);
+        if (_hashKeyExtractor.InDomain(userKey)) return _hashKeyExtractor.Transform(userKey);
+        if (_hashKeyExtractor.FullLengthEnabled(out int len) && len <= internalKey.Length) return internalKey[..len];
+        return userKey;
+    }
+
+    private void FlushPendingPrefix()
+    {
+        _prefixBlock.Write(_pendingEntryPrefix.WrittenSpan);
+        Coding.PutVarint32(_prefixMetaBlock, (uint)_pendingEntryPrefix.WrittenCount);
+        Coding.PutVarint32(_prefixMetaBlock, _pendingEntryIndex);
+        Coding.PutVarint32(_prefixMetaBlock, _pendingBlockNum);
+    }
+
+    public override bool Finish(BlockHandle lastPartitionHandle, out ReadOnlySpan<byte> contents)
+    {
+        if (_pendingBlockNum != 0)
+        {
+            FlushPendingPrefix();
+            _pendingBlockNum = 0;
+        }
+        contents = _primary.Finish();
+        return true;
+    }
+
+    public override void Dispose()
+    {
+        _primary.Dispose();
+        _prefixBlock.Dispose();
+        _prefixMetaBlock.Dispose();
+        _pendingEntryPrefix.Dispose();
     }
 }

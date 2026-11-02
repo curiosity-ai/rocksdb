@@ -36,9 +36,11 @@ public sealed class BlockIter : IDisposable
     public const ulong DisableGlobalSequenceNumber = ulong.MaxValue;
 
     private byte[] _data = [];
-    private int _restarts;      // offset of restart array == end of entries
+    private int _restarts;      // offset of restart array
+    private int _keysEnd;       // end of the entries (keys) section: == _restarts unless key/value are separated
+    private int _valuesSection = -1; // separated key/value storage: start of the values section (values end at _restarts)
     private int _numRestarts;
-    private int _current;       // offset of the current entry; == _restarts when invalid
+    private int _current;       // offset of the current entry; == _keysEnd when invalid
     private int _next;          // offset just past the current entry (incl. value)
     private int _restartIndex;  // restart block containing _current
     private int _hashMapOffset = -1;
@@ -152,7 +154,7 @@ public sealed class BlockIter : IDisposable
 
     private void UpdateModes()
     {
-        _slowParse = _valueDeltaEncoded || _padTsSize != 0;
+        _slowParse = _valueDeltaEncoded || _padTsSize != 0 || _valuesSection >= 0;
         _restartKeyFixup = _padTsSize != 0 || (_globalSeqno != DisableGlobalSequenceNumber && _keysAreInternal);
     }
 
@@ -168,6 +170,8 @@ public sealed class BlockIter : IDisposable
     {
         _kind = kind;
         _data = block.Buffer;
+        _keysEnd = block.KeysEndOffset;
+        _valuesSection = block.ValuesSectionOffset;
         _restarts = block.RestartOffset;
         _numRestarts = block.NumRestarts;
         _prefixLength = block.CommonPrefixLength;
@@ -195,6 +199,8 @@ public sealed class BlockIter : IDisposable
     {
         _data = [];
         _restarts = 0;
+        _keysEnd = 0;
+        _valuesSection = -1;
         _numRestarts = 0;
         _current = 0;
         _next = 0;
@@ -205,7 +211,7 @@ public sealed class BlockIter : IDisposable
     public bool Valid
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _current < _restarts;
+        get => _current < _keysEnd;
     }
 
     /// <summary>Current key (internal key for data blocks / internal-key index blocks).</summary>
@@ -245,7 +251,7 @@ public sealed class BlockIter : IDisposable
     {
         if (_numRestarts == 0) { Invalidate(); return; }
         SeekToRestartPoint(_numRestarts - 1);
-        while (ParseNextKey() && _next < _restarts)
+        while (ParseNextKey() && _next < _keysEnd)
         {
             // Keep skipping
         }
@@ -375,6 +381,75 @@ public sealed class BlockIter : IDisposable
         FindKeyAfterBinarySeek(target, index, skipLinearScan);
     }
 
+    /// <summary>
+    /// Port of IndexBlockIter::Seek with a prefix index (PrefixSeek + BinaryBlockIndexSeek, table/block_based/block.cc)
+    /// for kHashSearch index blocks (restart interval 1, so a data block index is a restart index).
+    /// <paramref name="blockIds"/> are the candidate blocks of the target's prefix (<see cref="BlockPrefixIndex.GetBlocks"/>).
+    /// Leaves the iterator invalid when no key with the prefix can be &gt;= target (prefix absent); otherwise positions
+    /// at the first index entry &gt;= target (possibly past the prefix, like a total-order seek).
+    /// </summary>
+    public void PrefixSeek(ReadOnlySpan<byte> target, ReadOnlySpan<uint> blockIds)
+    {
+        if (_numRestarts == 0 || blockIds.IsEmpty) { Invalidate(); return; }
+        ReadOnlySpan<byte> seekKey = _kind == BlockIterKind.Index && !_keysAreInternal ? DbFormat.ExtractUserKey(target) : target;
+        int left = 0, right = blockIds.Length - 1;
+        int leftBound = left;
+        while (left <= right)
+        {
+            int mid = (right + left) / 2;
+            int cmp = CompareBlockKey(blockIds[mid], seekKey);
+            if (cmp < 0)
+            {
+                // Key at "target" is larger than "mid". Therefore all blocks before or at "mid" are uninteresting.
+                left = mid + 1;
+            }
+            else
+            {
+                // Key at "target" is <= "mid". Therefore all blocks after "mid" are uninteresting.
+                // If there is only one block left, we found it.
+                if (left == right) break;
+                right = mid;
+            }
+        }
+        int index;
+        if (left == right)
+        {
+            // Either left is the first of block_ids or there is a gap of blocks between left and left - 1: the key does
+            // not exist if the block to the left of the one found is already larger than the target.
+            if (blockIds[left] > 0 && (left == leftBound || blockIds[left - 1] != blockIds[left] - 1)
+                && CompareBlockKey(blockIds[left] - 1, seekKey) > 0)
+            {
+                Invalidate();
+                return;
+            }
+            index = (int)blockIds[left];
+        }
+        else
+        {
+            // If the next block key is larger than the seek key, either no key shares the target's prefix or all of them
+            // are smaller than the target; then position like a total-order seek on the next block (or stay invalid).
+            uint rightIndex = blockIds[right];
+            if (rightIndex + 1 < (uint)_numRestarts && CompareBlockKey(rightIndex + 1, seekKey) >= 0)
+            {
+                index = (int)rightIndex + 1;
+            }
+            else
+            {
+                Invalidate();
+                return;
+            }
+        }
+        // restart interval must be one when hash search is enabled so the binary search simply lands at the right place.
+        FindKeyAfterBinarySeek(seekKey, index, skipLinearScan: true);
+    }
+
+    /// <summary>Port of IndexBlockIter::CompareBlockKey: compares the key of restart entry <paramref name="blockIndex"/> with the target.</summary>
+    private int CompareBlockKey(uint blockIndex, ReadOnlySpan<byte> target)
+    {
+        if (blockIndex >= (uint)_numRestarts) ThrowHelper.Corruption("bad hash index block id");
+        return CompareRestartKey(GetRestartKey((int)blockIndex), target);
+    }
+
     /// <summary>Positions at the last entry with key &lt;= target (data and meta blocks).</summary>
     public void SeekForPrev(ReadOnlySpan<byte> target)
     {
@@ -420,14 +495,14 @@ public sealed class BlockIter : IDisposable
         if (restartIndex >= _numRestarts) ThrowHelper.Corruption("bad data block hash index entry");
         SeekToRestartPoint(restartIndex);
         int cur = (int)GetRestartPoint(restartIndex);
-        int limit = restartIndex + 1 < _numRestarts ? (int)GetRestartPoint(restartIndex + 1) : _restarts;
+        int limit = restartIndex + 1 < _numRestarts ? (int)GetRestartPoint(restartIndex + 1) : _keysEnd;
         while (cur < limit)
         {
             // Only linear-seek inside the restart interval; stop at the first potential match.
             if (!ParseNextKey() || CompareKey(Key, target) >= 0) break;
             cur = _current;
         }
-        if (_current == _restarts) return true;
+        if (_current == _keysEnd) return true;
         if (!UserKeyEquals(DbFormat.ExtractUserKey(Key), targetUserKey)) return false;
         EntryType t = (EntryType)(byte)DbFormat.ExtractFooter(Key);
         if (t != EntryType.Value && t != EntryType.Deletion && t != EntryType.Merge && t != EntryType.SingleDeletion
@@ -443,8 +518,8 @@ public sealed class BlockIter : IDisposable
 
     private void Invalidate()
     {
-        _current = _restarts;
-        _next = _restarts;
+        _current = _keysEnd;
+        _next = _keysEnd;
         _restartIndex = _numRestarts;
     }
 
@@ -538,7 +613,7 @@ public sealed class BlockIter : IDisposable
     {
         int cur = _next;
         _current = cur;
-        int limit = _restarts;
+        int limit = _keysEnd;
         if (cur >= limit)
         {
             Invalidate();
@@ -560,10 +635,61 @@ public sealed class BlockIter : IDisposable
     [MethodImpl(MethodImplOptions.NoInlining)]
     private bool ParseNextKeySlow(int cur, int limit)
     {
+        if (_valuesSection >= 0) return ParseNextKeySeparated(cur, limit);
         int p = DecodeEntry(cur, limit, out uint shared, out uint nonShared, out uint valueLength);
         if (p < 0) return CorruptionError();
         if (_padTsSize != 0) return ParseEntryPadded(p, limit, shared, nonShared, valueLength);
         return ParseEntry(p, limit, shared, nonShared, valueLength);
+    }
+
+    /// <summary>
+    /// Port of the separated key/value branch of BlockIter::ParseNextKey (separate_key_value_in_data_block): entries in
+    /// the keys section are <c>shared | non_shared | value_size | [value_offset at restart points] | key_delta</c>; a
+    /// restart entry's value is at values_section + value_offset, every other value immediately follows the previous
+    /// entry's value. Upstream identifies restart entries by entry index modulo block_restart_interval; the port compares
+    /// the entry offset with the restart array, which is equivalent for well-formed blocks and needs no table property.
+    /// </summary>
+    private bool ParseNextKeySeparated(int cur, int limit)
+    {
+        while (_restartIndex + 1 < _numRestarts && GetRestartPoint(_restartIndex + 1) <= (uint)cur) _restartIndex++;
+        bool restartEntry = _restartIndex < _numRestarts && GetRestartPoint(_restartIndex) == (uint)cur;
+        int p = DecodeEntry(cur, limit, out uint shared, out uint nonShared, out uint valueLength);
+        uint valueOffset = 0;
+        if (p >= 0 && restartEntry)
+        {
+            ReadOnlySpan<byte> s = new(_data, p, limit - p);
+            int before = s.Length;
+            p = Coding.GetVarint32(ref s, out valueOffset) ? p + (before - s.Length) : -1;
+            if (shared != 0) return CorruptionError();
+        }
+        if (p < 0) return CorruptionError();
+        int previousValueEnd = _valueOffset + _valueLength;
+        bool ok = _padTsSize != 0 ? ParseEntryPadded(p, limit, shared, nonShared, 0) : ParseEntry(p, limit, shared, nonShared, 0);
+        if (!ok) return false;
+        int valuesEnd = _restarts;
+        int valueStart;
+        if (restartEntry)
+        {
+            uint valuesSize = (uint)(valuesEnd - _valuesSection);
+            if (valueOffset > valuesSize || valueLength > valuesSize - valueOffset) return CorruptionError();
+            valueStart = _valuesSection + (int)valueOffset;
+        }
+        else
+        {
+            valueStart = previousValueEnd;
+            if (valueStart < _valuesSection || valueStart > valuesEnd || valueLength > (uint)(valuesEnd - valueStart)) return CorruptionError();
+        }
+        _valueOffset = valueStart;
+        _valueLength = (int)valueLength;
+        return true;
+    }
+
+    /// <summary>Returns the offset just past the varint32 at <paramref name="p"/>, or -1 when malformed.</summary>
+    private int SkipVarint32(int p, int limit)
+    {
+        ReadOnlySpan<byte> s = new(_data, p, limit - p);
+        int before = s.Length;
+        return Coding.GetVarint32(ref s, out _) ? p + (before - s.Length) : -1;
     }
 
     /// <summary>
@@ -777,7 +903,7 @@ public sealed class BlockIter : IDisposable
     {
         index = 0;
         skipLinearScan = false;
-        if (_restarts == 0)
+        if (_keysEnd == 0)
         {
             // Blocks with no keys (e.g. index of a range-tombstone-only file) have num_restarts == 1.
             return false;
@@ -837,8 +963,10 @@ public sealed class BlockIter : IDisposable
     private ReadOnlySpan<byte> GetRestartKey(int index)
     {
         int offset = (int)GetRestartPoint(index);
-        int p = DecodeEntry(offset, _restarts, out uint shared, out uint nonShared, out _);
-        if (p < 0 || shared != 0 || nonShared > (uint)(_restarts - p))
+        int p = DecodeEntry(offset, _keysEnd, out uint shared, out uint nonShared, out _);
+        // Separated key/value storage: restart entries carry the value offset after the header (DecodeKey with value_offset).
+        if (p >= 0 && _valuesSection >= 0) p = SkipVarint32(p, _keysEnd);
+        if (p < 0 || shared != 0 || nonShared > (uint)(_keysEnd - p))
         {
             CorruptionError();
             return default;

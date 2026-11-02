@@ -84,6 +84,21 @@ internal sealed class IndexCursor
         SkipEmptyForward();
     }
 
+    /// <summary>
+    /// Index seek of a point lookup: with a kHashSearch prefix index (prefix seek, BlockBasedTable::Get without
+    /// total_order_seek) the index iterator is positioned through the prefix's candidate blocks and left invalid when
+    /// the prefix is absent; otherwise a regular <see cref="Seek"/>.
+    /// </summary>
+    public void SeekForGet(ReadOnlySpan<byte> target)
+    {
+        if (!_partitioned && _reader.TryGetPrefixBlocks(target, out ReadOnlySpan<uint> blocks))
+        {
+            _top.PrefixSeek(target, blocks);
+            return;
+        }
+        Seek(target);
+    }
+
     public void SeekToFirst()
     {
         _top.SeekToFirst();
