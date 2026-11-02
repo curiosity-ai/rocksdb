@@ -20,9 +20,8 @@ namespace RocksDb.Managed.Db;
 /// fragmented_range_dels of BlockBasedTable::Rep) and exposed through <see cref="GetRangeTombstones"/>.
 /// </para>
 /// <para>
-/// TODO(block cache): pass the shared <c>Cache.BlockCache</c> through the reader options once the block-cache
-/// wiring of <see cref="BlockBasedTableReader"/> (agent P) exposes it; readers currently use the reader options'
-/// <see cref="TableReaderOptions.BlockCache"/> as given.
+/// Readers share the column family's block cache (see <see cref="TableFactory.CreateReaderOptions(ColumnFamilyOptions, TableFormatOptions, Cache.BlockCache?, string?)"/>);
+/// the file number is passed so cache keys are stable when table properties lack the original file number.
 /// </para>
 /// </summary>
 internal sealed class TableCache : ITableCache, IDisposable
@@ -180,7 +179,8 @@ internal sealed class TableCache : ITableCache, IDisposable
         try
         {
             TableReaderOptions opts = _readerOptions;
-            if (file.LargestSeqno != opts.LargestSeqno) opts = opts with { LargestSeqno = file.LargestSeqno };
+            if (file.LargestSeqno != opts.LargestSeqno || file.FileNumber != opts.FileNumber)
+                opts = opts with { LargestSeqno = file.LargestSeqno, FileNumber = file.FileNumber };
             reader = BlockBasedTableReader.Open(f, opts);
         }
         catch

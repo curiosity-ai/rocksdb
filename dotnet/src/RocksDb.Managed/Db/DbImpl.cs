@@ -64,6 +64,25 @@ internal sealed partial class DbImpl : IAsyncDisposable
     public string WalDir { get; }
     public IReadOnlyList<string> DbPaths { get; }
     public VersionSet Versions { get; }
+    private Cache.BlockCache? _defaultBlockCache;
+    private readonly Lock _defaultBlockCacheLock = new();
+
+    /// <summary>Default block cache capacity when <c>BlockBasedTableOptions.BlockCache</c> is not set (upstream: 32 MiB).</summary>
+    internal const long DefaultBlockCacheCapacity = 32L << 20;
+
+    /// <summary>
+    /// The DB-wide default block cache (HyperClock, 32 MiB) used by column families that don't configure their own;
+    /// created lazily and shared so that all column families compete for one budget.
+    /// </summary>
+    internal Cache.BlockCache? GetDefaultBlockCache(BlockBasedTableOptions tableOptions)
+    {
+        if (tableOptions.NoBlockCache || tableOptions.BlockCache is not null) return null;
+        lock (_defaultBlockCacheLock)
+        {
+            return _defaultBlockCache ??= Cache.BlockCache.CreateDefault(DefaultBlockCacheCapacity, (int)Math.Min(tableOptions.BlockSize, int.MaxValue));
+        }
+    }
+
     public DbIdentity Identity { get; private set; }
     public Lock Mutex => _mutex;
 

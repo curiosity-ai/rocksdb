@@ -78,7 +78,7 @@ internal sealed class ColumnFamilyData
         Icmp = ucmp.Kind == ComparatorKind.Bytewise ? InternalKeyComparator.Bytewise : new InternalKeyComparator(ucmp);
         MergeOperator = options.MergeOperator;
         Format = TableFactory.CreateFormatOptions(options.TableOptions);
-        ReaderOptions = TableFactory.CreateReaderOptions(options, Format);
+        ReaderOptions = TableFactory.CreateReaderOptions(options, Format, db.GetDefaultBlockCache(options.TableOptions), db.Identity.SessionId);
         NumLevels = Math.Max(1, options.NumLevels);
         MemOptions = new MemTableOptions
         {
