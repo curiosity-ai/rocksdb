@@ -13,9 +13,9 @@ internal readonly record struct DbIdentity(string DbId, string SessionId, string
 /// (db/builder.cc): merges the point entries of the memtables in internal-key order, writes the fragmented range
 /// tombstones, finishes and syncs the file and fills in its <see cref="FileMetaData"/>.
 /// <para>
-/// No entries are dropped: the output keeps every version (upstream's flush-time CompactionIterator only drops
-/// versions invisible to all snapshots; keeping them is always correct). Also used for recovery flushes
-/// (WriteLevel0TableForRecovery).
+/// Versions hidden by a newer version of the same user key in the same snapshot stripe are dropped (rule (A) of
+/// upstream's flush-time CompactionIterator, see AddPointEntries); everything else is kept. Also used for recovery
+/// flushes (WriteLevel0TableForRecovery).
 /// </para>
 /// <para>
 /// With user-defined timestamps in memtable only (persist_user_defined_timestamps = false) the memtables are read
@@ -33,10 +33,11 @@ internal static class FlushJob
     /// With a <paramref name="blobBuilder"/> (enable_blob_files), plain values of at least min_blob_size bytes are written
     /// to blob files and replaced by blob indexes (BuildTable with a BlobFileBuilder); the builder is finished here and
     /// its <see cref="Blob.BlobFileBuilder.Additions"/> belong in the same version edit as the table file. On failure
-    /// the caller deletes the builder's files.
+    /// the caller deletes the builder's files. <paramref name="snapshots"/> are the live snapshot sequence numbers
+    /// (ascending) when the flush job was created (FlushJob's existing_snapshots_).
     /// </summary>
     public static async ValueTask<FileMetaData?> WriteLevel0TableAsync(IFileSystem fs, string path, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
-        ulong fileNumber, ulong epochNumber, DbIdentity identity, Blob.BlobFileBuilder? blobBuilder, IReadOnlyList<ulong> snapshots, bool synchronous,
+        ulong fileNumber, ulong epochNumber, DbIdentity identity, ulong[] snapshots, Blob.BlobFileBuilder? blobBuilder, bool synchronous,
         CancellationToken cancellationToken)
     {
         bool stripTimestamps = cfd.TimestampsInMemtableOnly;
@@ -70,8 +71,16 @@ internal static class FlushJob
             using (var builder = new BlockBasedTableBuilder(file, cfd.Format, tbo))
             {
                 FragmentedRangeTombstoneList? tombstones = FragmentRangeTombstones(cfd, mems, stripTimestamps);
-                if (stripTimestamps) AddPointEntriesWithMinTimestamp(builder, cfd, mems, meta, blobBuilder, snapshots, tombstones);
-                else AddPointEntries(builder, cfd.Icmp, mems, meta, blobBuilder);
+                if (stripTimestamps)
+                {
+                    AddPointEntriesWithMinTimestamp(builder, cfd, mems, meta, blobBuilder, snapshots, tombstones);
+                }
+                else
+                {
+                    // Collapsing versions of a key compares user keys without their timestamp and needs full_history_ts_low;
+                    // with persisted user-defined timestamps every version is kept (always correct).
+                    AddPointEntries(builder, cfd.Icmp, mems, meta, snapshots, dropHidden: cfd.TimestampSize == 0, blobBuilder);
+                }
                 blobBuilder?.Finish();
                 if (tombstones is not null) AddRangeTombstones(builder, cfd, tombstones, meta);
                 if (builder.IsEmpty && meta.Smallest.Length == 0)
@@ -114,15 +123,24 @@ internal static class FlushJob
         return meta;
     }
 
-    /// <summary>K-way merge of the memtables' point entries (few inputs: linear minimum selection).</summary>
+    /// <summary>
+    /// K-way merge of the memtables' point entries (few inputs: linear minimum selection). With
+    /// <paramref name="dropHidden"/>, an entry is dropped when the last entry written has the same user key, is in the
+    /// same snapshot stripe (no snapshot in between) and is a Put, Delete, blob index or entity: rule (A) of
+    /// CompactionIterator::NextFromInput ("hidden by a newer entry for the same user key"), which upstream's flush
+    /// applies through BuildTable's CompactionIterator. Merge operands, single deletes and TimedPut values never hide
+    /// older entries here (upstream resolves them with the merge helper / single-delete logic; keeping the older
+    /// entries is always correct and leaves that work to compaction), single deletes are never dropped (they have their
+    /// own branch before rule (A) upstream), and keys covered by range tombstones of the same flush are kept.
+    /// </summary>
     private static void AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
-        Blob.BlobFileBuilder? blobBuilder)
+        ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder)
     {
         Util.PooledBufferWriter? blobIndex = blobBuilder is null ? null : new Util.PooledBufferWriter(Blob.BlobIndex.MaxEncodedLength);
         Util.PooledBufferWriter? blobKey = blobBuilder is null ? null : new Util.PooledBufferWriter(64);
         try
         {
-            AddPointEntries(builder, icmp, mems, meta, blobBuilder, blobIndex, blobKey);
+            AddPointEntries(builder, icmp, mems, meta, snapshots, dropHidden, blobBuilder, blobIndex, blobKey);
         }
         finally
         {
@@ -133,7 +151,7 @@ internal static class FlushJob
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
-        Blob.BlobFileBuilder? blobBuilder, Util.PooledBufferWriter? blobIndex, Util.PooledBufferWriter? blobKey)
+        ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder, Util.PooledBufferWriter? blobIndex, Util.PooledBufferWriter? blobKey)
     {
         int n = mems.Count;
         var its = new MemTableIterator[n];
@@ -145,6 +163,8 @@ internal static class FlushJob
         bool first = true;
         byte[]? lastKey = null;
         int lastLen = 0;
+        bool lastHides = false;
+        ulong lastStripe = 0;
         while (true)
         {
             int best = -1;
@@ -157,6 +177,16 @@ internal static class FlushJob
             ReadOnlySpan<byte> key = its[best].Key;
             ulong footer = DbFormat.ExtractFooter(key);
             var type = (EntryType)(byte)footer;
+            ulong seq = footer >> 8;
+            // A single delete is never dropped this way (CompactionIterator handles it in its own branch before rule (A)):
+            // dropping one hidden by a newer Put would let a later SingleDelete cancel that Put and resurface an older one.
+            if (lastHides && type != EntryType.SingleDeletion && EarliestVisibleSnapshot(snapshots, seq) == lastStripe
+                && icmp.CompareUserKey(DbFormat.ExtractUserKey(key), DbFormat.ExtractUserKey(lastKey.AsSpan(0, lastLen))) == 0)
+            {
+                // Hidden by the newer entry written last (same user key, same snapshot stripe).
+                its[best].Next();
+                continue;
+            }
             if (blobBuilder is not null && type == EntryType.Value)
             {
                 // CompactionIterator::ExtractLargeValueIfNeeded (flush runs through a CompactionIterator upstream).
@@ -179,7 +209,6 @@ internal static class FlushJob
                 builder.Add(key, its[best].Value);
                 if (type == EntryType.BlobIndex) UpdateOldestBlobFileNumber(meta, its[best].Value);
             }
-            ulong seq = footer >> 8;
             if (seq < meta.SmallestSeqno) meta.SmallestSeqno = seq;
             if (seq > meta.LargestSeqno) meta.LargestSeqno = seq;
             if (first)
@@ -190,6 +219,8 @@ internal static class FlushJob
             if (lastKey is null || lastKey.Length < key.Length) lastKey = new byte[Math.Max(key.Length, 64)];
             key.CopyTo(lastKey);
             lastLen = key.Length;
+            lastHides = dropHidden && type is EntryType.Value or EntryType.Deletion or EntryType.BlobIndex or EntryType.WideColumnEntity;
+            lastStripe = EarliestVisibleSnapshot(snapshots, seq);
             its[best].Next();
         }
         if (!first) meta.Largest = lastKey.AsSpan(0, lastLen).ToArray();
@@ -202,7 +233,7 @@ internal static class FlushJob
     /// <paramref name="snapshots"/> are the live snapshot sequence numbers, ascending. Cold path (allocates per flush).
     /// </summary>
     private static void AddPointEntriesWithMinTimestamp(BlockBasedTableBuilder builder, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
-        FileMetaData meta, Blob.BlobFileBuilder? blobBuilder, IReadOnlyList<ulong> snapshots, FragmentedRangeTombstoneList? tombstones)
+        FileMetaData meta, Blob.BlobFileBuilder? blobBuilder, ulong[] snapshots, FragmentedRangeTombstoneList? tombstones)
     {
         InternalKeyComparator icmp = cfd.Icmp;
         int ts = cfd.TimestampSize;
@@ -298,7 +329,7 @@ internal static class FlushJob
     }
 
     private static bool CoveredInSameStripe(FragmentedRangeTombstoneList tombstones, ReadOnlySpan<byte> userKey, ulong seq, ulong stripe,
-        IReadOnlyList<ulong> snapshots)
+        ulong[] snapshots)
     {
         int f = tombstones.FindCovering(userKey);
         if (f < 0) return false;
@@ -311,19 +342,20 @@ internal static class FlushJob
     }
 
     /// <summary>
-    /// The snapshot stripe of <paramref name="seq"/>: the oldest snapshot that sees it, or MaxSequenceNumber
-    /// (CompactionIterator::findEarliestVisibleSnapshot without the snapshot checker).
+    /// CompactionIterator::findEarliestVisibleSnapshot without a snapshot checker: the smallest snapshot that can see
+    /// <paramref name="seq"/> (kMaxSequenceNumber if none). <paramref name="snapshots"/> is ascending.
     /// </summary>
-    private static ulong EarliestVisibleSnapshot(IReadOnlyList<ulong> snapshots, ulong seq)
+    internal static ulong EarliestVisibleSnapshot(ulong[] snapshots, ulong seq)
     {
-        int lo = 0, hi = snapshots.Count;
+        if (snapshots.Length == 0) return DbFormat.MaxSequenceNumber;
+        int lo = 0, hi = snapshots.Length;
         while (lo < hi)
         {
             int mid = (lo + hi) >>> 1;
             if (snapshots[mid] < seq) lo = mid + 1;
             else hi = mid;
         }
-        return lo < snapshots.Count ? snapshots[lo] : DbFormat.MaxSequenceNumber;
+        return lo < snapshots.Length ? snapshots[lo] : DbFormat.MaxSequenceNumber;
     }
 
     /// <summary>
@@ -341,10 +373,6 @@ internal static class FlushJob
         }
     }
 
-    /// <summary>
-    /// Writes the fragmented range tombstones of all memtables (every fragment with every covering sequence number,
-    /// in internal key order) and extends the file boundaries like FileMetaData::UpdateBoundariesForRange.
-    /// </summary>
     /// <summary>
     /// The fragmented range tombstones of all memtables (null when there are none); with <paramref name="minTimestamps"/>
     /// read through NewTimestampStrippingRangeTombstoneIterator.

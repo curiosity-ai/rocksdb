@@ -143,9 +143,12 @@ Takeaways:
 - **Flush and compaction** in a fresh process (cold, see "Warm code only" above) are mostly slower than C: one flush is 0.7-2.0x without compression and
   2.7-3.2x with LZ4, where the LZ4 codec's JIT warm-up dominates, and one full compaction is 0.96-2.35x. Later flushes
   and compactions in the same process are at or below native cost ([perf.md](perf.md), perf pass #3).
-- **LSM shape** in the compaction-heavy configuration is close to native: write-amp 3.24-3.33 managed against 2.96 for
-  c-native and 3.05 for rocksdb-sharp. Background compaction falls behind native under sustained writes
-  (`waitforcompaction` 0.5-0.8 s against 0.1-0.15 s). This is a known gap in compaction picking.
+- **LSM shape** in the compaction-heavy configuration: with flushes and compactions in lock step the managed engine
+  produces the same LSM shapes, compactions and write-amp as native (`CompactionPickerParityTests`). Free-running,
+  write-amp is 2.96-3.24 managed against 2.96 for c-native and 2.96-3.05 for rocksdb-sharp
+  (`bench/results/2026-11-02-vm-picker-compaction.md`): the managed writer is faster, so its single compaction thread
+  falls further behind (`waitforcompaction` 0.5-1.2 s against 0-0.4 s). See "Compaction-picking parity" in
+  [perf.md](perf.md).
 - **rocksdb-sharp** pays 10-50% over c-native on single-threaded small operations (P/Invoke and copies), and much
   more on `readseq` (2.4x).
 

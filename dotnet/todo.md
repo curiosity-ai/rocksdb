@@ -155,7 +155,8 @@ Final completeness wave:
 - [ ] UDT gaps: persist_user_defined_timestamps=false, UDT in transactions/WBWI, async timestamped Get uses sync path
 - [x] Fixed flaky `PrefixSameAsStartMatchesModel` (forced bottommost compaction for a deterministic LSM shape)
 - [x] Perf #3: flush WAL-on 2.31x → 1.19x native (WAL writeback during switch), no large per-file allocations (59.6 → 5.5 B/put, no gen2 GCs), first-run AggressiveOptimization on per-entry paths; steady-state flush/compaction ≤ native; compaction-heavy config managed 0.62x native geomean (`results/2026-11-02-vm-perf3*.md`)
-- [ ] Compaction picking diverges from native under sustained writes (L5 grows to 9–10 files vs 4–6; write-amp 3.05–3.33 vs 2.96; more pending work at end) — verify picker inputs/timing vs 11.12
+- [x] Compaction picking parity: root causes were flush keeping hidden versions (now applies upstream rule A per snapshot stripe) and max output size cap (2x target above bottommost). Lock-step harness: all 60 LSM shapes and compaction sequence identical to native; write-amp 4.321 vs 4.322. Compat test `CompactionPickerParityTests`
+- [ ] Under free-running load the faster managed writer piles L0 to ~10 files with 1 compaction thread (native 5–6) → more pending work at end; consider write-controller pacing parity
 - [x] Fixed secondary/WAL tailing lag at block-aligned EOF (also likely cause of an intermittent replication-test failure: 15/15 clean runs after the fix) and missing-dir open error (InvalidArgument)
 - [~] Bench warm-up: dbbench `--warmup` (default on, all engines) on a throwaway DB + JIT-count reporting; re-run matrix warm (agent running)
 - [ ] First flush/compaction in a fresh process 1.4–1.64x native (JIT warm-up; affects cold-start only); LZ4 flushes 2.5x (K4os JIT/unoptimized) — consider ReadyToRun guidance or a faster LZ4 path

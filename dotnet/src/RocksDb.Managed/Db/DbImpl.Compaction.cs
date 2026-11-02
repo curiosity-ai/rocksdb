@@ -310,6 +310,7 @@ internal sealed partial class DbImpl
             CancellationToken ct = _bgCancellation.Token;
             TestHooks.Invoke("DBImpl::RunCompaction:Start");
             jobId = NewJobId();
+            OnCompactionStarted(cfd, c, jobId);
             NotifyOnCompactionBegin(cfd, c, jobId);
             compactionStart = System.Diagnostics.Stopwatch.GetTimestamp();
             ct.ThrowIfCancellationRequested();

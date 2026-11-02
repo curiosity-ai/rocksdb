@@ -56,7 +56,6 @@ internal sealed partial class DbImpl
         var picked = new List<ImmutableMemTable>();
         ulong fileNumber;
         ulong epoch;
-        List<ulong> snapshots = [];
         lock (_mutex)
         {
             if (ShouldRescheduleFlushToRetainUdt(cfd))
@@ -64,7 +63,6 @@ internal sealed partial class DbImpl
                 RescheduleFlushToRetainUdt(cfd);
                 return;
             }
-            if (cfd.TimestampsInMemtableOnly) _snapshots.GetAll(snapshots, ulong.MaxValue);
             foreach (ImmutableMemTable m in cfd.Imm)
             {
                 if (m.FlushInProgress || m.FlushCompleted) continue;
@@ -80,7 +78,7 @@ internal sealed partial class DbImpl
         }
         try
         {
-            if (picked.Count > 0) await FlushMemTablesAsync(cfd, picked, fileNumber, epoch, snapshots, synchronous: false).ConfigureAwait(false);
+            if (picked.Count > 0) await FlushMemTablesAsync(cfd, picked, fileNumber, epoch, synchronous: false).ConfigureAwait(false);
         }
         catch (RocksDbException e) when (e.Code == StatusCode.ColumnFamilyDropped || cfd.Dropped)
         {
@@ -131,7 +129,7 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>Builds the L0 file for <paramref name="picked"/> and installs the result (FlushJob::Run + install).</summary>
-    private async ValueTask FlushMemTablesAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch, List<ulong> snapshots,
+    private async ValueTask FlushMemTablesAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch,
         bool synchronous)
     {
         TestHooks.Invoke("DBImpl::FlushMemTables:Start");
@@ -146,7 +144,7 @@ internal sealed partial class DbImpl
         using Blob.BlobFileBuilder? blobBuilder = CreateBlobFileBuilder(cfd, outputLevel: 0, Blob.BlobFileCreationReason.Flush);
         try
         {
-            await FlushAndInstallAsync(cfd, picked, fileNumber, epoch, snapshots, synchronous, jobId, flushStart, mems, path, blobBuilder, reason)
+            await FlushAndInstallAsync(cfd, picked, fileNumber, epoch, synchronous, jobId, flushStart, mems, path, blobBuilder, reason)
                 .ConfigureAwait(false);
         }
         finally
@@ -156,16 +154,20 @@ internal sealed partial class DbImpl
     }
 
     private async ValueTask FlushAndInstallAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch,
-        List<ulong> snapshots, bool synchronous, int jobId, long flushStart, List<MemTable> mems, string path, Blob.BlobFileBuilder? blobBuilder,
+        bool synchronous, int jobId, long flushStart, List<MemTable> mems, string path, Blob.BlobFileBuilder? blobBuilder,
         FlushReason reason)
     {
-        FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, mems, fileNumber, epoch, Identity, blobBuilder, snapshots,
-                synchronous, CancellationToken.None)
+        ulong[] snapshots;
+        lock (_mutex) snapshots = SnapshotsForCompaction();
+        FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, mems, fileNumber, epoch, Identity, snapshots, blobBuilder, synchronous,
+                CancellationToken.None)
             .ConfigureAwait(false);
         if (meta is not null)
         {
             FileSystem.SyncDirectory(DbPaths[0]);
             RecordFlushBytes(meta.FileSize + BlobBytesWritten(blobBuilder));
+            // FlushJob::WriteLevel0Table logs this before the result is installed (and compactions are scheduled).
+            LogInfo("[" + cfd.Name + "] [JOB " + jobId + "] Level-0 flush table #" + meta.FileNumber + ": " + meta.FileSize + " bytes OK");
         }
 
         var edit = new VersionEdit
