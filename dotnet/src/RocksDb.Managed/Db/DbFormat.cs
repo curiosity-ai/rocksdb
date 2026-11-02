@@ -74,6 +74,59 @@ public static class DbFormat
         return userKey.Length + InternalKeyFooterSize;
     }
 
+    // ---- user-defined timestamps (db/dbformat.h) ------------------------------------------------------------
+
+    /// <summary>Port of StripTimestampFromUserKey: the user key without its trailing <paramref name="timestampSize"/> bytes.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ReadOnlySpan<byte> StripTimestampFromUserKey(ReadOnlySpan<byte> userKey, int timestampSize) =>
+        userKey[..^timestampSize];
+
+    /// <summary>Port of ExtractTimestampFromUserKey: the trailing <paramref name="timestampSize"/> bytes of the user key.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ReadOnlySpan<byte> ExtractTimestampFromUserKey(ReadOnlySpan<byte> userKey, int timestampSize) =>
+        userKey[^timestampSize..];
+
+    /// <summary>Port of ExtractUserKeyAndStripTimestamp: the user key of an internal key without its timestamp.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ReadOnlySpan<byte> ExtractUserKeyAndStripTimestamp(ReadOnlySpan<byte> internalKey, int timestampSize) =>
+        internalKey[..^(InternalKeyFooterSize + timestampSize)];
+
+    /// <summary>Port of ExtractTimestampFromKey: the timestamp of an internal key.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ReadOnlySpan<byte> ExtractTimestampFromKey(ReadOnlySpan<byte> internalKey, int timestampSize) =>
+        internalKey.Slice(internalKey.Length - InternalKeyFooterSize - timestampSize, timestampSize);
+
+    /// <summary>
+    /// Writes <c>userKey | timestamp | footer(seq, t)</c> into <paramref name="dst"/> (AppendInternalKeyWithDifferentTimestamp
+    /// when <paramref name="userKey"/> is already stripped). Returns bytes written.
+    /// </summary>
+    public static int AppendInternalKey(Span<byte> dst, ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> timestamp, ulong seq, EntryType t)
+    {
+        userKey.CopyTo(dst);
+        timestamp.CopyTo(dst[userKey.Length..]);
+        int n = userKey.Length + timestamp.Length;
+        Coding.EncodeFixed64(dst[n..], PackSequenceAndType(seq, t));
+        return n + InternalKeyFooterSize;
+    }
+
+    /// <summary>Port of AppendKeyWithMinTimestamp: <paramref name="key"/> followed by <paramref name="timestampSize"/> zero bytes.</summary>
+    public static void AppendKeyWithMinTimestamp(System.Buffers.IBufferWriter<byte> dst, ReadOnlySpan<byte> key, int timestampSize)
+    {
+        Span<byte> d = dst.GetSpan(key.Length + timestampSize);
+        key.CopyTo(d);
+        d.Slice(key.Length, timestampSize).Clear();
+        dst.Advance(key.Length + timestampSize);
+    }
+
+    /// <summary>Port of AppendKeyWithMaxTimestamp: <paramref name="key"/> followed by <paramref name="timestampSize"/> 0xff bytes.</summary>
+    public static void AppendKeyWithMaxTimestamp(System.Buffers.IBufferWriter<byte> dst, ReadOnlySpan<byte> key, int timestampSize)
+    {
+        Span<byte> d = dst.GetSpan(key.Length + timestampSize);
+        key.CopyTo(d);
+        d.Slice(key.Length, timestampSize).Fill(0xff);
+        dst.Advance(key.Length + timestampSize);
+    }
+
     public static bool TryParseInternalKey(ReadOnlySpan<byte> internalKey, out ParsedInternalKey result)
     {
         if (internalKey.Length < InternalKeyFooterSize)

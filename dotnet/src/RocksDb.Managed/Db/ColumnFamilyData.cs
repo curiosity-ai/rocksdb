@@ -76,6 +76,12 @@ internal sealed class ColumnFamilyData
         Options = options;
         Comparator ucmp = TableFactory.ResolveComparator(options);
         Icmp = ucmp.Kind == ComparatorKind.Bytewise ? InternalKeyComparator.Bytewise : new InternalKeyComparator(ucmp);
+        TimestampSize = ucmp.TimestampSize;
+        if (TimestampSize > 0 && !options.PersistUserDefinedTimestamps)
+        {
+            // Memtable-only user-defined timestamps (timestamps stripped at flush) are not ported.
+            ThrowHelper.NotSupported("persist_user_defined_timestamps = false is not supported yet");
+        }
         MergeOperator = options.MergeOperator;
         Format = TableFactory.CreateFormatOptions(options.TableOptions);
         ReaderOptions = TableFactory.CreateReaderOptions(options, Format, db.GetDefaultBlockCache(options.TableOptions), db.Identity.SessionId);
@@ -102,6 +108,19 @@ internal sealed class ColumnFamilyData
     public ColumnFamilyOptions Options { get; }
     public InternalKeyComparator Icmp { get; }
     public Comparator UserComparator => Icmp.UserComparator;
+    /// <summary>Size of the user-defined timestamp of every user key (0 = timestamps disabled). Fixed for the CF's lifetime.</summary>
+    public int TimestampSize { get; }
+    private byte[]? _fullHistoryTsLow;
+    /// <summary>
+    /// full_history_ts_low (ColumnFamilyData::GetFullHistoryTsLow): versions with a timestamp below it may be collapsed by
+    /// compaction and reads below it are rejected. Null when unset. Only increases; written under the DB mutex (after the
+    /// MANIFEST edit), read lock-free.
+    /// </summary>
+    public byte[]? FullHistoryTsLow
+    {
+        get => Volatile.Read(ref _fullHistoryTsLow);
+        set => Volatile.Write(ref _fullHistoryTsLow, value);
+    }
     public MergeOperator? MergeOperator { get; }
     public TableFormatOptions Format { get; }
     public TableReaderOptions ReaderOptions { get; }

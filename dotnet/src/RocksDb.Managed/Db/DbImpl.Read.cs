@@ -31,7 +31,6 @@ internal sealed partial class DbImpl
     /// Point lookup (DBImpl::GetImpl): mutable memtable, immutable memtables (newest first), then table files
     /// (Version::Get). On return <paramref name="ctx"/> holds the final state; use <see cref="GetContext.TryResolve"/>.
     /// </summary>
-    [SkipLocalsInit]
     public void Get(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, GetContext ctx)
     {
         // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
@@ -42,26 +41,7 @@ internal sealed partial class DbImpl
         ulong snapshot = ReadSequence(options);
         try
         {
-            Span<byte> scratch = stackalloc byte[LookupKey.StackBufferSize];
-            var lkey = new LookupKey(key, snapshot, scratch);
-            try
-            {
-                if (GetFromMemTables(sv, lkey, ctx))
-                {
-                    ctx.FromMemTable = true;
-                    return;
-                }
-                if (options?.ReadTier == ReadTier.MemtableTier)
-                {
-                    if (ctx.State == GetContext.GetState.NotFound) return;
-                    ThrowHelper.Corruption("Incomplete: merge operands not all in memtables");
-                }
-                GetFromVersion(cfd, sv.Current, lkey.InternalKey, lkey.UserKey, snapshot, ctx);
-            }
-            finally
-            {
-                lkey.Dispose();
-            }
+            GetWithSuperVersion(cfd, sv, snapshot, options, key, ctx);
         }
         finally
         {
@@ -69,15 +49,45 @@ internal sealed partial class DbImpl
         }
     }
 
+    /// <summary>The lookup part of GetImpl on a referenced super version at <paramref name="snapshot"/>.</summary>
+    [SkipLocalsInit]
+    private void GetWithSuperVersion(ColumnFamilyData cfd, SuperVersion sv, ulong snapshot, ReadOptions? options, ReadOnlySpan<byte> key, GetContext ctx)
+    {
+        // User-defined timestamps: the lookup key is key | read timestamp (validated here, after the SV reference).
+        ReadOnlySpan<byte> ts = GetReadTimestamp(cfd, options);
+        ctx.TimestampSize = cfd.TimestampSize;
+        Span<byte> scratch = stackalloc byte[LookupKey.StackBufferSize];
+        var lkey = new LookupKey(key, snapshot, ts, scratch);
+        try
+        {
+            if (GetFromMemTables(sv, lkey, ctx))
+            {
+                ctx.FromMemTable = true;
+                return;
+            }
+            if (options?.ReadTier == ReadTier.MemtableTier)
+            {
+                if (ctx.State == GetContext.GetState.NotFound) return;
+                ThrowHelper.Corruption("Incomplete: merge operands not all in memtables");
+            }
+            GetFromVersion(cfd, sv.Current, lkey.InternalKey, lkey.UserKey, snapshot, ctx);
+        }
+        finally
+        {
+            lkey.Dispose();
+        }
+    }
+
     /// <summary>Memtable part of GetImpl. Returns true if a final result was found.</summary>
     private static bool GetFromMemTables(SuperVersion sv, scoped in LookupKey lkey, GetContext ctx)
     {
-        MemTableGetResult r = sv.Mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq);
+        GetContext? tsSink = ctx.TimestampSize != 0 ? ctx : null;
+        MemTableGetResult r = sv.Mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink);
         if (ctx.ApplyMemTableResult(r, v, t)) return true;
         MemTable[] imm = sv.Imm;
         for (int i = 0; i < imm.Length; i++)
         {
-            r = imm[i].Get(lkey, out v, out t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq);
+            r = imm[i].Get(lkey, out v, out t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink);
             if (ctx.ApplyMemTableResult(r, v, t)) return true;
         }
         return false;
@@ -91,11 +101,12 @@ internal sealed partial class DbImpl
     {
         VersionStorageInfo s = v.Storage;
         Comparator ucmp = cfd.UserComparator;
+        int tsSize = cfd.TimestampSize;
         ReadOnlySpan<FileMetaData> l0 = s.LevelFiles(0);
         for (int i = 0; i < l0.Length; i++)
         {
             FileMetaData f = l0[i];
-            if (ucmp.Compare(userKey, DbFormat.ExtractUserKey(f.Smallest)) < 0 || ucmp.Compare(userKey, DbFormat.ExtractUserKey(f.Largest)) > 0) continue;
+            if (CompareFileBoundary(ucmp, tsSize, userKey, f.Smallest) < 0 || CompareFileBoundary(ucmp, tsSize, userKey, f.Largest) > 0) continue;
             if (GetFromFile(cfd, f, ikey, userKey, snapshot, ctx)) return;
         }
         for (int level = 1; level < s.NumLevels; level++)
@@ -105,10 +116,18 @@ internal sealed partial class DbImpl
             ReadOnlySpan<FileMetaData> files = s.LevelFiles(level);
             if (idx >= files.Length) continue;
             FileMetaData f = files[idx];
-            if (ucmp.Compare(userKey, DbFormat.ExtractUserKey(f.Smallest)) < 0) continue;
+            if (CompareFileBoundary(ucmp, tsSize, userKey, f.Smallest) < 0) continue;
             if (GetFromFile(cfd, f, ikey, userKey, snapshot, ctx)) return;
         }
     }
+
+    /// <summary>
+    /// User key vs. a file boundary (FilePicker): with user-defined timestamps the timestamps are ignored
+    /// (CompareWithoutTimestamp), since newer versions of the boundary key sort before it.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int CompareFileBoundary(Comparator ucmp, int tsSize, ReadOnlySpan<byte> userKey, byte[] boundary) =>
+        tsSize == 0 ? ucmp.Compare(userKey, DbFormat.ExtractUserKey(boundary)) : ucmp.CompareWithoutTimestamp(userKey, DbFormat.ExtractUserKey(boundary));
 
     /// <summary>TableCache::Get: range tombstones of the file, then the point lookup. Returns true when done.</summary>
     private static bool GetFromFile(ColumnFamilyData cfd, FileMetaData f, ReadOnlySpan<byte> ikey, ReadOnlySpan<byte> userKey, ulong snapshot, GetContext ctx)
@@ -142,6 +161,12 @@ internal sealed partial class DbImpl
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     public async ValueTask GetAsync(ColumnFamilyData cfd, ReadOptions? options, ReadOnlyMemory<byte> key, GetContext ctx, CancellationToken cancellationToken)
     {
+        if (cfd.TimestampSize != 0)
+        {
+            // Timestamped lookups take the synchronous path (the async table lookup does not report the entry's key).
+            Get(cfd, options, key.Span, ctx);
+            return;
+        }
         // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
         // in between could drop the versions visible at that sequence (no snapshot protects them).
         ValidateReadSnapshot(options);
@@ -258,6 +283,16 @@ internal sealed partial class DbImpl
         ValidateReadSnapshot(options);
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         ulong sequence = ReadSequence(options);
+        try
+        {
+            GetReadTimestamp(cfd, options);
+            if (options?.IterStartTs is not null && options.Timestamp is null) ThrowHelper.InvalidArgument("iter_start_ts requires timestamp");
+        }
+        catch
+        {
+            ReturnSuperVersion(sv);
+            throw;
+        }
         var mems = new MemTable[1 + sv.Imm.Length];
         mems[0] = sv.Mem;
         sv.Imm.CopyTo(mems, 1);

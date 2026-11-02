@@ -588,9 +588,19 @@ public abstract class Transaction : IDisposable
 
     private protected ColumnFamilyData Cfd(ColumnFamily? columnFamily)
     {
-        if (columnFamily is null) return _database.DefaultColumnFamily.Data;
-        if (columnFamily.Db != _db) ThrowHelper.InvalidArgument("column family does not belong to this database");
-        return columnFamily.Data;
+        ColumnFamilyData cfd;
+        if (columnFamily is null)
+        {
+            cfd = _database.DefaultColumnFamily.Data;
+        }
+        else
+        {
+            if (columnFamily.Db != _db) ThrowHelper.InvalidArgument("column family does not belong to this database");
+            cfd = columnFamily.Data;
+        }
+        // Transactions with user-defined timestamps (commit timestamps, write_batch_track_timestamp_size) are not ported.
+        if (cfd.TimestampSize != 0) ThrowHelper.NotSupported("transactions on column families with user-defined timestamps");
+        return cfd;
     }
 
     private protected static RocksDbException? WaitSync(ValueTask<RocksDbException?> t) =>

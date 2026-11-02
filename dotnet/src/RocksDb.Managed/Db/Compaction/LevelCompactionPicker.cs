@@ -365,7 +365,7 @@ internal sealed class LevelCompactionPicker : CompactionPicker
                     _vstorage.GetOverlappingInputs(_outputLevel, initialFile.Smallest, nextFile.Largest, outputLevelInputs);
                     if (outputLevelInputs.Count > 0) break;
                     if (i < levelFiles.Length - 1
-                        && icmp.CompareUserKey(DbFormat.ExtractUserKey(nextFile.Largest), DbFormat.ExtractUserKey(levelFiles[i + 1].Smallest)) == 0)
+                        && VersionStorageInfo.CompareWithoutTimestamp(icmp, DbFormat.ExtractUserKey(nextFile.Largest), DbFormat.ExtractUserKey(levelFiles[i + 1].Smallest)) == 0)
                     {
                         break; // Not a clean cut after adding the next file.
                     }
@@ -381,7 +381,7 @@ internal sealed class LevelCompactionPicker : CompactionPicker
                         if (nextFile.BeingCompacted) break;
                         _vstorage.GetOverlappingInputs(_outputLevel, nextFile.Smallest, initialFile.Largest, outputLevelInputs);
                         if (outputLevelInputs.Count > 0) break;
-                        if (i > 0 && icmp.CompareUserKey(DbFormat.ExtractUserKey(nextFile.Smallest), DbFormat.ExtractUserKey(levelFiles[i - 1].Largest)) == 0)
+                        if (i > 0 && VersionStorageInfo.CompareWithoutTimestamp(icmp, DbFormat.ExtractUserKey(nextFile.Smallest), DbFormat.ExtractUserKey(levelFiles[i - 1].Largest)) == 0)
                         {
                             break;
                         }

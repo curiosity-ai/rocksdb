@@ -79,6 +79,7 @@ public sealed partial class ColumnFamily
 
     private void Encode(WriteBatch b, Op op, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
+        if (_cfd.TimestampSize != 0) ThrowCfHasTimestamp();
         uint id = _cfd.Id;
         switch (op)
         {

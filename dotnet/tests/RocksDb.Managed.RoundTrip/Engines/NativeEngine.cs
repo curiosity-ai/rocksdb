@@ -98,7 +98,12 @@ public sealed class NativeEngine : IEngine
         return o;
     }
 
-    private static N.ColumnFamilyOptions CfOptions(CfSpec s) => Keep(Configure(new N.ColumnFamilyOptions(), s));
+    private static N.ColumnFamilyOptions CfOptions(CfSpec s)
+    {
+        N.ColumnFamilyOptions o = Keep(Configure(new N.ColumnFamilyOptions(), s));
+        if (s.UserTimestamps) N.Native.Instance.rocksdb_options_set_comparator(o.Handle, NativeU64TsComparator.Handle);
+        return o;
+    }
 
     // ---------------------------------------------------------------------------------------------------------
     // open / close
@@ -220,7 +225,11 @@ public sealed class NativeEngine : IEngine
 
     public void Write(IReadOnlyList<Op> ops, bool sync)
     {
-        using var batch = new N.WriteBatch();
+        // A batch writing to a default CF with timestamps must know its timestamp size (default_cf_ts_sz), otherwise
+        // WriteBatch::Put(cf, ...) fails with "Default cf timestamp size mismatch" (silently dropped by the C API).
+        using var batch = !_ttl && _spec.Cf("default").UserTimestamps
+            ? new N.WriteBatch(N.Native.Instance.rocksdb_writebatch_create_with_params(0, 0, 0, 8))
+            : new N.WriteBatch();
         foreach (Op op in ops)
         {
             N.ColumnFamilyHandle cf = Cf(op.Cf!);
@@ -238,6 +247,7 @@ public sealed class NativeEngine : IEngine
                 default: throw new InvalidOperationException("not a data op: " + op.Kind);
             }
         }
+        if (UsesTimestamps(ops)) UpdateTimestamps(batch);
         var wo = new N.WriteOptions().SetSync(sync);
         Db.Write(batch, wo);
         GC.KeepAlive(wo);
@@ -312,16 +322,62 @@ public sealed class NativeEngine : IEngine
     // ---------------------------------------------------------------------------------------------------------
     // reads
 
-    private N.ReadOptions ReadOptions(long? snapshot)
+    private N.ReadOptions ReadOptions(long? snapshot, string cf)
     {
         var ro = new N.ReadOptions();
         if (snapshot is long id) ro.SetSnapshot(_snapshots[id]);
+        if (_spec.Cf(cf).UserTimestamps) N.Native.Instance.rocksdb_readoptions_set_timestamp(ro.Handle, s_maxTs, 8);
         return ro;
+    }
+
+    // ---- user-defined timestamps -------------------------------------------------------------------------------
+
+    private static readonly IntPtr s_maxTs = AllocMaxTs();
+
+    private static IntPtr AllocMaxTs()
+    {
+        IntPtr p = Marshal.AllocHGlobal(8);
+        Marshal.Copy(UdtClock.MaxTimestamp, 0, p, 8);
+        return p;
+    }
+
+    private bool UsesTimestamps(IReadOnlyList<Op> ops)
+    {
+        foreach (Op op in ops)
+        {
+            if (_spec.Cf(op.Cf!).UserTimestamps)
+            {
+                if (op.Kind == OpKind.DeleteRange) throw new InvalidOperationException("DeleteRange is not used with user-defined timestamps");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// WriteBatch::Put/Delete/... with a column family handle append a placeholder timestamp for CFs with timestamps;
+    /// rocksdb_writebatch_update_timestamps then assigns the batch's timestamp to all of them.
+    /// </summary>
+    private unsafe void UpdateTimestamps(N.WriteBatch batch)
+    {
+        var sizes = new Dictionary<uint, nuint>();
+        foreach (string name in _cfNames)
+        {
+            sizes[N.Native.Instance.rocksdb_column_family_handle_get_id(Db.GetColumnFamily(name).Handle)] = _spec.Cf(name).UserTimestamps ? 8u : 0u;
+        }
+        N.GetTsSizeDelegate getTsSize = (_, cf) => sizes.TryGetValue(cf, out nuint s) ? s : 0;
+        byte[] ts = UdtClock.Next();
+        fixed (byte* p = ts)
+        {
+            N.Native.Instance.rocksdb_writebatch_update_timestamps(batch.Handle, (IntPtr)p, 8, IntPtr.Zero, getTsSize, out IntPtr err);
+            if (err != IntPtr.Zero) throw new InvalidOperationException("rocksdb_writebatch_update_timestamps: " + Marshal.PtrToStringAnsi(err));
+        }
+        GC.KeepAlive(getTsSize);
     }
 
     public IEnumerable<KeyValuePair<byte[], byte[]>> Scan(string cf, long? snapshot)
     {
-        N.ReadOptions ro = ReadOptions(snapshot);
+        N.ReadOptions ro = ReadOptions(snapshot, cf);
         using N.Iterator it = Db.NewIterator(Cf(cf), ro);
         for (it.SeekToFirst(); it.Valid(); it.Next()) yield return new(it.Key(), it.Value());
         GC.KeepAlive(ro);
@@ -329,7 +385,7 @@ public sealed class NativeEngine : IEngine
 
     public byte[]? Get(string cf, byte[] key, long? snapshot)
     {
-        N.ReadOptions ro = ReadOptions(snapshot);
+        N.ReadOptions ro = ReadOptions(snapshot, cf);
         byte[]? v = Db.Get(key, Cf(cf), ro);
         GC.KeepAlive(ro);
         return v;

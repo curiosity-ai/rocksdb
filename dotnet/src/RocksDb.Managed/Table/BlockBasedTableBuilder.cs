@@ -37,6 +37,11 @@ public sealed class BlockBasedTableBuilder : IDisposable
     private readonly TableFormatOptions _options;
     private readonly TableBuilderOptions _tbo;
     private readonly Comparator _ucmp;
+    /// <summary>User-defined timestamp size (ts_sz): filters get user keys without it; min/max timestamps are collected.</summary>
+    private readonly int _tsSize;
+    // TimestampTablePropertiesCollector state ("rocksdb.timestamp_min" / "rocksdb.timestamp_max").
+    private byte[]? _timestampMin;
+    private byte[]? _timestampMax;
     private readonly InternalKeyComparator _icmp;
     private readonly BlockBuilder _dataBlock;
     private readonly BlockBuilder _rangeDelBlock;
@@ -77,6 +82,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
         _options = options;
         _tbo = tableBuilderOptions;
         _ucmp = tableBuilderOptions.Comparator;
+        _tsSize = _ucmp.TimestampSize;
         _icmp = _ucmp.Kind == ComparatorKind.Bytewise ? InternalKeyComparator.Bytewise : new InternalKeyComparator(_ucmp);
         _offset = (ulong)file.Size;
         bool useCommonPrefix = UseCommonPrefix(options, _ucmp);
@@ -117,7 +123,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
                 partitionSize = Math.Max(partitionSize, 1u);
                 _filterBuilder = new PartitionedFilterBlockBuilder(_prefixExtractor, options.WholeKeyFiltering, bits, options.IndexBlockRestartInterval,
                     _useDeltaEncodingForIndexValues, options.FormatVersion, partitionedIndex, partitionSize, options.DecouplePartitionedFilters,
-                    useCommonPrefix);
+                    useCommonPrefix)
+                { TimestampSize = _tsSize };
                 _partitionedFilter = true;
             }
             else
@@ -229,6 +236,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
         DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(internalKey), out ulong seq, out EntryType type);
         if (seq > _props.KeyLargestSeqno) _props.KeyLargestSeqno = seq;
         if (seq < _props.KeySmallestSeqno) _props.KeySmallestSeqno = seq;
+        if (_tsSize != 0) CollectTimestamp(internalKey);
 
         if (type == EntryType.RangeDeletion)
         {
@@ -247,7 +255,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
             // Note: PartitionedFilterBlockBuilder with decouple_partitioned_filters = false requires key being added
             // to filter builder after being added to the index builder (in Flush). Buffered keys will be replayed
             // from the buffered data blocks once the compression dictionary has been finalized.
-            if (!_buffered) _filterBuilder?.Add(DbFormat.ExtractUserKey(internalKey));
+            if (!_buffered) _filterBuilder?.Add(DbFormat.ExtractUserKeyAndStripTimestamp(internalKey, _tsSize));
 
             _dataBlock.Add(internalKey, value);
             _lastKey.Clear();
@@ -354,7 +362,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
                 for (it.SeekToFirst(); it.Valid; it.Next())
                 {
                     ReadOnlySpan<byte> key = it.Key;
-                    _filterBuilder?.Add(DbFormat.ExtractUserKey(key));
+                    _filterBuilder?.Add(DbFormat.ExtractUserKeyAndStripTimestamp(key, _tsSize));
                     _indexBuilder.OnKeyAdded(key);
                     lastKey.Clear();
                     lastKey.Write(key);
@@ -515,7 +523,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
         if (_lastKey.WrittenCount > 0)
         {
             // We might have been using AddWithPrevKey, so need PrevKeyBeforeFinish to be safe.
-            _filterBuilder.PrevKeyBeforeFinish(DbFormat.ExtractUserKey(_lastKey.WrittenSpan));
+            _filterBuilder.PrevKeyBeforeFinish(DbFormat.ExtractUserKeyAndStripTimestamp(_lastKey.WrittenSpan, _tsSize));
         }
         _props.NumFilterEntries += _filterBuilder.EstimateEntriesAdded;
         BlockHandle h = default;
@@ -569,6 +577,28 @@ public sealed class BlockBasedTableBuilder : IDisposable
         metaIndex.Add(BlockBasedTableConstants.RangeDelBlockName, h);
     }
 
+    /// <summary>Port of TimestampTablePropertiesCollector::InternalAdd (db/table_properties_collector.h).</summary>
+    private void CollectTimestamp(ReadOnlySpan<byte> internalKey)
+    {
+        ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(internalKey);
+        if (userKey.Length < _tsSize) ThrowHelper.Corruption("User key size mismatch when comparing to timestamp size.");
+        ReadOnlySpan<byte> ts = DbFormat.ExtractTimestampFromUserKey(userKey, _tsSize);
+        if (_timestampMax is null)
+        {
+            _timestampMax = ts.ToArray();
+            _timestampMin = ts.ToArray();
+            return;
+        }
+        if (_ucmp.CompareTimestamp(ts, _timestampMax) > 0) ts.CopyTo(_timestampMax);
+        if (_ucmp.CompareTimestamp(_timestampMin, ts) > 0) ts.CopyTo(_timestampMin);
+    }
+
+    /// <summary>Smallest user-defined timestamp added ("rocksdb.timestamp_min"); empty without timestamps or entries.</summary>
+    public byte[] TimestampMin => _timestampMin ?? [];
+
+    /// <summary>Largest user-defined timestamp added ("rocksdb.timestamp_max"); empty without timestamps or entries.</summary>
+    public byte[] TimestampMax => _timestampMax ?? [];
+
     private void WritePropertiesBlock(MetaIndexBuilder metaIndex)
     {
         // WritePropertiesBlock: the policy's Name(), even when it built no filter.
@@ -591,6 +621,12 @@ public sealed class BlockBasedTableBuilder : IDisposable
         pb.Add(TablePropertiesNames.BlockBasedWholeKeyFiltering, _options.WholeKeyFiltering ? TablePropertiesNames.PropTrue : TablePropertiesNames.PropFalse);
         pb.Add(TablePropertiesNames.BlockBasedPrefixFiltering, _prefixExtractor is not null ? TablePropertiesNames.PropTrue : TablePropertiesNames.PropFalse);
         if (_options.DecouplePartitionedFilters) pb.Add(TablePropertiesNames.BlockBasedDecoupledPartitionedFilters, TablePropertiesNames.PropTrue);
+        if (_tsSize > 0)
+        {
+            // TimestampTablePropertiesCollector::Finish (only when timestamps are persisted).
+            pb.Add(TablePropertiesNames.TimestampMin, TimestampMin);
+            pb.Add(TablePropertiesNames.TimestampMax, TimestampMax);
+        }
 
         if (_tbo.ExternalSstFile)
         {

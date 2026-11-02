@@ -173,8 +173,8 @@ internal abstract class CompactionPicker
         foreach (Compaction c in _compactionsInProgress)
         {
             if (c.OutputLevel == level
-                && Icmp.CompareUserKey(smallestUserKey, c.LargestUserKey) <= 0
-                && Icmp.CompareUserKey(largestUserKey, c.SmallestUserKey) >= 0)
+                && VersionStorageInfo.CompareWithoutTimestamp(Icmp, smallestUserKey, c.LargestUserKey) <= 0
+                && VersionStorageInfo.CompareWithoutTimestamp(Icmp, largestUserKey, c.SmallestUserKey) >= 0)
             {
                 return true;
             }

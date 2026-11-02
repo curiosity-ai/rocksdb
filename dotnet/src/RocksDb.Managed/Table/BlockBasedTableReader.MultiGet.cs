@@ -115,7 +115,7 @@ public sealed partial class BlockBasedTableReader
         {
             if (first)
             {
-                if (!data.SeekForGet(internalKey)) return -1;
+                if (!SeekForGet(data, internalKey)) return -1;
             }
             else
             {

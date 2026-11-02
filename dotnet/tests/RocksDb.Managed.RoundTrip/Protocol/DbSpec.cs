@@ -40,11 +40,18 @@ public sealed class CfSpec
     public MergeKind Merge { get; set; } = MergeKind.StringAppend;
     /// <summary>Created when the DB is first created (others are only created by a createcf op).</summary>
     public bool Initial { get; set; } = true;
+    /// <summary>
+    /// User-defined timestamps: the CF uses "leveldb.BytewiseComparator.u64ts" (native: rocksdb_comparator_with_ts_create,
+    /// managed: <see cref="Comparator.BytewiseWithU64Ts"/>); every write batch gets a fresh, increasing timestamp
+    /// (<see cref="Engines.UdtClock"/>) and reads use the maximum timestamp, so the latest-value model still applies.
+    /// Range deletions and SST ingestion are not used on such CFs.
+    /// </summary>
+    public bool UserTimestamps { get; set; }
 
     public CfSpec Clone() => (CfSpec)MemberwiseClone();
 
     public override string ToString() =>
-        $"{Name}[{Compression},fv{FormatVersion},{Filter},bs{BlockSize},wb{WriteBufferSize},{(DisableAutoCompactions ? "noauto" : "auto")},{Merge}]";
+        $"{Name}[{Compression},fv{FormatVersion},{Filter},bs{BlockSize},wb{WriteBufferSize},{(DisableAutoCompactions ? "noauto" : "auto")},{Merge}{(UserTimestamps ? ",u64ts" : "")}]";
 }
 
 /// <summary>How a database is opened by either engine. Serialized as JSON for the child process.</summary>

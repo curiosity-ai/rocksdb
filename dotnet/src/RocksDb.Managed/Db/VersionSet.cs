@@ -329,6 +329,12 @@ internal sealed class VersionSet : IAsyncDisposable
                         InstallVersion(cfd, new DbVersion(cfd, storage, ++_versionNumber));
                     }
                     if (edit.LogNumber is ulong ln && ln > cfd.LogNumber) cfd.LogNumber = ln;
+                    if (edit.FullHistoryTsLow is { Length: > 0 } tsLow && (cfd.FullHistoryTsLow is not { } cur
+                        || cfd.UserComparator.CompareTimestamp(tsLow, cur) > 0))
+                    {
+                        // ColumnFamilyData::SetFullHistoryTsLow (only increases).
+                        cfd.FullHistoryTsLow = tsLow;
+                    }
                 }
             }
         }
@@ -374,6 +380,7 @@ internal sealed class VersionSet : IAsyncDisposable
                 ComparatorName = c.UserComparator.Name,
                 PersistUserDefinedTimestamps = c.Options.PersistUserDefinedTimestamps,
                 LogNumber = c.LogNumber,
+                FullHistoryTsLow = c.FullHistoryTsLow,
             };
             VersionStorageInfo s = c.Current.Storage;
             for (int l = 0; l < s.NumLevels; l++)

@@ -330,6 +330,26 @@ public sealed class LogWriter : IDisposable, IAsyncDisposable
     /// Records the user-defined timestamp sizes of column families that have not been recorded in this log yet
     /// (zero sizes are not recorded). Port of <c>Writer::MaybeAddUserDefinedTimestampSizeRecord</c>.
     /// </summary>
+    public void MaybeAddUserDefinedTimestampSizeRecord(KeyValuePair<uint, int>[] cfToTimestampSize)
+    {
+        // Allocation-free fast path for the per-write call: every column family already recorded in this log.
+        Dictionary<uint, int>? recorded = _recordedCfToTsSize;
+        if (recorded is not null && recorded.Count >= cfToTimestampSize.Length)
+        {
+            bool all = true;
+            foreach (KeyValuePair<uint, int> kv in cfToTimestampSize)
+            {
+                if (kv.Value != 0 && !recorded.ContainsKey(kv.Key))
+                {
+                    all = false;
+                    break;
+                }
+            }
+            if (all) return;
+        }
+        MaybeAddUserDefinedTimestampSizeRecord((IEnumerable<KeyValuePair<uint, int>>)cfToTimestampSize);
+    }
+
     public void MaybeAddUserDefinedTimestampSizeRecord(IEnumerable<KeyValuePair<uint, int>> cfToTimestampSize)
     {
         ArgumentNullException.ThrowIfNull(cfToTimestampSize);

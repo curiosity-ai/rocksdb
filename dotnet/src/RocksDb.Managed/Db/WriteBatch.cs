@@ -281,6 +281,114 @@ public sealed class WriteBatch : IDisposable
         return this;
     }
 
+    // ---- User-defined timestamps (WriteBatch::Put/Delete/SingleDelete/DeleteRange/Merge with ts) ---------------
+
+    /// <summary>
+    /// Stores <paramref name="key"/> at <paramref name="timestamp"/> -> <paramref name="value"/>: the record key is
+    /// <c>key | timestamp</c> (WriteBatch::Put(cf, key, ts, value)). The column family must use a timestamp-aware
+    /// comparator whose timestamp size equals <paramref name="timestamp"/>.Length (checked when written to a DB).
+    /// </summary>
+    public WriteBatch Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp, ReadOnlySpan<byte> value)
+    {
+        AppendTimestampedRecord(EntryType.Value, EntryType.ColumnFamilyValue, columnFamilyId, key, timestamp, value, true, ContentFlags.HasPut);
+        return this;
+    }
+
+    /// <summary>Deletes <paramref name="key"/> at <paramref name="timestamp"/> (WriteBatch::Delete(cf, key, ts)).</summary>
+    public WriteBatch Delete(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp)
+    {
+        AppendTimestampedRecord(EntryType.Deletion, EntryType.ColumnFamilyDeletion, columnFamilyId, key, timestamp, default, false, ContentFlags.HasDelete);
+        return this;
+    }
+
+    /// <summary>SingleDelete of <paramref name="key"/> at <paramref name="timestamp"/> (WriteBatch::SingleDelete(cf, key, ts)).</summary>
+    public WriteBatch SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp)
+    {
+        AppendTimestampedRecord(EntryType.SingleDeletion, EntryType.ColumnFamilySingleDeletion, columnFamilyId, key, timestamp, default, false,
+            ContentFlags.HasSingleDelete);
+        return this;
+    }
+
+    /// <summary>Merge operand for <paramref name="key"/> at <paramref name="timestamp"/> (WriteBatch::Merge(cf, key, ts, value)).</summary>
+    public WriteBatch Merge(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp, ReadOnlySpan<byte> value)
+    {
+        AppendTimestampedRecord(EntryType.Merge, EntryType.ColumnFamilyMerge, columnFamilyId, key, timestamp, value, true, ContentFlags.HasMerge);
+        return this;
+    }
+
+    /// <summary>
+    /// Range deletion at <paramref name="timestamp"/>: both bounds carry the timestamp (WriteBatch::DeleteRange(cf, begin,
+    /// end, ts)).
+    /// </summary>
+    public WriteBatch DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey, ReadOnlySpan<byte> timestamp)
+    {
+        SaveState(out SavePoint save);
+        int keyLen = beginKey.Length + timestamp.Length;
+        int endLen = endKey.Length + timestamp.Length;
+        Span<byte> dst = BeginRecord(EntryType.RangeDeletion, EntryType.ColumnFamilyRangeDeletion, columnFamilyId, keyLen, endLen, out int p);
+        p += Coding.EncodeVarint32(dst[p..], (uint)keyLen);
+        beginKey.CopyTo(dst[p..]);
+        timestamp.CopyTo(dst[(p + beginKey.Length)..]);
+        p += keyLen;
+        p += Coding.EncodeVarint32(dst[p..], (uint)endLen);
+        endKey.CopyTo(dst[p..]);
+        timestamp.CopyTo(dst[(p + endKey.Length)..]);
+        p += endLen;
+        CommitRecord(p, ContentFlags.HasDeleteRange, counted: true, save);
+        return this;
+    }
+
+    private void AppendTimestampedRecord(EntryType defaultCfTag, EntryType cfTag, uint columnFamilyId, ReadOnlySpan<byte> key,
+        ReadOnlySpan<byte> timestamp, ReadOnlySpan<byte> value, bool hasValue, ContentFlags flag)
+    {
+        SaveState(out SavePoint save);
+        int keyLen = key.Length + timestamp.Length;
+        Span<byte> dst = BeginRecord(defaultCfTag, cfTag, columnFamilyId, keyLen, value.Length, out int p);
+        p += Coding.EncodeVarint32(dst[p..], (uint)keyLen);
+        key.CopyTo(dst[p..]);
+        timestamp.CopyTo(dst[(p + key.Length)..]);
+        p += keyLen;
+        if (hasValue)
+        {
+            p += Coding.EncodeVarint32(dst[p..], (uint)value.Length);
+            value.CopyTo(dst[p..]);
+            p += value.Length;
+        }
+        CommitRecord(p, flag, counted: true, save);
+    }
+
+    /// <summary>
+    /// Port of WriteBatch::UpdateTimestamps: overwrites, in place, the trailing timestamp of every key (and range
+    /// deletion bound) of the column families for which <paramref name="timestampSizeOf"/> returns a non-zero size with
+    /// <paramref name="timestamp"/>. Used for batches built with placeholder timestamps that are assigned at commit time.
+    /// Throws InvalidArgument if a size differs from <paramref name="timestamp"/>.Length or a key is shorter than it.
+    /// </summary>
+    public void UpdateTimestamps(ReadOnlySpan<byte> timestamp, Func<uint, int> timestampSizeOf)
+    {
+        ArgumentNullException.ThrowIfNull(timestampSizeOf);
+        Span<byte> rep = _rep.WrittenSpanMutable;
+        ref byte origin = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(rep);
+        var reader = new WriteBatchReader(rep);
+        while (reader.TryReadNext(out WriteBatchEntry e))
+        {
+            bool hasKey = e.Type is EntryType.Value or EntryType.Deletion or EntryType.SingleDeletion or EntryType.Merge
+                or EntryType.RangeDeletion or EntryType.WideColumnEntity or EntryType.BlobIndex or EntryType.ValuePreferredSeqno;
+            if (!hasKey) continue;
+            int tsSize = timestampSizeOf(e.ColumnFamilyId);
+            if (tsSize == 0) continue;
+            if (tsSize != timestamp.Length) ThrowHelper.InvalidArgument("timestamp size mismatch");
+            OverwriteTimestamp(rep, ref origin, e.Key, timestamp);
+            if (e.Type == EntryType.RangeDeletion) OverwriteTimestamp(rep, ref origin, e.Value, timestamp);
+        }
+    }
+
+    private static void OverwriteTimestamp(Span<byte> rep, ref byte origin, ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp)
+    {
+        if (key.Length < timestamp.Length) ThrowHelper.InvalidArgument("key is shorter than the timestamp");
+        int offset = (int)Unsafe.ByteOffset(ref origin, ref System.Runtime.InteropServices.MemoryMarshal.GetReference(key));
+        timestamp.CopyTo(rep[(offset + key.Length - timestamp.Length)..]);
+    }
+
     /// <summary>
     /// Stores a wide-column entity whose serialized form (<c>WideColumnSerialization</c>, columns sorted by name) is
     /// <paramref name="entity"/>. Port of <c>WriteBatchInternal::PutEntitySerialized</c>.

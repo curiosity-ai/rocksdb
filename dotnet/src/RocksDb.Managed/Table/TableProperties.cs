@@ -39,6 +39,9 @@ public static class TablePropertiesNames
     public const string MergeOperator = "rocksdb.merge.operator";
     public const string PrefixExtractorName = "rocksdb.prefix.extractor.name";
     public const string PropertyCollectors = "rocksdb.property.collectors";
+    /// <summary>TimestampTablePropertiesCollector: smallest / largest user-defined timestamp of the table.</summary>
+    public const string TimestampMin = "rocksdb.timestamp_min";
+    public const string TimestampMax = "rocksdb.timestamp_max";
     public const string Compression = "rocksdb.compression";
     public const string CompressionOptions = "rocksdb.compression_options";
     /// <summary>kOldestAncestorTime (also kCreationTime).</summary>

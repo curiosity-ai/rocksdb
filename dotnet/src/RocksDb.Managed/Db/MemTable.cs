@@ -254,7 +254,14 @@ public sealed unsafe class MemTable : IDisposable
     /// <param name="mergeContext">Receives merge operands; when null, a merge entry yields <see cref="MemTableGetResult.MergeInProgress"/> immediately.</param>
     /// <param name="maxCoveringTombstoneSeq">In/out: the largest covering range-tombstone seqno seen so far (newer sources first).</param>
     public MemTableGetResult Get(scoped in LookupKey key, out ReadOnlySpan<byte> value, out EntryType valueType, out ulong sequence,
-        MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq)
+        MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq) =>
+        Get(key, out value, out valueType, out sequence, mergeContext, ref maxCoveringTombstoneSeq, null);
+
+    /// <inheritdoc cref="Get(in LookupKey, out ReadOnlySpan{byte}, out EntryType, out ulong, MergeContext?, ref ulong)"/>
+    /// <param name="timestampSink">When non-null with a non-zero <see cref="GetContext.TimestampSize"/>, receives the
+    /// timestamp of the first entry of the key that is matched (SaveValue, s->timestamp).</param>
+    internal MemTableGetResult Get(scoped in LookupKey key, out ReadOnlySpan<byte> value, out EntryType valueType, out ulong sequence,
+        MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq, GetContext? timestampSink)
     {
         value = default;
         valueType = EntryType.Value;
@@ -285,6 +292,7 @@ public sealed unsafe class MemTable : IDisposable
             bool same = _bytewise ? entryUserKey.SequenceEqual(lookupUserKey) : _ucmp.EqualWithoutTimestamp(entryUserKey, lookupUserKey);
             if (!same) break;
 
+            if (timestampSink is { TimestampSize: not 0 }) timestampSink.RecordTimestampOfUserKey(entryUserKey);
             ulong tag = Coding.DecodeFixed64(new ReadOnlySpan<byte>(ek.Ptr + userKeyLen, DbFormat.InternalKeyFooterSize));
             ulong seq = tag >> 8;
             var type = (EntryType)(byte)tag;

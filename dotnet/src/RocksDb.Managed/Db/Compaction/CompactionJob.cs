@@ -187,8 +187,12 @@ internal sealed class CompactionJob
         ulong latestSnapshot = _snapshots.Length == 0 ? 0 : _snapshots[^1];
         MergeHelper? merge = mergeOperator is null ? null : new MergeHelper(_icmp, mergeOperator, filter, latestSnapshot, _c.StartLevel);
         ulong earliestWriteConflict = DbFormat.MaxSequenceNumber;
+        // full_history_ts_low of the column family at the time the job runs (CompactionJob: cfd->GetFullHistoryTsLow()).
+        byte[]? fullHistoryTsLow = _cfd.TimestampSize != 0 ? _cfd.FullHistoryTsLow : null;
+        if (merge is not null) merge.FullHistoryTsLow = fullHistoryTsLow;
         var iter = new CompactionIterator(input, _icmp, merge, _snapshots, earliestWriteConflict, rangeDel, _c, filter,
-            _db.Options.EnforceSingleDelContracts, _cancellation);
+            _db.Options.EnforceSingleDelContracts, _cancellation)
+        { FullHistoryTsLow = fullHistoryTsLow };
         try
         {
             input.SeekToFirst();
@@ -348,6 +352,9 @@ internal sealed class CompactionJob
                 else await file.SyncAsync(_cancellation).ConfigureAwait(false);
                 meta.FileSize = builder.FileSize;
                 meta.TailSize = builder.FileSize - builder.Properties.TailStartOffset;
+                // ExtractTimestampFromTableProperties (db/builder.cc).
+                meta.MinTimestamp = builder.TimestampMin;
+                meta.MaxTimestamp = builder.TimestampMax;
                 Stats.NumOutputRangeDeletions += (long)builder.Properties.NumRangeDeletions;
                 keep = true;
             }

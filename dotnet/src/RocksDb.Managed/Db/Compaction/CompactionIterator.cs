@@ -29,7 +29,10 @@ internal struct CompactionIterationStats
 /// (db/compaction/compaction_iterator.cc: NextFromInput, InvokeFilterIfNeeded, PrepareOutput,
 /// findEarliestVisibleSnapshot).
 /// <para>
-/// Not ported: snapshot checkers (write-prepared transactions), user-defined timestamps, blob files, wide-column
+/// User-defined timestamps: versions of a key with different timestamps are distinct keys unless they are older than
+/// full_history_ts_low, in which case the older ones may be collapsed (rule A) and their sequence number and timestamp
+/// zeroed at the bottommost level.
+/// Not ported: snapshot checkers (write-prepared transactions), blob files, wide-column
 /// filtering, range-tombstone sentinel keys (range tombstones are handled by the <see cref="RangeDelAggregator"/>
 /// and written by the compaction job). Allocation-free per key: the current key lives in an <see cref="IterKey"/>
 /// and values are spans into the input, the merge helper or the filter output.
@@ -86,6 +89,16 @@ internal sealed class CompactionIterator : IDisposable
 
     public CompactionIterationStats Stats;
 
+    // User-defined timestamps (timestamp_size_, full_history_ts_low_, curr_ts_, cmp_with_history_ts_low_).
+    private readonly int _tsSize;
+    private readonly Comparator _ucmp;
+    private readonly byte[]? _currTs;
+    private bool _hasCurrTs;
+    private int _cmpWithHistoryTsLow;
+
+    /// <summary>full_history_ts_low of the compaction (null: all timestamp history is preserved).</summary>
+    public byte[]? FullHistoryTsLow { get; init; }
+
     /// <param name="input">Merged input, positioned by <see cref="SeekToFirst"/>.</param>
     /// <param name="icmp">Internal key comparator.</param>
     /// <param name="mergeHelper">Merge helper (null when the column family has no merge operator).</param>
@@ -115,6 +128,9 @@ internal sealed class CompactionIterator : IDisposable
         _level = compaction?.StartLevel ?? 0;
         _levelPtrs = new int[compaction?.NumberLevels ?? 0];
         _cancellation = cancellation;
+        _ucmp = icmp.UserComparator;
+        _tsSize = _ucmp.TimestampSize;
+        if (_tsSize != 0) _currTs = new byte[_tsSize];
     }
 
     public bool Valid => _valid;
@@ -199,8 +215,9 @@ internal sealed class CompactionIterator : IDisposable
         DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(k), out ulong seq, out EntryType type);
         _ikeySequence = seq;
         _ikeyType = type;
-        // Keep current_key_ in sync (same user key).
-        _currentKey.UpdateInternalKey(seq, type);
+        // Keep current_key_ in sync (same user key; with timestamps the merge output carries its own timestamp).
+        if (_tsSize == 0) _currentKey.UpdateInternalKey(seq, type);
+        else _currentKey.SetInternalKey(k);
         _valueSource = ValueSource.Merge;
     }
 
@@ -248,7 +265,18 @@ internal sealed class CompactionIterator : IDisposable
             type = 0;
             return false;
         }
-        return _icmp.EqualUserKey(_input.Key[..ukLen], _currentKey.UserKey);
+        ReadOnlySpan<byte> uk = _input.Key[..ukLen];
+        return _tsSize == 0 ? _icmp.EqualUserKey(uk, _currentKey.UserKey) : _ucmp.EqualWithoutTimestamp(uk, _currentKey.UserKey);
+    }
+
+    /// <summary>Port of UpdateTimestampAndCompareWithFullHistoryLow.</summary>
+    private void UpdateTimestampAndCompareWithFullHistoryLow(ReadOnlySpan<byte> userKey)
+    {
+        if (_tsSize == 0) return;
+        ReadOnlySpan<byte> ts = DbFormat.ExtractTimestampFromUserKey(userKey, _tsSize);
+        ts.CopyTo(_currTs);
+        _hasCurrTs = true;
+        if (FullHistoryTsLow is { } low) _cmpWithHistoryTsLow = _ucmp.CompareTimestamp(ts, low);
     }
 
     /// <summary>Port of InvokeFilterIfNeeded (plain values only). Returns false if the iteration must stop with an error.</summary>
@@ -311,7 +339,7 @@ internal sealed class CompactionIterator : IDisposable
             }
             ReadOnlySpan<byte> inUserKey = inKey[..pik.UserKeyLength];
             Stats.NumInputRecords++;
-            if (pik.Type is EntryType.Deletion or EntryType.SingleDeletion) Stats.NumInputDeletionRecords++;
+            if (pik.Type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp) Stats.NumInputDeletionRecords++;
             Stats.TotalInputRawKeyBytes += inKey.Length;
             Stats.TotalInputRawValueBytes += _input.Value.Length;
 
@@ -323,13 +351,35 @@ internal sealed class CompactionIterator : IDisposable
 
             // Check whether the user key changed. After this current_key_ is a copy of the current input key (maybe
             // converted to a delete by the compaction filter).
-            if (!_hasCurrentUserKey || !_icmp.EqualUserKey(inUserKey, _currentKey.UserKey))
+            bool userKeyEqualWithoutTs = false;
+            int cmpTs = 0;
+            if (_hasCurrentUserKey)
             {
-                // First occurrence of this user key.
+                if (_tsSize == 0)
+                {
+                    userKeyEqualWithoutTs = _icmp.EqualUserKey(inUserKey, _currentKey.UserKey);
+                }
+                else
+                {
+                    userKeyEqualWithoutTs = _ucmp.EqualWithoutTimestamp(inUserKey, _currentKey.UserKey);
+                    cmpTs = _ucmp.CompareTimestamp(DbFormat.ExtractTimestampFromUserKey(inUserKey, _tsSize), _currTs);
+                }
+            }
+            if (!_hasCurrentUserKey || !userKeyEqualWithoutTs || cmpTs != 0)
+            {
+                // First occurrence of this user key (or of this timestamp of it).
                 _currentKey.SetInternalKey(inKey);
-                _currentUserKeySequence = DbFormat.MaxSequenceNumber;
-                _currentUserKeySnapshot = 0;
-                _hasCurrentUserKey = true;
+                int prevCmpWithTsLow = FullHistoryTsLow is { } low && _hasCurrTs ? _ucmp.CompareTimestamp(_currTs, low) : 0;
+                UpdateTimestampAndCompareWithFullHistoryLow(inUserKey);
+                // The user key is treated as a new key unless timestamps are enabled with full_history_ts_low and this
+                // is an older version (below full_history_ts_low) of the previous user key, which then may be GC'ed.
+                if (!_hasCurrentUserKey || _tsSize == 0 || FullHistoryTsLow is null || !userKeyEqualWithoutTs || _cmpWithHistoryTsLow >= 0
+                    || prevCmpWithTsLow >= 0)
+                {
+                    _currentUserKeySequence = DbFormat.MaxSequenceNumber;
+                    _currentUserKeySnapshot = 0;
+                    _hasCurrentUserKey = true;
+                }
                 _hasOutputtedKey = false;
                 _lastKeySeqZeroed = false;
                 // Apply the compaction filter to the first committed version of the user key.
@@ -379,7 +429,8 @@ internal sealed class CompactionIterator : IDisposable
                 Stats.NumRecordDropHidden++;
                 _input.Next();
             }
-            else if (_compaction is not null && _ikeyType == EntryType.Deletion && !_compaction.Options.CfAllowIngestBehind
+            else if (_compaction is not null && (_ikeyType == EntryType.Deletion || (_ikeyType == EntryType.DeletionWithTimestamp && _cmpWithHistoryTsLow < 0))
+                     && !_compaction.Options.CfAllowIngestBehind
                      && DefinitelyInSnapshot(_ikeySequence, _earliestSnapshot)
                      && _compaction.KeyNotExistsBeyondOutputLevel(_currentKey.UserKey, _levelPtrs))
             {
@@ -390,7 +441,7 @@ internal sealed class CompactionIterator : IDisposable
                 if (!_bottommostLevel) Stats.NumOptimizedDelDropObsolete++;
                 _input.Next();
             }
-            else if (_ikeyType == EntryType.Deletion && _bottommostLevel)
+            else if ((_ikeyType == EntryType.Deletion || (_ikeyType == EntryType.DeletionWithTimestamp && _cmpWithHistoryTsLow < 0)) && _bottommostLevel)
             {
                 // Handle the case where we have a delete key at the bottom most level. We can skip outputting the key
                 // iff there are no subsequent puts for this key.
@@ -492,6 +543,8 @@ internal sealed class CompactionIterator : IDisposable
     /// <summary>The SingleDelete branch of NextFromInput (peeks at the next entry).</summary>
     private void HandleSingleDelete(ulong prevSnapshot)
     {
+        // With timestamps, a SingleDelete may only be dropped below full_history_ts_low.
+        bool isTimestampEligibleForGc = _tsSize == 0 || (FullHistoryTsLow is not null && _cmpWithHistoryTsLow < 0);
         // The easiest way to process a SingleDelete during iteration is to peek ahead at the next key.
         _input.Next();
         if (InputHasSameUserKey(out ulong nextSeq, out EntryType nextType))
@@ -521,6 +574,12 @@ internal sealed class CompactionIterator : IDisposable
                         ThrowHelper.Corruption("Found SD and type: " + (int)nextType + " on the same key, violating the contract of SingleDelete. " +
                                                "Check your application to make sure the application does not mix SingleDelete and Delete for the same key.");
                     }
+                }
+                else if (!isTimestampEligibleForGc)
+                {
+                    // We cannot drop the SingleDelete as timestamp is enabled, and timestamp of this key is greater than or
+                    // equal to full_history_ts_low. We will output the SingleDelete.
+                    _valid = true;
                 }
                 else if (_hasOutputtedKey || DefinitelyInSnapshot(_ikeySequence, _earliestWriteConflictSnapshot)
                          || (_earliestSnapshot < _earliestWriteConflictSnapshot && DefinitelyInSnapshot(_ikeySequence, _earliestSnapshot)))
@@ -558,7 +617,7 @@ internal sealed class CompactionIterator : IDisposable
             // is at the next key, we do not compare it again against the previous key at the next iteration.
             _hasCurrentUserKey = false;
             if (_compaction is not null && !_compaction.Options.CfAllowIngestBehind && DefinitelyInSnapshot(_ikeySequence, _earliestSnapshot)
-                && _compaction.KeyNotExistsBeyondOutputLevel(_currentKey.UserKey, _levelPtrs))
+                && _compaction.KeyNotExistsBeyondOutputLevel(_currentKey.UserKey, _levelPtrs) && isTimestampEligibleForGc)
             {
                 // Key doesn't exist outside of this range. Can compact out this SingleDelete.
                 Stats.NumRecordDropObsolete++;
@@ -586,12 +645,41 @@ internal sealed class CompactionIterator : IDisposable
         // levels) and the earliest snapshot is larger than this seqno and the userkey differs from the last userkey in
         // compaction then we can squash the seqno to zero.
         if (_valid && _bottommostLevel && DefinitelyInSnapshot(_ikeySequence, _earliestSnapshot) && _ikeyType != EntryType.Merge
-            && _ikeyType is not (EntryType.Deletion or EntryType.SingleDeletion))
+            && _ikeyType != EntryType.Deletion && (_ikeyType != EntryType.SingleDeletion || _tsSize != 0))
         {
-            // BottommostSeqnoCanBeZeroed: seq <= preserve_seqno_after_ (= earliest snapshot without time preservation).
-            _currentKey.UpdateInternalKey(0, _ikeyType);
+            // BottommostSeqnoCanBeZeroed: seq <= preserve_seqno_after_ (= earliest snapshot without time preservation);
+            // with user-defined timestamps only below full_history_ts_low.
+            if (_tsSize == 0)
+            {
+                _currentKey.UpdateInternalKey(0, _ikeyType);
+            }
+            else
+            {
+                if (FullHistoryTsLow is null || _cmpWithHistoryTsLow >= 0) return;
+                // For UDT, the seqno and timestamp are zeroed together: the timestamp-based history of the key is collapsed.
+                ZeroTimestampOfCurrentKey();
+            }
             _ikeySequence = 0;
             _lastKeySeqZeroed = true;
+        }
+    }
+
+    /// <summary>current_key_.UpdateInternalKey(0, type, &amp;kTsMin).</summary>
+    private void ZeroTimestampOfCurrentKey()
+    {
+        ReadOnlySpan<byte> userKey = _currentKey.UserKey;
+        int n = userKey.Length + DbFormat.InternalKeyFooterSize;
+        byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(n);
+        try
+        {
+            userKey[..^_tsSize].CopyTo(buf);
+            buf.AsSpan(userKey.Length - _tsSize, _tsSize).Clear();
+            Coding.EncodeFixed64(buf.AsSpan(userKey.Length), DbFormat.PackSequenceAndType(0, _ikeyType));
+            _currentKey.SetInternalKey(buf.AsSpan(0, n));
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(buf);
         }
     }
 

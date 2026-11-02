@@ -41,6 +41,27 @@ internal sealed class GetContext
     public bool ValueIsEntity;
     public ulong MaxCoveringTombstoneSeq;
     public MergeOperator? MergeOperator;
+    /// <summary>
+    /// User-defined timestamp size of the column family being read (0 = timestamps disabled). When non-zero, the
+    /// timestamp of the first (newest visible) entry matched is captured (GetContext::SaveValue, timestamp_).
+    /// </summary>
+    public int TimestampSize;
+    /// <summary>True once <see cref="FoundTimestamp"/> holds the timestamp of the first matched entry.</summary>
+    public bool HasTimestamp;
+    private byte[] _timestamp = new byte[8];
+
+    /// <summary>Timestamp of the newest visible entry of the key. REQUIRES: <see cref="HasTimestamp"/>.</summary>
+    public ReadOnlySpan<byte> FoundTimestamp => _timestamp.AsSpan(0, TimestampSize);
+
+    /// <summary>Records the timestamp of the first matched entry (later calls are ignored).</summary>
+    public void RecordTimestampOfUserKey(ReadOnlySpan<byte> userKeyWithTimestamp)
+    {
+        if (HasTimestamp) return;
+        int n = TimestampSize;
+        if (_timestamp.Length < n) _timestamp = new byte[n];
+        userKeyWithTimestamp[^n..].CopyTo(_timestamp);
+        HasTimestamp = true;
+    }
 
     public void Reset(MergeOperator? mergeOperator)
     {
@@ -51,6 +72,8 @@ internal sealed class GetContext
         ValueIsEntity = false;
         MaxCoveringTombstoneSeq = 0;
         MergeOperator = mergeOperator;
+        TimestampSize = 0;
+        HasTimestamp = false;
     }
 
     /// <summary>
@@ -60,6 +83,7 @@ internal sealed class GetContext
     public bool SaveValue(ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value)
     {
         DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(internalKey), out ulong seq, out EntryType type);
+        if (TimestampSize != 0) RecordTimestampOfUserKey(DbFormat.ExtractUserKey(internalKey));
         return SaveEntry(seq, type, value);
     }
 

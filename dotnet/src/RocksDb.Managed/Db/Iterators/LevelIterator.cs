@@ -204,10 +204,17 @@ public sealed class LevelIterator : InternalIterator
     }
 
     private bool FileStartsAtOrAfterUpperBound(int index) =>
-        _upper is ReadOnlyMemory<byte> ub && _icmp.CompareUserKey(DbFormat.ExtractUserKey(_files[index].Smallest), ub.Span) >= 0;
+        _upper is ReadOnlyMemory<byte> ub && CompareToBound(DbFormat.ExtractUserKey(_files[index].Smallest), ub.Span) >= 0;
 
     private bool FileEndsBeforeLowerBound(int index) =>
-        _lower is ReadOnlyMemory<byte> lb && _icmp.CompareUserKey(DbFormat.ExtractUserKey(_files[index].Largest), lb.Span) < 0;
+        _lower is ReadOnlyMemory<byte> lb && CompareToBound(DbFormat.ExtractUserKey(_files[index].Largest), lb.Span) < 0;
+
+    /// <summary>A file boundary user key against an iterate bound; bounds carry no user-defined timestamp.</summary>
+    private int CompareToBound(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> bound)
+    {
+        Comparator ucmp = _icmp.UserComparator;
+        return ucmp.TimestampSize == 0 ? _icmp.CompareUserKey(userKey, bound) : ucmp.CompareWithoutTimestamp(userKey, true, bound, false);
+    }
 
     /// <summary>Opens (or keeps) the iterator for file <paramref name="index"/>; null iterator if out of range.</summary>
     private void InitFileIterator(int index)

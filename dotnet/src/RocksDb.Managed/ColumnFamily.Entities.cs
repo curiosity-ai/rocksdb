@@ -16,6 +16,7 @@ public sealed partial class ColumnFamily
 
     public void PutEntity(WriteOptions? options, ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns)
     {
+        if (_cfd.TimestampSize != 0) ThrowCfHasTimestamp(); // DBImpl::PutEntity: FailIfCfHasTs
         WriteBatch b = WriteBatch.Rent();
         try
         {
@@ -36,6 +37,7 @@ public sealed partial class ColumnFamily
     public async ValueTask PutEntityAsync(WriteOptions? options, ReadOnlyMemory<byte> key, ReadOnlyMemory<WideColumn> columns,
         CancellationToken cancellationToken = default)
     {
+        if (_cfd.TimestampSize != 0) ThrowCfHasTimestamp(); // DBImpl::PutEntity: FailIfCfHasTs
         WriteBatch b = WriteBatch.Rent();
         try
         {

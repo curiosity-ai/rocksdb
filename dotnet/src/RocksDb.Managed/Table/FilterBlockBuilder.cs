@@ -124,6 +124,9 @@ internal sealed class PartitionedFilterBlockBuilder : FilterBlockBuilder
     private BlockHandle _lastEncodedHandle;
     private byte[]? _returnedFilter;
 
+    /// <summary>User-defined timestamp size of the comparator (ts_sz_): decoupled partition keys get the minimum timestamp.</summary>
+    internal int TimestampSize { get; init; }
+
     public PartitionedFilterBlockBuilder(SliceTransform? prefixExtractor, bool wholeKeyFiltering, IFilterBitsBuilder bits, int indexBlockRestartInterval,
         bool useValueDeltaEncoding, int formatVersion, PartitionedIndexBuilder partitionedIndexBuilder, uint partitionSize,
         bool decoupleFromIndexPartitions, bool useCommonPrefix)
@@ -214,8 +217,11 @@ internal sealed class PartitionedFilterBlockBuilder : FilterBlockBuilder
         byte[] ikey;
         if (_decoupleFromIndexPartitions)
         {
-            ikey = new byte[prevKey.Length + DbFormat.InternalKeyFooterSize];
-            DbFormat.AppendInternalKey(ikey, prevKey, 0, EntryType.Deletion);
+            // prevKey has no timestamp: the partition key carries the minimum timestamp (AppendKeyWithMinTimestamp).
+            int ts = TimestampSize;
+            ikey = new byte[prevKey.Length + ts + DbFormat.InternalKeyFooterSize];
+            prevKey.CopyTo(ikey);
+            Coding.EncodeFixed64(ikey.AsSpan(prevKey.Length + ts), DbFormat.PackSequenceAndType(0, EntryType.Deletion));
         }
         else
         {

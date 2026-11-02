@@ -626,12 +626,23 @@ internal sealed partial class VersionStorageInfo
     // Overlap queries
 
     /// <summary>
+    /// Comparator::CompareWithoutTimestamp of two user keys that carry the column family's timestamp (plain user-key
+    /// comparison without timestamps): file range overlap checks treat all versions of a key as the same key.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int CompareWithoutTimestamp(InternalKeyComparator icmp, ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
+    {
+        Comparator ucmp = icmp.UserComparator;
+        return ucmp.TimestampSize == 0 ? icmp.CompareUserKey(a, b) : ucmp.CompareWithoutTimestamp(a, b);
+    }
+
+    /// <summary>
     /// Port of sstableKeyCompare (db/compaction/compaction.cc): user-key comparison where a range-tombstone sentinel
     /// (kMaxSequenceNumber, kTypeRangeDeletion) sorts before any other key with the same user key.
     /// </summary>
     public static int SstableKeyCompare(InternalKeyComparator icmp, ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
     {
-        int c = icmp.CompareUserKey(DbFormat.ExtractUserKey(a), DbFormat.ExtractUserKey(b));
+        int c = VersionStorageInfo.CompareWithoutTimestamp(icmp, DbFormat.ExtractUserKey(a), DbFormat.ExtractUserKey(b));
         if (c != 0) return c;
         ulong sentinel = DbFormat.PackSequenceAndType(DbFormat.MaxSequenceNumber, EntryType.RangeDeletion);
         ulong af = DbFormat.ExtractFooter(a), bf = DbFormat.ExtractFooter(b);
@@ -688,11 +699,11 @@ internal sealed partial class VersionStorageInfo
                 FileMetaData f = files[index[k]];
                 ReadOnlySpan<byte> fileStart = DbFormat.ExtractUserKey(f.Smallest);
                 ReadOnlySpan<byte> fileLimit = DbFormat.ExtractUserKey(f.Largest);
-                if (userBegin is not null && icmp.CompareUserKey(fileLimit, userBegin) < 0)
+                if (userBegin is not null && VersionStorageInfo.CompareWithoutTimestamp(icmp, fileLimit, userBegin) < 0)
                 {
                     k++; // "f" is completely before specified range; skip it
                 }
-                else if (userEnd is not null && icmp.CompareUserKey(fileStart, userEnd) > 0)
+                else if (userEnd is not null && VersionStorageInfo.CompareWithoutTimestamp(icmp, fileStart, userEnd) > 0)
                 {
                     k++; // "f" is completely after specified range; skip it
                 }
@@ -704,8 +715,8 @@ internal sealed partial class VersionStorageInfo
                     index.RemoveAt(k);
                     if (expandRange)
                     {
-                        if (userBegin is not null && icmp.CompareUserKey(fileStart, userBegin) < 0) userBegin = fileStart.ToArray();
-                        if (userEnd is not null && icmp.CompareUserKey(fileLimit, userEnd) > 0) userEnd = fileLimit.ToArray();
+                        if (userBegin is not null && VersionStorageInfo.CompareWithoutTimestamp(icmp, fileStart, userBegin) < 0) userBegin = fileStart.ToArray();
+                        if (userEnd is not null && VersionStorageInfo.CompareWithoutTimestamp(icmp, fileLimit, userEnd) > 0) userEnd = fileLimit.ToArray();
                     }
                 }
             }

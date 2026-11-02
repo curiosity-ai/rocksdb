@@ -16,6 +16,18 @@ public sealed class ReadOptions
     public ReadOnlyMemory<byte>? IterateLowerBound { get; set; }
     /// <summary>Exclusive upper bound for iterators; null for none.</summary>
     public ReadOnlyMemory<byte>? IterateUpperBound { get; set; }
+    /// <summary>
+    /// Read timestamp for column families with user-defined timestamps (ReadOptions::timestamp): each key is read at its
+    /// newest version whose timestamp is &lt;= this one. Required for such column families, rejected for others. Its
+    /// length must equal the column family's timestamp size.
+    /// </summary>
+    public ReadOnlyMemory<byte>? Timestamp { get; set; }
+    /// <summary>
+    /// Lower timestamp bound for iterators (ReadOptions::iter_start_ts, inclusive): when set, the iterator returns every
+    /// version with a timestamp in [IterStartTs, <see cref="Timestamp"/>], deletions included (see
+    /// <see cref="Db.Iterators.Iterator.InternalKey"/>). Requires <see cref="Timestamp"/>.
+    /// </summary>
+    public ReadOnlyMemory<byte>? IterStartTs { get; set; }
     public ReadTier ReadTier { get; set; } = ReadTier.ReadAllTier;
     public bool IgnoreRangeDeletions { get; set; }
     public bool AsyncIo { get; set; }
@@ -75,4 +87,9 @@ public sealed class CompactRangeOptions
     public uint MaxSubcompactions { get; set; }
     /// <summary>-1 means use the column family setting.</summary>
     public double BlobGarbageCollectionAgeCutoff { get; set; } = -1;
+    /// <summary>
+    /// When set, full_history_ts_low of the column family is first raised to this timestamp
+    /// (CompactRangeOptions::full_history_ts_low); only allowed for a full-range compaction.
+    /// </summary>
+    public ReadOnlyMemory<byte>? FullHistoryTsLow { get; set; }
 }

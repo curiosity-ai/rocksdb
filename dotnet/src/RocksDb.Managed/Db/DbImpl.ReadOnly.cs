@@ -93,7 +93,7 @@ internal sealed partial class DbImpl
                 if (!descriptors.TryGetValue(cf.Name, out ColumnFamilyOptions? cfOptions)) continue;
                 ColumnFamilyOptions opts = PrepareCfOptions(cfOptions);
                 ValidateRecoveredColumnFamily(cf, opts);
-                var cfd = new ColumnFamilyData(cf.Id, cf.Name, opts, this) { LogNumber = cf.LogNumber };
+                var cfd = new ColumnFamilyData(cf.Id, cf.Name, opts, this) { LogNumber = cf.LogNumber, FullHistoryTsLow = cf.FullHistoryTsLow };
                 Versions.AddColumnFamily(cfd, ToFileArrays(cf));
                 cfd.RecoverEpochNumbers();
                 cfd.Mem = cfd.ConstructNewMemtable(state.LastSequence);

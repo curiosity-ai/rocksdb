@@ -220,6 +220,9 @@ internal sealed partial class DbImpl
                 try
                 {
                     LogWriter log = _log!;
+                    // DBImpl::WriteToWAL: record the timestamp sizes of column families with timestamps not yet recorded
+                    // in this WAL (recovery uses them to reconcile timestamp-size changes).
+                    if (_cfTimestampSizes is { } tsSizes) log.MaybeAddUserDefinedTimestampSizeRecord(tsSizes);
                     if (synchronous)
                     {
                         log.AddRecord(record.Span, last);
@@ -469,6 +472,7 @@ internal sealed partial class DbImpl
         old.CopyTo(map, 0);
         map[cfd.Id] = cfd;
         Volatile.Write(ref _cfById, map);
+        RefreshTimestampSizes(map);
     }
 
     private void UnregisterCfForWrite(ColumnFamilyData cfd)
@@ -476,6 +480,7 @@ internal sealed partial class DbImpl
         ColumnFamilyData?[] map = (ColumnFamilyData?[])_cfById.Clone();
         if (cfd.Id < (uint)map.Length) map[cfd.Id] = null;
         Volatile.Write(ref _cfById, map);
+        RefreshTimestampSizes(map);
     }
 
     /// <summary>Validates the column family ids of a user batch before it is committed (avoids partially applied batches).</summary>
@@ -554,6 +559,8 @@ internal sealed partial class DbImpl
             ColumnFamilyData? c = _db.CfForInsert(cf, _logNumber, IgnoreMissingColumnFamilies);
             if (c is not null)
             {
+                // MemTableInserter::DeleteCF: a deletion in a column family with timestamps is kTypeDeletionWithTimestamp.
+                if (type == EntryType.Deletion && c.TimestampSize != 0) type = EntryType.DeletionWithTimestamp;
                 MemTable mem = c.Mem;
                 // A duplicate key+seq can only come from replaying an already applied batch; ignore it like upstream's
                 // TryAgain handling for non-seq-per-batch writes.

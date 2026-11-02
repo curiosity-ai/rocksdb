@@ -27,6 +27,12 @@ internal sealed partial class DbImpl
         ulong snapshot = ReadSequence(options);
         try
         {
+            if (cfd.TimestampSize != 0)
+            {
+                MultiGetWithTimestamp(cfd, sv, snapshot, options, batch);
+                if (st is not null) RecordMultiGet(st, batch, t0);
+                return;
+            }
             Comparator ucmp = cfd.UserComparator;
             batch.BeginRun(cfd.MergeOperator, snapshot, ucmp);
             int n = batch.Count;
@@ -169,5 +175,27 @@ internal sealed partial class DbImpl
         {
             lease.Dispose();
         }
+    }
+
+    /// <summary>
+    /// MultiGet on a column family with user-defined timestamps: every key is looked up on the same super version and
+    /// sequence like the batched path, one key at a time (the batched table lookup is not timestamp-aware).
+    /// </summary>
+    private void MultiGetWithTimestamp(ColumnFamilyData cfd, SuperVersion sv, ulong snapshot, ReadOptions? options, MultiGetBatch batch)
+    {
+        GetReadTimestamp(cfd, options); // validate once (throws for the whole call, like GetImpl's checks in MultiGet)
+        batch.BeginRun(cfd.MergeOperator, snapshot, cfd.UserComparator.RootComparator);
+        for (int k = 0; k < batch.Count; k++)
+        {
+            try
+            {
+                GetWithSuperVersion(cfd, sv, snapshot, options, batch.UserKey(k), batch.Context(k));
+            }
+            catch (RocksDbException e)
+            {
+                batch.SetError(k, e);
+            }
+        }
+        batch.FinishRun();
     }
 }

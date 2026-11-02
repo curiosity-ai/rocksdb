@@ -36,7 +36,14 @@ public sealed class Iterator : IDisposable
         ArgumentNullException.ThrowIfNull(iter);
         _it = iter;
         _icmp = iter.Comparator;
+        _keyComparator = _icmp.UserComparator.TimestampSize == 0 ? null : _icmp.UserComparator.RootComparator;
     }
+
+    /// <summary>Keys without timestamps are ordered by the root comparator when the column family has timestamps.</summary>
+    private readonly Comparator? _keyComparator;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int CompareKeys(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) => _keyComparator is null ? _icmp.CompareUserKey(a, b) : _keyComparator.Compare(a, b);
 
     /// <summary>True if positioned at an entry.</summary>
     public bool Valid
@@ -50,6 +57,18 @@ public sealed class Iterator : IDisposable
 
     /// <summary>Current value. REQUIRES: <see cref="Valid"/>. Valid until the iterator moves.</summary>
     public ReadOnlySpan<byte> Value => _it.Value;
+
+    /// <summary>
+    /// User-defined timestamp of the current entry (Iterator::timestamp()) for column families with timestamps; empty
+    /// otherwise. REQUIRES: <see cref="Valid"/>. Valid until the iterator moves.
+    /// </summary>
+    public ReadOnlySpan<byte> Timestamp => _it.Timestamp;
+
+    /// <summary>
+    /// With <see cref="ReadOptions.IterStartTs"/>: the internal key of the current version (user key | timestamp |
+    /// fixed64(seq &lt;&lt; 8 | type)), which tells deletions apart (upstream returns it as key()). Empty otherwise.
+    /// </summary>
+    public ReadOnlySpan<byte> InternalKey => _it.InternalKey;
 
     /// <summary>True if the current entry is a wide-column entity (PutEntity). REQUIRES: <see cref="Valid"/>.</summary>
     public bool IsEntity => _it.IsEntity;
@@ -238,7 +257,7 @@ public sealed class Iterator : IDisposable
             {
                 it.Next();
             }
-            return it.Valid && (!_hasEnd || it._icmp.CompareUserKey(it.Key, _end) < 0);
+            return it.Valid && (!_hasEnd || it.CompareKeys(it.Key, _end) < 0);
         }
 
         public readonly KeyValueRef Current => new(_iterator.Key, _iterator.Value);
@@ -321,7 +340,7 @@ public sealed class Iterator : IDisposable
         private bool Capture()
         {
             DbIter it = _iterator._it;
-            if (!it.Valid || (_end is ReadOnlyMemory<byte> e && _iterator._icmp.CompareUserKey(it.Key, e.Span) >= 0))
+            if (!it.Valid || (_end is ReadOnlyMemory<byte> e && _iterator.CompareKeys(it.Key, e.Span) >= 0))
             {
                 _done = true;
                 _current = default;

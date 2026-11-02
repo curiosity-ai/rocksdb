@@ -312,4 +312,41 @@ public sealed class FeatureRoundTripTests : RoundTripTestBase
         await h.RunAsync(writer, h.NewScript($"{writer}-options-back", h.DbPath, fromFile, h.Model));
         await h.RunAsync(writer, h.NewScript($"{writer}-own-options"));
     }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // user-defined timestamps
+
+    /// <summary>
+    /// Column families with user-defined timestamps (u64ts comparator) alternately written by both engines: every batch
+    /// carries a fresh timestamp, reads use the maximum one. Exercises WAL timestamp-size records, recovery, flush,
+    /// compaction and merges with timestamped keys across implementations. Range deletions are excluded (not supported
+    /// with timestamps by the managed read path).
+    /// </summary>
+    [TestMethod]
+    [DataRow(EngineKind.Native, 64UL << 20)]
+    [DataRow(EngineKind.Managed, 96UL << 10)]
+    public async Task UserDefinedTimestamps_Alternating(EngineKind first, ulong writeBuffer)
+    {
+        DbSpec spec = DbSpec.Standard(CompressionType.LZ4, 6, FilterKind.Bloom, writeBuffer, false);
+        foreach (CfSpec cf in spec.ColumnFamilies)
+        {
+            if (cf.Name is "default" or "counters" or "late") cf.UserTimestamps = true;
+        }
+        RoundTripHarness h = CreateHarness(spec, $"udt-{first}-{writeBuffer >> 10}K");
+        EngineKind engine = first;
+        for (int i = 0; i < 6; i++)
+        {
+            ScriptBuilder b = h.NewScript($"udt-{engine}-{i}");
+            // Snapshots are not used: with timestamps, reads are versioned by timestamp (a point lookup at the maximum
+            // timestamp sees newer timestamps regardless of the snapshot sequence, upstream as well).
+            OpGenerator.Generate(b, new GeneratorOptions { Ops = 900, AllowRangeDelete = false, AllowSnapshots = false });
+            if (i % 3 == 2) b.Add(Op.Reopen());
+            b.Verify().Dump();
+            await h.RunAsync(engine, b);
+            engine = Other(engine);
+        }
+        await h.RunAsync(engine, h.NewScript($"udt-{engine}-final"));
+        engine = Other(engine);
+        await h.RunAsync(engine, h.NewScript($"udt-{engine}-final"));
+    }
 }

@@ -36,6 +36,7 @@ public sealed class ManagedEngine : IEngine
 
     public static ColumnFamilyOptions CfOptions(CfSpec s) => new()
     {
+        Comparator = s.UserTimestamps ? Comparator.BytewiseWithU64Ts : Comparator.Bytewise,
         WriteBufferSize = s.WriteBufferSize,
         Compression = s.Compression,
         DisableAutoCompactions = s.DisableAutoCompactions,
@@ -128,9 +129,22 @@ public sealed class ManagedEngine : IEngine
     public void Write(IReadOnlyList<Op> ops, bool sync)
     {
         using WriteBatch batch = Db.CreateWriteBatch();
+        byte[] ts = UdtClock.Next();
         foreach (Op op in ops)
         {
             uint cf = Cf(op.Cf!).Id;
+            if (_spec.Cf(op.Cf!).UserTimestamps)
+            {
+                switch (op.Kind)
+                {
+                    case OpKind.Put: batch.Put(cf, op.Key, ts, op.Value); break;
+                    case OpKind.Merge: batch.Merge(cf, op.Key, ts, op.Value); break;
+                    case OpKind.Delete: batch.Delete(cf, op.Key, ts); break;
+                    case OpKind.SingleDelete: batch.SingleDelete(cf, op.Key, ts); break;
+                    default: throw new InvalidOperationException("not supported with user-defined timestamps: " + op.Kind);
+                }
+                continue;
+            }
             switch (op.Kind)
             {
                 case OpKind.Put: batch.Put(cf, op.Key, op.Value); break;
@@ -191,11 +205,19 @@ public sealed class ManagedEngine : IEngine
     // ---------------------------------------------------------------------------------------------------------
     // reads
 
-    private ReadOptions? ReadOptions(long? snapshot) => snapshot is long id ? new ReadOptions { Snapshot = _snapshots[id] } : null;
+    private ReadOptions? ReadOptions(long? snapshot, string cf)
+    {
+        bool udt = _spec.Cf(cf).UserTimestamps;
+        if (snapshot is null && !udt) return null;
+        var ro = new ReadOptions();
+        if (snapshot is long id) ro.Snapshot = _snapshots[id];
+        if (udt) ro.Timestamp = UdtClock.MaxTimestamp;
+        return ro;
+    }
 
     public IEnumerable<KeyValuePair<byte[], byte[]>> Scan(string cf, long? snapshot)
     {
-        using Iterator it = Cf(cf).NewIterator(ReadOptions(snapshot));
+        using Iterator it = Cf(cf).NewIterator(ReadOptions(snapshot, cf));
         for (it.SeekToFirst(); it.Valid; it.Next())
         {
             byte[] v = _ttl is not null ? TtlValue.Strip(it.Value).ToArray() : it.Value.ToArray();
@@ -206,7 +228,7 @@ public sealed class ManagedEngine : IEngine
     public byte[]? Get(string cf, byte[] key, long? snapshot)
     {
         if (_ttl is not null) return _ttl.Get(key);
-        return Cf(cf).Get(ReadOptions(snapshot), key);
+        return Cf(cf).Get(ReadOptions(snapshot, cf), key);
     }
 
     public int[] FilesPerLevel(string cf)

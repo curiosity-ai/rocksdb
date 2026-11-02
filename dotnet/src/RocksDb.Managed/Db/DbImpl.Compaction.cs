@@ -464,6 +464,13 @@ internal sealed partial class DbImpl
         if (options.ChangeLevel && style == CompactionStyle.Fifo) ThrowHelper.NotSupported("FIFO compaction does not support change_level.");
         if (style == CompactionStyle.None) ThrowHelper.NotSupported("Compaction style None does not support CompactRange");
 
+        // CompactRangeInternal: update full_history_ts_low if it's set.
+        if (options.FullHistoryTsLow is { Length: > 0 } tsLow)
+        {
+            if (begin is not null || end is not null) ThrowHelper.InvalidArgument("Cannot specify compaction range with full_history_ts_low");
+            await IncreaseFullHistoryTsLowAsync(cfd, tsLow.ToArray(), synchronous, cancellationToken).ConfigureAwait(false);
+        }
+
         // Flush first, unless there is nothing in memory (flushing takes write-leadership, which a writer waiting on a
         // write stop holds; skipping the no-op flush lets a manual compaction resolve the stop).
         bool flushNeeded;

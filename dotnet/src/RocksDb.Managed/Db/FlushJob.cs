@@ -67,6 +67,9 @@ internal static class FlushJob
                     else await file.SyncAsync(cancellationToken).ConfigureAwait(false);
                     meta.FileSize = builder.FileSize;
                     meta.TailSize = builder.FileSize - builder.Properties.TailStartOffset;
+                    // ExtractTimestampFromTableProperties (db/builder.cc).
+                    meta.MinTimestamp = builder.TimestampMin;
+                    meta.MaxTimestamp = builder.TimestampMax;
                     keep = true;
                 }
             }

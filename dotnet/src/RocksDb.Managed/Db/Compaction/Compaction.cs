@@ -276,7 +276,13 @@ internal sealed class Compaction
                     if (icmp.CompareUserKey(userKey, DbFormat.ExtractUserKey(f.Largest)) <= 0)
                     {
                         // We've advanced far enough.
-                        if (icmp.CompareUserKey(userKey, DbFormat.ExtractUserKey(f.Smallest)) >= 0) return false; // key falls in this file's range
+                        // In the presence of user-defined timestamps, f.Smallest may have the same user key with a smaller
+                        // timestamp (sorting after userKey): hence CompareWithoutTimestamp.
+                        ReadOnlySpan<byte> smallest = DbFormat.ExtractUserKey(f.Smallest);
+                        int c = icmp.UserComparator.TimestampSize == 0
+                            ? icmp.CompareUserKey(userKey, smallest)
+                            : icmp.UserComparator.CompareWithoutTimestamp(userKey, smallest);
+                        if (c >= 0) return false; // key falls in this file's range
                         break;
                     }
                 }
@@ -300,8 +306,8 @@ internal sealed class Compaction
                 {
                     FileMetaData f = files[levelPtrs[lvl]];
                     // Advance until the first file with begin_key <= f->largest.user_key().
-                    if (icmp.CompareUserKey(beginKey, DbFormat.ExtractUserKey(f.Largest)) > 0) continue;
-                    if (icmp.CompareUserKey(endKey, DbFormat.ExtractUserKey(f.Smallest)) <= 0) break; // not overlapping with this level
+                    if (VersionStorageInfo.CompareWithoutTimestamp(icmp, beginKey, DbFormat.ExtractUserKey(f.Largest)) > 0) continue;
+                    if (VersionStorageInfo.CompareWithoutTimestamp(icmp, endKey, DbFormat.ExtractUserKey(f.Smallest)) <= 0) break; // not overlapping with this level
                     return false;
                 }
             }

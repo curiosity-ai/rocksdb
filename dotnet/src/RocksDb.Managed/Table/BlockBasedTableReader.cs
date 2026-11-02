@@ -187,6 +187,8 @@ public sealed partial class BlockBasedTableReader : IDisposable
     private readonly IRandomAccessFile _file;
     private readonly TableReaderOptions _options;
     private readonly InternalKeyComparator _icmp;
+    /// <summary>User-defined timestamp size of the comparator (0 = none): filters are keyed by the user key without it.</summary>
+    private readonly int _tsSize;
     private readonly Footer _footer;
     private readonly Block? _indexBlock;          // null when the index lives in the block cache
     private readonly Block? _rangeDelBlock;
@@ -244,6 +246,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         _file = file;
         _options = options;
         _icmp = options.Comparator.Kind == ComparatorKind.Bytewise ? InternalKeyComparator.Bytewise : new InternalKeyComparator(options.Comparator);
+        _tsSize = options.Comparator.TimestampSize;
         _footer = footer;
         MetaBlocks = metaBlocks;
         Properties = props;
@@ -803,7 +806,8 @@ public sealed partial class BlockBasedTableReader : IDisposable
     public bool InternalKeyMayMatch(ReadOnlySpan<byte> internalKey, TableReadFlags flags)
     {
         if (_filterKind == FilterKind.None) return true;
-        ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(internalKey);
+        // FullFilterKeyMayMatch: filters hold user keys without the timestamp.
+        ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKeyAndStripTimestamp(internalKey, _tsSize);
         if (WholeKeyFiltering)
         {
             bool mayMatch = FilterMayMatch(userKey, internalKey, flags);
@@ -844,7 +848,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         {
             prefixExtractor = _tablePrefixExtractor;
         }
-        ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(internalKey);
+        ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKeyAndStripTimestamp(internalKey, _tsSize);
         if (prefixExtractor is null || !prefixExtractor.InDomain(userKey)) return true;
         ReadOnlySpan<byte> prefix = prefixExtractor.Transform(userKey);
         if (o.NeedUpperBoundCheck && !IsFilterCompatible(o.UpperBound, prefix)) return true;
@@ -993,7 +997,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
                     data.InitializeData(block.Block!, _icmp, GlobalSequenceNumber);
                     if (first)
                     {
-                        if (!data.SeekForGet(internalKey)) return;
+                        if (!SeekForGet(data, internalKey)) return;
                         first = false;
                     }
                     else
@@ -1112,7 +1116,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         data.InitializeData(block, _icmp, GlobalSequenceNumber);
         if (first)
         {
-            if (!data.SeekForGet(internalKey)) return -1;
+            if (!SeekForGet(data, internalKey)) return -1;
         }
         else
         {
@@ -1127,8 +1131,26 @@ public sealed partial class BlockBasedTableReader : IDisposable
         return 1;
     }
 
+    /// <summary>
+    /// User keys of the same key (GetContext::SaveValue): with user-defined timestamps, versions with different
+    /// timestamps belong to the same key (EqualWithoutTimestamp).
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private bool UserKeyEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) => _icmp.EqualUserKey(a, b);
+    private bool UserKeyEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) =>
+        _tsSize == 0 ? _icmp.EqualUserKey(a, b) : _icmp.UserComparator.EqualWithoutTimestamp(a, b);
+
+    /// <summary>
+    /// DataBlockIter::SeekForGet. With user-defined timestamps the hash index (keyed by the user key with its timestamp)
+    /// cannot find older versions, so a plain binary-search Seek is used (upstream does not end the search on a hash
+    /// miss in that case).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool SeekForGet(BlockIter data, ReadOnlySpan<byte> internalKey)
+    {
+        if (_tsSize == 0) return data.SeekForGet(internalKey);
+        data.Seek(internalKey);
+        return true;
+    }
 
     // ---------------------------------------------------------------------------------------------
     // Iterators

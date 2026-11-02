@@ -181,7 +181,8 @@ public enum MergeUntilResult : byte
 /// DBIter and point lookups) and <see cref="MergeUntil"/> (used by compaction/flush).
 /// </summary>
 /// <remarks>
-/// Statistics, timers, wide-column/blob base values, user-defined timestamps and snapshot checkers are not ported.
+/// Statistics, timers, blob base values and snapshot checkers are not ported (user-defined timestamps: see
+/// <see cref="FullHistoryTsLow"/>).
 /// A merge operator failure throws <see cref="RocksDbException"/> (Corruption / MergeOperatorFailed). An instance
 /// is not thread-safe (it owns reusable buffers); the static helpers are.
 /// </remarks>
@@ -262,6 +263,12 @@ public sealed class MergeHelper : IDisposable
     /// </summary>
     public bool AssertValidInternalKey { get; set; } = true;
 
+    /// <summary>
+    /// full_history_ts_low of the compaction (null when unset or without user-defined timestamps): versions of a key
+    /// with different timestamps are only merged together below it.
+    /// </summary>
+    internal byte[]? FullHistoryTsLow { get; set; }
+
     /// <summary>Number of output entries after <see cref="MergeUntil"/>.</summary>
     public int OutputCount => _keys.Count;
 
@@ -300,6 +307,10 @@ public sealed class MergeHelper : IDisposable
         Debug.Assert(orig.Type == EntryType.Merge);
 
         bool hitTheNextUserKey = false;
+        Comparator ucmp = _icmp.UserComparator;
+        int tsSize = ucmp.TimestampSize;
+        byte[]? tsLow = FullHistoryTsLow;
+        int cmpWithFullHistoryTsLow = 0;
         for (; iter.Valid; iter.Next())
         {
             ReadOnlySpan<byte> ikeyBytes = iter.Key;
@@ -311,14 +322,18 @@ public sealed class MergeHelper : IDisposable
             }
             ReadOnlySpan<byte> userKey = ikeyBytes[..ikey.UserKeyLength];
             ReadOnlySpan<byte> origUserKey = _origKey.UserKey;
+            if (tsLow is not null) cmpWithFullHistoryTsLow = ucmp.CompareTimestamp(DbFormat.ExtractTimestampFromUserKey(userKey, tsSize), tsLow);
             if (firstKey)
             {
                 Debug.Assert(_icmp.EqualUserKey(userKey, origUserKey));
                 firstKey = false;
             }
-            else if (!_icmp.EqualUserKey(userKey, origUserKey))
+            else if (tsSize == 0
+                ? !_icmp.EqualUserKey(userKey, origUserKey)
+                : !ucmp.EqualWithoutTimestamp(userKey, origUserKey) || (!ucmp.Equal(userKey, origUserKey) && cmpWithFullHistoryTsLow >= 0))
             {
-                // hit a different user key, stop right here
+                // 1) hit a different user key, or 2) user-defined timestamp is enabled, and hit a version of the user key
+                // NOT eligible for GC: stop right here.
                 hitTheNextUserKey = true;
                 break;
             }
@@ -415,7 +430,8 @@ public sealed class MergeHelper : IDisposable
         if (_operands.Count == 0) return MergeUntilResult.Ok;
 
         // We are sure we have seen this key's entire history if at_bottom and we either hit another key or the end.
-        bool surelySeenTheBeginning = (hitTheNextUserKey || !iter.Valid) && atBottom;
+        // With user-defined timestamps, the beginning is only known for versions below full_history_ts_low.
+        bool surelySeenTheBeginning = (hitTheNextUserKey || !iter.Valid) && atBottom && (tsSize == 0 || cmpWithFullHistoryTsLow < 0);
         if (surelySeenTheBeginning)
         {
             // do a final merge with no existing value and say bye to the merge type (it's now converted to a Put)

@@ -131,7 +131,7 @@ internal sealed partial class DbImpl
             {
                 ColumnFamilyOptions opts = PrepareCfOptions(descriptors[cf.Name]);
                 ValidateRecoveredColumnFamily(cf, opts);
-                var cfd = new ColumnFamilyData(cf.Id, cf.Name, opts, this) { LogNumber = cf.LogNumber };
+                var cfd = new ColumnFamilyData(cf.Id, cf.Name, opts, this) { LogNumber = cf.LogNumber, FullHistoryTsLow = cf.FullHistoryTsLow };
                 var files = new FileMetaData[cf.NumLevels][];
                 for (int l = 0; l < cf.NumLevels; l++)
                 {
@@ -501,6 +501,8 @@ internal sealed partial class DbImpl
             if (Options.WalRecoveryMode == WalRecoveryMode.PointInTimeRecovery && seq == progress.NextSequence) progress.StopReplay = false;
             else return true; // dropped
         }
+        IReadOnlyDictionary<uint, int> recordedTs = reader.RecordedTimestampSizes;
+        if (_cfTimestampSizes is not null || recordedTs.Count > 0) CheckRecoveredBatchTimestampSizes(record, recordedTs);
         var inserter = new MemTableInserter(this, walNumber, ignoreMissingColumnFamilies: true) { Sequence = seq };
         WriteBatch.Iterate(record, ref inserter);
         // next_sequence comes from the inserter, not the record header: a prepared section counts its entries but

@@ -18,7 +18,11 @@ namespace RocksDb.Managed.Db.Iterators;
 /// iterator is in prefix mode (tables skipped by their prefix filter): direction changes re-seek like upstream
 /// (expect_total_order_inner_iter_ false) and the reseek optimization is disabled for SeekToFirst/SeekToLast.
 /// prefix_same_as_start stops iteration at the end of the seek key's prefix (PrefixCheck).</para>
-/// <para><b>Not ported (yet).</b> User-defined timestamps, read callbacks, blob values and wide-column entities
+/// <para><b>User-defined timestamps.</b> With a timestamp-aware comparator, entries are visible when their sequence is
+/// &lt;= the snapshot and their timestamp is in [iter_start_ts, timestamp] (IsVisible); <see cref="Key"/> excludes the
+/// timestamp and <see cref="Timestamp"/> returns it. With iter_start_ts every visible version (deletions included) is
+/// returned and <see cref="InternalKey"/> holds its internal key (upstream's key()).</para>
+/// <para><b>Not ported (yet).</b> Read callbacks, blob values and wide-column entities
 /// (NotSupported), statistics/perf context, tombstone-run conversion, multi-scan.</para>
 /// <para><b>Errors.</b> Upstream sets status() and invalidates the iterator; here the positioning call throws
 /// <see cref="RocksDbException"/> (Corruption, InvalidArgument for a merge without operator, Incomplete when
@@ -54,6 +58,13 @@ public sealed class DbIter : IDisposable
     private readonly ReadOnlyMemory<byte> _lower;
     private readonly ReadOnlyMemory<byte> _upper;
     private IDisposable? _cleanup;
+
+    // User-defined timestamps (timestamp_size_, timestamp_ub_, timestamp_lb_, saved_timestamp_).
+    private readonly int _tsSize;
+    private readonly Comparator _ucmp;
+    private readonly byte[]? _tsUb;
+    private readonly byte[]? _tsLb;
+    private readonly byte[]? _savedTimestamp;
 
     private readonly IterKey _savedKey = new();
     private readonly PooledBufferWriter _seekKey = new(64);
@@ -131,6 +142,16 @@ public sealed class DbIter : IDisposable
             if (readOptions.IgnoreRangeDeletions) rangeDel = null;
         }
         _rangeDel = rangeDel is null || rangeDel.IsEmpty ? null : rangeDel;
+        _ucmp = comparator.UserComparator;
+        _tsSize = _ucmp.TimestampSize;
+        if (_tsSize > 0)
+        {
+            // timestamp_ub_: the read timestamp (the maximum timestamp when none was given).
+            _tsUb = readOptions?.Timestamp is ReadOnlyMemory<byte> ub ? ub.ToArray() : _ucmp.MaxTimestamp.ToArray();
+            _tsLb = readOptions?.IterStartTs is ReadOnlyMemory<byte> lb ? lb.ToArray() : null;
+            if (_tsUb.Length != _tsSize || (_tsLb is not null && _tsLb.Length != _tsSize)) ThrowHelper.InvalidArgument("Timestamp size mismatch");
+            _savedTimestamp = new byte[_tsSize];
+        }
     }
 
     public bool Valid => _valid;
@@ -141,9 +162,29 @@ public sealed class DbIter : IDisposable
         get
         {
             Debug.Assert(_valid);
-            return _savedKey.UserKey;
+            ReadOnlySpan<byte> k = _savedKey.UserKey;
+            return _tsSize == 0 ? k : k[..^_tsSize];
         }
     }
+
+    /// <summary>
+    /// The user-defined timestamp of the current entry (DBIter::timestamp()). REQUIRES: <see cref="Valid"/>; empty when
+    /// the comparator has no timestamp.
+    /// </summary>
+    public ReadOnlySpan<byte> Timestamp
+    {
+        get
+        {
+            if (_tsSize == 0) return default;
+            return _forward ? DbFormat.ExtractTimestampFromUserKey(_savedKey.UserKey, _tsSize) : _savedTimestamp;
+        }
+    }
+
+    /// <summary>
+    /// With <see cref="ReadOptions.IterStartTs"/>: the internal key (user key | timestamp | seq/type) of the current
+    /// version, as returned by upstream's key(); empty for merge results and without IterStartTs.
+    /// </summary>
+    public ReadOnlySpan<byte> InternalKey => _tsLb is not null && !_savedKey.IsUserKey ? _savedKey.InternalKey : default;
 
     /// <summary>The current value. REQUIRES: <see cref="Valid"/>. Valid until the next positioning call.</summary>
     public ReadOnlySpan<byte> Value
@@ -231,6 +272,70 @@ public sealed class DbIter : IDisposable
         throw new RocksDbException(StatusCode.InvalidArgument, "Invalid argument: merge_operator_ must be set.");
     }
 
+    /// <summary>Port of DBIter::IsVisible (no read callback): sequence and timestamp range.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool IsVisible(ulong sequence, ReadOnlySpan<byte> userKey)
+    {
+        if (sequence > _sequence) return false;
+        if (_tsSize == 0) return true;
+        return IsTimestampVisible(DbFormat.ExtractTimestampFromUserKey(userKey, _tsSize));
+    }
+
+    private bool IsTimestampVisible(ReadOnlySpan<byte> ts) =>
+        _ucmp.CompareTimestamp(ts, _tsUb) <= 0 && (_tsLb is null || _ucmp.CompareTimestamp(ts, _tsLb) >= 0);
+
+    /// <summary>User keys of the same key, ignoring timestamps (EqualWithoutTimestamp).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool SameUserKey(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) =>
+        _tsSize == 0 ? _icmp.EqualUserKey(a, b) : _ucmp.EqualWithoutTimestamp(a, b);
+
+    /// <summary>CompareWithoutTimestamp(a, b) of two user keys with timestamps.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int CompareWithoutTimestamp(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) =>
+        _tsSize == 0 ? _icmp.CompareUserKey(a, b) : _ucmp.CompareWithoutTimestamp(a, b);
+
+    /// <summary>DBIter::CompareKeyForSkip: with iter_start_ts every timestamp is a distinct key.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int CompareKeyForSkip(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) =>
+        _tsLb is not null ? _icmp.CompareUserKey(a, b) : CompareWithoutTimestamp(a, b);
+
+    /// <summary>A user key (with timestamp) against an iterate bound (without): CompareWithoutTimestamp(a, true, b, false).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int CompareToBound(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> bound) =>
+        _tsSize == 0 ? _icmp.CompareUserKey(userKey, bound) : _ucmp.CompareWithoutTimestamp(userKey, true, bound, false);
+
+    /// <summary>The user key without its timestamp.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ReadOnlySpan<byte> StripTs(ReadOnlySpan<byte> userKey) => _tsSize == 0 ? userKey : userKey[..^_tsSize];
+
+    /// <summary>AppendInternalKeyWithDifferentTimestamp: seek key <c>userKeyWithoutTs | ts | (seq, type)</c>.</summary>
+    private void SetSeekKeyWithTimestamp(ReadOnlySpan<byte> userKeyWithoutTs, ReadOnlySpan<byte> ts, ulong sequence, EntryType type)
+    {
+        _seekKey.Clear();
+        Span<byte> dst = _seekKey.GetSpan(userKeyWithoutTs.Length + ts.Length + DbFormat.InternalKeyFooterSize);
+        _seekKey.Advance(DbFormat.AppendInternalKey(dst, userKeyWithoutTs, ts, sequence, type));
+    }
+
+    /// <summary>Seek key for the saved key at the min/max timestamp (kTsMin / kTsMax), or the plain one without timestamps.</summary>
+    [SkipLocalsInit]
+    private void SetSeekKeyForSaved(ulong sequence, EntryType type, bool maxTimestamp)
+    {
+        if (_tsSize == 0)
+        {
+            SetSeekKey(_savedKey.UserKey, sequence, type);
+            return;
+        }
+        Span<byte> ts = stackalloc byte[_tsSize];
+        ts.Fill(maxTimestamp ? (byte)0xff : (byte)0);
+        SetSeekKeyWithTimestamp(StripTs(_savedKey.UserKey), ts, sequence, type);
+    }
+
+    /// <summary>saved_timestamp_.assign(ts) for reverse iteration.</summary>
+    private void SaveTimestamp(ReadOnlySpan<byte> userKey)
+    {
+        if (_tsSize != 0) DbFormat.ExtractTimestampFromUserKey(userKey, _tsSize).CopyTo(_savedTimestamp);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool IsCoveredByRangeTombstone(ReadOnlySpan<byte> userKey, ulong sequence) =>
         _rangeDel is not null && _rangeDel.ShouldDelete(userKey, sequence);
@@ -260,7 +365,10 @@ public sealed class DbIter : IDisposable
     /// <summary>Port of DBIter::PrefixCheck: the key has the seek key's prefix (or no prefix is being enforced).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool PrefixCheck(ReadOnlySpan<byte> userKey) =>
-        !_hasPrefix || (_prefixExtractor!.InDomain(userKey) && _prefixExtractor.Transform(userKey).SequenceEqual(_prefix.WrittenSpan));
+        !_hasPrefix || PrefixCheckSlow(StripTs(userKey));
+
+    private bool PrefixCheckSlow(ReadOnlySpan<byte> userKey) =>
+        _prefixExtractor!.InDomain(userKey) && _prefixExtractor.Transform(userKey).SequenceEqual(_prefix.WrittenSpan);
 
     /// <summary>
     /// Port of DBIter::ShouldSetPrefix + prefix_->SetUserKey(Transform(target)): remembers the prefix of
@@ -348,7 +456,7 @@ public sealed class DbIter : IDisposable
         ReadOnlySpan<byte> userKey = ParseCurrent(out ulong seq, out EntryType type);
         _isKeySeqnumZero = seq == 0;
 
-        if (_hasUpper && _icmp.CompareUserKey(userKey, _upper.Span) >= 0)
+        if (_hasUpper && CompareToBound(userKey, _upper.Span) >= 0)
         {
             _valid = false;
             return StepAction.Done;
@@ -363,10 +471,11 @@ public sealed class DbIter : IDisposable
 
         TooManyInternalKeysSkipped(true);
 
-        if (seq <= _sequence)
+        if (IsVisible(seq, userKey))
         {
-            // If the previous entry is of seqnum 0, the current entry will not possibly be skipped.
-            if (!isPrevKeySeqnumZero && _skipping && _icmp.CompareUserKey(userKey, _savedKey.UserKey) <= 0)
+            // If the previous entry is of seqnum 0, the current entry will not possibly be skipped. With user-defined
+            // timestamps the same user key can have different timestamps and zero sequence numbers.
+            if ((!isPrevKeySeqnumZero || _tsSize > 0) && _skipping && CompareKeyForSkip(userKey, _savedKey.UserKey) <= 0)
             {
                 _numSkipped++; // skip this entry
             }
@@ -379,6 +488,14 @@ public sealed class DbIter : IDisposable
                     case EntryType.Deletion:
                     case EntryType.DeletionWithTimestamp:
                     case EntryType.SingleDeletion:
+                        if (_tsLb is not null)
+                        {
+                            // iter_start_ts: deletions are returned too (with an empty value).
+                            _savedKey.SetInternalKey(_iter.Key);
+                            _valueSource = ValueSource.None;
+                            _valid = true;
+                            return StepAction.Done;
+                        }
                         // Arrange to skip all upcoming entries for this key since they are hidden by this deletion.
                         _savedKey.SetUserKey(userKey);
                         _skipping = true;
@@ -395,6 +512,7 @@ public sealed class DbIter : IDisposable
                             break;
                         }
                         if (type is EntryType.BlobIndex) ThrowNotSupportedType(type);
+                        if (_tsLb is not null) _savedKey.SetInternalKey(_iter.Key);
                         _valueSource = type == EntryType.ValuePreferredSeqno ? ValueSource.IterPacked : ValueSource.Iter;
                         _valueIsEntity = type == EntryType.WideColumnEntity;
                         _valid = true;
@@ -423,9 +541,9 @@ public sealed class DbIter : IDisposable
         }
         else
         {
-            // This key was inserted after our snapshot was taken. If this happens too many times in a row for the
-            // same user key, we want to seek to the target sequence number.
-            int cmp = _icmp.CompareUserKey(userKey, _savedKey.UserKey);
+            // This key was inserted after our snapshot was taken or skipped by timestamp range. If this happens too many
+            // times in a row for the same user key, we want to seek to the target sequence number.
+            int cmp = CompareWithoutTimestamp(userKey, _savedKey.UserKey);
             if (cmp == 0 || (_skipping && cmp < 0))
             {
                 _numSkipped++;
@@ -450,13 +568,14 @@ public sealed class DbIter : IDisposable
             {
                 // We're looking for the next user-key but all we see are the same user-key with decreasing sequence
                 // numbers. Fast forward to sequence number 0 and type deletion (the smallest type).
-                SetSeekKey(_savedKey.UserKey, 0, EntryType.Deletion);
+                SetSeekKeyForSaved(0, EntryType.Deletion, maxTimestamp: false);
             }
             else
             {
                 // We saw multiple entries with this user key and sequence numbers higher than sequence_. Fast
                 // forward to sequence_.
-                SetSeekKey(_savedKey.UserKey, _sequence, DbFormat.ValueTypeForSeek);
+                if (_tsSize == 0) SetSeekKey(_savedKey.UserKey, _sequence, DbFormat.ValueTypeForSeek);
+                else SetSeekKeyWithTimestamp(StripTs(_savedKey.UserKey), _tsUb, _sequence, DbFormat.ValueTypeForSeek);
             }
             return StepAction.Seek;
         }
@@ -467,7 +586,7 @@ public sealed class DbIter : IDisposable
     private StepAction MergeStep()
     {
         ReadOnlySpan<byte> userKey = ParseCurrent(out ulong seq, out EntryType type);
-        if (!_icmp.EqualUserKey(userKey, _savedKey.UserKey))
+        if (!SameUserKey(userKey, _savedKey.UserKey))
         {
             // hit the next user key, stop right here
             _merging = false;
@@ -682,7 +801,7 @@ public sealed class DbIter : IDisposable
         _savedKey.SetUserKey(DbFormat.ExtractUserKey(_iter.Key));
         BeginFindNextUserEntry(skippingSavedKey: false);
         RunForward();
-        if (_valid) MaybeSetPrefix(_savedKey.UserKey);
+        if (_valid) MaybeSetPrefix(StripTs(_savedKey.UserKey));
     }
 
     public void SeekToLast()
@@ -699,20 +818,45 @@ public sealed class DbIter : IDisposable
         _forward = false;
         _iter.SeekToLast();
         PrevInternal();
-        if (_valid) MaybeSetPrefix(_savedKey.UserKey);
+        if (_valid) MaybeSetPrefix(StripTs(_savedKey.UserKey));
     }
 
     /// <summary>Port of SetSavedKeyToSeekTarget (clamped to the lower bound).</summary>
     private void SetSavedKeyToSeekTarget(ReadOnlySpan<byte> target)
     {
+        if (_tsSize != 0)
+        {
+            // 'target' does not contain a timestamp: seek to target | timestamp_ub_.
+            if (_hasLower && _ucmp.CompareWithoutTimestamp(target, false, _lower.Span, false) < 0) target = _lower.Span;
+            SetSeekKeyWithTimestamp(target, _tsUb, _sequence, DbFormat.ValueTypeForSeek);
+            _savedKey.SetUserKey(DbFormat.ExtractUserKey(_seekKey.WrittenSpan));
+            return;
+        }
         if (_hasLower && _icmp.CompareUserKey(target, _lower.Span) < 0) target = _lower.Span; // seek key is smaller than the lower bound
         _savedKey.SetUserKey(target);
         SetSeekKey(target, _sequence, DbFormat.ValueTypeForSeek);
     }
 
     /// <summary>Port of SetSavedKeyToSeekForPrevTarget (clamped below the upper bound).</summary>
+    [SkipLocalsInit]
     private void SetSavedKeyToSeekForPrevTarget(ReadOnlySpan<byte> target)
     {
+        if (_tsSize != 0)
+        {
+            Span<byte> ts = stackalloc byte[_tsSize];
+            if (_hasUpper && _ucmp.CompareWithoutTimestamp(target, false, _upper.Span, false) >= 0)
+            {
+                ts.Fill(0xff);
+                SetSeekKeyWithTimestamp(_upper.Span, ts, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeekForPrev);
+            }
+            else
+            {
+                if (_tsLb is not null) _tsLb.CopyTo(ts);
+                else ts.Clear();
+                SetSeekKeyWithTimestamp(target, ts, 0, DbFormat.ValueTypeForSeekForPrev);
+            }
+            return;
+        }
         if (_hasUpper && _icmp.CompareUserKey(target, _upper.Span) >= 0)
         {
             SetSeekKey(_upper.Span, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeekForPrev);
@@ -846,7 +990,7 @@ public sealed class DbIter : IDisposable
         // prefix than the current key(). If that's the case, seek iter_ to current key.
         if (!_expectTotalOrderInnerIter || !_iter.Valid)
         {
-            SetSeekKey(_savedKey.UserKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
+            SetSeekKeyForSaved(DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek, maxTimestamp: true);
             _iter.Seek(_seekKey.WrittenSpan);
         }
         _forward = true;
@@ -896,7 +1040,7 @@ public sealed class DbIter : IDisposable
                 _valid = false;
                 return;
             }
-            if (_hasLower && _icmp.CompareUserKey(_savedKey.UserKey, _lower.Span) < 0)
+            if (_hasLower && CompareToBound(_savedKey.UserKey, _lower.Span) < 0)
             {
                 // We've iterated earlier than the user-specified lower bound.
                 _valid = false;
@@ -933,16 +1077,19 @@ public sealed class DbIter : IDisposable
         while (_iter.Valid)
         {
             ReadOnlySpan<byte> userKey = ParseCurrent(out ulong seq, out EntryType type);
-            if (!_icmp.EqualUserKey(userKey, _savedKey.UserKey))
+            if (!SameUserKey(userKey, _savedKey.UserKey))
             {
                 // Found a smaller user key, thus we are done with current user key.
                 break;
             }
-            if (seq > _sequence)
+            bool visible = IsVisible(seq, userKey);
+            if (!visible && (_tsLb is null || _ucmp.CompareTimestamp(DbFormat.ExtractTimestampFromUserKey(userKey, _tsSize), _tsUb) > 0))
             {
-                // Found an invisible version of the current user key, and it must have a higher sequence number.
+                // Found an invisible version of the current user key, and it must have a higher sequence number or
+                // timestamp. Therefore, we are done with the current user key.
                 break;
             }
+            SaveTimestamp(userKey);
 
             TooManyInternalKeysSkipped(true);
 
@@ -952,6 +1099,12 @@ public sealed class DbIter : IDisposable
             {
                 FindValueForCurrentKeyUsingSeek();
                 return;
+            }
+
+            if (_tsSize != 0)
+            {
+                if (_tsLb is not null) _savedKey.SetInternalKey(_iter.Key);
+                else if (_icmp.CompareUserKey(userKey, _savedKey.UserKey) < 0) _savedKey.SetUserKey(userKey);
             }
 
             validEntrySeen = true;
@@ -1001,6 +1154,9 @@ public sealed class DbIter : IDisposable
 
             _iter.Prev();
             ++numSkipped;
+
+            // With iter_start_ts every visible version is its own entry: stop at the first one.
+            if (visible && _tsLb is not null) break;
         }
 
         if (!validEntrySeen)
@@ -1014,6 +1170,10 @@ public sealed class DbIter : IDisposable
             case EntryType.Deletion:
             case EntryType.DeletionWithTimestamp:
             case EntryType.SingleDeletion:
+                // iter_start_ts: the deletion itself is returned (empty value).
+                _valueSource = ValueSource.None;
+                _valid = _tsLb is not null;
+                return;
             case EntryType.RangeDeletion:
                 _valid = false;
                 return;
@@ -1037,7 +1197,8 @@ public sealed class DbIter : IDisposable
     /// </summary>
     private void FindValueForCurrentKeyUsingSeek()
     {
-        SetSeekKey(_savedKey.UserKey, _sequence, DbFormat.ValueTypeForSeek);
+        if (_tsSize == 0) SetSeekKey(_savedKey.UserKey, _sequence, DbFormat.ValueTypeForSeek);
+        else SetSeekKeyWithTimestamp(StripTs(_savedKey.UserKey), _tsLb ?? _tsUb, _sequence, DbFormat.ValueTypeForSeek);
         _iter.Seek(_seekKey.WrittenSpan);
 
         ulong seq;
@@ -1051,23 +1212,34 @@ public sealed class DbIter : IDisposable
                 return;
             }
             userKey = ParseCurrent(out seq, out type);
-            if (!_icmp.EqualUserKey(userKey, _savedKey.UserKey))
+            if (!SameUserKey(userKey, _savedKey.UserKey))
             {
                 // No visible values for this key, even though FindValueForCurrentKey() has seen some (possible with a
                 // tailing iterator when entries were compacted away).
                 _valid = false;
                 return;
             }
-            if (seq <= _sequence) break;
+            if (IsVisible(seq, userKey)) break;
             _iter.Next();
         }
 
         if (type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp ||
             IsCoveredByRangeTombstone(userKey, seq))
         {
-            _valid = false;
+            if (_tsLb is null || type is not (EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp))
+            {
+                _valid = false;
+            }
+            else
+            {
+                _savedKey.SetInternalKey(_iter.Key);
+                SaveTimestamp(userKey);
+                _valueSource = ValueSource.None;
+                _valid = true;
+            }
             return;
         }
+        SaveTimestamp(userKey);
         if (type is EntryType.Value or EntryType.ValuePreferredSeqno or EntryType.WideColumnEntity)
         {
             ReadOnlySpan<byte> v = _iter.Value;
@@ -1075,6 +1247,8 @@ public sealed class DbIter : IDisposable
             _pinned.Write(type == EntryType.ValuePreferredSeqno ? ParsePackedValueForValue(v) : v);
             _valueSource = ValueSource.Pinned;
             _valueIsEntity = type == EntryType.WideColumnEntity;
+            if (_tsLb is not null) _savedKey.SetInternalKey(_iter.Key);
+            else if (_tsSize != 0) _savedKey.SetUserKey(userKey);
             _valid = true;
             return;
         }
@@ -1091,7 +1265,7 @@ public sealed class DbIter : IDisposable
             _iter.Next();
             if (!_iter.Valid) break;
             userKey = ParseCurrent(out seq, out type);
-            if (!_icmp.EqualUserKey(userKey, _savedKey.UserKey)) break;
+            if (!SameUserKey(userKey, _savedKey.UserKey)) break;
             if (type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp ||
                 IsCoveredByRangeTombstone(userKey, seq))
             {
@@ -1120,10 +1294,9 @@ public sealed class DbIter : IDisposable
         MergeWithNoBaseValue();
 
         // Make sure we leave iter_ in a good state. If it's valid and we don't care about prefixes, that's already
-        // good enough. Otherwise it needs to be seeked to the current key.
+        // good enough. Otherwise it needs to be seeked to the current key (last_key, still in _seekKey).
         if (!_expectTotalOrderInnerIter || !_iter.Valid)
         {
-            SetSeekKey(_savedKey.UserKey, _sequence, DbFormat.ValueTypeForSeek);
             if (!_expectTotalOrderInnerIter)
             {
                 _iter.SeekForPrev(_seekKey.WrittenSpan);
@@ -1145,14 +1318,14 @@ public sealed class DbIter : IDisposable
         while (_iter.Valid)
         {
             ReadOnlySpan<byte> userKey = ParseCurrent(out _, out _);
-            if (_icmp.CompareUserKey(userKey, _savedKey.UserKey) < 0) return;
+            if (CompareKeyForSkip(userKey, _savedKey.UserKey) < 0) return;
 
             TooManyInternalKeysSkipped(true);
 
             if (numSkipped >= _maxSkip)
             {
                 numSkipped = 0;
-                SetSeekKey(_savedKey.UserKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
+                SetSeekKeyForSaved(DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek, maxTimestamp: true);
                 // It would be more efficient to use SeekForPrev() here, but some iterators may not support it.
                 _iter.Seek(_seekKey.WrittenSpan);
                 if (!_iter.Valid) break;
