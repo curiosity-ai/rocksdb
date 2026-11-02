@@ -847,44 +847,81 @@ internal sealed class WritePreparedTxnDb : SeqPerBatchHooks
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     public override async ValueTask WritePlainAsync(WriteOptions? options, WriteBatch batch, bool synchronous, CancellationToken cancellationToken)
     {
-        int batchCnt = SubBatchCounter.Count(batch, _db);
-        RecordTick(Ticker.TxnDuplicateKeyOverhead);
-        bool doOneWrite = !_db.TwoWriteQueues;
-        WriteBatch copy = WriteBatch.Rent();
+        PlainWriteState st = RentPlainWriteState();
         try
         {
+            int batchCnt = SubBatchCounter.Count(batch, _db, st.Keys);
+            RecordTick(Ticker.TxnDuplicateKeyOverhead);
+            bool doOneWrite = !_db.TwoWriteQueues;
+            WriteBatch copy = st.Batch;
             copy.SetContents(batch.Data);
             // In the absence of Prepare markers, use Noop as a batch separator
             copy.InsertNoop();
-            var context = new TransactionWriteContext { BatchCount = batchCnt };
+            TransactionWriteContext context = st.Context;
+            context.Reset();
+            context.BatchCount = batchCnt;
             if (doOneWrite)
             {
-                var commit = new CommitEntryPreReleaseCallback(this);
-                commit.Set(DbFormat.MaxSequenceNumber, 0, batchCnt);
-                context.PreRelease = commit;
+                st.Commit.Set(DbFormat.MaxSequenceNumber, 0, batchCnt);
+                context.PreRelease = st.Commit;
             }
             else
             {
                 // Since this is not 2pc, there is no need for AddPrepared but having it in the PreReleaseCallback enables
                 // an optimization. Refer to SmallestUnCommittedSeq for more details.
-                var addPrepared = new AddPreparedCallback(this);
-                addPrepared.Set(batchCnt, firstPrepareBatch: false);
-                context.PreRelease = addPrepared;
+                st.AddPrepared.Set(batchCnt, firstPrepareBatch: false);
+                context.PreRelease = st.AddPrepared;
             }
             await _db.WriteAsync(options, copy, validateColumnFamilies: false, context, synchronous, cancellationToken).ConfigureAwait(false);
             if (doOneWrite) return;
             // else do the 2nd write for commit: an empty batch on the 2nd queue releases the commit sequence to readers.
-            ulong prepareSeq = context.SequenceUsed;
-            var commitWithPrepare = new CommitEntryPreReleaseCallback(this);
-            commitWithPrepare.Set(prepareSeq, batchCnt, 0);
-            var commitContext = new TransactionWriteContext { DisableMemtable = true, BatchCount = 1, PreRelease = commitWithPrepare };
+            st.Commit.Set(context.SequenceUsed, batchCnt, 0);
+            context.Reset();
+            context.DisableMemtable = true;
+            context.BatchCount = 1;
+            context.PreRelease = st.Commit;
             copy.Clear();
-            await _db.WriteAsync(s_commitOnlyNoWal, copy, validateColumnFamilies: false, commitContext, synchronous, cancellationToken).ConfigureAwait(false);
+            await _db.WriteAsync(s_commitOnlyNoWal, copy, validateColumnFamilies: false, context, synchronous, cancellationToken).ConfigureAwait(false);
             // Note: RemovePrepared is called from within PreReleaseCallback
         }
         finally
         {
-            copy.Dispose();
+            ReturnPlainWriteState(st);
+        }
+    }
+
+    /// <summary>The reusable objects of one plain write (the batch copy, its write context and callbacks).</summary>
+    private sealed class PlainWriteState(WritePreparedTxnDb db)
+    {
+        public readonly WriteBatch Batch = new();
+        public readonly TransactionWriteContext Context = new();
+        public readonly CommitEntryPreReleaseCallback Commit = new(db);
+        public readonly AddPreparedCallback AddPrepared = new(db);
+        public readonly SubBatchKeySet Keys = new();
+    }
+
+    private readonly PlainWriteState?[] _plainWriteStates = new PlainWriteState?[Math.Min(64, Environment.ProcessorCount * 4)];
+
+    private PlainWriteState RentPlainWriteState()
+    {
+        PlainWriteState?[] pool = _plainWriteStates;
+        for (int i = 0; i < pool.Length; i++)
+        {
+            PlainWriteState? s = pool[i];
+            if (s is not null && Interlocked.CompareExchange(ref pool[i], null, s) == s) return s;
+        }
+        return new PlainWriteState(this);
+    }
+
+    private void ReturnPlainWriteState(PlainWriteState s)
+    {
+        if (s.Batch.DataSize > 1 << 20) return; // don't keep large buffers alive
+        s.Batch.Clear();
+        s.Context.Reset();
+        PlainWriteState?[] pool = _plainWriteStates;
+        for (int i = 0; i < pool.Length; i++)
+        {
+            if (pool[i] is null && Interlocked.CompareExchange(ref pool[i], s, null) is null) return;
         }
     }
 
@@ -1159,43 +1196,68 @@ internal sealed class UnpreparedCommitEntryPreReleaseCallback(WritePreparedTxnDb
 internal struct SubBatchCounter : IWriteBatchHandler
 {
     private readonly DbImpl _db;
+    private readonly SubBatchKeySet? _fast;
     private Dictionary<uint, SortedSet<byte[]>>? _keys;
     private int _batches;
 
-    private SubBatchCounter(DbImpl db)
+    private SubBatchCounter(DbImpl db, SubBatchKeySet? fast)
     {
         _db = db;
+        _fast = fast;
         _keys = null;
         _batches = 1;
     }
 
-    public static int Count(WriteBatch batch, DbImpl db)
+    public static int Count(WriteBatch batch, DbImpl db) => Count(batch, db, null);
+
+    /// <summary>
+    /// Counts the sub-batches of <paramref name="batch"/>. With <paramref name="scratch"/>, keys of column families whose
+    /// comparator only considers byte-identical keys equal are tracked in that reusable set (no allocation per key).
+    /// </summary>
+    public static int Count(WriteBatch batch, DbImpl db, SubBatchKeySet? scratch)
     {
-        var c = new SubBatchCounter(db);
-        batch.Iterate(ref c);
+        var c = new SubBatchCounter(db, scratch);
+        try
+        {
+            batch.Iterate(ref c);
+        }
+        finally
+        {
+            scratch?.Clear();
+        }
         return c._batches;
+    }
+
+    private void NewSubBatch()
+    {
+        _batches++;
+        _keys?.Clear();
+        _fast?.Clear();
     }
 
     private void AddKey(uint cf, ReadOnlySpan<byte> key)
     {
+        Comparator cmp = _db.UserComparatorOf(cf);
+        if (_fast is not null && !cmp.CanKeysWithDifferentByteContentsBeEqual)
+        {
+            if (_fast.Add(cf, key)) return;
+            NewSubBatch();
+            _fast.Add(cf, key);
+            return;
+        }
         _keys ??= new Dictionary<uint, SortedSet<byte[]>>();
-        if (!_keys.TryGetValue(cf, out SortedSet<byte[]>? set)) _keys[cf] = set = NewSet(cf);
+        if (!_keys.TryGetValue(cf, out SortedSet<byte[]>? set)) _keys[cf] = set = NewSet(cmp);
         if (!set.Add(key.ToArray()))
         {
             // second is false if a element already existed.
-            _batches++;
-            _keys.Clear();
-            set = NewSet(cf);
+            NewSubBatch();
+            set = NewSet(cmp);
             set.Add(key.ToArray());
             _keys[cf] = set;
         }
     }
 
-    private readonly SortedSet<byte[]> NewSet(uint cf)
-    {
-        Comparator cmp = _db.UserComparatorOf(cf);
-        return new SortedSet<byte[]>(Comparer<byte[]>.Create((a, b) => cmp.Compare(a, b)));
-    }
+    private static SortedSet<byte[]> NewSet(Comparator cmp) => new(Comparer<byte[]>.Create((a, b) => cmp.Compare(a, b)));
 
     public readonly bool Continue() => true;
     public void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => AddKey(columnFamilyId, key);
@@ -1213,4 +1275,47 @@ internal struct SubBatchCounter : IWriteBatchHandler
     public readonly void MarkCommit(ReadOnlySpan<byte> xid) { }
     public readonly void MarkCommitWithTimestamp(ReadOnlySpan<byte> xid, ReadOnlySpan<byte> commitTimestamp) { }
     public readonly void MarkRollback(ReadOnlySpan<byte> xid) { }
+}
+
+/// <summary>
+/// Reusable key set of <see cref="SubBatchCounter"/> for column families whose comparator never considers keys with
+/// different bytes equal (bytewise and reverse bytewise): keys are compared by bytes and kept in recycled buffers.
+/// Not thread-safe.
+/// </summary>
+internal sealed class SubBatchKeySet
+{
+    private readonly List<(uint Cf, HashSet<PooledKey> Set)> _sets = new();
+    private KeyBufferPool _buffers;
+
+    /// <summary>Adds the key; false if the column family already has it.</summary>
+    public bool Add(uint cf, ReadOnlySpan<byte> key)
+    {
+        HashSet<PooledKey>? set = null;
+        foreach ((uint c, HashSet<PooledKey> s) in _sets)
+        {
+            if (c == cf)
+            {
+                set = s;
+                break;
+            }
+        }
+        if (set is null)
+        {
+            set = new HashSet<PooledKey>(PooledKeyComparer.Instance);
+            _sets.Add((cf, set));
+        }
+        if (set.GetAlternateLookup<ReadOnlySpan<byte>>().Contains(key)) return false;
+        set.Add(_buffers.Rent(key));
+        return true;
+    }
+
+    public void Clear()
+    {
+        foreach ((_, HashSet<PooledKey> set) in _sets)
+        {
+            if (set.Count == 0) continue;
+            foreach (PooledKey k in set) _buffers.Return(k);
+            set.Clear();
+        }
+    }
 }

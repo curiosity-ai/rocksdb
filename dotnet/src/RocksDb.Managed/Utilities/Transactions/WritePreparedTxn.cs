@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Util;
 
@@ -69,6 +70,7 @@ internal class WritePreparedTxn : PessimisticTransaction
     /// The second write with two write queues: a data-less write on the WAL-only queue (one sequence number) whose
     /// pre-release callback commits what the first write wrote and publishes the commit sequence.
     /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private protected async ValueTask WriteCommitOnlyAsync(WriteOptions options, WriteBatch batch, IPreReleaseCallback callback, bool synchronous,
         CancellationToken cancellationToken)
     {
@@ -122,6 +124,7 @@ internal class WritePreparedTxn : PessimisticTransaction
     private protected override bool SupportsUserDefinedTimestamps => false;
 
     /// <summary>WritePreparedTxn::PrepareInternal.</summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private protected override async ValueTask PrepareInternalAsync(bool synchronous, CancellationToken cancellationToken)
     {
         WriteOptions wo = _writeOptions.DisableWal ? CloneWithWal(_writeOptions) : _writeOptions;
@@ -150,6 +153,7 @@ internal class WritePreparedTxn : PessimisticTransaction
     /// pre-release callback, or with two write queues the batch as prepared data on the main queue followed by a
     /// WAL-less commit on the second queue.
     /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private protected override async ValueTask CommitWithoutPrepareInternalAsync(bool synchronous, CancellationToken cancellationToken)
     {
         int batchCnt = _batch.SubBatchCount;
@@ -197,6 +201,7 @@ internal class WritePreparedTxn : PessimisticTransaction
     /// would go to the memtables (includes_data) is refused by <see cref="CommitMarkerWithCommitTimeBatch"/>, so the
     /// commit is always a single write.
     /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private protected override async ValueTask CommitInternalAsync(bool synchronous, CancellationToken cancellationToken)
     {
         WriteBatch working = CommitMarkerWithCommitTimeBatch();
@@ -226,6 +231,7 @@ internal class WritePreparedTxn : PessimisticTransaction
     /// prepared data) is written back, followed by a rollback marker; the write commits the prepared sub-batches and
     /// itself.
     /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private protected override async ValueTask RollbackInternalAsync(bool synchronous, CancellationToken cancellationToken)
     {
         using var rollbackBatch = new WriteBatch();

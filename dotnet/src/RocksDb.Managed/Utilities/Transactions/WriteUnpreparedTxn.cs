@@ -330,7 +330,7 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         for (int i = 0; i < trackedKeys.ColumnFamilyCount; i++)
         {
             TrackedColumnFamily c = trackedKeys.GetColumnFamily(i);
-            foreach (byte[] key in c.Keys.Keys) WriteRollbackKey(rollbackBatch, c.Cfd, key, options, callback);
+            foreach (PooledKey key in c.Keys.Keys) WriteRollbackKey(rollbackBatch, c.Cfd, key.Span, options, callback);
         }
         if (!includeUntracked) return;
         foreach (KeyValuePair<uint, List<byte[]>> cfKeys in _untrackedKeys)

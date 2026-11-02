@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Text;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Util;
@@ -21,6 +22,8 @@ internal class PessimisticTransaction : Transaction
     private ulong _id;
     private protected string? _name;
     private protected byte[]? _nameBytes;
+    private string? _lastName;
+    private byte[]? _lastNameBytes;
     private protected ulong _logNumber;
     private long _expirationTime; // µs (PointLockManager.NowMicros); 0 = none
     private long _lockTimeout;    // µs; < 0 = infinite
@@ -148,7 +151,13 @@ internal class PessimisticTransaction : Transaction
         int len = Encoding.UTF8.GetByteCount(name);
         if (len < 1 || len > 512) throw Invalid("Transaction name length must be between 1 and 512 chars.");
         _name = name;
-        _nameBytes = Encoding.UTF8.GetBytes(name);
+        // A reused transaction object is often given the same name again: keep its encoding.
+        if (_lastNameBytes is null || !string.Equals(_lastName, name, StringComparison.Ordinal))
+        {
+            _lastName = name;
+            _lastNameBytes = Encoding.UTF8.GetBytes(name);
+        }
+        _nameBytes = _lastNameBytes;
         if (!_txnDb.RegisterTransaction(this))
         {
             _name = null;
@@ -237,6 +246,13 @@ internal class PessimisticTransaction : Transaction
         // directly to the transaction's WriteBatch.
         if (!_batch.Wbwi.HasKeyWithTimestamp && !_batch.Batch.HasKeyWithTimestamp) return null;
         if (_commitTimestamp == MaxTimestamp) throw Invalid("Must assign a commit timestamp");
+        return AssignCommitTimestampToBatch();
+    }
+
+    // Separate from AssignCommitTimestamp: the closure below is allocated on entry to the scope that declares the
+    // variables it captures, which would otherwise be every commit.
+    private byte[] AssignCommitTimestampToBatch()
+    {
         byte[] ts = new byte[sizeof(ulong)];
         Coding.EncodeFixed64(ts, _commitTimestamp);
         WriteBatch wb = _batch.Batch;
@@ -346,6 +362,7 @@ internal class PessimisticTransaction : Transaction
 
     // ---- commit / prepare / rollback --------------------------------------------------------------------
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private protected override async ValueTask PrepareCoreAsync(bool synchronous, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
@@ -387,6 +404,7 @@ internal class PessimisticTransaction : Transaction
     /// marker with the name is appended, and the batch is written to the WAL only; the WAL is marked as holding an
     /// outstanding prepared section before the write is released. Sets the log number.
     /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private protected virtual async ValueTask PrepareInternalAsync(bool synchronous, CancellationToken cancellationToken)
     {
         _batch.Batch.MarkEndPrepare(_nameBytes!, writeAfterCommit: true, unpreparedBatch: false);
@@ -419,6 +437,7 @@ internal class PessimisticTransaction : Transaction
 
     private protected static RocksDbException Expired() => new(StatusCode.Expired, "Operation expired: ");
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private protected override async ValueTask CommitCoreAsync(bool synchronous, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
@@ -516,6 +535,7 @@ internal class PessimisticTransaction : Transaction
     /// memtables (they keep the WAL with the prepared section alive until flushed). With timestamps the marker carries
     /// the commit timestamp (recovery assigns it to the prepared batch) and the batch gets it now.
     /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private protected virtual async ValueTask CommitInternalAsync(bool synchronous, CancellationToken cancellationToken)
     {
         byte[]? commitTs = AssignCommitTimestamp();
@@ -571,6 +591,7 @@ internal class PessimisticTransaction : Transaction
     /// </summary>
     private protected WriteBatch WorkingCommitBatch() => _commitTimeBatch ?? MarkerBatch();
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private protected override async ValueTask RollbackCoreAsync(bool synchronous, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
