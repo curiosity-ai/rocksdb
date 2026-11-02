@@ -209,9 +209,10 @@ Goal: finish implementation, validate vs C++ source, comprehensive tests (unit/i
 Legend: S/M/L = rough size. [~] = agent working on it.
 
 - Compaction
-  - [~] read-triggered compaction, reduce_file_locking, preclude_last_level_data_seconds, CompactRange partition-straddle
+  - [x] read-triggered compaction (read sampling), periodic compaction trigger, reduce_file_locking (bottom-priority pool), preclude_last_level_data_seconds (seqno-to-time mapping, per-key placement), CompactRange partition-straddle; lock-step/compat vs native
+  - [ ] perf check of read-sampling overhead on the next quiet benchmark run (S)
   - [ ] subcompactions (L); async compaction input reads (M); compensated size with point-deletion boost (M)
-  - [ ] bottommost files marked for compaction (S/M); persist round-robin cursors to MANIFEST (S); CompactFiles API (M)
+  - [ ] bottommost files marked for compaction (+ by preserve boundary) (S/M); bottommost_file_compaction_delay (S); persist round-robin cursors to MANIFEST (S); CompactFiles API (M)
   - [ ] write-controller pacing parity (L0 pile-up under free-running load) (M)
 - Transactions
   - [~] WritePrepared two_write_queues + commit-time batches; per-txn allocations
