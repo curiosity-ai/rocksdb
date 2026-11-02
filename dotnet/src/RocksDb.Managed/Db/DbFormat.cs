@@ -83,8 +83,22 @@ public static class DbFormat
         }
         UnpackSequenceAndType(ExtractFooter(internalKey), out ulong seq, out EntryType t);
         result = new ParsedInternalKey(seq, t, internalKey.Length - InternalKeyFooterSize);
-        return (byte)t < (byte)EntryType.MaxValid;
+        // ParseInternalKey (db/dbformat.h) only accepts IsExtendedValueType: WAL-only types are corruption.
+        return IsExtendedValueType(t);
     }
+
+    /// <summary>Port of IsValueType (db/dbformat.h): the types that may appear in memtables and SST data blocks.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsValueType(EntryType t) =>
+        t <= EntryType.Merge || t == EntryType.SingleDeletion || t == EntryType.BlobIndex || t == EntryType.DeletionWithTimestamp ||
+        t == EntryType.WideColumnEntity || t == EntryType.ValuePreferredSeqno;
+
+    /// <summary>
+    /// Port of IsExtendedValueType (db/dbformat.h): <see cref="IsValueType"/> plus range deletions and
+    /// <see cref="EntryType.MaxValid"/> (used by truncated range tombstone boundaries).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsExtendedValueType(EntryType t) => IsValueType(t) || t == EntryType.RangeDeletion || t == EntryType.MaxValid;
 }
 
 /// <summary>Parsed footer of an internal key. The user key is <c>internalKey[..UserKeyLength]</c>.</summary>

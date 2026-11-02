@@ -51,7 +51,11 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public int MaxWriteBufferNumber { get; set; } = 2;
     public int MinWriteBufferNumberToMerge { get; set; } = 1;
     public long MaxWriteBufferSizeToMaintain { get; set; }
-    public ulong ArenaBlockSize { get; set; } = 1024 * 1024;
+    /// <summary>
+    /// arena_block_size. 0 (the default, as in include/rocksdb/advanced_options.h) derives it from
+    /// <see cref="WriteBufferSize"/> like SanitizeCfOptions: min(1 MiB, write_buffer_size / 8), 4 KiB aligned.
+    /// </summary>
+    public ulong ArenaBlockSize { get; set; }
     public bool InplaceUpdateSupport { get; set; }
     public ulong InplaceUpdateNumLocks { get; set; } = 10000;
     public double MemtablePrefixBloomSizeRatio { get; set; }
