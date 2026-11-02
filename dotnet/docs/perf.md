@@ -586,9 +586,59 @@ alternating runs of the previous build and this one on the shared 4-core VM, µs
 The spread between runs of the same build is larger than any difference (the free-running write-amp depends on how far
 compactions fall behind the writer, see "Compaction-picking parity").
 
+## Final three-way results: 5 repetitions on a quiet machine
+
+`bench/results/2026-11-02-final-warm-r5.md` (19:50-21:27 UTC): the reduced matrix and the compaction-heavy
+configuration, all four engines, `REPEATS=5` (new in `run-all.sh` / `report`: engines interleaved per repetition,
+fresh DB and warm-up per run, medians, min-max, CV, 95% bootstrap CIs), with no other agents on the VM (each repetition
+started at a 1-minute load average <= 1.5; 0.51-3.36 before the individual runs, median 1.65). Sizes: 300k x 100 B,
+100k x 1 KiB (as many reads), 500k for the compaction-heavy configuration. Same tree as "Compaction features" above.
+
+Geometric mean of the µs/op ratio vs c-native, against the previous single warm run on the loaded VM
+(`2026-11-02-vm-warm.md`: 1 KiB with 60k entries and 200k reads; `-vm-warm-compaction.md`: median of 3 runs):
+
+| configuration | rocksdb-sharp single run | rocksdb-sharp median of 5 [95% CI] | managed single run | managed median of 5 [95% CI] | managed-async single run | managed-async median of 5 [95% CI] |
+|---|---:|---:|---:|---:|---:|---:|
+| 100 B, 1 thread, none | 0.98x | 1.06x [1.01-1.13] | 0.52x | 0.59x [0.56-0.63] | 0.66x | 0.64x [0.61-0.68] |
+| 100 B, 4 threads, none | 1.05x | 1.01x [0.96-1.09] | 0.60x | 0.78x [0.72-0.82] | 0.63x | 0.79x [0.74-0.83] |
+| 100 B, 1 thread, LZ4 | 1.19x | 1.11x [1.07-1.16] | 0.63x | 0.69x [0.66-0.73] | 0.68x | 0.76x [0.72-0.79] |
+| 100 B, 4 threads, LZ4 | 1.10x | 1.01x [0.97-1.09] | 0.61x | 0.83x [0.77-0.87] | 0.59x | 0.78x [0.73-0.81] |
+| 1 KiB, 1 thread, none | 0.90x | 1.04x [0.96-1.19] | 0.50x | 0.52x [0.49-0.57] | 0.48x | 0.55x [0.53-0.61] |
+| 1 KiB, 4 threads, none | 0.99x | 1.03x [0.96-1.08] | 0.73x | 0.63x [0.58-0.66] | 0.72x | 0.60x [0.56-0.63] |
+| 1 KiB, 1 thread, LZ4 | 1.09x | 0.99x [0.94-1.07] | 0.67x | 0.58x [0.55-0.62] | 0.73x | 0.64x [0.60-0.68] |
+| 1 KiB, 4 threads, LZ4 | 0.89x | 1.02x [0.94-1.11] | 0.81x | 0.70x [0.65-0.75] | 0.72x | 0.74x [0.68-0.79] |
+| all 8 matrix configurations | | 1.03x [1.01-1.06] | | 0.66x [0.64-0.67] | | 0.68x [0.67-0.70] |
+| compaction-heavy | 1.02x | 1.07x [1.00-1.13] | 0.57x | 0.58x [0.51-0.63] | 0.68x | 0.69x [0.64-0.72] |
+
+What the repetitions show that single runs did not:
+
+- The run-to-run noise floor of the VM is ~10% per cell even when it is quiet (median CV 9.9% c-native, 10.0-10.7% the
+  .NET engines; 20% at the 90th percentile). Single-run cells of earlier entries in this log are within that noise.
+- The 100 B / 4-thread configurations are worse than the single warm run suggested (0.78-0.83x instead of 0.60x).
+  The causes are two real slow spots, consistent over all 5 repetitions: sync `fillrandom` / `overwrite` with 4
+  writer threads (1.15-1.31x / 1.48-1.81x vs C; async 0.90-1.03x / 0.94-0.95x, so it is the sync write path under
+  contention, not the memtable), and 4-thread `readmissing` with 100 B values (managed 1.42-1.68x, managed-async
+  1.93-3.00x; 0.33-0.59x / 0.51-0.73x in the other configurations).
+- rocksdb-sharp's binding cost is 3% overall (CI 1-6%), concentrated in scans (`readseq` 1.17x, `readreverse` 1.14x).
+- Compaction-heavy write-amp: c-native, rocksdb-sharp and managed-async 2.96 in every repetition, managed 2.96-3.15
+  (median 3.05).
+- 1 managed process of 45 crashed in its warm-up: `RocksDatabase.Open` on the directory the warm-up had just deleted
+  and re-created failed with `MANIFEST-000001` not found (`DbBenchRunner.RunWarmup`, open with destroyExisting before
+  a fill benchmark; 1 KiB / LZ4 / 1 thread, repetition 1). It looks like a file of the new DB being removed by
+  something still running from the disposed instance; not reproduced or investigated yet. The 14 rows were re-measured.
+
+BenchmarkDotNet head-to-head, default job, same window (`bench/results/2026-11-02-final-bdn.md`): managed /
+rocksdb-sharp is 0.57x for Put, 0.60x for a 100-put WriteBatch, 0.49x / 0.35x / 0.28x for Get from the memtable /
+a cached block / a missing key, 0.26x / 0.21x for Seek + 10 / 100 Next and 0.52x for MultiGet(16); nothing allocates.
+`DbAsync`: async costs 0-20% over sync when calls complete synchronously (TryGet 1.31 vs 1.60 µs, MultiGet(16)
+19.1 vs 19.1 µs).
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
 - Data block linear scan could skip comparisons using the shared-prefix length (incremental comparison).
 - Batched MultiGet exists (perf pass #2) but does not prefetch filter cache lines or interleave the block reads of a batch.
 - Block cache charge does not include the `Block` object (~64 bytes).
+- Sync writes from 4 threads (`fillrandom` / `overwrite` 1.04-1.81x vs C, while async is 0.75-1.03x) and 4-thread
+  `readmissing` with small values (1.4-3.0x); see "Final three-way results".
+- Warm-up crash: reopening a just-deleted and re-created DB directory once failed with `MANIFEST-000001` not found.

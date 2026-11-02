@@ -34,7 +34,9 @@ engine (knobs `COMPACTION_NUM`, `COMPACTION_ARGS`, `COMPACTION_BENCHMARKS`, ... 
 `results/2026-11-02-vm-compaction.md`, then `-vm-perf2-compaction.md` and `-vm-perf3-compaction.md` after perf passes #2
 and #3, and `-vm-picker-compaction.md` after the compaction-picking parity fixes (`docs/perf.md`), all cold; with the
 warm-up: `-vm-warm-compaction.md` (alternated with cold runs: `-vm-cold-compaction.md`). Reduced matrix with the warm-up:
-`results/2026-11-02-vm-warm.md` (cold counterpart from the same session: `-vm-cold.md`).
+`results/2026-11-02-vm-warm.md` (cold counterpart from the same session: `-vm-cold.md`). The current reference is
+`results/2026-11-02-final-warm-r5.md`: matrix + compaction-heavy configuration, 5 repetitions on a quiet machine
+(medians, CVs, bootstrap CIs), with the BenchmarkDotNet head-to-head reports in `results/2026-11-02-final-bdn.md`.
 
 All engines run a **warm-up phase** before the measurement (default on, `WARMUP=false` for cold-process numbers; see
 "Warm-up" below), so the .NET engines are not measured while the JIT is still compiling and tiering up. Results before
@@ -61,6 +63,31 @@ $B compare --engines c-native,rocksdb-sharp,managed,managed-async --db_base /tmp
     --benchmarks fillrandom,readrandom --num 1000000 --threads 4 --compression lz4
 $B report --csv out.csv --out out.md
 ```
+
+### Repeated runs (`REPEATS`)
+
+One run of a configuration varies by +-10-30% per cell, more for single-shot rows (`flush`, `compact`). For
+statistically meaningful numbers, repeat the whole matrix:
+
+```bash
+REPEATS=5 LOAD_MAX=1.5 NUM=300000 NUM_LARGE=100000 COMPACTION_NUM=500000 bench/run-all.sh
+```
+
+- Repetition r runs every configuration (and the compaction / blob configurations) on all engines, in the order
+  c-native, rocksdb-sharp, managed, managed-async, before repetition r+1 starts. Every engine run is a fresh process
+  with its own warm-up and a fresh DB, so slow drift of the machine (thermal, other tenants) is spread over all engines
+  instead of landing on one.
+- `LOAD_MAX=1.5` waits before each repetition until the 1-minute load average is at most 1.5 (at most
+  `LOAD_WAIT_MAX_S`, default 900 s). The report lists the load average at the start of each repetition and the
+  min / median / max load before every engine-set run.
+- `compare --rep N` writes the repetition number into the last CSV column (`rep`; also in `.lsm.csv`).
+- `report` detects repeated rows and shows, per benchmark and engine, the **median** µs/op with the min-max range and
+  the coefficient of variation (sample stddev / mean). Ratios use medians. Rows where any engine has CV > 10% are
+  marked `!` and listed in a "Noisy rows" section. The summary geometric means use the medians and come with a 95%
+  percentile-bootstrap confidence interval: 2000 resamples (fixed seed), each redrawing the repetitions of every
+  engine and benchmark with replacement and recomputing medians, ratios and their geometric mean. The report also has
+  a geometric mean over all matrix configurations and one per benchmark. The LSM section gives the median write-amp
+  (min-max) and the most frequent LSM shape per engine, then every repetition.
 
 ## Warm-up
 

@@ -859,10 +859,12 @@ API and behavior differences:
 - A secondary instance opened while the primary's current WAL is empty does not see writes appended to that WAL by a
   later `TryCatchUpWithPrimary` until the primary switches to a new WAL (for example, after a flush).
 
-Performance: on the three-way benchmarks, the managed engine's geometric mean per configuration is between 0.53x and
-2.07x native C. Writes, and point reads and seeks with small values, are mostly at parity or faster. The first
-flush and compaction in a process (JIT warm-up), LZ4 flushes, reverse iteration, and the configuration with 1 KiB
-values on 4 threads are slower. See [docs/benchmarks.md](docs/benchmarks.md).
+Performance: on the three-way db_bench-style benchmarks (warm, medians of 5 repetitions, same librocksdb 11.12 for
+the native legs), the managed engine's geometric mean per configuration is 0.52x-0.83x the time of the RocksDB C API
+(all 8 configurations: 0.66x, 95% CI 0.64-0.67; async API 0.68x), while rocksdb-sharp is 1.03x. Reads, seeks, scans
+and single-threaded writes are faster than C; random writes on 4 threads through the sync API are 1.0-1.8x
+(0.75-1.03x through the async API), and missing-key reads with 100 B values on 4 threads are 1.4-3.0x. See
+[docs/benchmarks.md](docs/benchmarks.md).
 
 ## Documentation
 

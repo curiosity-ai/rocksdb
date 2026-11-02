@@ -31,6 +31,13 @@
 #                                JIT-compiled, tiered-up code (see "Warm-up" in bench/README.md); false = cold process
 #   WARMUP_OPS=                  --warmup_ops (default max(50k, num/10), <= 200k, <= num)
 #   WARMUP_MIN_MS=               --warmup_min_ms (default 1000)
+#   REPEATS=1                    repetitions: every engine x configuration x benchmark runs REPEATS times, each on a fresh
+#                                DB; repetition r runs all configurations (engines A B C D in turn) before repetition r+1
+#                                starts, so drift spreads over all engines. With REPEATS > 1 the CSV rows carry the
+#                                repetition number and the report shows medians, min-max, CV and bootstrap CIs.
+#   LOAD_MAX=                    before each repetition, wait (up to LOAD_WAIT_MAX_S=900 s) until the 1-minute load
+#                                average is <= LOAD_MAX (e.g. 1.5); the load average at the start of every repetition is
+#                                recorded in the report
 #   RUN_MATRIX=1                 run the matrix above
 #   RUN_COMPACTION=1             also run one compaction-heavy configuration (label "compaction"): small memtables and
 #                                SST files so the LSM tree gets several levels; reports LSM shape + write amplification
@@ -70,6 +77,9 @@ WARMUP="${WARMUP:-true}"
 WARMUP_ARGS="--warmup ${WARMUP}"
 if [[ -n "${WARMUP_OPS:-}" ]]; then WARMUP_ARGS="${WARMUP_ARGS} --warmup_ops ${WARMUP_OPS}"; fi
 if [[ -n "${WARMUP_MIN_MS:-}" ]]; then WARMUP_ARGS="${WARMUP_ARGS} --warmup_min_ms ${WARMUP_MIN_MS}"; fi
+REPEATS="${REPEATS:-1}"
+LOAD_MAX="${LOAD_MAX:-}"
+LOAD_WAIT_MAX_S="${LOAD_WAIT_MAX_S:-900}"
 RUN_MATRIX="${RUN_MATRIX:-1}"
 RUN_COMPACTION="${RUN_COMPACTION:-1}"
 COMPACTION_NUM="${COMPACTION_NUM:-${NUM}}"
@@ -117,40 +127,61 @@ SONAME="$(readelf -d "${LIBDIR}/librocksdb.so" 2>/dev/null | sed -n 's/.*Library
 } > "${MACHINE}"
 
 START=$(date +%s)
-if [[ "${RUN_MATRIX}" == 1 ]]; then
-for vs in ${VALUE_SIZES}; do
-  num="${NUM}"
-  reads="${READS:-${num}}"
-  if (( vs > 100 )); then num="${NUM_LARGE}"; reads="${READS_LARGE:-${num}}"; fi
-  for comp in ${COMPRESSIONS}; do
-    for th in ${THREADS_LIST}; do
-      echo "== value_size=${vs} num=${num} reads=${reads} compression=${comp} threads=${th}"
-      # shellcheck disable=SC2086
-      "${RUNNER[@]}" compare --engines "${ENGINES}" --db_base "${DB_BASE}" --csv "${CSV}" -- \
-        --benchmarks "${BENCHMARKS}" --num "${num}" --reads "${reads}" --value_size "${vs}" \
-        --threads "${th}" --compression "${comp}" ${WARMUP_ARGS} ${EXTRA_ARGS} \
-        | grep -E '^(====|[a-z]+ +: )' | grep -vE '^warmup +: ([a-z]+ [0-9]+ reps|reopen|start)' || true
+LOADS=""
+LOAD_SAMPLES=()
+sample_load() { LOAD_SAMPLES+=("$(cut -d' ' -f1 /proc/loadavg)"); }
+for (( rep = 1; rep <= REPEATS; rep++ )); do
+  REP_ARGS=""
+  if (( REPEATS > 1 )); then REP_ARGS="--rep ${rep}"; echo "== repetition ${rep}/${REPEATS}"; fi
+  if [[ -n "${LOAD_MAX}" ]]; then
+    waited=0
+    while awk -v l="$(cut -d' ' -f1 /proc/loadavg)" -v m="${LOAD_MAX}" 'BEGIN { exit !(l > m) }' && (( waited < LOAD_WAIT_MAX_S )); do
+      sleep 10; waited=$(( waited + 10 ))
+    done
+    if (( waited > 0 )); then echo "   waited ${waited} s for load <= ${LOAD_MAX}"; fi
+  fi
+  LOADS="${LOADS}${LOADS:+; }rep ${rep} $(date -u +%H:%M) $(cut -d' ' -f1-3 /proc/loadavg)"
+  if [[ "${RUN_MATRIX}" == 1 ]]; then
+  for vs in ${VALUE_SIZES}; do
+    num="${NUM}"
+    reads="${READS:-${num}}"
+    if (( vs > 100 )); then num="${NUM_LARGE}"; reads="${READS_LARGE:-${num}}"; fi
+    for comp in ${COMPRESSIONS}; do
+      for th in ${THREADS_LIST}; do
+        echo "== value_size=${vs} num=${num} reads=${reads} compression=${comp} threads=${th}"
+        sample_load
+        # shellcheck disable=SC2086
+        "${RUNNER[@]}" compare --engines "${ENGINES}" --db_base "${DB_BASE}" --csv "${CSV}" ${REP_ARGS} -- \
+          --benchmarks "${BENCHMARKS}" --num "${num}" --reads "${reads}" --value_size "${vs}" \
+          --threads "${th}" --compression "${comp}" ${WARMUP_ARGS} ${EXTRA_ARGS} \
+          | grep -E '^(====|[a-z]+ +: )' | grep -vE '^warmup +: ([a-z]+ [0-9]+ reps|reopen|start)' || true
+      done
     done
   done
+  fi
+  if [[ "${RUN_COMPACTION}" == 1 ]]; then
+    echo "== compaction: num=${COMPACTION_NUM} value_size=${COMPACTION_VALUE_SIZE} compression=${COMPACTION_COMPRESSION} threads=${COMPACTION_THREADS} ${COMPACTION_ARGS}"
+    sample_load
+    # shellcheck disable=SC2086
+    "${RUNNER[@]}" compare --engines "${ENGINES}" --db_base "${DB_BASE}" --csv "${CSV}" ${REP_ARGS} --label compaction -- \
+      --benchmarks "${COMPACTION_BENCHMARKS}" --num "${COMPACTION_NUM}" --value_size "${COMPACTION_VALUE_SIZE}" \
+      --threads "${COMPACTION_THREADS}" --compression "${COMPACTION_COMPRESSION}" ${COMPACTION_ARGS} ${WARMUP_ARGS} ${EXTRA_ARGS} \
+      | grep -E '^(====|[a-z]+ +: |Cumulative compaction)' | grep -vE '^warmup +: ([a-z]+ [0-9]+ reps|reopen|start)' || true
+  fi
+  if [[ "${RUN_BLOB}" == 1 ]]; then
+    echo "== blob: num=${BLOB_NUM} value_size=${BLOB_VALUE_SIZE} compression=${BLOB_COMPRESSION} threads=${BLOB_THREADS} ${BLOB_ARGS}"
+    sample_load
+    # shellcheck disable=SC2086
+    "${RUNNER[@]}" compare --engines "${ENGINES}" --db_base "${DB_BASE}" --csv "${CSV}" ${REP_ARGS} --label blob -- \
+      --benchmarks "${BLOB_BENCHMARKS}" --num "${BLOB_NUM}" --value_size "${BLOB_VALUE_SIZE}" \
+      --threads "${BLOB_THREADS}" --compression "${BLOB_COMPRESSION}" ${BLOB_ARGS} ${WARMUP_ARGS} ${EXTRA_ARGS} \
+      | grep -E '^(====|[a-z]+ +: |Cumulative compaction)' | grep -vE '^warmup +: ([a-z]+ [0-9]+ reps|reopen|start)' || true
+  fi
 done
-fi
-if [[ "${RUN_COMPACTION}" == 1 ]]; then
-  echo "== compaction: num=${COMPACTION_NUM} value_size=${COMPACTION_VALUE_SIZE} compression=${COMPACTION_COMPRESSION} threads=${COMPACTION_THREADS} ${COMPACTION_ARGS}"
-  # shellcheck disable=SC2086
-  "${RUNNER[@]}" compare --engines "${ENGINES}" --db_base "${DB_BASE}" --csv "${CSV}" --label compaction -- \
-    --benchmarks "${COMPACTION_BENCHMARKS}" --num "${COMPACTION_NUM}" --value_size "${COMPACTION_VALUE_SIZE}" \
-    --threads "${COMPACTION_THREADS}" --compression "${COMPACTION_COMPRESSION}" ${COMPACTION_ARGS} ${WARMUP_ARGS} ${EXTRA_ARGS} \
-    | grep -E '^(====|[a-z]+ +: |Cumulative compaction)' | grep -vE '^warmup +: ([a-z]+ [0-9]+ reps|reopen|start)' || true
-fi
-if [[ "${RUN_BLOB}" == 1 ]]; then
-  echo "== blob: num=${BLOB_NUM} value_size=${BLOB_VALUE_SIZE} compression=${BLOB_COMPRESSION} threads=${BLOB_THREADS} ${BLOB_ARGS}"
-  # shellcheck disable=SC2086
-  "${RUNNER[@]}" compare --engines "${ENGINES}" --db_base "${DB_BASE}" --csv "${CSV}" --label blob -- \
-    --benchmarks "${BLOB_BENCHMARKS}" --num "${BLOB_NUM}" --value_size "${BLOB_VALUE_SIZE}" \
-    --threads "${BLOB_THREADS}" --compression "${BLOB_COMPRESSION}" ${BLOB_ARGS} ${WARMUP_ARGS} ${EXTRA_ARGS} \
-    | grep -E '^(====|[a-z]+ +: |Cumulative compaction)' | grep -vE '^warmup +: ([a-z]+ [0-9]+ reps|reopen|start)' || true
-fi
 END=$(date +%s)
+if (( REPEATS > 1 )); then echo "Repetitions: ${REPEATS}; UTC time and load average (1/5/15 min) at the start of each: ${LOADS}" >> "${MACHINE}"; fi
+LOAD_SUMMARY="$(printf '%s\n' "${LOAD_SAMPLES[@]}" | sort -g | awk '{ v[NR] = $1 } END { printf "min %s, median %s, max %s", v[1], v[int((NR + 1) / 2)], v[NR] }')"
+echo "1-minute load average before each of the ${#LOAD_SAMPLES[@]} engine-set runs: ${LOAD_SUMMARY}" >> "${MACHINE}"
 echo "Load average at end: $(cut -d' ' -f1-3 /proc/loadavg); total runtime $(( (END - START) / 60 )) min $(( (END - START) % 60 )) s" >> "${MACHINE}"
 
 {
