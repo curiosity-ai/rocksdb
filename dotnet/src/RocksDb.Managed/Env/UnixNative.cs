@@ -67,6 +67,13 @@ internal static partial class UnixNative
     [LibraryImport(LibC, SetLastError = true)]
     private static partial int close(int fd);
 
+    [LibraryImport(LibC, EntryPoint = "link", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
+    private static partial int link_(string oldpath, string newpath);
+
+    [LibraryImport("kernel32", EntryPoint = "CreateHardLinkW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool CreateHardLinkW(string newFileName, string existingFileName, IntPtr securityAttributes);
+
     [LibraryImport(LibC, SetLastError = true)]
     private static partial int fallocate(int fd, int mode, long offset, long len);
 
@@ -256,6 +263,68 @@ internal static partial class UnixNative
         {
             if (addRef) handle.DangerousRelease();
         }
+    }
+
+    // errno values for link(2) failures that mean "hard links are not possible here" (Linux / macOS).
+    private const int EPERM = 1;
+    private const int EXDEV = 18;
+    private const int EMLINK_LINUX = 31;
+    private const int EOPNOTSUPP_LINUX = 95;
+    private const int EOPNOTSUPP_MAC = 45;
+    private const int EEXIST = 17;
+    private const int ENOENT = 2;
+    // Windows error codes for CreateHardLink.
+    private const int ERROR_FILE_NOT_FOUND = 2;
+    private const int ERROR_PATH_NOT_FOUND = 3;
+    private const int ERROR_ALREADY_EXISTS = 183;
+    private const int ERROR_FILE_EXISTS = 80;
+
+    /// <summary>
+    /// Creates a hard link (PosixFileSystem::LinkFile: link(2); Windows: CreateHardLinkW). Cross-device links and
+    /// file systems without hard link support throw NotSupported so callers can fall back to copying.
+    /// </summary>
+    public static void Link(string source, string target)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            if (CreateHardLinkW(target, source, IntPtr.Zero)) return;
+            int err = Marshal.GetLastPInvokeError();
+            switch (err)
+            {
+                case ERROR_FILE_NOT_FOUND:
+                case ERROR_PATH_NOT_FOUND:
+                    throw new RocksDbException(StatusCode.IOError, "IO error: while link file to " + target + ": " + source + ": No such file or directory",
+                        StatusSubCode.PathNotFound);
+                case ERROR_ALREADY_EXISTS:
+                case ERROR_FILE_EXISTS:
+                    throw RocksDbException.IOError("while link file to " + target + ": " + source + ": file exists");
+                default:
+                    throw RocksDbException.NotSupported("No support for hard link: " + Marshal.GetPInvokeErrorMessage(err));
+            }
+        }
+        if (!IsUnix) ThrowHelper.NotSupported("No support for hard link on this platform");
+        int rc;
+        try
+        {
+            rc = link_(source, target);
+        }
+        catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException)
+        {
+            throw RocksDbException.NotSupported("No support for hard link: " + e.Message);
+        }
+        if (rc == 0) return;
+        int errno = Marshal.GetLastPInvokeError();
+        if (errno == EXDEV || errno == EPERM || errno == EMLINK_LINUX || errno == EOPNOTSUPP_LINUX || errno == EOPNOTSUPP_MAC)
+        {
+            // PosixFileSystem::LinkFile: EXDEV / ENOTSUP -> NotSupported("No cross FS links allowed").
+            throw RocksDbException.NotSupported("No cross FS links allowed: " + Marshal.GetPInvokeErrorMessage(errno));
+        }
+        if (errno == ENOENT)
+        {
+            throw new RocksDbException(StatusCode.IOError, "IO error: while link file to " + target + ": " + source + ": No such file or directory",
+                StatusSubCode.PathNotFound);
+        }
+        throw IOErrorFromErrno("while link file to " + target, source, errno);
     }
 
     public static RocksDbException IOErrorFromErrno(string context, string path, int errno) =>

@@ -8,6 +8,7 @@ internal sealed partial class DbImpl
     public async ValueTask<ColumnFamilyData> CreateColumnFamilyAsync(string name, ColumnFamilyOptions options, bool synchronous, CancellationToken ct)
     {
         ThrowIfDisposed();
+        if (_readOnly) ThrowReadOnly();
         ColumnFamilyData cfd = await CreateColumnFamilyCoreAsync(name, options, writeOptionsFile: true, synchronous, ct).ConfigureAwait(false);
         return cfd;
     }
@@ -63,6 +64,7 @@ internal sealed partial class DbImpl
     public async ValueTask DropColumnFamilyAsync(ColumnFamilyData cfd, bool synchronous, CancellationToken ct)
     {
         ThrowIfDisposed();
+        if (_readOnly) ThrowReadOnly();
         if (cfd.Id == 0) ThrowHelper.InvalidArgument("Can't drop default column family");
         WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
         try

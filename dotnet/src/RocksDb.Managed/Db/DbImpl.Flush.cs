@@ -160,6 +160,7 @@ internal sealed partial class DbImpl
     internal async ValueTask FlushColumnFamilyAsync(ColumnFamilyData cfd, bool wait, bool synchronous, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        if (_readOnly) ThrowReadOnly();
         WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, cancellationToken).ConfigureAwait(false);
         ImmutableMemTable? target = null;
         try

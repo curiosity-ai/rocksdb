@@ -46,6 +46,11 @@ internal sealed class VersionSet : IAsyncDisposable
     public ulong MinLogNumberToKeep { get; private set; }
     public ulong ManifestFileNumber { get; private set; }
     public ulong PrevLogNumber { get; set; }
+    /// <summary>
+    /// MANIFEST number and size as of the last installed edit (manifest_file_number_ / manifest_file_size_), consistent
+    /// with the installed versions. REQUIRES: DB mutex.
+    /// </summary>
+    public (ulong Number, ulong Size) InstalledManifest { get; set; }
 
     public IReadOnlyCollection<ColumnFamilyData> ColumnFamilies => _cfs.Values;
 
@@ -263,6 +268,7 @@ internal sealed class VersionSet : IAsyncDisposable
 
             lock (_db.Mutex)
             {
+                InstalledManifest = (ManifestFileNumber, (ulong)_manifestLog!.Log.File!.Size);
                 if (edit.MinLogNumberToKeep is ulong minLog && minLog > MinLogNumberToKeep) MinLogNumberToKeep = minLog;
                 if (edit.IsColumnFamilyAdd)
                 {

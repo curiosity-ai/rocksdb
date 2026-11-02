@@ -80,4 +80,17 @@ public interface IFileSystem
     /// <summary>Deletes an empty directory (FileSystem::DeleteDir).</summary>
     void DeleteDirectory(string path) =>
         throw RocksDbException.NotSupported("DeleteDirectory is not supported by " + GetType().Name);
+
+    /// <summary>
+    /// Creates a hard link <paramref name="target"/> to the existing file <paramref name="source"/>
+    /// (FileSystem::LinkFile). Fails if <paramref name="target"/> exists. Throws <see cref="StatusCode.NotSupported"/>
+    /// when the file system (or the pair of directories, e.g. across devices) does not support hard links; callers
+    /// such as Checkpoint then fall back to copying.
+    /// </summary>
+    void LinkFile(string source, string target) =>
+        throw RocksDbException.NotSupported("LinkFile is not supported by " + GetType().Name);
+
+    /// <summary>Last modification time of a file (FileSystem::GetFileModificationTime), used by WAL archive TTL purging.</summary>
+    DateTimeOffset GetFileModificationTime(string path) =>
+        throw RocksDbException.NotSupported("GetFileModificationTime is not supported by " + GetType().Name);
 }
