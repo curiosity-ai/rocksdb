@@ -144,7 +144,7 @@ With compaction (1M ops, 16B/100B, 4MB write buffer, no compression, shared box)
 Write-amp: fill 3.42 native vs 3.24 managed; overwrite 4.12 vs 4.17.
 
 ## Phase 3 — Compat + performance
-Final completeness wave:
+Final completeness wave (all merged):
 - [x] Integrated BlobDB: blob file format/builder/reader/cache/GC, versions & MANIFEST, Get/MultiGet/iterators/merges, checkpoint/GetLiveFiles; blob files byte-identical to native; native↔managed both ways; blob dbbench (`results/2026-11-02-vm-blob.md`: managed 0.55x C)
 - [x] Blob: zlib >16 KiB (16 KiB independent chunks; readable by native), blob readers bounded by max_open_files; forced GC universal/FIFO = parity (upstream leveled-only)
 - [ ] Blob gaps: V2 entity blob columns (native 11.12 never writes them), blob direct write
@@ -159,7 +159,8 @@ Final completeness wave:
 - [x] Compaction picking parity: root causes were flush keeping hidden versions (now applies upstream rule A per snapshot stripe) and max output size cap (2x target above bottommost). Lock-step harness: all 60 LSM shapes and compaction sequence identical to native; write-amp 4.321 vs 4.322. Compat test `CompactionPickerParityTests`
 - [ ] Under free-running load the faster managed writer piles L0 to ~10 files with 1 compaction thread (native 5–6) → more pending work at end; consider write-controller pacing parity
 - [x] Fixed secondary/WAL tailing lag at block-aligned EOF (also likely cause of an intermittent replication-test failure: 15/15 clean runs after the fix) and missing-dir open error (InvalidArgument)
-- [~] Bench warm-up: dbbench `--warmup` (default on, all engines) on a throwaway DB + JIT-count reporting; re-run matrix warm (agent running)
+- [x] Bench warm-up: `--warmup` (default on, all 3 legs) runs every workload + 64 flush/compaction cycles on a throwaway DB, waits for JIT quiescence; per-benchmark JIT counts in reports (managed: median 161 → 0 methods during measurement). Warm three-way geomean vs C: managed 0.50–0.81x, managed-async 0.48–0.73x, rocksdb-sharp 0.89–1.19x (`bench/results/2026-11-02-vm-warm*.md`)
+- [ ] Compaction-heavy fills still JIT 40–630 methods while timed (LSM shapes not reached by warm-up); LZ4 1 KiB flush 1.04–1.21x C (K4os encoder)
 - [ ] First flush/compaction in a fresh process 1.4–1.64x native (JIT warm-up; affects cold-start only); LZ4 flushes 2.5x (K4os JIT/unoptimized) — consider ReadyToRun guidance or a faster LZ4 path
 - [x] Features: WriteBatchWithIndex (+BaseDeltaIterator; transactions now use it), SetOptions/SetDBOptions (+typed), custom comparators e2e (+MANIFEST comparator/num_levels validation), KeyMayExist/GetApproximateSizes/memtable stats/int+map properties/table properties, Statistics (all upstream tickers/histograms, native ToString), info LOG (+rotation), wide columns (PutEntity/GetEntity/iterator columns, merge/compaction) — all compat-tested vs native
 - [ ] Features gaps: compaction filters on entities, blob columns/attribute groups/MultiGetEntity, per-SuperVersion options snapshot, mutable block-based table options, KeyMayExist doing filter I/O on cache miss, cfstats interval/file-read histograms, per-level GET_HIT stats, WBWI MultiGetFromBatchAndDB
