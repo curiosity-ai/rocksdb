@@ -153,8 +153,18 @@ dotnet run -c Release --project bench/RocksDb.Managed.Benchmarks -f net10.0 -- -
 ```
 
 They use the same `IKeyValueEngine` adapters as the dbbench runner (interface dispatch costs ~1 ns per call on both
-sides). The `Allocated` column should be `-` for both engines except managed `MultiGet` (the managed API returns a new
-`byte[]?[]` with one array per found value).
+sides). The `Allocated` column should be `-` for both engines (managed `MultiGet` uses a reusable `MultiGetBatch`).
+
+### Managed sync vs async (`DbAsyncBenchmarks.cs`, category `DbAsync`)
+
+Put / TryGet / Seek + 10 Next / MultiGet(16) through the synchronous and the `ValueTask` API of RocksDb.Managed, with
+`Blocks` = `BlockCache` (64 MiB cache, all blocks resident) or `PageCache` (1 MiB cache: most lookups read the block
+from the file, which is in the OS page cache). `Allocated` should be `-` everywhere and async within a few percent of
+sync (see `docs/perf.md`).
+
+```bash
+dotnet run -c Release --project bench/RocksDb.Managed.Benchmarks -f net10.0 -- --anyCategories DbAsync --job short
+```
 
 ### Component benchmarks
 

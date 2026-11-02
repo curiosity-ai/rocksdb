@@ -165,9 +165,128 @@ All hot paths still report `Allocated = -`. Dictionary compression allocates per
 samples) and per data block with LZ4 dictionaries (a native LZ4 stream context); ZSTD dictionaries are digested once
 per table (CDict / DDict) and use thread-local contexts.
 
+## Perf pass #2 (async allocations, batched MultiGet, reverse iteration, level iterator, flush/compaction)
+
+Inputs: the three-way results `bench/results/2026-11-02-vm.md` / `-vm-compaction.md` (before) and
+`bench/results/2026-11-02-vm-perf2.md` / `-vm-perf2-compaction.md` (after; reduced sizes: num=300k, 60k for 1 KiB
+values; same shared 4-vCPU VM, load 4-18 during the runs). "Before" = `60888de`, built in a separate directory;
+before/after runs were alternated in the same window (dbbench runner and BenchmarkDotNet `--job short
+--iterationCount 8`), medians reported. Allocation-tick sampling (`EventListener` on `GCAllocationTick`) and
+`dotnet-trace` (sampled thread time) located the allocations and hot spots.
+
+### 1. Async API: synchronous completion when nothing has to wait
+
+Causes: (a) every async WAL append went through `RandomAccess.WriteAsync`, which on Unix runs a blocking `pwrite` on a
+thread-pool thread (one pool hop plus a non-pooled state machine box per write: ~150 B and ~8 µs per `PutAsync`);
+(b) every async block read went through `RandomAccess.ReadAsync` (same pool hop) and a non-pooled
+`BlockFetcher.ReadBlockAsync` box (~230-380 B per `TryGetAsync` / async seek missing the block cache); (c) the
+decompression writer object was allocated per compressed block read.
+
+Fixes (`Env/UnixNative.cs`, `Env/LocalFileSystem.cs`, `Table/BlockFetcher.cs`):
+- Async reads first try `preadv2(RWF_NOWAIT)`: a page cache hit completes synchronously (a short read continues
+  asynchronously, EAGAIN falls back to the async read). Async writes use `pwritev2(RWF_NOWAIT)` where the file system
+  supports buffered NOWAIT writes; otherwise (ext4 here) buffered writes up to 256 KiB (WAL records, write-buffer
+  flushes) are written inline, like native RocksDB and like the inline `fdatasync` of `SyncAsync`. Larger writes,
+  direct I/O and rate-limited writes keep the thread-pool path.
+- `BlockFetcher.ReadBlockAsync` has a synchronous fast path and a `PoolingAsyncValueTaskMethodBuilder` slow path; the
+  decompression `RentedBufferWriter` is per thread.
+
+| (1 thread, 100 B values unless noted) | before µs/op | before B/op | after µs/op | after B/op |
+|---|---:|---:|---:|---:|
+| `PutAsync` (probe, WAL on) | 13.5 | 300 | 6.4 - 8.6 (sync `Put` 4.9 - 6.3) | 147 (memtable arena, same as sync) |
+| `TryGetAsync`, block from page cache (1 MiB block cache) | 14.4 | 256 | 4.0 | 0 |
+| `SeekAsync` + 10 `NextAsync`, page cache | 13.9 | 376 | 6.2 | 0 |
+| matrix fillseq, managed-async | 10.34 | 320.6 | 3.55 | 143.5 |
+| matrix readrandom, managed-async | 20.73 | 230.0 | 8.36 | 47.6 (cache fill, same as sync) |
+| matrix seekrandom, managed-async | 41.06 | 818.2 | 21.24 | 0.3 |
+| matrix readwhilewriting, managed-async | 21.68 | 431.1 | 8.00 | 0.5 |
+| matrix seekrandom 1 KiB, managed-async | 95.96 | 2418.7 | 37.38 | 0.3 |
+| matrix readseq 1 KiB, managed-async | 5.98 | 130.5 | 2.34 | 0.3 |
+
+Matrix summary (geometric mean of µs/op vs c-native), managed-async: before 1.06x - 1.86x, after 0.64x - 1.17x; async is
+within noise of the sync API in every configuration. BenchmarkDotNet `DbAsyncBenchmarks` (after, per op):
+
+| op | BlockCache sync | BlockCache async | PageCache sync | PageCache async | Allocated |
+|---|---:|---:|---:|---:|---:|
+| Put / PutAsync | 4.19 µs | 4.98 µs | 4.90 µs | 5.10 µs | - |
+| TryGet / TryGetAsync | 1.25 µs | 1.52 µs | 3.38 µs | 5.07 µs | - |
+| Seek + 10 Next | 1.83 µs | 2.50 µs | 4.70 µs | 4.97 µs | - |
+| MultiGet(16), per batch | 23.1 µs | 21.3 µs | 51.6 µs | 52.7 µs | - |
+
+### 2. Batched MultiGet: `MultiGetBatch`, `MultiGet(batch)`, `MultiGetAsync(batch)`
+
+New API (`MultiGetBatch.cs`, `Db/DbImpl.MultiGet.cs`, `Table/BlockBasedTableReader.MultiGet.cs`): a reusable batch owns
+the keys (`Add(ReadOnlySpan<byte>)`), the per-key results (`GetStatus` = `Found` / `NotFound` / `Error`, `GetValue`
+span, `GetError`) and all scratch, so steady-state calls allocate nothing. Port of `DBImpl::MultiGetImpl` +
+`Version::MultiGet` + `BlockBasedTable::MultiGet`: one super version and one sequence number for the batch, keys sorted
+with the column family comparator (non-allocating sort), memtables per key, then every table file is visited once with
+the sub-batch of keys in its range (L0 newest first; on sorted levels consecutive keys of one file are grouped); the
+filter is checked for the whole sub-batch before any data block is read, and consecutive keys in the same data block
+share one block lookup. `MultiGetAsync` reads missing data blocks asynchronously (same code, `synchronous: false`).
+Per-key errors (corrupt entries, `ReadTier.MemtableTier` with an incomplete merge) are reported per key; I/O errors fail
+the call. Statistics: `NUMBER_MULTIGET_*` tickers, `BYTES_PER_MULTIGET` and `DB_MULTIGET` histograms. The old
+`byte[]?[] MultiGet(IReadOnlyList<byte[]>)` is kept, implemented on the batch.
+
+| | before | after |
+|---|---:|---:|
+| `DbMultiGetBenchmarks` MultiGet(16), cached SST (2 runs) | 22.9 / 23.3 µs, 2384 B | 19.6 / 22.1 µs, - |
+| matrix multireadrandom 100 B, alloc | 132 B/op | 0.4 B/op |
+| matrix multireadrandom 1 KiB, alloc | 929 B/op | 0.5 B/op |
+
+### 3. Reverse iteration
+
+`BlockIter.Prev` caches the entries decoded by its restart-interval scan (port of `DataBlockIter::PrevImpl`'s
+`prev_entries_`), so a run of `Prev` decodes each restart interval once instead of once per entry (data and meta blocks;
+index blocks keep the plain scan). Fully cached 100-byte values, one `Prev` per op (probe, 3 alternated runs): 0.368 /
+0.444 / 0.325 µs before, 0.258 / 0.351 / 0.220 µs after (about -30%); 1 KiB values (4 entries per block): unchanged.
+
+Standalone runs (fresh process on an existing DB, 8 MiB cache) put managed reverse iteration at parity with C: on 9 L0
+files `readreverse` 0.67 - 1.08 µs managed vs 1.07 - 1.50 µs c-native. The remaining matrix gap (readreverse 100 B:
+1.43x) comes from how the matrix runs: each benchmark runs once, and `readreverse` is the first user of the Prev code
+paths, which run as tier-0 / instrumented code for a large part of the short run (same binary, same DB: 1.9 µs/op on the
+first pass, 0.6 µs/op on the second). Iteration over 1 KiB values is at parity (readseq 0.87x, readreverse 1.01x,
+seekrandom 0.84x). Not done: values are still copied when iterating backwards (`DbIter.FindValueForCurrentKey`, ~18% of
+reverse time with 1 KiB values); upstream pins blocks with `PinnedIteratorsManager` instead.
+
+### 4. Level iterator: no allocation per file switch
+
+On a multi-level LSM, every seek landing in another file of a level created a new `TableInternalIterator` +
+`BlockBasedTableIterator` + `IndexCursor` + 3 `BlockIter`s (500-1300 B per seek). `LevelIterator` now recycles its file
+iterator (`TableInternalIterator.Retarget`, `ITableCache.NewIterator(file, reuse)`); an exhausted level iterator still
+releases its file (`Park` drops the lease and the blocks and keeps the objects).
+
+| seekrandom on the compaction-heavy LSM (`0 0 0 0 0 3 14`) | before | after |
+|---|---:|---:|
+| probe Seek + 10 Next | 13.7 µs, 507 B | 5.5 µs, 0 B |
+| dbbench seekrandom (2 alternated runs) | 13.6 / 13.8 µs, 560 B | 12.0 / 12.5 µs, 49 B (cache warm-up) |
+| compaction config seekrandom, managed | 25.22 µs, 1099 B | 21.79 µs, 0.2 B |
+
+### 5. Flush and compaction (investigated; nothing kept)
+
+- Flush is 1.4 - 2x slower than c-native (400k x 100 B: 0.83 - 1.0 s vs 0.4 - 0.6 s, alternated runs). Instrumented
+  phases: memtable iteration ~120 ms (randomly ordered skiplist nodes, cache misses), block building 160 - 235 ms, file
+  appends 37 ms with the WAL disabled but 290 - 370 ms with it on (page cache writes behind ~50 MB of dirty WAL pages),
+  finish 40 ms, fsync 60 - 80 ms. The steady-state in-process build is ~0.6 µs/entry, the first build in a process
+  ~2 µs/entry (also with `TieredCompilation=0`, so first-touch of pooled buffers and new page cache pages, not JIT). The
+  2 - 10 MB the matrix's single flush per process allocates are pool warm-up (later flushes in the same process: 20 KB).
+  A write-behind wrapper (page cache copy of chunk N overlapping with building chunk N+1) gave no measurable gain over
+  16 alternated flushes and was reverted.
+- Compaction: under `overwrite` with a 4 MiB write buffer managed is now faster than native in the foreground
+  (`-vm-perf2-compaction.md`: overwrite 3.39 µs vs 5.14 µs c-native; before 12.29 vs 5.49 µs) with the same LSM shape and
+  write-amp (2.96 - 3.15), but leaves more background work behind (waitforcompaction 0.6 - 0.8 s vs 0.02 - 0.18 s), i.e.
+  background compaction throughput is lower: a full `CompactRange` of 9 L0 files (58 MB) takes 0.9 - 1.0 s managed vs
+  0.4 - 0.6 s c-native. Job limits match upstream (`max_background_jobs = 2`: 1 flush + 1 compaction; native runs one
+  subcompaction by default, so range-partitioned subcompactions would not change this comparison). Compaction input
+  readahead through `FilePrefetchBuffer` (`compaction_readahead_size` = 2 MiB) gave no gain here (inputs are in the page
+  cache; the extra copy costs what the saved `pread`s save) and rented 4 MiB per input, so it was reverted. The profile is
+  spread over the merging iterator heap, `CompactionIterator`, block checksums and the table builder.
+
+Remaining gaps: flush / compaction CPU per entry 1.4 - 2x native; background compaction throughput under sustained
+writes; `fillsync` and `flush` in the matrix carry first-run effects; reverse iteration copies values (no block pinning).
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
 - Data block linear scan could skip comparisons using the shared-prefix length (incremental comparison).
-- No batched MultiGet (filter prefetch, coroutine-style interleaving of misses).
+- Batched MultiGet exists (perf pass #2) but does not prefetch filter cache lines or interleave the block reads of a batch.
 - Block cache charge does not include the `Block` object (~64 bytes).
