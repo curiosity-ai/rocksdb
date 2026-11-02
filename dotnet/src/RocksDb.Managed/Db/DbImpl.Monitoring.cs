@@ -411,6 +411,7 @@ internal sealed partial class DbImpl
     {
         _statsDumpTimer?.Dispose();
         _statsDumpTimer = null;
+        StopCompactionTrigger();
         InfoLogger? log = _infoLog;
         if (log is null) return;
         LogInfo("Shutdown complete");

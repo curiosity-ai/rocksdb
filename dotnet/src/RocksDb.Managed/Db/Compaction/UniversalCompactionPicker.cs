@@ -9,8 +9,9 @@ namespace RocksDb.Managed.Db;
 /// marked for compaction (PickDeleteTriggeredCompaction / BuildCompactionToNextLevel), compression_size_percent,
 /// trivial moves of non-overlapping inputs.
 /// <para>
-/// Not ported: read-triggered compaction (the managed read path does not sample file reads, so no file reaches
-/// read_triggered_compaction_threshold), standalone range tombstone files (FileIsStandAloneRangeTombstone needs the
+/// Read-triggered compaction (PickReadTriggeredCompaction) picks the files marked from the sampled reads
+/// (monitoring/file_read_sample.h, VersionStorageInfo::ComputeFilesMarkedForReadTriggeredCompaction).
+/// Not ported: standalone range tombstone files (FileIsStandAloneRangeTombstone needs the
 /// per-file entry counts, which the port does not keep: such files are treated like other marked files), multiple
 /// db_paths (GetPathId returns 0), reduce_file_locking (no bottom-priority pool) and require_max_output_level (remote
 /// compaction). REQUIRES: DB mutex.
@@ -32,7 +33,8 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
 
     /// <summary>Port of UniversalCompactionPicker::NeedsCompaction.</summary>
     public override bool NeedsCompaction(VersionStorageInfo vstorage) =>
-        vstorage.CompactionScore(0) >= 1 || vstorage.FilesMarkedForPeriodicCompaction.Count > 0 || vstorage.FilesMarkedForCompaction.Count > 0;
+        vstorage.CompactionScore(0) >= 1 || vstorage.FilesMarkedForPeriodicCompaction.Count > 0 || vstorage.FilesMarkedForCompaction.Count > 0
+        || vstorage.ReadTriggeredCompactionFiles.Count > 0;
 
     /// <summary>Port of CalculateSortedRuns (also returns max_run_size).</summary>
     private static List<SortedRun> CalculateSortedRuns(VersionStorageInfo vstorage, int lastLevel, out ulong maxRunSize)
@@ -81,7 +83,8 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         uint ratio = Options.CompactionOptionsUniversal.SizeRatio;
         List<SortedRun> runs = CalculateSortedRuns(vstorage, maxOutputLevel, out ulong maxRunSize);
         if (runs.Count == 0
-            || (vstorage.FilesMarkedForPeriodicCompaction.Count == 0 && vstorage.FilesMarkedForCompaction.Count == 0 && runs.Count < trigger))
+            || (vstorage.FilesMarkedForPeriodicCompaction.Count == 0 && vstorage.FilesMarkedForCompaction.Count == 0
+                && vstorage.ReadTriggeredCompactionFiles.Count == 0 && runs.Count < trigger))
         {
             return null; // "Universal: nothing to do"
         }
@@ -102,6 +105,8 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         }
         // MaybePickDeleteTriggeredCompaction
         c ??= PickDeleteTriggeredCompaction(b);
+        // MaybePickReadTriggeredCompaction
+        if (c is null && vstorage.ReadTriggeredCompactionFiles.Count > 0) c = PickReadTriggeredCompaction(b);
         if (c is null) return null;
         RegisterCompaction(c);
         // Creating a compaction influences the compaction score because the score takes running compactions into
@@ -502,6 +507,36 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
             if (startLevelInputs.IsEmpty) return null;
         }
         return BuildCompactionToNextLevel(b, startLevelInputs, CompactionReason.FilesMarkedForCompaction);
+    }
+
+    /// <summary>
+    /// Port of UniversalCompactionBuilder::PickReadTriggeredCompaction: the hottest file marked by
+    /// ComputeFilesMarkedForReadTriggeredCompaction that expands to a clean cut (L0 files are skipped while an L0
+    /// compaction runs), compacted to the next non-empty level; with a single level, with every overlapping L0 file.
+    /// </summary>
+    private Compaction? PickReadTriggeredCompaction(Builder b)
+    {
+        VersionStorageInfo vstorage = b.Vstorage;
+        CompactionInputFiles? startLevelInputs = null;
+        foreach ((int level, FileMetaData file) in vstorage.ReadTriggeredCompactionFiles)
+        {
+            if (file.BeingCompacted) continue;
+            if (level == 0 && IsLevel0CompactionInProgress) continue;
+            var candidate = new CompactionInputFiles(level, new List<FileMetaData> { file });
+            if (ExpandInputsToCleanCut(vstorage, candidate))
+            {
+                startLevelInputs = candidate;
+                break;
+            }
+        }
+        if (startLevelInputs is null || startLevelInputs.IsEmpty) return null;
+        // For intra L0 compactions, pick up all overlapping files
+        if (vstorage.NumLevels == 1 && startLevelInputs.Level == 0)
+        {
+            int unusedParentIndex = -1;
+            if (!GetOverlappingL0Files(vstorage, startLevelInputs, 0, ref unusedParentIndex)) return null;
+        }
+        return BuildCompactionToNextLevel(b, startLevelInputs, CompactionReason.ReadTriggered);
     }
 
     /// <summary>

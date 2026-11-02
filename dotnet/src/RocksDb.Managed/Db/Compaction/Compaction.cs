@@ -27,6 +27,8 @@ public enum CompactionReason
     ForcedBlobGC,
     RoundRobinTtl,
     RefitLevel,
+    /// <summary>Files whose sampled collapsible-entry reads exceed read_triggered_compaction_threshold.</summary>
+    ReadTriggered,
 }
 
 /// <summary>Files of one input level of a compaction (rocksdb::CompactionInputFiles).</summary>

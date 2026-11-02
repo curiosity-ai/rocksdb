@@ -1,4 +1,5 @@
 using RocksDb.Managed.Cache;
+using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Options;
 using RocksDb.Managed.Table;
@@ -317,5 +318,185 @@ public sealed class CompactionFeatureTests
         var big = new HyperClockCache(new HyperClockCacheOptions { Capacity = 1 << 20, EstimatedEntryCharge = 4096, NumShardBits = 0 });
         // capacity / (4096 * 0.7 + 64) = 357 slots -> 512
         Assert.AreEqual(512, big.TableSize);
+    }
+    // ---- read-triggered compaction (db_compaction_test.cc ReadTriggeredCompaction, monitoring/file_read_sample.h) -----
+
+    /// <summary>
+    /// num_levels 3: keys 0..9 at L2, a tombstone file for keys 0..4 in L0 (not the last non-empty level).
+    /// </summary>
+    private static RocksDatabase OpenWithTombstoneFile(MemoryFileSystem fs, ColumnFamilyOptions cf, DbOptions? options = null)
+    {
+        RocksDatabase db = RocksDatabase.Open(DbPath, options ?? NewOptions(fs), cf);
+        for (int i = 0; i < 10; i++) db.Put(Key(i), B(new string('v', 1024)));
+        db.Flush();
+        db.CompactRange();
+        Assert.AreEqual(1, FilesAt(db, 2).Count);
+        for (int i = 0; i < 5; i++) db.Delete(Key(i));
+        db.Flush();
+        Assert.AreEqual(1, FilesAt(db, 0).Count);
+        return db;
+    }
+
+    /// <summary>Point lookups of the deleted keys with every read sampled (sync point should_sample_file_read:override).</summary>
+    private static void ReadDeletedKeysSampled(RocksDatabase db, int rounds)
+    {
+        int old = Interlocked.Exchange(ref FileReadSample.TestOverride, 1);
+        try
+        {
+            for (int r = 0; r < rounds; r++)
+            {
+                for (int i = 0; i < 5; i++) Assert.IsNull(db.Get(Key(i)));
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref FileReadSample.TestOverride, old);
+        }
+    }
+
+    private static ColumnFamilyOptions ReadTriggered(double threshold) => new()
+    {
+        NumLevels = 3,
+        Level0FileNumCompactionTrigger = 10,
+        ReadTriggeredCompactionThreshold = threshold,
+        DisableAutoCompactions = true,
+        Compression = RocksDb.Managed.Compression.CompressionType.None,
+    };
+
+    [TestMethod]
+    public void SampledReadsOfTombstonesTriggerCompaction()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = OpenWithTombstoneFile(fs, ReadTriggered(0.001));
+        Assert.AreEqual(0UL, FilesAt(db, 0)[0].NumReadsSampled);
+        ReadDeletedKeysSampled(db, 1);
+        // Every lookup of a deleted key read the L0 file and found a tombstone there (kDeleted).
+        Assert.AreEqual(5UL * FileReadSample.SampleRate, FilesAt(db, 0)[0].NumReadsSampled);
+        // Enabling auto compactions recomputes the score: the L0 file is marked and compacted to the next level.
+        db.DefaultColumnFamily.SetOptions(new Dictionary<string, string> { ["disable_auto_compactions"] = "false" });
+        db.WaitForCompact();
+        Assert.AreEqual(0, FilesAt(db, 0).Count);
+        Assert.AreEqual(5, CountKeys(db));
+        for (int i = 5; i < 10; i++) Assert.IsNotNull(db.Get(Key(i)));
+    }
+
+    [TestMethod]
+    public void ReadTriggeredCompactionNeedsSampledCollapsibleReads()
+    {
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cf = ReadTriggered(0.001);
+        cf.DisableAutoCompactions = false;
+        using RocksDatabase db = OpenWithTombstoneFile(fs, cf);
+        // Reads of live keys find values in L2 (the L0 lookup is a miss there: collapsible for L0 only).
+        int old = Interlocked.Exchange(ref FileReadSample.TestOverride, -1);
+        try
+        {
+            for (int r = 0; r < 100; r++) Assert.IsNull(db.Get(Key(0)));
+        }
+        finally
+        {
+            Volatile.Write(ref FileReadSample.TestOverride, old);
+        }
+        Assert.AreEqual(0UL, FilesAt(db, 0)[0].NumReadsSampled, "no read sampled");
+        db.Flush();
+        db.WaitForCompact();
+        Assert.AreEqual(1, FilesAt(db, 0).Count, "nothing marked without sampled reads");
+    }
+
+    [TestMethod]
+    public void PeriodicTriggerPicksReadTriggeredFilesWithoutWrites()
+    {
+        // TriggerPeriodicCompaction (max_compaction_trigger_wakeup_seconds): a DB that only serves reads re-evaluates
+        // its files and compacts the hot tombstone file.
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cf = ReadTriggered(0.001);
+        cf.DisableAutoCompactions = false;
+        DbOptions options = NewOptions(fs);
+        options.MaxCompactionTriggerWakeupSeconds = 0; // polls every second
+        using RocksDatabase db = OpenWithTombstoneFile(fs, cf, options);
+        ReadDeletedKeysSampled(db, 1);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (FilesAt(db, 0).Count != 0 && sw.Elapsed < TimeSpan.FromSeconds(20)) Thread.Sleep(50);
+        db.WaitForCompact();
+        Assert.AreEqual(0, FilesAt(db, 0).Count, "the periodic trigger compacted the read-hot file");
+        Assert.AreEqual(5, CountKeys(db));
+    }
+
+    [TestMethod]
+    public void IteratorSamplesFileReads()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = OpenWithTombstoneFile(fs, ReadTriggered(0));
+        int old = Interlocked.Exchange(ref FileReadSample.TestOverride, 1);
+        try
+        {
+            using Iterator it = db.NewIterator();
+            it.Seek(Key(0));
+            Assert.IsTrue(it.Valid);
+        }
+        finally
+        {
+            Volatile.Write(ref FileReadSample.TestOverride, old);
+        }
+        // L0: once per iterator creation; L2 (LevelIterator): the seek.
+        Assert.IsTrue(FilesAt(db, 0)[0].NumReadsSampled >= FileReadSample.SampleRate);
+        Assert.IsTrue(FilesAt(db, 2)[0].NumReadsSampled >= FileReadSample.SampleRate);
+    }
+
+    [TestMethod]
+    public void ReadTriggeredCompactionThresholdIsValidatedAndPersisted()
+    {
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions bad = Leveled();
+        bad.ReadTriggeredCompactionThreshold = -1;
+        var ex = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbPath, NewOptions(fs), bad).Dispose());
+        Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
+        bad.ReadTriggeredCompactionThreshold = double.PositiveInfinity;
+        ex = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbPath, NewOptions(fs), bad).Dispose());
+        Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
+
+        ColumnFamilyOptions cf = Leveled();
+        cf.ReadTriggeredCompactionThreshold = 0.01;
+        DbOptions options = NewOptions(fs);
+        options.MaxCompactionTriggerWakeupSeconds = 600;
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, options, cf))
+        {
+            ex = Assert.ThrowsExactly<RocksDbException>(() =>
+                db.DefaultColumnFamily.SetOptions(new Dictionary<string, string> { ["read_triggered_compaction_threshold"] = "-0.5" }));
+            Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
+            db.DefaultColumnFamily.SetOptions(new Dictionary<string, string> { ["read_triggered_compaction_threshold"] = "0.02" });
+        }
+        OptionsFile f = OptionsFile.Load(fs, OptionsFile.FindLatestOptionsFile(fs, DbPath)!, preserveUnknownOptions: false);
+        Assert.AreEqual(0.02, f.FindColumnFamily("default")!.ReadTriggeredCompactionThreshold);
+        Assert.AreEqual(600UL, f.DbOptions.MaxCompactionTriggerWakeupSeconds);
+    }
+
+    [TestMethod]
+    public void TriggerCompactionPeriodFollowsUpstream()
+    {
+        // ComputeTriggerCompactionPeriod: min(max wakeup, stats periods, min time-based interval / 5), at least 1.
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cf = Leveled();
+        cf.Ttl = 0;
+        cf.PeriodicCompactionSeconds = 0;
+        DbOptions options = NewOptions(fs);
+        options.StatsDumpPeriodSec = 0;
+        options.StatsPersistPeriodSec = 0;
+        options.MaxCompactionTriggerWakeupSeconds = 43200;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, options, cf);
+        RocksDb.Managed.Db.DbImpl impl = db.DefaultColumnFamily.Db;
+        Assert.AreEqual(43200UL, impl.ComputeTriggerCompactionPeriod());
+        db.DefaultColumnFamily.SetOptions(new Dictionary<string, string> { ["periodic_compaction_seconds"] = "1000" });
+        Assert.AreEqual(200UL, impl.ComputeTriggerCompactionPeriod());
+        db.SetDBOptions(new Dictionary<string, string> { ["max_compaction_trigger_wakeup_seconds"] = "0" });
+        Assert.AreEqual(1UL, impl.ComputeTriggerCompactionPeriod());
+    }
+
+    private static int CountKeys(RocksDatabase db)
+    {
+        int n = 0;
+        using Iterator it = db.NewIterator();
+        for (it.SeekToFirst(); it.Valid; it.Next()) n++;
+        return n;
     }
 }

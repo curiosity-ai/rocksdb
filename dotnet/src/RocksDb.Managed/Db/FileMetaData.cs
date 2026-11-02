@@ -15,8 +15,8 @@ public readonly record struct UniqueId64x2(ulong Lo, ulong Hi)
 
 /// <summary>
 /// Port of FileMetaData + FileDescriptor (db/version_edit.h): everything the MANIFEST records about one
-/// SST file. In-memory-only members (refs, table reader pin, sampled stats, being_compacted, data-entry
-/// stats) belong to the version set and are not modelled here.
+/// SST file. In-memory-only members modelled here: being_compacted, the newest key time and the sampled read stats
+/// (FileSampledStats); refs, the table reader pin and data-entry stats belong to the version set / table cache.
 /// </summary>
 public sealed class FileMetaData
 {
@@ -76,15 +76,38 @@ public sealed class FileMetaData
     /// <summary>In-memory only (FileMetaData::being_compacted): the file is an input of a running compaction. Guarded by the DB mutex.</summary>
     internal bool BeingCompacted { get; set; }
 
+    // FileSampledStats (db/version_edit.h), in memory only; updated with relaxed atomics by readers
+    // (monitoring/file_read_sample.h). Shared by every version that contains this file.
+    private long _numReadsSampled;
+    private long _numCollapsibleEntryReadsSampled;
+
+    /// <summary>FileSampledStats::num_reads_sampled: estimated number of user reads of this file (sampled).</summary>
+    public ulong NumReadsSampled => (ulong)Volatile.Read(ref _numReadsSampled);
+
+    /// <summary>
+    /// FileSampledStats::num_collapsible_entry_reads_sampled: estimated number of reads of this file that found a
+    /// deletion, single deletion or merge operand, or nothing (sampled). Drives read-triggered compaction.
+    /// </summary>
+    public ulong NumCollapsibleEntryReadsSampled => (ulong)Volatile.Read(ref _numCollapsibleEntryReadsSampled);
+
+    internal void AddReadsSampled(uint n) => Interlocked.Add(ref _numReadsSampled, n);
+    internal void AddCollapsibleEntryReadsSampled(uint n) => Interlocked.Add(ref _numCollapsibleEntryReadsSampled, n);
+
     /// <summary>PackFileNumberAndPathId.</summary>
     public ulong PackedNumberAndPathId => PackFileNumberAndPathId(FileNumber, PathId);
 
     public static ulong PackFileNumberAndPathId(ulong number, ulong pathId) => number | (pathId * (FileNumberMask + 1));
 
+    /// <summary>
+    /// A copy of the persisted metadata (trivial moves: upstream re-adds the file from its fields, so the in-memory
+    /// state -- being_compacted and the sampled read stats -- starts fresh).
+    /// </summary>
     public FileMetaData Clone()
     {
         var c = (FileMetaData)MemberwiseClone();
         c.BeingCompacted = false;
+        c._numReadsSampled = 0;
+        c._numCollapsibleEntryReadsSampled = 0;
         return c; // byte[] members are treated as immutable once assigned
     }
 

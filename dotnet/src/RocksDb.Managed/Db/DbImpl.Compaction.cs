@@ -88,11 +88,123 @@ internal sealed partial class DbImpl
             }
             MaybeScheduleCompaction();
         }
+        RescheduleCompactionTrigger();
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // periodic compaction trigger (PeriodicTaskType::kTriggerCompaction)
+
+    private Timer? _compactionTriggerTimer;
+    private ulong _compactionTriggerPeriod;
+
+    /// <summary>
+    /// Port of GetMinTimeBasedCompactionInterval (db/db_impl/db_impl.cc): the smallest time-based compaction interval of
+    /// a column family (periodic_compaction_seconds, ttl, the first FIFO temperature age), 0 if none.
+    /// (bottommost_file_compaction_delay is not an option of the managed port.)
+    /// </summary>
+    internal static ulong GetMinTimeBasedCompactionInterval(ColumnFamilyOptions o)
+    {
+        ulong minInterval = ulong.MaxValue;
+        if (o.PeriodicCompactionSeconds > 0) minInterval = Math.Min(minInterval, o.PeriodicCompactionSeconds);
+        if (o.Ttl > 0) minInterval = Math.Min(minInterval, o.Ttl);
+        List<FileTemperatureAge> fifoThresholds = o.CompactionOptionsFifo.FileTemperatureAgeThresholds;
+        // Thresholds are in increasing order by age, so first is smallest
+        if (fifoThresholds.Count > 0 && fifoThresholds[0].Age > 0) minInterval = Math.Min(minInterval, fifoThresholds[0].Age);
+        // Sentinel values like UINT64_MAX - 1 (ttl, periodic_compaction_seconds) are like disabling.
+        return minInterval > ulong.MaxValue / 2 ? 0 : minInterval;
+    }
+
+    /// <summary>Port of DBImpl::ComputeTriggerCompactionPeriod.</summary>
+    internal ulong ComputeTriggerCompactionPeriod()
+    {
+        // Start with the configured maximum, then reduce based on other options.
+        ulong periodSec = Options.MaxCompactionTriggerWakeupSeconds;
+        // Consider DB-level options that have the DB waking up periodically anyway.
+        if (Options.StatsDumpPeriodSec > 0) periodSec = Math.Min(periodSec, Options.StatsDumpPeriodSec);
+        if (Options.StatsPersistPeriodSec > 0) periodSec = Math.Min(periodSec, Options.StatsPersistPeriodSec);
+        // Consider per-CF settings that can trigger compaction based on time.
+        ulong compactionTriggerSec = ulong.MaxValue;
+        foreach (ColumnFamilyData cfd in GetColumnFamilies())
+        {
+            if (cfd.Dropped) continue;
+            ulong cfMin = GetMinTimeBasedCompactionInterval(cfd.Options);
+            if (cfMin > 0) compactionTriggerSec = Math.Min(compactionTriggerSec, cfMin);
+        }
+        // We might not align with those timings perfectly, so we tolerate only some proportional delay, up to
+        // 1/kTriggerDivisor ~= 20%.
+        const ulong TriggerDivisor = 5;
+        periodSec = Math.Min(periodSec, compactionTriggerSec / TriggerDivisor);
+        // But must be > 0
+        return Math.Max(periodSec, 1UL);
+    }
+
+    /// <summary>
+    /// (Re)arms the periodic compaction trigger with <see cref="ComputeTriggerCompactionPeriod"/> (DBImpl::
+    /// StartPeriodicTaskScheduler / the period updates of SetOptions, SetDBOptions and column family changes).
+    /// </summary>
+    private void RescheduleCompactionTrigger()
+    {
+        if (_readOnly) return;
+        ulong period = ComputeTriggerCompactionPeriod();
+        lock (_mutex)
+        {
+            if (_shuttingDown || !_compactionsEnabled) return;
+            if (_compactionTriggerTimer is not null && period == _compactionTriggerPeriod) return;
+            _compactionTriggerPeriod = period;
+            // Timer periods are limited to 0xfffffffe ms.
+            TimeSpan due = TimeSpan.FromMilliseconds(Math.Min((double)period * 1000, 0xfffffffe));
+            if (_compactionTriggerTimer is null)
+            {
+                _compactionTriggerTimer = new Timer(static s => ((DbImpl)s!).TriggerPeriodicCompaction(), this, due, due);
+            }
+            else
+            {
+                _compactionTriggerTimer.Change(due, due);
+            }
+        }
+    }
+
+    private void StopCompactionTrigger()
+    {
+        Timer? t;
+        lock (_mutex)
+        {
+            t = _compactionTriggerTimer;
+            _compactionTriggerTimer = null;
+        }
+        t?.Dispose();
+    }
+
+    /// <summary>
+    /// Port of DBImpl::TriggerPeriodicCompaction: re-evaluates the compaction score (expired TTL files, periodic
+    /// compaction, FIFO temperature, read-triggered files) of every column family with a time-based or read-triggered
+    /// compaction setting that is not already queued, and schedules the compactions that are now needed.
+    /// </summary>
+    internal void TriggerPeriodicCompaction()
+    {
+        if (IsDisposed) return;
+        TestHooks.Invoke("DBImpl::TriggerPeriodicCompaction:StartRunning");
+        lock (_mutex)
+        {
+            if (_shuttingDown) return;
+            foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
+            {
+                if (cfd.Dropped || cfd.CompactionState.QueuedForCompaction || cfd.Current is null) continue;
+                if (GetMinTimeBasedCompactionInterval(cfd.Options) > 0 || cfd.Options.ReadTriggeredCompactionThreshold > 0.0)
+                {
+                    cfd.Current.Storage.ComputeCompactionScore();
+                    SchedulePendingCompaction(cfd);
+                }
+            }
+            MaybeScheduleCompaction();
+            SignalBackgroundWork();
+        }
     }
 
     /// <summary>Asks running compactions to stop (shutdown).</summary>
     private void CancelBackgroundCompactions()
     {
+        StopCompactionTrigger();
         try
         {
             _bgCancellation.Cancel();

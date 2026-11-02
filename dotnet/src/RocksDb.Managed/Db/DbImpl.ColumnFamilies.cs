@@ -10,6 +10,7 @@ internal sealed partial class DbImpl
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
         ColumnFamilyData cfd = await CreateColumnFamilyCoreAsync(name, options, writeOptionsFile: true, synchronous, ct).ConfigureAwait(false);
+        RescheduleCompactionTrigger();
         return cfd;
     }
 
@@ -92,6 +93,7 @@ internal sealed partial class DbImpl
             ExitUnbatched(w, synchronous);
         }
         PurgeObsoleteFiles();
+        RescheduleCompactionTrigger();
         await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
     }
 

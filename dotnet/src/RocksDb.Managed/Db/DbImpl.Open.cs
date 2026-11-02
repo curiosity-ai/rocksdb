@@ -231,6 +231,7 @@ internal sealed partial class DbImpl
                 ThrowHelper.InvalidArgument("The garbage ratio threshold for forcing blob garbage collection should be in the range [0.0, 1.0].");
             }
         }
+        ValidateReadTriggeredCompactionThreshold(o);
         return o;
     }
 

@@ -377,6 +377,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                             Temperature = f.Temperature,
                             OldestAncestorTime = f.OldestAncestorTime,
                             FileCreationTime = f.FileCreationTime,
+                            NumReadsSampled = f.NumReadsSampled,
                         });
                     }
                 }

@@ -165,6 +165,16 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public List<CompressionType> CompressionPerLevel { get; set; } = new();
     public ulong SampleForCompression { get; set; }
 
+    /// <summary>
+    /// read_triggered_compaction_threshold (EXPERIMENTAL): a file whose sampled reads that found a tombstone, a merge
+    /// operand or nothing (collapsible-entry reads), per byte of file size, exceed this ratio is compacted to the next
+    /// level (leveled and universal; FIFO ignores it). Must be &gt;= 0 and finite; 0 (default) disables it. A starting
+    /// point upstream recommends is 0.01. Files are re-evaluated when a new version is installed and by the periodic
+    /// compaction trigger (<see cref="DbOptions.MaxCompactionTriggerWakeupSeconds"/>), so a DB that only serves reads
+    /// picks them up within that period. Dynamically changeable through SetOptions.
+    /// </summary>
+    public double ReadTriggeredCompactionThreshold { get; set; }
+
     // ---- LSM shape / compaction --------------------------------------------------------------
     public int NumLevels { get; set; } = 7;
     public int Level0FileNumCompactionTrigger { get; set; } = 4;
@@ -299,6 +309,8 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .Add("compression_per_level", static o => FormatCompressionList(o.CompressionPerLevel),
             static (o, v) => o.CompressionPerLevel = ParseCompressionList(v))
         .UInt64("sample_for_compression", static o => o.SampleForCompression, static (o, v) => o.SampleForCompression = v)
+        .Double("read_triggered_compaction_threshold", static o => o.ReadTriggeredCompactionThreshold,
+            static (o, v) => o.ReadTriggeredCompactionThreshold = v)
         .Int32("num_levels", static o => o.NumLevels, static (o, v) => o.NumLevels = v)
         .Int32("level0_file_num_compaction_trigger", static o => o.Level0FileNumCompactionTrigger, static (o, v) => o.Level0FileNumCompactionTrigger = v)
         .Int32("level0_slowdown_writes_trigger", static o => o.Level0SlowdownWritesTrigger, static (o, v) => o.Level0SlowdownWritesTrigger = v)

@@ -73,6 +73,16 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     public bool IsFdCloseOnExec { get; set; } = true;
     public uint StatsDumpPeriodSec { get; set; } = 600;
     public uint StatsPersistPeriodSec { get; set; } = 600;
+
+    /// <summary>
+    /// max_compaction_trigger_wakeup_seconds: upper bound of the period of the background task that re-evaluates
+    /// time-based and read-triggered compaction (TTL, periodic compaction, FIFO temperature changes,
+    /// read_triggered_compaction_threshold) on DBs that receive no writes. The period is reduced to align with
+    /// stats_dump_period_sec / stats_persist_period_sec and to a fifth of the smallest time-based compaction interval of
+    /// any column family; it is at least 1 second (0 polls every second). Default 43200 (12 hours). Dynamically
+    /// changeable through SetDBOptions.
+    /// </summary>
+    public ulong MaxCompactionTriggerWakeupSeconds { get; set; } = 43200;
     public bool PersistStatsToDisk { get; set; }
     public ulong StatsHistoryBufferSize { get; set; } = 1024 * 1024;
     public bool AdviseRandomOnOpen { get; set; } = true;
@@ -156,6 +166,8 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
         .Bool("is_fd_close_on_exec", static o => o.IsFdCloseOnExec, static (o, v) => o.IsFdCloseOnExec = v)
         .UInt32("stats_dump_period_sec", static o => o.StatsDumpPeriodSec, static (o, v) => o.StatsDumpPeriodSec = v)
         .UInt32("stats_persist_period_sec", static o => o.StatsPersistPeriodSec, static (o, v) => o.StatsPersistPeriodSec = v)
+        .UInt64("max_compaction_trigger_wakeup_seconds", static o => o.MaxCompactionTriggerWakeupSeconds,
+            static (o, v) => o.MaxCompactionTriggerWakeupSeconds = v)
         .Bool("persist_stats_to_disk", static o => o.PersistStatsToDisk, static (o, v) => o.PersistStatsToDisk = v)
         .UInt64("stats_history_buffer_size", static o => o.StatsHistoryBufferSize, static (o, v) => o.StatsHistoryBufferSize = v)
         .Bool("advise_random_on_open", static o => o.AdviseRandomOnOpen, static (o, v) => o.AdviseRandomOnOpen = v)
