@@ -1,5 +1,8 @@
 # Benchmarks
 
+Reference for the benchmark runner. [docs/benchmarks.md](../docs/benchmarks.md) explains the methodology, how to
+read a report and the latest results.
+
 Three ways to measure RocksDb.Managed against native RocksDB:
 
 | leg | what | where |

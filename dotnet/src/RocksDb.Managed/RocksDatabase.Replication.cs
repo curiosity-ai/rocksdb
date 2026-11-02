@@ -24,13 +24,16 @@ public sealed partial class RocksDatabase
         return new RocksDatabase(t.IsCompleted ? t.Result : t.AsTask().GetAwaiter().GetResult());
     }
 
+    /// <summary>Opens the DB read-only with only the default column family; WAL files are allowed and replayed.</summary>
     public static RocksDatabase OpenReadOnly(string path, DbOptions options) =>
         OpenReadOnly(path, options, [new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, new ColumnFamilyOptions())], false);
 
+    /// <summary>Async <see cref="OpenReadOnly(string, DbOptions, IReadOnlyList{ColumnFamilyDescriptor}, bool)"/>.</summary>
     public static async ValueTask<RocksDatabase> OpenReadOnlyAsync(string path, DbOptions options, IReadOnlyList<ColumnFamilyDescriptor> columnFamilies,
         bool errorIfWalFileExists, CancellationToken cancellationToken = default) =>
         new(await DbImpl.OpenReadOnlyAsync(path, options, columnFamilies, errorIfWalFileExists, null, synchronous: false, cancellationToken).ConfigureAwait(false));
 
+    /// <summary>Async <see cref="OpenReadOnly(string, DbOptions)"/>.</summary>
     public static ValueTask<RocksDatabase> OpenReadOnlyAsync(string path, DbOptions options, CancellationToken cancellationToken = default) =>
         OpenReadOnlyAsync(path, options, [new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, new ColumnFamilyOptions())], false,
             cancellationToken);
@@ -48,6 +51,7 @@ public sealed partial class RocksDatabase
             .ConfigureAwait(false));
     }
 
+    /// <summary>Opens a secondary instance with only the default column family (see the overload with column families).</summary>
     public static ValueTask<RocksDatabase> OpenAsSecondaryAsync(string path, string secondaryPath, DbOptions options,
         CancellationToken cancellationToken = default) =>
         OpenAsSecondaryAsync(path, secondaryPath, options,
@@ -73,6 +77,7 @@ public sealed partial class RocksDatabase
     public ValueTask TryCatchUpWithPrimaryAsync(CancellationToken cancellationToken = default) =>
         _db.TryCatchUpWithPrimaryAsync(synchronous: false, cancellationToken);
 
+    /// <summary>Synchronous <see cref="TryCatchUpWithPrimaryAsync"/>.</summary>
     public void TryCatchUpWithPrimary()
     {
         ValueTask t = _db.TryCatchUpWithPrimaryAsync(synchronous: true, CancellationToken.None);
@@ -97,6 +102,7 @@ public sealed partial class RocksDatabase
     /// </summary>
     public TransactionLogIterator GetUpdatesSince(ulong sequenceNumber) => _db.GetUpdatesSince(sequenceNumber, verifyChecksums: true);
 
+    /// <summary><see cref="GetUpdatesSince(ulong)"/>, optionally without verifying record checksums.</summary>
     public TransactionLogIterator GetUpdatesSince(ulong sequenceNumber, bool verifyChecksums) => _db.GetUpdatesSince(sequenceNumber, verifyChecksums);
 
     /// <summary>
@@ -167,11 +173,13 @@ public sealed partial class RocksDatabase
     /// <summary>Writes buffered WAL data to the OS (manual_wal_flush) and, with <paramref name="sync"/>, fsyncs it (DB::FlushWAL).</summary>
     public void FlushWal(bool sync) => _db.FlushWalAsync(sync, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
 
+    /// <summary>Async <see cref="FlushWal(bool)"/>.</summary>
     public ValueTask FlushWalAsync(bool sync, CancellationToken cancellationToken = default) => _db.FlushWalAsync(sync, synchronous: false, cancellationToken);
 
     /// <summary>fsyncs the WAL (DB::SyncWAL).</summary>
     public void SyncWal() => FlushWal(sync: true);
 
+    /// <summary>Async <see cref="SyncWal"/>.</summary>
     public ValueTask SyncWalAsync(CancellationToken cancellationToken = default) => FlushWalAsync(sync: true, cancellationToken);
 
     // =====================================================================================================
@@ -201,6 +209,7 @@ public sealed partial class RocksDatabase
     public async ValueTask<(List<string> Files, ulong ManifestFileSize)> GetLiveFilesAsync(bool flushMemtable, CancellationToken cancellationToken = default) =>
         await _db.GetLiveFilesAsync(flushMemtable, synchronous: false, cancellationToken).ConfigureAwait(false);
 
+    /// <summary>Synchronous <see cref="GetLiveFilesAsync"/>.</summary>
     public List<string> GetLiveFiles(bool flushMemtable, out ulong manifestFileSize)
     {
         ValueTask<(List<string> Files, ulong ManifestFileSize)> t = _db.GetLiveFilesAsync(flushMemtable, synchronous: true, CancellationToken.None);
@@ -231,15 +240,18 @@ public sealed partial class RocksDatabase
     public ValueTask<ulong> CreateCheckpointAsync(string checkpointDir, ulong logSizeForFlush, CancellationToken cancellationToken = default) =>
         _db.CreateCheckpointAsync(checkpointDir, logSizeForFlush, synchronous: false, cancellationToken);
 
+    /// <summary>Creates a checkpoint, always flushing the memtables first (logSizeForFlush = 0).</summary>
     public ValueTask<ulong> CreateCheckpointAsync(string checkpointDir, CancellationToken cancellationToken = default) =>
         _db.CreateCheckpointAsync(checkpointDir, 0, synchronous: false, cancellationToken);
 
+    /// <summary>Synchronous <see cref="CreateCheckpointAsync(string, ulong, CancellationToken)"/>.</summary>
     public ulong CreateCheckpoint(string checkpointDir, ulong logSizeForFlush)
     {
         ValueTask<ulong> t = _db.CreateCheckpointAsync(checkpointDir, logSizeForFlush, synchronous: true, CancellationToken.None);
         return t.IsCompleted ? t.Result : t.AsTask().GetAwaiter().GetResult();
     }
 
+    /// <summary>Creates a checkpoint, always flushing the memtables first (logSizeForFlush = 0).</summary>
     public ulong CreateCheckpoint(string checkpointDir) => CreateCheckpoint(checkpointDir, 0);
 
     // =====================================================================================================
@@ -253,6 +265,7 @@ public sealed partial class RocksDatabase
     public ValueTask IngestExternalFilesAsync(IReadOnlyList<string> files, IngestExternalFileOptions options, CancellationToken cancellationToken = default) =>
         _db.IngestExternalFilesAsync(_default.Data, files, options, synchronous: false, cancellationToken);
 
+    /// <summary>Ingests external SST files into <paramref name="columnFamily"/> (DB::IngestExternalFile).</summary>
     public ValueTask IngestExternalFilesAsync(ColumnFamily columnFamily, IReadOnlyList<string> files, IngestExternalFileOptions options,
         CancellationToken cancellationToken = default)
     {
@@ -260,9 +273,11 @@ public sealed partial class RocksDatabase
         return _db.IngestExternalFilesAsync(columnFamily.Data, files, options, synchronous: false, cancellationToken);
     }
 
+    /// <summary>Synchronous <see cref="IngestExternalFilesAsync(IReadOnlyList{string}, IngestExternalFileOptions, CancellationToken)"/>.</summary>
     public void IngestExternalFiles(IReadOnlyList<string> files, IngestExternalFileOptions options) =>
         IngestExternalFiles(_default, files, options);
 
+    /// <summary>Synchronous ingestion of external SST files into <paramref name="columnFamily"/>.</summary>
     public void IngestExternalFiles(ColumnFamily columnFamily, IReadOnlyList<string> files, IngestExternalFileOptions options)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
