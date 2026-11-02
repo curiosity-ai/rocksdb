@@ -41,7 +41,7 @@ while the bytes may differ (for example, because a compressor makes different ch
 | Compression: Snappy, LZ4, LZ4HC, ZSTD, Zlib | yes | yes | read + write; ZSTD (with dictionaries) byte-identical; see deviations below |
 | Compression: BZip2, Xpress | no | n/a | a configured BZip2/Xpress type stores blocks uncompressed |
 | Integrated BlobDB (blob files, blob GC) | yes | yes | blob files byte-identical |
-| Wide columns (`PutEntity`, V1 entities) | yes | yes | compaction filters on entities (`FilterV3`, `kChangeWideColumnEntity`) |
+| Wide columns (`PutEntity`, V1 entities) | yes | yes | compaction filters on entities (`FilterV3`, `FilterV4` with a lazy blob resolver, `kChangeWideColumnEntity`); `MultiGetEntity`, attribute groups, coalescing / attribute-group iterators, lazy entity reads (`GetEntityLazy`) |
 | Wide-column entities with blob-backed columns (V2 entities) | yes | yes | written by flush/compaction value separation and blob direct write; blob GC and garbage accounting of entity columns |
 | Blob direct write (`enable_blob_direct_write`, partitions) | yes | yes | needs RocksDB with blob direct write (librocksdb 11.12 has it); off by default; like upstream v1, blob files not registered by a flush before a crash are not recovered |
 | User-defined timestamps (persisted) | yes | yes | timestamped writes byte-identical; `full_history_ts_low` GC; timestamped range deletions and `SstFileWriter` files |
@@ -554,6 +554,41 @@ Console.WriteLine(System.Text.Encoding.UTF8.GetString(db.Get("user:1"u8)!));   /
 using Iterator it = db.NewIterator();
 for (it.SeekToFirst(); it.Valid; it.Next())
     if (it.IsEntity) Console.WriteLine(it.Columns.Count);           // 3
+```
+
+### Attribute groups, MultiGetEntity and lazy entity reads
+
+<!-- snippet:attribute-groups -->
+```csharp
+// One logical row split across column families, written atomically.
+db.PutAttributeGroups("user:1"u8,
+[
+    new AttributeGroup(profile, new[] { new WideColumn("name"u8.ToArray(), "alice"u8.ToArray()) }),
+    new AttributeGroup(media, new[] { new WideColumn("avatar"u8.ToArray(), new byte[4096]) }),
+]);
+
+// Read the groups back (one consistent view); the result objects are reusable.
+PinnableAttributeGroup[] groups = [new(profile), new(media)];
+db.GetAttributeGroups(null, "user:1"u8, groups);
+Console.WriteLine(groups[1].Columns.Count);                        // 1
+
+// Batched entity reads on one column family.
+using var batch = new MultiGetBatch();
+batch.Add("user:1"u8);
+var columns = new WideColumns();
+profile.MultiGetEntity(batch);
+if (batch.TryGetEntity(0, columns)) Console.WriteLine(columns.Count);   // 1
+
+// Iterate rows across column families: columns of later families shadow earlier ones.
+using (CoalescingIterator rows = db.NewCoalescingIterator(null, [profile, media]))
+    for (rows.SeekToFirst(); rows.Valid; rows.Next())
+        Console.WriteLine(rows.Columns.Count);                     // 2
+
+// Lazy read: blob-backed columns are fetched only when pulled, in whole or by byte range.
+media.Flush();
+using LazyWideColumns? lazy = media.GetEntityLazy(null, "user:1"u8);
+Span<byte> header = stackalloc byte[16];
+int read = lazy!.ReadColumnRange(lazy.IndexOf("avatar"u8), 0, header);   // reads 16 bytes, not 4 KiB
 ```
 
 ### User-defined timestamps

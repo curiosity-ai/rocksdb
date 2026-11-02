@@ -254,6 +254,99 @@ public sealed class EntityBlobCompatTests
         }
     }
 
+    /// <summary>
+    /// FilterV4 lazy filter: removes entities whose blob-backed "zlarge" column starts with 'c' (only that column is read)
+    /// and rewrites those starting with 'd' to a single default column.
+    /// </summary>
+    private sealed class LazyZLargeFilter : CompactionFilter
+    {
+        public int Resolved;
+        public override string Name => "LazyZLarge";
+        public override bool SupportsFilterV4 => true;
+
+        public override CompactionFilterDecision Filter(int level, ReadOnlySpan<byte> key, CompactionFilterValueType valueType,
+            ReadOnlySpan<byte> existingValue, IBufferWriter<byte> newValue, IBufferWriter<byte> skipUntil) => CompactionFilterDecision.Keep;
+
+        public override CompactionFilterDecision FilterV4(int level, ReadOnlySpan<byte> key, CompactionFilterValueType valueType,
+            ReadOnlySpan<byte> existingValue, WideColumns? existingColumns, IBufferWriter<byte> newValue, List<WideColumn> newColumns,
+            IBufferWriter<byte> skipUntil, WideColumnBlobResolver? blobResolver)
+        {
+            if (valueType != CompactionFilterValueType.WideColumnEntity || blobResolver is null) return CompactionFilterDecision.Keep;
+            int z = existingColumns!.Count - 1; // "zlarge" sorts last
+            Assert.IsTrue(blobResolver.IsBlobColumn(z));
+            ReadOnlySpan<byte> v = blobResolver.ResolveColumn(z);
+            Resolved++;
+            // Entity(i, tag): zlarge = tag + letters; the letter follows the 2-char tag.
+            if (v[2] == (byte)'c') return CompactionFilterDecision.Remove;
+            if (v[2] == (byte)'d')
+            {
+                newColumns.Add(C("", "rewritten"));
+                return CompactionFilterDecision.ChangeWideColumnEntity;
+            }
+            return CompactionFilterDecision.Keep;
+        }
+    }
+
+    /// <summary>
+    /// Native-written version 2 entities through the managed lazy APIs: GetEntityLazy (partial range reads of the blob
+    /// columns), MultiGetEntityLazy and a FilterV4 compaction filter that resolves only one blob column; native then
+    /// reads the filtered result.
+    /// </summary>
+    [TestMethod]
+    public void NativeV2EntitiesLazyReadsAndFilterV4ByManaged()
+    {
+        using var dir = new TempDir("ent-blob-lazy");
+        var model = new Dictionary<string, WideColumn[]?>();
+        using (RocksDbSharp.RocksDb db = OpenNative(dir.Path))
+        {
+            PutEntities(db, model, 0, 60, "n1");
+            db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+        }
+        Assert.IsTrue(CountV2EntitiesInTables(dir.Path) >= 60);
+        var filter = new LazyZLargeFilter();
+        using (RocksDatabase db = RocksDatabase.Open(dir.Path, new DbOptions(),
+                   [new("default", new ColumnFamilyOptions { EnableBlobFiles = true, MinBlobSize = MinBlobSize, BlobFileSize = 16 * 1024, MergeOperator = new StringAppend(), CompactionFilter = filter })]))
+        {
+            ColumnFamily cf = db.DefaultColumnFamily;
+            using var lazy = new LazyWideColumns();
+            Span<byte> buf = stackalloc byte[8];
+            for (int i = 0; i < 60; i++)
+            {
+                WideColumn[] cols = model[Key(i)]!;
+                Assert.IsTrue(cf.TryGetEntityLazy(null, U(Key(i)), lazy));
+                Assert.AreEqual(3, lazy.Count);
+                Assert.IsTrue(lazy.IsReference(2), "zlarge is blob-backed");
+                ReadOnlySpan<byte> expected = cols[2].Value.Span;
+                int n = lazy.ReadColumnRange(2, 3, buf);
+                Assert.IsTrue(expected.Slice(3, n).SequenceEqual(buf[..n]));
+                Assert.IsTrue(expected.SequenceEqual(lazy.ResolveColumn(2)));
+                Assert.IsTrue(cols[0].Value.Span.SequenceEqual(lazy.ResolveColumn(0)));
+                Assert.IsTrue(lazy.TryGetInlineValue(1, out ReadOnlySpan<byte> small));
+                Assert.IsTrue(cols[1].Value.Span.SequenceEqual(small));
+            }
+            using var keys = new MultiGetBatch();
+            keys.Add(U(Key(7))).Add(U("missing"));
+            using var batch = new LazyWideColumnsBatch();
+            cf.MultiGetEntityLazy(null, keys, batch);
+            Assert.IsTrue(model[Key(7)]![2].Value.Span.SequenceEqual(batch[0].ResolveColumn(2)));
+            Assert.AreEqual(MultiGetStatus.NotFound, batch.GetStatus(1));
+            batch.Reset();
+            db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+            Assert.IsTrue(filter.Resolved >= 60, "every entity reached FilterV4 with a resolver");
+            for (int i = 0; i < 60; i++)
+            {
+                char letter = (char)('a' + i % 26);
+                if (letter == 'c') model[Key(i)] = null;
+                else if (letter == 'd') model[Key(i)] = [C("", "rewritten")];
+            }
+            VerifyManaged(db, model, "managed after FilterV4");
+        }
+        using (RocksDbSharp.RocksDb db = OpenNative(dir.Path))
+        {
+            VerifyNative(db, model, "native reads FilterV4 output");
+        }
+    }
+
     private sealed class StringAppend : MergeOperator
     {
         public override string Name => "StringAppendOperator";

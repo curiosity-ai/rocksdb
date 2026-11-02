@@ -28,6 +28,7 @@ internal static class Program
         ("TwoPhaseCommit", Transactions.TwoPhaseCommit),
         ("WriteBatchWithIndex", Transactions.WriteBatchWithIndexExample),
         ("WideColumns", DataModels.WideColumns),
+        ("AttributeGroups", DataModels.AttributeGroups),
         ("UserDefinedTimestamps", DataModels.UserDefinedTimestamps),
         ("BlobFiles", DataModels.BlobFiles),
         ("Ttl", DataModels.Ttl),

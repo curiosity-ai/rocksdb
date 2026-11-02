@@ -502,13 +502,19 @@ public sealed class MergeHelper : IDisposable
         _operands.Reset(_mergeResult.WrittenSpan);
     }
 
+    private List<WideColumn>? _filterNewColumns;
+
     /// <summary>Port of MergeHelper::FilterMerge.</summary>
     private CompactionFilterDecision FilterMerge(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> value)
     {
         if (_compactionFilter is null) return CompactionFilterDecision.Keep;
         _filterValue.Clear();
         _skipUntilUser.Clear();
-        CompactionFilterDecision ret = _compactionFilter.Filter(_level, userKey, CompactionFilterValueType.MergeOperand, value, _filterValue, _skipUntilUser);
+        List<WideColumn> newColumns = _filterNewColumns ??= new List<WideColumn>();
+        newColumns.Clear();
+        // FilterV4 (default: FilterV3 -> FilterV2/Filter) with existing_columns, new_columns and blob_resolver unused.
+        CompactionFilterDecision ret = _compactionFilter.FilterV4(_level, userKey, CompactionFilterValueType.MergeOperand, value, null, _filterValue,
+            newColumns, _skipUntilUser, null);
         if (ret == CompactionFilterDecision.RemoveAndSkipUntil)
         {
             if (_icmp.CompareUserKey(_skipUntilUser.WrittenSpan, userKey) <= 0)

@@ -21,13 +21,13 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (221 files, about 68,000 lines):
+Summary (226 files, about 69,200 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
-| line-by-line (feature audits) | 49 |
+| line-by-line (feature audits) | 54 |
 | line-by-line (#3) | 17 |
 | line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
@@ -65,6 +65,7 @@ changes there need their own review.
 | `RocksDb.Managed.Replication/Switchover/PrimaryWriteGate.cs` | 124 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
 | `RocksDb.Managed.Replication/Switchover/ReplicationRoleState.cs` | 227 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
 | `RocksDb.Managed.Replication/Switchover/SwitchoverNode.cs` | 542 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
+| `AttributeGroups.cs` | 286 | include/rocksdb/attribute_groups.h, db/db_impl/db_impl.cc, db/db_impl/db_impl_write.cc | line-by-line (feature audit: user features (wide-column APIs)) |
 | `Cache/BlockCache.cs` | 327 | include/rocksdb/advanced_cache.h | line-by-line (#1) |
 | `Cache/CacheKey.cs` | 231 | cache/cache_key.h, cache/cache_key.{h,cc}, table/unique_id.cc | line-by-line (#1) |
 | `Cache/HyperClockCache.cs` | 796 | include/rocksdb/cache.h, cache/clock_cache.{h,cc} | line-by-line (#3): FixedHyperClockTable / BaseClockTable (meta word, probing, eviction, strict/non-strict charging, standalone); compaction-features pass: eviction_effort_cap, CalcHashBits overshoot clamp, table metadata charged up front |
@@ -89,6 +90,7 @@ changes there need their own review.
 | `Db/Blob/BlobLogFormat.cs` | 130 | db/blob/blob_log_format.{h,cc} | line-by-line (feature audit: integrated BlobDB (+ #3 re-check)) |
 | `Db/Blob/BlobSource.cs` | 353 | db/blob/blob_source.cc, db/blob/blob_file_cache.cc, db/version_set.cc | line-by-line (feature audit: integrated BlobDB) |
 | `Db/Blob/CompactionBlobProcessor.cs` | 110 | db/compaction/compaction_iterator.cc, db/blob/blob_fetcher.cc | line-by-line (feature audit: integrated BlobDB) |
+| `Db/Blob/CompactionBlobResolver.cs` | 97 | db/compaction/compaction_iterator.{h,cc} (CompactionBlobResolver) | line-by-line (feature audit: user features (wide-column APIs)) |
 | `Db/ColumnFamilyData.cs` | 257 | db/memtable_list.h, db/column_family.h, db/column_family.cc | line-by-line (#2) |
 | `Db/Compaction/ColumnFamilyCompactionState.cs` | 34 | db/compaction/compaction_picker.h (NullCompactionPicker), db/column_family.h | line-by-line (#2) |
 | `Db/Compaction/Compaction.cs` | 446 | include/rocksdb/listener.h, db/compaction/compaction.{h,cc} | line-by-line (#2); #3: MaxOutputFileSize, MaxInputFileNewestKeyTime (new), MinInputFileOldestAncestorTime; compaction-features pass: output_split_key_, CreateSstPartitioner, IsTrivialMove partitioner check, GetOutputTemperature inputs |
@@ -108,6 +110,7 @@ changes there need their own review.
 | `Db/DbImpl.Comparators.cs` | 136 | db/version_edit_handler.cc, db/version_builder.cc, util/udt_util.cc | line-by-line (feature audit: user features (comparators) + UDT memtable-only) |
 | `Db/DbImpl.Flush.cs` | 418 | db/db_impl/db_impl_compaction_flush.cc (flush), db/flush_job.cc | line-by-line (#2) |
 | `Db/DbImpl.Ingest.cs` | 107 | db/db_impl/db_impl.cc | line-by-line (#2) |
+| `Db/DbImpl.LazyEntity.cs` | 34 | db/db_impl/db_impl.cc (GetEntityLazyImpl / GetEntityLazyForBatch) | line-by-line (feature audit: user features (wide-column APIs)) |
 | `Db/DbImpl.Monitoring.cs` | 420 | db/event_helpers.cc | line-by-line (feature audit: user features (LOG)) |
 | `Db/DbImpl.MultiGet.cs` | 234 | db/db_impl/db_impl.cc, db/version_set.cc | line-by-line (feature audit: UDT / MultiGet (+ #3 read-sequence rule)) |
 | `Db/DbImpl.Open.cs` | 596 | db/db_impl/db_impl_open.cc | line-by-line (#2); #3: fixed WAL checksum, blob GC option validation, FIFO TTL reader preload |
@@ -141,6 +144,7 @@ changes there need their own review.
 | `Db/Iterators/LevelIterator.cs` | 384 | db/version_set.cc | line-by-line (#1) |
 | `Db/Iterators/MemTableInternalIterator.cs` | 45 | db/memtable.cc | line-by-line (#1) |
 | `Db/Iterators/MergingIterator.cs` | 363 | table/merging_iterator.cc | line-by-line (#1) |
+| `Db/Iterators/MultiCfIterator.cs` | 335 | db/multi_cf_iterator_impl.h, db/coalescing_iterator.{h,cc}, db/attribute_group_iterator_impl.{h,cc} | line-by-line (feature audit: user features (wide-column APIs)) |
 | `Db/Iterators/TableInternalIterator.cs` | 126 | table/block_based/block_based_table_iterator.cc | line-by-line (#1) |
 | `Db/Manifest.cs` | 608 | db/log_reader.cc, db/log_writer.cc, db/blob/blob_file_meta.h | line-by-line (#1) |
 | `Db/ManifestLog.cs` | 84 | db/version_set.cc | line-by-line (#1) |
@@ -173,6 +177,7 @@ changes there need their own review.
 | `Env/LocalFileSystem.cs` | 1021 | env/fs_posix.cc, env/io_posix.cc, file/writable_file_writer.cc | managed-only, design-reviewed (#3): POSIX/Windows file system: rename(2) overwrite, fdatasync, dir fsync, OFD LOCK, truncate-on-close |
 | `Env/MemoryFileSystem.cs` | 491 | env/mock_env.cc, utilities/fault_injection_fs.{h,cc} | managed-only, design-reviewed (#3): in-memory FS for tests (mock_env idea), crash simulation |
 | `Env/UnixNative.cs` | 431 | env/io_posix.cc, env/fs_posix.cc | managed-only, design-reviewed (#3): P/Invoke (fdatasync, fsync dir, OFD locks, preadv2/pwritev2) |
+| `LazyWideColumns.cs` | 483 | include/rocksdb/lazy_wide_columns.h, db/wide/lazy_wide_columns.cc, db/wide/read_path_blob_resolver.cc | line-by-line (feature audit: user features (wide-column APIs)) |
 | `Logging/FileInfoLogger.cs` | 233 | logging/auto_roll_logger.cc, logging/env_logger.h | line-by-line (feature audit: user features (LOG)) |
 | `Logging/InfoLogger.cs` | 72 | include/rocksdb/env.h, env/env.cc | line-by-line (feature audit: user features (LOG)) |
 | `Memory/Arena.cs` | 225 | memory/allocator.h, memory/arena.h, memory/arena.cc | line-by-line (#1) |

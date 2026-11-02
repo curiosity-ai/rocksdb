@@ -71,6 +71,22 @@ public sealed class WideColumns : IReadOnlyList<WideColumn>
         WideColumnSerialization.Deserialize(_buffer.AsSpan(0, _length), _slots);
     }
 
+    /// <summary>
+    /// Like <see cref="SetSerialized"/> but blob-backed (version 2 kTypeBlobIndex) columns are kept with their serialized
+    /// blob index as value (WideColumnSerialization::Deserialize with blob_columns). Returns whether any column is
+    /// blob-backed.
+    /// </summary>
+    internal bool SetSerializedWithBlobColumns(ReadOnlySpan<byte> entity)
+    {
+        if (_buffer.Length < entity.Length) _buffer = new byte[Math.Max(entity.Length, _buffer.Length * 2)];
+        entity.CopyTo(_buffer);
+        _length = entity.Length;
+        return WideColumnSerialization.DeserializeWithBlobColumns(_buffer.AsSpan(0, _length), _slots);
+    }
+
+    /// <summary>True if column <paramref name="index"/> holds a serialized blob index (see <see cref="SetSerializedWithBlobColumns"/>).</summary>
+    internal bool IsBlobIndex(int index) => _slots[index].IsBlobIndex;
+
     internal void Clear()
     {
         _length = 0;

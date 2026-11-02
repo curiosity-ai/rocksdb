@@ -349,10 +349,14 @@ internal sealed class CompactionIterator : IDisposable
     private WideColumns? _filterColumns;
     private List<WideColumn>? _filterNewColumns;
 
+    private Blob.CompactionBlobResolver? _filterBlobResolver;
+
     /// <summary>
-    /// Port of InvokeFilterIfNeeded: plain values, blob values of the integrated BlobDB (the blob is read and the filter
-    /// sees it as a plain value) and wide-column entities (FilterV3 with the columns; blob-backed columns are resolved
-    /// eagerly, the FilterV3 compatibility path of FilterV4).
+    /// Port of InvokeFilterIfNeeded: plain values, blob values of the integrated BlobDB (FilterBlobByKey first; when
+    /// undetermined the blob is read and the filter sees it as a plain value) and wide-column entities. Entities with
+    /// blob-backed columns get a lazy <see cref="WideColumnBlobResolver"/> when the filter
+    /// <see cref="CompactionFilter.SupportsFilterV4"/> (columns carry their blob index); otherwise their blob columns are
+    /// resolved eagerly (the FilterV3 compatibility path of FilterV4).
     /// </summary>
     private void InvokeFilterIfNeeded(ref bool needSkip)
     {
@@ -362,35 +366,77 @@ internal sealed class CompactionIterator : IDisposable
         ReadOnlySpan<byte> userKey = _currentKey.UserKey;
         ReadOnlySpan<byte> existing = _input.Value;
         CompactionFilterValueType valueType = CompactionFilterValueType.Value;
+        CompactionFilterDecision decision = CompactionFilterDecision.Undetermined;
         WideColumns? columns = null;
+        Blob.CompactionBlobResolver? resolver = null;
+        _filterNewColumns?.Clear();
         if (_ikeyType == EntryType.BlobIndex)
         {
-            // For the integrated BlobDB the compaction iterator reads the blob (FilterBlobByKey is not ported).
-            if (BlobProcessor is null)
+            decision = _compactionFilter.FilterBlobByKey(_level, userKey, _filterValue, _filterSkipUntil);
+            if (decision == CompactionFilterDecision.Undetermined)
             {
-                ThrowHelper.NotSupported("Blob-backed value filtering requires blob read support in the current table-file creation context");
-            }
-            existing = BlobProcessor!.FetchBlobForFilter(userKey, existing);
-        }
-        else if (_ikeyType == EntryType.WideColumnEntity)
-        {
-            if (Wide.WideColumnSerialization.HasBlobColumns(existing))
-            {
+                // For the integrated BlobDB the compaction iterator reads the blob.
                 if (BlobProcessor is null)
                 {
                     ThrowHelper.NotSupported("Blob-backed value filtering requires blob read support in the current table-file creation context");
                 }
-                existing = BlobProcessor!.ResolveEntityForFilter(userKey, existing);
+                existing = BlobProcessor!.FetchBlobForFilter(userKey, existing);
             }
+        }
+        else if (_ikeyType == EntryType.WideColumnEntity)
+        {
             columns = _filterColumns ??= new WideColumns();
-            columns.SetSerialized(existing);
+            if (Wide.WideColumnSerialization.HasBlobColumns(existing))
+            {
+                if (_compactionFilter.SupportsFilterV4)
+                {
+                    // Lazy: blob columns keep their blob index; the filter resolves what it needs.
+                    columns.SetSerializedWithBlobColumns(existing);
+                    resolver = _filterBlobResolver ??= new Blob.CompactionBlobResolver(BlobProcessor);
+                    resolver.Reset(userKey, columns);
+                }
+                else
+                {
+                    if (BlobProcessor is null)
+                    {
+                        ThrowHelper.NotSupported("Blob-backed value filtering requires blob read support in the current table-file creation context");
+                    }
+                    columns.SetSerialized(BlobProcessor!.ResolveEntityForFilter(userKey, existing));
+                }
+            }
+            else
+            {
+                columns.SetSerialized(existing);
+            }
             existing = default;
             valueType = CompactionFilterValueType.WideColumnEntity;
         }
-        List<WideColumn> newColumns = _filterNewColumns ??= new List<WideColumn>();
-        newColumns.Clear();
-        CompactionFilterDecision decision = _compactionFilter.FilterV3(_level, userKey, valueType, existing, columns, _filterValue, newColumns,
-            _filterSkipUntil);
+        if (decision == CompactionFilterDecision.Undetermined)
+        {
+            List<WideColumn> newColumns = _filterNewColumns ??= new List<WideColumn>();
+            try
+            {
+                decision = _compactionFilter.FilterV4(_level, userKey, valueType, existing, columns, _filterValue, newColumns, _filterSkipUntil,
+                    resolver);
+                // Lazy FilterV4 failure semantics match the eager path: a blob read failure fails the compaction even if
+                // the filter noticed it and returned kKeep.
+                if (resolver?.ResolveError is { } resolveError) throw resolveError;
+            }
+            finally
+            {
+                resolver?.Clear();
+            }
+            if (decision == CompactionFilterDecision.Undetermined)
+            {
+                throw new RocksDbException(StatusCode.NotSupported, "FilterV2/V3/V4 should never return kUndetermined");
+            }
+            if (decision == CompactionFilterDecision.ChangeWideColumnEntity) SerializeFilterColumns(newColumns);
+        }
+        else if (decision == CompactionFilterDecision.ChangeWideColumnEntity)
+        {
+            // FilterBlobByKey has no new_columns output: like upstream the entry becomes an entity without columns.
+            SerializeFilterColumns(_filterNewColumns ??= new List<WideColumn>());
+        }
         if (decision == CompactionFilterDecision.RemoveAndSkipUntil && _icmp.CompareUserKey(_filterSkipUntil.WrittenSpan, userKey) <= 0)
         {
             // Can't skip to a key smaller than the current one. Keep the key as per FilterV2 documentation.
@@ -428,11 +474,7 @@ internal sealed class CompactionIterator : IDisposable
                 break;
             case CompactionFilterDecision.ChangeWideColumnEntity:
             {
-                // WideColumnsHelper::SortColumns + WideColumnSerialization::Serialize of the new columns.
-                WideColumn[] sorted = newColumns.ToArray();
-                Wide.WideColumnSerialization.SortColumns(sorted);
-                _filterValue.Clear();
-                Wide.WideColumnSerialization.Serialize(sorted, _filterValue);
+                // _filterValue holds the serialized new columns (SerializeFilterColumns).
                 if (_ikeyType != EntryType.WideColumnEntity)
                 {
                     _ikeyType = EntryType.WideColumnEntity;
@@ -445,11 +487,18 @@ internal sealed class CompactionIterator : IDisposable
                 throw new RocksDbException(StatusCode.NotSupported, "Only stacked BlobDB's internal compaction filter can return kChangeBlobIndex.");
             case CompactionFilterDecision.IOError:
                 throw new RocksDbException(StatusCode.NotSupported, "CompactionFilter for integrated BlobDB should not return kIOError");
-            case CompactionFilterDecision.Undetermined:
-                throw new RocksDbException(StatusCode.NotSupported, "FilterV2/V3/V4 should never return kUndetermined");
             default:
                 throw new RocksDbException(StatusCode.NotSupported, "Compaction filter decision " + decision + " is not supported");
         }
+    }
+
+    /// <summary>kChangeWideColumnEntity: WideColumnsHelper::SortColumns + WideColumnSerialization::Serialize of the new columns into _filterValue.</summary>
+    private void SerializeFilterColumns(List<WideColumn> newColumns)
+    {
+        WideColumn[] sorted = newColumns.ToArray();
+        Wide.WideColumnSerialization.SortColumns(sorted);
+        _filterValue.Clear();
+        Wide.WideColumnSerialization.Serialize(sorted, _filterValue);
     }
 
     /// <summary>Port of CompactionIterator::NextFromInput.</summary>
@@ -873,6 +922,7 @@ internal sealed class CompactionIterator : IDisposable
         _currentKey.Dispose();
         _filterValue.Dispose();
         _filterSkipUntil.Dispose();
+        _filterBlobResolver?.Dispose();
         _skipUntilKey.Dispose();
     }
 }
