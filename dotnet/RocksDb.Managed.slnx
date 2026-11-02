@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RocksDb.Managed/RocksDb.Managed.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/RocksDb.Managed.Tests/RocksDb.Managed.Tests.csproj" />
+    <Project Path="tests/RocksDb.Managed.CompatTests/RocksDb.Managed.CompatTests.csproj" />
+  </Folder>
+  <Folder Name="/bench/">
+    <Project Path="bench/RocksDb.Managed.Benchmarks/RocksDb.Managed.Benchmarks.csproj" />
+  </Folder>
+</Solution>

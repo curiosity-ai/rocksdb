@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RocksDb.Managed\RocksDb.Managed.csproj" />
+    <PackageReference Include="RocksDB" />
+    <PackageReference Include="BenchmarkDotNet" />
+  </ItemGroup>
+</Project>

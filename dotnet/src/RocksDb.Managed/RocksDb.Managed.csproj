@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>RocksDb.Managed</RootNamespace>
+    <AssemblyName>RocksDb.Managed</AssemblyName>
+    <IsAotCompatible>true</IsAotCompatible>
+    <Description>Fully managed, async-first C# port of RocksDB with on-disk binary compatibility.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.IO.Hashing" />
+    <PackageReference Include="Snappier" />
+    <PackageReference Include="K4os.Compression.LZ4" />
+    <PackageReference Include="ZstdSharp.Port" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="RocksDb.Managed.Tests" />
+    <InternalsVisibleTo Include="RocksDb.Managed.CompatTests" />
+    <InternalsVisibleTo Include="RocksDb.Managed.Benchmarks" />
+  </ItemGroup>
+</Project>

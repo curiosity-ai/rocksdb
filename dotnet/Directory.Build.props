@@ -1,0 +1,18 @@
+<Project>
+  <!-- Intentionally does NOT import the parent Directory.Build.props (that one configures MSVC for the C++ build). -->
+  <PropertyGroup>
+    <TargetFrameworks>net10.0;net11.0</TargetFrameworks>
+    <LangVersion>preview</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <WarningsAsErrors>nullable</WarningsAsErrors>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- Version of the native rocksdb NuGet package (rocksdb-sharp) used as the reference implementation in tests/benchmarks. -->
+    <NativeRocksDbPackageVersion>11.12.0.7385</NativeRocksDbPackageVersion>
+  </PropertyGroup>
+</Project>
