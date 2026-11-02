@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Managed <-> native whole-DB round trips. The native engine (rocksdb-sharp / librocksdb) only ever runs in a
+       child process: the test executable re-invokes itself with "roundtrip-child" (see Program.cs), so a native
+       crash (SIGSEGV/SIGABRT/access violation) or hang is captured and reported as a test failure instead of taking
+       down the test host. The managed engine runs in-process by default and in a child for the crash scenarios. -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <OutputType>Exe</OutputType>
+    <EnableMSTestRunner>true</EnableMSTestRunner>
+    <!-- Program.cs owns Main so the child mode can run before the testing platform starts. -->
+    <GenerateTestingPlatformEntryPoint>false</GenerateTestingPlatformEntryPoint>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="MSTest" />
+    <ProjectReference Include="..\..\src\RocksDb.Managed\RocksDb.Managed.csproj" />
+    <PackageReference Include="RocksDB" />
+  </ItemGroup>
+</Project>

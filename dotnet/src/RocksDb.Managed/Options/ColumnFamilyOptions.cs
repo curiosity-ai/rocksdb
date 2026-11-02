@@ -41,7 +41,10 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public int MaxWriteBufferNumber { get; set; } = 2;
     public int MinWriteBufferNumberToMerge { get; set; } = 1;
     public long MaxWriteBufferSizeToMaintain { get; set; }
-    public ulong ArenaBlockSize { get; set; } = 1024 * 1024;
+    /// <summary>arena_block_size. 0 (the upstream default) derives it from <see cref="WriteBufferSize"/> when the column
+    /// family is opened: min(1 MiB, write_buffer_size / 8) aligned up to 4 KiB (SanitizeCfOptions in
+    /// db/column_family.cc). A fixed 1 MiB default made memtables with a small write buffer "full" on creation.</summary>
+    public ulong ArenaBlockSize { get; set; }
     public bool InplaceUpdateSupport { get; set; }
     public ulong InplaceUpdateNumLocks { get; set; } = 10000;
     public double MemtablePrefixBloomSizeRatio { get; set; }
