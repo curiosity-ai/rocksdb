@@ -17,6 +17,11 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     // ---- named pluggable components ----------------------------------------------------------
     public string ComparatorName { get; set; } = "leveldb.BytewiseComparator";
     public string? MergeOperatorName { get; set; }
+    /// <summary>
+    /// The merge operator implementation used by the DB (not persisted). When set, its <see cref="Managed.MergeOperator.Name"/>
+    /// is what the DB records as <see cref="MergeOperatorName"/> in OPTIONS files and table properties.
+    /// </summary>
+    public MergeOperator? MergeOperator { get; set; }
     public string? CompactionFilterName { get; set; }
     public string? CompactionFilterFactoryName { get; set; }
     /// <summary>Serialized prefix extractor id, e.g. "rocksdb.FixedPrefix.4" / "rocksdb.CappedPrefix.8"; null = none.</summary>
@@ -188,6 +193,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     {
         var c = new ColumnFamilyOptions();
         c.CopyFrom(this);
+        c.MergeOperator = MergeOperator;
         c.TableOptions = TableOptions.Clone();
         c.OtherTableFactoryOptions = OtherTableFactoryOptions is null ? null : new Dictionary<string, string>(OtherTableFactoryOptions, StringComparer.Ordinal);
         return c;
