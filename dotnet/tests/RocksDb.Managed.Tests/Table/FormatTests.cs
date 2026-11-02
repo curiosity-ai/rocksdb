@@ -27,6 +27,29 @@ public sealed class FormatTests
         Assert.IsFalse(BlockHandle.TryDecode(ref bad, out _));
     }
 
+    /// <summary>format_version 8: low 16 bits metaindex size, high 16 bits gap before the footer (FooterBuilder::Build).</summary>
+    [TestMethod]
+    public void FooterFormatVersion8MetaindexGap()
+    {
+        byte[] buf = new byte[Footer.EncodedLength];
+        var meta = new BlockHandle(5000, 300);
+        foreach (ulong gap in new ulong[] { 0, 1, 777, 0xFFFF })
+        {
+            ulong footerOffset = meta.Offset + meta.Size + BlockBasedTableConstants.BlockTrailerSize + gap;
+            Footer.Build(buf, 8, footerOffset, ChecksumType.Xxh3, meta, BlockHandle.Null, 0x1234567);
+            Assert.AreEqual((uint)(gap << 16) | 300u, RocksDb.Managed.Util.Coding.DecodeFixed32(buf.AsSpan(13)));
+            Assert.AreEqual(meta, Footer.Decode(buf, footerOffset).MetaindexHandle);
+            if (gap > 0)
+            {
+                // Older format versions require the metaindex to be adjacent to the footer.
+                Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(
+                    () => Footer.Build(buf, 7, footerOffset, ChecksumType.Xxh3, meta, BlockHandle.Null, 0x1234567)).Code);
+            }
+        }
+        Assert.AreEqual(StatusCode.NotSupported, Assert.ThrowsExactly<RocksDbException>(
+            () => Footer.Build(buf, 8, 0x10000UL + 6 + 0x10000, ChecksumType.Xxh3, new BlockHandle(1, 0x10000), BlockHandle.Null, 1)).Code);
+    }
+
     [TestMethod]
     public void FooterRoundTripAllVersionsAndChecksums()
     {

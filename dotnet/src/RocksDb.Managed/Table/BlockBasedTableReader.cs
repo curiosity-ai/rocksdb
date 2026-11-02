@@ -293,7 +293,8 @@ public sealed class BlockBasedTableReader : IDisposable
     }
 
     internal void InitIndexIter(BlockIter it, Block block) =>
-        it.InitializeIndex(block, _icmp, IndexKeyIncludesSeq, IndexValueIsFull, IndexHasFirstKey, GlobalSequenceNumber);
+        it.InitializeIndex(block, _icmp, IndexKeyIncludesSeq, IndexValueIsFull, IndexHasFirstKey,
+            BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(_footer.FormatVersion), GlobalSequenceNumber);
 
     internal Block IndexBlock => _indexBlock;
     internal bool IsPartitionedIndex => IndexType == IndexType.TwoLevelIndexSearch;

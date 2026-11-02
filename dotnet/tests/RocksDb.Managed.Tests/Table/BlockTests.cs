@@ -9,7 +9,7 @@ namespace RocksDb.Managed.Tests.Table;
 [TestClass]
 public sealed class BlockTests
 {
-    private static List<byte[]> SortedInternalKeys(int count, Random rnd, int maxLen = 24)
+    private static List<byte[]> SortedInternalKeys(int count, Random rnd, int maxLen = 24, string prefix = "")
     {
         var set = new SortedSet<string>(StringComparer.Ordinal);
         while (set.Count < count)
@@ -17,34 +17,41 @@ public sealed class BlockTests
             int len = rnd.Next(1, maxLen);
             char[] c = new char[len];
             for (int i = 0; i < len; i++) c[i] = (char)('a' + rnd.Next(0, 6));
-            set.Add(new string(c));
+            set.Add(prefix + new string(c));
         }
         var keys = new List<byte[]>();
         foreach (string s in set) keys.Add(IKey(s, 7));
         return keys;
     }
 
-    private static Block BuildBlock(List<byte[]> keys, List<byte[]> values, int restartInterval, DataBlockIndexType indexType = DataBlockIndexType.BinarySearch)
+    private static Block BuildBlock(List<byte[]> keys, List<byte[]> values, int restartInterval, DataBlockIndexType indexType = DataBlockIndexType.BinarySearch,
+        bool commonPrefix = false)
     {
-        using var b = new BlockBuilder(restartInterval, true, false, indexType, 0.75);
+        using var b = new BlockBuilder(restartInterval, true, false, indexType, 0.75, commonPrefix, isUserKey: false);
         for (int i = 0; i < keys.Count; i++) b.Add(keys[i], values[i]);
         return Block.CreateCopy(b.Finish());
     }
 
     [TestMethod]
-    [DataRow(1)]
-    [DataRow(2)]
-    [DataRow(16)]
-    [DataRow(1000)]
-    public void DataBlockRoundTripSeekAndPrev(int restartInterval)
+    [DataRow(1, "", false)]
+    [DataRow(2, "", false)]
+    [DataRow(16, "", false)]
+    [DataRow(1000, "", false)]
+    [DataRow(1, "common/prefix/", true)]
+    [DataRow(16, "common/prefix/", true)]
+    [DataRow(1000, "p", true)]
+    [DataRow(16, "", true)] // common-prefix builder whose keys happen to share little or nothing
+    public void DataBlockRoundTripSeekAndPrev(int restartInterval, string prefix, bool commonPrefix)
     {
         int seed = Environment.TickCount;
         string trace = "seed=" + seed;
         var rnd = new Random(seed);
-        List<byte[]> keys = SortedInternalKeys(500, rnd);
+        List<byte[]> keys = SortedInternalKeys(500, rnd, 24, prefix);
         var values = new List<byte[]>();
         foreach (byte[] k in keys) { byte[] v = new byte[rnd.Next(0, 40)]; rnd.NextBytes(v); values.Add(v); }
-        Block block = BuildBlock(keys, values, restartInterval);
+        Block block = BuildBlock(keys, values, restartInterval, DataBlockIndexType.BinarySearch, commonPrefix);
+        if (prefix.Length > 0) Assert.IsTrue(block.CommonPrefixLength >= prefix.Length, trace);
+        if (!commonPrefix) Assert.AreEqual(0, block.CommonPrefixLength, trace);
         using var it = new BlockIter();
         it.InitializeData(block, InternalKeyComparator.Bytewise, BlockIter.DisableGlobalSequenceNumber);
 
@@ -155,16 +162,19 @@ public sealed class BlockTests
     }
 
     [TestMethod]
-    [DataRow(1, true)]
-    [DataRow(4, true)]
-    [DataRow(1, false)]
-    [DataRow(3, false)]
-    public void IndexBlockValueDeltaEncoding(int restartInterval, bool deltaEncoded)
+    [DataRow(1, true, false, false)]
+    [DataRow(4, true, false, false)]
+    [DataRow(1, false, false, false)]
+    [DataRow(3, false, false, false)]
+    [DataRow(1, true, true, false)]
+    [DataRow(4, true, true, true)]
+    [DataRow(1, false, true, true)]
+    public void IndexBlockValueDeltaEncoding(int restartInterval, bool deltaEncoded, bool valueDeltaEscape, bool commonPrefix)
     {
         var rnd = new Random(7);
-        List<byte[]> keys = SortedInternalKeys(200, rnd);
+        List<byte[]> keys = SortedInternalKeys(200, rnd, 24, commonPrefix ? "idx/" : "");
         var handles = new List<BlockHandle>();
-        using var b = new BlockBuilder(restartInterval, true, deltaEncoded, DataBlockIndexType.BinarySearch, 0.75);
+        using var b = new BlockBuilder(restartInterval, true, deltaEncoded, DataBlockIndexType.BinarySearch, 0.75, commonPrefix, isUserKey: false);
         using var full = new PooledBufferWriter();
         using var delta = new PooledBufferWriter();
         ulong offset = 0;
@@ -176,14 +186,16 @@ public sealed class BlockTests
             full.Clear();
             delta.Clear();
             IndexValue.EncodeFull(full, h, false, default);
-            if (i > 0) IndexValue.EncodeDelta(delta, h, prev, false, default);
+            if (i > 0) IndexValue.EncodeDelta(delta, h, prev, valueDeltaEscape, false, default);
             b.Add(keys[i], full.WrittenSpan, delta.WrittenSpan, false);
             prev = h;
             offset += h.Size + BlockBasedTableConstants.BlockTrailerSize;
+            // With the format_version 8 escape, non-contiguous handles (e.g. padding) remain delta entries.
+            if (valueDeltaEscape && i % 5 == 0) offset += (ulong)rnd.Next(1, 4096);
         }
         Block block = Block.CreateCopy(b.Finish());
         using var it = new BlockIter();
-        it.InitializeIndex(block, InternalKeyComparator.Bytewise, keyIncludesSeq: true, valueIsFull: !deltaEncoded, haveFirstKey: false, BlockIter.DisableGlobalSequenceNumber);
+        it.InitializeIndex(block, InternalKeyComparator.Bytewise, keyIncludesSeq: true, valueIsFull: !deltaEncoded, haveFirstKey: false, valueDeltaEscape: valueDeltaEscape, BlockIter.DisableGlobalSequenceNumber);
         int n = 0;
         for (it.SeekToFirst(); it.Valid; it.Next(), n++)
         {

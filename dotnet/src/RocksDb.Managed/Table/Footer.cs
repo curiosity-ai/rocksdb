@@ -15,11 +15,8 @@ public static class BlockBasedTableConstants
 
     public const int MinSupportedFormatVersionForRead = 2;
     public const int MinSupportedFormatVersionForWrite = 2;
-    /// <summary>
-    /// Highest format_version this port reads/writes. Upstream main supports 8 (common key prefix, value
-    /// delta escape, metaindex gap) which is not ported yet.
-    /// </summary>
-    public const int LatestSupportedFormatVersion = 7;
+    /// <summary>Highest format_version this port reads/writes (BlockBasedTableOptions::kLatestSupportedFormatVersion).</summary>
+    public const int LatestSupportedFormatVersion = 8;
 
     public const string PropertiesBlockName = "rocksdb.properties";
     /// <summary>Only used with format_version &gt;= 6 (index handle lives in the metaindex rather than the footer).</summary>
@@ -34,6 +31,12 @@ public static class BlockBasedTableConstants
     public static bool FormatVersionUsesContextChecksum(int v) => v >= 6;
     public static bool FormatVersionUsesIndexHandleInFooter(int v) => v < 6;
     public static bool FormatVersionUsesCompressionManagerName(int v) => v >= 7;
+    /// <summary>Index value deltas reserve varint 0 as an escape for a full handle; size deltas are zigzag + 1 (table/format.h).</summary>
+    public static bool FormatVersionUsesValueDeltaEscape(int v) => v >= 8;
+    /// <summary>Footer "metaindex size" field: low 16 bits size, high 16 bits gap before the footer.</summary>
+    public static bool FormatVersionUsesMetaindexGap(int v) => v >= 8;
+    /// <summary>Data/index blocks may store the common user-key prefix once (restarts[0] &gt; 0).</summary>
+    public static bool FormatVersionUsesCommonKeyPrefix(int v) => v >= 8;
 }
 
 /// <summary>
@@ -44,7 +47,8 @@ public static class BlockBasedTableConstants
 ///   Part2 (40 bytes):
 ///     fv &lt;= 5: metaindex handle, index handle (varints), zero padding
 ///     fv &gt;= 6: extended magic 3e 00 7a 00, footer checksum (u32), base context checksum (u32),
-///             metaindex block size (u32, metaindex immediately precedes the footer),
+///             metaindex block size (u32, metaindex immediately precedes the footer; fv &gt;= 8: low 16 bits size,
+///             high 16 bits gap between metaindex trailer and footer),
 ///             16 reserved zero bytes, incompatible feature flags (u64)
 ///   Part3: format_version (u32), magic number (u64)
 /// </code>
@@ -98,10 +102,26 @@ public readonly struct Footer
             // footer checksum at [5..9) left zero for now
             Coding.EncodeFixed32(cur[8..], baseContextChecksum);
             ulong metaindexEnd = metaindexHandle.Offset + metaindexHandle.Size + BlockBasedTableConstants.BlockTrailerSize;
-            if (metaindexHandle.Size > uint.MaxValue) ThrowHelper.NotSupported("Metaindex block size > 4GB");
-            if (metaindexHandle.Size != 0 && metaindexEnd != footerOffset)
-                ThrowHelper.InvalidArgument("metaindex block must immediately precede the footer");
-            Coding.EncodeFixed32(cur[12..], (uint)metaindexHandle.Size);
+            if (BlockBasedTableConstants.FormatVersionUsesMetaindexGap(formatVersion))
+            {
+                // Low 16 bits: metaindex block size. High 16 bits: gap in bytes (FooterBuilder::Build).
+                if (metaindexHandle.Size > 0xFFFF) ThrowHelper.NotSupported("Metaindex block size > 64KB with format_version >= 8");
+                ulong gap = 0;
+                if (metaindexHandle.Size != 0)
+                {
+                    if (metaindexEnd > footerOffset) ThrowHelper.InvalidArgument("metaindex block overlaps the footer");
+                    gap = footerOffset - metaindexEnd;
+                }
+                if (gap > 0xFFFF) ThrowHelper.NotSupported("Gap between metaindex block and footer > 64KB");
+                Coding.EncodeFixed32(cur[12..], ((uint)gap << 16) | (uint)metaindexHandle.Size);
+            }
+            else
+            {
+                if (metaindexHandle.Size > uint.MaxValue) ThrowHelper.NotSupported("Metaindex block size > 4GB");
+                if (metaindexHandle.Size != 0 && metaindexEnd != footerOffset)
+                    ThrowHelper.InvalidArgument("metaindex block must immediately precede the footer");
+                Coding.EncodeFixed32(cur[12..], (uint)metaindexHandle.Size);
+            }
             // 16 reserved zero bytes + incompatible features (0) already zero.
             uint checksum = BlockChecksum.ComputeBuiltinChecksum(checksumType, dst);
             checksum += BlockChecksum.ChecksumModifierForContext(baseContextChecksum, footerOffset);
@@ -163,7 +183,13 @@ public readonly struct Footer
             ulong features = Coding.DecodeFixed64(p2[32..]);
             if ((features & ~KnownFooterFeatures) != 0)
                 ThrowHelper.NotSupported("File uses unsupported incompatible footer features: " + (features & ~KnownFooterFeatures));
-            ulong metaindexEnd = footerOffset - BlockBasedTableConstants.BlockTrailerSize;
+            ulong metaindexGap = 0;
+            if (BlockBasedTableConstants.FormatVersionUsesMetaindexGap(formatVersion))
+            {
+                metaindexGap = metaindexSize >> 16;
+                metaindexSize &= 0xFFFF;
+            }
+            ulong metaindexEnd = footerOffset - BlockBasedTableConstants.BlockTrailerSize - metaindexGap;
             return new Footer
             {
                 TableMagicNumber = magic,

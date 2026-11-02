@@ -36,6 +36,8 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
     public bool EnableIndexCompression { get; set; } = true;
     public bool UseDeltaEncoding { get; set; } = true;
     public IndexShorteningMode IndexShortening { get; set; } = IndexShorteningMode.ShortenSeparators;
+    /// <summary>format_version &gt;= 8 common user-key prefix optimization (needs <see cref="UseDeltaEncoding"/>).</summary>
+    public OptimizeKeyCommonPrefix OptimizeKeyCommonPrefix { get; set; } = OptimizeKeyCommonPrefix.IfFastSeek;
     public uint ReadAmpBytesPerBit { get; set; }
     public bool VerifyCompression { get; set; }
     public PrepopulateBlockCache PrepopulateBlockCache { get; set; } = PrepopulateBlockCache.Disable;
@@ -71,6 +73,8 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
         .Bool("enable_index_compression", static o => o.EnableIndexCompression, static (o, v) => o.EnableIndexCompression = v)
         .Bool("use_delta_encoding", static o => o.UseDeltaEncoding, static (o, v) => o.UseDeltaEncoding = v)
         .Enum("index_shortening", OptionEnumMaps.IndexShortening, static o => o.IndexShortening, static (o, v) => o.IndexShortening = v)
+        .Enum("optimize_key_common_prefix", OptionEnumMaps.OptimizeKeyCommonPrefix, static o => o.OptimizeKeyCommonPrefix,
+            static (o, v) => o.OptimizeKeyCommonPrefix = v)
         .UInt32("read_amp_bytes_per_bit", static o => o.ReadAmpBytesPerBit, static (o, v) => o.ReadAmpBytesPerBit = v)
         .Bool("verify_compression", static o => o.VerifyCompression, static (o, v) => o.VerifyCompression = v)
         .Enum("prepopulate_block_cache", OptionEnumMaps.PrepopulateBlockCache, static o => o.PrepopulateBlockCache, static (o, v) => o.PrepopulateBlockCache = v)

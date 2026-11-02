@@ -41,6 +41,8 @@ public sealed class BlockIter : IDisposable
     private int _restartIndex;  // restart block containing _current
     private int _hashMapOffset = -1;
     private int _hashNumBuckets;
+    private int _prefixLength;     // common user-key prefix stored at [0, _prefixLength) (format_version >= 8)
+    private byte[] _restartKeyBuf = [];
 
     private byte[] _keyBuf = [];
     private int _keyLen;
@@ -59,6 +61,7 @@ public sealed class BlockIter : IDisposable
     private InternalKeyComparator _icmp = InternalKeyComparator.Bytewise;
     private bool _keysAreInternal;
     private bool _valueDeltaEncoded;
+    private bool _valueDeltaEscape;
     private bool _haveFirstKey;
     private ulong _globalSeqno = DisableGlobalSequenceNumber;
 
@@ -75,13 +78,16 @@ public sealed class BlockIter : IDisposable
     /// <summary>
     /// Iterator for an index block. <paramref name="keyIncludesSeq"/> = !index_key_is_user_key;
     /// <paramref name="valueIsFull"/> = !index_value_is_delta_encoded; <paramref name="haveFirstKey"/> for
-    /// kBinarySearchWithFirstKey.
+    /// kBinarySearchWithFirstKey; <paramref name="valueDeltaEscape"/> for format_version &gt;= 8
+    /// (FormatVersionUsesValueDeltaEscape).
     /// </summary>
-    public void InitializeIndex(Block block, InternalKeyComparator comparator, bool keyIncludesSeq, bool valueIsFull, bool haveFirstKey, ulong globalSeqno)
+    public void InitializeIndex(Block block, InternalKeyComparator comparator, bool keyIncludesSeq, bool valueIsFull, bool haveFirstKey,
+        bool valueDeltaEscape, ulong globalSeqno)
     {
         Reset(block, BlockIterKind.Index, comparator);
         _keysAreInternal = keyIncludesSeq;
         _valueDeltaEncoded = !valueIsFull;
+        _valueDeltaEscape = valueDeltaEscape;
         _haveFirstKey = haveFirstKey;
         _globalSeqno = globalSeqno;
     }
@@ -99,10 +105,12 @@ public sealed class BlockIter : IDisposable
         _data = block.Buffer;
         _restarts = block.RestartOffset;
         _numRestarts = block.NumRestarts;
+        _prefixLength = block.CommonPrefixLength;
         _icmp = icmp;
         _hashMapOffset = -1;
         _hashNumBuckets = 0;
         _valueDeltaEncoded = false;
+        _valueDeltaEscape = false;
         _haveFirstKey = false;
         _globalSeqno = DisableGlobalSequenceNumber;
         _handle = default;
@@ -350,10 +358,23 @@ public sealed class BlockIter : IDisposable
 
         if (shared == 0)
         {
-            // Key stored whole: point into the block (no copy).
-            _keyInBuf = false;
-            _keyBlockOffset = p;
-            _keyLen = (int)nonShared;
+            if (_prefixLength == 0)
+            {
+                // Key stored whole: point into the block (no copy).
+                _keyInBuf = false;
+                _keyBlockOffset = p;
+                _keyLen = (int)nonShared;
+            }
+            else
+            {
+                // Restart key stored without the block's common prefix: full key = prefix + stored bytes.
+                int newLen = _prefixLength + (int)nonShared;
+                EnsureKeyCapacity(newLen);
+                Buffer.BlockCopy(_data, 0, _keyBuf, 0, _prefixLength);
+                Buffer.BlockCopy(_data, p, _keyBuf, _prefixLength, (int)nonShared);
+                _keyInBuf = true;
+                _keyLen = newLen;
+            }
             // Keep restart index in sync.
             while (_restartIndex + 1 < _numRestarts && GetRestartPoint(_restartIndex + 1) < (uint)_current) _restartIndex++;
         }
@@ -392,7 +413,7 @@ public sealed class BlockIter : IDisposable
         ReadOnlySpan<byte> v = new(_data, valueStart, limit - valueStart);
         int startLen = v.Length;
         bool hasPrevious = _valueDeltaEncoded && isShared;
-        if (!IndexValue.TryDecode(ref v, _haveFirstKey, hasPrevious, _handle, out BlockHandle h, out int fko, out int fkl))
+        if (!IndexValue.TryDecode(ref v, _haveFirstKey, hasPrevious, _handle, _valueDeltaEscape, out BlockHandle h, out int fko, out int fkl))
         {
             CorruptionError();
             return;
@@ -501,7 +522,17 @@ public sealed class BlockIter : IDisposable
             CorruptionError();
             return default;
         }
-        return new ReadOnlySpan<byte>(_data, p, (int)nonShared);
+        if (_prefixLength == 0) return new ReadOnlySpan<byte>(_data, p, (int)nonShared);
+        // Reconstruct prefix + stored suffix (format_version >= 8 common-prefix blocks).
+        int len = _prefixLength + (int)nonShared;
+        if (_restartKeyBuf.Length < len)
+        {
+            if (_restartKeyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_restartKeyBuf);
+            _restartKeyBuf = ArrayPool<byte>.Shared.Rent(Math.Max(len, 64));
+        }
+        Buffer.BlockCopy(_data, 0, _restartKeyBuf, 0, _prefixLength);
+        Buffer.BlockCopy(_data, p, _restartKeyBuf, _prefixLength, (int)nonShared);
+        return new ReadOnlySpan<byte>(_restartKeyBuf, 0, len);
     }
 
     private void FindKeyAfterBinarySeek(ReadOnlySpan<byte> target, int index, bool skipLinearScan)
@@ -527,6 +558,8 @@ public sealed class BlockIter : IDisposable
         Clear();
         if (_keyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_keyBuf);
         _keyBuf = [];
+        if (_restartKeyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_restartKeyBuf);
+        _restartKeyBuf = [];
         _keyLen = 0;
         _keyInBuf = true;
     }

@@ -15,6 +15,8 @@ internal sealed class ShortenedIndexBuilder : IDisposable
     private readonly BlockBuilder _withSeq;
     private readonly BlockBuilder _withoutSeq;
     private readonly bool _useValueDeltaEncoding;
+    private readonly bool _useValueDeltaEscape;
+    private readonly bool _useCommonPrefix;
     private readonly bool _includeFirstKey;
     private readonly IndexShorteningMode _shortening;
     private readonly PooledBufferWriter _scratch = new(64);
@@ -28,11 +30,15 @@ internal sealed class ShortenedIndexBuilder : IDisposable
     private bool _finished;
 
     public ShortenedIndexBuilder(InternalKeyComparator icmp, int indexBlockRestartInterval, int formatVersion, bool useValueDeltaEncoding,
-        IndexShorteningMode shortening, bool includeFirstKey)
+        IndexShorteningMode shortening, bool includeFirstKey, bool useCommonPrefix)
     {
         _icmp = icmp;
-        _withSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75);
-        _withoutSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75);
+        _withSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75,
+            useCommonPrefix, isUserKey: false);
+        _withoutSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75,
+            useCommonPrefix, isUserKey: true);
+        _useValueDeltaEscape = BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(formatVersion);
+        _useCommonPrefix = useCommonPrefix;
         _useValueDeltaEncoding = useValueDeltaEncoding;
         _includeFirstKey = includeFirstKey;
         _shortening = shortening;
@@ -67,8 +73,10 @@ internal sealed class ShortenedIndexBuilder : IDisposable
         }
         else
         {
+            // Last entry: a short successor shares ~no prefix with the file's keys and would collapse the common-prefix
+            // index block's prefix, so with common-prefix encoding the full last key is used (GetSeparatorWithSeq).
             _scratch.Clear();
-            if (_shortening == IndexShorteningMode.ShortenSeparatorsAndSuccessor
+            if (_shortening == IndexShorteningMode.ShortenSeparatorsAndSuccessor && !_useCommonPrefix
                 && _icmp.FindShortSuccessor(lastKeyInCurrentBlock, _scratch))
                 separator = _scratch.WrittenSpan;
             else
@@ -80,7 +88,7 @@ internal sealed class ShortenedIndexBuilder : IDisposable
         IndexValue.EncodeFull(_encoded, handle, _includeFirstKey, firstKey);
         _deltaEncoded.Clear();
         if (_useValueDeltaEncoding && _hasLastHandle)
-            IndexValue.EncodeDelta(_deltaEncoded, handle, _lastHandle, _includeFirstKey, firstKey);
+            IndexValue.EncodeDelta(_deltaEncoded, handle, _lastHandle, _useValueDeltaEscape, _includeFirstKey, firstKey);
         _lastHandle = handle;
         _hasLastHandle = true;
 

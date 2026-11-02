@@ -69,11 +69,15 @@ public sealed class BlockBasedTableBuilder : IDisposable
         _ucmp = tableBuilderOptions.Comparator;
         _icmp = _ucmp.Kind == ComparatorKind.Bytewise ? InternalKeyComparator.Bytewise : new InternalKeyComparator(_ucmp);
         _offset = (ulong)file.Size;
-        _dataBlock = new BlockBuilder(options.BlockRestartInterval, options.UseDeltaEncoding, false, options.DataBlockIndexType, options.DataBlockHashTableUtilRatio);
+        bool useCommonPrefix = UseCommonPrefix(options, _ucmp);
+        // The hash index needs keys whose bytes determine equality (CanKeysWithDifferentByteContentsBeEqual).
+        _dataBlock = new BlockBuilder(options.BlockRestartInterval, options.UseDeltaEncoding, false,
+            _ucmp.CanKeysWithDifferentByteContentsBeEqual ? DataBlockIndexType.BinarySearch : options.DataBlockIndexType,
+            options.DataBlockHashTableUtilRatio, useCommonPrefix, isUserKey: false);
         _rangeDelBlock = new BlockBuilder(1, true, false, DataBlockIndexType.BinarySearch, 0.75);
         _useDeltaEncodingForIndexValues = options.FormatVersion >= 4;
         _indexBuilder = new ShortenedIndexBuilder(_icmp, options.IndexBlockRestartInterval, options.FormatVersion, _useDeltaEncodingForIndexValues,
-            options.IndexShortening, options.IndexType == IndexType.BinarySearchWithFirstKey);
+            options.IndexShortening, options.IndexType == IndexType.BinarySearchWithFirstKey, useCommonPrefix);
         // Port of CreateFilterBlockBuilder: the policy picks the filter implementation from the full building context
         // (format version, level, flush); a built-in policy with &lt; 0.5 bits/key builds no filter at all.
         if (options.FilterPolicy is { } policy && policy is not BloomLikeFilterPolicy { CreatesFilters: false })
@@ -108,6 +112,24 @@ public sealed class BlockBasedTableBuilder : IDisposable
             do { v = (uint)RandomNumberGenerator.GetInt32(int.MinValue, int.MaxValue); } while (v == 0);
             _baseContextChecksum = v;
         }
+    }
+
+    /// <summary>
+    /// Port of UseCommonPrefixForDataBlock / UseCommonPrefixForIndex (block_based_table_builder.cc): format_version
+    /// &gt;= 8, delta encoding, no user-defined timestamps; kIfFastSeek only for the (reverse-)bytewise comparators.
+    /// (super_block_alignment_size is not supported, so the index gate is the same as the data block gate.)
+    /// </summary>
+    internal static bool UseCommonPrefix(TableFormatOptions options, Comparator ucmp)
+    {
+        if (!BlockBasedTableConstants.FormatVersionUsesCommonKeyPrefix(options.FormatVersion) || !options.UseDeltaEncoding || ucmp.TimestampSize != 0)
+            return false;
+        bool isBytewise = ucmp.Kind is ComparatorKind.Bytewise or ComparatorKind.ReverseBytewise;
+        return options.OptimizeKeyCommonPrefix switch
+        {
+            OptimizeKeyCommonPrefix.IfFastSeek => isBytewise,
+            OptimizeKeyCommonPrefix.Enabled => true,
+            _ => false,
+        };
     }
 
     public ulong NumEntries => _props.NumEntries;

@@ -53,7 +53,7 @@ public sealed class BlockBasedTableTests
 
     public static IEnumerable<object[]> FormatMatrix()
     {
-        for (int fv = 2; fv <= 7; fv++)
+        for (int fv = 2; fv <= BlockBasedTableConstants.LatestSupportedFormatVersion; fv++)
             foreach (ChecksumType ct in new[] { ChecksumType.Crc32c, ChecksumType.XxHash, ChecksumType.XxHash64, ChecksumType.Xxh3, ChecksumType.NoChecksum })
                 yield return [fv, ct];
     }

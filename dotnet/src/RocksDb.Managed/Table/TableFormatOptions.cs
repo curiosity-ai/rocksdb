@@ -20,7 +20,7 @@ public sealed record TableFormatOptions
     public int IndexBlockRestartInterval { get; init; } = 1;
     /// <summary>Target size of index partitions with <see cref="IndexType.TwoLevelIndexSearch"/>.</summary>
     public int MetadataBlockSize { get; init; } = 4096;
-    /// <summary>Supported for writing: 2..7. Default 7 (upstream default).</summary>
+    /// <summary>Supported for writing: 2..8. Default 7 (upstream default).</summary>
     public int FormatVersion { get; init; } = 7;
     public ChecksumType Checksum { get; init; } = ChecksumType.Xxh3;
     public IndexType IndexType { get; init; } = IndexType.BinarySearch;
@@ -31,6 +31,8 @@ public sealed record TableFormatOptions
     public FilterPolicy? FilterPolicy { get; init; }
     public bool WholeKeyFiltering { get; init; } = true;
     public bool UseDeltaEncoding { get; init; } = true;
+    /// <summary>format_version &gt;= 8 common user-key prefix optimization for data and index blocks.</summary>
+    public OptimizeKeyCommonPrefix OptimizeKeyCommonPrefix { get; init; } = OptimizeKeyCommonPrefix.IfFastSeek;
     public bool EnableIndexCompression { get; init; } = true;
     /// <summary>Verify block checksums when reading (ReadOptions::verify_checksums default true).</summary>
     public bool VerifyChecksums { get; init; } = true;

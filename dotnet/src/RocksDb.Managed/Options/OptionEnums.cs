@@ -83,6 +83,20 @@ public enum IndexShorteningMode : byte
     ShortenSeparatorsAndSuccessor,
 }
 
+/// <summary>
+/// Mirrors BlockBasedTableOptions::OptimizeKeyCommonPrefix: when the format_version &gt;= 8 common user-key prefix
+/// optimization is used for data and index blocks.
+/// </summary>
+public enum OptimizeKeyCommonPrefix : byte
+{
+    /// <summary>Never use the optimization.</summary>
+    Disabled = 0,
+    /// <summary>Only with a (reverse-)bytewise comparator (where it also enables the fast Seek). Default.</summary>
+    IfFastSeek = 1,
+    /// <summary>For all comparators.</summary>
+    Enabled = 2,
+}
+
 /// <summary>Mirrors BlockBasedTableOptions::PrepopulateBlockCache.</summary>
 public enum PrepopulateBlockCache : byte
 {

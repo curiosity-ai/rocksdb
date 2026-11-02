@@ -40,7 +40,7 @@ public sealed class SstCompatTests
 
     public static IEnumerable<object[]> NativeMatrix()
     {
-        int[] fvs = [2, 3, 4, 5, 6, 7];
+        int[] fvs = [2, 3, 4, 5, 6, 7, 8];
         char[] checksums = [(char)1, (char)2, (char)3, (char)4, (char)0];
         int n = 0;
         foreach (int fv in fvs)
@@ -141,6 +141,7 @@ public sealed class SstCompatTests
     [TestMethod]
     [DataRow(5)]
     [DataRow(7)]
+    [DataRow(8)]
     public void ManagedPropertiesMatchNative(int formatVersion)
     {
         using var dir = new TempDir("sst-props");
@@ -198,7 +199,7 @@ public sealed class SstCompatTests
     public static IEnumerable<object[]> ManagedMatrix()
     {
         int n = 0;
-        for (int fv = 2; fv <= 7; fv++)
+        for (int fv = 2; fv <= 8; fv++)
             foreach (ChecksumType cs in new[] { ChecksumType.Crc32c, ChecksumType.XxHash, ChecksumType.XxHash64, ChecksumType.Xxh3 })
             {
                 yield return [fv, (int)cs, 1 + n % 17, n % 2 == 0, n % 3 == 0];

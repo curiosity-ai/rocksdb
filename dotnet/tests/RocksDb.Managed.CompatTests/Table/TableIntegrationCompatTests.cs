@@ -215,6 +215,9 @@ public sealed class TableIntegrationCompatTests
     [DataRow(7, IndexShorteningMode.ShortenSeparators)]
     [DataRow(7, IndexShorteningMode.ShortenSeparatorsAndSuccessor)]
     [DataRow(7, IndexShorteningMode.NoShortening)]
+    [DataRow(8, IndexShorteningMode.ShortenSeparators)]
+    [DataRow(8, IndexShorteningMode.ShortenSeparatorsAndSuccessor)]
+    [DataRow(8, IndexShorteningMode.NoShortening)]
     public void IndexAndDataBlocksMatchNative(int formatVersion, IndexShorteningMode shortening)
     {
         using var dir = new TempDir("idx-compat");
@@ -240,7 +243,19 @@ public sealed class TableIntegrationCompatTests
             foreach (BlockHandle h in nh) CollectionAssert.AreEqual(native.RawBlock(h), managed.RawBlock(h));
         }
         CollectionAssert.AreEqual(native.RawBlock(native.Reader.IndexHandle), managed.RawBlock(managed.Reader.IndexHandle), "index block");
+        // format_version 8 (bytewise comparator, default optimize_key_common_prefix=kIfFastSeek) stores each block's
+        // common user-key prefix once; make sure the case is really exercised.
+        int prefixed = 0;
+        foreach (BlockHandle h in native.DataBlockHandles())
+        {
+            Block b = Block.CreateCopy(native.UncompressedBlock(h));
+            if (b.CommonPrefixLength > 0) prefixed++;
+            b.Release();
+        }
+        if (formatVersion >= 8) Assert.IsTrue(prefixed > 10, "blocks with a common prefix: " + prefixed);
+        else Assert.AreEqual(0, prefixed);
         VerifyManagedRead(native, keys, AbsentKeys(keys));
+        VerifyManagedRead(managed, keys, AbsentKeys(keys));
     }
 
     public static IEnumerable<object[]> FilterCases()
@@ -255,6 +270,8 @@ public sealed class TableIntegrationCompatTests
         yield return ["ribbonfilter:8.3:-1", 6, (Func<IntPtr>)(static () => RocksDbSharp.Native.Instance.rocksdb_filterpolicy_create_ribbon_hybrid(8.3, -1))];
         yield return ["ribbonfilter:10:0", 7, (Func<IntPtr>)(static () => RocksDbSharp.Native.Instance.rocksdb_filterpolicy_create_ribbon(10))];
         // bloom_before_level = INT_MAX: always Bloom.
+        yield return ["bloomfilter:10:false", 8, (Func<IntPtr>)(static () => RocksDbSharp.Native.Instance.rocksdb_filterpolicy_create_bloom_full(10))];
+        yield return ["ribbonfilter:10:-1", 8, (Func<IntPtr>)(static () => RocksDbSharp.Native.Instance.rocksdb_filterpolicy_create_ribbon_hybrid(10, -1))];
         yield return ["ribbonfilter:10:2147483647", 7, (Func<IntPtr>)(static () => RocksDbSharp.Native.Instance.rocksdb_filterpolicy_create_ribbon_hybrid(10, int.MaxValue))];
     }
 
@@ -305,6 +322,9 @@ public sealed class TableIntegrationCompatTests
     [DataRow(CompressionType.Zstd, 2)]
     [DataRow(CompressionType.Zlib, 5)]
     [DataRow(CompressionType.Zlib, 7)]
+    [DataRow(CompressionType.Snappy, 8)]
+    [DataRow(CompressionType.Zstd, 8)]
+    [DataRow(CompressionType.LZ4, 8)]
     public void CompressionMatchesNative(CompressionType compression, int formatVersion)
     {
         using var dir = new TempDir("compress-compat");

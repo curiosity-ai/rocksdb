@@ -65,6 +65,7 @@ public static class TableFactory
             FilterPolicy = CreateFilterPolicy(options.FilterPolicy),
             WholeKeyFiltering = options.WholeKeyFiltering,
             UseDeltaEncoding = options.UseDeltaEncoding,
+            OptimizeKeyCommonPrefix = options.OptimizeKeyCommonPrefix,
             EnableIndexCompression = options.EnableIndexCompression,
         };
     }
