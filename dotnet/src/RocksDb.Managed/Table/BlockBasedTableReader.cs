@@ -54,6 +54,7 @@ public sealed class BlockBasedTableReader : IDisposable
 
     private readonly IRandomAccessFile _file;
     private readonly TableReaderOptions _options;
+    private readonly InternalKeyComparator _icmp;
     private readonly Footer _footer;
     private readonly Block _indexBlock;
     private readonly Block? _rangeDelBlock;
@@ -65,6 +66,8 @@ public sealed class BlockBasedTableReader : IDisposable
     public Footer Footer => _footer;
     public TableProperties Properties { get; }
     public IReadOnlyDictionary<string, BlockHandle> MetaBlocks { get; }
+    /// <summary>Handle of the (top-level) index block (footer for format_version &lt; 6, metaindex otherwise).</summary>
+    public BlockHandle IndexHandle { get; }
     public IndexType IndexType { get; }
     public bool IndexKeyIncludesSeq { get; }
     public bool IndexValueIsFull { get; }
@@ -74,14 +77,16 @@ public sealed class BlockBasedTableReader : IDisposable
     /// <summary>Effective global sequence number (external files), or <see cref="BlockIter.DisableGlobalSequenceNumber"/>.</summary>
     public ulong GlobalSequenceNumber { get; }
     public long FileSize { get; }
-    internal Comparator Comparator => _options.Comparator;
+    internal InternalKeyComparator InternalComparator => _icmp;
     internal IRandomAccessFile File => _file;
 
     private BlockBasedTableReader(IRandomAccessFile file, TableReaderOptions options, Footer footer, Dictionary<string, BlockHandle> metaBlocks,
-        TableProperties props, Block indexBlock, Block? rangeDel, IFilterBitsReader? filter, byte[]? filterBuffer, long fileSize)
+        TableProperties props, BlockHandle indexHandle, Block indexBlock, Block? rangeDel, IFilterBitsReader? filter, byte[]? filterBuffer, long fileSize)
     {
+        IndexHandle = indexHandle;
         _file = file;
         _options = options;
+        _icmp = options.Comparator.Kind == ComparatorKind.Bytewise ? InternalKeyComparator.Bytewise : new InternalKeyComparator(options.Comparator);
         _footer = footer;
         MetaBlocks = metaBlocks;
         Properties = props;
@@ -201,14 +206,20 @@ public sealed class BlockBasedTableReader : IDisposable
             if (metaBlocks.TryGetValue(BlockBasedTableConstants.RangeDelBlockName, out BlockHandle rdHandle))
                 rangeDel = BlockFetcher.ReadBlock(file, footer, rdHandle, verify);
 
+            // Port of the filter lookup in BlockBasedTable::PrefetchIndexAndFilterBlocks: the full filter is keyed by the
+            // configured policy's CompatibilityName (no policy -> filters ignored). Partitioned filters are not read yet,
+            // which is safe (no filtering).
             IFilterBitsReader? filter = null;
             if (options.FilterPolicy is { } policy
                 && metaBlocks.TryGetValue(BlockBasedTableConstants.FullFilterBlockPrefix + policy.CompatibilityName, out BlockHandle fh))
             {
                 filterBuf = BlockFetcher.ReadRawPayload(file, footer, fh, verify, out int flen);
-                filter = policy.CreateReader(filterBuf.AsMemory(0, flen));
+                // Any built-in policy reads any built-in filter format (BuiltinFilterPolicy::GetBuiltinFilterBitsReader).
+                filter = policy.CompatibilityName == BloomLikeFilterPolicy.BuiltinFilterMetadataName
+                    ? BuiltinFilterBitsReader.Create(filterBuf.AsMemory(0, flen))
+                    : policy.CreateReader(filterBuf.AsMemory(0, flen));
             }
-            return new BlockBasedTableReader(ownedFile ?? file, options, footer, metaBlocks, props, indexBlock, rangeDel, filter, filterBuf, fileSize);
+            return new BlockBasedTableReader(ownedFile ?? file, options, footer, metaBlocks, props, indexHandle, indexBlock, rangeDel, filter, filterBuf, fileSize);
         }
         catch
         {
@@ -282,7 +293,8 @@ public sealed class BlockBasedTableReader : IDisposable
     }
 
     internal void InitIndexIter(BlockIter it, Block block) =>
-        it.InitializeIndex(block, _options.Comparator, IndexKeyIncludesSeq, IndexValueIsFull, IndexHasFirstKey, GlobalSequenceNumber);
+        it.InitializeIndex(block, _icmp, IndexKeyIncludesSeq, IndexValueIsFull, IndexHasFirstKey,
+            BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(_footer.FormatVersion), GlobalSequenceNumber);
 
     internal Block IndexBlock => _indexBlock;
     internal bool IsPartitionedIndex => IndexType == IndexType.TwoLevelIndexSearch;
@@ -321,7 +333,7 @@ public sealed class BlockBasedTableReader : IDisposable
                 Block block = GetBlock(idx.Handle);
                 try
                 {
-                    data.InitializeData(block, _options.Comparator, GlobalSequenceNumber);
+                    data.InitializeData(block, _icmp, GlobalSequenceNumber);
                     if (first)
                     {
                         if (!data.SeekForGet(internalKey)) return;
@@ -418,7 +430,7 @@ public sealed class BlockBasedTableReader : IDisposable
     private int ScanBlockForGet(BlockIter data, Block block, ReadOnlySpan<byte> internalKey, bool first, IBufferWriter<byte>? value, out TableGetResult result)
     {
         result = default;
-        data.InitializeData(block, _options.Comparator, GlobalSequenceNumber);
+        data.InitializeData(block, _icmp, GlobalSequenceNumber);
         if (first)
         {
             if (!data.SeekForGet(internalKey)) return -1;
@@ -437,8 +449,7 @@ public sealed class BlockBasedTableReader : IDisposable
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private bool UserKeyEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) =>
-        ReferenceEquals(_options.Comparator, Comparator.Bytewise) ? a.SequenceEqual(b) : _options.Comparator.Equal(a, b);
+    private bool UserKeyEquals(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) => _icmp.EqualUserKey(a, b);
 
     // ---------------------------------------------------------------------------------------------
     // Iterators
@@ -456,7 +467,7 @@ public sealed class BlockBasedTableReader : IDisposable
     {
         if (_rangeDelBlock is null) return null;
         var it = new BlockIter();
-        it.InitializeData(_rangeDelBlock, _options.Comparator, GlobalSequenceNumber);
+        it.InitializeData(_rangeDelBlock, _icmp, GlobalSequenceNumber);
         return it;
     }
 

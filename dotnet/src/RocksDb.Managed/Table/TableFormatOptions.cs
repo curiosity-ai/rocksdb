@@ -1,4 +1,5 @@
 using RocksDb.Managed.Compression;
+using CompressionOptions = RocksDb.Managed.CompressionOptions;
 using RocksDb.Managed.Table.Filters;
 
 namespace RocksDb.Managed.Table;
@@ -19,7 +20,7 @@ public sealed record TableFormatOptions
     public int IndexBlockRestartInterval { get; init; } = 1;
     /// <summary>Target size of index partitions with <see cref="IndexType.TwoLevelIndexSearch"/>.</summary>
     public int MetadataBlockSize { get; init; } = 4096;
-    /// <summary>Supported for writing: 2..7. Default 7 (upstream default).</summary>
+    /// <summary>Supported for writing: 2..8. Default 7 (upstream default).</summary>
     public int FormatVersion { get; init; } = 7;
     public ChecksumType Checksum { get; init; } = ChecksumType.Xxh3;
     public IndexType IndexType { get; init; } = IndexType.BinarySearch;
@@ -30,6 +31,8 @@ public sealed record TableFormatOptions
     public FilterPolicy? FilterPolicy { get; init; }
     public bool WholeKeyFiltering { get; init; } = true;
     public bool UseDeltaEncoding { get; init; } = true;
+    /// <summary>format_version &gt;= 8 common user-key prefix optimization for data and index blocks.</summary>
+    public OptimizeKeyCommonPrefix OptimizeKeyCommonPrefix { get; init; } = OptimizeKeyCommonPrefix.IfFastSeek;
     public bool EnableIndexCompression { get; init; } = true;
     /// <summary>Verify block checksums when reading (ReadOptions::verify_checksums default true).</summary>
     public bool VerifyChecksums { get; init; } = true;
@@ -56,16 +59,25 @@ public sealed record TableBuilderOptions
     /// <summary>User key comparator. Persisted as "rocksdb.comparator".</summary>
     public Comparator Comparator { get; init; } = Comparator.Bytewise;
     public CompressionType CompressionType { get; init; } = CompressionType.None;
-    /// <summary>Compression level passed to the compression facade (CompressionOptions::level, kDefaultCompressionLevel = 32767).</summary>
-    public int CompressionLevel { get; init; } = 32767;
-    /// <summary>CompressionOptions::max_compressed_bytes_per_kb (stored compressed only if at least 1/8 smaller by default).</summary>
-    public int MaxCompressedBytesPerKb { get; init; } = 1024 * 7 / 8;
+    /// <summary>
+    /// TableBuilderOptions::compression_opts: level (kDefaultCompressionLevel = 32767 means library default) and
+    /// max_compressed_bytes_per_kb are used for compression; all fields are persisted in "rocksdb.compression_options".
+    /// Dictionary compression is not implemented: max_dict_bytes etc. are only recorded, not applied.
+    /// </summary>
+    public CompressionOptions CompressionOptions { get; init; } = new();
     public ulong ColumnFamilyId { get; init; } = TableProperties.UnknownColumnFamily;
     public string ColumnFamilyName { get; init; } = "";
     /// <summary>Persisted as "rocksdb.merge.operator" ("nullptr" when none).</summary>
     public string MergeOperatorName { get; init; } = "nullptr";
     /// <summary>Persisted as "rocksdb.prefix.extractor.name" ("nullptr" when none). Prefix filtering itself is not implemented.</summary>
     public string PrefixExtractorName { get; init; } = "nullptr";
+    /// <summary>
+    /// Level the file is created at (FilterBuildingContext::level_at_creation); -1 when unknown (treated as bottommost
+    /// by level-aware filter policies such as Ribbon's bloom_before_level).
+    /// </summary>
+    public int LevelAtCreation { get; init; } = -1;
+    /// <summary>True when the file is written by a memtable flush (TableFileCreationReason::kFlush; Ribbon treats it as level -1).</summary>
+    public bool IsFlush { get; init; }
     public ulong OldestKeyTime { get; init; }
     public ulong NewestKeyTime { get; init; }
     public ulong FileCreationTime { get; init; }

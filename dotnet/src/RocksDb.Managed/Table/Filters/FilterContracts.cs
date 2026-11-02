@@ -24,6 +24,11 @@ public abstract class FilterPolicy
 {
     /// <summary>Name persisted in table properties (e.g. "rocksdb.BuiltinBloomFilter").</summary>
     public abstract string CompatibilityName { get; }
+    /// <summary>
+    /// Policy class name (Customizable::Name), persisted as the "rocksdb.filter.policy" table property whenever a
+    /// policy is configured, e.g. "bloomfilter" / "ribbonfilter". Default: <see cref="CompatibilityName"/>.
+    /// </summary>
+    public virtual string Name => CompatibilityName;
     public abstract IFilterBitsBuilder CreateBuilder(int formatVersion);
     /// <summary>
     /// Creates a builder with full table-building context (port of GetBuilderWithContext). Policies whose

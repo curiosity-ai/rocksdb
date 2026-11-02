@@ -211,6 +211,13 @@ internal static class OptionEnumMaps
         ("kShortenSeparatorsAndSuccessor", IndexShorteningMode.ShortenSeparatorsAndSuccessor),
     ]);
 
+    public static readonly EnumMap<OptimizeKeyCommonPrefix> OptimizeKeyCommonPrefix = new(
+    [
+        ("kDisabled", Managed.OptimizeKeyCommonPrefix.Disabled),
+        ("kIfFastSeek", Managed.OptimizeKeyCommonPrefix.IfFastSeek),
+        ("kEnabled", Managed.OptimizeKeyCommonPrefix.Enabled),
+    ]);
+
     public static readonly EnumMap<PrepopulateBlockCache> PrepopulateBlockCache = new(
     [
         ("kDisable", Managed.PrepopulateBlockCache.Disable),

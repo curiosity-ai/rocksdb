@@ -6,8 +6,8 @@ namespace RocksDb.Managed.Db;
 
 /// <summary>
 /// SEAM: yields the logical records of a MANIFEST file (log-format payloads, already reassembled from
-/// fragments and checksum-verified). The production implementation is an adapter over the WAL
-/// <c>Wal.LogReader</c> (db/log_reader.cc; the MANIFEST uses the same 32KiB block log format).
+/// fragments and checksum-verified). The production implementation is <see cref="ManifestLogReader"/>, an adapter
+/// over the WAL <c>Wal.LogReader</c> (db/log_reader.cc; the MANIFEST uses the same 32KiB block log format).
 /// </summary>
 public interface IManifestRecordReader
 {
@@ -19,8 +19,8 @@ public interface IManifestRecordReader
 }
 
 /// <summary>
-/// SEAM: accepts MANIFEST records and frames them in the log format. The production implementation is an
-/// adapter over <c>Wal.LogWriter</c> (db/log_writer.cc) writing to an <see cref="IWritableFile"/>.
+/// SEAM: accepts MANIFEST records and frames them in the log format. The production implementation is
+/// <see cref="ManifestLogWriter"/>, an adapter over <c>Wal.LogWriter</c> (db/log_writer.cc) writing to an <see cref="IWritableFile"/>.
 /// </summary>
 public interface IManifestRecordWriter
 {
@@ -432,15 +432,15 @@ public static class ManifestReader
     }
 
     /// <summary>
-    /// Reads CURRENT in <paramref name="dbname"/>, opens the MANIFEST it names and recovers the state.
-    /// <paramref name="logReaderFactory"/> wraps the MANIFEST file in a log-format record reader (the WAL LogReader).
+    /// Reads CURRENT in <paramref name="dbname"/>, opens the MANIFEST it names and recovers the state, reading the log
+    /// records with <see cref="ManifestLogReader"/> (the WAL <c>LogReader</c>).
     /// </summary>
-    public static RecoveredVersionState RecoverFromDirectory(IFileSystem fs, string dbname, Func<ISequentialFile, IManifestRecordReader> logReaderFactory,
-        Func<string, Comparator?>? comparatorResolver, out ulong manifestFileNumber)
+    public static RecoveredVersionState RecoverFromDirectory(IFileSystem fs, string dbname, Func<string, Comparator?>? comparatorResolver,
+        out ulong manifestFileNumber)
     {
         string path = FileNames.GetCurrentManifestPath(fs, dbname, out manifestFileNumber);
-        using ISequentialFile file = fs.OpenSequential(path);
-        return Recover(logReaderFactory(file), comparatorResolver);
+        using ManifestLogReader reader = ManifestLogReader.Open(fs, path);
+        return Recover(reader, comparatorResolver);
     }
 
     /// <summary>Decodes all edits of a MANIFEST without replaying them (diagnostics, ldb manifest_dump).</summary>

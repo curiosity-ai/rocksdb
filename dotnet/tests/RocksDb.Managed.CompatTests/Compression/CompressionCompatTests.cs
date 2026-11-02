@@ -1,6 +1,8 @@
 using RocksDb.Managed.CompatTests.Filters;
 using RocksDb.Managed.CompatTests.Infrastructure;
 using RocksDb.Managed.Compression;
+using RocksDb.Managed.Db;
+using RocksDb.Managed.Table;
 using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.CompatTests.Compression;
@@ -18,8 +20,8 @@ public sealed class CompressionCompatTests
     private static void RunCase(RocksDbSharp.Compression nativeType, CompressionType expected, int formatVersion)
     {
         using var dir = new TempDir("compress");
-        TestSstParser sst = NativeSst.Build(dir, IntPtr.Zero, formatVersion, nativeType, KeyCount);
-        List<(ulong Offset, ulong Size)> handles = sst.DataBlockHandles();
+        using SstFile sst = NativeSst.Build(dir, IntPtr.Zero, formatVersion, nativeType, KeyCount, TableReaderOptions.Default);
+        List<BlockHandle> handles = sst.DataBlockHandles();
         Assert.IsTrue(handles.Count > 1);
         int compressedBlocks = 0;
         int next = 0;
@@ -34,13 +36,18 @@ public sealed class CompressionCompatTests
                 Assert.IsTrue(len > (int)h.Size);
             }
             byte[] block = sst.UncompressedBlock(h);
-            foreach (var (internalKey, value) in TestSstParser.ParseBlockEntries(block, valueLengthPresent: true))
+            Block parsed = Block.CreateCopy(block);
+            using (var it = new BlockIter())
             {
-                // internal key = user key + 8-byte (seq << 8 | type)
-                CollectionAssert.AreEqual(NativeSst.Key(next), internalKey.AsSpan(0, internalKey.Length - 8).ToArray());
-                CollectionAssert.AreEqual(NativeSst.Value(next), value);
-                next++;
+                it.InitializeData(parsed, InternalKeyComparator.Bytewise, BlockIter.DisableGlobalSequenceNumber);
+                for (it.SeekToFirst(); it.Valid; it.Next())
+                {
+                    CollectionAssert.AreEqual(NativeSst.Key(next), DbFormat.ExtractUserKey(it.Key).ToArray());
+                    CollectionAssert.AreEqual(NativeSst.Value(next), it.Value.ToArray());
+                    next++;
+                }
             }
+            parsed.Release();
 
             // Managed re-compression of the same block round-trips too.
             if (type != CompressionType.None)

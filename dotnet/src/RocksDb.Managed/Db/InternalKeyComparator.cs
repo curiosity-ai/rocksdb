@@ -52,6 +52,11 @@ public sealed class InternalKeyComparator
         return _user.Compare(a, b);
     }
 
+    /// <summary>User-key equality (port of Comparator::Equal on the user comparator); memcmp for the built-ins.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool EqualUserKey(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) =>
+        _kind is ComparatorKind.Bytewise or ComparatorKind.ReverseBytewise ? a.SequenceEqual(b) : _user.Equal(a, b);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static ulong Footer(ReadOnlySpan<byte> internalKey) =>
         BinaryPrimitives.ReadUInt64LittleEndian(internalKey[^DbFormat.InternalKeyFooterSize..]);

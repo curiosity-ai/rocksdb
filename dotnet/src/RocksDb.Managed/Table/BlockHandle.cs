@@ -67,12 +67,35 @@ internal static class IndexValue
         if (haveFirstKey) Coding.PutLengthPrefixedSlice(dst, firstInternalKey);
     }
 
-    /// <summary>Port of IndexValue::EncodeTo with a previous handle (format_version 4..7, no value delta escape).</summary>
-    public static void EncodeDelta(IBufferWriter<byte> dst, BlockHandle handle, BlockHandle previous, bool haveFirstKey, ReadOnlySpan<byte> firstInternalKey)
+    /// <summary>
+    /// Port of IndexValue::EncodeTo with a previous handle. Without the escape (format_version 4..7) the handle must be
+    /// contiguous and only the zigzag size delta is stored. With <paramref name="useValueDeltaEscape"/>
+    /// (format_version &gt;= 8) a contiguous handle stores zigzag(delta) + 1 and a non-contiguous one stores varint 0
+    /// followed by the full handle.
+    /// </summary>
+    public static void EncodeDelta(IBufferWriter<byte> dst, BlockHandle handle, BlockHandle previous, bool useValueDeltaEscape, bool haveFirstKey,
+        ReadOnlySpan<byte> firstInternalKey)
     {
         // WART (upstream): specific to block-based table.
-        System.Diagnostics.Debug.Assert(handle.Offset == previous.Offset + previous.Size + BlockBasedTableConstants.BlockTrailerSize);
-        Coding.PutVarint64(dst, Coding.ZigZagEncode64((long)handle.Size - (long)previous.Size));
+        ulong contiguousOffset = previous.Offset + previous.Size + BlockBasedTableConstants.BlockTrailerSize;
+        if (useValueDeltaEscape)
+        {
+            if (handle.Offset == contiguousOffset)
+            {
+                Coding.PutVarint64(dst, Coding.ZigZagEncode64((long)handle.Size - (long)previous.Size) + 1);
+            }
+            else
+            {
+                // Escape: a full BlockHandle (offset + size) follows.
+                Coding.PutVarint64(dst, 0);
+                handle.EncodeTo(dst);
+            }
+        }
+        else
+        {
+            System.Diagnostics.Debug.Assert(handle.Offset == contiguousOffset);
+            Coding.PutVarint64(dst, Coding.ZigZagEncode64((long)handle.Size - (long)previous.Size));
+        }
         if (haveFirstKey) Coding.PutLengthPrefixedSlice(dst, firstInternalKey);
     }
 
@@ -81,7 +104,7 @@ internal static class IndexValue
     /// <paramref name="firstKeyOffset"/>/<paramref name="firstKeyLength"/> describe the first key relative to the
     /// start of <paramref name="input"/> as it was passed in (only when <paramref name="haveFirstKey"/>).
     /// </summary>
-    public static bool TryDecode(ref ReadOnlySpan<byte> input, bool haveFirstKey, bool hasPrevious, BlockHandle previous,
+    public static bool TryDecode(ref ReadOnlySpan<byte> input, bool haveFirstKey, bool hasPrevious, BlockHandle previous, bool useValueDeltaEscape,
         out BlockHandle handle, out int firstKeyOffset, out int firstKeyLength)
     {
         int startLen = input.Length;
@@ -94,8 +117,18 @@ internal static class IndexValue
                 handle = default;
                 return false;
             }
-            long delta = Coding.ZigZagDecode64(zz);
-            handle = new BlockHandle(previous.Offset + previous.Size + BlockBasedTableConstants.BlockTrailerSize, (ulong)((long)previous.Size + delta));
+            if (useValueDeltaEscape && zz == 0)
+            {
+                // Escape: a full BlockHandle (offset + size) follows.
+                if (!BlockHandle.TryDecode(ref input, out handle)) return false;
+            }
+            else
+            {
+                // format_version >= 8 stores zigzag(delta) + 1 to keep 0 free for the escape.
+                if (useValueDeltaEscape) zz--;
+                long delta = Coding.ZigZagDecode64(zz);
+                handle = new BlockHandle(previous.Offset + previous.Size + BlockBasedTableConstants.BlockTrailerSize, (ulong)((long)previous.Size + delta));
+            }
         }
         else if (!BlockHandle.TryDecode(ref input, out handle))
         {

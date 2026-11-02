@@ -121,6 +121,8 @@ public sealed class BloomFilterPolicy : BloomLikeFilterPolicy
 
     public BloomFilterPolicy(double bitsPerKey) : base(bitsPerKey) { }
 
+    public override string Name => ClassName;
+
     public override string Id => ClassName + GetBitsPerKeySuffix() + ":false";
 
     public override IFilterBitsBuilder CreateBuilder(int formatVersion)
@@ -156,6 +158,8 @@ public sealed class RibbonFilterPolicy : BloomLikeFilterPolicy
         get => _bloomBeforeLevel;
         set => _bloomBeforeLevel = value;
     }
+
+    public override string Name => ClassName;
 
     public override string Id => ClassName + GetBitsPerKeySuffix() + ":" + _bloomBeforeLevel.ToString(System.Globalization.CultureInfo.InvariantCulture);
 

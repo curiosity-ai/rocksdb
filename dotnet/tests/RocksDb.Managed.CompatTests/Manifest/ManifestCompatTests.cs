@@ -84,10 +84,10 @@ public sealed class ManifestCompatTests
         return result;
     }
 
-    private static TestLogReader OpenManifest(string dbPath, out string manifestPath)
+    private static ManifestLogReader OpenManifest(string dbPath, out string manifestPath)
     {
         manifestPath = FileNames.GetCurrentManifestPath(LocalFileSystem.Instance, dbPath, out _);
-        return new TestLogReader(File.ReadAllBytes(manifestPath));
+        return ManifestLogReader.Open(LocalFileSystem.Instance, manifestPath);
     }
 
     private static void AssertLiveFilesMatch(List<NativeLiveFile> native, RecoveredVersionState state)
@@ -124,7 +124,8 @@ public sealed class ManifestCompatTests
         (List<NativeLiveFile> nativeFiles, ulong lastSeq) = CreateNativeDb(dir.Path);
         Assert.IsTrue(nativeFiles.Count >= 5);
 
-        RecoveredVersionState state = ManifestReader.Recover(OpenManifest(dir.Path, out _), null);
+        RecoveredVersionState state;
+        using (ManifestLogReader manifest = OpenManifest(dir.Path, out _)) state = ManifestReader.Recover(manifest, null);
         Assert.AreEqual(lastSeq, state.LastSequence);
         Assert.AreEqual(3, state.ColumnFamilies.Count); // default, cf1, cf2 ("temp" was dropped)
         Assert.IsNotNull(state.FindColumnFamily("cf1"));
@@ -136,19 +137,9 @@ public sealed class ManifestCompatTests
         AssertLiveFilesMatch(nativeFiles, state);
 
         // Same result through the directory-level entry point.
-        RecoveredVersionState viaDir = ManifestReader.RecoverFromDirectory(LocalFileSystem.Instance, dir.Path,
-            static f => new TestLogReader(ReadAll(f)), null, out ulong manifestNumber);
+        RecoveredVersionState viaDir = ManifestReader.RecoverFromDirectory(LocalFileSystem.Instance, dir.Path, null, out ulong manifestNumber);
         Assert.AreEqual(state.LastSequence, viaDir.LastSequence);
         Assert.IsTrue(manifestNumber > 0);
-    }
-
-    private static byte[] ReadAll(ISequentialFile f)
-    {
-        using var ms = new MemoryStream();
-        var buf = new byte[8192];
-        int n;
-        while ((n = f.Read(buf)) > 0) ms.Write(buf, 0, n);
-        return ms.ToArray();
     }
 
     [TestMethod]
@@ -156,7 +147,7 @@ public sealed class ManifestCompatTests
     {
         using var dir = new TempDir("manifest-bytes");
         CreateNativeDb(dir.Path);
-        TestLogReader reader = OpenManifest(dir.Path, out _);
+        using ManifestLogReader reader = OpenManifest(dir.Path, out _);
         int records = 0, withFiles = 0;
         while (reader.TryReadRecord(out ReadOnlySpan<byte> record))
         {
@@ -176,13 +167,15 @@ public sealed class ManifestCompatTests
     {
         using var dir = new TempDir("manifest-write");
         (List<NativeLiveFile> nativeFiles, ulong lastSeq) = CreateNativeDb(dir.Path);
-        RecoveredVersionState state = ManifestReader.Recover(OpenManifest(dir.Path, out string oldManifest), null);
+        RecoveredVersionState state;
+        string oldManifest;
+        using (ManifestLogReader manifest = OpenManifest(dir.Path, out oldManifest)) state = ManifestReader.Recover(manifest, null);
 
         // Write a fresh MANIFEST with the managed writer (snapshot of the recovered state) and point CURRENT at it.
         ulong manifestNumber = state.NextFileNumber;
         state.NextFileNumber = manifestNumber + 1;
         string newManifest = FileNames.DescriptorFileName(dir.Path, manifestNumber);
-        using (var log = new TestLogWriter(newManifest))
+        await using (ManifestLogWriter log = ManifestLogWriter.Create(LocalFileSystem.Instance, newManifest))
         {
             await new ManifestWriter(log).WriteSnapshotAsync(state, static _ => 0, CancellationToken.None);
         }
@@ -190,7 +183,8 @@ public sealed class ManifestCompatTests
         File.Delete(oldManifest);
 
         // Our own reader agrees with what we wrote.
-        AssertLiveFilesMatch(nativeFiles, ManifestReader.Recover(new TestLogReader(File.ReadAllBytes(newManifest)), null));
+        using (ManifestLogReader reread = ManifestLogReader.Open(LocalFileSystem.Instance, newManifest))
+            AssertLiveFilesMatch(nativeFiles, ManifestReader.Recover(reread, null));
 
         // Native opens the DB through the managed MANIFEST and sees all data.
         var options = new RocksDbSharp.DbOptions();

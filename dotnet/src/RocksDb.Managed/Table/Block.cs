@@ -42,6 +42,11 @@ public sealed class Block
     public int HashMapOffset { get; private set; }
     public int HashNumBuckets { get; private set; }
     public bool HasHashIndex => HashMapOffset >= 0;
+    /// <summary>
+    /// Length of the common user-key prefix stored at the start of the block (format_version &gt;= 8,
+    /// optimize_key_common_prefix): restarts[0] when non-zero. Restart entries store their key without it.
+    /// </summary>
+    public int CommonPrefixLength { get; private set; }
     /// <summary>Approximate memory charged for this block (for cache accounting).</summary>
     public int Charge => _buffer.Length;
 
@@ -88,7 +93,7 @@ public sealed class Block
         uint packed = Coding.DecodeFixed32(data[(_length - 4)..]);
         bool hash = (packed & HashIndexBit) != 0;
         packed &= ~HashIndexBit;
-        if ((packed & SeparatedKvBit) != 0) ThrowHelper.NotSupported("separated key/value data blocks (format_version 8) are not supported");
+        if ((packed & SeparatedKvBit) != 0) ThrowHelper.NotSupported("separated key/value data blocks (separate_key_value_in_data_block) are not supported");
         packed &= ~UniformKeysBit; // informational only
         if ((packed & ExtendedMetadataBit) != 0) ThrowHelper.Corruption("Unsupported extended block metadata (reserved bit set)");
         if (packed > MaxNumRestarts) ThrowHelper.Corruption("Unrecognized feature in block footer (reserved bits set)");
@@ -113,8 +118,8 @@ public sealed class Block
                 ThrowHelper.Corruption("bad block restart offset");
             prev = r;
         }
-        if (numRestarts > 0 && RestartOffset > 0 && Coding.DecodeFixed32(data[RestartOffset..]) != 0)
-            ThrowHelper.NotSupported("blocks with a common key prefix section (format_version 8) are not supported");
+        // A non-zero restarts[0] self-signals the common-prefix section [0, restarts[0]) (no footer bit).
+        CommonPrefixLength = numRestarts > 0 && RestartOffset > 0 ? (int)Coding.DecodeFixed32(data[RestartOffset..]) : 0;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

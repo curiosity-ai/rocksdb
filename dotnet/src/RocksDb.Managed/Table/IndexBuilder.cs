@@ -11,10 +11,12 @@ namespace RocksDb.Managed.Table;
 /// </summary>
 internal sealed class ShortenedIndexBuilder : IDisposable
 {
-    private readonly Comparator _ucmp;
+    private readonly InternalKeyComparator _icmp;
     private readonly BlockBuilder _withSeq;
     private readonly BlockBuilder _withoutSeq;
     private readonly bool _useValueDeltaEncoding;
+    private readonly bool _useValueDeltaEscape;
+    private readonly bool _useCommonPrefix;
     private readonly bool _includeFirstKey;
     private readonly IndexShorteningMode _shortening;
     private readonly PooledBufferWriter _scratch = new(64);
@@ -27,12 +29,16 @@ internal sealed class ShortenedIndexBuilder : IDisposable
     private int _indexSize;
     private bool _finished;
 
-    public ShortenedIndexBuilder(Comparator ucmp, int indexBlockRestartInterval, int formatVersion, bool useValueDeltaEncoding,
-        IndexShorteningMode shortening, bool includeFirstKey)
+    public ShortenedIndexBuilder(InternalKeyComparator icmp, int indexBlockRestartInterval, int formatVersion, bool useValueDeltaEncoding,
+        IndexShorteningMode shortening, bool includeFirstKey, bool useCommonPrefix)
     {
-        _ucmp = ucmp;
-        _withSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75);
-        _withoutSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75);
+        _icmp = icmp;
+        _withSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75,
+            useCommonPrefix, isUserKey: false);
+        _withoutSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75,
+            useCommonPrefix, isUserKey: true);
+        _useValueDeltaEscape = BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(formatVersion);
+        _useCommonPrefix = useCommonPrefix;
         _useValueDeltaEncoding = useValueDeltaEncoding;
         _includeFirstKey = includeFirstKey;
         _shortening = shortening;
@@ -55,18 +61,23 @@ internal sealed class ShortenedIndexBuilder : IDisposable
         ReadOnlySpan<byte> separator;
         if (hasNext)
         {
+            _scratch.Clear();
             if (_shortening != IndexShorteningMode.NoShortening
-                && InternalKeyOrdering.TryFindShortestSeparator(_ucmp, lastKeyInCurrentBlock, firstKeyInNextBlock, _scratch))
+                && _icmp.FindShortestSeparator(lastKeyInCurrentBlock, firstKeyInNextBlock, _scratch))
                 separator = _scratch.WrittenSpan;
             else
                 separator = lastKeyInCurrentBlock;
-            if (!_mustUseSeparatorWithSeq && _ucmp.Compare(DbFormat.ExtractUserKey(lastKeyInCurrentBlock), DbFormat.ExtractUserKey(firstKeyInNextBlock)) == 0)
+            // ShouldUseKeyPlusSeqAsSeparator: adjacent blocks share a boundary user key.
+            if (!_mustUseSeparatorWithSeq && _icmp.EqualUserKey(DbFormat.ExtractUserKey(lastKeyInCurrentBlock), DbFormat.ExtractUserKey(firstKeyInNextBlock)))
                 _mustUseSeparatorWithSeq = true;
         }
         else
         {
-            if (_shortening == IndexShorteningMode.ShortenSeparatorsAndSuccessor
-                && InternalKeyOrdering.TryFindShortSuccessor(_ucmp, lastKeyInCurrentBlock, _scratch))
+            // Last entry: a short successor shares ~no prefix with the file's keys and would collapse the common-prefix
+            // index block's prefix, so with common-prefix encoding the full last key is used (GetSeparatorWithSeq).
+            _scratch.Clear();
+            if (_shortening == IndexShorteningMode.ShortenSeparatorsAndSuccessor && !_useCommonPrefix
+                && _icmp.FindShortSuccessor(lastKeyInCurrentBlock, _scratch))
                 separator = _scratch.WrittenSpan;
             else
                 separator = lastKeyInCurrentBlock;
@@ -77,7 +88,7 @@ internal sealed class ShortenedIndexBuilder : IDisposable
         IndexValue.EncodeFull(_encoded, handle, _includeFirstKey, firstKey);
         _deltaEncoded.Clear();
         if (_useValueDeltaEncoding && _hasLastHandle)
-            IndexValue.EncodeDelta(_deltaEncoded, handle, _lastHandle, _includeFirstKey, firstKey);
+            IndexValue.EncodeDelta(_deltaEncoded, handle, _lastHandle, _useValueDeltaEscape, _includeFirstKey, firstKey);
         _lastHandle = handle;
         _hasLastHandle = true;
 
