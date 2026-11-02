@@ -55,7 +55,7 @@ public static class EngineFactory
         return engine switch
         {
             "native" => new Native.NativeKeyValueEngine(path, options),
-            "managed" => throw new NotSupportedException("The managed engine is not implemented yet (Phase 2: DB core)."),
+            "managed" => new ManagedEngine(path, options),
             _ => throw new ArgumentException("unknown engine '" + engine + "' (expected native|managed)"),
         };
     }

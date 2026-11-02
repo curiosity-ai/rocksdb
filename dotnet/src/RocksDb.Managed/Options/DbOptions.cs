@@ -15,6 +15,8 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     public string WalDir { get; set; } = "";
     /// <summary>Directory for info LOG files; empty means the DB directory. Not persisted.</summary>
     public string DbLogDir { get; set; } = "";
+    /// <summary>File system the DB uses (rocksdb::DBOptions::env / file_system). Not persisted.</summary>
+    public Env.IFileSystem FileSystem { get; set; } = Env.LocalFileSystem.Instance;
     /// <summary>Additional data paths (path, target size) for SST files. Not persisted.</summary>
     public List<(string Path, ulong TargetSize)> DbPaths { get; } = new();
 
@@ -178,7 +180,7 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
 
     public DbOptions Clone()
     {
-        var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir };
+        var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir, FileSystem = FileSystem };
         c.DbPaths.AddRange(DbPaths);
         c.CopyFrom(this);
         return c;

@@ -90,6 +90,8 @@ public static class DbBenchRunner
         long bytes = 0, found = 0;
         int valuePos = 0;
 
+        long allocBefore = GC.GetTotalAllocatedBytes(precise: true);
+        int gen0Before = GC.CollectionCount(0);
         var sw = Stopwatch.StartNew();
         switch (name)
         {
@@ -134,6 +136,8 @@ public static class DbBenchRunner
                 throw new ArgumentException("unknown benchmark " + name);
         }
         sw.Stop();
+        long allocated = GC.GetTotalAllocatedBytes(precise: true) - allocBefore;
+        int gen0 = GC.CollectionCount(0) - gen0Before;
 
         double seconds = sw.Elapsed.TotalSeconds;
         double microsPerOp = sw.Elapsed.TotalMicroseconds / Math.Max(ops, 1);
@@ -142,6 +146,8 @@ public static class DbBenchRunner
             name, microsPerOp, opsPerSec, seconds, ops);
         if (bytes > 0) line += string.Format(CultureInfo.InvariantCulture, " {0,6:F1} MB/s", bytes / 1048576.0 / Math.Max(seconds, 1e-9));
         if (name is "readrandom" or "readmissing") line += " (" + found + " of " + ops + " found)";
+        // Managed allocations (all threads) per operation; native engines only allocate in unmanaged memory.
+        line += string.Format(CultureInfo.InvariantCulture, " alloc {0:F1} B/op gen0 {1}", allocated / (double)Math.Max(ops, 1), gen0);
         Console.WriteLine(line);
     }
 
