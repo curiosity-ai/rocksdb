@@ -106,7 +106,7 @@ P = perf + block cache wiring (Table/, Cache/, Memtable/, Util/).
 - [x] SstFileWriter public API + IngestExternalFiles (level picking, global seqno in MANIFEST) — compat both ways
 - [x] Replication round trip (checkpoint + tail into managed and native replicas)
 - [ ] Ingestion: WriteGlobalSeqno, IngestBehind, overlapping files in one call, running-compaction checks
-- [ ] Port rocksdb-sharp Replication/ layer onto the new API (mapping in phase-2b report: checkpoint seq + TailUpdatesAsync replaces WalTailer)
+- [~] Port rocksdb-sharp Replication/ + Switchover/ + Cluster/ (Raft) into `src/RocksDb.Managed.Replication` (agent running) — rocksdb-sharp stays native-only, no integration
 - [x] Read-only and secondary open (+TryCatchUpWithPrimary over a live native primary)
 - [ ] Secondary: tail MANIFEST incrementally instead of re-reading
 - [x] GetProperty (subset)
@@ -132,6 +132,7 @@ Perf follow-ups: flush is ~2x slower than native and allocates 6 MB; cache-miss 
 HyperClock slots as array-of-structs; single-threaded cached table Get +18% vs plain dictionary.
 
 ## Phase 3 — Compat + performance
+- [~] `tests/RocksDb.Managed.RoundTrip`: crash-isolated managed↔native round trips (test exe re-invokes itself as a child for native/managed sides; captures crashes, hangs, unclean shutdown) (agent running)
 - [x] Full-DB compat: native writes DB → managed opens/reads/writes → native reopens & verifies (and reverse)
 - [ ] Randomized differential test vs native (same op stream, compare results)
 - [ ] Benchmarks vs native: fillseq, fillrandom, readrandom, readseq, seekrandom, multiget; allocation report
