@@ -84,8 +84,9 @@ P = perf + block cache wiring (Table/, Cache/, Memtable/, Util/).
 - [ ] Column families (create/drop/list, per-CF options)
 - [ ] Write path: async group commit (leader/follower via channel), WAL append + sync, memtable insert, sequence numbers
 - [ ] Read path: memtable → immutable memtables → L0..Ln with filter + block cache; snapshots
-- [ ] Iterators: merging iterator, DBIter (visibility, deletions, merges, bounds, prefix)
-- [ ] Merge operator support (full/partial merge, span-based)
+- [x] Iterators: MergingIterator, LevelIterator, DBIter, public `Iterator` (+foreach, ScanAsync), `DbIteratorFactory` — matches native exactly on multi-level DB with snapshots/bounds
+- [ ] Iterators: range tombstones in heap (skip deleted ranges), prefix seek, async reverse movement, blob/wide columns
+- [x] Merge: `MergeHelper` (TimedFullMerge, MergeUntil), `UInt64AddOperator`, `StringAppendOperator`; `RangeDelAggregator` (read + compaction w/ snapshot stripes); `CompactionFilter` contract
 - [ ] Flush: memtable → L0 SST, MANIFEST update, WAL obsoletion
 - [ ] Compaction: leveled (picker + job), universal later; compaction filter; background scheduling
 - [ ] Range deletions (DeleteRange) end-to-end
