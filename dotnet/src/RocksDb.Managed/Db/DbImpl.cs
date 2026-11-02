@@ -504,7 +504,11 @@ internal sealed partial class DbImpl : IAsyncDisposable
         NotifySequenceWaiters(); // wake WAL tailers so they observe the close
         try
         {
-            lock (_mutex) _shuttingDown = true;
+            lock (_mutex)
+            {
+                _shuttingDown = true;
+                SignalBackgroundWork(); // wake FlushAsync waiters whose queued flush will never be scheduled now
+            }
             CancelBackgroundCompactions();
             await WaitForBackgroundWorkAsync(synchronous).ConfigureAwait(false);
             LogWriter? log = _log;

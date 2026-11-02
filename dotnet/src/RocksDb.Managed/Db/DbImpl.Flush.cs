@@ -206,6 +206,9 @@ internal sealed partial class DbImpl
                 if (target.FlushCompleted || !cfd.Imm.Contains(target)) return;
                 if (_bgError is { } e) ThrowBackgroundError(e);
                 if (cfd.Dropped) ThrowDropped(cfd);
+                // Close stops scheduling flushes: a flush that was queued but never started will not complete, so
+                // waiters must not sleep past shutdown (CloseAsync signals after setting _shuttingDown).
+                if (_shuttingDown) ThrowDisposed();
                 signal = _bgSignal.Task;
             }
             if (synchronous) signal.Wait(cancellationToken);
