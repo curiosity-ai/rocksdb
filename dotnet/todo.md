@@ -145,7 +145,9 @@ Write-amp: fill 3.42 native vs 3.24 managed; overwrite 4.12 vs 4.17.
 Goal: finish implementation, validate vs C++ source, comprehensive tests (unit/integration/round-trip) and benchmarks (managed vs rocksdb-sharp vs pure C native).
 - [x] Source audit #1 vs C++ (`docs/validation.md`): ~90 files (formats/util/table/wal/options/memtable/iterators); fixed memtable range-tombstone publish race, ArenaBlockSize default (0 → derived), internal-key type validation; added db_iter_test vectors
 - [ ] Source audit #2: DB layer (DbImpl*, VersionSet/Version, Compaction/*, FlushJob, WriteThread, recovery, ingestion, checkpoint, secondary)
-- [~] Three-way benchmark suite: C benchmark on librocksdb (`bench/native-c`), extended dbbench runner, `bench/run-all.sh`, micro head-to-heads (agent running)
+- [x] Three-way benchmark suite: C benchmark on librocksdb (`bench/native-c`), dbbench runner with full workload list + percentiles + async, `bench/run-all.sh`, `compare`/`report`, `DbHeadToHeadBenchmarks` (results in `bench/results/`)
+- [~] Bench follow-up: re-add compaction flags/stats/waitforcompaction for all 3 engines (agent running)
+- [ ] Perf #2 (from 3-way results): async API allocations (150–300 B/write, ~230 B/TryGetAsync, 0.8–2.9 KB/async seek); span-based MultiGet (130–930 B/key); reverse iteration 1.3–4.6x slower than C; iteration/seek with 1 KiB values 2–5x; flush 1.3–3x slower + 2–8 MB allocs; fillseq 1 KiB allocs ~1.1 KB/op; re-run matrix on a quiet machine
 - [~] `tests/RocksDb.Managed.RoundTrip`: crash-isolated managed↔native round trips (test exe re-invokes itself as a child for native/managed sides; captures crashes, hangs, unclean shutdown) (agent running)
 - [x] Full-DB compat: native writes DB → managed opens/reads/writes → native reopens & verifies (and reverse)
 - [ ] Randomized differential test vs native (same op stream, compare results)
