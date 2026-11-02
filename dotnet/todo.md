@@ -145,10 +145,11 @@ Write-amp: fill 3.42 native vs 3.24 managed; overwrite 4.12 vs 4.17.
 
 ## Phase 3 — Compat + performance
 Remaining-gap wave (agents running):
-- [~] WritePrepared / WriteUnprepared transaction policies (+ read callbacks, SnapshotChecker, recovery)
-- [~] Blob direct write, V2 entity blob columns, compaction filters on entities/blobs; optimistic-txn UDT parity check; remaining UDT txn overloads
-- [~] Audit #3: line-by-line coverage of every remaining file (`docs/validation-coverage.md`)
-- [~] rocksdb-sharp: full native build with codecs + export/loader verification (PR #98)
+- [x] WritePrepared / WriteUnprepared (commit cache, prepared heap, read callbacks, SnapshotChecker in compaction, recovery; WAL byte-identical and mutual recovery with native 11.12 under both policies). Gaps: two_write_queues, commit-time batches
+- [x] Blob direct write + V2 entity blob columns + FilterV3 on entities (compat both ways with native 11.12, which supports both); optimistic txn + UDT = upstream parity (cited); remaining UDT txn overloads done
+- [x] Audit #3: `docs/validation-coverage.md` covers all 220 source files (172 line-by-line across audits, 48 managed-only design-reviewed); fixed FIFO TTL newest-key-time, WAL checksum always verified, compaction_options_fifo/universal persisted + SetOptions, blob GC ranges, TTL 2038
+- [x] rocksdb-sharp: real linux-x64 glibc CI build with all codecs: exports only rocksdb_* (1772), loader preload not required, all native/managed tests pass (PR #98). arm64/musl/jemalloc not built locally (same flags)
+- [ ] Remaining deviations from audit #3: universal periodic/delete-/read-triggered/incremental, FIFO kv-ratio/max_data_files_size/temperature, output cutting (TTL/partitioner/round-robin/upper bound), memtable first-insert time, HyperClock eviction-effort cap
 - [ ] After the above: repeated benchmark runs (≥3 repetitions, medians + spread) on a quiet machine
 Final completeness wave (all merged):
 - [x] Integrated BlobDB: blob file format/builder/reader/cache/GC, versions & MANIFEST, Get/MultiGet/iterators/merges, checkpoint/GetLiveFiles; blob files byte-identical to native; native↔managed both ways; blob dbbench (`results/2026-11-02-vm-blob.md`: managed 0.55x C)
