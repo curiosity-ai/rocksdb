@@ -1,6 +1,6 @@
 using System.Buffers;
 using RocksDb.Managed.Db;
-using RocksDb.Managed.Utilities.WriteBatchWithIndex;
+using RocksDb.Managed.Utilities.Wbwi;
 using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed;
@@ -58,6 +58,18 @@ public sealed class WriteBatchWithIndex : IDisposable
         _index = new WriteBatchEntryIndex(_batch, defaultComparator);
         OverwriteKey = overwriteKey;
     }
+
+    /// <summary>
+    /// The batch of a transaction (TransactionBaseImpl): overwrite_key mode, and with <paramref name="withNoop"/> (2PC) the
+    /// batch starts with a Noop record that Prepare turns into the begin-prepare marker (also after <see cref="Clear"/>).
+    /// </summary>
+    internal WriteBatchWithIndex(int maxBytes, bool withNoop) : this(Comparator.Bytewise, 0, true, maxBytes)
+    {
+        _withNoop = withNoop;
+        if (withNoop) _batch.InsertNoop();
+    }
+
+    private readonly bool _withNoop;
 
     /// <summary>overwrite_key mode.</summary>
     public bool OverwriteKey { get; }
@@ -158,6 +170,7 @@ public sealed class WriteBatchWithIndex : IDisposable
     public void Clear()
     {
         _batch.Clear();
+        if (_withNoop) _batch.InsertNoop();
         _index.Clear();
     }
 
@@ -266,6 +279,106 @@ public sealed class WriteBatchWithIndex : IDisposable
     }
 
     internal WriteBatchEntryIndex Index => _index;
+
+    // ---- internal column-family-id API (transactions) ----
+
+    /// <summary>Registers the comparator ordering column family <paramref name="cf"/> (SetComparatorForCF).</summary>
+    internal void RegisterColumnFamily(uint cf, Comparator comparator) => _index.SetComparator(cf, comparator);
+
+    internal void Put(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+    {
+        int offset = _batch.DataSize;
+        _batch.Put(cf, key, value);
+        AddOrUpdateIndex(cf, WriteType.Put, offset);
+    }
+
+    internal void PutEntitySerialized(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity)
+    {
+        int offset = _batch.DataSize;
+        _batch.PutEntitySerialized(cf, key, entity);
+        AddOrUpdateIndex(cf, WriteType.PutEntity, offset);
+    }
+
+    internal void Delete(uint cf, ReadOnlySpan<byte> key)
+    {
+        int offset = _batch.DataSize;
+        _batch.Delete(cf, key);
+        AddOrUpdateIndex(cf, WriteType.Delete, offset);
+    }
+
+    internal void SingleDelete(uint cf, ReadOnlySpan<byte> key)
+    {
+        int offset = _batch.DataSize;
+        _batch.SingleDelete(cf, key);
+        AddOrUpdateIndex(cf, WriteType.SingleDelete, offset);
+    }
+
+    internal void Merge(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+    {
+        int offset = _batch.DataSize;
+        _batch.Merge(cf, key, value);
+        AddOrUpdateIndex(cf, WriteType.Merge, offset);
+    }
+
+    /// <summary>
+    /// GetFromBatchAndDB's batch part for column family <paramref name="cf"/>: the lookup result, with
+    /// <see cref="LookupResult.Deleted"/> reported as <see cref="LookupResult.Found"/> when merge operands follow the delete.
+    /// </summary>
+    internal LookupResult Lookup(uint cf, ReadOnlySpan<byte> key)
+    {
+        LookupResult r = FindLatestUpdate(cf, _index.GetComparator(cf), key, _mergeContext, out _, out _);
+        return r == LookupResult.Deleted && _mergeContext.Count > 0 ? LookupResult.Found : r;
+    }
+
+    /// <summary>
+    /// Computes the value of <paramref name="key"/> (MergeKey): the batch's Put/PutEntity (or, when the batch holds only
+    /// merges, <paramref name="dbValue"/> when <paramref name="dbHasValue"/>) with the batch's merge operands applied.
+    /// Returns false if the key does not exist.
+    /// </summary>
+    internal bool ComputeValue(uint cf, ReadOnlySpan<byte> key, MergeOperator? mergeOperator, bool dbHasValue, ReadOnlySpan<byte> dbValue,
+        IBufferWriter<byte> result)
+    {
+        LookupResult r = FindLatestUpdate(cf, _index.GetComparator(cf), key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+        bool hasBase;
+        ReadOnlySpan<byte> baseValue;
+        switch (r)
+        {
+            case LookupResult.Found:
+                hasBase = true;
+                baseValue = type == WriteType.PutEntity ? Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(v) : v;
+                break;
+            case LookupResult.MergeInProgress:
+                hasBase = dbHasValue;
+                baseValue = dbValue;
+                break;
+            case LookupResult.Deleted:
+                hasBase = false;
+                baseValue = default;
+                break;
+            default:
+                if (!dbHasValue) return false;
+                result.Write(dbValue);
+                return true;
+        }
+        if (_mergeContext.Count == 0)
+        {
+            if (!hasBase) return false;
+            result.Write(baseValue);
+            return true;
+        }
+        if (mergeOperator is null) ThrowHelper.InvalidArgument("Merge operator not specified for the column family");
+        MergeHelper.TimedFullMerge(mergeOperator!, key, hasBase, baseValue, _mergeContext, result);
+        return true;
+    }
+
+    /// <summary>NewIteratorWithBase for a column family id (transactions).</summary>
+    internal BaseDeltaIterator NewIteratorWithBase(uint cf, Comparator comparator, MergeOperator? mergeOperator, Iterator baseIterator,
+        ReadOptions? options)
+    {
+        _index.SetComparator(cf, comparator);
+        var delta = new WriteBatchWithIndexIterator(this, cf, comparator, options?.IterateLowerBound, options?.IterateUpperBound);
+        return new BaseDeltaIterator(baseIterator, delta, comparator, mergeOperator);
+    }
 
     internal Comparator ComparatorOf(ColumnFamily? cf) => cf is null ? _defaultComparator : _index.GetComparator(CfId(cf));
 

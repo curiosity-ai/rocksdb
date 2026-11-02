@@ -24,6 +24,13 @@ internal sealed partial class DbImpl
         return Comparator.TryGetBuiltin(name, out c) ? c : null;
     }
 
+    /// <summary>The user comparator of the live column family <paramref name="cfId"/> (bytewise when unknown).</summary>
+    internal Comparator UserComparatorOf(uint cfId)
+    {
+        ColumnFamilyData?[] map = Volatile.Read(ref _cfById);
+        return cfId < (uint)map.Length && map[cfId] is { } cfd ? cfd.UserComparator : Comparator.Bytewise;
+    }
+
     /// <summary>Registers the custom comparators of <paramref name="descriptors"/> for MANIFEST replays.</summary>
     private void SetComparatorResolver(Dictionary<string, ColumnFamilyOptions> descriptors)
     {

@@ -55,7 +55,7 @@ public abstract class Transaction : IDisposable
         _writeOptions = writeOptions ?? new WriteOptions();
         // TransactionBaseImpl::InitWriteBatch: with allow_2pc the batch starts with a Noop that Prepare turns into the
         // begin-prepare marker.
-        _batch = new IndexedWriteBatch(_db.Options.Allow2Pc, maxWriteBatchSize);
+        _batch = new IndexedWriteBatch(_db.Options.Allow2Pc, maxWriteBatchSize, _db.UserComparatorOf);
     }
 
     /// <summary>The database this transaction belongs to.</summary>

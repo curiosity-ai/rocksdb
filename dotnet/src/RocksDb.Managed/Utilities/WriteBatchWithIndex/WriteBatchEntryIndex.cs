@@ -1,6 +1,6 @@
 using System.Runtime.CompilerServices;
 
-namespace RocksDb.Managed.Utilities.WriteBatchWithIndex;
+namespace RocksDb.Managed.Utilities.Wbwi;
 
 /// <summary>
 /// The index of a <see cref="Managed.WriteBatchWithIndex"/>: a skip list of entries pointing into the batch rep,

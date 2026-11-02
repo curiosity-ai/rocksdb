@@ -1,5 +1,5 @@
 using RocksDb.Managed.Db;
-using RocksDb.Managed.Utilities.WriteBatchWithIndex;
+using RocksDb.Managed.Utilities.Wbwi;
 
 namespace RocksDb.Managed;
 
