@@ -64,10 +64,14 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [ ] Verify index separators against a native SST index block (needs stream B reader)
 - [x] Renamed `Db.ValueType` → `Db.EntryType` (clashed with `System.ValueType`)
 
-### F. Infrastructure  `[~] agent running`
-- [ ] `Env/` file abstraction: async sequential writer (`WritableFileWriter`), random-access reader (`RandomAccessFileReader`), `LOCK` file
-- [ ] Block cache (sharded LRU first, HyperClock later) with ref-counted pooled blocks — `cache/`
-- [ ] Benchmark harness: managed vs native for each component + db_bench-like workloads (fillseq, fillrandom, readrandom, seekrandom)
+### F. Infrastructure  `[x] merged (8d7a3d0)`
+- [x] `LocalFileSystem` hardened: pooled growing write buffer, fdatasync, dir fsync, fallocate, direct I/O (Linux), OFD LOCK interoperating with native RocksDB; `MemoryFileSystem` with crash simulation; `FilePrefetchBuffer`
+- [x] Block cache: sharded LRU (+priority pools, strict capacity) and HyperClock; `OffsetableCacheKey`; `CachedBlock` ref-counted handles — recommendation: HyperClock default
+- [x] db_bench-style runner (`-- dbbench --engine native ...`) + `IKeyValueEngine`; native baseline recorded below
+- [ ] Wire block cache into `BlockBasedTableReader` (replace `Table.IBlockCache` seam with `Cache.BlockCache`/`CachedBlock`)
+- [ ] Rate limiter implementation; hard links (Checkpoint); non-blocking SyncAsync; auto-resizing HyperClock
+
+Native baseline (200k ops, 16B key / 100B value, shared noisy 4-core box): fillseq 3.9–9.1 µs/op, fillrandom 7.1–8.0, readrandom memtable 4.8, readrandom SST 15.4, readmissing 4.0.
 
 ## Phase 2 — DB core
 - [ ] `RocksDb.OpenAsync`: create/recover DB (CURRENT→MANIFEST→VersionSet, replay WALs into memtables)
