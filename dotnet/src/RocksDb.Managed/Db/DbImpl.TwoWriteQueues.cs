@@ -271,8 +271,19 @@ internal sealed partial class DbImpl
             }
             else
             {
-                // Otherwise we inc seq number to do solely the seq allocation.
-                AssignWalOnlySequences(group, seqInc);
+                // Otherwise we inc seq number to do solely the seq allocation. Taken under the WAL write lock too, so that
+                // WriteRecoverableState (which reads the last allocated sequence and then consumes the following ones
+                // under that lock) cannot interleave with it.
+                ValueTask l = AcquireWalWriteLockAsync(synchronous);
+                if (!l.IsCompletedSuccessfully) await l.ConfigureAwait(false);
+                try
+                {
+                    AssignWalOnlySequences(group, seqInc);
+                }
+                finally
+                {
+                    _walWriteLock!.Release();
+                }
             }
 
             // PreReleaseCallback (is_mem_disabled = true: the commit callbacks publish from this queue only, in order).

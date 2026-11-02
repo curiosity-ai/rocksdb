@@ -339,20 +339,20 @@ public sealed class TwoWriteQueuesTests
     }
 
     /// <summary>
-    /// A read without a snapshot. With a tiny commit cache it can fail with TryAgain (max_evicted_seq advanced past its
-    /// sequence while it ran: TXN_GET_TRY_AGAIN), like upstream; it is retried.
+    /// A read without a snapshot. With a tiny commit cache it can fail with TryAgain (max_evicted_seq reached its
+    /// sequence: TXN_GET_TRY_AGAIN), like upstream, and keeps failing while nothing is written; it then reads through a
+    /// fresh snapshot (GetSnapshot advances the sequence past max_evicted_seq).
     /// </summary>
     private static string GetLatest(TransactionDatabase db, string key)
     {
-        for (int attempt = 0; ; attempt++)
+        try
         {
-            try
-            {
-                return Get(db, key);
-            }
-            catch (RocksDbException e) when (e.Code == StatusCode.TryAgain && attempt < 100)
-            {
-            }
+            return Get(db, key);
+        }
+        catch (RocksDbException e) when (e.Code == StatusCode.TryAgain)
+        {
+            using Snapshot s = db.Database.GetSnapshot();
+            return Get(db, key, s);
         }
     }
 
