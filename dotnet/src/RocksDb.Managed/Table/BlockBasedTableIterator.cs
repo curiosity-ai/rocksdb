@@ -14,14 +14,16 @@ internal sealed class IndexCursor
     private BlockBasedTableReader _reader = null!;
     private readonly BlockIter _top = new();
     private readonly BlockIter _part = new();
-    private Block? _partBlock;
+    private BlockRef _topRef;
+    private BlockRef _partRef;
     private bool _partitioned;
+    private TableReadFlags _flags;
 
-    public static IndexCursor Rent(BlockBasedTableReader reader)
+    public static IndexCursor Rent(BlockBasedTableReader reader, TableReadFlags flags)
     {
         IndexCursor c = t_cached ?? new IndexCursor();
         t_cached = null;
-        c.Init(reader);
+        c.Init(reader, flags);
         return c;
     }
 
@@ -31,19 +33,28 @@ internal sealed class IndexCursor
         t_cached = this;
     }
 
-    public void Init(BlockBasedTableReader reader)
+    public void Init(BlockBasedTableReader reader, TableReadFlags flags)
     {
-        _reader = reader;
-        _partitioned = reader.IsPartitionedIndex;
-        reader.InitIndexIter(_top, reader.IndexBlock);
         UnloadPartition();
+        ReleaseTop();
+        _reader = reader;
+        _flags = flags;
+        _partitioned = reader.IsPartitionedIndex;
+        _topRef = reader.GetIndexBlockRef(flags);
+        reader.InitIndexIter(_top, _topRef.Block!);
     }
 
     public void Reset()
     {
         UnloadPartition();
-        _top.Clear();
+        ReleaseTop();
         _reader = null!;
+    }
+
+    private void ReleaseTop()
+    {
+        _top.Clear();
+        if (!_topRef.IsEmpty) _topRef.Release();
     }
 
     /// <summary>Releases the partition block and returns key buffers to the pool.</summary>
@@ -57,7 +68,7 @@ internal sealed class IndexCursor
     public bool Valid
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _partitioned ? _partBlock is not null && _part.Valid : _top.Valid;
+        get => _partitioned ? !_partRef.IsEmpty && _part.Valid : _top.Valid;
     }
 
     public BlockHandle Handle => _partitioned ? _part.BlockHandle : _top.BlockHandle;
@@ -132,17 +143,14 @@ internal sealed class IndexCursor
     private void LoadPartition()
     {
         UnloadPartition();
-        Block b = _reader.GetBlock(_top.BlockHandle);
-        _partBlock = b;
-        _reader.InitIndexIter(_part, b);
+        _partRef = _reader.GetBlockRef(_top.BlockHandle, BlockKind.Index, _flags);
+        _reader.InitIndexIter(_part, _partRef.Block!);
     }
 
     private void UnloadPartition()
     {
         _part.Clear();
-        Block? b = _partBlock;
-        _partBlock = null;
-        b?.Release();
+        if (!_partRef.IsEmpty) _partRef.Release();
     }
 }
 
@@ -160,19 +168,21 @@ public sealed class BlockBasedTableIterator : IDisposable
     private readonly BlockBasedTableReader _reader;
     private readonly IndexCursor _index = new();
     private readonly BlockIter _data = new();
-    private Block? _block;
+    private readonly TableReadFlags _flags;
+    private BlockRef _block;
     private BlockHandle _blockHandle;
 
-    internal BlockBasedTableIterator(BlockBasedTableReader reader)
+    internal BlockBasedTableIterator(BlockBasedTableReader reader, TableReadFlags flags)
     {
         _reader = reader;
-        _index.Init(reader);
+        _flags = flags;
+        _index.Init(reader, flags);
     }
 
     public bool Valid
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _block is not null && _data.Valid;
+        get => !_block.IsEmpty && _data.Valid;
     }
 
     /// <summary>Current internal key.</summary>
@@ -257,25 +267,23 @@ public sealed class BlockBasedTableIterator : IDisposable
             return false;
         }
         BlockHandle h = _index.Handle;
-        if (_block is not null && h == _blockHandle) return true;
+        if (!_block.IsEmpty && h == _blockHandle) return true;
         ReleaseBlock();
-        SetBlock(_reader.GetBlock(h), h);
+        SetBlock(_reader.GetBlockRef(h, BlockKind.Data, _flags), h);
         return true;
     }
 
-    private void SetBlock(Block b, BlockHandle h)
+    private void SetBlock(BlockRef b, BlockHandle h)
     {
         _block = b;
         _blockHandle = h;
-        _data.InitializeData(b, _reader.InternalComparator, _reader.GlobalSequenceNumber);
+        _data.InitializeData(b.Block!, _reader.InternalComparator, _reader.GlobalSequenceNumber);
     }
 
     private void ReleaseBlock()
     {
         _data.Clear();
-        Block? b = _block;
-        _block = null;
-        b?.Release();
+        if (!_block.IsEmpty) _block.Release();
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -314,10 +322,10 @@ public sealed class BlockBasedTableIterator : IDisposable
                 return ValueTask.CompletedTask;
             }
             BlockHandle h = _index.Handle;
-            if (_block is null || h != _blockHandle)
+            if (_block.IsEmpty || h != _blockHandle)
             {
                 ReleaseBlock();
-                ValueTask<Block> pending = _reader.GetBlockAsync(h, ct);
+                ValueTask<BlockRef> pending = _reader.GetBlockRefAsync(h, BlockKind.Data, _flags, ct);
                 if (!pending.IsCompletedSuccessfully) return PositionSlowAsync(pending, h, op, target, ct);
                 SetBlock(pending.Result, h);
             }
@@ -330,7 +338,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    private async ValueTask PositionSlowAsync(ValueTask<Block> pending, BlockHandle h, Op op, ReadOnlyMemory<byte> target, CancellationToken ct)
+    private async ValueTask PositionSlowAsync(ValueTask<BlockRef> pending, BlockHandle h, Op op, ReadOnlyMemory<byte> target, CancellationToken ct)
     {
         SetBlock(await pending.ConfigureAwait(false), h);
         if (op == Op.Seek) _data.Seek(target.Span);

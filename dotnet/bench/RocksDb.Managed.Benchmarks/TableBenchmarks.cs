@@ -13,12 +13,16 @@ namespace RocksDb.Managed.Benchmarks;
 public class TableBenchmarks
 {
     private const int NumEntries = 100_000;
+
+    private const int BlockSize = 4096;
     private byte[][] _lookupKeys = null!;
     private Block _block = null!;
     private BlockIter _blockIter = null!;
     private byte[][] _blockKeys = null!;
     private BlockBasedTableReader _cachedReader = null!;
+    private BlockBasedTableReader _legacyCachedReader = null!;
     private BlockBasedTableReader _uncachedReader = null!;
+    private BlockIter _indexIter = null!;
     private BlockBasedTableIterator _tableIter = null!;
     private PooledBufferWriter _value = null!;
     private int _next;
@@ -30,7 +34,7 @@ public class TableBenchmarks
     {
         var rnd = new Random(1);
         var file = new MemWritableFile();
-        using (var b = new BlockBasedTableBuilder(file, TableFormatOptions.Default, new TableBuilderOptions()))
+        using (var b = new BlockBasedTableBuilder(file, TableFormatOptions.Default with { BlockSize = BlockSize }, new TableBuilderOptions()))
         {
             byte[] v = new byte[100];
             for (int i = 0; i < NumEntries; i++)
@@ -43,7 +47,12 @@ public class TableBenchmarks
             b.Finish();
         }
         byte[] data = file.ToArray();
-        _cachedReader = BlockBasedTableReader.Open(new MemFile(data), new TableReaderOptions { BlockCache = new SimpleBlockCache() });
+        // HyperClock (the DB default) holds every block; the legacy seam variant matches the pre-wiring baseline.
+        var cache = Cache.BlockCache.CreateHyperClock(new Cache.HyperClockCacheOptions { Capacity = 64L << 20, EstimatedEntryCharge = 4096 });
+        _cachedReader = BlockBasedTableReader.Open(new MemFile(data), new TableReaderOptions { BlockCache = cache });
+        _legacyCachedReader = BlockBasedTableReader.Open(new MemFile(data), new TableReaderOptions { BlockCache = new SimpleBlockCache() });
+        _indexIter = new BlockIter();
+        _cachedReader.InitIndexIter(_indexIter, _cachedReader.IndexBlock);
         _uncachedReader = BlockBasedTableReader.Open(new MemFile(data), TableReaderOptions.Default);
         _tableIter = _cachedReader.NewIterator();
         _value = new PooledBufferWriter(256);
@@ -72,6 +81,7 @@ public class TableBenchmarks
         _blockIter.InitializeData(_block, InternalKeyComparator.Bytewise, BlockIter.DisableGlobalSequenceNumber);
         // Warm the cache.
         for (int i = 0; i < NumEntries; i += 10) _cachedReader.Get(_lookupKeys[i % _lookupKeys.Length], null);
+        for (int i = 0; i < NumEntries; i += 10) _legacyCachedReader.Get(_lookupKeys[i % _lookupKeys.Length], null);
         for (_tableIter.SeekToFirst(); _tableIter.Valid; _tableIter.Next()) { }
     }
 
@@ -80,6 +90,8 @@ public class TableBenchmarks
     {
         _tableIter.Dispose();
         _cachedReader.Dispose();
+        _legacyCachedReader.Dispose();
+        _indexIter.Dispose();
         _uncachedReader.Dispose();
         _blockIter.Dispose();
         _block.Release();
@@ -108,6 +120,20 @@ public class TableBenchmarks
         return _cachedReader.Get(_lookupKeys[_next++ & 1023], _value).Found;
     }
 
+    [Benchmark(Description = "Table: Get (cached, legacy IBlockCache seam)")]
+    public bool TableGetCachedLegacy()
+    {
+        _value.Clear();
+        return _legacyCachedReader.Get(_lookupKeys[_next++ & 1023], _value).Found;
+    }
+
+    [Benchmark(Description = "Index: Seek (top-level index, ~3k entries)")]
+    public bool IndexSeek()
+    {
+        _indexIter.Seek(_lookupKeys[_next++ & 1023]);
+        return _indexIter.Valid;
+    }
+
     [Benchmark(Description = "Table: Get (block read+checksum per op)")]
     public bool TableGetUncached()
     {
@@ -124,7 +150,7 @@ public class TableBenchmarks
         return n;
     }
 
-    private sealed class MemFile(byte[] data) : IRandomAccessFile
+    internal sealed class MemFile(byte[] data) : IRandomAccessFile
     {
         public long Length => data.Length;
         public int Read(long offset, Span<byte> destination)
@@ -137,7 +163,7 @@ public class TableBenchmarks
         public void Dispose() { }
     }
 
-    private sealed class MemWritableFile : IWritableFile
+    internal sealed class MemWritableFile : IWritableFile
     {
         private readonly MemoryStream _ms = new();
         public long Size => _ms.Length;
@@ -153,7 +179,7 @@ public class TableBenchmarks
     }
 
     /// <summary>Minimal lock-protected cache standing in for stream F's block cache.</summary>
-    private sealed class SimpleBlockCache : IBlockCache
+    internal sealed class SimpleBlockCache : IBlockCache
     {
         private readonly Dictionary<BlockCacheKey, Block> _map = new();
         private readonly Lock _lock = new();
