@@ -21,6 +21,8 @@ internal sealed partial class DbImpl
         // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
         // in between could drop the versions visible at that sequence (no snapshot protects them).
         ValidateReadSnapshot(options);
+        Statistics? st = Stats;
+        long t0 = st is null ? 0 : st.StartTimer();
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         ulong snapshot = ReadSequence(options);
         try
@@ -90,11 +92,25 @@ internal sealed partial class DbImpl
                 }
             }
             batch.FinishRun();
+            if (st is not null) RecordMultiGet(st, batch, t0);
         }
         finally
         {
             ReturnSuperVersion(sv);
         }
+    }
+
+    /// <summary>MultiGet statistics (DBImpl::MultiGetCommon: calls, keys read/found, bytes read, latency).</summary>
+    private static void RecordMultiGet(Statistics st, MultiGetBatch batch, long startTimestamp)
+    {
+        ulong bytes = 0;
+        for (int i = 0; i < batch.Count; i++) bytes += (ulong)batch.GetValue(i).Length;
+        st.RecordTick(Ticker.NumberMultigetCalls);
+        st.RecordTick(Ticker.NumberMultigetKeysRead, (ulong)batch.Count);
+        st.RecordTick(Ticker.NumberMultigetKeysFound, (ulong)batch.FoundCount);
+        st.RecordTick(Ticker.NumberMultigetBytesRead, bytes);
+        st.RecordInHistogram(Histogram.BytesPerMultiget, bytes);
+        st.RecordElapsedMicros(Histogram.DbMultiget, startTimestamp);
     }
 
     /// <summary>Drops the keys whose lookup finished from the front <paramref name="pending"/> entries of <paramref name="order"/>.</summary>

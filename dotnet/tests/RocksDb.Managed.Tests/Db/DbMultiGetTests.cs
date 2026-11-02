@@ -148,6 +148,26 @@ public sealed class DbMultiGetTests
     }
 
     [TestMethod]
+    public void RecordsMultiGetStatistics()
+    {
+        MemoryFileSystem fs = NewFs();
+        DbOptions o = NewOptions(fs);
+        var st = new Statistics();
+        o.Statistics = st;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o);
+        db.Put(B("a"), B("12345"));
+        db.Flush();
+        db.Put(B("b"), B("xy"));
+        using var batch = new MultiGetBatch();
+        batch.Add(B("a")).Add(B("b")).Add(B("c"));
+        db.MultiGet(batch);
+        Assert.AreEqual(1UL, st.GetTickerCount(Ticker.NumberMultigetCalls));
+        Assert.AreEqual(3UL, st.GetTickerCount(Ticker.NumberMultigetKeysRead));
+        Assert.AreEqual(2UL, st.GetTickerCount(Ticker.NumberMultigetKeysFound));
+        Assert.AreEqual(7UL, st.GetTickerCount(Ticker.NumberMultigetBytesRead));
+    }
+
+    [TestMethod]
     public void LegacyArrayOverloadUsesBatch()
     {
         MemoryFileSystem fs = NewFs();
