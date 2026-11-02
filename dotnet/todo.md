@@ -151,7 +151,13 @@ Remaining-gap wave (agents running):
 - [x] rocksdb-sharp: real linux-x64 glibc CI build with all codecs: exports only rocksdb_* (1772), loader preload not required, all native/managed tests pass (PR #98). arm64/musl/jemalloc not built locally (same flags)
 - [x] Audit #3 deviations ported: universal (full picker port: periodic, delete-triggered/marked files, max_read_amp, incremental, compression_size_percent), FIFO (max_data_files_size, kv-ratio, temperature in MANIFEST), output cutting (TTL, SstPartitioner + fixed-prefix, round-robin, upper bound), memtable first-insert time, HyperClock eviction cap/clamp, LRU charge, WAL iterator NotFound on gaps. Universal + FIFO lock-step parity with native (write-amp 3.201 vs 3.202, 4.408 vs 4.408)
 - [ ] Left: read-triggered compaction (needs read sampling), reduce_file_locking, preclude_last_level_data_seconds; partition-straddle preselection in CompactRange
-- [~] Final benchmarks: REPEATS=5 warm three-way matrix + compaction config + BDN head-to-heads on a quiet machine (agent running)
+- [x] Final benchmarks (`bench/results/2026-11-02-final-warm-r5.md`, `-final-bdn.md`): REPEATS=5 warm, medians + 95% bootstrap CIs.
+  Geomean time vs C native over 112 matrix benchmarks: managed 0.66x [0.64-0.67], managed-async 0.68x, rocksdb-sharp 1.03x;
+  compaction-heavy managed 0.58x. Known slow spots: 4-thread sync fillrandom/overwrite (1.04-1.81x; async 0.75-1.03x), 4-thread
+  readmissing with 100 B values (1.4-3.0x). BDN vs rocksdb-sharp: 0.21-0.60x, hot paths allocation-free.
+- [x] Fixed close/background-flush race found by the benchmark warm-up (purge after a flush could run after close and delete a
+  new DB's MANIFEST in the same directory).
+- [ ] Perf: 4-thread sync random writes and 4-thread readmissing (see above)
 Final completeness wave (all merged):
 - [x] Integrated BlobDB: blob file format/builder/reader/cache/GC, versions & MANIFEST, Get/MultiGet/iterators/merges, checkpoint/GetLiveFiles; blob files byte-identical to native; native↔managed both ways; blob dbbench (`results/2026-11-02-vm-blob.md`: managed 0.55x C)
 - [x] Blob: zlib >16 KiB (16 KiB independent chunks; readable by native), blob readers bounded by max_open_files; forced GC universal/FIFO = parity (upstream leveled-only)

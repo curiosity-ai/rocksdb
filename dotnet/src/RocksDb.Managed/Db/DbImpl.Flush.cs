@@ -110,6 +110,19 @@ internal sealed partial class DbImpl
                     if (m.Mem.Unref()) m.Mem.Dispose();
                 }
                 _pendingOutputs.Remove(fileNumber);
+            }
+            try
+            {
+                // Before the job is accounted as finished (like compaction): CloseAsync waits for _backgroundJobs to
+                // drain, so a purge running after close could delete files of a new DB created in the same directory.
+                PurgeObsoleteFiles();
+            }
+            catch (Exception e) when (e is IOException or RocksDbException)
+            {
+                // Deleting obsolete files is best effort.
+            }
+            lock (_mutex)
+            {
                 cfd.FlushRunning = false;
                 _runningFlushes--;
                 _backgroundJobs--;
@@ -117,14 +130,6 @@ internal sealed partial class DbImpl
                 MaybeScheduleFlush();
                 SignalBackgroundWork();
             }
-        }
-        try
-        {
-            PurgeObsoleteFiles();
-        }
-        catch (Exception e) when (e is IOException or RocksDbException)
-        {
-            // Deleting obsolete files is best effort.
         }
     }
 

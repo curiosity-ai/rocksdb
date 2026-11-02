@@ -203,6 +203,7 @@ Takeaways:
   `flush` rows are the noisiest.
 - **Robustness**: in 1 of 45 managed (sync) processes the warm-up crashed while re-creating its throwaway DB
   (`MANIFEST-000001` not found right after the destroy + open; see the report's notes); its 14 rows were re-measured.
+  Cause, fixed afterwards: close did not wait for the obsolete-file purge at the end of a background flush.
 
 Older reports in `bench/results/` are single runs on the shared, loaded VM: `2026-11-02-vm*.md` before perf pass #2,
 `-vm-perf2*.md` after it, `-vm-perf3*.md` after perf pass #3, `-vm-picker-compaction.md` after the compaction-picking

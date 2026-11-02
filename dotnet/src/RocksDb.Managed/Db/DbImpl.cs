@@ -455,6 +455,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         var wals = new List<ulong>();
         var manifests = new List<ulong>();
         List<(ColumnFamilyData Cfd, ulong Number)>? releasedBlobs = null;
+        TestHooks.Invoke("DBImpl::PurgeObsoleteFiles:Start");
         lock (_mutex)
         {
             // DisableFileDeletions: keep everything queued until deletions are re-enabled (FindObsoleteFiles).

@@ -624,8 +624,10 @@ What the repetitions show that single runs did not:
   (median 3.05).
 - 1 managed process of 45 crashed in its warm-up: `RocksDatabase.Open` on the directory the warm-up had just deleted
   and re-created failed with `MANIFEST-000001` not found (`DbBenchRunner.RunWarmup`, open with destroyExisting before
-  a fill benchmark; 1 KiB / LZ4 / 1 thread, repetition 1). It looks like a file of the new DB being removed by
-  something still running from the disposed instance; not reproduced or investigated yet. The 14 rows were re-measured.
+  a fill benchmark; 1 KiB / LZ4 / 1 thread, repetition 1). The 14 rows were re-measured. **Fixed since:** a background
+  flush counted itself finished before its obsolete-file purge, so close could return while the purge of the disposed
+  instance was still deleting files (an old MANIFEST number = the new DB's `MANIFEST-000001`). The purge now runs before
+  the job is accounted, like compaction (`DbLayerAuditTests.CloseWaitsForTheFlushObsoleteFilePurge`).
 
 BenchmarkDotNet head-to-head, default job, same window (`bench/results/2026-11-02-final-bdn.md`): managed /
 rocksdb-sharp is 0.57x for Put, 0.60x for a 100-put WriteBatch, 0.49x / 0.35x / 0.28x for Get from the memtable /
@@ -641,4 +643,3 @@ a cached block / a missing key, 0.26x / 0.21x for Seek + 10 / 100 Next and 0.52x
 - Block cache charge does not include the `Block` object (~64 bytes).
 - Sync writes from 4 threads (`fillrandom` / `overwrite` 1.04-1.81x vs C, while async is 0.75-1.03x) and 4-thread
   `readmissing` with small values (1.4-3.0x); see "Final three-way results".
-- Warm-up crash: reopening a just-deleted and re-created DB directory once failed with `MANIFEST-000001` not found.

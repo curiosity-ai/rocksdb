@@ -249,6 +249,40 @@ public sealed class DbLayerAuditTests
     }
 
     [TestMethod]
+    public void CloseWaitsForTheFlushObsoleteFilePurge()
+    {
+        // The purge at the end of a background flush is part of the job: close must not return while it runs, or it
+        // could delete files of a new DB created in the same directory after close (e.g. its MANIFEST-000001).
+        using var entered = new ManualResetEventSlim(false);
+        using var gate = new ManualResetEventSlim(false);
+        int armed = 0;
+        RocksDatabase db = RocksDatabase.Open(DbPath, new DbOptions { CreateIfMissing = true, FileSystem = NewFs() });
+        TestHooks.Set("DBImpl::PurgeObsoleteFiles:Start", () =>
+        {
+            if (Interlocked.Exchange(ref armed, 0) == 0) return;
+            entered.Set();
+            gate.Wait();
+        });
+        try
+        {
+            db.Put(Key(1), Value(1, 0));
+            Volatile.Write(ref armed, 1);
+            Task flush = Task.Run(() => db.Flush());
+            Assert.IsTrue(entered.Wait(10_000), "flush purge did not start");
+            Task close = Task.Run(db.Dispose);
+            Assert.IsFalse(close.Wait(200), "close returned while the flush job was still deleting files");
+            gate.Set();
+            Assert.IsTrue(Task.WaitAll([flush, close], 10_000));
+        }
+        finally
+        {
+            gate.Set();
+            TestHooks.ClearAll();
+            db.Dispose();
+        }
+    }
+
+    [TestMethod]
     public void CloseRacingWritersAndFlushes()
     {
         // Writers and flushes queued behind close get leadership after close released it: they must fail cleanly
