@@ -165,6 +165,7 @@ public sealed class ErrorHandlerTests
     public void FlushNoSpaceErrorNeedsManualResume()
     {
         (FaultInjectionFileSystem fs, DbOptions options, ErrorListener listener) = Setup();
+        listener.DisableAutoRecovery = true; // the SstFileManager would otherwise recover once space is free
         using (RocksDatabase db = RocksDatabase.Open(DbPath, options))
         {
             Put(db, "a");
@@ -174,7 +175,7 @@ public sealed class ErrorHandlerTests
             Assert.AreEqual(ErrorSeverity.HardError, ex.Severity);
             ex = Assert.ThrowsExactly<RocksDbException>(() => Put(db, "b"));
             Assert.AreEqual(StatusSubCode.NoSpace, ex.SubCode);
-            Assert.AreEqual(0, listener.RecoveryBegins);
+            Assert.AreEqual(1, listener.RecoveryBegins); // offered, and vetoed by the listener
             // Still out of space: Resume fails and keeps the error.
             fs.FailMatching(".sst", FaultOps.Append, 1, InjectedFaultKind.NoSpace);
             ex = Assert.ThrowsExactly<RocksDbException>(() => db.Resume());
@@ -251,7 +252,8 @@ public sealed class ErrorHandlerTests
     [TestMethod]
     public void ManifestNoSpaceErrorRecoversOnResume()
     {
-        (FaultInjectionFileSystem fs, DbOptions options, _) = Setup();
+        (FaultInjectionFileSystem fs, DbOptions options, ErrorListener listener) = Setup();
+        listener.DisableAutoRecovery = true; // like upstream's EnableAutoRecovery(false): no SstFileManager recovery
         using (RocksDatabase db = RocksDatabase.Open(DbPath, options))
         {
             Put(db, "a");
@@ -344,7 +346,8 @@ public sealed class ErrorHandlerTests
     [TestMethod]
     public void WalSyncNoSpaceErrorManualResume()
     {
-        (FaultInjectionFileSystem fs, DbOptions options, _) = Setup();
+        (FaultInjectionFileSystem fs, DbOptions options, ErrorListener listener) = Setup();
+        listener.DisableAutoRecovery = true;
         using (RocksDatabase db = RocksDatabase.Open(DbPath, options))
         {
             Put(db, "a");

@@ -382,6 +382,7 @@ internal sealed partial class DbImpl
             {
                 InstallSuperVersion(cfd);
             }
+            if (job is not null && job.Outputs.Count > 0) MaybeReportMaxAllowedSpaceReached(BackgroundErrorReason.Compaction);
             ok = true;
             Interlocked.Increment(ref _statCompactions);
             if (job is not null)

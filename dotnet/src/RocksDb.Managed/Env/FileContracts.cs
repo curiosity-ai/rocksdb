@@ -93,4 +93,11 @@ public interface IFileSystem
     /// <summary>Last modification time of a file (FileSystem::GetFileModificationTime), used by WAL archive TTL purging.</summary>
     DateTimeOffset GetFileModificationTime(string path) =>
         throw RocksDbException.NotSupported("GetFileModificationTime is not supported by " + GetType().Name);
+
+    /// <summary>
+    /// Bytes available to the process on the file system holding <paramref name="path"/> (FileSystem::GetFreeSpace), used by
+    /// the <see cref="SstFileManager"/> to recover from out-of-space errors. Throws NotSupported when unknown.
+    /// </summary>
+    long GetFreeSpace(string path) =>
+        throw RocksDbException.NotSupported("GetFreeSpace is not supported by " + GetType().Name);
 }

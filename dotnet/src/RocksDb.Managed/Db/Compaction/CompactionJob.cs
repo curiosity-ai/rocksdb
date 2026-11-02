@@ -463,11 +463,8 @@ internal sealed class CompactionJob
             // user_defined_timestamps_persisted (persist_user_defined_timestamps): the outputs strip timestamps too.
             UserDefinedTimestampsPersisted = !_cfd.TimestampsInMemtableOnly,
         };
-        var fileOptions = new WritableFileOptions
-        {
-            BytesPerSync = (long)Math.Min(_db.Options.BytesPerSync, long.MaxValue),
-            MaxBufferSize = (int)Math.Clamp(_db.Options.WritableFileMaxBufferSize, 64 * 1024, int.MaxValue),
-        };
+        // Compaction outputs are charged to the DB's rate limiter at IO_LOW.
+        WritableFileOptions fileOptions = _db.TableFileWriteOptions(IoPriority.Low);
         _file = _db.FileSystem.CreateWritable(_path, truncate: true, fileOptions);
         _builder = new BlockBasedTableBuilder(_file, _cfd.Format, tbo);
         _hasPointKey = false;

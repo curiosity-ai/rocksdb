@@ -235,6 +235,11 @@ public sealed class MemoryFileSystem : IFileSystem
         }
     }
 
+    /// <summary>Free space reported by <see cref="GetFreeSpace"/> (default: effectively unlimited). Tests lower it to simulate a full disk.</summary>
+    public long FreeSpace { get; set; } = long.MaxValue;
+
+    public long GetFreeSpace(string path) => FreeSpace;
+
     public DateTimeOffset GetFileModificationTime(string path) => GetFile(path, "while stat a file for modification time").LastModified;
 
     public IDisposable LockFile(string path)

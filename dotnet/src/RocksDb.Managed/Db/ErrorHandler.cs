@@ -57,6 +57,15 @@ internal sealed class ErrorHandler
     /// <summary>The current background error, or null. REQUIRES: mutex.</summary>
     public RocksDbException? BgError => _bgError;
 
+    /// <summary>The current background error, taking the DB mutex (GetBGError).</summary>
+    public RocksDbException? CurrentBgError
+    {
+        get
+        {
+            lock (_db.Mutex) return _bgError;
+        }
+    }
+
     /// <summary>Error recorded while a recovery was running (recovery_error_). REQUIRES: mutex.</summary>
     public RocksDbException? RecoveryError => _recoveryError;
 
@@ -230,7 +239,7 @@ internal sealed class ErrorHandler
         return HandleKnownErrors(err, reason, walRelated);
     }
 
-    /// <summary>Port of ErrorHandler::HandleKnownErrors (without the SstFileManager).</summary>
+    /// <summary>Port of ErrorHandler::HandleKnownErrors (with OverrideNoSpaceError and RecoverFromNoSpace).</summary>
     private RocksDbException? HandleKnownErrors(RocksDbException err, BackgroundErrorReason reason, bool walRelated)
     {
         DbOptions o = _db.Options;
@@ -238,15 +247,25 @@ internal sealed class ErrorHandler
         bool autoRecovery;
         lock (_db.Mutex) autoRecovery = _autoRecovery;
         if (sev >= ErrorSeverity.FatalError) autoRecovery = false;
-        if ((err.SubCode is StatusSubCode.NoSpace or StatusSubCode.SpaceLimit) && sev < ErrorSeverity.FatalError)
+        bool noSpace = err.SubCode is StatusSubCode.NoSpace or StatusSubCode.SpaceLimit;
+        if (noSpace && sev < ErrorSeverity.FatalError)
         {
-            // OverrideNoSpaceError: recovery from out-of-space errors relies on an SstFileManager polling for free space,
-            // which is not ported, so it is never automatic.
-            autoRecovery = false;
-            if (o.Allow2Pc && sev <= ErrorSeverity.SoftError)
+            // OverrideNoSpaceError: recovery from out-of-space errors relies on the SstFileManager polling for free space.
+            if (o.SstFileManager is null)
+            {
+                autoRecovery = false;
+            }
+            else if (o.Allow2Pc && sev <= ErrorSeverity.SoftError)
             {
                 // The contents of the current WAL may be inconsistent and needed for 2PC.
+                autoRecovery = false;
                 sev = ErrorSeverity.FatalError;
+            }
+            else
+            {
+                try { _ = _db.FileSystem.GetFreeSpace(_db.DbPaths[0]); }
+                catch (RocksDbException e) when (e.Code == StatusCode.NotSupported) { autoRecovery = false; }
+                catch (Exception e) when (e is IOException or RocksDbException) { }
             }
         }
         RocksDbException classified = err.WithSeverity(sev);
@@ -260,7 +279,8 @@ internal sealed class ErrorHandler
             _db.LogInfo("ErrorHandler: Hit less severe background error");
             return null;
         }
-        RocksDbException? s = NotifyOnBackgroundError(reason, classified, autoRecovery, out _);
+        RocksDbException? s = NotifyOnBackgroundError(reason, classified, autoRecovery, out bool autoRecoveryAfterListeners);
+        autoRecovery = autoRecoveryAfterListeners;
         lock (_db.Mutex)
         {
             if (s is not null && s.Severity > Severity(_bgError))
@@ -275,7 +295,13 @@ internal sealed class ErrorHandler
                 return _bgError;
             }
             if (_bgError.Severity >= ErrorSeverity.HardError) _isDbStopped = true;
-            _db.LogInfo("ErrorHandler: Set regular background error, auto_recovery=0, stop=" + (_isDbStopped ? 1 : 0));
+            _db.LogInfo("ErrorHandler: Set regular background error, auto_recovery=" + (autoRecovery ? 1 : 0) + ", stop=" + (_isDbStopped ? 1 : 0));
+            if (autoRecovery && noSpace && _db.Options.SstFileManager is { } sfm && !_endRecovery)
+            {
+                // RecoverFromNoSpace: the SstFileManager recovers once enough space is free.
+                _recoveryInProgress = true;
+                sfm.StartErrorRecovery(this, _bgError);
+            }
             return _bgError;
         }
     }
@@ -485,6 +511,12 @@ internal sealed class ErrorHandler
             _autoRecovery = false;
             _endRecovery = true;
             t = _recoveryTask;
+        }
+        // CancelErrorRecoveryForShutDown: a recovery waiting in the SstFileManager is dropped; one running right now sees
+        // the shutdown and ends.
+        if (_db.Options.SstFileManager is { } sfm && sfm.CancelErrorRecovery(this))
+        {
+            lock (_db.Mutex) _recoveryInProgress = false;
         }
         try
         {

@@ -52,6 +52,7 @@ internal sealed partial class DbImpl
         }
         _groupBatch.Dispose();
         try { ShutdownMonitoring(); } catch (Exception e) when (e is IOException or RocksDbException) { }
+        DisposeOwnedSstFileManager();
         _dbLock?.Dispose();
         _dbLock = null;
     }
@@ -65,6 +66,7 @@ internal sealed partial class DbImpl
             if (!descriptors.TryAdd(d.Name, d.Options)) ThrowHelper.InvalidArgument("Duplicate column family name: " + d.Name);
         }
         if (!descriptors.ContainsKey(DefaultColumnFamilyName)) descriptors[DefaultColumnFamilyName] = new ColumnFamilyOptions();
+        SetupSstFileManager();
 
         // ---- directories + LOCK (DBImpl::Recover) ----
         if (Options.CreateIfMissing)
@@ -219,6 +221,7 @@ internal sealed partial class DbImpl
             await CreateColumnFamilyCoreAsync(name, descriptors[name], writeOptionsFile: false, synchronous, ct).ConfigureAwait(false);
         }
 
+        StartSstFileManager();
         DeleteObsoleteFilesFullScan();
         await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
         DeleteObsoleteFilesFullScan();
@@ -611,7 +614,7 @@ internal sealed partial class DbImpl
         FileMetaData? meta;
         try
         {
-            meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, [], CurrentSnapshotChecker, blobBuilder, null, synchronous, ct)
+            meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, TableFileWriteOptions(Env.IoPriority.High), cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, [], CurrentSnapshotChecker, blobBuilder, null, synchronous, ct)
                 .ConfigureAwait(false);
         }
         catch

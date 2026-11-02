@@ -42,7 +42,7 @@ internal static class FlushJob
     /// uncommitted data, so no version is dropped as hidden (the managed flush does not evaluate the checker; keeping
     /// every version is always correct and leaves the garbage collection to compaction, which does).
     /// </remarks>
-    public static async ValueTask<FileMetaData?> WriteLevel0TableAsync(IFileSystem fs, string path, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
+    public static async ValueTask<FileMetaData?> WriteLevel0TableAsync(IFileSystem fs, string path, WritableFileOptions fileOptions, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
         ulong fileNumber, ulong epochNumber, DbIdentity identity, ulong[] snapshots, SnapshotChecker? snapshotChecker, Blob.BlobFileBuilder? blobBuilder,
         Blob.BlobGarbageMeter? blobOutflow,
         bool synchronous, CancellationToken cancellationToken)
@@ -83,7 +83,7 @@ internal static class FlushJob
             // FileMetaData::user_defined_timestamps_persisted: the MANIFEST then stores the boundaries without timestamps.
             UserDefinedTimestampsPersisted = !stripTimestamps,
         };
-        IWritableFile file = fs.CreateWritable(path, truncate: true);
+        IWritableFile file = fs.CreateWritable(path, truncate: true, fileOptions);
         bool keep = false;
         try
         {

@@ -36,6 +36,20 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     /// errors (rocksdb::DBOptions::listeners). Not persisted.
     /// </summary>
     public List<EventListener> Listeners { get; } = new();
+    /// <summary>
+    /// Rate limiter for the DB's background writes (rocksdb::DBOptions::rate_limiter), e.g. a
+    /// <see cref="Env.GenericRateLimiter"/>: flush outputs are charged at <see cref="Env.IoPriority.High"/>,
+    /// compaction outputs at <see cref="Env.IoPriority.Low"/>; WAL and MANIFEST writes are not limited. May be shared
+    /// by several DBs. Null (the default) means no limit. Only honored by file systems that apply
+    /// <see cref="Env.WritableFileOptions.RateLimiter"/> (<see cref="Env.LocalFileSystem"/>). Not persisted.
+    /// </summary>
+    public Env.IRateLimiter? RateLimiter { get; set; }
+    /// <summary>
+    /// Tracks the DB's SST and blob files, enforces a space limit and rate limits file deletions
+    /// (rocksdb::DBOptions::sst_file_manager; see <see cref="SstFileManager"/>). May be shared by several DBs. Null (the
+    /// default) means no tracking. Not persisted.
+    /// </summary>
+    public SstFileManager? SstFileManager { get; set; }
 
     // ---- persisted ---------------------------------------------------------------------------
     public bool CreateIfMissing { get; set; }
@@ -211,7 +225,8 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
 
     public DbOptions Clone()
     {
-        var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir, FileSystem = FileSystem, Statistics = Statistics, InfoLog = InfoLog };
+        var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir, FileSystem = FileSystem, Statistics = Statistics, InfoLog = InfoLog,
+            RateLimiter = RateLimiter, SstFileManager = SstFileManager };
         c.DbPaths.AddRange(DbPaths);
         c.Listeners.AddRange(Listeners);
         c.CopyFrom(this);

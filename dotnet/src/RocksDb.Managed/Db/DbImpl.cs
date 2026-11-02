@@ -493,7 +493,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             // The SharedBlobFileMetaData deleter: evict the reader, then delete the file (AddObsoleteBlobFile).
             b.Cfd.BlobSource.Evict(b.BlobFileNumber);
             b.Cfd.BlobDirectWrite?.Forget(b.BlobFileNumber);
-            TryDeleteFile(FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber));
+            DeleteDbFile(FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber), DbPaths[0]);
         }
         if (releasedBlobs is not null)
         {
@@ -662,6 +662,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             WriteThread.Return(w, synchronous);
             _groupBatch.Dispose();
             try { ShutdownMonitoring(); } catch (Exception e) when (e is IOException or RocksDbException) { }
+            DisposeOwnedSstFileManager();
             _dbLock?.Dispose();
             _dbLock = null;
             if (_secondary) DisposeSecondaryReaders();

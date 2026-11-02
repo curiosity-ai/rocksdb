@@ -212,6 +212,8 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
     public IEnumerable<string> GetChildren(string directory) => Inner.GetChildren(directory);
     public DateTimeOffset GetFileModificationTime(string path) => Inner.GetFileModificationTime(path);
 
+    public long GetFreeSpace(string path) => Inner.GetFreeSpace(path);
+
     public void DeleteFile(string path)
     {
         Mutate();

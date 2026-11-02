@@ -448,6 +448,12 @@ internal sealed class VersionSet : IAsyncDisposable
     private void InstallEdit(ColumnFamilyData? cfd, VersionEdit edit, FileMetaData[][]? newFiles, Blob.BlobFileMetaData[]? newBlobFiles)
     {
         if (edit.MinLogNumberToKeep is ulong minLog && minLog > MinLogNumberToKeep) MinLogNumberToKeep = minLog;
+        // SstFileManagerImpl::OnAddFile for the table and blob files the edit adds (flush, compaction, ingestion outputs).
+        foreach (NewFileEntry nf in edit.NewFiles) _db.OnDataFileAdded(FileNames.TableFileName(_db.DbPaths, nf.Meta.FileNumber, nf.Meta.PathId), nf.Meta.FileSize);
+        foreach (BlobFileAddition b in edit.BlobFileAdditions)
+        {
+            _db.OnDataFileAdded(FileNames.BlobFileName(_db.DbPaths[0], b.BlobFileNumber), b.TotalBlobBytes + Blob.BlobLogFormat.HeaderSize + Blob.BlobLogFormat.FooterSize);
+        }
         // VersionSet::wals_ (ProcessManifestWrites: AddWals / DeleteWalsBefore after the write succeeded).
         foreach (WalAddition w in edit.WalAdditions) WalSet.AddWal(_wals, _minWalNumberToKeep, w);
         if (edit.IsWalDeletion) WalSet.DeleteWalsBefore(_wals, ref _minWalNumberToKeep, edit.WalDeletionBefore);

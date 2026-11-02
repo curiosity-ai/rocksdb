@@ -180,7 +180,7 @@ internal sealed partial class DbImpl
         // PrepareFlushAdditions: the blob direct write files of the flushed memtables are sealed and registered with the
         // table file; their blobs the output does not reference (hidden versions, failed writes) are garbage.
         (List<BlobFileAddition> Additions, Blob.BlobGarbageMeter Meter)? directWrite = PrepareBlobDirectWriteFlush(cfd, picked);
-        FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, cfd, mems, fileNumber, epoch, Identity, snapshots, CurrentSnapshotChecker, blobBuilder,
+        FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, TableFileWriteOptions(Env.IoPriority.High), cfd, mems, fileNumber, epoch, Identity, snapshots, CurrentSnapshotChecker, blobBuilder,
                 directWrite?.Meter, synchronous, CancellationToken.None)
             .ConfigureAwait(false);
         if (meta is not null)
@@ -253,6 +253,7 @@ internal sealed partial class DbImpl
         {
             await Versions.LogAndApplyAsync(cfd, edit, synchronous, CancellationToken.None).ConfigureAwait(false);
         }
+        if (meta is not null) MaybeReportMaxAllowedSpaceReached(BackgroundErrorReason.Flush);
 
         lock (_mutex)
         {
@@ -310,7 +311,12 @@ internal sealed partial class DbImpl
             Task signal;
             lock (_mutex)
             {
-                if (target.FlushCompleted || !cfd.Imm.Contains(target)) return;
+                if (target.FlushCompleted || !cfd.Imm.Contains(target))
+                {
+                    // WaitForFlushMemTables: an error that stopped the DB (e.g. SpaceLimit after the flush) is reported.
+                    if (ErrorHandler.IsDbStopped && ErrorHandler.BgError is { } stopped) ThrowBackgroundError(stopped);
+                    return;
+                }
                 if (IsBgWorkStopped && ErrorHandler.BgError is { } e) ThrowBackgroundError(e);
                 if (cfd.Dropped) ThrowDropped(cfd);
                 // Close stops scheduling flushes: a flush that was queued but never started will not complete, so
@@ -435,16 +441,36 @@ internal sealed partial class DbImpl
     {
         ColumnFamilyOptions o = cfd.Options;
         if (!o.EnableBlobFiles || outputLevel < o.BlobFileStartingLevel) return null;
+        // Blob files of flushes are rate limited like their table files (IO_HIGH), those of compactions at IO_LOW.
+        Env.IoPriority priority = reason == Blob.BlobFileCreationReason.Compaction ? Env.IoPriority.Low : Env.IoPriority.High;
         return new Blob.BlobFileBuilder(FileSystem, DbPaths[0], NewPendingOutputFileNumber, o, cfd.Id, reason, cfd.BlobSource, Stats,
-            BlobFileWriteOptions(o));
+            BlobFileWriteOptions(o, priority));
     }
+
+    /// <summary>
+    /// Write options of table files written by flushes (<see cref="Env.IoPriority.High"/>) and compactions
+    /// (<see cref="Env.IoPriority.Low"/>): bytes_per_sync, writable_file_max_buffer_size and the DB's rate limiter
+    /// (WritableFileWriter charges DBOptions::rate_limiter at the job's I/O priority).
+    /// </summary>
+    internal Env.WritableFileOptions TableFileWriteOptions(Env.IoPriority priority) => new()
+    {
+        BytesPerSync = (long)Math.Min(Options.BytesPerSync, long.MaxValue),
+        MaxBufferSize = (int)Math.Clamp(Options.WritableFileMaxBufferSize, 64 * 1024, int.MaxValue),
+        RateLimiter = Options.RateLimiter,
+        IoPriority = priority,
+    };
 
     /// <summary>
     /// Write options of blob files: bytes_per_sync and the max buffer size (blob_file_writable_file_max_buffer_size when
     /// set, else writable_file_max_buffer_size).
     /// </summary>
-    internal Env.WritableFileOptions BlobFileWriteOptions(ColumnFamilyOptions o) => new()
+    internal Env.WritableFileOptions BlobFileWriteOptions(ColumnFamilyOptions o) => BlobFileWriteOptions(o, Env.IoPriority.Total);
+
+    /// <summary><see cref="BlobFileWriteOptions(ColumnFamilyOptions)"/> charged to the rate limiter at <paramref name="priority"/>.</summary>
+    internal Env.WritableFileOptions BlobFileWriteOptions(ColumnFamilyOptions o, Env.IoPriority priority) => new()
     {
+        RateLimiter = priority == Env.IoPriority.Total ? null : Options.RateLimiter,
+        IoPriority = priority,
         BytesPerSync = (long)Math.Min(Options.BytesPerSync, long.MaxValue),
         MaxBufferSize = (int)Math.Clamp(o.BlobFileWritableFileMaxBufferSize != 0 ? o.BlobFileWritableFileMaxBufferSize : Options.WritableFileMaxBufferSize,
             64 * 1024, int.MaxValue),
