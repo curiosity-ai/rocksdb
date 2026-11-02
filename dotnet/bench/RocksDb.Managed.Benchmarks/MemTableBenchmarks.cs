@@ -1,6 +1,6 @@
 using BenchmarkDotNet.Attributes;
 using RocksDb.Managed.Db;
-using ValueType = RocksDb.Managed.Db.ValueType;
+using EntryType = RocksDb.Managed.Db.EntryType;
 
 namespace RocksDb.Managed.Benchmarks;
 
@@ -36,7 +36,7 @@ public class MemTableBenchmarks
         _value = new byte[100];
         rnd.NextBytes(_value);
         _filled = new MemTable(InternalKeyComparator.Bytewise, new MemTableOptions { WriteBufferSize = 1L << 30 }, 0);
-        for (int i = 0; i < N; i++) _filled.Add((ulong)i + 1, ValueType.Value, _keys[i], _value);
+        for (int i = 0; i < N; i++) _filled.Add((ulong)i + 1, EntryType.Value, _keys[i], _value);
 
         _writeOptions = new RocksDbSharp.WriteOptions().DisableWal(1);
         _nativeFilledDir = NewDir();
@@ -88,7 +88,7 @@ public class MemTableBenchmarks
     {
         MemTable mem = _mem!;
         byte[][] keys = _keys;
-        for (int i = 0; i < keys.Length; i++) mem.Add((ulong)i + 1, ValueType.Value, keys[i], _value);
+        for (int i = 0; i < keys.Length; i++) mem.Add((ulong)i + 1, EntryType.Value, keys[i], _value);
     }
 
     [Benchmark(OperationsPerInvoke = N)]

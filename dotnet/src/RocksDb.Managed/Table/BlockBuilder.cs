@@ -3,12 +3,7 @@ using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Table;
 
-/// <summary>Mirrors BlockBasedTableOptions::DataBlockIndexType (include/rocksdb/table.h).</summary>
-public enum DataBlockIndexType : byte
-{
-    BinarySearch = 0,
-    BinaryAndHash = 1,
-}
+
 
 /// <summary>
 /// Builds blocks where keys are prefix-compressed. Port of table/block_based/block_builder.{h,cc}

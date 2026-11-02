@@ -20,17 +20,18 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [ ] XXH3 per-record checksum, WAL termination point, protection info, timestamps, structured `PutEntity`
 - [ ] Public API: `ColumnFamily` object instead of `uint cfId`
 
-### B. Block-based table (SST)  `[~] agent running`
-- [ ] `Table/BlockBuilder` + `Table/Block` reader/iterator (restart points, shared-prefix delta encoding) — `table/block_based/block_builder.cc`, `block.cc`
-- [ ] Data block hash index (`data_block_hash_index.cc`) — reader at least
-- [ ] `Table/BlockHandle`, `Footer` (legacy + format_version 1..7, checksum types, magic numbers) — `table/format.cc`
-- [ ] Block trailer: compression type + checksum (crc32c/xxhash/xxhash64/xxh3), context checksum (fv 6+)
-- [ ] Index blocks: binary search index (+ `index_value_is_delta_encoded`), two-level/partitioned index (reader)
-- [ ] Metaindex + properties block (`table_properties.cc`, `meta_blocks.cc`)
-- [ ] `BlockBasedTableBuilder` — `block_based_table_builder.cc`
-- [ ] `BlockBasedTableReader` + iterator, point lookup using filter — `block_based_table_reader.cc`
-- [ ] Range deletion meta block
-- [ ] Compat: native `SstFileWriter` → managed reader; managed builder → native `IngestExternalFiles` / read back
+### B. Block-based table (SST)  `[x] merged (082f9f0)`
+- [x] `BlockBuilder`, `Block` (ref-counted pooled), `BlockIter` (data/index/meta, SeekForGet via hash index), `DataBlockHashIndex`
+- [x] `BlockHandle`, `Footer` (fv 2..7, all checksum types, context checksum), `BlockChecksum`, `BlockFetcher`
+- [x] Index: binary search (+delta-encoded values, first-key index); partitioned index read-only
+- [x] Metaindex + properties (match native incl. compression name/options), range-del block
+- [x] `BlockBasedTableBuilder` (sync/async, external SST mode for ingestion), `BlockBasedTableReader` (+Get visitor for merge chains), `BlockBasedTableIterator`
+- [x] Compat: native SstFileWriter/flush → managed read (fv2..7 × 5 checksums, partitioned index); managed → native ingest
+- [ ] format_version 8 (newer than native 11.12 package? check) 
+- [ ] Partitioned index/filter writing; partitioned filter reading; prefix extractor/prefix filters; compression dictionaries; UDT; property collectors
+- [ ] Integration: use stream E's `InternalKeyComparator` + comparator separators (remove local copies in `InternalKeyOrdering.cs`), stream C's `Hash` (remove `DataBlockHashIndex.LegacyHash`), call `FilterPolicy.CreateBuilder(in FilterBuildingContext)`
+- [ ] Compat with compression (snappy/lz4/zstd) + native bloom/ribbon filters end-to-end; replace C's test-only `TestSstParser`
+- [ ] Map public `RocksDb.Managed.BlockBasedTableOptions` (options model) → `Table.TableFormatOptions` (runtime)
 
 ### C. Hashing, filters, compression  `[x] merged (cffc808)`
 - [x] Hashes: `Hash()`, BloomHash, XXPH3-based `Hash64`/`GetSliceHash64` (RocksDB's frozen pre-release XXH3 — NOT System.IO.Hashing.XxHash3), Hash128/Hash2x64, checksum wrappers
@@ -61,7 +62,7 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [ ] Memtable extras: bloom filter, in-place updates, insert hints, protection bytes, wide columns/blob, read callback
 - [ ] `MemTableList` (immutable memtables), snapshot-striped tombstone fragmenter
 - [ ] Verify index separators against a native SST index block (needs stream B reader)
-- [ ] Rename `Db.ValueType` (clashes with `System.ValueType`) once A/B/D are merged — e.g. `EntryType`
+- [x] Renamed `Db.ValueType` → `Db.EntryType` (clashed with `System.ValueType`)
 
 ### F. Infrastructure  `[~] agent running`
 - [ ] `Env/` file abstraction: async sequential writer (`WritableFileWriter`), random-access reader (`RandomAccessFileReader`), `LOCK` file

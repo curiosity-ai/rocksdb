@@ -185,19 +185,19 @@ public sealed class WriteBatch : IDisposable
             {
                 rv |= e.Type switch
                 {
-                    ValueType.Value => ContentFlags.HasPut,
-                    ValueType.ValuePreferredSeqno => ContentFlags.HasTimedPut,
-                    ValueType.WideColumnEntity => ContentFlags.HasPutEntity,
-                    ValueType.Deletion => ContentFlags.HasDelete,
-                    ValueType.SingleDeletion => ContentFlags.HasSingleDelete,
-                    ValueType.RangeDeletion => ContentFlags.HasDeleteRange,
-                    ValueType.Merge => ContentFlags.HasMerge,
-                    ValueType.BlobIndex => ContentFlags.HasBlobIndex,
-                    ValueType.BeginPrepareXID or ValueType.BeginPersistedPrepareXID => ContentFlags.HasBeginPrepare,
-                    ValueType.BeginUnprepareXID => ContentFlags.HasBeginPrepare | ContentFlags.HasBeginUnprepare,
-                    ValueType.EndPrepareXID => ContentFlags.HasEndPrepare,
-                    ValueType.CommitXID or ValueType.CommitXIDAndTimestamp => ContentFlags.HasCommit,
-                    ValueType.RollbackXID => ContentFlags.HasRollback,
+                    EntryType.Value => ContentFlags.HasPut,
+                    EntryType.ValuePreferredSeqno => ContentFlags.HasTimedPut,
+                    EntryType.WideColumnEntity => ContentFlags.HasPutEntity,
+                    EntryType.Deletion => ContentFlags.HasDelete,
+                    EntryType.SingleDeletion => ContentFlags.HasSingleDelete,
+                    EntryType.RangeDeletion => ContentFlags.HasDeleteRange,
+                    EntryType.Merge => ContentFlags.HasMerge,
+                    EntryType.BlobIndex => ContentFlags.HasBlobIndex,
+                    EntryType.BeginPrepareXID or EntryType.BeginPersistedPrepareXID => ContentFlags.HasBeginPrepare,
+                    EntryType.BeginUnprepareXID => ContentFlags.HasBeginPrepare | ContentFlags.HasBeginUnprepare,
+                    EntryType.EndPrepareXID => ContentFlags.HasEndPrepare,
+                    EntryType.CommitXID or EntryType.CommitXIDAndTimestamp => ContentFlags.HasCommit,
+                    EntryType.RollbackXID => ContentFlags.HasRollback,
                     _ => ContentFlags.None,
                 };
             }
@@ -234,7 +234,7 @@ public sealed class WriteBatch : IDisposable
     /// <summary>Stores <paramref name="key"/> -> <paramref name="value"/>. Port of <c>WriteBatchInternal::Put</c>.</summary>
     public WriteBatch Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
-        AppendKeyValueRecord(ValueType.Value, ValueType.ColumnFamilyValue, columnFamilyId, key, value, ContentFlags.HasPut);
+        AppendKeyValueRecord(EntryType.Value, EntryType.ColumnFamilyValue, columnFamilyId, key, value, ContentFlags.HasPut);
         return this;
     }
 
@@ -244,7 +244,7 @@ public sealed class WriteBatch : IDisposable
     /// <summary>Removes the mapping for <paramref name="key"/>, if any. Port of <c>WriteBatchInternal::Delete</c>.</summary>
     public WriteBatch Delete(uint columnFamilyId, ReadOnlySpan<byte> key)
     {
-        AppendKeyRecord(ValueType.Deletion, ValueType.ColumnFamilyDeletion, columnFamilyId, key, ContentFlags.HasDelete);
+        AppendKeyRecord(EntryType.Deletion, EntryType.ColumnFamilyDeletion, columnFamilyId, key, ContentFlags.HasDelete);
         return this;
     }
 
@@ -257,7 +257,7 @@ public sealed class WriteBatch : IDisposable
     /// </summary>
     public WriteBatch SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key)
     {
-        AppendKeyRecord(ValueType.SingleDeletion, ValueType.ColumnFamilySingleDeletion, columnFamilyId, key, ContentFlags.HasSingleDelete);
+        AppendKeyRecord(EntryType.SingleDeletion, EntryType.ColumnFamilySingleDeletion, columnFamilyId, key, ContentFlags.HasSingleDelete);
         return this;
     }
 
@@ -267,7 +267,7 @@ public sealed class WriteBatch : IDisposable
     /// <summary>Removes keys in [<paramref name="beginKey"/>, <paramref name="endKey"/>). Port of <c>WriteBatchInternal::DeleteRange</c>.</summary>
     public WriteBatch DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey)
     {
-        AppendKeyValueRecord(ValueType.RangeDeletion, ValueType.ColumnFamilyRangeDeletion, columnFamilyId, beginKey, endKey, ContentFlags.HasDeleteRange);
+        AppendKeyValueRecord(EntryType.RangeDeletion, EntryType.ColumnFamilyRangeDeletion, columnFamilyId, beginKey, endKey, ContentFlags.HasDeleteRange);
         return this;
     }
 
@@ -277,7 +277,7 @@ public sealed class WriteBatch : IDisposable
     /// <summary>Merges <paramref name="value"/> into <paramref name="key"/>. Port of <c>WriteBatchInternal::Merge</c>.</summary>
     public WriteBatch Merge(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
-        AppendKeyValueRecord(ValueType.Merge, ValueType.ColumnFamilyMerge, columnFamilyId, key, value, ContentFlags.HasMerge);
+        AppendKeyValueRecord(EntryType.Merge, EntryType.ColumnFamilyMerge, columnFamilyId, key, value, ContentFlags.HasMerge);
         return this;
     }
 
@@ -287,7 +287,7 @@ public sealed class WriteBatch : IDisposable
     /// </summary>
     public WriteBatch PutEntitySerialized(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity)
     {
-        AppendKeyValueRecord(ValueType.WideColumnEntity, ValueType.ColumnFamilyWideColumnEntity, columnFamilyId, key, entity, ContentFlags.HasPutEntity);
+        AppendKeyValueRecord(EntryType.WideColumnEntity, EntryType.ColumnFamilyWideColumnEntity, columnFamilyId, key, entity, ContentFlags.HasPutEntity);
         return this;
     }
 
@@ -301,7 +301,7 @@ public sealed class WriteBatch : IDisposable
         SaveState(out SavePoint save);
         // PackValueAndWriteTime: value | fixed64(write_unix_time)
         long packedLength = (long)value.Length + 8;
-        Span<byte> dst = BeginRecord(ValueType.ValuePreferredSeqno, ValueType.ColumnFamilyValuePreferredSeqno, columnFamilyId,
+        Span<byte> dst = BeginRecord(EntryType.ValuePreferredSeqno, EntryType.ColumnFamilyValuePreferredSeqno, columnFamilyId,
             key.Length, packedLength, out int p);
         p += Coding.EncodeVarint32(dst[p..], (uint)key.Length);
         key.CopyTo(dst[p..]);
@@ -318,7 +318,7 @@ public sealed class WriteBatch : IDisposable
     /// <summary>Stores a blob index (BlobDB). Port of <c>WriteBatchInternal::PutBlobIndex</c>.</summary>
     internal WriteBatch PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex)
     {
-        AppendKeyValueRecord(ValueType.BlobIndex, ValueType.ColumnFamilyBlobIndex, columnFamilyId, key, blobIndex, ContentFlags.HasBlobIndex);
+        AppendKeyValueRecord(EntryType.BlobIndex, EntryType.ColumnFamilyBlobIndex, columnFamilyId, key, blobIndex, ContentFlags.HasBlobIndex);
         return this;
     }
 
@@ -330,7 +330,7 @@ public sealed class WriteBatch : IDisposable
     {
         SaveState(out SavePoint save);
         Span<byte> dst = _rep.GetSpan(1 + Coding.MaxVarint32Length + blob.Length);
-        dst[0] = (byte)ValueType.LogData;
+        dst[0] = (byte)EntryType.LogData;
         int p = 1 + Coding.EncodeVarint32(dst[1..], (uint)blob.Length);
         blob.CopyTo(dst[p..]);
         CommitRecord(p + blob.Length, ContentFlags.None, counted: false, save);
@@ -340,12 +340,12 @@ public sealed class WriteBatch : IDisposable
     // ---- Transaction markers (WriteBatchInternal) -----------------------------------------------------------
 
     /// <summary>WriteBatchInternal::InsertNoop.</summary>
-    internal void InsertNoop() => _rep.WriteByte((byte)ValueType.Noop);
+    internal void InsertNoop() => _rep.WriteByte((byte)EntryType.Noop);
 
     /// <summary>WriteBatchInternal::GetBeginPrepareType.</summary>
-    internal static ValueType GetBeginPrepareType(bool writeAfterCommit, bool unpreparedBatch) =>
-        writeAfterCommit ? ValueType.BeginPrepareXID
-            : (unpreparedBatch ? ValueType.BeginUnprepareXID : ValueType.BeginPersistedPrepareXID);
+    internal static EntryType GetBeginPrepareType(bool writeAfterCommit, bool unpreparedBatch) =>
+        writeAfterCommit ? EntryType.BeginPrepareXID
+            : (unpreparedBatch ? EntryType.BeginUnprepareXID : EntryType.BeginPersistedPrepareXID);
 
     /// <summary>WriteBatchInternal::InsertBeginPrepare.</summary>
     internal void InsertBeginPrepare(bool writeAfterCommit, bool unpreparedBatch)
@@ -357,7 +357,7 @@ public sealed class WriteBatch : IDisposable
     /// <summary>WriteBatchInternal::InsertEndPrepare.</summary>
     internal void InsertEndPrepare(ReadOnlySpan<byte> xid)
     {
-        _rep.WriteByte((byte)ValueType.EndPrepareXID);
+        _rep.WriteByte((byte)EntryType.EndPrepareXID);
         Coding.PutLengthPrefixedSlice(_rep, xid);
         _contentFlags |= ContentFlags.HasEndPrepare;
     }
@@ -369,7 +369,7 @@ public sealed class WriteBatch : IDisposable
     internal void MarkEndPrepare(ReadOnlySpan<byte> xid, bool writeAfterCommit, bool unpreparedBatch)
     {
         // a manually constructed batch can only contain one prepare section
-        if (_rep.WrittenCount <= HeaderSize || _rep.WrittenSpan[HeaderSize] != (byte)ValueType.Noop)
+        if (_rep.WrittenCount <= HeaderSize || _rep.WrittenSpan[HeaderSize] != (byte)EntryType.Noop)
             ThrowHelper.InvalidArgument("MarkEndPrepare requires a batch that starts with a Noop");
         // all savepoints up to this point are cleared
         _savePointCount = 0;
@@ -383,7 +383,7 @@ public sealed class WriteBatch : IDisposable
     /// <summary>WriteBatchInternal::MarkCommit.</summary>
     internal void MarkCommit(ReadOnlySpan<byte> xid)
     {
-        _rep.WriteByte((byte)ValueType.CommitXID);
+        _rep.WriteByte((byte)EntryType.CommitXID);
         Coding.PutLengthPrefixedSlice(_rep, xid);
         _contentFlags |= ContentFlags.HasCommit;
     }
@@ -392,7 +392,7 @@ public sealed class WriteBatch : IDisposable
     internal void MarkCommitWithTimestamp(ReadOnlySpan<byte> xid, ReadOnlySpan<byte> commitTimestamp)
     {
         if (commitTimestamp.IsEmpty) ThrowHelper.InvalidArgument("commit timestamp must not be empty");
-        _rep.WriteByte((byte)ValueType.CommitXIDAndTimestamp);
+        _rep.WriteByte((byte)EntryType.CommitXIDAndTimestamp);
         Coding.PutLengthPrefixedSlice(_rep, commitTimestamp);
         Coding.PutLengthPrefixedSlice(_rep, xid);
         _contentFlags |= ContentFlags.HasCommit;
@@ -401,7 +401,7 @@ public sealed class WriteBatch : IDisposable
     /// <summary>WriteBatchInternal::MarkRollback.</summary>
     internal void MarkRollback(ReadOnlySpan<byte> xid)
     {
-        _rep.WriteByte((byte)ValueType.RollbackXID);
+        _rep.WriteByte((byte)EntryType.RollbackXID);
         Coding.PutLengthPrefixedSlice(_rep, xid);
         _contentFlags |= ContentFlags.HasRollback;
     }
@@ -434,7 +434,7 @@ public sealed class WriteBatch : IDisposable
     /// into and the number of bytes written so far.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private Span<byte> BeginRecord(ValueType defaultCfTag, ValueType cfTag, uint columnFamilyId, int keyLength, long valueLength, out int p)
+    private Span<byte> BeginRecord(EntryType defaultCfTag, EntryType cfTag, uint columnFamilyId, int keyLength, long valueLength, out int p)
     {
         long max = 1 + Coding.MaxVarint32Length + (2L * Coding.MaxVarint32Length) + keyLength + valueLength;
         if (max > Array.MaxLength) ThrowTooLarge();
@@ -452,7 +452,7 @@ public sealed class WriteBatch : IDisposable
         return dst;
     }
 
-    private void AppendKeyValueRecord(ValueType defaultCfTag, ValueType cfTag, uint columnFamilyId,
+    private void AppendKeyValueRecord(EntryType defaultCfTag, EntryType cfTag, uint columnFamilyId,
         ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ContentFlags flag)
     {
         SaveState(out SavePoint save);
@@ -466,7 +466,7 @@ public sealed class WriteBatch : IDisposable
         CommitRecord(p, flag, counted: true, save);
     }
 
-    private void AppendKeyRecord(ValueType defaultCfTag, ValueType cfTag, uint columnFamilyId, ReadOnlySpan<byte> key, ContentFlags flag)
+    private void AppendKeyRecord(EntryType defaultCfTag, EntryType cfTag, uint columnFamilyId, ReadOnlySpan<byte> key, ContentFlags flag)
     {
         SaveState(out SavePoint save);
         Span<byte> dst = BeginRecord(defaultCfTag, cfTag, columnFamilyId, key.Length, 0, out int p);
@@ -589,77 +589,77 @@ public sealed class WriteBatch : IDisposable
 
             switch (e.Type)
             {
-                case ValueType.Value:
+                case EntryType.Value:
                     handler.Put(e.ColumnFamilyId, e.Key, e.Value);
                     emptyBatch = false;
                     found++;
                     break;
-                case ValueType.Deletion:
+                case EntryType.Deletion:
                     handler.Delete(e.ColumnFamilyId, e.Key);
                     emptyBatch = false;
                     found++;
                     break;
-                case ValueType.SingleDeletion:
+                case EntryType.SingleDeletion:
                     handler.SingleDelete(e.ColumnFamilyId, e.Key);
                     emptyBatch = false;
                     found++;
                     break;
-                case ValueType.RangeDeletion:
+                case EntryType.RangeDeletion:
                     handler.DeleteRange(e.ColumnFamilyId, e.Key, e.Value);
                     emptyBatch = false;
                     found++;
                     break;
-                case ValueType.Merge:
+                case EntryType.Merge:
                     handler.Merge(e.ColumnFamilyId, e.Key, e.Value);
                     emptyBatch = false;
                     found++;
                     break;
-                case ValueType.BlobIndex:
+                case EntryType.BlobIndex:
                     handler.PutBlobIndex(e.ColumnFamilyId, e.Key, e.Value);
                     emptyBatch = false;
                     found++;
                     break;
-                case ValueType.LogData:
+                case EntryType.LogData:
                     handler.LogData(e.Value);
                     // A batch might have nothing but LogData. It is still a batch.
                     emptyBatch = false;
                     break;
-                case ValueType.BeginPrepareXID:
-                case ValueType.BeginPersistedPrepareXID:
+                case EntryType.BeginPrepareXID:
+                case EntryType.BeginPersistedPrepareXID:
                     handler.MarkBeginPrepare(false);
                     emptyBatch = false;
                     break;
-                case ValueType.BeginUnprepareXID:
+                case EntryType.BeginUnprepareXID:
                     handler.MarkBeginPrepare(true);
                     emptyBatch = false;
                     break;
-                case ValueType.EndPrepareXID:
+                case EntryType.EndPrepareXID:
                     handler.MarkEndPrepare(e.Value);
                     emptyBatch = true;
                     break;
-                case ValueType.CommitXID:
+                case EntryType.CommitXID:
                     handler.MarkCommit(e.Value);
                     emptyBatch = true;
                     break;
-                case ValueType.CommitXIDAndTimestamp:
+                case EntryType.CommitXIDAndTimestamp:
                     // key stores the commit timestamp.
                     handler.MarkCommitWithTimestamp(e.Value, e.Key);
                     emptyBatch = true;
                     break;
-                case ValueType.RollbackXID:
+                case EntryType.RollbackXID:
                     handler.MarkRollback(e.Value);
                     emptyBatch = true;
                     break;
-                case ValueType.Noop:
+                case EntryType.Noop:
                     handler.MarkNoop(emptyBatch);
                     emptyBatch = true;
                     break;
-                case ValueType.WideColumnEntity:
+                case EntryType.WideColumnEntity:
                     handler.PutEntity(e.ColumnFamilyId, e.Key, e.Value);
                     emptyBatch = false;
                     found++;
                     break;
-                case ValueType.ValuePreferredSeqno:
+                case EntryType.ValuePreferredSeqno:
                     handler.TimedPut(e.ColumnFamilyId, e.Key, e.Value, e.WriteUnixTime);
                     emptyBatch = false;
                     found++;

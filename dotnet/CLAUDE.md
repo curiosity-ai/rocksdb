@@ -100,6 +100,7 @@ compat tests pass.
 - **Status → exceptions at the public boundary**, `bool Try...(out ...)` internally for expected
   failures (NotFound, truncated input). Corruption/IO errors throw `RocksDbException` with the
   matching `StatusCode`. Keep throw sites in `ThrowHelper` so hot methods stay inlinable.
+- **Naming**: C++ `ValueType` is `Db.EntryType` (avoids clashing with `System.ValueType`). Public user-facing options live in `Options/` (`RocksDb.Managed.*Options`); runtime/resolved settings used internally by a subsystem get distinct names (e.g. `Table.TableFormatOptions`). Enums are defined once.
 - **Encoding helpers**: use `Util.Coding` (varints/fixed LE) and `Util.Crc32C` — don't re-implement.
 - **No LINQ, no closures, no boxing, no `params` arrays, no string formatting** on hot paths.
   Prefer `sealed` classes, `readonly struct`, `static` lambdas, `[SkipLocalsInit]` where it helps.

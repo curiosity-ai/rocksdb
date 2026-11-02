@@ -227,7 +227,7 @@ public sealed class ManifestCompatTests
         Assert.AreEqual("leveldb.BytewiseComparator", cf1.ComparatorName);
         Assert.AreEqual(7, cf1.NumLevels);
         Assert.AreEqual(CompactionStyle.Level, cf1.CompactionStyle);
-        Assert.AreEqual(Table.ChecksumType.Xxh3, cf1.TableOptions.Checksum);
+        Assert.AreEqual(RocksDb.Managed.Table.ChecksumType.Xxh3, cf1.TableOptions.Checksum);
         Assert.AreEqual(4096UL, cf1.TableOptions.BlockSize);
 
         // Re-serialize: parsing our output yields the same option set.

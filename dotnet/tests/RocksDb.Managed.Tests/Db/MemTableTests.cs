@@ -1,5 +1,5 @@
 using RocksDb.Managed.Db;
-using ValueType = RocksDb.Managed.Db.ValueType;
+using EntryType = RocksDb.Managed.Db.EntryType;
 
 namespace RocksDb.Managed.Tests.Db;
 
@@ -13,16 +13,16 @@ public sealed class MemTableTests
     private static MemTable NewMem(InternalKeyComparator? icmp = null, MemTableOptions? options = null) =>
         new(icmp ?? InternalKeyComparator.Bytewise, options ?? new MemTableOptions(), 0);
 
-    private readonly record struct GetOutcome(MemTableGetResult Result, string? Value, ValueType Type, ulong Seq, ulong MaxCovering);
+    private readonly record struct GetOutcome(MemTableGetResult Result, string? Value, EntryType Type, ulong Seq, ulong MaxCovering);
 
     private static GetOutcome Get(MemTable mem, string key, ulong seq, MergeContext? mc = null, ulong maxCovering = 0)
     {
         using var lk = new LookupKey(B(key), seq, stackalloc byte[LookupKey.StackBufferSize]);
-        MemTableGetResult r = mem.Get(in lk, out ReadOnlySpan<byte> v, out ValueType t, out ulong s, mc, ref maxCovering);
+        MemTableGetResult r = mem.Get(in lk, out ReadOnlySpan<byte> v, out EntryType t, out ulong s, mc, ref maxCovering);
         return new GetOutcome(r, r == MemTableGetResult.Found ? S(v) : null, t, s, maxCovering);
     }
 
-    private static void Put(MemTable mem, ulong seq, string k, string v) => Assert.IsTrue(mem.Add(seq, ValueType.Value, B(k), B(v)));
+    private static void Put(MemTable mem, ulong seq, string k, string v) => Assert.IsTrue(mem.Add(seq, EntryType.Value, B(k), B(v)));
 
     [TestMethod]
     public void EmptyMemTable()
@@ -43,17 +43,17 @@ public sealed class MemTableTests
         Put(mem, 1, "k", "v1");
         Put(mem, 5, "k", "v5");
         Put(mem, 3, "j", "j3");
-        Assert.IsTrue(mem.Add(9, ValueType.Deletion, B("k"), default));
+        Assert.IsTrue(mem.Add(9, EntryType.Deletion, B("k"), default));
         Put(mem, 12, "k", "v12");
 
         Assert.AreEqual(MemTableGetResult.NotFound, Get(mem, "k", 0).Result);
-        Assert.AreEqual(new GetOutcome(MemTableGetResult.Found, "v1", ValueType.Value, 1, 0), Get(mem, "k", 1));
+        Assert.AreEqual(new GetOutcome(MemTableGetResult.Found, "v1", EntryType.Value, 1, 0), Get(mem, "k", 1));
         Assert.AreEqual("v1", Get(mem, "k", 4).Value);
         Assert.AreEqual("v5", Get(mem, "k", 5).Value);
         Assert.AreEqual("v5", Get(mem, "k", 8).Value);
         GetOutcome del = Get(mem, "k", 9);
         Assert.AreEqual(MemTableGetResult.Deleted, del.Result);
-        Assert.AreEqual(ValueType.Deletion, del.Type);
+        Assert.AreEqual(EntryType.Deletion, del.Type);
         Assert.AreEqual(9UL, del.Seq);
         Assert.AreEqual(MemTableGetResult.Deleted, Get(mem, "k", 11).Result);
         Assert.AreEqual("v12", Get(mem, "k", DbFormat.MaxSequenceNumber).Value);
@@ -75,10 +75,10 @@ public sealed class MemTableTests
     {
         using MemTable mem = NewMem();
         Put(mem, 7, "a", "x");
-        Assert.IsFalse(mem.Add(7, ValueType.Value, B("a"), B("y")));
+        Assert.IsFalse(mem.Add(7, EntryType.Value, B("a"), B("y")));
         // Same seq, different type is also rejected (memtable ordering ignores the type, as upstream).
-        Assert.IsFalse(mem.Add(7, ValueType.Deletion, B("a"), default));
-        Assert.IsTrue(mem.Add(8, ValueType.Value, B("a"), B("y")));
+        Assert.IsFalse(mem.Add(7, EntryType.Deletion, B("a"), default));
+        Assert.IsTrue(mem.Add(8, EntryType.Value, B("a"), B("y")));
         Assert.AreEqual(2L, mem.NumEntries);
     }
 
@@ -87,18 +87,18 @@ public sealed class MemTableTests
     {
         using MemTable mem = NewMem();
         Put(mem, 1, "a", "1");
-        Assert.IsTrue(mem.Add(2, ValueType.SingleDeletion, B("a"), default));
-        Assert.AreEqual(ValueType.SingleDeletion, Get(mem, "a", 5).Type);
+        Assert.IsTrue(mem.Add(2, EntryType.SingleDeletion, B("a"), default));
+        Assert.AreEqual(EntryType.SingleDeletion, Get(mem, "a", 5).Type);
         Assert.AreEqual(MemTableGetResult.Deleted, Get(mem, "a", 5).Result);
 
         byte[] packed = new byte[3 + 8];
         B("val").CopyTo(packed, 0);
         BitConverter.TryWriteBytes(packed.AsSpan(3), 123UL);
-        Assert.IsTrue(mem.Add(10, ValueType.ValuePreferredSeqno, B("b"), packed));
+        Assert.IsTrue(mem.Add(10, EntryType.ValuePreferredSeqno, B("b"), packed));
         GetOutcome g = Get(mem, "b", 10);
         Assert.AreEqual(MemTableGetResult.Found, g.Result);
         Assert.AreEqual("val", g.Value);
-        Assert.AreEqual(ValueType.Value, g.Type);
+        Assert.AreEqual(EntryType.Value, g.Type);
     }
 
     [TestMethod]
@@ -106,12 +106,12 @@ public sealed class MemTableTests
     {
         using MemTable mem = NewMem();
         using var mc = new MergeContext();
-        Assert.IsTrue(mem.Add(1, ValueType.Value, B("m"), B("base")));
-        Assert.IsTrue(mem.Add(2, ValueType.Merge, B("m"), B("+a")));
-        Assert.IsTrue(mem.Add(3, ValueType.Merge, B("m"), B("+b")));
-        Assert.IsTrue(mem.Add(4, ValueType.Merge, B("n"), B("+x")));
-        Assert.IsTrue(mem.Add(5, ValueType.Deletion, B("o"), default));
-        Assert.IsTrue(mem.Add(6, ValueType.Merge, B("o"), B("+y")));
+        Assert.IsTrue(mem.Add(1, EntryType.Value, B("m"), B("base")));
+        Assert.IsTrue(mem.Add(2, EntryType.Merge, B("m"), B("+a")));
+        Assert.IsTrue(mem.Add(3, EntryType.Merge, B("m"), B("+b")));
+        Assert.IsTrue(mem.Add(4, EntryType.Merge, B("n"), B("+x")));
+        Assert.IsTrue(mem.Add(5, EntryType.Deletion, B("o"), default));
+        Assert.IsTrue(mem.Add(6, EntryType.Merge, B("o"), B("+y")));
 
         GetOutcome g = Get(mem, "m", 10, mc);
         Assert.AreEqual(MemTableGetResult.Found, g.Result);
@@ -149,14 +149,14 @@ public sealed class MemTableTests
         Put(mem, 1, "a", "a1");
         Put(mem, 2, "c", "c2");
         Put(mem, 3, "e", "e3");
-        Assert.IsTrue(mem.Add(5, ValueType.RangeDeletion, B("b"), B("e")));
+        Assert.IsTrue(mem.Add(5, EntryType.RangeDeletion, B("b"), B("e")));
         Put(mem, 6, "d", "d6");
         Assert.AreEqual(1L, mem.NumRangeDeletes);
 
         Assert.AreEqual("a1", Get(mem, "a", 10).Value);
         GetOutcome c = Get(mem, "c", 10);
         Assert.AreEqual(MemTableGetResult.Deleted, c.Result);
-        Assert.AreEqual(ValueType.RangeDeletion, c.Type);
+        Assert.AreEqual(EntryType.RangeDeletion, c.Type);
         Assert.AreEqual(5UL, c.MaxCovering);
         Assert.AreEqual(5UL, c.Seq);
         Assert.AreEqual("c2", Get(mem, "c", 4).Value, "snapshot before the range deletion");
@@ -170,7 +170,7 @@ public sealed class MemTableTests
         Assert.AreEqual(0UL, mem.MaxCoveringTombstoneSeqnum(B("b"), 4));
 
         // Newer, overlapping tombstone invalidates the cache.
-        Assert.IsTrue(mem.Add(8, ValueType.RangeDeletion, B("d"), B("z")));
+        Assert.IsTrue(mem.Add(8, EntryType.RangeDeletion, B("d"), B("z")));
         Assert.AreEqual(MemTableGetResult.Deleted, Get(mem, "d", 10).Result);
         Assert.AreEqual(MemTableGetResult.Deleted, Get(mem, "e", 10).Result);
         Assert.AreEqual("d6", Get(mem, "d", 7).Value);
@@ -186,7 +186,7 @@ public sealed class MemTableTests
         rit.SeekToFirst();
         Assert.AreEqual("b", S(rit.UserKey));
         Assert.AreEqual("e", S(rit.Value));
-        Assert.AreEqual(ValueType.RangeDeletion, rit.Type);
+        Assert.AreEqual(EntryType.RangeDeletion, rit.Type);
     }
 
     [TestMethod]
@@ -238,7 +238,7 @@ public sealed class MemTableTests
             Assert.AreEqual(expected[idx].k, S(it.UserKey));
             Assert.AreEqual(expected[idx].seq, it.Sequence);
             Assert.AreEqual(expected[idx].v, S(it.Value));
-            Assert.AreEqual(ValueType.Value, it.Type);
+            Assert.AreEqual(EntryType.Value, it.Type);
         }
         Assert.AreEqual(expected.Count, idx);
         idx = expected.Count - 1;
@@ -255,11 +255,11 @@ public sealed class MemTableTests
         Assert.IsTrue(it.Valid);
         Assert.AreEqual(target.k, S(it.UserKey));
         Assert.AreEqual(target.seq, it.Sequence);
-        it.SeekForPrev(new InternalKey(B(target.k), target.seq, ValueType.Deletion).Encoded);
+        it.SeekForPrev(new InternalKey(B(target.k), target.seq, EntryType.Deletion).Encoded);
         Assert.AreEqual(target.seq, it.Sequence);
-        it.Seek(new InternalKey(B("zzz"), 1, ValueType.Value).Encoded);
+        it.Seek(new InternalKey(B("zzz"), 1, EntryType.Value).Encoded);
         Assert.IsFalse(it.Valid);
-        it.SeekForPrev(new InternalKey(B("a"), 1, ValueType.Value).Encoded);
+        it.SeekForPrev(new InternalKey(B("a"), 1, EntryType.Value).Encoded);
         Assert.IsFalse(it.Valid);
 
         ulong approx = mem.ApproximateNumEntries(InternalKey.MinPossibleForUserKey(B("key0100")).Encoded, InternalKey.MinPossibleForUserKey(B("key0200")).Encoded);
@@ -274,8 +274,8 @@ public sealed class MemTableTests
         byte[] val = new byte[100_000]; // bigger than a quarter arena block -> irregular block
         new Random(3).NextBytes(key);
         new Random(4).NextBytes(val);
-        Assert.IsTrue(mem.Add(1, ValueType.Value, key, val));
-        Assert.IsTrue(mem.Add(2, ValueType.Value, key, default));
+        Assert.IsTrue(mem.Add(1, EntryType.Value, key, val));
+        Assert.IsTrue(mem.Add(2, EntryType.Value, key, default));
         using var lk = new LookupKey(key, 1, stackalloc byte[LookupKey.StackBufferSize]);
         ulong mc = 0;
         Assert.AreEqual(MemTableGetResult.Found, mem.Get(in lk, out ReadOnlySpan<byte> v, out _, out _, null, ref mc));
@@ -312,7 +312,7 @@ public sealed class MemTableTests
         ulong seq = 1;
         while (!mem.ShouldScheduleFlush)
         {
-            Assert.IsTrue(mem.Add(seq, ValueType.Value, BitConverter.GetBytes(seq), val));
+            Assert.IsTrue(mem.Add(seq, EntryType.Value, BitConverter.GetBytes(seq), val));
             seq++;
             Assert.IsTrue(seq < 10_000, "never became full");
         }
@@ -327,9 +327,9 @@ public sealed class MemTableTests
     public void MaxRangeDeletionsTriggersFlush()
     {
         using MemTable mem = NewMem(options: new MemTableOptions { MaxRangeDeletions = 2 });
-        Assert.IsTrue(mem.Add(1, ValueType.RangeDeletion, B("a"), B("b")));
+        Assert.IsTrue(mem.Add(1, EntryType.RangeDeletion, B("a"), B("b")));
         Assert.IsFalse(mem.ShouldScheduleFlush);
-        Assert.IsTrue(mem.Add(2, ValueType.RangeDeletion, B("c"), B("d")));
+        Assert.IsTrue(mem.Add(2, EntryType.RangeDeletion, B("c"), B("d")));
         Assert.IsTrue(mem.ShouldScheduleFlush);
     }
 
@@ -353,7 +353,7 @@ public sealed class MemTableTests
                     {
                         ulong seq = (ulong)(i * Writers + id + 1);
                         byte[] k = B("k" + (i % 1000).ToString("D4"));
-                        ValueType t = i % 7 == 0 ? ValueType.Deletion : ValueType.Value;
+                        EntryType t = i % 7 == 0 ? EntryType.Deletion : EntryType.Value;
                         if (!mem.AddConcurrently(seq, t, k, BitConverter.GetBytes(seq), ref info)) throw new InvalidOperationException("dup");
                     }
                 }

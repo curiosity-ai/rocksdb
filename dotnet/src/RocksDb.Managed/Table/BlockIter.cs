@@ -2,7 +2,7 @@ using System.Buffers;
 using System.Runtime.CompilerServices;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Util;
-using ValueType = RocksDb.Managed.Db.ValueType;
+using EntryType = RocksDb.Managed.Db.EntryType;
 
 namespace RocksDb.Managed.Table;
 
@@ -262,9 +262,9 @@ public sealed class BlockIter : IDisposable
         }
         if (_current == _restarts) return true;
         if (!UserKeyEquals(DbFormat.ExtractUserKey(Key), targetUserKey)) return false;
-        ValueType t = (ValueType)(byte)DbFormat.ExtractFooter(Key);
-        if (t != ValueType.Value && t != ValueType.Deletion && t != ValueType.Merge && t != ValueType.SingleDeletion
-            && t != ValueType.BlobIndex && t != ValueType.WideColumnEntity && t != ValueType.ValuePreferredSeqno)
+        EntryType t = (EntryType)(byte)DbFormat.ExtractFooter(Key);
+        if (t != EntryType.Value && t != EntryType.Deletion && t != EntryType.Merge && t != EntryType.SingleDeletion
+            && t != EntryType.BlobIndex && t != EntryType.WideColumnEntity && t != EntryType.ValuePreferredSeqno)
         {
             Seek(target);
         }
@@ -419,7 +419,7 @@ public sealed class BlockIter : IDisposable
         }
         if (_keyLen < DbFormat.InternalKeyFooterSize) { CorruptionError(); return; }
         Span<byte> footer = _keyBuf.AsSpan(_keyLen - DbFormat.InternalKeyFooterSize, DbFormat.InternalKeyFooterSize);
-        ValueType t = (ValueType)footer[0];
+        EntryType t = (EntryType)footer[0];
         Coding.EncodeFixed64(footer, DbFormat.PackSequenceAndType(_globalSeqno, t));
     }
 
@@ -487,7 +487,7 @@ public sealed class BlockIter : IDisposable
             Span<byte> tmp = restartKey.Length <= 256 ? stackalloc byte[restartKey.Length] : new byte[restartKey.Length];
             restartKey.CopyTo(tmp);
             Span<byte> footer = tmp[^DbFormat.InternalKeyFooterSize..];
-            Coding.EncodeFixed64(footer, DbFormat.PackSequenceAndType(_globalSeqno, (ValueType)footer[0]));
+            Coding.EncodeFixed64(footer, DbFormat.PackSequenceAndType(_globalSeqno, (EntryType)footer[0]));
             return CompareKey(tmp, target);
         }
         return CompareKey(restartKey, target);

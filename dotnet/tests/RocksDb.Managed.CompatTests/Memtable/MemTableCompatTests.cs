@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
 using RocksDb.Managed.CompatTests.Infrastructure;
 using RocksDb.Managed.Db;
-using ValueType = RocksDb.Managed.Db.ValueType;
+using EntryType = RocksDb.Managed.Db.EntryType;
 
 namespace RocksDb.Managed.CompatTests.Memtable;
 
@@ -64,7 +64,7 @@ public sealed class MemTableCompatTests
         // Managed memtable with the same comparator must iterate in the same order.
         using var mem = new MemTable(new InternalKeyComparator(cmp), new MemTableOptions(), 0);
         ulong seq = 1;
-        foreach (byte[] k in keys) Assert.IsTrue(mem.Add(seq++, ValueType.Value, k, k));
+        foreach (byte[] k in keys) Assert.IsTrue(mem.Add(seq++, EntryType.Value, k, k));
 
         var native = new List<byte[]>();
         using (var db = RocksDbSharp.RocksDb.Open(NativeOptions(optionsString), dir.Path))
@@ -117,12 +117,12 @@ public sealed class MemTableCompatTests
                     rnd.NextBytes(v);
                     db.Put(k, v, null, writeOptions);
                     ulong seq = db.GetLatestSequenceNumber();
-                    Assert.IsTrue(mem.Add(seq, ValueType.Value, k, v));
+                    Assert.IsTrue(mem.Add(seq, EntryType.Value, k, v));
                 }
                 else if (r < 90)
                 {
                     db.Remove(k, null, writeOptions);
-                    Assert.IsTrue(mem.Add(db.GetLatestSequenceNumber(), ValueType.Deletion, k, default));
+                    Assert.IsTrue(mem.Add(db.GetLatestSequenceNumber(), EntryType.Deletion, k, default));
                 }
                 else if (r < 93)
                 {
@@ -131,7 +131,7 @@ public sealed class MemTableCompatTests
                     using var batch = new RocksDbSharp.WriteBatch();
                     batch.DeleteRange(start, (ulong)start.Length, end, (ulong)end.Length);
                     db.Write(batch, writeOptions);
-                    Assert.IsTrue(mem.Add(db.GetLatestSequenceNumber(), ValueType.RangeDeletion, start, end));
+                    Assert.IsTrue(mem.Add(db.GetLatestSequenceNumber(), EntryType.RangeDeletion, start, end));
                 }
                 if (op % 500 == 0) snapshots.Add((db.CreateSnapshot(), db.GetLatestSequenceNumber()));
             }

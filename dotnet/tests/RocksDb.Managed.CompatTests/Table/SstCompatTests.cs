@@ -4,7 +4,7 @@ using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Table;
 using RocksDb.Managed.Util;
-using ValueType = RocksDb.Managed.Db.ValueType;
+using EntryType = RocksDb.Managed.Db.EntryType;
 
 namespace RocksDb.Managed.CompatTests.Table;
 
@@ -94,12 +94,12 @@ public sealed class SstCompatTests
         for (it.SeekToFirst(); it.Valid; it.Next(), n++)
         {
             CollectionAssert.AreEqual(Key(n), DbFormat.ExtractUserKey(it.Key).ToArray());
-            DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(it.Key), out ulong seq, out ValueType t);
+            DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(it.Key), out ulong seq, out EntryType t);
             Assert.AreEqual(0UL, seq);
-            if (n % 10 == 9) Assert.AreEqual(ValueType.Deletion, t);
+            if (n % 10 == 9) Assert.AreEqual(EntryType.Deletion, t);
             else
             {
-                Assert.AreEqual(ValueType.Value, t);
+                Assert.AreEqual(EntryType.Value, t);
                 CollectionAssert.AreEqual(Val(n, seed), it.Value.ToArray());
             }
         }
@@ -114,8 +114,8 @@ public sealed class SstCompatTests
             value.Clear();
             TableGetResult r = reader.Get(LookupKey(Key(i)), value);
             Assert.IsTrue(r.Found);
-            Assert.AreEqual(i % 10 == 9 ? ValueType.Deletion : ValueType.Value, r.Type);
-            if (r.Type == ValueType.Value) CollectionAssert.AreEqual(Val(i, seed), value.WrittenSpan.ToArray());
+            Assert.AreEqual(i % 10 == 9 ? EntryType.Deletion : EntryType.Value, r.Type);
+            if (r.Type == EntryType.Value) CollectionAssert.AreEqual(Val(i, seed), value.WrittenSpan.ToArray());
             it.Seek(LookupKey(Key(i)));
             CollectionAssert.AreEqual(Key(i), DbFormat.ExtractUserKey(it.Key).ToArray());
         }
@@ -130,7 +130,7 @@ public sealed class SstCompatTests
         return k;
     }
 
-    private static byte[] IKey(byte[] userKey, ulong seq, ValueType t)
+    private static byte[] IKey(byte[] userKey, ulong seq, EntryType t)
     {
         byte[] k = new byte[userKey.Length + 8];
         DbFormat.AppendInternalKey(k, userKey, seq, t);
@@ -152,7 +152,7 @@ public sealed class SstCompatTests
             writer.Finish();
         }
         string managedPath = Path.Combine(dir.Path, "managed.sst");
-        WriteManaged(managedPath, new BlockBasedTableOptions { FormatVersion = formatVersion }, 1000, 1);
+        WriteManaged(managedPath, new TableFormatOptions { FormatVersion = formatVersion }, 1000, 1);
 
         using var nr = BlockBasedTableReader.Open(LocalFileSystem.Instance.OpenRandomAccess(nativePath), TableReaderOptions.Default);
         using var mr = BlockBasedTableReader.Open(LocalFileSystem.Instance.OpenRandomAccess(managedPath), TableReaderOptions.Default);
@@ -184,12 +184,12 @@ public sealed class SstCompatTests
         CollectionAssert.AreEqual(nb.AsSpan(0, firstBlock).ToArray(), mb.AsSpan(0, firstBlock).ToArray());
     }
 
-    private static void WriteManaged(string path, BlockBasedTableOptions options, int count, int seed)
+    private static void WriteManaged(string path, TableFormatOptions options, int count, int seed)
     {
         using IWritableFile f = LocalFileSystem.Instance.CreateWritable(path);
         using (var b = new BlockBasedTableBuilder(f, options, new TableBuilderOptions { ExternalSstFile = true, DbId = "SST Writer" }))
         {
-            for (int i = 0; i < count; i++) b.Add(IKey(Key(i), 0, ValueType.Value), Val(i, seed));
+            for (int i = 0; i < count; i++) b.Add(IKey(Key(i), 0, EntryType.Value), Val(i, seed));
             b.Finish();
         }
         f.Sync();
@@ -214,7 +214,7 @@ public sealed class SstCompatTests
         string sst = Path.Combine(dir.Path, "managed.sst");
         const int count = 5000;
         const int seed = 11;
-        var options = new BlockBasedTableOptions
+        var options = new TableFormatOptions
         {
             FormatVersion = formatVersion,
             Checksum = (ChecksumType)checksum,
@@ -255,7 +255,7 @@ public sealed class SstCompatTests
         var dbOptions = new RocksDbSharp.DbOptions().SetCreateIfMissing(true);
         dbOptions.SetCompression(RocksDbSharp.Compression.No);
         const int count = 4000;
-        var expected = new SortedDictionary<string, (ulong Seq, ValueType Type, string? Value)>(StringComparer.Ordinal);
+        var expected = new SortedDictionary<string, (ulong Seq, EntryType Type, string? Value)>(StringComparer.Ordinal);
         ulong seq = 0;
         using (var db = RocksDbSharp.RocksDb.Open(dbOptions, dir.Path))
         {
@@ -264,13 +264,13 @@ public sealed class SstCompatTests
                 string k = "k" + (i * 7919 % count).ToString("D6");
                 string v = "value-" + i;
                 db.Put(Encoding.ASCII.GetBytes(k), Encoding.ASCII.GetBytes(v));
-                expected[k] = (++seq, ValueType.Value, v);
+                expected[k] = (++seq, EntryType.Value, v);
             }
             for (int i = 0; i < count; i += 5)
             {
                 string k = "k" + i.ToString("D6");
                 db.Remove(Encoding.ASCII.GetBytes(k));
-                expected[k] = (++seq, ValueType.Deletion, null);
+                expected[k] = (++seq, EntryType.Deletion, null);
             }
             db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
         }
@@ -286,14 +286,14 @@ public sealed class SstCompatTests
         {
             Assert.IsTrue(e.MoveNext());
             Assert.AreEqual(e.Current.Key, Encoding.ASCII.GetString(DbFormat.ExtractUserKey(it.Key)));
-            DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(it.Key), out ulong s, out ValueType t);
+            DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(it.Key), out ulong s, out EntryType t);
             Assert.AreEqual(e.Current.Value.Seq, s);
             Assert.AreEqual(e.Current.Value.Type, t);
-            if (t == ValueType.Value) Assert.AreEqual(e.Current.Value.Value, Encoding.ASCII.GetString(it.Value));
+            if (t == EntryType.Value) Assert.AreEqual(e.Current.Value.Value, Encoding.ASCII.GetString(it.Value));
         }
         Assert.IsFalse(e.MoveNext());
         using var value = new PooledBufferWriter();
-        foreach (KeyValuePair<string, (ulong Seq, ValueType Type, string? Value)> kv in expected)
+        foreach (KeyValuePair<string, (ulong Seq, EntryType Type, string? Value)> kv in expected)
         {
             value.Clear();
             TableGetResult r = reader.Get(LookupKey(Encoding.ASCII.GetBytes(kv.Key)), value);

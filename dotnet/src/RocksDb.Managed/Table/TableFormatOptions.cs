@@ -3,28 +3,13 @@ using RocksDb.Managed.Table.Filters;
 
 namespace RocksDb.Managed.Table;
 
-/// <summary>Mirrors BlockBasedTableOptions::IndexType (include/rocksdb/table.h). Persisted in table properties.</summary>
-public enum IndexType : byte
-{
-    BinarySearch = 0x00,
-    HashSearch = 0x01,
-    TwoLevelIndexSearch = 0x02,
-    BinarySearchWithFirstKey = 0x03,
-}
-
-/// <summary>Mirrors BlockBasedTableOptions::IndexShorteningMode.</summary>
-public enum IndexShorteningMode : byte
-{
-    NoShortening,
-    ShortenSeparators,
-    ShortenSeparatorsAndSuccessor,
-}
+// IndexType / IndexShorteningMode / DataBlockIndexType are defined once in Options/OptionEnums.cs.
 
 /// <summary>
-/// Block-based table configuration (the subset of rocksdb::BlockBasedTableOptions, include/rocksdb/table.h, that
+/// Block-based table configuration (the subset of rocksdb::TableFormatOptions, include/rocksdb/table.h, that
 /// affects the table builder and reader in this port). Defaults match upstream.
 /// </summary>
-public sealed record BlockBasedTableOptions
+public sealed record TableFormatOptions
 {
     /// <summary>Approximate size of user data packed per block (uncompressed). Default 4 KiB.</summary>
     public int BlockSize { get; init; } = 4 * 1024;
@@ -49,7 +34,7 @@ public sealed record BlockBasedTableOptions
     /// <summary>Verify block checksums when reading (ReadOptions::verify_checksums default true).</summary>
     public bool VerifyChecksums { get; init; } = true;
 
-    public static BlockBasedTableOptions Default { get; } = new();
+    public static TableFormatOptions Default { get; } = new();
 
     internal void Validate()
     {

@@ -6,7 +6,7 @@ using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Table.Filters;
 using RocksDb.Managed.Util;
-using ValueType = RocksDb.Managed.Db.ValueType;
+using EntryType = RocksDb.Managed.Db.EntryType;
 
 namespace RocksDb.Managed.Table;
 
@@ -16,7 +16,7 @@ namespace RocksDb.Managed.Table;
 /// index/filters on the write side).
 /// <para>
 /// Keys are internal keys (user key + 8-byte packed sequence/type) added in strictly increasing internal-key order;
-/// range deletions (<see cref="ValueType.RangeDeletion"/>) may be interleaved and go to the "rocksdb.range_del" meta block.
+/// range deletions (<see cref="EntryType.RangeDeletion"/>) may be interleaved and go to the "rocksdb.range_del" meta block.
 /// </para>
 /// <para>
 /// I/O: serialized blocks are staged in an internal pooled buffer and handed to the <see cref="IWritableFile"/> in
@@ -33,7 +33,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
     private const int CompressionSizeLimit = int.MaxValue;
 
     private readonly IWritableFile _file;
-    private readonly BlockBasedTableOptions _options;
+    private readonly TableFormatOptions _options;
     private readonly TableBuilderOptions _tbo;
     private readonly Comparator _ucmp;
     private readonly bool _bytewise;
@@ -52,7 +52,7 @@ public sealed class BlockBasedTableBuilder : IDisposable
     private uint _compressionTypesUsed; // bitset over CompressionType values (< 32)
     private bool _closed;
 
-    public BlockBasedTableBuilder(IWritableFile file, BlockBasedTableOptions options, TableBuilderOptions tableBuilderOptions)
+    public BlockBasedTableBuilder(IWritableFile file, TableFormatOptions options, TableBuilderOptions tableBuilderOptions)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(options);
@@ -126,11 +126,11 @@ public sealed class BlockBasedTableBuilder : IDisposable
     {
         if (_closed) throw new InvalidOperationException("Table builder already finished.");
         if (internalKey.Length < DbFormat.InternalKeyFooterSize) ThrowHelper.InvalidArgument("internal key too short");
-        DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(internalKey), out ulong seq, out ValueType type);
+        DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(internalKey), out ulong seq, out EntryType type);
         if (seq > _props.KeyLargestSeqno) _props.KeyLargestSeqno = seq;
         if (seq < _props.KeySmallestSeqno) _props.KeySmallestSeqno = seq;
 
-        if (type == ValueType.RangeDeletion)
+        if (type == EntryType.RangeDeletion)
         {
             _rangeDelBlock.Add(internalKey, value);
             _props.NumDeletions++;
@@ -150,17 +150,17 @@ public sealed class BlockBasedTableBuilder : IDisposable
             _lastKey.Clear();
             _lastKey.Write(internalKey);
             _indexBuilder.OnKeyAdded(internalKey);
-            if (type is ValueType.Deletion or ValueType.SingleDeletion or ValueType.DeletionWithTimestamp) _props.NumDeletions++;
-            else if (type == ValueType.Merge) _props.NumMergeOperands++;
+            if (type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp) _props.NumDeletions++;
+            else if (type == EntryType.Merge) _props.NumMergeOperands++;
         }
         _props.NumEntries++;
         _props.RawKeySize += (ulong)internalKey.Length;
         _props.RawValueSize += (ulong)value.Length;
     }
 
-    private static bool IsValueType(ValueType t) =>
-        t is ValueType.Deletion or ValueType.Value or ValueType.Merge or ValueType.SingleDeletion or ValueType.BlobIndex
-            or ValueType.DeletionWithTimestamp or ValueType.WideColumnEntity or ValueType.ValuePreferredSeqno;
+    private static bool IsValueType(EntryType t) =>
+        t is EntryType.Deletion or EntryType.Value or EntryType.Merge or EntryType.SingleDeletion or EntryType.BlobIndex
+            or EntryType.DeletionWithTimestamp or EntryType.WideColumnEntity or EntryType.ValuePreferredSeqno;
 
     /// <summary>Port of FlushBlockBySizePolicy::Update.</summary>
     private bool ShouldFlush(int keyLength, int valueLength)

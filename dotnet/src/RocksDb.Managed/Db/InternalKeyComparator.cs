@@ -84,7 +84,7 @@ public sealed class InternalKeyComparator
     }
 
     /// <summary>Compares an encoded internal key with a parsed one (port of Compare(Slice, ParsedInternalKey)).</summary>
-    public int Compare(ReadOnlySpan<byte> a, ReadOnlySpan<byte> bUserKey, ulong bSequence, ValueType bType)
+    public int Compare(ReadOnlySpan<byte> a, ReadOnlySpan<byte> bUserKey, ulong bSequence, EntryType bType)
     {
         int r = CompareUserKey(a[..^DbFormat.InternalKeyFooterSize], bUserKey);
         if (r == 0)
@@ -105,8 +105,8 @@ public sealed class InternalKeyComparator
         if (r == 0)
         {
             ulong af = Footer(a), bf = Footer(b);
-            if (aGlobalSeqno != DisableGlobalSequenceNumber) af = DbFormat.PackSequenceAndType(aGlobalSeqno, (ValueType)(byte)af);
-            if (bGlobalSeqno != DisableGlobalSequenceNumber) bf = DbFormat.PackSequenceAndType(bGlobalSeqno, (ValueType)(byte)bf);
+            if (aGlobalSeqno != DisableGlobalSequenceNumber) af = DbFormat.PackSequenceAndType(aGlobalSeqno, (EntryType)(byte)af);
+            if (bGlobalSeqno != DisableGlobalSequenceNumber) bf = DbFormat.PackSequenceAndType(bGlobalSeqno, (EntryType)(byte)bf);
             r = af > bf ? -1 : (af < bf ? 1 : 0);
         }
         return r;

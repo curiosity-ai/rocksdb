@@ -16,7 +16,7 @@ public readonly struct InternalKey : IEquatable<InternalKey>
 
     private InternalKey(byte[] rep) => _rep = rep;
 
-    public InternalKey(ReadOnlySpan<byte> userKey, ulong sequence, ValueType type)
+    public InternalKey(ReadOnlySpan<byte> userKey, ulong sequence, EntryType type)
     {
         _rep = new byte[userKey.Length + DbFormat.InternalKeyFooterSize];
         DbFormat.AppendInternalKey(_rep, userKey, sequence, type);
@@ -26,7 +26,7 @@ public readonly struct InternalKey : IEquatable<InternalKey>
     public static InternalKey FromEncoded(ReadOnlySpan<byte> encoded) => new(encoded.ToArray());
 
     /// <summary>An internal key that sorts at or after every internal key with this user key (seq 0, type 0).</summary>
-    public static InternalKey MaxPossibleForUserKey(ReadOnlySpan<byte> userKey) => new(userKey, 0, ValueType.Deletion);
+    public static InternalKey MaxPossibleForUserKey(ReadOnlySpan<byte> userKey) => new(userKey, 0, EntryType.Deletion);
 
     /// <summary>An internal key that sorts at or before every internal key with this user key (kMaxSequenceNumber, kValueTypeForSeek).</summary>
     public static InternalKey MinPossibleForUserKey(ReadOnlySpan<byte> userKey) => new(userKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
@@ -39,7 +39,7 @@ public readonly struct InternalKey : IEquatable<InternalKey>
     public ReadOnlySpan<byte> Encoded => _rep;
     public ReadOnlySpan<byte> UserKey => _rep is null ? default : DbFormat.ExtractUserKey(_rep);
     public ulong Sequence => DbFormat.ExtractFooter(_rep) >> 8;
-    public ValueType Type => (ValueType)(byte)DbFormat.ExtractFooter(_rep);
+    public EntryType Type => (EntryType)(byte)DbFormat.ExtractFooter(_rep);
 
     public bool Equals(InternalKey other) => Encoded.SequenceEqual(other.Encoded);
     public override bool Equals(object? obj) => obj is InternalKey k && Equals(k);
@@ -187,7 +187,7 @@ public sealed class IterKey : IDisposable
     }
 
     /// <summary>Encodes <c>userKey | footer(seq, type)</c> into the buffer.</summary>
-    public ReadOnlySpan<byte> SetInternalKey(ReadOnlySpan<byte> userKey, ulong sequence, ValueType type)
+    public ReadOnlySpan<byte> SetInternalKey(ReadOnlySpan<byte> userKey, ulong sequence, EntryType type)
     {
         _isUserKey = false;
         EnsureCapacity(userKey.Length + DbFormat.InternalKeyFooterSize, 0);
@@ -196,7 +196,7 @@ public sealed class IterKey : IDisposable
     }
 
     /// <summary>Rewrites the footer of the held internal key in place.</summary>
-    public void UpdateInternalKey(ulong sequence, ValueType type)
+    public void UpdateInternalKey(ulong sequence, EntryType type)
     {
         System.Diagnostics.Debug.Assert(!_isUserKey && _size >= DbFormat.InternalKeyFooterSize);
         Coding.EncodeFixed64(_buf.AsSpan(_size - DbFormat.InternalKeyFooterSize), DbFormat.PackSequenceAndType(sequence, type));

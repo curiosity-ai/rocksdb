@@ -1,7 +1,7 @@
 using System.Buffers;
 using System.Text;
 using RocksDb.Managed.Db;
-using ValueType = RocksDb.Managed.Db.ValueType;
+using EntryType = RocksDb.Managed.Db.EntryType;
 using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Tests.Db;
@@ -13,7 +13,7 @@ public sealed class VersionEditTests
     private const ulong Big = 1UL << 50;
     private const uint Big32Bit = 1U << 30;
 
-    internal static byte[] IKey(string userKey, ulong seq, ValueType type)
+    internal static byte[] IKey(string userKey, ulong seq, EntryType type)
     {
         byte[] u = Encoding.UTF8.GetBytes(userKey);
         var k = new byte[u.Length + 8];
@@ -46,7 +46,7 @@ public sealed class VersionEditTests
         {
             EncodeDecode(edit);
             edit.AddFile(3, File(Big + 300 + (ulong)i, 0, Big + 400 + (ulong)i,
-                IKey("foo", Big + 500 + (ulong)i, ValueType.Value), IKey("zoo", Big + 600 + (ulong)i, ValueType.Deletion),
+                IKey("foo", Big + 500 + (ulong)i, EntryType.Value), IKey("zoo", Big + 600 + (ulong)i, EntryType.Deletion),
                 Big + 500 + (ulong)i, Big + 600 + (ulong)i, Big + 300 + (ulong)i));
             edit.DeleteFile(4, Big + 700 + (ulong)i);
         }
@@ -67,12 +67,12 @@ public sealed class VersionEditTests
     public void EncodeDecodeNewFile4()
     {
         var edit = new VersionEdit();
-        FileMetaData f1 = File(300, 3, 100, IKey("foo", Big + 500, ValueType.Value), IKey("zoo", Big + 600, ValueType.Deletion), Big + 500, Big + 600, 300);
+        FileMetaData f1 = File(300, 3, 100, IKey("foo", Big + 500, EntryType.Value), IKey("zoo", Big + 600, EntryType.Deletion), Big + 500, Big + 600, 300);
         f1.MarkedForCompaction = true;
         edit.AddFile(3, f1);
-        FileMetaData f2 = File(301, 3, 100, IKey("foo", Big + 501, ValueType.Value), IKey("zoo", Big + 601, ValueType.Deletion), Big + 501, Big + 601, 301);
+        FileMetaData f2 = File(301, 3, 100, IKey("foo", Big + 501, EntryType.Value), IKey("zoo", Big + 601, EntryType.Deletion), Big + 501, Big + 601, 301);
         edit.AddFile(4, f2);
-        FileMetaData f3 = File(302, 0, 100, IKey("foo", Big + 502, ValueType.Value), IKey("zoo", Big + 602, ValueType.Deletion), Big + 502, Big + 602, 302);
+        FileMetaData f3 = File(302, 0, 100, IKey("foo", Big + 502, EntryType.Value), IKey("zoo", Big + 602, EntryType.Deletion), Big + 502, Big + 602, 302);
         f3.MarkedForCompaction = true;
         f3.OldestBlobFileNumber = 666;
         f3.OldestAncestorTime = 888;
@@ -127,8 +127,8 @@ public sealed class VersionEditTests
         const int tsSize = 16;
         byte[] minTs = new byte[tsSize];
         var edit = new VersionEdit();
-        FileMetaData f = File(300, 3, 100, IKey("foo" + Encoding.Latin1.GetString(minTs), Big + 500, ValueType.Value),
-            IKey("zoo" + Encoding.Latin1.GetString(minTs), Big + 600, ValueType.Deletion), Big + 500, Big + 600, 300);
+        FileMetaData f = File(300, 3, 100, IKey("foo" + Encoding.Latin1.GetString(minTs), Big + 500, EntryType.Value),
+            IKey("zoo" + Encoding.Latin1.GetString(minTs), Big + 600, EntryType.Deletion), Big + 500, Big + 600, 300);
         f.UserDefinedTimestampsPersisted = false;
         edit.AddFile(3, f);
         edit.ComparatorName = "foo";
@@ -139,8 +139,8 @@ public sealed class VersionEditTests
 
         VersionEdit parsed = VersionEdit.DecodeFrom(edit.Encode(tsSize));
         // Timestamps are stripped from file boundaries when they are not persisted.
-        CollectionAssert.AreEqual(IKey("foo", Big + 500, ValueType.Value), parsed.NewFiles[0].Meta.Smallest);
-        CollectionAssert.AreEqual(IKey("zoo", Big + 600, ValueType.Deletion), parsed.NewFiles[0].Meta.Largest);
+        CollectionAssert.AreEqual(IKey("foo", Big + 500, EntryType.Value), parsed.NewFiles[0].Meta.Smallest);
+        CollectionAssert.AreEqual(IKey("zoo", Big + 600, EntryType.Deletion), parsed.NewFiles[0].Meta.Largest);
         Assert.IsFalse(parsed.NewFiles[0].Meta.UserDefinedTimestampsPersisted);
     }
 
@@ -160,7 +160,7 @@ public sealed class VersionEditTests
     private static VersionEdit SingleFileEdit(bool markedForCompaction)
     {
         var edit = new VersionEdit();
-        FileMetaData f = File(300, 3, 100, IKey("foo", Big + 500, ValueType.Value), IKey("zoo", Big + 600, ValueType.Deletion), Big + 500, Big + 600, 300);
+        FileMetaData f = File(300, 3, 100, IKey("foo", Big + 500, EntryType.Value), IKey("zoo", Big + 600, EntryType.Deletion), Big + 500, Big + 600, 300);
         f.MarkedForCompaction = markedForCompaction;
         edit.DeleteFile(4, 700);
         edit.ComparatorName = "foo"; // (persist_user_defined_timestamps would be encoded after the files)
@@ -400,7 +400,7 @@ public sealed class VersionEditTests
     public void CompactCursorsAndPrevLog()
     {
         var edit = new VersionEdit { PrevLogNumber = 9 };
-        edit.CompactCursors.Add(new CompactCursor(2, IKey("cursor", 5, ValueType.Value)));
+        edit.CompactCursors.Add(new CompactCursor(2, IKey("cursor", 5, EntryType.Value)));
         VersionEdit p = EncodeDecode(edit);
         Assert.AreEqual(9UL, p.PrevLogNumber);
         Assert.AreEqual(2, p.CompactCursors[0].Level);
@@ -445,7 +445,7 @@ public sealed class VersionEditTests
     [TestMethod]
     public void LegacyNewFileFormats()
     {
-        byte[] smallest = IKey("a", 1, ValueType.Value), largest = IKey("b", 2, ValueType.Value);
+        byte[] smallest = IKey("a", 1, EntryType.Value), largest = IKey("b", 2, EntryType.Value);
         var w = new ArrayBufferWriter<byte>();
         // kNewFile: level, number, size, smallest, largest
         Coding.PutVarint32(w, (uint)VersionEditTag.NewFile);

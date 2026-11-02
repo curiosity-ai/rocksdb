@@ -1,6 +1,6 @@
 using System.Text;
 using RocksDb.Managed.Db;
-using ValueType = RocksDb.Managed.Db.ValueType;
+using EntryType = RocksDb.Managed.Db.EntryType;
 
 namespace RocksDb.Managed.CompatTests.Wal;
 
@@ -70,12 +70,12 @@ internal static class NativeDbHelper
             string k = Encoding.UTF8.GetString(e.Key), v = Encoding.UTF8.GetString(e.Value);
             switch (e.Type)
             {
-                case ValueType.Value: sb.Append($"Put({e.ColumnFamilyId},{k},{v})@{seq++} "); break;
-                case ValueType.Deletion: sb.Append($"Delete({e.ColumnFamilyId},{k})@{seq++} "); break;
-                case ValueType.SingleDeletion: sb.Append($"SingleDelete({e.ColumnFamilyId},{k})@{seq++} "); break;
-                case ValueType.RangeDeletion: sb.Append($"DeleteRange({e.ColumnFamilyId},{k},{v})@{seq++} "); break;
-                case ValueType.Merge: sb.Append($"Merge({e.ColumnFamilyId},{k},{v})@{seq++} "); break;
-                case ValueType.LogData: sb.Append($"LogData({v}) "); break;
+                case EntryType.Value: sb.Append($"Put({e.ColumnFamilyId},{k},{v})@{seq++} "); break;
+                case EntryType.Deletion: sb.Append($"Delete({e.ColumnFamilyId},{k})@{seq++} "); break;
+                case EntryType.SingleDeletion: sb.Append($"SingleDelete({e.ColumnFamilyId},{k})@{seq++} "); break;
+                case EntryType.RangeDeletion: sb.Append($"DeleteRange({e.ColumnFamilyId},{k},{v})@{seq++} "); break;
+                case EntryType.Merge: sb.Append($"Merge({e.ColumnFamilyId},{k},{v})@{seq++} "); break;
+                case EntryType.LogData: sb.Append($"LogData({v}) "); break;
                 default: sb.Append($"{e.Type} "); break;
             }
         }

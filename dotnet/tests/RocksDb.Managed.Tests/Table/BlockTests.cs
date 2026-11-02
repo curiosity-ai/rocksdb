@@ -231,7 +231,7 @@ public sealed class BlockTests
     [TestMethod]
     public void GlobalSeqnoIsApplied()
     {
-        var keys = new List<byte[]> { IKey("a", 0), IKey("b", 0), IKey("c", 0, Db.ValueType.Deletion) };
+        var keys = new List<byte[]> { IKey("a", 0), IKey("b", 0), IKey("c", 0, RocksDb.Managed.Db.EntryType.Deletion) };
         var values = new List<byte[]> { new byte[] { 1 }, new byte[] { 2 }, Array.Empty<byte>() };
         Block block = BuildBlock(keys, values, 2);
         using var it = new BlockIter();
@@ -239,9 +239,9 @@ public sealed class BlockTests
         int n = 0;
         for (it.SeekToFirst(); it.Valid; it.Next(), n++)
         {
-            DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(it.Key), out ulong seq, out Db.ValueType t);
+            DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(it.Key), out ulong seq, out RocksDb.Managed.Db.EntryType t);
             Assert.AreEqual(42UL, seq);
-            Assert.AreEqual(n == 2 ? Db.ValueType.Deletion : Db.ValueType.Value, t);
+            Assert.AreEqual(n == 2 ? RocksDb.Managed.Db.EntryType.Deletion : RocksDb.Managed.Db.EntryType.Value, t);
         }
         it.Seek(IKey("b", 42));
         Assert.AreEqual("b", UserKeyOf(it.Key));

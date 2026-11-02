@@ -3,7 +3,7 @@ using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Table;
 using RocksDb.Managed.Table.Filters;
-using ValueType = RocksDb.Managed.Db.ValueType;
+using EntryType = RocksDb.Managed.Db.EntryType;
 
 namespace RocksDb.Managed.Tests.Table;
 
@@ -93,9 +93,9 @@ internal sealed class ExactSetFilterPolicy : FilterPolicy
 
 internal static class TableTestUtil
 {
-    public static byte[] IKey(string userKey, ulong seq, ValueType type = ValueType.Value) => IKey(System.Text.Encoding.UTF8.GetBytes(userKey), seq, type);
+    public static byte[] IKey(string userKey, ulong seq, EntryType type = EntryType.Value) => IKey(System.Text.Encoding.UTF8.GetBytes(userKey), seq, type);
 
-    public static byte[] IKey(ReadOnlySpan<byte> userKey, ulong seq, ValueType type = ValueType.Value)
+    public static byte[] IKey(ReadOnlySpan<byte> userKey, ulong seq, EntryType type = EntryType.Value)
     {
         byte[] k = new byte[userKey.Length + 8];
         DbFormat.AppendInternalKey(k, userKey, seq, type);
@@ -107,7 +107,7 @@ internal static class TableTestUtil
     public static string UserKeyOf(ReadOnlySpan<byte> ikey) => System.Text.Encoding.UTF8.GetString(DbFormat.ExtractUserKey(ikey));
 
     /// <summary>Builds a table from sorted (internal key, value) pairs and returns the file bytes.</summary>
-    public static byte[] BuildTable(IEnumerable<(byte[] Key, byte[] Value)> entries, BlockBasedTableOptions options, TableBuilderOptions? tbo = null)
+    public static byte[] BuildTable(IEnumerable<(byte[] Key, byte[] Value)> entries, TableFormatOptions options, TableBuilderOptions? tbo = null)
     {
         var file = new MemWritableFile();
         using (var b = new BlockBasedTableBuilder(file, options, tbo ?? new TableBuilderOptions()))

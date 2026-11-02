@@ -14,7 +14,7 @@ namespace RocksDb.Managed.Db;
 /// <remarks>
 /// <para><b>Entry format</b> (as upstream, without per-key protection bytes):
 /// <c>varint32(internal_key_len) | user_key | fixed64(seq &lt;&lt; 8 | type) | varint32(value_len) | value</c>.
-/// Point entries live in one skiplist; <see cref="ValueType.RangeDeletion"/> entries (value = end key) live in a
+/// Point entries live in one skiplist; <see cref="EntryType.RangeDeletion"/> entries (value = end key) live in a
 /// separate skiplist like upstream's <c>range_del_table_</c>.</para>
 /// <para><b>Ordering.</b> Entries are ordered by <see cref="InternalKeyComparator.CompareKeySeq"/>; a second entry with
 /// the same user key and sequence number is rejected (<see cref="Add"/> returns false, upstream
@@ -111,17 +111,17 @@ public sealed unsafe class MemTable : IDisposable
     /// Adds an entry. Must be serialized with other <see cref="Add"/> calls. Returns false if an entry with the same
     /// user key and sequence number already exists (upstream Status::TryAgain).
     /// </summary>
-    public bool Add(ulong sequence, ValueType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+    public bool Add(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         if (!Insert(sequence, type, key, value, concurrent: false, out int encodedLen)) return false;
 
         Interlocked.Increment(ref _numEntries);
         Interlocked.Add(ref _dataSize, encodedLen);
-        if (type is ValueType.Deletion or ValueType.SingleDeletion or ValueType.DeletionWithTimestamp)
+        if (type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp)
         {
             Interlocked.Increment(ref _numDeletes);
         }
-        else if (type == ValueType.RangeDeletion)
+        else if (type == EntryType.RangeDeletion)
         {
             Interlocked.Increment(ref _numRangeDeletes);
         }
@@ -134,16 +134,16 @@ public sealed unsafe class MemTable : IDisposable
     /// Adds an entry; may run concurrently with other <see cref="AddConcurrently"/> calls. Counters are accumulated in
     /// <paramref name="postProcessInfo"/> and must be applied with <see cref="BatchPostProcess"/>.
     /// </summary>
-    public bool AddConcurrently(ulong sequence, ValueType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ref MemTablePostProcessInfo postProcessInfo)
+    public bool AddConcurrently(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ref MemTablePostProcessInfo postProcessInfo)
     {
         if (!Insert(sequence, type, key, value, concurrent: true, out int encodedLen)) return false;
         postProcessInfo.NumEntries++;
         postProcessInfo.DataSize += encodedLen;
-        if (type is ValueType.Deletion or ValueType.SingleDeletion or ValueType.DeletionWithTimestamp)
+        if (type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp)
         {
             postProcessInfo.NumDeletes++;
         }
-        else if (type == ValueType.RangeDeletion)
+        else if (type == EntryType.RangeDeletion)
         {
             postProcessInfo.NumRangeDeletes++;
         }
@@ -162,7 +162,7 @@ public sealed unsafe class MemTable : IDisposable
     }
 
     [SkipLocalsInit]
-    private bool Insert(ulong sequence, ValueType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool concurrent, out int encodedLen)
+    private bool Insert(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool concurrent, out int encodedLen)
     {
         // Format of an entry is concatenation of:
         //  key_size     : varint32 of internal_key.size()
@@ -174,7 +174,7 @@ public sealed unsafe class MemTable : IDisposable
         long len = Coding.VarintLength(internalKeySize) + (long)internalKeySize + Coding.VarintLength(valSize) + valSize;
         if (len > int.MaxValue / 2) ThrowHelper.InvalidArgument("memtable entry too large");
         encodedLen = (int)len;
-        InlineSkipList<MemTableKeyComparer> table = type == ValueType.RangeDeletion ? _rangeDelTable : _table;
+        InlineSkipList<MemTableKeyComparer> table = type == EntryType.RangeDeletion ? _rangeDelTable : _table;
 
         byte* buf = table.AllocateKey(encodedLen);
         var dst = new Span<byte>(buf, encodedLen);
@@ -188,10 +188,10 @@ public sealed unsafe class MemTable : IDisposable
         Debug.Assert(p + value.Length == encodedLen);
 
         // Range deletions always insert concurrently-safe (they may race with other range-deletion writers).
-        return concurrent || type == ValueType.RangeDeletion ? table.InsertConcurrently(buf) : table.Insert(buf);
+        return concurrent || type == EntryType.RangeDeletion ? table.InsertConcurrently(buf) : table.Insert(buf);
     }
 
-    private void AfterInsert(ulong s, ValueType type)
+    private void AfterInsert(ulong s, EntryType type)
     {
         // Atomically update first_seqno_ and earliest_seqno_.
         ulong cur = Volatile.Read(ref _firstSeqno);
@@ -208,7 +208,7 @@ public sealed unsafe class MemTable : IDisposable
             if (observed == curEarliest) break;
             curEarliest = observed;
         }
-        if (type == ValueType.RangeDeletion)
+        if (type == EntryType.RangeDeletion)
         {
             // Invalidate the fragmented tombstone cache. Readers that loaded the old cache are fine: the new
             // sequence number is not published yet.
@@ -230,11 +230,11 @@ public sealed unsafe class MemTable : IDisposable
     /// <param name="sequence">Sequence number of the newest visible entry for the key (or of the covering range tombstone), else <see cref="DbFormat.MaxSequenceNumber"/>.</param>
     /// <param name="mergeContext">Receives merge operands; when null, a merge entry yields <see cref="MemTableGetResult.MergeInProgress"/> immediately.</param>
     /// <param name="maxCoveringTombstoneSeq">In/out: the largest covering range-tombstone seqno seen so far (newer sources first).</param>
-    public MemTableGetResult Get(scoped in LookupKey key, out ReadOnlySpan<byte> value, out ValueType valueType, out ulong sequence,
+    public MemTableGetResult Get(scoped in LookupKey key, out ReadOnlySpan<byte> value, out EntryType valueType, out ulong sequence,
         MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq)
     {
         value = default;
-        valueType = ValueType.Value;
+        valueType = EntryType.Value;
         sequence = DbFormat.MaxSequenceNumber;
         bool mergeInProgress = mergeContext is not null && mergeContext.Count > 0;
         if (IsEmpty) return mergeInProgress ? MemTableGetResult.MergeInProgress : MemTableGetResult.NotFound;
@@ -264,38 +264,38 @@ public sealed unsafe class MemTable : IDisposable
 
             ulong tag = Coding.DecodeFixed64(new ReadOnlySpan<byte>(ek.Ptr + userKeyLen, DbFormat.InternalKeyFooterSize));
             ulong seq = tag >> 8;
-            var type = (ValueType)(byte)tag;
+            var type = (EntryType)(byte)tag;
             if (sequence == DbFormat.MaxSequenceNumber)
             {
                 sequence = seq > maxCoveringTombstoneSeq ? seq : maxCoveringTombstoneSeq;
             }
             if (maxCoveringTombstoneSeq > seq &&
-                type is ValueType.Value or ValueType.Merge or ValueType.BlobIndex or ValueType.WideColumnEntity or ValueType.Deletion
-                    or ValueType.SingleDeletion or ValueType.DeletionWithTimestamp or ValueType.ValuePreferredSeqno)
+                type is EntryType.Value or EntryType.Merge or EntryType.BlobIndex or EntryType.WideColumnEntity or EntryType.Deletion
+                    or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp or EntryType.ValuePreferredSeqno)
             {
-                type = ValueType.RangeDeletion;
+                type = EntryType.RangeDeletion;
             }
             switch (type)
             {
-                case ValueType.Value:
-                case ValueType.BlobIndex:
-                case ValueType.WideColumnEntity:
+                case EntryType.Value:
+                case EntryType.BlobIndex:
+                case EntryType.WideColumnEntity:
                     value = EntryValue(ek);
                     valueType = type;
                     return MemTableGetResult.Found;
-                case ValueType.ValuePreferredSeqno:
+                case EntryType.ValuePreferredSeqno:
                     // ParsePackedValueForValue: strip the trailing packed preferred seqno.
                     value = EntryValue(ek);
                     value = value[..^sizeof(ulong)];
-                    valueType = ValueType.Value;
+                    valueType = EntryType.Value;
                     return MemTableGetResult.Found;
-                case ValueType.Deletion:
-                case ValueType.DeletionWithTimestamp:
-                case ValueType.SingleDeletion:
-                case ValueType.RangeDeletion:
+                case EntryType.Deletion:
+                case EntryType.DeletionWithTimestamp:
+                case EntryType.SingleDeletion:
+                case EntryType.RangeDeletion:
                     valueType = type;
                     return MemTableGetResult.Deleted;
-                case ValueType.Merge:
+                case EntryType.Merge:
                     valueType = type;
                     if (mergeContext is null) return MemTableGetResult.MergeInProgress;
                     mergeContext.PushOperand(EntryValue(ek));
@@ -534,7 +534,7 @@ public unsafe struct MemTableIterator
     }
 
     public readonly ulong Sequence => Footer >> 8;
-    public readonly ValueType Type => (ValueType)(byte)Footer;
+    public readonly EntryType Type => (EntryType)(byte)Footer;
 
     /// <summary>The current value. REQUIRES: Valid.</summary>
     public readonly ReadOnlySpan<byte> Value

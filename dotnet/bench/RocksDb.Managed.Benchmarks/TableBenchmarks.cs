@@ -4,7 +4,7 @@ using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Table;
 using RocksDb.Managed.Util;
-using ValueType = RocksDb.Managed.Db.ValueType;
+using EntryType = RocksDb.Managed.Db.EntryType;
 
 namespace RocksDb.Managed.Benchmarks;
 
@@ -30,14 +30,14 @@ public class TableBenchmarks
     {
         var rnd = new Random(1);
         var file = new MemWritableFile();
-        using (var b = new BlockBasedTableBuilder(file, BlockBasedTableOptions.Default, new TableBuilderOptions()))
+        using (var b = new BlockBasedTableBuilder(file, TableFormatOptions.Default, new TableBuilderOptions()))
         {
             byte[] v = new byte[100];
             for (int i = 0; i < NumEntries; i++)
             {
                 rnd.NextBytes(v);
                 byte[] k = new byte[16 + 8];
-                DbFormat.AppendInternalKey(k, UserKey(i), (ulong)i + 1, ValueType.Value);
+                DbFormat.AppendInternalKey(k, UserKey(i), (ulong)i + 1, EntryType.Value);
                 b.Add(k, v);
             }
             b.Finish();
@@ -62,7 +62,7 @@ public class TableBenchmarks
         for (int i = 0; bb.CurrentSizeEstimate < 4096; i++)
         {
             byte[] k = new byte[16 + 8];
-            DbFormat.AppendInternalKey(k, UserKey(i * 2), 1, ValueType.Value);
+            DbFormat.AppendInternalKey(k, UserKey(i * 2), 1, EntryType.Value);
             bb.Add(k, new byte[64]);
             keys.Add(k);
         }

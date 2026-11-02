@@ -3,8 +3,8 @@ using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Db;
 
-/// <summary>Mirrors rocksdb::ValueType (db/dbformat.h). Byte values are part of the on-disk format.</summary>
-public enum ValueType : byte
+/// <summary>Mirrors rocksdb::EntryType (db/dbformat.h). Byte values are part of the on-disk format.</summary>
+public enum EntryType : byte
 {
     Deletion = 0x0,
     Value = 0x1,
@@ -46,18 +46,18 @@ public static class DbFormat
     public const int InternalKeyFooterSize = 8;
 
     /// <summary>kValueTypeForSeek: the type with the highest byte value that may appear in a key, used when seeking.</summary>
-    public const ValueType ValueTypeForSeek = ValueType.ValuePreferredSeqno;
+    public const EntryType ValueTypeForSeek = EntryType.ValuePreferredSeqno;
     /// <summary>kValueTypeForSeekForPrev.</summary>
-    public const ValueType ValueTypeForSeekForPrev = ValueType.Deletion;
+    public const EntryType ValueTypeForSeekForPrev = EntryType.Deletion;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static ulong PackSequenceAndType(ulong seq, ValueType t) => (seq << 8) | (byte)t;
+    public static ulong PackSequenceAndType(ulong seq, EntryType t) => (seq << 8) | (byte)t;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static void UnpackSequenceAndType(ulong packed, out ulong seq, out ValueType t)
+    public static void UnpackSequenceAndType(ulong packed, out ulong seq, out EntryType t)
     {
         seq = packed >> 8;
-        t = (ValueType)(byte)packed;
+        t = (EntryType)(byte)packed;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -67,7 +67,7 @@ public static class DbFormat
     public static ulong ExtractFooter(ReadOnlySpan<byte> internalKey) => Coding.DecodeFixed64(internalKey[^InternalKeyFooterSize..]);
 
     /// <summary>Writes user_key + packed footer into dst; returns bytes written.</summary>
-    public static int AppendInternalKey(Span<byte> dst, ReadOnlySpan<byte> userKey, ulong seq, ValueType t)
+    public static int AppendInternalKey(Span<byte> dst, ReadOnlySpan<byte> userKey, ulong seq, EntryType t)
     {
         userKey.CopyTo(dst);
         Coding.EncodeFixed64(dst[userKey.Length..], PackSequenceAndType(seq, t));
@@ -81,11 +81,11 @@ public static class DbFormat
             result = default;
             return false;
         }
-        UnpackSequenceAndType(ExtractFooter(internalKey), out ulong seq, out ValueType t);
+        UnpackSequenceAndType(ExtractFooter(internalKey), out ulong seq, out EntryType t);
         result = new ParsedInternalKey(seq, t, internalKey.Length - InternalKeyFooterSize);
-        return (byte)t < (byte)ValueType.MaxValid;
+        return (byte)t < (byte)EntryType.MaxValid;
     }
 }
 
 /// <summary>Parsed footer of an internal key. The user key is <c>internalKey[..UserKeyLength]</c>.</summary>
-public readonly record struct ParsedInternalKey(ulong Sequence, ValueType Type, int UserKeyLength);
+public readonly record struct ParsedInternalKey(ulong Sequence, EntryType Type, int UserKeyLength);

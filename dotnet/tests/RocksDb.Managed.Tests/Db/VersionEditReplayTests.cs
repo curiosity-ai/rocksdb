@@ -1,5 +1,5 @@
 using RocksDb.Managed.Db;
-using ValueType = RocksDb.Managed.Db.ValueType;
+using EntryType = RocksDb.Managed.Db.EntryType;
 using static RocksDb.Managed.Tests.Db.VersionEditTests;
 
 namespace RocksDb.Managed.Tests.Db;
@@ -42,7 +42,7 @@ internal sealed class InMemoryManifest : IManifestRecordWriter, IManifestRecordR
 public sealed class VersionEditReplayTests
 {
     private static FileMetaData F(ulong number, string smallest, string largest, ulong seq, ulong epoch) =>
-        File(number, 0, 1000 + number, IKey(smallest, seq, ValueType.Value), IKey(largest, seq + 1, ValueType.Value), seq, seq + 1, epoch);
+        File(number, 0, 1000 + number, IKey(smallest, seq, EntryType.Value), IKey(largest, seq + 1, EntryType.Value), seq, seq + 1, epoch);
 
     private static VersionEdit Base()
     {

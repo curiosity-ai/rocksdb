@@ -1,7 +1,7 @@
 using System.Text;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Util;
-using ValueType = RocksDb.Managed.Db.ValueType;
+using EntryType = RocksDb.Managed.Db.EntryType;
 
 namespace RocksDb.Managed.Tests.Db;
 
@@ -72,23 +72,23 @@ public sealed class WriteBatchTests
                 string k = Encoding.ASCII.GetString(e.Key), v = Encoding.ASCII.GetString(e.Value);
                 switch (e.Type)
                 {
-                    case ValueType.Value: sb.Append($"Put({cf}{k}, {v})@{seq++}"); break;
-                    case ValueType.Deletion: sb.Append($"Delete({cf}{k})@{seq++}"); break;
-                    case ValueType.SingleDeletion: sb.Append($"SingleDelete({cf}{k})@{seq++}"); break;
-                    case ValueType.RangeDeletion: sb.Append($"DeleteRange({cf}{k}, {v})@{seq++}"); break;
-                    case ValueType.Merge: sb.Append($"Merge({cf}{k}, {v})@{seq++}"); break;
-                    case ValueType.BlobIndex: sb.Append($"PutBlobIndex({cf}{k}, {v})@{seq++}"); break;
-                    case ValueType.WideColumnEntity: sb.Append($"PutEntity({cf}{k}, {Convert.ToHexString(e.Value)})@{seq++}"); break;
-                    case ValueType.ValuePreferredSeqno: sb.Append($"TimedPut({cf}{k}, {v}, {e.WriteUnixTime})@{seq++}"); break;
-                    case ValueType.LogData: sb.Append($"LogData({v})"); break;
-                    case ValueType.BeginPrepareXID:
-                    case ValueType.BeginPersistedPrepareXID: sb.Append("MarkBeginPrepare()"); break;
-                    case ValueType.BeginUnprepareXID: sb.Append("MarkBeginUnprepare()"); break;
-                    case ValueType.EndPrepareXID: sb.Append($"MarkEndPrepare({v})"); break;
-                    case ValueType.CommitXID: sb.Append($"MarkCommit({v})"); break;
-                    case ValueType.CommitXIDAndTimestamp: sb.Append($"MarkCommitWithTimestamp({v}, {k})"); break;
-                    case ValueType.RollbackXID: sb.Append($"MarkRollback({v})"); break;
-                    case ValueType.Noop: sb.Append("MarkNoop(?)"); break;
+                    case EntryType.Value: sb.Append($"Put({cf}{k}, {v})@{seq++}"); break;
+                    case EntryType.Deletion: sb.Append($"Delete({cf}{k})@{seq++}"); break;
+                    case EntryType.SingleDeletion: sb.Append($"SingleDelete({cf}{k})@{seq++}"); break;
+                    case EntryType.RangeDeletion: sb.Append($"DeleteRange({cf}{k}, {v})@{seq++}"); break;
+                    case EntryType.Merge: sb.Append($"Merge({cf}{k}, {v})@{seq++}"); break;
+                    case EntryType.BlobIndex: sb.Append($"PutBlobIndex({cf}{k}, {v})@{seq++}"); break;
+                    case EntryType.WideColumnEntity: sb.Append($"PutEntity({cf}{k}, {Convert.ToHexString(e.Value)})@{seq++}"); break;
+                    case EntryType.ValuePreferredSeqno: sb.Append($"TimedPut({cf}{k}, {v}, {e.WriteUnixTime})@{seq++}"); break;
+                    case EntryType.LogData: sb.Append($"LogData({v})"); break;
+                    case EntryType.BeginPrepareXID:
+                    case EntryType.BeginPersistedPrepareXID: sb.Append("MarkBeginPrepare()"); break;
+                    case EntryType.BeginUnprepareXID: sb.Append("MarkBeginUnprepare()"); break;
+                    case EntryType.EndPrepareXID: sb.Append($"MarkEndPrepare({v})"); break;
+                    case EntryType.CommitXID: sb.Append($"MarkCommit({v})"); break;
+                    case EntryType.CommitXIDAndTimestamp: sb.Append($"MarkCommitWithTimestamp({v}, {k})"); break;
+                    case EntryType.RollbackXID: sb.Append($"MarkRollback({v})"); break;
+                    case EntryType.Noop: sb.Append("MarkNoop(?)"); break;
                 }
             }
         }
@@ -240,7 +240,7 @@ public sealed class WriteBatchTests
         batch.Put("k"u8, "v"u8);
         batch.MarkEndPrepare("x"u8, writeAfterCommit: false, unpreparedBatch: true);
         batch.MarkCommitWithTimestamp("x"u8, "ts"u8);
-        Assert.AreEqual((byte)ValueType.BeginUnprepareXID, batch.Data[12]);
+        Assert.AreEqual((byte)EntryType.BeginUnprepareXID, batch.Data[12]);
         Assert.AreEqual("MarkBeginUnprepare()Put(k, v)@0MarkEndPrepare(x)MarkCommitWithTimestamp(x, ts)", PrintContents(batch));
         // Deferred content flags are computed from the rep.
         using var copy = new WriteBatch(batch.Data);
@@ -292,8 +292,8 @@ public sealed class WriteBatchTests
         [
             8, 7, 6, 5, 4, 3, 2, 1, // sequence, fixed64
             2, 0, 0, 0,             // count, fixed32
-            (byte)ValueType.Value, 1, (byte)'k', 1, (byte)'v',
-            (byte)ValueType.ColumnFamilyDeletion, 0xC8, 0x01, 1, (byte)'d',
+            (byte)EntryType.Value, 1, (byte)'k', 1, (byte)'v',
+            (byte)EntryType.ColumnFamilyDeletion, 0xC8, 0x01, 1, (byte)'d',
         ];
         CollectionAssert.AreEqual(expected, batch.Data.ToArray());
     }
@@ -308,7 +308,7 @@ public sealed class WriteBatchTests
         Assert.AreEqual("TimedPut(k, v, 12345)@0Put(4, k2, v2)@1PutEntity(5, e, 0100)@2PutBlobIndex(b, idx)@3", PrintContents(batch));
         Assert.IsTrue(batch.HasTimedPut && batch.HasPut && batch.HasPutEntity);
         // TimedPut value is packed as value | fixed64(write time).
-        Assert.AreEqual((byte)ValueType.ValuePreferredSeqno, batch.Data[12]);
+        Assert.AreEqual((byte)EntryType.ValuePreferredSeqno, batch.Data[12]);
         Assert.AreEqual(9, batch.Data[15]);
     }
 
@@ -408,7 +408,7 @@ public sealed class WriteBatchTests
         int seed = Environment.TickCount;
         var rnd = new Random(seed);
         using var batch = new WriteBatch();
-        var expected = new List<(ValueType, uint, byte[], byte[])>();
+        var expected = new List<(EntryType, uint, byte[], byte[])>();
         for (int i = 0; i < 2000; i++)
         {
             uint cf = rnd.Next(3) == 0 ? (uint)rnd.Next(1, 100000) : 0;
@@ -418,18 +418,18 @@ public sealed class WriteBatchTests
             rnd.NextBytes(v);
             switch (rnd.Next(5))
             {
-                case 0: batch.Put(cf, k, v); expected.Add((ValueType.Value, cf, k, v)); break;
-                case 1: batch.Delete(cf, k); expected.Add((ValueType.Deletion, cf, k, [])); break;
-                case 2: batch.SingleDelete(cf, k); expected.Add((ValueType.SingleDeletion, cf, k, [])); break;
-                case 3: batch.DeleteRange(cf, k, v); expected.Add((ValueType.RangeDeletion, cf, k, v)); break;
-                default: batch.Merge(cf, k, v); expected.Add((ValueType.Merge, cf, k, v)); break;
+                case 0: batch.Put(cf, k, v); expected.Add((EntryType.Value, cf, k, v)); break;
+                case 1: batch.Delete(cf, k); expected.Add((EntryType.Deletion, cf, k, [])); break;
+                case 2: batch.SingleDelete(cf, k); expected.Add((EntryType.SingleDeletion, cf, k, [])); break;
+                case 3: batch.DeleteRange(cf, k, v); expected.Add((EntryType.RangeDeletion, cf, k, v)); break;
+                default: batch.Merge(cf, k, v); expected.Add((EntryType.Merge, cf, k, v)); break;
             }
         }
         Assert.AreEqual(expected.Count, batch.Count, "seed=" + seed);
         int idx = 0;
         foreach (WriteBatchEntry e in batch)
         {
-            (ValueType t, uint cf, byte[] k, byte[] v) = expected[idx++];
+            (EntryType t, uint cf, byte[] k, byte[] v) = expected[idx++];
             Assert.AreEqual(t, e.Type, "seed=" + seed);
             Assert.AreEqual(cf, e.ColumnFamilyId, "seed=" + seed);
             Assert.IsTrue(e.Key.SequenceEqual(k), "seed=" + seed);

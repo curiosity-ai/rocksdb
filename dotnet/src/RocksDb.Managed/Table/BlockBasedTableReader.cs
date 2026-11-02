@@ -5,7 +5,7 @@ using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Table.Filters;
 using RocksDb.Managed.Util;
-using ValueType = RocksDb.Managed.Db.ValueType;
+using EntryType = RocksDb.Managed.Db.EntryType;
 
 namespace RocksDb.Managed.Table;
 
@@ -29,7 +29,7 @@ public sealed record TableReaderOptions
 }
 
 /// <summary>Result of a point lookup.</summary>
-public readonly record struct TableGetResult(bool Found, ulong Sequence, ValueType Type);
+public readonly record struct TableGetResult(bool Found, ulong Sequence, EntryType Type);
 
 /// <summary>
 /// Visitor for <see cref="BlockBasedTableReader.Get{TState}"/>: called for each entry whose user key equals the lookup
@@ -369,7 +369,7 @@ public sealed class BlockBasedTableReader : IDisposable
         var state = new GetState { Output = value };
         Get(internalKey, ref state, static (ref GetState s, ReadOnlySpan<byte> k, ReadOnlySpan<byte> v) =>
         {
-            DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(k), out ulong seq, out ValueType t);
+            DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(k), out ulong seq, out EntryType t);
             s.Result = new TableGetResult(true, seq, t);
             s.Output?.Write(v);
             return false;
@@ -430,7 +430,7 @@ public sealed class BlockBasedTableReader : IDisposable
         if (!data.Valid) return 0;
         ReadOnlySpan<byte> k = data.Key;
         if (!UserKeyEquals(DbFormat.ExtractUserKey(k), DbFormat.ExtractUserKey(internalKey))) return -1;
-        DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(k), out ulong seq, out ValueType t);
+        DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(k), out ulong seq, out EntryType t);
         value?.Write(data.Value);
         result = new TableGetResult(true, seq, t);
         return 1;

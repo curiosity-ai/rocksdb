@@ -3,7 +3,7 @@ using RocksDb.Managed.Db;
 using RocksDb.Managed.Table;
 using RocksDb.Managed.Util;
 using static RocksDb.Managed.Tests.Table.TableTestUtil;
-using ValueType = RocksDb.Managed.Db.ValueType;
+using EntryType = RocksDb.Managed.Db.EntryType;
 
 namespace RocksDb.Managed.Tests.Table;
 
@@ -65,7 +65,7 @@ public sealed class BlockBasedTableTests
         int seed = Environment.TickCount;
         string trace = "seed=" + seed + " fv=" + formatVersion + " cs=" + checksum;
         var rnd = new Random(seed);
-        var options = new BlockBasedTableOptions
+        var options = new TableFormatOptions
         {
             FormatVersion = formatVersion,
             Checksum = checksum,
@@ -91,7 +91,7 @@ public sealed class BlockBasedTableTests
     [TestMethod]
     public void EmptyTable()
     {
-        byte[] data = BuildTable([], BlockBasedTableOptions.Default);
+        byte[] data = BuildTable([], TableFormatOptions.Default);
         using BlockBasedTableReader reader = Open(data);
         Assert.AreEqual(0UL, reader.Properties.NumEntries);
         Assert.AreEqual(0UL, reader.Properties.NumDataBlocks);
@@ -119,7 +119,7 @@ public sealed class BlockBasedTableTests
             rnd.NextBytes(v);
             entries.Add((IKey(uk, 1), v));
         }
-        byte[] data = BuildTable(entries, new BlockBasedTableOptions { BlockSize = 1024 });
+        byte[] data = BuildTable(entries, new TableFormatOptions { BlockSize = 1024 });
         using BlockBasedTableReader reader = Open(data);
         VerifyAll(reader, entries, "large");
     }
@@ -131,7 +131,7 @@ public sealed class BlockBasedTableTests
         var entries = new List<(byte[], byte[])>();
         for (ulong s = 500; s > 0; s--) entries.Add((IKey("dup", s), Encoding.ASCII.GetBytes("v" + s)));
         entries.Add((IKey("zzz", 1), [1]));
-        byte[] data = BuildTable(entries, new BlockBasedTableOptions { BlockSize = 128 });
+        byte[] data = BuildTable(entries, new TableFormatOptions { BlockSize = 128 });
         using BlockBasedTableReader reader = Open(data);
         Assert.AreEqual(0UL, reader.Properties.IndexKeyIsUserKey);
         VerifyAll(reader, entries, "dup");
@@ -157,10 +157,10 @@ public sealed class BlockBasedTableTests
     {
         var entries = new List<(byte[], byte[])>
         {
-            (IKey("a", 10, ValueType.Value), [1, 2, 3]),
-            (IKey("b", 11, ValueType.Deletion), []),
-            (IKey("c", 12, ValueType.Merge), [4]),
-            (IKey("d", 5, ValueType.RangeDeletion), Encoding.ASCII.GetBytes("f")),
+            (IKey("a", 10, EntryType.Value), [1, 2, 3]),
+            (IKey("b", 11, EntryType.Deletion), []),
+            (IKey("c", 12, EntryType.Merge), [4]),
+            (IKey("d", 5, EntryType.RangeDeletion), Encoding.ASCII.GetBytes("f")),
         };
         var tbo = new TableBuilderOptions
         {
@@ -172,7 +172,7 @@ public sealed class BlockBasedTableTests
             FileCreationTime = 1234,
             ExternalSstFile = true,
         };
-        byte[] data = BuildTable(entries, BlockBasedTableOptions.Default, tbo);
+        byte[] data = BuildTable(entries, TableFormatOptions.Default, tbo);
         using BlockBasedTableReader reader = Open(data);
         TableProperties p = reader.Properties;
         Assert.AreEqual(4UL, p.NumEntries);
@@ -220,7 +220,7 @@ public sealed class BlockBasedTableTests
     public void GlobalSeqnoFromLargestSeqno()
     {
         var entries = new List<(byte[], byte[])> { (IKey("a", 0), [1]), (IKey("b", 0), [2]) };
-        byte[] data = BuildTable(entries, BlockBasedTableOptions.Default, new TableBuilderOptions { ExternalSstFile = true });
+        byte[] data = BuildTable(entries, TableFormatOptions.Default, new TableBuilderOptions { ExternalSstFile = true });
         using BlockBasedTableReader reader = Open(data, new TableReaderOptions { LargestSeqno = 99 });
         Assert.AreEqual(99UL, reader.GlobalSequenceNumber);
         TableGetResult r = reader.Get(LookupKey("b"), null);
@@ -234,7 +234,7 @@ public sealed class BlockBasedTableTests
     {
         var policy = new ExactSetFilterPolicy();
         List<(byte[] Key, byte[] Value)> entries = MakeEntries(500, 1);
-        byte[] data = BuildTable(entries, new BlockBasedTableOptions { FilterPolicy = policy });
+        byte[] data = BuildTable(entries, new TableFormatOptions { FilterPolicy = policy });
         var file = new MemRandomAccessFile(data);
         using var reader = BlockBasedTableReader.Open(file, new TableReaderOptions { FilterPolicy = policy });
         Assert.IsTrue(reader.HasFilter);
@@ -254,7 +254,7 @@ public sealed class BlockBasedTableTests
         List<(byte[] Key, byte[] Value)> entries = MakeEntries(200, 2);
         foreach (ChecksumType ct in new[] { ChecksumType.Crc32c, ChecksumType.XxHash, ChecksumType.XxHash64, ChecksumType.Xxh3 })
         {
-            byte[] data = BuildTable(entries, new BlockBasedTableOptions { Checksum = ct, BlockSize = 256 });
+            byte[] data = BuildTable(entries, new TableFormatOptions { Checksum = ct, BlockSize = 256 });
             data[10] ^= 0x40; // inside the first data block
             using BlockBasedTableReader reader = Open(data);
             using BlockBasedTableIterator it = reader.NewIterator();
@@ -262,7 +262,7 @@ public sealed class BlockBasedTableTests
             Assert.AreEqual(StatusCode.Corruption, ex.Code, ct.ToString());
         }
         // Truncated file.
-        byte[] full = BuildTable(entries, BlockBasedTableOptions.Default);
+        byte[] full = BuildTable(entries, TableFormatOptions.Default);
         Assert.AreEqual(StatusCode.Corruption, Assert.ThrowsExactly<RocksDbException>(() => Open(full.AsSpan(0, full.Length - 1).ToArray())).Code);
         Assert.AreEqual(StatusCode.Corruption, Assert.ThrowsExactly<RocksDbException>(() => Open(new byte[10])).Code);
     }
@@ -271,7 +271,7 @@ public sealed class BlockBasedTableTests
     public void OutOfOrderKeysRejected()
     {
         var file = new MemWritableFile();
-        using var b = new BlockBasedTableBuilder(file, BlockBasedTableOptions.Default, new TableBuilderOptions());
+        using var b = new BlockBasedTableBuilder(file, TableFormatOptions.Default, new TableBuilderOptions());
         b.Add(IKey("b", 1), []);
         Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(() => b.Add(IKey("a", 1), [])).Code);
         Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(() => b.Add(IKey("b", 1), [])).Code);
@@ -282,14 +282,14 @@ public sealed class BlockBasedTableTests
     {
         List<(byte[] Key, byte[] Value)> entries = MakeEntries(2000, 9, 2000);
         var wf = new MemWritableFile();
-        using (var b = new BlockBasedTableBuilder(wf, new BlockBasedTableOptions { BlockSize = 1024 }, new TableBuilderOptions()))
+        using (var b = new BlockBasedTableBuilder(wf, new TableFormatOptions { BlockSize = 1024 }, new TableBuilderOptions()))
         {
             foreach ((byte[] k, byte[] v) in entries) await b.AddAsync(k, v);
             await b.FinishAsync();
         }
         byte[] data = wf.ToArray();
         // Same layout as the sync path (contents differ only by the random context checksum).
-        Assert.AreEqual(BuildTable(entries, new BlockBasedTableOptions { BlockSize = 1024 }).Length, data.Length);
+        Assert.AreEqual(BuildTable(entries, new TableFormatOptions { BlockSize = 1024 }).Length, data.Length);
         using BlockBasedTableReader reader = await BlockBasedTableReader.OpenAsync(new MemRandomAccessFile(data), TableReaderOptions.Default);
         using var value = new PooledBufferWriter();
         for (int i = 0; i < entries.Count; i += 37)
@@ -317,7 +317,7 @@ public sealed class BlockBasedTableTests
     public void BlockCacheSeamIsUsed()
     {
         List<(byte[] Key, byte[] Value)> entries = MakeEntries(1000, 4);
-        byte[] data = BuildTable(entries, new BlockBasedTableOptions { BlockSize = 512 });
+        byte[] data = BuildTable(entries, new TableFormatOptions { BlockSize = 512 });
         var cache = new DictionaryBlockCache();
         var file = new MemRandomAccessFile(data);
         using var reader = BlockBasedTableReader.Open(file, new TableReaderOptions { BlockCache = cache });

@@ -17,18 +17,18 @@ namespace RocksDb.Managed.Db;
 /// </summary>
 public readonly ref struct WriteBatchEntry
 {
-    /// <summary>The tag byte as stored in the rep (e.g. <see cref="ValueType.ColumnFamilyValue"/>).</summary>
-    public readonly ValueType Tag;
-    /// <summary>The operation type with column-family variants mapped to their default-CF tag (e.g. <see cref="ValueType.Value"/>).</summary>
-    public readonly ValueType Type;
+    /// <summary>The tag byte as stored in the rep (e.g. <see cref="EntryType.ColumnFamilyValue"/>).</summary>
+    public readonly EntryType Tag;
+    /// <summary>The operation type with column-family variants mapped to their default-CF tag (e.g. <see cref="EntryType.Value"/>).</summary>
+    public readonly EntryType Type;
     /// <summary>Column family id (0 = default).</summary>
     public readonly uint ColumnFamilyId;
     public readonly ReadOnlySpan<byte> Key;
     public readonly ReadOnlySpan<byte> Value;
-    /// <summary>For TimedPut (<see cref="ValueType.ValuePreferredSeqno"/>): the write time unpacked from the value.</summary>
+    /// <summary>For TimedPut (<see cref="EntryType.ValuePreferredSeqno"/>): the write time unpacked from the value.</summary>
     public readonly ulong WriteUnixTime;
 
-    internal WriteBatchEntry(ValueType tag, ValueType type, uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong writeUnixTime)
+    internal WriteBatchEntry(EntryType tag, EntryType type, uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong writeUnixTime)
     {
         Tag = tag;
         Type = type;
@@ -116,10 +116,10 @@ public ref struct WriteBatchReader
     public bool MoveNext() => TryReadNext(out _current);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static bool IsCountedType(ValueType type) => type switch
+    internal static bool IsCountedType(EntryType type) => type switch
     {
-        ValueType.Value or ValueType.Deletion or ValueType.SingleDeletion or ValueType.RangeDeletion or
-        ValueType.Merge or ValueType.BlobIndex or ValueType.WideColumnEntity or ValueType.ValuePreferredSeqno => true,
+        EntryType.Value or EntryType.Deletion or EntryType.SingleDeletion or EntryType.RangeDeletion or
+        EntryType.Merge or EntryType.BlobIndex or EntryType.WideColumnEntity or EntryType.ValuePreferredSeqno => true,
         _ => false,
     };
 
@@ -129,64 +129,64 @@ public ref struct WriteBatchReader
     /// </summary>
     internal static string? TryReadRecord(ReadOnlySpan<byte> input, scoped ref int pos, out WriteBatchEntry entry)
     {
-        var tag = (ValueType)input[pos++];
+        var tag = (EntryType)input[pos++];
         uint cf = 0; // default
         ReadOnlySpan<byte> key = default, value = default;
         ulong writeUnixTime = 0;
-        ValueType type;
+        EntryType type;
         switch (tag)
         {
-            case ValueType.ColumnFamilyValue:
-            case ValueType.Value:
-                type = ValueType.Value;
-                if ((tag == ValueType.ColumnFamilyValue && !GetVarint32(input, ref pos, out cf)) ||
+            case EntryType.ColumnFamilyValue:
+            case EntryType.Value:
+                type = EntryType.Value;
+                if ((tag == EntryType.ColumnFamilyValue && !GetVarint32(input, ref pos, out cf)) ||
                     !GetSlice(input, ref pos, out key) || !GetSlice(input, ref pos, out value))
                     goto BadPut;
                 break;
-            case ValueType.ColumnFamilyDeletion:
-            case ValueType.ColumnFamilySingleDeletion:
-            case ValueType.Deletion:
-            case ValueType.SingleDeletion:
-                type = tag is ValueType.ColumnFamilyDeletion or ValueType.Deletion ? ValueType.Deletion : ValueType.SingleDeletion;
-                if ((tag is ValueType.ColumnFamilyDeletion or ValueType.ColumnFamilySingleDeletion && !GetVarint32(input, ref pos, out cf)) ||
+            case EntryType.ColumnFamilyDeletion:
+            case EntryType.ColumnFamilySingleDeletion:
+            case EntryType.Deletion:
+            case EntryType.SingleDeletion:
+                type = tag is EntryType.ColumnFamilyDeletion or EntryType.Deletion ? EntryType.Deletion : EntryType.SingleDeletion;
+                if ((tag is EntryType.ColumnFamilyDeletion or EntryType.ColumnFamilySingleDeletion && !GetVarint32(input, ref pos, out cf)) ||
                     !GetSlice(input, ref pos, out key))
                 {
                     entry = default;
                     return "bad WriteBatch Delete";
                 }
                 break;
-            case ValueType.ColumnFamilyRangeDeletion:
-            case ValueType.RangeDeletion:
+            case EntryType.ColumnFamilyRangeDeletion:
+            case EntryType.RangeDeletion:
                 // for range delete, "key" is begin_key, "value" is end_key
-                type = ValueType.RangeDeletion;
-                if ((tag == ValueType.ColumnFamilyRangeDeletion && !GetVarint32(input, ref pos, out cf)) ||
+                type = EntryType.RangeDeletion;
+                if ((tag == EntryType.ColumnFamilyRangeDeletion && !GetVarint32(input, ref pos, out cf)) ||
                     !GetSlice(input, ref pos, out key) || !GetSlice(input, ref pos, out value))
                 {
                     entry = default;
                     return "bad WriteBatch DeleteRange";
                 }
                 break;
-            case ValueType.ColumnFamilyMerge:
-            case ValueType.Merge:
-                type = ValueType.Merge;
-                if ((tag == ValueType.ColumnFamilyMerge && !GetVarint32(input, ref pos, out cf)) ||
+            case EntryType.ColumnFamilyMerge:
+            case EntryType.Merge:
+                type = EntryType.Merge;
+                if ((tag == EntryType.ColumnFamilyMerge && !GetVarint32(input, ref pos, out cf)) ||
                     !GetSlice(input, ref pos, out key) || !GetSlice(input, ref pos, out value))
                 {
                     entry = default;
                     return "bad WriteBatch Merge";
                 }
                 break;
-            case ValueType.ColumnFamilyBlobIndex:
-            case ValueType.BlobIndex:
-                type = ValueType.BlobIndex;
-                if ((tag == ValueType.ColumnFamilyBlobIndex && !GetVarint32(input, ref pos, out cf)) ||
+            case EntryType.ColumnFamilyBlobIndex:
+            case EntryType.BlobIndex:
+                type = EntryType.BlobIndex;
+                if ((tag == EntryType.ColumnFamilyBlobIndex && !GetVarint32(input, ref pos, out cf)) ||
                     !GetSlice(input, ref pos, out key) || !GetSlice(input, ref pos, out value))
                 {
                     entry = default;
                     return "bad WriteBatch BlobIndex";
                 }
                 break;
-            case ValueType.LogData:
+            case EntryType.LogData:
                 type = tag;
                 if (!GetSlice(input, ref pos, out value))
                 {
@@ -194,15 +194,15 @@ public ref struct WriteBatchReader
                     return "bad WriteBatch Blob";
                 }
                 break;
-            case ValueType.Noop:
-            case ValueType.BeginPrepareXID:
+            case EntryType.Noop:
+            case EntryType.BeginPrepareXID:
             // This indicates that the prepared batch is also persisted in the db. This is used in WritePreparedTxn
-            case ValueType.BeginPersistedPrepareXID:
+            case EntryType.BeginPersistedPrepareXID:
             // This is used in WriteUnpreparedTxn
-            case ValueType.BeginUnprepareXID:
+            case EntryType.BeginUnprepareXID:
                 type = tag;
                 break;
-            case ValueType.EndPrepareXID:
+            case EntryType.EndPrepareXID:
                 type = tag;
                 if (!GetSlice(input, ref pos, out value))
                 {
@@ -210,7 +210,7 @@ public ref struct WriteBatchReader
                     return "bad EndPrepare XID";
                 }
                 break;
-            case ValueType.CommitXIDAndTimestamp:
+            case EntryType.CommitXIDAndTimestamp:
                 type = tag;
                 if (!GetSlice(input, ref pos, out key))
                 {
@@ -223,7 +223,7 @@ public ref struct WriteBatchReader
                     return "bad Commit XID";
                 }
                 break;
-            case ValueType.CommitXID:
+            case EntryType.CommitXID:
                 type = tag;
                 if (!GetSlice(input, ref pos, out value))
                 {
@@ -231,7 +231,7 @@ public ref struct WriteBatchReader
                     return "bad Commit XID";
                 }
                 break;
-            case ValueType.RollbackXID:
+            case EntryType.RollbackXID:
                 type = tag;
                 if (!GetSlice(input, ref pos, out value))
                 {
@@ -239,20 +239,20 @@ public ref struct WriteBatchReader
                     return "bad Rollback XID";
                 }
                 break;
-            case ValueType.ColumnFamilyWideColumnEntity:
-            case ValueType.WideColumnEntity:
-                type = ValueType.WideColumnEntity;
-                if ((tag == ValueType.ColumnFamilyWideColumnEntity && !GetVarint32(input, ref pos, out cf)) ||
+            case EntryType.ColumnFamilyWideColumnEntity:
+            case EntryType.WideColumnEntity:
+                type = EntryType.WideColumnEntity;
+                if ((tag == EntryType.ColumnFamilyWideColumnEntity && !GetVarint32(input, ref pos, out cf)) ||
                     !GetSlice(input, ref pos, out key) || !GetSlice(input, ref pos, out value))
                 {
                     entry = default;
                     return "bad WriteBatch PutEntity";
                 }
                 break;
-            case ValueType.ColumnFamilyValuePreferredSeqno:
-            case ValueType.ValuePreferredSeqno:
-                type = ValueType.ValuePreferredSeqno;
-                if ((tag == ValueType.ColumnFamilyValuePreferredSeqno && !GetVarint32(input, ref pos, out cf)) ||
+            case EntryType.ColumnFamilyValuePreferredSeqno:
+            case EntryType.ValuePreferredSeqno:
+                type = EntryType.ValuePreferredSeqno;
+                if ((tag == EntryType.ColumnFamilyValuePreferredSeqno && !GetVarint32(input, ref pos, out cf)) ||
                     !GetSlice(input, ref pos, out key) || !GetSlice(input, ref pos, out value) ||
                     value.Length < 8)
                 {
