@@ -15,7 +15,31 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public const string BlockBasedTableFactoryName = "BlockBasedTable";
 
     // ---- named pluggable components ----------------------------------------------------------
+    /// <summary>
+    /// Name of the user comparator (persisted in the MANIFEST, OPTIONS files and table properties). Setting
+    /// <see cref="Comparator"/> sets this to its <see cref="Managed.Comparator.Name"/>; otherwise it must name a built-in
+    /// comparator.
+    /// </summary>
     public string ComparatorName { get; set; } = "leveldb.BytewiseComparator";
+
+    /// <summary>
+    /// The user key comparator (rocksdb::ColumnFamilyOptions::comparator); null = the built-in comparator named by
+    /// <see cref="ComparatorName"/> (bytewise by default). A custom comparator must define a total order, be
+    /// thread-safe, and keep its <see cref="Managed.Comparator.Name"/> and ordering stable for the life of the data: the
+    /// name is recorded in the MANIFEST and opening an existing column family with a comparator of a different name fails
+    /// with InvalidArgument. Setting it also sets <see cref="ComparatorName"/>.
+    /// </summary>
+    public Comparator? Comparator
+    {
+        get => _comparator;
+        set
+        {
+            _comparator = value;
+            if (value is not null) ComparatorName = value.Name;
+        }
+    }
+
+    private Comparator? _comparator;
     public string? MergeOperatorName { get; set; }
     /// <summary>
     /// The merge operator implementation used by the DB (not persisted). When set, its <see cref="Managed.MergeOperator.Name"/>
@@ -215,6 +239,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     {
         var c = new ColumnFamilyOptions();
         c.CopyFrom(this);
+        c._comparator = _comparator;
         c.MergeOperator = MergeOperator;
         c.PrefixExtractor = PrefixExtractor;
         c.CompactionFilter = CompactionFilter;

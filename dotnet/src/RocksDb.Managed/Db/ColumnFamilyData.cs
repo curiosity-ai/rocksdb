@@ -74,7 +74,7 @@ internal sealed class ColumnFamilyData
         Id = id;
         Name = name;
         Options = options;
-        Comparator ucmp = TableFactory.ResolveComparator(options.ComparatorName);
+        Comparator ucmp = TableFactory.ResolveComparator(options);
         Icmp = ucmp.Kind == ComparatorKind.Bytewise ? InternalKeyComparator.Bytewise : new InternalKeyComparator(ucmp);
         MergeOperator = options.MergeOperator;
         Format = TableFactory.CreateFormatOptions(options.TableOptions);
