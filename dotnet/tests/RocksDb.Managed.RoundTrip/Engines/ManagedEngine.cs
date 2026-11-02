@@ -2,6 +2,7 @@ using RocksDb.Managed.Compression;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.RoundTrip.Protocol;
+using RocksDb.Managed.Table.Filters;
 
 namespace RocksDb.Managed.RoundTrip.Engines;
 
@@ -33,19 +34,10 @@ public sealed class ManagedEngine : IEngine
     // ---------------------------------------------------------------------------------------------------------
     // options
 
-    private static CompressionType Compression(string name) => name switch
-    {
-        "none" => CompressionType.None,
-        "snappy" => CompressionType.Snappy,
-        "lz4" => CompressionType.LZ4,
-        "zstd" => CompressionType.Zstd,
-        _ => throw new ArgumentException("unknown compression " + name),
-    };
-
     public static ColumnFamilyOptions CfOptions(CfSpec s) => new()
     {
         WriteBufferSize = s.WriteBufferSize,
-        Compression = Compression(s.Compression),
+        Compression = s.Compression,
         DisableAutoCompactions = s.DisableAutoCompactions,
         MergeOperator = MergeOperatorFor(s.Merge),
         TableOptions = new BlockBasedTableOptions
@@ -54,9 +46,9 @@ public sealed class ManagedEngine : IEngine
             BlockSize = s.BlockSize,
             FilterPolicy = s.Filter switch
             {
-                "none" => null,
-                "bloom" => "bloomfilter:10:false",
-                "ribbon" => "ribbonfilter:10",
+                FilterKind.None => null,
+                FilterKind.Bloom => new BloomFilterPolicy(10),
+                FilterKind.Ribbon => new RibbonFilterPolicy(10, 0), // NewRibbonFilterPolicy(10): bloom_before_level 0
                 _ => throw new ArgumentException("unknown filter " + s.Filter),
             },
         },
@@ -68,35 +60,6 @@ public sealed class ManagedEngine : IEngine
         MergeKind.StringAppend => new StringAppendOperator(),
         _ => null,
     };
-
-    /// <summary>Instantiates a built-in merge operator recorded in an OPTIONS file, either as a bare name
-    /// ("StringAppendOperator") or in the struct form native writes for configurable objects
-    /// ("{id=StringAppendOperator;delimiter=,;}"). Upstream's ObjectRegistry does this when loading options; the
-    /// managed OptionsFile keeps only the string.</summary>
-    private static MergeOperator? MergeOperatorByName(string? value)
-    {
-        if (value is null or "" or "nullptr") return null;
-        string id = value;
-        string? delimiter = null;
-        if (value.StartsWith('{') && value.EndsWith('}'))
-        {
-            id = "";
-            foreach (string part in value[1..^1].Split(';', StringSplitOptions.RemoveEmptyEntries))
-            {
-                int eq = part.IndexOf('=');
-                if (eq < 0) continue;
-                string k = part[..eq], v = part[(eq + 1)..];
-                if (k == "id") id = v;
-                else if (k == "delimiter") delimiter = v;
-            }
-        }
-        return id switch
-        {
-            "UInt64AddOperator" or "uint64add" => UInt64AddOperator.Instance,
-            "StringAppendOperator" or "stringappend" => delimiter is null ? new StringAppendOperator() : new StringAppendOperator(delimiter),
-            _ => throw new NotSupportedException("merge operator from OPTIONS file not known to the round-trip tests: " + value),
-        };
-    }
 
     // ---------------------------------------------------------------------------------------------------------
     // open / close
@@ -125,7 +88,9 @@ public sealed class ManagedEngine : IEngine
             LoadedUnknownOptions = unknown;
             foreach (ColumnFamilyDescriptor d in options.ColumnFamilies)
             {
-                d.Options.MergeOperator = MergeOperatorByName(d.Options.MergeOperatorName);
+                // OptionsFile recreates built-in merge operators (bare or struct form) like upstream's ObjectRegistry.
+                if (d.Options.MergeOperator is null && d.Options.MergeOperatorName is { } unresolved)
+                    throw new NotSupportedException("merge operator from OPTIONS file not known to the managed port: " + unresolved);
                 descriptors.Add(d);
             }
         }

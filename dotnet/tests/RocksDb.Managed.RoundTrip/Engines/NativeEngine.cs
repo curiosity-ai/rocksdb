@@ -1,3 +1,4 @@
+using RocksDb.Managed.Compression;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using RocksDb.Managed.RoundTrip.Protocol;
@@ -36,13 +37,13 @@ public sealed class NativeEngine : IEngine
     // ---------------------------------------------------------------------------------------------------------
     // options
 
-    private static N.Compression Compression(string name) => name switch
+    private static N.Compression Compression(CompressionType compression) => compression switch
     {
-        "none" => N.Compression.No,
-        "snappy" => N.Compression.Snappy,
-        "lz4" => N.Compression.Lz4,
-        "zstd" => N.Compression.Zstd,
-        _ => throw new ArgumentException("unknown compression " + name),
+        CompressionType.None => N.Compression.No,
+        CompressionType.Snappy => N.Compression.Snappy,
+        CompressionType.LZ4 => N.Compression.Lz4,
+        CompressionType.Zstd => N.Compression.Zstd,
+        _ => throw new ArgumentException("unsupported compression " + compression),
     };
 
     /// <summary>Merge operator with the semantics of the C++ StringAppendOperator (delimiter ',').</summary>
@@ -83,9 +84,9 @@ public sealed class NativeEngine : IEngine
             .SetBlockSize(s.BlockSize);
         switch (s.Filter)
         {
-            case "none": break;
-            case "bloom": table.SetFilterPolicy(Keep(N.BloomFilterPolicy.Create(10, false))); break;
-            case "ribbon": table.SetFilterPolicy(N.Native.Instance.rocksdb_filterpolicy_create_ribbon(10)); break;
+            case FilterKind.None: break;
+            case FilterKind.Bloom: table.SetFilterPolicy(Keep(N.BloomFilterPolicy.Create(10, false))); break;
+            case FilterKind.Ribbon: table.SetFilterPolicy(N.Native.Instance.rocksdb_filterpolicy_create_ribbon(10)); break;
             default: throw new ArgumentException("unknown filter " + s.Filter);
         }
         o.SetBlockBasedTableFactory(table);

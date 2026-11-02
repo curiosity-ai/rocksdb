@@ -1,12 +1,12 @@
 using RocksDb.Managed.Options;
 using RocksDb.Managed.Table;
+using RocksDb.Managed.Table.Filters;
 
 namespace RocksDb.Managed;
 
 /// <summary>
 /// Port of rocksdb::BlockBasedTableOptions (include/rocksdb/table.h) with upstream defaults; OPTIONS-file names and
-/// string forms follow table/block_based/block_based_table_factory.cc. The filter policy is kept as its serialized id
-/// (e.g. "bloomfilter:10:false", "ribbonfilter:10:-1"); the policy object is resolved by the table code.
+/// string forms follow table/block_based/block_based_table_factory.cc.
 /// </summary>
 public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOptions>
 {
@@ -20,8 +20,26 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
     public IndexType IndexType { get; set; } = IndexType.BinarySearch;
     public DataBlockIndexType DataBlockIndexType { get; set; } = DataBlockIndexType.BinarySearch;
     public double DataBlockHashTableUtilRatio { get; set; } = 0.75;
-    /// <summary>Serialized filter policy id, or null for no filter.</summary>
-    public string? FilterPolicy { get; set; }
+    private CustomizableOption<FilterPolicy> _filterPolicy;
+
+    /// <summary>
+    /// Filter policy (e.g. <c>new BloomFilterPolicy(10)</c>, <c>new RibbonFilterPolicy(10, 0)</c>), or null for no filter.
+    /// Persisted as filter_policy by id (<c>bloomfilter:10:false</c>, <c>ribbonfilter:10:0</c>); built-in ids read from an
+    /// OPTIONS file (including the struct form <c>{id=ribbonfilter:10:0;bloom_before_level=0;}</c>) are recreated as
+    /// policy objects, and the parsed text is written back unchanged while the policy is not replaced or reconfigured.
+    /// </summary>
+    public FilterPolicy? FilterPolicy
+    {
+        get => _filterPolicy.Value;
+        set => _filterPolicy.Set(value);
+    }
+
+    /// <summary>
+    /// The filter_policy id read from an OPTIONS file that does not name a built-in policy (null otherwise). It is
+    /// written back verbatim; opening a table with it fails like upstream's FilterPolicy::CreateFromString, except for
+    /// the bare class names the C API writes, which mean "no filter".
+    /// </summary>
+    public string? UnresolvedFilterPolicyId => _filterPolicy.UnresolvedText;
     public bool WholeKeyFiltering { get; set; } = true;
     public bool PartitionFilters { get; set; }
     public bool DecouplePartitionedFilters { get; set; } = true;
@@ -50,7 +68,8 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
     public ulong MaxAutoReadaheadSize { get; set; } = 256 * 1024;
     public ulong InitialAutoReadaheadSize { get; set; } = 8 * 1024;
     public ulong NumFileReadsForAutoReadahead { get; set; } = 2;
-    public string FlushBlockPolicyFactory { get; set; } = "FlushBlockBySizePolicyFactory";
+    /// <summary>flush_block_policy_factory (the managed table builder cuts blocks by size).</summary>
+    public FlushBlockPolicyType FlushBlockPolicy { get; set; } = FlushBlockPolicyType.BySize;
 
     private static readonly OptionTable<BlockBasedTableOptions> s_table = new OptionTable<BlockBasedTableOptions>()
         .UInt64("block_size", static o => o.BlockSize, static (o, v) => o.BlockSize = v)
@@ -63,7 +82,8 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
         .Enum("index_type", OptionEnumMaps.IndexType, static o => o.IndexType, static (o, v) => o.IndexType = v)
         .Enum("data_block_index_type", OptionEnumMaps.DataBlockIndexType, static o => o.DataBlockIndexType, static (o, v) => o.DataBlockIndexType = v)
         .Double("data_block_hash_table_util_ratio", static o => o.DataBlockHashTableUtilRatio, static (o, v) => o.DataBlockHashTableUtilRatio = v)
-        .Name("filter_policy", static o => o.FilterPolicy, static (o, v) => o.FilterPolicy = v)
+        .Add("filter_policy", static o => o._filterPolicy.Serialize(FilterPolicyId) ?? "nullptr",
+            static (o, v) => o._filterPolicy.Parse(v, Db.TableFactory.CreateFilterPolicy, FilterPolicyId))
         .Bool("whole_key_filtering", static o => o.WholeKeyFiltering, static (o, v) => o.WholeKeyFiltering = v)
         .Bool("partition_filters", static o => o.PartitionFilters, static (o, v) => o.PartitionFilters = v)
         .Bool("decouple_partitioned_filters", static o => o.DecouplePartitionedFilters, static (o, v) => o.DecouplePartitionedFilters = v)
@@ -87,7 +107,10 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
         .UInt64("max_auto_readahead_size", static o => o.MaxAutoReadaheadSize, static (o, v) => o.MaxAutoReadaheadSize = v)
         .UInt64("initial_auto_readahead_size", static o => o.InitialAutoReadaheadSize, static (o, v) => o.InitialAutoReadaheadSize = v)
         .UInt64("num_file_reads_for_auto_readahead", static o => o.NumFileReadsForAutoReadahead, static (o, v) => o.NumFileReadsForAutoReadahead = v)
-        .Add("flush_block_policy_factory", static o => o.FlushBlockPolicyFactory, static (o, v) => o.FlushBlockPolicyFactory = v);
+        .EnumId("flush_block_policy_factory", OptionEnumMaps.FlushBlockPolicy, static o => o.FlushBlockPolicy, static (o, v) => o.FlushBlockPolicy = v);
+
+    /// <summary>The persisted id of a filter policy object: the built-in policies' Id (FilterPolicy::GetId), else its name.</summary>
+    private static string FilterPolicyId(FilterPolicy p) => p is BloomLikeFilterPolicy b ? b.Id : p.Name;
 
     internal override OptionTable<BlockBasedTableOptions> OptionTable => s_table;
 
@@ -96,6 +119,7 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
         var c = new BlockBasedTableOptions();
         c.CopyFrom(this);
         c.BlockCache = BlockCache;
+        c._filterPolicy = _filterPolicy;
         return c;
     }
 }

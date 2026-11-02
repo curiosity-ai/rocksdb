@@ -18,8 +18,8 @@ public abstract class DbHeadToHeadBase
     protected const int ValueSize = 100;
     protected const int OpsPerInvoke = 1000;
 
-    [Params("managed", "rocksdb-sharp")]
-    public string Engine { get; set; } = "managed";
+    [Params(EngineKind.Managed, EngineKind.RocksDbSharp)]
+    public EngineKind Engine { get; set; } = EngineKind.Managed;
 
     protected IKeyValueEngine Db = null!;
     protected ValueBuffer Values = null!;
@@ -27,7 +27,7 @@ public abstract class DbHeadToHeadBase
 
     protected void Open(EngineOptions options)
     {
-        _dir = Path.Combine(Path.GetTempPath(), "rocksdb-h2h-" + GetType().Name + "-" + Engine + "-" + Environment.ProcessId);
+        _dir = Path.Combine(Path.GetTempPath(), "rocksdb-h2h-" + GetType().Name + "-" + BenchFlags.Name(Engine) + "-" + Environment.ProcessId);
         Db = EngineFactory.Open(Engine, _dir, options, destroyExisting: true);
         Values = new ValueBuffer(301, ValueSize, 0.5);
     }

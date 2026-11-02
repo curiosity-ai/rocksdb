@@ -464,6 +464,14 @@ public sealed class ColumnFamily
         return _db.GetProperty(_cfd, property);
     }
 
+    /// <summary>A numeric DB property of this column family (DB::GetIntProperty); false if unknown or not numeric.</summary>
+    public bool TryGetIntProperty(string property, out ulong value)
+    {
+        value = 0;
+        return GetProperty(property) is { } s
+            && ulong.TryParse(s, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out value);
+    }
+
     // =====================================================================================================
     // Iterators
     // =====================================================================================================

@@ -1,5 +1,6 @@
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
+using RocksDb.Managed.Table.Filters;
 
 namespace RocksDb.Managed.Benchmarks.DbBench;
 
@@ -21,7 +22,7 @@ public sealed class ManagedEngine : IKeyValueEngine
         var cfo = new ColumnFamilyOptions
         {
             WriteBufferSize = (ulong)options.WriteBufferSize,
-            Compression = ParseCompression(options.Compression),
+            Compression = options.Compression,
             TargetFileSizeBase = (ulong)options.TargetFileSizeBase,
             MaxBytesForLevelBase = (ulong)options.MaxBytesForLevelBase,
             Level0FileNumCompactionTrigger = options.Level0FileNumCompactionTrigger,
@@ -30,24 +31,18 @@ public sealed class ManagedEngine : IKeyValueEngine
         cfo.TableOptions.BlockSize = (ulong)options.BlockSize;
         cfo.TableOptions.FormatVersion = 6;
         if (options.BlockCacheSize <= 0) cfo.TableOptions.NoBlockCache = true;
-        else if (options.CacheType == "hyperclock") cfo.TableOptions.BlockCache = Cache.BlockCache.CreateDefault(options.BlockCacheSize, options.BlockSize);
-        else if (options.CacheType == "lru") cfo.TableOptions.BlockCache = Cache.BlockCache.CreateLru(options.BlockCacheSize);
-        else throw new ArgumentException("unknown --cache_type " + options.CacheType);
-        if (options.BloomBitsPerKey > 0) cfo.TableOptions.FilterPolicy = "bloomfilter:" + options.BloomBitsPerKey + ":false";
+        else cfo.TableOptions.BlockCache = options.CacheType switch
+        {
+            BlockCacheKind.HyperClock => Cache.BlockCache.CreateDefault(options.BlockCacheSize, options.BlockSize),
+            BlockCacheKind.Lru => Cache.BlockCache.CreateLru(options.BlockCacheSize),
+            _ => throw new ArgumentOutOfRangeException(nameof(options), options.CacheType, "unknown cache type"),
+        };
+        if (options.BloomBitsPerKey > 0) cfo.TableOptions.FilterPolicy = new BloomFilterPolicy(options.BloomBitsPerKey);
         var dbo = new DbOptions { CreateIfMissing = true, FileSystem = LocalFileSystem.Instance, MaxBackgroundJobs = options.MaxBackgroundJobs };
         _db = RocksDatabase.Open(path, dbo, cfo);
         _writeOptions = new WriteOptions { Sync = options.Sync, DisableWal = options.DisableWal };
         _syncWriteOptions = new WriteOptions { Sync = true };
     }
-
-    public static Compression.CompressionType ParseCompression(string name) => name switch
-    {
-        "none" or "no" => Compression.CompressionType.None,
-        "snappy" => Compression.CompressionType.Snappy,
-        "lz4" => Compression.CompressionType.LZ4,
-        "zstd" => Compression.CompressionType.Zstd,
-        _ => throw new ArgumentException("unsupported --compression " + name + " (none|snappy|lz4|zstd)"),
-    };
 
     public string Name => "managed (RocksDb.Managed)";
 

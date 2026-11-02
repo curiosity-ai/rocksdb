@@ -25,7 +25,7 @@ public sealed class TableFactoryTests
             BlockSize = 16384, BlockSizeDeviation = 5, BlockRestartInterval = 4, IndexBlockRestartInterval = 2, MetadataBlockSize = 8192,
             FormatVersion = 5, Checksum = ChecksumType.Crc32c, IndexType = IndexType.BinarySearchWithFirstKey,
             IndexShortening = IndexShorteningMode.ShortenSeparatorsAndSuccessor, DataBlockIndexType = DataBlockIndexType.BinaryAndHash,
-            DataBlockHashTableUtilRatio = 0.5, FilterPolicy = "bloomfilter:10:false", WholeKeyFiltering = false, UseDeltaEncoding = false,
+            DataBlockHashTableUtilRatio = 0.5, FilterPolicy = new BloomFilterPolicy(10), WholeKeyFiltering = false, UseDeltaEncoding = false,
             EnableIndexCompression = false,
         };
         TableFormatOptions f = TableFactory.CreateFormatOptions(o);
@@ -149,12 +149,12 @@ public sealed class TableFactoryTests
         var cf = new ColumnFamilyOptions
         {
             ComparatorName = "rocksdb.ReverseBytewiseComparator",
-            MergeOperatorName = "StringAppendOperator",
+            MergeOperator = new StringAppendOperator(),
             Compression = CompressionType.LZ4,
             BottommostCompression = CompressionType.Zstd,
         };
         cf.CompressionOpts.Level = 3;
-        cf.TableOptions.FilterPolicy = "ribbonfilter:10:1";
+        cf.TableOptions.FilterPolicy = new RibbonFilterPolicy(10, 1);
 
         TableBuilderOptions flush = TableFactory.CreateBuilderOptions(cf, TableFileLevel.Flush);
         Assert.AreSame(Comparator.ReverseBytewise, flush.Comparator);

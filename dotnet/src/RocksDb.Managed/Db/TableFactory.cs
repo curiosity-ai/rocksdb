@@ -62,7 +62,9 @@ public static class TableFactory
             IndexShortening = options.IndexShortening,
             DataBlockIndexType = options.DataBlockIndexType,
             DataBlockHashTableUtilRatio = options.DataBlockHashTableUtilRatio,
-            FilterPolicy = CreateFilterPolicy(options.FilterPolicy),
+            // An unresolved OPTIONS-file id fails here like FilterPolicy::CreateFromString (or means "no filter" for
+            // the bare class names written by the C API).
+            FilterPolicy = options.FilterPolicy ?? CreateFilterPolicy(options.UnresolvedFilterPolicyId),
             WholeKeyFiltering = options.WholeKeyFiltering,
             UseDeltaEncoding = options.UseDeltaEncoding,
             OptimizeKeyCommonPrefix = options.OptimizeKeyCommonPrefix,

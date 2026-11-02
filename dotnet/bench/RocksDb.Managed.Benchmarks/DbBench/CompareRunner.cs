@@ -70,7 +70,7 @@ public static class CompareRunner
             writer = new StreamWriter(csv, append: true);
             if (!exists) writer.WriteLine(CsvHeader);
         }
-        string context = label + "," + flags.Num + "," + flags.ValueSize + "," + flags.Threads + "," + flags.Options.Compression;
+        string context = label + "," + flags.Num + "," + flags.ValueSize + "," + flags.Threads + "," + BenchFlags.Name(flags.Options.Compression);
         int failures = 0;
         try
         {
@@ -103,7 +103,7 @@ public static class CompareRunner
                             var sb = new StringBuilder();
                             sb.Append(label).Append(',').Append(c[1]).Append(',').Append(c[2]).Append(',')
                               .Append(flags.Num).Append(',').Append(flags.ValueSize).Append(',').Append(c[3]).Append(',')
-                              .Append(flags.Options.Compression);
+                              .Append(BenchFlags.Name(flags.Options.Compression));
                             for (int k = 4; k < c.Length; k++) sb.Append(',').Append(c[k]);
                             writer.WriteLine(sb.ToString());
                             writer.Flush();

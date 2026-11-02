@@ -224,10 +224,10 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             if (heartbeat.Term > _state.CurrentTerm) _state.UpdateTermAndVote(heartbeat.Term, null);
 
             // The database is being rebuilt: answer before touching it.
-            if (_resyncing) return new AppendEntriesResult(_state.CurrentTerm, false, 0, AppendEntriesResult.ReasonResyncing);
+            if (_resyncing) return new AppendEntriesResult(_state.CurrentTerm, false, 0, AppendEntriesRejectReason.Resyncing);
 
             if (heartbeat.Term < _state.CurrentTerm)
-                return new AppendEntriesResult(_state.CurrentTerm, false, _db.GetLatestSequenceNumber(), AppendEntriesResult.ReasonStaleTerm);
+                return new AppendEntriesResult(_state.CurrentTerm, false, _db.GetLatestSequenceNumber(), AppendEntriesRejectReason.StaleTerm);
 
             BecomeFollowerLocked(heartbeat.LeaderId);
 
@@ -238,20 +238,20 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             ulong myLatest = _db.GetLatestSequenceNumber();
             if (heartbeat.PrevLogSeq > 0 && heartbeat.PrevLogSeq > myLatest)
             {
-                result = new AppendEntriesResult(_state.CurrentTerm, false, myLatest, AppendEntriesResult.ReasonBehind);
+                result = new AppendEntriesResult(_state.CurrentTerm, false, myLatest, AppendEntriesRejectReason.Behind);
             }
             else if (heartbeat.PrevLogSeq > 0 && _state.Terms.GetTermForSeq(heartbeat.PrevLogSeq) != heartbeat.PrevLogTerm)
             {
                 // Our entry at prevLogSeq disagrees with the leader's. Raft would truncate the conflicting suffix; a
                 // RocksDB WAL cannot be truncated, so this replica must be rebuilt from a leader snapshot.
                 conflict = true;
-                result = new AppendEntriesResult(_state.CurrentTerm, false, myLatest, AppendEntriesResult.ReasonTermMismatch);
+                result = new AppendEntriesResult(_state.CurrentTerm, false, myLatest, AppendEntriesRejectReason.TermMismatch);
             }
             else
             {
                 ulong newCommit = Math.Min(heartbeat.LeaderCommit, myLatest);
                 if (newCommit > _commitSeq) SetCommitLocked(newCommit);
-                result = new AppendEntriesResult(_state.CurrentTerm, true, myLatest, null);
+                result = new AppendEntriesResult(_state.CurrentTerm, true, myLatest, AppendEntriesRejectReason.None);
             }
         }
         if (conflict) ResyncRequired?.Invoke(this, EventArgs.Empty);
@@ -555,7 +555,7 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
                     MaybePromoteToClusterLocked();
                 }
             }
-            else if (resp.Reason == AppendEntriesResult.ReasonBehind)
+            else if (resp.Reason == AppendEntriesRejectReason.Behind)
             {
                 // The follower's log is shorter; probe at its tip next time.
                 peer.RewindOnConflict(Math.Max(1, resp.LastSeq + 1));
@@ -671,13 +671,22 @@ public sealed record RequestVoteResult(long Term, bool VoteGranted);
 /// <summary>A heartbeat (AppendEntries without entries: data flows on the WAL stream).</summary>
 public sealed record HeartbeatPayload(long Term, string LeaderId, ulong PrevLogSeq, long PrevLogTerm, ulong LeaderCommit, ClusterMode LeaderMode);
 
-public sealed record AppendEntriesResult(long Term, bool Success, ulong LastSeq, string? Reason)
+/// <summary>Why a follower rejected a heartbeat (<see cref="AppendEntriesResult.Reason"/>).</summary>
+public enum AppendEntriesRejectReason
 {
-    public const string ReasonBehind = "behind";
-    public const string ReasonTermMismatch = "term-mismatch";
-    public const string ReasonResyncing = "resyncing";
-    public const string ReasonStaleTerm = "stale term";
+    /// <summary>Not rejected (<see cref="AppendEntriesResult.Success"/>).</summary>
+    None = 0,
+    /// <summary>The follower's log ends before the leader's PrevLogSeq; the leader probes at the follower's tip.</summary>
+    Behind,
+    /// <summary>The follower's term at PrevLogSeq differs from the leader's: the follower rebuilds from a snapshot.</summary>
+    TermMismatch,
+    /// <summary>The follower is rebuilding its database from a leader snapshot.</summary>
+    Resyncing,
+    /// <summary>The heartbeat's term is older than the follower's current term.</summary>
+    StaleTerm,
 }
+
+public sealed record AppendEntriesResult(long Term, bool Success, ulong LastSeq, AppendEntriesRejectReason Reason);
 
 public sealed record LogConsistencyResult(bool IsLeader, bool Consistent, long Term);
 
