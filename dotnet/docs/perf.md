@@ -375,7 +375,8 @@ lz4 1.37x -> 0.64x, 1 KiB / 4 threads / lz4 1.46x -> 2.76x), so the summary rows
 
 Remaining gaps:
 - First-run JIT: a single flush / compaction per process (the matrix's `flush` and `compact`) still costs 1.5 - 2x
-  native; steady-state flush / compaction CPU per entry is at or below native.
+  native; steady-state flush / compaction CPU per entry is at or below native. (Cold-start only: the benchmarks now
+  warm up first, see "Benchmark warm-up".)
 - LZ4 flushes: K4os LZ4's compressor is JIT compiled (82 ms of JIT for `LZ4_compress_generic` instantiations / OSR
   variants) and runs as tier-0 code during the first flush; fillrandom 300k + flush with LZ4 is 720 - 845 ms vs
   290 - 343 ms native. Not addressed (third-party code; a warm-up or an in-house LZ4 encoder would be needed).
@@ -430,6 +431,124 @@ L0 -> L5 compaction (up to 10 vs 5 - 6), the L0 score keeps L5 -> L6 compactions
 `waitforcompaction` has more left (0.5 - 1.2 s vs 0 - 0.4 s). Given the same LSM state the managed picker chooses
 the same compactions (same inputs in the LOG comparison of the two engines), and the lock-step test shows identical
 results. The managed timings of these runs are cold (fresh process, no warm-up pass).
+
+## Benchmark warm-up (measuring warm code)
+
+Until this change every dbbench process measured from a cold start: the managed engines (and rocksdb-sharp's
+P/Invoke stubs and wrapper) were JIT compiled during the first benchmarks, ran as tier-0 / OSR code until tiered
+compilation caught up, and the background tier-1 compiler competed with the measurement. The runner now warms up
+first, in all three legs, with the same workload (design and flags: "Warm-up" in `bench/README.md`): the whole
+benchmark list on a throwaway `<db>-warmup` DB (same options, max(50k, num/10) <= 200k keys; repeated benchmarks for
+>= 32 repetitions, >= warmup_ops ops and >= 1 s each), then 4 cycles of reopen + 16 small overwrite + flush,
+waitforcompaction and compact (64 flushes, so methods that run once per flush / table file / compaction also get the
+~30 calls per tiering step), delete the DB, full GC, wait until `JitInfo.GetCompiledMethodCount` is stable for
+200 ms; every measured benchmark starts after a settle pause (JIT quiet for 200 ms; the C leg sleeps 200 ms). Each
+.NET result line reports the methods compiled while it was timed (`jit N methods X ms`, CSV `jit_methods` / `jit_ms`).
+
+Development notes. A warm-up that ran each benchmark only for its op count (50 - 100 ms for fast reads) or with
+`--warmup_min_ms 100` still left 50 - 120 methods / up to 140 ms of JIT in the measured readrandom: the per-op read
+path (block fetch, `BlockIter.Seek`, cache insert) is called millions of times but only promoted after the tiering
+delay expires, which needs the warm-up to keep running; hence the time floor. The DB open path (options parsing, LOG
+header) and the end of each benchmark (report formatting) promote methods when called again; the settle pause moves
+that out of the measurement. With 3 cycles of 4 flushes, 35 - 90 methods were still compiled during the measured
+`compact` (managed); 64 small flushes bring that to 4 - 21.
+
+Results, alternated cold (`--warmup false`) / warm runs in the same window, after the compaction-picking merge
+(`bench/results/2026-11-02-vm-cold.md` / `-vm-warm.md`, reduced matrix, load 1 - 7; `-vm-cold-compaction.md` /
+`-vm-warm-compaction.md` = pair 3 of 3 compaction-heavy pairs, load 1 - 2). The first warm runs (15:43 - 16:10 UTC)
+overlapped another agent's librocksdb source build and were redone; the committed files are the redone runs.
+
+JIT methods compiled during the measured benchmarks (all threads):
+
+| | rocksdb-sharp total / median / max | managed total / median / max | managed-async total / median / max |
+|---|---:|---:|---:|
+| matrix, cold (112 benchmarks per engine) | 3904 / 22 / 249 | 30176 / 161 / 1256 | 34690 / 180 / 1529 |
+| matrix, warm | 16 / 0 / 1 | 408 / 0 / 51 | 617 / 1 / 75 |
+| compaction-heavy, cold (5 benchmarks, 3 runs) | 40 - 250 per fill | fillrandom 1820 - 2060, overwrite 1110 - 1260, readrandom 600 - 1000 | fillrandom 2010 - 2520, readrandom 1460 - 1720 |
+| compaction-heavy, warm (3 runs) | 0 - 1 | fillrandom 170 - 610, overwrite 110 - 630, reads 2 - 37 | fillrandom 40 - 600, overwrite 140 - 430, reads 3 - 106 |
+
+What remains: the compaction-heavy fills reach LSM shapes the 50k-key warm-up DB does not (L5 -> L6 compactions
+of a 110 MB tree), so a few hundred per-file / per-compaction methods still tier up during them (60 - 220 ms of
+background JIT over a 1.6 - 3.5 s benchmark, on another core). `--warmup_ops 250000` did not reliably reduce it.
+Everything else is 0 - a few methods.
+
+Cold vs warm, reduced matrix (median over the 8 configurations of each benchmark; warm/cold = same engine, ratios vs
+c-native of the same run):
+
+| benchmark | engine | warm / cold | cold / C | warm / C | JIT methods cold -> warm (median) |
+|---|---|---:|---:|---:|---|
+| fillseq (first op of the process) | rocksdb-sharp | 0.92x | 1.00x | 1.01x | 207 -> 1 |
+| | managed | 0.56x | 0.98x | 0.53x | 494 -> 1 |
+| | managed-async | 0.48x | 1.06x | 0.60x | 567 -> 1 |
+| flush | rocksdb-sharp | 0.94x | 0.99x | 0.85x | 4 -> 0 |
+| | managed | 0.94x | 0.76x | 0.56x | 65 -> 2 |
+| | managed-async | 0.54x | 1.71x | 0.50x | 44 -> 3 |
+| compact | rocksdb-sharp | 0.90x | 1.08x | 0.94x | 6 -> 0 |
+| | managed | 0.64x | 1.04x | 0.47x | 346 -> 8 |
+| | managed-async | 0.60x | 0.81x | 0.69x | 386 -> 14 |
+| readrandom | rocksdb-sharp | 0.92x | 1.15x | 1.20x | 40 -> 0 |
+| | managed | 0.58x | 1.22x | 0.70x | 1026 -> 19 |
+| | managed-async | 0.58x | 1.37x | 0.75x | 1264 -> 36 |
+| seekrandom | managed | 0.92x | 0.68x | 0.66x | 236 -> 1 |
+| multireadrandom | managed | 0.85x | 0.90x | 0.72x | 159 -> 0 |
+| readseq | managed | 0.63x | 0.85x | 0.51x | 21 -> 0 |
+
+c-native's own warm/cold medians are 0.87x (fillseq), 1.32x (flush), 1.08x (compact), 0.94x (readrandom): the C
+leg gains nothing from the warm-up, and its single-shot `flush` / `compact` rows swing by up to 3x between runs
+(e.g. 100 B / 1 thread flush 144 -> 381 ms, 1 KiB / 4 threads compact 678 -> 1544 ms), so read the flush / compact
+ratios as +-50%. Per configuration (managed, ms; ratio vs c-native of the same run):
+
+| configuration | flush cold | flush warm | compact cold | compact warm |
+|---|---:|---:|---:|---:|
+| 100 B, 1 thread, none | 111 (0.77x) | 107 (0.28x) | 648 (0.69x) | 650 (0.53x) |
+| 100 B, 4 threads, none | 93 (0.64x) | 95 (0.28x) | 523 (0.64x) | 371 (0.41x) |
+| 100 B, 1 thread, lz4 | 181 (1.43x) | 163 (0.76x) | 793 (0.97x) | 679 (0.93x) |
+| 100 B, 4 threads, lz4 | 160 (0.93x) | 156 (0.97x) | 688 (1.25x) | 494 (0.84x) |
+| 1 KiB, 1 thread, none | 233 (0.39x) | 190 (0.34x) | 2150 (1.49x) | 420 (0.32x) |
+| 1 KiB, 4 threads, none | 291 (1.95x) | 161 (0.36x) | 1312 (1.94x) | 422 (0.27x) |
+| 1 KiB, 1 thread, lz4 | 282 (0.76x) | 258 (1.04x) | 1140 (0.63x) | 657 (0.82x) |
+| 1 KiB, 4 threads, lz4 | 243 (0.63x) | 337 (1.21x) | 1247 (1.11x) | 444 (0.36x) |
+
+Summary (geometric mean vs c-native over the 14 benchmarks of each configuration, same window):
+
+| configuration | rocksdb-sharp cold -> warm | managed cold -> warm | managed-async cold -> warm |
+|---|---:|---:|---:|
+| 100 B, 1 thread, none | 1.13x -> 0.98x | 0.71x -> 0.52x | 0.72x -> 0.66x |
+| 100 B, 4 threads, none | 1.11x -> 1.05x | 0.99x -> 0.60x | 1.03x -> 0.63x |
+| 100 B, 1 thread, lz4 | 1.26x -> 1.19x | 0.93x -> 0.63x | 1.12x -> 0.68x |
+| 100 B, 4 threads, lz4 | 0.98x -> 1.10x | 0.85x -> 0.61x | 0.87x -> 0.59x |
+| 1 KiB, 1 thread, none | 1.05x -> 0.90x | 0.78x -> 0.50x | 0.66x -> 0.48x |
+| 1 KiB, 4 threads, none | 1.43x -> 0.99x | 1.23x -> 0.73x | 1.11x -> 0.72x |
+| 1 KiB, 1 thread, lz4 | 1.10x -> 1.09x | 0.80x -> 0.67x | 0.85x -> 0.73x |
+| 1 KiB, 4 threads, lz4 | 1.04x -> 0.89x | 0.94x -> 0.81x | 1.00x -> 0.72x |
+| compaction-heavy (median of 3 pairs) | 1.08x -> 1.02x | 0.62x -> 0.57x | 0.65x -> 0.68x |
+
+Compaction-heavy pairs (µs/op, 3 runs each; the first pair still had load 7 - 8):
+
+| benchmark | engine | cold | warm | cold / C (median) | warm / C (median) |
+|---|---|---|---|---:|---:|
+| fillrandom | c-native | 5.00 / 5.87 / 6.40 | 5.27 / 5.46 / 5.25 | - | - |
+| | managed | 4.73 / 5.74 / 4.01 | 3.23 / 3.22 / 3.26 | 0.95x | 0.61x |
+| overwrite | c-native | 5.36 / 6.08 / 5.69 | 5.08 / 6.34 / 6.15 | - | - |
+| | managed | 3.01 / 3.35 / 2.97 | 6.73 / 3.25 / 3.25 | 0.55x | 0.53x |
+| readrandom | c-native | 11.8 / 13.4 / 12.0 | 11.9 / 13.4 / 11.9 | - | - |
+| | managed | 7.56 / 9.72 / 7.85 | 9.24 / 7.98 / 7.46 | 0.66x | 0.63x |
+| seekrandom | c-native | 47.0 / 56.8 / 49.2 | 44.0 / 51.6 / 45.8 | - | - |
+| | managed | 23.9 / 21.6 / 15.2 | 34.2 / 24.9 / 22.8 | 0.38x | 0.50x |
+
+LSM shape / write-amp of these pairs: native 2.96 every run; managed 2.96 / 2.96 / 3.15 cold and 2.96 / 3.05 / 3.05
+warm, managed-async 2.87 / 2.87 / 3.05 cold and 2.96 every warm run.
+
+Side effect of the settle pause: background flushes / compactions also progress during the 200 ms before each
+benchmark (in every leg), so `waitforcompaction` right after the fills now finds little or nothing left (20 - 60 µs in
+all engines vs 15 - 970 ms cold); it is excluded from the summaries anyway. With the warm-up on, the .NET pause can be
+longer than C's when the JIT is still busy (bounded at 5 s; typically 200 - 300 ms).
+
+Takeaways: on the fill and read paths the cold runs mostly measured JIT (fillseq and readrandom compile 500 - 1000
+methods; warm, managed is 0.53x / 0.70x of C instead of ~1x / 1.22x). Flush and full compaction of a warm process are
+at or below native cost except the LZ4 flushes (K4os LZ4 is steady-state slower; 1 KiB / lz4 flush 1.04 - 1.21x)
+and reflect what a long-running application sees. rocksdb-sharp changes little (its JIT is the binding layer only).
+Noise: shared 4-vCPU VM; even at load 1 - 7 single-shot rows vary by +-50% and benchmark rows by +-10-30%.
 
 ## Integrated BlobDB (blob files)
 

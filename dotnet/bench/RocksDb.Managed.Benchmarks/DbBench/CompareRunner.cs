@@ -22,7 +22,7 @@ namespace RocksDb.Managed.Benchmarks.DbBench;
 public static class CompareRunner
 {
     public const string CsvHeader =
-        "label,engine,benchmark,num,value_size,threads,compression,ops,seconds,micros_per_op,ops_per_sec,mb_per_sec,p50_us,p99_us,p999_us,found,alloc_b_per_op,gc0,gc1,gc2";
+        "label,engine,benchmark,num,value_size,threads,compression,ops,seconds,micros_per_op,ops_per_sec,mb_per_sec,p50_us,p99_us,p999_us,found,alloc_b_per_op,gc0,gc1,gc2,jit_methods,jit_ms";
 
     public const string LsmCsvHeader = "label,engine,num,value_size,threads,compression,files_per_level,user_bytes,written_bytes,write_amp,pending_compaction_bytes";
 
@@ -99,7 +99,7 @@ public static class CompareRunner
                         if (writer is not null)
                         {
                             string[] c = line.Split(',');
-                            // RESULT,engine,benchmark,threads,ops,seconds,us,ops/s,MB/s,p50,p99,p999,found,alloc,gc0,gc1,gc2
+                            // RESULT,engine,benchmark,threads,ops,seconds,us,ops/s,MB/s,p50,p99,p999,found,alloc,gc0,gc1,gc2,jit_methods,jit_ms
                             var sb = new StringBuilder();
                             sb.Append(label).Append(',').Append(c[1]).Append(',').Append(c[2]).Append(',')
                               .Append(flags.Num).Append(',').Append(flags.ValueSize).Append(',').Append(c[3]).Append(',')
@@ -140,6 +140,8 @@ public static class CompareRunner
                     failures++;
                 }
                 if (Directory.Exists(db)) Directory.Delete(db, recursive: true);
+                // <db>-txnoptimistic, <db>-txnpessimistic, <db>-warmup (if a run was interrupted), ...
+                foreach (string sibling in Directory.GetDirectories(dbBase, Path.GetFileName(db) + "-*")) Directory.Delete(sibling, recursive: true);
             }
         }
         finally
@@ -184,7 +186,7 @@ public static class CompareRunner
     // ---------------------------------------------------------------------- report
 
     private sealed record Row(string Label, string Engine, string Benchmark, long Num, int ValueSize, int Threads, string Compression,
-        long Ops, double Micros, double OpsPerSec, double MBs, double P50, double P99, double P999, string Alloc)
+        long Ops, double Micros, double OpsPerSec, double MBs, double P50, double P99, double P999, string Alloc, string JitMethods)
     {
         public bool Available => Ops > 0;
     }
@@ -218,7 +220,7 @@ public static class CompareRunner
                 string[] c = line.Split(',');
                 if (c.Length < 17) continue;
                 rows.Add(new Row(c[0], c[1], c[2], L(c[3]), (int)L(c[4]), (int)L(c[5]), c[6], L(c[7]), D(c[9]), D(c[10]), D(c[11]),
-                    D(c[12]), D(c[13]), D(c[14]), c.Length > 16 ? c[16] : ""));
+                    D(c[12]), D(c[13]), D(c[14]), c.Length > 16 ? c[16] : "", c.Length > 20 ? c[20] : ""));
             }
         }
 
@@ -252,6 +254,12 @@ public static class CompareRunner
             + "async API (one task per thread). Cells are µs/op (wall time / total ops, lower is better); ratios are relative to c-native "
             + "(> 1 = slower). p99 is per-operation latency in µs (per 16-key batch for multireadrandom). alloc = managed bytes allocated per op.")
           .AppendLine();
+        bool hasJit = rows.Exists(r => r.JitMethods.Length > 0);
+        if (hasJit)
+        {
+            md.AppendLine("jit = methods JIT-compiled (all threads, incl. the tiering background compiler) while the benchmark was measured, "
+                + "for the .NET engines (`System.Runtime.JitInfo`); ~0 when the warm-up did its job.").AppendLine();
+        }
 
         // Summary: geometric mean of ratios vs c-native per configuration.
         md.AppendLine("## Summary (geometric mean of µs/op ratio vs c-native over the benchmarks of each configuration)").AppendLine();
@@ -286,6 +294,31 @@ public static class CompareRunner
         }
         md.AppendLine();
 
+        if (hasJit)
+        {
+            md.AppendLine("JIT during the measurements (methods compiled while a benchmark was being timed, over all configurations):").AppendLine();
+            md.AppendLine("| engine | benchmarks | total methods | median | max (benchmark) |");
+            md.AppendLine("|---|---:|---:|---:|---|");
+            foreach (string e in engines)
+            {
+                if (e == "c-native") continue;
+                var counts = new List<(long N, Row R)>();
+                foreach (Row r in rows)
+                {
+                    if (r.Engine == e && r.Available && long.TryParse(r.JitMethods, NumberStyles.Integer, CultureInfo.InvariantCulture, out long n)) counts.Add((n, r));
+                }
+                if (counts.Count == 0) continue;
+                counts.Sort((x, y) => x.N.CompareTo(y.N));
+                long sum = 0;
+                foreach (var c in counts) sum += c.N;
+                var max = counts[^1];
+                md.Append("| ").Append(e).Append(" | ").Append(counts.Count).Append(" | ").Append(sum).Append(" | ")
+                  .Append(counts[counts.Count / 2].N).Append(" | ").Append(max.N).Append(" (").Append(max.R.Benchmark).Append(", ")
+                  .Append(ConfigName((max.R.Label, max.R.Num, max.R.ValueSize, max.R.Threads, max.R.Compression))).AppendLine(") |");
+            }
+            md.AppendLine();
+        }
+
         foreach (var cfg in configs)
         {
             md.Append("## ").AppendLine(ConfigName(cfg)).AppendLine();
@@ -294,9 +327,11 @@ public static class CompareRunner
             foreach (string e in engines) if (e != "c-native") md.Append(' ').Append(e).Append(" / C |");
             foreach (string e in engines) md.Append(' ').Append(e).Append(" p99 |");
             foreach (string e in engines) if (e.StartsWith("managed", StringComparison.Ordinal)) md.Append(' ').Append(e).Append(" alloc B/op |");
+            if (hasJit) foreach (string e in engines) if (e != "c-native") md.Append(' ').Append(e).Append(" jit |");
             md.AppendLine();
             md.Append("|---|");
-            int cols = engines.Count * 2 + (engines.Count - (engines.Contains("c-native") ? 1 : 0)) + engines.FindAll(e => e.StartsWith("managed", StringComparison.Ordinal)).Count;
+            int cols = engines.Count * 2 + (engines.Count - (engines.Contains("c-native") ? 1 : 0)) + engines.FindAll(e => e.StartsWith("managed", StringComparison.Ordinal)).Count
+                + (hasJit ? engines.FindAll(e => e != "c-native").Count : 0);
             for (int k = 0; k < cols; k++) md.Append("---:|");
             md.AppendLine();
             foreach (string b in benchOrder)
@@ -326,6 +361,15 @@ public static class CompareRunner
                     if (!e.StartsWith("managed", StringComparison.Ordinal)) continue;
                     Row? r = Find(rows, cfg, e, b);
                     md.Append(' ').Append(r is { Available: true } && r.Alloc.Length > 0 ? r.Alloc : "-").Append(" |");
+                }
+                if (hasJit)
+                {
+                    foreach (string e in engines)
+                    {
+                        if (e == "c-native") continue;
+                        Row? r = Find(rows, cfg, e, b);
+                        md.Append(' ').Append(r is { Available: true } && r.JitMethods.Length > 0 ? r.JitMethods : "-").Append(" |");
+                    }
                 }
                 md.AppendLine();
             }

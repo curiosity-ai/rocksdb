@@ -13,7 +13,8 @@
 // this program and the rocksdb-sharp engine is the cost of the managed
 // binding (P/Invoke + marshalling), not of the storage engine.
 //
-// Keep the following in sync with DbBench/Workload.cs:
+// Keep the following in sync with DbBench/Workload.cs (and the warm-up with
+// RunWarmup in DbBench/DbBenchRunner.cs):
 //   - SplitMix64 PRNG and the per (benchmark, thread) seed derivation
 //   - key format (db_bench GenerateKeyFromInt: 8-byte big-endian + '0' pad)
 //   - value buffer (db_bench RandomGenerator / CompressibleString)
@@ -71,6 +72,9 @@ typedef struct {
   const char* db;
   bool histogram;
   int txn_puts;
+  bool warmup;            // warm-up phase on a separate DB (see warmup())
+  int64_t warmup_ops;     // -1 = max(50k, num / 10), <= 200k, <= num
+  int warmup_min_ms;      // minimum time per repeated warm-up benchmark
 } Flags;
 
 static Flags FLAGS = {
@@ -104,6 +108,9 @@ static Flags FLAGS = {
     .db = "/tmp/rocksdb-c-bench",
     .histogram = true,
     .txn_puts = 10,
+    .warmup = true,
+    .warmup_ops = -1,
+    .warmup_min_ms = 1000,
 };
 
 static void usage(void) {
@@ -121,6 +128,7 @@ static void usage(void) {
           "  [--disable_auto_compactions] [--max_background_jobs 2]\n"
           "  [--enable_blob_files] [--min_blob_size 0]\n"
           "  [--use_existing_db] [--seed 301] [--db PATH] [--histogram 1]\n"
+          "  [--warmup true|false] [--warmup_ops N] [--warmup_min_ms 1000]\n"
           "benchmarks: fillseq fillrandom overwrite fillsync readrandom "
           "readmissing readseq readreverse\n"
           "            seekrandom multireadrandom readwhilewriting "
@@ -199,6 +207,9 @@ static void parse_flags(int argc, char** argv) {
     else if (FLAG("db")) FLAGS.db = value;
     else if (FLAG("histogram")) FLAGS.histogram = parse_bool(value);
     else if (FLAG("txn_puts")) FLAGS.txn_puts = atoi(value);
+    else if (FLAG("warmup")) FLAGS.warmup = parse_bool(value);
+    else if (FLAG("warmup_ops")) FLAGS.warmup_ops = strtoll(value, NULL, 10);
+    else if (FLAG("warmup_min_ms")) FLAGS.warmup_min_ms = atoi(value);
     else if (FLAG("engine") || FLAG("async")) { /* accepted for runner parity */ }
     else {
       fprintf(stderr, "unknown flag --%s\n", name);
@@ -216,6 +227,14 @@ static void parse_flags(int argc, char** argv) {
   if (FLAGS.multiget_size < 1) FLAGS.multiget_size = 1;
   if (FLAGS.txn_puts < 1) FLAGS.txn_puts = 1;
   if (FLAGS.reads < 0) FLAGS.reads = FLAGS.num;
+  if (FLAGS.warmup_min_ms < 0) FLAGS.warmup_min_ms = 0;
+  if (FLAGS.warmup_ops <= 0) {
+    // Same default as DbBenchRunner.DefaultWarmupOps.
+    int64_t w = FLAGS.num / 10 > 50000 ? FLAGS.num / 10 : 50000;
+    if (w > 200000) w = 200000;
+    if (w > FLAGS.num) w = FLAGS.num;
+    FLAGS.warmup_ops = w > 0 ? w : 1;
+  }
 }
 
 // ---------------------------------------------------------------- workload
@@ -861,9 +880,15 @@ static void* thread_main(void* arg) {
 
 static const char* kEngineName = "c-native";
 
+// Warm-up state: report() prints nothing while g_quiet is set, and
+// run_threaded() runs g_ops_override ops instead of --num / --reads when >= 0.
+static bool g_quiet;
+static int64_t g_ops_override = -1;
+
 static void report(const char* name, int64_t ops, double seconds,
                    int64_t bytes, int64_t found, bool show_found,
                    const Histogram* h, const char* extra) {
+  if (g_quiet) return;
   double micros_per_op = ops > 0 ? seconds * 1e6 / (double)ops : 0;
   double ops_per_sec = seconds > 0 ? (double)ops / seconds : 0;
   double mbs = seconds > 0 ? (double)bytes / 1048576.0 / seconds : 0;
@@ -882,9 +907,9 @@ static void report(const char* name, int64_t ops, double seconds,
   if (extra != NULL && extra[0] != 0) printf(" %s", extra);
   printf("\n");
   // Machine-readable line; the C# runner prints the same columns and fills
-  // the allocation/GC columns.
+  // the allocation/GC/JIT columns.
   printf("RESULT,%s,%s,%d,%" PRId64 ",%.6f,%.4f,%.1f,%.2f,%.4f,%.4f,%.4f,%" PRId64
-         ",,,,\n",
+         ",,,,,,\n",
          kEngineName, name, FLAGS.threads, ops, seconds, micros_per_op,
          ops_per_sec, mbs, p50, p99, p999, found);
   fflush(stdout);
@@ -895,27 +920,24 @@ static void run_threaded(BenchId b, int bench_index, const char* name) {
   memset(&s, 0, sizeof(s));
   s.bench = b;
   s.bench_index = bench_index;
+  bool is_read = b == B_READRANDOM || b == B_READMISSING || b == B_READSEQ ||
+                 b == B_READREVERSE || b == B_SEEKRANDOM ||
+                 b == B_MULTIREADRANDOM || b == B_READWHILEWRITING;
+  int64_t nominal = g_ops_override >= 0 ? g_ops_override
+                    : is_read           ? FLAGS.reads
+                                        : FLAGS.num;
   switch (b) {
     case B_FILLSYNC:
-      s.total_ops = FLAGS.num / 1000 > 0 ? FLAGS.num / 1000 : 1;
-      break;
-    case B_READRANDOM:
-    case B_READMISSING:
-    case B_READSEQ:
-    case B_READREVERSE:
-    case B_SEEKRANDOM:
-    case B_MULTIREADRANDOM:
-    case B_READWHILEWRITING:
-      s.total_ops = FLAGS.reads;
+      s.total_ops = nominal / 1000 > 0 ? nominal / 1000 : 1;
       break;
     case B_TXNOPTIMISTIC:
     case B_TXNPESSIMISTIC:
       // one op = one transaction (as many puts in total as fillrandom)
-      s.total_ops = FLAGS.num / FLAGS.txn_puts > 0 ? FLAGS.num / FLAGS.txn_puts : 1;
+      s.total_ops = nominal / FLAGS.txn_puts > 0 ? nominal / FLAGS.txn_puts : 1;
       atomic_store(&g_txn_retries, 0);
       break;
     default:
-      s.total_ops = FLAGS.num;
+      s.total_ops = nominal;
       break;
   }
   int nthreads = FLAGS.threads + (b == B_READWHILEWRITING ? 1 : 0);
@@ -1032,6 +1054,154 @@ static void print_stats(void) {
   fflush(stdout);
 }
 
+// ---------------------------------------------------------------- warm-up
+
+// Same constants and algorithm as RunWarmup in DbBench/DbBenchRunner.cs. The C
+// leg has no JIT to warm up; it runs the identical warm-up workload so that all
+// three legs are measured under the same page cache / allocator / file system
+// conditions.
+enum {
+  kWarmupMinReps = 32,
+  kWarmupMaxMsPerBenchmark = 30000,
+  kWarmupFlushCompactionCycles = 4,
+  kWarmupFlushesPerCycle = 16,
+  kSettleMs = 200,
+};
+
+static void sleep_ms(int ms) {
+  struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+  while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+  }
+}
+
+static void destroy_options(void) {
+  rocksdb_writeoptions_destroy(g_wo);
+  rocksdb_writeoptions_destroy(g_wo_sync);
+  rocksdb_readoptions_destroy(g_ro);
+  rocksdb_options_destroy(g_options);
+  rocksdb_block_based_options_destroy(g_table_options);
+  if (g_cache != NULL) rocksdb_cache_destroy(g_cache);
+  g_cache = NULL;
+}
+
+// Plan step: a benchmark, or B_UNKNOWN = close and reopen the DB, then pause
+// (the C# runner waits for the JIT to quiesce there).
+typedef struct {
+  BenchId bench;
+  bool repeat;
+} WarmupStep;
+
+// Runs every requested benchmark on <db>-warmup (same options, key range
+// --warmup_ops), then deletes it and rebuilds the options (fresh block cache):
+//   - fillrandom first when the list does not start with a fill;
+//   - repeated benchmarks (all but flush/compact/waitforcompaction; stats is
+//     skipped) run repetitions of warmup_ops / 32 ops until >= 32
+//     repetitions, >= warmup_ops ops and >= warmup_min_ms ms;
+//   - flush / compact / waitforcompaction run once where they appear;
+//   - 4 cycles of: reopen, 16 x (overwrite of warmup_ops / 50 keys + flush),
+//     waitforcompaction, compact.
+static void warmup(const BenchId* benches, int count) {
+  static char path[1024];
+  Flags saved = FLAGS;
+  snprintf(path, sizeof(path), "%s-warmup", saved.db);
+  FLAGS.db = path;
+  FLAGS.num = saved.warmup_ops;
+  FLAGS.reads = saved.warmup_ops;
+  FLAGS.use_existing_db = false;
+
+  int cap = count + 1 +
+            kWarmupFlushCompactionCycles * (3 + 2 * kWarmupFlushesPerCycle);
+  WarmupStep* plan = (WarmupStep*)calloc((size_t)cap, sizeof(WarmupStep));
+  int n = 0;
+  if (count == 0 || !(benches[0] == B_FILLSEQ || benches[0] == B_FILLRANDOM ||
+                      benches[0] == B_FILLSYNC))
+    plan[n++] = (WarmupStep){B_FILLRANDOM, true};
+  for (int i = 0; i < count; i++) {
+    BenchId b = benches[i];
+    if (b == B_STATS) continue;
+    plan[n++] = (WarmupStep){
+        b, !(b == B_FLUSH || b == B_COMPACT || b == B_WAITFORCOMPACTION)};
+  }
+  for (int c = 0; c < kWarmupFlushCompactionCycles; c++) {
+    plan[n++] = (WarmupStep){B_UNKNOWN, false};
+    for (int i = 0; i < kWarmupFlushesPerCycle; i++) {
+      plan[n++] = (WarmupStep){B_OVERWRITE, false};
+      plan[n++] = (WarmupStep){B_FLUSH, false};
+    }
+    plan[n++] = (WarmupStep){B_WAITFORCOMPACTION, false};
+    plan[n++] = (WarmupStep){B_COMPACT, false};
+  }
+
+  printf("%-17s : start\n", "warmup");
+  fflush(stdout);
+  int64_t saved_user_bytes = g_user_bytes_written;
+  int64_t chunk = FLAGS.num / kWarmupMinReps > 0 ? FLAGS.num / kWarmupMinReps : 1;
+  uint64_t total0 = now_ns();
+  g_quiet = true;
+  for (int index = 0; index < n; index++) {
+    BenchId b = plan[index].bench;
+    if (b == B_UNKNOWN) {
+      open_db(false);
+      sleep_ms(100);
+      printf("%-17s : reopen\n", "warmup");
+      fflush(stdout);
+      continue;
+    }
+    const char* name = kBenchNames[b];
+    bool fresh = b == B_FILLSEQ || b == B_FILLRANDOM || b == B_FILLSYNC;
+    if (g_db == NULL || fresh) open_db(true);
+    bool txn = b == B_TXNOPTIMISTIC || b == B_TXNPESSIMISTIC;
+    if (txn) open_txn_db(b, name);
+    uint64_t t0 = now_ns();
+    int reps = 0;
+    int64_t ops = 0;
+    if (!plan[index].repeat) {
+      g_ops_override = FLAGS.num / 50 > 0 ? FLAGS.num / 50 : 1;
+      if (b == B_FLUSH || b == B_COMPACT || b == B_WAITFORCOMPACTION)
+        run_single(b, name);
+      else
+        run_threaded(b, index, name);
+      reps = 1;
+      ops = g_ops_override;
+    } else {
+      g_ops_override = chunk;
+      for (;;) {
+        uint64_t ms = (now_ns() - t0) / 1000000;
+        if (ms >= kWarmupMaxMsPerBenchmark) break;
+        if (reps >= kWarmupMinReps && ops >= FLAGS.num &&
+            ms >= (uint64_t)FLAGS.warmup_min_ms)
+          break;
+        // A different random key stream per repetition (same derivation as
+        // the C# runner).
+        run_threaded(b, index + 1000 * (reps + 1), name);
+        reps++;
+        ops += chunk;
+      }
+    }
+    if (txn) {
+      close_txn_db();
+      char txn_path[1100];
+      snprintf(txn_path, sizeof(txn_path), "%s-%s", FLAGS.db, name);
+      nftw(txn_path, rm_cb, 64, FTW_DEPTH | FTW_PHYS);
+    }
+    printf("%-17s : %s %d reps %" PRId64 " ops %.3f s\n", "warmup", name, reps,
+           ops, (double)(now_ns() - t0) / 1e9);
+    fflush(stdout);
+  }
+  g_quiet = false;
+  g_ops_override = -1;
+  close_db();
+  nftw(FLAGS.db, rm_cb, 64, FTW_DEPTH | FTW_PHYS);
+  free(plan);
+  FLAGS = saved;
+  g_user_bytes_written = saved_user_bytes;
+  // Fresh options and block cache for the measured run.
+  destroy_options();
+  build_options();
+  printf("%-17s : done in %.1f s\n", "warmup", (double)(now_ns() - total0) / 1e9);
+  fflush(stdout);
+}
+
 static void print_header(void) {
   struct utsname u;
   uname(&u);
@@ -1060,6 +1230,14 @@ static void print_header(void) {
   printf("Blob files:  enable_blob_files=%d min_blob_size=%" PRIu64 "\n",
          FLAGS.enable_blob_files, FLAGS.min_blob_size);
   printf("DB path:     %s\n", FLAGS.db);
+  if (FLAGS.warmup)
+    printf("Warm-up:     on (%" PRId64
+           " ops per benchmark, >= %d repetitions and >= %d ms, then %d x %d "
+           "flushes + compactions; separate DB %s-warmup)\n",
+           FLAGS.warmup_ops, kWarmupMinReps, FLAGS.warmup_min_ms,
+           kWarmupFlushCompactionCycles, kWarmupFlushesPerCycle, FLAGS.db);
+  else
+    printf("Warm-up:     off\n");
   printf("Kernel:      %s %s\n", u.sysname, u.release);
   printf("------------------------------------------------\n");
   fflush(stdout);
@@ -1071,24 +1249,39 @@ int main(int argc, char** argv) {
   build_options();
   print_header();
 
+  // Parse the whole list first (the warm-up runs it before the measurement).
   char* list = strdup(FLAGS.benchmarks);
-  int index = 0;
+  int count = 0;
+  BenchId* benches = (BenchId*)calloc(strlen(FLAGS.benchmarks) + 1, sizeof(BenchId));
   for (char* save = NULL, *name = strtok_r(list, ",", &save); name != NULL;
-       name = strtok_r(NULL, ",", &save), index++) {
+       name = strtok_r(NULL, ",", &save)) {
     while (*name == ' ') name++;
     BenchId b = bench_from_name(name);
     if (b == B_UNKNOWN) {
       fprintf(stderr, "unknown benchmark %s\n", name);
       return 1;
     }
+    benches[count++] = b;
+  }
+  free(list);
+  if (FLAGS.warmup) warmup(benches, count);
+
+  for (int index = 0; index < count; index++) {
+    BenchId b = benches[index];
+    const char* name = kBenchNames[b];
     bool fresh = !FLAGS.use_existing_db &&
                  (b == B_FILLSEQ || b == B_FILLRANDOM || b == B_FILLSYNC);
     if (g_db == NULL || fresh) {
       open_db(fresh);
       if (fresh) g_user_bytes_written = 0;
     }
-    if (b == B_STATS) print_stats();
-    else if (b == B_FLUSH || b == B_COMPACT || b == B_WAITFORCOMPACTION)
+    if (b == B_STATS) {
+      print_stats();
+      continue;
+    }
+    // Settle pause, as long as the C# runner's (which waits for the JIT).
+    if (FLAGS.warmup) sleep_ms(kSettleMs);
+    if (b == B_FLUSH || b == B_COMPACT || b == B_WAITFORCOMPACTION)
       run_single(b, name);
     else if (b == B_TXNOPTIMISTIC || b == B_TXNPESSIMISTIC) {
       open_txn_db(b, name);
@@ -1097,14 +1290,9 @@ int main(int argc, char** argv) {
     }
     else run_threaded(b, index, name);
   }
-  free(list);
+  free(benches);
   close_db();
-  rocksdb_writeoptions_destroy(g_wo);
-  rocksdb_writeoptions_destroy(g_wo_sync);
-  rocksdb_readoptions_destroy(g_ro);
-  rocksdb_options_destroy(g_options);
-  rocksdb_block_based_options_destroy(g_table_options);
-  if (g_cache != NULL) rocksdb_cache_destroy(g_cache);
+  destroy_options();
   free(g_values);
   return 0;
 }
