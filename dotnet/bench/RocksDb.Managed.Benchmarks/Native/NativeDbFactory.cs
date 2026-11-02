@@ -48,12 +48,17 @@ public static class NativeDbFactory
             .SetCreateIfMissing(true)
             .SetCompression(RocksDbSharp.Compression.No)
             .SetWriteBufferSize((ulong)options.WriteBufferSize)
+            .SetTargetFileSizeBase((ulong)options.TargetFileSizeBase)
+            .SetMaxBytesForLevelBase((ulong)options.MaxBytesForLevelBase)
+            .SetLevel0FileNumCompactionTrigger(options.Level0FileNumCompactionTrigger)
+            .SetDisableAutoCompactions(options.DisableAutoCompactions ? 1 : 0)
             .SetBlockBasedTableFactory(table);
     }
 
     public static NativeDb Open(string path, EngineOptions options)
     {
         RocksDbSharp.DbOptions dbOptions = CreateOptions(options, out RocksDbSharp.Cache? cache, out RocksDbSharp.BloomFilterPolicy? bloom, out RocksDbSharp.BlockBasedTableOptions table);
+        RocksDbSharp.Native.Instance.rocksdb_options_set_max_background_jobs(dbOptions.Handle, options.MaxBackgroundJobs);
         var writeOptions = new RocksDbSharp.WriteOptions().SetSync(options.Sync).DisableWal(options.DisableWal ? 1 : 0);
         return new NativeDb
         {
@@ -98,6 +103,18 @@ public sealed class NativeKeyValueEngine : IKeyValueEngine
     public void Delete(ReadOnlySpan<byte> key) => _db.Db.Remove(key, null, _db.WriteOptions);
 
     public void Flush() => _db.Db.Flush(_flushOptions);
+
+    public void WaitForCompaction()
+    {
+        // rocksdb_wait_for_compact is not exposed by rocksdb-sharp: poll the background work properties.
+        while (_db.Db.GetProperty("rocksdb.compaction-pending") != "0" || _db.Db.GetProperty("rocksdb.num-running-compactions") != "0"
+               || _db.Db.GetProperty("rocksdb.num-running-flushes") != "0" || _db.Db.GetProperty("rocksdb.mem-table-flush-pending") != "0")
+        {
+            Thread.Sleep(10);
+        }
+    }
+
+    public string? GetProperty(string name) => _db.Db.GetProperty(name);
 
     public void Dispose() => _db.Dispose();
 

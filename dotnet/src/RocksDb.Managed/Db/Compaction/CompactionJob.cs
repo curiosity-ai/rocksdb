@@ -43,6 +43,7 @@ internal sealed class CompactionJob
     private readonly Func<ulong> _newFileNumber;
     private readonly CancellationToken _cancellation;
     private readonly InternalKeyComparator _icmp;
+    private readonly NoFillTableCache _noFillCache;
 
     // Range tombstones to write (fragmented over all inputs, truncated to input file boundaries at user-key level).
     private FragmentedRangeTombstoneList? _outputTombstones;
@@ -77,6 +78,24 @@ internal sealed class CompactionJob
         _cancellation = cancellation;
         _icmp = cfd.Icmp;
         _rangeDelLevelPtrs = new int[compaction.NumberLevels];
+        _noFillCache = new NoFillTableCache(cfd.TableCache);
+    }
+
+    /// <summary>
+    /// Table cache view whose iterators don't insert data blocks into the block cache (compaction input reads use
+    /// fill_cache = false, like CompactionJob's ReadOptions): avoids polluting the cache and lets the iterator reuse
+    /// its block buffers.
+    /// </summary>
+    private sealed class NoFillTableCache(TableCache inner) : ITableCache
+    {
+        public ValueTask<TableReaderLease> GetReaderAsync(FileMetaData file, CancellationToken cancellationToken = default) =>
+            inner.GetReaderAsync(file, cancellationToken);
+
+        public TableReaderLease GetReader(FileMetaData file) => inner.GetReader(file);
+
+        public InternalIterator NewIterator(FileMetaData file) => new TableInternalIterator(inner.GetReader(file), TableReadFlags.DontFillCache);
+
+        public void Evict(ulong fileNumber) => inner.Evict(fileNumber);
     }
 
     public List<FileMetaData> Outputs { get; } = new();
@@ -101,11 +120,11 @@ internal sealed class CompactionJob
                 if (input.IsEmpty) continue;
                 if (input.Level == 0)
                 {
-                    foreach (FileMetaData f in input.Files) children.Add(tc.NewIterator(f));
+                    foreach (FileMetaData f in input.Files) children.Add(_noFillCache.NewIterator(f));
                 }
                 else
                 {
-                    children.Add(new LevelIterator(tc, _icmp, input.Files, null));
+                    children.Add(new LevelIterator(_noFillCache, _icmp, input.Files, null));
                 }
                 foreach (FileMetaData f in input.Files)
                 {
