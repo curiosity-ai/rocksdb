@@ -560,4 +560,109 @@ public sealed class CompactionFeatureTests
         Assert.AreEqual(1, files.Count);
         Assert.AreNotEqual(0, files[0].Level);
     }
+    // ---- bottom-priority pool and reduce_file_locking (db_universal_compaction_test.cc ConcurrentBottomPriLowPri...) ---
+
+    private static int CountBeingCompacted(RocksDatabase db, int level)
+    {
+        lock (db.DefaultColumnFamily.Db.MutexForTests)
+        {
+            int n = 0;
+            foreach (FileMetaData f in db.DefaultColumnFamily.Data.Current.Storage.LevelFiles(level)) n += f.BeingCompacted ? 1 : 0;
+            return n;
+        }
+    }
+
+    /// <summary>
+    /// A full universal compaction (to the last level) is forwarded to the bottom-priority pool. While it waits for the
+    /// bottom thread, reduce_file_locking = true reserves only the oldest L0 file (the intended compaction of
+    /// CreateIntendedCompactionForwardedToBottomPriorityPool) and the bottom thread repicks; with false every input
+    /// file stays reserved. Both end with one sorted run in the last level.
+    /// </summary>
+    [TestMethod]
+    public void BottomPriorityPoolReservesFilesPerReduceFileLocking()
+    {
+        foreach (bool reduceFileLocking in new[] { true, false })
+        {
+            using var entered = new ManualResetEventSlim(false);
+            using var gate = new ManualResetEventSlim(false);
+            TestHooks.Set("DBImpl::BGWorkBottomCompaction", () =>
+            {
+                entered.Set();
+                gate.Wait(TimeSpan.FromSeconds(30));
+            });
+            try
+            {
+                MemoryFileSystem fs = NewFs();
+                DbOptions options = NewOptions(fs);
+                options.BottomPriorityBackgroundThreads = 1;
+                var cf = new ColumnFamilyOptions
+                {
+                    CompactionStyle = CompactionStyle.Universal,
+                    NumLevels = 3,
+                    Level0FileNumCompactionTrigger = 3,
+                    Compression = RocksDb.Managed.Compression.CompressionType.None,
+                };
+                cf.CompactionOptionsUniversal.ReduceFileLocking = reduceFileLocking;
+                using RocksDatabase db = RocksDatabase.Open(DbPath, options, cf);
+                for (int f = 0; f < 3; f++)
+                {
+                    for (int i = 0; i < 100; i++) db.Put(Key(i), Value(i, f));
+                    db.Flush();
+                }
+                Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(20)), "forwarded to the bottom-priority pool");
+                Assert.AreEqual(3, FilesAt(db, 0).Count);
+                Assert.AreEqual(reduceFileLocking ? 1 : 3, CountBeingCompacted(db, 0), "reduce_file_locking=" + reduceFileLocking);
+                gate.Set();
+                db.WaitForCompact();
+                Assert.AreEqual(0, FilesAt(db, 0).Count);
+                Assert.AreNotEqual(0, FilesAt(db, 2).Count);
+                Assert.AreEqual(0, CountBeingCompacted(db, 2));
+                for (int i = 0; i < 100; i++) Assert.AreEqual(S(Value(i, 2)), GetString(db, S(Key(i))!));
+            }
+            finally
+            {
+                gate.Set();
+                TestHooks.Set("DBImpl::BGWorkBottomCompaction", null);
+            }
+        }
+    }
+
+    [TestMethod]
+    public void UniversalRequireMaxOutputLevelPicksOnlyLastLevelCompactions()
+    {
+        // MeetsOutputLevelRequirements: the bottom-priority repick ignores compactions that do not output to the
+        // non-zero max output level.
+        var o = new ColumnFamilyOptions { CompactionStyle = CompactionStyle.Universal, NumLevels = 3, Level0FileNumCompactionTrigger = 2 };
+        o.CompactionOptionsUniversal.MaxSizeAmplificationPercent = 1000000;
+        var picker = new UniversalCompactionPicker(o, InternalKeyComparator.Bytewise);
+        static FileMetaData F(ulong n, ulong epoch, ulong seq) => new()
+        {
+            FileNumber = n,
+            FileSize = 1000,
+            Smallest = MakeIKey("a", seq),
+            Largest = MakeIKey("z", seq),
+            SmallestSeqno = seq,
+            LargestSeqno = seq,
+            EpochNumber = epoch,
+        };
+        // Two small L0 runs above a large last level: size ratio picks the two L0 files into L0... L1 (not the last).
+        FileMetaData big = F(1, 0, 1);
+        big.FileSize = 1000000;
+        FileMetaData[][] files = [[F(3, 3, 30), F(2, 2, 20)], [], [big]];
+        var vs = new VersionStorageInfo(InternalKeyComparator.Bytewise, 3, o, files);
+        Compaction? c = picker.PickCompaction(vs, [], requireMaxOutputLevel: false);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(1, c.OutputLevel);
+        picker.ReleaseCompactionFiles(c, succeeded: false);
+        vs.ComputeCompactionScore();
+        Assert.IsNull(picker.PickCompaction(vs, [], requireMaxOutputLevel: true));
+    }
+
+    private static byte[] MakeIKey(string user, ulong seq)
+    {
+        byte[] u = B(user);
+        var k = new byte[u.Length + 8];
+        DbFormat.AppendInternalKey(k, u, seq, EntryType.Value);
+        return k;
+    }
 }

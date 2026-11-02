@@ -221,6 +221,17 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     /// <summary>DBImpl's batch_per_txn (not persisted): false for WriteUnprepared (a transaction writes several batches).</summary>
     internal bool BatchPerTxn { get; set; } = true;
 
+    /// <summary>
+    /// Threads of the bottom-priority compaction pool (upstream <c>Env::SetBackgroundThreads(n, Env::Priority::BOTTOM)</c>;
+    /// per DB here, not persisted). Default 0: no bottom pool. With a bottom pool, automatic compactions that output to
+    /// the last (non-zero) level are forwarded to it, so compactions that relieve write stalls keep the regular
+    /// threads. With <see cref="CompactionOptionsUniversal.ReduceFileLocking"/> (default true) only the newest input
+    /// sorted run (the newest L0 file, or the input level's run) stays reserved while the compaction waits for a bottom
+    /// thread, which then picks a fresh compaction to the last level; otherwise the whole compaction waits with all
+    /// its input files reserved.
+    /// </summary>
+    public int BottomPriorityBackgroundThreads { get; set; }
+
     public DbOptions Clone()
     {
         var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir, FileSystem = FileSystem, Statistics = Statistics, InfoLog = InfoLog };
@@ -229,6 +240,7 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
         c.CopyFrom(this);
         c.SeqPerBatch = SeqPerBatch;
         c.BatchPerTxn = BatchPerTxn;
+        c.BottomPriorityBackgroundThreads = BottomPriorityBackgroundThreads;
         return c;
     }
 }

@@ -132,6 +132,9 @@ internal sealed class Compaction
     /// </summary>
     public byte[]? OutputSplitKey { get; set; }
 
+    /// <summary>Compaction::OutputToNonZeroMaxOutputLevel.</summary>
+    public static bool OutputToNonZeroMaxOutputLevel(int outputLevel, int maxOutputLevel) => outputLevel > 0 && outputLevel == maxOutputLevel;
+
     /// <summary>Port of Compaction::CreateSstPartitioner: the column family's partitioner for this compaction, or null.</summary>
     public SstPartitioner? CreateSstPartitioner() =>
         Options.SstPartitionerFactory?.CreatePartitioner(new SstPartitionerContext(IsFullCompaction, IsManual, OutputLevel, _smallestUserKey,

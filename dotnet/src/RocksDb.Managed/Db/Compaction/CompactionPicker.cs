@@ -37,6 +37,13 @@ internal abstract class CompactionPicker
     /// <summary>Picks an automatic compaction, or null. <paramref name="snapshots"/> are the live snapshots (ascending).</summary>
     public abstract Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots);
 
+    /// <summary>
+    /// CompactionPicker::PickCompaction with require_max_output_level (a bottom-priority thread repicking a forwarded
+    /// compaction): only the universal picker honours it, like upstream.
+    /// </summary>
+    public virtual Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots, bool requireMaxOutputLevel) =>
+        PickCompaction(vstorage, snapshots);
+
     // ---------------------------------------------------------------------------------------------------------
     // registry
 

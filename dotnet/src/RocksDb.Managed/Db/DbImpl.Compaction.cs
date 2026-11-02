@@ -21,6 +21,10 @@ internal sealed partial class DbImpl
     private readonly HashSet<ColumnFamilyData> _stallTokenHolders = new();   // guarded by mutex
     private WriteController? _writeControllerField;
     private int _bgCompactionScheduled;   // automatic compactions running (guarded by mutex)
+    // bg_bottom_compaction_scheduled_: compactions forwarded to the bottom-priority pool, queued or running (mutex).
+    private int _bgBottomCompactionScheduled;
+    private int _bgBottomCompactionRunning;  // bottom-priority threads busy (mutex)
+    private readonly Queue<BottomPriorityCompaction> _bottomPriorityQueue = new(); // mutex
     private int _manualCompactionsRunning; // guarded by mutex
     private int _exclusiveManualCompactions; // guarded by mutex
     private int _ingestionsRunning;       // guarded by mutex (num_running_ingest_file_)
@@ -45,7 +49,7 @@ internal sealed partial class DbImpl
     {
         get
         {
-            lock (_mutex) return _bgCompactionScheduled + _manualCompactionsRunning;
+            lock (_mutex) return _bgCompactionScheduled + _bgBottomCompactionScheduled + _manualCompactionsRunning;
         }
     }
 
@@ -353,13 +357,19 @@ internal sealed partial class DbImpl
             ulong[] snapshots = SnapshotsForCompaction();
             Compaction? c = cfd.CompactionState.Picker.PickCompaction(cfd.Current.Storage, snapshots);
             if (c is null) continue;
+            if (ShouldForwardToBottomPriorityPool(cfd, c))
+            {
+                ForwardToBottomPriorityPool(cfd, c, snapshots);
+                SchedulePendingCompaction(cfd);
+                continue;
+            }
             c.InputVersion = cfd.Current;
             cfd.Current.Ref();
             _bgCompactionScheduled++;
             _backgroundJobs++;
             // There may be more work for this column family (another level, another key range).
             SchedulePendingCompaction(cfd);
-            var job = new CompactionRun(this, cfd, c, snapshots, isManual: false);
+            var job = new CompactionRun(this, cfd, c, snapshots, CompactionThread.Low);
             _ = Task.Factory.StartNew(static s => ((CompactionRun)s!).RunBackground(), job, CancellationToken.None,
                 TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
         }
@@ -430,6 +440,184 @@ internal sealed partial class DbImpl
         return list.ToArray();
     }
 
+    /// <summary>The thread (pool) a compaction runs on: its accounting and error handling differ.</summary>
+    private enum CompactionThread : byte
+    {
+        /// <summary>Automatic compaction on the regular (Env::Priority::LOW) pool.</summary>
+        Low,
+        /// <summary>Automatic compaction on the bottom-priority pool (Env::Priority::BOTTOM).</summary>
+        Bottom,
+        /// <summary>Manual compaction (CompactRange / CompactFiles) on the caller's thread.</summary>
+        Manual,
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // bottom-priority pool (DBImpl::BackgroundCompaction forwarding, reduce_file_locking)
+
+    /// <summary>A compaction forwarded to the bottom-priority pool (CompactionArg with a PrepickedCompaction).</summary>
+    private sealed class BottomPriorityCompaction(ColumnFamilyData cfd, Compaction compaction, ulong[] snapshots, bool needRepick)
+    {
+        public ColumnFamilyData Cfd { get; } = cfd;
+        /// <summary>The compaction to run, or with <see cref="NeedRepick"/> the intended compaction holding its files.</summary>
+        public Compaction Compaction { get; } = compaction;
+        public ulong[] Snapshots { get; } = snapshots;
+        public bool NeedRepick { get; } = needRepick;
+    }
+
+    /// <summary>
+    /// The forwarding condition of DBImpl::BackgroundCompaction: an automatic compaction that is neither a FIFO deletion
+    /// nor a trivial move and outputs to the non-zero max output level goes to the bottom-priority pool when it has
+    /// threads. REQUIRES: mutex.
+    /// </summary>
+    private bool ShouldForwardToBottomPriorityPool(ColumnFamilyData cfd, Compaction c) =>
+        Options.BottomPriorityBackgroundThreads > 0 && !c.IsDeletionCompaction && !c.IsTrivialMove()
+        && Compaction.OutputToNonZeroMaxOutputLevel(c.OutputLevel,
+            cfd.Current.Storage.MaxOutputLevel(cfd.Options.CfAllowIngestBehind || Options.AllowIngestBehind));
+
+    /// <summary>
+    /// Forwards <paramref name="c"/> to the bottom-priority pool (DBImpl::BackgroundCompaction). If
+    /// compaction_options_universal.reduce_file_locking is true, only a limited set of input files is locked by an
+    /// intended compaction, and the files are repicked when a bottom-priority thread gets to execute it. REQUIRES: mutex.
+    /// </summary>
+    private void ForwardToBottomPriorityPool(ColumnFamilyData cfd, Compaction c, ulong[] snapshots)
+    {
+        TestHooks.Invoke("DBImpl::BackgroundCompaction:ForwardToBottomPriPool");
+        bool needRepick = cfd.Options.CompactionOptionsUniversal.ReduceFileLocking;
+        Compaction forwarded;
+        if (needRepick)
+        {
+            forwarded = CreateIntendedCompactionForwardedToBottomPriorityPool(cfd, c);
+        }
+        else
+        {
+            forwarded = c;
+            c.InputVersion = cfd.Current;
+            cfd.Current.Ref();
+        }
+        _bottomPriorityQueue.Enqueue(new BottomPriorityCompaction(cfd, forwarded, snapshots, needRepick));
+        _bgBottomCompactionScheduled++;
+        _backgroundJobs++;
+        MaybeStartBottomPriorityCompactions();
+    }
+
+    /// <summary>
+    /// Port of DBImpl::CreateIntendedCompactionForwardedToBottomPriorityPool: releases <paramref name="c"/> and registers
+    /// a compaction of only its last input level's files (the oldest of them when that level is L0, else the whole
+    /// sorted run), which keeps those files reserved for the bottom thread. REQUIRES: mutex.
+    /// </summary>
+    private static Compaction CreateIntendedCompactionForwardedToBottomPriorityPool(ColumnFamilyData cfd, Compaction c)
+    {
+        VersionStorageInfo vstorage = c.InputStorage;
+        CompactionInputFiles? maxInputLevelFiles = null;
+        for (int i = c.NumInputLevels; i >= 1; --i)
+        {
+            if (c.Inputs(i - 1).Count > 0)
+            {
+                maxInputLevelFiles = c.Inputs(i - 1);
+                break;
+            }
+        }
+        var inputs = new CompactionInputFiles(maxInputLevelFiles!.Level);
+        // The last input file (L0) or the last input sorted run.
+        if (inputs.Level == 0) inputs.Files.Add(maxInputLevelFiles.Files[^1]);
+        else inputs.Files.AddRange(maxInputLevelFiles.Files);
+        CompactionPicker picker = cfd.CompactionState.Picker;
+        picker.ReleaseCompactionFiles(c, succeeded: true);
+        var intended = new Compaction(vstorage, c.Options, [inputs], c.OutputLevel, c.TargetOutputFileSize, c.MaxCompactionBytes, c.OutputPathId,
+            c.OutputCompression, c.Grandparents, c.Reason, c.Score, l0FilesMightOverlap: true, isManual: false);
+        picker.RegisterCompaction(intended);
+        vstorage.ComputeCompactionScore();
+        return intended;
+    }
+
+    /// <summary>Starts queued bottom-priority compactions while the pool has idle threads. REQUIRES: mutex.</summary>
+    private void MaybeStartBottomPriorityCompactions()
+    {
+        while (_bgBottomCompactionRunning < Options.BottomPriorityBackgroundThreads && _bottomPriorityQueue.TryDequeue(out BottomPriorityCompaction? task))
+        {
+            _bgBottomCompactionRunning++;
+            _ = Task.Factory.StartNew(static s => ((BottomPriorityRun)s!).Run(), new BottomPriorityRun(this, task), CancellationToken.None,
+                TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
+        }
+    }
+
+    private sealed class BottomPriorityRun(DbImpl db, BottomPriorityCompaction task)
+    {
+        public void Run()
+        {
+            try
+            {
+                db.RunBottomPriorityCompaction(task);
+            }
+            catch (Exception)
+            {
+                // Recorded as background error (or ignored for shutdown / dropped column families) by RunCompaction.
+            }
+        }
+    }
+
+    /// <summary>
+    /// A bottom-priority thread executing a forwarded compaction (BackgroundCallCompaction with a prepicked compaction):
+    /// with need_repick the intended compaction is released (ResetBottomPriCompactionIntent) and a compaction to the
+    /// max output level is picked afresh (require_max_output_level).
+    /// </summary>
+    private void RunBottomPriorityCompaction(BottomPriorityCompaction task)
+    {
+        TestHooks.Invoke("DBImpl::BGWorkBottomCompaction");
+        ColumnFamilyData cfd = task.Cfd;
+        Compaction? c = task.Compaction;
+        ulong[] snapshots = task.Snapshots;
+        lock (_mutex)
+        {
+            if (task.NeedRepick)
+            {
+                // ResetBottomPriCompactionIntent
+                CompactionPicker picker = cfd.CompactionState.Picker;
+                picker.ReleaseCompactionFiles(c, succeeded: true);
+                c = null;
+                if (!cfd.Dropped && cfd.Current is not null)
+                {
+                    cfd.Current.Storage.ComputeCompactionScore();
+                    if (!cfd.Options.DisableAutoCompactions && !_shuttingDown && !IsBgWorkStopped && !_bgCancellation.IsCancellationRequested
+                        && _exclusiveManualCompactions == 0)
+                    {
+                        TestHooks.Invoke("DBImpl::BackgroundCompaction():BeforePickCompaction");
+                        snapshots = SnapshotsForCompaction();
+                        c = picker.PickCompaction(cfd.Current.Storage, snapshots, requireMaxOutputLevel: true);
+                        if (c is not null)
+                        {
+                            c.InputVersion = cfd.Current;
+                            cfd.Current.Ref();
+                        }
+                    }
+                }
+                TestHooks.Invoke("DBImpl::BackgroundCompaction():AfterPickCompactionBottomPri");
+                if (c is null)
+                {
+                    FinishBottomPriorityCompaction(cfd);
+                    return;
+                }
+            }
+        }
+        RunCompaction(cfd, c, snapshots, CompactionThread.Bottom);
+    }
+
+    /// <summary>Accounts a finished bottom-priority job and schedules more work. REQUIRES: mutex.</summary>
+    private void FinishBottomPriorityCompaction(ColumnFamilyData cfd)
+    {
+        _bgBottomCompactionScheduled--;
+        _bgBottomCompactionRunning--;
+        _backgroundJobs--;
+        if (!cfd.Dropped && cfd.Current is not null)
+        {
+            RecalculateWriteStall(cfd);
+            SchedulePendingCompaction(cfd);
+        }
+        MaybeStartBottomPriorityCompactions();
+        MaybeScheduleCompaction();
+        SignalBackgroundWork();
+    }
+
     /// <summary>One compaction execution (BackgroundCompaction after picking).</summary>
     private sealed class CompactionRun
     {
@@ -437,22 +625,22 @@ internal sealed partial class DbImpl
         private readonly ColumnFamilyData _cfd;
         private readonly Compaction _c;
         private readonly ulong[] _snapshots;
-        private readonly bool _isManual;
+        private readonly CompactionThread _thread;
 
-        public CompactionRun(DbImpl db, ColumnFamilyData cfd, Compaction c, ulong[] snapshots, bool isManual)
+        public CompactionRun(DbImpl db, ColumnFamilyData cfd, Compaction c, ulong[] snapshots, CompactionThread thread)
         {
             _db = db;
             _cfd = cfd;
             _c = c;
             _snapshots = snapshots;
-            _isManual = isManual;
+            _thread = thread;
         }
 
         public void RunBackground()
         {
             try
             {
-                _db.RunCompaction(_cfd, _c, _snapshots, _isManual);
+                _db.RunCompaction(_cfd, _c, _snapshots, _thread);
             }
             catch (Exception)
             {
@@ -466,8 +654,9 @@ internal sealed partial class DbImpl
     /// <see cref="CompactionJob"/>; installs the result and releases the inputs. Errors other than shutdown / dropped
     /// column family become the background error. Rethrows the failure for manual callers.
     /// </summary>
-    private void RunCompaction(ColumnFamilyData cfd, Compaction c, ulong[] snapshots, bool isManual)
+    private void RunCompaction(ColumnFamilyData cfd, Compaction c, ulong[] snapshots, CompactionThread thread)
     {
+        bool isManual = thread == CompactionThread.Manual;
         bool ok = false;
         CompactionJob? job = null;
         Exception? failure = null;
@@ -620,12 +809,20 @@ internal sealed partial class DbImpl
             }
             lock (_mutex)
             {
-                if (isManual) _manualCompactionsRunning--;
-                else _bgCompactionScheduled--;
-                _backgroundJobs--;
-                if (!cfd.Dropped) SchedulePendingCompaction(cfd);
-                MaybeScheduleCompaction();
-                SignalBackgroundWork();
+                if (thread == CompactionThread.Bottom)
+                {
+                    FinishBottomPriorityCompaction(cfd);
+                }
+                else
+                {
+                    if (isManual) _manualCompactionsRunning--;
+                    else _bgCompactionScheduled--;
+                    _backgroundJobs--;
+                    if (!cfd.Dropped) SchedulePendingCompaction(cfd);
+                    MaybeStartBottomPriorityCompactions();
+                    MaybeScheduleCompaction();
+                    SignalBackgroundWork();
+                }
             }
         }
         if (failure is not null && isManual)
@@ -850,7 +1047,7 @@ internal sealed partial class DbImpl
                 Task wait;
                 lock (_mutex)
                 {
-                    if (_bgCompactionScheduled == 0) return;
+                    if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0) return;
                     wait = _bgSignal.Task;
                 }
                 if (synchronous) wait.Wait(cancellationToken);
@@ -937,7 +1134,7 @@ internal sealed partial class DbImpl
             if (outputLevel == CompactionPicker.CompactToBaseLevel) baseLevel = c.OutputLevel;
             if (synchronous)
             {
-                RunCompaction(cfd, c, snapshots, isManual: true);
+                RunCompaction(cfd, c, snapshots, CompactionThread.Manual);
             }
             else
             {
@@ -952,7 +1149,7 @@ internal sealed partial class DbImpl
 
     private sealed class ManualRun(DbImpl db, ColumnFamilyData cfd, Compaction c, ulong[] snapshots)
     {
-        public void Run() => db.RunCompaction(cfd, c, snapshots, isManual: true);
+        public void Run() => db.RunCompaction(cfd, c, snapshots, CompactionThread.Manual);
     }
 
     /// <summary>Port of DBImpl::FindMinimumEmptyLevelFitting. REQUIRES: mutex.</summary>
@@ -987,7 +1184,7 @@ internal sealed partial class DbImpl
                 Task wait;
                 lock (_mutex)
                 {
-                    if (_bgCompactionScheduled == 0 && _manualCompactionsRunning == 0) break;
+                    if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0) break;
                     wait = _bgSignal.Task;
                 }
                 if (synchronous) wait.Wait(cancellationToken);
@@ -1046,9 +1243,9 @@ internal sealed partial class DbImpl
                         if (!cfd.Options.DisableAutoCompactions && cfd.CompactionState.Picker.NeedsCompaction(cfd.Current.Storage)) pending = true;
                     }
                 }
-                if (_bgCompactionScheduled == 0 && _manualCompactionsRunning == 0 && _runningFlushes == 0 && _flushQueue.Count == 0 && !pending) return;
+                if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0 && _runningFlushes == 0 && _flushQueue.Count == 0 && !pending) return;
                 if (pending) MaybeScheduleCompaction();
-                if (_bgCompactionScheduled == 0 && _manualCompactionsRunning == 0 && _runningFlushes == 0 && _flushQueue.Count == 0)
+                if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0 && _runningFlushes == 0 && _flushQueue.Count == 0)
                 {
                     // Pending work that cannot be scheduled (e.g. picker found nothing to do).
                     return;
