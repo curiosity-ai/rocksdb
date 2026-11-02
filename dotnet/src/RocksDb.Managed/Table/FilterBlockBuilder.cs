@@ -129,7 +129,7 @@ internal sealed class PartitionedFilterBlockBuilder : FilterBlockBuilder
 
     public PartitionedFilterBlockBuilder(SliceTransform? prefixExtractor, bool wholeKeyFiltering, IFilterBitsBuilder bits, int indexBlockRestartInterval,
         bool useValueDeltaEncoding, int formatVersion, PartitionedIndexBuilder partitionedIndexBuilder, uint partitionSize,
-        bool decoupleFromIndexPartitions, bool useCommonPrefix)
+        bool decoupleFromIndexPartitions, bool useCommonPrefix, int stripTimestampSize)
     {
         _prefixExtractor = prefixExtractor;
         _wholeKeyFiltering = wholeKeyFiltering;
@@ -138,10 +138,11 @@ internal sealed class PartitionedFilterBlockBuilder : FilterBlockBuilder
         _decoupleFromIndexPartitions = decoupleFromIndexPartitions;
         _useValueDeltaEncoding = useValueDeltaEncoding;
         _valueDeltaEscape = BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(formatVersion);
+        // persist_user_defined_timestamps = false: the partition index keys are stored without timestamps.
         _indexOnFilterBlockBuilder = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch, 0.75,
-            useCommonPrefix, isUserKey: false);
+            useCommonPrefix, isUserKey: false, stripTimestampSize);
         _indexOnFilterBlockBuilderWithoutSeq = new BlockBuilder(indexBlockRestartInterval, true, useValueDeltaEncoding, DataBlockIndexType.BinarySearch,
-            0.75, useCommonPrefix, isUserKey: true);
+            0.75, useCommonPrefix, isUserKey: true, stripTimestampSize);
 
         // Compute keys_per_partition_
         _keysPerPartition = (uint)_bits.ApproximateNumEntries(partitionSize);

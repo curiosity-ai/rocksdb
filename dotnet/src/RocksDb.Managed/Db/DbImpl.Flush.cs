@@ -58,6 +58,11 @@ internal sealed partial class DbImpl
         ulong epoch;
         lock (_mutex)
         {
+            if (ShouldRescheduleFlushToRetainUdt(cfd))
+            {
+                RescheduleFlushToRetainUdt(cfd);
+                return;
+            }
             foreach (ImmutableMemTable m in cfd.Imm)
             {
                 if (m.FlushInProgress || m.FlushCompleted) continue;
@@ -124,7 +129,8 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>Builds the L0 file for <paramref name="picked"/> and installs the result (FlushJob::Run + install).</summary>
-    private async ValueTask FlushMemTablesAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch, bool synchronous)
+    private async ValueTask FlushMemTablesAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch,
+        bool synchronous)
     {
         TestHooks.Invoke("DBImpl::FlushMemTables:Start");
         long flushStart = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -138,7 +144,8 @@ internal sealed partial class DbImpl
         using Blob.BlobFileBuilder? blobBuilder = CreateBlobFileBuilder(cfd, outputLevel: 0, Blob.BlobFileCreationReason.Flush);
         try
         {
-            await FlushAndInstallAsync(cfd, picked, fileNumber, epoch, synchronous, jobId, flushStart, mems, path, blobBuilder, reason).ConfigureAwait(false);
+            await FlushAndInstallAsync(cfd, picked, fileNumber, epoch, synchronous, jobId, flushStart, mems, path, blobBuilder, reason)
+                .ConfigureAwait(false);
         }
         finally
         {
@@ -146,8 +153,9 @@ internal sealed partial class DbImpl
         }
     }
 
-    private async ValueTask FlushAndInstallAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch, bool synchronous,
-        int jobId, long flushStart, List<MemTable> mems, string path, Blob.BlobFileBuilder? blobBuilder, FlushReason reason)
+    private async ValueTask FlushAndInstallAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch,
+        bool synchronous, int jobId, long flushStart, List<MemTable> mems, string path, Blob.BlobFileBuilder? blobBuilder,
+        FlushReason reason)
     {
         ulong[] snapshots;
         lock (_mutex) snapshots = SnapshotsForCompaction();
@@ -174,6 +182,9 @@ internal sealed partial class DbImpl
             edit.AddFile(0, meta);
             if (blobBuilder is not null) edit.BlobFileAdditions.AddRange(blobBuilder.Additions);
         }
+        // FlushJob::MaybeIncreaseFullHistoryTsLowToAboveCutoffUDT (written in the flush's own edit instead of a separate
+        // MANIFEST record before it; recovery applies both the same way).
+        if (GetFullHistoryTsLowAboveCutoffUdt(cfd, mems) is { } newTsLow) edit.FullHistoryTsLow = newTsLow;
         lock (_mutex)
         {
             if (cfd.Dropped) ThrowDropped(cfd);
@@ -234,6 +245,8 @@ internal sealed partial class DbImpl
             lock (_mutex)
             {
                 if (cfd.Imm.Count > 0) target = cfd.Imm[^1];
+                // DBImpl::FlushMemTable: a manual flush is never postponed to retain user-defined timestamps.
+                if (cfd.TimestampsInMemtableOnly && cfd.HasPendingFlush) cfd.FlushSkipReschedule = true;
                 EnqueueFlush(cfd);
                 MaybeScheduleFlush();
             }
@@ -259,6 +272,91 @@ internal sealed partial class DbImpl
             if (synchronous) signal.Wait(cancellationToken);
             else await signal.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    // ---- user-defined timestamps in memtable only (persist_user_defined_timestamps = false) ----------------
+
+    /// <summary>
+    /// Port of DBImpl::ShouldRescheduleFlushRequestToRetainUDT: an automatic flush of a column family with timestamps
+    /// in memtable only is postponed while a memtable to flush holds timestamps not below full_history_ts_low, unless
+    /// postponing would stall writes (the memtable criteria of GetWriteStallConditionAndCause) or a manual flush asked
+    /// for it. REQUIRES: mutex.
+    /// </summary>
+    private bool ShouldRescheduleFlushToRetainUdt(ColumnFamilyData cfd)
+    {
+        if (!cfd.TimestampsInMemtableOnly) return false;
+        if (cfd.FlushSkipReschedule)
+        {
+            cfd.FlushSkipReschedule = false;
+            return false;
+        }
+        if (cfd.Dropped) return false;
+        var mems = new List<MemTable>();
+        foreach (ImmutableMemTable m in cfd.Imm)
+        {
+            if (!m.FlushInProgress && !m.FlushCompleted) mems.Add(m.Mem);
+        }
+        if (!cfd.ShouldPostponeFlushToRetainUdt(mems)) return false;
+        int unflushed = (cfd.Mem.IsEmpty ? 0 : 1) + cfd.NumNotFlushed;
+        ColumnFamilyOptions o = cfd.Options;
+        bool stall = unflushed >= o.MaxWriteBufferNumber
+            || (o.MaxWriteBufferNumber > 3 && unflushed >= o.MaxWriteBufferNumber - 1 && unflushed - 1 >= o.MinWriteBufferNumberToMerge);
+        return !stall;
+    }
+
+    /// <summary>
+    /// Re-queues a postponed flush after 100 ms (BGWorkFlush: "prevent hot loop"). The flush runs once
+    /// full_history_ts_low has passed the memtables' newest timestamps. REQUIRES: mutex.
+    /// </summary>
+    private void RescheduleFlushToRetainUdt(ColumnFamilyData cfd)
+    {
+        // Release the flush slot now; the delayed retry stays a background job (shutdown waits for it).
+        cfd.FlushRunning = false;
+        _runningFlushes--;
+        _ = RetryAsync(cfd);
+
+        async Task RetryAsync(ColumnFamilyData c)
+        {
+            try
+            {
+                TestHooks.Invoke("DBImpl::AfterRetainUDTReschedule:cb");
+                await Task.Delay(100).ConfigureAwait(false);
+            }
+            finally
+            {
+                lock (_mutex)
+                {
+                    _backgroundJobs--;
+                    EnqueueFlush(c);
+                    MaybeScheduleFlush();
+                    SignalBackgroundWork();
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// FlushJob::GetEffectiveCutoffUDTForPickedMemTables + MaybeIncreaseFullHistoryTsLowToAboveCutoffUDT: the newest
+    /// timestamp of the flushed memtables plus one (GetFullHistoryTsLowFromU64CutoffTs) when that raises the column
+    /// family's full_history_ts_low, else null.
+    /// </summary>
+    private static byte[]? GetFullHistoryTsLowAboveCutoffUdt(ColumnFamilyData cfd, List<MemTable> mems)
+    {
+        if (!cfd.TimestampsInMemtableOnly) return null;
+        Comparator ucmp = cfd.UserComparator;
+        byte[]? cutoff = null;
+        foreach (MemTable m in mems)
+        {
+            byte[]? newest = m.GetNewestUdt();
+            if (newest is null) continue;
+            if (cutoff is null || ucmp.CompareTimestamp(newest, cutoff) > 0) cutoff = newest;
+        }
+        if (cutoff is null || cutoff.Length != sizeof(ulong)) return null;
+        byte[]? low = cfd.FullHistoryTsLow;
+        if (low is not null && ucmp.CompareTimestamp(cutoff, low) < 0) return null;
+        byte[] next = new byte[sizeof(ulong)];
+        Util.Coding.EncodeFixed64(next, Util.Coding.DecodeFixed64(cutoff) + 1);
+        return next;
     }
 
     /// <summary>Waits until no background job is running (used at shutdown).</summary>

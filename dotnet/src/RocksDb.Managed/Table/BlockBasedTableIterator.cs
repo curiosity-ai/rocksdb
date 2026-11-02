@@ -315,7 +315,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     {
         _block = b;
         _blockHandle = h;
-        _data.InitializeData(b.Block!, _reader.InternalComparator, _reader.GlobalSequenceNumber);
+        _data.InitializeData(b.Block!, _reader.InternalComparator, _reader.GlobalSequenceNumber, _reader.PadTimestampSize);
     }
 
     private void ReleaseBlock()

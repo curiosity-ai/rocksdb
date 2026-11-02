@@ -79,11 +79,7 @@ internal sealed class ColumnFamilyData
         Comparator ucmp = TableFactory.ResolveComparator(options);
         Icmp = ucmp.Kind == ComparatorKind.Bytewise ? InternalKeyComparator.Bytewise : new InternalKeyComparator(ucmp);
         TimestampSize = ucmp.TimestampSize;
-        if (TimestampSize > 0 && !options.PersistUserDefinedTimestamps)
-        {
-            // Memtable-only user-defined timestamps (timestamps stripped at flush) are not ported.
-            ThrowHelper.NotSupported("persist_user_defined_timestamps = false is not supported yet");
-        }
+        if (TimestampSize > 0 && !options.PersistUserDefinedTimestamps) ValidateMemtableOnlyTimestamps(ucmp, db.Options);
         MergeOperator = options.MergeOperator;
         Format = TableFactory.CreateFormatOptions(options.TableOptions);
         ReaderOptions = TableFactory.CreateReaderOptions(options, Format, db.GetDefaultBlockCache(options.TableOptions), db.Identity.SessionId);
@@ -93,6 +89,7 @@ internal sealed class ColumnFamilyData
         {
             WriteBufferSize = (long)Math.Min(options.WriteBufferSize, (ulong)long.MaxValue),
             ArenaBlockSize = (int)Math.Min(options.ArenaBlockSize, int.MaxValue / 2),
+            TrackNewestTimestampSize = options.PersistUserDefinedTimestamps ? 0 : TimestampSize,
         };
         TableCache = new TableCache(db.FileSystem, db.DbPaths, ReaderOptions, db.Options.MaxOpenFiles);
         // Blob files live in cf_paths.front() (the first DB path); readers and the optional blob cache are per CF.
@@ -100,6 +97,55 @@ internal sealed class ColumnFamilyData
             db.Options.MaxOpenFiles);
         CompactionState = new ColumnFamilyCompactionState(options, Icmp);
         Stats = new InternalStats(NumLevels);
+    }
+
+    /// <summary>
+    /// The persist_user_defined_timestamps = false checks of ColumnFamilyData::ValidateOptions (db/column_family.cc):
+    /// incompatible with atomic_flush and allow_concurrent_memtable_write, and only u64 timestamps (".u64ts"
+    /// comparators) are supported. Messages are copied verbatim (including upstream's missing spaces).
+    /// </summary>
+    private static void ValidateMemtableOnlyTimestamps(Comparator ucmp, DbOptions dbOptions)
+    {
+        if (dbOptions.AtomicFlush)
+        {
+            ThrowHelper.NotSupported("Not persisting user-defined timestamps feature is not supportedin combination with atomic flush.");
+        }
+        if (dbOptions.AllowConcurrentMemtableWrite)
+        {
+            ThrowHelper.NotSupported("Not persisting user-defined timestamps feature is not supported in combination with concurrent memtable write.");
+        }
+        string name = ucmp.Name;
+        if (name.Length <= BlockBasedTableReader.UdtComparatorSuffix.Length || !name.EndsWith(BlockBasedTableReader.UdtComparatorSuffix, StringComparison.Ordinal))
+        {
+            ThrowHelper.NotSupported("Not persisting user-defined timestampsfeature only support user-defined timestamps formatted as uint64_t.");
+        }
+    }
+
+    /// <summary>persist_user_defined_timestamps = false with timestamps enabled (UDT in memtable only).</summary>
+    public bool TimestampsInMemtableOnly => TimestampSize > 0 && !Options.PersistUserDefinedTimestamps;
+
+    /// <summary>
+    /// Set by a manual flush so the next flush of this CF is not postponed to retain timestamps
+    /// (ColumnFamilyData::SetFlushSkipReschedule / GetAndClearFlushSkipReschedule). Guarded by the DB mutex.
+    /// </summary>
+    public bool FlushSkipReschedule { get; set; }
+
+    /// <summary>
+    /// Port of ColumnFamilyData::ShouldPostponeFlushToRetainUDT: with timestamps in memtable only and full_history_ts_low
+    /// set, a flush of <paramref name="picked"/> is postponed while one of them holds a timestamp &gt;= full_history_ts_low.
+    /// </summary>
+    public bool ShouldPostponeFlushToRetainUdt(IReadOnlyList<MemTable> picked)
+    {
+        if (!TimestampsInMemtableOnly) return false;
+        byte[]? low = FullHistoryTsLow;
+        if (low is null) return false;
+        foreach (MemTable m in picked)
+        {
+            byte[]? newest = m.GetNewestUdt();
+            if (newest is null) continue;
+            if (UserComparator.CompareTimestamp(newest, low) >= 0) return true;
+        }
+        return false;
     }
 
     /// <summary>Versions of this column family still referenced ("rocksdb.num-live-versions"). Guarded by the DB mutex.</summary>

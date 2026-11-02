@@ -20,6 +20,8 @@ internal sealed class IngestedFileInfo
     public ulong TailSize;
     public byte[] MinTimestamp = [];
     public byte[] MaxTimestamp = [];
+    /// <summary>user_defined_timestamps_persisted of the file (false: keys stored without timestamps, read padded).</summary>
+    public bool UserDefinedTimestampsPersisted = true;
     public ulong AssignedSeqno;
     public int PickedLevel;
     public bool Copied;
@@ -144,10 +146,30 @@ internal sealed class ExternalSstFileIngestionJob
         {
             ThrowHelper.InvalidArgument("External file version " + info.Version + " is not supported");
         }
-        if (props.ComparatorName.Length > 0 && props.ComparatorName != _cfd.UserComparator.Name)
+        // ValidateUserDefinedTimestampsOptions(cf comparator, file comparator, cf persist flag, file persist flag): a
+        // column family with timestamps in memtable only also takes files written without timestamps (they are then
+        // marked as not persisting timestamps and read with the minimum timestamp).
+        info.UserDefinedTimestampsPersisted = props.UserDefinedTimestampsPersisted != 0;
+        if (props.ComparatorName.Length > 0)
         {
-            ThrowHelper.InvalidArgument("External file comparator " + props.ComparatorName + " does not match column family comparator " +
-                                        _cfd.UserComparator.Name);
+            if (props.ComparatorName == _cfd.UserComparator.Name)
+            {
+                if (info.UserDefinedTimestampsPersisted != _cfd.Options.PersistUserDefinedTimestamps && _cfd.TimestampSize > 0)
+                {
+                    ThrowHelper.InvalidArgument("Cannot toggle the persist_user_defined_timestamps flag for a column family with user-defined " +
+                                                "timestamps feature enabled.");
+                }
+            }
+            else if (_cfd.TimestampsInMemtableOnly && BlockBasedTableReader.TimestampsStripped(props, _cfd.UserComparator))
+            {
+                info.UserDefinedTimestampsPersisted = false; // kEnableUDT: mark_sst_file_has_no_udt
+            }
+            else if (!(_cfd.TimestampSize == 0 && !info.UserDefinedTimestampsPersisted
+                       && props.ComparatorName == _cfd.UserComparator.Name + BlockBasedTableReader.UdtComparatorSuffix))
+            {
+                ThrowHelper.InvalidArgument("External file comparator " + props.ComparatorName + " does not match column family comparator " +
+                                            _cfd.UserComparator.Name);
+            }
         }
         info.NumEntries = props.NumEntries - props.NumRangeDeletions;
         if (uprops.TryGetValue(TablePropertiesNames.TimestampMin, out byte[]? tsMin)) info.MinTimestamp = tsMin;
@@ -187,10 +209,14 @@ internal sealed class ExternalSstFileIngestionJob
                 if (pk.Sequence != 0) ThrowHelper.Corruption("External file has a range deletion with non zero sequence number");
                 ReadOnlySpan<byte> start = rit.Key[..pk.UserKeyLength];
                 byte[] startKey = new InternalKey(start, 0, EntryType.RangeDeletion).Encoded.ToArray();
-                byte[] endKey = new InternalKey(rit.Value, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion).Encoded.ToArray();
-                // RangeTombstone::SerializeEndKey: with user-defined timestamps the end key carries the maximum timestamp.
+                // RangeTombstone::SerializeEndKey: with user-defined timestamps the end key carries the maximum timestamp
+                // (files without persisted timestamps store the end key without one: it is appended).
                 int tsSize = _cfd.TimestampSize;
-                if (tsSize > 0 && rit.Value.Length >= tsSize) endKey.AsSpan(rit.Value.Length - tsSize, tsSize).Fill(0xff);
+                int padded = reader.PadTimestampSize;
+                byte[] endUser = new byte[rit.Value.Length + padded];
+                rit.Value.CopyTo(endUser);
+                byte[] endKey = new InternalKey(endUser, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion).Encoded.ToArray();
+                if (tsSize > 0 && endUser.Length >= tsSize) endKey.AsSpan(endUser.Length - tsSize, tsSize).Fill(0xff);
                 if (smallest is null || _cfd.Icmp.Compare(startKey, smallest) < 0) smallest = startKey;
                 if (largest is null || _cfd.Icmp.Compare(endKey, largest) > 0) largest = endKey;
             }
@@ -282,6 +308,7 @@ internal sealed class ExternalSstFileIngestionJob
                 TailSize = f.TailSize,
                 MinTimestamp = f.MinTimestamp,
                 MaxTimestamp = f.MaxTimestamp,
+                UserDefinedTimestampsPersisted = f.UserDefinedTimestampsPersisted,
             };
             edit.AddFile(f.PickedLevel, meta);
         }

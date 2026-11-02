@@ -28,6 +28,10 @@ public sealed partial class RocksDatabase
     public bool TryGet(ReadOptions options, ReadOnlySpan<byte> key, IBufferWriter<byte> value, IBufferWriter<byte> timestamp) =>
         _default.TryGet(options, key, value, timestamp);
 
+    /// <inheritdoc cref="ColumnFamily.TryGetAsync(ReadOptions, ReadOnlyMemory{byte}, IBufferWriter{byte}, IBufferWriter{byte}, CancellationToken)"/>
+    public ValueTask<bool> TryGetAsync(ReadOptions options, ReadOnlyMemory<byte> key, IBufferWriter<byte> value, IBufferWriter<byte> timestamp,
+        CancellationToken cancellationToken = default) => _default.TryGetAsync(options, key, value, timestamp, cancellationToken);
+
     /// <inheritdoc cref="ColumnFamily.GetFullHistoryTsLow"/>
     public byte[]? GetFullHistoryTsLow() => _default.GetFullHistoryTsLow();
 

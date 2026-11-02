@@ -29,7 +29,8 @@ internal sealed partial class DbImpl
         {
             if (cfd.TimestampSize != 0)
             {
-                MultiGetWithTimestamp(cfd, sv, snapshot, options, batch);
+                if (synchronous) MultiGetWithTimestamp(cfd, sv, snapshot, options, batch);
+                else await MultiGetWithTimestampAsync(cfd, sv, snapshot, options, batch, cancellationToken).ConfigureAwait(false);
                 if (st is not null) RecordMultiGet(st, batch, t0);
                 return;
             }
@@ -189,6 +190,30 @@ internal sealed partial class DbImpl
     /// MultiGet on a column family with user-defined timestamps: every key is looked up on the same super version and
     /// sequence like the batched path, one key at a time (the batched table lookup is not timestamp-aware).
     /// </summary>
+    /// <summary>
+    /// Async <see cref="MultiGetWithTimestamp"/>: each key's table lookups read data blocks with async I/O
+    /// (<see cref="GetWithSuperVersionAsync"/>).
+    /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask MultiGetWithTimestampAsync(ColumnFamilyData cfd, SuperVersion sv, ulong snapshot, ReadOptions? options, MultiGetBatch batch,
+        CancellationToken cancellationToken)
+    {
+        GetReadTimestamp(cfd, options);
+        batch.BeginRun(cfd.MergeOperator, snapshot, cfd.UserComparator.RootComparator);
+        for (int k = 0; k < batch.Count; k++)
+        {
+            try
+            {
+                await GetWithSuperVersionAsync(cfd, sv, snapshot, options, batch.UserKeyMemory(k), batch.Context(k), cancellationToken).ConfigureAwait(false);
+            }
+            catch (RocksDbException e)
+            {
+                batch.SetError(k, e);
+            }
+        }
+        batch.FinishRun();
+    }
+
     private void MultiGetWithTimestamp(ColumnFamilyData cfd, SuperVersion sv, ulong snapshot, ReadOptions? options, MultiGetBatch batch)
     {
         GetReadTimestamp(cfd, options); // validate once (throws for the whole call, like GetImpl's checks in MultiGet)

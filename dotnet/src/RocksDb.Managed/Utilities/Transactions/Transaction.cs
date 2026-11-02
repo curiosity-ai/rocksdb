@@ -292,6 +292,7 @@ public abstract class Transaction : IDisposable
     {
         ThrowIfDisposed();
         ColumnFamilyData cfd = Cfd(columnFamily);
+        options = PrepareGetForUpdateOptions(options, cfd, doValidate: true);
         ThrowIfError(WaitSync(TryLock(cfd, key, readOnly: true, exclusive, doValidate: true, synchronous: true, CancellationToken.None)));
         return value is null ? false : GetFromBatchAndDb(options, cfd, key, value);
     }
@@ -320,6 +321,7 @@ public abstract class Transaction : IDisposable
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(value);
         ColumnFamilyData cfd = Cfd(columnFamily);
+        options = PrepareGetForUpdateOptions(options, cfd, doValidate: true);
         ValueTask<RocksDbException?> t = TryLock(cfd, key.Span, readOnly: true, exclusive, doValidate: true, synchronous: false, cancellationToken);
         if (t.IsCompletedSuccessfully)
         {
@@ -387,6 +389,7 @@ public abstract class Transaction : IDisposable
 
     private bool GetFromBatchAndDb(ReadOptions? options, ColumnFamilyData cfd, ReadOnlySpan<byte> key, IBufferWriter<byte> value)
     {
+        RequireReadTimestamp(options, cfd);
         int idx = _batch.Find(cfd.Id, key);
         switch (_batch.Classify(idx))
         {
@@ -412,9 +415,16 @@ public abstract class Transaction : IDisposable
         }
     }
 
+    /// <summary>WriteBatchWithIndex::GetFromBatchAndDB: reads of a column family with timestamps need a read timestamp.</summary>
+    private static void RequireReadTimestamp(ReadOptions? options, ColumnFamilyData cfd)
+    {
+        if (cfd.TimestampSize > 0 && options?.Timestamp is null) ThrowHelper.InvalidArgument("Must specify timestamp");
+    }
+
     private ValueTask<bool> GetFromBatchAndDbAsync(ReadOptions? options, ColumnFamilyData cfd, ReadOnlyMemory<byte> key, IBufferWriter<byte> value,
         CancellationToken cancellationToken)
     {
+        RequireReadTimestamp(options, cfd);
         int idx = _batch.Find(cfd.Id, key.Span);
         switch (_batch.Classify(idx))
         {
@@ -598,10 +608,39 @@ public abstract class Transaction : IDisposable
             if (columnFamily.Db != _db) ThrowHelper.InvalidArgument("column family does not belong to this database");
             cfd = columnFamily.Data;
         }
-        // Transactions with user-defined timestamps (commit timestamps, write_batch_track_timestamp_size) are not ported.
-        if (cfd.TimestampSize != 0) ThrowHelper.NotSupported("transactions on column families with user-defined timestamps");
+        // Only WriteCommitted pessimistic transactions support user-defined timestamps (as upstream).
+        if (cfd.TimestampSize != 0 && !SupportsUserDefinedTimestamps) ThrowHelper.NotSupported("transactions on column families with user-defined timestamps");
         return cfd;
     }
+
+    /// <summary>kMaxTxnTimestamp: "no timestamp set".</summary>
+    public const ulong MaxTimestamp = ulong.MaxValue;
+
+    /// <summary>Whether this kind of transaction supports column families with user-defined timestamps.</summary>
+    private protected virtual bool SupportsUserDefinedTimestamps => false;
+
+    /// <summary>
+    /// Transaction::SetReadTimestampForValidation: keys locked with validation (GetForUpdate, writes) on column families
+    /// with user-defined timestamps must not have a version newer than <paramref name="timestamp"/>. Cannot decrease.
+    /// Only supported by pessimistic (WriteCommitted) transactions.
+    /// </summary>
+    public virtual void SetReadTimestampForValidation(ulong timestamp) => ThrowHelper.NotSupported("SetReadTimestampForValidation");
+
+    /// <summary>
+    /// Transaction::SetCommitTimestamp: the timestamp assigned at commit to every write of this transaction on column
+    /// families with user-defined timestamps (required when there are such writes). Only supported by pessimistic
+    /// (WriteCommitted) transactions.
+    /// </summary>
+    public virtual void SetCommitTimestamp(ulong timestamp) => ThrowHelper.NotSupported("SetCommitTimestamp");
+
+    /// <summary>The commit timestamp (<see cref="MaxTimestamp"/> when not set).</summary>
+    public virtual ulong CommitTimestamp => MaxTimestamp;
+
+    /// <summary>
+    /// GetForUpdate's read options on a column family with user-defined timestamps (WriteCommittedTxn::GetForUpdateImpl):
+    /// the read timestamp defaults to the transaction's read timestamp for validation and must equal it otherwise.
+    /// </summary>
+    private protected virtual ReadOptions? PrepareGetForUpdateOptions(ReadOptions? options, ColumnFamilyData cfd, bool doValidate) => options;
 
     private protected static RocksDbException? WaitSync(ValueTask<RocksDbException?> t) =>
         t.IsCompleted ? t.Result : t.AsTask().GetAwaiter().GetResult();

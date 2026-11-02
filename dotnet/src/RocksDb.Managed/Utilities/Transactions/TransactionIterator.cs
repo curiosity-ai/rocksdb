@@ -31,6 +31,16 @@ public sealed class TransactionIterator : IDisposable
         }
     }
 
+    /// <summary>The user-defined timestamp of the current DB entry (empty for this transaction's own writes).</summary>
+    public ReadOnlySpan<byte> Timestamp
+    {
+        get
+        {
+            if (!_it.Valid) ThrowHelper.InvalidArgument("iterator is not valid");
+            return _it.Timestamp;
+        }
+    }
+
     public ReadOnlySpan<byte> Value
     {
         get

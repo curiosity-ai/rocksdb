@@ -1,5 +1,6 @@
 using System.Text;
 using RocksDb.Managed.Db;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Utilities.Transactions;
 
@@ -26,6 +27,9 @@ internal sealed class PessimisticTransaction : Transaction
     private bool _skipConcurrencyControl;
     private bool _skipPrepare;
     private WriteBatch? _markerBatch;
+    // WriteCommittedTxn::read_timestamp_ / commit_timestamp_ (kMaxTxnTimestamp = unset).
+    private ulong _readTimestamp = MaxTimestamp;
+    private ulong _commitTimestamp = MaxTimestamp;
     // Waiting info (GetWaitingTxns)
     private readonly Lock _waitLock = new();
     private ulong[] _waitingTxnIds = [];
@@ -54,6 +58,8 @@ internal sealed class PessimisticTransaction : Transaction
         _name = null;
         _nameBytes = null;
         _logNumber = 0;
+        _readTimestamp = MaxTimestamp;
+        _commitTimestamp = MaxTimestamp;
         if (options.SetSnapshot) SetSnapshot();
         if (_expirationTime > 0) _txnDb.InsertExpirableTransaction(_id, this);
     }
@@ -150,6 +156,84 @@ internal sealed class PessimisticTransaction : Transaction
 
     private protected override bool NeedsUnlockOnUntrack => true;
 
+    // ---- user-defined timestamps (WriteCommittedTxn) ------------------------------------------------------
+
+    private protected override bool SupportsUserDefinedTimestamps => true;
+
+    private bool EnableUdtValidation => _txnDb.Options.EnableUdtValidation;
+
+    /// <summary>WriteCommittedTxn::SetReadTimestampForValidation.</summary>
+    public override void SetReadTimestampForValidation(ulong timestamp)
+    {
+        ThrowIfDisposed();
+        if (_readTimestamp < MaxTimestamp && timestamp < _readTimestamp) throw Invalid("Cannot decrease read timestamp for validation");
+        _readTimestamp = timestamp;
+    }
+
+    /// <summary>WriteCommittedTxn::SetCommitTimestamp.</summary>
+    public override void SetCommitTimestamp(ulong timestamp)
+    {
+        ThrowIfDisposed();
+        if (EnableUdtValidation && _readTimestamp < MaxTimestamp && timestamp <= _readTimestamp)
+        {
+            throw Invalid("Cannot commit at timestamp smaller than or equal to read timestamp");
+        }
+        _commitTimestamp = timestamp;
+    }
+
+    public override ulong CommitTimestamp => _commitTimestamp;
+
+    /// <summary>WriteCommittedTxn::SanityCheckReadTimestamp.</summary>
+    private void SanityCheckReadTimestamp(bool doValidate)
+    {
+        if (!EnableUdtValidation)
+        {
+            if (_readTimestamp != MaxTimestamp) throw Invalid("read_timestamp is set but timestamp validation is disabled for the DB");
+        }
+        else if (!doValidate)
+        {
+            if (_readTimestamp != MaxTimestamp) throw Invalid("If do_validate is false then GetForUpdate with read_timestamp is not defined.");
+        }
+        else if (_readTimestamp == MaxTimestamp)
+        {
+            throw Invalid("read_timestamp must be set for validation");
+        }
+    }
+
+    /// <summary>WriteCommittedTxn::GetForUpdateImpl's timestamp handling.</summary>
+    private protected override ReadOptions? PrepareGetForUpdateOptions(ReadOptions? options, ColumnFamilyData cfd, bool doValidate)
+    {
+        if (options?.Timestamp is not ReadOnlyMemory<byte> ts)
+        {
+            if (cfd.TimestampSize == 0) return options;
+            SanityCheckReadTimestamp(doValidate);
+            byte[] readTs = new byte[sizeof(ulong)];
+            Coding.EncodeFixed64(readTs, _readTimestamp);
+            ReadOptions copy = options is null ? new ReadOptions() : options.Clone();
+            copy.Timestamp = readTs;
+            return copy;
+        }
+        ColumnFamily.FailIfTsMismatchCf(cfd, ts.Length);
+        SanityCheckReadTimestamp(doValidate);
+        if (Coding.DecodeFixed64(ts.Span) != _readTimestamp) throw Invalid("Must read from the same read_timestamp");
+        return options;
+    }
+
+    /// <summary>
+    /// WriteCommittedTxn commit with timestamps: a batch holding keys of column families with timestamps needs the commit
+    /// timestamp, which replaces their placeholder timestamps (UpdateTimestamps). Returns the encoded commit timestamp, or
+    /// null when the batch has no such key.
+    /// </summary>
+    private byte[]? AssignCommitTimestamp()
+    {
+        if (!_batch.Wbwi.HasKeyWithTimestamp) return null;
+        if (_commitTimestamp == MaxTimestamp) throw Invalid("Must assign a commit timestamp");
+        byte[] ts = new byte[sizeof(ulong)];
+        Coding.EncodeFixed64(ts, _commitTimestamp);
+        _batch.Batch.UpdateTimestamps(ts, _db.TimestampSizeOf);
+        return ts;
+    }
+
     private protected override void UnlockGetForUpdate(ColumnFamilyData cfd, ReadOnlySpan<byte> key) => _txnDb.LockManager.UnLock(this, cfd.Id, key);
 
     /// <summary>
@@ -187,7 +271,7 @@ internal sealed class PessimisticTransaction : Transaction
         bool previouslyLocked, bool lockUpgrade, ulong trackedAtSeq)
     {
         SetSnapshotIfNeeded();
-        if (!doValidate || Snapshot is null)
+        if (!doValidate || (Snapshot is null && (cfd.TimestampSize == 0 || _readTimestamp == MaxTimestamp)))
         {
             // Need to remember the earliest sequence number that we know that this key has not been modified after.
             // Since we haven't checked a snapshot, we only know this key has not been modified since after we locked it.
@@ -226,13 +310,25 @@ internal sealed class PessimisticTransaction : Transaction
     /// </summary>
     private RocksDbException? ValidateSnapshot(ColumnFamilyData cfd, ReadOnlySpan<byte> key, ref ulong trackedAtSeq)
     {
-        ulong snapSeq = Snapshot!.SequenceNumber;
-        // If the key has been previous validated (or locked) at a sequence number earlier than the current snapshot's
-        // sequence number, we already know it has not been modified after snap_seq either.
-        if (trackedAtSeq <= snapSeq) return null;
+        ulong snapSeq;
+        if (Snapshot is { } snapshot)
+        {
+            snapSeq = snapshot.SequenceNumber;
+            // If the key has been previous validated (or locked) at a sequence number earlier than the current snapshot's
+            // sequence number, we already know it has not been modified after snap_seq either.
+            if (trackedAtSeq <= snapSeq) return null;
+        }
+        else
+        {
+            // Validation by read timestamp only.
+            snapSeq = _db.Versions.LastSequence;
+        }
         trackedAtSeq = snapSeq;
+        Span<byte> readTs = stackalloc byte[sizeof(ulong)];
+        bool hasReadTs = cfd.TimestampSize > 0 && _readTimestamp < MaxTimestamp;
+        if (hasReadTs) Coding.EncodeFixed64(readTs, _readTimestamp);
         using DbImpl.ConflictCheckView view = _db.AcquireConflictCheckView(cfd);
-        return _db.CheckKey(view, key, snapSeq, cacheOnly: false);
+        return _db.CheckKey(view, key, snapSeq, hasReadTs ? readTs : default, EnableUdtValidation, cacheOnly: false);
     }
 
     // ---- commit / prepare / rollback --------------------------------------------------------------------
@@ -327,6 +423,16 @@ internal sealed class PessimisticTransaction : Transaction
 
         if (commitWithoutPrepare)
         {
+            // CommitWithoutPrepareInternal: the commit timestamp is checked (and assigned) before anything is written.
+            try
+            {
+                AssignCommitTimestamp();
+            }
+            catch
+            {
+                SetState(TransactionState.Started);
+                throw;
+            }
             SetState(TransactionState.AwaitingCommit);
             if (_logNumber > 0) _db.MarkLogAsHavingPrepSectionFlushed(_logNumber);
             try
@@ -348,11 +454,14 @@ internal sealed class PessimisticTransaction : Transaction
         }
         else if (commitPrepared)
         {
-            SetState(TransactionState.AwaitingCommit);
             // WriteCommittedTxn::CommitInternal: the commit marker goes to the WAL; the prepared batch is inserted into
-            // the memtables (they keep the WAL with the prepared section alive until flushed).
+            // the memtables (they keep the WAL with the prepared section alive until flushed). With timestamps the marker
+            // carries the commit timestamp (recovery assigns it to the prepared batch) and the batch gets it now.
+            byte[]? commitTs = AssignCommitTimestamp();
+            SetState(TransactionState.AwaitingCommit);
             WriteBatch marker = MarkerBatch();
-            marker.MarkCommit(_nameBytes!);
+            if (commitTs is null) marker.MarkCommit(_nameBytes!);
+            else marker.MarkCommitWithTimestamp(_nameBytes!, commitTs);
             _writeContext.Reset();
             _writeContext.MemtableBatch = _batch.Batch;
             _writeContext.LogRef = _logNumber;
