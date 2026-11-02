@@ -54,9 +54,21 @@ dotnet/
     Env/                        file system abstraction (async I/O)
     Cache/                      block cache
   tests/RocksDb.Managed.Tests/        unit tests (MSTest), pure managed
-  tests/RocksDb.Managed.CompatTests/  binary-compat tests against native RocksDB
+  tests/RocksDb.Managed.CompatTests/  binary-compat tests against native RocksDB (in-process)
+  tests/RocksDb.Managed.RoundTrip/    managed<->native DB round trips; native side runs in a child process
+                                      (the test host re-invokes itself) so native crashes are captured
+  src/RocksDb.Managed.Replication/    replication / switchover / Raft cluster layer (ported from rocksdb-sharp)
   bench/RocksDb.Managed.Benchmarks/   BenchmarkDotNet: managed port vs native RocksDB
 ```
+
+## Relationship with rocksdb-sharp
+
+rocksdb-sharp (`../../rocksdb-sharp`, NuGet `RocksDB`) stays a binding over the **native** library and is **not**
+going to be integrated with or replaced by this port. This project must therefore implement everything users need
+on its own, including features that rocksdb-sharp layers on top of native RocksDB (e.g. its `Replication/`,
+`Replication/Switchover/` and `Cluster/` code is ported into `src/RocksDb.Managed.Replication`). rocksdb-sharp is used
+here only as (a) the native reference implementation in compat/round-trip tests and benchmarks and (b) a source of
+API/feature requirements. Never edit the rocksdb-sharp repo from this project's work.
 
 ## Reference implementation (native)
 
