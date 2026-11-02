@@ -1,4 +1,3 @@
-using System.Reflection;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
 
@@ -16,7 +15,6 @@ public sealed class ManagedEngine : IKeyValueEngine
     private readonly RocksDatabase _db;
     private readonly WriteOptions _writeOptions;
     private readonly WriteOptions _syncWriteOptions;
-    private readonly Func<bool>? _compactRange;
 
     public ManagedEngine(string path, EngineOptions options)
     {
@@ -24,6 +22,10 @@ public sealed class ManagedEngine : IKeyValueEngine
         {
             WriteBufferSize = (ulong)options.WriteBufferSize,
             Compression = ParseCompression(options.Compression),
+            TargetFileSizeBase = (ulong)options.TargetFileSizeBase,
+            MaxBytesForLevelBase = (ulong)options.MaxBytesForLevelBase,
+            Level0FileNumCompactionTrigger = options.Level0FileNumCompactionTrigger,
+            DisableAutoCompactions = options.DisableAutoCompactions,
         };
         cfo.TableOptions.BlockSize = (ulong)options.BlockSize;
         cfo.TableOptions.FormatVersion = 6;
@@ -32,11 +34,10 @@ public sealed class ManagedEngine : IKeyValueEngine
         else if (options.CacheType == "lru") cfo.TableOptions.BlockCache = Cache.BlockCache.CreateLru(options.BlockCacheSize);
         else throw new ArgumentException("unknown --cache_type " + options.CacheType);
         if (options.BloomBitsPerKey > 0) cfo.TableOptions.FilterPolicy = "bloomfilter:" + options.BloomBitsPerKey + ":false";
-        var dbo = new DbOptions { CreateIfMissing = true, FileSystem = LocalFileSystem.Instance };
+        var dbo = new DbOptions { CreateIfMissing = true, FileSystem = LocalFileSystem.Instance, MaxBackgroundJobs = options.MaxBackgroundJobs };
         _db = RocksDatabase.Open(path, dbo, cfo);
         _writeOptions = new WriteOptions { Sync = options.Sync, DisableWal = options.DisableWal };
         _syncWriteOptions = new WriteOptions { Sync = true };
-        _compactRange = FindCompactRange(_db);
     }
 
     public static Compression.CompressionType ParseCompression(string name) => name switch
@@ -76,47 +77,13 @@ public sealed class ManagedEngine : IKeyValueEngine
 
     public void Flush() => _db.Flush();
 
-    public bool TryCompactRange() => _compactRange is not null && _compactRange();
+    public void CompactRange() => _db.CompactRange();
+
+    public void WaitForCompaction() => _db.WaitForCompact();
+
+    public string? GetProperty(string name) => _db.GetProperty(name);
 
     public void Dispose() => _db.Dispose();
-
-    /// <summary>
-    /// Compaction is being implemented concurrently; bind to a full-range <c>CompactRange</c>/<c>CompactRangeAsync</c>
-    /// overload by reflection when one exists (parameters that are nullable references, <see cref="CompactRangeOptions"/>
-    /// or a <see cref="CancellationToken"/>), so the benchmark picks it up without code changes.
-    /// </summary>
-    private static Func<bool>? FindCompactRange(RocksDatabase db)
-    {
-        foreach (string name in new[] { "CompactRange", "CompactRangeAsync" })
-        {
-            foreach (MethodInfo m in typeof(RocksDatabase).GetMethods(BindingFlags.Public | BindingFlags.Instance))
-            {
-                if (m.Name != name || m.IsGenericMethodDefinition) continue;
-                ParameterInfo[] ps = m.GetParameters();
-                var args = new object?[ps.Length];
-                bool ok = true;
-                for (int i = 0; i < ps.Length && ok; i++)
-                {
-                    Type t = ps[i].ParameterType;
-                    if (t == typeof(CancellationToken)) args[i] = CancellationToken.None;
-                    else if (t == typeof(CompactRangeOptions)) args[i] = new CompactRangeOptions();
-                    else if (!t.IsValueType) args[i] = null;
-                    else if (Nullable.GetUnderlyingType(t) is not null) args[i] = null;
-                    else ok = false; // spans etc. cannot be passed through reflection
-                }
-                if (!ok) continue;
-                MethodInfo method = m;
-                return () =>
-                {
-                    object? r = method.Invoke(db, args);
-                    if (r is ValueTask vt) vt.AsTask().GetAwaiter().GetResult();
-                    else if (r is Task task) task.GetAwaiter().GetResult();
-                    return true;
-                };
-            }
-        }
-        return null;
-    }
 
     private sealed class Batch(WriteBatch inner) : IEngineWriteBatch
     {

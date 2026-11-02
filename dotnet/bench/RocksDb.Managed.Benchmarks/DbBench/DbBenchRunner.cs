@@ -22,7 +22,11 @@ namespace RocksDb.Managed.Benchmarks.DbBench;
 /// <item>Latency histogram per operation (per batch for multireadrandom / batched writes); percentiles in µs.</item>
 /// </list>
 /// <c>--async</c> (managed only) runs every worker as a task over PutAsync/TryGetAsync/DeleteAsync/WriteAsync and the
-/// async iterator; there is no MultiGetAsync, so multireadrandom uses the synchronous MultiGet.
+/// async iterator, and flush/compact/waitforcompaction over FlushAsync/CompactRangeAsync/WaitForCompactAsync; there is
+/// no MultiGetAsync, so multireadrandom uses the synchronous MultiGet.
+/// <c>stats</c> prints the LSM shape (files per level), the flush+compaction bytes written ("Cumulative compaction" line
+/// of rocksdb.stats) and the write amplification relative to the user bytes (key + value) written since the DB was
+/// created by this process, followed by a machine-readable <c>STATS,...</c> line (see <see cref="PrintStats"/>).
 /// </summary>
 public static class DbBenchRunner
 {
@@ -58,8 +62,14 @@ public static class DbBenchRunner
     public static readonly string[] AllBenchmarks =
     [
         "fillseq", "fillrandom", "overwrite", "fillsync", "readrandom", "readmissing", "readseq", "readreverse",
-        "seekrandom", "multireadrandom", "readwhilewriting", "deleterandom", "flush", "compact",
+        "seekrandom", "multireadrandom", "readwhilewriting", "deleterandom", "flush", "compact", "waitforcompaction", "stats",
     ];
+
+    /// <summary>
+    /// User bytes (key + value) written by the fill/overwrite benchmarks and the readwhilewriting writer since the DB
+    /// was (re)created; the denominator of the write amplification printed by <c>stats</c>.
+    /// </summary>
+    private static long s_userBytesWritten;
 
     public static int Run(string[] args)
     {
@@ -104,6 +114,12 @@ public static class DbBenchRunner
                 {
                     engine?.Dispose();
                     engine = EngineFactory.Open(f.Engine, f.Db, f.Options, destroyExisting: fresh);
+                    if (fresh) s_userBytesWritten = 0;
+                }
+                if (name == "stats")
+                {
+                    PrintStats(engine, f);
+                    continue;
                 }
                 new BenchRun(engine, f, values, name, index).Execute();
             }
@@ -140,26 +156,24 @@ public static class DbBenchRunner
             long allocBefore = GC.GetTotalAllocatedBytes(precise: true);
             int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
 
-            if (name is "flush" or "compact")
+            if (name is "flush" or "compact" or "waitforcompaction")
             {
                 long t0 = Clock.Now();
-                bool supported = true;
-                if (name == "flush")
+                if (f.Async)
                 {
-                    if (f.Async) ((ManagedEngine)engine).Db.FlushAsync().AsTask().GetAwaiter().GetResult();
-                    else engine.Flush();
+                    RocksDatabase db = ((ManagedEngine)engine).Db;
+                    ValueTask op = name switch
+                    {
+                        "flush" => db.FlushAsync(),
+                        "compact" => db.CompactRangeAsync(),
+                        _ => db.WaitForCompactAsync(),
+                    };
+                    op.AsTask().GetAwaiter().GetResult();
                 }
-                else
-                {
-                    supported = engine.TryCompactRange();
-                }
+                else if (name == "flush") engine.Flush();
+                else if (name == "compact") engine.CompactRange();
+                else engine.WaitForCompaction();
                 double secs = Clock.ElapsedNs(t0) / 1e9;
-                if (!supported)
-                {
-                    Console.WriteLine($"{name,-17} : n/a (CompactRange is not available in this engine)");
-                    Console.WriteLine($"RESULT,{f.EngineLabel},{name},{f.Threads},0,,,,,,,,,,,,");
-                    return;
-                }
                 Report(1, secs, 0, 0, null, allocBefore, g0, g1, g2, "");
                 return;
             }
@@ -190,6 +204,8 @@ public static class DbBenchRunner
                 found += w.Found;
             }
             string extra = name == "readwhilewriting" ? "(writer: " + Interlocked.Read(ref _writerOps) + " puts)" : "";
+            if (name is "fillseq" or "fillrandom" or "overwrite" or "fillsync") s_userBytesWritten += bytes;
+            else if (name == "readwhilewriting") s_userBytesWritten += Interlocked.Read(ref _writerOps) * (f.KeySize + f.ValueSize);
             Report(ops, Clock.ToNs(end - start) / 1e9, bytes, found, merged, allocBefore, g0, g1, g2, extra);
         }
 
@@ -709,6 +725,11 @@ public static class DbBenchRunner
                 case "block_size": o = o with { BlockSize = int.Parse(value, ci) }; break;
                 case "compression":
                 case "compression_type": o = o with { Compression = value }; break;
+                case "target_file_size_base": o = o with { TargetFileSizeBase = long.Parse(value, ci) }; break;
+                case "max_bytes_for_level_base": o = o with { MaxBytesForLevelBase = long.Parse(value, ci) }; break;
+                case "level0_file_num_compaction_trigger": o = o with { Level0FileNumCompactionTrigger = int.Parse(value, ci) }; break;
+                case "disable_auto_compactions": o = o with { DisableAutoCompactions = ParseBool(value) }; break;
+                case "max_background_jobs": o = o with { MaxBackgroundJobs = int.Parse(value, ci) }; break;
                 default: throw new ArgumentException("unknown flag --" + name);
             }
         }
@@ -720,12 +741,55 @@ public static class DbBenchRunner
 
     private static bool ParseBool(string v) => v is "1" or "true" or "True";
 
+    /// <summary>
+    /// The <c>stats</c> benchmark (identical output in bench/native-c/rocksdb_bench.c):
+    /// <code>
+    /// stats             : files per level [L0 L1 L2 L3 L4 L5 L6]
+    /// Cumulative compaction: ... (verbatim from rocksdb.stats; flush + compaction output, GB with 2 decimals)
+    /// stats             : user 55.3 MB, flush+compaction written 210.0 MB, write-amp 3.80, pending compaction 0 bytes
+    /// STATS,engine,L0 L1 ... L6,user_bytes,written_bytes,write_amp,pending_compaction_bytes
+    /// </code>
+    /// The written bytes come from the "Cumulative compaction: X GB write" line, so they have a resolution of 0.01 GB.
+    /// </summary>
+    private static void PrintStats(IKeyValueEngine engine, Flags f)
+    {
+        var ci = CultureInfo.InvariantCulture;
+        var levels = new System.Text.StringBuilder();
+        for (int l = 0; l < 7; l++)
+        {
+            if (l > 0) levels.Append(' ');
+            levels.Append(engine.GetProperty("rocksdb.num-files-at-level" + l.ToString(ci)) ?? "?");
+        }
+        Console.WriteLine(string.Format(ci, "{0,-17} : files per level [{1}]", "stats", levels));
+        string stats = engine.GetProperty("rocksdb.stats") ?? "";
+        const string marker = "Cumulative compaction: ";
+        double written = -1;
+        int i = stats.IndexOf(marker, StringComparison.Ordinal);
+        if (i >= 0)
+        {
+            int nl = stats.IndexOf('\n', i);
+            string line = nl < 0 ? stats[i..] : stats[i..nl];
+            int end = line.IndexOf(" GB write", StringComparison.Ordinal);
+            if (end > marker.Length && double.TryParse(line[marker.Length..end], NumberStyles.Float, ci, out double gb)) written = gb * 1073741824.0;
+            Console.WriteLine(line);
+        }
+        string pending = engine.GetProperty("rocksdb.estimate-pending-compaction-bytes") ?? "?";
+        long user = s_userBytesWritten;
+        double amp = written >= 0 && user > 0 ? written / user : 0;
+        Console.WriteLine(string.Format(ci, "{0,-17} : user {1:F1} MB, flush+compaction written {2:F1} MB, write-amp {3:F2}, pending compaction {4} bytes",
+            "stats", user / 1048576.0, Math.Max(written, 0) / 1048576.0, amp, pending));
+        Console.WriteLine(string.Format(ci, "STATS,{0},{1},{2},{3:F0},{4:F2},{5}", f.EngineLabel, levels, user, Math.Max(written, 0), amp, pending));
+        Console.Out.Flush();
+    }
+
     private static void PrintUsage()
     {
         Console.Error.WriteLine("usage: dbbench [--engine rocksdb-sharp|managed|c-native] [--async] [--benchmarks a,b,...] [--num N] [--reads N]");
         Console.Error.WriteLine("               [--key_size 16] [--value_size 100] [--threads 1] [--batch_size 1] [--multiget_size 16] [--seek_nexts 10]");
         Console.Error.WriteLine("               [--disable_wal] [--sync] [--cache_size BYTES] [--cache_type lru|hyperclock] [--bloom_bits 10]");
         Console.Error.WriteLine("               [--write_buffer_size BYTES] [--block_size 4096] [--compression none|snappy|lz4|zstd] [--compression_ratio 0.5]");
+        Console.Error.WriteLine("               [--target_file_size_base BYTES] [--max_bytes_for_level_base BYTES] [--level0_file_num_compaction_trigger 4]");
+        Console.Error.WriteLine("               [--disable_auto_compactions] [--max_background_jobs 2]");
         Console.Error.WriteLine("               [--use_existing_db] [--seed 301] [--db PATH] [--histogram 1] [--c_bench PATH-TO-rocksdb_bench]");
         Console.Error.WriteLine("benchmarks: " + string.Join(' ', AllBenchmarks));
     }

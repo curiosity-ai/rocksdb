@@ -77,6 +77,10 @@ public static class NativeDbFactory
             .SetCreateIfMissing(true)
             .SetCompression(ParseCompression(options.Compression))
             .SetWriteBufferSize((ulong)options.WriteBufferSize)
+            .SetTargetFileSizeBase((ulong)options.TargetFileSizeBase)
+            .SetMaxBytesForLevelBase((ulong)options.MaxBytesForLevelBase)
+            .SetLevel0FileNumCompactionTrigger(options.Level0FileNumCompactionTrigger)
+            .SetDisableAutoCompactions(options.DisableAutoCompactions ? 1 : 0)
             .SetBlockBasedTableFactory(table);
     }
 
@@ -84,6 +88,8 @@ public static class NativeDbFactory
     {
         RocksDbSharp.DbOptions dbOptions = CreateOptions(options, out RocksDbSharp.Cache? cache, out IntPtr hyperClock,
             out RocksDbSharp.BloomFilterPolicy? bloom, out RocksDbSharp.BlockBasedTableOptions table);
+        // rocksdb-sharp's DbOptions has no SetMaxBackgroundJobs; use the C API on its handle.
+        RocksDbSharp.Native.Instance.rocksdb_options_set_max_background_jobs(dbOptions.Handle, options.MaxBackgroundJobs);
         var writeOptions = new RocksDbSharp.WriteOptions().SetSync(options.Sync).DisableWal(options.DisableWal ? 1 : 0);
         return new NativeDb
         {
@@ -157,11 +163,30 @@ public sealed class NativeKeyValueEngine : IKeyValueEngine
 
     public void Flush() => _db.Db.Flush(_flushOptions);
 
-    public bool TryCompactRange()
+    public void CompactRange() => _db.Db.CompactRange((byte[]?)null, null);
+
+    public void WaitForCompaction()
     {
-        _db.Db.CompactRange((byte[]?)null, null);
-        return true;
+        // rocksdb-sharp has no wrapper; call rocksdb_wait_for_compact (default WaitForCompactOptions) directly.
+        RocksDbSharp.Native native = RocksDbSharp.Native.Instance;
+        IntPtr options = native.rocksdb_wait_for_compact_options_create();
+        try
+        {
+            native.rocksdb_wait_for_compact(_db.Db.Handle, options, out IntPtr err);
+            if (err != IntPtr.Zero)
+            {
+                string msg = Marshal.PtrToStringUTF8(err) ?? "error";
+                native.rocksdb_free(err);
+                throw new InvalidOperationException("WaitForCompact failed: " + msg);
+            }
+        }
+        finally
+        {
+            native.rocksdb_wait_for_compact_options_destroy(options);
+        }
     }
+
+    public string? GetProperty(string name) => _db.Db.GetProperty(name);
 
     public void Dispose()
     {
