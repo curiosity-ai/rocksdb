@@ -121,3 +121,47 @@ public enum BottommostLevelCompaction : byte
     Force,
     ForceOptimized,
 }
+
+/// <summary>
+/// The memtable representation factory (ColumnFamilyOptions::memtable_factory). OPTIONS-file names are the factories'
+/// class names (include/rocksdb/memtablerep.h, memtable/hash_*_rep.cc). The managed port implements
+/// <see cref="SkipList"/> only; the other values exist so OPTIONS files written by native RocksDB round-trip.
+/// </summary>
+public enum MemTableFactoryType : byte
+{
+    /// <summary>"SkipListFactory" (default).</summary>
+    SkipList,
+    /// <summary>"VectorRepFactory".</summary>
+    Vector,
+    /// <summary>"HashSkipListRepFactory".</summary>
+    HashSkipList,
+    /// <summary>"HashLinkListRepFactory".</summary>
+    HashLinkList,
+}
+
+/// <summary>
+/// The table format factory (ColumnFamilyOptions::table_factory); names are TableFactory::kXxxTableName()
+/// (include/rocksdb/table.h). The managed port implements <see cref="BlockBasedTable"/> only; the options of the
+/// other factories are preserved verbatim in <see cref="ColumnFamilyOptions.OtherTableFactoryOptions"/>.
+/// </summary>
+public enum TableFactoryType : byte
+{
+    /// <summary>"BlockBasedTable" (default).</summary>
+    BlockBasedTable,
+    /// <summary>"PlainTable".</summary>
+    PlainTable,
+    /// <summary>"CuckooTable".</summary>
+    CuckooTable,
+}
+
+/// <summary>
+/// When a block-based table data block is cut (BlockBasedTableOptions::flush_block_policy_factory;
+/// include/rocksdb/flush_block_policy.h, table/block_based/flush_block_policy_impl.h).
+/// </summary>
+public enum FlushBlockPolicyType : byte
+{
+    /// <summary>"FlushBlockBySizePolicyFactory": cut by <see cref="BlockBasedTableOptions.BlockSize"/> (default).</summary>
+    BySize,
+    /// <summary>"FlushBlockEveryKeyPolicyFactory": one entry per data block.</summary>
+    EveryKey,
+}

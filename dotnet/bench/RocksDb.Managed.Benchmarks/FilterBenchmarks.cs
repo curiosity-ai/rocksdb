@@ -12,8 +12,16 @@ public class FilterBenchmarks
     private const int KeyCount = 100_000;
     private const int KeyLen = 16;
 
-    [Params("FastLocalBloom", "Ribbon", "LegacyBloom")]
-    public string Impl { get; set; } = "FastLocalBloom";
+    /// <summary>Filter implementation under test.</summary>
+    public enum FilterImpl
+    {
+        FastLocalBloom,
+        Ribbon,
+        LegacyBloom,
+    }
+
+    [Params(FilterImpl.FastLocalBloom, FilterImpl.Ribbon, FilterImpl.LegacyBloom)]
+    public FilterImpl Impl { get; set; } = FilterImpl.FastLocalBloom;
 
     private byte[] _keys = [];
     private IFilterBitsReader _reader = null!;
@@ -28,8 +36,8 @@ public class FilterBenchmarks
         new Random(42).NextBytes(_keys);
         (_policy, _formatVersion) = Impl switch
         {
-            "Ribbon" => ((FilterPolicy)new RibbonFilterPolicy(10, -1), 5),
-            "LegacyBloom" => (new BloomFilterPolicy(10), 4),
+            FilterImpl.Ribbon => ((FilterPolicy)new RibbonFilterPolicy(10, -1), 5),
+            FilterImpl.LegacyBloom => (new BloomFilterPolicy(10), 4),
             _ => (new BloomFilterPolicy(10), 5),
         };
         using IFilterBitsBuilder b = _policy.CreateBuilder(_formatVersion);

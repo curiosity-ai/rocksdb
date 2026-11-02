@@ -140,7 +140,7 @@ public sealed class AppendEntriesDto
     [Key(0)] public long Term { get; set; }
     [Key(1)] public bool Success { get; set; }
     [Key(2)] public ulong LastSeq { get; set; }
-    [Key(3)] public string? Reason { get; set; }
+    [Key(3)] public AppendEntriesRejectReason Reason { get; set; }
 }
 
 [MessagePackObject]

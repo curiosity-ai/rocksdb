@@ -190,13 +190,14 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public ValueTask WaitForCompactAsync(CancellationToken cancellationToken = default) => _db.WaitForCompactAsync(synchronous: false, cancellationToken);
 
     /// <summary>
-    /// A DB property of the default column family, or null if unknown. Supported: rocksdb.num-entries-active-mem-table,
-    /// rocksdb.num-entries-imm-mem-tables, rocksdb.num-deletes-active-mem-table, rocksdb.num-immutable-mem-table,
-    /// rocksdb.cur-size-active-mem-table, rocksdb.estimate-num-keys, rocksdb.num-files-at-level&lt;N&gt;,
-    /// rocksdb.total-sst-files-size, rocksdb.live-sst-files-size, rocksdb.levelstats (summary), rocksdb.num-snapshots,
-    /// rocksdb.is-write-stopped.
+    /// A DB property of the default column family, or null if unknown. The supported names are the
+    /// <see cref="DbProperties"/> constants (e.g. <see cref="DbProperties.EstimateNumKeys"/>,
+    /// <see cref="DbProperties.NumFilesAtLevel(int)"/>).
     /// </summary>
     public string? GetProperty(string property) => _default.GetProperty(property);
+
+    /// <summary>A numeric DB property of the default column family (DB::GetIntProperty); false if unknown or not numeric.</summary>
+    public bool TryGetIntProperty(string property, out ulong value) => _default.TryGetIntProperty(property, out value);
 
     /// <summary>Metadata of all live table files (DB::GetLiveFilesMetaData).</summary>
     public List<LiveFileMetadata> GetLiveFilesMetadata()

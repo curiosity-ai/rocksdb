@@ -74,8 +74,8 @@ public sealed class OptionsFile
             sb.Append("\n[").Append(SectionCfOptions).Append(" \"").Append(escapedName).Append("\"]\n  ");
             AppendOptions(sb, cf.Options.ToOptionsList());
             sb.Append('\n');
-            string factory = cf.Options.TableFactoryName;
-            if (factory == ColumnFamilyOptions.BlockBasedTableFactoryName)
+            string factory = OptionEnumMaps.TableFactory.ToName(cf.Options.TableFactory);
+            if (cf.Options.TableFactory == TableFactoryType.BlockBasedTable)
             {
                 sb.Append('[').Append(SectionTableOptions).Append(factory).Append(" \"").Append(escapedName).Append("\"]\n  ");
                 AppendOptions(sb, cf.Options.TableOptions.ToOptionsList());
@@ -337,7 +337,7 @@ public sealed class OptionsFile
                 {
                     ColumnFamilyOptions cf = _file.FindColumnFamily(_argument)!;
                     string factory = _title[SectionTableOptions.Length..];
-                    if (factory == ColumnFamilyOptions.BlockBasedTableFactoryName)
+                    if (OptionEnumMaps.TableFactory.TryParse(factory, out TableFactoryType type) && type == TableFactoryType.BlockBasedTable)
                     {
                         var t = new BlockBasedTableOptions();
                         t.SetOptions(_statements, _preserveUnknown);

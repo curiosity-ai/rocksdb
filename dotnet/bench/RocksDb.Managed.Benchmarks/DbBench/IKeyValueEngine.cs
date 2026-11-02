@@ -1,3 +1,4 @@
+using RocksDb.Managed.Compression;
 namespace RocksDb.Managed.Benchmarks.DbBench;
 
 /// <summary>
@@ -89,7 +90,7 @@ public sealed record EngineOptions
     public long BlockCacheSize { get; init; } = 8L << 20;
 
     /// <summary>--cache_type: lru (RocksDB's default, used by all engines by default) or hyperclock.</summary>
-    public string CacheType { get; init; } = "lru";
+    public BlockCacheKind CacheType { get; init; } = BlockCacheKind.Lru;
 
     /// <summary>--bloom_bits (db_bench default -1 = none; we default to 10 for realistic point lookups).</summary>
     public int BloomBitsPerKey { get; init; } = 10;
@@ -116,21 +117,21 @@ public sealed record EngineOptions
     public int MaxBackgroundJobs { get; init; } = 2;
 
     /// <summary>--compression: none, snappy, lz4 or zstd (all levels).</summary>
-    public string Compression { get; init; } = "none";
+    public CompressionType Compression { get; init; } = CompressionType.None;
 }
 
 /// <summary>Opens engines by name.</summary>
 public static class EngineFactory
 {
-    public static IKeyValueEngine Open(string engine, string path, EngineOptions options, bool destroyExisting)
+    public static IKeyValueEngine Open(EngineKind engine, string path, EngineOptions options, bool destroyExisting)
     {
         if (destroyExisting && Directory.Exists(path)) Directory.Delete(path, recursive: true);
         Directory.CreateDirectory(path);
         return engine switch
         {
-            "native" or "rocksdb-sharp" => new Native.NativeKeyValueEngine(path, options),
-            "managed" => new ManagedEngine(path, options),
-            _ => throw new ArgumentException("unknown engine '" + engine + "' (expected rocksdb-sharp|native|managed|c-native)"),
+            EngineKind.RocksDbSharp => new Native.NativeKeyValueEngine(path, options),
+            EngineKind.Managed => new ManagedEngine(path, options),
+            _ => throw new ArgumentException("engine " + BenchFlags.Name(engine) + " is not an in-process engine"),
         };
     }
 }

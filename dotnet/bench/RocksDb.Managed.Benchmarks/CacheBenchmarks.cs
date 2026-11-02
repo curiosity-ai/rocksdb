@@ -22,10 +22,10 @@ public class CacheBenchmarks
 
     private const int Threads = 4;
 
-    [Params("lru", "hyperclock")]
-    public string CacheType { get; set; } = "lru";
+    [Params(DbBench.BlockCacheKind.Lru, DbBench.BlockCacheKind.HyperClock)]
+    public DbBench.BlockCacheKind CacheType { get; set; } = DbBench.BlockCacheKind.Lru;
 
-    private BlockCache Create(long capacity) => CacheType == "lru"
+    private BlockCache Create(long capacity) => CacheType == DbBench.BlockCacheKind.Lru
         ? BlockCache.CreateLru(capacity)
         : BlockCache.CreateHyperClock(new HyperClockCacheOptions { Capacity = capacity, EstimatedEntryCharge = BlockSize });
 

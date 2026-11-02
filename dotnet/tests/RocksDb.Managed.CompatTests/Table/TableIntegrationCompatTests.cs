@@ -87,7 +87,7 @@ public sealed class TableIntegrationCompatTests
             cf.TableOptions.FormatVersion = (uint)FormatVersion;
             cf.TableOptions.BlockSize = 1024;
             cf.TableOptions.IndexShortening = Shortening;
-            cf.TableOptions.FilterPolicy = FilterId;
+            cf.TableOptions.FilterPolicy = TableFactory.CreateFilterPolicy(FilterId);
             cf.TableOptions.OptimizeFiltersForMemory = false;
             return cf;
         }

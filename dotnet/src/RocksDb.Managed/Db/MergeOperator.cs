@@ -29,6 +29,43 @@ public abstract class MergeOperator
 
     /// <summary>Port of AllowSingleOperand.</summary>
     public virtual bool AllowSingleOperand => false;
+
+    public override string ToString() => Name;
+
+    /// <summary>Built-in "UInt64AddOperator" (<see cref="UInt64AddOperator"/>).</summary>
+    public static MergeOperator UInt64Add => UInt64AddOperator.Instance;
+
+    /// <summary>Built-in "StringAppendOperator" (<see cref="StringAppendOperator"/>) with the given delimiter.</summary>
+    public static MergeOperator StringAppend(string delimiter) => new StringAppendOperator(delimiter);
+
+    /// <summary>
+    /// Recreates a built-in merge operator from its OPTIONS-file id (the factories registered by
+    /// RegisterBuiltinMergeOperators, utilities/merge_operators.cc): the class name or nick name
+    /// ("UInt64AddOperator" / "uint64add", "StringAppendOperator" / "stringappend"), or the struct form native writes for
+    /// configurable objects ("{id=StringAppendOperator;delimiter=,;}"). Returns null for other (custom) ids.
+    /// </summary>
+    public static MergeOperator? CreateBuiltin(string id)
+    {
+        ArgumentNullException.ThrowIfNull(id);
+        string? delimiter = null;
+        if (id.Length >= 2 && id[0] == '{' && id[^1] == '}')
+        {
+            string inner = "";
+            foreach (KeyValuePair<string, string> kv in Options.OptionStrings.ParseStruct("merge_operator", id))
+            {
+                if (kv.Key == "id") inner = kv.Value;
+                else if (kv.Key == "delimiter") delimiter = kv.Value;
+                else return null;
+            }
+            id = inner;
+        }
+        return id switch
+        {
+            "UInt64AddOperator" or "uint64add" when delimiter is null => UInt64AddOperator.Instance,
+            "StringAppendOperator" or "stringappend" => delimiter is null ? new StringAppendOperator() : new StringAppendOperator(delimiter),
+            _ => null,
+        };
+    }
 }
 
 /// <summary>

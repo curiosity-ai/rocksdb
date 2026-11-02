@@ -70,6 +70,13 @@ internal sealed class OptionTable<TOwner>
 
     public OptionTable<TOwner> Enum<TEnum>(string name, EnumMap<TEnum> map, Func<TOwner, TEnum> get, Action<TOwner, TEnum> set) where TEnum : struct, System.Enum =>
         Add(name, o => map.ToName(get(o)), (o, v) => set(o, map.Parse(name, v)));
+
+    /// <summary>
+    /// A Customizable factory option selected by id (memtable_factory, table_factory, flush_block_policy_factory):
+    /// written as the bare class name; the struct form "{id=Name;...}" is accepted and only its id kept.
+    /// </summary>
+    public OptionTable<TOwner> EnumId<TEnum>(string name, EnumMap<TEnum> map, Func<TOwner, TEnum> get, Action<TOwner, TEnum> set) where TEnum : struct, System.Enum =>
+        Add(name, o => map.ToName(get(o)), (o, v) => set(o, map.Parse(name, OptionStrings.UnwrapId(v))));
 }
 
 /// <summary>Bidirectional enum &lt;-&gt; RocksDB-name map (OptionsHelper::*_string_map).</summary>
@@ -89,6 +96,17 @@ internal sealed class EnumMap<TEnum> where TEnum : struct, System.Enum
         }
         _fallbackName = fallbackName;
         _fallbackParse = fallbackParse;
+    }
+
+    public bool TryParse(string text, out TEnum value)
+    {
+        if (_byName.TryGetValue(text, out value)) return true;
+        if (_fallbackParse?.Invoke(text) is TEnum f)
+        {
+            value = f;
+            return true;
+        }
+        return false;
     }
 
     public string ToName(TEnum value)
@@ -223,12 +241,67 @@ internal static class OptionEnumMaps
         ("kDisable", Managed.PrepopulateBlockCache.Disable),
         ("kFlushOnly", Managed.PrepopulateBlockCache.FlushOnly),
     ]);
+
+    /// <summary>memtable_factory: class names (written) and nick names (accepted, optionally with ":args").</summary>
+    public static readonly EnumMap<MemTableFactoryType> MemTableFactory = new(
+    [
+        ("SkipListFactory", MemTableFactoryType.SkipList),
+        ("VectorRepFactory", MemTableFactoryType.Vector),
+        ("HashSkipListRepFactory", MemTableFactoryType.HashSkipList),
+        ("HashLinkListRepFactory", MemTableFactoryType.HashLinkList),
+        ("skip_list", MemTableFactoryType.SkipList),
+        ("vector", MemTableFactoryType.Vector),
+        ("prefix_hash", MemTableFactoryType.HashSkipList),
+        ("hash_linkedlist", MemTableFactoryType.HashLinkList),
+    ],
+    fallbackParse: static s =>
+    {
+        // Nick names may carry arguments, e.g. "skip_list:16" or "prefix_hash:1000" (CreateMemTableRepFactory).
+        int colon = s.IndexOf(':');
+        if (colon <= 0) return null;
+        return s[..colon] switch
+        {
+            "skip_list" => MemTableFactoryType.SkipList,
+            "vector" => MemTableFactoryType.Vector,
+            "prefix_hash" => MemTableFactoryType.HashSkipList,
+            "hash_linkedlist" => MemTableFactoryType.HashLinkList,
+            _ => null,
+        };
+    });
+
+    /// <summary>table_factory: TableFactory::kBlockBasedTableName() etc.</summary>
+    public static readonly EnumMap<TableFactoryType> TableFactory = new(
+    [
+        ("BlockBasedTable", TableFactoryType.BlockBasedTable),
+        ("PlainTable", TableFactoryType.PlainTable),
+        ("CuckooTable", TableFactoryType.CuckooTable),
+    ]);
+
+    /// <summary>flush_block_policy_factory: the factories' kClassName().</summary>
+    public static readonly EnumMap<FlushBlockPolicyType> FlushBlockPolicy = new(
+    [
+        ("FlushBlockBySizePolicyFactory", FlushBlockPolicyType.BySize),
+        ("FlushBlockEveryKeyPolicyFactory", FlushBlockPolicyType.EveryKey),
+    ]);
 }
 
 /// <summary>String helpers matching RocksDB's option (de)serialization (util/string_util.cc, options/options_helper.cc).</summary>
 internal static class OptionStrings
 {
     public static string FormatBool(bool v) => v ? "true" : "false";
+
+    /// <summary>Customizable ids may be written as "{id=Name;...}"; returns the id only (or the value unchanged).</summary>
+    public static string UnwrapId(string v)
+    {
+        if (v.Length > 0 && v[0] == '{')
+        {
+            foreach (KeyValuePair<string, string> kv in ParseStruct("id", v))
+            {
+                if (kv.Key == "id") return kv.Value;
+            }
+        }
+        return v;
+    }
 
     /// <summary>ParseBoolean: "true"/"1" or "false"/"0".</summary>
     public static bool ParseBool(string name, string v) => v switch
