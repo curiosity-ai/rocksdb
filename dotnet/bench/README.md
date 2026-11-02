@@ -32,7 +32,7 @@ After the matrix, `run-all.sh` runs one **compaction-heavy** configuration (labe
 compactions, the reads hit a multi-level LSM tree, and `stats` records the LSM shape and write amplification of every
 engine (knobs `COMPACTION_NUM`, `COMPACTION_ARGS`, `COMPACTION_BENCHMARKS`, ... in the header of `run-all.sh`). Results:
 `results/2026-11-02-vm-compaction.md`, then `-vm-perf2-compaction.md` and `-vm-perf3-compaction.md` after perf passes #2
-and #3 (`docs/perf.md`).
+and #3, and `-vm-picker-compaction.md` after the compaction-picking parity fixes (`docs/perf.md`).
 
 The `flush` and `compact` benchmarks run one flush / one full compaction in a fresh process, so for the managed engines
 they include JIT warm-up of the flush / compaction code (the first compaction of a process is 2.5 - 3.5x slower than

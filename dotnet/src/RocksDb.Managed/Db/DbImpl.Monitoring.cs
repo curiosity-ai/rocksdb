@@ -174,6 +174,40 @@ internal sealed partial class DbImpl
                  Json(cfd.Options.Compression.ToString()) + ", \"lsm_state\": [" + LsmState(cfd) + "]");
     }
 
+    /// <summary>
+    /// CompactionJob::LogCompaction: the "Compacting N@L + M@L' files to Lx, score s" line and the "compaction_started"
+    /// event (same fields as upstream, so native and managed LOGs can be compared).
+    /// </summary>
+    internal void OnCompactionStarted(ColumnFamilyData cfd, Compaction c, int jobId)
+    {
+        if (_infoLog is null || !_infoLog.IsEnabled(InfoLogLevel.Info)) return;
+        // Trivial moves and deletion compactions don't run a CompactionJob upstream (they log "Moved #..." instead).
+        if (c.IsDeletionCompaction || c.IsTrivialMove()) return;
+        var summary = new StringBuilder();
+        var files = new StringBuilder();
+        ulong inputBytes = 0;
+        for (int i = 0; i < c.NumInputLevels; i++)
+        {
+            List<FileMetaData> inputs = c.Inputs(i).Files;
+            if (inputs.Count == 0) continue;
+            if (summary.Length > 0) summary.Append(" + ");
+            summary.Append(inputs.Count).Append('@').Append(c.Level(i));
+            files.Append(", \"files_L").Append(c.Level(i)).Append("\": [");
+            for (int j = 0; j < inputs.Count; j++)
+            {
+                if (j > 0) files.Append(", ");
+                files.Append(inputs[j].FileNumber);
+                inputBytes += inputs[j].FileSize;
+            }
+            files.Append(']');
+        }
+        string score = c.Score.ToString("0.######", CultureInfo.InvariantCulture);
+        LogInfo("[" + cfd.Name + "] [JOB " + jobId + "] Compacting " + summary + " files to L" + c.OutputLevel + ", score " +
+                c.Score.ToString("F2", CultureInfo.InvariantCulture));
+        LogEvent("\"job\": " + jobId + ", \"event\": \"compaction_started\", \"cf_name\": " + Json(cfd.Name) + ", \"compaction_reason\": " +
+                 Json(c.Reason.ToString()) + files + ", \"score\": " + score + ", \"input_data_size\": " + inputBytes);
+    }
+
     private static string LsmState(ColumnFamilyData cfd)
     {
         VersionStorageInfo? s = cfd.Current?.Storage;
@@ -241,6 +275,21 @@ internal sealed partial class DbImpl
             st.RecordInHistogram(Histogram.NumFilesInSingleCompaction, (ulong)(ls.NumInputFilesInNonOutputLevels + ls.NumInputFilesInOutputLevel));
         }
         if (_infoLog is null) return;
+        if (job is not null)
+        {
+            foreach (FileMetaData meta in job.Outputs)
+            {
+                LogInfo("[" + cfd.Name + "] [JOB " + jobId + "] Generated table #" + meta.FileNumber + ": " + meta.FileSize + " bytes");
+                LogEvent("\"cf_name\": " + Json(cfd.Name) + ", \"job\": " + jobId + ", \"event\": \"table_file_creation\", \"file_number\": " +
+                         meta.FileNumber + ", \"file_size\": " + meta.FileSize);
+            }
+        }
+        else if (!c.IsDeletionCompaction)
+        {
+            // DBImpl::BackgroundCompaction, trivial move branch.
+            LogInfo("[" + cfd.Name + "] Moved #" + (ls.NumInputFilesInNonOutputLevels + ls.NumInputFilesInOutputLevel) + " files to level-" + c.OutputLevel +
+                    " " + ls.BytesMoved + " bytes OK");
+        }
         string kind = job is null ? (c.IsDeletionCompaction ? "deletion" : "trivial move") : "compaction";
         LogInfo("[" + cfd.Name + "] [JOB " + jobId + "] Compacted (" + kind + ") " + (ls.NumInputFilesInNonOutputLevels + ls.NumInputFilesInOutputLevel) +
                 " files to L" + c.OutputLevel + " => " + ls.BytesWritten + " bytes");

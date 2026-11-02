@@ -388,6 +388,54 @@ public sealed class CompactionPickerTests
         Assert.IsFalse(c.KeyNotExistsBeyondOutputLevel("190"u8, ptrs));
     }
 
+    /// <summary>
+    /// Compaction::max_output_file_size_ (db/compaction/compaction.cc): outputs of a non-bottommost compaction with
+    /// grandparents may grow to 2x the target file size (they are normally cut at a grandparent boundary first);
+    /// bottommost outputs, and outputs without grandparents, are capped at the target size.
+    /// </summary>
+    [TestMethod]
+    public void MaxOutputFileSizeIsTwiceTheTargetAboveTheBottommostLevel()
+    {
+        const ulong Target = 2 * 1024 * 1024;
+        // Grandparent file 3 (L3) overlaps the compaction range: not bottommost.
+        var fx = new Fixture(6);
+        fx.Options.MaxBytesForLevelBase = 1000;
+        fx.Options.TargetFileSizeBase = Target;
+        fx.Add(1, 1, "100", "200", 100000);
+        fx.Add(2, 2, "100", "150", 10);
+        fx.Add(3, 3, "180", "400", 10);
+        Compaction? c = fx.LevelPicker().PickCompaction(fx.Build(), []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(2, c.OutputLevel);
+        Assert.IsFalse(c.BottommostLevel);
+        Assert.AreEqual(1, c.Grandparents.Count);
+        Assert.AreEqual(Target, c.TargetOutputFileSize);
+        Assert.AreEqual(2 * Target, c.MaxOutputFileSize);
+
+        // Nothing below the output level overlaps: bottommost, no grandparents.
+        fx = new Fixture(6);
+        fx.Options.MaxBytesForLevelBase = 1000;
+        fx.Options.TargetFileSizeBase = Target;
+        fx.Add(1, 1, "100", "200", 100000);
+        fx.Add(2, 2, "100", "150", 10);
+        fx.Add(3, 3, "300", "400", 10);
+        c = fx.LevelPicker().PickCompaction(fx.Build(), []);
+        Assert.IsNotNull(c);
+        Assert.IsTrue(c.BottommostLevel);
+        Assert.AreEqual(0, c.Grandparents.Count);
+        Assert.AreEqual(Target, c.MaxOutputFileSize);
+
+        // L0 -> L1 with no files below L1: bottommost.
+        fx = new Fixture(6);
+        fx.Options.Level0FileNumCompactionTrigger = 2;
+        fx.Options.TargetFileSizeBase = Target;
+        fx.Add(0, 1, "150", "200");
+        fx.Add(0, 2, "160", "250");
+        c = fx.LevelPicker().PickCompaction(fx.Build(), []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(Target, c.MaxOutputFileSize);
+    }
+
     [TestMethod]
     public void ManualCompactRangePicksOverlappingFiles()
     {
