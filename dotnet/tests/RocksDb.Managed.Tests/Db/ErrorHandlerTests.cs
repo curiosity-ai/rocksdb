@@ -218,21 +218,34 @@ public sealed class ErrorHandlerTests
     public void ManifestRetryableErrorRecoversWithNewManifest()
     {
         (FaultInjectionFileSystem fs, DbOptions options, ErrorListener listener) = Setup();
-        using (RocksDatabase db = RocksDatabase.Open(DbPath, options))
+        using var gate = new ManualResetEventSlim(false);
+        TestHooks.Set("RecoverFromRetryableBGIOError:BeforeResume", () => gate.Wait(Timeout));
+        try
         {
-            Put(db, "a");
-            string manifest = CurrentManifest(fs);
-            fs.FailMatching("MANIFEST", FaultOps.Append, 1, InjectedFaultKind.Retryable);
-            Assert.ThrowsExactly<RocksDbException>(() => db.Flush());
-            BackgroundErrorRecoveryInfo end = listener.WaitForRecoveryEnd();
-            Assert.IsNull(end.NewBackgroundError);
-            Assert.IsTrue(listener.Errors.TryPeek(out BackgroundErrorEventArgs? e));
-            Assert.AreEqual(BackgroundErrorReason.ManifestWriteNoWal, e!.Reason);
-            Assert.AreNotEqual(manifest, CurrentManifest(fs));
-            Put(db, "b");
-            db.Flush();
+            using (RocksDatabase db = RocksDatabase.Open(DbPath, options))
+            {
+                Put(db, "a");
+                string manifest = CurrentManifest(fs);
+                fs.FailMatching("MANIFEST", FaultOps.Append, 1, InjectedFaultKind.Retryable);
+                // The manual flush reports the (soft) error unless the automatic recovery already finished.
+                RocksDbException ex = Assert.ThrowsExactly<RocksDbException>(() => db.Flush());
+                Assert.AreEqual(ErrorSeverity.SoftError, ex.Severity);
+                gate.Set();
+                BackgroundErrorRecoveryInfo end = listener.WaitForRecoveryEnd();
+                Assert.IsNull(end.NewBackgroundError);
+                Assert.IsTrue(listener.Errors.TryPeek(out BackgroundErrorEventArgs? e));
+                Assert.AreEqual(BackgroundErrorReason.ManifestWriteNoWal, e!.Reason);
+                Assert.AreNotEqual(manifest, CurrentManifest(fs));
+                Put(db, "b");
+                db.Flush();
+            }
+            AssertReopens(fs, "a", "b");
         }
-        AssertReopens(fs, "a", "b");
+        finally
+        {
+            gate.Set();
+            TestHooks.ClearAll();
+        }
     }
 
     [TestMethod]

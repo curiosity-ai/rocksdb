@@ -91,7 +91,7 @@ public class BackupEngineReadOnly : IDisposable
 
     private protected string PrivateDir(uint backupId) => GetAbsolutePath(PrivateDirName + "/" + backupId.ToString(CultureInfo.InvariantCulture));
 
-    /// <summary>GetFileFromChecksumFile: <c>&lt;number&gt;_&lt;anything&gt;.&lt;ext&gt;</c> → <c>&lt;number&gt;.&lt;ext&gt;</c>.</summary>
+    /// <summary>GetFileFromChecksumFile: <c>&lt;number&gt;_&lt;anything&gt;.&lt;ext&gt;</c> -> <c>&lt;number&gt;.&lt;ext&gt;</c>.</summary>
     internal static string GetFileFromChecksumFile(string file)
     {
         int firstUnderscore = file.IndexOf('_');
@@ -204,7 +204,7 @@ public class BackupEngineReadOnly : IDisposable
         }
     }
 
-    /// <summary>ReadChildFileCurrentSizes: absolute path → size of every file of <paramref name="dir"/> (missing dir: nothing).</summary>
+    /// <summary>ReadChildFileCurrentSizes: absolute path -> size of every file of <paramref name="dir"/> (missing dir: nothing).</summary>
     private protected void ReadChildFileCurrentSizes(string dir, Dictionary<string, ulong> result)
     {
         List<string>? children = TryGetChildren(_backupFs, dir);

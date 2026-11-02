@@ -50,6 +50,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
         DbPaths = paths;
         Versions = new VersionSet(this, FileSystem, dbname);
+        ErrorHandler = new ErrorHandler(this);
         _writeThread = new WriteThread(options.MaxWriteBatchGroupSizeBytes);
         // GetBGJobLimits (db/db_impl/db_impl_compaction_flush.cc).
         int maxFlushes = options.MaxBackgroundFlushes;
@@ -338,11 +339,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
 
     // ---- background error ----------------------------------------------------------------------------------
 
-    private ErrorHandler? _errorHandlerField;
     private ulong _failedWalNumber; // newest WAL whose write/sync failed (guarded by mutex)
 
     /// <summary>The background error handler (error_handler_).</summary>
-    internal ErrorHandler ErrorHandler => _errorHandlerField ??= new ErrorHandler(this);
+    internal ErrorHandler ErrorHandler { get; }
 
     /// <summary>
     /// Records a background error for <paramref name="reason"/> (ErrorHandler::SetBGError): depending on its severity

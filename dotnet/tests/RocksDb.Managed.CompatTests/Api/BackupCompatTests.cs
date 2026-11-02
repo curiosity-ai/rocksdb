@@ -113,6 +113,19 @@ public sealed class BackupCompatTests
         return set;
     }
 
+    /// <summary>
+    /// The native BackupEngine (librocksdb 11.12 from the RocksDB NuGet package) writes empty <c>meta/&lt;id&gt;</c> files when
+    /// it runs inside a .NET 11 process (observed on linux-x64; the same calls produce valid meta files under .NET 10),
+    /// so such backups are unreadable by native and managed alike. Gate on the symptom rather than on the runtime.
+    /// </summary>
+    internal static void SkipIfNativeMetaIsEmpty(string backupDir, uint id)
+    {
+        if (new FileInfo(Path.Combine(backupDir, "meta", id.ToString())).Length == 0)
+        {
+            Assert.Inconclusive("native BackupEngine wrote an empty meta file (librocksdb 11.12 hosted by .NET " + Environment.Version + ")");
+        }
+    }
+
     /// <summary>The kinds of private files of a backup (CURRENT, MANIFEST, OPTIONS, log), in order of appearance.</summary>
     private static List<string> PrivateKinds(string backupDir, uint id)
     {
@@ -145,6 +158,7 @@ public sealed class BackupCompatTests
             using var nbe = new NativeBackupEngine(backupDir);
             nbe.CreateNewBackup(db, flush: false);
         }
+        SkipIfNativeMetaIsEmpty(backupDir, 1);
         Func<int, string> v1 = i => i < 200 ? V(i, "a") : i < 450 ? V(i, "b") : V(i, "c");
 
         using (BackupEngine be = BackupEngine.Open(new BackupEngineOptions(backupDir)))
@@ -228,6 +242,7 @@ public sealed class BackupCompatTests
             nbe.CreateNewBackup(db, flush: true);
             nbe.Purge(2); // drops backup 1
         }
+        SkipIfNativeMetaIsEmpty(backupDir, 3);
         using (BackupEngine be = BackupEngine.Open(new BackupEngineOptions(backupDir)))
         {
             List<BackupInfo> infos = be.GetBackupInfo();
