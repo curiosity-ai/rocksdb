@@ -83,18 +83,4 @@ public static class LogFormat
         type == (byte)LogRecordType.RecyclableUserDefinedTimestampSize;
 }
 
-/// <summary>
-/// How WAL corruption is handled during recovery. Port of <c>WALRecoveryMode</c> (include/rocksdb/options.h); the
-/// numeric values match the C++ enum (and the OPTIONS file encoding).
-/// </summary>
-public enum WalRecoveryMode : byte
-{
-    /// <summary>Original LevelDB recovery: tolerate an incomplete record in the tail of any log.</summary>
-    TolerateCorruptedTailRecords = 0,
-    /// <summary>Recover from a clean shutdown: any corruption is reported.</summary>
-    AbsoluteConsistency = 1,
-    /// <summary>Recover to a point-in-time consistent state: stop replay at the first corruption (the default).</summary>
-    PointInTimeRecovery = 2,
-    /// <summary>Recover as much as possible, skipping corrupted records.</summary>
-    SkipAnyCorruptedRecords = 3,
-}
+// WalRecoveryMode lives in Options/OptionEnums.cs (RocksDb.Managed.WalRecoveryMode); values match the C++ enum.

@@ -264,7 +264,7 @@ public sealed class ManifestCompatTests
         file.DbOptions.CreateIfMissing = true;
         var def = new ColumnFamilyOptions();
         def.TableOptions.FilterPolicy = "bloomfilter:10:false";
-        def.CompressionPerLevel.AddRange([Compression.CompressionType.None, Compression.CompressionType.LZ4, Compression.CompressionType.Zstd]);
+        def.CompressionPerLevel.AddRange([RocksDb.Managed.Compression.CompressionType.None, RocksDb.Managed.Compression.CompressionType.LZ4, RocksDb.Managed.Compression.CompressionType.Zstd]);
         file.ColumnFamilies.Add(new ColumnFamilyDescriptor("default", def));
         var other = new ColumnFamilyOptions { WriteBufferSize = 777777, CompactionStyle = CompactionStyle.Universal };
         file.ColumnFamilies.Add(new ColumnFamilyDescriptor("with:special#chars", other));

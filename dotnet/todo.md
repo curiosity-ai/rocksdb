@@ -42,12 +42,15 @@ Legend: `[ ]` todo, `[~]` in progress, `[x]` done. Each item names the C++ sourc
 - [ ] Dictionary compression
 - Note: `FilterPolicy.CreateBuilder(in FilterBuildingContext)` added (level/flush aware, needed for ribbon `bloom_before_level`) — table builder must call it
 
-### D. Version metadata & files  `[~] agent running`
-- [ ] `Db/FileNames` — `file/filename.cc` (LOG, MANIFEST-, CURRENT, IDENTITY, .sst, .log, OPTIONS-)
-- [ ] `Db/VersionEdit` encode/decode, all tags incl. new-file custom fields, blob files, WAL additions/deletions — `db/version_edit.cc`
-- [ ] MANIFEST read/write via log format; `CURRENT` atomic update
-- [ ] `Options/OptionsFile` — parse & write `OPTIONS-*` (INI-like) — `options/options_parser.cc`
-- [ ] Compat: decode native MANIFEST & OPTIONS files of a natively created DB
+### D. Version metadata & files  `[x] merged (2d9abdd)`
+- [x] `Db/FileNames` (builders, TryParseFileName, CURRENT/IDENTITY helpers)
+- [x] `VersionEdit` encode/decode, all tags in this tree; byte-identical re-encode of native MANIFEST records
+- [x] `ManifestReader`/`ManifestReplayer` (atomic groups, CF add/drop, WALs) → `RecoveredVersionState`; `ManifestWriter` (native opens managed-written MANIFEST)
+- [x] Options model (`DbOptions`, `ColumnFamilyOptions`, `BlockBasedTableOptions`, `ReadOptions`, `WriteOptions`, ...) + `OptionsFile` parse/serialize, native loads our OPTIONS
+- [ ] Wire MANIFEST seam (`IManifestRecordReader/Writer`) to `Wal.LogReader/LogWriter`; drop test-only `TestLogFormat.cs`
+- [ ] Comparator/num_levels validation on replay, UDT boundary padding, point-in-time/best-efforts recovery
+- [ ] Type `compaction_options_universal/fifo`, `block_cache` etc. (kept as raw strings)
+- [ ] `ReadOptions.Snapshot`; a named static for sync writes (e.g. `WriteOptions.SyncWrites`)
 
 ### E. Memtable  `[x] merged (2fb2ccb)`
 - [x] Bytewise/ReverseBytewise (+u64ts) comparators with exact separator/successor ports; `ComparatorKind` fast path
