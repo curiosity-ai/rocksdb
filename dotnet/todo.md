@@ -238,7 +238,8 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [ ] write_global_seqno (S); ingest_behind (M); overlapping files in one call (M); allow_db_generated_files (S)
   - [ ] TTL iterator wrapper (S); per-level GET_HIT, file-read histograms, cfstats interval (S/M); KeyMayExist filter I/O on miss (S)
 - Replication / secondary
-  - [ ] network-partition cluster test (S/M); handoff latency investigation (S/M); replication benchmarks (M); incremental MANIFEST tailing (M)
+  - [x] secondary tails the MANIFEST incrementally (native<->managed secondary compat), Raft network-partition tests, switchover hold trimmed (probe promote, 3 fewer fsyncs), replication benchmarks (bench/RocksDb.Managed.Replication.Benchmarks)
+  - [ ] secondary: verify table files exist before installing a version (S); re-measure switchover hold on a quiet machine (S)
 - Backup / error handling
   - [ ] SstFileManager + no-space auto recovery (M); atomic WAL-error recovery edits (M); backup exclude_files_callback (S); parallel copies (S/M)
 - Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)
