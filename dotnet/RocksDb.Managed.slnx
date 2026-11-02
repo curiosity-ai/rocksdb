@@ -14,6 +14,7 @@
     <Project Path="samples/ReplicationTest/ReplicationTest.csproj" />
     <Project Path="samples/SwitchoverTest/SwitchoverTest.csproj" />
     <Project Path="samples/ClusterTest/ClusterTest.csproj" />
+    <Project Path="samples/QuickStart/QuickStart.csproj" />
   </Folder>
   <Folder Name="/bench/">
     <Project Path="bench/RocksDb.Managed.Benchmarks/RocksDb.Managed.Benchmarks.csproj" />

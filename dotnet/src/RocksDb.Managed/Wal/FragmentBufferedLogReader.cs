@@ -403,6 +403,10 @@ public sealed class FragmentBufferedLogReader : IDisposable
     /// </summary>
     private bool TryReadMoreSync()
     {
+        // EOF exactly at a block boundary (e.g. an empty or block-aligned WAL being tailed): nothing is buffered, so
+        // UnmarkEOF has nothing to re-read and would only clear the flag, deferring the read of newly appended data to
+        // the next call (a tailing reader would then lag one poll behind). Read the next block right away instead.
+        if (_eof && _eofOffset == 0 && !_readError) _eof = false;
         if (!_eof && !_readError)
         {
             // Last read was a full read, so this is a trailer to skip.
@@ -425,6 +429,7 @@ public sealed class FragmentBufferedLogReader : IDisposable
 
     private async ValueTask<bool> TryReadMoreAsync(CancellationToken cancellationToken)
     {
+        if (_eof && _eofOffset == 0 && !_readError) _eof = false; // see TryReadMoreSync
         if (!_eof && !_readError)
         {
             _bufStart = _bufLen = 0;

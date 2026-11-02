@@ -170,7 +170,7 @@ public sealed class LocalFileSystem : IFileSystem
             handle?.Dispose();
             lock (s_lockedFilesLock) s_lockedFiles.Remove(key);
             if (e is RocksDbException) throw;
-            if (e is IOException or UnauthorizedAccessException) throw RocksDbException.IOError("While lock file: " + path + ": " + e.Message, e);
+            if (e is IOException or UnauthorizedAccessException) throw MapException("While lock file", path, e);
             throw;
         }
     }
