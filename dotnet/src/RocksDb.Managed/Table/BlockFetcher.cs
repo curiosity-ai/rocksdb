@@ -71,21 +71,59 @@ internal static class BlockFetcher
     public static ValueTask<Block> ReadBlockAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, bool verifyChecksums, CancellationToken ct) =>
         ReadBlockAsync(file, footer, handle, verifyChecksums, null, ct);
 
-    public static async ValueTask<Block> ReadBlockAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, bool verifyChecksums,
+    public static ValueTask<Block> ReadBlockAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, bool verifyChecksums,
         CompressionDictionary? dictionary, CancellationToken ct)
     {
         int n = CheckedLength(handle);
         byte[] buf = BlockBufferPool.Rent(n);
+        ValueTask<int> first;
         try
         {
-            int total = 0;
-            while (total < n)
+            first = file.ReadAsync((long)handle.Offset, buf.AsMemory(0, n), ct);
+        }
+        catch (Exception e)
+        {
+            BlockBufferPool.Return(buf);
+            return ValueTask.FromException<Block>(e);
+        }
+        int already = -1;
+        if (first.IsCompletedSuccessfully)
+        {
+            // Synchronous completion (page cache hit): no state machine. A ValueTask may be consumed only once, so the
+            // slow path continues from the known count.
+            try
             {
-                int r = await file.ReadAsync((long)handle.Offset + total, buf.AsMemory(total, n - total), ct).ConfigureAwait(false);
-                if (r <= 0) break;
-                total += r;
+                already = first.Result;
+                if (already == n) return new ValueTask<Block>(ProcessSerialized(buf, footer, handle, verifyChecksums, dictionary));
             }
-            if (total != n) ThrowTruncated(handle, total);
+            catch (Exception e)
+            {
+                // ProcessSerialized returns the buffer itself when it fails.
+                if (already != n) BlockBufferPool.Return(buf);
+                return ValueTask.FromException<Block>(e);
+            }
+            first = default;
+        }
+        return ReadBlockSlowAsync(file, footer, handle, verifyChecksums, dictionary, buf, n, first, already, ct);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private static async ValueTask<Block> ReadBlockSlowAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, bool verifyChecksums,
+        CompressionDictionary? dictionary, byte[] buf, int n, ValueTask<int> first, int alreadyRead, CancellationToken ct)
+    {
+        try
+        {
+            int total = alreadyRead >= 0 ? alreadyRead : await first.ConfigureAwait(false);
+            if (total > 0)
+            {
+                while (total < n)
+                {
+                    int r = await file.ReadAsync((long)handle.Offset + total, buf.AsMemory(total, n - total), ct).ConfigureAwait(false);
+                    if (r <= 0) break;
+                    total += r;
+                }
+            }
+            if (total != n) ThrowTruncated(handle, Math.Max(total, 0));
         }
         catch
         {
@@ -144,6 +182,8 @@ internal static class BlockFetcher
         }
     }
 
+    [ThreadStatic] private static RentedBufferWriter? t_decompressWriter;
+
     [MethodImpl(MethodImplOptions.NoInlining)]
     internal static Block Decompress(CompressionType type, ReadOnlySpan<byte> compressed, int formatVersion) => Decompress(type, compressed, formatVersion, null);
 
@@ -152,7 +192,10 @@ internal static class BlockFetcher
     {
         // No initial buffer: the decompressors request the exact uncompressed size (stored in the block or the snappy
         // header) with a single GetSpan, so the block gets one right-sized array and no grow-and-copy.
-        var w = new RentedBufferWriter(0, blockPool: true);
+        // Per-thread writer (it holds no buffer between calls: Detach/Dispose leave it empty), so a block read does not
+        // allocate the writer object.
+        RentedBufferWriter w = t_decompressWriter ?? new RentedBufferWriter(0, blockPool: true);
+        t_decompressWriter = null;
         try
         {
             BlockCompression.Decompress(type, compressed, formatVersion, w, dictionary);
@@ -163,6 +206,7 @@ internal static class BlockFetcher
         finally
         {
             w.Dispose();
+            t_decompressWriter = w;
         }
     }
 
@@ -271,5 +315,6 @@ internal sealed class RentedBufferWriter : IBufferWriter<byte>, IDisposable
     {
         ReturnArray(_buffer);
         _buffer = [];
+        _written = 0;
     }
 }

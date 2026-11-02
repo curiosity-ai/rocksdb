@@ -260,40 +260,59 @@ public sealed class ColumnFamily
         }
     }
 
-    /// <summary>Looks up several keys (currently one lookup per key). Missing keys yield null.</summary>
+    /// <summary>
+    /// Looks up several keys from one consistent view (batched like DB::MultiGet). Missing keys yield null. Allocates the
+    /// result arrays; prefer <see cref="MultiGet(MultiGetBatch)"/> on hot paths.
+    /// </summary>
     public byte[]?[] MultiGet(IReadOnlyList<byte[]> keys) => MultiGet(null, keys);
 
+    /// <inheritdoc cref="MultiGet(IReadOnlyList{byte[]})"/>
     public byte[]?[] MultiGet(ReadOptions? options, IReadOnlyList<byte[]> keys)
     {
         ArgumentNullException.ThrowIfNull(keys);
-        // All lookups read at the same sequence number, like DB::MultiGet.
-        Snapshot? temp = null;
-        if (options?.Snapshot is null)
+        var result = new byte[]?[keys.Count];
+        if (keys.Count == 0) return result;
+        using var batch = new MultiGetBatch(keys.Count);
+        for (int i = 0; i < keys.Count; i++) batch.Add(keys[i]);
+        MultiGet(options, batch);
+        for (int i = 0; i < result.Length; i++)
         {
-            temp = _db.GetSnapshot();
-            options = options is null ? new ReadOptions { Snapshot = temp } : CloneWithSnapshot(options, temp);
+            switch (batch.GetStatus(i))
+            {
+                case MultiGetStatus.Found: result[i] = batch.GetValue(i).ToArray(); break;
+                case MultiGetStatus.Error: throw batch.GetError(i)!;
+            }
         }
-        try
-        {
-            var result = new byte[]?[keys.Count];
-            for (int i = 0; i < keys.Count; i++) result[i] = Get(options, keys[i]);
-            return result;
-        }
-        finally
-        {
-            temp?.Dispose();
-        }
+        return result;
     }
 
-    private static ReadOptions CloneWithSnapshot(ReadOptions o, Snapshot s) => new()
+    /// <summary>
+    /// Looks up all keys of <paramref name="batch"/> from one consistent view (one super version and sequence number;
+    /// DB::MultiGet). Results (per-key status and value) are stored in the batch. Does not allocate in steady state.
+    /// </summary>
+    public void MultiGet(MultiGetBatch batch) => MultiGet(null, batch);
+
+    /// <inheritdoc cref="MultiGet(MultiGetBatch)"/>
+    public void MultiGet(ReadOptions? options, MultiGetBatch batch)
     {
-        Snapshot = s,
-        VerifyChecksums = o.VerifyChecksums,
-        FillCache = o.FillCache,
-        ReadTier = o.ReadTier,
-        IgnoreRangeDeletions = o.IgnoreRangeDeletions,
-        AsyncIo = o.AsyncIo,
-    };
+        ArgumentNullException.ThrowIfNull(batch);
+        _db.ThrowIfDisposed();
+        if (batch.Count == 0) return;
+        ValueTask t = _db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None);
+        t.GetAwaiter().GetResult();
+    }
+
+    /// <summary>Async <see cref="MultiGet(MultiGetBatch)"/>: data blocks missing from the block cache are read with async I/O.</summary>
+    public ValueTask MultiGetAsync(MultiGetBatch batch, CancellationToken cancellationToken = default) => MultiGetAsync(null, batch, cancellationToken);
+
+    /// <inheritdoc cref="MultiGetAsync(MultiGetBatch, CancellationToken)"/>
+    public ValueTask MultiGetAsync(ReadOptions? options, MultiGetBatch batch, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(batch);
+        _db.ThrowIfDisposed();
+        if (batch.Count == 0) return ValueTask.CompletedTask;
+        return _db.MultiGetAsync(_cfd, options, batch, synchronous: false, cancellationToken);
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private GetContext Lookup(ReadOptions? options, ReadOnlySpan<byte> key)

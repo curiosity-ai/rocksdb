@@ -22,8 +22,8 @@ namespace RocksDb.Managed.Benchmarks.DbBench;
 /// <item>Latency histogram per operation (per batch for multireadrandom / batched writes); percentiles in µs.</item>
 /// </list>
 /// <c>--async</c> (managed only) runs every worker as a task over PutAsync/TryGetAsync/DeleteAsync/WriteAsync and the
-/// async iterator, and flush/compact/waitforcompaction over FlushAsync/CompactRangeAsync/WaitForCompactAsync; there is
-/// no MultiGetAsync, so multireadrandom uses the synchronous MultiGet.
+/// async iterator, multireadrandom over MultiGetAsync, and flush/compact/waitforcompaction over
+/// FlushAsync/CompactRangeAsync/WaitForCompactAsync.
 /// <c>stats</c> prints the LSM shape (files per level), the flush+compaction bytes written ("Cumulative compaction" line
 /// of rocksdb.stats) and the write amplification relative to the user bytes (key + value) written since the DB was
 /// created by this process, followed by a machine-readable <c>STATS,...</c> line (see <see cref="PrintStats"/>).
@@ -527,7 +527,7 @@ public static class DbBenchRunner
                     await SeeksAsync(me, w, n, rng).ConfigureAwait(false);
                     break;
                 case "multireadrandom":
-                    DoMultiGet(w, n, ref rng); // no MultiGetAsync in the managed API
+                    await MultiGetAsync(w, n, rng).ConfigureAwait(false);
                     break;
                 case "deleterandom":
                     await DeletesAsync(me, w, n, rng).ConfigureAwait(false);
@@ -591,6 +591,27 @@ public static class DbBenchRunner
                     w.Bytes += ks + buffer.WrittenCount;
                 }
                 if (hist) w.Hist.Add(Clock.ElapsedNs(t0));
+            }
+            w.Ops = n;
+        }
+
+        private async Task MultiGetAsync(Worker w, long n, SplitMix64 rng)
+        {
+            bool hist = f.Histogram;
+            ulong num = (ulong)f.Num;
+            int m = f.MultiGetSize, ks = f.KeySize;
+            using IMultiGetContext ctx = engine.CreateMultiGetContext(m, ks);
+            long i = 0;
+            while (i < n)
+            {
+                int cnt = (int)Math.Min(n - i, m);
+                for (int j = 0; j < cnt; j++) KeyFormat.Make(ctx.Key(j), rng.Uniform(num));
+                long t0 = Clock.Now();
+                (int found, long valueBytes) = await ManagedEngine.MultiGetAsync(ctx, cnt).ConfigureAwait(false);
+                if (hist) w.Hist.Add(Clock.ElapsedNs(t0));
+                w.Found += found;
+                w.Bytes += (long)found * ks + valueBytes;
+                i += cnt;
             }
             w.Ops = n;
         }

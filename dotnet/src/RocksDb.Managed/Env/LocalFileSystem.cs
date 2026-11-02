@@ -277,6 +277,14 @@ internal sealed class LocalRandomAccessFile : IRandomAccessFile
     {
         if (_alignment != 0) return ReadDirectAsync(offset, destination, cancellationToken);
         ValueTask<int> first;
+        if (UnixNative.NoWaitReadSupported)
+        {
+            // Page cache hit: complete synchronously instead of a thread pool round trip (RandomAccess.ReadAsync on
+            // Unix runs a blocking pread on the pool). A short count means only part of the range is cached.
+            int got = UnixNative.TryReadNoWait(_handle, destination.Span, offset);
+            if (got == destination.Length || got == 0) return new ValueTask<int>(got);
+            if (got > 0) return ReadAsyncSlow(default, got, offset, destination, cancellationToken);
+        }
         try
         {
             first = RandomAccess.ReadAsync(_handle, destination, offset, cancellationToken);
@@ -809,7 +817,48 @@ internal sealed class LocalWritableFile : IWritableFile
         }
     }
 
-    private async ValueTask WriteRawAsync(ReadOnlyMemory<byte> data, long offset, CancellationToken cancellationToken)
+    private ValueTask WriteRawAsync(ReadOnlyMemory<byte> data, long offset, CancellationToken cancellationToken)
+    {
+        if (_alignment == 0 && _options.RateLimiter is null && !data.IsEmpty)
+        {
+            if (UnixNative.NoWaitWriteSupported)
+            {
+                // Buffered write that fits into the page cache without blocking: complete synchronously instead of a
+                // thread pool round trip per WAL record / buffer flush. Falls back for the rest when it would block.
+                Preallocate(offset + data.Length);
+                int n = UnixNative.TryWriteNoWait(_handle, data.Span, offset);
+                if (n == data.Length) return ValueTask.CompletedTask;
+                if (n > 0)
+                {
+                    data = data[n..];
+                    offset += n;
+                }
+            }
+            else if (data.Length <= InlineAsyncWriteLimit)
+            {
+                // No RWF_NOWAIT for buffered writes (e.g. ext4): a small buffered pwrite is a copy into the page cache,
+                // much cheaper than the thread pool round trip RandomAccess.WriteAsync makes on Unix (it runs the same
+                // blocking pwrite on a pool thread). Native RocksDB writes the WAL the same way; SyncAsync already
+                // runs fdatasync inline.
+                try
+                {
+                    WriteRaw(data.Span, offset);
+                    return ValueTask.CompletedTask;
+                }
+                catch (Exception e)
+                {
+                    return ValueTask.FromException(e);
+                }
+            }
+        }
+        return WriteRawSlowAsync(data, offset, cancellationToken);
+    }
+
+    /// <summary>Largest buffered write <see cref="WriteRawAsync"/> performs inline when RWF_NOWAIT is unavailable.</summary>
+    private const int InlineAsyncWriteLimit = 256 << 10;
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask WriteRawSlowAsync(ReadOnlyMemory<byte> data, long offset, CancellationToken cancellationToken)
     {
         Preallocate(offset + data.Length);
         try

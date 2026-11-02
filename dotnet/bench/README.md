@@ -71,7 +71,7 @@ Flags (same for all engines): `--num`, `--reads` (default num), `--key_size` (16
 `--level0_file_num_compaction_trigger` (4), `--disable_auto_compactions`, `--max_background_jobs` (2), `--use_existing_db`,
 `--seed` (301), `--db`, `--histogram` (1). `--async` (managed only) runs each worker as a task over
 `PutAsync`/`TryGetAsync`/`DeleteAsync`/`WriteAsync` and the async iterator, and `flush`/`compact`/`waitforcompaction` over
-`FlushAsync`/`CompactRangeAsync`/`WaitForCompactAsync` (`multireadrandom` stays synchronous: there is no `MultiGetAsync`).
+`FlushAsync`/`CompactRangeAsync`/`WaitForCompactAsync`, and `multireadrandom` over `MultiGetAsync`.
 
 `stats` prints, for every engine through `GetProperty` (`rocksdb_property_value` in C):
 

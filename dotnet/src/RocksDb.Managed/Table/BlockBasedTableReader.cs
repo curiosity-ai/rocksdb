@@ -180,7 +180,7 @@ internal struct BlockRef
 /// </para>
 /// </summary>
 [SkipLocalsInit]
-public sealed class BlockBasedTableReader : IDisposable
+public sealed partial class BlockBasedTableReader : IDisposable
 {
     private static long s_nextTableId;
 
