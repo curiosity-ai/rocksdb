@@ -362,4 +362,73 @@ public sealed class BackupEngineTests
         Assert.AreEqual("cf-value", GetString(r.GetColumnFamily("x"), "cf-key"));
         CollectionAssert.AreEqual(Value(7, 1), r.Get(Key(7)));
     }
+
+    /// <summary>
+    /// With the DB's FileChecksumGenCrc32cFactory (compare_checksum in BackupEngineImpl::CreateNewBackupWithMetadata),
+    /// the MANIFEST crc32c of table and blob files is the backup checksum: the legacy shared_checksum names use it, and
+    /// a copy that does not match it fails (a table file modified since it was written is detected, unlike without the
+    /// factory, where the modified file is backed up).
+    /// </summary>
+    [TestMethod]
+    public void DbFileChecksumsAreUsedAndVerifiedByBackups()
+    {
+        foreach (bool withFactory in new[] { true, false })
+        {
+            MemoryFileSystem fs = NewFs();
+            DbOptions o = NewOptions(fs);
+            if (withFactory) o.FileChecksumGenFactory = FileChecksumGenCrc32cFactory.Instance;
+            var cf = new ColumnFamilyOptions { EnableBlobFiles = true, MinBlobSize = 40 };
+            using RocksDatabase db = RocksDatabase.Open(DbPath, o, cf);
+            Fill(db, 0, 100, 1);
+            db.Flush();
+            var legacy = new BackupEngineOptions(BackupDir) { ShareFilesWithChecksumNaming = ShareFilesNaming.LegacyCrc32cAndFileSize };
+            using (BackupEngine be = BackupEngine.Open(legacy, fs))
+            {
+                Assert.AreEqual(1u, be.CreateNewBackup(db, flushBeforeBackup: false));
+                be.VerifyBackup(1, verifyWithChecksum: true);
+            }
+            // The legacy names carry the crc32c, which is the MANIFEST checksum of the file.
+            foreach (LiveFileMetadata f in db.GetLiveFilesMetadata())
+            {
+                string prefix = f.FileNumber.ToString("D6", System.Globalization.CultureInfo.InvariantCulture) + "_";
+                string shared = Children(fs, BackupDir + "/shared_checksum").Single(n => n.StartsWith(prefix, StringComparison.Ordinal));
+                uint crc = RocksDb.Managed.Util.Crc32C.Value(ReadAll(fs, f.Directory + f.Name));
+                Assert.AreEqual(prefix + crc.ToString(System.Globalization.CultureInfo.InvariantCulture) + "_" + f.Size + ".sst", shared);
+                if (withFactory) Assert.AreEqual(crc, System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(f.FileChecksum));
+            }
+
+            // A table file modified in place (same size) after the MANIFEST recorded its checksum.
+            Fill(db, 100, 150, 1);
+            db.Flush();
+            LiveFileMetadata newest = db.GetLiveFilesMetadata().OrderByDescending(m => m.FileNumber).First();
+            Rewrite(fs, newest.Directory + newest.Name, d =>
+            {
+                d[20] ^= 0x01;
+                return d;
+            });
+            using (BackupEngine be = BackupEngine.Open(Opts(), fs))
+            {
+                if (withFactory)
+                {
+                    RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() => be.CreateNewBackup(db, flushBeforeBackup: false));
+                    Assert.AreEqual(StatusCode.Corruption, e.Code);
+                    StringAssert.Contains(e.Message, "Checksum mismatch after copying to");
+                    Assert.AreEqual(1, be.GetBackupInfo(includeFileDetails: false).Count);
+                }
+                else
+                {
+                    Assert.AreEqual(2u, be.CreateNewBackup(db, flushBeforeBackup: false));
+                }
+            }
+        }
+    }
+
+    private static byte[] ReadAll(IFileSystem fs, string path)
+    {
+        var data = new byte[fs.GetFileSize(path)];
+        using ISequentialFile f = fs.OpenSequential(path);
+        int read = 0;
+        while (read < data.Length) read += f.Read(data.AsSpan(read));
+        return data;
+    }
 }

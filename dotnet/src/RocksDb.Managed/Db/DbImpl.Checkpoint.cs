@@ -7,7 +7,17 @@ namespace RocksDb.Managed.Db;
 /// A live file to be captured by a checkpoint/backup. Port of LiveFileStorageInfo (include/rocksdb/metadata.h).
 /// </summary>
 internal sealed record LiveFileStorageInfo(string Directory, string RelativeFileName, ulong FileNumber, FileType FileType, ulong Size,
-    bool TrimToSize, string? ReplacementContents);
+    bool TrimToSize, string? ReplacementContents)
+{
+    /// <summary>
+    /// file_checksum_func_name with include_checksum_info: the MANIFEST's function name of a table / blob file, or
+    /// kUnknownFileChecksumFuncName ("Unknown"); empty when checksum info was not requested.
+    /// </summary>
+    public string FileChecksumFuncName { get; init; } = "";
+
+    /// <summary>file_checksum with include_checksum_info (kUnknownFileChecksum, empty, when unknown).</summary>
+    public byte[] FileChecksum { get; init; } = [];
+}
 
 /// <summary>
 /// Checkpoints. Ports DBImpl::GetLiveFilesStorageInfo (db/db_filesnapshot.cc) and CheckpointImpl::CreateCheckpoint /
@@ -81,7 +91,9 @@ internal sealed partial class DbImpl
     private async ValueTask<ulong> CreateCustomCheckpointAsync(string dest, ulong logSizeForFlush, bool synchronous, CancellationToken ct)
     {
         ulong sequenceNumber = Versions.LastSequence;
-        List<LiveFileStorageInfo> infos = await GetLiveFilesStorageInfoAsync(logSizeForFlush, synchronous, ct).ConfigureAwait(false);
+        // CheckpointImpl::CreateCheckpoint: get_live_table_checksum = false (the copies are not verified).
+        List<LiveFileStorageInfo> infos = await GetLiveFilesStorageInfoAsync(logSizeForFlush, includeChecksumInfo: false, synchronous, ct)
+            .ConfigureAwait(false);
         // Verify that everything except WAL files are in same directory (db_paths / cf_paths not supported).
         string? dir = null;
         foreach (LiveFileStorageInfo info in infos)
@@ -120,11 +132,13 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
-    /// Port of DBImpl::GetLiveFilesStorageInfo (without checksums): table and blob files, MANIFEST (trimmed to the size
-    /// matching the captured versions), CURRENT (replacement contents), OPTIONS and the live WALs (the last one
-    /// trimmed to its current size).
+    /// Port of DBImpl::GetLiveFilesStorageInfo: table and blob files, MANIFEST (trimmed to the size matching the
+    /// captured versions), CURRENT (replacement contents), OPTIONS and the live WALs (the last one trimmed to its
+    /// current size). With <paramref name="includeChecksumInfo"/> (LiveFilesStorageInfoOptions::include_checksum_info)
+    /// table and blob files carry their MANIFEST file checksum and function name, every other file the unknown ones.
     /// </summary>
-    internal async ValueTask<List<LiveFileStorageInfo>> GetLiveFilesStorageInfoAsync(ulong walSizeForFlush, bool synchronous, CancellationToken ct)
+    internal async ValueTask<List<LiveFileStorageInfo>> GetLiveFilesStorageInfoAsync(ulong walSizeForFlush, bool includeChecksumInfo, bool synchronous,
+        CancellationToken ct)
     {
         var results = new List<LiveFileStorageInfo>();
         bool flushMemtable = !_readOnly;
@@ -168,16 +182,18 @@ internal sealed partial class DbImpl
                     {
                         if (!seen.Add(meta.FileNumber)) continue;
                         string directory = DbPaths[(int)Math.Min(meta.PathId, (uint)(DbPaths.Count - 1))];
-                        results.Add(new LiveFileStorageInfo(directory, FileNames.MakeTableFileName(meta.FileNumber), meta.FileNumber, FileType.TableFile,
-                            meta.FileSize, TrimToSize: false, null));
+                        var info = new LiveFileStorageInfo(directory, FileNames.MakeTableFileName(meta.FileNumber), meta.FileNumber, FileType.TableFile,
+                            meta.FileSize, TrimToSize: false, null);
+                        results.Add(includeChecksumInfo ? WithChecksum(info, meta.FileChecksumFuncName, meta.FileChecksum) : info);
                     }
                 }
                 // Blob files live in cf_paths.front() (GetLiveFilesStorageInfo: blob_files of the current version).
                 foreach (Blob.BlobFileMetaData b in vsi.BlobFiles)
                 {
                     if (!seen.Add(b.BlobFileNumber)) continue;
-                    results.Add(new LiveFileStorageInfo(DbPaths[0], FileNames.BlobFileName(b.BlobFileNumber), b.BlobFileNumber, FileType.BlobFile,
-                        b.TotalBlobBytes + Blob.BlobLogFormat.HeaderSize + Blob.BlobLogFormat.FooterSize, TrimToSize: false, null));
+                    var info = new LiveFileStorageInfo(DbPaths[0], FileNames.BlobFileName(b.BlobFileNumber), b.BlobFileNumber, FileType.BlobFile,
+                        b.TotalBlobBytes + Blob.BlobLogFormat.HeaderSize + Blob.BlobLogFormat.FooterSize, TrimToSize: false, null);
+                    results.Add(includeChecksumInfo ? WithChecksum(info, b.Addition.ChecksumMethod, b.Addition.ChecksumValue) : info);
                 }
             }
             (manifestNumber, manifestSize) = Versions.InstalledManifest;
@@ -217,8 +233,22 @@ internal sealed partial class DbImpl
                 results.Add(new LiveFileStorageInfo(WalDir, FileNames.LogFileName(w.LogNumber), w.LogNumber, FileType.WalFile, w.SizeBytes, trim, null));
             }
         }
+        if (includeChecksumInfo)
+        {
+            // MANIFEST, CURRENT, OPTIONS and WAL files: kUnknownFileChecksumFuncName / kUnknownFileChecksum.
+            for (int i = 0; i < results.Count; i++)
+            {
+                if (results[i].FileChecksumFuncName.Length == 0) results[i] = WithChecksum(results[i], "", []);
+            }
+        }
         return results;
     }
+
+    /// <summary>The checksum info of a live file; an empty function name becomes kUnknownFileChecksumFuncName.</summary>
+    private static LiveFileStorageInfo WithChecksum(LiveFileStorageInfo info, string funcName, byte[] checksum) =>
+        funcName.Length == 0
+            ? info with { FileChecksumFuncName = FileMetaData.UnknownFileChecksumFuncName, FileChecksum = [] }
+            : info with { FileChecksumFuncName = funcName, FileChecksum = checksum };
 
     /// <summary>Port of CreateFile (file/file_util.cc): writes <paramref name="contents"/> and syncs.</summary>
     private async ValueTask CreateFileAsync(string path, string contents, bool synchronous, CancellationToken ct)

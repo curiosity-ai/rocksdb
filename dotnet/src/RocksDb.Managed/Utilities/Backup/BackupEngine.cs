@@ -113,7 +113,12 @@ public sealed class BackupEngine : BackupEngineReadOnly
                     // CheckpointImpl::CreateCustomCheckpoint: the sequence number is read before the live files.
                     ulong sequenceNumber = db.Versions.LastSequence;
                     ulong walSizeForFlush = options.FlushBeforeBackup || db.Options.Allow2Pc ? 0 : ulong.MaxValue;
-                    List<LiveFileStorageInfo> infos = await db.GetLiveFilesStorageInfoAsync(walSizeForFlush, synchronous, ct).ConfigureAwait(false);
+                    // compare_checksum: with the DB's crc32c checksum factory the live table / blob file checksums (crc32c
+                    // of the whole file, the backup engine's own checksum) come from the MANIFEST instead of being
+                    // computed, and the copies are verified against them.
+                    bool compareChecksum = db.Options.FileChecksumGenFactory?.Name == FileChecksumGenCrc32cFactory.ClassName;
+                    List<LiveFileStorageInfo> infos = await db.GetLiveFilesStorageInfoAsync(walSizeForFlush, compareChecksum, synchronous, ct)
+                        .ConfigureAwait(false);
                     string? dir = null;
                     foreach (LiveFileStorageInfo info in infos)
                     {
@@ -141,7 +146,8 @@ public sealed class BackupEngine : BackupEngineReadOnly
                         ulong sizeBytes = sharable ? (ulong)db.FileSystem.GetFileSize(info.Directory + "/" + info.RelativeFileName) : info.Size;
                         bool sharedChecksum = _options.ShareFilesWithChecksum && sharable;
                         BackupWorkItem item = await PrepareBackupFileAsync(newId, liveDstPaths, _options.ShareTableFiles && sharable, info.Directory,
-                            info.RelativeFileName, db.FileSystem, info.FileType, sizeBytes, info.Size, sharedChecksum, synchronous, ct).ConfigureAwait(false);
+                            info.RelativeFileName, db.FileSystem, info.FileType, sizeBytes, info.Size, sharedChecksum, info.FileChecksumFuncName,
+                            info.FileChecksum, synchronous, ct).ConfigureAwait(false);
                         // AddBackupFileWorkItem: with an exclude_files_callback, shared_checksum files that need a copy are
                         // excludable and only dispatched after the callback.
                         if (options.ExcludeFilesCallback is not null && item.Shared && sharedChecksum && item.NeedToCopy) excludable.Add(item);
@@ -299,13 +305,25 @@ public sealed class BackupEngine : BackupEngineReadOnly
     /// <summary>
     /// Port of BackupEngineImpl::AddBackupFileWorkItem (decision part): picks the destination (shared_checksum, shared or
     /// private) and skips files the backup directory already holds (reusing their known checksum). The copy runs later
-    /// (<see cref="CopyBackupFileAsync"/>), shared ones through a temporary name renamed into place afterwards.
+    /// (<see cref="CopyBackupFileAsync"/>), shared ones through a temporary name renamed into place afterwards. A source
+    /// checksum from the DB's MANIFEST (<paramref name="srcChecksumFuncName"/> = kDbFileChecksumFuncName,
+    /// "FileChecksumCrc32c") is used as the file's crc32c: no extra read for the legacy shared_checksum name, and the
+    /// copy is verified against it.
     /// </summary>
     private async ValueTask<BackupWorkItem> PrepareBackupFileAsync(uint backupId, HashSet<string> liveDstPaths, bool shared, string srcDir, string fname,
-        IFileSystem srcFs, FileType fileType, ulong sizeBytes, ulong sizeLimit, bool sharedChecksum, bool synchronous, CancellationToken ct)
+        IFileSystem srcFs, FileType fileType, ulong sizeBytes, ulong sizeLimit, bool sharedChecksum, string srcChecksumFuncName, byte[] srcChecksum,
+        bool synchronous, CancellationToken ct)
     {
         string srcPath = srcDir + "/" + fname;
         uint? crc = null;
+        // Step 0: Check if default checksum function name is passed in.
+        if (srcChecksumFuncName == FileChecksumGenCrc32cFactory.Crc32cFuncName)
+        {
+            if (srcChecksum.Length == 0) throw new RocksDbException(StatusCode.Aborted, "Operation aborted: Unknown checksum value for " + fname);
+            if (srcChecksum.Length != 4) ThrowHelper.Corruption("Invalid crc32c file checksum of " + fname);
+            // ChecksumStrToHex / ChecksumHexToInt32: the factory stores the crc32c big endian.
+            crc = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(srcChecksum);
+        }
         string dbSessionId = "";
         string dstRelative, dstRelativeTmp = "";
         if (shared && sharedChecksum)
@@ -316,7 +334,7 @@ public sealed class BackupEngine : BackupEngineReadOnly
                 TryGetFileDbIdentities(srcFs, srcPath, out _, out dbSessionId);
             }
             // Calculate the checksum when no db session id is available (the name then contains it).
-            if (dbSessionId.Length == 0) crc = await ComputeChecksumAsync(srcFs, srcPath, sizeLimit, _options.BackupRateLimiter, synchronous, ct).ConfigureAwait(false);
+            if (crc is null && dbSessionId.Length == 0) crc = await ComputeChecksumAsync(srcFs, srcPath, sizeLimit, _options.BackupRateLimiter, synchronous, ct).ConfigureAwait(false);
             string name = GetSharedFileWithChecksum(fname, crc, sizeBytes, dbSessionId);
             dstRelativeTmp = GetSharedFileWithChecksumRel(name, true);
             dstRelative = GetSharedFileWithChecksumRel(name, false);
@@ -383,8 +401,9 @@ public sealed class BackupEngine : BackupEngineReadOnly
             progress, synchronous, ct).ConfigureAwait(false);
         if (item.Crc is uint expected && expected != copiedCrc)
         {
-            ThrowHelper.Corruption("Checksum mismatch after copying " + item.SrcPath + ": expected " + BackupEngineReadOnly.ChecksumToHex(expected) + ", got " +
-                BackupEngineReadOnly.ChecksumToHex(copiedCrc));
+            // CopyEngine: the checksum known before the copy (computed, or the DB's crc32c file checksum) must match.
+            ThrowHelper.Corruption("Checksum mismatch after copying to " + item.CopyDestPath + ": Expected checksum is " +
+                BackupEngineReadOnly.ChecksumToHex(expected) + " while computed checksum is " + BackupEngineReadOnly.ChecksumToHex(copiedCrc));
         }
         item.Crc = copiedCrc;
         item.Size = (ulong)_backupFs.GetFileSize(item.CopyDestPath);
