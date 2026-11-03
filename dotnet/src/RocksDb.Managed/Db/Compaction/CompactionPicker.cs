@@ -12,7 +12,7 @@ namespace RocksDb.Managed.Db;
 /// <c>byte[]</c> (picking is a cold path: once per compaction).
 /// </para>
 /// </summary>
-internal abstract class CompactionPicker
+internal abstract partial class CompactionPicker
 {
     private readonly HashSet<Compaction> _compactionsInProgress = new();
     private readonly HashSet<Compaction> _level0CompactionsInProgress = new();
@@ -406,9 +406,6 @@ internal abstract class CompactionPicker
         return t == CompressionType.DisableCompressionOption ? CompressionType.None : t;
     }
 
-    /// <summary>The compact cursor of <paramref name="level"/> (VersionStorageInfo::GetCompactCursors), or null.</summary>
-    protected virtual byte[]? GetCompactCursor(int level) => null;
-
     /// <summary>Port of LevelCompactionBuilder::GetPathId (single path when db_paths has one entry).</summary>
     public virtual uint GetPathId(int level) => 0;
 
@@ -445,7 +442,7 @@ internal abstract class CompactionPicker
         // cursor in the output level to split output files (leveled kRoundRobin), if it is inside the user-key range.
         if (Options.CompactionStyle == CompactionStyle.Level && Options.CompactionPri == CompactionPri.RoundRobin)
         {
-            byte[]? cursor = GetCompactCursor(outputLevel);
+            byte[]? cursor = vstorage.GetCompactCursor(outputLevel);
             if (cursor is { Length: > 0 })
             {
                 ReadOnlySpan<byte> cursorUserKey = DbFormat.ExtractUserKey(cursor);

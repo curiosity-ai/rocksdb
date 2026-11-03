@@ -19,6 +19,23 @@ internal struct CompactionIterationStats
     public long NumRangeDelDropObsolete;
     public long TotalInputRawKeyBytes;
     public long TotalInputRawValueBytes;
+
+    /// <summary>Adds the counters of another (sub)compaction (CompactionJobStats::Add of the iteration stats).</summary>
+    public void Add(in CompactionIterationStats o)
+    {
+        NumInputRecords += o.NumInputRecords;
+        NumInputDeletionRecords += o.NumInputDeletionRecords;
+        NumRecordDropHidden += o.NumRecordDropHidden;
+        NumRecordDropObsolete += o.NumRecordDropObsolete;
+        NumRecordDropRangeDel += o.NumRecordDropRangeDel;
+        NumRecordDropUser += o.NumRecordDropUser;
+        NumSingleDelMismatch += o.NumSingleDelMismatch;
+        NumSingleDelFallthru += o.NumSingleDelFallthru;
+        NumOptimizedDelDropObsolete += o.NumOptimizedDelDropObsolete;
+        NumRangeDelDropObsolete += o.NumRangeDelDropObsolete;
+        TotalInputRawKeyBytes += o.TotalInputRawKeyBytes;
+        TotalInputRawValueBytes += o.TotalInputRawValueBytes;
+    }
 }
 
 /// <summary>

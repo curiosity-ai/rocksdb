@@ -76,6 +76,41 @@ public sealed class FileMetaData
     /// <summary>In-memory only (FileMetaData::being_compacted): the file is an input of a running compaction. Guarded by the DB mutex.</summary>
     internal bool BeingCompacted { get; set; }
 
+    // Data-entry stats (FileMetaData::num_entries, num_deletions, num_range_deletions, raw_key_size, raw_value_size,
+    // init_stats_from_file, compensated_file_size; db/version_edit.h), in memory only. Loaded from the table properties
+    // by VersionStorageInfo.UpdateAccumulatedStats (Version::UpdateAccumulatedStats) for a capped number of new files per
+    // version; CompensatedFileSize is computed once, when the file first appears in a version (ComputeCompensatedSizes),
+    // before the version is published. Written under the MANIFEST lock before publication, read-only afterwards.
+    internal ulong NumEntries;
+    internal ulong NumDeletions;
+    internal ulong NumRangeDeletions;
+    internal ulong RawKeySize;
+    internal ulong RawValueSize;
+    /// <summary>init_stats_from_file: the entry stats were loaded (or loading was attempted).</summary>
+    internal bool InitStatsFromFile;
+    /// <summary>
+    /// The entry stats above are already known (set from the table builder of a compaction output), so loading them
+    /// needs no table read. Upstream reads the same values back from the table properties.
+    /// </summary>
+    internal bool EntryStatsKnown;
+    /// <summary>
+    /// compensated_file_size: file size plus a deletion boost (point deletions beyond the non-deletions, weighted by the
+    /// average value size) plus <see cref="CompensatedRangeDeletionSize"/>. 0 = not computed yet.
+    /// </summary>
+    internal ulong CompensatedFileSize;
+
+    /// <summary>Sets the entry stats from table properties (Version::MaybeInitializeFileMetaData, incl. its invariants).</summary>
+    internal void SetEntryStats(Table.TableProperties tp)
+    {
+        RawValueSize = tp.RawValueSize;
+        RawKeySize = tp.RawKeySize;
+        NumRangeDeletions = tp.NumRangeDeletions;
+        // Ensure new invariants on old files
+        NumDeletions = Math.Max(tp.NumDeletions, tp.NumRangeDeletions);
+        NumEntries = Math.Max(tp.NumEntries, NumDeletions);
+        EntryStatsKnown = true;
+    }
+
     // FileSampledStats (db/version_edit.h), in memory only; updated with relaxed atomics by readers
     // (monitoring/file_read_sample.h). Shared by every version that contains this file.
     private long _numReadsSampled;
@@ -106,6 +141,10 @@ public sealed class FileMetaData
     {
         var c = (FileMetaData)MemberwiseClone();
         c.BeingCompacted = false;
+        // Upstream re-creates the FileMetaData from the edit: its stats are initialized (and counted) again by the new
+        // version and its compensated size recomputed. The entry stats themselves are unchanged (EntryStatsKnown).
+        c.InitStatsFromFile = false;
+        c.CompensatedFileSize = 0;
         c._numReadsSampled = 0;
         c._numCollapsibleEntryReadsSampled = 0;
         return c; // byte[] members are treated as immutable once assigned

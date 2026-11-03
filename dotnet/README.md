@@ -441,6 +441,12 @@ db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = Bottommost
 await db.CompactRangeAsync("key:0"u8.ToArray(), "key:5"u8.ToArray());
 await db.WaitForCompactAsync();                       // until no flush/compaction is pending
 
+// Compact chosen table files into a level (files a valid compaction needs are added); returns the outputs.
+db.Put("key:x"u8, "value"u8);
+db.Flush();
+List<string> l0 = db.GetLiveFilesMetadata().FindAll(f => f.Level == 0).ConvertAll(f => f.Name);
+IReadOnlyList<string> outputs = db.CompactFiles(new CompactFilesOptions { MaxSubcompactions = 2 }, l0, 6);
+
 Console.WriteLine(db.GetProperty(DbProperties.NumFilesAtLevelPrefix + "6"));   // files at L6
 string? stats = db.GetProperty(DbProperties.Stats);                             // native-format stats dump
 ```
@@ -889,7 +895,7 @@ Not ported yet:
 - Timestamps in optimistic transactions and explicit-timestamp `WriteBatchWithIndex` writes (NotSupported, as upstream).
 - Range locks; for WritePrepared / WriteUnprepared: iterator invalidation when a WriteUnprepared transaction ends, and
   user-defined timestamps (NotSupported, as upstream).
-- PlainTable and CuckooTable, parallel compression, subcompactions, `CompactFiles`,
+- PlainTable and CuckooTable, parallel compression,
   the SST file manager and a rate limiter for flush and compaction.
 - Wide-column entities with blob-backed columns (V2) and blob direct write (forced blob GC is leveled-only, as
   upstream).

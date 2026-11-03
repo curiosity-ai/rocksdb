@@ -129,6 +129,8 @@ internal static class FlushJob
                     meta.MaxTimestamp = builder.TimestampMax;
                     // BuildTable: meta->marked_for_compaction = builder->NeedCompact() (table properties collectors).
                     meta.MarkedForCompaction = builder.NeedCompact;
+                    // Entry stats as the version would load them from the table properties (no table read needed).
+                    meta.SetEntryStats(builder.Properties);
                     keep = true;
                 }
             }
