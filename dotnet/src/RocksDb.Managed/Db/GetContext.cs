@@ -118,6 +118,44 @@ internal sealed class GetContext
         _tsFromRangeTombstone = true;
     }
 
+    /// <summary>
+    /// GetMergeOperandsOptions::continue_cb: called with each merge operand found (newest first, base values excluded);
+    /// returning false ends the lookup at that operand (<see cref="OperandsStopped"/>). Null for other lookups.
+    /// </summary>
+    public MergeOperandContinueCallback? ContinueCallback;
+    /// <summary>The lookup was ended by <see cref="ContinueCallback"/>: <see cref="MergeContext"/> holds the operands, there is no base value.</summary>
+    public bool OperandsStopped;
+
+    /// <summary>
+    /// Applies <see cref="ContinueCallback"/> to the operands pushed since index <paramref name="from"/> (by a memtable
+    /// lookup, which collects a key's operands in one pass). Returns true if the callback ended the lookup.
+    /// </summary>
+    public bool ApplyContinueCallback(int from)
+    {
+        MergeOperandContinueCallback? cb = ContinueCallback;
+        if (cb is null) return false;
+        for (int i = from; i < MergeContext.Count; i++)
+        {
+            if (!cb(MergeContext.GetOperandNewestFirst(i)))
+            {
+                MergeContext.Truncate(i + 1);
+                StopAtOperand();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void StopAtOperand()
+    {
+        OperandsStopped = true;
+        Value.Clear();
+        ValueIsEntity = false;
+        ValueIsBlobIndex = false;
+        ValueEntityHasBlobColumns = false;
+        State = GetState.Found;
+    }
+
     /// <summary>Table-level read options of the lookup (fill_cache, rate_limiter_priority) passed to the table reads.</summary>
     public Table.TableReadFlags ReadFlags;
 
@@ -137,6 +175,8 @@ internal sealed class GetContext
         ReadSequence = DbFormat.MaxSequenceNumber;
         MergeOperator = mergeOperator;
         Callback = null;
+        ContinueCallback = null;
+        OperandsStopped = false;
         TimestampSize = 0;
         HasTimestamp = false;
         _tsFromRangeTombstone = false;
@@ -200,6 +240,11 @@ internal sealed class GetContext
             case EntryType.Merge:
                 State = GetState.Merge;
                 MergeContext.PushOperand(value);
+                if (ContinueCallback is { } cb && !cb(value))
+                {
+                    StopAtOperand();
+                    return false;
+                }
                 return true;
             default:
                 State = GetState.Corrupt;

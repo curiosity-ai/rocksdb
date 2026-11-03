@@ -142,7 +142,8 @@ internal sealed partial class DbImpl
     {
         var results = new List<LiveFileStorageInfo>();
         bool flushMemtable = !_readOnly;
-        if (walSizeForFlush == ulong.MaxValue)
+        // While the WAL is locked (LockWAL) the flush is skipped: the frozen state is checkpointed with its WALs.
+        if (walSizeForFlush == ulong.MaxValue || IsWalLocked)
         {
             flushMemtable = false;
         }

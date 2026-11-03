@@ -478,7 +478,10 @@ internal sealed partial class DbImpl
     {
         ThrowIfDisposed();
         if (_readOnly) ThrowHelper.NotSupported("FlushWAL is not supported in read-only mode");
-        WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
+        // While LockWAL holds a write stop no write can be inside the WAL stage (a stalled leader waits before it), so the
+        // WAL is flushed without entering the write thread: a stalled leader holds it until UnlockWAL (upstream's
+        // FlushWAL only takes log_write_mutex_).
+        WriteThread.Writer? w = IsWalLocked ? null : await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
         try
         {
             LogWriter? log = _log;
@@ -512,7 +515,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            ExitUnbatched(w, synchronous);
+            if (w is not null) ExitUnbatched(w, synchronous);
         }
     }
 }

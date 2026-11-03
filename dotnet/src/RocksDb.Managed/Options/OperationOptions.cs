@@ -181,6 +181,9 @@ public sealed class CompactRangeOptions
     public uint MaxSubcompactions { get; set; }
     /// <summary>Overrides enable_blob_garbage_collection for this compaction (default: use the column family setting).</summary>
     public BlobGarbageCollectionPolicy BlobGarbageCollectionPolicy { get; set; } = BlobGarbageCollectionPolicy.UseDefault;
+
+    /// <summary>The trim_ts of CompactRangeInternal (DB::OpenAndTrimHistory only): data newer than it is removed.</summary>
+    internal byte[]? TrimTs { get; init; }
     /// <summary>Overrides blob_garbage_collection_age_cutoff; values outside [0, 1] (default -1) use the column family setting.</summary>
     public double BlobGarbageCollectionAgeCutoff { get; set; } = -1;
     /// <summary>

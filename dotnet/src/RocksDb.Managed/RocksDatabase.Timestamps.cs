@@ -1,10 +1,60 @@
 using System.Buffers;
+using RocksDb.Managed.Db;
 
 namespace RocksDb.Managed;
 
 /// <summary>User-defined timestamp operations on the default column family (see <see cref="ColumnFamily"/>).</summary>
 public sealed partial class RocksDatabase
 {
+    /// <summary>
+    /// Opens the DB and removes, from every column family with user-defined timestamps, all data whose timestamp is
+    /// newer than <paramref name="trimTimestamp"/> (DB::OpenAndTrimHistory): each such column family is fully compacted
+    /// (bottommost kForceOptimized) with entries and range tombstones above the bound dropped. Requires
+    /// <see cref="DbOptions.AvoidFlushDuringRecovery"/> = false (so WAL data is flushed and trimmed too).
+    /// </summary>
+    public static RocksDatabase OpenAndTrimHistory(string path, DbOptions options, IReadOnlyList<ColumnFamilyDescriptor> columnFamilies,
+        ReadOnlySpan<byte> trimTimestamp)
+    {
+        ValueTask<RocksDatabase> t = OpenAndTrimHistoryCoreAsync(path, options, columnFamilies, trimTimestamp.ToArray(), synchronous: true, CancellationToken.None);
+        return t.IsCompleted ? t.Result : t.AsTask().GetAwaiter().GetResult();
+    }
+
+    /// <summary>Async <see cref="OpenAndTrimHistory"/>.</summary>
+    public static ValueTask<RocksDatabase> OpenAndTrimHistoryAsync(string path, DbOptions options, IReadOnlyList<ColumnFamilyDescriptor> columnFamilies,
+        ReadOnlyMemory<byte> trimTimestamp, CancellationToken cancellationToken = default) =>
+        OpenAndTrimHistoryCoreAsync(path, options, columnFamilies, trimTimestamp.ToArray(), synchronous: false, cancellationToken);
+
+    private static async ValueTask<RocksDatabase> OpenAndTrimHistoryCoreAsync(string path, DbOptions options,
+        IReadOnlyList<ColumnFamilyDescriptor> columnFamilies, byte[] trimTimestamp, bool synchronous, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (options.AvoidFlushDuringRecovery) ThrowHelper.InvalidArgument("avoid_flush_during_recovery incompatible with OpenAndTrimHistory");
+        DbImpl db = await DbImpl.OpenAsync(path, options, columnFamilies, synchronous, ct).ConfigureAwait(false);
+        var rdb = new RocksDatabase(db);
+        try
+        {
+            var compact = new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.ForceOptimized, TrimTs = trimTimestamp };
+            foreach (ColumnFamily cf in rdb.ColumnFamilies)
+            {
+                // Only compact column families with timestamp enabled.
+                int tsSize = cf.Data.TimestampSize;
+                if (tsSize == 0) continue;
+                if (trimTimestamp.Length != tsSize)
+                {
+                    ThrowHelper.InvalidArgument("Timestamp size mismatch: trim_ts has " + trimTimestamp.Length + " bytes, column family " + cf.Name
+                        + " expects " + tsSize);
+                }
+                await db.CompactRangeAsync(cf.Data, null, null, compact, synchronous, ct).ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            await rdb.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+        return rdb;
+    }
+
     /// <summary>Sets <paramref name="key"/> to <paramref name="value"/> at <paramref name="timestamp"/> in the default column family.</summary>
     public void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp, ReadOnlySpan<byte> value) => _default.Put(key, timestamp, value);
     public void Put(WriteOptions options, ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp, ReadOnlySpan<byte> value) =>

@@ -654,9 +654,18 @@ internal sealed class CompactionJob
         byte[]? fullHistoryTsLow = _cfd.TimestampSize != 0 ? _cfd.FullHistoryTsLow : null;
         _fullHistoryTsLow = fullHistoryTsLow;
         // With user-defined timestamps only tombstones at or below full_history_ts_low delete keys.
-        RangeDelAggregator rangeDel = RangeDelAggregator.ForCompaction(_icmp, _snapshots, fullHistoryTsLow);
+        // OpenAndTrimHistory: tombstones newer than trim_ts don't delete anything either (and are not written out).
+        byte[]? trimTs = _cfd.TimestampSize != 0 ? _c.TrimTs : null;
+        byte[]? tsUpperBound = fullHistoryTsLow;
+        if (trimTs is not null && (tsUpperBound is null || _cfd.UserComparator.CompareTimestamp(trimTs, tsUpperBound) < 0)) tsUpperBound = trimTs;
+        RangeDelAggregator rangeDel = RangeDelAggregator.ForCompaction(_icmp, _snapshots, tsUpperBound);
         var raw = new List<FragmentedRangeTombstoneList.Tombstone>();
         InternalIterator input = MakeInputIterator(rangeDel, raw);
+        if (trimTs is not null)
+        {
+            raw.RemoveAll(t => t.Timestamp is { } ts && _cfd.UserComparator.CompareTimestamp(ts, trimTs) > 0);
+            input = new HistoryTrimmingIterator(input, _cfd.UserComparator, trimTs);
+        }
         if (isPart)
         {
             // The subcompaction's slice of the input: [start@kMaxSequenceNumber, end@kMaxSequenceNumber).

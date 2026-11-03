@@ -761,9 +761,12 @@ internal sealed partial class DbImpl
         Exception? failure = null;
         long compactionStart = 0;
         int jobId = 0;
+        CancellationTokenSource? manualCancellation = null;
         try
         {
-            CancellationToken ct = _bgCancellation.Token;
+            // Manual compactions are also canceled by DisableManualCompaction (manual_compaction_canceled_).
+            if (isManual) manualCancellation = NewManualCompactionCancellation();
+            CancellationToken ct = manualCancellation?.Token ?? _bgCancellation.Token;
             TestHooks.Invoke("DBImpl::RunCompaction:Start");
             jobId = NewJobId();
             OnCompactionStarted(cfd, c, jobId);
@@ -869,6 +872,10 @@ internal sealed partial class DbImpl
             }
             OnCompactionCompleted(cfd, c, job, jobId, compactionStart);
         }
+        catch (OperationCanceledException e) when (isManual && !_bgCancellation.IsCancellationRequested)
+        {
+            failure = ManualCompactionPausedException(e);
+        }
         catch (OperationCanceledException e)
         {
             failure = new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress: compaction aborted", StatusSubCode.None, e);
@@ -894,6 +901,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
+            manualCancellation?.Dispose();
             if (jobId != 0)
             {
                 // CompactFilesImpl: BuildCompactionJobInfo for the caller's compaction_job_info.
@@ -1060,6 +1068,7 @@ internal sealed partial class DbImpl
         CompactionStyle style = cfd.Options.CompactionStyle;
         if (options.ChangeLevel && style == CompactionStyle.Fifo) ThrowHelper.NotSupported("FIFO compaction does not support change_level.");
         if (style == CompactionStyle.None) ThrowHelper.NotSupported("Compaction style None does not support CompactRange");
+        ThrowIfManualCompactionPaused();
 
         // CompactRangeInternal: update full_history_ts_low if it's set.
         if (options.FullHistoryTsLow is { Length: > 0 } tsLow)
@@ -1284,17 +1293,21 @@ internal sealed partial class DbImpl
                         throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
                     if (IsBgWorkStopped && ErrorHandler.BgError is { } e) ThrowBackgroundError(e);
                     if (cfd.Dropped) ThrowDropped(cfd);
+                    // DisableManualCompaction(): fail with Incomplete(kManualCompactionPaused) instead of starting.
+                    if (_manualCompactionPaused > 0) throw ManualCompactionPausedException(null);
                     bool conflict = _ingestionsRunning > 0;
                     if (!conflict)
                     {
                         c = cfd.CompactionState.Picker.PickCompactionForCompactRange(cfd.Current.Storage, inputLevel, outputLevel,
-                            options.MaxSubcompactions, beginKey, endKey, out compactionEnd, out conflict, maxFileNumToIgnore, disallowTrivialMove);
+                            options.MaxSubcompactions, beginKey, endKey, out compactionEnd, out conflict, maxFileNumToIgnore,
+                            disallowTrivialMove || options.TrimTs is not null);
                     }
                     if (!conflict)
                     {
                         if (c is not null)
                         {
                             c.BlobGarbageCollectionPolicy = options.BlobGarbageCollectionPolicy;
+                            c.TrimTs = options.TrimTs;
                             c.MaxSubcompactions = options.MaxSubcompactions;
                             c.BlobGarbageCollectionAgeCutoffOverride = options.BlobGarbageCollectionAgeCutoff;
                             c.InputVersion = cfd.Current;
@@ -1363,6 +1376,7 @@ internal sealed partial class DbImpl
         {
             if (_shuttingDown || _bgCancellation.IsCancellationRequested) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
             if (cfd.Dropped) ThrowDropped(cfd);
+            if (_manualCompactionPaused > 0) throw ManualCompactionPausedException(null);
             int outputPathId = options.OutputPathId;
             if (outputPathId < 0)
             {
