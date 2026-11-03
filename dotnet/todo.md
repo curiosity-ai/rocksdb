@@ -264,7 +264,8 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [x] PlainTable + CuckooTable (read/write, byte-identical regions vs native SstFileWriter, OPTIONS sections), adaptive reading by magic, user-defined index API
 - [ ] ingesting PlainTable/Cuckoo external files (ingestion still opens files as block-based) (S); trie_index factory (utilities/trie_index, ~17k lines; native trie-index files read through their standard index) (L)
 - [~] Cache layers: secondary cache (CompressedSecondaryCache, TieredCache), persistent cache, WriteBufferManager (cross-DB/CF memtable budget, cache charging, stalls), SimCache
-- [~] Column family export/import (ExportColumnFamily, CreateColumnFamilyWithImport), remote compaction (CompactionService + OpenAndCompact), DB APIs: GetMergeOperands, PromoteL0, SuggestCompactRange, LockWAL/UnlockWAL, DisableManualCompaction/EnableManualCompaction, GetCreationTimeOfOldestFile, ClipColumnFamily, GetPropertiesOfTablesInRange, OpenAndTrimHistory, MultiScan
+- [x] Column family export/import, remote compaction (CompactionService + OpenAndCompact; job/result format interoperates with native both ways), GetMergeOperands, PromoteL0, SuggestCompactRange, DeleteFilesInRange(s), LockWAL, Disable/EnableManualCompaction, GetCreationTimeOfOldestFile, ClipColumnFamily, GetPropertiesOfTablesInRange, OpenAndTrimHistory (compat vs native), MultiScan
+- [ ] remote compaction: per-subcompaction jobs, blob compactions on the worker, paranoid_hash (S/M)
 - [~] Tracing (StartTrace/EndTrace, Replayer, block cache tracer, IO tracer) + tools (ldb and sst_dump equivalents)
 - [-] Deviation inventory: not needed (user accepted the documented reasons in docs/validation.md)
 - [ ] (upstream NotSupported, kept) timestamps in optimistic transactions and explicit-timestamp WBWI writes

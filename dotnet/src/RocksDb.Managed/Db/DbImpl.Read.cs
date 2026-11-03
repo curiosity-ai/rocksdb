@@ -220,12 +220,17 @@ internal sealed partial class DbImpl
     {
         GetContext? tsSink = ctx.TimestampSize != 0 ? ctx : null;
         ReadCallback? cb = ctx.Callback;
+        int operands = ctx.MergeContext.Count;
         MemTableGetResult r = sv.Mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb);
+        // GetMergeOperands with continue_cb: the callback may end the lookup at an operand of this memtable.
+        if (ctx.ContinueCallback is not null && ctx.ApplyContinueCallback(operands)) return true;
         if (ctx.ApplyMemTableResult(r, v, t)) return true;
         MemTable[] imm = sv.Imm;
         for (int i = 0; i < imm.Length; i++)
         {
+            operands = ctx.MergeContext.Count;
             r = imm[i].Get(lkey, out v, out t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb);
+            if (ctx.ContinueCallback is not null && ctx.ApplyContinueCallback(operands)) return true;
             if (ctx.ApplyMemTableResult(r, v, t)) return true;
         }
         return false;
