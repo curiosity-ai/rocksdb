@@ -457,25 +457,8 @@ internal sealed partial class DbImpl
         }
         r.BytesRead = s.BytesRead;
         r.BytesWritten = s.BytesWritten;
-        ulong inputsAtOutputLevel = 0;
-        int filesNonOutput = 0, filesOutput = 0;
-        ulong bytesNonOutput = 0, bytesOutput = 0;
-        for (int i = 0; i < c.NumInputLevels; i++)
-        {
-            ulong bytes = 0;
-            foreach (FileMetaData f in c.Inputs(i).Files) bytes += f.FileSize;
-            if (c.Level(i) == c.OutputLevel)
-            {
-                inputsAtOutputLevel += (ulong)c.Inputs(i).Count;
-                filesOutput += c.Inputs(i).Count;
-                bytesOutput += bytes;
-            }
-            else
-            {
-                filesNonOutput += c.Inputs(i).Count;
-                bytesNonOutput += bytes;
-            }
-        }
+        // Like CompactionServiceCompactionJob::Run, the input-side statistics are left to the primary, which derives them
+        // from the input files' table properties (VerifyInputRecordCount adds the worker's output-level stats to them).
         r.Stats = new RemoteCompactionJobStats
         {
             ElapsedMicros = micros,
@@ -483,27 +466,19 @@ internal sealed partial class DbImpl
             HasAccurateNumInputRecords = true,
             NumInputRecords = (ulong)s.NumInputRecords,
             NumOutputRecords = (ulong)s.NumOutputRecords,
-            NumInputFiles = (ulong)s.NumInputFiles,
-            NumInputFilesAtOutputLevel = inputsAtOutputLevel,
             NumOutputFiles = (ulong)s.NumOutputFiles,
             IsFullCompaction = c.IsFullCompaction,
             IsManualCompaction = c.IsManual,
             IsRemoteCompaction = true,
-            TotalInputBytes = s.BytesRead,
             TotalOutputBytes = s.BytesWritten,
+            NumRecordsReplaced = (ulong)Math.Max(0, s.NumInputRecords - s.NumOutputRecords),
         };
         var levelStats = new RemoteCompactionLevelStats
         {
             Micros = micros,
             CpuMicros = micros,
-            BytesReadNonOutputLevels = bytesNonOutput,
-            BytesReadOutputLevel = bytesOutput,
             BytesWritten = s.BytesWritten,
-            NumInputFilesInNonOutputLevels = filesNonOutput,
-            NumInputFilesInOutputLevel = filesOutput,
             NumOutputFiles = s.NumOutputFiles,
-            NumInputRecords = (ulong)s.NumInputRecords,
-            NumDroppedRecords = (ulong)Math.Max(0, s.NumInputRecords - s.NumOutputRecords),
             NumOutputRecords = (ulong)s.NumOutputRecords,
             Count = 1,
         };
