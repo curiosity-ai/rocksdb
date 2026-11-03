@@ -172,8 +172,7 @@ public enum MemTableFactoryType : byte
 
 /// <summary>
 /// The table format factory (ColumnFamilyOptions::table_factory); names are TableFactory::kXxxTableName()
-/// (include/rocksdb/table.h). The managed port implements <see cref="BlockBasedTable"/> only; the options of the
-/// other factories are preserved verbatim in <see cref="ColumnFamilyOptions.OtherTableFactoryOptions"/>.
+/// (include/rocksdb/table.h) and AdaptiveTableFactory::Name() (table/adaptive/adaptive_table_factory.h).
 /// </summary>
 public enum TableFactoryType : byte
 {
@@ -183,6 +182,12 @@ public enum TableFactoryType : byte
     PlainTable,
     /// <summary>"CuckooTable".</summary>
     CuckooTable,
+    /// <summary>
+    /// "AdaptiveTableFactory" (NewAdaptiveTableFactory): reads block-based, plain and cuckoo tables by their magic number
+    /// and writes <see cref="ColumnFamilyOptions.AdaptiveTableWriteFactory"/>. Upstream does not register it for
+    /// OPTIONS-file loading.
+    /// </summary>
+    AdaptiveTable,
 }
 
 /// <summary>

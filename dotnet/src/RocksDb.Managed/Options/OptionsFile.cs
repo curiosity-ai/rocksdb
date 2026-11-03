@@ -75,10 +75,17 @@ public sealed class OptionsFile
             AppendOptions(sb, cf.Options.ToOptionsList());
             sb.Append('\n');
             string factory = OptionEnumMaps.TableFactory.ToName(cf.Options.TableFactory);
-            if (cf.Options.TableFactory == TableFactoryType.BlockBasedTable)
+            List<KeyValuePair<string, string>>? tableOptions = cf.Options.TableFactory switch
+            {
+                TableFactoryType.BlockBasedTable => cf.Options.TableOptions.ToOptionsList(),
+                TableFactoryType.PlainTable => cf.Options.PlainTableOptions.ToOptionsList(),
+                TableFactoryType.CuckooTable => cf.Options.CuckooTableOptions.ToOptionsList(),
+                _ => null,
+            };
+            if (tableOptions is not null)
             {
                 sb.Append('[').Append(SectionTableOptions).Append(factory).Append(" \"").Append(escapedName).Append("\"]\n  ");
-                AppendOptions(sb, cf.Options.TableOptions.ToOptionsList());
+                AppendOptions(sb, tableOptions);
                 sb.Append('\n');
             }
             else if (cf.Options.OtherTableFactoryOptions is { } other)
@@ -337,11 +344,24 @@ public sealed class OptionsFile
                 {
                     ColumnFamilyOptions cf = _file.FindColumnFamily(_argument)!;
                     string factory = _title[SectionTableOptions.Length..];
-                    if (OptionEnumMaps.TableFactory.TryParse(factory, out TableFactoryType type) && type == TableFactoryType.BlockBasedTable)
+                    bool known = OptionEnumMaps.TableFactory.TryParse(factory, out TableFactoryType type);
+                    if (known && type == TableFactoryType.BlockBasedTable)
                     {
                         var t = new BlockBasedTableOptions();
                         t.SetOptions(_statements, _preserveUnknown);
                         cf.TableOptions = t;
+                    }
+                    else if (known && type == TableFactoryType.PlainTable)
+                    {
+                        var t = new PlainTableOptions();
+                        t.SetOptions(_statements, _preserveUnknown);
+                        cf.PlainTableOptions = t;
+                    }
+                    else if (known && type == TableFactoryType.CuckooTable)
+                    {
+                        var t = new CuckooTableOptions();
+                        t.SetOptions(_statements, _preserveUnknown);
+                        cf.CuckooTableOptions = t;
                     }
                     else
                     {

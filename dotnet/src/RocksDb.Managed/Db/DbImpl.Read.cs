@@ -313,7 +313,9 @@ internal sealed partial class DbImpl
                     if (tsSize != 0) ctx.SetTimestampFromRangeTombstone(tombstoneTs);
                 }
             }
-            lease.Reader.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
+            // The sealed block-based reader is called directly (no generic virtual dispatch on the hot path).
+            if (lease.Reader is BlockBasedTableReader bbt) bbt.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
+            else lease.Reader.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
         }
         finally
         {
@@ -539,7 +541,10 @@ internal sealed partial class DbImpl
         try
         {
             ApplyFileRangeTombstones(rangeDels, DbFormat.ExtractUserKey(ikey.Span), snapshot, ctx);
-            await lease.Reader.GetAsync(ikey, ctx, s_saveValue, ctx.ReadFlags, cancellationToken).ConfigureAwait(false);
+            ValueTask pendingGet = lease.Reader is BlockBasedTableReader bbt
+                ? bbt.GetAsync(ikey, ctx, s_saveValue, ctx.ReadFlags, cancellationToken)
+                : lease.Reader.GetAsync(ikey, ctx, s_saveValue, ctx.ReadFlags, cancellationToken);
+            await pendingGet.ConfigureAwait(false);
         }
         finally
         {
@@ -597,7 +602,9 @@ internal sealed partial class DbImpl
                 if (cov > ctx.MaxCoveringTombstoneSeq) ctx.MaxCoveringTombstoneSeq = cov;
             }
             ctx.Scratch.Clear();
-            pending = lease.Reader.GetAsync(ikey, ctx.Scratch, ctx.ReadFlags, cancellationToken);
+            pending = lease.Reader is BlockBasedTableReader bbt
+                ? bbt.GetAsync(ikey, ctx.Scratch, ctx.ReadFlags, cancellationToken)
+                : lease.Reader.GetAsync(ikey, ctx.Scratch, ctx.ReadFlags, cancellationToken);
             if (pending.IsCompletedSuccessfully)
             {
                 SaveFileResult(lease.Reader, pending.Result, ikey.Span, ctx);
@@ -628,13 +635,14 @@ internal sealed partial class DbImpl
         return ctx.Done;
     }
 
-    private static void SaveFileResult(BlockBasedTableReader reader, TableGetResult r, ReadOnlySpan<byte> ikey, GetContext ctx)
+    private static void SaveFileResult(TableReader reader, TableGetResult r, ReadOnlySpan<byte> ikey, GetContext ctx)
     {
         if (!r.Found) return;
         if (r.Type == EntryType.Merge && ctx.MaxCoveringTombstoneSeq <= r.Sequence)
         {
             // Merge chain: the rest of the operands are most likely in the same (now cached by the OS) block.
-            reader.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
+            if (reader is BlockBasedTableReader bbt) bbt.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
+            else reader.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
         }
         else
         {

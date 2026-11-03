@@ -10,9 +10,21 @@ using EntryType = RocksDb.Managed.Db.EntryType;
 
 namespace RocksDb.Managed.Table;
 
-/// <summary>Options for opening a <see cref="BlockBasedTableReader"/>.</summary>
+/// <summary>Options for opening a <see cref="TableReader"/> (<see cref="TableReaderFactory.Open"/>).</summary>
 public sealed record TableReaderOptions
 {
+    /// <summary>
+    /// The column family's table factory: the format files are read as (a file of another format fails with Corruption
+    /// "Bad table magic number"), or <see cref="TableFactoryType.AdaptiveTable"/> to pick the reader by magic number.
+    /// </summary>
+    public TableFactoryType TableFactory { get; init; } = TableFactoryType.BlockBasedTable;
+    /// <summary>Plain table reader settings (bloom_bits_per_key, hash_table_ratio, index_sparseness, full_scan_mode); null: defaults.</summary>
+    public PlainTableOptions? PlainTableOptions { get; init; }
+    /// <summary>DBOptions::allow_mmap_reads: cuckoo tables can only be read memory-mapped (InvalidArgument otherwise).</summary>
+    public bool AllowMmapReads { get; init; }
+    /// <summary>ImmutableOptions::bloom_locality: locality of the bloom filters plain tables build at open.</summary>
+    public uint BloomLocality { get; init; }
+
     /// <summary>User comparator the table was built with.</summary>
     public Comparator Comparator { get; init; } = Comparator.Bytewise;
     /// <summary>Filter policy used to interpret the full filter block ("fullfilter.&lt;name&gt;"); null ignores filters.</summary>
@@ -204,7 +216,7 @@ internal struct BlockRef
 /// </para>
 /// </summary>
 [SkipLocalsInit]
-public sealed partial class BlockBasedTableReader : IDisposable
+public sealed partial class BlockBasedTableReader : TableReader
 {
     private static long s_nextTableId;
 
@@ -235,7 +247,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     private int _disposed;
 
     public Footer Footer => _footer;
-    public TableProperties Properties { get; }
+    public override TableProperties Properties { get; }
     public IReadOnlyDictionary<string, BlockHandle> MetaBlocks { get; }
     /// <summary>Handle of the (top-level) index block (footer for format_version &lt; 6, metaindex otherwise).</summary>
     public BlockHandle IndexHandle { get; }
@@ -250,7 +262,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     /// <summary>True when the top-level index and the filter live in the block cache rather than being pinned by the reader.</summary>
     public bool IndexAndFilterInCache => _indexBlock is null;
     /// <summary>Effective global sequence number (external files), or <see cref="BlockIter.DisableGlobalSequenceNumber"/>.</summary>
-    public ulong GlobalSequenceNumber { get; }
+    public override ulong GlobalSequenceNumber { get; }
     /// <summary>
     /// Size of the minimum timestamp padded into every key read from this file (pad_min_timestamp_), 0 when the keys
     /// are stored with their timestamps. Non-zero for files written with persist_user_defined_timestamps = false
@@ -259,9 +271,9 @@ public sealed partial class BlockBasedTableReader : IDisposable
     /// Deviation: upstream takes this from FileMetaData::user_defined_timestamps_persisted; the file's own properties
     /// give the same answer for every file the toggling rules (ValidateUserDefinedTimestampsOptions) accept.
     /// </summary>
-    public int PadTimestampSize { get; }
-    public long FileSize { get; }
-    internal InternalKeyComparator InternalComparator => _icmp;
+    public override int PadTimestampSize { get; }
+    public override long FileSize { get; }
+    internal override InternalKeyComparator InternalComparator => _icmp;
     internal IRandomAccessFile File => _file;
 
     private BlockBasedTableReader(IRandomAccessFile file, TableReaderOptions options, Footer footer, Dictionary<string, BlockHandle> metaBlocks,
@@ -997,7 +1009,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     /// Port of BlockBasedTable::ApproximateOffsetOf: approximate file offset of the data for <paramref name="internalKey"/>
     /// (the offset of the data block the index points to, pro-rated over the whole file to account for metadata).
     /// </summary>
-    public ulong ApproximateOffsetOf(ReadOnlySpan<byte> internalKey)
+    public override ulong ApproximateOffsetOf(ReadOnlySpan<byte> internalKey)
     {
         ulong dataSize = Properties.DataSize;
         // Hmm. Let's just split in half to avoid skewing one way or another, since we don't know whether we're
@@ -1010,7 +1022,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     }
 
     /// <summary>Port of BlockBasedTable::ApproximateSize: approximate bytes of the data between two internal keys.</summary>
-    public ulong ApproximateSize(ReadOnlySpan<byte> startInternalKey, ReadOnlySpan<byte> endInternalKey)
+    public override ulong ApproximateSize(ReadOnlySpan<byte> startInternalKey, ReadOnlySpan<byte> endInternalKey)
     {
         ulong dataSize = Properties.DataSize;
         // Hmm. Assume whole file is involved, since we have lower and upper bound.
@@ -1025,7 +1037,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     /// Port of BlockBasedTable::ApproximateKeyAnchors: walks the index and returns up to ~128 anchors (user key, bytes of
     /// the data blocks since the previous anchor) that partition the file evenly; used to plan subcompactions.
     /// </summary>
-    public List<(byte[] UserKey, ulong RangeSize)> ApproximateKeyAnchors()
+    public override List<(byte[] UserKey, ulong RangeSize)> ApproximateKeyAnchors()
     {
         var anchors = new List<(byte[], ulong)>();
         // If needed the threshold could be more adaptive (e.g. based on size).
@@ -1107,7 +1119,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     /// <paramref name="internalKey"/> may be present; otherwise, when the configured prefix extractor matches the
     /// table's, whether its prefix may be present. The internal key selects the partition of a partitioned filter.
     /// </summary>
-    public bool InternalKeyMayMatch(ReadOnlySpan<byte> internalKey, TableReadFlags flags)
+    public override bool InternalKeyMayMatch(ReadOnlySpan<byte> internalKey, TableReadFlags flags)
     {
         if (_filterKind == FilterKind.None) return true;
         // FullFilterKeyMayMatch: filters hold user keys without the timestamp.
@@ -1285,8 +1297,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         where TState : allows ref struct => Get(internalKey, ref state, visitor, TableReadFlags.None);
 
     /// <inheritdoc cref="Get{TState}(ReadOnlySpan{byte}, ref TState, TableEntryVisitor{TState})"/>
-    public void Get<TState>(ReadOnlySpan<byte> internalKey, ref TState state, TableEntryVisitor<TState> visitor, TableReadFlags flags)
-        where TState : allows ref struct
+    public override void Get<TState>(ReadOnlySpan<byte> internalKey, ref TState state, TableEntryVisitor<TState> visitor, TableReadFlags flags)
     {
         ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(internalKey);
         if (!InternalKeyMayMatch(internalKey, flags)) return;
@@ -1341,7 +1352,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     public TableGetResult Get(ReadOnlySpan<byte> internalKey, IBufferWriter<byte>? value) => Get(internalKey, value, TableReadFlags.None);
 
     /// <inheritdoc cref="Get(ReadOnlySpan{byte}, IBufferWriter{byte}?)"/>
-    public TableGetResult Get(ReadOnlySpan<byte> internalKey, IBufferWriter<byte>? value, TableReadFlags flags)
+    public override TableGetResult Get(ReadOnlySpan<byte> internalKey, IBufferWriter<byte>? value, TableReadFlags flags)
     {
         if (!InternalKeyMayMatch(internalKey, flags)) return default;
         IndexCursor idx = IndexCursor.Rent(this, flags);
@@ -1380,7 +1391,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         GetAsync(internalKey, value, TableReadFlags.None, cancellationToken);
 
     /// <inheritdoc cref="GetAsync(ReadOnlyMemory{byte}, IBufferWriter{byte}?, CancellationToken)"/>
-    public ValueTask<TableGetResult> GetAsync(ReadOnlyMemory<byte> internalKey, IBufferWriter<byte>? value, TableReadFlags flags, CancellationToken cancellationToken)
+    public override ValueTask<TableGetResult> GetAsync(ReadOnlyMemory<byte> internalKey, IBufferWriter<byte>? value, TableReadFlags flags, CancellationToken cancellationToken)
     {
         // A filter miss (the common case of a lookup in a table without the key) completes without an async state machine.
         if (!InternalKeyMayMatch(internalKey.Span, flags)) return default;
@@ -1433,8 +1444,8 @@ public sealed partial class BlockBasedTableReader : IDisposable
     /// reference type, so the visitor's updates survive the awaits.
     /// </summary>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    public async ValueTask GetAsync<TState>(ReadOnlyMemory<byte> internalKey, TState state, TableEntryVisitor<TState> visitor, TableReadFlags flags,
-        CancellationToken cancellationToken) where TState : class
+    public override async ValueTask GetAsync<TState>(ReadOnlyMemory<byte> internalKey, TState state, TableEntryVisitor<TState> visitor, TableReadFlags flags,
+        CancellationToken cancellationToken)
     {
         if (!InternalKeyMayMatch(internalKey.Span, flags)) return;
         IndexCursor idx = IndexCursor.Rent(this, flags);
@@ -1551,6 +1562,10 @@ public sealed partial class BlockBasedTableReader : IDisposable
     /// </summary>
     public BlockBasedTableIterator NewIterator(TableReadFlags flags, in TableIteratorPrefixOptions prefixOptions) => new(this, flags, prefixOptions);
 
+    /// <inheritdoc/>
+    public override Db.Iterators.InternalIterator NewInternalIterator(TableReadFlags flags, ReadOptions? readOptions, SliceTransform? prefixExtractor) =>
+        new Db.Iterators.TableInternalIterator(new TableReaderLease(this, null, null), flags, readOptions, prefixExtractor);
+
     /// <summary>
     /// Prefix seek settings for an iterator over this table (port of the need_upper_bound_check / check_filter
     /// computation in BlockBasedTable::NewIterator).
@@ -1570,13 +1585,13 @@ public sealed partial class BlockBasedTableReader : IDisposable
         };
     }
 
-    public bool HasRangeTombstones => _rangeDelBlock is not null;
+    public override bool HasRangeTombstones => _rangeDelBlock is not null;
 
     /// <summary>
     /// Iterator over the range tombstones (internal start key → exclusive end user key), or null if none.
     /// The returned iterator is valid while the reader is alive; dispose it when done.
     /// </summary>
-    public BlockIter? NewRangeTombstoneIterator()
+    public override BlockIter? NewRangeTombstoneIterator()
     {
         if (_rangeDelBlock is null) return null;
         var it = new BlockIter();
@@ -1588,7 +1603,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     /// Releases the reader's pinned blocks and the file. Entries this file put into a shared block cache stay there
     /// until evicted (keys are not reused by other files); erase them explicitly when the file is deleted if desired.
     /// </summary>
-    public void Dispose()
+    public override void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _indexBlock?.Release();

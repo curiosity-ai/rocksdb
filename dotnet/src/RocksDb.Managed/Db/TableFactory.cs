@@ -237,7 +237,18 @@ public static class TableFactory
             PersistUserDefinedTimestamps = options.PersistUserDefinedTimestamps,
             TablePropertiesCollectorFactories = options.TablePropertiesCollectorFactories.ToArray(),
             NumLevels = options.NumLevels,
+            TableFactory = WriteFactory(options),
+            PlainTableOptions = options.PlainTableOptions,
+            CuckooTableOptions = options.CuckooTableOptions,
+            BloomLocality = options.BloomLocality,
         };
+    }
+
+    /// <summary>The format new files of the column family are written in (AdaptiveTableFactory::NewTableBuilder: its write factory).</summary>
+    public static TableFactoryType WriteFactory(ColumnFamilyOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return options.TableFactory == TableFactoryType.AdaptiveTable ? options.AdaptiveTableWriteFactory : options.TableFactory;
     }
 
     /// <summary>
@@ -279,6 +290,10 @@ public static class TableFactory
             PersistUserDefinedTimestamps = options.PersistUserDefinedTimestamps,
             TablePropertiesCollectorFactories = options.TablePropertiesCollectorFactories.ToArray(),
             NumLevels = options.NumLevels,
+            TableFactory = WriteFactory(options),
+            PlainTableOptions = options.PlainTableOptions,
+            CuckooTableOptions = options.CuckooTableOptions,
+            BloomLocality = options.BloomLocality,
         };
     }
 
@@ -313,6 +328,9 @@ public static class TableFactory
             MaxAutoReadaheadSize = (long)Math.Min(t.MaxAutoReadaheadSize, int.MaxValue),
             InitialAutoReadaheadSize = (long)Math.Min(t.InitialAutoReadaheadSize, int.MaxValue),
             NumFileReadsForAutoReadahead = t.NumFileReadsForAutoReadahead,
+            TableFactory = options.TableFactory,
+            PlainTableOptions = options.PlainTableOptions,
+            BloomLocality = options.BloomLocality,
         };
         if (cache is not null) r = r with { BlockCache = cache };
         return r;

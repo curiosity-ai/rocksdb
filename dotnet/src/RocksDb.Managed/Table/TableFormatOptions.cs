@@ -158,6 +158,18 @@ public sealed record TableBuilderOptions
     public ulong LastLevelInclusiveMaxSeqnoThreshold { get; init; } = Db.DbFormat.MaxSequenceNumber;
 
     /// <summary>
+    /// The SST format to write (the column family's table factory; for the adaptive factory its write factory). Read by
+    /// <see cref="TableBuilder.Create"/>.
+    /// </summary>
+    public TableFactoryType TableFactory { get; init; } = TableFactoryType.BlockBasedTable;
+    /// <summary>Plain table settings when <see cref="TableFactory"/> is <see cref="TableFactoryType.PlainTable"/> (null: defaults).</summary>
+    public PlainTableOptions? PlainTableOptions { get; init; }
+    /// <summary>Cuckoo table settings when <see cref="TableFactory"/> is <see cref="TableFactoryType.CuckooTable"/> (null: defaults).</summary>
+    public CuckooTableOptions? CuckooTableOptions { get; init; }
+    /// <summary>ImmutableOptions::bloom_locality (plain table bloom filters: 0 = no locality).</summary>
+    public uint BloomLocality { get; init; }
+
+    /// <summary>
     /// Test hook: a fixed non-zero base context checksum (format_version &gt;= 6) instead of a random one, so two builds of
     /// the same input produce identical bytes. 0 (default): random, like upstream.
     /// </summary>

@@ -46,7 +46,7 @@ public sealed partial class BlockBasedTableBuilder
     /// data blocks emitted for parallel compression but not yet written. Equal to <see cref="FileSize"/> without
     /// parallel compression.
     /// </summary>
-    public ulong EstimatedFileSize => _pc is null ? _offset : _offset + _pc.EstimatedInflightSize;
+    public override ulong EstimatedFileSize => _pc is null ? _offset : _offset + _pc.EstimatedInflightSize;
 
     /// <summary>Whether data blocks are compressed in parallel (CompressionOptions.parallel_threads &gt; 1 and supported).</summary>
     internal bool IsParallelCompressionActive => _pc is not null;

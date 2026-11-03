@@ -222,4 +222,45 @@ public static class Hash
     /// <summary>FastRange64: maps a 64-bit hash uniformly onto [0, range) (upper 64 bits of the 128-bit product).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static ulong FastRange64(ulong hash, ulong range) => Math.BigMul(range, hash, out _);
+
+    /// <summary>
+    /// MurmurHash64A (util/murmurhash.cc, the <c>MurmurHash</c> of 64-bit x86 builds): the hash cuckoo tables use to place
+    /// keys (CuckooHash, table/cuckoo/cuckoo_table_factory.h). Part of the cuckoo table format. 8-byte blocks are read
+    /// little-endian (upstream reads them in host order on little-endian x86-64).
+    /// </summary>
+    public static ulong MurmurHash64A(ReadOnlySpan<byte> key, uint seed)
+    {
+        const ulong m = 0xc6a4a7935bd1e995UL;
+        const int r = 47;
+        int len = key.Length;
+        ulong h = seed ^ ((ulong)(long)len * m);
+        int blocks = len / 8;
+        for (int i = 0; i < blocks; i++)
+        {
+            ulong k = BinaryPrimitives.ReadUInt64LittleEndian(key.Slice(i * 8, 8));
+            k *= m;
+            k ^= k >> r;
+            k *= m;
+            h ^= k;
+            h *= m;
+        }
+        ReadOnlySpan<byte> tail = key[(blocks * 8)..];
+        switch (len & 7)
+        {
+            case 7: h ^= (ulong)tail[6] << 48; goto case 6;
+            case 6: h ^= (ulong)tail[5] << 40; goto case 5;
+            case 5: h ^= (ulong)tail[4] << 32; goto case 4;
+            case 4: h ^= (ulong)tail[3] << 24; goto case 3;
+            case 3: h ^= (ulong)tail[2] << 16; goto case 2;
+            case 2: h ^= (ulong)tail[1] << 8; goto case 1;
+            case 1:
+                h ^= tail[0];
+                h *= m;
+                break;
+        }
+        h ^= h >> r;
+        h *= m;
+        h ^= h >> r;
+        return h;
+    }
 }

@@ -405,10 +405,10 @@ public sealed class RangeDelAggregator
 /// </summary>
 public static class RangeDelTableTombstones
 {
-    private static readonly ConditionalWeakTable<BlockBasedTableReader, FragmentedRangeTombstoneList> s_cache = new();
+    private static readonly ConditionalWeakTable<TableReader, FragmentedRangeTombstoneList> s_cache = new();
 
     /// <summary>The fragmented tombstones of <paramref name="reader"/>, or null if it has none. Cached per reader.</summary>
-    public static FragmentedRangeTombstoneList? Get(BlockBasedTableReader reader)
+    public static FragmentedRangeTombstoneList? Get(TableReader reader)
     {
         ArgumentNullException.ThrowIfNull(reader);
         if (!reader.HasRangeTombstones) return null;
@@ -417,7 +417,7 @@ public static class RangeDelTableTombstones
         return s_cache.GetValue(reader, _ => built);
     }
 
-    private static FragmentedRangeTombstoneList Build(BlockBasedTableReader reader)
+    private static FragmentedRangeTombstoneList Build(TableReader reader)
     {
         var list = new List<FragmentedRangeTombstoneList.Tombstone>();
         using BlockIter? it = reader.NewRangeTombstoneIterator();

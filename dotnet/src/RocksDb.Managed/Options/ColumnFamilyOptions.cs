@@ -139,12 +139,28 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     /// <summary>memtable_factory (the managed port implements the skip list only).</summary>
     public MemTableFactoryType MemtableFactory { get; set; } = MemTableFactoryType.SkipList;
 
-    /// <summary>table_factory; the managed port reads and writes <see cref="TableFactoryType.BlockBasedTable"/> only.</summary>
+    /// <summary>
+    /// table_factory: the SST format new files are written in and existing files are read with (a file of another
+    /// format fails to open with Corruption "Bad table magic number", like upstream), or
+    /// <see cref="TableFactoryType.AdaptiveTable"/> to read every format by its magic number and write
+    /// <see cref="AdaptiveTableWriteFactory"/>.
+    /// </summary>
     public TableFactoryType TableFactory { get; set; } = TableFactoryType.BlockBasedTable;
+
+    /// <summary>
+    /// The format an <see cref="TableFactoryType.AdaptiveTable"/> factory writes (table_factory_to_write of
+    /// NewAdaptiveTableFactory, default block-based), using <see cref="TableOptions"/> / <see cref="PlainTableOptions"/> /
+    /// <see cref="CuckooTableOptions"/>. Not persisted (upstream's AdaptiveTableFactory has no OPTIONS-file options).
+    /// </summary>
+    public TableFactoryType AdaptiveTableWriteFactory { get; set; } = TableFactoryType.BlockBasedTable;
 
     /// <summary>Options of the block-based table factory (the [TableOptions/BlockBasedTable "cf"] section).</summary>
     public BlockBasedTableOptions TableOptions { get; set; } = new();
-    /// <summary>Raw options of a non block-based table factory section, preserved for round trips.</summary>
+    /// <summary>Options of the plain table factory (the [TableOptions/PlainTable "cf"] section).</summary>
+    public PlainTableOptions PlainTableOptions { get; set; } = new();
+    /// <summary>Options of the cuckoo table factory (the [TableOptions/CuckooTable "cf"] section).</summary>
+    public CuckooTableOptions CuckooTableOptions { get; set; } = new();
+    /// <summary>Raw options of the table factory section of an unknown table factory, preserved for round trips.</summary>
     public Dictionary<string, string>? OtherTableFactoryOptions { get; set; }
 
     // ---- memtable ----------------------------------------------------------------------------
@@ -454,6 +470,9 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         c.CompactionOptionsFifo = CompactionOptionsFifo.Clone();
         c.CompactionOptionsUniversal = CompactionOptionsUniversal.Clone();
         c.TableOptions = TableOptions.Clone();
+        c.PlainTableOptions = PlainTableOptions.Clone();
+        c.CuckooTableOptions = CuckooTableOptions.Clone();
+        c.AdaptiveTableWriteFactory = AdaptiveTableWriteFactory;
         c.InplaceCallback = InplaceCallback;
         c.TablePropertiesCollectorFactories = new List<TablePropertiesCollectorFactory>(TablePropertiesCollectorFactories);
         c.BlobCache = BlobCache;

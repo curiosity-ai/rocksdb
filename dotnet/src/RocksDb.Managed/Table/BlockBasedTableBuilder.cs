@@ -30,7 +30,7 @@ namespace RocksDb.Managed.Table;
 /// The file is not closed by the builder.
 /// </para>
 /// </summary>
-public sealed partial class BlockBasedTableBuilder : IDisposable
+public sealed partial class BlockBasedTableBuilder : TableBuilder
 {
     /// <summary>Staged output is handed to the file once it exceeds this many bytes.</summary>
     private const int OutputFlushThreshold = 256 * 1024;
@@ -80,7 +80,7 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     /// Port of BlockBasedTableBuilder::NeedCompact: a user table properties collector asks for the file to be compacted
     /// (sets FileMetaData::marked_for_compaction). Valid after <see cref="Finish"/>.
     /// </summary>
-    public bool NeedCompact => _collectors is not null && _collectors.NeedCompact;
+    public override bool NeedCompact => _collectors is not null && _collectors.NeedCompact;
     private readonly int _compressionLevel;
     private readonly int _maxCompressedBytesPerKb;
     private ulong _offset;
@@ -251,10 +251,10 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     /// <summary>The data block compression dictionary (after the builder left the buffered state), or null.</summary>
     public ReadOnlySpan<byte> CompressionDictionary => _dict is null ? default : _dict.Data;
 
-    public ulong NumEntries => _props.NumEntries;
-    public bool IsEmpty => _props.NumEntries == 0;
+    public override ulong NumEntries => _props.NumEntries;
+    public override bool IsEmpty => _props.NumEntries == 0;
     /// <summary>Size of the file generated so far (final size after <see cref="Finish"/>).</summary>
-    public ulong FileSize => _offset;
+    public override ulong FileSize => _offset;
 
     /// <summary>
     /// Port of BlockBasedTableBuilder::EstimatedTailSize: the index and filter estimates, the compression dictionary,
@@ -262,7 +262,7 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     /// compaction with target_file_size_is_upper_bound. Upstream refreshes the index/filter estimates once per data
     /// block; the port caches the result per data block count.
     /// </summary>
-    public ulong EstimatedTailSize()
+    public override ulong EstimatedTailSize()
     {
         ulong blocks = _props.NumDataBlocks;
         if (_tailEstimateBlocks == blocks && _tailEstimate != 0) return _tailEstimate;
@@ -278,20 +278,20 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     private ulong _tailEstimateBlocks;
     private ulong _tailEstimate;
     /// <summary>Properties of the table (complete after <see cref="Finish"/>).</summary>
-    public TableProperties Properties => _props;
+    public override TableProperties Properties => _props;
     /// <summary>The base context checksum written to the footer (format_version &gt;= 6).</summary>
     public uint BaseContextChecksum => _baseContextChecksum;
 
     /// <summary>Port of BlockBasedTableBuilder::Add. May synchronously append staged output to the file.</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public void Add(ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value)
+    public override void Add(ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value)
     {
         AddCore(internalKey, value);
         if (_out.WrittenCount >= OutputFlushThreshold) DrainOutput();
     }
 
     /// <summary>Adds an entry; staged output beyond the threshold is written asynchronously.</summary>
-    public ValueTask AddAsync(ReadOnlyMemory<byte> internalKey, ReadOnlyMemory<byte> value, CancellationToken cancellationToken = default)
+    public override ValueTask AddAsync(ReadOnlyMemory<byte> internalKey, ReadOnlyMemory<byte> value, CancellationToken cancellationToken = default)
     {
         AddCore(internalKey.Span, value.Span);
         return _out.WrittenCount >= OutputFlushThreshold ? DrainOutputAsync(cancellationToken) : ValueTask.CompletedTask;
@@ -647,7 +647,7 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     }
 
     /// <summary>Finishes the table: writes remaining data, filter, index, range-del, properties, metaindex and footer, then flushes the file.</summary>
-    public void Finish()
+    public override void Finish()
     {
         FinishCore();
         DrainOutput();
@@ -655,7 +655,7 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     }
 
     /// <summary>Async <see cref="Finish"/>.</summary>
-    public async ValueTask FinishAsync(CancellationToken cancellationToken = default)
+    public override async ValueTask FinishAsync(CancellationToken cancellationToken = default)
     {
         FinishCore();
         await DrainOutputAsync(cancellationToken).ConfigureAwait(false);
@@ -771,10 +771,10 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     }
 
     /// <summary>Smallest user-defined timestamp added ("rocksdb.timestamp_min"); empty without timestamps or entries.</summary>
-    public byte[] TimestampMin => _timestampMin ?? [];
+    public override byte[] TimestampMin => _timestampMin ?? [];
 
     /// <summary>Largest user-defined timestamp added ("rocksdb.timestamp_max"); empty without timestamps or entries.</summary>
-    public byte[] TimestampMax => _timestampMax ?? [];
+    public override byte[] TimestampMax => _timestampMax ?? [];
 
     private void WritePropertiesBlock(MetaIndexBuilder metaIndex)
     {
@@ -898,14 +898,14 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     }
 
     /// <summary>Stops building without writing the tail (the partially written file should be deleted by the caller).</summary>
-    public void Abandon()
+    public override void Abandon()
     {
         if (_pc is not null) StopParallelCompression(abort: true);
         _closed = true;
         _out.Clear();
     }
 
-    public void Dispose()
+    public override void Dispose()
     {
         if (_pc is not null) StopParallelCompression(abort: true);
         _closed = true;
