@@ -76,13 +76,25 @@ public readonly ref struct MergeOperands
 {
     private readonly ReadOnlySpan<byte> _data;
     private readonly ReadOnlySpan<int> _offsets; // Count + 1 entries: operand i spans [_offsets[i], _offsets[i+1])
+    // Alternatively, operands referenced in place (pinned blocks / memtable memory), oldest first
+    // (MergeContext::PushOperand with operand_pinned = true).
+    private readonly ReadOnlySpan<Db.Iterators.PinnedSlice> _slices;
 
     public MergeOperands(ReadOnlySpan<byte> data, ReadOnlySpan<int> offsets)
     {
         _data = data;
         _offsets = offsets;
+        _slices = default;
     }
 
-    public int Count => _offsets.Length == 0 ? 0 : _offsets.Length - 1;
-    public ReadOnlySpan<byte> this[int index] => _data[_offsets[index].._offsets[index + 1]];
+    /// <summary>Operands that are slices of pinned memory, oldest first (no copy).</summary>
+    internal MergeOperands(ReadOnlySpan<Db.Iterators.PinnedSlice> slices)
+    {
+        _data = default;
+        _offsets = default;
+        _slices = slices;
+    }
+
+    public int Count => _slices.Length != 0 ? _slices.Length : _offsets.Length == 0 ? 0 : _offsets.Length - 1;
+    public ReadOnlySpan<byte> this[int index] => _slices.Length != 0 ? _slices[index].Span : _data[_offsets[index].._offsets[index + 1]];
 }

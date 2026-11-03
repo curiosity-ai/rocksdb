@@ -92,6 +92,12 @@ public sealed class DbIter : IDisposable
     private VersionStorageInfo? _blobVersion;
     private readonly ReadOptions? _readOptions;
     private readonly MergeOperandBuffer _operands = new();
+    // FindValueForCurrentKey (reverse): merge operands referenced in the pinned blocks / memtable instead of copied
+    // (merge_context_.PushOperand(iter_.value(), iter_.iter()->IsValuePinned())), oldest first. Used while every
+    // operand of the key could be pinned (_pinnedOperandsOnly); otherwise they are copied into _operands.
+    private PinnedSlice[] _pinnedOperands = [];
+    private int _pinnedOperandCount;
+    private bool _pinnedOperandsOnly = true;
 
     private bool _valid;
     private bool _forward = true;
@@ -641,11 +647,61 @@ public sealed class DbIter : IDisposable
         _entityResolved = false;
     }
 
+    /// <summary>Clears the merge operands (both the copied and the pinned ones).</summary>
+    private void ClearOperands()
+    {
+        _operands.Clear();
+        _pinnedOperandCount = 0;
+        _pinnedOperandsOnly = true;
+    }
+
+    /// <summary>The collected merge operands, oldest first.</summary>
+    private MergeOperands CurrentOperands()
+    {
+        if (_pinnedOperandCount != 0 && _pinnedOperandsOnly)
+        {
+            PinnedOperandMerges++;
+            return new MergeOperands(_pinnedOperands.AsSpan(0, _pinnedOperandCount));
+        }
+        return _operands.AsOperands();
+    }
+
+    /// <summary>Merges done on operands referenced in place (tests).</summary>
+    internal long PinnedOperandMerges { get; private set; }
+
+    /// <summary>
+    /// FindValueForCurrentKey: adds the merge operand the inner iterator is on as the newest one, referencing it in
+    /// place when the iterator can pin its value (blocks are temp-pinned during the reverse scan); the first operand
+    /// that cannot be pinned turns the list into copies.
+    /// </summary>
+    private void PushNewerOperand()
+    {
+        if (_pinnedOperandsOnly && _iter.TryGetPinnedValue(out PinnedSlice pv))
+        {
+            if (_pinnedOperandCount == _pinnedOperands.Length)
+            {
+                var n = new PinnedSlice[Math.Max(8, _pinnedOperandCount * 2)];
+                _pinnedOperands.AsSpan(0, _pinnedOperandCount).CopyTo(n);
+                _pinnedOperands = n;
+            }
+            _pinnedOperands[_pinnedOperandCount++] = pv;
+            return;
+        }
+        if (_pinnedOperandsOnly)
+        {
+            // Copy the operands pinned so far (still valid: the blocks stay pinned until the next positioning call).
+            _pinnedOperandsOnly = false;
+            for (int i = 0; i < _pinnedOperandCount; i++) _operands.PushNewer(_pinnedOperands[i].Span);
+            _pinnedOperandCount = 0;
+        }
+        _operands.PushNewer(_iter.Value);
+    }
+
     private void MergeWithNoBaseValue()
     {
         _valid = false;
         _mergeResult.Clear();
-        MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, false, default, _operands.AsOperands(), _mergeResult);
+        MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, false, default, CurrentOperands(), _mergeResult);
         _valueSource = ValueSource.Merged;
         _valueIsEntity = false;
         _valueIsBlob = false;
@@ -656,7 +712,7 @@ public sealed class DbIter : IDisposable
     {
         _valid = false;
         _mergeResult.Clear();
-        MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, true, value, _operands.AsOperands(), _mergeResult);
+        MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, true, value, CurrentOperands(), _mergeResult);
         _valueSource = ValueSource.Merged;
         _valueIsEntity = false;
         _valueIsBlob = false;
@@ -674,7 +730,7 @@ public sealed class DbIter : IDisposable
         entity = ResolveEntity(entity);
         _mergeResult.Clear();
         MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, true, Wide.WideColumnSerialization.GetValueOfDefaultColumn(entity),
-            _operands.AsOperands(), _mergeResult);
+            CurrentOperands(), _mergeResult);
         _mergedEntity ??= new PooledBufferWriter(128);
         _mergedEntity.Clear();
         Wide.WideColumnSerialization.ReplaceDefaultColumn(entity, _mergeResult.WrittenSpan, _mergedEntity);
@@ -790,7 +846,7 @@ public sealed class DbIter : IDisposable
                         _currentEntryIsMerged = true;
                         _valid = true;
                         // MergeValuesNewToOld: start the merge process by pushing the first operand.
-                        _operands.Clear();
+                        ClearOperands();
                         _operands.PushOlder(_iter.Value);
                         _merging = true;
                         return StepAction.Next;
@@ -1589,7 +1645,7 @@ public sealed class DbIter : IDisposable
         // Temporarily pin blocks that hold the value (TempPinData).
         ReleaseTempPinnedData();
         TempPinData();
-        _operands.Clear();
+        ClearOperands();
         _currentEntryIsMerged = false;
         _valid = false;
         // last entry before merge (could be a deletion, a value or a range deletion)
@@ -1656,18 +1712,18 @@ public sealed class DbIter : IDisposable
                 {
                     _fvLastKeyEntryType = EntryType.RangeDeletion;
                     _fvLastNotMergeType = EntryType.RangeDeletion;
-                    _operands.Clear();
+                    ClearOperands();
                     break;
                 }
                 // The child iterator moves on: keep the value pinned (or a copy when the child cannot pin it).
                 SaveCurrentValue(type);
-                _operands.Clear();
+                ClearOperands();
                 _fvLastNotMergeType = type;
                 break;
             case EntryType.Deletion:
             case EntryType.DeletionWithTimestamp:
             case EntryType.SingleDeletion:
-                _operands.Clear();
+                ClearOperands();
                 _fvLastNotMergeType = type;
                 break;
             case EntryType.Merge:
@@ -1675,11 +1731,11 @@ public sealed class DbIter : IDisposable
                 {
                     _fvLastKeyEntryType = EntryType.RangeDeletion;
                     _fvLastNotMergeType = EntryType.RangeDeletion;
-                    _operands.Clear();
+                    ClearOperands();
                     break;
                 }
                 if (_mergeOperator is null) ThrowNoMergeOperator();
-                _operands.PushNewer(_iter.Value);
+                PushNewerOperand();
                 break;
             default:
                 ThrowUnknownType(type);
@@ -1800,7 +1856,7 @@ public sealed class DbIter : IDisposable
         // kTypeMerge. We need to collect all kTypeMerge values and save them in operands.
         if (_mergeOperator is null) ThrowNoMergeOperator();
         _currentEntryIsMerged = true;
-        _operands.Clear();
+        ClearOperands();
         _operands.PushOlder(_iter.Value);
         _revPhase = RevPhase.SeekMerge;
         return InnerOp.Next;

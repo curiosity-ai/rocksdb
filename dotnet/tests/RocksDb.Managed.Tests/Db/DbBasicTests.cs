@@ -11,6 +11,43 @@ namespace RocksDb.Managed.Tests.Db;
 [TestClass]
 public sealed class DbBasicTests
 {
+    /// <summary>
+    /// DBIter::FindValueForCurrentKey: in reverse iteration the merge operands are referenced in the pinned blocks /
+    /// memtable (merge_context_.PushOperand(value, IsValuePinned())) instead of copied; results equal forward iteration,
+    /// for operands in the memtable, in table files and spread over both.
+    /// </summary>
+    [TestMethod]
+    public void ReverseIterationMergesPinnedOperands()
+    {
+        MemoryFileSystem fs = NewFs();
+        var cf = new ColumnFamilyOptions { MergeOperator = new StringAppendMergeOperator(), DisableAutoCompactions = true };
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cf);
+        for (int round = 0; round < 3; round++)
+        {
+            for (int i = 0; i < 200; i++)
+            {
+                if (round == 0 && i % 3 == 0) db.Put(Key(i), B("base" + i));
+                else db.Merge(Key(i), B("r" + round + "-" + i));
+            }
+            if (round < 2) db.Flush();
+        }
+        var forward = new List<(string, string)>();
+        using (Iterator it = db.NewIterator())
+        {
+            for (it.SeekToFirst(); it.Valid; it.Next()) forward.Add((S(it.Key.ToArray())!, S(it.Value.ToArray())!));
+        }
+        Assert.AreEqual(200, forward.Count);
+        Assert.AreEqual("base3,r1-3,r2-3", forward[3].Item2);
+        var backward = new List<(string, string)>();
+        using (Iterator it = db.NewIterator())
+        {
+            for (it.SeekToLast(); it.Valid; it.Prev()) backward.Add((S(it.Key.ToArray())!, S(it.Value.ToArray())!));
+            Assert.IsTrue(it.Inner.PinnedOperandMerges >= 200, "operands referenced in place: " + it.Inner.PinnedOperandMerges);
+        }
+        backward.Reverse();
+        CollectionAssert.AreEqual(forward, backward);
+    }
+
     [TestMethod]
     public void PutGetDeleteOverwrite()
     {
