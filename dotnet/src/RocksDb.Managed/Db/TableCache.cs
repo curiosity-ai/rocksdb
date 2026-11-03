@@ -57,6 +57,8 @@ internal sealed class TableCacheStore : IDisposable
         public BlockBasedTableReader? Reader;
         public FragmentedRangeTombstoneList? RangeDels;
         public long LastUse;
+        /// <summary>1 while the handle holds a pin reference (see <see cref="TableCacheStore.TryGetPinned"/>).</summary>
+        public int Pinned;
         // One reference is held by the cache itself while the handle is in the dictionary.
         private int _refs = 1;
         private int _opened;
@@ -92,6 +94,36 @@ internal sealed class TableCacheStore : IDisposable
                 Reader = null;
             }
         }
+
+        /// <summary>Drops the cache's reference and the pin reference, if any (the handle left the dictionary).</summary>
+        public void ReleaseFromCache()
+        {
+            if (Interlocked.Exchange(ref Pinned, 0) != 0) Release();
+            Release();
+        }
+    }
+
+    /// <summary>
+    /// The open handle of <paramref name="fileNumber"/> for a reader that holds a version containing the file, without a
+    /// per-call reference, or null (not open yet, or not pinnable). Port of the pinned <c>fd.table_reader</c> of
+    /// max_open_files == -1: while the cache is unbounded, the first such lookup pins the handle with one extra
+    /// reference, which keeps the reader open (and out of capacity eviction, also after a later SetCapacity) until the
+    /// file is evicted as obsolete (no referenced version contains it any more) or its column family / the DB is closed.
+    /// </summary>
+    internal Handle? TryGetPinned(ulong fileNumber)
+    {
+        if (!_handles.TryGetValue(fileNumber, out Handle? h) || !h.IsOpen) return null;
+        if (Volatile.Read(ref h.Pinned) == 0 && !Pin(h)) return null;
+        return h;
+    }
+
+    private bool Pin(Handle h)
+    {
+        if (Volatile.Read(ref _capacity) != int.MaxValue || !h.TryRef()) return false;
+        // Another reader pinned it first: drop our extra reference. (Evict cannot race with this: a pinned lookup holds a
+        // version containing the file, and only obsolete files are evicted.)
+        if (Interlocked.CompareExchange(ref h.Pinned, 1, 0) != 0) h.Release();
+        return true;
     }
 
     /// <summary>A referenced handle if the table is already open (FindTable with no_io), else false.</summary>
@@ -115,7 +147,8 @@ internal sealed class TableCacheStore : IDisposable
         {
             if (_handles.TryGetValue(number, out Handle? h) && h.IsOpen && h.TryRef())
             {
-                h.LastUse = Interlocked.Increment(ref _openSequence);
+                // LastUse only orders evictions: an unbounded cache skips the shared counter.
+                if (Volatile.Read(ref _capacity) != int.MaxValue) h.LastUse = Interlocked.Increment(ref _openSequence);
                 return h;
             }
             ObjectDisposedException.ThrowIf(_disposed || owner.IsDisposed, owner);
@@ -176,7 +209,7 @@ internal sealed class TableCacheStore : IDisposable
     /// <summary>Port of TableCache::Evict: drops the cached reader of a deleted file (closed once unreferenced).</summary>
     public void Evict(ulong fileNumber)
     {
-        if (_handles.TryRemove(fileNumber, out Handle? h)) h.Release();
+        if (_handles.TryRemove(fileNumber, out Handle? h)) h.ReleaseFromCache();
     }
 
     /// <summary>Drops every reader opened through <paramref name="owner"/> (its column family is being released).</summary>
@@ -184,7 +217,7 @@ internal sealed class TableCacheStore : IDisposable
     {
         foreach (KeyValuePair<ulong, Handle> kv in _handles)
         {
-            if (kv.Value.Owner == owner && ((ICollection<KeyValuePair<ulong, Handle>>)_handles).Remove(kv)) kv.Value.Release();
+            if (kv.Value.Owner == owner && ((ICollection<KeyValuePair<ulong, Handle>>)_handles).Remove(kv)) kv.Value.ReleaseFromCache();
         }
     }
 
@@ -203,7 +236,7 @@ internal sealed class TableCacheStore : IDisposable
         _disposed = true;
         foreach (KeyValuePair<ulong, Handle> kv in _handles)
         {
-            if (_handles.TryRemove(kv.Key, out Handle? h)) h.Release();
+            if (_handles.TryRemove(kv.Key, out Handle? h)) h.ReleaseFromCache();
         }
     }
 }
@@ -297,6 +330,24 @@ internal sealed class TableCache : ITableCache, IDisposable
         TableCacheStore.Handle h = _store.FindTable(this, file);
         rangeTombstones = h.RangeDels;
         return new TableReaderLease(h.Reader!, TableCacheStore.s_release, h);
+    }
+
+    /// <summary>
+    /// <see cref="GetReader(FileMetaData, out FragmentedRangeTombstoneList?)"/> for a file of a version the caller holds
+    /// referenced (through a super version or a version reference) for as long as it uses the lease. With
+    /// <c>max_open_files == -1</c> the reader is pinned (<see cref="TableCacheStore.TryGetPinned"/>) and stays open until
+    /// its file becomes obsolete, which cannot happen while a referenced version contains it, so the lease takes no
+    /// reference: no shared counter is written per lookup (like the pinned <c>fd.table_reader</c> that Version::Get uses
+    /// upstream). Otherwise the lease is referenced as usual.
+    /// </summary>
+    public TableReaderLease GetReaderForVersion(FileMetaData file, out FragmentedRangeTombstoneList? rangeTombstones)
+    {
+        if (_store.TryGetPinned(file.FileNumber) is { Reader: { } reader } h)
+        {
+            rangeTombstones = h.RangeDels;
+            return new TableReaderLease(reader, null, null);
+        }
+        return GetReader(file, out rangeTombstones);
     }
 
     /// <summary>The fragmented range tombstones of a table (opening it if needed), or null if it has none.</summary>

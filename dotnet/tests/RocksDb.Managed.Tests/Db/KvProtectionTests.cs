@@ -22,7 +22,130 @@ public sealed class KvProtectionTests
     private int _skipOffset = -1;
 
     [TestCleanup]
-    public void Cleanup() => TestHooks.ClearAll();
+    public void Cleanup()
+    {
+        TestHooks.ClearAll();
+        TestHooks.ForceParallelMemtableWrites = false;
+    }
+
+    // ------------------------------------------------------------------------------------------------- parallel inserts
+
+    private const int ParallelThreads = 8;
+    private const int ParallelWritesPerThread = 300;
+
+    private static byte[] ParallelKey(int thread, int i) => B("t" + thread.ToString("D2", System.Globalization.CultureInfo.InvariantCulture) + "-"
+        + i.ToString("D5", System.Globalization.CultureInfo.InvariantCulture));
+
+    /// <summary>
+    /// Runs <see cref="ParallelThreads"/> writers of protected batches (2 keys each) against <paramref name="db"/> with
+    /// parallel memtable inserts forced; returns the exceptions thrown by the writes.
+    /// </summary>
+    private static List<Exception> RunParallelProtectedWriters(RocksDatabase db)
+    {
+        var errors = new System.Collections.Concurrent.ConcurrentQueue<Exception>();
+        var wo = new WriteOptions { ProtectionBytesPerKey = 8 };
+        using var start = new Barrier(ParallelThreads);
+        var threads = new Thread[ParallelThreads];
+        for (int t = 0; t < ParallelThreads; t++)
+        {
+            int thread = t;
+            threads[t] = new Thread(() =>
+            {
+                start.SignalAndWait();
+                for (int i = 0; i < ParallelWritesPerThread; i++)
+                {
+                    using var b = new WriteBatch();
+                    b.Put(ParallelKey(thread, i), Value(i, thread));
+                    b.Delete(B("absent-" + thread.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                    try
+                    {
+                        db.Write(wo, b);
+                    }
+                    catch (Exception e)
+                    {
+                        errors.Enqueue(e);
+                    }
+                }
+            });
+            threads[t].Start();
+        }
+        foreach (Thread th in threads) th.Join();
+        return [.. errors];
+    }
+
+    /// <summary>
+    /// Protected batches through the parallel memtable insert path (concurrent_memtable_writes forced for every group):
+    /// every entry is inserted by its own writer thread (MemTable.AddConcurrently with the batch's protection info and the
+    /// memtable checksum) and reads back, also through iterators and after a flush.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public void ParallelMemtableInsertsWithProtection()
+    {
+        TestHooks.ForceParallelMemtableWrites = true;
+        var insertedBy = new System.Collections.Concurrent.ConcurrentDictionary<string, int>(StringComparer.Ordinal);
+        TestHooks.SetSpan("MemTable::Add:Encoded", data =>
+        {
+            // varint32(ikey len) | user key | 8-byte footer | ...
+            int ikeyLen = data[0];
+            insertedBy[System.Text.Encoding.ASCII.GetString(data.Slice(1, ikeyLen - 8))] = Environment.CurrentManagedThreadId;
+        });
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), CfOptions(memtableProtection: 8));
+        List<Exception> errors = RunParallelProtectedWriters(db);
+        Assert.AreEqual(0, errors.Count, errors.Count > 0 ? errors[0].ToString() : "");
+        // Every Put key plus one tombstone key per writer went through the protected memtable insert.
+        Assert.AreEqual(ParallelThreads * ParallelWritesPerThread + ParallelThreads, insertedBy.Count);
+        // Each writer inserts its own batch: all keys of one writer thread were inserted by the same thread.
+        for (int t = 0; t < ParallelThreads; t++)
+        {
+            var ids = new HashSet<int>();
+            for (int i = 0; i < ParallelWritesPerThread; i++) ids.Add(insertedBy[System.Text.Encoding.ASCII.GetString(ParallelKey(t, i))]);
+            Assert.AreEqual(1, ids.Count, "writer " + t + " entries inserted by " + ids.Count + " threads");
+        }
+        for (int t = 0; t < ParallelThreads; t++)
+            for (int i = 0; i < ParallelWritesPerThread; i += 7)
+                CollectionAssert.AreEqual(Value(i, t), db.Get(ParallelKey(t, i)));
+        using (Iterator it = db.NewIterator())
+        {
+            int n = 0;
+            for (it.SeekToFirst(); it.Valid; it.Next()) n++;
+            Assert.AreEqual(ParallelThreads * ParallelWritesPerThread, n);
+        }
+        db.Flush();
+        CollectionAssert.AreEqual(Value(5, 3), db.Get(ParallelKey(3, 5)));
+    }
+
+    /// <summary>
+    /// MemTableAddCorrupted on the parallel insert path: one entry's encoded bytes are corrupted after encoding (one
+    /// writer thread, while the others insert concurrently); exactly that write fails with Corruption, the others succeed.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public void ParallelMemtableInsertDetectsCorruptedEntry()
+    {
+        TestHooks.ForceParallelMemtableWrites = true;
+        int armed = 0;
+        TestHooks.SetSpan("MemTable::Add:Encoded", data =>
+        {
+            // Corrupt one value byte of the 100th Put of writer 5 (the first byte after the user key and footer is the
+            // value length; corrupt the byte after it).
+            int ikeyLen = data[0];
+            if (data.Slice(1, ikeyLen - 8).SequenceEqual(ParallelKey(5, 100)) && Interlocked.Exchange(ref armed, 1) == 0)
+                data[1 + ikeyLen + 1]++;
+        });
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), CfOptions());
+        List<Exception> errors = RunParallelProtectedWriters(db);
+        Assert.AreEqual(1, armed);
+        Assert.AreEqual(1, errors.Count, string.Join("\n", errors));
+        var ex = errors[0] as RocksDbException;
+        Assert.IsNotNull(ex, errors[0].ToString());
+        Assert.AreEqual(StatusCode.Corruption, ex.Code);
+        StringAssert.Contains(ex.ToString(), KvChecksum.MismatchMessage);
+        Assert.IsNull(db.Get(ParallelKey(5, 100)));
+        CollectionAssert.AreEqual(Value(99, 5), db.Get(ParallelKey(5, 99)));
+    }
 
     private static IEnumerable<object[]> Ops()
     {

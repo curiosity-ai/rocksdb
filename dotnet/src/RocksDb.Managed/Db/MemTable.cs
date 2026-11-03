@@ -223,9 +223,18 @@ public sealed unsafe class MemTable : IDisposable
     /// Adds an entry; may run concurrently with other <see cref="AddConcurrently"/> calls. Counters are accumulated in
     /// <paramref name="postProcessInfo"/> and must be applied with <see cref="BatchPostProcess"/>.
     /// </summary>
-    public bool AddConcurrently(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ref MemTablePostProcessInfo postProcessInfo)
+    public bool AddConcurrently(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ref MemTablePostProcessInfo postProcessInfo) =>
+        AddConcurrently(sequence, type, key, value, ref postProcessInfo, hasKvProtInfo: false, kvProtInfo: 0);
+
+    /// <summary>
+    /// <see cref="AddConcurrently(ulong, EntryType, ReadOnlySpan{byte}, ReadOnlySpan{byte}, ref MemTablePostProcessInfo)"/>
+    /// with the entry's ProtectionInfoKVOS64 from the write batch: it becomes the entry checksum and the encoded entry
+    /// is verified against it, exactly like the serial <see cref="Add(ulong, EntryType, ReadOnlySpan{byte}, ReadOnlySpan{byte}, bool, ulong)"/>.
+    /// </summary>
+    internal bool AddConcurrently(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ref MemTablePostProcessInfo postProcessInfo,
+        bool hasKvProtInfo, ulong kvProtInfo)
     {
-        if (!Insert(sequence, type, key, value, concurrent: true, out int encodedLen, hasKvProtInfo: false, kvProtInfo: 0)) return false;
+        if (!Insert(sequence, type, key, value, concurrent: true, out int encodedLen, hasKvProtInfo, kvProtInfo)) return false;
         if (_newestUdtSize != 0) MaybeUpdateNewestUdt(key);
         if (_bloom is not null) AddToBloom(key, concurrent: true);
         postProcessInfo.NumEntries++;

@@ -1248,10 +1248,17 @@ public sealed partial class BlockBasedTableReader : IDisposable
         GetAsync(internalKey, value, TableReadFlags.None, cancellationToken);
 
     /// <inheritdoc cref="GetAsync(ReadOnlyMemory{byte}, IBufferWriter{byte}?, CancellationToken)"/>
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    public async ValueTask<TableGetResult> GetAsync(ReadOnlyMemory<byte> internalKey, IBufferWriter<byte>? value, TableReadFlags flags, CancellationToken cancellationToken)
+    public ValueTask<TableGetResult> GetAsync(ReadOnlyMemory<byte> internalKey, IBufferWriter<byte>? value, TableReadFlags flags, CancellationToken cancellationToken)
     {
+        // A filter miss (the common case of a lookup in a table without the key) completes without an async state machine.
         if (!InternalKeyMayMatch(internalKey.Span, flags)) return default;
+        return GetAfterFilterAsync(internalKey, value, flags, cancellationToken);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<TableGetResult> GetAfterFilterAsync(ReadOnlyMemory<byte> internalKey, IBufferWriter<byte>? value, TableReadFlags flags,
+        CancellationToken cancellationToken)
+    {
         IndexCursor idx = IndexCursor.Rent(this, flags);
         BlockIter data = IterPool.Rent();
         try

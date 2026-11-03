@@ -376,6 +376,7 @@ public static class DbBenchRunner
 
         private long _jitMethodsBefore;
         private TimeSpan _jitTimeBefore;
+        private TimeSpan _cpuBefore;
 
         /// <summary>The transactional DB of txnoptimistic / txnpessimistic.</summary>
         public ITxnEngine? Txn { get; init; }
@@ -389,6 +390,7 @@ public static class DbBenchRunner
             // benchmark; ~0 after the warm-up, so the measurement does not include compilation.
             _jitMethodsBefore = System.Runtime.JitInfo.GetCompiledMethodCount(currentThread: false);
             _jitTimeBefore = System.Runtime.JitInfo.GetCompilationTime(currentThread: false);
+            _cpuBefore = Environment.CpuUsage.TotalTime;
             long allocBefore = GC.GetTotalAllocatedBytes(precise: true);
             int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
 
@@ -479,6 +481,10 @@ public static class DbBenchRunner
             double allocPerOp = allocated / (double)Math.Max(ops, 1);
             // Managed allocations (all threads) per operation; native engines only allocate in unmanaged memory.
             line += string.Format(ci, " alloc {0:F1} B/op gc {1}/{2}/{3} jit {4} methods {5:F1} ms", allocPerOp, d0, d1, d2, jitMethods, jitMs);
+            // Process CPU time (all threads, incl. background jobs) per operation: less sensitive to other load on the
+            // machine than wall time, and it shows spinning and cache-line contention.
+            double cpuPerOp = (Environment.CpuUsage.TotalTime - _cpuBefore).TotalMicroseconds / Math.Max(ops, 1);
+            line += string.Format(ci, " cpu {0:F3} us/op", cpuPerOp);
             Console.WriteLine(line);
             Console.WriteLine(string.Format(ci, "RESULT,{0},{1},{2},{3},{4:F6},{5:F4},{6:F1},{7:F2},{8:F4},{9:F4},{10:F4},{11},{12:F1},{13},{14},{15},{16},{17:F1}",
                 f.EngineLabel, _name, f.Threads, ops, seconds, microsPerOp, opsPerSec, mbs, p50, p99, p999, found, allocPerOp, d0, d1, d2, jitMethods, jitMs));
@@ -1061,6 +1067,8 @@ public static class DbBenchRunner
                 case "disable_auto_compactions": o = o with { DisableAutoCompactions = ParseBool(value) }; break;
                 case "enable_blob_files": o = o with { EnableBlobFiles = ParseBool(value) }; break;
                 case "min_blob_size": o = o with { MinBlobSize = ulong.Parse(value, ci) }; break;
+                case "allow_concurrent_memtable_write": o = o with { AllowConcurrentMemtableWrite = ParseBool(value) }; break;
+                case "enable_write_thread_adaptive_yield": o = o with { EnableWriteThreadAdaptiveYield = ParseBool(value) }; break;
                 case "max_background_jobs": o = o with { MaxBackgroundJobs = int.Parse(value, ci) }; break;
                 case "max_subcompactions": o = o with { MaxSubcompactions = uint.Parse(value, ci) }; break;
                 default: throw new ArgumentException("unknown flag --" + name);

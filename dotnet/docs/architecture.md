@@ -127,13 +127,23 @@ collects compatible queued writers into a group (no sync write under a non-sync 
 `NoSlowdown` writers, a size cap of the leader's size + 128 KiB), writes one WAL record for the group, inserts into
 the memtables, publishes the sequence number, and hands leadership to the next queued writer.
 
+With `allow_concurrent_memtable_write` (the default), a group of plain writes (no merge operands, no transaction
+extras) with at least `DbImpl.MinParallelMemtableGroupEntries` (64) entries inserts in parallel: after the WAL write the
+leader wakes the followers with `StateParallelMemtableWriter`, every writer inserts its own batch with
+`MemTable.AddConcurrently`, and the writer that finishes last publishes the sequence and exits the group for everyone
+(`LaunchParallelMemTableWriters` / `CompleteParallelMemTableWriter` / `ExitAsBatchGroupFollower`). Upstream goes
+parallel for any group of two or more writers; for small groups the two extra hand-offs per writer cost more than the
+serial inserts (docs/perf.md, "Read/write contention").
+
 Followers wait in one of two ways:
 
 - **async writers** (`PutAsync`, `WriteAsync`) wait on a pooled `IValueTaskSource`
   (`ManualResetValueTaskSourceCore`). Continuations run asynchronously, so they never run on the leader's thread.
-- **sync writers** (`Put`, `Write`) wait on a `ManualResetEventSlim` that spins briefly (like upstream's adaptive
-  yield). A sync writer that becomes leader does the group's I/O on its own thread, so the sync API never waits
-  on thread-pool work.
+- **sync writers** (`Put`, `Write`) wait like upstream's `AwaitState`: a short busy spin, then (with
+  `enable_write_thread_adaptive_yield`) `Thread.Yield` for up to `write_thread_max_yield_usec` while the yield credit
+  says yielding pays off, then a blocking wait on a monitor that the waker only touches if the waiter registered as
+  blocked (`STATE_LOCKED_WAITING`). A sync writer that becomes leader does the group's I/O on its own thread, so the
+  sync API never waits on thread-pool work.
 
 "Unbatched" writers (memtable switches and other exclusive operations) form a group of their own. Write stalls and
 delayed writes (`Db/Compaction/WriteController.cs`) delay the leader with a token bucket, as upstream does.
@@ -222,10 +232,11 @@ verified with `[MemoryDiagnoser]` and the benchmark runner's allocated-bytes-per
 | `rocksdb::DB` | `RocksDatabase` | a class named `RocksDb` would clash with the `RocksDb.Managed` namespace |
 | `Version`, `ValueType` | `Db.DbVersion` (internal), `Db.EntryType` | avoid clashing with `System.Version` / `System.ValueType` |
 | `TEST_SYNC_POINT` | `Db/TestHooks.cs` | deterministic concurrency tests |
-| thread-local SuperVersion caching | a short lock to reference the SuperVersion | simpler; not measurable at current throughput |
+| thread-local SuperVersion caching (`local_sv_`) | per-processor slots (`Db/SuperVersionCache.cs`) for point reads; iterators take a plain reference | no thread-exit hook in .NET; a slot shared by two threads falls back to a plain reference |
 | `std::thread` background pools (`Env::Schedule`) | thread-pool tasks for flushes, `LongRunning` tasks for compactions | .NET scheduling; no fixed pool to size |
 | no cancellation | `CancellationToken` on every async API; a cancelled write leader that is delayed by a stall fails its whole group with `OperationCanceledException` | .NET convention |
-| write-group follower wait (spin + futex) | `IValueTaskSource` for async writers, spinning `ManualResetEventSlim` for sync writers | async callers do not block a thread |
+| write-group follower wait (spin + yield + futex) | `IValueTaskSource` for async writers, `AwaitState` port (spin, adaptive yield, monitor) for sync writers | async callers do not block a thread |
+| parallel memtable writes for any group of 2+ writers | only for groups of >= 64 entries | the extra hand-offs cost more than serial inserts of small groups |
 
 Format-level differences (compression corner cases, flush not dropping overwritten entries) and the features that are
 not ported are listed in the [README](../README.md#known-deviations-and-gaps).

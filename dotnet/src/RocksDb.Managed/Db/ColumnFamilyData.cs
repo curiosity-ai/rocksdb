@@ -257,6 +257,8 @@ internal sealed class ColumnFamilyData
     public SuperVersion Super => Volatile.Read(ref _super)!;
     public SuperVersion? SuperOrNull() => Volatile.Read(ref _super);
     public void SetSuper(SuperVersion sv) => Volatile.Write(ref _super, sv);
+    /// <summary>Per-processor cached super version references for point reads (local_sv_).</summary>
+    public SuperVersionCache LocalSuperVersions { get; } = new();
 
     /// <summary>WALs with numbers below this have been flushed for this CF (ColumnFamilyData::GetLogNumber).</summary>
     public ulong LogNumber { get; set; }

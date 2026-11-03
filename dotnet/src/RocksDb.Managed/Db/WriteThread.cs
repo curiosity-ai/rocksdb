@@ -14,9 +14,15 @@ namespace RocksDb.Managed.Db;
 /// </list>
 /// Waiting is either asynchronous (an <see cref="IValueTaskSource{TResult}"/> backed by
 /// <see cref="ManualResetValueTaskSourceCore{TResult}"/>, continuations run asynchronously so they never execute on
-/// the leader) or synchronous (a <see cref="ManualResetEventSlim"/>, which spins briefly like the C++
-/// AwaitState adaptive yield). A synchronous writer promoted to leader performs the group's I/O on its own thread, so
-/// the sync API never blocks on thread-pool work.
+/// the leader) or synchronous (<see cref="Writer.WaitSync"/>: AwaitState's busy spin, then the adaptive yield phase
+/// of up to <c>write_thread_max_yield_usec</c>, then a blocking wait on a monitor, BlockingAwaitWaitImpl). A synchronous writer
+/// promoted to leader performs the group's I/O on its own thread, so the sync API never blocks on thread-pool work.
+/// <para>
+/// With <c>allow_concurrent_memtable_write</c> the leader may wake its followers with
+/// <see cref="StateParallelMemtableWriter"/> after the WAL write (LaunchParallelMemTableWriters): every writer inserts
+/// its own batch, and the last one to finish (<see cref="DbImpl"/> counts them down) completes the others and hands
+/// leadership on (<see cref="ExitAsParallelGroup"/>, ExitAsBatchGroupFollower).
+/// </para>
 /// <para>
 /// Writers with <c>Batch == null</c> are "unbatched" writers (EnterUnbatched): they become leader of a group of their
 /// own and are used to run exclusive operations such as memtable switches.
@@ -26,23 +32,86 @@ internal sealed class WriteThread
 {
     public const int StateCompleted = 1;
     public const int StateGroupLeader = 2;
+    /// <summary>STATE_PARALLEL_MEMTABLE_WRITER: insert the writer's own batch into the memtables, then count down.</summary>
+    public const int StateParallelMemtableWriter = 3;
 
     private readonly Lock _lock = new();
     private Writer? _head;
     private Writer? _tail;
     private bool _leaderActive;
     private readonly long _maxGroupBytes;
+    private readonly long _maxYieldTicks;
+    private readonly long _slowYieldTicks;
+    // AdaptationContext::value (yield_credit): fixed-point running estimate of whether yielding ends before
+    // max_yield_usec without involuntary context switches (>= 0: yield).
+    private int _yieldCredit;
+    [ThreadStatic] private static uint t_yieldSample;
 
-    public WriteThread(ulong maxWriteBatchGroupSizeBytes)
+    /// <param name="maxWriteBatchGroupSizeBytes">max_write_batch_group_size_bytes.</param>
+    /// <param name="maxYieldMicros">write_thread_max_yield_usec when enable_write_thread_adaptive_yield, else 0.</param>
+    public WriteThread(ulong maxWriteBatchGroupSizeBytes, ulong maxYieldMicros)
     {
         _maxGroupBytes = (long)Math.Min(maxWriteBatchGroupSizeBytes, (ulong)int.MaxValue);
+        _maxYieldTicks = (long)Math.Min(maxYieldMicros * (ulong)Stopwatch.Frequency / 1_000_000UL, (ulong)Stopwatch.Frequency);
+        // write_thread_slow_yield_usec (default 3): a yield that takes longer is assumed to be an involuntary context switch.
+        _slowYieldTicks = Math.Max(1, 3 * Stopwatch.Frequency / 1_000_000);
+    }
+
+    /// <summary>
+    /// The adaptive yield phase of AwaitState (db/write_thread.cc): yields while the state is unset, for at most
+    /// write_thread_max_yield_usec, if the yield credit is non-negative or this wait is sampled (1 in 256) to update it.
+    /// Three slow yields fall back to blocking at once. Returns the state, or 0 to block.
+    /// </summary>
+    private int YieldWait(Writer w)
+    {
+        const int kMaxSlowYieldsWhileSpinning = 3;
+        bool updateCtx = (++t_yieldSample & 255) == 0;
+        bool wouldSpinAgain = false;
+        int state = 0;
+        if (updateCtx || Volatile.Read(ref _yieldCredit) >= 0)
+        {
+            long spinBegin = Stopwatch.GetTimestamp();
+            long iterBegin = spinBegin;
+            int slowYields = 0;
+            while (iterBegin - spinBegin <= _maxYieldTicks)
+            {
+                Thread.Yield();
+                if ((state = w.SyncState) > 0)
+                {
+                    wouldSpinAgain = true;
+                    break;
+                }
+                long now = Stopwatch.GetTimestamp();
+                if (now == iterBegin || now - iterBegin >= _slowYieldTicks)
+                {
+                    // conservatively count it as a slow yield if our clock isn't accurate enough to measure the yield duration
+                    if (++slowYields >= kMaxSlowYieldsWhileSpinning)
+                    {
+                        // Not just one ivcsw, but several. Immediately update yield_credit and fall back to blocking
+                        updateCtx = true;
+                        break;
+                    }
+                }
+                iterBegin = now;
+            }
+        }
+        if (updateCtx)
+        {
+            // fixed point exponential decay with decay constant 1/1024, with +1 and -1 scaled to avoid overflow
+            int v = Volatile.Read(ref _yieldCredit);
+            v = v - (v / 1024) + (wouldSpinAgain ? 1 : -1) * 131072;
+            Volatile.Write(ref _yieldCredit, v);
+        }
+        return state;
     }
 
     /// <summary>A queued write request. Pooled; reset with <see cref="Prepare"/> before each use.</summary>
     internal sealed class Writer : IValueTaskSource<int>
     {
         private ManualResetValueTaskSourceCore<int> _core = new() { RunContinuationsAsynchronously = true };
-        private ManualResetEventSlim? _event;
+        // STATE_LOCKED_WAITING: the waiter is blocked on the monitor of _stateLock (BlockingAwaitWaitImpl).
+        private const int StateLockedWaiting = -1;
+        private readonly object _stateLock = new();
         private int _syncState;
 
         public WriteBatch? Batch;
@@ -57,6 +126,8 @@ internal sealed class WriteThread
         public TransactionWriteContext? Txn;
         /// <summary>The write callback failed: the writer is excluded from the WAL record and the memtables.</summary>
         public bool CallbackFailed;
+        /// <summary>The write thread the writer joined (its adaptive-yield context for <see cref="WaitSync"/>).</summary>
+        public WriteThread? Owner;
 
         public void Prepare(WriteBatch? batch, WriteOptions? options, bool syncWaiter)
         {
@@ -70,10 +141,15 @@ internal sealed class WriteThread
             Next = null;
             Txn = null;
             CallbackFailed = false;
-            if (syncWaiter)
+            Rearm();
+        }
+
+        /// <summary>Re-arms the wait primitive so the writer can be woken once more (after it consumed its last wake-up).</summary>
+        public void Rearm()
+        {
+            if (IsSyncWaiter)
             {
-                _syncState = 0;
-                (_event ??= new ManualResetEventSlim(false, 100)).Reset();
+                Volatile.Write(ref _syncState, 0);
             }
             else
             {
@@ -89,8 +165,17 @@ internal sealed class WriteThread
         {
             if (IsSyncWaiter)
             {
-                Volatile.Write(ref _syncState, state);
-                _event!.Set();
+                // SetState: publish with a CAS unless the waiter has registered as blocked; then set it under the
+                // monitor and wake it. A waiter that already saw the state never has its monitor touched later.
+                int cur = Volatile.Read(ref _syncState);
+                if (cur == StateLockedWaiting || Interlocked.CompareExchange(ref _syncState, state, 0) != 0)
+                {
+                    lock (_stateLock)
+                    {
+                        Volatile.Write(ref _syncState, state);
+                        Monitor.Pulse(_stateLock);
+                    }
+                }
             }
             else
             {
@@ -98,12 +183,38 @@ internal sealed class WriteThread
             }
         }
 
-        /// <summary>Blocks until woken (AwaitState); returns the state.</summary>
+        /// <summary>
+        /// Blocks until woken; returns the state. Port of WriteThread::AwaitState: a short busy spin (a hand-off from a
+        /// leader usually takes a few microseconds), then, with adaptive yield, Thread.Yield for up to
+        /// write_thread_max_yield_usec while the yield credit says that yielding tends to pay off, and only then a blocking
+        /// wait (a futex wake-up costs the waker a system call and the waiter a reschedule).
+        /// </summary>
         public int WaitSync()
         {
-            _event!.Wait();
-            return Volatile.Read(ref _syncState);
+            int s;
+            // kMaxSpin iterations of the pause loop.
+            for (int i = 0; i < 200; i++)
+            {
+                if ((s = Volatile.Read(ref _syncState)) != 0) return s;
+                Thread.SpinWait(1);
+            }
+            WriteThread? owner = Owner;
+            if (owner is not null && owner._maxYieldTicks > 0)
+            {
+                s = owner.YieldWait(this);
+                if (s != 0) return s;
+            }
+            // BlockingAwaitWaitImpl: register as blocked unless the state was set meanwhile.
+            s = Interlocked.CompareExchange(ref _syncState, StateLockedWaiting, 0);
+            if (s != 0) return s;
+            lock (_stateLock)
+            {
+                while ((s = Volatile.Read(ref _syncState)) == StateLockedWaiting) Monitor.Wait(_stateLock);
+            }
+            return s;
         }
+
+        internal int SyncState => Volatile.Read(ref _syncState);
 
         public ValueTask<int> WaitAsync() => new(this, _core.Version);
 
@@ -120,6 +231,7 @@ internal sealed class WriteThread
     /// </summary>
     public bool JoinBatchGroup(Writer w)
     {
+        w.Owner = this;
         lock (_lock)
         {
             if (!_leaderActive)
@@ -181,6 +293,22 @@ internal sealed class WriteThread
     public void ExitAsBatchGroupLeader(List<Writer> group)
     {
         for (int i = 1; i < group.Count; i++) group[i].Complete(StateCompleted);
+        group.Clear();
+        ExitAsLeader();
+    }
+
+    /// <summary>
+    /// ExitAsBatchGroupFollower / the parallel part of ExitAsBatchGroupLeader: called by the writer of a parallel
+    /// memtable group that finished last (<paramref name="self"/>, the leader or a follower); completes every other writer
+    /// of the group (including the leader) and hands leadership to the next queued writer.
+    /// </summary>
+    public void ExitAsParallelGroup(List<Writer> group, Writer self)
+    {
+        // The woken writers do not touch the group, so the next leader may reuse it once leadership is handed on.
+        for (int i = 0; i < group.Count; i++)
+        {
+            if (group[i] != self) group[i].Complete(StateCompleted);
+        }
         group.Clear();
         ExitAsLeader();
     }

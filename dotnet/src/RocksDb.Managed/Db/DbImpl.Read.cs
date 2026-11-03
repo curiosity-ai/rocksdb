@@ -41,17 +41,17 @@ internal sealed partial class DbImpl
         // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
         // in between could drop the versions visible at that sequence (no snapshot protects them).
         ValidateReadSnapshot(options);
-        SuperVersion sv = GetReferencedSuperVersion(cfd);
-        TestHooks.Invoke("DBImpl::GetImpl:AfterSuperVersion");
-        ulong snapshot = ReadSequence(options);
-        if (ctx.Callback is { } cb) snapshot = ApplyReadCallback(cb, options, snapshot);
+        SuperVersion sv = GetAndRefSuperVersion(cfd, out int svSlot);
         try
         {
+            TestHooks.Invoke("DBImpl::GetImpl:AfterSuperVersion");
+            ulong snapshot = ReadSequence(options);
+            if (ctx.Callback is { } cb) snapshot = ApplyReadCallback(cb, options, snapshot);
             GetWithSuperVersion(cfd, sv, snapshot, options, key, ctx);
         }
         finally
         {
-            ReturnSuperVersion(sv);
+            ReturnAndCleanupSuperVersion(cfd, sv, svSlot);
         }
     }
 
@@ -298,7 +298,7 @@ internal sealed partial class DbImpl
     /// <summary>TableCache::Get: range tombstones of the file, then the point lookup. Returns true when done.</summary>
     private static bool GetFromFile(ColumnFamilyData cfd, FileMetaData f, ReadOnlySpan<byte> ikey, ReadOnlySpan<byte> userKey, ulong snapshot, GetContext ctx)
     {
-        TableReaderLease lease = cfd.TableCache.GetReader(f, out FragmentedRangeTombstoneList? rangeDels);
+        TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels);
         try
         {
             if (rangeDels is not null)
@@ -347,7 +347,7 @@ internal sealed partial class DbImpl
         // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
         // in between could drop the versions visible at that sequence (no snapshot protects them).
         ValidateReadSnapshot(options);
-        SuperVersion sv = GetReferencedSuperVersion(cfd);
+        SuperVersion sv = GetAndRefSuperVersion(cfd, out int svSlot);
         ulong snapshot = ReadSequence(options);
         PooledBufferWriter ikeyBuf = ObjectPools.RentWriter();
         try
@@ -410,7 +410,7 @@ internal sealed partial class DbImpl
         finally
         {
             ObjectPools.ReturnWriter(ikeyBuf);
-            ReturnSuperVersion(sv);
+            ReturnAndCleanupSuperVersion(cfd, sv, svSlot);
         }
     }
 
@@ -531,10 +531,11 @@ internal sealed partial class DbImpl
     private static async ValueTask<bool> GetFromFileWithTimestampAsync(ColumnFamilyData cfd, FileMetaData f, ReadOnlyMemory<byte> ikey, ulong snapshot,
         GetContext ctx, CancellationToken cancellationToken)
     {
-        TableReaderLease lease = await cfd.TableCache.GetReaderAsync(f, cancellationToken).ConfigureAwait(false);
+        // Opening a table is synchronous (TableCache.GetReaderAsync); the super version keeps the file's version referenced.
+        TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels);
         try
         {
-            ApplyFileRangeTombstones(cfd.TableCache.GetRangeTombstones(f), DbFormat.ExtractUserKey(ikey.Span), snapshot, ctx);
+            ApplyFileRangeTombstones(rangeDels, DbFormat.ExtractUserKey(ikey.Span), snapshot, ctx);
             await lease.Reader.GetAsync(ikey, ctx, s_saveValue, TableReadFlags.None, cancellationToken).ConfigureAwait(false);
         }
         finally
@@ -574,39 +575,68 @@ internal sealed partial class DbImpl
         }
     }
 
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    private static async ValueTask<bool> GetFromFileAsync(ColumnFamilyData cfd, FileMetaData f, ReadOnlyMemory<byte> ikey, ReadOnlyMemory<byte> userKey,
+    /// <summary>
+    /// Async <see cref="GetFromFile"/>: the first entry of the key is read with <see cref="BlockBasedTableReader.GetAsync"/>
+    /// (merge chains continue with the synchronous visitor). Completes without an async state machine when the table
+    /// lookup does (filter miss, cached blocks).
+    /// </summary>
+    private static ValueTask<bool> GetFromFileAsync(ColumnFamilyData cfd, FileMetaData f, ReadOnlyMemory<byte> ikey, ReadOnlyMemory<byte> userKey,
         ulong snapshot, GetContext ctx, CancellationToken cancellationToken)
     {
-        TableReaderLease lease = await cfd.TableCache.GetReaderAsync(f, cancellationToken).ConfigureAwait(false);
+        // Opening a table is synchronous (TableCache.GetReaderAsync); the super version keeps the file's version referenced.
+        TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels);
+        ValueTask<TableGetResult> pending;
         try
         {
-            FragmentedRangeTombstoneList? rangeDels = cfd.TableCache.GetRangeTombstones(f);
             if (rangeDels is not null)
             {
                 ulong cov = rangeDels.MaxCoveringTombstoneSeqnum(userKey.Span, snapshot);
                 if (cov > ctx.MaxCoveringTombstoneSeq) ctx.MaxCoveringTombstoneSeq = cov;
             }
             ctx.Scratch.Clear();
-            TableGetResult r = await lease.Reader.GetAsync(ikey, ctx.Scratch, cancellationToken).ConfigureAwait(false);
-            if (r.Found)
+            pending = lease.Reader.GetAsync(ikey, ctx.Scratch, cancellationToken);
+            if (pending.IsCompletedSuccessfully)
             {
-                if (r.Type == EntryType.Merge && ctx.MaxCoveringTombstoneSeq <= r.Sequence)
-                {
-                    // Merge chain: the rest of the operands are most likely in the same (now cached by the OS) block.
-                    lease.Reader.Get(ikey.Span, ref ctx, s_saveValue);
-                }
-                else
-                {
-                    ctx.SaveEntry(r.Sequence, r.Type, ctx.Scratch.WrittenSpan);
-                }
+                SaveFileResult(lease.Reader, pending.Result, ikey.Span, ctx);
+                lease.Dispose();
+                return new ValueTask<bool>(ctx.Done);
             }
+        }
+        catch
+        {
+            lease.Dispose();
+            throw;
+        }
+        return GetFromFileSlowAsync(lease, pending, ikey, ctx);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private static async ValueTask<bool> GetFromFileSlowAsync(TableReaderLease lease, ValueTask<TableGetResult> pending, ReadOnlyMemory<byte> ikey, GetContext ctx)
+    {
+        try
+        {
+            TableGetResult r = await pending.ConfigureAwait(false);
+            SaveFileResult(lease.Reader, r, ikey.Span, ctx);
         }
         finally
         {
             lease.Dispose();
         }
         return ctx.Done;
+    }
+
+    private static void SaveFileResult(BlockBasedTableReader reader, TableGetResult r, ReadOnlySpan<byte> ikey, GetContext ctx)
+    {
+        if (!r.Found) return;
+        if (r.Type == EntryType.Merge && ctx.MaxCoveringTombstoneSeq <= r.Sequence)
+        {
+            // Merge chain: the rest of the operands are most likely in the same (now cached by the OS) block.
+            reader.Get(ikey, ref ctx, s_saveValue);
+        }
+        else
+        {
+            ctx.SaveEntry(r.Sequence, r.Type, ctx.Scratch.WrittenSpan);
+        }
     }
 
     // ---- iterators --------------------------------------------------------------------------------------

@@ -16,6 +16,12 @@ internal static class TestHooks
     private static volatile bool s_any;
 #endif
 
+    /// <summary>
+    /// Tests: run the memtable inserts of every eligible write group in parallel, regardless of
+    /// <see cref="DbImpl.MinParallelMemtableGroupEntries"/> (only changes scheduling; the result is the same).
+    /// </summary>
+    internal static volatile bool ForceParallelMemtableWrites;
+
     /// <summary>Installs (or with null removes) the callback for <paramref name="name"/>. DEBUG builds only.</summary>
     public static void Set(string name, Action? callback)
     {

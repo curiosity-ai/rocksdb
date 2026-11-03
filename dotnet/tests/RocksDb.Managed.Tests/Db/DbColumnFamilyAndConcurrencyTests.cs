@@ -96,13 +96,33 @@ public sealed class DbColumnFamilyAndConcurrencyTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task ConcurrentWritersSyncAndAsync()
+    [DataRow(true, true)]
+    [DataRow(true, false)]
+    [DataRow(false, true)]
+    public async Task ConcurrentWritersSyncAndAsync(bool concurrentMemtableWrite, bool adaptiveYield)
+    {
+        // Single-key writes form groups below the parallel threshold: force the parallel inserts to exercise them.
+        TestHooks.ForceParallelMemtableWrites = concurrentMemtableWrite;
+        try
+        {
+            await ConcurrentWritersSyncAndAsyncCore(concurrentMemtableWrite, adaptiveYield);
+        }
+        finally
+        {
+            TestHooks.ForceParallelMemtableWrites = false;
+        }
+    }
+
+    private static async Task ConcurrentWritersSyncAndAsyncCore(bool concurrentMemtableWrite, bool adaptiveYield)
     {
         MemoryFileSystem fs = NewFs();
         var cfo = new ColumnFamilyOptions { WriteBufferSize = 256 * 1024, ArenaBlockSize = 16 * 1024, MaxWriteBufferNumber = 3 };
         const int threads = 8;
         var counts = new int[threads];
-        await using (RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs), cfo))
+        DbOptions options = NewOptions(fs);
+        options.AllowConcurrentMemtableWrite = concurrentMemtableWrite;
+        options.EnableWriteThreadAdaptiveYield = adaptiveYield;
+        await using (RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, options, cfo))
         {
             var sw = Stopwatch.StartNew();
             var tasks = new Task[threads];
@@ -153,6 +173,104 @@ public sealed class DbColumnFamilyAndConcurrencyTests
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Parallel memtable inserts with WAL termination points: the memtables get the whole batches, the merged WAL record
+    /// only the parts before each termination point, so after a reopen (WAL recovery) only those survive.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ParallelMemtableInsertsWithWalTerminationPoints()
+    {
+        MemoryFileSystem fs = NewFs();
+        const int threads = 6, perThread = 300;
+        TestHooks.ForceParallelMemtableWrites = true;
+        try
+        {
+            await using (RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs)))
+            {
+                var tasks = new Task[threads];
+                for (int t = 0; t < threads; t++)
+                {
+                    int id = t;
+                    tasks[t] = Task.Factory.StartNew(() =>
+                    {
+                        for (int i = 0; i < perThread; i++)
+                        {
+                            using WriteBatch b = db.CreateWriteBatch();
+                            b.Put(B("wal" + id + "-" + i), Value(i, id));
+                            b.MarkWalTerminationPoint();
+                            b.Put(B("mem" + id + "-" + i), Value(i, id));
+                            if (id % 2 == 0) db.Write(b);
+                            else db.WriteAsync(b).AsTask().GetAwaiter().GetResult();
+                        }
+                    }, TaskCreationOptions.LongRunning);
+                }
+                await Task.WhenAll(tasks);
+                for (int t = 0; t < threads; t++)
+                {
+                    for (int i = 0; i < perThread; i++)
+                    {
+                        CollectionAssert.AreEqual(Value(i, t), db.Get(B("wal" + t + "-" + i)));
+                        CollectionAssert.AreEqual(Value(i, t), db.Get(B("mem" + t + "-" + i)));
+                    }
+                }
+                Assert.AreEqual((ulong)(threads * perThread * 2), db.GetLatestSequenceNumber());
+            }
+        }
+        finally
+        {
+            TestHooks.ForceParallelMemtableWrites = false;
+        }
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs)))
+        {
+            for (int t = 0; t < threads; t++)
+            {
+                for (int i = 0; i < perThread; i++)
+                {
+                    CollectionAssert.AreEqual(Value(i, t), db.Get(B("wal" + t + "-" + i)));
+                    Assert.IsNull(db.Get(B("mem" + t + "-" + i)));
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Point reads use super version references cached per processor (SuperVersionCache, upstream local_sv_): a read
+    /// after a memtable switch, flush or compaction must not use the cached, obsolete one.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task PointReadsNeverUseAnObsoleteCachedSuperVersion()
+    {
+        MemoryFileSystem fs = NewFs();
+        await using RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs));
+        ColumnFamily cf = db.CreateColumnFamily("cf", new ColumnFamilyOptions());
+        for (int round = 0; round < 20; round++)
+        {
+            string expect = "v" + round;
+            cf.Put(B("k"), B(expect));
+            // Several reads (sync, async, MultiGet) on whatever processors this thread runs on cache the super version.
+            Assert.AreEqual(expect, GetString(cf, "k"));
+            Assert.AreEqual(expect, System.Text.Encoding.UTF8.GetString((await cf.GetAsync(B("k")))!));
+            switch (round % 3)
+            {
+                case 0: cf.Flush(); break;
+                case 1: await cf.CompactRangeAsync(); break;
+                default: await cf.FlushAsync(); break;
+            }
+            string next = "w" + round;
+            cf.Put(B("k"), B(next)); // lands in the memtable of the newly installed super version
+            Assert.AreEqual(next, GetString(cf, "k"));
+            Assert.AreEqual(next, System.Text.Encoding.UTF8.GetString((await cf.GetAsync(B("k")))!));
+            byte[]?[] values = cf.MultiGet([B("k")]);
+            Assert.AreEqual(next, System.Text.Encoding.UTF8.GetString(values[0]!));
+        }
+        // Reads through a dropped column family's handle keep working on its last super version (upstream).
+        db.DropColumnFamily(cf);
+        Assert.AreEqual("w19", GetString(cf, "k"));
+        Assert.AreEqual("w19", System.Text.Encoding.UTF8.GetString((await cf.GetAsync(B("k")))!));
     }
 
     [TestMethod]
