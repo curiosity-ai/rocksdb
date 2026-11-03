@@ -341,6 +341,19 @@ public sealed class BlockCacheTier : PersistentCacheTier
         }
     }
 
+    private void ForceReserve(long size)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            _size += size;
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
+    }
+
     /// <summary>Waits until queued inserts and buffer writes are done (TEST_Flush).</summary>
     public override void Flush()
     {
@@ -710,8 +723,18 @@ public sealed class BlockCacheTier : PersistentCacheTier
             {
                 (CacheFile? file, byte[]? buf, int length) = _q.Take();
                 if (file is null) break;
+                // Wait for space (upstream retries every second forever); files only become evictable once fully
+                // written, so this waits for other writers. After ~30 s the write is accounted anyway.
                 int tries = 0;
-                while (!_tier.Reserve(length) && tries++ < 10) Thread.Sleep(100);
+                while (!_tier.Reserve(length))
+                {
+                    if (++tries > 3000)
+                    {
+                        _tier.ForceReserve(length);
+                        break;
+                    }
+                    Thread.Sleep(10);
+                }
                 try
                 {
                     file.WriteToDisk(buf!, length, _ioSize);
