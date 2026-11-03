@@ -40,6 +40,7 @@ internal static class Program
         ("ReadOnlyAndSecondary", Replication.ReadOnlyAndSecondary),
         ("Monitoring", Monitoring.StatisticsListenersLog),
         ("ErrorHandling", Errors.ErrorHandling),
+        ("Tracing", Tracing.TraceAndReplay),
     ];
 
     public static async Task<int> Main(string[] args)

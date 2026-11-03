@@ -896,6 +896,71 @@ Dictionary<string, TableProperties> tables = db.GetPropertiesOfAllTables();
 block-cache properties. `KeyMayExist`, `GetApproximateSizes`, `GetApproximateMemTableStats`, `GetLiveFilesMetadata`
 and `GetPropertiesOfAllTables` are also available.
 
+### Tracing and replay
+
+<!-- snippet:tracing -->
+```csharp
+using (RocksDatabase db = RocksDatabase.Open(path, new DbOptions { CreateIfMissing = true }))
+{
+    // Query trace (native trace file format: native trace_analyzer and replayers read it).
+    db.StartTrace(new TraceOptions { SamplingFrequency = 1, Filter = TraceFilter.None }, trace);
+    db.Put("k1"u8, "v1"u8);
+    _ = db.Get("k1"u8);
+    using (Iterator it = db.NewIterator()) it.Seek("k"u8);
+    db.EndTrace();
+
+    // Block cache trace: every block cache lookup of the table readers.
+    db.Flush();
+    db.StartBlockCacheTrace(new BlockCacheTraceOptions(), blockTrace);
+    _ = db.Get("k1"u8);
+    db.EndBlockCacheTrace();
+}
+
+using (var reader = new BlockCacheTraceReader(TraceReader.OpenFile(blockTrace)))
+{
+    reader.ReadHeader();
+    while (reader.TryReadAccess(out BlockCacheTraceRecord? access))
+        Line($"{access!.Caller} {access.BlockType} hit={access.IsCacheHit}");
+}
+
+// Replay the query trace against another DB (here: twice as fast, 2 threads).
+using RocksDatabase target = RocksDatabase.Open(replayPath, new DbOptions { CreateIfMissing = true });
+using Replayer replayer = target.NewDefaultReplayer(TraceReader.OpenFile(trace));
+replayer.Prepare();
+int executed = 0;
+replayer.Replay(new ReplayOptions { NumThreads = 2, FastForward = 2.0 }, (error, result) => Interlocked.Increment(ref executed));
+```
+
+Query traces (`StartTrace` / `EndTrace`: writes, `Get`, `MultiGet`, iterator `Seek` / `SeekForPrev`, with
+`TraceOptions.MaxTraceFileSize`, `SamplingFrequency`, `Filter`, `PreserveWriteOrder` and `IncludeReadWriteOptions`),
+block cache traces (`StartBlockCacheTrace`) and IO traces (`StartIOTrace`) use the native file formats: native
+`trace_analyzer`, `block_cache_trace_analyzer` and `io_tracer_parser` read managed traces, and the managed
+`Replayer`, `BlockCacheTraceReader` and `IoTraceReader` read native ones. `Replayer.TryNext` / `Execute` step through a
+trace one record at a time. `RocksDatabase.Repair(path, options)` (RepairDB) rebuilds a lost or corrupt MANIFEST from
+the table files and WALs.
+
+### Tools
+
+`tools/RocksDb.Managed.Tools` is a console program with `ldb` and `sst_dump` equivalents. They work on managed and
+native DB directories and files, take the native flags, and print the native output formats, so existing scripts keep
+working:
+
+```bash
+dotnet run --project tools/RocksDb.Managed.Tools -f net10.0 -- ldb --db=/data/db scan --from=a --to=m
+dotnet run --project tools/RocksDb.Managed.Tools -f net10.0 -- ldb --db=/data/db --hex get 0x6B31
+dotnet run --project tools/RocksDb.Managed.Tools -f net10.0 -- ldb --db=/data/db manifest_dump --verbose
+dotnet run --project tools/RocksDb.Managed.Tools -f net10.0 -- ldb dump_wal --walfile=/data/db --header --print_value
+dotnet run --project tools/RocksDb.Managed.Tools -f net10.0 -- sst_dump --file=/data/db/000012.sst --command=scan --show_properties
+```
+
+`ldb` commands: `get`, `multi_get`, `put`, `batchput`, `delete`, `singledelete`, `deleterange`, `scan`, `dump`
+(also `--path=<wal|sst|MANIFEST>`), `idump`, `manifest_dump`, `dump_wal`, `list_column_families`,
+`create_column_family`, `drop_column_family`, `compact`, `checkconsistency`, `repair`, `approxsize`, `reduce_levels`,
+`file_checksum_dump`, `list_live_files_metadata`, `get_property` and `checkpoint`, with `--hex` / `--key_hex` /
+`--value_hex` and `--column_family`. `sst_dump` commands: `check` (default), `scan`, `raw`, `verify`, `identify` and
+`recompress` (prints the input file only), with `--show_properties`, `--show_summary`, `--list_meta_blocks`,
+`--from` / `--to` / `--prefix`, `--input_key_hex`, `--read_num` and `--output_hex`.
+
 ## Error handling
 
 Native RocksDB returns a `Status`. The port throws `RocksDbException`, whose `Code` and `SubCode` have the same values

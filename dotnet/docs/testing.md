@@ -56,8 +56,10 @@ or the replication layer.
 
 The folders mirror `src/RocksDb.Managed`: `Util`, `Compression`, `Wal`, `Table`, `Filters`, `Cache`, `Memtable`,
 `Iterators`, `Merge`, `RangeDel`, `Options`, `Env`, `Db`, `Blob`, `Transactions`, `Features` (BackupEngine, custom
-comparators, properties and statistics, SetOptions, wide columns, WriteBatchWithIndex) and `Validation` (regression
-tests for the source audits in [validation.md](validation.md)).
+comparators, properties and statistics, SetOptions, wide columns, WriteBatchWithIndex), `Trace` (query, block cache
+and IO tracing, replay), `Tools` (every `ldb` / `sst_dump` command of `tools/RocksDb.Managed.Tools`, run in process
+through `ToolMain.Run` on a `MemoryFileSystem`) and `Validation` (regression tests for the source audits in
+[validation.md](validation.md)).
 
 Most DB-level tests run on `MemoryFileSystem` (`DbTestUtil.NewFs()`, `DbTestUtil.NewOptions(fs)`), so they are fast
 and leave nothing on disk. Tests that need real files (direct I/O, `LOCK`, hard links, `preadv2`) use
@@ -103,8 +105,14 @@ The folders follow the formats: `Wal` (WAL and WriteBatch), `Table` (SST, prefix
 table integration), `Filters`, `Compression` (all codecs plus dictionaries), `Manifest`, `Memtable`, `Iterators`,
 `Compaction` (DBs compacted by the other engine; a randomized differential against native; a lock-step LSM-shape and
 write-amp parity test, `PARITY_TRACE=<file>` keeps its side-by-side trace), `Env` (the `LOCK` file
-across engines), and `Api` (backup, BlobDB, custom comparators, properties and statistics, replication, `SetOptions`,
-timestamps, transactions, wide columns, `WriteBatchWithIndex`).
+across engines), `Trace` (query traces replayed in both directions through the native `rocksdb_new_default_replayer`
+and the managed `Replayer`, native block cache / IO traces parsed by the managed readers, managed ones framed by the
+native `rocksdb_trace_reader_read`), and `Api` (backup, BlobDB, custom comparators, properties and statistics,
+replication, `RepairDB` in both directions, `SetOptions`, timestamps, the `ldb` / `sst_dump` tools on native DBs,
+transactions, wide columns, `WriteBatchWithIndex`).
+
+C API functions that rocksdb-sharp's `Native` class does not bind are resolved from the library it loaded (see
+`Infrastructure/NativeExtras.cs` and `Trace/TraceCompatTests.cs`).
 
 ### What "compat" guarantees
 
