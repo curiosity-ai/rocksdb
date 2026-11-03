@@ -387,6 +387,54 @@ public sealed class BlockBasedTableTests
         Assert.IsTrue((ulong)file.AsyncReads > reader.Properties.IndexPartitions);
     }
 
+    /// <summary>
+    /// BlockPrefetcher implicit auto readahead: after num_file_reads_for_auto_readahead sequential data block reads the
+    /// iterator reads through a readahead buffer starting at initial_auto_readahead_size and doubling up to
+    /// max_auto_readahead_size (far fewer file reads); a non-sequential block resets it; max_auto_readahead_size = 0
+    /// disables it; ReadOptions::readahead_size (SetUserReadahead) uses a fixed size.
+    /// </summary>
+    [TestMethod]
+    public void IteratorAutoReadahead()
+    {
+        List<(byte[] Key, byte[] Value)> entries = MakeEntries(4000, 12, 200);
+        byte[] data = BuildTable(entries, new TableFormatOptions { BlockSize = 1024 });
+        int Scan(TableReaderOptions options, out BlockBasedTableIterator? kept, bool keep, ulong userReadahead)
+        {
+            var file = new MemRandomAccessFile(data);
+            BlockBasedTableReader reader = BlockBasedTableReader.Open(file, options);
+            int before = file.Reads;
+            BlockBasedTableIterator it = reader.NewIterator();
+            it.SetUserReadahead(userReadahead);
+            int n = 0;
+            for (it.SeekToFirst(); it.Valid; it.Next()) CollectionAssert.AreEqual(entries[n++].Key, it.Key.ToArray());
+            Assert.AreEqual(entries.Count, n);
+            int reads = file.Reads - before;
+            kept = keep ? it : null;
+            if (!keep)
+            {
+                it.Dispose();
+                reader.Dispose();
+            }
+            return reads;
+        }
+        int none = Scan(new TableReaderOptions { MaxAutoReadaheadSize = 0 }, out _, keep: false, 0);
+        Assert.IsTrue(none > 100, "one read per data block without readahead: " + none);
+        int auto = Scan(TableReaderOptions.Default, out BlockBasedTableIterator? autoIt, keep: true, 0);
+        Assert.IsTrue(auto * 5 < none, "auto readahead: " + auto + " reads vs " + none);
+        Assert.IsNotNull(autoIt!.Readahead);
+        Assert.AreEqual(256 * 1024, autoIt.Readahead.ReadaheadSize, "grown to max_auto_readahead_size");
+        // A random seek resets the readahead to its initial size.
+        autoIt.Seek(entries[100].Key);
+        autoIt.Seek(entries[3900].Key);
+        autoIt.Seek(entries[2000].Key);
+        Assert.AreEqual(8 * 1024, autoIt.Readahead.ReadaheadSize);
+        autoIt.Dispose();
+        int fixedReads = Scan(new TableReaderOptions { MaxAutoReadaheadSize = 0 }, out BlockBasedTableIterator? fixedIt, keep: true, 64 * 1024);
+        Assert.IsTrue(fixedReads * 5 < none, "readahead_size: " + fixedReads);
+        Assert.AreEqual(64 * 1024, fixedIt!.Readahead!.ReadaheadSize);
+        fixedIt.Dispose();
+    }
+
     [TestMethod]
     public void BlockCacheSeamIsUsed()
     {

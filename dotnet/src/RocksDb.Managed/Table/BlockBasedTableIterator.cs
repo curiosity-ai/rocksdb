@@ -295,6 +295,25 @@ public sealed class BlockBasedTableIterator : IDisposable
     private Db.Iterators.PinnedIteratorsManager? _pinMgr;
     private Env.AsyncPrefetchBuffer? _prefetch;
 
+    /// <summary>How data blocks that are not cached are read (BlockPrefetcher).</summary>
+    private enum ReadaheadMode : byte
+    {
+        /// <summary>Implicit auto readahead after sequential reads (user iterators without readahead_size).</summary>
+        Auto,
+        /// <summary>A fixed readahead (compaction_readahead_size, ReadOptions::readahead_size).</summary>
+        Fixed,
+        /// <summary>No readahead (compaction inputs with compaction_readahead_size = 0).</summary>
+        None,
+    }
+
+    private ReadaheadMode _readaheadMode;
+    // BlockPrefetcher's implicit auto readahead state: num_file_reads_, prev_offset_ / prev_len_, and whether the
+    // readahead buffer is in use (readahead started).
+    private ulong _numFileReads;
+    private ulong _prevOffset;
+    private ulong _prevLen;
+    private bool _autoPrefetching;
+
     internal BlockBasedTableIterator(BlockBasedTableReader reader, TableReadFlags flags, in TableIteratorPrefixOptions prefixOptions)
     {
         _reader = reader;
@@ -426,8 +445,58 @@ public sealed class BlockBasedTableIterator : IDisposable
         BlockHandle h = _index.Handle;
         if (!_block.IsEmpty && h == _blockHandle) return true;
         ReleaseBlock();
-        SetBlock(_reader.GetBlockRef(h, BlockKind.Data, _flags, _prefetch), h);
+        SetBlock(_reader.GetBlockRef(h, BlockKind.Data, _flags, PrefetchIfNeeded(h)), h);
         return true;
+    }
+
+    /// <summary>
+    /// Port of BlockPrefetcher::PrefetchIfNeeded for the sync reads of a data block: the fixed readahead buffer
+    /// (compaction or ReadOptions::readahead_size); or, in auto mode, the readahead buffer once
+    /// num_file_reads_for_auto_readahead sequential blocks were read, starting at initial_auto_readahead_size and
+    /// doubling up to max_auto_readahead_size; a non-sequential block resets it (ResetValues).
+    /// </summary>
+    private Env.AsyncPrefetchBuffer? PrefetchIfNeeded(BlockHandle h)
+    {
+        if (_readaheadMode != ReadaheadMode.Auto) return _prefetch;
+        TableReaderOptions o = _reader.Options;
+        long max = o.MaxAutoReadaheadSize;
+        long initial = Math.Min(o.InitialAutoReadaheadSize, max);
+        // If max_auto_readahead_size is set to be 0 by user, no data will be prefetched.
+        if (max <= 0 || initial <= 0) return null;
+        ulong offset = h.Offset;
+        ulong len = h.Size + BlockBasedTableConstants.BlockTrailerSize;
+        bool sequential = _prevLen == 0 || _prevOffset + _prevLen == offset;
+        // UpdateReadPattern
+        _prevOffset = offset;
+        _prevLen = len;
+        if (!sequential)
+        {
+            // ResetValues
+            _numFileReads = 1;
+            if (_autoPrefetching)
+            {
+                _autoPrefetching = false;
+                _prefetch!.ResetReadahead();
+            }
+            return null;
+        }
+        if (_autoPrefetching) return _prefetch;
+        // Implicit auto readahead, enabled once the number of reads reached num_file_reads_for_auto_readahead and
+        // scans are sequential.
+        if (++_numFileReads <= o.NumFileReadsForAutoReadahead) return null;
+        if (_prefetch is null) _prefetch = new Env.AsyncPrefetchBuffer((int)initial, (int)max);
+        else _prefetch.ResetReadahead();
+        _prefetch.Reset(_reader.File);
+        _autoPrefetching = true;
+        return _prefetch;
+    }
+
+    private void ResetAutoReadahead()
+    {
+        _numFileReads = 0;
+        _prevOffset = 0;
+        _prevLen = 0;
+        _autoPrefetching = false;
     }
 
     private void SetBlock(BlockRef b, BlockHandle h)
@@ -643,14 +712,31 @@ public sealed class BlockBasedTableIterator : IDisposable
     /// <summary>
     /// Reads data blocks that are not cached through a readahead buffer of <paramref name="readaheadSize"/> bytes that
     /// prefetches the following chunk asynchronously (BlockPrefetcher with compaction_readahead_size and async_io).
-    /// For sequential scans of whole files (compaction inputs); the sync positioning paths use it, the async ones read
-    /// blocks directly. Idempotent.
+    /// For sequential scans of whole files (compaction inputs, which never use auto readahead: 0 disables readahead);
+    /// the sync positioning paths use it, the async ones read blocks directly. Idempotent.
     /// </summary>
     internal void EnableReadahead(int readaheadSize)
     {
-        if (_prefetch is not null || readaheadSize <= 0) return;
+        if (readaheadSize <= 0)
+        {
+            if (_prefetch is null) _readaheadMode = ReadaheadMode.None;
+            return;
+        }
+        if (_readaheadMode == ReadaheadMode.Fixed) return;
+        _readaheadMode = ReadaheadMode.Fixed;
+        _prefetch?.Dispose();
         _prefetch = new Env.AsyncPrefetchBuffer(readaheadSize);
         _prefetch.Reset(_reader.File);
+    }
+
+    /// <summary>
+    /// ReadOptions::readahead_size: an explicit readahead for a user iterator (BlockPrefetcher's "explicit user requested
+    /// readahead"); without it, iterators use the automatic readahead.
+    /// </summary>
+    internal void SetUserReadahead(ulong readaheadSize)
+    {
+        if (readaheadSize == 0) return;
+        EnableReadahead((int)Math.Min(readaheadSize, 256UL << 20));
     }
 
     /// <summary>The readahead buffer (tests / diagnostics), or null.</summary>
@@ -663,6 +749,7 @@ public sealed class BlockBasedTableIterator : IDisposable
         _prefix = prefixOptions;
         _index.Init(reader, _flags);
         _prefetch?.Reset(reader.File);
+        ResetAutoReadahead();
     }
 
     public void Dispose()

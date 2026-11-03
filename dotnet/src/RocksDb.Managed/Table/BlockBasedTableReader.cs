@@ -80,6 +80,15 @@ public sealed record TableReaderOptions
     /// (RandomAccessFileReader::ChargeRateLimiterForRead). Null: reads are never charged.
     /// </summary>
     public Env.IRateLimiter? RateLimiter { get; init; }
+    /// <summary>
+    /// max_auto_readahead_size: iterators read sequential data blocks with automatic readahead growing up to this many
+    /// bytes (0 disables it). Default 256 KiB.
+    /// </summary>
+    public long MaxAutoReadaheadSize { get; init; } = 256 * 1024;
+    /// <summary>initial_auto_readahead_size: the first automatic readahead (0 disables it). Default 8 KiB.</summary>
+    public long InitialAutoReadaheadSize { get; init; } = 8 * 1024;
+    /// <summary>num_file_reads_for_auto_readahead: sequential data block reads before automatic readahead starts. Default 2.</summary>
+    public ulong NumFileReadsForAutoReadahead { get; init; } = 2;
 
     public static TableReaderOptions Default { get; } = new();
 }
@@ -906,6 +915,9 @@ public sealed partial class BlockBasedTableReader : IDisposable
     }
 
     /// <summary>The top-level index block: pinned by the reader, or looked up in (and if evicted re-read into) the block cache.</summary>
+    /// <summary>The options the reader was opened with.</summary>
+    internal TableReaderOptions Options => _options;
+
     internal BlockRef GetIndexBlockRef(TableReadFlags flags) =>
         _indexBlock is not null ? BlockRef.FromPinned(_indexBlock) : GetBlockRef(IndexHandle, BlockKind.Index, flags);
 
