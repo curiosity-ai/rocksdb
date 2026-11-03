@@ -153,6 +153,13 @@ public enum GetLocation
 
     /// <summary>Absent keys after a flush: answered by the bloom filter.</summary>
     Miss,
+
+    /// <summary>
+    /// All keys in one SST file (~13 MB of data blocks) behind a 1 MiB block cache: almost every lookup misses the
+    /// block cache and reads its data block from the file (OS page cache), evicting another block. Once the cache is
+    /// full, the managed engine reuses the evicted block's buffer, so "Allocated" should stay "-".
+    /// </summary>
+    SstUncached,
 }
 
 [BenchmarkCategory("DbHeadToHead", "Get")]
@@ -162,13 +169,13 @@ public class DbGetBenchmarks : DbHeadToHeadBase
     private byte[][] _keys = null!;
     private readonly byte[] _buffer = new byte[ValueSize * 2];
 
-    [Params(GetLocation.Memtable, GetLocation.SstCached, GetLocation.Miss)]
+    [Params(GetLocation.Memtable, GetLocation.SstCached, GetLocation.Miss, GetLocation.SstUncached)]
     public GetLocation Location { get; set; }
 
     [GlobalSetup]
     public void Setup()
     {
-        Open(new EngineOptions { BlockCacheSize = 64L << 20 });
+        Open(new EngineOptions { BlockCacheSize = Location == GetLocation.SstUncached ? 1L << 20 : 64L << 20 });
         Load(KeyCount, flush: Location != GetLocation.Memtable);
         _keys = RandomKeys(OpsPerInvoke, KeyCount, missing: Location == GetLocation.Miss);
         // Warm the block cache with every data block.

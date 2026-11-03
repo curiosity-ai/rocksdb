@@ -1237,12 +1237,68 @@ bench/README.md "Warm-up"). `fillrandom,compact`, 1M x 100 B, 16 MiB memtables, 
 old 11.9, base 16.4, new **10.6**. The seek regression was the readahead buffer of (2); readrandom is within noise
 (CV ~10% in all trees). Read sampling (`FileReadSample`, one thread-static RNG step per Get / seek) was not changed.
 
+## readrandom / overwrite allocations: memory growth, not per-op cost
+
+The matrix reports showed `readrandom` at ~86 B/op with 1 KiB values (~29 B/op with 100 B) in every tree since the
+start, and `overwrite` at ~80 B/op in the 300k x 100 B configurations, although `multireadrandom` on the same DB
+allocates ~1 B/op. Allocation sources, found with GC `AllocationTick` sampling (an in-process EventListener in the
+runner, now `DBBENCH_ALLOC_TYPES=1`, and `dotnet-trace collect --providers Microsoft-Windows-DotNETRuntime:0x1:5` with
+the events grouped by call stack through TraceEvent; bench/README.md "Allocations"), `DOTNET_gcServer=0`:
+
+- **`readrandom`: the empty block cache filling up.** Every byte is `BlockBufferPool.Rent` -> new array in
+  `BlockFetcher.ReadBlock` on a block cache miss (the sampler attributes part of it to the `Block` object allocated next
+  to it). The total scales with `--cache_size`, not with the number of misses: 100k x 1 KiB, fresh DB, first
+  `readrandom`: 1 MiB cache 1.2 MB (11.9 B/op), 8 MiB 9.1 MB (91 B/op), 32 MiB 34.6 MB (346 B/op). The 8 MiB default
+  over 100k / 300k reads is the 86 / 29 B/op of the matrix. Once the cache is full, a miss reuses the buffer of the
+  block its insert evicts (the block's release returns it to `BlockBufferPool`) and a pooled `Block` object: a second
+  `readrandom` on the same DB allocates 0.7 B/op, all of it the runner's own histograms (0.0 - 0.1 B/op once they are
+  excluded, below), with 86% data-block misses. Same with HyperClock, lz4 / zstd, 4 threads and the async API
+  (0.6 - 2 B/op before the runner fix). Upstream allocates the block contents on every miss and frees the evicted one;
+  the port only allocates while the cache grows to its capacity, and the cache's own memory is the "cache entry
+  itself" that cannot be avoided. Nothing on the Get path was changed.
+- **`overwrite` (300k x 100 B): the second memtable's arena.** `fillrandom` leaves ~45 MB in the 64 MiB memtable, so
+  `overwrite` switches to a second memtable while the first one is flushed; its arena slabs (`ArenaSlabPool.Rent`,
+  20 - 26 MB) cannot come from the pool because the first memtable still holds its slabs, plus the flush's filter hash
+  buffer growing past the retained size (`FilterEntryPool`, 3 - 4 MB of `ulong[]`). Repeating `overwrite`: 89.7, then
+  0.2, 2.9, 2.6, 0.2 B/op (each later switch reuses a flushed memtable's slabs; the remainder is amortized flush /
+  compaction buffers, ~1 - 2 MB per 64 MiB flush).
+
+So neither is a per-operation allocation; the B/op of the first run on a fresh DB includes the growth of the engine's
+memory up to the configured sizes (the C leg's malloc/mmap growth is not counted anywhere). Changes:
+
+- dbbench: `alloc B/op` no longer counts the runner's worker histograms (2 x 30 KB per thread), the merged histogram and
+  the report strings, which were the whole steady-state 0.2 - 0.7 B/op of reads.
+- dbbench: `DBBENCH_ALLOC_TYPES=1|N` prints the sampled allocations by type after every benchmark.
+- BenchmarkDotNet: `DbGetBenchmarks` has `Location = SstUncached` (1 MiB block cache, ~13 MB of data blocks: nearly
+  every Get misses the cache and reads the block from the page cache). Allocated is `-` for managed (and native).
+- Unit test `SteadyStateGetsWithBlockCacheMissesDoNotAllocate` (LRU and HyperClock): 4000 Gets with > 2000 data-block
+  cache misses allocate 0 bytes once the cache is full.
+
+Not done: retaining more freed block buffers process-wide (`BlockBufferPool` keeps 64 per size class) would let a new
+DB reuse the warm-up DB's 8 MiB and hide the fill in the benchmark, at the cost of memory held after a DB is closed.
+
+Interleaved A/B, base = `954536b`, new = this change (only the runner's accounting differs; the library is
+unchanged), `fillseq,fillrandom,overwrite,flush,readrandom,readrandom,multireadrandom`, warm-up on, n = 4, medians:
+
+| benchmark | 300k x 100 B µs/op base / new | B/op base / new | 100k x 1 KiB µs/op base / new | B/op base / new |
+|---|---:|---:|---:|---:|
+| overwrite | 3.21 / 3.24 | 63.4 / 70.2 | 4.61 / 4.14 | 17.5 / 17.9 |
+| readrandom (first) | 2.95 / 2.88 | 28.9 / 28.7 | 3.40 / 3.24 | 86.4 / 85.8 |
+| readrandom (second) | 2.95 / 2.88 | 0.2 / **0.0** | 3.13 / 3.18 | 0.7 / **0.1** |
+| multireadrandom | 2.69 / 2.93 | 0.3 / 0.1 | 2.98 / 3.24 | 1.0 / 0.4 |
+
+BenchmarkDotNet `DbGetBenchmarks` (default job, ns/op, Allocated): Memtable managed 786 / rocksdb-sharp 1463,
+SstCached 1110 / 2020, Miss 116 / 419, **SstUncached 1996 / 3538**, all `-`.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
 - Data block linear scan could skip comparisons using the shared-prefix length (incremental comparison).
 - Batched MultiGet exists (perf pass #2) but does not prefetch filter cache lines or interleave the block reads of a batch.
 - Block cache charge does not include the `Block` object (~64 bytes).
+- The first read / overwrite benchmark on a fresh DB shows the block cache fill and the second memtable's arena in
+  alloc B/op (see "readrandom / overwrite allocations"); a byte-bounded `BlockBufferPool` retention would let a
+  reopened DB reuse a closed one's block buffers.
 - Confirm the 4-thread `fillrandom` / `overwrite` / `readmissing` ratios vs C on a quiet machine (see "Read/write
   contention with 4 threads"). Done since: pipelined writes (see "Pipelined writes and parallel memtable inserts"), reverse-iteration block pinning, async reverse
   movement, covered-range skipping and compaction input readahead (see "Reverse iteration, range-deleted runs,

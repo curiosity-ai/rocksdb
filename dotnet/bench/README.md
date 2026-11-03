@@ -223,13 +223,26 @@ Equivalence guarantees (see `DbBench/Workload.cs` and `native-c/rocksdb_bench.c`
   machine-readable `RESULT,engine,benchmark,threads,ops,seconds,micros_per_op,ops_per_sec,mb_per_sec,p50_us,p99_us,p999_us,found,alloc_b_per_op,gc0,gc1,gc2,jit_methods,jit_ms`
   line. µs/op = wall time / total ops (like db_bench); percentiles come from a per-operation latency histogram
   (log-linear buckets, <= 1.6% error; per batch for `multireadrandom` and batched writes). The managed runner adds
-  allocated bytes per op (all threads, `GC.GetTotalAllocatedBytes`), gen0/1/2 collection counts and the methods
+  allocated bytes per op (all threads, `GC.GetTotalAllocatedBytes`, minus the runner's own worker / histogram
+  objects; see "Allocations" below), gen0/1/2 collection counts and the methods
   JIT-compiled during the measurement (`System.Runtime.JitInfo`, all threads); the C leg leaves these columns empty.
   The managed human-readable line also ends with `cpu X us/op`: process CPU time (all threads, incl. background jobs)
   per operation, which is far less sensitive to other load on the machine than wall time and shows spinning and
   cache-line contention (not in the CSV).
 - managed-only flags (not accepted by the C leg, so not usable with `compare`): `--allow_concurrent_memtable_write`,
   `--enable_write_thread_adaptive_yield` (both default true, like the engines' defaults).
+
+**Allocations.** `alloc B/op` counts every managed allocation of the process during the benchmark, background jobs
+included, so the first benchmark that grows the engine's memory shows that growth spread over its ops: the first read
+benchmark on a fresh DB fills the empty block cache (`--cache_size` bytes of block buffers: 8 MiB / 100k reads =
+~85 B/op, / 300k reads = ~29 B/op), and an `overwrite` that switches to a second memtable allocates that memtable's
+arena (~80 B/op in the 300k x 100 B matrix). Both are recycled afterwards (an evicted block's buffer is reused by the
+next miss, a flushed memtable's arena by the next memtable), so a repeated `readrandom` shows ~0 B/op (see
+docs/perf.md, "readrandom / overwrite allocations"). To see what allocates, set `DBBENCH_ALLOC_TYPES=1` (or `=N` for
+the top N types): every benchmark line is followed by `ALLOC,<benchmark>,<type>,<bytes>` rows, sampled from the
+runtime's GC AllocationTick events (one per ~100 KB, in-process EventListener). For call stacks, record the same events
+with `dotnet-trace collect --providers Microsoft-Windows-DotNETRuntime:0x1:5 -- dotnet <bench dll> dbbench ...` and
+group the `GCAllocationTick` events by stack (TraceEvent's `TraceLog`).
 
 The C leg uses `rocksdb_get` (+ `rocksdb_free`) for point reads, like rocksdb-sharp's span `Get`, and
 `rocksdb_batched_multi_get_cf` with pinnable slices for MultiGet, which rocksdb-sharp also calls (through
@@ -262,7 +275,7 @@ Every class is parameterized by `Engine = managed | rocksdb-sharp`, has `[Memory
 |---|---|---|
 | `Put` | `DbPutBenchmarks` | Put of a random 16 B key / 100 B value, WAL on |
 | `WriteBatch` | `DbWriteBatchBenchmarks` | Clear + 100 Put + Write of a reusable batch (per batch) |
-| `Get` | `DbGetBenchmarks` | Get with `Location` = `Memtable` (100k keys in the memtable), `SstCached` (flushed, all blocks in a 64 MiB cache), `Miss` (absent key, bloom filter) |
+| `Get` | `DbGetBenchmarks` | Get with `Location` = `Memtable` (100k keys in the memtable), `SstCached` (flushed, all blocks in a 64 MiB cache), `Miss` (absent key, bloom filter), `SstUncached` (flushed, 1 MiB block cache: nearly every Get misses the block cache and reads its block from the page cache) |
 | `Iterator` | `DbIteratorBenchmarks` | Seek to a random key + `Nexts` = 10 / 100 Next, reading key and value (per seek) |
 | `MultiGet` | `DbMultiGetBenchmarks` | MultiGet of 16 random existing keys from cached SST blocks (per batch) |
 

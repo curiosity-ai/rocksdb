@@ -443,6 +443,7 @@ public static class DbBenchRunner
             _jitMethodsBefore = System.Runtime.JitInfo.GetCompiledMethodCount(currentThread: false);
             _jitTimeBefore = System.Runtime.JitInfo.GetCompilationTime(currentThread: false);
             _cpuBefore = Environment.CpuUsage.TotalTime;
+            if (!Quiet) AllocationTracer.Instance?.Reset();
             long allocBefore = GC.GetTotalAllocatedBytes(precise: true);
             int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
 
@@ -479,13 +480,18 @@ public static class DbBenchRunner
                     Math.Max(nominal / f.TxnPuts, 1),
                 _ => nominal,
             };
+            // The harness's own allocations (workers with their histograms, the merged histogram, the report strings)
+            // are excluded from "alloc B/op", which is meant to show the engine's allocations during the run.
+            long harnessStart = GC.GetTotalAllocatedBytes(precise: true);
             int n = f.Threads + (bench == DbBenchmark.ReadWhileWriting ? 1 : 0);
             var workers = new Worker[n];
             for (int i = 0; i < n; i++) workers[i] = new Worker(i);
+            long harnessBytes = GC.GetTotalAllocatedBytes(precise: true) - harnessStart;
 
             if (f.Async) RunAsyncWorkers(workers);
             else RunThreads(workers);
 
+            harnessStart = GC.GetTotalAllocatedBytes(precise: true);
             var merged = new Histogram();
             long start = long.MaxValue, end = 0, ops = 0, bytes = 0, found = 0;
             for (int i = 0; i < f.Threads; i++) // readers only for readwhilewriting
@@ -502,7 +508,8 @@ public static class DbBenchRunner
                 : Txn is not null ? "(" + f.TxnPuts + " puts/txn, " + Interlocked.Read(ref _txnRetries) + " retries)" : "";
             if (bench is DbBenchmark.FillSeq or DbBenchmark.FillRandom or DbBenchmark.Overwrite or DbBenchmark.FillSync) s_userBytesWritten += bytes;
             else if (bench == DbBenchmark.ReadWhileWriting) s_userBytesWritten += Interlocked.Read(ref _writerOps) * (f.KeySize + f.ValueSize);
-            Report(ops, Clock.ToNs(end - start) / 1e9, bytes, found, merged, allocBefore, g0, g1, g2, extra);
+            harnessBytes += GC.GetTotalAllocatedBytes(precise: true) - harnessStart;
+            Report(ops, Clock.ToNs(end - start) / 1e9, bytes, found, merged, allocBefore + harnessBytes, g0, g1, g2, extra);
         }
 
         private void Report(long ops, double seconds, long bytes, long found, Histogram? h, long allocBefore, int g0, int g1, int g2, string extra)
@@ -540,6 +547,7 @@ public static class DbBenchRunner
             Console.WriteLine(line);
             Console.WriteLine(string.Format(ci, "RESULT,{0},{1},{2},{3},{4:F6},{5:F4},{6:F1},{7:F2},{8:F4},{9:F4},{10:F4},{11},{12:F1},{13},{14},{15},{16},{17:F1}",
                 f.EngineLabel, _name, f.Threads, ops, seconds, microsPerOp, opsPerSec, mbs, p50, p99, p999, found, allocPerOp, d0, d1, d2, jitMethods, jitMs));
+            AllocationTracer.Instance?.Print(_name);
             Console.Out.Flush();
         }
 

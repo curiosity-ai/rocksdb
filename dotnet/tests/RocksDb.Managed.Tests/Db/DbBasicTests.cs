@@ -673,6 +673,64 @@ public sealed class DbBasicTests
         Assert.AreEqual(0L, allocated, "bytes allocated by 2000 TryGet (memtable)");
     }
 
+    /// <summary>
+    /// Point lookups that miss a full block cache: the block read on each miss reuses the buffer of the block the
+    /// insert evicts (block buffer pool) and a pooled <c>Block</c> object, so once the cache has reached its capacity
+    /// the Get path allocates nothing. (While the cache is still filling up, each miss allocates its buffer: that is the
+    /// cache's own memory.)
+    /// </summary>
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void SteadyStateGetsWithBlockCacheMissesDoNotAllocate(bool hyperClock)
+    {
+        MemoryFileSystem fs = NewFs();
+        const long capacity = 256 << 10;
+        var cfo = new ColumnFamilyOptions();
+        cfo.TableOptions.BlockCache = hyperClock
+            ? Managed.Cache.BlockCache.CreateDefault(capacity, 4096)
+            : Managed.Cache.BlockCache.CreateLru(new Managed.Cache.LruCacheOptions { Capacity = capacity, NumShardBits = 0 });
+        DbOptions options = NewOptions(fs);
+        var stats = new Statistics();
+        options.Statistics = stats;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, options, cfo);
+        const int count = 20_000; // many times the cache (asserted below: most lookups miss)
+        byte[] key = new byte[16], value = new byte[100];
+        for (int i = 0; i < count; i++)
+        {
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(key, i);
+            value.AsSpan().Fill((byte)i);
+            db.Put(key, value);
+        }
+        db.Flush();
+        byte[] buffer = new byte[256];
+        var rng = new Random(17);
+        long[] order = new long[4000];
+        for (int i = 0; i < order.Length; i++) order[i] = rng.Next(count);
+        // Fill the cache and prime the pools (and the JIT) with a full pass.
+        for (int pass = 0; pass < 2; pass++)
+        {
+            foreach (long k in order)
+            {
+                System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(key, k);
+                Assert.IsTrue(db.TryGet(key, buffer, out _));
+            }
+        }
+        ulong missesBefore = stats.GetTickerCount(Ticker.BlockCacheDataMiss);
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        foreach (long k in order)
+        {
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(key, k);
+            Assert.IsTrue(db.TryGet(key, buffer, out int len));
+            Assert.AreEqual(value.Length, len);
+            Assert.AreEqual((byte)k, buffer[0]);
+        }
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        ulong misses = stats.GetTickerCount(Ticker.BlockCacheDataMiss) - missesBefore;
+        Assert.IsTrue(misses > (ulong)order.Length / 2, "data block cache misses: " + misses);
+        Assert.AreEqual(0L, allocated, "bytes allocated by " + order.Length + " TryGet with " + misses + " block cache misses");
+    }
+
     private static List<string> Scan(Iterator it)
     {
         var list = new List<string>();

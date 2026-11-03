@@ -103,8 +103,12 @@ $B report --csv out.csv --out out.md
   engine's CV exceeds 10%; the "Noisy rows" section lists them. A CI that excludes 1.00x is a difference beyond the
   run-to-run noise.
 - **p99** is per operation (per 16-key batch for `multireadrandom`).
-- **alloc B/op** is managed bytes allocated per operation. Steady-state reads and seeks are expected to be about 0.
-  Fills show the memtable arena (about 144 B per 100-byte entry), and `flush`/`compact` show per-job buffers.
+- **alloc B/op** is managed bytes allocated per operation (all threads, without the runner's own objects). Steady-state
+  reads and seeks are expected to be about 0. Fills show the memtable arena (about 144 B per 100-byte entry) when no
+  pooled arena slabs are left, and `flush`/`compact` show per-job buffers. The first read benchmark on a fresh DB
+  includes filling the empty 8 MiB block cache (~85 B/op at 100k reads, ~29 B/op at 300k), and `overwrite` in the
+  300k x 100 B configurations the arena of the second memtable (~80 B/op): memory growth up to the configured sizes,
+  recycled afterwards (bench/README.md, "Allocations").
 - **LSM shape / write-amp** (compaction configuration): files per level from `rocksdb.num-files-at-level<N>`, and
   flush + compaction bytes written divided by user bytes. The WAL is not counted. The written bytes have a resolution
   of 0.01 GB.
