@@ -900,6 +900,14 @@ public sealed partial class WriteBatch : IDisposable
         IterateRecords(rep[HeaderSize..], wholeBatch: true, Coding.DecodeFixed32(rep[8..]), ref handler, policy);
     }
 
+    /// <summary>
+    /// Invokes <paramref name="handler"/> for the whole records in <paramref name="records"/> (a slice of a batch's
+    /// records, without the header; the batch's record count is not checked).
+    /// </summary>
+    internal static void IterateRecordRange<THandler>(ReadOnlySpan<byte> records, ref THandler handler, TxnMarkerPolicy policy)
+        where THandler : IWriteBatchHandler =>
+        IterateRecords(records, wholeBatch: false, 0, ref handler, policy);
+
     /// <summary>The NotSupported status of WriteBatchInternal::Iterate for a begin-prepare marker the handler's policy refuses, or null.</summary>
     private static string? CheckBeginPrepareMarker(EntryType type, TxnMarkerPolicy policy)
     {

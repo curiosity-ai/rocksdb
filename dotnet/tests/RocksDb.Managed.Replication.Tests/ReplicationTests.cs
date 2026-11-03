@@ -246,6 +246,72 @@ public sealed class ReplicationTests
     }
 
     [TestMethod]
+    public async Task LargeChunksAppliedInParallelMatchSerialApply()
+    {
+        using var dir = new TempDir("parallel-apply");
+        DbOptions sourceOptions = DbOpts(null);
+        sourceOptions.WalTtlSeconds = 600; // keep the flushed WAL for the tailer
+        await using RocksDatabase source = await RocksDatabase.OpenAsync(dir.Sub("source"), sourceOptions);
+        // Concurrent writers with overlapping keys (puts, deletes and range deletes of each other's keys).
+        const int Writers = 4, Batches = 40, PerBatch = 50;
+        var writers = new Task[Writers];
+        for (int w = 0; w < Writers; w++)
+        {
+            int writer = w;
+            writers[w] = Task.Run(async () =>
+            {
+                for (int i = 0; i < Batches; i++)
+                {
+                    using WriteBatch b = source.CreateWriteBatch();
+                    for (int j = 0; j < PerBatch; j++) FillBatch(b, (i * PerBatch + j) * 2 + writer % 2, writer);
+                    await source.WriteAsync(b);
+                    if (writer == 0 && i == Batches / 2) await source.FlushAsync();
+                }
+            });
+        }
+        await Task.WhenAll(writers);
+
+        var chunks = new List<byte[]>();
+        var boundaries = new HashSet<ulong> { 0 };
+        using (WalTailer tailer = new ReplicationSource(source).TailWal(1, WalTailer.DefaultMaxChunkBytes))
+        {
+            while (tailer.TryReadChunk(out WalChunk c))
+            {
+                chunks.Add(c.Memory.ToArray());
+                boundaries.Add(c.NextSequenceNumber - 1);
+            }
+        }
+        Assert.IsTrue(chunks.Exists(c => new WalBatch(c).Count >= 1024), "the workload produces chunks large enough to split");
+
+        foreach (int parallelism in new[] { 1, 4 })
+        {
+            await using RocksDatabase replica = await RocksDatabase.OpenAsync(dir.Sub("replica" + parallelism), DbOpts(null));
+            var consumer = new ReplicationConsumer(replica) { ApplyParallelism = parallelism };
+            Assert.AreEqual(parallelism, consumer.ApplyParallelism);
+            // A reader never observes a partially applied chunk: the published sequence is always a chunk boundary.
+            using var stop = new CancellationTokenSource();
+            ulong torn = 0;
+            Task reader = Task.Run(() =>
+            {
+                while (!stop.IsCancellationRequested)
+                {
+                    ulong seq = replica.GetLatestSequenceNumber();
+                    if (!boundaries.Contains(seq)) torn = seq;
+                }
+            });
+            foreach (byte[] c in chunks) Assert.IsTrue(await consumer.TryIngestChunkAsync(c, Ct));
+            await stop.CancelAsync();
+            await reader;
+            Assert.AreEqual(0UL, torn, "published sequence inside a chunk");
+            AssertReplicaEquals(source, replica, "parallelism " + parallelism);
+            Assert.AreEqual(DatabaseDigest.Compute(source), DatabaseDigest.Compute(replica));
+            await replica.FlushAsync();
+            AssertReplicaEquals(source, replica, "parallelism " + parallelism + " after flush");
+        }
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new ReplicationConsumer(source) { ApplyParallelism = 0 });
+    }
+
+    [TestMethod]
     public async Task ConsumerRejectsGapsAndOverlaps()
     {
         using var dir = new TempDir("gap");

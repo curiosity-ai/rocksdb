@@ -6,10 +6,10 @@ using RocksDb.Managed.Replication.MagicOnion;
 
 namespace RocksDb.Managed.Replication.Benchmarks;
 
-internal sealed record StreamConfig(string Transport, int Num, int Batch, int ValueSize, int Threads, int Rate, int ChunkBytes);
+internal sealed record StreamConfig(string Transport, int Num, int Batch, int ValueSize, int Threads, int Rate, int ChunkBytes, int ApplyParallelism);
 
 internal sealed record StreamResult(StreamConfig Config, double PrimaryOpsPerSec, double ReplicaOpsPerSec, double LagP50Ms, double LagP90Ms,
-    double LagP99Ms, double LagMaxMs, double CatchUpMs, long Chunks, long JitMethods);
+    double LagP99Ms, double LagMaxMs, double CatchUpMs, long Chunks, double ApplyBusyPercent, long JitMethods);
 
 /// <summary>
 /// WAL-stream replication throughput and lag: writers put batches into a primary as fast as they can (or at a fixed
@@ -69,22 +69,25 @@ internal static class StreamBenchmark
         var appliedSeq = new List<ulong>(writes + 16);
         var appliedAt = new List<long>(writes + 16);
         long chunks = 0;
+        long applyTicks = 0;
 
         using var stop = new CancellationTokenSource();
         var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         Task follower = Task.Run(async () =>
         {
-            var consumer = new ReplicationConsumer(replica);
+            var consumer = new ReplicationConsumer(replica) { ApplyParallelism = config.ApplyParallelism };
             try
             {
                 await foreach (WalStreamMessage m in client.StreamUpdatesAsync(1, stop.Token).ConfigureAwait(false))
                 {
+                    long t0 = Stopwatch.GetTimestamp();
                     if (m.ResyncRequired || !await consumer.TryIngestChunkAsync(m.Data, CancellationToken.None).ConfigureAwait(false))
                     {
                         reached.TrySetException(new InvalidOperationException("replica diverged: " + m.Reason));
                         return;
                     }
                     long now = Stopwatch.GetTimestamp();
+                    applyTicks += now - t0;
                     ulong latest = replica.GetLatestSequenceNumber();
                     appliedSeq.Add(latest);
                     appliedAt.Add(now);
@@ -172,17 +175,18 @@ internal static class StreamBenchmark
         double writeSecs = (writesEnd - start) / (double)Stopwatch.Frequency;
         double replicaSecs = (ats[^1] - start) / (double)Stopwatch.Frequency;
         return new StreamResult(config, config.Num / writeSecs, config.Num / replicaSecs, Percentiles.At(lags, 50), Percentiles.At(lags, 90),
-            Percentiles.At(lags, 99), lags[^1], Math.Max(0, ats[^1] - writesEnd) * 1000.0 / Stopwatch.Frequency, chunks, jitAfter - jitBefore);
+            Percentiles.At(lags, 99), lags[^1], Math.Max(0, ats[^1] - writesEnd) * 1000.0 / Stopwatch.Frequency, chunks,
+            100.0 * applyTicks / Math.Max(1, ats[^1] - start), jitAfter - jitBefore);
     }
 
     public static string Header =>
-        "| transport | threads | batch | value | rate (ops/s) | ops | primary ops/s | replica ops/s | lag p50 ms | p90 | p99 | max | catch-up ms | chunks | JIT |\n" +
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|";
+        "| transport | threads | batch | value | rate (ops/s) | apply threads | ops | primary ops/s | replica ops/s | lag p50 ms | p90 | p99 | max | catch-up ms | chunks | apply busy % | JIT |\n" +
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|";
 
     public static string Row(StreamResult r)
     {
         StreamConfig c = r.Config;
         return string.Create(CultureInfo.InvariantCulture,
-            $"| {c.Transport} | {c.Threads} | {c.Batch} | {c.ValueSize} | {(c.Rate == 0 ? "max" : c.Rate.ToString(CultureInfo.InvariantCulture))} | {c.Num} | {r.PrimaryOpsPerSec:N0} | {r.ReplicaOpsPerSec:N0} | {r.LagP50Ms:F2} | {r.LagP90Ms:F2} | {r.LagP99Ms:F2} | {r.LagMaxMs:F1} | {r.CatchUpMs:F1} | {r.Chunks} | {r.JitMethods} |");
+            $"| {c.Transport} | {c.Threads} | {c.Batch} | {c.ValueSize} | {(c.Rate == 0 ? "max" : c.Rate.ToString(CultureInfo.InvariantCulture))} | {c.ApplyParallelism} | {c.Num} | {r.PrimaryOpsPerSec:N0} | {r.ReplicaOpsPerSec:N0} | {r.LagP50Ms:F2} | {r.LagP90Ms:F2} | {r.LagP99Ms:F2} | {r.LagMaxMs:F1} | {r.CatchUpMs:F1} | {r.Chunks} | {r.ApplyBusyPercent:F0} | {r.JitMethods} |");
     }
 }
