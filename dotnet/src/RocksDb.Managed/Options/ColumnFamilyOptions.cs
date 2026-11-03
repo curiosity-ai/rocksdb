@@ -43,9 +43,11 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public string ComparatorName => _comparator.Name(ComparatorId) ?? BytewiseComparator.ClassName;
 
     /// <summary>
-    /// The merge operator (thread-safe; used by reads, flush and compaction). Built-ins: <see cref="UInt64AddOperator"/>,
-    /// <see cref="StringAppendOperator"/> (also see <see cref="Managed.MergeOperator.CreateBuiltin"/>). Persisted as its
-    /// <see cref="Managed.MergeOperator.Name"/>; when an OPTIONS file names a built-in operator it is recreated here.
+    /// The merge operator (thread-safe; used by reads, flush and compaction). Built-ins: upstream's
+    /// utilities/merge_operators (see <see cref="Managed.MergeOperator.CreateBuiltin"/>) and
+    /// <see cref="Utilities.AggMerge.AggMergeOperator"/>. Persisted as its <see cref="Managed.MergeOperator.Name"/> (the
+    /// string append operators as "{id=Name;delimiter=X;}", like native); when an OPTIONS file names a built-in operator
+    /// it is recreated here.
     /// </summary>
     public MergeOperator? MergeOperator
     {
@@ -351,8 +353,8 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     private static readonly OptionTable<ColumnFamilyOptions> s_table = new OptionTable<ColumnFamilyOptions>()
         .Add("comparator", static o => o._comparator.Serialize(ComparatorId) ?? BytewiseComparator.ClassName,
             static (o, v) => o._comparator.Parse(v, static n => Managed.Comparator.TryGetBuiltin(n, out Comparator? c) ? c : null, ComparatorId))
-        .Add("merge_operator", static o => o._mergeOperator.Serialize(MergeOperatorId) ?? "nullptr",
-            static (o, v) => o._mergeOperator.Parse(v, Managed.MergeOperator.CreateBuiltin, MergeOperatorId))
+        .Add("merge_operator", static o => o._mergeOperator.Serialize(MergeOperatorOptionsId) ?? "nullptr",
+            static (o, v) => o._mergeOperator.Parse(v, Managed.MergeOperator.CreateBuiltin, MergeOperatorOptionsId))
         .Add("compaction_filter", static o => o._compactionFilter.Serialize(CompactionFilterId) ?? "nullptr",
             static (o, v) => o._compactionFilter.Parse(v, static _ => null, CompactionFilterId))
         .Add("compaction_filter_factory", static o => o._compactionFilterFactory.Serialize(CompactionFilterFactoryId) ?? "nullptr",
@@ -445,6 +447,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .UInt32("blob_direct_write_partitions", static o => o.BlobDirectWritePartitions, static (o, v) => o.BlobDirectWritePartitions = v);
 
     private static string MergeOperatorId(MergeOperator m) => m.Name;
+    private static string MergeOperatorOptionsId(MergeOperator m) => m.OptionsId;
     private static string ComparatorId(Comparator c) => c.Name;
     private static string CompactionFilterId(CompactionFilter f) => f.Name;
     private static string CompactionFilterFactoryId(CompactionFilterFactory f) => f.Name;

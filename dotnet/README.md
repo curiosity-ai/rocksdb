@@ -343,12 +343,19 @@ using Iterator it = db.NewIterator(atSnapshot);       // iterators honour the sn
 A merge operator writes its result to an `IBufferWriter<byte>` and reads operands as spans. It must be thread-safe,
 because reads, flushes and compactions call it concurrently.
 
+Upstream's built-in operators are included under their native names, and an OPTIONS file naming one
+(`merge_operator=max`, `{id=StringAppendOperator;delimiter=,;}`, ...) recreates it: `UInt64AddOperator`,
+`StringAppendOperator`, `StringAppendTestOperator`, `MaxOperator`, `PutOperator` / `PutOperatorV2`, `SortListOperator`
+(`MergeSortOperator`), `BytesXorOperator` (`BytesXOR`) and the aggregation operator
+`Utilities.AggMerge.AggMergeOperator` (`AggMergeOperator.v1`, with `Aggregator`s registered through
+`AggMerge.AddAggregator`). `MergeOperator.CreateBuiltin(id)` resolves the same ids.
+
 <!-- snippet:merge-operator-class -->
 ```csharp
 /// <summary>Keeps the maximum of little-endian int64 operands.</summary>
-private sealed class MaxOperator : MergeOperator
+private sealed class Int64MaxOperator : MergeOperator
 {
-    public override string Name => "MaxOperator";       // persisted in OPTIONS; keep it stable
+    public override string Name => "Int64MaxOperator";  // persisted in OPTIONS; keep it stable and unique
 
     public override bool FullMerge(ReadOnlySpan<byte> key, bool hasExistingValue, ReadOnlySpan<byte> existingValue,
         in MergeOperands operands, IBufferWriter<byte> result)
@@ -368,10 +375,10 @@ private sealed class MaxOperator : MergeOperator
 var options = new DbOptions { CreateIfMissing = true, CreateMissingColumnFamilies = true };
 using RocksDatabase db = RocksDatabase.Open(path, options,
 [
-    // Built-ins share the native names (uint64add, stringappend), so native RocksDB opens the DB too.
+    // Built-ins share the native names (uint64add, stringappend, max, put, bytesxor, ...), so native RocksDB opens the DB too.
     new ColumnFamilyDescriptor("default", new ColumnFamilyOptions { MergeOperator = MergeOperator.UInt64Add }),
     new ColumnFamilyDescriptor("tags", new ColumnFamilyOptions { MergeOperator = MergeOperator.StringAppend(",") }),
-    new ColumnFamilyDescriptor("max", new ColumnFamilyOptions { MergeOperator = new MaxOperator() }),
+    new ColumnFamilyDescriptor("max", new ColumnFamilyOptions { MergeOperator = new Int64MaxOperator() }),
 ]);
 
 Span<byte> one = stackalloc byte[8];

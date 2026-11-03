@@ -114,7 +114,7 @@ public sealed class TypedOptionsTests
         Assert.AreEqual("{id=MyOperator;x=1;}", o.GetOption("merge_operator"));
 
         o.MergeOperator = MergeOperator.StringAppend(",");
-        Assert.AreEqual("StringAppendOperator", o.GetOption("merge_operator"));
+        Assert.AreEqual("{id=StringAppendOperator;delimiter=,;}", o.GetOption("merge_operator"));
         o.MergeOperator = null;
         Assert.IsNull(o.MergeOperatorName);
         Assert.AreEqual("nullptr", o.GetOption("merge_operator"));
