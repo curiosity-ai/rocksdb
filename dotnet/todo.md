@@ -178,7 +178,7 @@ Final completeness wave (all merged):
 - [ ] Compaction-heavy fills still JIT 40–630 methods while timed (LSM shapes not reached by warm-up); LZ4 1 KiB flush 1.04–1.21x C (K4os encoder)
 - [ ] First flush/compaction in a fresh process 1.4–1.64x native (JIT warm-up; affects cold-start only); LZ4 flushes 2.5x (K4os JIT/unoptimized) — consider ReadyToRun guidance or a faster LZ4 path
 - [x] Features: WriteBatchWithIndex (+BaseDeltaIterator; transactions now use it), SetOptions/SetDBOptions (+typed), custom comparators e2e (+MANIFEST comparator/num_levels validation), KeyMayExist/GetApproximateSizes/memtable stats/int+map properties/table properties, Statistics (all upstream tickers/histograms, native ToString), info LOG (+rotation), wide columns (PutEntity/GetEntity/iterator columns, merge/compaction) — all compat-tested vs native
-- [ ] Features gaps: compaction filters on entities, blob columns/attribute groups/MultiGetEntity, per-SuperVersion options snapshot, mutable block-based table options, KeyMayExist doing filter I/O on cache miss, cfstats interval/file-read histograms, per-level GET_HIT stats, WBWI MultiGetFromBatchAndDB
+- [x] (closed, see Remaining gaps) Features gaps: compaction filters on entities, blob columns/attribute groups/MultiGetEntity, per-SuperVersion options snapshot, mutable block-based table options, KeyMayExist doing filter I/O on cache miss, cfstats interval/file-read histograms, per-level GET_HIT stats, WBWI MultiGetFromBatchAndDB
 - [x] Flaky? `PrefixSeekTests.PrefixSameAsStartMatchesModel` failed once on net11.0 (sorted-run file count precondition); 10/10 reruns pass
 - [x] Perf #2: async fast paths (preadv2/pwritev2 RWF_NOWAIT, pooled builders) → async ≈ sync, 0 B/op reads/seeks; batched `MultiGetBatch` (+async, 0 B/op); BlockIter.Prev cache (~30% faster reverse); LevelIterator reuses table iterators (0 B/op seeks in multi-level LSM); managed overwrite under compaction now 3.4 vs C 5.1 µs. Three-way geomean vs C: managed 0.69–1.17×, async 0.64–1.17×, rocksdb-sharp 0.85–1.33× (`bench/results/2026-11-02-vm-perf2*.md`)
 - [ ] Flush/compaction per-entry cost still 1.4–2x native; background compaction lags under sustained writes (waitforcompaction 0.6–0.8 s vs 0.02–0.18 s); reverse iteration copies values (pin blocks instead)
@@ -226,8 +226,8 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - Table format / options / API
   - [x] hash index (kHashSearch) read+write, separated key/value data blocks, uniform index hint, block_align, super_block_alignment (byte-identical vs native SstFileWriter)
   - [x] user table-properties collectors (+ CompactOnDeletionCollector, NeedCompact), memtable prefix bloom, insert hints, in-place updates (+ callback)
-  - [ ] parallel compression (throughput only; output identical) (M); is_uniform hint used for index search on read (S); CompactForTieringCollector (S)
-  - [ ] per-key protection info (L); per-SuperVersion options snapshot (M); mutable block-based table options (M)
+  - [x] parallel compression (byte-identical to serial), per-key protection info (WriteBatch/memtable/block; db_kv_checksum_test ported; serial + parallel inserts), managed LZ4 fast encoder (byte-identical to liblz4, 1.4-2.2x faster than K4os)
+  - [ ] is_uniform hint used for index search on read (S); CompactForTieringCollector (S)
   - [x] WriteBatch ColumnFamily overloads, WriteOptions.SyncWrites, MarkWalTerminationPoint, max_total_wal_size, lazy WAL sync on rotation (single-CF, non-2PC; else eager = stronger), reads on dropped CF handles
   - [x] shared per-DB table cache, best_efforts_recovery (matches native on 12 damage cases), WAL tracking in MANIFEST, per-SuperVersion options snapshot, mutable block-based table options
   - [x] auto-resizing HyperClock (growable table, writers pause briefly; upstream is lock-free linear hashing), GenericRateLimiter for flush/compaction writes
@@ -244,4 +244,5 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [ ] secondary: verify table files exist before installing a version (S); re-measure switchover hold on a quiet machine (S)
 - Backup / error handling
   - [x] SstFileManager (space limit, trash deletion, compaction space pre-check) + no-space auto recovery; atomic WAL-error recovery flush
+- Flaky under load (investigate): RoundTrip `NativeFirst_Alternating` managed reopen hit LOCK 'Resource temporarily unavailable' once (seed 1518776361 replays clean); `CommitsRacingReaders(WriteUnprepared,True)`; `ManagedDbPrefixSeekReadByNative(BinarySearch,False,False)`
 - Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)
