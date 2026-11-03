@@ -1398,6 +1398,30 @@ public sealed class WriteStallTests
     }
 
     [TestMethod]
+    public void ContinuedDelayKeepsWriteControllerDebt()
+    {
+        // GetDelayToken resets the credit and refill time only when the delayed count goes from 0 to 1. A
+        // recalculation that keeps the CF delayed acquires its new token before the old one is released, so the
+        // writes already paid for in advance (next_refill_time_ in the future) still have to wait.
+        const ulong Rate = 1_000_000;
+        var wc = new WriteController(Rate);
+        var state = new ColumnFamilyStallState();
+        var o = new ColumnFamilyOptions { Level0SlowdownWritesTrigger = 20, Level0StopWritesTrigger = 10000 };
+        var vs = new VersionStorageInfo(InternalKeyComparator.Bytewise, 7, o, null, []);
+        vs.TestSetL0DelayTriggerCount(20);
+        Assert.AreEqual(WriteStallCondition.Delayed, state.Recalculate(wc, 1, vs, o));
+        // One second worth of bytes: the first write waits ~1 s and the refill time moves ~1 s ahead.
+        Assert.IsGreaterThan(900_000UL, wc.GetDelay(Rate));
+        Assert.AreEqual(WriteStallCondition.Delayed, state.Recalculate(wc, 1, vs, o));
+        Assert.AreEqual(Rate, wc.DelayedWriteRate, "no compaction debt: the rate is kept");
+        // A small write right after still waits for the debt (a reset would give it a fresh 1 ms allotment: no delay).
+        Assert.IsGreaterThan(500_000UL, wc.GetDelay(100));
+        vs.TestSetL0DelayTriggerCount(0);
+        Assert.AreEqual(WriteStallCondition.Normal, state.Recalculate(wc, 1, vs, o));
+        Assert.IsFalse(wc.NeedsDelay);
+    }
+
+    [TestMethod]
     public void CompactionSpeedupByDebtRelativeToBottommostData()
     {
         // GetPendingCompactionBytesForCompactionSpeedup: min(max(bottommost / 8, 2 * max_bytes_for_level_base), soft / 4).

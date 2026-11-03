@@ -76,9 +76,10 @@ internal sealed partial class DbImpl
 
     /// <summary>
     /// Called after a new super version was installed for <paramref name="cfd"/> (InstallSuperVersionAndScheduleWork):
-    /// recalculates its write stall condition and schedules compactions. REQUIRES: mutex.
+    /// recalculates its write stall condition if <paramref name="versionOrMemTablesChanged"/> and schedules compactions.
+    /// REQUIRES: mutex.
     /// </summary>
-    private void OnSuperVersionInstalled(ColumnFamilyData cfd)
+    private void OnSuperVersionInstalled(ColumnFamilyData cfd, bool versionOrMemTablesChanged)
     {
         if (cfd.Current is { } current)
         {
@@ -89,7 +90,7 @@ internal sealed partial class DbImpl
                 _bottommostFilesMarkThreshold = Math.Min(_bottommostFilesMarkThreshold, current.Storage.BottommostFilesMarkThreshold);
             }
         }
-        RecalculateWriteStall(cfd);
+        if (versionOrMemTablesChanged) RecalculateWriteStall(cfd);
         if (_compactionsEnabled)
         {
             SchedulePendingCompaction(cfd);
@@ -173,7 +174,6 @@ internal sealed partial class DbImpl
             _compactionsEnabled = true;
             foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
             {
-                RecalculateWriteStall(cfd);
                 SchedulePendingCompaction(cfd);
             }
             MaybeScheduleCompaction();
@@ -710,7 +710,6 @@ internal sealed partial class DbImpl
         _backgroundJobs--;
         if (!cfd.Dropped && cfd.Current is not null)
         {
-            RecalculateWriteStall(cfd);
             SchedulePendingCompaction(cfd);
         }
         MaybeStartBottomPriorityCompactions();
@@ -852,11 +851,10 @@ internal sealed partial class DbImpl
             {
                 foreach (Blob.BlobFileBuilder blobOut in job.BlobBuilders) blobOut.Committed = true;
             }
-            Versions.LogAndApplyAsync(cfd, edit, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
-            lock (_mutex)
-            {
-                InstallSuperVersion(cfd);
-            }
+            // The super version (and with it the write stall) is installed in the critical section that installs the
+            // version (InstallSuperVersionAndScheduleWork right after LogAndApply, under the same mutex hold).
+            Versions.LogAndApplyAsync(cfd, edit, synchronous: true, () => InstallSuperVersion(cfd), CancellationToken.None).GetAwaiter().GetResult();
+            TestHooks.Invoke("DBImpl::RunCompaction:AfterLogAndApply");
             var installed = new List<FileMetaData>(edit.NewFiles.Count);
             foreach (NewFileEntry nf in edit.NewFiles) installed.Add(nf.Meta);
             c.InstalledFiles = installed;
@@ -920,7 +918,6 @@ internal sealed partial class DbImpl
                 if (!cfd.Dropped && cfd.Current is not null)
                 {
                     cfd.Current.Storage.ComputeCompactionScore();
-                    RecalculateWriteStall(cfd);
                 }
             }
             if (!ok && job is not null)
@@ -1509,8 +1506,7 @@ internal sealed partial class DbImpl
                     edit.AddFile(toLevel, f.Clone());
                 }
             }
-            await Versions.LogAndApplyAsync(cfd, edit, synchronous, cancellationToken).ConfigureAwait(false);
-            lock (_mutex) InstallSuperVersion(cfd);
+            await Versions.LogAndApplyAsync(cfd, edit, synchronous, () => InstallSuperVersion(cfd), cancellationToken).ConfigureAwait(false);
         }
         finally
         {

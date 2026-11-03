@@ -186,15 +186,20 @@ internal sealed class ColumnFamilyStallState
 
     public void Release(WriteController wc)
     {
-        switch (_token)
+        ReleaseToken(wc, _token);
+        _token = Token.None;
+        Condition = WriteStallCondition.Normal;
+        Cause = WriteStallCause.None;
+    }
+
+    private static void ReleaseToken(WriteController wc, Token token)
+    {
+        switch (token)
         {
             case Token.Stop: wc.ReleaseStop(); break;
             case Token.Delay: wc.ReleaseDelay(); break;
             case Token.Pressure: wc.ReleaseCompactionPressure(); break;
         }
-        _token = Token.None;
-        Condition = WriteStallCondition.Normal;
-        Cause = WriteStallCause.None;
     }
 
     /// <summary>Port of ColumnFamilyData::GetWriteStallConditionAndCause.</summary>
@@ -234,7 +239,11 @@ internal sealed class ColumnFamilyStallState
         (WriteStallCondition condition, WriteStallCause cause) = GetWriteStallConditionAndCause(numUnflushedMemtables, l0, compactionNeededBytes, o);
         bool wasStopped = wc.IsStopped;
         bool neededDelay = wc.NeedsDelay;
-        Release(wc);
+        // The previous token is released after the new one was acquired (upstream assigns write_controller_token_), so
+        // a delay that continues keeps the controller's credit and refill time (GetDelayToken resets them only when the
+        // delayed count goes from 0 to 1).
+        Token previous = _token;
+        _token = Token.None;
         Condition = condition;
         Cause = cause;
         if (condition == WriteStallCondition.Stopped)
@@ -275,6 +284,7 @@ internal sealed class ColumnFamilyStallState
             // balance the long term slowdown increase signal.
             if (neededDelay) wc.SetDelayedWriteRate((ulong)(wc.DelayedWriteRate * DelayRecoverSlowdownRatio));
         }
+        ReleaseToken(wc, previous);
         _prevCompactionNeededBytes = compactionNeededBytes;
         return condition;
     }

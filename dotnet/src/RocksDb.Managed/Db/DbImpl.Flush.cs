@@ -263,22 +263,11 @@ internal sealed partial class DbImpl
         TestHooks.Invoke("DBImpl::FlushMemTables:BeforeLogAndApply");
         // From here on a failure may still have made the edit durable: leave the blob files to the obsolete-file scan.
         if (blobBuilder is not null) blobBuilder.Committed = true;
-        if (group is not null)
-        {
-            await group.CommitAsync(cfd, edit).ConfigureAwait(false);
-        }
-        else if (walDeletion is not null)
-        {
-            await Versions.LogAndApplyAsync([new ManifestEditEntry(cfd, edit), new ManifestEditEntry(null, walDeletion)], atomicGroup: false, synchronous,
-                CancellationToken.None).ConfigureAwait(false);
-        }
-        else
-        {
-            await Versions.LogAndApplyAsync(cfd, edit, synchronous, CancellationToken.None).ConfigureAwait(false);
-        }
-        if (meta is not null) MaybeReportMaxAllowedSpaceReached(BackgroundErrorReason.Flush);
-
-        lock (_mutex)
+        // Removes the flushed memtables and installs the super version (which recalculates the write stall); runs in the
+        // critical section that installs the new version, like upstream's TryInstallMemtableFlushResults followed by
+        // InstallSuperVersionAndScheduleWork under one mutex hold. REQUIRES: mutex.
+        bool dropped = false;
+        void InstallFlushResults()
         {
             foreach (ImmutableMemTable m in picked)
             {
@@ -286,10 +275,30 @@ internal sealed partial class DbImpl
                 // A drop that committed right after our MANIFEST write already released the list's references.
                 if (cfd.Imm.Remove(m)) RetireFlushedMemTable(cfd, m.Mem);
             }
-            if (cfd.Dropped) return;
+            if (cfd.Dropped)
+            {
+                dropped = true;
+                return;
+            }
             InstallSuperVersion(cfd);
             _maybeStalled = IsWriteStalled();
         }
+        if (group is not null)
+        {
+            await group.CommitAsync(cfd, edit).ConfigureAwait(false);
+            lock (_mutex) InstallFlushResults();
+        }
+        else if (walDeletion is not null)
+        {
+            await Versions.LogAndApplyAsync([new ManifestEditEntry(cfd, edit), new ManifestEditEntry(null, walDeletion)], atomicGroup: false, synchronous,
+                InstallFlushResults, CancellationToken.None).ConfigureAwait(false);
+        }
+        else
+        {
+            await Versions.LogAndApplyAsync(cfd, edit, synchronous, InstallFlushResults, CancellationToken.None).ConfigureAwait(false);
+        }
+        if (meta is not null) MaybeReportMaxAllowedSpaceReached(BackgroundErrorReason.Flush);
+        if (dropped) return;
         OnFlushCompleted(cfd, jobId, meta, BlobBytesWritten(blobBuilder), flushStart);
         NotifyOnFlushCompleted(cfd, jobId, meta, path, mems, reason);
     }

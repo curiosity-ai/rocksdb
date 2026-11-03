@@ -375,7 +375,19 @@ internal sealed class VersionSet : IAsyncDisposable
     /// MANIFEST write succeeds.
     /// </summary>
     public ValueTask LogAndApplyAsync(ColumnFamilyData? cfd, VersionEdit edit, bool synchronous, CancellationToken cancellationToken) =>
-        LogAndApplyAsync([new ManifestEditEntry(cfd, edit)], atomicGroup: false, synchronous, cancellationToken);
+        LogAndApplyAsync([new ManifestEditEntry(cfd, edit)], atomicGroup: false, synchronous, null, cancellationToken);
+
+    /// <summary>
+    /// <see cref="LogAndApplyAsync(ColumnFamilyData?, VersionEdit, bool, CancellationToken)"/> that also runs
+    /// <paramref name="installedUnderMutex"/> (if not null) in the DB-mutex section that installs the new version.
+    /// </summary>
+    public ValueTask LogAndApplyAsync(ColumnFamilyData? cfd, VersionEdit edit, bool synchronous, Action? installedUnderMutex,
+        CancellationToken cancellationToken) =>
+        LogAndApplyAsync([new ManifestEditEntry(cfd, edit)], atomicGroup: false, synchronous, installedUnderMutex, cancellationToken);
+
+    /// <summary>The multi-edit form without a callback (see the overload with <c>installedUnderMutex</c>).</summary>
+    public ValueTask LogAndApplyAsync(IReadOnlyList<ManifestEditEntry> edits, bool atomicGroup, bool synchronous, CancellationToken cancellationToken) =>
+        LogAndApplyAsync(edits, atomicGroup, synchronous, null, cancellationToken);
 
     /// <summary>
     /// Port of the multi-edit form of VersionSet::LogAndApply (one ProcessManifestWrites batch): writes all
@@ -383,8 +395,16 @@ internal sealed class VersionSet : IAsyncDisposable
     /// <paramref name="atomicGroup"/> (and more than one edit) they are written as an atomic group, so recovery applies
     /// all of them or none (used by atomic flushes, e.g. WAL write error recovery). Column family additions and drops
     /// cannot be batched. At most one edit per column family may change files.
+    /// <para>
+    /// <paramref name="installedUnderMutex"/>, if not null, runs while the DB mutex is still held after the new versions
+    /// were installed (and only if they were). Upstream's LogAndApply returns with the mutex held, and its callers install
+    /// the super version (InstallSuperVersionAndScheduleWork, which recalculates the write stall) before releasing it.
+    /// Installing it in a later critical section lets other threads see the new version with the previous write-stall
+    /// state in between (e.g. an empty L0 while writes are still delayed).
+    /// </para>
     /// </summary>
-    public async ValueTask LogAndApplyAsync(IReadOnlyList<ManifestEditEntry> edits, bool atomicGroup, bool synchronous, CancellationToken cancellationToken)
+    public async ValueTask LogAndApplyAsync(IReadOnlyList<ManifestEditEntry> edits, bool atomicGroup, bool synchronous, Action? installedUnderMutex,
+        CancellationToken cancellationToken)
     {
         int n = edits.Count;
         if (n == 0) return;
@@ -542,6 +562,7 @@ internal sealed class VersionSet : IAsyncDisposable
             {
                 InstalledManifest = (ManifestFileNumber, (ulong)_manifestLog!.Log.File!.Size);
                 for (int i = 0; i < n; i++) InstallEdit(edits[i].Cfd, editList[i], newFiles[i], newBlobFiles[i], newStats[i]);
+                installedUnderMutex?.Invoke();
             }
         }
         finally

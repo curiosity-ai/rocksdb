@@ -283,12 +283,25 @@ internal sealed partial class DbImpl : IAsyncDisposable
         cfd.Current.Ref();
         var sv = new SuperVersion(cfd.Mem, imm, cfd.Current, ++_superVersionNumber, cfd.OptionsSnapshot);
         SuperVersion? old = cfd.SuperOrNull();
+        // ColumnFamilyData::InstallSuperVersion: the write stall is recalculated only if the version or the memtables
+        // changed, since RecalculateWriteStallConditions treats a repeated delay as a signal to slow down further.
+        bool changed = old is null || !ReferenceEquals(old.Current, sv.Current) || !ReferenceEquals(old.Mem, sv.Mem) || !SameMemTables(old.Imm, imm);
         cfd.SetSuper(sv);
         // Reset the cached references before releasing the CF's own one, so that a slot never holds the last reference
         // (ColumnFamilyData::InstallSuperVersion -> ResetThreadLocalSuperVersions).
         if (old is not null) cfd.LocalSuperVersions.Reset(this);
         if (old is not null && old.Unref()) CleanupSuperVersion(old);
-        OnSuperVersionInstalled(cfd);
+        OnSuperVersionInstalled(cfd, changed);
+    }
+
+    private static bool SameMemTables(MemTable[] a, MemTable[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+        {
+            if (!ReferenceEquals(a[i], b[i])) return false;
+        }
+        return true;
     }
 
     /// <summary>The table readers of all column families (DBImpl::table_cache_), bounded by max_open_files.</summary>

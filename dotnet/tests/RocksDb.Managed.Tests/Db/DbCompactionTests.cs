@@ -632,15 +632,7 @@ public sealed class DbCompactionTests
     {
         MemoryFileSystem fs = NewFs();
         ColumnFamilyOptions cfo = SmallCf();
-        cfo.DisableAutoCompactions = true;
-        using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfo))
-        {
-            for (int round = 0; round < 3; round++)
-            {
-                db.Put(Key(round), Val(round, round));
-                db.Flush();
-            }
-        }
+        WriteL0Files(fs, cfo, 3);
         cfo.DisableAutoCompactions = false;
         cfo.Level0FileNumCompactionTrigger = 3;
         cfo.Level0SlowdownWritesTrigger = 3;
@@ -654,7 +646,9 @@ public sealed class DbCompactionTests
         {
             using RocksDatabase db2 = RocksDatabase.Open(DbPath, dbo, cfo);
             Assert.AreEqual("0", db2.GetProperty("rocksdb.is-write-stopped"));
-            Assert.AreNotEqual("0", db2.GetProperty("rocksdb.actual-delayed-write-rate"));
+            // The first delay starts at delayed_write_rate: installing the same version again (open, enabling
+            // compactions) does not recalculate the stall, which would count as a further slowdown (x 0.8 each).
+            Assert.AreEqual("102400", db2.GetProperty("rocksdb.actual-delayed-write-rate"));
             // The clock starts before the first delayed write: the WriteController refills credit for the time that
             // passes between writes (a descheduled test thread gets that time back as credit), so only the span from
             // its first refill has a scheduling-independent lower bound: (bytes requested - 1 ms of credit) / rate.
@@ -665,14 +659,14 @@ public sealed class DbCompactionTests
             });
             Assert.AreEqual(StatusCode.Incomplete, ex.Code);
             for (int i = 0; i < 10; i++) db2.Put(Key(200 + i), new byte[4096]);
-            // 11 delayed writes of 4 KiB (the rejected one is charged too) at 100 KB/s: at least ~440 ms.
+            // 11 delayed writes of 4 KiB (the rejected one is charged too) at <= 100 KB/s: at least ~440 ms.
             Assert.IsGreaterThanOrEqualTo(400, sw.ElapsedMilliseconds, "elapsed " + sw.ElapsedMilliseconds);
             gate.Set();
             db2.CompactRange();
-            // Background work that the manual compaction scheduled (EndExclusiveManual) finishes first; then L0 is empty
-            // and the stall released (ColumnFamilyData::RecalculateWriteStallConditions: no delay token without L0
-            // pressure). Checking L0 first tells a compaction-timing failure from a leaked delay token.
-            db2.WaitForCompact();
+            // CompactRange returns once L0 (including the file of its own flush) was compacted, waiting for a running
+            // L0 compaction if there is one. The compaction that emptied L0 installed its super version, and with it
+            // the released stall (RecalculateWriteStallConditions: no delay token without L0 pressure), in the
+            // critical section that installed its version, so the stall is already released here.
             Assert.AreEqual("0", db2.GetProperty("rocksdb.num-files-at-level0"), "L0 after CompactRange");
             Assert.AreEqual("0", db2.GetProperty("rocksdb.is-write-stopped"));
             Assert.AreEqual("0", db2.GetProperty("rocksdb.actual-delayed-write-rate"), "delay token still held with an empty L0");
@@ -681,6 +675,69 @@ public sealed class DbCompactionTests
         {
             gate.Set();
             TestHooks.ClearAll();
+        }
+    }
+
+    [TestMethod]
+    public void CompactionInstallsVersionAndWriteStallTogether()
+    {
+        // Upstream installs a compaction's version and recalculates the write stall (InstallSuperVersionAndScheduleWork)
+        // without releasing the DB mutex in between. Another thread (here: the test, at the hook right after the
+        // MANIFEST write) must never see the new version (L0 below the slowdown trigger) with the old stall state
+        // (writes still delayed): a manual compaction waiting for that L0 compaction could return in between, and the
+        // caller would then read a delayed write rate with an empty L0.
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions cfo = SmallCf();
+        WriteL0Files(fs, cfo, 3);
+        cfo.DisableAutoCompactions = false;
+        cfo.Level0FileNumCompactionTrigger = 3;
+        cfo.Level0SlowdownWritesTrigger = 3;
+        cfo.Level0StopWritesTrigger = 100;
+        DbOptions dbo = NewOptions(fs);
+        dbo.DelayedWriteRate = 100 * 1024;
+        using var gate = new ManualResetEventSlim(false);
+        RocksDatabase? db = null;
+        int observedL0 = -1;
+        string? observedRate = null;
+        TestHooks.Set("DBImpl::RunCompaction:Start", () => gate.Wait());
+        TestHooks.Set("DBImpl::RunCompaction:AfterLogAndApply", () =>
+        {
+            if (observedRate is not null) return;
+            DbImpl impl = db!.DefaultColumnFamily.Db;
+            lock (impl.MutexForTests)
+            {
+                observedL0 = db.DefaultColumnFamily.Data.Current.Storage.NumLevelFiles(0);
+                observedRate = db.GetProperty("rocksdb.actual-delayed-write-rate");
+            }
+        });
+        try
+        {
+            db = RocksDatabase.Open(DbPath, dbo, cfo);
+            Assert.AreNotEqual("0", db.GetProperty("rocksdb.actual-delayed-write-rate"));
+            gate.Set();
+            db.WaitForCompact();
+            Assert.IsNotNull(observedRate, "no compaction was installed");
+            Assert.IsLessThan(3, observedL0, "L0 after the compaction");
+            Assert.AreEqual("0", observedRate, "write stall of the previous version seen with the new version installed");
+            Assert.AreEqual("0", db.GetProperty("rocksdb.actual-delayed-write-rate"));
+        }
+        finally
+        {
+            gate.Set();
+            TestHooks.ClearAll();
+            db?.Dispose();
+        }
+    }
+
+    /// <summary>Creates a DB with <paramref name="count"/> L0 files (one key each, auto compactions disabled).</summary>
+    private static void WriteL0Files(MemoryFileSystem fs, ColumnFamilyOptions cfo, int count)
+    {
+        cfo.DisableAutoCompactions = true;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+        for (int round = 0; round < count; round++)
+        {
+            db.Put(Key(round), Val(round, round));
+            db.Flush();
         }
     }
 
