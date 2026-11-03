@@ -239,7 +239,7 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [x] forward merge operands pinned; readahead prefetch allocation-free
   - [x] pipelined write (4-thread sync writes 15-20% faster; native WAL compat both ways), parallel memtable inserts for every group (no 64-entry minimum; faster than serial on a non-oversubscribed box), LZ4 encoder / cold start (managed fast encoder)
   - [x] unordered_write (native WAL compat both ways; 4-8 threads 35-60% faster), offloaded async fdatasync (opt-in `LocalFileSystem.OffloadAsyncSync`: slower on this VM), secondary catch-up re-reads the MANIFEST when the replayed state references a deleted file, `MergeOperatorAcrossMemtableAndTables` / blob auto-flush flakes root-caused
-  - [ ] `WriteSlowdownDelaysWrites` once saw a re-delayed CF at the end (not reproduced in 110 runs; assertion now waits for compaction) (S)
+  - [x] `WriteSlowdownDelaysWrites` root-caused: version install and write-stall recalculation were in separate mutex sections (upstream: one); spurious recalculations cut the delayed rate; continued delay now keeps write-controller debt
 - Ingestion / TTL / stats
   - [x] ingestion: write_global_seqno (legacy, + reader checksum fallback), ingest_behind, overlapping files in one call, allow_db_generated_files, link_files; TTL iterator; GET_HIT_L*, file-read histograms, cfstats intervals; KeyMayExist without I/O
   - [x] file checksums (FileChecksumGenCrc32c in MANIFEST, VerifyFileChecksums, ingestion verify), ingestion temperatures; GET_HIT for MultiGet, FILE_READ_FLUSH/DB_OPEN/VERIFY histograms, per-level file-read histograms
@@ -255,5 +255,6 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [x] Final-run regressions fixed: flush (closed WAL writers freed by the background purge, like logs_to_free_: 1 KiB flush 75.9 -> 39.0 ms, C 43.7), readahead via OS prefetch like BlockPrefetcher (seekrandom 1 KiB 16.6 -> 10.2 us, C 14.9), compaction allocations (74 -> 0.45 MB), subcompactions 4x: 294 ms vs C 354 (warm-up now JIT-quiesces compaction)
 - [x] readrandom ~86 B/op / overwrite ~80 B/op explained: one-time block-cache fill and second-memtable arena growth on a fresh DB; steady-state Gets with block-cache misses allocate 0 B (unit test + BDN SstUncached); runner no longer counts its own histograms
 - [x] Definitive benchmark (bench/results/2026-11-03-definitive-r5.*, same CPU as the previous run): managed 0.72x of C [0.71-0.74], async 0.73x, rocksdb-sharp 1.05x; compaction-heavy 0.58x; 2 of 232 managed cells >1.1x (noisy fillsync / async readmissing); hot paths allocate nothing (BDN)
-- [ ] Flush allocations rose to 0.05-0.55 MB per flush (S); 4-thread 100 B readmissing / fillrandom ratios moved within noise - recheck (S)
+- [x] 4-thread 100 B readmissing / fillrandom rechecked (7-rep interleaved A/B): noise, no regression; flush allocations: table-builder buffers pooled (TableBuilderBuffers), no longer bimodal
+- [ ] table reader could allocate index/filter blocks from the builder pool so a flush reuses them (S); `DbBlobTests.BlobReadersBoundedByMaxOpenFiles` failed once in one full run (not reproduced in 45+ runs) (S)
 - Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)
