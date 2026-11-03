@@ -34,3 +34,21 @@ public sealed partial class RocksDatabase
     /// <summary>Number of compactions currently waiting for their remote worker (rocksdb.num-running-remote-compactions).</summary>
     public int NumRunningRemoteCompactions => _db.NumRunningRemoteCompactions;
 }
+
+/// <summary>
+/// A failed <see cref="RocksDatabase.OpenAndCompact(OpenAndCompactOptions, string, string, ReadOnlySpan{byte}, CompactionServiceOptionsOverride)"/>:
+/// <see cref="RocksDbException.Code"/> is the compaction's status and <see cref="Result"/> the serialized result carrying
+/// it (upstream fills the output even when OpenAndCompact returns a non-OK status), which the service may return to the
+/// primary from <see cref="CompactionService.WaitAsync"/> with <see cref="CompactionServiceJobStatus.Failure"/>.
+/// </summary>
+public sealed class OpenAndCompactException : RocksDbException
+{
+    internal OpenAndCompactException(RocksDbException status, byte[] result)
+        : base(status.Code, status.Message, status.SubCode, status)
+    {
+        Result = result;
+    }
+
+    /// <summary>The serialized CompactionServiceResult.</summary>
+    public byte[] Result { get; }
+}
