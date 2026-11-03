@@ -660,11 +660,111 @@ that declares the captured variables, before the early return); the commit / pre
 WritePrepared DB reuse their WriteInternal state and count sub-batches of bytewise column families in a reusable
 byte-equality set.
 
+## Read/write contention with 4 threads (readmissing, sync random writes)
+
+Follow-up of the two slow spots of the final three-way run: 4-thread `readmissing` with 100 B values (managed 1.4-1.7x,
+managed-async 1.9-3.0x vs C) and 4-thread sync `fillrandom` / `overwrite` (1.04-1.81x, async 0.75-1.03x).
+
+**Method.** The machine was shared with other agents (load average 8-15 on 4 vCPUs) for the whole session, so wall time
+alone was useless (c-native moved by 2x between runs). The A/B runs below use `nice -n -15` for every engine process
+(the benchmark gets nearly all CPU when runnable), a short warm-up (`--warmup true --warmup_ops 50000
+--warmup_min_ms 300`), the before / after binaries (`base` = the commit before, `new` = after) and c-native interleaved
+in every repetition, 5 repetitions, medians. The dbbench runner now also prints the process CPU time per operation
+(`cpu ... us/op`, all threads): it is much less sensitive to the other load and shows spinning and cache-line
+contention directly. `perf record` with `DOTNET_PerfMapEnabled=1 DOTNET_EnableWriteXorExecute=0` (W^X double mapping
+hides JIT code from perf otherwise) was used for the profiles.
+
+### 1. readmissing: shared reference counts on every Get
+
+Profile of 4-thread `readmissing` (data in L0 files after a flush): `TableCache.FindTable` 21% and the inlined super
+version reference in `ColumnFamily.Lookup` 15%, while the filter probe itself was a few percent. Every Get wrote four
+shared cache lines: the super version's reference count (CAS + decrement), the table handle's reference count (CAS +
+decrement) and a global `Interlocked.Increment` for the table cache's LRU order, so the lines bounced between the 4
+cores on every lookup. Fixes, both ports of what upstream does:
+
+- **Cached super version references** (`Db/SuperVersionCache.cs`, upstream `ColumnFamilyData::local_sv_`,
+  `GetThreadLocalSuperVersion` / `ReturnThreadLocalSuperVersion` / `ResetThreadLocalSuperVersions`). Point reads
+  (Get, GetAsync, MultiGet) swap `InUse` into a slot, use the super version the slot holds a reference on, and swap it
+  back. Installing a super version resets every slot under the DB mutex before the old one's CF reference is released.
+  Slots are per processor (128 bytes apart) rather than per thread (.NET has no thread-exit hook to release a thread's
+  reference); a reader that finds `InUse` (another thread on the same processor holds the slot) takes a plain
+  reference, and a cached super version that is no longer current is released instead of used.
+- **Pinned table readers** (`TableCache.GetReaderForVersion`, upstream `fd.table_reader` with `max_open_files = -1`).
+  With an unbounded table cache a reader is only closed when its file becomes obsolete, which cannot happen while a
+  referenced version contains it, so lookups through a super version take no reference on the reader. The LRU counter
+  is no longer updated by unbounded caches.
+- Async Get: the range tombstones came from a second table-cache lookup per file; a filter miss now completes without
+  the async state machines of `GetFromFileAsync` and `BlockBasedTableReader.GetAsync`.
+
+| 4 threads, 100 B, after fillrandom + flush (µs/op, median of 10) | base wall | new wall | base cpu | new cpu | c-native wall |
+|---|---:|---:|---:|---:|---:|
+| readmissing (sync) | 0.410 | 0.314 | 0.724 | 0.398 | 0.427 |
+| readmissing (async) | 0.616 | 0.329 | 0.927 | 0.599 | |
+
+1 thread (median of 5): sync 0.285 / 0.290 µs (unchanged), async 0.507 / 0.405 µs. readrandom, 4 threads: cpu 3.83 ->
+3.34 µs/op sync, wall within noise. Allocations unchanged (readmissing 0.1 B/op, readrandom 5.9 B/op, multiread 0.2).
+After the change the remaining 4-thread profile is the filter probe, the index/L0 file checks and the benchmark's own
+key generation; no shared write is left on the path.
+
+### 2. Sync random writes: follower wake-ups
+
+Profile of 4-thread sync `fillrandom`: 41% skip-list insert by the leader, the rest spread over WAL write, wake-ups and
+scheduler. The async path performs the same serial inserts, but its followers resume as thread-pool work items (the
+pool's workers spin before they sleep), while a sync follower waited on a `ManualResetEventSlim` and needed a futex
+wake-up (and a reschedule) for every hand-off: completing a follower and making the next writer leader.
+
+- **AwaitState port** (`WriteThread.Writer.WaitSync`): busy spin (200 pause iterations), then, with
+  `enable_write_thread_adaptive_yield` (default), `Thread.Yield` for up to `write_thread_max_yield_usec` (100 µs) as
+  long as the yield credit says yielding ends the wait without involuntary context switches (sampled 1 in 256, three
+  slow yields fall back to blocking at once), then a blocking wait. The block is upstream's `STATE_LOCKED_WAITING`
+  protocol on a monitor: the waker CASes the state and only takes the monitor if the waiter registered as blocked, so a
+  waiter that saw the state while spinning is never touched again (a `ManualResetEventSlim.Set` landing after the
+  writer re-armed would have woken its next wait spuriously).
+- **Parallel memtable inserts** (`allow_concurrent_memtable_write`, upstream `LaunchParallelMemTableWriters` /
+  `CompleteParallelMemTableWriter` / `ExitAsBatchGroupFollower`): after the WAL write the leader wakes the followers,
+  every writer inserts its own batch with `MemTable.AddConcurrently` (counters applied by `BatchPostProcess`, flushes
+  scheduled from there), and the last writer to finish publishes the sequence and completes the others. Measured with
+  single-key writes it was clearly slower (each follower needs two hand-offs instead of one, and concurrent skip-list
+  inserts are CAS-based): 4 threads, 5 repetitions, fillrandom 8.48 vs 5.97 µs/op, overwrite 10.34 vs 7.53 (cpu 10.1 vs
+  6.0 and 13.9 vs 8.7). With 16-key batches it was neutral (fillrandom 3.92 vs 4.03, overwrite 4.27 vs 3.95 µs/key).
+  So groups go parallel only from 64 entries (`DbImpl.MinParallelMemtableGroupEntries`; upstream: any group of two or
+  more writers). Groups with merge operands, transaction writers or blob direct write rewrites stay serial like
+  upstream (merges) or for simplicity. `TestHooks.ForceParallelMemtableWrites` makes tests exercise the parallel path
+  with small groups.
+
+| 4 threads, 100 B (µs/op, median of 5 / 10) | base wall | new wall | base cpu | new cpu | c-native wall |
+|---|---:|---:|---:|---:|---:|
+| fillrandom (sync) | 6.31 | 5.22 | 6.38 | 6.47 | 8.94 |
+| overwrite (sync) | 6.80 | 6.47 | 8.64 | 6.91 | 11.32 |
+| fillrandom (async) | 5.79 | 6.27 | 7.40 | 6.06 | |
+| overwrite (async) | 6.85 | 6.42 | 8.68 | 7.91 | |
+
+An earlier run of the same comparison (no c-native, 5 repetitions): sync fillrandom 6.98 -> 5.97, overwrite 7.41 ->
+7.53 µs/op. c-native is slower than on a quiet machine in these runs (its WAL and flush I/O compete with the other
+agents' I/O, which `nice` does not cover), so the ratios vs C are only indicative; the 4-thread rows need a quiet
+`bench/run-all.sh` run to confirm the ratios. Allocations unchanged (fillrandom 66.9 B/op = memtable arena growth).
+
+### 3. Not done
+
+- **Reverse iteration pins blocks.** `DbIter.FindValueForCurrentKey` still copies the value of the newest visible entry
+  (upstream pins the data block with `PinnedIteratorsManager`). Pinning needs a pin handle through the merging, level
+  and table iterators down to the block (a `BlockRef` reference, or ownership of an uncached block buffer); the copy is
+  one memcpy of the value per user key, and managed `readreverse` is already 0.41-0.68x of C (geometric mean 0.59x).
+- **Async reverse movement.** `PrevAsync` / `SeekForPrevAsync` / `SeekToLastAsync` stay synchronous (a block read on a
+  cache miss blocks the caller). Making `PrevInternal` / `FindValueForCurrentKey` resumable needs the step-function
+  treatment of the forward path through the merging and level iterators' reverse movement.
+- **Range tombstones in the merging-iterator heap** (upstream 7.x `MergingIterator`). It only pays off when seeking or
+  scanning over long deleted ranges (whole covered ranges are skipped with one reseek instead of key by key); the
+  matrix has no such workload, and the current design (every visible entry checked against the
+  `RangeDelAggregator` in `DbIter`) is correct for all workloads. Not ported.
+- **Pipelined writes** (`enable_pipelined_write`): accepted and persisted, but writes use the non-pipelined path.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
 - Data block linear scan could skip comparisons using the shared-prefix length (incremental comparison).
 - Batched MultiGet exists (perf pass #2) but does not prefetch filter cache lines or interleave the block reads of a batch.
 - Block cache charge does not include the `Block` object (~64 bytes).
-- Sync writes from 4 threads (`fillrandom` / `overwrite` 1.04-1.81x vs C, while async is 0.75-1.03x) and 4-thread
-  `readmissing` with small values (1.4-3.0x); see "Final three-way results".
+- Confirm the 4-thread `fillrandom` / `overwrite` / `readmissing` ratios vs C on a quiet machine (see "Read/write
+  contention with 4 threads"); reverse-iteration block pinning, async reverse movement, range tombstones in the
+  merging-iterator heap and pipelined writes are open.

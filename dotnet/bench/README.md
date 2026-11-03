@@ -213,6 +213,11 @@ Equivalence guarantees (see `DbBench/Workload.cs` and `native-c/rocksdb_bench.c`
   (log-linear buckets, <= 1.6% error; per batch for `multireadrandom` and batched writes). The managed runner adds
   allocated bytes per op (all threads, `GC.GetTotalAllocatedBytes`), gen0/1/2 collection counts and the methods
   JIT-compiled during the measurement (`System.Runtime.JitInfo`, all threads); the C leg leaves these columns empty.
+  The managed human-readable line also ends with `cpu X us/op`: process CPU time (all threads, incl. background jobs)
+  per operation, which is far less sensitive to other load on the machine than wall time and shows spinning and
+  cache-line contention (not in the CSV).
+- managed-only flags (not accepted by the C leg, so not usable with `compare`): `--allow_concurrent_memtable_write`,
+  `--enable_write_thread_adaptive_yield` (both default true, like the engines' defaults).
 
 The C leg uses `rocksdb_get` (+ `rocksdb_free`) for point reads, like rocksdb-sharp's span `Get`, and
 `rocksdb_batched_multi_get_cf` with pinnable slices for MultiGet, which rocksdb-sharp also calls (through
