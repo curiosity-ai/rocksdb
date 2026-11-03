@@ -18,6 +18,13 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
     public uint FormatVersion { get; set; } = 7;
     public ChecksumType Checksum { get; set; } = ChecksumType.Xxh3;
     public IndexType IndexType { get; set; } = IndexType.BinarySearch;
+    /// <summary>
+    /// index_block_search_type: the search algorithm for index blocks (read time only; default binary).
+    /// <see cref="IndexBlockSearchType.Interpolation"/> requires the bytewise comparator;
+    /// <see cref="IndexBlockSearchType.Auto"/> uses interpolation search only on index blocks marked "is_uniform" (see
+    /// <see cref="UniformCvThreshold"/>). Partitioned-index top levels and hash indexes always use binary search, like upstream.
+    /// </summary>
+    public IndexBlockSearchType IndexBlockSearchType { get; set; } = IndexBlockSearchType.Binary;
     public DataBlockIndexType DataBlockIndexType { get; set; } = DataBlockIndexType.BinarySearch;
     public double DataBlockHashTableUtilRatio { get; set; } = 0.75;
     private CustomizableOption<FilterPolicy> _filterPolicy;
@@ -72,7 +79,7 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
     public bool SeparateKeyValueInDataBlock { get; set; }
     /// <summary>
     /// uniform_cv_threshold: index blocks whose key gaps have a coefficient of variation below this get the "is_uniform"
-    /// hint in their footer (used by native readers with index_block_search_type = kAuto). -1 (default) disables it.
+    /// hint in their footer (used by readers with <see cref="IndexBlockSearchType"/> = Auto). -1 (default) disables it.
     /// </summary>
     public double UniformCvThreshold { get; set; } = -1;
     public bool EnableIndexCompression { get; set; } = true;
@@ -98,6 +105,8 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
         .UInt32("format_version", static o => o.FormatVersion, static (o, v) => o.FormatVersion = v)
         .Enum("checksum", OptionEnumMaps.Checksum, static o => o.Checksum, static (o, v) => o.Checksum = v)
         .Enum("index_type", OptionEnumMaps.IndexType, static o => o.IndexType, static (o, v) => o.IndexType = v)
+        .Enum("index_block_search_type", OptionEnumMaps.IndexBlockSearchType, static o => o.IndexBlockSearchType,
+            static (o, v) => o.IndexBlockSearchType = v)
         .Enum("data_block_index_type", OptionEnumMaps.DataBlockIndexType, static o => o.DataBlockIndexType, static (o, v) => o.DataBlockIndexType = v)
         .Double("data_block_hash_table_util_ratio", static o => o.DataBlockHashTableUtilRatio, static (o, v) => o.DataBlockHashTableUtilRatio = v)
         .Add("filter_policy", static o => o._filterPolicy.Serialize(FilterPolicyId) ?? "nullptr",

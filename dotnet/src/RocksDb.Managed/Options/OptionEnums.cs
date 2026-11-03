@@ -75,6 +75,26 @@ public enum DataBlockIndexType : byte
     BinaryAndHash = 1,
 }
 
+/// <summary>
+/// Mirrors BlockBasedTableOptions::BlockSearchType (include/rocksdb/table.h): the search algorithm used when seeking in
+/// index blocks. Read-time only; compatible with any block.
+/// </summary>
+public enum IndexBlockSearchType : byte
+{
+    /// <summary>Standard binary search (kBinary, default).</summary>
+    Binary = 0x00,
+    /// <summary>
+    /// Interpolation search (kInterpolation), which may be faster for uniformly distributed keys. Requires the bytewise
+    /// comparator.
+    /// </summary>
+    Interpolation = 0x01,
+    /// <summary>
+    /// kAuto: interpolation search for index blocks whose footer carries the "is_uniform" hint (written with
+    /// <see cref="BlockBasedTableOptions.UniformCvThreshold"/> &gt;= 0) when the comparator is bytewise, else binary search.
+    /// </summary>
+    Auto = 0x02,
+}
+
 /// <summary>Mirrors BlockBasedTableOptions::IndexShorteningMode.</summary>
 public enum IndexShorteningMode : byte
 {

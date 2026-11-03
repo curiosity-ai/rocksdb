@@ -143,6 +143,7 @@ public sealed class LocalFileSystem : IFileSystem
 
         SafeFileHandle? handle = null;
         FileStream? stream = null;
+        bool ofd = false;
         try
         {
             if (OperatingSystem.IsLinux())
@@ -150,6 +151,7 @@ public sealed class LocalFileSystem : IFileSystem
                 handle = File.OpenHandle(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
                 int rc = UnixNative.TryOfdLock(handle);
                 if (rc > 0) throw UnixNative.IOErrorFromErrno("While lock file", path, rc);
+                ofd = rc == 0;
                 if (rc < 0)
                 {
                     // No OFD locks (old kernel): FileStream.Lock uses fcntl(F_SETLK), which still excludes other processes.
@@ -162,7 +164,7 @@ public sealed class LocalFileSystem : IFileSystem
                 // Windows: exclusive share mode (like WinFileSystem::LockFile). macOS/BSD: .NET takes flock(LOCK_EX).
                 handle = File.OpenHandle(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
             }
-            return new FileLock(key, handle, stream);
+            return new FileLock(key, handle, stream, ofd);
         }
         catch (Exception e)
         {
@@ -233,14 +235,17 @@ public sealed class LocalFileSystem : IFileSystem
         }
     }
 
-    private sealed class FileLock(string key, SafeFileHandle handle, FileStream? stream) : IDisposable
+    private sealed class FileLock(string key, SafeFileHandle handle, FileStream? stream, bool ofd) : IDisposable
     {
         private int _disposed;
 
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-            // Closing the descriptor releases the OFD/fcntl/flock lock (PosixFileSystem::UnlockFile).
+            // PosixFileSystem::UnlockFile: unlock, then close. The explicit unlock matters for OFD locks, which stay
+            // held while a forked-but-not-yet-exec'd child (Process.Start on any thread) shares the description.
+            // fcntl record locks are per process and .NET drops its flock before closing, so those need nothing more.
+            if (ofd) UnixNative.OfdUnlock(handle);
             stream?.Dispose();
             handle.Dispose();
             lock (s_lockedFilesLock) s_lockedFiles.Remove(key);
@@ -843,7 +848,7 @@ internal sealed class LocalWritableFile : IWritableFile
                 int chunk = (int)Math.Min(data.Length, Math.Max(1, limiter.SingleBurstBytes));
                 if (_alignment != 0) chunk = Math.Max(_alignment, (int)AlignedBuffer.RoundDown(chunk, _alignment));
                 chunk = Math.Min(chunk, data.Length);
-                limiter.Request(chunk, _options.IoPriority);
+                limiter.Request(chunk, _options.IoPriority, _options.Statistics, RateLimiterOpType.Write);
                 RandomAccess.Write(_handle, data[..chunk], offset);
                 offset += chunk;
                 data = data[chunk..];
@@ -912,7 +917,7 @@ internal sealed class LocalWritableFile : IWritableFile
                 int chunk = (int)Math.Min(data.Length, Math.Max(1, limiter.SingleBurstBytes));
                 if (_alignment != 0) chunk = Math.Max(_alignment, (int)AlignedBuffer.RoundDown(chunk, _alignment));
                 chunk = Math.Min(chunk, data.Length);
-                await limiter.RequestAsync(chunk, _options.IoPriority, cancellationToken).ConfigureAwait(false);
+                await limiter.RequestAsync(chunk, _options.IoPriority, _options.Statistics, RateLimiterOpType.Write, cancellationToken).ConfigureAwait(false);
                 await RandomAccess.WriteAsync(_handle, data[..chunk], offset, cancellationToken).ConfigureAwait(false);
                 offset += chunk;
                 data = data[chunk..];

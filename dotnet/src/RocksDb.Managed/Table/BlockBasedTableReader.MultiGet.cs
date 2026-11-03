@@ -12,6 +12,9 @@ internal interface ITableMultiGetBatch
     /// <summary>The lookup key (user key + packed (snapshot sequence, kValueTypeForSeek)) of key <paramref name="key"/>.</summary>
     ReadOnlySpan<byte> InternalKey(int key);
 
+    /// <summary><see cref="InternalKey"/> as memory (stable during the lookup; used across awaits).</summary>
+    ReadOnlyMemory<byte> InternalKeyMemory(int key);
+
     /// <summary>
     /// Called for each entry with the user key of <paramref name="key"/> at or after its lookup key, newest first, until
     /// it returns false (like <see cref="TableEntryVisitor{TState}"/>).
@@ -50,7 +53,16 @@ public sealed partial class BlockBasedTableReader
             {
                 if (!mayMatch[i]) continue;
                 int key = keys[i];
-                SeekIndex(idx, batch, key);
+                if (synchronous)
+                {
+                    SeekIndex(idx, batch, key);
+                }
+                else
+                {
+                    // Index partitions that are not cached are read with async I/O too.
+                    ValueTask seek = idx.SeekForGetAsync(batch.InternalKeyMemory(key), cancellationToken);
+                    if (!seek.IsCompletedSuccessfully) await seek.ConfigureAwait(false);
+                }
                 bool first = true;
                 while (idx.Valid)
                 {
@@ -75,7 +87,15 @@ public sealed partial class BlockBasedTableReader
                     int r = VisitBlock(batch, key, data, current.Block!, first);
                     if (r <= 0) break; // done with this key
                     first = false;
-                    idx.Next();
+                    if (synchronous)
+                    {
+                        idx.Next();
+                    }
+                    else
+                    {
+                        ValueTask next = idx.NextAsync(cancellationToken);
+                        if (!next.IsCompletedSuccessfully) await next.ConfigureAwait(false);
+                    }
                 }
             }
         }

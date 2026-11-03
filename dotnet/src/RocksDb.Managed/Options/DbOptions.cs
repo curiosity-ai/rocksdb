@@ -50,6 +50,14 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     /// default) means no tracking. Not persisted.
     /// </summary>
     public SstFileManager? SstFileManager { get; set; }
+    /// <summary>
+    /// file_checksum_gen_factory: when set (e.g. <see cref="FileChecksumGenCrc32cFactory.Instance"/>), a whole-file
+    /// checksum is computed for every table and blob file written by flushes and compactions and for ingested files, and
+    /// recorded in the MANIFEST with its function name (native RocksDB reads and writes the same records); see
+    /// <see cref="RocksDatabase.VerifyFileChecksums()"/> and <see cref="IngestExternalFileOptions.VerifyFileChecksum"/>.
+    /// Null (the default) computes none. Persisted by name.
+    /// </summary>
+    public FileChecksumGenFactory? FileChecksumGenFactory { get; set; }
 
     // ---- persisted ---------------------------------------------------------------------------
     public bool CreateIfMissing { get; set; }
@@ -227,6 +235,10 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
         .UInt64("bgerror_resume_retry_interval", static o => o.BgErrorResumeRetryInterval, static (o, v) => o.BgErrorResumeRetryInterval = v)
         .Bool("allow_data_in_errors", static o => o.AllowDataInErrors, static (o, v) => o.AllowDataInErrors = v)
         .String("db_host_id", static o => o.DbHostId, static (o, v) => o.DbHostId = v)
+        // AsCustomSharedPtr<FileChecksumGenFactory> (kByNameAllowFromNull): the factory's name; only the built-in
+        // FileChecksumGenCrc32cFactory is recreated from an OPTIONS file, other names load as null.
+        .Add("file_checksum_gen_factory", static o => o.FileChecksumGenFactory?.Name ?? "",
+            static (o, v) => o.FileChecksumGenFactory = OptionStrings.UnwrapId(v) == FileChecksumGenCrc32cFactory.ClassName ? FileChecksumGenCrc32cFactory.Instance : null)
         .Bool("enforce_single_del_contracts", static o => o.EnforceSingleDelContracts, static (o, v) => o.EnforceSingleDelContracts = v)
         .Enum("info_log_level", OptionEnumMaps.InfoLogLevel, static o => o.InfoLogLevel, static (o, v) => o.InfoLogLevel = v);
 
@@ -255,7 +267,7 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     public DbOptions Clone()
     {
         var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir, FileSystem = FileSystem, Statistics = Statistics, InfoLog = InfoLog,
-            RateLimiter = RateLimiter, SstFileManager = SstFileManager };
+            RateLimiter = RateLimiter, SstFileManager = SstFileManager, FileChecksumGenFactory = FileChecksumGenFactory };
         c.DbPaths.AddRange(DbPaths);
         c.Listeners.AddRange(Listeners);
         c.CopyFrom(this);

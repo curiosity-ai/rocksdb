@@ -222,6 +222,14 @@ internal static class OptionEnumMaps
         ("kBinarySearchWithFirstKey", Managed.IndexType.BinarySearchWithFirstKey),
     ]);
 
+    /// <summary>block_base_table_index_search_type_string_map (table/block_based/block_based_table_factory.cc).</summary>
+    public static readonly EnumMap<IndexBlockSearchType> IndexBlockSearchType = new(
+    [
+        ("kBinary", Managed.IndexBlockSearchType.Binary),
+        ("kInterpolation", Managed.IndexBlockSearchType.Interpolation),
+        ("kAuto", Managed.IndexBlockSearchType.Auto),
+    ]);
+
     public static readonly EnumMap<DataBlockIndexType> DataBlockIndexType = new(
     [
         ("kDataBlockBinarySearch", Managed.DataBlockIndexType.BinarySearch),

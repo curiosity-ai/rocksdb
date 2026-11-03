@@ -10,10 +10,19 @@ public enum IoPriority : byte
     Total = 4,
 }
 
+/// <summary>The kind of I/O a rate limiter request is for (RateLimiter::OpType, include/rocksdb/rate_limiter.h).</summary>
+public enum RateLimiterOpType
+{
+    Read = 0,
+    Write = 1,
+}
+
 /// <summary>
 /// Rate limiter hook (interface subset of include/rocksdb/rate_limiter.h). <see cref="LocalFileSystem"/> writers
 /// request tokens before every physical write, in chunks of at most <see cref="SingleBurstBytes"/>, exactly like
-/// WritableFileWriter::WriteBuffered. Implementations must be thread-safe. No implementation ships yet.
+/// WritableFileWriter::WriteBuffered; table readers charge block reads made with a rate limiter priority (compaction
+/// inputs, <see cref="ReadOptions.RateLimiterPriority"/>) like RandomAccessFileReader::ChargeRateLimiterForRead.
+/// Implementations must be thread-safe. <see cref="GenericRateLimiter"/> is the built-in implementation.
 /// </summary>
 public interface IRateLimiter
 {
@@ -25,6 +34,26 @@ public interface IRateLimiter
 
     /// <summary>Async variant of <see cref="Request"/>. Should complete synchronously when tokens are available.</summary>
     ValueTask RequestAsync(long bytes, IoPriority priority, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// IsRateLimited(op_type): whether requests of this kind are charged. The default charges writes only (the
+    /// behaviour of implementations written before reads were charged).
+    /// </summary>
+    bool IsRateLimited(RateLimiterOpType opType) => opType == RateLimiterOpType.Write;
+
+    /// <summary>
+    /// Request(bytes, pri, stats, op_type): charges <paramref name="bytes"/> when <see cref="IsRateLimited"/> and records
+    /// the RATE_LIMITER_* statistics in <paramref name="statistics"/> (may be null). The default forwards to
+    /// <see cref="Request(long, IoPriority)"/> without statistics.
+    /// </summary>
+    void Request(long bytes, IoPriority priority, RocksDb.Managed.Statistics? statistics, RateLimiterOpType opType)
+    {
+        if (IsRateLimited(opType)) Request(bytes, priority);
+    }
+
+    /// <summary>Async variant of <see cref="Request(long, IoPriority, RocksDb.Managed.Statistics?, RateLimiterOpType)"/>.</summary>
+    ValueTask RequestAsync(long bytes, IoPriority priority, RocksDb.Managed.Statistics? statistics, RateLimiterOpType opType, CancellationToken cancellationToken) =>
+        IsRateLimited(opType) ? RequestAsync(bytes, priority, cancellationToken) : ValueTask.CompletedTask;
 }
 
 /// <summary>
@@ -68,6 +97,15 @@ public sealed class WritableFileOptions
 
     /// <summary>Priority passed to <see cref="RateLimiter"/>.</summary>
     public IoPriority IoPriority { get; init; } = IoPriority.Total;
+
+    /// <summary>
+    /// The DB's file_checksum_gen_factory for this file (WritableFileWriter::checksum_generator_). Applied by the DB's
+    /// table and blob writers (FileChecksumHelper.CreateWritable), not by the file system.
+    /// </summary>
+    public FileChecksumGenFactory? FileChecksumGenFactory { get; init; }
+
+    /// <summary>Statistics receiving the RATE_LIMITER_* write tickers of <see cref="RateLimiter"/> requests (WritableFileWriter::stats_).</summary>
+    public RocksDb.Managed.Statistics? Statistics { get; init; }
 }
 
 /// <summary>Options for random-access readers (RandomAccessFileReader / PosixRandomAccessFile).</summary>

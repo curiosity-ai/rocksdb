@@ -25,6 +25,24 @@ internal static unsafe class NativeExtras
 
     private static IntPtr Export(string name) => NativeLibrary.GetExport(s_library.Value, name);
 
+    /// <summary>rocksdb_file_checksum_gen_crc32c_factory_create + rocksdb_options_set_file_checksum_gen_factory (the factory is leaked).</summary>
+    public static void SetCrc32cFileChecksums(RocksDbSharp.DbOptions options)
+    {
+        IntPtr factory = ((delegate* unmanaged<IntPtr>)Export("rocksdb_file_checksum_gen_crc32c_factory_create"))();
+        ((delegate* unmanaged<IntPtr, IntPtr, void>)Export("rocksdb_options_set_file_checksum_gen_factory"))(options.Handle, factory);
+    }
+
+    /// <summary>rocksdb_verify_file_checksums: null when OK, else the error message.</summary>
+    public static string? VerifyFileChecksums(RocksDbSharp.RocksDb db)
+    {
+        IntPtr err = IntPtr.Zero;
+        ((delegate* unmanaged<IntPtr, IntPtr*, void>)Export("rocksdb_verify_file_checksums"))(db.Handle, &err);
+        if (err == IntPtr.Zero) return null;
+        string msg = Marshal.PtrToStringUTF8(err)!;
+        ((delegate* unmanaged<IntPtr, void>)Export("rocksdb_free"))(err);
+        return msg;
+    }
+
     /// <summary>rocksdb_options_set_best_efforts_recovery.</summary>
     public static void SetBestEffortsRecovery(RocksDbSharp.DbOptions options, bool value) =>
         ((delegate* unmanaged<IntPtr, byte, void>)Export("rocksdb_options_set_best_efforts_recovery"))(options.Handle, value ? (byte)1 : (byte)0);

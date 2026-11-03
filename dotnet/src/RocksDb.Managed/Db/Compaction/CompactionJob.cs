@@ -91,7 +91,9 @@ internal sealed class CompactionJob
         _newFileNumber = newFileNumber;
         _cancellation = cancellation;
         _icmp = cfd.Icmp;
-        _noFillCache = new NoFillTableCache(cfd.TableCache, (int)Math.Min(db.Options.CompactionReadaheadSize, 256UL << 20));
+        // Input reads: fill_cache = false, charged to the rate limiter at GetRateLimiterPriority().
+        _noFillCache = new NoFillTableCache(cfd.TableCache, (int)Math.Min(db.Options.CompactionReadaheadSize, 256UL << 20),
+            TableReadFlags.DontFillCache.WithRateLimiterPriority(db.CompactionRateLimiterPriority()));
         _subStart = start;
         _subEnd = end;
         SubJobId = subJobId;
@@ -244,7 +246,7 @@ internal sealed class CompactionJob
     /// work and is done in large reads instead of one pread per block. 0 disables readahead.
     /// </para>
     /// </summary>
-    private sealed class NoFillTableCache(TableCache inner, int readaheadSize) : ITableCache
+    private sealed class NoFillTableCache(TableCache inner, int readaheadSize, TableReadFlags flags) : ITableCache
     {
         public ValueTask<TableReaderLease> GetReaderAsync(FileMetaData file, CancellationToken cancellationToken = default) =>
             inner.GetReaderAsync(file, cancellationToken);
@@ -253,14 +255,14 @@ internal sealed class CompactionJob
 
         public InternalIterator NewIterator(FileMetaData file)
         {
-            var t = new TableInternalIterator(inner.GetReader(file), TableReadFlags.DontFillCache);
+            var t = new TableInternalIterator(inner.GetReader(file), flags);
             t.EnableReadahead(readaheadSize);
             return t;
         }
 
         public InternalIterator NewIterator(FileMetaData file, InternalIterator? reuse)
         {
-            InternalIterator it = TableCache.Recycle(reuse, inner.GetReader(file), TableReadFlags.DontFillCache);
+            InternalIterator it = TableCache.Recycle(reuse, inner.GetReader(file), flags);
             if (it is TableInternalIterator t) t.EnableReadahead(readaheadSize);
             return it;
         }
@@ -340,12 +342,11 @@ internal sealed class CompactionJob
     /// <summary>
     /// Port of Compaction::ShouldFormSubcompactions: leveled kRoundRobin compactions to L1+ always may (their count can
     /// exceed max_subcompactions); otherwise max_subcompactions &gt; 1 and, leveled, an L0 or manual compaction to L1+,
-    /// or universal with more than one level outputting to L1+. The managed port also keeps compactions with
-    /// user-defined timestamps in one subcompaction (boundary keys would need a timestamp).
+    /// or universal with more than one level outputting to L1+. With user-defined timestamps the boundaries carry the
+    /// maximum timestamp (InitializeReadOptionsAndBoundaries), so all versions of a user key stay in one subcompaction.
     /// </summary>
     internal static bool ShouldFormSubcompactions(Compaction c, uint maxSubcompactions)
     {
-        if (c.InputStorage.Icmp.UserComparator.TimestampSize != 0) return false;
         CompactionStyle style = c.Options.CompactionStyle;
         if (c.Options.CompactionPri == CompactionPri.RoundRobin && style == CompactionStyle.Level) return c.OutputLevel > 0;
         if (maxSubcompactions <= 1) return false;
@@ -660,8 +661,8 @@ internal sealed class CompactionJob
         {
             // The subcompaction's slice of the input: [start@kMaxSequenceNumber, end@kMaxSequenceNumber).
             input = new ClippingIterator(input,
-                _subStart is null ? null : MakeInternalKey(_subStart, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek),
-                _subEnd is null ? null : MakeInternalKey(_subEnd, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek), _icmp);
+                _subStart is null ? null : BoundaryKey(_subStart, DbFormat.ValueTypeForSeek),
+                _subEnd is null ? null : BoundaryKey(_subEnd, DbFormat.ValueTypeForSeek), _icmp);
         }
         // CompactionJob::ProcessKeyValueCompaction: a BlobCountingIterator measures the blob inflow when the input
         // references blob files (DoesInputReferenceBlobFiles).
@@ -909,6 +910,8 @@ internal sealed class CompactionJob
             TargetFileSize = _c.MaxOutputFileSize,
             FileCreationTime = now,
             NewestKeyTime = newestKeyTime,
+            // proximal_after_seqno_ /*last_level_inclusive_max_seqno_threshold*/ (CompactionJob::OpenCompactionOutputFile).
+            LastLevelInclusiveMaxSeqnoThreshold = _proximalAfterSeqno,
         };
         if (!_c.EnableCompression)
         {
@@ -929,7 +932,7 @@ internal sealed class CompactionJob
         };
         // Compaction outputs (of every subcompaction and of the proximal level) are charged to the DB's rate limiter at IO_LOW.
         WritableFileOptions fileOptions = _db.TableFileWriteOptions(IoPriority.Low);
-        _out.File = _db.FileSystem.CreateWritable(_out.Path, truncate: true, fileOptions);
+        _out.File = FileChecksumHelper.CreateWritable(_db.FileSystem, _out.Path, fileOptions);
         _out.Builder = new BlockBasedTableBuilder(_out.File, _cfd.Format, tbo);
         _out.HasPointKey = false;
         _out.LargestKey.Clear();
@@ -1010,6 +1013,8 @@ internal sealed class CompactionJob
                 else await file.SyncAsync(_cancellation).ConfigureAwait(false);
                 meta.FileSize = builder.FileSize;
                 meta.TailSize = builder.FileSize - builder.Properties.TailStartOffset;
+                // CompactionJob::FinishCompactionOutputFile: outfile->GetFileChecksum() / GetFileChecksumFuncName().
+                (meta.FileChecksum, meta.FileChecksumFuncName) = FileChecksumHelper.GetChecksum(file);
                 // ExtractTimestampFromTableProperties (db/builder.cc).
                 meta.MinTimestamp = builder.TimestampMin;
                 meta.MaxTimestamp = builder.TimestampMax;
@@ -1050,6 +1055,19 @@ internal sealed class CompactionJob
     // ---------------------------------------------------------------------------------------------------------
     // range tombstones (CompactionOutputs::AddRangeDels)
 
+    /// <summary>
+    /// A subcompaction boundary as an internal key: boundary@kMaxSequenceNumber,<paramref name="type"/>, with the
+    /// timestamp of a user-defined-timestamp boundary replaced by the maximum timestamp (UpdateInternalKey with
+    /// boundaries.ts_slice in InitializeReadOptionsAndBoundaries): it sorts before every version of the user key.
+    /// </summary>
+    private byte[] BoundaryKey(byte[] userKey, EntryType type)
+    {
+        byte[] k = MakeInternalKey(userKey, DbFormat.MaxSequenceNumber, type);
+        int ts = _cfd.TimestampSize;
+        if (ts != 0 && userKey.Length >= ts) k.AsSpan(userKey.Length - ts, ts).Fill(0xff);
+        return k;
+    }
+
     private static byte[] MakeInternalKey(ReadOnlySpan<byte> userKey, ulong seq, EntryType type)
     {
         var k = new byte[userKey.Length + DbFormat.InternalKeyFooterSize];
@@ -1069,13 +1087,13 @@ internal sealed class CompactionJob
         // covered on both sides, so the earlier subcompaction's last file extends to boundary@kMaxSequenceNumber and
         // this one starts at the boundary user key with any version.
         byte[]? lowerBound = _out.FirstOutput
-            ? (_subStart is null ? null : MakeInternalKey(_subStart, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion))
+            ? (_subStart is null ? null : BoundaryKey(_subStart, EntryType.RangeDeletion))
             : meta.Smallest.Length == 0 ? null : meta.Smallest;
         byte[]? upperBound;
         if (nextTableMinKey.Length == 0)
         {
             // Last file of the subcompaction.
-            upperBound = _subEnd is null ? null : MakeInternalKey(_subEnd, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion);
+            upperBound = _subEnd is null ? null : BoundaryKey(_subEnd, EntryType.RangeDeletion);
         }
         else
         {

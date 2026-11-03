@@ -24,7 +24,9 @@ public sealed class AsyncPrefetchBuffer : IDisposable
 {
     private const int MinReserve = 64 * 1024;
 
-    private readonly int _readahead;
+    private int _readahead;
+    private readonly int _initialReadahead;
+    private readonly int _maxReadahead;
     private IRandomAccessFile? _file;
     private long _fileLength;
     private int _reserve = MinReserve;
@@ -42,10 +44,41 @@ public sealed class AsyncPrefetchBuffer : IDisposable
     private Task<int>? _pending;
 
     /// <param name="readaheadSize">Bytes per read (compaction_readahead_size).</param>
-    public AsyncPrefetchBuffer(int readaheadSize)
+    public AsyncPrefetchBuffer(int readaheadSize) : this(readaheadSize, readaheadSize)
     {
-        ArgumentOutOfRangeException.ThrowIfLessThan(readaheadSize, 1);
-        _readahead = readaheadSize;
+    }
+
+    /// <summary>
+    /// A buffer whose reads start at <paramref name="initialReadaheadSize"/> bytes and double with every read up to
+    /// <paramref name="maxReadaheadSize"/> (FilePrefetchBuffer with implicit auto readahead: initial_auto_readahead_size,
+    /// max_auto_readahead_size).
+    /// </summary>
+    public AsyncPrefetchBuffer(int initialReadaheadSize, int maxReadaheadSize)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(initialReadaheadSize, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxReadaheadSize, initialReadaheadSize);
+        _readahead = initialReadaheadSize;
+        _initialReadahead = initialReadaheadSize;
+        _maxReadahead = maxReadaheadSize;
+    }
+
+    /// <summary>The size of the next read.</summary>
+    public int ReadaheadSize => _readahead;
+
+    /// <summary>
+    /// Drops the buffered data and restarts the readahead at its initial size (a non-sequential access:
+    /// FilePrefetchBuffer::ResetValues).
+    /// </summary>
+    public void ResetReadahead()
+    {
+        Reset(_file);
+        _readahead = _initialReadahead;
+    }
+
+    /// <summary>Keeps exponentially increasing the readahead size until the maximum.</summary>
+    private void GrowReadahead()
+    {
+        if (_readahead < _maxReadahead) _readahead = (int)Math.Min(_maxReadahead, (long)_readahead * 2);
     }
 
     /// <summary>Synchronous file reads issued on misses (tests / diagnostics).</summary>
@@ -127,6 +160,7 @@ public sealed class AsyncPrefetchBuffer : IDisposable
         if (_cur.Length < want) Rent(ref _cur, want);
         int got = _file!.Read(offset, _cur.AsSpan(0, want));
         SyncReads++;
+        GrowReadahead();
         _curStart = 0;
         _curLen = got;
         _curOffset = offset;
@@ -149,6 +183,7 @@ public sealed class AsyncPrefetchBuffer : IDisposable
         _nextStart = _reserve;
         if (_next.Length < _reserve + len) Rent(ref _next, _reserve + len);
         Prefetches++;
+        GrowReadahead();
         ValueTask<int> t = _file!.ReadAsync(start, _next.AsMemory(_nextStart, len));
         _pending = t.IsCompletedSuccessfully ? Task.FromResult(t.Result) : t.AsTask();
     }

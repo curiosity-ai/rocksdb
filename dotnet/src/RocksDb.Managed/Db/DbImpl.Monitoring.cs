@@ -395,7 +395,7 @@ internal sealed partial class DbImpl
                 SuperVersion sv = GetReferencedSuperVersion(cfd);
                 try
                 {
-                    sb.Append(cfd.Stats.Dump(cfd.Name, sv.Current.Storage, isPeriodic: true));
+                    sb.Append(cfd.Stats.Dump(cfd.Name, sv.Current.Storage, isPeriodic: true)).Append(cfd.Stats.DumpFileHistogram(cfd.Name));
                 }
                 finally
                 {

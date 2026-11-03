@@ -49,19 +49,6 @@ internal sealed partial class DbImpl
         "max_manifest_file_size", "manifest_preallocation_size", "max_compaction_trigger_wakeup_seconds",
     };
 
-    /// <summary>
-    /// Block-based table options SetOptions can change: the ones that only affect how new tables are built (readers,
-    /// caches and filters are configured when a column family is created). Upstream clones the table factory for any
-    /// field; the others are refused here ("Option not changeable").
-    /// </summary>
-    internal static readonly HashSet<string> MutableTableOptionNames = new(StringComparer.Ordinal)
-    {
-        "block_size", "block_size_deviation", "block_restart_interval", "index_block_restart_interval", "metadata_block_size",
-        "format_version", "checksum", "data_block_index_type", "data_block_hash_table_util_ratio", "optimize_filters_for_memory",
-        "detect_filter_construct_corruption", "block_align", "super_block_alignment_size", "super_block_alignment_space_overhead_ratio",
-        "separate_key_value_in_data_block", "uniform_cv_threshold", "enable_index_compression", "use_delta_encoding", "index_shortening",
-        "optimize_key_common_prefix", "verify_compression",
-    };
 
     /// <summary>
     /// Applies a table factory option of SetOptions (TableFactoryParseFn): "table_factory.NAME" /
@@ -102,13 +89,23 @@ internal sealed partial class DbImpl
         return false;
     }
 
+    /// <summary>
+    /// One block-based table option of SetOptions. Like upstream's TableFactoryParseFn, which clones the table factory and
+    /// configures any of its fields (CloneTableFactoryForOptionsUpdate), every block-based table option can be changed:
+    /// builder settings apply to new tables, reader settings (block cache, filter policy, cache/pin settings, index search
+    /// type, readahead) to table readers opened afterwards, while readers already open keep theirs. "block_cache" takes
+    /// a capacity (Cache::CreateFromString: a new LRU cache of that many bytes, k/m/g/t suffixes allowed).
+    /// </summary>
     private static void SetTableOption(BlockBasedTableOptions options, string name, string value)
     {
-        if (!MutableTableOptionNames.Contains(name))
+        if (name == "block_cache")
         {
-            if (options.GetOption(name) is null) ThrowHelper.InvalidArgument("Unrecognized option: table_factory." + name);
-            ThrowHelper.InvalidArgument("Option not changeable: table_factory." + name);
+            // Cache::CreateFromString with a plain capacity (kDontSerialize: not written to the OPTIONS file).
+            ulong capacity = RocksDb.Managed.Options.OptionStrings.ParseUInt64("table_factory.block_cache", value.Trim());
+            options.BlockCache = Cache.BlockCache.CreateLru(checked((long)capacity));
+            return;
         }
+        if (options.GetOption(name) is null) ThrowHelper.InvalidArgument("Unrecognized option: table_factory." + name);
         try
         {
             options.SetOption(name, value, preserveUnknown: false);
@@ -187,6 +184,12 @@ internal sealed partial class DbImpl
             SetTableOption(candidate.TableOptions, kv.Key, kv.Value);
             changed.Add(new KeyValuePair<string, string>("table_factory." + kv.Key, kv.Value));
         }
+        // Objects that are not serialized: the block cache and a filter policy object with the same id.
+        if (!ReferenceEquals(newOptions.TableOptions.BlockCache, current.TableOptions.BlockCache))
+        {
+            candidate.TableOptions.BlockCache = newOptions.TableOptions.BlockCache;
+            changed.Add(new KeyValuePair<string, string>("table_factory.block_cache", newOptions.TableOptions.BlockCache?.ToString() ?? "nullptr"));
+        }
         if (newOptions.PrefixExtractor is not null && !ReferenceEquals(newOptions.PrefixExtractor, current.PrefixExtractor)
             && newOptions.PrefixExtractor.AsString() == current.PrefixExtractor?.AsString())
         {
@@ -219,7 +222,7 @@ internal sealed partial class DbImpl
                 // The table options are replaced, not modified: running flushes and compactions keep the settings they
                 // started with (CloneTableFactoryForOptionsUpdate).
                 live.TableOptions = candidate.TableOptions.Clone();
-                cfd.OnOptionsChanged();
+                cfd.OnOptionsChanged(this);
                 // Derived state (MutableCFOptions::RefreshDerivedOptions, InstallSuperVersionForConfigChange).
                 cfd.MemOptions.WriteBufferSize = (long)Math.Min(live.WriteBufferSize, (ulong)long.MaxValue);
                 cfd.MemOptions.ArenaBlockSize = (int)Math.Min(live.ArenaBlockSize, int.MaxValue / 2);

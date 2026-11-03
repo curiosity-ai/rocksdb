@@ -161,49 +161,52 @@ internal sealed partial class DbImpl
         Identity = Identity with { DbId = dbId };
 
         // ---- column families from the MANIFEST ----
-        lock (_mutex)
+        // VersionSet::Recover reads with Env::IOActivity::kDBOpen (table properties for the version stats, LoadTables):
+        // the reads are timed in FILE_READ_DB_OPEN_MICROS.
+        int openActivity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbOpenMicros);
+        try
         {
-            foreach (ColumnFamilyVersion cf in state.ColumnFamilies.Values)
+            lock (_mutex)
             {
-                ColumnFamilyOptions opts = PrepareCfOptions(descriptors[cf.Name]);
-                ValidateRecoveredColumnFamily(cf, opts);
-                var cfd = new ColumnFamilyData(cf.Id, cf.Name, opts, this) { LogNumber = cf.LogNumber, FullHistoryTsLow = cf.FullHistoryTsLow };
-                var files = new FileMetaData[cf.NumLevels][];
-                for (int l = 0; l < cf.NumLevels; l++)
+                foreach (ColumnFamilyVersion cf in state.ColumnFamilies.Values)
                 {
-                    var list = new List<FileMetaData>(cf.Levels[l]);
-                    files[l] = list.ToArray();
+                    ColumnFamilyOptions opts = PrepareCfOptions(descriptors[cf.Name]);
+                    ValidateRecoveredColumnFamily(cf, opts);
+                    var cfd = new ColumnFamilyData(cf.Id, cf.Name, opts, this) { LogNumber = cf.LogNumber, FullHistoryTsLow = cf.FullHistoryTsLow };
+                    var files = new FileMetaData[cf.NumLevels][];
+                    for (int l = 0; l < cf.NumLevels; l++)
+                    {
+                        var list = new List<FileMetaData>(cf.Levels[l]);
+                        files[l] = list.ToArray();
+                    }
+                    var cursors = new List<CompactCursor>(cf.CompactCursors.Count);
+                    foreach (KeyValuePair<int, byte[]> c in cf.CompactCursors) cursors.Add(new CompactCursor(c.Key, c.Value));
+                    Versions.AddColumnFamily(cfd, files, cf.BlobFiles.Values, cursors, updateStats: !Options.SkipStatsUpdateOnDbOpen);
+                    cfd.RecoverEpochNumbers();
+                    cfd.Mem = cfd.ConstructNewMemtable(state.LastSequence);
+                    InstallSuperVersion(cfd);
+                    RegisterCfForWrite(cfd);
                 }
-                var cursors = new List<CompactCursor>(cf.CompactCursors.Count);
-                foreach (KeyValuePair<int, byte[]> c in cf.CompactCursors) cursors.Add(new CompactCursor(c.Key, c.Value));
-                Versions.AddColumnFamily(cfd, files, cf.BlobFiles.Values, cursors, updateStats: !Options.SkipStatsUpdateOnDbOpen);
-                cfd.RecoverEpochNumbers();
-                cfd.Mem = cfd.ConstructNewMemtable(state.LastSequence);
-                InstallSuperVersion(cfd);
-                RegisterCfForWrite(cfd);
+            }
+            // LoadTables (before anything is written: a failure leaves the MANIFEST untouched).
+            if (!Options.BestEffortsRecovery) LoadTableHandlers(FileNames.DescriptorFileName(DbName, manifestNumber));
+            foreach (ColumnFamilyData cfd in GetColumnFamilies())
+            {
+                VersionStorageInfo s = cfd.Current.Storage;
+                // The FIFO TTL picker needs the newest key time of every L0 file (upstream: max_open_files = -1 pins every
+                // reader at open, LoadTableHandlers); opening the readers here records it in FileMetaData.NewestKeyTime.
+                if (cfd.Options.CompactionStyle == CompactionStyle.Fifo && cfd.Options.Ttl > 0)
+                {
+                    foreach (FileMetaData f in s.LevelFiles(0))
+                    {
+                        using TableReaderLease lease = cfd.TableCache.GetReader(f);
+                    }
+                }
             }
         }
-        // LoadTables: every live table file must exist.
-        foreach (ColumnFamilyData cfd in GetColumnFamilies())
+        finally
         {
-            VersionStorageInfo s = cfd.Current.Storage;
-            for (int l = 0; l < s.NumLevels; l++)
-            {
-                foreach (FileMetaData f in s.LevelFiles(l))
-                {
-                    string p = FileNames.TableFileName(DbPaths, f.FileNumber, f.PathId);
-                    if (!Options.BestEffortsRecovery && !FileSystem.FileExists(p)) ThrowHelper.Corruption("IO error: No such file or directory: While open a file for random read: " + p);
-                }
-            }
-            // The FIFO TTL picker needs the newest key time of every L0 file (upstream: max_open_files = -1 pins every
-            // reader at open, LoadTableHandlers); opening the readers here records it in FileMetaData.NewestKeyTime.
-            if (cfd.Options.CompactionStyle == CompactionStyle.Fifo && cfd.Options.Ttl > 0)
-            {
-                foreach (FileMetaData f in s.LevelFiles(0))
-                {
-                    using TableReaderLease lease = cfd.TableCache.GetReader(f);
-                }
-            }
+            Monitoring.FileReadActivity.Exit(openActivity);
         }
 
         // ---- WALs tracked in the MANIFEST (DBImpl::Recover: WalSet::CheckWals) ----
@@ -267,6 +270,55 @@ internal sealed partial class DbImpl
         StartStatsDump();
         EnableBackgroundCompactions();
         RegisterRecordSeqnoTimeWorker();
+    }
+
+    /// <summary>
+    /// Port of VersionEditHandler::LoadTables / VersionBuilder::LoadTableHandlers for DB::Open: opens the table readers of
+    /// the recovered versions into the table cache: all of them with an unbounded table cache (max_open_files = -1, the
+    /// default), else at most min(16, capacity / 4) (kInitialLoadLimit). Opening a table checks that the file exists,
+    /// that its size matches the MANIFEST, its footer and meta blocks, and (verify_sst_unique_id_in_manifest) its unique
+    /// id, so a missing or truncated table fails the open here with paranoid_checks (the default), before the recovery
+    /// writes a new MANIFEST; without paranoid_checks errors are ignored (and surface when the file is read). Tables not
+    /// loaded at open are checked the same way when first opened. Errors are reported like VersionEditHandler: a missing
+    /// file (PathNotFound) becomes Corruption, and Corruption messages name the MANIFEST.
+    /// </summary>
+    private void LoadTableHandlers(string manifestPath)
+    {
+        TableCacheStore store = SharedTableCache;
+        bool alwaysLoad = store.Capacity == int.MaxValue;
+        // kInitialLoadLimit = 16, capped at a quarter of the table cache.
+        int loadLimit = alwaysLoad ? int.MaxValue : Math.Min(16, store.Capacity / 4);
+        foreach (ColumnFamilyData cfd in GetColumnFamilies())
+        {
+            VersionStorageInfo s = cfd.Current.Storage;
+            for (int l = 0; l < s.NumLevels; l++)
+            {
+                foreach (FileMetaData f in s.LevelFiles(l))
+                {
+                    if (!alwaysLoad && store.Count >= loadLimit) return;
+                    try
+                    {
+                        using TableReaderLease lease = cfd.TableCache.GetReader(f);
+                    }
+                    catch (Exception e) when (e is RocksDbException or IOException or InvalidDataException)
+                    {
+                        if (Options.ParanoidChecks)
+                        {
+                            if (e is not RocksDbException re) throw;
+                            // VersionEditHandler::CheckIterationResult: PathNotFound marks the DB as corrupted.
+                            if (re.SubCode == StatusSubCode.PathNotFound)
+                                throw new RocksDbException(StatusCode.Corruption, "Corruption: " + re.Message + "  The file " + manifestPath + " may be corrupted.", StatusSubCode.None, re);
+                            // VersionEditHandlerBase::Iterate appends the MANIFEST name to Corruption messages.
+                            if (re.Code == StatusCode.Corruption)
+                                throw new RocksDbException(StatusCode.Corruption, re.Message + "  The file " + manifestPath + " may be corrupted.", StatusSubCode.None, re);
+                            throw;
+                        }
+                        LogWarn("LoadTableHandlers: ignoring table file " + f.FileNumber.ToString(CultureInfo.InvariantCulture)
+                            + " that failed to open (paranoid_checks = false): " + e.Message);
+                    }
+                }
+            }
+        }
     }
 
     /// <summary>

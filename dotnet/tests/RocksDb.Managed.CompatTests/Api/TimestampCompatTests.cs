@@ -357,6 +357,34 @@ public sealed unsafe partial class TimestampCompatTests
         }
     }
 
+    /// <summary>
+    /// Subcompactions on a column family with user-defined timestamps (boundaries at the maximum timestamp): the
+    /// compacted DB reads identically in native RocksDB.
+    /// </summary>
+    [TestMethod]
+    public void ManagedUdtSubcompactionsReadIdenticallyInNative()
+    {
+        using var dir = new TempDir("udt-subc");
+        const int Keys = 4000;
+        var stats = new Statistics();
+        var cfo = new ColumnFamilyOptions { Comparator = Comparator.BytewiseWithU64Ts, DisableAutoCompactions = true, TargetFileSizeBase = 32 * 1024 };
+        cfo.TableOptions.FilterPolicy = new BloomFilterPolicy(10);
+        List<string> managedDump;
+        using (RocksDatabase db = RocksDatabase.Open(dir.Path, new DbOptions { CreateIfMissing = true, MaxSubcompactions = 4, Statistics = stats }, cfo))
+        {
+            for (int round = 0; round < 4; round++)
+            {
+                WriteHistory(Keys, (ulong)round * 50, (k, t, v) => db.Put(B(k), Ts(t), B(v)), (k, t) => db.Delete(B(k), Ts(t)));
+                db.Flush();
+            }
+            db.CompactRange();
+            Assert.IsTrue(stats.GetHistogramData(Histogram.NumSubcompactionsScheduled).Max > 1, "split into subcompactions");
+            managedDump = ManagedDump(db, Keys, 0);
+        }
+        using RocksDbSharp.RocksDb native = OpenNative(dir.Path);
+        AssertSameDump(managedDump, NativeDump(native, Keys, 0), "native reading the subcompacted managed DB");
+    }
+
     [TestMethod]
     public void ManagedUdtDbReadsIdenticallyInNative()
     {

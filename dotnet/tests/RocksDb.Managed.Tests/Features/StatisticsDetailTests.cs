@@ -53,6 +53,18 @@ public sealed class StatisticsDetailTests
         Assert.IsNotNull(await db.GetAsync(B("c")));
         Assert.AreEqual(2UL, stats.GetTickerCount(Ticker.GetHitL0));
         Assert.AreEqual(2UL, stats.GetTickerCount(Ticker.GetHitL2AndUp));
+
+        // MultiGet (Version::MultiGetFromSST): per key found in a table file; memtable hits and misses count nothing.
+        using var batch = new MultiGetBatch();
+        foreach (string k in new[] { "a", "b", "c", "m", "zz" }) batch.Add(B(k));
+        db.MultiGet(batch);
+        Assert.AreEqual(3UL, stats.GetTickerCount(Ticker.GetHitL0));
+        Assert.AreEqual(2UL, stats.GetTickerCount(Ticker.GetHitL1));
+        Assert.AreEqual(3UL, stats.GetTickerCount(Ticker.GetHitL2AndUp));
+        await db.MultiGetAsync(null, batch);
+        Assert.AreEqual(4UL, stats.GetTickerCount(Ticker.GetHitL0));
+        Assert.AreEqual(3UL, stats.GetTickerCount(Ticker.GetHitL1));
+        Assert.AreEqual(4UL, stats.GetTickerCount(Ticker.GetHitL2AndUp));
     }
 
     [TestMethod]
@@ -71,6 +83,8 @@ public sealed class StatisticsDetailTests
         stats.Reset();
         using (RocksDatabase db = RocksDatabase.Open(DbPath, o, cfo))
         {
+            // The table is opened at DB::Open (LoadTableHandlers, Env::IOActivity::kDBOpen).
+            Assert.IsTrue(stats.GetHistogramData(Histogram.FileReadDbOpenMicros).Count > 0, "FILE_READ_DB_OPEN_MICROS");
             ulong sstBefore = stats.GetHistogramData(Histogram.SstReadMicros).Count;
             Assert.IsNotNull(db.Get(Key(5)));
             Assert.IsTrue(stats.GetHistogramData(Histogram.FileReadGetMicros).Count > 0);
@@ -92,8 +106,18 @@ public sealed class StatisticsDetailTests
 
             for (int i = 0; i < 200; i++) db.Put(Key(i), Value(i, 1));
             db.Flush();
+            // BuildTable opens the new table to verify it (Env::IOActivity::kFlush).
+            Assert.IsTrue(stats.GetHistogramData(Histogram.FileReadFlushMicros).Count > 0, "FILE_READ_FLUSH_MICROS");
+            // Per-level latency histograms (InternalStats::file_read_latency_, DumpCFFileHistogram).
+            string fileHistogram = db.GetProperty(DbProperties.CfFileHistogram)!;
+            StringAssert.Contains(fileHistogram, "** File Read Latency Histogram By Level [default] **");
+            StringAssert.Contains(fileHistogram, "** Level 0 read latency histogram (micros):\nCount: ");
+            StringAssert.Contains(db.GetProperty(DbProperties.CfStats)!, "** Level 0 read latency histogram (micros):");
+            Assert.IsFalse(db.GetProperty(DbProperties.CfStatsNoFileHistogram)!.Contains("read latency histogram", StringComparison.Ordinal));
             db.CompactRange();
             Assert.IsTrue(stats.GetHistogramData(Histogram.FileReadCompactionMicros).Count > 0);
+            Assert.IsNotNull(db.Get(Key(5)));
+            StringAssert.Contains(db.GetProperty(DbProperties.CfFileHistogram)!, "** Level 6 read latency histogram (micros):");
         }
         // Without statistics nothing is wrapped (and nothing recorded).
         stats.Reset();

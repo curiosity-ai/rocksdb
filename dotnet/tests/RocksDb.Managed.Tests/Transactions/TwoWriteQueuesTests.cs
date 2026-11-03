@@ -339,6 +339,67 @@ public sealed class TwoWriteQueuesTests
     }
 
     /// <summary>
+    /// Regression (CommitsRacingReaders): with two write queues a WriteUnprepared rollback writes the rollback batch on
+    /// the main queue and commits it (with the rolled back batches) by a second write. In between, max_evicted_seq can
+    /// pass the rollback batch; it must still be uncommitted then, like the batches it cancels. It used to skip the
+    /// prepared heap and read as committed, so snapshots saw half of the rollback and compactions kept an older value
+    /// under it (both with sequence number 0: "keys must be added in strictly increasing internal key order").
+    /// </summary>
+    [TestMethod]
+    public async Task WriteUnpreparedRollbackBatchIsUncommittedUntilItsCommit()
+    {
+        MemoryFileSystem fs = NewFs();
+        using TransactionDatabase db = Open(fs, TransactionWritePolicy.WriteUnprepared);
+        WritePreparedTxnDb wp = db.WritePreparedDb!;
+        db.Put(s_wo, null, B("k"), B("v0"));
+        using var paused = new ManualResetEventSlim(false);
+        using var resume = new ManualResetEventSlim(false);
+        TestHooks.Set("WriteUnpreparedTxn::RollbackInternal:BeforeCommit", () =>
+        {
+            paused.Set();
+            resume.Wait();
+        });
+        try
+        {
+            using Transaction t = db.BeginTransaction(s_wo, Unprepared(TransactionWritePolicy.WriteUnprepared));
+            t.SetName("rolled-back");
+            t.Put(B("k"), B("v1"));
+            t.Prepare();
+            SortedDictionary<ulong, int> unprepared = ((WriteUnpreparedTxn)t).UnpreparedSequenceNumbers;
+            ulong data = unprepared.Keys.First();
+            Task rollback = Task.Run(() => t.Rollback());
+            Assert.IsTrue(paused.Wait(TimeSpan.FromSeconds(30)), "rollback did not reach its second write");
+            ulong rollbackSeq = unprepared.Keys.Last();
+            Assert.IsGreaterThan(data, rollbackSeq);
+
+            // A busy commit cache: max_evicted_seq passes the rollback batch before the rollback commits.
+            wp.AdvanceMaxEvictedSeq(wp.MaxEvictedSeq, rollbackSeq);
+            using (Snapshot s = db.Database.GetSnapshot())
+            {
+                bool released = false;
+                Assert.IsFalse(wp.IsInSnapshot(data, s.SequenceNumber, s.MinUncommitted, ref released), "rolled back data");
+                Assert.IsFalse(wp.IsInSnapshot(rollbackSeq, s.SequenceNumber, s.MinUncommitted, ref released), "uncommitted rollback batch");
+                Assert.IsFalse(released);
+                Assert.AreEqual("v0", Get(db, "k", s));
+            }
+
+            resume.Set();
+            await rollback;
+            using (Snapshot s = db.Database.GetSnapshot())
+            {
+                bool released = false;
+                Assert.IsTrue(wp.IsInSnapshot(rollbackSeq, s.SequenceNumber, s.MinUncommitted, ref released), "committed rollback batch");
+                Assert.AreEqual("v0", Get(db, "k", s));
+            }
+        }
+        finally
+        {
+            resume.Set();
+            TestHooks.ClearAll();
+        }
+    }
+
+    /// <summary>
     /// A read without a snapshot. With a tiny commit cache it can fail with TryAgain (max_evicted_seq reached its
     /// sequence: TXN_GET_TRY_AGAIN), like upstream, and keeps failing while nothing is written; it then reads through a
     /// fresh snapshot (GetSnapshot advances the sequence past max_evicted_seq).

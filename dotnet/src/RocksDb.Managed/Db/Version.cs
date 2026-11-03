@@ -44,7 +44,11 @@ internal sealed partial class VersionStorageInfo
         {
             _files[l] = files is not null && l < files.Length ? files[l] : s_empty;
             ulong bytes = 0;
-            foreach (FileMetaData f in _files[l]) bytes += f.FileSize;
+            foreach (FileMetaData f in _files[l])
+            {
+                bytes += f.FileSize;
+                f.LevelHint = l;
+            }
             _levelBytes[l] = bytes;
         }
         // Inherited state (VersionStorageInfo::VersionStorageInfo with ref_vstorage), the edit's compact cursors

@@ -280,6 +280,42 @@ public sealed class DbIterTests
         AssertAt(it, "c", "3");
     }
 
+    /// <summary>
+    /// NextAsync after reverse movement: ReverseToForward's re-seek / skip awaits the inner iterator (no synchronous
+    /// moves), with the same results as the sync direction change.
+    /// </summary>
+    [TestMethod]
+    public async Task DirectionChangesAsync()
+    {
+        var ii = new TestInternalIterator();
+        foreach (string k in new[] { "a", "b", "c", "d" })
+        {
+            ii.AddPut(k, k + "1");
+            ii.AddMerge(k, k + "2");
+        }
+        ii.Finish();
+        using DbIter it = NewDbIter(ii, 100, s_append, null);
+        await it.SeekAsync(B("c"));
+        AssertAt(it, "c", "c1,c2");
+        ii.YieldAsync = true;
+        await it.PrevAsync();
+        AssertAt(it, "b", "b1,b2");
+        int stepsBefore = ii.Steps, asyncBefore = ii.AsyncMoves;
+        await it.NextAsync();
+        AssertAt(it, "c", "c1,c2");
+        Assert.IsTrue(ii.AsyncMoves > asyncBefore);
+        Assert.AreEqual(ii.Steps - stepsBefore, ii.AsyncMoves - asyncBefore, "every inner move of the direction change was async");
+        await it.NextAsync();
+        AssertAt(it, "d", "d1,d2");
+        await it.PrevAsync();
+        AssertAt(it, "c", "c1,c2");
+        await it.PrevAsync();
+        await it.PrevAsync();
+        AssertAt(it, "a", "a1,a2");
+        await it.NextAsync();
+        AssertAt(it, "b", "b1,b2");
+    }
+
     /// <summary>DBIterator11/12: single deletions hide the key.</summary>
     [TestMethod]
     public void SingleDeletion()

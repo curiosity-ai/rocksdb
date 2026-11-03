@@ -42,6 +42,7 @@ internal sealed partial class DbImpl
             }
             Comparator ucmp = cfd.UserComparator;
             batch.BeginRun(cfd.MergeOperator, snapshot, ucmp);
+            batch.ReadFlags = TableReadFlagsExtensions.FromReadOptions(options);
             int n = batch.Count;
             int[] order = batch.Order;
             bool memtableOnly = options?.ReadTier == ReadTier.MemtableTier;
@@ -79,6 +80,7 @@ internal sealed partial class DbImpl
                     if (m == 0) continue;
                     await MultiGetFromFileAsync(cfd, f, batch, m, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
                     SampleMultiGetReads(f, batch, m);
+                    MarkHitLevel(batch, m, 0);
                     pending = RemoveDone(batch, order, pending);
                 }
                 // Sorted levels: one file per key (FindFile on the lookup key); consecutive keys of a file are grouped.
@@ -102,6 +104,7 @@ internal sealed partial class DbImpl
                         if (m == 0) continue;
                         await MultiGetFromFileAsync(cfd, f, batch, m, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
                         SampleMultiGetReads(f, batch, m);
+                        MarkHitLevel(batch, m, level);
                     }
                     pending = RemoveDone(batch, order, pending);
                 }
@@ -123,11 +126,33 @@ internal sealed partial class DbImpl
         }
     }
 
-    /// <summary>MultiGet statistics (DBImpl::MultiGetCommon: calls, keys read/found, bytes read, latency).</summary>
+    /// <summary>Records the level at which the keys batch.Sub[0..count) finished their lookup (hit_file_level).</summary>
+    private static void MarkHitLevel(MultiGetBatch batch, int count, int level)
+    {
+        int[] sub = batch.Sub;
+        for (int i = 0; i < count; i++)
+        {
+            GetContext ctx = batch.Context(sub[i]);
+            if (ctx.Done && ctx.HitLevel < 0) ctx.HitLevel = level;
+        }
+    }
+
+    /// <summary>
+    /// MultiGet statistics (DBImpl::MultiGetCommon: calls, keys read/found, bytes read, latency) and, per key found in a
+    /// table file, GET_HIT_L0 / GET_HIT_L1 / GET_HIT_L2_AND_UP (Version::MultiGetFromSST, kFound).
+    /// </summary>
     private static void RecordMultiGet(Statistics st, MultiGetBatch batch, long startTimestamp)
     {
         ulong bytes = 0;
-        for (int i = 0; i < batch.Count; i++) bytes += (ulong)batch.GetValue(i).Length;
+        for (int i = 0; i < batch.Count; i++)
+        {
+            bytes += (ulong)batch.GetValue(i).Length;
+            GetContext ctx = batch.Context(i);
+            if (ctx.HitLevel >= 0 && ctx.State == GetContext.GetState.Found)
+            {
+                st.RecordTick(ctx.HitLevel switch { 0 => Ticker.GetHitL0, 1 => Ticker.GetHitL1, _ => Ticker.GetHitL2AndUp });
+            }
+        }
         st.RecordTick(Ticker.NumberMultigetCalls);
         st.RecordTick(Ticker.NumberMultigetKeysRead, (ulong)batch.Count);
         st.RecordTick(Ticker.NumberMultigetKeysFound, (ulong)batch.FoundCount);
@@ -182,7 +207,7 @@ internal sealed partial class DbImpl
                     if (cov > ctx.MaxCoveringTombstoneSeq) ctx.MaxCoveringTombstoneSeq = cov;
                 }
             }
-            t = lease.Reader.MultiGetAsync(batch, sub, count, batch.MayMatch, TableReadFlags.None, synchronous, cancellationToken);
+            t = lease.Reader.MultiGetAsync(batch, sub, count, batch.MayMatch, batch.ReadFlags, synchronous, cancellationToken);
             if (t.IsCompleted)
             {
                 lease.Dispose();

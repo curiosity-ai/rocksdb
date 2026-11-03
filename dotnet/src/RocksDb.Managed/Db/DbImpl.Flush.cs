@@ -192,8 +192,17 @@ internal sealed partial class DbImpl
         {
             // BuildTable: "Verify that the table is usable" (table_cache->NewIterator): the new table is opened and stays
             // in the table cache, so lookups that must not do file I/O (KeyMayExist, kBlockCacheTier) can use it.
-            using (cfd.TableCache.GetReader(meta))
+            // (ReadOptions with Env::IOActivity::kFlush: the reads are timed in FILE_READ_FLUSH_MICROS.)
+            int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadFlushMicros);
+            try
             {
+                using (cfd.TableCache.GetReader(meta))
+                {
+                }
+            }
+            finally
+            {
+                Monitoring.FileReadActivity.Exit(activity);
             }
             FileSystem.SyncDirectory(DbPaths[0]);
             RecordFlushBytes(meta.FileSize + BlobBytesWritten(blobBuilder));
@@ -468,6 +477,8 @@ internal sealed partial class DbImpl
         MaxBufferSize = (int)Math.Clamp(Options.WritableFileMaxBufferSize, 64 * 1024, int.MaxValue),
         RateLimiter = Options.RateLimiter,
         IoPriority = priority,
+        Statistics = Options.Statistics,
+        FileChecksumGenFactory = Options.FileChecksumGenFactory,
     };
 
     /// <summary>
@@ -481,6 +492,8 @@ internal sealed partial class DbImpl
     {
         RateLimiter = priority == Env.IoPriority.Total ? null : Options.RateLimiter,
         IoPriority = priority,
+        Statistics = Options.Statistics,
+        FileChecksumGenFactory = Options.FileChecksumGenFactory,
         BytesPerSync = (long)Math.Min(Options.BytesPerSync, long.MaxValue),
         MaxBufferSize = (int)Math.Clamp(o.BlobFileWritableFileMaxBufferSize != 0 ? o.BlobFileWritableFileMaxBufferSize : Options.WritableFileMaxBufferSize,
             64 * 1024, int.MaxValue),

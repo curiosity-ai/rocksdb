@@ -95,6 +95,28 @@ internal sealed class TestInternalIterator : InternalIterator
         _pos--;
         if (_pos < 0) _pos = _data.Count; // invalid
     }
+
+    /// <summary>When set, the async positioning calls yield before moving (they never complete synchronously).</summary>
+    public bool YieldAsync;
+    /// <summary>Async positioning calls that yielded.</summary>
+    public int AsyncMoves;
+
+    public override ValueTask NextAsync(CancellationToken cancellationToken = default) => YieldAsync ? YieldThen(static t => t.Next()) : base.NextAsync(cancellationToken);
+    public override ValueTask PrevAsync(CancellationToken cancellationToken = default) => YieldAsync ? YieldThen(static t => t.Prev()) : base.PrevAsync(cancellationToken);
+
+    public override ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
+    {
+        if (!YieldAsync) return base.SeekAsync(target, cancellationToken);
+        byte[] copy = target.ToArray();
+        return YieldThen(t => t.Seek(copy));
+    }
+
+    private async ValueTask YieldThen(Action<TestInternalIterator> move)
+    {
+        await Task.Yield();
+        AsyncMoves++;
+        move(this);
+    }
 }
 
 /// <summary>Test operator equivalent to StringAppendTESTOperator: ',' join, no partial merge.</summary>

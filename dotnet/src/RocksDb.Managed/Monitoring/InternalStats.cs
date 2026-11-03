@@ -94,10 +94,39 @@ internal sealed class InternalStats
 
     private readonly CfStatsSnapshot _snapshot = new();
 
+    // file_read_latency_: per-level table read latency (micros), filled only when the DB has statistics.
+    private readonly HistogramImpl?[] _fileReadLatency;
+
     public InternalStats(int numLevels)
     {
         _levels = new CompactionLevelStats[Math.Max(1, numLevels)];
         for (int i = 0; i < _levels.Length; i++) _levels[i] = new CompactionLevelStats();
+        _fileReadLatency = new HistogramImpl?[_levels.Length];
+    }
+
+    /// <summary>GetFileReadHist(level): the read latency histogram of tables opened at <paramref name="level"/> (null if unknown).</summary>
+    public HistogramImpl? GetFileReadHist(int level)
+    {
+        if ((uint)level >= (uint)_fileReadLatency.Length) return null;
+        HistogramImpl? h = Volatile.Read(ref _fileReadLatency[level]);
+        if (h is not null) return h;
+        Interlocked.CompareExchange(ref _fileReadLatency[level], new HistogramImpl(), null);
+        return _fileReadLatency[level];
+    }
+
+    /// <summary>Port of InternalStats::DumpCFFileHistogram ("rocksdb.cf-file-histogram", part of "rocksdb.cfstats").</summary>
+    public string DumpFileHistogram(string cfName)
+    {
+        var sb = new StringBuilder();
+        sb.Append("\n** File Read Latency Histogram By Level [").Append(cfName).Append("] **\n");
+        for (int level = 0; level < _fileReadLatency.Length; level++)
+        {
+            HistogramImpl? h = Volatile.Read(ref _fileReadLatency[level]);
+            if (h is null || h.Data().Count == 0) continue;
+            sb.Append("** Level ").Append(level.ToString(CultureInfo.InvariantCulture)).Append(" read latency histogram (micros):\n")
+                .Append(h.ToString()).Append('\n');
+        }
+        return sb.ToString();
     }
 
     public void AddFlush(ulong bytes, long micros)

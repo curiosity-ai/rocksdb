@@ -201,4 +201,55 @@ public sealed class TablePropertiesCollectorTests
         Assert.AreEqual(TableEntryType.TimedPut, TablePropertiesCollectors.GetEntryType(EntryType.ValuePreferredSeqno));
         Assert.AreEqual(TableEntryType.Other, TablePropertiesCollectors.GetEntryType(EntryType.ColumnFamilyValue));
     }
+
+    /// <summary>Port of compact_for_tiering_collector_test.cc (NotEnabled, TieringDisabled, LastLevelFile, CollectorEnabled, TimedPutEntries).</summary>
+    [TestMethod]
+    public void CompactForTieringCollectorPort()
+    {
+        const string Prop = CompactForTieringCollectorFactory.NumEligibleLastLevelEntriesPropertyName;
+        // NotEnabled: ratio 0 creates no collector.
+        Assert.IsNull(new CompactForTieringCollectorFactory(0).CreateTablePropertiesCollector(new TablePropertiesCollectorContext(1, 1, 6, 50)));
+        foreach (double ratio in new[] { 0.0, 0.1, 1.0, 1.5 })
+        {
+            // TieringDisabled and LastLevelFile: no collector.
+            Assert.IsNull(new CompactForTieringCollectorFactory(ratio).CreateTablePropertiesCollector(new TablePropertiesCollectorContext(1, 1, 6, RocksDb.Managed.Db.DbFormat.MaxSequenceNumber)));
+            Assert.IsNull(new CompactForTieringCollectorFactory(ratio).CreateTablePropertiesCollector(new TablePropertiesCollectorContext(1, 5, 6, 50)));
+        }
+        // CollectorEnabled: seqnos 0..99 with threshold 50 -> 50 eligible entries.
+        foreach (double ratio in new[] { 0.1, 0.33333333, 0.5, 1.0, 1.5 })
+        {
+            TablePropertiesCollector c = new CompactForTieringCollectorFactory(ratio).CreateTablePropertiesCollector(new TablePropertiesCollectorContext(1, 1, 6, 50))!;
+            Assert.AreEqual(CompactForTieringCollectorFactory.ClassName, c.Name);
+            for (ulong i = 0; i < 100; i++)
+            {
+                c.AddUserKey("hello"u8, "rocksdb"u8, TableEntryType.Put, i, 0);
+                Assert.IsFalse(c.NeedCompact);
+            }
+            var props = new Dictionary<string, byte[]>();
+            c.Finish(props);
+            Assert.AreEqual("50", System.Text.Encoding.ASCII.GetString(props[Prop]));
+            Assert.AreEqual("50", c.GetReadableProperties()[Prop]);
+            Assert.AreEqual(ratio <= 0.5, c.NeedCompact, "ratio " + ratio);
+        }
+        // TimedPutEntries: the packed preferred seqno decides, not the entry's seqno.
+        TablePropertiesCollector t = new CompactForTieringCollectorFactory(0.1).CreateTablePropertiesCollector(new TablePropertiesCollectorContext(1, 1, 6, 50))!;
+        for (ulong i = 0; i < 100; i++)
+        {
+            byte[] packed = new byte[7 + 8];
+            "rocksdb"u8.CopyTo(packed);
+            RocksDb.Managed.Util.Coding.EncodeFixed64(packed.AsSpan(7), i);
+            t.AddUserKey("hello"u8, packed, TableEntryType.TimedPut, 0, 0);
+        }
+        var tp = new Dictionary<string, byte[]>();
+        t.Finish(tp);
+        Assert.AreEqual("50", System.Text.Encoding.ASCII.GetString(tp[Prop]));
+        Assert.IsTrue(t.NeedCompact);
+        // No eligible entries: no property.
+        TablePropertiesCollector none = new CompactForTieringCollectorFactory(0.5).CreateTablePropertiesCollector(new TablePropertiesCollectorContext(1, 1, 6, 0))!;
+        none.AddUserKey("k"u8, "v"u8, TableEntryType.Put, 10, 0);
+        var np = new Dictionary<string, byte[]>();
+        none.Finish(np);
+        Assert.AreEqual(0, np.Count);
+        Assert.IsFalse(none.NeedCompact);
+    }
 }

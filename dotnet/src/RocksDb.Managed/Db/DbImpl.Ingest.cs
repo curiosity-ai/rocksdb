@@ -8,6 +8,63 @@ namespace RocksDb.Managed.Db;
 /// </summary>
 internal sealed partial class DbImpl
 {
+    /// <summary>
+    /// Port of DBImpl::VerifyChecksumInternal(use_file_checksum = true) and VerifyFullFileChecksum: every live table file
+    /// of every column family, then its blob files, on referenced super versions.
+    /// </summary>
+    public void VerifyFileChecksums()
+    {
+        ThrowIfDisposed();
+        FileChecksumGenFactory? factory = Options.FileChecksumGenFactory;
+        if (factory is null) ThrowHelper.InvalidArgument("Cannot verify file checksum if options.file_checksum_gen_factory is null");
+        foreach (ColumnFamilyData cfd in GetColumnFamilies())
+        {
+            if (cfd.Dropped) continue;
+            SuperVersion sv = GetReferencedSuperVersion(cfd);
+            try
+            {
+                VersionStorageInfo s = sv.Current.Storage;
+                for (int l = 0; l < s.NumLevels; l++)
+                {
+                    foreach (FileMetaData f in s.LevelFiles(l))
+                    {
+                        VerifyFullFileChecksum(factory!, f.FileChecksum, f.FileChecksumFuncName, FileNames.TableFileName(DbPaths, f.FileNumber, f.PathId));
+                    }
+                }
+                foreach (Blob.BlobFileMetaData b in s.BlobFiles)
+                {
+                    VerifyFullFileChecksum(factory!, b.Addition.ChecksumValue, b.Addition.ChecksumMethod, FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber));
+                }
+            }
+            finally
+            {
+                ReturnSuperVersion(sv);
+            }
+        }
+    }
+
+    private void VerifyFullFileChecksum(FileChecksumGenFactory factory, byte[] expected, string funcName, string path)
+    {
+        // kUnknownFileChecksum: nothing to verify.
+        if (expected.Length == 0) return;
+        // Env::IOActivity::kVerifyFileChecksums: FILE_READ_VERIFY_FILE_CHECKSUMS_MICROS.
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadVerifyFileChecksumsMicros);
+        byte[] actual;
+        try
+        {
+            (actual, _) = FileChecksumHelper.GenerateOneFileChecksum(FileSystem, path, factory, funcName, Stats);
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
+        if (!actual.AsSpan().SequenceEqual(expected))
+        {
+            ThrowHelper.Corruption(path + " file checksum mismatch, expecting " + FileChecksumHelper.Hex(expected) + ", but actual "
+                + FileChecksumHelper.Hex(actual));
+        }
+    }
+
     internal ulong ReserveFileNumberForIngestion()
     {
         ulong n = Versions.NewFileNumber();
@@ -20,9 +77,20 @@ internal sealed partial class DbImpl
         lock (_mutex) return cfd.NewEpochNumber();
     }
 
-    public async ValueTask IngestExternalFilesAsync(ColumnFamilyData cfd, IReadOnlyList<string> files, IngestExternalFileOptions options, bool synchronous,
+    public ValueTask IngestExternalFilesAsync(ColumnFamilyData cfd, IReadOnlyList<string> files, IngestExternalFileOptions options, bool synchronous,
         CancellationToken ct)
     {
+        ArgumentNullException.ThrowIfNull(files);
+        ArgumentNullException.ThrowIfNull(options);
+        return IngestExternalFilesAsync(cfd, new IngestExternalFileArg { ExternalFiles = files, Options = options }, synchronous, ct);
+    }
+
+    /// <summary>DBImpl::IngestExternalFiles for one IngestExternalFileArg (files, options, checksums, temperature hint).</summary>
+    public async ValueTask IngestExternalFilesAsync(ColumnFamilyData cfd, IngestExternalFileArg arg, bool synchronous, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(arg);
+        IReadOnlyList<string> files = arg.ExternalFiles;
+        IngestExternalFileOptions options = arg.Options;
         ArgumentNullException.ThrowIfNull(files);
         ArgumentNullException.ThrowIfNull(options);
         ThrowIfDisposed();
@@ -44,7 +112,7 @@ internal sealed partial class DbImpl
         BeginIngestion();
         try
         {
-            await job.PrepareAsync(files, synchronous, ct).ConfigureAwait(false);
+            await job.PrepareAsync(files, arg.FilesChecksums, arg.FilesChecksumFuncNames, arg.FileTemperature, synchronous, ct).ConfigureAwait(false);
             for (int attempt = 0; ; attempt++)
             {
                 // Stop writes to the DB (WriteThread::EnterUnbatched), then check the memtables.

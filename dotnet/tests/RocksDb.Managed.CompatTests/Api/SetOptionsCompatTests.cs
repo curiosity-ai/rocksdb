@@ -122,6 +122,61 @@ public sealed class SetOptionsCompatTests
         Assert.IsTrue(DataBlocks(managedDir.Path) > 20);
     }
 
+    private static readonly KeyValuePair<string, string>[] s_readerTableChanges =
+    [
+        new("table_factory.filter_policy", "bloomfilter:10:false"), new("table_factory.cache_index_and_filter_blocks", "true"),
+        new("table_factory.pin_l0_filter_and_index_blocks_in_cache", "true"), new("table_factory.pin_top_level_index_and_filter", "false"),
+        new("table_factory.index_block_search_type", "kAuto"), new("table_factory.whole_key_filtering", "false"),
+        new("table_factory.block_cache", "8M"), new("table_factory.max_auto_readahead_size", "65536"),
+        new("block_based_table_factory", "{index_type=kTwoLevelIndexSearch;partition_filters=true;prepopulate_block_cache=kFlushOnly}"),
+    ];
+
+    /// <summary>
+    /// Reader-affecting table options (block cache, filter policy, cache/pin settings, index type and search type): native
+    /// accepts every one through SetOptions (TableFactoryParseFn clones the factory), so the managed side does too, and
+    /// both persist the same values.
+    /// </summary>
+    [TestMethod]
+    public void ReaderTableOptionsLikeNative()
+    {
+        using var nativeDir = new TempDir("setrd-n");
+        using var managedDir = new TempDir("setrd-m");
+        var o = new RocksDbSharp.DbOptions().SetCreateIfMissing(true);
+        s_keepAlive.Add(o);
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(o, nativeDir.Path))
+        {
+            db.SetOptions(s_readerTableChanges);
+            Assert.ThrowsExactly<RocksDbSharp.RocksDbException>(() => db.SetOptions([new("table_factory.block_cache", "lots")]));
+            for (int i = 0; i < 2000; i++) db.Put("key" + i.ToString("D6", System.Globalization.CultureInfo.InvariantCulture), new string('v', 20));
+            db.Flush(new RocksDbSharp.FlushOptions());
+            Assert.AreEqual(new string('v', 20), db.Get("key000010"));
+        }
+        using (RocksDatabase db = RocksDatabase.Open(managedDir.Path, new DbOptions { CreateIfMissing = true }))
+        {
+            db.SetOptions(s_readerTableChanges);
+            Assert.AreEqual(StatusCode.InvalidArgument,
+                Assert.ThrowsExactly<RocksDbException>(() => db.SetOptions([new("table_factory.block_cache", "lots")])).Code);
+            for (int i = 0; i < 2000; i++) db.Put(System.Text.Encoding.UTF8.GetBytes("key" + i.ToString("D6", System.Globalization.CultureInfo.InvariantCulture)), System.Text.Encoding.UTF8.GetBytes(new string('v', 20)));
+            db.Flush();
+            Assert.AreEqual(new string('v', 20), System.Text.Encoding.UTF8.GetString(db.Get("key000010"u8)!));
+        }
+        BlockBasedTableOptions nt = Latest(nativeDir.Path).FindColumnFamily("default")!.TableOptions;
+        BlockBasedTableOptions mt = Latest(managedDir.Path).FindColumnFamily("default")!.TableOptions;
+        foreach (string name in new[] { "filter_policy", "cache_index_and_filter_blocks", "pin_l0_filter_and_index_blocks_in_cache",
+                     "pin_top_level_index_and_filter", "index_block_search_type", "whole_key_filtering", "max_auto_readahead_size", "index_type",
+                     "partition_filters", "prepopulate_block_cache" })
+        {
+            Assert.AreEqual(nt.GetOption(name), mt.GetOption(name), name);
+        }
+        // Both flushes built partitioned index + filter tables; each side reads the other's DB.
+        using (RocksDatabase db = RocksDatabase.Open(nativeDir.Path, new DbOptions()))
+            Assert.AreEqual(new string('v', 20), System.Text.Encoding.UTF8.GetString(db.Get("key001999"u8)!));
+        var o2 = new RocksDbSharp.DbOptions();
+        s_keepAlive.Add(o2);
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(o2, managedDir.Path))
+            Assert.AreEqual(new string('v', 20), db.Get("key001999"));
+    }
+
     private static ulong DataBlocks(string dir)
     {
         using SstFile f = SstFile.OpenSingle(dir, RocksDb.Managed.Db.TableFactory.CreateReaderOptions(new ColumnFamilyOptions(),

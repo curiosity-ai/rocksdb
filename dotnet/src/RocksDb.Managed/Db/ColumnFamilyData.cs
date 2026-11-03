@@ -92,11 +92,13 @@ internal sealed class ColumnFamilyData
         // ColumnFamilyData::ValidateOptions / CheckConcurrentWritesSupported (db/column_family.cc).
         if (db.Options.AllowConcurrentMemtableWrite && options.InplaceUpdateSupport)
             ThrowHelper.InvalidArgument("In-place memtable updates (inplace_update_support) is not compatible with concurrent writes (allow_concurrent_memtable_write)");
+        // BlockBasedTableFactory::ValidateOptions (table/block_based/block_based_table_factory.cc).
+        if (options.TableOptions.IndexBlockSearchType == IndexBlockSearchType.Interpolation && ucmp.Kind != ComparatorKind.Bytewise)
+            ThrowHelper.InvalidArgument("Interpolation search requires BytewiseComparator");
         MergeOperator = options.MergeOperator;
         Format = TableFactory.CreateFormatOptions(options.TableOptions);
         OptionsSnapshot = options.Clone();
-        ReaderOptions = TableFactory.CreateReaderOptions(options, Format, db.GetDefaultBlockCache(options.TableOptions), db.Identity.SessionId);
-        if (db.Options.Statistics is { } statistics) ReaderOptions = ReaderOptions with { Statistics = statistics.BlockCacheCounters };
+        _readerOptions = CreateReaderOptions(options, Format, db);
         NumLevels = Math.Max(1, options.NumLevels);
         MemOptions = new MemTableOptions
         {
@@ -105,12 +107,17 @@ internal sealed class ColumnFamilyData
             TrackNewestTimestampSize = options.PersistUserDefinedTimestamps ? 0 : TimestampSize,
         };
         MemOptions.ApplyColumnFamilyOptions(options);
-        TableCache = new TableCache(db.SharedTableCache, db.FileSystem, db.DbPaths, ReaderOptions) { Statistics = db.Options.Statistics };
+        TableCache = new TableCache(db.SharedTableCache, db.FileSystem, db.DbPaths, ReaderOptions)
+        {
+            Statistics = db.Options.Statistics,
+            VerifyUniqueIdInManifest = db.Options.VerifySstUniqueIdInManifest,
+        };
         // Blob files live in cf_paths.front() (the first DB path); readers and the optional blob cache are per CF.
         BlobSource = new Blob.BlobSource(db.FileSystem, db.DbPaths[0], id, options.BlobCache, db.Identity.DbId, db.Identity.SessionId, db.Options.Statistics,
             db.Options.MaxOpenFiles);
         CompactionState = new ColumnFamilyCompactionState(options, Icmp);
         Stats = new InternalStats(NumLevels);
+        TableCache.LevelStats = Stats;
         if (options.EnableBlobDirectWrite && options.EnableBlobFiles && !db.IsReadOnly)
         {
             // DBImpl::MaybeInitBlobDirectWriteColumnFamily.
@@ -227,12 +234,32 @@ internal sealed class ColumnFamilyData
     private ColumnFamilyOptions _optionsSnapshot = null!;
 
     /// <summary>Refreshes the snapshot and the table builder settings after SetOptions changed <see cref="Options"/>. REQUIRES: DB mutex.</summary>
-    internal void OnOptionsChanged()
+    /// <summary>
+    /// Called (under the DB mutex) after SetOptions replaced the options: new tables are built with the new format and
+    /// tables opened from now on use the new reader options (block cache, filter policy, cache/pin settings...); readers
+    /// already in the table cache keep theirs, like upstream's readers keep the cloned table factory they were opened with.
+    /// </summary>
+    internal void OnOptionsChanged(DbImpl db)
     {
         Format = TableFactory.CreateFormatOptions(Options.TableOptions);
         OptionsSnapshot = Options.Clone();
+        TableReaderOptions reader = CreateReaderOptions(Options, Format, db);
+        Volatile.Write(ref _readerOptions, reader);
+        TableCache.ReaderOptions = reader;
     }
-    public TableReaderOptions ReaderOptions { get; }
+
+    private static TableReaderOptions CreateReaderOptions(ColumnFamilyOptions options, TableFormatOptions format, DbImpl db)
+    {
+        TableReaderOptions r = TableFactory.CreateReaderOptions(options, format, db.GetDefaultBlockCache(options.TableOptions), db.Identity.SessionId);
+        if (db.Options.Statistics is { } statistics) r = r with { Statistics = statistics.BlockCacheCounters };
+        if (db.Options.RateLimiter is { } rateLimiter) r = r with { RateLimiter = rateLimiter };
+        return r;
+    }
+
+    private TableReaderOptions _readerOptions;
+
+    /// <summary>Reader options for tables opened now (replaced by SetOptions of reader-affecting table options).</summary>
+    public TableReaderOptions ReaderOptions => Volatile.Read(ref _readerOptions);
     public MemTableOptions MemOptions { get; }
     public TableCache TableCache { get; }
     /// <summary>Blob file readers and the blob cache of this column family (BlobFileCache + BlobSource).</summary>

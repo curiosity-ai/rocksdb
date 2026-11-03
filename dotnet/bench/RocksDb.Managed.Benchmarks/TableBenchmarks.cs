@@ -52,7 +52,7 @@ public class TableBenchmarks
         _cachedReader = BlockBasedTableReader.Open(new MemFile(data), new TableReaderOptions { BlockCache = cache });
         _legacyCachedReader = BlockBasedTableReader.Open(new MemFile(data), new TableReaderOptions { BlockCache = new SimpleBlockCache() });
         _indexIter = new BlockIter();
-        _cachedReader.InitIndexIter(_indexIter, _cachedReader.IndexBlock);
+        _cachedReader.InitIndexIter(_indexIter, _cachedReader.IndexBlock, isPartition: false);
         _uncachedReader = BlockBasedTableReader.Open(new MemFile(data), TableReaderOptions.Default);
         _tableIter = _cachedReader.NewIterator();
         _value = new PooledBufferWriter(256);

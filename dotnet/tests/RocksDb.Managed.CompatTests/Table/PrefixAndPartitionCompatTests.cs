@@ -589,7 +589,10 @@ public sealed class PrefixAndPartitionCompatTests
         var managedResults = new List<List<string>>();
         using (RocksDatabase db = RocksDatabase.Open(dir.Path, new DbOptions { CreateIfMissing = true }, ManagedCfOptions(s)))
         {
-            model = Workload(keys, (k, v) => db.Put(k, v), k => db.Delete(k), () => db.Flush(), () => db.CompactRange());
+            // Force rewrites the bottommost level: a flush thread that runs late (a loaded machine) writes the phase-0
+            // memtables into one table, which CompactRange would otherwise just move down as the only L1+ file.
+            model = Workload(keys, (k, v) => db.Put(k, v), k => db.Delete(k), () => db.Flush(),
+                () => db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null));
             Assert.IsTrue(SortedRunFiles(db.GetProperty) > 1, "L1+ files");
             db.Flush();
             ReadOptions mro = ManagedPrefixRead();

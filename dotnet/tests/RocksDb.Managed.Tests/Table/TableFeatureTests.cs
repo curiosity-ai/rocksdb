@@ -449,7 +449,7 @@ public sealed class TableFeatureTests
         using BlockBasedTableReader r = TableTestUtil.Open(file);
         using (BlockIter idx = new())
         {
-            r.InitIndexIter(idx, r.IndexBlock);
+            r.InitIndexIter(idx, r.IndexBlock, isPartition: false);
             bool padded = false;
             ulong expectedNext = 0;
             for (idx.SeekToFirst(); idx.Valid; idx.Next())
@@ -506,5 +506,165 @@ public sealed class TableFeatureTests
         Assert.IsTrue(copy.SeparateKeyValueInDataBlock);
         Assert.AreEqual(0.25, copy.UniformCvThreshold);
         Assert.AreEqual((ulong)(1 << 20), copy.SuperBlockAlignmentSize);
+    }
+
+    // ------------------------------------------------------------------------------------------- index_block_search_type
+
+    private enum KeyShape { Uniform, Skewed, RandomVarLen, ManyVersions, SharedPrefix }
+
+    /// <summary>Sorted internal keys of the given distribution (unique user keys except <see cref="KeyShape.ManyVersions"/>).</summary>
+    private static List<(byte[] Key, byte[] Value)> SearchTypeEntries(KeyShape shape, Random rnd)
+    {
+        var users = new SortedSet<byte[]>(Comparer<byte[]>.Create(static (a, b) => a.AsSpan().SequenceCompareTo(b)));
+        switch (shape)
+        {
+            case KeyShape.Uniform:
+            case KeyShape.SharedPrefix:
+                for (int i = 0; i < 4000; i++)
+                {
+                    byte[] k = new byte[shape == KeyShape.Uniform ? 8 : 20];
+                    if (shape == KeyShape.SharedPrefix) "common-prefix/"u8.CopyTo(k);
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt64BigEndian(k.AsSpan(k.Length - 8), 5000UL + (ulong)i * 104729);
+                    users.Add(k);
+                }
+                break;
+            case KeyShape.Skewed:
+                for (int i = 0; i < 4000; i++)
+                {
+                    byte[] k = new byte[8];
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt64BigEndian(k, (ulong)i * (ulong)i * (ulong)i * 977);
+                    users.Add(k);
+                }
+                break;
+            case KeyShape.RandomVarLen:
+                while (users.Count < 4000)
+                {
+                    byte[] k = new byte[1 + rnd.Next(12)];
+                    rnd.NextBytes(k);
+                    users.Add(k);
+                }
+                break;
+            case KeyShape.ManyVersions:
+                for (int i = 0; i < 300; i++) users.Add(Encoding.ASCII.GetBytes("mv" + (i * 7).ToString("D6", System.Globalization.CultureInfo.InvariantCulture)));
+                break;
+        }
+        var entries = new List<(byte[], byte[])>();
+        foreach (byte[] u in users)
+        {
+            int versions = shape == KeyShape.ManyVersions ? 1 + rnd.Next(12) : 1;
+            for (int v = versions; v >= 1; v--)
+            {
+                byte[] value = new byte[shape == KeyShape.ManyVersions ? 40 + rnd.Next(80) : rnd.Next(40)];
+                rnd.NextBytes(value);
+                entries.Add((TableTestUtil.IKey(u, (ulong)(100 + v)), value));
+            }
+        }
+        return entries;
+    }
+
+    /// <summary>
+    /// index_block_search_type kInterpolation / kAuto (BlockIter::InterpolationSeekRestartPointIndex, Block::NewIndexIterator):
+    /// every seek and point lookup returns the same result as binary search for uniform, skewed, random variable-length,
+    /// multi-version and shared-prefix keys, through single-level, first-key and partitioned indexes (where the top level
+    /// stays binary like upstream's PartitionIndexReader).
+    /// </summary>
+    [TestMethod]
+    public void IndexSearchTypesMatchBinarySearch()
+    {
+        int seed = Environment.TickCount;
+        var rnd = new Random(seed);
+        foreach (KeyShape shape in Enum.GetValues<KeyShape>())
+        {
+            foreach (IndexType indexType in new[] { IndexType.BinarySearch, IndexType.BinarySearchWithFirstKey, IndexType.TwoLevelIndexSearch })
+            {
+                foreach (int formatVersion in new[] { 5, 8 })
+                {
+                    string ctx = $"seed={seed} shape={shape} index={indexType} fv={formatVersion}";
+                    List<(byte[] Key, byte[] Value)> entries = SearchTypeEntries(shape, rnd);
+                    byte[] file = TableTestUtil.BuildTable(entries, new TableFormatOptions
+                    {
+                        FormatVersion = formatVersion,
+                        BlockSize = 128,
+                        IndexType = indexType,
+                        MetadataBlockSize = 512,
+                        UniformCvThreshold = 0.5,
+                    });
+                    using BlockBasedTableReader binary = TableTestUtil.Open(file);
+                    using BlockBasedTableReader interp = TableTestUtil.Open(file, new TableReaderOptions { IndexBlockSearchType = IndexBlockSearchType.Interpolation });
+                    using BlockBasedTableReader auto = TableTestUtil.Open(file, new TableReaderOptions { IndexBlockSearchType = IndexBlockSearchType.Auto });
+                    using (var top = new BlockIter())
+                    {
+                        interp.InitIndexIter(top, interp.IndexBlock, isPartition: false);
+                        // Partitioned top levels stay binary; fv8 index blocks strip their common prefix (binary as upstream).
+                        bool expectInterpolation = indexType != IndexType.TwoLevelIndexSearch && interp.IndexBlock.CommonPrefixLength == 0;
+                        Assert.AreEqual(expectInterpolation, top.UsesInterpolationSearch, ctx);
+                        auto.InitIndexIter(top, auto.IndexBlock, isPartition: false);
+                        Assert.AreEqual(expectInterpolation && auto.IndexBlock.IsUniform, top.UsesInterpolationSearch, ctx);
+                        if (shape == KeyShape.Uniform && indexType == IndexType.BinarySearch) Assert.IsTrue(auto.IndexBlock.IsUniform, ctx);
+                        if (shape == KeyShape.Skewed && indexType == IndexType.BinarySearch) Assert.IsFalse(auto.IndexBlock.IsUniform, ctx);
+                    }
+
+                    var targets = new List<byte[]> { TableTestUtil.IKey([], DbFormat.MaxSequenceNumber), TableTestUtil.IKey([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], 0) };
+                    for (int i = 0; i < entries.Count; i += 1 + rnd.Next(5))
+                    {
+                        byte[] user = DbFormat.ExtractUserKey(entries[i].Key).ToArray();
+                        targets.Add(TableTestUtil.IKey(user, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek));
+                        targets.Add(TableTestUtil.IKey(user, 101, DbFormat.ValueTypeForSeek));
+                        targets.Add(TableTestUtil.IKey([.. user, 0], DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek));
+                        byte[] shorter = user.AsSpan(0, Math.Max(0, user.Length - 1)).ToArray();
+                        targets.Add(TableTestUtil.IKey(shorter, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek));
+                        byte[] random = new byte[1 + rnd.Next(user.Length + 2)];
+                        rnd.NextBytes(random);
+                        targets.Add(TableTestUtil.IKey(random, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek));
+                    }
+                    using BlockBasedTableIterator bi = binary.NewIterator(), ii = interp.NewIterator(), ai = auto.NewIterator();
+                    using var bv = new PooledBufferWriter();
+                    using var iv = new PooledBufferWriter();
+                    foreach (byte[] t in targets)
+                    {
+                        bi.Seek(t);
+                        ii.Seek(t);
+                        ai.Seek(t);
+                        Assert.AreEqual(bi.Valid, ii.Valid, ctx);
+                        Assert.AreEqual(bi.Valid, ai.Valid, ctx);
+                        if (bi.Valid)
+                        {
+                            Assert.IsTrue(bi.Key.SequenceEqual(ii.Key), ctx + " target " + TableTestUtil.Hex(t));
+                            Assert.IsTrue(bi.Key.SequenceEqual(ai.Key), ctx + " target " + TableTestUtil.Hex(t));
+                        }
+                        bv.Clear();
+                        iv.Clear();
+                        TableGetResult br = binary.Get(t, bv), ir = interp.Get(t, iv);
+                        Assert.AreEqual(br, ir, ctx);
+                        Assert.IsTrue(bv.WrittenSpan.SequenceEqual(iv.WrittenSpan), ctx);
+                    }
+                }
+            }
+        }
+    }
+
+    [TestMethod]
+    public void InterpolationSearchRequiresBytewiseComparator()
+    {
+        RocksDb.Managed.Env.MemoryFileSystem fs = Db.DbTestUtil.NewFs();
+        var cf = new ColumnFamilyOptions { Comparator = Comparator.ReverseBytewise };
+        cf.TableOptions.IndexBlockSearchType = IndexBlockSearchType.Interpolation;
+        RocksDbException ex = Assert.ThrowsExactly<RocksDbException>(() =>
+            RocksDatabase.Open(Db.DbTestUtil.DbPath, Db.DbTestUtil.NewOptions(fs), [new ColumnFamilyDescriptor("default", cf)]).Dispose());
+        Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
+        // kAuto falls back to binary search for other comparators.
+        cf.TableOptions.IndexBlockSearchType = IndexBlockSearchType.Auto;
+        cf.TableOptions.UniformCvThreshold = 2.0;
+        using (RocksDatabase db = RocksDatabase.Open(Db.DbTestUtil.DbPath, Db.DbTestUtil.NewOptions(fs), [new ColumnFamilyDescriptor("default", cf)]))
+        {
+            for (int i = 0; i < 500; i++) db.Put(Db.DbTestUtil.Key(i), "v"u8);
+            db.Flush();
+            for (int i = 0; i < 500; i++) Assert.IsNotNull(db.Get(Db.DbTestUtil.Key(i)));
+        }
+        // Persisted like upstream: index_block_search_type=kAuto.
+        Assert.AreEqual("kAuto", cf.TableOptions.GetOption("index_block_search_type"));
+        var parsed = new BlockBasedTableOptions();
+        parsed.SetOption("index_block_search_type", "kInterpolation", preserveUnknown: false);
+        Assert.AreEqual(IndexBlockSearchType.Interpolation, parsed.IndexBlockSearchType);
     }
 }

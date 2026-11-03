@@ -19,10 +19,13 @@ namespace RocksDb.Managed.Db;
 /// MANIFEST tailing ports ReactiveVersionSet::ReadAndApply / MaybeSwitchManifest (db/version_set.cc) and ManifestTailer
 /// (db/version_edit_handler.h): the reader keeps its position in the MANIFEST and a <see cref="ManifestReplayer"/> keeps
 /// the replayed state; only when CURRENT names a new MANIFEST (the primary rolled it over) is the new one replayed from
-/// its start (it begins with a full snapshot). Unlike ManifestTailer (a VersionEditHandlerPointInTime) the managed
-/// secondary does not check that new table files exist before installing a version; files deleted by the primary while
-/// still referenced by an old secondary version are only readable if their table reader was already open (same
-/// caveat as upstream).
+/// its start (it begins with a full snapshot). Like ManifestTailer (a VersionEditHandlerPointInTime, VerifyFile), the
+/// table and blob files a new version adds are verified (present, MANIFEST size, and with verify_sst_unique_id_in_manifest
+/// opened, which also keeps them readable) before it is installed; when one is missing (the primary already deleted it
+/// after edits not yet visible) the column family keeps its current version until a later catch-up. Upstream would
+/// instead install the latest intermediate point in time whose files all exist; the managed replayer only keeps the
+/// latest state. Files deleted by the primary while still referenced by an old secondary version are only readable if
+/// their table reader is open (same caveat as upstream).
 /// </summary>
 internal sealed partial class DbImpl
 {
@@ -35,6 +38,9 @@ internal sealed partial class DbImpl
     // Secondary: position in the primary's current MANIFEST + replayed state. Guarded by _catchUpLock.
     private SecondaryManifestTailer? _manifestTailer;
     private int _secondaryManifestOpens;
+    // Secondary: a column family's new version was not installed because a file was missing (retried by the next
+    // catch-up even when the MANIFEST did not change). Guarded by _catchUpLock.
+    private bool _secondaryInstallDeferred;
     private long _secondaryManifestRecords;
 
     /// <summary>Secondary diagnostics: MANIFESTs replayed from their start, and MANIFEST records applied in total.</summary>
@@ -305,7 +311,7 @@ internal sealed partial class DbImpl
     {
         _ = synchronous;
         ct.ThrowIfCancellationRequested();
-        if (manifestChanged)
+        if (manifestChanged || _secondaryInstallDeferred)
         {
             var obsolete = new List<ObsoleteTableFile>();
             var obsoleteBlobs = new List<ObsoleteBlobFile>();
@@ -325,6 +331,7 @@ internal sealed partial class DbImpl
     private bool InstallManifestState(RecoveredVersionState state, List<ObsoleteTableFile> obsolete, List<ObsoleteBlobFile> obsoleteBlobs)
     {
         bool resetMemtables = false;
+        _secondaryInstallDeferred = false;
         lock (_mutex)
         {
             foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
@@ -337,6 +344,12 @@ internal sealed partial class DbImpl
                 if (cf is null) continue; // dropped by the primary: keep serving the last state
                 if (!SameFiles(cfd.Current.Storage, cf))
                 {
+                    // ManifestTailer::VerifyFile: install only a version whose new files all exist.
+                    if (!NewFilesPresent(cfd, cf))
+                    {
+                        _secondaryInstallDeferred = true;
+                        continue;
+                    }
                     Versions.AddColumnFamily(cfd, ToFileArrays(cf), cf.BlobFiles.Values); // installs a new current version
                 }
                 if (cf.LogNumber != cfd.LogNumber)
@@ -414,6 +427,60 @@ internal sealed partial class DbImpl
             foreach (ColumnFamilyData cfd in Versions.ColumnFamilies) InstallSuperVersion(cfd);
         }
         NotifySequenceWaiters();
+    }
+
+    /// <summary>
+    /// Port of ManifestTailer::VerifyFile / VersionSet::VerifyFileMetadata for the files <paramref name="cf"/> adds to the
+    /// column family's current version: each table file must exist with the size recorded in the MANIFEST and, with
+    /// verify_sst_unique_id_in_manifest, open through the table cache (unique id checked; the open reader stays cached);
+    /// each new blob file must exist. Missing files are logged.
+    /// </summary>
+    private bool NewFilesPresent(ColumnFamilyData cfd, ColumnFamilyVersion cf)
+    {
+        VersionStorageInfo current = cfd.Current.Storage;
+        var known = new HashSet<ulong>();
+        for (int l = 0; l < current.NumLevels; l++)
+        {
+            foreach (FileMetaData f in current.LevelFiles(l)) known.Add(f.FileNumber);
+        }
+        for (int l = 0; l < cf.NumLevels; l++)
+        {
+            foreach (FileMetaData f in cf.Levels[l])
+            {
+                if (known.Contains(f.FileNumber)) continue;
+                string path = FileNames.TableFileName(DbPaths, f.FileNumber, f.PathId);
+                try
+                {
+                    if (!FileSystem.FileExists(path) || (ulong)FileSystem.GetFileSize(path) != f.FileSize)
+                    {
+                        LogInfo("Secondary: table file " + path + " is missing or has a different size; keeping the current version of [" + cfd.Name + "]");
+                        return false;
+                    }
+                    if (Options.VerifySstUniqueIdInManifest)
+                    {
+                        f.LevelHint = l;
+                        using TableReaderLease lease = cfd.TableCache.GetReader(f);
+                    }
+                }
+                catch (Exception e) when (e is RocksDbException or IOException)
+                {
+                    LogInfo("Secondary: table file " + path + " is not usable (" + e.Message + "); keeping the current version of [" + cfd.Name + "]");
+                    return false;
+                }
+            }
+        }
+        var knownBlobs = new HashSet<ulong>();
+        foreach (Blob.BlobFileMetaData b in current.BlobFiles) knownBlobs.Add(b.BlobFileNumber);
+        foreach (ulong blobNumber in cf.BlobFiles.Keys)
+        {
+            if (knownBlobs.Contains(blobNumber)) continue;
+            if (!FileSystem.FileExists(FileNames.BlobFileName(DbPaths[0], blobNumber)))
+            {
+                LogInfo("Secondary: blob file " + blobNumber + " is missing; keeping the current version of [" + cfd.Name + "]");
+                return false;
+            }
+        }
+        return true;
     }
 
     private static bool SameFiles(VersionStorageInfo current, ColumnFamilyVersion cf)

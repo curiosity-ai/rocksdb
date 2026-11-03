@@ -11,10 +11,13 @@ public enum RateLimiterMode
 }
 
 /// <summary>
-/// Token-bucket rate limiter shared by a DB's background writes. Port of GenericRateLimiter (util/rate_limiter.cc,
+/// Token-bucket rate limiter shared by a DB's background I/O. Port of GenericRateLimiter (util/rate_limiter.cc,
 /// util/rate_limiter_impl.h; NewGenericRateLimiter). Set it as <see cref="DbOptions.RateLimiter"/>: flush outputs are
 /// charged at <see cref="IoPriority.High"/>, compaction outputs at <see cref="IoPriority.Low"/>; WAL and MANIFEST writes
-/// are not limited (IO_TOTAL), like upstream's defaults.
+/// are not limited (IO_TOTAL), like upstream's defaults. With <see cref="RateLimiterMode.ReadsOnly"/> or
+/// <see cref="RateLimiterMode.AllIo"/>, compaction input reads are charged at <see cref="IoPriority.Low"/> (or
+/// <see cref="IoPriority.User"/> while writes are delayed or stopped) and user reads at
+/// <see cref="ReadOptions.RateLimiterPriority"/>.
 /// <para>
 /// Every <c>refillPeriodMicros</c> the bucket is refilled with <c>bytesPerSecond * refillPeriod</c> bytes (unused bytes
 /// do not carry over) and handed to the queued requests: <see cref="IoPriority.User"/> first, then high, mid and low,
@@ -25,7 +28,13 @@ public enum RateLimiterMode
 /// <para>
 /// Synchronization: all state is guarded by <c>_lock</c>. Waiting requests do not hold a thread: the refill that
 /// grants them is driven by a one-shot timer while requests are queued (upstream elects a waiting thread for that
-/// duty), and <see cref="RequestAsync"/> waits asynchronously.
+/// duty), and <see cref="RequestAsync(long, IoPriority, CancellationToken)"/> waits asynchronously.
+/// </para>
+/// <para>
+/// Statistics (when the caller passes them, like WritableFileWriter does for writes): RATE_LIMITER_REQUESTS_* and
+/// RATE_LIMITER_BYTES_* per granted request; RATE_LIMITER_DELAYED_REQUESTS_*, RATE_LIMITER_TOTAL_WAIT_MICROS_* and the
+/// RATE_LIMITER_WAIT_MICROS_* histogram for requests that waited for a refill; NUMBER_RATE_LIMITER_DRAINS per refill
+/// wait.
 /// </para>
 /// </summary>
 public sealed class GenericRateLimiter : IRateLimiter, IDisposable
@@ -37,11 +46,19 @@ public sealed class GenericRateLimiter : IRateLimiter, IDisposable
     {
         public long RequestBytes;
         public readonly long Bytes;
+        public readonly RocksDb.Managed.Statistics? Stats;
+        public readonly RateLimiterOpType OpType;
+        // Set when the request had to wait for a refill (request_delayed / wait_start_us).
+        public long WaitStartMicros = -1;
+        // Bytes of the original request, including any part granted immediately (requested_bytes).
+        public long Requested;
         public readonly TaskCompletionSource Granted = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public Req(long bytes)
+        public Req(long bytes, RocksDb.Managed.Statistics? stats, RateLimiterOpType opType)
         {
             RequestBytes = bytes;
             Bytes = bytes;
+            Stats = stats;
+            OpType = opType;
         }
     }
 
@@ -102,8 +119,11 @@ public sealed class GenericRateLimiter : IRateLimiter, IDisposable
     /// <summary>Whether writes are charged (IsRateLimited(kWrite)).</summary>
     public bool LimitsWrites => Mode != RateLimiterMode.ReadsOnly;
 
-    /// <summary>Whether reads are charged (IsRateLimited(kRead)). The DB does not rate limit reads yet.</summary>
+    /// <summary>Whether reads are charged (IsRateLimited(kRead)).</summary>
     public bool LimitsReads => Mode != RateLimiterMode.WritesOnly;
+
+    /// <inheritdoc/>
+    public bool IsRateLimited(RateLimiterOpType opType) => opType == RateLimiterOpType.Read ? LimitsReads : LimitsWrites;
 
     /// <summary>GetSingleBurstBytes: the configured burst, or the refill amount when 0.</summary>
     public long SingleBurstBytes
@@ -168,32 +188,40 @@ public sealed class GenericRateLimiter : IRateLimiter, IDisposable
         }
     }
 
+    /// <summary>Charges a write (Request(bytes, pri, nullptr, kWrite)).</summary>
+    public void Request(long bytes, IoPriority priority) => Request(bytes, priority, null, RateLimiterOpType.Write);
+
+    /// <summary>Async <see cref="Request(long, IoPriority)"/>.</summary>
+    public ValueTask RequestAsync(long bytes, IoPriority priority, CancellationToken cancellationToken) =>
+        RequestAsync(bytes, priority, null, RateLimiterOpType.Write, cancellationToken);
+
     /// <inheritdoc/>
-    public void Request(long bytes, IoPriority priority)
+    public void Request(long bytes, IoPriority priority, RocksDb.Managed.Statistics? statistics, RateLimiterOpType opType)
     {
-        Task? wait = RequestCore(bytes, priority);
+        Task? wait = RequestCore(bytes, priority, statistics, opType);
         wait?.GetAwaiter().GetResult();
     }
 
     /// <inheritdoc/>
-    public ValueTask RequestAsync(long bytes, IoPriority priority, CancellationToken cancellationToken)
+    public ValueTask RequestAsync(long bytes, IoPriority priority, RocksDb.Managed.Statistics? statistics, RateLimiterOpType opType, CancellationToken cancellationToken)
     {
-        Task? wait = RequestCore(bytes, priority);
+        Task? wait = RequestCore(bytes, priority, statistics, opType);
         if (wait is null) return ValueTask.CompletedTask;
         // A cancelled waiter keeps its place in the queue (its tokens are still consumed when granted).
         return new ValueTask(cancellationToken.CanBeCanceled ? wait.WaitAsync(cancellationToken) : wait);
     }
 
     /// <summary>GenericRateLimiter::RequestImpl. Returns null when granted immediately, else the grant to wait for.</summary>
-    private Task? RequestCore(long bytes, IoPriority priority)
+    private Task? RequestCore(long bytes, IoPriority priority, RocksDb.Managed.Statistics? stats, RateLimiterOpType opType)
     {
-        if (priority >= IoPriority.Total || !LimitsWrites) return null;
+        if (priority >= IoPriority.Total || !IsRateLimited(opType)) return null;
         bytes = Math.Max(0, Math.Min(bytes, SingleBurstBytes));
         lock (_lock)
         {
             if (_autoTuned && NowMicros() - _tunedTimeMicros >= RefillsPerTune * _refillPeriodMicros) TuneLocked();
             if (_stopped) return null;
             _totalRequests[(int)priority]++;
+            long requested = bytes;
             if (_availableBytes > 0)
             {
                 long through = Math.Min(_availableBytes, bytes);
@@ -201,24 +229,49 @@ public sealed class GenericRateLimiter : IRateLimiter, IDisposable
                 _availableBytes -= through;
                 bytes -= through;
             }
-            if (bytes == 0) return null;
-            var r = new Req(bytes);
+            if (bytes == 0)
+            {
+                RecordGranted(stats, opType, requested, -1);
+                return null;
+            }
+            var r = new Req(bytes, stats, opType) { Requested = requested };
             _queues[(int)priority].Enqueue(r);
             long now = NowMicros();
             if (now >= _nextRefillMicros)
             {
                 RefillBytesAndGrantRequestsLocked();
             }
-            if (r.RequestBytes > 0) ScheduleRefillLocked();
+            if (r.RequestBytes > 0)
+            {
+                // request_delayed: the request waits for a future refill.
+                r.WaitStartMicros = now;
+                ScheduleRefillLocked(stats);
+            }
             return r.Granted.Task;
         }
     }
 
-    private void ScheduleRefillLocked()
+    /// <summary>The statistics GenericRateLimiter::RequestImpl records for a granted request.</summary>
+    private static void RecordGranted(RocksDb.Managed.Statistics? stats, RateLimiterOpType opType, long requestedBytes, long waitMicros)
+    {
+        if (stats is null) return;
+        bool read = opType == RateLimiterOpType.Read;
+        stats.RecordTick(read ? Ticker.RateLimiterRequestsRead : Ticker.RateLimiterRequestsWrite);
+        stats.RecordTick(read ? Ticker.RateLimiterBytesRead : Ticker.RateLimiterBytesWrite, (ulong)requestedBytes);
+        if (waitMicros >= 0)
+        {
+            stats.RecordTick(read ? Ticker.RateLimiterDelayedRequestsRead : Ticker.RateLimiterDelayedRequestsWrite);
+            stats.RecordTick(read ? Ticker.RateLimiterTotalWaitMicrosRead : Ticker.RateLimiterTotalWaitMicrosWrite, (ulong)waitMicros);
+            stats.RecordInHistogram(read ? Histogram.RateLimiterWaitMicrosRead : Histogram.RateLimiterWaitMicrosWrite, (ulong)waitMicros);
+        }
+    }
+
+    private void ScheduleRefillLocked(RocksDb.Managed.Statistics? stats)
     {
         if (_timerPending || _stopped) return;
         _timerPending = true;
         _numDrains++; // NUMBER_RATE_LIMITER_DRAINS: a request had to wait for a refill
+        stats?.RecordTick(Ticker.NumberRateLimiterDrains);
         long dueMicros = Math.Max(0, _nextRefillMicros - NowMicros());
         _timer.Change(Math.Max(1, (dueMicros + 999) / 1000), Timeout.Infinite);
     }
@@ -237,7 +290,8 @@ public sealed class GenericRateLimiter : IRateLimiter, IDisposable
             {
                 if (q.Count > 0)
                 {
-                    ScheduleRefillLocked();
+                    // The request at the head waits for another refill (the waiter performing duty (1) upstream).
+                    ScheduleRefillLocked(q.Peek().Stats);
                     break;
                 }
             }
@@ -290,6 +344,7 @@ public sealed class GenericRateLimiter : IRateLimiter, IDisposable
                 next.RequestBytes = 0;
                 _totalBytesThrough[(int)pri] += next.Bytes;
                 queue.Dequeue();
+                RecordGranted(next.Stats, next.OpType, next.Requested, next.WaitStartMicros < 0 ? -1 : Math.Max(0, NowMicros() - next.WaitStartMicros));
                 next.Granted.TrySetResult();
             }
         }

@@ -243,6 +243,94 @@ public sealed class CompactOnDeletionCollectorFactory : TablePropertiesCollector
     }
 }
 
+/// <summary>
+/// Marks files for compaction when enough of their entries are eligible for the last level under the tiering feature
+/// (preclude_last_level_data_seconds): an entry is eligible when its sequence number (a TimedPut's preferred seqno) is
+/// below the compaction's last-level threshold. Files with at least <c>compactionTriggerRatio</c> x entries eligible are
+/// marked, and files with eligible entries record "rocksdb.eligible.last.level.entries". Disabled (no collector) for
+/// ratios &lt;= 0, files created on the last level, and column families without tiering (flushes, ingestion). Port of
+/// CompactForTieringCollectorFactory (utilities/table_properties_collectors/compact_for_tiering_collector.cc); like
+/// upstream, data age stats are not collected.
+/// </summary>
+public sealed class CompactForTieringCollectorFactory : TablePropertiesCollectorFactory
+{
+    /// <summary>kClassName.</summary>
+    public const string ClassName = "CompactForTieringCollector";
+    /// <summary>kNumEligibleLastLevelEntriesPropertyName.</summary>
+    public const string NumEligibleLastLevelEntriesPropertyName = "rocksdb.eligible.last.level.entries";
+
+    private double _compactionTriggerRatio;
+
+    /// <param name="compactionTriggerRatio">Threshold for the ratio of eligible entries to all entries (in (0, 1]).</param>
+    public CompactForTieringCollectorFactory(double compactionTriggerRatio) => CompactionTriggerRatio = compactionTriggerRatio;
+
+    public override string Name => ClassName;
+
+    /// <summary>compaction_trigger_ratio; can be changed while the DB runs (affects files created afterwards).</summary>
+    public double CompactionTriggerRatio
+    {
+        get => Volatile.Read(ref _compactionTriggerRatio);
+        set => Volatile.Write(ref _compactionTriggerRatio, value);
+    }
+
+    public override TablePropertiesCollector? CreateTablePropertiesCollector(TablePropertiesCollectorContext context)
+    {
+        double ratio = CompactionTriggerRatio;
+        if (ratio <= 0 || context.LevelAtCreation == context.NumLevels - 1
+            || context.LastLevelInclusiveMaxSeqnoThreshold == DbFormat.MaxSequenceNumber)
+        {
+            return null;
+        }
+        return new Collector(context.LastLevelInclusiveMaxSeqnoThreshold, ratio);
+    }
+
+    public override string ToString() =>
+        Name + ", compaction trigger ratio:" + CompactionTriggerRatio.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n";
+
+    /// <summary>Port of CompactForTieringCollector.</summary>
+    private sealed class Collector : TablePropertiesCollector
+    {
+        private readonly ulong _lastLevelInclusiveMaxSeqnoThreshold;
+        private readonly double _compactionTriggerRatio;
+        private ulong _lastLevelEligibleEntries;
+        private ulong _totalEntries;
+        private bool _needCompaction;
+
+        public Collector(ulong lastLevelInclusiveMaxSeqnoThreshold, double compactionTriggerRatio)
+        {
+            _lastLevelInclusiveMaxSeqnoThreshold = lastLevelInclusiveMaxSeqnoThreshold;
+            _compactionTriggerRatio = compactionTriggerRatio;
+        }
+
+        public override string Name => ClassName;
+        public override bool NeedCompact => _needCompaction;
+
+        public override void AddUserKey(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, TableEntryType type, ulong sequence, ulong fileSize)
+        {
+            ulong seqForCheck = sequence;
+            // ParsePackedValueForSeqno: a TimedPut value ends with its fixed64 preferred seqno.
+            if (type == TableEntryType.TimedPut && value.Length >= sizeof(ulong)) seqForCheck = Util.Coding.DecodeFixed64(value[^sizeof(ulong)..]);
+            if (seqForCheck < _lastLevelInclusiveMaxSeqnoThreshold) _lastLevelEligibleEntries++;
+            _totalEntries++;
+        }
+
+        public override void Finish(IDictionary<string, byte[]> properties)
+        {
+            if (_lastLevelEligibleEntries >= _compactionTriggerRatio * _totalEntries) _needCompaction = true;
+            if (_lastLevelEligibleEntries > 0)
+            {
+                properties[NumEligibleLastLevelEntriesPropertyName] =
+                    System.Text.Encoding.ASCII.GetBytes(_lastLevelEligibleEntries.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+        }
+
+        public override IReadOnlyDictionary<string, string> GetReadableProperties() => new Dictionary<string, string>
+        {
+            [NumEligibleLastLevelEntriesPropertyName] = _lastLevelEligibleEntries.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        };
+    }
+}
+
 /// <summary>Builder-side driver of the user collectors (UserKeyTablePropertiesCollector + NotifyCollectTableCollectorsOn*, table/meta_blocks.cc).</summary>
 internal sealed class TablePropertiesCollectors
 {

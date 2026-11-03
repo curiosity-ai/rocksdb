@@ -289,6 +289,33 @@ public sealed partial class RocksDatabase
         else t.GetAwaiter().GetResult();
     }
 
+    /// <summary>
+    /// Ingests <see cref="IngestExternalFileArg.ExternalFiles"/> into <paramref name="columnFamily"/> with the per-file
+    /// checksums and temperature hint of <paramref name="arg"/> (DB::IngestExternalFiles with one argument).
+    /// </summary>
+    public ValueTask IngestExternalFilesAsync(ColumnFamily columnFamily, IngestExternalFileArg arg, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(columnFamily);
+        return _db.IngestExternalFilesAsync(columnFamily.Data, arg, synchronous: false, cancellationToken);
+    }
+
+    /// <summary>Synchronous <see cref="IngestExternalFilesAsync(ColumnFamily, IngestExternalFileArg, CancellationToken)"/>.</summary>
+    public void IngestExternalFiles(ColumnFamily columnFamily, IngestExternalFileArg arg)
+    {
+        ArgumentNullException.ThrowIfNull(columnFamily);
+        ValueTask t = _db.IngestExternalFilesAsync(columnFamily.Data, arg, synchronous: true, CancellationToken.None);
+        if (!t.IsCompleted) t.AsTask().GetAwaiter().GetResult();
+        else t.GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Port of DB::VerifyFileChecksums: recomputes the whole-file checksum of every live table and blob file whose
+    /// MANIFEST entry has one and compares it (Corruption "... file checksum mismatch ..." on a difference). Requires
+    /// <see cref="DbOptions.FileChecksumGenFactory"/> (InvalidArgument otherwise). Files without a recorded checksum are
+    /// skipped.
+    /// </summary>
+    public void VerifyFileChecksums() => _db.VerifyFileChecksums();
+
     /// <summary>A writer for SST files to ingest into <paramref name="columnFamily"/> (uses its options and file system).</summary>
     public SstFileWriter CreateSstFileWriter(ColumnFamily columnFamily)
     {

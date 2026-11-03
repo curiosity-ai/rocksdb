@@ -537,6 +537,31 @@ public sealed partial class ColumnFamily
         return _db.CompactFilesAsync(_cfd, options, inputFileNumbers, outputLevel, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
     }
 
+    /// <summary>
+    /// <see cref="CompactFiles(CompactFilesOptions, IEnumerable{ulong}, int)"/> also returning the job's
+    /// <see cref="CompactionJobInfo"/> (DB::CompactFiles' compaction_job_info: inputs, outputs, levels, records, bytes).
+    /// With <see cref="DbOptions.SstFileManager"/>, fails with <see cref="StatusCode.CompactionTooLarge"/> when there is
+    /// not enough room for the compaction.
+    /// </summary>
+    public IReadOnlyList<string> CompactFiles(CompactFilesOptions options, IEnumerable<ulong> inputFileNumbers, int outputLevel, out CompactionJobInfo? jobInfo)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        (List<string> files, CompactionJobInfo? info) = _db.CompactFilesWithJobInfoAsync(_cfd, options, inputFileNumbers, outputLevel, synchronous: true,
+            CancellationToken.None).GetAwaiter().GetResult();
+        jobInfo = info;
+        return files;
+    }
+
+    /// <summary>Async <see cref="CompactFiles(CompactFilesOptions, IEnumerable{ulong}, int, out CompactionJobInfo)"/>.</summary>
+    public async ValueTask<(IReadOnlyList<string> OutputFiles, CompactionJobInfo? JobInfo)> CompactFilesWithJobInfoAsync(CompactFilesOptions options,
+        IEnumerable<ulong> inputFileNumbers, int outputLevel, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        (List<string> files, CompactionJobInfo? info) = await _db.CompactFilesWithJobInfoAsync(_cfd, options, inputFileNumbers, outputLevel, synchronous: false,
+            cancellationToken).ConfigureAwait(false);
+        return (files, info);
+    }
+
     /// <summary>Async <see cref="CompactFiles(IEnumerable{string}, int)"/>: the compaction runs on a background thread.</summary>
     public async ValueTask<IReadOnlyList<string>> CompactFilesAsync(IEnumerable<string> inputFileNames, int outputLevel,
         CancellationToken cancellationToken = default) =>

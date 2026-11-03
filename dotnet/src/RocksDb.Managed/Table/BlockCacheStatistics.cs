@@ -102,4 +102,39 @@ public enum TableReadFlags : byte
     /// that is neither pinned nor in the block cache answers "may match" (upstream returns Incomplete).
     /// </summary>
     BlockCacheTier = 2,
+    /// <summary>
+    /// Bits holding the rate limiter priority the block reads are charged at (ReadOptions::rate_limiter_priority, stored
+    /// as priority + 1; 0 = IO_TOTAL, not charged). Use <see cref="TableReadFlagsExtensions"/> to read and set it.
+    /// </summary>
+    RateLimiterPriorityMask = 0b11100,
+}
+
+/// <summary>Helpers for the packed fields of <see cref="TableReadFlags"/>.</summary>
+public static class TableReadFlagsExtensions
+{
+    private const int PriorityShift = 2;
+
+    /// <summary>The flags with block reads charged to the rate limiter at <paramref name="priority"/> (Total: not charged).</summary>
+    public static TableReadFlags WithRateLimiterPriority(this TableReadFlags flags, Env.IoPriority priority)
+    {
+        flags &= ~TableReadFlags.RateLimiterPriorityMask;
+        return priority >= Env.IoPriority.Total ? flags : flags | (TableReadFlags)(((int)priority + 1) << PriorityShift);
+    }
+
+    /// <summary>The rate limiter priority of block reads (<see cref="Env.IoPriority.Total"/>: not charged).</summary>
+    public static Env.IoPriority RateLimiterPriority(this TableReadFlags flags)
+    {
+        int v = ((int)(flags & TableReadFlags.RateLimiterPriorityMask)) >> PriorityShift;
+        return v == 0 ? Env.IoPriority.Total : (Env.IoPriority)(v - 1);
+    }
+
+    /// <summary>
+    /// The table-level flags of user read options: fill_cache and rate_limiter_priority (null options: the defaults).
+    /// </summary>
+    public static TableReadFlags FromReadOptions(ReadOptions? options)
+    {
+        if (options is null) return TableReadFlags.None;
+        TableReadFlags f = options.FillCache ? TableReadFlags.None : TableReadFlags.DontFillCache;
+        return f.WithRateLimiterPriority(options.RateLimiterPriority);
+    }
 }

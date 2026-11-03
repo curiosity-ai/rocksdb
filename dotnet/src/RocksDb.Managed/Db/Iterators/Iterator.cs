@@ -33,6 +33,9 @@ public sealed class Iterator : IDisposable
     /// <summary>Whether the iterator was disposed (WriteUnprepared transactions track their active iterators).</summary>
     internal bool IsDisposed => _disposed;
 
+    /// <summary>The wrapped DB iterator (tests).</summary>
+    internal DbIter Inner => _it;
+
     /// <summary>Wraps a <see cref="DbIter"/> (ownership transferred). Normally created by <see cref="DbIteratorFactory"/>.</summary>
     public Iterator(DbIter iter)
     {

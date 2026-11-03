@@ -27,7 +27,8 @@ public sealed class FormatFeatureCompatTests
     /// <summary>Equivalent native and managed table settings for one test case.</summary>
     public sealed record Case(string Name, int FormatVersion, int RestartInterval = 16, ulong BlockSize = 1024, bool SeparateKv = false,
         double UniformCv = -1, bool BlockAlign = false, ulong SuperBlockSize = 0, ulong SuperBlockRatio = 128, IndexType IndexType = IndexType.BinarySearch,
-        bool Prefix = false, bool HashDataBlock = false, bool UniformKeys = false, ulong MetadataBlockSize = 512)
+        bool Prefix = false, bool HashDataBlock = false, bool UniformKeys = false, ulong MetadataBlockSize = 512,
+        IndexBlockSearchType SearchType = IndexBlockSearchType.Binary)
     {
         public override string ToString() => Name;
 
@@ -43,6 +44,7 @@ public sealed class FormatFeatureCompatTests
             native.rocksdb_block_based_options_set_super_block_alignment_size(bbto.Handle, (UIntPtr)SuperBlockSize);
             native.rocksdb_block_based_options_set_super_block_alignment_space_overhead_ratio(bbto.Handle, (UIntPtr)SuperBlockRatio);
             if (HashDataBlock) native.rocksdb_block_based_options_set_data_block_index_type(bbto.Handle, 1);
+            native.rocksdb_block_based_options_set_index_block_search_type(bbto.Handle, (int)SearchType);
             s_keepAlive.Add(bbto);
             var cf = new RocksDbSharp.ColumnFamilyOptions();
             cf.SetBlockBasedTableFactory(bbto);
@@ -68,6 +70,7 @@ public sealed class FormatFeatureCompatTests
             t.SuperBlockAlignmentSize = SuperBlockSize;
             t.SuperBlockAlignmentSpaceOverheadRatio = SuperBlockRatio;
             t.DataBlockIndexType = HashDataBlock ? DataBlockIndexType.BinaryAndHash : DataBlockIndexType.BinarySearch;
+            t.IndexBlockSearchType = SearchType;
             return cf;
         }
     }
@@ -81,6 +84,14 @@ public sealed class FormatFeatureCompatTests
         yield return [new Case("uniform fv7", 7, UniformCv: 2.0, UniformKeys: true)];
         yield return [new Case("uniform fv8 partitioned", 8, UniformCv: 2.0, UniformKeys: true, IndexType: IndexType.TwoLevelIndexSearch, MetadataBlockSize: 256)];
         yield return [new Case("uniform fv6 not uniform", 6, UniformCv: 0.05)];
+        // index_block_search_type: interpolation search on the read side (native reads the managed file with it too).
+        yield return [new Case("uniform fv7 kAuto search", 7, UniformCv: 2.0, UniformKeys: true, SearchType: IndexBlockSearchType.Auto)];
+        yield return [new Case("uniform fv8 partitioned kAuto search", 8, UniformCv: 2.0, UniformKeys: true, IndexType: IndexType.TwoLevelIndexSearch,
+            MetadataBlockSize: 256, SearchType: IndexBlockSearchType.Auto)];
+        yield return [new Case("fv7 kInterpolation search skewed keys", 7, SearchType: IndexBlockSearchType.Interpolation)];
+        yield return [new Case("fv5 kInterpolation search first-key index", 5, IndexType: IndexType.BinarySearchWithFirstKey,
+            SearchType: IndexBlockSearchType.Interpolation)];
+        yield return [new Case("uniform fv7 kInterpolation search", 7, UniformKeys: true, SearchType: IndexBlockSearchType.Interpolation)];
         yield return [new Case("block_align fv7", 7, BlockAlign: true)];
         yield return [new Case("block_align fv8 separated", 8, BlockAlign: true, SeparateKv: true)];
         yield return [new Case("super block fv7", 7, SuperBlockSize: 8192, SuperBlockRatio: 4)];
@@ -182,7 +193,7 @@ public sealed class FormatFeatureCompatTests
         try
         {
             using var idx = new BlockIter();
-            sst.Reader.InitIndexIter(idx, top);
+            sst.Reader.InitIndexIter(idx, top, isPartition: false);
             for (idx.SeekToFirst(); idx.Valid; idx.Next())
             {
                 if (sst.Reader.IndexType != IndexType.TwoLevelIndexSearch)
@@ -194,7 +205,7 @@ public sealed class FormatFeatureCompatTests
                 try
                 {
                     using var p = new BlockIter();
-                    sst.Reader.InitIndexIter(p, part);
+                    sst.Reader.InitIndexIter(p, part, isPartition: true);
                     for (p.SeekToFirst(); p.Valid; p.Next()) result.Add(p.BlockHandle);
                 }
                 finally

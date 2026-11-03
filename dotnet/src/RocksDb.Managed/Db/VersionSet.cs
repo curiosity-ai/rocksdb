@@ -221,8 +221,15 @@ internal sealed class VersionSet : IAsyncDisposable
     /// Version::UpdateAccumulatedStats for a version about to be built from <paramref name="files"/>: loads the entry
     /// stats of new files through the table cache (no I/O when the table is open or the stats came from the builder).
     /// </summary>
-    private AccumulatedFileStats LoadFileStats(ColumnFamilyData cfd, FileMetaData[][] files, AccumulatedFileStats accumulated) =>
-        VersionStorageInfo.UpdateAccumulatedStats(files, accumulated, _db.Options.MaxOpenFiles == -1, f => ReadTableProperties(cfd, f));
+    private AccumulatedFileStats LoadFileStats(ColumnFamilyData cfd, FileMetaData[][] files, AccumulatedFileStats accumulated)
+    {
+        // The readers opened here record their reads in the histogram of the file's level (file_read_hist).
+        for (int l = 0; l < files.Length; l++)
+        {
+            foreach (FileMetaData f in files[l]) f.LevelHint = l;
+        }
+        return VersionStorageInfo.UpdateAccumulatedStats(files, accumulated, _db.Options.MaxOpenFiles == -1, f => ReadTableProperties(cfd, f));
+    }
 
     private Table.TableProperties? ReadTableProperties(ColumnFamilyData cfd, FileMetaData f)
     {

@@ -163,4 +163,50 @@ public sealed class SecondaryManifestTailingTests
             try { Directory.Delete(root, recursive: true); } catch (IOException) { }
         }
     }
+    /// <summary>
+    /// ManifestTailer::VerifyFile: a version whose new table file is missing (or has the wrong size) is not installed;
+    /// the column family keeps serving its current version (and its WALs), and the next catch-up after the file appears
+    /// installs it.
+    /// </summary>
+    [TestMethod]
+    public async Task VersionWithMissingTableFileIsNotInstalled()
+    {
+        MemoryFileSystem fs = NewFs();
+        await using RocksDatabase primary = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs), SmallCf(autoCompactions: false));
+        for (int i = 0; i < 50; i++) primary.Put(Key(i), Value(i, 0));
+        await primary.FlushAsync();
+        await using RocksDatabase sec = await RocksDatabase.OpenAsSecondaryAsync(DbPath, "/sec-missing", new DbOptions { FileSystem = fs });
+        Assert.AreEqual(1, sec.GetLiveFilesMetadata().Count);
+
+        for (int i = 50; i < 100; i++) primary.Put(Key(i), Value(i, 1));
+        await primary.FlushAsync();
+        LiveFileMetadata newest = primary.GetLiveFilesMetadata().MaxBy(f => f.FileNumber)!;
+        string path = newest.Directory + newest.Name;
+        byte[] bytes = fs.ReadAllBytes(path);
+        fs.DeleteFile(path);
+        await sec.TryCatchUpWithPrimaryAsync();
+        Assert.AreEqual(1, sec.GetLiveFilesMetadata().Count, "the version adding the missing file is not installed");
+        Assert.AreEqual(S(Value(5, 0)), GetString(sec, S(Key(5))!));
+
+        // A file with the wrong size is not installed either.
+        using (IWritableFile w = fs.CreateWritable(path))
+        {
+            w.Append(bytes.AsSpan(0, bytes.Length - 1));
+            w.Sync();
+        }
+        await sec.TryCatchUpWithPrimaryAsync();
+        Assert.AreEqual(1, sec.GetLiveFilesMetadata().Count);
+
+        // Restored: installed by the next catch-up.
+        fs.DeleteFile(path);
+        using (IWritableFile w = fs.CreateWritable(path))
+        {
+            w.Append(bytes);
+            w.Sync();
+        }
+        for (int i = 0; i < 10; i++) primary.Put(Key(i), Value(i, 2));
+        await sec.TryCatchUpWithPrimaryAsync();
+        Assert.AreEqual(2, sec.GetLiveFilesMetadata().Count);
+        AssertSameContents(primary, sec, 100, "after restore");
+    }
 }

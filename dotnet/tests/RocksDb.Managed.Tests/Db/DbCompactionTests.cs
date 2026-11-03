@@ -655,14 +655,18 @@ public sealed class DbCompactionTests
             using RocksDatabase db2 = RocksDatabase.Open(DbPath, dbo, cfo);
             Assert.AreEqual("0", db2.GetProperty("rocksdb.is-write-stopped"));
             Assert.AreNotEqual("0", db2.GetProperty("rocksdb.actual-delayed-write-rate"));
+            // The clock starts before the first delayed write: the WriteController refills credit for the time that
+            // passes between writes (a descheduled test thread gets that time back as credit), so only the span from
+            // its first refill has a scheduling-independent lower bound: (bytes requested - 1 ms of credit) / rate.
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             var ex = Assert.ThrowsExactly<RocksDbException>(() =>
             {
                 for (int i = 0; i < 100; i++) db2.Put(new WriteOptions { NoSlowdown = true }, Key(100 + i), new byte[4096]);
             });
             Assert.AreEqual(StatusCode.Incomplete, ex.Code);
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            for (int i = 0; i < 10; i++) db2.Put(Key(200 + i), new byte[4096]); // 40KB at 100KB/s
-            Assert.IsTrue(sw.ElapsedMilliseconds >= 150, "elapsed " + sw.ElapsedMilliseconds);
+            for (int i = 0; i < 10; i++) db2.Put(Key(200 + i), new byte[4096]);
+            // 11 delayed writes of 4 KiB (the rejected one is charged too) at 100 KB/s: at least ~440 ms.
+            Assert.IsGreaterThanOrEqualTo(400, sw.ElapsedMilliseconds, "elapsed " + sw.ElapsedMilliseconds);
             gate.Set();
             db2.CompactRange();
             Assert.AreEqual("0", db2.GetProperty("rocksdb.actual-delayed-write-rate"));
@@ -832,6 +836,56 @@ public sealed class DbCompactFilesTests
         Assert.AreEqual(1, Files(db, "default", 0).Count);
         Assert.AreEqual(S(Value(1, 0)), S(db.Get(Key(1))));
     }
+    /// <summary>
+    /// CompactFilesImpl: EnoughRoomForCompaction with an SstFileManager (CompactionTooLarge, COMPACTION_CANCELLED, the
+    /// reservation released) and the compaction_job_info output (BuildCompactionJobInfo).
+    /// </summary>
+    [TestMethod]
+    public async Task CompactFilesChecksRoomAndReturnsJobInfo()
+    {
+        MemoryFileSystem fs = NewFs();
+        using var sfm = new SstFileManager(fs, 0, 0.25, 64UL << 20);
+        var stats = new Statistics();
+        DbOptions o = NewOptions(fs);
+        o.SstFileManager = sfm;
+        o.Statistics = stats;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, ManualCf());
+        for (int round = 0; round < 3; round++)
+        {
+            for (int i = round; i < 300; i += 2) db.Put(Key(i), Value(i, round));
+            db.Flush();
+        }
+        List<LiveFileMetadata> l0 = Files(db, "default", 0);
+        ulong[] inputs = l0.ConvertAll(f => f.FileNumber).ToArray();
+        sfm.SetMaxAllowedSpaceUsage(1);
+        var ex = Assert.ThrowsExactly<RocksDbException>(() => db.DefaultColumnFamily.CompactFiles(new CompactFilesOptions(), inputs, 1, out _));
+        Assert.AreEqual(StatusCode.CompactionTooLarge, ex.Code);
+        Assert.AreEqual(1UL, stats.GetTickerCount(Ticker.CompactionCancelled));
+        Assert.AreEqual(3, Files(db, "default", 0).Count, "nothing compacted");
+        Assert.AreEqual(0UL, sfm.CompactionsReservedSize);
+
+        sfm.SetMaxAllowedSpaceUsage(0);
+        IReadOnlyList<string> outputs = db.DefaultColumnFamily.CompactFiles(new CompactFilesOptions(), inputs, 1, out CompactionJobInfo? info);
+        Assert.IsNotNull(info);
+        Assert.IsNull(info.Status);
+        Assert.AreEqual("default", info.ColumnFamilyName);
+        Assert.AreEqual(0, info.BaseInputLevel);
+        Assert.AreEqual(1, info.OutputLevel);
+        Assert.AreEqual(3, info.InputFiles.Count);
+        CollectionAssert.AreEquivalent(outputs.ToList(), info.OutputFiles.ToList());
+        Assert.AreEqual(CompactionReason.ManualCompaction, info.CompactionReason);
+        Assert.IsTrue(info.NumInputRecords >= 300 && info.NumOutputRecords == 300);
+        Assert.AreEqual(0UL, sfm.CompactionsReservedSize, "reservation released");
+
+        // Async, with a trivial move.
+        List<LiveFileMetadata> l1 = Files(db, "default", 1);
+        (IReadOnlyList<string> moved, CompactionJobInfo? moveInfo) = await db.DefaultColumnFamily.CompactFilesWithJobInfoAsync(
+            new CompactFilesOptions { AllowTrivialMove = true }, l1.ConvertAll(f => f.FileNumber), 3);
+        Assert.IsNotNull(moveInfo);
+        Assert.IsTrue(moveInfo.IsTrivialMove);
+        Assert.AreEqual(3, moveInfo.OutputLevel);
+        Assert.AreEqual(l1.Count, moved.Count);
+    }
 }
 
 /// <summary>Subcompactions (max_subcompactions; CompactionJob::GenSubcompactionBoundaries) on <see cref="MemoryFileSystem"/>.</summary>
@@ -913,6 +967,54 @@ public sealed class DbSubcompactionTests
         int expected = 0;
         foreach (string? v in model) if (v is not null) expected++;
         Assert.AreEqual(expected, count);
+    }
+
+    /// <summary>
+    /// Subcompactions with user-defined timestamps: boundaries carry the maximum timestamp (InitializeReadOptionsAndBoundaries),
+    /// so every version of a user key is compacted by one subcompaction; outputs do not overlap by user key and every
+    /// version stays readable at its timestamp.
+    /// </summary>
+    [TestMethod]
+    public void SubcompactionsWithUserDefinedTimestamps()
+    {
+        MemoryFileSystem fs = NewFs();
+        var stats = new Statistics();
+        DbOptions o = NewOptions(fs);
+        o.MaxSubcompactions = 4;
+        o.Statistics = stats;
+        ColumnFamilyOptions cf = Cf();
+        cf.Comparator = Comparator.BytewiseWithU64Ts;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, cf);
+        const int N = 3000;
+        const int Rounds = 5;
+        for (int round = 0; round < Rounds; round++)
+        {
+            byte[] ts = DbTimestampTests.Ts((ulong)(round + 1) * 10);
+            for (int k = 0; k < N; k++)
+            {
+                if (round == 3 && k % 7 == 0) db.Delete(Key(k), ts);
+                else db.Put(Key(k), ts, Value(k, round));
+            }
+            db.Flush();
+        }
+        db.CompactRange();
+        HistogramData h = stats.GetHistogramData(Histogram.NumSubcompactionsScheduled);
+        Assert.AreEqual(1UL, h.Count, "one compaction split into subcompactions");
+        Assert.IsTrue(h.Max > 1);
+        List<LiveFileMetadata> files = db.GetLiveFilesMetadata();
+        Assert.IsTrue(files.Count > 1);
+        // Sorted, non-overlapping outputs (user keys with timestamps, newest timestamp first).
+        Comparator ucmp = Comparator.BytewiseWithU64Ts;
+        files.Sort((a, b) => ucmp.Compare(a.SmallestKey, b.SmallestKey));
+        for (int i = 1; i < files.Count; i++) Assert.IsTrue(ucmp.Compare(files[i - 1].LargestKey, files[i].SmallestKey) < 0, "overlapping outputs");
+        for (int k = 0; k < N; k += 3)
+        {
+            for (int round = 0; round < Rounds; round++)
+            {
+                string? expected = round == 3 && k % 7 == 0 ? null : S(Value(k, round));
+                Assert.AreEqual(expected, S(db.Get(new ReadOptions { Timestamp = DbTimestampTests.Ts((ulong)(round + 1) * 10) }, Key(k))), "key " + k + " round " + round);
+            }
+        }
     }
 
     [TestMethod]

@@ -33,11 +33,17 @@ internal static class FileReadActivity
 /// <summary>
 /// Timing decorator of a table file (RandomAccessFileReader::Read with its StopWatch, file/random_access_file_reader.cc):
 /// every read records SST_READ_MICROS and the histogram of the current <see cref="FileReadActivity"/>
-/// (FILE_READ_GET_MICROS, FILE_READ_MULTIGET_MICROS, FILE_READ_DB_ITERATOR_MICROS, FILE_READ_COMPACTION_MICROS).
+/// (FILE_READ_GET_MICROS, FILE_READ_MULTIGET_MICROS, FILE_READ_DB_ITERATOR_MICROS, FILE_READ_COMPACTION_MICROS,
+/// FILE_READ_FLUSH_MICROS, FILE_READ_DB_OPEN_MICROS, FILE_READ_VERIFY_FILE_CHECKSUMS_MICROS), plus the per-level
+/// file_read_hist_ of the reader (<paramref name="levelHistogram"/>, may be null).
 /// Only installed when the DB has statistics; records nothing when timers are disabled by the stats level.
 /// </summary>
-internal sealed class StatisticsRandomAccessFile(IRandomAccessFile inner, Statistics statistics) : IRandomAccessFile
+internal sealed class StatisticsRandomAccessFile(IRandomAccessFile inner, Statistics statistics, HistogramImpl? levelHistogram) : IRandomAccessFile
 {
+    public StatisticsRandomAccessFile(IRandomAccessFile inner, Statistics statistics) : this(inner, statistics, null)
+    {
+    }
+
     public long Length => inner.Length;
 
     public int Read(long offset, Span<byte> destination)
@@ -76,6 +82,7 @@ internal sealed class StatisticsRandomAccessFile(IRandomAccessFile inner, Statis
         ulong micros = (ulong)Stopwatch.GetElapsedTime(t0).Ticks / 10;
         statistics.RecordInHistogram(Histogram.SstReadMicros, micros);
         if (activity != 0) statistics.RecordInHistogram((Histogram)(activity - 1), micros);
+        levelHistogram?.Add(micros);
     }
 
     public void Dispose() => inner.Dispose();

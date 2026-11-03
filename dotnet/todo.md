@@ -213,11 +213,11 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [ ] perf check of read-sampling overhead on the next quiet benchmark run (S)
   - [x] subcompactions (index-anchor boundaries, ClippingIterator), compensated size with deletion boost, bottommost files marked for compaction + bottommost_file_compaction_delay, round-robin cursors persisted in MANIFEST (byte-identical to native), CompactFiles API; lock-step parity vs native
   - [x] write-controller: L0 peak re-measured warm = native (7-8); three write-controller deviations fixed
-  - [ ] async compaction input reads (M); subcompactions with UDT (S); CompactFiles disk-space check / CompactionJobInfo (S)
+  - [x] async compaction input readahead; subcompactions with UDT; CompactFiles disk-space check + CompactionJobInfo
 - Transactions
   - [x] two_write_queues (second WAL-only write queue, published vs allocated seqno) + commit-time write batches, all policies; compat vs native both ways
   - [x] steady-state transactions allocate only what the equivalent WriteBatch does (557 B for 4 puts, was 717-1517 B)
-  - [ ] flaky under load? `WriteSlowdownDelaysWrites`, `AutoFlushPreservesGenerationOrderAndOldestBlobFile` (failed once in a loaded full run)
+  - [x] flaky under load `WriteSlowdownDelaysWrites`, `AutoFlushPreservesGenerationOrderAndOldestBlobFile`, `CommitsRacingReaders` (root-caused, see below)
   - [x] range locks (RangeLockManager, escalation, deadlock detection; range_locking_test ported); WAL termination point
 - Wide columns / blob
   - [x] compaction filters on entities (FilterV4 + lazy WideColumnBlobResolver), MultiGetEntity, attribute groups (Put/Get/MultiGet), coalescing + attribute-group iterators, lazy entity reads (GetEntityLazy/MultiGetEntityLazy, ranged blob column reads); compat-tested vs native
@@ -227,23 +227,26 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [x] hash index (kHashSearch) read+write, separated key/value data blocks, uniform index hint, block_align, super_block_alignment (byte-identical vs native SstFileWriter)
   - [x] user table-properties collectors (+ CompactOnDeletionCollector, NeedCompact), memtable prefix bloom, insert hints, in-place updates (+ callback)
   - [x] parallel compression (byte-identical to serial), per-key protection info (WriteBatch/memtable/block; db_kv_checksum_test ported; serial + parallel inserts), managed LZ4 fast encoder (byte-identical to liblz4, 1.4-2.2x faster than K4os)
-  - [ ] is_uniform hint used for index search on read (S); CompactForTieringCollector (S)
+  - [x] index_block_search_type (interpolation / auto on is_uniform), CompactForTieringCollector
   - [x] WriteBatch ColumnFamily overloads, WriteOptions.SyncWrites, MarkWalTerminationPoint, max_total_wal_size, lazy WAL sync on rotation (single-CF, non-2PC; else eager = stronger), reads on dropped CF handles
   - [x] shared per-DB table cache, best_efforts_recovery (matches native on 12 damage cases), WAL tracking in MANIFEST, per-SuperVersion options snapshot, mutable block-based table options
   - [x] auto-resizing HyperClock (growable table, writers pause briefly; upstream is lock-free linear hashing), GenericRateLimiter for flush/compaction writes
-  - [ ] rate limiter on reads + tickers (S); reader-affecting table options via SetOptions (S); normal open of a DB with a truncated SST fails only at first read (S)
+  - [x] rate limiter on reads + tickers; all block-based table options via SetOptions; damaged SST fails at open (same status as native, directory untouched)
 - Write path / iterators perf
   - [x] 4-thread readmissing (per-processor SuperVersion cache, pinned table readers: 0.41->0.31 us sync, 0.62->0.33 async, C 0.43) and sync group-commit wait (AwaitState port), parallel memtable inserts for groups >= 64 entries (loaded-machine numbers; re-measure quietly)
   - [x] reverse iteration pins blocks (readreverse 1 KiB 0.70->0.45 us), async reverse movement, range-deleted runs skipped (scan over 99% deleted 13.8 ms -> 0.16 ms, native 0.66), async compaction input readahead (cold compact 3.05 s -> 1.05 s, native 2.3-2.5)
-  - [ ] merge operands copied in reverse; NextAsync after reverse switches sync; index partitions loaded sync in async paths; user-iterator readahead (S each)
+  - [x] reverse merge operands pinned; async NextAsync direction switch; async index partition loads; user-iterator readahead (auto + ReadaheadSize)
+  - [ ] forward merge operands still copied (S); user-iterator readahead allocates a Task per prefetch on cache miss (S)
   - [ ] pipelined write (L); parallel insert for small groups is slower than serial - investigate (S); non-blocking SyncAsync (S); LZ4 encoder / cold-start JIT (M)
 - Ingestion / TTL / stats
   - [x] ingestion: write_global_seqno (legacy, + reader checksum fallback), ingest_behind, overlapping files in one call, allow_db_generated_files, link_files; TTL iterator; GET_HIT_L*, file-read histograms, cfstats intervals; KeyMayExist without I/O
-  - [ ] ingestion atomic_replace_range / checksum generation / temperatures (S/M); GET_HIT for MultiGet, FILE_READ_FLUSH/DB_OPEN (S)
+  - [x] file checksums (FileChecksumGenCrc32c in MANIFEST, VerifyFileChecksums, ingestion verify), ingestion temperatures; GET_HIT for MultiGet, FILE_READ_FLUSH/DB_OPEN/VERIFY histograms, per-level file-read histograms
+  - [ ] ingestion atomic_replace_range (M); checksums for blob direct-write files + backup/checkpoint use of the checksum factory (S); blob file read latency histogram (S)
 - Replication / secondary
   - [x] secondary tails the MANIFEST incrementally (native<->managed secondary compat), Raft network-partition tests, switchover hold trimmed (probe promote, 3 fewer fsyncs), replication benchmarks (bench/RocksDb.Managed.Replication.Benchmarks)
-  - [ ] secondary: verify table files exist before installing a version (S); re-measure switchover hold on a quiet machine (S)
+  - [x] secondary verifies new files before installing a version
+  - [ ] re-measure switchover hold on a quiet machine (S)
 - Backup / error handling
   - [x] SstFileManager (space limit, trash deletion, compaction space pre-check) + no-space auto recovery; atomic WAL-error recovery flush
-- Flaky under load (investigate): RoundTrip `NativeFirst_Alternating` managed reopen hit LOCK 'Resource temporarily unavailable' once (seed 1518776361 replays clean); `CommitsRacingReaders(WriteUnprepared,True)`; `ManagedDbPrefixSeekReadByNative(...)` (L1+ precondition when an L0 file trivially moves to L6)
+- [x] Flaky-under-load hunt: LOCK release race (OFD lock shared with vforked children; unlock before close, as upstream), compaction zeroing seqnos of versions committed mid-compaction (current_key_committed_), WriteUnprepared rollback with two_write_queues visible before its commit (rollback batch now AddPrepared, deviation worth reporting upstream), compaction snapshot list taken at pick time (now with the job snapshot under the mutex); test-timing fixes for prefix-seek compat, blob auto-flush, write slowdown
 - Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)

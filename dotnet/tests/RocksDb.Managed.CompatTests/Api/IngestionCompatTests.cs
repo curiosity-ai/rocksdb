@@ -268,4 +268,103 @@ public sealed class IngestionCompatTests
             Assert.IsNull(db.Get(Key(9)));
         }
     }
+
+    private static uint Crc32cOfFile(string path) => RocksDb.Managed.Util.Crc32C.Extend(0, File.ReadAllBytes(path));
+
+    private static byte[] BigEndian(uint v)
+    {
+        byte[] b = new byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(b, v);
+        return b;
+    }
+
+    private static string? OptionLine(string dbPath, string name)
+    {
+        string latest = Directory.GetFiles(dbPath, "OPTIONS-*").Order(StringComparer.Ordinal).Last();
+        foreach (string line in File.ReadLines(latest))
+        {
+            string t = line.Trim();
+            if (t.StartsWith(name + "=", StringComparison.Ordinal)) return t[(name.Length + 1)..];
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// file_checksum_gen_factory = FileChecksumGenCrc32cFactory on both sides: checksums of flushed, compacted, blob and
+    /// ingested files are identical (crc32c of the whole file, big endian, "FileChecksumCrc32c"), recorded in the
+    /// MANIFEST, and each implementation's VerifyFileChecksums accepts the other's DB and detects a modified file.
+    /// </summary>
+    [TestMethod]
+    public void FileChecksumsMatchNative()
+    {
+        using var dir = new TempDir("ingest-cksum");
+        // Native writer.
+        string nativeDb = Path.Combine(dir.Path, "native");
+        string nativeSst = WriteSst(Path.Combine(dir.Path, "n.sst"), 1000, 1100, "ing");
+        var nopts = new RocksDbSharp.DbOptions().SetCreateIfMissing(true);
+        NativeExtras.SetCrc32cFileChecksums(nopts);
+        using (var db = RocksDbSharp.RocksDb.Open(nopts, nativeDb))
+        {
+            for (int i = 0; i < 200; i++) db.Put(Key(i), "v" + i);
+            db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            db.IngestExternalFiles([nativeSst], new RocksDbSharp.IngestExternalFileOptions());
+            db.CompactRange(Array.Empty<byte>(), null);
+            Assert.IsNull(NativeExtras.VerifyFileChecksums(db));
+        }
+        string? nativeFactoryOption = OptionLine(nativeDb, "file_checksum_gen_factory");
+        Assert.AreEqual("FileChecksumGenCrc32cFactory", nativeFactoryOption);
+        using (RocksDatabase db = RocksDatabase.Open(nativeDb, new DbOptions { FileChecksumGenFactory = FileChecksumGenCrc32cFactory.Instance }))
+        {
+            foreach (LiveFileMetadata f in db.GetLiveFilesMetadata())
+            {
+                Assert.AreEqual(FileChecksumGenCrc32cFactory.Crc32cFuncName, f.FileChecksumFuncName);
+                CollectionAssert.AreEqual(BigEndian(Crc32cOfFile(f.Directory + f.Name)), f.FileChecksum);
+            }
+            db.VerifyFileChecksums();
+        }
+
+        // Managed writer: flush, blob file, ingestion with a provided (verified) checksum, compaction.
+        string managedDb = Path.Combine(dir.Path, "managed");
+        string managedSst = WriteSst(Path.Combine(dir.Path, "m.sst"), 1000, 1100, "ing");
+        var cf = new ColumnFamilyOptions { EnableBlobFiles = true, MinBlobSize = 64 };
+        using (RocksDatabase db = RocksDatabase.Open(managedDb, new DbOptions { CreateIfMissing = true, FileChecksumGenFactory = FileChecksumGenCrc32cFactory.Instance },
+                   [new ColumnFamilyDescriptor("default", cf)]))
+        {
+            for (int i = 0; i < 200; i++) db.Put(U(Key(i)), U(i % 10 == 0 ? new string('b', 100) : "v" + i));
+            db.Flush();
+            db.IngestExternalFiles(db.DefaultColumnFamily, new IngestExternalFileArg
+            {
+                ExternalFiles = [managedSst],
+                FilesChecksums = [BigEndian(Crc32cOfFile(managedSst))],
+                FilesChecksumFuncNames = [FileChecksumGenCrc32cFactory.Crc32cFuncName],
+            });
+            db.CompactRange(null, null);
+            db.VerifyFileChecksums();
+            foreach (LiveFileMetadata f in db.GetLiveFilesMetadata())
+                CollectionAssert.AreEqual(BigEndian(Crc32cOfFile(f.Directory + f.Name)), f.FileChecksum);
+        }
+        Assert.AreEqual(nativeFactoryOption, OptionLine(managedDb, "file_checksum_gen_factory"));
+        var nopts2 = new RocksDbSharp.DbOptions();
+        NativeExtras.SetCrc32cFileChecksums(nopts2);
+        using (var db = RocksDbSharp.RocksDb.Open(nopts2, managedDb))
+        {
+            Assert.IsNull(NativeExtras.VerifyFileChecksums(db), "native verifies the managed checksums (tables and blob files)");
+            Assert.AreEqual("ing1050", db.Get(Key(1050)));
+        }
+        // A modified byte (same size) in a table file: both report a checksum mismatch.
+        string victim = Directory.GetFiles(managedDb, "*.sst").Order(StringComparer.Ordinal).Last();
+        byte[] bytes = File.ReadAllBytes(victim);
+        bytes[10] ^= 0x5A; // inside the first data block: the table still opens
+        File.WriteAllBytes(victim, bytes);
+        using (var db = RocksDbSharp.RocksDb.Open(nopts2, managedDb))
+        {
+            StringAssert.Contains(NativeExtras.VerifyFileChecksums(db), "file checksum mismatch");
+        }
+        using (RocksDatabase db = RocksDatabase.Open(managedDb, new DbOptions { FileChecksumGenFactory = FileChecksumGenCrc32cFactory.Instance }))
+        {
+            var ex = Assert.ThrowsExactly<RocksDbException>(db.VerifyFileChecksums);
+            Assert.AreEqual(StatusCode.Corruption, ex.Code);
+            StringAssert.Contains(ex.Message, "file checksum mismatch");
+        }
+    }
 }

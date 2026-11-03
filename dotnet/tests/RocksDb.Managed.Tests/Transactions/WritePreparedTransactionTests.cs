@@ -604,6 +604,54 @@ public sealed class WritePreparedTransactionTests
         ]);
     }
 
+    /// <summary>
+    /// Regression (TwoWriteQueuesTests.CommitsRacingReaders, "snapshot changed" to NOT_FOUND): a compaction's snapshot list
+    /// must be taken with its job snapshot, not when the compaction was picked. A snapshot taken in between does not see
+    /// a transaction that commits before the job snapshot; without it in the list, the compaction let the newer value
+    /// hide the version that snapshot reads, and zeroed the newer value's sequence number, so the snapshot read the
+    /// later commit (or nothing once the older versions were gone).
+    /// </summary>
+    [TestMethod]
+    public async Task CompactionSeesSnapshotsTakenAfterItWasPicked()
+    {
+        using TransactionDatabase db = Open(NewFs());
+        db.Database.Put(B("key"), B("v1"));
+        db.Database.Flush();
+        using Transaction txn = db.BeginTransaction(s_wo);
+        txn.SetName("txn");
+        txn.Put(B("key"), B("v2"));
+        txn.Prepare();
+        db.Database.Flush(); // the prepared value goes to a second L0 file
+
+        using var paused = new ManualResetEventSlim(false);
+        using var resume = new ManualResetEventSlim(false);
+        int hits = 0;
+        TestHooks.Set("DBImpl::RunCompaction:Start", () =>
+        {
+            if (Interlocked.Increment(ref hits) != 1) return;
+            paused.Set();
+            resume.Wait();
+        });
+        try
+        {
+            // Picked (and its snapshots listed) now; runs once resumed.
+            Task compaction = Task.Run(() => db.Database.CompactRange());
+            Assert.IsTrue(paused.Wait(TimeSpan.FromSeconds(30)), "compaction did not start");
+            using Snapshot snapshot = db.Database.GetSnapshot();
+            txn.Commit();
+            Assert.AreEqual("v1", Get(db, "key", snapshot));
+            resume.Set();
+            await compaction;
+            Assert.AreEqual("v1", Get(db, "key", snapshot));
+            Assert.AreEqual("v2", Get(db, "key"));
+        }
+        finally
+        {
+            resume.Set();
+            TestHooks.ClearAll();
+        }
+    }
+
     [TestMethod]
     public void CompactionShouldKeepSnapshotVisibleKeys()
     {

@@ -277,6 +277,53 @@ public sealed class SeqnoToTimeMappingTests
         for (int i = 0; i < 100; i++) Assert.AreEqual(S(Value(i, 0)), GetString(db, S(Key(i))!));
     }
 
+    /// <summary>Records the collector contexts it is created with and declines collecting.</summary>
+    private sealed class ContextRecorder : TablePropertiesCollectorFactory
+    {
+        public readonly List<TablePropertiesCollectorContext> Contexts = new();
+        public override string Name => "ContextRecorder";
+
+        public override TablePropertiesCollector? CreateTablePropertiesCollector(TablePropertiesCollectorContext context)
+        {
+            lock (Contexts) Contexts.Add(context);
+            return null;
+        }
+    }
+
+    [TestMethod]
+    public void LastLevelSeqnoThresholdReachesCollectors()
+    {
+        // TableBuilderOptions::last_level_inclusive_max_seqno_threshold: kMaxSequenceNumber for flushes, the compaction's
+        // proximal_after_seqno_ for a per-key-placement compaction (CompactForTieringCollector's input).
+        MemoryFileSystem fs = NewFs();
+        var recorder = new ContextRecorder();
+        ColumnFamilyOptions cf = Tiered(10000);
+        cf.TablePropertiesCollectorFactories.Add(recorder);
+        cf.TablePropertiesCollectorFactories.Add(new CompactForTieringCollectorFactory(0.5));
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cf);
+        for (int i = 0; i < 100; i++) db.Put(Key(i), Value(i, 0));
+        db.Flush();
+        Assert.AreEqual(DbFormat.MaxSequenceNumber, recorder.Contexts[^1].LastLevelInclusiveMaxSeqnoThreshold, "flush");
+        ulong cutoff = 150;
+        CompactionJob.TestPrecludeLastLevelMinSeqno = _ => cutoff;
+        try
+        {
+            db.CompactRange();
+        }
+        finally
+        {
+            CompactionJob.TestPrecludeLastLevelMinSeqno = null;
+        }
+        CollectionAssert.AreEqual(new List<int> { 5, 6 }, Levels(db));
+        Assert.IsTrue(recorder.Contexts.Count >= 3);
+        for (int i = 1; i < recorder.Contexts.Count; i++) Assert.AreEqual(cutoff, recorder.Contexts[i].LastLevelInclusiveMaxSeqnoThreshold);
+        // Proximal-level entries are all newer than the threshold: nothing eligible, nothing marked.
+        foreach (LiveFileMetadata f in db.GetLiveFilesMetadata())
+        {
+            Assert.IsFalse(PropertiesOf(db, f).UserCollectedProperties.ContainsKey(CompactForTieringCollectorFactory.NumEligibleLastLevelEntriesPropertyName));
+        }
+    }
+
     [TestMethod]
     public void WithoutPrecludeEverythingGoesToTheLastLevel()
     {
