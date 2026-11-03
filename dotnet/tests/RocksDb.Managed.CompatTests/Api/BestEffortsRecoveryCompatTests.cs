@@ -150,9 +150,22 @@ public sealed class BestEffortsRecoveryCompatTests
         CopyDir(src, managedCopy);
         CopyDir(src, plainCopy);
 
-        // Without best-efforts recovery the damaged DB does not open.
+        // Without best-efforts recovery the damaged DB does not open (LoadTableHandlers: missing file -> IO error, size
+        // mismatch or bad footer -> Corruption), in either implementation, and the failed open writes no new MANIFEST.
+        string nativePlainCopy = Path.Combine(dir.Path, "native-plain");
+        CopyDir(src, nativePlainCopy);
+        var nex = Assert.ThrowsExactly<RocksDbSharp.RocksDbException>(() => RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions(), nativePlainCopy).Dispose());
+        string[] before = Directory.GetFiles(plainCopy).Select(Path.GetFileName).Order(StringComparer.Ordinal).ToArray()!;
+        string currentBefore = File.ReadAllText(Path.Combine(plainCopy, "CURRENT"));
         var ex = Assert.ThrowsExactly<RocksDbException>(() => DumpManaged(plainCopy, bestEfforts: false));
-        Assert.AreEqual(StatusCode.Corruption, ex.Code, ex.Message);
+        StatusCode expectedCode = nex.Message.StartsWith("IO error", StringComparison.Ordinal) ? StatusCode.IOError : StatusCode.Corruption;
+        StringAssert.Contains(ex.Message, "may be corrupted.");
+        Assert.AreEqual(expectedCode, ex.Code, "managed: " + ex.Message + " native: " + nex.Message);
+        if (damage == Damage.TruncateMiddle) StringAssert.Contains(ex.Message, "Sst file size mismatch");
+        string[] after = Directory.GetFiles(plainCopy).Select(Path.GetFileName).Where(static n => !n!.StartsWith("LOG", StringComparison.Ordinal))
+            .Order(StringComparer.Ordinal).ToArray()!;
+        CollectionAssert.AreEqual(before.Where(static n => !n!.StartsWith("LOG", StringComparison.Ordinal)).ToArray(), after, "no new MANIFEST/WAL/OPTIONS");
+        Assert.AreEqual(currentBefore, File.ReadAllText(Path.Combine(plainCopy, "CURRENT")));
 
         SortedDictionary<string, string> expected = DumpNative(nativeCopy);
         SortedDictionary<string, string> actual = DumpManaged(managedCopy, bestEfforts: true);

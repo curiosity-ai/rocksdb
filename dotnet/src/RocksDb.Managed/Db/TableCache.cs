@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using RocksDb.Managed.Db.Iterators;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Table;
@@ -282,12 +283,35 @@ internal sealed class TableCache : ITableCache, IDisposable
         _ownsStore = true;
     }
 
+    /// <summary>
+    /// The expected_unique_id check of BlockBasedTable::Open: the unique id the MANIFEST recorded for the file must be the
+    /// one derived from the table's db_id / db_session_id / orig_file_number properties (GetSstInternalUniqueId, force).
+    /// </summary>
+    private static void VerifyUniqueId(BlockBasedTableReader reader, FileMetaData file)
+    {
+        TableProperties props = reader.Properties;
+        Cache.OffsetableCacheKey.GetSstInternalUniqueId(props.DbId, props.DbSessionId, props.OriginalFileNumber, out ulong id0, out ulong id1);
+        UniqueId64x2 expected = file.UniqueId;
+        if (expected.Lo != id0 || expected.Hi != id1)
+        {
+            ThrowHelper.Corruption("Mismatch in unique ID on table file " + file.FileNumber.ToString(CultureInfo.InvariantCulture) + ". Expected: {"
+                + expected.Lo.ToString(CultureInfo.InvariantCulture) + "," + expected.Hi.ToString(CultureInfo.InvariantCulture) + "} Actual: {"
+                + id0.ToString(CultureInfo.InvariantCulture) + "," + id1.ToString(CultureInfo.InvariantCulture) + "}");
+        }
+    }
+
     /// <summary>Options for readers opened from now on (SetOptions replaces them; open readers keep theirs).</summary>
     internal TableReaderOptions ReaderOptions
     {
         get => Volatile.Read(ref _readerOptions);
         set => Volatile.Write(ref _readerOptions, value);
     }
+
+    /// <summary>
+    /// DBOptions::verify_sst_unique_id_in_manifest: opening a table whose MANIFEST entry carries a unique id fails with
+    /// Corruption when the id derived from the file's properties differs (BlockBasedTable::Open with expected_unique_id).
+    /// </summary>
+    internal bool VerifyUniqueIdInManifest { get; set; }
 
     /// <summary>When set (DBOptions::statistics), table file reads are timed (SST_READ_MICROS, FILE_READ_*_MICROS).</summary>
     internal Statistics? Statistics { get; set; }
@@ -391,6 +415,12 @@ internal sealed class TableCache : ITableCache, IDisposable
         BlockBasedTableReader reader;
         try
         {
+            // ReadFooterFromFile: the size recorded in the MANIFEST (FileDescriptor::file_size) must match the file.
+            if (file.FileSize != 0 && (ulong)f.Length != file.FileSize)
+            {
+                ThrowHelper.Corruption("Sst file size mismatch between expected " + file.FileSize.ToString(CultureInfo.InvariantCulture)
+                    + " and file system " + f.Length.ToString(CultureInfo.InvariantCulture) + " sstable: " + path);
+            }
             TableReaderOptions opts = ReaderOptions;
             if (file.LargestSeqno != opts.LargestSeqno || file.FileNumber != opts.FileNumber)
                 opts = opts with { LargestSeqno = file.LargestSeqno, FileNumber = file.FileNumber };
@@ -400,6 +430,18 @@ internal sealed class TableCache : ITableCache, IDisposable
         {
             f.Dispose();
             throw;
+        }
+        if (VerifyUniqueIdInManifest && file.UniqueId != UniqueId64x2.Null)
+        {
+            try
+            {
+                VerifyUniqueId(reader, file);
+            }
+            catch
+            {
+                reader.Dispose();
+                throw;
+            }
         }
         h.Reader = reader;
         // FileMetaData::TryGetNewestKeyTime reads the pinned reader's properties; remember it for the FIFO TTL picker.
