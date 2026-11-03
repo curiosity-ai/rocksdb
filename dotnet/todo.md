@@ -211,9 +211,9 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - Compaction
   - [x] read-triggered compaction (read sampling), periodic compaction trigger, reduce_file_locking (bottom-priority pool), preclude_last_level_data_seconds (seqno-to-time mapping, per-key placement), CompactRange partition-straddle; lock-step/compat vs native
   - [ ] perf check of read-sampling overhead on the next quiet benchmark run (S)
-  - [ ] subcompactions (L); async compaction input reads (M); compensated size with point-deletion boost (M)
-  - [ ] bottommost files marked for compaction (+ by preserve boundary) (S/M); bottommost_file_compaction_delay (S); persist round-robin cursors to MANIFEST (S); CompactFiles API (M)
-  - [ ] write-controller pacing parity (L0 pile-up under free-running load) (M)
+  - [x] subcompactions (index-anchor boundaries, ClippingIterator), compensated size with deletion boost, bottommost files marked for compaction + bottommost_file_compaction_delay, round-robin cursors persisted in MANIFEST (byte-identical to native), CompactFiles API; lock-step parity vs native
+  - [x] write-controller: L0 peak re-measured warm = native (7-8); three write-controller deviations fixed
+  - [ ] async compaction input reads (M); subcompactions with UDT (S); CompactFiles disk-space check / CompactionJobInfo (S)
 - Transactions
   - [x] two_write_queues (second WAL-only write queue, published vs allocated seqno) + commit-time write batches, all policies; compat vs native both ways
   - [x] steady-state transactions allocate only what the equivalent WriteBatch does (557 B for 4 puts, was 717-1517 B)
