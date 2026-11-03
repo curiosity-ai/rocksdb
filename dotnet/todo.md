@@ -210,7 +210,7 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 
 - Compaction
   - [x] read-triggered compaction (read sampling), periodic compaction trigger, reduce_file_locking (bottom-priority pool), preclude_last_level_data_seconds (seqno-to-time mapping, per-key placement), CompactRange partition-straddle; lock-step/compat vs native
-  - [ ] perf check of read-sampling overhead on the next quiet benchmark run (S)
+  - [x] read-sampling overhead checked on the quiet final run (one thread-local random step per Get; no slowdown beyond noise)
   - [x] subcompactions (index-anchor boundaries, ClippingIterator), compensated size with deletion boost, bottommost files marked for compaction + bottommost_file_compaction_delay, round-robin cursors persisted in MANIFEST (byte-identical to native), CompactFiles API; lock-step parity vs native
   - [x] write-controller: L0 peak re-measured warm = native (7-8); three write-controller deviations fixed
   - [x] async compaction input readahead; subcompactions with UDT; CompactFiles disk-space check + CompactionJobInfo
