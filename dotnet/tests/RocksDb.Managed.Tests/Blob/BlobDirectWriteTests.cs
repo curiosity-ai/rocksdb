@@ -335,7 +335,13 @@ public sealed class BlobDirectWriteTests
         cf.WriteBufferSize = 64 << 10;
         cf.MaxWriteBufferNumber = 6;
         using RocksDatabase db = Open(fs, cf);
-        for (int i = 0; i < 2000; i++) db.Put(Key(i), B(new string((char)('a' + i % 26), 120)));
+        for (int i = 0; i < 2000; i++)
+        {
+            db.Put(Key(i), B(new string((char)('a' + i % 26), 120)));
+            // Let every auto flush finish before the next memtable fills up: a flush job picks all immutable memtables,
+            // so a late flush thread (a loaded machine) would otherwise write several memtables into one table.
+            if (IntProperty(db, DbProperties.NumImmutableMemTable) > 0) db.WaitForCompact();
+        }
         db.Flush();
         db.WaitForCompact();
         VersionStorageInfo vs = db.DefaultColumnFamily.Data.Current.Storage;
