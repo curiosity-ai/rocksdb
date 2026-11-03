@@ -1001,7 +1001,8 @@ Format-level deviations (the output is always readable by native RocksDB):
 
 Not ported yet (being implemented; tracked in [todo.md](todo.md)):
 
-- PlainTable and CuckooTable SST formats, and tables that require a user-defined index (detected and rejected).
+- Ingesting PlainTable / CuckooTable external files, and the `trie_index` user-defined index (native trie-index files
+  are read through their standard index).
 - Secondary caches (CompressedSecondaryCache, TieredCache), the persistent cache, `WriteBufferManager` and `SimCache`.
 - Column family export / import, remote compaction (`CompactionService`, `OpenAndCompact`).
 - `GetMergeOperands`, `PromoteL0`, `SuggestCompactRange`, `LockWAL` / `UnlockWAL`, `DisableManualCompaction`,
