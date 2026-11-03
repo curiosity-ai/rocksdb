@@ -1328,7 +1328,7 @@ now):
   - Compaction-heavy `fillrandom` / `overwrite` 77 / 119 -> 4.8 / 10.4 B/op (fix 3).
   - `fillsync` 206-1590 -> 2-71 B/op, from the runner no longer counting its histograms.
   - `flush` 0.04-0.25 -> 0.05-0.55 MB per flush, with the increase in the 100 B configurations. Not investigated;
-    small next to the 62-71 ms flush.
+    small next to the 62-71 ms flush. Explained since (see "Definitive-run follow-ups").
 - **Got worse, within the noise**:
   - 4-thread `readmissing` with 100 B values: 0.61x -> 0.85x (no compression) and 0.59x -> 0.80x (LZ4). Its rows
     have CVs of 15-25%, and the ranges of the old and new runs overlap.
@@ -1361,6 +1361,86 @@ BenchmarkDotNet (`2026-11-03-definitive-bdn.md`, default job): managed / rocksdb
 the block cache is 0.58x, Seek + 10 / 100 Next 0.24x / 0.21x, and MultiGet(16) 0.65x. Nothing allocates (1 B per Put,
 26 B per 100-entry batch). Async over sync costs -5% to +17%, with TryGet the highest.
 
+## Definitive-run follow-ups: 4-thread recheck, flush allocations, write-stall install (2026-11-03)
+
+**1. 4-thread `readmissing` / `fillrandom` with 100 B values: noise, not a regression.** The definitive run showed
+`readmissing` at 0.85x / 0.80x of C (none / LZ4; previously 0.61x / 0.59x) and `fillrandom` without compression at
+0.98x (previously 0.82x). Interleaved A/B on the quiet VM (load 2-4 from the runs themselves), `nice -n -15`, 7
+repetitions, each repetition c-native, `old` = `79d3c6b` (the tree of the previous run, before the regression fixes)
+and `new` = `29bd2ec`, sync and async in one process each, benchmarks `fillseq,fillrandom,overwrite,flush,readrandom,readmissing`,
+300k x 100 B, 4 threads, warm-up on. Medians, ratio to C, min-max:
+
+| µs/op | C | old | new | old async | new async |
+|---|---:|---:|---:|---:|---:|
+| fillrandom, none | 4.68 | 3.99 (0.85x) | 3.88 (0.83x) | 4.19 (0.89x) | 4.04 (0.86x) |
+| fillrandom, LZ4 | 4.85 | 3.75 (0.77x) | 3.85 (0.79x) | 4.00 (0.83x) | 4.28 (0.88x) |
+| readmissing, none | 0.194 | 0.188 (0.97x) [0.12-0.23] | 0.160 (0.83x) [0.11-0.17] | 0.197 (1.02x) | 0.178 (0.92x) |
+| readmissing, LZ4 | 0.222 | 0.183 (0.83x) [0.15-0.21] | 0.163 (0.73x) [0.09-0.18] | 0.189 (0.85x) | 0.203 (0.91x) |
+| flush, none (ms) | 84.8 | 93.6 (1.10x) | 51.2 (0.60x) | 100.7 (1.19x) | 54.9 (0.65x) |
+| flush, LZ4 (ms) | 83.2 | 101.3 (1.22x) | 58.3 (0.70x) | 101.3 (1.22x) | 58.9 (0.71x) |
+
+Per repetition, new / old: `fillrandom` 0.97x / 1.02x (sync, none / LZ4) and 0.96x / 1.06x (async), `readmissing`
+0.81x / 0.85x (sync) and 0.97x / 1.00x (async), with single repetitions from 0.45x to 1.53x. `readmissing` is ~0.2
+µs/op (a memtable miss and one bloom probe per file), so a context switch in a 4-thread run moves it by 30-50%. A
+second A/B (4 repetitions, new vs. the final tree of this section) gave `readmissing` 0.73-0.77x (async 0.77-0.89x) and `fillrandom`
+0.86-0.90x of C for both trees. None of the code since `79d3c6b` is on these paths (the readahead changes are iterator /
+compaction only, `MemtableInsertParallelism` is checked only for a lone writer with the option set), and the
+`readmissing` / `fillrandom` cells of the definitive run were inside the noise of their rows.
+
+**2. Flush allocations (0.04-0.25 -> 0.05-0.55 MB per flush).** Bimodal in every tree: the measured `flush` of
+300k x 100 B with 4 threads allocated ~40 / ~80 KB or ~260 / ~300 KB (none / LZ4) in `29bd2ec`, 40-97 / 170-186 KB in
+`79d3c6b`, with no change of what is allocated. `DBBENCH_ALLOC_TYPES=1` and `dotnet-trace` (GC AllocationTick with
+stacks, the window of the last flush): the large mode is `ArrayPool<T>.Shared` misses in the table builder (the index
+block buffer of `BlockBuilder` and its restart `uint[]` growing to 128-256 KiB, the full filter output, the
+compressed-block buffer), the rest is the new table reader's index and filter blocks (`BlockFetcher.ReadBlock`,
+`ReadRawPayload`), i.e. memory the reader keeps. `ArrayPool.Shared` keeps a returned array in the returning thread's
+local slot first, and flushes and compactions run on whichever pool / background thread is free, so whether the next
+builder finds the arrays depends on the thread (the same effect that made `FilterEntryPool` and the builder's staging
+pool necessary). The table builders' growable buffers now come from `TableBuilderBuffers` (lock-based
+`ArrayPool.Create` instances, not trimmed): BlockBuilder contents and restarts, the full filter, the compressed-block
+buffer and the output staging buffer. n = 4-5 per side:
+
+| | new (`29bd2ec`) | this change |
+|---|---:|---:|
+| `flush` alloc, 300k x 100 B, 4 threads, none | 39-262 KB | 170-174 KB |
+| `flush` alloc, same, LZ4 | 80-302 KB | 211-229 KB |
+| `compact` alloc (300k x 100 B) | 1.06-2.16 MB | 0.10-1.15 MB |
+| compaction-heavy `fillrandom` / `overwrite` (500k x 100 B, 4 MiB memtables, n = 3) | 4.9-6.0 / 9.9-10.8 B/op | 4.1-4.4 / 8.7-10.1 B/op |
+
+What is left in the flush window is the new table reader's index and filter blocks. Previously they could reuse the
+arrays the builder had just returned to `ArrayPool.Shared` on the same thread (the 40 KB mode); now the builder's
+arrays go back to their own pool, so the reader allocates its blocks unless an earlier reader's are free. Over
+sustained writes (the compaction-heavy fills) the total went down; a single flush is no longer bimodal. Flush and fill
+times are unchanged (`flush` 0.68-0.79x of C in the second A/B against 0.65-0.81x).
+
+**3. `WriteSlowdownDelaysWrites` (rate 73399 = 102400 x 0.8^3 x 1.4 where 0 was expected).** A temporary trace of
+every write-stall recalculation (thread, condition, L0 files, rate, call stack) reproduced the exact rate in a normal
+run: the stall is recalculated at open twice (two super version installs with the same version) and once more when
+compactions are enabled (102400 -> 81920 -> 65536), by the memtable switch of CompactRange's flush (52428); the gated
+L0 compaction (one file, L0 3 -> 2) releases the delay (x 1.4 = 73399); the flush installs L0 = 3 again (delayed at
+73399); the next L0 compaction empties L0. CompactRange waits for that compaction (its L0 pick conflicts), so the test
+could only see 73399 if CompactRange returned after the version with the empty L0 was installed but before the stall
+was recalculated: compactions, RefitLevel and flushes installed the version inside `LogAndApplyAsync`'s mutex section
+and the super version (with the stall recalculation) in a second one after releasing the mutex, and the waiting manual
+compaction can be woken in between. Upstream's LogAndApply returns with the DB mutex held and
+InstallSuperVersionAndScheduleWork runs before it is released. Fixes (product, `75dbcfa`):
+
+- `VersionSet.LogAndApplyAsync(..., installedUnderMutex, ...)`: compaction, RefitLevel and flush install their super
+  version in the critical section that installs the version. New test `CompactionInstallsVersionAndWriteStallTogether`
+  (a hook right after the MANIFEST write reads the version's L0 and the stall under the mutex) failed every time before.
+- `InstallSuperVersion` recalculates the stall only if the version or the memtables changed
+  (`ColumnFamilyData::InstallSuperVersion`: "treats it as further slowing down"), and the extra recalculations (enabling
+  compactions, the end of every compaction, bottom-priority jobs) are gone: the DB of this test now starts at exactly
+  delayed_write_rate (asserted), not at 0.64x of it.
+- A continued delay acquires its new token before releasing the old one, so the WriteController keeps its credit and
+  refill time (`GetDelayToken` resets them only when the delayed count goes from 0 to 1); before, every recalculation
+  of a delayed CF forgave the write debt (`ContinuedDelayKeepsWriteControllerDebt`).
+
+The test now asserts what upstream guarantees right after CompactRange (L0 empty, no stall), without
+`WaitForCompact`. Stress: 60 runs under 6 CPU hogs before the fix (no failure, as in earlier attempts); after it, 30
+runs of the whole `DbCompactionTests` class under 6 hogs, 3 x 15 parallel runs of the class (plus 2 hogs), 20 runs each
+with `DOTNET_TieredCompilation=0` and `DOTNET_TieredPGO=0 DOTNET_TC_QuickJitForLoops=0` (4 hogs): no failure.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
@@ -1370,10 +1450,13 @@ the block cache is 0.58x, Seek + 10 / 100 Next 0.24x / 0.21x, and MultiGet(16) 0
 - The first read / overwrite benchmark on a fresh DB shows the block cache fill and the second memtable's arena in
   alloc B/op (see "readrandom / overwrite allocations"); a byte-bounded `BlockBufferPool` retention would let a
   reopened DB reuse a closed one's block buffers.
-- Confirm the 4-thread `fillrandom` / `overwrite` / `readmissing` ratios vs C on a quiet machine (see "Read/write
-  contention with 4 threads"). Done since: pipelined writes (see "Pipelined writes and parallel memtable inserts"), reverse-iteration block pinning, async reverse
+- Confirmed on a quiet machine: the 4-thread `fillrandom` / `readmissing` ratios vs C are noise, not a regression (see
+  "Definitive-run follow-ups"). Done since: pipelined writes (see "Pipelined writes and parallel memtable inserts"), reverse-iteration block pinning, async reverse
   movement, covered-range skipping and compaction input readahead (see "Reverse iteration, range-deleted runs,
   compaction input readahead").
+- A new table reader's index and filter blocks (`BlockFetcher.ReadBlock` / `ReadRawPayload`, `ArrayPool.Shared` and
+  `BlockBufferPool`) could come from the pool the table builder returns its buffers to (`TableBuilderBuffers`), so a
+  flush would reuse them (~170-210 KB per 64 MiB flush of 100 B values; see "Definitive-run follow-ups").
 - Done since: merge operands are referenced in pinned blocks in both directions, `NextAsync` after reverse movement
   awaits, async table paths load index partitions asynchronously, user iterators use (auto) readahead, and the
   readahead's prefetches no longer allocate a Task each (see "Allocation-free readahead prefetches, forward pinned
