@@ -1061,6 +1061,10 @@ pool but that synced async writers no longer hold thread-pool threads for the du
 disks: milliseconds), which is what starves other async work on a busy server; latency-sensitive single-writer
 workloads on fast storage can turn it off.
 
+**Default: off.** Given the measured latency cost and no throughput gain, the shipped default keeps the inline
+fdatasync (the previous behaviour, like upstream's synchronous `Fsync` on the write thread); set
+`new LocalFileSystem { OffloadAsyncSync = true }` (or `dbbench --offload_async_sync true`) to opt in.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).

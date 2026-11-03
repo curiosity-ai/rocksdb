@@ -22,13 +22,13 @@ public sealed class LocalFileSystem : IFileSystem
     public static readonly LocalFileSystem Instance = new();
 
     /// <summary>
-    /// Whether <see cref="IWritableFile.SyncAsync"/> runs fdatasync on a dedicated sync thread (default) instead of
-    /// blocking the calling thread, typically a thread-pool thread, for the device flush. Durability and ordering are
-    /// the same either way; the hand-off adds two thread wake-ups per sync, which matters for latency with few
-    /// concurrent synced writers on fast storage (see docs/perf.md). Synchronous <see cref="IWritableFile.Sync"/> always
-    /// runs on the caller.
+    /// Whether <see cref="IWritableFile.SyncAsync"/> runs fdatasync on a dedicated sync thread instead of blocking the
+    /// calling thread (typically a thread-pool thread) for the device flush. Off by default: durability and ordering are
+    /// the same either way, but the hand-off adds two thread wake-ups per sync, which measured 15-53% higher latency for
+    /// async synced writes (1-64 writers, see docs/perf.md). Turn it on when blocking pool threads on slow devices
+    /// matters more than sync latency. Synchronous <see cref="IWritableFile.Sync"/> always runs on the caller.
     /// </summary>
-    public bool OffloadAsyncSync { get; init; } = true;
+    public bool OffloadAsyncSync { get; init; }
 
     // Process-wide set of locked files (PosixFileSystem's static lockedFiles). Guarded by s_lockedFilesLock.
     private static readonly HashSet<string> s_lockedFiles = new(StringComparer.Ordinal);

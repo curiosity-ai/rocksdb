@@ -238,7 +238,8 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [x] reverse merge operands pinned; async NextAsync direction switch; async index partition loads; user-iterator readahead (auto + ReadaheadSize)
   - [x] forward merge operands pinned; readahead prefetch allocation-free
   - [x] pipelined write (4-thread sync writes 15-20% faster; native WAL compat both ways), parallel memtable inserts for every group (no 64-entry minimum; faster than serial on a non-oversubscribed box), LZ4 encoder / cold start (managed fast encoder)
-  - [ ] unordered_write path (accepted, writes stay ordered) (M); non-blocking SyncAsync (S); possible order-dependent flake `MergeOperatorAcrossMemtableAndTables` at load ~15 (S)
+  - [x] unordered_write (native WAL compat both ways; 4-8 threads 35-60% faster), offloaded async fdatasync (opt-in `LocalFileSystem.OffloadAsyncSync`: slower on this VM), secondary catch-up re-reads the MANIFEST when the replayed state references a deleted file, `MergeOperatorAcrossMemtableAndTables` / blob auto-flush flakes root-caused
+  - [ ] `WriteSlowdownDelaysWrites` once saw a re-delayed CF at the end (not reproduced in 110 runs; assertion now waits for compaction) (S)
 - Ingestion / TTL / stats
   - [x] ingestion: write_global_seqno (legacy, + reader checksum fallback), ingest_behind, overlapping files in one call, allow_db_generated_files, link_files; TTL iterator; GET_HIT_L*, file-read histograms, cfstats intervals; KeyMayExist without I/O
   - [x] file checksums (FileChecksumGenCrc32c in MANIFEST, VerifyFileChecksums, ingestion verify), ingestion temperatures; GET_HIT for MultiGet, FILE_READ_FLUSH/DB_OPEN/VERIFY histograms, per-level file-read histograms

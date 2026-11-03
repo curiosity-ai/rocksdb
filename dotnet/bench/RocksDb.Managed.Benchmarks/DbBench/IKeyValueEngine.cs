@@ -136,8 +136,8 @@ public sealed record EngineOptions
     public bool UnorderedWrite { get; init; }
     /// <summary>enable_write_thread_adaptive_yield (managed engine only; native uses its default, true).</summary>
     public bool EnableWriteThreadAdaptiveYield { get; init; } = true;
-    /// <summary>--offload_async_sync (true; managed engine only): LocalFileSystem.OffloadAsyncSync (async syncs on sync threads).</summary>
-    public bool OffloadAsyncSync { get; init; } = true;
+    /// <summary>--offload_async_sync (false; managed engine only): LocalFileSystem.OffloadAsyncSync (async syncs on sync threads).</summary>
+    public bool OffloadAsyncSync { get; init; }
 
     /// <summary>--max_subcompactions (1).</summary>
     public uint MaxSubcompactions { get; init; } = 1;
