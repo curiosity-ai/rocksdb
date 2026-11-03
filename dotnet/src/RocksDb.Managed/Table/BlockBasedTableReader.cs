@@ -90,6 +90,15 @@ public sealed record TableReaderOptions
     /// <summary>num_file_reads_for_auto_readahead: sequential data block reads before automatic readahead starts. Default 2.</summary>
     public ulong NumFileReadsForAutoReadahead { get; init; } = 2;
 
+    /// <summary>The DB's block cache tracer (BlockBasedTable::block_cache_tracer_), or null.</summary>
+    internal Trace.BlockCacheTracer? BlockCacheTracer { get; init; }
+
+    /// <summary>LSM level of the file (TableReaderOptions::level, -1 unknown); only used for tracing.</summary>
+    internal int Level { get; init; } = -1;
+
+    /// <summary>block_restart_interval of the table options (estimates the keys of a traced block).</summary>
+    internal int BlockRestartInterval { get; init; } = 16;
+
     public static TableReaderOptions Default { get; } = new();
 }
 
@@ -232,6 +241,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     private readonly OffsetableCacheKey _baseCacheKey;
     private readonly CachePriority _metaPriority;
     private readonly BlockCacheStatistics? _stats;
+    private readonly Trace.BlockCacheTracer? _bcTracer;
     private int _disposed;
 
     public Footer Footer => _footer;
@@ -296,6 +306,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         _baseCacheKey = baseCacheKey;
         _metaPriority = MetaPriority(options);
         _stats = options.Statistics;
+        _bcTracer = options.BlockCacheTracer;
 
         IndexType = ReadIndexType(props);
         IndexKeyIncludesSeq = props.IndexKeyIsUserKey == 0;
@@ -736,6 +747,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
             if (cache.TryLookup(key, out CachedBlock h))
             {
                 _stats?.Record(HitCounter(kind));
+                if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, Unsafe.As<Block>(h.Value), hit: true, flags);
                 return BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h);
             }
             return ReadAndInsert(cache, key, handle, kind, flags);
@@ -758,6 +770,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
             if (cache.TryLookup(key, out CachedBlock h))
             {
                 _stats?.Record(HitCounter(kind));
+                if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, Unsafe.As<Block>(h.Value), hit: true, flags);
                 return BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h);
             }
         }
@@ -769,6 +782,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         // Charged per block consumed from the readahead buffer (upstream charges the prefetch reads themselves).
         ChargeRateLimiter(handle, flags);
         Block b = Protect(BlockFetcher.ReadBlock(prefetch, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind);
+        if (cache is not null && _bcTracer is { IsEnabled: true } tr) TraceAccess(tr, key, kind, b, hit: false, flags);
         return cache is null || (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
 
@@ -822,6 +836,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         _stats?.Record(MissCounter(kind));
         ChargeRateLimiter(handle, flags);
         Block b = Protect(BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind);
+        if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, b, hit: false, flags);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
 
@@ -860,6 +875,35 @@ public sealed partial class BlockBasedTableReader : IDisposable
         return BlockRef.FromOwned(b);
     }
 
+    /// <summary>
+    /// BlockBasedTable::SaveLookupContextOrTraceRecord + FinishTraceRecord: records one block cache lookup while a block
+    /// cache trace runs. The number of keys is estimated from the restart points as upstream.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void TraceAccess(Trace.BlockCacheTracer t, in CacheKey key, BlockKind kind, Block? block, bool hit, TableReadFlags flags, ulong sizeIfNoBlock = 0)
+    {
+        ulong nkeys = 0;
+        ulong usage = sizeIfNoBlock;
+        if (block is not null)
+        {
+            int interval = _options.BlockRestartInterval;
+            nkeys = (ulong)interval * (ulong)block.NumRestarts;
+            if (nkeys > 0) nkeys -= (ulong)(interval / 2); // ~ half-utilized last restart interval
+            usage = (ulong)block.Charge;
+        }
+        Trace.TraceType type = kind switch
+        {
+            BlockKind.Data => Trace.TraceType.BlockDataBlock,
+            BlockKind.Index => Trace.TraceType.BlockIndexBlock,
+            _ => Trace.TraceType.BlockFilterBlock,
+        };
+        bool noInsert = (flags & (TableReadFlags.BlockCacheTier | TableReadFlags.DontFillCache)) != 0;
+        ulong cfId = Properties.ColumnFamilyId;
+        string cfName = Properties.ColumnFamilyName;
+        t.TraceBlockAccess(key, type, usage, nkeys, hit, noInsert, cfId, cfName, _options.Level >= 0 ? (uint)_options.Level : uint.MaxValue,
+            _options.FileNumber != 0 ? _options.FileNumber : ulong.MaxValue);
+    }
+
     /// <summary>Async <see cref="GetBlockRef"/>; completes synchronously on a cache hit.</summary>
     internal ValueTask<BlockRef> GetBlockRefAsync(BlockHandle handle, BlockKind kind, TableReadFlags flags, CancellationToken ct)
     {
@@ -870,6 +914,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
             if (cache.TryLookup(key, out CachedBlock h))
             {
                 _stats?.Record(HitCounter(kind));
+                if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, Unsafe.As<Block>(h.Value), hit: true, flags);
                 return new ValueTask<BlockRef>(BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h));
             }
             _stats?.Record(MissCounter(kind));
@@ -893,6 +938,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     {
         await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
         Block b = Protect(await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false), kind);
+        if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, b, hit: false, flags);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
 
@@ -1246,6 +1292,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
             if (cache.TryLookup(key, out CachedBlock h))
             {
                 _stats?.Record(BlockCacheCounter.FilterHit);
+                if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, BlockKind.Filter, null, hit: true, flags, (ulong)handle.Size);
                 bool r = Unsafe.As<IFilterBitsReader>(h.Value)!.MayMatch(entry);
                 h.Dispose();
                 return r;
@@ -1254,6 +1301,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         _stats?.Record(BlockCacheCounter.FilterMiss);
         if ((flags & TableReadFlags.BlockCacheTier) != 0) return true; // no I/O allowed: Incomplete -> may match
         byte[] buf = BlockFetcher.ReadRawPayload(_file, _footer, handle, _options.VerifyChecksums, out int len);
+        if (cache is not null && _bcTracer is { IsEnabled: true } tm) TraceAccess(tm, key, BlockKind.Filter, null, hit: false, flags, (ulong)len);
         IFilterBitsReader reader;
         try
         {
