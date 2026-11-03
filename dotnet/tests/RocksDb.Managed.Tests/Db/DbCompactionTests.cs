@@ -915,6 +915,54 @@ public sealed class DbSubcompactionTests
         Assert.AreEqual(expected, count);
     }
 
+    /// <summary>
+    /// Subcompactions with user-defined timestamps: boundaries carry the maximum timestamp (InitializeReadOptionsAndBoundaries),
+    /// so every version of a user key is compacted by one subcompaction; outputs do not overlap by user key and every
+    /// version stays readable at its timestamp.
+    /// </summary>
+    [TestMethod]
+    public void SubcompactionsWithUserDefinedTimestamps()
+    {
+        MemoryFileSystem fs = NewFs();
+        var stats = new Statistics();
+        DbOptions o = NewOptions(fs);
+        o.MaxSubcompactions = 4;
+        o.Statistics = stats;
+        ColumnFamilyOptions cf = Cf();
+        cf.Comparator = Comparator.BytewiseWithU64Ts;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, cf);
+        const int N = 3000;
+        const int Rounds = 5;
+        for (int round = 0; round < Rounds; round++)
+        {
+            byte[] ts = DbTimestampTests.Ts((ulong)(round + 1) * 10);
+            for (int k = 0; k < N; k++)
+            {
+                if (round == 3 && k % 7 == 0) db.Delete(Key(k), ts);
+                else db.Put(Key(k), ts, Value(k, round));
+            }
+            db.Flush();
+        }
+        db.CompactRange();
+        HistogramData h = stats.GetHistogramData(Histogram.NumSubcompactionsScheduled);
+        Assert.AreEqual(1UL, h.Count, "one compaction split into subcompactions");
+        Assert.IsTrue(h.Max > 1);
+        List<LiveFileMetadata> files = db.GetLiveFilesMetadata();
+        Assert.IsTrue(files.Count > 1);
+        // Sorted, non-overlapping outputs (user keys with timestamps, newest timestamp first).
+        Comparator ucmp = Comparator.BytewiseWithU64Ts;
+        files.Sort((a, b) => ucmp.Compare(a.SmallestKey, b.SmallestKey));
+        for (int i = 1; i < files.Count; i++) Assert.IsTrue(ucmp.Compare(files[i - 1].LargestKey, files[i].SmallestKey) < 0, "overlapping outputs");
+        for (int k = 0; k < N; k += 3)
+        {
+            for (int round = 0; round < Rounds; round++)
+            {
+                string? expected = round == 3 && k % 7 == 0 ? null : S(Value(k, round));
+                Assert.AreEqual(expected, S(db.Get(new ReadOptions { Timestamp = DbTimestampTests.Ts((ulong)(round + 1) * 10) }, Key(k))), "key " + k + " round " + round);
+            }
+        }
+    }
+
     [TestMethod]
     public void ClippingIteratorRestrictsToRange()
     {
