@@ -1505,6 +1505,30 @@ concurrent hits this can happen in any DB with `max_open_files != -1` and concur
 hitting a hot set while two read all files, 2 s) failed 4 of 10 runs before the fix and 0 of 20 after; the
 `DbBlobTests` class passed 100 of 100 runs after it with 2 CPU hogs (1 of 100 failed before, without hogs).
 
+## Cache layers: block cache hit path with the new layers unused (2026-11-03)
+
+The secondary cache adapter, SimCache, persistent cache and write buffer manager only cost something when configured.
+On a plain cache the remaining changes on the hit path are one `BlockCache.ExtendedLookup` field test in the table
+reader's lookup, one plain bool test in `HyperClockCache.TryLookup` (hit bits are recorded only while an eviction
+callback is installed; the first version read the eviction handler and measured about +8% on the auto table, so it was
+replaced by the bool), and an 8-byte `Helper` field per cache entry. On the write path a disabled write buffer manager
+adds one volatile read per write group, and memtable arenas get no tracker.
+
+BenchmarkDotNet, `CacheBenchmarks.LookupHit` (16 Ki resident 4 KiB entries) and `TableBenchmarks.TableGetCached`
+(100k-entry table, all blocks cached in HyperClock), net10.0 Release. Baseline is `350379a`. The runs alternate
+baseline and new builds on a shared machine with load average 11-13 (four other agents running). The numbers are
+medians of 3 alternating runs for LookupHit after the change and of 5 runs for Table Get. Allocated is `-` in every run.
+
+| Benchmark | Baseline (median) | New (median) | Delta |
+|---|---:|---:|---:|
+| LookupHit, LRU | 206 ns | 205 ns | -0.5% |
+| LookupHit, HyperClock | 92.9 ns | 91.6 ns | -1.5% |
+| LookupHit, AutoHyperClock | 88.5 ns | 90.3 ns | +1.9% |
+| Table: Get (cached blocks) | 908 ns | 930 ns | +2.4% |
+
+All deltas are within the run-to-run spread (StdDev 6-15% of the mean on this machine), so the unused layers cause no
+measurable regression and no allocations. Raw outputs are in the session scratchpad (`bdn-ab*.txt`).
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).

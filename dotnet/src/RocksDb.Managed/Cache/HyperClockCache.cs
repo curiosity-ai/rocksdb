@@ -94,6 +94,15 @@ public sealed class HyperClockCache : BlockCache
 
     public override string Name => "HyperClockCache";
 
+    // Hit bits are only recorded while an eviction callback is installed (a plain field, read on every hit).
+    private bool _trackHits;
+
+    internal override void SetEvictionHandler(CacheEvictionHandler? handler)
+    {
+        base.SetEvictionHandler(handler);
+        Volatile.Write(ref _trackHits, handler is not null);
+    }
+
     /// <summary>The tables resize automatically (estimated_entry_charge = 0).</summary>
     public bool IsAutoResizing => _shards[0].IsAuto;
 
@@ -192,7 +201,7 @@ public sealed class HyperClockCache : BlockCache
             return false;
         }
         // Record the hit for the eviction callback (was_hit), only when one is installed (as upstream).
-        if (EvictionHandler is not null && (s.LoadMeta() & ClockSlot.HitBit) == 0) Interlocked.Or(ref s.Meta, unchecked((long)ClockSlot.HitBit));
+        if (_trackHits && (s.LoadMeta() & ClockSlot.HitBit) == 0) Interlocked.Or(ref s.Meta, unchecked((long)ClockSlot.HitBit));
         block = new CachedBlock(s);
         return true;
     }
