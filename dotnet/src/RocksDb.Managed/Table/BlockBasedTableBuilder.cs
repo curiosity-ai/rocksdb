@@ -56,15 +56,9 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     private readonly BlockBuilder _rangeDelBlock;
     private readonly IndexBuilder _indexBuilder;
     private readonly FilterBlockBuilder? _filterBuilder;
-    /// <summary>
-    /// Staging buffers of all builders. A dedicated (lock-based, untrimmed) pool: the 512 KiB arrays from
-    /// ArrayPool.Shared were mostly not found again by the next builder (rented and returned on different flush /
-    /// compaction threads) and were reallocated on the large object heap per output file.
-    /// </summary>
-    private static readonly ArrayPool<byte> s_stagingPool = ArrayPool<byte>.Create(1 << 20, 16);
-    private readonly PooledBufferWriter _out = new(OutputFlushThreshold + 64 * 1024, s_stagingPool);
+    private readonly PooledBufferWriter _out = new(OutputFlushThreshold + 64 * 1024, TableBuilderBuffers.Bytes);
     private readonly PooledBufferWriter _lastKey = new(64);
-    private readonly PooledBufferWriter _compressed = new(4096);
+    private readonly PooledBufferWriter _compressed = new(4096, TableBuilderBuffers.Bytes);
     private readonly TableProperties _props = new();
     private readonly bool _useDeltaEncodingForIndexValues;
     private readonly uint _baseContextChecksum;

@@ -72,7 +72,7 @@ internal sealed class FullFilterBlockBuilder : FilterBlockBuilder
     private readonly SliceTransform? _prefixExtractor;
     private readonly bool _wholeKeyFiltering;
     private readonly IFilterBitsBuilder _bits;
-    private readonly PooledBufferWriter _filter = new(1024);
+    private readonly PooledBufferWriter _filter = new(1024, TableBuilderBuffers.Bytes);
 
     public FullFilterBlockBuilder(SliceTransform? prefixExtractor, bool wholeKeyFiltering, IFilterBitsBuilder bits)
     {

@@ -142,9 +142,9 @@ public sealed class BlockBuilder : IDisposable
             _hashIndexBuilder = new DataBlockHashIndexBuilder();
             _hashIndexBuilder.Initialize(hashTableUtilRatio);
         }
-        _buffer = new PooledBufferWriter(4096);
+        _buffer = new PooledBufferWriter(4096, TableBuilderBuffers.Bytes);
         _lastKey = new PooledBufferWriter(64);
-        _restarts = ArrayPool<uint>.Shared.Rent(64);
+        _restarts = TableBuilderBuffers.UInts.Rent(64);
         _restarts[0] = 0;
         _numRestarts = 1;
         _estimate = BaseEstimate;
@@ -471,9 +471,9 @@ public sealed class BlockBuilder : IDisposable
 
     private void GrowRestarts()
     {
-        uint[] n = ArrayPool<uint>.Shared.Rent(_restarts.Length * 2);
+        uint[] n = TableBuilderBuffers.UInts.Rent(_restarts.Length * 2);
         _restarts.AsSpan(0, _numRestarts).CopyTo(n);
-        ArrayPool<uint>.Shared.Return(_restarts);
+        TableBuilderBuffers.UInts.Return(_restarts);
         _restarts = n;
     }
 
@@ -486,7 +486,7 @@ public sealed class BlockBuilder : IDisposable
         _rewriteBuffer?.Dispose();
         _values?.Dispose();
         _hashIndexBuilder?.Release();
-        if (_restarts.Length > 0) ArrayPool<uint>.Shared.Return(_restarts);
+        if (_restarts.Length > 0) TableBuilderBuffers.UInts.Return(_restarts);
         _restarts = [];
     }
 }
