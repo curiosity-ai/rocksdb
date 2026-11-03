@@ -645,5 +645,106 @@ public sealed class PlainCuckooTableTests
         Assert.AreEqual(TableFactoryType.CuckooTable, parsed.ColumnFamilies[1].Options.TableFactory);
     }
 
+    // ---- ingestion of external plain / cuckoo files ------------------------------------------------------------
+
+    private static string WriteExternal(RocksDb.Managed.Env.IFileSystem fs, ColumnFamilyOptions cf, string path, SortedDictionary<string, string> data)
+    {
+        using var w = new SstFileWriter(cf, fs);
+        w.Open(path);
+        foreach (KeyValuePair<string, string> kv in data) w.Put(DbTestUtil.B(kv.Key), DbTestUtil.B(kv.Value));
+        w.Finish();
+        return path;
+    }
+
+    private static SortedDictionary<string, string> IngestData(int from, int count, string tag)
+    {
+        var d = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        for (int i = from; i < from + count; i++)
+            d["key" + i.ToString("D5", System.Globalization.CultureInfo.InvariantCulture)] = tag + i.ToString("D5", System.Globalization.CultureInfo.InvariantCulture);
+        return d;
+    }
+
+    private static void AssertComparatorMismatch(Action ingest)
+    {
+        RocksDbException e = Assert.ThrowsExactly<RocksDbException>(ingest);
+        Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+        StringAssert.Contains(e.Message, "leveldb.BytewiseComparator: does not match existing comparator");
+    }
+
+    /// <summary>
+    /// ExternalSstFileIngestionJob opens external files with the column family's table factory (a file of another format
+    /// fails with "Bad table magic number" in either direction) and then applies upstream's validation, which rejects
+    /// plain and cuckoo files: their builders record no comparator name (InvalidArgument "... does not match existing
+    /// comparator "), and SstFileWriter cuckoo files lack the external-file version property (the cuckoo builder runs no
+    /// collectors: Corruption "External file version not found", unless allow_db_generated_files).
+    /// </summary>
+    [TestMethod]
+    public void Ingestion_PlainAndCuckooExternalFiles_UpstreamValidation()
+    {
+        var cuckoo = new ColumnFamilyOptions { TableFactory = TableFactoryType.CuckooTable };
+        foreach (ColumnFamilyOptions cf in new[] { PlainCf(PlainTableEncodingType.Prefix, storeIndex: true), PlainCf(PlainTableEncodingType.Plain, false), cuckoo })
+        {
+            var fs = DbTestUtil.NewFs();
+            DbOptions o = DbTestUtil.NewOptions(fs);
+            o.AllowMmapReads = true;
+            fs.CreateDirectoryIfMissing("/ext");
+            string fa = WriteExternal(fs, cf, "/ext/a.sst", IngestData(0, 400, "a"));
+            using (RocksDatabase db = RocksDatabase.Open(DbTestUtil.DbPath, o, cf))
+            {
+                if (cf.TableFactory == TableFactoryType.CuckooTable)
+                {
+                    RocksDbException noVersion = Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles([fa], new IngestExternalFileOptions()));
+                    Assert.AreEqual(StatusCode.Corruption, noVersion.Code);
+                    StringAssert.Contains(noVersion.Message, "External file version not found");
+                    AssertComparatorMismatch(() => db.IngestExternalFiles([fa], new IngestExternalFileOptions { AllowDbGeneratedFiles = true }));
+                }
+                else
+                {
+                    AssertComparatorMismatch(() => db.IngestExternalFiles([fa], new IngestExternalFileOptions()));
+                }
+                // A block-based file cannot be opened by a plain / cuckoo column family's factory.
+                string bbt = WriteExternal(fs, new ColumnFamilyOptions(), "/ext/bbt.sst", IngestData(5000, 10, "c"));
+                RocksDbException bad = Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles([bbt], new IngestExternalFileOptions()));
+                Assert.AreEqual(StatusCode.Corruption, bad.Code);
+                StringAssert.Contains(bad.Message, "Bad table magic number");
+                Assert.IsNull(db.Get(DbTestUtil.B("key00001")));
+                Assert.AreEqual(0, db.GetLiveFilesMetadata().Count);
+            }
+            // ... nor a plain / cuckoo file by a block-based column family's.
+            var fs2 = DbTestUtil.NewFs();
+            fs2.CreateDirectoryIfMissing("/ext");
+            string f2 = WriteExternal(fs2, cf, "/ext/x.sst", IngestData(0, 10, "x"));
+            using RocksDatabase bdb = RocksDatabase.Open(DbTestUtil.DbPath, DbTestUtil.NewOptions(fs2), new ColumnFamilyOptions());
+            RocksDbException magic = Assert.ThrowsExactly<RocksDbException>(() => bdb.IngestExternalFiles([f2], new IngestExternalFileOptions()));
+            Assert.AreEqual(StatusCode.Corruption, magic.Code);
+            StringAssert.Contains(magic.Message, "Bad table magic number");
+        }
+    }
+
+    /// <summary>
+    /// The adaptive factory opens external files of any format by their magic number: block-based files are ingested
+    /// into an adaptive column family; plain and cuckoo files reach upstream's validation (and are rejected there).
+    /// </summary>
+    [TestMethod]
+    public void Ingestion_AdaptiveTableOpensEveryFormat()
+    {
+        var fs = DbTestUtil.NewFs();
+        DbOptions o = DbTestUtil.NewOptions(fs);
+        o.AllowMmapReads = true;
+        fs.CreateDirectoryIfMissing("/ext");
+        SortedDictionary<string, string> d0 = IngestData(0, 200, "f0");
+        string bbt = WriteExternal(fs, new ColumnFamilyOptions(), "/ext/f0.sst", d0);
+        string plain = WriteExternal(fs, PlainCf(PlainTableEncodingType.Plain, true), "/ext/f1.sst", IngestData(1000, 200, "f1"));
+        string cuckoo = WriteExternal(fs, new ColumnFamilyOptions { TableFactory = TableFactoryType.CuckooTable }, "/ext/f2.sst", IngestData(2000, 200, "f2"));
+        var cf = PlainCf(PlainTableEncodingType.Plain, true);
+        cf.TableFactory = TableFactoryType.AdaptiveTable;
+        using RocksDatabase db = RocksDatabase.Open(DbTestUtil.DbPath, o, cf);
+        db.IngestExternalFiles([bbt], new IngestExternalFileOptions());
+        foreach (KeyValuePair<string, string> kv in d0) Assert.AreEqual(kv.Value, DbTestUtil.GetString(db, kv.Key));
+        AssertComparatorMismatch(() => db.IngestExternalFiles([plain], new IngestExternalFileOptions()));
+        AssertComparatorMismatch(() => db.IngestExternalFiles([cuckoo], new IngestExternalFileOptions { AllowDbGeneratedFiles = true }));
+        Assert.AreEqual(1, db.GetLiveFilesMetadata().Count);
+    }
+
     public TestContext? TestContext { get; set; }
 }

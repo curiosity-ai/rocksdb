@@ -358,6 +358,90 @@ public sealed class PlainCuckooCompatTests
         Assert.AreEqual(section, Section(parsed.Serialize(), "[TableOptions/PlainTable \"default\"]"));
     }
 
+    // ---- ingestion ---------------------------------------------------------------------------------------------
+
+    private static RocksDbSharp.IngestExternalFileOptions NativeIngest(bool dbGenerated)
+    {
+        var o = new RocksDbSharp.IngestExternalFileOptions();
+        RocksDbSharp.Native.Instance.rocksdb_ingestexternalfileoptions_set_allow_db_generated_files(o.Handle, (byte)(dbGenerated ? 1 : 0));
+        s_keepAlive.Add(o);
+        return o;
+    }
+
+    private static void AssertNativeRejects(RocksDbSharp.RocksDb db, string file, bool dbGenerated, string message)
+    {
+        var e = Assert.ThrowsExactly<RocksDbSharp.RocksDbException>(() => db.IngestExternalFiles([file], NativeIngest(dbGenerated)));
+        StringAssert.Contains(e.Message, message);
+    }
+
+    private static void AssertManagedRejects(RocksDatabase db, string file, bool dbGenerated, StatusCode code, string message)
+    {
+        RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles([file], new IngestExternalFileOptions { AllowDbGeneratedFiles = dbGenerated }));
+        Assert.AreEqual(code, e.Code);
+        StringAssert.Contains(e.Message, message);
+    }
+
+    private const string ComparatorMismatch = "leveldb.BytewiseComparator: does not match existing comparator";
+    private const string NoVersion = "External file version not found";
+
+    /// <summary>
+    /// Ingestion of external plain / cuckoo files behaves like native 11.12 for files written by either side's
+    /// SstFileWriter: the column family's table factory opens them (another format: bad magic number), then the
+    /// comparator check rejects them, because neither format records a comparator name; cuckoo files (no property
+    /// collectors) already fail the external-file version check unless allow_db_generated_files. Native rejects its own
+    /// files the same way.
+    /// </summary>
+    [TestMethod]
+    public void PlainAndCuckoo_Ingestion_SameValidationAsNative()
+    {
+        var rnd = new Random(31);
+        var cases = new List<(string Name, RocksDbSharp.ColumnFamilyOptions Native, ColumnFamilyOptions Managed, bool Cuckoo)>();
+        foreach (PlainSettings s in s_plainSettings) cases.Add(("plain " + s, s.Native(), s.Managed(), false));
+        foreach (CuckooTableOptions o in s_cuckooSettings)
+            cases.Add(("cuckoo " + o.ToOptionsString(), NativeCuckoo(o), new ColumnFamilyOptions { TableFactory = TableFactoryType.CuckooTable, CuckooTableOptions = o }, true));
+        foreach ((string name, RocksDbSharp.ColumnFamilyOptions ncf, ColumnFamilyOptions mcf, bool isCuckoo) in cases)
+        {
+            SortedDictionary<string, string> data = isCuckoo ? CuckooData(rnd, 300) : RandomData(rnd, 300);
+            using var dir = new TempDir("ext-ingest");
+            string nativeSst = System.IO.Path.Combine(dir.Path, "native.sst"), managedSst = System.IO.Path.Combine(dir.Path, "managed.sst");
+            using (var w = new RocksDbSharp.SstFileWriter(new RocksDbSharp.EnvOptions(), ncf))
+            {
+                w.Open(nativeSst);
+                foreach (KeyValuePair<string, string> kv in data) w.Add(kv.Key, kv.Value);
+                w.Finish();
+            }
+            using (var w = new SstFileWriter(mcf))
+            {
+                w.Open(managedSst);
+                foreach (KeyValuePair<string, string> kv in data) w.Put(B(kv.Key), B(kv.Value));
+                w.Finish();
+            }
+            using (var ndb = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions().SetCreateIfMissing(true).SetAllowMmapReads(true),
+                       System.IO.Path.Combine(dir.Path, "ndb"), new RocksDbSharp.ColumnFamilies(ncf)))
+            {
+                foreach (string f in new[] { nativeSst, managedSst })
+                {
+                    if (isCuckoo) AssertNativeRejects(ndb, f, false, NoVersion);
+                    AssertNativeRejects(ndb, f, isCuckoo, ComparatorMismatch);
+                }
+            }
+            using (RocksDatabase mdb = RocksDatabase.Open(System.IO.Path.Combine(dir.Path, "mdb"), new DbOptions { CreateIfMissing = true, AllowMmapReads = true }, mcf))
+            {
+                foreach (string f in new[] { nativeSst, managedSst })
+                {
+                    if (isCuckoo) AssertManagedRejects(mdb, f, false, StatusCode.Corruption, NoVersion);
+                    AssertManagedRejects(mdb, f, isCuckoo, StatusCode.InvalidArgument, ComparatorMismatch);
+                }
+                Assert.AreEqual(0, mdb.GetLiveFilesMetadata().Count, name);
+            }
+            // A block-based column family cannot open them (magic number), on either side.
+            using (var nbb = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions().SetCreateIfMissing(true), System.IO.Path.Combine(dir.Path, "nbb")))
+                AssertNativeRejects(nbb, nativeSst, false, "Bad table magic number");
+            using (RocksDatabase mbb = RocksDatabase.Open(System.IO.Path.Combine(dir.Path, "mbb"), new DbOptions { CreateIfMissing = true }, new ColumnFamilyOptions()))
+                AssertManagedRejects(mbb, nativeSst, false, StatusCode.Corruption, "Bad table magic number");
+        }
+    }
+
     private static string Section(string text, string title)
     {
         int i = text.IndexOf(title, StringComparison.Ordinal);
