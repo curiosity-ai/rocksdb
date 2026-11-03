@@ -12,8 +12,10 @@ namespace RocksDb.Managed.Db;
 /// SkipListRep (memtable/skiplistrep.cc).
 /// </summary>
 /// <remarks>
-/// <para><b>Entry format</b> (as upstream, without per-key protection bytes):
-/// <c>varint32(internal_key_len) | user_key | fixed64(seq &lt;&lt; 8 | type) | varint32(value_len) | value</c>.
+/// <para><b>Entry format</b> (as upstream):
+/// <c>varint32(internal_key_len) | user_key | fixed64(seq &lt;&lt; 8 | type) | varint32(value_len) | value | checksum</c>,
+/// where checksum is memtable_protection_bytes_per_key (0, 1, 2, 4 or 8) bytes of the entry's ProtectionInfoKVOS64
+/// (<see cref="KvChecksum"/>), verified by point lookups, iterators (and so flush) like upstream.
 /// Point entries live in one skiplist; <see cref="EntryType.RangeDeletion"/> entries (value = end key) live in a
 /// separate skiplist like upstream's <c>range_del_table_</c>.</para>
 /// <para><b>Ordering.</b> Entries are ordered by <see cref="InternalKeyComparator.CompareKeySeq"/>; a second entry with
@@ -57,6 +59,8 @@ public sealed unsafe class MemTable : IDisposable
     private readonly InplaceUpdateCallback? _inplaceCallback;
     // memtable_insert_with_hint_prefix_extractor: per-prefix skiplist splice (insert_hints_), serial inserts only.
     private readonly SliceTransform? _insertHintExtractor;
+    // moptions_.protection_bytes_per_key (memtable_protection_bytes_per_key): 0 = no per-entry checksum.
+    private readonly int _protectionBytes;
     private Dictionary<ArenaSlice, nint>? _insertHints;
     [ThreadStatic] private static byte[]? t_inplaceValue;
 
@@ -125,7 +129,11 @@ public sealed unsafe class MemTable : IDisposable
             _inplaceCallback = options.InplaceCallback;
         }
         _insertHintExtractor = options.InsertWithHintPrefixExtractor;
+        _protectionBytes = (int)options.ProtectionBytesPerKey;
     }
+
+    /// <summary>memtable_protection_bytes_per_key of this memtable (bytes of checksum after each entry).</summary>
+    public int ProtectionBytesPerKey => _protectionBytes;
 
     /// <summary>The memtable bloom filter (memtable_prefix_bloom_size_ratio), or null.</summary>
     public DynamicBloom? BloomFilter => _bloom;
@@ -181,9 +189,17 @@ public sealed unsafe class MemTable : IDisposable
     /// Adds an entry. Must be serialized with other <see cref="Add"/> calls. Returns false if an entry with the same
     /// user key and sequence number already exists (upstream Status::TryAgain).
     /// </summary>
-    public bool Add(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+    public bool Add(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) =>
+        Add(sequence, type, key, value, hasKvProtInfo: false, kvProtInfo: 0);
+
+    /// <summary>
+    /// <see cref="Add(ulong, EntryType, ReadOnlySpan{byte}, ReadOnlySpan{byte})"/> with the entry's ProtectionInfoKVOS64
+    /// from the write batch (MemTable::Add's kv_prot_info): it becomes the entry checksum and the encoded entry is
+    /// verified against it (Corruption "ProtectionInfo mismatch" when the bytes written to the memtable differ).
+    /// </summary>
+    internal bool Add(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool hasKvProtInfo, ulong kvProtInfo)
     {
-        if (!Insert(sequence, type, key, value, concurrent: false, out int encodedLen)) return false;
+        if (!Insert(sequence, type, key, value, concurrent: false, out int encodedLen, hasKvProtInfo, kvProtInfo)) return false;
         if (_newestUdtSize != 0) MaybeUpdateNewestUdt(key);
         // Range deletions take the concurrent insert path upstream (AddConcurrently on the bloom too).
         if (_bloom is not null) AddToBloom(key, concurrent: type == EntryType.RangeDeletion);
@@ -209,7 +225,7 @@ public sealed unsafe class MemTable : IDisposable
     /// </summary>
     public bool AddConcurrently(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ref MemTablePostProcessInfo postProcessInfo)
     {
-        if (!Insert(sequence, type, key, value, concurrent: true, out int encodedLen)) return false;
+        if (!Insert(sequence, type, key, value, concurrent: true, out int encodedLen, hasKvProtInfo: false, kvProtInfo: 0)) return false;
         if (_newestUdtSize != 0) MaybeUpdateNewestUdt(key);
         if (_bloom is not null) AddToBloom(key, concurrent: true);
         postProcessInfo.NumEntries++;
@@ -237,16 +253,18 @@ public sealed unsafe class MemTable : IDisposable
     }
 
     [SkipLocalsInit]
-    private bool Insert(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool concurrent, out int encodedLen)
+    private bool Insert(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool concurrent, out int encodedLen,
+        bool hasKvProtInfo, ulong kvProtInfo)
     {
         // Format of an entry is concatenation of:
         //  key_size     : varint32 of internal_key.size()
         //  key bytes    : char[internal_key.size()]
         //  value_size   : varint32 of value.size()
         //  value bytes  : char[value.size()]
+        //  checksum     : char[moptions_.protection_bytes_per_key]
         uint internalKeySize = (uint)key.Length + DbFormat.InternalKeyFooterSize;
         uint valSize = (uint)value.Length;
-        long len = Coding.VarintLength(internalKeySize) + (long)internalKeySize + Coding.VarintLength(valSize) + valSize;
+        long len = Coding.VarintLength(internalKeySize) + (long)internalKeySize + Coding.VarintLength(valSize) + valSize + _protectionBytes;
         if (len > int.MaxValue / 2) ThrowHelper.InvalidArgument("memtable entry too large");
         encodedLen = (int)len;
         InlineSkipList<MemTableKeyComparer> table = type == EntryType.RangeDeletion ? _rangeDelTable : _table;
@@ -260,7 +278,8 @@ public sealed unsafe class MemTable : IDisposable
         p += DbFormat.InternalKeyFooterSize;
         p += Coding.EncodeVarint32(dst[p..], valSize);
         value.CopyTo(dst[p..]);
-        Debug.Assert(p + value.Length == encodedLen);
+        Debug.Assert(p + value.Length + _protectionBytes == encodedLen);
+        if (_protectionBytes != 0 || hasKvProtInfo) ProtectEncodedEntry(dst, p + value.Length, sequence, type, key, value, hasKvProtInfo, kvProtInfo);
 
         // Range deletions always insert concurrently-safe (they may race with other range-deletion writers).
         if (concurrent || type == EntryType.RangeDeletion) return table.InsertConcurrently(buf);
@@ -279,6 +298,74 @@ public sealed unsafe class MemTable : IDisposable
             }
         }
         return table.Insert(buf);
+    }
+
+    /// <summary>Length of the encoded entry at <paramref name="entry"/> including its checksum.</summary>
+    private static int EncodedEntryLength(byte* entry, int protectionBytes)
+    {
+        SkipListKey ek = MemTableKeyComparer.DecodeEntryKey(entry);
+        byte* p = ek.Ptr + ek.Length;
+        int n = Coding.DecodeVarint32(new ReadOnlySpan<byte>(p, Coding.MaxVarint32Length), out uint valueLen);
+        return (int)(p - entry) + n + (int)valueLen + protectionBytes;
+    }
+
+    /// <summary>
+    /// UpdateEntryChecksum + (with the batch's protection info) VerifyEncodedEntry of MemTable::Add: writes the checksum
+    /// at <paramref name="checksumOffset"/> of the encoded entry <paramref name="dst"/> and verifies the encoded bytes.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void ProtectEncodedEntry(Span<byte> dst, int checksumOffset, ulong sequence, EntryType type, ReadOnlySpan<byte> key,
+        ReadOnlySpan<byte> value, bool hasKvProtInfo, ulong kvProtInfo)
+    {
+        if (_protectionBytes != 0)
+        {
+            ulong info = hasKvProtInfo ? kvProtInfo : KvChecksum.ProtectS(KvChecksum.ProtectKvo(key, value, type), sequence);
+            KvChecksum.Encode(info, _protectionBytes, dst[checksumOffset..]);
+        }
+        if (hasKvProtInfo)
+        {
+            TestHooks.InvokeSpan("MemTable::Add:Encoded", dst[..checksumOffset]);
+            VerifyEncodedEntry(dst[..checksumOffset], kvProtInfo);
+        }
+        TestHooks.InvokeSpan("MemTable::Add:BeforeReturn:Encoded", dst[..checksumOffset]);
+    }
+
+    /// <summary>Port of MemTable::VerifyEncodedEntry: strips the encoded entry's fields from its ProtectionInfoKVOS64.</summary>
+    private void VerifyEncodedEntry(ReadOnlySpan<byte> encoded, ulong kvProtInfo)
+    {
+        if (!Coding.GetVarint32(ref encoded, out uint ikeyLen)) ThrowHelper.Corruption("Unable to parse internal key length");
+        if (ikeyLen < DbFormat.InternalKeyFooterSize + (uint)_tsSize) ThrowHelper.Corruption("Internal key length too short");
+        if (ikeyLen > (uint)encoded.Length) ThrowHelper.Corruption("Internal key length too long");
+        int userKeyLen = (int)ikeyLen - DbFormat.InternalKeyFooterSize;
+        ReadOnlySpan<byte> userKey = encoded[..userKeyLen];
+        ulong packed = Coding.DecodeFixed64(encoded[userKeyLen..]);
+        encoded = encoded[(int)ikeyLen..];
+        if (!Coding.GetVarint32(ref encoded, out uint valueLen)) ThrowHelper.Corruption("Unable to parse value length");
+        if (valueLen < (uint)encoded.Length) ThrowHelper.Corruption("Value length too short");
+        if (valueLen > (uint)encoded.Length) ThrowHelper.Corruption("Value length too long");
+        ulong info = KvChecksum.StripKvo(KvChecksum.StripS(kvProtInfo, packed >> 8), userKey, encoded, (EntryType)(byte)packed);
+        KvChecksum.ThrowIfMismatch(info);
+    }
+
+    /// <summary>
+    /// Port of MemTable::VerifyEntryChecksum: recomputes the checksum of the entry at <paramref name="entry"/> (as stored
+    /// in the skiplist) and throws Corruption when it does not match the stored one.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static void VerifyEntryChecksum(byte* entry, int protectionBytes)
+    {
+        SkipListKey ek = MemTableKeyComparer.DecodeEntryKey(entry);
+        if (ek.Length < DbFormat.InternalKeyFooterSize) ThrowHelper.Corruption("Memtable entry internal key length too short.");
+        int userKeyLen = ek.Length - DbFormat.InternalKeyFooterSize;
+        var userKey = new ReadOnlySpan<byte>(ek.Ptr, userKeyLen);
+        ulong packed = Coding.DecodeFixed64(new ReadOnlySpan<byte>(ek.Ptr + userKeyLen, DbFormat.InternalKeyFooterSize));
+        byte* p = ek.Ptr + ek.Length;
+        int n = Coding.DecodeVarint32(new ReadOnlySpan<byte>(p, Coding.MaxVarint32Length), out uint valueLen);
+        if (n <= 0) ThrowHelper.Corruption("Unable to parse internal key value");
+        var value = new ReadOnlySpan<byte>(p + n, (int)valueLen);
+        var checksum = new ReadOnlySpan<byte>(p + n + valueLen, protectionBytes);
+        ulong info = KvChecksum.ProtectS(KvChecksum.ProtectKvo(userKey, value, (EntryType)(byte)packed), packed >> 8);
+        if (!KvChecksum.Verify(info, protectionBytes, checksum)) ThrowHelper.Corruption(KvChecksum.MemtableEntryCorruptedMessage);
     }
 
     /// <summary>MemTable::Add's bloom update: the prefix (if in the extractor's domain) and/or the whole key, without timestamp.</summary>
@@ -401,6 +488,10 @@ public sealed unsafe class MemTable : IDisposable
                     {
                         int w = Coding.EncodeVarint32(new Span<byte>(p, lenBytes), (uint)value.Length);
                         value.CopyTo(new Span<byte>(p + w, value.Length));
+                        // UpdateEntryChecksum(nullptr, key, value, type, existing_seq, p + value.size()).
+                        if (_protectionBytes != 0)
+                            KvChecksum.Encode(KvChecksum.ProtectS(KvChecksum.ProtectKvo(key, value, type), tag >> 8), _protectionBytes,
+                                new Span<byte>(p + w + value.Length, _protectionBytes));
                     }
                     finally
                     {
@@ -446,7 +537,12 @@ public sealed unsafe class MemTable : IDisposable
                     int w = Coding.EncodeVarint32(new Span<byte>(p, lenBytes), (uint)newPrevSize);
                     // shift the value buffer as well.
                     if (w < lenBytes) Buffer.MemoryCopy(prevBuffer, p + w, newPrevSize, newPrevSize);
+                    prevBuffer = p + w;
                 }
+                // UpdateEntryChecksum(nullptr, key, new_value, type, existing_seq, prev_buffer + new_prev_size).
+                if (_protectionBytes != 0)
+                    KvChecksum.Encode(KvChecksum.ProtectS(KvChecksum.ProtectKvo(key, new ReadOnlySpan<byte>(prevBuffer, newPrevSize), EntryType.Value), tag >> 8),
+                        _protectionBytes, new Span<byte>(prevBuffer + newPrevSize, _protectionBytes));
                 UpdateFlushState();
                 return UpdateCallbackResult.Done;
             }
@@ -620,6 +716,12 @@ public sealed unsafe class MemTable : IDisposable
             // With user-defined timestamps older timestamps sort after the lookup key whatever their seqno: entries
             // newer than the read snapshot are skipped (native returns NotFound for keys written after the snapshot).
             if (tsSize != 0 && seq > lookupSeq) continue;
+            if (_protectionBytes != 0)
+            {
+                TestHooks.InvokeSpan("Memtable::SaveValue:Found:entry", new Span<byte>(entry, EncodedEntryLength(entry, _protectionBytes)));
+                // Memtable entry corrupted: Corruption ends the lookup (found_final_value).
+                VerifyEntryChecksum(entry, _protectionBytes);
+            }
             if (timestampSink is { TimestampSize: not 0 }) timestampSink.RecordTimestampOfUserKey(entryUserKey, seq);
             var type = (EntryType)(byte)tag;
             if (sequence == DbFormat.MaxSequenceNumber)
@@ -716,7 +818,7 @@ public sealed unsafe class MemTable : IDisposable
     private sealed record RangeDelCacheEntry(int Version, FragmentedRangeTombstoneList List);
 
     /// <summary>Iterator over point entries (internal keys). Allocation-free; valid while the memtable is alive.</summary>
-    public MemTableIterator NewIterator() => new(_table);
+    public MemTableIterator NewIterator() => new(_table, _protectionBytes);
 
     /// <summary>
     /// Iterator over point entries that, when <paramref name="usePrefixBloom"/> and the memtable has a bloom filter, skips
@@ -724,7 +826,9 @@ public sealed unsafe class MemTable : IDisposable
     /// or neither total_order_seek nor auto_prefix_mode, with the column family's own prefix extractor).
     /// </summary>
     public MemTableIterator NewIterator(bool usePrefixBloom) =>
-        usePrefixBloom && _bloom is not null && _prefixExtractor is not null ? new(_table, _bloom, _prefixExtractor, _tsSize) : new(_table);
+        usePrefixBloom && _bloom is not null && _prefixExtractor is not null
+            ? new(_table, _bloom, _prefixExtractor, _tsSize, _protectionBytes)
+            : new(_table, _protectionBytes);
 
     /// <summary>
     /// Whether a DB iterator with <paramref name="readOptions"/> and the column family extractor
@@ -735,7 +839,7 @@ public sealed unsafe class MemTable : IDisposable
         && (readOptions?.PrefixSameAsStart == true || (readOptions?.TotalOrderSeek != true && readOptions?.AutoPrefixMode != true));
 
     /// <summary>Iterator over raw range-deletion entries: key = start internal key, value = end user key.</summary>
-    public MemTableIterator NewRangeTombstoneEntryIterator() => new(_rangeDelTable);
+    public MemTableIterator NewRangeTombstoneEntryIterator() => new(_rangeDelTable, _protectionBytes);
 
     /// <summary>Estimated number of point entries in [startInternalKey, endInternalKey).</summary>
     public ulong ApproximateNumEntries(ReadOnlySpan<byte> startInternalKey, ReadOnlySpan<byte> endInternalKey)
@@ -890,29 +994,58 @@ public unsafe struct MemTableIterator
     private readonly DynamicBloom? _bloom;
     private readonly SliceTransform? _prefixExtractor;
     private readonly int _tsSize;
+    // memtable_protection_bytes_per_key: every position is verified (MemTableIterator::VerifyEntryChecksum), a corrupted
+    // entry throws Corruption (upstream: invalid iterator with a Corruption status).
+    private readonly int _protectionBytes;
 
-    internal MemTableIterator(InlineSkipList<MemTableKeyComparer> list)
+    internal MemTableIterator(InlineSkipList<MemTableKeyComparer> list, int protectionBytes)
     {
         _it = new InlineSkipList<MemTableKeyComparer>.Iterator(list);
         _bloom = null;
         _prefixExtractor = null;
         _tsSize = 0;
+        _protectionBytes = protectionBytes;
     }
 
-    internal MemTableIterator(InlineSkipList<MemTableKeyComparer> list, DynamicBloom bloom, SliceTransform prefixExtractor, int tsSize)
+    internal MemTableIterator(InlineSkipList<MemTableKeyComparer> list, DynamicBloom bloom, SliceTransform prefixExtractor, int tsSize, int protectionBytes)
     {
         _it = new InlineSkipList<MemTableKeyComparer>.Iterator(list);
         _bloom = bloom;
         _prefixExtractor = prefixExtractor;
         _tsSize = tsSize;
+        _protectionBytes = protectionBytes;
     }
 
     public readonly bool Valid => _it.Valid;
 
-    public void SeekToFirst() => _it.SeekToFirst();
-    public void SeekToLast() => _it.SeekToLast();
-    public void Next() => _it.Next();
-    public void Prev() => _it.Prev();
+    public void SeekToFirst()
+    {
+        _it.SeekToFirst();
+        if (_protectionBytes != 0) VerifyEntryChecksum();
+    }
+
+    public void SeekToLast()
+    {
+        _it.SeekToLast();
+        if (_protectionBytes != 0) VerifyEntryChecksum();
+    }
+
+    public void Next()
+    {
+        _it.Next();
+        if (_protectionBytes != 0) VerifyEntryChecksum();
+    }
+
+    public void Prev()
+    {
+        _it.Prev();
+        if (_protectionBytes != 0) VerifyEntryChecksum();
+    }
+
+    private readonly void VerifyEntryChecksum()
+    {
+        if (_it.Valid) MemTable.VerifyEntryChecksum(_it.Key, _protectionBytes);
+    }
 
     /// <summary>Positions at the first entry with internal key &gt;= <paramref name="internalKey"/>.</summary>
     public void Seek(ReadOnlySpan<byte> internalKey)
@@ -923,6 +1056,7 @@ public unsafe struct MemTableIterator
             return;
         }
         fixed (byte* p = internalKey) _it.Seek(new SkipListKey(p, internalKey.Length));
+        if (_protectionBytes != 0) VerifyEntryChecksum();
     }
 
     /// <summary>Positions at the last entry with internal key &lt;= <paramref name="internalKey"/>.</summary>
@@ -934,6 +1068,7 @@ public unsafe struct MemTableIterator
             return;
         }
         fixed (byte* p = internalKey) _it.SeekForPrev(new SkipListKey(p, internalKey.Length));
+        if (_protectionBytes != 0) VerifyEntryChecksum();
     }
 
     /// <summary>The iterator only uses the prefix bloom filter (never the whole key).</summary>

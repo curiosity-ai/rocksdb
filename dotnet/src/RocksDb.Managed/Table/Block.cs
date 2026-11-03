@@ -35,6 +35,10 @@ public sealed class Block : IDisposable
     private int _length;
     private bool _rented;
     private int _refCount;
+    // block_protection_bytes_per_key requested by the table reader that loaded this block, and the per key-value
+    // checksums (computed on first verification, then shared by every iterator over the block).
+    private int _kvProtectionBytes;
+    private BlockKvProtection? _kvProtection;
 
     /// <summary>Uncompressed block bytes.</summary>
     public ReadOnlySpan<byte> Data => new(_buffer, 0, _length);
@@ -80,6 +84,8 @@ public sealed class Block : IDisposable
         b._length = length;
         b._rented = rentedFromSharedPool;
         b._refCount = 1;
+        b._kvProtectionBytes = 0;
+        b._kvProtection = null;
         try
         {
             b.Parse();
@@ -161,6 +167,22 @@ public sealed class Block : IDisposable
     internal uint GetRestartPoint(int index) => Coding.DecodeFixed32(new ReadOnlySpan<byte>(_buffer, RestartOffset + index * 4, 4));
 
     public void AddRef() => Interlocked.Increment(ref _refCount);
+
+    /// <summary>
+    /// Requests per key-value checksum protection (block_protection_bytes_per_key: 1, 2, 4 or 8) for this key/value
+    /// block: every iterator over it verifies each entry it positions on. Set by the table reader right after loading.
+    /// </summary>
+    internal void RequestKvProtection(int protectionBytesPerKey) => _kvProtectionBytes = protectionBytesPerKey;
+
+    /// <summary>The requested block_protection_bytes_per_key (0: none).</summary>
+    internal int KvProtectionBytes => _kvProtectionBytes;
+
+    /// <summary>The per key-value checksums once computed (see <see cref="PublishKvProtection"/>).</summary>
+    internal BlockKvProtection? KvProtection => Volatile.Read(ref _kvProtection);
+
+    /// <summary>Publishes the checksums computed by an iterator; the first published instance wins.</summary>
+    internal BlockKvProtection PublishKvProtection(BlockKvProtection protection) =>
+        Interlocked.CompareExchange(ref _kvProtection, protection, null) ?? protection;
 
     public void Release()
     {
