@@ -7,7 +7,9 @@ public sealed partial class ColumnFamily
     /// <c>("write_buffer_size", "131072")</c>, <c>("disable_auto_compactions", "true")</c>, <c>("compression",
     /// "kZSTD")</c>. All pairs are validated first; InvalidArgument for empty input, unknown names, immutable options
     /// ("Option not changeable") or bad values, in which case nothing changes. On success the new values take effect
-    /// for subsequent memtables, flushes and compactions, and a new OPTIONS file is written.
+    /// for subsequent memtables, flushes and compactions (block-based table options such as "table_factory.block_cache"
+    /// or "table_factory.filter_policy": for tables built and table readers opened afterwards), and a new OPTIONS file
+    /// is written.
     /// </summary>
     public void SetOptions(IEnumerable<KeyValuePair<string, string>> options) =>
         _db.SetOptionsAsync(_cfd, options, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();

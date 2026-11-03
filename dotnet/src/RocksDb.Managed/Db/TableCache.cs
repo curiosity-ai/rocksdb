@@ -259,7 +259,7 @@ internal sealed class TableCache : ITableCache, IDisposable
 {
     private readonly IFileSystem _fs;
     private readonly IReadOnlyList<string> _dbPaths;
-    private readonly TableReaderOptions _readerOptions;
+    private TableReaderOptions _readerOptions;
     private readonly TableCacheStore _store;
     private readonly bool _ownsStore;
     private volatile bool _disposed;
@@ -280,6 +280,13 @@ internal sealed class TableCache : ITableCache, IDisposable
         : this(new TableCacheStore(maxOpenFiles), fs, dbPaths, readerOptions)
     {
         _ownsStore = true;
+    }
+
+    /// <summary>Options for readers opened from now on (SetOptions replaces them; open readers keep theirs).</summary>
+    internal TableReaderOptions ReaderOptions
+    {
+        get => Volatile.Read(ref _readerOptions);
+        set => Volatile.Write(ref _readerOptions, value);
     }
 
     /// <summary>When set (DBOptions::statistics), table file reads are timed (SST_READ_MICROS, FILE_READ_*_MICROS).</summary>
@@ -384,7 +391,7 @@ internal sealed class TableCache : ITableCache, IDisposable
         BlockBasedTableReader reader;
         try
         {
-            TableReaderOptions opts = _readerOptions;
+            TableReaderOptions opts = ReaderOptions;
             if (file.LargestSeqno != opts.LargestSeqno || file.FileNumber != opts.FileNumber)
                 opts = opts with { LargestSeqno = file.LargestSeqno, FileNumber = file.FileNumber };
             reader = BlockBasedTableReader.Open(f, opts);
@@ -411,7 +418,7 @@ internal sealed class TableCache : ITableCache, IDisposable
             }
             // Tables without persisted timestamps: the start keys come back padded, the end keys (values) without a
             // timestamp (tombstone_end_include_ts = false).
-            FragmentedRangeTombstoneList frag = FragmentedRangeTombstoneList.Build(_readerOptions.Comparator, list, endIncludesTimestamp: reader.PadTimestampSize == 0);
+            FragmentedRangeTombstoneList frag = FragmentedRangeTombstoneList.Build(reader.InternalComparator.UserComparator, list, endIncludesTimestamp: reader.PadTimestampSize == 0);
             h.RangeDels = frag.IsEmpty ? null : frag;
         }
     }

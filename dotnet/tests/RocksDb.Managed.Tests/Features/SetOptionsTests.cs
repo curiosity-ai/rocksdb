@@ -150,13 +150,65 @@ public sealed class SetOptionsTests
         BlockBasedTableOptions persisted = LatestOptions(fs).FindColumnFamily("default")!.TableOptions;
         Assert.AreEqual("8192", persisted.GetOption("block_size"));
         Assert.AreEqual("7", persisted.GetOption("block_restart_interval"));
-        // Unknown table options, options that are not changeable and a different factory are refused; nothing changes.
-        foreach (KeyValuePair<string, string> bad in new[] { P("table_factory.does_not_exist", "true"), P("table_factory.no_block_cache", "true"),
-                     P("table_factory", "PlainTable") })
+        // Unknown table options, invalid values and a different factory are refused; nothing changes.
+        foreach (KeyValuePair<string, string> bad in new[] { P("table_factory.does_not_exist", "true"), P("table_factory.no_block_cache", "maybe"),
+                     P("table_factory.block_cache", "lots"), P("table_factory", "PlainTable") })
         {
             var ex = Assert.ThrowsExactly<RocksDbException>(() => db.SetOptions([P("table_factory.block_size", "1024"), bad]));
             Assert.AreEqual(StatusCode.InvalidArgument, ex.Code, bad.Key);
         }
         Assert.AreEqual("8192", db.DefaultColumnFamily.Options.TableOptions.GetOption("block_size"));
+    }
+
+    /// <summary>
+    /// Reader-affecting block-based table options (TableFactoryParseFn clones the factory for any field): the block cache,
+    /// filter policy, cache/pin settings and index search type apply to table readers opened afterwards; readers already
+    /// open keep theirs.
+    /// </summary>
+    [TestMethod]
+    public void ReaderTableOptionsApplyToNewlyOpenedTables()
+    {
+        MemoryFileSystem fs = NewFs();
+        var cf = new ColumnFamilyOptions { DisableAutoCompactions = true };
+        cf.TableOptions.NoBlockCache = true;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cf);
+        RocksDb.Managed.Db.ColumnFamilyData cfd = db.DefaultColumnFamily.Data;
+        for (int i = 0; i < 300; i++) db.Put(Key(i), Value(i, 0));
+        db.Flush();
+        Assert.AreEqual("value-5-0" + new string('x', 5), GetString(db, "key000005"));
+        Assert.IsNull(cfd.ReaderOptions.FilterPolicy);
+
+        db.SetOptions([P("table_factory.no_block_cache", "false"), P("table_factory.block_cache", "4M"),
+            P("table_factory.filter_policy", "bloomfilter:10:false"), P("table_factory.cache_index_and_filter_blocks", "true"),
+            P("table_factory.index_block_search_type", "kAuto"), P("table_factory.pin_top_level_index_and_filter", "false")]);
+        RocksDb.Managed.Table.TableReaderOptions ro = cfd.ReaderOptions;
+        var cache = (RocksDb.Managed.Cache.BlockCache)ro.BlockCache;
+        Assert.AreEqual(4L << 20, cache.Capacity);
+        Assert.IsInstanceOfType<RocksDb.Managed.Table.Filters.BloomFilterPolicy>(ro.FilterPolicy);
+        Assert.IsTrue(ro.CacheIndexAndFilterBlocks);
+        Assert.IsFalse(ro.PinTopLevelIndexAndFilter);
+        Assert.AreEqual(IndexBlockSearchType.Auto, ro.IndexBlockSearchType);
+        Assert.AreSame(ro, cfd.TableCache.ReaderOptions);
+        // The table opened before keeps reading without the cache.
+        Assert.AreEqual(0L, cache.Usage);
+        Assert.AreEqual("value-5-0" + new string('x', 5), GetString(db, "key000005"));
+        Assert.AreEqual(0L, cache.Usage);
+
+        // A new table is opened with the new options: its blocks go to the new cache and it has a bloom filter.
+        for (int i = 300; i < 600; i++) db.Put(Key(i), Value(i, 0));
+        db.Flush();
+        Assert.AreEqual("value-400-0" + new string('x', 400 % 50), GetString(db, "key000400"));
+        Assert.IsTrue(cache.Usage > 0, "new reader uses the new block cache");
+        LiveFileMetadata newest = db.GetLiveFilesMetadata().MaxBy(f => f.FileNumber)!;
+        Assert.AreEqual("bloomfilter", db.GetPropertiesOfAllTables().Single(p => p.Key.EndsWith(newest.Name, StringComparison.Ordinal)).Value.FilterPolicyName);
+        BlockBasedTableOptions persisted = LatestOptions(fs).FindColumnFamily("default")!.TableOptions;
+        Assert.AreEqual("bloomfilter:10:false", persisted.GetOption("filter_policy"));
+        Assert.AreEqual("kAuto", persisted.GetOption("index_block_search_type"));
+        Assert.AreEqual("false", persisted.GetOption("no_block_cache"));
+
+        // Typed SetOptions with a block cache object.
+        RocksDb.Managed.Cache.BlockCache other = RocksDb.Managed.Cache.BlockCache.CreateLru(1 << 20);
+        db.DefaultColumnFamily.SetOptions(o => o.TableOptions.BlockCache = other);
+        Assert.AreSame(other, cfd.ReaderOptions.BlockCache);
     }
 }
