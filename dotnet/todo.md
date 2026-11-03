@@ -247,7 +247,8 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - Replication / secondary
   - [x] secondary tails the MANIFEST incrementally (native<->managed secondary compat), Raft network-partition tests, switchover hold trimmed (probe promote, 3 fewer fsyncs), replication benchmarks (bench/RocksDb.Managed.Replication.Benchmarks)
   - [x] secondary verifies new files before installing a version
-  - [ ] re-measure switchover hold on a quiet machine (S)
+  - [x] switchover hold re-measured quietly (in-process p50 4.6-6.1 ms; multi-process median 27 ms)
+  - [x] replica keeps up at max rate: large chunks inserted into the memtable in parallel ranges (WriteOptions.MemtableInsertParallelism, replica default min(cores,4)); lag p50 39-268 ms -> 5-8 ms
 - Backup / error handling
   - [x] SstFileManager (space limit, trash deletion, compaction space pre-check) + no-space auto recovery; atomic WAL-error recovery flush
 - [x] Flaky-under-load hunt: LOCK release race (OFD lock shared with vforked children; unlock before close, as upstream), compaction zeroing seqnos of versions committed mid-compaction (current_key_committed_), WriteUnprepared rollback with two_write_queues visible before its commit (rollback batch now AddPrepared, deviation worth reporting upstream), compaction snapshot list taken at pick time (now with the job snapshot under the mutex); test-timing fixes for prefix-seek compat, blob auto-flush, write slowdown
