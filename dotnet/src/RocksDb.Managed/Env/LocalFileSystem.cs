@@ -315,6 +315,9 @@ internal sealed class LocalRandomAccessFile : IRandomAccessFile
         }
     }
 
+    /// <summary>PosixRandomAccessFile::Prefetch: readahead(2) on Linux; not supported with direct I/O.</summary>
+    public bool Prefetch(long offset, long length) => _alignment == 0 && UnixNative.TryReadahead(_handle, offset, length);
+
     public ValueTask<int> ReadAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken = default)
     {
         if (_alignment != 0) return ReadDirectAsync(offset, destination, cancellationToken);
@@ -611,9 +614,16 @@ internal sealed class LocalWritableFile : IWritableFile
         _path = path;
         _offloadAsyncSync = offloadAsyncSync;
         _options = options;
-        _handle = LocalFileSystem.OpenHandle(path, mode, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete, FileOptions.Asynchronous);
+        // FileMode.Create opens with O_CREAT and then always calls ftruncate(fd, 0), even on a file it just created. On
+        // ext4 a truncate to size 0 arms auto_da_alloc's "replace via truncate" heuristic, which starts the writeback of
+        // the file's delayed allocations when it is closed. Upstream (PosixFileSystem::NewWritableFile) opens with
+        // O_CREAT | O_TRUNC, which truncates only a file that already existed; do the same.
+        bool truncate = mode == FileMode.Create;
+        _handle = LocalFileSystem.OpenHandle(path, truncate ? FileMode.OpenOrCreate : mode, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete,
+            FileOptions.Asynchronous);
         try
         {
+            if (truncate && RandomAccess.GetLength(_handle) > 0) RandomAccess.SetLength(_handle, 0);
             if (append) _filePos = RandomAccess.GetLength(_handle);
             if (options.UseDirectIO)
             {

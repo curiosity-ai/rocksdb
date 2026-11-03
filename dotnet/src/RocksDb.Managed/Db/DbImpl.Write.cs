@@ -34,6 +34,13 @@ internal sealed partial class DbImpl
     /// WALs whose data was flushed are released unsynced. Leader-only.
     /// </summary>
     private readonly List<LogWriter> _closedWalsToSync = new();
+    /// <summary>
+    /// logs_to_free_: obsolete closed WAL writers taken off <see cref="_closedWalsToSync"/> by the write leader, closed
+    /// by the next obsolete-file purge (background) or at shutdown. Closing a large WAL whose tail is still being written
+    /// back can block for tens of milliseconds (ext4 releases its block reservation), which must not happen on the write
+    /// path. Guarded by the mutex.
+    /// </summary>
+    private readonly List<LogWriter> _walsToFree = new();
     /// <summary>Bytes appended to the current WAL (alive_wal_files_.back().size). Leader-only.</summary>
     private long _currentWalSize;
     /// <summary>wals_total_size_: bytes of all alive WALs (written by the leader, decremented by obsolete-file purges).</summary>
@@ -1013,18 +1020,34 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
-    /// Closes, without syncing, the closed WALs whose data is in table files (FindObsoleteFiles releasing logs_ entries
-    /// below min_log_number), so that WALs never synced by a write do not accumulate. Leader-only.
+    /// Releases, without syncing, the closed WALs whose data is in table files (FindObsoleteFiles moving logs_ entries
+    /// below min_log_number to logs_to_free_), so that WALs never synced by a write do not accumulate. Their writers are
+    /// closed by the next purge (<see cref="CloseFreedWals"/>), not here on the write path. Leader-only.
     /// </summary>
     private void ReleaseObsoleteClosedWals()
     {
         List<LogWriter> wals = _closedWalsToSync;
         if (wals.Count == 0) return;
-        ulong minLog;
-        lock (_mutex) minLog = MinLogNumberToKeepLive();
-        int n = 0;
-        while (n < wals.Count && wals[n].LogNumber < minLog) CloseQuietly(wals[n++]);
-        wals.RemoveRange(0, n);
+        lock (_mutex)
+        {
+            ulong minLog = MinLogNumberToKeepLive();
+            int n = 0;
+            while (n < wals.Count && wals[n].LogNumber < minLog) _walsToFree.Add(wals[n++]);
+            wals.RemoveRange(0, n);
+        }
+    }
+
+    /// <summary>Closes the writers released by <see cref="ReleaseObsoleteClosedWals"/> (JobContext::logs_to_free).</summary>
+    private void CloseFreedWals()
+    {
+        LogWriter[] freed;
+        lock (_mutex)
+        {
+            if (_walsToFree.Count == 0) return;
+            freed = _walsToFree.ToArray();
+            _walsToFree.Clear();
+        }
+        foreach (LogWriter w in freed) CloseQuietly(w);
     }
 
     private static void CloseQuietly(LogWriter w)

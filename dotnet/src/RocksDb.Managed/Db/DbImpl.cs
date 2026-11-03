@@ -533,6 +533,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         var manifests = new List<ulong>();
         List<(ColumnFamilyData Cfd, ulong Number)>? releasedBlobs = null;
         TestHooks.Invoke("DBImpl::PurgeObsoleteFiles:Start");
+        CloseFreedWals();
         ulong minLog;
         lock (_mutex)
         {
@@ -722,6 +723,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             // logs_.clear() (ClearWriter): closed WALs not synced yet are closed without a sync, like the current one.
             foreach (LogWriter closed in _closedWalsToSync) CloseQuietly(closed);
             _closedWalsToSync.Clear();
+            CloseFreedWals();
             LogWriter? log = _log;
             _log = null;
             if (log is not null)
