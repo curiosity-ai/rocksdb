@@ -177,7 +177,7 @@ Flags (same for all engines): `--num`, `--reads` (default num), `--key_size` (16
 `--disable_wal`, `--sync`, `--cache_size` (8 MiB), `--cache_type` (lru|hyperclock), `--bloom_bits` (10),
 `--write_buffer_size` (64 MiB), `--block_size` (4096), `--compression` (none|snappy|lz4|zstd), `--compression_parallel_threads` (1; managed only),
 `--compression_ratio` (0.5), `--target_file_size_base` (64 MiB), `--max_bytes_for_level_base` (256 MiB),
-`--level0_file_num_compaction_trigger` (4), `--disable_auto_compactions`, `--max_background_jobs` (2), `--enable_pipelined_write` (false),
+`--level0_file_num_compaction_trigger` (4), `--disable_auto_compactions`, `--max_background_jobs` (2), `--enable_pipelined_write` (false), `--unordered_write` (false),
 `--enable_blob_files` / `--min_blob_size` (0) (integrated BlobDB; set through the C API for c-native and rocksdb-sharp), `--use_existing_db`,
 `--seed` (301), `--db`, `--histogram` (1), `--warmup` (true) / `--warmup_ops` / `--warmup_min_ms` (1000) (see "Warm-up"). `--async` (managed only) runs each worker as a task over
 `PutAsync`/`TryGetAsync`/`DeleteAsync`/`WriteAsync` and the async iterator, and `flush`/`compact`/`waitforcompaction` over

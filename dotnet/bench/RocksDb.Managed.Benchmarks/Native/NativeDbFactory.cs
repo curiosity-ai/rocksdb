@@ -93,6 +93,7 @@ public static class NativeDbFactory
         RocksDbSharp.Native.Instance.rocksdb_options_compaction_readahead_size(dbOptions.Handle, (UIntPtr)options.CompactionReadaheadSize);
         RocksDbSharp.Native.Instance.rocksdb_options_set_max_subcompactions(dbOptions.Handle, options.MaxSubcompactions);
         RocksDbSharp.Native.Instance.rocksdb_options_set_enable_pipelined_write(dbOptions.Handle, options.EnablePipelinedWrite ? (byte)1 : (byte)0);
+        RocksDbSharp.Native.Instance.rocksdb_options_set_unordered_write(dbOptions.Handle, options.UnorderedWrite ? (byte)1 : (byte)0);
         if (options.EnableBlobFiles)
         {
             // Blob options are not wrapped by rocksdb-sharp either.

@@ -132,6 +132,8 @@ public sealed record EngineOptions
     public bool AllowConcurrentMemtableWrite { get; init; } = true;
     /// <summary>--enable_pipelined_write (false): separate WAL and memtable write stages (all engines).</summary>
     public bool EnablePipelinedWrite { get; init; }
+    /// <summary>--unordered_write (false): memtable inserts after the WAL write group, unordered (all engines).</summary>
+    public bool UnorderedWrite { get; init; }
     /// <summary>enable_write_thread_adaptive_yield (managed engine only; native uses its default, true).</summary>
     public bool EnableWriteThreadAdaptiveYield { get; init; } = true;
 

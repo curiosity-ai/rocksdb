@@ -45,7 +45,7 @@ public sealed class ManagedEngine : IKeyValueEngine
         var dbo = new DbOptions { CreateIfMissing = true, FileSystem = LocalFileSystem.Instance, MaxBackgroundJobs = options.MaxBackgroundJobs,
             MaxSubcompactions = options.MaxSubcompactions, CompactionReadaheadSize = options.CompactionReadaheadSize,
             AllowConcurrentMemtableWrite = options.AllowConcurrentMemtableWrite, EnableWriteThreadAdaptiveYield = options.EnableWriteThreadAdaptiveYield,
-            EnablePipelinedWrite = options.EnablePipelinedWrite };
+            EnablePipelinedWrite = options.EnablePipelinedWrite, UnorderedWrite = options.UnorderedWrite };
         return (dbo, cfo);
     }
 

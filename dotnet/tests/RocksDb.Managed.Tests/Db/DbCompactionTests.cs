@@ -669,7 +669,13 @@ public sealed class DbCompactionTests
             Assert.IsGreaterThanOrEqualTo(400, sw.ElapsedMilliseconds, "elapsed " + sw.ElapsedMilliseconds);
             gate.Set();
             db2.CompactRange();
-            Assert.AreEqual("0", db2.GetProperty("rocksdb.actual-delayed-write-rate"));
+            // Background work that the manual compaction scheduled (EndExclusiveManual) finishes first; then L0 is empty
+            // and the stall released (ColumnFamilyData::RecalculateWriteStallConditions: no delay token without L0
+            // pressure). Checking L0 first tells a compaction-timing failure from a leaked delay token.
+            db2.WaitForCompact();
+            Assert.AreEqual("0", db2.GetProperty("rocksdb.num-files-at-level0"), "L0 after CompactRange");
+            Assert.AreEqual("0", db2.GetProperty("rocksdb.is-write-stopped"));
+            Assert.AreEqual("0", db2.GetProperty("rocksdb.actual-delayed-write-rate"), "delay token still held with an empty L0");
         }
         finally
         {

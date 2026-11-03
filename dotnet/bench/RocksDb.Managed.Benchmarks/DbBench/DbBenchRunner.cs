@@ -1079,6 +1079,7 @@ public static class DbBenchRunner
                 case "min_blob_size": o = o with { MinBlobSize = ulong.Parse(value, ci) }; break;
                 case "allow_concurrent_memtable_write": o = o with { AllowConcurrentMemtableWrite = ParseBool(value) }; break;
                 case "enable_pipelined_write": o = o with { EnablePipelinedWrite = ParseBool(value) }; break;
+                case "unordered_write": o = o with { UnorderedWrite = ParseBool(value) }; break;
                 case "enable_write_thread_adaptive_yield": o = o with { EnableWriteThreadAdaptiveYield = ParseBool(value) }; break;
                 case "max_background_jobs": o = o with { MaxBackgroundJobs = int.Parse(value, ci) }; break;
                 case "compaction_readahead_size": o = o with { CompactionReadaheadSize = ulong.Parse(value, ci) }; break;
@@ -1144,7 +1145,7 @@ public static class DbBenchRunner
         Console.Error.WriteLine("               [--write_buffer_size BYTES] [--block_size 4096] [--compression none|snappy|lz4|zstd] [--compression_parallel_threads 1] [--compression_ratio 0.5]");
         Console.Error.WriteLine("               [--target_file_size_base BYTES] [--max_bytes_for_level_base BYTES] [--level0_file_num_compaction_trigger 4]");
         Console.Error.WriteLine("               [--disable_auto_compactions] [--max_background_jobs 2] [--max_subcompactions 1] [--enable_blob_files] [--min_blob_size 0]");
-        Console.Error.WriteLine("               [--enable_pipelined_write false] [--allow_concurrent_memtable_write true (managed only)]");
+        Console.Error.WriteLine("               [--enable_pipelined_write false] [--unordered_write false] [--allow_concurrent_memtable_write true (managed only)]");
         Console.Error.WriteLine("               [--compaction_readahead_size 2097152] [--drop_page_cache false] [--reverse_iterator false]");
         Console.Error.WriteLine("               [--use_existing_db] [--seed 301] [--db PATH] [--histogram 1] [--c_bench PATH-TO-rocksdb_bench]");
         Console.Error.WriteLine("               [--warmup true|false] [--warmup_ops N (default max(50k, num/10), <= 200k, <= num)] [--warmup_min_ms 1000]");
