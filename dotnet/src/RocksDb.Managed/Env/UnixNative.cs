@@ -81,6 +81,9 @@ internal static partial class UnixNative
     [LibraryImport(LibC, SetLastError = true)]
     private static partial int sync_file_range(int fd, long offset, long nbytes, uint flags);
 
+    [LibraryImport(LibC, SetLastError = true)]
+    private static partial nint readahead(int fd, long offset, nuint count);
+
     [LibraryImport(LibC, EntryPoint = "fcntl", SetLastError = true)]
     private static partial int fcntl_int(int fd, int cmd, int arg);
 
@@ -175,6 +178,32 @@ internal static partial class UnixNative
         }
         catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException)
         {
+            return false;
+        }
+        finally
+        {
+            if (addRef) handle.DangerousRelease();
+        }
+    }
+
+    private static volatile bool s_readaheadUnavailable;
+
+    /// <summary>
+    /// readahead(2) like PosixRandomAccessFile::Prefetch: starts reading the range into the page cache. False when
+    /// unsupported (not Linux, no libc entry point, or the call failed).
+    /// </summary>
+    public static bool TryReadahead(SafeFileHandle handle, long offset, long length)
+    {
+        if (!IsLinux || !Environment.Is64BitProcess || s_readaheadUnavailable || length <= 0) return false;
+        bool addRef = false;
+        try
+        {
+            handle.DangerousAddRef(ref addRef);
+            return readahead((int)handle.DangerousGetHandle(), offset, (nuint)length) == 0;
+        }
+        catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException)
+        {
+            s_readaheadUnavailable = true;
             return false;
         }
         finally

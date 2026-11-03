@@ -28,6 +28,14 @@ public interface IRandomAccessFile : IDisposable
     /// <summary>Reads up to destination.Length bytes at offset; returns bytes read (short only at EOF).</summary>
     int Read(long offset, Span<byte> destination);
     ValueTask<int> ReadAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// FSRandomAccessFile::Prefetch: asks the OS to read <paramref name="length"/> bytes at <paramref name="offset"/> into
+    /// its page cache without copying them (Linux readahead(2), as PosixRandomAccessFile). Returns false when the file
+    /// does not support it (IOStatus::NotSupported: direct I/O, other platforms, in-memory files); callers then use their
+    /// own prefetch buffer.
+    /// </summary>
+    bool Prefetch(long offset, long length) => false;
 }
 
 /// <summary>CONTRACT (owned by stream F). Sequential reads (WAL/MANIFEST replay). Port of SequentialFileReader.</summary>

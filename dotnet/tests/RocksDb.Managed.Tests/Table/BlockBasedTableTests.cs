@@ -435,6 +435,52 @@ public sealed class BlockBasedTableTests
         fixedIt.Dispose();
     }
 
+    /// <summary>
+    /// BlockPrefetcher implicit auto readahead on a file that supports Prefetch (readahead(2)): no readahead buffer; after
+    /// num_file_reads_for_auto_readahead sequential blocks the iterator asks the OS for the block plus readahead_size_
+    /// bytes, again only for a block beyond the prefetched range (readahead_limit_), doubling the size up to
+    /// max_auto_readahead_size; data blocks are still read one by one. A seek to a non-sequential block resets the size.
+    /// </summary>
+    [TestMethod]
+    public void IteratorAutoReadaheadUsesFilePrefetch()
+    {
+        List<(byte[] Key, byte[] Value)> entries = MakeEntries(4000, 12, 200);
+        byte[] data = BuildTable(entries, new TableFormatOptions { BlockSize = 1024 });
+        var file = new MemRandomAccessFile(data) { SupportsPrefetch = true };
+        using BlockBasedTableReader reader = BlockBasedTableReader.Open(file, TableReaderOptions.Default);
+        int before = file.Reads;
+        using BlockBasedTableIterator it = reader.NewIterator();
+        int n = 0;
+        for (it.SeekToFirst(); it.Valid; it.Next()) CollectionAssert.AreEqual(entries[n++].Key, it.Key.ToArray());
+        Assert.AreEqual(entries.Count, n);
+        Assert.IsNull(it.Readahead, "no prefetch buffer when the file supports Prefetch");
+        int blockReads = file.Reads - before;
+        Assert.IsTrue(blockReads > 100, "data blocks are read individually: " + blockReads);
+        List<(long Offset, long Length)> calls = file.PrefetchCalls;
+        Assert.IsTrue(calls.Count >= 6, "prefetches: " + calls.Count);
+        // readahead_size_ = 8, 16, 32, 64, 128, 256, 256 KiB ... on top of the block that triggered the prefetch.
+        long expected = 8 * 1024;
+        for (int i = 0; i < calls.Count; i++)
+        {
+            long blockLength = calls[i].Length - expected;
+            Assert.IsTrue(blockLength > 0 && blockLength < 2048, "prefetch #" + i + ": " + calls[i].Length + " bytes, readahead " + expected);
+            if (i > 0)
+            {
+                // Issued for the first block that ends past the previous prefetched range.
+                long previousEnd = calls[i - 1].Offset + calls[i - 1].Length;
+                Assert.IsTrue(calls[i].Offset <= previousEnd && calls[i].Offset + blockLength > previousEnd, "prefetch #" + i);
+            }
+            expected = Math.Min(256 * 1024, expected * 2);
+        }
+        // Seek + 10 Next (~4 entries per block): the first two blocks after a non-sequential seek never prefetch, the
+        // third asks for initial_auto_readahead_size again (ResetValues), the fourth is inside that range.
+        calls.Clear();
+        it.Seek(entries[100].Key);
+        for (int i = 0; i < 10 && it.Valid; i++) it.Next();
+        Assert.IsTrue(calls.Count <= 1, "Seek + 10 Next: " + calls.Count + " prefetches");
+        foreach ((long _, long length) in calls) Assert.IsTrue(length > 8 * 1024 && length < 8 * 1024 + 2048, "reset to 8 KiB: " + length);
+    }
+
     [TestMethod]
     public void BlockCacheSeamIsUsed()
     {

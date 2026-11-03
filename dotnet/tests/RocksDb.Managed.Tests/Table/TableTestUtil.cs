@@ -45,6 +45,15 @@ internal sealed class MemRandomAccessFile(byte[] data) : IRandomAccessFile
         await Task.Yield();
         return Read(offset, destination.Span);
     }
+    /// <summary>When true, <see cref="Prefetch"/> succeeds (an OS readahead) and records its ranges.</summary>
+    public bool SupportsPrefetch;
+    public readonly List<(long Offset, long Length)> PrefetchCalls = new();
+    public bool Prefetch(long offset, long length)
+    {
+        if (!SupportsPrefetch) return false;
+        PrefetchCalls.Add((offset, length));
+        return true;
+    }
     public void Dispose() { }
 }
 

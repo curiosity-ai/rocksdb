@@ -1638,6 +1638,8 @@ public sealed partial class BlockBasedTableReader : IDisposable
         public ValueTask<int> ReadAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken = default) =>
             new(Read(offset, destination.Span));
 
+        public bool Prefetch(long offset, long length) => _inner.Prefetch(offset, length);
+
         public void ReleaseBuffer()
         {
             if (_tail is not null) ArrayPool<byte>.Shared.Return(_tail);

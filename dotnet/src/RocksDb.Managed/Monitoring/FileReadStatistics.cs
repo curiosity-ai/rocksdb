@@ -95,5 +95,7 @@ internal sealed class StatisticsRandomAccessFile(IRandomAccessFile inner, Statis
         fileHistogram?.Add(micros);
     }
 
+    public bool Prefetch(long offset, long length) => inner.Prefetch(offset, length);
+
     public void Dispose() => inner.Dispose();
 }
