@@ -641,14 +641,18 @@ public sealed class DbCompactionTests
             using RocksDatabase db2 = RocksDatabase.Open(DbPath, dbo, cfo);
             Assert.AreEqual("0", db2.GetProperty("rocksdb.is-write-stopped"));
             Assert.AreNotEqual("0", db2.GetProperty("rocksdb.actual-delayed-write-rate"));
+            // The clock starts before the first delayed write: the WriteController refills credit for the time that
+            // passes between writes (a descheduled test thread gets that time back as credit), so only the span from
+            // its first refill has a scheduling-independent lower bound: (bytes requested - 1 ms of credit) / rate.
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             var ex = Assert.ThrowsExactly<RocksDbException>(() =>
             {
                 for (int i = 0; i < 100; i++) db2.Put(new WriteOptions { NoSlowdown = true }, Key(100 + i), new byte[4096]);
             });
             Assert.AreEqual(StatusCode.Incomplete, ex.Code);
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            for (int i = 0; i < 10; i++) db2.Put(Key(200 + i), new byte[4096]); // 40KB at 100KB/s
-            Assert.IsTrue(sw.ElapsedMilliseconds >= 150, "elapsed " + sw.ElapsedMilliseconds);
+            for (int i = 0; i < 10; i++) db2.Put(Key(200 + i), new byte[4096]);
+            // 11 delayed writes of 4 KiB (the rejected one is charged too) at 100 KB/s: at least ~440 ms.
+            Assert.IsGreaterThanOrEqualTo(400, sw.ElapsedMilliseconds, "elapsed " + sw.ElapsedMilliseconds);
             gate.Set();
             db2.CompactRange();
             Assert.AreEqual("0", db2.GetProperty("rocksdb.actual-delayed-write-rate"));
