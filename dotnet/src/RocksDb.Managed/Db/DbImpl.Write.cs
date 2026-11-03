@@ -65,6 +65,7 @@ internal sealed partial class DbImpl
         if (_readOnly) ThrowReadOnly();
         if (options is { Sync: true, DisableWal: true }) ThrowHelper.InvalidArgument("Sync writes has to enable WAL.");
         if (batch.DataSize < WriteBatch.HeaderSize) ThrowHelper.Corruption("malformed WriteBatch (too small)");
+        if (options is { ProtectionBytesPerKey: not 0 } || batch.ProtectionBytesPerKey != 0) PrepareProtectedWrite(options, batch);
         if (validateColumnFamilies)
         {
             ValidateColumnFamilies(batch, options?.IgnoreMissingColumnFamilies ?? false);
@@ -319,6 +320,9 @@ internal sealed partial class DbImpl
                     walRecordBytes = record.Length;
                     try
                     {
+                        // DBImpl::WriteToWAL: merged_batch.VerifyChecksum() (each protected batch of the group).
+                        if (Volatile.Read(ref _protectedWrites) != 0)
+                            VerifyWalRecordProtection(valid == 1 && !firstValid!.Batch!.HasWalTerminationPoint ? firstValid.Batch : _groupBatch);
                         LogWriter log = _log!;
                         // DBImpl::WriteToWAL: record the timestamp sizes of column families with timestamps not yet recorded
                         // in this WAL (recovery uses them to reconcile timestamp-size changes).
@@ -450,6 +454,7 @@ internal sealed partial class DbImpl
             if (_seqPerBatch) mb.Sequence = inserter.Sequence;
             inserter.IgnoreMissingColumnFamilies = w.IgnoreMissingColumnFamilies;
             inserter.LogRef = t?.LogRef ?? 0;
+            inserter.SetProtection(mb);
             try
             {
                 inserter.Run(mb.Data);
@@ -511,6 +516,7 @@ internal sealed partial class DbImpl
         var inserter = MemTableInserter.ForConcurrentWriter(this, w.IgnoreMissingColumnFamilies);
         WriteBatch b = w.Batch!;
         inserter.Sequence = b.Sequence;
+        inserter.SetProtection(b);
         try
         {
             inserter.Run(b.Data);
@@ -1031,6 +1037,16 @@ internal sealed partial class DbImpl
         private readonly bool _writeAfterCommit;
         private readonly WriteBatch.TxnMarkerPolicy _policy;
         private DuplicateDetector? _dupDetector;
+        // prot_info_ of the batch being inserted (WriteBatch per key-value protection) and the next entry's index.
+        private WriteBatch? _protBatch;
+        private int _protIdx;
+
+        /// <summary>set_prot_info: the protection info of <paramref name="batch"/> is used for its next <see cref="Run"/>.</summary>
+        public void SetProtection(WriteBatch batch)
+        {
+            _protBatch = batch.ProtectionBytesPerKey != 0 ? batch : null;
+            _protIdx = 0;
+        }
         // concurrent_memtable_writes_: inserts use MemTable.AddConcurrently, whose counters are accumulated per memtable
         // (post_info_map_; one memtable at a time here, flushed when the batch moves to another) and applied by
         // PostProcess.
@@ -1056,6 +1072,8 @@ internal sealed partial class DbImpl
             _policy = !_seqPerBatch ? WriteBatch.TxnMarkerPolicy.WriteCommitted
                 : db._batchPerTxn ? WriteBatch.TxnMarkerPolicy.WritePrepared : WriteBatch.TxnMarkerPolicy.WriteUnprepared;
             _dupDetector = null;
+            _protBatch = null;
+            _protIdx = 0;
             _concurrent = false;
             _postMem = null;
             _postCfd = null;
@@ -1113,6 +1131,14 @@ internal sealed partial class DbImpl
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void Add(uint cf, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
         {
+            // NextProtectionInfo: the batch's ProtectionInfoKVOC64 of this entry, without its column family (KVO).
+            bool hasProt = false;
+            ulong kvo = 0;
+            if (_protBatch is not null && _protIdx < _protBatch.ProtectionInfo.Length)
+            {
+                kvo = KvChecksum.StripC(_protBatch.ProtectionInfo[_protIdx++], cf);
+                hasProt = true;
+            }
             ColumnFamilyData? c = _db.CfForInsert(cf, _logNumber, IgnoreMissingColumnFamilies);
             if (c is null)
             {
@@ -1129,9 +1155,13 @@ internal sealed partial class DbImpl
                 return;
             }
             // MemTableInserter::DeleteCF: a deletion in a column family with timestamps is kTypeDeletionWithTimestamp.
-            if (type == EntryType.Deletion && c.TimestampSize != 0) type = EntryType.DeletionWithTimestamp;
+            if (type == EntryType.Deletion && c.TimestampSize != 0)
+            {
+                type = EntryType.DeletionWithTimestamp;
+                if (hasProt) kvo = KvChecksum.UpdateO(kvo, EntryType.Deletion, EntryType.DeletionWithTimestamp);
+            }
             MemTable mem = c.Mem;
-            while (!AddToMemTable(c, mem, type, key, value))
+            while (!AddToMemTable(c, mem, type, key, value, hasProt, kvo))
             {
                 // key+seq exists (TryAgain). Without seq_per_batch this can only come from replaying an already applied
                 // batch: ignore it like upstream. With seq_per_batch the key starts a new sub-batch: advance and retry.
@@ -1150,15 +1180,17 @@ internal sealed partial class DbImpl
         /// the DB read fallback when the memtable has no value for the key. Returns false when the key+seq exists.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private bool AddToMemTable(ColumnFamilyData c, MemTable mem, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        private bool AddToMemTable(ColumnFamilyData c, MemTable mem, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value,
+            bool hasProt, ulong kvo)
         {
-            if (_concurrent) return AddConcurrently(c, mem, type, key, value);
+            if (_concurrent) return AddConcurrently(c, mem, type, key, value, hasProt, kvo);
             if (!mem.InplaceUpdateSupport || type is not (EntryType.Value or EntryType.WideColumnEntity or EntryType.BlobIndex or EntryType.ValuePreferredSeqno))
-                return mem.Add(Sequence, type, key, value);
+                return hasProt ? mem.Add(Sequence, type, key, value, true, KvChecksum.ProtectS(kvo, Sequence)) : mem.Add(Sequence, type, key, value);
             return AddInplace(c, mem, type, key, value);
         }
 
-        private bool AddConcurrently(ColumnFamilyData c, MemTable mem, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        private bool AddConcurrently(ColumnFamilyData c, MemTable mem, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value,
+            bool hasProt, ulong kvo)
         {
             if (!ReferenceEquals(mem, _postMem))
             {
@@ -1166,7 +1198,9 @@ internal sealed partial class DbImpl
                 _postMem = mem;
                 _postCfd = c;
             }
-            return mem.AddConcurrently(Sequence, type, key, value, ref _post);
+            return hasProt
+                ? mem.AddConcurrently(Sequence, type, key, value, ref _post, true, KvChecksum.ProtectS(kvo, Sequence))
+                : mem.AddConcurrently(Sequence, type, key, value, ref _post);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]

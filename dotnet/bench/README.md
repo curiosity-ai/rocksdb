@@ -175,7 +175,7 @@ Flags (same for all engines): `--num`, `--reads` (default num), `--key_size` (16
 `--reverse_iterator` (seekrandom: SeekForPrev + `--seek_nexts` Prev, db_bench's flag), `--compaction_readahead_size`
 (2 MiB), `--drop_page_cache` (`compact` evicts the SSTs from the OS page cache first: fsync + POSIX_FADV_DONTNEED), `--txn_puts` (10),
 `--disable_wal`, `--sync`, `--cache_size` (8 MiB), `--cache_type` (lru|hyperclock), `--bloom_bits` (10),
-`--write_buffer_size` (64 MiB), `--block_size` (4096), `--compression` (none|snappy|lz4|zstd),
+`--write_buffer_size` (64 MiB), `--block_size` (4096), `--compression` (none|snappy|lz4|zstd), `--compression_parallel_threads` (1; managed only),
 `--compression_ratio` (0.5), `--target_file_size_base` (64 MiB), `--max_bytes_for_level_base` (256 MiB),
 `--level0_file_num_compaction_trigger` (4), `--disable_auto_compactions`, `--max_background_jobs` (2),
 `--enable_blob_files` / `--min_blob_size` (0) (integrated BlobDB; set through the C API for c-native and rocksdb-sharp), `--use_existing_db`,

@@ -308,6 +308,7 @@ public static class TableFactory
             PinTopLevelIndexAndFilter = t.PinTopLevelIndexAndFilter,
             PrefixExtractor = options.PrefixExtractor,
             DbSessionId = dbSessionId,
+            BlockProtectionBytesPerKey = (int)options.BlockProtectionBytesPerKey,
         };
         if (cache is not null) r = r with { BlockCache = cache };
         return r;

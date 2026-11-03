@@ -38,6 +38,8 @@ internal static class TestHooks
 #if DEBUG
         s_hooks.Clear();
         s_any = false;
+        s_spanHooks.Clear();
+        s_anySpan = false;
 #endif
     }
 
@@ -47,6 +49,33 @@ internal static class TestHooks
     {
 #if DEBUG
         if (s_any && s_hooks.TryGetValue(name, out Action? a)) a();
+#endif
+    }
+
+    /// <summary>A callback that may inspect or modify bytes (TEST_SYNC_POINT_CALLBACK with a Slice / buffer argument).</summary>
+    public delegate void SpanCallback(Span<byte> data);
+
+#if DEBUG
+    private static readonly ConcurrentDictionary<string, SpanCallback> s_spanHooks = new(StringComparer.Ordinal);
+    private static volatile bool s_anySpan;
+#endif
+
+    /// <summary>Installs (or with null removes) the span callback for <paramref name="name"/>. DEBUG builds only.</summary>
+    public static void SetSpan(string name, SpanCallback? callback)
+    {
+#if DEBUG
+        if (callback is null) s_spanHooks.TryRemove(name, out _);
+        else s_spanHooks[name] = callback;
+        s_anySpan = !s_spanHooks.IsEmpty;
+#endif
+    }
+
+    /// <summary>Runs the span callback registered for <paramref name="name"/>, if any (TEST_SYNC_POINT_CALLBACK).</summary>
+    [Conditional("DEBUG")]
+    public static void InvokeSpan(string name, Span<byte> data)
+    {
+#if DEBUG
+        if (s_anySpan && s_spanHooks.TryGetValue(name, out SpanCallback? a)) a(data);
 #endif
     }
 }

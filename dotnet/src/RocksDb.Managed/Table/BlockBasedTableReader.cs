@@ -19,6 +19,11 @@ public sealed record TableReaderOptions
     public FilterPolicy? FilterPolicy { get; init; }
     public bool VerifyChecksums { get; init; } = true;
     /// <summary>
+    /// block_protection_bytes_per_key (0, 1, 2, 4 or 8): per key-value checksums of the data, index and metaindex blocks
+    /// in memory, verified for every entry an iterator positions on (Corruption on mismatch). Default 0 (off).
+    /// </summary>
+    public int BlockProtectionBytesPerKey { get; init; }
+    /// <summary>
     /// Block cache for data blocks and index partitions (and the index/filter blocks with
     /// <see cref="CacheIndexAndFilterBlocks"/>). Default: none. Pass a <see cref="Cache.BlockCache"/>
     /// (<c>BlockCache.CreateHyperClock(...)</c> recommended, or <c>BlockCache.CreateLru(...)</c>), which the reader uses
@@ -455,7 +460,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     {
         bool verify = options.VerifyChecksums;
         var metaBlocks = new Dictionary<string, BlockHandle>(StringComparer.Ordinal);
-        Block metaindex = BlockFetcher.ReadBlock(file, footer, footer.MetaindexHandle, verify);
+        Block metaindex = Protect(BlockFetcher.ReadBlock(file, footer, footer.MetaindexHandle, verify), options);
         try
         {
             using var it = new BlockIter();
@@ -496,7 +501,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         BlockCache? metaCache = options.CacheIndexAndFilterBlocks ? options.BlockCache as BlockCache : null;
         CachePriority metaPriority = MetaPriority(options);
 
-        Block? indexBlock = BlockFetcher.ReadBlock(file, footer, indexHandle, verify);
+        Block? indexBlock = Protect(BlockFetcher.ReadBlock(file, footer, indexHandle, verify), options);
         Block? rangeDel = null;
         byte[]? filterBuf = null;
         Block? filterIndex = null;
@@ -518,7 +523,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
             }
 
             if (metaBlocks.TryGetValue(BlockBasedTableConstants.RangeDelBlockName, out BlockHandle rdHandle))
-                rangeDel = BlockFetcher.ReadBlock(file, footer, rdHandle, verify);
+                rangeDel = Protect(BlockFetcher.ReadBlock(file, footer, rdHandle, verify), options);
 
             // Port of the compression dictionary setup (ReadCompressionDictBlock / UncompressionDictReader): pinned by
             // the reader for its lifetime and used to decompress data blocks.
@@ -734,21 +739,21 @@ public sealed partial class BlockBasedTableReader : IDisposable
             return GetBlockRefLegacy(handle, kind, flags);
         }
         _stats?.Record(MissCounter(kind));
-        Block b = BlockFetcher.ReadBlock(prefetch, _footer, handle, _options.VerifyChecksums, DictFor(kind));
+        Block b = Protect(BlockFetcher.ReadBlock(prefetch, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind);
         return cache is null || (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
 
     private BlockRef ReadAndInsert(BlockCache cache, in CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
         _stats?.Record(MissCounter(kind));
-        Block b = BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind));
+        Block b = Protect(BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
 
     private BlockRef GetBlockRefLegacy(BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
         IBlockCache? legacy = _legacyCache;
-        if (legacy is null) return BlockRef.FromOwned(BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind)));
+        if (legacy is null) return BlockRef.FromOwned(Protect(BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind));
         var key = new BlockCacheKey(_tableId, handle.Offset);
         if (legacy.TryGet(key, out Block? b))
         {
@@ -756,7 +761,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
             return BlockRef.FromOwned(b);
         }
         _stats?.Record(MissCounter(kind));
-        b = BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind));
+        b = Protect(BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind);
         if ((flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(key, b);
         return BlockRef.FromOwned(b);
     }
@@ -806,16 +811,33 @@ public sealed partial class BlockBasedTableReader : IDisposable
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<BlockRef> ReadAndInsertAsync(BlockCache cache, CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags, CancellationToken ct)
     {
-        Block b = await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false);
+        Block b = Protect(await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false), kind);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<BlockRef> ReadAndInsertLegacyAsync(BlockHandle handle, BlockKind kind, TableReadFlags flags, CancellationToken ct)
     {
-        Block b = await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false);
+        Block b = Protect(await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false), kind);
         if (_legacyCache is { } legacy && (flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(new BlockCacheKey(_tableId, handle.Offset), b);
         return BlockRef.FromOwned(b);
+    }
+
+    /// <summary>
+    /// block_protection_bytes_per_key: requests per key-value checksums for a key/value block (data, index, metaindex,
+    /// range deletion) just loaded (Block::Initialize*ProtectionInfo in BlockCreateContext::Create). Filter blocks are
+    /// not key/value blocks and stay unprotected.
+    /// </summary>
+    private Block Protect(Block b, BlockKind kind)
+    {
+        if (_options.BlockProtectionBytesPerKey != 0 && kind != BlockKind.Filter) b.RequestKvProtection(_options.BlockProtectionBytesPerKey);
+        return b;
+    }
+
+    private static Block Protect(Block b, TableReaderOptions options)
+    {
+        if (options.BlockProtectionBytesPerKey != 0) b.RequestKvProtection(options.BlockProtectionBytesPerKey);
+        return b;
     }
 
     /// <summary>The top-level index block: pinned by the reader, or looked up in (and if evicted re-read into) the block cache.</summary>

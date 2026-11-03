@@ -100,6 +100,9 @@ public sealed record EngineOptions
     /// <summary>--write_buffer_size (64 MiB).</summary>
     public long WriteBufferSize { get; init; } = 64L << 20;
 
+    /// <summary>--compression_parallel_threads (CompressionOptions.parallel_threads, 1 = serial; managed engine only).</summary>
+    public uint CompressionParallelThreads { get; init; } = 1;
+
     /// <summary>--block_size (4 KiB).</summary>
     public int BlockSize { get; init; } = 4096;
 

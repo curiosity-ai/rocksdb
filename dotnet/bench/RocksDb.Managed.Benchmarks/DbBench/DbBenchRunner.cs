@@ -1070,6 +1070,7 @@ public static class DbBenchRunner
                 case "block_size": o = o with { BlockSize = int.Parse(value, ci) }; break;
                 case "compression":
                 case "compression_type": o = o with { Compression = BenchFlags.ParseCompression(value) }; break;
+                case "compression_parallel_threads": o = o with { CompressionParallelThreads = uint.Parse(value, ci) }; break;
                 case "target_file_size_base": o = o with { TargetFileSizeBase = long.Parse(value, ci) }; break;
                 case "max_bytes_for_level_base": o = o with { MaxBytesForLevelBase = long.Parse(value, ci) }; break;
                 case "level0_file_num_compaction_trigger": o = o with { Level0FileNumCompactionTrigger = int.Parse(value, ci) }; break;
@@ -1139,7 +1140,7 @@ public static class DbBenchRunner
         Console.Error.WriteLine("usage: dbbench [--engine rocksdb-sharp|managed|c-native] [--async] [--benchmarks a,b,...] [--num N] [--reads N]");
         Console.Error.WriteLine("               [--key_size 16] [--value_size 100] [--threads 1] [--batch_size 1] [--multiget_size 16] [--seek_nexts 10] [--txn_puts 10]");
         Console.Error.WriteLine("               [--disable_wal] [--sync] [--cache_size BYTES] [--cache_type lru|hyperclock] [--bloom_bits 10]");
-        Console.Error.WriteLine("               [--write_buffer_size BYTES] [--block_size 4096] [--compression none|snappy|lz4|zstd] [--compression_ratio 0.5]");
+        Console.Error.WriteLine("               [--write_buffer_size BYTES] [--block_size 4096] [--compression none|snappy|lz4|zstd] [--compression_parallel_threads 1] [--compression_ratio 0.5]");
         Console.Error.WriteLine("               [--target_file_size_base BYTES] [--max_bytes_for_level_base BYTES] [--level0_file_num_compaction_trigger 4]");
         Console.Error.WriteLine("               [--disable_auto_compactions] [--max_background_jobs 2] [--max_subcompactions 1] [--enable_blob_files] [--min_blob_size 0]");
         Console.Error.WriteLine("               [--compaction_readahead_size 2097152] [--drop_page_cache false] [--reverse_iterator false]");
