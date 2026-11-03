@@ -731,6 +731,8 @@ wake-up (and a reschedule) for every hand-off: completing a follower and making 
   more writers). Groups with merge operands, transaction writers or blob direct write rewrites stay serial like
   upstream (merges) or for simplicity. `TestHooks.ForceParallelMemtableWrites` makes tests exercise the parallel path
   with small groups.
+  *(Superseded: the 64-entry minimum and the test hook were removed later, see "Pipelined writes and parallel memtable
+  inserts".)*
 
 | 4 threads, 100 B (µs/op, median of 5 / 10) | base wall | new wall | base cpu | new cpu | c-native wall |
 |---|---:|---:|---:|---:|---:|
@@ -757,7 +759,7 @@ agents' I/O, which `nice` does not cover), so the ratios vs C are only indicativ
   scanning over long deleted ranges (whole covered ranges are skipped with one reseek instead of key by key); the
   matrix has no such workload, and the current design (every visible entry checked against the
   `RangeDelAggregator` in `DbIter`) is correct for all workloads. Not ported.
-- **Pipelined writes** (`enable_pipelined_write`): accepted and persisted, but writes use the non-pipelined path.
+- **Pipelined writes** (`enable_pipelined_write`): done later, see "Pipelined writes and parallel memtable inserts".
 
 ## Compaction completeness: L0 pacing and subcompactions
 
@@ -950,6 +952,56 @@ threads already take most of the gain. With fewer free cores than threads the wo
 (the emit thread then compresses the blocks itself when it needs a slot, so throughput never drops below serial by
 much). Output is byte-identical in every configuration.
 
+## Pipelined writes and parallel memtable inserts
+
+**Pipelined writes** (`enable_pipelined_write`, upstream `PipelinedWriteImpl`; design in docs/architecture.md "Write
+path"): the WAL leader links its group to a memtable writer queue and hands WAL leadership on before the inserts, so the
+next group's WAL write overlaps them. `dbbench --enable_pipelined_write` sets it on all engines (managed, rocksdb-sharp,
+c-native).
+
+**Parallel memtable inserts for small groups.** The earlier measurement ("Read/write contention", fillrandom 8.48 vs
+5.97 µs/op with single-key writes, 4 threads) led to a 64-entry minimum for parallel inserts. Re-measured with the
+minimum configurable (`all` = any group of 2+ writers, as upstream; `pw4` / `pw8` = at least 4 / 8 entries per writer;
+`g64` = the old rule), 4 threads, 100 B values, 200k keys, warm-up 50k ops, medians of 4 interleaved repetitions, load
+average 1.5 - 4:
+
+| 4 threads, µs/op (wall) | g64 | all | pw4 | pw8 | g64 async | all async | pw4 async | pw8 async |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| fillrandom, 1 key / write | 4.33 | **3.73** | 4.25 | 4.21 | 3.94 | **3.88** | 4.18 | 4.10 |
+| overwrite, 1 key / write | 5.55 | **4.66** | 5.61 | 5.87 | 5.55 | **4.52** | 5.48 | 5.84 |
+| fillrandom, 4-key batches (per key) | 2.63 | 2.00 | **1.94** | 2.86 | 3.01 | **2.04** | 2.15 | 2.98 |
+| overwrite, 4-key batches | 4.01 | 2.74 | **2.43** | 4.28 | 4.80 | **2.79** | 2.82 | 4.80 |
+| fillrandom, 16-key batches | 2.59 | **1.41** | 1.51 | 1.54 | 2.37 | **1.64** | 1.84 | 1.72 |
+| overwrite, 16-key batches | 3.00 | 2.26 | 2.04 | **1.96** | 3.60 | 2.76 | **2.62** | 2.64 |
+
+Process CPU per op followed the same order (single-key fillrandom 13.6 `all` vs 16.0 `g64` µs/op, all threads). Going
+parallel for every group is never worse on a lightly loaded machine, so the minimum is removed (as upstream;
+`TestHooks.ForceParallelMemtableWrites` is gone too, tests exercise the parallel path naturally). The old result came
+from a heavily oversubscribed VM (load 8 - 15 on 4 vCPUs): parallel inserts need every writer of the group to be
+scheduled, the serial path only the leader. The same effect showed in this session's loaded runs (load 12 - 16:
+single-key sync fillrandom 6.98 `all` vs 5.00 `g64`, cpu 11.1 vs 8.4, async equal) and is inherent to upstream's design
+too; the hand-offs themselves are not the problem (followers spin through both waits when the CPU is available).
+
+**Final A/B** (`base` = the commit before this work: 64-entry minimum, no pipelining; `final` = no minimum;
+`pipelined` = final with `--enable_pipelined_write true`; c-native with and without pipelining), 200k keys, 100 B,
+medians of 5 interleaved repetitions, load average 1.8 - 2.6:
+
+| µs/op (wall) | base | final | pipelined | base async | final async | pipelined async | c-native | c-native pipelined |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| fillrandom, 1 thread | 2.70 | 2.57 | 2.77 | 2.78 | 2.79 | 2.83 | 4.16 | 4.16 |
+| overwrite, 1 thread | 4.22 | 4.07 | 4.01 | 4.18 | 4.04 | 4.15 | 5.80 | 5.48 |
+| fillrandom, 4 threads | 3.86 | 3.98 | **3.21** | 4.28 | 3.90 | 3.98 | 4.17 | 3.81 |
+| overwrite, 4 threads | 5.70 | 4.64 | **3.88** | 5.41 | 4.73 | 4.94 | 5.09 | 4.25 |
+
+CPU per op, 4 threads sync: fillrandom 14.8 / 14.1 / 11.8, overwrite 20.8 / 15.9 / 14.4 (base / final / pipelined).
+With one writer there is nothing to overlap (the single writer leads both stages in turn) and the cost of the second
+stage is within noise. With 4 sync writers pipelining gains 15 - 20 % wall, about what it gains on native (fillrandom
+4.17 -> 3.81, overwrite 5.09 -> 4.25). Async writers gain nothing: their follower wake-ups are thread-pool work items,
+so the stage hand-off adds a continuation per write that eats the overlap. Sync WAL writes (`--sync true`, 20k keys,
+fsync-bound, ~80 - 115 µs/op) are unchanged by pipelining on both engines (managed 113.7 -> 97.9 and async 86.6 -> 82.0
+µs/op within a 70 - 1070 µs/op spread on a loaded VM; native 85.6 -> 116.3). Pipelining stays off by default, as
+upstream.
+
 ## Allocation-free readahead prefetches, forward pinned merge operands
 
 BenchmarkDotNet `ScanBenchmarks.cs` (`--anyCategories Scan`, short job, 4 vCPU container, one op = one full scan of an
@@ -973,7 +1025,7 @@ only shows with large operands and is within the noise of the short job.
 - Batched MultiGet exists (perf pass #2) but does not prefetch filter cache lines or interleave the block reads of a batch.
 - Block cache charge does not include the `Block` object (~64 bytes).
 - Confirm the 4-thread `fillrandom` / `overwrite` / `readmissing` ratios vs C on a quiet machine (see "Read/write
-  contention with 4 threads"); pipelined writes are open. Done since: reverse-iteration block pinning, async reverse
+  contention with 4 threads"). Done since: pipelined writes (see "Pipelined writes and parallel memtable inserts"), reverse-iteration block pinning, async reverse
   movement, covered-range skipping and compaction input readahead (see "Reverse iteration, range-deleted runs,
   compaction input readahead").
 - Done since: merge operands are referenced in pinned blocks in both directions, `NextAsync` after reverse movement

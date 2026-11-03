@@ -24,6 +24,16 @@ namespace RocksDb.Managed.Db;
 /// leadership on (<see cref="ExitAsParallelGroup"/>, ExitAsBatchGroupFollower).
 /// </para>
 /// <para>
+/// With <c>enable_pipelined_write</c> the WAL write and the memtable inserts are two stages with a queue each: the WAL
+/// leader links its group's memtable writers to the memtable writer queue (<see cref="ExitAsPipelinedWalLeader"/>,
+/// LinkGroup) before it hands WAL leadership on, so the next group's WAL write overlaps this group's memtable inserts.
+/// The first writer of that queue becomes memtable writer leader (<see cref="StateMemtableWriterLeader"/>), takes the
+/// following queued writers into its memtable group (<see cref="EnterAsMemTableWriter"/>), inserts them (serially or in
+/// parallel) and hands the stage on (<see cref="ExitAsMemTableWriter"/>). Memtable groups run one at a time in WAL order,
+/// so each publishes its last sequence in order. <see cref="EnqueueMemTableDrain"/> (WaitForMemTableWriters) lets the WAL
+/// leader or an unbatched leader wait until the memtable stage is idle (memtable switches, exclusive operations).
+/// </para>
+/// <para>
 /// Writers with <c>Batch == null</c> are "unbatched" writers (EnterUnbatched): they become leader of a group of their
 /// own and are used to run exclusive operations such as memtable switches.
 /// </para>
@@ -34,12 +44,20 @@ internal sealed class WriteThread
     public const int StateGroupLeader = 2;
     /// <summary>STATE_PARALLEL_MEMTABLE_WRITER: insert the writer's own batch into the memtables, then count down.</summary>
     public const int StateParallelMemtableWriter = 3;
+    /// <summary>STATE_MEMTABLE_WRITER_LEADER (pipelined writes): lead the next memtable group.</summary>
+    public const int StateMemtableWriterLeader = 4;
 
     private readonly Lock _lock = new();
     private Writer? _head;
     private Writer? _tail;
     private bool _leaderActive;
     private readonly long _maxGroupBytes;
+    // Pipelined writes: the memtable writer queue (newest_memtable_writer_), guarded by _memLock. _memLeaderActive is
+    // set while a memtable group (or a WaitForMemTableWriters caller) owns the memtable stage.
+    private readonly Lock _memLock = new();
+    private Writer? _memHead;
+    private Writer? _memTail;
+    private bool _memLeaderActive;
     private readonly long _maxYieldTicks;
     private readonly long _slowYieldTicks;
     // AdaptationContext::value (yield_credit): fixed-point running estimate of whether yielding ends before
@@ -122,6 +140,8 @@ internal sealed class WriteThread
         public bool IsSyncWaiter;
         public Exception? Error;
         public Writer? Next;
+        /// <summary>Pipelined writes: the next writer in the memtable writer queue.</summary>
+        public Writer? MemNext;
         /// <summary>Transaction extras (callback, memtable batch, prepared-section WAL tracking); null for plain writes.</summary>
         public TransactionWriteContext? Txn;
         /// <summary>The write callback failed: the writer is excluded from the WAL record and the memtables.</summary>
@@ -139,6 +159,7 @@ internal sealed class WriteThread
             IsSyncWaiter = syncWaiter;
             Error = null;
             Next = null;
+            MemNext = null;
             Txn = null;
             CallbackFailed = false;
             Rearm();
@@ -158,6 +179,10 @@ internal sealed class WriteThread
         }
 
         public bool IsUnbatched => Batch is null;
+        /// <summary>The batch inserted into the memtables (a transaction's separate memtable batch, or the batch).</summary>
+        public WriteBatch MemtableBatch => Txn?.MemtableBatch ?? Batch!;
+        /// <summary>ShouldWriteToMemtable: no error, no failed callback, not a WAL-only (disable_memtable) write.</summary>
+        public bool ShouldWriteToMemtable => Error is null && !CallbackFailed && Txn is not { DisableMemtable: true };
         public long Size => Batch?.DataSize ?? 0;
 
         /// <summary>Wakes the writer with <paramref name="state"/> (SetState).</summary>
@@ -313,6 +338,167 @@ internal sealed class WriteThread
         ExitAsLeader();
     }
 
+    // ---- pipelined writes (enable_pipelined_write) --------------------------------------------------------
+
+    /// <summary>
+    /// The pipelined part of ExitAsBatchGroupLeader, called by the WAL leader once the group's WAL record is written (or
+    /// failed): completes the writers that do not write to the memtables, links the others in order to the memtable
+    /// writer queue (LinkGroup), and only then hands WAL leadership to the next queued writer, so that memtable groups
+    /// follow WAL order. Returns the leader's next state: <see cref="StateMemtableWriterLeader"/> when it leads the
+    /// memtable stage right away, <see cref="StateCompleted"/> when it does not write to the memtables, or 0 when it must
+    /// wait (it is re-armed before it is linked).
+    /// </summary>
+    public int ExitAsPipelinedWalLeader(List<Writer> group, Writer leader)
+    {
+        Writer? first = null, last = null;
+        // Decided before linking: once linked, a memtable leader may insert the leader's batch (and set its error).
+        int leaderState = StateCompleted;
+        for (int i = 0; i < group.Count; i++)
+        {
+            Writer w = group[i];
+            if (!w.ShouldWriteToMemtable)
+            {
+                if (w != leader) w.Complete(StateCompleted);
+                continue;
+            }
+            if (w == leader)
+            {
+                w.Rearm();
+                leaderState = 0;
+            }
+            w.MemNext = null;
+            if (last is null) first = w;
+            else last.MemNext = w;
+            last = w;
+        }
+        group.Clear();
+        bool firstLeads = false;
+        if (first is not null)
+        {
+            lock (_memLock)
+            {
+                Writer? rest = first;
+                if (!_memLeaderActive)
+                {
+                    _memLeaderActive = true;
+                    firstLeads = true;
+                    rest = first.MemNext;
+                    first.MemNext = null;
+                }
+                if (rest is not null)
+                {
+                    if (_memTail is null) _memHead = rest;
+                    else _memTail.MemNext = rest;
+                    _memTail = last;
+                }
+            }
+        }
+        ExitAsLeader();
+        if (firstLeads)
+        {
+            if (first == leader) leaderState = StateMemtableWriterLeader;
+            else first!.Complete(StateMemtableWriterLeader);
+        }
+        return leaderState;
+    }
+
+    /// <summary>
+    /// Port of EnterAsMemTableWriter: appends to <paramref name="group"/> (which starts with the memtable leader) the
+    /// queued memtable writers inserted together with it. Without concurrent memtable writes the group is bounded by
+    /// size (growth of max_write_batch_group_size_bytes / 8 for small writes); with them, a batch with merge operands is
+    /// inserted alone. A WaitForMemTableWriters marker ends the group.
+    /// </summary>
+    public void EnterAsMemTableWriter(Writer leader, List<Writer> group, bool allowConcurrentMemtableWrite)
+    {
+        group.Clear();
+        group.Add(leader);
+        WriteBatch lb = leader.MemtableBatch;
+        if (allowConcurrentMemtableWrite && lb.HasMerge) return;
+        long size = lb.DataSize;
+        long maxSize = _maxGroupBytes;
+        long minBatchSizeBytes = _maxGroupBytes / 8;
+        if (size <= minBatchSizeBytes) maxSize = size + minBatchSizeBytes;
+        lock (_memLock)
+        {
+            while (_memHead is { } w)
+            {
+                if (w.IsUnbatched) break;
+                WriteBatch b = w.MemtableBatch;
+                if (b.HasMerge) break;
+                if (!allowConcurrentMemtableWrite)
+                {
+                    // Do not make batch too big
+                    if (size + b.DataSize > maxSize) break;
+                    size += b.DataSize;
+                }
+                _memHead = w.MemNext;
+                if (_memHead is null) _memTail = null;
+                w.MemNext = null;
+                group.Add(w);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Port of ExitAsMemTableWriter (also run by the last writer of a parallel memtable group): completes every writer of
+    /// the group other than <paramref name="self"/> and hands the memtable stage to the next queued writer; a
+    /// WaitForMemTableWriters marker takes it over idle.
+    /// </summary>
+    public void ExitAsMemTableWriter(List<Writer> group, Writer self)
+    {
+        // The woken writers do not touch the group, so the next memtable leader may reuse it once the stage is handed on.
+        for (int i = 0; i < group.Count; i++)
+        {
+            if (group[i] != self) group[i].Complete(StateCompleted);
+        }
+        group.Clear();
+        Writer? next;
+        lock (_memLock)
+        {
+            next = _memHead;
+            if (next is null)
+            {
+                _memLeaderActive = false;
+                return;
+            }
+            _memHead = next.MemNext;
+            if (_memHead is null) _memTail = null;
+            next.MemNext = null;
+            if (next.IsUnbatched)
+            {
+                // A drain marker is always last (only the WAL leader links writers, and it is the one waiting), so the
+                // stage is idle from here on (WaitForMemTableWriters: newest_memtable_writer_ = nullptr).
+                Debug.Assert(_memHead is null);
+                _memLeaderActive = false;
+            }
+        }
+        next.Complete(StateMemtableWriterLeader);
+    }
+
+    /// <summary>
+    /// First half of WaitForMemTableWriters, called by the WAL leader or an unbatched leader (so that no memtable writer
+    /// can be linked meanwhile): returns false if the memtable stage is idle; otherwise queues <paramref name="marker"/>
+    /// (an unbatched writer) behind the pending memtable writers, and the caller waits for
+    /// <see cref="StateMemtableWriterLeader"/>, after which the stage is idle.
+    /// </summary>
+    public bool EnqueueMemTableDrain(Writer marker)
+    {
+        Debug.Assert(marker.IsUnbatched);
+        marker.Owner = this;
+        lock (_memLock)
+        {
+            if (!_memLeaderActive) return false;
+            marker.MemNext = null;
+            if (_memTail is null) _memHead = _memTail = marker;
+            else
+            {
+                _memTail.MemNext = marker;
+                _memTail = marker;
+            }
+            return true;
+        }
+    }
+
     /// <summary>Releases leadership (ExitUnbatched for unbatched writers).</summary>
     public void ExitAsLeader()
     {
@@ -364,6 +550,7 @@ internal sealed class WriteThread
         w.Batch = null;
         w.Error = null;
         w.Next = null;
+        w.MemNext = null;
         w.Txn = null;
         if (synchronous)
         {

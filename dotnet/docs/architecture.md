@@ -127,13 +127,26 @@ collects compatible queued writers into a group (no sync write under a non-sync 
 `NoSlowdown` writers, a size cap of the leader's size + 128 KiB), writes one WAL record for the group, inserts into
 the memtables, publishes the sequence number, and hands leadership to the next queued writer.
 
-With `allow_concurrent_memtable_write` (the default), a group of plain writes (no merge operands, no transaction
-extras) with at least `DbImpl.MinParallelMemtableGroupEntries` (64) entries inserts in parallel: after the WAL write the
-leader wakes the followers with `StateParallelMemtableWriter`, every writer inserts its own batch with
-`MemTable.AddConcurrently`, and the writer that finishes last publishes the sequence and exits the group for everyone
-(`LaunchParallelMemTableWriters` / `CompleteParallelMemTableWriter` / `ExitAsBatchGroupFollower`). Upstream goes
-parallel for any group of two or more writers; for small groups the two extra hand-offs per writer cost more than the
-serial inserts (docs/perf.md, "Read/write contention").
+With `allow_concurrent_memtable_write` (the default), a group of two or more plain writes (no merge operands, no
+transaction extras) inserts in parallel, like upstream: after the WAL write the leader wakes the followers with
+`StateParallelMemtableWriter`, every writer inserts its own batch with `MemTable.AddConcurrently`, and the writer that
+finishes last publishes the sequence and exits the group for everyone (`LaunchParallelMemTableWriters` /
+`CompleteParallelMemTableWriter` / `ExitAsBatchGroupFollower`). (An earlier 64-entry minimum was removed after
+measurements on a quiet machine, see docs/perf.md "Pipelined writes and parallel memtable inserts".)
+
+With `enable_pipelined_write` (`DbImpl.WritePipelinedAsync`, upstream `PipelinedWriteImpl`) the WAL write and the
+memtable inserts are separate stages with a queue each. The WAL leader groups writers, runs `PreprocessWrite`, the write
+callbacks and the sequence allocation, writes the group's WAL record, then links the group's memtable writers to the
+memtable writer queue and only then hands WAL leadership on (`WriteThread.ExitAsPipelinedWalLeader`, upstream
+`LinkGroup`), so the next group's WAL write overlaps this group's inserts. The first queued memtable writer becomes
+memtable leader (`StateMemtableWriterLeader`), takes the following queued writers (`EnterAsMemTableWriter`), inserts them
+serially or wakes them for parallel inserts, publishes the group's last sequence and hands the stage on
+(`ExitAsMemTableWriter`). Memtable groups run one at a time in WAL order, so sequences are published in order. Anything
+that switches memtables or needs exclusive access (`PreprocessWrite` before a memtable / WAL switch, unbatched leaders such
+as flush, ingestion and close, writers whose callback disallows batching) first drains the memtable stage
+(`WaitForMemTableWriters`: a marker queued behind the pending memtable writers). As upstream, pipelined writes are
+rejected with two write queues and seq_per_batch (NotSupported at write time) and with `unordered_write` or `atomic_flush`
+(InvalidArgument at open).
 
 Followers wait in one of two ways:
 
@@ -236,7 +249,6 @@ verified with `[MemoryDiagnoser]` and the benchmark runner's allocated-bytes-per
 | `std::thread` background pools (`Env::Schedule`) | thread-pool tasks for flushes, `LongRunning` tasks for compactions | .NET scheduling; no fixed pool to size |
 | no cancellation | `CancellationToken` on every async API; a cancelled write leader that is delayed by a stall fails its whole group with `OperationCanceledException` | .NET convention |
 | write-group follower wait (spin + yield + futex) | `IValueTaskSource` for async writers, `AwaitState` port (spin, adaptive yield, monitor) for sync writers | async callers do not block a thread |
-| parallel memtable writes for any group of 2+ writers | only for groups of >= 64 entries | the extra hand-offs cost more than serial inserts of small groups |
 
 Format-level differences (compression corner cases, flush not dropping overwritten entries) and the features that are
 not ported are listed in the [README](../README.md#known-deviations-and-gaps).

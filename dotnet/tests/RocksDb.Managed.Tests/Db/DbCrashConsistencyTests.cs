@@ -59,9 +59,11 @@ public sealed class DbCrashConsistencyTests
         MaxWriteBufferNumber = 3,
     };
 
-    private static RocksDatabase Open(IFileSystem fs, out ColumnFamily cf1)
+    private static RocksDatabase Open(IFileSystem fs, out ColumnFamily cf1) => Open(fs, out cf1, pipelined: false);
+
+    private static RocksDatabase Open(IFileSystem fs, out ColumnFamily cf1, bool pipelined)
     {
-        var options = new DbOptions { CreateIfMissing = true, CreateMissingColumnFamilies = true, FileSystem = fs };
+        var options = new DbOptions { CreateIfMissing = true, CreateMissingColumnFamilies = true, FileSystem = fs, EnablePipelinedWrite = pipelined };
         RocksDatabase db = RocksDatabase.Open(DbPath, options,
             [new ColumnFamilyDescriptor("default", CfOptions()), new ColumnFamilyDescriptor("cf1", CfOptions())]);
         cf1 = db.GetColumnFamily("cf1");
@@ -169,10 +171,10 @@ public sealed class DbCrashConsistencyTests
         return -1;
     }
 
-    private static long CountOperations(int seed)
+    private static long CountOperations(int seed, bool pipelined)
     {
         var fs = new FaultInjectionFileSystem(NewFs());
-        RocksDatabase db = Open(fs, out ColumnFamily cf1);
+        RocksDatabase db = Open(fs, out ColumnFamily cf1, pipelined);
         long start = fs.Operations;
         (_, int acked, _) = RunWorkload(db, cf1, MakeOps(seed));
         Assert.AreEqual(NumOps, acked);
@@ -181,12 +183,12 @@ public sealed class DbCrashConsistencyTests
         return n;
     }
 
-    private static void CrashAndRecover(int seed, long crashAt, bool powerLoss)
+    private static void CrashAndRecover(int seed, long crashAt, bool powerLoss, bool pipelined)
     {
-        string context = "seed=" + seed + " crashAt=" + crashAt + " powerLoss=" + powerLoss;
+        string context = "seed=" + seed + " crashAt=" + crashAt + " powerLoss=" + powerLoss + " pipelined=" + pipelined;
         List<Op> ops = MakeOps(seed);
         var fs = new FaultInjectionFileSystem(NewFs()) { TornWrites = !powerLoss };
-        RocksDatabase db = Open(fs, out ColumnFamily cf1);
+        RocksDatabase db = Open(fs, out ColumnFamily cf1, pipelined);
         fs.CrashAtOperation = fs.Operations + crashAt;
         (int durable, int acked, int attempted) = RunWorkload(db, cf1, ops);
         try { db.Dispose(); }
@@ -200,7 +202,7 @@ public sealed class DbCrashConsistencyTests
         RocksDatabase db2;
         try
         {
-            db2 = Open(fs, out cf1);
+            db2 = Open(fs, out cf1, pipelined);
         }
         catch (Exception e)
         {
@@ -221,22 +223,24 @@ public sealed class DbCrashConsistencyTests
             cf1.Flush();
             db2.CompactRange();
         }
-        using RocksDatabase db3 = Open(fs, out ColumnFamily cf3);
+        using RocksDatabase db3 = Open(fs, out ColumnFamily cf3, pipelined);
         Assert.AreEqual("crash", S(db3.Get(B("after"))), context);
         Dictionary<int, int>[] again = ReadAll(db3, cf3);
         Assert.AreNotEqual(-1, FindMatchingPrefix(ops, again, powerLoss ? durable : acked, attempted), "state changed after reopen: " + context);
     }
 
-    private static void RunCrashSweep(int seed, bool powerLoss, int points)
+    private static void RunCrashSweep(int seed, bool powerLoss, int points) => RunCrashSweep(seed, powerLoss, points, pipelined: false);
+
+    private static void RunCrashSweep(int seed, bool powerLoss, int points, bool pipelined)
     {
-        long total = CountOperations(seed);
+        long total = CountOperations(seed, pipelined);
         Assert.IsTrue(total > 100, "workload too small: " + total);
         var rnd = new Random(seed * 31 + (powerLoss ? 1 : 0));
         long step = Math.Max(1, total / points);
         for (long at = 1; at <= total; at += step)
         {
             long crashAt = Math.Min(total, at + rnd.Next((int)step));
-            CrashAndRecover(seed, crashAt, powerLoss);
+            CrashAndRecover(seed, crashAt, powerLoss, pipelined);
         }
     }
 
@@ -248,6 +252,108 @@ public sealed class DbCrashConsistencyTests
 
     [TestMethod]
     public void PowerLossSweepSecondSeed() => RunCrashSweep(seed: 1234, powerLoss: true, points: 60);
+
+    [TestMethod]
+    public void PipelinedWritesPowerLossSweep() => RunCrashSweep(seed: 21, powerLoss: true, points: 60, pipelined: true);
+
+    [TestMethod]
+    public void PipelinedWritesProcessKillSweep() => RunCrashSweep(seed: 23, powerLoss: false, points: 60, pipelined: true);
+
+    /// <summary>
+    /// Concurrent writers (sync and async API) with pipelined writes and parallel memtable inserts crash at many points.
+    /// Every writer writes its own keys in order and waits for each acknowledgement, so WAL order follows each writer's
+    /// order: after recovery each writer's surviving keys must be a prefix of its writes (no holes), containing at least
+    /// its writes up to its last acknowledged sync write (power loss) or all its acknowledged writes (process kill).
+    /// </summary>
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    [DataRow(true)]
+    [DataRow(false)]
+    public void PipelinedConcurrentWritersCrashSweep(bool powerLoss)
+    {
+        const int points = 24;
+        long total = RunConcurrentWriters(new FaultInjectionFileSystem(NewFs()), crashAt: 0, powerLoss, out _, out _);
+        long step = Math.Max(1, total / points);
+        var rnd = new Random(powerLoss ? 5 : 6);
+        for (long at = 1; at <= total; at += step)
+        {
+            long crashAt = Math.Min(total, at + rnd.Next((int)step));
+            string context = "crashAt=" + crashAt + " powerLoss=" + powerLoss;
+            var fs = new FaultInjectionFileSystem(NewFs()) { TornWrites = !powerLoss };
+            RunConcurrentWriters(fs, crashAt, powerLoss, out int[] durable, out int[] acked);
+            if (powerLoss) fs.PowerLoss();
+            else FaultInjectionFileSystem.ProcessKill();
+            fs.Restart();
+            using RocksDatabase db = Open(fs, out ColumnFamily cf1, pipelined: true);
+            for (int t = 0; t < ConcurrentWriters; t++)
+            {
+                ColumnFamily cf = t % 2 == 0 ? db.DefaultColumnFamily : cf1;
+                int present = 0;
+                while (present < ConcurrentWritesPerWriter && cf.Get(WriterKey(t, present)) is not null) present++;
+                for (int i = present; i < ConcurrentWritesPerWriter; i++)
+                {
+                    Assert.IsNull(cf.Get(WriterKey(t, i)), "hole in writer " + t + " at " + present + " (found " + i + "): " + context);
+                }
+                int min = powerLoss ? durable[t] : acked[t];
+                Assert.IsTrue(present >= min, "writer " + t + " lost acknowledged writes: " + present + " < " + min + ": " + context);
+            }
+            db.Put(new WriteOptions { Sync = true }, B("after"), B("crash"));
+        }
+    }
+
+    private const int ConcurrentWriters = 6;
+    private const int ConcurrentWritesPerWriter = 120;
+
+    private static byte[] WriterKey(int t, int i) =>
+        B("w" + t.ToString(System.Globalization.CultureInfo.InvariantCulture) + "-" + i.ToString("D4", System.Globalization.CultureInfo.InvariantCulture));
+
+    /// <summary>Runs the concurrent workload (crashing at <paramref name="crashAt"/> if not 0); returns the operation count.</summary>
+    private static long RunConcurrentWriters(FaultInjectionFileSystem fs, long crashAt, bool powerLoss, out int[] durable, out int[] acked)
+    {
+        var durableOut = new int[ConcurrentWriters];
+        var ackedOut = new int[ConcurrentWriters];
+        RocksDatabase db = Open(fs, out ColumnFamily cf1, pipelined: true);
+        long start = fs.Operations;
+        if (crashAt != 0) fs.CrashAtOperation = start + crashAt;
+        var threads = new Thread[ConcurrentWriters];
+        for (int t = 0; t < ConcurrentWriters; t++)
+        {
+            int id = t;
+            threads[t] = new Thread(() =>
+            {
+                ColumnFamily cf = id % 2 == 0 ? db.DefaultColumnFamily : cf1;
+                try
+                {
+                    for (int i = 0; i < ConcurrentWritesPerWriter; i++)
+                    {
+                        var wo = new WriteOptions { Sync = (i + id) % 10 == 0 };
+                        byte[] value = V(id, i);
+                        if (id % 3 == 0) cf.PutAsync(wo, WriterKey(id, i), value).AsTask().GetAwaiter().GetResult();
+                        else cf.Put(wo, WriterKey(id, i), value);
+                        ackedOut[id] = i + 1;
+                        if (wo.Sync) durableOut[id] = i + 1;
+                    }
+                }
+                catch (Exception e) when (e is RocksDbException or IOException or ObjectDisposedException)
+                {
+                }
+            });
+            threads[t].Start();
+        }
+        foreach (Thread th in threads) th.Join();
+        long ops = fs.Operations - start;
+        try { db.Dispose(); }
+        catch (Exception e) when (e is RocksDbException or IOException) { }
+        Assert.AreEqual(0, fs.OpenFiles, "file handles leaked after a failed close: crashAt=" + crashAt);
+        Assert.AreEqual(0, fs.OpenLocks, "LOCK not released: crashAt=" + crashAt);
+        if (crashAt == 0)
+        {
+            for (int t = 0; t < ConcurrentWriters; t++) Assert.AreEqual(ConcurrentWritesPerWriter, ackedOut[t]);
+        }
+        durable = durableOut;
+        acked = ackedOut;
+        return ops;
+    }
 
     [TestMethod]
     public void CleanCloseReleasesAllFileHandles()

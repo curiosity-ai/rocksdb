@@ -25,7 +25,6 @@ public sealed class KvProtectionTests
     public void Cleanup()
     {
         TestHooks.ClearAll();
-        TestHooks.ForceParallelMemtableWrites = false;
     }
 
     // ------------------------------------------------------------------------------------------------- parallel inserts
@@ -82,7 +81,6 @@ public sealed class KvProtectionTests
     [Timeout(60_000, CooperativeCancellation = true)]
     public void ParallelMemtableInsertsWithProtection()
     {
-        TestHooks.ForceParallelMemtableWrites = true;
         var insertedBy = new System.Collections.Concurrent.ConcurrentDictionary<string, int>(StringComparer.Ordinal);
         TestHooks.SetSpan("MemTable::Add:Encoded", data =>
         {
@@ -124,7 +122,6 @@ public sealed class KvProtectionTests
     [Timeout(60_000, CooperativeCancellation = true)]
     public void ParallelMemtableInsertDetectsCorruptedEntry()
     {
-        TestHooks.ForceParallelMemtableWrites = true;
         int armed = 0;
         TestHooks.SetSpan("MemTable::Add:Encoded", data =>
         {

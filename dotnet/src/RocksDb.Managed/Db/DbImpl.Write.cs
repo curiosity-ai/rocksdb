@@ -9,6 +9,10 @@ internal sealed partial class DbImpl
 {
     private readonly WriteThread _writeThread;
     private readonly bool _allowConcurrentMemtableWrite;
+    /// <summary>enable_pipelined_write: WAL writes and memtable inserts are separate stages (see <see cref="WritePipelinedAsync"/>).</summary>
+    private readonly bool _pipelined;
+    private readonly List<WriteThread.Writer> _memGroup = new();    // pipelined: memtable-leader-only
+    private readonly WriteThread.Writer _memDrainMarker = new();    // pipelined: WaitForMemTableWriters (WAL / unbatched leader only)
     private readonly List<WriteThread.Writer> _group = new();       // leader-only
     private readonly WriteBatch _groupBatch = new(64 << 10, 0);     // leader-only: merged WAL record
     private readonly List<ColumnFamilyData> _flushScheduler = new(); // leader-only: CFs whose memtable became full
@@ -85,6 +89,11 @@ internal sealed partial class DbImpl
             await WritePlainSeqPerBatchAsync(options, batch, txn, synchronous, cancellationToken).ConfigureAwait(false);
             return;
         }
+        if (_pipelined)
+        {
+            await WritePipelinedAsync(options, batch, txn, synchronous, cancellationToken).ConfigureAwait(false);
+            return;
+        }
         Statistics? stats = Options.Statistics;
         long writeStart = stats?.StartTimer() ?? 0;
         WriteThread.Writer w = WriteThread.Rent(synchronous);
@@ -112,7 +121,7 @@ internal sealed partial class DbImpl
                 }
                 Debug.Assert(state == WriteThread.StateGroupLeader);
             }
-            ValueTask lead = LeadWriteGroupAsync(w, synchronous, cancellationToken);
+            ValueTask<int> lead = LeadWriteGroupAsync(w, synchronous, cancellationToken);
             if (synchronous)
             {
                 Debug.Assert(lead.IsCompleted);
@@ -129,6 +138,110 @@ internal sealed partial class DbImpl
             WriteThread.Return(w, synchronous);
             stats?.RecordElapsedMicros(Histogram.DbWrite, writeStart);
         }
+    }
+
+    /// <summary>
+    /// Port of DBImpl::PipelinedWriteImpl. The WAL leader groups the queued writers, runs PreprocessWrite, the write
+    /// callbacks and the sequence allocation, writes the group's WAL record (<see cref="LeadWriteGroupAsync"/>), links the
+    /// memtable writers of the group to the memtable writer queue and hands WAL leadership on
+    /// (<see cref="WriteThread.ExitAsPipelinedWalLeader"/>). The next WAL group is then written while this group's
+    /// memtable inserts run: the first queued memtable writer leads a memtable group (<see cref="LeadMemTableGroup"/>),
+    /// inserting serially or waking the writers for parallel inserts, and the group publishes its last sequence before
+    /// the next memtable group starts. Not compatible with two write queues or seq_per_batch (NotSupported at write time,
+    /// as upstream).
+    /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask WritePipelinedAsync(WriteOptions? options, WriteBatch batch, TransactionWriteContext? txn, bool synchronous,
+        CancellationToken cancellationToken)
+    {
+        if (_twoWriteQueues) ThrowHelper.NotSupported("pipelined_writes is not compatible with concurrent prepares");
+        if (_seqPerBatch) ThrowHelper.NotSupported("pipelined_writes is not compatible with seq_per_batch");
+        Statistics? stats = Options.Statistics;
+        long writeStart = stats?.StartTimer() ?? 0;
+        WriteThread.Writer w = WriteThread.Rent(synchronous);
+        w.Prepare(batch, options, synchronous);
+        w.Txn = txn;
+        try
+        {
+            int state = WriteThread.StateGroupLeader;
+            if (!_writeThread.JoinBatchGroup(w)) state = synchronous ? w.WaitSync() : await w.WaitAsync().ConfigureAwait(false);
+            if (state == WriteThread.StateGroupLeader)
+            {
+                ValueTask<int> lead = LeadWriteGroupAsync(w, synchronous, cancellationToken);
+                if (synchronous)
+                {
+                    Debug.Assert(lead.IsCompleted);
+                    state = lead.GetAwaiter().GetResult();
+                }
+                else
+                {
+                    state = await lead.ConfigureAwait(false);
+                }
+                // 0: linked behind earlier memtable writers; wait for our turn.
+                if (state == 0) state = synchronous ? w.WaitSync() : await w.WaitAsync().ConfigureAwait(false);
+            }
+            if (state == WriteThread.StateMemtableWriterLeader) state = LeadMemTableGroup(w);
+            if (state == WriteThread.StateParallelMemtableWriter)
+            {
+                ParallelMemTableInsert(w);
+                if (CompleteParallelMemTableWriter()) FinishParallelGroup(w);
+                else state = synchronous ? w.WaitSync() : await w.WaitAsync().ConfigureAwait(false);
+            }
+            Debug.Assert(state is WriteThread.StateCompleted or WriteThread.StateParallelMemtableWriter);
+            if (w.Error is { } err) ThrowWriteError(err);
+        }
+        finally
+        {
+            WriteThread.Return(w, synchronous);
+            stats?.RecordElapsedMicros(Histogram.DbWrite, writeStart);
+        }
+    }
+
+    /// <summary>
+    /// The memtable stage of a pipelined write led by <paramref name="leader"/> (PipelinedWriteImpl,
+    /// STATE_MEMTABLE_WRITER_LEADER): EnterAsMemTableWriter, then either LaunchParallelMemTableWriters (returns
+    /// <see cref="WriteThread.StateParallelMemtableWriter"/>: the leader inserts its own batch next) or the serial insert
+    /// of the whole group, publication of its last sequence and ExitAsMemTableWriter (returns
+    /// <see cref="WriteThread.StateCompleted"/>).
+    /// </summary>
+    private int LeadMemTableGroup(WriteThread.Writer leader)
+    {
+        TestHooks.Invoke("DBImpl::PipelinedWriteImpl:MemTableWriterLeader");
+        List<WriteThread.Writer> group = _memGroup;
+        _writeThread.EnterAsMemTableWriter(leader, group, _allowConcurrentMemtableWrite);
+        ulong total = 0;
+        for (int i = 0; i < group.Count; i++) total += (uint)group[i].MemtableBatch.Count;
+        WriteBatch lastBatch = group[^1].MemtableBatch;
+        // write_group.last_sequence (sequences are consecutive along the memtable queue).
+        ulong last = lastBatch.Sequence + (uint)lastBatch.Count - 1;
+        if (CanInsertInParallel(group, group.Count, total))
+        {
+            LaunchParallelMemTableWriters(group, leader, total, last, walRecordBytes: 0, wal: false, needSync: false);
+            return WriteThread.StateParallelMemtableWriter;
+        }
+        InsertWritersSerially(group);
+        if (total > 0)
+        {
+            Versions.SetLastSequence(last);
+            NotifySequenceWaiters();
+        }
+        _writeThread.ExitAsMemTableWriter(group, leader);
+        return WriteThread.StateCompleted;
+    }
+
+    /// <summary>
+    /// WriteThread::WaitForMemTableWriters (DBImpl::WaitForPendingWrites with pipelined writes): waits until no memtable
+    /// insert is pending. REQUIRES: the caller is the WAL leader or an unbatched leader (no new memtable writer can be
+    /// linked meanwhile).
+    /// </summary>
+    private async ValueTask WaitForMemTableWritersAsync(bool synchronous)
+    {
+        if (!_pipelined) return;
+        WriteThread.Writer marker = _memDrainMarker;
+        marker.Prepare(null, null, synchronous);
+        if (!_writeThread.EnqueueMemTableDrain(marker)) return;
+        int state = synchronous ? marker.WaitSync() : await marker.WaitAsync().ConfigureAwait(false);
+        Debug.Assert(state == WriteThread.StateMemtableWriterLeader);
     }
 
     /// <summary>A plain write into a sequence-per-batch DB (see <see cref="SeqPerBatchHooks.WritePlainAsync"/>).</summary>
@@ -181,6 +294,7 @@ internal sealed partial class DbImpl
             int state = synchronous ? w.WaitSync() : await w.WaitAsync().ConfigureAwait(false);
             Debug.Assert(state == WriteThread.StateGroupLeader);
         }
+        if (_pipelined) await WaitForMemTableWritersAsync(synchronous).ConfigureAwait(false);
         if (_twoWriteQueues) await EnterNonMemUnbatchedAsync(synchronous).ConfigureAwait(false);
         return w;
     }
@@ -196,14 +310,20 @@ internal sealed partial class DbImpl
     /// <summary>
     /// Commits the group led by <paramref name="leader"/>: PreprocessWrite, sequence allocation, one WAL record for the
     /// whole group, memtable inserts, publication of the last sequence, then wakes the followers
-    /// (DBImpl::WriteImpl, non-pipelined).
+    /// (DBImpl::WriteImpl, non-pipelined). With pipelined writes only the WAL stage: the group is then linked to the
+    /// memtable writer queue, and the result is the leader's next state (see
+    /// <see cref="WriteThread.ExitAsPipelinedWalLeader"/>); otherwise it is <see cref="WriteThread.StateCompleted"/>.
     /// </summary>
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    private async ValueTask LeadWriteGroupAsync(WriteThread.Writer leader, bool synchronous, CancellationToken cancellationToken)
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<int> LeadWriteGroupAsync(WriteThread.Writer leader, bool synchronous, CancellationToken cancellationToken)
     {
         List<WriteThread.Writer> group = _group;
+        // PipelinedWriteImpl: a writer that must not be batched (its callback reads the DB) waits until every earlier
+        // write is in the memtables.
+        if (_pipelined && leader.Txn?.Callback is { AllowWriteBatching: false }) await WaitForMemTableWritersAsync(synchronous).ConfigureAwait(false);
         _writeThread.EnterAsBatchGroupLeader(leader, group);
         bool parallel = false;
+        int leaderState = WriteThread.StateCompleted;
         try
         {
             // Writers that queued before the DB was closed get leadership after close released it.
@@ -399,19 +519,17 @@ internal sealed partial class DbImpl
                 }
             }
 
-            if (CanInsertInParallel(group, valid, total))
+            if (_pipelined)
+            {
+                // PipelinedWriteImpl records the group's stats in the WAL stage; the memtable stage follows.
+                RecordWriteGroup(group, total, walRecordBytes, !leader.DisableWal, needSync);
+            }
+            else if (CanInsertInParallel(group, valid, total))
             {
                 // LaunchParallelMemTableWriters: every writer inserts its own batch; the last one to finish publishes the
                 // sequence and exits the group (FinishParallelGroup).
-                _parallelLast = last;
-                _parallelTotal = total;
-                _parallelWalBytes = walRecordBytes;
-                _parallelWal = !leader.DisableWal;
-                _parallelSynced = needSync;
-                Volatile.Write(ref _parallelRemaining, group.Count);
-                leader.Rearm(); // completed by whichever writer finishes last
                 parallel = true;
-                for (int i = 1; i < group.Count; i++) group[i].Complete(WriteThread.StateParallelMemtableWriter);
+                LaunchParallelMemTableWriters(group, leader, total, last, walRecordBytes, !leader.DisableWal, needSync);
             }
             else
             {
@@ -424,7 +542,12 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            if (!parallel)
+            if (_pipelined)
+            {
+                // Writers that failed (error, callback) are completed; the others go to the memtable stage.
+                leaderState = _writeThread.ExitAsPipelinedWalLeader(group, leader);
+            }
+            else if (!parallel)
             {
                 if (_bdwSwapped.Count > 0) RestoreBlobDirectWriteBatches();
                 _writeThread.ExitAsBatchGroupLeader(group);
@@ -437,10 +560,23 @@ internal sealed partial class DbImpl
             else if (synchronous) leader.WaitSync();
             else await leader.WaitAsync().ConfigureAwait(false);
         }
+        return leaderState;
     }
 
     /// <summary>The memtable inserts of a group by its leader (the serial part of DBImpl::WriteImpl), then publication.</summary>
     private void InsertGroupSerially(List<WriteThread.Writer> group, WriteThread.Writer leader, ulong total, ulong last, int walRecordBytes, bool needSync)
+    {
+        InsertWritersSerially(group);
+        if (total > 0)
+        {
+            Versions.SetLastSequence(last);
+            NotifySequenceWaiters();
+        }
+        RecordWriteGroup(group, total, walRecordBytes, !leader.DisableWal, needSync);
+    }
+
+    /// <summary>WriteBatchInternal::InsertInto(write_group): the memtable inserts of the group's writers, one after another.</summary>
+    private void InsertWritersSerially(List<WriteThread.Writer> group)
     {
         var inserter = new MemTableInserter(this, logNumber: 0, ignoreMissingColumnFamilies: false);
         for (int i = 0; i < group.Count; i++)
@@ -465,12 +601,6 @@ internal sealed partial class DbImpl
                 w.Error = e;
             }
         }
-        if (total > 0)
-        {
-            Versions.SetLastSequence(last);
-            NotifySequenceWaiters();
-        }
-        RecordWriteGroup(group, total, walRecordBytes, !leader.DisableWal, needSync);
     }
 
     // ---- parallel memtable writes (allow_concurrent_memtable_write) ----------------------------------------
@@ -482,26 +612,38 @@ internal sealed partial class DbImpl
     private bool _parallelWal;
     private bool _parallelSynced;
     private int _parallelRemaining;
+    private List<WriteThread.Writer>? _parallelGroup;
 
     /// <summary>
-    /// Smallest number of entries in a group for which its memtable inserts run in parallel. Deviation from upstream
-    /// (which goes parallel for any group of two or more writers): waking the followers for their inserts and counting
-    /// them down adds two hand-offs per writer, which costs more than inserting a few keys serially (4 writer threads,
-    /// single-key writes: fillrandom 8.5 vs 6.0 µs/op, overwrite 10.3 vs 7.5 µs/op; 16-key batches: neutral, see
-    /// docs/perf.md). Scheduling only: what is written is the same either way.
+    /// LaunchParallelMemTableWriters: records the group's state for the writer that finishes last, re-arms the leader
+    /// (completed by whichever writer finishes last) and wakes the other writers for their own inserts.
     /// </summary>
-    internal const int MinParallelMemtableGroupEntries = 64;
+    private void LaunchParallelMemTableWriters(List<WriteThread.Writer> group, WriteThread.Writer leader, ulong total, ulong last,
+        int walRecordBytes, bool wal, bool needSync)
+    {
+        _parallelGroup = group;
+        _parallelLast = last;
+        _parallelTotal = total;
+        _parallelWalBytes = walRecordBytes;
+        _parallelWal = wal;
+        _parallelSynced = needSync;
+        Volatile.Write(ref _parallelRemaining, group.Count);
+        leader.Rearm();
+        for (int i = 0; i < group.Count; i++)
+        {
+            if (group[i] != leader) group[i].Complete(WriteThread.StateParallelMemtableWriter);
+        }
+    }
 
     /// <summary>
     /// Whether the group's memtable inserts run in parallel (DBImpl::WriteImpl: allow_concurrent_memtable_write, more
-    /// than one writer, no merge operands, and here at least <see cref="MinParallelMemtableGroupEntries"/> entries).
-    /// Transaction writes (callbacks, separate memtable batches, prepared sections, sequence-per-batch), excluded writers
-    /// and blob direct write rewrites keep the serial path.
+    /// than one writer, no merge operands; like upstream, for groups of any size). Transaction writes (callbacks, separate
+    /// memtable batches, prepared sections, sequence-per-batch), excluded writers and blob direct write rewrites keep the
+    /// serial path.
     /// </summary>
     private bool CanInsertInParallel(List<WriteThread.Writer> group, int valid, ulong total)
     {
         if (!_allowConcurrentMemtableWrite || group.Count < 2 || valid != group.Count || _seqPerBatch || _bdwSwapped.Count > 0) return false;
-        if (total < (ulong)MinParallelMemtableGroupEntries && !TestHooks.ForceParallelMemtableWrites) return false;
         for (int i = 0; i < group.Count; i++)
         {
             WriteThread.Writer w = group[i];
@@ -543,11 +685,17 @@ internal sealed partial class DbImpl
     /// </summary>
     private void FinishParallelGroup(WriteThread.Writer self)
     {
-        List<WriteThread.Writer> group = _group;
+        List<WriteThread.Writer> group = _parallelGroup!;
         if (_parallelTotal > 0)
         {
             Versions.SetLastSequence(_parallelLast);
             NotifySequenceWaiters();
+        }
+        if (_pipelined)
+        {
+            // The stats were recorded by the WAL stage.
+            _writeThread.ExitAsMemTableWriter(group, self);
+            return;
         }
         RecordWriteGroup(group, _parallelTotal, _parallelWalBytes, _parallelWal, _parallelSynced);
         _writeThread.ExitAsParallelGroup(group, self);
@@ -615,10 +763,14 @@ internal sealed partial class DbImpl
         ThrowIfDbStopped();
         if (Volatile.Read(ref _walsTotalSize) > (long)GetMaxTotalWalSize() && Versions.ColumnFamilies.Count > 1)
         {
+            // WaitForPendingWrites: with pipelined writes the memtables are switched only once no insert is pending.
+            if (_pipelined) await WaitForMemTableWritersAsync(synchronous).ConfigureAwait(false);
             await SwitchWalAsync(synchronous, cancellationToken).ConfigureAwait(false);
         }
         if (_flushScheduler.Count > 0)
         {
+            // With pipelined writes the memtable stage may still add to the flush scheduler until it is drained.
+            if (_pipelined) await WaitForMemTableWritersAsync(synchronous).ConfigureAwait(false);
             for (int i = 0; i < _flushScheduler.Count; i++)
             {
                 ColumnFamilyData cfd = _flushScheduler[i];

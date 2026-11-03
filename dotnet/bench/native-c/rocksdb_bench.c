@@ -71,6 +71,7 @@ typedef struct {
   uint64_t min_blob_size;
   int max_background_jobs;
   unsigned max_subcompactions;
+  bool enable_pipelined_write;
   uint64_t compaction_readahead_size;
   bool drop_page_cache;  // compact: evict the SST files from the page cache first
   bool use_existing_db;
@@ -110,6 +111,7 @@ static Flags FLAGS = {
     .min_blob_size = 0,
     .max_background_jobs = 2,
     .max_subcompactions = 1,
+    .enable_pipelined_write = false,
     .compaction_readahead_size = 2 * 1024 * 1024,
     .drop_page_cache = false,
     .use_existing_db = false,
@@ -136,6 +138,7 @@ static void usage(void) {
           "[--level0_file_num_compaction_trigger 4]\n"
           "  [--disable_auto_compactions] [--max_background_jobs 2] [--max_subcompactions 1]\n"
           "  [--compaction_readahead_size 2097152] [--drop_page_cache]\n"
+          "  [--enable_pipelined_write]\n"
           "  [--enable_blob_files] [--min_blob_size 0]\n"
           "  [--use_existing_db] [--seed 301] [--db PATH] [--histogram 1]\n"
           "  [--warmup true|false] [--warmup_ops N] [--warmup_min_ms 1000]\n"
@@ -211,6 +214,8 @@ static void parse_flags(int argc, char** argv) {
       FLAGS.enable_blob_files = parse_bool(value);
     else if (FLAG("min_blob_size"))
       FLAGS.min_blob_size = strtoull(value, NULL, 10);
+    else if (FLAG("enable_pipelined_write"))
+      FLAGS.enable_pipelined_write = parse_bool(value);
     else if (FLAG("max_background_jobs"))
       FLAGS.max_background_jobs = atoi(value);
     else if (FLAG("compaction_readahead_size"))
@@ -462,6 +467,8 @@ static void build_options(void) {
   rocksdb_options_compaction_readahead_size(g_options,
                                             (size_t)FLAGS.compaction_readahead_size);
   rocksdb_options_set_max_subcompactions(g_options, FLAGS.max_subcompactions);
+  rocksdb_options_set_enable_pipelined_write(g_options,
+                                             FLAGS.enable_pipelined_write);
   rocksdb_options_set_block_based_table_factory(g_options, g_table_options);
 
   g_wo = rocksdb_writeoptions_create();
@@ -1257,11 +1264,11 @@ static void print_header(void) {
   printf("Options:     compression=%s cache=%s:%" PRId64
          " bloom_bits=%d write_buffer_size=%" PRId64
          " block_size=%d batch_size=%d multiget_size=%d seek_nexts=%d "
-         "disable_wal=%d sync=%d\n",
+         "disable_wal=%d sync=%d pipelined=%d\n",
          FLAGS.compression, FLAGS.cache_type, FLAGS.cache_size,
          FLAGS.bloom_bits, FLAGS.write_buffer_size, FLAGS.block_size,
          FLAGS.batch_size, FLAGS.multiget_size, FLAGS.seek_nexts,
-         FLAGS.disable_wal, FLAGS.sync);
+         FLAGS.disable_wal, FLAGS.sync, FLAGS.enable_pipelined_write);
   printf("Compaction:  target_file_size_base=%" PRId64
          " max_bytes_for_level_base=%" PRId64
          " level0_file_num_compaction_trigger=%d disable_auto_compactions=%d "

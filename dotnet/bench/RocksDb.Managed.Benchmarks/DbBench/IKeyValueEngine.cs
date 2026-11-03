@@ -130,6 +130,8 @@ public sealed record EngineOptions
     public ulong CompactionReadaheadSize { get; init; } = 2 * 1024 * 1024;
     /// <summary>allow_concurrent_memtable_write (managed engine only; native uses its default, true).</summary>
     public bool AllowConcurrentMemtableWrite { get; init; } = true;
+    /// <summary>--enable_pipelined_write (false): separate WAL and memtable write stages (all engines).</summary>
+    public bool EnablePipelinedWrite { get; init; }
     /// <summary>enable_write_thread_adaptive_yield (managed engine only; native uses its default, true).</summary>
     public bool EnableWriteThreadAdaptiveYield { get; init; } = true;
 

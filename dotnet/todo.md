@@ -237,7 +237,8 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [x] reverse iteration pins blocks (readreverse 1 KiB 0.70->0.45 us), async reverse movement, range-deleted runs skipped (scan over 99% deleted 13.8 ms -> 0.16 ms, native 0.66), async compaction input readahead (cold compact 3.05 s -> 1.05 s, native 2.3-2.5)
   - [x] reverse merge operands pinned; async NextAsync direction switch; async index partition loads; user-iterator readahead (auto + ReadaheadSize)
   - [ ] forward merge operands still copied (S); user-iterator readahead allocates a Task per prefetch on cache miss (S)
-  - [ ] pipelined write (L); parallel insert for small groups is slower than serial - investigate (S); non-blocking SyncAsync (S); LZ4 encoder / cold-start JIT (M)
+  - [x] pipelined write (4-thread sync writes 15-20% faster; native WAL compat both ways), parallel memtable inserts for every group (no 64-entry minimum; faster than serial on a non-oversubscribed box), LZ4 encoder / cold start (managed fast encoder)
+  - [ ] unordered_write path (accepted, writes stay ordered) (M); non-blocking SyncAsync (S); possible order-dependent flake `MergeOperatorAcrossMemtableAndTables` at load ~15 (S)
 - Ingestion / TTL / stats
   - [x] ingestion: write_global_seqno (legacy, + reader checksum fallback), ingest_behind, overlapping files in one call, allow_db_generated_files, link_files; TTL iterator; GET_HIT_L*, file-read histograms, cfstats intervals; KeyMayExist without I/O
   - [x] file checksums (FileChecksumGenCrc32c in MANIFEST, VerifyFileChecksums, ingestion verify), ingestion temperatures; GET_HIT for MultiGet, FILE_READ_FLUSH/DB_OPEN/VERIFY histograms, per-level file-read histograms
