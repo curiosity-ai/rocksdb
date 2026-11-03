@@ -121,6 +121,7 @@ public sealed partial class WriteBatch : IDisposable
         {
             _pooled = false;
             Clear();
+            DropProtection(); // a rented batch starts unprotected
             WriteBatch?[] pool = s_pool;
             for (int i = 0; i < pool.Length; i++)
             {
@@ -287,7 +288,7 @@ public sealed partial class WriteBatch : IDisposable
         _rep.Write(rep);
         _contentFlags = ContentFlags.Deferred;
         _savePointCount = 0;
-        ResetProtection();
+        DropProtection(); // the new records carry no protection info (upstream asserts prot_info_ == nullptr)
         // Upstream's SetContents is internal and keeps wal_term_point_; a public rep replacement must not keep a point
         // beyond (or inside) the new contents.
         _walTermPoint = default;

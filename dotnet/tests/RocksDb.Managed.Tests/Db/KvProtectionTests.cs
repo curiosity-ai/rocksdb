@@ -125,6 +125,46 @@ public sealed class KvProtectionTests
         ts.VerifyChecksum();
     }
 
+    /// <summary>
+    /// SetContents and pooled batches start unprotected; appending a protected batch to an unprotected non-empty one
+    /// (a write group mixing both) leaves the destination unprotected.
+    /// </summary>
+    [TestMethod]
+    public void ProtectionIsDroppedWhereRecordsAreNotProtected()
+    {
+        WriteBatch pooled = WriteBatch.Rent();
+        pooled.Put(B("k"), B("v"));
+        pooled.UpdateProtectionInfo(8);
+        Assert.AreEqual(8, pooled.ProtectionBytesPerKey);
+        pooled.Dispose();
+        WriteBatch again = WriteBatch.Rent();
+        Assert.AreEqual(0, again.ProtectionBytesPerKey);
+        again.Dispose();
+
+        using var p = new WriteBatch(0, 0, protectionBytesPerKey: 8);
+        p.Put(B("a"), B("1"));
+        using var copy = new WriteBatch(0, 0, protectionBytesPerKey: 8);
+        copy.SetContents(p.Data);
+        Assert.AreEqual(0, copy.ProtectionBytesPerKey);
+        copy.VerifyChecksum();
+
+        using var plain = new WriteBatch();
+        plain.Put(B("b"), B("2"));
+        WriteBatch.Append(plain, p);
+        Assert.AreEqual(0, plain.ProtectionBytesPerKey);
+        plain.VerifyChecksum();
+
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), CfOptions());
+        db.Put(new WriteOptions { ProtectionBytesPerKey = 8 }, B("x"), B("1"));
+        using var raw = new WriteBatch();
+        raw.SetContents(p.Data);
+        db.Write(raw);
+        db.Put(B("y"), B("2"));
+        Assert.AreEqual("1", GetString(db, "a"));
+        Assert.AreEqual("2", GetString(db, "y"));
+    }
+
     [TestMethod]
     public void InvalidProtectionSizesAreRejected()
     {

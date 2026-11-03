@@ -166,4 +166,44 @@ public sealed class BlockCompressionTests
         BlockCompression.Decompress(CompressionType.None, "abc"u8, 5, w);
         Assert.IsTrue(w.WrittenSpan.SequenceEqual("abc"u8));
     }
+
+    /// <summary>
+    /// The managed LZ4 encoder (Lz4BlockEncoder) round-trips through the K4os decoder for every size class below 64 KiB,
+    /// and with a limited output returns 0 exactly when the full output does not fit (LZ4_compress_fast's contract).
+    /// Byte identity with native liblz4 is checked by the compat test.
+    /// </summary>
+    [TestMethod]
+    public void Lz4EncoderRoundTripsAndHonorsLimitedOutput()
+    {
+        int seed = Environment.TickCount;
+        var rnd = new Random(seed);
+        foreach (int size in (int[])[0, 1, 12, 13, 17, 100, 1000, 4096, 4099, 16384, 65535, Lz4BlockEncoder.Limit64K - 1])
+        {
+            for (int kind = 0; kind < 3; kind++)
+            {
+                byte[] src = kind == 0 ? new byte[size] : kind == 1 ? Compressible(size, rnd.Next()) : RandomBytes(rnd, size);
+                byte[] full = new byte[K4os.Compression.LZ4.LZ4Codec.MaximumOutputSize(size)];
+                int n = Lz4BlockEncoder.Compress(src, full);
+                string ctx = "seed=" + seed + " size=" + size + " kind=" + kind;
+                Assert.IsTrue(n > 0, ctx);
+                byte[] back = new byte[size];
+                // (K4os decodes into an empty buffer as an error; the empty input encodes to the single token 0x00.)
+                if (size == 0) Assert.AreEqual(1, n, ctx);
+                else Assert.AreEqual(size, K4os.Compression.LZ4.LZ4Codec.Decode(full.AsSpan(0, n), back), ctx);
+                CollectionAssert.AreEqual(src, back, ctx);
+                // Limited output: exactly enough succeeds with the same bytes, one byte less fails.
+                byte[] exact = new byte[n];
+                Assert.AreEqual(n, Lz4BlockEncoder.Compress(src, exact), ctx);
+                CollectionAssert.AreEqual(full.AsSpan(0, n).ToArray(), exact, ctx);
+                if (n > 1) Assert.AreEqual(0, Lz4BlockEncoder.Compress(src, new byte[n - 1]), ctx);
+            }
+        }
+
+        static byte[] RandomBytes(Random rnd, int size)
+        {
+            byte[] b = new byte[size];
+            rnd.NextBytes(b);
+            return b;
+        }
+    }
 }

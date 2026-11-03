@@ -15,9 +15,11 @@ namespace RocksDb.Managed.Compression;
 /// the varint32 uncompressed size; Snappy is raw snappy (which carries its own varint length).</para>
 /// <list type="bullet">
 /// <item>Snappy: Snappier (raw snappy block format).</item>
-/// <item>LZ4/LZ4HC: K4os raw LZ4 block format (not the frame format). Both types share one wire format; the
-///   level picks fast vs HC exactly like upstream. LZ4 fast acceleration &gt; 1 (level &lt; -1) is not exposed by
-///   K4os, so it compresses with acceleration 1 (output still fully compatible).</item>
+/// <item>LZ4/LZ4HC: raw LZ4 block format (not the frame format). Both types share one wire format; the level picks fast
+///   vs HC exactly like upstream. Fast LZ4 below 64 KiB uses <see cref="Lz4BlockEncoder"/> (a port of liblz4's
+///   LZ4_compress_generic byU16 path, same output as native); larger inputs, LZ4HC and decompression use K4os. LZ4 fast
+///   acceleration &gt; 1 (level &lt; -1) is not supported, so it compresses with acceleration 1 (output still fully
+///   compatible).</item>
 /// <item>ZSTD: ZstdSharp, a plain zstd frame (ZSTD_compress2) with pooled thread-local contexts.</item>
 /// <item>Zlib: raw deflate (window_bits = -14). .NET's deflater (both target frameworks) uses a 32 KiB window,
 ///   which a native inflater with window_bits -14 rejects as soon as a match reaches back more than 16 KiB. Inputs
@@ -140,6 +142,12 @@ public static partial class BlockCompression
         return true;
     }
 
+    /// <summary>
+    /// Benchmark A/B switch (TableBuildBenchmarks): true routes fast LZ4 below 64 KiB through K4os instead of
+    /// <see cref="Lz4BlockEncoder"/>. The output is LZ4-compatible either way. Not for production use.
+    /// </summary>
+    internal static bool UseK4osLz4Encoder;
+
     private static bool TryCompressLz4(CompressionType type, ReadOnlySpan<byte> raw, int level, int maxSize, IBufferWriter<byte> output)
     {
         // LZ4 and LZ4HC share the same wire format; level selects the compressor (BuiltinCompressionManagerV2::GetCompressor)
@@ -153,7 +161,10 @@ public static partial class BlockCompression
         int bound = LZ4Codec.MaximumOutputSize(raw.Length);
         Span<byte> dst = output.GetSpan(Coding.MaxVarint32Length + bound);
         int header = Coding.EncodeVarint32(dst, (uint)raw.Length);
-        int outLen = LZ4Codec.Encode(raw, dst.Slice(header, bound), lz4Level);
+        int outLen = !useHc && raw.Length < Lz4BlockEncoder.Limit64K && BitConverter.IsLittleEndian && !UseK4osLz4Encoder
+            // LZ4_compress_fast (acceleration 1) with the output limited to the acceptable size: 0 = rejected.
+            ? Lz4BlockEncoder.Compress(raw, dst.Slice(header, (int)Math.Min(bound, (long)maxSize - header)))
+            : LZ4Codec.Encode(raw, dst.Slice(header, bound), lz4Level);
         if (outLen <= 0 || header + outLen > maxSize)
         {
             return false;

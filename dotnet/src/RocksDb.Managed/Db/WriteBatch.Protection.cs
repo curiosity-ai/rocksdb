@@ -123,6 +123,14 @@ public sealed partial class WriteBatch
         _protCount = 0;
     }
 
+    /// <summary>SetContents / return to the pool: the batch becomes unprotected.</summary>
+    private void DropProtection()
+    {
+        _protInfo = null;
+        _protCount = 0;
+        _protectionBytesPerKey = 0;
+    }
+
     /// <summary>RollbackToSavePoint: prot_info_->entries_.resize(savepoint.count).</summary>
     private void TruncateProtection(uint count)
     {
@@ -139,6 +147,9 @@ public sealed partial class WriteBatch
             ThrowHelper.Corruption("Write batch has inconsistent count and number of checksums");
         if (src._protInfo is not null)
         {
+            // A group of batches written together may mix protected and unprotected ones (upstream asserts they do
+            // not): records already in an unprotected destination keep it unprotected.
+            if (_protInfo is null && Count != srcCount) return;
             if (_protInfo is null)
             {
                 _protInfo = new ulong[Math.Max(8, srcCount)];
