@@ -1505,6 +1505,27 @@ concurrent hits this can happen in any DB with `max_open_files != -1` and concur
 hitting a hot set while two read all files, 2 s) failed 4 of 10 runs before the fix and 0 of 20 after; the
 `DbBlobTests` class passed 100 of 100 runs after it with 2 CPU hogs (1 of 100 failed before, without hogs).
 
+## Trie user-defined index vs the standard index (2026-11-03)
+
+`TrieIndexBenchmarks` (BenchmarkDotNet, net10.0, default job, `[MemoryDiagnoser]`): one table of 200,000 keys
+("user" + 12 digits, 100-byte values, 4 KiB blocks, ~5,800 data blocks) built with both indexes
+(`IndexMode.StandardDefault` + `TrieIndexFactory`), every block cached in HyperClock, random existing keys. The run
+shared the 4-core box with other work (load average ~12), so absolute times are inflated and the error bars wide; the
+ratios are what matter.
+
+| Benchmark | Mean | Ratio | Allocated |
+|---|---:|---:|---:|
+| Get: standard index | 1,223.5 ns | 1.00 | - |
+| Get: trie index (`ReadIndex.PreferCustom`) | 1,246.0 ns | 1.03 | - |
+| Seek: standard index | 1,196.4 ns | 0.99 | - |
+| Seek: trie index | 1,230.2 ns | 1.01 | - |
+| Index only: index block Seek | 285.3 ns | 0.24 | - |
+| Index only: `LoudsTrieIterator.Seek` | 291.2 ns | 0.24 | - |
+
+The trie matches the binary-search index within noise for Get and Seek, and allocates nothing: trie iterators are
+recycled through a per-thread slot (the table's IndexCursor creates one per lookup), and the trie's arrays are decoded
+once when the table is opened.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
