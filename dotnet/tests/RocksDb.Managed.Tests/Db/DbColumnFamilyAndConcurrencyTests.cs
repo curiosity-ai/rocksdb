@@ -96,13 +96,33 @@ public sealed class DbColumnFamilyAndConcurrencyTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task ConcurrentWritersSyncAndAsync()
+    [DataRow(true, true)]
+    [DataRow(true, false)]
+    [DataRow(false, true)]
+    public async Task ConcurrentWritersSyncAndAsync(bool concurrentMemtableWrite, bool adaptiveYield)
+    {
+        // Single-key writes form groups below the parallel threshold: force the parallel inserts to exercise them.
+        TestHooks.ForceParallelMemtableWrites = concurrentMemtableWrite;
+        try
+        {
+            await ConcurrentWritersSyncAndAsyncCore(concurrentMemtableWrite, adaptiveYield);
+        }
+        finally
+        {
+            TestHooks.ForceParallelMemtableWrites = false;
+        }
+    }
+
+    private static async Task ConcurrentWritersSyncAndAsyncCore(bool concurrentMemtableWrite, bool adaptiveYield)
     {
         MemoryFileSystem fs = NewFs();
         var cfo = new ColumnFamilyOptions { WriteBufferSize = 256 * 1024, ArenaBlockSize = 16 * 1024, MaxWriteBufferNumber = 3 };
         const int threads = 8;
         var counts = new int[threads];
-        await using (RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs), cfo))
+        DbOptions options = NewOptions(fs);
+        options.AllowConcurrentMemtableWrite = concurrentMemtableWrite;
+        options.EnableWriteThreadAdaptiveYield = adaptiveYield;
+        await using (RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, options, cfo))
         {
             var sw = Stopwatch.StartNew();
             var tasks = new Task[threads];
@@ -153,6 +173,44 @@ public sealed class DbColumnFamilyAndConcurrencyTests
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Point reads use super version references cached per processor (SuperVersionCache, upstream local_sv_): a read
+    /// after a memtable switch, flush, compaction or column family drop must not use the cached, obsolete one.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task PointReadsNeverUseAnObsoleteCachedSuperVersion()
+    {
+        MemoryFileSystem fs = NewFs();
+        await using RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs));
+        ColumnFamily cf = db.CreateColumnFamily("cf", new ColumnFamilyOptions());
+        for (int round = 0; round < 20; round++)
+        {
+            string expect = "v" + round;
+            cf.Put(B("k"), B(expect));
+            // Several reads (sync, async, MultiGet) on whatever processors this thread runs on cache the super version.
+            Assert.AreEqual(expect, GetString(cf, "k"));
+            Assert.AreEqual(expect, System.Text.Encoding.UTF8.GetString((await cf.GetAsync(B("k")))!));
+            switch (round % 3)
+            {
+                case 0: cf.Flush(); break;
+                case 1: await cf.CompactRangeAsync(); break;
+                default: await cf.FlushAsync(); break;
+            }
+            string next = "w" + round;
+            cf.Put(B("k"), B(next)); // lands in the memtable of the newly installed super version
+            Assert.AreEqual(next, GetString(cf, "k"));
+            Assert.AreEqual(next, System.Text.Encoding.UTF8.GetString((await cf.GetAsync(B("k")))!));
+            byte[]?[] values = cf.MultiGet([B("k")]);
+            Assert.AreEqual(next, System.Text.Encoding.UTF8.GetString(values[0]!));
+        }
+        db.DropColumnFamily(cf);
+        RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() => cf.Get(B("k")));
+        Assert.AreEqual(StatusCode.ColumnFamilyDropped, e.Code);
+        RocksDbException e2 = Assert.ThrowsExactly<RocksDbException>(() => cf.Get(B("k")));
+        Assert.AreEqual(StatusCode.ColumnFamilyDropped, e2.Code);
     }
 
     [TestMethod]

@@ -29,7 +29,7 @@ internal sealed partial class DbImpl
         }
         Statistics? st = Stats;
         long t0 = st is null ? 0 : st.StartTimer();
-        SuperVersion sv = GetReferencedSuperVersion(cfd);
+        SuperVersion sv = GetAndRefSuperVersion(cfd, out int svSlot);
         ulong snapshot = ReadSequence(options);
         try
         {
@@ -119,7 +119,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            ReturnSuperVersion(sv);
+            ReturnAndCleanupSuperVersion(cfd, sv, svSlot);
         }
     }
 
@@ -168,7 +168,7 @@ internal sealed partial class DbImpl
     private static ValueTask MultiGetFromFileAsync(ColumnFamilyData cfd, FileMetaData f, MultiGetBatch batch, int count, ulong snapshot, bool synchronous,
         CancellationToken cancellationToken)
     {
-        TableReaderLease lease = cfd.TableCache.GetReader(f, out FragmentedRangeTombstoneList? rangeDels);
+        TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels);
         ValueTask t;
         try
         {

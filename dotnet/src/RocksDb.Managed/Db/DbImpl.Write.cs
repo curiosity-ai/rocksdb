@@ -8,6 +8,7 @@ namespace RocksDb.Managed.Db;
 internal sealed partial class DbImpl
 {
     private readonly WriteThread _writeThread;
+    private readonly bool _allowConcurrentMemtableWrite;
     private readonly List<WriteThread.Writer> _group = new();       // leader-only
     private readonly WriteBatch _groupBatch = new(64 << 10, 0);     // leader-only: merged WAL record
     private readonly List<ColumnFamilyData> _flushScheduler = new(); // leader-only: CFs whose memtable became full
@@ -75,6 +76,16 @@ internal sealed partial class DbImpl
             if (!_writeThread.JoinBatchGroup(w))
             {
                 int state = synchronous ? w.WaitSync() : await w.WaitAsync().ConfigureAwait(false);
+                if (state == WriteThread.StateParallelMemtableWriter)
+                {
+                    // The leader wrote the WAL record and assigned the sequence numbers; insert our own batch.
+                    ParallelMemTableInsert(w);
+                    if (CompleteParallelMemTableWriter()) FinishParallelGroup(w);
+                    else state = synchronous ? w.WaitSync() : await w.WaitAsync().ConfigureAwait(false);
+                    Debug.Assert(state is WriteThread.StateCompleted or WriteThread.StateParallelMemtableWriter);
+                    if (w.Error is { } pe) ThrowWriteError(pe);
+                    return;
+                }
                 if (state == WriteThread.StateCompleted)
                 {
                     if (w.Error is { } e) ThrowWriteError(e);
@@ -173,6 +184,7 @@ internal sealed partial class DbImpl
     {
         List<WriteThread.Writer> group = _group;
         _writeThread.EnterAsBatchGroupLeader(leader, group);
+        bool parallel = false;
         try
         {
             // Writers that queued before the DB was closed get leadership after close released it.
@@ -356,34 +368,24 @@ internal sealed partial class DbImpl
                 }
             }
 
-            var inserter = new MemTableInserter(this, logNumber: 0, ignoreMissingColumnFamilies: false);
-            for (int i = 0; i < group.Count; i++)
+            if (CanInsertInParallel(group, valid, total))
             {
-                WriteThread.Writer w = group[i];
-                if (w.CallbackFailed) continue;
-                TransactionWriteContext? t = w.Txn;
-                if (t is { DisableMemtable: true }) continue;
-                WriteBatch mb = t?.MemtableBatch ?? w.Batch!;
-                inserter.Sequence = _seqPerBatch ? t!.SequenceUsed : mb.Sequence;
-                if (_seqPerBatch) mb.Sequence = inserter.Sequence;
-                inserter.IgnoreMissingColumnFamilies = w.IgnoreMissingColumnFamilies;
-                inserter.LogRef = t?.LogRef ?? 0;
-                try
-                {
-                    inserter.Run(mb.Data);
-                    Debug.Assert(!_seqPerBatch || inserter.Sequence - t!.SequenceUsed == (ulong)t.BatchCount, "sub-batch count mismatch");
-                }
-                catch (Exception e)
-                {
-                    w.Error = e;
-                }
+                // LaunchParallelMemTableWriters: every writer inserts its own batch; the last one to finish publishes the
+                // sequence and exits the group (FinishParallelGroup).
+                _parallelLast = last;
+                _parallelTotal = total;
+                _parallelWalBytes = leader.DisableWal ? 0 : (group.Count == 1 ? leader.Batch!.DataSize : _groupBatch.DataSize);
+                _parallelWal = !leader.DisableWal;
+                _parallelSynced = needSync;
+                Volatile.Write(ref _parallelRemaining, group.Count);
+                leader.Rearm(); // completed by whichever writer finishes last
+                parallel = true;
+                for (int i = 1; i < group.Count; i++) group[i].Complete(WriteThread.StateParallelMemtableWriter);
             }
-            if (total > 0)
+            else
             {
-                Versions.SetLastSequence(last);
-                NotifySequenceWaiters();
+                InsertGroupSerially(group, leader, total, last, needSync);
             }
-            RecordWriteGroup(group, total, leader.DisableWal ? 0 : (group.Count == 1 ? leader.Batch!.DataSize : _groupBatch.DataSize), !leader.DisableWal, needSync);
         }
         catch (Exception e)
         {
@@ -391,9 +393,131 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            if (_bdwSwapped.Count > 0) RestoreBlobDirectWriteBatches();
-            _writeThread.ExitAsBatchGroupLeader(group);
+            if (!parallel)
+            {
+                if (_bdwSwapped.Count > 0) RestoreBlobDirectWriteBatches();
+                _writeThread.ExitAsBatchGroupLeader(group);
+            }
         }
+        if (parallel)
+        {
+            ParallelMemTableInsert(leader);
+            if (CompleteParallelMemTableWriter()) FinishParallelGroup(leader);
+            else if (synchronous) leader.WaitSync();
+            else await leader.WaitAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>The memtable inserts of a group by its leader (the serial part of DBImpl::WriteImpl), then publication.</summary>
+    private void InsertGroupSerially(List<WriteThread.Writer> group, WriteThread.Writer leader, ulong total, ulong last, bool needSync)
+    {
+        var inserter = new MemTableInserter(this, logNumber: 0, ignoreMissingColumnFamilies: false);
+        for (int i = 0; i < group.Count; i++)
+        {
+            WriteThread.Writer w = group[i];
+            if (w.CallbackFailed) continue;
+            TransactionWriteContext? t = w.Txn;
+            if (t is { DisableMemtable: true }) continue;
+            WriteBatch mb = t?.MemtableBatch ?? w.Batch!;
+            inserter.Sequence = _seqPerBatch ? t!.SequenceUsed : mb.Sequence;
+            if (_seqPerBatch) mb.Sequence = inserter.Sequence;
+            inserter.IgnoreMissingColumnFamilies = w.IgnoreMissingColumnFamilies;
+            inserter.LogRef = t?.LogRef ?? 0;
+            try
+            {
+                inserter.Run(mb.Data);
+                Debug.Assert(!_seqPerBatch || inserter.Sequence - t!.SequenceUsed == (ulong)t.BatchCount, "sub-batch count mismatch");
+            }
+            catch (Exception e)
+            {
+                w.Error = e;
+            }
+        }
+        if (total > 0)
+        {
+            Versions.SetLastSequence(last);
+            NotifySequenceWaiters();
+        }
+        RecordWriteGroup(group, total, leader.DisableWal ? 0 : (group.Count == 1 ? leader.Batch!.DataSize : _groupBatch.DataSize), !leader.DisableWal, needSync);
+    }
+
+    // ---- parallel memtable writes (allow_concurrent_memtable_write) ----------------------------------------
+    // State of the current parallel group: written by its leader before it wakes the followers, read by the writer that
+    // finishes last (ordered by the wake-up and by the countdown).
+    private ulong _parallelLast;
+    private ulong _parallelTotal;
+    private int _parallelWalBytes;
+    private bool _parallelWal;
+    private bool _parallelSynced;
+    private int _parallelRemaining;
+
+    /// <summary>
+    /// Smallest number of entries in a group for which its memtable inserts run in parallel. Deviation from upstream
+    /// (which goes parallel for any group of two or more writers): waking the followers for their inserts and counting
+    /// them down adds two hand-offs per writer, which costs more than inserting a few keys serially (4 writer threads,
+    /// single-key writes: fillrandom 8.5 vs 6.0 µs/op, overwrite 10.3 vs 7.5 µs/op; 16-key batches: neutral, see
+    /// docs/perf.md). Scheduling only: what is written is the same either way.
+    /// </summary>
+    internal const int MinParallelMemtableGroupEntries = 64;
+
+    /// <summary>
+    /// Whether the group's memtable inserts run in parallel (DBImpl::WriteImpl: allow_concurrent_memtable_write, more
+    /// than one writer, no merge operands, and here at least <see cref="MinParallelMemtableGroupEntries"/> entries).
+    /// Transaction writes (callbacks, separate memtable batches, prepared sections, sequence-per-batch), excluded writers
+    /// and blob direct write rewrites keep the serial path.
+    /// </summary>
+    private bool CanInsertInParallel(List<WriteThread.Writer> group, int valid, ulong total)
+    {
+        if (!_allowConcurrentMemtableWrite || group.Count < 2 || valid != group.Count || _seqPerBatch || _bdwSwapped.Count > 0) return false;
+        if (total < (ulong)MinParallelMemtableGroupEntries && !TestHooks.ForceParallelMemtableWrites) return false;
+        for (int i = 0; i < group.Count; i++)
+        {
+            WriteThread.Writer w = group[i];
+            if (w.Txn is not null || w.Batch!.HasMerge) return false;
+        }
+        return true;
+    }
+
+    /// <summary>The memtable insert of one writer of a parallel group (WriteBatchInternal::InsertInto with concurrent_memtable_writes).</summary>
+    private void ParallelMemTableInsert(WriteThread.Writer w)
+    {
+        var inserter = MemTableInserter.ForConcurrentWriter(this, w.IgnoreMissingColumnFamilies);
+        WriteBatch b = w.Batch!;
+        inserter.Sequence = b.Sequence;
+        try
+        {
+            inserter.Run(b.Data);
+        }
+        catch (Exception e)
+        {
+            w.Error = e;
+        }
+        finally
+        {
+            inserter.PostProcess();
+        }
+        // Re-arm before counting down: the writer finishing last may complete this one right after.
+        w.Rearm();
+    }
+
+    /// <summary>WriteThread::CompleteParallelMemTableWriter: true for the writer that finished last.</summary>
+    private bool CompleteParallelMemTableWriter() => Interlocked.Decrement(ref _parallelRemaining) == 0;
+
+    /// <summary>
+    /// The end of a parallel group, run by the writer that finished last (DBImpl::WriteImpl after
+    /// CompleteParallelMemTableWriter + ExitAsBatchGroupFollower): publishes the last sequence, then completes the other
+    /// writers and hands leadership on.
+    /// </summary>
+    private void FinishParallelGroup(WriteThread.Writer self)
+    {
+        List<WriteThread.Writer> group = _group;
+        if (_parallelTotal > 0)
+        {
+            Versions.SetLastSequence(_parallelLast);
+            NotifySequenceWaiters();
+        }
+        RecordWriteGroup(group, _parallelTotal, _parallelWalBytes, _parallelWal, _parallelSynced);
+        _writeThread.ExitAsParallelGroup(group, self);
     }
 
     // ---- blob direct write (leader-only state) -------------------------------------------------------------
@@ -735,6 +859,13 @@ internal sealed partial class DbImpl
         private readonly bool _writeAfterCommit;
         private readonly WriteBatch.TxnMarkerPolicy _policy;
         private DuplicateDetector? _dupDetector;
+        // concurrent_memtable_writes_: inserts use MemTable.AddConcurrently, whose counters are accumulated per memtable
+        // (post_info_map_; one memtable at a time here, flushed when the batch moves to another) and applied by
+        // PostProcess.
+        private bool _concurrent;
+        private MemTable? _postMem;
+        private ColumnFamilyData? _postCfd;
+        private MemTablePostProcessInfo _post;
 
         public MemTableInserter(DbImpl db, ulong logNumber, bool ignoreMissingColumnFamilies)
         {
@@ -753,6 +884,36 @@ internal sealed partial class DbImpl
             _policy = !_seqPerBatch ? WriteBatch.TxnMarkerPolicy.WriteCommitted
                 : db._batchPerTxn ? WriteBatch.TxnMarkerPolicy.WritePrepared : WriteBatch.TxnMarkerPolicy.WriteUnprepared;
             _dupDetector = null;
+            _concurrent = false;
+            _postMem = null;
+            _postCfd = null;
+            _post = default;
+        }
+
+        /// <summary>An inserter for one writer of a parallel memtable group (concurrent_memtable_writes).</summary>
+        public static MemTableInserter ForConcurrentWriter(DbImpl db, bool ignoreMissingColumnFamilies)
+        {
+            var m = new MemTableInserter(db, logNumber: 0, ignoreMissingColumnFamilies);
+            m._concurrent = true;
+            return m;
+        }
+
+        /// <summary>
+        /// MemTableInserter::PostProcess: applies the counters of concurrent inserts (MemTable::BatchPostProcess) and
+        /// schedules a flush of the memtable when that made it full (CheckMemtableFull).
+        /// </summary>
+        public void PostProcess()
+        {
+            if (_postMem is not { } mem) return;
+            mem.BatchPostProcess(_post);
+            if (mem.ShouldScheduleFlush && mem.MarkFlushScheduled())
+            {
+                List<ColumnFamilyData> scheduler = _db._flushScheduler;
+                lock (scheduler) scheduler.Add(_postCfd!);
+            }
+            _postMem = null;
+            _postCfd = null;
+            _post = default;
         }
 
         /// <summary>Iterates <paramref name="rep"/> into the memtables (WriteBatch::Iterate with this handler's option states).</summary>
@@ -806,7 +967,8 @@ internal sealed partial class DbImpl
                 MaybeAdvanceSeq(batchBoundary: true);
             }
             if (LogRef != 0) mem.RefLogContainingPrepSection(LogRef);
-            if (mem.ShouldScheduleFlush && mem.MarkFlushScheduled()) _db._flushScheduler.Add(c);
+            // Concurrent inserts update the flush state in PostProcess (BatchPostProcess), which also schedules the flush.
+            if (!_concurrent && mem.ShouldScheduleFlush && mem.MarkFlushScheduled()) _db._flushScheduler.Add(c);
             MaybeAdvanceSeq(batchBoundary: false);
         }
 
@@ -816,11 +978,23 @@ internal sealed partial class DbImpl
         /// the DB read fallback when the memtable has no value for the key. Returns false when the key+seq exists.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private readonly bool AddToMemTable(ColumnFamilyData c, MemTable mem, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        private bool AddToMemTable(ColumnFamilyData c, MemTable mem, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
         {
+            if (_concurrent) return AddConcurrently(c, mem, type, key, value);
             if (!mem.InplaceUpdateSupport || type is not (EntryType.Value or EntryType.WideColumnEntity or EntryType.BlobIndex or EntryType.ValuePreferredSeqno))
                 return mem.Add(Sequence, type, key, value);
             return AddInplace(c, mem, type, key, value);
+        }
+
+        private bool AddConcurrently(ColumnFamilyData c, MemTable mem, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            if (!ReferenceEquals(mem, _postMem))
+            {
+                PostProcess();
+                _postMem = mem;
+                _postCfd = c;
+            }
+            return mem.AddConcurrently(Sequence, type, key, value, ref _post);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]

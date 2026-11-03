@@ -30,6 +30,8 @@ internal sealed class TableCache : ITableCache, IDisposable
     private readonly IReadOnlyList<string> _dbPaths;
     private readonly TableReaderOptions _readerOptions;
     private readonly int _capacity;
+    // max_open_files == -1: every reader stays open until its file is obsolete (no eviction, no LRU bookkeeping).
+    private readonly bool _unbounded;
     private readonly ConcurrentDictionary<ulong, Handle> _handles = new();
     private readonly Lock _openLock = new();
     private long _openSequence;
@@ -46,6 +48,7 @@ internal sealed class TableCache : ITableCache, IDisposable
         _readerOptions = readerOptions;
         // table_cache_size = max_open_files - kNumNonTableCacheFiles (db/db_impl/db_impl.cc)
         _capacity = maxOpenFiles < 0 ? int.MaxValue : Math.Max(maxOpenFiles - 10, 20);
+        _unbounded = maxOpenFiles < 0;
     }
 
     public int Count => _handles.Count;
@@ -116,6 +119,23 @@ internal sealed class TableCache : ITableCache, IDisposable
         return new TableReaderLease(h.Reader!, s_release, h);
     }
 
+    /// <summary>
+    /// <see cref="GetReader(FileMetaData, out FragmentedRangeTombstoneList?)"/> for a file of a version the caller holds
+    /// referenced (through a super version or a version reference) for as long as it uses the lease. With
+    /// <c>max_open_files == -1</c> a reader is only closed when its file becomes obsolete, which cannot happen while a
+    /// referenced version contains it, so the lease takes no reference: no shared counter is written per lookup (like the
+    /// pinned <c>fd.table_reader</c> that Version::Get uses upstream). Otherwise the lease is referenced as usual.
+    /// </summary>
+    public TableReaderLease GetReaderForVersion(FileMetaData file, out FragmentedRangeTombstoneList? rangeTombstones)
+    {
+        if (_unbounded && _handles.TryGetValue(file.FileNumber, out Handle? h) && h.IsOpen && h.Reader is { } reader)
+        {
+            rangeTombstones = h.RangeDels;
+            return new TableReaderLease(reader, null, null);
+        }
+        return GetReader(file, out rangeTombstones);
+    }
+
     /// <summary>The fragmented range tombstones of a table (opening it if needed), or null if it has none.</summary>
     public FragmentedRangeTombstoneList? GetRangeTombstones(FileMetaData file)
     {
@@ -149,7 +169,8 @@ internal sealed class TableCache : ITableCache, IDisposable
         {
             if (_handles.TryGetValue(number, out Handle? h) && h.IsOpen && h.TryRef())
             {
-                h.LastUse = Interlocked.Increment(ref _openSequence);
+                // LastUse only orders evictions; unbounded caches never evict (and skip the shared counter).
+                if (!_unbounded) h.LastUse = Interlocked.Increment(ref _openSequence);
                 return h;
             }
             ObjectDisposedException.ThrowIf(_disposed, this);

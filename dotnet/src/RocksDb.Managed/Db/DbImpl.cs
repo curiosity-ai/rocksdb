@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using RocksDb.Managed.Cache;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Wal;
@@ -55,7 +56,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
         DbPaths = paths;
         Versions = new VersionSet(this, FileSystem, dbname);
         ErrorHandler = new ErrorHandler(this);
-        _writeThread = new WriteThread(options.MaxWriteBatchGroupSizeBytes);
+        _allowConcurrentMemtableWrite = options.AllowConcurrentMemtableWrite;
+        _writeThread = new WriteThread(options.MaxWriteBatchGroupSizeBytes, options.EnableWriteThreadAdaptiveYield ? options.WriteThreadMaxYieldUsec : 0);
         // GetBGJobLimits (db/db_impl/db_impl_compaction_flush.cc).
         int maxFlushes = options.MaxBackgroundFlushes;
         if (maxFlushes == -1 && options.MaxBackgroundCompactions == -1) maxFlushes = Math.Max(1, options.MaxBackgroundJobs / 4);
@@ -70,7 +72,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         _lastSeqSameAsPublishSeq = !(_seqPerBatch && _twoWriteQueues);
         if (_twoWriteQueues)
         {
-            _nonmemWriteThread = new WriteThread(options.MaxWriteBatchGroupSizeBytes);
+            _nonmemWriteThread = new WriteThread(options.MaxWriteBatchGroupSizeBytes, options.EnableWriteThreadAdaptiveYield ? options.WriteThreadMaxYieldUsec : 0);
             _walWriteLock = new SemaphoreSlim(1, 1);
         }
     }
@@ -193,6 +195,52 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Port of DBImpl::GetAndRefSuperVersion (ColumnFamilyData::GetThreadLocalSuperVersion): the current super version,
+    /// usually through the reference cached in the processor's slot of <see cref="ColumnFamilyData.LocalSuperVersions"/>
+    /// so that no shared counter is written. Release with <see cref="ReturnAndCleanupSuperVersion"/> passing
+    /// <paramref name="slot"/> back.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal SuperVersion GetAndRefSuperVersion(ColumnFamilyData cfd, out int slot)
+    {
+        SuperVersionCache cache = cfd.LocalSuperVersions;
+        slot = cache.Take(out object? cached);
+        // Interlocked.Exchange is a full fence: the current super version is read after the slot was taken.
+        if (cached is SuperVersion sv && ReferenceEquals(sv, cfd.SuperOrNull())) return sv;
+        return GetAndRefSuperVersionSlow(cfd, cached, ref slot);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private SuperVersion GetAndRefSuperVersionSlow(ColumnFamilyData cfd, object? cached, ref int slot)
+    {
+        if (ReferenceEquals(cached, SuperVersionCache.InUse))
+        {
+            // Another thread uses this processor's slot (it was preempted while reading): plain reference.
+            slot = -1;
+            return GetReferencedSuperVersion(cfd);
+        }
+        try
+        {
+            // An obsolete super version stored back by a reader that raced with a reset: drop the slot's reference.
+            if (cached is SuperVersion stale) ReturnSuperVersion(stale);
+            return GetReferencedSuperVersion(cfd);
+        }
+        catch
+        {
+            cfd.LocalSuperVersions.Abandon(slot);
+            throw;
+        }
+    }
+
+    /// <summary>Port of DBImpl::ReturnAndCleanupSuperVersion (ReturnThreadLocalSuperVersion).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void ReturnAndCleanupSuperVersion(ColumnFamilyData cfd, SuperVersion sv, int slot)
+    {
+        if (slot >= 0 && cfd.LocalSuperVersions.TryPut(slot, sv)) return;
+        ReturnSuperVersion(sv);
+    }
+
     private static void ThrowDropped(ColumnFamilyData cfd) =>
         throw new RocksDbException(StatusCode.ColumnFamilyDropped, "Column family drop: column family " + cfd.Name + " was dropped");
 
@@ -233,6 +281,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
         var sv = new SuperVersion(cfd.Mem, imm, cfd.Current, ++_superVersionNumber);
         SuperVersion? old = cfd.SuperOrNull();
         cfd.SetSuper(sv);
+        // Reset the cached references before releasing the CF's own one, so that a slot never holds the last reference
+        // (ColumnFamilyData::InstallSuperVersion -> ResetThreadLocalSuperVersions).
+        if (old is not null) cfd.LocalSuperVersions.Reset(this);
         if (old is not null && old.Unref()) CleanupSuperVersion(old);
         OnSuperVersionInstalled(cfd);
     }
@@ -686,6 +737,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     private void ReleaseColumnFamilyMemTables(ColumnFamilyData cfd)
     {
         SuperVersion? sv = cfd.SuperOrNull();
+        cfd.LocalSuperVersions.Reset(this);
         if (sv is not null && sv.Unref()) CleanupSuperVersion(sv);
         if (cfd.Mem is not null && cfd.Mem.Unref()) cfd.Mem.Dispose();
         foreach (ImmutableMemTable m in cfd.Imm)

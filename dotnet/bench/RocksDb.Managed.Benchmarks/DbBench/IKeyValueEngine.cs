@@ -121,6 +121,10 @@ public sealed record EngineOptions
 
     /// <summary>--max_background_jobs (2).</summary>
     public int MaxBackgroundJobs { get; init; } = 2;
+    /// <summary>allow_concurrent_memtable_write (managed engine only; native uses its default, true).</summary>
+    public bool AllowConcurrentMemtableWrite { get; init; } = true;
+    /// <summary>enable_write_thread_adaptive_yield (managed engine only; native uses its default, true).</summary>
+    public bool EnableWriteThreadAdaptiveYield { get; init; } = true;
 
     /// <summary>--compression: none, snappy, lz4 or zstd (all levels).</summary>
     public CompressionType Compression { get; init; } = CompressionType.None;
