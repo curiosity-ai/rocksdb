@@ -226,15 +226,17 @@ internal sealed class Compaction
 
     /// <summary>
     /// Port of Compaction::OverlapProximalLevelOutputRange: does the user key range overlap the range this compaction
-    /// may write to its proximal level?
+    /// may write to its proximal level? With <paramref name="rangeLimitExclusive"/> the range's largest key is an
+    /// exclusive limit (a range tombstone's end).
     /// </summary>
-    public bool OverlapProximalLevelOutputRange(ReadOnlySpan<byte> smallestUserKey, ReadOnlySpan<byte> largestUserKey)
+    public bool OverlapProximalLevelOutputRange(ReadOnlySpan<byte> smallestUserKey, ReadOnlySpan<byte> largestUserKey, bool rangeLimitExclusive)
     {
         if (!SupportsPerKeyPlacement) return false;
         // See FIXME in PopulateProximalLevelOutputRange: we do not compact any key up in this case.
         if (_proximalLevelSmallest.Length == 0 || _proximalLevelLargest.Length == 0) return false;
+        int largestCmp = VersionStorageInfo.CompareWithoutTimestamp(InputStorage.Icmp, largestUserKey, DbFormat.ExtractUserKey(_proximalLevelSmallest));
         return VersionStorageInfo.CompareWithoutTimestamp(InputStorage.Icmp, smallestUserKey, DbFormat.ExtractUserKey(_proximalLevelLargest)) <= 0
-            && VersionStorageInfo.CompareWithoutTimestamp(InputStorage.Icmp, largestUserKey, DbFormat.ExtractUserKey(_proximalLevelSmallest)) >= 0;
+            && (rangeLimitExclusive ? largestCmp > 0 : largestCmp >= 0);
     }
 
     /// <summary>Whether a user key lies within the proximal level output range (TEST_AssertWithinProximalLevelOutputRange).</summary>

@@ -367,4 +367,68 @@ public sealed class IngestionCompatTests
             StringAssert.Contains(ex.Message, "file checksum mismatch");
         }
     }
+
+    /// <summary>
+    /// IngestExternalFileArg::atomic_replace_range (newer than the C API of the native package, which cannot request it):
+    /// the DB the managed replacement leaves behind -- replaced files deleted in the MANIFEST, plus, with universal
+    /// compaction and a partial overlap, a generated range-tombstone file below the new data -- opens and reads the same
+    /// in native RocksDB, also after a native full compaction, and opens again in the managed port.
+    /// </summary>
+    [TestMethod]
+    public void AtomicReplaceRangeResultIsReadByNative()
+    {
+        using var dir = new TempDir("ingest-replace");
+        string dbPath = Path.Combine(dir.Path, "db");
+        string old0 = WriteSst(Path.Combine(dir.Path, "old0.sst"), 0, 100, "old");
+        string old1 = WriteSst(Path.Combine(dir.Path, "old1.sst"), 100, 200, "old");
+        string old2 = WriteSst(Path.Combine(dir.Path, "old2.sst"), 200, 300, "old");
+        string replacement = WriteSst(Path.Combine(dir.Path, "new.sst"), 60, 250, "new");
+        var cfo = new ColumnFamilyOptions { CompactionStyle = CompactionStyle.Universal, DisableAutoCompactions = true };
+        Dictionary<string, string> expected;
+        using (RocksDatabase db = RocksDatabase.Open(dbPath, new DbOptions { CreateIfMissing = true }, cfo))
+        {
+            db.IngestExternalFiles([old0, old1, old2], new IngestExternalFileOptions());
+            for (int i = 290; i < 300; i++) db.Put(U(Key(i)), U("mem" + i)); // memtable data outside the range stays unflushed
+            // [key000050, key000260): {100..199} is replaced, {0..99} and {200..299} partially overlap it.
+            db.IngestExternalFiles(db.DefaultColumnFamily, new IngestExternalFileArg
+            {
+                ExternalFiles = [replacement],
+                Options = new IngestExternalFileOptions { SnapshotConsistency = false },
+                AtomicReplaceRange = new IngestReplaceRange(U(Key(50)), U(Key(260))),
+            });
+            expected = ManagedScan(db);
+            Assert.AreEqual("old49", expected[Key(49)]);
+            Assert.IsFalse(expected.ContainsKey(Key(55)));
+            Assert.AreEqual("new60", expected[Key(60)]);
+            Assert.AreEqual("new249", expected[Key(249)]);
+            Assert.IsFalse(expected.ContainsKey(Key(255)));
+            Assert.AreEqual("old260", expected[Key(260)]);
+            Assert.AreEqual("mem295", expected[Key(295)]);
+            Assert.AreEqual(50 + 190 + 40, expected.Count);
+        }
+        var nopts = new RocksDbSharp.DbOptions().SetDisableAutoCompactions(1).SetCompactionStyle(RocksDbSharp.Compaction.Universal);
+        using (var db = RocksDbSharp.RocksDb.Open(nopts, dbPath))
+        {
+            AssertSameContents(expected, NativeScan(db), "native reads the replaced range");
+            db.CompactRange(Array.Empty<byte>(), null);
+            AssertSameContents(expected, NativeScan(db), "native after a full compaction");
+        }
+        using (RocksDatabase db = RocksDatabase.Open(dbPath, new DbOptions(), cfo))
+        {
+            AssertSameContents(expected, ManagedScan(db), "managed after native compaction");
+            // Whole column family replacement, read back by native.
+            db.IngestExternalFiles(db.DefaultColumnFamily, new IngestExternalFileArg
+            {
+                ExternalFiles = [WriteSst(Path.Combine(dir.Path, "all.sst"), 500, 510, "all")],
+                Options = new IngestExternalFileOptions { SnapshotConsistency = false },
+                AtomicReplaceRange = IngestReplaceRange.EntireColumnFamily,
+            });
+            expected = ManagedScan(db);
+            Assert.AreEqual(10, expected.Count);
+        }
+        using (var db = RocksDbSharp.RocksDb.Open(nopts, dbPath))
+        {
+            AssertSameContents(expected, NativeScan(db), "native reads the replaced column family");
+        }
+    }
 }

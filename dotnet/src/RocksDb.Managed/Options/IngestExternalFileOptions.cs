@@ -23,6 +23,53 @@ public sealed class IngestExternalFileArg
     /// or default_write_temperature.
     /// </summary>
     public Temperature FileTemperature { get; init; } = Temperature.Unknown;
+
+    /// <summary>
+    /// EXPERIMENTAL atomic_replace_range: when set, the existing keys of the column family in this range are cleared
+    /// atomically as part of the ingestion; the ingested files are logically applied on top of the cleared range.
+    /// <list type="bullet">
+    /// <item><see cref="IngestReplaceRange.EntireColumnFamily"/> (both bounds null) clears the whole column family;
+    /// setting just one bound is not supported (NotSupported).</item>
+    /// <item>With bounds, every ingested file must be contained in the half-open range [start, limit) (InvalidArgument
+    /// otherwise), and the memtable overlap check (and possible blocking flush) applies to the range, not just to the
+    /// file ranges.</item>
+    /// <item>Requires <see cref="IngestExternalFileOptions.SnapshotConsistency"/> = false (NotSupported otherwise); not
+    /// compatible with <see cref="IngestExternalFileOptions.IngestBehind"/> (InvalidArgument) nor FIFO compaction
+    /// (NotSupported).</item>
+    /// <item>Table files entirely inside the range are dropped (like DeleteFilesInRange). A file that only partially
+    /// overlaps the range is kept, and with universal compaction (and AllowGlobalSeqNo = true, AllowDbGeneratedFiles =
+    /// false, no user-defined timestamps) a generated file holding one range tombstone over the range is ingested below
+    /// the new files; that consumes one extra sequence number and is rejected (TryAgain) with
+    /// <see cref="IngestExternalFileOptions.FailIfNotBottommostLevel"/>. Other configurations fail on a partial overlap
+    /// (InvalidArgument).</item>
+    /// <item>Fails with InvalidArgument when a running compaction overlaps the range (any running compaction for
+    /// <see cref="IngestReplaceRange.EntireColumnFamily"/>): retry after it finishes.</item>
+    /// </list>
+    /// </summary>
+    public IngestReplaceRange? AtomicReplaceRange { get; init; }
+}
+
+/// <summary>
+/// The key range cleared by an ingestion with <see cref="IngestExternalFileArg.AtomicReplaceRange"/> (rocksdb::RangeOpt
+/// in IngestExternalFileArg::atomic_replace_range): start inclusive, limit exclusive, user keys without timestamps.
+/// </summary>
+public sealed class IngestReplaceRange
+{
+    /// <summary>A range with optional bounds. Both null = the whole column family; only one null is not supported.</summary>
+    public IngestReplaceRange(byte[]? start, byte[]? limit)
+    {
+        Start = start;
+        Limit = limit;
+    }
+
+    /// <summary>The whole column family (RangeOpt with both bounds unset).</summary>
+    public static IngestReplaceRange EntireColumnFamily { get; } = new(null, null);
+
+    /// <summary>Inclusive start user key, or null.</summary>
+    public byte[]? Start { get; }
+
+    /// <summary>Exclusive limit user key, or null.</summary>
+    public byte[]? Limit { get; }
 }
 
 /// <summary>
