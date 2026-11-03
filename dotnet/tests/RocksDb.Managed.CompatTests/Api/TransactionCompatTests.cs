@@ -391,4 +391,51 @@ public sealed class TransactionCompatTests
             Assert.AreEqual("2", S(native.Get(B("b"))));
         }
     }
+
+    /// <summary>
+    /// Transaction PutEntity: a committed entity and a prepared one (2PC) written by the managed TransactionDB; native
+    /// recovers the prepared transaction (its PutEntity record in the WAL's prepared section), commits it and reads the
+    /// default columns; the managed side then reads the full entities back.
+    /// </summary>
+    [TestMethod]
+    public void ManagedTransactionEntitiesRecoverAndCommitInNative()
+    {
+        using var dir = new TempDir("txn-entity");
+        using (TransactionDatabase db = TransactionDatabase.Open(dir.Path, ManagedOptions()))
+        {
+            using (Transaction t0 = db.BeginTransaction(s_sync))
+            {
+                t0.PutEntity(B("e0"), [new WideColumn(B(""), B("d0")), new WideColumn(B("c"), B("1"))]);
+                t0.Commit();
+            }
+            Transaction t1 = db.BeginTransaction(s_sync);
+            t1.SetName("xid-entity");
+            t1.PutEntity(B("e1"), [new WideColumn(B("z"), B("26")), new WideColumn(B(""), B("d1"))]);
+            t1.Prepare();
+            // closed with t1 prepared
+        }
+        using (var native = new NativeTxnDb(dir.Path))
+        {
+            Assert.AreEqual("d0", native.Get("e0"));
+            Assert.IsNull(native.Get("e1"));
+            List<IntPtr> prepared = native.GetPreparedTransactions();
+            Assert.AreEqual(1, prepared.Count);
+            Assert.AreEqual("xid-entity", NativeTxnDb.GetName(prepared[0]));
+            NativeTxnDb.Commit(prepared[0]);
+            NativeTxnDb.Destroy(prepared[0]);
+            Assert.AreEqual("d1", native.Get("e1"));
+        }
+        using (TransactionDatabase db = TransactionDatabase.Open(dir.Path, ManagedOptions()))
+        {
+            using Transaction t = db.BeginTransaction(s_sync);
+            var columns = new WideColumns();
+            Assert.IsTrue(t.TryGetEntity(null, B("e1"), columns));
+            Assert.AreEqual(2, columns.Count);
+            Assert.AreEqual("d1", S(columns.DefaultColumnValue.ToArray()));
+            Assert.IsTrue(columns.TryGetValue(B("z"), out ReadOnlySpan<byte> z));
+            Assert.AreEqual("26", S(z.ToArray()));
+            Assert.IsTrue(t.TryGetEntity(null, B("e0"), columns));
+            Assert.AreEqual(2, columns.Count);
+        }
+    }
 }

@@ -27,7 +27,7 @@ namespace RocksDb.Managed.Utilities.Transactions;
 /// Not thread-safe: use a transaction from one logical flow at a time. Dispose it when done (an uncommitted
 /// transaction releases its locks; a prepared one stays prepared in the WAL).
 /// </summary>
-public abstract class Transaction : IDisposable
+public abstract partial class Transaction : IDisposable
 {
     private protected readonly RocksDatabase _database;
     private protected readonly DbImpl _db;
