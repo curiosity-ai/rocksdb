@@ -1135,9 +1135,7 @@ Not ported yet (being implemented; tracked in [todo.md](todo.md)):
 - Ingesting PlainTable / CuckooTable external files, and the `trie_index` user-defined index (native trie-index files
   are read through their standard index).
 - Secondary caches (CompressedSecondaryCache, TieredCache), the persistent cache, `WriteBufferManager` and `SimCache`.
-- Column family export / import, remote compaction (`CompactionService`, `OpenAndCompact`).
-- `GetMergeOperands`, `PromoteL0`, `SuggestCompactRange`, `LockWAL` / `UnlockWAL`, `DisableManualCompaction`,
-  `GetCreationTimeOfOldestFile`, `ClipColumnFamily`, `GetPropertiesOfTablesInRange`, `OpenAndTrimHistory`, multi-range scans.
+- Remote compaction of compactions with blob files, and per-subcompaction remote jobs (such compactions run locally).
 - Query, block cache and I/O tracing (and replay); `ldb` / `sst_dump` equivalents.
 - Not supported, as upstream: user-defined timestamps in optimistic transactions and explicit-timestamp
   `WriteBatchWithIndex` writes.
