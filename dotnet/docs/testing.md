@@ -179,10 +179,15 @@ These tests cover `src/RocksDb.Managed.Replication` and `src/RocksDb.Managed.Rep
   forced failover and rebuild of a diverged log.
 - `ClusterTests`: bootstrap to cluster mode, re-election, quorum commit, a far-behind follower catching up through a
   snapshot, term-log persistence.
+- `ClusterPartitionTests`: the leader partitioned from the majority (a new leader in a later term, no acknowledgement
+  on the minority, the old leader steps down and rebuilds after healing) and a follower partitioned and healed, with a
+  client writing through whichever node claims leadership; no acknowledged write may be lost.
 - `GrpcTests`: two-node replication, a switchover pair and a three-node cluster over real gRPC on localhost.
 - `NativeReplicaTests`: a native rocksdb-sharp replica applies the managed WAL chunks.
 
-Nodes talk over an in-memory transport (channels) except in `GrpcTests`. `testconfig.json` caps each test at 60 s.
+Nodes talk over an in-memory transport (channels) except in `GrpcTests`. Its fault hooks (`InMemoryNetwork.SetPartitioned`,
+`Isolate`, `Heal`) cut links: unary calls fail and the streams open across a cut link are torn down, like a dropped
+connection. `testconfig.json` caps each test at 60 s.
 The multi-process versions are the programs in `samples/ReplicationTest`, `samples/SwitchoverTest` and
 `samples/ClusterTest` (`dotnet run --project samples/ClusterTest`). Each coordinator checks the final digests and
 exits non-zero on a mismatch.

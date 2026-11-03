@@ -385,7 +385,7 @@ Remaining gaps:
   2.96) and more work is left at the end of the writes (`waitforcompaction` 0.3 - 1.7 s vs 0.02 - 0.25 s). Fixed
   where it was a fidelity problem, see "Compaction-picking parity" below.
 - Range-partitioned subcompactions (`max_subcompactions`) are not implemented; native defaults to 1, so they would not
-  change the comparison.
+  change the comparison. (Implemented since: "Compaction completeness" below.)
 
 ## Compaction-picking parity (compaction-heavy configuration)
 
@@ -758,6 +758,42 @@ agents' I/O, which `nice` does not cover), so the ratios vs C are only indicativ
   matrix has no such workload, and the current design (every visible entry checked against the
   `RangeDelAggregator` in `DbIter`) is correct for all workloads. Not ported.
 - **Pipelined writes** (`enable_pipelined_write`): accepted and persisted, but writes use the non-pipelined path.
+
+## Compaction completeness: L0 pacing and subcompactions
+
+**L0 pile-up under the free-running compaction-heavy config** ("Compaction-picking parity" above reported up to 10 L0
+files for managed vs 5 - 6 for native). Re-measured with the warm-up (num = 500k, 4 MiB memtables / target files,
+16 MiB level base, 2 background jobs = 1 flush + 1 compaction thread, fillrandom + overwrite), peak L0 count from both
+LOGs (native: the "Level summary" / "compacted to" lines; managed: flushes since the last `compaction_finished`
+lsm_state), loaded VM (load average 8 - 12 from other agents):
+
+| run | 1 | 2 | 3 | 4 | 5 |
+|---|---:|---:|---:|---:|---:|
+| c-native | 7 | 7 | 6 | 7 | 8 |
+| managed | 8 | 7 | 9 | 7 | 7 |
+| managed, cold (`--warmup false`) | 10 | | | | |
+
+The earlier native figure was the number of L0 files each compaction picked (`Compacting N@0`), which is 4 - 5 on both
+engines; the actual L0 count peaks at 6 - 8 on native too. Neither engine reaches a write-stall trigger (L0 slowdown 20,
+soft pending bytes 64 GiB; native only stops briefly on max_write_buffer_number while its slower flush runs), so the
+write controller does not pace these runs, and the scheduling latency is the same (an L0 -> Lbase compaction starts in
+the millisecond its 4th file is flushed, in both LOGs). The pile-up follows from how many flushes complete during an
+L0 -> Lbase compaction: managed writes 1.2 - 1.9x faster here (overwrite 4.1 - 7.2 vs 6.3 - 11.1 µs/op) with
+compactions of similar speed, and cold JIT slows its first compactions. The write-controller code was still compared
+with `column_family.cc` and three differences fixed (delay recovery reward, rate carried between delays,
+compaction-speedup thresholds relative to the bottommost data; see `docs/validation.md`); none fires in this config.
+
+**Subcompactions** (`max_subcompactions`, new): `compact` of 1M x 100 B random keys written with auto compactions
+disabled (16 MiB memtables, 4 MiB target files, 8 background jobs), one run each on the loaded VM, the managed
+`compact` includes some JIT (149 - 299 methods):
+
+| | max_subcompactions 1 | 4 |
+|---|---:|---:|
+| c-native | 1.62 s | 0.96 s |
+| managed | 1.57 s | 0.51 s |
+
+The per-key loop of a subcompaction is the unchanged compaction loop (allocation-free); planning reads up to 128 index
+anchors per input file once per compaction.
 
 ## Gaps / follow-ups
 

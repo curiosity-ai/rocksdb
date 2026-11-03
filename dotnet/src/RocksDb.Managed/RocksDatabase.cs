@@ -218,6 +218,19 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public ValueTask CompactRangeAsync(CompactRangeOptions options, byte[]? begin, byte[]? end, CancellationToken cancellationToken = default) =>
         _default.CompactRangeAsync(options, begin, end, cancellationToken);
 
+    /// <summary>Compacts table files of the default column family (see <see cref="ColumnFamily.CompactFiles(IEnumerable{string}, int)"/>).</summary>
+    public IReadOnlyList<string> CompactFiles(IEnumerable<string> inputFileNames, int outputLevel) => _default.CompactFiles(inputFileNames, outputLevel);
+    public IReadOnlyList<string> CompactFiles(CompactFilesOptions options, IEnumerable<string> inputFileNames, int outputLevel) =>
+        _default.CompactFiles(options, inputFileNames, outputLevel);
+    public IReadOnlyList<string> CompactFiles(CompactFilesOptions options, IEnumerable<ulong> inputFileNumbers, int outputLevel) =>
+        _default.CompactFiles(options, inputFileNumbers, outputLevel);
+    public ValueTask<IReadOnlyList<string>> CompactFilesAsync(IEnumerable<string> inputFileNames, int outputLevel, CancellationToken cancellationToken = default) =>
+        _default.CompactFilesAsync(inputFileNames, outputLevel, cancellationToken);
+    public ValueTask<IReadOnlyList<string>> CompactFilesAsync(CompactFilesOptions options, IEnumerable<string> inputFileNames, int outputLevel,
+        CancellationToken cancellationToken = default) => _default.CompactFilesAsync(options, inputFileNames, outputLevel, cancellationToken);
+    public ValueTask<IReadOnlyList<string>> CompactFilesAsync(CompactFilesOptions options, IEnumerable<ulong> inputFileNumbers, int outputLevel,
+        CancellationToken cancellationToken = default) => _default.CompactFilesAsync(options, inputFileNumbers, outputLevel, cancellationToken);
+
     /// <summary>
     /// Waits until all scheduled flushes and compactions (of every column family) have finished and no automatic
     /// compaction is pending (DB::WaitForCompact with default options).

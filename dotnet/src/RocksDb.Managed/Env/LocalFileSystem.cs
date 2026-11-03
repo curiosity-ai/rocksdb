@@ -181,6 +181,21 @@ public sealed class LocalFileSystem : IFileSystem
     /// <summary>Hard link (link(2) / CreateHardLinkW). Cross-device links throw NotSupported.</summary>
     public void LinkFile(string source, string target) => UnixNative.Link(source, target);
 
+    /// <summary>PosixRandomRWFile::Write + Sync on an existing file.</summary>
+    public void WriteAt(string path, long offset, ReadOnlySpan<byte> data)
+    {
+        using SafeFileHandle h = OpenHandle(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete, FileOptions.None);
+        try
+        {
+            RandomAccess.Write(h, data, offset);
+            RandomAccess.FlushToDisk(h);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            throw MapException("While write random read/write file", path, e);
+        }
+    }
+
     public DateTimeOffset GetFileModificationTime(string path)
     {
         if (!File.Exists(path)) throw MapException("while stat a file for modification time", path, new FileNotFoundException(path));

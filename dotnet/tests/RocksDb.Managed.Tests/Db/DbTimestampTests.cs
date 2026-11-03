@@ -638,8 +638,19 @@ public sealed class DbTimestampTests
         MemoryFileSystem fs = NewFs();
         ColumnFamilyOptions cfo = UdtOptions(bloom: true);
         using RocksDatabase db = OpenUdt(fs, cfo);
-        db.Put(B("a"), Ts(5), B("a5"));
+        db.Put(B("0"), Ts(5), B("05"));
         db.Flush();
+
+        using (var w = new SstFileWriter(cfo, fs))
+        {
+            w.Open("/ext0.sst");
+            w.Put(B("0"), Ts(9), B("09"));
+            w.Finish();
+        }
+        // AssignLevelAndSeqnoForIngestedFile: with user-defined timestamps a file may not overlap the DB's keys (without
+        // timestamps), whatever the timestamps (ExternalSSTFileWithTimestampTest.Basic).
+        Assert.AreEqual(StatusCode.InvalidArgument,
+            Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles(["/ext0.sst"], new IngestExternalFileOptions())).Code);
 
         using (var w = new SstFileWriter(cfo, fs))
         {
@@ -660,11 +671,10 @@ public sealed class DbTimestampTests
         db.IngestExternalFiles(["/ext1.sst"], new IngestExternalFileOptions());
         for (int pass = 0; pass < 2; pass++)
         {
-            CollectionAssert.AreEqual(new[] { "a=a5@5", "b=b10@10", "c=c10@10", "d=d10@10" }, Scan(db, At(12)));
-            CollectionAssert.AreEqual(new[] { "b=b20@20", "c=c10@10", "d=d10@10" }, Scan(db, At(25)));
-            CollectionAssert.AreEqual(new[] { "b=b20@20", "d=d10@10" }, Scan(db, At(35)));
+            CollectionAssert.AreEqual(new[] { "0=05@5", "b=b10@10", "c=c10@10", "d=d10@10" }, Scan(db, At(12)));
+            CollectionAssert.AreEqual(new[] { "0=05@5", "b=b20@20", "c=c10@10", "d=d10@10" }, Scan(db, At(25)));
+            CollectionAssert.AreEqual(new[] { "0=05@5", "b=b20@20", "d=d10@10" }, Scan(db, At(35)));
             Assert.AreEqual((null as string, 30UL), GetAt(db.DefaultColumnFamily, "c", 35));
-            Assert.AreEqual((null as string, 15UL), GetAt(db.DefaultColumnFamily, "a", 16));
             db.CompactRange();
         }
 
@@ -679,9 +689,10 @@ public sealed class DbTimestampTests
         Assert.AreEqual(StatusCode.InvalidArgument,
             Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles(["/ext2.sst"], new IngestExternalFileOptions())).Code);
         db.Flush();
-        db.IngestExternalFiles(["/ext2.sst"], new IngestExternalFileOptions());
-        Assert.AreEqual(("b50", 50UL), GetAt(db.DefaultColumnFamily, "b", 60));
-        Assert.AreEqual(("b40", 40UL), GetAt(db.DefaultColumnFamily, "b", 45));
+        // Once flushed, "b" overlaps the DB's table files: rejected as well (no global seqno for timestamped files).
+        Assert.AreEqual(StatusCode.InvalidArgument,
+            Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles(["/ext2.sst"], new IngestExternalFileOptions())).Code);
+        Assert.AreEqual(("b40", 40UL), GetAt(db.DefaultColumnFamily, "b", 60));
     }
 
     [TestMethod]

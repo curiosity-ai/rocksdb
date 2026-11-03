@@ -67,6 +67,7 @@ typedef struct {
   bool enable_blob_files;
   uint64_t min_blob_size;
   int max_background_jobs;
+  unsigned max_subcompactions;
   bool use_existing_db;
   int64_t seed;
   const char* db;
@@ -103,6 +104,7 @@ static Flags FLAGS = {
     .enable_blob_files = false,
     .min_blob_size = 0,
     .max_background_jobs = 2,
+    .max_subcompactions = 1,
     .use_existing_db = false,
     .seed = 301,
     .db = "/tmp/rocksdb-c-bench",
@@ -125,7 +127,7 @@ static void usage(void) {
           "[--compression_ratio 0.5]\n"
           "  [--target_file_size_base BYTES] [--max_bytes_for_level_base BYTES] "
           "[--level0_file_num_compaction_trigger 4]\n"
-          "  [--disable_auto_compactions] [--max_background_jobs 2]\n"
+          "  [--disable_auto_compactions] [--max_background_jobs 2] [--max_subcompactions 1]\n"
           "  [--enable_blob_files] [--min_blob_size 0]\n"
           "  [--use_existing_db] [--seed 301] [--db PATH] [--histogram 1]\n"
           "  [--warmup true|false] [--warmup_ops N] [--warmup_min_ms 1000]\n"
@@ -202,6 +204,8 @@ static void parse_flags(int argc, char** argv) {
       FLAGS.min_blob_size = strtoull(value, NULL, 10);
     else if (FLAG("max_background_jobs"))
       FLAGS.max_background_jobs = atoi(value);
+    else if (FLAG("max_subcompactions"))
+      FLAGS.max_subcompactions = (unsigned)strtoul(value, NULL, 10);
     else if (FLAG("use_existing_db")) FLAGS.use_existing_db = parse_bool(value);
     else if (FLAG("seed")) FLAGS.seed = strtoll(value, NULL, 10);
     else if (FLAG("db")) FLAGS.db = value;
@@ -442,6 +446,7 @@ static void build_options(void) {
   rocksdb_options_set_min_blob_size(g_options, FLAGS.min_blob_size);
   rocksdb_options_set_max_background_jobs(g_options,
                                           FLAGS.max_background_jobs);
+  rocksdb_options_set_max_subcompactions(g_options, FLAGS.max_subcompactions);
   rocksdb_options_set_block_based_table_factory(g_options, g_table_options);
 
   g_wo = rocksdb_writeoptions_create();

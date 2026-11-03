@@ -43,7 +43,7 @@ while the bytes may differ (for example, because a compressor makes different ch
 | Compression: Snappy, LZ4, LZ4HC, ZSTD, Zlib | yes | yes | read + write; ZSTD (with dictionaries) byte-identical; see deviations below |
 | Compression: BZip2, Xpress | no | n/a | a configured BZip2/Xpress type stores blocks uncompressed |
 | Integrated BlobDB (blob files, blob GC) | yes | yes | blob files byte-identical |
-| Wide columns (`PutEntity`, V1 entities) | yes | yes | compaction filters on entities (`FilterV3`, `FilterV4` with a lazy blob resolver, `kChangeWideColumnEntity`); `MultiGetEntity`, attribute groups, coalescing / attribute-group iterators, lazy entity reads (`GetEntityLazy`) |
+| Wide columns (`PutEntity`, V1 entities) | yes | yes | compaction filters on entities (`FilterV3`, `FilterV4` with a lazy blob resolver, `kChangeWideColumnEntity`); `MultiGetEntity`, attribute groups, coalescing / attribute-group iterators, lazy entity reads (`GetEntityLazy`, batched `MultiResolve`) |
 | Wide-column entities with blob-backed columns (V2 entities) | yes | yes | written by flush/compaction value separation and blob direct write; blob GC and garbage accounting of entity columns |
 | Blob direct write (`enable_blob_direct_write`, partitions) | yes | yes | needs RocksDB with blob direct write (librocksdb 11.12 has it); off by default; like upstream v1, blob files not registered by a flush before a crash are not recovered |
 | User-defined timestamps (persisted) | yes | yes | timestamped writes byte-identical; `full_history_ts_low` GC; timestamped range deletions and `SstFileWriter` files |
@@ -238,7 +238,7 @@ using (WriteBatch batch = db.CreateWriteBatch())               // pooled; Dispos
     batch.Put("k1"u8, "v1"u8)
          .Delete("stale"u8)
          .DeleteRange("tmp:"u8, "tmp;"u8)                      // [begin, end)
-         .Put(audit.Id, "k1"u8, "created"u8);                  // other column family by id
+         .Put(audit, "k1"u8, "created"u8);                     // another column family
     db.Write(batch);                                           // atomic
 }
 
@@ -248,8 +248,15 @@ using (WriteBatch batch = db.CreateWriteBatch())
     batch.SetSavePoint();
     batch.Put("k3"u8, "oops"u8);
     batch.RollbackToSavePoint();                               // drops k3
-    await db.WriteAsync(new WriteOptions { Sync = true }, batch);   // fsync the WAL before completing
+    await db.WriteAsync(WriteOptions.SyncWrites, batch);       // fsync the WAL before completing
     Console.WriteLine(batch.Count);                            // 1
+}
+using (WriteBatch batch = db.CreateWriteBatch())
+{
+    batch.Put("logged"u8, "1"u8);
+    batch.MarkWalTerminationPoint();                           // later records skip the WAL (memtable only)
+    batch.Put("cache-only"u8, "2"u8);
+    db.Write(batch);
 }
 // The batch representation (batch.Data) is byte-identical to native rocksdb::WriteBatch::Data().
 ```
@@ -434,6 +441,12 @@ db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = Bottommost
 await db.CompactRangeAsync("key:0"u8.ToArray(), "key:5"u8.ToArray());
 await db.WaitForCompactAsync();                       // until no flush/compaction is pending
 
+// Compact chosen table files into a level (files a valid compaction needs are added); returns the outputs.
+db.Put("key:x"u8, "value"u8);
+db.Flush();
+List<string> l0 = db.GetLiveFilesMetadata().FindAll(f => f.Level == 0).ConvertAll(f => f.Name);
+IReadOnlyList<string> outputs = db.CompactFiles(new CompactFilesOptions { MaxSubcompactions = 2 }, l0, 6);
+
 Console.WriteLine(db.GetProperty(DbProperties.NumFilesAtLevelPrefix + "6"));   // files at L6
 string? stats = db.GetProperty(DbProperties.Stats);                             // native-format stats dump
 ```
@@ -441,7 +454,7 @@ string? stats = db.GetProperty(DbProperties.Stats);                             
 ### Transactions
 
 `OptimisticTransactionDatabase` validates at commit time, either serially or in parallel (the upstream default).
-`TransactionDatabase` takes point locks and supports lock timeouts, deadlock detection, expiration and two-phase
+`TransactionDatabase` takes point (or range) locks and supports lock timeouts, deadlock detection, expiration and two-phase
 commit. Both expose the underlying `RocksDatabase` as `Database`. `TransactionDbOptions.WritePolicy` selects
 WriteCommitted (default), WritePrepared (data goes to the memtables at prepare; readers use a commit cache) or
 WriteUnprepared (large transactions are written to the DB before prepare once their batch exceeds
@@ -488,6 +501,52 @@ using (Transaction t2 = txnDb.BeginTransaction(new WriteOptions(), new Transacti
     t1.Commit();
     t2.Rollback();
 }
+```
+
+With a `RangeLockManager` in `TransactionDbOptions.RangeLockManager`, every lock is a range lock (port of the
+range-tree lock manager): `GetRangeLock` locks a key range or prefix exclusively, point locks are single-key ranges,
+deadlocks are always detected, and lock escalation merges a transaction's adjacent locks when the lock memory limit
+is reached.
+
+<!-- snippet:range-locks -->
+```csharp
+var rangeLocks = new RangeLockManager();             // keep it to inspect and tune the locks
+using TransactionDatabase txnDb = TransactionDatabase.Open(path, new DbOptions { CreateIfMissing = true },
+    new TransactionDbOptions { RangeLockManager = rangeLocks, TransactionLockTimeout = TimeSpan.FromMilliseconds(100) });
+
+using Transaction t1 = txnDb.BeginTransaction(new WriteOptions());
+using Transaction t2 = txnDb.BeginTransaction(new WriteOptions());
+// Lock every key starting with "user:1" (a prefix range: the infinite suffix covers all extensions).
+t1.GetRangeLock(null, new RangeLockEndpoint("user:1"u8.ToArray()), new RangeLockEndpoint("user:1"u8.ToArray(), infSuffix: true));
+t1.Put("user:1:name"u8, "Ada"u8);                    // inside t1's range: no extra lock wait
+try
+{
+    t2.Put("user:1:email"u8, "x"u8);                 // point locks are single-key ranges: conflicts
+}
+catch (RocksDbException e) when (e.Code == StatusCode.TimedOut)
+{
+    Console.WriteLine("locked by t1's range");
+}
+foreach (RangeLockInfo l in rangeLocks.GetRangeLockStatusData())
+    Console.WriteLine($"{l.Start} .. {l.End} held by {string.Join(",", l.TransactionIds)}");
+t1.Commit();                                          // releases the range
+t2.Put("user:1:email"u8, "ada@example.com"u8);
+t2.Commit();
+```
+
+Transactions read and write wide-column entities too (`PutEntity`, `TryGetEntity`, `TryGetEntityForUpdate`,
+`MultiGetEntity`, `GetCoalescingIterator`, `GetAttributeGroupIterator`; `WriteBatchWithIndex` has
+`TryGetEntityFromBatchAndDB` / `MultiGetEntityFromBatchAndDB`):
+
+<!-- snippet:transaction-entities -->
+```csharp
+using Transaction txn = txnDb.BeginTransaction(new WriteOptions());
+var columns = new WideColumns();
+txn.TryGetEntityForUpdate(null, "user:2"u8, columns);   // locks the key, reads its columns
+txn.PutEntity("user:2"u8, [new WideColumn("name"u8.ToArray(), "Grace"u8.ToArray()),
+                           new WideColumn("lang"u8.ToArray(), "COBOL"u8.ToArray())]);
+txn.TryGetEntity(null, "user:2"u8, columns);            // sees its own uncommitted entity: lang, name
+txn.Commit();
 ```
 
 <!-- snippet:two-phase-commit -->
@@ -651,6 +710,8 @@ Console.WriteLine(db.Get("big"u8)!.Length);                          // 4096, re
 using TtlDatabase db = TtlDatabase.Open(path, new DbOptions { CreateIfMissing = true }, ttlSeconds: 3600);
 db.Put("session"u8, "token"u8);
 Console.WriteLine(System.Text.Encoding.UTF8.GetString(db.Get("session"u8)!));   // token (timestamp stripped)
+using (Iterator it = db.NewIterator())                                           // iterators strip it too
+    for (it.SeekToFirst(); it.Valid; it.Next()) Console.WriteLine(it.Value.Length); // 5
 db.CompactRange();                                                               // expired entries are removed here
 ```
 
@@ -666,7 +727,7 @@ using (RocksDatabase db = RocksDatabase.Open(path, new DbOptions { CreateIfMissi
     await db.CreateCheckpointAsync(checkpointDir);
 
     // Backups: incremental, shared SST files, native-identical layout (native BackupEngine can read them).
-    using BackupEngine backups = BackupEngine.Open(new BackupEngineOptions(backupDir));
+    using BackupEngine backups = BackupEngine.Open(new BackupEngineOptions(backupDir) { MaxBackgroundOperations = 4 });
     uint id = backups.CreateNewBackup(db, flushBeforeBackup: true);
     backups.VerifyBackup(id, verifyWithChecksum: true);
     foreach (BackupInfo info in backups.GetBackupInfo())
@@ -682,7 +743,8 @@ using RocksDatabase fromCheckpoint = RocksDatabase.Open(checkpointDir, new DbOpt
 ```
 
 `BackupEngine` also supports app metadata, progress callbacks, rate limiting (`BackupRateLimiter`), `DeleteBackup`,
-`GarbageCollect` and `StopBackup`. Every operation that does I/O has an async version.
+`GarbageCollect`, `StopBackup`, parallel copies (`MaxBackgroundOperations`) and excluding shared files known to live in
+another backup directory (`CreateBackupOptions.ExcludeFilesCallback`, restored with `RestoreOptions.AlternateDirs`). Every operation that does I/O has an async version.
 
 ### SstFileWriter and ingestion
 
@@ -701,6 +763,7 @@ using (SstFileWriter writer = db.CreateSstFileWriter(db.DefaultColumnFamily))   
 }
 
 // ...and ingest it atomically (the file is placed at the lowest level it fits; also works with native SSTs).
+// Several files may overlap: later files in the list win. IngestBehind = true back-fills below existing data.
 db.IngestExternalFiles([sstPath], new IngestExternalFileOptions { MoveFiles = true });
 ```
 
@@ -878,7 +941,7 @@ Not ported yet:
 - Timestamps in optimistic transactions and explicit-timestamp `WriteBatchWithIndex` writes (NotSupported, as upstream).
 - Range locks; for WritePrepared / WriteUnprepared: iterator invalidation when a WriteUnprepared transaction ends, and
   user-defined timestamps (NotSupported, as upstream).
-- PlainTable and CuckooTable, parallel compression, subcompactions, `CompactFiles`,
+- PlainTable and CuckooTable, parallel compression,
   the SST file manager and a rate limiter for flush and compaction.
 - Wide-column entities with blob-backed columns (V2) and blob direct write (forced blob GC is leveled-only, as
   upstream).

@@ -57,6 +57,12 @@ internal sealed partial class VersionStorageInfo
     /// <summary>estimated_compaction_needed_bytes(). Guarded by the DB mutex.</summary>
     public ulong EstimatedCompactionNeededBytes { get; private set; }
 
+    /// <summary>TEST_set_estimated_compaction_needed_bytes.</summary>
+    internal void TestSetEstimatedCompactionNeededBytes(ulong bytes) => EstimatedCompactionNeededBytes = bytes;
+
+    /// <summary>set_l0_delay_trigger_count (tests).</summary>
+    internal void TestSetL0DelayTriggerCount(int count) => L0DelayTriggerCount = count;
+
     /// <summary>Files marked for compaction by a table property collector (FileMetaData::marked_for_compaction).</summary>
     public List<(int Level, FileMetaData File)> FilesMarkedForCompaction => _filesMarkedForCompaction;
     public List<(int Level, FileMetaData File)> ExpiredTtlFiles => _expiredTtlFiles;
@@ -101,8 +107,12 @@ internal sealed partial class VersionStorageInfo
     /// <summary>MaxOutputLevel(allow_ingest_behind).</summary>
     public int MaxOutputLevel(bool allowIngestBehind) => allowIngestBehind ? NumLevels - 2 : NumLevels - 1;
 
-    /// <summary>compensated_file_size: file size plus the estimated size of data its range tombstones cover.</summary>
-    public static ulong CompensatedFileSize(FileMetaData f) => f.FileSize + f.CompensatedRangeDeletionSize;
+    /// <summary>
+    /// compensated_file_size: file size plus the point-deletion boost and the estimated size of data its range
+    /// tombstones cover (computed when the file first appears in a version, see ComputeCompensatedSizes).
+    /// </summary>
+    public static ulong CompensatedFileSize(FileMetaData f) =>
+        f.CompensatedFileSize != 0 ? f.CompensatedFileSize : f.FileSize + f.CompensatedRangeDeletionSize;
 
     private void InitializeCompactionState(ColumnFamilyOptions options)
     {
@@ -121,7 +131,8 @@ internal sealed partial class VersionStorageInfo
         NumNonEmptyLevels = nonEmpty;
         Level0NonOverlapping = ComputeLevel0NonOverlapping();
         CalculateBaseBytes();
-        UpdateFilesByCompactionPri(null);
+        UpdateFilesByCompactionPri();
+        GenerateBottommostFiles();
         ComputeCompactionScore();
     }
 
@@ -259,7 +270,7 @@ internal sealed partial class VersionStorageInfo
     {
         double totalDowncompactBytes = 0.0;
         const double ScoreScale = 10.0;
-        int maxOutputLevel = MaxOutputLevel(_options.CfAllowIngestBehind);
+        int maxOutputLevel = MaxOutputLevel(_options.AllowIngestBehind);
         int scored = _compactionScore.Length;
         Array.Clear(_compactionScore);
         for (int i = 0; i < scored; i++) _compactionLevel[i] = i;
@@ -381,6 +392,7 @@ internal sealed partial class VersionStorageInfo
             }
         }
         ComputeFilesMarkedForCompaction(maxOutputLevel);
+        ComputeBottommostFilesMarkedForCompaction();
         ComputeExpiredTtlFiles();
         ComputeFilesMarkedForPeriodicCompaction(maxOutputLevel);
         ComputeFilesMarkedForForcedBlobGC(_options.BlobGarbageCollectionAgeCutoff, _options.BlobGarbageCollectionForceThreshold,
@@ -671,10 +683,10 @@ internal sealed partial class VersionStorageInfo
     // Files by compaction priority
 
     /// <summary>
-    /// Port of VersionStorageInfo::UpdateFilesByCompactionPri (+ SortFileByOverlappingRatio, SortFileByRoundRobin).
-    /// <paramref name="compactCursors"/> (round-robin only) are the per-level cursors of the column family.
+    /// Port of VersionStorageInfo::UpdateFilesByCompactionPri (+ SortFileByOverlappingRatio, SortFileByRoundRobin with
+    /// this version's compact cursors).
     /// </summary>
-    public void UpdateFilesByCompactionPri(byte[]?[]? compactCursors)
+    private void UpdateFilesByCompactionPri()
     {
         for (int level = 0; level < NumLevels; level++) _filesByCompactionPri[level] = [];
         if (CompactionStyle is CompactionStyle.None or CompactionStyle.Fifo or CompactionStyle.Universal) return;
@@ -717,7 +729,7 @@ internal sealed partial class VersionStorageInfo
                     SortFileByOverlappingRatio(level, files, _files[level + 1], temp);
                     break;
                 case CompactionPri.RoundRobin:
-                    SortFileByRoundRobin(level, files, temp, compactCursors);
+                    SortFileByRoundRobin(level, files, temp);
                     break;
             }
             _filesByCompactionPri[level] = temp;
@@ -758,7 +770,7 @@ internal sealed partial class VersionStorageInfo
     }
 
     /// <summary>Port of SortFileByRoundRobin.</summary>
-    private void SortFileByRoundRobin(int level, FileMetaData[] files, int[] temp, byte[]?[]? cursors)
+    private void SortFileByRoundRobin(int level, FileMetaData[] files, int[] temp)
     {
         InternalKeyComparator icmp = Icmp;
         if (level == 0 && !Level0NonOverlapping)
@@ -772,7 +784,7 @@ internal sealed partial class VersionStorageInfo
             return;
         }
         if (level == 0) Array.Sort(temp, (a, b) => icmp.Compare(files[a].Smallest, files[b].Smallest));
-        byte[]? cursor = cursors is not null && level < cursors.Length ? cursors[level] : null;
+        byte[]? cursor = GetCompactCursor(level);
         if (cursor is null || cursor.Length == 0 || temp.Length <= 1) return;
         // Find the file whose smallest key is >= the cursor.
         int start = 0;

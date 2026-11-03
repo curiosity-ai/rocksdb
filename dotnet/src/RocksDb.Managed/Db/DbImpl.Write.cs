@@ -20,6 +20,24 @@ internal sealed partial class DbImpl
     private bool _logEmpty = true;    // leader-only
     private bool _walDirSynced;       // leader-only
     private bool _hasUnpersistedData; // set when a DisableWal write was applied
+
+    // ---- WAL size accounting and lazy sync of closed WALs (logs_ / alive_wal_files_ / wals_total_size_) ----
+
+    /// <summary>
+    /// Closed WALs (older than <see cref="_log"/>) whose buffer was written to the OS at the switch but which were not
+    /// synced yet (logs_ entries before the current one; single column family without 2PC, see SwitchMemtableAsync).
+    /// Like upstream, the next sync write, FlushWAL(sync) / SyncWAL syncs them (oldest first) before the current WAL;
+    /// WALs whose data was flushed are released unsynced. Leader-only.
+    /// </summary>
+    private readonly List<LogWriter> _closedWalsToSync = new();
+    /// <summary>Bytes appended to the current WAL (alive_wal_files_.back().size). Leader-only.</summary>
+    private long _currentWalSize;
+    /// <summary>wals_total_size_: bytes of all alive WALs (written by the leader, decremented by obsolete-file purges).</summary>
+    private long _walsTotalSize;
+    /// <summary>Sizes of alive WALs other than the current one (alive_wal_files_ entries). Guarded by the mutex.</summary>
+    private readonly Dictionary<ulong, long> _aliveWalSizes = new();
+    /// <summary>alive_wal_files_.begin()->getting_flushed: the oldest WAL a SwitchWAL already asked to flush. Leader-only.</summary>
+    private ulong _walGettingFlushed;
     // Cached IsWriteStalled() (recomputed under the mutex whenever memtable counts change) so that the common,
     // unstalled write path does not take the DB mutex.
     private volatile bool _maybeStalled;
@@ -247,6 +265,7 @@ internal sealed partial class DbImpl
                 walLocked = true;
             }
             ulong last;
+            int walRecordBytes = 0;
             try
             {
                 ulong first = Versions.AllocateSequence(total);
@@ -279,22 +298,25 @@ internal sealed partial class DbImpl
 
                 if (!leader.DisableWal && valid > 0)
                 {
+                    // DBImpl::MergeBatch: a single batch without a WAL termination point is logged as is; otherwise the
+                    // WAL parts of the batches (WriteBatchInternal::Append(wal_only = true)) are flattened into one record.
                     ReadOnlyMemory<byte> record;
-                    if (valid == 1)
+                    if (valid == 1 && !firstValid!.Batch!.HasWalTerminationPoint)
                     {
-                        record = firstValid!.Batch!.DataMemory;
+                        record = firstValid.Batch.DataMemory;
                     }
                     else
                     {
-                        _groupBatch.SetContents(firstValid!.Batch!.Data);
+                        _groupBatch.SetContentsWalOnly(firstValid!.Batch!);
                         for (int i = 0; i < group.Count; i++)
                         {
                             WriteThread.Writer w = group[i];
                             if (w == firstValid || w.CallbackFailed) continue;
-                            WriteBatch.Append(_groupBatch, w.Batch!);
+                            WriteBatch.Append(_groupBatch, w.Batch!, walOnly: true);
                         }
                         record = _groupBatch.DataMemory;
                     }
+                    walRecordBytes = record.Length;
                     try
                     {
                         LogWriter log = _log!;
@@ -306,6 +328,8 @@ internal sealed partial class DbImpl
                             log.AddRecord(record.Span, last);
                             if (needSync)
                             {
+                                // WriteToWAL with need_log_sync: every WAL in logs_ is synced, oldest first.
+                                if (_closedWalsToSync.Count > 0) SyncClosedWalsAsync(synchronous: true).GetAwaiter().GetResult();
                                 log.Sync();
                                 SyncWalDirIfNeeded();
                             }
@@ -317,11 +341,14 @@ internal sealed partial class DbImpl
                             await log.AddRecordAsync(record, last, CancellationToken.None).ConfigureAwait(false);
                             if (needSync)
                             {
+                                if (_closedWalsToSync.Count > 0) await SyncClosedWalsAsync(synchronous: false).ConfigureAwait(false);
                                 await log.SyncAsync(CancellationToken.None).ConfigureAwait(false);
                                 SyncWalDirIfNeeded();
                             }
                         }
                         _logEmpty = false;
+                        _currentWalSize += record.Length;
+                        Interlocked.Add(ref _walsTotalSize, record.Length);
                         if (_seqPerBatch) CacheRecoverableStateOf(group);
                     }
                     catch (Exception e)
@@ -374,7 +401,7 @@ internal sealed partial class DbImpl
                 // sequence and exits the group (FinishParallelGroup).
                 _parallelLast = last;
                 _parallelTotal = total;
-                _parallelWalBytes = leader.DisableWal ? 0 : (group.Count == 1 ? leader.Batch!.DataSize : _groupBatch.DataSize);
+                _parallelWalBytes = walRecordBytes;
                 _parallelWal = !leader.DisableWal;
                 _parallelSynced = needSync;
                 Volatile.Write(ref _parallelRemaining, group.Count);
@@ -384,7 +411,7 @@ internal sealed partial class DbImpl
             }
             else
             {
-                InsertGroupSerially(group, leader, total, last, needSync);
+                InsertGroupSerially(group, leader, total, last, walRecordBytes, needSync);
             }
         }
         catch (Exception e)
@@ -409,7 +436,7 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>The memtable inserts of a group by its leader (the serial part of DBImpl::WriteImpl), then publication.</summary>
-    private void InsertGroupSerially(List<WriteThread.Writer> group, WriteThread.Writer leader, ulong total, ulong last, bool needSync)
+    private void InsertGroupSerially(List<WriteThread.Writer> group, WriteThread.Writer leader, ulong total, ulong last, int walRecordBytes, bool needSync)
     {
         var inserter = new MemTableInserter(this, logNumber: 0, ignoreMissingColumnFamilies: false);
         for (int i = 0; i < group.Count; i++)
@@ -438,7 +465,7 @@ internal sealed partial class DbImpl
             Versions.SetLastSequence(last);
             NotifySequenceWaiters();
         }
-        RecordWriteGroup(group, total, leader.DisableWal ? 0 : (group.Count == 1 ? leader.Batch!.DataSize : _groupBatch.DataSize), !leader.DisableWal, needSync);
+        RecordWriteGroup(group, total, walRecordBytes, !leader.DisableWal, needSync);
     }
 
     // ---- parallel memtable writes (allow_concurrent_memtable_write) ----------------------------------------
@@ -580,6 +607,10 @@ internal sealed partial class DbImpl
     private async ValueTask PreprocessWriteAsync(bool noSlowdown, bool synchronous, CancellationToken cancellationToken)
     {
         ThrowIfDbStopped();
+        if (Volatile.Read(ref _walsTotalSize) > (long)GetMaxTotalWalSize() && Versions.ColumnFamilies.Count > 1)
+        {
+            await SwitchWalAsync(synchronous, cancellationToken).ConfigureAwait(false);
+        }
         if (_flushScheduler.Count > 0)
         {
             for (int i = 0; i < _flushScheduler.Count; i++)
@@ -647,6 +678,7 @@ internal sealed partial class DbImpl
         }
         if (!_logEmpty || _log is null || walFailed)
         {
+            ReleaseObsoleteClosedWals();
             newLogNumber = Versions.NewFileNumber();
             try
             {
@@ -658,11 +690,24 @@ internal sealed partial class DbImpl
                     try { old.Dispose(); }
                     catch (Exception de) when (de is IOException or RocksDbException) { }
                 }
+                else if (old is not null && Versions.ColumnFamilies.Count == 1 && !Options.Allow2Pc)
+                {
+                    // SwitchMemtable: always flush the buffer of the last log before switching to a new one; it is synced
+                    // later with the other logs_ entries (next sync write / SyncWAL / FlushWAL(sync)), like upstream.
+                    // A crash may lose its unsynced tail together with the unsynced writes of the new WAL (recovery
+                    // stops at the gap), exactly as upstream with a single column family.
+                    if (synchronous) old.WriteBuffer();
+                    else await old.WriteBufferAsync(CancellationToken.None).ConfigureAwait(false);
+                    _closedWalsToSync.Add(old);
+                }
                 else if (old is not null)
                 {
-                    // Make the old WAL durable before writes continue in the new one, so a crash can't lose its tail while
-                    // keeping later writes (upstream syncs closed WALs on the next sync write instead). Not cancellable:
-                    // the old WAL is closed only after it was synced.
+                    // With several column families (or 2PC) upstream syncs the closed WALs before each flush
+                    // (FlushMemTableToOutputFile -> SyncClosedWals) so that a flushed SST never holds data of write
+                    // batches whose updates to other column families are not durable. The port syncs the closed WAL
+                    // here instead, right before its memtable can be flushed (at least as durable as upstream).
+                    // Earlier closed WALs still waiting for a sync go first.
+                    if (_closedWalsToSync.Count > 0) await SyncClosedWalsAsync(synchronous).ConfigureAwait(false);
                     if (synchronous)
                     {
                         old.Sync();
@@ -692,6 +737,8 @@ internal sealed partial class DbImpl
         {
             if (newLog is not null)
             {
+                if (_logNumber != 0) _aliveWalSizes[_logNumber] = _currentWalSize;
+                _currentWalSize = 0;
                 _log = newLog;
                 _logNumber = newLogNumber;
                 _logEmpty = true;
@@ -719,6 +766,133 @@ internal sealed partial class DbImpl
             _maybeStalled = IsWriteStalled();
             EnqueueFlush(cfd);
             MaybeScheduleFlush();
+        }
+    }
+
+    /// <summary>
+    /// Syncs (oldest first) and closes the closed WALs of <see cref="_closedWalsToSync"/> (the logs_ loop of
+    /// DBImpl::WriteToWAL / SyncWAL); WALs whose data is already in table files (number below the minimum log to keep)
+    /// are closed without a sync (FindObsoleteFiles moves them to logs_to_free_). Leader-only. A sync failure propagates
+    /// (the caller turns it into a WAL background error) and keeps the remaining WALs queued.
+    /// </summary>
+    private async ValueTask SyncClosedWalsAsync(bool synchronous)
+    {
+        ulong minLog;
+        lock (_mutex) minLog = MinLogNumberToKeepLive();
+        List<LogWriter> wals = _closedWalsToSync;
+        int done = 0;
+        try
+        {
+            for (; done < wals.Count; done++)
+            {
+                LogWriter w = wals[done];
+                if (w.LogNumber >= minLog)
+                {
+                    if (synchronous) w.Sync();
+                    else await w.SyncAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+                CloseQuietly(w);
+            }
+        }
+        finally
+        {
+            wals.RemoveRange(0, done);
+        }
+    }
+
+    /// <summary>
+    /// Closes, without syncing, the closed WALs whose data is in table files (FindObsoleteFiles releasing logs_ entries
+    /// below min_log_number), so that WALs never synced by a write do not accumulate. Leader-only.
+    /// </summary>
+    private void ReleaseObsoleteClosedWals()
+    {
+        List<LogWriter> wals = _closedWalsToSync;
+        if (wals.Count == 0) return;
+        ulong minLog;
+        lock (_mutex) minLog = MinLogNumberToKeepLive();
+        int n = 0;
+        while (n < wals.Count && wals[n].LogNumber < minLog) CloseQuietly(wals[n++]);
+        wals.RemoveRange(0, n);
+    }
+
+    private static void CloseQuietly(LogWriter w)
+    {
+        try { w.Dispose(); }
+        catch (Exception e) when (e is IOException or RocksDbException) { }
+    }
+
+    /// <summary>
+    /// Port of DBImpl::GetMaxTotalWalSize: max_total_wal_size, or 4 x max_total_in_memory_state (the sum over column
+    /// families of write_buffer_size * max_write_buffer_number) when it is 0.
+    /// </summary>
+    internal ulong GetMaxTotalWalSize()
+    {
+        ulong max = Options.MaxTotalWalSize;
+        if (max > 0) return max;
+        return 4 * Volatile.Read(ref _maxTotalInMemoryState);
+    }
+
+    /// <summary>max_total_in_memory_state_ (kept up to date on column family add/drop and SetOptions).</summary>
+    private ulong _maxTotalInMemoryState;
+
+    private void RecomputeMaxTotalInMemoryState()
+    {
+        ulong inMemory = 0;
+        foreach (ColumnFamilyData? cfd in Volatile.Read(ref _cfById))
+        {
+            if (cfd is null || cfd.Dropped) continue;
+            inMemory += cfd.Options.WriteBufferSize * (ulong)Math.Max(cfd.Options.MaxWriteBufferNumber, 0);
+        }
+        Volatile.Write(ref _maxTotalInMemoryState, inMemory);
+    }
+
+    /// <summary>
+    /// Port of DBImpl::SwitchWAL: the alive WALs exceed max_total_wal_size, so switch the memtables of every column
+    /// family whose data is in the oldest alive WAL (OldestLogToKeep &lt;= that WAL) and flush them (FlushReason
+    /// kWalFull), letting the WAL be released. Done once per oldest WAL (getting_flushed). Only called with more than
+    /// one column family (a single CF's memtables already bound its WALs). REQUIRES: write leader.
+    /// Not ported: the 2PC check for outstanding prepared transactions in the oldest WAL (unable_to_release_oldest_log_)
+    /// and atomic_flush column family selection.
+    /// </summary>
+    private async ValueTask SwitchWalAsync(bool synchronous, CancellationToken cancellationToken)
+    {
+        ulong oldest;
+        var cfds = new List<ColumnFamilyData>();
+        lock (_mutex)
+        {
+            if (_aliveWals.Count == 0) return;
+            oldest = ulong.MaxValue;
+            foreach (ulong n in _aliveWals) oldest = Math.Min(oldest, n);
+            if (_walGettingFlushed == oldest) return;
+            _walGettingFlushed = oldest;
+            foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
+            {
+                if (cfd.Dropped) continue;
+                if (cfd.LogNumber <= oldest) cfds.Add(cfd);
+            }
+        }
+        LogInfo("Flushing all column families with data in WAL number " + oldest + ". Total log size is " + Volatile.Read(ref _walsTotalSize) +
+                " while max_total_wal_size is " + GetMaxTotalWalSize());
+        foreach (ColumnFamilyData cfd in cfds)
+        {
+            // An empty memtable is not switched: its log number advances with the next WAL switch (SwitchMemtable).
+            if (cfd.Dropped || cfd.Mem.IsEmpty) continue;
+            await SwitchMemtableAsync(cfd, FlushReason.WalFull, synchronous, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Test helper (TEST_SwitchMemtable): switches the default column family's memtable and WAL.</summary>
+    internal void SwitchMemtableForTest()
+    {
+        WriteThread.Writer w = EnterUnbatchedAsync(synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        try
+        {
+            SwitchMemtableAsync(GetColumnFamilyData(DefaultColumnFamilyName), FlushReason.Test, synchronous: true, CancellationToken.None)
+                .GetAwaiter().GetResult();
+        }
+        finally
+        {
+            ExitUnbatched(w, synchronous: true);
         }
     }
 
@@ -780,6 +954,7 @@ internal sealed partial class DbImpl
         old.CopyTo(map, 0);
         map[cfd.Id] = cfd;
         Volatile.Write(ref _cfById, map);
+        RecomputeMaxTotalInMemoryState();
         RefreshTimestampSizes(map);
         if (cfd.BlobDirectWrite is not null) _anyBlobDirectWrite = true;
     }
@@ -789,6 +964,7 @@ internal sealed partial class DbImpl
         ColumnFamilyData?[] map = (ColumnFamilyData?[])_cfById.Clone();
         if (cfd.Id < (uint)map.Length) map[cfd.Id] = null;
         Volatile.Write(ref _cfById, map);
+        RecomputeMaxTotalInMemoryState();
         RefreshTimestampSizes(map);
     }
 

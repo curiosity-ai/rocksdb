@@ -113,6 +113,8 @@ where noted below. Out of scope as before: pre-vote, membership changes, ReadInd
 | file transfer through `FileStream`s and `System.IO` | `IFileSystem` everywhere (checkpoint, snapshot transfer, Raft/role state) | works on `MemoryFileSystem` |
 | `PrimaryWriteGate.HoldAsync` spins and polls | drained signal raised by the last `Exit` | no polling; `TryEnterAsync` is allocation-free while open |
 | promoted replica spins until it reaches the handoff point | `WaitForSequenceAsync` | no polling |
+| promote RPC sent cold while writes are held | a probe promote (`PromoteRequest.Probe`, refused without side effects) warms the RPC path on both nodes before the hold | the first promote of a process paid 15-30 ms per side over MagicOnion |
+| promoted replica persists its epoch map and role separately; old primary persists its demotion, then closes the gate | one combined write (`ReplicationRoleState.BecomePrimary`); the gate closes first (the node is durably `HandingOff`) | 3 fewer fsyncs while writes are held |
 | hosts poll `CommitSeq` every 15 ms to acknowledge writes | `RaftClusterNode.WaitForCommitAsync` | signalled |
 | hosts wait fixed 500-1000 ms for "in-flight handlers" before disposing a DB on resync | `DatabaseUsageGate` drain | deterministic |
 | snapshot stream ends without a marker | plan + files + `Complete` marker | a truncated transfer is detected |
@@ -122,6 +124,18 @@ where noted below. Out of scope as before: pre-vote, membership changes, ReadInd
 | signature length prefix in machine byte order | little-endian | identical signatures across architectures |
 | per-batch `EntryTerm` on the Raft stream | chunks merge batches, so a follower also merges the leader's term map at attach | a chunk may span a term boundary |
 | MagicOnion in the samples only | same: `RocksDb.Managed.Replication.MagicOnion` is optional | the core stays transport-agnostic |
+
+## Switchover cost
+
+Writes held per handoff, measured on a shared 4-vCPU box (other builds running; see `docs/benchmarks.md`,
+"Replication"): the gate drains in about 1 ms and the replica is writable 1-5 ms after the promote arrives; the rest
+is the promote round trip and the fsync'd role-state writes on both nodes (one promise and one combined epoch/role
+write on the replica). With a quiet disk a warm handoff holds writes for 5-8 ms in process and over gRPC on loopback;
+under heavy load fsync and scheduling latency push the hold to 30-40 ms (median) and single handoffs past 100 ms. Of
+our own costs, the first promote of a process paid 15-30 ms per side over MagicOnion (now probed before the hold) and
+the hold contained four fsync'd role-state writes (now two; the demotion is persisted after the gate closed); the
+remaining spread of the 60-220 ms measured earlier is machine load. `bench/RocksDb.Managed.Replication.Benchmarks`
+(`switchover`) measures it.
 
 ## Tests and samples
 

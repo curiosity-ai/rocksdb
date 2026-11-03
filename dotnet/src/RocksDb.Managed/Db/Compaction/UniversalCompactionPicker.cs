@@ -92,7 +92,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
     /// </summary>
     public override Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots, bool requireMaxOutputLevel)
     {
-        int maxOutputLevel = vstorage.MaxOutputLevel(Options.CfAllowIngestBehind);
+        int maxOutputLevel = vstorage.MaxOutputLevel(Options.AllowIngestBehind);
         if (maxOutputLevel == 0 && requireMaxOutputLevel) return null; // !MeetsOutputLevelRequirements(0)
         int trigger = Options.Level0FileNumCompactionTrigger;
         uint ratio = Options.CompactionOptionsUniversal.SizeRatio;
@@ -259,7 +259,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
             }
         }
         int startLevel = runs[startIndex].Level;
-        int maxOutputLevel = vstorage.MaxOutputLevel(Options.CfAllowIngestBehind);
+        int maxOutputLevel = vstorage.MaxOutputLevel(Options.AllowIngestBehind);
         int outputLevel;
         if (firstIndexAfter == runs.Count) outputLevel = maxOutputLevel;
         else if (runs[firstIndexAfter].Level == 0) outputLevel = 0;
@@ -574,7 +574,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
     {
         VersionStorageInfo vstorage = b.Vstorage;
         int startLevel = startLevelInputs.Level;
-        int maxOutputLevel = vstorage.MaxOutputLevel(Options.CfAllowIngestBehind);
+        int maxOutputLevel = vstorage.MaxOutputLevel(Options.AllowIngestBehind);
         // Pick the first non-empty level after start_level as output.
         int outputLevel;
         for (outputLevel = startLevel + 1; outputLevel <= maxOutputLevel; outputLevel++)
@@ -659,7 +659,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         List<SortedRun> runs = b.Runs;
         VersionStorageInfo vstorage = b.Vstorage;
         int startLevel = runs[startIndex].Level;
-        int maxOutputLevel = vstorage.MaxOutputLevel(Options.CfAllowIngestBehind);
+        int maxOutputLevel = vstorage.MaxOutputLevel(Options.AllowIngestBehind);
         CompactionInputFiles[] inputs = NewInputLevels(startLevel, maxOutputLevel);
         for (int i = startIndex; i <= endIndex; i++) AddRun(vstorage, inputs, runs[i], startLevel);
         // If it's not including all sorted_runs, it can only output to the level above the `end_index + 1` sorted_run.

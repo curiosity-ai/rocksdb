@@ -90,6 +90,14 @@ public interface IFileSystem
     void LinkFile(string source, string target) =>
         throw RocksDbException.NotSupported("LinkFile is not supported by " + GetType().Name);
 
+    /// <summary>
+    /// Overwrites <paramref name="data"/> at <paramref name="offset"/> of an existing file and syncs it (an
+    /// FSRandomRWFile Write + Sync, see FileSystem::NewRandomRWFile). Throws <see cref="StatusCode.NotSupported"/> when
+    /// the file system has no random writes.
+    /// </summary>
+    void WriteAt(string path, long offset, ReadOnlySpan<byte> data) =>
+        throw RocksDbException.NotSupported("WriteAt is not supported by " + GetType().Name);
+
     /// <summary>Last modification time of a file (FileSystem::GetFileModificationTime), used by WAL archive TTL purging.</summary>
     DateTimeOffset GetFileModificationTime(string path) =>
         throw RocksDbException.NotSupported("GetFileModificationTime is not supported by " + GetType().Name);

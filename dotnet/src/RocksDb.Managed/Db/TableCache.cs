@@ -53,6 +53,9 @@ internal sealed class TableCache : ITableCache, IDisposable
 
     public int Count => _handles.Count;
 
+    /// <summary>When set (DBOptions::statistics), table file reads are timed (SST_READ_MICROS, FILE_READ_*_MICROS).</summary>
+    internal Statistics? Statistics { get; set; }
+
     private sealed class Handle
     {
         public readonly ulong FileNumber;
@@ -106,6 +109,22 @@ internal sealed class TableCache : ITableCache, IDisposable
         // Opening a table reads the footer and the meta blocks; the first open of a file does that synchronously (cold
         // path, once per file), later lookups are cache hits.
         return new ValueTask<TableReaderLease>(GetReader(file));
+    }
+
+    /// <summary>
+    /// TableCache::FindTable(no_io = true): a lease on the reader if the table is already open, without opening it
+    /// (kBlockCacheTier lookups must not do file I/O).
+    /// </summary>
+    public bool TryGetOpenReader(FileMetaData file, out TableReaderLease lease)
+    {
+        if (_handles.TryGetValue(file.FileNumber, out Handle? h) && h.IsOpen && h.TryRef())
+        {
+            h.LastUse = Interlocked.Increment(ref _openSequence);
+            lease = new TableReaderLease(h.Reader!, s_release, h);
+            return true;
+        }
+        lease = default;
+        return false;
     }
 
     /// <summary>
@@ -211,6 +230,7 @@ internal sealed class TableCache : ITableCache, IDisposable
     {
         string path = TableFilePath(file);
         IRandomAccessFile f = _fs.OpenRandomAccess(path);
+        if (Statistics is { } st) f = new Monitoring.StatisticsRandomAccessFile(f, st);
         BlockBasedTableReader reader;
         try
         {

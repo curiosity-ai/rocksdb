@@ -488,6 +488,8 @@ internal sealed partial class DbImpl
                 log.WriteBuffer();
                 if (sync)
                 {
+                    // SyncWAL: every WAL in logs_, oldest first.
+                    if (_closedWalsToSync.Count > 0) SyncClosedWalsAsync(synchronous: true).GetAwaiter().GetResult();
                     log.Sync();
                     SyncWalDirIfNeeded();
                 }
@@ -497,6 +499,7 @@ internal sealed partial class DbImpl
                 await log.WriteBufferAsync(CancellationToken.None).ConfigureAwait(false);
                 if (sync)
                 {
+                    if (_closedWalsToSync.Count > 0) await SyncClosedWalsAsync(synchronous: false).ConfigureAwait(false);
                     await log.SyncAsync(CancellationToken.None).ConfigureAwait(false);
                     SyncWalDirIfNeeded();
                 }

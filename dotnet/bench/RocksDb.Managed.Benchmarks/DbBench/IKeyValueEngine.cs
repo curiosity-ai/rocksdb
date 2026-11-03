@@ -126,6 +126,9 @@ public sealed record EngineOptions
     /// <summary>enable_write_thread_adaptive_yield (managed engine only; native uses its default, true).</summary>
     public bool EnableWriteThreadAdaptiveYield { get; init; } = true;
 
+    /// <summary>--max_subcompactions (1).</summary>
+    public uint MaxSubcompactions { get; init; } = 1;
+
     /// <summary>--compression: none, snappy, lz4 or zstd (all levels).</summary>
     public CompressionType Compression { get; init; } = CompressionType.None;
 }

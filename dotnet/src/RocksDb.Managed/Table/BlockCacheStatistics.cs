@@ -97,4 +97,9 @@ public enum TableReadFlags : byte
     None = 0,
     /// <summary>ReadOptions::fill_cache = false: look blocks up in the cache, but do not insert blocks read on a miss.</summary>
     DontFillCache = 1,
+    /// <summary>
+    /// ReadOptions::read_tier = kBlockCacheTier for filter checks: no file I/O; a filter (or partitioned filter index)
+    /// that is neither pinned nor in the block cache answers "may match" (upstream returns Incomplete).
+    /// </summary>
+    BlockCacheTier = 2,
 }

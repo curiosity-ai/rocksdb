@@ -73,6 +73,28 @@ internal sealed class IndexedWriteBatch : IDisposable
         _wbwi.PutEntitySerialized(cf, key, entity);
     }
 
+    public void PutEntity(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns)
+    {
+        Register(cf);
+        _wbwi.PutEntity(cf, key, columns);
+    }
+
+    /// <summary>GetEntityFromBatchAndDB with the DB read through <paramref name="reader"/>.</summary>
+    public bool GetEntity<TReader>(uint cf, MergeOperator? mergeOperator, ReadOnlySpan<byte> key, WideColumns columns, ref TReader reader)
+        where TReader : struct, WriteBatchWithIndex.IEntityDbReader
+    {
+        Register(cf);
+        return _wbwi.GetEntityFromBatchAndDBCore(cf, mergeOperator, key, columns, ref reader);
+    }
+
+    /// <summary>MultiGetEntityFromBatchAndDB with the DB read through <paramref name="reader"/>.</summary>
+    public void MultiGetEntity<TReader>(uint cf, MergeOperator? mergeOperator, int timestampSize, ReadOptions? options, MultiGetBatch batch, ref TReader reader)
+        where TReader : struct, WriteBatchWithIndex.IMultiEntityDbReader
+    {
+        Register(cf);
+        _wbwi.MultiGetEntityFromBatchAndDBCore(cf, mergeOperator, timestampSize, options, batch, ref reader);
+    }
+
     public void Delete(uint cf, ReadOnlySpan<byte> key)
     {
         Register(cf);

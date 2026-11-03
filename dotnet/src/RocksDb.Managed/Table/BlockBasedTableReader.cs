@@ -471,9 +471,12 @@ public sealed partial class BlockBasedTableReader : IDisposable
         TableProperties props;
         if (metaBlocks.TryGetValue(BlockBasedTableConstants.PropertiesBlockName, out BlockHandle propsHandle))
         {
-            Block pb = BlockFetcher.ReadBlock(file, footer, propsHandle, verify);
+            // ReadTablePropertiesHelper: read and parse without checksum verification, then verify (an ingested file
+            // whose global seqno was rewritten by the legacy write_global_seqno has a stale properties checksum).
+            Block pb = BlockFetcher.ReadBlock(file, footer, propsHandle, verifyChecksums: false);
             try { props = TableProperties.Parse(pb, propsHandle.Offset); }
             finally { pb.Release(); }
+            if (verify) VerifyPropertiesBlockChecksum(file, footer, propsHandle, props.ExternalSstFileGlobalSeqnoOffset);
         }
         else
         {
@@ -616,6 +619,37 @@ public sealed partial class BlockBasedTableReader : IDisposable
             return new OffsetableCacheKey("unknown", currentDbSessionId, currentFileNumber);
         }
         return OffsetableCacheKey.FromInternalUniqueId(s_processNonce, (ulong)Interlocked.Increment(ref s_uniqueBaseKeyCounter));
+    }
+
+    /// <summary>
+    /// Properties block checksum check of ReadTablePropertiesHelper (table/meta_blocks.cc): on a mismatch, retry with
+    /// the rocksdb.external_sst_file.global_seqno value restored to its original zero placeholder, since older
+    /// ingestion (write_global_seqno) rewrote it without updating the block checksum. Other mismatches are Corruption.
+    /// </summary>
+    private static void VerifyPropertiesBlockChecksum(IRandomAccessFile file, in Footer footer, BlockHandle handle, ulong globalSeqnoFileOffset)
+    {
+        if (handle.Size + BlockBasedTableConstants.BlockTrailerSize > int.MaxValue) ThrowHelper.Corruption("block too large: " + handle);
+        int n = (int)(handle.Size + BlockBasedTableConstants.BlockTrailerSize);
+        byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(n);
+        try
+        {
+            Span<byte> block = buf.AsSpan(0, n);
+            if (BlockFetcher.ReadFully(file, (long)handle.Offset, block) != n) ThrowHelper.Corruption("truncated block read at offset " + handle.Offset);
+            if (BlockChecksum.Verify(footer.ChecksumType, footer.BaseContextChecksum, block, handle.Offset)) return;
+            ulong blockSize = handle.Size;
+            if (globalSeqnoFileOffset > handle.Offset && blockSize >= 8 && globalSeqnoFileOffset - handle.Offset <= blockSize - 8)
+            {
+                // Older ingestion could rewrite this value without updating the block checksum. Verify against the
+                // original zero placeholder.
+                Coding.EncodeFixed64(block[(int)(globalSeqnoFileOffset - handle.Offset)..], 0);
+                if (BlockChecksum.Verify(footer.ChecksumType, footer.BaseContextChecksum, block, handle.Offset)) return;
+            }
+            ThrowHelper.Corruption("block checksum mismatch at offset " + handle.Offset + " size " + handle.Size + " (properties block)");
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(buf);
+        }
     }
 
     /// <summary>Port of GetGlobalSequenceNumber (table/meta_blocks.cc).</summary>
@@ -833,6 +867,47 @@ public sealed partial class BlockBasedTableReader : IDisposable
         return (ulong)(sizeRatio * FileSize);
     }
 
+    /// <summary>
+    /// Port of BlockBasedTable::ApproximateKeyAnchors: walks the index and returns up to ~128 anchors (user key, bytes of
+    /// the data blocks since the previous anchor) that partition the file evenly; used to plan subcompactions.
+    /// </summary>
+    public List<(byte[] UserKey, ulong RangeSize)> ApproximateKeyAnchors()
+    {
+        var anchors = new List<(byte[], ulong)>();
+        // If needed the threshold could be more adaptive (e.g. based on size).
+        const ulong MaxNumAnchors = 128;
+        ulong numBlocksPerAnchor = Math.Max(1UL, Properties.NumDataBlocks / MaxNumAnchors);
+        ulong count = 0, rangeSize = 0, prevOffset = 0;
+        byte[] lastKey = [];
+        IndexCursor cursor = IndexCursor.Rent(this, TableReadFlags.DontFillCache);
+        try
+        {
+            for (cursor.SeekToFirst(); cursor.Valid; cursor.Next())
+            {
+                BlockHandle bh = cursor.Handle;
+                rangeSize += bh.Offset + bh.Size - prevOffset;
+                prevOffset = bh.Offset + bh.Size;
+                ReadOnlySpan<byte> userKey = IndexKeyIncludesSeq ? DbFormat.ExtractUserKey(cursor.Key) : cursor.Key;
+                if (++count % numBlocksPerAnchor == 0)
+                {
+                    count = 0;
+                    anchors.Add((userKey.ToArray(), rangeSize));
+                    rangeSize = 0;
+                }
+                else
+                {
+                    lastKey = userKey.ToArray();
+                }
+            }
+        }
+        finally
+        {
+            cursor.Return();
+        }
+        if (count != 0) anchors.Add((lastKey, rangeSize));
+        return anchors;
+    }
+
     /// <summary>ApproximateDataOffsetOf: the offset of the data block holding the key, or the data size past the end.</summary>
     private ulong ApproximateDataOffsetOf(ReadOnlySpan<byte> internalKey, ulong dataSize)
     {
@@ -975,6 +1050,8 @@ public sealed partial class BlockBasedTableReader : IDisposable
     /// </summary>
     private bool PartitionedFilterMayMatch(ReadOnlySpan<byte> entry, ReadOnlySpan<byte> internalKey, TableReadFlags flags)
     {
+        // kBlockCacheTier: the partition index would have to be read (conservatively "may match").
+        if (_filterIndexBlock is null && (flags & TableReadFlags.BlockCacheTier) != 0) return true;
         BlockRef top = _filterIndexBlock is not null ? BlockRef.FromPinned(_filterIndexBlock) : GetBlockRef(_filterHandle, BlockKind.Filter, flags);
         BlockHandle partition;
         BlockIter it = IterPool.Rent();
@@ -1021,6 +1098,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
             }
         }
         _stats?.Record(BlockCacheCounter.FilterMiss);
+        if ((flags & TableReadFlags.BlockCacheTier) != 0) return true; // no I/O allowed: Incomplete -> may match
         byte[] buf = BlockFetcher.ReadRawPayload(_file, _footer, handle, _options.VerifyChecksums, out int len);
         IFilterBitsReader reader;
         try

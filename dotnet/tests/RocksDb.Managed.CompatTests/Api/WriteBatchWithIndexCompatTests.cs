@@ -7,8 +7,8 @@ namespace RocksDb.Managed.CompatTests.Api;
 
 /// <summary>
 /// WriteBatchWithIndex against native rocksdb::WriteBatchWithIndex: the same operations give a byte-identical batch
-/// rep (also after RollbackToSavePoint), and GetFromBatchAndDB / NewIteratorWithBase return the same results on the
-/// same DB contents (merges included).
+/// rep (also after RollbackToSavePoint), and GetFromBatchAndDB / MultiGetFromBatchAndDB / NewIteratorWithBase return
+/// the same results on the same DB contents (merges included).
 /// </summary>
 [TestClass]
 public sealed class WriteBatchWithIndexCompatTests
@@ -157,6 +157,19 @@ public sealed class WriteBatchWithIndexCompatTests
             {
                 if (singleDeleted.Contains((other, k))) continue;
                 Assert.AreEqual(nativeGets[(other, k)], S(mb.GetFromBatchAndDB(mdb, null, cf, U(k))), ctx + " get " + other + " " + k);
+            }
+            // MultiGetFromBatchAndDB: one DB MultiGet for the keys the batch does not settle, same results.
+            using (var multi = new MultiGetBatch())
+            {
+                foreach (string k in keys) multi.Add(U(k));
+                mb.MultiGetFromBatchAndDB(mdb, null, cf, multi);
+                for (int i = 0; i < keys.Count; i++)
+                {
+                    if (singleDeleted.Contains((other, keys[i]))) continue;
+                    Assert.AreNotEqual(MultiGetStatus.Error, multi.GetStatus(i), ctx + " multiget error " + multi.GetError(i)?.Message);
+                    string? got = multi.TryGetValue(i, out ReadOnlySpan<byte> mv) ? Encoding.UTF8.GetString(mv) : null;
+                    Assert.AreEqual(nativeGets[(other, keys[i])], got, ctx + " multiget " + other + " " + keys[i]);
+                }
             }
             var scan = new List<string>();
             using (BaseDeltaIterator it = mb.NewIteratorWithBase(cf, cf.NewIterator(), null))

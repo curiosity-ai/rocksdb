@@ -117,6 +117,29 @@ public sealed class ClusterHarness : IAsyncDisposable
         return found!;
     }
 
+    /// <summary>
+    /// A leader that every node of <paramref name="nodes"/> agrees on (same term, it leads or they follow it) - the
+    /// majority side of a partition, while the nodes outside the set may still believe in an older leader.
+    /// </summary>
+    public async Task<ClusterNodeHost> WaitForLeaderAmongAsync(IReadOnlyCollection<string> nodes, long minTerm)
+    {
+        ClusterNodeHost? found = null;
+        await WaitUntilAsync(() =>
+        {
+            List<ClusterNodeStatus> all = Statuses();
+            List<ClusterNodeStatus> s = all.FindAll(x => nodes.Contains(x.NodeId));
+            ClusterNodeStatus? leader = s.Find(x => x.Role == RaftRole.Leader && x.Term >= minTerm);
+            if (leader == null) return false;
+            foreach (ClusterNodeStatus x in s)
+            {
+                if (x.Term != leader.Term || (x.NodeId != leader.NodeId && x.LeaderId != leader.NodeId)) return false;
+            }
+            found = _hosts[leader.NodeId];
+            return true;
+        }, TimeSpan.FromSeconds(15), "an agreed leader among " + string.Join(",", nodes) + "\n" + LogText);
+        return found!;
+    }
+
     /// <summary>Waits until every running node has the leader's tail and commit index, then compares digests.</summary>
     public async Task AssertConvergedAsync(ClusterNodeHost leader)
     {

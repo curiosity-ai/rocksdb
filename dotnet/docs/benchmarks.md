@@ -254,3 +254,55 @@ when every call completes synchronously.
 
 For BenchmarkDotNet comparisons on a shared machine, follow [perf.md](perf.md#method): alternate the baseline and
 the candidate in the same time window (`--job short --iterationCount 8`), and report medians.
+
+## Replication
+
+`bench/RocksDb.Managed.Replication.Benchmarks` (see `bench/README.md`) measures the WAL-stream replication pipeline and
+planned switchover. Machine: the shared 4-vCPU cloud box, .NET 10.0.14, Release, **with other agents building and
+testing at the same time (load average 6-25 during these runs)**. Treat the numbers as indicative: repeated runs
+of one configuration vary by 2x or more, and the latency tails mostly reflect CPU and fsync contention from other
+processes. Primary and replica are on the local file system in one process, writes are not synced, keys are 16 B,
+values 100 B; every measured run follows a full-size warm-up run (the JIT column is not ~0 for the gRPC rows: Kestrel /
+gRPC code keeps tiering up during the run).
+
+### WAL stream: throughput and primary -> replica lag (2026-11-02, load average 15-25)
+
+| transport | writers | batch | rate (ops/s) | ops | primary ops/s | replica ops/s | lag p50 ms | p90 | p99 | max | catch-up ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| in-memory | 1 | 1 | max | 200,000 | 114,201 | 114,157 | 4.54 | 16.20 | 28.90 | 33.5 | 0.7 |
+| in-memory | 4 | 1 | max | 400,000 | 143,021 | 138,013 | 36.21 | 118.83 | 181.35 | 190.1 | 101.5 |
+| in-memory | 4 | 100 | max | 1,000,000 | 179,135 | 178,872 | 192.45 | 481.44 | 562.34 | 572.2 | 8.2 |
+| in-memory | 4 | 1 | 20,000 | 100,000 | 19,996 | 19,995 | 0.38 | 0.66 | 1.85 | 24.4 | 0.0 |
+| gRPC loopback | 1 | 1 | max | 200,000 | 128,747 | 121,830 | 6.22 | 108.88 | 165.53 | 171.5 | 88.2 |
+| gRPC loopback | 4 | 1 | max | 400,000 | 174,711 | 174,544 | 2.77 | 6.83 | 18.37 | 30.8 | 2.2 |
+| gRPC loopback | 4 | 100 | max | 1,000,000 | 311,941 | 308,793 | 60.55 | 115.57 | 123.33 | 128.3 | 32.7 |
+| gRPC loopback | 4 | 1 | 20,000 | 100,000 | 19,991 | 19,988 | 0.62 | 1.25 | 5.20 | 26.7 | 0.6 |
+
+- The replica keeps up with the primary's write rate in every configuration (replica ops/s = primary ops/s within a
+  few percent; catch-up after the last write is milliseconds).
+- At an unsaturated 20k ops/s the median lag is 0.4 ms in process and 0.6 ms over gRPC, p99 2-5 ms.
+- At full speed the lag is queueing: the stream buffers up to 16 chunks of up to 256 KiB, so with 100-entry batches
+  the replica is a few hundred thousand entries (100-500 ms) behind while writers saturate the box.
+
+### Switchover: writes held per handoff
+
+`switchover --handoffs 20 --writers 4`, before (`c2126e3`) and after the hold reductions in
+`src/RocksDb.Managed.Replication/README.md` ("Switchover cost"), runs interleaved. Columns: first handoff of the
+process held / client gap, then p50 and max over the other 19.
+
+| transport | before: first | before: p50 / max | after: first | after: p50 / max |
+|---|---|---|---|---|
+| in-memory, round 1 (load 15/13) | 18.4 | 6.5 / 9.9 | 26.1 | 6.1 / 14.2 |
+| gRPC, round 1 | 21.6 | 6.0 / 10.6 | 13.8 | 19.2 / 36.6 |
+| in-memory, round 2 (load 12/15) | 21.7 | 37.6 / 97.9 | 32.2 | 35.2 / 76.0 |
+| gRPC, round 2 | 25.8 | 28.0 / 81.7 | 76.0 | 31.7 / 91.6 |
+| in-memory, round 3 (load 17/17) | 43.2 | 34.9 / 114.1 | 229.6 | 37.6 / 364.0 |
+| gRPC, round 3 | 66.9 | 28.0 / 59.0 | 25.3 | 5.3 / 12.6 |
+
+On this machine the warm hold is bimodal - about 5-7 ms whenever the box is quiet enough, 30-40 ms when fsync and
+scheduling latency are high - and the before/after difference is inside that noise. The breakdown (timestamps on both
+nodes) shows where the time goes: draining the gate ~1 ms, replica catch-up and detach 1-5 ms, the rest is the promote
+round trip and the fsync'd role-state writes. The changes remove one-time costs of the first promote of a process
+over gRPC (15-30 ms per side, visible in the multi-process `samples/SwitchoverTest`: before 40-230 ms, median ~99 ms,
+after 35-133 ms, median ~85 ms over 8 handoffs each at load 7-20) and three fsyncs from the hold. The 10-50 ms in
+rocksdb-sharp's notes were measured on a quieter machine with one fsync per state write (no directory fsync).

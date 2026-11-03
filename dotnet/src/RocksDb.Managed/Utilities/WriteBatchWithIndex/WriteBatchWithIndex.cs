@@ -109,12 +109,16 @@ public sealed class WriteBatchWithIndex : IDisposable
 
     public WriteBatchWithIndex PutEntity(ColumnFamily? columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns)
     {
-        uint cf = CfId(columnFamily);
+        PutEntity(CfId(columnFamily), key, columns);
+        return this;
+    }
+
+    internal void PutEntity(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns)
+    {
         if (TimestampSizeOf(cf) != 0) ThrowHelper.NotSupported("PutEntity on a column family with user-defined timestamps in WriteBatchWithIndex");
         int offset = _batch.DataSize;
         _batch.PutEntity(cf, key, columns);
         AddOrUpdateIndex(cf, WriteType.PutEntity, offset);
-        return this;
     }
 
     public WriteBatchWithIndex Delete(ReadOnlySpan<byte> key) => Delete(null, key);
@@ -556,6 +560,21 @@ public sealed class WriteBatchWithIndex : IDisposable
         ArgumentNullException.ThrowIfNull(columns);
         uint cf = CfId(columnFamily);
         LookupResult r = FindLatestUpdate(cf, ComparatorOf(columnFamily), key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+        if (r == LookupResult.MergeInProgress)
+        {
+            columns.Clear();
+            throw new RocksDbException(StatusCode.MergeInProgress, "Merge in progress");
+        }
+        return ResolveBatchEntity(r, type, v, columnFamily?.Data.MergeOperator, key, columns);
+    }
+
+    /// <summary>
+    /// WriteBatchWithIndexInternal::GetEntityFromBatch for a settled lookup (NotFound, Deleted or Found, with the merge
+    /// operands of <c>_mergeContext</c>): the entity of the key, or false (columns emptied).
+    /// </summary>
+    private bool ResolveBatchEntity(LookupResult r, WriteType type, ReadOnlySpan<byte> v, MergeOperator? mergeOperator, ReadOnlySpan<byte> key,
+        WideColumns columns)
+    {
         PooledBufferWriter w = ObjectPools.RentWriter();
         try
         {
@@ -564,16 +583,13 @@ public sealed class WriteBatchWithIndex : IDisposable
                 case LookupResult.NotFound:
                     columns.Clear();
                     return false;
-                case LookupResult.MergeInProgress:
-                    columns.Clear();
-                    throw new RocksDbException(StatusCode.MergeInProgress, "Merge in progress");
                 case LookupResult.Deleted:
                     if (_mergeContext.Count == 0)
                     {
                         columns.Clear();
                         return false;
                     }
-                    MergeHelper.TimedFullMerge(RequireMergeOperator(columnFamily?.Data.MergeOperator), key, false, default, _mergeContext, w);
+                    MergeHelper.TimedFullMerge(RequireMergeOperator(mergeOperator), key, false, default, _mergeContext, w);
                     WrapDefault(w, columns);
                     return true;
                 default:
@@ -587,20 +603,11 @@ public sealed class WriteBatchWithIndex : IDisposable
                         }
                         return true;
                     }
-                    MergeOperator op = RequireMergeOperator(columnFamily?.Data.MergeOperator);
+                    MergeOperator op = RequireMergeOperator(mergeOperator);
                     if (type == WriteType.PutEntity)
                     {
                         MergeHelper.TimedFullMerge(op, key, true, Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(v), _mergeContext, w);
-                        PooledBufferWriter e = ObjectPools.RentWriter();
-                        try
-                        {
-                            Db.Wide.WideColumnSerialization.ReplaceDefaultColumn(v, w.WrittenSpan, e);
-                            columns.SetSerialized(e.WrittenSpan);
-                        }
-                        finally
-                        {
-                            ObjectPools.ReturnWriter(e);
-                        }
+                        ReplaceDefault(v, w, columns);
                         return true;
                     }
                     MergeHelper.TimedFullMerge(op, key, true, v, _mergeContext, w);
@@ -611,6 +618,277 @@ public sealed class WriteBatchWithIndex : IDisposable
         finally
         {
             ObjectPools.ReturnWriter(w);
+        }
+    }
+
+    private static void ReplaceDefault(ReadOnlySpan<byte> entity, PooledBufferWriter newDefault, WideColumns columns)
+    {
+        PooledBufferWriter e = ObjectPools.RentWriter();
+        try
+        {
+            Db.Wide.WideColumnSerialization.ReplaceDefaultColumn(entity, newDefault.WrittenSpan, e);
+            columns.SetSerialized(e.WrittenSpan);
+        }
+        finally
+        {
+            ObjectPools.ReturnWriter(e);
+        }
+    }
+
+    // ---- entities from the batch and the DB ----------------------------------------------------------------
+
+    /// <summary>The DB side of an entity read from the batch and the DB (DBImpl::GetImpl with columns).</summary>
+    internal interface IEntityDbReader
+    {
+        /// <summary>Reads the entity of <paramref name="key"/> from the DB into <paramref name="columns"/>; false if absent.</summary>
+        bool TryGetEntity(ReadOnlySpan<byte> key, WideColumns columns);
+    }
+
+    private readonly struct HandleEntityReader(ColumnFamily cfh, ReadOptions? options) : IEntityDbReader
+    {
+        public bool TryGetEntity(ReadOnlySpan<byte> key, WideColumns columns) => cfh.TryGetEntity(options, key, columns);
+    }
+
+    /// <summary>
+    /// GetEntityFromBatchAndDB / MultiGetEntityFromBatchAndDB timestamp checks: a column family with timestamps needs a
+    /// read timestamp of its size; one without must not get one.
+    /// </summary>
+    internal static RocksDbException? CheckEntityReadTimestamp(int timestampSize, ReadOptions? options)
+    {
+        if (timestampSize > 0)
+        {
+            if (options?.Timestamp is not { } ts) return new RocksDbException(StatusCode.InvalidArgument, "Invalid argument: Must specify timestamp");
+            if (ts.Length != timestampSize)
+            {
+                return new RocksDbException(StatusCode.InvalidArgument,
+                    "Invalid argument: Timestamp size does not match the timestamp size of the column family");
+            }
+        }
+        else if (options?.Timestamp is not null)
+        {
+            return new RocksDbException(StatusCode.InvalidArgument,
+                "Invalid argument: Cannot specify timestamp since the column family does not have timestamps enabled");
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Reads the entity of <paramref name="key"/> from the batch, falling back to (and merging with) the DB
+    /// (WriteBatchWithIndex::GetEntityFromBatchAndDB): a Put / PutEntity / Delete in the batch wins (a plain value reads
+    /// as a single default column); merge operands in the batch apply to the default column of the DB entity read with
+    /// <paramref name="options"/>, keeping its other columns. Returns false (columns emptied) if the key does not exist.
+    /// A column family with timestamps requires <see cref="ReadOptions.Timestamp"/> of its timestamp size; one without
+    /// rejects it (InvalidArgument).
+    /// </summary>
+    public bool TryGetEntityFromBatchAndDB(RocksDatabase db, ReadOptions? options, ColumnFamily? columnFamily, ReadOnlySpan<byte> key, WideColumns columns)
+    {
+        ArgumentNullException.ThrowIfNull(db);
+        ArgumentNullException.ThrowIfNull(columns);
+        ColumnFamily cfh = columnFamily ?? db.DefaultColumnFamily;
+        if (CheckEntityReadTimestamp(cfh.Data.TimestampSize, options) is { } e) throw e;
+        var reader = new HandleEntityReader(cfh, options);
+        return GetEntityFromBatchAndDBCore(CfId(cfh), cfh.Data.MergeOperator, key, columns, ref reader);
+    }
+
+    public bool TryGetEntityFromBatchAndDB(RocksDatabase db, ReadOnlySpan<byte> key, WideColumns columns) =>
+        TryGetEntityFromBatchAndDB(db, null, null, key, columns);
+
+    /// <summary>Allocating convenience form of <see cref="TryGetEntityFromBatchAndDB(RocksDatabase, ReadOptions?, ColumnFamily?, ReadOnlySpan{byte}, WideColumns)"/>.</summary>
+    public WideColumns? GetEntityFromBatchAndDB(RocksDatabase db, ReadOptions? options, ColumnFamily? columnFamily, ReadOnlySpan<byte> key)
+    {
+        var c = new WideColumns();
+        return TryGetEntityFromBatchAndDB(db, options, columnFamily, key, c) ? c : null;
+    }
+
+    /// <summary>
+    /// GetEntityFromBatchAndDB for a registered column family: the batch lookup, then the DB read through
+    /// <paramref name="reader"/> when the batch does not settle the key.
+    /// </summary>
+    internal bool GetEntityFromBatchAndDBCore<TReader>(uint cf, MergeOperator? mergeOperator, ReadOnlySpan<byte> key, WideColumns columns, ref TReader reader)
+        where TReader : struct, IEntityDbReader
+    {
+        LookupResult r = FindLatestUpdate(cf, _index.GetComparator(cf), key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+        switch (r)
+        {
+            case LookupResult.NotFound:
+                return reader.TryGetEntity(key, columns);
+            case LookupResult.MergeInProgress:
+                {
+                    MergeOperator op = RequireMergeOperator(mergeOperator);
+                    // The DB read does not touch the batch: the operands collected in _mergeContext stay valid.
+                    var existing = new WideColumns();
+                    bool found = reader.TryGetEntity(key, existing);
+                    MergeEntityAcrossBatchAndDB(op, key, found, existing, _mergeContext, columns);
+                    return true;
+                }
+            default:
+                return ResolveBatchEntity(r, type, v, mergeOperator, key, columns);
+        }
+    }
+
+    /// <summary>
+    /// MergeAcrossBatchAndDB for an entity: the batch's operands on top of the DB entity's default column (a plain base
+    /// when the entity has only the default column, kWideBaseValue keeping the other columns otherwise; no base value
+    /// when the key is absent from the DB).
+    /// </summary>
+    private static void MergeEntityAcrossBatchAndDB(MergeOperator op, ReadOnlySpan<byte> key, bool found, WideColumns existing, MergeContext operands,
+        WideColumns columns)
+    {
+        PooledBufferWriter w = ObjectPools.RentWriter();
+        try
+        {
+            if (!found)
+            {
+                MergeHelper.TimedFullMerge(op, key, false, default, operands, w);
+                WrapDefault(w, columns);
+            }
+            else if (existing.Count == 1 && existing.HasDefaultColumn)
+            {
+                MergeHelper.TimedFullMerge(op, key, true, existing.DefaultColumnValue, operands, w);
+                WrapDefault(w, columns);
+            }
+            else
+            {
+                MergeHelper.TimedFullMerge(op, key, true, existing.DefaultColumnValue, operands, w);
+                ReplaceDefault(existing.Serialized, w, columns);
+            }
+        }
+        finally
+        {
+            ObjectPools.ReturnWriter(w);
+        }
+    }
+
+    /// <summary>
+    /// Port of WriteBatchWithIndex::MultiGetEntityFromBatchAndDB: looks up the entity of every key of
+    /// <paramref name="batch"/> like <see cref="TryGetEntityFromBatchAndDB(RocksDatabase, ReadOptions?, ColumnFamily?, ReadOnlySpan{byte}, WideColumns)"/>,
+    /// reading all keys the write batch does not settle (absent, or only merge operands) with one DB MultiGetEntity, so
+    /// they come from one consistent view of the DB. Read the results from <paramref name="batch"/> per key with
+    /// <see cref="MultiGetBatch.TryGetEntity"/> (status, columns, error), in the order the keys were added. Timestamp
+    /// rules as for the single-key form (every key fails with InvalidArgument otherwise).
+    /// </summary>
+    public void MultiGetEntityFromBatchAndDB(RocksDatabase db, ReadOptions? options, ColumnFamily? columnFamily, MultiGetBatch batch)
+    {
+        ArgumentNullException.ThrowIfNull(db);
+        ArgumentNullException.ThrowIfNull(batch);
+        ColumnFamily cfh = columnFamily ?? db.DefaultColumnFamily;
+        var reader = new HandleMultiEntityReader(cfh, options);
+        MultiGetEntityFromBatchAndDBCore(CfId(cfh), cfh.Data.MergeOperator, cfh.Data.TimestampSize, options, batch, ref reader);
+    }
+
+    /// <summary><see cref="MultiGetEntityFromBatchAndDB(RocksDatabase, ReadOptions?, ColumnFamily?, MultiGetBatch)"/> on the default column family.</summary>
+    public void MultiGetEntityFromBatchAndDB(RocksDatabase db, MultiGetBatch batch) => MultiGetEntityFromBatchAndDB(db, null, null, batch);
+
+    /// <summary>The DB side of a batched entity read: one MultiGetEntity of the keys the write batch does not settle.</summary>
+    internal interface IMultiEntityDbReader
+    {
+        void MultiGetEntity(MultiGetBatch keys);
+    }
+
+    private readonly struct HandleMultiEntityReader(ColumnFamily cfh, ReadOptions? options) : IMultiEntityDbReader
+    {
+        public void MultiGetEntity(MultiGetBatch keys) => cfh.MultiGetEntity(options, keys);
+    }
+
+    internal void MultiGetEntityFromBatchAndDBCore<TReader>(uint cf, MergeOperator? op, int timestampSize, ReadOptions? options, MultiGetBatch batch,
+        ref TReader reader) where TReader : struct, IMultiEntityDbReader
+    {
+        Comparator cmp = _index.GetComparator(cf);
+        int n = batch.Count;
+        batch.EntityRun = true;
+        if (CheckEntityReadTimestamp(timestampSize, options) is { } tsError)
+        {
+            batch.BeginExternalRun(cmp);
+            for (int i = 0; i < n; i++) batch.SetError(i, tsError);
+            return;
+        }
+        // Per key: the entity from the batch (serialized; empty array = not found), or the index of the key in the DB read.
+        var fromBatch = new byte[]?[n];
+        var dbIndex = new int[n];
+        var errors = new RocksDbException?[n];
+        MergeContext?[]? merges = null;
+        using var dbBatch = new MultiGetBatch(Math.Max(1, n));
+        var scratch = new WideColumns();
+        for (int i = 0; i < n; i++)
+        {
+            dbIndex[i] = -1;
+            ReadOnlySpan<byte> key = batch.GetKey(i);
+            try
+            {
+                LookupResult r = FindLatestUpdate(cf, cmp, key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+                switch (r)
+                {
+                    case LookupResult.NotFound:
+                        dbIndex[i] = dbBatch.Count;
+                        dbBatch.Add(key);
+                        break;
+                    case LookupResult.MergeInProgress:
+                        {
+                            RequireMergeOperator(op);
+                            var operands = new MergeContext();
+                            for (int j = 0; j < _mergeContext.Count; j++) operands.PushOperand(_mergeContext.GetOperandNewestFirst(j));
+                            (merges ??= new MergeContext?[n])[i] = operands;
+                            dbIndex[i] = dbBatch.Count;
+                            dbBatch.Add(key);
+                            break;
+                        }
+                    default:
+                        fromBatch[i] = ResolveBatchEntity(r, type, v, op, key, scratch) ? scratch.Serialized.ToArray() : [];
+                        break;
+                }
+            }
+            catch (RocksDbException e)
+            {
+                errors[i] = e;
+            }
+        }
+        try
+        {
+            if (dbBatch.Count > 0) reader.MultiGetEntity(dbBatch);
+            batch.BeginExternalRun(cmp);
+            for (int i = 0; i < n; i++)
+            {
+                if (errors[i] is { } err)
+                {
+                    batch.SetError(i, err);
+                    continue;
+                }
+                int d = dbIndex[i];
+                if (d < 0)
+                {
+                    byte[] entity = fromBatch[i]!;
+                    batch.SetExternalResult(i, entity.Length > 0, entity);
+                    continue;
+                }
+                if (dbBatch.GetStatus(d) == MultiGetStatus.Error)
+                {
+                    batch.SetError(i, dbBatch.GetError(d)!);
+                    continue;
+                }
+                bool found = dbBatch.TryGetEntity(d, scratch);
+                if (merges?[i] is not { } operands)
+                {
+                    batch.SetExternalResult(i, found, found ? scratch.Serialized : default);
+                    continue;
+                }
+                try
+                {
+                    var merged = new WideColumns();
+                    MergeEntityAcrossBatchAndDB(op!, batch.GetKey(i), found, scratch, operands, merged);
+                    batch.SetExternalResult(i, true, merged.Serialized);
+                }
+                catch (RocksDbException e)
+                {
+                    batch.SetError(i, e);
+                }
+            }
+        }
+        finally
+        {
+            if (merges is not null)
+            {
+                foreach (MergeContext? m in merges) m?.Dispose();
+            }
         }
     }
 
@@ -680,6 +958,138 @@ public sealed class WriteBatchWithIndex : IDisposable
     }
 
     public byte[]? GetFromBatchAndDB(RocksDatabase db, ReadOnlySpan<byte> key) => GetFromBatchAndDB(db, null, null, key);
+
+    /// <summary>
+    /// Port of WriteBatchWithIndex::MultiGetFromBatchAndDB (utilities/write_batch_with_index/write_batch_with_index.cc):
+    /// looks up every key of <paramref name="batch"/> like
+    /// <see cref="TryGetFromBatchAndDB(RocksDatabase, ReadOptions?, ColumnFamily?, ReadOnlySpan{byte}, IBufferWriter{byte})"/>,
+    /// but reads all keys that the batch does not settle (absent, or only merge operands) with one DB MultiGet, so they
+    /// come from one consistent view of the DB. Results are read from <paramref name="batch"/> per key (status, value,
+    /// error), in the order the keys were added. A column family with user-defined timestamps requires
+    /// <see cref="ReadOptions.Timestamp"/> (every key fails with InvalidArgument otherwise). Values found in the write
+    /// batch are copied into <paramref name="batch"/> (upstream does not pin batch values either).
+    /// </summary>
+    public void MultiGetFromBatchAndDB(RocksDatabase db, ReadOptions? options, ColumnFamily? columnFamily, MultiGetBatch batch)
+    {
+        ArgumentNullException.ThrowIfNull(db);
+        ArgumentNullException.ThrowIfNull(batch);
+        ColumnFamily cfh = columnFamily ?? db.DefaultColumnFamily;
+        uint cf = CfId(cfh);
+        Comparator cmp = ComparatorOf(cfh);
+        int n = batch.Count;
+        batch.EntityRun = false; // plain values (the batch may have been used for an entity run before)
+        if (cfh.Data.TimestampSize > 0 && options?.Timestamp is null)
+        {
+            batch.BeginExternalRun(cmp);
+            for (int i = 0; i < n; i++) batch.SetError(i, new RocksDbException(StatusCode.InvalidArgument, "Invalid argument: Must specify timestamp"));
+            return;
+        }
+        MergeOperator? op = cfh.Data.MergeOperator;
+        // Per key: the batch result (value bytes or "deleted"), or the index of the key in the DB MultiGet.
+        var fromBatch = new byte[]?[n];
+        var dbIndex = new int[n];
+        var errors = new RocksDbException?[n];
+        MergeContext?[]? merges = null;
+        using var dbBatch = new MultiGetBatch(Math.Max(1, n));
+        PooledBufferWriter w = ObjectPools.RentWriter();
+        try
+        {
+            for (int i = 0; i < n; i++)
+            {
+                dbIndex[i] = -1;
+                ReadOnlySpan<byte> key = batch.GetKey(i);
+                try
+                {
+                    LookupResult r = FindLatestUpdate(cf, cmp, key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+                    switch (r)
+                    {
+                        case LookupResult.Found:
+                            {
+                                ReadOnlySpan<byte> baseValue = type == WriteType.PutEntity ? Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(v) : v;
+                                w.Clear();
+                                if (_mergeContext.Count == 0) w.Write(baseValue);
+                                else MergeHelper.TimedFullMerge(RequireMergeOperator(op), key, true, baseValue, _mergeContext, w);
+                                fromBatch[i] = w.WrittenSpan.ToArray();
+                                break;
+                            }
+                        case LookupResult.Deleted:
+                            if (_mergeContext.Count == 0) break; // NotFound
+                            w.Clear();
+                            MergeHelper.TimedFullMerge(RequireMergeOperator(op), key, false, default, _mergeContext, w);
+                            fromBatch[i] = w.WrittenSpan.ToArray();
+                            break;
+                        case LookupResult.NotFound:
+                            dbIndex[i] = dbBatch.Count;
+                            dbBatch.Add(key);
+                            break;
+                        default: // MergeInProgress: the operands are merged on top of the DB value.
+                            {
+                                RequireMergeOperator(op);
+                                var operands = new MergeContext();
+                                for (int j = 0; j < _mergeContext.Count; j++) operands.PushOperand(_mergeContext.GetOperandNewestFirst(j));
+                                (merges ??= new MergeContext?[n])[i] = operands;
+                                dbIndex[i] = dbBatch.Count;
+                                dbBatch.Add(key);
+                                break;
+                            }
+                    }
+                }
+                catch (RocksDbException e)
+                {
+                    errors[i] = e;
+                }
+            }
+            if (dbBatch.Count > 0) cfh.MultiGet(options, dbBatch);
+
+            batch.BeginExternalRun(cmp);
+            for (int i = 0; i < n; i++)
+            {
+                if (errors[i] is { } err)
+                {
+                    batch.SetError(i, err);
+                    continue;
+                }
+                int d = dbIndex[i];
+                if (d < 0)
+                {
+                    batch.SetExternalResult(i, fromBatch[i] is not null, fromBatch[i]);
+                    continue;
+                }
+                if (dbBatch.GetStatus(d) == MultiGetStatus.Error)
+                {
+                    batch.SetError(i, dbBatch.GetError(d)!);
+                    continue;
+                }
+                bool found = dbBatch.TryGetValue(d, out ReadOnlySpan<byte> dbValue);
+                if (merges?[i] is not { } operands)
+                {
+                    batch.SetExternalResult(i, found, dbValue);
+                    continue;
+                }
+                try
+                {
+                    w.Clear();
+                    MergeHelper.TimedFullMerge(op!, batch.GetKey(i), found, found ? dbValue : default, operands, w);
+                    batch.SetExternalResult(i, true, w.WrittenSpan);
+                }
+                catch (RocksDbException e)
+                {
+                    batch.SetError(i, e);
+                }
+            }
+        }
+        finally
+        {
+            ObjectPools.ReturnWriter(w);
+            if (merges is not null)
+            {
+                foreach (MergeContext? m in merges) m?.Dispose();
+            }
+        }
+    }
+
+    /// <summary><see cref="MultiGetFromBatchAndDB(RocksDatabase, ReadOptions?, ColumnFamily?, MultiGetBatch)"/> on the default column family.</summary>
+    public void MultiGetFromBatchAndDB(RocksDatabase db, MultiGetBatch batch) => MultiGetFromBatchAndDB(db, null, null, batch);
 
     public void Dispose()
     {
