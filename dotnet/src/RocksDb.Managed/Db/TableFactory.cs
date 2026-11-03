@@ -69,6 +69,8 @@ public static class TableFactory
             UseDeltaEncoding = options.UseDeltaEncoding,
             OptimizeKeyCommonPrefix = options.OptimizeKeyCommonPrefix,
             EnableIndexCompression = options.EnableIndexCompression,
+            UserDefinedIndexFactory = options.UserDefinedIndexFactory,
+            IndexMode = options.IndexMode,
             // We do not support partitioned filters without partitioning indexes (InitializeOptions).
             PartitionFilters = options.PartitionFilters && options.IndexType == IndexType.TwoLevelIndexSearch,
             DecouplePartitionedFilters = options.DecouplePartitionedFilters,
@@ -331,6 +333,8 @@ public static class TableFactory
             TableFactory = options.TableFactory,
             PlainTableOptions = options.PlainTableOptions,
             BloomLocality = options.BloomLocality,
+            UserDefinedIndexFactory = t.UserDefinedIndexFactory,
+            IndexMode = t.IndexMode,
         };
         if (cache is not null) r = r with { BlockCache = cache };
         return r;

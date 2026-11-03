@@ -65,7 +65,7 @@ public sealed class PlainCuckooCompatTests
         var d = new SortedDictionary<string, string>(StringComparer.Ordinal);
         while (d.Count < n)
         {
-            string k = "p" + rnd.Next(30).ToString("D2", System.Globalization.CultureInfo.InvariantCulture) + "/" + rnd.Next(100000).ToString("D5", System.Globalization.CultureInfo.InvariantCulture);
+            string k = "p" + rnd.Next(30).ToString("D2", System.Globalization.CultureInfo.InvariantCulture) + "/" + rnd.Next(1000000).ToString("D6", System.Globalization.CultureInfo.InvariantCulture);
             d[k] = "v" + rnd.Next() + new string('x', rnd.Next(80));
         }
         return d;

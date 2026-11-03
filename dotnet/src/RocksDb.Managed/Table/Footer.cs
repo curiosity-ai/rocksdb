@@ -97,8 +97,10 @@ public readonly struct Footer
     /// <summary>kVersion0EncodedLength (legacy format_version 0) = 48, also the minimum.</summary>
     public const int MinEncodedLength = 2 * BlockHandle.MaxEncodedLength + BlockBasedTableConstants.MagicNumberLengthByte;
     private const int Part2Size = 2 * BlockHandle.MaxEncodedLength;
-    /// <summary>kKnownFooterFeatures (currently only kFooterFeatureRequireUserDefinedIndex = 1, which this port can't honour).</summary>
-    private const ulong KnownFooterFeatures = 0;
+    /// <summary>kFooterFeatureRequireUserDefinedIndex: the file can only be read through its user-defined index.</summary>
+    public const ulong FeatureRequireUserDefinedIndex = 1;
+    /// <summary>kKnownFooterFeatures.</summary>
+    private const ulong KnownFooterFeatures = FeatureRequireUserDefinedIndex;
 
     public ulong TableMagicNumber { get; init; }
     public int FormatVersion { get; init; }
@@ -117,8 +119,16 @@ public readonly struct Footer
     /// will be written (needed for the context checksum).
     /// </summary>
     public static void Build(Span<byte> dst, int formatVersion, ulong footerOffset, ChecksumType checksumType,
-        BlockHandle metaindexHandle, BlockHandle indexHandle, uint baseContextChecksum)
+        BlockHandle metaindexHandle, BlockHandle indexHandle, uint baseContextChecksum) =>
+        Build(dst, formatVersion, footerOffset, checksumType, metaindexHandle, indexHandle, baseContextChecksum, incompatibleFeatures: 0);
+
+    /// <summary><see cref="Build(Span{byte}, int, ulong, ChecksumType, BlockHandle, BlockHandle, uint)"/> with incompatible feature flags (format_version &gt;= 6).</summary>
+    public static void Build(Span<byte> dst, int formatVersion, ulong footerOffset, ChecksumType checksumType,
+        BlockHandle metaindexHandle, BlockHandle indexHandle, uint baseContextChecksum, ulong incompatibleFeatures)
     {
+        if (formatVersion < 6 && incompatibleFeatures != 0) ThrowHelper.InvalidArgument("incompatible footer features require format_version >= 6");
+        if ((incompatibleFeatures & ~KnownFooterFeatures) != 0)
+            ThrowHelper.InvalidArgument("unsupported incompatible footer features: " + (incompatibleFeatures & ~KnownFooterFeatures));
         if (formatVersion < BlockBasedTableConstants.MinSupportedFormatVersionForWrite || formatVersion > BlockBasedTableConstants.LatestSupportedFormatVersion)
             ThrowHelper.InvalidArgument("unsupported format_version " + formatVersion);
         dst = dst[..EncodedLength];
@@ -159,7 +169,8 @@ public readonly struct Footer
                     ThrowHelper.InvalidArgument("metaindex block must immediately precede the footer");
                 Coding.EncodeFixed32(cur[12..], (uint)metaindexHandle.Size);
             }
-            // 16 reserved zero bytes + incompatible features (0) already zero.
+            // 16 reserved zero bytes, then the incompatible features.
+            Coding.EncodeFixed64(cur[32..], incompatibleFeatures);
             uint checksum = BlockChecksum.ComputeBuiltinChecksum(checksumType, dst);
             checksum += BlockChecksum.ChecksumModifierForContext(baseContextChecksum, footerOffset);
             Coding.EncodeFixed32(dst[5..], checksum);

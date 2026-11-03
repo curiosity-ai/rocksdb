@@ -24,6 +24,10 @@ public sealed record TableReaderOptions
     public bool AllowMmapReads { get; init; }
     /// <summary>ImmutableOptions::bloom_locality: locality of the bloom filters plain tables build at open.</summary>
     public uint BloomLocality { get; init; }
+    /// <summary>BlockBasedTableOptions::user_defined_index_factory: reader of the tables' custom index; null: none.</summary>
+    public UserDefinedIndexFactory? UserDefinedIndexFactory { get; init; }
+    /// <summary>BlockBasedTableOptions::index_mode (effective).</summary>
+    public BlockBasedIndexMode IndexMode { get; init; } = BlockBasedIndexMode.StandardDefault;
 
     /// <summary>User comparator the table was built with.</summary>
     public Comparator Comparator { get; init; } = Comparator.Bytewise;
@@ -614,8 +618,13 @@ public sealed partial class BlockBasedTableReader : TableReader
                     filter = null;
                 }
             }
-            return new BlockBasedTableReader(ownedFile ?? file, options, footer, metaBlocks, props, indexHandle, indexBlock, rangeDel, filter, filterBuf,
+            UserDefinedIndexReader? udi = OpenUserDefinedIndex(file, options, footer, metaBlocks, props, verify, out bool udiStub);
+            var reader = new BlockBasedTableReader(ownedFile ?? file, options, footer, metaBlocks, props, indexHandle, indexBlock, rangeDel, filter, filterBuf,
                 filterKind, fh, filterIndex, pinnedParts, compressionDict, baseCacheKey, fileSize);
+            reader._udiReader = udi;
+            reader._udiStub = udiStub;
+            reader._udiPrimary = options.IndexMode is BlockBasedIndexMode.CustomDefault or BlockBasedIndexMode.CustomOnly;
+            return reader;
         }
         catch
         {
@@ -627,6 +636,83 @@ public sealed partial class BlockBasedTableReader : TableReader
             if (filterBuf is not null) TableBuilderBuffers.Return(filterSource, filterBuf);
             throw;
         }
+    }
+
+    private UserDefinedIndexReader? _udiReader;
+    private bool _udiStub;
+    private bool _udiPrimary;
+
+    /// <summary>The table's user-defined index reader (null: none loaded).</summary>
+    public UserDefinedIndexReader? UserDefinedIndex => _udiReader;
+
+    /// <summary>
+    /// Port of the user-defined index setup of BlockBasedTable::Open / PrefetchIndexAndFilterBlocks
+    /// (block_based_table_reader.cc): validates index_mode against the file (footer kFooterFeatureRequireUserDefinedIndex,
+    /// "rocksdb.standard.index.is.stub") and loads the "rocksdb.user_defined_index.&lt;name&gt;" block through the configured
+    /// factory. In kStandardDefault a missing or unusable custom index falls back to the standard index.
+    /// </summary>
+    private static UserDefinedIndexReader? OpenUserDefinedIndex(IRandomAccessFile file, TableReaderOptions options, in Footer footer,
+        Dictionary<string, BlockHandle> metaBlocks, TableProperties props, bool verify, out bool requiresCustomReader)
+    {
+        BlockBasedIndexMode mode = options.IndexMode;
+        UserDefinedIndexFactory? factory = options.UserDefinedIndexFactory;
+        if (mode is BlockBasedIndexMode.CustomDefault or BlockBasedIndexMode.CustomOnly && factory is null)
+            ThrowHelper.InvalidArgument("index_mode kCustomDefault/kCustomOnly requires user_defined_index_factory");
+        requiresCustomReader = (footer.IncompatibleFeatures & Footer.FeatureRequireUserDefinedIndex) != 0 || props.StandardIndexIsStub != 0;
+        if (requiresCustomReader && (mode == BlockBasedIndexMode.StandardOnly || factory is null))
+            ThrowHelper.InvalidArgument("SST has only a stub standard index; configure the matching user_defined_index_factory to read it");
+        if (mode == BlockBasedIndexMode.StandardOnly || factory is null) return null;
+        // kStandardDefault is the only mode that treats the custom index as optional.
+        bool customIndexRequired = mode != BlockBasedIndexMode.StandardDefault || requiresCustomReader;
+        string name = factory.Name;
+        UserDefinedIndexReader? reader = null;
+        if (!metaBlocks.TryGetValue(UserDefinedIndexFactory.MetaBlockPrefix + name, out BlockHandle h))
+        {
+            if (customIndexRequired) ThrowHelper.Corruption("Not found: Cannot find the meta block " + UserDefinedIndexFactory.MetaBlockPrefix + name);
+        }
+        else if (h.Size == 0)
+        {
+            // A zero-size UDI block means no user-defined index for this SST (legacy builds).
+            if (requiresCustomReader) ThrowHelper.Corruption("UDI block " + name + " has size 0 -- cannot serve reads in the configured index_mode");
+        }
+        else
+        {
+            try
+            {
+                byte[] raw = BlockFetcher.ReadRawPayload(file, footer, h, verify, out int length);
+                byte[] contents;
+                try { contents = raw.AsSpan(0, length).ToArray(); }
+                finally { if (raw.Length > 0) ArrayPool<byte>.Shared.Return(raw); }
+                reader = factory.NewReader(new UserDefinedIndexOptions { Comparator = options.Comparator }, contents)
+                    ?? throw RocksDbException.Corruption("Failed to create UDI reader for " + name);
+            }
+            catch (RocksDbException e) when (!customIndexRequired && e.Code is StatusCode.Corruption or StatusCode.NotSupported or StatusCode.InvalidArgument)
+            {
+                // The file is still fully indexed by the standard index: keep it readable.
+                reader = null;
+            }
+        }
+        if (requiresCustomReader && reader is null) ThrowHelper.Corruption("SST requires a matching user_defined_index_factory reader");
+        return reader;
+    }
+
+    /// <summary>
+    /// IndexFactoryReaderWrapper::NewIterator: the custom index iterator when the read routes through it (kPreferCustom,
+    /// or kDefault with a primary custom index / a stub standard index), else null for the standard index.
+    /// </summary>
+    internal UserDefinedIndexIterator? NewUserDefinedIndexIterator(TableReadFlags flags)
+    {
+        UserDefinedIndexReader? udi = _udiReader;
+        if (udi is null) return null;
+        bool useUdi = (flags & TableReadFlags.BuiltinIndex) != 0 ? false
+            : (flags & TableReadFlags.PreferCustomIndex) != 0 || _udiPrimary || _udiStub;
+        if (!useUdi)
+        {
+            // Only reachable via an explicit read_index=kBuiltin request.
+            if (_udiStub) ThrowHelper.InvalidArgument("Cannot read via the standard index because this SST was written with only a custom index");
+            return null;
+        }
+        return udi.NewIterator(null) ?? throw RocksDbException.Corruption("Could not create UDI iterator");
     }
 
     // Any built-in policy reads any built-in filter format (BuiltinFilterPolicy::GetBuiltinFilterBitsReader).
@@ -1611,6 +1697,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         _filterIndexBlock?.Release();
         _pinnedFilterPartitions?.Dispose();
         _compressionDict?.Dispose();
+        _udiReader?.Dispose();
 
 
         byte[]? fb = Interlocked.Exchange(ref _filterBuffer, null);

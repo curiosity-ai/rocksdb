@@ -26,6 +26,19 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
     /// </summary>
     public IndexBlockSearchType IndexBlockSearchType { get; set; } = IndexBlockSearchType.Binary;
     public DataBlockIndexType DataBlockIndexType { get; set; } = DataBlockIndexType.BinarySearch;
+    /// <summary>
+    /// user_defined_index_factory (EXPERIMENTAL): a custom index built in addition to (or instead of) the standard index,
+    /// see <see cref="IndexMode"/>. Like upstream's factory pointer it is not persisted in the OPTIONS file (reattach it
+    /// before opening a database whose files require it).
+    /// </summary>
+    public UserDefinedIndexFactory? UserDefinedIndexFactory { get; set; }
+    /// <summary>
+    /// index_mode (EXPERIMENTAL): how <see cref="UserDefinedIndexFactory"/>'s index interacts with the standard index
+    /// (default <see cref="BlockBasedIndexMode.StandardDefault"/>). The OPTIONS-file entries (index_mode, the legacy
+    /// use_udi_as_primary_index / fail_if_no_udi_on_open / skip_standard_index booleans) are preserved verbatim but not
+    /// interpreted; set this property explicitly.
+    /// </summary>
+    public BlockBasedIndexMode IndexMode { get; set; } = BlockBasedIndexMode.StandardDefault;
     public double DataBlockHashTableUtilRatio { get; set; } = 0.75;
     private CustomizableOption<FilterPolicy> _filterPolicy;
 
@@ -151,6 +164,8 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
         var c = new BlockBasedTableOptions();
         c.CopyFrom(this);
         c.BlockCache = BlockCache;
+        c.UserDefinedIndexFactory = UserDefinedIndexFactory;
+        c.IndexMode = IndexMode;
         c._filterPolicy = _filterPolicy;
         return c;
     }

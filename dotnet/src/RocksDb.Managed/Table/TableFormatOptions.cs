@@ -34,6 +34,10 @@ public sealed record TableFormatOptions
     /// <summary>format_version &gt;= 8 common user-key prefix optimization for data and index blocks.</summary>
     public OptimizeKeyCommonPrefix OptimizeKeyCommonPrefix { get; init; } = OptimizeKeyCommonPrefix.IfFastSeek;
     public bool EnableIndexCompression { get; init; } = true;
+    /// <summary>user_defined_index_factory: a custom index built with (or instead of) the standard index; null: none.</summary>
+    public UserDefinedIndexFactory? UserDefinedIndexFactory { get; init; }
+    /// <summary>index_mode (effective): how the custom index relates to the standard index.</summary>
+    public BlockBasedIndexMode IndexMode { get; init; } = BlockBasedIndexMode.StandardDefault;
     /// <summary>
     /// partition_filters: write the filter as partitions with a top-level index ("partitionedfilter.&lt;name&gt;").
     /// Only effective with <see cref="IndexType.TwoLevelIndexSearch"/> (sanitized away otherwise, like
