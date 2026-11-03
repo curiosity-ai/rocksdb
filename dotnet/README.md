@@ -1201,7 +1201,7 @@ Not ported yet (being implemented; tracked in [todo.md](todo.md)):
   checks, exactly as native RocksDB rejects its own.
 - Secondary caches (CompressedSecondaryCache, TieredCache), the persistent cache, `WriteBufferManager` and `SimCache`.
 - Remote compaction of compactions with blob files, and per-subcompaction remote jobs (such compactions run locally).
-- Query, block cache and I/O tracing (and replay); `ldb` / `sst_dump` equivalents.
+- `ldb` commands for TTL, timestamp, blob and transaction databases; `sst_dump` on PlainTable / CuckooTable files.
 - Not supported, as upstream: user-defined timestamps in optimistic transactions and explicit-timestamp
   `WriteBatchWithIndex` writes.
 
