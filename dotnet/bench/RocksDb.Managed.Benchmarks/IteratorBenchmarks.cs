@@ -20,6 +20,10 @@ public class IteratorBenchmarks
     private const int NumFiles = 4;
     private const int MemKeys = 20_000;
 
+    /// <summary>Value size: reverse steps used to copy every value (now pinned in its block), so 1 KiB shows the difference.</summary>
+    [Params(100, 1024)]
+    public int ValueSize { get; set; }
+
     private MemTable _mem = null!;
     private BenchTableCache _tableCache = null!;
     private Iterator _managed = null!;
@@ -39,7 +43,7 @@ public class IteratorBenchmarks
     public void Setup()
     {
         var rnd = new Random(7);
-        byte[] value = new byte[100];
+        byte[] value = new byte[ValueSize];
         InternalKeyComparator icmp = InternalKeyComparator.Bytewise;
 
         // ---- native: 4 flushed L0 files (key i goes to file i % 4) + one memtable of overwrites.
@@ -169,6 +173,55 @@ public class IteratorBenchmarks
         long n = 0;
         RocksDbSharp.Iterator it = _nativeIter;
         for (it.SeekToLast(); it.Valid(); it.Prev()) n += it.GetKeySpan().Length + it.GetValueSpan().Length;
+        return n;
+    }
+
+    [Benchmark(OperationsPerInvoke = NumKeys)]
+    public async Task<long> ManagedAsyncReverseScan()
+    {
+        long n = 0;
+        Iterator it = _managed;
+        await it.SeekToLastAsync();
+        while (it.Valid)
+        {
+            n += it.Key.Length + it.Value.Length;
+            await it.PrevAsync();
+        }
+        return n;
+    }
+
+    /// <summary>SeekForPrev + 100 x Prev (seekrandom --reverse_iterator), per seek.</summary>
+    [Benchmark]
+    public long ManagedSeekForPrevPrev100()
+    {
+        long n = 0;
+        Iterator it = _managed;
+        it.SeekForPrev(_seekKeys[_next++ & 1023]);
+        for (int i = 0; i < 100 && it.Valid; i++, it.Prev()) n += it.Value.Length;
+        return n;
+    }
+
+    [Benchmark]
+    public async Task<long> ManagedSeekForPrevPrev100Async()
+    {
+        long n = 0;
+        Iterator it = _managed;
+        await it.SeekForPrevAsync(_seekKeys[_next++ & 1023]);
+        for (int i = 0; i < 100 && it.Valid; i++)
+        {
+            n += it.Value.Length;
+            await it.PrevAsync();
+        }
+        return n;
+    }
+
+    [Benchmark]
+    public long NativeSeekForPrevPrev100()
+    {
+        long n = 0;
+        RocksDbSharp.Iterator it = _nativeIter;
+        it.SeekForPrev(_seekKeys[_next++ & 1023]);
+        for (int i = 0; i < 100 && it.Valid(); i++, it.Prev()) n += it.GetValueSpan().Length;
         return n;
     }
 

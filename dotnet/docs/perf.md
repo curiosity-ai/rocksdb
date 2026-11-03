@@ -811,6 +811,102 @@ reference and a branch on a readonly flag. Every case stays allocation-free.
 Allocated: `-` in every cell. The auto table (estimated_entry_charge = 0) performs like the fixed one once grown;
 growth itself (64 slots per shard, doubling) only happens while the cache fills.
 
+## Reverse iteration, range-deleted runs, compaction input readahead
+
+Four items of the "Read/write contention with 4 threads" follow-up list. Method as in that section (shared 4-vCPU VM,
+load 5-17): dbbench A/B with the before / after binaries interleaved per repetition (`nice -n -5`, warm-up
+`--warmup_ops 50000 --warmup_min_ms 300`, medians), BenchmarkDotNet `--job short` with `[MemoryDiagnoser]`.
+
+### 1. Reverse steps pin data blocks (PinnedIteratorsManager)
+
+DBIter::FindValueForCurrentKey walks a key's versions from old to new, so the value it returns lies behind the inner
+iterator's position; the port copied every value into a buffer. Upstream pins the blocks instead
+(`db/pinned_iterators_manager.h`, `TempPinData` / `ReleaseTempPinnedData`, `IsValuePinned`). Ported: while DbIter pins,
+`BlockBasedTableIterator` hands the block it leaves to the `PinnedIteratorsManager` instead of releasing it (one hand-off
+per data block crossed, not per key); `InternalIterator.TryGetPinnedValue` (IsValuePinned + value) returns the value as a
+`PinnedSlice` (block buffer range, or memtable arena memory, whose address is fixed) through the merging / level /
+table / memtable iterators; children that cannot pin fall back to the copy. Pins are released at the next positioning
+call; `ReadOptions.PinData` (pin_thru_lifetime) keeps them until the iterator is disposed. The forward path only gained
+one predictable branch in `ReleaseBlock` (on block changes) and in `Next`.
+
+### 2. Async reverse movement
+
+`DbIter.PrevAsync` / `SeekForPrevAsync` / `SeekToLastAsync` were synchronous. DBIter's reverse logic
+(ReverseToBackward, PrevInternal, FindValueForCurrentKey(+UsingSeek), FindUserKeyBeforeSavedKey) is now one resumable
+state machine (`ReverseStep` returns the next move of the inner iterator); the sync driver performs the moves directly,
+the async driver awaits them and completes synchronously when they do (the same pattern as the forward step functions),
+so both paths share all of the logic. The table, level and merging iterators got async SeekToLast / SeekForPrev / Prev
+(blocks and table opens awaited, cache hits synchronous) and the merging iterator's direction switches are async.
+
+| 1 thread, 200k x 1 KiB after compact, block cache 1 GiB (µs/op, median of 3) | before | after | after, async API |
+|---|---:|---:|---:|
+| readreverse | 0.70 | 0.45 | 0.48 (before: 0.75) |
+| seekrandom --reverse_iterator (SeekForPrev + 10 Prev) | 10.2 | 6.0 | 6.5 (before: 10.4) |
+| readseq (forward, unchanged path) | 1.25 | 1.21 | |
+
+The state machine itself costs nothing measurable (pinning-only build vs. pinning + state machine: readreverse
+0.474 / 0.453, seekrandom reverse 6.45 / 5.82). BenchmarkDotNet (`IteratorBenchmarks`, 1 memtable + 4 L0 files, per
+key; per SeekForPrev + 100 Prev):
+
+| ValueSize | ManagedReverseScan | ManagedAsyncReverseScan | NativeReverseScan | SeekForPrevPrev100 | ...Async | Native |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 194 ns | 185 ns | 515 ns | 26.3 µs | 28.5 µs | 66.0 µs |
+| 1024 | 361 ns | 375 ns | 903 ns | 57.4 µs | 48.6 µs | 108.4 µs |
+
+Allocated: `-` everywhere except 72 B per call of the `async Task<long>` SeekForPrev benchmark method (its own
+`Task<long>`; the per-key async scan shows `-`). New dbbench / native-c flag: `--reverse_iterator` (seekrandom with
+SeekForPrev + Prev, upstream db_bench's flag).
+
+### 3. Range-deleted runs: covered-range skipping
+
+The merging iterator only merged point keys and DbIter asked a `RangeDelAggregator` about every visible entry
+(pre-7.x scheme), so a scan over a deleted range visited every deleted key. Upstream feeds range tombstones into the
+merging iterator's heap and reseeks past covered ranges (`table/merging_iterator.cc`, SkipNextDeleted /
+SkipPrevDeleted, with LevelIterator sentinel keys at file boundaries). Benchmark first (`RangeDeletionBenchmarks`,
+200k keys compacted to the last level, 100 range tombstones deleting 99% of every 2000-key chunk flushed to L0, same DB
+shape in rocksdb-sharp): managed full scan 13.8 ms vs native 0.69 ms, reverse 24.4 vs 0.83 ms, Seek + 10 Next 59 vs
+4.8 µs, so a port was worth it.
+
+Implemented as the same reseek, driven from the aggregator rather than from heap entries: when DbIter drops a visible
+entry as covered, `RangeDelAggregator.ShouldDeleteWithSkipTarget` also returns the covering tombstone's seqno and reach
+(the fragment end / start, clamped so no user key at a truncated file boundary is crossed), and
+`InternalIterator.SkipCoveredForward` / `SkipCoveredBackward` move only the child that produced the entry, in one seek,
+and only where its file(s) hold nothing newer than the tombstone (`FileMetaData` smallest / largest seqno: an L0 table,
+or every file of a level up to the target). Everything skipped is therefore an entry the aggregator reports as covered,
+so the results are exactly those of the per-entry check (unlike upstream's level-order rule, this does not rely on the
+LSM ordering invariant). Disabled with user-defined timestamps, read callbacks and legacy prefix seek; memtables never
+skip.
+
+| `RangeDeletionBenchmarks` | before | after | native |
+|---|---:|---:|---:|
+| full scan (2000 live of 200k) | 13,753 µs | 159 µs | 658 µs |
+| reverse scan | 24,379 µs | 297 µs | 825 µs |
+| Seek + 10 Next (per seek) | 59.4 µs | 2.15 µs | 4.78 µs |
+
+Allocated `-`. Correctness: the randomized model tests now give their files seqno ranges (so skipping is active), the
+native compat iterator test has a wide-range-delete variant (tombstones over up to 150 keys, 5 phases over L0/L1/L3/L5,
+every snapshot, both directions, bounds), and `DeleteRangeSkipsCoveredKeysOfOlderFiles` proves the skip (with
+max_skippable_internal_keys = 50 over 2800 covered keys, which fails without it).
+
+### 4. Compaction input readahead with async prefetch
+
+Compaction read its inputs with one pread per data block. Upstream reads them through a FilePrefetchBuffer of
+compaction_readahead_size (2 MiB), with async_io prefetching the next chunk. Ported as `Env/AsyncPrefetchBuffer`
+(two buffers; a miss reads a chunk synchronously and starts the next with `ReadAsync`, so I/O of the next chunk overlaps
+the merge / output work; a block straddling two chunks is stitched through a reserved gap in front of the prefetch, no
+re-read). Compaction input table iterators (`CompactionJob.NoFillTableCache`) read uncached data blocks through it with
+`DbOptions.CompactionReadaheadSize` (0 disables it). New dbbench / native-c flags: `--compaction_readahead_size`,
+`--drop_page_cache` (fsync + POSIX_FADV_DONTNEED of the SSTs before `compact`).
+
+| `fillrandom,compact`, 300k x 1 KiB, inputs evicted from the page cache (same binary, A/B by flag, 4 reps) | wall | CPU |
+|---|---:|---:|
+| compaction_readahead_size 0 (one pread per block, as before) | 3.05 s | 1.59 s |
+| compaction_readahead_size 2 MiB | 1.05 s | 0.69 s |
+| c-native (2 MiB, 2 reps) | 2.27-2.50 s | |
+
+With the inputs in the page cache (the default dbbench run) the difference is within the noise of this machine
+(median CPU 0.32 vs 0.33 s, wall 0.75 s both): there the reads complete synchronously (RWF_NOWAIT) and are cheap.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
@@ -818,5 +914,9 @@ growth itself (64 slots per shard, doubling) only happens while the cache fills.
 - Batched MultiGet exists (perf pass #2) but does not prefetch filter cache lines or interleave the block reads of a batch.
 - Block cache charge does not include the `Block` object (~64 bytes).
 - Confirm the 4-thread `fillrandom` / `overwrite` / `readmissing` ratios vs C on a quiet machine (see "Read/write
-  contention with 4 threads"); reverse-iteration block pinning, async reverse movement, range tombstones in the
-  merging-iterator heap and pipelined writes are open.
+  contention with 4 threads"); pipelined writes are open. Done since: reverse-iteration block pinning, async reverse
+  movement, covered-range skipping and compaction input readahead (see "Reverse iteration, range-deleted runs,
+  compaction input readahead").
+- Merge operands in reverse iteration are still copied (upstream pins them too, `operand_pinned`); the direction switch
+  of `NextAsync` after reverse movement (ReverseToForward) is synchronous; index partitions are loaded synchronously by
+  the async table paths; user iterators do not use readahead (auto_readahead / ReadOptions.readahead_size).
