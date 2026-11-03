@@ -57,6 +57,12 @@ public sealed class MemTableOptions
     public SliceTransform? InsertWithHintPrefixExtractor { get; set; }
 
     /// <summary>
+    /// memtable_protection_bytes_per_key (0, 1, 2, 4 or 8): bytes of per key-value checksum stored after each entry and
+    /// verified on reads, iteration and flush.
+    /// </summary>
+    public uint ProtectionBytesPerKey { get; set; }
+
+    /// <summary>
     /// Port of the memtable_prefix_bloom_bits computation of ImmutableMemTableOptions (db/memtable.cc):
     /// static_cast&lt;uint32_t&gt;(write_buffer_size * memtable_prefix_bloom_size_ratio) * 8.
     /// </summary>
@@ -77,6 +83,12 @@ public sealed class MemTableOptions
         WholeKeyFiltering = options.MemtableWholeKeyFiltering;
         InplaceUpdateSupport = options.InplaceUpdateSupport;
         InplaceUpdateNumLocks = (int)Math.Clamp(options.InplaceUpdateNumLocks, 1UL, 1UL << 24);
+        // ColumnFamilyData::ValidateOptions (db/column_family.cc).
+        if (!KvChecksum.IsSupportedLength(options.MemtableProtectionBytesPerKey))
+            ThrowHelper.NotSupported("Memtable per key-value checksum protection only supports 0, 1, 2, 4 or 8 bytes per key.");
+        if (!KvChecksum.IsSupportedLength(options.BlockProtectionBytesPerKey))
+            ThrowHelper.NotSupported("Block per key-value checksum protection only supports 0, 1, 2, 4 or 8 bytes per key.");
+        ProtectionBytesPerKey = options.MemtableProtectionBytesPerKey;
         InplaceCallback = options.InplaceCallback;
         InsertWithHintPrefixExtractor = options.MemtableInsertWithHintPrefixExtractor;
     }

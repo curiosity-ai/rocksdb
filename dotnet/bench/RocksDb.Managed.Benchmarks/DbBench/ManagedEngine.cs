@@ -31,6 +31,7 @@ public sealed class ManagedEngine : IKeyValueEngine
             EnableBlobFiles = options.EnableBlobFiles,
             MinBlobSize = options.MinBlobSize,
         };
+        cfo.CompressionOpts.ParallelThreads = options.CompressionParallelThreads;
         cfo.TableOptions.BlockSize = (ulong)options.BlockSize;
         cfo.TableOptions.FormatVersion = 6;
         if (options.BlockCacheSize <= 0) cfo.TableOptions.NoBlockCache = true;

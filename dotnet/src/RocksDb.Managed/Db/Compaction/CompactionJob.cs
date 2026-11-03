@@ -1292,7 +1292,8 @@ internal sealed class CompactionJob
         if (_out.Partitioner is not null && ShouldPartition(internalKey)) return true;
         // files output to Level 0 won't be split
         if (_c.OutputLevel == 0) return false;
-        ulong currentOutputFileSize = _out.Builder.FileSize;
+        // EstimatedFileSize (CompactionOutputs::UpdateFileSize): includes data blocks still in the parallel compression ring.
+        ulong currentOutputFileSize = _out.Builder.EstimatedFileSize;
         // reach the max file size
         ulong estimatedFileSize = currentOutputFileSize;
         if (_targetFileSizeIsUpperBound) estimatedFileSize += _out.Builder.EstimatedTailSize();

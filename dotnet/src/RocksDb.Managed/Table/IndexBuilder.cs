@@ -20,6 +20,23 @@ internal abstract class IndexBuilder : IDisposable
     public abstract ReadOnlySpan<byte> AddIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
         BlockHandle handle, bool skipDeltaEncoding);
 
+    /// <summary>
+    /// Parallel compression alternative to <see cref="AddIndexEntry"/>, 1/2 (IndexBuilder::PrepareIndexEntry): computes
+    /// and records in <paramref name="entry"/> everything the index entry needs except the block handle, which is known
+    /// only once the (compressed) block is written. Called in data block order, interleaved with
+    /// <see cref="OnKeyAdded"/> exactly where <see cref="AddIndexEntry"/> would be called.
+    /// </summary>
+    public abstract void PrepareIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
+        PreparedIndexEntry entry);
+
+    /// <summary>
+    /// Parallel compression alternative to <see cref="AddIndexEntry"/>, 2/2 (IndexBuilder::FinishIndexEntry): adds the
+    /// prepared entry with its handle. Called for the prepared entries in the same order, possibly several blocks
+    /// later (on the same thread). The resulting index blocks are byte-identical to the ones
+    /// <see cref="AddIndexEntry"/> builds.
+    /// </summary>
+    public abstract void FinishIndexEntry(BlockHandle handle, PreparedIndexEntry entry, bool skipDeltaEncoding);
+
     /// <summary>NumUniformIndexBlocks: index blocks written with the "is_uniform" hint ("rocksdb.num.uniform.blocks").</summary>
     public abstract ulong NumUniformIndexBlocks { get; }
 
@@ -51,6 +68,27 @@ internal abstract class IndexBuilder : IDisposable
     public abstract bool Finish(BlockHandle lastPartitionHandle, out ReadOnlySpan<byte> contents);
 
     public abstract void Dispose();
+}
+
+/// <summary>
+/// Port of IndexBuilder::PreparedIndexEntry / ShortenedIndexBuilder::ShortenedPreparedIndexEntry: what
+/// <see cref="IndexBuilder.PrepareIndexEntry"/> hands to <see cref="IndexBuilder.FinishIndexEntry"/>. Reused across
+/// blocks (one per parallel compression ring slot).
+/// </summary>
+internal sealed class PreparedIndexEntry : IDisposable
+{
+    public readonly PooledBufferWriter Separator = new(64);
+    public readonly PooledBufferWriter FirstInternalKey = new(0);
+    public bool MustUseSeparatorWithSeq;
+    public bool HasNext;
+    /// <summary>Length of the block's last key (PartitionedIndexBuilder's flush policy estimates with it).</summary>
+    public int LastKeyLength;
+
+    public void Dispose()
+    {
+        Separator.Dispose();
+        FirstInternalKey.Dispose();
+    }
 }
 
 /// <summary>
@@ -139,42 +177,103 @@ internal sealed class ShortenedIndexBuilder : IndexBuilder
     public override ReadOnlySpan<byte> AddIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
         BlockHandle handle, bool skipDeltaEncoding)
     {
-        ReadOnlySpan<byte> separator;
+        _scratch.Clear();
+        ReadOnlySpan<byte> separator = GetSeparatorWithSeq(lastKeyInCurrentBlock, firstKeyInNextBlock, hasNext, _scratch, ref _mustUseSeparatorWithSeq);
+        AddIndexEntryImpl(separator, GetFirstInternalKey(), handle, _mustUseSeparatorWithSeq, skipDeltaEncoding);
+        _currentBlockFirstKey.Clear();
+        return separator;
+    }
+
+    /// <summary>Port of ShortenedIndexBuilder::PrepareIndexEntry: separator and first key are copied into the entry.</summary>
+    public override void PrepareIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
+        PreparedIndexEntry entry)
+    {
+        PrepareIndexEntry(lastKeyInCurrentBlock, firstKeyInNextBlock, hasNext, entry, ref _mustUseSeparatorWithSeq);
+        _currentBlockFirstKey.Clear();
+    }
+
+    /// <summary>
+    /// PrepareIndexEntry with an external must_use_separator_with_seq flag: <see cref="PartitionedIndexBuilder"/> prepares
+    /// entries for sub-index builders that may not exist yet (upstream prepares with entries_.front()).
+    /// </summary>
+    internal void PrepareIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
+        PreparedIndexEntry entry, ref bool mustUseSeparatorWithSeq)
+    {
+        PooledBufferWriter sep = entry.Separator;
+        sep.Clear();
+        ReadOnlySpan<byte> separator = GetSeparatorWithSeq(lastKeyInCurrentBlock, firstKeyInNextBlock, hasNext, sep, ref mustUseSeparatorWithSeq);
+        // The separator is left in the scratch buffer unless it is the last key itself.
+        if (sep.WrittenCount == 0 || !System.Runtime.CompilerServices.Unsafe.AreSame(
+                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(separator),
+                ref System.Runtime.InteropServices.MemoryMarshal.GetReference(sep.WrittenSpan)))
+        {
+            sep.Clear();
+            sep.Write(separator);
+        }
+        entry.FirstInternalKey.Clear();
+        entry.FirstInternalKey.Write(GetFirstInternalKey());
+        entry.MustUseSeparatorWithSeq = mustUseSeparatorWithSeq;
+        entry.HasNext = hasNext;
+        entry.LastKeyLength = lastKeyInCurrentBlock.Length;
+    }
+
+    /// <summary>Port of ShortenedIndexBuilder::FinishIndexEntry.</summary>
+    public override void FinishIndexEntry(BlockHandle handle, PreparedIndexEntry entry, bool skipDeltaEncoding)
+    {
+        if (entry.MustUseSeparatorWithSeq) _mustUseSeparatorWithSeq = true;
+        AddIndexEntryImpl(entry.Separator.WrittenSpan, entry.FirstInternalKey.WrittenSpan, handle, _mustUseSeparatorWithSeq, skipDeltaEncoding);
+    }
+
+    /// <summary>
+    /// Port of ShortenedIndexBuilder::GetSeparatorWithSeq. Shortened separators are written to <paramref name="scratch"/>
+    /// (cleared by the caller); otherwise the last key itself is returned and <paramref name="scratch"/> stays empty.
+    /// Sets <paramref name="mustUseSeparatorWithSeq"/> when adjacent blocks share a boundary user key.
+    /// </summary>
+    private ReadOnlySpan<byte> GetSeparatorWithSeq(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
+        PooledBufferWriter scratch, ref bool mustUseSeparatorWithSeq)
+    {
         if (hasNext)
         {
-            _scratch.Clear();
+            ReadOnlySpan<byte> separator;
             if (_shortening != IndexShorteningMode.NoShortening
-                && _icmp.FindShortestSeparator(lastKeyInCurrentBlock, firstKeyInNextBlock, _scratch))
-                separator = _scratch.WrittenSpan;
+                && _icmp.FindShortestSeparator(lastKeyInCurrentBlock, firstKeyInNextBlock, scratch))
+                separator = scratch.WrittenSpan;
             else
                 separator = lastKeyInCurrentBlock;
             // ShouldUseKeyPlusSeqAsSeparator: adjacent blocks share a boundary user key. Without persisted timestamps all
             // user keys act as if they had the minimum timestamp, so they must differ without their timestamps.
-            if (!_mustUseSeparatorWithSeq && SameBoundaryUserKey(DbFormat.ExtractUserKey(lastKeyInCurrentBlock), DbFormat.ExtractUserKey(firstKeyInNextBlock)))
-                _mustUseSeparatorWithSeq = true;
+            if (!mustUseSeparatorWithSeq && SameBoundaryUserKey(DbFormat.ExtractUserKey(lastKeyInCurrentBlock), DbFormat.ExtractUserKey(firstKeyInNextBlock)))
+                mustUseSeparatorWithSeq = true;
+            return separator;
         }
-        else
-        {
-            // Last entry: a short successor shares ~no prefix with the file's keys and would collapse the common-prefix
-            // index block's prefix, so with common-prefix encoding the full last key is used (GetSeparatorWithSeq).
-            _scratch.Clear();
-            if (_shortening == IndexShorteningMode.ShortenSeparatorsAndSuccessor && !_useCommonPrefix
-                && _icmp.FindShortSuccessor(lastKeyInCurrentBlock, _scratch))
-                separator = _scratch.WrittenSpan;
-            else
-                separator = lastKeyInCurrentBlock;
-        }
+        // Last entry: a short successor shares ~no prefix with the file's keys and would collapse the common-prefix
+        // index block's prefix, so with common-prefix encoding the full last key is used (GetSeparatorWithSeq).
+        if (_shortening == IndexShorteningMode.ShortenSeparatorsAndSuccessor && !_useCommonPrefix
+            && _icmp.FindShortSuccessor(lastKeyInCurrentBlock, scratch))
+            return scratch.WrittenSpan;
+        return lastKeyInCurrentBlock;
+    }
 
-        ReadOnlySpan<byte> firstKey = _includeFirstKey ? _currentBlockFirstKey.WrittenSpan : default;
-        if (_includeFirstKey && _stripTsSize != 0 && firstKey.Length >= _stripTsSize + DbFormat.InternalKeyFooterSize)
+    /// <summary>Port of GetFirstInternalKey: the current block's first key (timestamp stripped when not persisted), or empty.</summary>
+    private ReadOnlySpan<byte> GetFirstInternalKey()
+    {
+        if (!_includeFirstKey) return default;
+        ReadOnlySpan<byte> firstKey = _currentBlockFirstKey.WrittenSpan;
+        if (_stripTsSize != 0 && firstKey.Length >= _stripTsSize + DbFormat.InternalKeyFooterSize)
         {
-            // GetFirstInternalKey: the first internal key inside IndexValue is stripped here (block builders only strip
-            // the entry keys).
+            // The first internal key inside IndexValue is stripped here (block builders only strip the entry keys).
             _firstKeyStripped.Clear();
             _firstKeyStripped.Write(firstKey[..^(DbFormat.InternalKeyFooterSize + _stripTsSize)]);
             _firstKeyStripped.Write(firstKey[^DbFormat.InternalKeyFooterSize..]);
             firstKey = _firstKeyStripped.WrittenSpan;
         }
+        return firstKey;
+    }
+
+    /// <summary>Port of ShortenedIndexBuilder::AddIndexEntryImpl.</summary>
+    private void AddIndexEntryImpl(ReadOnlySpan<byte> separator, ReadOnlySpan<byte> firstKey, BlockHandle handle, bool mustUseSeparatorWithSeq,
+        bool skipDeltaEncoding)
+    {
         _encoded.Clear();
         IndexValue.EncodeFull(_encoded, handle, _includeFirstKey, firstKey);
         _deltaEncoded.Clear();
@@ -188,10 +287,8 @@ internal sealed class ShortenedIndexBuilder : IndexBuilder
         _hasLastHandle = true;
 
         _withSeq.Add(separator, _encoded.WrittenSpan, _deltaEncoded.WrittenSpan, forceFullKey);
-        if (!_mustUseSeparatorWithSeq)
+        if (!mustUseSeparatorWithSeq)
             _withoutSeq.Add(DbFormat.ExtractUserKey(separator), _encoded.WrittenSpan, _deltaEncoded.WrittenSpan, forceFullKey);
-        _currentBlockFirstKey.Clear();
-        return separator;
     }
 
     private bool SameBoundaryUserKey(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) =>
@@ -264,6 +361,7 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
     private ShortenedIndexBuilder? _subIndexBuilder;
     private BlockBuilder _flushMonitor = null!;
     private bool _mustUseSeparatorWithSeq;
+    private bool _prepareMustUseSeparatorWithSeq;
     private bool _partitionCutRequested;
     private bool _cutFilterBlock;
     private bool _finishingIndexes;
@@ -380,10 +478,10 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
         return after > _metadataBlockSize && currSize > _blockSizeDeviationLimit;
     }
 
-    private void MaybeFlush(ReadOnlySpan<byte> indexKey, BlockHandle indexValue)
+    private void MaybeFlush(int indexKeyLength, BlockHandle indexValue)
     {
         bool doFlush = !_subIndexBuilder!.WithSeqBuilder.IsEmpty
-            && (_partitionCutRequested || FlushPolicyUpdate(indexKey.Length, EncodedLength(indexValue)));
+            && (_partitionCutRequested || FlushPolicyUpdate(indexKeyLength, EncodedLength(indexValue)));
         if (doFlush)
         {
             _cutFilterBlock = true;
@@ -395,13 +493,44 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
 
     public override void OnKeyAdded(ReadOnlySpan<byte> internalKey) => _subIndexBuilder!.OnKeyAdded(internalKey);
 
+    /// <summary>
+    /// Port of PartitionedIndexBuilder::PrepareIndexEntry: any sub-index builder can prepare an entry finished at
+    /// another; <see cref="_prepareMustUseSeparatorWithSeq"/> tracks must_use_separator_with_seq along the pipeline
+    /// (upstream: the first sub builder's flag).
+    /// </summary>
+    public override void PrepareIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
+        PreparedIndexEntry entry)
+        => _subIndexBuilder!.PrepareIndexEntry(lastKeyInCurrentBlock, firstKeyInNextBlock, hasNext, entry, ref _prepareMustUseSeparatorWithSeq);
+
+    /// <summary>
+    /// Port of PartitionedIndexBuilder::FinishIndexEntry. Deviation: replays exactly what <see cref="AddIndexEntry"/>
+    /// does (no partition cut before the last entry, partition cut signal at the end) so that parallel compression
+    /// produces the same partitions as the serial path; upstream's FinishIndexEntry may cut before the last entry.
+    /// </summary>
+    public override void FinishIndexEntry(BlockHandle handle, PreparedIndexEntry entry, bool skipDeltaEncoding)
+    {
+        if (entry.HasNext) MaybeFlush(entry.LastKeyLength, handle);
+        ShortenedIndexBuilder sub = _subIndexBuilder!;
+        sub.FinishIndexEntry(handle, entry, skipDeltaEncoding);
+        PooledBufferWriter key = _entries[^1].Key;
+        key.Clear();
+        key.Write(entry.Separator.WrittenSpan);
+        if (!_mustUseSeparatorWithSeq && sub.MustUseSeparatorWithSeq)
+        {
+            // We need to apply !must_use_separator_with_seq to all sub-index builders
+            _mustUseSeparatorWithSeq = true;
+            _flushMonitor = sub.WithSeqBuilder;
+        }
+        if (!entry.HasNext) _cutFilterBlock = true;
+    }
+
     /// <summary>Port of PartitionedIndexBuilder::AddIndexEntry.</summary>
     public override ReadOnlySpan<byte> AddIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
         BlockHandle handle, bool skipDeltaEncoding)
     {
         // At least when running without parallel compression, maintain behavior of avoiding a last index partition
         // with just one entry
-        if (hasNext) MaybeFlush(lastKeyInCurrentBlock, handle);
+        if (hasNext) MaybeFlush(lastKeyInCurrentBlock.Length, handle);
 
         ShortenedIndexBuilder sub = _subIndexBuilder!;
         ReadOnlySpan<byte> sep = sub.AddIndexEntry(lastKeyInCurrentBlock, firstKeyInNextBlock, hasNext, handle, skipDeltaEncoding);
@@ -547,6 +676,16 @@ internal sealed class HashIndexBuilder : IndexBuilder
         ++_currentRestartIndex;
         return _primary.AddIndexEntry(lastKeyInCurrentBlock, firstKeyInNextBlock, hasNext, handle, skipDeltaEncoding);
     }
+
+    public override void PrepareIndexEntry(ReadOnlySpan<byte> lastKeyInCurrentBlock, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext,
+        PreparedIndexEntry entry)
+    {
+        ++_currentRestartIndex;
+        _primary.PrepareIndexEntry(lastKeyInCurrentBlock, firstKeyInNextBlock, hasNext, entry);
+    }
+
+    public override void FinishIndexEntry(BlockHandle handle, PreparedIndexEntry entry, bool skipDeltaEncoding)
+        => _primary.FinishIndexEntry(handle, entry, skipDeltaEncoding);
 
     public override void OnKeyAdded(ReadOnlySpan<byte> internalKey)
     {

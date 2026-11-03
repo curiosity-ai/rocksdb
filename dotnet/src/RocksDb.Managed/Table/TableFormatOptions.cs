@@ -156,4 +156,10 @@ public sealed record TableBuilderOptions
     public int NumLevels { get; init; } = -1;
     /// <summary>TableBuilderOptions::last_level_inclusive_max_seqno_threshold (kMaxSequenceNumber: tiering disabled).</summary>
     public ulong LastLevelInclusiveMaxSeqnoThreshold { get; init; } = Db.DbFormat.MaxSequenceNumber;
+
+    /// <summary>
+    /// Test hook: a fixed non-zero base context checksum (format_version &gt;= 6) instead of a random one, so two builds of
+    /// the same input produce identical bytes. 0 (default): random, like upstream.
+    /// </summary>
+    internal uint TestBaseContextChecksum { get; init; }
 }

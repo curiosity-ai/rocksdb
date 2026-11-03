@@ -14,7 +14,8 @@ namespace RocksDb.Managed.Table;
 
 /// <summary>
 /// Builds a block-based table (SST file). Port of BlockBasedTableBuilder (table/block_based/block_based_table_builder.cc):
-/// the single-threaded emit path (no parallel compression) with dictionary compression (buffered state), all index
+/// the emit path, optionally with parallel data block compression (CompressionOptions.parallel_threads &gt; 1, see
+/// BlockBasedTableBuilder.Parallel.cs), dictionary compression (buffered state), all index
 /// types (binary search, with first key, partitioned, kHashSearch), full and partitioned filters, separated key/value
 /// data blocks, the index "is_uniform" hint, block_align and super block alignment, plus user table properties
 /// collectors (<see cref="TablePropertiesCollector"/>).
@@ -29,7 +30,7 @@ namespace RocksDb.Managed.Table;
 /// The file is not closed by the builder.
 /// </para>
 /// </summary>
-public sealed class BlockBasedTableBuilder : IDisposable
+public sealed partial class BlockBasedTableBuilder : IDisposable
 {
     /// <summary>Staged output is handed to the file once it exceeds this many bytes.</summary>
     private const int OutputFlushThreshold = 256 * 1024;
@@ -216,10 +217,11 @@ public sealed class BlockBasedTableBuilder : IDisposable
         if (BlockBasedTableConstants.FormatVersionUsesContextChecksum(options.FormatVersion))
         {
             // Must be non-zero and semi-random.
-            uint v;
-            do { v = (uint)RandomNumberGenerator.GetInt32(int.MinValue, int.MaxValue); } while (v == 0);
+            uint v = tableBuilderOptions.TestBaseContextChecksum;
+            while (v == 0) v = (uint)RandomNumberGenerator.GetInt32(int.MinValue, int.MaxValue);
             _baseContextChecksum = v;
         }
+        MaybeStartParallelCompression();
     }
 
     /// <summary>
@@ -391,7 +393,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
         // blocks replayed from the dictionary buffer (EmitBlock), so with dictionary compression "rocksdb.num.data.blocks"
         // only counts blocks written after the buffer was flushed; matched for identical properties.
         _props.NumDataBlocks++;
-        EmitBlock(raw, _lastKey.WrittenSpan, firstKeyInNextBlock, hasNext);
+        if (_pc is not null) EmitBlockForParallel(raw, _lastKey.WrittenSpan, firstKeyInNextBlock, hasNext);
+        else EmitBlock(raw, _lastKey.WrittenSpan, firstKeyInNextBlock, hasNext);
         _dataBlock.Reset();
     }
 
@@ -489,7 +492,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
                 nextFirstKey.Write(firstKeyInNextBlock);
                 blockHasNext = hasNext;
             }
-            EmitBlock(data, lastKey.WrittenSpan, nextFirstKey.WrittenSpan, blockHasNext);
+            if (_pc is not null) EmitBlockForParallel(data, lastKey.WrittenSpan, nextFirstKey.WrittenSpan, blockHasNext);
+            else EmitBlock(data, lastKey.WrittenSpan, nextFirstKey.WrittenSpan, blockHasNext);
         }
         _dataBlockBuffers.Clear();
         _dataBeginOffset = 0;
@@ -523,23 +527,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private BlockHandle WriteBlock(ReadOnlySpan<byte> raw, bool isDataBlock, out bool skipDeltaEncoding)
     {
-        CompressionType type = CompressionType.None;
-        bool compress = _tbo.CompressionType != CompressionType.None && (isDataBlock || _options.EnableIndexCompression) && raw.Length < CompressionSizeLimit;
-        if (compress)
-        {
-            _compressed.Clear();
-            long maxCompressed = ((long)_maxCompressedBytesPerKb * raw.Length) >> 10;
-            if (BlockCompression.TryCompress(_tbo.CompressionType, raw, _options.FormatVersion, _compressionLevel, _maxCompressedBytesPerKb, _compressed,
-                    isDataBlock ? _dict : null)
-                && _compressed.WrittenCount <= maxCompressed)
-            {
-                type = _tbo.CompressionType;
-            }
-            else if (isDataBlock)
-            {
-                _props.NumDataBlocksCompressionRejected++;
-            }
-        }
+        CompressionType type = CompressBlock(raw, isDataBlock, _compressed, out bool rejected);
+        if (rejected) _props.NumDataBlocksCompressionRejected++;
         BlockHandle h = type == CompressionType.None
             ? WriteMaybeCompressedBlock(raw, type, isDataBlock, out skipDeltaEncoding)
             : WriteMaybeCompressedBlock(_compressed.WrittenSpan, type, isDataBlock, out skipDeltaEncoding);
@@ -549,6 +538,31 @@ public sealed class BlockBasedTableBuilder : IDisposable
             _props.UncompressedDataSize += (ulong)raw.Length;
         }
         return h;
+    }
+
+    /// <summary>
+    /// Port of CompressAndVerifyBlock (compression via the facade, with the ratio check). Returns the block's type:
+    /// <see cref="CompressionType.None"/> (store <paramref name="raw"/>) or the configured type (store
+    /// <paramref name="compressed"/>, which is cleared first). <paramref name="rejected"/>: a data block whose compression
+    /// was attempted but rejected ("rocksdb.num.data.blocks.compression.rejected"). Thread-safe for distinct outputs
+    /// (parallel compression workers call it concurrently): reads only immutable builder state and the dictionary.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private CompressionType CompressBlock(ReadOnlySpan<byte> raw, bool isDataBlock, PooledBufferWriter compressed, out bool rejected)
+    {
+        rejected = false;
+        bool compress = _tbo.CompressionType != CompressionType.None && (isDataBlock || _options.EnableIndexCompression) && raw.Length < CompressionSizeLimit;
+        if (!compress) return CompressionType.None;
+        compressed.Clear();
+        long maxCompressed = ((long)_maxCompressedBytesPerKb * raw.Length) >> 10;
+        if (BlockCompression.TryCompress(_tbo.CompressionType, raw, _options.FormatVersion, _compressionLevel, _maxCompressedBytesPerKb, compressed,
+                isDataBlock ? _dict : null)
+            && compressed.WrittenCount <= maxCompressed)
+        {
+            return _tbo.CompressionType;
+        }
+        rejected = isDataBlock;
+        return CompressionType.None;
     }
 
     /// <summary>WriteMaybeCompressedBlockImpl for meta blocks (no alignment).</summary>
@@ -562,6 +576,18 @@ public sealed class BlockBasedTableBuilder : IDisposable
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private BlockHandle WriteMaybeCompressedBlock(ReadOnlySpan<byte> contents, CompressionType type, bool isDataBlock, out bool skipDeltaEncoding)
+        => WriteMaybeCompressedBlock(contents, type, isDataBlock, out skipDeltaEncoding, hasRawChecksum: false, rawChecksum: 0);
+
+    /// <param name="contents">Block payload.</param>
+    /// <param name="type">Compression type byte of the trailer.</param>
+    /// <param name="isDataBlock">Data blocks may be aligned / padded.</param>
+    /// <param name="skipDeltaEncoding">Set when super block alignment padding precedes the block.</param>
+    /// <param name="hasRawChecksum">Whether <paramref name="rawChecksum"/> holds the precomputed checksum of
+    /// <paramref name="contents"/> + type byte without the context modifier (computed by a parallel compression worker).</param>
+    /// <param name="rawChecksum">See <paramref name="hasRawChecksum"/>.</param>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private BlockHandle WriteMaybeCompressedBlock(ReadOnlySpan<byte> contents, CompressionType type, bool isDataBlock, out bool skipDeltaEncoding,
+        bool hasRawChecksum, uint rawChecksum)
     {
         skipDeltaEncoding = false;
         // try to align the data block page to the super alignment size, if enabled
@@ -587,7 +613,9 @@ public sealed class BlockBasedTableBuilder : IDisposable
         _out.Write(contents);
         Span<byte> trailer = _out.GetSpan(BlockBasedTableConstants.BlockTrailerSize);
         trailer[0] = (byte)type;
-        uint checksum = BlockChecksum.ComputeTrailerChecksum(_options.Checksum, _baseContextChecksum, contents, (byte)type, _offset);
+        uint checksum = hasRawChecksum
+            ? rawChecksum + BlockChecksum.ChecksumModifierForContext(_baseContextChecksum, _offset)
+            : BlockChecksum.ComputeTrailerChecksum(_options.Checksum, _baseContextChecksum, contents, (byte)type, _offset);
         Coding.EncodeFixed32(trailer[1..], checksum);
         _out.Advance(BlockBasedTableConstants.BlockTrailerSize);
         _offset += (ulong)contents.Length + BlockBasedTableConstants.BlockTrailerSize;
@@ -646,6 +674,8 @@ public sealed class BlockBasedTableBuilder : IDisposable
         if (_closed) throw new InvalidOperationException("Table builder already finished.");
         Flush(default, hasNext: false);
         if (_buffered) MaybeEnterUnbuffered(default, hasNext: false);
+        // StopParallelCompression: every data block is written (and indexed) before the meta blocks.
+        if (_pc is not null) StopParallelCompression(abort: false);
         _closed = true;
         _props.TailStartOffset = _offset;
 
@@ -876,12 +906,14 @@ public sealed class BlockBasedTableBuilder : IDisposable
     /// <summary>Stops building without writing the tail (the partially written file should be deleted by the caller).</summary>
     public void Abandon()
     {
+        if (_pc is not null) StopParallelCompression(abort: true);
         _closed = true;
         _out.Clear();
     }
 
     public void Dispose()
     {
+        if (_pc is not null) StopParallelCompression(abort: true);
         _closed = true;
         _dataBlock.Dispose();
         _rangeDelBlock.Dispose();

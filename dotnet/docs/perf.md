@@ -379,7 +379,7 @@ Remaining gaps:
   warm up first, see "Benchmark warm-up".)
 - LZ4 flushes: K4os LZ4's compressor is JIT compiled (82 ms of JIT for `LZ4_compress_generic` instantiations / OSR
   variants) and runs as tier-0 code during the first flush; fillrandom 300k + flush with LZ4 is 720 - 845 ms vs
-  290 - 343 ms native. Not addressed (third-party code; a warm-up or an in-house LZ4 encoder would be needed).
+  290 - 343 ms native. Addressed later by the managed LZ4 encoder (see "LZ4 encoder and parallel compression").
 - Compaction picking under sustained writes: managed lets L5 grow to 9 - 10 files before L5 -> L6 compactions while
   native 11.12 keeps it at 4 - 6, so managed L0 -> L5 compactions read ~1.4x more L5 data (write-amp 3.05 - 3.33 vs
   2.96) and more work is left at the end of the writes (`waitforcompaction` 0.3 - 1.7 s vs 0.02 - 0.25 s). Fixed
@@ -810,6 +810,49 @@ reference and a branch on a readonly flag. Every case stays allocation-free.
 
 Allocated: `-` in every cell. The auto table (estimated_entry_charge = 0) performs like the fixed one once grown;
 growth itself (64 slots per shard, doubling) only happens while the cache fills.
+
+## LZ4 encoder and parallel compression
+
+**LZ4 encoder.** K4os' `LZ4Codec.Encode` (1.3.8) allocates and zeroes a 16 KiB `LZ4_stream_t` in unmanaged memory per
+call and its generic engine is 2.2 - 3x slower than native liblz4 on data blocks. Options measured (BenchmarkDotNet,
+db_bench-like blocks: 16-byte keys + 100-byte values with compression ratio 0.5, warm, 64 rotating blocks):
+
+| Block | K4os Encode | K4os + cached state (`LL64.LZ4_compress_fast_extState` via reflection) | managed `Lz4BlockEncoder` | native `LZ4_compress_fast` (librocksdb) |
+|---|---|---|---|---|
+| 1 KiB | 2.87 us | 1.97 us (0.69x) | 1.35 us (0.47x) | 0.97 us (0.34x) |
+| 4 KiB | 7.99 us | 7.20 us (0.90x) | 4.71 us (0.59x) | 3.43 us (0.43x) |
+| 16 KiB | 28.2 us | 29.1 us (1.03x) | 19.5 us (0.69x) | 14.4 us (0.51x) |
+
+Reusing K4os' state only removes the per-call allocation (worth it for 1 KiB only) and needs reflection into its
+internals, so it was not kept. `Compression/Lz4BlockEncoder.cs` ports liblz4's LZ4_compress_generic for the byU16
+table (inputs below 64 KiB + 11, acceleration 1, limited output, per-thread hash table cleared per call like
+LZ4_initStream): its output is byte-identical to native liblz4 (compat test `Lz4EncoderCompatTests`, random inputs of
+every size class and limited capacities), it is 1.4 - 1.7x faster than K4os and within 1.35 - 1.4x of native. LZ4HC,
+inputs of 64 KiB and more, big-endian hosts and decompression stay on K4os.
+
+**Cold start.** A fresh process compressing 64 then 12 800 4 KiB blocks (tiered compilation, the first flushes of a
+process): K4os 14 - 16 ms + 400 - 430 ms; managed encoder (tier 0 / OSR) 5.3 - 5.9 ms + 213 - 248 ms; managed encoder
+with `[MethodImpl(AggressiveOptimization)]` on the loop (kept) 3.2 ms + 83 ms (~4.7x less than K4os; steady state is
+60 ms with `DOTNET_TieredCompilation=0`). Guidance for applications that flush right after start: ReadyToRun
+(`<PublishReadyToRun>`) precompiles the port and K4os (decompression); `DOTNET_TieredPGO=0` alone does not help
+(K4os 14 ms + 333 ms), `DOTNET_TieredCompilation=0` removes the warm-up at the cost of slower startup elsewhere.
+
+**Table build A/B** (`TableBuildBenchmarks`: 200k entries, 4 KiB blocks, fv6, bloom; one SST in memory; ShortRun,
+one process, LZ4 rows measured with the machine quiet, the ZSTD rows while other agents' builds started (load 15),
+so treat them as indicative):
+
+| | parallel_threads 1 | 2 | 4 |
+|---|---|---|---|
+| LZ4, K4os encoder | 67.5 ms | 68.0 ms | 69.0 ms |
+| LZ4, managed encoder | 52.8 ms (0.78x) | 39.8 ms (0.59x) | 65.2 ms (noisy, median 59 ms) |
+| ZSTD | 191 ms | 196 ms | 151 ms (median 130 ms, 0.68x) |
+
+Earlier interleaved run of parallel compression alone (K4os encoder, load ~9 on 4 vCPU): LZ4 130 / 128 / 115 ms,
+ZSTD 295 / 279 / 234 ms for 1 / 2 / 4 threads. Parallel compression helps ZSTD most (compression dominates the emit
+work); with the faster LZ4 encoder the emit thread (block building, index/filter, checksums) is the bottleneck, so 2
+threads already take most of the gain. With fewer free cores than threads the workers only add scheduling cost
+(the emit thread then compresses the blocks itself when it needs a slot, so throughput never drops below serial by
+much). Output is byte-identical in every configuration.
 
 ## Gaps / follow-ups
 

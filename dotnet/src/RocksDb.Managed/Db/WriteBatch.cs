@@ -27,7 +27,7 @@ namespace RocksDb.Managed.Db;
 /// objects on top.
 /// </para>
 /// </summary>
-public sealed class WriteBatch : IDisposable
+public sealed partial class WriteBatch : IDisposable
 {
     /// <summary>WriteBatchInternal::kHeader: 8-byte sequence number followed by a 4-byte count.</summary>
     public const int HeaderSize = 12;
@@ -121,6 +121,7 @@ public sealed class WriteBatch : IDisposable
         {
             _pooled = false;
             Clear();
+            DropProtection(); // a rented batch starts unprotected
             WriteBatch?[] pool = s_pool;
             for (int i = 0; i < pool.Length; i++)
             {
@@ -217,6 +218,7 @@ public sealed class WriteBatch : IDisposable
         _contentFlags = ContentFlags.None;
         _savePointCount = 0;
         _walTermPoint = default;
+        ResetProtection();
         HasKeyWithTimestamp = false;
         IsLatestPersistentState = false;
         _cfTimestampSizes?.Clear();
@@ -286,6 +288,7 @@ public sealed class WriteBatch : IDisposable
         _rep.Write(rep);
         _contentFlags = ContentFlags.Deferred;
         _savePointCount = 0;
+        DropProtection(); // the new records carry no protection info (upstream asserts prot_info_ == nullptr)
         // Upstream's SetContents is internal and keeps wal_term_point_; a public rep replacement must not keep a point
         // beyond (or inside) the new contents.
         _walTermPoint = default;
@@ -487,16 +490,22 @@ public sealed class WriteBatch : IDisposable
         Span<byte> rep = _rep.WrittenSpanMutable;
         ref byte origin = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(rep);
         var reader = new WriteBatchReader(rep);
+        int protIdx = 0;
         while (reader.TryReadNext(out WriteBatchEntry e))
         {
             bool hasKey = e.Type is EntryType.Value or EntryType.Deletion or EntryType.SingleDeletion or EntryType.Merge
                 or EntryType.RangeDeletion or EntryType.WideColumnEntity or EntryType.BlobIndex or EntryType.ValuePreferredSeqno;
             if (!hasKey) continue;
+            int idx = protIdx++;
             int tsSize = timestampSizeOf(e.ColumnFamilyId);
             if (tsSize == 0) continue;
             if (tsSize != timestamp.Length) ThrowHelper.InvalidArgument("timestamp size mismatch");
+            // TimestampUpdater: the protection info follows the key (and range deletion end key) update (UpdateK / UpdateV).
+            bool prot = _protInfo is not null && idx < _protCount;
+            if (prot) _protInfo![idx] = KvChecksum.UpdateK(_protInfo[idx], e.Key, e.Type == EntryType.RangeDeletion ? e.Value : default);
             OverwriteTimestamp(rep, ref origin, e.Key, timestamp);
             if (e.Type == EntryType.RangeDeletion) OverwriteTimestamp(rep, ref origin, e.Value, timestamp);
+            if (prot) _protInfo![idx] = KvChecksum.UpdateK(_protInfo[idx], e.Key, e.Type == EntryType.RangeDeletion ? e.Value : default);
         }
     }
 
@@ -705,6 +714,7 @@ public sealed class WriteBatch : IDisposable
             srcFlags = src._contentFlags;
         }
         dst.SetCount((uint)dst.Count + srcCount);
+        if ((dst._protInfo ?? src._protInfo) is not null) dst.AppendProtection(src, (int)srcCount);
         dst._rep.Write(src._rep.WrittenSpan.Slice(HeaderSize, srcLen));
         dst._contentFlags |= srcFlags;
     }
@@ -786,6 +796,7 @@ public sealed class WriteBatch : IDisposable
         _contentFlags |= flag;
         // LocalSavePoint::commit
         if (_maxBytes != 0 && _rep.WrittenCount > _maxBytes) RollbackAndThrowMemoryLimit(save);
+        if (counted && _protInfo is not null) ProtectRecord(_rep.WrittenCount - length);
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -830,6 +841,7 @@ public sealed class WriteBatch : IDisposable
             _rep.Truncate(sp.Size);
             SetCount(sp.Count);
             _contentFlags = sp.Flags;
+            TruncateProtection(sp.Count);
         }
         return true;
     }

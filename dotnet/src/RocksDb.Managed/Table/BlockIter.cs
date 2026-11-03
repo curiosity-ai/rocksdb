@@ -89,6 +89,9 @@ public sealed class BlockIter : IDisposable
     private bool _slowParse;
     // Restart keys need rewriting before comparisons (global seqno or timestamp padding).
     private bool _restartKeyFixup;
+    // block_protection_bytes_per_key of the block (0: no per key-value verification) and the block itself.
+    private int _kvProtectionBytes;
+    private Block? _block;
 
     /// <summary>Iterator for a data or range-deletion block (internal keys ordered by <paramref name="comparator"/>).</summary>
     public void InitializeData(Block block, InternalKeyComparator comparator, ulong globalSeqno)
@@ -169,6 +172,8 @@ public sealed class BlockIter : IDisposable
     private void Reset(Block block, BlockIterKind kind, InternalKeyComparator icmp)
     {
         _kind = kind;
+        _block = block;
+        _kvProtectionBytes = block.KvProtectionBytes;
         _data = block.Buffer;
         _keysEnd = block.KeysEndOffset;
         _valuesSection = block.ValuesSectionOffset;
@@ -197,6 +202,8 @@ public sealed class BlockIter : IDisposable
     /// <summary>Detaches from the current block (does not release it).</summary>
     public void Clear()
     {
+        _block = null;
+        _kvProtectionBytes = 0;
         _data = [];
         _restarts = 0;
         _keysEnd = 0;
@@ -245,6 +252,7 @@ public sealed class BlockIter : IDisposable
         if (_numRestarts == 0) { Invalidate(); return; }
         SeekToRestartPoint(0);
         ParseNextKey();
+        if (_kvProtectionBytes != 0) VerifyKvChecksum();
     }
 
     public void SeekToLast()
@@ -255,6 +263,7 @@ public sealed class BlockIter : IDisposable
         {
             // Keep skipping
         }
+        if (_kvProtectionBytes != 0) VerifyKvChecksum();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -262,6 +271,7 @@ public sealed class BlockIter : IDisposable
     {
         System.Diagnostics.Debug.Assert(Valid);
         ParseNextKey();
+        if (_kvProtectionBytes != 0) VerifyKvChecksum();
     }
 
     /// <summary>
@@ -270,6 +280,12 @@ public sealed class BlockIter : IDisposable
     /// calls decodes each restart interval once instead of once per entry.
     /// </summary>
     public void Prev()
+    {
+        PrevImpl();
+        if (_kvProtectionBytes != 0) VerifyKvChecksum();
+    }
+
+    private void PrevImpl()
     {
         System.Diagnostics.Debug.Assert(Valid);
         // The prev cache holds exposed keys; with timestamp padding the delta base differs, so it is not used.
@@ -379,6 +395,7 @@ public sealed class BlockIter : IDisposable
         if (_kind == BlockIterKind.Index && !_keysAreInternal) target = DbFormat.ExtractUserKey(target);
         if (!BinarySeekRestartPointIndex(target, out int index, out bool skipLinearScan)) { Invalidate(); return; }
         FindKeyAfterBinarySeek(target, index, skipLinearScan);
+        if (_kvProtectionBytes != 0) VerifyKvChecksum();
     }
 
     /// <summary>
@@ -441,6 +458,7 @@ public sealed class BlockIter : IDisposable
         }
         // restart interval must be one when hash search is enabled so the binary search simply lands at the right place.
         FindKeyAfterBinarySeek(seekKey, index, skipLinearScan: true);
+        if (_kvProtectionBytes != 0) VerifyKvChecksum();
     }
 
     /// <summary>Port of IndexBlockIter::CompareBlockKey: compares the key of restart entry <paramref name="blockIndex"/> with the target.</summary>
@@ -464,6 +482,7 @@ public sealed class BlockIter : IDisposable
         {
             while (Valid && CompareKey(Key, target) > 0) Prev();
         }
+        if (_kvProtectionBytes != 0) VerifyKvChecksum();
     }
 
     /// <summary>
@@ -503,6 +522,7 @@ public sealed class BlockIter : IDisposable
             cur = _current;
         }
         if (_current == _keysEnd) return true;
+        if (_kvProtectionBytes != 0) VerifyKvChecksum();
         if (!UserKeyEquals(DbFormat.ExtractUserKey(Key), targetUserKey)) return false;
         EntryType t = (EntryType)(byte)DbFormat.ExtractFooter(Key);
         if (t != EntryType.Value && t != EntryType.Deletion && t != EntryType.Merge && t != EntryType.SingleDeletion
@@ -511,6 +531,64 @@ public sealed class BlockIter : IDisposable
             Seek(target);
         }
         return true;
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Per key-value checksum (block_protection_bytes_per_key)
+
+    /// <summary>
+    /// Port of BlockIter::UpdateKey's verification: the current entry's ProtectKV(key, value) must match the block's
+    /// checksum of the entry; otherwise Corruption (upstream: invalid iterator with a Corruption status).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void VerifyKvChecksum()
+    {
+        if (!Valid) return;
+        BlockKvProtection p = _block!.KvProtection ?? _block.PublishKvProtection(ComputeKvProtection());
+        TestHooks.InvokeSpan("BlockIter::UpdateKey::value", _data.AsSpan(_valueOffset, _valueLength));
+        int idx = Array.BinarySearch(p.Offsets, _current);
+        if (idx < 0 || !KvChecksum.Verify(KvChecksum.ProtectKv(Key, Value), p.BytesPerKey, p.Checksums.AsSpan(idx * p.BytesPerKey, p.BytesPerKey)))
+        {
+            ThrowHelper.Corruption("Corrupted block entry: per key-value checksum verification failed. Offset: " + _current.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                + ". Entry index: " + Math.Max(idx, -1).ToString(System.Globalization.CultureInfo.InvariantCulture) + ".");
+        }
+    }
+
+    /// <summary>
+    /// Port of Block::Initialize*ProtectionInfo: a second iterator configured like this one (unverified) scans the block
+    /// and records ProtectKV(key, value) of every entry.
+    /// </summary>
+    private BlockKvProtection ComputeKvProtection()
+    {
+        int bytes = _kvProtectionBytes;
+        using var it = new BlockIter();
+        it.Reset(_block!, _kind, _icmp);
+        it._kvProtectionBytes = 0;
+        it._keysAreInternal = _keysAreInternal;
+        it._valueDeltaEncoded = _valueDeltaEncoded;
+        it._valueDeltaEscape = _valueDeltaEscape;
+        it._haveFirstKey = _haveFirstKey;
+        it._globalSeqno = _globalSeqno;
+        it._hashMapOffset = _hashMapOffset;
+        it._hashNumBuckets = _hashNumBuckets;
+        it._padTsSize = _padTsSize;
+        it.UpdateModes();
+        var offsets = new List<int>(64);
+        var sums = new PooledBufferWriter(64 * bytes);
+        try
+        {
+            for (it.SeekToFirst(); it.Valid; it.Next())
+            {
+                offsets.Add(it._current);
+                KvChecksum.Encode(KvChecksum.ProtectKv(it.Key, it.Value), bytes, sums.GetSpan(bytes));
+                sums.Advance(bytes);
+            }
+            return new BlockKvProtection(bytes, offsets.ToArray(), sums.WrittenSpan.ToArray());
+        }
+        finally
+        {
+            sums.Dispose();
+        }
     }
 
     // ---------------------------------------------------------------------------------------------
