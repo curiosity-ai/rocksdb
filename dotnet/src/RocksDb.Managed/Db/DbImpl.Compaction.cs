@@ -370,9 +370,14 @@ internal sealed partial class DbImpl
         if (delayMicros > 0)
         {
             if (noSlowdown) throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Write stall");
-            TimeSpan delay = TimeSpan.FromMicroseconds(delayMicros);
-            if (synchronous) Thread.Sleep(delay);
-            else await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            // We will delay the write until we have slept for `delay` microseconds or we don't need a delay anymore
+            // (checked every ~1 ms: kDelayInterval, the WriteController's minimum delay).
+            long stallEnd = System.Diagnostics.Stopwatch.GetTimestamp() + (long)(delayMicros * (System.Diagnostics.Stopwatch.Frequency / 1e6));
+            while (wc.NeedsDelay && System.Diagnostics.Stopwatch.GetTimestamp() < stallEnd)
+            {
+                if (synchronous) Thread.Sleep(1);
+                else await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+            }
         }
         while (true)
         {

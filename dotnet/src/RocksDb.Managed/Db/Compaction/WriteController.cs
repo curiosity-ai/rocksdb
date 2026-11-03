@@ -62,6 +62,18 @@ internal sealed class WriteController
     }
     public ulong DelayedWriteRate => Volatile.Read(ref _delayedWriteRate);
 
+    /// <summary>WriteController::set_delayed_write_rate: at least 1, at most the maximum.</summary>
+    public void SetDelayedWriteRate(ulong writeRate)
+    {
+        lock (_lock)
+        {
+            // avoid divide 0
+            if (writeRate == 0) writeRate = 1;
+            else if (writeRate > MaxDelayedWriteRate) writeRate = MaxDelayedWriteRate;
+            Volatile.Write(ref _delayedWriteRate, writeRate);
+        }
+    }
+
     public bool IsStopped => Volatile.Read(ref _totalStopped) > 0;
 
     /// <summary>NeedsDelay(): writes are rate limited.</summary>
@@ -161,6 +173,9 @@ internal sealed class ColumnFamilyStallState
     private const double IncSlowdownRatio = 0.8;
     private const double DecSlowdownRatio = 1 / IncSlowdownRatio;
     private const double NearStopSlowdownRatio = 0.6;
+    private const double DelayRecoverSlowdownRatio = 1.4;
+    /// <summary>GetMarkedFileCountForCompactionSpeedup.</summary>
+    private const int MarkedFileCountForCompactionSpeedup = 2;
     private const ulong MinWriteRate = 16 * 1024; // Minimum write rate 16KB/s.
 
     private Token _token;
@@ -244,18 +259,21 @@ internal sealed class ColumnFamilyStallState
         }
         else
         {
-            // Increase compaction threads if bottommost-relative debt is high or L0 is getting close to the slowdown trigger.
-            bool pressure = !o.DisableAutoCompactions && (l0 >= GetL0FileCountForCompactionSpeedup(o.Level0FileNumCompactionTrigger, o.Level0SlowdownWritesTrigger)
-                || compactionNeededBytes >= o.SoftPendingCompactionBytesLimit / 4);
+            // Increase compaction threads when L0 is getting close to the slowdown trigger, when the soft pending
+            // compaction bytes limit is 0 (always), when the compaction debt is large relative to the bottommost data or
+            // close to the soft limit, or when several files are marked for compaction.
+            bool pressure = l0 >= GetL0FileCountForCompactionSpeedup(o.Level0FileNumCompactionTrigger, o.Level0SlowdownWritesTrigger)
+                || o.SoftPendingCompactionBytesLimit == 0
+                || compactionNeededBytes >= GetPendingCompactionBytesForCompactionSpeedup(o, vstorage)
+                || vstorage.FilesMarkedForCompaction.Count >= MarkedFileCountForCompactionSpeedup;
             if (pressure)
             {
                 wc.AcquireCompactionPressure();
                 _token = Token.Pressure;
             }
-            else if (neededDelay && !wc.NeedsDelay)
-            {
-                // Writes are no longer delayed: reset the delayed write rate to the user's rate on the next delay.
-            }
+            // If the DB recovers from delay conditions, we reward with reducing double the slowdown ratio. This is to
+            // balance the long term slowdown increase signal.
+            if (neededDelay) wc.SetDelayedWriteRate((ulong)(wc.DelayedWriteRate * DelayRecoverSlowdownRatio));
         }
         _prevCompactionNeededBytes = compactionNeededBytes;
         return condition;
@@ -288,11 +306,32 @@ internal sealed class ColumnFamilyStallState
                 writeRate = Math.Min(maxWriteRate, (ulong)(writeRate * DecSlowdownRatio));
             }
         }
-        else if (!alreadyDelayed)
-        {
-            writeRate = maxWriteRate;
-        }
+        // Otherwise the current delayed write rate applies: it is reset to the maximum only by SetDBOptions; a delay
+        // that ended raised it by kDelayRecoverSlowdownRatio.
         wc.AcquireDelay(writeRate);
+    }
+
+    /// <summary>
+    /// Port of GetPendingCompactionBytesForCompactionSpeedup (db/column_family.cc): compaction debt above 1/8 of the
+    /// bottommost data (at least two full L0 -> Lbase compactions) or above 1/4 of the soft limit speeds up compaction.
+    /// </summary>
+    internal static ulong GetPendingCompactionBytesForCompactionSpeedup(ColumnFamilyOptions o, VersionStorageInfo vstorage)
+    {
+        // Compaction debt relatively large compared to the stable (bottommost) data size indicates compaction fell behind.
+        const ulong BottommostSizeDivisor = 8;
+        // Meaningful progress toward the slowdown trigger is another good indication.
+        const ulong SlowdownTriggerDivisor = 4;
+        ulong bottommostFilesSize = 0;
+        foreach ((int _, FileMetaData f) in vstorage.BottommostFiles) bottommostFilesSize += f.FileSize;
+        // Slowdown trigger might be zero but that means compaction speedup should always happen.
+        ulong slowdownThreshold = o.SoftPendingCompactionBytesLimit / SlowdownTriggerDivisor;
+        // Size of zero, however, should not be used to decide to speedup compaction.
+        if (bottommostFilesSize == 0) return slowdownThreshold;
+        // Prevent a small CF from triggering parallel compactions for other CFs. Require compaction debt to be more than
+        // a full L0 to Lbase compaction.
+        ulong minDebtSize = 2 * o.MaxBytesForLevelBase;
+        ulong sizeThreshold = Math.Max(bottommostFilesSize / BottommostSizeDivisor, minDebtSize);
+        return Math.Min(sizeThreshold, slowdownThreshold);
     }
 
     /// <summary>Port of GetL0FileCountForCompactionSpeedup.</summary>

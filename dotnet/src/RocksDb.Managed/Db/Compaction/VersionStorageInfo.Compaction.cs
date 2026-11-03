@@ -57,6 +57,12 @@ internal sealed partial class VersionStorageInfo
     /// <summary>estimated_compaction_needed_bytes(). Guarded by the DB mutex.</summary>
     public ulong EstimatedCompactionNeededBytes { get; private set; }
 
+    /// <summary>TEST_set_estimated_compaction_needed_bytes.</summary>
+    internal void TestSetEstimatedCompactionNeededBytes(ulong bytes) => EstimatedCompactionNeededBytes = bytes;
+
+    /// <summary>set_l0_delay_trigger_count (tests).</summary>
+    internal void TestSetL0DelayTriggerCount(int count) => L0DelayTriggerCount = count;
+
     /// <summary>Files marked for compaction by a table property collector (FileMetaData::marked_for_compaction).</summary>
     public List<(int Level, FileMetaData File)> FilesMarkedForCompaction => _filesMarkedForCompaction;
     public List<(int Level, FileMetaData File)> ExpiredTtlFiles => _expiredTtlFiles;

@@ -1316,3 +1316,114 @@ public sealed class CompactionPickerTests
         Assert.AreEqual(1, new List<CompactCursor>(next.ValidCompactCursors()).Count);
     }
 }
+
+/// <summary>
+/// Write stall conditions and the delayed write rate. Port of db/column_family_test.cc WriteStallSingleColumnFamily
+/// (ColumnFamilyData::RecalculateWriteStallConditions, SetupDelay, WriteController).
+/// </summary>
+[TestClass]
+public sealed class WriteStallTests
+{
+    [TestMethod]
+    public void WriteStallSingleColumnFamily()
+    {
+        const ulong BaseRate = 800000;
+        var wc = new WriteController(BaseRate);
+        var state = new ColumnFamilyStallState();
+        var o = new ColumnFamilyOptions
+        {
+            Level0SlowdownWritesTrigger = 20,
+            Level0StopWritesTrigger = 10000,
+            SoftPendingCompactionBytesLimit = 200,
+            HardPendingCompactionBytesLimit = 2000,
+            DisableAutoCompactions = false,
+        };
+        var vs = new VersionStorageInfo(InternalKeyComparator.Bytewise, 7, o, null, []);
+        ulong Rate() => wc.NeedsDelay ? wc.DelayedWriteRate : 0;
+        void Step(ulong pending, bool stopped, bool delayed, ulong expectedRate)
+        {
+            vs.TestSetEstimatedCompactionNeededBytes(pending);
+            state.Recalculate(wc, 1, vs, o);
+            Assert.AreEqual(stopped, wc.IsStopped, "stopped at pending " + pending);
+            Assert.AreEqual(delayed, wc.NeedsDelay, "delayed at pending " + pending);
+            if (delayed) Assert.AreEqual(expectedRate, wc.DelayedWriteRate, "rate at pending " + pending);
+        }
+
+        Step(50, false, false, 0);
+        Step(201, false, true, BaseRate);
+        Assert.IsTrue(wc.NeedSpeedupCompaction);
+        Step(400, false, true, (ulong)(BaseRate / 1.25));
+        Step(500, false, true, (ulong)(BaseRate / 1.25 / 1.25));
+        Step(450, false, true, (ulong)(BaseRate / 1.25));
+        Step(205, false, true, BaseRate);
+        Step(202, false, true, BaseRate);
+        Step(201, false, true, BaseRate);
+        Step(198, false, false, 0);
+        Step(399, false, true, BaseRate);
+        Step(599, false, true, (ulong)(BaseRate / 1.25));
+        Step(2001, true, false, 0);
+        Assert.IsTrue(wc.NeedSpeedupCompaction);
+        Step(3001, true, false, 0);
+        Step(390, false, true, (ulong)(BaseRate / 1.25));
+        Step(100, false, false, 0);
+
+        vs.TestSetL0DelayTriggerCount(100);
+        state.Recalculate(wc, 1, vs, o);
+        Assert.IsTrue(wc.NeedsDelay);
+        Assert.AreEqual(BaseRate, Rate());
+        vs.TestSetL0DelayTriggerCount(101);
+        state.Recalculate(wc, 1, vs, o);
+        Assert.AreEqual((ulong)(BaseRate / 1.25), Rate());
+        vs.TestSetL0DelayTriggerCount(0);
+        Step(300, false, true, (ulong)(BaseRate / 1.25 / 1.25));
+        vs.TestSetL0DelayTriggerCount(101);
+        state.Recalculate(wc, 1, vs, o);
+        Assert.AreEqual((ulong)(BaseRate / 1.25 / 1.25 / 1.25), Rate());
+        Step(200, false, true, (ulong)(BaseRate / 1.25 / 1.25));
+        vs.TestSetL0DelayTriggerCount(0);
+        Step(0, false, false, 0);
+
+        // With auto compactions disabled neither L0 nor pending bytes stall writes; the rate is kept.
+        o.DisableAutoCompactions = true;
+        wc.SetDelayedWriteRate(BaseRate);
+        state.Recalculate(wc, 1, vs, o);
+        Assert.IsFalse(wc.NeedsDelay);
+        vs.TestSetL0DelayTriggerCount(50);
+        state.Recalculate(wc, 1, vs, o);
+        Assert.IsFalse(wc.NeedsDelay);
+        Assert.AreEqual(BaseRate, wc.DelayedWriteRate);
+        vs.TestSetL0DelayTriggerCount(60);
+        Step(300, false, false, 0);
+        Assert.AreEqual(BaseRate, wc.DelayedWriteRate);
+    }
+
+    [TestMethod]
+    public void CompactionSpeedupByDebtRelativeToBottommostData()
+    {
+        // GetPendingCompactionBytesForCompactionSpeedup: min(max(bottommost / 8, 2 * max_bytes_for_level_base), soft / 4).
+        var o = new ColumnFamilyOptions { MaxBytesForLevelBase = 1000, SoftPendingCompactionBytesLimit = 1_000_000 };
+        var files = new FileMetaData[7][];
+        for (int l = 0; l < 7; l++) files[l] = [];
+        var k1 = new byte[11];
+        DbFormat.AppendInternalKey(k1, "100"u8, 1, EntryType.Value);
+        var k2 = new byte[11];
+        DbFormat.AppendInternalKey(k2, "200"u8, 1, EntryType.Value);
+        files[6] = [new FileMetaData { FileNumber = 1, FileSize = 80_000, Smallest = k1, Largest = k2, SmallestSeqno = 1, LargestSeqno = 1 }];
+        var vs = new VersionStorageInfo(InternalKeyComparator.Bytewise, 7, o, files, []);
+        Assert.AreEqual(10_000UL, ColumnFamilyStallState.GetPendingCompactionBytesForCompactionSpeedup(o, vs));
+        o.MaxBytesForLevelBase = 20_000;
+        Assert.AreEqual(40_000UL, ColumnFamilyStallState.GetPendingCompactionBytesForCompactionSpeedup(o, vs));
+        o.SoftPendingCompactionBytesLimit = 100_000;
+        Assert.AreEqual(25_000UL, ColumnFamilyStallState.GetPendingCompactionBytesForCompactionSpeedup(o, vs));
+
+        var wc = new WriteController(1 << 20);
+        var state = new ColumnFamilyStallState();
+        vs.TestSetEstimatedCompactionNeededBytes(24_999);
+        state.Recalculate(wc, 1, vs, o);
+        Assert.IsFalse(wc.NeedSpeedupCompaction);
+        vs.TestSetEstimatedCompactionNeededBytes(25_000);
+        state.Recalculate(wc, 1, vs, o);
+        Assert.IsTrue(wc.NeedSpeedupCompaction);
+        Assert.IsFalse(wc.NeedsDelay);
+    }
+}
