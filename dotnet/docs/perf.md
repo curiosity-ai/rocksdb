@@ -950,6 +950,22 @@ threads already take most of the gain. With fewer free cores than threads the wo
 (the emit thread then compresses the blocks itself when it needs a slot, so throughput never drops below serial by
 much). Output is byte-identical in every configuration.
 
+## Allocation-free readahead prefetches, forward pinned merge operands
+
+BenchmarkDotNet `ScanBenchmarks.cs` (`--anyCategories Scan`, short job, 4 vCPU container, one op = one full scan of an
+on-disk DB through the public iterator), before -> after:
+
+| Benchmark | Before | After | Allocated before -> after |
+|---|---|---|---|
+| ColdScan (200k keys, 1 MiB block cache, fill_cache = false, auto readahead) | 14.1 ms | 13.7 ms | 6.4 KB -> - |
+| MergeScan, 5 operands of 24 bytes per key (20k keys, 4 L0 files + memtable) | 7.8 ms | 8.4 ms | - -> - |
+| MergeScan, 5 operands of 1 KiB per key | 40.0 ms (+-81 ms error) | 35.9 ms | - -> - |
+
+The cold scan allocated one Task per prefetch (`AsTask` / `Task.FromResult`); the buffer now keeps the ValueTask and
+waits on a reusable event when the read is still pending. Forward merges reference their operands in the temp-pinned
+blocks instead of copying them into the operand buffer: no allocation change (the buffer was pooled), the copy saving
+only shows with large operands and is within the noise of the short job.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
@@ -960,6 +976,7 @@ much). Output is byte-identical in every configuration.
   contention with 4 threads"); pipelined writes are open. Done since: reverse-iteration block pinning, async reverse
   movement, covered-range skipping and compaction input readahead (see "Reverse iteration, range-deleted runs,
   compaction input readahead").
-- Merge operands in reverse iteration are still copied (upstream pins them too, `operand_pinned`); the direction switch
-  of `NextAsync` after reverse movement (ReverseToForward) is synchronous; index partitions are loaded synchronously by
-  the async table paths; user iterators do not use readahead (auto_readahead / ReadOptions.readahead_size).
+- Done since: merge operands are referenced in pinned blocks in both directions, `NextAsync` after reverse movement
+  awaits, async table paths load index partitions asynchronously, user iterators use (auto) readahead, and the
+  readahead's prefetches no longer allocate a Task each (see "Allocation-free readahead prefetches, forward pinned
+  merge operands").

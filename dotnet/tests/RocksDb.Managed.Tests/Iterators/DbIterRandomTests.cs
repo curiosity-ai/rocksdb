@@ -387,7 +387,8 @@ public sealed class DbIterRandomTests
 
     /// <summary>
     /// Reverse steps pin the data blocks they leave (instead of copying values) and release them at the next
-    /// positioning call: the number of pinned blocks stays bounded during a reverse scan and drops to zero on Next.
+    /// positioning call: the number of pinned blocks stays bounded during a reverse scan and drops to zero on Next (unless
+    /// that lands on a merge, whose operands are pinned in turn).
     /// </summary>
     [TestMethod]
     public void ReverseScanPinsBlocksTemporarily()
@@ -412,8 +413,16 @@ public sealed class DbIterRandomTests
         it.Prev();
         Assert.IsTrue(it.Valid);
         it.Next();
-        Assert.IsFalse(it.PinnedItersMgr.IsPinning);
-        Assert.AreEqual(0, it.PinnedItersMgr.PinnedBlockCount);
+        // Next releases the reverse step's blocks; only a forward merge (MergeValuesNewToOld) pins its operands' blocks.
+        if (!it.CurrentEntryIsMerged)
+        {
+            Assert.IsFalse(it.PinnedItersMgr.IsPinning);
+            Assert.AreEqual(0, it.PinnedItersMgr.PinnedBlockCount);
+        }
+        else
+        {
+            Assert.IsTrue(it.PinnedItersMgr.PinnedBlockCount <= 16);
+        }
     }
 
     /// <summary>

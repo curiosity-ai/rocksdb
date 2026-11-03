@@ -12,8 +12,9 @@ namespace RocksDb.Managed.Tests.Db;
 public sealed class DbBasicTests
 {
     /// <summary>
-    /// DBIter::FindValueForCurrentKey: in reverse iteration the merge operands are referenced in the pinned blocks /
-    /// memtable (merge_context_.PushOperand(value, IsValuePinned())) instead of copied; results equal forward iteration,
+    /// DBIter::FindValueForCurrentKey and MergeValuesNewToOld: in reverse and forward iteration the merge operands are
+    /// referenced in the pinned blocks / memtable (merge_context_.PushOperand(value, IsValuePinned())) instead of copied;
+    /// results of both directions (and of async steps) are equal,
     /// for operands in the memtable, in table files and spread over both.
     /// </summary>
     [TestMethod]
@@ -35,8 +36,21 @@ public sealed class DbBasicTests
         using (Iterator it = db.NewIterator())
         {
             for (it.SeekToFirst(); it.Valid; it.Next()) forward.Add((S(it.Key.ToArray())!, S(it.Value.ToArray())!));
+            // MergeValuesNewToOld: forward merges reference their operands in place too.
+            Assert.IsTrue(it.Inner.PinnedOperandMerges >= 200, "forward operands referenced in place: " + it.Inner.PinnedOperandMerges);
         }
         Assert.AreEqual(200, forward.Count);
+        var forwardAsync = new List<(string, string)>();
+        using (Iterator it = db.NewIterator())
+        {
+            it.SeekToFirst();
+            while (it.Valid)
+            {
+                forwardAsync.Add((S(it.Key.ToArray())!, S(it.Value.ToArray())!));
+                it.NextAsync().AsTask().GetAwaiter().GetResult();
+            }
+        }
+        CollectionAssert.AreEqual(forward, forwardAsync);
         Assert.AreEqual("base3,r1-3,r2-3", forward[3].Item2);
         var backward = new List<(string, string)>();
         using (Iterator it = db.NewIterator())

@@ -108,8 +108,23 @@ internal static class Maintenance
         // ...and ingest it atomically (the file is placed at the lowest level it fits; also works with native SSTs).
         // Several files may overlap: later files in the list win. IngestBehind = true back-fills below existing data.
         db.IngestExternalFiles([sstPath], new IngestExternalFileOptions { MoveFiles = true });
+
+        // Replace a whole key range atomically: existing keys in ["bulk:", "bulk;") disappear in the same step as the new
+        // file appears (EXPERIMENTAL atomic_replace_range; requires SnapshotConsistency = false).
+        using (SstFileWriter writer = db.CreateSstFileWriter(db.DefaultColumnFamily))
+        {
+            writer.Open(sstPath);
+            writer.Put("bulk:0001"u8, "v2"u8);
+            await writer.FinishAsync();
+        }
+        db.IngestExternalFiles(db.DefaultColumnFamily, new IngestExternalFileArg
+        {
+            ExternalFiles = [sstPath],
+            Options = new IngestExternalFileOptions { SnapshotConsistency = false },
+            AtomicReplaceRange = new IngestReplaceRange("bulk:"u8.ToArray(), "bulk;"u8.ToArray()),
+        });
         // </snippet:sst-ingest>
-        Line($"bulk:0042 = {Utf8(db.Get("bulk:0042"u8))}");
-        Check(Utf8(db.Get("bulk:0042"u8)) == "v", "ingested");
+        Line($"bulk:0042 = {Utf8(db.Get("bulk:0042"u8))}, bulk:0001 = {Utf8(db.Get("bulk:0001"u8))}");
+        Check(db.Get("bulk:0042"u8) is null && Utf8(db.Get("bulk:0001"u8)) == "v2", "ingested and replaced");
     }
 }
