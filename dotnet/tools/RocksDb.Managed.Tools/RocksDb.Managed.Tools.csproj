@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    ldb and sst_dump equivalents for managed (and native) RocksDB directories and files (tools/ldb_cmd.cc,
+    tools/sst_dump_tool.cc, table/sst_file_dumper.cc). Usage: rocksdb-tools ldb ... | rocksdb-tools sst_dump ...
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>RocksDb.Managed.Tools</AssemblyName>
+    <RootNamespace>RocksDb.Managed.Tools</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RocksDb.Managed\RocksDb.Managed.csproj" />
+  </ItemGroup>
+</Project>

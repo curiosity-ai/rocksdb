@@ -8,5 +8,6 @@
   <ItemGroup>
     <PackageReference Include="MSTest" />
     <ProjectReference Include="..\..\src\RocksDb.Managed\RocksDb.Managed.csproj" />
+    <ProjectReference Include="..\..\tools\RocksDb.Managed.Tools\RocksDb.Managed.Tools.csproj" />
   </ItemGroup>
 </Project>

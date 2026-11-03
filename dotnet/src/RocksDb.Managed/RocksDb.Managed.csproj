@@ -15,5 +15,6 @@
     <InternalsVisibleTo Include="RocksDb.Managed.Tests" />
     <InternalsVisibleTo Include="RocksDb.Managed.CompatTests" />
     <InternalsVisibleTo Include="RocksDb.Managed.Benchmarks" />
+    <InternalsVisibleTo Include="RocksDb.Managed.Tools" />
   </ItemGroup>
 </Project>
