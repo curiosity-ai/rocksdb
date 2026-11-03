@@ -39,6 +39,7 @@ internal static class Program
         ("WalTailing", Replication.WalTailing),
         ("ReadOnlyAndSecondary", Replication.ReadOnlyAndSecondary),
         ("Monitoring", Monitoring.StatisticsListenersLog),
+        ("CacheTiers", Caching.CacheTiersAndWriteBufferManager),
         ("ErrorHandling", Errors.ErrorHandling),
     ];
 

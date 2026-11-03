@@ -66,7 +66,23 @@ changes there need their own review.
 | `RocksDb.Managed.Replication/Switchover/ReplicationRoleState.cs` | 227 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
 | `RocksDb.Managed.Replication/Switchover/SwitchoverNode.cs` | 542 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
 | `AttributeGroups.cs` | 286 | include/rocksdb/attribute_groups.h, db/db_impl/db_impl.cc, db/db_impl/db_impl_write.cc | line-by-line (feature audit: user features (wide-column APIs)) |
-| `Cache/BlockCache.cs` | 327 | include/rocksdb/advanced_cache.h | line-by-line (#1) |
+| `Cache/BlockCache.cs` | 521 | include/rocksdb/advanced_cache.h | line-by-line (#1); secondary-cache members: feature audit (cache layers) |
+| `Cache/CacheItemHelper.cs` | 133 | include/rocksdb/advanced_cache.h (CacheItemHelper) | line-by-line (feature audit: cache layers) |
+| `Cache/CacheReservationManager.cs` | 172 | cache/cache_reservation_manager.{h,cc} | line-by-line (feature audit: cache layers) |
+| `Cache/CacheSupport.cs` | 103 | include/rocksdb/advanced_cache.h (EvictionCallback, CreateStandalone, AsyncLookupHandle) | line-by-line (feature audit: cache layers) |
+| `Cache/CacheTypes.cs` | 154 | include/rocksdb/cache.h, cache/cache_entry_roles.cc, include/rocksdb/advanced_options.h (CacheTier) | line-by-line (feature audit: cache layers) |
+| `Cache/CacheWithSecondaryAdapter.cs` | 543 | cache/secondary_cache_adapter.{h,cc}, include/rocksdb/cache.h (TieredCacheOptions) | line-by-line (feature audit: cache layers) |
+| `Cache/CompressedSecondaryCache.cs` | 368 | cache/compressed_secondary_cache.{h,cc} | line-by-line (feature audit: cache layers) |
+| `Cache/PersistentCache/BlockCacheTier.cs` | 751 | utilities/persistent_cache/block_cache_tier*.{h,cc} | line-by-line (feature audit: cache layers) |
+| `Cache/PersistentCache/PersistentCache.cs` | 58 | include/rocksdb/persistent_cache.h | line-by-line (feature audit: cache layers) |
+| `Cache/PersistentCache/PersistentCacheTier.cs` | 301 | utilities/persistent_cache/persistent_cache_tier.{h,cc}, volatile_tier_impl.{h,cc} | line-by-line (feature audit: cache layers) |
+| `Cache/SecondaryCache.cs` | 153 | include/rocksdb/secondary_cache.h | line-by-line (feature audit: cache layers) |
+| `Cache/SimCache.cs` | 288 | utilities/simulator_cache/sim_cache.cc, include/rocksdb/utilities/sim_cache.h | line-by-line (feature audit: cache layers) |
+| `Cache/TieredSecondaryCache.cs` | 153 | cache/tiered_secondary_cache.{h,cc} | line-by-line (feature audit: cache layers) |
+| `Db/DbImpl.WriteBufferManager.cs` | 248 | db/db_impl/db_impl_write.cc (PreprocessWrite, HandleWriteBufferManagerFlush, WriteBufferManagerStallWrites), db_impl_compaction_flush.cc (CollectFlushableCFs) | line-by-line (feature audit: cache layers) |
+| `Memory/AllocTracker.cs` | 43 | memory/allocator.h, memtable/alloc_tracker.cc | line-by-line (feature audit: cache layers) |
+| `Memtable/WriteBufferManager.cs` | 364 | include/rocksdb/write_buffer_manager.h, memtable/write_buffer_manager.cc | line-by-line (feature audit: cache layers) |
+| `Table/BlockBasedTableReader.CacheTiers.cs` | 241 | table/block_based/block_cache.h, block_based_table_reader.cc (RetrieveBlock with helper), table/persistent_cache_helper.cc | line-by-line (feature audit: cache layers) |
 | `Cache/CacheKey.cs` | 231 | cache/cache_key.h, cache/cache_key.{h,cc}, table/unique_id.cc | line-by-line (#1) |
 | `Cache/HyperClockCache.cs` | 796 | include/rocksdb/cache.h, cache/clock_cache.{h,cc} | line-by-line (#3): FixedHyperClockTable / BaseClockTable (meta word, probing, eviction, strict/non-strict charging, standalone); compaction-features pass: eviction_effort_cap, CalcHashBits overshoot clamp, table metadata charged up front |
 | `Cache/LruCache.cs` | 748 | include/rocksdb/cache.h, cache/lru_cache.{h,cc}, cache/sharded_cache.{h,cc} | line-by-line (#3): LRUCacheShard / LRUHandleTable (insert, release, pools, eviction); metadata charge = CalcuMetaCharge with glibc malloc_usable_size (88) |

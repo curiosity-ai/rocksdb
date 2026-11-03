@@ -896,6 +896,54 @@ Dictionary<string, TableProperties> tables = db.GetPropertiesOfAllTables();
 block-cache properties. `KeyMayExist`, `GetApproximateSizes`, `GetApproximateMemTableStats`, `GetLiveFilesMetadata`
 and `GetPropertiesOfAllTables` are also available.
 
+### Cache tiers, simulated caches and memtable budgets
+
+`BlockCache.CreateTiered` combines the primary block cache with a compressed secondary tier under one budget
+(`TieredCacheOptions`, `UpdateTieredCache`); `LruCacheOptions.SecondaryCache` / `HyperClockCacheOptions.SecondaryCache`
+attach any `SecondaryCache` (e.g. `CompressedSecondaryCache`). A `WriteBufferManager` caps the memtable memory of any
+number of DBs and column families, can stall writes at the limit and charge memtables to a block cache;
+`DbOptions.DbWriteBufferSize` is the per-DB shortcut. `SimCache` reports the hit rate of a hypothetical capacity, and
+`BlockBasedTableOptions.PersistentCache` (`VolatileCacheTier`, file-based `PersistentCache.Create`) is the legacy
+persistent block cache.
+
+<!-- snippet:cache-tiers -->
+```csharp
+// One memory budget for blocks and memtables: a 64 MiB tiered cache (primary HyperClock + compressed secondary tier,
+// 25% of the budget) and a write buffer manager that charges memtables to it and caps them at 16 MiB.
+BlockCache cache = BlockCache.CreateTiered(new TieredCacheOptions
+{
+    TotalCapacity = 64L << 20,
+    CompressedSecondaryRatio = 0.25,
+    CacheType = PrimaryCacheType.HyperClock,
+    HyperClockCacheOptions = new HyperClockCacheOptions { EstimatedEntryCharge = BlockCache.EstimateBlockCharge(4096) },
+})!;
+var writeBufferManager = new WriteBufferManager(16L << 20, cache, allowStall: true);
+var stats = new Statistics();
+var dbOptions = new DbOptions { CreateIfMissing = true, WriteBufferManager = writeBufferManager, Statistics = stats };
+var cfOptions = new ColumnFamilyOptions { TableOptions = new BlockBasedTableOptions { BlockCache = cache } };
+
+using (RocksDatabase db = RocksDatabase.Open(path, dbOptions, cfOptions))
+{
+    for (int i = 0; i < 10_000; i++) db.Put(System.Text.Encoding.UTF8.GetBytes("key" + i), new byte[200]);
+    db.Flush();
+    _ = db.Get("key42"u8);
+    Console.WriteLine($"memtables: {writeBufferManager.MemoryUsage} bytes, charged to the cache: {writeBufferManager.DummyEntriesInCacheUsage}");
+    Console.WriteLine($"secondary cache hits: {stats.GetTickerCount(Ticker.SecondaryCacheHits)}");
+}
+// Resize the whole budget, or the compressed share, at runtime.
+BlockCache.UpdateTieredCache(cache, 128L << 20, 0.3, TieredAdmissionPolicy.Max);
+writeBufferManager.SetBufferSize(32L << 20);
+
+// What hit rate would a 1 GiB cache give? A SimCache tracks keys only, at no memory cost for values.
+SimCache sim = BlockCache.CreateSimCache(BlockCache.CreateLru(8L << 20), 1L << 30, numShardBits: -1);
+using (RocksDatabase db = RocksDatabase.Open(path, new DbOptions(),
+           new ColumnFamilyOptions { TableOptions = new BlockBasedTableOptions { BlockCache = sim } }))
+{
+    for (int i = 0; i < 10_000; i += 7) _ = db.Get(System.Text.Encoding.UTF8.GetBytes("key" + i));
+}
+Console.Write(sim.ToString());   // SimCache MISSes / HITs / HITRATE
+```
+
 ## Error handling
 
 Native RocksDB returns a `Status`. The port throws `RocksDbException`, whose `Code` and `SubCode` have the same values

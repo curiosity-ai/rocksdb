@@ -93,6 +93,11 @@ Paths on the left are relative to the repository root (C++). Paths on the right 
 | `util/coding.h`, `crc32c.cc`, `hash.cc`, `xxph3.h` | `Util/Coding.cs`, `Util/Crc32C.cs`, `Util/Hash.cs`, `Util/HashXxph3.cs` |
 | `include/rocksdb/comparator.h`, `util/comparator.cc` | `Util/Comparator.cs`, `Util/Comparators.cs` |
 | `cache/lru_cache.cc`, `clock_cache.cc`, `cache_key.cc` | `Cache/LruCache.cs`, `Cache/HyperClockCache.cs`, `Cache/CacheKey.cs`, `Cache/BlockCache.cs` |
+| `include/rocksdb/secondary_cache.h`, `advanced_cache.h` (CacheItemHelper, AsyncLookupHandle), `cache/secondary_cache_adapter.cc`, `compressed_secondary_cache.cc`, `tiered_secondary_cache.cc`, `cache_entry_roles.cc` | `Cache/SecondaryCache.cs`, `Cache/CacheItemHelper.cs`, `Cache/CacheSupport.cs`, `Cache/CacheWithSecondaryAdapter.cs` (also NewTieredCache / UpdateTieredCache, `TieredCacheOptions`), `Cache/CompressedSecondaryCache.cs`, `Cache/TieredSecondaryCache.cs`, `Cache/CacheTypes.cs`; table side `Table/BlockBasedTableReader.CacheTiers.cs` |
+| `cache/cache_reservation_manager.cc` | `Cache/CacheReservationManager.cs` |
+| `utilities/simulator_cache/sim_cache.cc` | `Cache/SimCache.cs` |
+| `include/rocksdb/persistent_cache.h`, `utilities/persistent_cache/*` (tiers, block cache tier files), `table/persistent_cache_helper.cc` | `Cache/PersistentCache/*`, `Table/BlockBasedTableReader.CacheTiers.cs` |
+| `memtable/write_buffer_manager.cc`, `memtable/alloc_tracker.cc`, `DBImpl::HandleWriteBufferManagerFlush` / `WriteBufferManagerStallWrites` | `Memtable/WriteBufferManager.cs`, `Memory/AllocTracker.cs`, `Db/DbImpl.WriteBufferManager.cs` |
 | `env/fs_posix.cc`, `env/mock_env.cc`, `file/file_prefetch_buffer.cc`, `util/aligned_buffer.h` | `Env/LocalFileSystem.cs`, `Env/UnixNative.cs`, `Env/MemoryFileSystem.cs`, `Env/FilePrefetchBuffer.cs`, `Env/AlignedBuffer.cs`, `Env/FileContracts.cs` |
 | `logging/auto_roll_logger.cc`, `env.h` Logger | `Logging/FileInfoLogger.cs`, `Logging/InfoLogger.cs` |
 
@@ -232,6 +237,16 @@ verified with `[MemoryDiagnoser]` and the benchmark runner's allocated-bytes-per
   (`GC.AllocateUninitializedArray(pinned: true)`), so the skip list can use raw pointers. Slabs are recycled through
   `ArenaSlabPool` (capped at 256 MiB) when a memtable is freed. `InlineSkipList<TComparer>` takes a struct comparer, so
   comparisons are not virtual calls; reads are lock-free, and concurrent inserts use CAS.
+- **Memtable budget**: every DB has a `WriteBufferManager` (`DbOptions.WriteBufferManager`, else a private one of
+  `db_write_buffer_size`). When it limits memory or charges a cache, each memtable's arena reports its blocks through an
+  `AllocTracker` (reserve on allocation, "scheduled free" when the memtable becomes immutable, free on dispose); the
+  write leader checks `ShouldFlush` / `ShouldStall` once per group (two volatile reads when disabled). Cache charging
+  inserts pinned 256 KiB placeholder entries (`CacheReservationManager`).
+- **Cache tiers**: a cache with a secondary tier or a `SimCache` sets `BlockCache.ExtendedLookup`; table readers then
+  pass the block's `CacheItemHelper`, themselves (create context) and the DB statistics on lookups. Plain caches keep the
+  original lookup call (one extra field test on the hit path). Entries carry their helper, so primary evictions can be
+  saved to the secondary tier; promoted entries are standalone handles or regular entries, with "dummy" entries
+  recording recent secondary hits as upstream.
 - **Block buffers**: blocks in the block cache are rented from `BlockBufferPool`, which has finer size classes than
   `ArrayPool<byte>.Shared` (at most 25% padding instead of up to 100%), and are returned when evicted. `CachedBlock`
   handles are reference counted. Iterators pin the blocks they point into, which is why `Key`/`Value` spans are valid
