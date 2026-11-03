@@ -1441,6 +1441,70 @@ The test now asserts what upstream guarantees right after CompactRange (L0 empty
 runs of the whole `DbCompactionTests` class under 6 hogs, 3 x 15 parallel runs of the class (plus 2 hogs), 20 runs each
 with `DOTNET_TieredCompilation=0` and `DOTNET_TieredPGO=0 DOTNET_TC_QuickJitForLoops=0` (4 hogs): no failure.
 
+## Table reader blocks from the table buffer pool; table cache eviction race (2026-11-03)
+
+**1. A new table reader's index and filter.** After `TableBuilderBuffers`, the measured `flush` (300k x 100 B, 4
+threads) still allocated 170-210 KB. `dotnet-trace` (GC AllocationTick with stacks, grouped by stack for the window of
+the measured benchmark) showed what: the reader that `FlushAndInstallAsync` opens reads its full filter into
+`ArrayPool<byte>.Shared` (`ReadRawPayload`, a 128 KiB array for the 64 MiB flush; a miss, since the shared pool keeps
+returned arrays per thread first) and its index into `BlockBufferPool` (a hit or a miss of one fine size class). In the
+compaction-heavy fills, the readers that compactions open for their L0 / L1 inputs missed the same way (4.5 MB over a
+1.5M-op `fillrandom` + `overwrite` run, warm-up included), although the readers of deleted files had returned theirs:
+filters went to whichever thread closed the reader, index blocks to one of 32 fine size classes per MiB.
+
+Now the index block and the full filter that a reader pins (not those in the block cache with
+`cache_index_and_filter_blocks`, which keep the block buffer pool's finer classes because the cache is charged the
+buffer length) are rented from `TableBuilderBuffers.Bytes`, and returned there when the reader is closed (the `Block`
+records its pool, `BlockBufferSource`; compressed index blocks are decompressed into the same pool). Their sizes match
+the builder's index and filter buffers, which the builder has just returned to that pool, so the reader of a new table
+takes them, and the blocks of deleted tables go back to where the next builders look. Retention went from 16 to 32
+arrays per size class. Cost: a pinned index block is held in a power-of-two array (up to 2x its size, ~1.4x on average)
+instead of a fine size class (at most 1.25x); filters were power-of-two arrays before too.
+
+A/B, 5 interleaved repetitions (`f9a895f` vs this change, one process each, warm-up on, `--cache_size 8388608`), medians
+[min-max] of the bytes allocated during the benchmark:
+
+| | before | after |
+|---|---:|---:|
+| `flush`, 300k x 100 B, 4 threads, none | 171 KB [171-174] | 40 KB [39-41] |
+| `flush`, same, LZ4 | 212 KB [212-212] | 40 KB [39-40] |
+| `compact`, same, none | 0.10 MB [0.10-1.09] | 0.95 MB [0.95-2.00] |
+| `compact`, same, LZ4 | 1.09 MB [0.04-1.15] | 0.96 MB [0.95-2.01] |
+| compaction-heavy `fillrandom` (500k x 100 B, 4 MiB memtables / files) | 4.7 B/op [4.4-4.9] | 4.0 B/op [3.8-4.1] |
+| compaction-heavy `overwrite` | 9.4 B/op [7.5-9.6] | 8.7 B/op [6.3-9.2] |
+
+Over a 1.5M-op compaction-heavy `fillrandom` + `overwrite` process (traced, warm-up included), the reader block
+allocations went from 4.5 MB to none and the builder's pool misses from 1.7 to 2.7 MB; the process allocated 78 instead
+of 86 MB. What is left in the steady state of those fills is per-file, not per-block: the write buffers of new SST and
+WAL files (`LocalWritableFile`), the strings of parsed table properties, `CompactionJob` / `LogWriter` objects and event
+log strings.
+
+The measured `compact` is the largest compaction of the run (all of L0 into one 300k-key output), and its builder now
+misses the filter and index arrays of that size (512 + 256 KB), which the live L0 readers hold until the compaction
+installs its result and closes them (before, the builder pool kept a set of the flushes' arrays for itself, and the
+readers had allocated their own copies at each flush). It is the same memory as before, allocated at a different point
+of this sequence; flush + compact together went from 0.27 to 1.0 MB (none) and 1.30 to 1.0 MB (LZ4) in these runs.
+
+Times are unchanged within the noise. A second A/B (7 repetitions, after load < 1.5, the same allocation results): `flush`
+57.2 -> 58.6 ms (none; ranges 51.6-66.5 / 52.7-75.2) and 60.8 -> 65.0 ms (LZ4; 57.1-76.4 / 55.3-90.2), `compact`
+135 -> 147 ms (none; 130-155 / 132-187) and 154 -> 143 ms (LZ4; 135-196 / 139-160); in the first A/B `flush` with LZ4
+was 56.5 -> 71.1 ms and `compact` without compression 135 -> 142 ms. Two more A/Bs of `fillrandom,overwrite,flush` with
+LZ4 only: 65.8 -> 69.1 ms (15 repetitions, per-repetition ratios 0.90-1.36, median 1.06), then 70.7 -> 62.0 ms with
+process CPU time 61.9 -> 47.3 ms per flush (10 repetitions). The fills moved by -4% to +4%.
+
+**2. `DbBlobTests.BlobReadersBoundedByMaxOpenFiles` (failed once in a full run).** Reproduced in 1 of 100 runs of the
+`DbBlobTests` class: `ArgumentException: Unable to sort because the IComparer.Compare() method returns inconsistent
+results` thrown by `List.Sort` in `TableCacheStore.EvictUnreferenced`, out of a `Get` of the test's concurrent phase
+(8 threads, `max_open_files = 25`, 30 SST files). Not a blob problem: the table cache (capacity 20) evicts on every miss
+and sorted the unreferenced handles by their `LastUse` field, which lookups of open readers stamp without the lock
+(`FindTable`'s fast path). A stamp that changes during the sort makes the introsort's partition scan run off the
+range, which .NET reports as an inconsistent comparer; with more than 16 candidates (insertion sort below that) and
+concurrent hits this can happen in any DB with `max_open_files != -1` and concurrent reads, failing the read. Fix
+(product): the stamps are copied with the handles before sorting. New test
+`DbColumnFamilyAndConcurrencyTests.BoundedTableCacheEvictsUnderConcurrentLookups` (capacity 54, 120 files, six threads
+hitting a hot set while two read all files, 2 s) failed 4 of 10 runs before the fix and 0 of 20 after; the
+`DbBlobTests` class passed 100 of 100 runs after it with 2 CPU hogs (1 of 100 failed before, without hogs).
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
@@ -1454,9 +1518,9 @@ with `DOTNET_TieredCompilation=0` and `DOTNET_TieredPGO=0 DOTNET_TC_QuickJitForL
   "Definitive-run follow-ups"). Done since: pipelined writes (see "Pipelined writes and parallel memtable inserts"), reverse-iteration block pinning, async reverse
   movement, covered-range skipping and compaction input readahead (see "Reverse iteration, range-deleted runs,
   compaction input readahead").
-- A new table reader's index and filter blocks (`BlockFetcher.ReadBlock` / `ReadRawPayload`, `ArrayPool.Shared` and
-  `BlockBufferPool`) could come from the pool the table builder returns its buffers to (`TableBuilderBuffers`), so a
-  flush would reuse them (~170-210 KB per 64 MiB flush of 100 B values; see "Definitive-run follow-ups").
+- Done: a new table reader's pinned index and filter come from `TableBuilderBuffers` (see "Table reader blocks from
+  the table buffer pool"). Left in the compaction-heavy steady state: per-file allocations (the `LocalWritableFile`
+  write buffer of every new SST / WAL file, parsed table property strings, event log strings).
 - Done since: merge operands are referenced in pinned blocks in both directions, `NextAsync` after reverse movement
   awaits, async table paths load index partitions asynchronously, user iterators use (auto) readahead, and the
   readahead's prefetches no longer allocate a Task each (see "Allocation-free readahead prefetches, forward pinned

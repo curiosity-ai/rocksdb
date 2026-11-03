@@ -236,6 +236,11 @@ verified with `[MemoryDiagnoser]` and the benchmark runner's allocated-bytes-per
   `ArrayPool<byte>.Shared` (at most 25% padding instead of up to 100%), and are returned when evicted. `CachedBlock`
   handles are reference counted. Iterators pin the blocks they point into, which is why `Key`/`Value` spans are valid
   until the iterator moves.
+- **Table buffers**: the large buffers of table builders (block contents, restart arrays, the full filter, the
+  compressed-block and output staging buffers) and the index block and full filter a table reader pins (when they are
+  not in the block cache) come from `TableBuilderBuffers`, lock-based power-of-two pools shared by all threads. A new
+  table's reader takes the index and filter buffers its builder has just returned, and the blocks of the tables a
+  compaction deletes go back to the builders.
 - **Pooled objects**: `WriteBatch.Rent()` / `CreateWriteBatch()`, the write-thread writer objects, `GetContext`,
   lookup keys (`LookupKey` uses `stackalloc` for small keys), `PooledBufferWriter.RentWriter()`, per-thread
   decompression buffers, and reused table iterators in `LevelIterator`.
