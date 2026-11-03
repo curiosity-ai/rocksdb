@@ -55,7 +55,8 @@ while the bytes may differ (for example, because a compressor makes different ch
 | BackupEngine directory layout and meta files | yes | yes | incremental backups across engines |
 | Checkpoints, external SST ingestion | yes | yes | |
 | File checksums in the MANIFEST (`file_checksum_gen_factory`, `FileChecksumGenCrc32cFactory`) | yes | yes | identical checksums for flushed, compacted, blob and ingested files; `VerifyFileChecksums` on either side |
-| PlainTable / CuckooTable | no | no | option names round-trip only |
+| PlainTable / CuckooTable, AdaptiveTableFactory reading | yes | yes | plain data / index / bloom and cuckoo hash tables byte-identical to native SstFileWriter output; `[TableOptions/PlainTable]` / `[TableOptions/CuckooTable]` OPTIONS sections round-trip; cuckoo reads need `AllowMmapReads` (as upstream) |
+| User-defined index (`UserDefinedIndexFactory`, `IndexMode`, `ReadOptions.ReadIndex`) | yes | yes | custom index meta block and kCustomOnly footer feature as upstream; native `trie_index` files are read through their standard index (the trie format is not ported) |
 
 Supported features: column families, point reads (`Get`, `MultiGet`), iterators (bounds, prefix seek, reverse,
 tailing), snapshots, merge operators, single delete, range deletion, leveled / universal / FIFO compaction with
@@ -405,6 +406,49 @@ using Iterator it = db.NewIterator(new ReadOptions { PrefixSameAsStart = true })
 int users = 0;
 for (it.Seek("user:"u8); it.Valid; it.Next()) users++;            // 2
 // TotalOrderSeek = true ignores the prefix extractor for one iterator.
+```
+
+### Table formats: PlainTable, CuckooTable, adaptive reading
+
+<!-- snippet:table-formats -->
+```csharp
+// PlainTable: for in-memory / tmpfs databases (no blocks, compression or checksums). With a prefix extractor,
+// lookups use a prefix hash index and iterators only support prefix seeks.
+var plain = new ColumnFamilyOptions
+{
+    TableFactory = TableFactoryType.PlainTable,                    // table_factory=PlainTable
+    PrefixExtractor = SliceTransform.CreateFixedPrefix(5),
+    PlainTableOptions = { EncodingType = PlainTableEncodingType.Prefix, StoreIndexInFile = true },
+};
+using (RocksDatabase db = RocksDatabase.Open(Path.Combine(path, "plain"), new DbOptions { CreateIfMissing = true }, plain))
+{
+    db.Put("user:1"u8, "a"u8);
+    db.Put("user:2"u8, "b"u8);
+    db.Flush();                                                    // a plain table SST, readable by native RocksDB
+    using Iterator it = db.NewIterator(new ReadOptions { PrefixSameAsStart = true });
+    for (it.Seek("user:"u8); it.Valid; it.Next()) { /* user:1, user:2 */ }
+}
+
+// CuckooTable: fixed-size keys and values, one version per key, read memory-mapped (AllowMmapReads).
+var cuckoo = new ColumnFamilyOptions { TableFactory = TableFactoryType.CuckooTable, CuckooTableOptions = { HashTableRatio = 0.9 } };
+using (RocksDatabase db = RocksDatabase.Open(Path.Combine(path, "cuckoo"), new DbOptions { CreateIfMissing = true, AllowMmapReads = true }, cuckoo))
+{
+    db.Put("key00001"u8, "val1"u8);
+    db.Flush();
+    byte[]? v = db.Get("key00001"u8);                              // "val1"
+}
+
+// AdaptiveTableFactory: reads block-based, plain and cuckoo files by their magic number; writes one format.
+var adaptive = new ColumnFamilyOptions
+{
+    TableFactory = TableFactoryType.AdaptiveTable,
+    AdaptiveTableWriteFactory = TableFactoryType.BlockBasedTable,
+    PrefixExtractor = SliceTransform.CreateFixedPrefix(5),
+};
+using (RocksDatabase db = RocksDatabase.Open(Path.Combine(path, "plain"), new DbOptions(), adaptive))
+{
+    byte[]? v = db.Get("user:2"u8);                                // read from the plain table file
+}
 ```
 
 ### Flush, compaction and compaction filters

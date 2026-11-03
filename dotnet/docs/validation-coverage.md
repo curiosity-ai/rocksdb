@@ -10,7 +10,7 @@ Status values:
   (DB layer) or audit #3. For audit #3 the entry names the functions compared and any fix.
 - **line-by-line (feature audit: ...)**: compared when the feature was ported. The findings are in the named section of
   validation.md: "Background errors, listeners and backups", "Transactions", "User features", "User-defined
-  timestamps" or "Integrated BlobDB". Audit #3 re-checked defaults and constants where noted.
+  timestamps", "Integrated BlobDB" or "Other SST formats". Audit #3 re-checked defaults and constants where noted.
 - **compaction-features pass**: the pass that ported audit #3's remaining compaction deviations (validation.md,
   "Compaction features (audit #3 remaining deviations)"); the named functions were compared with `main` and with the
   11.12 sources (identical except where noted).
@@ -21,13 +21,13 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (238 files, about 72,600 lines):
+Summary (250 files, about 75,500 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
-| line-by-line (feature audits) | 66 |
+| line-by-line (feature audits) | 78 |
 | line-by-line (#3) | 17 |
 | line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
@@ -207,6 +207,7 @@ changes there need their own review.
 | `Options/OptionEnums.cs` | 178 | include/rocksdb/types.h, include/rocksdb/advanced_options.h, include/rocksdb/options.h | line-by-line (#3): enum values / names |
 | `Options/OptionTypeInfo.cs` | 484 | options/cf_options.cc, options/db_options.cc, table/block_based/block_based_table_factory.cc | line-by-line (#1) |
 | `Options/OptionsBase.cs` | 77 | options/options_helper.cc (unknown-option preservation) | managed-only, design-reviewed (#3): OPTIONS round-trip plumbing |
+| `Options/PlainAndCuckooTableOptions.cs` | 117 | include/rocksdb/table.h (PlainTableOptions, CuckooTableOptions), table/plain/plain_table_factory.cc, table/cuckoo/cuckoo_table_factory.cc (type info) | line-by-line (feature audit: other SST formats) |
 | `Options/OptionsFile.cs` | 408 | options/options_parser.cc, include/rocksdb/version.h | line-by-line (#1) |
 | `Options/SstPartitioner.cs` | 166 | include/rocksdb/sst_partitioner.h, db/compaction/sst_partitioner.cc | line-by-line (compaction-features pass): SstPartitioner / factory / fixed prefix, ShouldPartitionByPrefix, OPTIONS id form |
 | `Options/SliceTransform.cs` | 180 | include/rocksdb/slice_transform.h, util/slice.cc | line-by-line (feature audit: table prefix (prefix extractor)) |
@@ -238,8 +239,19 @@ changes there need their own review.
 | `Table/Footer.cs` | 220 | table/format.h, table/block_based/block_based_table_reader.h, table/format.cc | line-by-line (#1) |
 | `Table/IndexBuilder.cs` | 480 | table/block_based/index_builder.h, table/block_based/index_builder.{h,cc} | line-by-line (#1); compaction-features pass: UpdateIndexSizeEstimate (shortened, partitioned) |
 | `Table/PinnedFilterPartitions.cs` | 56 | table/block_based/partitioned_filter_block.cc | line-by-line (#1) |
+| `Table/Cuckoo/CuckooTableBuilder.cs` | 465 | table/cuckoo/cuckoo_table_builder.{h,cc}, table/cuckoo/cuckoo_table_factory.h (CuckooHash) | line-by-line (feature audit: other SST formats) |
+| `Table/Cuckoo/CuckooTableReader.cs` | 317 | table/cuckoo/cuckoo_table_reader.{h,cc} | line-by-line (feature audit: other SST formats) |
+| `Table/Plain/PlainTableBloom.cs` | 118 | table/plain/plain_table_bloom.{h,cc}, util/bloom_impl.h | line-by-line (feature audit: other SST formats) |
+| `Table/Plain/PlainTableBuilder.cs` | 232 | table/plain/plain_table_builder.{h,cc} | line-by-line (feature audit: other SST formats) |
+| `Table/Plain/PlainTableIndex.cs` | 204 | table/plain/plain_table_index.{h,cc} | line-by-line (feature audit: other SST formats) |
+| `Table/Plain/PlainTableKeyCoding.cs` | 360 | table/plain/plain_table_key_coding.{h,cc} | line-by-line (feature audit: other SST formats) |
+| `Table/Plain/PlainTableReader.cs` | 559 | table/plain/plain_table_reader.{h,cc}, table/plain/plain_table_factory.cc | line-by-line (feature audit: other SST formats) |
+| `Table/TableBuilder.cs` | 83 | table/table_builder.h | line-by-line (feature audit: other SST formats) |
 | `Table/TableFormatOptions.cs` | 122 | include/rocksdb/table.h, table/table_builder.h | line-by-line (#1) |
+| `Table/TableReader.cs` | 148 | table/table_reader.h | line-by-line (feature audit: other SST formats) |
+| `Table/TableReaderFactory.cs` | 121 | table/adaptive/adaptive_table_factory.cc, table/format.cc (ReadFooterFromFile), table/meta_blocks.cc | line-by-line (feature audit: other SST formats) |
 | `Table/TableProperties.cs` | 373 | table/table_properties.cc, table/sst_file_writer.cc, include/rocksdb/table_properties.h | line-by-line (#1) |
+| `Table/UserDefinedIndex.cs` | 156 | include/rocksdb/index_factory.h, include/rocksdb/user_defined_index.h, table/block_based/user_defined_index_wrapper.h | line-by-line (feature audit: other SST formats) |
 | `Util/ByteCompare.cs` | 73 | (memcmp) | managed-only, design-reviewed (#3): memcmp |
 | `Util/Coding.cs` | 256 | util/coding.h | line-by-line (#1) |
 | `Util/Comparator.cs` | 211 | include/rocksdb/comparator.h, util/comparator.cc | line-by-line (#1) |
