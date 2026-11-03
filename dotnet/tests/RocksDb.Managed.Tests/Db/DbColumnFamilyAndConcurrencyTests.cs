@@ -96,16 +96,19 @@ public sealed class DbColumnFamilyAndConcurrencyTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    [DataRow(true, true)]
-    [DataRow(true, false)]
-    [DataRow(false, true)]
-    public async Task ConcurrentWritersSyncAndAsync(bool concurrentMemtableWrite, bool adaptiveYield)
+    [DataRow(true, true, false)]
+    [DataRow(true, false, false)]
+    [DataRow(false, true, false)]
+    [DataRow(true, true, true)]
+    [DataRow(false, true, true)]
+    [DataRow(true, false, true)]
+    public async Task ConcurrentWritersSyncAndAsync(bool concurrentMemtableWrite, bool adaptiveYield, bool pipelined)
     {
         // Single-key writes form groups below the parallel threshold: force the parallel inserts to exercise them.
         TestHooks.ForceParallelMemtableWrites = concurrentMemtableWrite;
         try
         {
-            await ConcurrentWritersSyncAndAsyncCore(concurrentMemtableWrite, adaptiveYield);
+            await ConcurrentWritersSyncAndAsyncCore(concurrentMemtableWrite, adaptiveYield, pipelined);
         }
         finally
         {
@@ -113,7 +116,7 @@ public sealed class DbColumnFamilyAndConcurrencyTests
         }
     }
 
-    private static async Task ConcurrentWritersSyncAndAsyncCore(bool concurrentMemtableWrite, bool adaptiveYield)
+    private static async Task ConcurrentWritersSyncAndAsyncCore(bool concurrentMemtableWrite, bool adaptiveYield, bool pipelined)
     {
         MemoryFileSystem fs = NewFs();
         var cfo = new ColumnFamilyOptions { WriteBufferSize = 256 * 1024, ArenaBlockSize = 16 * 1024, MaxWriteBufferNumber = 3 };
@@ -122,6 +125,7 @@ public sealed class DbColumnFamilyAndConcurrencyTests
         DbOptions options = NewOptions(fs);
         options.AllowConcurrentMemtableWrite = concurrentMemtableWrite;
         options.EnableWriteThreadAdaptiveYield = adaptiveYield;
+        options.EnablePipelinedWrite = pipelined;
         await using (RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, options, cfo))
         {
             var sw = Stopwatch.StartNew();
@@ -181,14 +185,18 @@ public sealed class DbColumnFamilyAndConcurrencyTests
     /// </summary>
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task ParallelMemtableInsertsWithWalTerminationPoints()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task ParallelMemtableInsertsWithWalTerminationPoints(bool pipelined)
     {
         MemoryFileSystem fs = NewFs();
         const int threads = 6, perThread = 300;
         TestHooks.ForceParallelMemtableWrites = true;
+        DbOptions options = NewOptions(fs);
+        options.EnablePipelinedWrite = pipelined;
         try
         {
-            await using (RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs)))
+            await using (RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, options))
             {
                 var tasks = new Task[threads];
                 for (int t = 0; t < threads; t++)
@@ -234,6 +242,197 @@ public sealed class DbColumnFamilyAndConcurrencyTests
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Pipelined writes (enable_pipelined_write) under memtable and WAL switches: small memtables over two column
+    /// families and a small max_total_wal_size make the WAL leader drain the memtable stage (WaitForMemTableWriters)
+    /// before every switch, while writers (sync and async API, some with per-key protection, some with merge operands,
+    /// which are inserted alone) and manual flushes run concurrently. Every write must be readable, the last sequence
+    /// must count every key, and a reopen (WAL recovery) must see the same data.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    [DataRow(true)]
+    [DataRow(false)]
+    public async Task PipelinedWritesWithMemtableAndWalSwitches(bool concurrentMemtableWrite)
+    {
+        MemoryFileSystem fs = NewFs();
+        DbOptions options = NewOptions(fs);
+        options.EnablePipelinedWrite = true;
+        options.AllowConcurrentMemtableWrite = concurrentMemtableWrite;
+        options.CreateMissingColumnFamilies = true;
+        options.MaxTotalWalSize = 256 * 1024;
+        options.Statistics = new Statistics();
+        var cfo = new ColumnFamilyOptions
+        {
+            WriteBufferSize = 64 * 1024, MaxWriteBufferNumber = 4, MergeOperator = new StringAppendOperator(),
+        };
+        const int threads = 6, perThread = 400;
+        ColumnFamilyDescriptor[] cfs = [new("default", cfo), new("cf1", cfo)];
+        await using (RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, options, cfs))
+        {
+            ColumnFamily cf1 = db.GetColumnFamily("cf1");
+            using var stop = new CancellationTokenSource();
+            Task flusher = Task.Run(async () =>
+            {
+                while (!stop.IsCancellationRequested)
+                {
+                    await db.FlushAsync();
+                    await Task.Delay(5);
+                }
+            });
+            var tasks = new Task[threads];
+            for (int t = 0; t < threads; t++)
+            {
+                int id = t;
+                tasks[t] = Task.Factory.StartNew(() =>
+                {
+                    ColumnFamily cf = id % 2 == 0 ? db.DefaultColumnFamily : cf1;
+                    for (int i = 0; i < perThread; i++)
+                    {
+                        var wo = new WriteOptions { Sync = i % 40 == 0, ProtectionBytesPerKey = id % 3 == 0 ? 8UL : 0UL };
+                        using WriteBatch b = db.CreateWriteBatch();
+                        b.Put(cf, B("p" + id + "-" + i), Value(i, id));
+                        if (i % 7 == 0) b.Merge(cf, B("m" + id), B(i.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                        if (id % 2 == 0) db.Write(wo, b);
+                        else db.WriteAsync(wo, b).AsTask().GetAwaiter().GetResult();
+                    }
+                }, TaskCreationOptions.LongRunning);
+            }
+            await Task.WhenAll(tasks);
+            stop.Cancel();
+            await flusher;
+            ulong keys = 0;
+            for (int t = 0; t < threads; t++)
+            {
+                ColumnFamily cf = t % 2 == 0 ? db.DefaultColumnFamily : cf1;
+                for (int i = 0; i < perThread; i++)
+                {
+                    CollectionAssert.AreEqual(Value(i, t), cf.Get(B("p" + t + "-" + i)), "t" + t + " i" + i);
+                    keys += i % 7 == 0 ? 2UL : 1UL;
+                }
+                Assert.AreEqual(ExpectedMerge(perThread), S(cf.Get(B("m" + t))));
+            }
+            Assert.AreEqual(keys, db.GetLatestSequenceNumber());
+            Assert.IsTrue(options.Statistics.GetTickerCount(Ticker.NumberKeysWritten) == keys);
+        }
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfs))
+        {
+            ColumnFamily cf1 = db.GetColumnFamily("cf1");
+            for (int t = 0; t < threads; t++)
+            {
+                ColumnFamily cf = t % 2 == 0 ? db.DefaultColumnFamily : cf1;
+                for (int i = 0; i < perThread; i += 7) CollectionAssert.AreEqual(Value(i, t), cf.Get(B("p" + t + "-" + i)));
+                Assert.AreEqual(ExpectedMerge(perThread), S(cf.Get(B("m" + t))));
+            }
+        }
+
+        static string ExpectedMerge(int n)
+        {
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < n; i += 7)
+            {
+                if (sb.Length > 0) sb.Append(',');
+                sb.Append(i.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>
+    /// The two stages of pipelined writes overlap: while the first write's memtable insert is held, a second write
+    /// completes its WAL stage (the next WAL group), but neither is visible before the first group's insert publishes
+    /// its sequence; then both complete in order.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task PipelinedWalStageOverlapsMemtableStage()
+    {
+        DbOptions options = NewOptions(NewFs());
+        options.EnablePipelinedWrite = true;
+        options.Statistics = new Statistics();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, options);
+        using var inMem = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        int calls = 0;
+        TestHooks.Set("DBImpl::PipelinedWriteImpl:MemTableWriterLeader", () =>
+        {
+            if (Interlocked.Increment(ref calls) != 1) return;
+            inMem.Set();
+            release.Wait();
+        });
+        try
+        {
+            ulong walGroupsBefore = options.Statistics.GetTickerCount(Ticker.WriteDoneBySelf);
+            Task first = Task.Factory.StartNew(() => db.Put(B("k1"), B("v1")), TaskCreationOptions.LongRunning);
+            Assert.IsTrue(inMem.Wait(30_000));
+            Task second = db.PutAsync(B("k2"), B("v2")).AsTask();
+            var sw = Stopwatch.StartNew();
+            while (options.Statistics.GetTickerCount(Ticker.WriteDoneBySelf) < walGroupsBefore + 2 && sw.ElapsedMilliseconds < 30_000) await Task.Delay(1);
+            Assert.AreEqual(walGroupsBefore + 2, options.Statistics.GetTickerCount(Ticker.WriteDoneBySelf), "second WAL group not written");
+            Assert.AreEqual(0UL, db.GetLatestSequenceNumber());
+            Assert.IsNull(db.Get(B("k1")));
+            Assert.IsFalse(first.IsCompleted);
+            Assert.IsFalse(second.IsCompleted);
+            release.Set();
+            await Task.WhenAll(first, second);
+            Assert.AreEqual(2UL, db.GetLatestSequenceNumber());
+            Assert.AreEqual("v1", S(db.Get(B("k1"))));
+            Assert.AreEqual("v2", S(db.Get(B("k2"))));
+        }
+        finally
+        {
+            release.Set();
+            TestHooks.Set("DBImpl::PipelinedWriteImpl:MemTableWriterLeader", null);
+        }
+    }
+
+    /// <summary>
+    /// Option checks of pipelined writes, as upstream: unordered_write and atomic_flush are rejected at open
+    /// (DBImpl::ValidateOptions), two_write_queues at write time (DBImpl::WriteImpl).
+    /// </summary>
+    [TestMethod]
+    public void PipelinedWriteIncompatibleOptions()
+    {
+        DbOptions o = NewOptions(NewFs());
+        o.EnablePipelinedWrite = true;
+        o.UnorderedWrite = true;
+        var e = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbPath, o));
+        Assert.AreEqual(StatusCode.InvalidArgument, e.Code, e.Message);
+
+        o = NewOptions(NewFs());
+        o.EnablePipelinedWrite = true;
+        o.AtomicFlush = true;
+        e = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbPath, o));
+        Assert.AreEqual(StatusCode.InvalidArgument, e.Code, e.Message);
+
+        o = NewOptions(NewFs());
+        o.UnorderedWrite = true;
+        o.AllowConcurrentMemtableWrite = false;
+        e = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbPath, o));
+        Assert.AreEqual(StatusCode.InvalidArgument, e.Code, e.Message);
+
+        o = NewOptions(NewFs());
+        o.EnablePipelinedWrite = true;
+        o.TwoWriteQueues = true;
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, o))
+        {
+            e = Assert.ThrowsExactly<RocksDbException>(() => db.Put(B("k"), B("v")));
+            Assert.AreEqual(StatusCode.NotSupported, e.Code, e.Message);
+        }
+
+        // Accepted and persisted: the OPTIONS file round-trips the flag.
+        o = NewOptions(NewFs());
+        o.EnablePipelinedWrite = true;
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, o))
+        {
+            db.Put(B("k"), B("v"));
+            Assert.AreEqual("v", S(db.Get(B("k"))));
+        }
+        OptionsFile persisted = OptionsFile.Load(o.FileSystem, OptionsFile.FindLatestOptionsFile(o.FileSystem, DbPath)!, preserveUnknownOptions: true);
+        DbOptions loaded = persisted.DbOptions;
+        Assert.IsTrue(loaded.EnablePipelinedWrite);
     }
 
     /// <summary>

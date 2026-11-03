@@ -135,6 +135,20 @@ leader wakes the followers with `StateParallelMemtableWriter`, every writer inse
 parallel for any group of two or more writers; for small groups the two extra hand-offs per writer cost more than the
 serial inserts (docs/perf.md, "Read/write contention").
 
+With `enable_pipelined_write` (`DbImpl.WritePipelinedAsync`, upstream `PipelinedWriteImpl`) the WAL write and the
+memtable inserts are separate stages with a queue each. The WAL leader groups writers, runs `PreprocessWrite`, the write
+callbacks and the sequence allocation, writes the group's WAL record, then links the group's memtable writers to the
+memtable writer queue and only then hands WAL leadership on (`WriteThread.ExitAsPipelinedWalLeader`, upstream
+`LinkGroup`), so the next group's WAL write overlaps this group's inserts. The first queued memtable writer becomes
+memtable leader (`StateMemtableWriterLeader`), takes the following queued writers (`EnterAsMemTableWriter`), inserts them
+serially or wakes them for parallel inserts, publishes the group's last sequence and hands the stage on
+(`ExitAsMemTableWriter`). Memtable groups run one at a time in WAL order, so sequences are published in order. Anything
+that switches memtables or needs exclusive access (`PreprocessWrite` before a memtable / WAL switch, unbatched leaders such
+as flush, ingestion and close, writers whose callback disallows batching) first drains the memtable stage
+(`WaitForMemTableWriters`: a marker queued behind the pending memtable writers). As upstream, pipelined writes are
+rejected with two write queues and seq_per_batch (NotSupported at write time) and with `unordered_write` or `atomic_flush`
+(InvalidArgument at open).
+
 Followers wait in one of two ways:
 
 - **async writers** (`PutAsync`, `WriteAsync`) wait on a pooled `IValueTaskSource`

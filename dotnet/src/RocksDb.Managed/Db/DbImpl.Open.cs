@@ -58,9 +58,30 @@ internal sealed partial class DbImpl
         _dbLock = null;
     }
 
+    /// <summary>
+    /// The write-mode checks of DBImpl::ValidateOptions (db/db_impl/db_impl_open.cc); messages copied verbatim.
+    /// unordered_write itself is accepted and writes are ordered (a stronger guarantee than it asks for). Upstream checks
+    /// the column families first: a column family with blob direct write reports its own NotSupported for these write
+    /// modes (<see cref="ColumnFamilyData"/>), so the DB-level checks are left to it then.
+    /// </summary>
+    private static void ValidateWriteModeOptions(DbOptions o, IReadOnlyList<ColumnFamilyDescriptor> columnFamilies)
+    {
+        foreach (ColumnFamilyDescriptor d in columnFamilies)
+        {
+            if (d.Options is { EnableBlobDirectWrite: true, EnableBlobFiles: true }) return;
+        }
+        if (o.UnorderedWrite && !o.AllowConcurrentMemtableWrite)
+            ThrowHelper.InvalidArgument("unordered_write is incompatible with !allow_concurrent_memtable_write");
+        if (o.UnorderedWrite && o.EnablePipelinedWrite)
+            ThrowHelper.InvalidArgument("unordered_write is incompatible with enable_pipelined_write");
+        if (o.AtomicFlush && o.EnablePipelinedWrite)
+            ThrowHelper.InvalidArgument("atomic_flush is incompatible with enable_pipelined_write");
+    }
+
     private async ValueTask OpenCoreAsync(IReadOnlyList<ColumnFamilyDescriptor> columnFamilies, bool synchronous, CancellationToken ct)
     {
         // ---- descriptors (DB::Open requires the default CF; we add it with default options when omitted) ----
+        ValidateWriteModeOptions(Options, columnFamilies);
         var descriptors = new Dictionary<string, ColumnFamilyOptions>(StringComparer.Ordinal);
         foreach (ColumnFamilyDescriptor d in columnFamilies)
         {
