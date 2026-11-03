@@ -117,10 +117,14 @@ workload (no JIT there, but the page cache, allocator and file system then start
    keys + flush), waitforcompaction, compact. The 64 small flushes and the automatic compactions they trigger push the
    methods that run once per flush / table file / compaction / DB open through tier 0 -> instrumented -> tier 1 (each
    step needs ~30 calls), even when the list has no flush or compaction.
-4. The warm-up DB (and its `-txn*` siblings) is deleted; C rebuilds its options, so the measured DB starts with a fresh
+4. .NET only: extra cycles of 4 x (overwrite + flush) + compact, each compaction after the JIT has quiesced, until a
+   compaction compiles fewer than 10 methods (at most 16 cycles). The methods that run once per compaction output file
+   or subcompaction need ~60 calls to reach tier 1; with small target files or subcompactions the fixed cycles create too
+   few output files and the measured `compact` used to tier up 200 - 400 methods.
+5. The warm-up DB (and its `-txn*` siblings) is deleted; C rebuilds its options, so the measured DB starts with a fresh
    block cache in every leg. .NET: a full blocking GC, then the runner waits until
    `JitInfo.GetCompiledMethodCount` has been stable for 200 ms.
-5. Every **measured** benchmark starts after a settle pause: the .NET runner waits until the JIT has been quiet for
+6. Every **measured** benchmark starts after a settle pause: the .NET runner waits until the JIT has been quiet for
    200 ms (methods that reached their call count during the DB open or the previous benchmark are compiled then), the
    C leg sleeps 200 ms.
 

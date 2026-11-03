@@ -1157,6 +1157,86 @@ concurrently and publishes after the last one; the replica uses 4 threads: 0.70-
 went from 39-268 ms to 5-8 ms and the catch-up from 0.1-0.6 s to 23-68 ms (load 4-6). Details: docs/benchmarks.md
 "Replica apply with parallel memtable inserts", `bench/results/2026-11-03-replication-apply.md`.
 
+## Final-run regressions: flush, readahead, compaction allocations, subcompaction scaling
+
+Follow-up of "Final run on a new VM CPU". Interleaved A/B on the quiet 4-vCPU VM, warm-up on, medians (n = runs per
+engine): `c` = c-native, `old` = tree `0f866b8`, `base` = `549770a` (final run + the FlushAsync waiter fix), `new` =
+this change; `-a` = async API.
+
+**1. `flush` (1.3 - 2x of C).** Stopwatch marks through the flush path showed 38 - 55 ms spent before the flush was
+even scheduled, in the memtable switch's `ReleaseObsoleteClosedWals`: with a single column family a closed WAL is not
+synced at the switch (lazy closed-WAL sync, as upstream), so its writer stays open until a sync write or the next
+switch, which closed the obsolete ones inline. By then the flush's purge had already unlinked the file, so that
+`close()` was the real deletion of a 64+ MiB file (ext4 freeing its blocks, `discard` mount; strace: `close` 53 ms).
+The old tree synced and closed the WAL at the switch (28 ms of fdatasync, cheaper). Upstream moves these writers to
+`logs_to_free_` and deletes them in the background purge; the port now hands them to the next `PurgeObsoleteFiles`
+(or closes them at shutdown). Not the cause, checked on the way: WAL tracking (only with
+`track_and_verify_wals_in_manifest`), MANIFEST writes (< 1 ms), the post-flush purge (already after the waiter
+release). Also aligned: writable files are no longer `ftruncate(0)`d after `O_CREAT` (.NET `FileMode.Create`
+does that unconditionally; upstream's `O_TRUNC` only truncates an existing file, and a truncate to 0 arms ext4's
+auto_da_alloc flush on close).
+
+| flush, ms | c | old | base | new | base-a | new-a |
+|---|---:|---:|---:|---:|---:|---:|
+| 100k x 1 KiB after fillseq,fillrandom,overwrite (n = 5) | 43.7 | 38.4 | 75.9 | **39.0** | 78.0 | **31.9** |
+| 300k x 100 B, same list (n = 3) | 99.7 | | 112.4 | **83.6** | | |
+
+The rest of a flush is the table write and its fdatasync (~50 ms for 100 MB here), as in C.
+
+**2. User-iterator readahead (`seekrandom` 1 KiB 1.21x of C, `readseq` allocations).** The auto readahead read through
+an `AsyncPrefetchBuffer` (8 KiB+ copy into a pooled buffer) on the third sequential block, i.e. on nearly every Seek +
+10 Next over ~4 entries per block, and the next seek threw it away. Ported `BlockPrefetcher::PrefetchIfNeeded` as is:
+`readahead_limit_` / `readahead_size_`, and with buffered I/O an OS prefetch (`IRandomAccessFile.Prefetch` =
+`readahead(2)` on Linux, PosixRandomAccessFile::Prefetch) of the block plus readahead_size_ whenever a block lies past
+the prefetched range, doubling to max_auto_readahead_size; blocks are read normally (from the page cache). The buffer is
+only the fallback where `Prefetch` is not supported; `ReadOptions.readahead_size` keeps it, as upstream.
+
+| µs/op, 100k x 1 KiB (n = 5) | c | base | new | base-a | new-a |
+|---|---:|---:|---:|---:|---:|
+| seekrandom | 14.85 | 16.61 | **10.21** | 9.93 | 10.83 |
+| readseq (alloc B/op) | 0.96 | 0.69 (7.2) | 0.66 (**0.7**) | 0.68 (0.6) | 0.77 (0.6) |
+| readseq 300k x 100 B (n = 3; alloc) | 0.47 | 0.24 (8.1) | 0.27 (**0.2**) | | |
+
+(The old tree: seekrandom 9.38, readseq 0.64 / 0.7 B/op. The async paths never used the readahead.)
+
+**3. Compaction allocations.** An allocation-tick sampler (EventListener on GCAllocationTick, temporary) showed
+byte[] of 2 MiB and 4 MiB: every compaction input file (per subcompaction: all L0 files) got an `AsyncPrefetchBuffer`
+of compaction_readahead_size (2 MiB) plus a 2 MiB + 64 KiB prefetch half (rented as 4 MiB); with dozens of concurrent
+input iterators the shared ArrayPool overflowed and allocated them on the LOH. Upstream's compaction readahead with
+buffered I/O is again only an OS prefetch (`fs_prefetch_support`: `Prefetch(offset, len + compaction_readahead_size)`
+past `readahead_limit_`); ported the same way, the buffer stays as the fallback.
+
+| compaction allocations | base | new |
+|---|---:|---:|
+| `compact` 1M x 100 B, 1 subcompaction | 74.0 MB | **0.45 MB** |
+| `compact` 1M x 100 B, 4 subcompactions | 297 MB | **3.6 MB** |
+| `compact` 300k x 100 B (matrix) | 22.7 MB | **2.1 MB** |
+| compaction-heavy fillrandom / overwrite (B/op, n = 6) | 71.7 / 129 | **5.1 / 10.3** (old 4.8 / 10.3) |
+
+**4. Subcompaction scaling (C 697 -> 330 ms, managed 586 -> 484 ms).** Trace marks: the 4 subcompactions start within
+20 ms of each other on their own threads (LongRunning, not limited by max_background_jobs) and each processes 1/4 of
+the records, but each took ~360 ms. With `DOTNET_TieredCompilation=0` or `DOTNET_TieredPGO=0` 4 subcompactions take
+350 - 380 ms, and the measured `compact` showed 180 - 410 methods / 100 - 300 ms of JIT (also in the final extras
+run): methods called once per output file / subcompaction (~60 calls to reach tier 1) were tiering up during the
+measurement, competing for the 4 cores with the 4 subcompaction threads (background JIT, runtime suspensions for
+tier-up: 19% of the subcompaction threads' samples in `PollGC`). The warm-up's fixed cycles create only a few output
+files when the warm-up DB is small compared with target_file_size_base. dbbench now adds extra (overwrite + flush) x 4
++ compact cycles until a warm-up compaction compiles fewer than 10 methods (2 - 7 cycles, +2 - 4 s of warm-up here;
+bench/README.md "Warm-up"). `fillrandom,compact`, 1M x 100 B, 16 MiB memtables, 4 MiB target files, 8 background jobs
+(n = 3):
+
+| compact, ms | c | base | new |
+|---|---:|---:|---:|
+| max_subcompactions 1 | 683 | 645 | **588** |
+| max_subcompactions 4 | 354 | 446 | **294** |
+
+(`new` with 4 subcompactions: jit 40 methods / 64 ms instead of 182 - 414.)
+
+**5. Compaction-heavy reads (readrandom 1.22x, seekrandom 1.31x of the old tree).** Re-measured with 6 interleaved runs
+(500k x 100 B, compaction-heavy shape): readrandom c 7.57, old 5.02, base 5.29, new **4.98** µs/op; seekrandom c 27.4,
+old 11.9, base 16.4, new **10.6**. The seek regression was the readahead buffer of (2); readrandom is within noise
+(CV ~10% in all trees). Read sampling (`FileReadSample`, one thread-static RNG step per Get / seek) was not changed.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
@@ -1171,8 +1251,7 @@ went from 39-268 ms to 5-8 ms and the catch-up from 0.1-0.6 s to 23-68 ms (load 
   awaits, async table paths load index partitions asynchronously, user iterators use (auto) readahead, and the
   readahead's prefetches no longer allocate a Task each (see "Allocation-free readahead prefetches, forward pinned
   merge operands").
-- From the 2026-11-03 final run ("Final run on a new VM CPU"): release `FlushAsync` waiters when the flush is
-  installed, before the obsolete-file purge (`flush` 1.2-2.1x of C); start the user-iterator auto readahead with an OS
-  readahead hint instead of a prefetch buffer read, as upstream (`seekrandom` 1 KiB 1.21x of C, sync `readseq`
-  allocations); find why 4 subcompactions scale 1.2x (native 2.1x) and why compaction allocates 4x more than before;
-  replica apply throughput below a primary that group-commits 100-entry batches at full speed.
+- From the 2026-11-03 final run: done (see "Final-run regressions: flush, readahead, compaction allocations,
+  subcompaction scaling"). Still open: `readrandom` with 1 KiB values allocates ~86 B/op (100 B: ~29 B/op) in every
+  tree since `0f866b8` (block cache misses with the 8 MiB cache; not investigated); the dbbench `overwrite` row of the
+  300k x 100 B matrix configuration allocates ~80 B/op (not investigated).

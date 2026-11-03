@@ -205,6 +205,8 @@ public static class DbBenchRunner
     /// <see cref="WarmupFlushesPerCycle"/> x (overwrite of --warmup_ops / 50 keys + flush), waitforcompaction, compact.
     /// They compile and tier up the DB open, flush, table file, automatic compaction picking and compaction paths even
     /// when the list has no flush or compaction.</item>
+    /// <item>extra compaction cycles until a compaction compiles (almost) nothing (<see cref="RunExtraCompactionCycles"/>;
+    /// .NET only).</item>
     /// </list>
     /// Afterwards a full blocking GC runs and the JIT is given time to quiesce (compiled method count stable for
     /// 200 ms, at most 10 s). JIT statistics before / after are printed; every measured benchmark then prints the
