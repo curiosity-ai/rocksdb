@@ -157,7 +157,7 @@ Remaining-gap wave (agents running):
   readmissing with 100 B values (1.4-3.0x). BDN vs rocksdb-sharp: 0.21-0.60x, hot paths allocation-free.
 - [x] Fixed close/background-flush race found by the benchmark warm-up (purge after a flush could run after close and delete a
   new DB's MANIFEST in the same directory).
-- [ ] Perf: 4-thread sync random writes and 4-thread readmissing (see above)
+- [x] Perf: 4-thread sync random writes and 4-thread readmissing (see Remaining gaps)
 Final completeness wave (all merged):
 - [x] Integrated BlobDB: blob file format/builder/reader/cache/GC, versions & MANIFEST, Get/MultiGet/iterators/merges, checkpoint/GetLiveFiles; blob files byte-identical to native; native↔managed both ways; blob dbbench (`results/2026-11-02-vm-blob.md`: managed 0.55x C)
 - [x] Blob: zlib >16 KiB (16 KiB independent chunks; readable by native), blob readers bounded by max_open_files; forced GC universal/FIFO = parity (upstream leveled-only)
@@ -233,9 +233,9 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [x] auto-resizing HyperClock (growable table, writers pause briefly; upstream is lock-free linear hashing), GenericRateLimiter for flush/compaction writes
   - [ ] rate limiter on reads + tickers (S); reader-affecting table options via SetOptions (S); normal open of a DB with a truncated SST fails only at first read (S)
 - Write path / iterators perf
-  - [ ] 4-thread sync random writes, 4-thread readmissing (see final benchmarks)
+  - [x] 4-thread readmissing (per-processor SuperVersion cache, pinned table readers: 0.41->0.31 us sync, 0.62->0.33 async, C 0.43) and sync group-commit wait (AwaitState port), parallel memtable inserts for groups >= 64 entries (loaded-machine numbers; re-measure quietly)
   - [ ] reverse iteration pins blocks instead of copying (M); async reverse movement (M); range tombstones in iterator heap (M/L)
-  - [ ] concurrent memtable insert (M); pipelined write (L); non-blocking SyncAsync (S); LZ4 encoder / cold-start JIT (M)
+  - [ ] pipelined write (L); parallel insert for small groups is slower than serial - investigate (S); non-blocking SyncAsync (S); LZ4 encoder / cold-start JIT (M)
 - Ingestion / TTL / stats
   - [x] ingestion: write_global_seqno (legacy, + reader checksum fallback), ingest_behind, overlapping files in one call, allow_db_generated_files, link_files; TTL iterator; GET_HIT_L*, file-read histograms, cfstats intervals; KeyMayExist without I/O
   - [ ] ingestion atomic_replace_range / checksum generation / temperatures (S/M); GET_HIT for MultiGet, FILE_READ_FLUSH/DB_OPEN (S)
