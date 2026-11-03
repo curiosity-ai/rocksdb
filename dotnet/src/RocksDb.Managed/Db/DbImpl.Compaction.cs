@@ -446,6 +446,7 @@ internal sealed partial class DbImpl
             ulong[] snapshots = SnapshotsForCompaction();
             Compaction? c = cfd.CompactionState.Picker.PickCompaction(cfd.Current.Storage, snapshots);
             if (c is null) continue;
+            if (!EnoughRoomForCompaction(cfd, c)) continue;
             if (ShouldForwardToBottomPriorityPool(cfd, c))
             {
                 ForwardToBottomPriorityPool(cfd, c, snapshots);
@@ -838,6 +839,7 @@ internal sealed partial class DbImpl
             var installed = new List<FileMetaData>(edit.NewFiles.Count);
             foreach (NewFileEntry nf in edit.NewFiles) installed.Add(nf.Meta);
             c.InstalledFiles = installed;
+            if (job is not null && job.Outputs.Count > 0) MaybeReportMaxAllowedSpaceReached(BackgroundErrorReason.Compaction);
             ok = true;
             Interlocked.Increment(ref _statCompactions);
             if (job is not null)
@@ -890,6 +892,7 @@ internal sealed partial class DbImpl
                     foreach (ulong n in job.CreatedFileNumbers) _pendingOutputs.Remove(n);
                 }
                 cfd.CompactionState.Picker.ReleaseCompactionFiles(c, ok);
+                ReleaseCompactionRoom(c);
                 if (c.InputVersion is not null) Versions.UnrefVersion(c.InputVersion);
                 if (!cfd.Dropped && cfd.Current is not null)
                 {

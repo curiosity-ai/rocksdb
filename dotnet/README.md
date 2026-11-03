@@ -61,7 +61,9 @@ tailing), snapshots, merge operators, single delete, range deletion, leveled / u
 compaction filters and TTL, manual compaction, write stalls, block cache (LRU and HyperClock), statistics, event
 listeners, the info `LOG`, dynamic options (`SetOptions` / `SetDBOptions`), optimistic and pessimistic transactions,
 `WriteBatchWithIndex`, wide columns, user-defined timestamps, BlobDB, TTL, checkpoints, BackupEngine, `SstFileWriter` /
-ingestion, WAL tailing, read-only and secondary instances, background error handling with `Resume`.
+ingestion, WAL tailing, read-only and secondary instances, background error handling with `Resume`, best-efforts recovery, WAL tracking in
+the MANIFEST (`TrackAndVerifyWalsInManifest`), an `SstFileManager` (space limit, rate-limited deletion, automatic
+recovery from out-of-space errors) and a `GenericRateLimiter` for flush and compaction writes (`DbOptions.RateLimiter`).
 
 The [replication layer](src/RocksDb.Managed.Replication/README.md) (checkpoint + WAL streaming, planned switchover,
 Raft cluster, optional gRPC transport) is a separate library on top of the engine.
@@ -941,8 +943,7 @@ Not ported yet:
 - Timestamps in optimistic transactions and explicit-timestamp `WriteBatchWithIndex` writes (NotSupported, as upstream).
 - Range locks; for WritePrepared / WriteUnprepared: iterator invalidation when a WriteUnprepared transaction ends, and
   user-defined timestamps (NotSupported, as upstream).
-- PlainTable and CuckooTable, parallel compression,
-  the SST file manager and a rate limiter for flush and compaction.
+- PlainTable and CuckooTable, parallel compression.
 - Wide-column entities with blob-backed columns (V2) and blob direct write (forced blob GC is leveled-only, as
   upstream).
 - Pipelined writes (`enable_pipelined_write` is accepted and persisted). Concurrent memtable inserts

@@ -181,6 +181,19 @@ public sealed class LocalFileSystem : IFileSystem
     /// <summary>Hard link (link(2) / CreateHardLinkW). Cross-device links throw NotSupported.</summary>
     public void LinkFile(string source, string target) => UnixNative.Link(source, target);
 
+    /// <summary>statvfs f_bavail * f_frsize (PosixFileSystem::GetFreeSpace), through <see cref="DriveInfo"/>.</summary>
+    public long GetFreeSpace(string path)
+    {
+        try
+        {
+            return new DriveInfo(Path.GetFullPath(path)).AvailableFreeSpace;
+        }
+        catch (Exception e) when (e is IOException or ArgumentException or UnauthorizedAccessException)
+        {
+            throw MapException("While doing statvfs", path, e);
+        }
+    }
+
     /// <summary>PosixRandomRWFile::Write + Sync on an existing file.</summary>
     public void WriteAt(string path, long offset, ReadOnlySpan<byte> data)
     {

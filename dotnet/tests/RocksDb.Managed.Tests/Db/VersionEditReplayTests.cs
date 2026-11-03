@@ -258,4 +258,99 @@ public sealed class VersionEditReplayTests
         Assert.AreEqual(21UL, recovered.ColumnFamilies[1].Levels[1][0].FileNumber);
         Assert.AreEqual(9UL, recovered.ColumnFamilies[1].LogNumber);
     }
+
+    // ---- point-in-time (best-efforts) replay: VersionEditHandlerPointInTime -------------------------------------
+
+    private sealed class MissingFiles(params ulong[] missing) : IRecoveryFileVerifier
+    {
+        private readonly HashSet<ulong> _missing = [.. missing];
+        public bool VerifyTableFile(ColumnFamilyVersion cf, int level, FileMetaData meta) => !_missing.Contains(meta.FileNumber);
+        public bool VerifyBlobFile(ColumnFamilyVersion cf, BlobFileAddition addition) => !_missing.Contains(addition.BlobFileNumber);
+    }
+
+    private static VersionEdit AddL(uint cf, int level, FileMetaData f)
+    {
+        var e = new VersionEdit { ColumnFamily = cf };
+        e.AddFile(level, f);
+        return e;
+    }
+
+    private static List<ulong> Files(ColumnFamilyVersion cf)
+    {
+        var r = new List<ulong>();
+        foreach ((_, FileMetaData f) in cf.AllFiles()) r.Add(f.FileNumber);
+        r.Sort();
+        return r;
+    }
+
+    [TestMethod]
+    public void PointInTimeKeepsL0PrefixWhenNewestL0IsMissing()
+    {
+        var r = new ManifestReplayer(null, new MissingFiles(12, 13));
+        r.Apply(Base());
+        r.Apply(AddL(0, 0, F(10, "a", "b", 1, 1)));
+        r.Apply(AddL(0, 0, F(11, "a", "b", 3, 2)));
+        r.Apply(AddL(0, 0, F(12, "a", "b", 5, 3)));
+        r.Apply(AddL(0, 0, F(13, "a", "b", 7, 4)));
+        RecoveredVersionState s = r.Finish();
+        Assert.IsTrue(r.HasMissingFiles);
+        CollectionAssert.AreEqual(new ulong[] { 10, 11 }, Files(s.ColumnFamilies[0]));
+    }
+
+    [TestMethod]
+    public void PointInTimeStopsBeforeAMissingFileThatIsNotTheNewest()
+    {
+        var r = new ManifestReplayer(null, new MissingFiles(11));
+        r.Apply(Base());
+        r.Apply(AddL(0, 0, F(10, "a", "b", 1, 1)));
+        r.Apply(AddL(0, 0, F(11, "a", "b", 3, 2)));
+        r.Apply(AddL(0, 0, F(12, "a", "b", 5, 3)));
+        // A compaction later removes the missing file: the state becomes valid again.
+        var compaction = new VersionEdit { ColumnFamily = 0 };
+        compaction.DeleteFile(0, 10);
+        compaction.DeleteFile(0, 11);
+        compaction.DeleteFile(0, 12);
+        compaction.AddFile(1, F(14, "a", "b", 1, 0));
+        var r2 = new ManifestReplayer(null, new MissingFiles(11));
+        r2.Apply(Base());
+        r2.Apply(AddL(0, 0, F(10, "a", "b", 1, 1)));
+        r2.Apply(AddL(0, 0, F(11, "a", "b", 3, 2)));
+        r2.Apply(AddL(0, 0, F(12, "a", "b", 5, 3)));
+        r2.Apply(compaction);
+        CollectionAssert.AreEqual(new ulong[] { 10 }, Files(r.Finish().ColumnFamilies[0]));
+        CollectionAssert.AreEqual(new ulong[] { 14 }, Files(r2.Finish().ColumnFamilies[0]));
+    }
+
+    [TestMethod]
+    public void PointInTimeMissingNonL0FileInvalidatesLaterVersions()
+    {
+        var r = new ManifestReplayer(null, new MissingFiles(20));
+        r.Apply(Base());
+        r.Apply(AddL(0, 0, F(10, "a", "b", 1, 1)));
+        r.Apply(AddL(0, 1, F(20, "c", "d", 3, 0)));
+        r.Apply(AddL(0, 0, F(11, "e", "f", 5, 2)));
+        CollectionAssert.AreEqual(new ulong[] { 10 }, Files(r.Finish().ColumnFamilies[0]));
+    }
+
+    [TestMethod]
+    public void PointInTimeAtomicGroupNeedsEveryColumnFamily()
+    {
+        var r = new ManifestReplayer(null, new MissingFiles(31));
+        r.Apply(Base());
+        var addCf = new VersionEdit { ColumnFamily = 1, ComparatorName = "leveldb.BytewiseComparator" };
+        addCf.AddColumnFamily("cf1");
+        r.Apply(addCf);
+        r.Apply(AddL(0, 0, F(10, "a", "b", 1, 1)));
+        r.Apply(AddL(1, 0, F(20, "a", "b", 2, 1)));
+        // Atomic flush of both CFs; cf1's output is missing, so neither CF may use the group's result.
+        VersionEdit g0 = AddL(0, 0, F(30, "a", "b", 3, 2));
+        VersionEdit g1 = AddL(1, 0, F(31, "a", "b", 4, 2));
+        g0.MarkAtomicGroup(1);
+        g1.MarkAtomicGroup(0);
+        r.Apply(g0);
+        r.Apply(g1);
+        RecoveredVersionState s = r.Finish();
+        CollectionAssert.AreEqual(new ulong[] { 10 }, Files(s.ColumnFamilies[0]));
+        CollectionAssert.AreEqual(new ulong[] { 20 }, Files(s.ColumnFamilies[1]));
+    }
 }

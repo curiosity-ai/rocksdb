@@ -45,6 +45,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     {
         DbName = dbname;
         Options = options;
+        SharedTableCache = new TableCacheStore(options.MaxOpenFiles);
         FileSystem = options.FileSystem;
         WalDir = string.IsNullOrEmpty(options.WalDir) ? dbname : options.WalDir.TrimEnd('/');
         var paths = new List<string> { dbname };
@@ -278,7 +279,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
         cfd.Mem.Ref();
         cfd.Current.Ref();
-        var sv = new SuperVersion(cfd.Mem, imm, cfd.Current, ++_superVersionNumber);
+        var sv = new SuperVersion(cfd.Mem, imm, cfd.Current, ++_superVersionNumber, cfd.OptionsSnapshot);
         SuperVersion? old = cfd.SuperOrNull();
         cfd.SetSuper(sv);
         // Reset the cached references before releasing the CF's own one, so that a slot never holds the last reference
@@ -287,6 +288,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
         if (old is not null && old.Unref()) CleanupSuperVersion(old);
         OnSuperVersionInstalled(cfd);
     }
+
+    /// <summary>The table readers of all column families (DBImpl::table_cache_), bounded by max_open_files.</summary>
+    internal TableCacheStore SharedTableCache { get; }
 
     // ---- snapshots --------------------------------------------------------------------------------------
 
@@ -525,6 +529,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         var manifests = new List<ulong>();
         List<(ColumnFamilyData Cfd, ulong Number)>? releasedBlobs = null;
         TestHooks.Invoke("DBImpl::PurgeObsoleteFiles:Start");
+        ulong minLog;
         lock (_mutex)
         {
             // DisableFileDeletions: keep everything queued until deletions are re-enabled (FindObsoleteFiles).
@@ -537,7 +542,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 blobs.RemoveAll(b => _pendingOutputs.Contains(b.BlobFileNumber));
                 releasedBlobs = TakeReleasedBlobDirectWriteFiles();
             }
-            ulong minLog = MinLogNumberToKeepLive();
+            minLog = MinLogNumberToKeepLive();
             for (int i = 0; i < _aliveWals.Count;)
             {
                 ulong n = _aliveWals[i];
@@ -562,7 +567,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             // The SharedBlobFileMetaData deleter: evict the reader, then delete the file (AddObsoleteBlobFile).
             b.Cfd.BlobSource.Evict(b.BlobFileNumber);
             b.Cfd.BlobDirectWrite?.Forget(b.BlobFileNumber);
-            TryDeleteFile(FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber));
+            DeleteDbFile(FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber), DbPaths[0]);
         }
         if (releasedBlobs is not null)
         {
@@ -572,6 +577,12 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 cfd.BlobDirectWrite?.Forget(n);
                 TryDeleteFile(FileNames.BlobFileName(DbPaths[0], n));
             }
+        }
+        if (wals.Count > 0 && !TryPersistWalDeletion(minLog))
+        {
+            // The MANIFEST still tracks them: keep the WALs until a later purge records their deletion.
+            lock (_mutex) _aliveWals.AddRange(wals);
+            wals.Clear();
         }
         foreach (ulong n in wals) DeleteOrArchiveWal(n);
         foreach (ulong n in manifests) TryDeleteFile(FileNames.DescriptorFileName(DbName, n));
@@ -587,10 +598,11 @@ internal sealed partial class DbImpl : IAsyncDisposable
         var toDelete = new List<string>();
         var options = new List<(ulong Number, string Path)>();
         var walsToDelete = new List<ulong>();
+        ulong minLog;
         lock (_mutex)
         {
             if (FileDeletionsDisabled || _readOnly) return;
-            ulong minLog = MinLogNumberToKeepLive();
+            minLog = MinLogNumberToKeepLive();
             var dirs = new List<string>(DbPaths);
             if (!dirs.Contains(WalDir)) dirs.Add(WalDir);
             foreach (string dir in dirs)
@@ -634,6 +646,11 @@ internal sealed partial class DbImpl : IAsyncDisposable
         options.Sort(static (a, b) => b.Number.CompareTo(a.Number));
         for (int i = 2; i < options.Count; i++) toDelete.Add(options[i].Path);
         foreach (string p in toDelete) TryDeleteFile(p);
+        if (walsToDelete.Count > 0 && !TryPersistWalDeletion(minLog))
+        {
+            lock (_mutex) _aliveWals.AddRange(walsToDelete);
+            walsToDelete.Clear();
+        }
         foreach (ulong n in walsToDelete) DeleteOrArchiveWal(n);
         PurgeObsoleteWalFiles(force: true);
     }
@@ -749,6 +766,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
             _groupBatch.Dispose();
             _nonmemGroupBatch.Dispose();
             try { ShutdownMonitoring(); } catch (Exception e) when (e is IOException or RocksDbException) { }
+            DisposeOwnedSstFileManager();
+            SharedTableCache.Dispose();
             _dbLock?.Dispose();
             _dbLock = null;
             if (_secondary) DisposeSecondaryReaders();

@@ -94,7 +94,9 @@ public sealed class IngestionCompatTests
         string nativePath = Path.Combine(dir.Path, "native"), managedPath = Path.Combine(dir.Path, "managed");
         List<FileInfo> nativeFiles;
         Dictionary<string, string> nativeData;
-        var no = new RocksDbSharp.DbOptions().SetCreateIfMissing(true);
+        // Auto compactions off on both sides: the placement under test is ingestion's, and a background compaction
+        // native schedules after the ingestion (5 L0 files) would otherwise race the file listing.
+        var no = new RocksDbSharp.DbOptions().SetCreateIfMissing(true).SetDisableAutoCompactions(1);
         using (var db = RocksDbSharp.RocksDb.Open(no, nativePath))
         {
             db.Put(U(Key(10)), U("base"));
@@ -104,7 +106,8 @@ public sealed class IngestionCompatTests
             nativeFiles = NativeFiles(db);
             nativeData = NativeScan(db);
         }
-        using (RocksDatabase db = RocksDatabase.Open(managedPath, new DbOptions { CreateIfMissing = true }))
+        using (RocksDatabase db = RocksDatabase.Open(managedPath, new DbOptions { CreateIfMissing = true },
+                   new ColumnFamilyOptions { DisableAutoCompactions = true }))
         {
             db.Put(U(Key(10)), U("base"));
             db.Flush();

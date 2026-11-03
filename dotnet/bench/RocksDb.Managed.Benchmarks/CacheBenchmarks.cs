@@ -22,12 +22,23 @@ public class CacheBenchmarks
 
     private const int Threads = 4;
 
-    [Params(DbBench.BlockCacheKind.Lru, DbBench.BlockCacheKind.HyperClock)]
-    public DbBench.BlockCacheKind CacheType { get; set; } = DbBench.BlockCacheKind.Lru;
+    /// <summary>Cache implementation under test (AutoHyperClock = HyperClockCache with estimated_entry_charge = 0).</summary>
+    public enum Flavor
+    {
+        Lru,
+        HyperClock,
+        AutoHyperClock,
+    }
 
-    private BlockCache Create(long capacity) => CacheType == DbBench.BlockCacheKind.Lru
-        ? BlockCache.CreateLru(capacity)
-        : BlockCache.CreateHyperClock(new HyperClockCacheOptions { Capacity = capacity, EstimatedEntryCharge = BlockSize });
+    [Params(Flavor.Lru, Flavor.HyperClock, Flavor.AutoHyperClock)]
+    public Flavor CacheType { get; set; } = Flavor.Lru;
+
+    private BlockCache Create(long capacity) => CacheType switch
+    {
+        Flavor.Lru => BlockCache.CreateLru(capacity),
+        Flavor.HyperClock => BlockCache.CreateHyperClock(new HyperClockCacheOptions { Capacity = capacity, EstimatedEntryCharge = BlockSize }),
+        _ => BlockCache.CreateHyperClock(new HyperClockCacheOptions { Capacity = capacity, EstimatedEntryCharge = 0 }),
+    };
 
     [GlobalSetup]
     public void Setup()

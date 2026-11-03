@@ -10,10 +10,18 @@ public sealed class HyperClockCacheOptions
     public long Capacity { get; init; }
 
     /// <summary>
-    /// Expected average charge of an entry (e.g. the block size). Required: the fixed-size table is sized as
-    /// capacity / (estimated_entry_charge * 0.7) slots (FixedHyperClockTable::CalcHashBits).
+    /// Expected average charge of an entry (e.g. the block size): the fixed-size table is sized as
+    /// capacity / (estimated_entry_charge * 0.7) slots (FixedHyperClockTable::CalcHashBits). 0 (the upstream default)
+    /// selects the automatically resizing table (AutoHyperClockTable), which starts small and grows with the number of
+    /// entries up to capacity / <see cref="MinAvgEntryCharge"/> slots.
     /// </summary>
     public long EstimatedEntryCharge { get; init; }
+
+    /// <summary>
+    /// min_avg_entry_charge of the automatically resizing table (<see cref="EstimatedEntryCharge"/> = 0): the smallest
+    /// average entry charge the table can grow to accommodate. Default 450 (upstream).
+    /// </summary>
+    public long MinAvgEntryCharge { get; init; } = 450;
 
     /// <summary>log2 of the shard count; -1 picks the default with a 32 MiB minimum shard size.</summary>
     public int NumShardBits { get; init; } = -1;
@@ -63,7 +71,8 @@ public sealed class HyperClockCache : BlockCache
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentOutOfRangeException.ThrowIfNegative(options.Capacity);
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(options.EstimatedEntryCharge, 0);
+        ArgumentOutOfRangeException.ThrowIfNegative(options.EstimatedEntryCharge);
+        if (options.EstimatedEntryCharge == 0) ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(options.MinAvgEntryCharge, 0);
         int bits = options.NumShardBits >= 0 ? options.NumShardBits : GetDefaultCacheShardBits(options.Capacity, MinShardSize);
         if (bits > 19) ThrowHelper.InvalidArgument("num_shard_bits too large");
         int numShards = 1 << bits;
@@ -73,11 +82,14 @@ public sealed class HyperClockCache : BlockCache
         long perShard = (options.Capacity + numShards - 1) / numShards;
         _shards = new ClockShard[numShards];
         for (int i = 0; i < numShards; i++)
-            _shards[i] = new ClockShard(perShard, options.EstimatedEntryCharge, options.StrictCapacityLimit, options.MetadataChargePolicy,
-                options.EvictionEffortCap);
+            _shards[i] = new ClockShard(perShard, options.EstimatedEntryCharge, options.MinAvgEntryCharge, options.StrictCapacityLimit,
+                options.MetadataChargePolicy, options.EvictionEffortCap);
     }
 
     public override string Name => "HyperClockCache";
+
+    /// <summary>The tables resize automatically (estimated_entry_charge = 0).</summary>
+    public bool IsAutoResizing => _shards[0].IsAuto;
 
     public int NumShards => _shards.Length;
 
@@ -280,10 +292,36 @@ internal sealed class ClockShard
     private const double LoadFactor = 0.7;
     private const double StrictLoadFactor = 0.84;
 
-    private readonly ClockSlot[] _array;
-    private readonly int _lengthBits;
-    private readonly int _lengthMask;
-    private readonly long _occupancyLimit;
+    /// <summary>The slot array with its derived sizes; replaced as a whole when an automatic table grows.</summary>
+    internal sealed class Table
+    {
+        public readonly ClockSlot[] Array;
+        public readonly int LengthBits;
+        public readonly int Mask;
+        /// <summary>Occupancy above which an insert must evict (kStrictLoadFactor).</summary>
+        public readonly long OccupancyLimit;
+        /// <summary>Occupancy above which an automatic table grows (kLoadFactor); long.MaxValue when it cannot grow.</summary>
+        public readonly long GrowLimit;
+
+        public Table(ClockSlot[] array, int lengthBits, bool canGrow)
+        {
+            Array = array;
+            LengthBits = lengthBits;
+            Mask = array.Length - 1;
+            OccupancyLimit = (long)(array.Length * StrictLoadFactor);
+            GrowLimit = canGrow ? (long)(array.Length * LoadFactor) : long.MaxValue;
+        }
+    }
+
+    private Table _t;
+    // Automatic resizing (AutoHyperClockTable): the table doubles while it is fuller than LoadFactor and has not reached
+    // its maximum size. Growing moves the slot objects to a new array; operations that change the probe structure
+    // (insert, evict, erase, freeing on release) hold a mutator count, and the grower waits for it to drain.
+    private readonly bool _auto;
+    private readonly int _maxLengthBits;
+    private readonly CacheMetadataChargePolicy _policy;
+    private int _mutators;
+    private int _resizing;
     private readonly uint _evictionEffortCap;
     private long _evictionEffortExceededCount;
     private long _capacity;
@@ -293,24 +331,124 @@ internal sealed class ClockShard
     private long _occupancy;
     private long _clockPointer;
 
-    public ClockShard(long capacity, long estimatedEntryCharge, bool strict, CacheMetadataChargePolicy policy, int evictionEffortCap)
+    /// <summary>Initial size of an automatically resizing table (log2 slots).</summary>
+    private const int AutoInitialLengthBits = 6;
+
+    public ClockShard(long capacity, long estimatedEntryCharge, long minAvgEntryCharge, bool strict, CacheMetadataChargePolicy policy,
+        int evictionEffortCap)
     {
         _capacity = capacity;
         _strict = strict;
+        _policy = policy;
         // SanitizeEvictionEffortCap
         _evictionEffortCap = (uint)Math.Max(1, evictionEffortCap);
-        _lengthBits = CalcHashBits(capacity, estimatedEntryCharge, policy);
-        _array = new ClockSlot[1 << _lengthBits];
-        for (int i = 0; i < _array.Length; i++) _array[i] = new ClockSlot(this, standalone: false);
-        _lengthMask = _array.Length - 1;
-        _occupancyLimit = (long)(_array.Length * StrictLoadFactor);
-        // FixedHyperClockTable::FixedHyperClockTable: the table's metadata is charged up front.
-        if (policy == CacheMetadataChargePolicy.FullCharge) _usage = (long)_array.Length * HyperClockCache.SlotMetadataCharge;
+        int lengthBits;
+        if (estimatedEntryCharge == 0)
+        {
+            // AutoHyperClockTable: the maximum size is what the minimum average entry charge would need.
+            _auto = true;
+            _maxLengthBits = CalcHashBits(capacity, minAvgEntryCharge, policy);
+            lengthBits = Math.Min(AutoInitialLengthBits, _maxLengthBits);
+        }
+        else
+        {
+            lengthBits = CalcHashBits(capacity, estimatedEntryCharge, policy);
+            _maxLengthBits = lengthBits;
+        }
+        var array = new ClockSlot[1 << lengthBits];
+        for (int i = 0; i < array.Length; i++) array[i] = new ClockSlot(this, standalone: false);
+        _t = new Table(array, lengthBits, _auto && lengthBits < _maxLengthBits);
+        // FixedHyperClockTable::FixedHyperClockTable: the table's metadata is charged up front (an automatic table charges
+        // the slots it has grown to).
+        if (policy == CacheMetadataChargePolicy.FullCharge) _usage = (long)array.Length * HyperClockCache.SlotMetadataCharge;
+    }
+
+    public bool IsAuto => _auto;
+
+    // ---- automatic resizing ----
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void EnterMutation()
+    {
+        if (!_auto) return;
+        while (true)
+        {
+            Interlocked.Increment(ref _mutators);
+            if (Volatile.Read(ref _resizing) == 0) return;
+            Interlocked.Decrement(ref _mutators);
+            var spin = new SpinWait();
+            while (Volatile.Read(ref _resizing) != 0) spin.SpinOnce();
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ExitMutation()
+    {
+        if (_auto) Interlocked.Decrement(ref _mutators);
+    }
+
+    /// <summary>
+    /// Doubles an automatic table (AutoHyperClockTable::Grow, simplified): waits for in-flight mutators, moves every
+    /// occupied slot object to its probe position in a twice as large array (recomputing displacements) and publishes
+    /// the new array. Lookups keep running on the old array meanwhile (they may miss an entry, never find a wrong one).
+    /// REQUIRES: the caller does not hold a mutator count.
+    /// </summary>
+    private void Grow(Table expected)
+    {
+        if (Interlocked.CompareExchange(ref _resizing, 1, 0) != 0)
+        {
+            // Another thread grows the table: wait for it (the caller re-checks).
+            var wait = new SpinWait();
+            while (Volatile.Read(ref _resizing) != 0) wait.SpinOnce();
+            return;
+        }
+        try
+        {
+            var spin = new SpinWait();
+            while (Volatile.Read(ref _mutators) != 0) spin.SpinOnce();
+            Table old = _t;
+            if (old != expected || old.LengthBits >= _maxLengthBits) return;
+            int newBits = old.LengthBits + 1;
+            var array = new ClockSlot[1 << newBits];
+            int mask = array.Length - 1;
+            var empty = new List<ClockSlot>(old.Array.Length);
+            foreach (ClockSlot h in old.Array) Volatile.Write(ref h.Displacements, 0);
+            foreach (ClockSlot h in old.Array)
+            {
+                if (ClockSlot.State(h.LoadMeta()) == ClockSlot.StateEmpty)
+                {
+                    empty.Add(h);
+                    continue;
+                }
+                int current = (int)(h.H1 >> 32) & mask, inc = ((int)h.H2 & mask) | 1;
+                while (array[current] is not null)
+                {
+                    array[current].Displacements++;
+                    current = (current + inc) & mask;
+                }
+                array[current] = h;
+            }
+            int next = 0;
+            for (int i = 0; i < array.Length; i++)
+            {
+                if (array[i] is not null) continue;
+                array[i] = next < empty.Count ? empty[next++] : new ClockSlot(this, standalone: false);
+            }
+            if (_policy == CacheMetadataChargePolicy.FullCharge)
+            {
+                Interlocked.Add(ref _usage, (long)(array.Length - old.Array.Length) * HyperClockCache.SlotMetadataCharge);
+            }
+            Volatile.Write(ref _t, new Table(array, newBits, newBits < _maxLengthBits));
+        }
+        finally
+        {
+            Volatile.Write(ref _resizing, 0);
+        }
     }
 
     public long EvictionEffortExceededCount => Volatile.Read(ref _evictionEffortExceededCount);
 
-    public int TableSize => _array.Length;
+    public int TableSize => Volatile.Read(ref _t).Array.Length;
     public long Usage => Volatile.Read(ref _usage);
     public long Occupancy => Volatile.Read(ref _occupancy);
 
@@ -340,29 +478,29 @@ internal sealed class ClockShard
     // ---- probing ----
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private int Base(ulong h1) => (int)(h1 >> 32) & _lengthMask;
+    private static int Base(Table t, ulong h1) => (int)(h1 >> 32) & t.Mask;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private int Increment(ulong h2) => ((int)h2 & _lengthMask) | 1;
+    private static int Increment(Table t, ulong h2) => ((int)h2 & t.Mask) | 1;
 
     /// <summary>Undo displacement increments on the probe path from the base up to (excluding) <paramref name="stop"/>.</summary>
-    private void Rollback(ulong h1, ulong h2, ClockSlot stop)
+    private static void Rollback(Table t, ulong h1, ulong h2, ClockSlot stop)
     {
-        int current = Base(h1), inc = Increment(h2);
-        while (_array[current] != stop)
+        int current = Base(t, h1), inc = Increment(t, h2);
+        while (t.Array[current] != stop)
         {
-            Interlocked.Decrement(ref _array[current].Displacements);
-            current = (current + inc) & _lengthMask;
+            Interlocked.Decrement(ref t.Array[current].Displacements);
+            current = (current + inc) & t.Mask;
         }
     }
 
-    private void RollbackCount(ulong h1, ulong h2, int count)
+    private static void RollbackCount(Table t, ulong h1, ulong h2, int count)
     {
-        int current = Base(h1), inc = Increment(h2);
+        int current = Base(t, h1), inc = Increment(t, h2);
         for (int i = 0; i < count; i++)
         {
-            Interlocked.Decrement(ref _array[current].Displacements);
-            current = (current + inc) & _lengthMask;
+            Interlocked.Decrement(ref t.Array[current].Displacements);
+            current = (current + inc) & t.Mask;
         }
     }
 
@@ -382,10 +520,11 @@ internal sealed class ClockShard
 
     public ClockSlot? Lookup(in CacheKey key, ulong h1, ulong h2)
     {
-        int current = Base(h1), inc = Increment(h2);
-        for (int probe = 0; probe <= _lengthMask; probe++)
+        Table t = Volatile.Read(ref _t);
+        int current = Base(t, h1), inc = Increment(t, h2);
+        for (int probe = 0; probe <= t.Mask; probe++)
         {
-            ClockSlot h = _array[current];
+            ClockSlot h = t.Array[current];
             // (Optimistically) increment acquire counter
             ulong oldMeta = h.FetchAdd(ClockSlot.AcquireIncrement);
             ulong state = ClockSlot.State(oldMeta);
@@ -402,7 +541,7 @@ internal sealed class ClockShard
             // For other states, incrementing the acquire counter has no effect (it is overwritten when the slot
             // becomes shareable), so we must not undo it.
             if (Volatile.Read(ref h.Displacements) == 0) return null;
-            current = (current + inc) & _lengthMask;
+            current = (current + inc) & t.Mask;
         }
         return null;
     }
@@ -412,6 +551,29 @@ internal sealed class ClockShard
     public ClockSlot? Insert(in CacheKey key, ulong h1, ulong h2, in CacheValue value, long charge, CachePriority priority, bool wantHandle)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(charge);
+        if (_auto)
+        {
+            // Grow instead of evicting while entries are smaller than the table was sized for (within capacity).
+            while (true)
+            {
+                Table t0 = Volatile.Read(ref _t);
+                if (Volatile.Read(ref _occupancy) + 1 <= t0.GrowLimit || Volatile.Read(ref _usage) + charge > Volatile.Read(ref _capacity)) break;
+                Grow(t0);
+            }
+        }
+        EnterMutation();
+        try
+        {
+            return InsertCore(key, h1, h2, value, charge, priority, wantHandle);
+        }
+        finally
+        {
+            ExitMutation();
+        }
+    }
+
+    private ClockSlot? InsertCore(in CacheKey key, ulong h1, ulong h2, in CacheValue value, long charge, CachePriority priority, bool wantHandle)
+    {
         // ClockCacheShard::Insert: total_charge = charge (the slot metadata is charged with the table).
         long totalCharge = charge;
         ulong initialCountdown = priority switch
@@ -423,7 +585,7 @@ internal sealed class ClockShard
 
         // Optimistically assume available occupancy.
         long oldOccupancy = Interlocked.Increment(ref _occupancy) - 1;
-        bool needEvictForOccupancy = oldOccupancy + 1 > _occupancyLimit;
+        bool needEvictForOccupancy = oldOccupancy + 1 > Volatile.Read(ref _t).OccupancyLimit;
         bool useStandalone = false;
         if (Volatile.Read(ref _strict))
         {
@@ -476,18 +638,19 @@ internal sealed class ClockShard
 
     private ClockSlot? DoInsert(in CacheKey key, ulong h1, ulong h2, in CacheValue value, long totalCharge, ulong initialCountdown, bool takeRef)
     {
-        int current = Base(h1), inc = Increment(h2);
+        Table t = Volatile.Read(ref _t);
+        int current = Base(t, h1), inc = Increment(t, h2);
         int probe = 0;
         bool alreadyMatches = false;
-        for (; probe <= _lengthMask; probe++)
+        for (; probe <= t.Mask; probe++)
         {
-            ClockSlot h = _array[current];
+            ClockSlot h = t.Array[current];
             if (TryInsert(h, key, h1, h2, value, totalCharge, initialCountdown, takeRef, ref alreadyMatches)) return h;
             if (alreadyMatches) break;
             Interlocked.Increment(ref h.Displacements);
-            current = (current + inc) & _lengthMask;
+            current = (current + inc) & t.Mask;
         }
-        RollbackCount(h1, h2, probe);
+        RollbackCount(t, h1, h2, probe);
         return null;
     }
 
@@ -608,19 +771,20 @@ internal sealed class ClockShard
         ulong oldClockPointer = unchecked((ulong)Interlocked.Add(ref _clockPointer, stepSize) - stepSize);
         // Cap the eviction effort at this thread (along with those operating in parallel) circling through the whole
         // structure kMaxCountdown times.
-        ulong maxClockPointer = oldClockPointer + (ClockSlot.MaxCountdown << _lengthBits);
+        Table t = Volatile.Read(ref _t);
+        ulong maxClockPointer = oldClockPointer + (ClockSlot.MaxCountdown << t.LengthBits);
         // EecAndScl::GetEffectiveEvictionEffortCap: strict_capacity_limit (the top bit) implies an infinite cap.
         ulong effectiveCap = Volatile.Read(ref _strict) ? _evictionEffortCap | 0x80000000u : _evictionEffortCap;
         while (true)
         {
             for (int i = 0; i < stepSize; i++)
             {
-                ClockSlot h = _array[(int)((oldClockPointer + (ulong)i) & (ulong)_lengthMask)];
+                ClockSlot h = t.Array[(int)((oldClockPointer + (ulong)i) & (ulong)t.Mask)];
                 if (ClockUpdate(h, ref seenPinnedCount))
                 {
                     freedCharge += h.TotalCharge;
                     freedCount++;
-                    Rollback(h.H1, h.H2, h);
+                    Rollback(t, h.H1, h.H2, h);
                     FreeDataMarkEmpty(h);
                 }
             }
@@ -680,6 +844,24 @@ internal sealed class ClockShard
         ulong oldMeta = h.FetchAdd(ClockSlot.ReleaseIncrement);
         if (eraseIfLastRef || ClockSlot.State(oldMeta) == ClockSlot.StateInvisible)
         {
+            EnterMutation();
+            try
+            {
+                ReleaseErase(h, oldMeta);
+            }
+            finally
+            {
+                ExitMutation();
+            }
+            return;
+        }
+        CorrectNearOverflow(oldMeta, h);
+    }
+
+    // The erase part of Release: free the entry if this was the last reference. REQUIRES: mutator count.
+    private void ReleaseErase(ClockSlot h, ulong oldMeta)
+    {
+        {
             oldMeta += ClockSlot.ReleaseIncrement;
             // Take ownership if no refs.
             while (true)
@@ -700,22 +882,34 @@ internal sealed class ClockShard
                 Interlocked.Add(ref _usage, -totalCharge);
                 return;
             }
-            Rollback(h.H1, h.H2, h);
+            Rollback(Volatile.Read(ref _t), h.H1, h.H2, h);
             FreeDataMarkEmpty(h);
             Interlocked.Add(ref _usage, -totalCharge);
             Interlocked.Decrement(ref _occupancy);
-            return;
         }
-        CorrectNearOverflow(oldMeta, h);
     }
 
     public bool Erase(in CacheKey key, ulong h1, ulong h2)
     {
-        bool found = false;
-        int current = Base(h1), inc = Increment(h2);
-        for (int probe = 0; probe <= _lengthMask; probe++)
+        EnterMutation();
+        try
         {
-            ClockSlot h = _array[current];
+            return EraseCore(key, h1, h2);
+        }
+        finally
+        {
+            ExitMutation();
+        }
+    }
+
+    private bool EraseCore(in CacheKey key, ulong h1, ulong h2)
+    {
+        bool found = false;
+        Table t = Volatile.Read(ref _t);
+        int current = Base(t, h1), inc = Increment(t, h2);
+        for (int probe = 0; probe <= t.Mask; probe++)
+        {
+            ClockSlot h = t.Array[current];
             ulong oldMeta = h.FetchAdd(ClockSlot.AcquireIncrement);
             ulong state = ClockSlot.State(oldMeta);
             if (state == ClockSlot.StateVisible)
@@ -740,7 +934,7 @@ internal sealed class ClockShard
                         if (seen == oldMeta)
                         {
                             long totalCharge = h.TotalCharge;
-                            Rollback(h1, h2, h);
+                            Rollback(t, h1, h2, h);
                             FreeDataMarkEmpty(h);
                             Interlocked.Add(ref _usage, -totalCharge);
                             Interlocked.Decrement(ref _occupancy);
@@ -759,7 +953,7 @@ internal sealed class ClockShard
                 h.FetchSub(ClockSlot.AcquireIncrement);
             }
             if (Volatile.Read(ref h.Displacements) == 0) break;
-            current = (current + inc) & _lengthMask;
+            current = (current + inc) & t.Mask;
         }
         return found;
     }
@@ -767,14 +961,28 @@ internal sealed class ClockShard
     // EraseUnRefEntries: take ownership of every unreferenced shareable slot.
     public void EraseUnRefEntries()
     {
-        foreach (ClockSlot h in _array)
+        EnterMutation();
+        try
+        {
+            EraseUnRefEntriesCore();
+        }
+        finally
+        {
+            ExitMutation();
+        }
+    }
+
+    private void EraseUnRefEntriesCore()
+    {
+        Table t = Volatile.Read(ref _t);
+        foreach (ClockSlot h in t.Array)
         {
             ulong meta = h.LoadMeta();
             if ((ClockSlot.State(meta) & ClockSlot.StateShareableBit) != 0 && ClockSlot.Refcount(meta) == 0
                 && h.Cas(meta, ClockSlot.StateConstruction << ClockSlot.StateShift))
             {
                 long totalCharge = h.TotalCharge;
-                Rollback(h.H1, h.H2, h);
+                Rollback(t, h.H1, h.H2, h);
                 FreeDataMarkEmpty(h);
                 Interlocked.Add(ref _usage, -totalCharge);
                 Interlocked.Decrement(ref _occupancy);
@@ -785,7 +993,7 @@ internal sealed class ClockShard
     public long ComputePinnedUsage()
     {
         long pinned = 0;
-        foreach (ClockSlot h in _array)
+        foreach (ClockSlot h in Volatile.Read(ref _t).Array)
         {
             ulong meta = h.LoadMeta();
             if ((ClockSlot.State(meta) & ClockSlot.StateShareableBit) != 0 && ClockSlot.Refcount(meta) > 0)

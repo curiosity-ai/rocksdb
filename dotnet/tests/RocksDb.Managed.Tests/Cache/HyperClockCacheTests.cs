@@ -303,4 +303,74 @@ public sealed class HyperClockCacheTests
         Assert.AreEqual(0, c.Count);
         Assert.AreEqual(TableMetadataCharge(c), c.Usage);
     }
+
+    // ---- automatically resizing table (estimated_entry_charge = 0, AutoHyperClockTable) -------------------------
+
+    [TestMethod]
+    public void AutoTableGrowsWithTheNumberOfEntries()
+    {
+        var c = new HyperClockCache(new HyperClockCacheOptions { Capacity = 1 << 20, EstimatedEntryCharge = 0, NumShardBits = 0 });
+        Assert.IsTrue(c.IsAutoResizing);
+        int initial = c.TableSize;
+        Assert.AreEqual(64, initial);
+        // 1000 small entries (100 bytes) fit the capacity: the table grows instead of evicting.
+        for (int i = 0; i < 1000; i++) Insert(c, i, i, 100);
+        Assert.IsTrue(c.TableSize >= 1024, c.TableSize.ToString());
+        for (int i = 0; i < 1000; i++) Assert.AreEqual(i, Lookup(c, i), i.ToString());
+        Assert.AreEqual(0, _deleted.Count);
+        // Metadata of the grown table is charged (64 bytes per slot) on top of the entries.
+        Assert.AreEqual(1000L * 100 + (long)c.TableSize * HyperClockCache.SlotMetadataCharge, c.Usage);
+        // The maximum size is capacity / min_avg_entry_charge (450 by default): never beyond it.
+        for (int i = 1000; i < 20000; i++) Insert(c, i, i, 10);
+        Assert.IsTrue(c.TableSize <= 1 << HyperClockCacheTestsMaxBits(1 << 20, 450), c.TableSize.ToString());
+        Assert.IsTrue(c.Usage <= (1 << 20) + 64 * 1024, c.Usage.ToString());
+    }
+
+    private static int HyperClockCacheTestsMaxBits(long capacity, long minAvg) =>
+        ClockShard.CalcHashBits(capacity, minAvg, CacheMetadataChargePolicy.FullCharge);
+
+    [TestMethod]
+    public void AutoTableEvictsAtCapacityAndErases()
+    {
+        var c = new HyperClockCache(new HyperClockCacheOptions
+        {
+            Capacity = 100_000, EstimatedEntryCharge = 0, NumShardBits = 0, MetadataChargePolicy = CacheMetadataChargePolicy.DontCharge,
+        });
+        for (int i = 0; i < 300; i++) Insert(c, i, i, 1000);
+        Assert.IsTrue(c.Usage <= 101_000, c.Usage.ToString());
+        Assert.IsTrue(_deleted.Count >= 199, _deleted.Count.ToString());
+        Insert(c, 5000, 5000, 1000);
+        Assert.AreEqual(5000, Lookup(c, 5000));
+        Assert.IsTrue(c.Erase(Key(5000)));
+        Assert.AreEqual(-1, Lookup(c, 5000));
+    }
+
+    [TestMethod]
+    public void AutoTableConcurrentInsertsLookupsAndGrowth()
+    {
+        var c = new HyperClockCache(new HyperClockCacheOptions { Capacity = 64L << 20, EstimatedEntryCharge = 0, NumShardBits = 2 });
+        const int threads = 4, perThread = 20_000;
+        Parallel.For(0, threads, t =>
+        {
+            for (int i = 0; i < perThread; i++)
+            {
+                int k = t * perThread + i;
+                c.Insert(Key(k), CacheValue.FromObject(new object()), 200, CachePriority.Low);
+                if (c.TryLookup(Key(k - (i % 7)), out CachedBlock h)) h.Dispose();
+            }
+        });
+        // Everything fits: after growth every entry is still findable.
+        int found = 0;
+        for (int k = 0; k < threads * perThread; k++)
+        {
+            if (c.TryLookup(Key(k), out CachedBlock h))
+            {
+                h.Dispose();
+                found++;
+            }
+        }
+        Assert.AreEqual(threads * perThread, found);
+        Assert.AreEqual(threads * perThread, c.Count);
+        Assert.AreEqual(0, c.PinnedUsage);
+    }
 }

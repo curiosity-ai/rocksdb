@@ -707,10 +707,10 @@ internal sealed partial class DbImpl
             MemTables = mems,
             Levels = levels,
             TableCache = cfd.TableCache,
-            MaxSequentialSkipInIterations = cfd.Options.MaxSequentialSkipInIterations,
+            MaxSequentialSkipInIterations = sv.MutableOptions.MaxSequentialSkipInIterations,
             BlobSource = cfd.BlobSource,
             BlobVersion = s,
-            PrefixExtractor = cfd.Options.PrefixExtractor,
+            PrefixExtractor = sv.MutableOptions.PrefixExtractor,
             ReadCallback = callback,
             Cleanup = new SuperVersionRelease(this, sv, ownedSnapshot),
         };

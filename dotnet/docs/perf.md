@@ -690,9 +690,9 @@ cores on every lookup. Fixes, both ports of what upstream does:
   reference); a reader that finds `InUse` (another thread on the same processor holds the slot) takes a plain
   reference, and a cached super version that is no longer current is released instead of used.
 - **Pinned table readers** (`TableCache.GetReaderForVersion`, upstream `fd.table_reader` with `max_open_files = -1`).
-  With an unbounded table cache a reader is only closed when its file becomes obsolete, which cannot happen while a
-  referenced version contains it, so lookups through a super version take no reference on the reader. The LRU counter
-  is no longer updated by unbounded caches.
+  With an unbounded table cache the first lookup through a referenced version pins the reader (one extra reference,
+  dropped when the file is evicted as obsolete), so later lookups through a super version take no reference on it. The
+  LRU counter is no longer updated by unbounded caches.
 - Async Get: the range tombstones came from a second table-cache lookup per file; a filter miss now completes without
   the async state machines of `GetFromFileAsync` and `BlockBasedTableReader.GetAsync`.
 
@@ -794,6 +794,22 @@ disabled (16 MiB memtables, 4 MiB target files, 8 background jobs), one run each
 
 The per-key loop of a subcompaction is the unchanged compaction loop (allocation-free); planning reads up to 128 index
 anchors per input file once per compaction.
+## Auto-resizing HyperClock table and shared table cache (cache micro-benchmarks)
+
+`CacheBenchmarks` (BenchmarkDotNet default job, net10.0) before and after the change, single runs each on the shared
+4-vCPU VM with other agents building (load average 4-10, so differences below ~30% are noise; LRU, which did not
+change, moved by +10% to +57% between the two runs). The fixed table code path only gained a read of the table
+reference and a branch on a readonly flag. Every case stays allocation-free.
+
+| Benchmark | LRU before | LRU after | HyperClock before | HyperClock after | AutoHyperClock (new) |
+|---|---:|---:|---:|---:|---:|
+| LookupHit | 609 ns | 668 ns | 292 ns | 263 ns | 260 ns |
+| LookupMiss | 94 ns | 139 ns | 131 ns | 164 ns | 107 ns |
+| InsertWithEviction | 159 ns | 174 ns | 230 ns | 267 ns | 260 ns |
+| LookupHitMultiThreaded (per op) | 307 ns | 484 ns | 72 ns | 125 ns | 100 ns |
+
+Allocated: `-` in every cell. The auto table (estimated_entry_charge = 0) performs like the fixed one once grown;
+growth itself (64 slots per shard, doubling) only happens while the cache fills.
 
 ## Gaps / follow-ups
 

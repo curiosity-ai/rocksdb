@@ -229,8 +229,9 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [ ] parallel compression (throughput only; output identical) (M); is_uniform hint used for index search on read (S); CompactForTieringCollector (S)
   - [ ] per-key protection info (L); per-SuperVersion options snapshot (M); mutable block-based table options (M)
   - [x] WriteBatch ColumnFamily overloads, WriteOptions.SyncWrites, MarkWalTerminationPoint, max_total_wal_size, lazy WAL sync on rotation (single-CF, non-2PC; else eager = stronger), reads on dropped CF handles
-  - [ ] shared table cache across CFs (S/M); best_efforts_recovery (M); WAL tracking in MANIFEST emit+verify (M)
-  - [ ] auto-resizing HyperClock (M); DB-wide rate limiter for flush/compaction (M)
+  - [x] shared per-DB table cache, best_efforts_recovery (matches native on 12 damage cases), WAL tracking in MANIFEST, per-SuperVersion options snapshot, mutable block-based table options
+  - [x] auto-resizing HyperClock (growable table, writers pause briefly; upstream is lock-free linear hashing), GenericRateLimiter for flush/compaction writes
+  - [ ] rate limiter on reads + tickers (S); reader-affecting table options via SetOptions (S); normal open of a DB with a truncated SST fails only at first read (S)
 - Write path / iterators perf
   - [ ] 4-thread sync random writes, 4-thread readmissing (see final benchmarks)
   - [ ] reverse iteration pins blocks instead of copying (M); async reverse movement (M); range tombstones in iterator heap (M/L)
@@ -242,5 +243,5 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [x] secondary tails the MANIFEST incrementally (native<->managed secondary compat), Raft network-partition tests, switchover hold trimmed (probe promote, 3 fewer fsyncs), replication benchmarks (bench/RocksDb.Managed.Replication.Benchmarks)
   - [ ] secondary: verify table files exist before installing a version (S); re-measure switchover hold on a quiet machine (S)
 - Backup / error handling
-  - [ ] SstFileManager + no-space auto recovery (M); atomic WAL-error recovery edits (M)
+  - [x] SstFileManager (space limit, trash deletion, compaction space pre-check) + no-space auto recovery; atomic WAL-error recovery flush
 - Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)

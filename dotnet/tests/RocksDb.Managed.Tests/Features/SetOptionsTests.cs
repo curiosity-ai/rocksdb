@@ -118,4 +118,45 @@ public sealed class SetOptionsTests
         using RocksDatabase again = RocksDatabase.Open(DbPath, NewOptions(fs), cf);
         Assert.AreEqual(5, again.DefaultColumnFamily.Options.MaxWriteBufferNumber);
     }
+
+    /// <summary>Each super version carries an immutable options snapshot; SetOptions installs a new one.</summary>
+    [TestMethod]
+    public void SuperVersionsCarryImmutableOptionsSnapshots()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        RocksDb.Managed.Db.ColumnFamilyData cfd = db.DefaultColumnFamily.Data;
+        RocksDb.Managed.Db.SuperVersion before = cfd.Super;
+        ulong oldSkip = before.MutableOptions.MaxSequentialSkipInIterations;
+        db.SetOptions([P("max_sequential_skip_in_iterations", "77")]);
+        RocksDb.Managed.Db.SuperVersion after = cfd.Super;
+        Assert.AreNotSame(before, after);
+        Assert.AreEqual(oldSkip, before.MutableOptions.MaxSequentialSkipInIterations, "old snapshot unchanged");
+        Assert.AreEqual(77UL, after.MutableOptions.MaxSequentialSkipInIterations);
+        Assert.AreNotSame(cfd.Options, after.MutableOptions);
+    }
+
+    /// <summary>Mutable block-based table options (db_options_test.cc SetMutableTableOptions).</summary>
+    [TestMethod]
+    public void MutableTableOptionsApplyToNewTablesAndArePersisted()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        RocksDb.Managed.Table.TableFormatOptions oldFormat = db.DefaultColumnFamily.Data.Format;
+        db.SetOptions([P("table_factory.block_size", "16384"), P("table_factory.block_restart_interval", "11")]);
+        Assert.AreEqual(16384UL, db.DefaultColumnFamily.Options.TableOptions.BlockSize);
+        Assert.AreNotSame(oldFormat, db.DefaultColumnFamily.Data.Format);
+        db.SetOptions([P("block_based_table_factory", "{block_size=8192;block_restart_interval=7}")]);
+        BlockBasedTableOptions persisted = LatestOptions(fs).FindColumnFamily("default")!.TableOptions;
+        Assert.AreEqual("8192", persisted.GetOption("block_size"));
+        Assert.AreEqual("7", persisted.GetOption("block_restart_interval"));
+        // Unknown table options, options that are not changeable and a different factory are refused; nothing changes.
+        foreach (KeyValuePair<string, string> bad in new[] { P("table_factory.does_not_exist", "true"), P("table_factory.no_block_cache", "true"),
+                     P("table_factory", "PlainTable") })
+        {
+            var ex = Assert.ThrowsExactly<RocksDbException>(() => db.SetOptions([P("table_factory.block_size", "1024"), bad]));
+            Assert.AreEqual(StatusCode.InvalidArgument, ex.Code, bad.Key);
+        }
+        Assert.AreEqual("8192", db.DefaultColumnFamily.Options.TableOptions.GetOption("block_size"));
+    }
 }

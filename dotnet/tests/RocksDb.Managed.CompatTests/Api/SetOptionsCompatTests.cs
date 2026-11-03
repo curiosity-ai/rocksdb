@@ -73,4 +73,59 @@ public sealed class SetOptionsCompatTests
             Assert.AreEqual("v", db.Get("k"));
         }
     }
+
+    private static readonly KeyValuePair<string, string>[] s_tableChanges =
+    [
+        new("table_factory.block_size", "1024"), new("table_factory.block_restart_interval", "4"),
+        new("block_based_table_factory", "{index_block_restart_interval=2;enable_index_compression=false}"),
+    ];
+
+    /// <summary>
+    /// Mutable block-based table options (db_options_test.cc SetMutableTableOptions): both sides accept the same keys,
+    /// persist the same values in the OPTIONS file, build the next flush with them, and reject unknown table options and a
+    /// different table factory.
+    /// </summary>
+    [TestMethod]
+    public void MutableTableOptionsLikeNative()
+    {
+        using var nativeDir = new TempDir("settab-n");
+        using var managedDir = new TempDir("settab-m");
+        var o = new RocksDbSharp.DbOptions().SetCreateIfMissing(true);
+        s_keepAlive.Add(o);
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(o, nativeDir.Path))
+        {
+            db.SetOptions(s_tableChanges);
+            Assert.ThrowsExactly<RocksDbSharp.RocksDbException>(() => db.SetOptions([new("table_factory.does_not_exist", "true")]));
+            Assert.ThrowsExactly<RocksDbSharp.RocksDbException>(() => db.SetOptions([new("table_factory", "PlainTable")]));
+            for (int i = 0; i < 2000; i++) db.Put("key" + i.ToString("D6", System.Globalization.CultureInfo.InvariantCulture), new string('v', 20));
+            db.Flush(new RocksDbSharp.FlushOptions());
+        }
+        using (RocksDatabase db = RocksDatabase.Open(managedDir.Path, new DbOptions { CreateIfMissing = true }))
+        {
+            db.SetOptions(s_tableChanges);
+            Assert.AreEqual(StatusCode.InvalidArgument,
+                Assert.ThrowsExactly<RocksDbException>(() => db.SetOptions([new("table_factory.does_not_exist", "true")])).Code);
+            Assert.AreEqual(StatusCode.InvalidArgument,
+                Assert.ThrowsExactly<RocksDbException>(() => db.SetOptions([new("table_factory", "PlainTable")])).Code);
+            for (int i = 0; i < 2000; i++) db.Put(System.Text.Encoding.UTF8.GetBytes("key" + i.ToString("D6", System.Globalization.CultureInfo.InvariantCulture)), System.Text.Encoding.UTF8.GetBytes(new string('v', 20)));
+            db.Flush();
+        }
+        BlockBasedTableOptions nt = Latest(nativeDir.Path).FindColumnFamily("default")!.TableOptions;
+        BlockBasedTableOptions mt = Latest(managedDir.Path).FindColumnFamily("default")!.TableOptions;
+        foreach (string name in new[] { "block_size", "block_restart_interval", "index_block_restart_interval", "enable_index_compression" })
+        {
+            Assert.AreEqual(nt.GetOption(name), mt.GetOption(name), name);
+        }
+        Assert.AreEqual("1024", mt.GetOption("block_size"));
+        // Both flushed tables were built with 1 KiB blocks: identical data block counts.
+        Assert.AreEqual(DataBlocks(nativeDir.Path), DataBlocks(managedDir.Path));
+        Assert.IsTrue(DataBlocks(managedDir.Path) > 20);
+    }
+
+    private static ulong DataBlocks(string dir)
+    {
+        using SstFile f = SstFile.OpenSingle(dir, RocksDb.Managed.Db.TableFactory.CreateReaderOptions(new ColumnFamilyOptions(),
+            RocksDb.Managed.Db.TableFactory.CreateFormatOptions(new BlockBasedTableOptions())));
+        return f.Properties.NumDataBlocks;
+    }
 }
