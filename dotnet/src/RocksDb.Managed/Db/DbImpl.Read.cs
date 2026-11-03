@@ -15,7 +15,7 @@ internal sealed partial class DbImpl
     private ulong ReadSequence(ReadOptions? options)
     {
         Snapshot? snap = options?.Snapshot;
-        if (snap is null) return Versions.LastSequence;
+        if (snap is null) return LastPublishedSequence;
         return snap.SequenceNumber;
     }
 
@@ -239,12 +239,20 @@ internal sealed partial class DbImpl
         VersionStorageInfo s = v.Storage;
         Comparator ucmp = cfd.UserComparator;
         int tsSize = cfd.TimestampSize;
+        bool sample = FileReadSample.ShouldSampleFileRead();
         ReadOnlySpan<FileMetaData> l0 = s.LevelFiles(0);
         for (int i = 0; i < l0.Length; i++)
         {
             FileMetaData f = l0[i];
             if (CompareFileBoundary(ucmp, tsSize, userKey, f.Smallest) < 0 || CompareFileBoundary(ucmp, tsSize, userKey, f.Largest) > 0) continue;
-            if (GetFromFile(cfd, f, ikey, userKey, snapshot, ctx)) return;
+            if (sample) FileReadSample.SampleFileReadInc(f);
+            bool done = GetFromFile(cfd, f, ikey, userKey, snapshot, ctx);
+            if (sample) SampleCollapsibleRead(f, ctx);
+            if (done)
+            {
+                ctx.HitLevel = 0;
+                return;
+            }
         }
         for (int level = 1; level < s.NumLevels; level++)
         {
@@ -254,7 +262,28 @@ internal sealed partial class DbImpl
             if (idx >= files.Length) continue;
             FileMetaData f = files[idx];
             if (CompareFileBoundary(ucmp, tsSize, userKey, f.Smallest) < 0) continue;
-            if (GetFromFile(cfd, f, ikey, userKey, snapshot, ctx)) return;
+            if (sample) FileReadSample.SampleFileReadInc(f);
+            bool done = GetFromFile(cfd, f, ikey, userKey, snapshot, ctx);
+            if (sample) SampleCollapsibleRead(f, ctx);
+            if (done)
+            {
+                ctx.HitLevel = level;
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The sampling in Version::Get after a table lookup (version_set_sync_and_async.h): a lookup that left the key not
+    /// found, collected merge operands or found a deletion is a collapsible-entry read of the file
+    /// (sample_collapsible_entry_file_read_inc).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static void SampleCollapsibleRead(FileMetaData f, GetContext ctx)
+    {
+        if (ctx.State is GetContext.GetState.NotFound or GetContext.GetState.Merge or GetContext.GetState.Deleted)
+        {
+            FileReadSample.SampleCollapsibleEntryFileReadInc(f);
         }
     }
 
@@ -341,12 +370,20 @@ internal sealed partial class DbImpl
 
             VersionStorageInfo s = sv.Current.Storage;
             Comparator ucmp = cfd.UserComparator;
+            bool sample = FileReadSample.ShouldSampleFileRead();
             FileMetaData[] l0 = s.LevelFilesArray(0);
             for (int i = 0; i < l0.Length; i++)
             {
                 FileMetaData f = l0[i];
                 if (!UserKeyInFileRange(ucmp, key.Span, f)) continue;
-                if (await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false)) break;
+                if (sample) FileReadSample.SampleFileReadInc(f);
+                bool done = await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false);
+                if (sample) SampleCollapsibleRead(f, ctx);
+                if (done)
+                {
+                    ctx.HitLevel = 0;
+                    break;
+                }
             }
             if (!ctx.Done)
             {
@@ -358,7 +395,14 @@ internal sealed partial class DbImpl
                     if (idx >= files.Length) continue;
                     FileMetaData f = files[idx];
                     if (ucmp.Compare(key.Span, DbFormat.ExtractUserKey(f.Smallest)) < 0) continue;
-                    if (await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false)) break;
+                    if (sample) FileReadSample.SampleFileReadInc(f);
+                    bool done = await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false);
+                    if (sample) SampleCollapsibleRead(f, ctx);
+                    if (done)
+                    {
+                        ctx.HitLevel = level;
+                        break;
+                    }
                 }
             }
             if (ctx.NeedsBlobResolution) await ctx.ResolveBlobAsync(cfd.BlobSource, s, options, key, cancellationToken).ConfigureAwait(false);
@@ -421,11 +465,15 @@ internal sealed partial class DbImpl
             int tsSize = cfd.TimestampSize;
             FileMetaData[] l0 = s.LevelFilesArray(0);
             bool done = false;
+            bool sample = FileReadSample.ShouldSampleFileRead();
             for (int i = 0; i < l0.Length && !done; i++)
             {
                 FileMetaData f = l0[i];
                 if (!UserKeyInFileRangeWithoutTimestamp(ucmp, tsSize, ikey, f)) continue;
+                if (sample) FileReadSample.SampleFileReadInc(f);
                 done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);
+                if (sample) SampleCollapsibleRead(f, ctx);
+                if (done) ctx.HitLevel = 0;
             }
             for (int level = 1; level < s.NumLevels && !done; level++)
             {
@@ -435,7 +483,10 @@ internal sealed partial class DbImpl
                 if (idx >= files.Length) continue;
                 FileMetaData f = files[idx];
                 if (CompareFileBoundary(ucmp, tsSize, DbFormat.ExtractUserKey(ikey.Span), f.Smallest) < 0) continue;
+                if (sample) FileReadSample.SampleFileReadInc(f);
                 done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);
+                if (sample) SampleCollapsibleRead(f, ctx);
+                if (done) ctx.HitLevel = level;
             }
             if (ctx.NeedsBlobResolution) await ctx.ResolveBlobAsync(cfd.BlobSource, s, options, key, cancellationToken).ConfigureAwait(false);
         }

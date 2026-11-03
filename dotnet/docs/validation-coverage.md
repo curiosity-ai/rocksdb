@@ -21,13 +21,13 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (226 files, about 69,200 lines):
+Summary (229 files, about 70,400 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
-| line-by-line (feature audits) | 54 |
+| line-by-line (feature audits) | 57 |
 | line-by-line (#3) | 17 |
 | line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
@@ -92,16 +92,19 @@ changes there need their own review.
 | `Db/Blob/CompactionBlobProcessor.cs` | 110 | db/compaction/compaction_iterator.cc, db/blob/blob_fetcher.cc | line-by-line (feature audit: integrated BlobDB) |
 | `Db/Blob/CompactionBlobResolver.cs` | 97 | db/compaction/compaction_iterator.{h,cc} (CompactionBlobResolver) | line-by-line (feature audit: user features (wide-column APIs)) |
 | `Db/ColumnFamilyData.cs` | 257 | db/memtable_list.h, db/column_family.h, db/column_family.cc | line-by-line (#2) |
+| `Db/Compaction/ClippingIterator.cs` | 101 | db/compaction/clipping_iterator.h | line-by-line (completeness pass) |
+| `Db/Compaction/CompactionPicker.CompactFiles.cs` | 265 | db/compaction/compaction_picker.cc (SanitizeCompactionInputFilesForAllLevels, SanitizeAndConvertCompactionInputFiles, GetCompactionInputsFromFileNumbers, PickCompactionForCompactFiles) | line-by-line (completeness pass) |
 | `Db/Compaction/ColumnFamilyCompactionState.cs` | 34 | db/compaction/compaction_picker.h (NullCompactionPicker), db/column_family.h | line-by-line (#2) |
 | `Db/Compaction/Compaction.cs` | 446 | include/rocksdb/listener.h, db/compaction/compaction.{h,cc} | line-by-line (#2); #3: MaxOutputFileSize, MaxInputFileNewestKeyTime (new), MinInputFileOldestAncestorTime; compaction-features pass: output_split_key_, CreateSstPartitioner, IsTrivialMove partitioner check, GetOutputTemperature inputs |
 | `Db/Compaction/CompactionIterator.cs` | 762 | db/compaction/compaction_iteration_stats.h, db/compaction/compaction_iterator.cc | line-by-line (#3): NextFromInput / InvokeFilterIfNeeded / PrepareOutput / findEarliestVisibleSnapshot vs compaction_iterator.cc (main) |
-| `Db/Compaction/CompactionJob.cs` | 885 | db/compaction/compaction_job.cc, db/compaction/compaction_outputs.cc | line-by-line (#2); #3: ShouldStopBefore / grandparent boundaries, output time properties (fixed newest_key_time); compaction-features pass: full ShouldStopBefore (TTL cuts, partitioner, upper-bound size, round-robin split), GetOutputTemperature, compression switch |
-| `Db/Compaction/CompactionPicker.cs` | 592 | db/compaction/compaction_picker.{h,cc} | line-by-line (#2); compaction-features pass: enable_compression / output temperature / output split key in NewCompaction |
+| `Db/Compaction/CompactionJob.cs` | 1347 | db/compaction/compaction_job.cc, db/compaction/compaction_outputs.cc, db/compaction/subcompaction_state.h | line-by-line (#2); #3: ShouldStopBefore / grandparent boundaries, output time properties (fixed newest_key_time); compaction-features pass: full ShouldStopBefore (TTL cuts, partitioner, upper-bound size, round-robin split), GetOutputTemperature, compression switch; completeness pass: GenSubcompactionBoundaries, subcompaction execution and aggregation, AddRangeDels subcompaction bounds, SetOutputSlitKey |
+| `Db/Compaction/CompactionPicker.cs` | 623 | db/compaction/compaction_picker.{h,cc} | line-by-line (#2); compaction-features pass: enable_compression / output temperature / output split key in NewCompaction; completeness pass: split key from the input version's cursors |
 | `Db/Compaction/FifoCompactionPicker.cs` | 311 | db/compaction/compaction_picker_fifo.cc | line-by-line (#3): PickTTL/Size/IntraL0/PickCompaction; **fixed** TTL expiry by newest key time; compaction-features pass: whole file (blob-aware sizing, PickRatioBasedIntraL0Compaction, PickTemperatureChangeCompaction) |
-| `Db/Compaction/LevelCompactionPicker.cs` | 511 | db/compaction/compaction_picker_level.cc | line-by-line (#2) |
-| `Db/Compaction/UniversalCompactionPicker.cs` | 680 | db/compaction/compaction_picker_universal.cc | line-by-line (compaction-features pass): whole file except read-triggered compaction (periodic, size amp with MightExcludeNewL0sToReduceWriteStop and incremental mode, size ratio, max_read_amp, delete-triggered, compression_size_percent) |
-| `Db/Compaction/VersionStorageInfo.Compaction.cs` | 974 | db/version_set.cc | line-by-line (#2); #3: FIFO score / GetExpiredTtlFilesCount; compaction-features pass: blob-aware FIFO score, ShouldChangeFileTemperature, **fixed** periodic-compaction file age (file_creation_time first) |
-| `Db/Compaction/WriteController.cs` | 307 | db/write_controller.{h,cc} | line-by-line (#2) |
+| `Db/Compaction/LevelCompactionPicker.cs` | 506 | db/compaction/compaction_picker_level.cc | line-by-line (#2); completeness pass: kBottommostFiles, cursors moved to the version |
+| `Db/Compaction/UniversalCompactionPicker.cs` | 680 | db/compaction/compaction_picker_universal.cc | line-by-line (compaction-features pass): whole file (read-triggered compaction, require_max_output_level and ShouldSkipLastSortedRunForSizeAmpCompaction added in the tiering pass; periodic, size amp with MightExcludeNewL0sToReduceWriteStop and incremental mode, size ratio, max_read_amp, delete-triggered, compression_size_percent) |
+| `Db/Compaction/VersionStorageInfo.Compaction.cs` | 1040 | db/version_set.cc | line-by-line (#2); #3: FIFO score / GetExpiredTtlFilesCount; compaction-features pass: blob-aware FIFO score, ShouldChangeFileTemperature, **fixed** periodic-compaction file age (file_creation_time first); completeness pass: compensated sizes, bottommost marking in ComputeCompactionScore, version cursors in SortFileByRoundRobin |
+| `Db/Compaction/VersionStorageInfo.Inherited.cs` | 354 | db/version_set.{h,cc} (UpdateAccumulatedStats, MaybeInitializeFileMetaData, ComputeCompensatedSizes, GenerateBottommostFiles, UpdateOldestSnapshot, ComputeBottommostFilesMarkedForCompaction, compact_cursor_ / GetNextCompactCursor), db/dbformat.h (BottommostSeqnoCanBeZeroed) | line-by-line (completeness pass) |
+| `Db/Compaction/WriteController.cs` | 346 | db/write_controller.{h,cc}, db/column_family.cc (RecalculateWriteStallConditions, SetupDelay, GetPendingCompactionBytesForCompactionSpeedup) | line-by-line (#2); completeness pass: **fixed** delay recovery reward, rate carried between delays, compaction-speedup thresholds |
 | `Db/CompactionFilter.cs` | 95 | include/rocksdb/compaction_filter.h | line-by-line (#3): compaction_filter.h decisions / value types |
 | `Db/DbFormat.cs` | 158 | db/dbformat.h | line-by-line (#1) |
 | `Db/DbImpl.Checkpoint.cs` | 280 | include/rocksdb/metadata.h, db/db_filesnapshot.cc, utilities/checkpoint/checkpoint_impl.cc | line-by-line (#2) |
@@ -118,6 +121,7 @@ changes there need their own review.
 | `Db/DbImpl.Properties.cs` | 657 | db/internal_stats.cc, db/db_impl/db_impl.cc | line-by-line (feature audit: user features (properties)) |
 | `Db/DbImpl.Read.cs` | 477 | db/db_impl/db_impl.cc (GetImpl, NewIterator), db/version_set.cc (Version::Get) | line-by-line (#2) |
 | `Db/DbImpl.ReadOnly.cs` | 330 | db/db_impl/db_impl_readonly.cc, db/db_impl/db_impl_secondary.cc | line-by-line (#3): db_impl_readonly.cc / db_impl_secondary.cc; **fixed** WAL checksum |
+| `Db/DbImpl.SeqnoTime.cs` | 165 | db/db_impl/db_impl.cc, db/db_impl/db_impl_open.cc (seqno-to-time recording) | line-by-line (tiering pass: validation.md "Compaction triggers and tiering") |
 | `Db/DbImpl.Replication.cs` | 539 | db/db_impl/db_impl_files.cc, db/wal_manager.cc, db/db_filesnapshot.cc | line-by-line (#2) |
 | `Db/DbImpl.Timestamps.cs` | 295 | db/db_impl/db_impl.h, db/db_impl/db_impl_compaction_flush.cc | line-by-line (feature audit: user-defined timestamps) |
 | `Db/DbImpl.Transactions.cs` | 524 | db/logs_with_prep_tracker.cc, db/db_impl/db_impl_files.cc, db/db_impl/db_impl.cc | line-by-line (feature audit: transactions) |
@@ -155,6 +159,7 @@ changes there need their own review.
 | `Db/MergeHelper.cs` | 517 | db/merge_context.h | line-by-line (#1) |
 | `Db/MergeOperator.cs` | 88 | include/rocksdb/merge_operator.h, utilities/merge_operators.cc | line-by-line (#1) |
 | `Db/RangeDelAggregator.cs` | 363 | db/range_del_aggregator.{h,cc}, db/dbformat.h | line-by-line (#1) |
+| `Db/SeqnoToTimeMapping.cs` | 485 | db/seqno_to_time_mapping.{h,cc} | line-by-line (tiering pass: validation.md "Compaction triggers and tiering") |
 | `Db/Snapshot.cs` | 101 | include/rocksdb/snapshot.h, db/snapshot_impl.h | line-by-line (#2) |
 | `Db/SstFileWriter.cs` | 329 | include/rocksdb/sst_file_writer.h, table/sst_file_writer.cc | line-by-line (#2) |
 | `Db/TableCache.cs` | 263 | db/table_cache.cc, db/db_impl/db_impl.cc | line-by-line (#2); #3: records newest_key_time from opened readers |
@@ -184,6 +189,7 @@ changes there need their own review.
 | `Memory/BlockBufferPool.cs` | 114 | (managed buffer pool) | managed-only, design-reviewed (#3): pooled block buffers |
 | `Memory/ConcurrentArena.cs` | 235 | memory/concurrent_arena.h, memory/concurrent_arena.cc | line-by-line (#1) |
 | `Memtable/InlineSkipList.cs` | 649 | memtable/inlineskiplist.h | line-by-line (#1) |
+| `Monitoring/FileReadSample.cs` | 86 | monitoring/file_read_sample.h | line-by-line (tiering pass: validation.md "Compaction triggers and tiering") |
 | `Monitoring/InternalStats.cs` | 345 | db/internal_stats.h, db/internal_stats.{h,cc} | line-by-line (feature audit: user features (properties)) |
 | `Monitoring/Statistics.cs` | 456 | include/rocksdb/statistics.h, monitoring/statistics.cc, monitoring/histogram.cc | line-by-line (feature audit: user features (statistics)) |
 | `Monitoring/StatisticsNames.g.cs` | 1075 | monitoring/statistics.cc, include/rocksdb/statistics.h | line-by-line (feature audit: user features (statistics; generated from TickersNameMap)) |

@@ -20,15 +20,21 @@ namespace RocksDb.Managed.Replication.Switchover;
 /// sequence number - the handoff point - is final;</item>
 /// <item>ask the replica to promote itself in epoch + 1 once it holds exactly the handoff point; it persists that
 /// promise before it acts;</item>
-/// <item>promoted: persist Replica, close the gate - held writes are refused and redirected - and let the host follow the
+/// <item>promoted: close the gate - held writes are refused and redirected - persist Replica and let the host follow the
 /// new primary from the handoff point (its log is a prefix of the new primary's, so no snapshot);</item>
 /// <item>not promoted, or no answer: make the replica promise the proposed epoch (<see cref="ISwitchoverPeer.RejectEpochAsync"/>)
 /// so a delayed promote cannot succeed, and act on its answer: it is primary (complete the demotion) or it is not
 /// (resume as primary in a newer epoch). If it cannot be reached the outcome is <see cref="SwitchoverOutcome.Unresolved"/>
 /// and writes stay off: two writable primaries are worse than none.</item>
 /// </list>
-/// <para>Managed difference: a promoted replica waits for the handoff point with
-/// <see cref="RocksDatabase.WaitForSequenceAsync"/> (signalled by its write path) instead of spinning and polling.</para>
+/// <para>Managed differences: a promoted replica waits for the handoff point with
+/// <see cref="RocksDatabase.WaitForSequenceAsync"/> (signalled by its write path) instead of spinning and polling; and
+/// before holding writes the primary sends a probe promote (<see cref="PromoteRequest.Probe"/>, refused without side
+/// effects) so that the promote round trip made while writes are held runs warm. The first promote call of a process
+/// otherwise pays one-time costs on both ends (gRPC/MagicOnion method binding, serializer and JIT warm-up) - measured at
+/// 15-30 ms per side over MagicOnion on loopback. The fsync'd role-state writes made while writes are held are also
+/// fewer: the promoted replica persists its epoch map and role together (<see cref="ReplicationRoleState.BecomePrimary"/>)
+/// and the old primary closes its gate before persisting its demotion (it is durably HandingOff already).</para>
 /// </summary>
 public sealed class SwitchoverNode
 {
@@ -153,6 +159,7 @@ public sealed class SwitchoverNode
             ulong latest = LatestSeq;
             if (latest > status.LatestSeq && latest - status.LatestSeq > options.MaxLagToStart)
                 return SwitchoverResult.Rejected(epoch, target.NodeId + " is " + (latest - status.LatestSeq) + " entries behind (limit " + options.MaxLagToStart + ")");
+            await WarmUpPromoteAsync(target, options, cancellationToken).ConfigureAwait(false);
 
             // From here on the outcome is not "nothing happened", so the caller's token no longer applies: every path
             // below ends with this node primary, replica, or explicitly unresolved. The proposed epoch is persisted (as
@@ -232,6 +239,24 @@ public sealed class SwitchoverNode
         }
     }
 
+    /// <summary>
+    /// Sends a probe promote (refused by the target without side effects) so that the real promote, made while writes are
+    /// held, does not pay the first-call costs of the transport on either side. Failures are ignored: the handoff decides
+    /// on the real promote.
+    /// </summary>
+    private async Task WarmUpPromoteAsync(ISwitchoverPeer target, SwitchoverOptions options, CancellationToken cancellationToken)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(options.RpcGrace);
+        try
+        {
+            await target.PromoteAsync(PromoteRequest.Probe(_nodeId), timeout.Token).ConfigureAwait(false);
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+        }
+    }
+
     private static async Task<ReplicationNodeStatus?> GetStatusSafeAsync(ISwitchoverPeer peer, CancellationToken cancellationToken)
     {
         try
@@ -287,8 +312,12 @@ public sealed class SwitchoverNode
 
     private void CompleteDemotion(long epoch, string newPrimaryId)
     {
-        lock (_gate) _state.Set(epoch, ReplicationRole.Replica, newPrimaryId);
+        // The gate closes (held writes are refused and redirected) before the new role is persisted: this node is
+        // already durably HandingOff (or, settling an unplanned promotion, a primary that ResolveAsync demotes again after
+        // a crash), so it restarts read-only and asks the other node either way. Persisting first kept writes held for
+        // one more fsync'd write.
         Writes.Close();
+        lock (_gate) _state.Set(epoch, ReplicationRole.Replica, newPrimaryId);
         RaiseRoleChanged();
     }
 
@@ -296,8 +325,7 @@ public sealed class SwitchoverNode
     {
         lock (_gate)
         {
-            _state.StartEpoch(_db!.GetLatestSequenceNumber() + 1, epoch);
-            _state.Set(epoch, ReplicationRole.Primary, _nodeId);
+            _state.BecomePrimary(_db!.GetLatestSequenceNumber() + 1, epoch, _nodeId);
         }
         Writes.OpenGate();
         RaiseRoleChanged();
@@ -346,6 +374,7 @@ public sealed class SwitchoverNode
     public Task<PromoteResult> HandlePromoteAsync(PromoteRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
+        if (request.IsProbe) return Task.FromResult(Refuse("probe"));
         lock (_gate)
         {
             if (_state.Role != ReplicationRole.Replica) return Task.FromResult(Refuse(_nodeId + " is " + _state.Role + ", not a replica"));
@@ -394,8 +423,7 @@ public sealed class SwitchoverNode
                 // A RejectEpoch that arrived while we were detaching wins: the old primary is waiting on its answer to
                 // resume, and must be the only primary when it does.
                 if (_rejected || _db == null) return Refuse("epoch " + request.Epoch + " was rejected before the promotion completed");
-                _state.StartEpoch(request.HandoffSeq + 1, request.Epoch);
-                _state.Set(request.Epoch, ReplicationRole.Primary, _nodeId);
+                _state.BecomePrimary(request.HandoffSeq + 1, request.Epoch, _nodeId);
             }
             Writes.OpenGate();
             RaiseRoleChanged();
@@ -471,8 +499,7 @@ public sealed class SwitchoverNode
         await _detachFromPrimaryAsync(cancellationToken).ConfigureAwait(false);
         lock (_gate)
         {
-            _state.StartEpoch(_db!.GetLatestSequenceNumber() + 1, epoch);
-            _state.Set(epoch, ReplicationRole.Primary, _nodeId);
+            _state.BecomePrimary(_db!.GetLatestSequenceNumber() + 1, epoch, _nodeId);
         }
         Writes.OpenGate();
         RaiseRoleChanged();
@@ -486,7 +513,19 @@ public sealed class SwitchoverNode
 
 public sealed record ReplicationNodeStatus(string NodeId, ReplicationRole Role, long Epoch, long PromisedEpoch, string? PrimaryId, ulong LatestSeq, bool Promoting);
 
-public sealed record PromoteRequest(long Epoch, string FromPrimaryId, ulong HandoffSeq, int CatchUpTimeoutMs);
+public sealed record PromoteRequest(long Epoch, string FromPrimaryId, ulong HandoffSeq, int CatchUpTimeoutMs)
+{
+    /// <summary>The epoch of a probe request. Real epochs start at 1.</summary>
+    public const long ProbeEpoch = 0;
+
+    /// <summary>
+    /// A request the replica refuses at once without side effects; sent before writes are held to warm the promote path
+    /// (connection, serializers, JIT) on both nodes.
+    /// </summary>
+    public static PromoteRequest Probe(string fromPrimaryId) => new(ProbeEpoch, fromPrimaryId, 0, 0);
+
+    public bool IsProbe => Epoch == ProbeEpoch;
+}
 
 /// <summary><see cref="Epoch"/> is the promoted epoch, or on a refusal the replica's promised epoch.</summary>
 public sealed record PromoteResult(bool Promoted, long Epoch, ReplicationRole Role, string? Reason);

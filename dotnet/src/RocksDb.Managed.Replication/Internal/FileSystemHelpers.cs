@@ -22,15 +22,34 @@ internal static class FileSystemHelpers
     public static void AtomicWrite(IFileSystem fs, string path, string content)
     {
         string tmp = path + ".tmp";
-        byte[] bytes = Encoding.UTF8.GetBytes(content);
-        using (IWritableFile f = fs.CreateWritable(tmp, truncate: true))
-        {
-            f.Append(bytes);
-            f.Sync();
-        }
+        WriteSynced(fs, tmp, content);
         fs.RenameFile(tmp, path);
         string? dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) fs.SyncDirectory(dir);
+    }
+
+    /// <summary>
+    /// <see cref="AtomicWrite"/> of two files in the same directory with one directory fsync: both temp files are written
+    /// and fsync'd, then renamed in order (<paramref name="firstPath"/> first), then the directory is fsync'd. A crash
+    /// leaves each file old or new, and the first one new whenever the second is (renames in one directory are ordered).
+    /// </summary>
+    public static void AtomicWriteBoth(IFileSystem fs, string firstPath, string firstContent, string secondPath, string secondContent)
+    {
+        WriteSynced(fs, firstPath + ".tmp", firstContent);
+        WriteSynced(fs, secondPath + ".tmp", secondContent);
+        fs.RenameFile(firstPath + ".tmp", firstPath);
+        fs.RenameFile(secondPath + ".tmp", secondPath);
+        string? dir = Path.GetDirectoryName(firstPath);
+        if (!string.IsNullOrEmpty(dir)) fs.SyncDirectory(dir);
+        string? dir2 = Path.GetDirectoryName(secondPath);
+        if (!string.IsNullOrEmpty(dir2) && dir2 != dir) fs.SyncDirectory(dir2);
+    }
+
+    private static void WriteSynced(IFileSystem fs, string path, string content)
+    {
+        using IWritableFile f = fs.CreateWritable(path, truncate: true);
+        f.Append(Encoding.UTF8.GetBytes(content));
+        f.Sync();
     }
 
     /// <summary>Reads a whole (small) file as UTF-8, or null if it does not exist.</summary>

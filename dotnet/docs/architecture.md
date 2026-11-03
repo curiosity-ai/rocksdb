@@ -67,7 +67,7 @@ Paths on the left are relative to the repository root (C++). Paths on the right 
 | `db/external_sst_file_ingestion_job.cc`, `table/sst_file_writer.cc` | `Db/ExternalSstFileIngestionJob.cs`, `Db/DbImpl.Ingest.cs`, `Db/SstFileWriter.cs` |
 | `db/transaction_log_impl.cc`, `wal_manager.cc` | `Db/TransactionLogIterator.cs`, `Db/DbImpl.Replication.cs` |
 | `utilities/checkpoint/checkpoint_impl.cc` | `Db/DbImpl.Checkpoint.cs` |
-| `db_impl_readonly.cc`, `db_impl_secondary.cc` | `Db/DbImpl.ReadOnly.cs` |
+| `db_impl_readonly.cc`, `db_impl_secondary.cc`, `ReactiveVersionSet` / `ManifestTailer` (`version_set.cc`, `version_edit_handler.h`) | `Db/DbImpl.ReadOnly.cs` |
 | `db/error_handler.cc`, `db/event_helpers.cc`, `include/rocksdb/listener.h` | `Db/ErrorHandler.cs`, `Db/EventListener.cs`, `Db/EventListener.Notifications.cs` |
 | `db/blob/*` | `Db/Blob/*` |
 | `db/wide/*` | `Db/Wide/*`, `ColumnFamily.Entities.cs` |
@@ -149,7 +149,14 @@ their reads carry a `ReadCallback` and their flushes / compactions a `SnapshotCh
   column family are serialized; different column families flush in parallel.
 - **Compactions** are picked under the mutex and run on dedicated threads (`TaskCreationOptions.LongRunning`), up to
   the compaction limit, because a compaction is long, CPU-bound work that should not occupy the thread pool.
-  `CompactRange` and `WaitForCompact` have sync and async versions.
+  `CompactRange` and `WaitForCompact` have sync and async versions. With `DbOptions.BottomPriorityBackgroundThreads`
+  (upstream's BOTTOM `Env` pool, per DB here) compactions to the last level are queued for that many extra threads;
+  with `reduce_file_locking` they reserve only their newest input run while queued and are repicked when they start.
+  A compaction split into subcompactions (`max_subcompactions`) runs the first range on its own thread and each other
+  range on an extra long-running thread; `CompactFiles` runs on the caller's thread (sync) or one long-running thread.
+- **Periodic tasks** are `System.Threading.Timer`s: the stats dump, the compaction trigger
+  (`max_compaction_trigger_wakeup_seconds`: re-evaluates TTL / periodic / read-triggered compaction on idle DBs) and,
+  with `preserve_internal_time_seconds` / `preclude_last_level_data_seconds`, the seqno-to-time recorder.
 - **Listener notifications** are queued and drained on the thread pool (`EventListener.Notifications.cs`), so a slow
   listener does not hold the mutex.
 - **Error recovery** (`Db/ErrorHandler.cs`) runs automatic resume for retryable background errors as a task; `Resume`

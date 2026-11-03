@@ -55,6 +55,35 @@ internal sealed partial class DbImpl
         foreach (string path in DbPaths) sfm.CleanupTrash(path);
     }
 
+    /// <summary>Compactions holding an SstFileManager reservation (sfm_reserved_compact_space), with its size. Guarded by mutex.</summary>
+    private readonly Dictionary<Compaction, ulong> _sfmReservedCompactions = new();
+
+    /// <summary>
+    /// Port of DBImpl::EnoughRoomForCompaction (BackgroundCompaction): an automatically picked compaction that the space
+    /// limit (or, after an out-of-space error, the free space) does not allow is cancelled (COMPACTION_CANCELLED) and its
+    /// files released; otherwise its input size is reserved until it finishes. REQUIRES: mutex.
+    /// </summary>
+    private bool EnoughRoomForCompaction(ColumnFamilyData cfd, Compaction c)
+    {
+        if (Options.SstFileManager is not { } sfm || c.IsTrivialMove()) return true;
+        ulong inputSize = c.TotalInputBytes;
+        if (sfm.EnoughRoomForCompaction(inputSize, DbPaths[0], ErrorHandler.BgError))
+        {
+            _sfmReservedCompactions[c] = inputSize;
+            return true;
+        }
+        cfd.CompactionState.Picker.ReleaseCompactionFiles(c, succeeded: false);
+        Stats?.RecordTick(Ticker.CompactionCancelled);
+        LogWarn("[" + cfd.Name + "] Cancelled compaction because not enough room");
+        return false;
+    }
+
+    /// <summary>SstFileManagerImpl::OnCompactionCompletion: drops the reservation of a finished compaction. REQUIRES: mutex.</summary>
+    private void ReleaseCompactionRoom(Compaction c)
+    {
+        if (_sfmReservedCompactions.Remove(c, out ulong size)) Options.SstFileManager?.OnCompactionCompletion(size);
+    }
+
     /// <summary>VersionSet hook: a table or blob file became part of a version.</summary>
     internal void OnDataFileAdded(string path, ulong size) => Options.SstFileManager?.OnAddFile(path, size);
 

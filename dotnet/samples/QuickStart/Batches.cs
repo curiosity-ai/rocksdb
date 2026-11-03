@@ -19,7 +19,7 @@ internal static class Batches
             batch.Put("k1"u8, "v1"u8)
                  .Delete("stale"u8)
                  .DeleteRange("tmp:"u8, "tmp;"u8)                      // [begin, end)
-                 .Put(audit.Id, "k1"u8, "created"u8);                  // other column family by id
+                 .Put(audit, "k1"u8, "created"u8);                     // another column family
             db.Write(batch);                                           // atomic
         }
 
@@ -29,8 +29,15 @@ internal static class Batches
             batch.SetSavePoint();
             batch.Put("k3"u8, "oops"u8);
             batch.RollbackToSavePoint();                               // drops k3
-            await db.WriteAsync(new WriteOptions { Sync = true }, batch);   // fsync the WAL before completing
+            await db.WriteAsync(WriteOptions.SyncWrites, batch);       // fsync the WAL before completing
             Console.WriteLine(batch.Count);                            // 1
+        }
+        using (WriteBatch batch = db.CreateWriteBatch())
+        {
+            batch.Put("logged"u8, "1"u8);
+            batch.MarkWalTerminationPoint();                           // later records skip the WAL (memtable only)
+            batch.Put("cache-only"u8, "2"u8);
+            db.Write(batch);
         }
         // The batch representation (batch.Data) is byte-identical to native rocksdb::WriteBatch::Data().
         // </snippet:write-batch>

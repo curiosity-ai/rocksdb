@@ -12,7 +12,7 @@ namespace RocksDb.Managed.Db;
 /// <c>byte[]</c> (picking is a cold path: once per compaction).
 /// </para>
 /// </summary>
-internal abstract class CompactionPicker
+internal abstract partial class CompactionPicker
 {
     private readonly HashSet<Compaction> _compactionsInProgress = new();
     private readonly HashSet<Compaction> _level0CompactionsInProgress = new();
@@ -36,6 +36,13 @@ internal abstract class CompactionPicker
 
     /// <summary>Picks an automatic compaction, or null. <paramref name="snapshots"/> are the live snapshots (ascending).</summary>
     public abstract Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots);
+
+    /// <summary>
+    /// CompactionPicker::PickCompaction with require_max_output_level (a bottom-priority thread repicking a forwarded
+    /// compaction): only the universal picker honours it, like upstream.
+    /// </summary>
+    public virtual Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots, bool requireMaxOutputLevel) =>
+        PickCompaction(vstorage, snapshots);
 
     // ---------------------------------------------------------------------------------------------------------
     // registry
@@ -178,14 +185,41 @@ internal abstract class CompactionPicker
             {
                 return true;
             }
+            if (c.SupportsPerKeyPlacement && c.OverlapProximalLevelOutputRange(smallestUserKey, largestUserKey)) return true;
         }
         return false;
     }
 
-    /// <summary>Port of CompactionPicker::FilesRangeOverlapWithCompaction (no proximal level).</summary>
-    public bool FilesRangeOverlapWithCompaction(IReadOnlyList<CompactionInputFiles> inputs, int level)
+    /// <summary>
+    /// Port of CompactionPicker::FilesRangeOverlapWithCompaction with the proximal level the compaction would write
+    /// (Compaction::EvaluateProximalLevel of the inputs' start level and <paramref name="level"/>).
+    /// </summary>
+    public bool FilesRangeOverlapWithCompaction(VersionStorageInfo vstorage, IReadOnlyList<CompactionInputFiles> inputs, int level)
     {
+        int startLevel = -1;
+        foreach (CompactionInputFiles i in inputs)
+        {
+            if (!i.IsEmpty)
+            {
+                startLevel = i.Level;
+                break;
+            }
+        }
+        if (startLevel < 0) return false; // No files in inputs
         if (!GetRange(inputs, out byte[] smallest, out byte[] largest, -1)) return false;
+        int proximalLevel = Compaction.EvaluateProximalLevel(vstorage, Options, startLevel, level);
+        if (proximalLevel != Compaction.InvalidLevel)
+        {
+            if (Options.CompactionStyle == CompactionStyle.Universal)
+            {
+                if (RangeOverlapWithCompaction(DbFormat.ExtractUserKey(smallest), DbFormat.ExtractUserKey(largest), proximalLevel)) return true;
+            }
+            else if (GetRange(inputs, out byte[] proximalSmallest, out byte[] proximalLargest, level)
+                     && RangeOverlapWithCompaction(DbFormat.ExtractUserKey(proximalSmallest), DbFormat.ExtractUserKey(proximalLargest), proximalLevel))
+            {
+                return true;
+            }
+        }
         return RangeOverlapWithCompaction(DbFormat.ExtractUserKey(smallest), DbFormat.ExtractUserKey(largest), level);
     }
 
@@ -372,9 +406,6 @@ internal abstract class CompactionPicker
         return t == CompressionType.DisableCompressionOption ? CompressionType.None : t;
     }
 
-    /// <summary>The compact cursor of <paramref name="level"/> (VersionStorageInfo::GetCompactCursors), or null.</summary>
-    protected virtual byte[]? GetCompactCursor(int level) => null;
-
     /// <summary>Port of LevelCompactionBuilder::GetPathId (single path when db_paths has one entry).</summary>
     public virtual uint GetPathId(int level) => 0;
 
@@ -411,7 +442,7 @@ internal abstract class CompactionPicker
         // cursor in the output level to split output files (leveled kRoundRobin), if it is inside the user-key range.
         if (Options.CompactionStyle == CompactionStyle.Level && Options.CompactionPri == CompactionPri.RoundRobin)
         {
-            byte[]? cursor = GetCompactCursor(outputLevel);
+            byte[]? cursor = vstorage.GetCompactCursor(outputLevel);
             if (cursor is { Length: > 0 })
             {
                 ReadOnlySpan<byte> cursorUserKey = DbFormat.ExtractUserKey(cursor);
@@ -450,7 +481,7 @@ internal abstract class CompactionPicker
         if (inputLevel == CompactAllLevels)
         {
             // Universal compaction with more than one level always compacts all the files together to the last level.
-            int maxOutputLevel = vstorage.MaxOutputLevel(Options.CfAllowIngestBehind);
+            int maxOutputLevel = vstorage.MaxOutputLevel(Options.AllowIngestBehind);
             int startLevel = 0;
             for (; startLevel <= maxOutputLevel && vstorage.NumLevelFiles(startLevel) == 0; startLevel++) { }
             if (startLevel > maxOutputLevel) return null;
@@ -470,7 +501,7 @@ internal abstract class CompactionPicker
                     return null;
                 }
             }
-            if (FilesRangeOverlapWithCompaction(all, outputLevel))
+            if (FilesRangeOverlapWithCompaction(vstorage, all, outputLevel))
             {
                 manualConflict = true;
                 return null;
@@ -578,7 +609,7 @@ internal abstract class CompactionPicker
             }
         }
         // Two non-exclusive manual compactions could run at the same time producing overlapping outputs in the same level.
-        if (FilesRangeOverlapWithCompaction(compactionInputs, outputLevel))
+        if (FilesRangeOverlapWithCompaction(vstorage, compactionInputs, outputLevel))
         {
             manualConflict = true;
             return null;

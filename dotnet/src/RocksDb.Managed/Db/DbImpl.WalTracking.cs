@@ -95,34 +95,57 @@ internal sealed partial class DbImpl
     private ulong _walTrackingStart = ulong.MaxValue;
 
     /// <summary>
+    /// Closed WALs that were fully synced (number -> synced size) and are not yet recorded in the MANIFEST
+    /// (MarkLogsSynced's synced_wals). Closed WALs synced lazily (single column family) only appear once a sync write,
+    /// SyncWAL or FlushWAL(sync) actually synced them. Guarded by mutex.
+    /// </summary>
+    private readonly Dictionary<ulong, ulong> _syncedClosedWals = new();
+
+    /// <summary>A closed (inactive) WAL was fully synced: remember its size for the next WalAddition. Leader-only caller.</summary>
+    private void NoteClosedWalSynced(Wal.LogWriter w)
+    {
+        if (!Options.TrackAndVerifyWalsInManifest) return;
+        long size = w.File?.Size ?? 0;
+        if (size <= 0) return;
+        lock (_mutex) _syncedClosedWals[w.LogNumber] = (ulong)size;
+    }
+
+    /// <summary>
     /// Records the synced sizes of the closed WALs of this instance in the MANIFEST (MarkLogsSynced: inactive WALs with
-    /// a non-zero pre-sync size become WalAddition(number, size)). WALs are fdatasync'ed when a memtable switch closes
-    /// them, so the size on disk is the synced size. A WAL whose write or sync failed is never recorded.
+    /// a non-zero pre-sync size become WalAddition(number, size)), whichever path synced them: a memtable switch with several
+    /// column families, or the lazy sync of closed WALs (sync writes of either write queue, SyncWAL / FlushWAL(sync)),
+    /// including the switches made by SwitchWAL (max_total_wal_size). A WAL whose write or sync failed is never recorded.
     /// </summary>
     private async ValueTask TrackClosedWalsAsync()
     {
         if (!Options.TrackAndVerifyWalsInManifest || _readOnly) return;
-        List<ulong>? candidates = null;
+        VersionEdit? edit = null;
         lock (_mutex)
         {
-            foreach (ulong n in _aliveWals)
+            if (_syncedClosedWals.Count == 0) return;
+            foreach (KeyValuePair<ulong, ulong> w in _syncedClosedWals)
             {
-                if (n >= _logNumber || n < _walTrackingStart || n <= _failedWalNumber || n < Versions.MinWalNumberToKeep) continue;
-                if (Versions.TrackedWals.TryGetValue(n, out ulong? size) && size is not null) continue;
-                (candidates ??= new()).Add(n);
+                ulong n = w.Key;
+                if (n < _walTrackingStart || n <= _failedWalNumber || n < Versions.MinWalNumberToKeep) continue;
+                if (Versions.TrackedWals.TryGetValue(n, out ulong? size) && size is ulong s && s >= w.Value) continue;
+                (edit ??= new VersionEdit()).WalAdditions.Add(new WalAddition(n, w.Value));
             }
+            _syncedClosedWals.Clear();
         }
-        if (candidates is null) return;
-        VersionEdit? edit = null;
-        foreach (ulong n in candidates)
+        if (edit is null) return;
+        try
         {
-            long size;
-            try { size = FileSystem.GetFileSize(FileNames.LogFileName(WalDir, n)); }
-            catch (Exception e) when (e is IOException or RocksDbException) { continue; }
-            if (size <= 0) continue;
-            (edit ??= new VersionEdit()).WalAdditions.Add(new WalAddition(n, (ulong)size));
+            await Versions.LogAndApplyAsync(null, edit, synchronous: false, CancellationToken.None).ConfigureAwait(false);
         }
-        if (edit is not null) await Versions.LogAndApplyAsync(null, edit, synchronous: false, CancellationToken.None).ConfigureAwait(false);
+        catch
+        {
+            // Not recorded: retry with the next flush.
+            lock (_mutex)
+            {
+                foreach (WalAddition w in edit.WalAdditions) _syncedClosedWals.TryAdd(w.LogNumber, w.SyncedSizeInBytes!.Value);
+            }
+            throw;
+        }
     }
 
     /// <summary>

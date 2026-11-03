@@ -15,8 +15,8 @@ public readonly record struct UniqueId64x2(ulong Lo, ulong Hi)
 
 /// <summary>
 /// Port of FileMetaData + FileDescriptor (db/version_edit.h): everything the MANIFEST records about one
-/// SST file. In-memory-only members (refs, table reader pin, sampled stats, being_compacted, data-entry
-/// stats) belong to the version set and are not modelled here.
+/// SST file. In-memory-only members modelled here: being_compacted, the newest key time and the sampled read stats
+/// (FileSampledStats); refs, the table reader pin and data-entry stats belong to the version set / table cache.
 /// </summary>
 public sealed class FileMetaData
 {
@@ -76,15 +76,77 @@ public sealed class FileMetaData
     /// <summary>In-memory only (FileMetaData::being_compacted): the file is an input of a running compaction. Guarded by the DB mutex.</summary>
     internal bool BeingCompacted { get; set; }
 
+    // Data-entry stats (FileMetaData::num_entries, num_deletions, num_range_deletions, raw_key_size, raw_value_size,
+    // init_stats_from_file, compensated_file_size; db/version_edit.h), in memory only. Loaded from the table properties
+    // by VersionStorageInfo.UpdateAccumulatedStats (Version::UpdateAccumulatedStats) for a capped number of new files per
+    // version; CompensatedFileSize is computed once, when the file first appears in a version (ComputeCompensatedSizes),
+    // before the version is published. Written under the MANIFEST lock before publication, read-only afterwards.
+    internal ulong NumEntries;
+    internal ulong NumDeletions;
+    internal ulong NumRangeDeletions;
+    internal ulong RawKeySize;
+    internal ulong RawValueSize;
+    /// <summary>init_stats_from_file: the entry stats were loaded (or loading was attempted).</summary>
+    internal bool InitStatsFromFile;
+    /// <summary>
+    /// The entry stats above are already known (set from the table builder of a compaction output), so loading them
+    /// needs no table read. Upstream reads the same values back from the table properties.
+    /// </summary>
+    internal bool EntryStatsKnown;
+    /// <summary>
+    /// compensated_file_size: file size plus a deletion boost (point deletions beyond the non-deletions, weighted by the
+    /// average value size) plus <see cref="CompensatedRangeDeletionSize"/>. 0 = not computed yet.
+    /// </summary>
+    internal ulong CompensatedFileSize;
+
+    /// <summary>Sets the entry stats from table properties (Version::MaybeInitializeFileMetaData, incl. its invariants).</summary>
+    internal void SetEntryStats(Table.TableProperties tp)
+    {
+        RawValueSize = tp.RawValueSize;
+        RawKeySize = tp.RawKeySize;
+        NumRangeDeletions = tp.NumRangeDeletions;
+        // Ensure new invariants on old files
+        NumDeletions = Math.Max(tp.NumDeletions, tp.NumRangeDeletions);
+        NumEntries = Math.Max(tp.NumEntries, NumDeletions);
+        EntryStatsKnown = true;
+    }
+
+    // FileSampledStats (db/version_edit.h), in memory only; updated with relaxed atomics by readers
+    // (monitoring/file_read_sample.h). Shared by every version that contains this file.
+    private long _numReadsSampled;
+    private long _numCollapsibleEntryReadsSampled;
+
+    /// <summary>FileSampledStats::num_reads_sampled: estimated number of user reads of this file (sampled).</summary>
+    public ulong NumReadsSampled => (ulong)Volatile.Read(ref _numReadsSampled);
+
+    /// <summary>
+    /// FileSampledStats::num_collapsible_entry_reads_sampled: estimated number of reads of this file that found a
+    /// deletion, single deletion or merge operand, or nothing (sampled). Drives read-triggered compaction.
+    /// </summary>
+    public ulong NumCollapsibleEntryReadsSampled => (ulong)Volatile.Read(ref _numCollapsibleEntryReadsSampled);
+
+    internal void AddReadsSampled(uint n) => Interlocked.Add(ref _numReadsSampled, n);
+    internal void AddCollapsibleEntryReadsSampled(uint n) => Interlocked.Add(ref _numCollapsibleEntryReadsSampled, n);
+
     /// <summary>PackFileNumberAndPathId.</summary>
     public ulong PackedNumberAndPathId => PackFileNumberAndPathId(FileNumber, PathId);
 
     public static ulong PackFileNumberAndPathId(ulong number, ulong pathId) => number | (pathId * (FileNumberMask + 1));
 
+    /// <summary>
+    /// A copy of the persisted metadata (trivial moves: upstream re-adds the file from its fields, so the in-memory
+    /// state -- being_compacted and the sampled read stats -- starts fresh).
+    /// </summary>
     public FileMetaData Clone()
     {
         var c = (FileMetaData)MemberwiseClone();
         c.BeingCompacted = false;
+        // Upstream re-creates the FileMetaData from the edit: its stats are initialized (and counted) again by the new
+        // version and its compensated size recomputed. The entry stats themselves are unchanged (EntryStatsKnown).
+        c.InitStatsFromFile = false;
+        c.CompensatedFileSize = 0;
+        c._numReadsSampled = 0;
+        c._numCollapsibleEntryReadsSampled = 0;
         return c; // byte[] members are treated as immutable once assigned
     }
 

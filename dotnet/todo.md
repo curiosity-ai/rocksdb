@@ -209,33 +209,38 @@ Goal: finish implementation, validate vs C++ source, comprehensive tests (unit/i
 Legend: S/M/L = rough size. [~] = agent working on it.
 
 - Compaction
-  - [~] read-triggered compaction, reduce_file_locking, preclude_last_level_data_seconds, CompactRange partition-straddle
-  - [ ] subcompactions (L); async compaction input reads (M); compensated size with point-deletion boost (M)
-  - [ ] bottommost files marked for compaction (S/M); persist round-robin cursors to MANIFEST (S); CompactFiles API (M)
-  - [ ] write-controller pacing parity (L0 pile-up under free-running load) (M)
+  - [x] read-triggered compaction (read sampling), periodic compaction trigger, reduce_file_locking (bottom-priority pool), preclude_last_level_data_seconds (seqno-to-time mapping, per-key placement), CompactRange partition-straddle; lock-step/compat vs native
+  - [ ] perf check of read-sampling overhead on the next quiet benchmark run (S)
+  - [x] subcompactions (index-anchor boundaries, ClippingIterator), compensated size with deletion boost, bottommost files marked for compaction + bottommost_file_compaction_delay, round-robin cursors persisted in MANIFEST (byte-identical to native), CompactFiles API; lock-step parity vs native
+  - [x] write-controller: L0 peak re-measured warm = native (7-8); three write-controller deviations fixed
+  - [ ] async compaction input reads (M); subcompactions with UDT (S); CompactFiles disk-space check / CompactionJobInfo (S)
 - Transactions
-  - [~] WritePrepared two_write_queues + commit-time batches; per-txn allocations
+  - [x] two_write_queues (second WAL-only write queue, published vs allocated seqno) + commit-time write batches, all policies; compat vs native both ways
+  - [x] steady-state transactions allocate only what the equivalent WriteBatch does (557 B for 4 puts, was 717-1517 B)
+  - [ ] flaky under load? `WriteSlowdownDelaysWrites`, `AutoFlushPreservesGenerationOrderAndOldestBlobFile` (failed once in a loaded full run)
   - [ ] range locks (L); public WAL termination point (S)
 - Wide columns / blob
   - [x] compaction filters on entities (FilterV4 + lazy WideColumnBlobResolver), MultiGetEntity, attribute groups (Put/Get/MultiGet), coalescing + attribute-group iterators, lazy entity reads (GetEntityLazy/MultiGetEntityLazy, ranged blob column reads); compat-tested vs native
-  - [ ] WBWI MultiGetFromBatchAndDB, GetEntityFromBatchAndDB / MultiGetEntityFromBatchAndDB, txn entity APIs (S/M); lazy MultiResolve (S)
+  - [x] WBWI MultiGetFromBatchAndDB; backup exclude_files_callback + parallel copies
+  - [ ] WBWI GetEntityFromBatchAndDB / MultiGetEntityFromBatchAndDB, txn entity APIs (S/M); lazy MultiResolve (S)
 - Table format / options / API
   - [x] hash index (kHashSearch) read+write, separated key/value data blocks, uniform index hint, block_align, super_block_alignment (byte-identical vs native SstFileWriter)
   - [x] user table-properties collectors (+ CompactOnDeletionCollector, NeedCompact), memtable prefix bloom, insert hints, in-place updates (+ callback)
   - [ ] parallel compression (throughput only; output identical) (M); is_uniform hint used for index search on read (S); CompactForTieringCollector (S)
   - [ ] per-key protection info (L); per-SuperVersion options snapshot (M); mutable block-based table options (M)
-  - [ ] WriteBatch ColumnFamily overloads (S); WriteOptions sync static (S); max_total_wal_size (S/M); lazy WAL sync on rotation (S)
-  - [ ] shared table cache across CFs (S/M); best_efforts_recovery (M); WAL tracking in MANIFEST emit+verify (M); reads on dropped CF handle (S)
+  - [x] WriteBatch ColumnFamily overloads, WriteOptions.SyncWrites, MarkWalTerminationPoint, max_total_wal_size, lazy WAL sync on rotation (single-CF, non-2PC; else eager = stronger), reads on dropped CF handles
+  - [ ] shared table cache across CFs (S/M); best_efforts_recovery (M); WAL tracking in MANIFEST emit+verify (M)
   - [ ] auto-resizing HyperClock (M); DB-wide rate limiter for flush/compaction (M)
 - Write path / iterators perf
   - [ ] 4-thread sync random writes, 4-thread readmissing (see final benchmarks)
   - [ ] reverse iteration pins blocks instead of copying (M); async reverse movement (M); range tombstones in iterator heap (M/L)
   - [ ] concurrent memtable insert (M); pipelined write (L); non-blocking SyncAsync (S); LZ4 encoder / cold-start JIT (M)
 - Ingestion / TTL / stats
-  - [ ] write_global_seqno (S); ingest_behind (M); overlapping files in one call (M); allow_db_generated_files (S)
-  - [ ] TTL iterator wrapper (S); per-level GET_HIT, file-read histograms, cfstats interval (S/M); KeyMayExist filter I/O on miss (S)
+  - [x] ingestion: write_global_seqno (legacy, + reader checksum fallback), ingest_behind, overlapping files in one call, allow_db_generated_files, link_files; TTL iterator; GET_HIT_L*, file-read histograms, cfstats intervals; KeyMayExist without I/O
+  - [ ] ingestion atomic_replace_range / checksum generation / temperatures (S/M); GET_HIT for MultiGet, FILE_READ_FLUSH/DB_OPEN (S)
 - Replication / secondary
-  - [ ] network-partition cluster test (S/M); handoff latency investigation (S/M); replication benchmarks (M); incremental MANIFEST tailing (M)
+  - [x] secondary tails the MANIFEST incrementally (native<->managed secondary compat), Raft network-partition tests, switchover hold trimmed (probe promote, 3 fewer fsyncs), replication benchmarks (bench/RocksDb.Managed.Replication.Benchmarks)
+  - [ ] secondary: verify table files exist before installing a version (S); re-measure switchover hold on a quiet machine (S)
 - Backup / error handling
-  - [ ] SstFileManager + no-space auto recovery (M); atomic WAL-error recovery edits (M); backup exclude_files_callback (S); parallel copies (S/M)
+  - [ ] SstFileManager + no-space auto recovery (M); atomic WAL-error recovery edits (M)
 - Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)

@@ -385,7 +385,7 @@ Remaining gaps:
   2.96) and more work is left at the end of the writes (`waitforcompaction` 0.3 - 1.7 s vs 0.02 - 0.25 s). Fixed
   where it was a fidelity problem, see "Compaction-picking parity" below.
 - Range-partitioned subcompactions (`max_subcompactions`) are not implemented; native defaults to 1, so they would not
-  change the comparison.
+  change the comparison. (Implemented since: "Compaction completeness" below.)
 
 ## Compaction-picking parity (compaction-heavy configuration)
 
@@ -635,6 +635,66 @@ a cached block / a missing key, 0.26x / 0.21x for Seek + 10 / 100 Next and 0.52x
 `DbAsync`: async costs 0-20% over sync when calls complete synchronously (TryGet 1.31 vs 1.60 µs, MultiGet(16)
 19.1 vs 19.1 µs).
 
+## Transactions: per-transaction allocations
+
+BenchmarkDotNet `TransactionBenchmarks` (`--anyCategories Txn`, short job, net10.0, shared 4-vCPU container, one run
+before and one after; times are noisy, compare allocations). Begin reusing the previous transaction object, 4 puts
+(16 B keys, 100 B values), Commit; the baseline is the same 4-put WriteBatch written directly, whose 557 B are the
+memtable arena growth for the data.
+
+| Kind | Allocated before | Allocated after | Mean before | Mean after | plain batch (after) |
+|---|---:|---:|---:|---:|---:|
+| Optimistic | 717 B | 557 B | 32.7 µs | 31.8 µs | 24.0 µs |
+| Pessimistic (WriteCommitted) | 1325 B | 557 B | 25.7 µs | 25.5 µs | 23.6 µs |
+| WritePrepared | 1325 B | 557 B | 22.8 µs | 25.0 µs | 21.5 µs |
+| WritePrepared, two_write_queues | 1325 B | 557 B | 26.5 µs | 25.8 µs | 24.6 µs |
+| plain WriteBatch into a WritePrepared DB | 1397 B | 557 B | 22.1 µs | 21.5 µs | |
+| plain WriteBatch into a WritePrepared DB, two_write_queues | 1397 B | 557 B | 23.2 µs | 24.6 µs | |
+
+After: the async variant (PutAsync / CommitAsync) and a named 2PC cycle (SetName, Prepare, Commit) also allocate only
+the memtable data, for every pessimistic policy. What changed: lock-table entries (LockInfo + key buffer) are recycled
+per stripe; tracked keys live in recycled buffers (`PooledKey`, span lookups) instead of one `byte[]` per key; a lambda
+in `AssignCommitTimestamp` allocated its closure on every commit (C# creates the display class on entry to the scope
+that declares the captured variables, before the early return); the commit / prepare async methods use
+`PoolingAsyncValueTaskMethodBuilder`; a reused transaction keeps the UTF-8 encoding of its name; plain writes into a
+WritePrepared DB reuse their WriteInternal state and count sub-batches of bytewise column families in a reusable
+byte-equality set.
+
+## Compaction completeness: L0 pacing and subcompactions
+
+**L0 pile-up under the free-running compaction-heavy config** ("Compaction-picking parity" above reported up to 10 L0
+files for managed vs 5 - 6 for native). Re-measured with the warm-up (num = 500k, 4 MiB memtables / target files,
+16 MiB level base, 2 background jobs = 1 flush + 1 compaction thread, fillrandom + overwrite), peak L0 count from both
+LOGs (native: the "Level summary" / "compacted to" lines; managed: flushes since the last `compaction_finished`
+lsm_state), loaded VM (load average 8 - 12 from other agents):
+
+| run | 1 | 2 | 3 | 4 | 5 |
+|---|---:|---:|---:|---:|---:|
+| c-native | 7 | 7 | 6 | 7 | 8 |
+| managed | 8 | 7 | 9 | 7 | 7 |
+| managed, cold (`--warmup false`) | 10 | | | | |
+
+The earlier native figure was the number of L0 files each compaction picked (`Compacting N@0`), which is 4 - 5 on both
+engines; the actual L0 count peaks at 6 - 8 on native too. Neither engine reaches a write-stall trigger (L0 slowdown 20,
+soft pending bytes 64 GiB; native only stops briefly on max_write_buffer_number while its slower flush runs), so the
+write controller does not pace these runs, and the scheduling latency is the same (an L0 -> Lbase compaction starts in
+the millisecond its 4th file is flushed, in both LOGs). The pile-up follows from how many flushes complete during an
+L0 -> Lbase compaction: managed writes 1.2 - 1.9x faster here (overwrite 4.1 - 7.2 vs 6.3 - 11.1 µs/op) with
+compactions of similar speed, and cold JIT slows its first compactions. The write-controller code was still compared
+with `column_family.cc` and three differences fixed (delay recovery reward, rate carried between delays,
+compaction-speedup thresholds relative to the bottommost data; see `docs/validation.md`); none fires in this config.
+
+**Subcompactions** (`max_subcompactions`, new): `compact` of 1M x 100 B random keys written with auto compactions
+disabled (16 MiB memtables, 4 MiB target files, 8 background jobs), one run each on the loaded VM, the managed
+`compact` includes some JIT (149 - 299 methods):
+
+| | max_subcompactions 1 | 4 |
+|---|---:|---:|
+| c-native | 1.62 s | 0.96 s |
+| managed | 1.57 s | 0.51 s |
+
+The per-key loop of a subcompaction is the unchanged compaction loop (allocation-free); planning reads up to 128 index
+anchors per input file once per compaction.
 ## Auto-resizing HyperClock table and shared table cache (cache micro-benchmarks)
 
 `CacheBenchmarks` (BenchmarkDotNet default job, net10.0) before and after the change, single runs each on the shared

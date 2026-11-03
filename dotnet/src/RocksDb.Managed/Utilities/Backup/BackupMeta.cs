@@ -85,6 +85,9 @@ internal sealed class BackupMeta
     public void RecordTimestamp() => Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
     /// <summary>Port of BackupMeta::AddFile: coalesces with the engine-wide entry (size and checksum must agree).</summary>
+    /// <summary>BackupMeta::AddExcludedFile.</summary>
+    public void AddExcludedFile(string relativeFile) => _excludedFiles.Add(relativeFile);
+
     public void AddFile(BackupFileEntry info)
     {
         if (!_fileInfos.TryGetValue(info.Filename, out BackupFileEntry? existing))

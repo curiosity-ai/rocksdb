@@ -10,6 +10,9 @@ internal sealed partial class DbImpl
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
         ColumnFamilyData cfd = await CreateColumnFamilyCoreAsync(name, options, writeOptionsFile: true, synchronous, ct).ConfigureAwait(false);
+        lock (_mutex) EnsureSeqnoToTimeMapping(cfd.Options);
+        RegisterRecordSeqnoTimeWorker();
+        RescheduleCompactionTrigger();
         return cfd;
     }
 
@@ -59,8 +62,12 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
-    /// Port of DBImpl::DropColumnFamily(Impl): records the drop in the MANIFEST, discards the CF's memtables and makes
-    /// its table files obsolete. Reads through existing handles fail with ColumnFamilyDropped afterwards.
+    /// Port of DBImpl::DropColumnFamily(Impl): records the drop in the MANIFEST and stops writes, flushes and compactions
+    /// of the CF. Like upstream ("RocksDB's contract guarantees that we're still able to read dropped CF" while its
+    /// ColumnFamilyHandle exists, db/column_family_test.cc ReadDroppedColumnFamily), reads and iterators through the
+    /// <see cref="ColumnFamily"/> keep working on the data as of the drop: <see cref="ColumnFamily"/> objects live as
+    /// long as the database, so the CF's memtables and table files are released (and the files deleted) when the
+    /// database is closed.
     /// </summary>
     public async ValueTask DropColumnFamilyAsync(ColumnFamilyData cfd, bool synchronous, CancellationToken ct)
     {
@@ -77,12 +84,9 @@ internal sealed partial class DbImpl
             UnregisterCfForWrite(cfd);
             lock (_mutex)
             {
-                DbVersion current = cfd.Current;
-                // Readers holding a super version and running flushes / compactions may still read the CF's memtables
-                // and table files: memtables are reference counted, the table cache is closed at shutdown.
-                ReleaseColumnFamilyMemTables(cfd);
+                // The super version, memtables and current version stay referenced until close (see the summary): the
+                // ColumnFamilyData is the handle's cfd, which upstream unrefs in ~ColumnFamilyHandleImpl.
                 _droppedColumnFamilies.Add(cfd);
-                Versions.UnrefVersion(current);
                 _maybeStalled = IsWriteStalled();
                 SignalBackgroundWork();
             }
@@ -92,6 +96,8 @@ internal sealed partial class DbImpl
             ExitUnbatched(w, synchronous);
         }
         PurgeObsoleteFiles();
+        RegisterRecordSeqnoTimeWorker();
+        RescheduleCompactionTrigger();
         await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
     }
 

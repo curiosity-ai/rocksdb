@@ -128,7 +128,9 @@ public sealed class PairNodeHost : IAsyncDisposable
             Log("role -> " + e.Role + " in epoch " + e.Epoch + " (primary: " + (e.PrimaryId ?? "unknown") + ")");
             lock (_followerLock)
             {
-                if (e.Role == ReplicationRole.Replica) _primaryCts.Cancel();
+                // Asynchronously: Cancel() would tear down the WAL streams this node serves (gRPC calls) inline, delaying the
+                // end of a handoff by tens of milliseconds (rocksdb-sharp Switchover/README.md "Measured cost").
+                if (e.Role == ReplicationRole.Replica) _ = _primaryCts.CancelAsync();
                 else if (_primaryCts.IsCancellationRequested) _primaryCts = new CancellationTokenSource();
             }
             if (e.Role == ReplicationRole.Replica) EnsureFollowerStream();

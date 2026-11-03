@@ -190,6 +190,16 @@ public sealed class ManifestReplayer
     public RecoveredVersionState Finish()
     {
         _atomicGroup.Clear();
+        return CurrentState();
+    }
+
+    /// <summary>
+    /// Validates and returns the state after the edits applied so far, keeping a buffered incomplete atomic group so that
+    /// more edits can still be applied (tailing a live MANIFEST like ManifestTailer, db/version_edit_handler.h). The
+    /// returned object is live: later <see cref="Apply"/> calls mutate it.
+    /// </summary>
+    public RecoveredVersionState CurrentState()
+    {
         if (!_hasLogNumber || !_hasNextFile || !_hasLastSequence)
         {
             var msg = new System.Text.StringBuilder("no ");

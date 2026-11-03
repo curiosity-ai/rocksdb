@@ -236,11 +236,11 @@ public sealed class ManagedEngine : IEngine
 
     public IEnumerable<KeyValuePair<byte[], byte[]>> Scan(string cf, long? snapshot)
     {
-        using Iterator it = Cf(cf).NewIterator(ReadOptions(snapshot, cf));
+        // TtlDatabase iterators strip the write-time suffix (TtlIterator).
+        using Iterator it = _ttl is not null ? _ttl.NewIterator(ReadOptions(snapshot, cf)) : Cf(cf).NewIterator(ReadOptions(snapshot, cf));
         for (it.SeekToFirst(); it.Valid; it.Next())
         {
-            byte[] v = _ttl is not null ? TtlValue.Strip(it.Value).ToArray() : it.Value.ToArray();
-            yield return new(it.Key.ToArray(), v);
+            yield return new(it.Key.ToArray(), it.Value.ToArray());
         }
     }
 

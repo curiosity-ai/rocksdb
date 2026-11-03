@@ -12,6 +12,8 @@ namespace RocksDb.Managed.CompatTests.Api;
 /// duplicate-key sub-batches and WriteUnprepared transactions with several unprepared batches) written by native
 /// RocksDB recover identically in the managed port and vice versa; the WAL records of the same operations are
 /// byte-identical; a DB whose WAL holds prepared sections of one policy is refused by the other policies on both sides.
+/// Each case also runs with two_write_queues on both sides (rocksdb_options_set_two_write_queues), where commits without
+/// prepare and rollbacks take a second write on the WAL-only queue (a rollback adds a PutLogData("") + Noop record).
 /// </summary>
 [TestClass]
 public sealed class WritePreparedCompatTests
@@ -23,16 +25,24 @@ public sealed class WritePreparedCompatTests
 
     private static DbOptions ManagedOptions() => new() { CreateIfMissing = true };
 
-    private static TransactionDatabase OpenManaged(string path, TransactionWritePolicy policy) =>
-        TransactionDatabase.Open(path, ManagedOptions(), new TransactionDbOptions { WritePolicy = policy, WpCommitCacheBits = 12 });
+    private static TransactionDatabase OpenManaged(string path, TransactionWritePolicy policy) => OpenManaged(path, policy, twoWriteQueues: false);
+
+    private static TransactionDatabase OpenManaged(string path, TransactionWritePolicy policy, bool twoWriteQueues)
+    {
+        DbOptions o = ManagedOptions();
+        o.TwoWriteQueues = twoWriteQueues;
+        return TransactionDatabase.Open(path, o, new TransactionDbOptions { WritePolicy = policy, WpCommitCacheBits = 12 });
+    }
 
     [TestMethod]
-    [DataRow(TransactionWritePolicy.WritePrepared)]
-    [DataRow(TransactionWritePolicy.WriteUnprepared)]
-    public void NativeTransactionsRecoverInManaged(TransactionWritePolicy policy)
+    [DataRow(TransactionWritePolicy.WritePrepared, false)]
+    [DataRow(TransactionWritePolicy.WriteUnprepared, false)]
+    [DataRow(TransactionWritePolicy.WritePrepared, true)]
+    [DataRow(TransactionWritePolicy.WriteUnprepared, true)]
+    public void NativeTransactionsRecoverInManaged(TransactionWritePolicy policy, bool twoWriteQueues)
     {
         using var dir = new TempDir("wp-n2m");
-        using (var native = new NativeTxnDb(dir.Path, policy))
+        using (var native = new NativeTxnDb(dir.Path, policy, twoWriteQueues))
         {
             native.Put("plain", "p");
             native.Put("dup", "d0");
@@ -71,7 +81,7 @@ public sealed class WritePreparedCompatTests
             Assert.IsNull(native.Get("t3"));
         }
 
-        using (TransactionDatabase db = OpenManaged(dir.Path, policy))
+        using (TransactionDatabase db = OpenManaged(dir.Path, policy, twoWriteQueues))
         {
             Assert.AreEqual("v0", S(db.Database.Get(B("t0"))));
             Assert.AreEqual("v1b", S(db.Database.Get(B("t1"))));
@@ -98,7 +108,7 @@ public sealed class WritePreparedCompatTests
             m.Prepare();
         }
 
-        using (var native = new NativeTxnDb(dir.Path, policy))
+        using (var native = new NativeTxnDb(dir.Path, policy, twoWriteQueues))
         {
             Assert.AreEqual("v3-final", native.Get("t3"));
             Assert.AreEqual("v3b", native.Get("t3b"));
@@ -112,7 +122,7 @@ public sealed class WritePreparedCompatTests
             Assert.AreEqual("mv2", native.Get("m2"));
         }
 
-        using (TransactionDatabase db = OpenManaged(dir.Path, policy))
+        using (TransactionDatabase db = OpenManaged(dir.Path, policy, twoWriteQueues))
         {
             Assert.AreEqual(0, db.GetAllPreparedTransactions().Count);
             Assert.AreEqual("mv1b", S(db.Database.Get(B("m1"))));
@@ -121,13 +131,15 @@ public sealed class WritePreparedCompatTests
     }
 
     [TestMethod]
-    [DataRow(TransactionWritePolicy.WritePrepared)]
-    [DataRow(TransactionWritePolicy.WriteUnprepared)]
-    public void ManagedTransactionsRecoverInNative(TransactionWritePolicy policy)
+    [DataRow(TransactionWritePolicy.WritePrepared, false)]
+    [DataRow(TransactionWritePolicy.WriteUnprepared, false)]
+    [DataRow(TransactionWritePolicy.WritePrepared, true)]
+    [DataRow(TransactionWritePolicy.WriteUnprepared, true)]
+    public void ManagedTransactionsRecoverInNative(TransactionWritePolicy policy, bool twoWriteQueues)
     {
         using var dir = new TempDir("wp-m2n");
         long threshold = policy == TransactionWritePolicy.WriteUnprepared ? 1 : 0;
-        using (TransactionDatabase db = OpenManaged(dir.Path, policy))
+        using (TransactionDatabase db = OpenManaged(dir.Path, policy, twoWriteQueues))
         {
             db.Put(s_sync, null, B("plain"), B("p"));
             db.Put(s_sync, null, B("dup"), B("d0"));
@@ -168,7 +180,7 @@ public sealed class WritePreparedCompatTests
             // closed with t3 prepared
         }
 
-        using (var native = new NativeTxnDb(dir.Path, policy))
+        using (var native = new NativeTxnDb(dir.Path, policy, twoWriteQueues))
         {
             Assert.AreEqual("v0b", native.Get("t0"));
             Assert.AreEqual("v1", native.Get("t1"));
@@ -192,7 +204,7 @@ public sealed class WritePreparedCompatTests
             NativeTxnDb.Prepare(n);
         }
 
-        using (TransactionDatabase db = OpenManaged(dir.Path, policy))
+        using (TransactionDatabase db = OpenManaged(dir.Path, policy, twoWriteQueues))
         {
             Assert.AreEqual("v3-final", S(db.Database.Get(B("t3"))));
             Assert.IsNull(db.Database.Get(B("n1")));
@@ -202,7 +214,7 @@ public sealed class WritePreparedCompatTests
             Assert.IsNull(db.Database.Get(B("n1")));
             Assert.IsNull(db.Database.Get(B("n2")));
         }
-        using (var native = new NativeTxnDb(dir.Path, policy))
+        using (var native = new NativeTxnDb(dir.Path, policy, twoWriteQueues))
         {
             Assert.AreEqual(0, native.GetPreparedTransactions().Count);
             Assert.IsNull(native.Get("n1"));
@@ -211,14 +223,16 @@ public sealed class WritePreparedCompatTests
     }
 
     [TestMethod]
-    [DataRow(TransactionWritePolicy.WritePrepared)]
-    [DataRow(TransactionWritePolicy.WriteUnprepared)]
-    public void WalRecordsAreByteIdentical(TransactionWritePolicy policy)
+    [DataRow(TransactionWritePolicy.WritePrepared, false)]
+    [DataRow(TransactionWritePolicy.WriteUnprepared, false)]
+    [DataRow(TransactionWritePolicy.WritePrepared, true)]
+    [DataRow(TransactionWritePolicy.WriteUnprepared, true)]
+    public void WalRecordsAreByteIdentical(TransactionWritePolicy policy, bool twoWriteQueues)
     {
         using var nativeDir = new TempDir("wp-wal-n");
         using var managedDir = new TempDir("wp-wal-m");
         long threshold = policy == TransactionWritePolicy.WriteUnprepared ? 1 : 0;
-        using (var native = new NativeTxnDb(nativeDir.Path, policy))
+        using (var native = new NativeTxnDb(nativeDir.Path, policy, twoWriteQueues))
         {
             native.Put("p", "1");
             IntPtr t = native.Begin(threshold);
@@ -243,7 +257,7 @@ public sealed class WritePreparedCompatTests
             NativeTxnDb.Commit(c);
             NativeTxnDb.Destroy(c);
         }
-        using (TransactionDatabase db = OpenManaged(managedDir.Path, policy))
+        using (TransactionDatabase db = OpenManaged(managedDir.Path, policy, twoWriteQueues))
         {
             db.Put(s_sync, null, B("p"), B("1"));
             using (Transaction t = db.BeginTransaction(s_sync, new TransactionOptions { WriteBatchFlushThreshold = threshold }))

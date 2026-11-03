@@ -44,7 +44,7 @@ internal static class FlushJob
     /// </remarks>
     public static async ValueTask<FileMetaData?> WriteLevel0TableAsync(IFileSystem fs, string path, WritableFileOptions fileOptions, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
         ulong fileNumber, ulong epochNumber, DbIdentity identity, ulong[] snapshots, SnapshotChecker? snapshotChecker, Blob.BlobFileBuilder? blobBuilder,
-        Blob.BlobGarbageMeter? blobOutflow,
+        Blob.BlobGarbageMeter? blobOutflow, SeqnoToTimeMapping? seqnoToTimeMapping,
         bool synchronous, CancellationToken cancellationToken)
     {
         bool stripTimestamps = cfd.TimestampsInMemtableOnly;
@@ -89,6 +89,7 @@ internal static class FlushJob
         {
             using (var builder = new BlockBasedTableBuilder(file, cfd.Format, tbo))
             {
+                ulong smallestPreferredSeqno = DbFormat.MaxSequenceNumber;
                 FragmentedRangeTombstoneList? tombstones = FragmentRangeTombstones(cfd, mems, stripTimestamps);
                 if (stripTimestamps)
                 {
@@ -98,7 +99,8 @@ internal static class FlushJob
                 {
                     // Collapsing versions of a key compares user keys without their timestamp and needs full_history_ts_low;
                     // with persisted user-defined timestamps every version is kept (always correct).
-                    AddPointEntries(builder, cfd.Icmp, mems, meta, snapshots, dropHidden: cfd.TimestampSize == 0 && snapshotChecker is null, blobBuilder, blobOutflow);
+                    smallestPreferredSeqno = AddPointEntries(builder, cfd.Icmp, mems, meta, snapshots,
+                        dropHidden: cfd.TimestampSize == 0 && snapshotChecker is null, blobBuilder, blobOutflow, seqnoToTimeMapping);
                 }
                 blobBuilder?.Finish();
                 if (tombstones is not null) AddRangeTombstones(builder, cfd, tombstones, meta);
@@ -108,6 +110,14 @@ internal static class FlushJob
                 }
                 else
                 {
+                    // BuildTable -> SetSeqnoTimeTableProperties: the part of the DB's seqno-to-time mapping relevant to
+                    // the file's seqno range (and the preferred seqnos of its TimedPut entries), at most
+                    // kMaxSeqnoTimePairsPerSST pairs.
+                    if (seqnoToTimeMapping is not null)
+                    {
+                        builder.Properties.SequenceNumberTimeMapping = RelevantSeqnoToTimeMapping(seqnoToTimeMapping,
+                            Math.Min(meta.SmallestSeqno, smallestPreferredSeqno), meta.LargestSeqno, now);
+                    }
                     if (synchronous) builder.Finish();
                     else await builder.FinishAsync(cancellationToken).ConfigureAwait(false);
                     if (synchronous) file.Sync();
@@ -119,6 +129,8 @@ internal static class FlushJob
                     meta.MaxTimestamp = builder.TimestampMax;
                     // BuildTable: meta->marked_for_compaction = builder->NeedCompact() (table properties collectors).
                     meta.MarkedForCompaction = builder.NeedCompact;
+                    // Entry stats as the version would load them from the table properties (no table read needed).
+                    meta.SetEntryStats(builder.Properties);
                     keep = true;
                 }
             }
@@ -154,28 +166,92 @@ internal static class FlushJob
     /// entries is always correct and leaves that work to compaction), single deletes are never dropped (they have their
     /// own branch before rule (A) upstream), and keys covered by range tombstones of the same flush are kept.
     /// </summary>
-    private static void AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
-        ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder, Blob.BlobGarbageMeter? blobOutflow)
+    /// <summary>
+    /// The table property value of SetSeqnoTimeTableProperties: <paramref name="mapping"/> restricted to
+    /// [<paramref name="fromSeqno"/>, <paramref name="toSeqno"/>], capped at kMaxSeqnoTimePairsPerSST pairs and
+    /// enforced at <paramref name="fileCreationTime"/> (empty when nothing is relevant).
+    /// </summary>
+    internal static byte[] RelevantSeqnoToTimeMapping(SeqnoToTimeMapping mapping, ulong fromSeqno, ulong toSeqno, ulong fileCreationTime)
+    {
+        var relevant = new SeqnoToTimeMapping();
+        relevant.CopyFromSeqnoRange(mapping, fromSeqno, toSeqno);
+        relevant.SetCapacity(SeqnoToTimeMapping.MaxSeqnoTimePairsPerSst);
+        relevant.Enforce(fileCreationTime);
+        return relevant.Encode();
+    }
+
+    /// <summary>Returns the smallest preferred seqno assigned to a TimedPut entry (kMaxSequenceNumber if none).</summary>
+    private static ulong AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
+        ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder, Blob.BlobGarbageMeter? blobOutflow, SeqnoToTimeMapping? seqnoToTimeMapping)
     {
         Util.PooledBufferWriter? blobIndex = blobBuilder is null ? null : new Util.PooledBufferWriter(Blob.BlobIndex.MaxEncodedLength);
         Util.PooledBufferWriter? blobKey = blobBuilder is null ? null : new Util.PooledBufferWriter(64);
         Blob.EntityBlobRewriter? entities = blobBuilder is null ? null : new Blob.EntityBlobRewriter();
+        var timed = new TimedPutRewriter(seqnoToTimeMapping);
         try
         {
-            AddPointEntries(builder, icmp, mems, meta, snapshots, dropHidden, blobBuilder, blobIndex, blobKey, entities, blobOutflow);
+            AddPointEntries(builder, icmp, mems, meta, snapshots, dropHidden, blobBuilder, blobIndex, blobKey, entities, blobOutflow, ref timed);
+            return timed.SmallestPreferredSeqno;
         }
         finally
         {
             blobIndex?.Dispose();
             blobKey?.Dispose();
             entities?.Dispose();
+            timed.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The TimedPut conversion of BuildTable (db/builder.cc): a kTypeValuePreferredSeqno entry carries its write time
+    /// in the memtable; the table gets the preferred seqno estimated from the seqno-to-time mapping
+    /// (GetProximalSeqnoBeforeTime) when it is older than the entry's seqno, else a plain kTypeValue.
+    /// </summary>
+    private struct TimedPutRewriter(SeqnoToTimeMapping? mapping) : IDisposable
+    {
+        public ulong SmallestPreferredSeqno = DbFormat.MaxSequenceNumber;
+        private Util.PooledBufferWriter? _key;
+        private Util.PooledBufferWriter? _value;
+
+        public void Add(BlockBasedTableBuilder builder, ReadOnlySpan<byte> key, ulong seq, ReadOnlySpan<byte> packedValue)
+        {
+            _key ??= new Util.PooledBufferWriter(64);
+            _value ??= new Util.PooledBufferWriter(64);
+            ReadOnlySpan<byte> unpacked = packedValue[..^8];
+            ulong writeTime = Util.Coding.DecodeFixed64(packedValue[^8..]);
+            ulong preferred = mapping is not null ? mapping.GetProximalSeqnoBeforeTime(writeTime) : DbFormat.MaxSequenceNumber;
+            _value.Clear();
+            _value.Write(unpacked);
+            if (preferred < seq)
+            {
+                // PackValueAndSeqno
+                Span<byte> tail = _value.GetSpan(8);
+                Util.Coding.EncodeFixed64(tail, preferred);
+                _value.Advance(8);
+                SmallestPreferredSeqno = Math.Min(SmallestPreferredSeqno, preferred);
+                builder.Add(key, _value.WrittenSpan);
+            }
+            else
+            {
+                // Cannot get a useful preferred seqno, convert it to a kTypeValue.
+                _key.Clear();
+                _key.Write(key);
+                Util.Coding.EncodeFixed64(_key.WrittenSpanMutable[^DbFormat.InternalKeyFooterSize..], (seq << 8) | (byte)EntryType.Value);
+                builder.Add(_key.WrittenSpan, _value.WrittenSpan);
+            }
+        }
+
+        public void Dispose()
+        {
+            _key?.Dispose();
+            _value?.Dispose();
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
         ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder, Util.PooledBufferWriter? blobIndex, Util.PooledBufferWriter? blobKey,
-        Blob.EntityBlobRewriter? entities, Blob.BlobGarbageMeter? blobOutflow)
+        Blob.EntityBlobRewriter? entities, Blob.BlobGarbageMeter? blobOutflow, ref TimedPutRewriter timed)
     {
         int n = mems.Count;
         var its = new MemTableIterator[n];
@@ -232,6 +308,10 @@ internal static class FlushJob
             {
                 AddEntity(builder, meta, key, its[best].Value, blobBuilder, entities);
                 blobOutflow?.ProcessOutFlow(key, its[best].Value);
+            }
+            else if (type == EntryType.ValuePreferredSeqno)
+            {
+                timed.Add(builder, key, seq, its[best].Value);
             }
             else
             {

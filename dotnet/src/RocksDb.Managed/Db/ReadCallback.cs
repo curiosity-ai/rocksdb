@@ -62,6 +62,13 @@ internal enum SnapshotCheckerResult
 internal abstract class SnapshotChecker
 {
     public abstract SnapshotCheckerResult CheckInSnapshot(ulong sequence, ulong snapshotSequence);
+
+    /// <summary>
+    /// The sequence number below which every entry is known to be committed (bounded by <paramref name="oldestSnapshot"/>).
+    /// Bottommost files are marked for compaction only below it: uncommitted entries are never visible to the
+    /// compaction's snapshots, so their sequence numbers cannot be zeroed and the rewrite would be repeated forever.
+    /// </summary>
+    public virtual ulong BoundOldestSnapshotForBottommostMarking(ulong oldestSnapshot) => oldestSnapshot;
 }
 
 /// <summary>
@@ -77,6 +84,9 @@ internal sealed class DisableGcSnapshotChecker : SnapshotChecker
     }
 
     public override SnapshotCheckerResult CheckInSnapshot(ulong sequence, ulong snapshotSequence) => SnapshotCheckerResult.NotInSnapshot;
+
+    /// <summary>Nothing can be zeroed: no bottommost file is marked.</summary>
+    public override ulong BoundOldestSnapshotForBottommostMarking(ulong oldestSnapshot) => 0;
 }
 
 /// <summary>
@@ -126,11 +136,9 @@ internal abstract class SeqPerBatchHooks
     public abstract Snapshot GetSnapshot();
 
     /// <summary>
-    /// Prepares a write that did not come from a transaction: returns the batch to write (with the trailing Noop
-    /// boundary, WriteInternal's InsertNoop) and fills <paramref name="context"/> (batch count and commit-map
-    /// callback). Return the batch with <see cref="EndPlainWrite"/>.
+    /// Writes a batch that did not come from a transaction (WritePreparedTxnDB::Write with skip_concurrency_control ->
+    /// WriteInternal): the batch gets its sub-batch count and a trailing Noop boundary, and is committed by the
+    /// write's pre-release callback, or, with two write queues, by a second (WAL-less) write on the WAL-only queue.
     /// </summary>
-    public abstract WriteBatch BeginPlainWrite(WriteBatch batch, TransactionWriteContext context);
-
-    public abstract void EndPlainWrite(WriteBatch written, TransactionWriteContext context);
+    public abstract ValueTask WritePlainAsync(WriteOptions? options, WriteBatch batch, bool synchronous, CancellationToken cancellationToken);
 }

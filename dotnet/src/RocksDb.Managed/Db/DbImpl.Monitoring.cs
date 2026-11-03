@@ -254,7 +254,7 @@ internal sealed partial class DbImpl
         else
         {
             ls.BytesWritten = job.Stats.BytesWritten;
-            ls.NumOutputFiles = job.Outputs.Count;
+            ls.NumOutputFiles = job.Outputs.Count + job.ProximalOutputs.Count;
             ls.NumInputRecords = (ulong)job.Stats.NumInputRecords;
             ls.NumDroppedRecords = (ulong)Math.Max(0, job.Stats.NumInputRecords - job.Stats.NumOutputRecords);
         }
@@ -277,7 +277,7 @@ internal sealed partial class DbImpl
         if (_infoLog is null) return;
         if (job is not null)
         {
-            foreach (FileMetaData meta in job.Outputs)
+            foreach (FileMetaData meta in job.AllOutputs)
             {
                 LogInfo("[" + cfd.Name + "] [JOB " + jobId + "] Generated table #" + meta.FileNumber + ": " + meta.FileSize + " bytes");
                 LogEvent("\"cf_name\": " + Json(cfd.Name) + ", \"job\": " + jobId + ", \"event\": \"table_file_creation\", \"file_number\": " +
@@ -347,11 +347,18 @@ internal sealed partial class DbImpl
         }
     }
 
-    /// <summary>NUMBER_KEYS_READ, BYTES_READ, MEMTABLE_HIT / MISS, BYTES_PER_READ and DB_GET for one point lookup.</summary>
+    /// <summary>
+    /// NUMBER_KEYS_READ, BYTES_READ, MEMTABLE_HIT / MISS, GET_HIT_L0 / L1 / L2_AND_UP (Version::Get, kFound in a table
+    /// file), BYTES_PER_READ and DB_GET for one point lookup.
+    /// </summary>
     internal static void RecordGet(Statistics st, GetContext ctx, long startTimestamp)
     {
         st.RecordTick(Ticker.NumberKeysRead);
         st.RecordTick(ctx.FromMemTable ? Ticker.MemtableHit : Ticker.MemtableMiss);
+        if (ctx.HitLevel >= 0 && ctx.State == GetContext.GetState.Found)
+        {
+            st.RecordTick(ctx.HitLevel switch { 0 => Ticker.GetHitL0, 1 => Ticker.GetHitL1, _ => Ticker.GetHitL2AndUp });
+        }
         if (ctx.State == GetContext.GetState.Found || ctx.MergeContext.Count > 0)
         {
             int n = ctx.Value.WrittenCount;
@@ -388,7 +395,7 @@ internal sealed partial class DbImpl
                 SuperVersion sv = GetReferencedSuperVersion(cfd);
                 try
                 {
-                    sb.Append(cfd.Stats.Dump(cfd.Name, sv.Current.Storage));
+                    sb.Append(cfd.Stats.Dump(cfd.Name, sv.Current.Storage, isPeriodic: true));
                 }
                 finally
                 {
@@ -411,6 +418,8 @@ internal sealed partial class DbImpl
     {
         _statsDumpTimer?.Dispose();
         _statsDumpTimer = null;
+        StopCompactionTrigger();
+        StopRecordSeqnoTimeWorker();
         InfoLogger? log = _infoLog;
         if (log is null) return;
         LogInfo("Shutdown complete");

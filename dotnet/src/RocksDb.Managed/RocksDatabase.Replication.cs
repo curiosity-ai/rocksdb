@@ -77,6 +77,9 @@ public sealed partial class RocksDatabase
     public ValueTask TryCatchUpWithPrimaryAsync(CancellationToken cancellationToken = default) =>
         _db.TryCatchUpWithPrimaryAsync(synchronous: false, cancellationToken);
 
+    /// <summary>Secondary diagnostics (tests): MANIFESTs replayed from their start, MANIFEST records applied in total.</summary>
+    internal (int ManifestOpens, long ManifestRecords) SecondaryManifestTailStats => _db.SecondaryManifestTailStats;
+
     /// <summary>Synchronous <see cref="TryCatchUpWithPrimaryAsync"/>.</summary>
     public void TryCatchUpWithPrimary()
     {

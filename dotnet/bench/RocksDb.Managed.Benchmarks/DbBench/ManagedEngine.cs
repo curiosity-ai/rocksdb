@@ -41,7 +41,8 @@ public sealed class ManagedEngine : IKeyValueEngine
             _ => throw new ArgumentOutOfRangeException(nameof(options), options.CacheType, "unknown cache type"),
         };
         if (options.BloomBitsPerKey > 0) cfo.TableOptions.FilterPolicy = new BloomFilterPolicy(options.BloomBitsPerKey);
-        var dbo = new DbOptions { CreateIfMissing = true, FileSystem = LocalFileSystem.Instance, MaxBackgroundJobs = options.MaxBackgroundJobs };
+        var dbo = new DbOptions { CreateIfMissing = true, FileSystem = LocalFileSystem.Instance, MaxBackgroundJobs = options.MaxBackgroundJobs,
+            MaxSubcompactions = options.MaxSubcompactions };
         return (dbo, cfo);
     }
 

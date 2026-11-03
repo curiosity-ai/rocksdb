@@ -10,14 +10,19 @@ namespace RocksDb.Managed.Db;
 /// file deletion); the WALs are replayed into memtables, which simply grow; writes, flushes and column family
 /// changes fail with NotSupported. A subset of the column families may be opened.</item>
 /// <item>Secondary: a read-only instance that follows a live primary. <see cref="TryCatchUpWithPrimaryAsync"/>
-/// re-reads the primary's MANIFEST (installing new versions), then tails the WALs from the oldest one holding
+/// tails the primary's MANIFEST (applying only the VersionEdits appended since the previous catch-up and installing
+/// new versions for the column families whose files changed), then tails the WALs from the oldest one holding
 /// unflushed data. When a column family's log number advanced (the primary flushed), memtables are rebuilt from the
 /// remaining WALs; otherwise only records appended since the previous catch-up are applied (incremental tailing with
 /// <see cref="FragmentBufferedLogReader"/>, like DBImplSecondary::RecoverLogFiles).</item>
 /// </list>
-/// The managed secondary re-reads the whole MANIFEST on every catch-up instead of tailing it with a
-/// ReactiveVersionSet; files deleted by the primary while still referenced by an old secondary version are only
-/// readable if their table reader was already open (same caveat as upstream).
+/// MANIFEST tailing ports ReactiveVersionSet::ReadAndApply / MaybeSwitchManifest (db/version_set.cc) and ManifestTailer
+/// (db/version_edit_handler.h): the reader keeps its position in the MANIFEST and a <see cref="ManifestReplayer"/> keeps
+/// the replayed state; only when CURRENT names a new MANIFEST (the primary rolled it over) is the new one replayed from
+/// its start (it begins with a full snapshot). Unlike ManifestTailer (a VersionEditHandlerPointInTime) the managed
+/// secondary does not check that new table files exist before installing a version; files deleted by the primary while
+/// still referenced by an old secondary version are only readable if their table reader was already open (same
+/// caveat as upstream).
 /// </summary>
 internal sealed partial class DbImpl
 {
@@ -27,6 +32,14 @@ internal sealed partial class DbImpl
     private readonly SemaphoreSlim _catchUpLock = new(1, 1);
     // Secondary: open WAL readers by log number (incremental tailing). Guarded by _catchUpLock.
     private readonly SortedDictionary<ulong, FragmentBufferedLogReader> _secondaryWalReaders = new();
+    // Secondary: position in the primary's current MANIFEST + replayed state. Guarded by _catchUpLock.
+    private SecondaryManifestTailer? _manifestTailer;
+    private int _secondaryManifestOpens;
+    private long _secondaryManifestRecords;
+
+    /// <summary>Secondary diagnostics: MANIFESTs replayed from their start, and MANIFEST records applied in total.</summary>
+    internal (int ManifestOpens, long ManifestRecords) SecondaryManifestTailStats =>
+        (Volatile.Read(ref _secondaryManifestOpens), Interlocked.Read(ref _secondaryManifestRecords));
 
     public bool IsReadOnly => _readOnly;
     public bool IsSecondary => _secondary;
@@ -72,7 +85,17 @@ internal sealed partial class DbImpl
         {
             throw new RocksDbException(StatusCode.InvalidArgument, "Invalid argument: " + DbName + ": does not exist (read-only open)");
         }
-        RecoveredVersionState state = RecoverManifestWithRetry(out ulong manifestNumber);
+        ulong manifestNumber;
+        RecoveredVersionState state;
+        if (_secondary)
+        {
+            state = TailManifestWithRetry(out _);
+            manifestNumber = _manifestTailer!.ManifestNumber;
+        }
+        else
+        {
+            state = ManifestReader.RecoverFromDirectory(FileSystem, DbName, _comparatorResolver, out manifestNumber);
+        }
         Versions.RecoverFrom(state, manifestNumber);
         foreach (string name in descriptors.Keys)
         {
@@ -103,7 +126,7 @@ internal sealed partial class DbImpl
 
         if (_secondary)
         {
-            await CatchUpCoreAsync(state, synchronous, ct).ConfigureAwait(false);
+            await CatchUpCoreAsync(state, manifestChanged: true, synchronous, ct).ConfigureAwait(false);
         }
         else
         {
@@ -168,20 +191,89 @@ internal sealed partial class DbImpl
         return wals;
     }
 
-    /// <summary>Reads CURRENT + MANIFEST, retrying when the primary switches MANIFEST concurrently.</summary>
-    private RecoveredVersionState RecoverManifestWithRetry(out ulong manifestNumber)
+    // ---- secondary MANIFEST tailing ----------------------------------------------------------------------
+
+    /// <summary>Open MANIFEST reader + the state replayed from it so far (ReactiveVersionSet's manifest_reader_ + ManifestTailer).</summary>
+    private sealed class SecondaryManifestTailer(ulong manifestNumber, FragmentBufferedLogReader reader, WalRecoveryReporter reporter,
+        ManifestReplayer replayer) : IDisposable
+    {
+        public readonly ulong ManifestNumber = manifestNumber;
+        public readonly FragmentBufferedLogReader Reader = reader;
+        public readonly WalRecoveryReporter Reporter = reporter;
+        public readonly ManifestReplayer Replayer = replayer;
+        /// <summary>Validated state as of the last applied edit (null until the first <see cref="ManifestReplayer.CurrentState"/>).</summary>
+        public RecoveredVersionState? State;
+
+        public void Dispose() => Reader.Dispose();
+    }
+
+    /// <summary>
+    /// <see cref="TailManifest"/>, starting over from CURRENT when it fails: the primary may have switched to a new MANIFEST
+    /// and deleted the old one between reading CURRENT and opening it (Status::TryAgain in MaybeSwitchManifest), or the
+    /// tail did not decode. Caller serializes (open / _catchUpLock).
+    /// </summary>
+    private RecoveredVersionState TailManifestWithRetry(out bool changed)
     {
         for (int attempt = 0; ; attempt++)
         {
             try
             {
-                return ManifestReader.RecoverFromDirectory(FileSystem, DbName, _comparatorResolver, out manifestNumber);
+                return TailManifest(out changed);
             }
-            catch (RocksDbException) when (_secondary && attempt < 5)
+            catch (RocksDbException) when (attempt < 5)
             {
+                DisposeManifestTailer();
                 Thread.Sleep(1 << attempt);
             }
         }
+    }
+
+    /// <summary>
+    /// Port of ReactiveVersionSet::ReadAndApply: switches to the MANIFEST named by CURRENT if it changed
+    /// (MaybeSwitchManifest -- the new one is replayed from its start), then applies every complete record appended since
+    /// the previous call. A torn trailing record stays buffered in the reader; an incomplete trailing atomic group stays
+    /// buffered in the replayer. <paramref name="changed"/> is false when no new edit was applied (nothing to install).
+    /// The returned state is live (owned by the tailer).
+    /// </summary>
+    private RecoveredVersionState TailManifest(out bool changed)
+    {
+        changed = false;
+        string path = FileNames.GetCurrentManifestPath(FileSystem, DbName, out ulong manifestNumber);
+        SecondaryManifestTailer? tailer = _manifestTailer;
+        if (tailer is null || tailer.ManifestNumber != manifestNumber)
+        {
+            // Like C++, the rest of the old MANIFEST is not read: the new one starts with a snapshot of the full state.
+            DisposeManifestTailer();
+            var reporter = new WalRecoveryReporter { FileName = path };
+            // log::FragmentBufferedReader(..., checksum=true, log_number=0), as in MaybeSwitchManifest.
+            var reader = new FragmentBufferedLogReader(FileSystem.OpenSequential(path), reporter, checksum: true, logNumber: 0);
+            tailer = new SecondaryManifestTailer(manifestNumber, reader, reporter, new ManifestReplayer(_comparatorResolver));
+            _manifestTailer = tailer;
+            Interlocked.Increment(ref _secondaryManifestOpens);
+            changed = true;
+        }
+        long applied = 0;
+        while (tailer.Reader.TryReadRecord(out ReadOnlySpan<byte> record))
+        {
+            if (tailer.Reporter.Error is not null) break;
+            tailer.Replayer.Apply(VersionEdit.DecodeFrom(record));
+            applied++;
+        }
+        if (tailer.Reporter.Error is { } error) throw error;
+        if (applied > 0)
+        {
+            Interlocked.Add(ref _secondaryManifestRecords, applied);
+            changed = true;
+        }
+        // CurrentState validates and re-sorts the levels: only needed after new edits.
+        if (changed) tailer.State = tailer.Replayer.CurrentState();
+        return tailer.State!;
+    }
+
+    private void DisposeManifestTailer()
+    {
+        _manifestTailer?.Dispose();
+        _manifestTailer = null;
     }
 
     // ---- secondary catch-up ----------------------------------------------------------------------------
@@ -196,8 +288,8 @@ internal sealed partial class DbImpl
         try
         {
             ThrowIfDisposed();
-            RecoveredVersionState state = RecoverManifestWithRetry(out _);
-            await CatchUpCoreAsync(state, synchronous, ct).ConfigureAwait(false);
+            RecoveredVersionState state = TailManifestWithRetry(out bool manifestChanged);
+            await CatchUpCoreAsync(state, manifestChanged, synchronous, ct).ConfigureAwait(false);
         }
         finally
         {
@@ -205,14 +297,34 @@ internal sealed partial class DbImpl
         }
     }
 
-    /// <summary>Installs the primary's current versions and applies its WALs. Caller serializes (open / _catchUpLock).</summary>
-    private ValueTask CatchUpCoreAsync(RecoveredVersionState state, bool synchronous, CancellationToken ct)
+    /// <summary>
+    /// Installs the primary's current versions (when <paramref name="manifestChanged"/>) and applies its WALs. Caller
+    /// serializes (open / _catchUpLock).
+    /// </summary>
+    private ValueTask CatchUpCoreAsync(RecoveredVersionState state, bool manifestChanged, bool synchronous, CancellationToken ct)
     {
         _ = synchronous;
         ct.ThrowIfCancellationRequested();
+        if (manifestChanged)
+        {
+            var obsolete = new List<ObsoleteTableFile>();
+            var obsoleteBlobs = new List<ObsoleteBlobFile>();
+            bool resetMemtables = InstallManifestState(state, obsolete, obsoleteBlobs);
+            foreach (ObsoleteTableFile t in obsolete) t.Cfd.TableCache.Evict(t.Meta.FileNumber);
+            foreach (ObsoleteBlobFile b in obsoleteBlobs) b.Cfd.BlobSource.Evict(b.BlobFileNumber);
+            if (resetMemtables) DisposeSecondaryWalReaders();
+        }
+        ApplyWalTail(state);
+        return default;
+    }
+
+    /// <summary>
+    /// Installs new versions for the column families whose live files changed (ReactiveVersionSet's cfds_changed).
+    /// Returns true when a log number advanced and the memtables were reset (WALs must be re-read).
+    /// </summary>
+    private bool InstallManifestState(RecoveredVersionState state, List<ObsoleteTableFile> obsolete, List<ObsoleteBlobFile> obsoleteBlobs)
+    {
         bool resetMemtables = false;
-        var obsolete = new List<ObsoleteTableFile>();
-        var obsoleteBlobs = new List<ObsoleteBlobFile>();
         lock (_mutex)
         {
             foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
@@ -246,10 +358,12 @@ internal sealed partial class DbImpl
                 }
             }
         }
-        foreach (ObsoleteTableFile t in obsolete) t.Cfd.TableCache.Evict(t.Meta.FileNumber);
-        foreach (ObsoleteBlobFile b in obsoleteBlobs) b.Cfd.BlobSource.Evict(b.BlobFileNumber);
-        if (resetMemtables) DisposeSecondaryReaders();
+        return resetMemtables;
+    }
 
+    /// <summary>Applies WAL records appended since the previous catch-up (DBImplSecondary::RecoverLogFiles).</summary>
+    private void ApplyWalTail(RecoveredVersionState state)
+    {
         ulong minLog;
         lock (_mutex) minLog = Versions.MinLogNumberWithUnflushedData(null);
         // Readers of WALs whose data is now in table files are no longer needed.
@@ -300,7 +414,6 @@ internal sealed partial class DbImpl
             foreach (ColumnFamilyData cfd in Versions.ColumnFamilies) InstallSuperVersion(cfd);
         }
         NotifySequenceWaiters();
-        return default;
     }
 
     private static bool SameFiles(VersionStorageInfo current, ColumnFamilyVersion cf)
@@ -322,7 +435,14 @@ internal sealed partial class DbImpl
         return true;
     }
 
+    /// <summary>Disposes the MANIFEST tailer and the WAL readers (close / failed open).</summary>
     private void DisposeSecondaryReaders()
+    {
+        DisposeManifestTailer();
+        DisposeSecondaryWalReaders();
+    }
+
+    private void DisposeSecondaryWalReaders()
     {
         foreach (FragmentBufferedLogReader r in _secondaryWalReaders.Values) r.Dispose();
         _secondaryWalReaders.Clear();

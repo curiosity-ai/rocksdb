@@ -32,6 +32,7 @@ internal sealed partial class VersionStorageInfo
     private readonly List<(int Level, FileMetaData File)> _expiredTtlFiles = new();
     private readonly List<(int Level, FileMetaData File)> _filesMarkedForPeriodicCompaction = new();
     private readonly List<(int Level, FileMetaData File)> _filesMarkedForForcedBlobGC = new();
+    private readonly List<(int Level, FileMetaData File)> _readTriggeredCompactionFiles = new();
 
     /// <summary>The column family options this version was built with.</summary>
     public ColumnFamilyOptions Options => _options;
@@ -56,12 +57,23 @@ internal sealed partial class VersionStorageInfo
     /// <summary>estimated_compaction_needed_bytes(). Guarded by the DB mutex.</summary>
     public ulong EstimatedCompactionNeededBytes { get; private set; }
 
+    /// <summary>TEST_set_estimated_compaction_needed_bytes.</summary>
+    internal void TestSetEstimatedCompactionNeededBytes(ulong bytes) => EstimatedCompactionNeededBytes = bytes;
+
+    /// <summary>set_l0_delay_trigger_count (tests).</summary>
+    internal void TestSetL0DelayTriggerCount(int count) => L0DelayTriggerCount = count;
+
     /// <summary>Files marked for compaction by a table property collector (FileMetaData::marked_for_compaction).</summary>
     public List<(int Level, FileMetaData File)> FilesMarkedForCompaction => _filesMarkedForCompaction;
     public List<(int Level, FileMetaData File)> ExpiredTtlFiles => _expiredTtlFiles;
     public List<(int Level, FileMetaData File)> FilesMarkedForPeriodicCompaction => _filesMarkedForPeriodicCompaction;
     /// <summary>Table files linked to the oldest blob files when their garbage ratio reaches the force threshold.</summary>
     public List<(int Level, FileMetaData File)> FilesMarkedForForcedBlobGC => _filesMarkedForForcedBlobGC;
+    /// <summary>
+    /// ReadTriggeredCompactionFiles(): files whose sampled collapsible-entry reads per byte exceed
+    /// read_triggered_compaction_threshold, hottest first.
+    /// </summary>
+    public List<(int Level, FileMetaData File)> ReadTriggeredCompactionFiles => _readTriggeredCompactionFiles;
 
     /// <summary>MaxBytesForLevel: target size of a level (L0 is governed by file count).</summary>
     public ulong MaxBytesForLevel(int level) => _levelMaxBytes[level];
@@ -95,8 +107,12 @@ internal sealed partial class VersionStorageInfo
     /// <summary>MaxOutputLevel(allow_ingest_behind).</summary>
     public int MaxOutputLevel(bool allowIngestBehind) => allowIngestBehind ? NumLevels - 2 : NumLevels - 1;
 
-    /// <summary>compensated_file_size: file size plus the estimated size of data its range tombstones cover.</summary>
-    public static ulong CompensatedFileSize(FileMetaData f) => f.FileSize + f.CompensatedRangeDeletionSize;
+    /// <summary>
+    /// compensated_file_size: file size plus the point-deletion boost and the estimated size of data its range
+    /// tombstones cover (computed when the file first appears in a version, see ComputeCompensatedSizes).
+    /// </summary>
+    public static ulong CompensatedFileSize(FileMetaData f) =>
+        f.CompensatedFileSize != 0 ? f.CompensatedFileSize : f.FileSize + f.CompensatedRangeDeletionSize;
 
     private void InitializeCompactionState(ColumnFamilyOptions options)
     {
@@ -115,7 +131,8 @@ internal sealed partial class VersionStorageInfo
         NumNonEmptyLevels = nonEmpty;
         Level0NonOverlapping = ComputeLevel0NonOverlapping();
         CalculateBaseBytes();
-        UpdateFilesByCompactionPri(null);
+        UpdateFilesByCompactionPri();
+        GenerateBottommostFiles();
         ComputeCompactionScore();
     }
 
@@ -253,7 +270,7 @@ internal sealed partial class VersionStorageInfo
     {
         double totalDowncompactBytes = 0.0;
         const double ScoreScale = 10.0;
-        int maxOutputLevel = MaxOutputLevel(_options.CfAllowIngestBehind);
+        int maxOutputLevel = MaxOutputLevel(_options.AllowIngestBehind);
         int scored = _compactionScore.Length;
         Array.Clear(_compactionScore);
         for (int i = 0; i < scored; i++) _compactionLevel[i] = i;
@@ -375,11 +392,60 @@ internal sealed partial class VersionStorageInfo
             }
         }
         ComputeFilesMarkedForCompaction(maxOutputLevel);
+        ComputeBottommostFilesMarkedForCompaction();
         ComputeExpiredTtlFiles();
         ComputeFilesMarkedForPeriodicCompaction(maxOutputLevel);
         ComputeFilesMarkedForForcedBlobGC(_options.BlobGarbageCollectionAgeCutoff, _options.BlobGarbageCollectionForceThreshold,
             _options.EnableBlobGarbageCollection);
+        ComputeFilesMarkedForReadTriggeredCompaction(_options.ReadTriggeredCompactionThreshold, CompactionStyle);
         EstimateCompactionBytesNeeded();
+    }
+
+    /// <summary>
+    /// Port of VersionStorageInfo::ComputeFilesMarkedForReadTriggeredCompaction: files (not being compacted, not on the
+    /// last non-empty level unless on L0) whose sampled collapsible-entry reads (tombstones, merge operands, misses) per
+    /// byte exceed <paramref name="threshold"/>, sorted by that ratio descending. FIFO never marks files.
+    /// </summary>
+    internal void ComputeFilesMarkedForReadTriggeredCompaction(double threshold, CompactionStyle compactionStyle)
+    {
+        _readTriggeredCompactionFiles.Clear();
+        if (threshold <= 0.0 || compactionStyle == CompactionStyle.Fifo) return;
+        // Skip files at the last non-empty level -- there is no lower level to compact into. Exception: L0 files are
+        // allowed even when L0 is the last non-empty level, because in single-level universal or FIFO compaction, L0
+        // files can be compacted together (L0 -> L0).
+        int lastNonEmpty = NumNonEmptyLevels - 1;
+        List<double>? ratios = null;
+        for (int level = 0; level < NumLevels; level++)
+        {
+            if (level >= lastNonEmpty && level != 0) continue;
+            foreach (FileMetaData f in _files[level])
+            {
+                if (f.BeingCompacted) continue;
+                ulong fileSize = f.FileSize;
+                if (fileSize == 0) continue;
+                // Snapshot reads_per_byte for each file so the sort sees stable values.
+                double readsPerByte = (double)f.NumCollapsibleEntryReadsSampled / fileSize;
+                if (readsPerByte > threshold)
+                {
+                    _readTriggeredCompactionFiles.Add((level, f));
+                    (ratios ??= new List<double>()).Add(readsPerByte);
+                }
+            }
+        }
+        if (ratios is null || ratios.Count < 2) return;
+        // Sort by reads_per_byte descending so the hottest files are picked first. std::sort is not stable; a stable
+        // order (level, then key order) is used for equal ratios.
+        var keys = ratios.ToArray();
+        var items = _readTriggeredCompactionFiles.ToArray();
+        var order = new int[keys.Length];
+        for (int i = 0; i < order.Length; i++) order[i] = i;
+        Array.Sort(order, (a, b) =>
+        {
+            int c = keys[b].CompareTo(keys[a]);
+            return c != 0 ? c : a.CompareTo(b);
+        });
+        _readTriggeredCompactionFiles.Clear();
+        foreach (int i in order) _readTriggeredCompactionFiles.Add(items[i]);
     }
 
     /// <summary>
@@ -617,10 +683,10 @@ internal sealed partial class VersionStorageInfo
     // Files by compaction priority
 
     /// <summary>
-    /// Port of VersionStorageInfo::UpdateFilesByCompactionPri (+ SortFileByOverlappingRatio, SortFileByRoundRobin).
-    /// <paramref name="compactCursors"/> (round-robin only) are the per-level cursors of the column family.
+    /// Port of VersionStorageInfo::UpdateFilesByCompactionPri (+ SortFileByOverlappingRatio, SortFileByRoundRobin with
+    /// this version's compact cursors).
     /// </summary>
-    public void UpdateFilesByCompactionPri(byte[]?[]? compactCursors)
+    private void UpdateFilesByCompactionPri()
     {
         for (int level = 0; level < NumLevels; level++) _filesByCompactionPri[level] = [];
         if (CompactionStyle is CompactionStyle.None or CompactionStyle.Fifo or CompactionStyle.Universal) return;
@@ -663,7 +729,7 @@ internal sealed partial class VersionStorageInfo
                     SortFileByOverlappingRatio(level, files, _files[level + 1], temp);
                     break;
                 case CompactionPri.RoundRobin:
-                    SortFileByRoundRobin(level, files, temp, compactCursors);
+                    SortFileByRoundRobin(level, files, temp);
                     break;
             }
             _filesByCompactionPri[level] = temp;
@@ -704,7 +770,7 @@ internal sealed partial class VersionStorageInfo
     }
 
     /// <summary>Port of SortFileByRoundRobin.</summary>
-    private void SortFileByRoundRobin(int level, FileMetaData[] files, int[] temp, byte[]?[]? cursors)
+    private void SortFileByRoundRobin(int level, FileMetaData[] files, int[] temp)
     {
         InternalKeyComparator icmp = Icmp;
         if (level == 0 && !Level0NonOverlapping)
@@ -718,7 +784,7 @@ internal sealed partial class VersionStorageInfo
             return;
         }
         if (level == 0) Array.Sort(temp, (a, b) => icmp.Compare(files[a].Smallest, files[b].Smallest));
-        byte[]? cursor = cursors is not null && level < cursors.Length ? cursors[level] : null;
+        byte[]? cursor = GetCompactCursor(level);
         if (cursor is null || cursor.Length == 0 || temp.Length <= 1) return;
         // Find the file whose smallest key is >= the cursor.
         int start = 0;

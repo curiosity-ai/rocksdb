@@ -203,8 +203,10 @@ public sealed class CompactionOptionsUniversal : PersistedOptions<CompactionOpti
     /// </summary>
     public bool Incremental { get; set; }
     /// <summary>
-    /// Minimize locking of input files while bottom-priority compactions wait (persisted; the managed port has no
-    /// bottom-priority pool, so it has no effect). Default true.
+    /// When a compaction is forwarded to the bottom-priority pool (<see cref="DbOptions.BottomPriorityBackgroundThreads"/>),
+    /// reserve only its newest input sorted run while it waits and pick the compaction afresh when a bottom thread runs
+    /// it, so other compactions can use the remaining files. Despite the name it applies to every compaction style, like
+    /// upstream. No effect without a bottom-priority pool and on manual compactions. Default true.
     /// </summary>
     public bool ReduceFileLocking { get; set; } = true;
 

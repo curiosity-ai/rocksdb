@@ -176,6 +176,14 @@ public sealed class TransactionOptions
     /// column family's own timestamp size, so such writes are timestamped correctly either way.
     /// </summary>
     public bool WriteBatchTrackTimestampSize { get; set; }
+
+    /// <summary>
+    /// use_only_the_last_commit_time_batch_for_recovery: (WritePrepared / WriteUnprepared) the commit-time write batch
+    /// (<see cref="Transaction.GetCommitTimeWriteBatch"/>) is written to the WAL only and just the last one written is
+    /// kept for recovery: the DB inserts it into the memtables before the next memtable switch. Required to use a
+    /// commit-time batch with these write policies. Default false.
+    /// </summary>
+    public bool UseOnlyTheLastCommitTimeBatchForRecovery { get; set; }
 }
 
 /// <summary>One transaction waiting in a deadlock cycle (DeadlockInfo).</summary>

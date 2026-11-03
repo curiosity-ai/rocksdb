@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using RocksDb.Managed.Db;
 
 namespace RocksDb.Managed.Utilities.Transactions;
@@ -171,6 +172,7 @@ internal sealed class OptimisticTransaction : Transaction, IWriteCallback
     /// CommitWithSerialValidate: the conflict check runs as a write callback inside the write group, so no other write
     /// can be applied between the check and this transaction's write.
     /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private async ValueTask CommitWithSerialValidateAsync(bool synchronous, CancellationToken cancellationToken)
     {
         _writeContext.Reset();
@@ -192,6 +194,7 @@ internal sealed class OptimisticTransaction : Transaction, IWriteCallback
     /// CommitWithParallelValidate: takes the bucket locks of all tracked keys in ascending order (so concurrent
     /// committers cannot deadlock), checks for conflicts against the memtables, then writes.
     /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private async ValueTask CommitWithParallelValidateAsync(bool synchronous, CancellationToken cancellationToken)
     {
         List<int> buckets = _bucketScratch ??= new List<int>();
@@ -202,7 +205,7 @@ internal sealed class OptimisticTransaction : Transaction, IWriteCallback
             TrackedColumnFamily c = _tracked.GetColumnFamily(i);
             // To avoid the same key(s) contending across CFs or DBs, seed the hash independently.
             ulong seed = (ulong)_owner.GetHashCode() + 0xb83c07fbc6ced699UL * c.Cfd.Id;
-            foreach (byte[] key in c.Keys.Keys) buckets.Add(ByteKeyComparer.Bucket(key, seed, n));
+            foreach (PooledKey key in c.Keys.Keys) buckets.Add(ByteKeyComparer.Bucket(key.Span, seed, n));
         }
         buckets.Sort();
         int taken = 0;
@@ -244,9 +247,9 @@ internal sealed class OptimisticTransaction : Transaction, IWriteCallback
             if (c.Keys.Count == 0) continue;
             if (c.Cfd.Dropped) return new RocksDbException(StatusCode.InvalidArgument, "Invalid argument: Could not access column family " + c.Cfd.Id);
             using DbImpl.ConflictCheckView view = _db.AcquireConflictCheckView(c.Cfd);
-            foreach (KeyValuePair<byte[], TrackedKeyInfo> kv in c.Keys)
+            foreach (KeyValuePair<PooledKey, TrackedKeyInfo> kv in c.Keys)
             {
-                RocksDbException? e = _db.CheckKey(view, kv.Key, kv.Value.Seq, cacheOnly: true);
+                RocksDbException? e = _db.CheckKey(view, kv.Key.Span, kv.Value.Seq, cacheOnly: true);
                 if (e is not null) return e;
             }
         }

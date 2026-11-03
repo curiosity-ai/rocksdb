@@ -12,17 +12,14 @@ internal sealed class LevelCompactionPicker : CompactionPicker
 
     public LevelCompactionPicker(ColumnFamilyOptions options, InternalKeyComparator icmp) : base(options, icmp) { }
 
-    /// <summary>Round-robin cursors per level (compact_cursor_), carried across versions in memory.</summary>
-    public byte[]?[] CompactCursors { get; } = new byte[]?[64];
-
-    protected override byte[]? GetCompactCursor(int level) => (uint)level < (uint)CompactCursors.Length ? CompactCursors[level] : null;
-
     public override bool NeedsCompaction(VersionStorageInfo vstorage)
     {
         if (vstorage.ExpiredTtlFiles.Count > 0) return true;
         if (vstorage.FilesMarkedForPeriodicCompaction.Count > 0) return true;
+        if (vstorage.BottommostFilesMarkedForCompaction.Count > 0) return true;
         if (vstorage.FilesMarkedForCompaction.Count > 0) return true;
         if (vstorage.FilesMarkedForForcedBlobGC.Count > 0) return true;
+        if (vstorage.ReadTriggeredCompactionFiles.Count > 0) return true;
         for (int i = 0; i <= vstorage.MaxInputLevel && i < vstorage.NumLevels - 1; i++)
         {
             if (vstorage.CompactionScore(i) >= 1) return true;
@@ -30,11 +27,8 @@ internal sealed class LevelCompactionPicker : CompactionPicker
         return false;
     }
 
-    public override Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots)
-    {
-        if (Options.CompactionPri == CompactionPri.RoundRobin) vstorage.UpdateFilesByCompactionPri(CompactCursors);
-        return new Builder(this, vstorage).PickCompaction();
-    }
+    public override Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots) =>
+        new Builder(this, vstorage).PickCompaction();
 
     private enum CompactToNextLevel
     {
@@ -165,6 +159,14 @@ internal sealed class LevelCompactionPicker : CompactionPicker
                 return;
             }
 
+            // Bottommost Files Compaction on deleting tombstones
+            PickFileToCompact(_vstorage.BottommostFilesMarkedForCompaction, CompactToNextLevel.No);
+            if (!_startLevelInputs.IsEmpty)
+            {
+                _reason = CompactionReason.BottommostFiles;
+                return;
+            }
+
             // TTL Compaction
             if (_o.CompactionPri == CompactionPri.RoundRobin && _vstorage.ExpiredTtlFiles.Count > 0)
             {
@@ -197,7 +199,15 @@ internal sealed class LevelCompactionPicker : CompactionPicker
 
             // Forced blob garbage collection
             PickFileToCompact(_vstorage.FilesMarkedForForcedBlobGC, CompactToNextLevel.No);
-            if (!_startLevelInputs.IsEmpty) _reason = CompactionReason.ForcedBlobGC;
+            if (!_startLevelInputs.IsEmpty)
+            {
+                _reason = CompactionReason.ForcedBlobGC;
+                return;
+            }
+
+            // Read-triggered compaction
+            PickFileToCompact(_vstorage.ReadTriggeredCompactionFiles, CompactToNextLevel.Yes);
+            if (!_startLevelInputs.IsEmpty) _reason = CompactionReason.ReadTriggered;
         }
 
         private bool SetupOtherL0FilesIfNeeded()
@@ -244,7 +254,7 @@ internal sealed class LevelCompactionPicker : CompactionPicker
                 FileMetaData f = levelFiles[i];
                 if (f.BeingCompacted) return;
                 tmp.Files.Add(f);
-                if (!_picker.ExpandInputsToCleanCut(_vstorage, tmp) || _picker.FilesRangeOverlapWithCompaction([tmp], _outputLevel)) return;
+                if (!_picker.ExpandInputsToCleanCut(_vstorage, tmp) || _picker.FilesRangeOverlapWithCompaction(_vstorage, [tmp], _outputLevel)) return;
                 ulong currBytes = CompactionPicker.TotalFileSize(tmp.Files);
                 _picker.GetRange(tmp, out smallest, out largest);
                 _vstorage.GetOverlappingInputs(_outputLevel, smallest, largest, outputLevelInputs.Files);
@@ -274,7 +284,7 @@ internal sealed class LevelCompactionPicker : CompactionPicker
                 _compactionInputs.Add(_startLevelInputs);
                 if (!_outputLevelInputs.IsEmpty) _compactionInputs.Add(_outputLevelInputs);
                 // Disallow compactions whose output could overlap a running compaction's output in the same level.
-                if (_picker.FilesRangeOverlapWithCompaction(_compactionInputs, _outputLevel)) return false;
+                if (_picker.FilesRangeOverlapWithCompaction(_vstorage, _compactionInputs, _outputLevel)) return false;
                 if (!_isL0TrivialMove) _picker.GetGrandparents(_vstorage, _startLevelInputs, _outputLevelInputs, _grandparents);
             }
             else
@@ -287,26 +297,11 @@ internal sealed class LevelCompactionPicker : CompactionPicker
         private Compaction GetCompaction()
         {
             bool l0FilesMightOverlap = _startLevel == 0 && !_isL0TrivialMove && (_compactionInputs.Count > 1 || _compactionInputs[0].Count > 1);
-            Compaction c = _picker.NewCompaction(_vstorage, _compactionInputs.ToArray(), _outputLevel,
+            // The round-robin cursor advances when the compaction's result is installed (CompactionJob::
+            // InstallCompactionResults records it in the version edit, see DbImpl.RunCompaction).
+            return _picker.NewCompaction(_vstorage, _compactionInputs.ToArray(), _outputLevel,
                 MaxFileSizeForLevel(_o, _outputLevel, _vstorage.BaseLevel), _o.MaxCompactionBytes, _picker.GetPathId(_outputLevel),
                 _grandparents, _reason, _startLevelScore, l0FilesMightOverlap, isManual: false);
-            if (_o.CompactionPri == CompactionPri.RoundRobin && _startLevel > 0 && _reason == CompactionReason.LevelMaxLevelSize)
-            {
-                // Advance the cursor to the successor of the last input file (the next compaction starts there).
-                ReadOnlySpan<FileMetaData> files = _vstorage.LevelFiles(_startLevel);
-                FileMetaData last = _startLevelInputs.Files[^1];
-                byte[]? next = null;
-                for (int i = 0; i < files.Length; i++)
-                {
-                    if (ReferenceEquals(files[i], last))
-                    {
-                        next = i + 1 < files.Length ? files[i + 1].Smallest : null;
-                        break;
-                    }
-                }
-                if (_startLevel < _picker.CompactCursors.Length) _picker.CompactCursors[_startLevel] = next;
-            }
-            return c;
         }
 
         /// <summary>Port of TryPickL0TrivialMove.</summary>
@@ -434,7 +429,7 @@ internal sealed class LevelCompactionPicker : CompactionPicker
                 }
                 _startLevelInputs.Files.Add(f);
                 if (!_picker.ExpandInputsToCleanCut(_vstorage, _startLevelInputs)
-                    || _picker.FilesRangeOverlapWithCompaction([_startLevelInputs], _outputLevel))
+                    || _picker.FilesRangeOverlapWithCompaction(_vstorage, [_startLevelInputs], _outputLevel))
                 {
                     // A locked (pending compaction) input-level file was pulled in due to user-key overlap.
                     _startLevelInputs.Clear();

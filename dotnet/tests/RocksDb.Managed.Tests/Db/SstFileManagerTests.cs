@@ -125,4 +125,29 @@ public sealed class SstFileManagerTests
         Assert.AreEqual("v-a", GetString(db, "a"));
         Assert.AreEqual("v-b", GetString(db, "b"));
     }
+
+    /// <summary>EnoughRoomForCompaction: compactions that would not fit the space limit (with the compaction buffer) are cancelled.</summary>
+    [TestMethod]
+    public void CompactionsThatDoNotFitAreCancelled()
+    {
+        MemoryFileSystem fs = NewFs();
+        using var sfm = new SstFileManager(fs, 0, 0.25, 64UL << 20);
+        sfm.SetMaxAllowedSpaceUsage(10UL << 20);
+        sfm.SetCompactionBufferSize(10UL << 20);
+        var stats = new Statistics();
+        DbOptions o = NewOptions(fs);
+        o.SstFileManager = sfm;
+        o.Statistics = stats;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, new ColumnFamilyOptions { Level0FileNumCompactionTrigger = 2 });
+        for (int round = 0; round < 4; round++)
+        {
+            for (int i = 0; i < 50; i++) db.Put(Key(i), Value(i, round));
+            db.Flush();
+        }
+        db.WaitForCompact();
+        Assert.IsTrue(stats.GetTickerCount(Ticker.CompactionCancelled) > 0);
+        Assert.AreEqual("4", db.GetProperty("rocksdb.num-files-at-level0"));
+        Assert.AreEqual(0UL, sfm.CompactionsReservedSize);
+        Assert.AreEqual(S(Value(3, 3)), GetString(db, S(Key(3))!));
+    }
 }

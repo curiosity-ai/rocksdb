@@ -56,7 +56,9 @@ public sealed class CompactionPickerTests
             return f;
         }
 
-        public VersionStorageInfo Build()
+        public VersionStorageInfo Build() => Build(null);
+
+        public VersionStorageInfo Build(VersionBuildContext? context)
         {
             var arrays = new FileMetaData[Files.Length][];
             InternalKeyComparator icmp = InternalKeyComparator.Bytewise;
@@ -67,7 +69,7 @@ public sealed class CompactionPickerTests
                 else files.Sort((a, b) => icmp.Compare(a.Smallest, b.Smallest));
                 arrays[l] = files.ToArray();
             }
-            return new VersionStorageInfo(icmp, Files.Length, Options, arrays, BlobFiles.ToArray());
+            return new VersionStorageInfo(icmp, Files.Length, Options, arrays, BlobFiles.ToArray(), context);
         }
 
         /// <summary>CompactionPickerTestBase::AddBlobFile (one blob, no garbage, no linked SSTs).</summary>
@@ -927,8 +929,7 @@ public sealed class CompactionPickerTests
         LevelCompactionPicker picker = fx.LevelPicker();
         byte[] cursor = new byte[3 + 8];
         DbFormat.AppendInternalKey(cursor, "180"u8, 100, EntryType.Value);
-        picker.CompactCursors[1] = cursor;
-        Compaction? c = picker.PickCompaction(fx.Build(), []);
+        Compaction? c = picker.PickCompaction(fx.Build(new VersionBuildContext { CompactCursors = [new CompactCursor(1, cursor)] }), []);
         Assert.IsNotNull(c);
         Assert.AreEqual(1, c.OutputLevel);
         Assert.AreSame(cursor, c.OutputSplitKey);
@@ -942,8 +943,7 @@ public sealed class CompactionPickerTests
         LevelCompactionPicker picker2 = fx2.LevelPicker();
         byte[] outside = new byte[3 + 8];
         DbFormat.AppendInternalKey(outside, "900"u8, 100, EntryType.Value);
-        picker2.CompactCursors[1] = outside;
-        c = picker2.PickCompaction(fx2.Build(), []);
+        c = picker2.PickCompaction(fx2.Build(new VersionBuildContext { CompactCursors = [new CompactCursor(1, outside)] }), []);
         Assert.IsNotNull(c);
         Assert.IsNull(c.OutputSplitKey);
     }
@@ -974,5 +974,456 @@ public sealed class CompactionPickerTests
         CollectionAssert.AreEqual(new List<ulong> { 2 }, Numbers(new CompactionInputFiles(2, cut)));
         fx.Options.CompactionPri = CompactionPri.OldestLargestSeqFirst;
         Assert.IsNull(CompactionJob.FillFilesToCutForTtl(c));
+    }
+    // ---- read-triggered compaction (compaction_picker_test.cc ReadTriggered*) -------------------------------------
+
+    private static void SetCollapsibleReads(FileMetaData f, uint n) => f.AddCollapsibleEntryReadsSampled(n);
+
+    [TestMethod]
+    public void ReadTriggeredCompactionDisabled()
+    {
+        var fx = new Fixture(6);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.0; // threshold=0 means disabled, no files should be marked
+        SetCollapsibleReads(fx.Add(0, 1, "100", "200", 1000), 999999);
+        Assert.AreEqual(0, fx.Build().ReadTriggeredCompactionFiles.Count);
+    }
+
+    [TestMethod]
+    public void ReadTriggeredCompactionBelowThreshold()
+    {
+        var fx = new Fixture(6);
+        fx.Options.ReadTriggeredCompactionThreshold = 1.0;
+        // file_size=1000, reads=500 => reads_per_byte=0.5 < 1.0
+        SetCollapsibleReads(fx.Add(0, 1, "100", "200", 1000), 500);
+        Assert.AreEqual(0, fx.Build().ReadTriggeredCompactionFiles.Count);
+    }
+
+    [TestMethod]
+    public void ReadTriggeredCompactionAboveThreshold()
+    {
+        var fx = new Fixture(6);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.5;
+        SetCollapsibleReads(fx.Add(0, 1, "100", "200", 1000), 600); // 0.6 > 0.5
+        SetCollapsibleReads(fx.Add(1, 2, "300", "400", 1000), 300); // 0.3 < 0.5 (not marked)
+        SetCollapsibleReads(fx.Add(2, 3, "500", "600", 1000), 800); // 0.8 > 0.5 (hottest)
+        fx.Add(4, 4, "700", "800", 1000); // L2 is not the last non-empty level
+        List<(int Level, FileMetaData File)> marked = fx.Build().ReadTriggeredCompactionFiles;
+        Assert.AreEqual(2, marked.Count);
+        // Sorted by reads_per_byte descending: file 3 (0.8) then file 1 (0.6)
+        Assert.AreEqual(3UL, marked[0].File.FileNumber);
+        Assert.AreEqual(1UL, marked[1].File.FileNumber);
+    }
+
+    [TestMethod]
+    public void ReadTriggeredCompactionIgnoresFifoAndFilesBeingCompacted()
+    {
+        var fx = new Fixture(1, CompactionStyle.Fifo);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.1;
+        SetCollapsibleReads(fx.Add(0, 1, "100", "200", 1000), 5000);
+        Assert.AreEqual(0, fx.Build().ReadTriggeredCompactionFiles.Count);
+
+        var lv = new Fixture(6);
+        lv.Options.ReadTriggeredCompactionThreshold = 0.1;
+        FileMetaData busy = lv.Add(1, 1, "100", "200", 1000);
+        SetCollapsibleReads(busy, 5000);
+        lv.Add(3, 2, "300", "400", 1000);
+        busy.BeingCompacted = true;
+        Assert.AreEqual(0, lv.Build().ReadTriggeredCompactionFiles.Count);
+    }
+
+    [TestMethod]
+    public void NeedsCompactionReadTriggered()
+    {
+        var fx = new Fixture(6);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.1;
+        SetCollapsibleReads(fx.Add(1, 1, "100", "200", 1000), 500);
+        fx.Add(3, 2, "300", "400", 1000);
+        VersionStorageInfo vs = fx.Build();
+        Assert.AreNotEqual(0, vs.ReadTriggeredCompactionFiles.Count);
+        Assert.IsTrue(fx.LevelPicker().NeedsCompaction(vs));
+    }
+
+    [TestMethod]
+    public void ReadTriggeredPicksFile()
+    {
+        var fx = new Fixture(6);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.1;
+        SetCollapsibleReads(fx.Add(1, 1, "100", "200", 1000), 500);
+        fx.Add(3, 2, "300", "400", 1000);
+        Compaction? c = fx.LevelPicker().PickCompaction(fx.Build(), []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.ReadTriggered, c.Reason);
+        Assert.AreEqual(1, c.StartLevel);
+        Assert.AreEqual(2, c.OutputLevel);
+    }
+
+    [TestMethod]
+    public void UniversalReadTriggeredCompaction()
+    {
+        const ulong FileSize = 100000;
+        var fx = new Fixture(5, CompactionStyle.Universal);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.001;
+        // Set trigger high so size amp / sorted run pickers don't fire
+        fx.Options.Level0FileNumCompactionTrigger = 10;
+        // Hot file at L2 with data at L4 below it
+        fx.Add(0, 1, "150", "200", FileSize, 500, 550);
+        SetCollapsibleReads(fx.Add(2, 2, "301", "350", FileSize, 201, 250), (uint)FileSize);
+        fx.Add(4, 3, "301", "400", FileSize, 101, 150);
+        VersionStorageInfo vs = fx.Build();
+        UniversalCompactionPicker picker = fx.UniversalPicker();
+        Assert.IsTrue(picker.NeedsCompaction(vs));
+        Compaction? c = picker.PickCompaction(vs, []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.ReadTriggered, c.Reason);
+        Assert.AreEqual(2, c.StartLevel);
+        Assert.AreEqual(4, c.OutputLevel);
+    }
+
+    [TestMethod]
+    public void ReadTriggeredSkipsLastLevel()
+    {
+        const ulong FileSize = 100000;
+        var fx = new Fixture(5, CompactionStyle.Universal);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.001;
+        fx.Options.Level0FileNumCompactionTrigger = 10;
+        fx.Add(0, 1, "150", "200", FileSize, 500, 550);
+        // File 3 is at the last non-empty level -- should NOT be marked for read-triggered compaction.
+        SetCollapsibleReads(fx.Add(4, 3, "301", "350", FileSize, 101, 150), (uint)FileSize);
+        Assert.AreEqual(0, fx.Build().ReadTriggeredCompactionFiles.Count);
+    }
+
+    [TestMethod]
+    public void UniversalReadTriggeredNoPickWhenNotMarked()
+    {
+        const ulong FileSize = 100000;
+        var fx = new Fixture(5, CompactionStyle.Universal);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.001;
+        fx.Add(0, 1, "150", "200", FileSize, 500, 550);
+        fx.Add(4, 3, "301", "350", FileSize, 101, 150);
+        VersionStorageInfo vs = fx.Build();
+        Assert.AreEqual(0, vs.ReadTriggeredCompactionFiles.Count);
+        // Not enough sorted runs to trigger compaction either
+        Assert.IsFalse(fx.UniversalPicker().NeedsCompaction(vs));
+    }
+
+    [TestMethod]
+    public void UniversalReadTriggeredIntraL0()
+    {
+        const ulong FileSize = 100000;
+        var fx = new Fixture(1, CompactionStyle.Universal);
+        fx.Options.ReadTriggeredCompactionThreshold = 0.001;
+        fx.Options.Level0FileNumCompactionTrigger = 10;
+        // Single-level universal with overlapping L0 files; file 1 is hot.
+        SetCollapsibleReads(fx.Add(0, 1, "100", "300", FileSize, 500, 550), (uint)FileSize);
+        fx.Add(0, 2, "200", "400", FileSize, 400, 450);
+        VersionStorageInfo vs = fx.Build();
+        Assert.AreNotEqual(0, vs.ReadTriggeredCompactionFiles.Count);
+        UniversalCompactionPicker picker = fx.UniversalPicker();
+        Assert.IsTrue(picker.NeedsCompaction(vs));
+        Compaction? c = picker.PickCompaction(vs, []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.ReadTriggered, c.Reason);
+        Assert.AreEqual(0, c.StartLevel);
+        Assert.AreEqual(0, c.OutputLevel);
+        Assert.AreEqual(2, c.Inputs(0).Count);
+    }
+
+    // ---- bottommost files marked for compaction ----
+
+    private static List<ulong> MarkedBottommost(VersionStorageInfo vs)
+    {
+        var l = new List<ulong>();
+        foreach ((int _, FileMetaData f) in vs.BottommostFilesMarkedForCompaction) l.Add(f.FileNumber);
+        return l;
+    }
+
+    [TestMethod]
+    public void BottommostFilesMarkedOnlyBelowOldestSnapshot()
+    {
+        // VersionStorageInfo::ComputeBottommostFilesMarkedForCompaction: a bottommost file (nothing older overlaps it)
+        // with a nonzero largest seqno is marked once the oldest snapshot passes it; until then it sets the threshold.
+        var fx = new Fixture(6);
+        fx.Add(5, 1, "100", "200", 1000, 90, 100);
+        fx.Add(5, 2, "300", "400", 1000, 0, 0); // seqnos already zeroed: never marked
+        fx.Add(4, 3, "150", "160", 1000, 200, 300); // overlaps L5: not bottommost
+        fx.Add(4, 4, "500", "600", 1000, 200, 250); // bottommost (nothing below)
+        VersionStorageInfo vs = fx.Build();
+        CollectionAssert.AreEquivalent(new ulong[] { 1, 2, 4 }, BottommostFileNumbers(vs));
+        Assert.AreEqual(0, vs.BottommostFilesMarkedForCompaction.Count);
+        Assert.AreEqual(100UL, vs.BottommostFilesMarkThreshold);
+
+        vs.UpdateOldestSnapshot(200);
+        CollectionAssert.AreEqual(new ulong[] { 1 }, MarkedBottommost(vs));
+        Assert.AreEqual(250UL, vs.BottommostFilesMarkThreshold);
+        vs.UpdateOldestSnapshot(1000);
+        CollectionAssert.AreEquivalent(new ulong[] { 1, 4 }, MarkedBottommost(vs));
+        Assert.AreEqual(DbFormat.MaxSequenceNumber, vs.BottommostFilesMarkThreshold);
+
+        // The leveled picker compacts it within its level (kBottommostFiles, CompactToNextLevel::kNo).
+        LevelCompactionPicker picker = fx.LevelPicker();
+        Assert.IsTrue(picker.NeedsCompaction(vs));
+        Compaction? c = picker.PickCompaction(vs, []);
+        Assert.IsNotNull(c);
+        Assert.AreEqual(CompactionReason.BottommostFiles, c.Reason);
+        Assert.AreEqual(c.StartLevel, c.OutputLevel);
+        Assert.AreEqual(1, c.NumInputFiles(0));
+    }
+
+    private static List<ulong> BottommostFileNumbers(VersionStorageInfo vs)
+    {
+        var l = new List<ulong>();
+        foreach ((int _, FileMetaData f) in vs.BottommostFiles) l.Add(f.FileNumber);
+        return l;
+    }
+
+    [TestMethod]
+    public void BottommostFileMarkingRespectsPreserveWindow()
+    {
+        // compaction_picker_test.cc BottommostFileNotMarkedWithinPreserveWindow / BottommostFileMarkedBelowPreserveWindow:
+        // a file whose largest seqno is inside the preserve window cannot be zeroed, so it must not be marked.
+        foreach ((ulong preserveMin, bool marked) in new[] { (100UL, false), (150UL, true) })
+        {
+            var fx = new Fixture(6);
+            fx.Add(5, 1, "100", "200", 1000, 90, 100);
+            VersionStorageInfo vs = fx.Build();
+            vs.SetPreserveTimeMinSeqno(preserveMin);
+            vs.UpdateOldestSnapshot(200);
+            Assert.AreEqual(marked ? 1 : 0, vs.BottommostFilesMarkedForCompaction.Count, "preserve_time_min_seqno " + preserveMin);
+        }
+        Assert.IsTrue(VersionStorageInfo.BottommostSeqnoCanBeZeroed(99, 99, 0, false, false));
+        Assert.IsFalse(VersionStorageInfo.BottommostSeqnoCanBeZeroed(100, 99, 0, false, false));
+        Assert.IsFalse(VersionStorageInfo.BottommostSeqnoCanBeZeroed(10, 99, 8, false, true));
+        Assert.IsTrue(VersionStorageInfo.BottommostSeqnoCanBeZeroed(10, 99, 8, true, true));
+    }
+
+    [TestMethod]
+    public void BottommostFileCompactionDelay()
+    {
+        // bottommost_file_compaction_delay: only files created at least that long ago (or of unknown creation time).
+        var fx = new Fixture(6);
+        fx.Options.BottommostFileCompactionDelay = 3600;
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        fx.Add(5, 1, "100", "200", 1000, 90, 100).FileCreationTime = (ulong)now;
+        fx.Add(5, 2, "300", "400", 1000, 90, 100).FileCreationTime = (ulong)(now - 7200);
+        fx.Add(5, 3, "500", "600", 1000, 90, 100).FileCreationTime = FileMetaData.UnknownFileCreationTime;
+        VersionStorageInfo vs = fx.Build();
+        vs.UpdateOldestSnapshot(200);
+        CollectionAssert.AreEqual(new ulong[] { 2, 3 }, MarkedBottommost(vs));
+        // The too-new file does not lower the threshold; it is retried on the next recomputation.
+        Assert.AreEqual(DbFormat.MaxSequenceNumber, vs.BottommostFilesMarkThreshold);
+        Assert.AreEqual(3600UL, RocksDb.Managed.Db.DbImpl.GetMinTimeBasedCompactionInterval(new ColumnFamilyOptions
+        {
+            Ttl = 0, PeriodicCompactionSeconds = 0, BottommostFileCompactionDelay = 3600,
+        }));
+    }
+
+    [TestMethod]
+    public void BottommostFilesNotMarkedWithIngestBehind()
+    {
+        var fx = new Fixture(6);
+        fx.Add(5, 1, "100", "200", 1000, 90, 100);
+        VersionStorageInfo vs = fx.Build(new VersionBuildContext { AllowIngestBehind = true });
+        vs.UpdateOldestSnapshot(200);
+        Assert.AreEqual(0, vs.BottommostFilesMarkedForCompaction.Count);
+    }
+
+    // ---- compensated file size ----
+
+    private static void SetStats(FileMetaData f, ulong entries, ulong deletions, ulong rawKey, ulong rawValue)
+    {
+        f.SetEntryStats(new RocksDb.Managed.Table.TableProperties
+        {
+            NumEntries = entries, NumDeletions = deletions, RawKeySize = rawKey, RawValueSize = rawValue,
+        });
+    }
+
+    [TestMethod]
+    public void CompensatedSizeBoostsPointDeletions()
+    {
+        // Version::UpdateAccumulatedStats + VersionStorageInfo::ComputeCompensatedSizes: a file whose point deletions
+        // are at least half of its entries is boosted by (2 * deletions - entries) * average value size * 2.
+        var fx = new Fixture(6);
+        FileMetaData values = fx.Add(1, 1, "100", "200", 10000);
+        SetStats(values, 100, 0, 1000, 9000); // average value size = 9000 / 100 * 10000 / 10000 = 90
+        FileMetaData tombstones = fx.Add(1, 2, "300", "400", 1000);
+        SetStats(tombstones, 100, 80, 1000, 0);
+        FileMetaData balanced = fx.Add(1, 3, "500", "600", 1000);
+        SetStats(balanced, 100, 40, 1000, 5400);
+        var files = new FileMetaData[6][];
+        for (int l = 0; l < 6; l++) files[l] = fx.Files[l].ToArray();
+        int loads = 0;
+        AccumulatedFileStats stats = VersionStorageInfo.UpdateAccumulatedStats(files, default, infiniteTableCache: false, f => { loads++; return null; });
+        Assert.AreEqual(0, loads, "stats known from the builder need no table read");
+        Assert.AreEqual(12000UL, stats.FileSize);
+        Assert.AreEqual(180UL, stats.NumNonDeletions);
+        Assert.AreEqual(120UL, stats.NumDeletions);
+        VersionStorageInfo vs = fx.Build(new VersionBuildContext { AccumulatedStats = stats });
+        ulong avg = stats.AverageValueSize;
+        Assert.AreEqual(14400UL / 180 * 12000 / 17400, avg);
+        Assert.AreEqual(10000UL, VersionStorageInfo.CompensatedFileSize(values));
+        Assert.AreEqual(1000UL + (160 - 100) * avg * 2, VersionStorageInfo.CompensatedFileSize(tombstones));
+        Assert.AreEqual(1000UL, VersionStorageInfo.CompensatedFileSize(balanced));
+        // The level score uses the compensated sizes.
+        double expected = (10000.0 + VersionStorageInfo.CompensatedFileSize(tombstones) + 1000) / vs.MaxBytesForLevel(1);
+        Assert.AreEqual(expected, vs.ScoreOfLevel(1), 1e-9);
+        // Computed once: a later version keeps it (only the first version containing a file computes it).
+        ulong once = VersionStorageInfo.CompensatedFileSize(tombstones);
+        fx.Build(new VersionBuildContext { AccumulatedStats = new AccumulatedFileStats(1, 1, 1_000_000, 1, 0) });
+        Assert.AreEqual(once, VersionStorageInfo.CompensatedFileSize(tombstones));
+    }
+
+    [TestMethod]
+    public void UpdateAccumulatedStatsCapsTableReads()
+    {
+        // kMaxInitCount = 20 files per version unless the table cache is infinite (max_open_files = -1); lower levels first.
+        var fx = new Fixture(3);
+        for (int i = 0; i < 30; i++) fx.Add(1, (ulong)i + 1, (100 + i * 10).ToString(System.Globalization.CultureInfo.InvariantCulture),
+            (105 + i * 10).ToString(System.Globalization.CultureInfo.InvariantCulture), 100);
+        var files = new FileMetaData[3][];
+        for (int l = 0; l < 3; l++) files[l] = fx.Files[l].ToArray();
+        var props = new RocksDb.Managed.Table.TableProperties { NumEntries = 10, RawKeySize = 50, RawValueSize = 50 };
+        int loads = 0;
+        AccumulatedFileStats s = VersionStorageInfo.UpdateAccumulatedStats(files, default, infiniteTableCache: false, f => { loads++; return props; });
+        Assert.AreEqual(VersionStorageInfo.MaxStatsInitCount, loads);
+        Assert.AreEqual(200UL, s.NumNonDeletions);
+        // Each file is initialized only once.
+        AccumulatedFileStats s2 = VersionStorageInfo.UpdateAccumulatedStats(files, s, infiniteTableCache: true, f => { loads++; return props; });
+        Assert.AreEqual(30, loads);
+        Assert.AreEqual(300UL, s2.NumNonDeletions);
+    }
+
+    [TestMethod]
+    public void GetNextCompactCursorFollowsPriorityOrderAndWraps()
+    {
+        // VersionStorageInfo::GetNextCompactCursor with kRoundRobin: the files are rotated to start at the cursor; the
+        // next cursor is the smallest key of the file after the compacted ones, wrapping to the first.
+        var fx = new Fixture(6);
+        fx.Options.CompactionPri = CompactionPri.RoundRobin;
+        fx.Add(1, 1, "100", "150");
+        fx.Add(1, 2, "200", "250");
+        fx.Add(1, 3, "300", "350");
+        var cursor = new byte[3 + 8];
+        DbFormat.AppendInternalKey(cursor, "200"u8, 100, EntryType.Value);
+        VersionStorageInfo vs = fx.Build(new VersionBuildContext { CompactCursors = [new CompactCursor(1, cursor)] });
+        CollectionAssert.AreEqual(new[] { 1, 2, 0 }, vs.FilesByCompactionPri(1));
+        Assert.AreEqual("300", Encoding.ASCII.GetString(DbFormat.ExtractUserKey(vs.GetNextCompactCursor(1, 1))));
+        Assert.AreEqual("100", Encoding.ASCII.GetString(DbFormat.ExtractUserKey(vs.GetNextCompactCursor(1, 2))));
+        Assert.AreEqual("200", Encoding.ASCII.GetString(DbFormat.ExtractUserKey(vs.GetNextCompactCursor(1, 3))));
+        // Inherited by the next version, overridden by an edit; levels beyond num_levels are dropped.
+        var next = new VersionStorageInfo(InternalKeyComparator.Bytewise, 6, fx.Options, vs.LevelFilesArrays(), [],
+            new VersionBuildContext { RefStorage = vs, CompactCursors = [new CompactCursor(9, cursor)] });
+        Assert.AreSame(cursor, next.GetCompactCursor(1));
+        Assert.AreEqual(1, new List<CompactCursor>(next.ValidCompactCursors()).Count);
+    }
+}
+
+/// <summary>
+/// Write stall conditions and the delayed write rate. Port of db/column_family_test.cc WriteStallSingleColumnFamily
+/// (ColumnFamilyData::RecalculateWriteStallConditions, SetupDelay, WriteController).
+/// </summary>
+[TestClass]
+public sealed class WriteStallTests
+{
+    [TestMethod]
+    public void WriteStallSingleColumnFamily()
+    {
+        const ulong BaseRate = 800000;
+        var wc = new WriteController(BaseRate);
+        var state = new ColumnFamilyStallState();
+        var o = new ColumnFamilyOptions
+        {
+            Level0SlowdownWritesTrigger = 20,
+            Level0StopWritesTrigger = 10000,
+            SoftPendingCompactionBytesLimit = 200,
+            HardPendingCompactionBytesLimit = 2000,
+            DisableAutoCompactions = false,
+        };
+        var vs = new VersionStorageInfo(InternalKeyComparator.Bytewise, 7, o, null, []);
+        ulong Rate() => wc.NeedsDelay ? wc.DelayedWriteRate : 0;
+        void Step(ulong pending, bool stopped, bool delayed, ulong expectedRate)
+        {
+            vs.TestSetEstimatedCompactionNeededBytes(pending);
+            state.Recalculate(wc, 1, vs, o);
+            Assert.AreEqual(stopped, wc.IsStopped, "stopped at pending " + pending);
+            Assert.AreEqual(delayed, wc.NeedsDelay, "delayed at pending " + pending);
+            if (delayed) Assert.AreEqual(expectedRate, wc.DelayedWriteRate, "rate at pending " + pending);
+        }
+
+        Step(50, false, false, 0);
+        Step(201, false, true, BaseRate);
+        Assert.IsTrue(wc.NeedSpeedupCompaction);
+        Step(400, false, true, (ulong)(BaseRate / 1.25));
+        Step(500, false, true, (ulong)(BaseRate / 1.25 / 1.25));
+        Step(450, false, true, (ulong)(BaseRate / 1.25));
+        Step(205, false, true, BaseRate);
+        Step(202, false, true, BaseRate);
+        Step(201, false, true, BaseRate);
+        Step(198, false, false, 0);
+        Step(399, false, true, BaseRate);
+        Step(599, false, true, (ulong)(BaseRate / 1.25));
+        Step(2001, true, false, 0);
+        Assert.IsTrue(wc.NeedSpeedupCompaction);
+        Step(3001, true, false, 0);
+        Step(390, false, true, (ulong)(BaseRate / 1.25));
+        Step(100, false, false, 0);
+
+        vs.TestSetL0DelayTriggerCount(100);
+        state.Recalculate(wc, 1, vs, o);
+        Assert.IsTrue(wc.NeedsDelay);
+        Assert.AreEqual(BaseRate, Rate());
+        vs.TestSetL0DelayTriggerCount(101);
+        state.Recalculate(wc, 1, vs, o);
+        Assert.AreEqual((ulong)(BaseRate / 1.25), Rate());
+        vs.TestSetL0DelayTriggerCount(0);
+        Step(300, false, true, (ulong)(BaseRate / 1.25 / 1.25));
+        vs.TestSetL0DelayTriggerCount(101);
+        state.Recalculate(wc, 1, vs, o);
+        Assert.AreEqual((ulong)(BaseRate / 1.25 / 1.25 / 1.25), Rate());
+        Step(200, false, true, (ulong)(BaseRate / 1.25 / 1.25));
+        vs.TestSetL0DelayTriggerCount(0);
+        Step(0, false, false, 0);
+
+        // With auto compactions disabled neither L0 nor pending bytes stall writes; the rate is kept.
+        o.DisableAutoCompactions = true;
+        wc.SetDelayedWriteRate(BaseRate);
+        state.Recalculate(wc, 1, vs, o);
+        Assert.IsFalse(wc.NeedsDelay);
+        vs.TestSetL0DelayTriggerCount(50);
+        state.Recalculate(wc, 1, vs, o);
+        Assert.IsFalse(wc.NeedsDelay);
+        Assert.AreEqual(BaseRate, wc.DelayedWriteRate);
+        vs.TestSetL0DelayTriggerCount(60);
+        Step(300, false, false, 0);
+        Assert.AreEqual(BaseRate, wc.DelayedWriteRate);
+    }
+
+    [TestMethod]
+    public void CompactionSpeedupByDebtRelativeToBottommostData()
+    {
+        // GetPendingCompactionBytesForCompactionSpeedup: min(max(bottommost / 8, 2 * max_bytes_for_level_base), soft / 4).
+        var o = new ColumnFamilyOptions { MaxBytesForLevelBase = 1000, SoftPendingCompactionBytesLimit = 1_000_000 };
+        var files = new FileMetaData[7][];
+        for (int l = 0; l < 7; l++) files[l] = [];
+        var k1 = new byte[11];
+        DbFormat.AppendInternalKey(k1, "100"u8, 1, EntryType.Value);
+        var k2 = new byte[11];
+        DbFormat.AppendInternalKey(k2, "200"u8, 1, EntryType.Value);
+        files[6] = [new FileMetaData { FileNumber = 1, FileSize = 80_000, Smallest = k1, Largest = k2, SmallestSeqno = 1, LargestSeqno = 1 }];
+        var vs = new VersionStorageInfo(InternalKeyComparator.Bytewise, 7, o, files, []);
+        Assert.AreEqual(10_000UL, ColumnFamilyStallState.GetPendingCompactionBytesForCompactionSpeedup(o, vs));
+        o.MaxBytesForLevelBase = 20_000;
+        Assert.AreEqual(40_000UL, ColumnFamilyStallState.GetPendingCompactionBytesForCompactionSpeedup(o, vs));
+        o.SoftPendingCompactionBytesLimit = 100_000;
+        Assert.AreEqual(25_000UL, ColumnFamilyStallState.GetPendingCompactionBytesForCompactionSpeedup(o, vs));
+
+        var wc = new WriteController(1 << 20);
+        var state = new ColumnFamilyStallState();
+        vs.TestSetEstimatedCompactionNeededBytes(24_999);
+        state.Recalculate(wc, 1, vs, o);
+        Assert.IsFalse(wc.NeedSpeedupCompaction);
+        vs.TestSetEstimatedCompactionNeededBytes(25_000);
+        state.Recalculate(wc, 1, vs, o);
+        Assert.IsTrue(wc.NeedSpeedupCompaction);
+        Assert.IsFalse(wc.NeedsDelay);
     }
 }

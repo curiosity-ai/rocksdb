@@ -9,11 +9,12 @@ namespace RocksDb.Managed.Db;
 /// marked for compaction (PickDeleteTriggeredCompaction / BuildCompactionToNextLevel), compression_size_percent,
 /// trivial moves of non-overlapping inputs.
 /// <para>
-/// Not ported: read-triggered compaction (the managed read path does not sample file reads, so no file reaches
-/// read_triggered_compaction_threshold), standalone range tombstone files (FileIsStandAloneRangeTombstone needs the
+/// Read-triggered compaction (PickReadTriggeredCompaction) picks the files marked from the sampled reads
+/// (monitoring/file_read_sample.h, VersionStorageInfo::ComputeFilesMarkedForReadTriggeredCompaction).
+/// Not ported: standalone range tombstone files (FileIsStandAloneRangeTombstone needs the
 /// per-file entry counts, which the port does not keep: such files are treated like other marked files), multiple
-/// db_paths (GetPathId returns 0), reduce_file_locking (no bottom-priority pool) and require_max_output_level (remote
-/// compaction). REQUIRES: DB mutex.
+/// db_paths (GetPathId returns 0). require_max_output_level is used by the bottom-priority repick of
+/// reduce_file_locking (DBImpl::BackgroundCompaction). REQUIRES: DB mutex.
 /// </para>
 /// </summary>
 internal sealed class UniversalCompactionPicker : CompactionPicker
@@ -32,7 +33,8 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
 
     /// <summary>Port of UniversalCompactionPicker::NeedsCompaction.</summary>
     public override bool NeedsCompaction(VersionStorageInfo vstorage) =>
-        vstorage.CompactionScore(0) >= 1 || vstorage.FilesMarkedForPeriodicCompaction.Count > 0 || vstorage.FilesMarkedForCompaction.Count > 0;
+        vstorage.CompactionScore(0) >= 1 || vstorage.FilesMarkedForPeriodicCompaction.Count > 0 || vstorage.FilesMarkedForCompaction.Count > 0
+        || vstorage.ReadTriggeredCompactionFiles.Count > 0;
 
     /// <summary>Port of CalculateSortedRuns (also returns max_run_size).</summary>
     private static List<SortedRun> CalculateSortedRuns(VersionStorageInfo vstorage, int lastLevel, out ulong maxRunSize)
@@ -71,21 +73,44 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         public required List<SortedRun> Runs;
         public ulong MaxRunSize;
         public double Score;
+        /// <summary>require_max_output_level_: only compactions to the non-zero max output level (bottom-priority repick).</summary>
+        public bool RequireMaxOutputLevel;
+
+        /// <summary>UniversalCompactionBuilder::MeetsOutputLevelRequirements.</summary>
+        public bool MeetsOutputLevelRequirements(int outputLevel, int maxOutputLevel) =>
+            !RequireMaxOutputLevel || Compaction.OutputToNonZeroMaxOutputLevel(outputLevel, maxOutputLevel);
     }
 
     /// <summary>Port of UniversalCompactionBuilder::PickCompaction.</summary>
-    public override Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots)
+    public override Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots) =>
+        PickCompaction(vstorage, snapshots, requireMaxOutputLevel: false);
+
+    /// <summary>
+    /// Port of UniversalCompactionBuilder::PickCompaction. With <paramref name="requireMaxOutputLevel"/> (a
+    /// bottom-priority thread repicking a compaction forwarded with reduce_file_locking) only compactions that output to
+    /// the non-zero max output level are picked.
+    /// </summary>
+    public override Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots, bool requireMaxOutputLevel)
     {
-        int maxOutputLevel = vstorage.MaxOutputLevel(Options.CfAllowIngestBehind);
+        int maxOutputLevel = vstorage.MaxOutputLevel(Options.AllowIngestBehind);
+        if (maxOutputLevel == 0 && requireMaxOutputLevel) return null; // !MeetsOutputLevelRequirements(0)
         int trigger = Options.Level0FileNumCompactionTrigger;
         uint ratio = Options.CompactionOptionsUniversal.SizeRatio;
         List<SortedRun> runs = CalculateSortedRuns(vstorage, maxOutputLevel, out ulong maxRunSize);
         if (runs.Count == 0
-            || (vstorage.FilesMarkedForPeriodicCompaction.Count == 0 && vstorage.FilesMarkedForCompaction.Count == 0 && runs.Count < trigger))
+            || (vstorage.FilesMarkedForPeriodicCompaction.Count == 0 && vstorage.FilesMarkedForCompaction.Count == 0
+                && vstorage.ReadTriggeredCompactionFiles.Count == 0 && runs.Count < trigger))
         {
             return null; // "Universal: nothing to do"
         }
-        var b = new Builder { Vstorage = vstorage, Runs = runs, MaxRunSize = maxRunSize, Score = vstorage.CompactionScore(0) };
+        var b = new Builder
+        {
+            Vstorage = vstorage,
+            Runs = runs,
+            MaxRunSize = maxRunSize,
+            Score = vstorage.CompactionScore(0),
+            RequireMaxOutputLevel = requireMaxOutputLevel,
+        };
 
         Compaction? c = null;
         // MaybePickPeriodicCompaction
@@ -102,6 +127,8 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         }
         // MaybePickDeleteTriggeredCompaction
         c ??= PickDeleteTriggeredCompaction(b);
+        // MaybePickReadTriggeredCompaction
+        if (c is null && vstorage.ReadTriggeredCompactionFiles.Count > 0) c = PickReadTriggeredCompaction(b);
         if (c is null) return null;
         RegisterCompaction(c);
         // Creating a compaction influences the compaction score because the score takes running compactions into
@@ -109,6 +136,10 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         vstorage.ComputeCompactionScore();
         return c;
     }
+
+    /// <summary>UniversalCompactionBuilder::ShouldSkipLastSortedRunForSizeAmpCompaction.</summary>
+    private bool ShouldSkipLastSortedRunForSizeAmpCompaction(List<SortedRun> runs) =>
+        Options.PrecludeLastLevelDataSeconds > 0 && Options.NumLevels > 2 && runs[^1].Level == Options.NumLevels - 1 && runs.Count > 1;
 
     /// <summary>Port of GetMaxNumFilesToCompactBasedOnMaxReadAmp.</summary>
     private uint GetMaxNumFilesToCompactBasedOnMaxReadAmp(Builder b, int fileNumCompactionTrigger, uint ratio)
@@ -228,11 +259,12 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
             }
         }
         int startLevel = runs[startIndex].Level;
-        int maxOutputLevel = vstorage.MaxOutputLevel(Options.CfAllowIngestBehind);
+        int maxOutputLevel = vstorage.MaxOutputLevel(Options.AllowIngestBehind);
         int outputLevel;
         if (firstIndexAfter == runs.Count) outputLevel = maxOutputLevel;
         else if (runs[firstIndexAfter].Level == 0) outputLevel = 0;
         else outputLevel = runs[firstIndexAfter].Level - 1;
+        if (!b.MeetsOutputLevelRequirements(outputLevel, maxOutputLevel)) return null;
 
         CompactionInputFiles[] inputs = NewInputLevels(startLevel, maxOutputLevel);
         for (int i = startIndex; i < firstIndexAfter; i++) AddRun(vstorage, inputs, runs[i], startLevel);
@@ -245,7 +277,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
             grandparents.AddRange(vstorage.LevelFiles(runs[firstIndexAfter].Level).ToArray());
         }
         // intra L0 compactions outputs could have overlap
-        if (outputLevel != 0 && FilesRangeOverlapWithCompaction(inputs, outputLevel)) return null;
+        if (outputLevel != 0 && FilesRangeOverlapWithCompaction(b.Vstorage, inputs, outputLevel)) return null;
         CompactionReason reason = maxNumberOfFilesToCompact == uint.MaxValue ? CompactionReason.UniversalSizeRatio : CompactionReason.UniversalSortedRunNum;
         return Create(b, inputs, outputLevel, grandparents, reason, enableCompression);
     }
@@ -258,9 +290,9 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
     private Compaction? PickCompactionToReduceSizeAmp(Builder b)
     {
         List<SortedRun> runs = b.Runs;
-        // ShouldSkipLastSortedRunForSizeAmpCompaction needs preclude_last_level_data_seconds (per-key placement), which
-        // the port does not act on: the end is always the last run.
-        int endIndex = runs.Count - 1;
+        // ShouldSkipLastSortedRunForSizeAmpCompaction: with per-key placement the last sorted run (the last level) is
+        // left out, the size amplification compaction then ends at the proximal level.
+        int endIndex = ShouldSkipLastSortedRunForSizeAmpCompaction(runs) ? runs.Count - 2 : runs.Count - 1;
         if (runs[endIndex].BeingCompacted) return null;
         ulong baseSrSize = runs[endIndex].Size;
         int startIndex = endIndex;
@@ -454,7 +486,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         // The start level is the first non-empty input (the job and the compaction read the first input as the start).
         while (inputs.Count > 1 && inputs[0].IsEmpty) inputs.RemoveAt(0);
         // intra L0 compactions outputs could have overlap
-        if (outputLevel != 0 && FilesRangeOverlapWithCompaction(inputs, outputLevel)) return null;
+        if (outputLevel != 0 && FilesRangeOverlapWithCompaction(b.Vstorage, inputs, outputLevel)) return null;
         return Create(b, DropEmptyInnerLevels(inputs), outputLevel, new List<FileMetaData>(), CompactionReason.UniversalSizeAmplification, true);
     }
 
@@ -505,6 +537,36 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
     }
 
     /// <summary>
+    /// Port of UniversalCompactionBuilder::PickReadTriggeredCompaction: the hottest file marked by
+    /// ComputeFilesMarkedForReadTriggeredCompaction that expands to a clean cut (L0 files are skipped while an L0
+    /// compaction runs), compacted to the next non-empty level; with a single level, with every overlapping L0 file.
+    /// </summary>
+    private Compaction? PickReadTriggeredCompaction(Builder b)
+    {
+        VersionStorageInfo vstorage = b.Vstorage;
+        CompactionInputFiles? startLevelInputs = null;
+        foreach ((int level, FileMetaData file) in vstorage.ReadTriggeredCompactionFiles)
+        {
+            if (file.BeingCompacted) continue;
+            if (level == 0 && IsLevel0CompactionInProgress) continue;
+            var candidate = new CompactionInputFiles(level, new List<FileMetaData> { file });
+            if (ExpandInputsToCleanCut(vstorage, candidate))
+            {
+                startLevelInputs = candidate;
+                break;
+            }
+        }
+        if (startLevelInputs is null || startLevelInputs.IsEmpty) return null;
+        // For intra L0 compactions, pick up all overlapping files
+        if (vstorage.NumLevels == 1 && startLevelInputs.Level == 0)
+        {
+            int unusedParentIndex = -1;
+            if (!GetOverlappingL0Files(vstorage, startLevelInputs, 0, ref unusedParentIndex)) return null;
+        }
+        return BuildCompactionToNextLevel(b, startLevelInputs, CompactionReason.ReadTriggered);
+    }
+
+    /// <summary>
     /// Port of UniversalCompactionBuilder::BuildCompactionToNextLevel: output to the first non-empty level after the
     /// start level (the last level for an L0 start when all are empty), with the overlapping output-level files.
     /// </summary>
@@ -512,7 +574,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
     {
         VersionStorageInfo vstorage = b.Vstorage;
         int startLevel = startLevelInputs.Level;
-        int maxOutputLevel = vstorage.MaxOutputLevel(Options.CfAllowIngestBehind);
+        int maxOutputLevel = vstorage.MaxOutputLevel(Options.AllowIngestBehind);
         // Pick the first non-empty level after start_level as output.
         int outputLevel;
         for (outputLevel = startLevel + 1; outputLevel <= maxOutputLevel; outputLevel++)
@@ -533,6 +595,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         var grandparents = new List<FileMetaData>();
         if (outputLevel != 0)
         {
+            if (!b.MeetsOutputLevelRequirements(outputLevel, maxOutputLevel)) return null;
             if (startLevel == 0)
             {
                 int unusedParentIndex = -1;
@@ -543,7 +606,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
             if (!SetupOtherInputs(vstorage, startLevelInputs, outputLevelInputs, ref parentIndex, -1, false)) return null;
             inputs.Add(startLevelInputs);
             if (!outputLevelInputs.IsEmpty) inputs.Add(outputLevelInputs);
-            if (FilesRangeOverlapWithCompaction(inputs, outputLevel)) return null;
+            if (FilesRangeOverlapWithCompaction(b.Vstorage, inputs, outputLevel)) return null;
             GetGrandparents(vstorage, startLevelInputs, outputLevelInputs, grandparents);
         }
         else
@@ -596,13 +659,14 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         List<SortedRun> runs = b.Runs;
         VersionStorageInfo vstorage = b.Vstorage;
         int startLevel = runs[startIndex].Level;
-        int maxOutputLevel = vstorage.MaxOutputLevel(Options.CfAllowIngestBehind);
+        int maxOutputLevel = vstorage.MaxOutputLevel(Options.AllowIngestBehind);
         CompactionInputFiles[] inputs = NewInputLevels(startLevel, maxOutputLevel);
         for (int i = startIndex; i <= endIndex; i++) AddRun(vstorage, inputs, runs[i], startLevel);
         // If it's not including all sorted_runs, it can only output to the level above the `end_index + 1` sorted_run.
         int outputLevel = endIndex == runs.Count - 1 ? maxOutputLevel : runs[endIndex + 1].Level - 1;
+        if (!b.MeetsOutputLevelRequirements(outputLevel, maxOutputLevel)) return null;
         // intra L0 compactions outputs could have overlap
-        if (outputLevel != 0 && FilesRangeOverlapWithCompaction(inputs, outputLevel)) return null;
+        if (outputLevel != 0 && FilesRangeOverlapWithCompaction(b.Vstorage, inputs, outputLevel)) return null;
         // We never check size for compaction_options_universal.compression_size_percent, because we always compact all
         // the files, so always compress.
         return Create(b, inputs, outputLevel, new List<FileMetaData>(), reason, true);

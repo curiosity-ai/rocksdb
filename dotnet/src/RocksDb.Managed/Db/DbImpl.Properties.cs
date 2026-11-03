@@ -140,15 +140,18 @@ internal sealed partial class DbImpl
                 value = ErrorHandler.ErrorCount.ToString(CultureInfo.InvariantCulture);
                 return true;
             case DbProperties.CfStats:
+                // HandleCFStats: DumpCFStatsNoFileHistogram(is_periodic = true) starts a new interval.
+                value = cfd.Stats.Dump(cfd.Name, sv.Current.Storage, isPeriodic: true);
+                return true;
             case DbProperties.CfStatsNoFileHistogram:
-                value = cfd.Stats.Dump(cfd.Name, sv.Current.Storage);
+                value = cfd.Stats.Dump(cfd.Name, sv.Current.Storage, isPeriodic: false);
                 return true;
             case DbProperties.DbStats:
                 value = _writeStats.Dump();
                 return true;
             case DbProperties.Stats:
                 // DB stats, the CF stats, then the managed port's cumulative compaction summary (incl. trivial moves).
-                value = _writeStats.Dump() + cfd.Stats.Dump(cfd.Name, sv.Current.Storage) + CompactionStatsString(sv);
+                value = _writeStats.Dump() + cfd.Stats.Dump(cfd.Name, sv.Current.Storage, isPeriodic: true) + CompactionStatsString(sv);
                 return true;
             case DbProperties.SsTables:
                 value = VersionDebugString(sv.Current);
@@ -598,11 +601,13 @@ internal sealed partial class DbImpl
     // ---- KeyMayExist -------------------------------------------------------------------------------------
 
     /// <summary>
-    /// Port of DBImpl::KeyMayExist: a lookup that does no data-block I/O. Returns false only if the key definitely
-    /// does not exist. The memtables are searched completely: a value found there (after merging, when the merge
-    /// operands and their base are all in memtables) is returned with <paramref name="valueFound"/> = true. Otherwise
-    /// table files whose key range covers the key are checked with their filters only (filter blocks may be read;
-    /// upstream's kBlockCacheTier lookup instead answers "may exist" when a block is not cached).
+    /// Port of DBImpl::KeyMayExist (a GetImpl with read_tier = kBlockCacheTier): a lookup that does no file I/O. Returns
+    /// false only if the key definitely does not exist. The memtables are searched completely: a value found there
+    /// (after merging, when the merge operands and their base are all in memtables) is returned with
+    /// <paramref name="valueFound"/> = true. Otherwise table files whose key range covers the key are checked with
+    /// their filters only: a table that is not open yet, or whose filter is neither pinned nor cached, answers "may
+    /// exist" like upstream's Incomplete. Deviation: values in cached data blocks are not returned (valueFound stays
+    /// false for keys only in table files).
     /// </summary>
     public bool KeyMayExist(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, IBufferWriter<byte>? value, out bool valueFound)
     {
@@ -637,8 +642,12 @@ internal sealed partial class DbImpl
                     foreach (FileMetaData f in s.LevelFiles(level))
                     {
                         if (ucmp.Compare(key, DbFormat.ExtractUserKey(f.Smallest)) < 0 || ucmp.Compare(key, DbFormat.ExtractUserKey(f.Largest)) > 0) continue;
-                        using TableReaderLease lease = cfd.TableCache.GetReader(f);
-                        if (lease.Reader.InternalKeyMayMatch(lkey.InternalKey, TableReadFlags.None)) return true;
+                        // TableCache::FindTable(no_io): a table that is not open would need I/O -> Incomplete -> may exist.
+                        if (!cfd.TableCache.TryGetOpenReader(f, out TableReaderLease lease)) return true;
+                        using (lease)
+                        {
+                            if (lease.Reader.InternalKeyMayMatch(lkey.InternalKey, TableReadFlags.BlockCacheTier)) return true;
+                        }
                     }
                 }
                 return false;

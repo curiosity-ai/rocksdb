@@ -28,6 +28,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
     private const string DefaultColumnFamilyName = ColumnFamilyDescriptor.DefaultColumnFamilyName;
 
     private readonly Lock _mutex = new();
+
+    /// <summary>The DB mutex, for tests that inspect state guarded by it.</summary>
+    internal Lock MutexForTests => _mutex;
+
     private readonly SnapshotList _snapshots = new();
     private readonly List<ulong> _aliveWals = new();          // WAL numbers that may still hold unflushed data (guarded by mutex)
     private readonly List<ulong> _obsoleteManifests = new();  // guarded by mutex
@@ -61,6 +65,15 @@ internal sealed partial class DbImpl : IAsyncDisposable
         Identity = new DbIdentity("", GenerateDbSessionId(), host);
         _seqPerBatch = options.SeqPerBatch;
         _batchPerTxn = options.BatchPerTxn;
+        _twoWriteQueues = options.TwoWriteQueues;
+        // last_seq_same_as_publish_seq_ (db_impl.cc): only the WAL-only writes of a seq_per_batch DB consume sequence
+        // numbers on the second queue, so only then is the published sequence maintained separately.
+        _lastSeqSameAsPublishSeq = !(_seqPerBatch && _twoWriteQueues);
+        if (_twoWriteQueues)
+        {
+            _nonmemWriteThread = new WriteThread(options.MaxWriteBatchGroupSizeBytes);
+            _walWriteLock = new SemaphoreSlim(1, 1);
+        }
     }
 
     // ---- WritePrepared / WriteUnprepared support (seq_per_batch_, batch_per_txn_, use_custom_gc_) ---------
@@ -242,7 +255,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         ThrowIfDisposed();
         lock (_mutex)
         {
-            var s = new Snapshot(this, Versions.LastSequence, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            var s = new Snapshot(this, LastPublishedSequence, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
             _snapshots.Add(s);
             return s;
         }
@@ -250,7 +263,11 @@ internal sealed partial class DbImpl : IAsyncDisposable
 
     internal void ReleaseSnapshot(Snapshot s)
     {
-        lock (_mutex) _snapshots.Remove(s);
+        lock (_mutex)
+        {
+            _snapshots.Remove(s);
+            OnSnapshotReleased();
+        }
     }
 
     /// <summary>The live snapshots with a sequence number &lt;= <paramref name="max"/>, ascending (LoadSnapshots).</summary>
@@ -381,6 +398,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                             Temperature = f.Temperature,
                             OldestAncestorTime = f.OldestAncestorTime,
                             FileCreationTime = f.FileCreationTime,
+                            NumReadsSampled = f.NumReadsSampled,
                         });
                     }
                 }
@@ -481,6 +499,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 {
                     wals.Add(n);
                     _aliveWals.RemoveAt(i);
+                    ForgetAliveWalSize(n);
                 }
                 else i++;
             }
@@ -563,6 +582,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                             {
                                 walsToDelete.Add(number);
                                 _aliveWals.Remove(number);
+                                ForgetAliveWalSize(number);
                             }
                             break;
                         case FileType.OptionsFile:
@@ -582,6 +602,12 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
         foreach (ulong n in walsToDelete) DeleteOrArchiveWal(n);
         PurgeObsoleteWalFiles(force: true);
+    }
+
+    /// <summary>A WAL left alive_wal_files_: its size leaves wals_total_size_. REQUIRES: mutex.</summary>
+    private void ForgetAliveWalSize(ulong number)
+    {
+        if (_aliveWalSizes.Remove(number, out long size)) Interlocked.Add(ref _walsTotalSize, -size);
     }
 
     private void TryDeleteFile(string path)
@@ -624,7 +650,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         WriteThread.Writer w = await EnterUnbatchedCoreAsync(synchronous).ConfigureAwait(false);
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
-            _writeThread.ExitAsLeader();
+            ExitUnbatchedQueues();
             return;
         }
         NotifySequenceWaiters(); // wake WAL tailers so they observe the close
@@ -638,12 +664,34 @@ internal sealed partial class DbImpl : IAsyncDisposable
             }
             CancelBackgroundCompactions();
             await WaitForBackgroundWorkAsync(synchronous).ConfigureAwait(false);
+            // logs_.clear() (ClearWriter): closed WALs not synced yet are closed without a sync, like the current one.
+            foreach (LogWriter closed in _closedWalsToSync) CloseQuietly(closed);
+            _closedWalsToSync.Clear();
             LogWriter? log = _log;
             _log = null;
             if (log is not null)
             {
                 if (synchronous) log.Dispose();
                 else await log.DisposeAsync().ConfigureAwait(false);
+            }
+            // ~ColumnFamilyHandleImpl of dropped column families (their handles live as long as the DB): release their
+            // memtables and current version; their table files become obsolete and are deleted now.
+            bool releasedDropped = false;
+            lock (_mutex)
+            {
+                foreach (ColumnFamilyData cfd in _droppedColumnFamilies)
+                {
+                    if (cfd.Current is not { } v) continue;
+                    ReleaseColumnFamilyMemTables(cfd);
+                    cfd.Current = null!;
+                    Versions.UnrefVersion(v);
+                    releasedDropped = true;
+                }
+            }
+            if (releasedDropped)
+            {
+                try { PurgeObsoleteFiles(); }
+                catch (Exception e) when (e is IOException or RocksDbException) { }
             }
             await Versions.DisposeAsync().ConfigureAwait(false);
             lock (_mutex)
@@ -662,9 +710,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
         finally
         {
-            _writeThread.ExitAsLeader();
+            ExitUnbatchedQueues();
             WriteThread.Return(w, synchronous);
             _groupBatch.Dispose();
+            _nonmemGroupBatch.Dispose();
             try { ShutdownMonitoring(); } catch (Exception e) when (e is IOException or RocksDbException) { }
             DisposeOwnedSstFileManager();
             SharedTableCache.Dispose();

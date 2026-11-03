@@ -94,6 +94,19 @@ internal sealed class TableCacheStore : IDisposable
         }
     }
 
+    /// <summary>A referenced handle if the table is already open (FindTable with no_io), else false.</summary>
+    internal bool TryGetOpen(ulong fileNumber, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out Handle? handle)
+    {
+        if (_handles.TryGetValue(fileNumber, out Handle? h) && h.IsOpen && h.TryRef())
+        {
+            h.LastUse = Interlocked.Increment(ref _openSequence);
+            handle = h;
+            return true;
+        }
+        handle = null;
+        return false;
+    }
+
     /// <summary>Port of TableCache::FindTable: returns a referenced, opened handle.</summary>
     internal Handle FindTable(TableCache owner, FileMetaData file)
     {
@@ -236,6 +249,9 @@ internal sealed class TableCache : ITableCache, IDisposable
         _ownsStore = true;
     }
 
+    /// <summary>When set (DBOptions::statistics), table file reads are timed (SST_READ_MICROS, FILE_READ_*_MICROS).</summary>
+    internal Statistics? Statistics { get; set; }
+
     /// <summary>Readers of this column family currently cached.</summary>
     public int Count => _store.CountOwnedBy(this);
 
@@ -255,6 +271,21 @@ internal sealed class TableCache : ITableCache, IDisposable
         // Opening a table reads the footer and the meta blocks; the first open of a file does that synchronously (cold
         // path, once per file), later lookups are cache hits.
         return new ValueTask<TableReaderLease>(GetReader(file));
+    }
+
+    /// <summary>
+    /// TableCache::FindTable(no_io = true): a lease on the reader if the table is already open, without opening it
+    /// (kBlockCacheTier lookups must not do file I/O).
+    /// </summary>
+    public bool TryGetOpenReader(FileMetaData file, out TableReaderLease lease)
+    {
+        if (_store.TryGetOpen(file.FileNumber, out TableCacheStore.Handle? h))
+        {
+            lease = new TableReaderLease(h.Reader!, TableCacheStore.s_release, h);
+            return true;
+        }
+        lease = default;
+        return false;
     }
 
     /// <summary>
@@ -298,6 +329,7 @@ internal sealed class TableCache : ITableCache, IDisposable
     {
         string path = TableFilePath(file);
         IRandomAccessFile f = _fs.OpenRandomAccess(path);
+        if (Statistics is { } st) f = new Monitoring.StatisticsRandomAccessFile(f, st);
         BlockBasedTableReader reader;
         try
         {

@@ -37,8 +37,11 @@ internal sealed class VersionSet : IAsyncDisposable
     private readonly List<ObsoleteBlobFile> _obsoleteBlobFiles = new();
 
     private ulong _nextFileNumber = 2;
-    private ulong _lastSequence;          // last published sequence (visible to readers)
-    private ulong _lastAllocatedSequence; // last sequence handed out to a write group
+    // last_sequence_ <= last_published_sequence_ <= last_allocated_sequence_ (db/version_set.h). Without two write
+    // queues (or without seq_per_batch) the last sequence is also the last published one.
+    private ulong _lastSequence;          // last sequence in the memtables (maintained by the main write queue)
+    private ulong _lastAllocatedSequence; // last sequence handed out to a write group (atomic with two write queues)
+    private ulong _lastPublishedSequence; // last sequence visible to readers when it differs from _lastSequence
     private ulong _versionNumber;
     private ulong _descriptorLastSequence; // last_sequence recorded in the MANIFEST so far (descriptor_last_sequence_), guarded by _manifestLock
     private ManifestLogWriter? _manifestLog;
@@ -94,25 +97,69 @@ internal sealed class VersionSet : IAsyncDisposable
 
     public void SetNextFileNumber(ulong value) => Volatile.Write(ref _nextFileNumber, value);
 
-    /// <summary>The last sequence number visible to readers (LastSequence / LastPublishedSequence).</summary>
+    /// <summary>
+    /// The last sequence number written to the memtables (VersionSet::LastSequence). It is also the last sequence
+    /// visible to readers unless the DB has two write queues with seq_per_batch (see
+    /// <see cref="LastPublishedSequence"/>).
+    /// </summary>
     public ulong LastSequence => Volatile.Read(ref _lastSequence);
 
-    /// <summary>Publishes <paramref name="s"/> to readers (SetLastSequence). Only the write leader calls this.</summary>
+    /// <summary>
+    /// Sets the last sequence number (SetLastSequence). Only the main write queue's leader (or a writer that blocked both
+    /// queues) calls this. Also raises the last allocated sequence when it is behind (recovery, ingestion).
+    /// </summary>
     public void SetLastSequence(ulong s)
     {
         Volatile.Write(ref _lastSequence, s);
-        if (s > _lastAllocatedSequence) _lastAllocatedSequence = s;
+        ulong cur = Volatile.Read(ref _lastAllocatedSequence);
+        while (cur < s)
+        {
+            ulong o = Interlocked.CompareExchange(ref _lastAllocatedSequence, s, cur);
+            if (o == cur) break;
+            cur = o;
+        }
     }
 
-    /// <summary>Allocates <paramref name="count"/> sequence numbers; returns the first. Write leader only.</summary>
-    public ulong AllocateSequence(ulong count)
+    /// <summary>
+    /// Allocates <paramref name="count"/> sequence numbers; returns the first. Thread-safe (FetchAddLastAllocatedSequence
+    /// + 1): with two write queues both leaders allocate concurrently.
+    /// </summary>
+    public ulong AllocateSequence(ulong count) => Interlocked.Add(ref _lastAllocatedSequence, count) - count + 1;
+
+    /// <summary>LastAllocatedSequence: the last sequence handed out (&gt;= <see cref="LastSequence"/>).</summary>
+    public ulong LastAllocatedSequence => Volatile.Read(ref _lastAllocatedSequence);
+
+    /// <summary>
+    /// LastPublishedSequence: the last sequence visible to readers when the DB has two write queues and seq_per_batch
+    /// (WritePrepared / WriteUnprepared), published by the commit callbacks of the second queue.
+    /// </summary>
+    public ulong LastPublishedSequence => Volatile.Read(ref _lastPublishedSequence);
+
+    /// <summary>
+    /// SetLastPublishedSequence. Callers publish in increasing order (the WAL-only queue publishes); a smaller value
+    /// (a callback run at open time from the main queue) never moves the published sequence back.
+    /// </summary>
+    public void SetLastPublishedSequence(ulong s)
     {
-        ulong first = _lastAllocatedSequence + 1;
-        _lastAllocatedSequence += count;
-        return first;
+        ulong cur = Volatile.Read(ref _lastPublishedSequence);
+        while (cur < s)
+        {
+            ulong o = Interlocked.CompareExchange(ref _lastPublishedSequence, s, cur);
+            if (o == cur) return;
+            cur = o;
+        }
     }
 
-    public ulong LastAllocatedSequence => _lastAllocatedSequence;
+    /// <summary>
+    /// SyncLastSequenceWithAllocated: raises the last sequence to the last allocated one. REQUIRES: no write in
+    /// progress on either queue (sequence numbers allocated by WAL-only writes of the second queue are accounted for in
+    /// new memtables / MANIFEST state).
+    /// </summary>
+    public void SyncLastSequenceWithAllocated()
+    {
+        ulong alloc = LastAllocatedSequence;
+        if (alloc > LastSequence) Volatile.Write(ref _lastSequence, alloc);
+    }
 
     // ---- column families ------------------------------------------------------------------------
 
@@ -134,7 +181,17 @@ internal sealed class VersionSet : IAsyncDisposable
     /// Registers a column family with an initial version built from <paramref name="files"/> and the recovered
     /// <paramref name="blobFiles"/> (null = none). REQUIRES: DB mutex.
     /// </summary>
-    public void AddColumnFamily(ColumnFamilyData cfd, FileMetaData[][]? files, IEnumerable<BlobFileState>? blobFiles)
+    public void AddColumnFamily(ColumnFamilyData cfd, FileMetaData[][]? files, IEnumerable<BlobFileState>? blobFiles) =>
+        AddColumnFamily(cfd, files, blobFiles, null, updateStats: false);
+
+    /// <summary>
+    /// Registers a recovered column family (VersionEditHandler: the version built from the MANIFEST), with its
+    /// round-robin <paramref name="compactCursors"/> and, with <paramref name="updateStats"/> (not
+    /// skip_stats_update_on_db_open), the entry stats of its files loaded (Version::PrepareAppend(update_stats)).
+    /// REQUIRES: DB mutex (only taken during DB open, when the table reads under it block nobody).
+    /// </summary>
+    public void AddColumnFamily(ColumnFamilyData cfd, FileMetaData[][]? files, IEnumerable<BlobFileState>? blobFiles,
+        IReadOnlyList<CompactCursor>? compactCursors, bool updateStats)
     {
         _cfs[cfd.Id] = cfd;
         if (cfd.Id > MaxColumnFamily) MaxColumnFamily = cfd.Id;
@@ -145,9 +202,40 @@ internal sealed class VersionSet : IAsyncDisposable
             foreach (BlobFileState b in blobFiles) baseList.Add(new Blob.BlobFileMetaData(b.Addition, b.GarbageBlobCount, b.GarbageBlobBytes, []));
             blobs = Blob.BlobFileMetaData.Build(baseList, null, files ?? []);
         }
-        var storage = new VersionStorageInfo(cfd.Icmp, Math.Max(cfd.NumLevels, files?.Length ?? 0), cfd.Options, files, blobs);
+        AccumulatedFileStats? stats = updateStats && files is not null ? LoadFileStats(cfd, files, default) : null;
+        var context = new VersionBuildContext
+        {
+            CompactCursors = compactCursors,
+            AccumulatedStats = stats,
+            AllowIngestBehind = AllowIngestBehind(cfd),
+            FullHistoryTsLow = cfd.FullHistoryTsLow,
+        };
+        var storage = new VersionStorageInfo(cfd.Icmp, Math.Max(cfd.NumLevels, files?.Length ?? 0), cfd.Options, files, blobs, context);
         var v = new DbVersion(cfd, storage, ++_versionNumber);
         InstallVersion(cfd, v);
+    }
+
+    private bool AllowIngestBehind(ColumnFamilyData cfd) => _db.Options.AllowIngestBehind || cfd.Options.CfAllowIngestBehind;
+
+    /// <summary>
+    /// Version::UpdateAccumulatedStats for a version about to be built from <paramref name="files"/>: loads the entry
+    /// stats of new files through the table cache (no I/O when the table is open or the stats came from the builder).
+    /// </summary>
+    private AccumulatedFileStats LoadFileStats(ColumnFamilyData cfd, FileMetaData[][] files, AccumulatedFileStats accumulated) =>
+        VersionStorageInfo.UpdateAccumulatedStats(files, accumulated, _db.Options.MaxOpenFiles == -1, f => ReadTableProperties(cfd, f));
+
+    private Table.TableProperties? ReadTableProperties(ColumnFamilyData cfd, FileMetaData f)
+    {
+        try
+        {
+            using TableReaderLease lease = cfd.TableCache.GetReader(f);
+            return lease.Reader.Properties;
+        }
+        catch (Exception e) when (e is RocksDbException or IOException)
+        {
+            _db.LogError("Unable to load table properties for file " + f.FileNumber.ToString(System.Globalization.CultureInfo.InvariantCulture) + " --- " + e.Message);
+            return null;
+        }
     }
 
     /// <summary>Makes <paramref name="v"/> the current version of <paramref name="cfd"/>. REQUIRES: DB mutex.</summary>
@@ -309,6 +397,7 @@ internal sealed class VersionSet : IAsyncDisposable
             var newBlobFiles = new Blob.BlobFileMetaData[n][];
             var editList = new VersionEdit[n];
             var tsSizes = new int[n];
+            var baseStats = new AccumulatedFileStats[n];
             bool newManifest;
             lock (_db.Mutex)
             {
@@ -330,7 +419,8 @@ internal sealed class VersionSet : IAsyncDisposable
                         edit.MaxColumnFamily = Math.Max(MaxColumnFamily, edit.ColumnFamily);
                     }
                     else if (cfd is not null && !edit.IsColumnFamilyDrop && (edit.NewFiles.Count > 0 || edit.DeletedFiles.Count > 0 ||
-                                                                             edit.BlobFileAdditions.Count > 0 || edit.BlobFileGarbages.Count > 0))
+                                                                             edit.BlobFileAdditions.Count > 0 || edit.BlobFileGarbages.Count > 0 ||
+                                                                             edit.CompactCursors.Count > 0))
                     {
                         for (int j = 0; j < i; j++)
                         {
@@ -339,6 +429,7 @@ internal sealed class VersionSet : IAsyncDisposable
                         VersionStorageInfo cur = cfd.Current.Storage;
                         newFiles[i] = cur.ApplyEdit(edit, cfd.NumLevels);
                         newBlobFiles[i] = Blob.BlobFileMetaData.Build(cur.BlobFiles, edit, newFiles[i]);
+                        baseStats[i] = cur.AccumulatedStats;
                     }
                     // WalSet::AddWal fails for a WAL created twice: check before anything is written.
                     foreach (WalAddition w in edit.WalAdditions)
@@ -361,6 +452,14 @@ internal sealed class VersionSet : IAsyncDisposable
                 }
                 for (int i = 0; i < n; i++) editList[i].LastSequence = lastSeq;
                 _descriptorLastSequence = lastSeq;
+            }
+
+            // Version::PrepareAppend(update_stats): load the entry stats of the new files before the versions are built
+            // (outside the DB mutex; the new FileMetaData objects are not visible to anyone else yet).
+            var newStats = new AccumulatedFileStats?[n];
+            for (int i = 0; i < n; i++)
+            {
+                if (newFiles[i] is not null) newStats[i] = LoadFileStats(edits[i].Cfd!, newFiles[i], baseStats[i]);
             }
 
             TestHooks.Invoke("VersionSet::LogAndApply:BeforeManifestWrite");
@@ -435,7 +534,7 @@ internal sealed class VersionSet : IAsyncDisposable
             lock (_db.Mutex)
             {
                 InstalledManifest = (ManifestFileNumber, (ulong)_manifestLog!.Log.File!.Size);
-                for (int i = 0; i < n; i++) InstallEdit(edits[i].Cfd, editList[i], newFiles[i], newBlobFiles[i]);
+                for (int i = 0; i < n; i++) InstallEdit(edits[i].Cfd, editList[i], newFiles[i], newBlobFiles[i], newStats[i]);
             }
         }
         finally
@@ -445,7 +544,8 @@ internal sealed class VersionSet : IAsyncDisposable
     }
 
     /// <summary>Installs one written edit (the in-memory part of ProcessManifestWrites). REQUIRES: DB mutex.</summary>
-    private void InstallEdit(ColumnFamilyData? cfd, VersionEdit edit, FileMetaData[][]? newFiles, Blob.BlobFileMetaData[]? newBlobFiles)
+    private void InstallEdit(ColumnFamilyData? cfd, VersionEdit edit, FileMetaData[][]? newFiles, Blob.BlobFileMetaData[]? newBlobFiles,
+        AccumulatedFileStats? newStats)
     {
         if (edit.MinLogNumberToKeep is ulong minLog && minLog > MinLogNumberToKeep) MinLogNumberToKeep = minLog;
         // SstFileManagerImpl::OnAddFile for the table and blob files the edit adds (flush, compaction, ingestion outputs).
@@ -477,7 +577,15 @@ internal sealed class VersionSet : IAsyncDisposable
         {
             if (newFiles is not null)
             {
-                var storage = new VersionStorageInfo(cfd.Icmp, newFiles.Length, cfd.Options, newFiles, newBlobFiles ?? []);
+                var context = new VersionBuildContext
+                {
+                    RefStorage = cfd.Current.Storage,
+                    CompactCursors = edit.CompactCursors,
+                    AccumulatedStats = newStats,
+                    AllowIngestBehind = AllowIngestBehind(cfd),
+                    FullHistoryTsLow = cfd.FullHistoryTsLow,
+                };
+                var storage = new VersionStorageInfo(cfd.Icmp, newFiles.Length, cfd.Options, newFiles, newBlobFiles ?? [], context);
                 InstallVersion(cfd, new DbVersion(cfd, storage, ++_versionNumber));
             }
             if (edit.LogNumber is ulong ln && ln > cfd.LogNumber) cfd.LogNumber = ln;
@@ -486,6 +594,7 @@ internal sealed class VersionSet : IAsyncDisposable
             {
                 // ColumnFamilyData::SetFullHistoryTsLow (only increases).
                 cfd.FullHistoryTsLow = tsLow;
+                cfd.Current.Storage.FullHistoryTsLow = tsLow;
             }
         }
     }
@@ -545,6 +654,8 @@ internal sealed class VersionSet : IAsyncDisposable
                 List<FileMetaData> level = cv.MutableLevel(l);
                 foreach (FileMetaData f in s.LevelFiles(l)) level.Add(f);
             }
+            // WriteCurrentStateToManifest: edit.SetCompactCursors(vstorage->GetCompactCursors()).
+            foreach (CompactCursor cursor in s.ValidCompactCursors()) cv.CompactCursors[cursor.Level] = cursor.InternalKey;
             foreach (Blob.BlobFileMetaData b in s.BlobFiles)
             {
                 cv.BlobFiles[b.BlobFileNumber] = new BlobFileState
@@ -573,6 +684,7 @@ internal sealed class VersionSet : IAsyncDisposable
         MarkFileNumberUsed(manifestFileNumber);
         _lastSequence = state.LastSequence;
         _lastAllocatedSequence = state.LastSequence;
+        _lastPublishedSequence = state.LastSequence;
         _descriptorLastSequence = state.LastSequence;
         ManifestFileNumber = manifestFileNumber;
         _wals.Clear();

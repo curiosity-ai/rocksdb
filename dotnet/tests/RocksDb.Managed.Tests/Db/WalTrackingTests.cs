@@ -134,4 +134,47 @@ public sealed class WalTrackingTests
         ex = Assert.ThrowsExactly<RocksDbException>(() => WalSet.CheckWals(wals, new Dictionary<ulong, string>(), static _ => 10));
         Assert.AreEqual(StatusCode.Corruption, ex.Code);
     }
+
+    private static List<VersionEdit> AllEdits(MemoryFileSystem fs)
+    {
+        using ManifestLogReader r = ManifestLogReader.Open(fs, FileNames.GetCurrentManifestPath(fs, DbPath, out _));
+        return ManifestReader.ReadAllEdits(r);
+    }
+
+    private static bool HasSyncedAddition(List<VersionEdit> edits, ulong wal)
+    {
+        foreach (VersionEdit e in edits)
+        {
+            foreach (WalAddition w in e.WalAdditions)
+            {
+                if (w.LogNumber == wal && w.SyncedSizeInBytes is not null) return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// With one column family a closed WAL is synced lazily (by the next sync write); it is never recorded as synced at
+    /// the memtable switch itself.
+    /// </summary>
+    [TestMethod]
+    public void LazilySyncedClosedWalIsRecordedOnlyAfterItsSync()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, Options(fs, track: true));
+        db.Put(B("a"), B("1"));
+        ulong closed = WalNumbers(fs)[^1];
+        db.DefaultColumnFamily.Db.SwitchMemtableForTest(); // closes the WAL without syncing it
+        db.Put(B("b"), B("2")); // not a sync write: the closed WAL stays unsynced
+        db.Flush(); // records only synced closed WALs
+        Assert.IsFalse(HasSyncedAddition(AllEdits(fs), closed), "unsynced closed WAL recorded as synced");
+
+        // Once a sync write synced it, it may be recorded (or, as here, already be obsolete: its data was flushed).
+        db.Put(new WriteOptions { Sync = true }, B("c"), B("3"));
+        db.Flush();
+        foreach (VersionEdit e in AllEdits(fs))
+        {
+            foreach (WalAddition w in e.WalAdditions) Assert.IsTrue(w.LogNumber != closed || w.SyncedSizeInBytes is null || w.SyncedSizeInBytes > 0);
+        }
+    }
 }

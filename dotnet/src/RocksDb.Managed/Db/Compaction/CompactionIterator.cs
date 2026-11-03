@@ -19,6 +19,23 @@ internal struct CompactionIterationStats
     public long NumRangeDelDropObsolete;
     public long TotalInputRawKeyBytes;
     public long TotalInputRawValueBytes;
+
+    /// <summary>Adds the counters of another (sub)compaction (CompactionJobStats::Add of the iteration stats).</summary>
+    public void Add(in CompactionIterationStats o)
+    {
+        NumInputRecords += o.NumInputRecords;
+        NumInputDeletionRecords += o.NumInputDeletionRecords;
+        NumRecordDropHidden += o.NumRecordDropHidden;
+        NumRecordDropObsolete += o.NumRecordDropObsolete;
+        NumRecordDropRangeDel += o.NumRecordDropRangeDel;
+        NumRecordDropUser += o.NumRecordDropUser;
+        NumSingleDelMismatch += o.NumSingleDelMismatch;
+        NumSingleDelFallthru += o.NumSingleDelFallthru;
+        NumOptimizedDelDropObsolete += o.NumOptimizedDelDropObsolete;
+        NumRangeDelDropObsolete += o.NumRangeDelDropObsolete;
+        TotalInputRawKeyBytes += o.TotalInputRawKeyBytes;
+        TotalInputRawValueBytes += o.TotalInputRawValueBytes;
+    }
 }
 
 /// <summary>
@@ -109,6 +126,12 @@ internal sealed class CompactionIterator : IDisposable
     /// <summary>job_snapshot_: the snapshot taken for the job when there is a snapshot checker.</summary>
     internal ulong JobSnapshot { get; init; }
 
+    /// <summary>
+    /// preserve_seqno_after_: sequence numbers above this are not zeroed at the bottommost level (their write time is
+    /// preserved for preserve_internal_time_seconds / preclude_last_level_data_seconds). Null: the earliest snapshot.
+    /// </summary>
+    internal ulong? PreserveSeqnoAfter { get; init; }
+
     /// <summary>current_key_committed_: whether the current version of the user key is committed in the job snapshot.</summary>
     private bool _currentKeyCommitted;
 
@@ -148,7 +171,7 @@ internal sealed class CompactionIterator : IDisposable
         _rangeDelAgg = rangeDelAgg;
         _compaction = compaction;
         _compactionFilter = compactionFilter;
-        _bottommostLevel = compaction is not null && compaction.BottommostLevel && !compaction.Options.CfAllowIngestBehind;
+        _bottommostLevel = compaction is not null && compaction.BottommostLevel && !compaction.Options.AllowIngestBehind;
         _enforceSingleDelContracts = enforceSingleDelContracts;
         _level = compaction?.StartLevel ?? 0;
         _levelPtrs = new int[compaction?.NumberLevels ?? 0];
@@ -625,7 +648,7 @@ internal sealed class CompactionIterator : IDisposable
                 _input.Next();
             }
             else if (_compaction is not null && (_ikeyType == EntryType.Deletion || (_ikeyType == EntryType.DeletionWithTimestamp && _cmpWithHistoryTsLow < 0))
-                     && !_compaction.Options.CfAllowIngestBehind
+                     && !_compaction.Options.AllowIngestBehind
                      && DefinitelyInSnapshot(_ikeySequence, _earliestSnapshot)
                      && _compaction.KeyNotExistsBeyondOutputLevel(_currentKey.UserKey, _levelPtrs))
             {
@@ -814,7 +837,7 @@ internal sealed class CompactionIterator : IDisposable
             // possibly exists beyond the current output level. Set has_current_user_key to false so that if the iterator
             // is at the next key, we do not compare it again against the previous key at the next iteration.
             _hasCurrentUserKey = false;
-            if (_compaction is not null && !_compaction.Options.CfAllowIngestBehind && DefinitelyInSnapshot(_ikeySequence, _earliestSnapshot)
+            if (_compaction is not null && !_compaction.Options.AllowIngestBehind && DefinitelyInSnapshot(_ikeySequence, _earliestSnapshot)
                 && _compaction.KeyNotExistsBeyondOutputLevel(_currentKey.UserKey, _levelPtrs) && isTimestampEligibleForGc)
             {
                 // Key doesn't exist outside of this range. Can compact out this SingleDelete.
@@ -879,9 +902,10 @@ internal sealed class CompactionIterator : IDisposable
         // levels) and the earliest snapshot is larger than this seqno and the userkey differs from the last userkey in
         // compaction then we can squash the seqno to zero.
         if (_valid && _bottommostLevel && DefinitelyInSnapshot(_ikeySequence, _earliestSnapshot) && _ikeyType != EntryType.Merge
+            && _ikeySequence <= (PreserveSeqnoAfter ?? _earliestSnapshot)
             && _ikeyType != EntryType.Deletion && (_ikeyType != EntryType.SingleDeletion || _tsSize != 0))
         {
-            // BottommostSeqnoCanBeZeroed: seq <= preserve_seqno_after_ (= earliest snapshot without time preservation);
+            // BottommostSeqnoCanBeZeroed: seq <= preserve_seqno_after_ (the earliest snapshot without time preservation);
             // with user-defined timestamps only below full_history_ts_low.
             if (_tsSize == 0)
             {

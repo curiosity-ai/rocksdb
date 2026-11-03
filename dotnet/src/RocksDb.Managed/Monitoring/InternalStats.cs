@@ -22,6 +22,30 @@ internal sealed class CompactionLevelStats
     public ulong NumDroppedRecords;
     public int Count;
 
+    /// <summary>CompactionStats::Subtract (interval stats = cumulative - snapshot).</summary>
+    public void Subtract(CompactionLevelStats o)
+    {
+        Micros -= o.Micros;
+        CpuMicros -= o.CpuMicros;
+        BytesReadNonOutputLevels -= o.BytesReadNonOutputLevels;
+        BytesReadOutputLevel -= o.BytesReadOutputLevel;
+        BytesWritten -= o.BytesWritten;
+        BytesMoved -= o.BytesMoved;
+        NumInputFilesInNonOutputLevels -= o.NumInputFilesInNonOutputLevels;
+        NumInputFilesInOutputLevel -= o.NumInputFilesInOutputLevel;
+        NumOutputFiles -= o.NumOutputFiles;
+        NumInputRecords -= o.NumInputRecords;
+        NumDroppedRecords -= o.NumDroppedRecords;
+        Count -= o.Count;
+    }
+
+    public CompactionLevelStats Clone()
+    {
+        var c = new CompactionLevelStats();
+        c.Add(this);
+        return c;
+    }
+
     public void Add(CompactionLevelStats o)
     {
         Micros += o.Micros;
@@ -54,6 +78,21 @@ internal sealed class InternalStats
     private ulong _flushCount;
     private ulong _ingestedFiles;
     private readonly long _startTicks = Environment.TickCount64;
+
+    /// <summary>cf_stats_snapshot_ (CFStatsSnapshot): values at the last periodic dump, for the interval columns.</summary>
+    private sealed class CfStatsSnapshot
+    {
+        public double SecondsUp;
+        public ulong IngestBytesFlush;
+        public ulong IngestBytesAddFile;
+        public ulong IngestFilesAddFile;
+        public ulong CompactBytesWrite;
+        public ulong CompactBytesRead;
+        public long CompactMicros;
+        public CompactionLevelStats CompStats = new();
+    }
+
+    private readonly CfStatsSnapshot _snapshot = new();
 
     public InternalStats(int numLevels)
     {
@@ -177,10 +216,12 @@ internal sealed class InternalStats
     /// Per-level statistics rows (level -1 = "Sum"), port of InternalStats::DumpCFMapStats(vstorage, ...): only levels
     /// with files or compaction activity are listed.
     /// </summary>
-    private List<(int Level, double[] Values)> LevelRows(VersionStorageInfo vstorage)
+    private List<(int Level, double[] Values)> LevelRows(VersionStorageInfo vstorage) => LevelRows(vstorage, out _);
+
+    private List<(int Level, double[] Values)> LevelRows(VersionStorageInfo vstorage, out CompactionLevelStats sum)
     {
         var rows = new List<(int, double[])>();
-        var sum = new CompactionLevelStats();
+        sum = new CompactionLevelStats();
         int totalFiles = 0;
         double totalSize = 0;
         lock (_lock)
@@ -220,10 +261,12 @@ internal sealed class InternalStats
     }
 
     /// <summary>
-    /// The "rocksdb.cfstats" text (InternalStats::DumpCFStats): the level table plus the flush / cumulative compaction
-    /// summary lines. Interval columns repeat the cumulative values.
+    /// The "rocksdb.cfstats" text (InternalStats::DumpCFStatsNoFileHistogram): the level table with the "Int" (interval)
+    /// row, then the flush / add-file / compaction summary with cumulative and interval values. A periodic dump
+    /// (<paramref name="isPeriodic"/>: rocksdb.cfstats, rocksdb.stats and the stats_dump_period_sec dump) starts a new
+    /// interval; rocksdb.cfstats-no-file-histogram does not.
     /// </summary>
-    public string Dump(string cfName, VersionStorageInfo vstorage)
+    public string Dump(string cfName, VersionStorageInfo vstorage, bool isPeriodic)
     {
         var sb = new StringBuilder();
         sb.Append("\n** Compaction Stats [").Append(cfName).Append("] **\n");
@@ -234,38 +277,68 @@ internal sealed class InternalStats
         header = header.TrimEnd(' ', '\n') + "\n";
         sb.Append(header);
         sb.Append('-', header.Length - 1).Append('\n');
-        foreach ((int level, double[] v) in LevelRows(vstorage))
-        {
-            string name = level == -1 ? "Sum" : "L" + level.ToString(CultureInfo.InvariantCulture);
-            sb.Append(string.Format(CultureInfo.InvariantCulture,
-                "{0,4} {1,6}/{2,-3} {3,10} {4,5:F1} {5,8:F1} {6,7:F1} {7,8:F1} {8,9:F1} {9,8:F1} {10,9:F1} {11,5:F1} {12,8:F1} {13,8:F1} {14,9:F2} {15,17:F2} {16,9} {17,8:F3} {18,7} {19,6} {20,9:F1} {21,9:F1}\n",
-                name, (int)v[(int)Stat.NumFiles], (int)v[(int)Stat.CompactedFiles], BytesToHumanString((ulong)v[(int)Stat.SizeBytes]),
-                v[(int)Stat.Score], v[(int)Stat.ReadGb], v[(int)Stat.RnGb], v[(int)Stat.Rnp1Gb], v[(int)Stat.WriteGb], v[(int)Stat.WNewGb],
-                v[(int)Stat.MovedGb], v[(int)Stat.WriteAmp], v[(int)Stat.ReadMBps], v[(int)Stat.WriteMBps], v[(int)Stat.CompSec],
-                v[(int)Stat.CompCpuSec], (int)v[(int)Stat.CompCount], v[(int)Stat.AvgSec], NumberToHumanString((long)v[(int)Stat.KeyIn]),
-                NumberToHumanString((long)v[(int)Stat.KeyDrop]), v[(int)Stat.RBlobGb], v[(int)Stat.WBlobGb]));
-        }
+        List<(int Level, double[] Values)> rows = LevelRows(vstorage, out CompactionLevelStats sumStats);
+        foreach ((int level, double[] v) in rows) AppendRow(sb, level == -1 ? "Sum" : "L" + level.ToString(CultureInfo.InvariantCulture), v);
+
         double uptime = (Environment.TickCount64 - _startTicks) / 1000.0;
-        ulong flushed, ingested;
+        ulong flushed, ingested, ingestedFiles;
         lock (_lock)
         {
             flushed = _bytesFlushed;
             ingested = _bytesIngestedAddFile;
+            ingestedFiles = _ingestedFiles;
         }
+        CfStatsSnapshot snap = _snapshot;
+        // Interval summary: PrintLevelStats(..., "Int", 0, 0, 0, 0, w_amp, interval_stats)
+        ulong intervalFlushIngest = flushed - snap.IngestBytesFlush;
+        ulong intervalAddFileIngest = ingested - snap.IngestBytesAddFile;
+        ulong intervalIngest = intervalFlushIngest + intervalAddFileIngest + 1;
+        CompactionLevelStats intervalStats = sumStats.Clone();
+        intervalStats.Subtract(snap.CompStats);
+        double intervalWAmp = intervalStats.BytesWritten / (double)intervalIngest;
+        AppendRow(sb, "Int", PrepareLevelStats(0, 0, 0, 0, intervalWAmp, intervalStats));
+
         (ulong read, ulong written, long micros, _) = CompactionTotals();
-        sb.Append(string.Format(CultureInfo.InvariantCulture, "\nUptime(secs): {0:F1} total, {0:F1} interval\n", uptime));
-        sb.Append(string.Format(CultureInfo.InvariantCulture, "Flush(GB): cumulative {0:F3}, interval {0:F3}\n", flushed / GB));
-        sb.Append(string.Format(CultureInfo.InvariantCulture, "AddFile(GB): cumulative {0:F3}, interval {0:F3}\n", ingested / GB));
-        lock (_lock) sb.Append(string.Format(CultureInfo.InvariantCulture, "AddFile(Total Files): cumulative {0}, interval {0}\n", _ingestedFiles));
-        double w = (written + flushed) / GB, r = read / GB, secs = micros / MicrosInSec;
+        double intervalUp = uptime - snap.SecondsUp;
+        sb.Append(string.Format(CultureInfo.InvariantCulture, "\nUptime(secs): {0:F1} total, {1:F1} interval\n", uptime, intervalUp));
+        sb.Append(string.Format(CultureInfo.InvariantCulture, "Flush(GB): cumulative {0:F3}, interval {1:F3}\n", flushed / GB, intervalFlushIngest / GB));
+        sb.Append(string.Format(CultureInfo.InvariantCulture, "AddFile(GB): cumulative {0:F3}, interval {1:F3}\n", ingested / GB, intervalAddFileIngest / GB));
+        sb.Append(string.Format(CultureInfo.InvariantCulture, "AddFile(Total Files): cumulative {0}, interval {1}\n", ingestedFiles,
+            ingestedFiles - snap.IngestFilesAddFile));
+        // Compact: the flush (L0) bytes count as compaction writes in the port's per-level stats (level 0 row).
+        ulong compactWrite = written + flushed;
+        double w = compactWrite / GB, r = read / GB, secs = micros / MicrosInSec;
         sb.Append(string.Format(CultureInfo.InvariantCulture,
             "Cumulative compaction: {0:F2} GB write, {1:F2} MB/s write, {2:F2} GB read, {3:F2} MB/s read, {4:F1} seconds\n",
-            w, w * 1024 / Math.Max(uptime, 0.001), r, r * 1024 / Math.Max(uptime, 0.001), secs));
+            w, compactWrite / MB / Math.Max(uptime, 0.001), r, read / MB / Math.Max(uptime, 0.001), secs));
+        ulong iWrite = compactWrite - snap.CompactBytesWrite, iRead = read - snap.CompactBytesRead;
+        long iMicros = micros - snap.CompactMicros;
         sb.Append(string.Format(CultureInfo.InvariantCulture,
             "Interval compaction: {0:F2} GB write, {1:F2} MB/s write, {2:F2} GB read, {3:F2} MB/s read, {4:F1} seconds\n",
-            w, w * 1024 / Math.Max(uptime, 0.001), r, r * 1024 / Math.Max(uptime, 0.001), secs));
+            iWrite / GB, iWrite / MB / Math.Max(intervalUp, 0.001), iRead / GB, iRead / MB / Math.Max(intervalUp, 0.001), iMicros / MicrosInSec));
+        if (isPeriodic)
+        {
+            snap.SecondsUp = uptime;
+            snap.IngestBytesFlush = flushed;
+            snap.IngestBytesAddFile = ingested;
+            snap.IngestFilesAddFile = ingestedFiles;
+            snap.CompactBytesWrite = compactWrite;
+            snap.CompactBytesRead = read;
+            snap.CompactMicros = micros;
+            snap.CompStats = sumStats;
+        }
         return sb.ToString();
     }
+
+    /// <summary>PrintLevelStats.</summary>
+    private static void AppendRow(StringBuilder sb, string name, double[] v) =>
+        sb.Append(string.Format(CultureInfo.InvariantCulture,
+            "{0,4} {1,6}/{2,-3} {3,10} {4,5:F1} {5,8:F1} {6,7:F1} {7,8:F1} {8,9:F1} {9,8:F1} {10,9:F1} {11,5:F1} {12,8:F1} {13,8:F1} {14,9:F2} {15,17:F2} {16,9} {17,8:F3} {18,7} {19,6} {20,9:F1} {21,9:F1}\n",
+            name, (int)v[(int)Stat.NumFiles], (int)v[(int)Stat.CompactedFiles], BytesToHumanString((ulong)v[(int)Stat.SizeBytes]),
+            v[(int)Stat.Score], v[(int)Stat.ReadGb], v[(int)Stat.RnGb], v[(int)Stat.Rnp1Gb], v[(int)Stat.WriteGb], v[(int)Stat.WNewGb],
+            v[(int)Stat.MovedGb], v[(int)Stat.WriteAmp], v[(int)Stat.ReadMBps], v[(int)Stat.WriteMBps], v[(int)Stat.CompSec],
+            v[(int)Stat.CompCpuSec], (int)v[(int)Stat.CompCount], v[(int)Stat.AvgSec], NumberToHumanString((long)v[(int)Stat.KeyIn]),
+            NumberToHumanString((long)v[(int)Stat.KeyDrop]), v[(int)Stat.RBlobGb], v[(int)Stat.WBlobGb]));
 
     /// <summary>BytesToHumanString (util/string_util.cc).</summary>
     internal static string BytesToHumanString(ulong bytes)
@@ -312,34 +385,72 @@ internal sealed class DbWriteStats
     public long WriteStallMicros;
     private readonly long _startTicks = Environment.TickCount64;
 
-    /// <summary>InternalStats::DumpDBStats (cumulative and interval sections; interval = cumulative).</summary>
+    /// <summary>db_stats_snapshot_ (DBStatsSnapshot): values at the previous dump.</summary>
+    private double _snapSecondsUp;
+    private long _snapIngestBytes, _snapWriteOther, _snapWriteSelf, _snapNumKeys, _snapWalBytes, _snapWalSynced, _snapWriteWithWal, _snapStall;
+    private readonly Lock _dumpLock = new();
+
+    /// <summary>
+    /// InternalStats::DumpDBStats: cumulative and interval (since the previous dump, which every call starts) writes,
+    /// WAL and stall lines.
+    /// </summary>
     public string Dump()
     {
         const double GB = 1024.0 * 1024 * 1024, MB = 1024.0 * 1024;
-        double uptime = Math.Max((Environment.TickCount64 - _startTicks) / 1000.0, 0.001);
-        long self = Interlocked.Read(ref WriteDoneBySelf), other = Interlocked.Read(ref WriteDoneByOther);
-        long keys = Interlocked.Read(ref NumKeysWritten), bytes = Interlocked.Read(ref BytesWritten);
-        long walBytes = Interlocked.Read(ref WalFileBytes), synced = Interlocked.Read(ref WalFileSynced), withWal = Interlocked.Read(ref WriteWithWal);
-        long stall = Interlocked.Read(ref WriteStallMicros);
-        long writes = self + other;
-        var sb = new StringBuilder();
-        sb.Append("\n** DB Stats **\n");
-        sb.Append(string.Format(CultureInfo.InvariantCulture, "Uptime(secs): {0:F1} total, {0:F1} interval\n", uptime));
-        for (int pass = 0; pass < 2; pass++)
+        lock (_dumpLock)
         {
-            string kind = pass == 0 ? "Cumulative" : "Interval";
+            double uptime = (Environment.TickCount64 - _startTicks) / 1000.0;
+            double intervalUp = uptime - _snapSecondsUp;
+            long self = Interlocked.Read(ref WriteDoneBySelf), other = Interlocked.Read(ref WriteDoneByOther);
+            long keys = Interlocked.Read(ref NumKeysWritten), bytes = Interlocked.Read(ref BytesWritten);
+            long walBytes = Interlocked.Read(ref WalFileBytes), synced = Interlocked.Read(ref WalFileSynced), withWal = Interlocked.Read(ref WriteWithWal);
+            long stall = Interlocked.Read(ref WriteStallMicros);
+            var sb = new StringBuilder();
+            sb.Append(string.Format(CultureInfo.InvariantCulture, "\n** DB Stats **\nUptime(secs): {0:F1} total, {1:F1} interval\n", uptime, intervalUp));
             sb.Append(string.Format(CultureInfo.InvariantCulture,
-                "{0} writes: {1} writes, {2} keys, {3} commit groups, {4:F1} writes per commit group, ingest: {5:F2} {6}, {7:F2} MB/s\n",
-                kind, InternalStats.NumberToHumanString(writes), InternalStats.NumberToHumanString(keys), InternalStats.NumberToHumanString(self),
-                writes / (double)(self + 1), pass == 0 ? bytes / GB : bytes / MB, pass == 0 ? "GB" : "MB", bytes / MB / uptime));
+                "Cumulative writes: {0} writes, {1} keys, {2} commit groups, {3:F1} writes per commit group, ingest: {4:F2} GB, {5:F2} MB/s\n",
+                InternalStats.NumberToHumanString(other + self), InternalStats.NumberToHumanString(keys), InternalStats.NumberToHumanString(self),
+                (other + self) / Math.Max(1.0, self), bytes / GB, bytes / MB / Math.Max(uptime, 0.001)));
             sb.Append(string.Format(CultureInfo.InvariantCulture,
-                "{0} WAL: {1} writes, {2} syncs, {3:F2} writes per sync, written: {4:F2} {5}, {6:F2} MB/s\n",
-                kind, InternalStats.NumberToHumanString(withWal), InternalStats.NumberToHumanString(synced), withWal / (double)(synced + 1),
-                pass == 0 ? walBytes / GB : walBytes / MB, pass == 0 ? "GB" : "MB", walBytes / MB / uptime));
-            TimeSpan st = TimeSpan.FromTicks(stall * 10);
-            sb.Append(string.Format(CultureInfo.InvariantCulture, "{0} stall: {1:D2}:{2:D2}:{3:F3} H:M:S, {4:F1} percent\n",
-                kind, (int)st.TotalHours, st.Minutes, st.Seconds + st.Milliseconds / 1000.0, stall / 10000.0 / uptime));
+                "Cumulative WAL: {0} writes, {1} syncs, {2:F2} writes per sync, written: {3:F2} GB, {4:F2} MB/s\n",
+                InternalStats.NumberToHumanString(withWal), InternalStats.NumberToHumanString(synced), withWal / Math.Max(1.0, synced),
+                walBytes / GB, walBytes / MB / Math.Max(uptime, 0.001)));
+            sb.Append("Cumulative stall: ").Append(HumanMicrosFixed(stall))
+                .Append(string.Format(CultureInfo.InvariantCulture, ", {0:F1} percent\n", stall / 10000.0 / Math.Max(uptime, 0.001)));
+
+            long iOther = other - _snapWriteOther, iSelf = self - _snapWriteSelf, iKeys = keys - _snapNumKeys, iBytes = bytes - _snapIngestBytes;
+            sb.Append(string.Format(CultureInfo.InvariantCulture,
+                "Interval writes: {0} writes, {1} keys, {2} commit groups, {3:F1} writes per commit group, ingest: {4:F2} MB, {5:F2} MB/s\n",
+                InternalStats.NumberToHumanString(iOther + iSelf), InternalStats.NumberToHumanString(iKeys), InternalStats.NumberToHumanString(iSelf),
+                (iOther + iSelf) / Math.Max(1.0, iSelf), iBytes / MB, iBytes / MB / Math.Max(intervalUp, 0.001)));
+            long iWithWal = withWal - _snapWriteWithWal, iSynced = synced - _snapWalSynced, iWalBytes = walBytes - _snapWalBytes;
+            sb.Append(string.Format(CultureInfo.InvariantCulture,
+                "Interval WAL: {0} writes, {1} syncs, {2:F2} writes per sync, written: {3:F2} GB, {4:F2} MB/s\n",
+                InternalStats.NumberToHumanString(iWithWal), InternalStats.NumberToHumanString(iSynced), iWithWal / Math.Max(1.0, iSynced),
+                iWalBytes / GB, iWalBytes / MB / Math.Max(intervalUp, 0.001)));
+            long iStall = stall - _snapStall;
+            sb.Append("Interval stall: ").Append(HumanMicrosFixed(iStall))
+                .Append(string.Format(CultureInfo.InvariantCulture, ", {0:F1} percent\n", iStall / 10000.0 / Math.Max(intervalUp, 0.001)));
+
+            _snapSecondsUp = uptime;
+            _snapIngestBytes = bytes;
+            _snapWriteOther = other;
+            _snapWriteSelf = self;
+            _snapNumKeys = keys;
+            _snapWalBytes = walBytes;
+            _snapWalSynced = synced;
+            _snapWriteWithWal = withWal;
+            _snapStall = stall;
+            return sb.ToString();
         }
-        return sb.ToString();
+    }
+
+    /// <summary>AppendHumanMicros(micros, fixed_format = true): "%02d:%02d:%05.3f H:M:S".</summary>
+    internal static string HumanMicrosFixed(long micros)
+    {
+        ulong m = (ulong)Math.Max(micros, 0);
+        double seconds = (m % 60000000) / 1000000.0;
+        return string.Format(CultureInfo.InvariantCulture, "{0:D2}:{1:D2}:{2} H:M:S", m / 1000000 / 3600, (m / 1000000 / 60) % 60,
+            seconds.ToString("F3", CultureInfo.InvariantCulture).PadLeft(5, '0'));
     }
 }

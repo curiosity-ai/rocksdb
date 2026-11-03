@@ -176,15 +176,25 @@ internal sealed partial class DbImpl
         FlushReason reason, AtomicFlushGroup? group)
     {
         ulong[] snapshots;
-        lock (_mutex) snapshots = SnapshotsForCompaction();
+        SeqnoToTimeMapping? seqnoToTime;
+        lock (_mutex)
+        {
+            snapshots = SnapshotsForCompaction();
+            seqnoToTime = CopySeqnoToTimeMapping(cfd);
+        }
         // PrepareFlushAdditions: the blob direct write files of the flushed memtables are sealed and registered with the
         // table file; their blobs the output does not reference (hidden versions, failed writes) are garbage.
         (List<BlobFileAddition> Additions, Blob.BlobGarbageMeter Meter)? directWrite = PrepareBlobDirectWriteFlush(cfd, picked);
         FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, TableFileWriteOptions(Env.IoPriority.High), cfd, mems, fileNumber, epoch, Identity, snapshots, CurrentSnapshotChecker, blobBuilder,
-                directWrite?.Meter, synchronous, CancellationToken.None)
+                directWrite?.Meter, seqnoToTime, synchronous, CancellationToken.None)
             .ConfigureAwait(false);
         if (meta is not null)
         {
+            // BuildTable: "Verify that the table is usable" (table_cache->NewIterator): the new table is opened and stays
+            // in the table cache, so lookups that must not do file I/O (KeyMayExist, kBlockCacheTier) can use it.
+            using (cfd.TableCache.GetReader(meta))
+            {
+            }
             FileSystem.SyncDirectory(DbPaths[0]);
             RecordFlushBytes(meta.FileSize + BlobBytesWritten(blobBuilder));
             // FlushJob::WriteLevel0Table logs this before the result is installed (and compactions are scheduled).

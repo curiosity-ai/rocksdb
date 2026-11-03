@@ -194,6 +194,16 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public List<CompressionType> CompressionPerLevel { get; set; } = new();
     public ulong SampleForCompression { get; set; }
 
+    /// <summary>
+    /// read_triggered_compaction_threshold (EXPERIMENTAL): a file whose sampled reads that found a tombstone, a merge
+    /// operand or nothing (collapsible-entry reads), per byte of file size, exceed this ratio is compacted to the next
+    /// level (leveled and universal; FIFO ignores it). Must be &gt;= 0 and finite; 0 (default) disables it. A starting
+    /// point upstream recommends is 0.01. Files are re-evaluated when a new version is installed and by the periodic
+    /// compaction trigger (<see cref="DbOptions.MaxCompactionTriggerWakeupSeconds"/>), so a DB that only serves reads
+    /// picks them up within that period. Dynamically changeable through SetOptions.
+    /// </summary>
+    public double ReadTriggeredCompactionThreshold { get; set; }
+
     // ---- LSM shape / compaction --------------------------------------------------------------
     public int NumLevels { get; set; } = 7;
     public int Level0FileNumCompactionTrigger { get; set; } = 4;
@@ -229,9 +239,31 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     /// </summary>
     public ulong PeriodicCompactionSeconds { get; set; } = DefaultPeriodicCompactionSeconds;
 
+    /// <summary>
+    /// bottommost_file_compaction_delay: once a released snapshot no longer protects data in a bottommost file, the file
+    /// is compacted (reason BottommostFiles) to drop that data and zero its sequence numbers; this delays such compactions
+    /// until the file is at least this many seconds old. 0 (default) = no delay. Mutable through SetOptions.
+    /// </summary>
+    public uint BottommostFileCompactionDelay { get; set; }
+
     /// <summary>kDefaultPeriodicCompSecs (db/column_family.cc).</summary>
     internal const ulong DefaultPeriodicCompactionSeconds = 0xfffffffffffffffe;
+    /// <summary>
+    /// preclude_last_level_data_seconds (EXPERIMENTAL): data written within this many seconds is kept out of the last
+    /// level. Compactions to the last level of leveled or universal compaction place each entry by its estimated write
+    /// time (per-key placement): newer entries go to the level above (the proximal level). Write times come from the
+    /// DB's sequence-number-to-time mapping, which is recorded while the option is set and persisted in each table
+    /// (<c>rocksdb.seqno.time.map</c>); a DB created with the option gets 100 pre-allocated sequence numbers mapped back
+    /// over the window. Implies <see cref="PreserveInternalTimeSeconds"/> for that duration. 0 (default) disables it.
+    /// Dynamically changeable through SetOptions.
+    /// </summary>
     public ulong PrecludeLastLevelDataSeconds { get; set; }
+
+    /// <summary>
+    /// preserve_internal_time_seconds (EXPERIMENTAL): keep the write-time information (sequence numbers and the
+    /// sequence-number-to-time mapping) of data written within this many seconds; such data is not given sequence
+    /// number 0 by bottommost compactions. 0 (default) disables it. Dynamically changeable through SetOptions.
+    /// </summary>
     public ulong PreserveInternalTimeSeconds { get; set; }
     public Temperature LastLevelTemperature { get; set; } = Temperature.Unknown;
     public Temperature DefaultTemperature { get; set; } = Temperature.Unknown;
@@ -239,6 +271,18 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public uint BlockProtectionBytesPerKey { get; set; }
     public bool PersistUserDefinedTimestamps { get; set; } = true;
     public bool CfAllowIngestBehind { get; set; }
+
+    /// <summary>
+    /// The deprecated DBOptions::allow_ingest_behind, copied in by the DB's option sanitization (not persisted in the
+    /// column family section of the OPTIONS file).
+    /// </summary>
+    internal bool DbAllowIngestBehind { get; set; }
+
+    /// <summary>
+    /// cf_allow_ingest_behind || DBOptions::allow_ingest_behind (ColumnFamilyData::AllowIngestBehind): the last level is
+    /// reserved for files ingested with <see cref="IngestExternalFileOptions.IngestBehind"/>.
+    /// </summary>
+    internal bool AllowIngestBehind => CfAllowIngestBehind || DbAllowIngestBehind;
 
     // ---- blob files --------------------------------------------------------------------------
     public bool EnableBlobFiles { get; set; }
@@ -328,6 +372,8 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .Add("compression_per_level", static o => FormatCompressionList(o.CompressionPerLevel),
             static (o, v) => o.CompressionPerLevel = ParseCompressionList(v))
         .UInt64("sample_for_compression", static o => o.SampleForCompression, static (o, v) => o.SampleForCompression = v)
+        .Double("read_triggered_compaction_threshold", static o => o.ReadTriggeredCompactionThreshold,
+            static (o, v) => o.ReadTriggeredCompactionThreshold = v)
         .Int32("num_levels", static o => o.NumLevels, static (o, v) => o.NumLevels = v)
         .Int32("level0_file_num_compaction_trigger", static o => o.Level0FileNumCompactionTrigger, static (o, v) => o.Level0FileNumCompactionTrigger = v)
         .Int32("level0_slowdown_writes_trigger", static o => o.Level0SlowdownWritesTrigger, static (o, v) => o.Level0SlowdownWritesTrigger = v)
@@ -357,6 +403,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .Bool("report_bg_io_stats", static o => o.ReportBgIoStats, static (o, v) => o.ReportBgIoStats = v)
         .UInt64("ttl", static o => o.Ttl, static (o, v) => o.Ttl = v)
         .UInt64("periodic_compaction_seconds", static o => o.PeriodicCompactionSeconds, static (o, v) => o.PeriodicCompactionSeconds = v)
+        .UInt32("bottommost_file_compaction_delay", static o => o.BottommostFileCompactionDelay, static (o, v) => o.BottommostFileCompactionDelay = v)
         .UInt64("preclude_last_level_data_seconds", static o => o.PrecludeLastLevelDataSeconds, static (o, v) => o.PrecludeLastLevelDataSeconds = v)
         .UInt64("preserve_internal_time_seconds", static o => o.PreserveInternalTimeSeconds, static (o, v) => o.PreserveInternalTimeSeconds = v)
         .Enum("last_level_temperature", OptionEnumMaps.Temperature, static o => o.LastLevelTemperature, static (o, v) => o.LastLevelTemperature = v)
@@ -403,6 +450,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         c._sstPartitionerFactory = _sstPartitionerFactory;
         c._compactionFilter = _compactionFilter;
         c._compactionFilterFactory = _compactionFilterFactory;
+        c.DbAllowIngestBehind = DbAllowIngestBehind;
         c.CompactionOptionsFifo = CompactionOptionsFifo.Clone();
         c.CompactionOptionsUniversal = CompactionOptionsUniversal.Clone();
         c.TableOptions = TableOptions.Clone();

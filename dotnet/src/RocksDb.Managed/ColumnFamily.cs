@@ -300,8 +300,20 @@ public sealed partial class ColumnFamily
         _db.ThrowIfDisposed();
         batch.EntityRun = false;
         if (batch.Count == 0) return;
-        ValueTask t = _db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None);
-        t.GetAwaiter().GetResult();
+        if (_db.Stats is null)
+        {
+            _db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+            return;
+        }
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadMultigetMicros);
+        try
+        {
+            _db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
     }
 
     /// <summary>Async <see cref="MultiGet(MultiGetBatch)"/>: data blocks missing from the block cache are read with async I/O.</summary>
@@ -332,7 +344,15 @@ public sealed partial class ColumnFamily
             else
             {
                 long t0 = st.StartTimer();
-                _db.Get(_cfd, options, key, ctx);
+                int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadGetMicros);
+                try
+                {
+                    _db.Get(_cfd, options, key, ctx);
+                }
+                finally
+                {
+                    Monitoring.FileReadActivity.Exit(activity);
+                }
                 DbImpl.RecordGet(st, ctx, t0);
             }
         }
@@ -490,6 +510,65 @@ public sealed partial class ColumnFamily
     }
 
     private static readonly CompactRangeOptions s_defaultCompactRange = new();
+
+    /// <summary>
+    /// Compacts the given table files of this column family into <paramref name="outputLevel"/> (DB::CompactFiles), as
+    /// one manual compaction on the caller's thread. Files are named like
+    /// <see cref="LiveFileMetadata.Name"/> ("/000012.sst", a full path or "000012.sst"; only the number counts). Files a
+    /// valid compaction also needs are added: the files between the given ones on their level, all older L0 files when
+    /// compacting L0 to a higher level, and the overlapping files of the levels down to the output level. Returns the
+    /// paths of the files written to the output level.
+    /// </summary>
+    /// <exception cref="RocksDbException">
+    /// InvalidArgument for an unknown file, an output level above an input file or beyond the compaction style's last
+    /// level; Aborted when a needed file is being compacted by another compaction.
+    /// </exception>
+    public IReadOnlyList<string> CompactFiles(IEnumerable<string> inputFileNames, int outputLevel) =>
+        CompactFiles(s_defaultCompactFiles, inputFileNames, outputLevel);
+
+    /// <summary><see cref="CompactFiles(IEnumerable{string}, int)"/> with explicit <see cref="CompactFilesOptions"/>.</summary>
+    public IReadOnlyList<string> CompactFiles(CompactFilesOptions options, IEnumerable<string> inputFileNames, int outputLevel) =>
+        CompactFiles(options, ToFileNumbers(inputFileNames), outputLevel);
+
+    /// <summary><see cref="CompactFiles(IEnumerable{string}, int)"/> naming the inputs by file number.</summary>
+    public IReadOnlyList<string> CompactFiles(CompactFilesOptions options, IEnumerable<ulong> inputFileNumbers, int outputLevel)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return _db.CompactFilesAsync(_cfd, options, inputFileNumbers, outputLevel, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+    }
+
+    /// <summary>Async <see cref="CompactFiles(IEnumerable{string}, int)"/>: the compaction runs on a background thread.</summary>
+    public async ValueTask<IReadOnlyList<string>> CompactFilesAsync(IEnumerable<string> inputFileNames, int outputLevel,
+        CancellationToken cancellationToken = default) =>
+        await CompactFilesAsync(s_defaultCompactFiles, inputFileNames, outputLevel, cancellationToken).ConfigureAwait(false);
+
+    /// <summary>Async <see cref="CompactFiles(CompactFilesOptions, IEnumerable{string}, int)"/>.</summary>
+    public async ValueTask<IReadOnlyList<string>> CompactFilesAsync(CompactFilesOptions options, IEnumerable<string> inputFileNames, int outputLevel,
+        CancellationToken cancellationToken = default) =>
+        await CompactFilesAsync(options, ToFileNumbers(inputFileNames), outputLevel, cancellationToken).ConfigureAwait(false);
+
+    /// <summary>Async <see cref="CompactFiles(CompactFilesOptions, IEnumerable{ulong}, int)"/>.</summary>
+    public async ValueTask<IReadOnlyList<string>> CompactFilesAsync(CompactFilesOptions options, IEnumerable<ulong> inputFileNumbers, int outputLevel,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return await _db.CompactFilesAsync(_cfd, options, inputFileNumbers, outputLevel, synchronous: false, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>TableFileNameToNumber of each name (the digits before the extension of the last path component).</summary>
+    private static List<ulong> ToFileNumbers(IEnumerable<string> names)
+    {
+        ArgumentNullException.ThrowIfNull(names);
+        var numbers = new List<ulong>();
+        foreach (string name in names)
+        {
+            ArgumentNullException.ThrowIfNull(name);
+            numbers.Add(global::RocksDb.Managed.Db.FileNames.TableFileNameToNumber(name));
+        }
+        return numbers;
+    }
+
+    private static readonly CompactFilesOptions s_defaultCompactFiles = new();
 
     /// <summary>A DB property of this column family (DB::GetProperty), or null if unknown. See <see cref="RocksDatabase.GetProperty(string)"/>.</summary>
     public string? GetProperty(string property)
