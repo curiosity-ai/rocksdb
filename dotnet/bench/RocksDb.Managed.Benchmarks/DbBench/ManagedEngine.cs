@@ -43,7 +43,7 @@ public sealed class ManagedEngine : IKeyValueEngine
         };
         if (options.BloomBitsPerKey > 0) cfo.TableOptions.FilterPolicy = new BloomFilterPolicy(options.BloomBitsPerKey);
         var dbo = new DbOptions { CreateIfMissing = true, FileSystem = LocalFileSystem.Instance, MaxBackgroundJobs = options.MaxBackgroundJobs,
-            MaxSubcompactions = options.MaxSubcompactions,
+            MaxSubcompactions = options.MaxSubcompactions, CompactionReadaheadSize = options.CompactionReadaheadSize,
             AllowConcurrentMemtableWrite = options.AllowConcurrentMemtableWrite, EnableWriteThreadAdaptiveYield = options.EnableWriteThreadAdaptiveYield };
         return (dbo, cfo);
     }
@@ -117,6 +117,7 @@ public sealed class ManagedEngine : IKeyValueEngine
         public void SeekToLast() => it.SeekToLast();
 
         public void Seek(ReadOnlySpan<byte> key) => it.Seek(key);
+        public void SeekForPrev(ReadOnlySpan<byte> key) => it.SeekForPrev(key);
 
         public void Next() => it.Next();
 

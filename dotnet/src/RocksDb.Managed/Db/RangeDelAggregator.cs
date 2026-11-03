@@ -197,6 +197,81 @@ public sealed class RangeDelAggregator
     }
 
     /// <summary>
+    /// <see cref="ShouldDelete(ReadOnlySpan{byte}, ulong)"/> for the read path that also describes how far the covering
+    /// tombstone reaches, so the caller can skip the covered range in a child iterator (the role of upstream's
+    /// MergingIterator::SkipNextDeleted / SkipPrevDeleted reseeks). On true, <paramref name="tombstoneSeq"/> is the
+    /// newest visible tombstone covering the entry and <paramref name="skipTarget"/> receives an internal key such that
+    /// every entry strictly between the entry and the target (forward: up to, excluding, the target; backward: down to,
+    /// excluding, the entries after the target, i.e. SeekForPrev semantics) with a seqno &lt; <paramref name="tombstoneSeq"/>
+    /// is covered by that tombstone: the fragment end (start) clamped so that no user key at a truncated file boundary
+    /// is crossed. Read mode only.
+    /// </summary>
+    public bool ShouldDeleteWithSkipTarget(ReadOnlySpan<byte> userKey, ulong sequence, bool forward, Util.PooledBufferWriter skipTarget,
+        out ulong tombstoneSeq)
+    {
+        tombstoneSeq = 0;
+        if (_count == 0 || _snapshots is not null) return false;
+        ulong upper = _readSequence;
+        if (sequence >= upper) return false;
+        int best = -1, bestFragment = -1;
+        for (int i = 0; i < _count; i++)
+        {
+            ref Source s = ref _sources[i];
+            if (!InBounds(ref s, userKey, sequence)) continue;
+            int f = Locate(ref s, userKey);
+            if (f < 0) continue;
+            int k = s.List.VisibleIndex(f, upper, _tsUpperBound);
+            if (k < 0) continue;
+            ulong t = s.List.GetSequences(f)[k];
+            if (t > sequence && t > tombstoneSeq)
+            {
+                tombstoneSeq = t;
+                best = i;
+                bestFragment = f;
+            }
+        }
+        if (best < 0) return false;
+        ref Source src = ref _sources[best];
+        ReadOnlySpan<byte> boundary;
+        ulong seq;
+        EntryType type;
+        if (forward)
+        {
+            // Entries before (fragment end, kMaxSequenceNumber) are covered; with a truncated end, stop before the
+            // first entry of the file's last user key (its older versions may lie outside the file's bounds).
+            boundary = src.List.GetEnd(bestFragment);
+            if (src.Largest is not null)
+            {
+                ReadOnlySpan<byte> lu = DbFormat.ExtractUserKey(src.Largest);
+                if (_icmp.CompareUserKey(lu, boundary) < 0) boundary = lu;
+            }
+            seq = DbFormat.MaxSequenceNumber;
+            type = DbFormat.ValueTypeForSeek;
+        }
+        else
+        {
+            boundary = src.List.GetStart(bestFragment);
+            if (src.Smallest is not null && _icmp.CompareUserKey(DbFormat.ExtractUserKey(src.Smallest), boundary) >= 0)
+            {
+                // Truncated start: keep every version of the file's first user key (SeekForPrev to its oldest entry).
+                boundary = DbFormat.ExtractUserKey(src.Smallest);
+                seq = 0;
+                type = EntryType.Deletion;
+            }
+            else
+            {
+                // SeekForPrev(fragment start, kMaxSequenceNumber): the last entry of a smaller user key.
+                seq = DbFormat.MaxSequenceNumber;
+                type = DbFormat.ValueTypeForSeek;
+            }
+        }
+        skipTarget.Clear();
+        Span<byte> dst = skipTarget.GetSpan(boundary.Length + DbFormat.InternalKeyFooterSize);
+        skipTarget.Advance(DbFormat.AppendInternalKey(dst, boundary, seq, type));
+        return true;
+    }
+
+    /// <summary>
     /// Largest seqno &lt;= the read sequence of a range tombstone covering <paramref name="userKey"/> (0 if none),
     /// across all sources (truncation applied at user-key granularity). Port of
     /// FragmentedRangeTombstoneIterator::MaxCoveringTombstoneSeqnum aggregated over the sources of a point lookup.

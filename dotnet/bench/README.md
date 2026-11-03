@@ -171,7 +171,9 @@ and write their batch to the DB as an unprepared batch at half of their puts, `w
 select the policy with `rocksdb_transactiondb_options_set_write_policy`).
 
 Flags (same for all engines): `--num`, `--reads` (default num), `--key_size` (16), `--value_size` (100), `--threads`,
-`--batch_size` (puts per WriteBatch in fill benchmarks, default 1 = Put), `--multiget_size` (16), `--seek_nexts` (10), `--txn_puts` (10),
+`--batch_size` (puts per WriteBatch in fill benchmarks, default 1 = Put), `--multiget_size` (16), `--seek_nexts` (10),
+`--reverse_iterator` (seekrandom: SeekForPrev + `--seek_nexts` Prev, db_bench's flag), `--compaction_readahead_size`
+(2 MiB), `--drop_page_cache` (`compact` evicts the SSTs from the OS page cache first: fsync + POSIX_FADV_DONTNEED), `--txn_puts` (10),
 `--disable_wal`, `--sync`, `--cache_size` (8 MiB), `--cache_type` (lru|hyperclock), `--bloom_bits` (10),
 `--write_buffer_size` (64 MiB), `--block_size` (4096), `--compression` (none|snappy|lz4|zstd), `--compression_parallel_threads` (1; managed only),
 `--compression_ratio` (0.5), `--target_file_size_base` (64 MiB), `--max_bytes_for_level_base` (256 MiB),

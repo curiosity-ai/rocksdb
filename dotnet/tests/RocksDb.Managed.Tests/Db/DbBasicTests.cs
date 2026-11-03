@@ -350,6 +350,63 @@ public sealed class DbBasicTests
         }
     }
 
+    /// <summary>
+    /// Iteration over a range deleted by a newer tombstone skips the covered keys of the older files in one seek
+    /// instead of visiting them: with max_skippable_internal_keys far below the number of covered keys, every
+    /// positioning call still succeeds (it would fail with Incomplete if each covered key were stepped over), with the
+    /// tombstone in the memtable and in an L0 file, sync and async.
+    /// </summary>
+    [TestMethod]
+    public async Task DeleteRangeSkipsCoveredKeysOfOlderFiles()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        for (int i = 0; i < 3000; i++) db.Put(Key(i), Value(i, 0));
+        db.Flush();
+        db.CompactRange();
+        db.DeleteRange(Key(100), Key(2900));
+        db.Put(Key(1500), Value(1500, 1)); // newer than the tombstone
+        var expected = new List<int>();
+        for (int i = 0; i < 100; i++) expected.Add(i);
+        expected.Add(1500);
+        for (int i = 2900; i < 3000; i++) expected.Add(i);
+        for (int phase = 0; phase < 2; phase++)
+        {
+            if (phase == 1) db.Flush(); // tombstone and the newer put move to an L0 file
+            var ro = new ReadOptions { MaxSkippableInternalKeys = 50 };
+            using Iterator it = db.NewIterator(ro);
+            var fwd = new List<int>();
+            for (it.SeekToFirst(); it.Valid; it.Next()) fwd.Add(KeyIndex(it.Key));
+            CollectionAssert.AreEqual(expected, fwd, "forward, phase " + phase);
+            var rev = new List<int>();
+            for (it.SeekToLast(); it.Valid; it.Prev()) rev.Add(KeyIndex(it.Key));
+            rev.Reverse();
+            CollectionAssert.AreEqual(expected, rev, "reverse, phase " + phase);
+
+            it.Seek(Key(1000));
+            Assert.AreEqual(1500, KeyIndex(it.Key));
+            CollectionAssert.AreEqual(Value(1500, 1), it.Value.ToArray());
+            it.Next();
+            Assert.AreEqual(2900, KeyIndex(it.Key));
+            it.SeekForPrev(Key(2000));
+            Assert.AreEqual(1500, KeyIndex(it.Key));
+            it.Prev();
+            Assert.AreEqual(99, KeyIndex(it.Key));
+
+            await it.SeekAsync(Key(200));
+            Assert.AreEqual(1500, KeyIndex(it.Key));
+            await it.NextAsync();
+            Assert.AreEqual(2900, KeyIndex(it.Key));
+            await it.SeekForPrevAsync(Key(2800));
+            Assert.AreEqual(1500, KeyIndex(it.Key));
+            await it.PrevAsync();
+            Assert.AreEqual(99, KeyIndex(it.Key));
+        }
+    }
+
+    private static int KeyIndex(ReadOnlySpan<byte> key) =>
+        int.Parse(System.Text.Encoding.ASCII.GetString(key[3..]), System.Globalization.CultureInfo.InvariantCulture);
+
     [TestMethod]
     public void WriteBatchAtomicityAndValidation()
     {

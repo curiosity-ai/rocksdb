@@ -63,6 +63,8 @@ public interface IEngineIterator : IDisposable
 
     void Seek(ReadOnlySpan<byte> key);
 
+    void SeekForPrev(ReadOnlySpan<byte> key);
+
     void Next();
 
     void Prev();
@@ -124,6 +126,8 @@ public sealed record EngineOptions
 
     /// <summary>--max_background_jobs (2).</summary>
     public int MaxBackgroundJobs { get; init; } = 2;
+    /// <summary>--compaction_readahead_size (2 MiB, the upstream default).</summary>
+    public ulong CompactionReadaheadSize { get; init; } = 2 * 1024 * 1024;
     /// <summary>allow_concurrent_memtable_write (managed engine only; native uses its default, true).</summary>
     public bool AllowConcurrentMemtableWrite { get; init; } = true;
     /// <summary>enable_write_thread_adaptive_yield (managed engine only; native uses its default, true).</summary>

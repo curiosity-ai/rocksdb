@@ -22,7 +22,9 @@
 //   - work split across threads and the output line formats
 
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <ftw.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -51,6 +53,7 @@ typedef struct {
   int batch_size;     // puts per WriteBatch for fill benchmarks (1 = Put)
   int multiget_size;  // keys per MultiGet in multireadrandom
   int seek_nexts;     // Next() calls after each Seek in seekrandom
+  int reverse_iterator; // seekrandom: SeekForPrev + Prev() instead of Seek + Next()
   bool disable_wal;
   bool sync;
   int64_t cache_size;
@@ -68,6 +71,8 @@ typedef struct {
   uint64_t min_blob_size;
   int max_background_jobs;
   unsigned max_subcompactions;
+  uint64_t compaction_readahead_size;
+  bool drop_page_cache;  // compact: evict the SST files from the page cache first
   bool use_existing_db;
   int64_t seed;
   const char* db;
@@ -105,6 +110,8 @@ static Flags FLAGS = {
     .min_blob_size = 0,
     .max_background_jobs = 2,
     .max_subcompactions = 1,
+    .compaction_readahead_size = 2 * 1024 * 1024,
+    .drop_page_cache = false,
     .use_existing_db = false,
     .seed = 301,
     .db = "/tmp/rocksdb-c-bench",
@@ -120,7 +127,7 @@ static void usage(void) {
           "usage: rocksdb_bench [--benchmarks a,b,...] [--num N] [--reads N] "
           "[--key_size 16] [--value_size 100]\n"
           "  [--threads 1] [--batch_size 1] [--multiget_size 16] "
-          "[--seek_nexts 10] [--txn_puts 10] [--disable_wal] [--sync]\n"
+          "[--seek_nexts 10] [--reverse_iterator] [--txn_puts 10] [--disable_wal] [--sync]\n"
           "  [--cache_size BYTES] [--cache_type lru|hyperclock] [--bloom_bits "
           "10] [--write_buffer_size BYTES]\n"
           "  [--block_size 4096] [--compression none|snappy|lz4|zstd] "
@@ -128,6 +135,7 @@ static void usage(void) {
           "  [--target_file_size_base BYTES] [--max_bytes_for_level_base BYTES] "
           "[--level0_file_num_compaction_trigger 4]\n"
           "  [--disable_auto_compactions] [--max_background_jobs 2] [--max_subcompactions 1]\n"
+          "  [--compaction_readahead_size 2097152] [--drop_page_cache]\n"
           "  [--enable_blob_files] [--min_blob_size 0]\n"
           "  [--use_existing_db] [--seed 301] [--db PATH] [--histogram 1]\n"
           "  [--warmup true|false] [--warmup_ops N] [--warmup_min_ms 1000]\n"
@@ -178,6 +186,7 @@ static void parse_flags(int argc, char** argv) {
     else if (FLAG("batch_size")) FLAGS.batch_size = atoi(value);
     else if (FLAG("multiget_size")) FLAGS.multiget_size = atoi(value);
     else if (FLAG("seek_nexts")) FLAGS.seek_nexts = atoi(value);
+    else if (FLAG("reverse_iterator")) FLAGS.reverse_iterator = parse_bool(value);
     else if (FLAG("disable_wal")) FLAGS.disable_wal = parse_bool(value);
     else if (FLAG("sync")) FLAGS.sync = parse_bool(value);
     else if (FLAG("cache_size")) FLAGS.cache_size = strtoll(value, NULL, 10);
@@ -204,6 +213,10 @@ static void parse_flags(int argc, char** argv) {
       FLAGS.min_blob_size = strtoull(value, NULL, 10);
     else if (FLAG("max_background_jobs"))
       FLAGS.max_background_jobs = atoi(value);
+    else if (FLAG("compaction_readahead_size"))
+      FLAGS.compaction_readahead_size = strtoull(value, NULL, 10);
+    else if (FLAG("drop_page_cache"))
+      FLAGS.drop_page_cache = parse_bool(value);
     else if (FLAG("max_subcompactions"))
       FLAGS.max_subcompactions = (unsigned)strtoul(value, NULL, 10);
     else if (FLAG("use_existing_db")) FLAGS.use_existing_db = parse_bool(value);
@@ -446,6 +459,8 @@ static void build_options(void) {
   rocksdb_options_set_min_blob_size(g_options, FLAGS.min_blob_size);
   rocksdb_options_set_max_background_jobs(g_options,
                                           FLAGS.max_background_jobs);
+  rocksdb_options_compaction_readahead_size(g_options,
+                                            (size_t)FLAGS.compaction_readahead_size);
   rocksdb_options_set_max_subcompactions(g_options, FLAGS.max_subcompactions);
   rocksdb_options_set_block_based_table_factory(g_options, g_table_options);
 
@@ -669,14 +684,16 @@ static void do_seeks(ThreadState* t, int64_t n, uint64_t* rng) {
   for (int64_t i = 0; i < n; i++) {
     make_key(key, ks, rng_uniform(rng, (uint64_t)FLAGS.num));
     uint64_t t0 = now_ns();
-    rocksdb_iter_seek(it, key, (size_t)ks);
+    if (FLAGS.reverse_iterator) rocksdb_iter_seek_for_prev(it, key, (size_t)ks);
+    else rocksdb_iter_seek(it, key, (size_t)ks);
     if (rocksdb_iter_valid(it)) t->found++;
     for (int j = 0; j < FLAGS.seek_nexts && rocksdb_iter_valid(it); j++) {
       size_t kl, vl;
       rocksdb_iter_key(it, &kl);
       rocksdb_iter_value(it, &vl);
       t->bytes += (int64_t)(kl + vl);
-      rocksdb_iter_next(it);
+      if (FLAGS.reverse_iterator) rocksdb_iter_prev(it);
+      else rocksdb_iter_next(it);
     }
     if (FLAGS.histogram) hist_add(&t->hist, now_ns() - t0);
   }
@@ -995,7 +1012,27 @@ static void run_threaded(BenchId b, int bench_index, const char* name) {
   free(th);
 }
 
+// fsync + POSIX_FADV_DONTNEED for every *.sst file of the DB (--drop_page_cache).
+static void drop_page_cache(void) {
+  DIR* d = opendir(FLAGS.db);
+  if (d == NULL) return;
+  struct dirent* e;
+  char path[4096];
+  while ((e = readdir(d)) != NULL) {
+    size_t n = strlen(e->d_name);
+    if (n < 4 || strcmp(e->d_name + n - 4, ".sst") != 0) continue;
+    snprintf(path, sizeof(path), "%s/%s", FLAGS.db, e->d_name);
+    int fd = open(path, O_RDWR);
+    if (fd < 0) continue;
+    fsync(fd);
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd);
+  }
+  closedir(d);
+}
+
 static void run_single(BenchId b, const char* name) {
+  if (b == B_COMPACT && FLAGS.drop_page_cache) drop_page_cache();
   uint64_t t0 = now_ns();
   char* err = NULL;
   if (b == B_FLUSH) {

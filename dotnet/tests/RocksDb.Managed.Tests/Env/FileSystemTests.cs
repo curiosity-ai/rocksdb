@@ -388,4 +388,40 @@ public sealed partial class FileSystemTests
             return ValueTask.CompletedTask;
         }
     }
+    /// <summary>
+    /// <see cref="AsyncPrefetchBuffer"/> (FilePrefetchBuffer async_io): sequential reads of random sizes (blocks
+    /// straddling the prefetched chunks, blocks larger than the straddle reserve and the readahead), forward jumps and
+    /// backward jumps return exactly the file's bytes, and sequential reads are served by prefetches, not by
+    /// synchronous reads. The test file's ReadAsync completes asynchronously.
+    /// </summary>
+    [TestMethod]
+    public void AsyncPrefetchBufferReturnsFileBytes()
+    {
+        int seed = Environment.TickCount;
+        var rnd = new Random(seed);
+        byte[] data = new byte[3_000_000];
+        rnd.NextBytes(data);
+        var file = new RocksDb.Managed.Tests.Table.MemRandomAccessFile(data);
+        using var buf = new AsyncPrefetchBuffer(64 * 1024);
+        buf.Reset(file);
+        long offset = 0;
+        int sequential = 0;
+        while (offset < data.Length)
+        {
+            int len = rnd.Next(10) == 0 ? rnd.Next(70_000, 150_000) : rnd.Next(1, 9000);
+            len = (int)Math.Min(len, data.Length - offset);
+            Assert.IsTrue(buf.TryRead(offset, len, out ReadOnlySpan<byte> got), "seed=" + seed + " offset " + offset);
+            Assert.IsTrue(got.SequenceEqual(data.AsSpan((int)offset, len)), "seed=" + seed + " offset " + offset + " len " + len);
+            offset += len;
+            sequential++;
+            int jump = rnd.Next(50);
+            if (jump == 0) offset = Math.Max(0, offset - rnd.Next(200_000));   // backward
+            else if (jump == 1) offset += rnd.Next(300_000);                 // forward gap
+        }
+        Assert.IsTrue(buf.Prefetches > 0);
+        Assert.IsTrue(buf.SyncReads < sequential / 4, "seed=" + seed + ": " + buf.SyncReads + " sync reads for " + sequential + " reads");
+        Assert.IsFalse(buf.TryRead(data.Length - 10, 20, out _), "beyond the end");
+        buf.Reset(null);
+    }
 }
+

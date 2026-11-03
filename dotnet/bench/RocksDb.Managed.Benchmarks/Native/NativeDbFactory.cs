@@ -90,6 +90,7 @@ public static class NativeDbFactory
             out RocksDbSharp.BloomFilterPolicy? bloom, out RocksDbSharp.BlockBasedTableOptions table);
         // rocksdb-sharp's DbOptions has no SetMaxBackgroundJobs; use the C API on its handle.
         RocksDbSharp.Native.Instance.rocksdb_options_set_max_background_jobs(dbOptions.Handle, options.MaxBackgroundJobs);
+        RocksDbSharp.Native.Instance.rocksdb_options_compaction_readahead_size(dbOptions.Handle, (UIntPtr)options.CompactionReadaheadSize);
         RocksDbSharp.Native.Instance.rocksdb_options_set_max_subcompactions(dbOptions.Handle, options.MaxSubcompactions);
         if (options.EnableBlobFiles)
         {
@@ -236,6 +237,7 @@ public sealed class NativeKeyValueEngine : IKeyValueEngine
         public void SeekToLast() => it.SeekToLast();
 
         public void Seek(ReadOnlySpan<byte> key) => it.Seek(key);
+        public void SeekForPrev(ReadOnlySpan<byte> key) => it.SeekForPrev(key);
 
         public void Next() => it.Next();
 

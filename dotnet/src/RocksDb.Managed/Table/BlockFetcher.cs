@@ -156,6 +156,25 @@ internal static class BlockFetcher
     private static void ThrowTruncated(BlockHandle handle, int read) =>
         ThrowHelper.Corruption("truncated block read from file at offset " + handle.Offset + ", expected " + (handle.Size + BlockBasedTableConstants.BlockTrailerSize) + " bytes, got " + read);
 
+    /// <summary>
+    /// Reads a block through a readahead buffer (BlockFetcher::TryGetFromPrefetchBuffer): the serialized block is
+    /// verified in the buffer, uncompressed blocks are copied into their own buffer, compressed ones decompressed
+    /// straight from it.
+    /// </summary>
+    public static Block ReadBlock(AsyncPrefetchBuffer prefetch, in Footer footer, BlockHandle handle, bool verifyChecksums, CompressionDictionary? dictionary)
+    {
+        int n = CheckedLength(handle);
+        if (!prefetch.TryRead((long)handle.Offset, n, out ReadOnlySpan<byte> serialized)) ThrowTruncated(handle, 0);
+        int size = (int)handle.Size;
+        if (verifyChecksums && !BlockChecksum.Verify(footer.ChecksumType, footer.BaseContextChecksum, serialized, handle.Offset))
+            ThrowHelper.Corruption("block checksum mismatch at offset " + handle.Offset + " size " + size);
+        var type = (CompressionType)serialized[size];
+        if (type != CompressionType.None) return Decompress(type, serialized[..size], footer.FormatVersion, dictionary);
+        byte[] buf = BlockBufferPool.Rent(Math.Max(size, 1));
+        serialized[..size].CopyTo(buf);
+        return Block.Create(buf, size, rentedFromSharedPool: true);
+    }
+
     /// <summary>Takes ownership of <paramref name="buf"/> (rented) holding payload + trailer.</summary>
     private static Block ProcessSerialized(byte[] buf, in Footer footer, BlockHandle handle, bool verifyChecksums, CompressionDictionary? dictionary)
     {

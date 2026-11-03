@@ -234,7 +234,8 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [ ] rate limiter on reads + tickers (S); reader-affecting table options via SetOptions (S); normal open of a DB with a truncated SST fails only at first read (S)
 - Write path / iterators perf
   - [x] 4-thread readmissing (per-processor SuperVersion cache, pinned table readers: 0.41->0.31 us sync, 0.62->0.33 async, C 0.43) and sync group-commit wait (AwaitState port), parallel memtable inserts for groups >= 64 entries (loaded-machine numbers; re-measure quietly)
-  - [ ] reverse iteration pins blocks instead of copying (M); async reverse movement (M); range tombstones in iterator heap (M/L)
+  - [x] reverse iteration pins blocks (readreverse 1 KiB 0.70->0.45 us), async reverse movement, range-deleted runs skipped (scan over 99% deleted 13.8 ms -> 0.16 ms, native 0.66), async compaction input readahead (cold compact 3.05 s -> 1.05 s, native 2.3-2.5)
+  - [ ] merge operands copied in reverse; NextAsync after reverse switches sync; index partitions loaded sync in async paths; user-iterator readahead (S each)
   - [ ] pipelined write (L); parallel insert for small groups is slower than serial - investigate (S); non-blocking SyncAsync (S); LZ4 encoder / cold-start JIT (M)
 - Ingestion / TTL / stats
   - [x] ingestion: write_global_seqno (legacy, + reader checksum fallback), ingest_behind, overlapping files in one call, allow_db_generated_files, link_files; TTL iterator; GET_HIT_L*, file-read histograms, cfstats intervals; KeyMayExist without I/O
@@ -244,5 +245,5 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [ ] secondary: verify table files exist before installing a version (S); re-measure switchover hold on a quiet machine (S)
 - Backup / error handling
   - [x] SstFileManager (space limit, trash deletion, compaction space pre-check) + no-space auto recovery; atomic WAL-error recovery flush
-- Flaky under load (investigate): RoundTrip `NativeFirst_Alternating` managed reopen hit LOCK 'Resource temporarily unavailable' once (seed 1518776361 replays clean); `CommitsRacingReaders(WriteUnprepared,True)`; `ManagedDbPrefixSeekReadByNative(BinarySearch,False,False)`
+- Flaky under load (investigate): RoundTrip `NativeFirst_Alternating` managed reopen hit LOCK 'Resource temporarily unavailable' once (seed 1518776361 replays clean); `CommitsRacingReaders(WriteUnprepared,True)`; `ManagedDbPrefixSeekReadByNative(...)` (L1+ precondition when an L0 file trivially moves to L6)
 - Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)

@@ -17,7 +17,7 @@ internal sealed class RandomLsm : IDisposable
     public readonly List<TestOp> Ops = new();
     public readonly List<MemTable> MemTables = new();
     public readonly List<List<FileMetaData>> Levels = new() { new(), new(), new() };
-    public readonly TestTableCache TableCache = new();
+    public readonly TestTableCache TableCache;
     public readonly MergeOperator Merge = new StringAppendOperator();
     public readonly int KeySpace;
     private ulong _nextFile = 10;
@@ -25,7 +25,14 @@ internal sealed class RandomLsm : IDisposable
     public static string Key(int i) => "k" + i.ToString("D3", CultureInfo.InvariantCulture);
 
     public RandomLsm(int seed, int numOps, int keySpace, bool withRangeDeletes)
+        : this(seed, numOps, keySpace, withRangeDeletes, TableReaderOptions.Default)
     {
+    }
+
+    /// <param name="tableOptions">Options of the table readers (e.g. a block cache).</param>
+    public RandomLsm(int seed, int numOps, int keySpace, bool withRangeDeletes, TableReaderOptions tableOptions)
+    {
+        TableCache = new TestTableCache(tableOptions);
         KeySpace = keySpace;
         var rnd = new Random(seed);
         for (int i = 0; i < numOps; i++)
@@ -89,6 +96,7 @@ internal sealed class RandomLsm : IDisposable
         var points = new List<(byte[] Key, byte[] Value)>();
         var dels = new List<(byte[] Key, byte[] Value)>();
         byte[]? smallest = null, largest = null;
+        ulong minSeq = DbFormat.MaxSequenceNumber, maxSeq = 0;
         void Extend(byte[] small, byte[] large)
         {
             if (smallest is null || icmp.Compare(small, smallest) < 0) smallest = small;
@@ -103,6 +111,8 @@ internal sealed class RandomLsm : IDisposable
                 if (string.CompareOrdinal(s, e) >= 0) continue;
                 byte[] sk = TableTestUtil.IKey(s, op.Seq, EntryType.RangeDeletion);
                 dels.Add((sk, B(e)));
+                minSeq = Math.Min(minSeq, op.Seq);
+                maxSeq = Math.Max(maxSeq, op.Seq);
                 Extend(sk, TableTestUtil.IKey(e, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion));
             }
             else
@@ -111,6 +121,8 @@ internal sealed class RandomLsm : IDisposable
                 if (hi is not null && string.CompareOrdinal(op.Key, hi) >= 0) continue;
                 byte[] ik = TableTestUtil.IKey(op.Key, op.Seq, op.Type);
                 points.Add((ik, B(op.Value)));
+                minSeq = Math.Min(minSeq, op.Seq);
+                maxSeq = Math.Max(maxSeq, op.Seq);
                 Extend(ik, ik);
             }
         }
@@ -121,7 +133,11 @@ internal sealed class RandomLsm : IDisposable
         byte[] data = TableTestUtil.BuildTable(points, new TableFormatOptions { BlockSize = 256 });
         ulong number = _nextFile++;
         TableCache.AddFile(number, data);
-        return new FileMetaData { FileNumber = number, FileSize = (ulong)data.Length, Smallest = smallest, Largest = largest! };
+        // The seqno range lets the iterators skip ranges covered by newer range tombstones.
+        return new FileMetaData
+        {
+            FileNumber = number, FileSize = (ulong)data.Length, Smallest = smallest, Largest = largest!, SmallestSeqno = minSeq, LargestSeqno = maxSeq,
+        };
     }
 
     public DbIteratorSources Sources(ulong sequence, ReadOptions? ro, ulong maxSkip) => new()
@@ -274,6 +290,160 @@ public sealed class DbIterRandomTests
             await it.NextAsync();
         }
         Assert.AreEqual(Format(e.FindAll(x => string.CompareOrdinal(x.Key, start) >= 0)), Format(got), "seed=" + seed);
+    }
+
+    /// <summary>
+    /// Random walks with the async positioning calls (SeekAsync / SeekForPrevAsync / NextAsync / PrevAsync /
+    /// SeekToLastAsync) against the model. Without a block cache every data block read awaits (the test files yield in
+    /// ReadAsync), so the slow paths of the reverse state machine and the table / level / merging iterators run.
+    /// </summary>
+    [TestMethod]
+    [DataRow(1, false)]
+    [DataRow(2, true)]
+    [DataRow(3, false)]
+    public async Task AsyncRandomWalkMatchesModel(int seedOffset, bool withCache)
+    {
+        int seed = Environment.TickCount ^ (seedOffset * 104729);
+        string trace = "seed=" + seed.ToString(CultureInfo.InvariantCulture);
+        TableReaderOptions tableOptions = withCache ? TableReaderOptions.Default with { BlockCache = RocksDb.Managed.Cache.BlockCache.CreateLru(1 << 20) } : TableReaderOptions.Default;
+        using var lsm = new RandomLsm(seed, 600, 50, true, tableOptions);
+        var rnd = new Random(seed + 1);
+        for (int round = 0; round < 6; round++)
+        {
+            ulong snapshot = round == 0 ? DbFormat.MaxSequenceNumber : (ulong)rnd.Next(1, lsm.Ops.Count + 1);
+            string? lower = rnd.Next(3) == 0 ? RandomLsm.Key(rnd.Next(lsm.KeySpace)) : null;
+            string? upper = rnd.Next(3) == 0 ? RandomLsm.Key(rnd.Next(lsm.KeySpace)) : null;
+            var ro = new ReadOptions { PinData = rnd.Next(4) == 0 };
+            if (lower is not null) ro.IterateLowerBound = B(lower);
+            if (upper is not null) ro.IterateUpperBound = B(upper);
+            ulong maxSkip = rnd.Next(2) == 0 ? 8UL : (ulong)rnd.Next(0, 3);
+            string ctx = trace + " round=" + round + " snap=" + snapshot + " lower=" + lower + " upper=" + upper + " maxSkip=" + maxSkip + " pin=" + ro.PinData;
+
+            List<(string Key, string Value)> e = ReferenceModel.Expected(lsm.Ops, snapshot, lsm.Merge, lower, upper);
+            using Iterator it = await DbIteratorFactory.CreateAsync(lsm.Sources(snapshot, ro, maxSkip));
+            var rev = new List<(string, string)>();
+            await it.SeekToLastAsync();
+            while (it.Valid)
+            {
+                rev.Add((S(it.Key), S(it.Value)));
+                await it.PrevAsync();
+            }
+            rev.Reverse();
+            Assert.AreEqual(Format(e), Format(rev), ctx + " reverse");
+
+            for (int walk = 0; walk < 20; walk++)
+            {
+                string target = RandomLsm.Key(rnd.Next(lsm.KeySpace + 1)) + (rnd.Next(3) == 0 ? "a" : "");
+                int pos;
+                if (rnd.Next(2) == 0)
+                {
+                    await it.SeekAsync(B(target));
+                    pos = LowerIndex(e, target);
+                    AssertPos(e, pos, it, ctx + " SeekAsync(" + target + ")");
+                }
+                else
+                {
+                    await it.SeekForPrevAsync(B(target));
+                    pos = SeekForPrevIndex(e, target);
+                    AssertPos(e, pos, it, ctx + " SeekForPrevAsync(" + target + ")");
+                }
+                for (int step = 0; step < 15 && it.Valid; step++)
+                {
+                    if (rnd.Next(2) == 0)
+                    {
+                        await it.NextAsync();
+                        pos++;
+                        AssertPos(e, pos, it, ctx + " NextAsync step " + step);
+                    }
+                    else
+                    {
+                        await it.PrevAsync();
+                        pos--;
+                        AssertPos(e, pos, it, ctx + " PrevAsync step " + step);
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>ReadOptions.PinData (pin_thru_lifetime): every block stays pinned until the iterator is disposed.</summary>
+    [TestMethod]
+    public void PinDataMatchesModel()
+    {
+        int seed = Environment.TickCount;
+        using var lsm = new RandomLsm(seed, 600, 50, true);
+        List<(string Key, string Value)> e = ReferenceModel.Expected(lsm.Ops, DbFormat.MaxSequenceNumber, lsm.Merge, null, null);
+        using DbIter it = DbIteratorFactory.CreateDbIter(lsm.Sources(DbFormat.MaxSequenceNumber, new ReadOptions { PinData = true }, 8));
+        var fwd = new List<(string, string)>();
+        for (it.SeekToFirst(); it.Valid; it.Next()) fwd.Add((S(it.Key), S(it.Value)));
+        Assert.AreEqual(Format(e), Format(fwd), "seed=" + seed);
+        var rev = new List<(string, string)>();
+        for (it.SeekToLast(); it.Valid; it.Prev()) rev.Add((S(it.Key), S(it.Value)));
+        rev.Reverse();
+        Assert.AreEqual(Format(e), Format(rev), "seed=" + seed);
+        Assert.IsTrue(it.PinnedItersMgr.IsPinning);
+        Assert.IsTrue(it.PinnedItersMgr.PinnedBlockCount > 0, "blocks left by the scans are kept");
+    }
+
+    /// <summary>
+    /// Reverse steps pin the data blocks they leave (instead of copying values) and release them at the next
+    /// positioning call: the number of pinned blocks stays bounded during a reverse scan and drops to zero on Next.
+    /// </summary>
+    [TestMethod]
+    public void ReverseScanPinsBlocksTemporarily()
+    {
+        int seed = Environment.TickCount;
+        using var lsm = new RandomLsm(seed, 800, 60, true);
+        List<(string Key, string Value)> e = ReferenceModel.Expected(lsm.Ops, DbFormat.MaxSequenceNumber, lsm.Merge, null, null);
+        using DbIter it = DbIteratorFactory.CreateDbIter(lsm.Sources(DbFormat.MaxSequenceNumber, null, 8));
+        int pos = e.Count - 1;
+        int maxPinned = 0;
+        for (it.SeekToLast(); it.Valid; it.Prev(), pos--)
+        {
+            Assert.AreEqual(e[pos].Key, S(it.Key), "seed=" + seed);
+            Assert.AreEqual(e[pos].Value, S(it.Value), "seed=" + seed + " key " + e[pos].Key);
+            maxPinned = Math.Max(maxPinned, it.PinnedItersMgr.PinnedBlockCount);
+        }
+        Assert.AreEqual(-1, pos);
+        Assert.IsTrue(maxPinned > 0, "the scan crossed blocks while pinning");
+        Assert.IsTrue(maxPinned <= 16, "pinned blocks are released per step, max " + maxPinned);
+        it.SeekToLast();
+        Assert.IsTrue(it.Valid);
+        it.Prev();
+        Assert.IsTrue(it.Valid);
+        it.Next();
+        Assert.IsFalse(it.PinnedItersMgr.IsPinning);
+        Assert.AreEqual(0, it.PinnedItersMgr.PinnedBlockCount);
+    }
+
+    /// <summary>
+    /// With every block cached, async reverse movement completes synchronously. (Allocations are checked by the
+    /// BenchmarkDotNet run of ReverseIteratorBenchmarks: Debug builds compile async state machines as classes.)
+    /// </summary>
+    [TestMethod]
+    public void AsyncReverseCompletesSynchronouslyOnCacheHits()
+    {
+        using var lsm = new RandomLsm(17, 800, 60, true, TableReaderOptions.Default with { BlockCache = RocksDb.Managed.Cache.BlockCache.CreateLru(8 << 20) });
+        using DbIter it = DbIteratorFactory.CreateDbIter(lsm.Sources(DbFormat.MaxSequenceNumber, null, 8));
+        byte[] target = B(RandomLsm.Key(30));
+        for (it.SeekToLast(); it.Valid; it.Prev()) { } // warm the cache
+        int steps = 0;
+        ValueTask t = it.SeekToLastAsync();
+        Assert.IsTrue(t.IsCompletedSuccessfully);
+        while (it.Valid)
+        {
+            t = it.PrevAsync();
+            Assert.IsTrue(t.IsCompletedSuccessfully, "PrevAsync on cached blocks completes synchronously");
+            steps++;
+        }
+        Assert.IsTrue(steps > 10);
+        t = it.SeekForPrevAsync(target);
+        Assert.IsTrue(t.IsCompletedSuccessfully);
+        Assert.IsTrue(it.Valid);
+        t = it.NextAsync();
+        Assert.IsTrue(t.IsCompletedSuccessfully);
+        t = it.PrevAsync();
+        Assert.IsTrue(t.IsCompletedSuccessfully, "direction switch");
     }
 
     [TestMethod]

@@ -716,6 +716,33 @@ public sealed partial class BlockBasedTableReader : IDisposable
         return GetBlockRefLegacy(handle, kind, flags);
     }
 
+    /// <summary>
+    /// <see cref="GetBlockRef(BlockHandle, BlockKind, TableReadFlags)"/> reading a block that is not cached through
+    /// <paramref name="prefetch"/> (sequential readahead, e.g. compaction_readahead_size for compaction inputs).
+    /// </summary>
+    internal BlockRef GetBlockRef(BlockHandle handle, BlockKind kind, TableReadFlags flags, AsyncPrefetchBuffer? prefetch)
+    {
+        if (prefetch is null) return GetBlockRef(handle, kind, flags);
+        BlockCache? cache = _cache;
+        CacheKey key = default;
+        if (cache is not null)
+        {
+            key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
+            if (cache.TryLookup(key, out CachedBlock h))
+            {
+                _stats?.Record(HitCounter(kind));
+                return BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h);
+            }
+        }
+        else if (_legacyCache is not null)
+        {
+            return GetBlockRefLegacy(handle, kind, flags);
+        }
+        _stats?.Record(MissCounter(kind));
+        Block b = Protect(BlockFetcher.ReadBlock(prefetch, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind);
+        return cache is null || (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
+    }
+
     private BlockRef ReadAndInsert(BlockCache cache, in CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
         _stats?.Record(MissCounter(kind));

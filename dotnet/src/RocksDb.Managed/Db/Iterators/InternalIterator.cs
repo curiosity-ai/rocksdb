@@ -36,6 +36,49 @@ public abstract class InternalIterator : IDisposable
     /// <summary>Upper-level hint for iterate_upper_bound checks (port of IsKeyPinned/UpperBoundCheckResult is optional).</summary>
     public virtual bool MayBeOutOfUpperBound => true;
 
+    /// <summary>
+    /// Port of InternalIterator::SetPinnedItersMgr: iterators that hold data blocks hand the blocks they leave to
+    /// <paramref name="manager"/> while it <see cref="PinnedIteratorsManager.IsPinning"/>; composite iterators pass it
+    /// to their children. Default: nothing to pin.
+    /// </summary>
+    public virtual void SetPinnedItersMgr(PinnedIteratorsManager? manager) { }
+
+    /// <summary>
+    /// Port of IsValuePinned + value(): when the current value stays valid until the pinned iterators manager releases
+    /// its data (or for the memtable, while the memtable is alive), returns it as a storable slice. False (the caller
+    /// copies the value) when the value is not pinned. REQUIRES: <see cref="Valid"/>.
+    /// </summary>
+    public virtual bool TryGetPinnedValue(out PinnedSlice value)
+    {
+        value = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Range-deletion skipping (the role of upstream's MergingIterator::SkipNextDeleted reseek). PRE: the current entry
+    /// is covered by a range tombstone with seqno <paramref name="tombstoneSeq"/> that covers every entry in
+    /// [current, <paramref name="target"/>) whose seqno is below <paramref name="tombstoneSeq"/>. The iterator may move
+    /// to the first entry &gt;= <paramref name="target"/> when it can tell that every entry it skips that way has a
+    /// smaller seqno (an SST file's largest seqno, or every file of a level up to the target); for a merging iterator,
+    /// only the child providing the current entry moves. Returns false (and does not move) otherwise: the caller then
+    /// steps with <see cref="Next"/>. Default: false.
+    /// </summary>
+    public virtual bool SkipCoveredForward(ReadOnlySpan<byte> target, ulong tombstoneSeq) => false;
+
+    /// <summary>
+    /// Backward counterpart of <see cref="SkipCoveredForward"/>: may move to the last entry &lt;= <paramref name="target"/>
+    /// (SeekForPrev) when every skipped entry in (target, current] has a seqno below <paramref name="tombstoneSeq"/>.
+    /// </summary>
+    public virtual bool SkipCoveredBackward(ReadOnlySpan<byte> target, ulong tombstoneSeq) => false;
+
+    /// <summary>Async <see cref="SkipCoveredForward"/>; completes synchronously unless a block must be read.</summary>
+    public virtual ValueTask<bool> SkipCoveredForwardAsync(ReadOnlyMemory<byte> target, ulong tombstoneSeq, CancellationToken cancellationToken = default) =>
+        new(SkipCoveredForward(target.Span, tombstoneSeq));
+
+    /// <summary>Async <see cref="SkipCoveredBackward"/>; completes synchronously unless a block must be read.</summary>
+    public virtual ValueTask<bool> SkipCoveredBackwardAsync(ReadOnlyMemory<byte> target, ulong tombstoneSeq, CancellationToken cancellationToken = default) =>
+        new(SkipCoveredBackward(target.Span, tombstoneSeq));
+
     protected virtual void Dispose(bool disposing) { }
     public void Dispose()
     {

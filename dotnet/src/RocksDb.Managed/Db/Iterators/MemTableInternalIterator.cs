@@ -52,5 +52,12 @@ public sealed class MemTableInternalIterator : InternalIterator
     public override void Next() => _it.Next();
     public override void Prev() => _it.Prev();
 
+    /// <summary>Memtable values live in arena memory at a fixed address while the memtable is alive (MemTableIterator::IsValuePinned).</summary>
+    public override bool TryGetPinnedValue(out PinnedSlice value)
+    {
+        value = PinnedSlice.FromFixed(_it.Value);
+        return true;
+    }
+
     protected override void Dispose(bool disposing) => _memtable = null;
 }
