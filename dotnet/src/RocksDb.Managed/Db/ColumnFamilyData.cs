@@ -113,10 +113,13 @@ internal sealed class ColumnFamilyData
             VerifyUniqueIdInManifest = db.Options.VerifySstUniqueIdInManifest,
         };
         // Blob files live in cf_paths.front() (the first DB path); readers and the optional blob cache are per CF.
-        BlobSource = new Blob.BlobSource(db.FileSystem, db.DbPaths[0], id, options.BlobCache, db.Identity.DbId, db.Identity.SessionId, db.Options.Statistics,
-            db.Options.MaxOpenFiles);
-        CompactionState = new ColumnFamilyCompactionState(options, Icmp);
         Stats = new InternalStats(NumLevels);
+        BlobSource = new Blob.BlobSource(db.FileSystem, db.DbPaths[0], id, options.BlobCache, db.Identity.DbId, db.Identity.SessionId, db.Options.Statistics,
+            db.Options.MaxOpenFiles)
+        {
+            BlobFileReadHistogram = Stats.BlobFileReadHist,
+        };
+        CompactionState = new ColumnFamilyCompactionState(options, Icmp);
         TableCache.LevelStats = Stats;
         if (options.EnableBlobDirectWrite && options.EnableBlobFiles && !db.IsReadOnly)
         {
@@ -127,6 +130,7 @@ internal sealed class ColumnFamilyData
                 ColumnFamilyId = id,
                 BlobFileSize = options.BlobFileSize,
                 FileOptions = db.BlobFileWriteOptions(options),
+                BlobFileReadHistogram = Stats.BlobFileReadHist,
             };
             BlobSource.DirectWrite = BlobDirectWrite;
         }

@@ -104,6 +104,12 @@ internal sealed class InternalStats
         _fileReadLatency = new HistogramImpl?[_levels.Length];
     }
 
+    /// <summary>
+    /// GetBlobFileReadHist(): blob_file_read_latency_, the read latency histogram of the column family's blob files
+    /// (micros), filled only when the DB has statistics.
+    /// </summary>
+    public HistogramImpl BlobFileReadHist { get; } = new();
+
     /// <summary>GetFileReadHist(level): the read latency histogram of tables opened at <paramref name="level"/> (null if unknown).</summary>
     public HistogramImpl? GetFileReadHist(int level)
     {
@@ -125,6 +131,10 @@ internal sealed class InternalStats
             if (h is null || h.Data().Count == 0) continue;
             sb.Append("** Level ").Append(level.ToString(CultureInfo.InvariantCulture)).Append(" read latency histogram (micros):\n")
                 .Append(h.ToString()).Append('\n');
+        }
+        if (BlobFileReadHist.Data().Count != 0)
+        {
+            sb.Append("** Blob file read latency histogram (micros):\n").Append(BlobFileReadHist.ToString()).Append('\n');
         }
         return sb.ToString();
     }

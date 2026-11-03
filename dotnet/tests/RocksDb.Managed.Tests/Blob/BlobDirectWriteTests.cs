@@ -462,4 +462,43 @@ public sealed class BlobDirectWriteTests
         db.Flush();
         Assert.AreEqual(new string('p', 100) + ",m", GetString(db, "p"));
     }
+
+    /// <summary>
+    /// With a file_checksum_gen_factory, direct-write blob files are checksummed while written (WritableFileWriter with
+    /// the factory, BlobLogWriter::AppendFooter) and the checksum is recorded in their MANIFEST addition: VerifyFileChecksums
+    /// covers them (before and after reopen) and detects a modified byte.
+    /// </summary>
+    [TestMethod]
+    public void DirectWriteFilesRecordFileChecksums()
+    {
+        MemoryFileSystem fs = NewFs();
+        DbOptions o = DirectWriteDb(fs);
+        o.FileChecksumGenFactory = FileChecksumGenCrc32cFactory.Instance;
+        o.Statistics = new Statistics();
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, o, DirectWriteCf(partitions: 2)))
+        {
+            for (int i = 0; i < 50; i++) db.Put(Key(i), B(new string((char)('a' + i % 26), 100)));
+            db.Flush();
+            db.VerifyFileChecksums();
+            Assert.IsTrue(o.Statistics.GetHistogramData(Histogram.BlobDbBlobFileWriteMicros).Count > 0);
+            Assert.IsTrue(o.Statistics.GetHistogramData(Histogram.BlobDbBlobFileSyncMicros).Count > 0);
+        }
+        o.Statistics = null;
+        List<ulong> blobs = BlobFiles(fs);
+        Assert.IsTrue(blobs.Count >= 2);
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, o, DirectWriteCf(partitions: 2)))
+        {
+            db.VerifyFileChecksums();
+            Assert.AreEqual(new string('c', 100), GetString(db, S(Key(2))!));
+        }
+        // Same size, one byte changed inside a blob value: only the whole-file checksum notices.
+        string victim = FileNames.BlobFileName(DbPath, blobs[0]);
+        fs.WriteAt(victim, BlobLogFormat.HeaderSize + BlobLogFormat.RecordHeaderSize + 12, "Z"u8);
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, o, DirectWriteCf(partitions: 2)))
+        {
+            RocksDbException e = Assert.ThrowsExactly<RocksDbException>(db.VerifyFileChecksums);
+            Assert.AreEqual(StatusCode.Corruption, e.Code);
+            StringAssert.Contains(e.Message, "file checksum mismatch");
+        }
+    }
 }

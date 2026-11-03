@@ -504,4 +504,52 @@ public sealed class DbBlobTests
         db.Flush();
         Assert.AreEqual((int)IntProperty(db, DbProperties.NumBlobFiles), BlobFilesOnDisk(fs).Count);
     }
+
+    /// <summary>
+    /// Blob file I/O histograms (monitoring/statistics.cc names): blob reads go through the RandomAccessFileReader
+    /// timing with BLOB_DB_BLOB_FILE_READ_MICROS (blob_file_reader.cc), plus the activity histogram and the
+    /// column family's blob file read latency histogram of "rocksdb.cfstats"; decompression, compression, appends and
+    /// syncs record BLOB_DB_DECOMPRESSION_MICROS, BLOB_DB_COMPRESSION_MICROS, BLOB_DB_BLOB_FILE_WRITE_MICROS and
+    /// BLOB_DB_BLOB_FILE_SYNC_MICROS. Table reads do not count as blob reads.
+    /// </summary>
+    [TestMethod]
+    public void BlobFileIoHistogramsAreRecorded()
+    {
+        CompressionType compression = BlockCompression.IsSupported(CompressionType.LZ4) ? CompressionType.LZ4 : CompressionType.Snappy;
+        MemoryFileSystem fs = NewFs();
+        var stats = new Statistics();
+        DbOptions o = NewOptions(fs);
+        o.Statistics = stats;
+        ColumnFamilyOptions cf = BlobOptions(minBlobSize: 32);
+        cf.BlobCompressionType = compression;
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, o, cf))
+        {
+            for (int i = 0; i < 20; i++) db.Put(Key(i), B(new string((char)('a' + i), 200)));
+            db.Flush();
+        }
+        Assert.IsTrue(stats.GetHistogramData(Histogram.BlobDbCompressionMicros).Count >= 20);
+        Assert.IsTrue(stats.GetHistogramData(Histogram.BlobDbBlobFileWriteMicros).Count >= 20);
+        Assert.IsTrue(stats.GetHistogramData(Histogram.BlobDbBlobFileSyncMicros).Count >= 1);
+        Assert.AreEqual(0UL, stats.GetHistogramData(Histogram.BlobDbBlobFileReadMicros).Count);
+
+        stats.Reset();
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, o, cf))
+        {
+            ulong sstReads = stats.GetHistogramData(Histogram.SstReadMicros).Count;
+            Assert.AreEqual(new string('c', 200), GetString(db, S(Key(2))!));
+            using (Iterator it = db.NewIterator())
+            {
+                int n = 0;
+                for (it.SeekToFirst(); it.Valid; it.Next()) n += it.Value.Length;
+                Assert.AreEqual(20 * 200, n);
+            }
+            HistogramData reads = stats.GetHistogramData(Histogram.BlobDbBlobFileReadMicros);
+            // Header + footer of the reader, then one read per blob (Get + 20 iterator values; no blob cache).
+            Assert.IsTrue(reads.Count >= 21, "blob reads: " + reads.Count);
+            Assert.IsTrue(stats.GetHistogramData(Histogram.BlobDbDecompressionMicros).Count >= 21);
+            Assert.IsTrue(stats.GetHistogramData(Histogram.SstReadMicros).Count >= sstReads, "table reads are separate");
+            string cfStats = db.GetProperty("rocksdb.cfstats")!;
+            StringAssert.Contains(cfStats, "** Blob file read latency histogram (micros):");
+        }
+    }
 }

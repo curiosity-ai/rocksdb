@@ -82,7 +82,7 @@ internal sealed partial class DbImpl
             try
             {
                 if (!_db.FileSystem.FileExists(path)) return false;
-                Blob.BlobFileReader.Open(_db.FileSystem, path, cf.Id, null).Dispose();
+                Blob.BlobFileReader.Open(_db.FileSystem, path, cf.Id, null, null).Dispose();
                 return true;
             }
             catch (Exception e) when (e is IOException or RocksDbException or InvalidDataException)

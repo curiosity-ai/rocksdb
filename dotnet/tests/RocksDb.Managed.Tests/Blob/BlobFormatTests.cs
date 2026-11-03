@@ -138,7 +138,7 @@ public sealed class BlobFormatTests
         Assert.AreEqual("", a.ChecksumMethod);
         Assert.AreEqual((long)(BlobLogFormat.HeaderSize + expectedBytes + BlobLogFormat.FooterSize), fs.GetFileSize(FileNames.BlobFileName(DbPath, 10)));
 
-        using BlobFileReader reader = BlobFileReader.Open(fs, FileNames.BlobFileName(DbPath, 10), CfId, null);
+        using BlobFileReader reader = BlobFileReader.Open(fs, FileNames.BlobFileName(DbPath, 10), CfId, null, null);
         for (int i = 0; i < 10; i++)
         {
             BlobIndex idx = BlobIndex.Decode(indexes[i]);
@@ -162,7 +162,7 @@ public sealed class BlobFormatTests
         ex = Assert.ThrowsExactly<RocksDbException>(() => reader.GetBlob(B("key0"), fOff, fSize, CompressionType.Snappy, true, o2));
         StringAssert.Contains(ex.Message, "Compression type mismatch");
         // Column family mismatch.
-        ex = Assert.ThrowsExactly<RocksDbException>(() => BlobFileReader.Open(fs, FileNames.BlobFileName(DbPath, 10), CfId + 1, null));
+        ex = Assert.ThrowsExactly<RocksDbException>(() => BlobFileReader.Open(fs, FileNames.BlobFileName(DbPath, 10), CfId + 1, null, null));
         Assert.AreEqual(StatusCode.Corruption, ex.Code);
         o2.Dispose();
         w.Dispose();
@@ -214,7 +214,7 @@ public sealed class BlobFormatTests
         builder.Finish();
         Assert.AreEqual(type, BlobIndex.Decode(i1).Compression);
         Assert.IsTrue(BlobIndex.Decode(i1).Size < 5000);
-        using BlobFileReader reader = BlobFileReader.Open(fs, FileNames.BlobFileName(DbPath, 5), CfId, null);
+        using BlobFileReader reader = BlobFileReader.Open(fs, FileNames.BlobFileName(DbPath, 5), CfId, null, null);
         Assert.AreEqual(type, reader.Compression);
         var output = new PooledBufferWriter(64);
         BlobIndex a = BlobIndex.Decode(i1);
@@ -247,7 +247,7 @@ public sealed class BlobFormatTests
         bytes[65] ^= 0xff;
         string bad = FileNames.BlobFileName(DbPath, 4);
         using (IWritableFile f = fs.CreateWritable(bad)) f.Append(bytes);
-        using (BlobFileReader r = BlobFileReader.Open(fs, bad, CfId, null))
+        using (BlobFileReader r = BlobFileReader.Open(fs, bad, CfId, null, null))
         {
             var output = new PooledBufferWriter(16);
             RocksDbException ex = Assert.ThrowsExactly<RocksDbException>(() => r.GetBlob(B("key"), 65, 9, CompressionType.None, true, output));
@@ -258,13 +258,13 @@ public sealed class BlobFormatTests
         }
         string tiny = FileNames.BlobFileName(DbPath, 6);
         using (IWritableFile f = fs.CreateWritable(tiny)) f.Append(bytes.AsSpan(0, 40));
-        Assert.AreEqual(StatusCode.Corruption, Assert.ThrowsExactly<RocksDbException>(() => BlobFileReader.Open(fs, tiny, CfId, null)).Code);
+        Assert.AreEqual(StatusCode.Corruption, Assert.ThrowsExactly<RocksDbException>(() => BlobFileReader.Open(fs, tiny, CfId, null, null)).Code);
         // TTL header
         byte[] ttl = (byte[])fs.ReadAllBytes(path).Clone();
         ttl[12] = 1;
         string ttlPath = FileNames.BlobFileName(DbPath, 8);
         using (IWritableFile f = fs.CreateWritable(ttlPath)) f.Append(ttl);
-        RocksDbException e2 = Assert.ThrowsExactly<RocksDbException>(() => BlobFileReader.Open(fs, ttlPath, CfId, null));
+        RocksDbException e2 = Assert.ThrowsExactly<RocksDbException>(() => BlobFileReader.Open(fs, ttlPath, CfId, null, null));
         StringAssert.Contains(e2.Message, "Unexpected TTL blob file");
     }
 }

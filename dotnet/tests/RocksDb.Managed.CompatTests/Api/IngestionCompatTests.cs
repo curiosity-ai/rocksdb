@@ -369,6 +369,44 @@ public sealed class IngestionCompatTests
     }
 
     /// <summary>
+    /// Blob direct write files of a managed DB with FileChecksumGenCrc32cFactory carry their whole-file checksum in the
+    /// MANIFEST (BlobLogWriter::AppendFooter): native VerifyFileChecksums accepts them and the values are the crc32c of
+    /// the files.
+    /// </summary>
+    [TestMethod]
+    public void BlobDirectWriteFileChecksumsAreVerifiedByNative()
+    {
+        using var dir = new TempDir("bdw-cksum");
+        string managedDb = Path.Combine(dir.Path, "managed");
+        var cf = new ColumnFamilyOptions { EnableBlobFiles = true, EnableBlobDirectWrite = true, MinBlobSize = 64, BlobDirectWritePartitions = 2 };
+        using (RocksDatabase db = RocksDatabase.Open(managedDb,
+                   new DbOptions { CreateIfMissing = true, FileChecksumGenFactory = FileChecksumGenCrc32cFactory.Instance, AllowConcurrentMemtableWrite = false },
+                   [new ColumnFamilyDescriptor("default", cf)]))
+        {
+            for (int i = 0; i < 300; i++) db.Put(U(Key(i)), U(i % 3 == 0 ? new string('b', 100 + i) : "v" + i));
+            db.Flush();
+            db.VerifyFileChecksums();
+        }
+        Assert.IsTrue(Directory.GetFiles(managedDb, "*.blob").Length >= 2);
+        var nopts = new RocksDbSharp.DbOptions();
+        NativeExtras.SetCrc32cFileChecksums(nopts);
+        using (var db = RocksDbSharp.RocksDb.Open(nopts, managedDb))
+        {
+            Assert.IsNull(NativeExtras.VerifyFileChecksums(db), "native verifies the direct-write blob file checksums");
+            Assert.AreEqual(new string('b', 103), db.Get(Key(3)));
+        }
+        // Every blob file's recorded checksum must be non-empty: flip a byte, native must notice.
+        string victim = Directory.GetFiles(managedDb, "*.blob").Order(StringComparer.Ordinal).First();
+        byte[] bytes = File.ReadAllBytes(victim);
+        bytes[bytes.Length / 2] ^= 0x5A;
+        File.WriteAllBytes(victim, bytes);
+        using (var db = RocksDbSharp.RocksDb.Open(nopts, managedDb))
+        {
+            StringAssert.Contains(NativeExtras.VerifyFileChecksums(db), "file checksum mismatch");
+        }
+    }
+
+    /// <summary>
     /// IngestExternalFileArg::atomic_replace_range (newer than the C API of the native package, which cannot request it):
     /// the DB the managed replacement leaves behind -- replaced files deleted in the MANIFEST, plus, with universal
     /// compaction and a partial overlap, a generated range-tombstone file below the new data -- opens and reads the same
