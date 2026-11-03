@@ -832,6 +832,56 @@ public sealed class DbCompactFilesTests
         Assert.AreEqual(1, Files(db, "default", 0).Count);
         Assert.AreEqual(S(Value(1, 0)), S(db.Get(Key(1))));
     }
+    /// <summary>
+    /// CompactFilesImpl: EnoughRoomForCompaction with an SstFileManager (CompactionTooLarge, COMPACTION_CANCELLED, the
+    /// reservation released) and the compaction_job_info output (BuildCompactionJobInfo).
+    /// </summary>
+    [TestMethod]
+    public async Task CompactFilesChecksRoomAndReturnsJobInfo()
+    {
+        MemoryFileSystem fs = NewFs();
+        using var sfm = new SstFileManager(fs, 0, 0.25, 64UL << 20);
+        var stats = new Statistics();
+        DbOptions o = NewOptions(fs);
+        o.SstFileManager = sfm;
+        o.Statistics = stats;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, ManualCf());
+        for (int round = 0; round < 3; round++)
+        {
+            for (int i = round; i < 300; i += 2) db.Put(Key(i), Value(i, round));
+            db.Flush();
+        }
+        List<LiveFileMetadata> l0 = Files(db, "default", 0);
+        ulong[] inputs = l0.ConvertAll(f => f.FileNumber).ToArray();
+        sfm.SetMaxAllowedSpaceUsage(1);
+        var ex = Assert.ThrowsExactly<RocksDbException>(() => db.DefaultColumnFamily.CompactFiles(new CompactFilesOptions(), inputs, 1, out _));
+        Assert.AreEqual(StatusCode.CompactionTooLarge, ex.Code);
+        Assert.AreEqual(1UL, stats.GetTickerCount(Ticker.CompactionCancelled));
+        Assert.AreEqual(3, Files(db, "default", 0).Count, "nothing compacted");
+        Assert.AreEqual(0UL, sfm.CompactionsReservedSize);
+
+        sfm.SetMaxAllowedSpaceUsage(0);
+        IReadOnlyList<string> outputs = db.DefaultColumnFamily.CompactFiles(new CompactFilesOptions(), inputs, 1, out CompactionJobInfo? info);
+        Assert.IsNotNull(info);
+        Assert.IsNull(info.Status);
+        Assert.AreEqual("default", info.ColumnFamilyName);
+        Assert.AreEqual(0, info.BaseInputLevel);
+        Assert.AreEqual(1, info.OutputLevel);
+        Assert.AreEqual(3, info.InputFiles.Count);
+        CollectionAssert.AreEquivalent(outputs.ToList(), info.OutputFiles.ToList());
+        Assert.AreEqual(CompactionReason.ManualCompaction, info.CompactionReason);
+        Assert.IsTrue(info.NumInputRecords >= 300 && info.NumOutputRecords == 300);
+        Assert.AreEqual(0UL, sfm.CompactionsReservedSize, "reservation released");
+
+        // Async, with a trivial move.
+        List<LiveFileMetadata> l1 = Files(db, "default", 1);
+        (IReadOnlyList<string> moved, CompactionJobInfo? moveInfo) = await db.DefaultColumnFamily.CompactFilesWithJobInfoAsync(
+            new CompactFilesOptions { AllowTrivialMove = true }, l1.ConvertAll(f => f.FileNumber), 3);
+        Assert.IsNotNull(moveInfo);
+        Assert.IsTrue(moveInfo.IsTrivialMove);
+        Assert.AreEqual(3, moveInfo.OutputLevel);
+        Assert.AreEqual(l1.Count, moved.Count);
+    }
 }
 
 /// <summary>Subcompactions (max_subcompactions; CompactionJob::GenSubcompactionBoundaries) on <see cref="MemoryFileSystem"/>.</summary>

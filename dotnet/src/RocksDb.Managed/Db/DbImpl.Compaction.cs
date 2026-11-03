@@ -887,6 +887,8 @@ internal sealed partial class DbImpl
         {
             if (jobId != 0)
             {
+                // CompactFilesImpl: BuildCompactionJobInfo for the caller's compaction_job_info.
+                if (c.BuildJobInfo) c.JobInfo = NewCompactionJobInfo(cfd, c, job, jobId, ok ? null : failure ?? new RocksDbException(StatusCode.Incomplete, "Incomplete"));
                 try
                 {
                     NotifyOnCompactionCompleted(cfd, c, job, jobId, ok ? null : failure ?? new RocksDbException(StatusCode.Incomplete, "Incomplete"));
@@ -1329,7 +1331,16 @@ internal sealed partial class DbImpl
     /// Aborted when a needed file is being compacted. Returns the full paths of the files added to the output level.
     /// </summary>
     public async ValueTask<List<string>> CompactFilesAsync(ColumnFamilyData cfd, CompactFilesOptions options, IEnumerable<ulong> inputFileNumbers,
-        int outputLevel, bool synchronous, CancellationToken cancellationToken)
+        int outputLevel, bool synchronous, CancellationToken cancellationToken) =>
+        (await CompactFilesWithJobInfoAsync(cfd, options, inputFileNumbers, outputLevel, synchronous, cancellationToken).ConfigureAwait(false)).OutputFiles;
+
+    /// <summary>
+    /// <see cref="CompactFilesAsync"/> also returning the job's CompactionJobInfo (the compaction_job_info output of
+    /// DB::CompactFiles, BuildCompactionJobInfo). With an SstFileManager, the compaction is refused with
+    /// CompactionTooLarge (COMPACTION_CANCELLED) when there is not enough room for it (EnoughRoomForCompaction).
+    /// </summary>
+    public async ValueTask<(List<string> OutputFiles, CompactionJobInfo? JobInfo)> CompactFilesWithJobInfoAsync(ColumnFamilyData cfd,
+        CompactFilesOptions options, IEnumerable<ulong> inputFileNumbers, int outputLevel, bool synchronous, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(inputFileNumbers);
@@ -1368,8 +1379,34 @@ internal sealed partial class DbImpl
                     throw new RocksDbException(StatusCode.Aborted, "Operation aborted: Some of the necessary compaction input files are already being compacted");
                 }
             }
-            c = picker.PickCompactionForCompactFiles(vstorage, inputs, outputLevel, (uint)outputPathId, options.OutputFileSizeLimit, options.Compression,
-                options.OutputTemperatureOverride, options.MaxSubcompactions, options.AllowTrivialMove);
+            // First check if we have enough room to do the compaction (EnoughRoomForCompaction with the input files).
+            ulong reservedRoom = 0;
+            if (Options.SstFileManager is { } sfm)
+            {
+                foreach (CompactionInputFiles input in inputs)
+                {
+                    foreach (FileMetaData f in input.Files) reservedRoom += f.FileSize;
+                }
+                if (!sfm.EnoughRoomForCompaction(reservedRoom, DbPaths[0], ErrorHandler.BgError))
+                {
+                    Stats?.RecordTick(Ticker.CompactionCancelled);
+                    LogWarn("[" + cfd.Name + "] Cancelled compaction because not enough room");
+                    throw new RocksDbException(StatusCode.CompactionTooLarge, "Compaction too large");
+                }
+            }
+            try
+            {
+                c = picker.PickCompactionForCompactFiles(vstorage, inputs, outputLevel, (uint)outputPathId, options.OutputFileSizeLimit, options.Compression,
+                    options.OutputTemperatureOverride, options.MaxSubcompactions, options.AllowTrivialMove);
+            }
+            catch
+            {
+                if (Options.SstFileManager is { } reserved) reserved.OnCompactionCompletion(reservedRoom);
+                throw;
+            }
+            // Released by the job (SstFileManagerImpl::OnCompactionCompletion).
+            if (Options.SstFileManager is not null) _sfmReservedCompactions[c] = reservedRoom;
+            c.BuildJobInfo = true;
             c.InputVersion = cfd.Current;
             cfd.Current.Ref();
             snapshots = SnapshotsForCompaction();
@@ -1392,7 +1429,7 @@ internal sealed partial class DbImpl
         {
             foreach (FileMetaData f in files) names.Add(FileNames.TableFileName(DbPaths, f.FileNumber, f.PathId));
         }
-        return names;
+        return (names, c.JobInfo);
     }
 
     /// <summary>Port of DBImpl::FindMinimumEmptyLevelFitting. REQUIRES: mutex.</summary>

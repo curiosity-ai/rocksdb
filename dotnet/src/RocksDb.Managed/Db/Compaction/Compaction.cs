@@ -288,6 +288,12 @@ internal sealed class Compaction
     public uint MaxSubcompactions { get; set; }
     /// <summary>The files the compaction added to the LSM (outputs or trivially moved files), set once it is installed.</summary>
     public List<FileMetaData>? InstalledFiles { get; set; }
+
+    /// <summary>CompactFiles with a compaction_job_info output: the job builds <see cref="JobInfo"/> when it finishes.</summary>
+    internal bool BuildJobInfo { get; set; }
+
+    /// <summary>The CompactionJobInfo of the finished job (BuildCompactionJobInfo) when <see cref="BuildJobInfo"/>.</summary>
+    internal CompactionJobInfo? JobInfo { get; set; }
     /// <summary>
     /// False when the picker disabled compression of the outputs (universal compression_size_percent: the output holds
     /// newer data than the compressed share). <see cref="OutputCompression"/> is then <c>None</c>.
