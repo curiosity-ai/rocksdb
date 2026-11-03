@@ -218,11 +218,11 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [x] two_write_queues (second WAL-only write queue, published vs allocated seqno) + commit-time write batches, all policies; compat vs native both ways
   - [x] steady-state transactions allocate only what the equivalent WriteBatch does (557 B for 4 puts, was 717-1517 B)
   - [ ] flaky under load? `WriteSlowdownDelaysWrites`, `AutoFlushPreservesGenerationOrderAndOldestBlobFile` (failed once in a loaded full run)
-  - [ ] range locks (L); public WAL termination point (S)
+  - [x] range locks (RangeLockManager, escalation, deadlock detection; range_locking_test ported); WAL termination point
 - Wide columns / blob
   - [x] compaction filters on entities (FilterV4 + lazy WideColumnBlobResolver), MultiGetEntity, attribute groups (Put/Get/MultiGet), coalescing + attribute-group iterators, lazy entity reads (GetEntityLazy/MultiGetEntityLazy, ranged blob column reads); compat-tested vs native
   - [x] WBWI MultiGetFromBatchAndDB; backup exclude_files_callback + parallel copies
-  - [ ] WBWI GetEntityFromBatchAndDB / MultiGetEntityFromBatchAndDB, txn entity APIs (S/M); lazy MultiResolve (S)
+  - [x] WBWI GetEntityFromBatchAndDB / MultiGetEntityFromBatchAndDB, transaction entity APIs + cross-CF iterators, lazy MultiResolve
 - Table format / options / API
   - [x] hash index (kHashSearch) read+write, separated key/value data blocks, uniform index hint, block_align, super_block_alignment (byte-identical vs native SstFileWriter)
   - [x] user table-properties collectors (+ CompactOnDeletionCollector, NeedCompact), memtable prefix bloom, insert hints, in-place updates (+ callback)

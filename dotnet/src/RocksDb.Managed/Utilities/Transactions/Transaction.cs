@@ -27,7 +27,7 @@ namespace RocksDb.Managed.Utilities.Transactions;
 /// Not thread-safe: use a transaction from one logical flow at a time. Dispose it when done (an uncommitted
 /// transaction releases its locks; a prepared one stays prepared in the WAL).
 /// </summary>
-public abstract class Transaction : IDisposable
+public abstract partial class Transaction : IDisposable
 {
     private protected readonly RocksDatabase _database;
     private protected readonly DbImpl _db;
@@ -425,6 +425,35 @@ public abstract class Transaction : IDisposable
             ObjectPools.ReturnWriter(w);
         }
     }
+
+    // ---- range locks ----------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Locks the range [<paramref name="start"/>, <paramref name="end"/>] of <paramref name="columnFamily"/> (null =
+    /// default) exclusively until the transaction ends (Transaction::GetRangeLock). Only a pessimistic transaction of a
+    /// <see cref="TransactionDatabase"/> opened with a <see cref="TransactionDbOptions.RangeLockManager"/> supports it
+    /// (NotSupported otherwise). A conflicting lock of another transaction is waited for up to the lock timeout
+    /// (TimedOut / LockTimeout); a wait that would close a cycle fails with Busy / Deadlock. Writes and GetForUpdate of
+    /// keys inside a range this transaction locked are granted at once. <paramref name="start"/> must not be greater
+    /// than <paramref name="end"/>.
+    /// </summary>
+    public void GetRangeLock(ColumnFamily? columnFamily, RangeLockEndpoint start, RangeLockEndpoint end)
+    {
+        ThrowIfDisposed();
+        ThrowIfError(WaitSync(TryRangeLock(Cfd(columnFamily), start, end, synchronous: true, CancellationToken.None)));
+    }
+
+    /// <summary>Async <see cref="GetRangeLock(ColumnFamily?, RangeLockEndpoint, RangeLockEndpoint)"/>: lock waits do not block a thread.</summary>
+    public async ValueTask GetRangeLockAsync(ColumnFamily? columnFamily, RangeLockEndpoint start, RangeLockEndpoint end, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        ThrowIfError(await TryRangeLock(Cfd(columnFamily), start, end, synchronous: false, cancellationToken).ConfigureAwait(false));
+    }
+
+    /// <summary>Range lock (PessimisticTransaction::GetRangeLock); NotSupported by default.</summary>
+    private protected virtual ValueTask<RocksDbException?> TryRangeLock(ColumnFamilyData cfd, RangeLockEndpoint start, RangeLockEndpoint end, bool synchronous,
+        CancellationToken cancellationToken) =>
+        new(new RocksDbException(StatusCode.NotSupported, "Not implemented"));
 
     /// <summary>
     /// Undoes one <see cref="TryGetForUpdate(ReadOptions?, ReadOnlySpan{byte}, IBufferWriter{byte})"/> of the key

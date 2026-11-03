@@ -45,7 +45,7 @@ internal sealed class LazyReadPin(DbImpl db, SuperVersion sv)
 /// column and copies the range out of it.
 /// </para>
 /// </summary>
-public sealed class LazyWideColumns : IDisposable
+public sealed partial class LazyWideColumns : IDisposable
 {
     private enum ColumnKind : byte { Inline, BlobFile, InlinedBlob }
 
@@ -397,7 +397,7 @@ public sealed class LazyWideColumns : IDisposable
 /// version and sequence number, which the batch keeps referenced until it is reset or disposed (its entries are valid
 /// only that long). Reusable; not thread-safe.
 /// </summary>
-public sealed class LazyWideColumnsBatch : IDisposable
+public sealed partial class LazyWideColumnsBatch : IDisposable
 {
     private readonly List<LazyWideColumns> _entries = new();
     private MultiGetStatus[] _status = [];

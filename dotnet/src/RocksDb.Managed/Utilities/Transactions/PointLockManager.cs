@@ -17,7 +17,7 @@ namespace RocksDb.Managed.Utilities.Transactions;
 /// deadlock_detect_depth before waiting; detected cycles are recorded in a bounded buffer.</item>
 /// </list>
 /// </summary>
-internal sealed class PointLockManager
+internal sealed class PointLockManager : LockManager
 {
     private readonly TransactionDatabase _txnDb;
     private readonly int _numStripes;
@@ -124,7 +124,7 @@ internal sealed class PointLockManager
     private Stripe GetStripe(LockMap map, ReadOnlySpan<byte> key) => map.Stripes[ByteKeyComparer.Bucket(key, 0, map.Stripes.Length)];
 
     /// <summary>Lets the lock map of a dropped column family be collected (RemoveColumnFamily).</summary>
-    public void RemoveColumnFamily(uint cf) => _lockMaps.TryRemove(cf, out _);
+    public override void RemoveColumnFamily(uint cf) => _lockMaps.TryRemove(cf, out _);
 
     /// <summary>Monotonic clock in microseconds used for lock timeouts and expirations.</summary>
     public static long NowMicros() => (long)(Stopwatch.GetTimestamp() * (1_000_000.0 / Stopwatch.Frequency));
@@ -136,7 +136,7 @@ internal sealed class PointLockManager
     /// Completes with null on success, TimedOut(LockTimeout), Busy(Deadlock) or Aborted(LockLimit). The key is copied
     /// before any wait.
     /// </summary>
-    public ValueTask<RocksDbException?> TryLock(PessimisticTransaction txn, uint cf, ReadOnlySpan<byte> key, bool exclusive, bool synchronous,
+    public override ValueTask<RocksDbException?> TryLock(PessimisticTransaction txn, uint cf, ReadOnlySpan<byte> key, bool exclusive, bool synchronous,
         CancellationToken cancellationToken)
     {
         LockMap map = GetLockMap(cf);
@@ -282,7 +282,7 @@ internal sealed class PointLockManager
         // Lock not held. Check lock limit
         if (_maxNumLocks > 0 && Volatile.Read(ref map.LockedKeyCount) >= _maxNumLocks)
         {
-            return new RocksDbException(StatusCode.Busy, "Resource busy: Lock limit", StatusSubCode.LockLimit);
+            return new RocksDbException(StatusCode.Aborted, "Operation aborted: Lock limit", StatusSubCode.LockLimit);
         }
         stripe.Add(key, txnId, exclusive, txnExpiration);
         // Maintain lock count if there is a limit on the number of locks
@@ -320,7 +320,7 @@ internal sealed class PointLockManager
     // ---- UnLock ---------------------------------------------------------------------------------------------
 
     /// <summary>Releases <paramref name="txn"/>'s lock on one key and wakes the stripe's waiters (UnLock).</summary>
-    public void UnLock(PessimisticTransaction txn, uint cf, ReadOnlySpan<byte> key)
+    public override void UnLock(PessimisticTransaction txn, uint cf, ReadOnlySpan<byte> key)
     {
         if (!_lockMaps.TryGetValue(cf, out LockMap? map)) return; // Column Family must have been dropped.
         Stripe stripe = GetStripe(map, key);
@@ -342,7 +342,7 @@ internal sealed class PointLockManager
     }
 
     /// <summary>Releases all locks tracked by <paramref name="tracker"/>.</summary>
-    public void UnLock(PessimisticTransaction txn, LockTracker tracker)
+    public override void UnLock(PessimisticTransaction txn, LockTracker tracker)
     {
         for (int i = 0; i < tracker.ColumnFamilyCount; i++)
         {
@@ -350,6 +350,12 @@ internal sealed class PointLockManager
             foreach (PooledKey key in c.Keys.Keys) UnLock(txn, c.Cfd.Id, key.Span);
         }
     }
+
+    /// <inheritdoc/>
+    public override void UnLockAll(PessimisticTransaction txn, LockTracker tracked) => UnLock(txn, tracked);
+
+    /// <inheritdoc/>
+    public override bool IsRangeLockSupported => false;
 
     private void UnLockKey(ulong txnId, ReadOnlySpan<byte> key, Stripe stripe, LockMap map)
     {
@@ -464,7 +470,7 @@ internal sealed class PointLockManager
     }
 
     /// <summary>The most recent deadlocks, newest first (GetDeadlockInfoBuffer).</summary>
-    public List<DeadlockPath> GetDeadlockInfoBuffer()
+    public override List<DeadlockPath> GetDeadlockInfoBuffer()
     {
         lock (_waitLock)
         {
@@ -475,7 +481,7 @@ internal sealed class PointLockManager
     }
 
     /// <summary>Resizes the deadlock buffer (SetDeadlockInfoBufferSize).</summary>
-    public void Resize(int size)
+    public override void Resize(int size)
     {
         lock (_waitLock)
         {
@@ -485,7 +491,7 @@ internal sealed class PointLockManager
     }
 
     /// <summary>Snapshot of all held locks (GetPointLockStatus).</summary>
-    public List<KeyLockInfo> GetLockStatusData()
+    public override List<KeyLockInfo> GetLockStatusData()
     {
         var result = new List<KeyLockInfo>();
         foreach (KeyValuePair<uint, LockMap> kv in _lockMaps)

@@ -40,7 +40,19 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     {
         _db = db;
         _options = options;
-        LockManager = new PointLockManager(this, options);
+        if (options.RangeLockManager is { } rangeLocks)
+        {
+            if (options.WritePolicy == TransactionWritePolicy.WriteUnprepared)
+            {
+                throw new RocksDbException(StatusCode.NotSupported, "Not implemented: range locking with the WriteUnprepared write policy");
+            }
+            rangeLocks.Attach(this);
+            LockManager = rangeLocks.Impl;
+        }
+        else
+        {
+            LockManager = new PointLockManager(this, options);
+        }
         if (options.WritePolicy != TransactionWritePolicy.WriteCommitted) _wpDb = new WritePreparedTxnDb(db.Impl, this, options);
     }
 
@@ -61,7 +73,10 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     /// <summary>The options this database was opened with.</summary>
     public TransactionDbOptions Options => _options;
 
-    internal PointLockManager LockManager { get; }
+    internal LockManager LockManager { get; }
+
+    /// <summary>True when the database was opened with a <see cref="TransactionDbOptions.RangeLockManager"/>.</summary>
+    public bool IsRangeLocking => LockManager.IsRangeLockSupported;
 
     // =====================================================================================================
     // Open
@@ -494,7 +509,15 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     // Close
     // =====================================================================================================
 
-    public void Dispose() => _db.Dispose();
+    public void Dispose()
+    {
+        _db.Dispose();
+        _options.RangeLockManager?.Detach(this);
+    }
 
-    public ValueTask DisposeAsync() => _db.DisposeAsync();
+    public async ValueTask DisposeAsync()
+    {
+        await _db.DisposeAsync().ConfigureAwait(false);
+        _options.RangeLockManager?.Detach(this);
+    }
 }
