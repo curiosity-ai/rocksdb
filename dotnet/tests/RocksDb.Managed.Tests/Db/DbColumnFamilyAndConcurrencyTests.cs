@@ -104,20 +104,6 @@ public sealed class DbColumnFamilyAndConcurrencyTests
     [DataRow(true, false, true)]
     public async Task ConcurrentWritersSyncAndAsync(bool concurrentMemtableWrite, bool adaptiveYield, bool pipelined)
     {
-        // Single-key writes form groups below the parallel threshold: force the parallel inserts to exercise them.
-        TestHooks.ForceParallelMemtableWrites = concurrentMemtableWrite;
-        try
-        {
-            await ConcurrentWritersSyncAndAsyncCore(concurrentMemtableWrite, adaptiveYield, pipelined);
-        }
-        finally
-        {
-            TestHooks.ForceParallelMemtableWrites = false;
-        }
-    }
-
-    private static async Task ConcurrentWritersSyncAndAsyncCore(bool concurrentMemtableWrite, bool adaptiveYield, bool pipelined)
-    {
         MemoryFileSystem fs = NewFs();
         var cfo = new ColumnFamilyOptions { WriteBufferSize = 256 * 1024, ArenaBlockSize = 16 * 1024, MaxWriteBufferNumber = 3 };
         const int threads = 8;
@@ -191,10 +177,8 @@ public sealed class DbColumnFamilyAndConcurrencyTests
     {
         MemoryFileSystem fs = NewFs();
         const int threads = 6, perThread = 300;
-        TestHooks.ForceParallelMemtableWrites = true;
         DbOptions options = NewOptions(fs);
         options.EnablePipelinedWrite = pipelined;
-        try
         {
             await using (RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, options))
             {
@@ -226,10 +210,6 @@ public sealed class DbColumnFamilyAndConcurrencyTests
                 }
                 Assert.AreEqual((ulong)(threads * perThread * 2), db.GetLatestSequenceNumber());
             }
-        }
-        finally
-        {
-            TestHooks.ForceParallelMemtableWrites = false;
         }
         using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs)))
         {
@@ -385,6 +365,94 @@ public sealed class DbColumnFamilyAndConcurrencyTests
         {
             release.Set();
             TestHooks.Set("DBImpl::PipelinedWriteImpl:MemTableWriterLeader", null);
+        }
+    }
+
+    /// <summary>
+    /// Transactions over pipelined writes: optimistic transactions (whose conflict-check callback disallows batching, so
+    /// their WAL leader first drains the memtable stage) increment shared counters from several threads without lost
+    /// updates, and pessimistic 2PC transactions (WAL-only prepares, which skip the memtable stage, then commits) are
+    /// visible after commit and recovered after reopen.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public void PipelinedWritesWithTransactions()
+    {
+        MemoryFileSystem fs = NewFs();
+        DbOptions options = NewOptions(fs);
+        options.EnablePipelinedWrite = true;
+        const int threads = 4, perThread = 150, counters = 3;
+        using (var odb = Utilities.Transactions.OptimisticTransactionDatabase.Open(DbPath, options))
+        {
+            for (int c = 0; c < counters; c++) odb.Database.Put(B("c" + c), B("0"));
+            var tasks = new Task[threads];
+            for (int t = 0; t < threads; t++)
+            {
+                int id = t;
+                tasks[t] = Task.Factory.StartNew(() =>
+                {
+                    for (int i = 0; i < perThread; i++)
+                    {
+                        string key = "c" + ((id + i) % counters);
+                        while (true)
+                        {
+                            using Utilities.Transactions.Transaction txn = odb.BeginTransaction(new WriteOptions());
+                            int v = int.Parse(S(txn.GetForUpdate(B(key)))!, System.Globalization.CultureInfo.InvariantCulture);
+                            txn.Put(B(key), B((v + 1).ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                            odb.Database.Put(B("plain" + id + "-" + i), B("x")); // concurrent plain writes in the pipeline
+                            try
+                            {
+                                txn.Commit();
+                                break;
+                            }
+                            catch (RocksDbException e) when (e.Code is StatusCode.Busy or StatusCode.TryAgain)
+                            {
+                            }
+                        }
+                    }
+                }, TaskCreationOptions.LongRunning);
+            }
+            Task.WaitAll(tasks);
+            int sum = 0;
+            for (int c = 0; c < counters; c++) sum += int.Parse(S(odb.Database.Get(B("c" + c)))!, System.Globalization.CultureInfo.InvariantCulture);
+            Assert.AreEqual(threads * perThread, sum);
+        }
+
+        fs = NewFs();
+        options = NewOptions(fs);
+        options.EnablePipelinedWrite = true;
+        using (var tdb = Utilities.Transactions.TransactionDatabase.Open(DbPath, options))
+        {
+            var tasks = new Task[threads];
+            for (int t = 0; t < threads; t++)
+            {
+                int id = t;
+                tasks[t] = Task.Factory.StartNew(() =>
+                {
+                    for (int i = 0; i < 40; i++)
+                    {
+                        using Utilities.Transactions.Transaction txn = tdb.BeginTransaction(new WriteOptions { Sync = i % 10 == 0 });
+                        txn.SetName("x" + id + "-" + i);
+                        txn.Put(B("t" + id + "-" + i), Value(i, id));
+                        txn.Prepare();
+                        if (i % 5 == 4) txn.Rollback();
+                        else txn.Commit();
+                    }
+                }, TaskCreationOptions.LongRunning);
+            }
+            Task.WaitAll(tasks);
+        }
+        using (var tdb = Utilities.Transactions.TransactionDatabase.Open(DbPath, options))
+        {
+            for (int t = 0; t < threads; t++)
+            {
+                for (int i = 0; i < 40; i++)
+                {
+                    byte[]? v = tdb.Database.Get(B("t" + t + "-" + i));
+                    if (i % 5 == 4) Assert.IsNull(v);
+                    else CollectionAssert.AreEqual(Value(i, t), v);
+                }
+            }
         }
     }
 

@@ -636,24 +636,14 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
-    /// Smallest number of entries in a group for which its memtable inserts run in parallel. Deviation from upstream
-    /// (which goes parallel for any group of two or more writers): waking the followers for their inserts and counting
-    /// them down adds two hand-offs per writer, which costs more than inserting a few keys serially (4 writer threads,
-    /// single-key writes: fillrandom 8.5 vs 6.0 µs/op, overwrite 10.3 vs 7.5 µs/op; 16-key batches: neutral, see
-    /// docs/perf.md). Scheduling only: what is written is the same either way.
-    /// </summary>
-    internal const int MinParallelMemtableGroupEntries = 64;
-
-    /// <summary>
     /// Whether the group's memtable inserts run in parallel (DBImpl::WriteImpl: allow_concurrent_memtable_write, more
-    /// than one writer, no merge operands, and here at least <see cref="MinParallelMemtableGroupEntries"/> entries).
-    /// Transaction writes (callbacks, separate memtable batches, prepared sections, sequence-per-batch), excluded writers
-    /// and blob direct write rewrites keep the serial path.
+    /// than one writer, no merge operands; like upstream, for groups of any size). Transaction writes (callbacks, separate
+    /// memtable batches, prepared sections, sequence-per-batch), excluded writers and blob direct write rewrites keep the
+    /// serial path.
     /// </summary>
     private bool CanInsertInParallel(List<WriteThread.Writer> group, int valid, ulong total)
     {
         if (!_allowConcurrentMemtableWrite || group.Count < 2 || valid != group.Count || _seqPerBatch || _bdwSwapped.Count > 0) return false;
-        if (total < (ulong)MinParallelMemtableGroupEntries && !TestHooks.ForceParallelMemtableWrites) return false;
         for (int i = 0; i < group.Count; i++)
         {
             WriteThread.Writer w = group[i];
