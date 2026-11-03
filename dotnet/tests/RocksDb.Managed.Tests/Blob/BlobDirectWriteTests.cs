@@ -334,6 +334,10 @@ public sealed class BlobDirectWriteTests
         ColumnFamilyOptions cf = DirectWriteCf(32);
         cf.WriteBufferSize = 64 << 10;
         cf.MaxWriteBufferNumber = 6;
+        // As upstream's test: no automatic compactions. With the default L0 trigger (4) the ~6 flushes start an L0
+        // compaction whose input set depends on when its thread runs relative to the next flushes (a late start takes
+        // the 5th flush too and leaves a single L0 table), so the L0 table count was timing dependent.
+        cf.DisableAutoCompactions = true;
         using RocksDatabase db = Open(fs, cf);
         for (int i = 0; i < 2000; i++)
         {
