@@ -294,8 +294,22 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         _commitEntry.Set(_unprepSeqs, rollbackBatchCnt);
         _writeContext.Reset();
         _writeContext.BatchCount = rollbackBatchCnt;
-        // Note: the rollback batch does not need AddPrepared since it is written to DB in one shot.
-        _writeContext.PreRelease = doOneWrite ? _commitEntry : null;
+        if (doOneWrite)
+        {
+            // The rollback batch does not need AddPrepared since it is written to DB in one shot.
+            _writeContext.PreRelease = _commitEntry;
+        }
+        else
+        {
+            // Deviation from upstream (which passes no callback here): with two write queues the rollback batch is
+            // committed by the 2nd write, so until then it is uncommitted data like the unprepared batches it cancels
+            // and must be in the prepared heap, as WritePreparedTxn::RollbackInternal does for its rollback batch.
+            // Otherwise once max_evicted_seq passes it, readers and compactions take it as committed while the
+            // rolled back batches are not: snapshots see half of the rollback, and a compaction keeps an older
+            // version below the "committed" rollback value and zeroes both sequence numbers.
+            _addPreparedU.Set(rollbackBatchCnt, firstPrepareBatch: false);
+            _writeContext.PreRelease = _addPreparedU;
+        }
         ulong prepareSeq;
         try
         {
@@ -312,6 +326,7 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
             // Populate unprep_seqs_ with rollback_batch_cnt, since we treat data in the rollback write batch as just
             // another "unprepared" batch; the 2nd write commits them all and publishes the commit sequence.
             _unprepSeqs[prepareSeq] = rollbackBatchCnt;
+            TestHooks.Invoke("WriteUnpreparedTxn::RollbackInternal:BeforeCommit");
             _commitEntry.Set(_unprepSeqs, 0);
             ValueTask c = WriteCommitOnlyAsync(_writeOptions, EmptyBatch(forWal: true), _commitEntry, synchronous, cancellationToken);
             if (!c.IsCompletedSuccessfully) await c.ConfigureAwait(false);
