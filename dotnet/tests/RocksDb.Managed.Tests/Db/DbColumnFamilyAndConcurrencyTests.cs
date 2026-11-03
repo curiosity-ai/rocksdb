@@ -625,4 +625,132 @@ public sealed class DbColumnFamilyAndConcurrencyTests
         db.SetDBOptions([new("max_open_files", "25")]);
         Assert.AreEqual(20, store.Count); // excess unreferenced readers closed right away (minimum capacity 20)
     }
+
+    // ---- WriteOptions.MemtableInsertParallelism (one large batch inserted in parallel ranges) ----
+
+    private const string ParallelRangeHook = "DBImpl::InsertBatchInParallel:Range";
+
+    /// <summary>
+    /// A large batch mixing Put / Delete / SingleDelete / DeleteRange / PutEntity / LogData over two column families, with
+    /// keys overwritten and deleted across range boundaries.
+    /// </summary>
+    private static void FillMixedBatch(WriteBatch b, ColumnFamily users, int n)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            string k = "k" + (i * 7919 % n).ToString("D6");
+            b.Put(B(k), B("v" + i));
+            if (i % 10 == 3) b.Put(users.Id, B(k), B("u" + i));
+            if (i % 97 == 0) b.PutLogData(B("log" + i));
+        }
+        // Later records override earlier ones in other ranges: the higher sequence number must win.
+        b.Put(B("k000001"), B("overwritten"));
+        b.Delete(B("k000002"));
+        b.SingleDelete(B("k000003"));
+        b.DeleteRange(B("k000100"), B("k000200"));
+        b.PutEntity(B("k000004"), [new WideColumn(B("c1"), B("e1"))]);
+        b.Delete(users.Id, B("k000013"));
+        b.Put(B("last"), B("x"));
+    }
+
+    private static List<string> Dump(Iterator it)
+    {
+        var rows = new List<string>();
+        for (it.SeekToFirst(); it.Valid; it.Next()) rows.Add(S(it.Key.ToArray()) + "=" + S(it.Value.ToArray()));
+        return rows;
+    }
+
+    [TestMethod]
+    [DataRow(2)]
+    [DataRow(4)]
+    [DataRow(64)]
+    public async Task MemtableInsertParallelismMatchesSerialInsert(int parallelism)
+    {
+        const int n = 3000;
+        var results = new List<(ulong Seq, List<string> Default, List<string> Users)>();
+        foreach (int p in new[] { 1, parallelism })
+        {
+            MemoryFileSystem fs = NewFs();
+            await using RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs));
+            ColumnFamily users = await db.CreateColumnFamilyAsync("users", new ColumnFamilyOptions());
+            db.Put(B("k000005"), B("before"));
+            ulong before = db.GetLatestSequenceNumber();
+            using Snapshot snap = db.GetSnapshot();
+            int ranges = 0;
+            bool sawBatch = false;
+            // Every range runs before the batch is published: readers see none of it.
+            TestHooks.Set(ParallelRangeHook, () =>
+            {
+                Interlocked.Increment(ref ranges);
+                if (db.GetLatestSequenceNumber() != before || db.Get(B("last")) is not null) sawBatch = true;
+            });
+            try
+            {
+                using WriteBatch b = db.CreateWriteBatch();
+                FillMixedBatch(b, users, n);
+                await db.WriteAsync(new WriteOptions { MemtableInsertParallelism = p }, b);
+            }
+            finally
+            {
+                TestHooks.Set(ParallelRangeHook, null);
+            }
+            Assert.IsFalse(sawBatch);
+#if DEBUG
+            if (p == 1) Assert.AreEqual(0, ranges);
+            else Assert.AreEqual(Math.Min(p, 16), ranges);
+#endif
+            Assert.AreEqual("before", GetString(db, "k000005", snap));
+            Assert.IsNull(GetString(db, "last", snap));
+            Assert.AreEqual("overwritten", GetString(db, "k000001"));
+            Assert.IsNull(GetString(db, "k000002"));
+            Assert.IsNull(GetString(db, "k000150"));
+            // The write after the batch continues at the next sequence number.
+            db.Put(B("after"), B("a"));
+            using Iterator it = db.NewIterator();
+            using Iterator uit = users.NewIterator();
+            results.Add((db.GetLatestSequenceNumber(), Dump(it), Dump(uit)));
+            await db.FlushAsync();
+            await users.FlushAsync();
+            using Iterator it2 = db.NewIterator();
+            CollectionAssert.AreEqual(results[^1].Default, Dump(it2));
+        }
+        Assert.AreEqual(results[0].Seq, results[1].Seq);
+        CollectionAssert.AreEqual(results[0].Default, results[1].Default);
+        CollectionAssert.AreEqual(results[0].Users, results[1].Users);
+    }
+
+    [TestMethod]
+    public async Task MemtableInsertParallelismFallsBackToSerialInsert()
+    {
+        MemoryFileSystem fs = NewFs();
+        var merge = new ColumnFamilyOptions { MergeOperator = new UInt64AddMergeOperator() };
+        DbOptions options = NewOptions(fs);
+        await using RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, options, merge);
+        int ranges = 0;
+        TestHooks.Set(ParallelRangeHook, () => Interlocked.Increment(ref ranges));
+        try
+        {
+            var wo = new WriteOptions { MemtableInsertParallelism = 4 };
+            // Merge operands keep the serial insert.
+            using (WriteBatch b = db.CreateWriteBatch())
+            {
+                for (int i = 0; i < 2000; i++) b.Merge(B("c" + (i % 10)), BitConverter.GetBytes(1UL));
+                await db.WriteAsync(wo, b);
+            }
+            Assert.AreEqual(200UL, BitConverter.ToUInt64(db.Get(B("c3"))!));
+            // Too small to split.
+            using (WriteBatch b = db.CreateWriteBatch())
+            {
+                for (int i = 0; i < 255; i++) b.Put(B("s" + i), B("v"));
+                await db.WriteAsync(wo, b);
+            }
+            Assert.AreEqual("v", GetString(db, "s254"));
+            Assert.AreEqual(0, ranges);
+        }
+        finally
+        {
+            TestHooks.Set(ParallelRangeHook, null);
+        }
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new WriteOptions { MemtableInsertParallelism = 0 });
+    }
 }

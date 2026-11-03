@@ -301,7 +301,7 @@ A separate runner for the replication layer (so the main benchmark project does 
 dotnet run -c Release --project bench/RocksDb.Managed.Replication.Benchmarks -f net10.0 -- all
 # WAL-stream throughput and primary -> replica lag (--rate 0 = as fast as possible, else total ops/s)
 dotnet run -c Release --project bench/RocksDb.Managed.Replication.Benchmarks -f net10.0 -- stream \
-    --transport both --num 200000 --batch 1 --value_size 100 --threads 4 --rate 0 --chunk_bytes 262144 --repeat 1
+    --transport both --num 200000 --batch 1 --value_size 100 --threads 4 --rate 0 --chunk_bytes 262144 --apply_parallelism 4 --repeat 1
 # planned switchover: writes held per handoff, client-visible gap
 dotnet run -c Release --project bench/RocksDb.Managed.Replication.Benchmarks -f net10.0 -- switchover \
     --transport both --handoffs 10 --writers 4 --interval_ms 300
@@ -313,6 +313,9 @@ over an in-memory channel transport (payloads copied) or MagicOnion/gRPC on loop
 the write's completion on the primary to the replica having applied its sequence number. Each measured run follows a
 full-size warm-up run on throwaway databases; the `JIT` column counts methods compiled during the measured run. At
 `--rate 0` the lag is dominated by queueing (the transport buffers up to 16 chunks); use a fixed `--rate` for the
-latency of an unsaturated stream. `switchover` runs a `PairNodeHost` pair with client writers that follow primary
+latency of an unsaturated stream. `--apply_parallelism` is the replica's `ReplicationConsumer.ApplyParallelism` (threads
+inserting one chunk into the memtable; default: processor count, at most 4; 1 = the serial insert of rocksdb-sharp's
+consumer); `apply busy %` is the share of the replica's run spent inside `TryIngestChunkAsync` (near 100 = the apply side
+is the bottleneck). `switchover` runs a `PairNodeHost` pair with client writers that follow primary
 hints and reports the first handoff of the process (cold promote path) separately from the rest. Results:
 `docs/benchmarks.md`, "Replication".

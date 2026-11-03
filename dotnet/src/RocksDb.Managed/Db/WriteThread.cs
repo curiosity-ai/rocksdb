@@ -138,6 +138,8 @@ internal sealed class WriteThread
         public bool NoSlowdown;
         public bool IgnoreMissingColumnFamilies;
         public bool IsSyncWaiter;
+        /// <summary>WriteOptions.MemtableInsertParallelism (see DbImpl.TryInsertBatchInParallel).</summary>
+        public int MemtableInsertParallelism;
         public Exception? Error;
         public Writer? Next;
         /// <summary>Pipelined writes: the next writer in the memtable writer queue.</summary>
@@ -156,6 +158,7 @@ internal sealed class WriteThread
             DisableWal = options?.DisableWal ?? false;
             NoSlowdown = options?.NoSlowdown ?? false;
             IgnoreMissingColumnFamilies = options?.IgnoreMissingColumnFamilies ?? false;
+            MemtableInsertParallelism = options?.MemtableInsertParallelism ?? 1;
             IsSyncWaiter = syncWaiter;
             Error = null;
             Next = null;

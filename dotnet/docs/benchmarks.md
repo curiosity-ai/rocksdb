@@ -342,11 +342,10 @@ load average rises from 1.1 to 3-5 during the runs because the benchmark itself 
   writer 114k -> 307k ops/s, gRPC 129k -> 354k) and the replica keeps up with them (same ops/s, catch-up of a few
   milliseconds). The unsaturated 20k ops/s stream has a median lag of 0.05 ms in process and 0.27 ms over gRPC, p99
   ~4 ms (loaded: 0.38 / 0.62 ms, p99 2-5 ms).
-- **With 100-entry batches at full speed the replica now falls behind**: the primary writes 480-560k ops/s (loaded:
-  179k in process, 312k over gRPC), the replica applies 75-80% of that (350-425k ops/s), and it needs 0.5-0.9 s to
-  catch up after the last write (loaded: 8-33 ms). The replica applies the stream's batches one by one through the
-  normal write path, so a primary whose writers group-commit 4 x 100 entries outruns it; this is throughput, not a
-  stall (the lag stays bounded by the stream's buffer of 16 x 256 KiB chunks).
+- **With 100-entry batches at full speed the replica fell behind** in this run: the primary writes 480-560k ops/s
+  (loaded: 179k in process, 312k over gRPC), the replica applied 75-80% of that (350-425k ops/s) and needed 0.5-0.9 s
+  to catch up after the last write (loaded: 8-33 ms). Fixed since by parallel memtable inserts on the replica, see the
+  next section.
 - Switchover, in process (`all`: 10 handoffs x 3 runs, plus 20 handoffs): writes held p50 4.6-6.1 ms in memory and
   4.8-5.6 ms over gRPC, max 6.5-11.2 ms, client gap p50 5-6 ms; the first handoff of a process 13-16 ms in memory
   and 7-11 ms over gRPC. That is the quiet-machine mode of the bimodal hold described below (5-7 ms), with no 30-40 ms
@@ -355,6 +354,47 @@ load average rises from 1.1 to 3-5 during the runs because the benchmark itself 
   runs): held 17.9-31.0 ms, median 27 ms over 8 handoffs, every run consistent (55-65k acknowledged writes on both
   nodes). Loaded: 35-133 ms, median ~85 ms. These are first promotes of their processes (cold paths), hence above the
   warm in-process hold.
+
+### Replica apply with parallel memtable inserts (2026-11-03, load average 4-6)
+
+**Why the replica fell behind.** The replica's apply loop was busy 95-98% of the run: it was CPU-bound, not waiting on
+the stream. The primary's 4 writers commit in write groups whose memtable inserts run in parallel
+(`allow_concurrent_memtable_write`), while the replica applies each merged chunk (the tailer merges up to 256 KiB, about
+2,400 entries of these batches) as one write inserted by one thread. 56% of the apply profile is
+`InlineSkipList.Insert` (random keys, cache-miss bound); decoding, the `SetContents` copy and the replica's WAL write
+are a few percent. Applied alone (recorded chunks, fresh replica) the serial insert peaks at 456-493k entries/s, below
+what the primary writes. Allocation is ~400 B per chunk (background flush), the same before and after.
+
+**Fix.** `ReplicationConsumer.ApplyParallelism` (default: processor count, at most 4) applies a chunk with
+`WriteOptions.MemtableInsertParallelism`: a batch of at least 256 entries is cut at record boundaries into up to that
+many ranges of at least 128 entries, inserted concurrently by the applying thread and thread-pool threads. The replica
+still writes one WAL record per chunk at the source's sequence numbers, chunks are applied one at a time in order, and
+the chunk becomes visible only after every range is in the memtable (the sequence is published last), so ordering,
+durability and atomicity are as before. Applied alone the chunks now go in at 701-774k entries/s with 2 threads and
+0.95-1.14M with 4, about twice the primary's rate.
+
+`bench/results/2026-11-03-replication-apply.md`, `stream --batch 100 --threads 4 --num 1000000`, 3 rounds alternating
+`--apply_parallelism 1` (the previous serial insert) and `4`, medians. Another agent was building and benchmarking at
+the same time (load average 4.4-6.2), hence the lower primary rates than above:
+
+| transport | apply threads | primary ops/s | replica ops/s | replica / primary | lag p50 ms | p99 | max | catch-up ms | apply busy % |
+|---|---|---|---|---|---|---|---|---|---|
+| in-memory | 1 | 439,811 | 419,525 | 89-96% | 54.48 | 125.39 | 135.5 | 109.9 | 98 |
+| in-memory | 4 | 397,937 | 388,788 | 98% | 7.09 | 53.90 | 55.1 | 50.0 | 93 |
+| gRPC loopback | 1 | 470,600 | 395,475 | 77-89% | 207.16 | 416.93 | 421.5 | 403.7 | 96 |
+| gRPC loopback | 4 | 387,346 | 383,926 | 98-99% | 8.00 | 63.78 | 66.7 | 42.5 | 89 |
+
+- The replica now keeps up with the primary at full speed: lag p50 5-8 ms instead of 39-268 ms, max under 75 ms,
+  catch-up after the last write 23-68 ms instead of 0.1-0.6 s (0.5-0.9 s on the quiet machine above). The replica rate
+  is 98-99% of the primary's over the run; the remainder is the catch-up itself, which is included in the replica's
+  time.
+- The remaining lag is CPU contention of this single-process benchmark: primary writers, flushes, the tailer and the
+  apply threads share 4 vCPUs (with another agent's load), so the apply stays busy ~90%. The apply side has about 2x
+  the headroom when it has its own cores, as a replica on another machine has.
+- Chunks are smaller (2,000-2,600 instead of 420-1,160 per million entries) because the tailer merges only what
+  accumulated while the replica was busy; a replica that falls behind gets bigger chunks and so more parallelism.
+- The other configurations are unchanged (`all` in the results file): single-entry writes and the 20k ops/s stream
+  keep up with millisecond catch-up; their chunks are mostly too small to split.
 
 ### WAL stream: throughput and primary -> replica lag (2026-11-02, load average 15-25)
 

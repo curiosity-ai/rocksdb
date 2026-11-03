@@ -65,6 +65,7 @@ public sealed class WriteOptions
 {
     private bool _sync, _disableWal, _ignoreMissingColumnFamilies, _noSlowdown, _lowPri, _memtableInsertHintPerBatch;
     private ulong _protectionBytesPerKey;
+    private int _memtableInsertParallelism = 1;
     private readonly bool _readOnly;
 
     public WriteOptions()
@@ -97,6 +98,28 @@ public sealed class WriteOptions
     public bool LowPri { get => _lowPri; set => _lowPri = Settable(value); }
     public bool MemtableInsertHintPerBatch { get => _memtableInsertHintPerBatch; set => _memtableInsertHintPerBatch = Settable(value); }
     public ulong ProtectionBytesPerKey { get => _protectionBytesPerKey; set => _protectionBytesPerKey = Settable(value); }
+
+    /// <summary>
+    /// Managed extension (no upstream counterpart): the most threads that insert this write's batch into the memtable.
+    /// Default 1, the upstream behaviour (one thread per batch). With a larger value a batch of at least 256 entries is
+    /// cut at record boundaries into up to this many ranges of at least 128 entries, inserted concurrently by the
+    /// writing thread and thread-pool threads. Sequence numbers, the WAL record and visibility are unchanged: readers
+    /// see the whole batch only once every range is in the memtable. Useful for very large batches on a write path that
+    /// has spare cores, e.g. a replica applying its primary's merged WAL batches.
+    /// <para>The insert stays serial when <see cref="DbOptions.AllowConcurrentMemtableWrite"/> is off, with pipelined or
+    /// unordered writes, transaction writes, per-key protection, blob direct write, a batch holding merge operands,
+    /// blob indexes, timed puts or 2PC markers, and when the write is committed in one group with other writers (the
+    /// writers of a group already insert their batches in parallel).</para>
+    /// </summary>
+    public int MemtableInsertParallelism
+    {
+        get => _memtableInsertParallelism;
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(value, 1);
+            _memtableInsertParallelism = Settable(value);
+        }
+    }
 
     private T Settable<T>(T value)
     {

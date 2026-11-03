@@ -12,7 +12,11 @@ namespace RocksDb.Managed.Replication;
 /// </summary>
 public sealed class ReplicationConsumer
 {
+    /// <summary>The default <see cref="ApplyParallelism"/>: the processor count, at most 4.</summary>
+    public static int DefaultApplyParallelism => Math.Clamp(Environment.ProcessorCount, 1, 4);
+
     private readonly RocksDatabase _db;
+    private readonly WriteOptions _writeOptions = new() { MemtableInsertParallelism = DefaultApplyParallelism };
 
     public ReplicationConsumer(RocksDatabase db)
     {
@@ -21,6 +25,19 @@ public sealed class ReplicationConsumer
     }
 
     public RocksDatabase Database => _db;
+
+    /// <summary>
+    /// How many threads insert one applied chunk into the replica's memtable
+    /// (<see cref="WriteOptions.MemtableInsertParallelism"/>; default <see cref="DefaultApplyParallelism"/>). The primary's
+    /// concurrent writers insert their batches in parallel; a replica applies the merged chunk as one write, so a serial
+    /// insert caps it below a primary with several writers. 1 restores the serial insert. Chunks are still applied one at
+    /// a time, in order, each as one atomic write at the source's sequence numbers. Set it before applying.
+    /// </summary>
+    public int ApplyParallelism
+    {
+        get => _writeOptions.MemtableInsertParallelism;
+        set => _writeOptions.MemtableInsertParallelism = value;
+    }
 
     /// <summary>The sequence number the next applied batch must start with (latest + 1).</summary>
     public ulong ExpectedNextSequence => _db.GetLatestSequenceNumber() + 1;
@@ -32,7 +49,7 @@ public sealed class ReplicationConsumer
         try
         {
             batch.SetContents(chunk.Span);
-            await _db.WriteAsync(batch, cancellationToken).ConfigureAwait(false);
+            await _db.WriteAsync(_writeOptions, batch, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -45,7 +62,7 @@ public sealed class ReplicationConsumer
     {
         using WriteBatch batch = WriteBatch.Rent();
         batch.SetContents(chunk);
-        _db.Write(batch);
+        _db.Write(_writeOptions, batch);
     }
 
     public ValueTask IngestBatchAsync(WalBatch batch, CancellationToken cancellationToken) => IngestChunkAsync(batch.Data, cancellationToken);

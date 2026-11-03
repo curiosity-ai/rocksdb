@@ -2,11 +2,13 @@
 //
 //   dotnet run -c Release --project bench/RocksDb.Managed.Replication.Benchmarks -f net10.0 -- all
 //   ... -- stream --transport inmem|grpc|both --num 200000 --batch 1 --value_size 100 --threads 4 --rate 0 --chunk_bytes 262144
+//                 --apply_parallelism 4 (ReplicationConsumer.ApplyParallelism; 1 = serial memtable insert)
 //   ... -- switchover --transport inmem|grpc|both --handoffs 10 --writers 4 --interval_ms 300
 //
 // Every measured run is preceded by a warm-up run of the same scenario (fresh databases), so the measured numbers are
 // for tiered-up code; the "JIT" column counts methods compiled during the measured run (should be ~0).
 using System.Globalization;
+using RocksDb.Managed.Replication;
 using RocksDb.Managed.Replication.Benchmarks;
 
 string mode = args.Length > 0 ? args[0] : "all";
@@ -25,7 +27,7 @@ switch (mode)
         foreach (string t in Transports())
         {
             configs.Add(new StreamConfig(t, Int("num", 200_000), Int("batch", 1), Int("value_size", 100), Int("threads", 4), Int("rate", 0),
-                Int("chunk_bytes", 256 * 1024)));
+                Int("chunk_bytes", 256 * 1024), Int("apply_parallelism", ReplicationConsumer.DefaultApplyParallelism)));
         }
         await RunStreamsAsync(configs, Int("repeat", 1));
         break;
@@ -42,10 +44,10 @@ switch (mode)
         var configs = new List<StreamConfig>();
         foreach (string t in new[] { "inmem", "grpc" })
         {
-            configs.Add(new StreamConfig(t, 200_000, 1, 100, 1, 0, 256 * 1024));
-            configs.Add(new StreamConfig(t, 400_000, 1, 100, 4, 0, 256 * 1024));
-            configs.Add(new StreamConfig(t, 1_000_000, 100, 100, 4, 0, 256 * 1024));
-            configs.Add(new StreamConfig(t, 100_000, 1, 100, 4, 20_000, 256 * 1024));
+            configs.Add(new StreamConfig(t, 200_000, 1, 100, 1, 0, 256 * 1024, ReplicationConsumer.DefaultApplyParallelism));
+            configs.Add(new StreamConfig(t, 400_000, 1, 100, 4, 0, 256 * 1024, ReplicationConsumer.DefaultApplyParallelism));
+            configs.Add(new StreamConfig(t, 1_000_000, 100, 100, 4, 0, 256 * 1024, ReplicationConsumer.DefaultApplyParallelism));
+            configs.Add(new StreamConfig(t, 100_000, 1, 100, 4, 20_000, 256 * 1024, ReplicationConsumer.DefaultApplyParallelism));
         }
         await RunStreamsAsync(configs, Int("repeat", 1));
         await RunSwitchoversAsync([new SwitchoverConfig("inmem", 10, 4, 300), new SwitchoverConfig("grpc", 10, 4, 300)]);

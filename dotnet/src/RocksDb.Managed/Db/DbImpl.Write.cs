@@ -628,7 +628,8 @@ internal sealed partial class DbImpl
     /// <summary>The memtable inserts of a group by its leader (the serial part of DBImpl::WriteImpl), then publication.</summary>
     private void InsertGroupSerially(List<WriteThread.Writer> group, WriteThread.Writer leader, ulong total, ulong last, int walRecordBytes, bool needSync)
     {
-        InsertWritersSerially(group);
+        // A lone writer may ask for its (large) batch to be inserted in parallel ranges (DbImpl.SplitInsert.cs).
+        if (group.Count != 1 || !TryInsertBatchInParallel(group[0])) InsertWritersSerially(group);
         if (total > 0)
         {
             Versions.SetLastSequence(last);
@@ -1341,6 +1342,9 @@ internal sealed partial class DbImpl
 
         /// <summary>Iterates <paramref name="rep"/> into the memtables (WriteBatch::Iterate with this handler's option states).</summary>
         public void Run(ReadOnlySpan<byte> rep) => WriteBatch.Iterate(rep, ref this, _policy);
+
+        /// <summary>Iterates whole records of a batch (no header, no count check) into the memtables, from <see cref="Sequence"/> on.</summary>
+        public void RunRange(ReadOnlySpan<byte> records) => WriteBatch.IterateRecordRange(records, ref this, _policy);
 
         public readonly bool Continue() => true;
 
