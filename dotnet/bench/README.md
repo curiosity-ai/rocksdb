@@ -35,8 +35,14 @@ engine (knobs `COMPACTION_NUM`, `COMPACTION_ARGS`, `COMPACTION_BENCHMARKS`, ... 
 and #3, and `-vm-picker-compaction.md` after the compaction-picking parity fixes (`docs/perf.md`), all cold; with the
 warm-up: `-vm-warm-compaction.md` (alternated with cold runs: `-vm-cold-compaction.md`). Reduced matrix with the warm-up:
 `results/2026-11-02-vm-warm.md` (cold counterpart from the same session: `-vm-cold.md`). The current reference is
-`results/2026-11-02-final-warm-r5.md`: matrix + compaction-heavy configuration, 5 repetitions on a quiet machine
-(medians, CVs, bootstrap CIs), with the BenchmarkDotNet head-to-head reports in `results/2026-11-02-final-bdn.md`.
+`results/2026-11-03-final-warm-r5.md`: matrix + compaction-heavy configuration, 5 repetitions on a quiet machine
+(medians, CVs, bootstrap CIs; managed 0.78x, managed-async 0.78x, rocksdb-sharp 1.05x of C over the matrix), with
+extra rows (pipelined / unordered writes, subcompactions, reverse iteration, read-heavy) in
+`results/2026-11-03-final-extras-r3.md`, the BenchmarkDotNet head-to-head reports in `results/2026-11-03-final-bdn.md`,
+the replication runs in `results/2026-11-03-replication.md`, and an old-vs-new tree A/B in
+`results/2026-11-03-ab-0f866b8-vs-cfb30f9.csv`. They ran on a different VM CPU (2.10 GHz) than the previous final run
+`results/2026-11-02-final-warm-r5.md` / `-final-bdn.md` (2.80 GHz; managed 0.66x, rocksdb-sharp 1.03x), so compare
+ratios within one run (see docs/benchmarks.md, "Latest results").
 
 All engines run a **warm-up phase** before the measurement (default on, `WARMUP=false` for cold-process numbers; see
 "Warm-up" below), so the .NET engines are not measured while the JIT is still compiling and tiering up. Results before
@@ -291,7 +297,7 @@ measure managed internals (some against native counterparts); see `docs/perf.md`
 A separate runner for the replication layer (so the main benchmark project does not depend on MagicOnion):
 
 ```bash
-# the default suite: 8 stream configurations + switchover over both transports (~15 min on 4 vCPUs)
+# the default suite: 8 stream configurations + switchover over both transports (about 1 min on the quiet 4-vCPU VM)
 dotnet run -c Release --project bench/RocksDb.Managed.Replication.Benchmarks -f net10.0 -- all
 # WAL-stream throughput and primary -> replica lag (--rate 0 = as fast as possible, else total ops/s)
 dotnet run -c Release --project bench/RocksDb.Managed.Replication.Benchmarks -f net10.0 -- stream \

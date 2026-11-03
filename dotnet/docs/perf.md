@@ -1065,6 +1065,86 @@ workloads on fast storage can turn it off.
 fdatasync (the previous behaviour, like upstream's synchronous `Fsync` on the write thread); set
 `new LocalFileSystem { OffloadAsyncSync = true }` (or `dbbench --offload_async_sync true`) to opt in.
 
+## Final run on a new VM CPU (2026-11-03)
+
+`bench/results/2026-11-03-final-warm-r5.md` (06:11-07:31 UTC): the same matrix, sizes, engines and `REPEATS=5` as
+"Final three-way results" above, on `cfb30f9` (everything in this log after that run: super version cache, pinned
+table readers, AwaitState, parallel memtable inserts, reverse pinning, range-delete skipping, compaction readahead,
+subcompactions, the managed LZ4 encoder, read sampling, ...). Quiet VM (each repetition started at a 1-minute load
+average <= 1.5; 0.91-3.10 before the individual runs, median 1.52). **The VM came back with a different CPU**: "Intel
+Xeon Processor @ 2.10GHz" (family 6 model 207, AVX-512 + AMX) instead of "@ 2.80GHz".
+
+| configuration | rocksdb-sharp 11-02 | rocksdb-sharp 11-03 | managed 11-02 | managed 11-03 | managed-async 11-02 | managed-async 11-03 |
+|---|---:|---:|---:|---:|---:|---:|
+| 100 B, 1 thread, none | 1.06x | 1.08x [1.05-1.14] | 0.59x | 0.72x [0.70-0.76] | 0.64x | 0.73x [0.70-0.76] |
+| 100 B, 4 threads, none | 1.01x | 1.05x [0.99-1.11] | 0.78x | 0.77x [0.73-0.82] | 0.79x | 0.75x [0.71-0.80] |
+| 100 B, 1 thread, LZ4 | 1.11x | 1.07x [1.01-1.12] | 0.69x | 0.71x [0.67-0.75] | 0.76x | 0.74x [0.70-0.78] |
+| 100 B, 4 threads, LZ4 | 1.01x | 1.04x [0.99-1.12] | 0.83x | 0.76x [0.73-0.81] | 0.78x | 0.74x [0.71-0.80] |
+| 1 KiB, 1 thread, none | 1.04x | 1.05x [0.98-1.10] | 0.52x | 0.80x [0.76-0.85] | 0.55x | 0.81x [0.77-0.86] |
+| 1 KiB, 4 threads, none | 1.03x | 1.04x [0.96-1.13] | 0.63x | 0.84x [0.77-0.91] | 0.60x | 0.85x [0.78-0.92] |
+| 1 KiB, 1 thread, LZ4 | 0.99x | 1.03x [0.97-1.08] | 0.58x | 0.76x [0.72-0.81] | 0.64x | 0.76x [0.72-0.80] |
+| 1 KiB, 4 threads, LZ4 | 1.02x | 1.02x [0.96-1.07] | 0.70x | 0.89x [0.82-0.92] | 0.74x | 0.84x [0.79-0.87] |
+| all 8 matrix configurations | 1.03x | 1.05x [1.02-1.07] | 0.66x | 0.78x [0.76-0.80] | 0.68x | 0.78x [0.76-0.79] |
+| compaction-heavy | 1.07x | 1.05x [0.94-1.15] | 0.58x | 0.62x [0.53-0.66] | 0.69x | 0.65x [0.58-0.73] |
+
+**CPU or code?** Absolute medians, 11-03 / 11-02, geometric mean over all 116 cells: c-native 0.60x, rocksdb-sharp
+0.61x, managed 0.71x, managed-async 0.68x. Every engine is faster on the new CPU, native more so, most of all where
+the old VM's native times were I/O-bound (c-native `flush` 0.33x: 1 KiB flushes took 200-460 ms there, 39-56 ms
+now; `compact` 0.53x; `readmissing` 0.46x). To separate the two, managed at `0f866b8` (the tree of the 11-02 run,
+built from `git archive` in a scratch directory) and at `cfb30f9` ran interleaved with c-native on the new CPU, 3
+repetitions, warm-up on (`bench/results/2026-11-03-ab-0f866b8-vs-cfb30f9.csv`; labels `old-*` / `new-*`):
+
+| configuration (14 benchmarks; compaction-heavy 4) | old / C | new / C | new / old |
+|---|---:|---:|---:|
+| 100 B, 1 thread, none | 0.65x | 0.69x | 1.07x |
+| 1 KiB, 1 thread, none | 0.69x | 0.79x | 1.15x |
+| 1 KiB, 4 threads, LZ4 | 0.88x | 0.83x | 0.95x |
+| compaction-heavy | 0.54x | 0.63x | 1.16x |
+| all 46 | 0.71x | 0.76x | 1.06x |
+
+So on the new CPU the old tree would have scored ~0.71x, not 0.66x. Of the 18% move (0.66x -> 0.78x) about 7% is the
+CPU, about 6% is code (new / old 1.06x), the rest is the difference between these 4 configurations and the full
+matrix, and noise. The code differences, per benchmark (new / old):
+
+- **Better**: 4-thread sync writes (`fillrandom` 0.72x, `overwrite` 0.68x of the old tree with 1 KiB / LZ4; in the
+  matrix 0.81-0.93x / 0.86-1.06x of C, previously 1.04-1.31x / 1.28-1.81x), 4-thread `readmissing` (0.54x; matrix
+  100 B 0.59-0.61x of C, previously 1.42-1.68x), 4-thread `readrandom` (0.75x).
+- **`flush` 1.40-2.40x slower** (new / old). Not the flush itself: since `01ad63b` the background flush runs the
+  obsolete-file purge (which deletes the flushed WAL, 64+ MiB with 1 KiB values) before it accounts the job as
+  finished, and `FlushAsync` waits for that accounting. Probe (100k x 1 KiB, fillseq + fillrandom + flush, 3 runs per
+  side): with the WAL old 73-93 ms, new 111-130 ms; `--disable_wal true` old 64-102 ms, new 67-89 ms. Upstream signals
+  the flush waiter when the memtable flush is installed (`WaitForFlushMemTables`), before the purge. A fix would
+  release the waiter at install time and keep only `CloseAsync` waiting for the purge.
+- **`seekrandom` with 1 KiB values, 1 thread: 1.69x** (new / old; 1.21x of C in the matrix). Seek + 10 Next over
+  ~4 entries per 4 KiB block reads 3-4 consecutive data blocks, so the user-iterator auto readahead (`e4d4311`,
+  `BlockBasedTableIterator.PrefetchIfNeeded`, after `num_file_reads_for_auto_readahead` = 2 sequential blocks)
+  starts on nearly every seek and issues an extra 8 KiB+ async read into the prefetch buffer, which the next seek
+  discards. Probe with the auto readahead disabled by an environment switch (not committed): 9.1-11.0 µs/op against
+  16.2-17.1 (old tree 9.8-11.3). Upstream's `BlockPrefetcher` first calls `RandomAccessFile::Prefetch` (the OS
+  `readahead`), which costs no copy and no buffer, and creates a prefetch buffer only where `Prefetch` is unsupported.
+  The same buffers make sync `readseq` allocate 6-55 B/op (old tree 0.2-2.9 B/op; async scans do not).
+- **Compaction-heavy reads** `readrandom` 1.22x, `seekrandom` 1.31x (new / old, 3 repetitions, CVs ~10%; in the
+  5-repetition matrix run 0.64x / 0.47x of C). Not investigated further; read sampling adds one thread-static RNG
+  step per Get / seek (`FileReadSample.ShouldSampleFileRead`), too little to explain 20%.
+- **Allocations of compaction**: one full compaction of the 100 B DB 7.4 -> 31 MB, compaction-heavy fills 5-10 ->
+  80-140 B/op (they count the background compactions), `compact` with 4 subcompactions 294 MB vs 74 MB with one.
+  Not profiled; the compaction input readahead buffers (`09c0552`) are the likely source.
+
+**Extra rows** (`2026-11-03-final-extras-r3.md`, 3 repetitions): 4-thread writes with `--enable_pipelined_write`
+0.91x / 0.91x of C sync (async 1.25x / 1.11x), with `--unordered_write` 0.70x / 0.82x (async 0.94x / 0.91x);
+`compact` of 1M x 100 B with 4 subcompactions 1.47x of C (C 697 -> 330 ms, managed 586 -> 484 ms: subcompactions
+scale 1.2x on managed and 2.1x on native; not investigated); `readreverse` with 1 KiB values 0.27x, reverse
+`seekrandom` 0.69x; 4-thread `readrandom` on the compaction-heavy tree 0.58x.
+
+BenchmarkDotNet (`2026-11-03-final-bdn.md`, default job): managed / rocksdb-sharp 0.72x Put, 0.56x 100-put batch,
+0.45x / 0.55x / 0.30x Get memtable / cached block / miss, 0.25x / 0.21x Seek + 10 / 100 Next, 0.62x MultiGet(16);
+nothing allocates (1 B per Put, 26 B per 100-entry batch of arena growth). The binding gained more from the new CPU
+(cached-block Get 3782 -> 2052 ns vs managed 1334 -> 1133 ns). Async over sync 0-11%.
+
+Replication on the quiet machine (`2026-11-03-replication.md`): in-process switchover hold p50 4.6-6.1 ms, max
+6.5-11.2 ms; multi-process `SwitchoverTest` 17.9-31.0 ms (median 27 ms; loaded 35-133 ms). With 100-entry batches at
+full speed the replica now applies only 75-80% of the primary's 480-560k ops/s and needs 0.5-0.9 s to catch up.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
@@ -1079,3 +1159,8 @@ fdatasync (the previous behaviour, like upstream's synchronous `Fsync` on the wr
   awaits, async table paths load index partitions asynchronously, user iterators use (auto) readahead, and the
   readahead's prefetches no longer allocate a Task each (see "Allocation-free readahead prefetches, forward pinned
   merge operands").
+- From the 2026-11-03 final run ("Final run on a new VM CPU"): release `FlushAsync` waiters when the flush is
+  installed, before the obsolete-file purge (`flush` 1.2-2.1x of C); start the user-iterator auto readahead with an OS
+  readahead hint instead of a prefetch buffer read, as upstream (`seekrandom` 1 KiB 1.21x of C, sync `readseq`
+  allocations); find why 4 subcompactions scale 1.2x (native 2.1x) and why compaction allocates 4x more than before;
+  replica apply throughput below a primary that group-commits 100-entry batches at full speed.

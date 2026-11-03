@@ -976,10 +976,10 @@ API and behavior differences:
   later `TryCatchUpWithPrimary` until the primary switches to a new WAL (for example, after a flush).
 
 Performance: on the three-way db_bench-style benchmarks (warm, medians of 5 repetitions, same librocksdb 11.12 for
-the native legs), the managed engine's geometric mean per configuration is 0.52x-0.83x the time of the RocksDB C API
-(all 8 configurations: 0.66x, 95% CI 0.64-0.67; async API 0.68x), while rocksdb-sharp is 1.03x. Reads, seeks, scans
-and single-threaded writes are faster than C; random writes on 4 threads through the sync API are 1.0-1.8x
-(0.75-1.03x through the async API), and missing-key reads with 100 B values on 4 threads are 1.4-3.0x. See
+the native legs), the managed engine's geometric mean per configuration is 0.71x-0.89x the time of the RocksDB C API
+(all 8 configurations: 0.78x, 95% CI 0.76-0.80; async API 0.78x), while rocksdb-sharp is 1.05x. Reads, seeks, scans
+and writes are faster than C, including random writes on 4 threads (0.81-1.06x); the slow spots are an explicit
+`Flush` (1.2-2.1x, it also waits for the deletion of the flushed WAL) and 1 KiB seeks on one thread (1.2x). See
 [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Documentation
