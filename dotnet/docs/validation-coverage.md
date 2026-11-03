@@ -244,13 +244,13 @@ changes there need their own review.
 | `Table/PinnedFilterPartitions.cs` | 56 | table/block_based/partitioned_filter_block.cc | line-by-line (#1) |
 | `Table/TableFormatOptions.cs` | 122 | include/rocksdb/table.h, table/table_builder.h | line-by-line (#1) |
 | `Table/TableProperties.cs` | 373 | table/table_properties.cc, table/sst_file_writer.cc, include/rocksdb/table_properties.h | line-by-line (#1) |
-| `Trace/BlockCacheTracer.cs` | 290 | trace_replay/block_cache_tracer.{h,cc}, include/rocksdb/block_cache_trace_writer.h, include/rocksdb/table_reader_caller.h | line-by-line (feature audit: tracing, tools and repair) |
-| `Trace/IoTracer.cs` | 445 | trace_replay/io_tracer.{h,cc}, env/file_system_tracer.{h,cc} | line-by-line (feature audit: tracing, tools and repair) |
-| `Trace/QueryTracer.cs` | 189 | trace_replay/trace_replay.cc (Tracer) | line-by-line (feature audit: tracing, tools and repair) |
-| `Trace/Replayer.cs` | 366 | utilities/trace/replayer_impl.cc, trace_replay/trace_record_handler.cc, include/rocksdb/utilities/replayer.h | line-by-line (feature audit: tracing, tools and repair) |
-| `Trace/TraceFormat.cs` | 438 | trace_replay/trace_replay.{h,cc} (TracerHelper, TracedReadOptions, TracedWriteOptions), include/rocksdb/trace_record.h | line-by-line (feature audit: tracing, tools and repair) |
-| `Trace/TraceReaderWriter.cs` | 144 | include/rocksdb/trace_reader_writer.h, utilities/trace/file_trace_reader_writer.cc | line-by-line (feature audit: tracing, tools and repair) |
-| `Trace/TraceRecord.cs` | 144 | include/rocksdb/trace_record.h, trace_replay/trace_record.cc, include/rocksdb/trace_record_result.h | line-by-line (feature audit: tracing, tools and repair) |
+| `Tracing/BlockCacheTracer.cs` | 290 | trace_replay/block_cache_tracer.{h,cc}, include/rocksdb/block_cache_trace_writer.h, include/rocksdb/table_reader_caller.h | line-by-line (feature audit: tracing, tools and repair) |
+| `Tracing/IoTracer.cs` | 445 | trace_replay/io_tracer.{h,cc}, env/file_system_tracer.{h,cc} | line-by-line (feature audit: tracing, tools and repair) |
+| `Tracing/QueryTracer.cs` | 189 | trace_replay/trace_replay.cc (Tracer) | line-by-line (feature audit: tracing, tools and repair) |
+| `Tracing/Replayer.cs` | 366 | utilities/trace/replayer_impl.cc, trace_replay/trace_record_handler.cc, include/rocksdb/utilities/replayer.h | line-by-line (feature audit: tracing, tools and repair) |
+| `Tracing/TraceFormat.cs` | 438 | trace_replay/trace_replay.{h,cc} (TracerHelper, TracedReadOptions, TracedWriteOptions), include/rocksdb/trace_record.h | line-by-line (feature audit: tracing, tools and repair) |
+| `Tracing/TraceReaderWriter.cs` | 144 | include/rocksdb/trace_reader_writer.h, utilities/trace/file_trace_reader_writer.cc | line-by-line (feature audit: tracing, tools and repair) |
+| `Tracing/TraceRecord.cs` | 144 | include/rocksdb/trace_record.h, trace_replay/trace_record.cc, include/rocksdb/trace_record_result.h | line-by-line (feature audit: tracing, tools and repair) |
 | `Util/ByteCompare.cs` | 73 | (memcmp) | managed-only, design-reviewed (#3): memcmp |
 | `Util/Coding.cs` | 256 | util/coding.h | line-by-line (#1) |
 | `Util/Comparator.cs` | 211 | include/rocksdb/comparator.h, util/comparator.cc | line-by-line (#1) |

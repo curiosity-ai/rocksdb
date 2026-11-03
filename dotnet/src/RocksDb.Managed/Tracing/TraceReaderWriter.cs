@@ -2,7 +2,7 @@ using System.Buffers;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Util;
 
-namespace RocksDb.Managed.Trace;
+namespace RocksDb.Managed.Tracing;
 
 /// <summary>
 /// Sink of encoded trace records (include/rocksdb/trace_reader_writer.h TraceWriter). Calls are serialized by the

@@ -1,10 +1,10 @@
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
-using RocksDb.Managed.Trace;
+using RocksDb.Managed.Tracing;
 using RocksDb.Managed.Util;
 using static RocksDb.Managed.Tests.Db.DbTestUtil;
 
-namespace RocksDb.Managed.Tests.Trace;
+namespace RocksDb.Managed.Tests.Tracing;
 
 /// <summary>Query / block cache / IO tracing and replay (port of the spirit of db/db_test2.cc TraceAndReplay*, trace_replay/*_test.cc).</summary>
 [TestClass]

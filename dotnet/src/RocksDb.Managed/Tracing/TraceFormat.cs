@@ -4,7 +4,7 @@ using System.Numerics;
 using System.Text;
 using RocksDb.Managed.Util;
 
-namespace RocksDb.Managed.Trace;
+namespace RocksDb.Managed.Tracing;
 
 /// <summary>
 /// The type byte of a trace record (include/rocksdb/trace_record.h TraceType). Values hit disk: they are copied

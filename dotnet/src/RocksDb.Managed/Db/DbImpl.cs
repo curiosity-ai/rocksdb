@@ -47,7 +47,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         Options = options;
         SharedTableCache = new TableCacheStore(options.MaxOpenFiles);
         // FileSystemTracingWrapper (DBImpl::fs_): records file operations while an IO trace runs.
-        FileSystem = new Trace.IoTracingFileSystem(options.FileSystem, IoTracer);
+        FileSystem = new Tracing.IoTracingFileSystem(options.FileSystem, IoTracer);
         WalDir = string.IsNullOrEmpty(options.WalDir) ? dbname : options.WalDir.TrimEnd('/');
         var paths = new List<string> { dbname };
         foreach ((string p, _) in options.DbPaths)

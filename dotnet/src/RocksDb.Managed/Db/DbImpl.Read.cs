@@ -73,7 +73,7 @@ internal sealed partial class DbImpl
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void GetWithBlockCacheTrace(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, GetContext ctx)
     {
-        object? prev = Trace.BlockCacheTracer.SetCaller(Trace.TableReaderCaller.UserGet, BlockCacheTracer.NextGetId(), key,
+        object? prev = Tracing.BlockCacheTracer.SetCaller(Tracing.TableReaderCaller.UserGet, BlockCacheTracer.NextGetId(), key,
             options?.Snapshot is not null);
         try
         {
@@ -81,7 +81,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            Trace.BlockCacheTracer.RestoreCaller(prev);
+            Tracing.BlockCacheTracer.RestoreCaller(prev);
         }
     }
 
@@ -365,7 +365,7 @@ internal sealed partial class DbImpl
     public async ValueTask GetAsync(ColumnFamilyData cfd, ReadOptions? options, ReadOnlyMemory<byte> key, GetContext ctx, CancellationToken cancellationToken)
     {
         if (_queryTracer is { } tracer) TraceGet(tracer, cfd, key.Span, options);
-        if (BlockCacheTracer.IsEnabled) SetBlockCacheTraceContext(Trace.TableReaderCaller.UserGet, key.Span, options);
+        if (BlockCacheTracer.IsEnabled) SetBlockCacheTraceContext(Tracing.TableReaderCaller.UserGet, key.Span, options);
         if (_txnHooks is not null && ctx.Callback is null)
         {
             await GetWithTxnHooksAsync(cfd, options, key, ctx, cancellationToken).ConfigureAwait(false);

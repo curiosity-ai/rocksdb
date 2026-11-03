@@ -3,7 +3,7 @@ using System.Diagnostics;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Util;
 
-namespace RocksDb.Managed.Trace;
+namespace RocksDb.Managed.Tracing;
 
 /// <summary>Optional fields of an IO trace record, by bit of <see cref="IoTraceRecord.IoOpData"/> (io_tracer.h IOTraceOp).</summary>
 [Flags]

@@ -1,7 +1,7 @@
 using System.Buffers;
 using RocksDb.Managed.Util;
 
-namespace RocksDb.Managed.Trace;
+namespace RocksDb.Managed.Tracing;
 
 /// <summary>Who looked a block up (include/rocksdb/table_reader_caller.h TableReaderCaller). Values hit disk.</summary>
 public enum TableReaderCaller : byte

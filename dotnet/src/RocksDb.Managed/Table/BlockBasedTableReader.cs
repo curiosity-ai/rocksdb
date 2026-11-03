@@ -91,7 +91,7 @@ public sealed record TableReaderOptions
     public ulong NumFileReadsForAutoReadahead { get; init; } = 2;
 
     /// <summary>The DB's block cache tracer (BlockBasedTable::block_cache_tracer_), or null.</summary>
-    internal Trace.BlockCacheTracer? BlockCacheTracer { get; init; }
+    internal Tracing.BlockCacheTracer? BlockCacheTracer { get; init; }
 
     /// <summary>LSM level of the file (TableReaderOptions::level, -1 unknown); only used for tracing.</summary>
     internal int Level { get; init; } = -1;
@@ -241,7 +241,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     private readonly OffsetableCacheKey _baseCacheKey;
     private readonly CachePriority _metaPriority;
     private readonly BlockCacheStatistics? _stats;
-    private readonly Trace.BlockCacheTracer? _bcTracer;
+    private readonly Tracing.BlockCacheTracer? _bcTracer;
     private int _disposed;
 
     public Footer Footer => _footer;
@@ -880,7 +880,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     /// cache trace runs. The number of keys is estimated from the restart points as upstream.
     /// </summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private void TraceAccess(Trace.BlockCacheTracer t, in CacheKey key, BlockKind kind, Block? block, bool hit, TableReadFlags flags, ulong sizeIfNoBlock = 0)
+    private void TraceAccess(Tracing.BlockCacheTracer t, in CacheKey key, BlockKind kind, Block? block, bool hit, TableReadFlags flags, ulong sizeIfNoBlock = 0)
     {
         ulong nkeys = 0;
         ulong usage = sizeIfNoBlock;
@@ -891,11 +891,11 @@ public sealed partial class BlockBasedTableReader : IDisposable
             if (nkeys > 0) nkeys -= (ulong)(interval / 2); // ~ half-utilized last restart interval
             usage = (ulong)block.Charge;
         }
-        Trace.TraceType type = kind switch
+        Tracing.TraceType type = kind switch
         {
-            BlockKind.Data => Trace.TraceType.BlockDataBlock,
-            BlockKind.Index => Trace.TraceType.BlockIndexBlock,
-            _ => Trace.TraceType.BlockFilterBlock,
+            BlockKind.Data => Tracing.TraceType.BlockDataBlock,
+            BlockKind.Index => Tracing.TraceType.BlockIndexBlock,
+            _ => Tracing.TraceType.BlockFilterBlock,
         };
         bool noInsert = (flags & (TableReadFlags.BlockCacheTier | TableReadFlags.DontFillCache)) != 0;
         ulong cfId = Properties.ColumnFamilyId;

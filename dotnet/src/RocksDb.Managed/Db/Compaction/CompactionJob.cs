@@ -647,7 +647,7 @@ internal sealed class CompactionJob
     private async ValueTask RunSubcompactionAsync(bool synchronous)
     {
         // BlockCacheLookupContext{kCompaction} of the compaction input reads (scoped to this async method).
-        if (_db.BlockCacheTracer.IsEnabled) Trace.BlockCacheTracer.SetCaller(Trace.TableReaderCaller.Compaction, 0, default, false);
+        if (_db.BlockCacheTracer.IsEnabled) Tracing.BlockCacheTracer.SetCaller(Tracing.TableReaderCaller.Compaction, 0, default, false);
         long start = System.Diagnostics.Stopwatch.GetTimestamp();
         bool isPart = _subStart is not null || _subEnd is not null;
         Stats.NumInputFiles = isPart ? 0 : _c.TotalInputFiles;

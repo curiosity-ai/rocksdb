@@ -1,6 +1,6 @@
 using RocksDb.Managed.Util;
 
-namespace RocksDb.Managed.Trace;
+namespace RocksDb.Managed.Tracing;
 
 /// <summary>
 /// Port of Tracer (trace_replay/trace_replay.cc): encodes query records (writes, Get, iterator seeks, MultiGet) into a

@@ -186,7 +186,7 @@ public sealed class Iterator : IDisposable
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private void TraceSeek(Trace.QueryTracer t, Trace.TraceType type, ReadOnlySpan<byte> target)
+    private void TraceSeek(Tracing.QueryTracer t, Tracing.TraceType type, ReadOnlySpan<byte> target)
     {
         ReadOptions? o = _traceReadOptions;
         ReadOnlySpan<byte> lower = o?.IterateLowerBound is { } lb ? lb.Span : default;
@@ -197,7 +197,7 @@ public sealed class Iterator : IDisposable
     /// <summary>Positions at the first key &gt;= <paramref name="target"/>.</summary>
     public void Seek(ReadOnlySpan<byte> target)
     {
-        if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Trace.TraceType.IteratorSeek, target);
+        if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Tracing.TraceType.IteratorSeek, target);
         if (_stats is null)
         {
             _it.Seek(target);
@@ -219,7 +219,7 @@ public sealed class Iterator : IDisposable
     /// <summary>Positions at the last key &lt;= <paramref name="target"/>.</summary>
     public void SeekForPrev(ReadOnlySpan<byte> target)
     {
-        if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Trace.TraceType.IteratorSeekForPrev, target);
+        if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Tracing.TraceType.IteratorSeekForPrev, target);
         if (_stats is null)
         {
             _it.SeekForPrev(target);
@@ -313,13 +313,13 @@ public sealed class Iterator : IDisposable
     public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default) => _it.SeekToLastAsync(cancellationToken);
     public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
-        if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Trace.TraceType.IteratorSeek, target.Span);
+        if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Tracing.TraceType.IteratorSeek, target.Span);
         return _it.SeekAsync(target, cancellationToken);
     }
 
     public ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
-        if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Trace.TraceType.IteratorSeekForPrev, target.Span);
+        if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Tracing.TraceType.IteratorSeekForPrev, target.Span);
         return _it.SeekForPrevAsync(target, cancellationToken);
     }
     public ValueTask NextAsync(CancellationToken cancellationToken = default) => _it.NextAsync(cancellationToken);

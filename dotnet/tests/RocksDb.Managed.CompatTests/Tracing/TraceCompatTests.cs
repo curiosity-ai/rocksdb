@@ -1,9 +1,9 @@
 using System.Runtime.InteropServices;
 using System.Text;
 using RocksDb.Managed.CompatTests.Infrastructure;
-using RocksDb.Managed.Trace;
+using RocksDb.Managed.Tracing;
 
-namespace RocksDb.Managed.CompatTests.Trace;
+namespace RocksDb.Managed.CompatTests.Tracing;
 
 /// <summary>
 /// Trace file compatibility with native RocksDB (trace_replay/trace_replay.cc, block_cache_tracer.cc, io_tracer.cc):

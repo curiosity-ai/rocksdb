@@ -3,7 +3,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using RocksDb.Managed.Db;
 
-namespace RocksDb.Managed.Trace;
+namespace RocksDb.Managed.Tracing;
 
 /// <summary>Options of <see cref="Replayer.Replay"/> (include/rocksdb/utilities/replayer.h ReplayOptions).</summary>
 public sealed class ReplayOptions

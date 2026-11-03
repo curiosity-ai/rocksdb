@@ -28,7 +28,7 @@ internal sealed partial class DbImpl
             return;
         }
         if (_queryTracer is { } tracer) TraceMultiGet(tracer, cfd, batch, options);
-        if (BlockCacheTracer.IsEnabled) SetBlockCacheTraceContext(Trace.TableReaderCaller.UserMultiGet, default, options);
+        if (BlockCacheTracer.IsEnabled) SetBlockCacheTraceContext(Tracing.TableReaderCaller.UserMultiGet, default, options);
         Statistics? st = Stats;
         long t0 = st is null ? 0 : st.StartTimer();
         SuperVersion sv = GetAndRefSuperVersion(cfd, out int svSlot);

@@ -1,4 +1,4 @@
-namespace RocksDb.Managed.Trace;
+namespace RocksDb.Managed.Tracing;
 
 /// <summary>Seek kind of an <see cref="IteratorSeekQueryTraceRecord"/> (values = the trace types).</summary>
 public enum IteratorSeekType : byte

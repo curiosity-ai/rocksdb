@@ -1,5 +1,5 @@
 using System.Runtime.CompilerServices;
-using RocksDb.Managed.Trace;
+using RocksDb.Managed.Tracing;
 
 namespace RocksDb.Managed.Db;
 

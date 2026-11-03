@@ -1,5 +1,5 @@
 using RocksDb.Managed;
-using RocksDb.Managed.Trace;
+using RocksDb.Managed.Tracing;
 using static QuickStart.Show;
 
 namespace QuickStart;
