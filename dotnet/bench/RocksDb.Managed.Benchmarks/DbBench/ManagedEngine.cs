@@ -42,7 +42,7 @@ public sealed class ManagedEngine : IKeyValueEngine
         };
         if (options.BloomBitsPerKey > 0) cfo.TableOptions.FilterPolicy = new BloomFilterPolicy(options.BloomBitsPerKey);
         var dbo = new DbOptions { CreateIfMissing = true, FileSystem = LocalFileSystem.Instance, MaxBackgroundJobs = options.MaxBackgroundJobs,
-            MaxSubcompactions = options.MaxSubcompactions,
+            MaxSubcompactions = options.MaxSubcompactions, CompactionReadaheadSize = options.CompactionReadaheadSize,
             AllowConcurrentMemtableWrite = options.AllowConcurrentMemtableWrite, EnableWriteThreadAdaptiveYield = options.EnableWriteThreadAdaptiveYield };
         return (dbo, cfo);
     }

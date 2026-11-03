@@ -12,8 +12,10 @@ namespace RocksDb.Managed.Db.Iterators;
 /// <para><b>What is ported.</b> FindNextUserEntry (incl. the max_sequential_skip_in_iterations reseek),
 /// MergeValuesNewToOld, ReverseToForward / ReverseToBackward, PrevInternal, FindValueForCurrentKey(+UsingSeek),
 /// FindUserKeyBeforeSavedKey, Seek / SeekForPrev / SeekToFirst / SeekToLast with iterate_lower_bound /
-/// iterate_upper_bound, max_skippable_internal_keys (Incomplete). Range deletions use the pre-7.x scheme: every
-/// visible entry is checked against a <see cref="RangeDelAggregator"/> (see <see cref="MergingIterator"/>).</para>
+/// iterate_upper_bound, max_skippable_internal_keys (Incomplete). Range deletions: every visible entry is checked
+/// against a <see cref="RangeDelAggregator"/> (pre-7.x scheme), and a covered entry lets the inner iterator skip the
+/// covered range in one seek where it can prove the skipped entries are older than the tombstone (see
+/// <see cref="MergingIterator"/>, <see cref="InternalIterator.SkipCoveredForward"/>).</para>
 /// <para><b>Prefix seek.</b> With a prefix extractor and neither total_order_seek nor auto_prefix_mode, the inner
 /// iterator is in prefix mode (tables skipped by their prefix filter): direction changes re-seek like upstream
 /// (expect_total_order_inner_iter_ false) and the reseek optimization is disabled for SeekToFirst/SeekToLast.
@@ -44,7 +46,7 @@ namespace RocksDb.Managed.Db.Iterators;
 /// </remarks>
 public sealed class DbIter : IDisposable
 {
-    private enum StepAction : byte { Done, Next, Seek, NextThenDone }
+    private enum StepAction : byte { Done, Next, Seek, NextThenDone, SkipCovered }
     private enum ValueSource : byte { None, Iter, IterPacked, Pinned, Merged }
 
     private readonly InternalIterator _iter;
@@ -160,6 +162,10 @@ public sealed class DbIter : IDisposable
             if (readOptions.IgnoreRangeDeletions) rangeDel = null;
         }
         _rangeDel = rangeDel is null || rangeDel.IsEmpty ? null : rangeDel;
+        // Covered-range skipping needs total order (a prefix-mode seek may stop at the prefix end) and plain seqno
+        // visibility (no user-defined timestamps; read callbacks disable it in SetReadCallback).
+        _skipCovered = _rangeDel is not null && comparator.UserComparator.TimestampSize == 0 && _expectTotalOrderInnerIter;
+        if (_skipCovered) _skipTarget = new PooledBufferWriter(64);
         // DBIter::SetIter: iter_.iter()->SetPinnedItersMgr(&pinned_iters_mgr_); with pin_data everything is pinned until
         // the iterator is destroyed.
         _iter.SetPinnedItersMgr(_pinMgr);
@@ -480,7 +486,11 @@ public sealed class DbIter : IDisposable
     private ReadCallback? _readCallback;
 
     /// <summary>Sets the read callback before the first positioning call.</summary>
-    internal void SetReadCallback(ReadCallback callback) => _readCallback = callback;
+    internal void SetReadCallback(ReadCallback callback)
+    {
+        _readCallback = callback;
+        _skipCovered = false;
+    }
 
     /// <summary>Port of DBIter::IsVisible: sequence (or read callback) and timestamp range.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -550,6 +560,29 @@ public sealed class DbIter : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool IsCoveredByRangeTombstone(ReadOnlySpan<byte> userKey, ulong sequence) =>
         _rangeDel is not null && _rangeDel.ShouldDelete(userKey, sequence);
+
+    // Covered-range skipping (the effect of upstream's MergingIterator::SkipNextDeleted / SkipPrevDeleted reseeks):
+    // when a visible entry is covered by a range tombstone, the aggregator also returns how far the tombstone reaches
+    // (_skipTarget) and its seqno (_skipSeq); the inner iterator then moves the child providing the entry past the
+    // covered range in one seek when that child's file(s) only hold older entries (SkipCoveredForward / Backward), so a
+    // long run of deleted keys is not visited key by key. Only entries the aggregator would report as covered are
+    // skipped, so the results are those of checking every entry.
+    private bool _skipCovered;
+    private bool _skipPending;
+    private ulong _skipSeq;
+    private readonly PooledBufferWriter? _skipTarget;
+
+    /// <summary>
+    /// <see cref="IsCoveredByRangeTombstone"/> for a visible point entry about to be dropped as covered; also prepares
+    /// the covered-range skip (<see cref="_skipPending"/>) in the given direction.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool IsCoveredWithSkip(ReadOnlySpan<byte> userKey, ulong sequence, bool forward)
+    {
+        if (_rangeDel is null) return false;
+        if (!_skipCovered) return _rangeDel.ShouldDelete(userKey, sequence);
+        return _skipPending = _rangeDel.ShouldDeleteWithSkipTarget(userKey, sequence, forward, _skipTarget!, out _skipSeq);
+    }
 
     /// <summary>Port of TooManyInternalKeysSkipped; throws Incomplete instead of returning true.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -732,10 +765,11 @@ public sealed class DbIter : IDisposable
                     case EntryType.BlobIndex:
                     case EntryType.WideColumnEntity:
                         _savedKey.SetUserKey(userKey);
-                        if (IsCoveredByRangeTombstone(userKey, seq))
+                        if (IsCoveredWithSkip(userKey, seq, forward: true))
                         {
                             // Covered by a range tombstone: behaves like a deletion.
                             _skipping = true;
+                            if (_skipPending) return StepAction.SkipCovered;
                             break;
                         }
                         if (_tsLb is not null) _savedKey.SetInternalKey(_iter.Key);
@@ -745,9 +779,10 @@ public sealed class DbIter : IDisposable
                         return StepAction.Done;
                     case EntryType.Merge:
                         _savedKey.SetUserKey(userKey);
-                        if (IsCoveredByRangeTombstone(userKey, seq))
+                        if (IsCoveredWithSkip(userKey, seq, forward: true))
                         {
                             _skipping = true;
+                            if (_skipPending) return StepAction.SkipCovered;
                             break;
                         }
                         // By now, we are sure the current ikey is going to yield a value.
@@ -900,6 +935,9 @@ public sealed class DbIter : IDisposable
                 case StepAction.Seek:
                     _iter.Seek(_seekKey.WrittenSpan);
                     break;
+                case StepAction.SkipCovered:
+                    if (!_iter.SkipCoveredForward(_skipTarget!.WrittenSpan, _skipSeq)) _iter.Next();
+                    break;
                 default:
                     _iter.Next();
                     if (a == StepAction.NextThenDone) return;
@@ -920,7 +958,12 @@ public sealed class DbIter : IDisposable
         {
             StepAction a = _merging ? MergeStep() : FindNextUserEntryStep();
             if (a == StepAction.Done) return ValueTask.CompletedTask;
-            ValueTask t = a == StepAction.Seek ? _iter.SeekAsync(_seekKey.WrittenMemory, ct) : _iter.NextAsync(ct);
+            ValueTask t = a switch
+            {
+                StepAction.Seek => _iter.SeekAsync(_seekKey.WrittenMemory, ct),
+                StepAction.SkipCovered => SkipCoveredAsync(forward: true, ct),
+                _ => _iter.NextAsync(ct),
+            };
             if (!t.IsCompletedSuccessfully) return RunForwardSlowAsync(t, a, ct);
             t.GetAwaiter().GetResult();
             if (a == StepAction.NextThenDone) return ValueTask.CompletedTask;
@@ -943,6 +986,25 @@ public sealed class DbIter : IDisposable
             return;
         }
         await RunForwardAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Async covered-range skip of the inner iterator, or Next / Prev when it cannot skip.</summary>
+    private ValueTask SkipCoveredAsync(bool forward, CancellationToken ct)
+    {
+        ValueTask<bool> s = forward
+            ? _iter.SkipCoveredForwardAsync(_skipTarget!.WrittenMemory, _skipSeq, ct)
+            : _iter.SkipCoveredBackwardAsync(_skipTarget!.WrittenMemory, _skipSeq, ct);
+        if (!s.IsCompletedSuccessfully) return SkipCoveredSlowAsync(s, forward, ct);
+        if (s.Result) return ValueTask.CompletedTask;
+        return forward ? _iter.NextAsync(ct) : _iter.PrevAsync(ct);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask SkipCoveredSlowAsync(ValueTask<bool> pending, bool forward, CancellationToken ct)
+    {
+        if (await pending.ConfigureAwait(false)) return;
+        if (forward) await _iter.NextAsync(ct).ConfigureAwait(false);
+        else await _iter.PrevAsync(ct).ConfigureAwait(false);
     }
 
     // ==================================================================== public positioning (sync)
@@ -1276,7 +1338,7 @@ public sealed class DbIter : IDisposable
     // after the move, so the sync and async paths share all of the logic.
 
     /// <summary>The next move of the inner iterator requested by <see cref="ReverseStep"/>.</summary>
-    private enum InnerOp : byte { Done, Continue, Prev, Next, Seek, SeekForPrev, SeekToLast }
+    private enum InnerOp : byte { Done, Continue, Prev, Next, Seek, SeekForPrev, SeekToLast, SkipCovered }
 
     private enum RevPhase : byte
     {
@@ -1353,6 +1415,9 @@ public sealed class DbIter : IDisposable
                 case InnerOp.SeekToLast:
                     _iter.SeekToLast();
                     break;
+                case InnerOp.SkipCovered:
+                    if (!_iter.SkipCoveredBackward(_skipTarget!.WrittenSpan, _skipSeq)) _iter.Prev();
+                    break;
             }
         }
     }
@@ -1397,6 +1462,7 @@ public sealed class DbIter : IDisposable
         InnerOp.Next => _iter.NextAsync(ct),
         InnerOp.Seek => _iter.SeekAsync(_seekKey.WrittenMemory, ct),
         InnerOp.SeekForPrev => _iter.SeekForPrevAsync(_seekKey.WrittenMemory, ct),
+        InnerOp.SkipCovered => SkipCoveredAsync(forward: false, ct),
         _ => _iter.SeekToLastAsync(ct),
     };
 
@@ -1537,6 +1603,7 @@ public sealed class DbIter : IDisposable
     /// <summary>One iteration of FindValueForCurrentKey's loop (the entry iter_ is on).</summary>
     private InnerOp FindValueStep()
     {
+        _skipPending = false;
         if (!_iter.Valid)
         {
             FindValueForCurrentKeyEnd();
@@ -1585,7 +1652,7 @@ public sealed class DbIter : IDisposable
             case EntryType.ValuePreferredSeqno:
             case EntryType.BlobIndex:
             case EntryType.WideColumnEntity:
-                if (IsCoveredByRangeTombstone(userKey, seq))
+                if (IsCoveredWithSkip(userKey, seq, forward: false))
                 {
                     _fvLastKeyEntryType = EntryType.RangeDeletion;
                     _fvLastNotMergeType = EntryType.RangeDeletion;
@@ -1604,7 +1671,7 @@ public sealed class DbIter : IDisposable
                 _fvLastNotMergeType = type;
                 break;
             case EntryType.Merge:
-                if (IsCoveredByRangeTombstone(userKey, seq))
+                if (IsCoveredWithSkip(userKey, seq, forward: false))
                 {
                     _fvLastKeyEntryType = EntryType.RangeDeletion;
                     _fvLastNotMergeType = EntryType.RangeDeletion;
@@ -1622,7 +1689,7 @@ public sealed class DbIter : IDisposable
         ++_fvNumSkipped;
         // With iter_start_ts every visible version is its own entry: stop at the first one.
         if (visible && _tsLb is not null) _revPhase = RevPhase.FindValueEnd;
-        return InnerOp.Prev;
+        return _skipPending ? InnerOp.SkipCovered : InnerOp.Prev;
     }
 
     /// <summary>The end of FindValueForCurrentKey (after its loop); continues with FindUserKeyBeforeSavedKey.</summary>
@@ -1847,6 +1914,7 @@ public sealed class DbIter : IDisposable
         _operands.Dispose();
         _blobValue?.Dispose();
         _blobKey?.Dispose();
+        _skipTarget?.Dispose();
         _resolvedEntity?.Dispose();
         _entityFetchScratch?.Dispose();
     }

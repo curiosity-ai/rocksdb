@@ -70,6 +70,43 @@ public sealed class MergingIterator : InternalIterator
 
     public override bool TryGetPinnedValue(out PinnedSlice value) => _children[_current].TryGetPinnedValue(out value);
 
+    /// <summary>Range-deletion skip: only the child providing the current entry moves (see the base method).</summary>
+    public override bool SkipCoveredForward(ReadOnlySpan<byte> target, ulong tombstoneSeq)
+    {
+        if (!_forward || !_children[_current].SkipCoveredForward(target, tombstoneSeq)) return false;
+        AfterCurrentMoved();
+        return true;
+    }
+
+    public override bool SkipCoveredBackward(ReadOnlySpan<byte> target, ulong tombstoneSeq)
+    {
+        if (_forward || !_children[_current].SkipCoveredBackward(target, tombstoneSeq)) return false;
+        AfterCurrentMoved();
+        return true;
+    }
+
+    public override ValueTask<bool> SkipCoveredForwardAsync(ReadOnlyMemory<byte> target, ulong tombstoneSeq, CancellationToken cancellationToken = default) =>
+        _forward ? AfterSkip(_children[_current].SkipCoveredForwardAsync(target, tombstoneSeq, cancellationToken)) : new(false);
+
+    public override ValueTask<bool> SkipCoveredBackwardAsync(ReadOnlyMemory<byte> target, ulong tombstoneSeq, CancellationToken cancellationToken = default) =>
+        !_forward ? AfterSkip(_children[_current].SkipCoveredBackwardAsync(target, tombstoneSeq, cancellationToken)) : new(false);
+
+    private ValueTask<bool> AfterSkip(ValueTask<bool> pending)
+    {
+        if (!pending.IsCompletedSuccessfully) return AfterSkipAsync(pending);
+        if (!pending.Result) return new(false);
+        AfterCurrentMoved();
+        return new(true);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<bool> AfterSkipAsync(ValueTask<bool> pending)
+    {
+        if (!await pending.ConfigureAwait(false)) return false;
+        AfterCurrentMoved();
+        return true;
+    }
+
     // ------------------------------------------------------------------ positioning
 
     public override void SeekToFirst()

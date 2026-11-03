@@ -154,13 +154,19 @@ public sealed class IteratorCompatTests
 
     private sealed record ReadConfig(int SnapshotIndex, string? Lower, string? Upper);
 
+    /// <param name="kind">Merge operator.</param>
+    /// <param name="wideRangeDeletes">
+    /// Range deletions spanning up to 150 keys (and more of them), so iterators skip long covered runs of older files
+    /// (DbIter's covered-range skipping through the merging / level / table iterators).
+    /// </param>
     [TestMethod]
-    [DataRow(Kind.UInt64Add)]
-    [DataRow(Kind.StringAppend)]
-    public void ManagedIteratorMatchesNativeAcrossLevels(Kind kind)
+    [DataRow(Kind.UInt64Add, false)]
+    [DataRow(Kind.StringAppend, false)]
+    [DataRow(Kind.StringAppend, true)]
+    public void ManagedIteratorMatchesNativeAcrossLevels(Kind kind, bool wideRangeDeletes)
     {
         int seed = Environment.TickCount ^ (int)kind;
-        string ctx = "seed=" + seed.ToString(CultureInfo.InvariantCulture) + " kind=" + kind;
+        string ctx = "seed=" + seed.ToString(CultureInfo.InvariantCulture) + " kind=" + kind + " wide=" + wideRangeDeletes;
         var rnd = new Random(seed);
         using var dir = new TempDir("iter");
         const int keySpace = 400;
@@ -200,7 +206,7 @@ public sealed class IteratorCompatTests
                     if (r < 45) batch.Put(k, v);
                     else if (r < 72) batch.Merge(k, (ulong)k.Length, v, (ulong)v.Length);
                     else if (r < 88) batch.Delete(k);
-                    else if (r < 94)
+                    else if (r < (wideRangeDeletes ? 90 : 94))
                     {
                         // SingleDelete is only well defined on a key written exactly once.
                         byte[] sk = B("sd" + (sdNext++).ToString("D5", CultureInfo.InvariantCulture));
@@ -216,7 +222,7 @@ public sealed class IteratorCompatTests
                     else
                     {
                         int s = rnd.Next(keySpace);
-                        byte[] start = B(Key(s)), end = B(Key(Math.Min(keySpace, s + 1 + rnd.Next(12))));
+                        byte[] start = B(Key(s)), end = B(Key(Math.Min(keySpace, s + 1 + rnd.Next(wideRangeDeletes ? 150 : 12))));
                         batch.DeleteRange(start, (ulong)start.Length, end, (ulong)end.Length);
                     }
                     db.Write(batch);

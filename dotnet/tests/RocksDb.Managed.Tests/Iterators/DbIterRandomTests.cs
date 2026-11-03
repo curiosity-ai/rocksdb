@@ -96,6 +96,7 @@ internal sealed class RandomLsm : IDisposable
         var points = new List<(byte[] Key, byte[] Value)>();
         var dels = new List<(byte[] Key, byte[] Value)>();
         byte[]? smallest = null, largest = null;
+        ulong minSeq = DbFormat.MaxSequenceNumber, maxSeq = 0;
         void Extend(byte[] small, byte[] large)
         {
             if (smallest is null || icmp.Compare(small, smallest) < 0) smallest = small;
@@ -110,6 +111,8 @@ internal sealed class RandomLsm : IDisposable
                 if (string.CompareOrdinal(s, e) >= 0) continue;
                 byte[] sk = TableTestUtil.IKey(s, op.Seq, EntryType.RangeDeletion);
                 dels.Add((sk, B(e)));
+                minSeq = Math.Min(minSeq, op.Seq);
+                maxSeq = Math.Max(maxSeq, op.Seq);
                 Extend(sk, TableTestUtil.IKey(e, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion));
             }
             else
@@ -118,6 +121,8 @@ internal sealed class RandomLsm : IDisposable
                 if (hi is not null && string.CompareOrdinal(op.Key, hi) >= 0) continue;
                 byte[] ik = TableTestUtil.IKey(op.Key, op.Seq, op.Type);
                 points.Add((ik, B(op.Value)));
+                minSeq = Math.Min(minSeq, op.Seq);
+                maxSeq = Math.Max(maxSeq, op.Seq);
                 Extend(ik, ik);
             }
         }
@@ -128,7 +133,11 @@ internal sealed class RandomLsm : IDisposable
         byte[] data = TableTestUtil.BuildTable(points, new TableFormatOptions { BlockSize = 256 });
         ulong number = _nextFile++;
         TableCache.AddFile(number, data);
-        return new FileMetaData { FileNumber = number, FileSize = (ulong)data.Length, Smallest = smallest, Largest = largest! };
+        // The seqno range lets the iterators skip ranges covered by newer range tombstones.
+        return new FileMetaData
+        {
+            FileNumber = number, FileSize = (ulong)data.Length, Smallest = smallest, Largest = largest!, SmallestSeqno = minSeq, LargestSeqno = maxSeq,
+        };
     }
 
     public DbIteratorSources Sources(ulong sequence, ReadOptions? ro, ulong maxSkip) => new()
@@ -296,7 +305,7 @@ public sealed class DbIterRandomTests
     {
         int seed = Environment.TickCount ^ (seedOffset * 104729);
         string trace = "seed=" + seed.ToString(CultureInfo.InvariantCulture);
-        TableReaderOptions tableOptions = withCache ? TableReaderOptions.Default with { BlockCache = Cache.BlockCache.CreateLru(1 << 20) } : TableReaderOptions.Default;
+        TableReaderOptions tableOptions = withCache ? TableReaderOptions.Default with { BlockCache = RocksDb.Managed.Cache.BlockCache.CreateLru(1 << 20) } : TableReaderOptions.Default;
         using var lsm = new RandomLsm(seed, 600, 50, true, tableOptions);
         var rnd = new Random(seed + 1);
         for (int round = 0; round < 6; round++)
@@ -407,31 +416,34 @@ public sealed class DbIterRandomTests
         Assert.AreEqual(0, it.PinnedItersMgr.PinnedBlockCount);
     }
 
-    /// <summary>With every block cached, async reverse movement completes synchronously and does not allocate.</summary>
+    /// <summary>
+    /// With every block cached, async reverse movement completes synchronously. (Allocations are checked by the
+    /// BenchmarkDotNet run of ReverseIteratorBenchmarks: Debug builds compile async state machines as classes.)
+    /// </summary>
     [TestMethod]
     public void AsyncReverseCompletesSynchronouslyOnCacheHits()
     {
-        using var lsm = new RandomLsm(17, 800, 60, true, TableReaderOptions.Default with { BlockCache = Cache.BlockCache.CreateLru(8 << 20) });
+        using var lsm = new RandomLsm(17, 800, 60, true, TableReaderOptions.Default with { BlockCache = RocksDb.Managed.Cache.BlockCache.CreateLru(8 << 20) });
         using DbIter it = DbIteratorFactory.CreateDbIter(lsm.Sources(DbFormat.MaxSequenceNumber, null, 8));
+        byte[] target = B(RandomLsm.Key(30));
         for (it.SeekToLast(); it.Valid; it.Prev()) { } // warm the cache
-        for (int pass = 0; pass < 2; pass++)
+        int steps = 0;
+        ValueTask t = it.SeekToLastAsync();
+        Assert.IsTrue(t.IsCompletedSuccessfully);
+        while (it.Valid)
         {
-            long before = GC.GetAllocatedBytesForCurrentThread();
-            int steps = 0;
-            ValueTask t = it.SeekToLastAsync();
-            Assert.IsTrue(t.IsCompletedSuccessfully);
-            while (it.Valid)
-            {
-                t = it.PrevAsync();
-                Assert.IsTrue(t.IsCompletedSuccessfully, "PrevAsync on cached blocks completes synchronously");
-                steps++;
-            }
-            t = it.SeekForPrevAsync(B(RandomLsm.Key(30)));
-            Assert.IsTrue(t.IsCompletedSuccessfully);
-            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
-            Assert.IsTrue(steps > 10);
-            if (pass == 1) Assert.AreEqual(0, allocated, "steady-state async reverse movement allocates nothing");
+            t = it.PrevAsync();
+            Assert.IsTrue(t.IsCompletedSuccessfully, "PrevAsync on cached blocks completes synchronously");
+            steps++;
         }
+        Assert.IsTrue(steps > 10);
+        t = it.SeekForPrevAsync(target);
+        Assert.IsTrue(t.IsCompletedSuccessfully);
+        Assert.IsTrue(it.Valid);
+        t = it.NextAsync();
+        Assert.IsTrue(t.IsCompletedSuccessfully);
+        t = it.PrevAsync();
+        Assert.IsTrue(t.IsCompletedSuccessfully, "direction switch");
     }
 
     [TestMethod]

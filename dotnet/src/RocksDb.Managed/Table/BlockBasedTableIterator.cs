@@ -191,6 +191,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     private BlockRef _block;
     private BlockHandle _blockHandle;
     private Db.Iterators.PinnedIteratorsManager? _pinMgr;
+    private Env.AsyncPrefetchBuffer? _prefetch;
 
     internal BlockBasedTableIterator(BlockBasedTableReader reader, TableReadFlags flags, in TableIteratorPrefixOptions prefixOptions)
     {
@@ -323,7 +324,7 @@ public sealed class BlockBasedTableIterator : IDisposable
         BlockHandle h = _index.Handle;
         if (!_block.IsEmpty && h == _blockHandle) return true;
         ReleaseBlock();
-        SetBlock(_reader.GetBlockRef(h, BlockKind.Data, _flags), h);
+        SetBlock(_reader.GetBlockRef(h, BlockKind.Data, _flags, _prefetch), h);
         return true;
     }
 
@@ -514,7 +515,24 @@ public sealed class BlockBasedTableIterator : IDisposable
     {
         ReleaseBlock();
         _index.Reset();
+        _prefetch?.Reset(null);
     }
+
+    /// <summary>
+    /// Reads data blocks that are not cached through a readahead buffer of <paramref name="readaheadSize"/> bytes that
+    /// prefetches the following chunk asynchronously (BlockPrefetcher with compaction_readahead_size and async_io).
+    /// For sequential scans of whole files (compaction inputs); the sync positioning paths use it, the async ones read
+    /// blocks directly. Idempotent.
+    /// </summary>
+    internal void EnableReadahead(int readaheadSize)
+    {
+        if (_prefetch is not null || readaheadSize <= 0) return;
+        _prefetch = new Env.AsyncPrefetchBuffer(readaheadSize);
+        _prefetch.Reset(_reader.File);
+    }
+
+    /// <summary>The readahead buffer (tests / diagnostics), or null.</summary>
+    internal Env.AsyncPrefetchBuffer? Readahead => _prefetch;
 
     internal void Retarget(BlockBasedTableReader reader, in TableIteratorPrefixOptions prefixOptions)
     {
@@ -522,6 +540,7 @@ public sealed class BlockBasedTableIterator : IDisposable
         _reader = reader;
         _prefix = prefixOptions;
         _index.Init(reader, _flags);
+        _prefetch?.Reset(reader.File);
     }
 
     public void Dispose()
@@ -529,5 +548,6 @@ public sealed class BlockBasedTableIterator : IDisposable
         ReleaseBlock();
         _index.Dispose();
         _data.Dispose();
+        _prefetch?.Dispose();
     }
 }

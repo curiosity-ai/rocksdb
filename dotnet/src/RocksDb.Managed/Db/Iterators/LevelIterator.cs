@@ -301,6 +301,56 @@ public sealed class LevelIterator : InternalIterator
 
     public override bool TryGetPinnedValue(out PinnedSlice value) => _fileIter!.TryGetPinnedValue(out value);
 
+    /// <summary>Files <paramref name="from"/>..<paramref name="to"/> (inclusive) all have seqnos below <paramref name="seq"/> (known ranges).</summary>
+    private bool FilesBelow(int from, int to, ulong seq)
+    {
+        for (int i = from; i <= to; i++)
+        {
+            FileMetaData f = _files[i];
+            if (f.SmallestSeqno > f.LargestSeqno || f.LargestSeqno >= seq) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Range-deletion skip (see <see cref="InternalIterator.SkipCoveredForward"/>): seeks to <paramref name="target"/>
+    /// when every file from the current one to the one holding the target has seqnos below the tombstone's. Not used in
+    /// legacy prefix seek mode (a seek there may stop at the prefix end).
+    /// </summary>
+    public override bool SkipCoveredForward(ReadOnlySpan<byte> target, ulong tombstoneSeq)
+    {
+        if (!CanSkipForward(target, tombstoneSeq)) return false;
+        Seek(target);
+        return true;
+    }
+
+    public override bool SkipCoveredBackward(ReadOnlySpan<byte> target, ulong tombstoneSeq)
+    {
+        if (!CanSkipBackward(target, tombstoneSeq)) return false;
+        SeekForPrev(target);
+        return true;
+    }
+
+    public override ValueTask<bool> SkipCoveredForwardAsync(ReadOnlyMemory<byte> target, ulong tombstoneSeq, CancellationToken cancellationToken = default) =>
+        CanSkipForward(target.Span, tombstoneSeq) ? TableInternalIterator.Moved(SeekAsync(target, cancellationToken)) : new(false);
+
+    public override ValueTask<bool> SkipCoveredBackwardAsync(ReadOnlyMemory<byte> target, ulong tombstoneSeq, CancellationToken cancellationToken = default) =>
+        CanSkipBackward(target.Span, tombstoneSeq) ? TableInternalIterator.Moved(SeekForPrevAsync(target, cancellationToken)) : new(false);
+
+    private bool CanSkipForward(ReadOnlySpan<byte> target, ulong tombstoneSeq)
+    {
+        if (_prefixSeekExtractor is not null || _fileIter is null || !_fileIter.Valid || _icmp.Compare(target, _fileIter.Key) <= 0) return false;
+        int last = Math.Min(FindFile(target), _files.Length - 1);
+        return FilesBelow(_fileIndex, last, tombstoneSeq);
+    }
+
+    private bool CanSkipBackward(ReadOnlySpan<byte> target, ulong tombstoneSeq)
+    {
+        if (_prefixSeekExtractor is not null || _fileIter is null || !_fileIter.Valid || _icmp.Compare(target, _fileIter.Key) >= 0) return false;
+        int first = Math.Min(FindFile(target), _files.Length - 1);
+        return first <= _fileIndex && FilesBelow(first, _fileIndex, tombstoneSeq);
+    }
+
     private InternalIterator NewFileIterator(int index, InternalIterator? reuse)
     {
         if (_prefixExtractor is null) return _tableCache.NewIterator(_files[index], reuse);

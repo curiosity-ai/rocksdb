@@ -22,7 +22,9 @@
 //   - work split across threads and the output line formats
 
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <ftw.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -69,6 +71,8 @@ typedef struct {
   uint64_t min_blob_size;
   int max_background_jobs;
   unsigned max_subcompactions;
+  uint64_t compaction_readahead_size;
+  bool drop_page_cache;  // compact: evict the SST files from the page cache first
   bool use_existing_db;
   int64_t seed;
   const char* db;
@@ -106,6 +110,8 @@ static Flags FLAGS = {
     .min_blob_size = 0,
     .max_background_jobs = 2,
     .max_subcompactions = 1,
+    .compaction_readahead_size = 2 * 1024 * 1024,
+    .drop_page_cache = false,
     .use_existing_db = false,
     .seed = 301,
     .db = "/tmp/rocksdb-c-bench",
@@ -129,6 +135,7 @@ static void usage(void) {
           "  [--target_file_size_base BYTES] [--max_bytes_for_level_base BYTES] "
           "[--level0_file_num_compaction_trigger 4]\n"
           "  [--disable_auto_compactions] [--max_background_jobs 2] [--max_subcompactions 1]\n"
+          "  [--compaction_readahead_size 2097152] [--drop_page_cache]\n"
           "  [--enable_blob_files] [--min_blob_size 0]\n"
           "  [--use_existing_db] [--seed 301] [--db PATH] [--histogram 1]\n"
           "  [--warmup true|false] [--warmup_ops N] [--warmup_min_ms 1000]\n"
@@ -206,6 +213,10 @@ static void parse_flags(int argc, char** argv) {
       FLAGS.min_blob_size = strtoull(value, NULL, 10);
     else if (FLAG("max_background_jobs"))
       FLAGS.max_background_jobs = atoi(value);
+    else if (FLAG("compaction_readahead_size"))
+      FLAGS.compaction_readahead_size = strtoull(value, NULL, 10);
+    else if (FLAG("drop_page_cache"))
+      FLAGS.drop_page_cache = parse_bool(value);
     else if (FLAG("max_subcompactions"))
       FLAGS.max_subcompactions = (unsigned)strtoul(value, NULL, 10);
     else if (FLAG("use_existing_db")) FLAGS.use_existing_db = parse_bool(value);
@@ -448,6 +459,8 @@ static void build_options(void) {
   rocksdb_options_set_min_blob_size(g_options, FLAGS.min_blob_size);
   rocksdb_options_set_max_background_jobs(g_options,
                                           FLAGS.max_background_jobs);
+  rocksdb_options_compaction_readahead_size(g_options,
+                                            (size_t)FLAGS.compaction_readahead_size);
   rocksdb_options_set_max_subcompactions(g_options, FLAGS.max_subcompactions);
   rocksdb_options_set_block_based_table_factory(g_options, g_table_options);
 
@@ -999,7 +1012,27 @@ static void run_threaded(BenchId b, int bench_index, const char* name) {
   free(th);
 }
 
+// fsync + POSIX_FADV_DONTNEED for every *.sst file of the DB (--drop_page_cache).
+static void drop_page_cache(void) {
+  DIR* d = opendir(FLAGS.db);
+  if (d == NULL) return;
+  struct dirent* e;
+  char path[4096];
+  while ((e = readdir(d)) != NULL) {
+    size_t n = strlen(e->d_name);
+    if (n < 4 || strcmp(e->d_name + n - 4, ".sst") != 0) continue;
+    snprintf(path, sizeof(path), "%s/%s", FLAGS.db, e->d_name);
+    int fd = open(path, O_RDWR);
+    if (fd < 0) continue;
+    fsync(fd);
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd);
+  }
+  closedir(d);
+}
+
 static void run_single(BenchId b, const char* name) {
+  if (b == B_COMPACT && FLAGS.drop_page_cache) drop_page_cache();
   uint64_t t0 = now_ns();
   char* err = NULL;
   if (b == B_FLUSH) {

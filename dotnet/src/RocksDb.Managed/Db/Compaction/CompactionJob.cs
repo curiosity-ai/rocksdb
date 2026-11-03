@@ -91,7 +91,7 @@ internal sealed class CompactionJob
         _newFileNumber = newFileNumber;
         _cancellation = cancellation;
         _icmp = cfd.Icmp;
-        _noFillCache = new NoFillTableCache(cfd.TableCache);
+        _noFillCache = new NoFillTableCache(cfd.TableCache, (int)Math.Min(db.Options.CompactionReadaheadSize, 256UL << 20));
         _subStart = start;
         _subEnd = end;
         SubJobId = subJobId;
@@ -237,18 +237,33 @@ internal sealed class CompactionJob
     /// Table cache view whose iterators don't insert data blocks into the block cache (compaction input reads use
     /// fill_cache = false, like CompactionJob's ReadOptions): avoids polluting the cache and lets the iterator reuse
     /// its block buffers.
+    /// <para>
+    /// Input files are read sequentially through an <see cref="Env.AsyncPrefetchBuffer"/> of
+    /// <see cref="DbOptions.CompactionReadaheadSize"/> bytes (upstream: compaction_readahead_size, with the next chunk
+    /// prefetched asynchronously like FilePrefetchBuffer's async_io), so the input I/O overlaps the merge / output
+    /// work and is done in large reads instead of one pread per block. 0 disables readahead.
+    /// </para>
     /// </summary>
-    private sealed class NoFillTableCache(TableCache inner) : ITableCache
+    private sealed class NoFillTableCache(TableCache inner, int readaheadSize) : ITableCache
     {
         public ValueTask<TableReaderLease> GetReaderAsync(FileMetaData file, CancellationToken cancellationToken = default) =>
             inner.GetReaderAsync(file, cancellationToken);
 
         public TableReaderLease GetReader(FileMetaData file) => inner.GetReader(file);
 
-        public InternalIterator NewIterator(FileMetaData file) => new TableInternalIterator(inner.GetReader(file), TableReadFlags.DontFillCache);
+        public InternalIterator NewIterator(FileMetaData file)
+        {
+            var t = new TableInternalIterator(inner.GetReader(file), TableReadFlags.DontFillCache);
+            t.EnableReadahead(readaheadSize);
+            return t;
+        }
 
-        public InternalIterator NewIterator(FileMetaData file, InternalIterator? reuse) =>
-            TableCache.Recycle(reuse, inner.GetReader(file), TableReadFlags.DontFillCache);
+        public InternalIterator NewIterator(FileMetaData file, InternalIterator? reuse)
+        {
+            InternalIterator it = TableCache.Recycle(reuse, inner.GetReader(file), TableReadFlags.DontFillCache);
+            if (it is TableInternalIterator t) t.EnableReadahead(readaheadSize);
+            return it;
+        }
 
         public void Evict(ulong fileNumber) => inner.Evict(fileNumber);
     }

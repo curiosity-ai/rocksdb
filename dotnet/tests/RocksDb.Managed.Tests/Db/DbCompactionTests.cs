@@ -117,7 +117,20 @@ public sealed class DbCompactionTests
         CollectionAssert.AreEqual(expected, actual, context + " scan");
     }
 
-    private static void RunRandomizedModel(int seed, bool withMerge, CompactionStyle style)
+    private const ulong DefaultReadahead = 2 * 1024 * 1024;
+
+    /// <summary>
+    /// Compaction inputs read through a tiny readahead buffer (smaller than two data blocks: blocks straddle the
+    /// prefetched chunks constantly) and without readahead give the same DB as the model.
+    /// </summary>
+    [TestMethod]
+    public void RandomizedModelCompactionReadahead()
+    {
+        RunRandomizedModel(Environment.TickCount & 0x7fffffff, withMerge: true, CompactionStyle.Level, 5000);
+        RunRandomizedModel(4242, withMerge: true, CompactionStyle.Level, 0);
+    }
+
+    private static void RunRandomizedModel(int seed, bool withMerge, CompactionStyle style, ulong compactionReadahead)
     {
         SCOPED(seed);
         MemoryFileSystem fs = NewFs();
@@ -127,6 +140,7 @@ public sealed class DbCompactionTests
         if (withMerge) cfo.MergeOperator = new StringAppendOperator();
         var dbo = NewOptions(fs);
         dbo.MaxBackgroundJobs = 4;
+        dbo.CompactionReadaheadSize = compactionReadahead;
         RocksDatabase db = RocksDatabase.Open(DbPath, dbo, cfo);
         try
         {
@@ -237,18 +251,18 @@ public sealed class DbCompactionTests
     public void RandomizedModelLeveled()
     {
         int seed = Environment.TickCount & 0x7fffffff;
-        RunRandomizedModel(seed, withMerge: true, CompactionStyle.Level);
-        RunRandomizedModel(12345, withMerge: true, CompactionStyle.Level);
+        RunRandomizedModel(seed, withMerge: true, CompactionStyle.Level, DefaultReadahead);
+        RunRandomizedModel(12345, withMerge: true, CompactionStyle.Level, DefaultReadahead);
     }
 
     [TestMethod]
-    public void RandomizedModelLeveledNoMergeOperator() => RunRandomizedModel(777, withMerge: false, CompactionStyle.Level);
+    public void RandomizedModelLeveledNoMergeOperator() => RunRandomizedModel(777, withMerge: false, CompactionStyle.Level, DefaultReadahead);
 
     [TestMethod]
     public void RandomizedModelUniversal()
     {
-        RunRandomizedModel(Environment.TickCount & 0x7fffffff, withMerge: true, CompactionStyle.Universal);
-        RunRandomizedModel(99, withMerge: true, CompactionStyle.Universal);
+        RunRandomizedModel(Environment.TickCount & 0x7fffffff, withMerge: true, CompactionStyle.Universal, DefaultReadahead);
+        RunRandomizedModel(99, withMerge: true, CompactionStyle.Universal, DefaultReadahead);
     }
 
     [TestMethod]

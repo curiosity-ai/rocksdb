@@ -44,6 +44,7 @@ public static class DbBenchRunner
         public int MultiGetSize = 16;
         public int SeekNexts = 10;
         public bool ReverseIterator;
+        public bool DropPageCache;
         public int TxnPuts = 10;
         public double CompressionRatio = 0.5;
         public string Db = Path.Combine(Path.GetTempPath(), "rocksdb-managed-dbbench");
@@ -389,6 +390,8 @@ public static class DbBenchRunner
         {
             // Methods compiled by the JIT (all threads, including the tiering background compiler) during this
             // benchmark; ~0 after the warm-up, so the measurement does not include compilation.
+            // --drop_page_cache: the compaction reads its inputs from the device, not the OS page cache.
+            if (bench == DbBenchmark.Compact && f.DropPageCache && !Quiet) PageCache.DropFiles(f.Db, "*.sst");
             _jitMethodsBefore = System.Runtime.JitInfo.GetCompiledMethodCount(currentThread: false);
             _jitTimeBefore = System.Runtime.JitInfo.GetCompilationTime(currentThread: false);
             _cpuBefore = Environment.CpuUsage.TotalTime;
@@ -1047,6 +1050,7 @@ public static class DbBenchRunner
                 case "multiget_size": f.MultiGetSize = Math.Max(1, int.Parse(value, ci)); break;
                 case "seek_nexts": f.SeekNexts = int.Parse(value, ci); break;
                 case "reverse_iterator": f.ReverseIterator = ParseBool(value); break;
+                case "drop_page_cache": f.DropPageCache = ParseBool(value); break;
                 case "txn_puts": f.TxnPuts = Math.Max(1, int.Parse(value, ci)); break;
                 case "compression_ratio": f.CompressionRatio = double.Parse(value, ci); break;
                 case "db": f.Db = value; break;
@@ -1075,6 +1079,7 @@ public static class DbBenchRunner
                 case "allow_concurrent_memtable_write": o = o with { AllowConcurrentMemtableWrite = ParseBool(value) }; break;
                 case "enable_write_thread_adaptive_yield": o = o with { EnableWriteThreadAdaptiveYield = ParseBool(value) }; break;
                 case "max_background_jobs": o = o with { MaxBackgroundJobs = int.Parse(value, ci) }; break;
+                case "compaction_readahead_size": o = o with { CompactionReadaheadSize = ulong.Parse(value, ci) }; break;
                 case "max_subcompactions": o = o with { MaxSubcompactions = uint.Parse(value, ci) }; break;
                 default: throw new ArgumentException("unknown flag --" + name);
             }
@@ -1137,6 +1142,7 @@ public static class DbBenchRunner
         Console.Error.WriteLine("               [--write_buffer_size BYTES] [--block_size 4096] [--compression none|snappy|lz4|zstd] [--compression_ratio 0.5]");
         Console.Error.WriteLine("               [--target_file_size_base BYTES] [--max_bytes_for_level_base BYTES] [--level0_file_num_compaction_trigger 4]");
         Console.Error.WriteLine("               [--disable_auto_compactions] [--max_background_jobs 2] [--max_subcompactions 1] [--enable_blob_files] [--min_blob_size 0]");
+        Console.Error.WriteLine("               [--compaction_readahead_size 2097152] [--drop_page_cache false] [--reverse_iterator false]");
         Console.Error.WriteLine("               [--use_existing_db] [--seed 301] [--db PATH] [--histogram 1] [--c_bench PATH-TO-rocksdb_bench]");
         Console.Error.WriteLine("               [--warmup true|false] [--warmup_ops N (default max(50k, num/10), <= 200k, <= num)] [--warmup_min_ms 1000]");
         Console.Error.WriteLine("benchmarks: " + string.Join(' ', BenchFlags.AllBenchmarkNames));
@@ -1187,5 +1193,25 @@ public static class CNativeBench
         using Process p = Process.Start(psi)!;
         p.WaitForExit();
         return p.ExitCode;
+    }
+}
+
+/// <summary>Evicts files from the OS page cache (fsync + posix_fadvise(POSIX_FADV_DONTNEED)); Linux only, no-op elsewhere.</summary>
+internal static partial class PageCache
+{
+    private const int PosixFadvDontNeed = 4;
+
+    [System.Runtime.InteropServices.LibraryImport("libc", EntryPoint = "posix_fadvise")]
+    private static partial int PosixFadvise(int fd, long offset, long len, int advice);
+
+    public static void DropFiles(string dir, string pattern)
+    {
+        if (!OperatingSystem.IsLinux() || !Directory.Exists(dir)) return;
+        foreach (string path in Directory.GetFiles(dir, pattern))
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+            fs.Flush(flushToDisk: true);
+            _ = PosixFadvise((int)fs.SafeFileHandle.DangerousGetHandle(), 0, 0, PosixFadvDontNeed);
+        }
     }
 }

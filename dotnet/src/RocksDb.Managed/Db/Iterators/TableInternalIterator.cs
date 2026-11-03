@@ -79,6 +79,69 @@ public sealed class TableInternalIterator : InternalIterator
     public override ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) => _it.SeekForPrevAsync(target, cancellationToken);
     public override ValueTask PrevAsync(CancellationToken cancellationToken = default) => _it.PrevAsync(cancellationToken);
 
+    private ulong _smallestSeqno = DbFormat.MaxSequenceNumber;
+    private ulong _largestSeqno;
+
+    /// <summary>
+    /// The seqno range of the file's entries (FileMetaData smallest / largest seqno); enables
+    /// <see cref="SkipCoveredForward"/>. Unknown (no skipping) until set and after <see cref="Retarget"/>.
+    /// </summary>
+    internal void SetSeqnoRange(ulong smallest, ulong largest)
+    {
+        _smallestSeqno = smallest;
+        _largestSeqno = largest;
+    }
+
+    /// <summary>Every entry of the file has a seqno below <paramref name="seq"/> (and the range is known).</summary>
+    private bool AllSeqnosBelow(ulong seq) => _smallestSeqno <= _largestSeqno && _largestSeqno < seq;
+
+    public override bool SkipCoveredForward(ReadOnlySpan<byte> target, ulong tombstoneSeq)
+    {
+        if (!AllSeqnosBelow(tombstoneSeq) || !_it.Valid || _lease.Reader.InternalComparator.Compare(target, _it.Key) <= 0) return false;
+        _it.Seek(target);
+        return true;
+    }
+
+    public override bool SkipCoveredBackward(ReadOnlySpan<byte> target, ulong tombstoneSeq)
+    {
+        if (!AllSeqnosBelow(tombstoneSeq) || !_it.Valid || _lease.Reader.InternalComparator.Compare(target, _it.Key) >= 0) return false;
+        _it.SeekForPrev(target);
+        return true;
+    }
+
+    public override ValueTask<bool> SkipCoveredForwardAsync(ReadOnlyMemory<byte> target, ulong tombstoneSeq, CancellationToken cancellationToken = default)
+    {
+        if (!AllSeqnosBelow(tombstoneSeq) || !_it.Valid || _lease.Reader.InternalComparator.Compare(target.Span, _it.Key) <= 0) return new(false);
+        return Moved(_it.SeekAsync(target, cancellationToken));
+    }
+
+    public override ValueTask<bool> SkipCoveredBackwardAsync(ReadOnlyMemory<byte> target, ulong tombstoneSeq, CancellationToken cancellationToken = default)
+    {
+        if (!AllSeqnosBelow(tombstoneSeq) || !_it.Valid || _lease.Reader.InternalComparator.Compare(target.Span, _it.Key) >= 0) return new(false);
+        return Moved(_it.SeekForPrevAsync(target, cancellationToken));
+    }
+
+    /// <summary>true once <paramref name="pending"/> completes.</summary>
+    internal static ValueTask<bool> Moved(ValueTask pending)
+    {
+        if (!pending.IsCompletedSuccessfully) return MovedAsync(pending);
+        pending.GetAwaiter().GetResult();
+        return new(true);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private static async ValueTask<bool> MovedAsync(ValueTask pending)
+    {
+        await pending.ConfigureAwait(false);
+        return true;
+    }
+
+    /// <summary>Reads uncached data blocks with sequential async readahead (see <see cref="BlockBasedTableIterator.EnableReadahead"/>).</summary>
+    internal void EnableReadahead(int readaheadSize) => _it.EnableReadahead(readaheadSize);
+
+    /// <summary>The readahead buffer (tests / diagnostics), or null.</summary>
+    internal Env.AsyncPrefetchBuffer? Readahead => _it.Readahead;
+
     /// <summary>The block-cache flags this iterator reads with.</summary>
     internal TableReadFlags Flags { get; private set; }
 
@@ -97,6 +160,8 @@ public sealed class TableInternalIterator : InternalIterator
                 ? default
                 : lease.Reader.GetPrefixOptions(readOptions, prefixExtractor);
             _it.Retarget(lease.Reader, prefix);
+            _smallestSeqno = DbFormat.MaxSequenceNumber;
+            _largestSeqno = 0;
         }
         catch
         {

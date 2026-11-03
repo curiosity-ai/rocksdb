@@ -146,9 +146,12 @@ public static class DbIteratorFactory
                     bool shouldSample = FileReadSample.ShouldSampleFileRead();
                     foreach (FileMetaData f in files)
                     {
-                        children.Add(sources.PrefixExtractor is null
+                        InternalIterator child = sources.PrefixExtractor is null
                             ? tc.NewIterator(f)
-                            : new TableInternalIterator(tc.GetReader(f), TableReadFlags.None, sources.ReadOptions, sources.PrefixExtractor));
+                            : new TableInternalIterator(tc.GetReader(f), TableReadFlags.None, sources.ReadOptions, sources.PrefixExtractor);
+                        children.Add(child);
+                        // Lets DbIter skip ranges covered by newer range tombstones (SkipCoveredForward / Backward).
+                        if (child is TableInternalIterator t) t.SetSeqnoRange(f.SmallestSeqno, f.LargestSeqno);
                         // Count once for every L0 file. This is done per iterator creation rather than Seek(), while
                         // files in other levels are sampled on seek/next/prev (Version::AddIteratorsForLevel).
                         if (shouldSample) FileReadSample.SampleFileReadInc(f);
