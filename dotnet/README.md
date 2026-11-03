@@ -975,12 +975,13 @@ API and behavior differences:
 - A secondary instance opened while the primary's current WAL is empty does not see writes appended to that WAL by a
   later `TryCatchUpWithPrimary` until the primary switches to a new WAL (for example, after a flush).
 
-Performance: on the three-way db_bench-style benchmarks (warm, medians of 5 repetitions, same librocksdb 11.12 for
-the native legs), the managed engine's geometric mean per configuration is 0.71x-0.89x the time of the RocksDB C API
-(all 8 configurations: 0.78x, 95% CI 0.76-0.80; async API 0.78x), while rocksdb-sharp is 1.05x. Reads, seeks, scans
-and writes are faster than C, including random writes on 4 threads (0.81-1.06x); the slow spots are an explicit
-`Flush` (1.2-2.1x, it also waits for the deletion of the flushed WAL) and 1 KiB seeks on one thread (1.2x). See
-[docs/benchmarks.md](docs/benchmarks.md).
+Performance: on the three-way db_bench-style benchmarks (warm, medians of 5 repetitions, the same librocksdb 11.12
+for the native legs), the managed engine's geometric mean per configuration is 0.67x-0.81x the time of the RocksDB C
+API. Over all 8 configurations it is 0.72x (95% CI 0.71-0.74), and 0.73x with the async API, while rocksdb-sharp is
+1.05x. Writes, flushes, compactions, reads, seeks and scans are faster than C on average, including random writes on
+4 threads (0.76-0.98x) and an explicit `Flush` (0.63-0.93x). Of the 232 managed cells, only 2 are above 1.1x of C,
+both within run-to-run noise: synced puts (`fillsync`, one fsync per write) and a sub-microsecond async bloom-filter
+miss. See [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Documentation
 

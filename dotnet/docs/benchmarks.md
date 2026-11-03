@@ -125,141 +125,137 @@ $B report --csv out.csv --out out.md
 `2026-11-02-*`, "Intel Xeon Processor @ 2.10GHz" (a newer core, model 207) from `2026-11-03-*` on. Absolute times
 and even ratios vs C differ between the two CPUs (see "Latest results"). Even on the quiet machine (no other agents,
 load average 0.5-1.7 between runs) one measurement of one cell varies by about 10% (median coefficient of variation
-over 5 repetitions: 8.3-10.7% depending on the engine and run), and 10% of the cells by more than 20%. Single runs before `2026-11-02-final-warm-r5.md` were taken while other agents ran
+over 5 repetitions: 7.8-10.7% depending on the engine and run), and 10% of the cells by more than 20%. Single runs before `2026-11-02-final-warm-r5.md` were taken while other agents ran
 builds and tests (load average 4-14) and are noisier. Quote medians of repeated runs (`REPEATS`, see
 [bench/README.md](../bench/README.md)) and their confidence intervals, not single cells.
 
 ## Latest results
 
-The source is `bench/results/2026-11-03-final-warm-r5.md` (raw rows: `.csv`, LSM rows: `.lsm.csv`): the reduced
-matrix (100 B and 1 KiB values, 1 and 4 threads, no compression and LZ4) plus the compaction-heavy configuration, on
-c-native, rocksdb-sharp, managed and managed-async, **5 repetitions** each (fresh DB, warm-up on, engines interleaved
-in every repetition), Release build of `cfb30f9`, .NET 10.0.14, librocksdb 11.12 (NuGet `RocksDB` 11.12.0.7385).
-Sizes as in the previous final run: num=300k (300k reads) for 100-byte values, 100k (100k reads) for 1 KiB values,
-500k for the compaction-heavy configuration. The machine was quiet (no other agents; each repetition started at a
-1-minute load average <= 1.5; 80 min in total).
+**Current reference run:** `bench/results/2026-11-03-definitive-r5.md` (raw rows: `.csv`, LSM rows: `.lsm.csv`). It
+covers the reduced matrix (100 B and 1 KiB values, 1 and 4 threads, no compression and LZ4) and the compaction-heavy
+configuration, on c-native, rocksdb-sharp, managed and managed-async. Each cell has **5 repetitions** (fresh DB, warm-up
+on, engines interleaved in every repetition). Release build of `fb97d3d`, .NET 10.0.14, librocksdb 11.12 (NuGet
+`RocksDB` 11.12.0.7385). Sizes: num=300k (300k reads) for 100-byte values, 100k (100k reads) for 1 KiB values, 500k for
+the compaction-heavy configuration. The machine was quiet: no other agents, and each repetition started at a 1-minute
+load average <= 1.5 (0.71-3.21 before the individual runs, median 1.44). The run took 79 min.
 
-**The VM's CPU changed** between the previous final run (`2026-11-02-final-warm-r5.md`, "Intel Xeon @ 2.80GHz") and
-this one ("Intel Xeon Processor @ 2.10GHz", family 6 model 207, AVX-512 + AMX). On the new CPU the native engines are
-~40% faster in absolute time and the managed engines ~30%, so the ratios vs C moved against managed partly for
-reasons that are not in the code. An interleaved A/B on the new CPU (managed at `0f866b8`, the tree of the previous
-run, against `cfb30f9`, with c-native; 3 repetitions of 4 configurations, `2026-11-03-ab-0f866b8-vs-cfb30f9.csv`) puts
-the old tree at 0.71x of C and the current one at 0.76x: of the 18% shift from 0.66x to 0.78x below, about 7% is the
-CPU, about 6% is code (flush and 1 KiB seeks, see the takeaways; 4-thread writes and reads improved), and the rest is
-the difference between the 4 A/B configurations and the full matrix, and noise. Compare ratios within one file, not
-across the two.
+The run used the same CPU, matrix and sizes as the previous run, `2026-11-03-final-warm-r5.md` (tree `cfb30f9`, "Intel
+Xeon Processor @ 2.10GHz", family 6 model 207), so the two compare cell by cell. The code in between fixed the flush
+waiter (WAL deletion), the user-iterator and compaction readahead, compaction allocations and subcompaction warm-up
+([perf.md](perf.md), "Final-run regressions"). The machine itself did not change speed: the native legs' absolute
+medians are 0.99x (c-native) and 0.98x (rocksdb-sharp) of the previous run's, as a geometric mean over the 116 cells.
+The managed engines' medians are 0.92x (sync) and 0.93x (async) of the previous run's.
 
 Geometric mean over the benchmarks of each configuration of the **median** µs/op ratio vs c-native (lower is better;
-below 1.00x is faster than C), with the 95% bootstrap confidence interval:
+below 1.00x is faster than C), with the 95% bootstrap confidence interval. The previous run is in parentheses:
 
 | configuration | rocksdb-sharp | managed | managed-async |
 |---|---:|---:|---:|
-| 100 B, 1 thread, no compression | 1.08x [1.05-1.14] | 0.72x [0.70-0.76] | 0.73x [0.70-0.76] |
-| 100 B, 4 threads, no compression | 1.05x [0.99-1.11] | 0.77x [0.73-0.82] | 0.75x [0.71-0.80] |
-| 100 B, 1 thread, LZ4 | 1.07x [1.01-1.12] | 0.71x [0.67-0.75] | 0.74x [0.70-0.78] |
-| 100 B, 4 threads, LZ4 | 1.04x [0.99-1.12] | 0.76x [0.73-0.81] | 0.74x [0.71-0.80] |
-| 1 KiB, 1 thread, no compression | 1.05x [0.98-1.10] | 0.80x [0.76-0.85] | 0.81x [0.77-0.86] |
-| 1 KiB, 4 threads, no compression | 1.04x [0.96-1.13] | 0.84x [0.77-0.91] | 0.85x [0.78-0.92] |
-| 1 KiB, 1 thread, LZ4 | 1.03x [0.97-1.08] | 0.76x [0.72-0.81] | 0.76x [0.72-0.80] |
-| 1 KiB, 4 threads, LZ4 | 1.02x [0.96-1.07] | 0.89x [0.82-0.92] | 0.84x [0.79-0.87] |
-| **all 8 matrix configurations (112 benchmarks)** | **1.05x [1.02-1.07]** | **0.78x [0.76-0.80]** | **0.78x [0.76-0.79]** |
-| compaction-heavy (500k x 100 B, 1 thread; 4 benchmarks) | 1.05x [0.94-1.15] | 0.62x [0.53-0.66] | 0.65x [0.58-0.73] |
+| 100 B, 1 thread, no compression | 1.09x [1.02-1.13] (1.08x) | 0.68x [0.65-0.71] (0.72x) | 0.70x [0.66-0.72] (0.73x) |
+| 100 B, 4 threads, no compression | 1.01x [0.96-1.07] (1.05x) | 0.76x [0.72-0.79] (0.77x) | 0.75x [0.70-0.78] (0.75x) |
+| 100 B, 1 thread, LZ4 | 1.10x [1.02-1.14] (1.07x) | 0.68x [0.64-0.72] (0.71x) | 0.70x [0.65-0.73] (0.74x) |
+| 100 B, 4 threads, LZ4 | 1.06x [1.01-1.12] (1.04x) | 0.74x [0.70-0.77] (0.76x) | 0.75x [0.70-0.78] (0.74x) |
+| 1 KiB, 1 thread, no compression | 1.01x [0.93-1.09] (1.05x) | 0.69x [0.63-0.75] (0.80x) | 0.69x [0.64-0.74] (0.81x) |
+| 1 KiB, 4 threads, no compression | 1.00x [0.95-1.07] (1.04x) | 0.77x [0.73-0.81] (0.84x) | 0.75x [0.71-0.79] (0.85x) |
+| 1 KiB, 1 thread, LZ4 | 1.00x [0.94-1.05] (1.03x) | 0.67x [0.65-0.71] (0.76x) | 0.73x [0.70-0.77] (0.76x) |
+| 1 KiB, 4 threads, LZ4 | 1.09x [1.05-1.17] (1.02x) | 0.81x [0.77-0.84] (0.89x) | 0.81x [0.76-0.84] (0.84x) |
+| **all 8 matrix configurations (112 benchmarks)** | **1.05x [1.02-1.06]** (1.05x) | **0.72x [0.71-0.74]** (0.78x) | **0.73x [0.72-0.74]** (0.78x) |
+| compaction-heavy (500k x 100 B, 1 thread; 4 benchmarks) | 1.06x [1.00-1.12] (1.05x) | 0.58x [0.54-0.62] (0.62x) | 0.59x [0.55-0.62] (0.65x) |
 
-Per benchmark, geometric mean over the 8 matrix configurations (median ratios, 95% bootstrap CI):
+Per benchmark, geometric mean over the 8 matrix configurations (median ratios, 95% bootstrap CI; previous run in
+parentheses):
 
 | benchmark | rocksdb-sharp | managed | managed-async |
 |---|---:|---:|---:|
-| fillseq | 1.03x [0.97-1.08] | 0.66x [0.63-0.69] | 0.67x [0.64-0.73] |
-| fillrandom | 1.02x [0.98-1.08] | 0.74x [0.71-0.79] | 0.79x [0.74-0.83] |
-| overwrite | 1.02x [0.96-1.07] | 0.86x [0.81-0.90] | 0.86x [0.81-0.90] |
-| flush | 0.97x [0.91-1.05] | 1.43x [1.34-1.58] | 1.44x [1.35-1.56] |
-| readrandom | 1.02x [0.97-1.06] | 0.67x [0.63-0.71] | 0.71x [0.67-0.75] |
-| readmissing | 1.12x [1.00-1.24] | 0.62x [0.56-0.69] | 0.72x [0.67-0.81] |
-| seekrandom | 1.07x [1.04-1.12] | 0.72x [0.70-0.75] | 0.63x [0.61-0.65] |
-| readseq | 1.15x [1.07-1.24] | 0.67x [0.61-0.73] | 0.67x [0.62-0.70] |
-| readreverse | 1.16x [1.09-1.24] | 0.64x [0.61-0.70] | 0.64x [0.61-0.69] |
-| multireadrandom | 1.03x [0.99-1.09] | 0.73x [0.70-0.77] | 0.73x [0.69-0.76] |
-| readwhilewriting | 1.01x [0.94-1.06] | 0.79x [0.74-0.83] | 0.79x [0.72-0.83] |
-| compact | 1.01x [0.89-1.18] | 0.88x [0.78-1.04] | 0.86x [0.75-1.00] |
-| deleterandom | 1.02x [0.97-1.09] | 0.70x [0.68-0.78] | 0.74x [0.70-0.79] |
-| fillsync | 1.06x [0.89-1.20] | 1.11x [0.92-1.22] | 0.87x [0.76-0.98] |
+| fillseq | 1.00x [0.96-1.07] | 0.68x [0.64-0.73] (0.66x) | 0.66x [0.63-0.69] (0.67x) |
+| fillrandom | 1.03x [0.96-1.06] | 0.74x [0.71-0.79] (0.74x) | 0.77x [0.72-0.79] (0.79x) |
+| overwrite | 1.03x [0.97-1.06] | 0.77x [0.73-0.80] (0.86x) | 0.78x [0.73-0.82] (0.86x) |
+| flush | 0.97x [0.82-1.05] | **0.73x [0.62-0.82]** (1.43x) | **0.73x [0.61-0.78]** (1.44x) |
+| readrandom | 1.04x [0.99-1.10] | 0.67x [0.63-0.69] (0.67x) | 0.73x [0.69-0.77] (0.71x) |
+| readmissing | 1.11x [0.99-1.22] | 0.60x [0.54-0.66] (0.62x) | 0.70x [0.64-0.75] (0.72x) |
+| seekrandom | 1.09x [1.05-1.12] | 0.61x [0.60-0.64] (0.72x) | 0.63x [0.61-0.65] (0.63x) |
+| readseq | 1.18x [1.07-1.25] | 0.66x [0.61-0.71] (0.67x) | 0.66x [0.60-0.69] (0.67x) |
+| readreverse | 1.14x [1.05-1.20] | 0.69x [0.64-0.74] (0.64x) | 0.68x [0.62-0.72] (0.64x) |
+| multireadrandom | 1.04x [1.00-1.09] | 0.71x [0.68-0.75] (0.73x) | 0.73x [0.70-0.78] (0.73x) |
+| readwhilewriting | 1.03x [0.98-1.09] | 0.78x [0.75-0.82] (0.79x) | 0.78x [0.74-0.83] (0.79x) |
+| compact | 0.99x [0.94-1.07] | 0.84x [0.81-0.90] (0.88x) | 0.82x [0.76-0.88] (0.86x) |
+| deleterandom | 1.03x [0.97-1.12] | 0.71x [0.67-0.76] (0.70x) | 0.75x [0.72-0.80] (0.74x) |
+| fillsync | 0.97x [0.87-1.17] | 1.02x [0.91-1.10] (1.11x) | 0.90x [0.81-1.03] (0.87x) |
 
 Takeaways:
 
-- **Overall** the managed engine takes about four fifths of the C API's time on the same workload (0.78x, CI
-  0.76-0.80; 0.74x without the `flush` rows), sync and async alike, and rocksdb-sharp costs about 5% over C (1.05x, CI
-  1.02-1.07). Every configuration's CI for managed and managed-async lies below 1.0.
-- **4-thread writes are no longer a slow spot**: sync `fillrandom` 0.81-0.93x and `overwrite` 0.86-1.06x (previous
-  run 1.04-1.31x / 1.28-1.81x), async 0.74-0.95x / 0.86-1.06x, from the AwaitState write wait and parallel memtable
-  inserts. Single-threaded writes stay well below C (`fillseq` 0.52-0.58x, `fillrandom` 0.56-0.71x, `overwrite`
-  0.70-0.92x).
-- **4-thread `readmissing` is fixed too**: 0.59-0.61x with 100 B values (previous run 1.42-1.68x; async 0.69-0.77x, was 1.93-3.00x), after the
-  per-processor super version cache and pinned table readers. With 1 KiB values and LZ4 it is 1.08x (async 1.20x) of
-  a 0.15 µs native operation.
-- **Point reads, seeks and scans** are faster than C: `readrandom` 0.60-0.77x, `seekrandom` 0.52-0.75x except 1 KiB /
-  1 thread / no compression (1.21x, see below), `readseq` 0.60-0.83x, `readreverse` 0.54-0.80x, `multireadrandom`
-  0.58-0.85x. Async costs 0-16% over sync on reads (per-benchmark geometric means) and is faster for seeks (0.63x vs
-  0.72x).
-- **Slow spots (managed > 1.1x of C)**, investigated, not fixed:
-  - `flush` 1.17-2.06x (1.58-2.06x with 1 KiB values; async the same). A flush now returns only after the obsolete-file
-    purge, which deletes the flushed WAL (64+ MiB with 1 KiB values): the purge moved before the job's completion
-    accounting in `01ad63b` (so close cannot race it), and `FlushAsync`'s wait is released by that accounting. Upstream
-    signals the flush waiter when the memtable is installed, before the purge. Evidence: 1 KiB fillseq + fillrandom +
-    flush, old vs new tree, 3 runs each: 73-93 vs 111-130 ms with the WAL, 64-102 vs 67-89 ms with
-    `--disable_wal true`. The flush itself did not get slower.
-  - `seekrandom` with 1 KiB values, 1 thread, no compression: 1.21x (old tree on the same CPU 0.70x). Seek + 10 Next
-    reads 3-4 consecutive data blocks, which triggers the user-iterator auto readahead (`BlockPrefetcher` port,
-    `e4d4311`) on nearly every seek: an extra 8 KiB+ async read into a prefetch buffer per seek, mostly wasted.
-    Upstream issues `Prefetch` (the OS `readahead` hint) first and falls back to a prefetch buffer only where that is
-    unsupported. A probe with the auto readahead disabled: 9.1-11.0 µs/op against 16.2-17.1 (old tree 9.8-11.3). The
-    same buffers make sync `readseq` allocate 6-55 B/op (previously 0.2-2.9; async scans 0.2-2.0).
-  - `fillsync` 1.13-1.30x in 4 of 8 configurations (sync API; async 0.67-1.03x): one fsync per put, device-bound
-    and the noisiest row (as in the previous run, 0.87-1.25x).
-  - `compact` with 1 KiB values, 4 threads, LZ4: 1.10x (previous run 1.02x), within its CI.
-- **Flush and full compaction**: one full compaction is 0.75-0.87x without compression and 0.84-1.10x with LZ4.
-  Compactions allocate more than in the previous run (A/B: 7.4 -> 31 MB per full compaction of the 100 B DB;
-  compaction-heavy fills 5-10 -> 80-140 B/op, which counts the background compactions); not profiled, the compaction
-  input readahead buffers (`09c0552`) are the likely source.
-- **Compaction-heavy configuration**: managed 0.69x / 0.74x on `fillrandom` / `overwrite` against background flushes
-  and compactions, 0.64x `readrandom` and 0.47x `seekrandom` on the multi-level tree. Write amplification: c-native and
-  rocksdb-sharp 2.96 in all 5 repetitions (LSM shape `3 0 0 0 0 4 15`, 5/5), managed 3.15 (3.05-3.15), managed-async
-  3.05 (2.96-3.15), shapes `0-3 0 0 0 0 3-5 15-16`.
-- **rocksdb-sharp** is at parity with C for most operations; its cost shows on scans (`readseq` 1.15x,
-  `readreverse` 1.16x) and `readmissing` (1.12x).
-- **JIT during measurement** (warm-up on): median 1 method per measured benchmark (managed and managed-async); the
-  compaction-heavy fills still compile up to 585 methods while running. rocksdb-sharp: 0-10.
-- **Noise**: 94 of 117 benchmark rows have at least one engine with CV > 10% (median CV 8.4% c-native, 8.3%
-  rocksdb-sharp, 10.2% managed, 9.2% managed-async; 18-23% at the 90th percentile). No process crashed.
+- **Overall**, the managed engine takes 0.72x of the C API's time on the same workload (CI 0.71-0.74). The async API
+  takes 0.73x and rocksdb-sharp 1.05x. Every configuration's CI for managed and managed-async lies below 1.0. Against
+  the previous run, the gain is 6 points on the same CPU, mostly from `flush`, 1 KiB seeks and overwrites.
+- **`flush` is no longer a slow spot.** It went from 1.02-2.06x of C to 0.63-0.93x (async 0.66-1.02x). A flush of the
+  64 MiB memtable takes 62-71 ms (async 56-70) against C's 85-105 ms with 100 B values, and 32-38 ms (async 30-50)
+  against 39-56 ms with 1 KiB values. The flush waiter no longer waits for the close of the deleted 64+ MiB WAL (perf.md).
+- **`seekrandom` with 1 KiB values, 1 thread, no compression** dropped from 1.21x to 0.64x, after the readahead
+  became an OS `readahead` hint instead of a copied prefetch buffer. Sync `readseq` no longer allocates (0.0-1.0 B/op,
+  was 7-52).
+- **Only 2 of 232 managed cells are above 1.1x of C**, both on rows with CVs of 16-20%:
+  - managed-async `readmissing`, 100 B, 4 threads, LZ4: 1.11x (0.21 against 0.19 µs; previous run 0.69x). C was 34%
+    faster than in its previous run on this cell. Likely cause: noise on a sub-µs bloom-filter miss, plus the async
+    API's per-call cost, which shows most on the cheapest operation. Sync is 0.80x.
+  - managed `fillsync`, 1 KiB, 4 threads, LZ4: 1.17x (previous run 1.23x). Likely cause: one fdatasync per put, so
+    the row measures the device (C's CV is 20%). Async is 1.01x.
+- **Writes**: single-threaded fills are 0.49-0.71x of C and 4-thread fills 0.76-0.98x. `overwrite` is 0.65-0.90x, down
+  from 0.86x to 0.77x overall.
+- **Reads, seeks and scans**: `readrandom` 0.56-0.75x, `readmissing` 0.37-0.85x, `seekrandom` 0.54-0.68x, `readseq`
+  0.54-0.79x, `readreverse` 0.63-0.86x, `multireadrandom` 0.61-0.85x. On reads, async costs 0-17% over sync
+  (per-benchmark geometric means; the most on `readmissing`, the cheapest operation).
+- **Full compaction** takes 0.74-0.97x of C (the slowest is 1 KiB with LZ4 on 4 threads). One full compaction of the
+  100 B DB allocates 6-7.6 MB, down from 31-39 MB. The flush rows allocate 0.05-0.55 MB per flush, with the larger
+  values in the 100 B configurations (previous run 0.04-0.25 MB; not investigated).
+- **Compaction-heavy configuration**: managed is 0.65x / 0.68x of C on `fillrandom` / `overwrite` against background
+  flushes and compactions. On the multi-level tree it is 0.66x on `readrandom` and 0.40x on `seekrandom`. The fills
+  allocate 4.8 / 10.4 B/op, down from 77 / 119 B/op. Write amplification: c-native and rocksdb-sharp are at 2.96 in
+  all 5 repetitions (shape `3 0 0 0 0 4 14-15`). managed is at 3.15 (3.05-3.15) and managed-async at 3.15 in all 5,
+  with shapes `0-1 0 0 0 0 3-6 15-16`.
+- **rocksdb-sharp** stays at about 5% over C. Its cost shows on scans (`readseq` 1.18x, `readreverse` 1.14x) and
+  `readmissing` (1.11x).
+- **Allocations**: steady-state reads, seeks and scans allocate 0.0-1.0 B/op, as do the single-threaded 100 B
+  fills. The exceptions are memory growth that is recycled later (see "Reading a report"). The first `readrandom`
+  fills the block cache (29 / 86 B/op). `overwrite` with 100 B values allocates the second memtable's arena (16-130
+  B/op). 1 KiB fills (6-22 B/op) and 4-thread async fills (12-26 B/op) are at the previous run's level. `fillsync` now shows 2-71 B/op; the previous run's 206-1590 B/op were the runner's own
+  histograms spread over num/1000 ops.
+- **JIT during measurement** (warm-up on): the median is 1 method per measured benchmark for both managed engines.
+  The compaction-heavy `overwrite` still compiles up to 635 methods while running (managed total 4024 methods over
+  585 measurements, previous run 5579). rocksdb-sharp compiles 0-5.
+- **Noise**: 82 of 116 benchmark rows have at least one engine with a CV above 10%. The median CV is 8.7% for
+  c-native, 7.9% for rocksdb-sharp, 8.0% for managed and 7.8% for managed-async (16-22% at the 90th percentile). No
+  process crashed.
 
-**Extra rows** (`bench/results/2026-11-03-final-extras-r3.md`, 3 repetitions, same session; µs/op medians, ratio vs C):
+**Extra rows** (`bench/results/2026-11-03-definitive-extras-r3.md`, 3 repetitions, same session; µs/op medians, ratio
+vs C, previous run's extras in parentheses):
 
 | workload | c-native | managed | managed-async |
 |---|---:|---:|---:|
-| 4 threads, 300k x 100 B, `fillrandom` / `overwrite`, default write path | 5.02 / 4.97 | 4.30 / 4.83 (0.86x / 0.97x) | 4.59 / 4.58 (0.91x / 0.92x) |
-| same, `--enable_pipelined_write true` | 3.74 / 4.37 | 3.41 / 3.99 (0.91x / 0.91x) | 4.68 / 4.83 (1.25x / 1.11x) |
-| same, `--unordered_write true` | 3.31 / 3.17 | 2.33 / 2.59 (0.70x / 0.82x) | 3.10 / 2.89 (0.94x / 0.91x) |
-| full `compact` of 1M x 100 B in L0, `max_subcompactions` 1 (ms) | 697 | 586 (0.84x) | |
-| same, `max_subcompactions` 4 (ms) | 330 | 484 (1.47x) | |
-| 100k x 1 KiB, `readreverse` | 2.96 | 0.80 (0.27x) | 0.99 (0.34x) |
-| 100k x 1 KiB, `seekrandom --reverse_iterator` (SeekForPrev + 10 Prev) | 16.57 | 11.41 (0.69x) | 12.26 (0.74x) |
-| compaction-heavy tree, 500k x 100 B, 4 threads, `readrandom` (1M reads) | 1.76 | 1.02 (0.58x) | |
+| 4 threads, 300k x 100 B, `fillrandom` / `overwrite`, default write path | 5.30 / 5.01 | 4.17 / 4.26: 0.79x / 0.85x (0.86x / 0.97x) | 4.84 / 4.84: 0.91x / 0.97x (0.91x / 0.92x) |
+| same, `--enable_pipelined_write true` | 4.42 / 4.34 | 3.16 / 3.71: 0.71x / 0.86x (0.91x / 0.91x) | 4.28 / 4.61: 0.97x / 1.06x (1.25x / 1.11x) |
+| same, `--unordered_write true` | 2.79 / 3.03 | 2.29 / 2.60: 0.82x / 0.86x (0.70x / 0.82x) | 2.92 / 2.86: 1.05x / 0.94x (0.94x / 0.91x) |
+| full `compact` of 1M x 100 B in L0, `max_subcompactions` 1 (ms) | 706 | 535: 0.76x (0.84x) | |
+| same, `max_subcompactions` 4 (ms) | 315 | 269: **0.85x** (1.47x) | |
+| 100k x 1 KiB, `readreverse` | 3.25 | 0.95: 0.29x (0.27x) | 0.86: 0.26x (0.34x) |
+| 100k x 1 KiB, `seekrandom --reverse_iterator` (SeekForPrev + 10 Prev) | 16.45 | 11.26: 0.68x (0.69x) | 11.43: 0.69x (0.74x) |
+| 100k x 1 KiB, `flush` after fillseq, fillrandom, overwrite (ms), no compression / LZ4 | 43.9 / 43.8 | 36.8 / 35.1: 0.84x / 0.80x | 29.2 / 37.7: 0.67x / 0.86x |
 
-- Pipelined writes gain 15-20% on both engines with 4 sync writers; async writers lose with pipelining (1.11-1.25x
-  of C), because each stage hand-off is a thread-pool continuation (see perf.md "Pipelined writes"). `unordered_write`
-  gains 35-50% on managed, 30-35% on native.
-- **Subcompactions scale less than native**: 4 subcompactions take C from 697 to 330 ms (2.1x), managed from 586 to
-  484 ms (1.2x), and the managed compaction allocates 294 MB instead of 74 MB. Not profiled (candidates: per-
-  subcompaction buffers, the input split, or the merge of the outputs).
-- **Read sampling** (read-triggered compaction bookkeeping, both engines): one thread-static RNG step per Get / seek
-  and a counter increment on 1 in 1024 file reads. `readrandom` did not get slower beyond the noise in the A/B
-  (new / old tree 0.75-1.09x in the matrix configurations, 1.22x in the compaction-heavy one, 3 repetitions, CVs ~10%),
-  and the read-heavy multi-level run above is 0.58x of C.
+- **Subcompactions now scale**: 4 subcompactions take managed from 535 to 269 ms (2.0x) and C from 706 to 315 ms
+  (2.2x). The previous run had 586 -> 484 ms (1.2x), when the measured compaction was still tiering up 180-410 methods.
+  A full compaction allocates 0.44 MB with 1 subcompaction and 3.4 MB with 4, down from 74 MB and 294 MB.
+- **Pipelined writes**: managed gains 13-24% with 4 sync writers, native 13-17%. Async writers are now at
+  0.97-1.06x of C with pipelining, up from 1.11-1.25x. `unordered_write` gains 39-45% on managed and 40-47% on native.
+  This run's C was faster on this row than in the previous run (2.79 against 3.31 µs), so the ratio rose while the
+  managed times stayed the same.
+- **1 KiB flush** (the regression of the previous run): 0.80-0.84x of C sync, 0.67-0.86x async, in line with the
+  matrix.
 
-The previous final run, `2026-11-02-final-warm-r5.md` (same matrix and sizes, tree `0f866b8`, the 2.80 GHz CPU), had
-managed 0.66x [0.64-0.67], managed-async 0.68x [0.67-0.70] and rocksdb-sharp 1.03x [1.01-1.06] over the 8 matrix
-configurations, with 4-thread sync random writes (1.04-1.81x) and 4-thread `readmissing` with 100 B values
-(1.42-3.00x) as its slow spots; [perf.md](perf.md) ("Final three-way results" and "Final run on a new VM CPU")
-compares the two.
+The previous run, `2026-11-03-final-warm-r5.md` (tree `cfb30f9`, same CPU), had managed 0.78x [0.76-0.80],
+managed-async 0.78x [0.76-0.79] and rocksdb-sharp 1.05x [1.02-1.07] over the 8 matrix configurations. Its slow spots
+were `flush` (1.02-2.06x) and 1 KiB single-threaded `seekrandom` (1.21x). The final run before it,
+`2026-11-02-final-warm-r5.md` (tree `0f866b8`), ran on a different VM CPU ("Intel Xeon @ 2.80GHz"), so its ratios
+(managed 0.66x, rocksdb-sharp 1.03x) are not comparable 1:1. [perf.md](perf.md) ("Final three-way results", "Final run
+on a new VM CPU", "Definitive run") compares the three.
 
 Older reports in `bench/results/` are single runs on the shared, loaded VM: `2026-11-02-vm*.md` before perf pass #2,
 `-vm-perf2*.md` after it, `-vm-perf3*.md` after perf pass #3, `-vm-picker-compaction.md` after the compaction-picking
@@ -277,27 +273,39 @@ dotnet run -c Release --project bench/RocksDb.Managed.Benchmarks -f net10.0 -- -
 Add `--cli /root/.dotnet/dotnet` if `dotnet` is not on the child processes' `PATH`. Every class has
 `[MemoryDiagnoser]`. The `Allocated` column must be `-` for hot paths.
 
-Latest head-to-head numbers (`bench/results/2026-11-03-final-bdn.md`: `--anyCategories DbHeadToHead DbAsync`, the
-default job, quiet machine, the 2.10 GHz CPU, .NET 10.0.14; mean per operation, single thread). The last column is
-the ratio of the previous final run (`2026-11-02-final-bdn.md`, 2.80 GHz CPU):
+Latest head-to-head numbers come from `bench/results/2026-11-03-definitive-bdn.md`: `--anyCategories DbHeadToHead
+DbAsync`, the default job, on the quiet machine with the 2.10 GHz CPU and .NET 10.0.14, tree `fb97d3d`. Times are the
+mean per operation on a single thread. The last column is the ratio of the previous run on the same CPU
+(`2026-11-03-final-bdn.md`, tree `cfb30f9`):
 
-| operation | rocksdb-sharp | managed | managed / rocksdb-sharp | 2026-11-02 |
+| operation | rocksdb-sharp | managed | managed / rocksdb-sharp | cfb30f9 |
 |---|---:|---:|---:|---:|
-| Put (memtable, WAL) | 4.12 µs | 2.98 µs | 0.72x | 0.57x |
-| WriteBatch of 100 puts | 120.2 µs | 67.8 µs | 0.56x | 0.60x |
-| Get from the memtable | 1716 ns | 765 ns | 0.45x | 0.49x |
-| Get from a cached SST block | 2052 ns | 1133 ns | 0.55x | 0.35x |
-| Get of a missing key (Bloom filter) | 416 ns | 125 ns | 0.30x | 0.28x |
-| Seek + 10 Next | 3.97 µs | 0.98 µs | 0.25x | 0.26x |
-| Seek + 100 Next | 28.19 µs | 5.86 µs | 0.21x | 0.21x |
-| MultiGet of 16 keys | 27.35 µs | 17.05 µs | 0.62x | 0.52x |
+| Put (memtable, WAL) | 3.98 µs | 2.72 µs | 0.68x | 0.72x |
+| WriteBatch of 100 puts | 130.7 µs | 58.9 µs | 0.45x | 0.56x |
+| Get from the memtable | 1451 ns | 838 ns | 0.58x | 0.45x |
+| Get from a cached SST block | 1982 ns | 1101 ns | 0.56x | 0.55x |
+| Get of a missing key (Bloom filter) | 400 ns | 113 ns | 0.28x | 0.30x |
+| Get, block cache miss (1 MiB cache, block from the page cache) | 3636 ns | 2104 ns | 0.58x | |
+| Seek + 10 Next | 4.17 µs | 0.99 µs | 0.24x | 0.25x |
+| Seek + 100 Next | 27.27 µs | 5.78 µs | 0.21x | 0.21x |
+| MultiGet of 16 keys | 27.73 µs | 18.07 µs | 0.65x | 0.62x |
 
-Both engines are faster on the newer CPU, the native binding more so for cached-block Gets (3782 -> 2052 ns against
-1334 -> 1133 ns) and Put (6.68 -> 4.12 µs against 3.82 -> 2.98 µs). No managed hot path allocates (`Allocated` `-`, or
-1 B per Put and 26 B per 100-entry batch, the amortized memtable arena / pool growth). Sync against async (`DbAsync`,
-blocks in the block cache / only in the OS page cache): Put 2.75 / 2.87 µs, TryGet 1.04 / 1.14 µs (page cache 2.07 /
-2.30 µs), Seek + 10 Next 1.45 / 1.44 µs (page cache 2.64 / 2.85 µs), MultiGet(16) 15.2 / 15.3 µs (page cache 33.6 /
-35.7 µs): async costs 0-11% when every call completes synchronously.
+No managed hot path allocates, including Gets that miss the block cache. `Allocated` is `-` everywhere except 1 B per
+Put, 26 B per 100-entry batch and 1 B per async MultiGet(16), which are amortized memtable arena and pool growth. The
+memtable Get moved by about one standard deviation on both sides (managed 765 -> 838 ns, rocksdb-sharp
+1716 -> 1451 ns). The other ratios are within a few percent of the previous run.
+
+`DbAsync` compares the sync and async APIs, with blocks in the block cache (blocks only in the OS page cache in
+parentheses):
+
+| operation | sync | async |
+|---|---:|---:|
+| Put | 2.62 µs (2.54) | 2.67 µs (2.69) |
+| TryGet | 0.96 µs (2.03) | 1.12 µs (2.24) |
+| Seek + 10 Next | 1.36 µs (2.68) | 1.35 µs (2.83) |
+| MultiGet(16) | 15.1 µs (32.5) | 14.4 µs (33.9) |
+
+When every call completes synchronously, async costs between -5% and +17%. TryGet has the largest cost.
 
 | Class | Category | Measures |
 |---|---|---|

@@ -35,14 +35,17 @@ engine (knobs `COMPACTION_NUM`, `COMPACTION_ARGS`, `COMPACTION_BENCHMARKS`, ... 
 and #3, and `-vm-picker-compaction.md` after the compaction-picking parity fixes (`docs/perf.md`), all cold; with the
 warm-up: `-vm-warm-compaction.md` (alternated with cold runs: `-vm-cold-compaction.md`). Reduced matrix with the warm-up:
 `results/2026-11-02-vm-warm.md` (cold counterpart from the same session: `-vm-cold.md`). The current reference is
-`results/2026-11-03-final-warm-r5.md`: matrix + compaction-heavy configuration, 5 repetitions on a quiet machine
-(medians, CVs, bootstrap CIs; managed 0.78x, managed-async 0.78x, rocksdb-sharp 1.05x of C over the matrix), with
-extra rows (pipelined / unordered writes, subcompactions, reverse iteration, read-heavy) in
-`results/2026-11-03-final-extras-r3.md`, the BenchmarkDotNet head-to-head reports in `results/2026-11-03-final-bdn.md`,
-the replication runs in `results/2026-11-03-replication.md`, and an old-vs-new tree A/B in
-`results/2026-11-03-ab-0f866b8-vs-cfb30f9.csv`. They ran on a different VM CPU (2.10 GHz) than the previous final run
+`results/2026-11-03-definitive-r5.md`: the matrix plus the compaction-heavy configuration on tree `fb97d3d`, 5
+repetitions on a quiet machine (medians, CVs, bootstrap CIs). Over the matrix, managed is at 0.72x of C, managed-async
+at 0.73x and rocksdb-sharp at 1.05x; only 2 of 232 managed cells are above 1.1x of C, both noisy `fillsync` /
+`readmissing` rows. Extra rows (pipelined / unordered writes, subcompactions, reverse iteration, 1 KiB flush) are in
+`results/2026-11-03-definitive-extras-r3.md`, and the BenchmarkDotNet head-to-head reports in
+`results/2026-11-03-definitive-bdn.md`. The run before it, `results/2026-11-03-final-warm-r5.md` (+ `-final-extras-r3`,
+`-final-bdn`, tree `cfb30f9`), ran on the same CPU and compares cell by cell (managed 0.78x, with `flush` at 1.43x).
+Also from that session: the replication runs in `results/2026-11-03-replication.md` and an old-vs-new tree A/B in
+`results/2026-11-03-ab-0f866b8-vs-cfb30f9.csv`. Both 2026-11-03 runs used a different VM CPU (2.10 GHz) than
 `results/2026-11-02-final-warm-r5.md` / `-final-bdn.md` (2.80 GHz; managed 0.66x, rocksdb-sharp 1.03x), so compare
-ratios within one run (see docs/benchmarks.md, "Latest results").
+ratios within one CPU (see docs/benchmarks.md, "Latest results").
 
 All engines run a **warm-up phase** before the measurement (default on, `WARMUP=false` for cold-process numbers; see
 "Warm-up" below), so the .NET engines are not measured while the JIT is still compiling and tiering up. Results before

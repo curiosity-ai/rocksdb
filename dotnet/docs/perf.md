@@ -1290,6 +1290,77 @@ unchanged), `fillseq,fillrandom,overwrite,flush,readrandom,readrandom,multireadr
 BenchmarkDotNet `DbGetBenchmarks` (default job, ns/op, Allocated): Memtable managed 786 / rocksdb-sharp 1463,
 SstCached 1110 / 2020, Miss 116 / 419, **SstUncached 1996 / 3538**, all `-`.
 
+## Definitive run (2026-11-03): after the final-run regression fixes
+
+`bench/results/2026-11-03-definitive-r5.md` (10:44-12:03 UTC) is the current reference run. It uses the same matrix,
+sizes, engines, `REPEATS=5` and CPU as "Final run on a new VM CPU" above ("Intel Xeon Processor @ 2.10GHz", family 6
+model 207). It ran on `fb97d3d`, which adds the fixes of "Final-run regressions" and the runner's allocation
+accounting of "readrandom / overwrite allocations". The VM was quiet: each repetition started at a 1-minute load
+average <= 1.5 (0.71-3.21 before the individual runs, median 1.44). Same CPU, so the two runs compare cell by cell.
+The native legs ran at the same speed: the geometric mean over the 116 cells of their absolute medians, new / old, is
+0.99x for c-native and 0.98x for rocksdb-sharp. The managed engines' is 0.92x (sync) and 0.93x (async).
+
+| configuration | rocksdb-sharp cfb30f9 | rocksdb-sharp fb97d3d | managed cfb30f9 | managed fb97d3d | managed-async cfb30f9 | managed-async fb97d3d |
+|---|---:|---:|---:|---:|---:|---:|
+| 100 B, 1 thread, none | 1.08x | 1.09x [1.02-1.13] | 0.72x | 0.68x [0.65-0.71] | 0.73x | 0.70x [0.66-0.72] |
+| 100 B, 4 threads, none | 1.05x | 1.01x [0.96-1.07] | 0.77x | 0.76x [0.72-0.79] | 0.75x | 0.75x [0.70-0.78] |
+| 100 B, 1 thread, LZ4 | 1.07x | 1.10x [1.02-1.14] | 0.71x | 0.68x [0.64-0.72] | 0.74x | 0.70x [0.65-0.73] |
+| 100 B, 4 threads, LZ4 | 1.04x | 1.06x [1.01-1.12] | 0.76x | 0.74x [0.70-0.77] | 0.74x | 0.75x [0.70-0.78] |
+| 1 KiB, 1 thread, none | 1.05x | 1.01x [0.93-1.09] | 0.80x | 0.69x [0.63-0.75] | 0.81x | 0.69x [0.64-0.74] |
+| 1 KiB, 4 threads, none | 1.04x | 1.00x [0.95-1.07] | 0.84x | 0.77x [0.73-0.81] | 0.85x | 0.75x [0.71-0.79] |
+| 1 KiB, 1 thread, LZ4 | 1.03x | 1.00x [0.94-1.05] | 0.76x | 0.67x [0.65-0.71] | 0.76x | 0.73x [0.70-0.77] |
+| 1 KiB, 4 threads, LZ4 | 1.02x | 1.09x [1.05-1.17] | 0.89x | 0.81x [0.77-0.84] | 0.84x | 0.81x [0.76-0.84] |
+| all 8 matrix configurations | 1.05x | 1.05x [1.02-1.06] | 0.78x | **0.72x [0.71-0.74]** | 0.78x | **0.73x [0.72-0.74]** |
+| compaction-heavy | 1.05x | 1.06x [1.00-1.12] | 0.62x | 0.58x [0.54-0.62] | 0.65x | 0.59x [0.55-0.62] |
+
+The 1 KiB configurations gained the most (0.80-0.89x -> 0.67-0.81x). Cell by cell (managed ratio vs C, previous ->
+now):
+
+- **`flush`**: 1.02-2.06x -> 0.63-0.93x (async 1.02-2.22x -> 0.66-1.02x). The managed flush takes 0.39-0.60x of its
+  previous time, while C's is unchanged (0.89-1.06x). This is fix 1 of "Final-run regressions": the WAL writer's
+  close, which was the real deletion of the 64+ MiB file, moved to the background purge.
+- **`seekrandom`, 1 KiB, 1 thread**: 1.21x -> 0.64x (no compression) and 0.98x -> 0.68x (LZ4), from fix 2 (the OS
+  readahead hint instead of a prefetch buffer). The per-benchmark mean went from 0.72x to 0.61x.
+- **`overwrite`**: 0.86x -> 0.77x per benchmark, most of it with 1 KiB values (0.82-1.06x -> 0.65-0.90x).
+- **Allocations**:
+  - sync `readseq` 7-52 -> 0.0-1.0 B/op (fix 2).
+  - One full compaction of the 100 B DB 31-39 -> 6-7.6 MB (fix 3).
+  - Compaction-heavy `fillrandom` / `overwrite` 77 / 119 -> 4.8 / 10.4 B/op (fix 3).
+  - `fillsync` 206-1590 -> 2-71 B/op, from the runner no longer counting its histograms.
+  - `flush` 0.04-0.25 -> 0.05-0.55 MB per flush, with the increase in the 100 B configurations. Not investigated;
+    small next to the 62-71 ms flush.
+- **Got worse, within the noise**:
+  - 4-thread `readmissing` with 100 B values: 0.61x -> 0.85x (no compression) and 0.59x -> 0.80x (LZ4). Its rows
+    have CVs of 15-25%, and the ranges of the old and new runs overlap.
+  - 4-thread `fillrandom` with 100 B values, no compression: 0.82x -> 0.98x. C was 10% faster on this cell than in
+    the previous run, and managed's absolute time rose 7%.
+- **Above 1.1x of C**, only 2 of 232 managed cells, both noisy:
+  - managed-async `readmissing`, 100 B, 4 threads, LZ4: 1.11x. The cell is 0.21 against 0.19 µs; C was 34% faster
+    on this cell than in the previous run, and the CVs are 16-20%.
+  - managed `fillsync`, 1 KiB, 4 threads, LZ4: 1.17x (was 1.23x). It does one fdatasync per put, and C's CV is 20%.
+
+Write amplification of the compaction-heavy configuration is unchanged: C 2.96, managed 3.05-3.15 (median 3.15),
+managed-async 3.15. JIT during measurements: median 1 method per benchmark. The most is still in the compaction-heavy
+fills (up to 635 methods), and the managed total over 585 measurements is 4024, down from 5579. Noise: median CV
+7.8-8.7% per engine (was 8.3-10.2%), with 82 of 116 rows flagged (was 93).
+
+**Extras** (`2026-11-03-definitive-extras-r3.md`, 3 repetitions):
+
+- **Subcompactions now scale**, from fix 4 (warm-up until compactions stop compiling methods). One subcompaction
+  takes 535 ms against C's 706 (0.76x), and 4 take 269 against 315 ms (0.85x; previously 1.47x). That is a 2.0x
+  speedup for managed against 2.2x for C. The JIT during the measured `compact` with 4 subcompactions is down to 27
+  methods. Allocations are 0.44 / 3.4 MB (1 / 4 subcompactions), down from 74 / 294 MB.
+- **4-thread writes**:
+  - Default write path: 0.79x / 0.85x (`fillrandom` / `overwrite`).
+  - Pipelined: 0.71x / 0.86x, with async at 0.97x / 1.06x (was 1.25x / 1.11x).
+  - Unordered: 0.82x / 0.86x, with the managed times unchanged and C faster in this session (2.79 against 3.31 µs).
+- **1 KiB, 1 thread**: `flush` 0.80-0.84x (async 0.67-0.86x), `readreverse` 0.29x, reverse `seekrandom` 0.68x.
+
+BenchmarkDotNet (`2026-11-03-definitive-bdn.md`, default job): managed / rocksdb-sharp is 0.68x for Put, 0.45x for a
+100-put batch, and 0.58x / 0.56x / 0.28x for Get from the memtable / a cached block / a missing key. A Get that misses
+the block cache is 0.58x, Seek + 10 / 100 Next 0.24x / 0.21x, and MultiGet(16) 0.65x. Nothing allocates (1 B per Put,
+26 B per 100-entry batch). Async over sync costs -5% to +17%, with TryGet the highest.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
@@ -1308,6 +1379,6 @@ SstCached 1110 / 2020, Miss 116 / 419, **SstUncached 1996 / 3538**, all `-`.
   readahead's prefetches no longer allocate a Task each (see "Allocation-free readahead prefetches, forward pinned
   merge operands").
 - From the 2026-11-03 final run: done (see "Final-run regressions: flush, readahead, compaction allocations,
-  subcompaction scaling"). Still open: `readrandom` with 1 KiB values allocates ~86 B/op (100 B: ~29 B/op) in every
+  subcompaction scaling"), confirmed by the definitive run (see "Definitive run (2026-11-03)"). Still open: `readrandom` with 1 KiB values allocates ~86 B/op (100 B: ~29 B/op) in every
   tree since `0f866b8` (block cache misses with the 8 MiB cache; not investigated); the dbbench `overwrite` row of the
   300k x 100 B matrix configuration allocates ~80 B/op (not investigated).
