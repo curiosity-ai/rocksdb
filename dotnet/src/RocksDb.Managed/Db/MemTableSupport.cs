@@ -162,6 +162,14 @@ public sealed class MergeContext : IDisposable
         _ends[_count++] = _data.WrittenCount;
     }
 
+    /// <summary>Keeps only the <paramref name="count"/> newest operands (the first pushed).</summary>
+    public void Truncate(int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfGreaterThan((uint)count, (uint)_count);
+        _count = count;
+        _data.Truncate(count == 0 ? 0 : _ends[count - 1]);
+    }
+
     /// <summary>Operand by push order: index 0 is the newest operand.</summary>
     public ReadOnlySpan<byte> GetOperandNewestFirst(int index)
     {

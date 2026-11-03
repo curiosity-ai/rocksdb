@@ -21,17 +21,17 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (250 files, about 75,500 lines):
+Summary (265 files, about 78,000 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
-| line-by-line (feature audits) | 78 |
+| line-by-line (feature audits) | 89 |
 | line-by-line (#3) | 17 |
 | line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
-| API wrapper, design-reviewed | 5 |
+| API wrapper, design-reviewed | 9 |
 
 Two areas are under active change by other work streams: WritePrepared / WriteUnprepared transactions, and blob direct
 write with entity blob columns. Their files were audited at the revision named in validation.md ("Audit #3"). Later
@@ -39,6 +39,20 @@ changes there need their own review.
 
 | Managed file | Lines | C++ source(s) | Audit status |
 |---|---:|---|---|
+| `ColumnFamily.DbApis.cs` | 274 | include/rocksdb/db.h (GetMergeOperands, SuggestCompactRange, PromoteL0, DeleteFilesInRanges, ClipColumnFamily, GetPropertiesOfTablesInRange/ByLevel, LockWAL, Disable/EnableManualCompaction, GetCreationTimeOfOldestFile), include/rocksdb/options.h (GetMergeOperandsOptions) | API wrapper, design-reviewed (DB API wave): delegates to audited DbImpl |
+| `ColumnFamily.ExportImport.cs` | 54 | include/rocksdb/utilities/checkpoint.h (ExportColumnFamily), include/rocksdb/db.h (CreateColumnFamilyWithImport) | API wrapper, design-reviewed (DB API wave): delegates to audited DbImpl |
+| `Db/Compaction/CompactionService.cs` | 133 | include/rocksdb/options.h (CompactionService, CompactionServiceJobInfo, CompactionServiceJobStatus, CompactionServiceScheduleResponse, OpenAndCompactOptions, CompactionServiceOptionsOverride) | line-by-line (feature audit: DB API wave) |
+| `Db/Compaction/CompactionServiceFormat.cs` | 706 | db/compaction/compaction_job.h (CompactionServiceInput/OutputFile/Result), db/compaction/compaction_service_job.cc (type maps, Read/Write), options/options_helper.cc (StringToMap, NextToken, StripOuterBraces, SerializeType), include/rocksdb/utilities/options_type.h (SerializeVector/Array, StringMap), table/table_properties.cc (table_properties_type_info) | line-by-line (feature audit: DB API wave) |
+| `Db/Compaction/HistoryTrimmingIterator.cs` | 84 | db/history_trimming_iterator.h | line-by-line (feature audit: DB API wave) |
+| `Db/DbImpl.Experimental.cs` | 364 | db/db_impl/db_impl_experimental.cc (SuggestCompactRange, PromoteL0), db/db_impl/db_impl.cc (DeleteFilesInRanges, ClipColumnFamily, GetCreationTimeOfOldestFile, GetPropertiesOfTablesInRange/ByLevel), db/version_set.cc (GetPropertiesOfTablesInRange, GetSstFilesBoundaryKeys, GetCreationTimeOfOldestFile), util/udt_util.cc (MaybeAddTimestampsToRange) | line-by-line (feature audit: DB API wave) |
+| `Db/DbImpl.ExportImport.cs` | 189 | utilities/checkpoint/checkpoint_impl.cc (ExportColumnFamily, ExportFilesInMetaData), db/db_impl/db_impl.cc (CreateColumnFamilyWithImport) | line-by-line (feature audit: DB API wave) |
+| `Db/DbImpl.LockWal.cs` | 75 | db/db_impl/db_impl.cc (LockWAL, UnlockWAL) | line-by-line (feature audit: DB API wave) |
+| `Db/DbImpl.ManualCompaction.cs` | 75 | db/db_impl/db_impl_compaction_flush.cc (DisableManualCompaction, EnableManualCompaction, manual_compaction_paused_) | line-by-line (feature audit: DB API wave) |
+| `Db/DbImpl.MergeOperands.cs` | 78 | db/db_impl/db_impl.cc (PrepareGetMergeOperands, FinalizeGetMergeOperands), table/get_context.cc / db/memtable.h (continue_cb) | line-by-line (feature audit: DB API wave) |
+| `Db/DbImpl.RemoteCompaction.cs` | 509 | db/compaction/compaction_service_job.cc (ProcessKeyValueCompactionWithCompactionService, CompactionServiceCompactionJob), db/db_impl/db_impl_secondary.cc (DB::OpenAndCompact, CompactWithoutInstallation), db/compaction/compaction_picker.cc (GetCompactionInputsFromFileNumbers), file/filename.cc (RemoteCompactionJobDir) | line-by-line (feature audit: DB API wave) |
+| `Db/ImportColumnFamilyJob.cs` | 295 | db/import_column_family_job.{h,cc}, db/version_set.cc (RecoverEpochNumbers) | line-by-line (feature audit: DB API wave) |
+| `MultiScan.cs` | 301 | include/rocksdb/multi_scan.h, db/multi_scan.cc, include/rocksdb/options.h (MultiScanArgs, ScanOptions), DBIter::Prepare / BlockBasedTableIterator::Prepare (block prefetch) | line-by-line (feature audit: DB API wave) |
+| `RocksDatabase.RemoteCompaction.cs` | 36 | include/rocksdb/db.h (OpenAndCompact) | API wrapper, design-reviewed (DB API wave): delegates to audited DbImpl |
 | `RocksDb.Managed.Replication.MagicOnion/ClusterService.cs` | 237 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
 | `RocksDb.Managed.Replication.MagicOnion/Dtos.cs` | 271 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
 | `RocksDb.Managed.Replication.MagicOnion/GrpcNodeServer.cs` | 83 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
@@ -264,6 +278,7 @@ changes there need their own review.
 | `Utilities/Backup/BackupEngineOptions.cs` | 215 | include/rocksdb/utilities/backup_engine.h | line-by-line (feature audit: errors/listeners/backups (+ #3 defaults)) |
 | `Utilities/Backup/BackupEngineReadOnly.cs` | 798 | include/rocksdb/utilities/backup_engine.h, utilities/backup/backup_engine.cc | line-by-line (feature audit: errors/listeners/backups) |
 | `Utilities/Backup/BackupMeta.cs` | 406 | utilities/backup/backup_engine.cc | line-by-line (feature audit: errors/listeners/backups) |
+| `Utilities/Checkpoint/ExportImportFilesMetadata.cs` | 26 | include/rocksdb/metadata.h (ExportImportFilesMetaData), include/rocksdb/options.h (ImportColumnFamilyOptions) | API wrapper, design-reviewed (DB API wave): delegates to audited DbImpl |
 | `Utilities/Transactions/ByteKeyComparer.cs` | 31 | (managed helper) | managed-only, design-reviewed (#3): helper |
 | `Utilities/Transactions/DbImpl.TransactionReads.cs` | 37 | db/db_impl/db_impl.cc (GetImpl with columns + read callback) | line-by-line (feature audit: transactions (entities)) |
 | `Utilities/Transactions/IndexedWriteBatch.cs` | 126 | utilities/write_batch_with_index (overwrite_key adapter) | managed-only, design-reviewed (#3): adapter over WBWI |

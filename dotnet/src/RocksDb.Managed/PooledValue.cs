@@ -98,4 +98,14 @@ public sealed record LiveFileMetadata(string Name, string Directory, ulong FileN
     /// 1 in 1024 point lookups / seeks (1 in 65536 iterator steps) is counted, as 1024 reads. In memory only.
     /// </summary>
     public ulong NumReadsSampled { get; init; }
+    /// <summary>
+    /// Smallest internal key (SstFileMetaData::smallest: user key + 8-byte footer); empty when unknown (e.g. metadata
+    /// built by hand or received from the C API), in which case <see cref="RocksDatabase.CreateColumnFamilyWithImport(string, ColumnFamilyOptions, ImportColumnFamilyOptions, ExportImportFilesMetadata)"/>
+    /// reads the bounds from the file.
+    /// </summary>
+    public byte[] SmallestInternalKey { get; init; } = [];
+    /// <summary>Largest internal key (SstFileMetaData::largest); empty when unknown.</summary>
+    public byte[] LargestInternalKey { get; init; } = [];
+    /// <summary>Oldest blob file referenced by the table (SstFileMetaData::oldest_blob_file_number); 0 = none.</summary>
+    public ulong OldestBlobFileNumber { get; init; }
 }
