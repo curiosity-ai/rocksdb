@@ -246,7 +246,7 @@ public sealed class CompactOnDeletionCollectorFactory : TablePropertiesCollector
 /// <summary>
 /// Marks files for compaction when enough of their entries are eligible for the last level under the tiering feature
 /// (preclude_last_level_data_seconds): an entry is eligible when its sequence number (a TimedPut's preferred seqno) is
-/// below the compaction's last-level threshold. Files with at least <c>compactionTriggerRatio</c> × entries eligible are
+/// below the compaction's last-level threshold. Files with at least <c>compactionTriggerRatio</c> x entries eligible are
 /// marked, and files with eligible entries record "rocksdb.eligible.last.level.entries". Disabled (no collector) for
 /// ratios &lt;= 0, files created on the last level, and column families without tiering (flushes, ingestion). Port of
 /// CompactForTieringCollectorFactory (utilities/table_properties_collectors/compact_for_tiering_collector.cc); like
