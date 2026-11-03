@@ -468,6 +468,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
                             OldestAncestorTime = f.OldestAncestorTime,
                             FileCreationTime = f.FileCreationTime,
                             NumReadsSampled = f.NumReadsSampled,
+                            SmallestInternalKey = f.Smallest,
+                            LargestInternalKey = f.Largest,
+                            OldestBlobFileNumber = f.OldestBlobFileNumber,
                         });
                     }
                 }

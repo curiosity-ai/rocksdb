@@ -1207,6 +1207,35 @@ public sealed partial class BlockBasedTableReader : TableReader
     }
 
     /// <summary>ApproximateDataOffsetOf: the offset of the data block holding the key, or the data size past the end.</summary>
+    /// <summary>
+    /// The file span of the data blocks holding [<paramref name="startInternalKey"/>, <paramref name="endInternalKey"/>]
+    /// (null end = to the last data block), found through the index (the block-handle lookup of
+    /// BlockBasedTableIterator::Prepare for MultiScan). False if the range starts after the last block.
+    /// </summary>
+    internal bool TryGetDataBlockSpan(ReadOnlySpan<byte> startInternalKey, ReadOnlySpan<byte> endInternalKey, bool hasEnd, out long offset, out long length)
+    {
+        offset = length = 0;
+        IndexCursor cursor = IndexCursor.Rent(this, TableReadFlags.DontFillCache);
+        try
+        {
+            cursor.Seek(startInternalKey);
+            if (!cursor.Valid) return false;
+            offset = (long)cursor.Handle.Offset;
+            long end = (long)Properties.DataSize;
+            if (hasEnd)
+            {
+                cursor.Seek(endInternalKey);
+                if (cursor.Valid) end = (long)(cursor.Handle.Offset + cursor.Handle.Size) + BlockBasedTableConstants.BlockTrailerSize;
+            }
+            length = Math.Max(0, end - offset);
+            return length > 0;
+        }
+        finally
+        {
+            cursor.Return();
+        }
+    }
+
     private ulong ApproximateDataOffsetOf(ReadOnlySpan<byte> internalKey, ulong dataSize)
     {
         IndexCursor cursor = IndexCursor.Rent(this, TableReadFlags.DontFillCache);
