@@ -33,6 +33,11 @@ internal sealed class IngestedFileInfo
     public ulong AssignedSeqno;
     public int PickedLevel;
     public bool Copied;
+    /// <summary>file_checksum / file_checksum_func_name recorded in the MANIFEST (unknown unless generated or provided).</summary>
+    public byte[] FileChecksum = [];
+    public string FileChecksumFuncName = FileMetaData.UnknownFileChecksumFuncName;
+    /// <summary>file_temperature: the caller's hint, or the destination temperature of a copy.</summary>
+    public Temperature Temperature;
 
     public ReadOnlySpan<byte> SmallestUserKey => DbFormat.ExtractUserKey(SmallestInternalKey);
     public ReadOnlySpan<byte> LargestUserKey => DbFormat.ExtractUserKey(LargestInternalKey);
@@ -51,7 +56,9 @@ internal sealed class IngestedFileInfo
 /// ingest_behind (last level, sequence number 0; requires cf_allow_ingest_behind or the deprecated
 /// allow_ingest_behind), allow_db_generated_files (original sequence numbers kept; no overlap with the DB allowed) and
 /// the legacy write_global_seqno (removed upstream in 11.12, see <see cref="IngestExternalFileOptions.WriteGlobalSeqno"/>).
-/// Not ported: atomic_replace_range, file checksum generation, PreparedFileInfo, prefetch/temperature hints.
+/// File checksums (file_checksum_gen_factory: generated, or provided and verified / trusted per verify_file_checksum)
+/// and temperatures (the caller's hint for linked files, last_level_temperature / default_write_temperature for
+/// copies) are recorded in the MANIFEST. Not ported: atomic_replace_range, PreparedFileInfo.
 /// </para>
 /// </summary>
 internal sealed class ExternalSstFileIngestionJob
@@ -86,7 +93,8 @@ internal sealed class ExternalSstFileIngestionJob
     /// Port of ExternalSstFileIngestionJob::Prepare: reads and validates every file, detects overlapping files, then
     /// links/copies them into the DB directory under new file numbers (registered as pending outputs).
     /// </summary>
-    public async ValueTask PrepareAsync(IReadOnlyList<string> externalFiles, bool synchronous, CancellationToken ct)
+    public async ValueTask PrepareAsync(IReadOnlyList<string> externalFiles, IReadOnlyList<byte[]>? filesChecksums,
+        IReadOnlyList<string>? filesChecksumFuncNames, Temperature fileTemperature, bool synchronous, CancellationToken ct)
     {
         var paths = new HashSet<string>(StringComparer.Ordinal);
         foreach (string path in externalFiles)
@@ -98,6 +106,8 @@ internal sealed class ExternalSstFileIngestionJob
             {
                 ThrowHelper.InvalidArgument("External file column family id don't match");
             }
+            // For temperature, first assume it matches provided hint.
+            f.Info.Temperature = fileTemperature;
             _files.Add(f.Info);
         }
         if (_files.Count == 0) ThrowHelper.InvalidArgument("The list of files is empty");
@@ -139,11 +149,82 @@ internal sealed class ExternalSstFileIngestionJob
             {
                 await _db.CopyFileAsync(f.ExternalFilePath, pathInsideDb, 0, synchronous, ct).ConfigureAwait(false);
                 f.Copied = true;
+                // The destination of the copy will be ingested: "last level" temperature when the user requires
+                // ingestion to the last level, else default_write_temperature (the level is only known in Run()).
+                f.Temperature = _options.IngestBehind || _options.FailIfNotBottommostLevel
+                    ? _cfd.Options.LastLevelTemperature
+                    : _cfd.Options.DefaultWriteTemperature;
             }
+            // Linking files is assumed not to cross temperatures: the hint stays.
             f.InternalFilePath = pathInsideDb;
         }
         _fs.SyncDirectory(_db.DbPaths[0]);
+        GenerateAndVerifyChecksums(externalFiles, filesChecksums ?? [], filesChecksumFuncNames ?? []);
         DivideInputFilesIntoBatches();
+    }
+
+    /// <summary>
+    /// The checksum part of ExternalSstFileIngestionJob::Prepare. With a file_checksum_gen_factory: the checksum of every
+    /// ingested (internal) file is generated, unless verify_file_checksum is false and checksums were provided for all
+    /// files; provided checksums are then verified against the generated ones (function name: InvalidArgument; value:
+    /// Corruption), or, with verify_file_checksum = false, trusted once the factory recognizes their function name.
+    /// Without a factory nothing is recorded (provided checksums are ignored).
+    /// </summary>
+    private void GenerateAndVerifyChecksums(IReadOnlyList<string> externalFiles, IReadOnlyList<byte[]> checksums, IReadOnlyList<string> funcNames)
+    {
+        FileChecksumGenFactory? factory = _db.Options.FileChecksumGenFactory;
+        if (factory is null) return;
+        int n = _files.Count;
+        bool provided = checksums.Count == n && funcNames.Count == n;
+        bool generate = _options.VerifyFileChecksum || !provided;
+        var generated = new (byte[] Checksum, string FuncName)[generate ? n : 0];
+        if (generate)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                string requested = i < funcNames.Count ? funcNames[i] : "";
+                generated[i] = FileChecksumHelper.GenerateOneFileChecksum(_fs, _files[i].InternalFilePath, factory, requested);
+                _files[i].FileChecksum = generated[i].Checksum;
+                _files[i].FileChecksumFuncName = generated[i].FuncName;
+            }
+        }
+        if (provided)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                if (_options.VerifyFileChecksum)
+                {
+                    if (funcNames[i] != generated[i].FuncName)
+                    {
+                        ThrowHelper.InvalidArgument("DB file checksum gen factory " + factory.Name + " generated checksum function name "
+                            + generated[i].FuncName + " for file " + externalFiles[i] + " which does not match requested/provided " + funcNames[i]);
+                    }
+                    if (!checksums[i].AsSpan().SequenceEqual(generated[i].Checksum))
+                    {
+                        ThrowHelper.Corruption("Checksum verification mismatch for ingestion file " + externalFiles[i] + " using function "
+                            + generated[i].FuncName + ". Expected: " + FileChecksumHelper.Hex(checksums[i]) + " Computed: "
+                            + FileChecksumHelper.Hex(generated[i].Checksum));
+                    }
+                }
+                else
+                {
+                    // Only check that the factory recognizes the function name, then trust the provided checksum.
+                    FileChecksumGenerator? gen = factory.CreateFileChecksumGenerator(new FileChecksumGenContext(_files[i].InternalFilePath, funcNames[i]));
+                    if (gen is null || funcNames[i] != gen.Name)
+                    {
+                        ThrowHelper.InvalidArgument("Checksum function name " + funcNames[i] + " for file " + externalFiles[i]
+                            + " not recognized by DB checksum gen factory" + factory.Name + (gen is null ? "" : " Returned function " + gen.Name));
+                    }
+                    _files[i].FileChecksum = checksums[i];
+                    _files[i].FileChecksumFuncName = funcNames[i];
+                }
+            }
+        }
+        else if (checksums.Count != funcNames.Count || checksums.Count != 0)
+        {
+            ThrowHelper.InvalidArgument("The checksum information of ingested sst files are nonempty and the size of checksums or the size of the "
+                + "checksum function names does not match with the number of ingested sst files");
+        }
     }
 
     /// <summary>ExternalSstFileIngestionJob::ComputeFilesOverlap: sort copies of the ranges and check adjacent pairs.</summary>
@@ -522,6 +603,9 @@ internal sealed class ExternalSstFileIngestionJob
                 MaxTimestamp = f.MaxTimestamp,
                 UserDefinedTimestampsPersisted = f.UserDefinedTimestampsPersisted,
                 MarkedForCompaction = f.NumRangeDeletions == 1 && f.NumEntries == 0,
+                FileChecksum = f.FileChecksum,
+                FileChecksumFuncName = f.FileChecksumFuncName,
+                Temperature = f.Temperature,
             };
             if (f.DbId.Length > 0 && f.DbSessionId.Length > 0)
             {
@@ -693,6 +777,12 @@ internal sealed class ExternalSstFileIngestionJob
                 try
                 {
                     _fs.WriteAt(f.InternalFilePath, (long)f.GlobalSeqnoOffset, seqnoVal);
+                    // Since the global sequence number is updated, the file checksum needs to be recalculated.
+                    if (_db.Options.FileChecksumGenFactory is { } factory && f.FileChecksumFuncName != FileMetaData.UnknownFileChecksumFuncName)
+                    {
+                        (f.FileChecksum, f.FileChecksumFuncName) =
+                            FileChecksumHelper.GenerateOneFileChecksum(_fs, f.InternalFilePath, factory, f.FileChecksumFuncName);
+                    }
                 }
                 catch (RocksDbException e) when (e.Code == StatusCode.NotSupported)
                 {

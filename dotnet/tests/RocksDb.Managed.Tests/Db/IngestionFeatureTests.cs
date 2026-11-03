@@ -251,4 +251,154 @@ public sealed class IngestionFeatureTests
         Assert.AreEqual("s19", GetString(re, S(Key(19))!));
         Assert.AreEqual("later", GetString(re, S(Key(100))!));
     }
+
+    private static byte[] Crc32cChecksum(MemoryFileSystem fs, string path)
+    {
+        byte[] b = new byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(b, RocksDb.Managed.Util.Crc32C.Extend(0, fs.ReadAllBytes(path)));
+        return b;
+    }
+
+    private static DbOptions ChecksumOptions(MemoryFileSystem fs)
+    {
+        DbOptions o = NewOptions(fs);
+        o.FileChecksumGenFactory = FileChecksumGenCrc32cFactory.Instance;
+        return o;
+    }
+
+    /// <summary>
+    /// ExternalSstFileIngestionJob::Prepare checksum handling with file_checksum_gen_factory: generated checksums, provided
+    /// checksums verified (Corruption / InvalidArgument) or trusted with verify_file_checksum = false, incomplete
+    /// vectors refused; nothing recorded without a factory.
+    /// </summary>
+    [TestMethod]
+    public void IngestedFileChecksums()
+    {
+        MemoryFileSystem fs = NewFsWithExt();
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, ChecksumOptions(fs)))
+        {
+            string a = WriteSst(fs, "/ext/a.sst", 0, 10, "a");
+            byte[] expected = Crc32cChecksum(fs, a);
+            // Generated (no checksum provided).
+            db.IngestExternalFiles([a], new IngestExternalFileOptions());
+            LiveFileMetadata fa = FileStarting(db, 0);
+            CollectionAssert.AreEqual(expected, fa.FileChecksum);
+            Assert.AreEqual("FileChecksumCrc32c", fa.FileChecksumFuncName);
+
+            string b = WriteSst(fs, "/ext/b.sst", 20, 30, "b");
+            byte[] bSum = Crc32cChecksum(fs, b);
+            var wrongValue = Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles(db.DefaultColumnFamily, new IngestExternalFileArg
+            {
+                ExternalFiles = [b], FilesChecksums = [[1, 2, 3, 4]], FilesChecksumFuncNames = ["FileChecksumCrc32c"],
+            }));
+            Assert.AreEqual(StatusCode.Corruption, wrongValue.Code);
+            StringAssert.Contains(wrongValue.Message, "Checksum verification mismatch for ingestion file /ext/b.sst");
+            var wrongName = Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles(db.DefaultColumnFamily, new IngestExternalFileArg
+            {
+                ExternalFiles = [b], FilesChecksums = [bSum], FilesChecksumFuncNames = ["MyChecksum"],
+            }));
+            Assert.AreEqual(StatusCode.InvalidArgument, wrongName.Code);
+            var incomplete = Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles(db.DefaultColumnFamily, new IngestExternalFileArg
+            {
+                ExternalFiles = [b], FilesChecksums = [bSum],
+            }));
+            Assert.AreEqual(StatusCode.InvalidArgument, incomplete.Code);
+            // verify_file_checksum = false: the provided checksum is trusted (not recomputed).
+            db.IngestExternalFiles(db.DefaultColumnFamily, new IngestExternalFileArg
+            {
+                ExternalFiles = [b], FilesChecksums = [[9, 9, 9, 9]], FilesChecksumFuncNames = ["FileChecksumCrc32c"],
+                Options = new IngestExternalFileOptions { VerifyFileChecksum = false },
+            });
+            CollectionAssert.AreEqual(new byte[] { 9, 9, 9, 9 }, FileStarting(db, 20).FileChecksum);
+            Assert.AreEqual(StatusCode.Corruption, Assert.ThrowsExactly<RocksDbException>(db.VerifyFileChecksums).Code);
+
+            // write_global_seqno rewrites the file: its checksum is recomputed.
+            db.Put(Key(45), B("x"));
+            string c = WriteSst(fs, "/ext/c.sst", 40, 50, "c");
+            db.IngestExternalFiles([c], new IngestExternalFileOptions { WriteGlobalSeqno = true });
+            LiveFileMetadata fc = FileStarting(db, 40);
+            Assert.AreNotEqual(0UL, fc.LargestSeqno);
+            CollectionAssert.AreEqual(Crc32cChecksum(fs, fc.Directory + fc.Name), fc.FileChecksum);
+            CollectionAssert.AreNotEqual(Crc32cChecksum(fs, c), fc.FileChecksum);
+        }
+        // Recorded in the MANIFEST: survives reopen.
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, ChecksumOptions(fs)))
+        {
+            CollectionAssert.AreEqual(new byte[] { 9, 9, 9, 9 }, FileStarting(db, 20).FileChecksum);
+        }
+        // No factory: nothing recorded, provided checksums ignored, VerifyFileChecksums refused.
+        MemoryFileSystem fs2 = NewFsWithExt();
+        using RocksDatabase plain = RocksDatabase.Open(DbPath, NewOptions(fs2));
+        string d = WriteSst(fs2, "/ext/d.sst", 0, 10, "d");
+        plain.IngestExternalFiles(plain.DefaultColumnFamily, new IngestExternalFileArg
+        {
+            ExternalFiles = [d], FilesChecksums = [[1, 2, 3, 4]], FilesChecksumFuncNames = ["FileChecksumCrc32c"],
+        });
+        Assert.AreEqual("Unknown", FileStarting(plain, 0).FileChecksumFuncName);
+        Assert.AreEqual(0, FileStarting(plain, 0).FileChecksum.Length);
+        Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(plain.VerifyFileChecksums).Code);
+    }
+
+    /// <summary>Flush, compaction and blob outputs record the factory's checksum; the option is persisted by name.</summary>
+    [TestMethod]
+    public void FlushAndCompactionOutputsHaveChecksums()
+    {
+        MemoryFileSystem fs = NewFs();
+        var cf = new ColumnFamilyOptions { EnableBlobFiles = true, MinBlobSize = 50 };
+        using RocksDatabase db = RocksDatabase.Open(DbPath, ChecksumOptions(fs), cf);
+        for (int round = 0; round < 2; round++)
+        {
+            for (int i = 0; i < 100; i++) db.Put(Key(i), B(i % 4 == 0 ? new string('z', 80) : "v" + round));
+            db.Flush();
+        }
+        db.CompactRange(null, null);
+        foreach (LiveFileMetadata f in db.GetLiveFilesMetadata())
+            CollectionAssert.AreEqual(Crc32cChecksum(fs, f.Directory + f.Name), f.FileChecksum, f.Name);
+        Assert.IsTrue(db.DefaultColumnFamily.Data.Current.Storage.BlobFiles.Length > 0);
+        foreach (RocksDb.Managed.Db.Blob.BlobFileMetaData b in db.DefaultColumnFamily.Data.Current.Storage.BlobFiles)
+        {
+            Assert.AreEqual("FileChecksumCrc32c", b.Addition.ChecksumMethod);
+            CollectionAssert.AreEqual(Crc32cChecksum(fs, FileNames.BlobFileName(DbPath, b.BlobFileNumber)), b.Addition.ChecksumValue);
+        }
+        db.VerifyFileChecksums();
+        var parsed = new DbOptions();
+        parsed.SetOption("file_checksum_gen_factory", "FileChecksumGenCrc32cFactory", preserveUnknown: false);
+        Assert.AreSame(FileChecksumGenCrc32cFactory.Instance, parsed.FileChecksumGenFactory);
+        Assert.AreEqual("FileChecksumGenCrc32cFactory", ChecksumOptions(fs).GetOption("file_checksum_gen_factory"));
+        parsed.SetOption("file_checksum_gen_factory", "nullptr", preserveUnknown: false);
+        Assert.IsNull(parsed.FileChecksumGenFactory);
+    }
+
+    /// <summary>
+    /// Ingested file temperatures (ExternalSstFileIngestionJob::Prepare): copies get default_write_temperature, or
+    /// last_level_temperature when the caller requires the last level; linked files keep the caller's hint.
+    /// </summary>
+    [TestMethod]
+    public void IngestedFileTemperatures()
+    {
+        MemoryFileSystem fs = NewFsWithExt();
+        var cf = new ColumnFamilyOptions { DefaultWriteTemperature = Temperature.Warm, LastLevelTemperature = Temperature.Cold };
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cf))
+        {
+            db.IngestExternalFiles([WriteSst(fs, "/ext/1.sst", 0, 10, "a")], new IngestExternalFileOptions());
+            Assert.AreEqual(Temperature.Warm, FileStarting(db, 0).Temperature);
+            db.IngestExternalFiles([WriteSst(fs, "/ext/2.sst", 20, 30, "b")], new IngestExternalFileOptions { FailIfNotBottommostLevel = true });
+            Assert.AreEqual(Temperature.Cold, FileStarting(db, 20).Temperature);
+            db.IngestExternalFiles(db.DefaultColumnFamily, new IngestExternalFileArg
+            {
+                ExternalFiles = [WriteSst(fs, "/ext/3.sst", 40, 50, "c")],
+                Options = new IngestExternalFileOptions { LinkFiles = true },
+                FileTemperature = Temperature.Hot,
+            });
+            Assert.AreEqual(Temperature.Hot, FileStarting(db, 40).Temperature);
+            db.IngestExternalFiles(db.DefaultColumnFamily, new IngestExternalFileArg
+            {
+                ExternalFiles = [WriteSst(fs, "/ext/4.sst", 60, 70, "d")],
+                FileTemperature = Temperature.Hot,
+            });
+            Assert.AreEqual(Temperature.Warm, FileStarting(db, 60).Temperature, "a copy gets the destination temperature");
+        }
+        using RocksDatabase re = RocksDatabase.Open(DbPath, NewOptions(fs), cf);
+        Assert.AreEqual(Temperature.Hot, FileStarting(re, 40).Temperature, "recorded in the MANIFEST");
+    }
 }

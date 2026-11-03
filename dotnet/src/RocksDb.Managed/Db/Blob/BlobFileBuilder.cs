@@ -18,8 +18,8 @@ internal enum BlobFileCreationReason : byte
 /// rocksdb::BlobFileBuilder (db/blob/blob_file_builder.cc) and BlobLogWriter (db/blob/blob_log_writer.cc).
 /// A blob file is opened lazily for the first blob, rolled over once it reaches <c>blob_file_size</c> and finished
 /// (footer, fsync) by <see cref="Finish"/>. Every blob is compressed with <c>blob_compression_type</c>, even when that
-/// makes it larger (LegacyForceBuiltinCompression). File checksums are not generated (empty checksum method/value,
-/// like upstream without a file_checksum_gen_factory).
+/// makes it larger (LegacyForceBuiltinCompression). With a file_checksum_gen_factory the file checksum is computed
+/// while writing and recorded as the addition's checksum method/value (empty without one, like upstream).
 /// <para>Used by flush and compaction; one builder per job, not thread-safe. Per blob the builder does not allocate
 /// (scratch buffers are reused).</para>
 /// </summary>
@@ -149,7 +149,7 @@ internal sealed class BlobFileBuilder : IDisposable
         string path = BlobFilePath(number);
         // Recorded right after the open so a failed job can clean it up (output_file_paths_).
         CreatedFileNumbers.Add(number);
-        _file = _fs.CreateWritable(path, truncate: true, _fileOptions);
+        _file = FileChecksumHelper.CreateWritable(_fs, path, _fileOptions);
         _fileNumber = number;
         _blobCount = 0;
         _blobBytes = 0;
@@ -188,11 +188,14 @@ internal sealed class BlobFileBuilder : IDisposable
         BlobLogFormat.EncodeFooter(_header, _blobCount, 0, 0);
         f.Append(_header.AsSpan(0, BlobLogFormat.FooterSize));
         f.Sync();
+        // BlobLogWriter::AppendFooter: checksum method/value from the writer (empty without a checksum factory).
+        (byte[] checksum, string method) = FileChecksumHelper.GetChecksum(f);
+        if (checksum.Length == 0) method = "";
         f.Dispose();
         _file = null;
         _stats?.RecordTick(Ticker.BlobDbBlobFileBytesWritten, BlobLogFormat.FooterSize);
         _stats?.RecordTick(Ticker.BlobDbBlobFileSynced);
-        Additions.Add(new BlobFileAddition(_fileNumber, _blobCount, _blobBytes, "", []));
+        Additions.Add(new BlobFileAddition(_fileNumber, _blobCount, _blobBytes, method, checksum));
         _blobCount = 0;
         _blobBytes = 0;
     }

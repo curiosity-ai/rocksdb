@@ -933,7 +933,7 @@ internal sealed class CompactionJob
         };
         // Compaction outputs (of every subcompaction and of the proximal level) are charged to the DB's rate limiter at IO_LOW.
         WritableFileOptions fileOptions = _db.TableFileWriteOptions(IoPriority.Low);
-        _out.File = _db.FileSystem.CreateWritable(_out.Path, truncate: true, fileOptions);
+        _out.File = FileChecksumHelper.CreateWritable(_db.FileSystem, _out.Path, fileOptions);
         _out.Builder = new BlockBasedTableBuilder(_out.File, _cfd.Format, tbo);
         _out.HasPointKey = false;
         _out.LargestKey.Clear();
@@ -1014,6 +1014,8 @@ internal sealed class CompactionJob
                 else await file.SyncAsync(_cancellation).ConfigureAwait(false);
                 meta.FileSize = builder.FileSize;
                 meta.TailSize = builder.FileSize - builder.Properties.TailStartOffset;
+                // CompactionJob::FinishCompactionOutputFile: outfile->GetFileChecksum() / GetFileChecksumFuncName().
+                (meta.FileChecksum, meta.FileChecksumFuncName) = FileChecksumHelper.GetChecksum(file);
                 // ExtractTimestampFromTableProperties (db/builder.cc).
                 meta.MinTimestamp = builder.TimestampMin;
                 meta.MaxTimestamp = builder.TimestampMax;

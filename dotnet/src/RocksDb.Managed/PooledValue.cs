@@ -89,6 +89,10 @@ public sealed record LiveFileMetadata(string Name, string Directory, ulong FileN
     public ulong OldestAncestorTime { get; init; }
     /// <summary>File creation time, unix seconds; 0 = unknown.</summary>
     public ulong FileCreationTime { get; init; }
+    /// <summary>Whole-file checksum recorded in the MANIFEST (SstFileMetaData::file_checksum); empty when unknown.</summary>
+    public byte[] FileChecksum { get; init; } = [];
+    /// <summary>Its function name (file_checksum_func_name), "Unknown" when none was recorded.</summary>
+    public string FileChecksumFuncName { get; init; } = "Unknown";
     /// <summary>
     /// Estimated number of user reads of the file since it was added to the LSM (SstFileMetaData::num_reads_sampled):
     /// 1 in 1024 point lookups / seeks (1 in 65536 iterator steps) is counted, as 1024 reads. In memory only.

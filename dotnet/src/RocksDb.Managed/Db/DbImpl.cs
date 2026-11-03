@@ -447,6 +447,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
                             f.EpochNumber)
                         {
                             Temperature = f.Temperature,
+                            FileChecksum = f.FileChecksum,
+                            FileChecksumFuncName = f.FileChecksumFuncName,
                             OldestAncestorTime = f.OldestAncestorTime,
                             FileCreationTime = f.FileCreationTime,
                             NumReadsSampled = f.NumReadsSampled,

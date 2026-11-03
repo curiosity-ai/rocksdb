@@ -98,6 +98,12 @@ public sealed class WritableFileOptions
     /// <summary>Priority passed to <see cref="RateLimiter"/>.</summary>
     public IoPriority IoPriority { get; init; } = IoPriority.Total;
 
+    /// <summary>
+    /// The DB's file_checksum_gen_factory for this file (WritableFileWriter::checksum_generator_). Applied by the DB's
+    /// table and blob writers (FileChecksumHelper.CreateWritable), not by the file system.
+    /// </summary>
+    public FileChecksumGenFactory? FileChecksumGenFactory { get; init; }
+
     /// <summary>Statistics receiving the RATE_LIMITER_* write tickers of <see cref="RateLimiter"/> requests (WritableFileWriter::stats_).</summary>
     public RocksDb.Managed.Statistics? Statistics { get; init; }
 }
