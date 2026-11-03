@@ -206,7 +206,9 @@ The file layer (`Env/LocalFileSystem.cs`, `Env/UnixNative.cs`) uses `RandomAcces
 first try `preadv2(RWF_NOWAIT)`: a page-cache hit completes synchronously, and only a miss goes to the asynchronous
 path. Async writes use `pwritev2(RWF_NOWAIT)` where the file system supports it, and otherwise write small buffered
 writes (up to 256 KiB, such as WAL records) inline, as native RocksDB does. Large writes, direct I/O and rate-limited
-writes use the thread pool. Block-cache and memtable hits never reach the file layer, so `GetAsync` and `NextAsync`
+writes use the thread pool. `SyncAsync` hands the fdatasync to dedicated sync threads (`Env/FileSyncWorkers.cs`) so
+that a synced async write does not hold a thread-pool thread for the device flush (`LocalFileSystem.OffloadAsyncSync`
+turns this off; the hand-off costs latency with few writers, see perf.md). Block-cache and memtable hits never reach the file layer, so `GetAsync` and `NextAsync`
 usually complete synchronously. The hot async methods use `PoolingAsyncValueTaskMethodBuilder`, so even an async
 completion does not allocate.
 

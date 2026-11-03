@@ -1018,6 +1018,49 @@ waits on a reusable event when the read is still pending. Forward merges referen
 blocks instead of copying them into the operand buffer: no allocation change (the buffer was pooled), the copy saving
 only shows with large operands and is within the noise of the short job.
 
+## unordered_write
+
+`dbbench --unordered_write true` (all engines; upstream semantics in docs/architecture.md "Write path"): the write group
+only writes the WAL and publishes its sequence numbers, every writer inserts its own batch afterwards, concurrently and
+without waiting for other groups. 200k keys, 100 B values, single-key writes, medians of 3 interleaved repetitions on
+the shared 4-vCPU VM:
+
+| µs/op (wall) | ordered | unordered | ordered async | unordered async | c-native ordered | c-native unordered |
+|---|---:|---:|---:|---:|---:|---:|
+| fillrandom, 4 threads | 3.66 | **2.25** | 3.86 | **2.65** | 4.13 | 2.87 |
+| overwrite, 4 threads | 4.28 | **2.35** | 4.38 | **2.89** | 5.47 | 2.97 |
+| fillrandom, 8 threads | 6.29 | **2.30** | 3.26 | **2.09** | 4.42 | 2.58 |
+| overwrite, 8 threads | 6.30 | **2.32** | 3.76 | **2.33** | 4.77 | 2.95 |
+
+The gain (35 - 63 % managed, 31 - 46 % native) is the memtable insert leaving the group's critical section: the next
+WAL group forms while the previous writers insert. The managed engine keeps its lead over native in both modes.
+
+## Async fdatasync on dedicated sync threads
+
+`LocalWritableFile.SyncAsync` used to call fdatasync inline: the async caller (a thread-pool thread, typically the write
+group leader) was blocked for the device flush. It now queues the fdatasync to `FileSyncWorkers` (dedicated threads,
+pooled `IValueTaskSource`, asynchronous continuations) and awaits it; `LocalFileSystem.OffloadAsyncSync = false` (and
+`dbbench --offload_async_sync false`) restores the inline call. `fillsync` (num/1000 = 10k synced puts, 100 B), medians
+of 3 interleaved repetitions, same build, `offload_async_sync` false (= previous behaviour) vs true:
+
+| fillsync µs/op (wall) | 1 thread | 4 threads | 16 threads | 64 threads |
+|---|---:|---:|---:|---:|
+| async API, inline fdatasync (before) | 159 | 79.5 | 33.4 | 14.4 |
+| async API, sync threads (after) | 244 | 115 | 40.6 | 16.6 |
+| sync API, before / after (unchanged path, noise) | 177 / 157 | 119 / 126 | 49.7 / 51.4 | 36.4 / 38.2 |
+
+fdatasync itself takes ~140 µs here (virtual disk). The hand-off costs two thread wake-ups per sync -- the sync worker,
+then the leader's continuation on the thread pool -- which this VM makes expensive: +85 µs per group at one writer,
+shrinking to +15 % at 64 writers where groups are large. Variants measured on the way (same harness, 3 interleaved
+repetitions each): continuations run inline on the sync thread (t1 208, t4 126, t16 46 µs/op; rejected: user code would
+run on, and could block, the sync threads), workers polling the queue 30 / 50 / 200 µs before blocking (50 µs kept: t1
+268 -> 229 with asynchronous continuations; 200 µs burned 3x the CPU per op for nothing), and a hybrid that synced inline
+when the thread pool had no queued work (t1 168, t4 109: the queue is rarely empty with 4+ writers, and it would still
+block pool threads). Allocation per op is unchanged (pooled requests). What the change buys is not throughput on an idle
+pool but that synced async writers no longer hold thread-pool threads for the duration of the device flush (on real
+disks: milliseconds), which is what starves other async work on a busy server; latency-sensitive single-writer
+workloads on fast storage can turn it off.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).

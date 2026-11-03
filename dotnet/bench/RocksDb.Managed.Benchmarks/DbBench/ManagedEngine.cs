@@ -42,7 +42,7 @@ public sealed class ManagedEngine : IKeyValueEngine
             _ => throw new ArgumentOutOfRangeException(nameof(options), options.CacheType, "unknown cache type"),
         };
         if (options.BloomBitsPerKey > 0) cfo.TableOptions.FilterPolicy = new BloomFilterPolicy(options.BloomBitsPerKey);
-        var dbo = new DbOptions { CreateIfMissing = true, FileSystem = LocalFileSystem.Instance, MaxBackgroundJobs = options.MaxBackgroundJobs,
+        var dbo = new DbOptions { CreateIfMissing = true, FileSystem = options.OffloadAsyncSync ? LocalFileSystem.Instance : new LocalFileSystem { OffloadAsyncSync = false }, MaxBackgroundJobs = options.MaxBackgroundJobs,
             MaxSubcompactions = options.MaxSubcompactions, CompactionReadaheadSize = options.CompactionReadaheadSize,
             AllowConcurrentMemtableWrite = options.AllowConcurrentMemtableWrite, EnableWriteThreadAdaptiveYield = options.EnableWriteThreadAdaptiveYield,
             EnablePipelinedWrite = options.EnablePipelinedWrite, UnorderedWrite = options.UnorderedWrite };
