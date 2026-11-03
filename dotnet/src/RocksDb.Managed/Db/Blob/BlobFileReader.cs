@@ -35,9 +35,9 @@ internal sealed class BlobFileReader : IDisposable
     /// files still being written): validates the header only. Readable bytes are those made visible with
     /// <see cref="ExtendVisibleSize"/> (no footer is assumed: IsValidBlobOffset with has_footer = false).
     /// </summary>
-    public static BlobFileReader OpenUnsealed(IFileSystem fs, string path, uint columnFamilyId, Statistics? stats)
+    public static BlobFileReader OpenUnsealed(IFileSystem fs, string path, uint columnFamilyId, Statistics? stats, HistogramImpl? readHistogram)
     {
-        IRandomAccessFile file = fs.OpenRandomAccess(path);
+        IRandomAccessFile file = OpenFile(fs, path, stats, readHistogram);
         try
         {
             if ((ulong)file.Length < BlobLogFormat.HeaderSize) ThrowHelper.Corruption("Malformed blob file");
@@ -77,9 +77,9 @@ internal sealed class BlobFileReader : IDisposable
     public ulong FileSize => _fileSize;
 
     /// <summary>BlobFileReader::Create (OpenFile + ReadHeader + ReadFooter). Throws Corruption / IOError / PathNotFound.</summary>
-    public static BlobFileReader Open(IFileSystem fs, string path, uint columnFamilyId, Statistics? stats)
+    public static BlobFileReader Open(IFileSystem fs, string path, uint columnFamilyId, Statistics? stats, HistogramImpl? readHistogram)
     {
-        IRandomAccessFile file = fs.OpenRandomAccess(path);
+        IRandomAccessFile file = OpenFile(fs, path, stats, readHistogram);
         try
         {
             ulong fileSize = (ulong)file.Length;
@@ -103,6 +103,17 @@ internal sealed class BlobFileReader : IDisposable
             file.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// BlobFileReader::OpenFile: with statistics, reads go through the RandomAccessFileReader timing
+    /// (BLOB_DB_BLOB_FILE_READ_MICROS, the activity histogram and InternalStats' blob_file_read_latency_,
+    /// <paramref name="readHistogram"/>).
+    /// </summary>
+    private static IRandomAccessFile OpenFile(IFileSystem fs, string path, Statistics? stats, HistogramImpl? readHistogram)
+    {
+        IRandomAccessFile file = fs.OpenRandomAccess(path);
+        return stats is null ? file : new Monitoring.StatisticsRandomAccessFile(file, stats, readHistogram, Histogram.BlobDbBlobFileReadMicros);
     }
 
     private static void ReadExactly(IRandomAccessFile file, string path, long offset, Span<byte> dst, Statistics? stats)
@@ -208,6 +219,8 @@ internal sealed class BlobFileReader : IDisposable
             output.Write(value);
             return;
         }
+        // StopWatch(BLOB_DB_DECOMPRESSION_MICROS) around DecompressBlock (UncompressBlobIfNeeded).
+        long t0 = _stats?.StartTimer() ?? 0;
         try
         {
             // The blob format has always used compression format 2.
@@ -217,6 +230,7 @@ internal sealed class BlobFileReader : IDisposable
         {
             ThrowHelper.Corruption(e.Message);
         }
+        _stats?.RecordElapsedMicros(Histogram.BlobDbDecompressionMicros, t0);
     }
 
     /// <summary>BlobFileReader::VerifyBlob.</summary>

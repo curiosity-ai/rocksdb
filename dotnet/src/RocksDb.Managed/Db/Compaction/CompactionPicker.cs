@@ -31,6 +31,16 @@ internal abstract partial class CompactionPicker
     public IReadOnlyCollection<Compaction> Level0CompactionsInProgress => _level0CompactionsInProgress;
     public bool IsLevel0CompactionInProgress => _level0CompactionsInProgress.Count > 0;
 
+    /// <summary>CompactionPicker::IsCompactionInProgress: any registered compaction (incl. file-ingesting ones).</summary>
+    public bool IsCompactionInProgress => _compactionsInProgress.Count > 0;
+
+    /// <summary>Port of CompactionPicker::UnregisterCompaction (a compaction that marked no files, e.g. file-ingesting).</summary>
+    public void UnregisterCompaction(Compaction c)
+    {
+        _level0CompactionsInProgress.Remove(c);
+        _compactionsInProgress.Remove(c);
+    }
+
     /// <summary>Whether the version needs (automatic) compaction.</summary>
     public abstract bool NeedsCompaction(VersionStorageInfo vstorage);
 
@@ -174,18 +184,22 @@ internal abstract partial class CompactionPicker
         return !AreFilesInCompaction(inputs.Files);
     }
 
-    /// <summary>Port of CompactionPicker::RangeOverlapWithCompaction.</summary>
-    public bool RangeOverlapWithCompaction(ReadOnlySpan<byte> smallestUserKey, ReadOnlySpan<byte> largestUserKey, int level)
+    /// <summary>
+    /// Port of CompactionPicker::RangeOverlapWithCompaction. With <paramref name="rangeLimitExclusive"/>,
+    /// <paramref name="largestUserKey"/> is an exclusive limit.
+    /// </summary>
+    public bool RangeOverlapWithCompaction(ReadOnlySpan<byte> smallestUserKey, ReadOnlySpan<byte> largestUserKey, int level, bool rangeLimitExclusive)
     {
         foreach (Compaction c in _compactionsInProgress)
         {
+            int largestCmp = VersionStorageInfo.CompareWithoutTimestamp(Icmp, largestUserKey, c.SmallestUserKey);
             if (c.OutputLevel == level
                 && VersionStorageInfo.CompareWithoutTimestamp(Icmp, smallestUserKey, c.LargestUserKey) <= 0
-                && VersionStorageInfo.CompareWithoutTimestamp(Icmp, largestUserKey, c.SmallestUserKey) >= 0)
+                && (rangeLimitExclusive ? largestCmp > 0 : largestCmp >= 0))
             {
                 return true;
             }
-            if (c.SupportsPerKeyPlacement && c.OverlapProximalLevelOutputRange(smallestUserKey, largestUserKey)) return true;
+            if (c.SupportsPerKeyPlacement && c.OverlapProximalLevelOutputRange(smallestUserKey, largestUserKey, rangeLimitExclusive)) return true;
         }
         return false;
     }
@@ -212,15 +226,15 @@ internal abstract partial class CompactionPicker
         {
             if (Options.CompactionStyle == CompactionStyle.Universal)
             {
-                if (RangeOverlapWithCompaction(DbFormat.ExtractUserKey(smallest), DbFormat.ExtractUserKey(largest), proximalLevel)) return true;
+                if (RangeOverlapWithCompaction(DbFormat.ExtractUserKey(smallest), DbFormat.ExtractUserKey(largest), proximalLevel, rangeLimitExclusive: false)) return true;
             }
             else if (GetRange(inputs, out byte[] proximalSmallest, out byte[] proximalLargest, level)
-                     && RangeOverlapWithCompaction(DbFormat.ExtractUserKey(proximalSmallest), DbFormat.ExtractUserKey(proximalLargest), proximalLevel))
+                     && RangeOverlapWithCompaction(DbFormat.ExtractUserKey(proximalSmallest), DbFormat.ExtractUserKey(proximalLargest), proximalLevel, rangeLimitExclusive: false))
             {
                 return true;
             }
         }
-        return RangeOverlapWithCompaction(DbFormat.ExtractUserKey(smallest), DbFormat.ExtractUserKey(largest), level);
+        return RangeOverlapWithCompaction(DbFormat.ExtractUserKey(smallest), DbFormat.ExtractUserKey(largest), level, rangeLimitExclusive: false);
     }
 
     /// <summary>Port of CompactionPicker::IsRangeInCompaction.</summary>

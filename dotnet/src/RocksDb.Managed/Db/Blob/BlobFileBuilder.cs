@@ -103,7 +103,10 @@ internal sealed class BlobFileBuilder : IDisposable
         if (_compression != CompressionType.None)
         {
             _compressed.Clear();
+            // StopWatch(BLOB_DB_COMPRESSION_MICROS) (BlobFileBuilder::CompressBlobIfNeeded).
+            long tc = _stats?.StartTimer() ?? 0;
             BlockCompression.CompressForced(_compression, value, BlockCompression.DefaultCompressionLevel, _compressed);
+            _stats?.RecordElapsedMicros(Histogram.BlobDbCompressionMicros, tc);
             blob = _compressed.WrittenSpan;
         }
         ulong fileNumber = _fileNumber;
@@ -155,7 +158,7 @@ internal sealed class BlobFileBuilder : IDisposable
         _blobBytes = 0;
         // BlobLogHeader(column_family_id, blob_compression_type, has_ttl = false, expiration_range = (0, 0)).
         BlobLogFormat.EncodeHeader(_header, _columnFamilyId, _compression, hasTtl: false, 0, 0);
-        _file.Append(_header.AsSpan(0, BlobLogFormat.HeaderSize));
+        Append(_file, _header.AsSpan(0, BlobLogFormat.HeaderSize));
         _stats?.RecordTick(Ticker.BlobDbBlobFileBytesWritten, BlobLogFormat.HeaderSize);
     }
 
@@ -165,14 +168,22 @@ internal sealed class BlobFileBuilder : IDisposable
         IWritableFile f = _file!;
         ulong recordOffset = (ulong)f.Size;
         BlobLogFormat.EncodeRecordHeader(_recordHeader, key, blob, expiration: 0);
-        f.Append(_recordHeader);
-        f.Append(key);
-        f.Append(blob);
+        Append(f, _recordHeader);
+        Append(f, key);
+        Append(f, blob);
         _blobCount++;
         ulong recordBytes = BlobLogFormat.RecordHeaderSize + (ulong)key.Length + (ulong)blob.Length;
         _blobBytes += recordBytes;
         _stats?.RecordTick(Ticker.BlobDbBlobFileBytesWritten, recordBytes);
         return recordOffset + BlobLogFormat.RecordHeaderSize + (ulong)key.Length;
+    }
+
+    /// <summary>WritableFileWriter::Append with its StopWatch(BLOB_DB_BLOB_FILE_WRITE_MICROS).</summary>
+    private void Append(IWritableFile file, ReadOnlySpan<byte> data)
+    {
+        long t0 = _stats?.StartTimer() ?? 0;
+        file.Append(data);
+        _stats?.RecordElapsedMicros(Histogram.BlobDbBlobFileWriteMicros, t0);
     }
 
     private void CloseBlobFileIfNeeded()
@@ -186,8 +197,11 @@ internal sealed class BlobFileBuilder : IDisposable
     {
         IWritableFile f = _file!;
         BlobLogFormat.EncodeFooter(_header, _blobCount, 0, 0);
-        f.Append(_header.AsSpan(0, BlobLogFormat.FooterSize));
+        Append(f, _header.AsSpan(0, BlobLogFormat.FooterSize));
+        // BlobLogWriter::Sync: StopWatch(BLOB_DB_BLOB_FILE_SYNC_MICROS).
+        long ts = _stats?.StartTimer() ?? 0;
         f.Sync();
+        _stats?.RecordElapsedMicros(Histogram.BlobDbBlobFileSyncMicros, ts);
         // BlobLogWriter::AppendFooter: checksum method/value from the writer (empty without a checksum factory).
         (byte[] checksum, string method) = FileChecksumHelper.GetChecksum(f);
         if (checksum.Length == 0) method = "";

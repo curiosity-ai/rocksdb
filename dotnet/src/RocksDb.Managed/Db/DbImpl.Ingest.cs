@@ -106,13 +106,34 @@ internal sealed partial class DbImpl
                 ThrowHelper.InvalidArgument("Can't ingest_behind file in ColumnFamily %s with cf_allow_ingest_behind=false");
             }
         }
+        if (arg.AtomicReplaceRange is { } replaceRange)
+        {
+            if (cfd.Options.CompactionStyle == CompactionStyle.Fifo) ThrowHelper.NotSupported("atomic_replace_range is not supported with FIFO compaction.");
+            if (options.IngestBehind) ThrowHelper.InvalidArgument("Can't combine atomic_replace_range with ingest_behind.");
+            // TODO upstream: support generating and ingesting a big tombstone file, which might depend on non-null start
+            // and limit.
+            if (options.SnapshotConsistency) ThrowHelper.NotSupported("atomic_replace_range not yet supported with snapshot_consistency.");
+            if ((replaceRange.Start is null) != (replaceRange.Limit is null))
+            {
+                ThrowHelper.NotSupported("Only one of atomic_replace_range.{start,limit}.has_value() is not supported.");
+            }
+        }
         if (options.MoveFiles && options.LinkFiles) ThrowHelper.InvalidArgument("`move_files` and `link_files` can not both be true.");
         var job = new ExternalSstFileIngestionJob(this, cfd, options);
         bool success = false;
         BeginIngestion();
         try
         {
-            await job.PrepareAsync(files, arg.FilesChecksums, arg.FilesChecksumFuncNames, arg.FileTemperature, synchronous, ct).ConfigureAwait(false);
+            SuperVersion prepareSv = GetReferencedSuperVersion(cfd);
+            try
+            {
+                await job.PrepareAsync(files, arg.FilesChecksums, arg.FilesChecksumFuncNames, arg.FileTemperature, arg.AtomicReplaceRange,
+                    prepareSv.Current.Storage, synchronous, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                ReturnSuperVersion(prepareSv);
+            }
             for (int attempt = 0; ; attempt++)
             {
                 // Stop writes to the DB (WriteThread::EnterUnbatched), then check the memtables.
@@ -125,27 +146,57 @@ internal sealed partial class DbImpl
                     SuperVersion sv = GetReferencedSuperVersion(cfd);
                     try
                     {
-                        needFlush = job.OverlapsWithMemtables(sv);
+                        needFlush = job.NeedsFlush(sv);
                         if (!needFlush)
                         {
-                            bool hasSnapshots = SnapshotCount > 0;
-                            ulong last = Versions.LastSequence;
-                            VersionEdit edit = job.Run(sv, last, hasSnapshots);
+                            VersionEdit edit;
+                            ulong last;
+                            lock (_mutex)
+                            {
+                                // Run picks levels from the current version and checks running compactions; RegisterRange
+                                // then keeps compactions picked while LogAndApply releases the mutex away from the
+                                // ingested ranges and the replaced files.
+                                bool hasSnapshots = SnapshotCount > 0;
+                                last = Versions.LastSequence;
+                                edit = job.Run(last, hasSnapshots);
+                                job.RegisterRange();
+                            }
                             // Every file of an overlapping batch (or every file with snapshots) gets its own sequence
                             // number; DB-generated files bring their own. max_assigned_seqno > last_seqno consumes them.
                             ulong maxAssigned = job.MaxAssignedSeqno;
                             bool consumed = maxAssigned > last;
-                            if (consumed) Versions.AllocateSequence(maxAssigned - last);
-                            // The MANIFEST edit records the files' largest seqno itself (VersionEdit.AddFile), so the last
-                            // sequence is published only once the files are installed: a snapshot taken while the MANIFEST
-                            // is written must not get the ingested files' seqno before they are visible (DBImpl::
-                            // IngestExternalFiles updates the last seqno after LogAndApply for the same reason).
-                            await Versions.LogAndApplyAsync(cfd, edit, synchronous, CancellationToken.None).ConfigureAwait(false);
-                            lock (_mutex)
+                            bool applied = false;
+                            try
                             {
-                                if (consumed) Versions.SetLastSequence(maxAssigned);
-                                InstallSuperVersion(cfd);
-                                foreach (IngestedFileInfo f in job.Files) _pendingOutputs.Remove(f.FileNumber);
+                                if (consumed) Versions.AllocateSequence(maxAssigned - last);
+                                TestHooks.Invoke("DBImpl::IngestExternalFiles:BeforeLogAndApply");
+                                // The MANIFEST edit records the files' largest seqno itself (VersionEdit.AddFile), so the
+                                // last sequence is published only once the files are installed: a snapshot taken while
+                                // the MANIFEST is written must not get the ingested files' seqno before they are visible
+                                // (DBImpl::IngestExternalFiles updates the last seqno after LogAndApply for the same
+                                // reason).
+                                await Versions.LogAndApplyAsync(cfd, edit, synchronous, CancellationToken.None).ConfigureAwait(false);
+                                applied = true;
+                            }
+                            finally
+                            {
+                                lock (_mutex)
+                                {
+                                    job.UnregisterRange(restoreCompactionCandidates: !applied);
+                                    if (applied)
+                                    {
+                                        if (consumed) Versions.SetLastSequence(maxAssigned);
+                                        InstallSuperVersion(cfd);
+                                        foreach (ulong n in job.ReservedFileNumbers) _pendingOutputs.Remove(n);
+                                    }
+                                    else if (_compactionsEnabled)
+                                    {
+                                        // Compaction may have been skipped while replacement files were reserved. Retry
+                                        // now that the failed ingestion has released them.
+                                        SchedulePendingCompaction(cfd);
+                                        MaybeScheduleCompaction();
+                                    }
+                                }
                             }
                             if (consumed) NotifySequenceWaiters();
                             success = true;
@@ -171,7 +222,10 @@ internal sealed partial class DbImpl
                 if (attempt >= 8) throw new RocksDbException(StatusCode.TryAgain, "Operation failed. Try again.: memtable keeps overlapping the ingested files");
                 await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.ExternalFileIngestion, synchronous, ct).ConfigureAwait(false);
             }
+            job.DeleteUnusedRangeTombstone();
             job.DeleteExternalLinks();
+            // Replaced files (atomic_replace_range) are obsolete now.
+            if (job.NumFilesReplaced > 0) PurgeObsoleteFiles();
             NotifyOnExternalFileIngested(cfd, job);
         }
         finally
@@ -182,7 +236,7 @@ internal sealed partial class DbImpl
                 job.DeleteInternalFiles();
                 lock (_mutex)
                 {
-                    foreach (IngestedFileInfo f in job.Files) _pendingOutputs.Remove(f.FileNumber);
+                    foreach (ulong n in job.ReservedFileNumbers) _pendingOutputs.Remove(n);
                 }
             }
         }

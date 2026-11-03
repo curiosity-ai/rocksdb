@@ -19,6 +19,10 @@ namespace RocksDb.Managed.Env;
 /// copied into that gap on the swap (no re-read). Blocks larger than the gap are read directly.</para>
 /// <para>Not thread-safe (one per iterator). Buffers come from <see cref="ArrayPool{T}.Shared"/>; dispose (or
 /// <see cref="Reset"/>) waits for a pending prefetch before reusing them.</para>
+/// <para>Allocation-free in steady state: the pending read is kept as its <see cref="ValueTask{TResult}"/> (no
+/// <c>AsTask</c> / <c>Task.FromResult</c> per prefetch); one that has not completed when it is started gets a cached
+/// continuation that records its result and signals a reusable event the reader waits on (a pooled
+/// <see cref="System.Threading.Tasks.Sources.IValueTaskSource{TResult}"/> must not be blocked on directly).</para>
 /// </remarks>
 public sealed class AsyncPrefetchBuffer : IDisposable
 {
@@ -41,7 +45,16 @@ public sealed class AsyncPrefetchBuffer : IDisposable
     private byte[] _next = [];
     private int _nextStart;
     private long _nextOffset = -1;
-    private Task<int>? _pending;
+
+    // The pending prefetch: _hasPending while a read was issued and its result not consumed. A read that completed
+    // synchronously stores its outcome directly (_pendingDone); otherwise OnPrefetchCompleted stores it and sets _done.
+    private bool _hasPending;
+    private volatile bool _pendingDone;
+    private ValueTask<int> _pendingTask;
+    private int _pendingResult;
+    private Exception? _pendingError;
+    private ManualResetEventSlim? _done;
+    private Action? _onCompleted;
 
     /// <param name="readaheadSize">Bytes per read (compaction_readahead_size).</param>
     public AsyncPrefetchBuffer(int readaheadSize) : this(readaheadSize, readaheadSize)
@@ -108,7 +121,7 @@ public sealed class AsyncPrefetchBuffer : IDisposable
     public bool TryRead(long offset, int length, out ReadOnlySpan<byte> data)
     {
         if (TryGetBuffered(offset, length, out data)) return true;
-        if (_pending is not null && offset >= _curOffset && offset <= _nextOffset && TrySwap(offset, length, out data)) return true;
+        if (_hasPending && offset >= _curOffset && offset <= _nextOffset && TrySwap(offset, length, out data)) return true;
         return ReadMiss(offset, length, out data);
     }
 
@@ -127,10 +140,8 @@ public sealed class AsyncPrefetchBuffer : IDisposable
     /// <summary>Moves to the prefetched chunk, keeping the tail of the current one from <paramref name="offset"/>.</summary>
     private bool TrySwap(long offset, int length, out ReadOnlySpan<byte> data)
     {
-        Task<int> pending = _pending!;
-        if (!pending.IsCompleted) PrefetchWaits++;
-        int n = pending.GetAwaiter().GetResult();
-        _pending = null;
+        if (!_pendingDone) PrefetchWaits++;
+        int n = TakePending();
         int tail = (int)(_nextOffset - offset); // bytes of the requested range still in the current window
         if (tail > _nextStart)
         {
@@ -185,7 +196,54 @@ public sealed class AsyncPrefetchBuffer : IDisposable
         Prefetches++;
         GrowReadahead();
         ValueTask<int> t = _file!.ReadAsync(start, _next.AsMemory(_nextStart, len));
-        _pending = t.IsCompletedSuccessfully ? Task.FromResult(t.Result) : t.AsTask();
+        _hasPending = true;
+        _pendingError = null;
+        if (t.IsCompleted)
+        {
+            // Completed synchronously (page-cache hit, in-memory file): consume it now.
+            try
+            {
+                _pendingResult = t.GetAwaiter().GetResult();
+            }
+            catch (Exception e)
+            {
+                _pendingError = e;
+            }
+            _pendingDone = true;
+            return;
+        }
+        _pendingDone = false;
+        _pendingTask = t;
+        ManualResetEventSlim done = _done ??= new ManualResetEventSlim(false);
+        done.Reset();
+        t.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(_onCompleted ??= OnPrefetchCompleted);
+    }
+
+    /// <summary>Continuation of a prefetch that completed asynchronously: records its outcome and wakes the reader.</summary>
+    private void OnPrefetchCompleted()
+    {
+        try
+        {
+            _pendingResult = _pendingTask.GetAwaiter().GetResult();
+        }
+        catch (Exception e)
+        {
+            _pendingError = e;
+        }
+        _pendingTask = default;
+        _pendingDone = true;
+        _done!.Set();
+    }
+
+    /// <summary>Waits for the pending prefetch and returns its byte count (rethrows its failure). PRE: one is pending.</summary>
+    private int TakePending()
+    {
+        if (!_pendingDone) _done!.Wait();
+        _hasPending = false;
+        Exception? e = _pendingError;
+        _pendingError = null;
+        if (e is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(e);
+        return _pendingResult;
     }
 
     private static void Rent(ref byte[] buffer, int size)
@@ -197,12 +255,10 @@ public sealed class AsyncPrefetchBuffer : IDisposable
 
     private void WaitPendingIgnoringErrors()
     {
-        Task<int>? p = _pending;
-        _pending = null;
-        if (p is null) return;
+        if (!_hasPending) return;
         try
         {
-            p.GetAwaiter().GetResult();
+            TakePending();
         }
         catch (Exception)
         {
@@ -219,5 +275,7 @@ public sealed class AsyncPrefetchBuffer : IDisposable
         if (_next.Length > 0) ArrayPool<byte>.Shared.Return(_next);
         _cur = [];
         _next = [];
+        _done?.Dispose();
+        _done = null;
     }
 }

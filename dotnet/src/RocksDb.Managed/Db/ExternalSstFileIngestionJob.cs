@@ -38,6 +38,8 @@ internal sealed class IngestedFileInfo
     public string FileChecksumFuncName = FileMetaData.UnknownFileChecksumFuncName;
     /// <summary>file_temperature: the caller's hint, or the destination temperature of a copy.</summary>
     public Temperature Temperature;
+    /// <summary>generated_for_ingestion: the range tombstone file of an atomic replace (no external file to unlink).</summary>
+    public bool GeneratedForIngestion;
 
     public ReadOnlySpan<byte> SmallestUserKey => DbFormat.ExtractUserKey(SmallestInternalKey);
     public ReadOnlySpan<byte> LargestUserKey => DbFormat.ExtractUserKey(LargestInternalKey);
@@ -58,7 +60,12 @@ internal sealed class IngestedFileInfo
 /// the legacy write_global_seqno (removed upstream in 11.12, see <see cref="IngestExternalFileOptions.WriteGlobalSeqno"/>).
 /// File checksums (file_checksum_gen_factory: generated, or provided and verified / trusted per verify_file_checksum)
 /// and temperatures (the caller's hint for linked files, last_level_temperature / default_write_temperature for
-/// copies) are recorded in the MANIFEST. Not ported: atomic_replace_range, PreparedFileInfo.
+/// copies) are recorded in the MANIFEST. atomic_replace_range (IngestExternalFileArg): the table files inside the range
+/// are deleted in the same VersionEdit (AddFileToReplace), and with universal compaction a partial overlap is handled
+/// by ingesting a generated range tombstone file below the new files (PrepareAtomicReplaceRangeTombstone /
+/// ActivateAtomicReplaceRangeTombstone). The equivalent file-ingesting compactions are registered (and the replaced
+/// files marked as being compacted) between <see cref="Run"/> and the end of LogAndApply (RegisterRange /
+/// UnregisterRange). Not ported: PreparedFileInfo.
 /// </para>
 /// </summary>
 internal sealed class ExternalSstFileIngestionJob
@@ -71,6 +78,22 @@ internal sealed class ExternalSstFileIngestionJob
     private readonly List<IngestedFileInfo> _files = new();
     /// <summary>file_batches_to_ingest_: older batches first.</summary>
     private readonly List<List<IngestedFileInfo>> _batches = new();
+    /// <summary>Every file number reserved by this job (pending outputs until the ingestion ends).</summary>
+    private readonly List<ulong> _reservedFileNumbers = new();
+
+    // atomic_replace_range_: _hasReplaceRange false = no replacement; empty keys = the whole column family
+    // (KeyRangeInfo::unset()).
+    private bool _hasReplaceRange;
+    private byte[] _replaceSmallest = [];
+    private byte[] _replaceLargest = [];
+    // atomic_replace_range_tombstone_ (prepared, not yet part of _files) / atomic_replace_range_tombstone_active_.
+    private IngestedFileInfo? _tombstone;
+    private bool _tombstoneActive;
+    // files_to_replace_ (with their levels), files_to_replace_marked_.
+    private readonly List<(int Level, FileMetaData File)> _filesToReplace = new();
+    private bool _filesToReplaceMarked;
+    // file_ingesting_compactions_.
+    private readonly List<Compaction> _fileIngestingCompactions = new();
 
     public ExternalSstFileIngestionJob(DbImpl db, ColumnFamilyData cfd, IngestExternalFileOptions options)
     {
@@ -81,6 +104,15 @@ internal sealed class ExternalSstFileIngestionJob
     }
 
     public IReadOnlyList<IngestedFileInfo> Files => _files;
+
+    /// <summary>File numbers reserved by this job (the caller releases them from the pending outputs at the end).</summary>
+    public IReadOnlyList<ulong> ReservedFileNumbers => _reservedFileNumbers;
+
+    /// <summary>Number of table files the edit of <see cref="Run"/> deletes (atomic_replace_range).</summary>
+    public int NumFilesReplaced => _filesToReplace.Count;
+
+    /// <summary>The generated range tombstone file was ingested (atomic replace with a partial overlap).</summary>
+    public bool RangeTombstoneIngested => _tombstoneActive;
     public bool FilesOverlap { get; private set; }
 
     /// <summary>
@@ -94,7 +126,8 @@ internal sealed class ExternalSstFileIngestionJob
     /// links/copies them into the DB directory under new file numbers (registered as pending outputs).
     /// </summary>
     public async ValueTask PrepareAsync(IReadOnlyList<string> externalFiles, IReadOnlyList<byte[]>? filesChecksums,
-        IReadOnlyList<string>? filesChecksumFuncNames, Temperature fileTemperature, bool synchronous, CancellationToken ct)
+        IReadOnlyList<string>? filesChecksumFuncNames, Temperature fileTemperature, IngestReplaceRange? atomicReplaceRange, VersionStorageInfo vstorage,
+        bool synchronous, CancellationToken ct)
     {
         var paths = new HashSet<string>(StringComparer.Ordinal);
         foreach (string path in externalFiles)
@@ -112,6 +145,34 @@ internal sealed class ExternalSstFileIngestionJob
         }
         if (_files.Count == 0) ThrowHelper.InvalidArgument("The list of files is empty");
         FilesOverlap = ComputeFilesOverlap();
+
+        if (atomicReplaceRange is not null)
+        {
+            _hasReplaceRange = true;
+            if (atomicReplaceRange.Start is { } start && atomicReplaceRange.Limit is { } limit)
+            {
+                if (_cfd.UserComparator.CompareWithoutTimestamp(start, limit) >= 0)
+                {
+                    ThrowHelper.InvalidArgument("Atomic replace range limit must be greater than start");
+                }
+                // User keys to internal keys (with timestamps): MaybeAddTimestampsToRange appends the maximum timestamp
+                // to both bounds (the limit is exclusive).
+                byte[] startTs = WithMaxTimestamp(start);
+                byte[] limitTs = WithMaxTimestamp(limit);
+                _replaceSmallest = new InternalKey(startTs, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek).Encoded.ToArray();
+                // RangeTombstone(start, limit, kMaxSequenceNumber).SerializeEndKey()
+                _replaceLargest = new InternalKey(limitTs, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion).Encoded.ToArray();
+                // Check files to ingest against replace range
+                foreach (IngestedFileInfo f in _files)
+                {
+                    if (!ReplaceRangeContains(f.SmallestInternalKey, f.LargestInternalKey))
+                    {
+                        ThrowHelper.InvalidArgument("Atomic replace range does not contain all files");
+                    }
+                }
+            }
+        }
+
         if (FilesOverlap)
         {
             if (_options.IngestBehind) ThrowHelper.NotSupported("Files with overlapping ranges cannot be ingested with ingestion behind mode.");
@@ -131,6 +192,7 @@ internal sealed class ExternalSstFileIngestionJob
         foreach (IngestedFileInfo f in _files)
         {
             f.FileNumber = _db.ReserveFileNumberForIngestion();
+            _reservedFileNumbers.Add(f.FileNumber);
             string pathInsideDb = FileNames.TableFileName(_db.DbPaths, f.FileNumber, 0);
             bool linked = false;
             if (_options.MoveFiles || _options.LinkFiles)
@@ -158,8 +220,129 @@ internal sealed class ExternalSstFileIngestionJob
             // Linking files is assumed not to cross temperatures: the hint stays.
             f.InternalFilePath = pathInsideDb;
         }
+        if (CanUseAtomicReplaceRangeTombstone(atomicReplaceRange) && HasPartialOverlap(vstorage))
+        {
+            PrepareAtomicReplaceRangeTombstone(atomicReplaceRange!.Start!, atomicReplaceRange.Limit!);
+        }
         _fs.SyncDirectory(_db.DbPaths[0]);
         GenerateAndVerifyChecksums(externalFiles, filesChecksums ?? [], filesChecksumFuncNames ?? []);
+        DivideInputFilesIntoBatches();
+    }
+
+    private byte[] WithMaxTimestamp(byte[] userKey)
+    {
+        int ts = _cfd.TimestampSize;
+        if (ts == 0) return userKey;
+        byte[] r = new byte[userKey.Length + ts];
+        userKey.CopyTo(r, 0);
+        r.AsSpan(userKey.Length).Fill(0xff);
+        return r;
+    }
+
+    /// <summary>ExternalFileRangeChecker::Overlaps(atomic_replace_range_, smallest, largest).</summary>
+    private bool ReplaceRangeOverlaps(byte[] smallest, byte[] largest)
+    {
+        InternalKeyComparator icmp = _cfd.Icmp;
+        return VersionStorageInfo.SstableKeyCompare(icmp, _replaceLargest, smallest) >= 0
+            && VersionStorageInfo.SstableKeyCompare(icmp, _replaceSmallest, largest) <= 0;
+    }
+
+    /// <summary>ExternalFileRangeChecker::Contains(atomic_replace_range_, smallest, largest).</summary>
+    private bool ReplaceRangeContains(byte[] smallest, byte[] largest)
+    {
+        InternalKeyComparator icmp = _cfd.Icmp;
+        return VersionStorageInfo.SstableKeyCompare(icmp, _replaceSmallest, smallest) <= 0
+            && VersionStorageInfo.SstableKeyCompare(icmp, _replaceLargest, largest) >= 0;
+    }
+
+    /// <summary>atomic_replace_range_->unset(): the whole column family is replaced.</summary>
+    private bool ReplaceRangeUnset => _replaceSmallest.Length == 0;
+
+    /// <summary>
+    /// Port of SupportsAtomicReplaceRangeTombstone: a partial overlap can be handled with a range tombstone (universal
+    /// compaction, a table format supporting range deletions, global seqnos, no DB-generated files, no snapshot
+    /// consistency, no user-defined timestamps).
+    /// </summary>
+    private bool SupportsAtomicReplaceRangeTombstone() =>
+        _cfd.Options.TableFactory == TableFactoryType.BlockBasedTable
+        && _cfd.Options.CompactionStyle == CompactionStyle.Universal
+        && _options.AllowGlobalSeqNo
+        && !_options.AllowDbGeneratedFiles
+        && !_options.SnapshotConsistency
+        && _cfd.TimestampSize == 0;
+
+    /// <summary>Port of CanUseAtomicReplaceRangeTombstone.</summary>
+    private bool CanUseAtomicReplaceRangeTombstone(IngestReplaceRange? range) =>
+        range is { Start: not null, Limit: not null } && SupportsAtomicReplaceRangeTombstone() && !_options.FailIfNotBottommostLevel;
+
+    /// <summary>Port of HasPartialOverlap: a file of <paramref name="vstorage"/> overlaps the range without being inside it.</summary>
+    private bool HasPartialOverlap(VersionStorageInfo vstorage)
+    {
+        for (int level = 0; level < vstorage.NumLevels; level++)
+        {
+            foreach (FileMetaData file in vstorage.LevelFiles(level))
+            {
+                if (ReplaceRangeOverlaps(file.Smallest, file.Largest) && !ReplaceRangeContains(file.Smallest, file.Largest)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Port of PrepareAtomicReplaceRangeTombstone: writes a file inside the DB holding the range tombstone [start, limit)
+    /// (SstFileWriter, default_write_temperature) and reads its info. It is only ingested if Run still sees a partial
+    /// overlap (<see cref="ActivateAtomicReplaceRangeTombstone"/>), otherwise deleted at the end.
+    /// </summary>
+    private void PrepareAtomicReplaceRangeTombstone(byte[] start, byte[] limit)
+    {
+        ulong fileNumber = _db.ReserveFileNumberForIngestion();
+        _reservedFileNumbers.Add(fileNumber);
+        string filePath = FileNames.TableFileName(_db.DbPaths, fileNumber, 0);
+        IngestedFileInfo tombstone;
+        try
+        {
+            using (var writer = new SstFileWriter(_cfd.Options, _fs))
+            {
+                writer.Open(filePath);
+                writer.DeleteRange(start, limit);
+                writer.Finish();
+            }
+            tombstone = GetIngestedFileInfo(filePath).Info;
+            // SstFileWriter::Finish reports the checksum computed with the DB's file_checksum_gen_factory.
+            if (_db.Options.FileChecksumGenFactory is { } factory)
+            {
+                (tombstone.FileChecksum, tombstone.FileChecksumFuncName) = FileChecksumHelper.GenerateOneFileChecksum(_fs, filePath, factory, "", null);
+            }
+        }
+        catch
+        {
+            try { _fs.DeleteFile(filePath); }
+            catch (Exception e) when (e is IOException or RocksDbException) { }
+            throw;
+        }
+        tombstone.Temperature = _cfd.Options.DefaultWriteTemperature;
+        tombstone.FileNumber = fileNumber;
+        tombstone.InternalFilePath = filePath;
+        tombstone.Copied = true;
+        tombstone.GeneratedForIngestion = true;
+        _tombstone = tombstone;
+    }
+
+    /// <summary>
+    /// Port of ActivateAtomicReplaceRangeTombstone: the tombstone becomes the first (oldest) file, so it forms its own
+    /// batch below the ingested files.
+    /// </summary>
+    private void ActivateAtomicReplaceRangeTombstone()
+    {
+        // Prepare rejects an empty external file list and verifies every input file is contained in the replacement
+        // range. The covering tombstone must therefore overlap at least one input file.
+        System.Diagnostics.Debug.Assert(_tombstone is not null && _files.Count > 0);
+        _batches.Clear();
+        _files.Insert(0, _tombstone!);
+        _tombstone = null;
+        _tombstoneActive = true;
+        FilesOverlap = ComputeFilesOverlap();
+        System.Diagnostics.Debug.Assert(FilesOverlap);
         DivideInputFilesIntoBatches();
     }
 
@@ -488,62 +671,220 @@ internal sealed class ExternalSstFileIngestionJob
         }
     }
 
-    /// <summary>True if the memtables of <paramref name="sv"/> may hold keys in the range of any file (IngestedFilesOverlapWithMemtable).</summary>
-    public bool OverlapsWithMemtables(SuperVersion sv)
+    /// <summary>
+    /// The flush decision of ExternalSstFileIngestionJob::NeedsFlush: true if the memtables of <paramref name="sv"/> may
+    /// hold keys in the range of any file (ColumnFamilyData::RangesOverlapWithMemtables), or, with atomic_replace_range,
+    /// in the half-open replaced range; replacing the whole column family needs a flush whenever the memtables hold
+    /// anything.
+    /// </summary>
+    public bool NeedsFlush(SuperVersion sv)
     {
-        foreach (IngestedFileInfo f in _files)
+        if (_hasReplaceRange && ReplaceRangeUnset)
         {
-            if (MemOverlaps(sv.Mem, f)) return true;
+            // For replacing whole CF, we can simply check whether memtable is empty. (Upstream checks the mutable
+            // memtable only; unflushed immutable memtables would survive the replacement, so they are checked too.)
+            if (!sv.Mem.IsEmpty) return true;
             foreach (MemTable m in sv.Imm)
             {
-                if (MemOverlaps(m, f)) return true;
+                if (!m.IsEmpty) return true;
+            }
+            return false;
+        }
+        if (_hasReplaceRange)
+        {
+            // NOTE: Prepare already checked that the atomic_replace_range covers all the files to ingest.
+            ReadOnlySpan<byte> start = DbFormat.ExtractUserKey(_replaceSmallest);
+            ReadOnlySpan<byte> limit = DbFormat.ExtractUserKey(_replaceLargest);
+            if (MemOverlaps(sv.Mem, start, limit, rangeLimitExclusive: true)) return true;
+            foreach (MemTable m in sv.Imm)
+            {
+                if (MemOverlaps(m, start, limit, rangeLimitExclusive: true)) return true;
+            }
+            return false;
+        }
+        foreach (IngestedFileInfo f in _files)
+        {
+            if (MemOverlaps(sv.Mem, f.SmallestUserKey, f.LargestUserKey, rangeLimitExclusive: false)) return true;
+            foreach (MemTable m in sv.Imm)
+            {
+                if (MemOverlaps(m, f.SmallestUserKey, f.LargestUserKey, rangeLimitExclusive: false)) return true;
             }
         }
         return false;
     }
 
-    private bool MemOverlaps(MemTable mem, IngestedFileInfo f)
+    private bool MemOverlaps(MemTable mem, ReadOnlySpan<byte> start, ReadOnlySpan<byte> limit, bool rangeLimitExclusive)
     {
         if (mem.IsEmpty) return false;
         if (mem.NumRangeDeletes > 0) return true; // conservative
         MemTableIterator it = mem.NewIterator();
-        it.Seek(SeekKey(f));
-        return it.Valid && _cfd.UserComparator.CompareWithoutTimestamp(DbFormat.ExtractUserKey(it.Key), f.LargestUserKey) <= 0;
+        it.Seek(SeekKey(start));
+        if (!it.Valid) return false;
+        int cmp = _cfd.UserComparator.CompareWithoutTimestamp(DbFormat.ExtractUserKey(it.Key), limit);
+        return rangeLimitExclusive ? cmp < 0 : cmp <= 0;
     }
 
     /// <summary>
-    /// Seek target for the file's smallest key: newest possible entry of it (with user-defined timestamps every version
-    /// of the key, whatever its timestamp, counts as an overlap: the maximum timestamp sorts first).
+    /// Seek target for a range's smallest user key: newest possible entry of it (with user-defined timestamps every
+    /// version of the key, whatever its timestamp, counts as an overlap: the maximum timestamp sorts first).
     /// </summary>
-    private byte[] SeekKey(IngestedFileInfo f)
+    private byte[] SeekKey(ReadOnlySpan<byte> smallestUserKey)
     {
-        byte[] seek = new InternalKey(f.SmallestUserKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek).Encoded.ToArray();
+        byte[] seek = new InternalKey(smallestUserKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek).Encoded.ToArray();
         int ts = _cfd.TimestampSize;
-        if (ts > 0 && f.SmallestUserKey.Length >= ts) seek.AsSpan(f.SmallestUserKey.Length - ts, ts).Fill(0xff);
+        if (ts > 0 && smallestUserKey.Length >= ts) seek.AsSpan(smallestUserKey.Length - ts, ts).Fill(0xff);
         return seek;
     }
 
     /// <summary>
-    /// Port of ExternalSstFileIngestionJob::Run: assigns levels and sequence numbers batch by batch (older batches
-    /// deeper in the LSM tree) and returns the edit. REQUIRES: the caller is the unbatched write leader (no concurrent
+    /// Port of ExternalSstFileIngestionJob::Run: with atomic_replace_range, selects the files to delete (failing on a
+    /// running compaction over the range, or on a partial overlap that cannot use the prepared range tombstone); then
+    /// assigns levels and sequence numbers batch by batch (older batches deeper in the LSM tree) from the current
+    /// version, and returns the edit. REQUIRES: the DB mutex, the caller is the unbatched write leader (no concurrent
     /// writes) and the memtables do not overlap the files. <see cref="MaxAssignedSeqno"/> tells which sequence numbers
-    /// were used.
+    /// were used. Follow with <see cref="RegisterRange"/> before releasing the mutex.
     /// </summary>
-    public VersionEdit Run(SuperVersion sv, ulong lastSeqno, bool hasSnapshots)
+    public VersionEdit Run(ulong lastSeqno, bool hasSnapshots)
     {
         // We need to assign a global sequence number to all the files even if the don't overlap with any ranges since
         // we have snapshots.
         bool forceGlobalSeqno = _options.SnapshotConsistency && hasSnapshots;
         var edit = new VersionEdit { ColumnFamily = _cfd.Id };
         MaxAssignedSeqno = 0;
+        // A grouped MANIFEST write can advance current before publishing its SV: work on the current version.
+        VersionStorageInfo vstorage = _cfd.Current.Storage;
+        CompactionPicker picker = _cfd.CompactionState.Picker;
+
+        if (_hasReplaceRange)
+        {
+            _filesToReplace.Clear();
+            if (ReplaceRangeUnset)
+            {
+                if (picker.IsCompactionInProgress) ThrowHelper.InvalidArgument("Atomic replace range (full) overlaps with pending compaction");
+                for (int lvl = 0; lvl < vstorage.NumLevels; lvl++)
+                {
+                    foreach (FileMetaData file in vstorage.LevelFiles(lvl)) AddFileToReplace(edit, lvl, file);
+                }
+            }
+            else
+            {
+                bool hasPartialOverlap = false;
+                ReadOnlySpan<byte> start = DbFormat.ExtractUserKey(_replaceSmallest);
+                ReadOnlySpan<byte> limit = DbFormat.ExtractUserKey(_replaceLargest);
+                for (int lvl = 0; lvl < vstorage.NumLevels; lvl++)
+                {
+                    if (picker.RangeOverlapWithCompaction(start, limit, lvl, rangeLimitExclusive: true))
+                    {
+                        ThrowHelper.InvalidArgument("Atomic replace range overlaps with pending compaction");
+                    }
+                    foreach (FileMetaData file in vstorage.LevelFiles(lvl))
+                    {
+                        if (!ReplaceRangeOverlaps(file.Smallest, file.Largest)) continue;
+                        if (ReplaceRangeContains(file.Smallest, file.Largest)) AddFileToReplace(edit, lvl, file);
+                        else hasPartialOverlap = true;
+                    }
+                }
+                if (hasPartialOverlap)
+                {
+                    if (_options.FailIfNotBottommostLevel && SupportsAtomicReplaceRangeTombstone())
+                    {
+                        throw new RocksDbException(StatusCode.TryAgain,
+                            "Operation failed. Try again.: Atomic replace range partially overlaps with an existing file, so replacement files " +
+                            "cannot all be ingested to Lmax");
+                    }
+                    if (_tombstone is null)
+                    {
+                        if (SupportsAtomicReplaceRangeTombstone())
+                        {
+                            throw new RocksDbException(StatusCode.TryAgain,
+                                "Operation failed. Try again.: Atomic replace range acquired a partial overlap after preparation; retry ingestion");
+                        }
+                        ThrowHelper.InvalidArgument("Atomic replace range partially overlaps with existing file");
+                    }
+                    ActivateAtomicReplaceRangeTombstone();
+                }
+            }
+        }
+
         int? prevBatchUppermostLevel = null;
         // Batches at the front contain older updates and are placed deeper in the LSM tree than later overlapping batches.
         foreach (List<IngestedFileInfo> batch in _batches)
         {
-            int batchUppermostLevel = AssignLevelsForOneBatch(sv.Current.Storage, batch, forceGlobalSeqno, ref lastSeqno, prevBatchUppermostLevel, edit);
+            int batchUppermostLevel = AssignLevelsForOneBatch(vstorage, batch, forceGlobalSeqno, ref lastSeqno, prevBatchUppermostLevel, edit);
             prevBatchUppermostLevel = batchUppermostLevel;
         }
+        CreateEquivalentFileIngestingCompactions(vstorage, edit);
         return edit;
+    }
+
+    /// <summary>
+    /// Port of ExternalSstFileIngestionJob::AddFileToReplace. Range checks against registered compactions do not cover
+    /// every input file, e.g. inputs of a compaction outputting to a different level.
+    /// </summary>
+    private void AddFileToReplace(VersionEdit edit, int level, FileMetaData file)
+    {
+        if (file.BeingCompacted) ThrowHelper.InvalidArgument("Atomic replace range overlaps with pending compaction");
+        edit.DeleteFile(level, file.FileNumber);
+        _filesToReplace.Add((level, file));
+    }
+
+    /// <summary>
+    /// Port of ExternalSstFileIngestionJob::CreateEquivalentFileIngestingCompactions: one compaction per output level
+    /// whose inputs are (copies of) the files ingested to it, with L0 as their source level.
+    /// </summary>
+    private void CreateEquivalentFileIngestingCompactions(VersionStorageInfo vstorage, VersionEdit edit)
+    {
+        var byLevel = new SortedDictionary<int, List<FileMetaData>>();
+        foreach ((int level, FileMetaData f) in edit.NewFiles)
+        {
+            if (!byLevel.TryGetValue(level, out List<FileMetaData>? list)) byLevel[level] = list = new List<FileMetaData>();
+            list.Add(f.Clone());
+        }
+        ColumnFamilyOptions o = _cfd.Options;
+        foreach (KeyValuePair<int, List<FileMetaData>> kv in byLevel)
+        {
+            // Treat the source level of ingested files to be level 0.
+            var input = new CompactionInputFiles(0, kv.Value);
+            _fileIngestingCompactions.Add(new Compaction(vstorage, o, [input], kv.Key,
+                CompactionPicker.MaxFileSizeForLevel(o, kv.Key, vstorage.BaseLevel), long.MaxValue, 0, o.Compression, new List<FileMetaData>(),
+                CompactionReason.ExternalSstIngestion, -1, FilesOverlap, isManual: false));
+        }
+    }
+
+    /// <summary>
+    /// Port of ExternalSstFileIngestionJob::RegisterRange: registers the file-ingesting compactions and marks the
+    /// replaced files as being compacted, so that no compaction picked while LogAndApply has released the DB mutex
+    /// overlaps the ingested files or takes a replaced file as input. REQUIRES: the DB mutex.
+    /// </summary>
+    public void RegisterRange()
+    {
+        CompactionPicker picker = _cfd.CompactionState.Picker;
+        foreach (Compaction c in _fileIngestingCompactions) picker.RegisterCompaction(c);
+        foreach ((_, FileMetaData f) in _filesToReplace)
+        {
+            System.Diagnostics.Debug.Assert(!f.BeingCompacted);
+            f.BeingCompacted = true;
+        }
+        _filesToReplaceMarked = true;
+        // RemoveFilesBeingCompactedFromCompactionCandidates.
+        if (_filesToReplace.Count > 0) _cfd.Current.Storage.ComputeCompactionScore();
+    }
+
+    /// <summary>
+    /// Port of ExternalSstFileIngestionJob::UnregisterRange. With <paramref name="restoreCompactionCandidates"/> (the
+    /// ingestion failed), the replaced files become compaction candidates again. REQUIRES: the DB mutex.
+    /// </summary>
+    public void UnregisterRange(bool restoreCompactionCandidates)
+    {
+        CompactionPicker picker = _cfd.CompactionState.Picker;
+        foreach (Compaction c in _fileIngestingCompactions) picker.UnregisterCompaction(c);
+        _fileIngestingCompactions.Clear();
+        if (_filesToReplaceMarked)
+        {
+            foreach ((_, FileMetaData f) in _filesToReplace) f.BeingCompacted = false;
+            _filesToReplaceMarked = false;
+            if (restoreCompactionCandidates && _filesToReplace.Count > 0) _cfd.Current.Storage.ComputeCompactionScore();
+        }
     }
 
     /// <summary>Port of ExternalSstFileIngestionJob::AssignLevelsForOneBatch. Returns the batch's uppermost level.</summary>
@@ -648,10 +989,17 @@ internal sealed class ExternalSstFileIngestionJob
         // we need to check all levels.
         int overlapCheckingExclusiveEnd = _options.AllowDbGeneratedFiles ? numLevels : assignedLevelExclusiveEnd;
         overlapCheckingExclusiveEnd = Math.Min(overlapCheckingExclusiveEnd, vstorage.NumLevels);
+        bool isGeneratedRangeTombstone = _tombstoneActive && f.GeneratedForIngestion;
         for (int lvl = 0; lvl < overlapCheckingExclusiveEnd; lvl++)
         {
             if (lvl > 0 && lvl < vstorage.BaseLevel) continue;
-            if (_db.RangeOverlapsRunningCompaction(_cfd, f.SmallestUserKey, f.LargestUserKey, lvl))
+            if (lvl < assignedLevelExclusiveEnd && _hasReplaceRange && !_tombstoneActive)
+            {
+                // Everything the files overlap is deleted by the same edit: the deepest level is free.
+                targetLevel = lvl;
+                continue;
+            }
+            if (_db.RangeOverlapsRunningCompaction(_cfd, f.SmallestUserKey, f.LargestUserKey, lvl, isGeneratedRangeTombstone))
             {
                 // We must use L0 or any level higher than `lvl` to be able to overwrite the compaction output keys that
                 // we overlap with in this level, We also need to assign this file a seqno to overwrite the compaction
@@ -692,6 +1040,7 @@ internal sealed class ExternalSstFileIngestionJob
     /// <summary>Port of ExternalSstFileIngestionJob::CheckLevelForIngestedBehindFile.</summary>
     private void CheckLevelForIngestedBehindFile(VersionStorageInfo vstorage, IngestedFileInfo f)
     {
+        System.Diagnostics.Debug.Assert(!_hasReplaceRange);
         // First, check if new files fit in the last level
         int lastLvl = _cfd.NumLevels - 1;
         if (!IngestedFileFitInLevel(vstorage, lastLvl, f)) ThrowHelper.InvalidArgument("Can't ingest_behind file as it doesn't fit at the last level!");
@@ -715,7 +1064,7 @@ internal sealed class ExternalSstFileIngestionJob
     {
         // AfterFile / BeforeFile / OverlapWithIterator compare user keys without timestamps.
         Comparator ucmp = _cfd.UserComparator;
-        byte[] seek = SeekKey(f);
+        byte[] seek = SeekKey(f.SmallestUserKey);
         foreach (FileMetaData lf in vstorage.LevelFiles(level))
         {
             if (ucmp.CompareWithoutTimestamp(DbFormat.ExtractUserKey(lf.Largest), f.SmallestUserKey) < 0 ||
@@ -800,7 +1149,7 @@ internal sealed class ExternalSstFileIngestionJob
         return new InternalKey(DbFormat.ExtractUserKey(internalKey), seqno, type).Encoded.ToArray();
     }
 
-    /// <summary>Deletes the files copied/linked into the DB (failed ingestion).</summary>
+    /// <summary>Deletes the files copied/linked into the DB, and a prepared range tombstone file (failed ingestion).</summary>
     public void DeleteInternalFiles()
     {
         foreach (IngestedFileInfo f in _files)
@@ -809,6 +1158,16 @@ internal sealed class ExternalSstFileIngestionJob
             try { _fs.DeleteFile(f.InternalFilePath); }
             catch (Exception e) when (e is IOException or RocksDbException) { }
         }
+        DeleteUnusedRangeTombstone();
+    }
+
+    /// <summary>The successful-ingestion part of Cleanup: a prepared range tombstone that Run did not need is deleted.</summary>
+    public void DeleteUnusedRangeTombstone()
+    {
+        if (_tombstone is null) return;
+        try { _fs.DeleteFile(_tombstone.InternalFilePath); }
+        catch (Exception e) when (e is IOException or RocksDbException) { }
+        _tombstone = null;
     }
 
     /// <summary>With move_files, the original links are removed after a successful ingestion.</summary>
@@ -817,7 +1176,7 @@ internal sealed class ExternalSstFileIngestionJob
         if (!_options.MoveFiles) return;
         foreach (IngestedFileInfo f in _files)
         {
-            if (f.Copied) continue;
+            if (f.Copied || f.GeneratedForIngestion) continue;
             try { _fs.DeleteFile(f.ExternalFilePath); }
             catch (Exception e) when (e is IOException or RocksDbException) { }
         }

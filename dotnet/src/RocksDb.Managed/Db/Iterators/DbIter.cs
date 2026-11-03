@@ -98,6 +98,9 @@ public sealed class DbIter : IDisposable
     private PinnedSlice[] _pinnedOperands = [];
     private int _pinnedOperandCount;
     private bool _pinnedOperandsOnly = true;
+    // MergeValuesNewToOld (forward) / FindValueForCurrentKeyUsingSeek push the operands newest first: the pinned list
+    // is then in that order and reversed (in place) when the merge reads it.
+    private bool _pinnedNewestFirst;
 
     private bool _valid;
     private bool _forward = true;
@@ -653,6 +656,7 @@ public sealed class DbIter : IDisposable
         _operands.Clear();
         _pinnedOperandCount = 0;
         _pinnedOperandsOnly = true;
+        _pinnedNewestFirst = false;
     }
 
     /// <summary>The collected merge operands, oldest first.</summary>
@@ -661,10 +665,18 @@ public sealed class DbIter : IDisposable
         if (_pinnedOperandCount != 0 && _pinnedOperandsOnly)
         {
             PinnedOperandMerges++;
+            if (_pinnedNewestFirst)
+            {
+                _pinnedOperands.AsSpan(0, _pinnedOperandCount).Reverse();
+                _pinnedNewestFirst = false;
+            }
             return new MergeOperands(_pinnedOperands.AsSpan(0, _pinnedOperandCount));
         }
         return _operands.AsOperands();
     }
+
+    /// <summary>The current entry is the result of a merge (current_entry_is_merged_; tests).</summary>
+    internal bool CurrentEntryIsMerged => _currentEntryIsMerged;
 
     /// <summary>Merges done on operands referenced in place (tests).</summary>
     internal long PinnedOperandMerges { get; private set; }
@@ -695,6 +707,48 @@ public sealed class DbIter : IDisposable
             _pinnedOperandCount = 0;
         }
         _operands.PushNewer(_iter.Value);
+    }
+
+    /// <summary>
+    /// MergeValuesNewToOld / FindValueForCurrentKeyUsingSeek: adds the merge operand the inner iterator is on as the
+    /// oldest one (merge_context_.PushOperand(iter_.value(), iter_.iter()->IsValuePinned())), referencing it in place
+    /// when the iterator pins its value (the blocks are temp-pinned until the next positioning call); the first operand
+    /// that cannot be pinned turns the list into copies.
+    /// </summary>
+    private void PushOlderOperand()
+    {
+        if (_pinnedOperandsOnly && _iter.TryGetPinnedValue(out PinnedSlice pv))
+        {
+            Debug.Assert(_pinnedOperandCount == 0 || _pinnedNewestFirst);
+            if (_pinnedOperandCount == _pinnedOperands.Length)
+            {
+                var n = new PinnedSlice[Math.Max(8, _pinnedOperandCount * 2)];
+                _pinnedOperands.AsSpan(0, _pinnedOperandCount).CopyTo(n);
+                _pinnedOperands = n;
+            }
+            _pinnedOperands[_pinnedOperandCount++] = pv;
+            _pinnedNewestFirst = true;
+            return;
+        }
+        if (_pinnedOperandsOnly)
+        {
+            // Copy the operands pinned so far (newest first, so each one is older than the previous).
+            _pinnedOperandsOnly = false;
+            for (int i = 0; i < _pinnedOperandCount; i++) _operands.PushOlder(_pinnedOperands[i].Span);
+            _pinnedOperandCount = 0;
+            _pinnedNewestFirst = false;
+        }
+        _operands.PushOlder(_iter.Value);
+    }
+
+    /// <summary>
+    /// TempPinData for MergeValuesNewToOld: pins the blocks holding the merge operands until the next positioning call
+    /// (no-op when already pinning).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void TempPinDataForMerge()
+    {
+        if (!_pinThruLifetime && !_pinMgr.IsPinning) _pinMgr.StartPinning();
     }
 
     private void MergeWithNoBaseValue()
@@ -845,9 +899,11 @@ public sealed class DbIter : IDisposable
                         if (_mergeOperator is null) ThrowNoMergeOperator();
                         _currentEntryIsMerged = true;
                         _valid = true;
-                        // MergeValuesNewToOld: start the merge process by pushing the first operand.
+                        // MergeValuesNewToOld: temporarily pin the blocks that hold merge operands, then start the merge
+                        // process by pushing the first operand.
+                        TempPinDataForMerge();
                         ClearOperands();
-                        _operands.PushOlder(_iter.Value);
+                        PushOlderOperand();
                         _merging = true;
                         return StepAction.Next;
                     default:
@@ -939,7 +995,7 @@ public sealed class DbIter : IDisposable
                     return StepAction.NextThenDone;
                 }
                 // hit a merge, add the value as an operand and continue.
-                _operands.PushOlder(_iter.Value);
+                PushOlderOperand();
                 return StepAction.Next;
             case EntryType.BlobIndex:
             case EntryType.WideColumnEntity:
@@ -1905,7 +1961,7 @@ public sealed class DbIter : IDisposable
         if (_mergeOperator is null) ThrowNoMergeOperator();
         _currentEntryIsMerged = true;
         ClearOperands();
-        _operands.PushOlder(_iter.Value);
+        PushOlderOperand();
         _revPhase = RevPhase.SeekMerge;
         return InnerOp.Next;
     }
@@ -1927,7 +1983,7 @@ public sealed class DbIter : IDisposable
                         MergeWithPlainBaseValue(type == EntryType.ValuePreferredSeqno ? ParsePackedValueForValue(v) : v);
                         return UsingSeekDone();
                     case EntryType.Merge:
-                        _operands.PushOlder(_iter.Value);
+                        PushOlderOperand();
                         return InnerOp.Next;
                     case EntryType.WideColumnEntity:
                         MergeWithEntityBaseValue(_iter.Value);

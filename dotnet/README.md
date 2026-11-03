@@ -769,6 +769,21 @@ using (SstFileWriter writer = db.CreateSstFileWriter(db.DefaultColumnFamily))   
 // ...and ingest it atomically (the file is placed at the lowest level it fits; also works with native SSTs).
 // Several files may overlap: later files in the list win. IngestBehind = true back-fills below existing data.
 db.IngestExternalFiles([sstPath], new IngestExternalFileOptions { MoveFiles = true });
+
+// Replace a whole key range atomically: existing keys in ["bulk:", "bulk;") disappear in the same step as the new
+// file appears (EXPERIMENTAL atomic_replace_range; requires SnapshotConsistency = false).
+using (SstFileWriter writer = db.CreateSstFileWriter(db.DefaultColumnFamily))
+{
+    writer.Open(sstPath);
+    writer.Put("bulk:0001"u8, "v2"u8);
+    await writer.FinishAsync();
+}
+db.IngestExternalFiles(db.DefaultColumnFamily, new IngestExternalFileArg
+{
+    ExternalFiles = [sstPath],
+    Options = new IngestExternalFileOptions { SnapshotConsistency = false },
+    AtomicReplaceRange = new IngestReplaceRange("bulk:"u8.ToArray(), "bulk;"u8.ToArray()),
+});
 ```
 
 ### WAL tailing: GetUpdatesSince and TailUpdatesAsync

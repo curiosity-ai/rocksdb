@@ -1031,9 +1031,10 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>True if a running compaction of <paramref name="cfd"/> writes to <paramref name="level"/> within the user key range.</summary>
-    internal bool RangeOverlapsRunningCompaction(ColumnFamilyData cfd, ReadOnlySpan<byte> smallestUserKey, ReadOnlySpan<byte> largestUserKey, int level)
+    internal bool RangeOverlapsRunningCompaction(ColumnFamilyData cfd, ReadOnlySpan<byte> smallestUserKey, ReadOnlySpan<byte> largestUserKey, int level,
+        bool rangeLimitExclusive)
     {
-        lock (_mutex) return cfd.CompactionState.Picker.RangeOverlapWithCompaction(smallestUserKey, largestUserKey, level);
+        lock (_mutex) return cfd.CompactionState.Picker.RangeOverlapWithCompaction(smallestUserKey, largestUserKey, level, rangeLimitExclusive);
     }
 
     internal ulong NewPendingOutputFileNumber()

@@ -143,6 +143,56 @@ public sealed class BackupCompatTests
         return kinds.ToList();
     }
 
+    /// <summary>
+    /// A DB with file_checksum_gen_factory = FileChecksumGenCrc32cFactory (blob files too): both engines take the live
+    /// files' crc32c from the MANIFEST (compare_checksum) and produce the same shared_checksum names and crc32 values
+    /// (session-id names for tables, legacy &lt;number&gt;_&lt;crc32c&gt;_&lt;size&gt; names for blob files); native
+    /// verifies and restores the managed backup.
+    /// </summary>
+    [TestMethod]
+    public void BackupsOfAChecksummedDbMatchNative()
+    {
+        using var dir = new TempDir("bk-cksum");
+        string dbPath = Path.Combine(dir.Path, "db"), nativeBackup = Path.Combine(dir.Path, "nb"), managedBackup = Path.Combine(dir.Path, "mb");
+        string restore = Path.Combine(dir.Path, "r");
+        RocksDbSharp.Native n = RocksDbSharp.Native.Instance;
+        var nopts = new RocksDbSharp.DbOptions().SetCreateIfMissing(true);
+        NativeExtras.SetCrc32cFileChecksums(nopts);
+        n.rocksdb_options_set_enable_blob_files(nopts.Handle, 1);
+        n.rocksdb_options_set_min_blob_size(nopts.Handle, 64);
+        Func<int, string> value = i => i % 4 == 0 ? new string('b', 80) + V(i, "a") : V(i, "a");
+        using (var db = RocksDbSharp.RocksDb.Open(nopts, dbPath))
+        {
+            for (int i = 0; i < 400; i++) db.Put(U("k" + i.ToString("D6")), U(value(i)));
+            db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            using var nbe = new NativeBackupEngine(nativeBackup);
+            nbe.CreateNewBackup(db, flush: true);
+        }
+        AssertNativeMetaIsNotEmpty(nativeBackup, 1);
+        Assert.IsTrue(Directory.GetFiles(dbPath, "*.blob").Length >= 1);
+        using (RocksDatabase db = RocksDatabase.Open(dbPath, new DbOptions { FileChecksumGenFactory = FileChecksumGenCrc32cFactory.Instance },
+                   new ColumnFamilyOptions { EnableBlobFiles = true, MinBlobSize = 64 }))
+        using (BackupEngine be = BackupEngine.Open(new BackupEngineOptions(managedBackup)))
+        {
+            Assert.AreEqual(1u, be.CreateNewBackup(db, flushBeforeBackup: true));
+            be.VerifyBackup(1, verifyWithChecksum: true);
+        }
+        SortedSet<string> nativeLines = SstLines(nativeBackup, 1), managedLines = SstLines(managedBackup, 1);
+        Assert.IsTrue(nativeLines.Any(l => l.Contains(".blob ", StringComparison.Ordinal)), "blob files are shared");
+        CollectionAssert.AreEqual(nativeLines.ToList(), managedLines.ToList(), "shared_checksum names and checksums differ from native");
+        using (var nbe = new NativeBackupEngine(managedBackup))
+        {
+            nbe.Verify(1);
+            nbe.RestoreLatest(restore);
+        }
+        var ropts = new RocksDbSharp.DbOptions();
+        n.rocksdb_options_set_enable_blob_files(ropts.Handle, 1);
+        using (var db = RocksDbSharp.RocksDb.Open(ropts, restore))
+        {
+            for (int i = 0; i < 400; i += 7) Assert.AreEqual(value(i), Encoding.UTF8.GetString(db.Get(U("k" + i.ToString("D6")))!), "key " + i);
+        }
+    }
+
     [TestMethod]
     public void NativeBackupIsReadAndExtendedByManaged()
     {

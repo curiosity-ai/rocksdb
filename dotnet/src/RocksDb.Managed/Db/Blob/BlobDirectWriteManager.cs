@@ -40,9 +40,12 @@ internal sealed class BlobDirectWriteGeneration
 /// from obsolete-file deletion from its creation until the memtable referencing it is gone (DbImpl releases it).
 /// </para>
 /// <para>
-/// Deviations: records are flushed to the OS one by one like upstream (kDoFlushEachRecord) but blob cache prepopulation
-/// and file checksums of direct-write files are not implemented; failed transformed writes are accounted as garbage by
-/// the flush (blobs the flush output does not reference) instead of MarkBlobWriteAsGarbage.
+/// Records are flushed to the OS one by one like upstream (kDoFlushEachRecord). With a file_checksum_gen_factory the
+/// files are checksummed while written (WritableFileWriter with the factory) and the checksum is recorded in their
+/// MANIFEST addition when sealed (BlobLogWriter::AppendFooter). Statistics: BLOB_DB_BLOB_FILE_WRITE_MICROS per append,
+/// BLOB_DB_BLOB_FILE_SYNC_MICROS per sync (BlobLogWriter::Sync), BLOB_DB_COMPRESSION_MICROS per compressed value.
+/// Deviations: blob cache prepopulation is not implemented; failed transformed writes are accounted as garbage by the
+/// flush (blobs the flush output does not reference) instead of MarkBlobWriteAsGarbage.
 /// </para>
 /// </summary>
 internal sealed class BlobDirectWriteManager : IDisposable
@@ -56,6 +59,9 @@ internal sealed class BlobDirectWriteManager : IDisposable
         public ulong BlobCount;
         public ulong TotalBlobBytes;
         public bool SyncRequired;
+        /// <summary>Checksum method / value of the sealed file (empty without a checksum factory).</summary>
+        public string ChecksumMethod = "";
+        public byte[] ChecksumValue = [];
     }
 
     private readonly IFileSystem _fs;
@@ -99,7 +105,16 @@ internal sealed class BlobDirectWriteManager : IDisposable
         _partitions = new OpenFile?[_numPartitions];
     }
 
-    /// <summary>Write buffering of the blob files (set from the mutable options before each write).</summary>
+    /// <summary>
+    /// InternalStats::GetBlobFileReadHist(): the column family's blob file read latency histogram for the readers of
+    /// unsealed files.
+    /// </summary>
+    public HistogramImpl? BlobFileReadHistogram { get; init; }
+
+    /// <summary>
+    /// Write buffering of the blob files, and the DB's file checksum factory (set from the mutable options before each
+    /// write).
+    /// </summary>
     public WritableFileOptions FileOptions { get; set; } = WritableFileOptions.Default;
 
     /// <summary>Blob file size limit (blob_file_size, mutable).</summary>
@@ -126,7 +141,9 @@ internal sealed class BlobDirectWriteManager : IDisposable
         {
             if (!BlockCompression.IsSupported(compression)) ThrowHelper.NotSupported("Blob direct write compression type not supported");
             _compressed.Clear();
+            long tc = _stats?.StartTimer() ?? 0;
             BlockCompression.CompressForced(compression, value, BlockCompression.DefaultCompressionLevel, _compressed);
+            _stats?.RecordElapsedMicros(Histogram.BlobDbCompressionMicros, tc);
             blob = _compressed.WrittenSpan;
         }
         uint idx = partition >= 0
@@ -147,9 +164,9 @@ internal sealed class BlobDirectWriteManager : IDisposable
 
         ulong recordOffset = BlobLogFormat.HeaderSize + f.TotalBlobBytes;
         BlobLogFormat.EncodeRecordHeader(_recordHeader, key, blob, expiration: 0);
-        f.File.Append(_recordHeader);
-        f.File.Append(key);
-        f.File.Append(blob);
+        Append(f.File, _recordHeader);
+        Append(f.File, key);
+        Append(f.File, blob);
         // kDoFlushEachRecord: readers of the memtable see the record right away. Durability comes from SyncAllOpenFiles
         // (sync writes) or the footer.
         f.File.Flush();
@@ -175,9 +192,10 @@ internal sealed class BlobDirectWriteManager : IDisposable
         ulong number = _newFileNumber();
         _current.FileNumbers.Add(number);
         _readers[number] = new ReaderEntry { VisibleSize = BlobLogFormat.HeaderSize };
-        IWritableFile file = _fs.CreateWritable(FileNames.BlobFileName(_blobDir, number), truncate: true, FileOptions);
+        // NewWritableFile + WritableFileWriter with the DB's file_checksum_gen_factory.
+        IWritableFile file = FileChecksumHelper.CreateWritable(_fs, FileNames.BlobFileName(_blobDir, number), FileOptions);
         BlobLogFormat.EncodeHeader(_header, columnFamilyId, compression, hasTtl: false, 0, 0);
-        file.Append(_header.AsSpan(0, BlobLogFormat.HeaderSize));
+        Append(file, _header.AsSpan(0, BlobLogFormat.HeaderSize));
         file.Flush();
         _stats?.RecordTick(Ticker.BlobDbBlobFileBytesWritten, BlobLogFormat.HeaderSize);
         var f = new OpenFile { FileNumber = number, File = file, Compression = compression, ColumnFamilyId = columnFamilyId };
@@ -190,8 +208,13 @@ internal sealed class BlobDirectWriteManager : IDisposable
     private void Seal(OpenFile f)
     {
         BlobLogFormat.EncodeFooter(_header, f.BlobCount, 0, 0);
-        f.File.Append(_header.AsSpan(0, BlobLogFormat.FooterSize));
-        f.File.Sync();
+        Append(f.File, _header.AsSpan(0, BlobLogFormat.FooterSize));
+        Sync(f.File);
+        // BlobLogWriter::AppendFooter: checksum method/value from the writer (empty without a checksum factory).
+        (byte[] checksum, string method) = FileChecksumHelper.GetChecksum(f.File);
+        if (checksum.Length == 0) method = "";
+        f.ChecksumMethod = method;
+        f.ChecksumValue = checksum;
         f.File.Dispose();
         lock (_unsealed) _unsealed.Remove(f);
         _stats?.RecordTick(Ticker.BlobDbBlobFileBytesWritten, BlobLogFormat.FooterSize);
@@ -206,7 +229,23 @@ internal sealed class BlobDirectWriteManager : IDisposable
         }
     }
 
-    private static BlobFileAddition Addition(OpenFile f) => new(f.FileNumber, f.BlobCount, f.TotalBlobBytes, "", []);
+    private static BlobFileAddition Addition(OpenFile f) => new(f.FileNumber, f.BlobCount, f.TotalBlobBytes, f.ChecksumMethod, f.ChecksumValue);
+
+    /// <summary>WritableFileWriter::Append with its StopWatch(BLOB_DB_BLOB_FILE_WRITE_MICROS).</summary>
+    private void Append(IWritableFile file, ReadOnlySpan<byte> data)
+    {
+        long t0 = _stats?.StartTimer() ?? 0;
+        file.Append(data);
+        _stats?.RecordElapsedMicros(Histogram.BlobDbBlobFileWriteMicros, t0);
+    }
+
+    /// <summary>BlobLogWriter::Sync: StopWatch(BLOB_DB_BLOB_FILE_SYNC_MICROS) around the sync.</summary>
+    private void Sync(IWritableFile file)
+    {
+        long t0 = _stats?.StartTimer() ?? 0;
+        file.Sync();
+        _stats?.RecordElapsedMicros(Histogram.BlobDbBlobFileSyncMicros, t0);
+    }
 
     /// <summary>
     /// RotateCurrentGeneration: the open files and the files sealed while the memtable was mutable become the
@@ -248,7 +287,7 @@ internal sealed class BlobDirectWriteManager : IDisposable
         foreach (OpenFile? f in _partitions)
         {
             if (f is null || !f.SyncRequired) continue;
-            f.File.Sync();
+            Sync(f.File);
             f.SyncRequired = false;
             _stats?.RecordTick(Ticker.BlobDbBlobFileSynced);
         }
@@ -286,7 +325,7 @@ internal sealed class BlobDirectWriteManager : IDisposable
             if (e.Reader is null)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
-                e.Reader = BlobFileReader.OpenUnsealed(_fs, FileNames.BlobFileName(_blobDir, fileNumber), ColumnFamilyId, _stats);
+                e.Reader = BlobFileReader.OpenUnsealed(_fs, FileNames.BlobFileName(_blobDir, fileNumber), ColumnFamilyId, _stats, BlobFileReadHistogram);
                 e.Reader.ExtendVisibleSize(e.VisibleSize);
             }
             reader = e.Reader;

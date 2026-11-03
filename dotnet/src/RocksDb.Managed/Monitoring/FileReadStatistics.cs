@@ -31,16 +31,26 @@ internal static class FileReadActivity
 }
 
 /// <summary>
-/// Timing decorator of a table file (RandomAccessFileReader::Read with its StopWatch, file/random_access_file_reader.cc):
-/// every read records SST_READ_MICROS and the histogram of the current <see cref="FileReadActivity"/>
-/// (FILE_READ_GET_MICROS, FILE_READ_MULTIGET_MICROS, FILE_READ_DB_ITERATOR_MICROS, FILE_READ_COMPACTION_MICROS,
-/// FILE_READ_FLUSH_MICROS, FILE_READ_DB_OPEN_MICROS, FILE_READ_VERIFY_FILE_CHECKSUMS_MICROS), plus the per-level
-/// file_read_hist_ of the reader (<paramref name="levelHistogram"/>, may be null).
+/// Timing decorator of a file read through RandomAccessFileReader (its StopWatch in Read / ReadAsync,
+/// file/random_access_file_reader.cc): every read records the reader's hist_type_ (<paramref name="readHistogram"/>:
+/// SST_READ_MICROS for table files, BLOB_DB_BLOB_FILE_READ_MICROS for blob files) and the histogram of the current
+/// <see cref="FileReadActivity"/> (FILE_READ_GET_MICROS, FILE_READ_MULTIGET_MICROS, FILE_READ_DB_ITERATOR_MICROS,
+/// FILE_READ_COMPACTION_MICROS, FILE_READ_FLUSH_MICROS, FILE_READ_DB_OPEN_MICROS, FILE_READ_VERIFY_FILE_CHECKSUMS_MICROS),
+/// plus the reader's file_read_hist_ (<paramref name="fileHistogram"/>: the per-level table histogram or the blob file
+/// histogram of InternalStats, may be null).
 /// Only installed when the DB has statistics; records nothing when timers are disabled by the stats level.
 /// </summary>
-internal sealed class StatisticsRandomAccessFile(IRandomAccessFile inner, Statistics statistics, HistogramImpl? levelHistogram) : IRandomAccessFile
+internal sealed class StatisticsRandomAccessFile(IRandomAccessFile inner, Statistics statistics, HistogramImpl? fileHistogram, Histogram readHistogram)
+    : IRandomAccessFile
 {
-    public StatisticsRandomAccessFile(IRandomAccessFile inner, Statistics statistics) : this(inner, statistics, null)
+    /// <summary>A table file reader (SST_READ_MICROS).</summary>
+    public StatisticsRandomAccessFile(IRandomAccessFile inner, Statistics statistics) : this(inner, statistics, null, Histogram.SstReadMicros)
+    {
+    }
+
+    /// <summary>A table file reader (SST_READ_MICROS) with its per-level histogram.</summary>
+    public StatisticsRandomAccessFile(IRandomAccessFile inner, Statistics statistics, HistogramImpl? levelHistogram)
+        : this(inner, statistics, levelHistogram, Histogram.SstReadMicros)
     {
     }
 
@@ -80,9 +90,9 @@ internal sealed class StatisticsRandomAccessFile(IRandomAccessFile inner, Statis
     private void Record(long t0, int activity)
     {
         ulong micros = (ulong)Stopwatch.GetElapsedTime(t0).Ticks / 10;
-        statistics.RecordInHistogram(Histogram.SstReadMicros, micros);
+        statistics.RecordInHistogram(readHistogram, micros);
         if (activity != 0) statistics.RecordInHistogram((Histogram)(activity - 1), micros);
-        levelHistogram?.Add(micros);
+        fileHistogram?.Add(micros);
     }
 
     public void Dispose() => inner.Dispose();

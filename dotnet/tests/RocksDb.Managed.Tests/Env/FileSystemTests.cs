@@ -471,5 +471,87 @@ public sealed partial class FileSystemTests
         Assert.IsFalse(buf.TryRead(data.Length - 10, 20, out _), "beyond the end");
         buf.Reset(null);
     }
+
+    /// <summary>
+    /// The prefetch keeps the file's <see cref="ValueTask{TResult}"/> instead of a Task: reads backed by a reusable
+    /// <see cref="System.Threading.Tasks.Sources.IValueTaskSource{TResult}"/> completing on another thread (like
+    /// RandomAccess on a SafeFileHandle) are waited for through the buffer's own event, the source is consumed once per
+    /// read, and a failed prefetch fails the read that needs it (but not a reset or an unrelated miss).
+    /// </summary>
+    [TestMethod]
+    public void AsyncPrefetchBufferWaitsForPooledValueTaskSources()
+    {
+        byte[] data = new byte[1_000_000];
+        new Random(5).NextBytes(data);
+        using var file = new PooledSourceFile(data);
+        using var buf = new AsyncPrefetchBuffer(32 * 1024);
+        buf.Reset(file);
+        for (long offset = 0; offset < data.Length; offset += 4000)
+        {
+            int len = (int)Math.Min(4000, data.Length - offset);
+            Assert.IsTrue(buf.TryRead(offset, len, out ReadOnlySpan<byte> got));
+            Assert.IsTrue(got.SequenceEqual(data.AsSpan((int)offset, len)), "offset " + offset);
+        }
+        Assert.IsTrue(buf.Prefetches > 10);
+        Assert.IsTrue(buf.SyncReads <= 2, "sync reads " + buf.SyncReads);
+        Assert.AreEqual(file.AsyncReads, file.Consumed, "every pooled read consumed exactly once");
+
+        // A failing prefetch: the read that needs its data fails; a reset ignores it.
+        buf.Reset(file);
+        Assert.IsTrue(buf.TryRead(0, 100, out _));
+        file.FailAsync = true;
+        Assert.IsTrue(buf.TryRead(32 * 1024, 100, out _)); // swaps to the prefetched chunk, starts a failing prefetch
+        // Straddles the current chunk and the failed prefetch: the swap needs the failed read.
+        Assert.ThrowsExactly<IOException>(() => buf.TryRead(2 * 32 * 1024 - 50, 100, out _));
+        Assert.IsTrue(buf.TryRead(3 * 32 * 1024, 100, out _)); // a miss: re-read synchronously (the prefetch failed)
+        buf.Reset(null);
+    }
+
+    /// <summary>A file whose ReadAsync completes on the thread pool through one reusable IValueTaskSource.</summary>
+    private sealed class PooledSourceFile(byte[] data) : IRandomAccessFile, System.Threading.Tasks.Sources.IValueTaskSource<int>
+    {
+        private System.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<int> _core;
+        public int AsyncReads;
+        public int Consumed;
+        public bool FailAsync;
+
+        public long Length => data.Length;
+
+        public int Read(long offset, Span<byte> destination)
+        {
+            int n = (int)Math.Max(0, Math.Min(destination.Length, data.Length - offset));
+            data.AsSpan((int)offset, n).CopyTo(destination);
+            return n;
+        }
+
+        public ValueTask<int> ReadAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken = default)
+        {
+            _core.Reset();
+            AsyncReads++;
+            bool fail = FailAsync;
+            ThreadPool.UnsafeQueueUserWorkItem(_ =>
+            {
+                Thread.Sleep(1);
+                if (fail) _core.SetException(new IOException("injected prefetch failure"));
+                else _core.SetResult(Read(offset, destination.Span));
+            }, null);
+            return new ValueTask<int>(this, _core.Version);
+        }
+
+        public int GetResult(short token)
+        {
+            Consumed++;
+            return _core.GetResult(token);
+        }
+
+        public System.Threading.Tasks.Sources.ValueTaskSourceStatus GetStatus(short token) => _core.GetStatus(token);
+
+        public void OnCompleted(Action<object?> continuation, object? state, short token,
+            System.Threading.Tasks.Sources.ValueTaskSourceOnCompletedFlags flags) => _core.OnCompleted(continuation, state, token, flags);
+
+        public void Dispose()
+        {
+        }
+    }
 }
 

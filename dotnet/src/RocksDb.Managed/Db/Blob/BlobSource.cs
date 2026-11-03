@@ -60,6 +60,12 @@ internal sealed class BlobSource : IDisposable
     public BlockCache? Cache => _cache;
 
     /// <summary>
+    /// InternalStats::GetBlobFileReadHist(): the column family's blob file read latency histogram, given to the readers
+    /// (BlobFileCache's blob_file_read_hist_). Only filled when the DB has statistics.
+    /// </summary>
+    public HistogramImpl? BlobFileReadHistogram { get; init; }
+
+    /// <summary>
     /// Blob direct write of the column family: blob indexes from memtables may reference its files before a flush
     /// registers them in a version (BlobFilePartitionManager::ResolveBlobDirectWriteIndex). Null without direct write.
     /// </summary>
@@ -131,7 +137,7 @@ internal sealed class BlobSource : IDisposable
                 return e;
             }
             if (_readers.Count >= _capacity) EvictUnused(_readers.Count - _capacity + 1);
-            e = new ReaderEntry(BlobFileReader.Open(_fs, FileNames.BlobFileName(_blobDir, fileNumber), _columnFamilyId, _stats))
+            e = new ReaderEntry(BlobFileReader.Open(_fs, FileNames.BlobFileName(_blobDir, fileNumber), _columnFamilyId, _stats, BlobFileReadHistogram))
             {
                 Refs = 1,
                 LastUse = Environment.TickCount64,
