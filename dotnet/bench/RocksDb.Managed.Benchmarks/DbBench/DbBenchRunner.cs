@@ -308,6 +308,7 @@ public static class DbBenchRunner
                     if (txnPath is not null && Directory.Exists(txnPath)) Directory.Delete(txnPath, recursive: true);
                 }
             }
+            if (engine is not null) RunExtraCompactionCycles(engine, w, values, plan.Count);
         }
         finally
         {
@@ -332,6 +333,51 @@ public static class DbBenchRunner
             jit2, jitTime2.TotalMilliseconds));
         Console.Out.Flush();
     }
+
+    /// <summary>
+    /// Extra warm-up cycles of <see cref="WarmupExtraFlushesPerCycle"/> x (overwrite of --warmup_ops / 50 keys + flush) +
+    /// compact, after the JIT has quiesced, until a compaction compiles fewer than
+    /// <see cref="WarmupExtraCompactionJitThreshold"/> methods (at most <see cref="WarmupMaxExtraCompactionCycles"/>
+    /// cycles). The methods that run once per compaction output file, per subcompaction or per compaction need ~60 calls
+    /// to reach tier 1; the fixed cycles create only a few output files when the warm-up DB is small compared with
+    /// target_file_size_base, so with small target files or subcompactions the measured compaction used to compile
+    /// 200 - 400 methods (100 - 250 ms of JIT, plus the runtime suspensions of tier-up) on a 4-core machine where 4
+    /// subcompactions already use every core. .NET only (the C leg has nothing to compile).
+    /// </summary>
+    private static void RunExtraCompactionCycles(IKeyValueEngine engine, Flags w, ValueBuffer values, int index)
+    {
+        var ci = CultureInfo.InvariantCulture;
+        var sw = Stopwatch.StartNew();
+        int cycles = 0;
+        long compiled = 0;
+        for (; cycles < WarmupMaxExtraCompactionCycles; cycles++)
+        {
+            w.OpsOverride = Math.Max(w.Num / 50, 1);
+            for (int i = 0; i < WarmupExtraFlushesPerCycle; i++)
+            {
+                new BenchRun(engine, w, values, DbBenchmark.Overwrite, index + 2000 * (cycles + 1) + i) { Quiet = true }.Execute();
+                new BenchRun(engine, w, values, DbBenchmark.Flush, index) { Quiet = true }.Execute();
+            }
+            new BenchRun(engine, w, values, DbBenchmark.WaitForCompaction, index) { Quiet = true }.Execute();
+            WaitForJitQuiescence(stableMs: 100, maxMs: 2_000);
+            long before = System.Runtime.JitInfo.GetCompiledMethodCount(currentThread: false);
+            new BenchRun(engine, w, values, DbBenchmark.Compact, index) { Quiet = true }.Execute();
+            WaitForJitQuiescence(stableMs: 100, maxMs: 2_000);
+            compiled = System.Runtime.JitInfo.GetCompiledMethodCount(currentThread: false) - before;
+            if (compiled < WarmupExtraCompactionJitThreshold) break;
+        }
+        Console.WriteLine(string.Format(ci, "{0,-17} : {1} extra compaction cycles {2:F3} s, last compaction compiled {3} methods", "warmup",
+            cycles, sw.Elapsed.TotalSeconds, compiled));
+    }
+
+    /// <summary>Upper bound of <see cref="RunExtraCompactionCycles"/>.</summary>
+    private const int WarmupMaxExtraCompactionCycles = 16;
+
+    /// <summary>Flushes per extra compaction cycle.</summary>
+    private const int WarmupExtraFlushesPerCycle = 4;
+
+    /// <summary>A compaction of the warm-up DB that compiles fewer methods than this ends the extra cycles.</summary>
+    private const int WarmupExtraCompactionJitThreshold = 10;
 
     /// <summary>
     /// Waits until the number of JIT-compiled methods (all threads, including the tiering background compiler) has
