@@ -38,6 +38,17 @@ internal sealed partial class DbImpl
             GetWithTxnHooks(cfd, options, key, ctx);
             return;
         }
+        if (_queryTracer is { } tracer) TraceGet(tracer, cfd, key, options);
+        if (BlockCacheTracer.IsEnabled)
+        {
+            GetWithBlockCacheTrace(cfd, options, key, ctx);
+            return;
+        }
+        GetImpl(cfd, options, key, ctx);
+    }
+
+    private void GetImpl(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, GetContext ctx)
+    {
         // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
         // in between could drop the versions visible at that sequence (no snapshot protects them).
         ValidateReadSnapshot(options);
@@ -52,6 +63,25 @@ internal sealed partial class DbImpl
         finally
         {
             ReturnAndCleanupSuperVersion(cfd, sv, svSlot);
+        }
+    }
+
+    /// <summary>
+    /// GetImpl while a block cache trace runs: the table lookups of this thread are attributed to a Get with a fresh
+    /// get id (BlockCacheLookupContext{kUserGet, NextGetId()}).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void GetWithBlockCacheTrace(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, GetContext ctx)
+    {
+        object? prev = Tracing.BlockCacheTracer.SetCaller(Tracing.TableReaderCaller.UserGet, BlockCacheTracer.NextGetId(), key,
+            options?.Snapshot is not null);
+        try
+        {
+            GetImpl(cfd, options, key, ctx);
+        }
+        finally
+        {
+            Tracing.BlockCacheTracer.RestoreCaller(prev);
         }
     }
 
@@ -341,6 +371,8 @@ internal sealed partial class DbImpl
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     public async ValueTask GetAsync(ColumnFamilyData cfd, ReadOptions? options, ReadOnlyMemory<byte> key, GetContext ctx, CancellationToken cancellationToken)
     {
+        if (_queryTracer is { } tracer) TraceGet(tracer, cfd, key.Span, options);
+        if (BlockCacheTracer.IsEnabled) SetBlockCacheTraceContext(Tracing.TableReaderCaller.UserGet, key.Span, options);
         if (_txnHooks is not null && ctx.Callback is null)
         {
             await GetWithTxnHooksAsync(cfd, options, key, ctx, cancellationToken).ConfigureAwait(false);

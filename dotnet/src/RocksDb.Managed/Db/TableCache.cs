@@ -432,8 +432,8 @@ internal sealed class TableCache : ITableCache, IDisposable
                     + " and file system " + f.Length.ToString(CultureInfo.InvariantCulture) + " sstable: " + path);
             }
             TableReaderOptions opts = ReaderOptions;
-            if (file.LargestSeqno != opts.LargestSeqno || file.FileNumber != opts.FileNumber)
-                opts = opts with { LargestSeqno = file.LargestSeqno, FileNumber = file.FileNumber };
+            if (file.LargestSeqno != opts.LargestSeqno || file.FileNumber != opts.FileNumber || (opts.BlockCacheTracer is not null && file.LevelHint != opts.Level))
+                opts = opts with { LargestSeqno = file.LargestSeqno, FileNumber = file.FileNumber, Level = file.LevelHint };
             reader = TableReaderFactory.Open(f, opts);
         }
         catch
