@@ -275,7 +275,7 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 
 ## Unported utilities (found 2026-11-03)
 
-- [~] Built-in merge operators: max, put / put_v2, sortlist, bytesxor, StringAppendTEST, AggMerge; resolve by name from OPTIONS (`merge_operator=max`, ...)
+- [x] Built-in merge operators: max, put / put_v1, sortlist, bytesxor, StringAppendTEST, AggMerge (+ Aggregator API); resolved by name from OPTIONS; native writes / managed reads and compacts and vice versa for 12 ids; string-append delimiter now persisted like native
 - [-] Encrypted file system (env_encryption.h): out of scope (user decision)
 - [~] WalFilter, track_and_verify_wals predecessor-WAL metadata records (write + verify), UserWriteCallback
 - [ ] GetAllKeyVersions (utilities/debug.h), OptionChangeMigration, MemoryUtil::GetApproximateMemoryUsageByType, InfoLogFinder (S each)

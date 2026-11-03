@@ -30,25 +30,48 @@ public abstract class MergeOperator
     /// <summary>Port of AllowSingleOperand.</summary>
     public virtual bool AllowSingleOperand => false;
 
+    /// <summary>
+    /// Port of Customizable::NickName: the short id a factory also accepts for this operator (e.g. "max" for
+    /// "MaxOperator"); null when there is none.
+    /// </summary>
+    public virtual string? NickName => null;
+
+    /// <summary>
+    /// The text persisted for this operator in OPTIONS files: <see cref="Name"/>, or the struct form native writes for
+    /// operators with options (e.g. "{id=StringAppendOperator;delimiter=,;}").
+    /// </summary>
+    internal virtual string OptionsId => Name;
+
     public override string ToString() => Name;
 
     /// <summary>Built-in "UInt64AddOperator" (<see cref="UInt64AddOperator"/>).</summary>
     public static MergeOperator UInt64Add => UInt64AddOperator.Instance;
 
+    /// <summary>Built-in "MaxOperator" (<see cref="MaxOperator"/>).</summary>
+    public static MergeOperator Max => MaxOperator.Instance;
+
+    /// <summary>Built-in "PutOperator" (<see cref="PutOperatorV2"/>, upstream's MergeOperators::CreatePutOperator()).</summary>
+    public static MergeOperator Put => PutOperatorV2.Instance;
+
     /// <summary>Built-in "StringAppendOperator" (<see cref="StringAppendOperator"/>) with the given delimiter.</summary>
     public static MergeOperator StringAppend(string delimiter) => new StringAppendOperator(delimiter);
 
     /// <summary>
-    /// Recreates a built-in merge operator from its OPTIONS-file id (the factories registered by
-    /// RegisterBuiltinMergeOperators, utilities/merge_operators.cc): the class name or nick name
-    /// ("UInt64AddOperator" / "uint64add", "StringAppendOperator" / "stringappend"), or the struct form native writes for
-    /// configurable objects ("{id=StringAppendOperator;delimiter=,;}"). Returns null for other (custom) ids.
+    /// Recreates a built-in merge operator from its id, like MergeOperator::CreateFromString /
+    /// MergeOperators::CreateFromStringId with the factories registered by RegisterBuiltinMergeOperators
+    /// (utilities/merge_operators.cc): the class name or nick name ("PutOperator" / "put" (V2), "put_v1",
+    /// "UInt64AddOperator" / "uint64add", "MaxOperator" / "max", "MergeSortOperator" / "sortlist", "BytesXOR" /
+    /// "bytesxor", "StringAppendOperator" / "stringappend", "StringAppendTESTOperator" / "stringappendtest"), or the
+    /// struct form native writes for configurable objects ("{id=StringAppendOperator;delimiter=,;}", also accepted
+    /// without braces: "id=stringappend;delimiter=||"). In addition (upstream does not register it by name)
+    /// "AggMergeOperator.v1" resolves to <see cref="Utilities.AggMerge.AggMergeOperator.Instance"/>.
+    /// Returns null for other (custom) ids and for properties the operator does not have.
     /// </summary>
     public static MergeOperator? CreateBuiltin(string id)
     {
         ArgumentNullException.ThrowIfNull(id);
         string? delimiter = null;
-        if (id.Length >= 2 && id[0] == '{' && id[^1] == '}')
+        if (id.Contains('=', StringComparison.Ordinal))
         {
             string inner = "";
             foreach (KeyValuePair<string, string> kv in Options.OptionStrings.ParseStruct("merge_operator", id))
@@ -59,10 +82,26 @@ public abstract class MergeOperator
             }
             id = inner;
         }
+        if (delimiter is not null)
+        {
+            return id switch
+            {
+                "StringAppendOperator" or "stringappend" => new StringAppendOperator(delimiter),
+                "StringAppendTESTOperator" or "stringappendtest" => new StringAppendTestOperator(delimiter),
+                _ => null,
+            };
+        }
         return id switch
         {
-            "UInt64AddOperator" or "uint64add" when delimiter is null => UInt64AddOperator.Instance,
-            "StringAppendOperator" or "stringappend" => delimiter is null ? new StringAppendOperator() : new StringAppendOperator(delimiter),
+            "UInt64AddOperator" or "uint64add" => UInt64AddOperator.Instance,
+            "StringAppendOperator" or "stringappend" => new StringAppendOperator(),
+            "StringAppendTESTOperator" or "stringappendtest" => new StringAppendTestOperator(),
+            "MaxOperator" or "max" => MaxOperator.Instance,
+            "PutOperator" or "put" => PutOperatorV2.Instance,
+            "put_v1" => PutOperator.Instance,
+            "MergeSortOperator" or "sortlist" => SortListOperator.Instance,
+            "BytesXOR" or "bytesxor" => BytesXorOperator.Instance,
+            Utilities.AggMerge.AggMergeOperator.ClassName => Utilities.AggMerge.AggMergeOperator.Instance,
             _ => null,
         };
     }

@@ -10,7 +10,7 @@ Status values:
   (DB layer) or audit #3. For audit #3 the entry names the functions compared and any fix.
 - **line-by-line (feature audit: ...)**: compared when the feature was ported. The findings are in the named section of
   validation.md: "Background errors, listeners and backups", "Transactions", "User features", "User-defined
-  timestamps", "Integrated BlobDB", "Other SST formats", "Tracing, RepairDB and tools" or "WAL filter, predecessor-WAL records (track_and_verify_wals) and UserWriteCallback". Audit #3 re-checked defaults and constants where noted.
+  timestamps", "Integrated BlobDB", "Other SST formats", "Tracing, RepairDB and tools", "Built-in merge operators" or "WAL filter, predecessor-WAL records (track_and_verify_wals) and UserWriteCallback". Audit #3 re-checked defaults and constants where noted.
 - **compaction-features pass**: the pass that ported audit #3's remaining compaction deviations (validation.md,
   "Compaction features (audit #3 remaining deviations)"); the named functions were compared with `main` and with the
   11.12 sources (identical except where noted).
@@ -21,13 +21,13 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (283 files, about 83,000 lines):
+Summary (284 files, about 83,000 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
-| line-by-line (feature audits) | 105 |
+| line-by-line (feature audits) | 106 |
 | line-by-line (#3) | 17 |
 | line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
@@ -187,9 +187,9 @@ changes there need their own review.
 | `Db/MemTable.cs` | 673 | db/memtable.h, db/memtable.cc, memtable/skiplistrep.cc | line-by-line (#1); compaction-features pass: UpdateOldestKeyTime / ApproximateOldestKeyTime |
 | `Db/MemTableRangeTombstones.cs` | 291 | db/range_tombstone_fragmenter.{h,cc} | line-by-line (#1) |
 | `Db/MemTableSupport.cs` | 185 | db/memtable.cc, db/column_family.cc, db/merge_context.h | line-by-line (#1) |
-| `Db/MergeHelper.BuiltinOperators.cs` | 85 | utilities/merge_operators/uint64add.cc, utilities/merge_operators/string_append/stringappend.cc | line-by-line (#1) |
+| `Db/MergeHelper.BuiltinOperators.cs` | 415 | utilities/merge_operators/uint64add.cc, utilities/merge_operators/string_append/stringappend.cc, stringappend2.cc, utilities/merge_operators/max.cc, put.cc, sortlist.cc, bytesxor.cc, db/merge_operator.cc | line-by-line (#1); line-by-line (feature audit: built-in merge operators) |
 | `Db/MergeHelper.cs` | 517 | db/merge_context.h | line-by-line (#1) |
-| `Db/MergeOperator.cs` | 88 | include/rocksdb/merge_operator.h, utilities/merge_operators.cc | line-by-line (#1) |
+| `Db/MergeOperator.cs` | 139 | include/rocksdb/merge_operator.h, utilities/merge_operators.cc | line-by-line (#1); line-by-line (feature audit: built-in merge operators): RegisterBuiltinMergeOperators names |
 | `Db/RangeDelAggregator.cs` | 363 | db/range_del_aggregator.{h,cc}, db/dbformat.h | line-by-line (#1) |
 | `Db/Repair.cs` | 348 | db/repair.cc (Repairer) | line-by-line (feature audit: tracing, tools and repair) |
 | `Db/SeqnoToTimeMapping.cs` | 485 | db/seqno_to_time_mapping.{h,cc} | line-by-line (tiering pass: validation.md "Compaction triggers and tiering") |
@@ -311,6 +311,7 @@ changes there need their own review.
 | `Utilities/Backup/BackupEngine.cs` | 383 | utilities/backup/backup_engine.cc, include/rocksdb/utilities/backup_engine.h | line-by-line (feature audit: errors/listeners/backups) |
 | `Utilities/Backup/BackupEngineOptions.cs` | 215 | include/rocksdb/utilities/backup_engine.h | line-by-line (feature audit: errors/listeners/backups (+ #3 defaults)) |
 | `Utilities/Backup/BackupEngineReadOnly.cs` | 798 | include/rocksdb/utilities/backup_engine.h, utilities/backup/backup_engine.cc | line-by-line (feature audit: errors/listeners/backups) |
+| `Utilities/AggMerge/AggMergeOperator.cs` | 390 | include/rocksdb/utilities/agg_merge.h, utilities/agg_merge/agg_merge.cc, utilities/agg_merge/agg_merge_impl.h | line-by-line (feature audit: built-in merge operators) |
 | `Utilities/Backup/BackupMeta.cs` | 406 | utilities/backup/backup_engine.cc | line-by-line (feature audit: errors/listeners/backups) |
 | `Utilities/Checkpoint/ExportImportFilesMetadata.cs` | 26 | include/rocksdb/metadata.h (ExportImportFilesMetaData), include/rocksdb/options.h (ImportColumnFamilyOptions) | API wrapper, design-reviewed (DB API wave): delegates to audited DbImpl |
 | `Utilities/Transactions/ByteKeyComparer.cs` | 31 | (managed helper) | managed-only, design-reviewed (#3): helper |
