@@ -267,8 +267,18 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [x] Cache layers: SecondaryCache + adapter, CompressedSecondaryCache, TieredCache, persistent cache (volatile + file tier), WriteBufferManager (shared across DBs, cache charging, stalls; behaves like native's in compat tests), SimCache, CacheReservationManager; block-cache lookups unchanged when unused
 - [ ] cache layers: batched MultiGet secondary lookups, compressed admission to non-volatile tiers, async persistent-cache reads (S each)
 - [x] Column family export/import, remote compaction (CompactionService + OpenAndCompact; job/result format interoperates with native both ways), GetMergeOperands, PromoteL0, SuggestCompactRange, DeleteFilesInRange(s), LockWAL, Disable/EnableManualCompaction, GetCreationTimeOfOldestFile, ClipColumnFamily, GetPropertiesOfTablesInRange, OpenAndTrimHistory (compat vs native), MultiScan
-- [ ] remote compaction: per-subcompaction jobs, blob compactions on the worker, paranoid_hash (S/M)
+- [-] remote compaction leftovers (per-subcompaction jobs, blob compactions on the worker, paranoid_hash): out of scope (user decision)
 - [x] Query tracing + Replayer, block cache and IO tracing (trace files interoperate with native both ways), RepairDB (compat both ways), tools/RocksDb.Managed.Tools with ldb and sst_dump commands
-- [ ] tools: TTL/timestamp/blob/transaction ldb commands, non-block-based tables in sst_dump, codec benchmark in recompress (S/M)
+- [-] tools leftovers (TTL/timestamp/blob/transaction ldb commands, sst_dump on PlainTable/Cuckoo, recompress codec benchmark): out of scope (user decision)
 - [-] Deviation inventory: not needed (user accepted the documented reasons in docs/validation.md)
 - [ ] (upstream NotSupported, kept) timestamps in optimistic transactions and explicit-timestamp WBWI writes
+
+## Unported utilities (found 2026-11-03)
+
+- [~] Built-in merge operators: max, put / put_v2, sortlist, bytesxor, StringAppendTEST, AggMerge; resolve by name from OPTIONS (`merge_operator=max`, ...)
+- [-] Encrypted file system (env_encryption.h): out of scope (user decision)
+- [~] WalFilter, track_and_verify_wals predecessor-WAL metadata records (write + verify), UserWriteCallback
+- [ ] GetAllKeyVersions (utilities/debug.h), OptionChangeMigration, MemoryUtil::GetApproximateMemoryUsageByType, InfoLogFinder (S each)
+- [ ] Cache dump / load (cache_dump_load.h) (M)
+- [ ] TransactionDBMutexFactory (custom transaction mutexes) (S)
+- [ ] EnvMirror (test utility) (S); StackableDB has no C# equivalent (transactions / TTL are built in)
