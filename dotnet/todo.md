@@ -277,7 +277,8 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 
 - [x] Built-in merge operators: max, put / put_v1, sortlist, bytesxor, StringAppendTEST, AggMerge (+ Aggregator API); resolved by name from OPTIONS; native writes / managed reads and compacts and vice versa for 12 ids; string-append delimiter now persisted like native
 - [-] Encrypted file system (env_encryption.h): out of scope (user decision)
-- [~] WalFilter, track_and_verify_wals predecessor-WAL metadata records (write + verify), UserWriteCallback
+- [x] WalFilter (recovery replay rewritten as a port of ProcessLogFiles), track_and_verify_wals predecessor-WAL records written + verified (byte-identical with native both ways), UserWriteCallback; WAL recovery now follows upstream for paranoid_checks=false and point-in-time stops
+- [ ] WAL recycling at DB level (managed never writes recyclable records; reads native ones) (S/M)
 - [ ] GetAllKeyVersions (utilities/debug.h), OptionChangeMigration, MemoryUtil::GetApproximateMemoryUsageByType, InfoLogFinder (S each)
 - [ ] Cache dump / load (cache_dump_load.h) (M)
 - [ ] TransactionDBMutexFactory (custom transaction mutexes) (S)
