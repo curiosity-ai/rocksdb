@@ -117,6 +117,7 @@ internal sealed class ColumnFamilyData
             db.Options.MaxOpenFiles);
         CompactionState = new ColumnFamilyCompactionState(options, Icmp);
         Stats = new InternalStats(NumLevels);
+        TableCache.LevelStats = Stats;
         if (options.EnableBlobDirectWrite && options.EnableBlobFiles && !db.IsReadOnly)
         {
             // DBImpl::MaybeInitBlobDirectWriteColumnFamily.

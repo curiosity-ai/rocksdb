@@ -73,6 +73,12 @@ public sealed class FileMetaData
     }
     private ulong _newestKeyTime;
 
+    /// <summary>
+    /// In-memory only: the level of the newest version the file was placed in (-1 before), used to pick the per-level
+    /// file read latency histogram when its table reader is opened (TableCache::FindTable's file_read_hist).
+    /// </summary>
+    internal int LevelHint { get; set; } = -1;
+
     /// <summary>In-memory only (FileMetaData::being_compacted): the file is an input of a running compaction. Guarded by the DB mutex.</summary>
     internal bool BeingCompacted { get; set; }
 

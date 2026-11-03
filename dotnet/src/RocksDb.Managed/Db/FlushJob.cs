@@ -82,6 +82,8 @@ internal static class FlushJob
             Temperature = cfd.Options.DefaultWriteTemperature,
             // FileMetaData::user_defined_timestamps_persisted: the MANIFEST then stores the boundaries without timestamps.
             UserDefinedTimestampsPersisted = !stripTimestamps,
+            // BuildTable opens the new table with internal_stats->GetFileReadHist(0).
+            LevelHint = 0,
         };
         IWritableFile file = FileChecksumHelper.CreateWritable(fs, path, fileOptions);
         bool keep = false;

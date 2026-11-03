@@ -313,6 +313,12 @@ internal sealed class TableCache : ITableCache, IDisposable
     /// </summary>
     internal bool VerifyUniqueIdInManifest { get; set; }
 
+    /// <summary>
+    /// The column family's internal stats: with <see cref="Statistics"/>, reads of a table are also recorded in the
+    /// latency histogram of the level it was opened at (InternalStats::GetFileReadHist, shown by rocksdb.cfstats).
+    /// </summary>
+    internal InternalStats? LevelStats { get; set; }
+
     /// <summary>When set (DBOptions::statistics), table file reads are timed (SST_READ_MICROS, FILE_READ_*_MICROS).</summary>
     internal Statistics? Statistics { get; set; }
 
@@ -411,7 +417,7 @@ internal sealed class TableCache : ITableCache, IDisposable
     {
         string path = TableFilePath(file);
         IRandomAccessFile f = _fs.OpenRandomAccess(path);
-        if (Statistics is { } st) f = new Monitoring.StatisticsRandomAccessFile(f, st);
+        if (Statistics is { } st) f = new Monitoring.StatisticsRandomAccessFile(f, st, LevelStats?.GetFileReadHist(file.LevelHint));
         BlockBasedTableReader reader;
         try
         {

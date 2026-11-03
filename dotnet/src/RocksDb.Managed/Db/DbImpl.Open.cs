@@ -140,42 +140,52 @@ internal sealed partial class DbImpl
         Identity = Identity with { DbId = dbId };
 
         // ---- column families from the MANIFEST ----
-        lock (_mutex)
+        // VersionSet::Recover reads with Env::IOActivity::kDBOpen (table properties for the version stats, LoadTables):
+        // the reads are timed in FILE_READ_DB_OPEN_MICROS.
+        int openActivity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbOpenMicros);
+        try
         {
-            foreach (ColumnFamilyVersion cf in state.ColumnFamilies.Values)
+            lock (_mutex)
             {
-                ColumnFamilyOptions opts = PrepareCfOptions(descriptors[cf.Name]);
-                ValidateRecoveredColumnFamily(cf, opts);
-                var cfd = new ColumnFamilyData(cf.Id, cf.Name, opts, this) { LogNumber = cf.LogNumber, FullHistoryTsLow = cf.FullHistoryTsLow };
-                var files = new FileMetaData[cf.NumLevels][];
-                for (int l = 0; l < cf.NumLevels; l++)
+                foreach (ColumnFamilyVersion cf in state.ColumnFamilies.Values)
                 {
-                    var list = new List<FileMetaData>(cf.Levels[l]);
-                    files[l] = list.ToArray();
+                    ColumnFamilyOptions opts = PrepareCfOptions(descriptors[cf.Name]);
+                    ValidateRecoveredColumnFamily(cf, opts);
+                    var cfd = new ColumnFamilyData(cf.Id, cf.Name, opts, this) { LogNumber = cf.LogNumber, FullHistoryTsLow = cf.FullHistoryTsLow };
+                    var files = new FileMetaData[cf.NumLevels][];
+                    for (int l = 0; l < cf.NumLevels; l++)
+                    {
+                        var list = new List<FileMetaData>(cf.Levels[l]);
+                        files[l] = list.ToArray();
+                    }
+                    var cursors = new List<CompactCursor>(cf.CompactCursors.Count);
+                    foreach (KeyValuePair<int, byte[]> c in cf.CompactCursors) cursors.Add(new CompactCursor(c.Key, c.Value));
+                    Versions.AddColumnFamily(cfd, files, cf.BlobFiles.Values, cursors, updateStats: !Options.SkipStatsUpdateOnDbOpen);
+                    cfd.RecoverEpochNumbers();
+                    cfd.Mem = cfd.ConstructNewMemtable(state.LastSequence);
+                    InstallSuperVersion(cfd);
+                    RegisterCfForWrite(cfd);
                 }
-                var cursors = new List<CompactCursor>(cf.CompactCursors.Count);
-                foreach (KeyValuePair<int, byte[]> c in cf.CompactCursors) cursors.Add(new CompactCursor(c.Key, c.Value));
-                Versions.AddColumnFamily(cfd, files, cf.BlobFiles.Values, cursors, updateStats: !Options.SkipStatsUpdateOnDbOpen);
-                cfd.RecoverEpochNumbers();
-                cfd.Mem = cfd.ConstructNewMemtable(state.LastSequence);
-                InstallSuperVersion(cfd);
-                RegisterCfForWrite(cfd);
+            }
+            // LoadTables (before anything is written: a failure leaves the MANIFEST untouched).
+            if (!Options.BestEffortsRecovery) LoadTableHandlers(FileNames.DescriptorFileName(DbName, manifestNumber));
+            foreach (ColumnFamilyData cfd in GetColumnFamilies())
+            {
+                VersionStorageInfo s = cfd.Current.Storage;
+                // The FIFO TTL picker needs the newest key time of every L0 file (upstream: max_open_files = -1 pins every
+                // reader at open, LoadTableHandlers); opening the readers here records it in FileMetaData.NewestKeyTime.
+                if (cfd.Options.CompactionStyle == CompactionStyle.Fifo && cfd.Options.Ttl > 0)
+                {
+                    foreach (FileMetaData f in s.LevelFiles(0))
+                    {
+                        using TableReaderLease lease = cfd.TableCache.GetReader(f);
+                    }
+                }
             }
         }
-        // LoadTables (before anything is written: a failure leaves the MANIFEST untouched).
-        if (!Options.BestEffortsRecovery) LoadTableHandlers(FileNames.DescriptorFileName(DbName, manifestNumber));
-        foreach (ColumnFamilyData cfd in GetColumnFamilies())
+        finally
         {
-            VersionStorageInfo s = cfd.Current.Storage;
-            // The FIFO TTL picker needs the newest key time of every L0 file (upstream: max_open_files = -1 pins every
-            // reader at open, LoadTableHandlers); opening the readers here records it in FileMetaData.NewestKeyTime.
-            if (cfd.Options.CompactionStyle == CompactionStyle.Fifo && cfd.Options.Ttl > 0)
-            {
-                foreach (FileMetaData f in s.LevelFiles(0))
-                {
-                    using TableReaderLease lease = cfd.TableCache.GetReader(f);
-                }
-            }
+            Monitoring.FileReadActivity.Exit(openActivity);
         }
 
         // ---- WALs tracked in the MANIFEST (DBImpl::Recover: WalSet::CheckWals) ----

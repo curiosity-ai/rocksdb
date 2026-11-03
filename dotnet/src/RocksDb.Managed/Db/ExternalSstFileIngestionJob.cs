@@ -183,7 +183,7 @@ internal sealed class ExternalSstFileIngestionJob
             for (int i = 0; i < n; i++)
             {
                 string requested = i < funcNames.Count ? funcNames[i] : "";
-                generated[i] = FileChecksumHelper.GenerateOneFileChecksum(_fs, _files[i].InternalFilePath, factory, requested);
+                generated[i] = FileChecksumHelper.GenerateOneFileChecksum(_fs, _files[i].InternalFilePath, factory, requested, null);
                 _files[i].FileChecksum = generated[i].Checksum;
                 _files[i].FileChecksumFuncName = generated[i].FuncName;
             }
@@ -781,7 +781,7 @@ internal sealed class ExternalSstFileIngestionJob
                     if (_db.Options.FileChecksumGenFactory is { } factory && f.FileChecksumFuncName != FileMetaData.UnknownFileChecksumFuncName)
                     {
                         (f.FileChecksum, f.FileChecksumFuncName) =
-                            FileChecksumHelper.GenerateOneFileChecksum(_fs, f.InternalFilePath, factory, f.FileChecksumFuncName);
+                            FileChecksumHelper.GenerateOneFileChecksum(_fs, f.InternalFilePath, factory, f.FileChecksumFuncName, null);
                     }
                 }
                 catch (RocksDbException e) when (e.Code == StatusCode.NotSupported)

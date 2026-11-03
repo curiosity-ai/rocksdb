@@ -47,7 +47,17 @@ internal sealed partial class DbImpl
     {
         // kUnknownFileChecksum: nothing to verify.
         if (expected.Length == 0) return;
-        (byte[] actual, _) = FileChecksumHelper.GenerateOneFileChecksum(FileSystem, path, factory, funcName);
+        // Env::IOActivity::kVerifyFileChecksums: FILE_READ_VERIFY_FILE_CHECKSUMS_MICROS.
+        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadVerifyFileChecksumsMicros);
+        byte[] actual;
+        try
+        {
+            (actual, _) = FileChecksumHelper.GenerateOneFileChecksum(FileSystem, path, factory, funcName, Stats);
+        }
+        finally
+        {
+            Monitoring.FileReadActivity.Exit(activity);
+        }
         if (!actual.AsSpan().SequenceEqual(expected))
         {
             ThrowHelper.Corruption(path + " file checksum mismatch, expecting " + FileChecksumHelper.Hex(expected) + ", but actual "

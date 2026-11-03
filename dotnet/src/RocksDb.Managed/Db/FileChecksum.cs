@@ -124,10 +124,11 @@ internal static class FileChecksumHelper
     /// <summary>
     /// Port of GenerateOneFileChecksum: reads <paramref name="path"/> sequentially and computes its checksum with the
     /// generator <paramref name="factory"/> creates for <paramref name="requestedFuncName"/> (empty: the default).
-    /// InvalidArgument when the factory does not support the requested function.
+    /// InvalidArgument when the factory does not support the requested function. With <paramref name="statistics"/> the
+    /// reads are timed like table reads.
     /// </summary>
     public static (byte[] Checksum, string FuncName) GenerateOneFileChecksum(IFileSystem fs, string path, FileChecksumGenFactory factory,
-        string requestedFuncName)
+        string requestedFuncName, Statistics? statistics)
     {
         FileChecksumGenerator? gen = factory.CreateFileChecksumGenerator(new FileChecksumGenContext(path, requestedFuncName));
         if (gen is null)
@@ -139,7 +140,9 @@ internal static class FileChecksumHelper
         byte[] buffer = ArrayPool<byte>.Shared.Rent(ChunkSize);
         try
         {
-            using IRandomAccessFile file = fs.OpenRandomAccess(path);
+            IRandomAccessFile raw = fs.OpenRandomAccess(path);
+            // RandomAccessFileReader with the DB statistics: SST_READ_MICROS + the current activity's histogram.
+            using IRandomAccessFile file = statistics is null ? raw : new Monitoring.StatisticsRandomAccessFile(raw, statistics);
             long size = file.Length;
             long offset = 0;
             while (offset < size)

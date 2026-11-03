@@ -140,8 +140,11 @@ internal sealed partial class DbImpl
                 value = ErrorHandler.ErrorCount.ToString(CultureInfo.InvariantCulture);
                 return true;
             case DbProperties.CfStats:
-                // HandleCFStats: DumpCFStatsNoFileHistogram(is_periodic = true) starts a new interval.
-                value = cfd.Stats.Dump(cfd.Name, sv.Current.Storage, isPeriodic: true);
+                // HandleCFStats: DumpCFStatsNoFileHistogram(is_periodic = true) starts a new interval, then DumpCFFileHistogram.
+                value = cfd.Stats.Dump(cfd.Name, sv.Current.Storage, isPeriodic: true) + cfd.Stats.DumpFileHistogram(cfd.Name);
+                return true;
+            case DbProperties.CfFileHistogram:
+                value = cfd.Stats.DumpFileHistogram(cfd.Name);
                 return true;
             case DbProperties.CfStatsNoFileHistogram:
                 value = cfd.Stats.Dump(cfd.Name, sv.Current.Storage, isPeriodic: false);
@@ -151,7 +154,8 @@ internal sealed partial class DbImpl
                 return true;
             case DbProperties.Stats:
                 // DB stats, the CF stats, then the managed port's cumulative compaction summary (incl. trivial moves).
-                value = _writeStats.Dump() + cfd.Stats.Dump(cfd.Name, sv.Current.Storage, isPeriodic: true) + CompactionStatsString(sv);
+                value = _writeStats.Dump() + cfd.Stats.Dump(cfd.Name, sv.Current.Storage, isPeriodic: true) + cfd.Stats.DumpFileHistogram(cfd.Name)
+                    + CompactionStatsString(sv);
                 return true;
             case DbProperties.SsTables:
                 value = VersionDebugString(sv.Current);

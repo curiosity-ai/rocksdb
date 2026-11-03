@@ -135,4 +135,54 @@ public sealed class PropertiesStatisticsCompatTests
         }
         Assert.AreEqual(2, Directory.GetFiles(dir.Path, "LOG.old.*").Length); // and native rotated ours
     }
+    private static ulong TickerValue(string statistics, string name)
+    {
+        Match m = Regex.Match(statistics, "^" + Regex.Escape(name) + " COUNT : (\\d+)$", RegexOptions.Multiline);
+        Assert.IsTrue(m.Success, name);
+        return ulong.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// GET_HIT_L0 / L1 / L2_AND_UP for MultiGet (Version::MultiGetFromSST): the same LSM shape (keys in L0 and in the
+    /// bottommost level) and MultiGet calls give the same counts on both sides.
+    /// </summary>
+    [TestMethod]
+    public void MultiGetHitTickersMatchNative()
+    {
+        using var nativeDir = new TempDir("mget-hit-n");
+        using var managedDir = new TempDir("mget-hit-m");
+        byte[][] keys = [K(1), K(50), K(150), K(199), K(500)];
+        string nativeText;
+        var no = new RocksDbSharp.DbOptions().SetCreateIfMissing(true).EnableStatistics();
+        s_keepAlive.Add(no);
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(no, nativeDir.Path))
+        {
+            for (int i = 0; i < 100; i++) db.Put(K(i), K(i));
+            db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            db.CompactRange(Array.Empty<byte>(), null);
+            for (int i = 100; i < 200; i++) db.Put(K(i), K(i));
+            db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            db.MultiGet(keys);
+            db.MultiGet(keys);
+            nativeText = no.GetStatisticsString();
+        }
+        var stats = new Statistics();
+        using (RocksDatabase db = RocksDatabase.Open(managedDir.Path, new DbOptions { CreateIfMissing = true, Statistics = stats }))
+        {
+            for (int i = 0; i < 100; i++) db.Put(K(i), K(i));
+            db.Flush();
+            db.CompactRange(null, null);
+            for (int i = 100; i < 200; i++) db.Put(K(i), K(i));
+            db.Flush();
+            db.MultiGet(keys);
+            db.MultiGet(keys);
+        }
+        string managedText = stats.ToString();
+        foreach (string name in new[] { "rocksdb.l0.hit", "rocksdb.l1.hit", "rocksdb.l2andup.hit" })
+        {
+            Assert.AreEqual(TickerValue(nativeText, name), TickerValue(managedText, name), name);
+        }
+        Assert.AreEqual(4UL, TickerValue(managedText, "rocksdb.l0.hit"));
+        Assert.AreEqual(4UL, TickerValue(managedText, "rocksdb.l2andup.hit"));
+    }
 }

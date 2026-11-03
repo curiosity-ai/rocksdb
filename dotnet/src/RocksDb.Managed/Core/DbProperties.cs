@@ -49,7 +49,12 @@ public static class DbProperties
     /// <summary>1 if writes are stopped, else 0 (kIsWriteStopped).</summary>
     public const string IsWriteStopped = "rocksdb.is-write-stopped";
 
-    /// <summary>Same as <see cref="CfStats"/> (kCFStatsNoFileHistogram).</summary>
+    /// <summary>
+    /// kCFFileHistogram: the per-level table read latency histograms ("File Read Latency Histogram By Level"), recorded
+    /// when the DB has statistics.
+    /// </summary>
+    public const string CfFileHistogram = "rocksdb.cf-file-histogram";
+    /// <summary><see cref="CfStats"/> without the file read latency histograms (kCFStatsNoFileHistogram).</summary>
     public const string CfStatsNoFileHistogram = "rocksdb.cfstats-no-file-histogram";
     /// <summary>DB-wide write / WAL / stall statistics (kDBStats); map form via GetMapProperty.</summary>
     public const string DbStats = "rocksdb.dbstats";
