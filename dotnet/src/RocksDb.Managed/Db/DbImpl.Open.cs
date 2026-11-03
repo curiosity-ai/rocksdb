@@ -53,6 +53,7 @@ internal sealed partial class DbImpl
         _groupBatch.Dispose();
         try { ShutdownMonitoring(); } catch (Exception e) when (e is IOException or RocksDbException) { }
         DisposeOwnedSstFileManager();
+        SharedTableCache.Dispose();
         _dbLock?.Dispose();
         _dbLock = null;
     }

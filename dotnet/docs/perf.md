@@ -635,6 +635,23 @@ a cached block / a missing key, 0.26x / 0.21x for Seek + 10 / 100 Next and 0.52x
 `DbAsync`: async costs 0-20% over sync when calls complete synchronously (TryGet 1.31 vs 1.60 µs, MultiGet(16)
 19.1 vs 19.1 µs).
 
+## Auto-resizing HyperClock table and shared table cache (cache micro-benchmarks)
+
+`CacheBenchmarks` (BenchmarkDotNet default job, net10.0) before and after the change, single runs each on the shared
+4-vCPU VM with other agents building (load average 4-10, so differences below ~30% are noise; LRU, which did not
+change, moved by +10% to +57% between the two runs). The fixed table code path only gained a read of the table
+reference and a branch on a readonly flag. Every case stays allocation-free.
+
+| Benchmark | LRU before | LRU after | HyperClock before | HyperClock after | AutoHyperClock (new) |
+|---|---:|---:|---:|---:|---:|
+| LookupHit | 609 ns | 668 ns | 292 ns | 263 ns | 260 ns |
+| LookupMiss | 94 ns | 139 ns | 131 ns | 164 ns | 107 ns |
+| InsertWithEviction | 159 ns | 174 ns | 230 ns | 267 ns | 260 ns |
+| LookupHitMultiThreaded (per op) | 307 ns | 484 ns | 72 ns | 125 ns | 100 ns |
+
+Allocated: `-` in every cell. The auto table (estimated_entry_charge = 0) performs like the fixed one once grown;
+growth itself (64 slots per shard, doubling) only happens while the cache fills.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).

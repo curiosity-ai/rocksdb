@@ -340,6 +340,8 @@ internal sealed partial class DbImpl
                 if (maxFlushes == -1 && Options.MaxBackgroundCompactions == -1) maxFlushes = Math.Max(1, Options.MaxBackgroundJobs / 4);
                 _maxBackgroundFlushes = Math.Max(1, maxFlushes);
                 WriteControllerInstance.SetMaxDelayedWriteRate(Options.DelayedWriteRate);
+                // table_cache_->SetCapacity for a new max_open_files.
+                SharedTableCache.SetCapacity(Options.MaxOpenFiles);
                 MaybeScheduleFlush();
                 MaybeScheduleCompaction();
                 SignalBackgroundWork();

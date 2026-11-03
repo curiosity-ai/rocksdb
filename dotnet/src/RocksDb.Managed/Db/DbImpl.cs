@@ -40,6 +40,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     {
         DbName = dbname;
         Options = options;
+        SharedTableCache = new TableCacheStore(options.MaxOpenFiles);
         FileSystem = options.FileSystem;
         WalDir = string.IsNullOrEmpty(options.WalDir) ? dbname : options.WalDir.TrimEnd('/');
         var paths = new List<string> { dbname };
@@ -223,6 +224,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
         if (old is not null && old.Unref()) CleanupSuperVersion(old);
         OnSuperVersionInstalled(cfd);
     }
+
+    /// <summary>The table readers of all column families (DBImpl::table_cache_), bounded by max_open_files.</summary>
+    internal TableCacheStore SharedTableCache { get; }
 
     // ---- snapshots --------------------------------------------------------------------------------------
 
@@ -663,6 +667,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             _groupBatch.Dispose();
             try { ShutdownMonitoring(); } catch (Exception e) when (e is IOException or RocksDbException) { }
             DisposeOwnedSstFileManager();
+            SharedTableCache.Dispose();
             _dbLock?.Dispose();
             _dbLock = null;
             if (_secondary) DisposeSecondaryReaders();
