@@ -297,6 +297,7 @@ internal static class OptionEnumMaps
         ("BlockBasedTable", TableFactoryType.BlockBasedTable),
         ("PlainTable", TableFactoryType.PlainTable),
         ("CuckooTable", TableFactoryType.CuckooTable),
+        ("AdaptiveTableFactory", TableFactoryType.AdaptiveTable),
     ]);
 
     /// <summary>flush_block_policy_factory: the factories' kClassName().</summary>

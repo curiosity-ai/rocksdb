@@ -716,16 +716,26 @@ public sealed class DbBasicTests
                 Assert.IsTrue(db.TryGet(key, buffer, out _));
             }
         }
+        // The measured loop only records results: assertions are checked afterwards so that nothing but TryGet runs
+        // between the two allocation counter reads (test-framework calls inside the loop showed up as stray bytes).
+        int[] lengths = new int[order.Length];
+        byte[] firstBytes = new byte[order.Length];
+        bool allFound = true;
         ulong missesBefore = stats.GetTickerCount(Ticker.BlockCacheDataMiss);
         long before = GC.GetAllocatedBytesForCurrentThread();
-        foreach (long k in order)
+        for (int j = 0; j < order.Length; j++)
         {
-            System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(key, k);
-            Assert.IsTrue(db.TryGet(key, buffer, out int len));
-            Assert.AreEqual(value.Length, len);
-            Assert.AreEqual((byte)k, buffer[0]);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(key, order[j]);
+            allFound &= db.TryGet(key, buffer, out lengths[j]);
+            firstBytes[j] = buffer[0];
         }
         long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.IsTrue(allFound);
+        for (int j = 0; j < order.Length; j++)
+        {
+            Assert.AreEqual(value.Length, lengths[j]);
+            Assert.AreEqual((byte)order[j], firstBytes[j]);
+        }
         ulong misses = stats.GetTickerCount(Ticker.BlockCacheDataMiss) - missesBefore;
         Assert.IsTrue(misses > (ulong)order.Length / 2, "data block cache misses: " + misses);
         Assert.AreEqual(0L, allocated, "bytes allocated by " + order.Length + " TryGet with " + misses + " block cache misses");

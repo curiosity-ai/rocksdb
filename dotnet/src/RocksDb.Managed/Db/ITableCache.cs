@@ -27,19 +27,19 @@ public interface ITableCache
     void Evict(ulong fileNumber);
 }
 
-/// <summary>A reference to a cached <see cref="BlockBasedTableReader"/>. Dispose exactly once.</summary>
+/// <summary>A reference to a cached <see cref="TableReader"/> (any SST format). Dispose exactly once.</summary>
 public readonly struct TableReaderLease : IDisposable
 {
     private readonly Action<object?>? _release;
     private readonly object? _state;
 
-    public TableReaderLease(BlockBasedTableReader reader, Action<object?>? release, object? state)
+    public TableReaderLease(TableReader reader, Action<object?>? release, object? state)
     {
         Reader = reader;
         _release = release;
         _state = state;
     }
 
-    public BlockBasedTableReader Reader { get; }
+    public TableReader Reader { get; }
     public void Dispose() => _release?.Invoke(_state);
 }

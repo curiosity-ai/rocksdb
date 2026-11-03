@@ -67,6 +67,9 @@ Paths on the left are relative to the repository root (C++). Paths on the right 
 | `db/external_sst_file_ingestion_job.cc`, `table/sst_file_writer.cc` | `Db/ExternalSstFileIngestionJob.cs`, `Db/DbImpl.Ingest.cs`, `Db/SstFileWriter.cs` |
 | `db/transaction_log_impl.cc`, `wal_manager.cc` | `Db/TransactionLogIterator.cs`, `Db/DbImpl.Replication.cs` |
 | `utilities/checkpoint/checkpoint_impl.cc` | `Db/DbImpl.Checkpoint.cs` |
+| `utilities/checkpoint/checkpoint_impl.cc` (ExportColumnFamily), `db/import_column_family_job.cc` | `Db/DbImpl.ExportImport.cs`, `Db/ImportColumnFamilyJob.cs`, `Utilities/Checkpoint/ExportImportFilesMetadata.cs` |
+| `db/compaction/compaction_service_job.cc`, `db/db_impl/db_impl_secondary.cc` (OpenAndCompact) | `Db/DbImpl.RemoteCompaction.cs`, `Db/Compaction/CompactionService.cs`, `Db/Compaction/CompactionServiceFormat.cs` |
+| `db/db_impl/db_impl_experimental.cc`, `db/multi_scan.cc`, `db/history_trimming_iterator.h` | `Db/DbImpl.Experimental.cs`, `MultiScan.cs`, `Db/Compaction/HistoryTrimmingIterator.cs` |
 | `db_impl_readonly.cc`, `db_impl_secondary.cc`, `ReactiveVersionSet` / `ManifestTailer` (`version_set.cc`, `version_edit_handler.h`) | `Db/DbImpl.ReadOnly.cs` |
 | `db/error_handler.cc`, `db/event_helpers.cc`, `include/rocksdb/listener.h` | `Db/ErrorHandler.cs`, `Db/EventListener.cs`, `Db/EventListener.Notifications.cs` |
 | `db/blob/*` | `Db/Blob/*` |

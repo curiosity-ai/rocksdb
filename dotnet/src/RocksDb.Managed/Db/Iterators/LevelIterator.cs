@@ -371,13 +371,13 @@ public sealed class LevelIterator : InternalIterator
                 : TableCache.Recycle(reuse, _tableCache.GetReader(_files[index]), _readFlags);
         }
         TableReaderLease lease = _tableCache.GetReader(_files[index]);
-        if (reuse is TableInternalIterator t && t.Flags == _readFlags)
+        if (reuse is TableInternalIterator t && t.Flags == _readFlags && lease.Reader is BlockBasedTableReader)
         {
             t.Retarget(lease, _readOptions, _prefixExtractor);
             return t;
         }
         reuse?.Dispose();
-        return new TableInternalIterator(lease, _readFlags, _readOptions, _prefixExtractor);
+        return TableInternalIterator.Create(lease, _readFlags, _readOptions, _prefixExtractor);
     }
 
     private void SetFileIterator(InternalIterator? iter, int index)

@@ -55,7 +55,7 @@ internal sealed class TableCacheStore : IDisposable
     {
         public readonly ulong FileNumber;
         public readonly TableCache Owner;
-        public BlockBasedTableReader? Reader;
+        public TableReader? Reader;
         public FragmentedRangeTombstoneList? RangeDels;
         public long LastUse;
         /// <summary>1 while the handle holds a pin reference (see <see cref="TableCacheStore.TryGetPinned"/>).</summary>
@@ -291,7 +291,7 @@ internal sealed class TableCache : ITableCache, IDisposable
     /// The expected_unique_id check of BlockBasedTable::Open: the unique id the MANIFEST recorded for the file must be the
     /// one derived from the table's db_id / db_session_id / orig_file_number properties (GetSstInternalUniqueId, force).
     /// </summary>
-    private static void VerifyUniqueId(BlockBasedTableReader reader, FileMetaData file)
+    private static void VerifyUniqueId(TableReader reader, FileMetaData file)
     {
         TableProperties props = reader.Properties;
         Cache.OffsetableCacheKey.GetSstInternalUniqueId(props.DbId, props.DbSessionId, props.OriginalFileNumber, out ulong id0, out ulong id1);
@@ -399,7 +399,7 @@ internal sealed class TableCache : ITableCache, IDisposable
     }
 
     /// <summary>Iterator over the table; disposing it releases the reader lease.</summary>
-    public InternalIterator NewIterator(FileMetaData file) => new TableInternalIterator(GetReader(file));
+    public InternalIterator NewIterator(FileMetaData file) => TableInternalIterator.Create(GetReader(file), TableReadFlags.None, null, null);
 
     /// <summary>Recycles <paramref name="reuse"/> when it is a table iterator with default flags (no allocation per file).</summary>
     public InternalIterator NewIterator(FileMetaData file, InternalIterator? reuse) => Recycle(reuse, GetReader(file), TableReadFlags.None);
@@ -407,13 +407,13 @@ internal sealed class TableCache : ITableCache, IDisposable
     /// <summary>Retargets <paramref name="reuse"/> to <paramref name="lease"/> if it is a table iterator with <paramref name="flags"/>; otherwise disposes it and creates a new one.</summary>
     internal static InternalIterator Recycle(InternalIterator? reuse, TableReaderLease lease, TableReadFlags flags)
     {
-        if (reuse is TableInternalIterator t && t.Flags == flags)
+        if (reuse is TableInternalIterator t && t.Flags == flags && lease.Reader is BlockBasedTableReader)
         {
             t.Retarget(lease, null, null);
             return t;
         }
         reuse?.Dispose();
-        return new TableInternalIterator(lease, flags);
+        return TableInternalIterator.Create(lease, flags, null, null);
     }
 
     /// <summary>Opens the reader of <paramref name="h"/> with this column family's options (called by the store).</summary>
@@ -422,7 +422,7 @@ internal sealed class TableCache : ITableCache, IDisposable
         string path = TableFilePath(file);
         IRandomAccessFile f = _fs.OpenRandomAccess(path);
         if (Statistics is { } st) f = new Monitoring.StatisticsRandomAccessFile(f, st, LevelStats?.GetFileReadHist(file.LevelHint));
-        BlockBasedTableReader reader;
+        TableReader reader;
         try
         {
             // ReadFooterFromFile: the size recorded in the MANIFEST (FileDescriptor::file_size) must match the file.
@@ -432,9 +432,9 @@ internal sealed class TableCache : ITableCache, IDisposable
                     + " and file system " + f.Length.ToString(CultureInfo.InvariantCulture) + " sstable: " + path);
             }
             TableReaderOptions opts = ReaderOptions;
-            if (file.LargestSeqno != opts.LargestSeqno || file.FileNumber != opts.FileNumber)
-                opts = opts with { LargestSeqno = file.LargestSeqno, FileNumber = file.FileNumber };
-            reader = BlockBasedTableReader.Open(f, opts);
+            if (file.LargestSeqno != opts.LargestSeqno || file.FileNumber != opts.FileNumber || (opts.BlockCacheTracer is not null && file.LevelHint != opts.Level))
+                opts = opts with { LargestSeqno = file.LargestSeqno, FileNumber = file.FileNumber, Level = file.LevelHint };
+            reader = TableReaderFactory.Open(f, opts);
         }
         catch
         {

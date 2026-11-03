@@ -113,6 +113,10 @@ public enum TableReadFlags : byte
     /// as priority + 1; 0 = IO_TOTAL, not charged). Use <see cref="TableReadFlagsExtensions"/> to read and set it.
     /// </summary>
     RateLimiterPriorityMask = 0b11100,
+    /// <summary>ReadOptions::read_index = kBuiltin: read through the standard index.</summary>
+    BuiltinIndex = 0b100000,
+    /// <summary>ReadOptions::read_index = kPreferCustom: read through the user-defined index when the table has one.</summary>
+    PreferCustomIndex = 0b1000000,
 }
 
 /// <summary>Helpers for the packed fields of <see cref="TableReadFlags"/>.</summary>
@@ -141,6 +145,12 @@ public static class TableReadFlagsExtensions
     {
         if (options is null) return TableReadFlags.None;
         TableReadFlags f = options.FillCache ? TableReadFlags.None : TableReadFlags.DontFillCache;
+        f |= options.ReadIndex switch
+        {
+            ReadIndex.Builtin => TableReadFlags.BuiltinIndex,
+            ReadIndex.PreferCustom => TableReadFlags.PreferCustomIndex,
+            _ => TableReadFlags.None,
+        };
         return f.WithRateLimiterPriority(options.RateLimiterPriority);
     }
 }

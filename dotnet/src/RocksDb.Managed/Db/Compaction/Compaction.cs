@@ -307,6 +307,12 @@ internal sealed class Compaction
     /// </summary>
     public byte[]? OutputSplitKey { get; set; }
 
+    /// <summary>
+    /// The user-defined timestamp trim bound of DB::OpenAndTrimHistory (Compaction::trim_ts): entries and range
+    /// tombstones newer than it are dropped. Null for every other compaction.
+    /// </summary>
+    public byte[]? TrimTs { get; set; }
+
     /// <summary>Compaction::OutputToNonZeroMaxOutputLevel.</summary>
     public static bool OutputToNonZeroMaxOutputLevel(int outputLevel, int maxOutputLevel) => outputLevel > 0 && outputLevel == maxOutputLevel;
 

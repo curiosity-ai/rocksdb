@@ -10,7 +10,7 @@ Status values:
   (DB layer) or audit #3. For audit #3 the entry names the functions compared and any fix.
 - **line-by-line (feature audit: ...)**: compared when the feature was ported. The findings are in the named section of
   validation.md: "Background errors, listeners and backups", "Transactions", "User features", "User-defined
-  timestamps" or "Integrated BlobDB". Audit #3 re-checked defaults and constants where noted.
+  timestamps", "Integrated BlobDB", "Other SST formats" or "Tracing, RepairDB and tools". Audit #3 re-checked defaults and constants where noted.
 - **compaction-features pass**: the pass that ported audit #3's remaining compaction deviations (validation.md,
   "Compaction features (audit #3 remaining deviations)"); the named functions were compared with `main` and with the
   11.12 sources (identical except where noted).
@@ -21,17 +21,17 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (238 files, about 72,600 lines):
+Summary (281 files, about 83,000 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
-| line-by-line (feature audits) | 66 |
+| line-by-line (feature audits) | 103 |
 | line-by-line (#3) | 17 |
 | line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
-| API wrapper, design-reviewed | 5 |
+| API wrapper, design-reviewed | 11 |
 
 Two areas are under active change by other work streams: WritePrepared / WriteUnprepared transactions, and blob direct
 write with entity blob columns. Their files were audited at the revision named in validation.md ("Audit #3"). Later
@@ -39,6 +39,20 @@ changes there need their own review.
 
 | Managed file | Lines | C++ source(s) | Audit status |
 |---|---:|---|---|
+| `ColumnFamily.DbApis.cs` | 274 | include/rocksdb/db.h (GetMergeOperands, SuggestCompactRange, PromoteL0, DeleteFilesInRanges, ClipColumnFamily, GetPropertiesOfTablesInRange/ByLevel, LockWAL, Disable/EnableManualCompaction, GetCreationTimeOfOldestFile), include/rocksdb/options.h (GetMergeOperandsOptions) | API wrapper, design-reviewed (DB API wave): delegates to audited DbImpl |
+| `ColumnFamily.ExportImport.cs` | 54 | include/rocksdb/utilities/checkpoint.h (ExportColumnFamily), include/rocksdb/db.h (CreateColumnFamilyWithImport) | API wrapper, design-reviewed (DB API wave): delegates to audited DbImpl |
+| `Db/Compaction/CompactionService.cs` | 133 | include/rocksdb/options.h (CompactionService, CompactionServiceJobInfo, CompactionServiceJobStatus, CompactionServiceScheduleResponse, OpenAndCompactOptions, CompactionServiceOptionsOverride) | line-by-line (feature audit: DB API wave) |
+| `Db/Compaction/CompactionServiceFormat.cs` | 706 | db/compaction/compaction_job.h (CompactionServiceInput/OutputFile/Result), db/compaction/compaction_service_job.cc (type maps, Read/Write), options/options_helper.cc (StringToMap, NextToken, StripOuterBraces, SerializeType), include/rocksdb/utilities/options_type.h (SerializeVector/Array, StringMap), table/table_properties.cc (table_properties_type_info) | line-by-line (feature audit: DB API wave) |
+| `Db/Compaction/HistoryTrimmingIterator.cs` | 84 | db/history_trimming_iterator.h | line-by-line (feature audit: DB API wave) |
+| `Db/DbImpl.Experimental.cs` | 364 | db/db_impl/db_impl_experimental.cc (SuggestCompactRange, PromoteL0), db/db_impl/db_impl.cc (DeleteFilesInRanges, ClipColumnFamily, GetCreationTimeOfOldestFile, GetPropertiesOfTablesInRange/ByLevel), db/version_set.cc (GetPropertiesOfTablesInRange, GetSstFilesBoundaryKeys, GetCreationTimeOfOldestFile), util/udt_util.cc (MaybeAddTimestampsToRange) | line-by-line (feature audit: DB API wave) |
+| `Db/DbImpl.ExportImport.cs` | 189 | utilities/checkpoint/checkpoint_impl.cc (ExportColumnFamily, ExportFilesInMetaData), db/db_impl/db_impl.cc (CreateColumnFamilyWithImport) | line-by-line (feature audit: DB API wave) |
+| `Db/DbImpl.LockWal.cs` | 75 | db/db_impl/db_impl.cc (LockWAL, UnlockWAL) | line-by-line (feature audit: DB API wave) |
+| `Db/DbImpl.ManualCompaction.cs` | 75 | db/db_impl/db_impl_compaction_flush.cc (DisableManualCompaction, EnableManualCompaction, manual_compaction_paused_) | line-by-line (feature audit: DB API wave) |
+| `Db/DbImpl.MergeOperands.cs` | 78 | db/db_impl/db_impl.cc (PrepareGetMergeOperands, FinalizeGetMergeOperands), table/get_context.cc / db/memtable.h (continue_cb) | line-by-line (feature audit: DB API wave) |
+| `Db/DbImpl.RemoteCompaction.cs` | 509 | db/compaction/compaction_service_job.cc (ProcessKeyValueCompactionWithCompactionService, CompactionServiceCompactionJob), db/db_impl/db_impl_secondary.cc (DB::OpenAndCompact, CompactWithoutInstallation), db/compaction/compaction_picker.cc (GetCompactionInputsFromFileNumbers), file/filename.cc (RemoteCompactionJobDir) | line-by-line (feature audit: DB API wave) |
+| `Db/ImportColumnFamilyJob.cs` | 295 | db/import_column_family_job.{h,cc}, db/version_set.cc (RecoverEpochNumbers) | line-by-line (feature audit: DB API wave) |
+| `MultiScan.cs` | 301 | include/rocksdb/multi_scan.h, db/multi_scan.cc, include/rocksdb/options.h (MultiScanArgs, ScanOptions), DBIter::Prepare / BlockBasedTableIterator::Prepare (block prefetch) | line-by-line (feature audit: DB API wave) |
+| `RocksDatabase.RemoteCompaction.cs` | 36 | include/rocksdb/db.h (OpenAndCompact) | API wrapper, design-reviewed (DB API wave): delegates to audited DbImpl |
 | `RocksDb.Managed.Replication.MagicOnion/ClusterService.cs` | 237 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
 | `RocksDb.Managed.Replication.MagicOnion/Dtos.cs` | 271 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
 | `RocksDb.Managed.Replication.MagicOnion/GrpcNodeServer.cs` | 83 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
@@ -140,6 +154,7 @@ changes there need their own review.
 | `Db/DbImpl.SeqnoTime.cs` | 165 | db/db_impl/db_impl.cc, db/db_impl/db_impl_open.cc (seqno-to-time recording) | line-by-line (tiering pass: validation.md "Compaction triggers and tiering") |
 | `Db/DbImpl.Replication.cs` | 539 | db/db_impl/db_impl_files.cc, db/wal_manager.cc, db/db_filesnapshot.cc | line-by-line (#2) |
 | `Db/DbImpl.Timestamps.cs` | 295 | db/db_impl/db_impl.h, db/db_impl/db_impl_compaction_flush.cc | line-by-line (feature audit: user-defined timestamps) |
+| `Db/DbImpl.Tracing.cs` | 119 | db/db_impl/db_impl.cc (StartTrace, EndTrace, TraceIteratorSeek*), db_impl_write.cc (WriteImpl / PipelinedWriteImpl tracing), db_impl_sync_and_async.h (GetImpl tracing) | line-by-line (feature audit: tracing, tools and repair) |
 | `Db/DbImpl.Transactions.cs` | 524 | db/logs_with_prep_tracker.cc, db/db_impl/db_impl_files.cc, db/db_impl/db_impl.cc | line-by-line (feature audit: transactions) |
 | `Db/DbImpl.Write.cs` | 760 | db/db_impl/db_impl_write.cc, db/write_batch.cc (MemTableInserter) | line-by-line (#2) |
 | `Db/DbImpl.cs` | 612 | db/db_impl/db_impl.cc, db/db_impl/db_impl_compaction_flush.cc | line-by-line (#2) |
@@ -147,7 +162,7 @@ changes there need their own review.
 | `Db/ErrorHandler.cs` | 755 | db/error_handler.{h,cc}, db/event_helpers.cc, db/error_handler.cc | line-by-line (feature audit: errors/listeners/backups (+ #3 severity maps)) |
 | `Db/EventListener.Notifications.cs` | 351 | db/event_helpers.cc, db/db_impl/db_impl_compaction_flush.cc (NotifyOn*) | line-by-line (feature audit: errors/listeners/backups) |
 | `Db/EventListener.cs` | 293 | include/rocksdb/listener.h | line-by-line (feature audit: errors/listeners/backups) |
-| `Db/ExternalSstFileIngestionJob.cs` | 428 | db/external_sst_file_ingestion_job.h, db/external_sst_file_ingestion_job.cc | line-by-line (#2) |
+| `Db/ExternalSstFileIngestionJob.cs` | 1219 | db/external_sst_file_ingestion_job.h, db/external_sst_file_ingestion_job.cc | line-by-line (#2); file opening and table validation re-checked (feature audit: other SST formats) |
 | `Db/FileChecksum.cs` | 202 | include/rocksdb/file_checksum.h, util/file_checksum_helper.{h,cc}, file/file_util.cc (GenerateOneFileChecksum), file/writable_file_writer.cc (checksum_generator_) | line-by-line (feature audit: validation.md "Small gaps closed (2026-11-03)") |
 | `Db/FileMetaData.cs` | 253 | table/unique_id_impl.h, db/version_edit.h, include/rocksdb/file_checksum.h | line-by-line (#1); #3: in-memory NewestKeyTime |
 | `Db/FileNames.cs` | 458 | include/rocksdb/types.h, include/rocksdb/transaction_log.h, file/filename.{h,cc} | line-by-line (#1) |
@@ -176,6 +191,7 @@ changes there need their own review.
 | `Db/MergeHelper.cs` | 517 | db/merge_context.h | line-by-line (#1) |
 | `Db/MergeOperator.cs` | 88 | include/rocksdb/merge_operator.h, utilities/merge_operators.cc | line-by-line (#1) |
 | `Db/RangeDelAggregator.cs` | 363 | db/range_del_aggregator.{h,cc}, db/dbformat.h | line-by-line (#1) |
+| `Db/Repair.cs` | 348 | db/repair.cc (Repairer) | line-by-line (feature audit: tracing, tools and repair) |
 | `Db/SeqnoToTimeMapping.cs` | 485 | db/seqno_to_time_mapping.{h,cc} | line-by-line (tiering pass: validation.md "Compaction triggers and tiering") |
 | `Db/Snapshot.cs` | 101 | include/rocksdb/snapshot.h, db/snapshot_impl.h | line-by-line (#2) |
 | `Db/SstFileWriter.cs` | 329 | include/rocksdb/sst_file_writer.h, table/sst_file_writer.cc | line-by-line (#2) |
@@ -223,12 +239,15 @@ changes there need their own review.
 | `Options/OptionEnums.cs` | 178 | include/rocksdb/types.h, include/rocksdb/advanced_options.h, include/rocksdb/options.h | line-by-line (#3): enum values / names |
 | `Options/OptionTypeInfo.cs` | 484 | options/cf_options.cc, options/db_options.cc, table/block_based/block_based_table_factory.cc | line-by-line (#1) |
 | `Options/OptionsBase.cs` | 77 | options/options_helper.cc (unknown-option preservation) | managed-only, design-reviewed (#3): OPTIONS round-trip plumbing |
+| `Options/PlainAndCuckooTableOptions.cs` | 117 | include/rocksdb/table.h (PlainTableOptions, CuckooTableOptions), table/plain/plain_table_factory.cc, table/cuckoo/cuckoo_table_factory.cc (type info) | line-by-line (feature audit: other SST formats) |
 | `Options/OptionsFile.cs` | 408 | options/options_parser.cc, include/rocksdb/version.h | line-by-line (#1) |
 | `Options/SstPartitioner.cs` | 166 | include/rocksdb/sst_partitioner.h, db/compaction/sst_partitioner.cc | line-by-line (compaction-features pass): SstPartitioner / factory / fixed prefix, ShouldPartitionByPrefix, OPTIONS id form |
 | `Options/SliceTransform.cs` | 180 | include/rocksdb/slice_transform.h, util/slice.cc | line-by-line (feature audit: table prefix (prefix extractor)) |
 | `PooledValue.cs` | 92 | include/rocksdb/metadata.h | managed-only, design-reviewed (#3): pooled Get results / LiveFileMetadata record |
+| `RocksDatabase.Repair.cs` | 26 | include/rocksdb/db.h (RepairDB) | API wrapper, design-reviewed (#3): delegates to Repairer |
 | `RocksDatabase.Replication.cs` | 295 | db/db_impl/db_impl_readonly.cc, db/db_impl/db_impl_secondary.cc | API wrapper, design-reviewed (#3): delegates to audited DbImpl |
 | `RocksDatabase.Timestamps.cs` | 43 | include/rocksdb/db.h (timestamp APIs) | line-by-line (feature audit: user-defined timestamps) |
+| `RocksDatabase.Tracing.cs` | 103 | include/rocksdb/db.h (StartTrace, EndTrace, NewDefaultReplayer, StartBlockCacheTrace, StartIOTrace) | API wrapper, design-reviewed (#3): delegates to the tracers |
 | `RocksDatabase.cs` | 408 | include/rocksdb/db.h | API wrapper, design-reviewed (#3): delegates to audited DbImpl |
 | `Table/Block.cs` | 170 | table/block_based/block.{h,cc}, table/block_based/data_block_footer.cc | line-by-line (#1) |
 | `Table/BlockBasedTableBuilder.cs` | 784 | table/block_based/block_based_table_builder.cc | line-by-line (#1); compaction-features pass: EstimatedTailSize |
@@ -254,8 +273,31 @@ changes there need their own review.
 | `Table/Footer.cs` | 220 | table/format.h, table/block_based/block_based_table_reader.h, table/format.cc | line-by-line (#1) |
 | `Table/IndexBuilder.cs` | 480 | table/block_based/index_builder.h, table/block_based/index_builder.{h,cc} | line-by-line (#1); compaction-features pass: UpdateIndexSizeEstimate (shortened, partitioned) |
 | `Table/PinnedFilterPartitions.cs` | 56 | table/block_based/partitioned_filter_block.cc | line-by-line (#1) |
+| `Table/Cuckoo/CuckooTableBuilder.cs` | 465 | table/cuckoo/cuckoo_table_builder.{h,cc}, table/cuckoo/cuckoo_table_factory.h (CuckooHash) | line-by-line (feature audit: other SST formats) |
+| `Table/Cuckoo/CuckooTableReader.cs` | 317 | table/cuckoo/cuckoo_table_reader.{h,cc} | line-by-line (feature audit: other SST formats) |
+| `Table/Plain/PlainTableBloom.cs` | 118 | table/plain/plain_table_bloom.{h,cc}, util/bloom_impl.h | line-by-line (feature audit: other SST formats) |
+| `Table/Plain/PlainTableBuilder.cs` | 232 | table/plain/plain_table_builder.{h,cc} | line-by-line (feature audit: other SST formats) |
+| `Table/Plain/PlainTableIndex.cs` | 204 | table/plain/plain_table_index.{h,cc} | line-by-line (feature audit: other SST formats) |
+| `Table/Plain/PlainTableKeyCoding.cs` | 360 | table/plain/plain_table_key_coding.{h,cc} | line-by-line (feature audit: other SST formats) |
+| `Table/Plain/PlainTableReader.cs` | 559 | table/plain/plain_table_reader.{h,cc}, table/plain/plain_table_factory.cc | line-by-line (feature audit: other SST formats) |
+| `Table/TableBuilder.cs` | 83 | table/table_builder.h | line-by-line (feature audit: other SST formats) |
 | `Table/TableFormatOptions.cs` | 122 | include/rocksdb/table.h, table/table_builder.h | line-by-line (#1) |
+| `Table/TableReader.cs` | 148 | table/table_reader.h | line-by-line (feature audit: other SST formats) |
+| `Table/TableReaderFactory.cs` | 121 | table/adaptive/adaptive_table_factory.cc, table/format.cc (ReadFooterFromFile), table/meta_blocks.cc | line-by-line (feature audit: other SST formats) |
 | `Table/TableProperties.cs` | 373 | table/table_properties.cc, table/sst_file_writer.cc, include/rocksdb/table_properties.h | line-by-line (#1) |
+| `Table/TrieIndex/Bitvector.cs` | 591 | utilities/trie_index/bitvector.{h,cc} | line-by-line (feature audit: other SST formats) |
+| `Table/TrieIndex/LoudsTrie.cs` | 242 | utilities/trie_index/louds_trie.{h,cc} (LoudsTrie::InitFromData) | line-by-line (feature audit: other SST formats) |
+| `Table/TrieIndex/LoudsTrieBuilder.cs` | 546 | utilities/trie_index/louds_trie.{h,cc} (LoudsTrieBuilder) | line-by-line (feature audit: other SST formats) |
+| `Table/TrieIndex/LoudsTrieIterator.cs` | 745 | utilities/trie_index/louds_trie.{h,cc} (LoudsTrieIterator) | line-by-line (feature audit: other SST formats) |
+| `Table/TrieIndex/TrieIndexFactory.cs` | 334 | utilities/trie_index/trie_index_factory.{h,cc} | line-by-line (feature audit: other SST formats) |
+| `Table/UserDefinedIndex.cs` | 156 | include/rocksdb/index_factory.h, include/rocksdb/user_defined_index.h, table/block_based/user_defined_index_wrapper.h | line-by-line (feature audit: other SST formats) |
+| `Tracing/BlockCacheTracer.cs` | 290 | trace_replay/block_cache_tracer.{h,cc}, include/rocksdb/block_cache_trace_writer.h, include/rocksdb/table_reader_caller.h | line-by-line (feature audit: tracing, tools and repair) |
+| `Tracing/IoTracer.cs` | 445 | trace_replay/io_tracer.{h,cc}, env/file_system_tracer.{h,cc} | line-by-line (feature audit: tracing, tools and repair) |
+| `Tracing/QueryTracer.cs` | 189 | trace_replay/trace_replay.cc (Tracer) | line-by-line (feature audit: tracing, tools and repair) |
+| `Tracing/Replayer.cs` | 366 | utilities/trace/replayer_impl.cc, trace_replay/trace_record_handler.cc, include/rocksdb/utilities/replayer.h | line-by-line (feature audit: tracing, tools and repair) |
+| `Tracing/TraceFormat.cs` | 438 | trace_replay/trace_replay.{h,cc} (TracerHelper, TracedReadOptions, TracedWriteOptions), include/rocksdb/trace_record.h | line-by-line (feature audit: tracing, tools and repair) |
+| `Tracing/TraceReaderWriter.cs` | 144 | include/rocksdb/trace_reader_writer.h, utilities/trace/file_trace_reader_writer.cc | line-by-line (feature audit: tracing, tools and repair) |
+| `Tracing/TraceRecord.cs` | 144 | include/rocksdb/trace_record.h, trace_replay/trace_record.cc, include/rocksdb/trace_record_result.h | line-by-line (feature audit: tracing, tools and repair) |
 | `Util/ByteCompare.cs` | 73 | (memcmp) | managed-only, design-reviewed (#3): memcmp |
 | `Util/Coding.cs` | 256 | util/coding.h | line-by-line (#1) |
 | `Util/Comparator.cs` | 211 | include/rocksdb/comparator.h, util/comparator.cc | line-by-line (#1) |
@@ -268,6 +310,7 @@ changes there need their own review.
 | `Utilities/Backup/BackupEngineOptions.cs` | 215 | include/rocksdb/utilities/backup_engine.h | line-by-line (feature audit: errors/listeners/backups (+ #3 defaults)) |
 | `Utilities/Backup/BackupEngineReadOnly.cs` | 798 | include/rocksdb/utilities/backup_engine.h, utilities/backup/backup_engine.cc | line-by-line (feature audit: errors/listeners/backups) |
 | `Utilities/Backup/BackupMeta.cs` | 406 | utilities/backup/backup_engine.cc | line-by-line (feature audit: errors/listeners/backups) |
+| `Utilities/Checkpoint/ExportImportFilesMetadata.cs` | 26 | include/rocksdb/metadata.h (ExportImportFilesMetaData), include/rocksdb/options.h (ImportColumnFamilyOptions) | API wrapper, design-reviewed (DB API wave): delegates to audited DbImpl |
 | `Utilities/Transactions/ByteKeyComparer.cs` | 31 | (managed helper) | managed-only, design-reviewed (#3): helper |
 | `Utilities/Transactions/DbImpl.TransactionReads.cs` | 37 | db/db_impl/db_impl.cc (GetImpl with columns + read callback) | line-by-line (feature audit: transactions (entities)) |
 | `Utilities/Transactions/IndexedWriteBatch.cs` | 126 | utilities/write_batch_with_index (overwrite_key adapter) | managed-only, design-reviewed (#3): adapter over WBWI |

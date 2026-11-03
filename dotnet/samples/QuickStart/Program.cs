@@ -22,6 +22,7 @@ internal static class Program
         ("Snapshots", Reading.Snapshots),
         ("MergeOperators", Reading.MergeOperators),
         ("PrefixSeek", Reading.PrefixSeek),
+        ("TableFormats", Reading.TableFormats),
         ("Compaction", Maintenance.Compaction),
         ("OptimisticTransactions", Transactions.Optimistic),
         ("PessimisticTransactions", Transactions.Pessimistic),
@@ -36,11 +37,16 @@ internal static class Program
         ("Ttl", DataModels.Ttl),
         ("CheckpointBackupRestore", Maintenance.CheckpointBackupRestore),
         ("SstFileIngest", Maintenance.SstFileIngest),
+        ("ExportImport", DbOperations.ExportImport),
+        ("RemoteCompaction", DbOperations.RemoteCompaction),
+        ("MergeOperandsAndScans", DbOperations.MergeOperandsAndScans),
+        ("FileLevelOperations", DbOperations.FileLevelOperations),
         ("WalTailing", Replication.WalTailing),
         ("ReadOnlyAndSecondary", Replication.ReadOnlyAndSecondary),
         ("Monitoring", Monitoring.StatisticsListenersLog),
         ("CacheTiers", Caching.CacheTiersAndWriteBufferManager),
         ("ErrorHandling", Errors.ErrorHandling),
+        ("Tracing", Tracing.TraceAndReplay),
     ];
 
     public static async Task<int> Main(string[] args)

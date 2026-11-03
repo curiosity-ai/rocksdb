@@ -74,6 +74,7 @@ internal sealed partial class DbImpl
         ArgumentNullException.ThrowIfNull(batch);
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
+        if (_queryTracer is not null) MaybeTraceWrite(options, batch, txn);
         if (options is { Sync: true, DisableWal: true }) ThrowHelper.InvalidArgument("Sync writes has to enable WAL.");
         if (batch.DataSize < WriteBatch.HeaderSize) ThrowHelper.Corruption("malformed WriteBatch (too small)");
         if (options is { ProtectionBytesPerKey: not 0 } || batch.ProtectionBytesPerKey != 0) PrepareProtectedWrite(options, batch);
@@ -349,6 +350,7 @@ internal sealed partial class DbImpl
             if (!pre.IsCompletedSuccessfully) await pre.ConfigureAwait(false);
 
             int valid = CheckGroupCallbacks(group, out ulong total, out bool needSync, out WriteThread.Writer? firstValid);
+            if (_queryTracer is { PreserveWriteOrder: true } tracer) TraceWriteGroup(tracer, group);
             if (_bdwTransformer is { Touched.Count: > 0 } bdw)
             {
                 // SyncBlobDirectWriteManagers: the blobs must be durable before a sync WAL write references them.

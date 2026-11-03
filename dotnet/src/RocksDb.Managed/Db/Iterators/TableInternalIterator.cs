@@ -29,7 +29,7 @@ public sealed class TableInternalIterator : InternalIterator
         if (lease.Reader is null) throw new ArgumentException("lease has no reader", nameof(lease));
         _lease = lease;
         Flags = flags;
-        _it = lease.Reader.NewIterator(flags);
+        _it = Bbt(lease).NewIterator(flags);
     }
 
     /// <summary>
@@ -43,7 +43,8 @@ public sealed class TableInternalIterator : InternalIterator
         Flags = flags;
         try
         {
-            _it = lease.Reader.NewIterator(flags, lease.Reader.GetPrefixOptions(readOptions, prefixExtractor));
+            BlockBasedTableReader r = Bbt(lease);
+            _it = r.NewIterator(flags, r.GetPrefixOptions(readOptions, prefixExtractor));
         }
         catch
         {
@@ -56,7 +57,33 @@ public sealed class TableInternalIterator : InternalIterator
     /// <summary>Iterates <paramref name="reader"/> without owning it.</summary>
     public TableInternalIterator(BlockBasedTableReader reader) : this(new TableReaderLease(reader, null, null)) { }
 
-    public BlockBasedTableReader Reader => _lease.Reader;
+    public BlockBasedTableReader Reader => (BlockBasedTableReader)_lease.Reader;
+
+    private static BlockBasedTableReader Bbt(TableReaderLease lease) =>
+        lease.Reader as BlockBasedTableReader ?? throw new ArgumentException("TableInternalIterator iterates block-based tables only", nameof(lease));
+
+    /// <summary>
+    /// An iterator over <paramref name="lease"/>'s table that owns the lease: a <see cref="TableInternalIterator"/> for
+    /// block-based tables, otherwise the format's own iterator (TableReader::NewIterator) wrapped to release the lease.
+    /// </summary>
+    public static InternalIterator Create(TableReaderLease lease, TableReadFlags flags, ReadOptions? readOptions, SliceTransform? prefixExtractor)
+    {
+        if (lease.Reader is BlockBasedTableReader)
+        {
+            return readOptions is null && prefixExtractor is null
+                ? new TableInternalIterator(lease, flags)
+                : new TableInternalIterator(lease, flags, readOptions, prefixExtractor);
+        }
+        try
+        {
+            return new LeasedTableIterator(lease.Reader.NewInternalIterator(flags, readOptions, prefixExtractor), lease);
+        }
+        catch
+        {
+            lease.Dispose();
+            throw;
+        }
+    }
 
     public override bool Valid { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _it.Valid; }
     public override ReadOnlySpan<byte> Key { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _it.Key; }
@@ -159,10 +186,11 @@ public sealed class TableInternalIterator : InternalIterator
         TableReaderLease old = _lease;
         try
         {
+            BlockBasedTableReader r = Bbt(lease);
             TableIteratorPrefixOptions prefix = prefixExtractor is null && readOptions is null
                 ? default
-                : lease.Reader.GetPrefixOptions(readOptions, prefixExtractor);
-            _it.Retarget(lease.Reader, prefix);
+                : r.GetPrefixOptions(readOptions, prefixExtractor);
+            _it.Retarget(r, prefix);
             _smallestSeqno = DbFormat.MaxSequenceNumber;
             _largestSeqno = 0;
         }
@@ -187,6 +215,44 @@ public sealed class TableInternalIterator : InternalIterator
         _lease = default;
         l.Dispose();
     }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _it.Dispose();
+        TableReaderLease l = _lease;
+        _lease = default;
+        l.Dispose();
+    }
+}
+
+/// <summary>
+/// The iterator of a table of a format other than block-based (plain, cuckoo) with the <see cref="TableReaderLease"/> it
+/// was created from: disposing the iterator releases the lease (the reader stays pinned while iterating).
+/// </summary>
+internal sealed class LeasedTableIterator : InternalIterator
+{
+    private readonly InternalIterator _it;
+    private TableReaderLease _lease;
+    private bool _disposed;
+
+    public LeasedTableIterator(InternalIterator it, TableReaderLease lease)
+    {
+        _it = it;
+        _lease = lease;
+    }
+
+    public override bool Valid => _it.Valid;
+    public override ReadOnlySpan<byte> Key => _it.Key;
+    public override ReadOnlySpan<byte> Value => _it.Value;
+    public override void SeekToFirst() => _it.SeekToFirst();
+    public override void SeekToLast() => _it.SeekToLast();
+    public override void Seek(ReadOnlySpan<byte> target) => _it.Seek(target);
+    public override void SeekForPrev(ReadOnlySpan<byte> target) => _it.SeekForPrev(target);
+    public override void Next() => _it.Next();
+    public override void Prev() => _it.Prev();
+    public override bool MayBeOutOfUpperBound => _it.MayBeOutOfUpperBound;
 
     protected override void Dispose(bool disposing)
     {

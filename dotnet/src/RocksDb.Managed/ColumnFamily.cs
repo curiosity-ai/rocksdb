@@ -629,6 +629,7 @@ public sealed partial class ColumnFamily
         {
             Iterator it = DbIteratorFactory.Create(sources);
             it.Statistics = _db.Stats;
+            it.SetTraceState(_db, _cfd.Id, options);
             return it;
         }
         catch
@@ -647,6 +648,7 @@ public sealed partial class ColumnFamily
         {
             Iterator it = await DbIteratorFactory.CreateAsync(sources, cancellationToken).ConfigureAwait(false);
             it.Statistics = _db.Stats;
+            it.SetTraceState(_db, _cfd.Id, options);
             return it;
         }
         catch

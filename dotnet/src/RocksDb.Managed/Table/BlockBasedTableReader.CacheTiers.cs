@@ -152,6 +152,7 @@ public sealed partial class BlockBasedTableReader
         if (h.HasValue)
         {
             _stats?.Record(HitCounter(kind));
+            if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, Unsafe.As<Block>(h.Value), hit: true, flags);
             return BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h);
         }
         _stats?.Record(MissCounter(kind));

@@ -177,9 +177,11 @@ public sealed class CheckpointIngestReadOnlyTests
 
         // Multiple non-overlapping files at once, then reopen.
         db.IngestExternalFiles([WriteSst(fs, "/ext/8.sst", 500, 510, "h"), WriteSst(fs, "/ext/9.sst", 520, 530, "i")], new IngestExternalFileOptions());
+        // Background compactions may merge files (before close or right after the reopen): count a quiesced LSM.
+        db.WaitForCompact();
         int liveBefore = db.GetLiveFilesMetadata().Count;
         db.Dispose();
-        using RocksDatabase re = RocksDatabase.Open(DbPath, NewOptions(fs));
+        using RocksDatabase re = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { DisableAutoCompactions = true });
         Assert.AreEqual(liveBefore, re.GetLiveFilesMetadata().Count);
         Assert.AreEqual("c55", GetString(re, S(Key(55))!));
         Assert.AreEqual("d70", GetString(re, S(Key(70))!));

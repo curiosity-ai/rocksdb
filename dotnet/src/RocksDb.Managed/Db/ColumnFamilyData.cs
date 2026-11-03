@@ -261,6 +261,8 @@ internal sealed class ColumnFamilyData
         if (db.Options.Statistics is { } statistics) r = r with { Statistics = statistics.BlockCacheCounters };
         if (db.Options.RateLimiter is { } rateLimiter) r = r with { RateLimiter = rateLimiter };
         if (db.Options.LowestUsedCacheTier != Cache.CacheTier.NonVolatileBlockTier) r = r with { LowestUsedCacheTier = db.Options.LowestUsedCacheTier };
+        r = r with { BlockCacheTracer = db.BlockCacheTracer, BlockRestartInterval = options.TableOptions.BlockRestartInterval };
+        if (db.Options.AllowMmapReads) r = r with { AllowMmapReads = true };
         return r;
     }
 

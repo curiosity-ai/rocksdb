@@ -44,6 +44,39 @@ public static class BlockBasedTableConstants
 }
 
 /// <summary>
+/// Table magic numbers of every SST format (table/format.h): block-based (block_based_table_builder.cc), plain
+/// (plain_table_builder.cc) and cuckoo (cuckoo_table_builder.cc), plus the footer helpers of table/format.{h,cc} that
+/// depend on the magic number (IsLegacyFooterFormat, IsSupportedFormatVersionForRead/Write,
+/// BlockTrailerSizeForMagicNumber).
+/// </summary>
+public static class TableMagicNumbers
+{
+    /// <summary>kBlockBasedTableMagicNumber.</summary>
+    public const ulong BlockBasedTable = BlockBasedTableConstants.BlockBasedTableMagicNumber;
+    /// <summary>kPlainTableMagicNumber: leading 64 bits of sha1("rocksdb.table.plain").</summary>
+    public const ulong PlainTable = 0x8242229663bf9564UL;
+    /// <summary>kLegacyPlainTableMagicNumber: written by plain tables to mark the format_version 0 footer.</summary>
+    public const ulong LegacyPlainTable = 0x4f3418eb7a8f13b8UL;
+    /// <summary>kCuckooTableMagicNumber: leading 64 bits of sha1("rocksdb.table.cuckoo").</summary>
+    public const ulong CuckooTable = 0x926789d0c5f17873UL;
+
+    /// <summary>IsLegacyFooterFormat: only legacy plain tables still use the format_version 0 footer.</summary>
+    public static bool IsLegacyFooterFormat(ulong magic) => magic == LegacyPlainTable;
+
+    /// <summary>IsSupportedFormatVersionForRead (table/format.h).</summary>
+    public static bool IsSupportedFormatVersionForRead(ulong magic, uint version) => magic switch
+    {
+        BlockBasedTable => version >= BlockBasedTableConstants.MinSupportedFormatVersionForRead && version <= BlockBasedTableConstants.LatestSupportedFormatVersion,
+        PlainTable => version == 0,
+        CuckooTable => version == 1,
+        _ => false,
+    };
+
+    /// <summary>BlockTrailerSizeForMagicNumber: only block-based tables have block trailers.</summary>
+    public static int BlockTrailerSize(ulong magic) => magic == BlockBasedTable ? BlockBasedTableConstants.BlockTrailerSize : 0;
+}
+
+/// <summary>
 /// The fixed-size footer at the end of every table file. Port of <c>Footer</c> / <c>FooterBuilder</c>
 /// (table/format.h, table/format.cc). Layout for format_version &gt;= 1 (always 53 bytes):
 /// <code>
@@ -64,8 +97,10 @@ public readonly struct Footer
     /// <summary>kVersion0EncodedLength (legacy format_version 0) = 48, also the minimum.</summary>
     public const int MinEncodedLength = 2 * BlockHandle.MaxEncodedLength + BlockBasedTableConstants.MagicNumberLengthByte;
     private const int Part2Size = 2 * BlockHandle.MaxEncodedLength;
-    /// <summary>kKnownFooterFeatures (currently only kFooterFeatureRequireUserDefinedIndex = 1, which this port can't honour).</summary>
-    private const ulong KnownFooterFeatures = 0;
+    /// <summary>kFooterFeatureRequireUserDefinedIndex: the file can only be read through its user-defined index.</summary>
+    public const ulong FeatureRequireUserDefinedIndex = 1;
+    /// <summary>kKnownFooterFeatures.</summary>
+    private const ulong KnownFooterFeatures = FeatureRequireUserDefinedIndex;
 
     public ulong TableMagicNumber { get; init; }
     public int FormatVersion { get; init; }
@@ -84,8 +119,16 @@ public readonly struct Footer
     /// will be written (needed for the context checksum).
     /// </summary>
     public static void Build(Span<byte> dst, int formatVersion, ulong footerOffset, ChecksumType checksumType,
-        BlockHandle metaindexHandle, BlockHandle indexHandle, uint baseContextChecksum)
+        BlockHandle metaindexHandle, BlockHandle indexHandle, uint baseContextChecksum) =>
+        Build(dst, formatVersion, footerOffset, checksumType, metaindexHandle, indexHandle, baseContextChecksum, incompatibleFeatures: 0);
+
+    /// <summary><see cref="Build(Span{byte}, int, ulong, ChecksumType, BlockHandle, BlockHandle, uint)"/> with incompatible feature flags (format_version &gt;= 6).</summary>
+    public static void Build(Span<byte> dst, int formatVersion, ulong footerOffset, ChecksumType checksumType,
+        BlockHandle metaindexHandle, BlockHandle indexHandle, uint baseContextChecksum, ulong incompatibleFeatures)
     {
+        if (formatVersion < 6 && incompatibleFeatures != 0) ThrowHelper.InvalidArgument("incompatible footer features require format_version >= 6");
+        if ((incompatibleFeatures & ~KnownFooterFeatures) != 0)
+            ThrowHelper.InvalidArgument("unsupported incompatible footer features: " + (incompatibleFeatures & ~KnownFooterFeatures));
         if (formatVersion < BlockBasedTableConstants.MinSupportedFormatVersionForWrite || formatVersion > BlockBasedTableConstants.LatestSupportedFormatVersion)
             ThrowHelper.InvalidArgument("unsupported format_version " + formatVersion);
         dst = dst[..EncodedLength];
@@ -126,7 +169,8 @@ public readonly struct Footer
                     ThrowHelper.InvalidArgument("metaindex block must immediately precede the footer");
                 Coding.EncodeFixed32(cur[12..], (uint)metaindexHandle.Size);
             }
-            // 16 reserved zero bytes + incompatible features (0) already zero.
+            // 16 reserved zero bytes, then the incompatible features.
+            Coding.EncodeFixed64(cur[32..], incompatibleFeatures);
             uint checksum = BlockChecksum.ComputeBuiltinChecksum(checksumType, dst);
             checksum += BlockChecksum.ChecksumModifierForContext(baseContextChecksum, footerOffset);
             Coding.EncodeFixed32(dst[5..], checksum);
@@ -141,21 +185,89 @@ public readonly struct Footer
     }
 
     /// <summary>
+    /// Port of FooterBuilder::Build for the plain (format_version 0: legacy magic, 48 bytes) and cuckoo (format_version 1,
+    /// 53 bytes) table formats, which have no block trailers or context checksums. Returns the number of bytes written to
+    /// <paramref name="dst"/> (which must hold <see cref="EncodedLength"/> bytes).
+    /// </summary>
+    public static int BuildForMagic(Span<byte> dst, ulong magic, int formatVersion, ChecksumType checksumType, BlockHandle metaindexHandle, BlockHandle indexHandle)
+    {
+        bool supported = magic switch
+        {
+            TableMagicNumbers.PlainTable => formatVersion == 0,
+            TableMagicNumbers.CuckooTable => formatVersion == 1,
+            _ => false,
+        };
+        if (!supported) ThrowHelper.InvalidArgument("unsupported format_version " + formatVersion + " for magic " + magic);
+        Span<byte> part2;
+        int length;
+        if (formatVersion > 0)
+        {
+            length = EncodedLength;
+            dst = dst[..length];
+            dst.Clear();
+            dst[0] = (byte)checksumType;
+            part2 = dst.Slice(1, Part2Size);
+            Coding.EncodeFixed32(dst[(1 + Part2Size)..], (uint)formatVersion);
+            Coding.EncodeFixed64(dst[(1 + Part2Size + 4)..], magic);
+        }
+        else
+        {
+            // format_version == 0 is used by plain tables: the legacy magic number marks it. Legacy SST files use the
+            // crc32c checksum but it's not stored in the footer.
+            if (checksumType is not (ChecksumType.NoChecksum or ChecksumType.Crc32c)) ThrowHelper.InvalidArgument("legacy footer requires crc32c");
+            length = MinEncodedLength;
+            dst = dst[..length];
+            dst.Clear();
+            part2 = dst[..Part2Size];
+            Coding.EncodeFixed64(dst[Part2Size..], TableMagicNumbers.LegacyPlainTable);
+        }
+        int n = metaindexHandle.EncodeTo(part2);
+        indexHandle.EncodeTo(part2[n..]);
+        return length;
+    }
+
+    /// <summary>
     /// Port of Footer::DecodeFrom. <paramref name="input"/> is the tail of the file (at least
     /// <see cref="MinEncodedLength"/> bytes, ideally <see cref="EncodedLength"/>), starting at file offset
     /// <paramref name="inputOffset"/>.
     /// </summary>
-    public static Footer Decode(ReadOnlySpan<byte> input, ulong inputOffset)
+    public static Footer Decode(ReadOnlySpan<byte> input, ulong inputOffset) => Decode(input, inputOffset, TableMagicNumbers.BlockBasedTable);
+
+    /// <summary>
+    /// Port of Footer::DecodeFrom with <c>enforce_table_magic_number</c> (0 accepts any known table format, like
+    /// ReadFooterFromFile without enforcement). Legacy plain table footers (format_version 0, 48 bytes, legacy magic)
+    /// are upconverted to <see cref="TableMagicNumbers.PlainTable"/> with checksum type crc32c.
+    /// </summary>
+    public static Footer Decode(ReadOnlySpan<byte> input, ulong inputOffset, ulong enforceTableMagicNumber)
     {
         if (input.Length < MinEncodedLength) ThrowHelper.Corruption("input is too short to be an SST file");
         ulong magic = Coding.DecodeFixed64(input[^8..]);
         if (magic == BlockBasedTableConstants.LegacyBlockBasedTableMagicNumber)
             ThrowHelper.NotSupported("Unsupported legacy magic number for block-based SST format. Load with RocksDB >= 4.6.0 and < 11.0.0 and run full compaction to upgrade.");
-        if (magic != BlockBasedTableConstants.BlockBasedTableMagicNumber)
-            ThrowHelper.Corruption("Bad table magic number: expected " + BlockBasedTableConstants.BlockBasedTableMagicNumber + ", found " + magic);
+        // Check for legacy formats: legacy plain tables are still supported - upconvert magic.
+        bool legacy = TableMagicNumbers.IsLegacyFooterFormat(magic);
+        if (legacy) magic = TableMagicNumbers.PlainTable;
+        if (enforceTableMagicNumber != 0 && enforceTableMagicNumber != magic)
+            ThrowHelper.Corruption("Bad table magic number: expected " + enforceTableMagicNumber + ", found " + magic);
+        if (legacy)
+        {
+            // Legacy format (format_version=0, used by plain tables): part2 then the magic, no checksum type stored.
+            ReadOnlySpan<byte> p0 = input[^MinEncodedLength..];
+            BlockHandle index0 = default;
+            if (!BlockHandle.TryDecode(ref p0, out BlockHandle meta0) || !BlockHandle.TryDecode(ref p0, out index0))
+                ThrowHelper.Corruption("bad block handle");
+            return new Footer
+            {
+                TableMagicNumber = magic,
+                FormatVersion = 0,
+                ChecksumType = ChecksumType.Crc32c,
+                MetaindexHandle = meta0,
+                IndexHandle = index0,
+            };
+        }
 
         int formatVersion = (int)Coding.DecodeFixed32(input[^12..]);
-        if (formatVersion < BlockBasedTableConstants.MinSupportedFormatVersionForRead || formatVersion > BlockBasedTableConstants.LatestSupportedFormatVersion)
+        if (!TableMagicNumbers.IsSupportedFormatVersionForRead(magic, (uint)formatVersion))
             ThrowHelper.Corruption("Corrupt or unsupported format_version " + (uint)formatVersion + " for magic " + magic);
         if (input.Length < EncodedLength) ThrowHelper.Corruption("Input is too short to be an SST file");
         int adjustment = input.Length - EncodedLength;
@@ -193,7 +305,7 @@ public readonly struct Footer
                 metaindexGap = metaindexSize >> 16;
                 metaindexSize &= 0xFFFF;
             }
-            ulong metaindexEnd = footerOffset - BlockBasedTableConstants.BlockTrailerSize - metaindexGap;
+            ulong metaindexEnd = footerOffset - (ulong)TableMagicNumbers.BlockTrailerSize(magic) - metaindexGap;
             return new Footer
             {
                 TableMagicNumber = magic,

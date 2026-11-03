@@ -143,4 +143,51 @@ internal static class Reading
         Check(users == 2, "prefix seek");
         return Task.CompletedTask;
     }
+
+    public static Task TableFormats(string path)
+    {
+        // <snippet:table-formats>
+        // PlainTable: for in-memory / tmpfs databases (no blocks, compression or checksums). With a prefix extractor,
+        // lookups use a prefix hash index and iterators only support prefix seeks.
+        var plain = new ColumnFamilyOptions
+        {
+            TableFactory = TableFactoryType.PlainTable,                    // table_factory=PlainTable
+            PrefixExtractor = SliceTransform.CreateFixedPrefix(5),
+            PlainTableOptions = { EncodingType = PlainTableEncodingType.Prefix, StoreIndexInFile = true },
+        };
+        using (RocksDatabase db = RocksDatabase.Open(Path.Combine(path, "plain"), new DbOptions { CreateIfMissing = true }, plain))
+        {
+            db.Put("user:1"u8, "a"u8);
+            db.Put("user:2"u8, "b"u8);
+            db.Flush();                                                    // a plain table SST, readable by native RocksDB
+            using Iterator it = db.NewIterator(new ReadOptions { PrefixSameAsStart = true });
+            for (it.Seek("user:"u8); it.Valid; it.Next()) { /* user:1, user:2 */ }
+        }
+
+        // CuckooTable: fixed-size keys and values, one version per key, read memory-mapped (AllowMmapReads).
+        var cuckoo = new ColumnFamilyOptions { TableFactory = TableFactoryType.CuckooTable, CuckooTableOptions = { HashTableRatio = 0.9 } };
+        using (RocksDatabase db = RocksDatabase.Open(Path.Combine(path, "cuckoo"), new DbOptions { CreateIfMissing = true, AllowMmapReads = true }, cuckoo))
+        {
+            db.Put("key00001"u8, "val1"u8);
+            db.Flush();
+            byte[]? v = db.Get("key00001"u8);                              // "val1"
+        }
+
+        // AdaptiveTableFactory: reads block-based, plain and cuckoo files by their magic number; writes one format.
+        var adaptive = new ColumnFamilyOptions
+        {
+            TableFactory = TableFactoryType.AdaptiveTable,
+            AdaptiveTableWriteFactory = TableFactoryType.BlockBasedTable,
+            PrefixExtractor = SliceTransform.CreateFixedPrefix(5),
+        };
+        using (RocksDatabase db = RocksDatabase.Open(Path.Combine(path, "plain"), new DbOptions(), adaptive))
+        {
+            byte[]? v = db.Get("user:2"u8);                                // read from the plain table file
+        }
+        // </snippet:table-formats>
+        using (RocksDatabase db = RocksDatabase.Open(Path.Combine(path, "plain"), new DbOptions(), adaptive))
+            Check(db.Get("user:2"u8) is [(byte)'b'], "adaptive read of a plain table");
+        Line("plain + cuckoo + adaptive ok");
+        return Task.CompletedTask;
+    }
 }

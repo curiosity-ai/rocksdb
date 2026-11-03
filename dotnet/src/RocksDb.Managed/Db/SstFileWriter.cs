@@ -35,7 +35,7 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     private readonly TableFormatOptions _format;
     private readonly string _columnFamilyName;
     private readonly ulong _columnFamilyId;
-    private BlockBasedTableBuilder? _builder;
+    private TableBuilder? _builder;
     private IWritableFile? _file;
     private string _path = "";
     private readonly PooledBufferWriter _key = new(64);
@@ -93,7 +93,7 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
         _file = _fs.CreateWritable(filePath, truncate: true);
         try
         {
-            _builder = new BlockBasedTableBuilder(_file, _format, tbo);
+            _builder = TableBuilder.Create(_file, _format, tbo);
         }
         catch
         {
@@ -166,7 +166,7 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     /// <summary>Port of SstFileWriter::Rep::AddImpl.</summary>
     private SstFileWriter AddImpl(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> value, EntryType type)
     {
-        BlockBasedTableBuilder builder = _builder ?? throw RocksDbException.InvalidArgument("File is not opened");
+        TableBuilder builder = _builder ?? throw RocksDbException.InvalidArgument("File is not opened");
         if (_numEntries > 0 && _ucmp.Compare(userKey, _largestKey.WrittenSpan) <= 0)
         {
             // Make sure that keys are added in order.
@@ -215,7 +215,7 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     /// <summary>Port of Rep::DeleteRangeImpl (keys with their timestamp when the comparator has one).</summary>
     private SstFileWriter DeleteRangeImpl(ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey)
     {
-        BlockBasedTableBuilder builder = _builder ?? throw RocksDbException.InvalidArgument("File is not opened");
+        TableBuilder builder = _builder ?? throw RocksDbException.InvalidArgument("File is not opened");
         int c = _ucmp.CompareWithoutTimestamp(beginKey, endKey);
         if (c > 0) ThrowHelper.InvalidArgument("end key comes before start key");
         if (c == 0) return this; // empty range: nothing to record (upstream skips it as well)
@@ -238,7 +238,7 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     /// <summary>Port of SstFileWriter::Finish: finishes and syncs the file and returns its description.</summary>
     public ExternalSstFileInfo Finish()
     {
-        BlockBasedTableBuilder builder = _builder ?? throw RocksDbException.InvalidArgument("File is not opened");
+        TableBuilder builder = _builder ?? throw RocksDbException.InvalidArgument("File is not opened");
         if (_numEntries == 0 && _numRangeDelEntries == 0) ThrowHelper.InvalidArgument("Cannot create sst file with no entries");
         try
         {
@@ -255,7 +255,7 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     /// <summary>Asynchronous <see cref="Finish"/>.</summary>
     public async ValueTask<ExternalSstFileInfo> FinishAsync(CancellationToken cancellationToken = default)
     {
-        BlockBasedTableBuilder builder = _builder ?? throw RocksDbException.InvalidArgument("File is not opened");
+        TableBuilder builder = _builder ?? throw RocksDbException.InvalidArgument("File is not opened");
         if (_numEntries == 0 && _numRangeDelEntries == 0) ThrowHelper.InvalidArgument("Cannot create sst file with no entries");
         try
         {
@@ -278,7 +278,7 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     /// <summary>CompareTimestamp(ts, MinU64Ts()) == 0 (the minimum u64 timestamp is all zeros).</summary>
     private static bool IsMinTimestamp(ReadOnlySpan<byte> timestamp) => !timestamp.ContainsAnyExcept((byte)0);
 
-    private ExternalSstFileInfo MakeInfo(BlockBasedTableBuilder builder)
+    private ExternalSstFileInfo MakeInfo(TableBuilder builder)
     {
         byte[] smallest = _smallestKey;
         byte[] largest = _largestKey.WrittenSpan.ToArray();

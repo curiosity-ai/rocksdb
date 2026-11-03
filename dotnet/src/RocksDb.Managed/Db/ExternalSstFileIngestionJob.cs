@@ -65,7 +65,14 @@ internal sealed class IngestedFileInfo
 /// by ingesting a generated range tombstone file below the new files (PrepareAtomicReplaceRangeTombstone /
 /// ActivateAtomicReplaceRangeTombstone). The equivalent file-ingesting compactions are registered (and the replaced
 /// files marked as being compacted) between <see cref="Run"/> and the end of LogAndApply (RegisterRange /
-/// UnregisterRange). Not ported: PreparedFileInfo.
+/// UnregisterRange). Files are opened with the column family's table factory (TableFactory::NewTableReader), so
+/// PlainTable / CuckooTable external files are ingested into column families of that format (a file of another format
+/// fails with "Bad table magic number"; the adaptive factory takes any), with upstream's validation: the largest key of
+/// a plain table is found by a full scan (its iterator has no SeekToLast) and verify_checksums_before_ingest fails with
+/// NotSupported for those formats (TableReader::VerifyChecksum). As upstream, plain and cuckoo files are then rejected
+/// by the comparator check (their builders record no comparator name: InvalidArgument "... does not match existing
+/// comparator "), and SstFileWriter cuckoo files already by the version check (the cuckoo builder runs no property
+/// collectors: Corruption "External file version not found"). Not ported: PreparedFileInfo.
 /// </para>
 /// </summary>
 internal sealed class ExternalSstFileIngestionJob
@@ -461,7 +468,8 @@ internal sealed class ExternalSstFileIngestionJob
 
     /// <summary>
     /// Port of ExternalSstFileIngestionJob::GetIngestedFileInfo / GetIngestedFileInfoFromFile /
-    /// SanityCheckTableProperties.
+    /// SanityCheckTableProperties / ResetTableReader: the file is opened through the format-neutral
+    /// <see cref="TableReaderFactory"/> with the column family's table factory.
     /// </summary>
     private FileInfoResult GetIngestedFileInfo(string path)
     {
@@ -470,7 +478,7 @@ internal sealed class ExternalSstFileIngestionJob
         bool dbGenerated = _options.AllowDbGeneratedFiles;
         // Read the raw keys: the global sequence number must not be applied while validating.
         TableReaderOptions ro = _cfd.ReaderOptions with { LargestSeqno = BlockIter.DisableGlobalSequenceNumber, BlockCache = NoBlockCache.Instance };
-        using BlockBasedTableReader reader = BlockBasedTableReader.Open(_fs.OpenRandomAccess(path), ro);
+        using TableReader reader = OpenTableReader(path, ro);
         TableProperties props = reader.Properties;
         SanityCheckTableProperties(props, info);
         info.NumEntries = props.NumEntries - props.NumRangeDeletions;
@@ -488,7 +496,7 @@ internal sealed class ExternalSstFileIngestionJob
         {
             // We are ingesting a DB generated SST file for which we don't reassign sequence numbers. We need its
             // smallest sequence number and largest sequence number for FileMetaData.
-            GetSeqnoBoundaryForFile(reader, props, info);
+            GetSeqnoBoundaryForFile(reader, ro.PrefixExtractor, props, info);
         }
         else if (props.KeyLargestSeqno != TableProperties.Unknown && props.KeyLargestSeqno > 0)
         {
@@ -497,7 +505,9 @@ internal sealed class ExternalSstFileIngestionJob
         }
 
         byte[]? smallest = null, largest = null;
-        using (BlockBasedTableIterator it = reader.NewIterator())
+        // TableReader::VerifyChecksum: only block-based tables implement it.
+        if (_options.VerifyChecksumsBeforeIngest && reader is not BlockBasedTableReader) ThrowHelper.NotSupported("VerifyChecksum() not supported");
+        using (Iterators.InternalIterator it = reader.NewInternalIterator(TableReadFlags.DontFillCache, null, ro.PrefixExtractor))
         {
             if (_options.VerifyChecksumsBeforeIngest)
             {
@@ -514,9 +524,20 @@ internal sealed class ExternalSstFileIngestionJob
             {
                 CheckKey(it.Key, dbGenerated);
                 smallest = it.Key.ToArray();
-                it.SeekToLast();
-                CheckKey(it.Key, dbGenerated);
-                largest = it.Key.ToArray();
+                if (reader is Table.Plain.PlainTableReader)
+                {
+                    // PlainTable iterator does not support SeekToLast().
+                    largest = smallest;
+                    for (; it.Valid; it.Next())
+                        if (_cfd.Icmp.Compare(it.Key, largest) > 0) largest = it.Key.ToArray();
+                }
+                else
+                {
+                    it.SeekToLast();
+                    if (!it.Valid) ThrowHelper.Corruption("Can not find largest key in sst file");
+                    largest = it.Key.ToArray();
+                }
+                CheckKey(largest, dbGenerated);
             }
         }
         if (reader.HasRangeTombstones)
@@ -588,26 +609,25 @@ internal sealed class ExternalSstFileIngestionJob
         // column family with timestamps in memtable only also takes files written without timestamps (they are then
         // marked as not persisting timestamps and read with the minimum timestamp).
         info.UserDefinedTimestampsPersisted = props.UserDefinedTimestampsPersisted != 0;
-        if (props.ComparatorName.Length > 0)
+        // Like upstream, a file without a comparator name (PlainTable / CuckooTable builders record none) is a
+        // comparator mismatch (CompareComparator: kInvalidChange).
+        if (props.ComparatorName == _cfd.UserComparator.Name)
         {
-            if (props.ComparatorName == _cfd.UserComparator.Name)
+            if (info.UserDefinedTimestampsPersisted != _cfd.Options.PersistUserDefinedTimestamps && _cfd.TimestampSize > 0)
             {
-                if (info.UserDefinedTimestampsPersisted != _cfd.Options.PersistUserDefinedTimestamps && _cfd.TimestampSize > 0)
-                {
-                    ThrowHelper.InvalidArgument("Cannot toggle the persist_user_defined_timestamps flag for a column family with user-defined " +
-                                                "timestamps feature enabled.");
-                }
+                ThrowHelper.InvalidArgument("Cannot toggle the persist_user_defined_timestamps flag for a column family with user-defined " +
+                                            "timestamps feature enabled.");
             }
-            else if (_cfd.TimestampsInMemtableOnly && BlockBasedTableReader.TimestampsStripped(props, _cfd.UserComparator))
-            {
-                info.UserDefinedTimestampsPersisted = false; // kEnableUDT: mark_sst_file_has_no_udt
-            }
-            else if (!(_cfd.TimestampSize == 0 && !info.UserDefinedTimestampsPersisted
-                       && props.ComparatorName == _cfd.UserComparator.Name + BlockBasedTableReader.UdtComparatorSuffix))
-            {
-                ThrowHelper.InvalidArgument("External file comparator " + props.ComparatorName + " does not match column family comparator " +
-                                            _cfd.UserComparator.Name);
-            }
+        }
+        else if (_cfd.TimestampsInMemtableOnly && BlockBasedTableReader.TimestampsStripped(props, _cfd.UserComparator))
+        {
+            info.UserDefinedTimestampsPersisted = false; // kEnableUDT: mark_sst_file_has_no_udt
+        }
+        else if (!(_cfd.TimestampSize == 0 && !info.UserDefinedTimestampsPersisted
+                   && props.ComparatorName == _cfd.UserComparator.Name + BlockBasedTableReader.UdtComparatorSuffix))
+        {
+            // Status::InvalidArgument(new_comparator->Name(), "does not match existing comparator " + old_comparator_name)
+            ThrowHelper.InvalidArgument(_cfd.UserComparator.Name + ": does not match existing comparator " + props.ComparatorName);
         }
     }
 
@@ -615,7 +635,7 @@ internal sealed class ExternalSstFileIngestionJob
     /// Port of ExternalSstFileIngestionJob::GetSeqnoBoundaryForFile: the key_smallest/largest_seqno table properties,
     /// or a scan of the point and range-deletion entries for older files.
     /// </summary>
-    private static void GetSeqnoBoundaryForFile(BlockBasedTableReader reader, TableProperties props, IngestedFileInfo info)
+    private static void GetSeqnoBoundaryForFile(TableReader reader, SliceTransform? prefixExtractor, TableProperties props, IngestedFileInfo info)
     {
         bool hasLargest = props.KeyLargestSeqno != TableProperties.Unknown;
         if (hasLargest)
@@ -634,7 +654,7 @@ internal sealed class ExternalSstFileIngestionJob
         }
         // For older SST files they may not be recorded in table properties, so we scan the file to find out.
         ulong smallest = DbFormat.MaxSequenceNumber, largestFromIter = 0;
-        using (BlockBasedTableIterator it = reader.NewIterator())
+        using (Iterators.InternalIterator it = reader.NewInternalIterator(TableReadFlags.DontFillCache, null, prefixExtractor))
         {
             for (it.SeekToFirst(); it.Valid; it.Next())
             {
@@ -657,6 +677,21 @@ internal sealed class ExternalSstFileIngestionJob
         info.LargestSeqno = hasLargest ? props.KeyLargestSeqno : largestFromIter;
         if (info.LargestSeqno == DbFormat.MaxSequenceNumber) ThrowHelper.InvalidArgument("Unknown smallest seqno for db generated file.");
         if (info.SmallestSeqno == DbFormat.MaxSequenceNumber) ThrowHelper.InvalidArgument("Unknown largest seqno for db generated file.");
+    }
+
+    /// <summary>Opens <paramref name="path"/> with the column family's table factory (the reader owns the file).</summary>
+    private TableReader OpenTableReader(string path, TableReaderOptions ro)
+    {
+        IRandomAccessFile f = _fs.OpenRandomAccess(path);
+        try
+        {
+            return TableReaderFactory.Open(f, ro);
+        }
+        catch
+        {
+            f.Dispose();
+            throw;
+        }
     }
 
     private static void CheckKey(ReadOnlySpan<byte> internalKey, bool dbGenerated)

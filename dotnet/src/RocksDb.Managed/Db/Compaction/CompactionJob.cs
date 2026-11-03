@@ -79,6 +79,20 @@ internal sealed class CompactionJob
     {
     }
 
+    /// <summary>
+    /// The compaction of only [<paramref name="start"/>, <paramref name="end"/>) (user keys, null = unbounded): a remote
+    /// worker running one subcompaction of the primary (CompactionServiceInput begin / end).
+    /// </summary>
+    internal static CompactionJob ForRange(DbImpl db, ColumnFamilyData cfd, Compaction compaction, ulong[] snapshots, Func<ulong> newFileNumber,
+        CancellationToken cancellation, byte[]? start, byte[]? end, string outputDirectory) =>
+        new(db, cfd, compaction, snapshots, newFileNumber, cancellation, start, end, 0) { OutputDirectory = outputDirectory };
+
+    /// <summary>
+    /// Directory the output tables are written to instead of the DB paths (CompactionServiceCompactionJob::output_path_
+    /// of a remote worker). Null for local compactions.
+    /// </summary>
+    internal string? OutputDirectory { get; init; }
+
     /// <summary>A subcompaction of [<paramref name="start"/>, <paramref name="end"/>) (user keys, null = unbounded).</summary>
     private CompactionJob(DbImpl db, ColumnFamilyData cfd, Compaction compaction, ulong[] snapshots, Func<ulong> newFileNumber,
         CancellationToken cancellation, byte[]? start, byte[]? end, int subJobId)
@@ -149,7 +163,7 @@ internal sealed class CompactionJob
 
         // Current output.
         public IWritableFile? File;
-        public BlockBasedTableBuilder? Builder;
+        public TableBuilder? Builder;
         public FileMetaData? Meta;
         public string? Path;
         public readonly PooledBufferWriter LargestKey = new(64);
@@ -255,9 +269,9 @@ internal sealed class CompactionJob
 
         public InternalIterator NewIterator(FileMetaData file)
         {
-            var t = new TableInternalIterator(inner.GetReader(file), flags);
-            t.EnableReadahead(readaheadSize);
-            return t;
+            InternalIterator it = TableInternalIterator.Create(inner.GetReader(file), flags, null, null);
+            if (it is TableInternalIterator t) t.EnableReadahead(readaheadSize);
+            return it;
         }
 
         public InternalIterator NewIterator(FileMetaData file, InternalIterator? reuse)
@@ -492,6 +506,7 @@ internal sealed class CompactionJob
             {
                 SnapshotChecker = SnapshotChecker,
                 JobSnapshot = JobSnapshot,
+                OutputDirectory = OutputDirectory,
             });
         }
         _db.Stats?.RecordInHistogram(Histogram.NumSubcompactionsScheduled, (ulong)_subcompactions.Count);
@@ -646,6 +661,8 @@ internal sealed class CompactionJob
     /// </summary>
     private async ValueTask RunSubcompactionAsync(bool synchronous)
     {
+        // BlockCacheLookupContext{kCompaction} of the compaction input reads (scoped to this async method).
+        if (_db.BlockCacheTracer.IsEnabled) Tracing.BlockCacheTracer.SetCaller(Tracing.TableReaderCaller.Compaction, 0, default, false);
         long start = System.Diagnostics.Stopwatch.GetTimestamp();
         bool isPart = _subStart is not null || _subEnd is not null;
         Stats.NumInputFiles = isPart ? 0 : _c.TotalInputFiles;
@@ -654,9 +671,18 @@ internal sealed class CompactionJob
         byte[]? fullHistoryTsLow = _cfd.TimestampSize != 0 ? _cfd.FullHistoryTsLow : null;
         _fullHistoryTsLow = fullHistoryTsLow;
         // With user-defined timestamps only tombstones at or below full_history_ts_low delete keys.
-        RangeDelAggregator rangeDel = RangeDelAggregator.ForCompaction(_icmp, _snapshots, fullHistoryTsLow);
+        // OpenAndTrimHistory: tombstones newer than trim_ts don't delete anything either (and are not written out).
+        byte[]? trimTs = _cfd.TimestampSize != 0 ? _c.TrimTs : null;
+        byte[]? tsUpperBound = fullHistoryTsLow;
+        if (trimTs is not null && (tsUpperBound is null || _cfd.UserComparator.CompareTimestamp(trimTs, tsUpperBound) < 0)) tsUpperBound = trimTs;
+        RangeDelAggregator rangeDel = RangeDelAggregator.ForCompaction(_icmp, _snapshots, tsUpperBound);
         var raw = new List<FragmentedRangeTombstoneList.Tombstone>();
         InternalIterator input = MakeInputIterator(rangeDel, raw);
+        if (trimTs is not null)
+        {
+            raw.RemoveAll(t => t.Timestamp is { } ts && _cfd.UserComparator.CompareTimestamp(ts, trimTs) > 0);
+            input = new HistoryTrimmingIterator(input, _cfd.UserComparator, trimTs);
+        }
         if (isPart)
         {
             // The subcompaction's slice of the input: [start@kMaxSequenceNumber, end@kMaxSequenceNumber).
@@ -890,7 +916,7 @@ internal sealed class CompactionJob
     {
         ulong fileNumber = _newFileNumber();
         CreatedFileNumbers.Add(fileNumber);
-        _out.Path = FileNames.TableFileName(_db.DbPaths, fileNumber, _c.OutputPathId);
+        _out.Path = OutputDirectory is { } outDir ? FileNames.MakeTableFileName(outDir, fileNumber) : FileNames.TableFileName(_db.DbPaths, fileNumber, _c.OutputPathId);
         ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         ulong oldestAncestor = _c.MinInputFileOldestAncestorTime();
         if (oldestAncestor == ulong.MaxValue) oldestAncestor = now;
@@ -933,7 +959,7 @@ internal sealed class CompactionJob
         // Compaction outputs (of every subcompaction and of the proximal level) are charged to the DB's rate limiter at IO_LOW.
         WritableFileOptions fileOptions = _db.TableFileWriteOptions(IoPriority.Low);
         _out.File = FileChecksumHelper.CreateWritable(_db.FileSystem, _out.Path, fileOptions);
-        _out.Builder = new BlockBasedTableBuilder(_out.File, _cfd.Format, tbo);
+        _out.Builder = TableBuilder.Create(_out.File, _cfd.Format, tbo);
         _out.HasPointKey = false;
         _out.LargestKey.Clear();
     }
@@ -987,7 +1013,7 @@ internal sealed class CompactionJob
         FileMetaData meta = _out.Meta!;
         if (_out.HasPointKey) meta.Largest = _out.LargestKey.WrittenSpan.ToArray();
         if (_outputTombstones is not null) AddRangeDels(nextTableMinKey.Span);
-        BlockBasedTableBuilder builder = _out.Builder!;
+        TableBuilder builder = _out.Builder!;
         IWritableFile file = _out.File!;
         _out.Builder = null;
         _out.File = null;
@@ -1079,7 +1105,7 @@ internal sealed class CompactionJob
     {
         FragmentedRangeTombstoneList tombstones = _outputTombstones!;
         FileMetaData meta = _out.Meta!;
-        BlockBasedTableBuilder builder = _out.Builder!;
+        TableBuilder builder = _out.Builder!;
         bool bottommost = _c.BottommostLevel;
 
         // Lower bound: none for the first output; otherwise the previous output's upper bound or this file's smallest.

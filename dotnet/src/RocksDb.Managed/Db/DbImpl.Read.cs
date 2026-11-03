@@ -38,6 +38,17 @@ internal sealed partial class DbImpl
             GetWithTxnHooks(cfd, options, key, ctx);
             return;
         }
+        if (_queryTracer is { } tracer) TraceGet(tracer, cfd, key, options);
+        if (BlockCacheTracer.IsEnabled)
+        {
+            GetWithBlockCacheTrace(cfd, options, key, ctx);
+            return;
+        }
+        GetImpl(cfd, options, key, ctx);
+    }
+
+    private void GetImpl(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, GetContext ctx)
+    {
         // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
         // in between could drop the versions visible at that sequence (no snapshot protects them).
         ValidateReadSnapshot(options);
@@ -52,6 +63,25 @@ internal sealed partial class DbImpl
         finally
         {
             ReturnAndCleanupSuperVersion(cfd, sv, svSlot);
+        }
+    }
+
+    /// <summary>
+    /// GetImpl while a block cache trace runs: the table lookups of this thread are attributed to a Get with a fresh
+    /// get id (BlockCacheLookupContext{kUserGet, NextGetId()}).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void GetWithBlockCacheTrace(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, GetContext ctx)
+    {
+        object? prev = Tracing.BlockCacheTracer.SetCaller(Tracing.TableReaderCaller.UserGet, BlockCacheTracer.NextGetId(), key,
+            options?.Snapshot is not null);
+        try
+        {
+            GetImpl(cfd, options, key, ctx);
+        }
+        finally
+        {
+            Tracing.BlockCacheTracer.RestoreCaller(prev);
         }
     }
 
@@ -220,12 +250,17 @@ internal sealed partial class DbImpl
     {
         GetContext? tsSink = ctx.TimestampSize != 0 ? ctx : null;
         ReadCallback? cb = ctx.Callback;
+        int operands = ctx.MergeContext.Count;
         MemTableGetResult r = sv.Mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb);
+        // GetMergeOperands with continue_cb: the callback may end the lookup at an operand of this memtable.
+        if (ctx.ContinueCallback is not null && ctx.ApplyContinueCallback(operands)) return true;
         if (ctx.ApplyMemTableResult(r, v, t)) return true;
         MemTable[] imm = sv.Imm;
         for (int i = 0; i < imm.Length; i++)
         {
+            operands = ctx.MergeContext.Count;
             r = imm[i].Get(lkey, out v, out t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb);
+            if (ctx.ContinueCallback is not null && ctx.ApplyContinueCallback(operands)) return true;
             if (ctx.ApplyMemTableResult(r, v, t)) return true;
         }
         return false;
@@ -313,7 +348,9 @@ internal sealed partial class DbImpl
                     if (tsSize != 0) ctx.SetTimestampFromRangeTombstone(tombstoneTs);
                 }
             }
-            lease.Reader.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
+            // The sealed block-based reader is called directly (no generic virtual dispatch on the hot path).
+            if (lease.Reader is BlockBasedTableReader bbt) bbt.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
+            else lease.Reader.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
         }
         finally
         {
@@ -334,6 +371,8 @@ internal sealed partial class DbImpl
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     public async ValueTask GetAsync(ColumnFamilyData cfd, ReadOptions? options, ReadOnlyMemory<byte> key, GetContext ctx, CancellationToken cancellationToken)
     {
+        if (_queryTracer is { } tracer) TraceGet(tracer, cfd, key.Span, options);
+        if (BlockCacheTracer.IsEnabled) SetBlockCacheTraceContext(Tracing.TableReaderCaller.UserGet, key.Span, options);
         if (_txnHooks is not null && ctx.Callback is null)
         {
             await GetWithTxnHooksAsync(cfd, options, key, ctx, cancellationToken).ConfigureAwait(false);
@@ -539,7 +578,10 @@ internal sealed partial class DbImpl
         try
         {
             ApplyFileRangeTombstones(rangeDels, DbFormat.ExtractUserKey(ikey.Span), snapshot, ctx);
-            await lease.Reader.GetAsync(ikey, ctx, s_saveValue, ctx.ReadFlags, cancellationToken).ConfigureAwait(false);
+            ValueTask pendingGet = lease.Reader is BlockBasedTableReader bbt
+                ? bbt.GetAsync(ikey, ctx, s_saveValue, ctx.ReadFlags, cancellationToken)
+                : lease.Reader.GetAsync(ikey, ctx, s_saveValue, ctx.ReadFlags, cancellationToken);
+            await pendingGet.ConfigureAwait(false);
         }
         finally
         {
@@ -597,7 +639,9 @@ internal sealed partial class DbImpl
                 if (cov > ctx.MaxCoveringTombstoneSeq) ctx.MaxCoveringTombstoneSeq = cov;
             }
             ctx.Scratch.Clear();
-            pending = lease.Reader.GetAsync(ikey, ctx.Scratch, ctx.ReadFlags, cancellationToken);
+            pending = lease.Reader is BlockBasedTableReader bbt
+                ? bbt.GetAsync(ikey, ctx.Scratch, ctx.ReadFlags, cancellationToken)
+                : lease.Reader.GetAsync(ikey, ctx.Scratch, ctx.ReadFlags, cancellationToken);
             if (pending.IsCompletedSuccessfully)
             {
                 SaveFileResult(lease.Reader, pending.Result, ikey.Span, ctx);
@@ -628,13 +672,14 @@ internal sealed partial class DbImpl
         return ctx.Done;
     }
 
-    private static void SaveFileResult(BlockBasedTableReader reader, TableGetResult r, ReadOnlySpan<byte> ikey, GetContext ctx)
+    private static void SaveFileResult(TableReader reader, TableGetResult r, ReadOnlySpan<byte> ikey, GetContext ctx)
     {
         if (!r.Found) return;
         if (r.Type == EntryType.Merge && ctx.MaxCoveringTombstoneSeq <= r.Sequence)
         {
             // Merge chain: the rest of the operands are most likely in the same (now cached by the OS) block.
-            reader.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
+            if (reader is BlockBasedTableReader bbt) bbt.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
+            else reader.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
         }
         else
         {

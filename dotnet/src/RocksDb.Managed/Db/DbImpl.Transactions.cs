@@ -577,7 +577,7 @@ internal sealed partial class DbImpl
                             tsSink?.SetTimestampFromRangeTombstone(tombstoneTs);
                         }
                     }
-                    lease.Reader.Get(ikey, ref state, s_recordSeq);
+                    lease.Reader.Get(ikey, ref state, s_recordSeq, TableReadFlags.None);
                 }
                 finally
                 {

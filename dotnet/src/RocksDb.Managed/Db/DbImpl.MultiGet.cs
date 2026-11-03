@@ -27,6 +27,8 @@ internal sealed partial class DbImpl
             MultiGetWithTxnHooks(cfd, options, batch);
             return;
         }
+        if (_queryTracer is { } tracer) TraceMultiGet(tracer, cfd, batch, options);
+        if (BlockCacheTracer.IsEnabled) SetBlockCacheTraceContext(Tracing.TableReaderCaller.UserMultiGet, default, options);
         Statistics? st = Stats;
         long t0 = st is null ? 0 : st.StartTimer();
         SuperVersion sv = GetAndRefSuperVersion(cfd, out int svSlot);
@@ -207,7 +209,9 @@ internal sealed partial class DbImpl
                     if (cov > ctx.MaxCoveringTombstoneSeq) ctx.MaxCoveringTombstoneSeq = cov;
                 }
             }
-            t = lease.Reader.MultiGetAsync(batch, sub, count, batch.MayMatch, batch.ReadFlags, synchronous, cancellationToken);
+            t = lease.Reader is BlockBasedTableReader bbt
+                ? bbt.MultiGetAsync(batch, sub, count, batch.MayMatch, batch.ReadFlags, synchronous, cancellationToken)
+                : lease.Reader.MultiGetAsync(batch, sub, count, batch.MayMatch, batch.ReadFlags, synchronous, cancellationToken);
             if (t.IsCompleted)
             {
                 lease.Dispose();

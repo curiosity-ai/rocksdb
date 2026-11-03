@@ -37,9 +37,8 @@ public sealed partial class BlockBasedTableReader
     /// </para>
     /// </summary>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    internal async ValueTask MultiGetAsync<TBatch>(TBatch batch, int[] keys, int count, bool[] mayMatch, TableReadFlags flags, bool synchronous,
+    internal override async ValueTask MultiGetAsync<TBatch>(TBatch batch, int[] keys, int count, bool[] mayMatch, TableReadFlags flags, bool synchronous,
         CancellationToken cancellationToken)
-        where TBatch : class, ITableMultiGetBatch
     {
         int candidates = FilterBatch(batch, keys, count, mayMatch, flags);
         if (candidates == 0) return;

@@ -168,7 +168,7 @@ public sealed partial class RocksDatabase
     public void DeleteArchivedWalFile(ulong logNumber) => _db.DeleteArchivedWalFile(logNumber);
 
     /// <summary>The file system the DB was opened with (<see cref="DbOptions.FileSystem"/>); checkpoints are written through it.</summary>
-    public Env.IFileSystem FileSystem => _db.FileSystem;
+    public Env.IFileSystem FileSystem => _db.Options.FileSystem;
 
     /// <summary>The WAL currently being written (DB::GetCurrentWalFile).</summary>
     public WalFileInfo GetCurrentWalFile() => _db.GetCurrentWalFile();

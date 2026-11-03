@@ -47,7 +47,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
         Options = options;
         InitializeWriteBufferManager();
         SharedTableCache = new TableCacheStore(options.MaxOpenFiles);
-        FileSystem = options.FileSystem;
+        // FileSystemTracingWrapper (DBImpl::fs_): records file operations while an IO trace runs.
+        FileSystem = new Tracing.IoTracingFileSystem(options.FileSystem, IoTracer);
         WalDir = string.IsNullOrEmpty(options.WalDir) ? dbname : options.WalDir.TrimEnd('/');
         var paths = new List<string> { dbname };
         foreach ((string p, _) in options.DbPaths)
@@ -468,6 +469,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
                             OldestAncestorTime = f.OldestAncestorTime,
                             FileCreationTime = f.FileCreationTime,
                             NumReadsSampled = f.NumReadsSampled,
+                            SmallestInternalKey = f.Smallest,
+                            LargestInternalKey = f.Largest,
+                            OldestBlobFileNumber = f.OldestBlobFileNumber,
                         });
                     }
                 }
@@ -727,6 +731,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         NotifySequenceWaiters(); // wake WAL tailers so they observe the close
         try
         {
+            EndAllTraces();
             LogInfo("Shutdown: canceling all background work");
             lock (_mutex)
             {
