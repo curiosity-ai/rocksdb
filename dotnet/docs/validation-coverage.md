@@ -21,13 +21,13 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (237 files, about 72,600 lines):
+Summary (238 files, about 72,600 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
-| line-by-line (feature audits) | 65 |
+| line-by-line (feature audits) | 66 |
 | line-by-line (#3) | 17 |
 | line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
@@ -132,6 +132,7 @@ changes there need their own review.
 | `Db/EventListener.Notifications.cs` | 351 | db/event_helpers.cc, db/db_impl/db_impl_compaction_flush.cc (NotifyOn*) | line-by-line (feature audit: errors/listeners/backups) |
 | `Db/EventListener.cs` | 293 | include/rocksdb/listener.h | line-by-line (feature audit: errors/listeners/backups) |
 | `Db/ExternalSstFileIngestionJob.cs` | 428 | db/external_sst_file_ingestion_job.h, db/external_sst_file_ingestion_job.cc | line-by-line (#2) |
+| `Db/FileChecksum.cs` | 202 | include/rocksdb/file_checksum.h, util/file_checksum_helper.{h,cc}, file/file_util.cc (GenerateOneFileChecksum), file/writable_file_writer.cc (checksum_generator_) | line-by-line (feature audit: validation.md "Small gaps closed (2026-11-03)") |
 | `Db/FileMetaData.cs` | 253 | table/unique_id_impl.h, db/version_edit.h, include/rocksdb/file_checksum.h | line-by-line (#1); #3: in-memory NewestKeyTime |
 | `Db/FileNames.cs` | 458 | include/rocksdb/types.h, include/rocksdb/transaction_log.h, file/filename.{h,cc} | line-by-line (#1) |
 | `Db/FlushJob.cs` | 516 | db/flush_job.cc, db/builder.cc | line-by-line (#2); #3: table time properties (fixed newest_key_time); compaction-features pass: oldest_key_time / oldest_ancestor_time from the memtable first-insert time, rocksdb.creation.time, default_write_temperature |

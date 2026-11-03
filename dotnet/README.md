@@ -37,7 +37,7 @@ while the bytes may differ (for example, because a compressor makes different ch
 | `OPTIONS-xxxxxx` files | yes | yes | typed options; unknown or custom ids are kept verbatim |
 | Block-based SST, `format_version` 2-8 | yes | yes | data, index and filter blocks byte-identical to native `SstFileWriter`; checksums crc32c, xxHash, xxHash64, XXH3 |
 | Index types | yes | yes | binary search, delta encoding, first-key index, partitioned (two-level) index, hash index (`kHashSearch`); data block hash index |
-| Optional block layouts | yes | yes | separated key/value data blocks, index `is_uniform` hint, `block_align`, super block alignment; byte-identical to native |
+| Optional block layouts | yes | yes | separated key/value data blocks, index `is_uniform` hint (used by `IndexBlockSearchType.Auto` interpolation search), `block_align`, super block alignment; byte-identical to native |
 | User table properties collectors | yes | yes | `TablePropertiesCollector` properties and `rocksdb.property.collectors` as native; `NeedCompact` marks files for compaction |
 | Filters: FastLocalBloom, legacy Bloom, Ribbon (incl. hybrid), prefix, partitioned | yes | yes | byte-identical; with `optimize_filters_for_memory`, Ribbon may differ by 16 bytes depending on heap state (both readable) |
 | Compression: Snappy, LZ4, LZ4HC, ZSTD, Zlib | yes | yes | read + write; ZSTD (with dictionaries) byte-identical; see deviations below |
@@ -54,6 +54,7 @@ while the bytes may differ (for example, because a compressor makes different ch
 | `DBWithTTL` value format | yes | yes | |
 | BackupEngine directory layout and meta files | yes | yes | incremental backups across engines |
 | Checkpoints, external SST ingestion | yes | yes | |
+| File checksums in the MANIFEST (`file_checksum_gen_factory`, `FileChecksumGenCrc32cFactory`) | yes | yes | identical checksums for flushed, compacted, blob and ingested files; `VerifyFileChecksums` on either side |
 | PlainTable / CuckooTable | no | no | option names round-trip only |
 
 Supported features: column families, point reads (`Get`, `MultiGet`), iterators (bounds, prefix seek, reverse,
@@ -63,7 +64,8 @@ listeners, the info `LOG`, dynamic options (`SetOptions` / `SetDBOptions`), opti
 `WriteBatchWithIndex`, wide columns, user-defined timestamps, BlobDB, TTL, checkpoints, BackupEngine, `SstFileWriter` /
 ingestion, WAL tailing, read-only and secondary instances, background error handling with `Resume`, best-efforts recovery, WAL tracking in
 the MANIFEST (`TrackAndVerifyWalsInManifest`), an `SstFileManager` (space limit, rate-limited deletion, automatic
-recovery from out-of-space errors) and a `GenericRateLimiter` for flush and compaction writes (`DbOptions.RateLimiter`).
+recovery from out-of-space errors) and a `GenericRateLimiter` for flush and compaction writes and, in reads-only / all-I/O
+mode, compaction input and user reads (`DbOptions.RateLimiter`, `ReadOptions.RateLimiterPriority`).
 
 The [replication layer](src/RocksDb.Managed.Replication/README.md) (checkpoint + WAL streaming, planned switchover,
 Raft cluster, optional gRPC transport) is a separate library on top of the engine.
