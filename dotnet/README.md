@@ -56,7 +56,7 @@ while the bytes may differ (for example, because a compressor makes different ch
 | Checkpoints, external SST ingestion | yes | yes | |
 | File checksums in the MANIFEST (`file_checksum_gen_factory`, `FileChecksumGenCrc32cFactory`) | yes | yes | identical checksums for flushed, compacted, blob and ingested files; `VerifyFileChecksums` on either side |
 | PlainTable / CuckooTable, AdaptiveTableFactory reading | yes | yes | plain data / index / bloom and cuckoo hash tables byte-identical to native SstFileWriter output; `[TableOptions/PlainTable]` / `[TableOptions/CuckooTable]` OPTIONS sections round-trip; cuckoo reads need `AllowMmapReads` (as upstream) |
-| User-defined index (`UserDefinedIndexFactory`, `IndexMode`, `ReadOptions.ReadIndex`) | yes | yes | custom index meta block and kCustomOnly footer feature as upstream; native `trie_index` files are read through their standard index (the trie format is not ported) |
+| User-defined index (`UserDefinedIndexFactory`, `IndexMode`, `ReadOptions.ReadIndex`), built-in trie index (`TrieIndexFactory`, "trie_index") | yes | yes | custom index meta block and kCustomOnly footer feature as upstream; trie-index blocks are byte-identical to native and each side reads the other's files through the trie |
 
 Supported features: column families, point reads (`Get`, `MultiGet`), iterators (bounds, prefix seek, reverse,
 tailing), snapshots, merge operators, single delete, range deletion, leveled / universal / FIFO compaction with

@@ -21,13 +21,13 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (250 files, about 75,500 lines):
+Summary (255 files, about 78,000 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
-| line-by-line (feature audits) | 78 |
+| line-by-line (feature audits) | 83 |
 | line-by-line (#3) | 17 |
 | line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
@@ -131,7 +131,7 @@ changes there need their own review.
 | `Db/ErrorHandler.cs` | 755 | db/error_handler.{h,cc}, db/event_helpers.cc, db/error_handler.cc | line-by-line (feature audit: errors/listeners/backups (+ #3 severity maps)) |
 | `Db/EventListener.Notifications.cs` | 351 | db/event_helpers.cc, db/db_impl/db_impl_compaction_flush.cc (NotifyOn*) | line-by-line (feature audit: errors/listeners/backups) |
 | `Db/EventListener.cs` | 293 | include/rocksdb/listener.h | line-by-line (feature audit: errors/listeners/backups) |
-| `Db/ExternalSstFileIngestionJob.cs` | 428 | db/external_sst_file_ingestion_job.h, db/external_sst_file_ingestion_job.cc | line-by-line (#2) |
+| `Db/ExternalSstFileIngestionJob.cs` | 1219 | db/external_sst_file_ingestion_job.h, db/external_sst_file_ingestion_job.cc | line-by-line (#2); file opening and table validation re-checked (feature audit: other SST formats) |
 | `Db/FileChecksum.cs` | 202 | include/rocksdb/file_checksum.h, util/file_checksum_helper.{h,cc}, file/file_util.cc (GenerateOneFileChecksum), file/writable_file_writer.cc (checksum_generator_) | line-by-line (feature audit: validation.md "Small gaps closed (2026-11-03)") |
 | `Db/FileMetaData.cs` | 253 | table/unique_id_impl.h, db/version_edit.h, include/rocksdb/file_checksum.h | line-by-line (#1); #3: in-memory NewestKeyTime |
 | `Db/FileNames.cs` | 458 | include/rocksdb/types.h, include/rocksdb/transaction_log.h, file/filename.{h,cc} | line-by-line (#1) |
@@ -251,6 +251,11 @@ changes there need their own review.
 | `Table/TableReader.cs` | 148 | table/table_reader.h | line-by-line (feature audit: other SST formats) |
 | `Table/TableReaderFactory.cs` | 121 | table/adaptive/adaptive_table_factory.cc, table/format.cc (ReadFooterFromFile), table/meta_blocks.cc | line-by-line (feature audit: other SST formats) |
 | `Table/TableProperties.cs` | 373 | table/table_properties.cc, table/sst_file_writer.cc, include/rocksdb/table_properties.h | line-by-line (#1) |
+| `Table/TrieIndex/Bitvector.cs` | 591 | utilities/trie_index/bitvector.{h,cc} | line-by-line (feature audit: other SST formats) |
+| `Table/TrieIndex/LoudsTrie.cs` | 242 | utilities/trie_index/louds_trie.{h,cc} (LoudsTrie::InitFromData) | line-by-line (feature audit: other SST formats) |
+| `Table/TrieIndex/LoudsTrieBuilder.cs` | 546 | utilities/trie_index/louds_trie.{h,cc} (LoudsTrieBuilder) | line-by-line (feature audit: other SST formats) |
+| `Table/TrieIndex/LoudsTrieIterator.cs` | 745 | utilities/trie_index/louds_trie.{h,cc} (LoudsTrieIterator) | line-by-line (feature audit: other SST formats) |
+| `Table/TrieIndex/TrieIndexFactory.cs` | 334 | utilities/trie_index/trie_index_factory.{h,cc} | line-by-line (feature audit: other SST formats) |
 | `Table/UserDefinedIndex.cs` | 156 | include/rocksdb/index_factory.h, include/rocksdb/user_defined_index.h, table/block_based/user_defined_index_wrapper.h | line-by-line (feature audit: other SST formats) |
 | `Util/ByteCompare.cs` | 73 | (memcmp) | managed-only, design-reviewed (#3): memcmp |
 | `Util/Coding.cs` | 256 | util/coding.h | line-by-line (#1) |
