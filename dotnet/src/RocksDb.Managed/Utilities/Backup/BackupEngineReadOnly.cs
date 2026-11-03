@@ -588,7 +588,14 @@ public class BackupEngineReadOnly : IDisposable
         dbSessionId = "";
         try
         {
-            using BlockBasedTableReader reader = BlockBasedTableReader.Open(fs.OpenRandomAccess(path), new TableReaderOptions { VerifyChecksums = true });
+            // SstFileDumper reads any table format (picked by the footer's magic number).
+            using TableReader reader = TableReaderFactory.Open(fs.OpenRandomAccess(path), new TableReaderOptions
+            {
+                VerifyChecksums = true,
+                TableFactory = TableFactoryType.AdaptiveTable,
+                AllowMmapReads = true,
+                PlainTableOptions = new PlainTableOptions { FullScanMode = true },
+            });
             dbId = reader.Properties.DbId;
             dbSessionId = reader.Properties.DbSessionId;
             return dbSessionId.Length > 0;
