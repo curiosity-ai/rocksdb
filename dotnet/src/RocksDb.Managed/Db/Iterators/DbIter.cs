@@ -31,12 +31,15 @@ namespace RocksDb.Managed.Db.Iterators;
 /// <see cref="RocksDbException"/> (Corruption, InvalidArgument for a merge without operator, Incomplete when
 /// max_skippable_internal_keys is exceeded) and the iterator is left invalid.</para>
 /// <para><b>Memory.</b> <see cref="Key"/> is a copy kept in a reusable buffer (saved_key_); <see cref="Value"/> points
-/// into the child iterator when moving forward over a plain value, into a reusable copy when moving backward
-/// (upstream pins blocks instead), or into a reusable merge-result buffer. Both spans are valid until the next
+/// into the child iterator when moving forward over a plain value, into a data block (or memtable memory) pinned
+/// by the <see cref="PinnedIteratorsManager"/> when moving backward (TempPinData / IsValuePinned; a copy when the child
+/// cannot pin), or into a reusable merge-result buffer. Both spans are valid until the next
 /// positioning call. Steady-state stepping does not allocate.</para>
-/// <para><b>Async.</b> Forward positioning (<see cref="SeekAsync"/>, <see cref="SeekToFirstAsync"/>,
-/// <see cref="NextAsync"/>) awaits the inner iterator and completes synchronously when no I/O is needed; the
-/// forward state machine is shared with the sync path (step functions). Reverse operations are synchronous.</para>
+/// <para><b>Async.</b> Every positioning call has an async variant that awaits the inner iterator and completes
+/// synchronously when no I/O is needed. Forward and reverse movement are step functions shared with the sync path
+/// (the forward FindNextUserEntry / MergeValuesNewToOld steps, and the reverse state machine of ReverseToBackward /
+/// PrevInternal / FindValueForCurrentKey(+UsingSeek) / FindUserKeyBeforeSavedKey); only the direction switch of
+/// <see cref="NextAsync"/> after reverse movement (ReverseToForward) is synchronous.</para>
 /// <para>Not thread-safe.</para>
 /// </remarks>
 public sealed class DbIter : IDisposable
@@ -71,7 +74,11 @@ public sealed class DbIter : IDisposable
 
     private readonly IterKey _savedKey = new();
     private readonly PooledBufferWriter _seekKey = new(64);
-    private readonly PooledBufferWriter _pinned = new(128);
+    private readonly PooledBufferWriter _pinned = new(128);   // saved_value_: copy of a value that is not pinned
+    private PinnedSlice _pinnedSlice;                          // pinned_value_: a value in a pinned block / memtable
+    private bool _pinnedIsSlice;                               // the Pinned value source is _pinnedSlice
+    private readonly PinnedIteratorsManager _pinMgr = new();   // pinned_iters_mgr_
+    private readonly bool _pinThruLifetime;                    // pin_thru_lifetime_ (ReadOptions::pin_data)
     private readonly PooledBufferWriter _mergeResult = new(128);
     private PooledBufferWriter? _mergedEntity;      // entity produced by a merge on top of a wide-column entity
     private bool _valueIsEntity;                    // the current value is a wide-column entity (Value = its default column)
@@ -153,6 +160,11 @@ public sealed class DbIter : IDisposable
             if (readOptions.IgnoreRangeDeletions) rangeDel = null;
         }
         _rangeDel = rangeDel is null || rangeDel.IsEmpty ? null : rangeDel;
+        // DBIter::SetIter: iter_.iter()->SetPinnedItersMgr(&pinned_iters_mgr_); with pin_data everything is pinned until
+        // the iterator is destroyed.
+        _iter.SetPinnedItersMgr(_pinMgr);
+        _pinThruLifetime = readOptions?.PinData == true;
+        if (_pinThruLifetime) _pinMgr.StartPinning();
         _ucmp = comparator.UserComparator;
         _tsSize = _ucmp.TimestampSize;
         if (_tsSize > 0)
@@ -178,9 +190,50 @@ public sealed class DbIter : IDisposable
     private ReadOnlySpan<byte> RawValue => _valueSource switch
     {
         ValueSource.Iter => _iter.Value,
-        ValueSource.Pinned => _pinned.WrittenSpan,
+        ValueSource.Pinned => PinnedSpan,
         _ => default,
     };
+
+    /// <summary>The saved value of a reverse step: pinned_value_ when the child value was pinned, else saved_value_.</summary>
+    private ReadOnlySpan<byte> PinnedSpan
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _pinnedIsSlice ? _pinnedSlice.Span : _pinned.WrittenSpan;
+    }
+
+    /// <summary>
+    /// Saves the value the inner iterator is on for use after it moves (FindValueForCurrentKey): the value itself when
+    /// the child pins it (IsValuePinned: memtable memory, or a data block the pinned iterators manager keeps alive),
+    /// else a copy. Strips the packed seqno of kTypeValuePreferredSeqno.
+    /// </summary>
+    private void SaveCurrentValue(EntryType type)
+    {
+        int trim = type == EntryType.ValuePreferredSeqno ? sizeof(ulong) : 0;
+        if (_iter.TryGetPinnedValue(out PinnedSlice pv))
+        {
+            _pinnedSlice = trim == 0 ? pv : pv.TrimEnd(trim);
+            _pinnedIsSlice = true;
+            return;
+        }
+        ReadOnlySpan<byte> v = _iter.Value;
+        _pinned.Clear();
+        _pinned.Write(v[..^trim]);
+        _pinnedIsSlice = false;
+    }
+
+    /// <summary>Port of DBIter::TempPinData: pin the blocks the inner iterators leave until <see cref="ReleaseTempPinnedData"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void TempPinData()
+    {
+        if (!_pinThruLifetime) _pinMgr.StartPinning();
+    }
+
+    /// <summary>Port of DBIter::ReleaseTempPinnedData: called at the start of every positioning call.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ReleaseTempPinnedData()
+    {
+        if (!_pinThruLifetime && _pinMgr.IsPinning) _pinMgr.ReleasePinnedData();
+    }
 
     /// <summary>The blob of the current blob-index entry, read on first use (DBIter::SetValueAndColumnsFromBlob).</summary>
     private ReadOnlySpan<byte> BlobValue()
@@ -344,7 +397,7 @@ public sealed class DbIter : IDisposable
                 case ValueSource.Iter: return _valueIsEntity ? Wide.WideColumnSerialization.GetValueOfDefaultColumn(ResolveEntity(_iter.Value)) : _iter.Value;
                 case ValueSource.IterPacked: return ParsePackedValueForValue(_iter.Value);
                 case ValueSource.Pinned:
-                    return _valueIsEntity ? Wide.WideColumnSerialization.GetValueOfDefaultColumn(ResolveEntity(_pinned.WrittenSpan)) : _pinned.WrittenSpan;
+                    return _valueIsEntity ? Wide.WideColumnSerialization.GetValueOfDefaultColumn(ResolveEntity(PinnedSpan)) : PinnedSpan;
                 case ValueSource.Merged: return _mergeResult.WrittenSpan;
                 default: return ReadOnlySpan<byte>.Empty;
             }
@@ -361,7 +414,7 @@ public sealed class DbIter : IDisposable
     public ReadOnlySpan<byte> SerializedEntity => _valueSource switch
     {
         ValueSource.Iter => ResolveEntity(_iter.Value),
-        ValueSource.Pinned => ResolveEntity(_pinned.WrittenSpan),
+        ValueSource.Pinned => ResolveEntity(PinnedSpan),
         ValueSource.Merged => _mergedEntity!.WrittenSpan,
         _ => default,
     };
@@ -374,6 +427,9 @@ public sealed class DbIter : IDisposable
 
     /// <summary>The internal iterator (for tests and diagnostics).</summary>
     public InternalIterator InternalIterator => _iter;
+
+    /// <summary>The pinned iterators manager (tests and diagnostics).</summary>
+    internal PinnedIteratorsManager PinnedItersMgr => _pinMgr;
 
     // ==================================================================== helpers
 
@@ -539,6 +595,7 @@ public sealed class DbIter : IDisposable
 
     private void ResetSeekState()
     {
+        ReleaseTempPinnedData();
         _hasPrefix = false;
         _numInternalKeysSkipped = 0;
         _isKeySeqnumZero = false;
@@ -893,6 +950,8 @@ public sealed class DbIter : IDisposable
     public void Next()
     {
         if (!_valid) ThrowHelper.InvalidArgument("Next on an invalid iterator");
+        // Release temporarily pinned blocks from last operation
+        ReleaseTempPinnedData();
         _numInternalKeysSkipped = 0;
         if (!_forward)
         {
@@ -922,9 +981,10 @@ public sealed class DbIter : IDisposable
     public void Prev()
     {
         if (!_valid) ThrowHelper.InvalidArgument("Prev on an invalid iterator");
+        ReleaseTempPinnedData();
         _numInternalKeysSkipped = 0;
-        if (_forward) ReverseToBackward();
-        PrevInternal();
+        BeginPrev();
+        RunReverse();
     }
 
     public void Seek(ReadOnlySpan<byte> target)
@@ -950,8 +1010,9 @@ public sealed class DbIter : IDisposable
         _iter.SeekForPrev(_seekKey.WrittenSpan);
         if (!_iter.Valid) return;
         MaybeSetPrefix(target);
-        PrevInternal();
-        if (!_valid) _hasPrefix = false;
+        _revPhase = RevPhase.PrevTop;
+        _revFinish = RevFinish.ClearPrefixIfInvalid;
+        RunReverse();
     }
 
     public void SeekToFirst()
@@ -986,8 +1047,9 @@ public sealed class DbIter : IDisposable
         ResetSeekState();
         _forward = false;
         _iter.SeekToLast();
-        PrevInternal();
-        if (_valid) MaybeSetPrefix(StripTs(_savedKey.UserKey));
+        _revPhase = RevPhase.PrevTop;
+        _revFinish = RevFinish.SetPrefixIfValid;
+        RunReverse();
     }
 
     /// <summary>Port of SetSavedKeyToSeekTarget (clamped to the lower bound).</summary>
@@ -1094,6 +1156,8 @@ public sealed class DbIter : IDisposable
     public ValueTask NextAsync(CancellationToken cancellationToken = default)
     {
         if (!_valid) ThrowHelper.InvalidArgument("Next on an invalid iterator");
+        // Release temporarily pinned blocks from last operation
+        ReleaseTempPinnedData();
         _numInternalKeysSkipped = 0;
         if (!_forward)
         {
@@ -1129,25 +1193,56 @@ public sealed class DbIter : IDisposable
         await ContinueNextAsync(ct).ConfigureAwait(false);
     }
 
-    /// <summary>Reverse movement is synchronous (see remarks).</summary>
+    /// <summary>Async <see cref="Prev"/>: completes synchronously unless a table block must be read.</summary>
     public ValueTask PrevAsync(CancellationToken cancellationToken = default)
     {
-        Prev();
-        return ValueTask.CompletedTask;
+        if (!_valid) ThrowHelper.InvalidArgument("Prev on an invalid iterator");
+        ReleaseTempPinnedData();
+        _numInternalKeysSkipped = 0;
+        BeginPrev();
+        return RunReverseAsync(cancellationToken);
     }
 
-    /// <summary>Reverse movement is synchronous (see remarks).</summary>
+    /// <summary>Async <see cref="SeekForPrev"/>: completes synchronously unless a table block must be read.</summary>
     public ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
-        SeekForPrev(target.Span);
-        return ValueTask.CompletedTask;
+        ResetSeekState();
+        SetSavedKeyToSeekForPrevTarget(target.Span);
+        _forward = false;
+        return AfterReverseSeekAsync(_iter.SeekForPrevAsync(_seekKey.WrittenMemory, cancellationToken), target, RevFinish.ClearPrefixIfInvalid,
+            cancellationToken);
     }
 
-    /// <summary>Reverse movement is synchronous (see remarks).</summary>
+    /// <summary>Async <see cref="SeekToLast"/>: completes synchronously unless a table block must be read.</summary>
     public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default)
     {
-        SeekToLast();
-        return ValueTask.CompletedTask;
+        if (_hasUpper) return SeekForPrevAsync(_upper, cancellationToken);
+        if (!_expectTotalOrderInnerIter) _maxSkip = ulong.MaxValue;
+        ResetSeekState();
+        _forward = false;
+        return AfterReverseSeekAsync(_iter.SeekToLastAsync(cancellationToken), default, RevFinish.SetPrefixIfValid, cancellationToken);
+    }
+
+    /// <summary>
+    /// The rest of SeekForPrev / SeekToLast once the inner iterator is positioned: PrevInternal (with
+    /// <paramref name="prefixTarget"/> remembered for prefix_same_as_start by SeekForPrev).
+    /// </summary>
+    private ValueTask AfterReverseSeekAsync(ValueTask positioned, ReadOnlyMemory<byte> prefixTarget, RevFinish finish, CancellationToken ct)
+    {
+        if (!positioned.IsCompletedSuccessfully) return AfterReverseSeekSlowAsync(positioned, prefixTarget, finish, ct);
+        positioned.GetAwaiter().GetResult();
+        if (!_iter.Valid) return ValueTask.CompletedTask;
+        if (finish == RevFinish.ClearPrefixIfInvalid) MaybeSetPrefix(prefixTarget.Span);
+        _revPhase = RevPhase.PrevTop;
+        _revFinish = finish;
+        return RunReverseAsync(ct);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask AfterReverseSeekSlowAsync(ValueTask positioned, ReadOnlyMemory<byte> prefixTarget, RevFinish finish, CancellationToken ct)
+    {
+        await positioned.ConfigureAwait(false);
+        await AfterReverseSeekAsync(ValueTask.CompletedTask, prefixTarget, finish, ct).ConfigureAwait(false);
     }
 
     // ==================================================================== direction changes
@@ -1172,182 +1267,382 @@ public sealed class DbIter : IDisposable
         }
     }
 
-    /// <summary>Port of DBIter::ReverseToBackward: move iter_ to the key before saved_key_.</summary>
-    private void ReverseToBackward()
+    // ==================================================================== reverse (state machine)
+    //
+    // DBIter::ReverseToBackward, PrevInternal, FindValueForCurrentKey(+UsingSeek) and FindUserKeyBeforeSavedKey as one
+    // resumable state machine: ReverseStep runs the logic up to the next move of the inner iterator and returns that
+    // move (InnerOp); the sync driver (RunReverse) performs it directly, the async driver (RunReverseAsync) awaits it
+    // and completes synchronously when the inner iterator does. Every upstream loop maps to a phase that is re-entered
+    // after the move, so the sync and async paths share all of the logic.
+
+    /// <summary>The next move of the inner iterator requested by <see cref="ReverseStep"/>.</summary>
+    private enum InnerOp : byte { Done, Continue, Prev, Next, Seek, SeekForPrev, SeekToLast }
+
+    private enum RevPhase : byte
     {
-        // When current_entry_is_merged_ is true, iter_ may be positioned on the next key, which may not exist. If
-        // that's the case, seek to saved_key_ (kMaxSequenceNumber + kValueTypeForSeek: strictly before its entries).
-        if (_currentEntryIsMerged && (!_expectTotalOrderInnerIter || !_iter.Valid))
-        {
-            SetSeekKey(_savedKey.UserKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
-            if (!_expectTotalOrderInnerIter)
-            {
-                _iter.SeekForPrev(_seekKey.WrittenSpan);
-            }
-            else
-            {
-                // Some iterators may not support SeekForPrev(), so we avoid using it when prefix seek mode is disabled.
-                _iter.Seek(_seekKey.WrittenSpan);
-                if (!_iter.Valid) _iter.SeekToLast();
-            }
-        }
-        _forward = false;
-        FindUserKeyBeforeSavedKey();
+        /// <summary>ReverseToBackward: entry.</summary>
+        ToBackward,
+        /// <summary>ReverseToBackward: after Seek(saved_key_, kMaxSequenceNumber) (SeekToLast if invalid).</summary>
+        ToBackwardAfterSeek,
+        /// <summary>ReverseToBackward: inner iterator positioned; continue with FindUserKeyBeforeSavedKey.</summary>
+        ToBackwardPositioned,
+        /// <summary>PrevInternal: loop head.</summary>
+        PrevTop,
+        /// <summary>FindValueForCurrentKey: loop over the entries of saved_key_ (old to new).</summary>
+        FindValue,
+        /// <summary>FindValueForCurrentKey: the loop ended after the last Prev.</summary>
+        FindValueEnd,
+        /// <summary>FindValueForCurrentKeyUsingSeek: skipping invisible entries after the seek.</summary>
+        SeekSkip,
+        /// <summary>FindValueForCurrentKeyUsingSeek: collecting merge operands (new to old).</summary>
+        SeekMerge,
+        /// <summary>FindValueForCurrentKeyUsingSeek: after the Seek of the iterator restore (SeekToLast if invalid).</summary>
+        SeekRestoreAfterSeek,
+        /// <summary>FindValueForCurrentKeyUsingSeek: done (iterator restored).</summary>
+        SeekRestored,
+        /// <summary>FindUserKeyBeforeSavedKey: loop.</summary>
+        BeforeSaved,
+        /// <summary>FindUserKeyBeforeSavedKey: after the reseek (Seek(saved_key_, kMaxSequenceNumber)).</summary>
+        BeforeSavedAfterSeek,
     }
 
-    // ==================================================================== reverse
+    /// <summary>What a public reverse operation does once the state machine is done.</summary>
+    private enum RevFinish : byte { None, ClearPrefixIfInvalid, SetPrefixIfValid }
 
-    /// <summary>Port of DBIter::PrevInternal.</summary>
-    private void PrevInternal()
+    private RevPhase _revPhase;
+    private RevFinish _revFinish;
+    private bool _fukFromPrevInternal;      // FindUserKeyBeforeSavedKey was called by PrevInternal (else ReverseToBackward)
+    private ulong _fukNumSkipped;           // FindUserKeyBeforeSavedKey's num_skipped
+    // FindValueForCurrentKey's locals.
+    private EntryType _fvLastNotMergeType;
+    private EntryType _fvLastKeyEntryType;
+    private bool _fvValidEntrySeen;
+    private ulong _fvNumSkipped;
+
+    /// <summary>Starts DBIter::Prev's reverse movement: ReverseToBackward (if moving forward) then PrevInternal.</summary>
+    private void BeginPrev()
     {
-        while (_iter.Valid)
-        {
-            _savedKey.SetUserKey(DbFormat.ExtractUserKey(_iter.Key));
-            if (_hasPrefix && !PrefixCheck(_savedKey.UserKey))
-            {
-                // prefix_same_as_start: we've iterated past the seek prefix.
-                _valid = false;
-                return;
-            }
-            if (_hasLower && CompareToBound(_savedKey.UserKey, _lower.Span) < 0)
-            {
-                // We've iterated earlier than the user-specified lower bound.
-                _valid = false;
-                return;
-            }
+        _revFinish = RevFinish.None;
+        _revPhase = _forward ? RevPhase.ToBackward : RevPhase.PrevTop;
+    }
 
-            FindValueForCurrentKey(); // assigns _valid
-            // Whether or not we found a value for current key, we need iter_ to end up on a smaller key.
-            FindUserKeyBeforeSavedKey();
-            if (_valid) return; // Found the value.
-            TooManyInternalKeysSkipped(false);
+    /// <summary>Sync driver of the reverse state machine.</summary>
+    private void RunReverse()
+    {
+        while (true)
+        {
+            switch (ReverseStep())
+            {
+                case InnerOp.Done:
+                    ReverseFinished();
+                    return;
+                case InnerOp.Continue:
+                    break;
+                case InnerOp.Prev:
+                    _iter.Prev();
+                    break;
+                case InnerOp.Next:
+                    _iter.Next();
+                    break;
+                case InnerOp.Seek:
+                    _iter.Seek(_seekKey.WrittenSpan);
+                    break;
+                case InnerOp.SeekForPrev:
+                    _iter.SeekForPrev(_seekKey.WrittenSpan);
+                    break;
+                case InnerOp.SeekToLast:
+                    _iter.SeekToLast();
+                    break;
+            }
         }
-        // We haven't found any key - iterator is not valid
-        _valid = false;
+    }
+
+    /// <summary>Async driver of the reverse state machine; completes synchronously when the inner iterator does.</summary>
+    private ValueTask RunReverseAsync(CancellationToken ct)
+    {
+        while (true)
+        {
+            InnerOp op = ReverseStep();
+            if (op == InnerOp.Done)
+            {
+                ReverseFinished();
+                return ValueTask.CompletedTask;
+            }
+            if (op == InnerOp.Continue) continue;
+            ValueTask t = IssueAsync(op, ct);
+            if (!t.IsCompletedSuccessfully) return RunReverseSlowAsync(t, ct);
+            t.GetAwaiter().GetResult();
+        }
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask RunReverseSlowAsync(ValueTask pending, CancellationToken ct)
+    {
+        await pending.ConfigureAwait(false);
+        while (true)
+        {
+            InnerOp op = ReverseStep();
+            if (op == InnerOp.Done)
+            {
+                ReverseFinished();
+                return;
+            }
+            if (op != InnerOp.Continue) await IssueAsync(op, ct).ConfigureAwait(false);
+        }
+    }
+
+    private ValueTask IssueAsync(InnerOp op, CancellationToken ct) => op switch
+    {
+        InnerOp.Prev => _iter.PrevAsync(ct),
+        InnerOp.Next => _iter.NextAsync(ct),
+        InnerOp.Seek => _iter.SeekAsync(_seekKey.WrittenMemory, ct),
+        InnerOp.SeekForPrev => _iter.SeekForPrevAsync(_seekKey.WrittenMemory, ct),
+        _ => _iter.SeekToLastAsync(ct),
+    };
+
+    private void ReverseFinished()
+    {
+        switch (_revFinish)
+        {
+            case RevFinish.ClearPrefixIfInvalid:
+                if (!_valid) _hasPrefix = false;
+                break;
+            case RevFinish.SetPrefixIfValid:
+                if (_valid) MaybeSetPrefix(StripTs(_savedKey.UserKey));
+                break;
+        }
+    }
+
+    /// <summary>Runs the reverse logic up to the next move of the inner iterator (see the phases).</summary>
+    private InnerOp ReverseStep()
+    {
+        switch (_revPhase)
+        {
+            case RevPhase.ToBackward:
+                // Port of DBIter::ReverseToBackward: move iter_ to the key before saved_key_. When
+                // current_entry_is_merged_ is true, iter_ may be positioned on the next key, which may not exist. If
+                // that's the case, seek to saved_key_ (kMaxSequenceNumber + kValueTypeForSeek: strictly before its entries).
+                if (_currentEntryIsMerged && (!_expectTotalOrderInnerIter || !_iter.Valid))
+                {
+                    SetSeekKey(_savedKey.UserKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
+                    if (!_expectTotalOrderInnerIter)
+                    {
+                        _revPhase = RevPhase.ToBackwardPositioned;
+                        return InnerOp.SeekForPrev;
+                    }
+                    // Some iterators may not support SeekForPrev(), so we avoid using it when prefix seek mode is disabled.
+                    _revPhase = RevPhase.ToBackwardAfterSeek;
+                    return InnerOp.Seek;
+                }
+                _revPhase = RevPhase.ToBackwardPositioned;
+                return InnerOp.Continue;
+
+            case RevPhase.ToBackwardAfterSeek:
+                _revPhase = RevPhase.ToBackwardPositioned;
+                return _iter.Valid ? InnerOp.Continue : InnerOp.SeekToLast;
+
+            case RevPhase.ToBackwardPositioned:
+                _forward = false;
+                BeginFindUserKeyBeforeSavedKey(fromPrevInternal: false);
+                return InnerOp.Continue;
+
+            case RevPhase.PrevTop:
+                return PrevInternalStep();
+
+            case RevPhase.FindValue:
+                return FindValueStep();
+
+            case RevPhase.FindValueEnd:
+                FindValueForCurrentKeyEnd();
+                return InnerOp.Continue;
+
+            case RevPhase.SeekSkip:
+                return UsingSeekSkipStep();
+
+            case RevPhase.SeekMerge:
+                return UsingSeekMergeStep();
+
+            case RevPhase.SeekRestoreAfterSeek:
+                _revPhase = RevPhase.SeekRestored;
+                return _iter.Valid ? InnerOp.Continue : InnerOp.SeekToLast;
+
+            case RevPhase.SeekRestored:
+                _valid = true;
+                BeginFindUserKeyBeforeSavedKey(fromPrevInternal: true);
+                return InnerOp.Continue;
+
+            case RevPhase.BeforeSaved:
+                return FindUserKeyBeforeSavedKeyStep();
+
+            case RevPhase.BeforeSavedAfterSeek:
+                if (!_iter.Valid) return FindUserKeyBeforeSavedKeyDone();
+                _revPhase = RevPhase.BeforeSaved;
+                return InnerOp.Prev;
+
+            default:
+                throw new InvalidOperationException();
+        }
+    }
+
+    /// <summary>Port of the head of DBIter::PrevInternal's loop.</summary>
+    private InnerOp PrevInternalStep()
+    {
+        if (!_iter.Valid)
+        {
+            // We haven't found any key - iterator is not valid
+            _valid = false;
+            return InnerOp.Done;
+        }
+        _savedKey.SetUserKey(DbFormat.ExtractUserKey(_iter.Key));
+        if (_hasPrefix && !PrefixCheck(_savedKey.UserKey))
+        {
+            // prefix_same_as_start: we've iterated past the seek prefix.
+            _valid = false;
+            return InnerOp.Done;
+        }
+        if (_hasLower && CompareToBound(_savedKey.UserKey, _lower.Span) < 0)
+        {
+            // We've iterated earlier than the user-specified lower bound.
+            _valid = false;
+            return InnerOp.Done;
+        }
+        // FindValueForCurrentKey() assigns _valid; whether or not we found a value for the current key, iter_ then has to
+        // end up on a smaller key (FindUserKeyBeforeSavedKey).
+        BeginFindValueForCurrentKey();
+        return InnerOp.Continue;
     }
 
     /// <summary>
-    /// Port of DBIter::FindValueForCurrentKey. PRE: iter_ is on the last entry with user key saved_key_. Walks the
-    /// entries of saved_key_ from oldest to newest visible, tracking the newest put/delete and the merge operands
-    /// stacked on top of it.
+    /// Port of the start of DBIter::FindValueForCurrentKey. PRE: iter_ is on the last entry with user key saved_key_.
+    /// The loop walks the entries of saved_key_ from oldest to newest visible, tracking the newest put/delete and the
+    /// merge operands stacked on top of it.
     /// </summary>
-    private void FindValueForCurrentKey()
+    private void BeginFindValueForCurrentKey()
     {
         Debug.Assert(_iter.Valid);
+        // Temporarily pin blocks that hold the value (TempPinData).
+        ReleaseTempPinnedData();
+        TempPinData();
         _operands.Clear();
         _currentEntryIsMerged = false;
         _valid = false;
         // last entry before merge (could be a deletion, a value or a range deletion)
-        EntryType lastNotMergeType = EntryType.Deletion;
-        EntryType lastKeyEntryType = EntryType.Deletion;
-        bool validEntrySeen = false;
-        ulong numSkipped = 0;
+        _fvLastNotMergeType = EntryType.Deletion;
+        _fvLastKeyEntryType = EntryType.Deletion;
+        _fvValidEntrySeen = false;
+        _fvNumSkipped = 0;
+        _revPhase = RevPhase.FindValue;
+    }
 
-        while (_iter.Valid)
+    /// <summary>One iteration of FindValueForCurrentKey's loop (the entry iter_ is on).</summary>
+    private InnerOp FindValueStep()
+    {
+        if (!_iter.Valid)
         {
-            ReadOnlySpan<byte> userKey = ParseCurrent(out ulong seq, out EntryType type);
-            if (!SameUserKey(userKey, _savedKey.UserKey))
-            {
-                // Found a smaller user key, thus we are done with current user key.
-                break;
-            }
-            bool visible = IsVisible(seq, userKey);
-            if (!visible && (_tsLb is null || _ucmp.CompareTimestamp(DbFormat.ExtractTimestampFromUserKey(userKey, _tsSize), _tsUb) > 0))
-            {
-                // Found an invisible version of the current user key, and it must have a higher sequence number or
-                // timestamp. Therefore, we are done with the current user key.
-                break;
-            }
-            if (visible && _tsSize != 0 && IsCoveredByRangeTombstone(userKey, seq))
-            {
-                // Dropped like by upstream's MergingIterator (see FindNextUserEntryStep).
-                _iter.Prev();
-                ++numSkipped;
-                continue;
-            }
-            SaveTimestamp(userKey);
+            FindValueForCurrentKeyEnd();
+            return InnerOp.Continue;
+        }
+        ReadOnlySpan<byte> userKey = ParseCurrent(out ulong seq, out EntryType type);
+        if (!SameUserKey(userKey, _savedKey.UserKey))
+        {
+            // Found a smaller user key, thus we are done with current user key.
+            FindValueForCurrentKeyEnd();
+            return InnerOp.Continue;
+        }
+        bool visible = IsVisible(seq, userKey);
+        if (!visible && (_tsLb is null || _ucmp.CompareTimestamp(DbFormat.ExtractTimestampFromUserKey(userKey, _tsSize), _tsUb) > 0))
+        {
+            // Found an invisible version of the current user key, and it must have a higher sequence number or
+            // timestamp. Therefore, we are done with the current user key.
+            FindValueForCurrentKeyEnd();
+            return InnerOp.Continue;
+        }
+        if (visible && _tsSize != 0 && IsCoveredByRangeTombstone(userKey, seq))
+        {
+            // Dropped like by upstream's MergingIterator (see FindNextUserEntryStep).
+            ++_fvNumSkipped;
+            return InnerOp.Prev;
+        }
+        SaveTimestamp(userKey);
 
-            TooManyInternalKeysSkipped(true);
+        TooManyInternalKeysSkipped(true);
 
-            // This user key has lots of entries. We're going from old to new, and it's taking too long. Let's do a
-            // Seek() and go from new to old. This helps when a key was overwritten many times.
-            if (numSkipped >= _maxSkip)
-            {
-                FindValueForCurrentKeyUsingSeek();
-                return;
-            }
+        // This user key has lots of entries. We're going from old to new, and it's taking too long. Let's do a
+        // Seek() and go from new to old. This helps when a key was overwritten many times.
+        if (_fvNumSkipped >= _maxSkip) return BeginFindValueForCurrentKeyUsingSeek();
 
-            if (_tsSize != 0)
-            {
-                if (_tsLb is not null) _savedKey.SetInternalKey(_iter.Key);
-                else if (_icmp.CompareUserKey(userKey, _savedKey.UserKey) < 0) _savedKey.SetUserKey(userKey);
-            }
-
-            validEntrySeen = true;
-            lastKeyEntryType = type;
-            switch (type)
-            {
-                case EntryType.Value:
-                case EntryType.ValuePreferredSeqno:
-                case EntryType.BlobIndex:
-                case EntryType.WideColumnEntity:
-                    if (IsCoveredByRangeTombstone(userKey, seq))
-                    {
-                        lastKeyEntryType = EntryType.RangeDeletion;
-                        lastNotMergeType = EntryType.RangeDeletion;
-                        _operands.Clear();
-                        break;
-                    }
-                    // The child iterator moves on: keep a copy (upstream pins the block instead).
-                    ReadOnlySpan<byte> v = _iter.Value;
-                    _pinned.Clear();
-                    _pinned.Write(type == EntryType.ValuePreferredSeqno ? ParsePackedValueForValue(v) : v);
-                    _operands.Clear();
-                    lastNotMergeType = type;
-                    break;
-                case EntryType.Deletion:
-                case EntryType.DeletionWithTimestamp:
-                case EntryType.SingleDeletion:
-                    _operands.Clear();
-                    lastNotMergeType = type;
-                    break;
-                case EntryType.Merge:
-                    if (IsCoveredByRangeTombstone(userKey, seq))
-                    {
-                        lastKeyEntryType = EntryType.RangeDeletion;
-                        lastNotMergeType = EntryType.RangeDeletion;
-                        _operands.Clear();
-                        break;
-                    }
-                    if (_mergeOperator is null) ThrowNoMergeOperator();
-                    _operands.PushNewer(_iter.Value);
-                    break;
-                default:
-                    ThrowUnknownType(type);
-                    break;
-            }
-
-            _iter.Prev();
-            ++numSkipped;
-
-            // With iter_start_ts every visible version is its own entry: stop at the first one.
-            if (visible && _tsLb is not null) break;
+        if (_tsSize != 0)
+        {
+            if (_tsLb is not null) _savedKey.SetInternalKey(_iter.Key);
+            else if (_icmp.CompareUserKey(userKey, _savedKey.UserKey) < 0) _savedKey.SetUserKey(userKey);
         }
 
-        if (!validEntrySeen)
+        _fvValidEntrySeen = true;
+        _fvLastKeyEntryType = type;
+        switch (type)
+        {
+            case EntryType.Value:
+            case EntryType.ValuePreferredSeqno:
+            case EntryType.BlobIndex:
+            case EntryType.WideColumnEntity:
+                if (IsCoveredByRangeTombstone(userKey, seq))
+                {
+                    _fvLastKeyEntryType = EntryType.RangeDeletion;
+                    _fvLastNotMergeType = EntryType.RangeDeletion;
+                    _operands.Clear();
+                    break;
+                }
+                // The child iterator moves on: keep the value pinned (or a copy when the child cannot pin it).
+                SaveCurrentValue(type);
+                _operands.Clear();
+                _fvLastNotMergeType = type;
+                break;
+            case EntryType.Deletion:
+            case EntryType.DeletionWithTimestamp:
+            case EntryType.SingleDeletion:
+                _operands.Clear();
+                _fvLastNotMergeType = type;
+                break;
+            case EntryType.Merge:
+                if (IsCoveredByRangeTombstone(userKey, seq))
+                {
+                    _fvLastKeyEntryType = EntryType.RangeDeletion;
+                    _fvLastNotMergeType = EntryType.RangeDeletion;
+                    _operands.Clear();
+                    break;
+                }
+                if (_mergeOperator is null) ThrowNoMergeOperator();
+                _operands.PushNewer(_iter.Value);
+                break;
+            default:
+                ThrowUnknownType(type);
+                break;
+        }
+
+        ++_fvNumSkipped;
+        // With iter_start_ts every visible version is its own entry: stop at the first one.
+        if (visible && _tsLb is not null) _revPhase = RevPhase.FindValueEnd;
+        return InnerOp.Prev;
+    }
+
+    /// <summary>The end of FindValueForCurrentKey (after its loop); continues with FindUserKeyBeforeSavedKey.</summary>
+    private void FindValueForCurrentKeyEnd()
+    {
+        BeginFindUserKeyBeforeSavedKey(fromPrevInternal: true);
+        if (!_fvValidEntrySeen)
         {
             _valid = false;
             return;
         }
 
-        switch (lastKeyEntryType)
+        switch (_fvLastKeyEntryType)
         {
             case EntryType.Deletion:
             case EntryType.DeletionWithTimestamp:
             case EntryType.SingleDeletion:
                 // iter_start_ts: the deletion itself is returned (empty value).
                 _valueSource = ValueSource.None;
-                SetValueKind(lastKeyEntryType);
+                SetValueKind(_fvLastKeyEntryType);
                 _valid = _tsLb is not null;
                 return;
             case EntryType.RangeDeletion:
@@ -1355,14 +1650,14 @@ public sealed class DbIter : IDisposable
                 return;
             case EntryType.Merge:
                 _currentEntryIsMerged = true;
-                if (lastNotMergeType is EntryType.Value or EntryType.ValuePreferredSeqno) MergeWithPlainBaseValue(_pinned.WrittenSpan);
-                else if (lastNotMergeType == EntryType.BlobIndex) MergeWithPlainBaseValue(FetchBlobForMerge(_pinned.WrittenSpan));
-                else if (lastNotMergeType == EntryType.WideColumnEntity) MergeWithEntityBaseValue(_pinned.WrittenSpan);
+                if (_fvLastNotMergeType is EntryType.Value or EntryType.ValuePreferredSeqno) MergeWithPlainBaseValue(PinnedSpan);
+                else if (_fvLastNotMergeType == EntryType.BlobIndex) MergeWithPlainBaseValue(FetchBlobForMerge(PinnedSpan));
+                else if (_fvLastNotMergeType == EntryType.WideColumnEntity) MergeWithEntityBaseValue(PinnedSpan);
                 else MergeWithNoBaseValue();
                 return;
             default: // Value / ValuePreferredSeqno / WideColumnEntity / BlobIndex
                 _valueSource = ValueSource.Pinned;
-                SetValueKind(lastKeyEntryType);
+                SetValueKind(_fvLastKeyEntryType);
                 _valid = true;
                 return;
         }
@@ -1372,33 +1667,38 @@ public sealed class DbIter : IDisposable
     /// Port of DBIter::FindValueForCurrentKeyUsingSeek: Seek to (saved_key_, sequence_) and resolve the key moving
     /// forward (new to old) instead of walking many old versions with Prev().
     /// </summary>
-    private void FindValueForCurrentKeyUsingSeek()
+    private InnerOp BeginFindValueForCurrentKeyUsingSeek()
     {
         if (_tsSize == 0) SetSeekKey(_savedKey.UserKey, _sequence, DbFormat.ValueTypeForSeek);
         else SetSeekKeyWithTimestamp(StripTs(_savedKey.UserKey), _tsLb ?? _tsUb, _sequence, DbFormat.ValueTypeForSeek);
-        _iter.Seek(_seekKey.WrittenSpan);
+        _revPhase = RevPhase.SeekSkip;
+        return InnerOp.Seek;
+    }
 
-        ulong seq;
-        EntryType type;
-        ReadOnlySpan<byte> userKey;
-        while (true)
+    /// <summary>The leaves of FindValueForCurrentKeyUsingSeek: the key is resolved, continue with FindUserKeyBeforeSavedKey.</summary>
+    private InnerOp UsingSeekDone()
+    {
+        BeginFindUserKeyBeforeSavedKey(fromPrevInternal: true);
+        return InnerOp.Continue;
+    }
+
+    /// <summary>FindValueForCurrentKeyUsingSeek: the loop skipping invisible entries, then the found entry.</summary>
+    private InnerOp UsingSeekSkipStep()
+    {
+        if (!_iter.Valid)
         {
-            if (!_iter.Valid)
-            {
-                _valid = false;
-                return;
-            }
-            userKey = ParseCurrent(out seq, out type);
-            if (!SameUserKey(userKey, _savedKey.UserKey))
-            {
-                // No visible values for this key, even though FindValueForCurrentKey() has seen some (possible with a
-                // tailing iterator when entries were compacted away).
-                _valid = false;
-                return;
-            }
-            if (IsVisible(seq, userKey) && (_tsSize == 0 || !IsCoveredByRangeTombstone(userKey, seq))) break;
-            _iter.Next();
+            _valid = false;
+            return UsingSeekDone();
         }
+        ReadOnlySpan<byte> userKey = ParseCurrent(out ulong seq, out EntryType type);
+        if (!SameUserKey(userKey, _savedKey.UserKey))
+        {
+            // No visible values for this key, even though FindValueForCurrentKey() has seen some (possible with a
+            // tailing iterator when entries were compacted away).
+            _valid = false;
+            return UsingSeekDone();
+        }
+        if (!IsVisible(seq, userKey) || (_tsSize != 0 && IsCoveredByRangeTombstone(userKey, seq))) return InnerOp.Next;
 
         if (type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp ||
             IsCoveredByRangeTombstone(userKey, seq))
@@ -1415,20 +1715,18 @@ public sealed class DbIter : IDisposable
                 SetValueKind(type);
                 _valid = true;
             }
-            return;
+            return UsingSeekDone();
         }
         SaveTimestamp(userKey);
         if (type is EntryType.Value or EntryType.ValuePreferredSeqno or EntryType.WideColumnEntity or EntryType.BlobIndex)
         {
-            ReadOnlySpan<byte> v = _iter.Value;
-            _pinned.Clear();
-            _pinned.Write(type == EntryType.ValuePreferredSeqno ? ParsePackedValueForValue(v) : v);
+            SaveCurrentValue(type);
             _valueSource = ValueSource.Pinned;
             SetValueKind(type);
             if (_tsLb is not null) _savedKey.SetInternalKey(_iter.Key);
             else if (_tsSize != 0) _savedKey.SetUserKey(userKey);
             _valid = true;
-            return;
+            return UsingSeekDone();
         }
         if (type != EntryType.Merge) ThrowUnknownType(type);
 
@@ -1437,86 +1735,97 @@ public sealed class DbIter : IDisposable
         _currentEntryIsMerged = true;
         _operands.Clear();
         _operands.PushOlder(_iter.Value);
-        while (true)
+        _revPhase = RevPhase.SeekMerge;
+        return InnerOp.Next;
+    }
+
+    /// <summary>FindValueForCurrentKeyUsingSeek: one iteration of the merge-operand loop (after a Next).</summary>
+    private InnerOp UsingSeekMergeStep()
+    {
+        if (_iter.Valid)
         {
-            _iter.Next();
-            if (!_iter.Valid) break;
-            userKey = ParseCurrent(out seq, out type);
-            if (!SameUserKey(userKey, _savedKey.UserKey)) break;
-            if (type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp ||
-                IsCoveredByRangeTombstone(userKey, seq))
+            ReadOnlySpan<byte> userKey = ParseCurrent(out ulong seq, out EntryType type);
+            if (SameUserKey(userKey, _savedKey.UserKey) &&
+                !(type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp || IsCoveredByRangeTombstone(userKey, seq)))
             {
-                break;
+                switch (type)
+                {
+                    case EntryType.Value:
+                    case EntryType.ValuePreferredSeqno:
+                        ReadOnlySpan<byte> v = _iter.Value;
+                        MergeWithPlainBaseValue(type == EntryType.ValuePreferredSeqno ? ParsePackedValueForValue(v) : v);
+                        return UsingSeekDone();
+                    case EntryType.Merge:
+                        _operands.PushOlder(_iter.Value);
+                        return InnerOp.Next;
+                    case EntryType.WideColumnEntity:
+                        MergeWithEntityBaseValue(_iter.Value);
+                        return UsingSeekDone();
+                    case EntryType.BlobIndex:
+                        MergeWithPlainBaseValue(FetchBlobForMerge(_iter.Value));
+                        return UsingSeekDone();
+                    default:
+                        ThrowUnknownType(type);
+                        break;
+                }
             }
-            if (type is EntryType.Value or EntryType.ValuePreferredSeqno)
-            {
-                ReadOnlySpan<byte> v = _iter.Value;
-                MergeWithPlainBaseValue(type == EntryType.ValuePreferredSeqno ? ParsePackedValueForValue(v) : v);
-                return;
-            }
-            if (type == EntryType.Merge)
-            {
-                _operands.PushOlder(_iter.Value);
-                continue;
-            }
-            if (type == EntryType.WideColumnEntity)
-            {
-                MergeWithEntityBaseValue(_iter.Value);
-                return;
-            }
-            if (type is EntryType.BlobIndex)
-            {
-                MergeWithPlainBaseValue(FetchBlobForMerge(_iter.Value));
-                return;
-            }
-            ThrowUnknownType(type);
         }
 
         MergeWithNoBaseValue();
 
         // Make sure we leave iter_ in a good state. If it's valid and we don't care about prefixes, that's already
         // good enough. Otherwise it needs to be seeked to the current key (last_key, still in _seekKey).
-        if (!_expectTotalOrderInnerIter || !_iter.Valid)
+        if (!_expectTotalOrderInnerIter)
         {
-            if (!_expectTotalOrderInnerIter)
-            {
-                _iter.SeekForPrev(_seekKey.WrittenSpan);
-            }
-            else
-            {
-                _iter.Seek(_seekKey.WrittenSpan);
-                if (!_iter.Valid) _iter.SeekToLast();
-            }
+            _revPhase = RevPhase.SeekRestored;
+            return InnerOp.SeekForPrev;
         }
-
-        _valid = true;
+        if (!_iter.Valid)
+        {
+            _revPhase = RevPhase.SeekRestoreAfterSeek;
+            return InnerOp.Seek;
+        }
+        _revPhase = RevPhase.SeekRestored;
+        return InnerOp.Continue;
     }
 
-    /// <summary>Port of DBIter::FindUserKeyBeforeSavedKey: move backwards until the key smaller than saved_key_.</summary>
-    private void FindUserKeyBeforeSavedKey()
+    /// <summary>Port of the start of DBIter::FindUserKeyBeforeSavedKey: move backwards until the key smaller than saved_key_.</summary>
+    private void BeginFindUserKeyBeforeSavedKey(bool fromPrevInternal)
     {
-        ulong numSkipped = 0;
-        while (_iter.Valid)
+        _fukFromPrevInternal = fromPrevInternal;
+        _fukNumSkipped = 0;
+        _revPhase = RevPhase.BeforeSaved;
+    }
+
+    /// <summary>One iteration of FindUserKeyBeforeSavedKey's loop.</summary>
+    private InnerOp FindUserKeyBeforeSavedKeyStep()
+    {
+        if (!_iter.Valid) return FindUserKeyBeforeSavedKeyDone();
+        ReadOnlySpan<byte> userKey = ParseCurrent(out _, out _);
+        if (CompareKeyForSkip(userKey, _savedKey.UserKey) < 0) return FindUserKeyBeforeSavedKeyDone();
+
+        TooManyInternalKeysSkipped(true);
+
+        if (_fukNumSkipped >= _maxSkip)
         {
-            ReadOnlySpan<byte> userKey = ParseCurrent(out _, out _);
-            if (CompareKeyForSkip(userKey, _savedKey.UserKey) < 0) return;
-
-            TooManyInternalKeysSkipped(true);
-
-            if (numSkipped >= _maxSkip)
-            {
-                numSkipped = 0;
-                SetSeekKeyForSaved(DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek, maxTimestamp: true);
-                // It would be more efficient to use SeekForPrev() here, but some iterators may not support it.
-                _iter.Seek(_seekKey.WrittenSpan);
-                if (!_iter.Valid) break;
-            }
-            else
-            {
-                ++numSkipped;
-            }
-            _iter.Prev();
+            _fukNumSkipped = 0;
+            SetSeekKeyForSaved(DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek, maxTimestamp: true);
+            // It would be more efficient to use SeekForPrev() here, but some iterators may not support it.
+            _revPhase = RevPhase.BeforeSavedAfterSeek;
+            return InnerOp.Seek;
         }
+        ++_fukNumSkipped;
+        return InnerOp.Prev;
+    }
+
+    /// <summary>FindUserKeyBeforeSavedKey returned: back to PrevInternal's loop (or to it, after ReverseToBackward).</summary>
+    private InnerOp FindUserKeyBeforeSavedKeyDone()
+    {
+        _revPhase = RevPhase.PrevTop;
+        if (!_fukFromPrevInternal) return InnerOp.Continue;
+        if (_valid) return InnerOp.Done; // Found the value.
+        TooManyInternalKeysSkipped(false);
+        return InnerOp.Continue;
     }
 
     public void Dispose()
@@ -1525,6 +1834,8 @@ public sealed class DbIter : IDisposable
         _disposed = true;
         _valid = false;
         _iter.Dispose();
+        // Blocks handed over while the children were disposed go too.
+        if (_pinMgr.IsPinning) _pinMgr.ReleasePinnedData();
         IDisposable? c = _cleanup;
         _cleanup = null;
         c?.Dispose();

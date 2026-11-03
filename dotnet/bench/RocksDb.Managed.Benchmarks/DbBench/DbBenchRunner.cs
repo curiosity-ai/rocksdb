@@ -43,6 +43,7 @@ public static class DbBenchRunner
         public int BatchSize = 1;
         public int MultiGetSize = 16;
         public int SeekNexts = 10;
+        public bool ReverseIterator;
         public int TxnPuts = 10;
         public double CompressionRatio = 0.5;
         public string Db = Path.Combine(Path.GetTempPath(), "rocksdb-managed-dbbench");
@@ -133,7 +134,7 @@ public static class DbBenchRunner
         Console.WriteLine("Values:      " + f.ValueSize + " bytes each (" + f.CompressionRatio.ToString("F2", CultureInfo.InvariantCulture) + " compression ratio)");
         Console.WriteLine("Entries:     " + f.Num + " (reads " + f.Reads + ")");
         Console.WriteLine("Threads:     " + f.Threads + (f.Async ? " (async tasks)" : ""));
-        Console.WriteLine("Options:     " + f.Options + " batch_size=" + f.BatchSize + " multiget_size=" + f.MultiGetSize + " seek_nexts=" + f.SeekNexts);
+        Console.WriteLine("Options:     " + f.Options + " batch_size=" + f.BatchSize + " multiget_size=" + f.MultiGetSize + " seek_nexts=" + f.SeekNexts + (f.ReverseIterator ? " reverse_iterator" : ""));
         Console.WriteLine("DB path:     " + f.Db);
         Console.WriteLine("Warm-up:     " + (f.Warmup
             ? "on (" + f.WarmupOps + " ops per benchmark, >= " + WarmupMinReps + " repetitions and >= " + f.WarmupMinMs + " ms, then " + WarmupFlushCompactionCycles + " x " + WarmupFlushesPerCycle + " flushes + compactions; separate DB " + f.Db + "-warmup)"
@@ -723,12 +724,14 @@ public static class DbBenchRunner
             {
                 KeyFormat.Make(key, rng.Uniform(num));
                 long t0 = Clock.Now();
-                it.Seek(key);
+                if (f.ReverseIterator) it.SeekForPrev(key);
+                else it.Seek(key);
                 if (it.Valid) w.Found++;
                 for (int j = 0; j < f.SeekNexts && it.Valid; j++)
                 {
                     w.Bytes += it.Key.Length + it.Value.Length;
-                    it.Next();
+                    if (f.ReverseIterator) it.Prev();
+                    else it.Next();
                 }
                 if (hist) w.Hist.Add(Clock.ElapsedNs(t0));
             }
@@ -973,12 +976,14 @@ public static class DbBenchRunner
             {
                 KeyFormat.Make(key, rng.Uniform(num));
                 long t0 = Clock.Now();
-                await it.SeekAsync(key).ConfigureAwait(false);
+                if (f.ReverseIterator) await it.SeekForPrevAsync(key).ConfigureAwait(false);
+                else await it.SeekAsync(key).ConfigureAwait(false);
                 if (it.Valid) w.Found++;
                 for (int j = 0; j < f.SeekNexts && it.Valid; j++)
                 {
                     w.Bytes += it.Key.Length + it.Value.Length;
-                    await it.NextAsync().ConfigureAwait(false);
+                    if (f.ReverseIterator) await it.PrevAsync().ConfigureAwait(false);
+                    else await it.NextAsync().ConfigureAwait(false);
                 }
                 if (hist) w.Hist.Add(Clock.ElapsedNs(t0));
             }
@@ -1041,6 +1046,7 @@ public static class DbBenchRunner
                 case "batch_size": f.BatchSize = Math.Max(1, int.Parse(value, ci)); break;
                 case "multiget_size": f.MultiGetSize = Math.Max(1, int.Parse(value, ci)); break;
                 case "seek_nexts": f.SeekNexts = int.Parse(value, ci); break;
+                case "reverse_iterator": f.ReverseIterator = ParseBool(value); break;
                 case "txn_puts": f.TxnPuts = Math.Max(1, int.Parse(value, ci)); break;
                 case "compression_ratio": f.CompressionRatio = double.Parse(value, ci); break;
                 case "db": f.Db = value; break;

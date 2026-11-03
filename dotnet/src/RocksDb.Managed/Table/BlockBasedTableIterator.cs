@@ -177,8 +177,8 @@ internal sealed class IndexCursor
 /// (CheckPrefixMayMatch) and leave the iterator invalid without reading any data block when it excludes the prefix.
 /// <para>
 /// Keys/values are spans into pinned block buffers (or the iterator's key buffer) valid until the next move.
-/// The async variants only await when a data block has to be read from the file (cache hits complete
-/// synchronously). Not thread-safe; dispose to release the current block.
+/// The async variants (forward and reverse) only await when a data block has to be read from the file (cache hits
+/// complete synchronously); index partitions are loaded synchronously. Not thread-safe; dispose to release the current block.
 /// </para>
 /// </summary>
 public sealed class BlockBasedTableIterator : IDisposable
@@ -190,6 +190,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     private TableIteratorPrefixOptions _prefix;
     private BlockRef _block;
     private BlockHandle _blockHandle;
+    private Db.Iterators.PinnedIteratorsManager? _pinMgr;
 
     internal BlockBasedTableIterator(BlockBasedTableReader reader, TableReadFlags flags, in TableIteratorPrefixOptions prefixOptions)
     {
@@ -336,7 +337,34 @@ public sealed class BlockBasedTableIterator : IDisposable
     private void ReleaseBlock()
     {
         _data.Clear();
-        if (!_block.IsEmpty) _block.Release();
+        if (_block.IsEmpty) return;
+        Db.Iterators.PinnedIteratorsManager? mgr = _pinMgr;
+        if (mgr is not null && mgr.IsPinning)
+        {
+            // block_iter_.DelegateCleanupsTo(pinned_iters_mgr_): values handed out stay valid until the manager releases.
+            mgr.PinBlock(_block);
+            _block = default;
+            return;
+        }
+        _block.Release();
+    }
+
+    /// <summary>Port of SetPinnedItersMgr: blocks left while <paramref name="manager"/> is pinning are handed over to it.</summary>
+    internal void SetPinnedItersMgr(Db.Iterators.PinnedIteratorsManager? manager) => _pinMgr = manager;
+
+    /// <summary>
+    /// Port of IsValuePinned (pinned_iters_mgr_ && PinningEnabled() && block_iter_.IsValuePinned()): the current value
+    /// as a slice of the data block, which the manager keeps alive once the iterator moves on.
+    /// </summary>
+    internal bool TryGetPinnedValue(out Db.Iterators.PinnedSlice value)
+    {
+        if (_pinMgr is { IsPinning: true } && Valid)
+        {
+            value = _data.PinnedValue;
+            return true;
+        }
+        value = default;
+        return false;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -405,6 +433,76 @@ public sealed class BlockBasedTableIterator : IDisposable
         if (_data.Valid) return;
         _index.Next();
         await PositionAsync(Op.First, default, ct).ConfigureAwait(false);
+    }
+
+    public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default)
+    {
+        _index.SeekToLast();
+        return PositionBackwardAsync(Op.First, default, cancellationToken);
+    }
+
+    /// <summary>Async <see cref="SeekForPrev"/>: completes synchronously unless a data block must be read from the file.</summary>
+    public ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
+    {
+        if (_prefix.CheckFilter && !CheckPrefixMayMatch(target.Span, backward: true))
+        {
+            ReleaseBlock();
+            return ValueTask.CompletedTask;
+        }
+        _index.Seek(target.Span);
+        if (!_index.Valid) _index.SeekToLast();
+        return PositionBackwardAsync(Op.Seek, target, cancellationToken);
+    }
+
+    /// <summary>Async <see cref="Prev"/>: completes synchronously unless the previous data block must be read from the file.</summary>
+    public ValueTask PrevAsync(CancellationToken cancellationToken = default)
+    {
+        System.Diagnostics.Debug.Assert(Valid);
+        _data.Prev();
+        if (_data.Valid) return ValueTask.CompletedTask;
+        _index.Prev();
+        return PositionBackwardAsync(Op.First, default, cancellationToken);
+    }
+
+    /// <summary>
+    /// Backward counterpart of <see cref="PositionAsync"/> (LoadCurrentBlock + FindKeyBackward): loads the block at the
+    /// index position, positions in it (SeekForPrev for <see cref="Op.Seek"/>, else SeekToLast) and moves to earlier
+    /// blocks while it is empty.
+    /// </summary>
+    private ValueTask PositionBackwardAsync(Op op, ReadOnlyMemory<byte> target, CancellationToken ct)
+    {
+        while (true)
+        {
+            if (!_index.Valid)
+            {
+                ReleaseBlock();
+                return ValueTask.CompletedTask;
+            }
+            BlockHandle h = _index.Handle;
+            if (_block.IsEmpty || h != _blockHandle)
+            {
+                ReleaseBlock();
+                ValueTask<BlockRef> pending = _reader.GetBlockRefAsync(h, BlockKind.Data, _flags, ct);
+                if (!pending.IsCompletedSuccessfully) return PositionBackwardSlowAsync(pending, h, op, target, ct);
+                SetBlock(pending.Result, h);
+            }
+            if (op == Op.Seek) _data.SeekForPrev(target.Span);
+            else _data.SeekToLast();
+            if (_data.Valid) return ValueTask.CompletedTask;
+            op = Op.First;
+            _index.Prev();
+        }
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask PositionBackwardSlowAsync(ValueTask<BlockRef> pending, BlockHandle h, Op op, ReadOnlyMemory<byte> target, CancellationToken ct)
+    {
+        SetBlock(await pending.ConfigureAwait(false), h);
+        if (op == Op.Seek) _data.SeekForPrev(target.Span);
+        else _data.SeekToLast();
+        if (_data.Valid) return;
+        _index.Prev();
+        await PositionBackwardAsync(Op.First, default, ct).ConfigureAwait(false);
     }
 
     /// <summary>

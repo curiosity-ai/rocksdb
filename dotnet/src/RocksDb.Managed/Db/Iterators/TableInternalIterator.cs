@@ -69,9 +69,15 @@ public sealed class TableInternalIterator : InternalIterator
     public override void Next() => _it.Next();
     public override void Prev() => _it.Prev();
 
+    public override void SetPinnedItersMgr(PinnedIteratorsManager? manager) => _it.SetPinnedItersMgr(manager);
+    public override bool TryGetPinnedValue(out PinnedSlice value) => _it.TryGetPinnedValue(out value);
+
     public override ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) => _it.SeekToFirstAsync(cancellationToken);
     public override ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) => _it.SeekAsync(target, cancellationToken);
     public override ValueTask NextAsync(CancellationToken cancellationToken = default) => _it.NextAsync(cancellationToken);
+    public override ValueTask SeekToLastAsync(CancellationToken cancellationToken = default) => _it.SeekToLastAsync(cancellationToken);
+    public override ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) => _it.SeekForPrevAsync(target, cancellationToken);
+    public override ValueTask PrevAsync(CancellationToken cancellationToken = default) => _it.PrevAsync(cancellationToken);
 
     /// <summary>The block-cache flags this iterator reads with.</summary>
     internal TableReadFlags Flags { get; private set; }

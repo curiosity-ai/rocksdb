@@ -227,6 +227,9 @@ public sealed class BlockIter : IDisposable
     /// <summary>Raw value as memory over the block buffer (valid while the block is alive).</summary>
     public ReadOnlyMemory<byte> ValueMemory => new(_data, _valueOffset, _valueLength);
 
+    /// <summary>The value as a slice of the block buffer (valid while the block is alive).</summary>
+    internal Db.Iterators.PinnedSlice PinnedValue => new(_data, _valueOffset, _valueLength);
+
     /// <summary>Index blocks: the decoded block handle of the current entry.</summary>
     public BlockHandle BlockHandle => _handle;
 

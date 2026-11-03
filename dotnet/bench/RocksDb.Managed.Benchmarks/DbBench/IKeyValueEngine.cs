@@ -63,6 +63,8 @@ public interface IEngineIterator : IDisposable
 
     void Seek(ReadOnlySpan<byte> key);
 
+    void SeekForPrev(ReadOnlySpan<byte> key);
+
     void Next();
 
     void Prev();

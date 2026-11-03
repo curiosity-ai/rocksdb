@@ -14,8 +14,8 @@ namespace RocksDb.Managed.Db.Iterators;
 /// key is outside the bound are not opened (upstream's KeyReachedUpperBound check in SkipEmptyFileForward).</para>
 /// <para>Range tombstones are not surfaced here (upstream emits file-boundary sentinel keys for them); the DB layer
 /// collects every file's tombstones into the <see cref="RangeDelAggregator"/> when the iterator is created.</para>
-/// <para>Async variants open files through <see cref="ITableCache.GetReaderAsync"/> first (so a table open awaits
-/// instead of blocking) and use the file iterator's async paths.</para>
+/// <para>Async variants (forward and reverse) open files through <see cref="ITableCache.GetReaderAsync"/> first (so a
+/// table open awaits instead of blocking) and use the file iterator's async paths.</para>
 /// </remarks>
 public sealed class LevelIterator : InternalIterator
 {
@@ -33,6 +33,7 @@ public sealed class LevelIterator : InternalIterator
     private InternalIterator? _spare; // a file iterator parked for reuse while the level iterator is exhausted
     private int _fileIndex = -1;
     private bool _disposed;
+    private PinnedIteratorsManager? _pinMgr;
 
     /// <param name="tableCache">Opens file iterators.</param>
     /// <param name="comparator">Internal key comparator.</param>
@@ -279,6 +280,7 @@ public sealed class LevelIterator : InternalIterator
         try
         {
             _fileIter = NewFileIterator(index, old);
+            _fileIter.SetPinnedItersMgr(_pinMgr);
         }
         catch
         {
@@ -288,6 +290,16 @@ public sealed class LevelIterator : InternalIterator
         }
         _fileIndex = index;
     }
+
+    /// <summary>Port of LevelIterator::SetPinnedItersMgr: passed to every file iterator.</summary>
+    public override void SetPinnedItersMgr(PinnedIteratorsManager? manager)
+    {
+        _pinMgr = manager;
+        _fileIter?.SetPinnedItersMgr(manager);
+        _spare?.SetPinnedItersMgr(manager);
+    }
+
+    public override bool TryGetPinnedValue(out PinnedSlice value) => _fileIter!.TryGetPinnedValue(out value);
 
     private InternalIterator NewFileIterator(int index, InternalIterator? reuse)
     {
@@ -427,6 +439,114 @@ public sealed class LevelIterator : InternalIterator
                 return;
             }
         }
+    }
+
+    public override ValueTask SeekToLastAsync(CancellationToken cancellationToken = default) =>
+        SampleAfter(PositionBackwardAsync(_files.Length - 1, default, seek: false, cancellationToken), isSeek: true);
+
+    public override ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
+    {
+        int index = FindFile(target.Span);
+        if (index >= _files.Length) index = _files.Length - 1;
+        return SampleAfter(PositionBackwardAsync(index, target, seek: true, cancellationToken), isSeek: true);
+    }
+
+    public override ValueTask PrevAsync(CancellationToken cancellationToken = default)
+    {
+        ValueTask t = _fileIter!.PrevAsync(cancellationToken);
+        if (!t.IsCompletedSuccessfully) return PrevSlowAsync(t, cancellationToken);
+        t.GetAwaiter().GetResult();
+        if (_fileIter.Valid)
+        {
+            SampleRead(isSeek: false);
+            return ValueTask.CompletedTask;
+        }
+        return SampleAfter(RetreatFileAsync(cancellationToken), isSeek: false);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask PrevSlowAsync(ValueTask pending, CancellationToken ct)
+    {
+        await pending.ConfigureAwait(false);
+        if (!_fileIter!.Valid) await RetreatFileAsync(ct).ConfigureAwait(false);
+        SampleRead(isSeek: false);
+    }
+
+    /// <summary>SkipEmptyFileBackward with async file opens and positioning.</summary>
+    private ValueTask RetreatFileAsync(CancellationToken ct)
+    {
+        int prev = _fileIndex - 1;
+        if (prev < 0 || FileEndsBeforeLowerBound(prev))
+        {
+            SetFileIterator(null, -1);
+            return ValueTask.CompletedTask;
+        }
+        return PositionBackwardAsync(prev, default, seek: false, ct);
+    }
+
+    /// <summary><see cref="SampleRead"/> once <paramref name="pending"/> completes (synchronously when it already has).</summary>
+    private ValueTask SampleAfter(ValueTask pending, bool isSeek)
+    {
+        if (!pending.IsCompletedSuccessfully) return SampleAfterAsync(pending, isSeek);
+        pending.GetAwaiter().GetResult();
+        SampleRead(isSeek);
+        return ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// Backward counterpart of <see cref="PositionAsync"/>: positions file <paramref name="index"/> (SeekForPrev when
+    /// <paramref name="seek"/>, else SeekToLast) and moves to earlier files while empty (SkipEmptyFileBackward, stopping
+    /// at files that end before the lower bound). Completes synchronously when the files are open and their blocks
+    /// cached.
+    /// </summary>
+    private ValueTask PositionBackwardAsync(int index, ReadOnlyMemory<byte> target, bool seek, CancellationToken ct)
+    {
+        while (true)
+        {
+            if ((uint)index >= (uint)_files.Length)
+            {
+                SetFileIterator(null, -1);
+                return ValueTask.CompletedTask;
+            }
+            if (_fileIter is null || _fileIndex != index) return PositionBackwardSlowAsync(index, target, seek, ct);
+            InternalIterator it = _fileIter;
+            ValueTask t = seek ? it.SeekForPrevAsync(target, ct) : it.SeekToLastAsync(ct);
+            if (!t.IsCompletedSuccessfully) return PositionBackwardSlowAsync(t, index, target, seek, ct);
+            t.GetAwaiter().GetResult();
+            if (it.Valid) return ValueTask.CompletedTask;
+            index--;
+            seek = false;
+            if (index < 0 || FileEndsBeforeLowerBound(index))
+            {
+                SetFileIterator(null, -1);
+                return ValueTask.CompletedTask;
+            }
+        }
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask PositionBackwardSlowAsync(ValueTask pending, int index, ReadOnlyMemory<byte> target, bool seek, CancellationToken ct)
+    {
+        await pending.ConfigureAwait(false);
+        if (_fileIter!.Valid) return;
+        index--;
+        if (index < 0 || FileEndsBeforeLowerBound(index))
+        {
+            SetFileIterator(null, -1);
+            return;
+        }
+        await PositionBackwardAsync(index, default, seek: false, ct).ConfigureAwait(false);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask PositionBackwardSlowAsync(int index, ReadOnlyMemory<byte> target, bool seek, CancellationToken ct)
+    {
+        // Warm the table cache asynchronously so InitFileIterator does not block on the table open.
+        using (await _tableCache.GetReaderAsync(_files[index], ct).ConfigureAwait(false))
+        {
+            InitFileIterator(index);
+        }
+        await PositionBackwardAsync(index, target, seek, ct).ConfigureAwait(false);
     }
 
     protected override void Dispose(bool disposing)

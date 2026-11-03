@@ -16,9 +16,9 @@ namespace RocksDb.Managed.Db.Iterators;
 /// <see cref="RangeDelAggregator"/> whether each visible entry is covered (ShouldDelete). This is simpler and correct,
 /// but a long range of deleted keys is still scanned key by key.</para>
 /// <para><b>Allocation.</b> The heap is an <c>int[]</c> of child indices allocated once; positioning and stepping do not
-/// allocate. Keys/values are the current child's spans. Async positioning (<see cref="SeekAsync"/>,
-/// <see cref="SeekToFirstAsync"/>, <see cref="NextAsync"/>) awaits children one at a time and completes
-/// synchronously when every child does; direction switches and reverse movement are synchronous.</para>
+/// allocate. Keys/values are the current child's spans. Async positioning (seeks, <see cref="NextAsync"/>,
+/// <see cref="PrevAsync"/>) awaits children one at a time and completes synchronously when every child does; an async
+/// direction switch re-positions the other children with async I/O (an async state machine, pooled).</para>
 /// <para>Owns its children: disposing the merging iterator disposes them.</para>
 /// </remarks>
 public sealed class MergingIterator : InternalIterator
@@ -30,6 +30,7 @@ public sealed class MergingIterator : InternalIterator
     private int _current = -1;
     private bool _forward = true;
     private bool _disposed;
+    private Util.PooledBufferWriter? _switchKey; // the current key during an async direction switch
 
     /// <param name="comparator">Internal key comparator.</param>
     /// <param name="children">Child iterators (ownership is transferred).</param>
@@ -60,6 +61,14 @@ public sealed class MergingIterator : InternalIterator
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => ChildValue(_current);
     }
+
+    /// <summary>Port of MergingIterator::SetPinnedItersMgr: passed to every child.</summary>
+    public override void SetPinnedItersMgr(PinnedIteratorsManager? manager)
+    {
+        foreach (InternalIterator c in _children) c.SetPinnedItersMgr(manager);
+    }
+
+    public override bool TryGetPinnedValue(out PinnedSlice value) => _children[_current].TryGetPinnedValue(out value);
 
     // ------------------------------------------------------------------ positioning
 
@@ -192,25 +201,47 @@ public sealed class MergingIterator : InternalIterator
 
     // ------------------------------------------------------------------ async
 
+    private enum PosOp : byte { First, Seek, Last, SeekForPrev }
+
     public override ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default)
     {
         ClearHeap(forward: true);
-        return PositionChildrenAsync(0, default, seekToFirst: true, cancellationToken);
+        return PositionChildrenAsync(0, default, PosOp.First, cancellationToken);
     }
 
     public override ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
         ClearHeap(forward: true);
-        return PositionChildrenAsync(0, target, seekToFirst: false, cancellationToken);
+        return PositionChildrenAsync(0, target, PosOp.Seek, cancellationToken);
     }
 
-    private ValueTask PositionChildrenAsync(int start, ReadOnlyMemory<byte> target, bool seekToFirst, CancellationToken ct)
+    public override ValueTask SeekToLastAsync(CancellationToken cancellationToken = default)
+    {
+        ClearHeap(forward: false);
+        return PositionChildrenAsync(0, default, PosOp.Last, cancellationToken);
+    }
+
+    public override ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
+    {
+        ClearHeap(forward: false);
+        return PositionChildrenAsync(0, target, PosOp.SeekForPrev, cancellationToken);
+    }
+
+    private static ValueTask PositionChild(InternalIterator c, ReadOnlyMemory<byte> target, PosOp op, CancellationToken ct) => op switch
+    {
+        PosOp.First => c.SeekToFirstAsync(ct),
+        PosOp.Seek => c.SeekAsync(target, ct),
+        PosOp.Last => c.SeekToLastAsync(ct),
+        _ => c.SeekForPrevAsync(target, ct),
+    };
+
+    private ValueTask PositionChildrenAsync(int start, ReadOnlyMemory<byte> target, PosOp op, CancellationToken ct)
     {
         for (int i = start; i < _children.Length; i++)
         {
             InternalIterator c = _children[i];
-            ValueTask t = seekToFirst ? c.SeekToFirstAsync(ct) : c.SeekAsync(target, ct);
-            if (!t.IsCompletedSuccessfully) return PositionChildrenSlowAsync(t, i, target, seekToFirst, ct);
+            ValueTask t = PositionChild(c, target, op, ct);
+            if (!t.IsCompletedSuccessfully) return PositionChildrenSlowAsync(t, i, target, op, ct);
             t.GetAwaiter().GetResult();
             if (c.Valid) Push(i);
         }
@@ -219,18 +250,32 @@ public sealed class MergingIterator : InternalIterator
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    private async ValueTask PositionChildrenSlowAsync(ValueTask pending, int index, ReadOnlyMemory<byte> target, bool seekToFirst, CancellationToken ct)
+    private async ValueTask PositionChildrenSlowAsync(ValueTask pending, int index, ReadOnlyMemory<byte> target, PosOp op, CancellationToken ct)
     {
         await pending.ConfigureAwait(false);
         if (_children[index].Valid) Push(index);
-        await PositionChildrenAsync(index + 1, target, seekToFirst, ct).ConfigureAwait(false);
+        await PositionChildrenAsync(index + 1, target, op, ct).ConfigureAwait(false);
     }
 
     public override ValueTask NextAsync(CancellationToken cancellationToken = default)
     {
         Debug.Assert(Valid);
-        if (!_forward) SwitchToForward();
+        if (!_forward) return SwitchThenMoveAsync(forward: true, cancellationToken);
         ValueTask t = _children[_current].NextAsync(cancellationToken);
+        if (t.IsCompletedSuccessfully)
+        {
+            t.GetAwaiter().GetResult();
+            AfterCurrentMoved();
+            return ValueTask.CompletedTask;
+        }
+        return AwaitNextAsync(t);
+    }
+
+    public override ValueTask PrevAsync(CancellationToken cancellationToken = default)
+    {
+        Debug.Assert(Valid);
+        if (_forward) return SwitchThenMoveAsync(forward: false, cancellationToken);
+        ValueTask t = _children[_current].PrevAsync(cancellationToken);
         if (t.IsCompletedSuccessfully)
         {
             t.GetAwaiter().GetResult();
@@ -244,6 +289,47 @@ public sealed class MergingIterator : InternalIterator
     private async ValueTask AwaitNextAsync(ValueTask pending)
     {
         await pending.ConfigureAwait(false);
+        AfterCurrentMoved();
+    }
+
+    /// <summary>
+    /// Async SwitchToForward / SwitchToBackward followed by the Next / Prev of the current child: every non-current child
+    /// is re-positioned with async I/O. The current key is copied first (it must outlive the awaits).
+    /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask SwitchThenMoveAsync(bool forward, CancellationToken ct)
+    {
+        Util.PooledBufferWriter key = _switchKey ??= new Util.PooledBufferWriter(64);
+        key.Clear();
+        key.Write(Key);
+        ReadOnlyMemory<byte> target = key.WrittenMemory;
+        int cur = _current;
+        ClearHeap(forward);
+        for (int i = 0; i < _children.Length; i++)
+        {
+            InternalIterator c = _children[i];
+            if (i != cur)
+            {
+                if (forward)
+                {
+                    await c.SeekAsync(target, ct).ConfigureAwait(false);
+                    // child.key() is ensured to be > target after this step.
+                    if (c.Valid && _icmp.Compare(target.Span, c.Key) == 0) await c.NextAsync(ct).ConfigureAwait(false);
+                }
+                else
+                {
+                    await c.SeekForPrevAsync(target, ct).ConfigureAwait(false);
+                    // child.key() is ensured to be < target after this step.
+                    if (c.Valid && _icmp.Compare(target.Span, c.Key) == 0) await c.PrevAsync(ct).ConfigureAwait(false);
+                }
+            }
+            if (c.Valid) Push(i);
+        }
+        _current = Top();
+        Debug.Assert(_current == cur);
+        InternalIterator current = _children[cur];
+        if (forward) await current.NextAsync(ct).ConfigureAwait(false);
+        else await current.PrevAsync(ct).ConfigureAwait(false);
         AfterCurrentMoved();
     }
 
@@ -359,5 +445,6 @@ public sealed class MergingIterator : InternalIterator
         if (_disposed) return;
         _disposed = true;
         foreach (InternalIterator c in _children) c.Dispose();
+        _switchKey?.Dispose();
     }
 }

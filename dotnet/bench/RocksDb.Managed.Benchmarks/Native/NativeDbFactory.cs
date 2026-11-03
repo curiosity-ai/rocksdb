@@ -236,6 +236,7 @@ public sealed class NativeKeyValueEngine : IKeyValueEngine
         public void SeekToLast() => it.SeekToLast();
 
         public void Seek(ReadOnlySpan<byte> key) => it.Seek(key);
+        public void SeekForPrev(ReadOnlySpan<byte> key) => it.SeekForPrev(key);
 
         public void Next() => it.Next();
 

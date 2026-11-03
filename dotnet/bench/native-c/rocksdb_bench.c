@@ -51,6 +51,7 @@ typedef struct {
   int batch_size;     // puts per WriteBatch for fill benchmarks (1 = Put)
   int multiget_size;  // keys per MultiGet in multireadrandom
   int seek_nexts;     // Next() calls after each Seek in seekrandom
+  int reverse_iterator; // seekrandom: SeekForPrev + Prev() instead of Seek + Next()
   bool disable_wal;
   bool sync;
   int64_t cache_size;
@@ -120,7 +121,7 @@ static void usage(void) {
           "usage: rocksdb_bench [--benchmarks a,b,...] [--num N] [--reads N] "
           "[--key_size 16] [--value_size 100]\n"
           "  [--threads 1] [--batch_size 1] [--multiget_size 16] "
-          "[--seek_nexts 10] [--txn_puts 10] [--disable_wal] [--sync]\n"
+          "[--seek_nexts 10] [--reverse_iterator] [--txn_puts 10] [--disable_wal] [--sync]\n"
           "  [--cache_size BYTES] [--cache_type lru|hyperclock] [--bloom_bits "
           "10] [--write_buffer_size BYTES]\n"
           "  [--block_size 4096] [--compression none|snappy|lz4|zstd] "
@@ -178,6 +179,7 @@ static void parse_flags(int argc, char** argv) {
     else if (FLAG("batch_size")) FLAGS.batch_size = atoi(value);
     else if (FLAG("multiget_size")) FLAGS.multiget_size = atoi(value);
     else if (FLAG("seek_nexts")) FLAGS.seek_nexts = atoi(value);
+    else if (FLAG("reverse_iterator")) FLAGS.reverse_iterator = parse_bool(value);
     else if (FLAG("disable_wal")) FLAGS.disable_wal = parse_bool(value);
     else if (FLAG("sync")) FLAGS.sync = parse_bool(value);
     else if (FLAG("cache_size")) FLAGS.cache_size = strtoll(value, NULL, 10);
@@ -669,14 +671,16 @@ static void do_seeks(ThreadState* t, int64_t n, uint64_t* rng) {
   for (int64_t i = 0; i < n; i++) {
     make_key(key, ks, rng_uniform(rng, (uint64_t)FLAGS.num));
     uint64_t t0 = now_ns();
-    rocksdb_iter_seek(it, key, (size_t)ks);
+    if (FLAGS.reverse_iterator) rocksdb_iter_seek_for_prev(it, key, (size_t)ks);
+    else rocksdb_iter_seek(it, key, (size_t)ks);
     if (rocksdb_iter_valid(it)) t->found++;
     for (int j = 0; j < FLAGS.seek_nexts && rocksdb_iter_valid(it); j++) {
       size_t kl, vl;
       rocksdb_iter_key(it, &kl);
       rocksdb_iter_value(it, &vl);
       t->bytes += (int64_t)(kl + vl);
-      rocksdb_iter_next(it);
+      if (FLAGS.reverse_iterator) rocksdb_iter_prev(it);
+      else rocksdb_iter_next(it);
     }
     if (FLAGS.histogram) hist_add(&t->hist, now_ns() - t0);
   }

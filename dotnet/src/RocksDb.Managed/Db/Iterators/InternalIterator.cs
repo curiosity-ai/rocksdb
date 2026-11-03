@@ -36,6 +36,24 @@ public abstract class InternalIterator : IDisposable
     /// <summary>Upper-level hint for iterate_upper_bound checks (port of IsKeyPinned/UpperBoundCheckResult is optional).</summary>
     public virtual bool MayBeOutOfUpperBound => true;
 
+    /// <summary>
+    /// Port of InternalIterator::SetPinnedItersMgr: iterators that hold data blocks hand the blocks they leave to
+    /// <paramref name="manager"/> while it <see cref="PinnedIteratorsManager.IsPinning"/>; composite iterators pass it
+    /// to their children. Default: nothing to pin.
+    /// </summary>
+    public virtual void SetPinnedItersMgr(PinnedIteratorsManager? manager) { }
+
+    /// <summary>
+    /// Port of IsValuePinned + value(): when the current value stays valid until the pinned iterators manager releases
+    /// its data (or for the memtable, while the memtable is alive), returns it as a storable slice. False (the caller
+    /// copies the value) when the value is not pinned. REQUIRES: <see cref="Valid"/>.
+    /// </summary>
+    public virtual bool TryGetPinnedValue(out PinnedSlice value)
+    {
+        value = default;
+        return false;
+    }
+
     protected virtual void Dispose(bool disposing) { }
     public void Dispose()
     {
