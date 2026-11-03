@@ -51,6 +51,11 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     /// </summary>
     public SstFileManager? SstFileManager { get; set; }
     /// <summary>
+    /// Runs compactions remotely (rocksdb::DBOptions::compaction_service; see <see cref="Managed.CompactionService"/>).
+    /// Null (the default) compacts locally. Not persisted.
+    /// </summary>
+    public CompactionService? CompactionService { get; set; }
+    /// <summary>
     /// file_checksum_gen_factory: when set (e.g. <see cref="FileChecksumGenCrc32cFactory.Instance"/>), a whole-file
     /// checksum is computed for every table and blob file written by flushes and compactions and for ingested files, and
     /// recorded in the MANIFEST with its function name (native RocksDB reads and writes the same records); see
@@ -276,7 +281,8 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     public DbOptions Clone()
     {
         var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir, FileSystem = FileSystem, Statistics = Statistics, InfoLog = InfoLog,
-            RateLimiter = RateLimiter, SstFileManager = SstFileManager, FileChecksumGenFactory = FileChecksumGenFactory };
+            RateLimiter = RateLimiter, SstFileManager = SstFileManager, FileChecksumGenFactory = FileChecksumGenFactory,
+            CompactionService = CompactionService };
         c.DbPaths.AddRange(DbPaths);
         c.Listeners.AddRange(Listeners);
         c.CopyFrom(this);

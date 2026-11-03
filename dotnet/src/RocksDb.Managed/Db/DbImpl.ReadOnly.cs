@@ -32,6 +32,8 @@ internal sealed partial class DbImpl
 {
     private bool _readOnly;
     private bool _secondary;
+    // A secondary opened by OpenAndCompact skips WAL replay (OpenAsSecondaryImpl with recover_wal = false).
+    private bool _secondaryRecoverWal = true;
     private string? _secondaryPath;
     private readonly SemaphoreSlim _catchUpLock = new(1, 1);
     // Secondary: open WAL readers by log number (incremental tailing). Guarded by _catchUpLock.
@@ -54,14 +56,22 @@ internal sealed partial class DbImpl
     private static void ThrowReadOnly() => throw RocksDbException.NotSupported("Not supported operation in read only mode.");
 
     /// <summary>Opens a read-only (or, with <paramref name="secondaryPath"/>, secondary) instance.</summary>
+    public static ValueTask<DbImpl> OpenReadOnlyAsync(string path, DbOptions options, IReadOnlyList<ColumnFamilyDescriptor> columnFamilies,
+        bool errorIfWalFileExists, string? secondaryPath, bool synchronous, CancellationToken cancellationToken) =>
+        OpenReadOnlyAsync(path, options, columnFamilies, errorIfWalFileExists, secondaryPath, recoverWal: true, synchronous, cancellationToken);
+
+    /// <summary>Read-only (<paramref name="secondaryPath"/> null) or secondary open; a secondary without <paramref name="recoverWal"/> ignores the WALs.</summary>
     public static async ValueTask<DbImpl> OpenReadOnlyAsync(string path, DbOptions options, IReadOnlyList<ColumnFamilyDescriptor> columnFamilies,
-        bool errorIfWalFileExists, string? secondaryPath, bool synchronous, CancellationToken cancellationToken)
+        bool errorIfWalFileExists, string? secondaryPath, bool recoverWal, bool synchronous, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(columnFamilies);
         string dbname = path.Length > 1 ? path.TrimEnd('/') : path;
-        var db = new DbImpl(dbname, options.Clone()) { _readOnly = true, _secondary = secondaryPath is not null, _secondaryPath = secondaryPath };
+        var db = new DbImpl(dbname, options.Clone())
+        {
+            _readOnly = true, _secondary = secondaryPath is not null, _secondaryPath = secondaryPath, _secondaryRecoverWal = recoverWal,
+        };
         try
         {
             await db.OpenReadOnlyCoreAsync(columnFamilies, errorIfWalFileExists, synchronous, cancellationToken).ConfigureAwait(false);
@@ -330,7 +340,14 @@ internal sealed partial class DbImpl
             state = TailManifestWithRetry(out manifestChanged);
             if (!manifestChanged) break;
         }
-        ApplyWalTail(state);
+        if (_secondaryRecoverWal) ApplyWalTail(state);
+        else
+        {
+            lock (_mutex)
+            {
+                foreach (ColumnFamilyData cfd in Versions.ColumnFamilies) InstallSuperVersion(cfd);
+            }
+        }
         return default;
     }
 

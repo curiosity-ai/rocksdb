@@ -307,6 +307,8 @@ internal sealed partial class DbImpl
         {
             // Callbacks are not registered; nothing to report.
         }
+        // CancelAllBackgroundWork: remote jobs being waited for are canceled too.
+        Options.CompactionService?.CancelAwaitingJobs();
         lock (_mutex) SignalBackgroundWork();
     }
 
@@ -758,6 +760,7 @@ internal sealed partial class DbImpl
         bool isManual = thread == CompactionThread.Manual;
         bool ok = false;
         CompactionJob? job = null;
+        RemoteCompactionOutcome? remote = null;
         Exception? failure = null;
         long compactionStart = 0;
         int jobId = 0;
@@ -810,9 +813,24 @@ internal sealed partial class DbImpl
                         jobSnapshots = WithJobSnapshot(SnapshotsForCompaction(), jobSnapshot.SequenceNumber);
                     }
                 }
+                bool bottom = thread == CompactionThread.Bottom;
+                // ProcessKeyValueCompactionWithCompactionService (no snapshot checker support in remote compaction).
+                if (Options.CompactionService is { } service && checker is null)
+                {
+                    remote = TryRunRemoteCompaction(service, cfd, c, jobSnapshots, jobId, bottom, ct);
+                }
+                if (remote is not null)
+                {
+                    jobSnapshot?.Dispose();
+                    c.AddInputDeletions(edit);
+                    foreach (FileMetaData f in remote.Outputs) edit.AddFile(c.OutputLevel, f);
+                    AddCompactCursorEdit(cfd, c, edit);
+                    if (remote.Outputs.Count > 0) FileSystem.SyncDirectory(DbPaths[(int)Math.Min(c.OutputPathId, (uint)(DbPaths.Count - 1))]);
+                }
+                else
+                {
                 try
                 {
-                    bool bottom = thread == CompactionThread.Bottom;
                     job = new CompactionJob(this, cfd, c, jobSnapshots, NewPendingOutputFileNumber, ct)
                     {
                         SnapshotChecker = checker,
@@ -842,6 +860,7 @@ internal sealed partial class DbImpl
                 edit.BlobFileGarbages.AddRange(job.BlobFileGarbages);
                 AddCompactCursorEdit(cfd, c, edit);
                 if (job.Outputs.Count + job.ProximalOutputs.Count > 0) FileSystem.SyncDirectory(DbPaths[(int)Math.Min(c.OutputPathId, (uint)(DbPaths.Count - 1))]);
+                }
             }
             lock (_mutex)
             {
@@ -864,6 +883,11 @@ internal sealed partial class DbImpl
             if (job is not null && job.Outputs.Count > 0) MaybeReportMaxAllowedSpaceReached(BackgroundErrorReason.Compaction);
             ok = true;
             Interlocked.Increment(ref _statCompactions);
+            if (remote is not null)
+            {
+                Interlocked.Add(ref _statCompactionBytesRead, (long)remote.BytesRead);
+                Interlocked.Add(ref _statCompactionBytesWritten, (long)remote.BytesWritten);
+            }
             if (job is not null)
             {
                 Interlocked.Add(ref _statCompactionBytesRead, (long)job.Stats.BytesRead);
@@ -920,6 +944,10 @@ internal sealed partial class DbImpl
                 {
                     foreach (ulong n in job.CreatedFileNumbers) _pendingOutputs.Remove(n);
                 }
+                if (remote is not null)
+                {
+                    foreach (ulong n in remote.CreatedFileNumbers) _pendingOutputs.Remove(n);
+                }
                 cfd.CompactionState.Picker.ReleaseCompactionFiles(c, ok);
                 ReleaseCompactionRoom(c);
                 if (c.InputVersion is not null) Versions.UnrefVersion(c.InputVersion);
@@ -931,6 +959,10 @@ internal sealed partial class DbImpl
             if (!ok && job is not null)
             {
                 foreach (ulong n in job.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
+            }
+            if (!ok && remote is not null)
+            {
+                foreach (ulong n in remote.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
             }
             if (job is not null)
             {

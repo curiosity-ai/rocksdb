@@ -79,6 +79,20 @@ internal sealed class CompactionJob
     {
     }
 
+    /// <summary>
+    /// The compaction of only [<paramref name="start"/>, <paramref name="end"/>) (user keys, null = unbounded): a remote
+    /// worker running one subcompaction of the primary (CompactionServiceInput begin / end).
+    /// </summary>
+    internal static CompactionJob ForRange(DbImpl db, ColumnFamilyData cfd, Compaction compaction, ulong[] snapshots, Func<ulong> newFileNumber,
+        CancellationToken cancellation, byte[]? start, byte[]? end, string outputDirectory) =>
+        new(db, cfd, compaction, snapshots, newFileNumber, cancellation, start, end, 0) { OutputDirectory = outputDirectory };
+
+    /// <summary>
+    /// Directory the output tables are written to instead of the DB paths (CompactionServiceCompactionJob::output_path_
+    /// of a remote worker). Null for local compactions.
+    /// </summary>
+    internal string? OutputDirectory { get; init; }
+
     /// <summary>A subcompaction of [<paramref name="start"/>, <paramref name="end"/>) (user keys, null = unbounded).</summary>
     private CompactionJob(DbImpl db, ColumnFamilyData cfd, Compaction compaction, ulong[] snapshots, Func<ulong> newFileNumber,
         CancellationToken cancellation, byte[]? start, byte[]? end, int subJobId)
@@ -492,6 +506,7 @@ internal sealed class CompactionJob
             {
                 SnapshotChecker = SnapshotChecker,
                 JobSnapshot = JobSnapshot,
+                OutputDirectory = OutputDirectory,
             });
         }
         _db.Stats?.RecordInHistogram(Histogram.NumSubcompactionsScheduled, (ulong)_subcompactions.Count);
@@ -899,7 +914,7 @@ internal sealed class CompactionJob
     {
         ulong fileNumber = _newFileNumber();
         CreatedFileNumbers.Add(fileNumber);
-        _out.Path = FileNames.TableFileName(_db.DbPaths, fileNumber, _c.OutputPathId);
+        _out.Path = OutputDirectory is { } outDir ? FileNames.MakeTableFileName(outDir, fileNumber) : FileNames.TableFileName(_db.DbPaths, fileNumber, _c.OutputPathId);
         ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         ulong oldestAncestor = _c.MinInputFileOldestAncestorTime();
         if (oldestAncestor == ulong.MaxValue) oldestAncestor = now;
