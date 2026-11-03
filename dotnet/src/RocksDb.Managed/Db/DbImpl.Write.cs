@@ -845,6 +845,9 @@ internal sealed partial class DbImpl
             }
             _flushScheduler.Clear();
         }
+        WriteBufferManager wbm = WriteBufferManager;
+        if (wbm.Enabled && (wbm.ShouldFlush() || wbm.ShouldStall()))
+            await PreprocessWriteBufferManagerAsync(noSlowdown, synchronous, cancellationToken).ConfigureAwait(false);
         if (_maybeStalled)
         {
             long stallStart = Stopwatch.GetTimestamp();
@@ -968,6 +971,7 @@ internal sealed partial class DbImpl
             // RotateCurrentGeneration: the blob direct write files of this memtable are registered by its flush.
             Blob.BlobDirectWriteGeneration? generation = cfd.BlobDirectWrite?.RotateGeneration();
             cfd.Imm.Add(new ImmutableMemTable(mem, newLogNumber) { FlushReason = reason, BlobGeneration = generation });
+            mem.MarkImmutable();
             if (generation is not null) ProtectBlobDirectWriteFiles(cfd, mem, generation);
             if (HasListeners) EnqueueMemTableSealed(cfd, mem);
             cfd.Mem = cfd.ConstructNewMemtable(Versions.LastSequence);

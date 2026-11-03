@@ -23,6 +23,7 @@ internal sealed partial class DbImpl
         try
         {
             await db.OpenCoreAsync(columnFamilies, synchronous, cancellationToken).ConfigureAwait(false);
+            db.RegisterWithWriteBufferManager();
             return db;
         }
         catch
@@ -34,6 +35,7 @@ internal sealed partial class DbImpl
 
     private void AbortOpen()
     {
+        DeregisterFromWriteBufferManager();
         Volatile.Write(ref _disposed, 1);
         try
         {

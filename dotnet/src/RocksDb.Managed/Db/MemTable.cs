@@ -40,6 +40,7 @@ public sealed unsafe class MemTable : IDisposable
     private readonly bool _bytewise;
     private readonly int _arenaBlockSize;
     private readonly ConcurrentArena _arena;
+    private readonly AllocTracker? _memTracker;
     private readonly InlineSkipList<MemTableKeyComparer> _table;
     private readonly InlineSkipList<MemTableKeyComparer> _rangeDelTable;
     private readonly long _maxRangeDeletions;
@@ -98,7 +99,9 @@ public sealed unsafe class MemTable : IDisposable
         _bytewise = comparator.IsBytewise;
         int blockSize = options.GetEffectiveArenaBlockSize();
         _arenaBlockSize = Arena.OptimizeBlockSize(blockSize);
-        _arena = new ConcurrentArena(blockSize);
+        // Memtable memory is reported to the write buffer manager only when it limits memory or charges a cache.
+        if (options.WriteBufferManager is { } wbm && (wbm.Enabled || wbm.CostToCache)) _memTracker = new AllocTracker(wbm);
+        _arena = new ConcurrentArena(blockSize, _memTracker);
         var keyCmp = new MemTableKeyComparer(comparator);
         _table = new InlineSkipList<MemTableKeyComparer>(keyCmp, _arena, options.SkipListMaxHeight, options.SkipListBranchingFactor);
         // range del table must support concurrent inserts
@@ -975,12 +978,22 @@ public sealed unsafe class MemTable : IDisposable
         UpdateFlushState();
     }
 
+    /// <summary>
+    /// The memtable no longer accepts writes (MemTable::MarkImmutable): its memory is scheduled to be freed in the write
+    /// buffer manager (no longer counted as mutable).
+    /// </summary>
+    public void MarkImmutable() => _memTracker?.DoneAllocating();
+
+    /// <summary>Memory reported to the write buffer manager (WBMTrackedMemoryUsage); 0 when not tracked.</summary>
+    internal long WriteBufferManagerTrackedMemory => _memTracker?.BytesAllocated ?? 0;
+
     /// <summary>Releases the arena. Callers must guarantee no reader still uses memtable memory (see <see cref="Unref"/>).</summary>
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
         _arena.Dispose();
+        _memTracker?.FreeMem();
         Interlocked.Exchange(ref OnDisposed, null)?.Invoke();
     }
 

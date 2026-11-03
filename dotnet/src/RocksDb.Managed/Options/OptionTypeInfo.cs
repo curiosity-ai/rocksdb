@@ -250,6 +250,14 @@ internal static class OptionEnumMaps
         ("kEnabled", Managed.OptimizeKeyCommonPrefix.Enabled),
     ]);
 
+    /// <summary>cache_tier_string_map (options/options_helper.cc), DBOptions::lowest_used_cache_tier.</summary>
+    public static readonly EnumMap<Cache.CacheTier> CacheTier = new(
+    [
+        ("kVolatileTier", Cache.CacheTier.VolatileTier),
+        ("kVolatileCompressedTier", Cache.CacheTier.VolatileCompressedTier),
+        ("kNonVolatileBlockTier", Cache.CacheTier.NonVolatileBlockTier),
+    ]);
+
     public static readonly EnumMap<PrepopulateBlockCache> PrepopulateBlockCache = new(
     [
         ("kDisable", Managed.PrepopulateBlockCache.Disable),

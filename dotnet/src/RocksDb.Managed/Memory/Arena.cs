@@ -49,11 +49,15 @@ public sealed unsafe class Arena : Allocator, IDisposable
     private long _blocksMemory;
     private int _irregularBlockNum;
     private bool _disposed;
+    private readonly AllocTracker? _tracker;
 
     public Arena(int blockSize)
     {
         _blockSize = OptimizeBlockSize(blockSize);
     }
+
+    /// <summary>An arena whose block allocations are reported to <paramref name="tracker"/> (Arena(block_size, tracker)).</summary>
+    internal Arena(int blockSize, AllocTracker? tracker) : this(blockSize) => _tracker = tracker;
 
     public Arena() : this(MinBlockSize) { }
 
@@ -148,6 +152,7 @@ public sealed unsafe class Arena : Allocator, IDisposable
         byte[] block = pooled ? ArenaSlabPool.Rent(blockBytes) : GC.AllocateUninitializedArray<byte>(blockBytes, pinned: true);
         _blocks.Add(block);
         _blocksMemory += block.Length;
+        _tracker?.Allocate(block.Length);
         // Pinned (POH) arrays never move, so the address is stable for the lifetime of the array.
         return (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(block));
     }

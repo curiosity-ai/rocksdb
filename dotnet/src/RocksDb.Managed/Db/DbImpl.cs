@@ -45,6 +45,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     {
         DbName = dbname;
         Options = options;
+        InitializeWriteBufferManager();
         SharedTableCache = new TableCacheStore(options.MaxOpenFiles);
         FileSystem = options.FileSystem;
         WalDir = string.IsNullOrEmpty(options.WalDir) ? dbname : options.WalDir.TrimEnd('/');
@@ -697,6 +698,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     public async ValueTask CloseAsync(bool synchronous)
     {
         if (Volatile.Read(ref _disposed) != 0) return;
+        DeregisterFromWriteBufferManager();
         // CancelErrorRecoveryForShutDown: stop automatic recovery first (it needs the write thread and background work).
         await ErrorHandler.EndAutoRecoveryAsync(synchronous).ConfigureAwait(false);
         // force_flush_for_blob_direct_write: blob direct write files are only registered by flushes (WAL recovery of

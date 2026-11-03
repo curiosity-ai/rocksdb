@@ -16,6 +16,9 @@ public sealed class MemTableOptions
     /// <summary>arena_block_size; 0 means "derive from write_buffer_size" (min(1 MiB, write_buffer_size / 8), 4 KiB aligned).</summary>
     public int ArenaBlockSize { get; set; }
 
+    /// <summary>The DB's write buffer manager; memtable arena blocks are reported to it (null: not tracked).</summary>
+    public WriteBufferManager? WriteBufferManager { get; set; }
+
     /// <summary>Skiplist max height (upstream SkipListFactory default 12).</summary>
     public int SkipListMaxHeight { get; set; } = 12;
 

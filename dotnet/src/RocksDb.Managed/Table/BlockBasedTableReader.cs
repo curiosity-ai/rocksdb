@@ -66,6 +66,16 @@ public sealed record TableReaderOptions
     /// <summary>Optional block cache hit/miss counters (may be shared by many readers); null disables recording.</summary>
     public BlockCacheStatistics? Statistics { get; init; }
     /// <summary>
+    /// DBOptions::lowest_used_cache_tier: <see cref="Cache.CacheTier.VolatileTier"/> keeps blocks out of any secondary
+    /// cache of <see cref="BlockCache"/> (they are inserted without secondary-cache callbacks). Default: all tiers.
+    /// </summary>
+    public Cache.CacheTier LowestUsedCacheTier { get; init; } = Cache.CacheTier.NonVolatileBlockTier;
+    /// <summary>
+    /// BlockBasedTableOptions::persistent_cache: consulted before reading a block from the file, filled after a read
+    /// (table/persistent_cache_helper.cc). Null: none.
+    /// </summary>
+    public Cache.PersistentCache? PersistentCache { get; init; }
+    /// <summary>
     /// Largest sequence number of the file as recorded in the MANIFEST, used to resolve the global sequence number
     /// of ingested external files; <see cref="DbFormat.MaxSequenceNumber"/> when unknown.
     /// </summary>
@@ -232,6 +242,8 @@ public sealed partial class BlockBasedTableReader : IDisposable
     private readonly OffsetableCacheKey _baseCacheKey;
     private readonly CachePriority _metaPriority;
     private readonly BlockCacheStatistics? _stats;
+    private readonly Cache.CacheItemHelper[] _helpers;      // per BlockKind (secondary-cache callbacks)
+    private readonly Cache.PersistentCache? _persistentCache;
     private int _disposed;
 
     public Footer Footer => _footer;
@@ -296,6 +308,8 @@ public sealed partial class BlockBasedTableReader : IDisposable
         _baseCacheKey = baseCacheKey;
         _metaPriority = MetaPriority(options);
         _stats = options.Statistics;
+        _helpers = HelpersFor(options);
+        _persistentCache = options.PersistentCache;
 
         IndexType = ReadIndexType(props);
         IndexKeyIncludesSeq = props.IndexKeyIsUserKey == 0;
@@ -543,7 +557,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
                 Block b = indexBlock;
                 if (pinTopLevel && ReadIndexType(props) == IndexType.TwoLevelIndexSearch) b.AddRef();
                 else indexBlock = null;
-                if (metaCache.Insert(baseCacheKey.WithOffsetForMinSizeRecord(indexHandle.Offset), CacheValue.FromObject(b), b.Charge, metaPriority))
+                if (metaCache.Insert(baseCacheKey.WithOffsetForMinSizeRecord(indexHandle.Offset), CacheValue.FromObject(b).WithHelper(HelpersFor(options)[(int)BlockKind.Index]), b.Charge, metaPriority))
                     RecordAdd(options.Statistics, BlockKind.Index, b.Charge);
             }
 
@@ -581,7 +595,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
                 {
                     if (pinTopLevel) top.AddRef();
                     else filterIndex = null;
-                    if (metaCache.Insert(baseCacheKey.WithOffsetForMinSizeRecord(fh.Offset), CacheValue.FromObject(top), top.Charge, metaPriority))
+                    if (metaCache.Insert(baseCacheKey.WithOffsetForMinSizeRecord(fh.Offset), CacheValue.FromObject(top).WithHelper(HelpersFor(options)[(int)BlockKind.Filter]), top.Charge, metaPriority))
                         RecordAdd(options.Statistics, BlockKind.Filter, top.Charge);
                 }
             }
@@ -597,7 +611,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
                 {
                     byte[] fb = filterBuf;
                     filterBuf = null;
-                    if (metaCache.Insert(baseCacheKey.WithOffsetForMinSizeRecord(fh.Offset), new CacheValue(fb, flen, filter, true), fb.Length, metaPriority))
+                    if (metaCache.Insert(baseCacheKey.WithOffsetForMinSizeRecord(fh.Offset), new CacheValue(fb, flen, filter, true).WithHelper(FilterHelperFor(options)), fb.Length, metaPriority))
                         RecordAdd(options.Statistics, BlockKind.Filter, fb.Length);
                     filter = null;
                 }
@@ -733,7 +747,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         if (cache is not null)
         {
             CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
-            if (cache.TryLookup(key, out CachedBlock h))
+            if (LookupCache(cache, key, kind, out CachedBlock h))
             {
                 _stats?.Record(HitCounter(kind));
                 return BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h);
@@ -755,7 +769,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         if (cache is not null)
         {
             key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
-            if (cache.TryLookup(key, out CachedBlock h))
+            if (LookupCache(cache, key, kind, out CachedBlock h))
             {
                 _stats?.Record(HitCounter(kind));
                 return BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h);
@@ -821,7 +835,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     {
         _stats?.Record(MissCounter(kind));
         ChargeRateLimiter(handle, flags);
-        Block b = Protect(BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind);
+        Block b = Protect(ReadBlockFromFile(handle, kind), kind);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
 
@@ -831,7 +845,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         if (legacy is null)
         {
             ChargeRateLimiter(handle, flags);
-            return BlockRef.FromOwned(Protect(BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind));
+            return BlockRef.FromOwned(Protect(ReadBlockFromFile(handle, kind), kind));
         }
         var key = new BlockCacheKey(_tableId, handle.Offset);
         if (legacy.TryGet(key, out Block? b))
@@ -841,7 +855,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         }
         _stats?.Record(MissCounter(kind));
         ChargeRateLimiter(handle, flags);
-        b = Protect(BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind);
+        b = Protect(ReadBlockFromFile(handle, kind), kind);
         if ((flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(key, b);
         return BlockRef.FromOwned(b);
     }
@@ -850,7 +864,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     {
         CachePriority priority = kind == BlockKind.Data ? CachePriority.Low : _metaPriority;
         // On success the cache takes over our reference (released through Block's IDisposable when the entry is freed).
-        if (cache.TryInsert(key, CacheValue.FromObject(b), b.Charge, priority, out CachedBlock h))
+        if (cache.TryInsert(key, CacheValue.FromObject(b).WithHelper(_helpers[(int)kind]), b.Charge, priority, out CachedBlock h))
         {
             RecordAdd(_stats, kind, b.Charge);
             return BlockRef.FromCache(b, h);
@@ -867,6 +881,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         if (cache is not null)
         {
             CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
+            if (cache.ExtendedLookup) return GetBlockRefExtendedAsync(cache, key, handle, kind, flags, ct);
             if (cache.TryLookup(key, out CachedBlock h))
             {
                 _stats?.Record(HitCounter(kind));
@@ -892,7 +907,8 @@ public sealed partial class BlockBasedTableReader : IDisposable
     private async ValueTask<BlockRef> ReadAndInsertAsync(BlockCache cache, CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags, CancellationToken ct)
     {
         await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
-        Block b = Protect(await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false), kind);
+        Block b = Protect(_persistentCache is not null ? ReadBlockFromFile(handle, kind)
+            : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false), kind);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
 
@@ -900,7 +916,8 @@ public sealed partial class BlockBasedTableReader : IDisposable
     private async ValueTask<BlockRef> ReadAndInsertLegacyAsync(BlockHandle handle, BlockKind kind, TableReadFlags flags, CancellationToken ct)
     {
         await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
-        Block b = Protect(await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false), kind);
+        Block b = Protect(_persistentCache is not null ? ReadBlockFromFile(handle, kind)
+            : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false), kind);
         if (_legacyCache is { } legacy && (flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(new BlockCacheKey(_tableId, handle.Offset), b);
         return BlockRef.FromOwned(b);
     }
@@ -1243,7 +1260,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         if (cache is not null)
         {
             key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
-            if (cache.TryLookup(key, out CachedBlock h))
+            if (LookupFilterCache(cache, key, out CachedBlock h))
             {
                 _stats?.Record(BlockCacheCounter.FilterHit);
                 bool r = Unsafe.As<IFilterBitsReader>(h.Value)!.MayMatch(entry);
@@ -1269,7 +1286,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         {
             ArrayPool<byte>.Shared.Return(buf);
         }
-        else if (cache.Insert(key, new CacheValue(buf, len, reader, true), buf.Length, _metaPriority))
+        else if (cache.Insert(key, new CacheValue(buf, len, reader, true).WithHelper(FilterHelperFor(_options)), buf.Length, _metaPriority))
         {
             RecordAdd(_stats, BlockKind.Filter, buf.Length);
         }

@@ -58,6 +58,13 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     /// Null (the default) computes none. Persisted by name.
     /// </summary>
     public FileChecksumGenFactory? FileChecksumGenFactory { get; set; }
+    /// <summary>
+    /// Memtable memory budget shared by DBs and column families (rocksdb::DBOptions::write_buffer_manager): flushes are
+    /// triggered when the budget is exceeded, writes may stall, and memtable memory may be charged to a block cache. Null
+    /// (the default) gives the DB a private manager of <see cref="DbWriteBufferSize"/> bytes (no limit when 0), like
+    /// SanitizeOptions. Not persisted.
+    /// </summary>
+    public WriteBufferManager? WriteBufferManager { get; set; }
 
     // ---- persisted ---------------------------------------------------------------------------
     public bool CreateIfMissing { get; set; }
@@ -108,7 +115,17 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     public bool PersistStatsToDisk { get; set; }
     public ulong StatsHistoryBufferSize { get; set; } = 1024 * 1024;
     public bool AdviseRandomOnOpen { get; set; } = true;
+    /// <summary>
+    /// db_write_buffer_size: total memtable memory of all column families of this DB before flushes are triggered, used for
+    /// the DB's own <see cref="Managed.WriteBufferManager"/> when <see cref="WriteBufferManager"/> is null. 0 (default):
+    /// no limit.
+    /// </summary>
     public ulong DbWriteBufferSize { get; set; }
+    /// <summary>
+    /// lowest_used_cache_tier: <see cref="Cache.CacheTier.VolatileTier"/> keeps table blocks out of the block cache's
+    /// secondary cache; the default uses every configured tier.
+    /// </summary>
+    public Cache.CacheTier LowestUsedCacheTier { get; set; } = Cache.CacheTier.NonVolatileBlockTier;
     public ulong CompactionReadaheadSize { get; set; } = 2 * 1024 * 1024;
     public ulong WritableFileMaxBufferSize { get; set; } = 1024 * 1024;
     public bool UseAdaptiveMutex { get; set; }
@@ -249,6 +266,7 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
         .Add("file_checksum_gen_factory", static o => o.FileChecksumGenFactory?.Name ?? "",
             static (o, v) => o.FileChecksumGenFactory = OptionStrings.UnwrapId(v) == FileChecksumGenCrc32cFactory.ClassName ? FileChecksumGenCrc32cFactory.Instance : null)
         .Bool("enforce_single_del_contracts", static o => o.EnforceSingleDelContracts, static (o, v) => o.EnforceSingleDelContracts = v)
+        .Enum("lowest_used_cache_tier", OptionEnumMaps.CacheTier, static o => o.LowestUsedCacheTier, static (o, v) => o.LowestUsedCacheTier = v)
         .Enum("info_log_level", OptionEnumMaps.InfoLogLevel, static o => o.InfoLogLevel, static (o, v) => o.InfoLogLevel = v);
 
     internal override OptionTable<DbOptions> OptionTable => s_table;
@@ -276,7 +294,8 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     public DbOptions Clone()
     {
         var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir, FileSystem = FileSystem, Statistics = Statistics, InfoLog = InfoLog,
-            RateLimiter = RateLimiter, SstFileManager = SstFileManager, FileChecksumGenFactory = FileChecksumGenFactory };
+            RateLimiter = RateLimiter, SstFileManager = SstFileManager, FileChecksumGenFactory = FileChecksumGenFactory,
+            WriteBufferManager = WriteBufferManager };
         c.DbPaths.AddRange(DbPaths);
         c.Listeners.AddRange(Listeners);
         c.CopyFrom(this);

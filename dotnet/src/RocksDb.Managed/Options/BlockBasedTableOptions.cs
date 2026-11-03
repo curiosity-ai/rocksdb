@@ -63,6 +63,12 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
     /// all column families of that database.
     /// </summary>
     public Cache.BlockCache? BlockCache { get; set; }
+    /// <summary>
+    /// persistent_cache (legacy upstream; not persisted): a cache of blocks consulted before reading a block from its
+    /// file, e.g. <see cref="Cache.PersistentCache.Create"/> (a file-based tier) or a <see cref="Cache.VolatileCacheTier"/>.
+    /// Null (the default): none.
+    /// </summary>
+    public Cache.PersistentCache? PersistentCache { get; set; }
     /// <summary>block_align: pad data blocks to min(block_size, 4 KiB) (block_size must be a power of 2; requires no compression).</summary>
     public bool BlockAlign { get; set; }
     /// <summary>
@@ -151,6 +157,7 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
         var c = new BlockBasedTableOptions();
         c.CopyFrom(this);
         c.BlockCache = BlockCache;
+        c.PersistentCache = PersistentCache;
         c._filterPolicy = _filterPolicy;
         return c;
     }

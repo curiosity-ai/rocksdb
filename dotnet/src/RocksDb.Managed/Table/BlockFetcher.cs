@@ -183,6 +183,18 @@ internal static class BlockFetcher
         return Block.Create(buf, size, rentedFromSharedPool: true);
     }
 
+    /// <summary>
+    /// Verifies and unpacks a serialized block (payload + trailer) held by the caller, e.g. from a persistent cache
+    /// (BlockFetcher's ProcessTrailerIfPresent + decompression on a serialized persistent cache hit).
+    /// </summary>
+    internal static Block ProcessSerializedCopy(ReadOnlySpan<byte> serialized, in Footer footer, BlockHandle handle, bool verifyChecksums,
+        CompressionDictionary? dictionary)
+    {
+        byte[] buf = BlockBufferPool.Rent(Math.Max(serialized.Length, 1));
+        serialized.CopyTo(buf);
+        return ProcessSerialized(buf, footer, handle, verifyChecksums, dictionary, BlockBufferSource.BlockBufferPool);
+    }
+
     /// <summary>Takes ownership of <paramref name="buf"/> (rented from <paramref name="source"/>) holding payload + trailer.</summary>
     private static Block ProcessSerialized(byte[] buf, in Footer footer, BlockHandle handle, bool verifyChecksums, CompressionDictionary? dictionary,
         BlockBufferSource source)

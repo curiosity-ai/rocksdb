@@ -43,9 +43,12 @@ public sealed unsafe class ConcurrentArena : Allocator, IDisposable
     private long _memoryAllocatedBytes;
     private int _irregularBlockNum;
 
-    public ConcurrentArena(int blockSize)
+    public ConcurrentArena(int blockSize) : this(blockSize, null) { }
+
+    /// <summary>An arena reporting its blocks to <paramref name="tracker"/> (ConcurrentArena(block_size, tracker)).</summary>
+    internal ConcurrentArena(int blockSize, AllocTracker? tracker)
     {
-        _arena = new Arena(blockSize);
+        _arena = new Arena(blockSize, tracker);
         _shardBlockSize = Math.Min(MaxShardBlockSize, _arena.BlockSize / 8);
         int n = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(1, Environment.ProcessorCount));
         _shards = new Shard[n];

@@ -55,10 +55,11 @@ public sealed class Statistics
     private readonly HistogramImpl[] _histograms;
 
     /// <summary>Block cache / filter counters fed by the table readers of DBs using this instance.</summary>
-    internal readonly BlockCacheStatistics BlockCacheCounters = new();
+    internal readonly BlockCacheStatistics BlockCacheCounters;
 
     public Statistics()
     {
+        BlockCacheCounters = new BlockCacheStatistics { Owner = this };
         _histograms = new HistogramImpl[StatisticsNames.HistogramCount];
         for (int i = 0; i < _histograms.Length; i++) _histograms[i] = new HistogramImpl();
     }

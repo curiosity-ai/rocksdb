@@ -315,6 +315,7 @@ public static class TableFactory
             NumFileReadsForAutoReadahead = t.NumFileReadsForAutoReadahead,
         };
         if (cache is not null) r = r with { BlockCache = cache };
+        if (t.PersistentCache is not null) r = r with { PersistentCache = t.PersistentCache };
         return r;
     }
 }

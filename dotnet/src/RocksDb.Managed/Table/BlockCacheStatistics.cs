@@ -51,6 +51,12 @@ public sealed class BlockCacheStatistics
     private const int NumStripes = 16;       // power of two
     private readonly long[] _counters = new long[NumStripes * NumCounters];
 
+    /// <summary>
+    /// The DB statistics these counters belong to (set by <see cref="Managed.Statistics"/>): secondary / persistent /
+    /// simulation cache tickers are recorded there.
+    /// </summary>
+    internal Statistics? Owner { get; init; }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void Record(BlockCacheCounter counter) => Add(counter, 1);
 

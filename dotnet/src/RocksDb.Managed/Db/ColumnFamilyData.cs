@@ -107,6 +107,7 @@ internal sealed class ColumnFamilyData
             WriteBufferSize = (long)Math.Min(options.WriteBufferSize, (ulong)long.MaxValue),
             ArenaBlockSize = (int)Math.Min(options.ArenaBlockSize, int.MaxValue / 2),
             TrackNewestTimestampSize = options.PersistUserDefinedTimestamps ? 0 : TimestampSize,
+            WriteBufferManager = db.WriteBufferManager,
         };
         MemOptions.ApplyColumnFamilyOptions(options);
         TableCache = new TableCache(db.SharedTableCache, db.FileSystem, db.DbPaths, ReaderOptions)
@@ -259,6 +260,7 @@ internal sealed class ColumnFamilyData
         TableReaderOptions r = TableFactory.CreateReaderOptions(options, format, db.GetDefaultBlockCache(options.TableOptions), db.Identity.SessionId);
         if (db.Options.Statistics is { } statistics) r = r with { Statistics = statistics.BlockCacheCounters };
         if (db.Options.RateLimiter is { } rateLimiter) r = r with { RateLimiter = rateLimiter };
+        if (db.Options.LowestUsedCacheTier != Cache.CacheTier.NonVolatileBlockTier) r = r with { LowestUsedCacheTier = db.Options.LowestUsedCacheTier };
         return r;
     }
 
