@@ -1132,8 +1132,8 @@ Format-level deviations (the output is always readable by native RocksDB):
 
 Not ported yet (being implemented; tracked in [todo.md](todo.md)):
 
-- Ingesting PlainTable / CuckooTable external files, and the `trie_index` user-defined index (native trie-index files
-  are read through their standard index).
+- Ingesting PlainTable / CuckooTable external files: they are opened, but rejected by upstream's comparator / version
+  checks, exactly as native RocksDB rejects its own.
 - Secondary caches (CompressedSecondaryCache, TieredCache), the persistent cache, `WriteBufferManager` and `SimCache`.
 - Remote compaction of compactions with blob files, and per-subcompaction remote jobs (such compactions run locally).
 - Query, block cache and I/O tracing (and replay); `ldb` / `sst_dump` equivalents.

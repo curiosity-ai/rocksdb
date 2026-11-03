@@ -262,7 +262,8 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 ## Missing features wave (2026-11-03, requested)
 
 - [x] PlainTable + CuckooTable (read/write, byte-identical regions vs native SstFileWriter, OPTIONS sections), adaptive reading by magic, user-defined index API
-- [ ] ingesting PlainTable/Cuckoo external files (ingestion still opens files as block-based) (S); trie_index factory (utilities/trie_index, ~17k lines; native trie-index files read through their standard index) (L)
+- [x] trie_index user-defined index (byte-identical trie blocks vs native 11.12, each side reads the other's through the trie, 0-alloc Gets); ingestion opens any table format and applies upstream's checks (plain/cuckoo files are rejected by the comparator/version checks, exactly as native rejects its own)
+- [ ] OPTIONS `user_defined_index_factory=trie_index` interpreted into a factory (kept as text today) (S)
 - [~] Cache layers: secondary cache (CompressedSecondaryCache, TieredCache), persistent cache, WriteBufferManager (cross-DB/CF memtable budget, cache charging, stalls), SimCache
 - [x] Column family export/import, remote compaction (CompactionService + OpenAndCompact; job/result format interoperates with native both ways), GetMergeOperands, PromoteL0, SuggestCompactRange, DeleteFilesInRange(s), LockWAL, Disable/EnableManualCompaction, GetCreationTimeOfOldestFile, ClipColumnFamily, GetPropertiesOfTablesInRange, OpenAndTrimHistory (compat vs native), MultiScan
 - [ ] remote compaction: per-subcompaction jobs, blob compactions on the worker, paranoid_hash (S/M)
