@@ -948,8 +948,6 @@ Not ported yet:
 - PlainTable and CuckooTable, parallel compression.
 - Wide-column entities with blob-backed columns (V2) and blob direct write (forced blob GC is leveled-only, as
   upstream).
-- `unordered_write` is accepted, but writes stay ordered (pipelined writes and concurrent memtable inserts are
-  supported).
 
 API and behavior differences:
 

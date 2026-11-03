@@ -148,6 +148,15 @@ as flush, ingestion and close, writers whose callback disallows batching) first 
 rejected with two write queues and seq_per_batch (NotSupported at write time) and with `unordered_write` or `atomic_flush`
 (InvalidArgument at open).
 
+`unordered_write` (`DbImpl.UnorderedWrite.cs`, upstream's WriteImplWALOnly with kDoPublishLastSeq + UnorderedWriteMemtable):
+the write group on the main queue only does PreprocessWrite, callbacks, sequence allocation, the WAL record, pre-release
+callbacks and the publication of its last sequence, counts its memtable writers in `pending_memtable_writes_` and hands
+leadership on; each writer then inserts its own batch concurrently. Memtable switches in PreprocessWrite and every
+unbatched leader wait until no insert is pending (`WaitForPendingWrites`, a `TaskCompletionSource` completed by the
+writer that counts down to 0). Snapshots are not immutable in this mode (documented upstream): a published sequence may
+still have inserts in flight. Requires allow_concurrent_memtable_write; incompatible with pipelined writes and
+max_successive_merges (InvalidArgument at open); TransactionDB accepts it only for WritePrepared with two write queues.
+
 Followers wait in one of two ways:
 
 - **async writers** (`PutAsync`, `WriteAsync`) wait on a pooled `IValueTaskSource`

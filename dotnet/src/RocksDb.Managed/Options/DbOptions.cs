@@ -118,6 +118,15 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     public bool EnableThreadTracking { get; set; }
     public ulong DelayedWriteRate { get; set; } = 16 * 1024 * 1024;
     public bool EnablePipelinedWrite { get; set; }
+    /// <summary>
+    /// unordered_write: trades higher write throughput for weaker snapshot guarantees. A write's sequence number becomes
+    /// visible once its WAL write group finished, while its memtable insert (and the inserts of other writes with lower
+    /// sequence numbers) may still be in flight. Writes issued after a snapshot stay invisible to it, and a writer reads
+    /// its own write once the call returned, but a snapshot (and therefore Get, MultiGet and iterators at that snapshot)
+    /// may change as pending writes with lower sequence numbers land. Requires <see cref="AllowConcurrentMemtableWrite"/>;
+    /// incompatible with <see cref="EnablePipelinedWrite"/> and <c>max_successive_merges</c> &gt; 0. Use a WritePrepared
+    /// TransactionDatabase with <see cref="TwoWriteQueues"/> to keep immutable snapshots.
+    /// </summary>
     public bool UnorderedWrite { get; set; }
     public bool AllowConcurrentMemtableWrite { get; set; } = true;
     public bool EnableWriteThreadAdaptiveYield { get; set; } = true;
