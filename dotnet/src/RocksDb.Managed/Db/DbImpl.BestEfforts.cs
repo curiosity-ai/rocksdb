@@ -60,7 +60,7 @@ internal sealed partial class DbImpl
                 IRandomAccessFile file = _db.FileSystem.OpenRandomAccess(path);
                 try
                 {
-                    BlockBasedTableReader.Open(file, opts).Dispose();
+                    TableReaderFactory.Open(file, opts with { AllowMmapReads = _db.Options.AllowMmapReads }).Dispose();
                 }
                 catch
                 {

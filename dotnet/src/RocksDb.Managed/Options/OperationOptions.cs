@@ -42,6 +42,11 @@ public sealed class ReadOptions
     public bool TotalOrderSeek { get; set; }
     public bool AutoPrefixMode { get; set; }
     public bool PrefixSameAsStart { get; set; }
+    /// <summary>
+    /// read_index (EXPERIMENTAL): which index of block-based tables with a user-defined index serves the read
+    /// (<see cref="Managed.ReadIndex"/>; see <see cref="BlockBasedTableOptions.UserDefinedIndexFactory"/>).
+    /// </summary>
+    public ReadIndex ReadIndex { get; set; }
     public bool PinData { get; set; }
     public bool AdaptiveReadahead { get; set; }
     public bool BackgroundPurgeOnIteratorCleanup { get; set; }

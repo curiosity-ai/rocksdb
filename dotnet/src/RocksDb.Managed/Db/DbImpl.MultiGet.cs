@@ -209,7 +209,9 @@ internal sealed partial class DbImpl
                     if (cov > ctx.MaxCoveringTombstoneSeq) ctx.MaxCoveringTombstoneSeq = cov;
                 }
             }
-            t = lease.Reader.MultiGetAsync(batch, sub, count, batch.MayMatch, batch.ReadFlags, synchronous, cancellationToken);
+            t = lease.Reader is BlockBasedTableReader bbt
+                ? bbt.MultiGetAsync(batch, sub, count, batch.MayMatch, batch.ReadFlags, synchronous, cancellationToken)
+                : lease.Reader.MultiGetAsync(batch, sub, count, batch.MayMatch, batch.ReadFlags, synchronous, cancellationToken);
             if (t.IsCompleted)
             {
                 lease.Dispose();

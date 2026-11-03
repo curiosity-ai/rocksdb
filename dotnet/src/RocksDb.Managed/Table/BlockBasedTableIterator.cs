@@ -20,6 +20,12 @@ internal sealed class IndexCursor
     private BlockRef _partRef;
     private bool _partitioned;
     private TableReadFlags _flags;
+    // User-defined index routing (IndexFactoryReaderWrapper / IndexFactoryIteratorWrapper,
+    // table/block_based/user_defined_index_wrapper.h): when set, every move goes through the custom index.
+    private UserDefinedIndexIterator? _udi;
+    private bool _udiValid;
+    private byte[] _udiKey = new byte[64];
+    private int _udiKeyLength;
 
     public static IndexCursor Rent(BlockBasedTableReader reader, TableReadFlags flags)
     {
@@ -41,15 +47,47 @@ internal sealed class IndexCursor
         ReleaseTop();
         _reader = reader;
         _flags = flags;
+        _udi = reader.NewUserDefinedIndexIterator(flags);
+        if (_udi is not null)
+        {
+            _udiValid = false;
+            _partitioned = false;
+            return;
+        }
         _partitioned = reader.IsPartitionedIndex;
         _topRef = reader.GetIndexBlockRef(flags);
         reader.InitIndexIter(_top, _topRef.Block!, isPartition: false);
+    }
+
+    /// <summary>
+    /// UpdateValidAndKey of IndexFactoryIteratorWrapper: the separator as the index key form of the table (internal key
+    /// with seq 0 / kTypeValue when the standard index keys include the sequence, else the user key).
+    /// </summary>
+    private void UdiUpdate(bool valid)
+    {
+        _udiValid = valid;
+        if (!valid) return;
+        ReadOnlySpan<byte> sep = _udi!.Key;
+        int n = _reader.IndexKeyIncludesSeq ? sep.Length + Db.DbFormat.InternalKeyFooterSize : sep.Length;
+        if (_udiKey.Length < n) _udiKey = new byte[Math.Max(n, _udiKey.Length * 2)];
+        if (_reader.IndexKeyIncludesSeq) Db.DbFormat.AppendInternalKey(_udiKey, sep, 0, Db.EntryType.Value);
+        else sep.CopyTo(_udiKey);
+        _udiKeyLength = n;
+    }
+
+    private void UdiSeek(ReadOnlySpan<byte> target)
+    {
+        if (target.Length < Db.DbFormat.InternalKeyFooterSize) ThrowHelper.Corruption("Invalid internal key (too short)");
+        UdiUpdate(_udi!.Seek(Db.DbFormat.ExtractUserKey(target), Db.DbFormat.ExtractFooter(target)));
     }
 
     public void Reset()
     {
         UnloadPartition();
         ReleaseTop();
+        _udi?.Dispose();
+        _udi = null;
+        _udiValid = false;
         _reader = null!;
     }
 
@@ -70,14 +108,19 @@ internal sealed class IndexCursor
     public bool Valid
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _partitioned ? !_partRef.IsEmpty && _part.Valid : _top.Valid;
+        get => _udi is not null ? _udiValid : _partitioned ? !_partRef.IsEmpty && _part.Valid : _top.Valid;
     }
 
-    public BlockHandle Handle => _partitioned ? _part.BlockHandle : _top.BlockHandle;
-    public ReadOnlySpan<byte> Key { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _partitioned ? _part.Key : _top.Key; }
+    public BlockHandle Handle => _udi is not null ? _udi.Value : _partitioned ? _part.BlockHandle : _top.BlockHandle;
+    public ReadOnlySpan<byte> Key
+    {
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        get => _udi is not null ? _udiKey.AsSpan(0, _udiKeyLength) : _partitioned ? _part.Key : _top.Key;
+    }
 
     public void Seek(ReadOnlySpan<byte> target)
     {
+        if (_udi is not null) { UdiSeek(target); return; }
         _top.Seek(target);
         if (!_partitioned) return;
         if (!_top.Valid) { UnloadPartition(); return; }
@@ -93,6 +136,7 @@ internal sealed class IndexCursor
     /// </summary>
     public void SeekForGet(ReadOnlySpan<byte> target)
     {
+        if (_udi is not null) { UdiSeek(target); return; }
         if (!_partitioned && _reader.TryGetPrefixBlocks(target, out ReadOnlySpan<uint> blocks))
         {
             _top.PrefixSeek(target, blocks);
@@ -103,6 +147,7 @@ internal sealed class IndexCursor
 
     public void SeekToFirst()
     {
+        if (_udi is not null) { UdiUpdate(_udi.SeekToFirst()); return; }
         _top.SeekToFirst();
         if (!_partitioned) return;
         if (!_top.Valid) { UnloadPartition(); return; }
@@ -113,6 +158,7 @@ internal sealed class IndexCursor
 
     public void SeekToLast()
     {
+        if (_udi is not null) { UdiUpdate(_udi.SeekToLast()); return; }
         _top.SeekToLast();
         if (!_partitioned) return;
         if (!_top.Valid) { UnloadPartition(); return; }
@@ -124,6 +170,7 @@ internal sealed class IndexCursor
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Next()
     {
+        if (_udi is not null) { UdiUpdate(_udi.Next()); return; }
         if (!_partitioned) { _top.Next(); return; }
         _part.Next();
         SkipEmptyForward();
@@ -131,6 +178,7 @@ internal sealed class IndexCursor
 
     public void Prev()
     {
+        if (_udi is not null) { UdiUpdate(_udi.Prev()); return; }
         if (!_partitioned) { _top.Prev(); return; }
         _part.Prev();
         SkipEmptyBackward();
@@ -172,6 +220,7 @@ internal sealed class IndexCursor
 
     public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken ct)
     {
+        if (_udi is not null) { UdiSeek(target.Span); return ValueTask.CompletedTask; }
         _top.Seek(target.Span);
         return AfterTopMoveAsync(PartOp.Seek, target, ct);
     }
@@ -179,6 +228,7 @@ internal sealed class IndexCursor
     /// <summary>Async <see cref="SeekForGet"/> (the hash index prefix seek is in memory).</summary>
     public ValueTask SeekForGetAsync(ReadOnlyMemory<byte> target, CancellationToken ct)
     {
+        if (_udi is not null) { UdiSeek(target.Span); return ValueTask.CompletedTask; }
         if (!_partitioned && _reader.TryGetPrefixBlocks(target.Span, out ReadOnlySpan<uint> blocks))
         {
             _top.PrefixSeek(target.Span, blocks);
@@ -189,18 +239,21 @@ internal sealed class IndexCursor
 
     public ValueTask SeekToFirstAsync(CancellationToken ct)
     {
+        if (_udi is not null) { SeekToFirst(); return ValueTask.CompletedTask; }
         _top.SeekToFirst();
         return AfterTopMoveAsync(PartOp.First, default, ct);
     }
 
     public ValueTask SeekToLastAsync(CancellationToken ct)
     {
+        if (_udi is not null) { SeekToLast(); return ValueTask.CompletedTask; }
         _top.SeekToLast();
         return AfterTopMoveAsync(PartOp.Last, default, ct);
     }
 
     public ValueTask NextAsync(CancellationToken ct)
     {
+        if (_udi is not null) { Next(); return ValueTask.CompletedTask; }
         if (!_partitioned)
         {
             _top.Next();
@@ -212,6 +265,7 @@ internal sealed class IndexCursor
 
     public ValueTask PrevAsync(CancellationToken ct)
     {
+        if (_udi is not null) { Prev(); return ValueTask.CompletedTask; }
         if (!_partitioned)
         {
             _top.Prev();

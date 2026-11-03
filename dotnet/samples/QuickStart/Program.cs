@@ -22,6 +22,7 @@ internal static class Program
         ("Snapshots", Reading.Snapshots),
         ("MergeOperators", Reading.MergeOperators),
         ("PrefixSeek", Reading.PrefixSeek),
+        ("TableFormats", Reading.TableFormats),
         ("Compaction", Maintenance.Compaction),
         ("OptimisticTransactions", Transactions.Optimistic),
         ("PessimisticTransactions", Transactions.Pessimistic),

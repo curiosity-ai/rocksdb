@@ -89,7 +89,7 @@ internal static class FlushJob
         bool keep = false;
         try
         {
-            using (var builder = new BlockBasedTableBuilder(file, cfd.Format, tbo))
+            using (TableBuilder builder = TableBuilder.Create(file, cfd.Format, tbo))
             {
                 ulong smallestPreferredSeqno = DbFormat.MaxSequenceNumber;
                 FragmentedRangeTombstoneList? tombstones = FragmentRangeTombstones(cfd, mems, stripTimestamps);
@@ -185,7 +185,7 @@ internal static class FlushJob
     }
 
     /// <summary>Returns the smallest preferred seqno assigned to a TimedPut entry (kMaxSequenceNumber if none).</summary>
-    private static ulong AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
+    private static ulong AddPointEntries(TableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
         ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder, Blob.BlobGarbageMeter? blobOutflow, SeqnoToTimeMapping? seqnoToTimeMapping)
     {
         Util.PooledBufferWriter? blobIndex = blobBuilder is null ? null : new Util.PooledBufferWriter(Blob.BlobIndex.MaxEncodedLength);
@@ -217,7 +217,7 @@ internal static class FlushJob
         private Util.PooledBufferWriter? _key;
         private Util.PooledBufferWriter? _value;
 
-        public void Add(BlockBasedTableBuilder builder, ReadOnlySpan<byte> key, ulong seq, ReadOnlySpan<byte> packedValue)
+        public void Add(TableBuilder builder, ReadOnlySpan<byte> key, ulong seq, ReadOnlySpan<byte> packedValue)
         {
             _key ??= new Util.PooledBufferWriter(64);
             _value ??= new Util.PooledBufferWriter(64);
@@ -253,7 +253,7 @@ internal static class FlushJob
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void AddPointEntries(BlockBasedTableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
+    private static void AddPointEntries(TableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
         ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder, Util.PooledBufferWriter? blobIndex, Util.PooledBufferWriter? blobKey,
         Blob.EntityBlobRewriter? entities, Blob.BlobGarbageMeter? blobOutflow, ref TimedPutRewriter timed)
     {
@@ -345,12 +345,12 @@ internal static class FlushJob
     }
 
     /// <summary>
-    /// Flush with timestamps in memtable only: the k-way merge of <see cref="AddPointEntries(BlockBasedTableBuilder, InternalKeyComparator, IReadOnlyList{MemTable}, FileMetaData, Blob.BlobFileBuilder?)"/>
+    /// Flush with timestamps in memtable only: the k-way merge of <see cref="AddPointEntries(TableBuilder, InternalKeyComparator, IReadOnlyList{MemTable}, FileMetaData, Blob.BlobFileBuilder?)"/>
     /// over upstream's TimestampStrippingIterator (each key's timestamp replaced by the minimum timestamp,
     /// ReplaceInternalKeyWithMinTimestamp) followed by the hidden-version rule of the flush-time CompactionIterator.
     /// <paramref name="snapshots"/> are the live snapshot sequence numbers, ascending. Cold path (allocates per flush).
     /// </summary>
-    private static void AddPointEntriesWithMinTimestamp(BlockBasedTableBuilder builder, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
+    private static void AddPointEntriesWithMinTimestamp(TableBuilder builder, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
         FileMetaData meta, Blob.BlobFileBuilder? blobBuilder, ulong[] snapshots, FragmentedRangeTombstoneList? tombstones)
     {
         InternalKeyComparator icmp = cfd.Icmp;
@@ -502,7 +502,7 @@ internal static class FlushJob
     /// Adds an entity to the flush output: CompactionIterator::ExtractLargeColumnValuesIfNeeded when the output gets
     /// blob files (flush runs through a CompactionIterator upstream), then the blob part of UpdateBoundaries.
     /// </summary>
-    private static void AddEntity(BlockBasedTableBuilder builder, FileMetaData meta, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity,
+    private static void AddEntity(TableBuilder builder, FileMetaData meta, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity,
         Blob.BlobFileBuilder? blobBuilder, Blob.EntityBlobRewriter? entities)
     {
         if (blobBuilder is not null && entities!.TryExtract(blobBuilder, DbFormat.ExtractUserKey(key), entity)) entity = entities.Output;
@@ -557,7 +557,7 @@ internal static class FlushJob
     /// Writes the fragmented range tombstones (every fragment with every covering sequence number, in internal key order)
     /// and extends the file boundaries like FileMetaData::UpdateBoundariesForRange.
     /// </summary>
-    private static void AddRangeTombstones(BlockBasedTableBuilder builder, ColumnFamilyData cfd, FragmentedRangeTombstoneList frag, FileMetaData meta)
+    private static void AddRangeTombstones(TableBuilder builder, ColumnFamilyData cfd, FragmentedRangeTombstoneList frag, FileMetaData meta)
     {
         InternalKeyComparator icmp = cfd.Icmp;
         int tsSize = frag.TimestampSize;

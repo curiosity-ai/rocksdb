@@ -30,7 +30,7 @@ namespace RocksDb.Managed.Table;
 /// The file is not closed by the builder.
 /// </para>
 /// </summary>
-public sealed partial class BlockBasedTableBuilder : IDisposable
+public sealed partial class BlockBasedTableBuilder : TableBuilder
 {
     /// <summary>Staged output is handed to the file once it exceeds this many bytes.</summary>
     private const int OutputFlushThreshold = 256 * 1024;
@@ -80,10 +80,15 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     /// Port of BlockBasedTableBuilder::NeedCompact: a user table properties collector asks for the file to be compacted
     /// (sets FileMetaData::marked_for_compaction). Valid after <see cref="Finish"/>.
     /// </summary>
-    public bool NeedCompact => _collectors is not null && _collectors.NeedCompact;
+    public override bool NeedCompact => _collectors is not null && _collectors.NeedCompact;
     private readonly int _compressionLevel;
     private readonly int _maxCompressedBytesPerKb;
     private ulong _offset;
+    // The user-defined index built alongside (or instead of) the standard index (Rep::custom_indexes; one factory).
+    private readonly UserDefinedIndexBuilder? _udi;
+    private readonly string? _udiName;
+    private readonly bool _customOnly;
+    private readonly PooledBufferWriter? _udiNextKey;
     private uint _compressionTypesUsed; // bitset over CompressionType values (< 32)
     private bool _closed;
 
@@ -215,7 +220,55 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
             while (v == 0) v = (uint)RandomNumberGenerator.GetInt32(int.MinValue, int.MaxValue);
             _baseContextChecksum = v;
         }
-        MaybeStartParallelCompression();
+        // Port of the index_mode validation and custom index setup of Rep::Rep (block_based_table_builder.cc).
+        BlockBasedIndexMode mode = options.IndexMode;
+        if (mode is BlockBasedIndexMode.CustomDefault or BlockBasedIndexMode.CustomOnly && options.UserDefinedIndexFactory is null)
+            ThrowHelper.InvalidArgument("index_mode kCustomDefault/kCustomOnly requires user_defined_index_factory to be set");
+        if (mode == BlockBasedIndexMode.CustomOnly && options.FormatVersion < 6)
+            ThrowHelper.InvalidArgument("index_mode kCustomOnly requires format_version >= 6; got " + options.FormatVersion);
+        if (mode != BlockBasedIndexMode.StandardOnly && options.UserDefinedIndexFactory is { } udiFactory)
+        {
+            if (_tsSize != 0) ThrowHelper.InvalidArgument("user_defined_index_factory is incompatible with user-defined timestamps");
+            if (mode is BlockBasedIndexMode.CustomDefault or BlockBasedIndexMode.CustomOnly)
+            {
+                if (options.IndexType == IndexType.TwoLevelIndexSearch)
+                    ThrowHelper.InvalidArgument("index_mode kCustomDefault/kCustomOnly is incompatible with kTwoLevelIndexSearch");
+                if (options.PartitionFilters) ThrowHelper.InvalidArgument("index_mode kCustomDefault/kCustomOnly is incompatible with partition_filters");
+            }
+            _udiName = udiFactory.Name;
+            _udi = udiFactory.NewBuilder(new UserDefinedIndexOptions { Comparator = _ucmp })
+                ?? throw RocksDbException.InvalidArgument("IndexFactory::NewBuilder returned OK with null builder for " + _udiName);
+            _customOnly = mode == BlockBasedIndexMode.CustomOnly;
+            _udiNextKey = new PooledBufferWriter(64);
+        }
+        // Custom index builders do not take part in parallel compression (IndexFactoryBuilder::SupportsParallelAddEntry
+        // defaults to false, which makes upstream fall back to single-threaded compression).
+        if (_udi is null) MaybeStartParallelCompression();
+    }
+
+    /// <summary>ForwardOnKeyAddedToAll (custom index part): the parsed user key, value type and user value.</summary>
+    private void UdiOnKeyAdded(ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value)
+    {
+        DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(internalKey), out _, out EntryType t);
+        UserDefinedIndexValueType vt = t switch
+        {
+            EntryType.Value or EntryType.ValuePreferredSeqno => UserDefinedIndexValueType.Value,
+            EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp => UserDefinedIndexValueType.Delete,
+            EntryType.Merge => UserDefinedIndexValueType.Merge,
+            _ => UserDefinedIndexValueType.Other,
+        };
+        // kTypeValuePreferredSeqno packs the user value with a preferred seqno; forward the user value portion.
+        if (t == EntryType.ValuePreferredSeqno && value.Length >= 8) value = value[..^8];
+        _udi!.OnKeyAdded(DbFormat.ExtractUserKey(internalKey), vt, value);
+    }
+
+    /// <summary>ForwardAddIndexEntryToAll (custom index part): user keys plus the packed tags of the internal keys.</summary>
+    private void UdiAddIndexEntry(ReadOnlySpan<byte> lastKey, ReadOnlySpan<byte> firstKeyInNextBlock, bool hasNext, BlockHandle handle, bool skipDeltaEncoding)
+    {
+        ulong lastTag = DbFormat.ExtractFooter(lastKey);
+        ulong firstTag = hasNext ? DbFormat.ExtractFooter(firstKeyInNextBlock) : 0;
+        _udi!.AddIndexEntry(DbFormat.ExtractUserKey(lastKey), hasNext ? DbFormat.ExtractUserKey(firstKeyInNextBlock) : default, hasNext, handle,
+            new UserDefinedIndexEntryContext(lastTag, firstTag, skipDeltaEncoding));
     }
 
     /// <summary>
@@ -251,10 +304,10 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     /// <summary>The data block compression dictionary (after the builder left the buffered state), or null.</summary>
     public ReadOnlySpan<byte> CompressionDictionary => _dict is null ? default : _dict.Data;
 
-    public ulong NumEntries => _props.NumEntries;
-    public bool IsEmpty => _props.NumEntries == 0;
+    public override ulong NumEntries => _props.NumEntries;
+    public override bool IsEmpty => _props.NumEntries == 0;
     /// <summary>Size of the file generated so far (final size after <see cref="Finish"/>).</summary>
-    public ulong FileSize => _offset;
+    public override ulong FileSize => _offset;
 
     /// <summary>
     /// Port of BlockBasedTableBuilder::EstimatedTailSize: the index and filter estimates, the compression dictionary,
@@ -262,7 +315,7 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     /// compaction with target_file_size_is_upper_bound. Upstream refreshes the index/filter estimates once per data
     /// block; the port caches the result per data block count.
     /// </summary>
-    public ulong EstimatedTailSize()
+    public override ulong EstimatedTailSize()
     {
         ulong blocks = _props.NumDataBlocks;
         if (_tailEstimateBlocks == blocks && _tailEstimate != 0) return _tailEstimate;
@@ -278,20 +331,20 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     private ulong _tailEstimateBlocks;
     private ulong _tailEstimate;
     /// <summary>Properties of the table (complete after <see cref="Finish"/>).</summary>
-    public TableProperties Properties => _props;
+    public override TableProperties Properties => _props;
     /// <summary>The base context checksum written to the footer (format_version &gt;= 6).</summary>
     public uint BaseContextChecksum => _baseContextChecksum;
 
     /// <summary>Port of BlockBasedTableBuilder::Add. May synchronously append staged output to the file.</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public void Add(ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value)
+    public override void Add(ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value)
     {
         AddCore(internalKey, value);
         if (_out.WrittenCount >= OutputFlushThreshold) DrainOutput();
     }
 
     /// <summary>Adds an entry; staged output beyond the threshold is written asynchronously.</summary>
-    public ValueTask AddAsync(ReadOnlyMemory<byte> internalKey, ReadOnlyMemory<byte> value, CancellationToken cancellationToken = default)
+    public override ValueTask AddAsync(ReadOnlyMemory<byte> internalKey, ReadOnlyMemory<byte> value, CancellationToken cancellationToken = default)
     {
         AddCore(internalKey.Span, value.Span);
         return _out.WrittenCount >= OutputFlushThreshold ? DrainOutputAsync(cancellationToken) : ValueTask.CompletedTask;
@@ -337,7 +390,11 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
             _dataBlock.Add(internalKey, value);
             _lastKey.Clear();
             _lastKey.Write(internalKey);
-            if (!_buffered) _indexBuilder.OnKeyAdded(internalKey);
+            if (!_buffered)
+            {
+                _indexBuilder.OnKeyAdded(internalKey);
+                if (_udi is not null) UdiOnKeyAdded(internalKey, value);
+            }
             // NotifyCollectTableCollectorsOnAdd (file_size: the offset after the data blocks written so far).
             _collectors?.Add(internalKey, value, _offset);
             if (type is EntryType.Deletion or EntryType.SingleDeletion or EntryType.DeletionWithTimestamp) _props.NumDeletions++;
@@ -398,6 +455,15 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
         // When data blocks are aligned with super block alignment, delta encoding needs to be skipped for the first block
         // after padding.
         BlockHandle handle = WriteBlock(raw, isDataBlock: true, out bool skipDeltaEncoding);
+        if (_udi is not null)
+        {
+            // The standard index builder may reuse the key buffers; keep the next block's first key for the custom index.
+            _udiNextKey!.Clear();
+            _udiNextKey.Write(firstKeyInNextBlock);
+            _indexBuilder.AddIndexEntry(lastKey, firstKeyInNextBlock, hasNext, handle, skipDeltaEncoding);
+            UdiAddIndexEntry(lastKey, _udiNextKey.WrittenSpan, hasNext, handle, skipDeltaEncoding);
+            return;
+        }
         _indexBuilder.AddIndexEntry(lastKey, firstKeyInNextBlock, hasNext, handle, skipDeltaEncoding);
     }
 
@@ -454,6 +520,7 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
                     ReadOnlySpan<byte> key = it.Key;
                     _filterBuilder?.Add(DbFormat.ExtractUserKeyAndStripTimestamp(key, _tsSize));
                     _indexBuilder.OnKeyAdded(key);
+                    if (_udi is not null) UdiOnKeyAdded(key, it.Value);
                     lastKey.Clear();
                     lastKey.Write(key);
                 }
@@ -647,7 +714,7 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     }
 
     /// <summary>Finishes the table: writes remaining data, filter, index, range-del, properties, metaindex and footer, then flushes the file.</summary>
-    public void Finish()
+    public override void Finish()
     {
         FinishCore();
         DrainOutput();
@@ -655,7 +722,7 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     }
 
     /// <summary>Async <see cref="Finish"/>.</summary>
-    public async ValueTask FinishAsync(CancellationToken cancellationToken = default)
+    public override async ValueTask FinishAsync(CancellationToken cancellationToken = default)
     {
         FinishCore();
         await DrainOutputAsync(cancellationToken).ConfigureAwait(false);
@@ -709,6 +776,34 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     /// <summary>Port of WriteIndexBlock / BuiltinIndexFactoryBuilder::FinishAndWrite: index partitions, then the (top-level) index.</summary>
     private BlockHandle WriteIndexBlock(MetaIndexBuilder metaIndex)
     {
+        BlockHandle h = _customOnly ? WriteStubIndexBlock() : WriteStandardIndexBlock(metaIndex);
+        if (!BlockBasedTableConstants.FormatVersionUsesIndexHandleInFooter(_options.FormatVersion))
+            metaIndex.Add(BlockBasedTableConstants.IndexBlockName, h);
+        if (_udi is not null)
+        {
+            // Custom indexes serialize into one self-contained, uncompressed block.
+            ReadOnlySpan<byte> contents = _udi.Finish();
+            if (contents.IsEmpty && _customOnly)
+                ThrowHelper.InvalidArgument("IndexFactory " + _udiName + " returned an empty index in a mode that requires it");
+            BlockHandle custom = WriteMaybeCompressedBlock(contents, CompressionType.None);
+            metaIndex.Add(UserDefinedIndexFactory.MetaBlockPrefix + _udiName, custom);
+            // kCustomOnly: index_size covers the stub and the block that actually serves reads.
+            if (_customOnly) _props.IndexSize += custom.Size + BlockBasedTableConstants.BlockTrailerSize;
+        }
+        return h;
+    }
+
+    /// <summary>index_mode=kCustomOnly: a minimal empty index block satisfies the SST footer.</summary>
+    private BlockHandle WriteStubIndexBlock()
+    {
+        using var empty = new BlockBuilder(1, false, false, DataBlockIndexType.BinarySearch, 0.75);
+        BlockHandle h = WriteMaybeCompressedBlock(empty.Finish(), CompressionType.None);
+        _props.IndexSize = h.Size + BlockBasedTableConstants.BlockTrailerSize;
+        return h;
+    }
+
+    private BlockHandle WriteStandardIndexBlock(MetaIndexBuilder metaIndex)
+    {
         BlockHandle h = default;
         bool done;
         bool first = true;
@@ -734,8 +829,6 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
             _props.IndexPartitions = (ulong)_indexBuilder.NumPartitions;
             _props.TopLevelIndexSize = (ulong)_indexBuilder.TopLevelIndexSize;
         }
-        if (!BlockBasedTableConstants.FormatVersionUsesIndexHandleInFooter(_options.FormatVersion))
-            metaIndex.Add(BlockBasedTableConstants.IndexBlockName, h);
         return h;
     }
 
@@ -771,10 +864,10 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     }
 
     /// <summary>Smallest user-defined timestamp added ("rocksdb.timestamp_min"); empty without timestamps or entries.</summary>
-    public byte[] TimestampMin => _timestampMin ?? [];
+    public override byte[] TimestampMin => _timestampMin ?? [];
 
     /// <summary>Largest user-defined timestamp added ("rocksdb.timestamp_max"); empty without timestamps or entries.</summary>
-    public byte[] TimestampMax => _timestampMax ?? [];
+    public override byte[] TimestampMax => _timestampMax ?? [];
 
     private void WritePropertiesBlock(MetaIndexBuilder metaIndex)
     {
@@ -784,8 +877,22 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
         _props.MergeOperatorName = _tbo.MergeOperatorName;
         _props.PrefixExtractorName = _tbo.PrefixExtractorName;
         _props.PropertyCollectorsNames = TablePropertiesCollectors.Names(_tbo.TablePropertiesCollectorFactories);
-        _props.IndexKeyIsUserKey = _indexBuilder.SeparatorIsKeyPlusSeq ? 0UL : 1UL;
-        _props.IndexValueIsDeltaEncoded = _useDeltaEncodingForIndexValues ? 1UL : 0UL;
+        if (!_customOnly)
+        {
+            _props.IndexKeyIsUserKey = _indexBuilder.SeparatorIsKeyPlusSeq ? 0UL : 1UL;
+            _props.IndexValueIsDeltaEncoded = _useDeltaEncodingForIndexValues ? 1UL : 0UL;
+            // kCustomDefault is the only mode with a populated standard index that makes the custom index primary.
+            if (_udi is not null && _options.IndexMode == BlockBasedIndexMode.CustomDefault) _props.UdiIsPrimaryIndex = 1;
+        }
+        else
+        {
+            // kCustomOnly stub properties.
+            _props.IndexKeyIsUserKey = 1;
+            _props.IndexValueIsDeltaEncoded = 0;
+            _props.UdiIsPrimaryIndex = 1;
+            _props.StandardIndexIsStub = 1;
+            _props.IndexPartitions = 0;
+        }
         _props.CompressionName = BuildCompressionName();
         _props.CompressionOptions = BuildCompressionOptions();
         // rep_->props.user_defined_timestamps_persisted (written only when 0).
@@ -892,20 +999,21 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
     private void WriteFooter(BlockHandle metaindexHandle, BlockHandle indexHandle)
     {
         Span<byte> footer = _out.GetSpan(Footer.EncodedLength);
-        Footer.Build(footer, _options.FormatVersion, _offset, _options.Checksum, metaindexHandle, indexHandle, _baseContextChecksum);
+        Footer.Build(footer, _options.FormatVersion, _offset, _options.Checksum, metaindexHandle, indexHandle, _baseContextChecksum,
+            _customOnly ? Footer.FeatureRequireUserDefinedIndex : 0);
         _out.Advance(Footer.EncodedLength);
         _offset += Footer.EncodedLength;
     }
 
     /// <summary>Stops building without writing the tail (the partially written file should be deleted by the caller).</summary>
-    public void Abandon()
+    public override void Abandon()
     {
         if (_pc is not null) StopParallelCompression(abort: true);
         _closed = true;
         _out.Clear();
     }
 
-    public void Dispose()
+    public override void Dispose()
     {
         if (_pc is not null) StopParallelCompression(abort: true);
         _closed = true;
@@ -916,6 +1024,8 @@ public sealed partial class BlockBasedTableBuilder : IDisposable
         _out.Dispose();
         _lastKey.Dispose();
         _compressed.Dispose();
+        _udi?.Dispose();
+        _udiNextKey?.Dispose();
         _dataBlockBuffers.Clear();
         _dict?.Dispose();
 
