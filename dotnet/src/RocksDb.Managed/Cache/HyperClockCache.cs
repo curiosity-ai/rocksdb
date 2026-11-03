@@ -42,6 +42,12 @@ public sealed class HyperClockCacheOptions
     /// treated as 1. Default 30.
     /// </summary>
     public int EvictionEffortCap { get; init; } = 30;
+
+    /// <summary>
+    /// Secondary cache consulted on misses and fed with evicted entries (ShardedCacheOptions::secondary_cache); honored by
+    /// <see cref="BlockCache.CreateHyperClock"/>, which wraps the cache in a secondary cache adapter.
+    /// </summary>
+    public SecondaryCache? SecondaryCache { get; init; }
 }
 
 /// <summary>
@@ -82,7 +88,7 @@ public sealed class HyperClockCache : BlockCache
         long perShard = (options.Capacity + numShards - 1) / numShards;
         _shards = new ClockShard[numShards];
         for (int i = 0; i < numShards; i++)
-            _shards[i] = new ClockShard(perShard, options.EstimatedEntryCharge, options.MinAvgEntryCharge, options.StrictCapacityLimit,
+            _shards[i] = new ClockShard(this, perShard, options.EstimatedEntryCharge, options.MinAvgEntryCharge, options.StrictCapacityLimit,
                 options.MetadataChargePolicy, options.EvictionEffortCap);
     }
 
@@ -120,7 +126,7 @@ public sealed class HyperClockCache : BlockCache
         {
             long sum = 0;
             foreach (ClockShard s in _shards) sum += s.Usage;
-            return sum;
+            return sum + StandaloneUsage;
         }
     }
 
@@ -130,7 +136,7 @@ public sealed class HyperClockCache : BlockCache
         {
             long sum = 0;
             foreach (ClockShard s in _shards) sum += s.ComputePinnedUsage();
-            return sum;
+            return sum + StandaloneUsage;
         }
     }
 
@@ -185,6 +191,8 @@ public sealed class HyperClockCache : BlockCache
             block = default;
             return false;
         }
+        // Record the hit for the eviction callback (was_hit), only when one is installed (as upstream).
+        if (EvictionHandler is not null && (s.LoadMeta() & ClockSlot.HitBit) == 0) Interlocked.Or(ref s.Meta, unchecked((long)ClockSlot.HitBit));
         block = new CachedBlock(s);
         return true;
     }
@@ -334,9 +342,12 @@ internal sealed class ClockShard
     /// <summary>Initial size of an automatically resizing table (log2 slots).</summary>
     private const int AutoInitialLengthBits = 6;
 
-    public ClockShard(long capacity, long estimatedEntryCharge, long minAvgEntryCharge, bool strict, CacheMetadataChargePolicy policy,
-        int evictionEffortCap)
+    private readonly HyperClockCache? _owner;
+
+    public ClockShard(HyperClockCache? owner, long capacity, long estimatedEntryCharge, long minAvgEntryCharge, bool strict,
+        CacheMetadataChargePolicy policy, int evictionEffortCap)
     {
+        _owner = owner;
         _capacity = capacity;
         _strict = strict;
         _policy = policy;
@@ -775,6 +786,7 @@ internal sealed class ClockShard
         ulong maxClockPointer = oldClockPointer + (ClockSlot.MaxCountdown << t.LengthBits);
         // EecAndScl::GetEffectiveEvictionEffortCap: strict_capacity_limit (the top bit) implies an infinite cap.
         ulong effectiveCap = Volatile.Read(ref _strict) ? _evictionEffortCap | 0x80000000u : _evictionEffortCap;
+        CacheEvictionHandler? handler = _owner?.EvictionHandler;
         while (true)
         {
             for (int i = 0; i < stepSize; i++)
@@ -784,6 +796,8 @@ internal sealed class ClockShard
                 {
                     freedCharge += h.TotalCharge;
                     freedCount++;
+                    // eviction_callback_(key, handle, was_hit) while this thread owns the slot, before the value is freed.
+                    if (handler is not null) handler.OnEvicted(h.Key, h, (h.LoadMeta() & ClockSlot.HitBit) != 0);
                     Rollback(t, h.H1, h.H2, h);
                     FreeDataMarkEmpty(h);
                 }

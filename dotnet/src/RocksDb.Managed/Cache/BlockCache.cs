@@ -39,6 +39,11 @@ public readonly struct CacheValue
     public readonly int Length;
     public readonly object? Object;
     public readonly bool ReturnBufferToPool;
+    /// <summary>
+    /// The entry's role and secondary-cache callbacks (Cache::CacheItemHelper); null: role <see cref="CacheEntryRole.Misc"/>,
+    /// never saved to a secondary cache.
+    /// </summary>
+    public readonly CacheItemHelper? Helper;
 
     public CacheValue(byte[]? buffer, int length, object? obj, bool returnBufferToPool)
     {
@@ -47,7 +52,23 @@ public readonly struct CacheValue
         Length = length;
         Object = obj;
         ReturnBufferToPool = returnBufferToPool && buffer is not null;
+        Helper = null;
     }
+
+    private CacheValue(in CacheValue v, CacheItemHelper? helper)
+    {
+        Buffer = v.Buffer;
+        Length = v.Length;
+        Object = v.Object;
+        ReturnBufferToPool = v.ReturnBufferToPool;
+        Helper = helper;
+    }
+
+    /// <summary>This value with <paramref name="helper"/> attached (see <see cref="Helper"/>).</summary>
+    public CacheValue WithHelper(CacheItemHelper? helper) => new(this, helper);
+
+    /// <summary>A placeholder value (no bytes, no object): a memory reservation (CacheReservationManager dummy entry).</summary>
+    public bool IsPlaceholder => Buffer is null && Object is null;
 
     /// <summary>Bytes rented from <see cref="ArrayPool{T}.Shared"/>; returned to the pool when the entry is freed.</summary>
     public static CacheValue FromPooledBuffer(byte[] buffer, int length) => new(buffer, length, null, true);
@@ -76,6 +97,7 @@ internal abstract class CacheEntry
     internal int Length;
     internal object? Object;
     internal bool ReturnBufferToPool;
+    internal CacheItemHelper? Helper;
     internal CacheKey Key;
     /// <summary>Charge including metadata (total_charge).</summary>
     internal long TotalCharge;
@@ -88,7 +110,11 @@ internal abstract class CacheEntry
         Length = value.Length;
         Object = value.Object;
         ReturnBufferToPool = value.ReturnBufferToPool;
+        Helper = value.Helper;
     }
+
+    /// <summary>The value as handed to the cache (for <see cref="CacheItemHelper"/> callbacks).</summary>
+    internal CacheValue GetValue() => new CacheValue(Buffer, Length, Object, false).WithHelper(Helper);
 
     /// <summary>Releases the value (del_cb) and clears references so the entry object can be recycled.</summary>
     internal void FreeValue()
@@ -100,6 +126,7 @@ internal abstract class CacheEntry
         Object = null;
         Length = 0;
         ReturnBufferToPool = false;
+        Helper = null;
         if (toPool && buffer is not null) ArrayPool<byte>.Shared.Return(buffer);
         (obj as IDisposable)?.Dispose();
     }
@@ -159,6 +186,24 @@ public struct CachedBlock : IDisposable
 
     public readonly CacheKey Key => EntryOrThrow().Key;
 
+    /// <summary>The entry's helper (GetCacheItemHelper), or null.</summary>
+    public readonly CacheItemHelper? Helper => EntryOrThrow().Helper;
+
+    /// <summary>True for a placeholder entry (no bytes, no object).</summary>
+    public readonly bool IsPlaceholder
+    {
+        get
+        {
+            CacheEntry e = EntryOrThrow();
+            return e.Buffer is null && e.Object is null;
+        }
+    }
+
+    /// <summary>The value as handed to the cache (helper callbacks, secondary-cache demotion).</summary>
+    internal readonly CacheValue GetValue() => EntryOrThrow().GetValue();
+
+    internal readonly CacheEntry? Entry => _entry;
+
     /// <summary>Takes an additional, independent reference (Cache::Ref). The returned handle must be released too.</summary>
     public readonly CachedBlock AddRef()
     {
@@ -206,6 +251,20 @@ public struct CachedBlock : IDisposable
 public abstract class BlockCache : Table.IBlockCache
 {
     private long _lastId;
+    private long _standaloneUsage;
+    private CacheEvictionHandler? _evictionHandler;
+
+    /// <summary>
+    /// True for caches whose lookups need the full context (the TryLookup overload with helper / create context /
+    /// statistics): caches with a secondary cache and simulation caches. Readers check this field once per lookup so a
+    /// plain cache pays nothing for the secondary-cache layers.
+    /// </summary>
+    internal readonly bool ExtendedLookup;
+
+    protected BlockCache() { }
+
+    /// <summary>For wrappers whose lookups need the helper / statistics (see <see cref="ExtendedLookup"/>).</summary>
+    private protected BlockCache(bool extendedLookup) => ExtendedLookup = extendedLookup;
 
     // Legacy seam keys: (per-reader table id, offset) tagged in the top bit so they cannot meet OffsetableCacheKey keys
     // of the same process in practice.
@@ -279,16 +338,151 @@ public abstract class BlockCache : Table.IBlockCache
     public abstract void EraseUnreferencedEntries();
 
     /// <summary>Returns a new id unique for this cache's lifetime (Cache::NewId).</summary>
-    public long NewId() => Interlocked.Increment(ref _lastId);
+    public virtual long NewId() => Interlocked.Increment(ref _lastId);
+
+    // ---- secondary-cache support (advanced_cache.h) ------------------------------------------------
+
+    /// <summary>
+    /// Lookup with the entry's helper and create context (Cache::Lookup(key, helper, create_context, priority, stats)).
+    /// A plain cache ignores the extra arguments; a cache with a secondary cache looks the key up there on a primary
+    /// miss and creates the value with <paramref name="helper"/> (<see cref="CacheItemHelper.TryCreate"/>).
+    /// </summary>
+    public virtual bool TryLookup(in CacheKey key, CacheItemHelper? helper, object? createContext, CachePriority priority,
+        Statistics? stats, out CachedBlock block) => TryLookup(key, out block);
+
+    /// <summary>
+    /// Insert that also offers the value's compressed (serialized) form to the secondary tiers (the compressed_value /
+    /// type arguments of Cache::Insert; only used with <see cref="TieredAdmissionPolicy.ThreeQueue"/>).
+    /// </summary>
+    public virtual bool TryInsert(in CacheKey key, in CacheValue value, long charge, CachePriority priority,
+        ReadOnlySpan<byte> compressedValue, Compression.CompressionType compressionType, out CachedBlock block) =>
+        TryInsert(key, value, charge, priority, out block);
+
+    /// <summary>
+    /// Starts a lookup that may complete later (Cache::StartAsyncLookup): the primary cache is probed immediately; on a
+    /// miss a secondary-cache lookup may stay pending until <see cref="WaitAll"/> / <see cref="WaitAllAsync"/>.
+    /// </summary>
+    public virtual void StartAsyncLookup(AsyncLookupHandle handle)
+    {
+        ArgumentNullException.ThrowIfNull(handle);
+        handle.SetResult(TryLookup(handle.Key, handle.Helper, handle.CreateContext, handle.Priority, handle.Statistics, out CachedBlock b)
+            ? b : default);
+    }
+
+    /// <summary>
+    /// Releases <paramref name="handle"/> through the cache (Cache::Release(handle, erase_if_last_ref)). Equivalent to
+    /// <see cref="CachedBlock.Release(bool)"/> except for wrappers that account for releases (placeholder reservations
+    /// of a tiered cache); memory reservations should be released this way.
+    /// </summary>
+    public virtual void Release(ref CachedBlock handle, bool eraseIfLastRef) => handle.Release(eraseIfLastRef);
+
+    /// <summary>Completes the pending lookups among <paramref name="handles"/> (Cache::WaitAll).</summary>
+    public virtual void WaitAll(ReadOnlySpan<AsyncLookupHandle> handles) { }
+
+    /// <summary>Async <see cref="WaitAll"/>: awaits pending secondary-cache lookups instead of blocking a thread.</summary>
+    public virtual ValueTask WaitAllAsync(AsyncLookupHandle[] handles, int count, CancellationToken cancellationToken)
+    {
+        WaitAll(handles.AsSpan(0, count));
+        return ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// Creates an entry that is not in the cache's table and is freed when its handle is released (Cache::CreateStandalone).
+    /// Its charge counts toward <see cref="Usage"/> while referenced. With a strict capacity limit and no room, the entry
+    /// is created uncharged if <paramref name="allowUncharged"/>, else nothing is created (false; the caller keeps
+    /// ownership of <paramref name="value"/>).
+    /// </summary>
+    public bool TryCreateStandalone(in CacheKey key, in CacheValue value, long charge, bool allowUncharged, out CachedBlock block)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(charge);
+        if (StrictCapacityLimit && Usage + charge > Capacity)
+        {
+            if (!allowUncharged)
+            {
+                block = default;
+                return false;
+            }
+            charge = 0;
+        }
+        var e = new StandaloneEntry(this);
+        e.SetValue(value);
+        e.Key = key;
+        e.TotalCharge = charge;
+        Interlocked.Add(ref _standaloneUsage, charge);
+        block = new CachedBlock(e);
+        return true;
+    }
+
+    /// <summary>Total charge of live standalone entries (included in <see cref="Usage"/> and <see cref="PinnedUsage"/>).</summary>
+    protected long StandaloneUsage => Volatile.Read(ref _standaloneUsage);
+
+    internal void ReleaseStandaloneCharge(long charge) => Interlocked.Add(ref _standaloneUsage, -charge);
+
+    /// <summary>
+    /// Called for entries evicted for capacity (not erased), outside internal locks, before the value is freed
+    /// (Cache::SetEvictionCallback). Used by the secondary cache adapter to demote evicted blocks.
+    /// </summary>
+    internal CacheEvictionHandler? EvictionHandler => Volatile.Read(ref _evictionHandler);
+
+    internal virtual void SetEvictionHandler(CacheEvictionHandler? handler) => Volatile.Write(ref _evictionHandler, handler);
+
+    /// <summary>Capacity of the secondary cache, if any (Cache::GetSecondaryCacheCapacity).</summary>
+    public virtual bool TryGetSecondaryCacheCapacity(out long capacity)
+    {
+        capacity = 0;
+        return false;
+    }
+
+    /// <summary>Secondary cache memory taken by distributed reservations (Cache::GetSecondaryCachePinnedUsage).</summary>
+    public virtual long SecondaryCachePinnedUsage => 0;
+
+    /// <summary>
+    /// Creates a primary + compressed secondary tiered cache whose total memory budget is split between the tiers and whose
+    /// memory reservations (e.g. a <see cref="WriteBufferManager"/> charging memtables to it) are distributed
+    /// proportionally (NewTieredCache, cache/secondary_cache_adapter.cc). Returns null for an invalid admission policy.
+    /// </summary>
+    public static BlockCache? CreateTiered(TieredCacheOptions options) => CacheWithSecondaryAdapter.NewTieredCache(options);
+
+    /// <summary>
+    /// Dynamically updates a cache created by <see cref="CreateTiered"/> (UpdateTieredCache): <paramref name="totalCapacity"/>
+    /// &gt; 0 sets the total budget, a ratio in [0, 1] sets the compressed secondary share, a policy other than
+    /// <see cref="TieredAdmissionPolicy.Max"/> sets the admission policy. Throws InvalidArgument for other caches.
+    /// Once the ratio is lowered to 0 the secondary cache cannot be re-enabled (as upstream).
+    /// </summary>
+    public static void UpdateTieredCache(BlockCache cache, long totalCapacity, double compressedSecondaryRatio, TieredAdmissionPolicy admissionPolicy) =>
+        CacheWithSecondaryAdapter.UpdateTiered(cache, totalCapacity, compressedSecondaryRatio, admissionPolicy);
+
+    /// <summary>
+    /// Wraps <paramref name="cache"/> with a key-only shadow LRU cache of <paramref name="simCapacity"/> bytes that reports
+    /// the hit rate the cache would have at that capacity (NewSimCache, utilities/simulator_cache/sim_cache.cc).
+    /// </summary>
+    public static SimCache CreateSimCache(BlockCache cache, long simCapacity, int numShardBits) =>
+        SimCache.Create(cache, simCapacity, numShardBits);
+
+    /// <summary>Wraps <paramref name="cache"/> with a secondary cache (what LRUCacheOptions::secondary_cache does).</summary>
+    public static BlockCache WithSecondaryCache(BlockCache cache, SecondaryCache secondaryCache) =>
+        new CacheWithSecondaryAdapter(cache, secondaryCache, TieredAdmissionPolicy.Auto, distributeCacheReservations: false);
 
     /// <summary>Creates a sharded LRU cache (NewLRUCache).</summary>
     public static BlockCache CreateLru(long capacity) => new LruCache(new LruCacheOptions { Capacity = capacity });
 
     /// <summary>Creates a sharded LRU cache (NewLRUCache).</summary>
-    public static BlockCache CreateLru(LruCacheOptions options) => new LruCache(options);
+    /// <remarks>With <see cref="LruCacheOptions.SecondaryCache"/> the cache is wrapped in a secondary cache adapter.</remarks>
+    public static BlockCache CreateLru(LruCacheOptions options)
+    {
+        BlockCache c = new LruCache(options);
+        return options.SecondaryCache is { } sec ? WithSecondaryCache(c, sec) : c;
+    }
 
-    /// <summary>Creates a lock-free HyperClockCache (HyperClockCacheOptions::MakeSharedCache).</summary>
-    public static BlockCache CreateHyperClock(HyperClockCacheOptions options) => new HyperClockCache(options);
+    /// <summary>
+    /// Creates a lock-free HyperClockCache (HyperClockCacheOptions::MakeSharedCache); with
+    /// <see cref="HyperClockCacheOptions.SecondaryCache"/> it is wrapped in a secondary cache adapter.
+    /// </summary>
+    public static BlockCache CreateHyperClock(HyperClockCacheOptions options)
+    {
+        BlockCache c = new HyperClockCache(options);
+        return options.SecondaryCache is { } sec ? WithSecondaryCache(c, sec) : c;
+    }
 
     /// <summary>
     /// The recommended block cache for a DB: a <see cref="HyperClockCache"/> of <paramref name="capacity"/> bytes whose

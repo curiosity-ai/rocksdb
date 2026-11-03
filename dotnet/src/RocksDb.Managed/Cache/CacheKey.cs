@@ -37,6 +37,14 @@ public readonly struct CacheKey : IEquatable<CacheKey>
         return new CacheKey(0, id);
     }
 
+    /// <summary>A key unique for <paramref name="cache"/>'s lifetime (CacheKey::CreateUniqueForCacheLifetime).</summary>
+    public static CacheKey CreateUniqueForCacheLifetime(BlockCache cache)
+    {
+        // +1 so that all zeros stay reserved for "unset"; NewId counts up from 1, below 1 << 63.
+        ulong id = (ulong)cache.NewId() + 1;
+        return new CacheKey(0, id);
+    }
+
     /// <summary>
     /// 32-bit hash used for shard selection (low bits) and the per-shard table (high bits). Not persisted; any
     /// well-mixed function works. This is a 128→64 multiply/xorshift mix.
@@ -71,6 +79,16 @@ public readonly struct CacheKey : IEquatable<CacheKey>
     }
 
     public override string ToString() => FileNumEtc64.ToString("x16") + OffsetEtc64.ToString("x16");
+
+    /// <summary>Size of the key in bytes (CacheKey::AsSlice().size()).</summary>
+    public const int Size = 16;
+
+    /// <summary>Reads a key written by <see cref="WriteTo"/>; InvalidArgument unless <paramref name="source"/> is 16 bytes.</summary>
+    public static CacheKey Read(ReadOnlySpan<byte> source)
+    {
+        if (source.Length != Size) ThrowHelper.InvalidArgument("cache keys are 16 bytes");
+        return new CacheKey(BinaryPrimitives.ReadUInt64LittleEndian(source), BinaryPrimitives.ReadUInt64LittleEndian(source[8..]));
+    }
 }
 
 /// <summary>

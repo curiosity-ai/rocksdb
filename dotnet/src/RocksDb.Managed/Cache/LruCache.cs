@@ -22,6 +22,12 @@ public sealed class LruCacheOptions
 
     /// <summary>Whether <see cref="LruCache.EntryMetadataCharge"/> is added to each entry's charge (default full).</summary>
     public CacheMetadataChargePolicy MetadataChargePolicy { get; init; } = CacheMetadataChargePolicy.FullCharge;
+
+    /// <summary>
+    /// Secondary cache consulted on misses and fed with evicted entries (LRUCacheOptions::secondary_cache); honored by
+    /// <see cref="BlockCache.CreateLru(LruCacheOptions)"/>, which wraps the cache in a secondary cache adapter.
+    /// </summary>
+    public SecondaryCache? SecondaryCache { get; init; }
 }
 
 /// <summary>
@@ -69,7 +75,7 @@ public sealed class LruCache : BlockCache
         long perShard = PerShardCapacity(options.Capacity, numShards);
         for (int i = 0; i < numShards; i++)
         {
-            _shards[i] = new LruCacheShard(perShard, options.StrictCapacityLimit, options.HighPriPoolRatio, options.LowPriPoolRatio,
+            _shards[i] = new LruCacheShard(this, perShard, options.StrictCapacityLimit, options.HighPriPoolRatio, options.LowPriPoolRatio,
                 options.MetadataChargePolicy, 32 - bits);
         }
     }
@@ -115,7 +121,7 @@ public sealed class LruCache : BlockCache
         {
             long sum = 0;
             foreach (LruCacheShard s in _shards) sum += s.Usage;
-            return sum;
+            return sum + StandaloneUsage;
         }
     }
 
@@ -125,7 +131,7 @@ public sealed class LruCache : BlockCache
         {
             long sum = 0;
             foreach (LruCacheShard s in _shards) sum += s.PinnedUsage;
-            return sum;
+            return sum + StandaloneUsage;
         }
     }
 
@@ -199,6 +205,9 @@ internal sealed class LruEntry : CacheEntry
     internal const byte FlagInHighPriPool = 8;
     internal const byte FlagInLowPriPool = 16;
     internal const byte FlagHasHit = 32;
+    // Queued to be freed by an eviction (EvictFromLRU, insert-and-evict, replacement; upstream NotifyEvicted): reported
+    // to the cache's eviction callback before the value is freed.
+    internal const byte FlagNotifyEvicted = 64;
 
     internal readonly LruCacheShard? Shard;
     internal LruEntry? Next;
@@ -347,9 +356,12 @@ internal sealed class LruCacheShard
     private LruEntry? _pendingFree;
     private int _freeCount;
 
-    public LruCacheShard(long capacity, bool strictCapacityLimit, double highPriPoolRatio, double lowPriPoolRatio,
+    private readonly LruCache? _owner;
+
+    public LruCacheShard(LruCache? owner, long capacity, bool strictCapacityLimit, double highPriPoolRatio, double lowPriPoolRatio,
         CacheMetadataChargePolicy metadataChargePolicy, int maxUpperHashBits)
     {
+        _owner = owner;
         _strictCapacityLimit = strictCapacityLimit;
         _highPriPoolRatio = highPriPoolRatio;
         _lowPriPoolRatio = lowPriPoolRatio;
@@ -479,7 +491,7 @@ internal sealed class LruCacheShard
             if (!wantHandle)
             {
                 // As if inserted and evicted immediately: the cache owns and frees the value.
-                FreeEntry(e);
+                FreeEvictedEntry(e);
             }
             else
             {
@@ -501,7 +513,7 @@ internal sealed class LruCacheShard
             {
                 LruRemove(old);
                 _usage -= old.TotalCharge;
-                FreeEntry(old);
+                FreeEvictedEntry(old);
             }
         }
         if (!wantHandle)
@@ -604,6 +616,12 @@ internal sealed class LruCacheShard
         _pendingFree = e;
     }
 
+    private void FreeEvictedEntry(LruEntry e)
+    {
+        e.Flags |= LruEntry.FlagNotifyEvicted;
+        FreeEntry(e);
+    }
+
     private LruEntry? TakePendingFree()
     {
         LruEntry? p = _pendingFree;
@@ -615,7 +633,13 @@ internal sealed class LruCacheShard
     private void FreePending(LruEntry? chain)
     {
         if (chain is null) return;
-        for (LruEntry? e = chain; e is not null; e = e.NextFree) e.FreeValue();
+        CacheEvictionHandler? handler = _owner?.EvictionHandler;
+        for (LruEntry? e = chain; e is not null; e = e.NextFree)
+        {
+            // NotifyEvicted: the eviction callback sees the value before it is freed (outside the mutex).
+            if (handler is not null && (e.Flags & LruEntry.FlagNotifyEvicted) != 0) handler.OnEvicted(e.Key, e, e.HasHit);
+            e.FreeValue();
+        }
         lock (_mutex)
         {
             LruEntry? e = chain;
@@ -727,7 +751,7 @@ internal sealed class LruCacheShard
             _table.Remove(old.Key, old.Hash);
             old.SetFlag(LruEntry.FlagInCache, false);
             _usage -= old.TotalCharge;
-            FreeEntry(old);
+            FreeEvictedEntry(old);
         }
     }
 
