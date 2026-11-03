@@ -70,6 +70,11 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     /// SanitizeOptions. Not persisted.
     /// </summary>
     public WriteBufferManager? WriteBufferManager { get; set; }
+    /// <summary>
+    /// Inspects, rewrites or drops WAL records replayed when the DB is opened (DBOptions::wal_filter); see
+    /// <see cref="RocksDb.Managed.WalFilter"/>. Null (the default) replays every record. Not persisted.
+    /// </summary>
+    public WalFilter? WalFilter { get; set; }
 
     // ---- persisted ---------------------------------------------------------------------------
     public bool CreateIfMissing { get; set; }
@@ -79,6 +84,14 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     public bool FlushVerifyMemtableCount { get; set; } = true;
     public bool CompactionVerifyRecordCount { get; set; } = true;
     public bool TrackAndVerifyWalsInManifest { get; set; }
+    /// <summary>
+    /// Writes the number, size and last sequence number of the previous WAL at the start of each new WAL (a
+    /// predecessor-WAL-info record) and verifies the chain during recovery (DBOptions::track_and_verify_wals): a missing
+    /// WAL, or a WAL truncated or with lost records, is reported as corruption and handled according to
+    /// <see cref="WalRecoveryMode"/> (not verified with kSkipAnyCorruptedRecords). Opening an existing DB without any WAL
+    /// file is also corruption. Independent of <see cref="TrackAndVerifyWalsInManifest"/>. Default false.
+    /// </summary>
+    public bool TrackAndVerifyWals { get; set; }
     public bool VerifySstUniqueIdInManifest { get; set; } = true;
     /// <summary>-1 keeps all files open.</summary>
     public int MaxOpenFiles { get; set; } = -1;
@@ -198,6 +211,7 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
         .Bool("flush_verify_memtable_count", static o => o.FlushVerifyMemtableCount, static (o, v) => o.FlushVerifyMemtableCount = v)
         .Bool("compaction_verify_record_count", static o => o.CompactionVerifyRecordCount, static (o, v) => o.CompactionVerifyRecordCount = v)
         .Bool("track_and_verify_wals_in_manifest", static o => o.TrackAndVerifyWalsInManifest, static (o, v) => o.TrackAndVerifyWalsInManifest = v)
+        .Bool("track_and_verify_wals", static o => o.TrackAndVerifyWals, static (o, v) => o.TrackAndVerifyWals = v)
         .Bool("verify_sst_unique_id_in_manifest", static o => o.VerifySstUniqueIdInManifest, static (o, v) => o.VerifySstUniqueIdInManifest = v)
         .Int32("max_open_files", static o => o.MaxOpenFiles, static (o, v) => o.MaxOpenFiles = v)
         .Int32("max_file_opening_threads", static o => o.MaxFileOpeningThreads, static (o, v) => o.MaxFileOpeningThreads = v)
@@ -300,7 +314,7 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     {
         var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir, FileSystem = FileSystem, Statistics = Statistics, InfoLog = InfoLog,
             RateLimiter = RateLimiter, SstFileManager = SstFileManager, FileChecksumGenFactory = FileChecksumGenFactory,
-            WriteBufferManager = WriteBufferManager, CompactionService = CompactionService };
+            WriteBufferManager = WriteBufferManager, CompactionService = CompactionService, WalFilter = WalFilter };
         c.DbPaths.AddRange(DbPaths);
         c.Listeners.AddRange(Listeners);
         c.CopyFrom(this);

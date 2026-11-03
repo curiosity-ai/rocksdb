@@ -154,33 +154,11 @@ internal sealed partial class DbImpl
             {
                 ThrowHelper.InvalidArgument("Write Ahead Log file in " + WalDir + " exists, but error_if_wal_file_exists is true");
             }
-            var progress = new ReplayProgress { LastSequence = Versions.LastSequence };
-            foreach (ulong walNumber in wals)
-            {
-                string fname = FileNames.LogFileName(WalDir, walNumber);
-                var reporter = new WalRecoveryReporter { FileName = fname };
-                using var reader = new LogReader(FileSystem.OpenSequential(fname), reporter, checksum: true, walNumber) // InitializeLogReader: always, even without paranoid_checks
-                {
-                    RecoveryMode = Options.WalRecoveryMode,
-                };
-                while (true)
-                {
-                    bool got = ReplayNextRecord(reader, reporter, walNumber, progress);
-                    _flushScheduler.Clear(); // read-only memtables just grow
-                    if (reporter.Error is { } err)
-                    {
-                        if (Options.WalRecoveryMode == WalRecoveryMode.SkipAnyCorruptedRecords) reporter.Error = null;
-                        else if (Options.WalRecoveryMode == WalRecoveryMode.PointInTimeRecovery && err.Code != StatusCode.IOError)
-                        {
-                            // Like the primary: drop records until the sequence continues (MaybeReviseStopReplayForCorruption).
-                            reporter.Error = null;
-                            progress.StopReplay = true;
-                        }
-                        else throw err;
-                    }
-                    if (!got) break;
-                }
-            }
+            // DBImpl::Recover(read_only = true): the same WAL checks and replay as the primary (ProcessLogFiles).
+            CheckWalFilesExist(isNewDb: false, ListWalNumbers(0).Count);
+            ReplayProgress progress = wals.Count == 0 || Options.BestEffortsRecovery
+                ? new ReplayProgress { LastSequence = Versions.LastSequence }
+                : await ProcessLogFilesAsync(wals, minLog, readOnly: true, edits: null, synchronous, ct).ConfigureAwait(false);
             ulong last = progress.LastSequence;
             Versions.SetLastSequence(last);
             lock (_mutex)

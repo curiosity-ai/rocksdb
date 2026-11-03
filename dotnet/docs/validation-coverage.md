@@ -10,7 +10,7 @@ Status values:
   (DB layer) or audit #3. For audit #3 the entry names the functions compared and any fix.
 - **line-by-line (feature audit: ...)**: compared when the feature was ported. The findings are in the named section of
   validation.md: "Background errors, listeners and backups", "Transactions", "User features", "User-defined
-  timestamps", "Integrated BlobDB", "Other SST formats" or "Tracing, RepairDB and tools". Audit #3 re-checked defaults and constants where noted.
+  timestamps", "Integrated BlobDB", "Other SST formats", "Tracing, RepairDB and tools" or "WAL filter, predecessor-WAL records (track_and_verify_wals) and UserWriteCallback". Audit #3 re-checked defaults and constants where noted.
 - **compaction-features pass**: the pass that ported audit #3's remaining compaction deviations (validation.md,
   "Compaction features (audit #3 remaining deviations)"); the named functions were compared with `main` and with the
   11.12 sources (identical except where noted).
@@ -21,13 +21,13 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (281 files, about 83,000 lines):
+Summary (283 files, about 83,000 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
-| line-by-line (feature audits) | 103 |
+| line-by-line (feature audits) | 105 |
 | line-by-line (#3) | 17 |
 | line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
@@ -200,14 +200,16 @@ changes there need their own review.
 | `Db/TestHooks.cs` | 46 | test_util/sync_point.h (lite) | managed-only, design-reviewed (#3): TEST_SYNC_POINT lite (DEBUG only) |
 | `Db/TransactionLogIterator.cs` | 396 | db/transaction_log_impl.cc | line-by-line (#3): wal_iterator_impl.cc (renamed from transaction_log_impl.cc); compaction-features pass: **fixed** sequence gap ends the run with NotFound (identical in 11.12) |
 | `Db/TransactionWriteContext.cs` | 60 | db/write_callback.h, db/db_impl/db_impl_write.cc | line-by-line (feature audit: transactions) |
+| `Db/UserWriteCallback.cs` | 22 | include/rocksdb/user_write_callback.h | line-by-line (feature audit: WAL filter / predecessor WALs / UserWriteCallback) |
 | `Db/Version.cs` | 199 | db/version_set.h, db/version_set.cc, db/version_builder.cc | line-by-line (#2) |
 | `Db/VersionEdit.cs` | 805 | db/version_edit.h, db/version_edit.{h,cc} | line-by-line (#1) |
 | `Db/VersionSet.cs` | 523 | db/version_set.cc, db/column_family.cc | line-by-line (#2) |
+| `Db/WalFilter.cs` | 87 | include/rocksdb/wal_filter.h, db/db_impl/db_impl_open.cc | line-by-line (feature audit: WAL filter / predecessor WALs / UserWriteCallback) |
 | `Db/Wide/WideColumnSerialization.cs` | 264 | db/wide/wide_column_serialization.{h,cc} | line-by-line (feature audit: user features (wide columns)) |
 | `Db/Wide/WideColumns.cs` | 140 | include/rocksdb/wide_columns.h, db/wide/wide_columns.cc | line-by-line (feature audit: user features (wide columns)) |
 | `Db/WriteBatch.cs` | 812 | db/write_batch.cc, db/write_batch_internal.h, include/rocksdb/write_batch.h | line-by-line (#1) |
 | `Db/WriteBatchReader.cs` | 300 | db/write_batch.cc | line-by-line (#1) |
-| `Db/WriteThread.cs` | 251 | db/write_thread.cc | line-by-line (#2) |
+| `Db/WriteThread.cs` | 251 | db/write_thread.cc | line-by-line (#2); JoinBatchGroup's CheckWriteEnqueuedCallback: feature audit: WAL filter / predecessor WALs / UserWriteCallback |
 | `Env/AlignedBuffer.cs` | 81 | util/aligned_buffer.h | managed-only, design-reviewed (#3): aligned buffers for O_DIRECT (util/aligned_buffer.h idea) |
 | `Env/EnvFileOptions.cs` | 99 | include/rocksdb/env.h, include/rocksdb/rate_limiter.h, file/sequence_file_reader.cc | managed-only, design-reviewed (#3): file options records |
 | `Env/FileContracts.cs` | 96 | file/writable_file_writer.h | managed-only, design-reviewed (#3): IFileSystem contracts (FileSystem / RandomAccessFileReader roles) |

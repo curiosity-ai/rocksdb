@@ -44,7 +44,8 @@ internal sealed partial class DbImpl
     /// (<see cref="UnorderedWriteMemtable"/>) without waiting for the writes of other groups.
     /// </summary>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    private async ValueTask WriteUnorderedAsync(WriteOptions? options, WriteBatch batch, TransactionWriteContext? txn, bool synchronous,
+    private async ValueTask WriteUnorderedAsync(WriteOptions? options, WriteBatch batch, TransactionWriteContext? txn, UserWriteCallback? userCallback,
+        bool synchronous,
         CancellationToken cancellationToken)
     {
         Statistics? stats = Options.Statistics;
@@ -52,6 +53,7 @@ internal sealed partial class DbImpl
         WriteThread.Writer w = WriteThread.Rent(synchronous);
         w.Prepare(batch, options, synchronous);
         w.Txn = txn;
+        w.UserCallback = userCallback;
         try
         {
             if (!_writeThread.JoinBatchGroup(w))

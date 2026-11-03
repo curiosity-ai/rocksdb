@@ -214,11 +214,13 @@ internal sealed partial class DbImpl
         VersionEdit? untrackWals = VerifyTrackedWalsAtOpen();
 
         // ---- WAL replay (DBImpl::RecoverLogFiles) ----
-        Dictionary<uint, VersionEdit> recoveryEdits = await RecoverLogFilesAsync(synchronous, ct).ConfigureAwait(false);
+        Dictionary<uint, VersionEdit> recoveryEdits = await RecoverLogFilesAsync(isNewDb: !exists, synchronous, ct).ConfigureAwait(false);
 
         // ---- new WAL + recovery edits (first LogAndApply writes the new MANIFEST) ----
         ulong newLogNumber = Versions.NewFileNumber();
-        _log = CreateWal(newLogNumber);
+        // Like upstream (a TODO there), the first WAL of an open records no predecessor, even when recovered WALs are kept
+        // (avoid_flush_during_recovery).
+        _log = CreateWal(newLogNumber, predecessor: null);
         _logEmpty = true;
         lock (_mutex)
         {
@@ -507,27 +509,35 @@ internal sealed partial class DbImpl
         return t;
     }
 
-    /// <summary>LogReporter for WAL recovery (DBImpl::RecoverLogFiles LogReporter): remembers the first error.</summary>
+    /// <summary>
+    /// LogReporter for WAL recovery (DBOpenLogRecordReadReporter). <see cref="Error"/> is the per-WAL status of
+    /// DBImpl::ProcessLogFile: reports set it (first one wins) only while <see cref="RecordErrors"/> (paranoid_checks and
+    /// not kSkipAnyCorruptedRecords; otherwise upstream's reporter has no status), but the WAL filter sets it directly.
+    /// </summary>
     private sealed class WalRecoveryReporter : LogReporter
     {
         public RocksDbException? Error;
         public string FileName = "";
+        public bool RecordErrors = true;
+        /// <summary>Log number named by the recorded corruption (GetCorruptedLogNumber), or UnspecifiedLogNumber.</summary>
+        public ulong CorruptedLogNumber = UnspecifiedLogNumber;
 
         public override void Corruption(long bytes, StatusCode code, string reason, ulong logNumber)
         {
-            Error ??= new RocksDbException(code == StatusCode.IOError ? StatusCode.IOError : StatusCode.Corruption,
+            if (!RecordErrors || Error is not null) return;
+            Error = new RocksDbException(code == StatusCode.IOError ? StatusCode.IOError : StatusCode.Corruption,
                 (code == StatusCode.IOError ? "IO error: " : "Corruption: ") + FileName + ": dropping " + bytes.ToString(CultureInfo.InvariantCulture) +
                 " bytes; " + reason);
+            CorruptedLogNumber = logNumber;
         }
     }
 
     /// <summary>
-    /// Port of DBImpl::RecoverLogFiles / ProcessLogFiles: replays every WAL with a number &gt;= the minimum log number
-    /// with unflushed data, in order, into the memtables (skipping CFs that already flushed that WAL), honoring
-    /// wal_recovery_mode. Recovered memtables are flushed to L0 (WriteLevel0TableForRecovery) when they fill up and,
-    /// unless avoid_flush_during_recovery, at the end. Returns the per-CF edits to apply.
+    /// Port of DBImpl::RecoverLogFiles: replays every WAL with a number &gt;= the minimum log number with unflushed data
+    /// (<see cref="ProcessLogFilesAsync"/>). Recovered memtables are flushed to L0 (WriteLevel0TableForRecovery) when they
+    /// fill up and, unless avoid_flush_during_recovery, at the end. Returns the per-CF edits to apply.
     /// </summary>
-    private async ValueTask<Dictionary<uint, VersionEdit>> RecoverLogFilesAsync(bool synchronous, CancellationToken ct)
+    private async ValueTask<Dictionary<uint, VersionEdit>> RecoverLogFilesAsync(bool isNewDb, bool synchronous, CancellationToken ct)
     {
         var edits = new Dictionary<uint, VersionEdit>();
         ulong minLog;
@@ -544,80 +554,23 @@ internal sealed partial class DbImpl
         }
 
         var wals = new List<ulong>();
+        int walFiles = 0;
         foreach (string child in FileSystem.GetChildren(WalDir))
         {
             if (FileNames.TryParseFileName(child, out ulong number, out FileType type) && type == FileType.WalFile)
             {
+                walFiles++;
                 Versions.MarkFileNumberUsed(number);
                 if (number >= minLog) wals.Add(number);
             }
         }
         wals.Sort();
+        CheckWalFilesExist(isNewDb, walFiles);
         // Best-efforts recovery does not replay WALs (DBImpl::Recover does not list the WAL directory); their numbers are
         // still marked used, and they become obsolete once the recovery edits advance every column family.
         if (wals.Count == 0 || Options.BestEffortsRecovery) return edits;
 
-        var progress = new ReplayProgress { LastSequence = Versions.LastSequence };
-        WalRecoveryMode mode = Options.WalRecoveryMode;
-        ulong corruptedWal = 0;
-        foreach (ulong walNumber in wals)
-        {
-            string fname = FileNames.LogFileName(WalDir, walNumber);
-            var reporter = new WalRecoveryReporter { FileName = fname };
-            using var reader = new LogReader(FileSystem.OpenSequential(fname), reporter, checksum: true, walNumber) // InitializeLogReader: always, even without paranoid_checks
-            {
-                RecoveryMode = mode,
-            };
-            while (true)
-            {
-                bool got = ReplayNextRecord(reader, reporter, walNumber, progress);
-                // Memtables that filled up during recovery are written out right away.
-                if (_flushScheduler.Count > 0)
-                {
-                    foreach (ColumnFamilyData cfd in _flushScheduler)
-                    {
-                        await FlushRecoveredMemTableAsync(cfd, edits, progress.LastSequence, synchronous, ct).ConfigureAwait(false);
-                    }
-                    _flushScheduler.Clear();
-                }
-                if (reporter.Error is { } err)
-                {
-                    switch (mode)
-                    {
-                        case WalRecoveryMode.SkipAnyCorruptedRecords:
-                            reporter.Error = null;
-                            break;
-                        case WalRecoveryMode.PointInTimeRecovery:
-                            if (err.Code == StatusCode.IOError) throw err; // likely loss of synced WAL: recovery fails
-                            // We should ignore the error but not continue replaying (HandleNonOkStatusOrOldLogRecord).
-                            // Records are still read: replay resumes if a later record continues the sequence
-                            // (MaybeReviseStopReplayForCorruption), e.g. writes made after an earlier PIT recovery.
-                            reporter.Error = null;
-                            if (!progress.StopReplay) corruptedWal = walNumber;
-                            progress.StopReplay = true;
-                            break;
-                        default:
-                            throw err;
-                    }
-                }
-                if (!got) break;
-            }
-        }
-        if (progress.StopReplay && mode is WalRecoveryMode.PointInTimeRecovery or WalRecoveryMode.TolerateCorruptedTailRecords)
-        {
-            // MaybeHandleStopReplayForCorruptionForInconsistency: a CF that already flushed data beyond the point of
-            // corruption cannot be made consistent with the others.
-            foreach (ColumnFamilyData cfd in GetColumnFamilies())
-            {
-                ulong liveBytes = 0;
-                VersionStorageInfo vs = cfd.Current.Storage;
-                for (int l = 0; l < vs.NumLevels; l++) liveBytes += vs.NumLevelBytes(l);
-                if (cfd.LogNumber > corruptedWal && liveBytes > 0)
-                {
-                    ThrowHelper.Corruption("Column family inconsistency: SST file contains data beyond the point of corruption in CF " + cfd.Name);
-                }
-            }
-        }
+        ReplayProgress progress = await ProcessLogFilesAsync(wals, minLog, readOnly: false, edits, synchronous, ct).ConfigureAwait(false);
         ulong lastSequence = progress.LastSequence;
         bool anyData = progress.AnyData;
 
@@ -657,38 +610,211 @@ internal sealed partial class DbImpl
         return edits;
     }
 
+    /// <summary>
+    /// DBImpl::Recover with track_and_verify_wals: opening an existing DB whose WAL directory holds no WAL file at all is
+    /// corruption (every open leaves at least the WAL it created). Not checked with best-efforts recovery.
+    /// </summary>
+    private void CheckWalFilesExist(bool isNewDb, int walFiles)
+    {
+        if (Options.TrackAndVerifyWals && !isNewDb && !Options.BestEffortsRecovery && walFiles == 0)
+        {
+            ThrowHelper.Corruption("Opening an existing DB with no WAL files");
+        }
+    }
+
+    /// <summary>
+    /// Port of DBImpl::ProcessLogFiles / ProcessLogFile (shared by primary and read-only opens, like upstream): replays
+    /// <paramref name="wals"/> (all &gt;= <paramref name="minLog"/>, ascending) through the WAL filter into the memtables,
+    /// verifies the predecessor-WAL-info records (track_and_verify_wals), handles a non-OK WAL status according to
+    /// wal_recovery_mode (HandleNonOkStatusOrOldLogRecord) and, after a point-in-time stop, checks that no column family
+    /// flushed data beyond the point of corruption (MaybeHandleStopReplayForCorruptionForInconsistency). Read-only opens
+    /// never flush (their memtables just grow).
+    /// </summary>
+    private async ValueTask<ReplayProgress> ProcessLogFilesAsync(List<ulong> wals, ulong minLog, bool readOnly, Dictionary<uint, VersionEdit>? edits,
+        bool synchronous, CancellationToken ct)
+    {
+        // No-op for wal_filter == null.
+        InvokeWalFilterOnColumnFamilyToWalNumberMap();
+        var progress = new ReplayProgress { LastSequence = Versions.LastSequence };
+        WalRecoveryMode mode = Options.WalRecoveryMode;
+        ulong corruptedWal = DbFormat.MaxSequenceNumber;
+        foreach (ulong walNumber in wals)
+        {
+            string fname = FileNames.LogFileName(WalDir, walNumber);
+            if (progress.StopReplayByWalFilter)
+            {
+                LogWalFileDropped(fname);
+                continue;
+            }
+            var reporter = new WalRecoveryReporter
+            {
+                FileName = fname,
+                RecordErrors = Options.ParanoidChecks && mode != WalRecoveryMode.SkipAnyCorruptedRecords,
+            };
+            progress.LastSeqnoObserved = 0;
+            // InitializeLogReader: checksums are always verified, even without paranoid_checks.
+            using (var reader = new LogReader(FileSystem.OpenSequential(fname), reporter, checksum: true, walNumber)
+            {
+                RecoveryMode = mode,
+                TrackAndVerifyWals = Options.TrackAndVerifyWals,
+                StopReplayForCorruption = progress.StopReplay,
+                MinWalNumberToKeep = minLog,
+                ObservedPredecessorWalInfo = progress.Predecessor,
+                FileName = fname,
+            })
+            {
+                while (!progress.StopReplayByWalFilter)
+                {
+                    bool processed = ReplayNextRecord(reader, reporter, walNumber, fname, progress);
+                    // Memtables that filled up during recovery are written out right away (MaybeWriteLevel0TableForRecovery).
+                    if (_flushScheduler.Count > 0)
+                    {
+                        if (!readOnly)
+                        {
+                            foreach (ColumnFamilyData cfd in _flushScheduler)
+                            {
+                                await FlushRecoveredMemTableAsync(cfd, edits!, progress.LastSequence, synchronous, ct).ConfigureAwait(false);
+                            }
+                        }
+                        _flushScheduler.Clear();
+                    }
+                    if (!processed || progress.StopReplay) break;
+                }
+            }
+            if (reporter.Error is null)
+            {
+                UpdatePredecessorWalInfo(walNumber, fname, progress);
+                continue;
+            }
+            // HandleNonOkStatusOrOldLogRecord.
+            RocksDbException err = reporter.Error;
+            // NotSupported is not a corruption (e.g. a WAL filter returning more records than the original batch).
+            if (err.Code == StatusCode.NotSupported) throw err;
+            switch (mode)
+            {
+                case WalRecoveryMode.SkipAnyCorruptedRecords:
+                    break; // ignore all errors unconditionally
+                case WalRecoveryMode.PointInTimeRecovery:
+                    if (err.Code == StatusCode.IOError)
+                    {
+                        LogError("IOError during point-in-time reading log #" + walNumber + ". " + err.Message +
+                            ". This likely mean loss of synced WAL, thus recovery fails.");
+                        throw err;
+                    }
+                    // We should ignore the error but not continue replaying. Later WALs are still read: replay resumes
+                    // if one continues the sequence (MaybeReviseStopReplayForCorruption), e.g. writes made after an
+                    // earlier point-in-time recovery.
+                    progress.StopReplay = true;
+                    corruptedWal = reporter.CorruptedLogNumber != LogReporter.UnspecifiedLogNumber ? reporter.CorruptedLogNumber : walNumber;
+                    break;
+                default:
+                    throw err;
+            }
+        }
+        if (progress.StopReplay && mode is WalRecoveryMode.PointInTimeRecovery or WalRecoveryMode.TolerateCorruptedTailRecords)
+        {
+            foreach (ColumnFamilyData cfd in GetColumnFamilies())
+            {
+                ulong liveBytes = 0;
+                VersionStorageInfo vs = cfd.Current.Storage;
+                for (int l = 0; l < vs.NumLevels; l++) liveBytes += vs.NumLevelBytes(l);
+                if (cfd.LogNumber > corruptedWal && liveBytes > 0)
+                {
+                    LogError("Column family inconsistency: SST file contains data beyond the point of corruption.");
+                    ThrowHelper.Corruption("Column family inconsistency: SST file contains data beyond the point of corruption in CF " + cfd.Name);
+                }
+            }
+        }
+        return progress;
+    }
+
+    private void LogWalFileDropped(string fname)
+    {
+        long bytes;
+        try { bytes = FileSystem.GetFileSize(fname); }
+        catch (Exception e) when (e is IOException or RocksDbException) { return; }
+        LogWarn(fname + ": dropping " + bytes.ToString(CultureInfo.InvariantCulture) + " bytes");
+    }
+
+    /// <summary>
+    /// Port of DBImpl::UpdatePredecessorWALInfo: a WAL replayed without error becomes the observed predecessor of the
+    /// next one (its number, its size on disk and the sequence of its last record). DEBUG builds pass
+    /// [fixed64 wal number, fixed64 mock seqno = kMaxSequenceNumber] to the "DBImpl::UpdatePredecessorWALInfo" span hook;
+    /// a test may overwrite the seqno.
+    /// </summary>
+    private void UpdatePredecessorWalInfo(ulong walNumber, string fname, ReplayProgress progress)
+    {
+        ulong bytes = (ulong)FileSystem.GetFileSize(fname);
+        ulong seqno = progress.LastSeqnoObserved;
+#if DEBUG
+        Span<byte> pair = stackalloc byte[16];
+        Util.Coding.EncodeFixed64(pair, walNumber);
+        Util.Coding.EncodeFixed64(pair[8..], DbFormat.MaxSequenceNumber);
+        TestHooks.InvokeSpan("DBImpl::UpdatePredecessorWALInfo", pair);
+        ulong mock = Util.Coding.DecodeFixed64(pair[8..]);
+        if (mock != DbFormat.MaxSequenceNumber) seqno = mock;
+#endif
+        progress.Predecessor = new PredecessorWalInfo(walNumber, bytes, seqno);
+    }
+
     private sealed class ReplayProgress
     {
         public ulong LastSequence;
         public bool AnyData;
         /// <summary>Sequence the next record must start with to resume after a corruption (next_sequence), or MaxValue.</summary>
         public ulong NextSequence = ulong.MaxValue;
-        /// <summary>Point-in-time recovery hit a corruption: records are dropped until the sequence continues.</summary>
+        /// <summary>Point-in-time recovery hit a corruption: WALs are dropped until one continues the sequence.</summary>
         public bool StopReplay;
+        /// <summary>The WAL filter stopped the replay: the remaining records and WALs are dropped (stop_replay_by_wal_filter).</summary>
+        public bool StopReplayByWalFilter;
+        /// <summary>Sequence of the last record read from the current WAL (last_seqno_observed), 0 if none.</summary>
+        public ulong LastSeqnoObserved;
+        /// <summary>The last WAL replayed without error (predecessor_wal_info), null before the first one.</summary>
+        public PredecessorWalInfo? Predecessor;
+        /// <summary>Record and replacement batches handed to the WAL filter (reused for every record).</summary>
+        public WriteBatch? FilterBatch;
+        public WriteBatch? FilterNewBatch;
     }
 
-    /// <summary>Reads one WAL record and inserts it into the memtables. Returns false at the end of the WAL.</summary>
-    private bool ReplayNextRecord(LogReader reader, WalRecoveryReporter reporter, ulong walNumber, ReplayProgress progress)
+    /// <summary>
+    /// Reads one WAL record and processes it (DBImpl::ProcessLogRecord): WAL filter, then insert into the memtables.
+    /// Returns false at the end of the WAL or once the WAL's status is not OK (the caller then stops reading the WAL).
+    /// </summary>
+    private bool ReplayNextRecord(LogReader reader, WalRecoveryReporter reporter, ulong walNumber, string fname, ReplayProgress progress)
     {
-        if (!reader.TryReadRecord(out ReadOnlySpan<byte> record)) return false;
+        // Reading changes reporter.Error when a corruption is encountered.
+        if (!reader.TryReadRecord(out ReadOnlySpan<byte> record) || reporter.Error is not null) return false;
         if (record.Length < WriteBatch.HeaderSize)
         {
-            reporter.Corruption(record.Length, StatusCode.Corruption, "log record too small", walNumber);
+            reporter.Corruption(record.Length, StatusCode.Corruption, "log record too small", LogReporter.UnspecifiedLogNumber);
             return true;
-        }
-        ulong seq = Util.Coding.DecodeFixed64(record);
-        uint count = Util.Coding.DecodeFixed32(record[8..]);
-        if (progress.StopReplay)
-        {
-            // MaybeReviseStopReplayForCorruption: in point-in-time recovery mode, if sequence ids are consecutive we
-            // continue recovery despite the corruption.
-            if (Options.WalRecoveryMode == WalRecoveryMode.PointInTimeRecovery && seq == progress.NextSequence) progress.StopReplay = false;
-            else return true; // dropped
         }
         IReadOnlyDictionary<uint, int> recordedTs = reader.RecordedTimestampSizes;
         byte[]? reconciled = null;
         if (_cfTimestampSizes is not null || recordedTs.Count > 0) reconciled = HandleRecoveredBatchTimestampSizes(record, recordedTs);
         if (reconciled is not null) record = reconciled;
+        ulong seq = Util.Coding.DecodeFixed64(record);
+        progress.LastSeqnoObserved = seq;
+        if (progress.StopReplay)
+        {
+            // MaybeReviseStopReplayForCorruption: in point-in-time recovery mode, if sequence ids are consecutive we
+            // continue recovery despite the corruption. Otherwise the rest of this WAL is dropped.
+            if (Options.WalRecoveryMode == WalRecoveryMode.PointInTimeRecovery && seq == progress.NextSequence)
+            {
+                progress.StopReplay = false;
+            }
+            else
+            {
+                LogWalFileDropped(fname);
+                return true;
+            }
+        }
+        // For the default case of wal_filter == null, always performs no-op.
+        if (Options.WalFilter is { } filter && !InvokeWalFilterOnWalRecord(filter, walNumber, fname, reporter, progress, ref record))
+        {
+            return true;
+        }
+        uint count = Util.Coding.DecodeFixed32(record[8..]);
         var inserter = new MemTableInserter(this, walNumber, ignoreMissingColumnFamilies: true) { Sequence = seq };
         inserter.Run(record);
         // next_sequence comes from the inserter, not the record header: a prepared section counts its entries but
@@ -700,6 +826,82 @@ internal sealed partial class DbImpl
         {
             ulong last = next - 1;
             if (last > progress.LastSequence) progress.LastSequence = last;
+        }
+        return true;
+    }
+
+    /// <summary>Port of DBImpl::InvokeWalFilterIfNeededOnColumnFamilyToWalNumberMap.</summary>
+    private void InvokeWalFilterOnColumnFamilyToWalNumberMap()
+    {
+        if (Options.WalFilter is not { } filter) return;
+        var logNumbers = new SortedDictionary<uint, ulong>();
+        var nameIds = new SortedDictionary<string, uint>(StringComparer.Ordinal);
+        foreach (ColumnFamilyData cfd in GetColumnFamilies())
+        {
+            nameIds.TryAdd(cfd.Name, cfd.Id);
+            logNumbers.TryAdd(cfd.Id, cfd.LogNumber);
+        }
+        filter.ColumnFamilyLogNumberMap(logNumbers, nameIds);
+    }
+
+    /// <summary>
+    /// Port of DBImpl::InvokeWalFilterIfNeededOnWalRecord: returns false when the record must not be replayed (ignored,
+    /// replay stopped, reported corrupted, or an invalid replacement), with the WAL's status set where upstream sets it.
+    /// A replacement batch (batch_changed) gets the original record's sequence and replaces <paramref name="record"/>.
+    /// </summary>
+    private bool InvokeWalFilterOnWalRecord(WalFilter filter, ulong walNumber, string fname, WalRecoveryReporter reporter, ReplayProgress progress,
+        ref ReadOnlySpan<byte> record)
+    {
+        WriteBatch batch = progress.FilterBatch ??= new WriteBatch();
+        WriteBatch newBatch = progress.FilterNewBatch ??= new WriteBatch();
+        batch.SetContents(record);
+        newBatch.Clear();
+        WalProcessingOption option = filter.LogRecordFound(walNumber, fname, batch, newBatch, out bool batchChanged);
+        switch (option)
+        {
+            case WalProcessingOption.ContinueProcessing:
+                break; // do nothing, proceed normally
+            case WalProcessingOption.IgnoreCurrentRecord:
+                return false; // skip current record
+            case WalProcessingOption.StopReplay:
+                // skip current record and stop replay
+                progress.StopReplayByWalFilter = true;
+                return false;
+            case WalProcessingOption.CorruptedRecord:
+                // MaybeIgnoreError: without paranoid_checks the report is ignored and the record is processed.
+                if (Options.ParanoidChecks)
+                {
+                    reporter.Error ??= RocksDbException.Corruption("Corruption reported by Wal Filter : " + filter.Name);
+                    return false;
+                }
+                LogWarn("Ignoring error Corruption: Corruption reported by Wal Filter " + filter.Name);
+                break;
+            default:
+                // Not a WalProcessingOption: with paranoid_checks the replay stops and the open fails; otherwise the error
+                // is ignored and the record processed.
+                if (Options.ParanoidChecks)
+                {
+                    reporter.Error ??= RocksDbException.NotSupported("Unknown WalProcessingOption returned by Wal Filter : " + filter.Name);
+                    progress.StopReplayByWalFilter = true;
+                    return false;
+                }
+                break;
+        }
+        if (batchChanged)
+        {
+            // Make sure that the count in the new batch is within the original count.
+            int newCount = newBatch.Count;
+            int originalCount = batch.Count;
+            if (newCount > originalCount)
+            {
+                _infoLog?.Log(InfoLogLevel.Fatal, "Recovering log #" + walNumber + " mode " + (int)Options.WalRecoveryMode + " log filter " + filter.Name +
+                    " returned more records (" + newCount + ") than original (" + originalCount + ") which is not allowed. Aborting recovery.");
+                reporter.Error ??= RocksDbException.NotSupported("More than original # of records returned by Wal Filter : " + filter.Name);
+                return false;
+            }
+            // Set the same sequence number in the new_batch as the original batch.
+            newBatch.Sequence = batch.Sequence;
+            record = newBatch.Data;
         }
         return true;
     }

@@ -132,6 +132,8 @@ public sealed class LogReader : IDisposable
     public ulong MinWalNumberToKeep { get; init; } = ulong.MaxValue;
     /// <summary>The predecessor WAL actually observed during recovery, if any.</summary>
     public PredecessorWalInfo? ObservedPredecessorWalInfo { get; init; }
+    /// <summary>Name of the file, for corruption messages (<c>file_->file_name()</c>); the log number when null.</summary>
+    public string? FileName { get; init; }
 
     public ulong LogNumber => _logNumber;
     /// <summary>Whether the reader has encountered an EOF condition.</summary>
@@ -795,7 +797,7 @@ public sealed class LogReader : IDisposable
         }
         else if (observed.LogNumber != recordedLogNumber)
         {
-            ReportCorruption(_fragLength, "Mismatched predecessor log number of WAL file " + _logNumber + " Recorded " +
+            ReportCorruption(_fragLength, "Mismatched predecessor log number of WAL file " + (FileName ?? _logNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)) + " Recorded " +
                 recordedLogNumber + ". Observed " + observed.LogNumber, recordedLogNumber);
         }
         else if (observed.LastSequenceRecorded != recorded.LastSequenceRecorded)

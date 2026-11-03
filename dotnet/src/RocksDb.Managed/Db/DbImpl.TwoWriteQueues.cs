@@ -110,13 +110,15 @@ internal sealed partial class DbImpl
     /// record to the WAL and runs the pre-release callbacks.
     /// </summary>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    private async ValueTask WriteWalOnlyAsync(WriteOptions? options, WriteBatch batch, TransactionWriteContext txn, bool synchronous, CancellationToken cancellationToken)
+    private async ValueTask WriteWalOnlyAsync(WriteOptions? options, WriteBatch batch, TransactionWriteContext txn, UserWriteCallback? userCallback, bool synchronous,
+        CancellationToken cancellationToken)
     {
         Statistics? stats = Options.Statistics;
         long writeStart = stats?.StartTimer() ?? 0;
         WriteThread.Writer w = WriteThread.Rent(synchronous);
         w.Prepare(batch, options, synchronous);
         w.Txn = txn;
+        w.UserCallback = userCallback;
         try
         {
             if (!_nonmemWriteThread!.JoinBatchGroup(w))
@@ -228,7 +230,7 @@ internal sealed partial class DbImpl
                         if (_cfTimestampSizes is { } tsSizes) log.MaybeAddUserDefinedTimestampSizeRecord(tsSizes);
                         if (synchronous)
                         {
-                            log.AddRecord(record.Span, last);
+                            log.AddRecord(record.Span, first);
                             if (needSync)
                             {
                                 // Requesting sync with two_write_queues is expected to be very rare (upstream calls
@@ -241,7 +243,7 @@ internal sealed partial class DbImpl
                         }
                         else
                         {
-                            await log.AddRecordAsync(record, last, CancellationToken.None).ConfigureAwait(false);
+                            await log.AddRecordAsync(record, first, CancellationToken.None).ConfigureAwait(false);
                             if (needSync)
                             {
                                 if (_closedWalsToSync.Count > 0) await SyncClosedWalsAsync(synchronous: false).ConfigureAwait(false);
@@ -274,6 +276,11 @@ internal sealed partial class DbImpl
                 finally
                 {
                     _walWriteLock!.Release();
+                }
+                // ConcurrentWriteGroupToWAL: CheckPostWalWriteCallback once the WAL write lock is released.
+                for (int i = 0; i < group.Count; i++)
+                {
+                    if (!group[i].CallbackFailed) group[i].CheckPostWalWriteCallback();
                 }
             }
             else

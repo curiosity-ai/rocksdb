@@ -67,9 +67,27 @@ internal sealed partial class DbImpl
     /// DBImpl::WriteImpl (write callback, disable_memtable, log_ref, log_used, WAL-only commit marker). See
     /// <see cref="TransactionWriteContext"/>.
     /// </summary>
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    internal async ValueTask WriteAsync(WriteOptions? options, WriteBatch batch, bool validateColumnFamilies, TransactionWriteContext? txn, bool synchronous,
+    internal ValueTask WriteAsync(WriteOptions? options, WriteBatch batch, bool validateColumnFamilies, TransactionWriteContext? txn, bool synchronous,
+        CancellationToken cancellationToken) =>
+        WriteImplAsync(options, batch, validateColumnFamilies, txn, userCallback: null, synchronous, cancellationToken);
+
+    /// <summary>
+    /// DB::WriteWithCallback(options, updates, user_write_cb): <see cref="WriteAsync(WriteOptions?, WriteBatch, bool, bool, CancellationToken)"/>
+    /// that notifies <paramref name="userCallback"/> when the write is enqueued and when its WAL record is written. Not
+    /// supported by sequence-per-batch (WritePrepared / WriteUnprepared) DBs, whose plain writes go through the
+    /// transaction layer (upstream's StackableDB does not implement WriteWithCallback either).
+    /// </summary>
+    internal ValueTask WriteWithCallbackAsync(WriteOptions? options, WriteBatch batch, UserWriteCallback userCallback, bool synchronous,
         CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(userCallback);
+        if (_seqPerBatch) ThrowHelper.NotSupported("WriteWithCallback not implemented for this interface.");
+        return WriteImplAsync(options, batch, validateColumnFamilies: true, txn: null, userCallback, synchronous, cancellationToken);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask WriteImplAsync(WriteOptions? options, WriteBatch batch, bool validateColumnFamilies, TransactionWriteContext? txn,
+        UserWriteCallback? userCallback, bool synchronous, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(batch);
         ThrowIfDisposed();
@@ -87,7 +105,7 @@ internal sealed partial class DbImpl
         {
             // two_write_queues: WAL-only writes (2PC prepare of WriteCommitted, commit markers of WritePrepared /
             // WriteUnprepared) go to the second queue (DBImpl::WriteImpl -> WriteImplWALOnly).
-            await WriteWalOnlyAsync(options, batch, txn, synchronous, cancellationToken).ConfigureAwait(false);
+            await WriteWalOnlyAsync(options, batch, txn, userCallback, synchronous, cancellationToken).ConfigureAwait(false);
             return;
         }
         if (_seqPerBatch && (txn is null || txn.BatchCount == 0))
@@ -99,12 +117,12 @@ internal sealed partial class DbImpl
         }
         if (_unorderedWrite)
         {
-            await WriteUnorderedAsync(options, batch, txn, synchronous, cancellationToken).ConfigureAwait(false);
+            await WriteUnorderedAsync(options, batch, txn, userCallback, synchronous, cancellationToken).ConfigureAwait(false);
             return;
         }
         if (_pipelined)
         {
-            await WritePipelinedAsync(options, batch, txn, synchronous, cancellationToken).ConfigureAwait(false);
+            await WritePipelinedAsync(options, batch, txn, userCallback, synchronous, cancellationToken).ConfigureAwait(false);
             return;
         }
         Statistics? stats = Options.Statistics;
@@ -112,6 +130,7 @@ internal sealed partial class DbImpl
         WriteThread.Writer w = WriteThread.Rent(synchronous);
         w.Prepare(batch, options, synchronous);
         w.Txn = txn;
+        w.UserCallback = userCallback;
         try
         {
             if (!_writeThread.JoinBatchGroup(w))
@@ -164,7 +183,8 @@ internal sealed partial class DbImpl
     /// as upstream).
     /// </summary>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    private async ValueTask WritePipelinedAsync(WriteOptions? options, WriteBatch batch, TransactionWriteContext? txn, bool synchronous,
+    private async ValueTask WritePipelinedAsync(WriteOptions? options, WriteBatch batch, TransactionWriteContext? txn, UserWriteCallback? userCallback,
+        bool synchronous,
         CancellationToken cancellationToken)
     {
         if (_twoWriteQueues) ThrowHelper.NotSupported("pipelined_writes is not compatible with concurrent prepares");
@@ -174,6 +194,7 @@ internal sealed partial class DbImpl
         WriteThread.Writer w = WriteThread.Rent(synchronous);
         w.Prepare(batch, options, synchronous);
         w.Txn = txn;
+        w.UserCallback = userCallback;
         try
         {
             int state = WriteThread.StateGroupLeader;
@@ -562,7 +583,7 @@ internal sealed partial class DbImpl
             if (_cfTimestampSizes is { } tsSizes) log.MaybeAddUserDefinedTimestampSizeRecord(tsSizes);
             if (synchronous)
             {
-                log.AddRecord(record.Span, last);
+                log.AddRecord(record.Span, Util.Coding.DecodeFixed64(record.Span));
                 if (needSync)
                 {
                     // WriteToWAL with need_log_sync: every WAL in logs_ is synced, oldest first.
@@ -575,7 +596,7 @@ internal sealed partial class DbImpl
             {
                 // No cancellation once the group is being committed: an abandoned AddRecord would leave a torn
                 // record in the middle of the WAL (and fail followers that did not ask for cancellation).
-                await log.AddRecordAsync(record, last, CancellationToken.None).ConfigureAwait(false);
+                await log.AddRecordAsync(record, Util.Coding.DecodeFixed64(record.Span), CancellationToken.None).ConfigureAwait(false);
                 if (needSync)
                 {
                     if (_closedWalsToSync.Count > 0) await SyncClosedWalsAsync(synchronous: false).ConfigureAwait(false);
@@ -597,8 +618,12 @@ internal sealed partial class DbImpl
         }
         for (int i = 0; i < group.Count; i++)
         {
+            WriteThread.Writer w = group[i];
+            if (w.CallbackFailed) continue;
+            // WriteGroupToWAL: CheckPostWalWriteCallback of every writer whose callback did not fail.
+            w.CheckPostWalWriteCallback();
             // PreReleaseCallback of WriteCommittedTxn::PrepareInternal (MarkLogCallback) + log_used.
-            if (group[i] is { CallbackFailed: false, Txn: { } t })
+            if (w.Txn is { } t)
             {
                 t.LogUsed = _logNumber;
                 if (t.MarkLogContainingPrepSection) MarkLogAsContainingPrepSection(_logNumber);
@@ -911,8 +936,13 @@ internal sealed partial class DbImpl
             newLogNumber = Versions.NewFileNumber();
             try
             {
-                newLog = CreateWal(newLogNumber);
                 LogWriter? old = _log;
+                // SwitchMemtable: the new WAL records its predecessor (the current WAL: number, size so far including
+                // buffered bytes, and the sequence of its last record) for track_and_verify_wals.
+                PredecessorWalInfo? predecessor = old?.File is { } oldFile
+                    ? new PredecessorWalInfo(old.LogNumber, (ulong)oldFile.Size, old.LastSequenceRecorded)
+                    : null;
+                newLog = CreateWal(newLogNumber, predecessor);
                 if (old is not null && walFailed)
                 {
                     // Its data is in the memtables, which the recovery flushes.
@@ -1141,8 +1171,12 @@ internal sealed partial class DbImpl
     /// <summary>Writeback granularity of a WAL without wal_bytes_per_sync (see <see cref="CreateWal"/>).</summary>
     private const long WalWritebackBytes = 1 << 20;
 
-    /// <summary>Creates WAL #<paramref name="number"/> (DBImpl::CreateWAL).</summary>
-    private LogWriter CreateWal(ulong number)
+    /// <summary>
+    /// Creates WAL #<paramref name="number"/> (DBImpl::CreateWAL + StartWALFile): the compression type record, then with
+    /// track_and_verify_wals the predecessor-WAL-info record when <paramref name="predecessor"/> is known
+    /// (Writer::MaybeAddPredecessorWALInfo). Like upstream, the first WAL of an open has no predecessor record.
+    /// </summary>
+    private LogWriter CreateWal(ulong number, PredecessorWalInfo? predecessor)
     {
         string path = FileNames.LogFileName(WalDir, number);
         var fileOptions = new WritableFileOptions
@@ -1158,6 +1192,7 @@ internal sealed partial class DbImpl
         {
             var log = new LogWriter(file, number, recycleLogFiles: false, Options.ManualWalFlush, Options.WalCompression, 0);
             log.AddCompressionTypeRecord();
+            if (Options.TrackAndVerifyWals && predecessor is { } info) log.AddPredecessorWalInfo(info);
             return log;
         }
         catch

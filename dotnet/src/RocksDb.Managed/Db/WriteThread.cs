@@ -150,6 +150,12 @@ internal sealed class WriteThread
         public bool CallbackFailed;
         /// <summary>The write thread the writer joined (its adaptive-yield context for <see cref="WaitSync"/>).</summary>
         public WriteThread? Owner;
+        /// <summary>DB::WriteWithCallback's user_write_cb (null for every other write).</summary>
+        public UserWriteCallback? UserCallback;
+
+        /// <summary>CheckPostWalWriteCallback: the writer's WAL record is written.</summary>
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        public void CheckPostWalWriteCallback() => UserCallback?.OnWalWriteFinish();
 
         public void Prepare(WriteBatch? batch, WriteOptions? options, bool syncWaiter)
         {
@@ -165,6 +171,7 @@ internal sealed class WriteThread
             MemNext = null;
             Txn = null;
             CallbackFailed = false;
+            UserCallback = null;
             Rearm();
         }
 
@@ -260,23 +267,30 @@ internal sealed class WriteThread
     public bool JoinBatchGroup(Writer w)
     {
         w.Owner = this;
+        bool linkedAsLeader;
         lock (_lock)
         {
             if (!_leaderActive)
             {
                 Debug.Assert(_head is null);
                 _leaderActive = true;
-                return true;
+                linkedAsLeader = true;
             }
-            w.Next = null;
-            if (_tail is null) _head = _tail = w;
             else
             {
-                _tail.Next = w;
-                _tail = w;
+                w.Next = null;
+                if (_tail is null) _head = _tail = w;
+                else
+                {
+                    _tail.Next = w;
+                    _tail = w;
+                }
+                linkedAsLeader = false;
             }
-            return false;
         }
+        // CheckWriteEnqueuedCallback (after LinkOne, before waiting).
+        w.UserCallback?.OnWriteEnqueued();
+        return linkedAsLeader;
     }
 
     /// <summary>

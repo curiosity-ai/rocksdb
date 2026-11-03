@@ -196,6 +196,20 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public ValueTask WriteAsync(WriteOptions? options, WriteBatch batch, CancellationToken cancellationToken = default) =>
         _db.WriteAsync(options, batch, validateColumnFamilies: true, synchronous: false, cancellationToken);
 
+    /// <summary>
+    /// Like <see cref="Write(WriteOptions?, WriteBatch)"/>, notifying <paramref name="callback"/> when the write is
+    /// enqueued (<see cref="UserWriteCallback.OnWriteEnqueued"/>) and when its WAL record has been written
+    /// (<see cref="UserWriteCallback.OnWalWriteFinish"/>, not called with <see cref="WriteOptions.DisableWal"/>), e.g. to
+    /// order concurrent writers. Port of DB::WriteWithCallback(options, updates, user_write_cb). Not supported
+    /// (NotSupported) on WritePrepared / WriteUnprepared transaction DBs.
+    /// </summary>
+    public void WriteWithCallback(WriteOptions? options, WriteBatch batch, UserWriteCallback callback) =>
+        _db.WriteWithCallbackAsync(options, batch, callback, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+
+    /// <summary>Asynchronous <see cref="WriteWithCallback(WriteOptions?, WriteBatch, UserWriteCallback)"/>.</summary>
+    public ValueTask WriteWithCallbackAsync(WriteOptions? options, WriteBatch batch, UserWriteCallback callback, CancellationToken cancellationToken = default) =>
+        _db.WriteWithCallbackAsync(options, batch, callback, synchronous: false, cancellationToken);
+
     /// <summary>Takes a snapshot of the current state (DB::GetSnapshot). Dispose it to release.</summary>
     public Snapshot GetSnapshot() => _db.GetSnapshot();
 

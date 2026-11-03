@@ -64,7 +64,8 @@ compaction filters and TTL, manual compaction, write stalls, block cache (LRU an
 listeners, the info `LOG`, dynamic options (`SetOptions` / `SetDBOptions`), optimistic and pessimistic transactions,
 `WriteBatchWithIndex`, wide columns, user-defined timestamps, BlobDB, TTL, checkpoints, BackupEngine, `SstFileWriter` /
 ingestion, WAL tailing, read-only and secondary instances, background error handling with `Resume`, best-efforts recovery, WAL tracking in
-the MANIFEST (`TrackAndVerifyWalsInManifest`), an `SstFileManager` (space limit, rate-limited deletion, automatic
+the MANIFEST (`TrackAndVerifyWalsInManifest`) and predecessor-WAL records in each WAL (`TrackAndVerifyWals`), WAL filters
+(`DbOptions.WalFilter`), write callbacks (`WriteWithCallback` with a `UserWriteCallback`), an `SstFileManager` (space limit, rate-limited deletion, automatic
 recovery from out-of-space errors) and a `GenericRateLimiter` for flush and compaction writes and, in reads-only / all-I/O
 mode, compaction input and user reads (`DbOptions.RateLimiter`, `ReadOptions.RateLimiterPriority`).
 
