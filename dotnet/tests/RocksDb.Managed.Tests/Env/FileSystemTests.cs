@@ -7,7 +7,7 @@ namespace RocksDb.Managed.Tests.Env;
 /// both <see cref="LocalFileSystem"/> and <see cref="MemoryFileSystem"/>.
 /// </summary>
 [TestClass]
-public sealed class FileSystemTests
+public sealed partial class FileSystemTests
 {
     public static IEnumerable<object[]> FileSystems => [["local"], ["memory"]];
 
@@ -186,6 +186,59 @@ public sealed class FileSystemTests
         l.Dispose();
         l.Dispose(); // idempotent
         using IDisposable again = fx.Fs.LockFile(lockPath);
+    }
+
+    /// <summary>
+    /// Regression: on Linux the LOCK is an open-file-description (OFD) lock, which belongs to the open file
+    /// description rather than to the descriptor. A child process started by any thread of this process (vfork/fork
+    /// before exec) briefly shares that description, so merely closing our descriptor did not release the lock until
+    /// the child exec'd, and an immediate reopen failed with "Resource temporarily unavailable". The extra reference
+    /// is modelled here with dup(2): releasing the lock must not depend on other references closing.
+    /// </summary>
+    [TestMethod]
+    public void LockFileReleasedWhileDescriptionStillReferenced()
+    {
+        if (!OperatingSystem.IsLinux()) Assert.Inconclusive("OFD locks are Linux-only");
+        using var fx = new Fixture("local");
+        string lockPath = fx.P("LOCK");
+        IDisposable l = fx.Fs.LockFile(lockPath);
+        int dupFd = DupDescriptorOf(lockPath);
+        try
+        {
+            l.Dispose();
+            using IDisposable again = fx.Fs.LockFile(lockPath);
+        }
+        finally
+        {
+            Assert.AreEqual(0, LibC.close(dupFd));
+        }
+    }
+
+    /// <summary>dup(2) of this process's descriptor open on <paramref name="path"/> (found through /proc/self/fd).</summary>
+    private static int DupDescriptorOf(string path)
+    {
+        string full = Path.GetFullPath(path);
+        foreach (string link in Directory.GetFiles("/proc/self/fd"))
+        {
+            string? target;
+            try { target = new FileInfo(link).LinkTarget; }
+            catch (IOException) { continue; }
+            if (target != full) continue;
+            int fd = LibC.dup(int.Parse(Path.GetFileName(link), System.Globalization.CultureInfo.InvariantCulture));
+            Assert.IsGreaterThanOrEqualTo(0, fd, "dup failed");
+            return fd;
+        }
+        Assert.Fail("no descriptor open on " + full);
+        return -1;
+    }
+
+    private static partial class LibC
+    {
+        [System.Runtime.InteropServices.LibraryImport("libc", SetLastError = true)]
+        public static partial int dup(int fd);
+
+        [System.Runtime.InteropServices.LibraryImport("libc", SetLastError = true)]
+        public static partial int close(int fd);
     }
 
     [TestMethod]
