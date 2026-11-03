@@ -33,13 +33,21 @@ public sealed class CompactionIteratorTests
     }
 
     private static List<string> Run(TestInternalIterator input, ulong[] snapshots, Compaction? compaction, MergeOperator? merge = null,
-        RangeDelAggregator? rangeDel = null, CompactionFilter? filter = null)
+        RangeDelAggregator? rangeDel = null, CompactionFilter? filter = null) =>
+        Run(input, snapshots, compaction, merge, rangeDel, filter, null, 0);
+
+    private static List<string> Run(TestInternalIterator input, ulong[] snapshots, Compaction? compaction, MergeOperator? merge,
+        RangeDelAggregator? rangeDel, CompactionFilter? filter, SnapshotChecker? checker, ulong jobSnapshot)
     {
         input.Finish();
         InternalKeyComparator icmp = InternalKeyComparator.Bytewise;
         rangeDel ??= RangeDelAggregator.ForCompaction(icmp, snapshots);
         using MergeHelper? mh = merge is null ? null : new MergeHelper(icmp, merge, filter, snapshots.Length == 0 ? 0 : snapshots[^1], 1);
-        using var it = new CompactionIterator(input, icmp, mh, snapshots, DbFormat.MaxSequenceNumber, rangeDel, compaction, filter, true, default);
+        using var it = new CompactionIterator(input, icmp, mh, snapshots, DbFormat.MaxSequenceNumber, rangeDel, compaction, filter, true, default)
+        {
+            SnapshotChecker = checker,
+            JobSnapshot = jobSnapshot,
+        };
         var result = new List<string>();
         input.SeekToFirst();
         for (it.SeekToFirst(); it.Valid; it.Next())
@@ -262,5 +270,40 @@ public sealed class CompactionIteratorTests
         // Not bottommost: the removed key becomes a deletion.
         AssertOutput(Run(input, [], MakeCompaction(bottommost: false), filter: new TestFilter()),
             "change@1:put=new", "drop@2:del=", "keep@3:put=k", "tail@6:put=t");
+    }
+
+    /// <summary>
+    /// Reports <see cref="_lateSequence"/> as uncommitted on its first query only: the transaction commits while the
+    /// compaction is running (a WritePrepared / WriteUnprepared commit racing a background compaction).
+    /// </summary>
+    private sealed class CommitsDuringCompactionChecker(ulong lateSequence) : SnapshotChecker
+    {
+        private readonly ulong _lateSequence = lateSequence;
+        private bool _reported;
+
+        public override SnapshotCheckerResult CheckInSnapshot(ulong sequence, ulong snapshotSequence)
+        {
+            if (sequence > snapshotSequence) return SnapshotCheckerResult.NotInSnapshot;
+            if (sequence != _lateSequence || _reported) return SnapshotCheckerResult.InSnapshot;
+            _reported = true;
+            return SnapshotCheckerResult.NotInSnapshot;
+        }
+    }
+
+    /// <summary>
+    /// Regression (TwoWriteQueuesTests.CommitsRacingReaders): a version that was uncommitted when the iterator reached
+    /// it is output as is, so the older committed version is kept too. If the commit lands before PrepareOutput, the
+    /// uncommitted version must still not get its sequence zeroed (upstream requires current_key_committed_), or
+    /// both versions become a@0 and the table builder rejects the out-of-order key.
+    /// </summary>
+    [TestMethod]
+    public void UncommittedVersionCommittedDuringCompactionKeepsItsSequence()
+    {
+        var input = new TestInternalIterator();
+        input.Add("a", EntryType.Value, "v3", 3);
+        input.Add("a", EntryType.Value, "v5", 5);
+        input.Add("b", EntryType.Value, "w", 6);
+        AssertOutput(Run(input, [], MakeCompaction(bottommost: true), null, null, null, new CommitsDuringCompactionChecker(5), 10),
+            "a@5:put=v5", "a@0:put=v3", "b@0:put=w");
     }
 }

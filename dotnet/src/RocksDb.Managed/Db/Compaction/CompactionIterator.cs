@@ -900,8 +900,11 @@ internal sealed class CompactionIterator : IDisposable
         }
         // Zeroing out the sequence number leads to better compression. If this is the bottommost level (no files in lower
         // levels) and the earliest snapshot is larger than this seqno and the userkey differs from the last userkey in
-        // compaction then we can squash the seqno to zero.
+        // compaction then we can squash the seqno to zero. current_key_committed_ was decided when the key was reached:
+        // a version that was uncommitted then was output without hiding older versions, so it keeps its sequence even if
+        // its transaction committed since (DefinitelyInSnapshot asks the snapshot checker again).
         if (_valid && _bottommostLevel && DefinitelyInSnapshot(_ikeySequence, _earliestSnapshot) && _ikeyType != EntryType.Merge
+            && _currentKeyCommitted
             && _ikeySequence <= (PreserveSeqnoAfter ?? _earliestSnapshot)
             && _ikeyType != EntryType.Deletion && (_ikeyType != EntryType.SingleDeletion || _tsSize != 0))
         {
