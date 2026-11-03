@@ -5,7 +5,9 @@ namespace RocksDb.Managed.Table;
 /// <summary>
 /// Iterator over the table's index yielding data block handles; transparently handles a two-level (partitioned)
 /// index. Port of the index-iteration parts of BinarySearchIndexReader / PartitionedIndexIterator
-/// (table/block_based/partitioned_index_iterator.cc). Index partitions are loaded synchronously.
+/// (table/block_based/partitioned_index_iterator.cc). The synchronous moves load index partitions synchronously; the
+/// async moves (<see cref="SeekAsync"/>, <see cref="NextAsync"/>, ...) read a partition that is not cached with async
+/// I/O (completing synchronously on a cache hit or a pinned partition).
 /// </summary>
 internal sealed class IndexCursor
 {
@@ -163,6 +165,106 @@ internal sealed class IndexCursor
         _reader.InitIndexIter(_part, _partRef.Block!, isPartition: true);
     }
 
+    // ---- async moves: partitions read with async I/O ----
+
+    /// <summary>How to position inside a newly loaded partition.</summary>
+    private enum PartOp : byte { Seek, First, Last }
+
+    public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken ct)
+    {
+        _top.Seek(target.Span);
+        return AfterTopMoveAsync(PartOp.Seek, target, ct);
+    }
+
+    /// <summary>Async <see cref="SeekForGet"/> (the hash index prefix seek is in memory).</summary>
+    public ValueTask SeekForGetAsync(ReadOnlyMemory<byte> target, CancellationToken ct)
+    {
+        if (!_partitioned && _reader.TryGetPrefixBlocks(target.Span, out ReadOnlySpan<uint> blocks))
+        {
+            _top.PrefixSeek(target.Span, blocks);
+            return ValueTask.CompletedTask;
+        }
+        return SeekAsync(target, ct);
+    }
+
+    public ValueTask SeekToFirstAsync(CancellationToken ct)
+    {
+        _top.SeekToFirst();
+        return AfterTopMoveAsync(PartOp.First, default, ct);
+    }
+
+    public ValueTask SeekToLastAsync(CancellationToken ct)
+    {
+        _top.SeekToLast();
+        return AfterTopMoveAsync(PartOp.Last, default, ct);
+    }
+
+    public ValueTask NextAsync(CancellationToken ct)
+    {
+        if (!_partitioned)
+        {
+            _top.Next();
+            return ValueTask.CompletedTask;
+        }
+        _part.Next();
+        return SkipEmptyAsync(forward: true, ct);
+    }
+
+    public ValueTask PrevAsync(CancellationToken ct)
+    {
+        if (!_partitioned)
+        {
+            _top.Prev();
+            return ValueTask.CompletedTask;
+        }
+        _part.Prev();
+        return SkipEmptyAsync(forward: false, ct);
+    }
+
+    /// <summary>After a move of the top-level index: load the partition it points to and position in it.</summary>
+    private ValueTask AfterTopMoveAsync(PartOp op, ReadOnlyMemory<byte> target, CancellationToken ct)
+    {
+        if (!_partitioned) return ValueTask.CompletedTask;
+        if (!_top.Valid)
+        {
+            UnloadPartition();
+            return ValueTask.CompletedTask;
+        }
+        UnloadPartition();
+        ValueTask<BlockRef> pending = _reader.GetBlockRefAsync(_top.BlockHandle, BlockKind.Index, _flags, ct);
+        if (!pending.IsCompletedSuccessfully) return LoadPartitionSlowAsync(pending, op, target, ct);
+        PositionInPartition(pending.Result, op, target);
+        return SkipEmptyAsync(op != PartOp.Last, ct);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask LoadPartitionSlowAsync(ValueTask<BlockRef> pending, PartOp op, ReadOnlyMemory<byte> target, CancellationToken ct)
+    {
+        PositionInPartition(await pending.ConfigureAwait(false), op, target);
+        await SkipEmptyAsync(op != PartOp.Last, ct).ConfigureAwait(false);
+    }
+
+    private void PositionInPartition(BlockRef partition, PartOp op, ReadOnlyMemory<byte> target)
+    {
+        _partRef = partition;
+        _reader.InitIndexIter(_part, _partRef.Block!, isPartition: true);
+        switch (op)
+        {
+            case PartOp.Seek: _part.Seek(target.Span); break;
+            case PartOp.First: _part.SeekToFirst(); break;
+            default: _part.SeekToLast(); break;
+        }
+    }
+
+    /// <summary>Async <see cref="SkipEmptyForward"/> / <see cref="SkipEmptyBackward"/>.</summary>
+    private ValueTask SkipEmptyAsync(bool forward, CancellationToken ct)
+    {
+        if (_part.Valid) return ValueTask.CompletedTask;
+        if (forward) _top.Next();
+        else _top.Prev();
+        return AfterTopMoveAsync(forward ? PartOp.First : PartOp.Last, default, ct);
+    }
+
     private void UnloadPartition()
     {
         _part.Clear();
@@ -177,8 +279,8 @@ internal sealed class IndexCursor
 /// (CheckPrefixMayMatch) and leave the iterator invalid without reading any data block when it excludes the prefix.
 /// <para>
 /// Keys/values are spans into pinned block buffers (or the iterator's key buffer) valid until the next move.
-/// The async variants (forward and reverse) only await when a data block has to be read from the file (cache hits
-/// complete synchronously); index partitions are loaded synchronously. Not thread-safe; dispose to release the current block.
+/// The async variants (forward and reverse) only await when a data block or an index partition has to be read from the
+/// file (cache hits complete synchronously). Not thread-safe; dispose to release the current block.
 /// </para>
 /// </summary>
 public sealed class BlockBasedTableIterator : IDisposable
@@ -371,11 +473,8 @@ public sealed class BlockBasedTableIterator : IDisposable
     // ---------------------------------------------------------------------------------------------
     // Async variants: identical positioning, but data block reads are awaited.
 
-    public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default)
-    {
-        _index.SeekToFirst();
-        return PositionAsync(Op.First, default, cancellationToken);
-    }
+    public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) =>
+        ThenPositionAsync(_index.SeekToFirstAsync(cancellationToken), Op.First, default, backward: false, cancellationToken);
 
     public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
@@ -384,21 +483,34 @@ public sealed class BlockBasedTableIterator : IDisposable
             ReleaseBlock();
             return ValueTask.CompletedTask;
         }
-        _index.Seek(target.Span);
-
-        return PositionAsync(Op.Seek, target, cancellationToken);
+        return ThenPositionAsync(_index.SeekAsync(target, cancellationToken), Op.Seek, target, backward: false, cancellationToken);
     }
 
-    /// <summary>Advances; completes synchronously unless the next data block must be read from the file.</summary>
+    /// <summary>Advances; completes synchronously unless the next data block (or index partition) must be read from the file.</summary>
     public ValueTask NextAsync(CancellationToken cancellationToken = default)
     {
         _data.Next();
         if (_data.Valid) return ValueTask.CompletedTask;
-        _index.Next();
-        return PositionAsync(Op.First, default, cancellationToken);
+        return ThenPositionAsync(_index.NextAsync(cancellationToken), Op.First, default, backward: false, cancellationToken);
     }
 
     private enum Op : byte { First, Seek }
+
+    /// <summary>Continues with <see cref="PositionAsync"/> / <see cref="PositionBackwardAsync"/> once the index move completed.</summary>
+    private ValueTask ThenPositionAsync(ValueTask indexMove, Op op, ReadOnlyMemory<byte> target, bool backward, CancellationToken ct)
+    {
+        if (!indexMove.IsCompletedSuccessfully) return ThenPositionSlowAsync(indexMove, op, target, backward, ct);
+        indexMove.GetAwaiter().GetResult();
+        return backward ? PositionBackwardAsync(op, target, ct) : PositionAsync(op, target, ct);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask ThenPositionSlowAsync(ValueTask indexMove, Op op, ReadOnlyMemory<byte> target, bool backward, CancellationToken ct)
+    {
+        await indexMove.ConfigureAwait(false);
+        if (backward) await PositionBackwardAsync(op, target, ct).ConfigureAwait(false);
+        else await PositionAsync(op, target, ct).ConfigureAwait(false);
+    }
 
     private ValueTask PositionAsync(Op op, ReadOnlyMemory<byte> target, CancellationToken ct)
     {
@@ -421,7 +533,9 @@ public sealed class BlockBasedTableIterator : IDisposable
             else _data.SeekToFirst();
             if (_data.Valid) return ValueTask.CompletedTask;
             op = Op.First;
-            _index.Next();
+            ValueTask next = _index.NextAsync(ct);
+            if (!next.IsCompletedSuccessfully) return ThenPositionSlowAsync(next, Op.First, default, backward: false, ct);
+            next.GetAwaiter().GetResult();
         }
     }
 
@@ -432,17 +546,14 @@ public sealed class BlockBasedTableIterator : IDisposable
         if (op == Op.Seek) _data.Seek(target.Span);
         else _data.SeekToFirst();
         if (_data.Valid) return;
-        _index.Next();
+        await _index.NextAsync(ct).ConfigureAwait(false);
         await PositionAsync(Op.First, default, ct).ConfigureAwait(false);
     }
 
-    public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default)
-    {
-        _index.SeekToLast();
-        return PositionBackwardAsync(Op.First, default, cancellationToken);
-    }
+    public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default) =>
+        ThenPositionAsync(_index.SeekToLastAsync(cancellationToken), Op.First, default, backward: true, cancellationToken);
 
-    /// <summary>Async <see cref="SeekForPrev"/>: completes synchronously unless a data block must be read from the file.</summary>
+    /// <summary>Async <see cref="SeekForPrev"/>: completes synchronously unless a data block or index partition must be read from the file.</summary>
     public ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
         if (_prefix.CheckFilter && !CheckPrefixMayMatch(target.Span, backward: true))
@@ -450,19 +561,28 @@ public sealed class BlockBasedTableIterator : IDisposable
             ReleaseBlock();
             return ValueTask.CompletedTask;
         }
-        _index.Seek(target.Span);
-        if (!_index.Valid) _index.SeekToLast();
+        ValueTask seek = _index.SeekAsync(target, cancellationToken);
+        if (!seek.IsCompletedSuccessfully) return SeekForPrevSlowAsync(seek, target, cancellationToken);
+        seek.GetAwaiter().GetResult();
+        if (!_index.Valid) return ThenPositionAsync(_index.SeekToLastAsync(cancellationToken), Op.Seek, target, backward: true, cancellationToken);
         return PositionBackwardAsync(Op.Seek, target, cancellationToken);
     }
 
-    /// <summary>Async <see cref="Prev"/>: completes synchronously unless the previous data block must be read from the file.</summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask SeekForPrevSlowAsync(ValueTask seek, ReadOnlyMemory<byte> target, CancellationToken ct)
+    {
+        await seek.ConfigureAwait(false);
+        if (!_index.Valid) await _index.SeekToLastAsync(ct).ConfigureAwait(false);
+        await PositionBackwardAsync(Op.Seek, target, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Async <see cref="Prev"/>: completes synchronously unless the previous data block (or index partition) must be read from the file.</summary>
     public ValueTask PrevAsync(CancellationToken cancellationToken = default)
     {
         System.Diagnostics.Debug.Assert(Valid);
         _data.Prev();
         if (_data.Valid) return ValueTask.CompletedTask;
-        _index.Prev();
-        return PositionBackwardAsync(Op.First, default, cancellationToken);
+        return ThenPositionAsync(_index.PrevAsync(cancellationToken), Op.First, default, backward: true, cancellationToken);
     }
 
     /// <summary>
@@ -491,7 +611,9 @@ public sealed class BlockBasedTableIterator : IDisposable
             else _data.SeekToLast();
             if (_data.Valid) return ValueTask.CompletedTask;
             op = Op.First;
-            _index.Prev();
+            ValueTask prev = _index.PrevAsync(ct);
+            if (!prev.IsCompletedSuccessfully) return ThenPositionSlowAsync(prev, Op.First, default, backward: true, ct);
+            prev.GetAwaiter().GetResult();
         }
     }
 
@@ -502,7 +624,7 @@ public sealed class BlockBasedTableIterator : IDisposable
         if (op == Op.Seek) _data.SeekForPrev(target.Span);
         else _data.SeekToLast();
         if (_data.Valid) return;
-        _index.Prev();
+        await _index.PrevAsync(ct).ConfigureAwait(false);
         await PositionBackwardAsync(Op.First, default, ct).ConfigureAwait(false);
     }
 

@@ -1352,7 +1352,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
         }
     }
 
-    /// <summary>Async <see cref="Get(ReadOnlySpan{byte}, IBufferWriter{byte}?)"/>: only data block reads are asynchronous; completes synchronously on cache hits.</summary>
+    /// <summary>Async <see cref="Get(ReadOnlySpan{byte}, IBufferWriter{byte}?)"/>: data blocks and index partitions are read asynchronously; completes synchronously on cache hits.</summary>
     public ValueTask<TableGetResult> GetAsync(ReadOnlyMemory<byte> internalKey, IBufferWriter<byte>? value, CancellationToken cancellationToken = default) =>
         GetAsync(internalKey, value, TableReadFlags.None, cancellationToken);
 
@@ -1372,7 +1372,9 @@ public sealed partial class BlockBasedTableReader : IDisposable
         BlockIter data = IterPool.Rent();
         try
         {
-            idx.SeekForGet(internalKey.Span);
+            // Index partitions that are not cached are read with async I/O too.
+            ValueTask seek = idx.SeekForGetAsync(internalKey, cancellationToken);
+            if (!seek.IsCompletedSuccessfully) await seek.ConfigureAwait(false);
             bool first = true;
             while (idx.Valid)
             {
@@ -1389,7 +1391,8 @@ public sealed partial class BlockBasedTableReader : IDisposable
                     data.Clear();
                     block.Release();
                 }
-                idx.Next();
+                ValueTask next = idx.NextAsync(cancellationToken);
+                if (!next.IsCompletedSuccessfully) await next.ConfigureAwait(false);
             }
             return default;
         }
@@ -1415,7 +1418,8 @@ public sealed partial class BlockBasedTableReader : IDisposable
         BlockIter data = IterPool.Rent();
         try
         {
-            idx.SeekForGet(internalKey.Span);
+            ValueTask seek = idx.SeekForGetAsync(internalKey, cancellationToken);
+            if (!seek.IsCompletedSuccessfully) await seek.ConfigureAwait(false);
             bool first = true;
             while (idx.Valid)
             {
@@ -1431,7 +1435,8 @@ public sealed partial class BlockBasedTableReader : IDisposable
                     data.Clear();
                     block.Release();
                 }
-                idx.Next();
+                ValueTask next = idx.NextAsync(cancellationToken);
+                if (!next.IsCompletedSuccessfully) await next.ConfigureAwait(false);
             }
         }
         finally

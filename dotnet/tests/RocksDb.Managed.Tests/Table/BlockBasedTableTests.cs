@@ -313,6 +313,80 @@ public sealed class BlockBasedTableTests
         CollectionAssert.AreEqual(entries[1500].Key, it.Key.ToArray());
     }
 
+    /// <summary>Counts synchronous and asynchronous reads separately (async reads yield first).</summary>
+    private sealed class SyncAsyncCountingFile(byte[] data) : RocksDb.Managed.Env.IRandomAccessFile
+    {
+        public int SyncReads, AsyncReads;
+        public long Length => data.Length;
+        public int Read(long offset, Span<byte> destination)
+        {
+            SyncReads++;
+            return Copy(offset, destination);
+        }
+        public async ValueTask<int> ReadAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken = default)
+        {
+            await Task.Yield();
+            AsyncReads++;
+            return Copy(offset, destination.Span);
+        }
+        private int Copy(long offset, Span<byte> destination)
+        {
+            if (offset >= data.Length) return 0;
+            int n = (int)Math.Min(destination.Length, data.Length - offset);
+            data.AsSpan((int)offset, n).CopyTo(destination);
+            return n;
+        }
+        public void Dispose() { }
+    }
+
+    /// <summary>
+    /// Partitioned index: the async iterator moves and async point lookups read index partitions (not cached: no block
+    /// cache) with async I/O like the data blocks: no synchronous read after the table is open.
+    /// </summary>
+    [TestMethod]
+    public async Task AsyncPathsReadIndexPartitionsAsynchronously()
+    {
+        List<(byte[] Key, byte[] Value)> entries = MakeEntries(3000, 11, 200);
+        byte[] data = BuildTable(entries, new TableFormatOptions { BlockSize = 512, IndexType = IndexType.TwoLevelIndexSearch, MetadataBlockSize = 256 });
+        var file = new SyncAsyncCountingFile(data);
+        using BlockBasedTableReader reader = BlockBasedTableReader.Open(file, TableReaderOptions.Default);
+        Assert.IsTrue(reader.IsPartitionedIndex);
+        Assert.IsTrue(reader.Properties.IndexPartitions > 4);
+        int syncAtOpen = file.SyncReads;
+
+        using (BlockBasedTableIterator it = reader.NewIterator())
+        {
+            int n = 0;
+            await it.SeekToFirstAsync();
+            while (it.Valid)
+            {
+                CollectionAssert.AreEqual(entries[n++].Key, it.Key.ToArray());
+                await it.NextAsync();
+            }
+            Assert.AreEqual(entries.Count, n);
+            await it.SeekToLastAsync();
+            while (it.Valid)
+            {
+                n--;
+                await it.PrevAsync();
+            }
+            Assert.AreEqual(0, n);
+            await it.SeekAsync(entries[2222].Key);
+            CollectionAssert.AreEqual(entries[2222].Key, it.Key.ToArray());
+            await it.SeekForPrevAsync(entries[1111].Key);
+            CollectionAssert.AreEqual(entries[1111].Key, it.Key.ToArray());
+        }
+        using var value = new PooledBufferWriter();
+        for (int i = 0; i < entries.Count; i += 97)
+        {
+            value.Clear();
+            Assert.IsTrue((await reader.GetAsync(LookupKey(UserKeyOf(entries[i].Key)), value)).Found);
+            CollectionAssert.AreEqual(entries[i].Value, value.WrittenSpan.ToArray());
+        }
+        Assert.AreEqual(syncAtOpen, file.SyncReads, "no synchronous reads in the async paths");
+        Assert.IsTrue((ulong)file.AsyncReads > reader.Properties.IndexPartitions);
+    }
+
     [TestMethod]
     public void BlockCacheSeamIsUsed()
     {

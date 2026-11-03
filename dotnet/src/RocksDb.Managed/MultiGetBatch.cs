@@ -369,6 +369,9 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
 
     ReadOnlySpan<byte> ITableMultiGetBatch.InternalKey(int key) => InternalKey(key);
 
+    ReadOnlyMemory<byte> ITableMultiGetBatch.InternalKeyMemory(int key) =>
+        new(_ikeys, _ikeyOffsets[key], _ikeyOffsets[key + 1] - _ikeyOffsets[key]);
+
     internal ReadOnlySpan<byte> InternalKey(int key) => _ikeys.AsSpan(_ikeyOffsets[key], _ikeyOffsets[key + 1] - _ikeyOffsets[key]);
 
     bool ITableMultiGetBatch.Visit(int key, ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value) => _contexts[key]!.SaveValue(internalKey, value);
