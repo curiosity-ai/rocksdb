@@ -25,6 +25,8 @@ internal static class Program
         ("Compaction", Maintenance.Compaction),
         ("OptimisticTransactions", Transactions.Optimistic),
         ("PessimisticTransactions", Transactions.Pessimistic),
+        ("RangeLocks", Transactions.RangeLocks),
+        ("TransactionEntities", Transactions.TransactionEntities),
         ("TwoPhaseCommit", Transactions.TwoPhaseCommit),
         ("WriteBatchWithIndex", Transactions.WriteBatchWithIndexExample),
         ("WideColumns", DataModels.WideColumns),
