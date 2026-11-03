@@ -129,7 +129,8 @@ public sealed class MultiScan : IDisposable
                             end = new byte[l.Length + DbFormat.InternalKeyFooterSize];
                             DbFormat.AppendInternalKey(end, l.Span, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
                         }
-                        if (lease.Reader.TryGetDataBlockSpan(start, end, r.Limit is not null, out long off, out long len)) spans.Add((off, len));
+                        // Data-block prefetch planning needs the block-based index; other table formats are scanned without it.
+                        if (lease.Reader is Table.BlockBasedTableReader bbt && bbt.TryGetDataBlockSpan(start, end, r.Limit is not null, out long off, out long len)) spans.Add((off, len));
                     }
                     if (spans.Count == 0) continue;
                     spans.Sort(static (a, b) => a.Offset.CompareTo(b.Offset));
@@ -144,7 +145,7 @@ public sealed class MultiScan : IDisposable
                             continue;
                         }
                         long n = Math.Min(curEnd - curOff, budget);
-                        reader.Reader.File.Prefetch(curOff, n);
+                        ((Table.BlockBasedTableReader)reader.Reader).File.Prefetch(curOff, n);
                         budget -= n;
                         if (i < spans.Count)
                         {
