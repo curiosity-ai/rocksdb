@@ -40,8 +40,8 @@ namespace RocksDb.Managed.Db.Iterators;
 /// <para><b>Async.</b> Every positioning call has an async variant that awaits the inner iterator and completes
 /// synchronously when no I/O is needed. Forward and reverse movement are step functions shared with the sync path
 /// (the forward FindNextUserEntry / MergeValuesNewToOld steps, and the reverse state machine of ReverseToBackward /
-/// PrevInternal / FindValueForCurrentKey(+UsingSeek) / FindUserKeyBeforeSavedKey); only the direction switch of
-/// <see cref="NextAsync"/> after reverse movement (ReverseToForward) is synchronous.</para>
+/// PrevInternal / FindValueForCurrentKey(+UsingSeek) / FindUserKeyBeforeSavedKey); the direction switch of
+/// <see cref="NextAsync"/> after reverse movement (ReverseToForward) awaits the inner iterator too.</para>
 /// <para>Not thread-safe.</para>
 /// </remarks>
 public sealed class DbIter : IDisposable
@@ -1280,7 +1280,9 @@ public sealed class DbIter : IDisposable
         if (!_forward)
         {
             _isKeySeqnumZero = false;
-            ReverseToForward();
+            ValueTask r = ReverseToForwardAsync(cancellationToken);
+            if (!r.IsCompletedSuccessfully) return NextSlowAsync(r, cancellationToken);
+            r.GetAwaiter().GetResult();
             return ContinueNextAsync(cancellationToken);
         }
         if (!_currentEntryIsMerged)
@@ -1383,6 +1385,52 @@ public sealed class DbIter : IDisposable
             if (_icmp.CompareUserKey(userKey, _savedKey.UserKey) >= 0) return;
             _iter.Next();
         }
+    }
+
+    /// <summary>
+    /// Async <see cref="ReverseToForward"/>: the re-seek to saved_key_ and the skip of smaller keys await the inner
+    /// iterator; completes synchronously when it does.
+    /// </summary>
+    private ValueTask ReverseToForwardAsync(CancellationToken ct)
+    {
+        if (!_expectTotalOrderInnerIter || !_iter.Valid)
+        {
+            SetSeekKeyForSaved(DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek, maxTimestamp: true);
+            ValueTask s = _iter.SeekAsync(_seekKey.WrittenMemory, ct);
+            if (!s.IsCompletedSuccessfully) return ReverseToForwardSlowAsync(s, ct);
+            s.GetAwaiter().GetResult();
+        }
+        _forward = true;
+        return SkipKeysBeforeSavedAsync(ct);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask ReverseToForwardSlowAsync(ValueTask seek, CancellationToken ct)
+    {
+        await seek.ConfigureAwait(false);
+        _forward = true;
+        await SkipKeysBeforeSavedAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>ReverseToForward's loop: skip keys less than the current key() (a.k.a. saved_key_).</summary>
+    private ValueTask SkipKeysBeforeSavedAsync(CancellationToken ct)
+    {
+        while (_iter.Valid)
+        {
+            ReadOnlySpan<byte> userKey = ParseCurrent(out _, out _);
+            if (_icmp.CompareUserKey(userKey, _savedKey.UserKey) >= 0) return ValueTask.CompletedTask;
+            ValueTask t = _iter.NextAsync(ct);
+            if (!t.IsCompletedSuccessfully) return SkipKeysBeforeSavedSlowAsync(t, ct);
+            t.GetAwaiter().GetResult();
+        }
+        return ValueTask.CompletedTask;
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask SkipKeysBeforeSavedSlowAsync(ValueTask pending, CancellationToken ct)
+    {
+        await pending.ConfigureAwait(false);
+        await SkipKeysBeforeSavedAsync(ct).ConfigureAwait(false);
     }
 
     // ==================================================================== reverse (state machine)
