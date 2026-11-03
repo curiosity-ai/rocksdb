@@ -548,9 +548,9 @@ internal sealed class LdbTool
     }
 
     /// <summary>
-    /// ReduceDBLevelsCommand: compacts the DB and moves its files to level new_levels-1. Deviation: upstream rewrites
-    /// the MANIFEST (VersionSet::ReduceNumberOfLevels) after a full compaction; this port moves the compaction output
-    /// with CompactRange(change_level, target_level), which leaves the same LSM shape.
+    /// ReduceDBLevelsCommand: compacts the DB, then VersionSet::ReduceNumberOfLevels rewrites the MANIFEST with the files
+    /// of the only non-empty level at or below new_levels-1 moved to level new_levels-1 (default column family, as upstream).
+    /// The DB must then be opened with num_levels = new_levels (or more).
     /// </summary>
     private void ReduceLevels()
     {
@@ -558,21 +558,56 @@ internal sealed class LdbTool
         if (newLevels <= 1) throw new ToolException("Invalid number of levels.\n");
         RequireDb();
         RecoveredVersionState state = ManifestReader.RecoverFromDirectory(_fs, _dbPath, null, out _);
+        int oldLevels = UsedLevels(state);
+        if (Flag("print_old_levels")) W("The old number of levels in use is " + oldLevels.ToString(CultureInfo.InvariantCulture) + "\n");
+        if (oldLevels <= newLevels) return;
+        RocksDatabase db = OpenDb(readOnly: false);
+        W("Compacting the db...\n");
+        Cf(db).CompactRange(new CompactRangeOptions(), null, null);
+        db.Dispose();
+        _db = null;
+
+        state = ManifestReader.RecoverFromDirectory(_fs, _dbPath, null, out _);
+        ColumnFamilyVersion def = state.FindColumnFamily(ColumnFamilyDescriptor.DefaultColumnFamilyName)!;
+        int first = -1;
+        for (int l = newLevels - 1; l < def.NumLevels; l++)
+        {
+            if (def.Levels[l].Count == 0) continue;
+            if (first > 0)
+            {
+                throw new ToolException("Invalid argument: Found at least two levels containing files: [" + first.ToString(CultureInfo.InvariantCulture) + ":"
+                    + l.ToString(CultureInfo.InvariantCulture) + "].\n");
+            }
+            first = l;
+        }
+        if (first > newLevels - 1)
+        {
+            List<FileMetaData> from = def.MutableLevel(first);
+            List<FileMetaData> to = def.MutableLevel(newLevels - 1);
+            foreach (FileMetaData f in from) def.FileLevels[f.FileNumber] = newLevels - 1;
+            to.AddRange(from);
+            from.Clear();
+        }
+        ulong manifestNumber = state.NextFileNumber;
+        state.NextFileNumber = manifestNumber + 1;
+        using (ManifestLogWriter log = ManifestLogWriter.Create(_fs, FileNames.DescriptorFileName(_dbPath, manifestNumber)))
+        {
+            new ManifestWriter(log).WriteSnapshotAsync(state, static _ => 0, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+        }
+        FileNames.SetCurrentFileAsync(_fs, _dbPath, manifestNumber, syncDirectory: true, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+    }
+
+    private static int UsedLevels(RecoveredVersionState state)
+    {
         int max = -1;
-        ColumnFamilyVersion? def = state.FindColumnFamily(ColumnFamilyDescriptor.DefaultColumnFamilyName);
-        if (def is not null)
+        if (state.FindColumnFamily(ColumnFamilyDescriptor.DefaultColumnFamilyName) is { } def)
         {
             for (int l = 0; l < def.NumLevels; l++)
             {
                 if (def.Levels[l].Count > 0) max = l;
             }
         }
-        int oldLevels = max + 1;
-        if (Flag("print_old_levels")) W("The old number of levels in use is " + oldLevels.ToString(CultureInfo.InvariantCulture) + "\n");
-        if (oldLevels <= newLevels) return;
-        RocksDatabase db = OpenDb(readOnly: false);
-        W("Compacting the db...\n");
-        Cf(db).CompactRange(new CompactRangeOptions { ChangeLevel = true, TargetLevel = newLevels - 1, BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+        return max + 1;
     }
 
     private void FileChecksumDump()
