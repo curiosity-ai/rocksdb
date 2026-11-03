@@ -43,7 +43,7 @@ while the bytes may differ (for example, because a compressor makes different ch
 | Compression: Snappy, LZ4, LZ4HC, ZSTD, Zlib | yes | yes | read + write; ZSTD (with dictionaries) byte-identical; see deviations below |
 | Compression: BZip2, Xpress | no | n/a | a configured BZip2/Xpress type stores blocks uncompressed |
 | Integrated BlobDB (blob files, blob GC) | yes | yes | blob files byte-identical |
-| Wide columns (`PutEntity`, V1 entities) | yes | yes | compaction filters on entities (`FilterV3`, `FilterV4` with a lazy blob resolver, `kChangeWideColumnEntity`); `MultiGetEntity`, attribute groups, coalescing / attribute-group iterators, lazy entity reads (`GetEntityLazy`) |
+| Wide columns (`PutEntity`, V1 entities) | yes | yes | compaction filters on entities (`FilterV3`, `FilterV4` with a lazy blob resolver, `kChangeWideColumnEntity`); `MultiGetEntity`, attribute groups, coalescing / attribute-group iterators, lazy entity reads (`GetEntityLazy`, batched `MultiResolve`) |
 | Wide-column entities with blob-backed columns (V2 entities) | yes | yes | written by flush/compaction value separation and blob direct write; blob GC and garbage accounting of entity columns |
 | Blob direct write (`enable_blob_direct_write`, partitions) | yes | yes | needs RocksDB with blob direct write (librocksdb 11.12 has it); off by default; like upstream v1, blob files not registered by a flush before a crash are not recovered |
 | User-defined timestamps (persisted) | yes | yes | timestamped writes byte-identical; `full_history_ts_low` GC; timestamped range deletions and `SstFileWriter` files |
@@ -454,7 +454,7 @@ string? stats = db.GetProperty(DbProperties.Stats);                             
 ### Transactions
 
 `OptimisticTransactionDatabase` validates at commit time, either serially or in parallel (the upstream default).
-`TransactionDatabase` takes point locks and supports lock timeouts, deadlock detection, expiration and two-phase
+`TransactionDatabase` takes point (or range) locks and supports lock timeouts, deadlock detection, expiration and two-phase
 commit. Both expose the underlying `RocksDatabase` as `Database`. `TransactionDbOptions.WritePolicy` selects
 WriteCommitted (default), WritePrepared (data goes to the memtables at prepare; readers use a commit cache) or
 WriteUnprepared (large transactions are written to the DB before prepare once their batch exceeds
@@ -501,6 +501,52 @@ using (Transaction t2 = txnDb.BeginTransaction(new WriteOptions(), new Transacti
     t1.Commit();
     t2.Rollback();
 }
+```
+
+With a `RangeLockManager` in `TransactionDbOptions.RangeLockManager`, every lock is a range lock (port of the
+range-tree lock manager): `GetRangeLock` locks a key range or prefix exclusively, point locks are single-key ranges,
+deadlocks are always detected, and lock escalation merges a transaction's adjacent locks when the lock memory limit
+is reached.
+
+<!-- snippet:range-locks -->
+```csharp
+var rangeLocks = new RangeLockManager();             // keep it to inspect and tune the locks
+using TransactionDatabase txnDb = TransactionDatabase.Open(path, new DbOptions { CreateIfMissing = true },
+    new TransactionDbOptions { RangeLockManager = rangeLocks, TransactionLockTimeout = TimeSpan.FromMilliseconds(100) });
+
+using Transaction t1 = txnDb.BeginTransaction(new WriteOptions());
+using Transaction t2 = txnDb.BeginTransaction(new WriteOptions());
+// Lock every key starting with "user:1" (a prefix range: the infinite suffix covers all extensions).
+t1.GetRangeLock(null, new RangeLockEndpoint("user:1"u8.ToArray()), new RangeLockEndpoint("user:1"u8.ToArray(), infSuffix: true));
+t1.Put("user:1:name"u8, "Ada"u8);                    // inside t1's range: no extra lock wait
+try
+{
+    t2.Put("user:1:email"u8, "x"u8);                 // point locks are single-key ranges: conflicts
+}
+catch (RocksDbException e) when (e.Code == StatusCode.TimedOut)
+{
+    Console.WriteLine("locked by t1's range");
+}
+foreach (RangeLockInfo l in rangeLocks.GetRangeLockStatusData())
+    Console.WriteLine($"{l.Start} .. {l.End} held by {string.Join(",", l.TransactionIds)}");
+t1.Commit();                                          // releases the range
+t2.Put("user:1:email"u8, "ada@example.com"u8);
+t2.Commit();
+```
+
+Transactions read and write wide-column entities too (`PutEntity`, `TryGetEntity`, `TryGetEntityForUpdate`,
+`MultiGetEntity`, `GetCoalescingIterator`, `GetAttributeGroupIterator`; `WriteBatchWithIndex` has
+`TryGetEntityFromBatchAndDB` / `MultiGetEntityFromBatchAndDB`):
+
+<!-- snippet:transaction-entities -->
+```csharp
+using Transaction txn = txnDb.BeginTransaction(new WriteOptions());
+var columns = new WideColumns();
+txn.TryGetEntityForUpdate(null, "user:2"u8, columns);   // locks the key, reads its columns
+txn.PutEntity("user:2"u8, [new WideColumn("name"u8.ToArray(), "Grace"u8.ToArray()),
+                           new WideColumn("lang"u8.ToArray(), "COBOL"u8.ToArray())]);
+txn.TryGetEntity(null, "user:2"u8, columns);            // sees its own uncommitted entity: lang, name
+txn.Commit();
 ```
 
 <!-- snippet:two-phase-commit -->

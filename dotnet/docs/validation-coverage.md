@@ -21,13 +21,13 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (229 files, about 70,400 lines):
+Summary (237 files, about 72,600 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
-| line-by-line (feature audits) | 57 |
+| line-by-line (feature audits) | 65 |
 | line-by-line (#3) | 17 |
 | line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
@@ -183,6 +183,7 @@ changes there need their own review.
 | `Env/MemoryFileSystem.cs` | 491 | env/mock_env.cc, utilities/fault_injection_fs.{h,cc} | managed-only, design-reviewed (#3): in-memory FS for tests (mock_env idea), crash simulation |
 | `Env/UnixNative.cs` | 431 | env/io_posix.cc, env/fs_posix.cc | managed-only, design-reviewed (#3): P/Invoke (fdatasync, fsync dir, OFD locks, preadv2/pwritev2) |
 | `LazyWideColumns.cs` | 483 | include/rocksdb/lazy_wide_columns.h, db/wide/lazy_wide_columns.cc, db/wide/read_path_blob_resolver.cc | line-by-line (feature audit: user features (wide-column APIs)) |
+| `LazyWideColumns.MultiResolve.cs` | 320 | include/rocksdb/lazy_wide_columns.h (LazyColumnReadRequest), db/wide/lazy_wide_columns.cc (LazyWideColumns/LazyWideColumnsBatch::MultiResolve), db/wide/read_path_blob_resolver.cc (ClassifyColumnRange) | line-by-line (feature audit: user features (wide-column APIs)) |
 | `Logging/FileInfoLogger.cs` | 233 | logging/auto_roll_logger.cc, logging/env_logger.h | line-by-line (feature audit: user features (LOG)) |
 | `Logging/InfoLogger.cs` | 72 | include/rocksdb/env.h, env/env.cc | line-by-line (feature audit: user features (LOG)) |
 | `Memory/Arena.cs` | 225 | memory/allocator.h, memory/arena.h, memory/arena.cc | line-by-line (#1) |
@@ -251,15 +252,22 @@ changes there need their own review.
 | `Utilities/Backup/BackupEngineReadOnly.cs` | 798 | include/rocksdb/utilities/backup_engine.h, utilities/backup/backup_engine.cc | line-by-line (feature audit: errors/listeners/backups) |
 | `Utilities/Backup/BackupMeta.cs` | 406 | utilities/backup/backup_engine.cc | line-by-line (feature audit: errors/listeners/backups) |
 | `Utilities/Transactions/ByteKeyComparer.cs` | 31 | (managed helper) | managed-only, design-reviewed (#3): helper |
+| `Utilities/Transactions/DbImpl.TransactionReads.cs` | 37 | db/db_impl/db_impl.cc (GetImpl with columns + read callback) | line-by-line (feature audit: transactions (entities)) |
 | `Utilities/Transactions/IndexedWriteBatch.cs` | 126 | utilities/write_batch_with_index (overwrite_key adapter) | managed-only, design-reviewed (#3): adapter over WBWI |
+| `Utilities/Transactions/LockManager.cs` | 44 | utilities/transactions/lock/lock_manager.h | line-by-line (feature audit: transactions (range locking)) |
 | `Utilities/Transactions/LockTracker.cs` | 194 | utilities/transactions/lock/point/point_lock_tracker.h, utilities/transactions/lock/point/point_lock_tracker.cc | line-by-line (feature audit: transactions) |
 | `Utilities/Transactions/OptimisticTransactionDatabase.cs` | 257 | utilities/transactions/optimistic_transaction_db_impl.cc, utilities/transactions/optimistic_transaction.cc | line-by-line (feature audit: transactions) |
 | `Utilities/Transactions/PessimisticTransaction.cs` | 671 | utilities/transactions/pessimistic_transaction.cc | line-by-line (feature audit: transactions) |
 | `Utilities/Transactions/PointLockManager.cs` | 465 | utilities/transactions/lock/point/point_lock_manager.cc | line-by-line (feature audit: transactions) |
+| `Utilities/Transactions/RangeLockManager.cs` | 361 | include/rocksdb/utilities/transaction_db.h (RangeLockManagerHandle), utilities/transactions/lock/range/range_lock_manager.h, utilities/transactions/lock/range/range_tree/range_tree_lock_manager.{h,cc} | line-by-line (feature audit: transactions (range locking)) |
+| `Utilities/Transactions/RangeLockTree.cs` | 861 | utilities/transactions/lock/range/range_tree/range_tree_lock_tracker.cc, lib/locktree/{locktree,lock_request,manager,keyrange,treenode,concurrent_tree,wfg,range_buffer}.cc | line-by-line (feature audit: transactions (range locking)) |
+| `Utilities/Transactions/RangeLockTypes.cs` | 57 | include/rocksdb/utilities/transaction.h (Endpoint), include/rocksdb/utilities/transaction_db.h (RangeLockInfo, RangeDeadlockInfo/Path, Counters) | line-by-line (feature audit: transactions (range locking)) |
 | `Utilities/Transactions/RocksDatabase.Transactions.cs` | 9 | (API glue) | managed-only, design-reviewed (#3): API glue |
 | `Utilities/Transactions/Transaction.cs` | 679 | include/rocksdb/utilities/transaction.h, utilities/transactions/transaction_base.cc | line-by-line (feature audit: transactions) |
+| `Utilities/Transactions/Transaction.Entities.cs` | 286 | include/rocksdb/utilities/transaction.h, utilities/transactions/transaction_base.cc (PutEntity, GetEntity, MultiGetEntity, GetEntityForUpdate, NewMultiCfIterator), pessimistic_transaction.cc (WriteCommittedTxn::GetEntityForUpdate) | line-by-line (feature audit: transactions (entities)) |
 | `Utilities/Transactions/TransactionDatabase.cs` | 347 | utilities/transactions/pessimistic_transaction_db.cc | line-by-line (feature audit: transactions) |
 | `Utilities/Transactions/TransactionIterator.cs` | 74 | utilities/write_batch_with_index (BaseDeltaIterator adapter) | managed-only, design-reviewed (#3): adapter over BaseDeltaIterator |
+| `Utilities/Transactions/TransactionMultiCfIterator.cs` | 268 | db/multi_cf_iterator_impl.h, db/coalescing_iterator.cc, db/attribute_group_iterator_impl.cc (over transaction iterators) | line-by-line (feature audit: transactions (entities)) |
 | `Utilities/Transactions/TransactionOptions.cs` | 139 | include/rocksdb/utilities/transaction.h, include/rocksdb/utilities/transaction_db.h | line-by-line (feature audit: transactions (+ #3 defaults)) |
 | `Utilities/WriteBatchWithIndex/BaseDeltaIterator.cs` | 352 | utilities/write_batch_with_index/write_batch_with_index_internal.cc | line-by-line (feature audit: user features (WBWI)) |
 | `Utilities/WriteBatchWithIndex/WriteBatchEntryIndex.cs` | 257 | utilities/write_batch_with_index/write_batch_with_index_internal.{h,cc} | line-by-line (feature audit: user features (WBWI)) |

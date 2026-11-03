@@ -25,6 +25,9 @@ namespace RocksDb.Managed.Utilities.Transactions;
 internal class WritePreparedTxn : PessimisticTransaction
 {
     private protected readonly WritePreparedTxnDb _wpDb;
+
+    /// <summary>WritePreparedTxn::GetCoalescingIterator / GetAttributeGroupIterator: NotSupported.</summary>
+    private protected override bool SupportsMultiCfIterators => false;
     private readonly AddPreparedCallback _addPrepared;
     private readonly CommitEntryPreReleaseCallback _commitEntry;
     // Two write queues: the AddPreparedCallback of the first write and the callbacks of the second, WAL-only write.
