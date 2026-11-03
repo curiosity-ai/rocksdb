@@ -258,3 +258,12 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [x] 4-thread 100 B readmissing / fillrandom rechecked (7-rep interleaved A/B): noise, no regression; flush allocations: table-builder buffers pooled (TableBuilderBuffers), no longer bimodal
 - [x] table readers pin index/filter blocks from the table buffer pool (flush 171 KB -> 40 KB); `BlobReadersBoundedByMaxOpenFiles` failure root-caused: bounded table cache sorted readers by a LastUse field mutated concurrently (List.Sort 'inconsistent comparer'), now sorts a snapshot
 - Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)
+
+## Missing features wave (2026-11-03, requested)
+
+- [~] PlainTable + CuckooTable (read/write, OPTIONS, native compat); user-defined index footer feature
+- [~] Cache layers: secondary cache (CompressedSecondaryCache, TieredCache), persistent cache, WriteBufferManager (cross-DB/CF memtable budget, cache charging, stalls), SimCache
+- [~] Column family export/import (ExportColumnFamily, CreateColumnFamilyWithImport), remote compaction (CompactionService + OpenAndCompact), DB APIs: GetMergeOperands, PromoteL0, SuggestCompactRange, LockWAL/UnlockWAL, DisableManualCompaction/EnableManualCompaction, GetCreationTimeOfOldestFile, ClipColumnFamily, GetPropertiesOfTablesInRange, OpenAndTrimHistory, MultiScan
+- [~] Tracing (StartTrace/EndTrace, Replayer, block cache tracer, IO tracer) + tools (ldb and sst_dump equivalents)
+- [~] Deviation inventory: every documented deviation classified (upstream-equivalent stricter/safer, .NET platform constraint, perf trade-off, unported dependency) with a reason; unjustified ones removed
+- [ ] (upstream NotSupported, kept) timestamps in optimistic transactions and explicit-timestamp WBWI writes
