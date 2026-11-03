@@ -60,8 +60,7 @@ internal sealed partial class DbImpl
 
     /// <summary>
     /// The write-mode checks of DBImpl::ValidateOptions (db/db_impl/db_impl_open.cc); messages copied verbatim.
-    /// unordered_write itself is accepted and writes are ordered (a stronger guarantee than it asks for). Upstream checks
-    /// the column families first: a column family with blob direct write reports its own NotSupported for these write
+    /// Upstream checks the column families first: a column family with blob direct write reports its own NotSupported for these write
     /// modes (<see cref="ColumnFamilyData"/>), so the DB-level checks are left to it then.
     /// </summary>
     private static void ValidateWriteModeOptions(DbOptions o, IReadOnlyList<ColumnFamilyDescriptor> columnFamilies)

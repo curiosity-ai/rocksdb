@@ -59,6 +59,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         ErrorHandler = new ErrorHandler(this);
         _allowConcurrentMemtableWrite = options.AllowConcurrentMemtableWrite;
         _pipelined = options.EnablePipelinedWrite;
+        _unorderedWrite = options.UnorderedWrite;
         _writeThread = new WriteThread(options.MaxWriteBatchGroupSizeBytes, options.EnableWriteThreadAdaptiveYield ? options.WriteThreadMaxYieldUsec : 0);
         // GetBGJobLimits (db/db_impl/db_impl_compaction_flush.cc).
         int maxFlushes = options.MaxBackgroundFlushes;

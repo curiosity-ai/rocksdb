@@ -114,6 +114,17 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(transactionDbOptions);
         if (!Enum.IsDefined(transactionDbOptions.WritePolicy)) throw new ArgumentOutOfRangeException(nameof(transactionDbOptions), "unknown write policy");
+        // TransactionDB::Open (utilities/transactions/pessimistic_transaction_db.cc): unordered_write only with
+        // WritePrepared on two write queues (whose commit publication restores immutable snapshots).
+        if (options.UnorderedWrite)
+        {
+            if (transactionDbOptions.WritePolicy == TransactionWritePolicy.WriteCommitted)
+                ThrowHelper.NotSupported("WRITE_COMMITTED is incompatible with unordered_writes");
+            if (transactionDbOptions.WritePolicy == TransactionWritePolicy.WriteUnprepared)
+                ThrowHelper.NotSupported("WRITE_UNPREPARED is currently incompatible with unordered_writes");
+            if (!options.TwoWriteQueues)
+                ThrowHelper.NotSupported("WRITE_PREPARED is incompatible with unordered_writes if two_write_queues is not enabled.");
+        }
         DbOptions o = options.Clone();
         o.Allow2Pc = true;
         // TransactionDB::Open: use_seq_per_batch for WritePrepared / WriteUnprepared, use_batch_per_txn except for

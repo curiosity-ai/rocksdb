@@ -92,6 +92,8 @@ internal sealed class ColumnFamilyData
         // ColumnFamilyData::ValidateOptions / CheckConcurrentWritesSupported (db/column_family.cc).
         if (db.Options.AllowConcurrentMemtableWrite && options.InplaceUpdateSupport)
             ThrowHelper.InvalidArgument("In-place memtable updates (inplace_update_support) is not compatible with concurrent writes (allow_concurrent_memtable_write)");
+        if (db.Options.UnorderedWrite && options.MaxSuccessiveMerges != 0)
+            ThrowHelper.InvalidArgument("max_successive_merges > 0 is incompatible with unordered_write");
         // BlockBasedTableFactory::ValidateOptions (table/block_based/block_based_table_factory.cc).
         if (options.TableOptions.IndexBlockSearchType == IndexBlockSearchType.Interpolation && ucmp.Kind != ComparatorKind.Bytewise)
             ThrowHelper.InvalidArgument("Interpolation search requires BytewiseComparator");
