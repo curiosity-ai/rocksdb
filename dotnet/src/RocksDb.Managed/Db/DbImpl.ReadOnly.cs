@@ -22,9 +22,10 @@ namespace RocksDb.Managed.Db;
 /// its start (it begins with a full snapshot). Like ManifestTailer (a VersionEditHandlerPointInTime, VerifyFile), the
 /// table and blob files a new version adds are verified (present, MANIFEST size, and with verify_sst_unique_id_in_manifest
 /// opened, which also keeps them readable) before it is installed; when one is missing (the primary already deleted it
-/// after edits not yet visible) the column family keeps its current version until a later catch-up. Upstream would
-/// instead install the latest intermediate point in time whose files all exist; the managed replayer only keeps the
-/// latest state. Files deleted by the primary while still referenced by an old secondary version are only readable if
+/// after edits not yet visible) the MANIFEST is read on (the edit that dropped the file precedes its deletion) and the
+/// newer state installed; after a few such rounds the column family keeps its current version until a later catch-up.
+/// Upstream instead installs the latest intermediate point in time whose files all exist (VersionEditHandlerPointInTime)
+/// and reaches the newer state at the next catch-up; the managed replayer only keeps the latest state. Files deleted by the primary while still referenced by an old secondary version are only readable if
 /// their table reader is open (same caveat as upstream).
 /// </summary>
 internal sealed partial class DbImpl
@@ -295,6 +296,7 @@ internal sealed partial class DbImpl
         {
             ThrowIfDisposed();
             RecoveredVersionState state = TailManifestWithRetry(out bool manifestChanged);
+            TestHooks.Invoke("DBImplSecondary::TryCatchUpWithPrimary:AfterManifestTail");
             await CatchUpCoreAsync(state, manifestChanged, synchronous, ct).ConfigureAwait(false);
         }
         finally
@@ -311,7 +313,7 @@ internal sealed partial class DbImpl
     {
         _ = synchronous;
         ct.ThrowIfCancellationRequested();
-        if (manifestChanged || _secondaryInstallDeferred)
+        for (int attempt = 0; manifestChanged || _secondaryInstallDeferred; attempt++)
         {
             var obsolete = new List<ObsoleteTableFile>();
             var obsoleteBlobs = new List<ObsoleteBlobFile>();
@@ -319,10 +321,21 @@ internal sealed partial class DbImpl
             foreach (ObsoleteTableFile t in obsolete) t.Cfd.TableCache.Evict(t.Meta.FileNumber);
             foreach (ObsoleteBlobFile b in obsoleteBlobs) b.Cfd.BlobSource.Evict(b.BlobFileNumber);
             if (resetMemtables) DisposeSecondaryWalReaders();
+            if (!_secondaryInstallDeferred || attempt == MaxDeferredInstallRetries) break;
+            // A file of the replayed state is gone: the primary deletes a table / blob file only after the MANIFEST edit
+            // that dropped it from its live versions was written (LogAndApply, then PurgeObsoleteFiles), so that edit was
+            // appended after this catch-up read the MANIFEST. Read on and install the newer state, which no longer
+            // references the file (upstream's point-in-time handler would install an older consistent version and only
+            // reach this state at the next catch-up).
+            state = TailManifestWithRetry(out manifestChanged);
+            if (!manifestChanged) break;
         }
         ApplyWalTail(state);
         return default;
     }
+
+    /// <summary>Re-reads of the MANIFEST within one catch-up when the replayed state references a deleted file.</summary>
+    private const int MaxDeferredInstallRetries = 3;
 
     /// <summary>
     /// Installs new versions for the column families whose live files changed (ReactiveVersionSet's cfds_changed).
@@ -347,6 +360,8 @@ internal sealed partial class DbImpl
                     // ManifestTailer::VerifyFile: install only a version whose new files all exist.
                     if (!NewFilesPresent(cfd, cf))
                     {
+                        // The log number stays with the installed version: the WAL data that the new version's table
+                        // files hold is replayed into the memtables until that version can be installed.
                         _secondaryInstallDeferred = true;
                         continue;
                     }

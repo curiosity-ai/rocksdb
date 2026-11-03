@@ -80,6 +80,44 @@ public sealed class SecondaryManifestTailingTests
         Assert.IsGreaterThan(opens, sec.SecondaryManifestTailStats.ManifestOpens, "the primary never rolled its MANIFEST over");
     }
 
+    /// <summary>
+    /// The primary compacts away (and deletes) a file of the state the secondary just read from the MANIFEST, before the
+    /// secondary verifies it: the catch-up reads on (the compaction's edit precedes the deletion) and installs the
+    /// compacted state in the same call, instead of keeping its old version.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task CatchUpReadsOnWhenTheReplayedStateReferencesADeletedFile()
+    {
+        MemoryFileSystem fs = NewFs();
+        await using RocksDatabase primary = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs), SmallCf(autoCompactions: false));
+        for (int i = 0; i < 200; i++) primary.Put(Key(i), Value(i, 0));
+        await primary.FlushAsync();
+        await using RocksDatabase sec = await RocksDatabase.OpenAsSecondaryAsync(DbPath, "/sec-deleted", new DbOptions { FileSystem = fs });
+        for (int i = 0; i < 200; i++) primary.Put(Key(i), Value(i, 1));
+        await primary.FlushAsync();
+        int calls = 0;
+        TestHooks.Set("DBImplSecondary::TryCatchUpWithPrimary:AfterManifestTail", () =>
+        {
+            if (Interlocked.Increment(ref calls) != 1) return;
+            // Deletes the round-1 table file the secondary is about to verify.
+            primary.CompactRange();
+            primary.WaitForCompact();
+        });
+        try
+        {
+            await sec.TryCatchUpWithPrimaryAsync();
+        }
+        finally
+        {
+            TestHooks.Set("DBImplSecondary::TryCatchUpWithPrimary:AfterManifestTail", null);
+        }
+        Assert.AreEqual(1, calls);
+        Assert.AreEqual("0", primary.GetProperty("rocksdb.num-files-at-level0"));
+        AssertSameContents(primary, sec, 200, "after catch-up");
+        Assert.AreEqual(primary.GetProperty("rocksdb.levelstats"), sec.GetProperty("rocksdb.levelstats"), "the compacted version is installed");
+    }
+
     [TestMethod]
     public async Task CatchUpWhilePrimaryWritesFlushesAndCompacts()
     {

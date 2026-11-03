@@ -327,7 +327,10 @@ public sealed class DbBasicTests
     public void MergeOperatorAcrossMemtableAndTables()
     {
         MemoryFileSystem fs = NewFs();
-        var cfo = new ColumnFamilyOptions { MergeOperator = new StringAppendMergeOperator() };
+        // No automatic compactions: the reopen flushes the recovered WAL into a 4th L0 file (the default compaction
+        // trigger), and whether that compaction folds the operands into one value before the DB closes depends on timing;
+        // the last open (without a merge operator) must still find unmerged operands.
+        var cfo = new ColumnFamilyOptions { MergeOperator = new StringAppendMergeOperator(), DisableAutoCompactions = true };
         using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfo))
         {
             db.Merge(B("m"), B("a"));
@@ -351,8 +354,9 @@ public sealed class DbBasicTests
             Assert.AreEqual("a,b,c", GetString(db, "m"));
             Assert.AreEqual("3", GetString(db, "p"));
         }
-        using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs)))
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { DisableAutoCompactions = true }))
         {
+            Assert.AreEqual("4", db.GetProperty("rocksdb.num-files-at-level0"));
             RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() => db.Get(B("m")));
             Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
         }
