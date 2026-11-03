@@ -21,18 +21,27 @@ public sealed class LocalFileSystem : IFileSystem
 {
     public static readonly LocalFileSystem Instance = new();
 
+    /// <summary>
+    /// Whether <see cref="IWritableFile.SyncAsync"/> runs fdatasync on a dedicated sync thread (default) instead of
+    /// blocking the calling thread, typically a thread-pool thread, for the device flush. Durability and ordering are
+    /// the same either way; the hand-off adds two thread wake-ups per sync, which matters for latency with few
+    /// concurrent synced writers on fast storage (see docs/perf.md). Synchronous <see cref="IWritableFile.Sync"/> always
+    /// runs on the caller.
+    /// </summary>
+    public bool OffloadAsyncSync { get; init; } = true;
+
     // Process-wide set of locked files (PosixFileSystem's static lockedFiles). Guarded by s_lockedFilesLock.
     private static readonly HashSet<string> s_lockedFiles = new(StringComparer.Ordinal);
     private static readonly Lock s_lockedFilesLock = new();
 
     public IWritableFile CreateWritable(string path, bool truncate = true) =>
-        new LocalWritableFile(path, truncate ? FileMode.Create : FileMode.OpenOrCreate, WritableFileOptions.Default, append: false);
+        new LocalWritableFile(path, truncate ? FileMode.Create : FileMode.OpenOrCreate, WritableFileOptions.Default, append: false, OffloadAsyncSync);
 
     public IWritableFile CreateWritable(string path, bool truncate, WritableFileOptions options) =>
-        new LocalWritableFile(path, truncate ? FileMode.Create : FileMode.OpenOrCreate, options, append: false);
+        new LocalWritableFile(path, truncate ? FileMode.Create : FileMode.OpenOrCreate, options, append: false, OffloadAsyncSync);
 
     public IWritableFile ReopenWritable(string path, WritableFileOptions options) =>
-        new LocalWritableFile(path, FileMode.OpenOrCreate, options, append: true);
+        new LocalWritableFile(path, FileMode.OpenOrCreate, options, append: true, OffloadAsyncSync);
 
     public IRandomAccessFile OpenRandomAccess(string path) => new LocalRandomAccessFile(path, RandomAccessFileOptions.Default);
 
@@ -595,10 +604,12 @@ internal sealed class LocalWritableFile : IWritableFile
     private long _lastRangeSync;
     private bool _preallocationFailed;
     private bool _disposed;
+    private readonly bool _offloadAsyncSync;  // LocalFileSystem.OffloadAsyncSync
 
-    public LocalWritableFile(string path, FileMode mode, WritableFileOptions options, bool append)
+    public LocalWritableFile(string path, FileMode mode, WritableFileOptions options, bool append, bool offloadAsyncSync)
     {
         _path = path;
+        _offloadAsyncSync = offloadAsyncSync;
         _options = options;
         _handle = LocalFileSystem.OpenHandle(path, mode, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete, FileOptions.Asynchronous);
         try
@@ -881,8 +892,8 @@ internal sealed class LocalWritableFile : IWritableFile
             {
                 // No RWF_NOWAIT for buffered writes (e.g. ext4): a small buffered pwrite is a copy into the page cache,
                 // much cheaper than the thread pool round trip RandomAccess.WriteAsync makes on Unix (it runs the same
-                // blocking pwrite on a pool thread). Native RocksDB writes the WAL the same way; SyncAsync already
-                // runs fdatasync inline.
+                // blocking pwrite on a pool thread). Native RocksDB writes the WAL the same way (the
+                // fdatasync of SyncAsync, which blocks much longer, runs on a dedicated sync thread).
                 try
                 {
                     WriteRaw(data.Span, offset);
@@ -967,13 +978,19 @@ internal sealed class LocalWritableFile : IWritableFile
             try
             {
                 ThrowIfDisposed();
-                UnixNative.DataSync(_handle, _path);
-                return ValueTask.CompletedTask;
+                if (!_offloadAsyncSync)
+                {
+                    UnixNative.DataSync(_handle, _path);
+                    return ValueTask.CompletedTask;
+                }
             }
             catch (Exception e)
             {
                 return ValueTask.FromException(e);
             }
+            // The fdatasync runs on a dedicated sync thread (FileSyncWorkers): the caller's thread is not blocked for
+            // the device flush. The data was written to the OS before, so the queued sync covers it.
+            return FileSyncWorkers.DataSyncAsync(_handle, _path);
         }
         return SyncSlowAsync(cancellationToken);
     }
@@ -982,7 +999,8 @@ internal sealed class LocalWritableFile : IWritableFile
     private async ValueTask SyncSlowAsync(CancellationToken cancellationToken)
     {
         await FlushAsync(cancellationToken).ConfigureAwait(false);
-        UnixNative.DataSync(_handle, _path);
+        if (_offloadAsyncSync) await FileSyncWorkers.DataSyncAsync(_handle, _path).ConfigureAwait(false);
+        else UnixNative.DataSync(_handle, _path);
     }
 
     private void ThrowIfDisposed()

@@ -269,6 +269,54 @@ public sealed partial class FileSystemTests
         await Task.WhenAll(tasks);
     }
 
+    /// <summary>
+    /// SyncAsync of a local file runs fdatasync on the dedicated sync threads (FileSyncWorkers): many files synced
+    /// concurrently from async callers complete with their data durable-ordered after their appends (each await sees
+    /// every byte appended before it), a sync of a closed file fails through the task, and the inline mode
+    /// (<see cref="LocalFileSystem.OffloadAsyncSync"/> = false) behaves the same.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    [DataRow(true)]
+    [DataRow(false)]
+    public async Task LocalSyncAsyncOnSyncThreads(bool offload)
+    {
+        using var fx = new Fixture("local");
+        var fs = new LocalFileSystem { OffloadAsyncSync = offload };
+        const int files = 12, rounds = 40;
+        var tasks = new Task[files];
+        for (int f = 0; f < files; f++)
+        {
+            int id = f;
+            tasks[f] = Task.Run(async () =>
+            {
+                using IWritableFile w = fs.CreateWritable(fx.P("s" + id), true, new WritableFileOptions { InitialBufferSize = 4096, MaxBufferSize = 4096 });
+                long expected = 0;
+                for (int r = 0; r < rounds; r++)
+                {
+                    byte[] chunk = Pattern(100 + r * 37 + id, id * 1000 + r);
+                    await w.AppendAsync(chunk);
+                    expected += chunk.Length;
+                    // Buffered tail (SyncSlowAsync: flush, then sync) and already-flushed data (fast path) alternate.
+                    if (r % 2 == 0) await w.FlushAsync();
+                    await w.SyncAsync();
+                    Assert.AreEqual(expected, new FileInfo(fx.P("s" + id)).Length, "file " + id + " round " + r);
+                }
+            });
+        }
+        await Task.WhenAll(tasks);
+        if (offload)
+        {
+            Assert.IsGreaterThan(0, FileSyncWorkers.WorkerCount);
+            Assert.IsLessThanOrEqualTo(FileSyncWorkers.MaxWorkers, FileSyncWorkers.WorkerCount);
+        }
+
+        IWritableFile closed = fs.CreateWritable(fx.P("closed"), true);
+        closed.Dispose();
+        var e = await Assert.ThrowsExactlyAsync<RocksDbException>(async () => await closed.SyncAsync());
+        Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+    }
+
     [TestMethod]
     public void LocalPreallocationAndRangeSyncKeepLogicalSize()
     {
