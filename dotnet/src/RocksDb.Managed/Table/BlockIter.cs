@@ -92,6 +92,8 @@ public sealed class BlockIter : IDisposable
     // block_protection_bytes_per_key of the block (0: no per key-value verification) and the block itself.
     private int _kvProtectionBytes;
     private Block? _block;
+    // Index blocks: Seek finds the restart point by interpolation search (index_search_type_ == kInterpolation).
+    private bool _interpolationSearch;
 
     /// <summary>Iterator for a data or range-deletion block (internal keys ordered by <paramref name="comparator"/>).</summary>
     public void InitializeData(Block block, InternalKeyComparator comparator, ulong globalSeqno)
@@ -161,6 +163,21 @@ public sealed class BlockIter : IDisposable
         _restartKeyFixup = _padTsSize != 0 || (_globalSeqno != DisableGlobalSequenceNumber && _keysAreInternal);
     }
 
+    /// <summary>
+    /// Makes <see cref="Seek"/> on this index block use interpolation search (IndexBlockIter with index_search_type_ =
+    /// kInterpolation, i.e. kInterpolation or a resolved kAuto). The caller guarantees the bytewise comparator. Like
+    /// upstream, blocks with a stripped common key prefix (format_version &gt;= 8) keep binary search; so do blocks whose
+    /// restart keys need rewriting before comparison (global seqno, stripped timestamps), which upstream would also
+    /// interpolate (same seek result, only the probe sequence differs).
+    /// </summary>
+    public void UseInterpolationSearch()
+    {
+        _interpolationSearch = _kind == BlockIterKind.Index && _prefixLength == 0 && !_restartKeyFixup;
+    }
+
+    /// <summary>Whether <see cref="Seek"/> uses interpolation search (tests).</summary>
+    internal bool UsesInterpolationSearch => _interpolationSearch;
+
     /// <summary>Iterator for a metaindex or properties block (bytewise ordered keys).</summary>
     public void InitializeMeta(Block block)
     {
@@ -191,6 +208,7 @@ public sealed class BlockIter : IDisposable
         _rawKeyLen = 0;
         _slowParse = false;
         _restartKeyFixup = false;
+        _interpolationSearch = false;
         _handle = default;
         _keyLen = 0;
         _keyInBuf = true;
@@ -396,7 +414,12 @@ public sealed class BlockIter : IDisposable
     {
         if (_numRestarts == 0) { Invalidate(); return; }
         if (_kind == BlockIterKind.Index && !_keysAreInternal) target = DbFormat.ExtractUserKey(target);
-        if (!BinarySeekRestartPointIndex(target, out int index, out bool skipLinearScan)) { Invalidate(); return; }
+        int index;
+        bool skipLinearScan;
+        bool ok = _interpolationSearch
+            ? InterpolationSeekRestartPointIndex(target, out index, out skipLinearScan)
+            : BinarySeekRestartPointIndex(target, out index, out skipLinearScan);
+        if (!ok) { Invalidate(); return; }
         FindKeyAfterBinarySeek(target, index, skipLinearScan);
         if (_kvProtectionBytes != 0) VerifyKvChecksum();
     }
@@ -1006,6 +1029,156 @@ public sealed class BlockIter : IDisposable
         }
         if (left == -1)
         {
+            skipLinearScan = true;
+            index = 0;
+        }
+        else
+        {
+            index = (int)left;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Port of BlockIter::InterpolationSeekRestartPointIndex (table/block_based/block.cc): same contract as
+    /// <see cref="BinarySeekRestartPointIndex"/>, but probes the restart point estimated from the first 8 bytes (big
+    /// endian) of the keys after the prefix shared by the boundary keys (ReadBe64FromKey). Falls back to binary search
+    /// for small windows (kGuardLen) and after kMaxPoorSearches probes that did not halve the window. Only used with
+    /// the bytewise comparator on blocks without key rewriting (<see cref="UseInterpolationSearch"/>), so restart keys are
+    /// spans over the block buffer and comparing whole keys is equivalent to upstream's suffix comparisons.
+    /// </summary>
+    private bool InterpolationSeekRestartPointIndex(ReadOnlySpan<byte> target, out int index, out bool skipLinearScan)
+    {
+        const long GuardLen = 8;
+        const ulong MaxPoorSearches = 8;
+        index = 0;
+        skipLinearScan = false;
+        if (_keysEnd == 0) return false;
+
+        bool isUserKey = !_keysAreInternal;
+        long left = -1;
+        long right = _numRestarts - 1;
+        int sharedUserPrefixLen = 0;
+        ReadOnlySpan<byte> leftKey = default;
+        ReadOnlySpan<byte> rightKey = default;
+        bool firstIter = true;
+        ulong leftVal = 0, rightVal = 0, targetVal = 0;
+        // A poor search is when less than half the search space is reduced, because binary search would do better.
+        ulong continuousPoorSearches = 0;
+        ReadOnlySpan<byte> targetUserKey = isUserKey ? target : DbFormat.ExtractUserKey(target);
+        while (left != right)
+        {
+            long mid = 0;
+            // If either search window is small or we've had numerous bad guesses, fall back to binary search.
+            bool seekFailed = right - left <= GuardLen || continuousPoorSearches >= MaxPoorSearches;
+            if (!seekFailed)
+            {
+                // Interpolation reads the left and right boundaries anyway, so left can be 0 (we exit early on the
+                // first iteration when target <= left).
+                int usableLeft = (int)Math.Max(left, 0);
+                if (firstIter)
+                {
+                    leftKey = GetRestartKey(usableLeft);
+                    rightKey = GetRestartKey((int)right);
+                    sharedUserPrefixLen = leftKey.CommonPrefixLength(rightKey);
+                    // Only the user key part may be shared (bytewise: the shorter user key is the left one).
+                    if (!isUserKey) sharedUserPrefixLen = Math.Min(sharedUserPrefixLen, leftKey.Length - DbFormat.InternalKeyFooterSize);
+                    leftVal = BlockBuilder.ReadBe64FromKey(leftKey, isUserKey, sharedUserPrefixLen);
+                    rightVal = BlockBuilder.ReadBe64FromKey(rightKey, isUserKey, sharedUserPrefixLen);
+                    targetVal = BlockBuilder.ReadBe64FromKey(target, isUserKey, sharedUserPrefixLen);
+                    if (sharedUserPrefixLen > 0)
+                    {
+                        // The boundaries' shared prefix is not necessarily a prefix of the target: exit early if not.
+                        int cmpLen = Math.Min(targetUserKey.Length, sharedUserPrefixLen);
+                        int c = targetUserKey[..cmpLen].SequenceCompareTo(leftKey[..cmpLen]);
+                        if (c < 0 || (c == 0 && cmpLen < sharedUserPrefixLen))
+                        {
+                            skipLinearScan = true;
+                            index = usableLeft;
+                            return true;
+                        }
+                        if (c > 0)
+                        {
+                            index = (int)right;
+                            return true;
+                        }
+                    }
+                }
+                if (leftVal > rightVal) return CorruptionError();
+
+                bool lteLeft = false;
+                bool gtRight = false;
+                if (targetVal < leftVal)
+                {
+                    lteLeft = true;
+                }
+                else if (targetVal == leftVal)
+                {
+                    // Equal values don't imply equal keys (only 8 bytes are read and the footer is skipped).
+                    if (CompareKey(leftKey, target) >= 0) lteLeft = true;
+                }
+                if (!lteLeft)
+                {
+                    // Only arr[target] < arr[right + 1] is guaranteed, so this can happen after the first iteration.
+                    if (targetVal > rightVal) gtRight = true;
+                    else if (rightVal == leftVal) seekFailed = true; // cannot divide by 0
+                }
+                if (lteLeft)
+                {
+                    skipLinearScan = true;
+                    index = usableLeft;
+                    return true;
+                }
+                if (gtRight)
+                {
+                    index = (int)right;
+                    return true;
+                }
+                if (!seekFailed)
+                {
+                    // HAVE_UINT128_EXTENSION branch: range * target_delta / range_delta in 128 bits.
+                    UInt128 range = (ulong)(right - usableLeft);
+                    UInt128 targetDelta = targetVal - leftVal;
+                    ulong rangeDelta = rightVal - leftVal;
+                    long offset = (long)(ulong)(range * targetDelta / rangeDelta);
+                    left = usableLeft; // can reduce search space by 1
+                    mid = usableLeft + offset;
+                    if (mid == usableLeft) ++mid; // guarantee progress
+                }
+            }
+            if (seekFailed) mid = left + (right - left + 1) / 2;
+
+            ReadOnlySpan<byte> midKey = GetRestartKey((int)mid);
+            int cmp = CompareKey(midKey, target);
+            long previousSearchSpace = right - left;
+            if (cmp < 0)
+            {
+                left = mid;
+                leftKey = midKey;
+                leftVal = BlockBuilder.ReadBe64FromKey(leftKey, isUserKey, sharedUserPrefixLen);
+            }
+            else if (cmp > 0)
+            {
+                right = mid - 1;
+                if (!seekFailed && left != right)
+                {
+                    rightKey = GetRestartKey((int)right);
+                    rightVal = BlockBuilder.ReadBe64FromKey(rightKey, isUserKey, sharedUserPrefixLen);
+                }
+            }
+            else
+            {
+                skipLinearScan = true;
+                left = right = mid;
+            }
+            // If the search space was not at least halved, the data is likely not uniform.
+            if (right - left > previousSearchSpace / 2) ++continuousPoorSearches;
+            else continuousPoorSearches = 0;
+            firstIter = false;
+        }
+        if (left == -1)
+        {
+            // All keys in the block were strictly greater than target: the first key is the result.
             skipLinearScan = true;
             index = 0;
         }

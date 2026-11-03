@@ -309,6 +309,7 @@ public static class TableFactory
             PrefixExtractor = options.PrefixExtractor,
             DbSessionId = dbSessionId,
             BlockProtectionBytesPerKey = (int)options.BlockProtectionBytesPerKey,
+            IndexBlockSearchType = t.IndexBlockSearchType,
         };
         if (cache is not null) r = r with { BlockCache = cache };
         return r;

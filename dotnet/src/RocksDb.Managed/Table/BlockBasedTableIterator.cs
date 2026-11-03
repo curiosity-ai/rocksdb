@@ -41,7 +41,7 @@ internal sealed class IndexCursor
         _flags = flags;
         _partitioned = reader.IsPartitionedIndex;
         _topRef = reader.GetIndexBlockRef(flags);
-        reader.InitIndexIter(_top, _topRef.Block!);
+        reader.InitIndexIter(_top, _topRef.Block!, isPartition: false);
     }
 
     public void Reset()
@@ -160,7 +160,7 @@ internal sealed class IndexCursor
     {
         UnloadPartition();
         _partRef = _reader.GetBlockRef(_top.BlockHandle, BlockKind.Index, _flags);
-        _reader.InitIndexIter(_part, _partRef.Block!);
+        _reader.InitIndexIter(_part, _partRef.Block!, isPartition: true);
     }
 
     private void UnloadPartition()

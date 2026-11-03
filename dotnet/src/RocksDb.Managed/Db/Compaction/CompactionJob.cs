@@ -909,6 +909,8 @@ internal sealed class CompactionJob
             TargetFileSize = _c.MaxOutputFileSize,
             FileCreationTime = now,
             NewestKeyTime = newestKeyTime,
+            // proximal_after_seqno_ /*last_level_inclusive_max_seqno_threshold*/ (CompactionJob::OpenCompactionOutputFile).
+            LastLevelInclusiveMaxSeqnoThreshold = _proximalAfterSeqno,
         };
         if (!_c.EnableCompression)
         {

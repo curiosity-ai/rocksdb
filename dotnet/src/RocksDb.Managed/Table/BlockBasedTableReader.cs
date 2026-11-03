@@ -70,6 +70,11 @@ public sealed record TableReaderOptions
     /// of ingested external files; <see cref="DbFormat.MaxSequenceNumber"/> when unknown.
     /// </summary>
     public ulong LargestSeqno { get; init; } = DbFormat.MaxSequenceNumber;
+    /// <summary>
+    /// index_block_search_type: search algorithm for index blocks (binary-search indexes and index partitions; the top
+    /// level of a partitioned index and hash indexes always use binary search, like upstream's index readers).
+    /// </summary>
+    public IndexBlockSearchType IndexBlockSearchType { get; init; } = IndexBlockSearchType.Binary;
 
     public static TableReaderOptions Default { get; } = new();
 }
@@ -872,9 +877,26 @@ public sealed partial class BlockBasedTableReader : IDisposable
         stats.Add(BlockCacheCounter.BytesInserted, charge);
     }
 
-    internal void InitIndexIter(BlockIter it, Block block) =>
+    /// <summary>
+    /// Initializes an index iterator over <paramref name="block"/> (the top-level index block, or an index partition when
+    /// <paramref name="isPartition"/>). Port of BlockBasedTable::InitBlockIterator&lt;IndexBlockIter&gt; /
+    /// BinarySearchIndexReader::NewIterator / PartitionIndexReader::NewIterator: index_block_search_type applies to
+    /// binary-search index blocks and index partitions, while partitioned-index top levels and hash indexes use kBinary.
+    /// </summary>
+    internal void InitIndexIter(BlockIter it, Block block, bool isPartition)
+    {
         it.InitializeIndex(block, _icmp, IndexKeyIncludesSeq, IndexValueIsFull, IndexHasFirstKey,
             BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(_footer.FormatVersion), GlobalSequenceNumber, PadTimestampSize);
+        IndexBlockSearchType searchType = _options.IndexBlockSearchType;
+        if (searchType == IndexBlockSearchType.Binary) return;
+        if (!isPartition && (IsPartitionedIndex || IndexType == IndexType.HashSearch)) return;
+        // Block::NewIndexIterator: kAuto resolves to interpolation search only for blocks marked "is_uniform" with the
+        // bytewise comparator (kInterpolation itself is rejected for other comparators by option validation).
+        bool interpolation = searchType == IndexBlockSearchType.Interpolation
+            ? _icmp.IsBytewise
+            : block.IsUniform && _icmp.IsBytewise;
+        if (interpolation) it.UseInterpolationSearch();
+    }
 
     /// <summary>Iterator over the top-level filter partition index (NewFilterPartitionIndexIterator: no global seqno, no first key).</summary>
     private void InitFilterIndexIter(BlockIter it, Block block) =>

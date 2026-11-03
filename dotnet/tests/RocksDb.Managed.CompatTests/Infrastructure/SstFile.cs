@@ -53,7 +53,7 @@ internal sealed class SstFile : IDisposable
     {
         var result = new List<BlockHandle>();
         using var it = new BlockIter();
-        Reader.InitIndexIter(it, Reader.IndexBlock);
+        Reader.InitIndexIter(it, Reader.IndexBlock, isPartition: false);
         for (it.SeekToFirst(); it.Valid; it.Next()) result.Add(it.BlockHandle);
         return result;
     }
