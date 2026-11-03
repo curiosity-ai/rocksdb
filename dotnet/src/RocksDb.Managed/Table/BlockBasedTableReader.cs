@@ -520,9 +520,15 @@ public sealed partial class BlockBasedTableReader : IDisposable
         BlockCache? metaCache = options.CacheIndexAndFilterBlocks ? options.BlockCache as BlockCache : null;
         CachePriority metaPriority = MetaPriority(options);
 
-        Block? indexBlock = Protect(BlockFetcher.ReadBlock(file, footer, indexHandle, verify), options);
+        // A pinned index and filter (not in the block cache) live as long as the reader: their buffers come from the table
+        // buffer pool, where the table builder has just returned its index and filter buffers (the same sizes) and where
+        // the builders of later flushes / compactions find them again once this reader is closed. Blocks that go to the
+        // block cache keep the block buffer pool's finer size classes (the cache is charged the buffer length).
+        BlockBufferSource pinnedSource = metaCache is null ? BlockBufferSource.TableBuffers : BlockBufferSource.BlockBufferPool;
+        Block? indexBlock = Protect(BlockFetcher.ReadBlock(file, footer, indexHandle, verify, null, pinnedSource), options);
         Block? rangeDel = null;
         byte[]? filterBuf = null;
+        BlockBufferSource filterSource = BlockBufferSource.NotRented;
         Block? filterIndex = null;
         PinnedFilterPartitions? pinnedParts = null;
         Compression.CompressionDictionary? compressionDict = null;
@@ -583,7 +589,9 @@ public sealed partial class BlockBasedTableReader : IDisposable
                 && metaBlocks.TryGetValue(BlockBasedTableConstants.FullFilterBlockPrefix + policy.CompatibilityName, out fh))
             {
                 filterKind = FilterKind.Full;
-                filterBuf = BlockFetcher.ReadRawPayload(file, footer, fh, verify, out int flen);
+                // A cached filter's buffer is returned to ArrayPool.Shared by the cache entry (CacheValue).
+                filterSource = metaCache is null ? BlockBufferSource.TableBuffers : BlockBufferSource.Shared;
+                filterBuf = BlockFetcher.ReadRawPayload(file, footer, fh, verify, filterSource, out int flen);
                 filter = CreateFilterReader(policy, filterBuf, flen);
                 if (metaCache is not null)
                 {
@@ -604,7 +612,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
             filterIndex?.Release();
             pinnedParts?.Dispose();
             compressionDict?.Dispose();
-            if (filterBuf is not null) ArrayPool<byte>.Shared.Return(filterBuf);
+            if (filterBuf is not null) TableBuilderBuffers.Return(filterSource, filterBuf);
             throw;
         }
     }
@@ -977,6 +985,9 @@ public sealed partial class BlockBasedTableReader : IDisposable
 
     /// <summary>The pinned top-level index block (not available when <see cref="IndexAndFilterInCache"/>).</summary>
     internal Block IndexBlock => _indexBlock ?? throw new InvalidOperationException("The index block is held by the block cache (CacheIndexAndFilterBlocks).");
+
+    /// <summary>The buffer of the pinned full filter (null when absent or held by the block cache). Tests only.</summary>
+    internal byte[]? PinnedFilterBuffer => Volatile.Read(ref _filterBuffer);
     internal bool IsPartitionedIndex => IndexType == IndexType.TwoLevelIndexSearch;
 
     // ---------------------------------------------------------------------------------------------
@@ -1588,7 +1599,8 @@ public sealed partial class BlockBasedTableReader : IDisposable
 
 
         byte[]? fb = Interlocked.Exchange(ref _filterBuffer, null);
-        if (fb is not null) ArrayPool<byte>.Shared.Return(fb);
+        // The pinned full filter (never set when the filter is held by the block cache) is rented from the table buffers.
+        if (fb is not null) TableBuilderBuffers.Bytes.Return(fb);
         _file.Dispose();
     }
 

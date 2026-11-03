@@ -1,6 +1,7 @@
 using System.Text;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Table;
+using RocksDb.Managed.Table.Filters;
 using RocksDb.Managed.Util;
 using static RocksDb.Managed.Tests.Table.TableTestUtil;
 using EntryType = RocksDb.Managed.Db.EntryType;
@@ -246,6 +247,59 @@ public sealed class BlockBasedTableTests
         Assert.AreEqual(readsBefore, file.Reads, "filter should prevent data block reads");
         Assert.IsTrue(reader.Get(LookupKey("key00000003"), null).Found);
         Assert.IsTrue(file.Reads > readsBefore);
+    }
+
+    /// <summary>
+    /// The index block and full filter a reader pins come from the table buffer pool (where table builders rent theirs)
+    /// and go back there when the reader is closed, also after iterators over the reader were used; with
+    /// cache_index_and_filter_blocks they stay in the block buffer pool / ArrayPool.Shared the cache returns them to.
+    /// </summary>
+    [TestMethod]
+    public void PinnedIndexAndFilterUseTableBufferPool()
+    {
+        List<(byte[] Key, byte[] Value)> entries = MakeEntries(20_000, 7);
+        var policy = new BloomFilterPolicy(10);
+        byte[] data = BuildTable(entries, new TableFormatOptions { FilterPolicy = policy });
+        byte[] index, filter;
+        using (BlockBasedTableReader reader = BlockBasedTableReader.Open(new MemRandomAccessFile(data), new TableReaderOptions { FilterPolicy = policy }))
+        {
+            index = reader.IndexBlock.Buffer;
+            filter = reader.PinnedFilterBuffer!;
+            Assert.IsNotNull(filter);
+            // Table buffer pool arrays are power-of-two sized (block buffer pool classes above 4 KiB are not).
+            Assert.IsTrue(index.Length > 4096 && System.Numerics.BitOperations.IsPow2(index.Length), "index buffer " + index.Length);
+            Assert.IsTrue(System.Numerics.BitOperations.IsPow2(filter.Length), "filter buffer " + filter.Length);
+            using (BlockBasedTableIterator it = reader.NewIterator())
+            {
+                int n = 0;
+                for (it.SeekToFirst(); it.Valid; it.Next()) n++;
+                Assert.AreEqual(entries.Count, n);
+            }
+            Assert.IsTrue(reader.Get(entries[123].Key, null).Found);
+        }
+        // Closed: both buffers are back in the table buffer pool (a LIFO per size class), not dropped or returned to
+        // another pool. Rent both before returning either, so they are told apart when they share a size class.
+        byte[] a = TableBuilderBuffers.Bytes.Rent(filter.Length);
+        byte[] b = TableBuilderBuffers.Bytes.Rent(index.Length);
+        try
+        {
+            Assert.IsTrue(ReferenceEquals(a, filter) || ReferenceEquals(a, index), "filter buffer not returned to the table buffer pool");
+            Assert.IsTrue(ReferenceEquals(b, index) || ReferenceEquals(b, filter), "index buffer not returned to the table buffer pool");
+        }
+        finally
+        {
+            TableBuilderBuffers.Bytes.Return(b);
+            TableBuilderBuffers.Bytes.Return(a);
+        }
+
+        // cache_index_and_filter_blocks: the cache owns them, charged at the block buffer pool's finer size classes.
+        var cache = RocksDb.Managed.Cache.BlockCache.CreateLru(new RocksDb.Managed.Cache.LruCacheOptions { Capacity = 8 << 20 });
+        using (BlockBasedTableReader reader = BlockBasedTableReader.Open(new MemRandomAccessFile(data),
+            new TableReaderOptions { FilterPolicy = policy, BlockCache = cache, CacheIndexAndFilterBlocks = true }))
+        {
+            Assert.IsNull(reader.PinnedFilterBuffer);
+            Assert.IsTrue(reader.Get(entries[5].Key, null).Found);
+        }
     }
 
     [TestMethod]

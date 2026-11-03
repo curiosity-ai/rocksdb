@@ -33,7 +33,7 @@ public sealed class Block : IDisposable
 
     private byte[] _buffer = [];
     private int _length;
-    private bool _rented;
+    private BlockBufferSource _source;
     private int _refCount;
     // block_protection_bytes_per_key requested by the table reader that loaded this block, and the per key-value
     // checksums (computed on first verification, then shared by every iterator over the block).
@@ -77,12 +77,19 @@ public sealed class Block : IDisposable
     /// <see cref="ArrayPool{T}.Shared"/> (or, for the non-power-of-two sizes the table reader rents, to the internal
     /// block buffer pool) when released. Throws Corruption for a malformed block.
     /// </summary>
-    public static Block Create(byte[] buffer, int length, bool rentedFromSharedPool)
+    public static Block Create(byte[] buffer, int length, bool rentedFromSharedPool) =>
+        Create(buffer, length, rentedFromSharedPool ? BlockBufferSource.BlockBufferPool : BlockBufferSource.NotRented);
+
+    /// <summary>
+    /// <see cref="Create(byte[], int, bool)"/> with the pool <paramref name="buffer"/> came from (the block returns it
+    /// there when released).
+    /// </summary>
+    internal static Block Create(byte[] buffer, int length, BlockBufferSource source)
     {
         Block b = RentObject();
         b._buffer = buffer;
         b._length = length;
-        b._rented = rentedFromSharedPool;
+        b._source = source;
         b._refCount = 1;
         b._kvProtectionBytes = 0;
         b._kvProtection = null;
@@ -190,10 +197,10 @@ public sealed class Block : IDisposable
         if (n > 0) return;
         if (n < 0) throw new InvalidOperationException("Block released too many times.");
         byte[] buf = _buffer;
-        bool rented = _rented;
+        BlockBufferSource source = _source;
         _buffer = [];
         _length = 0;
-        if (rented && buf.Length > 0) RocksDb.Managed.Memory.BlockBufferPool.Return(buf);
+        if (buf.Length > 0) TableBuilderBuffers.Return(source, buf);
         ReturnObject(this);
     }
 

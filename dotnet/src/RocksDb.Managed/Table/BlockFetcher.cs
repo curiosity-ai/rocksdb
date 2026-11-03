@@ -51,10 +51,18 @@ internal static class BlockFetcher
         ReadBlock(file, footer, handle, verifyChecksums, null);
 
     /// <summary>Reads a block, decompressing with <paramref name="dictionary"/> (data blocks of dictionary-compressed tables).</summary>
-    public static Block ReadBlock(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums, CompressionDictionary? dictionary)
+    public static Block ReadBlock(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums, CompressionDictionary? dictionary) =>
+        ReadBlock(file, footer, handle, verifyChecksums, dictionary, BlockBufferSource.BlockBufferPool);
+
+    /// <summary>
+    /// Reads a block into a buffer rented from <paramref name="source"/> (the block returns it there when released):
+    /// <see cref="BlockBufferSource.TableBuffers"/> for the blocks a table reader pins for its lifetime.
+    /// </summary>
+    public static Block ReadBlock(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums, CompressionDictionary? dictionary,
+        BlockBufferSource source)
     {
         int n = CheckedLength(handle);
-        byte[] buf = BlockBufferPool.Rent(n);
+        byte[] buf = TableBuilderBuffers.Rent(source, n);
         try
         {
             int read = ReadFully(file, (long)handle.Offset, buf.AsSpan(0, n));
@@ -62,10 +70,10 @@ internal static class BlockFetcher
         }
         catch
         {
-            BlockBufferPool.Return(buf);
+            TableBuilderBuffers.Return(source, buf);
             throw;
         }
-        return ProcessSerialized(buf, footer, handle, verifyChecksums, dictionary);
+        return ProcessSerialized(buf, footer, handle, verifyChecksums, dictionary, source);
     }
 
     public static ValueTask<Block> ReadBlockAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, bool verifyChecksums, CancellationToken ct) =>
@@ -94,7 +102,7 @@ internal static class BlockFetcher
             try
             {
                 already = first.Result;
-                if (already == n) return new ValueTask<Block>(ProcessSerialized(buf, footer, handle, verifyChecksums, dictionary));
+                if (already == n) return new ValueTask<Block>(ProcessSerialized(buf, footer, handle, verifyChecksums, dictionary, BlockBufferSource.BlockBufferPool));
             }
             catch (Exception e)
             {
@@ -130,7 +138,7 @@ internal static class BlockFetcher
             BlockBufferPool.Return(buf);
             throw;
         }
-        return ProcessSerialized(buf, footer, handle, verifyChecksums, dictionary);
+        return ProcessSerialized(buf, footer, handle, verifyChecksums, dictionary, BlockBufferSource.BlockBufferPool);
     }
 
     private static int CheckedLength(BlockHandle handle)
@@ -169,14 +177,15 @@ internal static class BlockFetcher
         if (verifyChecksums && !BlockChecksum.Verify(footer.ChecksumType, footer.BaseContextChecksum, serialized, handle.Offset))
             ThrowHelper.Corruption("block checksum mismatch at offset " + handle.Offset + " size " + size);
         var type = (CompressionType)serialized[size];
-        if (type != CompressionType.None) return Decompress(type, serialized[..size], footer.FormatVersion, dictionary);
+        if (type != CompressionType.None) return Decompress(type, serialized[..size], footer.FormatVersion, dictionary, BlockBufferSource.BlockBufferPool);
         byte[] buf = BlockBufferPool.Rent(Math.Max(size, 1));
         serialized[..size].CopyTo(buf);
         return Block.Create(buf, size, rentedFromSharedPool: true);
     }
 
-    /// <summary>Takes ownership of <paramref name="buf"/> (rented) holding payload + trailer.</summary>
-    private static Block ProcessSerialized(byte[] buf, in Footer footer, BlockHandle handle, bool verifyChecksums, CompressionDictionary? dictionary)
+    /// <summary>Takes ownership of <paramref name="buf"/> (rented from <paramref name="source"/>) holding payload + trailer.</summary>
+    private static Block ProcessSerialized(byte[] buf, in Footer footer, BlockHandle handle, bool verifyChecksums, CompressionDictionary? dictionary,
+        BlockBufferSource source)
     {
         int size = (int)handle.Size;
         try
@@ -186,41 +195,49 @@ internal static class BlockFetcher
         }
         catch
         {
-            BlockBufferPool.Return(buf);
+            TableBuilderBuffers.Return(source, buf);
             throw;
         }
         var type = (CompressionType)buf[size];
-        if (type == CompressionType.None) return Block.Create(buf, size, rentedFromSharedPool: true);
+        if (type == CompressionType.None) return Block.Create(buf, size, source);
         try
         {
-            return Decompress(type, buf.AsSpan(0, size), footer.FormatVersion, dictionary);
+            return Decompress(type, buf.AsSpan(0, size), footer.FormatVersion, dictionary, source);
         }
         finally
         {
-            BlockBufferPool.Return(buf);
+            TableBuilderBuffers.Return(source, buf);
         }
     }
 
     [ThreadStatic] private static RentedBufferWriter? t_decompressWriter;
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    internal static Block Decompress(CompressionType type, ReadOnlySpan<byte> compressed, int formatVersion) => Decompress(type, compressed, formatVersion, null);
+    internal static Block Decompress(CompressionType type, ReadOnlySpan<byte> compressed, int formatVersion) =>
+        Decompress(type, compressed, formatVersion, null, BlockBufferSource.BlockBufferPool);
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    internal static Block Decompress(CompressionType type, ReadOnlySpan<byte> compressed, int formatVersion, CompressionDictionary? dictionary)
+    internal static Block Decompress(CompressionType type, ReadOnlySpan<byte> compressed, int formatVersion, CompressionDictionary? dictionary) =>
+        Decompress(type, compressed, formatVersion, dictionary, BlockBufferSource.BlockBufferPool);
+
+    /// <summary>Decompresses into a block whose buffer is rented from <paramref name="source"/>.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static Block Decompress(CompressionType type, ReadOnlySpan<byte> compressed, int formatVersion, CompressionDictionary? dictionary,
+        BlockBufferSource source)
     {
         // No initial buffer: the decompressors request the exact uncompressed size (stored in the block or the snappy
         // header) with a single GetSpan, so the block gets one right-sized array and no grow-and-copy.
         // Per-thread writer (it holds no buffer between calls: Detach/Dispose leave it empty), so a block read does not
         // allocate the writer object.
-        RentedBufferWriter w = t_decompressWriter ?? new RentedBufferWriter(0, blockPool: true);
+        RentedBufferWriter w = t_decompressWriter ?? new RentedBufferWriter(0, BlockBufferSource.BlockBufferPool);
         t_decompressWriter = null;
         try
         {
+            w.Source = source;
             BlockCompression.Decompress(type, compressed, formatVersion, w, dictionary);
 
             byte[] arr = w.Detach(out int len);
-            return Block.Create(arr, len, rentedFromSharedPool: true);
+            return Block.Create(arr, len, source);
         }
         finally
         {
@@ -229,11 +246,22 @@ internal static class BlockFetcher
         }
     }
 
-    /// <summary>Unpacks a serialized block's payload into a fresh rented array (used for filters, which aren't parsed as blocks).</summary>
-    public static byte[] ReadRawPayload(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums, out int length)
+    /// <summary>
+    /// Unpacks a serialized block's payload into an array rented from <see cref="ArrayPool{T}.Shared"/> (used for filters,
+    /// which aren't parsed as blocks).
+    /// </summary>
+    public static byte[] ReadRawPayload(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums, out int length) =>
+        ReadRawPayload(file, footer, handle, verifyChecksums, BlockBufferSource.Shared, out length);
+
+    /// <summary>
+    /// Unpacks a serialized block's payload into an array rented from <paramref name="source"/> (the caller returns it
+    /// there).
+    /// </summary>
+    public static byte[] ReadRawPayload(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums, BlockBufferSource source,
+        out int length)
     {
         int n = CheckedLength(handle);
-        byte[] buf = ArrayPool<byte>.Shared.Rent(n);
+        byte[] buf = TableBuilderBuffers.Rent(source, n);
         try
         {
             int read = ReadFully(file, (long)handle.Offset, buf.AsSpan(0, n));
@@ -247,11 +275,11 @@ internal static class BlockFetcher
                 length = size;
                 return buf;
             }
-            var w = new RentedBufferWriter(size * 2, blockPool: false);
+            var w = new RentedBufferWriter(size * 2, source);
             try
             {
                 BlockCompression.Decompress(type, buf.AsSpan(0, size), footer.FormatVersion, w);
-                ArrayPool<byte>.Shared.Return(buf);
+                TableBuilderBuffers.Return(source, buf);
                 buf = [];
                 return w.Detach(out length);
             }
@@ -262,7 +290,7 @@ internal static class BlockFetcher
         }
         catch
         {
-            if (buf.Length > 0) ArrayPool<byte>.Shared.Return(buf);
+            if (buf.Length > 0) TableBuilderBuffers.Return(source, buf);
             throw;
         }
     }
@@ -270,28 +298,39 @@ internal static class BlockFetcher
 
 /// <summary>
 /// Minimal growable writer over a rented array whose buffer can be detached (ownership transfer). Arrays come from
-/// <see cref="BlockBufferPool"/> (<paramref name="blockPool"/>, for buffers that become <see cref="Block"/>s) or from
-/// <see cref="ArrayPool{T}.Shared"/> (buffers handed to code that returns them there, e.g. cached filters).
+/// <see cref="Source"/>: <see cref="BlockBufferPool"/> for buffers that become <see cref="Block"/>s,
+/// <see cref="ArrayPool{T}.Shared"/> for buffers handed to code that returns them there (e.g. cached filters), or the
+/// table buffers for the blocks a table reader pins.
 /// </summary>
 internal sealed class RentedBufferWriter : IBufferWriter<byte>, IDisposable
 {
     private byte[] _buffer;
     private int _written;
-    private readonly bool _blockPool;
+    private BlockBufferSource _source;
 
-    public RentedBufferWriter(int initialCapacity, bool blockPool)
+    public RentedBufferWriter(int initialCapacity, BlockBufferSource source)
     {
-        _blockPool = blockPool;
+        _source = source;
         _buffer = initialCapacity <= 0 ? [] : RentArray(Math.Max(initialCapacity, 16));
     }
 
-    private byte[] RentArray(int n) => _blockPool ? BlockBufferPool.Rent(n) : ArrayPool<byte>.Shared.Rent(n);
+    /// <summary>The pool buffers are rented from; can only be changed while the writer holds no buffer.</summary>
+    public BlockBufferSource Source
+    {
+        get => _source;
+        set
+        {
+            if (_buffer.Length != 0) throw new InvalidOperationException("The writer holds a buffer.");
+            _source = value;
+        }
+    }
+
+    private byte[] RentArray(int n) => TableBuilderBuffers.Rent(_source, n);
 
     private void ReturnArray(byte[] a)
     {
         if (a.Length == 0) return;
-        if (_blockPool) BlockBufferPool.Return(a);
-        else ArrayPool<byte>.Shared.Return(a);
+        TableBuilderBuffers.Return(_source, a);
     }
 
     public void Advance(int count)
