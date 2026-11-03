@@ -795,10 +795,21 @@ internal sealed partial class DbImpl
                 // InitSnapshotContext: with a snapshot checker the inputs may contain values not visible to a snapshot
                 // taken after the job starts; take one so that it appears in the snapshot list.
                 SnapshotChecker? checker = CurrentSnapshotChecker;
-                Snapshot? jobSnapshot = checker is null ? null : GetSnapshotImpl();
+                Snapshot? jobSnapshot = null;
+                ulong[] jobSnapshots = snapshots;
+                if (checker is not null)
+                {
+                    // GetSnapshotContext: the snapshot list is taken with the job snapshot, not when the compaction was
+                    // picked. With a checker a snapshot taken in between may not see data committed before the job
+                    // snapshot, so it must be in the list or the compaction drops the versions it reads.
+                    lock (_mutex)
+                    {
+                        jobSnapshot = GetSnapshotImpl();
+                        jobSnapshots = WithJobSnapshot(SnapshotsForCompaction(), jobSnapshot.SequenceNumber);
+                    }
+                }
                 try
                 {
-                    ulong[] jobSnapshots = jobSnapshot is null ? snapshots : WithJobSnapshot(snapshots, jobSnapshot.SequenceNumber);
                     bool bottom = thread == CompactionThread.Bottom;
                     job = new CompactionJob(this, cfd, c, jobSnapshots, NewPendingOutputFileNumber, ct)
                     {

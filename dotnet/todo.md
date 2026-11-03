@@ -245,5 +245,5 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [ ] secondary: verify table files exist before installing a version (S); re-measure switchover hold on a quiet machine (S)
 - Backup / error handling
   - [x] SstFileManager (space limit, trash deletion, compaction space pre-check) + no-space auto recovery; atomic WAL-error recovery flush
-- Flaky under load (investigate): RoundTrip `NativeFirst_Alternating` managed reopen hit LOCK 'Resource temporarily unavailable' once (seed 1518776361 replays clean); `CommitsRacingReaders(WriteUnprepared,True)`; `ManagedDbPrefixSeekReadByNative(...)` (L1+ precondition when an L0 file trivially moves to L6)
+- [x] Flaky-under-load hunt: LOCK release race (OFD lock shared with vforked children; unlock before close, as upstream), compaction zeroing seqnos of versions committed mid-compaction (current_key_committed_), WriteUnprepared rollback with two_write_queues visible before its commit (rollback batch now AddPrepared, deviation worth reporting upstream), compaction snapshot list taken at pick time (now with the job snapshot under the mutex); test-timing fixes for prefix-seek compat, blob auto-flush, write slowdown
 - Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)

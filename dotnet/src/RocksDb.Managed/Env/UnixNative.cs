@@ -31,6 +31,7 @@ internal static partial class UnixNative
     private const int F_SETFL = 4;
     private const int F_OFD_SETLK = 37;
     private const short F_WRLCK = 1;
+    private const short F_UNLCK = 2;
     private const int FALLOC_FL_KEEP_SIZE = 1;
     private const uint SYNC_FILE_RANGE_WRITE = 2;
     private const int O_RDONLY = 0;
@@ -258,6 +259,33 @@ internal static partial class UnixNative
         {
             s_ofdUnavailable = true;
             return -1;
+        }
+        finally
+        {
+            if (addRef) handle.DangerousRelease();
+        }
+    }
+
+    /// <summary>
+    /// Releases a lock taken by <see cref="TryOfdLock"/> (F_OFD_SETLK with F_UNLCK; PosixFileSystem::UnlockFile also
+    /// unlocks explicitly before closing). An OFD lock belongs to the open file description, which a child process
+    /// forked by any thread shares until it execs (O_CLOEXEC only closes it at exec), so closing our descriptor alone
+    /// does not release it while such a child exists. Unlocking removes the lock from the description itself.
+    /// Errors are ignored: closing the descriptor afterwards still releases the lock once the last reference goes.
+    /// </summary>
+    public static unsafe void OfdUnlock(SafeFileHandle handle)
+    {
+        bool addRef = false;
+        try
+        {
+            handle.DangerousAddRef(ref addRef);
+            Flock64 fl = default;
+            fl.l_type = F_UNLCK;
+            fl.l_whence = 0; // SEEK_SET
+            fl.l_start = 0;
+            fl.l_len = 0;
+            fl.l_pid = 0;
+            _ = fcntl_ptr((int)handle.DangerousGetHandle(), F_OFD_SETLK, &fl);
         }
         finally
         {
