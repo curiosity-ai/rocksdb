@@ -123,11 +123,19 @@ internal sealed partial class DbImpl
                     if (m.Mem.Unref()) m.Mem.Dispose();
                 }
                 _pendingOutputs.Remove(fileNumber);
+                // The flush itself is done: release FlushAsync waiters and let the next flush of this CF start before
+                // the (slow) obsolete-file purge, like upstream's bg_cv_ signal after the install.
+                cfd.FlushRunning = false;
+                _runningFlushes--;
+                EnqueueFlush(cfd);
+                MaybeScheduleFlush();
+                SignalBackgroundWork();
             }
             try
             {
-                // Before the job is accounted as finished (like compaction): CloseAsync waits for _backgroundJobs to
-                // drain, so a purge running after close could delete files of a new DB created in the same directory.
+                // Before the job is accounted as finished (like BackgroundCallFlush: bg_flush_scheduled_-- after
+                // PurgeObsoleteFiles): CloseAsync waits for _backgroundJobs to drain, so a purge running after close
+                // could delete files of a new DB created in the same directory.
                 PurgeObsoleteFiles();
             }
             catch (Exception e) when (e is IOException or RocksDbException)
@@ -136,11 +144,7 @@ internal sealed partial class DbImpl
             }
             lock (_mutex)
             {
-                cfd.FlushRunning = false;
-                _runningFlushes--;
                 _backgroundJobs--;
-                EnqueueFlush(cfd);
-                MaybeScheduleFlush();
                 SignalBackgroundWork();
             }
         }
