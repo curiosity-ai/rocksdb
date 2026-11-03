@@ -62,6 +62,13 @@ internal enum SnapshotCheckerResult
 internal abstract class SnapshotChecker
 {
     public abstract SnapshotCheckerResult CheckInSnapshot(ulong sequence, ulong snapshotSequence);
+
+    /// <summary>
+    /// The sequence number below which every entry is known to be committed (bounded by <paramref name="oldestSnapshot"/>).
+    /// Bottommost files are marked for compaction only below it: uncommitted entries are never visible to the
+    /// compaction's snapshots, so their sequence numbers cannot be zeroed and the rewrite would be repeated forever.
+    /// </summary>
+    public virtual ulong BoundOldestSnapshotForBottommostMarking(ulong oldestSnapshot) => oldestSnapshot;
 }
 
 /// <summary>
@@ -77,6 +84,9 @@ internal sealed class DisableGcSnapshotChecker : SnapshotChecker
     }
 
     public override SnapshotCheckerResult CheckInSnapshot(ulong sequence, ulong snapshotSequence) => SnapshotCheckerResult.NotInSnapshot;
+
+    /// <summary>Nothing can be zeroed: no bottommost file is marked.</summary>
+    public override ulong BoundOldestSnapshotForBottommostMarking(ulong oldestSnapshot) => 0;
 }
 
 /// <summary>

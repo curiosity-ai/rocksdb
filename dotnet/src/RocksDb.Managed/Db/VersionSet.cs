@@ -122,7 +122,17 @@ internal sealed class VersionSet : IAsyncDisposable
     /// Registers a column family with an initial version built from <paramref name="files"/> and the recovered
     /// <paramref name="blobFiles"/> (null = none). REQUIRES: DB mutex.
     /// </summary>
-    public void AddColumnFamily(ColumnFamilyData cfd, FileMetaData[][]? files, IEnumerable<BlobFileState>? blobFiles)
+    public void AddColumnFamily(ColumnFamilyData cfd, FileMetaData[][]? files, IEnumerable<BlobFileState>? blobFiles) =>
+        AddColumnFamily(cfd, files, blobFiles, null, updateStats: false);
+
+    /// <summary>
+    /// Registers a recovered column family (VersionEditHandler: the version built from the MANIFEST), with its
+    /// round-robin <paramref name="compactCursors"/> and, with <paramref name="updateStats"/> (not
+    /// skip_stats_update_on_db_open), the entry stats of its files loaded (Version::PrepareAppend(update_stats)).
+    /// REQUIRES: DB mutex (only taken during DB open, when the table reads under it block nobody).
+    /// </summary>
+    public void AddColumnFamily(ColumnFamilyData cfd, FileMetaData[][]? files, IEnumerable<BlobFileState>? blobFiles,
+        IReadOnlyList<CompactCursor>? compactCursors, bool updateStats)
     {
         _cfs[cfd.Id] = cfd;
         if (cfd.Id > MaxColumnFamily) MaxColumnFamily = cfd.Id;
@@ -133,9 +143,40 @@ internal sealed class VersionSet : IAsyncDisposable
             foreach (BlobFileState b in blobFiles) baseList.Add(new Blob.BlobFileMetaData(b.Addition, b.GarbageBlobCount, b.GarbageBlobBytes, []));
             blobs = Blob.BlobFileMetaData.Build(baseList, null, files ?? []);
         }
-        var storage = new VersionStorageInfo(cfd.Icmp, Math.Max(cfd.NumLevels, files?.Length ?? 0), cfd.Options, files, blobs);
+        AccumulatedFileStats? stats = updateStats && files is not null ? LoadFileStats(cfd, files, default) : null;
+        var context = new VersionBuildContext
+        {
+            CompactCursors = compactCursors,
+            AccumulatedStats = stats,
+            AllowIngestBehind = AllowIngestBehind(cfd),
+            FullHistoryTsLow = cfd.FullHistoryTsLow,
+        };
+        var storage = new VersionStorageInfo(cfd.Icmp, Math.Max(cfd.NumLevels, files?.Length ?? 0), cfd.Options, files, blobs, context);
         var v = new DbVersion(cfd, storage, ++_versionNumber);
         InstallVersion(cfd, v);
+    }
+
+    private bool AllowIngestBehind(ColumnFamilyData cfd) => _db.Options.AllowIngestBehind || cfd.Options.CfAllowIngestBehind;
+
+    /// <summary>
+    /// Version::UpdateAccumulatedStats for a version about to be built from <paramref name="files"/>: loads the entry
+    /// stats of new files through the table cache (no I/O when the table is open or the stats came from the builder).
+    /// </summary>
+    private AccumulatedFileStats LoadFileStats(ColumnFamilyData cfd, FileMetaData[][] files, AccumulatedFileStats accumulated) =>
+        VersionStorageInfo.UpdateAccumulatedStats(files, accumulated, _db.Options.MaxOpenFiles == -1, f => ReadTableProperties(cfd, f));
+
+    private Table.TableProperties? ReadTableProperties(ColumnFamilyData cfd, FileMetaData f)
+    {
+        try
+        {
+            using TableReaderLease lease = cfd.TableCache.GetReader(f);
+            return lease.Reader.Properties;
+        }
+        catch (Exception e) when (e is RocksDbException or IOException)
+        {
+            _db.LogError("Unable to load table properties for file " + f.FileNumber.ToString(System.Globalization.CultureInfo.InvariantCulture) + " --- " + e.Message);
+            return null;
+        }
     }
 
     /// <summary>Makes <paramref name="v"/> the current version of <paramref name="cfd"/>. REQUIRES: DB mutex.</summary>
@@ -276,6 +317,7 @@ internal sealed class VersionSet : IAsyncDisposable
             RecoveredVersionState? snapshot = null;
             FileMetaData[][]? newFiles = null;
             Blob.BlobFileMetaData[]? newBlobFiles = null;
+            AccumulatedFileStats baseStats = default;
             bool newManifest;
             lock (_db.Mutex)
             {
@@ -291,11 +333,13 @@ internal sealed class VersionSet : IAsyncDisposable
                     edit.MaxColumnFamily = Math.Max(MaxColumnFamily, edit.ColumnFamily);
                 }
                 else if (cfd is not null && !edit.IsColumnFamilyDrop && (edit.NewFiles.Count > 0 || edit.DeletedFiles.Count > 0 ||
-                                                                         edit.BlobFileAdditions.Count > 0 || edit.BlobFileGarbages.Count > 0))
+                                                                         edit.BlobFileAdditions.Count > 0 || edit.BlobFileGarbages.Count > 0 ||
+                                                                         edit.CompactCursors.Count > 0))
                 {
                     VersionStorageInfo cur = cfd.Current.Storage;
                     newFiles = cur.ApplyEdit(edit, cfd.NumLevels);
                     newBlobFiles = Blob.BlobFileMetaData.Build(cur.BlobFiles, edit, newFiles);
+                    baseStats = cur.AccumulatedStats;
                 }
                 newManifest = _manifest is null || (ulong)_manifestLog!.Log.File!.Size >= _db.Options.MaxManifestFileSize;
                 if (newManifest)
@@ -310,6 +354,10 @@ internal sealed class VersionSet : IAsyncDisposable
                 edit.LastSequence = lastSeq;
                 _descriptorLastSequence = lastSeq;
             }
+
+            // Version::PrepareAppend(update_stats): load the entry stats of the new files before the version is built
+            // (outside the DB mutex; the new FileMetaData objects are not visible to anyone else yet).
+            AccumulatedFileStats? newStats = newFiles is not null ? LoadFileStats(cfd!, newFiles, baseStats) : null;
 
             TestHooks.Invoke("VersionSet::LogAndApply:BeforeManifestWrite");
             ulong manifestNumber = 0;
@@ -402,7 +450,15 @@ internal sealed class VersionSet : IAsyncDisposable
                 {
                     if (newFiles is not null)
                     {
-                        var storage = new VersionStorageInfo(cfd.Icmp, newFiles.Length, cfd.Options, newFiles, newBlobFiles ?? []);
+                        var context = new VersionBuildContext
+                        {
+                            RefStorage = cfd.Current.Storage,
+                            CompactCursors = edit.CompactCursors,
+                            AccumulatedStats = newStats,
+                            AllowIngestBehind = AllowIngestBehind(cfd),
+                            FullHistoryTsLow = cfd.FullHistoryTsLow,
+                        };
+                        var storage = new VersionStorageInfo(cfd.Icmp, newFiles.Length, cfd.Options, newFiles, newBlobFiles ?? [], context);
                         InstallVersion(cfd, new DbVersion(cfd, storage, ++_versionNumber));
                     }
                     if (edit.LogNumber is ulong ln && ln > cfd.LogNumber) cfd.LogNumber = ln;
@@ -411,6 +467,7 @@ internal sealed class VersionSet : IAsyncDisposable
                     {
                         // ColumnFamilyData::SetFullHistoryTsLow (only increases).
                         cfd.FullHistoryTsLow = tsLow;
+                        cfd.Current.Storage.FullHistoryTsLow = tsLow;
                     }
                 }
             }
@@ -474,6 +531,8 @@ internal sealed class VersionSet : IAsyncDisposable
                 List<FileMetaData> level = cv.MutableLevel(l);
                 foreach (FileMetaData f in s.LevelFiles(l)) level.Add(f);
             }
+            // WriteCurrentStateToManifest: edit.SetCompactCursors(vstorage->GetCompactCursors()).
+            foreach (CompactCursor cursor in s.ValidCompactCursors()) cv.CompactCursors[cursor.Level] = cursor.InternalKey;
             foreach (Blob.BlobFileMetaData b in s.BlobFiles)
             {
                 cv.BlobFiles[b.BlobFileNumber] = new BlobFileState

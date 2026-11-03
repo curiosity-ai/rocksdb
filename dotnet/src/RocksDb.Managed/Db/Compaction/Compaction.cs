@@ -282,6 +282,13 @@ internal sealed class Compaction
     /// <summary>Universal/manual: never trivially move.</summary>
     public bool DisallowTrivialMove { get; init; }
     /// <summary>
+    /// Compaction::max_subcompactions_: the per-compaction override of DbOptions.MaxSubcompactions
+    /// (CompactRangeOptions / CompactionOptions max_subcompactions); 0 = use the DB option.
+    /// </summary>
+    public uint MaxSubcompactions { get; set; }
+    /// <summary>The files the compaction added to the LSM (outputs or trivially moved files), set once it is installed.</summary>
+    public List<FileMetaData>? InstalledFiles { get; set; }
+    /// <summary>
     /// False when the picker disabled compression of the outputs (universal compression_size_percent: the output holds
     /// newer data than the compressed share). <see cref="OutputCompression"/> is then <c>None</c>.
     /// </summary>

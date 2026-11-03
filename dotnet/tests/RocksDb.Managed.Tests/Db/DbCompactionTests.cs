@@ -742,3 +742,80 @@ public sealed class DbCompactionTests
         Assert.IsTrue(found);
     }
 }
+
+/// <summary>DB::CompactFiles on <see cref="MemoryFileSystem"/> (compact_files_test.cc in spirit).</summary>
+[TestClass]
+public sealed class DbCompactFilesTests
+{
+    private static ColumnFamilyOptions ManualCf() => new()
+    {
+        DisableAutoCompactions = true,
+        LevelCompactionDynamicLevelBytes = false,
+        Compression = RocksDb.Managed.Compression.CompressionType.None,
+    };
+
+    private static List<LiveFileMetadata> Files(RocksDatabase db, string cf, int level) =>
+        db.GetLiveFilesMetadata().FindAll(f => f.ColumnFamilyName == cf && f.Level == level);
+
+    private static void AssertValues(ColumnFamily cf)
+    {
+        for (int i = 0; i < 300; i++) Assert.AreEqual(S(Value(i, i == 0 ? 0 : i % 2 == 0 ? 2 : 1)), S(cf.Get(Key(i))), "key " + i);
+    }
+
+    [TestMethod]
+    public async Task CompactFilesOnColumnFamilyKeepsDataAndValidatesInputs()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), ManualCf());
+        ColumnFamily cf = db.CreateColumnFamily("other", ManualCf());
+        for (int round = 0; round < 3; round++)
+        {
+            for (int i = round; i < 300; i += 2) cf.Put(Key(i), Value(i, round));
+            cf.Flush();
+        }
+        List<LiveFileMetadata> l0 = Files(db, "other", 0);
+        Assert.AreEqual(3, l0.Count);
+        // By number, async; compacting the newest L0 file to L1 takes all older L0 files too.
+        ulong newest = l0.MaxBy(f => f.FileNumber)!.FileNumber;
+        IReadOnlyList<string> outputs = await cf.CompactFilesAsync(new CompactFilesOptions { OutputFileSizeLimit = 8 * 1024 }, [newest], 1);
+        Assert.IsTrue(outputs.Count > 1, "output_file_size_limit cuts the outputs");
+        Assert.AreEqual(0, Files(db, "other", 0).Count);
+        Assert.AreEqual(outputs.Count, Files(db, "other", 1).Count);
+        foreach (string o in outputs) Assert.IsTrue(fs.FileExists(o), o);
+        AssertValues(cf);
+        // The default column family has no such file.
+        var ex = Assert.ThrowsExactly<RocksDbException>(() => db.CompactFiles([Files(db, "other", 1)[0].Name], 2));
+        Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
+        ex = Assert.ThrowsExactly<RocksDbException>(() => cf.CompactFiles([Files(db, "other", 1)[0].Name], -1));
+        Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
+        ex = Assert.ThrowsExactly<RocksDbException>(() => cf.CompactFiles([], 1));
+        Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
+        // The first and the last L1 file to L2: the files between them on the sorted level come along.
+        List<LiveFileMetadata> l1 = Files(db, "other", 1);
+        l1.Sort((a, b) => a.SmallestKey.AsSpan().SequenceCompareTo(b.SmallestKey));
+        cf.CompactFiles(new CompactFilesOptions(), [l1[0].FileNumber, l1[^1].FileNumber], 2);
+        Assert.AreEqual(0, Files(db, "other", 1).Count);
+        AssertValues(cf);
+    }
+
+    [TestMethod]
+    public void CompactFilesFifoOnlyOutputsToL0()
+    {
+        MemoryFileSystem fs = NewFs();
+        ColumnFamilyOptions o = ManualCf();
+        o.CompactionStyle = CompactionStyle.Fifo;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), o);
+        db.Put(Key(1), Value(1, 0));
+        db.Flush();
+        db.Put(Key(2), Value(2, 0));
+        db.Flush();
+        List<LiveFileMetadata> l0 = Files(db, "default", 0);
+        var ex = Assert.ThrowsExactly<RocksDbException>(() => db.CompactFiles([l0[0].Name], 1));
+        Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
+        StringAssert.Contains(ex.Message, "maximum output level");
+        IReadOnlyList<string> outputs = db.CompactFiles([l0[0].Name, l0[1].Name], 0);
+        Assert.AreEqual(1, outputs.Count);
+        Assert.AreEqual(1, Files(db, "default", 0).Count);
+        Assert.AreEqual(S(Value(1, 0)), S(db.Get(Key(1))));
+    }
+}

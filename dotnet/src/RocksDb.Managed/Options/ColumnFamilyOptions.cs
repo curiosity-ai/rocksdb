@@ -239,6 +239,13 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     /// </summary>
     public ulong PeriodicCompactionSeconds { get; set; } = DefaultPeriodicCompactionSeconds;
 
+    /// <summary>
+    /// bottommost_file_compaction_delay: once a released snapshot no longer protects data in a bottommost file, the file
+    /// is compacted (reason BottommostFiles) to drop that data and zero its sequence numbers; this delays such compactions
+    /// until the file is at least this many seconds old. 0 (default) = no delay. Mutable through SetOptions.
+    /// </summary>
+    public uint BottommostFileCompactionDelay { get; set; }
+
     /// <summary>kDefaultPeriodicCompSecs (db/column_family.cc).</summary>
     internal const ulong DefaultPeriodicCompactionSeconds = 0xfffffffffffffffe;
     /// <summary>
@@ -384,6 +391,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .Bool("report_bg_io_stats", static o => o.ReportBgIoStats, static (o, v) => o.ReportBgIoStats = v)
         .UInt64("ttl", static o => o.Ttl, static (o, v) => o.Ttl = v)
         .UInt64("periodic_compaction_seconds", static o => o.PeriodicCompactionSeconds, static (o, v) => o.PeriodicCompactionSeconds = v)
+        .UInt32("bottommost_file_compaction_delay", static o => o.BottommostFileCompactionDelay, static (o, v) => o.BottommostFileCompactionDelay = v)
         .UInt64("preclude_last_level_data_seconds", static o => o.PrecludeLastLevelDataSeconds, static (o, v) => o.PrecludeLastLevelDataSeconds = v)
         .UInt64("preserve_internal_time_seconds", static o => o.PreserveInternalTimeSeconds, static (o, v) => o.PreserveInternalTimeSeconds = v)
         .Enum("last_level_temperature", OptionEnumMaps.Temperature, static o => o.LastLevelTemperature, static (o, v) => o.LastLevelTemperature = v)

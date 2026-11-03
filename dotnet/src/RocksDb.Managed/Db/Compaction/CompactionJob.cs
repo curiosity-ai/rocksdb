@@ -701,6 +701,8 @@ internal sealed class CompactionJob
                 meta.MaxTimestamp = builder.TimestampMax;
                 // CompactionOutputs::Finish: meta->marked_for_compaction = builder_->NeedCompact().
                 meta.MarkedForCompaction = builder.NeedCompact;
+                // Entry stats as the version would load them from the table properties (no table read needed).
+                meta.SetEntryStats(builder.Properties);
                 Stats.NumOutputRangeDeletions += (long)builder.Properties.NumRangeDeletions;
                 keep = true;
             }

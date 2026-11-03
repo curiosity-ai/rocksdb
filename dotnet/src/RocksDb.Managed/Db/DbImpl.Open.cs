@@ -138,7 +138,9 @@ internal sealed partial class DbImpl
                     var list = new List<FileMetaData>(cf.Levels[l]);
                     files[l] = list.ToArray();
                 }
-                Versions.AddColumnFamily(cfd, files, cf.BlobFiles.Values);
+                var cursors = new List<CompactCursor>(cf.CompactCursors.Count);
+                foreach (KeyValuePair<int, byte[]> c in cf.CompactCursors) cursors.Add(new CompactCursor(c.Key, c.Value));
+                Versions.AddColumnFamily(cfd, files, cf.BlobFiles.Values, cursors, updateStats: !Options.SkipStatsUpdateOnDbOpen);
                 cfd.RecoverEpochNumbers();
                 cfd.Mem = cfd.ConstructNewMemtable(state.LastSequence);
                 InstallSuperVersion(cfd);

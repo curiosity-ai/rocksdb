@@ -250,7 +250,11 @@ internal sealed partial class DbImpl : IAsyncDisposable
 
     internal void ReleaseSnapshot(Snapshot s)
     {
-        lock (_mutex) _snapshots.Remove(s);
+        lock (_mutex)
+        {
+            _snapshots.Remove(s);
+            OnSnapshotReleased();
+        }
     }
 
     /// <summary>The live snapshots with a sequence number &lt;= <paramref name="max"/>, ascending (LoadSnapshots).</summary>

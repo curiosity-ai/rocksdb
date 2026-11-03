@@ -960,6 +960,9 @@ internal sealed class WritePreparedSnapshotChecker(WritePreparedTxnDb db) : Snap
         if (released) return SnapshotCheckerResult.SnapshotReleased;
         return inSnapshot ? SnapshotCheckerResult.InSnapshot : SnapshotCheckerResult.NotInSnapshot;
     }
+
+    /// <summary>Prepared but uncommitted data (at or above SmallestUnCommittedSeq) keeps bottommost files unmarked.</summary>
+    public override ulong BoundOldestSnapshotForBottommostMarking(ulong oldestSnapshot) => Math.Min(oldestSnapshot, db.SmallestUnCommittedSeq());
 }
 
 /// <summary>
