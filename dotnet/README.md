@@ -1245,8 +1245,10 @@ Format-level deviations (the output is always readable by native RocksDB):
 
 Not ported yet (tracked in [todo.md](todo.md)):
 
-- Remote compaction of compactions with blob files, and per-subcompaction remote jobs (such compactions run locally).
-- `ldb` commands for TTL, timestamp, blob and transaction databases; `sst_dump` on PlainTable / CuckooTable files.
+- `WalFilter`, the `track_and_verify_wals` predecessor-WAL records and `UserWriteCallback` (in progress).
+- Out of scope (by decision): the encrypted file system (`env_encryption.h`); remote compaction of compactions with
+  blob files and per-subcompaction remote jobs (such compactions run locally); `ldb` commands for TTL, timestamp, blob
+  and transaction databases and `sst_dump` on PlainTable / CuckooTable files.
 - Not supported, as upstream: user-defined timestamps in optimistic transactions and explicit-timestamp
   `WriteBatchWithIndex` writes.
 
