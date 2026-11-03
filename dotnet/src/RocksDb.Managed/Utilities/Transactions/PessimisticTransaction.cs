@@ -46,10 +46,14 @@ internal class PessimisticTransaction : Transaction
 
     internal readonly List<ulong> WaitIdsScratch = new();
 
+    /// <summary>Range-locking mode: the ranges this transaction locked (RangeTreeLockTracker), else null.</summary>
+    internal RangeLockList? RangeLocks { get; }
+
     public PessimisticTransaction(TransactionDatabase txnDb, WriteOptions? writeOptions, TransactionOptions options)
         : base(txnDb.Database, writeOptions, options.MaxWriteBatchSize)
     {
         _txnDb = txnDb;
+        if (txnDb.LockManager.IsRangeLockSupported) RangeLocks = new RangeLockList();
         Initialize(options);
     }
 
@@ -170,7 +174,8 @@ internal class PessimisticTransaction : Transaction
 
     // ---- locking ------------------------------------------------------------------------------------------
 
-    private protected override bool NeedsUnlockOnUntrack => true;
+    // Range locking (RangeTreeLockTracker): untracking a key or rolling back to a save point keeps its lock.
+    private protected override bool NeedsUnlockOnUntrack => RangeLocks is null;
 
     // ---- user-defined timestamps (WriteCommittedTxn) ------------------------------------------------------
 
@@ -263,7 +268,10 @@ internal class PessimisticTransaction : Transaction
         return ts;
     }
 
-    private protected override void UnlockGetForUpdate(ColumnFamilyData cfd, ReadOnlySpan<byte> key) => _txnDb.LockManager.UnLock(this, cfd.Id, key);
+    private protected override void UnlockGetForUpdate(ColumnFamilyData cfd, ReadOnlySpan<byte> key)
+    {
+        if (RangeLocks is null) _txnDb.LockManager.UnLock(this, cfd.Id, key);
+    }
 
     /// <summary>
     /// PessimisticTransaction::TryLock: locks the key unless already locked by this transaction (or an upgrade from
@@ -273,6 +281,7 @@ internal class PessimisticTransaction : Transaction
         bool synchronous, CancellationToken cancellationToken)
     {
         if (_skipConcurrencyControl) return default;
+        if (RangeLocks is not null) return TryRangeModeLock(cfd, key, readOnly, exclusive, doValidate, synchronous, cancellationToken);
         bool previouslyLocked = _tracked.TryGet(cfd.Id, key, out TrackedKeyInfo status);
         bool lockUpgrade = previouslyLocked && exclusive && !status.Exclusive;
         ulong trackedAtSeq = previouslyLocked ? status.Seq : DbFormat.MaxSequenceNumber;
@@ -287,6 +296,52 @@ internal class PessimisticTransaction : Transaction
             return new ValueTask<RocksDbException?>(AfterLock(t.Result, cfd, key, readOnly, exclusive, doValidate, previouslyLocked, lockUpgrade, trackedAtSeq));
         }
         return AfterLockAsync(t, cfd, key.ToArray(), readOnly, exclusive, doValidate, previouslyLocked, lockUpgrade, trackedAtSeq);
+    }
+
+    /// <summary>
+    /// PessimisticTransaction::TryLock with a range lock tracker (IsPointLockSupported() == false): the lock manager is
+    /// always asked (re-locking an owned range is granted at once), the key is validated against the snapshot every time
+    /// and, if that fails, the transaction's locks overlapping the key are released, like upstream.
+    /// </summary>
+    private ValueTask<RocksDbException?> TryRangeModeLock(ColumnFamilyData cfd, ReadOnlySpan<byte> key, bool readOnly, bool exclusive, bool doValidate,
+        bool synchronous, CancellationToken cancellationToken)
+    {
+        ulong trackedAtSeq = DbFormat.MaxSequenceNumber;
+        ValueTask<RocksDbException?> t = _txnDb.LockManager.TryLock(this, cfd.Id, key, exclusive, synchronous, cancellationToken);
+        if (t.IsCompletedSuccessfully)
+        {
+            return new ValueTask<RocksDbException?>(AfterLock(t.Result, cfd, key, readOnly, exclusive, doValidate, false, false, trackedAtSeq));
+        }
+        return AfterLockAsync(t, cfd, key.ToArray(), readOnly, exclusive, doValidate, false, false, trackedAtSeq);
+    }
+
+    /// <summary>
+    /// PessimisticTransaction::GetRangeLock: locks [<paramref name="start"/>, <paramref name="end"/>] exclusively in
+    /// range-locking mode. Completes with null or the lock error.
+    /// </summary>
+    private protected override ValueTask<RocksDbException?> TryRangeLock(ColumnFamilyData cfd, RangeLockEndpoint start, RangeLockEndpoint end, bool synchronous,
+        CancellationToken cancellationToken)
+    {
+        if (_txnDb.LockManager is not RangeLockManagerImpl mgr)
+        {
+            return new ValueTask<RocksDbException?>(new RocksDbException(StatusCode.NotSupported, "Not implemented: PointLockManager does not support range locking"));
+        }
+        byte[] left = RangeLockTree.Serialize(start.Key.Span, start.InfSuffix);
+        byte[] right = RangeLockTree.Serialize(end.Key.Span, end.InfSuffix);
+        ValueTask<RocksDbException?> t = mgr.TryRangeLock(this, cfd.Id, left, right, exclusive: true, synchronous, cancellationToken);
+        if (t.IsCompletedSuccessfully)
+        {
+            if (t.Result is null) RangeLocks!.Append(cfd.Id, left, right);
+            return t;
+        }
+        return AfterRangeLockAsync(t, cfd.Id, left, right);
+    }
+
+    private async ValueTask<RocksDbException?> AfterRangeLockAsync(ValueTask<RocksDbException?> t, uint cf, byte[] left, byte[] right)
+    {
+        RocksDbException? s = await t.ConfigureAwait(false);
+        if (s is null) RangeLocks!.Append(cf, left, right);
+        return s;
     }
 
     private async ValueTask<RocksDbException?> AfterLockAsync(ValueTask<RocksDbException?> t, ColumnFamilyData cfd, byte[] key, bool readOnly, bool exclusive,
@@ -329,6 +384,11 @@ internal class PessimisticTransaction : Transaction
         {
             // We must track all the locked keys so that we can unlock them later.
             TrackKey(cfd, key, trackedAtSeq, readOnly, exclusive);
+            if (RangeLocks is not null)
+            {
+                byte[] e = RangeLockTree.Serialize(key, false);
+                RangeLocks.Append(cfd.Id, e, e);
+            }
         }
         return s;
     }
@@ -651,7 +711,7 @@ internal class PessimisticTransaction : Transaction
     /// <summary>PessimisticTransaction::Clear: releases the locks, then drops the writes.</summary>
     private protected override void Clear()
     {
-        _txnDb.LockManager.UnLock(this, _tracked);
+        _txnDb.LockManager.UnLockAll(this, _tracked);
         base.Clear();
     }
 
@@ -760,7 +820,7 @@ internal class PessimisticTransaction : Transaction
     private protected override void DisposeCore()
     {
         DisposeWritePolicy();
-        _txnDb.LockManager.UnLock(this, _tracked);
+        _txnDb.LockManager.UnLockAll(this, _tracked);
         if (_expirationTime > 0) _txnDb.RemoveExpirableTransaction(_id);
         if (_name is not null && State != TransactionState.Committed) _txnDb.UnregisterTransaction(this);
         _markerBatch?.Dispose();

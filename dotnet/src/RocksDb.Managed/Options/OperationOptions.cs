@@ -106,6 +106,37 @@ public sealed class FlushOptions
     public bool AllowWriteStall { get; set; }
 }
 
+/// <summary>
+/// Options for <see cref="ColumnFamily.CompactFiles(CompactFilesOptions, IEnumerable{string}, int)"/>. Port of
+/// rocksdb::CompactionOptions plus the output path id argument of DB::CompactFiles.
+/// </summary>
+public sealed class CompactFilesOptions
+{
+    /// <summary>Size at which an output file is cut (output_file_size_limit). Default: unlimited, a single output file.</summary>
+    public ulong OutputFileSizeLimit { get; set; } = ulong.MaxValue;
+
+    /// <summary>
+    /// Compression of the outputs (CompactionOptions::compression, deprecated upstream because the compression options
+    /// still come from the column family). Null (default) = the column family's compression for the output level.
+    /// </summary>
+    public Compression.CompressionType? Compression { get; set; }
+
+    /// <summary>Overrides DbOptions.MaxSubcompactions for this compaction when &gt; 0.</summary>
+    public uint MaxSubcompactions { get; set; }
+
+    /// <summary>Temperature of the output files; Unknown (default) = last_level_temperature / default_write_temperature.</summary>
+    public Temperature OutputTemperatureOverride { get; set; } = Temperature.Unknown;
+
+    /// <summary>
+    /// Move the input files to the output level without rewriting them when that is possible (one input level, no
+    /// overlap in the output level, matching compression). Default false: the files are always rewritten.
+    /// </summary>
+    public bool AllowTrivialMove { get; set; }
+
+    /// <summary>Index into the DB paths for the outputs; -1 (default) = automatic, only supported with a single path.</summary>
+    public int OutputPathId { get; set; } = -1;
+}
+
 /// <summary>Options for manual compaction. Port of rocksdb::CompactRangeOptions.</summary>
 public sealed class CompactRangeOptions
 {

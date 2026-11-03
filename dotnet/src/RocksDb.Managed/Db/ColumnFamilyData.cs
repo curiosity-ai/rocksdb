@@ -35,13 +35,20 @@ internal sealed class SuperVersion
 {
     private int _refs = 1; // the column family's reference
 
-    public SuperVersion(MemTable mem, MemTable[] imm, DbVersion current, ulong number)
+    public SuperVersion(MemTable mem, MemTable[] imm, DbVersion current, ulong number, ColumnFamilyOptions mutableOptions)
     {
         Mem = mem;
         Imm = imm;
         Current = current;
         Number = number;
+        MutableOptions = mutableOptions;
     }
+
+    /// <summary>
+    /// The column family's options when this super version was installed (SuperVersion::mutable_cf_options): an immutable
+    /// snapshot, replaced (not modified) by SetOptions, so a reader sees one consistent set for its whole operation.
+    /// </summary>
+    public ColumnFamilyOptions MutableOptions { get; }
 
     public MemTable Mem { get; }
     /// <summary>Immutable memtables, newest first.</summary>
@@ -87,6 +94,7 @@ internal sealed class ColumnFamilyData
             ThrowHelper.InvalidArgument("In-place memtable updates (inplace_update_support) is not compatible with concurrent writes (allow_concurrent_memtable_write)");
         MergeOperator = options.MergeOperator;
         Format = TableFactory.CreateFormatOptions(options.TableOptions);
+        OptionsSnapshot = options.Clone();
         ReaderOptions = TableFactory.CreateReaderOptions(options, Format, db.GetDefaultBlockCache(options.TableOptions), db.Identity.SessionId);
         if (db.Options.Statistics is { } statistics) ReaderOptions = ReaderOptions with { Statistics = statistics.BlockCacheCounters };
         NumLevels = Math.Max(1, options.NumLevels);
@@ -97,7 +105,7 @@ internal sealed class ColumnFamilyData
             TrackNewestTimestampSize = options.PersistUserDefinedTimestamps ? 0 : TimestampSize,
         };
         MemOptions.ApplyColumnFamilyOptions(options);
-        TableCache = new TableCache(db.FileSystem, db.DbPaths, ReaderOptions, db.Options.MaxOpenFiles) { Statistics = db.Options.Statistics };
+        TableCache = new TableCache(db.SharedTableCache, db.FileSystem, db.DbPaths, ReaderOptions) { Statistics = db.Options.Statistics };
         // Blob files live in cf_paths.front() (the first DB path); readers and the optional blob cache are per CF.
         BlobSource = new Blob.BlobSource(db.FileSystem, db.DbPaths[0], id, options.BlobCache, db.Identity.DbId, db.Identity.SessionId, db.Options.Statistics,
             db.Options.MaxOpenFiles);
@@ -210,7 +218,20 @@ internal sealed class ColumnFamilyData
         set => Volatile.Write(ref _fullHistoryTsLow, value);
     }
     public MergeOperator? MergeOperator { get; }
-    public TableFormatOptions Format { get; }
+    /// <summary>Builder settings of the block-based table options; replaced (not modified) when SetOptions changes them.</summary>
+    public TableFormatOptions Format { get => Volatile.Read(ref _format); private set => Volatile.Write(ref _format, value); }
+    private TableFormatOptions _format = null!;
+
+    /// <summary>Immutable snapshot of <see cref="Options"/> taken at creation and after each SetOptions (for super versions).</summary>
+    public ColumnFamilyOptions OptionsSnapshot { get => Volatile.Read(ref _optionsSnapshot); private set => Volatile.Write(ref _optionsSnapshot, value); }
+    private ColumnFamilyOptions _optionsSnapshot = null!;
+
+    /// <summary>Refreshes the snapshot and the table builder settings after SetOptions changed <see cref="Options"/>. REQUIRES: DB mutex.</summary>
+    internal void OnOptionsChanged()
+    {
+        Format = TableFactory.CreateFormatOptions(Options.TableOptions);
+        OptionsSnapshot = Options.Clone();
+    }
     public TableReaderOptions ReaderOptions { get; }
     public MemTableOptions MemOptions { get; }
     public TableCache TableCache { get; }

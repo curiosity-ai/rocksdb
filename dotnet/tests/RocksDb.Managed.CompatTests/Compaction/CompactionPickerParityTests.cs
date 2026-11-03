@@ -68,8 +68,8 @@ public sealed class CompactionPickerParityTests
     }
 
     /// <summary>The workload: <paramref name="steps"/> slices of <paramref name="putsPerStep"/> random puts over <paramref name="keySpace"/> keys.</summary>
-    private static Run Drive(Action<byte[], byte[]> put, Action flushAndWait, Func<(int[] Files, ulong[] Bytes)> shape,
-        int steps, int putsPerStep, ulong keySpace, ulong seed)
+    private static Run Drive(Action<byte[], byte[]?> write, Action flushAndWait, Func<(int[] Files, ulong[] Bytes)> shape,
+        int steps, int putsPerStep, ulong keySpace, ulong seed, int firstStep, int deletePercent)
     {
         var run = new Run();
         byte[] pool = ValuePool(seed);
@@ -85,9 +85,13 @@ public sealed class CompactionPickerParityTests
                 if (pos + ValueSize > pool.Length) pos = 0;
                 pool.AsSpan(pos, ValueSize).CopyTo(value);
                 pos += ValueSize;
-                put(key, value);
+                // deletePercent: this share of the operations deletes the key instead (a separate draw, only when > 0).
+                bool delete = deletePercent > 0 && Next(ref state) % 100 < (ulong)deletePercent;
+                if (s < firstStep) continue; // written by an earlier run on this DB
+                write(key, delete ? null : value);
                 run.UserBytes += KeySize + ValueSize;
             }
+            if (s < firstStep) continue;
             flushAndWait();
             (int[] files, ulong[] bytes) = shape();
             run.Steps.Add(new Step(files, bytes));
@@ -141,14 +145,14 @@ public sealed class CompactionPickerParityTests
     private static readonly System.Collections.Concurrent.ConcurrentBag<object> s_keepAlive = new();
 
     private static Run RunNative(string path, int steps, int putsPerStep, ulong keySpace, ulong seed) =>
-        RunNative(path, steps, putsPerStep, keySpace, seed, static (_, _) => { });
+        RunNative(path, steps, putsPerStep, keySpace, seed, static (_, _) => { }, 0, 0);
 
     /// <summary>
     /// Native run; <paramref name="configure"/> adjusts the base options (it gets the C options handle for settings
     /// rocksdb-sharp has no wrapper for, and must keep any native objects it creates alive).
     /// </summary>
     private static Run RunNative(string path, int steps, int putsPerStep, ulong keySpace, ulong seed,
-        Action<RocksDbSharp.DbOptions, RocksDbSharp.Native> configure)
+        Action<RocksDbSharp.DbOptions, RocksDbSharp.Native> configure, int firstStep, int deletePercent)
     {
         RocksDbSharp.Native native = RocksDbSharp.Native.Instance;
         var table = new RocksDbSharp.BlockBasedTableOptions().SetBlockSize(4096).SetFormatVersion(6)
@@ -171,7 +175,7 @@ public sealed class CompactionPickerParityTests
         using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(options, path))
         {
             run = Drive(
-            (k, v) => db.Put(k, v, null, wo),
+            (k, v) => { if (v is null) db.Remove(k, null, wo); else db.Put(k, v, null, wo); },
             () =>
             {
                 db.Flush(fo);
@@ -202,17 +206,17 @@ public sealed class CompactionPickerParityTests
                 }
                 return (files, bytes);
             },
-            steps, putsPerStep, keySpace, seed);
+            steps, putsPerStep, keySpace, seed, firstStep, deletePercent);
         }
         ReadLog(run, path);
         return run;
     }
 
     private static Run RunManaged(string path, int steps, int putsPerStep, ulong keySpace, ulong seed) =>
-        RunManaged(path, steps, putsPerStep, keySpace, seed, static _ => { });
+        RunManaged(path, steps, putsPerStep, keySpace, seed, static _ => { }, 0, 0);
 
     /// <summary>Managed run; <paramref name="configure"/> adjusts the base column family options.</summary>
-    private static Run RunManaged(string path, int steps, int putsPerStep, ulong keySpace, ulong seed, Action<ColumnFamilyOptions> configure)
+    private static Run RunManaged(string path, int steps, int putsPerStep, ulong keySpace, ulong seed, Action<ColumnFamilyOptions> configure, int firstStep, int deletePercent)
     {
         var cf = new ColumnFamilyOptions
         {
@@ -231,7 +235,7 @@ public sealed class CompactionPickerParityTests
         using (RocksDatabase db = RocksDatabase.Open(path, new DbOptions { CreateIfMissing = true, MaxBackgroundJobs = 1 }, cf))
         {
             run = Drive(
-            (k, v) => db.Put(wo, k, v),
+            (k, v) => { if (v is null) db.Delete(wo, k); else db.Put(wo, k, v); },
             () =>
             {
                 db.Flush();
@@ -248,7 +252,7 @@ public sealed class CompactionPickerParityTests
                 }
                 return (files, bytes);
             },
-            steps, putsPerStep, keySpace, seed);
+            steps, putsPerStep, keySpace, seed, firstStep, deletePercent);
         }
         ReadLog(run, path);
         return run;
@@ -331,12 +335,17 @@ public sealed class CompactionPickerParityTests
     /// shapes after every step and the same sequence of compactions.
     /// </summary>
     private void AssertLockStepParity(string name, int steps, int putsPerStep, ulong keySpace, ulong seed,
-        Action<RocksDbSharp.DbOptions, RocksDbSharp.Native> configureNative, Action<ColumnFamilyOptions> configureManaged)
+        Action<RocksDbSharp.DbOptions, RocksDbSharp.Native> configureNative, Action<ColumnFamilyOptions> configureManaged) =>
+        AssertLockStepParity(name, steps, putsPerStep, keySpace, seed, configureNative, configureManaged, 0);
+
+    /// <summary>As above, with <paramref name="deletePercent"/> of the operations being deletes.</summary>
+    private void AssertLockStepParity(string name, int steps, int putsPerStep, ulong keySpace, ulong seed,
+        Action<RocksDbSharp.DbOptions, RocksDbSharp.Native> configureNative, Action<ColumnFamilyOptions> configureManaged, int deletePercent)
     {
         using var nativeDir = new TempDir(name + "-native");
         using var managedDir = new TempDir(name + "-managed");
-        Run native = RunNative(nativeDir.Path, steps, putsPerStep, keySpace, seed, configureNative);
-        Run managed = RunManaged(managedDir.Path, steps, putsPerStep, keySpace, seed, configureManaged);
+        Run native = RunNative(nativeDir.Path, steps, putsPerStep, keySpace, seed, configureNative, 0, deletePercent);
+        Run managed = RunManaged(managedDir.Path, steps, putsPerStep, keySpace, seed, configureManaged, 0, deletePercent);
         string trace = Trace(native, managed, out int firstShape, out int firstCompaction);
         TestContext.WriteLine(trace);
         if (Environment.GetEnvironmentVariable("PARITY_TRACE") is { Length: > 0 } traceFile) File.WriteAllText(traceFile + "." + name, trace);
@@ -410,5 +419,95 @@ public sealed class CompactionPickerParityTests
                 cf.CompactionOptionsFifo.MaxTableFilesSize = MaxTableFilesSize;
                 cf.CompactionOptionsFifo.AllowCompaction = true;
             });
+    }
+
+    /// <summary>
+    /// Deletion-heavy writes (70% point deletes): flushed files have more deletions than values, so their compensated
+    /// size gets the point-deletion boost (Version::UpdateAccumulatedStats + ComputeCompensatedSizes), which raises the
+    /// level scores and orders the files of a level (kByCompensatedSize; kMinOverlappingRatio divides by it). The
+    /// compactions must match native step by step.
+    /// </summary>
+    [TestMethod]
+    [DataRow(0, DisplayName = "kByCompensatedSize")]
+    [DataRow(3, DisplayName = "kMinOverlappingRatio")]
+    public void LockStepDeletionHeavyMatchesNative(int pri)
+    {
+        AssertLockStepParity("parity-deletes-" + pri, steps: 50, putsPerStep: 2200, keySpace: 60000, seed: 406,
+            (o, native) => native.rocksdb_options_set_compaction_pri(o.Handle, pri),
+            cf => cf.CompactionPri = (CompactionPri)pri, deletePercent: 70);
+    }
+
+    private const int RoundRobinPri = 4; // kRoundRobin
+
+    private static void NativeRoundRobin(RocksDbSharp.DbOptions o, RocksDbSharp.Native native) =>
+        native.rocksdb_options_set_compaction_pri(o.Handle, RoundRobinPri);
+
+    private static void ManagedRoundRobin(ColumnFamilyOptions cf) => cf.CompactionPri = CompactionPri.RoundRobin;
+
+    /// <summary>
+    /// Leveled kRoundRobin compaction: the files picked from each level follow the compact cursor (SortFileByRoundRobin,
+    /// round-robin expansion, output split at the output level's cursor), which advances with every compaction
+    /// (GetNextCompactCursor recorded in the version edit) -- same sequence as native.
+    /// </summary>
+    [TestMethod]
+    public void LockStepRoundRobinMatchesNative()
+    {
+        AssertLockStepParity("parity-roundrobin", steps: 50, putsPerStep: 2200, keySpace: 60000, seed: 404, NativeRoundRobin, ManagedRoundRobin);
+    }
+
+    private static void CopyDirectory(string from, string to)
+    {
+        Directory.CreateDirectory(to);
+        foreach (string f in Directory.GetFiles(from))
+        {
+            string name = Path.GetFileName(f);
+            if (name is "LOCK" || name.StartsWith("LOG", StringComparison.Ordinal)) continue;
+            File.Copy(f, Path.Combine(to, name), overwrite: true);
+        }
+    }
+
+    /// <summary>The round-robin compact cursors recorded in the DB's MANIFEST (VersionEdit kCompactCursor records).</summary>
+    private static SortedDictionary<int, byte[]> RecordedCursors(string dbPath)
+    {
+        RocksDb.Managed.Db.RecoveredVersionState state = RocksDb.Managed.Db.ManifestReader.RecoverFromDirectory(RocksDb.Managed.Env.LocalFileSystem.Instance, dbPath, null, out _);
+        return state.ColumnFamilies[0].CompactCursors;
+    }
+
+    /// <summary>
+    /// Round-robin compact cursors persisted in the MANIFEST are byte-compatible: the first half of the workload runs on
+    /// <paramref name="writerIsNative"/>'s engine with kRoundRobin, which records cursors; then copies of that DB are
+    /// reopened by both engines and the second half runs on each. Both must resume from the recovered cursors
+    /// (VersionBuilder applying the kCompactCursor records) and produce the same LSM shapes and compactions; a lost or
+    /// misread cursor makes the first L5 compaction pick different files.
+    /// </summary>
+    [TestMethod]
+    [DataRow(true, DisplayName = "native writes, both resume")]
+    [DataRow(false, DisplayName = "managed writes, both resume")]
+    public void RoundRobinCursorsResumeAcrossEngines(bool writerIsNative)
+    {
+        const int Steps = 50, Half = 25, PutsPerStep = 2200;
+        const ulong KeySpace = 60000, Seed = 405;
+        using var first = new TempDir("rr-first");
+        using var nativeDir = new TempDir("rr-native");
+        using var managedDir = new TempDir("rr-managed");
+        if (writerIsNative) RunNative(first.Path, Half, PutsPerStep, KeySpace, Seed, NativeRoundRobin, 0, 0);
+        else RunManaged(first.Path, Half, PutsPerStep, KeySpace, Seed, ManagedRoundRobin, 0, 0);
+        SortedDictionary<int, byte[]> cursors = RecordedCursors(first.Path);
+        Assert.IsTrue(cursors.Count > 0, "the first half should record a compact cursor");
+        CopyDirectory(first.Path, nativeDir.Path);
+        CopyDirectory(first.Path, managedDir.Path);
+
+        Run native = RunNative(nativeDir.Path, Steps, PutsPerStep, KeySpace, Seed, NativeRoundRobin, Half, 0);
+        Run managed = RunManaged(managedDir.Path, Steps, PutsPerStep, KeySpace, Seed, ManagedRoundRobin, Half, 0);
+        string trace = Trace(native, managed, out int firstShape, out int firstCompaction);
+        TestContext.WriteLine("cursors after the first half: " + string.Join(", ", cursors.Keys) + "\n" + trace);
+        Assert.AreEqual(-1, firstShape, "first differing LSM shape\n" + trace);
+        Assert.AreEqual(-1, firstCompaction, "first differing compaction\n" + trace);
+        Assert.IsTrue(native.Compactions.Count > 0, "the second half should compact\n" + trace);
+
+        // Both engines keep writing (rewrite the cursors into a new MANIFEST on reopen) in the same format.
+        SortedDictionary<int, byte[]> nativeCursors = RecordedCursors(nativeDir.Path), managedCursors = RecordedCursors(managedDir.Path);
+        CollectionAssert.AreEqual(nativeCursors.Keys.ToList(), managedCursors.Keys.ToList());
+        foreach (int level in nativeCursors.Keys) CollectionAssert.AreEqual(nativeCursors[level], managedCursors[level], "cursor of L" + level);
     }
 }

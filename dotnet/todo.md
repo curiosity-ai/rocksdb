@@ -211,26 +211,27 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - Compaction
   - [x] read-triggered compaction (read sampling), periodic compaction trigger, reduce_file_locking (bottom-priority pool), preclude_last_level_data_seconds (seqno-to-time mapping, per-key placement), CompactRange partition-straddle; lock-step/compat vs native
   - [ ] perf check of read-sampling overhead on the next quiet benchmark run (S)
-  - [ ] subcompactions (L); async compaction input reads (M); compensated size with point-deletion boost (M)
-  - [ ] bottommost files marked for compaction (+ by preserve boundary) (S/M); bottommost_file_compaction_delay (S); persist round-robin cursors to MANIFEST (S); CompactFiles API (M)
-  - [ ] write-controller pacing parity (L0 pile-up under free-running load) (M)
+  - [x] subcompactions (index-anchor boundaries, ClippingIterator), compensated size with deletion boost, bottommost files marked for compaction + bottommost_file_compaction_delay, round-robin cursors persisted in MANIFEST (byte-identical to native), CompactFiles API; lock-step parity vs native
+  - [x] write-controller: L0 peak re-measured warm = native (7-8); three write-controller deviations fixed
+  - [ ] async compaction input reads (M); subcompactions with UDT (S); CompactFiles disk-space check / CompactionJobInfo (S)
 - Transactions
   - [x] two_write_queues (second WAL-only write queue, published vs allocated seqno) + commit-time write batches, all policies; compat vs native both ways
   - [x] steady-state transactions allocate only what the equivalent WriteBatch does (557 B for 4 puts, was 717-1517 B)
   - [ ] flaky under load? `WriteSlowdownDelaysWrites`, `AutoFlushPreservesGenerationOrderAndOldestBlobFile` (failed once in a loaded full run)
-  - [ ] range locks (L); public WAL termination point (S)
+  - [x] range locks (RangeLockManager, escalation, deadlock detection; range_locking_test ported); WAL termination point
 - Wide columns / blob
   - [x] compaction filters on entities (FilterV4 + lazy WideColumnBlobResolver), MultiGetEntity, attribute groups (Put/Get/MultiGet), coalescing + attribute-group iterators, lazy entity reads (GetEntityLazy/MultiGetEntityLazy, ranged blob column reads); compat-tested vs native
   - [x] WBWI MultiGetFromBatchAndDB; backup exclude_files_callback + parallel copies
-  - [ ] WBWI GetEntityFromBatchAndDB / MultiGetEntityFromBatchAndDB, txn entity APIs (S/M); lazy MultiResolve (S)
+  - [x] WBWI GetEntityFromBatchAndDB / MultiGetEntityFromBatchAndDB, transaction entity APIs + cross-CF iterators, lazy MultiResolve
 - Table format / options / API
   - [x] hash index (kHashSearch) read+write, separated key/value data blocks, uniform index hint, block_align, super_block_alignment (byte-identical vs native SstFileWriter)
   - [x] user table-properties collectors (+ CompactOnDeletionCollector, NeedCompact), memtable prefix bloom, insert hints, in-place updates (+ callback)
   - [ ] parallel compression (throughput only; output identical) (M); is_uniform hint used for index search on read (S); CompactForTieringCollector (S)
   - [ ] per-key protection info (L); per-SuperVersion options snapshot (M); mutable block-based table options (M)
   - [x] WriteBatch ColumnFamily overloads, WriteOptions.SyncWrites, MarkWalTerminationPoint, max_total_wal_size, lazy WAL sync on rotation (single-CF, non-2PC; else eager = stronger), reads on dropped CF handles
-  - [ ] shared table cache across CFs (S/M); best_efforts_recovery (M); WAL tracking in MANIFEST emit+verify (M)
-  - [ ] auto-resizing HyperClock (M); DB-wide rate limiter for flush/compaction (M)
+  - [x] shared per-DB table cache, best_efforts_recovery (matches native on 12 damage cases), WAL tracking in MANIFEST, per-SuperVersion options snapshot, mutable block-based table options
+  - [x] auto-resizing HyperClock (growable table, writers pause briefly; upstream is lock-free linear hashing), GenericRateLimiter for flush/compaction writes
+  - [ ] rate limiter on reads + tickers (S); reader-affecting table options via SetOptions (S); normal open of a DB with a truncated SST fails only at first read (S)
 - Write path / iterators perf
   - [ ] 4-thread sync random writes, 4-thread readmissing (see final benchmarks)
   - [ ] reverse iteration pins blocks instead of copying (M); async reverse movement (M); range tombstones in iterator heap (M/L)
@@ -242,5 +243,5 @@ Legend: S/M/L = rough size. [~] = agent working on it.
   - [x] secondary tails the MANIFEST incrementally (native<->managed secondary compat), Raft network-partition tests, switchover hold trimmed (probe promote, 3 fewer fsyncs), replication benchmarks (bench/RocksDb.Managed.Replication.Benchmarks)
   - [ ] secondary: verify table files exist before installing a version (S); re-measure switchover hold on a quiet machine (S)
 - Backup / error handling
-  - [ ] SstFileManager + no-space auto recovery (M); atomic WAL-error recovery edits (M)
+  - [x] SstFileManager (space limit, trash deletion, compaction space pre-check) + no-space auto recovery; atomic WAL-error recovery flush
 - Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)

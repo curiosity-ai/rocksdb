@@ -235,6 +235,10 @@ public sealed class MemoryFileSystem : IFileSystem
         }
     }
 
+    /// <summary>Free space reported by <see cref="GetFreeSpace"/> (default: effectively unlimited). Tests lower it to simulate a full disk.</summary>
+    public long FreeSpace { get; set; } = long.MaxValue;
+
+    public long GetFreeSpace(string path) => FreeSpace;
     /// <summary>Random write + sync of an existing file (FSRandomRWFile).</summary>
     public void WriteAt(string path, long offset, ReadOnlySpan<byte> data)
     {

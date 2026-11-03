@@ -488,6 +488,50 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         CancellationToken cancellationToken) =>
         new(GetFromDb(options, cfd, key.Span, value));
 
+    /// <summary>WriteUnpreparedTxn::GetEntityImpl's DB part: the read sees this transaction's unprepared batches.</summary>
+    private protected override bool GetEntityFromDb(ReadOptions? options, ColumnFamilyData cfd, ReadOnlySpan<byte> key, WideColumns columns)
+    {
+        WriteUnpreparedTxnReadCallback cb = NewReadCallback(options, out SnapshotBackup backed, out ulong snapSeq);
+        bool found = _db.GetEntityWithCallback(cfd, options, key, cb, columns);
+        if (!cb.Valid || !_wpDb.ValidateSnapshot(snapSeq, backed)) throw _wpDb.TryAgain();
+        return found;
+    }
+
+    private protected override ValueTask<bool> GetEntityFromDbAsync(ReadOptions? options, ColumnFamilyData cfd, ReadOnlyMemory<byte> key, WideColumns columns,
+        CancellationToken cancellationToken) =>
+        new(GetEntityFromDb(options, cfd, key.Span, columns));
+
+    /// <summary>
+    /// WriteUnpreparedTxn::MultiGetEntityImpl's DB part: every key read with one read callback (one snapshot) that sees
+    /// this transaction's unprepared batches.
+    /// </summary>
+    private protected override void MultiGetEntityFromDb(ReadOptions? options, ColumnFamilyData cfd, MultiGetBatch keys)
+    {
+        WriteUnpreparedTxnReadCallback cb = NewReadCallback(options, out SnapshotBackup backed, out ulong snapSeq);
+        var results = new (bool Found, byte[]? Entity, RocksDbException? Error)[keys.Count];
+        var columns = new WideColumns();
+        for (int i = 0; i < keys.Count; i++)
+        {
+            try
+            {
+                bool found = _db.GetEntityWithCallback(cfd, options, keys.GetKey(i), cb, columns);
+                results[i] = (found, found ? columns.Serialized.ToArray() : null, null);
+            }
+            catch (RocksDbException e)
+            {
+                results[i] = (false, null, e);
+            }
+        }
+        if (!cb.Valid || !_wpDb.ValidateSnapshot(snapSeq, backed)) throw _wpDb.TryAgain();
+        keys.EntityRun = true;
+        keys.BeginExternalRun(cfd.UserComparator);
+        for (int i = 0; i < results.Length; i++)
+        {
+            if (results[i].Error is { } e) keys.SetError(i, e);
+            else keys.SetExternalResult(i, results[i].Found, results[i].Entity);
+        }
+    }
+
     /// <summary>WriteUnpreparedTxnDB::NewIterator: reads at a snapshot plus this transaction's unprepared batches.</summary>
     private protected override Iterator NewDbIterator(ColumnFamily handle, ColumnFamilyData cfd, ReadOptions? options)
     {

@@ -379,13 +379,13 @@ Remaining gaps:
   warm up first, see "Benchmark warm-up".)
 - LZ4 flushes: K4os LZ4's compressor is JIT compiled (82 ms of JIT for `LZ4_compress_generic` instantiations / OSR
   variants) and runs as tier-0 code during the first flush; fillrandom 300k + flush with LZ4 is 720 - 845 ms vs
-  290 - 343 ms native. Not addressed (third-party code; a warm-up or an in-house LZ4 encoder would be needed).
+  290 - 343 ms native. Addressed later by the managed LZ4 encoder (see "LZ4 encoder and parallel compression").
 - Compaction picking under sustained writes: managed lets L5 grow to 9 - 10 files before L5 -> L6 compactions while
   native 11.12 keeps it at 4 - 6, so managed L0 -> L5 compactions read ~1.4x more L5 data (write-amp 3.05 - 3.33 vs
   2.96) and more work is left at the end of the writes (`waitforcompaction` 0.3 - 1.7 s vs 0.02 - 0.25 s). Fixed
   where it was a fidelity problem, see "Compaction-picking parity" below.
 - Range-partitioned subcompactions (`max_subcompactions`) are not implemented; native defaults to 1, so they would not
-  change the comparison.
+  change the comparison. (Implemented since: "Compaction completeness" below.)
 
 ## Compaction-picking parity (compaction-heavy configuration)
 
@@ -659,6 +659,101 @@ that declares the captured variables, before the early return); the commit / pre
 `PoolingAsyncValueTaskMethodBuilder`; a reused transaction keeps the UTF-8 encoding of its name; plain writes into a
 WritePrepared DB reuse their WriteInternal state and count sub-batches of bytewise column families in a reusable
 byte-equality set.
+
+## Compaction completeness: L0 pacing and subcompactions
+
+**L0 pile-up under the free-running compaction-heavy config** ("Compaction-picking parity" above reported up to 10 L0
+files for managed vs 5 - 6 for native). Re-measured with the warm-up (num = 500k, 4 MiB memtables / target files,
+16 MiB level base, 2 background jobs = 1 flush + 1 compaction thread, fillrandom + overwrite), peak L0 count from both
+LOGs (native: the "Level summary" / "compacted to" lines; managed: flushes since the last `compaction_finished`
+lsm_state), loaded VM (load average 8 - 12 from other agents):
+
+| run | 1 | 2 | 3 | 4 | 5 |
+|---|---:|---:|---:|---:|---:|
+| c-native | 7 | 7 | 6 | 7 | 8 |
+| managed | 8 | 7 | 9 | 7 | 7 |
+| managed, cold (`--warmup false`) | 10 | | | | |
+
+The earlier native figure was the number of L0 files each compaction picked (`Compacting N@0`), which is 4 - 5 on both
+engines; the actual L0 count peaks at 6 - 8 on native too. Neither engine reaches a write-stall trigger (L0 slowdown 20,
+soft pending bytes 64 GiB; native only stops briefly on max_write_buffer_number while its slower flush runs), so the
+write controller does not pace these runs, and the scheduling latency is the same (an L0 -> Lbase compaction starts in
+the millisecond its 4th file is flushed, in both LOGs). The pile-up follows from how many flushes complete during an
+L0 -> Lbase compaction: managed writes 1.2 - 1.9x faster here (overwrite 4.1 - 7.2 vs 6.3 - 11.1 µs/op) with
+compactions of similar speed, and cold JIT slows its first compactions. The write-controller code was still compared
+with `column_family.cc` and three differences fixed (delay recovery reward, rate carried between delays,
+compaction-speedup thresholds relative to the bottommost data; see `docs/validation.md`); none fires in this config.
+
+**Subcompactions** (`max_subcompactions`, new): `compact` of 1M x 100 B random keys written with auto compactions
+disabled (16 MiB memtables, 4 MiB target files, 8 background jobs), one run each on the loaded VM, the managed
+`compact` includes some JIT (149 - 299 methods):
+
+| | max_subcompactions 1 | 4 |
+|---|---:|---:|
+| c-native | 1.62 s | 0.96 s |
+| managed | 1.57 s | 0.51 s |
+
+The per-key loop of a subcompaction is the unchanged compaction loop (allocation-free); planning reads up to 128 index
+anchors per input file once per compaction.
+## Auto-resizing HyperClock table and shared table cache (cache micro-benchmarks)
+
+`CacheBenchmarks` (BenchmarkDotNet default job, net10.0) before and after the change, single runs each on the shared
+4-vCPU VM with other agents building (load average 4-10, so differences below ~30% are noise; LRU, which did not
+change, moved by +10% to +57% between the two runs). The fixed table code path only gained a read of the table
+reference and a branch on a readonly flag. Every case stays allocation-free.
+
+| Benchmark | LRU before | LRU after | HyperClock before | HyperClock after | AutoHyperClock (new) |
+|---|---:|---:|---:|---:|---:|
+| LookupHit | 609 ns | 668 ns | 292 ns | 263 ns | 260 ns |
+| LookupMiss | 94 ns | 139 ns | 131 ns | 164 ns | 107 ns |
+| InsertWithEviction | 159 ns | 174 ns | 230 ns | 267 ns | 260 ns |
+| LookupHitMultiThreaded (per op) | 307 ns | 484 ns | 72 ns | 125 ns | 100 ns |
+
+Allocated: `-` in every cell. The auto table (estimated_entry_charge = 0) performs like the fixed one once grown;
+growth itself (64 slots per shard, doubling) only happens while the cache fills.
+
+## LZ4 encoder and parallel compression
+
+**LZ4 encoder.** K4os' `LZ4Codec.Encode` (1.3.8) allocates and zeroes a 16 KiB `LZ4_stream_t` in unmanaged memory per
+call and its generic engine is 2.2 - 3x slower than native liblz4 on data blocks. Options measured (BenchmarkDotNet,
+db_bench-like blocks: 16-byte keys + 100-byte values with compression ratio 0.5, warm, 64 rotating blocks):
+
+| Block | K4os Encode | K4os + cached state (`LL64.LZ4_compress_fast_extState` via reflection) | managed `Lz4BlockEncoder` | native `LZ4_compress_fast` (librocksdb) |
+|---|---|---|---|---|
+| 1 KiB | 2.87 us | 1.97 us (0.69x) | 1.35 us (0.47x) | 0.97 us (0.34x) |
+| 4 KiB | 7.99 us | 7.20 us (0.90x) | 4.71 us (0.59x) | 3.43 us (0.43x) |
+| 16 KiB | 28.2 us | 29.1 us (1.03x) | 19.5 us (0.69x) | 14.4 us (0.51x) |
+
+Reusing K4os' state only removes the per-call allocation (worth it for 1 KiB only) and needs reflection into its
+internals, so it was not kept. `Compression/Lz4BlockEncoder.cs` ports liblz4's LZ4_compress_generic for the byU16
+table (inputs below 64 KiB + 11, acceleration 1, limited output, per-thread hash table cleared per call like
+LZ4_initStream): its output is byte-identical to native liblz4 (compat test `Lz4EncoderCompatTests`, random inputs of
+every size class and limited capacities), it is 1.4 - 1.7x faster than K4os and within 1.35 - 1.4x of native. LZ4HC,
+inputs of 64 KiB and more, big-endian hosts and decompression stay on K4os.
+
+**Cold start.** A fresh process compressing 64 then 12 800 4 KiB blocks (tiered compilation, the first flushes of a
+process): K4os 14 - 16 ms + 400 - 430 ms; managed encoder (tier 0 / OSR) 5.3 - 5.9 ms + 213 - 248 ms; managed encoder
+with `[MethodImpl(AggressiveOptimization)]` on the loop (kept) 3.2 ms + 83 ms (~4.7x less than K4os; steady state is
+60 ms with `DOTNET_TieredCompilation=0`). Guidance for applications that flush right after start: ReadyToRun
+(`<PublishReadyToRun>`) precompiles the port and K4os (decompression); `DOTNET_TieredPGO=0` alone does not help
+(K4os 14 ms + 333 ms), `DOTNET_TieredCompilation=0` removes the warm-up at the cost of slower startup elsewhere.
+
+**Table build A/B** (`TableBuildBenchmarks`: 200k entries, 4 KiB blocks, fv6, bloom; one SST in memory; ShortRun,
+one process, LZ4 rows measured with the machine quiet, the ZSTD rows while other agents' builds started (load 15),
+so treat them as indicative):
+
+| | parallel_threads 1 | 2 | 4 |
+|---|---|---|---|
+| LZ4, K4os encoder | 67.5 ms | 68.0 ms | 69.0 ms |
+| LZ4, managed encoder | 52.8 ms (0.78x) | 39.8 ms (0.59x) | 65.2 ms (noisy, median 59 ms) |
+| ZSTD | 191 ms | 196 ms | 151 ms (median 130 ms, 0.68x) |
+
+Earlier interleaved run of parallel compression alone (K4os encoder, load ~9 on 4 vCPU): LZ4 130 / 128 / 115 ms,
+ZSTD 295 / 279 / 234 ms for 1 / 2 / 4 threads. Parallel compression helps ZSTD most (compression dominates the emit
+work); with the faster LZ4 encoder the emit thread (block building, index/filter, checksums) is the bottleneck, so 2
+threads already take most of the gain. With fewer free cores than threads the workers only add scheduling cost
+(the emit thread then compresses the blocks itself when it needs a slot, so throughput never drops below serial by
+much). Output is byte-identical in every configuration.
 
 ## Gaps / follow-ups
 

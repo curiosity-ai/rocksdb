@@ -70,12 +70,88 @@ internal sealed partial class DbImpl
     /// </summary>
     private void OnSuperVersionInstalled(ColumnFamilyData cfd)
     {
+        if (cfd.Current is { } current)
+        {
+            MaybeUpdatePreserveTimeMinSeqno(cfd, current.Storage);
+            // Update bottommost_files_mark_threshold_ (InstallSuperVersionAndScheduleWork).
+            if (!current.Storage.AllowIngestBehind)
+            {
+                _bottommostFilesMarkThreshold = Math.Min(_bottommostFilesMarkThreshold, current.Storage.BottommostFilesMarkThreshold);
+            }
+        }
         RecalculateWriteStall(cfd);
         if (_compactionsEnabled)
         {
             SchedulePendingCompaction(cfd);
             MaybeScheduleCompaction();
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // bottommost files marked for compaction (snapshot release)
+
+    /// <summary>
+    /// bottommost_files_mark_threshold_: the minimum over the column families of the largest seqno of bottommost files
+    /// still protected by a snapshot; a snapshot release that raises the oldest snapshot past it re-marks files.
+    /// Guarded by the mutex.
+    /// </summary>
+    private ulong _bottommostFilesMarkThreshold = DbFormat.MaxSequenceNumber;
+
+    /// <summary>
+    /// The bottommost-file part of DBImpl::ReleaseSnapshot: with the oldest snapshot (or the last sequence when none is
+    /// left) past the mark threshold, every column family's current version re-marks its bottommost files
+    /// (VersionStorageInfo::UpdateOldestSnapshot) and those with marked files are scheduled; the threshold is
+    /// recomputed over the others. REQUIRES: mutex.
+    /// </summary>
+    internal void OnSnapshotReleased()
+    {
+        if (_readOnly) return;
+        ulong oldestSnapshot = _snapshots.OldestSequence(Versions.LastSequence);
+        // Managed safeguard (upstream relies on the transaction layer's snapshots): with a snapshot checker, entries
+        // that may still be uncommitted cannot be zeroed, so the oldest snapshot used for marking stays below them.
+        if (CurrentSnapshotChecker is { } checker) oldestSnapshot = checker.BoundOldestSnapshotForBottommostMarking(oldestSnapshot);
+        // Avoid to go through every column family by checking a global threshold first.
+        if (oldestSnapshot <= _bottommostFilesMarkThreshold) return;
+        ulong newThreshold = DbFormat.MaxSequenceNumber;
+        bool scheduled = false;
+        foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
+        {
+            if (cfd.Dropped || cfd.Current is null) continue;
+            VersionStorageInfo vs = cfd.Current.Storage;
+            if (vs.AllowIngestBehind) continue;
+            vs.UpdateOldestSnapshot(oldestSnapshot);
+            if (vs.BottommostFilesMarkedForCompaction.Count > 0)
+            {
+                if (_compactionsEnabled) SchedulePendingCompaction(cfd);
+                scheduled = true;
+            }
+            else
+            {
+                // Calculate a new threshold, skipping those CFs where compactions are scheduled.
+                newThreshold = Math.Min(newThreshold, vs.BottommostFilesMarkThreshold);
+            }
+        }
+        _bottommostFilesMarkThreshold = newThreshold;
+        if (scheduled && _compactionsEnabled) MaybeScheduleCompaction();
+    }
+
+    /// <summary>
+    /// Port of DBImpl::MaybeUpdatePreserveTimeMinSeqno: the seqno from which the preserve_internal_time_seconds /
+    /// preclude_last_level_data_seconds window starts (sequence numbers at or above it must keep their value, so
+    /// bottommost files reaching into it are not marked). Re-marks the bottommost files when it changed. REQUIRES:
+    /// mutex.
+    /// </summary>
+    private void MaybeUpdatePreserveTimeMinSeqno(ColumnFamilyData cfd, VersionStorageInfo vs)
+    {
+        var preserveInfo = new MinAndMaxPreserveSeconds(cfd.Options);
+        ulong preserveTimeMinSeqno = DbFormat.MaxSequenceNumber;
+        if (preserveInfo.IsEnabled)
+        {
+            ulong unused = DbFormat.MaxSequenceNumber;
+            _seqnoToTimeMapping.GetCurrentTieringCutoffSeqnos((ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(), cfd.Options.PreserveInternalTimeSeconds,
+                cfd.Options.PrecludeLastLevelDataSeconds, ref preserveTimeMinSeqno, ref unused);
+        }
+        if (vs.SetPreserveTimeMinSeqno(preserveTimeMinSeqno)) vs.RecomputeBottommostFilesMarkedForCompaction();
     }
 
     /// <summary>Starts automatic compactions once the DB is open (end of DB::Open). </summary>
@@ -103,8 +179,8 @@ internal sealed partial class DbImpl
 
     /// <summary>
     /// Port of GetMinTimeBasedCompactionInterval (db/db_impl/db_impl.cc): the smallest time-based compaction interval of
-    /// a column family (periodic_compaction_seconds, ttl, the first FIFO temperature age), 0 if none.
-    /// (bottommost_file_compaction_delay is not an option of the managed port.)
+    /// a column family (periodic_compaction_seconds, ttl, the first FIFO temperature age, bottommost_file_compaction_delay),
+    /// 0 if none.
     /// </summary>
     internal static ulong GetMinTimeBasedCompactionInterval(ColumnFamilyOptions o)
     {
@@ -114,6 +190,9 @@ internal sealed partial class DbImpl
         List<FileTemperatureAge> fifoThresholds = o.CompactionOptionsFifo.FileTemperatureAgeThresholds;
         // Thresholds are in increasing order by age, so first is smallest
         if (fifoThresholds.Count > 0 && fifoThresholds[0].Age > 0) minInterval = Math.Min(minInterval, fifoThresholds[0].Age);
+        // NOTE: 0 does not exactly mean "disabled" in this case but it does mean there's no time component to the
+        // relevant compaction picking.
+        if (o.BottommostFileCompactionDelay > 0) minInterval = Math.Min(minInterval, o.BottommostFileCompactionDelay);
         // Sentinel values like UINT64_MAX - 1 (ttl, periodic_compaction_seconds) are like disabling.
         return minInterval > ulong.MaxValue / 2 ? 0 : minInterval;
     }
@@ -295,9 +374,14 @@ internal sealed partial class DbImpl
         if (delayMicros > 0)
         {
             if (noSlowdown) throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Write stall");
-            TimeSpan delay = TimeSpan.FromMicroseconds(delayMicros);
-            if (synchronous) Thread.Sleep(delay);
-            else await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            // We will delay the write until we have slept for `delay` microseconds or we don't need a delay anymore
+            // (checked every ~1 ms: kDelayInterval, the WriteController's minimum delay).
+            long stallEnd = System.Diagnostics.Stopwatch.GetTimestamp() + (long)(delayMicros * (System.Diagnostics.Stopwatch.Frequency / 1e6));
+            while (wc.NeedsDelay && System.Diagnostics.Stopwatch.GetTimestamp() < stallEnd)
+            {
+                if (synchronous) Thread.Sleep(1);
+                else await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+            }
         }
         while (true)
         {
@@ -362,6 +446,7 @@ internal sealed partial class DbImpl
             ulong[] snapshots = SnapshotsForCompaction();
             Compaction? c = cfd.CompactionState.Picker.PickCompaction(cfd.Current.Storage, snapshots);
             if (c is null) continue;
+            if (!EnoughRoomForCompaction(cfd, c)) continue;
             if (ShouldForwardToBottomPriorityPool(cfd, c))
             {
                 ForwardToBottomPriorityPool(cfd, c, snapshots);
@@ -704,10 +789,13 @@ internal sealed partial class DbImpl
                 try
                 {
                     ulong[] jobSnapshots = jobSnapshot is null ? snapshots : WithJobSnapshot(snapshots, jobSnapshot.SequenceNumber);
+                    bool bottom = thread == CompactionThread.Bottom;
                     job = new CompactionJob(this, cfd, c, jobSnapshots, NewPendingOutputFileNumber, ct)
                     {
                         SnapshotChecker = checker,
                         JobSnapshot = jobSnapshot?.SequenceNumber ?? 0,
+                        AcquireSubcompactionResources = n => AcquireSubcompactionResources(n, bottom),
+                        ReleaseSubcompactionResources = n => ReleaseSubcompactionResources(n, bottom),
                     };
                     int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadCompactionMicros);
                     try
@@ -729,6 +817,7 @@ internal sealed partial class DbImpl
                 foreach (FileMetaData f in job.ProximalOutputs) edit.AddFile(c.ProximalLevel, f);
                 edit.BlobFileAdditions.AddRange(job.BlobFileAdditions);
                 edit.BlobFileGarbages.AddRange(job.BlobFileGarbages);
+                AddCompactCursorEdit(cfd, c, edit);
                 if (job.Outputs.Count + job.ProximalOutputs.Count > 0) FileSystem.SyncDirectory(DbPaths[(int)Math.Min(c.OutputPathId, (uint)(DbPaths.Count - 1))]);
             }
             lock (_mutex)
@@ -738,12 +827,19 @@ internal sealed partial class DbImpl
             ct.ThrowIfCancellationRequested();
             TestHooks.Invoke("DBImpl::RunCompaction:BeforeLogAndApply");
             // From here on a failure may still have made the edit durable: leave the blob files to the obsolete-file scan.
-            if (job?.BlobBuilder is { } blobOut) blobOut.Committed = true;
+            if (job is not null)
+            {
+                foreach (Blob.BlobFileBuilder blobOut in job.BlobBuilders) blobOut.Committed = true;
+            }
             Versions.LogAndApplyAsync(cfd, edit, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
             lock (_mutex)
             {
                 InstallSuperVersion(cfd);
             }
+            var installed = new List<FileMetaData>(edit.NewFiles.Count);
+            foreach (NewFileEntry nf in edit.NewFiles) installed.Add(nf.Meta);
+            c.InstalledFiles = installed;
+            if (job is not null && job.Outputs.Count > 0) MaybeReportMaxAllowedSpaceReached(BackgroundErrorReason.Compaction);
             ok = true;
             Interlocked.Increment(ref _statCompactions);
             if (job is not null)
@@ -796,6 +892,7 @@ internal sealed partial class DbImpl
                     foreach (ulong n in job.CreatedFileNumbers) _pendingOutputs.Remove(n);
                 }
                 cfd.CompactionState.Picker.ReleaseCompactionFiles(c, ok);
+                ReleaseCompactionRoom(c);
                 if (c.InputVersion is not null) Versions.UnrefVersion(c.InputVersion);
                 if (!cfd.Dropped && cfd.Current is not null)
                 {
@@ -807,11 +904,14 @@ internal sealed partial class DbImpl
             {
                 foreach (ulong n in job.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
             }
-            if (job?.BlobBuilder is { } blobBuilder)
+            if (job is not null)
             {
-                // Unregisters the pending blob outputs; a job that failed before its MANIFEST write deletes its blob files.
-                ReleaseBlobOutputs(blobBuilder);
-                blobBuilder.Dispose();
+                foreach (Blob.BlobFileBuilder blobBuilder in job.BlobBuilders)
+                {
+                    // Unregisters the pending blob outputs; a job that failed before its MANIFEST write deletes its blob files.
+                    ReleaseBlobOutputs(blobBuilder);
+                    blobBuilder.Dispose();
+                }
             }
             try
             {
@@ -844,6 +944,50 @@ internal sealed partial class DbImpl
         {
             if (failure is RocksDbException r) throw r.Rethrowable();
             throw RocksDbException.IOError(failure.Message, failure);
+        }
+    }
+
+    /// <summary>
+    /// Port of CompactionJob::AcquireSubcompactionResources: reserves up to <paramref name="n"/> extra compaction slots
+    /// (counted in bg_compaction_scheduled_ / bg_bottom_compaction_scheduled_) for round-robin subcompactions, bounded
+    /// by the free slots under the compaction limit (GetBGJobLimits). Returns the number reserved.
+    /// </summary>
+    private int AcquireSubcompactionResources(int n, bool bottom)
+    {
+        lock (_mutex)
+        {
+            int available = Math.Max(BgCompactionLimit() - _bgCompactionScheduled - _bgBottomCompactionScheduled, 0);
+            int reserved = Math.Min(n, available);
+            if (bottom) _bgBottomCompactionScheduled += reserved;
+            else _bgCompactionScheduled += reserved;
+            return reserved;
+        }
+    }
+
+    /// <summary>Port of CompactionJob::ShrinkSubcompactionResources.</summary>
+    private void ReleaseSubcompactionResources(int n, bool bottom)
+    {
+        lock (_mutex)
+        {
+            if (bottom) _bgBottomCompactionScheduled -= n;
+            else _bgCompactionScheduled -= n;
+            MaybeScheduleCompaction();
+            SignalBackgroundWork();
+        }
+    }
+
+    /// <summary>
+    /// The compact-cursor part of CompactionJob::InstallCompactionResults: a leveled kRoundRobin compaction picked by
+    /// size (or round-robin TTL) from L1+ records the cursor of its start level -- the smallest key of the file after
+    /// its inputs in the input version's compaction-priority order -- in the version edit (persisted in the MANIFEST).
+    /// Trivial moves don't run a compaction job and leave the cursor unchanged, as upstream.
+    /// </summary>
+    private void AddCompactCursorEdit(ColumnFamilyData cfd, Compaction c, VersionEdit edit)
+    {
+        if ((c.Reason is CompactionReason.LevelMaxLevelSize or CompactionReason.RoundRobinTtl) && cfd.Options.CompactionPri == CompactionPri.RoundRobin
+            && c.StartLevel > 0)
+        {
+            lock (_mutex) edit.CompactCursors.Add(new CompactCursor(c.StartLevel, c.InputStorage.GetNextCompactCursor(c.StartLevel, c.Inputs(0).Count)));
         }
     }
 
@@ -1130,6 +1274,7 @@ internal sealed partial class DbImpl
                         if (c is not null)
                         {
                             c.BlobGarbageCollectionPolicy = options.BlobGarbageCollectionPolicy;
+                            c.MaxSubcompactions = options.MaxSubcompactions;
                             c.BlobGarbageCollectionAgeCutoffOverride = options.BlobGarbageCollectionAgeCutoff;
                             c.InputVersion = cfd.Current;
                             cfd.Current.Ref();
@@ -1165,6 +1310,79 @@ internal sealed partial class DbImpl
     private sealed class ManualRun(DbImpl db, ColumnFamilyData cfd, Compaction c, ulong[] snapshots)
     {
         public void Run() => db.RunCompaction(cfd, c, snapshots, CompactionThread.Manual);
+    }
+
+    /// <summary>
+    /// Port of DBImpl::CompactFiles / CompactFilesImpl: compacts the given table files (by number; the picker adds the
+    /// files a valid compaction also needs) into <paramref name="outputLevel"/> as one manual compaction, or moves them
+    /// there with <see cref="CompactFilesOptions.AllowTrivialMove"/>. Fails with InvalidArgument for bad inputs and
+    /// Aborted when a needed file is being compacted. Returns the full paths of the files added to the output level.
+    /// </summary>
+    public async ValueTask<List<string>> CompactFilesAsync(ColumnFamilyData cfd, CompactFilesOptions options, IEnumerable<ulong> inputFileNumbers,
+        int outputLevel, bool synchronous, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(inputFileNumbers);
+        ThrowIfDisposed();
+        if (_readOnly) ThrowReadOnly();
+        cancellationToken.ThrowIfCancellationRequested();
+        var inputSet = new HashSet<ulong>(inputFileNumbers);
+        Compaction c;
+        ulong[] snapshots;
+        lock (_mutex)
+        {
+            if (_shuttingDown || _bgCancellation.IsCancellationRequested) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
+            if (cfd.Dropped) ThrowDropped(cfd);
+            int outputPathId = options.OutputPathId;
+            if (outputPathId < 0)
+            {
+                if (DbPaths.Count == 1) outputPathId = 0;
+                else ThrowHelper.NotSupported("Automatic output path selection is not yet supported in CompactFiles()");
+            }
+            else if (outputPathId >= DbPaths.Count)
+            {
+                ThrowHelper.InvalidArgument("Invalid output path ID");
+            }
+            if ((Options.AllowIngestBehind || cfd.Options.CfAllowIngestBehind) && outputLevel >= cfd.NumLevels - 1)
+            {
+                ThrowHelper.InvalidArgument("Exceed the maximum output level defined by the current compaction algorithm with ingest_behind --- " +
+                                            (cfd.NumLevels - 1).ToString(CultureInfo.InvariantCulture));
+            }
+            CompactionPicker picker = cfd.CompactionState.Picker;
+            VersionStorageInfo vstorage = cfd.Current.Storage;
+            List<CompactionInputFiles> inputs = picker.SanitizeAndConvertCompactionInputFiles(inputSet, outputLevel, vstorage, cfd.Name);
+            foreach (CompactionInputFiles input in inputs)
+            {
+                if (CompactionPicker.AreFilesInCompaction(input.Files))
+                {
+                    throw new RocksDbException(StatusCode.Aborted, "Operation aborted: Some of the necessary compaction input files are already being compacted");
+                }
+            }
+            c = picker.PickCompactionForCompactFiles(vstorage, inputs, outputLevel, (uint)outputPathId, options.OutputFileSizeLimit, options.Compression,
+                options.OutputTemperatureOverride, options.MaxSubcompactions, options.AllowTrivialMove);
+            c.InputVersion = cfd.Current;
+            cfd.Current.Ref();
+            snapshots = SnapshotsForCompaction();
+            _manualCompactionsRunning++;
+            _backgroundJobs++;
+        }
+        if (synchronous)
+        {
+            RunCompaction(cfd, c, snapshots, CompactionThread.Manual);
+        }
+        else
+        {
+            var run = new ManualRun(this, cfd, c, snapshots);
+            // Not cancellable once registered: the compaction must run (or fail) to release its input files.
+            await Task.Factory.StartNew(static s => ((ManualRun)s!).Run(), run, CancellationToken.None,
+                TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default).ConfigureAwait(false);
+        }
+        var names = new List<string>();
+        if (c.InstalledFiles is { } files)
+        {
+            foreach (FileMetaData f in files) names.Add(FileNames.TableFileName(DbPaths, f.FileNumber, f.PathId));
+        }
+        return names;
     }
 
     /// <summary>Port of DBImpl::FindMinimumEmptyLevelFitting. REQUIRES: mutex.</summary>

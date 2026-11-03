@@ -126,6 +126,15 @@ public sealed class TransactionDbOptions
     /// is a conflict). When disabled, setting a read timestamp is an error. Default true.
     /// </summary>
     public bool EnableUdtValidation { get; set; } = true;
+
+    /// <summary>
+    /// lock_mgr_handle: a <see cref="Transactions.RangeLockManager"/> to open the database in range-locking mode (every
+    /// lock is a range lock; <see cref="Transaction.GetRangeLock(ColumnFamily?, RangeLockEndpoint, RangeLockEndpoint)"/>
+    /// becomes available). Null (default) uses the per-key point lock manager. Requires the WriteCommitted or
+    /// WritePrepared write policy. <see cref="MaxNumLocks"/>, <see cref="NumStripes"/> and <see cref="MaxNumDeadlocks"/>
+    /// do not apply to range locking (see <see cref="Transactions.RangeLockManager.MaxLockMemory"/>).
+    /// </summary>
+    public RangeLockManager? RangeLockManager { get; set; }
 }
 
 /// <summary>Options of <see cref="TransactionDatabase.BeginTransaction(WriteOptions, TransactionOptions)"/> (TransactionOptions).</summary>

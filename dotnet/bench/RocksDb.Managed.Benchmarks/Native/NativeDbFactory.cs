@@ -90,6 +90,7 @@ public static class NativeDbFactory
             out RocksDbSharp.BloomFilterPolicy? bloom, out RocksDbSharp.BlockBasedTableOptions table);
         // rocksdb-sharp's DbOptions has no SetMaxBackgroundJobs; use the C API on its handle.
         RocksDbSharp.Native.Instance.rocksdb_options_set_max_background_jobs(dbOptions.Handle, options.MaxBackgroundJobs);
+        RocksDbSharp.Native.Instance.rocksdb_options_set_max_subcompactions(dbOptions.Handle, options.MaxSubcompactions);
         if (options.EnableBlobFiles)
         {
             // Blob options are not wrapped by rocksdb-sharp either.

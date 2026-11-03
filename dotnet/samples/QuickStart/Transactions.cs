@@ -60,6 +60,56 @@ internal static class Transactions
         return Task.CompletedTask;
     }
 
+    public static Task RangeLocks(string path)
+    {
+        // <snippet:range-locks>
+        var rangeLocks = new RangeLockManager();             // keep it to inspect and tune the locks
+        using TransactionDatabase txnDb = TransactionDatabase.Open(path, new DbOptions { CreateIfMissing = true },
+            new TransactionDbOptions { RangeLockManager = rangeLocks, TransactionLockTimeout = TimeSpan.FromMilliseconds(100) });
+
+        using Transaction t1 = txnDb.BeginTransaction(new WriteOptions());
+        using Transaction t2 = txnDb.BeginTransaction(new WriteOptions());
+        // Lock every key starting with "user:1" (a prefix range: the infinite suffix covers all extensions).
+        t1.GetRangeLock(null, new RangeLockEndpoint("user:1"u8.ToArray()), new RangeLockEndpoint("user:1"u8.ToArray(), infSuffix: true));
+        t1.Put("user:1:name"u8, "Ada"u8);                    // inside t1's range: no extra lock wait
+        try
+        {
+            t2.Put("user:1:email"u8, "x"u8);                 // point locks are single-key ranges: conflicts
+        }
+        catch (RocksDbException e) when (e.Code == StatusCode.TimedOut)
+        {
+            Console.WriteLine("locked by t1's range");
+        }
+        foreach (RangeLockInfo l in rangeLocks.GetRangeLockStatusData())
+            Console.WriteLine($"{l.Start} .. {l.End} held by {string.Join(",", l.TransactionIds)}");
+        t1.Commit();                                          // releases the range
+        t2.Put("user:1:email"u8, "ada@example.com"u8);
+        t2.Commit();
+        // </snippet:range-locks>
+        Line($"user:1:email = {Utf8(txnDb.Database.Get("user:1:email"u8))}");
+        Check(Utf8(txnDb.Database.Get("user:1:name"u8)) == "Ada" && rangeLocks.GetRangeLockStatusData().Count == 0, "range locks");
+        return Task.CompletedTask;
+    }
+
+    public static Task TransactionEntities(string path)
+    {
+        using TransactionDatabase txnDb = TransactionDatabase.Open(path, new DbOptions { CreateIfMissing = true });
+        txnDb.Database.PutEntity("user:2"u8, [new WideColumn("name"u8.ToArray(), "Grace"u8.ToArray())]);
+
+        // <snippet:transaction-entities>
+        using Transaction txn = txnDb.BeginTransaction(new WriteOptions());
+        var columns = new WideColumns();
+        txn.TryGetEntityForUpdate(null, "user:2"u8, columns);   // locks the key, reads its columns
+        txn.PutEntity("user:2"u8, [new WideColumn("name"u8.ToArray(), "Grace"u8.ToArray()),
+                                   new WideColumn("lang"u8.ToArray(), "COBOL"u8.ToArray())]);
+        txn.TryGetEntity(null, "user:2"u8, columns);            // sees its own uncommitted entity: lang, name
+        txn.Commit();
+        // </snippet:transaction-entities>
+        Line($"user:2 has {columns.Count} columns");
+        Check(columns.Count == 2 && txnDb.Database.GetEntity("user:2"u8)!.Count == 2, "transaction entities");
+        return Task.CompletedTask;
+    }
+
     public static Task TwoPhaseCommit(string path)
     {
         var dbOptions = new DbOptions { CreateIfMissing = true };

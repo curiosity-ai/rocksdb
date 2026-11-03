@@ -125,6 +125,9 @@ public sealed record EngineOptions
     /// <summary>--max_background_jobs (2).</summary>
     public int MaxBackgroundJobs { get; init; } = 2;
 
+    /// <summary>--max_subcompactions (1).</summary>
+    public uint MaxSubcompactions { get; init; } = 1;
+
     /// <summary>--compression: none, snappy, lz4 or zstd (all levels).</summary>
     public CompressionType Compression { get; init; } = CompressionType.None;
 }

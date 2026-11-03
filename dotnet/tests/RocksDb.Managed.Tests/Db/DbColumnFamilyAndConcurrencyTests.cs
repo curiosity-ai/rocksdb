@@ -192,4 +192,52 @@ public sealed class DbColumnFamilyAndConcurrencyTests
         await writer;
         for (int i = 0; i < n; i += 97) CollectionAssert.AreEqual(Value(i, 0), db.Get(Key(i)));
     }
+
+    /// <summary>
+    /// One table cache for all column families (DBImpl::table_cache_), bounded by max_open_files - 10 readers in total,
+    /// and resized by SetDBOptions(max_open_files).
+    /// </summary>
+    [TestMethod]
+    public void TableCacheIsSharedAcrossColumnFamiliesAndBoundedByMaxOpenFiles()
+    {
+        MemoryFileSystem fs = NewFs();
+        DbOptions o = NewOptions(fs);
+        o.MaxOpenFiles = 30; // capacity 20
+        o.CreateMissingColumnFamilies = true;
+        var cfo = new ColumnFamilyOptions { DisableAutoCompactions = true };
+        string[] names = ["default", "a", "b"];
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, [.. names.Select(n => new ColumnFamilyDescriptor(n, cfo))]);
+        foreach (string n in names)
+        {
+            ColumnFamily cf = db.GetColumnFamily(n);
+            for (int f = 0; f < 12; f++)
+            {
+                cf.Put(Key(f), Value(f, 0));
+                cf.Flush();
+            }
+        }
+        TableCacheStore store = db.DefaultColumnFamily.Db.SharedTableCache;
+        for (int round = 0; round < 2; round++)
+        {
+            foreach (string n in names)
+            {
+                ColumnFamily cf = db.GetColumnFamily(n);
+                for (int f = 0; f < 12; f++) CollectionAssert.AreEqual(Value(f, 0), cf.Get(Key(f)));
+            }
+        }
+        Assert.IsTrue(store.Count <= 20, "cached readers: " + store.Count);
+        Assert.IsTrue(store.Count >= 12);
+        int perCf = 0;
+        foreach (string n in names) perCf += db.GetColumnFamily(n).Data.TableCache.Count;
+        Assert.AreEqual(store.Count, perCf, "every cached reader belongs to one column family");
+        db.SetDBOptions([new("max_open_files", "-1")]);
+        foreach (string n in names)
+        {
+            ColumnFamily cf = db.GetColumnFamily(n);
+            for (int f = 0; f < 12; f++) CollectionAssert.AreEqual(Value(f, 0), cf.Get(Key(f)));
+        }
+        Assert.AreEqual(36, store.Count);
+        db.SetDBOptions([new("max_open_files", "25")]);
+        Assert.AreEqual(20, store.Count); // excess unreferenced readers closed right away (minimum capacity 20)
+    }
 }

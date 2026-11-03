@@ -589,16 +589,11 @@ internal sealed partial class DbImpl
                     // here instead, right before its memtable can be flushed (at least as durable as upstream).
                     // Earlier closed WALs still waiting for a sync go first.
                     if (_closedWalsToSync.Count > 0) await SyncClosedWalsAsync(synchronous).ConfigureAwait(false);
-                    if (synchronous)
-                    {
-                        old.Sync();
-                        old.Dispose();
-                    }
-                    else
-                    {
-                        await old.SyncAsync(CancellationToken.None).ConfigureAwait(false);
-                        await old.DisposeAsync().ConfigureAwait(false);
-                    }
+                    if (synchronous) old.Sync();
+                    else await old.SyncAsync(CancellationToken.None).ConfigureAwait(false);
+                    NoteClosedWalSynced(old);
+                    if (synchronous) old.Dispose();
+                    else await old.DisposeAsync().ConfigureAwait(false);
                 }
             }
             catch (Exception e)
@@ -671,6 +666,7 @@ internal sealed partial class DbImpl
                 {
                     if (synchronous) w.Sync();
                     else await w.SyncAsync(CancellationToken.None).ConfigureAwait(false);
+                    NoteClosedWalSynced(w);
                 }
                 CloseQuietly(w);
             }

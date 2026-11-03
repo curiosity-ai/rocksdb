@@ -24,6 +24,16 @@ internal sealed partial class VersionStorageInfo
 
     /// <param name="blobFiles">Live blob files of the version ordered by number (see <see cref="Blob.BlobFileMetaData.Build"/>).</param>
     public VersionStorageInfo(InternalKeyComparator icmp, int numLevels, ColumnFamilyOptions options, FileMetaData[][]? files, Blob.BlobFileMetaData[] blobFiles)
+        : this(icmp, numLevels, options, files, blobFiles, null)
+    {
+    }
+
+    /// <param name="context">
+    /// State carried over from the previous version of the column family and applied from the version edit (compact
+    /// cursors, accumulated entry stats, oldest snapshot, ...); null for a version without history.
+    /// </param>
+    public VersionStorageInfo(InternalKeyComparator icmp, int numLevels, ColumnFamilyOptions options, FileMetaData[][]? files, Blob.BlobFileMetaData[] blobFiles,
+        VersionBuildContext? context)
     {
         Icmp = icmp;
         BlobFiles = blobFiles;
@@ -37,7 +47,10 @@ internal sealed partial class VersionStorageInfo
             foreach (FileMetaData f in _files[l]) bytes += f.FileSize;
             _levelBytes[l] = bytes;
         }
-        // Level targets, compaction scores, files by compaction priority (VersionStorageInfo::PrepareForVersionAppend).
+        // Inherited state (VersionStorageInfo::VersionStorageInfo with ref_vstorage), the edit's compact cursors
+        // (VersionBuilder::SaveTo), then level targets, compaction scores, files by compaction priority
+        // (VersionStorageInfo::PrepareForVersionAppend).
+        InitializeInheritedState(context);
         InitializeCompactionState(options);
     }
 
@@ -77,6 +90,8 @@ internal sealed partial class VersionStorageInfo
 
     public ReadOnlySpan<FileMetaData> LevelFiles(int level) => _files[level];
     internal FileMetaData[] LevelFilesArray(int level) => _files[level];
+    /// <summary>A copy of the per-level file arrays (to build another version over the same files).</summary>
+    internal FileMetaData[][] LevelFilesArrays() => (FileMetaData[][])_files.Clone();
     public int NumLevelFiles(int level) => _files[level].Length;
     public ulong NumLevelBytes(int level) => _levelBytes[level];
 
