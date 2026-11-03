@@ -1243,11 +1243,8 @@ Format-level deviations (the output is always readable by native RocksDB):
 - Ribbon filters with `optimize_filters_for_memory` can differ from native by up to 16 bytes.
   Compaction drops them later, so the data is the same.
 
-Not ported yet (being implemented; tracked in [todo.md](todo.md)):
+Not ported yet (tracked in [todo.md](todo.md)):
 
-- Ingesting PlainTable / CuckooTable external files: they are opened, but rejected by upstream's comparator / version
-  checks, exactly as native RocksDB rejects its own.
-- Secondary caches (CompressedSecondaryCache, TieredCache), the persistent cache, `WriteBufferManager` and `SimCache`.
 - Remote compaction of compactions with blob files, and per-subcompaction remote jobs (such compactions run locally).
 - `ldb` commands for TTL, timestamp, blob and transaction databases; `sst_dump` on PlainTable / CuckooTable files.
 - Not supported, as upstream: user-defined timestamps in optimistic transactions and explicit-timestamp
