@@ -1086,14 +1086,16 @@ Format-level deviations (the output is always readable by native RocksDB):
 - Ribbon filters with `optimize_filters_for_memory` can differ from native by up to 16 bytes.
   Compaction drops them later, so the data is the same.
 
-Not ported yet:
+Not ported yet (being implemented; tracked in [todo.md](todo.md)):
 
-- Timestamps in optimistic transactions and explicit-timestamp `WriteBatchWithIndex` writes (NotSupported, as upstream).
-- Range locks; for WritePrepared / WriteUnprepared: iterator invalidation when a WriteUnprepared transaction ends, and
-  user-defined timestamps (NotSupported, as upstream).
-- PlainTable and CuckooTable, parallel compression.
-- Wide-column entities with blob-backed columns (V2) and blob direct write (forced blob GC is leveled-only, as
-  upstream).
+- PlainTable and CuckooTable SST formats, and tables that require a user-defined index (detected and rejected).
+- Secondary caches (CompressedSecondaryCache, TieredCache), the persistent cache, `WriteBufferManager` and `SimCache`.
+- Column family export / import, remote compaction (`CompactionService`, `OpenAndCompact`).
+- `GetMergeOperands`, `PromoteL0`, `SuggestCompactRange`, `LockWAL` / `UnlockWAL`, `DisableManualCompaction`,
+  `GetCreationTimeOfOldestFile`, `ClipColumnFamily`, `GetPropertiesOfTablesInRange`, `OpenAndTrimHistory`, multi-range scans.
+- Query, block cache and I/O tracing (and replay); `ldb` / `sst_dump` equivalents.
+- Not supported, as upstream: user-defined timestamps in optimistic transactions and explicit-timestamp
+  `WriteBatchWithIndex` writes.
 
 API and behavior differences:
 
@@ -1101,10 +1103,6 @@ API and behavior differences:
   with `OperationCanceledException`, because upstream has no cancellation.
 - No optional or defaulted parameters except `CancellationToken`. Options are explicit overloads, and the column family
   is the receiver.
-- Opening a missing directory without `CreateIfMissing` currently reports an `IOError` from the `LOCK` file, where
-  native RocksDB reports `InvalidArgument` (an existing empty directory gives `InvalidArgument` in both).
-- A secondary instance opened while the primary's current WAL is empty does not see writes appended to that WAL by a
-  later `TryCatchUpWithPrimary` until the primary switches to a new WAL (for example, after a flush).
 
 Performance: on the three-way db_bench-style benchmarks (warm, medians of 5 repetitions, the same librocksdb 11.12
 for the native legs), the managed engine's geometric mean per configuration is 0.67x-0.81x the time of the RocksDB C
