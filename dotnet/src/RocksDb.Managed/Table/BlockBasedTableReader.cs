@@ -833,6 +833,47 @@ public sealed partial class BlockBasedTableReader : IDisposable
         return (ulong)(sizeRatio * FileSize);
     }
 
+    /// <summary>
+    /// Port of BlockBasedTable::ApproximateKeyAnchors: walks the index and returns up to ~128 anchors (user key, bytes of
+    /// the data blocks since the previous anchor) that partition the file evenly; used to plan subcompactions.
+    /// </summary>
+    public List<(byte[] UserKey, ulong RangeSize)> ApproximateKeyAnchors()
+    {
+        var anchors = new List<(byte[], ulong)>();
+        // If needed the threshold could be more adaptive (e.g. based on size).
+        const ulong MaxNumAnchors = 128;
+        ulong numBlocksPerAnchor = Math.Max(1UL, Properties.NumDataBlocks / MaxNumAnchors);
+        ulong count = 0, rangeSize = 0, prevOffset = 0;
+        byte[] lastKey = [];
+        IndexCursor cursor = IndexCursor.Rent(this, TableReadFlags.DontFillCache);
+        try
+        {
+            for (cursor.SeekToFirst(); cursor.Valid; cursor.Next())
+            {
+                BlockHandle bh = cursor.Handle;
+                rangeSize += bh.Offset + bh.Size - prevOffset;
+                prevOffset = bh.Offset + bh.Size;
+                ReadOnlySpan<byte> userKey = IndexKeyIncludesSeq ? DbFormat.ExtractUserKey(cursor.Key) : cursor.Key;
+                if (++count % numBlocksPerAnchor == 0)
+                {
+                    count = 0;
+                    anchors.Add((userKey.ToArray(), rangeSize));
+                    rangeSize = 0;
+                }
+                else
+                {
+                    lastKey = userKey.ToArray();
+                }
+            }
+        }
+        finally
+        {
+            cursor.Return();
+        }
+        if (count != 0) anchors.Add((lastKey, rangeSize));
+        return anchors;
+    }
+
     /// <summary>ApproximateDataOffsetOf: the offset of the data block holding the key, or the data size past the end.</summary>
     private ulong ApproximateDataOffsetOf(ReadOnlySpan<byte> internalKey, ulong dataSize)
     {

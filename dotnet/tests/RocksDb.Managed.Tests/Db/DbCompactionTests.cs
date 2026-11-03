@@ -819,3 +819,136 @@ public sealed class DbCompactFilesTests
         Assert.AreEqual(S(Value(1, 0)), S(db.Get(Key(1))));
     }
 }
+
+/// <summary>Subcompactions (max_subcompactions; CompactionJob::GenSubcompactionBoundaries) on <see cref="MemoryFileSystem"/>.</summary>
+[TestClass]
+public sealed class DbSubcompactionTests
+{
+    private static ColumnFamilyOptions Cf() => new()
+    {
+        DisableAutoCompactions = true,
+        WriteBufferSize = 4 << 20,
+        TargetFileSizeBase = 64 * 1024,
+        Compression = RocksDb.Managed.Compression.CompressionType.None,
+    };
+
+    /// <summary>
+    /// Overlapping L0 files compacted with max_subcompactions = 4: the input is split at anchor keys into 4 ranges
+    /// compacted in parallel (NUM_SUBCOMPACTIONS_SCHEDULED records 4); the result is a valid sorted level with the same
+    /// data, including deletions and range tombstones that span subcompaction boundaries.
+    /// </summary>
+    [TestMethod]
+    [DataRow(1u, DisplayName = "max_subcompactions 1")]
+    [DataRow(4u, DisplayName = "max_subcompactions 4")]
+    public void SubcompactionsProduceSameData(uint maxSubcompactions)
+    {
+        MemoryFileSystem fs = NewFs();
+        var stats = new Statistics();
+        DbOptions o = NewOptions(fs);
+        o.MaxSubcompactions = maxSubcompactions;
+        o.Statistics = stats;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, Cf());
+        const int N = 6000;
+        var model = new string?[N];
+        var rnd = new Random(77);
+        for (int round = 0; round < 6; round++)
+        {
+            for (int i = 0; i < 2500; i++)
+            {
+                int k = rnd.Next(N);
+                if (rnd.Next(10) == 0)
+                {
+                    db.Delete(Key(k));
+                    model[k] = null;
+                }
+                else
+                {
+                    db.Put(Key(k), Value(k, round));
+                    model[k] = S(Value(k, round));
+                }
+            }
+            if (round == 3)
+            {
+                // A range tombstone across most of the key space (spans the subcompaction boundaries).
+                db.DeleteRange(Key(1000), Key(5000));
+                for (int k = 1000; k < 5000; k++) model[k] = null;
+            }
+            db.Flush();
+        }
+        db.CompactRange();
+        HistogramData h = stats.GetHistogramData(Histogram.NumSubcompactionsScheduled);
+        if (maxSubcompactions == 1) Assert.AreEqual(0UL, h.Count);
+        else
+        {
+            Assert.AreEqual(1UL, h.Count, "one compaction split into subcompactions");
+            Assert.AreEqual(4.0, h.Max);
+        }
+        List<LiveFileMetadata> files = db.GetLiveFilesMetadata();
+        files.Sort((a, b) => a.SmallestKey.AsSpan().SequenceCompareTo(b.SmallestKey));
+        for (int i = 0; i < files.Count; i++)
+        {
+            Assert.AreNotEqual(0, files[i].Level);
+            if (i > 0) Assert.IsTrue(files[i - 1].LargestKey.AsSpan().SequenceCompareTo(files[i].SmallestKey) < 0, "sorted, non-overlapping outputs");
+        }
+        for (int k = 0; k < N; k++) Assert.AreEqual(model[k], S(db.Get(Key(k))), "key " + k);
+        int count = 0;
+        using (Iterator it = db.NewIterator())
+        {
+            for (it.SeekToFirst(); it.Valid; it.Next()) count++;
+        }
+        int expected = 0;
+        foreach (string? v in model) if (v is not null) expected++;
+        Assert.AreEqual(expected, count);
+    }
+
+    [TestMethod]
+    public void ClippingIteratorRestrictsToRange()
+    {
+        var mem = new List<(byte[], byte[])>();
+        for (int i = 0; i < 10; i++)
+        {
+            var k = new byte[Key(i).Length + 8];
+            DbFormat.AppendInternalKey(k, Key(i), 100, EntryType.Value);
+            mem.Add((k, Value(i, 0)));
+        }
+        static byte[] Seek(byte[] user)
+        {
+            var k = new byte[user.Length + 8];
+            DbFormat.AppendInternalKey(k, user, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
+            return k;
+        }
+        using var it = new ClippingIterator(new ListIterator(mem), Seek(Key(3)), Seek(Key(7)), InternalKeyComparator.Bytewise);
+        var seen = new List<string>();
+        for (it.SeekToFirst(); it.Valid; it.Next()) seen.Add(S(DbFormat.ExtractUserKey(it.Key).ToArray())!);
+        CollectionAssert.AreEqual(new[] { S(Key(3)), S(Key(4)), S(Key(5)), S(Key(6)) }, seen);
+        it.SeekToLast();
+        Assert.AreEqual(S(Key(6)), S(DbFormat.ExtractUserKey(it.Key).ToArray()));
+        it.Seek(Seek(Key(8)));
+        Assert.IsFalse(it.Valid);
+        it.Seek(Seek(Key(1)));
+        Assert.AreEqual(S(Key(3)), S(DbFormat.ExtractUserKey(it.Key).ToArray()));
+    }
+
+    /// <summary>A sorted in-memory internal iterator.</summary>
+    private sealed class ListIterator(List<(byte[] Key, byte[] Value)> items) : RocksDb.Managed.Db.Iterators.InternalIterator
+    {
+        private int _pos = -1;
+        public override bool Valid => _pos >= 0 && _pos < items.Count;
+        public override ReadOnlySpan<byte> Key => items[_pos].Key;
+        public override ReadOnlySpan<byte> Value => items[_pos].Value;
+        public override void SeekToFirst() => _pos = 0;
+        public override void SeekToLast() => _pos = items.Count - 1;
+        public override void Seek(ReadOnlySpan<byte> target)
+        {
+            _pos = 0;
+            while (_pos < items.Count && InternalKeyComparator.Bytewise.Compare(items[_pos].Key, target) < 0) _pos++;
+        }
+        public override void SeekForPrev(ReadOnlySpan<byte> target)
+        {
+            _pos = items.Count - 1;
+            while (_pos >= 0 && InternalKeyComparator.Bytewise.Compare(items[_pos].Key, target) > 0) _pos--;
+        }
+        public override void Next() => _pos++;
+        public override void Prev() => _pos--;
+    }
+}

@@ -361,4 +361,101 @@ public sealed class CompactionApiCompatTests
         StringAssert.Contains(text, "bottommost_file_compaction_delay=900");
         using (RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions(), managedDir.Path)) { }
     }
+
+    // ---- subcompactions -----------------------------------------------------------------------------------------
+
+    public TestContext TestContext { get; set; } = null!;
+
+    /// <summary>
+    /// max_subcompactions = 4 on both engines: the same overlapping L0 files (puts, deletes and a range tombstone across
+    /// by parallel subcompactions, are read back by native. The output file boundaries are only reported (see the
+    /// comment at the end).
+    /// are compared only loosely: see the comment at the end).
+    /// </summary>
+    [TestMethod]
+    public void SubcompactionsMatchNative()
+    {
+        using var nativeDir = new TempDir("subc-native");
+        using var managedDir = new TempDir("subc-managed");
+        RocksDbSharp.Native native = RocksDbSharp.Native.Instance;
+        var no = new RocksDbSharp.DbOptions().SetCreateIfMissing(true).SetCompression(RocksDbSharp.Compression.No).SetDisableAutoCompactions(1)
+            .SetWriteBufferSize(4 << 20).SetTargetFileSizeBase(64 * 1024);
+        native.rocksdb_options_set_max_subcompactions(no.Handle, 4);
+        s_keepAlive.Add(no);
+        var mo = new ColumnFamilyOptions
+        {
+            DisableAutoCompactions = true,
+            WriteBufferSize = 4 << 20,
+            TargetFileSizeBase = 64 * 1024,
+            Compression = RocksDb.Managed.Compression.CompressionType.None,
+        };
+        const int N = 8000;
+        List<FileShape> nShape, mShape;
+        using (RocksDbSharp.RocksDb ndb = RocksDbSharp.RocksDb.Open(no, nativeDir.Path))
+        using (RocksDatabase mdb = RocksDatabase.Open(managedDir.Path, new DbOptions { CreateIfMissing = true, MaxSubcompactions = 4 }, mo))
+        {
+            var rnd = new Random(91);
+            var wo = new RocksDbSharp.WriteOptions();
+            for (int round = 0; round < 6; round++)
+            {
+                for (int i = 0; i < 3000; i++)
+                {
+                    int k = rnd.Next(N);
+                    if (rnd.Next(10) == 0)
+                    {
+                        ndb.Remove(U(K(k)));
+                        mdb.Delete(U(K(k)));
+                    }
+                    else
+                    {
+                        ndb.Put(U(K(k)), V(k, round));
+                        mdb.Put(U(K(k)), V(k, round));
+                    }
+                }
+                if (round == 2)
+                {
+                    native.rocksdb_delete_range_cf(ndb.Handle, wo.Handle, native.rocksdb_get_default_column_family_handle(ndb.Handle), U(K(1500)), (UIntPtr)K(1500).Length,
+                        U(K(6500)), (UIntPtr)K(6500).Length);
+                    mdb.DeleteRange(U(K(1500)), U(K(6500)));
+                }
+                ndb.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+                mdb.Flush();
+            }
+            ndb.CompactRange((byte[]?)null!, null!);
+            mdb.CompactRange();
+            nShape = NativeShape(ndb);
+            mShape = ManagedShape(mdb);
+            for (int k = 0; k < N; k++) CollectionAssert.AreEqual(ndb.Get(U(K(k))), mdb.Get(U(K(k))), K(k));
+        }
+        TestContext.WriteLine("native:  " + Describe(nShape));
+        TestContext.WriteLine("managed: " + Describe(mShape));
+        Assert.IsTrue(mShape.Count >= 4, "subcompactions write at least one file each");
+        using (RocksDbSharp.RocksDb ndb = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions(), nativeDir.Path))
+        using (RocksDbSharp.RocksDb mByNative = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions(), managedDir.Path))
+        {
+            int found = 0;
+            using (RocksDbSharp.Iterator a = ndb.NewIterator(), b = mByNative.NewIterator())
+            {
+                a.SeekToFirst();
+                b.SeekToFirst();
+                while (a.Valid())
+                {
+                    Assert.IsTrue(b.Valid());
+                    CollectionAssert.AreEqual(a.Key(), b.Key());
+                    CollectionAssert.AreEqual(a.Value(), b.Value());
+                    found++;
+                    a.Next();
+                    b.Next();
+                }
+                Assert.IsFalse(b.Valid());
+            }
+            Assert.IsTrue(found > 1000, "found " + found);
+        }
+        // The output file boundaries are not required to match: anchors with equal (shortened separator) keys from different
+        // files are deduplicated after std::sort, which is not stable, so which anchor size native keeps is unspecified and
+        // the subcompaction boundaries can shift by an anchor. Both write one sorted run on the same level.
+        foreach (FileShape f in nShape) Assert.AreEqual(6, f.Level);
+        foreach (FileShape f in mShape) Assert.AreEqual(6, f.Level);
+        TestContext.WriteLine($"output files: native {nShape.Count}, managed {mShape.Count}");
+    }
 }

@@ -779,10 +779,13 @@ internal sealed partial class DbImpl
                 try
                 {
                     ulong[] jobSnapshots = jobSnapshot is null ? snapshots : WithJobSnapshot(snapshots, jobSnapshot.SequenceNumber);
+                    bool bottom = thread == CompactionThread.Bottom;
                     job = new CompactionJob(this, cfd, c, jobSnapshots, NewPendingOutputFileNumber, ct)
                     {
                         SnapshotChecker = checker,
                         JobSnapshot = jobSnapshot?.SequenceNumber ?? 0,
+                        AcquireSubcompactionResources = n => AcquireSubcompactionResources(n, bottom),
+                        ReleaseSubcompactionResources = n => ReleaseSubcompactionResources(n, bottom),
                     };
                     job.RunAsync(synchronous: true).GetAwaiter().GetResult();
                 }
@@ -806,7 +809,10 @@ internal sealed partial class DbImpl
             ct.ThrowIfCancellationRequested();
             TestHooks.Invoke("DBImpl::RunCompaction:BeforeLogAndApply");
             // From here on a failure may still have made the edit durable: leave the blob files to the obsolete-file scan.
-            if (job?.BlobBuilder is { } blobOut) blobOut.Committed = true;
+            if (job is not null)
+            {
+                foreach (Blob.BlobFileBuilder blobOut in job.BlobBuilders) blobOut.Committed = true;
+            }
             Versions.LogAndApplyAsync(cfd, edit, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
             lock (_mutex)
             {
@@ -878,11 +884,14 @@ internal sealed partial class DbImpl
             {
                 foreach (ulong n in job.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
             }
-            if (job?.BlobBuilder is { } blobBuilder)
+            if (job is not null)
             {
-                // Unregisters the pending blob outputs; a job that failed before its MANIFEST write deletes its blob files.
-                ReleaseBlobOutputs(blobBuilder);
-                blobBuilder.Dispose();
+                foreach (Blob.BlobFileBuilder blobBuilder in job.BlobBuilders)
+                {
+                    // Unregisters the pending blob outputs; a job that failed before its MANIFEST write deletes its blob files.
+                    ReleaseBlobOutputs(blobBuilder);
+                    blobBuilder.Dispose();
+                }
             }
             try
             {
@@ -915,6 +924,35 @@ internal sealed partial class DbImpl
         {
             if (failure is RocksDbException r) throw r.Rethrowable();
             throw RocksDbException.IOError(failure.Message, failure);
+        }
+    }
+
+    /// <summary>
+    /// Port of CompactionJob::AcquireSubcompactionResources: reserves up to <paramref name="n"/> extra compaction slots
+    /// (counted in bg_compaction_scheduled_ / bg_bottom_compaction_scheduled_) for round-robin subcompactions, bounded
+    /// by the free slots under the compaction limit (GetBGJobLimits). Returns the number reserved.
+    /// </summary>
+    private int AcquireSubcompactionResources(int n, bool bottom)
+    {
+        lock (_mutex)
+        {
+            int available = Math.Max(BgCompactionLimit() - _bgCompactionScheduled - _bgBottomCompactionScheduled, 0);
+            int reserved = Math.Min(n, available);
+            if (bottom) _bgBottomCompactionScheduled += reserved;
+            else _bgCompactionScheduled += reserved;
+            return reserved;
+        }
+    }
+
+    /// <summary>Port of CompactionJob::ShrinkSubcompactionResources.</summary>
+    private void ReleaseSubcompactionResources(int n, bool bottom)
+    {
+        lock (_mutex)
+        {
+            if (bottom) _bgBottomCompactionScheduled -= n;
+            else _bgCompactionScheduled -= n;
+            MaybeScheduleCompaction();
+            SignalBackgroundWork();
         }
     }
 
