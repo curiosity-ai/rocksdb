@@ -272,3 +272,13 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [ ] tools: TTL/timestamp/blob/transaction ldb commands, non-block-based tables in sst_dump, codec benchmark in recompress (S/M)
 - [-] Deviation inventory: not needed (user accepted the documented reasons in docs/validation.md)
 - [ ] (upstream NotSupported, kept) timestamps in optimistic transactions and explicit-timestamp WBWI writes
+
+## Unported utilities (found 2026-11-03)
+
+- [~] Built-in merge operators: max, put / put_v2, sortlist, bytesxor, StringAppendTEST, AggMerge; resolve by name from OPTIONS (`merge_operator=max`, ...)
+- [ ] Encrypted file system (env_encryption.h: EncryptionProvider, CTR cipher) (M)
+- [ ] WalFilter (wal_filter.h: inspect / rewrite WAL records at recovery) (S)
+- [ ] GetAllKeyVersions (utilities/debug.h), OptionChangeMigration, MemoryUtil::GetApproximateMemoryUsageByType, InfoLogFinder (S each)
+- [ ] Cache dump / load (cache_dump_load.h) (M)
+- [ ] TransactionDBMutexFactory (custom transaction mutexes) (S)
+- [ ] EnvMirror (test utility) (S); StackableDB has no C# equivalent (transactions / TTL are built in)
