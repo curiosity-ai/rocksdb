@@ -75,6 +75,117 @@ public sealed class RateLimiterTests
         Assert.AreEqual(11 * burst, l.GetTotalBytesThrough(IoPriority.Low));
     }
 
+    /// <summary>RateLimiter::IsRateLimited per mode, and Request(bytes, pri, stats, op_type) honouring it.</summary>
+    [TestMethod]
+    public void OpTypesAreChargedPerMode()
+    {
+        foreach (RateLimiterMode mode in new[] { RateLimiterMode.ReadsOnly, RateLimiterMode.WritesOnly, RateLimiterMode.AllIo })
+        {
+            using var l = new GenericRateLimiter(1 << 30, 100_000, 10, mode, autoTuned: false, 0);
+            bool reads = mode != RateLimiterMode.WritesOnly, writes = mode != RateLimiterMode.ReadsOnly;
+            Assert.AreEqual(reads, l.IsRateLimited(RateLimiterOpType.Read), mode.ToString());
+            Assert.AreEqual(writes, l.IsRateLimited(RateLimiterOpType.Write), mode.ToString());
+            l.Request(100, IoPriority.User, null, RateLimiterOpType.Read);
+            l.Request(10, IoPriority.Low, null, RateLimiterOpType.Write);
+            Assert.AreEqual(reads ? 100 : 0, l.GetTotalBytesThrough(IoPriority.User), mode.ToString());
+            Assert.AreEqual(writes ? 10 : 0, l.GetTotalBytesThrough(IoPriority.Low), mode.ToString());
+        }
+        // The default interface implementation (implementations predating op types) charges writes only.
+        IRateLimiter counting = new CountingLimiter();
+        counting.Request(5, IoPriority.Low, null, RateLimiterOpType.Read);
+        counting.Request(7, IoPriority.Low, null, RateLimiterOpType.Write);
+        Assert.AreEqual(7, ((CountingLimiter)counting).Bytes);
+    }
+
+    private sealed class CountingLimiter : IRateLimiter
+    {
+        public long Bytes;
+        public long SingleBurstBytes => 1 << 20;
+        public void Request(long bytes, IoPriority priority) => Bytes += bytes;
+        public ValueTask RequestAsync(long bytes, IoPriority priority, CancellationToken cancellationToken)
+        {
+            Bytes += bytes;
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    /// <summary>The RATE_LIMITER_* tickers and wait histograms recorded by GenericRateLimiter::RequestImpl.</summary>
+    [TestMethod]
+    public async Task StatisticsAreRecorded()
+    {
+        var stats = new Statistics();
+        // 100 KB/s with 10 ms refills: 1000 bytes per refill.
+        using var l = new GenericRateLimiter(100_000, 10_000, 10, RateLimiterMode.AllIo, autoTuned: false, 0);
+        long burst = l.SingleBurstBytes;
+        l.Request(burst, IoPriority.Low, stats, RateLimiterOpType.Write); // drains the bucket
+        l.Request(burst, IoPriority.Low, stats, RateLimiterOpType.Write); // waits for a refill
+        await l.RequestAsync(burst, IoPriority.User, stats, RateLimiterOpType.Read, CancellationToken.None);
+        l.Request(burst, IoPriority.Low, null, RateLimiterOpType.Write); // no statistics passed
+        Assert.AreEqual(2UL, stats.GetTickerCount(Ticker.RateLimiterRequestsWrite));
+        Assert.AreEqual(2UL * (ulong)burst, stats.GetTickerCount(Ticker.RateLimiterBytesWrite));
+        Assert.AreEqual(1UL, stats.GetTickerCount(Ticker.RateLimiterRequestsRead));
+        Assert.AreEqual((ulong)burst, stats.GetTickerCount(Ticker.RateLimiterBytesRead));
+        Assert.AreEqual(1UL, stats.GetTickerCount(Ticker.RateLimiterDelayedRequestsWrite));
+        Assert.AreEqual(1UL, stats.GetTickerCount(Ticker.RateLimiterDelayedRequestsRead));
+        Assert.IsTrue(stats.GetTickerCount(Ticker.NumberRateLimiterDrains) >= 2);
+        Assert.AreEqual(1UL, stats.GetHistogramData(Histogram.RateLimiterWaitMicrosWrite).Count);
+        Assert.AreEqual(1UL, stats.GetHistogramData(Histogram.RateLimiterWaitMicrosRead).Count);
+        Assert.AreEqual(stats.GetHistogramData(Histogram.RateLimiterWaitMicrosWrite).Sum, stats.GetTickerCount(Ticker.RateLimiterTotalWaitMicrosWrite));
+    }
+
+    /// <summary>
+    /// Ports of db/db_rate_limiter_test.cc: compaction input reads are charged at IO_LOW, user reads at
+    /// ReadOptions::rate_limiter_priority (Get, MultiGet, iterators; nothing with the default IO_TOTAL).
+    /// </summary>
+    [TestMethod]
+    public async Task ReadsAreCharged()
+    {
+        using var limiter = new GenericRateLimiter(1L << 40, 100_000, 10, RateLimiterMode.ReadsOnly, autoTuned: false, 0);
+        RocksDb.Managed.Env.MemoryFileSystem fs = NewFs();
+        DbOptions o = NewOptions(fs);
+        o.RateLimiter = limiter;
+        var cf = new ColumnFamilyOptions { DisableAutoCompactions = true };
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, cf);
+        for (int round = 0; round < 2; round++)
+        {
+            for (int i = 0; i < 500; i++) db.Put(Key(i), Value(i, round));
+            db.Flush();
+        }
+        Assert.AreEqual(0, limiter.GetTotalRequests(IoPriority.Total), "flush writes are not charged in reads-only mode");
+        db.CompactRange(null, null);
+        long low = limiter.GetTotalRequests(IoPriority.Low);
+        Assert.IsTrue(low > 0, "compaction input reads are charged at IO_LOW");
+        Assert.AreEqual(0, limiter.GetTotalRequests(IoPriority.User));
+
+        // Default read options: not charged.
+        var noFill = new ReadOptions { FillCache = false };
+        for (int i = 0; i < 50; i++) Assert.IsNotNull(db.Get(noFill, Key(i)));
+        Assert.AreEqual(low, limiter.GetTotalRequests(IoPriority.Total));
+
+        var charged = new ReadOptions { FillCache = false, RateLimiterPriority = IoPriority.User };
+        for (int i = 0; i < 50; i++) Assert.IsNotNull(db.Get(charged, Key(i)));
+        long afterGet = limiter.GetTotalRequests(IoPriority.User);
+        Assert.IsTrue(afterGet >= 50, "each Get reads (and is charged for) at least one uncached data block: " + afterGet);
+        for (int i = 0; i < 20; i++) Assert.IsNotNull(await db.GetAsync(charged, Key(i)));
+        long afterAsync = limiter.GetTotalRequests(IoPriority.User);
+        Assert.IsTrue(afterAsync >= afterGet + 20, "async Get");
+
+        using (Iterator it = db.NewIterator(charged))
+        {
+            int n = 0;
+            for (it.SeekToFirst(); it.Valid; it.Next()) n++;
+            Assert.AreEqual(500, n);
+        }
+        long afterIter = limiter.GetTotalRequests(IoPriority.User);
+        Assert.IsTrue(afterIter > afterAsync, "iterator");
+
+        byte[][] keys = [Key(1), Key(100), Key(300)];
+        byte[]?[] values = db.MultiGet(charged, keys);
+        Assert.IsNotNull(values[2]);
+        Assert.IsTrue(limiter.GetTotalRequests(IoPriority.User) >= afterIter + 1, "MultiGet");
+        Assert.AreEqual(low, limiter.GetTotalRequests(IoPriority.Low));
+    }
+
     [TestMethod]
     public void AutoTunedStartsAtHalfTheRate()
     {
@@ -89,7 +200,8 @@ public sealed class RateLimiterTests
         try
         {
             using var limiter = new GenericRateLimiter(64 << 20);
-            var o = new DbOptions { CreateIfMissing = true, RateLimiter = limiter };
+            var stats = new Statistics();
+            var o = new DbOptions { CreateIfMissing = true, RateLimiter = limiter, Statistics = stats };
             using (RocksDatabase db = RocksDatabase.Open(path, o))
             {
                 for (int round = 0; round < 2; round++)
@@ -103,6 +215,10 @@ public sealed class RateLimiterTests
                 db.CompactRange(null, null);
                 Assert.IsTrue(limiter.GetTotalBytesThrough(IoPriority.Low) > 0, "compaction writes are charged at IO_LOW");
                 Assert.AreEqual(high, limiter.GetTotalBytesThrough(IoPriority.High));
+                // WritableFileWriter passes the DB statistics: every granted write request is counted.
+                Assert.AreEqual((ulong)limiter.GetTotalBytesThrough(IoPriority.Total), stats.GetTickerCount(Ticker.RateLimiterBytesWrite));
+                Assert.AreEqual((ulong)limiter.GetTotalRequests(IoPriority.Total), stats.GetTickerCount(Ticker.RateLimiterRequestsWrite));
+                Assert.AreEqual(0UL, stats.GetTickerCount(Ticker.RateLimiterRequestsRead));
             }
         }
         finally

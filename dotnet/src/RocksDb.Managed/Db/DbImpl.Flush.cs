@@ -468,6 +468,7 @@ internal sealed partial class DbImpl
         MaxBufferSize = (int)Math.Clamp(Options.WritableFileMaxBufferSize, 64 * 1024, int.MaxValue),
         RateLimiter = Options.RateLimiter,
         IoPriority = priority,
+        Statistics = Options.Statistics,
     };
 
     /// <summary>
@@ -481,6 +482,7 @@ internal sealed partial class DbImpl
     {
         RateLimiter = priority == Env.IoPriority.Total ? null : Options.RateLimiter,
         IoPriority = priority,
+        Statistics = Options.Statistics,
         BytesPerSync = (long)Math.Min(Options.BytesPerSync, long.MaxValue),
         MaxBufferSize = (int)Math.Clamp(o.BlobFileWritableFileMaxBufferSize != 0 ? o.BlobFileWritableFileMaxBufferSize : Options.WritableFileMaxBufferSize,
             64 * 1024, int.MaxValue),

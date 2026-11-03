@@ -843,7 +843,7 @@ internal sealed class LocalWritableFile : IWritableFile
                 int chunk = (int)Math.Min(data.Length, Math.Max(1, limiter.SingleBurstBytes));
                 if (_alignment != 0) chunk = Math.Max(_alignment, (int)AlignedBuffer.RoundDown(chunk, _alignment));
                 chunk = Math.Min(chunk, data.Length);
-                limiter.Request(chunk, _options.IoPriority);
+                limiter.Request(chunk, _options.IoPriority, _options.Statistics, RateLimiterOpType.Write);
                 RandomAccess.Write(_handle, data[..chunk], offset);
                 offset += chunk;
                 data = data[chunk..];
@@ -912,7 +912,7 @@ internal sealed class LocalWritableFile : IWritableFile
                 int chunk = (int)Math.Min(data.Length, Math.Max(1, limiter.SingleBurstBytes));
                 if (_alignment != 0) chunk = Math.Max(_alignment, (int)AlignedBuffer.RoundDown(chunk, _alignment));
                 chunk = Math.Min(chunk, data.Length);
-                await limiter.RequestAsync(chunk, _options.IoPriority, cancellationToken).ConfigureAwait(false);
+                await limiter.RequestAsync(chunk, _options.IoPriority, _options.Statistics, RateLimiterOpType.Write, cancellationToken).ConfigureAwait(false);
                 await RandomAccess.WriteAsync(_handle, data[..chunk], offset, cancellationToken).ConfigureAwait(false);
                 offset += chunk;
                 data = data[chunk..];

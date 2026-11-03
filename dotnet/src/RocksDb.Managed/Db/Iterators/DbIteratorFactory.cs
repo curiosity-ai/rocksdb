@@ -146,9 +146,10 @@ public static class DbIteratorFactory
                     bool shouldSample = FileReadSample.ShouldSampleFileRead();
                     foreach (FileMetaData f in files)
                     {
+                        TableReadFlags readFlags = TableReadFlagsExtensions.FromReadOptions(sources.ReadOptions);
                         InternalIterator child = sources.PrefixExtractor is null
-                            ? tc.NewIterator(f)
-                            : new TableInternalIterator(tc.GetReader(f), TableReadFlags.None, sources.ReadOptions, sources.PrefixExtractor);
+                            ? readFlags == TableReadFlags.None ? tc.NewIterator(f) : new TableInternalIterator(tc.GetReader(f), readFlags)
+                            : new TableInternalIterator(tc.GetReader(f), readFlags, sources.ReadOptions, sources.PrefixExtractor);
                         children.Add(child);
                         // Lets DbIter skip ranges covered by newer range tombstones (SkipCoveredForward / Backward).
                         if (child is TableInternalIterator t) t.SetSeqnoRange(f.SmallestSeqno, f.LargestSeqno);

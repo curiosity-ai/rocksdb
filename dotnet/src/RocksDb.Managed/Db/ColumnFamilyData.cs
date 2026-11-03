@@ -100,6 +100,7 @@ internal sealed class ColumnFamilyData
         OptionsSnapshot = options.Clone();
         ReaderOptions = TableFactory.CreateReaderOptions(options, Format, db.GetDefaultBlockCache(options.TableOptions), db.Identity.SessionId);
         if (db.Options.Statistics is { } statistics) ReaderOptions = ReaderOptions with { Statistics = statistics.BlockCacheCounters };
+        if (db.Options.RateLimiter is { } rateLimiter) ReaderOptions = ReaderOptions with { RateLimiter = rateLimiter };
         NumLevels = Math.Max(1, options.NumLevels);
         MemOptions = new MemTableOptions
         {

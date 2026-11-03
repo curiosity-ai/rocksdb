@@ -91,7 +91,9 @@ internal sealed class CompactionJob
         _newFileNumber = newFileNumber;
         _cancellation = cancellation;
         _icmp = cfd.Icmp;
-        _noFillCache = new NoFillTableCache(cfd.TableCache, (int)Math.Min(db.Options.CompactionReadaheadSize, 256UL << 20));
+        // Input reads: fill_cache = false, charged to the rate limiter at GetRateLimiterPriority().
+        _noFillCache = new NoFillTableCache(cfd.TableCache, (int)Math.Min(db.Options.CompactionReadaheadSize, 256UL << 20),
+            TableReadFlags.DontFillCache.WithRateLimiterPriority(db.CompactionRateLimiterPriority()));
         _subStart = start;
         _subEnd = end;
         SubJobId = subJobId;
@@ -244,7 +246,7 @@ internal sealed class CompactionJob
     /// work and is done in large reads instead of one pread per block. 0 disables readahead.
     /// </para>
     /// </summary>
-    private sealed class NoFillTableCache(TableCache inner, int readaheadSize) : ITableCache
+    private sealed class NoFillTableCache(TableCache inner, int readaheadSize, TableReadFlags flags) : ITableCache
     {
         public ValueTask<TableReaderLease> GetReaderAsync(FileMetaData file, CancellationToken cancellationToken = default) =>
             inner.GetReaderAsync(file, cancellationToken);
@@ -253,14 +255,14 @@ internal sealed class CompactionJob
 
         public InternalIterator NewIterator(FileMetaData file)
         {
-            var t = new TableInternalIterator(inner.GetReader(file), TableReadFlags.DontFillCache);
+            var t = new TableInternalIterator(inner.GetReader(file), flags);
             t.EnableReadahead(readaheadSize);
             return t;
         }
 
         public InternalIterator NewIterator(FileMetaData file, InternalIterator? reuse)
         {
-            InternalIterator it = TableCache.Recycle(reuse, inner.GetReader(file), TableReadFlags.DontFillCache);
+            InternalIterator it = TableCache.Recycle(reuse, inner.GetReader(file), flags);
             if (it is TableInternalIterator t) t.EnableReadahead(readaheadSize);
             return it;
         }

@@ -44,6 +44,16 @@ internal sealed partial class DbImpl
 
     private WriteController WriteControllerInstance => _writeControllerField ??= new WriteController(Options.DelayedWriteRate);
 
+    /// <summary>
+    /// Port of CompactionJob::GetRateLimiterPriority: compaction reads are charged at IO_LOW, or IO_USER while writes are
+    /// delayed or stopped (so compactions that unblock writers are not throttled behind other background I/O).
+    /// </summary>
+    internal Env.IoPriority CompactionRateLimiterPriority()
+    {
+        WriteController wc = WriteControllerInstance;
+        return wc.NeedsDelay || wc.IsStopped ? Env.IoPriority.User : Env.IoPriority.Low;
+    }
+
     /// <summary>Number of compactions currently running (auto + manual).</summary>
     internal int NumRunningCompactions
     {

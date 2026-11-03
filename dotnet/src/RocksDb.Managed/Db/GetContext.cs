@@ -118,8 +118,12 @@ internal sealed class GetContext
         _tsFromRangeTombstone = true;
     }
 
+    /// <summary>Table-level read options of the lookup (fill_cache, rate_limiter_priority) passed to the table reads.</summary>
+    public Table.TableReadFlags ReadFlags;
+
     public void Reset(MergeOperator? mergeOperator)
     {
+        ReadFlags = Table.TableReadFlags.None;
         MergeContext.Clear();
         Value.Clear();
         State = GetState.NotFound;

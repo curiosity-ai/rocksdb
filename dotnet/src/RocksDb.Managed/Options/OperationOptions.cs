@@ -51,6 +51,13 @@ public sealed class ReadOptions
     public TimeSpan Deadline { get; set; }
     public TimeSpan IoTimeout { get; set; }
     public ulong ValueSizeSoftLimit { get; set; } = ulong.MaxValue;
+    /// <summary>
+    /// rate_limiter_priority: charge the table block reads of this operation (Get, MultiGet, iterators) to
+    /// <see cref="DbOptions.RateLimiter"/> at this priority. <see cref="Env.IoPriority.Total"/> (default) disables
+    /// charging. Like upstream, the limiter only charges reads in <see cref="Env.RateLimiterMode.ReadsOnly"/> /
+    /// <see cref="Env.RateLimiterMode.AllIo"/> mode, and small metadata reads (footer, properties at table open) are not charged.
+    /// </summary>
+    public Env.IoPriority RateLimiterPriority { get; set; } = Env.IoPriority.Total;
 }
 
 /// <summary>Options for write operations. Port of rocksdb::WriteOptions with upstream defaults. Not persisted.</summary>

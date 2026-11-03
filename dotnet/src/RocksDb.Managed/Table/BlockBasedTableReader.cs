@@ -75,6 +75,11 @@ public sealed record TableReaderOptions
     /// level of a partitioned index and hash indexes always use binary search, like upstream's index readers).
     /// </summary>
     public IndexBlockSearchType IndexBlockSearchType { get; init; } = IndexBlockSearchType.Binary;
+    /// <summary>
+    /// DBOptions::rate_limiter for block reads whose <see cref="TableReadFlags"/> carry a rate limiter priority
+    /// (RandomAccessFileReader::ChargeRateLimiterForRead). Null: reads are never charged.
+    /// </summary>
+    public Env.IRateLimiter? RateLimiter { get; init; }
 
     public static TableReaderOptions Default { get; } = new();
 }
@@ -744,13 +749,61 @@ public sealed partial class BlockBasedTableReader : IDisposable
             return GetBlockRefLegacy(handle, kind, flags);
         }
         _stats?.Record(MissCounter(kind));
+        // Charged per block consumed from the readahead buffer (upstream charges the prefetch reads themselves).
+        ChargeRateLimiter(handle, flags);
         Block b = Protect(BlockFetcher.ReadBlock(prefetch, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind);
         return cache is null || (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
+    }
+
+    /// <summary>
+    /// Port of RandomAccessFileReader::ChargeRateLimiterForRead: charges the bytes of a block read from the file
+    /// (block + trailer) to the rate limiter at the priority in <paramref name="flags"/>, in chunks of at most the
+    /// single burst size. Like upstream, no statistics are recorded for these read charges.
+    /// </summary>
+    private void ChargeRateLimiter(BlockHandle handle, TableReadFlags flags)
+    {
+        Env.IRateLimiter? limiter = _options.RateLimiter;
+        if (limiter is null || (flags & TableReadFlags.RateLimiterPriorityMask) == 0) return;
+        ChargeRateLimiterSlow(limiter, handle, flags.RateLimiterPriority());
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ChargeRateLimiterSlow(Env.IRateLimiter limiter, BlockHandle handle, Env.IoPriority priority)
+    {
+        if (!limiter.IsRateLimited(Env.RateLimiterOpType.Read)) return;
+        long remaining = (long)handle.Size + BlockBasedTableConstants.BlockTrailerSize;
+        while (remaining > 0)
+        {
+            long request = Math.Min(Math.Max(1, limiter.SingleBurstBytes), remaining);
+            limiter.Request(request, priority, null, Env.RateLimiterOpType.Read);
+            remaining -= request;
+        }
+    }
+
+    /// <summary>Async <see cref="ChargeRateLimiter"/>.</summary>
+    private ValueTask ChargeRateLimiterAsync(BlockHandle handle, TableReadFlags flags, CancellationToken ct)
+    {
+        Env.IRateLimiter? limiter = _options.RateLimiter;
+        if (limiter is null || (flags & TableReadFlags.RateLimiterPriorityMask) == 0 || !limiter.IsRateLimited(Env.RateLimiterOpType.Read))
+            return ValueTask.CompletedTask;
+        return ChargeRateLimiterSlowAsync(limiter, handle, flags.RateLimiterPriority(), ct);
+    }
+
+    private static async ValueTask ChargeRateLimiterSlowAsync(Env.IRateLimiter limiter, BlockHandle handle, Env.IoPriority priority, CancellationToken ct)
+    {
+        long remaining = (long)handle.Size + BlockBasedTableConstants.BlockTrailerSize;
+        while (remaining > 0)
+        {
+            long request = Math.Min(Math.Max(1, limiter.SingleBurstBytes), remaining);
+            await limiter.RequestAsync(request, priority, null, Env.RateLimiterOpType.Read, ct).ConfigureAwait(false);
+            remaining -= request;
+        }
     }
 
     private BlockRef ReadAndInsert(BlockCache cache, in CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
         _stats?.Record(MissCounter(kind));
+        ChargeRateLimiter(handle, flags);
         Block b = Protect(BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
@@ -758,7 +811,11 @@ public sealed partial class BlockBasedTableReader : IDisposable
     private BlockRef GetBlockRefLegacy(BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
         IBlockCache? legacy = _legacyCache;
-        if (legacy is null) return BlockRef.FromOwned(Protect(BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind));
+        if (legacy is null)
+        {
+            ChargeRateLimiter(handle, flags);
+            return BlockRef.FromOwned(Protect(BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind));
+        }
         var key = new BlockCacheKey(_tableId, handle.Offset);
         if (legacy.TryGet(key, out Block? b))
         {
@@ -766,6 +823,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
             return BlockRef.FromOwned(b);
         }
         _stats?.Record(MissCounter(kind));
+        ChargeRateLimiter(handle, flags);
         b = Protect(BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind);
         if ((flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(key, b);
         return BlockRef.FromOwned(b);
@@ -816,6 +874,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<BlockRef> ReadAndInsertAsync(BlockCache cache, CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags, CancellationToken ct)
     {
+        await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
         Block b = Protect(await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false), kind);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
@@ -823,6 +882,7 @@ public sealed partial class BlockBasedTableReader : IDisposable
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<BlockRef> ReadAndInsertLegacyAsync(BlockHandle handle, BlockKind kind, TableReadFlags flags, CancellationToken ct)
     {
+        await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
         Block b = Protect(await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false), kind);
         if (_legacyCache is { } legacy && (flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(new BlockCacheKey(_tableId, handle.Offset), b);
         return BlockRef.FromOwned(b);

@@ -242,6 +242,9 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
     /// Prepares a run: resets the per-key lookup state, builds the lookup keys at <paramref name="sequence"/> and sorts
     /// the key order by user key (with the column family's comparator).
     /// </summary>
+    /// <summary>Table-level read flags of the current run (fill_cache, rate_limiter_priority).</summary>
+    internal Table.TableReadFlags ReadFlags { get; set; }
+
     internal void BeginRun(MergeOperator? mergeOperator, ulong sequence, Comparator userComparator)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);

@@ -42,6 +42,7 @@ internal sealed partial class DbImpl
             }
             Comparator ucmp = cfd.UserComparator;
             batch.BeginRun(cfd.MergeOperator, snapshot, ucmp);
+            batch.ReadFlags = TableReadFlagsExtensions.FromReadOptions(options);
             int n = batch.Count;
             int[] order = batch.Order;
             bool memtableOnly = options?.ReadTier == ReadTier.MemtableTier;
@@ -182,7 +183,7 @@ internal sealed partial class DbImpl
                     if (cov > ctx.MaxCoveringTombstoneSeq) ctx.MaxCoveringTombstoneSeq = cov;
                 }
             }
-            t = lease.Reader.MultiGetAsync(batch, sub, count, batch.MayMatch, TableReadFlags.None, synchronous, cancellationToken);
+            t = lease.Reader.MultiGetAsync(batch, sub, count, batch.MayMatch, batch.ReadFlags, synchronous, cancellationToken);
             if (t.IsCompleted)
             {
                 lease.Dispose();

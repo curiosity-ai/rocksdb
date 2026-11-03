@@ -25,6 +25,8 @@ public sealed class LevelIterator : InternalIterator
     private readonly ReadOnlyMemory<byte>? _lower;
     private readonly ReadOnlyMemory<byte>? _upper;
     private readonly ReadOptions? _readOptions;
+    // fill_cache / rate_limiter_priority of _readOptions for the file iterators.
+    private readonly TableReadFlags _readFlags;
     /// <summary>The column family's prefix extractor (file iterators consult prefix filters), or null.</summary>
     private readonly SliceTransform? _prefixExtractor;
     /// <summary>Non-null in legacy prefix seek mode (no total_order_seek / auto_prefix_mode): Seek invalidates past the prefix.</summary>
@@ -53,6 +55,7 @@ public sealed class LevelIterator : InternalIterator
         SliceTransform? prefixExtractor)
     {
         _readOptions = readOptions;
+        _readFlags = TableReadFlagsExtensions.FromReadOptions(readOptions);
         _prefixExtractor = prefixExtractor;
         if (prefixExtractor is not null && readOptions?.TotalOrderSeek != true && readOptions?.AutoPrefixMode != true)
             _prefixSeekExtractor = prefixExtractor;
@@ -353,15 +356,20 @@ public sealed class LevelIterator : InternalIterator
 
     private InternalIterator NewFileIterator(int index, InternalIterator? reuse)
     {
-        if (_prefixExtractor is null) return _tableCache.NewIterator(_files[index], reuse);
+        if (_prefixExtractor is null)
+        {
+            return _readFlags == TableReadFlags.None
+                ? _tableCache.NewIterator(_files[index], reuse)
+                : TableCache.Recycle(reuse, _tableCache.GetReader(_files[index]), _readFlags);
+        }
         TableReaderLease lease = _tableCache.GetReader(_files[index]);
-        if (reuse is TableInternalIterator t && t.Flags == TableReadFlags.None)
+        if (reuse is TableInternalIterator t && t.Flags == _readFlags)
         {
             t.Retarget(lease, _readOptions, _prefixExtractor);
             return t;
         }
         reuse?.Dispose();
-        return new TableInternalIterator(lease, TableReadFlags.None, _readOptions, _prefixExtractor);
+        return new TableInternalIterator(lease, _readFlags, _readOptions, _prefixExtractor);
     }
 
     private void SetFileIterator(InternalIterator? iter, int index)
