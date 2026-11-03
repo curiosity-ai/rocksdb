@@ -64,6 +64,12 @@ if (!await consumer.TryIngestChunkAsync(chunkBytes, ct)) Resync();   // must sta
 * `WalTailer` merges consecutive WAL batches into one serialized write batch under a single 12-byte header (summed
   count) - one message and one replica write per chunk. The bytes are a valid native `WriteBatch` (a test feeds them to a
   native rocksdb-sharp replica).
+* The replica inserts a chunk into its memtable with up to `ReplicationConsumer.ApplyParallelism` threads (default:
+  processor count, at most 4; `WriteOptions.MemtableInsertParallelism`). A primary's concurrent writers insert their
+  batches in parallel, so a replica inserting each merged chunk with one thread fell behind a primary writing 4 x
+  100-entry batches at full speed (75-80% of its rate, 0.5-0.9 s catch-up). The chunk is still one WAL record and one
+  atomic write at the source's sequence numbers, applied in stream order and published only after every range is in;
+  chunks with merge operands, blob indexes, timed puts or 2PC markers are inserted serially.
 * When the WAL a replica needs was purged, the tailer throws `RocksDbException(NotFound)` (the hosts turn this into a
   "resync required" stream message) and the replica rebuilds from a new snapshot. `ReplicationDelta` keeps the
   immutable SST/blob files both sides hold byte-identically (name + size + SHA-256 of length and last 1 MiB), so a
@@ -110,6 +116,7 @@ where noted below. Out of scope as before: pre-vote, membership changes, ReadInd
 | `GetWalUpdates` returns `byte[]` per batch, `GetPooledWalUpdates` pooled arrays | `GetWalUpdatesAsync` yields `WalBatch` views; chunks are pooled | no allocation per batch |
 | caller must `DisableFileDeletions` around `GetInitialState` | `ReplicationSession` pins deletions until released/disposed | WALs right after the checkpoint cannot be purged before the replica attaches |
 | sync `IngestBatch(ReplicationBatch)` / `IngestChunk(span)` | `IngestChunkAsync`, `TryIngestChunkAsync` (sequence check), pooled `WriteBatch` | async-first; the per-chunk check every host did is now in the library |
+| a chunk is one `Write`, inserted into the memtable by one thread | inserted in parallel ranges (`ApplyParallelism`, default min(cores, 4)), published atomically | the serial insert capped the replica below a primary with several writers |
 | file transfer through `FileStream`s and `System.IO` | `IFileSystem` everywhere (checkpoint, snapshot transfer, Raft/role state) | works on `MemoryFileSystem` |
 | `PrimaryWriteGate.HoldAsync` spins and polls | drained signal raised by the last `Exit` | no polling; `TryEnterAsync` is allocation-free while open |
 | promoted replica spins until it reaches the handoff point | `WaitForSequenceAsync` | no polling |

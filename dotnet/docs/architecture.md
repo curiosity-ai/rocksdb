@@ -134,6 +134,14 @@ finishes last publishes the sequence and exits the group for everyone (`LaunchPa
 `CompleteParallelMemTableWriter` / `ExitAsBatchGroupFollower`). (An earlier 64-entry minimum was removed after
 measurements on a quiet machine, see docs/perf.md "Pipelined writes and parallel memtable inserts".)
 
+`WriteOptions.MemtableInsertParallelism` (managed extension, default 1) parallelizes the insert of one large batch
+instead (`Db/DbImpl.SplitInsert.cs`): when the batch's writer is alone in its group, the leader cuts a batch of at least
+256 plain entries at record boundaries into ranges of at least 128 entries, each with the sequence number of its first
+entry, and inserts them with `MemTable.AddConcurrently` together with thread-pool workers that claim ranges from a
+shared counter (a worker starting after the last range was claimed just leaves, so the leader only waits for ranges in
+progress). The sequence is published after the last range, as for a parallel group. Replicas use it to apply merged WAL
+chunks (`ReplicationConsumer.ApplyParallelism`).
+
 With `enable_pipelined_write` (`DbImpl.WritePipelinedAsync`, upstream `PipelinedWriteImpl`) the WAL write and the
 memtable inserts are separate stages with a queue each. The WAL leader groups writers, runs `PreprocessWrite`, the write
 callbacks and the sequence allocation, writes the group's WAL record, then links the group's memtable writers to the

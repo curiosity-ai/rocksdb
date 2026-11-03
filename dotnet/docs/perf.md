@@ -1145,6 +1145,18 @@ Replication on the quiet machine (`2026-11-03-replication.md`): in-process switc
 6.5-11.2 ms; multi-process `SwitchoverTest` 17.9-31.0 ms (median 27 ms; loaded 35-133 ms). With 100-entry batches at
 full speed the replica now applies only 75-80% of the primary's 480-560k ops/s and needs 0.5-0.9 s to catch up.
 
+## Replica apply: parallel insert of one large batch (2026-11-03)
+
+A replica fed by 4 primary writers with 100-entry batches applied 75-80% of the primary's rate and needed 0.5-0.9 s to
+catch up. The replica's apply loop was 95-98% busy; `perf` of the apply alone: 56% `InlineSkipList.Insert`, the rest
+a few percent each (copy, decode, WAL, background flush). The primary inserts its write groups in parallel; the replica
+inserted each merged chunk (~2,400 entries) with one thread, peaking at 456-493k entries/s. New
+`WriteOptions.MemtableInsertParallelism` (`Db/DbImpl.SplitInsert.cs`) splits a lone writer's batch into ranges inserted
+concurrently and publishes after the last one; the replica uses 4 threads: 0.70-0.77M entries/s with 2 threads,
+0.95-1.14M with 4, no added allocation (pooled state, one thread-pool work item per extra range). End to end the lag p50
+went from 39-268 ms to 5-8 ms and the catch-up from 0.1-0.6 s to 23-68 ms (load 4-6). Details: docs/benchmarks.md
+"Replica apply with parallel memtable inserts", `bench/results/2026-11-03-replication-apply.md`.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
