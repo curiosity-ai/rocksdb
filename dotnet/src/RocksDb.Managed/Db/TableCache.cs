@@ -189,19 +189,23 @@ internal sealed class TableCacheStore : IDisposable
     // Caller holds _openLock.
     private void EvictUnreferenced()
     {
-        // Cold path: evict the least recently used unreferenced readers until within capacity.
-        var candidates = new List<Handle>();
+        // Cold path: evict the least recently used unreferenced readers until within capacity. Lookups of open readers
+        // stamp LastUse without the lock, so the stamps are copied before sorting: sorting by the live field let a
+        // concurrent lookup change a key in the middle of the sort, and List.Sort threw ("IComparer.Compare() method
+        // returns inconsistent results") out of the Get that triggered the eviction.
+        var candidates = new List<(long LastUse, Handle Handle)>();
         foreach (KeyValuePair<ulong, Handle> kv in _handles)
         {
-            if (kv.Value.Refs == 1) candidates.Add(kv.Value);
+            if (kv.Value.Refs == 1) candidates.Add((Volatile.Read(ref kv.Value.LastUse), kv.Value));
         }
         candidates.Sort(static (a, b) => a.LastUse.CompareTo(b.LastUse));
         int excess = _handles.Count - _capacity;
         for (int i = 0; i < candidates.Count && excess > 0; i++)
         {
-            if (((ICollection<KeyValuePair<ulong, Handle>>)_handles).Remove(new KeyValuePair<ulong, Handle>(candidates[i].FileNumber, candidates[i])))
+            Handle h = candidates[i].Handle;
+            if (((ICollection<KeyValuePair<ulong, Handle>>)_handles).Remove(new KeyValuePair<ulong, Handle>(h.FileNumber, h)))
             {
-                candidates[i].Release();
+                h.Release();
                 excess--;
             }
         }

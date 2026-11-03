@@ -626,6 +626,44 @@ public sealed class DbColumnFamilyAndConcurrencyTests
         Assert.AreEqual(20, store.Count); // excess unreferenced readers closed right away (minimum capacity 20)
     }
 
+    /// <summary>
+    /// Concurrent lookups through a bounded table cache: every miss evicts the least recently used readers while other
+    /// threads hit (and stamp the last use of) cached readers without the lock. The eviction once sorted the handles by
+    /// their live last-use stamps, which change during the sort; List.Sort then threw "IComparer.Compare() method returns
+    /// inconsistent results" out of Get (seen in DbBlobTests.BlobReadersBoundedByMaxOpenFiles).
+    /// </summary>
+    [TestMethod]
+    public async Task BoundedTableCacheEvictsUnderConcurrentLookups()
+    {
+        MemoryFileSystem fs = NewFs();
+        DbOptions o = NewOptions(fs);
+        // Capacity 54: an eviction sorts ~50 candidates (List.Sort switches from insertion sort to partitioning, which
+        // detects an inconsistent comparer, above 16 elements).
+        o.MaxOpenFiles = 64;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, new ColumnFamilyOptions { DisableAutoCompactions = true });
+        const int Files = 120;
+        for (int f = 0; f < Files; f++)
+        {
+            db.Put(Key(f), Value(f, 0));
+            db.Flush();
+        }
+        TableCacheStore store = db.DefaultColumnFamily.Db.SharedTableCache;
+        var sw = Stopwatch.StartNew();
+        await Parallel.ForAsync(0, 8, (t, ct) =>
+        {
+            var rnd = new Random(t);
+            // Six threads hit a hot set of 40 cached files (stamping their last use without the lock), two read all
+            // files (misses that evict).
+            for (int n = 0; sw.ElapsedMilliseconds < 2000; n++)
+            {
+                int f = t >= 2 ? rnd.Next(40) : rnd.Next(Files);
+                CollectionAssert.AreEqual(Value(f, 0), db.Get(Key(f)), "file " + f);
+            }
+            return ValueTask.CompletedTask;
+        });
+        Assert.IsTrue(store.Count <= 54 + 8, "cached readers: " + store.Count);
+    }
+
     // ---- WriteOptions.MemtableInsertParallelism (one large batch inserted in parallel ranges) ----
 
     private const string ParallelRangeHook = "DBImpl::InsertBatchInParallel:Range";
