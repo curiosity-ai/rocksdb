@@ -252,4 +252,6 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - Backup / error handling
   - [x] SstFileManager (space limit, trash deletion, compaction space pre-check) + no-space auto recovery; atomic WAL-error recovery flush
 - [x] Flaky-under-load hunt: LOCK release race (OFD lock shared with vforked children; unlock before close, as upstream), compaction zeroing seqnos of versions committed mid-compaction (current_key_committed_), WriteUnprepared rollback with two_write_queues visible before its commit (rollback batch now AddPrepared, deviation worth reporting upstream), compaction snapshot list taken at pick time (now with the job snapshot under the mutex); test-timing fixes for prefix-seek compat, blob auto-flush, write slowdown
+- [x] Final-run regressions fixed: flush (closed WAL writers freed by the background purge, like logs_to_free_: 1 KiB flush 75.9 -> 39.0 ms, C 43.7), readahead via OS prefetch like BlockPrefetcher (seekrandom 1 KiB 16.6 -> 10.2 us, C 14.9), compaction allocations (74 -> 0.45 MB), subcompactions 4x: 294 ms vs C 354 (warm-up now JIT-quiesces compaction)
+- [ ] readrandom allocates ~86 B/op (1 KiB) / ~29 B/op (100 B); matrix overwrite ~80 B/op (S/M)
 - Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)
