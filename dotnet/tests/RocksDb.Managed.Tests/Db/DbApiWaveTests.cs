@@ -444,4 +444,56 @@ public sealed class DbApiWaveTests
         Assert.IsNull(GetString(cf, S(Key(6))!));
         Assert.AreEqual(S(Value(9, 0)), GetString(cf, S(Key(9))!));
     }
+    // ---- MultiScan --------------------------------------------------------------------------------------
+
+    private static List<string> Collect(MultiScan ms)
+    {
+        var all = new List<string>();
+        while (ms.MoveNextRange())
+        {
+            var keys = new List<string>();
+            for (; ms.Valid; ms.Next()) keys.Add(System.Text.Encoding.UTF8.GetString(ms.Key));
+            all.Add(ms.RangeIndex + ":" + string.Join(",", keys));
+        }
+        return all;
+    }
+
+    [TestMethod]
+    public void MultiScanVisitsEveryRange()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = OpenMerge(fs);
+        for (int i = 0; i < 100; i++) db.Put(B("k" + i.ToString("D3", System.Globalization.CultureInfo.InvariantCulture)), B("v" + i));
+        db.Flush();
+        db.Delete(B("k011"));
+        db.Put(B("k012"), B("new"));
+        db.CompactRange(B("k050"), B("k099"));
+        var args = new MultiScanArgs().Add(B("k010"), B("k014")).Add(B("k050"), B("k052")).Add(B("k098"), B("k200"));
+        using (MultiScan ms = db.NewMultiScan(args))
+        {
+            CollectionAssert.AreEqual(new[] { "0:k010,k012,k013", "1:k050,k051", "2:k098,k099" }, Collect(ms));
+            Assert.IsFalse(ms.MoveNextRange());
+        }
+        using (MultiScan ms = db.NewMultiScan(new MultiScanArgs { Reverse = true }.Add(B("k010"), B("k014")).Add(B("k097"), B("k099"))))
+        {
+            CollectionAssert.AreEqual(new[] { "0:k013,k012,k010", "1:k098,k097" }, Collect(ms));
+        }
+        // Mixed bounded / unbounded ranges (no prefetch) and the value accessor.
+        using (MultiScan ms = db.NewMultiScan(new ReadOptions { IterateUpperBound = B("k001") }, new MultiScanArgs { MaxPrefetchSize = 1, IoCoalesceThreshold = 0 }
+                   .Add(B("k012"), B("k013")).Add(B("k097"))))
+        {
+            Assert.IsTrue(ms.MoveNextRange());
+            Assert.AreEqual("new", S(ms.Value.ToArray()));
+            Assert.IsTrue(ms.MoveNextRangeAsync().AsTask().GetAwaiter().GetResult());
+            int n = 0;
+            for (; ms.Valid; ms.NextAsync().AsTask().GetAwaiter().GetResult()) n++;
+            Assert.AreEqual(3, n);
+            Assert.ThrowsExactly<InvalidOperationException>(() => ms.Next());
+        }
+        Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(() => db.NewMultiScan(new MultiScanArgs())).Code);
+        Assert.AreEqual(StatusCode.InvalidArgument,
+            Assert.ThrowsExactly<RocksDbException>(() => db.NewMultiScan(new MultiScanArgs().Add(B("b"), B("a")))).Code);
+        Assert.AreEqual(StatusCode.InvalidArgument,
+            Assert.ThrowsExactly<RocksDbException>(() => db.NewMultiScan(new MultiScanArgs { Reverse = true }.Add(B("a")))).Code);
+    }
 }
