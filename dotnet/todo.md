@@ -257,6 +257,8 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [x] Definitive benchmark (bench/results/2026-11-03-definitive-r5.*, same CPU as the previous run): managed 0.72x of C [0.71-0.74], async 0.73x, rocksdb-sharp 1.05x; compaction-heavy 0.58x; 2 of 232 managed cells >1.1x (noisy fillsync / async readmissing); hot paths allocate nothing (BDN)
 - [x] 4-thread 100 B readmissing / fillrandom rechecked (7-rep interleaved A/B): noise, no regression; flush allocations: table-builder buffers pooled (TableBuilderBuffers), no longer bimodal
 - [x] table readers pin index/filter blocks from the table buffer pool (flush 171 KB -> 40 KB); `BlobReadersBoundedByMaxOpenFiles` failure root-caused: bounded table cache sorted readers by a LastUse field mutated concurrently (List.Sort 'inconsistent comparer'), now sorts a snapshot
+- [x] WAL write-error recovery with recycling on (deliberate deviation, user-accepted): 13 unit + 4 native-comparison tests incl. crash sweeps; fixed GetUpdatesSince returning the failed write (recovery-gap fence), tailing iterator missing records of a reused WAL, SstFileManager/flush deadlock
+- [ ] secondary instance catching up on a reused (recycled) WAL may miss records (reader not repositioned, as fixed for tailing iterators) (S); `RateLimiterTests.StatisticsAreRecorded` failed once in a full run (S)
 - Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)
 
 ## Missing features wave (2026-11-03, requested)
