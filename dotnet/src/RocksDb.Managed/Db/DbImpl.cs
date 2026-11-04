@@ -492,6 +492,30 @@ internal sealed partial class DbImpl : IAsyncDisposable
 
     private ulong _failedWalNumber; // newest WAL whose write/sync failed (guarded by mutex)
 
+    /// <summary>
+    /// Sequence ranges of failed WAL writes (WalManager::recovery_sequence_tracker_): fenced from WAL iterators for the
+    /// lifetime of this instance.
+    /// </summary>
+    internal WalRecoverySequenceTracker WalRecoverySequences { get; } = new();
+
+    /// <summary>The newest WAL whose write or sync failed (0 = none). Tests only.</summary>
+    internal ulong FailedWalNumberForTest
+    {
+        get
+        {
+            lock (_mutex) return _failedWalNumber;
+        }
+    }
+
+    /// <summary>A copy of the recycle list (wal_recycle_files_), oldest first. Tests only.</summary>
+    internal ulong[] WalRecycleListForTest
+    {
+        get
+        {
+            lock (_mutex) return _walRecycleFiles.ToArray();
+        }
+    }
+
     /// <summary>The background error handler (error_handler_).</summary>
     internal ErrorHandler ErrorHandler { get; }
 

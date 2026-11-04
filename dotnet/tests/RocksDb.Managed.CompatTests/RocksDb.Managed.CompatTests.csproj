@@ -16,5 +16,7 @@
   <ItemGroup>
     <!-- librocksdb under a .NET 11 apphost: see the file's remarks. -->
     <Compile Include="..\Shared\NativeStdCxxPreload.cs" Link="NativeStdCxxPreload.cs" />
+    <!-- The managed side of the WAL error recovery crash images (WalErrorRecyclingCompatTests). -->
+    <Compile Include="..\RocksDb.Managed.Tests\Db\FaultInjectionFileSystem.cs" Link="Wal\FaultInjectionFileSystem.cs" />
   </ItemGroup>
 </Project>

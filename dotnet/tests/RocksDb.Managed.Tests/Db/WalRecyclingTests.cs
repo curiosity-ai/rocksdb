@@ -250,6 +250,54 @@ public sealed class WalRecyclingTests
         Assert.AreEqual("bar", GetString(db, "foo"));
     }
 
+    /// <summary>
+    /// A tailing GetUpdatesSince iterator follows writes into a reused WAL. The reader buffers the stale records of the
+    /// file's previous use past the live end, and the writer then overwrites them in place: the iterator re-reads the file
+    /// from the end of the last complete record (managed fix; it used to miss every later record of the reused WAL).
+    /// Also across a rotation into a reused WAL.
+    /// </summary>
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void TailingIteratorFollowsReusedWal(bool acrossRotation)
+    {
+        MemoryFileSystem fs = NewFs();
+        var log = new CollectingLogger();
+        DbOptions o = Options(fs, recycle: 1);
+        o.InfoLog = log;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o);
+        for (int r = 0; r < 3; r++)
+        {
+            for (int i = 0; i < 50; i++) db.Put(Key(i), Value(i, r));
+            db.Flush();
+            WaitIdle(db);
+        }
+        Assert.IsTrue(log.Any("from recycle list"), "the current WAL is not a reused file");
+        db.Put(WriteOptions.SyncWrites, B("a"), B("1"));
+        using TransactionLogIterator it = db.GetUpdatesSince(db.GetLatestSequenceNumber());
+        var seen = new List<ulong>();
+        void DrainIt()
+        {
+            if (!it.Valid) it.Next();
+            for (; it.Valid; it.Next()) seen.Add(it.Current.Sequence);
+        }
+        DrainIt();
+        for (int round = 0; round < 3; round++)
+        {
+            for (int i = 0; i < 5; i++) db.Put(WriteOptions.SyncWrites, B("b" + round + "-" + i), B(new string('v', 100 * i)));
+            if (acrossRotation)
+            {
+                db.Flush();
+                WaitIdle(db);
+            }
+            DrainIt();
+        }
+        Assert.IsNull(it.Error, it.Error?.ToString());
+        Assert.AreEqual(16, seen.Count);
+        for (int i = 1; i < seen.Count; i++) Assert.AreEqual(seen[i - 1] + 1, seen[i]);
+        Assert.AreEqual(db.GetLatestSequenceNumber(), seen[^1]);
+    }
+
     /// <summary>Port of DBWriteTest.RecycleLogToggleTest: WALs of a previous instance are deleted, not recycled.</summary>
     [TestMethod]
     public void RecycleLogToggle()

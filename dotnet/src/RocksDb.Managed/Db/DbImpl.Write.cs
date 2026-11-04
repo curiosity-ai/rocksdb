@@ -617,7 +617,10 @@ internal sealed partial class DbImpl
         catch (Exception e)
         {
             // A failed WAL write leaves the WAL in an unknown state: stop accepting writes (bg error). The recovery
-            // replaces the WAL and never writes to or syncs the failed one again.
+            // replaces the WAL and never writes to or syncs the failed one again. Its record may be complete in the
+            // failed WAL while the write is not in the DB: fence the range from WAL iterators (WALIOStatusCheck ->
+            // RecordIndeterminateWriteSequence).
+            WalRecoverySequences.Record(_logNumber, Util.Coding.DecodeFixed64(record.Span), last);
             SetBackgroundError(e, BackgroundErrorReason.WriteCallback, walRelated: true);
             throw;
         }

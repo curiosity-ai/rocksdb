@@ -17,6 +17,17 @@ internal enum InjectedFaultKind
     DataLoss,
 }
 
+/// <summary>How much of its data a failing append (<see cref="FaultInjectionFileSystem.FailAppend"/>) writes first.</summary>
+internal enum AppendFailMode
+{
+    /// <summary>Nothing reaches the file.</summary>
+    NothingWritten,
+    /// <summary>The first half of the data reaches the file (a torn write).</summary>
+    Torn,
+    /// <summary>All of the data reaches the file, then the error is reported (an ambiguous outcome).</summary>
+    FullyWritten,
+}
+
 /// <summary>Operations a targeted fault applies to.</summary>
 [Flags]
 internal enum FaultOps
@@ -98,7 +109,47 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
         lock (_targetLock) _targetRemaining = 0;
     }
 
-    /// <summary>Number of faults raised by <see cref="FailMatching"/>.</summary>
+    private string? _appendFragment;
+    private byte[]? _appendMarker;
+    private AppendFailMode _appendMode;
+    private InjectedFaultKind _appendKind;
+
+    /// <summary>
+    /// One-shot: the next append to a path containing <paramref name="fragment"/> whose data contains
+    /// <paramref name="marker"/> (any append when null) writes what <paramref name="mode"/> says, then fails with
+    /// <paramref name="kind"/>. The file system stays usable. Counted in <see cref="TargetedFaults"/>.
+    /// </summary>
+    public void FailAppend(string fragment, byte[]? marker, AppendFailMode mode, InjectedFaultKind kind)
+    {
+        lock (_targetLock)
+        {
+            _appendFragment = fragment;
+            _appendMarker = marker;
+            _appendMode = mode;
+            _appendKind = kind;
+        }
+    }
+
+    /// <summary>Applies a pending <see cref="FailAppend"/> fault to this append, if it matches.</summary>
+    private void CheckFailAppend(string path, ReadOnlySpan<byte> data, IWritableFile inner)
+    {
+        AppendFailMode mode;
+        InjectedFaultKind kind;
+        lock (_targetLock)
+        {
+            if (_appendFragment is null || !path.Contains(_appendFragment, StringComparison.Ordinal)) return;
+            if (_appendMarker is not null && data.IndexOf(_appendMarker) < 0) return;
+            _appendFragment = null;
+            mode = _appendMode;
+            kind = _appendKind;
+        }
+        Interlocked.Increment(ref _targetHits);
+        if (mode == AppendFailMode.FullyWritten) inner.Append(data);
+        else if (mode == AppendFailMode.Torn && data.Length > 1) inner.Append(data[..(data.Length / 2)]);
+        throw MakeError(kind);
+    }
+
+    /// <summary>Number of faults raised by <see cref="FailMatching"/> and <see cref="FailAppend"/>.</summary>
     public int TargetedFaults => Volatile.Read(ref _targetHits);
 
     private void CheckTargeted(string path, FaultOps op)
@@ -144,17 +195,29 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
     {
         CrashAtOperation = 0;
         Crashed = false;
+        CrashedAt = null;
         Inner.SetFilesystemActive(true);
     }
 
+    /// <summary>
+    /// When set, every counted mutating operation is recorded as "op path" (in counting order, so the operation
+    /// <see cref="CrashAtOperation"/> = n stopped at is the n-th entry when recording started at operation 0).
+    /// </summary>
+    public System.Collections.Concurrent.ConcurrentQueue<string>? OpLog { get; set; }
+
+    /// <summary>The operation ("op path") at which the crash of <see cref="CrashAtOperation"/> happened, or null.</summary>
+    public string? CrashedAt { get; private set; }
+
     /// <summary>Counts one mutating operation; returns true if it is the one that must fail.</summary>
-    private bool Tick()
+    private bool Tick(string op, string path)
     {
+        OpLog?.Enqueue(op + " " + path);
         long n = Interlocked.Increment(ref _ops);
         long crashAt = CrashAtOperation;
         if (crashAt > 0 && n >= crashAt && !Crashed)
         {
             Crashed = true;
+            CrashedAt = op + " " + path;
             if (!TransientFailure) Inner.SetFilesystemActive(false);
             return true;
         }
@@ -163,9 +226,9 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
 
     private RocksDbException InjectedError() => MakeError(ErrorKind);
 
-    private void Mutate()
+    private void Mutate(string op, string path)
     {
-        if (Tick()) throw InjectedError();
+        if (Tick(op, path)) throw InjectedError();
         Inner.ThrowIfInactive();
     }
 
@@ -174,7 +237,7 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
     public IWritableFile CreateWritable(string path, bool truncate, WritableFileOptions options)
     {
         CheckTargeted(path, FaultOps.Create);
-        Mutate();
+        Mutate("create", path);
         IWritableFile f = Inner.CreateWritable(path, truncate, options);
         Interlocked.Increment(ref _openFiles);
         return new Writable(this, f, path);
@@ -182,7 +245,7 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
 
     public IWritableFile ReopenWritable(string path, WritableFileOptions options)
     {
-        Mutate();
+        Mutate("reopen", path);
         IWritableFile f = Inner.ReopenWritable(path, options);
         Interlocked.Increment(ref _openFiles);
         return new Writable(this, f, path);
@@ -216,39 +279,43 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
 
     public void DeleteFile(string path)
     {
-        Mutate();
+        Mutate("delete", path);
         Inner.DeleteFile(path);
     }
+
+    /// <summary>Every successful rename (source, target), in order (WAL reuse renames the recycled WAL).</summary>
+    public System.Collections.Concurrent.ConcurrentQueue<(string Source, string Target)> Renames { get; } = new();
 
     public void RenameFile(string source, string target)
     {
         CheckTargeted(target, FaultOps.Rename);
-        Mutate();
+        Mutate("rename", source + " -> " + target);
         Inner.RenameFile(source, target);
+        Renames.Enqueue((source, target));
     }
 
     public void LinkFile(string source, string target)
     {
-        Mutate();
+        Mutate("link", target);
         Inner.LinkFile(source, target);
     }
 
     public void CreateDirectoryIfMissing(string path)
     {
-        Mutate();
+        Mutate("mkdir", path);
         Inner.CreateDirectoryIfMissing(path);
     }
 
     public void DeleteDirectory(string path)
     {
-        Mutate();
+        Mutate("rmdir", path);
         Inner.DeleteDirectory(path);
     }
 
     public void SyncDirectory(string path)
     {
         CheckTargeted(path, FaultOps.SyncDirectory);
-        Mutate();
+        Mutate("syncdir", path);
         Inner.SyncDirectory(path);
     }
 
@@ -280,10 +347,11 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
         public void Append(ReadOnlySpan<byte> data)
         {
             fs.CheckTargeted(path, FaultOps.Append);
+            fs.CheckFailAppend(path, data, inner);
             string? fragment = fs.FailNextAppendTo;
             bool targeted = fragment is not null && path.Contains(fragment, StringComparison.Ordinal);
             if (targeted) fs.FailNextAppendTo = null;
-            if (fs.Tick() || targeted)
+            if (fs.Tick("append", path) || targeted)
             {
                 if (fs.TornWrites && data.Length > 1)
                 {
@@ -312,7 +380,7 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
 
         public void Flush()
         {
-            if (fs.Tick()) throw fs.InjectedError();
+            if (fs.Tick("flush", path)) throw fs.InjectedError();
             inner.Flush();
         }
 
@@ -332,7 +400,7 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
         public void Sync()
         {
             fs.CheckTargeted(path, FaultOps.Sync);
-            if (fs.Tick()) throw fs.InjectedError();
+            if (fs.Tick("sync", path)) throw fs.InjectedError();
             inner.Sync();
         }
 

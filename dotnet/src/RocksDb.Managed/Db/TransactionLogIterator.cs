@@ -98,6 +98,8 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
     private RocksDbException? _status;
     private ReadOnlyMemory<byte> _currentBatch;
     private bool _disposed;
+    // recovery_sequence_generation_: the fenced ranges known when the iterator was created.
+    private readonly ulong _recoverySequenceGeneration;
 
     private sealed class Reporter : LogReporter
     {
@@ -116,6 +118,7 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
         _verifyChecksums = verifyChecksums;
         _files = files;
         _startingSequenceNumber = seq;
+        _recoverySequenceGeneration = db.WalRecoverySequences.CurrentGeneration;
         SeekToStartSequence(0, strict: false);
     }
 
@@ -224,7 +227,23 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
             record = default;
             return false;
         }
-        return _reader!.TryReadRecord(out record);
+        FragmentBufferedLogReader reader = _reader!;
+        if (reader.TryReadRecord(out record)) return true;
+        // Managed fix: a recycled WAL is overwritten in place. A tailing reader that stopped at a record of the file's
+        // previous use has buffered (or dropped) bytes the writer has replaced since; the DB published newer
+        // sequences, so re-read the file from that record on a fresh handle.
+        if (!reader.AtStaleTail) return false;
+        Env.ISequentialFile f;
+        try
+        {
+            f = _db.OpenWalForRead(_files[_currentFileIndex]);
+        }
+        catch (Exception e) when (e is RocksDbException or IOException)
+        {
+            return false;
+        }
+        reader.Reposition(f);
+        return reader.TryReadRecord(out record);
     }
 
     private void SeekToStartSequence(int startFileIndex, bool strict)
@@ -270,6 +289,10 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
             // gaps while moving to start sequence.
             NextImpl(internalCall: true);
         }
+        else
+        {
+            StopBeforeRecoveryGap(_files[^1].LogNumber, ulong.MaxValue);
+        }
     }
 
     private void NextImpl(bool internalCall)
@@ -312,6 +335,7 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
                 continue;
             }
             _isValid = false;
+            if (StopBeforeRecoveryGap(_files[^1].LogNumber, ulong.MaxValue)) return;
             if (_currentLastSeq == _db.Versions.LastSequence || refreshed) return;
             // Managed extension: follow WAL rotation. Any WAL created after the current one implies the current one is
             // complete (the writer flushed every record before switching), so drain it once more, then continue.
@@ -329,7 +353,7 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
         {
             all = _db.GetSortedWalFiles(includeArchived: true);
         }
-        catch (RocksDbException)
+        catch (Exception e) when (e is RocksDbException or IOException)
         {
             return false;
         }
@@ -362,11 +386,38 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
             _status = new RocksDbException(StatusCode.NotFound, "NotFound: Gap in sequence numbers");
             return;
         }
+        ulong batchLastSeq = batchSeq + count - 1;
+        if (StopBeforeRecoveryGap(_files[_currentFileIndex].LogNumber, batchLastSeq)) return;
         _currentBatchSeq = batchSeq;
-        _currentLastSeq = batchSeq + count - 1;
+        _currentLastSeq = batchLastSeq;
         _currentBatch = _reader!.Record;
         _isValid = true;
         _status = null;
+    }
+
+    /// <summary>
+    /// Port of WalIteratorImpl::StopBeforeRecoveryGap: ends the run (NotFound) before a sequence range whose WAL write
+    /// failed. Successful WAL write error recovery leaves that write out of the DB although its record may be complete
+    /// in the failed WAL, so the iterator must not return it (and must not pretend the run continues across it). A range
+    /// recorded after the iterator was created is applied once the iterator reads the failed WAL or a later one.
+    /// Returns true if the iterator stopped.
+    /// </summary>
+    private bool StopBeforeRecoveryGap(ulong walNumber, ulong batchLastSequence)
+    {
+        if (!ReachedRecoveryGap(walNumber, batchLastSequence, out WalRecoverySequenceGap gap)) return false;
+        _isValid = false;
+        _status = new RocksDbException(StatusCode.NotFound,
+            "NotFound: Gap in sequence numbers after indeterminate WAL write through sequence " + gap.EndSequence);
+        return true;
+    }
+
+    /// <summary>True if a batch ending at <paramref name="batchLastSequence"/> read from WAL <paramref name="walNumber"/>
+    /// reaches the first fenced range at or after the start sequence (see <see cref="StopBeforeRecoveryGap"/>).</summary>
+    private bool ReachedRecoveryGap(ulong walNumber, ulong batchLastSequence, out WalRecoverySequenceGap gap)
+    {
+        if (!_db.WalRecoverySequences.FirstAtOrAfter(_startingSequenceNumber, out gap)) return false;
+        bool knownWhenCreated = gap.Generation <= _recoverySequenceGeneration;
+        return batchLastSequence >= gap.StartSequence && (knownWhenCreated || walNumber >= gap.WalNumber);
     }
 
     private bool OpenLogReader(WalFileInfo file)

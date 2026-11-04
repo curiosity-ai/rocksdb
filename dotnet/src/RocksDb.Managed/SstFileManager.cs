@@ -340,11 +340,14 @@ public sealed class SstFileManager : IDisposable
                 {
                     s = RocksDbException.FromException(e);
                 }
+                // Since we're past the recovery, we can look at this error. Read it before taking the lock: it takes the
+                // DB mutex, and the DB calls into this manager (OnAddFile from VersionSet.InstallEdit) while holding the
+                // DB mutex, so reading it under the lock deadlocked with a concurrent flush or compaction.
+                RocksDbException? err = handler.CurrentBgError;
                 lock (_lock)
                 {
                     if (_currentInstance is not null)
                     {
-                        RocksDbException? err = handler.CurrentBgError;
                         if (s is null && err is not null && err.SubCode == StatusSubCode.NoSpace && err.Severity < ErrorSeverity.FatalError) s = err;
                         _currentInstance = null;
                     }

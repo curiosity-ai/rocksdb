@@ -35,7 +35,7 @@ public sealed class FragmentBufferedLogReader : IDisposable
     private const int FragmentReady = 0;
     private const int NeedMore = 1;
 
-    private readonly ISequentialFile _file;
+    private ISequentialFile _file;
     private readonly LogReporter? _reporter;
     private readonly bool _checksum;
     private readonly ulong _logNumber;
@@ -55,6 +55,15 @@ public sealed class FragmentBufferedLogReader : IDisposable
     private PooledBufferWriter? _uncompressedRecord;
     private bool _inFragmentedRecord;
     private PooledBufferWriter _fragments;
+    // Recycled log tailing: the file offset of the first byte that may be stale (a record of the file's previous use, or
+    // one the writer is overwriting right now), -1 when none. See AtStaleTail / Reposition.
+    private long _staleResumeOffset = -1;
+    // File offset of the First fragment of a logical record not completed yet (-1 = none), and the offset right after
+    // the last record (or metadata record) read completely.
+    private long _openRecordStart = -1;
+    private long _consumedOffset;
+    // Bytes of the next block read to discard (Reposition to an offset inside a block).
+    private int _pendingDiscard;
 
     // Current fragment / record.
     private byte[] _fragArray = [];
@@ -87,6 +96,65 @@ public sealed class FragmentBufferedLogReader : IDisposable
     public bool HasReadError => _readError;
     public long LastRecordOffset => _lastRecordOffset;
     public CompressionType CompressionType => _compressionType;
+    /// <summary>
+    /// The last read of a recycled log returned no record, so the bytes after the last complete record may be stale (a
+    /// record of the file's previous use, a checksum mismatch, or a partial record). A recycled WAL is overwritten in
+    /// place, so those bytes can be replaced by new records while the reader tails it, but the reader has already
+    /// buffered (or dropped) them. <see cref="Reposition"/> re-reads the file from <see cref="StaleResumeOffset"/>.
+    /// Never set for a log that is not recycled.
+    /// </summary>
+    public bool AtStaleTail => _staleResumeOffset >= 0;
+
+    /// <summary>File offset to continue from after <see cref="AtStaleTail"/> (the start of the record that was stale or cut).</summary>
+    public long StaleResumeOffset => _staleResumeOffset;
+
+    /// <summary>
+    /// Continues reading from <see cref="StaleResumeOffset"/> on <paramref name="file"/>, a fresh handle of the same log
+    /// opened at offset 0 (this reader's handle is disposed). The recyclable and compression state is kept. Requires
+    /// <see cref="AtStaleTail"/>.
+    /// </summary>
+    public void Reposition(ISequentialFile file)
+    {
+        ArgumentNullException.ThrowIfNull(file);
+        if (_staleResumeOffset < 0) throw new InvalidOperationException("the reader is not at a stale tail");
+        long offset = _staleResumeOffset;
+        long blockStart = offset - offset % LogFormat.BlockSize;
+        if (blockStart > 0) file.Skip(blockStart);
+        ISequentialFile previous = _file;
+        _file = file;
+        previous.Dispose();
+        _bufStart = _bufLen = 0;
+        _eof = false;
+        _eofOffset = 0;
+        _readError = false;
+        _endOfBufferOffset = blockStart;
+        _pendingDiscard = (int)(offset - blockStart);
+        _inFragmentedRecord = false;
+        _fragments.Clear();
+        _pendingFragmentsClear = false;
+        _staleResumeOffset = -1;
+        _openRecordStart = -1;
+        _consumedOffset = offset;
+    }
+
+    /// <summary>
+    /// A read returned no record. In a recycled log whatever follows the last complete record may be stale (the reader
+    /// cannot tell a record of the previous use, or bytes cut by the writer overwriting them, from the end of the new
+    /// data), so remember where to re-read from.
+    /// </summary>
+    private bool NoRecord()
+    {
+        _staleResumeOffset = _recycled ? (_openRecordStart >= 0 ? _openRecordStart : _consumedOffset) : -1;
+        return false;
+    }
+
+    /// <summary>Notes that a record (or metadata record) ended at the current position.</summary>
+    private void RecordConsumed()
+    {
+        _openRecordStart = -1;
+        _consumedOffset = _endOfBufferOffset - _bufLen;
+    }
+
     /// <summary>The record returned by the last successful read; valid until the next read call.</summary>
     public ReadOnlyMemory<byte> Record => _recordArray.AsMemory(_recordOffset, _recordLength);
 
@@ -107,7 +175,7 @@ public sealed class FragmentBufferedLogReader : IDisposable
                 if (!TryReadMoreSync() || _bufLen == oldSize)
                 {
                     record = default;
-                    return false;
+                    return NoRecord();
                 }
                 continue;
             }
@@ -120,7 +188,7 @@ public sealed class FragmentBufferedLogReader : IDisposable
             {
                 _stopRead = false;
                 record = default;
-                return false;
+                return NoRecord();
             }
         }
     }
@@ -136,14 +204,14 @@ public sealed class FragmentBufferedLogReader : IDisposable
             if (r == NeedMore)
             {
                 int oldSize = _bufLen;
-                if (!await TryReadMoreAsync(cancellationToken).ConfigureAwait(false) || _bufLen == oldSize) return false;
+                if (!await TryReadMoreAsync(cancellationToken).ConfigureAwait(false) || _bufLen == oldSize) return NoRecord();
                 continue;
             }
             if (HandleFragment(ref physicalRecordOffset)) return true;
             if (_stopRead)
             {
                 _stopRead = false;
-                return false;
+                return NoRecord();
             }
         }
     }
@@ -153,6 +221,7 @@ public sealed class FragmentBufferedLogReader : IDisposable
         _recordArray = [];
         _recordOffset = _recordLength = 0;
         _uncompress?.Reset();
+        _staleResumeOffset = -1;
         physicalRecordOffset = _endOfBufferOffset - _bufLen;
     }
 
@@ -176,6 +245,7 @@ public sealed class FragmentBufferedLogReader : IDisposable
                 _lastRecordOffset = physicalRecordOffset;
                 _firstRecordRead = true;
                 _inFragmentedRecord = false;
+                RecordConsumed();
                 return true;
 
             case (int)LogRecordType.First:
@@ -187,6 +257,7 @@ public sealed class FragmentBufferedLogReader : IDisposable
                 _fragments.Clear();
                 _fragments.Write(_fragArray.AsSpan(_fragOffset, _fragLength));
                 _inFragmentedRecord = true;
+                _openRecordStart = _lastFragmentOffset;
                 return false;
 
             case (int)LogRecordType.Middle:
@@ -212,6 +283,7 @@ public sealed class FragmentBufferedLogReader : IDisposable
                 _firstRecordRead = true;
                 _lastRecordOffset = physicalRecordOffset;
                 _pendingFragmentsClear = true;
+                RecordConsumed();
                 return true;
 
             case (int)LogRecordType.SetCompressionType:
@@ -220,6 +292,7 @@ public sealed class FragmentBufferedLogReader : IDisposable
                 _fragments.Clear();
                 _lastRecordOffset = physicalRecordOffset;
                 _inFragmentedRecord = false;
+                RecordConsumed();
                 if (!CompressionTypeRecord.TryDecode(_fragArray.AsSpan(_fragOffset, _fragLength), out CompressionType ct))
                 {
                     ReportCorruption(_fragLength, "could not decode SetCompressionType record");
@@ -235,6 +308,7 @@ public sealed class FragmentBufferedLogReader : IDisposable
                 _fragments.Clear();
                 _lastRecordOffset = physicalRecordOffset;
                 _inFragmentedRecord = false;
+                RecordConsumed();
                 if (!PredecessorWalInfo.TryDecode(_fragArray.AsSpan(_fragOffset, _fragLength), out _))
                 {
                     ReportCorruption(_fragLength, "could not decode PredecessorWALInfoType record");
@@ -250,6 +324,7 @@ public sealed class FragmentBufferedLogReader : IDisposable
                 _fragments.Clear();
                 _lastRecordOffset = physicalRecordOffset;
                 _inFragmentedRecord = false;
+                RecordConsumed();
                 if (!UserDefinedTimestampSizeRecord.IsValid(_fragArray.AsSpan(_fragOffset, _fragLength)))
                 {
                     ReportCorruption(_fragLength, "could not decode user-defined timestamp size record");
@@ -299,6 +374,8 @@ public sealed class FragmentBufferedLogReader : IDisposable
 
     private bool _pendingFragmentsClear;
     private bool _stopRead;
+    // File offset of the physical record consumed last by TryReadFragmentCore.
+    private long _lastFragmentOffset;
 
     // ---- TryReadFragment (I/O-free part) ---------------------------------------------------------------------
 
@@ -361,6 +438,7 @@ public sealed class FragmentBufferedLogReader : IDisposable
             }
         }
 
+        _lastFragmentOffset = _endOfBufferOffset - _bufLen;
         int payloadOffset = _bufStart + headerSize;
         _bufStart += headerSize + length;
         _bufLen -= headerSize + length;
@@ -472,6 +550,14 @@ public sealed class FragmentBufferedLogReader : IDisposable
         _endOfBufferOffset += n;
         _bufStart = 0;
         _bufLen = n;
+        if (_pendingDiscard > 0)
+        {
+            // Reposition: the block starts before the resume offset.
+            int d = Math.Min(_pendingDiscard, n);
+            _bufStart = d;
+            _bufLen = n - d;
+            _pendingDiscard = 0;
+        }
         if (n < LogFormat.BlockSize)
         {
             _eof = true;

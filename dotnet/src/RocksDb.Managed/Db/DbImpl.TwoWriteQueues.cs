@@ -259,6 +259,8 @@ internal sealed partial class DbImpl
                     }
                     catch (Exception e)
                     {
+                        // Fence the failed range from WAL iterators (see WriteGroupToWalAsync).
+                        WalRecoverySequences.Record(_logNumber, first, last);
                         SetBackgroundError(e, BackgroundErrorReason.WriteCallback, walRelated: true);
                         throw;
                     }
