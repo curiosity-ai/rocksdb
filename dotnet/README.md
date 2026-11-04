@@ -1253,7 +1253,6 @@ Format-level deviations (the output is always readable by native RocksDB):
 
 Not ported yet (tracked in [todo.md](todo.md)):
 
-- WAL recycling (`recycle_log_file_num`): recyclable WALs written by native are read, but the port never recycles its own.
 - Out of scope (by decision): the encrypted file system (`env_encryption.h`); remote compaction of compactions with
   blob files and per-subcompaction remote jobs (such compactions run locally); `ldb` commands for TTL, timestamp, blob
   and transaction databases and `sst_dump` on PlainTable / CuckooTable files.
