@@ -1373,12 +1373,20 @@ internal sealed partial class DbImpl
     /// </list>
     /// Begin-prepare markers of another write policy fail with NotSupported (WriteBatchInternal::Iterate checks).
     /// </summary>
+    /// <summary>
+    /// A recovered batch hit an existing key+seq without seq_per_batch (MemTable::Add's TryAgain, twice in a row in
+    /// WriteBatch::Iterate). Thrown by <see cref="MemTableInserter"/> with <see cref="MemTableInserter.FailOnDuplicateKeySeq"/>.
+    /// </summary>
+    private sealed class DuplicateKeySeqException() : Exception("two consecutive TryAgain in WriteBatch handler; this is either a software bug or data corruption.");
+
     private struct MemTableInserter : IWriteBatchHandler
     {
         private readonly DbImpl _db;
         private readonly ulong _logNumber;
         public ulong Sequence;
         public bool IgnoreMissingColumnFamilies;
+        /// <summary>WAL recovery: an existing key+seq fails the batch (<see cref="DuplicateKeySeqException"/>) instead of being skipped.</summary>
+        public bool FailOnDuplicateKeySeq;
         /// <summary>log_number_ref_: WAL with the prepared section of the data being inserted (0 = none).</summary>
         public ulong LogRef;
         // rebuilding_trx_ / rebuilding_trx_seq_ / unprepared_batch_ (recovery only).
@@ -1520,8 +1528,15 @@ internal sealed partial class DbImpl
             while (!AddToMemTable(c, mem, type, key, value, hasProt, kvo))
             {
                 // key+seq exists (TryAgain). Without seq_per_batch this can only come from replaying an already applied
-                // batch: ignore it like upstream. With seq_per_batch the key starts a new sub-batch: advance and retry.
-                if (!_seqPerBatch) break;
+                // batch. WAL recovery fails the batch like upstream: MaybeAdvanceSeq(kBatchBoundary) does not advance,
+                // and WriteBatch::Iterate's retry of the entry hits the second TryAgain ("two consecutive TryAgain"); the
+                // sequence stays at this entry. Other callers ignore it. With seq_per_batch the key starts a new
+                // sub-batch: advance and retry.
+                if (!_seqPerBatch)
+                {
+                    if (FailOnDuplicateKeySeq) throw new DuplicateKeySeqException();
+                    break;
+                }
                 MaybeAdvanceSeq(batchBoundary: true);
             }
             if (LogRef != 0) mem.RefLogContainingPrepSection(LogRef);

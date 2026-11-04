@@ -570,7 +570,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 blobs.RemoveAll(b => _pendingOutputs.Contains(b.BlobFileNumber));
                 releasedBlobs = TakeReleasedBlobDirectWriteFiles();
             }
-            minLog = MinLogNumberToKeepLive();
+            minLog = MinLogNumberToKeepForDeletion();
             // FindObsoleteFiles: oldest first, so that the recycle list keeps the oldest obsolete WALs like upstream.
             if (Options.RecycleLogFileNum > 0) _aliveWals.Sort();
             for (int i = 0; i < _aliveWals.Count;)
@@ -652,7 +652,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         lock (_mutex)
         {
             if (FileDeletionsDisabled || _readOnly) return;
-            minLog = MinLogNumberToKeepLive();
+            minLog = MinLogNumberToKeepForDeletion();
             var dirs = new List<string>(DbPaths);
             if (!dirs.Contains(WalDir)) dirs.Add(WalDir);
             foreach (string dir in dirs)
@@ -670,7 +670,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
                             if (!Versions.IsLiveFile(number) && !_pendingOutputs.Contains(number)) toDelete.Add(full);
                             break;
                         case FileType.BlobFile:
-                            if (!Versions.IsLiveBlobFile(number) && !_pendingOutputs.Contains(number)) toDelete.Add(full);
+                            // ShouldKeepBlobFileDuringPurge: a footer-less blob file may be a blob direct write file
+                            // (of this instance, or of a crashed one whose blob indexes were recovered from the WAL).
+                            if (!Versions.IsLiveBlobFile(number) && !_pendingOutputs.Contains(number) && !ShouldKeepFooterlessBlobFile(full))
+                                toDelete.Add(full);
                             break;
                         case FileType.DescriptorFile:
                             if (dir == DbName && number != Versions.ManifestFileNumber) toDelete.Add(full);
@@ -704,6 +707,51 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
         foreach (ulong n in walsToDelete) DeleteOrArchiveWal(n);
         PurgeObsoleteWalFiles(force: true);
+    }
+
+    /// <summary>
+    /// The WAL number below which WAL files may be deleted or recycled (FindObsoleteFiles: job_context->log_number =
+    /// MinLogNumberToKeep() = versions_->min_log_number_to_keep()). In 2PC mode that is the value persisted in the
+    /// MANIFEST, which recovery starts from (SetupLogFilesRecovery): a WAL released since the last flush by a commit of its
+    /// prepared section stays until a flush records the new minimum. Deleting it earlier made the next open report it
+    /// missing with track_and_verify_wals ("Missing WAL of log number N"). Otherwise the live minimum
+    /// (MinLogNumberWithUnflushedData). REQUIRES: mutex.
+    /// </summary>
+    private ulong MinLogNumberToKeepForDeletion()
+    {
+        ulong live = MinLogNumberToKeepLive();
+        return Options.Allow2Pc ? Math.Min(live, Versions.MinLogNumberToKeep) : live;
+    }
+
+    /// <summary>
+    /// Port of ShouldKeepFooterlessBlobFile (db/db_impl/db_impl_files.cc): a blob file without a valid footer (too short,
+    /// or the last 32 bytes do not decode as BlobLogFooter) is conservatively kept by an obsolete-file purge, as are
+    /// files that cannot be read for a reason other than not existing.
+    /// </summary>
+    private bool ShouldKeepFooterlessBlobFile(string path)
+    {
+        try
+        {
+            long size = FileSystem.GetFileSize(path);
+            if (size < Blob.BlobLogFormat.HeaderSize + Blob.BlobLogFormat.FooterSize) return true;
+            using IRandomAccessFile f = FileSystem.OpenRandomAccess(path);
+            Span<byte> footer = stackalloc byte[Blob.BlobLogFormat.FooterSize];
+            if (f.Read(size - Blob.BlobLogFormat.FooterSize, footer) != footer.Length) return true;
+            Blob.BlobLogFormat.DecodeFooter(footer);
+            return false;
+        }
+        catch (RocksDbException e) when (e.Code == StatusCode.Corruption)
+        {
+            return true;
+        }
+        catch (RocksDbException e)
+        {
+            return e.SubCode != StatusSubCode.PathNotFound;
+        }
+        catch (IOException)
+        {
+            return true;
+        }
     }
 
     /// <summary>A WAL left alive_wal_files_: its size leaves wals_total_size_. REQUIRES: mutex.</summary>

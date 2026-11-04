@@ -212,7 +212,7 @@ internal sealed class BlobSource : IDisposable
         if (TryGetFromCache(index.FileNumber, index.Offset, output)) return;
         if (!DirectWrite!.TryGetBlob(options, userKey, index.FileNumber, index.Offset, index.Size, index.Compression, output))
         {
-            ThrowHelper.Corruption("Invalid blob file number " + index.FileNumber.ToString(CultureInfo.InvariantCulture));
+            DirectWrite.GetOrphanBlob(options, userKey, index.FileNumber, index.Offset, index.Size, index.Compression, output);
         }
     }
 
@@ -245,9 +245,11 @@ internal sealed class BlobSource : IDisposable
         if (index.HasTtl) ThrowHelper.Corruption("Unexpected TTL blob file");
         if (version.GetBlobFileMetaData(index.FileNumber) is null)
         {
-            // Only files still owned by the blob direct write path fall back to direct reads; once the version knows the
-            // file, every result of the version-backed read stands.
-            if (DirectWrite is { } dw && dw.IsDirectWriteFile(index.FileNumber))
+            // ResolveBlobDirectWriteIndex: in a column family with blob direct write, a file the version does not know
+            // is read directly (one of this instance's open files, or one left by a crashed instance whose blob indexes
+            // were recovered from the WAL); once the version knows the file, every result of the version-backed read
+            // stands.
+            if (DirectWrite is not null)
             {
                 directWrite = true;
                 return index;

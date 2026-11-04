@@ -35,6 +35,32 @@ internal sealed partial class DbImpl
         }
     }
 
+    /// <summary>recovered_seq of DBImpl::Open: the next sequence after a point-in-time recovery found corruption, else MaxValue.</summary>
+    private ulong _recoveredSeq = ulong.MaxValue;
+
+    /// <summary>
+    /// DBImpl::Open after a point-in-time recovery that found a corrupted WAL: an empty batch with the expected next
+    /// sequence is written to the new WAL and synced. The corrupted WAL may be kept (2PC keeps WALs down to the persisted
+    /// min_log_number_to_keep; WritePrepared also has sequence gaps); the dummy record tells the next recovery that the
+    /// new WAL continues the sequence, so it resumes after the corrupted WAL (MaybeReviseStopReplayForCorruption) instead
+    /// of reporting the column families flushed past it as inconsistent.
+    /// </summary>
+    private void WriteRecoveredSequenceRecord(ulong sequence)
+    {
+        Span<byte> batch = stackalloc byte[WriteBatch.HeaderSize];
+        batch.Clear();
+        Util.Coding.EncodeFixed64(batch, sequence);
+        LogWriter log = _log!;
+        log.AddRecord(batch, sequence);
+        log.WriteBuffer();
+        log.Sync();
+        lock (_mutex)
+        {
+            _logEmpty = false;
+            _currentWalSize += batch.Length;
+        }
+    }
+
     /// <summary>
     /// The WAL part of SanitizeOptions (db/db_impl/db_impl_open.cc), in place: WAL archival (WAL_ttl_seconds /
     /// WAL_size_limit_MB) disables WAL recycling, and so do kTolerateCorruptedTailRecords (it cannot tell the end of the
@@ -249,6 +275,7 @@ internal sealed partial class DbImpl
             _walTrackingStart = newLogNumber;
             _aliveWals.Add(newLogNumber);
         }
+        if (_recoveredSeq != ulong.MaxValue) WriteRecoveredSequenceRecord(_recoveredSeq);
         if (untrackWals is not null) await Versions.LogAndApplyAsync(null, untrackWals, synchronous, ct).ConfigureAwait(false);
         foreach (ColumnFamilyData cfd in GetColumnFamilies())
         {
@@ -548,14 +575,26 @@ internal sealed partial class DbImpl
         /// </summary>
         public bool OldLogRecordSeen;
 
-        public override void OldLogRecord(long bytes) => OldLogRecordSeen = true;
+        public override void OldLogRecord(long bytes)
+        {
+            OldLogRecordSeen = true;
+            Log?.Log(InfoLogLevel.Warn, FileName + ": dropping " + bytes.ToString(CultureInfo.InvariantCulture) + " bytes; possibly recycled");
+        }
 
+        /// <summary>The info LOG receiving the dropped-bytes warnings, or null.</summary>
+        public InfoLogger? Log;
+
+        /// <summary>
+        /// DBOpenLogRecordReadReporter::Corruption: the dropped bytes are logged ("(ignoring error) " when the status is
+        /// not recorded), and the first reported status becomes the WAL's status, as reported (without the file name).
+        /// </summary>
         public override void Corruption(long bytes, StatusCode code, string reason, ulong logNumber)
         {
+            string status = (code == StatusCode.IOError ? "IO error: " : "Corruption: ") + reason;
+            Log?.Log(InfoLogLevel.Warn, (RecordErrors ? "" : "(ignoring error) ") + FileName + ": dropping " +
+                bytes.ToString(CultureInfo.InvariantCulture) + " bytes; " + status);
             if (!RecordErrors || Error is not null) return;
-            Error = new RocksDbException(code == StatusCode.IOError ? StatusCode.IOError : StatusCode.Corruption,
-                (code == StatusCode.IOError ? "IO error: " : "Corruption: ") + FileName + ": dropping " + bytes.ToString(CultureInfo.InvariantCulture) +
-                " bytes; " + reason);
+            Error = new RocksDbException(code == StatusCode.IOError ? StatusCode.IOError : StatusCode.Corruption, status);
             CorruptedLogNumber = logNumber;
         }
     }
@@ -599,6 +638,9 @@ internal sealed partial class DbImpl
         if (wals.Count == 0 || Options.BestEffortsRecovery) return edits;
 
         ReplayProgress progress = await ProcessLogFilesAsync(wals, minLog, readOnly: false, edits, synchronous, ct).ConfigureAwait(false);
+        // DBImpl::Recover: a point-in-time recovery that stopped at a corrupted WAL hands next_sequence to Open
+        // (recovered_seq), which writes it to the new WAL as a dummy record.
+        if (progress.CorruptedWalFound) _recoveredSeq = progress.NextSequence;
         ulong lastSequence = progress.LastSequence;
         bool anyData = progress.AnyData;
 
@@ -678,6 +720,7 @@ internal sealed partial class DbImpl
             {
                 FileName = fname,
                 RecordErrors = Options.ParanoidChecks && mode != WalRecoveryMode.SkipAnyCorruptedRecords,
+                Log = _infoLog,
             };
             progress.LastSeqnoObserved = 0;
             // InitializeLogReader: checksums are always verified, even without paranoid_checks.
@@ -734,6 +777,7 @@ internal sealed partial class DbImpl
                     // if one continues the sequence (MaybeReviseStopReplayForCorruption), e.g. writes made after an
                     // earlier point-in-time recovery.
                     progress.StopReplay = true;
+                    progress.CorruptedWalFound = true;
                     corruptedWal = reporter.CorruptedLogNumber != LogReporter.UnspecifiedLogNumber ? reporter.CorruptedLogNumber : walNumber;
                     break;
                 default:
@@ -752,7 +796,8 @@ internal sealed partial class DbImpl
                 if (cfd.LogNumber > corruptedWal && liveBytes > 0)
                 {
                     LogError("Column family inconsistency: SST file contains data beyond the point of corruption.");
-                    ThrowHelper.Corruption("Column family inconsistency: SST file contains data beyond the point of corruption in CF " + cfd.Name);
+                    ThrowHelper.Corruption("Column family inconsistency: SST file contains data beyond the point of corruption in CF " + cfd.Name +
+                        ". WAL recovery stopped at corruption point, but SST files contain newer data.");
                 }
             }
         }
@@ -796,6 +841,8 @@ internal sealed partial class DbImpl
         public ulong NextSequence = ulong.MaxValue;
         /// <summary>Point-in-time recovery hit a corruption: WALs are dropped until one continues the sequence.</summary>
         public bool StopReplay;
+        /// <summary>Point-in-time recovery ignored a WAL error or an old record (corrupted_wal_found).</summary>
+        public bool CorruptedWalFound;
         /// <summary>The WAL filter stopped the replay: the remaining records and WALs are dropped (stop_replay_by_wal_filter).</summary>
         public bool StopReplayByWalFilter;
         /// <summary>Sequence of the last record read from the current WAL (last_seqno_observed), 0 if none.</summary>
@@ -846,11 +893,25 @@ internal sealed partial class DbImpl
             return true;
         }
         uint count = Util.Coding.DecodeFixed32(record[8..]);
-        var inserter = new MemTableInserter(this, walNumber, ignoreMissingColumnFamilies: true) { Sequence = seq };
-        inserter.Run(record);
+        var inserter = new MemTableInserter(this, walNumber, ignoreMissingColumnFamilies: true) { Sequence = seq, FailOnDuplicateKeySeq = true };
+        try
+        {
+            inserter.Run(record);
+        }
+        catch (DuplicateKeySeqException e)
+        {
+            // InsertLogRecordToMemtable failed: MaybeIgnoreError, else the failure becomes the WAL's status (reported
+            // like a read error). next_sequence is the inserter's sequence at the failing entry.
+            if (Options.ParanoidChecks) reporter.Corruption(record.Length, StatusCode.Corruption, e.Message, LogReporter.UnspecifiedLogNumber);
+            else LogWarn("Ignoring error Corruption: " + e.Message);
+            CheckSeqnoNotSetBackDuringRecovery(progress.NextSequence, inserter.Sequence);
+            progress.NextSequence = inserter.Sequence;
+            return true;
+        }
         // next_sequence comes from the inserter, not the record header: a prepared section counts its entries but
         // consumes no sequence numbers, and a commit marker consumes those of the prepared batch it applies.
         ulong next = inserter.Sequence;
+        CheckSeqnoNotSetBackDuringRecovery(progress.NextSequence, next);
         progress.NextSequence = next;
         if (count > 0 || next > seq) progress.AnyData = true;
         if (next > seq)
@@ -859,6 +920,18 @@ internal sealed partial class DbImpl
             if (last > progress.LastSequence) progress.LastSequence = last;
         }
         return true;
+    }
+
+    /// <summary>
+    /// Port of DBImpl::CheckSeqnoNotSetBackDuringRecovery: the next sequence never goes back while WAL records are
+    /// replayed (e.g. a stale copy of an older WAL under a newer number); a serious bug or corruption, the open fails in
+    /// every recovery mode. <paramref name="prevNextSeqno"/> is ulong.MaxValue (kMaxSequenceNumber) before the first record.
+    /// </summary>
+    private static void CheckSeqnoNotSetBackDuringRecovery(ulong prevNextSeqno, ulong currentNextSeqno)
+    {
+        if (prevNextSeqno == ulong.MaxValue || prevNextSeqno <= currentNextSeqno) return;
+        ThrowHelper.Corruption("Sequence number is being set backwards during recovery, this is likely a software bug or a data corruption. Prev next seqno: " +
+            prevNextSeqno.ToString(CultureInfo.InvariantCulture) + " , current next seqno: " + currentNextSeqno.ToString(CultureInfo.InvariantCulture));
     }
 
     /// <summary>Port of DBImpl::InvokeWalFilterIfNeededOnColumnFamilyToWalNumberMap.</summary>

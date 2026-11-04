@@ -335,6 +335,36 @@ internal sealed class BlobDirectWriteManager : IDisposable
         return true;
     }
 
+    /// <summary>Readers of files known neither to the reading version nor to this manager (see <see cref="GetOrphanBlob"/>).</summary>
+    private readonly Dictionary<ulong, BlobFileReader> _orphanReaders = new();
+
+    /// <summary>
+    /// ResolveBlobDirectWriteIndex for a blob file the reading version does not know and this instance did not write: a
+    /// direct-write file of a crashed instance whose blob indexes were recovered from the WAL (no flush registered it).
+    /// Upstream opens it by number through the blob file cache, accepting a missing footer
+    /// (allow_footer_skip_retry); so does this. The reader stays open until the manager is disposed. A missing file
+    /// fails like any blob file read (IOError / PathNotFound).
+    /// </summary>
+    public void GetOrphanBlob(ReadOptions? options, ReadOnlySpan<byte> userKey, ulong fileNumber, ulong offset, ulong size, CompressionType compression,
+        IBufferWriter<byte> output)
+    {
+        if (options?.ReadTier == ReadTier.BlockCacheTier)
+        {
+            throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Cannot read blob(s): no disk I/O allowed");
+        }
+        BlobFileReader? reader;
+        lock (_readerLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_orphanReaders.TryGetValue(fileNumber, out reader))
+            {
+                reader = BlobFileReader.OpenUnsealed(_fs, FileNames.BlobFileName(_blobDir, fileNumber), ColumnFamilyId, _stats, BlobFileReadHistogram);
+                _orphanReaders[fileNumber] = reader;
+            }
+        }
+        reader.GetBlob(userKey, offset, size, compression, options?.VerifyChecksums ?? true, output);
+    }
+
     /// <summary>Id of the owning column family (written in the blob file headers).</summary>
     public required uint ColumnFamilyId { get; init; }
 
@@ -367,6 +397,8 @@ internal sealed class BlobDirectWriteManager : IDisposable
                 e.Reader = null;
             }
             _readers.Clear();
+            foreach (BlobFileReader r in _orphanReaders.Values) r.Dispose();
+            _orphanReaders.Clear();
         }
         _compressed.Dispose();
     }
