@@ -135,6 +135,72 @@ symbol scope, which `tests/Shared/NativeStdCxxPreload.cs` now provides in every 
 backups section of validation.md.) A test that depends on a format newer than the NuGet
 package's 11.12 (the C++ tree is 11.14) must be gated the same way.
 
+## The WAL matrix
+
+WAL settings and failure modes are crossed in two matrices; both print their outcome counts to the test output.
+
+**Unit matrix** (`tests/RocksDb.Managed.Tests/Db/WalMatrixTests.cs`, about 10 s): 15 factors, covered pairwise by a
+seeded greedy (AETG-style) covering array of 20 rows. Coverage is asserted by `PairwiseCoversEveryPairOfLevels`. The
+factors are wal_recovery_mode (4 levels), paranoid_checks, recycle_log_file_num 0/1, track_and_verify_wals,
+track_and_verify_wals_in_manifest, manual_wal_flush, wal_compression none/zstd, a separate wal_dir, WAL archival
+(WAL_ttl_seconds), a small max_total_wal_size, avoid_flush_during_recovery, avoid_flush_during_shutdown, the write mode
+(default, two_write_queues, pipelined, unordered, WritePrepared 2PC with a prepared section spanning WALs; 5 levels),
+user-defined timestamps on one column family and blob direct write. Combinations upstream rejects are left out and
+checked separately (`UnsupportedCombinationsAreRejected`): blob direct write with two_write_queues, pipelined or
+unordered writes, and UDT with WritePrepared.
+
+Every row runs against 15 faults on `FaultInjectionFileSystem`:
+
+- crashes: a clean close, a process kill, a power loss, a WAL sync that fails before the power loss, and a MANIFEST
+  write that fails at a flush before the power loss;
+- damage: a torn last record, a corrupted middle record in the latest WAL and in the oldest WAL, a zeroed tail, the
+  oldest or the latest WAL missing, a stale copy of an old WAL under a newer number, an extra empty WAL, the two latest
+  WALs swapped, and a dropped record in the predecessor WAL.
+
+That makes 300 scenarios. A model of the committed writes checks the invariants:
+
+- A crash always reopens and keeps every write acknowledged before the last successful sync.
+- Where upstream recovers a point-in-time prefix, the contents of both column families equal one prefix of the commits.
+  That is after a crash, and after damage confined to the latest WAL with paranoid_checks outside
+  kSkipAnyCorruptedRecords.
+- Elsewhere every recovered value is one the key had.
+- Damage fails only with Corruption, and the damage upstream recovers from must open.
+- The recovered DB accepts a write and reopens with the same contents.
+
+The class also holds the regression tests of the bugs the matrices found.
+
+**Compat matrix** (`tests/RocksDb.Managed.CompatTests/Wal/WalMatrixCompatTests.cs`, about 30 s): crash images (the DB
+directory copied while open) are written by either engine with 8 write-time factors, covered pairwise in 8 images. The
+factors are the writer engine, recycle_log_file_num, track_and_verify_wals, track_and_verify_wals_in_manifest,
+wal_compression, manual_wal_flush, wal_dir and avoid_flush_during_recovery. The workload uses two column families with
+different flush progress, fragmented records, cross-CF batches, and a last sync write followed by unsynced writes; with
+recycling the latest WAL is a reused one with a stale tail.
+
+Each image gets the same 15 damage kinds as files on disk (`WalFault`). Every damaged copy is opened by the managed
+port and by native librocksdb, in each recovery mode with and without paranoid_checks. The undamaged image is also
+opened with a WAL filter returning IgnoreCurrentRecord, StopReplay or CorruptedRecord at the 8th record. The filter's
+out-of-range values are left to the unit matrix, because the C API maps them to kCorruptedRecord. That makes 1,152
+scenarios.
+
+Both engines must agree on success or failure, the status code and message (paths normalized), the contents of both
+column families and the last sequence number. Faults that keep the synced data must keep the last acknowledged sync
+write. Native runs in process: corrupt WALs make it return a Status, and none of the 36,864 long-variant scenarios
+crashed it. `WalRecyclingCompatTests` and `WalCrashFeatureCompatTests` add the recycling interop, recyclable record
+bytes, the 2PC point-in-time case and blob direct write crash images.
+
+Environment variables:
+
+| Variable | Effect |
+|---|---|
+| `WAL_MATRIX_LONG=1` (or `ROUNDTRIP_LONG=1`) | unit: 400 random rows on top of the pairwise ones (6,300 scenarios, about 2.5 min); compat: all 256 write-time combinations (36,864 scenarios, about 15 min) |
+| `WAL_MATRIX_REPORT=<file>` | write the outcome counts and every failure / disagreement to the file |
+| `WAL_MATRIX_ONLY=<row>` | unit matrix: run only the row with this description (as printed in a failure) |
+
+```bash
+WAL_MATRIX_LONG=1 dotnet test --project tests/RocksDb.Managed.Tests -f net10.0 --filter "ClassName~WalMatrixTests"
+WAL_MATRIX_LONG=1 dotnet test --project tests/RocksDb.Managed.CompatTests -f net10.0 --filter "ClassName~WalMatrixCompatTests"
+```
+
 ## Round-trip tests (`tests/RocksDb.Managed.RoundTrip`)
 
 These tests run whole databases through both engines: native creates a DB, managed reopens it and writes, native

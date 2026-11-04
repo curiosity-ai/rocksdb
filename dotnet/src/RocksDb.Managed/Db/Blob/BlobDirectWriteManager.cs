@@ -373,7 +373,8 @@ internal sealed class BlobDirectWriteManager : IDisposable
 
     /// <summary>
     /// Closes the open files without a footer (DB close after the shutdown flush, or a dropped column family); their
-    /// blobs are only referenced from WALs whose data was not flushed (like upstream v1, not recovered).
+    /// blobs are only referenced from WALs whose data was not flushed (the next open reads them through
+    /// <see cref="GetOrphanBlob"/>).
     /// </summary>
     public void Dispose()
     {
