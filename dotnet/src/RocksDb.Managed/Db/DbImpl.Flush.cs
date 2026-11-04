@@ -446,6 +446,9 @@ internal sealed partial class DbImpl
         return next;
     }
 
+    /// <summary>Test helper (TEST_WaitForBackgroundWork): waits until no background job (flush and its purge, compaction) runs.</summary>
+    internal void WaitForBackgroundWorkForTest() => WaitForBackgroundWorkAsync(synchronous: true).GetAwaiter().GetResult();
+
     /// <summary>Waits until no background job is running (used at shutdown).</summary>
     private async ValueTask WaitForBackgroundWorkAsync(bool synchronous)
     {

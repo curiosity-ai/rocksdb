@@ -36,6 +36,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
     private readonly SnapshotList _snapshots = new();
     private readonly List<ulong> _aliveWals = new();          // WAL numbers that may still hold unflushed data (guarded by mutex)
     private readonly List<ulong> _obsoleteManifests = new();  // guarded by mutex
+    // wal_recycle_files_: obsolete WALs kept for reuse (recycle_log_file_num), oldest first; guarded by mutex.
+    private readonly List<ulong> _walRecycleFiles = new();
+    // min_wal_number_to_recycle_: the first WAL of this instance; older WALs are never recycled (guarded by mutex).
+    private ulong _minWalNumberToRecycle;
     private readonly HashSet<ulong> _pendingOutputs = new();  // table files being written (guarded by mutex)
     private readonly List<ColumnFamilyData> _droppedColumnFamilies = new(); // table caches closed at shutdown (guarded by mutex)
     private IDisposable? _dbLock;
@@ -550,6 +554,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         var wals = new List<ulong>();
         var manifests = new List<ulong>();
         List<(ColumnFamilyData Cfd, ulong Number)>? releasedBlobs = null;
+        List<ulong>? recycled = null;
         TestHooks.Invoke("DBImpl::PurgeObsoleteFiles:Start");
         CloseFreedWals();
         ulong minLog;
@@ -566,12 +571,25 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 releasedBlobs = TakeReleasedBlobDirectWriteFiles();
             }
             minLog = MinLogNumberToKeepLive();
+            // FindObsoleteFiles: oldest first, so that the recycle list keeps the oldest obsolete WALs like upstream.
+            if (Options.RecycleLogFileNum > 0) _aliveWals.Sort();
             for (int i = 0; i < _aliveWals.Count;)
             {
                 ulong n = _aliveWals[i];
                 if (n < minLog && n != _logNumber)
                 {
-                    wals.Add(n);
+                    // A WAL whose write or sync failed is not reused (upstream refuses WAL write error recovery with
+                    // recycling altogether).
+                    if (Options.RecycleLogFileNum > (ulong)_walRecycleFiles.Count && n >= _minWalNumberToRecycle && n > _failedWalNumber)
+                    {
+                        LogInfo("adding log " + n.ToString(CultureInfo.InvariantCulture) + " to recycle list");
+                        _walRecycleFiles.Add(n);
+                        (recycled ??= new List<ulong>()).Add(n);
+                    }
+                    else
+                    {
+                        wals.Add(n);
+                    }
                     _aliveWals.RemoveAt(i);
                     ForgetAliveWalSize(n);
                 }
@@ -601,10 +619,19 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 TryDeleteFile(FileNames.BlobFileName(DbPaths[0], n));
             }
         }
-        if (wals.Count > 0 && !TryPersistWalDeletion(minLog))
+        // Recycled WALs leave the MANIFEST too (they are renamed when reused).
+        if ((wals.Count > 0 || recycled is not null) && !TryPersistWalDeletion(minLog))
         {
             // The MANIFEST still tracks them: keep the WALs until a later purge records their deletion.
-            lock (_mutex) _aliveWals.AddRange(wals);
+            lock (_mutex)
+            {
+                _aliveWals.AddRange(wals);
+                if (recycled is not null)
+                {
+                    foreach (ulong n in recycled) _walRecycleFiles.Remove(n);
+                    _aliveWals.AddRange(recycled);
+                }
+            }
             wals.Clear();
         }
         foreach (ulong n in wals) DeleteOrArchiveWal(n);
@@ -652,7 +679,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
                             if (dir == DbName) toDelete.Add(full);
                             break;
                         case FileType.WalFile:
-                            if (dir == WalDir && number < minLog && number != _logNumber)
+                            // Recycled WALs are kept (PurgeObsoleteFiles: wal_recycle_files_set).
+                            if (dir == WalDir && number < minLog && number != _logNumber && !_walRecycleFiles.Contains(number))
                             {
                                 walsToDelete.Add(number);
                                 _aliveWals.Remove(number);

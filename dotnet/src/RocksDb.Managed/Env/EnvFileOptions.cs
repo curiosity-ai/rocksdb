@@ -106,6 +106,28 @@ public sealed class WritableFileOptions
 
     /// <summary>Statistics receiving the RATE_LIMITER_* write tickers of <see cref="RateLimiter"/> requests (WritableFileWriter::stats_).</summary>
     public RocksDb.Managed.Statistics? Statistics { get; init; }
+
+    /// <summary>
+    /// Cut the file to its logical size (the bytes appended through this handle) when it is closed, also when it was
+    /// opened over existing contents without truncation. Set by <see cref="IFileSystem.ReuseWritable"/>: upstream's WALs
+    /// are preallocated and PosixWritableFile::Close trims them to the written size, so a cleanly closed recycled WAL
+    /// keeps no records of its previous use (a crash leaves them in place).
+    /// </summary>
+    public bool TruncateToSizeOnClose
+    {
+        get => _truncateToSizeOnClose;
+        init => _truncateToSizeOnClose = value;
+    }
+
+    private bool _truncateToSizeOnClose;
+
+    /// <summary>A copy of these options with <see cref="TruncateToSizeOnClose"/> set.</summary>
+    public WritableFileOptions WithTruncateToSizeOnClose()
+    {
+        var copy = (WritableFileOptions)MemberwiseClone();
+        copy._truncateToSizeOnClose = true;
+        return copy;
+    }
 }
 
 /// <summary>Options for random-access readers (RandomAccessFileReader / PosixRandomAccessFile).</summary>

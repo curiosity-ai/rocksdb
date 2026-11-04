@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using RocksDb.Managed.Env;
@@ -94,6 +95,10 @@ internal sealed partial class DbImpl
         if (_readOnly) ThrowReadOnly();
         if (_queryTracer is not null) MaybeTraceWrite(options, batch, txn);
         if (options is { Sync: true, DisableWal: true }) ThrowHelper.InvalidArgument("Sync writes has to enable WAL.");
+        // Corruption detection in recycled WALs relies on sequential sequence numbers, but WritePreparedTxnDB uses
+        // disableWAL internally for split writes (DBImpl::WriteImpl).
+        if (options is { DisableWal: true } && Options.RecycleLogFileNum > 0 && !(_twoWriteQueues && txn is { DisableMemtable: true }))
+            ThrowHelper.InvalidArgument("WriteOptions::disableWAL option is not supported if DBOptions::recycle_log_file_num > 0");
         if (batch.DataSize < WriteBatch.HeaderSize) ThrowHelper.Corruption("malformed WriteBatch (too small)");
         if (options is { ProtectionBytesPerKey: not 0 } || batch.ProtectionBytesPerKey != 0) PrepareProtectedWrite(options, batch);
         if (validateColumnFamilies)
@@ -930,9 +935,13 @@ internal sealed partial class DbImpl
             // A WAL whose write or sync failed is replaced and never written or synced again (WAL write error recovery).
             walFailed = _log is not null && _logNumber <= _failedWalNumber;
         }
+        ulong recycleLogNumber = 0;
         if (!_logEmpty || _log is null || walFailed)
         {
             ReleaseObsoleteClosedWals();
+            // SwitchMemtable: reuse the oldest recycled WAL, unless file deletions are disabled (the rename would look
+            // like a deletion) or it is still open (IsWalInLogs).
+            if (Options.RecycleLogFileNum > 0) recycleLogNumber = PickRecycledWal();
             newLogNumber = Versions.NewFileNumber();
             try
             {
@@ -942,7 +951,19 @@ internal sealed partial class DbImpl
                 PredecessorWalInfo? predecessor = old?.File is { } oldFile
                     ? new PredecessorWalInfo(old.LogNumber, (ulong)oldFile.Size, old.LastSequenceRecorded)
                     : null;
-                newLog = CreateWal(newLogNumber, predecessor);
+                try
+                {
+                    newLog = CreateWal(newLogNumber, predecessor, recycleLogNumber);
+                }
+                finally
+                {
+                    // Popped whether or not the reuse worked: it was held in the list only so that a concurrent purge
+                    // does not delete it while it is renamed.
+                    if (recycleLogNumber != 0)
+                    {
+                        lock (_mutex) _walRecycleFiles.Remove(recycleLogNumber);
+                    }
+                }
                 if (old is not null && walFailed)
                 {
                     // Its data is in the memtables, which the recovery flushes.
@@ -1083,8 +1104,51 @@ internal sealed partial class DbImpl
             if (_walsToFree.Count == 0) return;
             freed = _walsToFree.ToArray();
             _walsToFree.Clear();
+            // Until they are closed they must not be recycled (PickRecycledWal).
+            foreach (LogWriter w in freed) _walsBeingClosed.Add(w.LogNumber);
         }
         foreach (LogWriter w in freed) CloseQuietly(w);
+        lock (_mutex)
+        {
+            foreach (LogWriter w in freed) _walsBeingClosed.Remove(w.LogNumber);
+        }
+    }
+
+    /// <summary>WALs whose writer <see cref="CloseFreedWals"/> is closing outside the mutex (guarded by mutex).</summary>
+    private readonly HashSet<ulong> _walsBeingClosed = new();
+
+    /// <summary>
+    /// The recycled WAL a memtable switch reuses (SwitchMemtable: the front of wal_recycle_files_ when file deletions
+    /// are enabled and !IsWalInLogs), or 0. A WAL still waiting in the free list is closed first: a WAL that may be
+    /// recycled must be closed before it is reused (FindObsoleteFiles). One still open elsewhere is not reused this
+    /// time. The number stays in the list until the reuse is done. REQUIRES: write leader (owns
+    /// <see cref="_closedWalsToSync"/>).
+    /// </summary>
+    private ulong PickRecycledWal()
+    {
+        ulong n;
+        LogWriter? toClose = null;
+        lock (_mutex)
+        {
+            if (_walRecycleFiles.Count == 0 || FileDeletionsDisabled) return 0;
+            n = _walRecycleFiles[0];
+            if (_walsBeingClosed.Contains(n) || n == _logNumber) return 0;
+            for (int i = 0; i < _walsToFree.Count; i++)
+            {
+                if (_walsToFree[i].LogNumber == n)
+                {
+                    toClose = _walsToFree[i];
+                    _walsToFree.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+        foreach (LogWriter w in _closedWalsToSync)
+        {
+            if (w.LogNumber == n) return 0;
+        }
+        if (toClose is not null) CloseQuietly(toClose);
+        return n;
     }
 
     private static void CloseQuietly(LogWriter w)
@@ -1176,7 +1240,7 @@ internal sealed partial class DbImpl
     /// track_and_verify_wals the predecessor-WAL-info record when <paramref name="predecessor"/> is known
     /// (Writer::MaybeAddPredecessorWALInfo). Like upstream, the first WAL of an open has no predecessor record.
     /// </summary>
-    private LogWriter CreateWal(ulong number, PredecessorWalInfo? predecessor)
+    private LogWriter CreateWal(ulong number, PredecessorWalInfo? predecessor, ulong recycleLogNumber)
     {
         string path = FileNames.LogFileName(WalDir, number);
         var fileOptions = new WritableFileOptions
@@ -1187,10 +1251,24 @@ internal sealed partial class DbImpl
             BytesPerSync = Options.WalBytesPerSync != 0 ? (long)Math.Min(Options.WalBytesPerSync, long.MaxValue) : WalWritebackBytes,
             MaxBufferSize = (int)Math.Clamp(Options.WritableFileMaxBufferSize, 64 * 1024, int.MaxValue),
         };
-        IWritableFile file = FileSystem.CreateWritable(path, truncate: true, fileOptions);
+        IWritableFile file;
+        if (recycleLogNumber != 0)
+        {
+            // CreateWALWriter: ReuseWritableFile renames the recycled WAL and overwrites it in place (no truncation);
+            // its old records past the new data carry the old log number and end the log when it is read.
+            LogInfo("reusing log " + recycleLogNumber.ToString(CultureInfo.InvariantCulture) + " from recycle list");
+            TestHooks.Invoke("DBImpl::CreateWAL:BeforeReuseWritableFile");
+            file = FileSystem.ReuseWritable(path, FileNames.LogFileName(WalDir, recycleLogNumber), fileOptions);
+        }
+        else
+        {
+            file = FileSystem.CreateWritable(path, truncate: true, fileOptions);
+        }
         try
         {
-            var log = new LogWriter(file, number, recycleLogFiles: false, Options.ManualWalFlush, Options.WalCompression, 0);
+            // Any non-zero recycle_log_file_num (after sanitization) writes the recyclable record format, also for WALs
+            // that are not reused.
+            var log = new LogWriter(file, number, recycleLogFiles: Options.RecycleLogFileNum > 0, Options.ManualWalFlush, Options.WalCompression, 0);
             log.AddCompressionTypeRecord();
             if (Options.TrackAndVerifyWals && predecessor is { } info) log.AddPredecessorWalInfo(info);
             return log;

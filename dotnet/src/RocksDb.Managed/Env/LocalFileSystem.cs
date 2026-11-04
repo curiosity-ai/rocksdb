@@ -1022,7 +1022,7 @@ internal sealed class LocalWritableFile : IWritableFile
     // preallocated past EOF.
     private void TruncateOnClose()
     {
-        if (_alignment != 0 || _preallocatedEnd > Size)
+        if (_alignment != 0 || _preallocatedEnd > Size || _options.TruncateToSizeOnClose)
         {
             try
             {

@@ -106,6 +106,14 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     public ulong MaxLogFileSize { get; set; }
     public ulong LogFileTimeToRoll { get; set; }
     public ulong KeepLogFileNum { get; set; } = 1000;
+    /// <summary>
+    /// recycle_log_file_num: up to this many obsolete WALs are kept and reused (renamed and overwritten in place, no
+    /// truncation) instead of being deleted, and WALs are written in the recyclable record format (the log number in
+    /// every header, so records left from a file's previous use are recognized as its end). Sanitized to 0 at open with
+    /// WAL archival (<see cref="WalTtlSeconds"/> / <see cref="WalSizeLimitMb"/>) and with
+    /// <see cref="WalRecoveryMode.TolerateCorruptedTailRecords"/> or <see cref="WalRecoveryMode.AbsoluteConsistency"/>,
+    /// like SanitizeOptions. With a non-zero value, writes with <see cref="WriteOptions.DisableWal"/> are rejected.
+    /// </summary>
     public ulong RecycleLogFileNum { get; set; }
     public ulong MaxManifestFileSize { get; set; } = 1024UL * 1024 * 1024;
     public int TableCacheNumShardBits { get; set; } = 6;

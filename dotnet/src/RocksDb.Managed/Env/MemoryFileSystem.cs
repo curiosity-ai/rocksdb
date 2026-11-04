@@ -70,7 +70,7 @@ public sealed class MemoryFileSystem : IFileSystem
                 f = new MemFile();
                 _files[p] = f;
             }
-            return new MemWritableFile(this, f, 0);
+            return new MemWritableFile(this, f, 0, options.TruncateToSizeOnClose);
         }
     }
 
@@ -86,7 +86,7 @@ public sealed class MemoryFileSystem : IFileSystem
                 f = new MemFile();
                 _files[p] = f;
             }
-            return new MemWritableFile(this, f, f.Length);
+            return new MemWritableFile(this, f, f.Length, options.TruncateToSizeOnClose);
         }
     }
 
@@ -372,6 +372,18 @@ public sealed class MemoryFileSystem : IFileSystem
             }
         }
 
+        /// <summary>ftruncate(length) when the file is longer (the cut is durable, like the data it removes).</summary>
+        public void Truncate(long length)
+        {
+            lock (Lock)
+            {
+                if (length >= _length) return;
+                _length = length;
+                if (_synced > length) _synced = length;
+                LastModified = DateTimeOffset.UtcNow;
+            }
+        }
+
         public void MarkSynced()
         {
             lock (Lock) _synced = _length;
@@ -396,7 +408,7 @@ public sealed class MemoryFileSystem : IFileSystem
         }
     }
 
-    private sealed class MemWritableFile(MemoryFileSystem fs, MemFile file, long position) : IWritableFile
+    private sealed class MemWritableFile(MemoryFileSystem fs, MemFile file, long position, bool truncateOnClose) : IWritableFile
     {
         private long _position = position;
         private bool _disposed;
@@ -462,11 +474,17 @@ public sealed class MemoryFileSystem : IFileSystem
             }
         }
 
-        public void Dispose() => _disposed = true;
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            // PosixWritableFile::Close: ftruncate to the written size (no-op once the file system is "dead").
+            if (truncateOnClose && fs.IsFilesystemActive) file.Truncate(_position);
+        }
 
         public ValueTask DisposeAsync()
         {
-            _disposed = true;
+            Dispose();
             return ValueTask.CompletedTask;
         }
     }

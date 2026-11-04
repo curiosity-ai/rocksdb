@@ -19,7 +19,9 @@ internal sealed partial class DbImpl
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(columnFamilies);
         string dbname = path.Length > 1 ? path.TrimEnd('/') : path;
-        var db = new DbImpl(dbname, options.Clone());
+        DbOptions sanitized = options.Clone();
+        SanitizeWalOptions(sanitized);
+        var db = new DbImpl(dbname, sanitized);
         try
         {
             await db.OpenCoreAsync(columnFamilies, synchronous, cancellationToken).ConfigureAwait(false);
@@ -30,6 +32,22 @@ internal sealed partial class DbImpl
         {
             db.AbortOpen();
             throw;
+        }
+    }
+
+    /// <summary>
+    /// The WAL part of SanitizeOptions (db/db_impl/db_impl_open.cc), in place: WAL archival (WAL_ttl_seconds /
+    /// WAL_size_limit_MB) disables WAL recycling, and so do kTolerateCorruptedTailRecords (it cannot tell the end of the
+    /// new data in a recycled WAL from a real corruption) and kAbsoluteConsistency (upstream: temporarily, because of a
+    /// hole in the recovered data, PR 7252).
+    /// </summary>
+    internal static void SanitizeWalOptions(DbOptions result)
+    {
+        if (result.WalTtlSeconds > 0 || result.WalSizeLimitMb > 0) result.RecycleLogFileNum = 0;
+        if (result.RecycleLogFileNum != 0
+            && result.WalRecoveryMode is WalRecoveryMode.TolerateCorruptedTailRecords or WalRecoveryMode.AbsoluteConsistency)
+        {
+            result.RecycleLogFileNum = 0;
         }
     }
 
@@ -220,10 +238,13 @@ internal sealed partial class DbImpl
         ulong newLogNumber = Versions.NewFileNumber();
         // Like upstream (a TODO there), the first WAL of an open records no predecessor, even when recovered WALs are kept
         // (avoid_flush_during_recovery).
-        _log = CreateWal(newLogNumber, predecessor: null);
+        _log = CreateWal(newLogNumber, predecessor: null, recycleLogNumber: 0);
         _logEmpty = true;
         lock (_mutex)
         {
+            // Prevent WALs created by a previous instance from being recycled: they might be in alive_wal_files_ and
+            // get recycled otherwise (min_wal_number_to_recycle_).
+            _minWalNumberToRecycle = newLogNumber;
             _logNumber = newLogNumber;
             _walTrackingStart = newLogNumber;
             _aliveWals.Add(newLogNumber);
@@ -521,6 +542,13 @@ internal sealed partial class DbImpl
         public bool RecordErrors = true;
         /// <summary>Log number named by the recorded corruption (GetCorruptedLogNumber), or UnspecifiedLogNumber.</summary>
         public ulong CorruptedLogNumber = UnspecifiedLogNumber;
+        /// <summary>
+        /// The reader met a record from a previous use of a recycled WAL (DBOpenLogRecordReadReporter::OldLogRecord,
+        /// reported in point-in-time mode only). Set whatever paranoid_checks says, like upstream's old_log_record.
+        /// </summary>
+        public bool OldLogRecordSeen;
+
+        public override void OldLogRecord(long bytes) => OldLogRecordSeen = true;
 
         public override void Corruption(long bytes, StatusCode code, string reason, ulong logNumber)
         {
@@ -684,18 +712,19 @@ internal sealed partial class DbImpl
             if (reporter.Error is null)
             {
                 UpdatePredecessorWalInfo(walNumber, fname, progress);
-                continue;
+                if (!reporter.OldLogRecordSeen) continue;
             }
-            // HandleNonOkStatusOrOldLogRecord.
-            RocksDbException err = reporter.Error;
+            // HandleNonOkStatusOrOldLogRecord: a non-OK status, or (status OK) the end of the new data of a recycled WAL
+            // found by a record from its previous use.
+            RocksDbException? err = reporter.Error;
             // NotSupported is not a corruption (e.g. a WAL filter returning more records than the original batch).
-            if (err.Code == StatusCode.NotSupported) throw err;
+            if (err is { Code: StatusCode.NotSupported }) throw err;
             switch (mode)
             {
                 case WalRecoveryMode.SkipAnyCorruptedRecords:
                     break; // ignore all errors unconditionally
                 case WalRecoveryMode.PointInTimeRecovery:
-                    if (err.Code == StatusCode.IOError)
+                    if (err is { Code: StatusCode.IOError })
                     {
                         LogError("IOError during point-in-time reading log #" + walNumber + ". " + err.Message +
                             ". This likely mean loss of synced WAL, thus recovery fails.");
@@ -708,7 +737,9 @@ internal sealed partial class DbImpl
                     corruptedWal = reporter.CorruptedLogNumber != LogReporter.UnspecifiedLogNumber ? reporter.CorruptedLogNumber : walNumber;
                     break;
                 default:
-                    throw err;
+                    // The reader reports old records in point-in-time mode only, so err is set here.
+                    if (err is not null) throw err;
+                    break;
             }
         }
         if (progress.StopReplay && mode is WalRecoveryMode.PointInTimeRecovery or WalRecoveryMode.TolerateCorruptedTailRecords)

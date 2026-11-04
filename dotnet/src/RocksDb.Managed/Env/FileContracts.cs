@@ -75,6 +75,18 @@ public interface IFileSystem
     IWritableFile ReopenWritable(string path, WritableFileOptions options) =>
         throw RocksDbException.NotSupported("ReopenWritable is not supported by " + GetType().Name);
 
+    /// <summary>
+    /// FileSystem::ReuseWritableFile: renames <paramref name="oldPath"/> to <paramref name="path"/> and opens it for
+    /// writing from offset 0 without truncating it, so the old contents past the new writes stay in place until the file
+    /// is closed (WAL recycling, recycle_log_file_num). The default renames and then opens with <c>truncate: false</c> and
+    /// <see cref="WritableFileOptions.TruncateToSizeOnClose"/>.
+    /// </summary>
+    IWritableFile ReuseWritable(string path, string oldPath, WritableFileOptions options)
+    {
+        RenameFile(oldPath, path);
+        return CreateWritable(path, truncate: false, options.WithTruncateToSizeOnClose());
+    }
+
     /// <summary>Opens a random-access file with explicit options (e.g. direct I/O).</summary>
     IRandomAccessFile OpenRandomAccess(string path, RandomAccessFileOptions options) => OpenRandomAccess(path);
 

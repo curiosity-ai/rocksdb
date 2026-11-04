@@ -230,7 +230,8 @@ internal sealed partial class DbImpl
             WalFileInfo w = liveWalFiles[i];
             if (w.Type == WalFileType.AliveLogFile && (!flushMemtable || w.LogNumber >= minLogNum) && w.LogNumber <= maxLogNum)
             {
-                bool trim = i + 1 == liveWalFiles.Count;
+                // Recyclable WAL files must be copied instead of hard linked (their whole size, stale tail included).
+                bool trim = Options.RecycleLogFileNum > 0 || i + 1 == liveWalFiles.Count;
                 results.Add(new LiveFileStorageInfo(WalDir, FileNames.LogFileName(w.LogNumber), w.LogNumber, FileType.WalFile, w.SizeBytes, trim, null));
             }
         }
