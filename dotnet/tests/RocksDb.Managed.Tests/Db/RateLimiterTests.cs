@@ -114,13 +114,17 @@ public sealed class RateLimiterTests
     public async Task StatisticsAreRecorded()
     {
         var stats = new Statistics();
-        // 100 KB/s with 10 ms refills: 1000 bytes per refill.
-        using var l = new GenericRateLimiter(100_000, 10_000, 10, RateLimiterMode.AllIo, autoTuned: false, 0);
+        // 100 KB/s with 10 ms refills: 1000 bytes per refill. On a manual clock (util/rate_limiter_test.cc uses a mock
+        // clock), so a refill happens only when the test advances the clock. On the real clock, a pause of one refill
+        // period between two requests gave the later request a fresh refill at once, so it was not counted as delayed.
+        // On a busy machine, the thread woken by a refill often took longer than 10 ms to issue the next request.
+        var clock = new ManualClock();
+        using var l = new GenericRateLimiter(100_000, 10_000, 10, RateLimiterMode.AllIo, autoTuned: false, 0, clock.NowMicros);
         long burst = l.SingleBurstBytes;
-        l.Request(burst, IoPriority.Low, stats, RateLimiterOpType.Write); // drains the bucket
-        l.Request(burst, IoPriority.Low, stats, RateLimiterOpType.Write); // waits for a refill
-        await l.RequestAsync(burst, IoPriority.User, stats, RateLimiterOpType.Read, CancellationToken.None);
-        l.Request(burst, IoPriority.Low, null, RateLimiterOpType.Write); // no statistics passed
+        l.Request(burst, IoPriority.Low, stats, RateLimiterOpType.Write); // the first refill is due at once: granted
+        await WaitsForOneRefill(l.RequestAsync(burst, IoPriority.Low, stats, RateLimiterOpType.Write, CancellationToken.None), clock);
+        await WaitsForOneRefill(l.RequestAsync(burst, IoPriority.User, stats, RateLimiterOpType.Read, CancellationToken.None), clock);
+        await WaitsForOneRefill(l.RequestAsync(burst, IoPriority.Low, null, RateLimiterOpType.Write, CancellationToken.None), clock); // no statistics
         Assert.AreEqual(2UL, stats.GetTickerCount(Ticker.RateLimiterRequestsWrite));
         Assert.AreEqual(2UL * (ulong)burst, stats.GetTickerCount(Ticker.RateLimiterBytesWrite));
         Assert.AreEqual(1UL, stats.GetTickerCount(Ticker.RateLimiterRequestsRead));
@@ -131,6 +135,33 @@ public sealed class RateLimiterTests
         Assert.AreEqual(1UL, stats.GetHistogramData(Histogram.RateLimiterWaitMicrosWrite).Count);
         Assert.AreEqual(1UL, stats.GetHistogramData(Histogram.RateLimiterWaitMicrosRead).Count);
         Assert.AreEqual(stats.GetHistogramData(Histogram.RateLimiterWaitMicrosWrite).Sum, stats.GetTickerCount(Ticker.RateLimiterTotalWaitMicrosWrite));
+        // Each delayed request waited exactly one refill period of the manual clock.
+        Assert.AreEqual(10_000UL, stats.GetTickerCount(Ticker.RateLimiterTotalWaitMicrosWrite));
+        Assert.AreEqual(10_000UL, stats.GetTickerCount(Ticker.RateLimiterTotalWaitMicrosRead));
+        Assert.AreEqual(10_000UL, stats.GetHistogramData(Histogram.RateLimiterWaitMicrosRead).Sum);
+    }
+
+    /// <summary>A microsecond clock that moves only when the test advances it.</summary>
+    private sealed class ManualClock
+    {
+        private long _micros;
+
+        public long NowMicros() => Volatile.Read(ref _micros);
+
+        public void Advance(long micros) => Interlocked.Add(ref _micros, micros);
+    }
+
+    /// <summary>
+    /// The request must wait while the clock stands still, and be granted by the refill once the clock reaches the next
+    /// refill time (one 10 ms period later).
+    /// </summary>
+    private static async Task WaitsForOneRefill(ValueTask request, ManualClock clock)
+    {
+        Task t = request.AsTask();
+        await Task.Delay(30); // the refill timer fires on real time and finds the clock unchanged
+        Assert.IsFalse(t.IsCompleted, "granted before the next refill");
+        clock.Advance(10_000);
+        await t.WaitAsync(TimeSpan.FromSeconds(30));
     }
 
     /// <summary>

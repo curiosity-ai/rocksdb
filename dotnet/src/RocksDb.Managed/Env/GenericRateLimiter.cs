@@ -72,6 +72,7 @@ public sealed class GenericRateLimiter : IRateLimiter, IDisposable
     private readonly long[] _totalBytesThrough = new long[(int)IoPriority.Total];
     private readonly Random _random = new((int)(DateTime.UtcNow.Ticks & int.MaxValue));
     private readonly Timer _timer;
+    private readonly Func<long>? _clock;
     private long _rateBytesPerSecond;
     private long _refillBytesPerPeriod;
     private long _rawSingleBurstBytes;
@@ -90,7 +91,19 @@ public sealed class GenericRateLimiter : IRateLimiter, IDisposable
     /// <param name="autoTuned">Adapt the rate to the demand.</param>
     /// <param name="singleBurstBytes">Largest single grant; 0 = the refill amount.</param>
     public GenericRateLimiter(long bytesPerSecond, long refillPeriodMicros, int fairness, RateLimiterMode mode, bool autoTuned, long singleBurstBytes)
+        : this(bytesPerSecond, refillPeriodMicros, fairness, mode, autoTuned, singleBurstBytes, clockMicros: null)
     {
+    }
+
+    /// <summary>
+    /// The public constructor with a time source in microseconds (upstream's <c>clock</c> argument, which
+    /// util/rate_limiter_test.cc sets to a mock clock). Null means the monotonic <see cref="Stopwatch"/> clock. The
+    /// refill timer still runs on real time. When it fires before the clock reaches the next refill, it waits again.
+    /// </summary>
+    internal GenericRateLimiter(long bytesPerSecond, long refillPeriodMicros, int fairness, RateLimiterMode mode, bool autoTuned, long singleBurstBytes,
+        Func<long>? clockMicros)
+    {
+        _clock = clockMicros;
         if (bytesPerSecond <= 0) throw new ArgumentOutOfRangeException(nameof(bytesPerSecond));
         if (refillPeriodMicros <= 0) throw new ArgumentOutOfRangeException(nameof(refillPeriodMicros));
         if (fairness <= 0) throw new ArgumentOutOfRangeException(nameof(fairness));
@@ -397,7 +410,7 @@ public sealed class GenericRateLimiter : IRateLimiter, IDisposable
         _numDrains = 0;
     }
 
-    private static long NowMicros() => Stopwatch.GetTimestamp() / (Stopwatch.Frequency / 1_000_000);
+    private long NowMicros() => _clock is null ? Stopwatch.GetTimestamp() / (Stopwatch.Frequency / 1_000_000) : _clock();
 
     /// <summary>~GenericRateLimiter: releases all waiting requests (they return without being charged).</summary>
     public void Dispose()
