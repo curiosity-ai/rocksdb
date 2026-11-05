@@ -266,9 +266,9 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 
 - [x] PlainTable + CuckooTable (read/write, byte-identical regions vs native SstFileWriter, OPTIONS sections), adaptive reading by magic, user-defined index API
 - [x] trie_index user-defined index (byte-identical trie blocks vs native 11.12, each side reads the other's through the trie, 0-alloc Gets); ingestion opens any table format and applies upstream's checks (plain/cuckoo files are rejected by the comparator/version checks, exactly as native rejects its own)
-- [ ] OPTIONS `user_defined_index_factory=trie_index` interpreted into a factory (kept as text today) (S)
+- [~] OPTIONS `user_defined_index_factory=trie_index` interpreted into a factory (kept as text today) (S)
 - [x] Cache layers: SecondaryCache + adapter, CompressedSecondaryCache, TieredCache, persistent cache (volatile + file tier), WriteBufferManager (shared across DBs, cache charging, stalls; behaves like native's in compat tests), SimCache, CacheReservationManager; block-cache lookups unchanged when unused
-- [ ] cache layers: batched MultiGet secondary lookups, compressed admission to non-volatile tiers, async persistent-cache reads (S each)
+- [~] cache layers: batched MultiGet secondary lookups, compressed admission to non-volatile tiers, async persistent-cache reads (S each)
 - [x] Column family export/import, remote compaction (CompactionService + OpenAndCompact; job/result format interoperates with native both ways), GetMergeOperands, PromoteL0, SuggestCompactRange, DeleteFilesInRange(s), LockWAL, Disable/EnableManualCompaction, GetCreationTimeOfOldestFile, ClipColumnFamily, GetPropertiesOfTablesInRange, OpenAndTrimHistory (compat vs native), MultiScan
 - [-] remote compaction leftovers (per-subcompaction jobs, blob compactions on the worker, paranoid_hash): out of scope (user decision)
 - [x] Query tracing + Replayer, block cache and IO tracing (trace files interoperate with native both ways), RepairDB (compat both ways), tools/RocksDb.Managed.Tools with ldb and sst_dump commands
@@ -283,7 +283,7 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [x] WalFilter (recovery replay rewritten as a port of ProcessLogFiles), track_and_verify_wals predecessor-WAL records written + verified (byte-identical with native both ways), UserWriteCallback; WAL recovery now follows upstream for paranoid_checks=false and point-in-time stops
 - [x] WAL recycling at DB level (recycle list, in-place reuse, recyclable records, option rules; native recovers managed recycled WALs and vice versa)
 - [x] WAL settings x failure-mode matrices: unit 300 scenarios (15 factors pairwise x 15 faults; long 6,299), compat 1,152 managed-vs-native scenarios (long 36,864); 7 managed/native disagreements found and fixed (corruption messages, seqno-set-backwards check, 2PC WAL retention, 2PC after point-in-time stop, blob direct-write crash images, reused-WAL stale tail)
-- [ ] GetAllKeyVersions (utilities/debug.h), OptionChangeMigration, MemoryUtil::GetApproximateMemoryUsageByType, InfoLogFinder (S each)
-- [ ] Cache dump / load (cache_dump_load.h) (M)
-- [ ] TransactionDBMutexFactory (custom transaction mutexes) (S)
-- [ ] EnvMirror (test utility) (S); StackableDB has no C# equivalent (transactions / TTL are built in)
+- [~] GetAllKeyVersions (utilities/debug.h), OptionChangeMigration, MemoryUtil::GetApproximateMemoryUsageByType, InfoLogFinder (S each)
+- [~] Cache dump / load (cache_dump_load.h) (M)
+- [~] TransactionDBMutexFactory (custom transaction mutexes) (S)
+- [~] EnvMirror (test utility) (S); StackableDB has no C# equivalent (transactions / TTL are built in)
