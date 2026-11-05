@@ -258,7 +258,8 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [x] 4-thread 100 B readmissing / fillrandom rechecked (7-rep interleaved A/B): noise, no regression; flush allocations: table-builder buffers pooled (TableBuilderBuffers), no longer bimodal
 - [x] table readers pin index/filter blocks from the table buffer pool (flush 171 KB -> 40 KB); `BlobReadersBoundedByMaxOpenFiles` failure root-caused: bounded table cache sorted readers by a LastUse field mutated concurrently (List.Sort 'inconsistent comparer'), now sorts a snapshot
 - [x] WAL write-error recovery with recycling on (deliberate deviation, user-accepted): 13 unit + 4 native-comparison tests incl. crash sweeps; fixed GetUpdatesSince returning the failed write (recovery-gap fence), tailing iterator missing records of a reused WAL, SstFileManager/flush deadlock
-- [ ] secondary instance catching up on a reused (recycled) WAL may miss records (reader not repositioned, as fixed for tailing iterators) (S); `RateLimiterTests.StatisticsAreRecorded` failed once in a full run (S)
+- [x] tailing reused WALs (secondary catch-up, GetUpdatesSince, replication): fixed three reader bugs copied from upstream's FragmentBufferedReader (spin on old record, bad-length block skip, buffer dropped at bad checksum); managed secondary follows a live recycling native primary (native's own secondary hangs there); RateLimiter statistics test made deterministic with a manual clock
+- [ ] note: a replication tailer that falls a whole recycle cycle behind gets NotFound 'Gap in sequence numbers' and must resync (recycling keeps no WALs for tailers, as upstream) (by design); `BlockCacheTierInsertLookupAcrossFilesAndEviction(False)` failed once under CPU hogs (S)
 - Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)
 
 ## Missing features wave (2026-11-03, requested)
