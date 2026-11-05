@@ -56,7 +56,7 @@ test vectors added by this audit:
 | `Wal/LogFormat.cs` | `db/log_format.h` | verified (record types 0..11, 130, 131; header sizes 7/11; safe-ignore mask) |
 | `Wal/LogWriter.cs` | `db/log_writer.{h,cc}` | verified. The fragmentation loop, the trailer, the legacy vs recyclable header choice (SetCompressionType always uses the legacy header) and the metadata records with MaybeSwitchToNewBlock all match. |
 | `Wal/LogReader.cs` | `db/log_reader.{h,cc}` (Reader) | verified. ReadPhysicalRecord, the per-recovery-mode corruption reporting, recycled-log handling, the uncompress loop, UnmarkEOF and predecessor-WAL verification all match. Upstream `log_test.cc` was already ported (47 tests). **Not ported:** XXH3 `record_checksum` output. |
-| `Wal/FragmentBufferedLogReader.cs` | `db/log_reader.cc` (FragmentBufferedReader) | verified (record-type switch and recycled-log handling) |
+| `Wal/FragmentBufferedLogReader.cs` | `db/log_reader.cc` (FragmentBufferedReader) | verified (record-type switch and recycled-log handling); managed deviations for tailing reused WALs, see "Tailing reused WALs" |
 | `Wal/WalMetadataRecords.cs` | `util/compression.h` (CompressionTypeRecord), `util/udt_util.h`, `db/dbformat.h` (PredecessorWALInfo) | verified |
 | `Wal/WalStreamingCompression.cs` | `util/compression.cc` (ZSTDStreamingCompress/Uncompress) | verified (`ZSTD_e_end` with the checksum flag on; same output loop condition) |
 
@@ -937,3 +937,89 @@ Bugs these tests found (fixed):
 | GetUpdatesSince returned the failed batch after a successful recovery when the failed WAL could still be read (file deletions disabled, an iterator already reading it, or the window between publishing the reserved sequence and deleting the WAL). Its sequence is published, and the next batch continues the run. A WalTailer replica would apply a write the primary does not have. | `WalRecoverySequenceTracker`, `WalIteratorImpl::StopBeforeRecoveryGap` (`db/wal_iterator_impl.cc`), `WALIOStatusCheck` -> `RecordIndeterminateWriteSequence` | **Ported.** `Db/WalRecoverySequenceTracker.cs`. The failed range of every failed WAL write group is recorded in the main and the two_write_queues paths. Upstream records only file-scoped errors, but the port recovers every WAL error. An iterator that reaches the range ends its run with NotFound "Gap in sequence numbers after indeterminate WAL write through sequence N". A tailer then restarts after N or rebuilds. `WalErrorRecyclingTests.FailedWalKeptByDisabledDeletionsIsFencedAndNeverRecycled` fails without the fence. |
 | A tailing GetUpdatesSince iterator stopped seeing new records in a reused WAL. The reader had buffered the previous use's stale records past the live end, or dropped them on a checksum mismatch, and the writer then overwrote them in place. The iterator later failed with a sequence gap. | `FragmentBufferedReader` (same behaviour upstream) | **Managed fix.** In a recycled log, a read that returns no record remembers the end of the last complete record. `TransactionLogIterator` reopens the WAL there when the DB has published newer sequences (`FragmentBufferedLogReader.AtStaleTail` / `Reposition`). Logs that are not recycled are unaffected. `WalRecyclingTests.TailingIteratorFollowsReusedWal` |
 | Deadlock between the SstFileManager's out-of-space recovery and a flush or compaction. `ClearErrorAsync` read the DB's background error, which takes the DB mutex, while it held the manager's lock. `VersionSet.InstallEdit` calls `SstFileManager.OnAddFile`, which takes the manager's lock, while it holds the DB mutex. | `SstFileManagerImpl::ClearError` | The error is read before the lock is taken. `WalErrorRecyclingTests.RecoveryWithRecyclingNeverReusesTheFailedWal(NoSpace)` hung without the fix. |
+
+### Tailing reused WALs: secondaries and replication (deliberate deviation)
+
+C++ reference: `DBImplSecondary::RecoverLogFiles` / `MaybeInitLogReader` (`db/db_impl/db_impl_secondary.cc`) and
+`log::FragmentBufferedReader::ReadRecord` / `TryReadFragment` / `TryReadMore` (`db/log_reader.cc`), `main` (11.14).
+The same code ships in the native 11.12 package.
+
+A reused WAL keeps its old size, and the primary overwrites it in place. A reader that tails it, such as a secondary
+catching up, a GetUpdatesSince iterator or a WalTailer, reads the new records and then bytes of the file's previous use.
+The writer later overwrites those bytes. Upstream's tailing reader mishandles them in three ways:
+
+- **Old record.** When the live end is the header of a record of the previous use, `TryReadFragment` returns
+  kOldRecord without consuming the record. `ReadRecord` treats kOldRecord like kEof and loops, so it gets the same
+  record again forever. `DBImplSecondary::RecoverLogFiles` holds the DB mutex while this happens. So OpenAsSecondary
+  or TryCatchUpWithPrimary never returns. The non-tailing `log::Reader` consumes the record and treats it as EOF.
+- **Bad length.** A stale header whose length runs past the block makes `TryReadFragment` read the next block. The rest
+  of the current block is skipped. The writer then fills that rest with records the reader never returns. A
+  stale zero header does the same (kBadRecord clears the buffer).
+- **Bad checksum.** A recycled log ends at the first bad checksum, and the buffer is dropped. The next read starts at
+  the next block.
+
+The port keeps the record formats. The tailing reader (`Wal/FragmentBufferedLogReader.cs`) never consumes or skips
+bytes of a recycled log that it has not validated:
+
+- An old record, a bad checksum, a header whose record does not fit in the rest of the buffered block, and a zero
+  header end the read without consuming anything (`StaleData`). Block trailers are still skipped: they are shorter than
+  a recyclable header, and an incomplete record at the end of the file still waits for the writer.
+- The reader stays stopped (`AtStaleTail`) until `Reposition`. Reposition opens the WAL again and continues from the
+  end of the last complete record, or from the First fragment of an unfinished record.
+- `TransactionLogIterator` repositions when the DB has published newer sequences. Since the earlier fix, the replication
+  layer's `WalTailer` uses this. The secondary repositions each stale reader at the start of every catch-up
+  (`DbImpl.ReadOnly.cs`, `TryRepositionSecondaryWalReader`).
+
+Logs that are not recycled are read as before.
+
+Evidence:
+
+- Unit (`tests/RocksDb.Managed.Tests`):
+  - `Db/ReplicationTests.FragmentBufferedReaderNeverSkipsStaleBytesOfARecycledLog`. Over 100 seeds, a recycled log is
+    overwritten in place while the reader holds buffered stale bytes. Some seeds use same-size records. Every record
+    is read, in order. Without the bad-length check, some seeds lose records.
+  - `Db/WalRecyclingTests.SecondaryCatchUpFollowsReusedWal(sameSizeRecords)`. A secondary catches up every 13 writes and
+    after each rotation into a reused WAL. Before the fix, the same-size variant hung on the old record. With only the
+    old-record fix, the secondary missed records and its sequence fell behind.
+  - `Db/WalRecyclingTests.TailingIteratorFollowsReusedWalAtOldRecordHeader`. Before the fix, the iterator hung.
+- Replication (`tests/RocksDb.Managed.Replication.Tests`): `ReplicationTests.StreamingFromRecyclingSourceKeepsReplicaIdentical`,
+  on the local file system and on MemoryFileSystem. A recycling source streams to a replica, first in the middle of
+  reused WALs, then with three concurrent writers and rotations. The replica has the same latest sequence, contents
+  and digest. Before the bad-length fix, the stream failed with "Gap in sequence numbers" in most runs: the tailer had
+  skipped the rest of a block that the writer filled after the tailer buffered it.
+- **Limit, not a bug.** Recycling keeps no WAL for tailers, and WAL_ttl_seconds / WAL_size_limit_MB turn recycling
+  off. A tailer that falls a whole recycle cycle behind is reading a WAL that the primary renames and overwrites. The
+  rest of that WAL's records are gone. The iterator returns only the genuine records it still had buffered, then ends
+  with NotFound "Gap in sequence numbers", so a WalTailer replica resyncs.
+  `WalRecyclingTests.TailingIteratorGetsNotFoundWhenItsWalIsReused` covers this. Under 8 CPU hogs, the replication test
+  above hit this in 3 of 20 runs. The test now waits for the tailer before each rotation, while the other writers keep
+  writing.
+- Compat (`tests/RocksDb.Managed.CompatTests`): `Api/SecondaryCompatTests.ManagedSecondaryTailsRecyclingNativePrimary`.
+  A managed secondary follows a native 11.12 primary with recycle_log_file_num = 2. The data rows use random-size and
+  same-size records, and the secondary catches up in the middle of reused WALs.
+- Round trip (`tests/RocksDb.Managed.RoundTrip`): `SecondaryRecyclingRoundTripTests.NativeSecondaryOnRecyclingPrimary`.
+  The primary is managed or native. The native secondary runs in a child process. While the primary is live and its
+  reused WAL ends at an old record, the native OpenAsSecondary never returns for either primary. A native stack
+  showed the thread spinning in `FragmentBufferedReader::TryReadFragment` under `ReadRecord`, `RecoverLogFiles` and
+  `OpenAsSecondaryImpl`. Once the primary is closed, its reused WAL is cut to its written size. The native secondary
+  then reads every record either engine wrote.
+
+Each of these tests passed 20 runs in a row under 8 CPU hogs (net10.0).
+
+So a native secondary cannot follow a live primary with recycle_log_file_num > 0, whichever engine is the primary. A
+managed secondary can follow either.
+
+### GenericRateLimiter statistics test: timing assumption, not a race
+
+`RateLimiterTests.StatisticsAreRecorded` failed once in a full net10.0 run. Under 12 CPU hogs plus allocating threads,
+the old test body failed in about 22% of 300 iterations. Each time, the third request was not counted as delayed
+(RATE_LIMITER_DELAYED_REQUESTS_READ was 0). The refill timer granted the second request and woke the test thread. That
+thread took longer than the 10 ms refill period to issue the third request. The request then found a refill due and
+was granted at once, which is correct (upstream `RequestImpl` refills on the request path in the same way). The
+statistics are recorded under the limiter's lock before the grant is signalled, so no statistic was lost or raced.
+
+Fix (test only, plus a seam): `GenericRateLimiter` has an internal constructor that takes a microsecond clock, like the
+`clock` argument of upstream's constructor that `util/rate_limiter_test.cc` sets to a mock clock. The test advances a
+manual clock. It checks that each later request waits while the clock stands still and is granted by the refill
+after one period. The test is stricter now: it asserts exact wait totals (10000 us per delayed request) and the read
+histogram sum. Results: 300 iterations under 12 hogs with allocation load, all passed.

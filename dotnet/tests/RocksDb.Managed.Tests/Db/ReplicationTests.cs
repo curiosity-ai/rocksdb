@@ -209,4 +209,82 @@ public sealed class ReplicationTests
         Assert.AreEqual(records.Count, got.Count);
         for (int i = 0; i < records.Count; i++) CollectionAssert.AreEqual(records[i], got[i], "record " + i);
     }
+
+    /// <summary>Writes <paramref name="count"/> random records (sizes 1..<paramref name="maxSize"/>) as one recycled-format log.</summary>
+    private static byte[] RecycledLogBytes(MemoryFileSystem fs, string path, ulong logNumber, Random rnd, int count, int maxSize,
+        List<byte[]>? records)
+    {
+        using (var log = new LogWriter(fs.CreateWritable(path), logNumber, recycleLogFiles: true))
+        {
+            for (int i = 0; i < count; i++)
+            {
+                byte[] r = new byte[rnd.Next(1, maxSize)];
+                rnd.NextBytes(r);
+                records?.Add(r);
+                log.AddRecord(r);
+            }
+        }
+        return fs.ReadAllBytes(path);
+    }
+
+    /// <summary>
+    /// Reads up to <paramref name="max"/> records, re-reading the file from the stale tail when the reader stops there
+    /// (what TransactionLogIterator and the secondary catch-up do).
+    /// </summary>
+    private static void ReadRecycled(MemoryFileSystem fs, string path, FragmentBufferedLogReader reader, List<byte[]> got, int max)
+    {
+        bool repositioned = false;
+        while (got.Count < max || max < 0)
+        {
+            if (reader.TryReadRecord(out ReadOnlySpan<byte> rec))
+            {
+                got.Add(rec.ToArray());
+                repositioned = false;
+                continue;
+            }
+            if (!reader.AtStaleTail || repositioned) return;
+            reader.Reposition(fs.OpenSequential(path));
+            repositioned = true;
+        }
+    }
+
+    /// <summary>
+    /// A tailing reader of a recycled log, whose writer overwrites the previous use in place while the reader holds
+    /// buffered stale bytes. The reader must never consume bytes it has not validated: a stale header whose length runs
+    /// past the block used to make it skip to the next block (upstream FragmentBufferedReader does the same), losing the
+    /// records the writer then wrote over the skipped bytes; an old record header used to make it spin.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000)]
+    public void FragmentBufferedReaderNeverSkipsStaleBytesOfARecycledLog()
+    {
+        for (int seed = 1; seed <= 100; seed++)
+        {
+            var fs = new MemoryFileSystem();
+            fs.CreateDirectoryIfMissing("/w");
+            var rnd = new Random(seed);
+            // Same-size records (an old record header right at the live end) for some seeds, random sizes otherwise.
+            int maxSize = seed % 4 == 0 ? 2 : 400;
+            byte[] old = RecycledLogBytes(fs, "/w/old.log", 5, rnd, maxSize == 2 ? 3000 : 600, maxSize, null);
+            var records = new List<byte[]>();
+            byte[] fresh = RecycledLogBytes(fs, "/w/fresh.log", 6, rnd, maxSize == 2 ? 2500 : 500, maxSize, records);
+            using (IWritableFile w = fs.CreateWritable("/w/r.log")) w.Append(old);
+            IWritableFile overwrite = fs.CreateWritable("/w/r.log", truncate: false);
+            using var reader = new FragmentBufferedLogReader(fs.OpenSequential("/w/r.log"), null, checksum: true, 6);
+            var got = new List<byte[]>();
+            for (int pos = 0; pos < fresh.Length;)
+            {
+                int n = Math.Min(fresh.Length - pos, rnd.Next(1, 3000));
+                overwrite.Append(fresh.AsSpan(pos, n));
+                overwrite.Flush();
+                pos += n;
+                // Read only a few records, so the reader keeps buffered bytes that the next append overwrites.
+                ReadRecycled(fs, "/w/r.log", reader, got, got.Count + rnd.Next(0, 4));
+            }
+            overwrite.Dispose();
+            ReadRecycled(fs, "/w/r.log", reader, got, -1);
+            Assert.AreEqual(records.Count, got.Count, "seed " + seed);
+            for (int i = 0; i < records.Count; i++) CollectionAssert.AreEqual(records[i], got[i], "seed " + seed + " record " + i);
+        }
+    }
 }

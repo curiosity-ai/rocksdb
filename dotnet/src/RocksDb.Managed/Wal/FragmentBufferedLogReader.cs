@@ -17,6 +17,13 @@ namespace RocksDb.Managed.Wal;
 /// "end of log"; the reader re-polls the file on every call (TryReadMore + UnmarkEOF).
 /// </para>
 /// <para>
+/// Recycled logs (managed fixes): the writer overwrites the previous use of the file in place, so the bytes after the
+/// live end are stale and may change under the reader. The reader stops at them without consuming them (an old record,
+/// a bad checksum, a header that cannot be a record) and stays stopped until <see cref="Reposition"/> (see
+/// <see cref="AtStaleTail"/>). Upstream's reader spins on an old record and skips to the next block on a bad length.
+/// Used by the transaction log iterator and the secondary's WAL catch-up (DBImplSecondary::RecoverLogFiles).
+/// </para>
+/// <para>
 /// Owns a pooled 32KiB block buffer and a pooled fragment buffer; steady-state reads do not allocate. The returned
 /// record is valid until the next read call. Not thread-safe.
 /// </para>
@@ -30,6 +37,11 @@ public sealed class FragmentBufferedLogReader : IDisposable
     private const int OldRecord = LogFormat.MaxRecordType + 4;
     private const int BadRecordLen = LogFormat.MaxRecordType + 5;
     private const int BadRecordChecksum = LogFormat.MaxRecordType + 6;
+    // Managed: in a recycled log, a header that does not describe a complete physical record inside the rest of the
+    // buffered block (a length past the block, or an all-zero header). Upstream skips the rest of the block (it reads the
+    // next one), but in a reused WAL these are bytes of the previous use that the writer is about to overwrite with
+    // records the skip would lose.
+    private const int StaleData = LogFormat.MaxRecordType + 7;
 
     // Results of the I/O-free part of TryReadFragment.
     private const int FragmentReady = 0;
@@ -101,7 +113,9 @@ public sealed class FragmentBufferedLogReader : IDisposable
     /// record of the file's previous use, a checksum mismatch, or a partial record). A recycled WAL is overwritten in
     /// place, so those bytes can be replaced by new records while the reader tails it, but the reader has already
     /// buffered (or dropped) them. <see cref="Reposition"/> re-reads the file from <see cref="StaleResumeOffset"/>.
-    /// Never set for a log that is not recycled.
+    /// The state is sticky: reads return no record until <see cref="Reposition"/>, so the reader never consumes buffered
+    /// bytes that may have been overwritten since. In a recycled log the reader also never skips bytes it has not
+    /// validated (a stale header is not treated as a block trailer). Never set for a log that is not recycled.
     /// </summary>
     public bool AtStaleTail => _staleResumeOffset >= 0;
 
@@ -166,6 +180,12 @@ public sealed class FragmentBufferedLogReader : IDisposable
     {
         int r;
         StartRecord(out long physicalRecordOffset);
+        if (_staleResumeOffset >= 0)
+        {
+            // Stopped at a stale tail: the buffered bytes after it may be overwritten by now (see AtStaleTail).
+            record = default;
+            return false;
+        }
         while (true)
         {
             r = TryReadFragmentCore();
@@ -198,6 +218,7 @@ public sealed class FragmentBufferedLogReader : IDisposable
     public async ValueTask<bool> ReadRecordAsync(CancellationToken cancellationToken = default)
     {
         StartRecord(out long physicalRecordOffset);
+        if (_staleResumeOffset >= 0) return false; // see TryReadRecord
         while (true)
         {
             int r = TryReadFragmentCore();
@@ -221,8 +242,7 @@ public sealed class FragmentBufferedLogReader : IDisposable
         _recordArray = [];
         _recordOffset = _recordLength = 0;
         _uncompress?.Reset();
-        _staleResumeOffset = -1;
-        physicalRecordOffset = _endOfBufferOffset - _bufLen;
+        physicalRecordOffset = _endOfBufferOffset - _bufLen + _pendingDiscard;
     }
 
     // ---- ReadRecord switch ------------------------------------------------------------------------------------
@@ -331,10 +351,20 @@ public sealed class FragmentBufferedLogReader : IDisposable
                 }
                 return false;
 
+            case StaleData:
+            case OldRecord:
+                // A record of the file's previous use: the end of the new data. upstream's FragmentBufferedReader leaves
+                // the record in the buffer and loops on it forever (TryReadFragment returns kOldRecord again without
+                // consuming it); log::Reader treats it as EOF (kOldRecord outside kSkipAnyCorruptedRecords). Managed fix:
+                // stop here without consuming it, like the bad checksum of a recycled log below. A First fragment read
+                // before it is not an error: the writer has not written the rest yet. The caller can re-read the file
+                // from the stale tail once the writer overwrote it (AtStaleTail / Reposition).
+                _stopRead = true;
+                return false;
+
             case BadHeader:
             case BadRecord:
             case Eof:
-            case OldRecord:
                 if (_inFragmentedRecord)
                 {
                     ReportCorruption(_fragments.WrittenCount, "error in middle of record");
@@ -416,6 +446,12 @@ public sealed class FragmentBufferedLogReader : IDisposable
                 return FragmentReady;
             }
         }
+        if (_recycled && IsStaleHeader(headerSize + length > _bufLen, type == (byte)LogRecordType.Zero && length == 0))
+        {
+            // Managed fix: nothing here was validated, and the writer may overwrite it (see StaleData).
+            SetError(StaleData);
+            return FragmentReady;
+        }
         if (headerSize + length > _bufLen) return NeedMore;
 
         if (type == (byte)LogRecordType.Zero && length == 0)
@@ -464,6 +500,18 @@ public sealed class FragmentBufferedLogReader : IDisposable
         _fragLength = seg.Count;
         _fragType = type;
         return FragmentReady;
+    }
+
+    /// <summary>
+    /// For a recycled log: whether a header that <paramref name="doesNotFit"/> the buffered bytes, or is a
+    /// <paramref name="zeroHeader"/>, is stale data rather than a block trailer. Past the end of the file
+    /// (<see cref="_eof"/>) a record that does not fit yet may still be completed by the writer (wait for more); a
+    /// recyclable writer pads the last <see cref="LogFormat.RecyclableHeaderSize"/> - 1 bytes of a block at most.
+    /// </summary>
+    private bool IsStaleHeader(bool doesNotFit, bool zeroHeader)
+    {
+        if (zeroHeader) return _eof || _bufLen >= LogFormat.RecyclableHeaderSize;
+        return doesNotFit && !_eof && _bufLen >= LogFormat.RecyclableHeaderSize;
     }
 
     private void SetError(int code)

@@ -298,6 +298,151 @@ public sealed class WalRecyclingTests
         Assert.AreEqual(db.GetLatestSequenceNumber(), seen[^1]);
     }
 
+    /// <summary>
+    /// A key and a value of fixed size, so that every WAL record of every use of a recycled WAL has the same size and the
+    /// live end of a reused WAL is a header of the previous use (an old record).
+    /// </summary>
+    private static byte[] FixedValue(int i, int round) => B("v" + round.ToString("D4", System.Globalization.CultureInfo.InvariantCulture) + "-"
+        + i.ToString("D6", System.Globalization.CultureInfo.InvariantCulture) + new string('x', 40));
+
+    private static byte[] RecordValue(bool sameSize, int i, int round) => sameSize ? FixedValue(i, round) : Value(i, round);
+
+    /// <summary>
+    /// A tailing GetUpdatesSince iterator when every record has the same size: the live end of the reused WAL is the
+    /// header of a record of the previous use, which the reader reports as an old record (it used to spin on it).
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000)]
+    public void TailingIteratorFollowsReusedWalAtOldRecordHeader()
+    {
+        MemoryFileSystem fs = NewFs();
+        var log = new CollectingLogger();
+        DbOptions o = Options(fs, recycle: 1);
+        o.InfoLog = log;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o);
+        for (int r = 0; r < 3; r++)
+        {
+            for (int i = 0; i < 200; i++) db.Put(Key(i), FixedValue(i, r));
+            db.Flush();
+            WaitIdle(db);
+        }
+        Assert.IsTrue(log.Any("from recycle list"), "the current WAL is not a reused file");
+        db.Put(Key(0), FixedValue(0, 9));
+        using TransactionLogIterator it = db.GetUpdatesSince(db.GetLatestSequenceNumber());
+        var seen = new List<ulong>();
+        void DrainIt()
+        {
+            if (!it.Valid) it.Next();
+            for (; it.Valid; it.Next()) seen.Add(it.Current.Sequence);
+        }
+        DrainIt();
+        for (int round = 0; round < 4; round++)
+        {
+            for (int i = 0; i < 7; i++) db.Put(Key(i), FixedValue(i, 10 + round));
+            DrainIt();
+        }
+        Assert.IsNull(it.Error, it.Error?.ToString());
+        Assert.AreEqual(29, seen.Count);
+        for (int i = 1; i < seen.Count; i++) Assert.AreEqual(seen[i - 1] + 1, seen[i]);
+        Assert.AreEqual(db.GetLatestSequenceNumber(), seen[^1]);
+    }
+
+    /// <summary>
+    /// A tailing iterator that falls behind until the WAL it reads is recycled and reused: the file is renamed and
+    /// overwritten, so the rest of its records are gone. The iterator returns only genuine records of that WAL (those
+    /// still buffered), then ends with NotFound "Gap in sequence numbers" (a WalTailer replica must resync), never with
+    /// records of the new use.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000)]
+    public void TailingIteratorGetsNotFoundWhenItsWalIsReused()
+    {
+        MemoryFileSystem fs = NewFs();
+        var log = new CollectingLogger();
+        DbOptions o = Options(fs, recycle: 1);
+        o.InfoLog = log;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o);
+        ulong start = db.GetLatestSequenceNumber() + 1;
+        // Several blocks of WAL: the iterator buffers only the first one.
+        for (int i = 0; i < 1000; i++) db.Put(Key(i), FixedValue(i, 0));
+        ulong walNumber = db.GetCurrentWalFile().LogNumber;
+        using TransactionLogIterator it = db.GetUpdatesSince(start);
+        var seen = new List<ulong>();
+        for (int n = 0; n < 5 && it.Valid; n++, it.Next()) seen.Add(it.Current.Sequence);
+        Assert.AreEqual(5, seen.Count);
+        // The tailed WAL becomes obsolete and is reused (renamed and overwritten) by the next switch.
+        db.Flush();
+        WaitIdle(db);
+        db.Put(B("x"), B("1"));
+        db.Flush();
+        WaitIdle(db);
+        Assert.IsTrue(log.Any("reusing log " + walNumber + " from recycle list"), "the tailed WAL was not reused");
+        for (int i = 0; i < 1000; i++) db.Put(Key(i), FixedValue(i, 1)); // overwrite the reused file well past block 0
+        for (; it.Valid; it.Next()) seen.Add(it.Current.Sequence);
+        it.Next();
+        for (; it.Valid; it.Next()) seen.Add(it.Current.Sequence);
+        Assert.IsNotNull(it.Error, "the iterator went on past the overwritten records");
+        Assert.AreEqual(StatusCode.NotFound, it.Error.Code);
+        StringAssert.Contains(it.Error.Message, "Gap in sequence numbers");
+        // Only records of the original use, in order, all from the first 1000 writes.
+        for (int i = 0; i < seen.Count; i++) Assert.AreEqual(start + (ulong)i, seen[i]);
+        Assert.IsLessThan(1000, seen.Count);
+    }
+
+    /// <summary>
+    /// A secondary that catches up repeatedly while the primary writes into reused WALs, also in the middle of a reused
+    /// WAL: the secondary's WAL reader stops at the stale tail of the previous use (a cut record or, with records of the
+    /// same size, an old record header) and must re-read the file from there once the primary overwrote it
+    /// (DBImplSecondary::RecoverLogFiles with a log::FragmentBufferedReader per WAL). It used to miss every later record
+    /// of the reused WAL.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000)]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void SecondaryCatchUpFollowsReusedWal(bool sameSizeRecords)
+    {
+        MemoryFileSystem fs = NewFs();
+        var log = new CollectingLogger();
+        DbOptions o = Options(fs, recycle: 2);
+        o.InfoLog = log;
+        using RocksDatabase primary = RocksDatabase.Open(DbPath, o);
+        // Large previous uses, so that every later use of a recycled WAL ends inside stale data.
+        for (int r = 0; r < 3; r++)
+        {
+            for (int i = 0; i < 300; i++) primary.Put(Key(i), RecordValue(sameSizeRecords, i, r));
+            primary.Flush();
+            WaitIdle(primary);
+        }
+        Assert.IsTrue(log.Any("from recycle list"), "the current WAL is not a reused file");
+        using RocksDatabase sec = RocksDatabase.OpenAsSecondary(DbPath, "/sec-recycle", new DbOptions { FileSystem = fs },
+            [new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, new ColumnFamilyOptions())]);
+        void CatchUpAndCompare(string context)
+        {
+            sec.TryCatchUpWithPrimary();
+            Assert.AreEqual(primary.GetLatestSequenceNumber(), sec.GetLatestSequenceNumber(), context);
+            for (int i = 0; i < 300; i++) Assert.AreEqual(GetString(primary, S(Key(i))!), GetString(sec, S(Key(i))!), context + " key " + i);
+        }
+        CatchUpAndCompare("open");
+        for (int round = 3; round < 12; round++)
+        {
+            // Several catch-ups in the middle of the (reused) WAL.
+            for (int i = 0; i < 60; i++)
+            {
+                primary.Put(Key(i), RecordValue(sameSizeRecords, i, round));
+                if (i % 13 == 0) CatchUpAndCompare("round " + round + " write " + i);
+            }
+            CatchUpAndCompare("round " + round);
+            if (round % 3 != 2)
+            {
+                primary.Flush(); // switches to a reused WAL
+                WaitIdle(primary);
+                CatchUpAndCompare("round " + round + " after flush");
+            }
+        }
+        Assert.IsTrue(log.Any("reusing log"));
+    }
+
     /// <summary>Port of DBWriteTest.RecycleLogToggleTest: WALs of a previous instance are deleted, not recycled.</summary>
     [TestMethod]
     public void RecycleLogToggle()

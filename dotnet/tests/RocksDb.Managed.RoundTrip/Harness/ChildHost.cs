@@ -11,6 +11,8 @@ namespace RocksDb.Managed.RoundTrip.Harness;
 /// <see cref="ExitVerificationFailed"/> when a verify command found different contents,
 /// <see cref="ExitError"/> on any other exception, <see cref="ExitUsage"/> on bad arguments. A crash or kill shows up
 /// as a signal / NTSTATUS exit code instead (decoded by <see cref="ChildResult"/>).
+/// <c>roundtrip-child --native-secondary PRIMARY SECONDARY OUT</c> runs a native secondary instead
+/// (<see cref="Tests.SecondaryRecyclingRoundTripTests.RunNativeSecondaryChild"/>).
 /// </summary>
 internal static class ChildHost
 {
@@ -31,6 +33,10 @@ internal static class ChildHost
 
     public static int Run(string[] args)
     {
+        if (args.Length > 1 && args[1] == Tests.SecondaryRecyclingRoundTripTests.NativeSecondaryArgument)
+        {
+            return Tests.SecondaryRecyclingRoundTripTests.RunNativeSecondaryChild(args);
+        }
         string? engineName = null, db = null, specPath = null, scriptPath = null;
         for (int i = 1; i < args.Length - 1; i += 2)
         {

@@ -419,6 +419,10 @@ internal sealed partial class DbImpl
                 reader = new FragmentBufferedLogReader(file, reporter, checksum: true, walNumber);
                 _secondaryWalReaders[walNumber] = reader;
             }
+            else if (reader.AtStaleTail && !TryRepositionSecondaryWalReader(reader, walNumber))
+            {
+                continue;
+            }
             while (reader.TryReadRecord(out ReadOnlySpan<byte> record))
             {
                 if (record.Length < WriteBatch.HeaderSize) continue;
@@ -437,6 +441,28 @@ internal sealed partial class DbImpl
             foreach (ColumnFamilyData cfd in Versions.ColumnFamilies) InstallSuperVersion(cfd);
         }
         NotifySequenceWaiters();
+    }
+
+    /// <summary>
+    /// Managed fix for secondaries following a primary with recycle_log_file_num &gt; 0. The previous catch-up stopped
+    /// the reader of a reused WAL at bytes of the file's previous use (an old record, or a record cut by the new data),
+    /// which it had already buffered or dropped; the primary overwrites them in place. Re-read the WAL from the end of
+    /// the last complete record on a fresh handle. Upstream's secondary keeps its reader (and spins on the old record,
+    /// see FragmentBufferedLogReader). Returns false when the WAL is gone (deleted by the primary meanwhile).
+    /// </summary>
+    private bool TryRepositionSecondaryWalReader(FragmentBufferedLogReader reader, ulong walNumber)
+    {
+        Env.ISequentialFile file;
+        try
+        {
+            file = FileSystem.OpenSequential(FileNames.LogFileName(WalDir, walNumber));
+        }
+        catch (RocksDbException)
+        {
+            return false;
+        }
+        reader.Reposition(file);
+        return true;
     }
 
     /// <summary>

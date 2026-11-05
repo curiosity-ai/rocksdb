@@ -173,6 +173,104 @@ public sealed class ReplicationTests
         }
     }
 
+    /// <summary>Waits for the replica to reach <paramref name="sequence"/>; fails with the stream's error if it ended.</summary>
+    private static async Task WaitForStreamAsync(RocksDatabase replica, ulong sequence, Task<int> streaming, string what)
+    {
+        Task reached = WaitForSequenceAsync(replica, sequence, what);
+        if (await Task.WhenAny(reached, streaming) == streaming && streaming.IsFaulted)
+        {
+            Assert.Fail(what + ": streaming failed: " + streaming.Exception!.InnerException);
+        }
+        await reached;
+    }
+
+    private sealed class ReuseCountingLogger() : InfoLogger(InfoLogLevel.Info)
+    {
+        private int _reused;
+
+        public int Reused => Volatile.Read(ref _reused);
+
+        protected override void LogCore(InfoLogLevel level, string message)
+        {
+            if (message.Contains("from recycle list", StringComparison.Ordinal)) Interlocked.Increment(ref _reused);
+        }
+    }
+
+    /// <summary>
+    /// Streaming from a source with recycle_log_file_num &gt; 0: the tailer reads reused WALs, which the source overwrites
+    /// in place while the tailer is in the middle of them (it stops at the previous use's stale bytes and must re-read
+    /// the file from there), and follows rotations into reused WALs, also under concurrent writers. The replica stays
+    /// identical.
+    /// </summary>
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task StreamingFromRecyclingSourceKeepsReplicaIdentical(bool memoryFileSystem)
+    {
+        using var dir = new TempDir("recycle");
+        IFileSystem fs = memoryFileSystem ? new MemoryFileSystem() : LocalFileSystem.Instance;
+        string root = memoryFileSystem ? "/mem-recycle" : dir.Path;
+        var log = new ReuseCountingLogger();
+        DbOptions sourceOptions = DbOpts(fs);
+        sourceOptions.RecycleLogFileNum = 2;
+        sourceOptions.InfoLog = log;
+        await using RocksDatabase source = await RocksDatabase.OpenAsync(root + "/source", sourceOptions);
+        // Large previous uses: later uses of the recycled WALs end inside stale data.
+        for (int r = 0; r < 4; r++)
+        {
+            await WriteWorkloadAsync(source, 0, 800, r);
+            await source.FlushAsync();
+        }
+        Assert.IsGreaterThan(0, log.Reused, "the source never reused a WAL");
+        (RocksDatabase replica, _) = await InitialSyncAsync(source, root + "/cp", root + "/replica", fs, []);
+        await using (replica)
+        {
+            using var cts = new CancellationTokenSource();
+            Task<int> streaming = StreamAsync(source, replica, 4096, cts.Token);
+            // The tailer catches up in the middle of a reused WAL, then the source appends more to it.
+            for (int round = 0; round < 8; round++)
+            {
+                await WriteWorkloadAsync(source, 0, 120, 10 + round);
+                await WaitForStreamAsync(replica, source.GetLatestSequenceNumber(), streaming, "round " + round + " first half");
+                await WriteWorkloadAsync(source, 120, 240, 10 + round);
+                await WaitForStreamAsync(replica, source.GetLatestSequenceNumber(), streaming, "round " + round + " second half");
+                if (round % 2 == 0) await source.FlushAsync(); // rotation into a reused WAL
+            }
+            int reusedBefore = log.Reused;
+            // Concurrent writers with rotations.
+            var writers = new Task[3];
+            for (int w = 0; w < writers.Length; w++)
+            {
+                int writer = w;
+                writers[w] = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 600; i++)
+                    {
+                        using WriteBatch b = source.CreateWriteBatch();
+                        FillBatch(b, writer * 1_000_000 + i, 30 + writer);
+                        await source.WriteAsync(b);
+                        if (writer == 0 && i % 200 == 199)
+                        {
+                            // A recycled WAL is overwritten when it is reused, so a tailer must not fall a whole recycle
+                            // cycle behind (it then gets NotFound and must resync; see
+                            // WalRecyclingTests.TailingIteratorGetsNotFoundWhenItsWalIsReused). Let the tailer reach the
+                            // source before each rotation; the other writers keep writing meanwhile.
+                            await WaitForStreamAsync(replica, source.GetLatestSequenceNumber(), streaming, "before rotation");
+                            await source.FlushAsync();
+                        }
+                    }
+                });
+            }
+            await Task.WhenAll(writers);
+            await WaitForStreamAsync(replica, source.GetLatestSequenceNumber(), streaming, "concurrent streaming");
+            await cts.CancelAsync();
+            Assert.IsGreaterThan(0, await streaming);
+            Assert.IsGreaterThan(reusedBefore, log.Reused, "no WAL was reused while streaming");
+            AssertReplicaEquals(source, replica, "after streaming from a recycling source");
+            Assert.AreEqual(DatabaseDigest.Compute(source), DatabaseDigest.Compute(replica));
+        }
+    }
+
     [TestMethod]
     public async Task SourceWalPurgeGivesNotFoundThenResyncFromCheckpoint()
     {
