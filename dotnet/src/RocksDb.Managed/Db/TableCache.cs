@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Collections.Concurrent;
 using System.Globalization;
 using RocksDb.Managed.Db.Iterators;
@@ -321,6 +322,44 @@ internal sealed class TableCache : ITableCache, IDisposable
     /// </summary>
     internal bool VerifyUniqueIdInManifest { get; set; }
 
+    private Cache.RowCache? _rowCache;
+    private ulong _rowCacheId;
+
+    /// <summary>
+    /// DBOptions::row_cache (TableCache::Get / MultiGet row cache lookups); setting it draws this table cache's key
+    /// prefix (row_cache_id_ = row_cache->NewId()).
+    /// </summary>
+    internal Cache.RowCache? RowCache
+    {
+        get => _rowCache;
+        init
+        {
+            _rowCache = value;
+            _rowCacheId = value?.NewId() ?? 0;
+        }
+    }
+
+    /// <summary>
+    /// TableCache::CreateRowCacheKeyPrefix + the user key: row_cache_id | varint64(file number) | varint64(seq) | user key,
+    /// where seq is 0 when the read sequence exposes all of the file, else 1 + the read sequence. Returns the length
+    /// written to <paramref name="dst"/> and the sequence number entries are replayed with (seq - 1, or 0).
+    /// Deviation: upstream uses 1 + snapshot for a snapshot equal to the file's largest seqno too (which also sees the
+    /// whole file); only the cache key differs, not the result.
+    /// </summary>
+    internal int RowCacheKey(Span<byte> dst, FileMetaData file, ReadOnlySpan<byte> userKey, ulong readSequence, out ulong replaySeq)
+    {
+        ulong entrySeq = readSequence < file.LargestSeqno ? 1 + readSequence : 0;
+        int n = Util.Coding.EncodeVarint64(dst, _rowCacheId);
+        n += Util.Coding.EncodeVarint64(dst[n..], file.FileNumber);
+        n += Util.Coding.EncodeVarint64(dst[n..], entrySeq);
+        userKey.CopyTo(dst[n..]);
+        replaySeq = entrySeq == 0 ? 0 : entrySeq - 1;
+        return n + userKey.Length;
+    }
+
+    /// <summary>Maximum length of the row cache key prefix (three varint64s).</summary>
+    internal const int RowCacheKeyPrefixMax = 30;
+
     /// <summary>
     /// The column family's internal stats: with <see cref="Statistics"/>, reads of a table are also recorded in the
     /// latency histogram of the level it was opened at (InternalStats::GetFileReadHist, shown by rocksdb.cfstats).
@@ -395,6 +434,36 @@ internal sealed class TableCache : ITableCache, IDisposable
         return GetReader(file, out rangeTombstones);
     }
 
+    /// <summary>
+    /// <see cref="GetReaderForVersion(FileMetaData, out FragmentedRangeTombstoneList?)"/> for a read with
+    /// <paramref name="flags"/>: with <see cref="TableReadFlags.BlockCacheTier"/> a table that is not open is not
+    /// opened (TableCache::FindTable with no_io) and the read fails with Incomplete.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public TableReaderLease GetReaderForVersion(FileMetaData file, out FragmentedRangeTombstoneList? rangeTombstones, TableReadFlags flags)
+    {
+        if ((flags & TableReadFlags.BlockCacheTier) == 0) return GetReaderForVersion(file, out rangeTombstones);
+        return GetOpenReaderNoIo(file, out rangeTombstones);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private TableReaderLease GetOpenReaderNoIo(FileMetaData file, out FragmentedRangeTombstoneList? rangeTombstones)
+    {
+        if (_store.TryGetPinned(file.FileNumber) is { Reader: { } reader } p)
+        {
+            rangeTombstones = p.RangeDels;
+            return new TableReaderLease(reader, null, null);
+        }
+        if (_store.TryGetOpen(file.FileNumber, out TableCacheStore.Handle? h))
+        {
+            rangeTombstones = h.RangeDels;
+            return new TableReaderLease(h.Reader!, TableCacheStore.s_release, h);
+        }
+        rangeTombstones = null;
+        BlockBasedTableReader.ThrowNoIo();
+        return default;
+    }
+
     /// <summary>The fragmented range tombstones of a table (opening it if needed), or null if it has none.</summary>
     public FragmentedRangeTombstoneList? GetRangeTombstones(FileMetaData file)
     {
@@ -436,7 +505,7 @@ internal sealed class TableCache : ITableCache, IDisposable
                     + " and file system " + f.Length.ToString(CultureInfo.InvariantCulture) + " sstable: " + path);
             }
             TableReaderOptions opts = ReaderOptions;
-            if (file.LargestSeqno != opts.LargestSeqno || file.FileNumber != opts.FileNumber || (opts.BlockCacheTracer is not null && file.LevelHint != opts.Level))
+            if (file.LargestSeqno != opts.LargestSeqno || file.FileNumber != opts.FileNumber || file.LevelHint != opts.Level)
                 opts = opts with { LargestSeqno = file.LargestSeqno, FileNumber = file.FileNumber, Level = file.LevelHint };
             reader = TableReaderFactory.Open(f, opts);
         }

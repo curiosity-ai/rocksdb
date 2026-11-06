@@ -109,6 +109,8 @@ internal sealed partial class DbImpl
         if (options is { DisableWal: true } && Options.RecycleLogFileNum > 0 && !(_twoWriteQueues && txn is { DisableMemtable: true }))
             ThrowHelper.InvalidArgument("WriteOptions::disableWAL option is not supported if DBOptions::recycle_log_file_num > 0");
         if (batch.DataSize < WriteBatch.HeaderSize) ThrowHelper.Corruption("malformed WriteBatch (too small)");
+        // Row cache entries ignore range tombstones of their own file (TableCache::Get), so DeleteRange is rejected.
+        if (Options.RowCache is not null && batch.HasDeleteRange) ThrowHelper.NotSupported("DeleteRange is not compatible with row cache.");
         if (options is { ProtectionBytesPerKey: not 0 } || batch.ProtectionBytesPerKey != 0) PrepareProtectedWrite(options, batch);
         if (validateColumnFamilies)
         {

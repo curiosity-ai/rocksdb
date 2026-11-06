@@ -97,15 +97,16 @@ public sealed class BlockCacheStatistics
 
 /// <summary>Per-call flags for table reads (the table-level subset of ReadOptions).</summary>
 [Flags]
-public enum TableReadFlags : byte
+public enum TableReadFlags : ushort
 {
     /// <summary>Default: blocks read from the file are inserted into the block cache (ReadOptions::fill_cache = true).</summary>
     None = 0,
     /// <summary>ReadOptions::fill_cache = false: look blocks up in the cache, but do not insert blocks read on a miss.</summary>
     DontFillCache = 1,
     /// <summary>
-    /// ReadOptions::read_tier = kBlockCacheTier for filter checks: no file I/O; a filter (or partitioned filter index)
-    /// that is neither pinned nor in the block cache answers "may match" (upstream returns Incomplete).
+    /// ReadOptions::read_tier = kBlockCacheTier (no_io): no file I/O. A data block, index block or index partition that
+    /// is neither pinned nor in the block cache fails the read with <see cref="StatusCode.Incomplete"/> ("no blocking
+    /// io", BlockBasedTable::RetrieveBlock); a filter that is not cached answers "may match" (FullFilterBlockReader).
     /// </summary>
     BlockCacheTier = 2,
     /// <summary>
@@ -117,6 +118,17 @@ public enum TableReadFlags : byte
     BuiltinIndex = 0b100000,
     /// <summary>ReadOptions::read_index = kPreferCustom: read through the user-defined index when the table has one.</summary>
     PreferCustomIndex = 0b1000000,
+    /// <summary>
+    /// ReadOptions::verify_checksums = false: block checksums are not verified for blocks this read loads from the file
+    /// (BlockFetcher::ReadBlockContents checks read_options.verify_checksums). When clear, blocks are verified unless
+    /// the reader was opened with <see cref="TableReaderOptions.VerifyChecksums"/> = false.
+    /// </summary>
+    SkipChecksumVerification = 0b10000000,
+    /// <summary>
+    /// Version::IsFilterSkipped (optimize_filters_for_hits, last non-empty level): point lookups and seeks do not consult
+    /// the table's filter (the skip_filters argument of TableCache::Get / MultiGet / NewIterator).
+    /// </summary>
+    SkipFilters = 0b1_00000000,
 }
 
 /// <summary>Helpers for the packed fields of <see cref="TableReadFlags"/>.</summary>
@@ -139,12 +151,15 @@ public static class TableReadFlagsExtensions
     }
 
     /// <summary>
-    /// The table-level flags of user read options: fill_cache and rate_limiter_priority (null options: the defaults).
+    /// The table-level flags of user read options: fill_cache, read_tier = kBlockCacheTier (no_io), verify_checksums,
+    /// read_index and rate_limiter_priority (null options: the defaults).
     /// </summary>
     public static TableReadFlags FromReadOptions(ReadOptions? options)
     {
         if (options is null) return TableReadFlags.None;
         TableReadFlags f = options.FillCache ? TableReadFlags.None : TableReadFlags.DontFillCache;
+        if (options.ReadTier == ReadTier.BlockCacheTier) f |= TableReadFlags.BlockCacheTier;
+        if (!options.VerifyChecksums) f |= TableReadFlags.SkipChecksumVerification;
         f |= options.ReadIndex switch
         {
             ReadIndex.Builtin => TableReadFlags.BuiltinIndex,

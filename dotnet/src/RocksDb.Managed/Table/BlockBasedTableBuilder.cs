@@ -124,7 +124,11 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         // RangeDelBlockBuilder(ts_sz, persist_user_defined_timestamps): the start keys are stripped by the block
         // builder, the end keys (values) in AddCore.
         _rangeDelBlock = new BlockBuilder(1, true, false, DataBlockIndexType.BinarySearch, 0.75, useCommonPrefix: false, isUserKey: false, _stripTsSize);
-        _useDeltaEncodingForIndexValues = options.FormatVersion >= 4 && !options.BlockAlign;
+        // Embedded blob records are interleaved between data blocks, which breaks the contiguity plain index value-delta
+        // encoding assumes; format_version >= 8 handles it with the in-value escape.
+        _useDeltaEncodingForIndexValues = options.FormatVersion >= 4 && !options.BlockAlign
+            && (tableBuilderOptions.EmbeddedBlobMinSize is null || BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(options.FormatVersion));
+        _embeddedBlobMinSize = tableBuilderOptions.EmbeddedBlobMinSize;
         PartitionedIndexBuilder? partitionedIndex = null;
         if (options.IndexType == IndexType.TwoLevelIndexSearch)
         {
@@ -152,12 +156,15 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         _prefixExtractor = tableBuilderOptions.PrefixExtractor;
         // Port of CreateFilterBlockBuilder: the policy picks the filter implementation from the full building context
         // (format version, level, flush); a built-in policy with &lt; 0.5 bits/key builds no filter at all.
-        if (options.FilterPolicy is { } policy && policy is not BloomLikeFilterPolicy { CreatesFilters: false })
+        // optimize_filters_for_hits skips filter generation for bottommost outputs (block_based_table_builder.cc Rep()).
+        bool skipFilter = tableBuilderOptions.OptimizeFiltersForHits && tableBuilderOptions.IsBottommost;
+        if (!skipFilter && options.FilterPolicy is { } policy && policy is not BloomLikeFilterPolicy { CreatesFilters: false })
         {
             IFilterBitsBuilder bits = policy.CreateBuilder(new FilterBuildingContext(options.FormatVersion, tableBuilderOptions.LevelAtCreation, tableBuilderOptions.IsFlush)
             {
                 OptimizeFiltersForMemory = options.OptimizeFiltersForMemory,
             });
+            if (options.DetectFilterConstructCorruption) bits = new VerifyingFilterBitsBuilder(bits, policy);
             if (options.PartitionFilters && partitionedIndex is not null)
             {
                 // Since after partition cut request from filter builder it takes time until index builder actully cuts
@@ -377,6 +384,12 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         else
         {
             if (!IsValueType(type)) ThrowHelper.InvalidArgument("BlockBasedBuilder::Add() received a key with invalid value type " + (byte)type);
+            // Embedded-blob SSTs: large values are written as same-file blob records and the entry references them.
+            if (_embeddedBlobMinSize is { } minBlob && type == EntryType.Value && (ulong)value.Length >= minBlob)
+            {
+                AddEmbeddedBlob(internalKey, seq, value);
+                return;
+            }
             if (_lastKey.WrittenCount > 0 && _icmp.Compare(internalKey, _lastKey.WrittenSpan) <= 0)
                 ThrowHelper.InvalidArgument("keys must be added in strictly increasing internal key order");
 
@@ -620,10 +633,81 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
                 isDataBlock ? _dict : null)
             && compressed.WrittenCount <= maxCompressed)
         {
+            if (_options.VerifyCompression) VerifyCompressedBlock(raw, compressed.WrittenSpan, isDataBlock);
             return _tbo.CompressionType;
         }
         rejected = isDataBlock;
         return CompressionType.None;
+    }
+
+    // ---- embedded blob SSTs (table/embedded_blob_sst.h, BlockBasedTableBuilder::WriteEmbeddedBlobRecord) ----
+
+    private readonly ulong? _embeddedBlobMinSize;
+    private ulong _embeddedBlobCount, _embeddedBlobBytes;
+
+    /// <summary>
+    /// MaybeExtractEmbeddedBlobs for a kTypeValue entry: writes the value as a SimpleGen2Blob record (payload,
+    /// compression type byte, checksum with the context modifier of its offset, like a block trailer) at the current
+    /// file offset, then adds the entry as kTypeBlobIndex referencing it (file number 0 = this file).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void AddEmbeddedBlob(ReadOnlySpan<byte> internalKey, ulong seq, ReadOnlySpan<byte> value)
+    {
+        if ((ulong)value.Length > uint.MaxValue) ThrowHelper.InvalidArgument("Embedded blob value is too large");
+        ulong offset = _offset;
+        const CompressionType compression = CompressionType.None; // placeholder upstream: payloads are uncompressed
+        _out.Write(value);
+        Span<byte> trailer = _out.GetSpan(BlockBasedTableConstants.BlockTrailerSize);
+        trailer[0] = (byte)compression;
+        Coding.EncodeFixed32(trailer[1..], BlockChecksum.ComputeTrailerChecksum(_options.Checksum, _baseContextChecksum, value, (byte)compression, offset));
+        _out.Advance(BlockBasedTableConstants.BlockTrailerSize);
+        _offset += (ulong)value.Length + BlockBasedTableConstants.BlockTrailerSize;
+        _embeddedBlobCount++;
+        _embeddedBlobBytes += (ulong)value.Length;
+
+        Span<byte> index = stackalloc byte[Db.Blob.BlobIndex.MaxEncodedLength];
+        int n = Db.Blob.BlobIndex.EncodeBlob(index, Db.Blob.BlobIndex.CurrentFileBlobIndexFileNumber, offset, (ulong)value.Length, compression);
+        byte[] key = ArrayPool<byte>.Shared.Rent(internalKey.Length);
+        try
+        {
+            internalKey.CopyTo(key);
+            Coding.EncodeFixed64(key.AsSpan(internalKey.Length - DbFormat.InternalKeyFooterSize), DbFormat.PackSequenceAndType(seq, EntryType.BlobIndex));
+            AddCore(key.AsSpan(0, internalKey.Length), index[..n]);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(key);
+        }
+    }
+
+    /// <summary>
+    /// verify_compression (CompressAndVerifyBlock): decompresses <paramref name="compressed"/> (with the dictionary of
+    /// data blocks) and fails the build with Corruption unless it reproduces <paramref name="raw"/>. Off the default
+    /// write path (only called with the option set).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void VerifyCompressedBlock(ReadOnlySpan<byte> raw, ReadOnlySpan<byte> compressed, bool isDataBlock)
+    {
+        PooledBufferWriter check = ObjectPools.RentWriter();
+        try
+        {
+            try
+            {
+                BlockCompression.Decompress(_tbo.CompressionType, compressed, _options.FormatVersion, check, isDataBlock ? _dict : null);
+            }
+            catch (RocksDbException e)
+            {
+                throw new RocksDbException(StatusCode.Corruption, "Corruption: Could not decompress: " + e.Message, StatusSubCode.None, e);
+            }
+            if (!check.WrittenSpan.SequenceEqual(raw))
+            {
+                ThrowHelper.Corruption("Decompressed block did not match pre-compression block");
+            }
+        }
+        finally
+        {
+            ObjectPools.ReturnWriter(check);
+        }
     }
 
     /// <summary>WriteMaybeCompressedBlockImpl for meta blocks (no alignment).</summary>
@@ -900,6 +984,17 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
 
         using var pb = new PropertyBlockBuilder();
         _props.AddTo(pb);
+        if (_embeddedBlobCount > 0)
+        {
+            // kEmbeddedBlobSstStatsPropertyName: varint64 blob_count + varint64 payload_bytes; its presence tells
+            // readers that the file contains same-file blob records.
+            Span<byte> stats = stackalloc byte[2 * Coding.MaxVarint64Length];
+            int sn = Coding.EncodeVarint64(stats, _embeddedBlobCount);
+            sn += Coding.EncodeVarint64(stats[sn..], _embeddedBlobBytes);
+            byte[] encoded = stats[..sn].ToArray();
+            pb.Add(TablePropertiesNames.EmbeddedBlobSstStats, encoded);
+            _props.UserCollectedProperties[TablePropertiesNames.EmbeddedBlobSstStats] = encoded;
+        }
         // NotifyCollectTableCollectorsOnFinish: user collectors come first in the collector list, so on a name clash
         // their properties win over the internal collectors' (std::map insert keeps the first).
         if (_collectors is not null)

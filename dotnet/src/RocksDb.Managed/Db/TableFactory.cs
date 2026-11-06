@@ -66,6 +66,9 @@ public static class TableFactory
             // the bare class names written by the C API).
             FilterPolicy = options.FilterPolicy ?? CreateFilterPolicy(options.UnresolvedFilterPolicyId),
             WholeKeyFiltering = options.WholeKeyFiltering,
+            VerifyCompression = options.VerifyCompression,
+            DetectFilterConstructCorruption = options.DetectFilterConstructCorruption,
+            ReadAmpBytesPerBit = options.ReadAmpBytesPerBit,
             UseDeltaEncoding = options.UseDeltaEncoding,
             OptimizeKeyCommonPrefix = options.OptimizeKeyCommonPrefix,
             EnableIndexCompression = options.EnableIndexCompression,
@@ -236,6 +239,7 @@ public static class TableFactory
             PrefixExtractor = options.PrefixExtractor,
             LevelAtCreation = where.Level,
             IsFlush = where.IsFlush,
+            OptimizeFiltersForHits = options.OptimizeFiltersForHits,
             PersistUserDefinedTimestamps = options.PersistUserDefinedTimestamps,
             TablePropertiesCollectorFactories = options.TablePropertiesCollectorFactories.ToArray(),
             NumLevels = options.NumLevels,
@@ -335,6 +339,8 @@ public static class TableFactory
             BloomLocality = options.BloomLocality,
             UserDefinedIndexFactory = t.UserDefinedIndexFactory,
             IndexMode = t.IndexMode,
+            NumLevels = options.NumLevels,
+            ReadAmpBytesPerBit = format.ReadAmpBytesPerBit,
         };
         if (cache is not null) r = r with { BlockCache = cache };
         if (t.PersistentCache is not null) r = r with { PersistentCache = t.PersistentCache };

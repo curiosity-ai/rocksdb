@@ -114,6 +114,7 @@ internal sealed class ColumnFamilyData
         {
             Statistics = db.Options.Statistics,
             VerifyUniqueIdInManifest = db.Options.VerifySstUniqueIdInManifest,
+            RowCache = db.Options.RowCache,
         };
         // Blob files live in cf_paths.front() (the first DB path); readers and the optional blob cache are per CF.
         Stats = new InternalStats(NumLevels);

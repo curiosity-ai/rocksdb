@@ -51,6 +51,22 @@ public sealed record TableFormatOptions
     /// <summary>Verify block checksums when reading (ReadOptions::verify_checksums default true).</summary>
     public bool VerifyChecksums { get; init; } = true;
     /// <summary>
+    /// verify_compression: every compressed block is decompressed again and compared with its input before it is
+    /// written; a mismatch fails the build with Corruption (CompressAndVerifyBlock). Default false.
+    /// </summary>
+    public bool VerifyCompression { get; init; }
+    /// <summary>
+    /// detect_filter_construct_corruption: after a filter (or filter partition) is built, every key added to it must
+    /// match it, else the build fails with Corruption (FilterBlockBuilder::MaybePostVerifyFilter). Default false.
+    /// </summary>
+    public bool DetectFilterConstructCorruption { get; init; }
+    /// <summary>
+    /// read_amp_bytes_per_bit: when non-zero, data blocks read with this reader track which of their bytes were accessed
+    /// (BlockReadAmpBitmap, one bit per this many bytes) for READ_AMP_ESTIMATE_USEFUL_BYTES / READ_AMP_TOTAL_READ_BYTES.
+    /// Default 0 (off).
+    /// </summary>
+    public uint ReadAmpBytesPerBit { get; init; }
+    /// <summary>
     /// separate_key_value_in_data_block: data blocks store all keys first and the values after them (a value-offset varint
     /// per restart interval). Readable by RocksDB 11.x with the feature (recorded in "rocksdb.separate.key.value.in.data.block").
     /// </summary>
@@ -131,6 +147,22 @@ public sealed record TableBuilderOptions
     public ulong TargetFileSize { get; init; }
     /// <summary>True when the file is written by a memtable flush (TableFileCreationReason::kFlush; Ribbon treats it as level -1).</summary>
     public bool IsFlush { get; init; }
+    /// <summary>
+    /// TableBuilderOptions::is_bottommost: the file is an output of a compaction to the bottommost level
+    /// (Compaction::bottommost_level()). False for flushes, external files and repair.
+    /// </summary>
+    public bool IsBottommost { get; init; }
+    /// <summary>
+    /// TableBuilderOptions::embedded_blob_options (SstFileWriter::OpenWithEmbeddedBlobs): Put values of at least this
+    /// many bytes are written as same-file blob records (SimpleGen2Blob format) and referenced by blob indexes with
+    /// file number 0. Null (default): off.
+    /// </summary>
+    public ulong? EmbeddedBlobMinSize { get; init; }
+    /// <summary>
+    /// ImmutableCFOptions::optimize_filters_for_hits: with <see cref="IsBottommost"/>, no filter block is built
+    /// (the filter policy name is still recorded in the properties, like upstream).
+    /// </summary>
+    public bool OptimizeFiltersForHits { get; init; }
     public ulong OldestKeyTime { get; init; }
     public ulong NewestKeyTime { get; init; }
     public ulong FileCreationTime { get; init; }

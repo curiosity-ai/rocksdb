@@ -25,6 +25,11 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     /// </summary>
     public Statistics? Statistics { get; set; }
     /// <summary>
+    /// rocksdb::DBOptions::row_cache: caches point lookup results per table file (see <see cref="Cache.RowCache"/>);
+    /// null (the default) disables it. One instance may be shared by several DBs. Not persisted (like upstream).
+    /// </summary>
+    public Cache.RowCache? RowCache { get; set; }
+    /// <summary>
     /// Receiver of the DB's informational log (rocksdb::DBOptions::info_log). Null (the default) makes the DB write its
     /// own <c>LOG</c> file in the DB directory (or <see cref="DbLogDir"/>), rolled per <see cref="MaxLogFileSize"/> /
     /// <see cref="LogFileTimeToRoll"/> and trimmed to <see cref="KeepLogFileNum"/> old files. A supplied logger is not
@@ -427,7 +432,7 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
 
     public DbOptions Clone()
     {
-        var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir, FileSystem = FileSystem, Statistics = Statistics, InfoLog = InfoLog,
+        var c = new DbOptions { WalDir = WalDir, DbLogDir = DbLogDir, FileSystem = FileSystem, Statistics = Statistics, RowCache = RowCache, InfoLog = InfoLog,
             RateLimiter = RateLimiter, SstFileManager = SstFileManager, FileChecksumGenFactory = FileChecksumGenFactory,
             WriteBufferManager = WriteBufferManager, CompactionService = CompactionService, WalFilter = WalFilter };
         c.DbPaths.AddRange(DbPaths);

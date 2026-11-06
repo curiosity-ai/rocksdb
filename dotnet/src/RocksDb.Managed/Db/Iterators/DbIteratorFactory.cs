@@ -54,6 +54,15 @@ public sealed class DbIteratorSources
 
     /// <summary>The version the table files come from (blob files must belong to it).</summary>
     internal VersionStorageInfo? BlobVersion { get; init; }
+
+    /// <summary>
+    /// optimize_filters_for_hits of the column family: table iterators of the last non-empty level do not consult
+    /// prefix filters (Version::IsFilterSkipped, the skip_filters argument of AddIteratorsForLevel).
+    /// </summary>
+    internal bool OptimizeFiltersForHits { get; init; }
+
+    /// <summary>VersionStorageInfo::num_non_empty_levels of the version the table files come from.</summary>
+    internal int NumNonEmptyLevels { get; init; }
 }
 
 /// <summary>
@@ -144,9 +153,11 @@ public static class DbIteratorFactory
                 {
                     // Merge all level zero files together since they may overlap.
                     bool shouldSample = FileReadSample.ShouldSampleFileRead();
-                    foreach (FileMetaData f in files)
+                    for (int fi = 0; fi < files.Count; fi++)
                     {
+                        FileMetaData f = files[fi];
                         TableReadFlags readFlags = TableReadFlagsExtensions.FromReadOptions(sources.ReadOptions);
+                        if (sources.OptimizeFiltersForHits && fi == files.Count - 1 && sources.NumNonEmptyLevels == 1) readFlags |= TableReadFlags.SkipFilters;
                         InternalIterator child = sources.PrefixExtractor is null
                             ? readFlags == TableReadFlags.None ? tc.NewIterator(f) : TableInternalIterator.Create(tc.GetReader(f), readFlags, null, null)
                             : TableInternalIterator.Create(tc.GetReader(f), readFlags, sources.ReadOptions, sources.PrefixExtractor);
@@ -163,7 +174,9 @@ public static class DbIteratorFactory
                 {
                     // For levels > 0, we can use a concatenating iterator that sequentially walks through the
                     // non-overlapping files in the level, opening them lazily.
-                    children.Add(new LevelIterator(tc, sources.Comparator, files, sources.ReadOptions, sources.PrefixExtractor));
+                    var levelIter = new LevelIterator(tc, sources.Comparator, files, sources.ReadOptions, sources.PrefixExtractor);
+                    if (sources.OptimizeFiltersForHits && level == sources.NumNonEmptyLevels - 1) levelIter.AddReadFlags(TableReadFlags.SkipFilters);
+                    children.Add(levelIter);
                 }
 
             }

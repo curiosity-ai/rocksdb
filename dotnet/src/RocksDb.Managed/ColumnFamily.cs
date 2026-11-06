@@ -621,9 +621,19 @@ public sealed partial class ColumnFamily
     /// </summary>
     public Iterator NewIterator() => NewIterator(null);
 
+    /// <summary>ReadOptions::tailing (ForwardIterator semantics, see DbImpl.NewTailingIterator).</summary>
+    private Iterator NewTailingIterator(ReadOptions options)
+    {
+        Iterator it = _db.NewTailingIterator(_cfd, options);
+        it.Statistics = _db.Stats;
+        it.SetTraceState(_db, _cfd.Id, options);
+        return it;
+    }
+
     public Iterator NewIterator(ReadOptions? options)
     {
         _db.ThrowIfDisposed();
+        if (options is { Tailing: true }) return NewTailingIterator(options);
         DbIteratorSources sources = _db.NewIteratorSources(_cfd, options);
         try
         {
@@ -643,6 +653,7 @@ public sealed partial class ColumnFamily
     public async ValueTask<Iterator> NewIteratorAsync(ReadOptions? options, CancellationToken cancellationToken = default)
     {
         _db.ThrowIfDisposed();
+        if (options is { Tailing: true }) return NewTailingIterator(options); // renewed synchronously on demand
         DbIteratorSources sources = _db.NewIteratorSources(_cfd, options);
         try
         {

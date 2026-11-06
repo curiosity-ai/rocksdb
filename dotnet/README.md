@@ -63,7 +63,8 @@ tailing), snapshots, merge operators, single delete, range deletion, leveled / u
 compaction filters and TTL, manual compaction, write stalls, block cache (LRU and HyperClock), statistics, event
 listeners, the info `LOG`, dynamic options (`SetOptions` / `SetDBOptions`), optimistic and pessimistic transactions,
 `WriteBatchWithIndex`, wide columns, user-defined timestamps, BlobDB, TTL, checkpoints, BackupEngine, `SstFileWriter` /
-ingestion, WAL tailing, read-only and secondary instances, background error handling with `Resume`, best-efforts recovery, WAL tracking in
+ingestion (including embedded-blob SSTs), `SstFileReader`, the row cache (`DbOptions.RowCache`), read tiers, deadlines
+and value size limits (`ReadOptions`), WAL tailing, read-only and secondary instances, background error handling with `Resume`, best-efforts recovery, WAL tracking in
 the MANIFEST (`TrackAndVerifyWalsInManifest`) and predecessor-WAL records in each WAL (`TrackAndVerifyWals`), WAL filters
 (`DbOptions.WalFilter`), write callbacks (`WriteWithCallback` with a `UserWriteCallback`), an `SstFileManager` (space limit, rate-limited deletion, automatic
 recovery from out-of-space errors) and a `GenericRateLimiter` for flush and compaction writes and, in reads-only / all-I/O
@@ -1259,8 +1260,9 @@ if (live.BackgroundError is RocksDbException bg)
 Common codes: `InvalidArgument` (bad options, a missing DB without `CreateIfMissing`, a comparator mismatch),
 `NotSupported` (writes on a read-only instance, a feature that is not ported), `Corruption`, `IOError` (`SubCode`
 `NoSpace`, `PathNotFound`, ...), `Busy` (optimistic transaction conflict), `TimedOut` with `LockTimeout` (lock wait),
-`ShutdownInProgress` and `ObjectDisposedException` (the DB is closing), and `Incomplete` (`ReadTier.MemtableTier`
-reads, `MaxSkippableInternalKeys`).
+`ShutdownInProgress` and `ObjectDisposedException` (the DB is closing), `Incomplete` (`ReadTier.BlockCacheTier` reads
+of data that is not cached, `MaxSkippableInternalKeys`), `TimedOut` (`ReadOptions.Deadline` passed before a file read)
+and, per MultiGet key, `Aborted` (`ReadOptions.ValueSizeSoftLimit`).
 
 ## Known deviations and gaps
 
@@ -1319,6 +1321,15 @@ API and behavior differences:
   is the receiver.
 - `MergeOperator.FullMergeV3` results are a plain value or wide columns; upstream's third form (returning one of the
   existing operands by reference) is not offered, write its bytes instead.
+
+- Read path: tailing iterators (`ReadOptions.Tailing`) rebuild the regular iterator stack when the column family
+  installs a new super version instead of keeping ForwardIterator's per-level iterators (same results);
+  `ReadOptions.Deadline` is checked for file reads that start on the thread running the operation (continuations of
+  async reads on other threads are not checked) and `IoTimeout` is not enforced, like upstream's PosixFileSystem;
+  `kBlockCacheTier` iterators fail at creation when a table is not open in the table cache (upstream: an error
+  iterator). The row cache (`DbOptions.RowCache`) is bypassed by transactional reads, timestamped column families and
+  `GetMergeOperands` with a callback. Embedded-blob SSTs (`SstFileWriter.OpenWithEmbeddedBlobs`) embed plain values
+  only (not wide-column values), and same-file blob columns of wide-column entities written natively are not resolved.
 
 Performance: on the three-way db_bench-style benchmarks (warm, medians of 5 repetitions, the same librocksdb 11.12
 for the native legs), the managed engine's geometric mean per configuration is 0.67x-0.81x the time of the RocksDB C

@@ -26,7 +26,7 @@ namespace RocksDb.Managed;
 /// </remarks>
 public sealed class Iterator : IDisposable
 {
-    private readonly DbIter _it;
+    private DbIter _it;
     private readonly InternalKeyComparator _icmp;
     private bool _disposed;
 
@@ -134,6 +134,12 @@ public sealed class Iterator : IDisposable
 
     public void SeekToFirst()
     {
+        if (_deadlineOptions is not null)
+        {
+            MoveWithDeadline(DeadlineMove.SeekToFirst, default);
+            return;
+        }
+        if (_tailing is not null) _tailing.RenewIfStale(this);
         if (_stats is null)
         {
             _it.SeekToFirst();
@@ -154,6 +160,12 @@ public sealed class Iterator : IDisposable
 
     public void SeekToLast()
     {
+        if (_deadlineOptions is not null)
+        {
+            MoveWithDeadline(DeadlineMove.SeekToLast, default);
+            return;
+        }
+        if (_tailing is not null) TailingNotSupported("ForwardIterator::SeekToLast()");
         if (_stats is null)
         {
             _it.SeekToLast();
@@ -183,6 +195,37 @@ public sealed class Iterator : IDisposable
         _traceDb = db;
         _traceCfId = cfId;
         _traceReadOptions = options;
+        if (options is not null && options.Deadline > TimeSpan.Zero) _deadlineOptions = options;
+    }
+
+    // ReadOptions::deadline: table file reads of the iterator's moves fail with TimedOut once it has passed.
+    private ReadOptions? _deadlineOptions;
+
+    private enum DeadlineMove : byte { SeekToFirst, SeekToLast, Seek, SeekForPrev, Next, Prev }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void MoveWithDeadline(DeadlineMove move, ReadOnlySpan<byte> target)
+    {
+        ReadOptions o = _deadlineOptions!;
+        _deadlineOptions = null;
+        long token = Table.ReadDeadline.Enter(o);
+        try
+        {
+            switch (move)
+            {
+                case DeadlineMove.SeekToFirst: SeekToFirst(); break;
+                case DeadlineMove.SeekToLast: SeekToLast(); break;
+                case DeadlineMove.Seek: Seek(target); break;
+                case DeadlineMove.SeekForPrev: SeekForPrev(target); break;
+                case DeadlineMove.Next: Next(); break;
+                default: Prev(); break;
+            }
+        }
+        finally
+        {
+            Table.ReadDeadline.Exit(token);
+            _deadlineOptions = o;
+        }
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -197,6 +240,12 @@ public sealed class Iterator : IDisposable
     /// <summary>Positions at the first key &gt;= <paramref name="target"/>.</summary>
     public void Seek(ReadOnlySpan<byte> target)
     {
+        if (_deadlineOptions is not null)
+        {
+            MoveWithDeadline(DeadlineMove.Seek, target);
+            return;
+        }
+        if (_tailing is not null) _tailing.RenewIfStale(this);
         if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Tracing.TraceType.IteratorSeek, target);
         if (_stats is null)
         {
@@ -219,6 +268,12 @@ public sealed class Iterator : IDisposable
     /// <summary>Positions at the last key &lt;= <paramref name="target"/>.</summary>
     public void SeekForPrev(ReadOnlySpan<byte> target)
     {
+        if (_deadlineOptions is not null)
+        {
+            MoveWithDeadline(DeadlineMove.SeekForPrev, target);
+            return;
+        }
+        if (_tailing is not null) TailingNotSupported("ForwardIterator::SeekForPrev()");
         if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Tracing.TraceType.IteratorSeekForPrev, target);
         if (_stats is null)
         {
@@ -240,6 +295,12 @@ public sealed class Iterator : IDisposable
 
     public void Next()
     {
+        if (_deadlineOptions is not null)
+        {
+            MoveWithDeadline(DeadlineMove.Next, default);
+            return;
+        }
+        if (_tailing is not null && _tailing.IsStale && TailingRenewForNext()) return;
         if (_stats is null)
         {
             _it.Next();
@@ -259,6 +320,12 @@ public sealed class Iterator : IDisposable
 
     public void Prev()
     {
+        if (_deadlineOptions is not null)
+        {
+            MoveWithDeadline(DeadlineMove.Prev, default);
+            return;
+        }
+        if (_tailing is not null) TailingNotSupported("ForwardIterator::Prev");
         if (_stats is null)
         {
             _it.Prev();
@@ -309,21 +376,90 @@ public sealed class Iterator : IDisposable
         }
     }
 
-    public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) => _it.SeekToFirstAsync(cancellationToken);
-    public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default) => _it.SeekToLastAsync(cancellationToken);
+    public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default)
+    {
+        _tailing?.RenewIfStale(this);
+        return _it.SeekToFirstAsync(cancellationToken);
+    }
+
+    public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default)
+    {
+        if (_tailing is not null) TailingNotSupported("ForwardIterator::SeekToLast()");
+        return _it.SeekToLastAsync(cancellationToken);
+    }
+
     public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
+        _tailing?.RenewIfStale(this);
         if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Tracing.TraceType.IteratorSeek, target.Span);
         return _it.SeekAsync(target, cancellationToken);
     }
 
     public ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
+        if (_tailing is not null) TailingNotSupported("ForwardIterator::SeekForPrev()");
         if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Tracing.TraceType.IteratorSeekForPrev, target.Span);
         return _it.SeekForPrevAsync(target, cancellationToken);
     }
-    public ValueTask NextAsync(CancellationToken cancellationToken = default) => _it.NextAsync(cancellationToken);
-    public ValueTask PrevAsync(CancellationToken cancellationToken = default) => _it.PrevAsync(cancellationToken);
+    public ValueTask NextAsync(CancellationToken cancellationToken = default)
+    {
+        if (_tailing is not null && _tailing.IsStale && TailingRenewForNext()) return ValueTask.CompletedTask;
+        return _it.NextAsync(cancellationToken);
+    }
+
+    public ValueTask PrevAsync(CancellationToken cancellationToken = default)
+    {
+        if (_tailing is not null) TailingNotSupported("ForwardIterator::Prev");
+        return _it.PrevAsync(cancellationToken);
+    }
+
+    // ---- tailing (ReadOptions::tailing, ForwardIterator) ----
+
+    /// <summary>
+    /// Rebuilds the iterator stack of a tailing iterator when the column family's super version changed (a memtable
+    /// switch, flush or compaction), like ForwardIterator::RenewIterators; null for regular iterators.
+    /// </summary>
+    internal abstract class TailingSource
+    {
+        /// <summary>The column family installed a new super version since the current stack was built.</summary>
+        public abstract bool IsStale { get; }
+
+        /// <summary>A new DB iterator over the current super version (at kMaxSequenceNumber).</summary>
+        public abstract DbIter Build();
+
+        public void RenewIfStale(Iterator owner)
+        {
+            if (IsStale) owner.ReplaceInner(Build());
+        }
+    }
+
+    private TailingSource? _tailing;
+
+    internal void SetTailing(TailingSource source) => _tailing = source;
+
+    private void ReplaceInner(DbIter fresh)
+    {
+        DbIter old = _it;
+        _it = fresh;
+        old.Dispose();
+    }
+
+    /// <summary>
+    /// ForwardIterator::Next after a super version change: renew, re-seek to the current key and advance past it.
+    /// Returns true when the re-seek already moved past the old key (nothing left to do).
+    /// </summary>
+    private bool TailingRenewForNext()
+    {
+        byte[] current = _it.Key.ToArray();
+        ReplaceInner(_tailing!.Build());
+        _it.Seek(current);
+        return !_it.Valid || CompareKeys(_it.Key, current) != 0;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void TailingNotSupported(string op) =>
+        throw new RocksDbException(StatusCode.NotSupported, "Not implemented: " + op);
 
     /// <summary>
     /// Reads the current value with async I/O if it is still pending (a value stored in a blob file is otherwise read

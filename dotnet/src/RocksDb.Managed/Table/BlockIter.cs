@@ -190,6 +190,8 @@ public sealed class BlockIter : IDisposable
     {
         _kind = kind;
         _block = block;
+        _readAmp = kind == BlockIterKind.Data ? block.ReadAmp : null;
+        _lastBitmapOffset = -1;
         _kvProtectionBytes = block.KvProtectionBytes;
         _data = block.Buffer;
         _keysEnd = block.KeysEndOffset;
@@ -247,7 +249,33 @@ public sealed class BlockIter : IDisposable
     }
 
     /// <summary>Raw value (for index blocks: the encoded index value bytes).</summary>
-    public ReadOnlySpan<byte> Value { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => new(_data, _valueOffset, _valueLength); }
+    public ReadOnlySpan<byte> Value
+    {
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        get
+        {
+            if (_readAmp is not null) MarkReadAmp();
+            return new(_data, _valueOffset, _valueLength);
+        }
+    }
+
+    // read_amp_bytes_per_bit: the data block's bitmap (null when off) and the entry last marked (last_bitmap_offset_).
+    private BlockReadAmpBitmap? _readAmp;
+    private int _lastBitmapOffset;
+
+    /// <summary>
+    /// DataBlockIter::value(): the first read of each entry's value marks [entry offset, NextEntryOffset() - 1] in
+    /// the block's read-amp bitmap. Not tracked for blocks with separated key/value storage.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void MarkReadAmp()
+    {
+        if (_current < _keysEnd && _current != _lastBitmapOffset && _valuesSection < 0)
+        {
+            _readAmp!.Mark((uint)_current, (uint)(_valueOffset + _valueLength - 1));
+            _lastBitmapOffset = _current;
+        }
+    }
 
     /// <summary>Raw value as memory over the block buffer (valid while the block is alive).</summary>
     public ReadOnlyMemory<byte> ValueMemory => new(_data, _valueOffset, _valueLength);

@@ -47,6 +47,8 @@ public sealed class Block : IDisposable
     public int Length => _length;
     /// <summary>Offset of the restart array (= end of the entries section).</summary>
     public int RestartOffset { get; private set; }
+    /// <summary>read_amp_bytes_per_bit: the bitmap of the bytes of this data block that were read (null when off).</summary>
+    internal BlockReadAmpBitmap? ReadAmp { get; set; }
     public int NumRestarts { get; private set; }
     /// <summary>Hash index bucket array offset, or -1 if the block has no data block hash index.</summary>
     public int HashMapOffset { get; private set; }
@@ -93,6 +95,7 @@ public sealed class Block : IDisposable
         b._refCount = 1;
         b._kvProtectionBytes = 0;
         b._kvProtection = null;
+        b.ReadAmp = null;
         try
         {
             b.Parse();

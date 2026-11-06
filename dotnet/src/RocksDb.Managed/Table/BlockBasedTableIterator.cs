@@ -397,11 +397,14 @@ public sealed class BlockBasedTableIterator : IDisposable
             // so disable prefix check.
             return true;
         }
-        if (_prefix.CheckFilter && !_reader.PrefixRangeMayMatch(target, _prefix, _flags))
+        // skip_filters (optimize_filters_for_hits on the last non-empty level): BlockBasedTable::NewIterator check_filter.
+        if (!_prefix.CheckFilter || (_flags & TableReadFlags.SkipFilters) != 0) return true;
+        if (!_reader.PrefixRangeMayMatch(target, _prefix, _flags, out bool filterChecked))
         {
-            _reader.RecordSeekFiltered();
+            _reader.RecordSeekFilterResult(filtered: true);
             return false;
         }
+        if (filterChecked) _reader.RecordSeekFilterResult(filtered: false);
         return true;
     }
 
@@ -523,6 +526,8 @@ public sealed class BlockBasedTableIterator : IDisposable
     /// </summary>
     private Env.AsyncPrefetchBuffer? PrefetchIfNeeded(BlockHandle h)
     {
+        // BlockPrefetcher::PrefetchIfNeeded: no prefetching for kBlockCacheTier reads (no I/O allowed).
+        if ((_flags & TableReadFlags.BlockCacheTier) != 0) return null;
         if (_readaheadMode != ReadaheadMode.Auto)
         {
             return _readaheadMode == ReadaheadMode.Compaction ? PrefetchForCompaction(h) : _prefetch;

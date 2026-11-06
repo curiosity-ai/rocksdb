@@ -181,6 +181,52 @@ internal sealed class GetContext
         HasTimestamp = false;
         _tsFromRangeTombstone = false;
         _blobUserKey.Clear();
+        ReplayLog = null;
+    }
+
+    /// <summary>
+    /// GetContext::replay_log_: while a row cache entry is being built (TableCache::Get on a row cache miss), every
+    /// entry this context processes from the table is appended as type byte + length-prefixed value
+    /// (appendToReplayLog). Null otherwise.
+    /// </summary>
+    public PooledBufferWriter? ReplayLog;
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void AppendToReplayLog(PooledBufferWriter log, EntryType type, ReadOnlySpan<byte> value)
+    {
+        Span<byte> head = log.GetSpan(1 + Coding.MaxVarint32Length);
+        head[0] = (byte)type;
+        int n = 1 + Coding.EncodeVarint32(head[1..], (uint)value.Length);
+        log.Advance(n);
+        log.Write(value);
+    }
+
+    /// <summary>
+    /// replayGetContextLog (table/get_context.cc): feeds the entries of a row cache entry to <see cref="SaveValue"/> as
+    /// versions of <paramref name="userKey"/> at <paramref name="sequence"/>, until a terminal state.
+    /// </summary>
+    [SkipLocalsInit]
+    public void Replay(ReadOnlySpan<byte> log, ReadOnlySpan<byte> userKey, ulong sequence)
+    {
+        int n = userKey.Length + DbFormat.InternalKeyFooterSize;
+        byte[]? rented = null;
+        Span<byte> ikey = n <= 256 ? stackalloc byte[256] : (rented = System.Buffers.ArrayPool<byte>.Shared.Rent(n));
+        try
+        {
+            userKey.CopyTo(ikey);
+            while (!log.IsEmpty)
+            {
+                var type = (EntryType)log[0];
+                log = log[1..];
+                if (!Coding.GetLengthPrefixedSlice(ref log, out ReadOnlySpan<byte> value)) ThrowHelper.Corruption("bad row cache entry");
+                DbFormat.AppendInternalKey(ikey, userKey, sequence, type);
+                if (!SaveValue(ikey[..n], value)) break;
+            }
+        }
+        finally
+        {
+            if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
     /// <summary>
@@ -208,6 +254,7 @@ internal sealed class GetContext
     /// <summary><see cref="SaveValue"/> with the key footer already decoded.</summary>
     public bool SaveEntry(ulong seq, EntryType type, ReadOnlySpan<byte> value)
     {
+        if (ReplayLog is { } log) AppendToReplayLog(log, type, value);
         if (MaxCoveringTombstoneSeq > seq && type is EntryType.Value or EntryType.Merge or EntryType.Deletion or EntryType.SingleDeletion
                 or EntryType.DeletionWithTimestamp or EntryType.ValuePreferredSeqno or EntryType.BlobIndex or EntryType.WideColumnEntity)
         {

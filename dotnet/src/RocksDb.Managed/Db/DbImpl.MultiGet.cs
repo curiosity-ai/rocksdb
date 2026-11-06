@@ -33,6 +33,9 @@ internal sealed partial class DbImpl
         long t0 = st is null ? 0 : st.StartTimer();
         SuperVersion sv = GetAndRefSuperVersion(cfd, out int svSlot);
         ulong snapshot = ReadSequence(options);
+        // ReadOptions::deadline: file reads of a synchronous run check it (the thread-local deadline must not leak to
+        // other work on the threads an async run continues on).
+        long deadlineToken = synchronous ? ReadDeadline.Enter(options) : -1;
         try
         {
             if (cfd.TimestampSize != 0)
@@ -46,19 +49,37 @@ internal sealed partial class DbImpl
             batch.BeginRun(cfd.MergeOperator, snapshot, ucmp);
             batch.ReadFlags = TableReadFlagsExtensions.FromReadOptions(options);
             int n = batch.Count;
+            if (ReadDeadline.IsExceeded(options))
+            {
+                // MultiGetImpl: the deadline is checked before each batch of keys; the keys left are TimedOut.
+                for (int k = 0; k < n; k++) batch.SetTimedOut(k);
+                batch.FinishRun();
+                if (st is not null) RecordMultiGet(st, batch, t0);
+                return;
+            }
             int[] order = batch.Order;
-            bool memtableOnly = options?.ReadTier == ReadTier.MemtableTier;
+            // MultiGetImpl skip_memtable: kPersistedTier reads skip the memtables once data was written without the
+            // WAL. (kMemtableTier does not restrict MultiGet: like Get, it reads the table files.)
+            bool skipMemTables = SkipMemTables(options);
+            // value_size_soft_limit: once the values found so far exceed it, the keys not yet done are Aborted.
+            ulong softLimit = options?.ValueSizeSoftLimit ?? ulong.MaxValue;
+            ulong valueSize = 0;
 
             // Memtables (MultiGetImpl: per key, newest memtable first). Keys still pending stay in sorted order.
             int pending = 0;
             for (int i = 0; i < n; i++)
             {
                 int k = order[i];
-                if (GetFromMemTables(sv, batch.UserKey(k), snapshot, batch.Context(k))) continue;
-                if (memtableOnly)
+                if (!skipMemTables && GetFromMemTables(sv, batch.UserKey(k), snapshot, batch.Context(k)))
                 {
-                    if (batch.Context(k).State != GetContext.GetState.NotFound)
-                        batch.SetError(k, new RocksDbException(StatusCode.Incomplete, "Incomplete: merge operands not all in memtables"));
+                    if (softLimit != ulong.MaxValue && AddValueSize(batch, k, ref valueSize, softLimit))
+                    {
+                        // MemTable::MultiGet: every key still in the range is Aborted.
+                        for (int j = i + 1; j < n; j++) batch.SetAborted(order[j]);
+                        for (int j = 0; j < pending; j++) batch.SetAborted(order[j]);
+                        pending = 0;
+                        break;
+                    }
                     continue;
                 }
                 order[pending++] = k;
@@ -70,6 +91,7 @@ internal sealed partial class DbImpl
                 int[] sub = batch.Sub;
                 // L0: every file may overlap every key; newest first.
                 FileMetaData[] l0 = s.LevelFilesArray(0);
+                bool checkL0Range = CheckL0KeyRange(s, l0.Length); // FilePickerMultiGet
                 for (int fi = 0; fi < l0.Length && pending > 0; fi++)
                 {
                     FileMetaData f = l0[fi];
@@ -77,12 +99,14 @@ internal sealed partial class DbImpl
                     for (int j = 0; j < pending; j++)
                     {
                         int k = order[j];
-                        if (UserKeyInFileRange(ucmp, batch.UserKey(k), f)) sub[m++] = k;
+                        if (!checkL0Range || UserKeyInFileRange(ucmp, batch.UserKey(k), f)) sub[m++] = k;
                     }
                     if (m == 0) continue;
+                    batch.ReadFlags = WithFilterSkip(cfd, s, 0, fi == l0.Length - 1, batch.ReadFlags);
                     await MultiGetFromFileAsync(cfd, f, batch, m, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
                     SampleMultiGetReads(f, batch, m);
                     MarkHitLevel(batch, m, 0);
+                    if (softLimit != ulong.MaxValue && ApplySoftLimit(batch, m, ref valueSize, softLimit)) AbortPending(batch, order, pending);
                     pending = RemoveDone(batch, order, pending);
                 }
                 // Sorted levels: one file per key (FindFile on the lookup key); consecutive keys of a file are grouped.
@@ -104,9 +128,15 @@ internal sealed partial class DbImpl
                             if (ucmp.Compare(batch.UserKey(k), DbFormat.ExtractUserKey(f.Smallest)) >= 0) sub[m++] = k;
                         }
                         if (m == 0) continue;
+                        batch.ReadFlags = WithFilterSkip(cfd, s, level, false, batch.ReadFlags);
                         await MultiGetFromFileAsync(cfd, f, batch, m, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
                         SampleMultiGetReads(f, batch, m);
                         MarkHitLevel(batch, m, level);
+                        if (softLimit != ulong.MaxValue && ApplySoftLimit(batch, m, ref valueSize, softLimit))
+                        {
+                            AbortPending(batch, order, pending);
+                            break;
+                        }
                     }
                     pending = RemoveDone(batch, order, pending);
                 }
@@ -116,15 +146,69 @@ internal sealed partial class DbImpl
             {
                 GetContext ctx = batch.Context(k);
                 if (!ctx.NeedsBlobResolution) continue;
-                if (synchronous) ctx.ResolveBlob(cfd.BlobSource, sv.Current.Storage, options, batch.UserKey(k));
-                else await ctx.ResolveBlobAsync(cfd.BlobSource, sv.Current.Storage, options, batch.UserKeyMemory(k), cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    if (synchronous) ctx.ResolveBlob(cfd.BlobSource, sv.Current.Storage, options, batch.UserKey(k));
+                    else await ctx.ResolveBlobAsync(cfd.BlobSource, sv.Current.Storage, options, batch.UserKeyMemory(k), cancellationToken).ConfigureAwait(false);
+                }
+                catch (RocksDbException e) when (e.Code == StatusCode.Incomplete)
+                {
+                    // Version::MultiGetBlob with kBlockCacheTier: a blob that is not cached makes only this key Incomplete.
+                    batch.SetError(k, e);
+                }
             }
             batch.FinishRun();
             if (st is not null) RecordMultiGet(st, batch, t0);
         }
         finally
         {
+            ReadDeadline.Exit(deadlineToken);
             ReturnAndCleanupSuperVersion(cfd, sv, svSlot);
+        }
+    }
+
+    /// <summary>
+    /// MultiGetRange::AddValueSize for key <paramref name="k"/> found with a value; true when the total now exceeds
+    /// <paramref name="limit"/> (read_options.value_size_soft_limit). Deviation: a value still to be merged counts
+    /// with the size of its base value (upstream adds the merged size).
+    /// </summary>
+    private static bool AddValueSize(MultiGetBatch batch, int k, ref ulong valueSize, ulong limit)
+    {
+        GetContext ctx = batch.Context(k);
+        if (ctx.State != GetContext.GetState.Found || batch.GetStatus(k) == MultiGetStatus.Error) return false;
+        valueSize += (ulong)ctx.Value.WrittenCount;
+        return valueSize > limit;
+    }
+
+    /// <summary>
+    /// The value_size_soft_limit check of Version::MultiGetFromSST for the keys batch.Sub[0..count) just looked up in
+    /// one file (in key order): the key whose value crosses the limit is returned, later keys found in the file are
+    /// Aborted. True when the limit was crossed.
+    /// </summary>
+    private static bool ApplySoftLimit(MultiGetBatch batch, int count, ref ulong valueSize, ulong limit)
+    {
+        int[] sub = batch.Sub;
+        bool exceeded = valueSize > limit;
+        for (int i = 0; i < count; i++)
+        {
+            int k = sub[i];
+            if (exceeded)
+            {
+                if (batch.Context(k).State == GetContext.GetState.Found) batch.SetAborted(k);
+                continue;
+            }
+            exceeded = AddValueSize(batch, k, ref valueSize, limit);
+        }
+        return exceeded;
+    }
+
+    /// <summary>Version::MultiGet after Aborted: every key whose lookup is not finished is Aborted.</summary>
+    private static void AbortPending(MultiGetBatch batch, int[] order, int pending)
+    {
+        for (int i = 0; i < pending; i++)
+        {
+            int k = order[i];
+            if (!batch.Context(k).Done) batch.SetAborted(k);
         }
     }
 
@@ -195,7 +279,106 @@ internal sealed partial class DbImpl
     private static ValueTask MultiGetFromFileAsync(ColumnFamilyData cfd, FileMetaData f, MultiGetBatch batch, int count, ulong snapshot, bool synchronous,
         CancellationToken cancellationToken)
     {
-        TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels);
+        if (cfd.TableCache.RowCache is not null) return MultiGetFromFileWithRowCacheAsync(cfd, f, batch, count, snapshot, synchronous, cancellationToken);
+        return MultiGetFromFileCoreAsync(cfd, f, batch, count, snapshot, synchronous, cancellationToken);
+    }
+
+    /// <summary>
+    /// TableCache::MultiGet with a row cache: keys with a cached entry for the file are replayed (ROW_CACHE_HIT), the
+    /// others (ROW_CACHE_MISS) are looked up in the table together and their visited entries cached.
+    /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private static async ValueTask MultiGetFromFileWithRowCacheAsync(ColumnFamilyData cfd, FileMetaData f, MultiGetBatch batch, int count, ulong snapshot,
+        bool synchronous, CancellationToken cancellationToken)
+    {
+        TableCache tc = cfd.TableCache;
+        Cache.RowCache rc = tc.RowCache!;
+        int[] sub = batch.Sub;
+        int[] original = System.Buffers.ArrayPool<int>.Shared.Rent(count);
+        Util.PooledBufferWriter?[] logs = System.Buffers.ArrayPool<Util.PooledBufferWriter?>.Shared.Rent(count);
+        byte[] keyBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(256);
+        int misses = 0;
+        try
+        {
+            Array.Copy(sub, original, count);
+            for (int i = 0; i < count; i++)
+            {
+                int k = original[i];
+                ReadOnlySpan<byte> userKey = batch.UserKey(k);
+                if (keyBuf.Length < userKey.Length + TableCache.RowCacheKeyPrefixMax)
+                {
+                    System.Buffers.ArrayPool<byte>.Shared.Return(keyBuf);
+                    keyBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(userKey.Length + TableCache.RowCacheKeyPrefixMax);
+                }
+                int n = tc.RowCacheKey(keyBuf, f, userKey, snapshot, out ulong replaySeq);
+                if (rc.TryGet(keyBuf.AsSpan(0, n), out byte[]? log))
+                {
+                    tc.Statistics?.RecordTick(Ticker.RowCacheHit);
+                    batch.Context(k).Replay(log, userKey, replaySeq);
+                    continue;
+                }
+                tc.Statistics?.RecordTick(Ticker.RowCacheMiss);
+                Util.PooledBufferWriter w = Util.ObjectPools.RentWriter();
+                logs[misses] = w;
+                batch.Context(k).ReplayLog = w;
+                sub[misses++] = k;
+            }
+            if (misses > 0)
+            {
+                try
+                {
+                    await MultiGetFromFileCoreAsync(cfd, f, batch, misses, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    for (int i = 0; i < misses; i++) batch.Context(sub[i]).ReplayLog = null;
+                }
+                for (int i = 0; i < misses; i++)
+                {
+                    Util.PooledBufferWriter w = logs[i]!;
+                    if (w.WrittenCount == 0 || batch.GetStatus(sub[i]) == MultiGetStatus.Error) continue;
+                    ReadOnlySpan<byte> userKey = batch.UserKey(sub[i]);
+                    if (keyBuf.Length < userKey.Length + TableCache.RowCacheKeyPrefixMax)
+                    {
+                        System.Buffers.ArrayPool<byte>.Shared.Return(keyBuf);
+                        keyBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(userKey.Length + TableCache.RowCacheKeyPrefixMax);
+                    }
+                    int n = tc.RowCacheKey(keyBuf, f, userKey, snapshot, out _);
+                    rc.Insert(keyBuf.AsSpan(0, n), w.WrittenSpan);
+                }
+            }
+        }
+        finally
+        {
+            for (int i = 0; i < misses; i++)
+            {
+                Util.ObjectPools.ReturnWriter(logs[i]!);
+                logs[i] = null;
+            }
+            // The caller continues with batch.Sub[0..count) in key order.
+            Array.Copy(original, sub, count);
+            System.Buffers.ArrayPool<int>.Shared.Return(original);
+            System.Buffers.ArrayPool<Util.PooledBufferWriter?>.Shared.Return(logs);
+            System.Buffers.ArrayPool<byte>.Shared.Return(keyBuf);
+        }
+    }
+
+    /// <summary>The table lookup of <see cref="MultiGetFromFileAsync"/>.</summary>
+    private static ValueTask MultiGetFromFileCoreAsync(ColumnFamilyData cfd, FileMetaData f, MultiGetBatch batch, int count, ulong snapshot, bool synchronous,
+        CancellationToken cancellationToken)
+    {
+        FragmentedRangeTombstoneList? rangeDels;
+        TableReaderLease lease;
+        try
+        {
+            lease = cfd.TableCache.GetReaderForVersion(f, out rangeDels, batch.ReadFlags);
+        }
+        catch (RocksDbException e) when (e.Code == StatusCode.Incomplete)
+        {
+            // TableCache::MultiGet with no_io and a table that is not open: the keys of this file are Incomplete.
+            for (int i = 0; i < count; i++) batch.SetIncomplete(batch.Sub[i]);
+            return ValueTask.CompletedTask;
+        }
         ValueTask t;
         try
         {

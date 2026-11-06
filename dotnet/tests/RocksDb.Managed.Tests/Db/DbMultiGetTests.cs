@@ -124,8 +124,10 @@ public sealed class DbMultiGetTests
     }
 
     [TestMethod]
-    public void MemtableTierReportsIncompleteMergePerKey()
+    public void MemtableTierDoesNotRestrictMultiGet()
     {
+        // kMemtableTier only affects iterators upstream (NewInternalIterator): MultiGet reads the table files and
+        // completes merges whose operands span memtable and table.
         MemoryFileSystem fs = NewFs();
         using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { MergeOperator = new StringAppendMergeOperator() });
         db.Put(B("base"), B("v"));
@@ -136,10 +138,9 @@ public sealed class DbMultiGetTests
         using var batch = new MultiGetBatch();
         batch.Add(B("base")).Add(B("mem")).Add(B("flushed"));
         db.MultiGet(new ReadOptions { ReadTier = ReadTier.MemtableTier }, batch);
-        Assert.AreEqual(MultiGetStatus.Error, batch.GetStatus(0));
-        Assert.AreEqual(StatusCode.Incomplete, batch.GetError(0)!.Code);
+        Assert.AreEqual("v,m", S(batch.GetValue(0).ToArray()));
         Assert.AreEqual("x", S(batch.GetValue(1).ToArray()));
-        Assert.AreEqual(MultiGetStatus.NotFound, batch.GetStatus(2));
+        Assert.AreEqual("f", S(batch.GetValue(2).ToArray()));
 
         db.MultiGet(batch);
         Assert.AreEqual("v,m", S(batch.GetValue(0).ToArray()));

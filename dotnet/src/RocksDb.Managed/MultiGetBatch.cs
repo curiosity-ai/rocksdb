@@ -376,6 +376,33 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
 
     bool ITableMultiGetBatch.Visit(int key, ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value) => _contexts[key]!.SaveValue(internalKey, value);
 
+    void ITableMultiGetBatch.SetIncomplete(int key) => SetIncomplete(key);
+
+    /// <summary>Fails <paramref name="key"/> with TimedOut (ReadOptions::deadline passed before its lookup).</summary>
+    internal void SetTimedOut(int key)
+    {
+        _contexts[key]!.State = GetContext.GetState.Found;
+        SetError(key, new RocksDbException(StatusCode.TimedOut, "Operation timed out: "));
+    }
+
+    /// <summary>Ends the lookup of <paramref name="key"/> with Aborted (value_size_soft_limit exceeded).</summary>
+    internal void SetAborted(int key)
+    {
+        // Status::Aborted() of MultiGetImpl / Version::MultiGet once ReadOptions::value_size_soft_limit is exceeded.
+        _contexts[key]!.State = GetContext.GetState.Found;
+        SetError(key, new RocksDbException(StatusCode.Aborted, "Operation aborted: "));
+    }
+
+    /// <summary>
+    /// Ends the lookup of <paramref name="key"/> with Incomplete (read_tier = kBlockCacheTier and data that is not in
+    /// the block cache): GetContext::MarkKeyMayExist ends the search (no older level is consulted).
+    /// </summary>
+    internal void SetIncomplete(int key)
+    {
+        _contexts[key]!.State = GetContext.GetState.Found;
+        SetError(key, new RocksDbException(StatusCode.Incomplete, "Result incomplete: no blocking io"));
+    }
+
     /// <summary>
     /// Sorts key indices by user key (ties by index, so the order is deterministic). Quicksort with insertion sort for
     /// small ranges; unlike <see cref="MemoryExtensions.Sort{T, TComparer}(Span{T}, TComparer)"/> it does not box the
