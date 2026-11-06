@@ -259,7 +259,7 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [x] table readers pin index/filter blocks from the table buffer pool (flush 171 KB -> 40 KB); `BlobReadersBoundedByMaxOpenFiles` failure root-caused: bounded table cache sorted readers by a LastUse field mutated concurrently (List.Sort 'inconsistent comparer'), now sorts a snapshot
 - [x] WAL write-error recovery with recycling on (deliberate deviation, user-accepted): 13 unit + 4 native-comparison tests incl. crash sweeps; fixed GetUpdatesSince returning the failed write (recovery-gap fence), tailing iterator missing records of a reused WAL, SstFileManager/flush deadlock
 - [x] tailing reused WALs (secondary catch-up, GetUpdatesSince, replication): fixed three reader bugs copied from upstream's FragmentBufferedReader (spin on old record, bad-length block skip, buffer dropped at bad checksum); managed secondary follows a live recycling native primary (native's own secondary hangs there); RateLimiter statistics test made deterministic with a manual clock
-- [ ] note: a replication tailer that falls a whole recycle cycle behind gets NotFound 'Gap in sequence numbers' and must resync (recycling keeps no WALs for tailers, as upstream) (by design); `BlockCacheTierInsertLookupAcrossFilesAndEviction(False)` failed once under CPU hogs (S)
+- [ ] note: a replication tailer that falls a whole recycle cycle behind gets NotFound 'Gap in sequence numbers' and must resync (recycling keeps no WALs for tailers, as upstream) (by design)
 - Out of scope by request: rocksdb-sharp arm64 / musl / jemalloc native builds (only linux-x64 built)
 
 ## Missing features wave (2026-11-03, requested)
@@ -268,7 +268,7 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [x] trie_index user-defined index (byte-identical trie blocks vs native 11.12, each side reads the other's through the trie, 0-alloc Gets); ingestion opens any table format and applies upstream's checks (plain/cuckoo files are rejected by the comparator/version checks, exactly as native rejects its own)
 - [x] OPTIONS `user_defined_index_factory=trie_index` resolved to TrieIndexFactory; `index_mode`, `use_udi_as_primary_index`, `fail_if_no_udi_on_open` typed and written like native 11.12 (compat both ways)
 - [x] Cache layers: SecondaryCache + adapter, CompressedSecondaryCache, TieredCache, persistent cache (volatile + file tier), WriteBufferManager (shared across DBs, cache charging, stalls; behaves like native's in compat tests), SimCache, CacheReservationManager; block-cache lookups unchanged when unused
-- [~] cache layers: batched MultiGet secondary lookups, compressed admission to non-volatile tiers, async persistent-cache reads (S each)
+- [x] cache layers: batched MultiGet secondary lookups, compressed admission to non-volatile (three-queue) tiers, async persistent-cache reads; index/filter blocks at table open now come from the cache (incl. secondary tiers) like upstream
 - [x] Column family export/import, remote compaction (CompactionService + OpenAndCompact; job/result format interoperates with native both ways), GetMergeOperands, PromoteL0, SuggestCompactRange, DeleteFilesInRange(s), LockWAL, Disable/EnableManualCompaction, GetCreationTimeOfOldestFile, ClipColumnFamily, GetPropertiesOfTablesInRange, OpenAndTrimHistory (compat vs native), MultiScan
 - [-] remote compaction leftovers (per-subcompaction jobs, blob compactions on the worker, paranoid_hash): out of scope (user decision)
 - [x] Query tracing + Replayer, block cache and IO tracing (trace files interoperate with native both ways), RepairDB (compat both ways), tools/RocksDb.Managed.Tools with ldb and sst_dump commands
@@ -277,6 +277,9 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [ ] (upstream NotSupported, kept) timestamps in optimistic transactions and explicit-timestamp WBWI writes
 
 ## Gaps found while porting the utilities (2026-11-06)
+
+- [x] Flaky `BlockCacheTierInsertLookupAcrossFilesAndEviction(False)`: test assumed Insert never returns TryAgain; product fixes: buffer wait no longer gives up after 100 ms (pipelined inserts were dropped), writer-thread I/O errors no longer crash the process (100/100 under CPU hogs)
+- [ ] async MultiGet with block cache 2-4% slower after the batched secondary-cache lookups (consistent across runs, within one StdDev) (S)
 
 - [ ] `max_successive_merges` is accepted but ignored (upstream folds merge operands into a Put at write time once the limit is hit) (S)
 - [ ] `min_write_buffer_number_to_merge` is ignored: immutable memtables are flushed as soon as they are sealed (M)
@@ -289,6 +292,6 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [x] WAL recycling at DB level (recycle list, in-place reuse, recyclable records, option rules; native recovers managed recycled WALs and vice versa)
 - [x] WAL settings x failure-mode matrices: unit 300 scenarios (15 factors pairwise x 15 faults; long 6,299), compat 1,152 managed-vs-native scenarios (long 36,864); 7 managed/native disagreements found and fixed (corruption messages, seqno-set-backwards check, 2PC WAL retention, 2PC after point-in-time stop, blob direct-write crash images, reused-WAL stale tail)
 - [x] GetAllKeyVersions (pooled, 0-alloc enumeration), OptionChangeMigration (all of option_change_migration_test.cc; native opens migrated DBs), MemoryUtil (+ fixed `estimate-table-readers-mem` and `size-all-mem-tables`), InfoLogFinder (finds native LOG files)
-- [~] Cache dump / load (cache_dump_load.h) (M)
+- [x] Cache dump / load (cache_dump_load.h): dump file byte-identical to upstream's layout, LRU and HyperClock, `BlockCache.ApplyToAllEntries`; no native comparison possible (no C API)
 - [x] TransactionDBMutexFactory (`TransactionDbOptions.CustomMutexFactory`; default lock path unchanged within noise, PointLockBenchmarks)
 - [x] EnvMirror as `MirrorFileSystem` (env_mirror_test.cc ported + DB workload); StackableDB has no C# equivalent (transactions / TTL are built in)
