@@ -71,6 +71,46 @@ public class TransactionTests
         Assert.AreEqual(0, db.GetLockStatusData().Count); // locks released at commit
     }
 
+    /// <summary>
+    /// TransactionDB::Write locks the batch's keys with PessimisticTransaction::LockBatch, whose handler only implements
+    /// PutCF, PutEntityCF, MergeCF and DeleteCF: a SingleDelete on a non-default column family and any DeleteRange fail
+    /// with InvalidArgument (WriteBatch::Handler defaults), and nothing of the batch is written; a SingleDelete on the
+    /// default column family is accepted. Found by the managed/native round trip (TransactionRoundTripTests).
+    /// </summary>
+    [TestMethod]
+    public void WriteBatchWithUnsupportedRecordsIsRejected()
+    {
+        using TransactionDatabase db = Open(NewFs());
+        ColumnFamily other = db.Database.CreateColumnFamily("other", new ColumnFamilyOptions());
+        db.Put(B("a"), B("1"));
+        using (WriteBatch b = db.Database.CreateWriteBatch())
+        {
+            b.Put(B("x"), B("1"));
+            b.SingleDelete(other.Id, B("a"));
+            var e = Assert.ThrowsExactly<RocksDbException>(() => db.Write(s_wo, b));
+            Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+            StringAssert.Contains(e.Message, "non-default column family and SingleDeleteCF not implemented");
+        }
+        using (WriteBatch b = db.Database.CreateWriteBatch())
+        {
+            b.Put(B("x"), B("1"));
+            b.DeleteRange(0, B("a"), B("b"));
+            var e = Assert.ThrowsExactly<RocksDbException>(() => db.Write(s_wo, b));
+            Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+            StringAssert.Contains(e.Message, "DeleteRangeCF not implemented");
+        }
+        Assert.IsNull(db.Database.Get(B("x")));
+        Assert.AreEqual(0, db.GetLockStatusData().Count);
+        using (WriteBatch b = db.Database.CreateWriteBatch())
+        {
+            b.SingleDelete(0, B("a"));
+            b.Put(B("x"), B("2"));
+            db.Write(s_wo, b);
+        }
+        Assert.IsNull(db.Database.Get(B("a")));
+        Assert.AreEqual("2", GetString(db.Database, "x"));
+    }
+
     [TestMethod]
     public void WriteConflictTest()
     {

@@ -743,6 +743,7 @@ internal class PessimisticTransaction : Transaction
     {
         var collector = new KeyCollector(new Dictionary<uint, SortedSet<byte[]>>());
         batch.Iterate(ref collector);
+        if (collector.Error is { } error) ThrowHelper.InvalidArgument(error);
         var keysToUnlock = new LockTracker();
         try
         {
@@ -769,27 +770,44 @@ internal class PessimisticTransaction : Transaction
         }
     }
 
-    private readonly struct KeyCollector(Dictionary<uint, SortedSet<byte[]>> keys) : IWriteBatchHandler
+    /// <summary>
+    /// The LockBatch handler (utilities/transactions/pessimistic_transaction.cc, PessimisticTransaction::LockBatch): it
+    /// overrides PutCF, PutEntityCF, MergeCF and DeleteCF only, so every other record falls back to the
+    /// WriteBatch::Handler defaults (include/rocksdb/write_batch.h) and the write fails with InvalidArgument: SingleDelete
+    /// on a non-default column family ("non-default column family and SingleDeleteCF not implemented"; on the default
+    /// column family the default handler accepts it without locking the key), DeleteRange ("DeleteRangeCF not
+    /// implemented"), TimedPut ("TimedPutCF not implemented") and blob indexes ("PutBlobIndexCF not implemented").
+    /// Iteration stops at the first such record, like WriteBatch::Iterate.
+    /// </summary>
+    private struct KeyCollector(Dictionary<uint, SortedSet<byte[]>> keys) : IWriteBatchHandler
     {
         private static readonly IComparer<byte[]> s_bytewise = Comparer<byte[]>.Create(static (a, b) => a.AsSpan().SequenceCompareTo(b));
 
-        public Dictionary<uint, SortedSet<byte[]>> Keys => keys;
+        public readonly Dictionary<uint, SortedSet<byte[]>> Keys => keys;
 
-        private void Record(uint cf, ReadOnlySpan<byte> key)
+        /// <summary>The InvalidArgument message of the first record the upstream handler does not implement.</summary>
+        public string? Error { get; private set; }
+
+        private readonly void Record(uint cf, ReadOnlySpan<byte> key)
         {
             if (!keys.TryGetValue(cf, out SortedSet<byte[]>? set)) keys[cf] = set = new SortedSet<byte[]>(s_bytewise);
             set.Add(key.ToArray());
         }
 
-        public bool Continue() => true;
-        public void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Record(columnFamilyId, key);
-        public void TimedPut(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong writeUnixTime) => Record(columnFamilyId, key);
-        public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) => Record(columnFamilyId, key);
-        public void Delete(uint columnFamilyId, ReadOnlySpan<byte> key) => Record(columnFamilyId, key);
-        public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key) => Record(columnFamilyId, key);
-        public void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) { }
-        public void Merge(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Record(columnFamilyId, key);
-        public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex) => Record(columnFamilyId, key);
+        private void Fail(string message) => Error ??= message;
+
+        public readonly bool Continue() => Error is null;
+        public readonly void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Record(columnFamilyId, key);
+        public void TimedPut(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong writeUnixTime) => Fail("TimedPutCF not implemented");
+        public readonly void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) => Record(columnFamilyId, key);
+        public readonly void Delete(uint columnFamilyId, ReadOnlySpan<byte> key) => Record(columnFamilyId, key);
+        public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key)
+        {
+            if (columnFamilyId != 0) Fail("non-default column family and SingleDeleteCF not implemented");
+        }
+        public void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) => Fail("DeleteRangeCF not implemented");
+        public readonly void Merge(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Record(columnFamilyId, key);
+        public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex) => Fail("PutBlobIndexCF not implemented");
         public void LogData(ReadOnlySpan<byte> blob) { }
         public void MarkBeginPrepare(bool unprepare) { }
         public void MarkEndPrepare(ReadOnlySpan<byte> xid) { }
