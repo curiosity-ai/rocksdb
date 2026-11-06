@@ -135,6 +135,46 @@ public sealed class PropertiesStatisticsCompatTests
         }
         Assert.AreEqual(2, Directory.GetFiles(dir.Path, "LOG.old.*").Length); // and native rotated ours
     }
+    /// <summary>
+    /// rocksdb.estimate-num-keys (InternalStats::HandleEstimateNumKeys): memtable deletes of keys that live in tables
+    /// cancel those keys, so the sum is clamped once and not per part. Same workload on both sides, three LSM shapes.
+    /// </summary>
+    [TestMethod]
+    public void EstimateNumKeysMatchesNative()
+    {
+        using var nativeDir = new TempDir("enk-n");
+        using var managedDir = new TempDir("enk-m");
+        var nativeValues = new List<string>();
+        var no = new RocksDbSharp.DbOptions().SetCreateIfMissing(true).SetDisableAutoCompactions(1);
+        s_keepAlive.Add(no);
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(no, nativeDir.Path))
+        {
+            var flush = new RocksDbSharp.FlushOptions().SetWaitForFlush(true);
+            for (int i = 0; i < 100; i++) db.Put(K(i), K(i));
+            db.Flush(flush);
+            for (int i = 0; i < 50; i++) db.Remove(K(i));
+            nativeValues.Add(db.GetProperty("rocksdb.estimate-num-keys"));
+            db.Flush(flush);
+            nativeValues.Add(db.GetProperty("rocksdb.estimate-num-keys"));
+            for (int i = 0; i < 80; i++) db.Remove(K(1000 + i)); // deletes of keys that never existed
+            nativeValues.Add(db.GetProperty("rocksdb.estimate-num-keys"));
+        }
+        var managedValues = new List<string>();
+        using (RocksDatabase db = RocksDatabase.Open(managedDir.Path, new DbOptions { CreateIfMissing = true }, new ColumnFamilyOptions { DisableAutoCompactions = true }))
+        {
+            for (int i = 0; i < 100; i++) db.Put(K(i), K(i));
+            db.Flush();
+            for (int i = 0; i < 50; i++) db.Delete(K(i));
+            managedValues.Add(db.GetProperty(DbProperties.EstimateNumKeys)!);
+            db.Flush();
+            managedValues.Add(db.GetProperty(DbProperties.EstimateNumKeys)!);
+            for (int i = 0; i < 80; i++) db.Delete(K(1000 + i));
+            managedValues.Add(db.GetProperty(DbProperties.EstimateNumKeys)!);
+        }
+        CollectionAssert.AreEqual(new[] { "50", "50", "0" }, nativeValues, string.Join(",", nativeValues));
+        CollectionAssert.AreEqual(nativeValues, managedValues, string.Join(",", managedValues));
+    }
+
     private static ulong TickerValue(string statistics, string name)
     {
         Match m = Regex.Match(statistics, "^" + Regex.Escape(name) + " COUNT : (\\d+)$", RegexOptions.Multiline);

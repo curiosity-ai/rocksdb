@@ -391,7 +391,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 case DbProperties.CurSizeActiveMemTable:
                     return sv.Mem.ApproximateMemoryUsage.ToString(CultureInfo.InvariantCulture);
                 case DbProperties.EstimateNumKeys:
-                    return EstimateNumKeys(cfd, sv).ToString(CultureInfo.InvariantCulture);
+                    return EstimateNumKeys(sv).ToString(CultureInfo.InvariantCulture);
                 case DbProperties.TotalSstFilesSize:
                 case DbProperties.LiveSstFilesSize:
                     {
@@ -419,24 +419,59 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
     }
 
-    /// <summary>Port of "rocksdb.estimate-num-keys": memtable entries minus 2x deletes plus table-property estimates.</summary>
-    private static ulong EstimateNumKeys(ColumnFamilyData cfd, SuperVersion sv)
+    /// <summary>
+    /// Port of InternalStats::HandleEstimateNumKeys (db/internal_stats.cc): memtable entries + immutable memtable
+    /// entries + VersionStorageInfo::GetEstimatedActiveKeys, minus twice the memtable deletes, clamped at 0 once (the
+    /// memtable parts are not clamped on their own: memtable deletes of keys in tables cancel those keys).
+    /// </summary>
+    private static ulong EstimateNumKeys(SuperVersion sv)
     {
-        long mem = sv.Mem.NumEntries - 2 * sv.Mem.NumDeletes;
-        foreach (MemTable m in sv.Imm) mem += m.NumEntries - 2 * m.NumDeletes;
-        long files = 0;
-        VersionStorageInfo s = sv.Current.Storage;
+        ulong keys = (ulong)sv.Mem.NumEntries;
+        ulong deletes = (ulong)sv.Mem.NumDeletes;
+        foreach (MemTable m in sv.Imm)
+        {
+            keys += (ulong)m.NumEntries;
+            deletes += (ulong)m.NumDeletes;
+        }
+        ulong est = EstimatedActiveKeys(sv.Current.Storage);
+        // Saturating, like the uint64 arithmetic upstream can only overflow at GetEstimatedActiveKeys' max value.
+        keys = est > ulong.MaxValue - keys ? ulong.MaxValue : keys + est;
+        return keys > deletes * 2 ? keys - deletes * 2 : 0;
+    }
+
+    /// <summary>
+    /// Port of VersionStorageInfo::GetEstimatedActiveKeys (db/version_set.cc): non-deletions minus deletions of the
+    /// current version's files whose entry stats are loaded (current_num_non_deletions_ / current_num_deletions_ /
+    /// current_num_samples_), clamped at 0 and scaled up by files / samples when not every file was sampled.
+    /// </summary>
+    private static ulong EstimatedActiveKeys(VersionStorageInfo s)
+    {
+        ulong nonDeletions = 0, deletions = 0, samples = 0, fileCount = 0;
         for (int l = 0; l < s.NumLevels; l++)
         {
-            foreach (FileMetaData f in s.LevelFiles(l))
+            foreach (FileMetaData f in s.LevelFilesArray(l))
             {
-                using TableReaderLease lease = cfd.TableCache.GetReader(f);
-                Table.TableProperties p = lease.Reader.Properties;
-                files += (long)p.NumEntries - 2 * (long)p.NumDeletions;
+                fileCount++;
+                if (!f.EntryStatsKnown) continue;
+                nonDeletions += f.NumEntries - f.NumDeletions;
+                deletions += f.NumDeletions;
+                samples++;
             }
         }
-        long total = Math.Max(0, mem) + Math.Max(0, files);
-        return (ulong)total;
+        // Estimation will be inaccurate when: (1) there exist merge keys (2) keys are directly overwritten
+        // (3) deletion on non-existing keys (4) low number of samples
+        if (samples == 0) return 0;
+        if (nonDeletions <= deletions) return 0;
+        ulong est = nonDeletions - deletions;
+        if (samples < fileCount)
+        {
+            double multiplier = (double)fileCount / samples;
+            double maximumMultiplier = (double)ulong.MaxValue / est;
+            // If it can overflow, we return the maximum unsigned long.
+            if (multiplier >= maximumMultiplier) return ulong.MaxValue;
+            return (ulong)(est * multiplier);
+        }
+        return est;
     }
 
     /// <summary>Port of DB::GetLiveFilesMetaData.</summary>
