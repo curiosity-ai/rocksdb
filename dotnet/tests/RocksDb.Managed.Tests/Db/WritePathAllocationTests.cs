@@ -122,7 +122,6 @@ public sealed class WritePathAllocationTests
         await Run(2);
         await Run(3);
         long allocated = GC.GetTotalAllocatedBytes(precise: true) - before;
-        const int Puts = 2 * Tasks * PerTask;
         var buffer = new byte[100];
         for (int i = 0; i < keys.Length; i += 97)
         {
@@ -130,6 +129,7 @@ public sealed class WritePathAllocationTests
             Assert.AreEqual(value.Length, len);
         }
 #if !DEBUG
+        const int Puts = 2 * Tasks * PerTask;
         // All threads, so the Task.Run of the workers and the thread pool count too (about 30 KB here). Before the
         // leader's state machine was owned by its writer, the parallel memtable groups added 2-4 B per Put.
         Assert.IsTrue(allocated <= Slack, allocated + " B allocated by " + Puts + " Puts");
