@@ -68,9 +68,57 @@ internal sealed partial class DbImpl
     /// <summary>"EVENT_LOG_v1 {...}" (EventLogger::Log with a JSONWriter): the time and the given fields.</summary>
     private void LogEvent(string fields)
     {
-        if (_infoLog is null || !_infoLog.IsEnabled(InfoLogLevel.Info)) return;
+        if (BeginEvent() is not { } sb) return;
+        sb.Append(fields);
+        EndEvent(sb);
+    }
+
+    /// <summary>Whether INFO messages (and EVENT_LOG records) are logged: nothing is formatted when they are not.</summary>
+    private bool InfoLogEnabled => _infoLog is { } log && log.IsEnabled(InfoLogLevel.Info);
+
+    // The builder INFO lines and events are formatted into (one per thread: flushes, compactions and file deletions log
+    // from their own threads). Taken while in use, so a nested line (none today) would just use a new builder.
+    [ThreadStatic] private static StringBuilder? t_logLine;
+
+    /// <summary>A cleared builder for one INFO line, or null when INFO messages are not logged. Pass it to <see cref="EndInfoLine"/>.</summary>
+    private StringBuilder? BeginInfoLine()
+    {
+        if (!InfoLogEnabled) return null;
+        StringBuilder sb = t_logLine ?? new StringBuilder(1024);
+        t_logLine = null;
+        sb.Clear();
+        return sb;
+    }
+
+    /// <summary>Logs the line built in <paramref name="sb"/> (from <see cref="BeginInfoLine"/>) and keeps the builder for the next line.</summary>
+    private void EndInfoLine(StringBuilder sb)
+    {
+        _infoLog?.LogInfo(sb);
+        ReleaseLogLine(sb);
+    }
+
+    private static void ReleaseLogLine(StringBuilder sb)
+    {
+        // Don't keep a builder that grew for an unusually large line (e.g. a compaction of thousands of files).
+        if (sb.Capacity <= 16 * 1024) t_logLine = sb;
+    }
+
+    /// <summary>
+    /// <see cref="BeginInfoLine"/> with the event prefix (<c>EVENT_LOG_v1 {"time_micros": N, </c>) written; append the
+    /// fields and pass it to <see cref="EndEvent"/>.
+    /// </summary>
+    private StringBuilder? BeginEvent()
+    {
+        if (BeginInfoLine() is not { } sb) return null;
         ulong micros = (ulong)(DateTime.UtcNow - DateTime.UnixEpoch).Ticks / 10;
-        string line = "EVENT_LOG_v1 {\"time_micros\": " + micros.ToString(CultureInfo.InvariantCulture) + ", " + fields + "}";
+        sb.Append("EVENT_LOG_v1 {\"time_micros\": ").Append(micros).Append(", ");
+        return sb;
+    }
+
+    /// <summary>Closes and logs an event from <see cref="BeginEvent"/> (held back while the DB is still opening).</summary>
+    private void EndEvent(StringBuilder sb)
+    {
+        sb.Append('}');
         List<string>? deferred = _deferredEvents;
         if (deferred is not null)
         {
@@ -78,12 +126,13 @@ internal sealed partial class DbImpl
             {
                 if (_deferredEvents is not null)
                 {
-                    deferred.Add(line);
+                    deferred.Add(sb.ToString());
+                    ReleaseLogLine(sb);
                     return;
                 }
             }
         }
-        _infoLog.Log(InfoLogLevel.Info, line);
+        EndInfoLine(sb);
     }
 
     // Events logged during open before the header (see InitInfoLog); null once written.
@@ -112,10 +161,12 @@ internal sealed partial class DbImpl
     /// </summary>
     private void LogFileDeletionEvent(string eventName, int jobId, ulong fileNumber, Exception? failure)
     {
-        if (_infoLog is null) return;
-        LogEvent("\"job\": " + jobId.ToString(CultureInfo.InvariantCulture) + ", \"event\": \"" + eventName + "\", \"file_number\": " +
-                 fileNumber.ToString(CultureInfo.InvariantCulture) + ", \"db_session_id\": " + Json(Identity.SessionId) + ", \"status\": " +
-                 Json(StatusString(failure)));
+        if (BeginEvent() is not { } sb) return;
+        sb.Append("\"job\": ").Append(jobId).Append(", \"event\": \"").Append(eventName).Append("\", \"file_number\": ").Append(fileNumber)
+            .Append(", \"db_session_id\": ");
+        sb.AppendJsonString(Identity.SessionId).Append(", \"status\": ");
+        sb.AppendJsonString(StatusString(failure));
+        EndEvent(sb);
     }
 
     /// <summary>
@@ -126,13 +177,16 @@ internal sealed partial class DbImpl
     internal void LogBlobFileCreationEvent(string cfName, int jobId, ulong fileNumber, ulong totalBlobCount, ulong totalBlobBytes,
         string fileChecksum, string fileChecksumFuncName, Exception? failure)
     {
-        if (_infoLog is null) return;
-        LogEvent("\"cf_name\": " + Json(cfName) + ", \"job\": " + jobId.ToString(CultureInfo.InvariantCulture) +
-                 ", \"event\": \"blob_file_creation\", \"file_number\": " + fileNumber.ToString(CultureInfo.InvariantCulture) +
-                 ", \"total_blob_count\": " + totalBlobCount.ToString(CultureInfo.InvariantCulture) +
-                 ", \"total_blob_bytes\": " + totalBlobBytes.ToString(CultureInfo.InvariantCulture) +
-                 ", \"file_checksum\": " + Json(fileChecksum) + ", \"file_checksum_func_name\": " + Json(fileChecksumFuncName) +
-                 ", \"status\": " + Json(StatusString(failure)));
+        if (BeginEvent() is not { } sb) return;
+        sb.Append("\"cf_name\": ").AppendJsonString(cfName).Append(", \"job\": ").Append(jobId)
+            .Append(", \"event\": \"blob_file_creation\", \"file_number\": ").Append(fileNumber)
+            .Append(", \"total_blob_count\": ").Append(totalBlobCount)
+            .Append(", \"total_blob_bytes\": ").Append(totalBlobBytes)
+            .Append(", \"file_checksum\": ");
+        sb.AppendJsonString(fileChecksum).Append(", \"file_checksum_func_name\": ");
+        sb.AppendJsonString(fileChecksumFuncName).Append(", \"status\": ");
+        sb.AppendJsonString(StatusString(failure));
+        EndEvent(sb);
     }
 
     /// <summary>
@@ -141,7 +195,7 @@ internal sealed partial class DbImpl
     /// </summary>
     internal void LogBlobFileCreationEvents(ColumnFamilyData cfd, int jobId, List<BlobFileAddition> additions)
     {
-        if (_infoLog is null) return;
+        if (!InfoLogEnabled) return;
         foreach (BlobFileAddition a in additions)
         {
             LogBlobFileCreationEvent(cfd.Name, jobId, a.BlobFileNumber, a.TotalBlobCount, a.TotalBlobBytes,
@@ -152,7 +206,7 @@ internal sealed partial class DbImpl
     /// <summary>DBImpl::Recover (db_impl_open.cc): <c>{"time_micros", "job", "event": "recovery_started", "wal_files": [...]}</c>.</summary>
     private void LogRecoveryStartedEvent(int jobId, IReadOnlyList<ulong> walNumbers)
     {
-        if (_infoLog is null) return;
+        if (!InfoLogEnabled) return;
         var sb = new StringBuilder();
         for (int i = 0; i < walNumbers.Count; i++)
         {
@@ -168,7 +222,7 @@ internal sealed partial class DbImpl
     /// </summary>
     private void LogRecoveryFinishedEvent(int jobId, Exception? failure)
     {
-        if (_infoLog is null) return;
+        if (!InfoLogEnabled) return;
         LogEvent("\"job\": " + jobId.ToString(CultureInfo.InvariantCulture) + ", \"event\": \"" + (failure is null ? "recovery_finished" : "recovery_failed") +
                  "\", \"status\": " + Json(StatusString(failure)));
     }
@@ -179,14 +233,15 @@ internal sealed partial class DbImpl
     /// </summary>
     internal void LogIngestFinishedEvent(ColumnFamilyData cfd, IReadOnlyList<(string Path, int Level)> files)
     {
-        if (_infoLog is null) return;
-        var sb = new StringBuilder();
+        if (BeginEvent() is not { } sb) return;
+        sb.Append("\"event\": \"ingest_finished\", \"files_ingested\": [");
         for (int i = 0; i < files.Count; i++)
         {
             if (i > 0) sb.Append(", ");
-            sb.Append("\"file\", ").Append(Json(files[i].Path)).Append(", \"level\", ").Append(files[i].Level.ToString(CultureInfo.InvariantCulture));
+            sb.Append("\"file\", ").AppendJsonString(files[i].Path).Append(", \"level\", ").Append(files[i].Level);
         }
-        LogEvent("\"event\": \"ingest_finished\", \"files_ingested\": [" + sb + "], \"lsm_state\": [" + LsmState(cfd) + "]");
+        AppendLsmState(sb.Append("], \"lsm_state\": ["), cfd).Append(']');
+        EndEvent(sb);
     }
 
     private static string Json(string s) => "\"" + s.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
@@ -262,7 +317,7 @@ internal sealed partial class DbImpl
     /// <summary>FlushJob::Run logging and stats: "flush_started" event.</summary>
     internal void OnFlushStarted(ColumnFamilyData cfd, int jobId, IReadOnlyList<MemTable> mems, FlushReason reason)
     {
-        if (_infoLog is null) return;
+        if (!InfoLogEnabled) return;
         long entries = 0, deletes = 0, dataSize = 0, memory = 0, rangeDeletes = 0;
         foreach (MemTable m in mems)
         {
@@ -272,11 +327,28 @@ internal sealed partial class DbImpl
             memory += m.ApproximateMemoryUsageFast;
             rangeDeletes += m.NumRangeDeletes;
         }
-        LogInfo("[" + cfd.Name + "] [JOB " + jobId + "] Flushing memtable with next log file: " + _logNumber);
+        if (BeginInfoLine() is { } line)
+        {
+            line.Append('[').Append(cfd.Name).Append("] [JOB ").Append(jobId).Append("] Flushing memtable with next log file: ").Append(_logNumber);
+            EndInfoLine(line);
+        }
         // FlushJob::WriteLevel0Table.
-        LogEvent("\"job\": " + jobId + ", \"event\": \"flush_started\", \"num_memtables\": " + mems.Count + ", \"total_num_input_entries\": " + entries +
-                 ", \"num_deletes\": " + deletes + ", \"total_data_size\": " + dataSize + ", \"memory_usage\": " + memory +
-                 ", \"num_range_deletes\": " + rangeDeletes + ", \"flush_reason\": " + Json(FlushReasonString(reason)));
+        if (BeginEvent() is not { } sb) return;
+        sb.Append("\"job\": ").Append(jobId).Append(", \"event\": \"flush_started\", \"num_memtables\": ").Append(mems.Count)
+            .Append(", \"total_num_input_entries\": ").Append(entries).Append(", \"num_deletes\": ").Append(deletes)
+            .Append(", \"total_data_size\": ").Append(dataSize).Append(", \"memory_usage\": ").Append(memory)
+            .Append(", \"num_range_deletes\": ").Append(rangeDeletes).Append(", \"flush_reason\": ");
+        sb.AppendJsonString(FlushReasonString(reason));
+        EndEvent(sb);
+    }
+
+    /// <summary>FlushJob::WriteLevel0Table: "[cf] [JOB n] Level-0 flush table #N: S bytes OK".</summary>
+    internal void LogLevel0FlushTable(ColumnFamilyData cfd, int jobId, FileMetaData meta)
+    {
+        if (BeginInfoLine() is not { } sb) return;
+        sb.Append('[').Append(cfd.Name).Append("] [JOB ").Append(jobId).Append("] Level-0 flush table #").Append(meta.FileNumber).Append(": ")
+            .Append(meta.FileSize).Append(" bytes OK");
+        EndInfoLine(sb);
     }
 
     /// <summary>GetFlushReasonString (db/flush_job.cc).</summary>
@@ -321,6 +393,7 @@ internal sealed partial class DbImpl
     /// </summary>
     private void LogTableFileCreationEvent(ColumnFamilyData cfd, int jobId, FileMetaData meta)
     {
+        if (!InfoLogEnabled) return;
         Table.TableProperties? tp = null;
         try
         {
@@ -330,11 +403,11 @@ internal sealed partial class DbImpl
         catch (Exception e) when (e is IOException or RocksDbException)
         {
         }
-        var sb = new StringBuilder();
-        sb.Append("\"cf_name\": ").Append(Json(cfd.Name)).Append(", \"job\": ").Append(jobId).Append(", \"event\": \"table_file_creation\", \"file_number\": ")
+        if (BeginEvent() is not { } sb) return;
+        sb.Append("\"cf_name\": ").AppendJsonString(cfd.Name).Append(", \"job\": ").Append(jobId).Append(", \"event\": \"table_file_creation\", \"file_number\": ")
             .Append(meta.FileNumber).Append(", \"file_size\": ").Append(meta.FileSize)
-            .Append(", \"file_checksum\": ").Append(Json(meta.FileChecksum is { Length: > 0 } c ? Convert.ToHexString(c) : ""))
-            .Append(", \"file_checksum_func_name\": ").Append(Json(string.IsNullOrEmpty(meta.FileChecksumFuncName) ? "Unknown" : meta.FileChecksumFuncName))
+            .Append(", \"file_checksum\": ").AppendJsonString(meta.FileChecksum is { Length: > 0 } c ? Convert.ToHexString(c) : "")
+            .Append(", \"file_checksum_func_name\": ").AppendJsonString(string.IsNullOrEmpty(meta.FileChecksumFuncName) ? "Unknown" : meta.FileChecksumFuncName)
             .Append(", \"smallest_seqno\": ").Append(meta.SmallestSeqno).Append(", \"largest_seqno\": ").Append(meta.LargestSeqno)
             .Append(", \"table_properties\": {");
         if (tp is not null)
@@ -350,25 +423,25 @@ internal sealed partial class DbImpl
                 .Append(", \"num_filter_entries\": ").Append(tp.NumFilterEntries).Append(", \"num_deletions\": ").Append(tp.NumDeletions)
                 .Append(", \"num_merge_operands\": ").Append(tp.NumMergeOperands).Append(", \"num_range_deletions\": ").Append(tp.NumRangeDeletions)
                 .Append(", \"format_version\": ").Append(tp.FormatVersion).Append(", \"fixed_key_len\": ").Append(tp.FixedKeyLen)
-                .Append(", \"filter_policy\": ").Append(Json(tp.FilterPolicyName)).Append(", \"column_family_name\": ").Append(Json(tp.ColumnFamilyName))
-                .Append(", \"column_family_id\": ").Append(tp.ColumnFamilyId).Append(", \"comparator\": ").Append(Json(tp.ComparatorName))
+                .Append(", \"filter_policy\": ").AppendJsonString(tp.FilterPolicyName).Append(", \"column_family_name\": ").AppendJsonString(tp.ColumnFamilyName)
+                .Append(", \"column_family_id\": ").Append(tp.ColumnFamilyId).Append(", \"comparator\": ").AppendJsonString(tp.ComparatorName)
                 .Append(", \"user_defined_timestamps_persisted\": ").Append(tp.UserDefinedTimestampsPersisted)
                 .Append(", \"key_largest_seqno\": ").Append(tp.KeyLargestSeqno).Append(", \"key_smallest_seqno\": ").Append(tp.KeySmallestSeqno)
-                .Append(", \"merge_operator\": ").Append(Json(tp.MergeOperatorName)).Append(", \"prefix_extractor_name\": ").Append(Json(tp.PrefixExtractorName))
-                .Append(", \"property_collectors\": ").Append(Json(tp.PropertyCollectorsNames)).Append(", \"compression\": ").Append(Json(tp.CompressionName))
-                .Append(", \"compression_options\": ").Append(Json(tp.CompressionOptions)).Append(", \"creation_time\": ").Append(tp.CreationTime)
+                .Append(", \"merge_operator\": ").AppendJsonString(tp.MergeOperatorName).Append(", \"prefix_extractor_name\": ").AppendJsonString(tp.PrefixExtractorName)
+                .Append(", \"property_collectors\": ").AppendJsonString(tp.PropertyCollectorsNames).Append(", \"compression\": ").AppendJsonString(tp.CompressionName)
+                .Append(", \"compression_options\": ").AppendJsonString(tp.CompressionOptions).Append(", \"creation_time\": ").Append(tp.CreationTime)
                 .Append(", \"oldest_key_time\": ").Append(tp.OldestKeyTime).Append(", \"newest_key_time\": ").Append(tp.NewestKeyTime)
                 .Append(", \"file_creation_time\": ").Append(tp.FileCreationTime)
                 .Append(", \"slow_compression_estimated_data_size\": ").Append(tp.SlowCompressionEstimatedDataSize)
                 .Append(", \"fast_compression_estimated_data_size\": ").Append(tp.FastCompressionEstimatedDataSize)
-                .Append(", \"db_id\": ").Append(Json(tp.DbId)).Append(", \"db_session_id\": ").Append(Json(tp.DbSessionId))
+                .Append(", \"db_id\": ").AppendJsonString(tp.DbId).Append(", \"db_session_id\": ").AppendJsonString(tp.DbSessionId)
                 .Append(", \"orig_file_number\": ").Append(tp.OriginalFileNumber)
                 .Append(", \"seqno_to_time_mapping\": ").Append(tp.SequenceNumberTimeMapping is { Length: > 0 } ? "\"(mapping)\"" : "\"N/A\"");
         }
         sb.Append('}');
         if (meta.OldestBlobFileNumber != 0) sb.Append(", \"oldest_blob_file_number\": ").Append(meta.OldestBlobFileNumber);
         sb.Append(", \"status\": \"OK\"");
-        LogEvent(sb.ToString());
+        EndEvent(sb);
     }
 
     /// <summary>
@@ -386,23 +459,25 @@ internal sealed partial class DbImpl
             st.RecordTick(Ticker.FlushWriteBytes, bytes);
             st.RecordInHistogram(Histogram.FlushTime, (ulong)elapsed.TotalMicroseconds);
         }
-        if (_infoLog is null) return;
+        if (!InfoLogEnabled) return;
         if (meta is not null) LogTableFileCreationEvent(cfd, jobId, meta);
         // FlushJob::Run: output_compression, lsm_state, blob_file_head / blob_file_tail, immutable_memtables.
         int immutable;
         lock (_mutex) immutable = cfd.NumNotFlushed;
-        LogEvent("\"job\": " + jobId + ", \"event\": \"flush_finished\", \"output_compression\": " +
-                 Json(CompressionTypeName(cfd.Options.Compression)) + ", \"lsm_state\": [" + LsmState(cfd) + "]" + BlobFileHeadTail(cfd) +
-                 ", \"immutable_memtables\": " + immutable.ToString(CultureInfo.InvariantCulture));
+        if (BeginEvent() is not { } sb) return;
+        sb.Append("\"job\": ").Append(jobId).Append(", \"event\": \"flush_finished\", \"output_compression\": ");
+        sb.AppendJsonString(CompressionTypeName(cfd.Options.Compression)).Append(", \"lsm_state\": [");
+        AppendBlobFileHeadTail(AppendLsmState(sb, cfd).Append(']'), cfd).Append(", \"immutable_memtables\": ").Append(immutable);
+        EndEvent(sb);
     }
 
-    /// <summary>", "blob_file_head": N, "blob_file_tail": M" of the current version's blob files, or "".</summary>
-    private static string BlobFileHeadTail(ColumnFamilyData cfd)
+    /// <summary>Appends ", "blob_file_head": N, "blob_file_tail": M" of the current version's blob files, or nothing.</summary>
+    private static StringBuilder AppendBlobFileHeadTail(StringBuilder sb, ColumnFamilyData cfd)
     {
         VersionStorageInfo? s = cfd.Current?.Storage;
-        if (s is null || s.BlobFiles.Length == 0) return "";
-        return ", \"blob_file_head\": " + s.BlobFiles[0].BlobFileNumber.ToString(CultureInfo.InvariantCulture) + ", \"blob_file_tail\": " +
-               s.BlobFiles[^1].BlobFileNumber.ToString(CultureInfo.InvariantCulture);
+        if (s is null || s.BlobFiles.Length == 0) return sb;
+        return sb.Append(", \"blob_file_head\": ").Append(s.BlobFiles[0].BlobFileNumber).Append(", \"blob_file_tail\": ")
+            .Append(s.BlobFiles[^1].BlobFileNumber);
     }
 
     /// <summary>
@@ -411,55 +486,78 @@ internal sealed partial class DbImpl
     /// </summary>
     internal void OnCompactionStarted(ColumnFamilyData cfd, Compaction c, int jobId)
     {
-        if (_infoLog is null || !_infoLog.IsEnabled(InfoLogLevel.Info)) return;
+        if (!InfoLogEnabled) return;
         // Trivial moves and deletion compactions don't run a CompactionJob upstream (they log "Moved #..." instead).
         if (c.IsDeletionCompaction || c.IsTrivialMove()) return;
-        var summary = new StringBuilder();
-        var files = new StringBuilder();
+        if (BeginInfoLine() is not { } line) return;
+        line.Append('[').Append(cfd.Name).Append("] [JOB ").Append(jobId).Append("] Compacting ");
+        bool first = true;
         ulong inputBytes = 0;
         for (int i = 0; i < c.NumInputLevels; i++)
         {
             List<FileMetaData> inputs = c.Inputs(i).Files;
-            // The event lists every input level (an empty one as []); the summary line only the non-empty ones.
-            files.Append(", \"files_L").Append(c.Level(i)).Append("\": [");
-            if (inputs.Count > 0)
-            {
-                if (summary.Length > 0) summary.Append(" + ");
-                summary.Append(inputs.Count).Append('@').Append(c.Level(i));
-            }
+            foreach (FileMetaData f in inputs) inputBytes += f.FileSize;
+            // The summary line lists only the non-empty input levels.
+            if (inputs.Count == 0) continue;
+            if (!first) line.Append(" + ");
+            first = false;
+            line.Append(inputs.Count).Append('@').Append(c.Level(i));
+        }
+        line.Append(" files to L").Append(c.OutputLevel).Append(", score ").Append(c.Score.ToString("F2", CultureInfo.InvariantCulture));
+        EndInfoLine(line);
+        if (BeginEvent() is not { } sb) return;
+        sb.Append("\"job\": ").Append(jobId).Append(", \"event\": \"compaction_started\", \"cf_name\": ");
+        sb.AppendJsonString(cfd.Name).Append(", \"compaction_reason\": ");
+        sb.AppendJsonString(CompactionReasonName(c.Reason));
+        // The event lists every input level (an empty one as []).
+        for (int i = 0; i < c.NumInputLevels; i++)
+        {
+            List<FileMetaData> inputs = c.Inputs(i).Files;
+            sb.Append(", \"files_L").Append(c.Level(i)).Append("\": [");
             for (int j = 0; j < inputs.Count; j++)
             {
-                if (j > 0) files.Append(", ");
-                files.Append(inputs[j].FileNumber);
-                inputBytes += inputs[j].FileSize;
+                if (j > 0) sb.Append(", ");
+                sb.Append(inputs[j].FileNumber);
             }
-            files.Append(']');
+            sb.Append(']');
         }
-        string score = c.Score.ToString("0.######", CultureInfo.InvariantCulture);
-        LogInfo("[" + cfd.Name + "] [JOB " + jobId + "] Compacting " + summary + " files to L" + c.OutputLevel + ", score " +
-                c.Score.ToString("F2", CultureInfo.InvariantCulture));
-        LogEvent("\"job\": " + jobId + ", \"event\": \"compaction_started\", \"cf_name\": " + Json(cfd.Name) + ", \"compaction_reason\": " +
-                 Json(c.Reason.ToString()) + files + ", \"score\": " + score + ", \"input_data_size\": " + inputBytes +
-                 ", \"oldest_snapshot_seqno\": " + OldestSnapshotSeqnoForEvent());
+        sb.Append(", \"score\": ").Append(c.Score.ToString("0.######", CultureInfo.InvariantCulture)).Append(", \"input_data_size\": ").Append(inputBytes)
+            .Append(", \"oldest_snapshot_seqno\": ");
+        lock (_mutex)
+        {
+            if (_snapshots.IsEmpty) sb.Append("-1");
+            else sb.Append(_snapshots.Oldest.SequenceNumber);
+        }
+        EndEvent(sb);
     }
 
-    /// <summary>The oldest live snapshot's sequence number, or -1 for none (the compaction_started event).</summary>
-    private string OldestSnapshotSeqnoForEvent()
+    /// <summary>CompactionReason names (enum names, as the event logged them), cached so the event does not format them.</summary>
+    private static readonly string[] s_compactionReasonNames = BuildCompactionReasonNames();
+
+    private static string[] BuildCompactionReasonNames()
     {
-        lock (_mutex) return _snapshots.IsEmpty ? "-1" : _snapshots.Oldest.SequenceNumber.ToString(CultureInfo.InvariantCulture);
+        CompactionReason[] values = Enum.GetValues<CompactionReason>();
+        int max = 0;
+        foreach (CompactionReason r in values) max = Math.Max(max, (int)r);
+        var names = new string[max + 1];
+        foreach (CompactionReason r in values) names[(int)r] = r.ToString();
+        return names;
     }
 
-    private static string LsmState(ColumnFamilyData cfd)
+    private static string CompactionReasonName(CompactionReason reason) =>
+        (uint)reason < (uint)s_compactionReasonNames.Length && s_compactionReasonNames[(int)reason] is { } n ? n : reason.ToString();
+
+    /// <summary>Appends the file count of every level ("4, 0, 0, ...") of the current version.</summary>
+    private static StringBuilder AppendLsmState(StringBuilder sb, ColumnFamilyData cfd)
     {
         VersionStorageInfo? s = cfd.Current?.Storage;
-        if (s is null) return "";
-        var sb = new StringBuilder();
+        if (s is null) return sb;
         for (int l = 0; l < s.NumLevels; l++)
         {
             if (l > 0) sb.Append(", ");
             sb.Append(s.NumLevelFiles(l));
         }
-        return sb.ToString();
+        return sb;
     }
 
     /// <summary>
@@ -515,13 +613,18 @@ internal sealed partial class DbImpl
             st.RecordInHistogram(Histogram.CompactionCpuTime, (ulong)micros);
             st.RecordInHistogram(Histogram.NumFilesInSingleCompaction, (ulong)(ls.NumInputFilesInNonOutputLevels + ls.NumInputFilesInOutputLevel));
         }
-        if (_infoLog is null) return;
+        if (!InfoLogEnabled) return;
         if (job is not null)
         {
             LogBlobFileCreationEvents(cfd, jobId, job.BlobFileAdditions);
             foreach (FileMetaData meta in job.AllOutputs)
             {
-                LogInfo("[" + cfd.Name + "] [JOB " + jobId + "] Generated table #" + meta.FileNumber + ": " + meta.FileSize + " bytes");
+                if (BeginInfoLine() is { } generated)
+                {
+                    generated.Append('[').Append(cfd.Name).Append("] [JOB ").Append(jobId).Append("] Generated table #").Append(meta.FileNumber)
+                        .Append(": ").Append(meta.FileSize).Append(" bytes");
+                    EndInfoLine(generated);
+                }
                 LogTableFileCreationEvent(cfd, jobId, meta);
             }
         }
@@ -534,15 +637,20 @@ internal sealed partial class DbImpl
             LogInfo("[" + cfd.Name + "] Moved #" + moved + " files to level-" + c.OutputLevel + " " + ls.BytesMoved + " bytes OK");
         }
         string kind = job is null ? (c.IsDeletionCompaction ? "deletion" : "trivial move") : "compaction";
-        LogInfo("[" + cfd.Name + "] [JOB " + jobId + "] Compacted (" + kind + ") " + (ls.NumInputFilesInNonOutputLevels + ls.NumInputFilesInOutputLevel) +
-                " files to L" + c.OutputLevel + " => " + ls.BytesWritten + " bytes");
+        if (BeginInfoLine() is { } compacted)
+        {
+            compacted.Append('[').Append(cfd.Name).Append("] [JOB ").Append(jobId).Append("] Compacted (").Append(kind).Append(") ")
+                .Append(ls.NumInputFilesInNonOutputLevels + ls.NumInputFilesInOutputLevel).Append(" files to L").Append(c.OutputLevel).Append(" => ")
+                .Append(ls.BytesWritten).Append(" bytes");
+            EndInfoLine(compacted);
+        }
         // Trivial moves and deletion compactions run no CompactionJob upstream, so they log no "compaction_finished".
         if (job is null) return;
         // CompactionJob::Install: the table-file outputs, then the blob outputs when there are any (num_subcompactions is
         // 1: subcompactions are not ported).
         ulong tableBytes = 0;
         foreach (FileMetaData meta in job.AllOutputs) tableBytes += meta.FileSize;
-        var ev = new StringBuilder();
+        if (BeginEvent() is not { } ev) return;
         int numOutputFiles = 0;
         foreach (FileMetaData _ in job.AllOutputs) numOutputFiles++;
         ev.Append("\"job\": ").Append(jobId).Append(", \"event\": \"compaction_finished\", \"compaction_time_micros\": ").Append(micros)
@@ -555,11 +663,12 @@ internal sealed partial class DbImpl
             ev.Append(", \"num_blob_output_files\": ").Append(job.BlobFileAdditions.Count).Append(", \"total_blob_output_size\": ").Append(blobBytes);
         }
         ev.Append(", \"num_input_records\": ").Append(ls.NumInputRecords).Append(", \"num_output_records\": ").Append(job.Stats.NumOutputRecords)
-            .Append(", \"num_subcompactions\": 1, \"output_compression\": ").Append(Json(CompressionTypeName(c.OutputCompression)))
+            .Append(", \"num_subcompactions\": 1, \"output_compression\": ").AppendJsonString(CompressionTypeName(c.OutputCompression))
             .Append(", \"num_single_delete_mismatches\": ").Append(job.Stats.IterStats.NumSingleDelMismatch)
             .Append(", \"num_single_delete_fallthrough\": ").Append(job.Stats.IterStats.NumSingleDelFallthru)
-            .Append(", \"lsm_state\": [").Append(LsmState(cfd)).Append(']').Append(BlobFileHeadTail(cfd));
-        LogEvent(ev.ToString());
+            .Append(", \"lsm_state\": [");
+        AppendBlobFileHeadTail(AppendLsmState(ev, cfd).Append(']'), cfd);
+        EndEvent(ev);
     }
 
     // ---- write / read path -------------------------------------------------------------------------------
@@ -689,5 +798,21 @@ internal sealed partial class DbImpl
         LogInfo("Shutdown complete");
         if (_ownsInfoLog) log.Dispose();
         else log.Flush();
+    }
+}
+
+/// <summary>JSON string values of the EVENT_LOG records (JSONWriter::AddValue of a string).</summary>
+internal static class EventLogJson
+{
+    /// <summary>Appends <paramref name="s"/> as a JSON string: quotes and backslashes escaped (as DbImpl.Json does).</summary>
+    public static StringBuilder AppendJsonString(this StringBuilder sb, string s)
+    {
+        sb.Append('"');
+        foreach (char ch in s)
+        {
+            if (ch is '\\' or '"') sb.Append('\\');
+            sb.Append(ch);
+        }
+        return sb.Append('"');
     }
 }

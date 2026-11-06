@@ -595,6 +595,20 @@ internal sealed class LocalSequentialFile : ISequentialFile
 }
 
 /// <summary>
+/// The write buffers of <see cref="LocalWritableFile"/> (WritableFileWriter::buf_ upstream, an AlignedBuffer per file).
+/// Every WAL, table file, MANIFEST and OPTIONS file rents one (64 KiB growing up to 1 MiB by default). With
+/// <see cref="ArrayPool{T}.Shared"/> the buffer of the previous file was usually returned to another thread's local
+/// slot (files are closed by whichever background or writer thread finishes them) and the shared pool trims under GC,
+/// so most files allocated a new buffer. This pool is lock-based and shared by all threads: the next file takes the
+/// buffer the last closed one returned. At most 16 buffers are retained per power-of-two size class.
+/// </summary>
+internal static class WritableFileBuffers
+{
+    /// <summary>Byte arrays up to 4 MiB (larger buffers are allocated and dropped).</summary>
+    public static readonly ArrayPool<byte> Pool = ArrayPool<byte>.Create(4 << 20, 16);
+}
+
+/// <summary>
 /// Port of WritableFileWriter (file/writable_file_writer.cc) over PosixWritableFile (env/io_posix.cc).
 /// <list type="bullet">
 /// <item>Buffered mode: a pooled buffer that grows from <see cref="WritableFileOptions.InitialBufferSize"/> up to
@@ -660,7 +674,7 @@ internal sealed class LocalWritableFile : IWritableFile
             else
             {
                 _capacity = Math.Max(1, Math.Min(options.InitialBufferSize, options.MaxBufferSize));
-                _array = ArrayPool<byte>.Shared.Rent(_capacity);
+                _array = WritableFileBuffers.Pool.Rent(_capacity);
                 _capacity = _array.Length;
             }
             _lastRangeSync = _filePos;
@@ -789,9 +803,9 @@ internal sealed class LocalWritableFile : IWritableFile
         if (target > _options.MaxBufferSize) return false;
         int newSize = _capacity;
         while (newSize < target) newSize = (int)Math.Min((long)newSize * 2, _options.MaxBufferSize);
-        byte[] bigger = ArrayPool<byte>.Shared.Rent(newSize);
+        byte[] bigger = WritableFileBuffers.Pool.Rent(newSize);
         _array.AsSpan(0, _buffered).CopyTo(bigger);
-        ArrayPool<byte>.Shared.Return(_array);
+        WritableFileBuffers.Pool.Return(_array);
         _array = bigger;
         _capacity = bigger.Length;
         return true;
@@ -1060,7 +1074,7 @@ internal sealed class LocalWritableFile : IWritableFile
         _handle.Dispose();
         if (_array is not null)
         {
-            ArrayPool<byte>.Shared.Return(_array);
+            WritableFileBuffers.Pool.Return(_array);
             _array = null;
         }
         if (_aligned is not null)

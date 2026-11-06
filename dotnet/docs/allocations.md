@@ -9,9 +9,8 @@ The numbers come from the allocation profiler in `tools/RocksDb.Managed.Allocati
 [Measuring allocations](#measuring-allocations)). "B/op" counts the bytes allocated by every thread per operation in
 steady state, including background flush and compaction work, with 16-byte keys and 100-byte values.
 
-> **Planned additions.** More allocation-free variants are being added: iterator refresh / reuse, pooled
-> `WriteBatchWithIndex`, and fewer background allocations per flushed file. This guide will be updated when they ship.
-> Until then, the patterns below are what to use.
+> **Planned additions.** More allocation-free variants are being added: iterator refresh / reuse and pooled
+> `WriteBatchWithIndex`. This guide will be updated when they ship. Until then, the patterns below are what to use.
 
 ## Summary
 
@@ -19,7 +18,7 @@ steady state, including background flush and compaction work, with 16-byte keys 
 |---|---|---|---|
 | Point reads | `TryGet(key, Span<byte>, out len)`, `TryGet(key, IBufferWriter<byte>)`, `Get<TState,TResult>(key, state, callback)`, `GetPooled` + `Dispose`, `ContainsKey`, `KeyMayExist`, the async versions of each | `byte[]? Get` / `GetAsync` (the value array: 128 B for 100 B) | the span / writer / callback / pooled variants |
 | Batched reads | `MultiGetBatch` reused with `Clear()`, `MultiGet` / `MultiGetAsync` / `MultiGetEntity`; `MultiGet(options, keys, values, valueRanges, statuses)` into caller memory and its async version | `byte[]?[] MultiGet(IReadOnlyList<byte[]>)` (the result arrays: 2.2 KB per 16 values of 100 B) | a reused `MultiGetBatch` or the caller-memory `MultiGet` |
-| Writes | `Put` / `Delete` / `SingleDelete` / `Merge` / `PutEntity` with spans, and their async versions (0.0-0.3 B/op on the calling thread) | none on the caller; background work adds 1-4 B/op, see [Writes](#writes) | |
+| Writes | `Put` / `Delete` / `SingleDelete` / `Merge` / `PutEntity` with spans, and their async versions (0.0-0.3 B/op on the calling thread) | none on the caller; background work adds 1-3 B/op, see [Writes](#writes) | |
 | Write batches | `db.CreateWriteBatch()` + `using`; one batch reused with `Clear()`; `WriteAsync` | `new WriteBatch()` that is never disposed (2.2 KB per batch); `new WriteBatchWithIndex()` per batch (1.1 KB) | `CreateWriteBatch`; reuse a `WriteBatchWithIndex` with `Clear()` |
 | Iterators | a reused `Iterator`: `Seek` / `SeekForPrev` / `Next` / `Prev` / `Key` / `Value` / `Columns`, async moves, `foreach` over `Range(...)` | `NewIterator` (2-4 KB per iterator), `ScanAsync` (128 B per scan) | keep one iterator per thread and `Seek` it |
 | Wide columns | `TryGetEntity(key, WideColumns)` and `TryGetEntityLazy(options, key, LazyWideColumns)` with a reused result, `MultiGetEntity`, `Iterator.Columns` | `GetEntity` (312 B), `GetEntityLazy` (1 KB) | `TryGetEntity` / `TryGetEntityLazy` with a reused result |
@@ -102,10 +101,12 @@ and one array per found value (2.2 KB for 16 values of 100 B). It throws the fir
 `Put`, `Delete`, `SingleDelete`, `Merge`, `PutEntity` (span overloads) and their async versions allocate nothing on the
 calling thread: the bytes go into the WAL buffer and the memtable arena, and arena slabs are recycled after each flush.
 
-The background work that writes cause does allocate a little: about 1-4 B per 100-byte Put with a 4 MiB write buffer,
-mostly per new file (table properties, file buffers, info LOG lines). This scales with the number of flushes and
-compactions, not with the number of writes: a larger `WriteBufferSize` (the default is 64 MiB) means fewer files and
-less of it. Steady state is reached after the first few memtables of a new database or column family. Before that, the
+The background work that writes cause does allocate a little: about 1-3 B per 100-byte Put with a 4 MiB write buffer,
+mostly per new file (the table reader and the index and filter blocks it keeps, info LOG lines, the version). This
+scales with the number of flushes and compactions, not with the number of writes: a larger `WriteBufferSize` (the
+default is 64 MiB) means fewer files and less of it. Flushes and compactions run on long-lived background threads
+(named `rocksdb:high:N`, `rocksdb:low:N` and `rocksdb:bottom:N`, shared by all databases of the process), so their
+per-thread buffers are reused from one job to the next. Steady state is reached after the first few memtables of a new database or column family. Before that, the
 memtable arena and the block cache grow, which shows up as allocations but is the memory you configured.
 
 Write options: reuse `WriteOptions` instances (`WriteOptions.SyncWrites` is a shared one). Synced writes
@@ -136,10 +137,13 @@ per batch builds its index from scratch (1.1 KB). `TryGetFromBatchAndDB(db, key,
 
 ### Range deletions
 
-`DeleteRange` is cheap to write, but range tombstones are fragmented and rewritten by every flush and compaction that
-covers them. A workload that issues one `DeleteRange` per few keys allocates several KB per range in the background
-today. Prefer a few wide ranges over many narrow ones (as with upstream RocksDB, where many range tombstones also cost
-read and compaction time). Point deletes don't have this cost.
+`DeleteRange` allocates nothing on the calling thread. In the background, range tombstones are fragmented when a
+memtable or table file is first read and rewritten by every flush and compaction that covers them; this costs the
+fragmented copy of each tombstone (about 50 B per fragment, per memtable, table file and compaction) rather than per
+read. A workload that issues one `DeleteRange` per 10 keys measures about 300 B per `DeleteRange` in total, and a batch
+that mixes puts with one `DeleteRange` about 300 B per batch. Many narrow ranges still cost more than a few wide ones in
+memory, read time and compaction work (as with upstream RocksDB), so prefer wide ranges when you have the choice.
+Snapshots matter too: a flush or compaction keeps one tombstone per fragment for each snapshot that separates them.
 
 ## Iterators
 
@@ -233,8 +237,15 @@ txn.Commit();                                   // or await txn.CommitAsync()
 - **Statistics and PerfContext** cost no allocations on the read and write paths when enabled (`DbOptions.Statistics`,
   `PerfContext.Level`). Reading them doesn't either: `GetTickerCount`, `GetHistogramData` and
   `PerfContext.Current[metric]` allocate nothing. Only the text dumps (`ToString()`, `PerfContext.ToString()`) do.
-- **Info LOG.** Flushes and compactions write event lines to the `LOG` file. Today the event text is built for every new
-  file whatever the log level. This is part of the background allocations above.
+- **Info LOG.** Flushes, compactions and file deletions write INFO lines and `EVENT_LOG_v1` records to the `LOG` file,
+  one string per line. With `DbOptions.InfoLogLevel = InfoLogLevel.Warn` (or higher) they are not formatted at all,
+  which removes about a fifth of the background bytes of a flush or compaction:
+
+  ```csharp
+  var options = new DbOptions { CreateIfMissing = true, InfoLogLevel = InfoLogLevel.Warn };
+  ```
+
+  A custom `DbOptions.InfoLog` receives each line as a `string`; its `Level` is checked before anything is formatted.
 - **Write buffer size.** A larger memtable means fewer flushes and so fewer per-file allocations (see [Writes](#writes)).
 - **Snapshots.** `GetSnapshot()` allocates the snapshot handle (72 B). Take one per logical read view, not per read, and
   pass it through a reused `ReadOptions`.
@@ -278,10 +289,11 @@ steady-state throughput:
 - `Open` / `Dispose` (version set, options, memtable, LOG): about 0.7 MB for an empty database; recovery from a WAL adds
   its replay buffers.
 - `CreateColumnFamily` / `DropColumnFamily`: the new memtable's first arena slab and the OPTIONS file (about 0.8 MB).
-- Flush and compaction: a few KB per output file (properties, file names, events) plus the per-entry building, which
-  reuses pooled buffers. Dictionary compression (`CompressionOptions.MaxDictBytes`) currently buffers a copy of every
-  data block of the file being built.
-- `SstFileWriter` + `IngestExternalFiles`: about 200 KB per ingested file.
+- Flush and compaction: about 20-40 KB per output file (the new table's reader with its pinned index and filter blocks,
+  its properties, the new version, file names and LOG lines) plus the per-entry building, which reuses pooled buffers.
+  This includes dictionary compression (`CompressionOptions.MaxDictBytes`): the data blocks it buffers while sampling
+  go into pooled memory.
+- `SstFileWriter` + `IngestExternalFiles`: about 70 KB per ingested file.
 - `CreateCheckpoint` (about 27 KB) and `BackupEngine.CreateNewBackup` (MBs: file lists and the table properties of every
   file).
 - Text dumps: `GetProperty(rocksdb.stats)`, `Statistics.ToString()`, `PerfContext.ToString()`.

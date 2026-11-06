@@ -815,13 +815,18 @@ public sealed unsafe class MemTable : IDisposable
             if (cache is not null && cache.Version == version) return cache.List;
             // Every insert that incremented the version up to `version` is visible to this scan (the version is
             // bumped after the skiplist insert).
-            var list = new List<FragmentedRangeTombstoneList.Tombstone>();
-            MemTableIterator it = NewRangeTombstoneEntryIterator();
-            for (it.SeekToFirst(); it.Valid; it.Next())
+            FragmentedRangeTombstoneList built;
+            RangeTombstoneFragmenter frag = RangeTombstoneFragmenter.Rent(_ucmp, endIncludesTimestamp: true);
+            try
             {
-                list.Add(new FragmentedRangeTombstoneList.Tombstone(it.UserKey.ToArray(), it.Value.ToArray(), it.Sequence));
+                MemTableIterator it = NewRangeTombstoneEntryIterator();
+                for (it.SeekToFirst(); it.Valid; it.Next()) frag.Add(it.UserKey, it.Value, it.Sequence);
+                built = frag.Finish();
             }
-            FragmentedRangeTombstoneList built = FragmentedRangeTombstoneList.Build(_ucmp, list);
+            finally
+            {
+                RangeTombstoneFragmenter.Return(frag);
+            }
             Volatile.Write(ref _rangeDelCache, new RangeDelCacheEntry(version, built));
             return built;
         }

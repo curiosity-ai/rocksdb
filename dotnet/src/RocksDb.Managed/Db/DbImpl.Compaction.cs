@@ -431,6 +431,24 @@ internal sealed partial class DbImpl
         return maxCompactions;
     }
 
+    /// <summary>
+    /// DBImpl::Open / SetDBOptions: Env::IncBackgroundThreadsIfNeeded for the flush (HIGH), compaction (LOW) and
+    /// bottom-priority (BOTTOM) limits of this DB (GetBGJobLimits without the speedup rule).
+    /// </summary>
+    private void IncreaseBackgroundThreadsIfNeeded()
+    {
+        int maxFlushes = Options.MaxBackgroundFlushes;
+        int maxCompactions = Options.MaxBackgroundCompactions;
+        if (maxFlushes == -1 && maxCompactions == -1)
+        {
+            maxFlushes = Math.Max(1, Options.MaxBackgroundJobs / 4);
+            maxCompactions = Math.Max(1, Options.MaxBackgroundJobs - maxFlushes);
+        }
+        BackgroundThreadPool.High.IncreaseThreadsIfNeeded(Math.Max(1, maxFlushes));
+        BackgroundThreadPool.Low.IncreaseThreadsIfNeeded(Math.Max(1, maxCompactions));
+        if (Options.BottomPriorityBackgroundThreads > 0) BackgroundThreadPool.Bottom.IncreaseThreadsIfNeeded(Options.BottomPriorityBackgroundThreads);
+    }
+
     /// <summary>Port of SchedulePendingCompaction (EnqueuePendingCompaction). REQUIRES: mutex.</summary>
     private void SchedulePendingCompaction(ColumnFamilyData cfd)
     {
@@ -473,8 +491,7 @@ internal sealed partial class DbImpl
             // There may be more work for this column family (another level, another key range).
             SchedulePendingCompaction(cfd);
             var job = new CompactionRun(this, cfd, c, snapshots, CompactionThread.Low);
-            _ = Task.Factory.StartNew(static s => ((CompactionRun)s!).RunBackground(), job, CancellationToken.None,
-                TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
+            BackgroundThreadPool.Low.Schedule(job);
         }
     }
 
@@ -648,14 +665,13 @@ internal sealed partial class DbImpl
         while (_bgBottomCompactionRunning < Options.BottomPriorityBackgroundThreads && _bottomPriorityQueue.TryDequeue(out BottomPriorityCompaction? task))
         {
             _bgBottomCompactionRunning++;
-            _ = Task.Factory.StartNew(static s => ((BottomPriorityRun)s!).Run(), new BottomPriorityRun(this, task), CancellationToken.None,
-                TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
+            BackgroundThreadPool.Bottom.Schedule(new BottomPriorityRun(this, task));
         }
     }
 
-    private sealed class BottomPriorityRun(DbImpl db, BottomPriorityCompaction task)
+    private sealed class BottomPriorityRun(DbImpl db, BottomPriorityCompaction task) : IThreadPoolWorkItem
     {
-        public void Run()
+        public void Execute()
         {
             try
             {
@@ -730,7 +746,7 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>One compaction execution (BackgroundCompaction after picking).</summary>
-    private sealed class CompactionRun
+    private sealed class CompactionRun : IThreadPoolWorkItem
     {
         private readonly DbImpl _db;
         private readonly ColumnFamilyData _cfd;
@@ -747,7 +763,7 @@ internal sealed partial class DbImpl
             _thread = thread;
         }
 
-        public void RunBackground()
+        public void Execute()
         {
             try
             {
@@ -1455,8 +1471,7 @@ internal sealed partial class DbImpl
             else
             {
                 var run = new ManualRun(this, cfd, c, snapshots);
-                await Task.Factory.StartNew(static s => ((ManualRun)s!).Run(), run, CancellationToken.None,
-                    TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default).ConfigureAwait(false);
+                await BackgroundThreadPool.Low.Run(static s => ((ManualRun)s!).Run(), run).ConfigureAwait(false);
             }
             if (compactionEnd is null) return baseLevel;
             beginKey = compactionEnd;
@@ -1566,8 +1581,7 @@ internal sealed partial class DbImpl
         {
             var run = new ManualRun(this, cfd, c, snapshots);
             // Not cancellable once registered: the compaction must run (or fail) to release its input files.
-            await Task.Factory.StartNew(static s => ((ManualRun)s!).Run(), run, CancellationToken.None,
-                TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default).ConfigureAwait(false);
+            await BackgroundThreadPool.Low.Run(static s => ((ManualRun)s!).Run(), run).ConfigureAwait(false);
         }
         var names = new List<string>();
         if (c.InstalledFiles is { } files)

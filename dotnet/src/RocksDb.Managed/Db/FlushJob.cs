@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using RocksDb.Managed.Cache;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Table;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Db;
 
@@ -106,7 +107,13 @@ internal static class FlushJob
                         dropHidden: cfd.TimestampSize == 0 && snapshotChecker is null, blobBuilder, blobOutflow, seqnoToTimeMapping);
                 }
                 blobBuilder?.Finish();
-                if (tombstones is not null) AddRangeTombstones(builder, cfd, tombstones, meta);
+                // BuildTable writes CompactionRangeDelAggregator::NewIterator(): only the newest tombstone of each snapshot
+                // stripe (every one with user-defined timestamps; and every one when a snapshot checker decides visibility,
+                // like the point entries above).
+                if (tombstones is not null)
+                {
+                    AddRangeTombstones(builder, cfd, tombstones, meta, cfd.TimestampSize == 0 && snapshotChecker is null ? snapshots : null);
+                }
                 if (builder.IsEmpty && meta.Smallest.Length == 0)
                 {
                     builder.Abandon();
@@ -544,65 +551,153 @@ internal static class FlushJob
     /// </summary>
     private static FragmentedRangeTombstoneList? FragmentRangeTombstones(ColumnFamilyData cfd, IReadOnlyList<MemTable> mems, bool minTimestamps)
     {
-        List<FragmentedRangeTombstoneList.Tombstone>? raw = null;
-        int tsSz = cfd.TimestampSize;
+        int withRangeDels = 0;
+        MemTable? single = null;
         foreach (MemTable m in mems)
         {
             if (m.NumRangeDeletes == 0) continue;
-            MemTableIterator it = m.NewRangeTombstoneEntryIterator();
-            for (it.SeekToFirst(); it.Valid; it.Next())
-            {
-                byte[] start = it.UserKey.ToArray();
-                byte[] end = it.Value.ToArray();
-                if (minTimestamps)
-                {
-                    // NewTimestampStrippingRangeTombstoneIterator: start and end keys get the minimum timestamp.
-                    if (start.Length < tsSz || end.Length < tsSz) ThrowHelper.Corruption("range tombstone key too short for its timestamp");
-                    start.AsSpan(start.Length - tsSz).Clear();
-                    end.AsSpan(end.Length - tsSz).Clear();
-                }
-                (raw ??= new()).Add(new FragmentedRangeTombstoneList.Tombstone(start, end, it.Sequence));
-            }
+            withRangeDels++;
+            single = m;
         }
-        if (raw is null) return null;
-        FragmentedRangeTombstoneList frag = FragmentedRangeTombstoneList.Build(cfd.UserComparator, raw);
+        if (withRangeDels == 0) return null;
+        if (withRangeDels == 1 && !minTimestamps)
+        {
+            // One memtable: its cached fragmented list (MemTable::NewRangeTombstoneIterator of an immutable memtable) is
+            // what fragmenting its tombstones again would build.
+            FragmentedRangeTombstoneList cached = single!.GetFragmentedRangeTombstones();
+            return cached.IsEmpty ? null : cached;
+        }
+        int tsSz = cfd.TimestampSize;
+        // NewTimestampStrippingRangeTombstoneIterator: start and end keys get the minimum timestamp (all zero bytes); the
+        // fragmenter takes the key parts and this timestamp separately, so nothing is copied per tombstone.
+        Span<byte> minTs = minTimestamps ? stackalloc byte[tsSz] : default;
+        minTs.Clear();
+        FragmentedRangeTombstoneList frag;
+        RangeTombstoneFragmenter fragmenter = RangeTombstoneFragmenter.Rent(cfd.UserComparator, endIncludesTimestamp: true);
+        try
+        {
+            foreach (MemTable m in mems)
+            {
+                if (m.NumRangeDeletes == 0) continue;
+                MemTableIterator it = m.NewRangeTombstoneEntryIterator();
+                for (it.SeekToFirst(); it.Valid; it.Next())
+                {
+                    ReadOnlySpan<byte> start = it.UserKey, end = it.Value;
+                    if (minTimestamps)
+                    {
+                        if (start.Length < tsSz || end.Length < tsSz) ThrowHelper.Corruption("range tombstone key too short for its timestamp");
+                        fragmenter.Add(start, end, it.Sequence, minTs);
+                    }
+                    else
+                    {
+                        fragmenter.Add(start, end, it.Sequence);
+                    }
+                }
+            }
+            frag = fragmenter.Finish();
+        }
+        finally
+        {
+            RangeTombstoneFragmenter.Return(fragmenter);
+        }
         return frag.IsEmpty ? null : frag;
     }
 
     /// <summary>
-    /// Writes the fragmented range tombstones (every fragment with every covering sequence number, in internal key order)
-    /// and extends the file boundaries like FileMetaData::UpdateBoundariesForRange.
+    /// Writes the fragmented range tombstones (every fragment with its covering sequence numbers, in internal key order)
+    /// and extends the file boundaries like FileMetaData::UpdateBoundariesForRange. With <paramref name="stripeSnapshots"/>
+    /// only the newest sequence number of each snapshot stripe is written (CompactionRangeDelAggregator::NewIterator
+    /// fragments for_compaction with the job's snapshots); null writes all of them.
     /// </summary>
-    private static void AddRangeTombstones(TableBuilder builder, ColumnFamilyData cfd, FragmentedRangeTombstoneList frag, FileMetaData meta)
+    private static void AddRangeTombstones(TableBuilder builder, ColumnFamilyData cfd, FragmentedRangeTombstoneList frag, FileMetaData meta,
+        ulong[]? stripeSnapshots)
     {
         InternalKeyComparator icmp = cfd.Icmp;
         int tsSize = frag.TimestampSize;
-        for (int i = 0; i < frag.Count; i++)
+        // The tombstone keys are encoded into scratch buffers; the file boundaries are tracked there too and copied into
+        // meta once at the end (only when a tombstone extends them).
+        PooledBufferWriter startKey = ObjectPools.RentWriter();
+        var endKey = new PooledBufferWriter(64);
+        var tEndBuf = new PooledBufferWriter(tsSize != 0 ? 64 : 0);
+        var smallest = new PooledBufferWriter(64);
+        var largest = new PooledBufferWriter(64);
+        try
         {
-            ReadOnlySpan<byte> start = frag.GetStart(i);
-            ReadOnlySpan<byte> end = frag.GetEnd(i);
-            ReadOnlySpan<ulong> seqs = frag.GetSequences(i);
-            for (int k = 0; k < seqs.Length; k++)
+            smallest.Write(meta.Smallest);
+            largest.Write(meta.Largest);
+            bool smallestChanged = false, largestChanged = false;
+            for (int i = 0; i < frag.Count; i++)
             {
-                ulong seq = seqs[k];
-                ReadOnlySpan<byte> tStart = start, tEnd = end;
-                if (tsSize != 0)
-                {
-                    // RangeTombstone(start, end, seq, ts): both keys carry the tombstone's timestamp; the end key used
-                    // for the file boundary keeps the maximum timestamp (SerializeEndKey).
-                    tStart = ReplaceTimestamp(start, frag.GetTimestamp(i, k));
-                    tEnd = ReplaceTimestamp(end, frag.GetTimestamp(i, k));
-                }
-                var startKey = new InternalKey(tStart, seq, EntryType.RangeDeletion);
-                builder.Add(startKey.Encoded, tEnd);
+                ReadOnlySpan<byte> start = frag.GetStart(i);
+                ReadOnlySpan<byte> end = frag.GetEnd(i);
+                ReadOnlySpan<ulong> seqs = frag.GetSequences(i);
+                // SerializeEndKey: the end key at kMaxSequenceNumber (with the maximum timestamp), the same for every seq.
+                endKey.Clear();
+                AppendInternalKey(endKey, end, default, DbFormat.MaxSequenceNumber);
                 // UpdateBoundariesForRange(start = tombstone.SerializeKey(), end = tombstone.SerializeEndKey()).
-                if (meta.Smallest.Length == 0 || icmp.Compare(startKey.Encoded, meta.Smallest) < 0) meta.Smallest = startKey.Encoded.ToArray();
-                var endKey = new InternalKey(end, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion);
-                if (meta.Largest.Length == 0 || icmp.Compare(meta.Largest, endKey.Encoded) < 0) meta.Largest = endKey.Encoded.ToArray();
-                if (seq < meta.SmallestSeqno) meta.SmallestSeqno = seq;
-                if (seq > meta.LargestSeqno) meta.LargestSeqno = seq;
+                if (largest.WrittenCount == 0 || icmp.Compare(largest.WrittenSpan, endKey.WrittenSpan) < 0)
+                {
+                    largest.Clear();
+                    largest.Write(endKey.WrittenSpan);
+                    largestChanged = true;
+                }
+                ulong prevStripe = 0;
+                for (int k = 0; k < seqs.Length; k++)
+                {
+                    ulong seq = seqs[k];
+                    if (stripeSnapshots is not null)
+                    {
+                        // Sequence numbers are descending: an older one in the same stripe is hidden by the one kept.
+                        ulong stripe = EarliestVisibleSnapshot(stripeSnapshots, seq);
+                        if (k > 0 && stripe == prevStripe) continue;
+                        prevStripe = stripe;
+                    }
+                    ReadOnlySpan<byte> tEnd = end;
+                    startKey.Clear();
+                    if (tsSize != 0)
+                    {
+                        // RangeTombstone(start, end, seq, ts): both keys carry the tombstone's timestamp; the end key used
+                        // for the file boundary keeps the maximum timestamp (SerializeEndKey).
+                        ReadOnlySpan<byte> ts = frag.GetTimestamp(i, k);
+                        AppendInternalKey(startKey, start[..^tsSize], ts, seq);
+                        tEndBuf.Clear();
+                        tEndBuf.Write(end[..^tsSize]);
+                        tEndBuf.Write(ts);
+                        tEnd = tEndBuf.WrittenSpan;
+                    }
+                    else
+                    {
+                        AppendInternalKey(startKey, start, default, seq);
+                    }
+                    builder.Add(startKey.WrittenSpan, tEnd);
+                    if (smallest.WrittenCount == 0 || icmp.Compare(startKey.WrittenSpan, smallest.WrittenSpan) < 0)
+                    {
+                        smallest.Clear();
+                        smallest.Write(startKey.WrittenSpan);
+                        smallestChanged = true;
+                    }
+                    if (seq < meta.SmallestSeqno) meta.SmallestSeqno = seq;
+                    if (seq > meta.LargestSeqno) meta.LargestSeqno = seq;
+                }
             }
+            if (smallestChanged) meta.Smallest = smallest.WrittenSpan.ToArray();
+            if (largestChanged) meta.Largest = largest.WrittenSpan.ToArray();
         }
+        finally
+        {
+            ObjectPools.ReturnWriter(startKey);
+            endKey.Dispose();
+            tEndBuf.Dispose();
+            smallest.Dispose();
+            largest.Dispose();
+        }
+    }
+
+    /// <summary>InternalKey(userKey | timestamp, seq, kTypeRangeDeletion) appended to <paramref name="dst"/>.</summary>
+    internal static void AppendInternalKey(PooledBufferWriter dst, ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> timestamp, ulong seq)
+    {
+        int n = userKey.Length + timestamp.Length + DbFormat.InternalKeyFooterSize;
+        dst.Advance(DbFormat.AppendInternalKey(dst.GetSpan(n), userKey, timestamp, seq, EntryType.RangeDeletion));
     }
 
     /// <summary>

@@ -79,6 +79,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         int maxFlushes = options.MaxBackgroundFlushes;
         if (maxFlushes == -1 && options.MaxBackgroundCompactions == -1) maxFlushes = Math.Max(1, options.MaxBackgroundJobs / 4);
         _maxBackgroundFlushes = Math.Max(1, maxFlushes);
+        IncreaseBackgroundThreadsIfNeeded();
         string host = options.DbHostId == "__hostname__" ? Environment.MachineName : options.DbHostId;
         Identity = new DbIdentity("", GenerateDbSessionId(), host);
         _seqPerBatch = options.SeqPerBatch;

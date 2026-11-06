@@ -531,19 +531,29 @@ internal sealed class TableCache : ITableCache, IDisposable
         if (file.NewestKeyTime == 0) file.NewestKeyTime = reader.Properties.NewestKeyTime;
         if (reader.HasRangeTombstones)
         {
-            var list = new List<FragmentedRangeTombstoneList.Tombstone>();
-            using (BlockIter it = reader.NewRangeTombstoneIterator()!)
-            {
-                for (it.SeekToFirst(); it.Valid; it.Next())
-                {
-                    ReadOnlySpan<byte> k = it.Key;
-                    if (!DbFormat.TryParseInternalKey(k, out ParsedInternalKey pk)) ThrowHelper.Corruption("corrupted range tombstone key in " + path);
-                    list.Add(new FragmentedRangeTombstoneList.Tombstone(k[..pk.UserKeyLength].ToArray(), it.Value.ToArray(), pk.Sequence));
-                }
-            }
             // Tables without persisted timestamps: the start keys come back padded, the end keys (values) without a
-            // timestamp (tombstone_end_include_ts = false).
-            FragmentedRangeTombstoneList frag = FragmentedRangeTombstoneList.Build(reader.InternalComparator.UserComparator, list, endIncludesTimestamp: reader.PadTimestampSize == 0);
+            // timestamp (tombstone_end_include_ts = false). The keys are copied into the fragmenter's pooled buffer, and
+            // the fragmented list is cached with the reader (BlockBasedTable::Rep::fragmented_range_dels).
+            FragmentedRangeTombstoneList frag;
+            RangeTombstoneFragmenter fragmenter = RangeTombstoneFragmenter.Rent(reader.InternalComparator.UserComparator,
+                endIncludesTimestamp: reader.PadTimestampSize == 0);
+            try
+            {
+                using (BlockIter it = reader.NewRangeTombstoneIterator()!)
+                {
+                    for (it.SeekToFirst(); it.Valid; it.Next())
+                    {
+                        ReadOnlySpan<byte> k = it.Key;
+                        if (!DbFormat.TryParseInternalKey(k, out ParsedInternalKey pk)) ThrowHelper.Corruption("corrupted range tombstone key in " + path);
+                        fragmenter.Add(k[..pk.UserKeyLength], it.Value, pk.Sequence);
+                    }
+                }
+                frag = fragmenter.Finish();
+            }
+            finally
+            {
+                RangeTombstoneFragmenter.Return(fragmenter);
+            }
             h.RangeDels = frag.IsEmpty ? null : frag;
         }
     }

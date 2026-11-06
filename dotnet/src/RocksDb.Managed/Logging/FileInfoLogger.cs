@@ -133,21 +133,65 @@ internal sealed class FileInfoLogger : InfoLogger
         {
             lock (_writeLock) _headers.Add(line);
         }
+        Enqueue(line);
+    }
+
+    internal override void LogInfo(StringBuilder message)
+    {
+        if (InfoLogLevel.Info < Level || _closed) return;
+        Enqueue(FormatLine(message));
+    }
+
+    private void Enqueue(string line)
+    {
         _queue.Enqueue(line);
         // Wake the writer at most once per batch of messages.
         if (Interlocked.Exchange(ref _pendingSignals, 1) == 0) _signal.Release();
     }
 
+    /// <summary>Length of the "yyyy/MM/dd-HH:mm:ss.ffffff" timestamp.</summary>
+    private const int TimestampLength = 26;
+
     /// <summary>EnvLogger::Logv header: local time with microseconds and the thread id in hex.</summary>
     private static string FormatLine(string message)
     {
-        DateTime now = DateTime.Now;
-        var sb = new StringBuilder(message.Length + 48);
-        sb.Append(now.ToString("yyyy/MM/dd-HH:mm:ss.ffffff", CultureInfo.InvariantCulture)).Append(' ')
-            .Append(Environment.CurrentManagedThreadId.ToString("x", CultureInfo.InvariantCulture)).Append(' ')
-            .Append(message);
-        if (message.Length == 0 || message[^1] != '\n') sb.Append('\n');
-        return sb.ToString();
+        bool newline = message.Length == 0 || message[^1] != '\n';
+        int tid = Environment.CurrentManagedThreadId;
+        int length = TimestampLength + 1 + HexLength(tid) + 1 + message.Length + (newline ? 1 : 0);
+        return string.Create(length, (DateTime.Now, tid, message, newline), static (span, st) =>
+        {
+            int pos = WritePrefix(span, st.Item1, st.tid);
+            st.message.CopyTo(span[pos..]);
+            if (st.newline) span[^1] = '\n';
+        });
+    }
+
+    /// <summary><see cref="FormatLine(string)"/> for a message held in a builder (no intermediate message string).</summary>
+    private static string FormatLine(StringBuilder message)
+    {
+        int n = message.Length;
+        bool newline = n == 0 || message[n - 1] != '\n';
+        int tid = Environment.CurrentManagedThreadId;
+        int length = TimestampLength + 1 + HexLength(tid) + 1 + n + (newline ? 1 : 0);
+        return string.Create(length, (DateTime.Now, tid, message, newline), static (span, st) =>
+        {
+            int pos = WritePrefix(span, st.Item1, st.tid);
+            st.message.CopyTo(0, span[pos..], st.message.Length);
+            if (st.newline) span[^1] = '\n';
+        });
+    }
+
+    private static int HexLength(int value) => value <= 0 ? 1 : (32 - System.Numerics.BitOperations.LeadingZeroCount((uint)value) + 3) / 4;
+
+    /// <summary>Writes "&lt;timestamp&gt; &lt;thread id hex&gt; " and returns its length.</summary>
+    private static int WritePrefix(Span<char> span, DateTime now, int tid)
+    {
+        now.TryFormat(span, out int written, "yyyy/MM/dd-HH:mm:ss.ffffff", CultureInfo.InvariantCulture);
+        span[written++] = ' ';
+        tid.TryFormat(span[written..], out int w, "x", CultureInfo.InvariantCulture);
+        written += w;
+        span[written++] = ' ';
+        return written;
     }
 
     private async Task WriterLoopAsync()
