@@ -528,8 +528,26 @@ public sealed class WriteBatchWithIndex : IDisposable
         ReadOptions? options)
     {
         _index.SetComparator(cf, comparator);
-        var delta = new WriteBatchWithIndexIterator(this, cf, comparator, options?.IterateLowerBound, options?.IterateUpperBound);
-        return new BaseDeltaIterator(baseIterator, delta, comparator, mergeOperator);
+        return new BaseDeltaIterator(baseIterator, this, RentDeltaScratch(cf, comparator, options), comparator, mergeOperator);
+    }
+
+    // One spare delta iterator + merge buffers for NewIteratorWithBase (iterators are usually created one at a time).
+    private BaseDeltaScratch? _spareDeltaScratch;
+
+    /// <summary>The spare delta iterator state re-targeted at <paramref name="cf"/> (or a new one).</summary>
+    private BaseDeltaScratch RentDeltaScratch(uint cf, Comparator comparator, ReadOptions? options)
+    {
+        BaseDeltaScratch? s = Interlocked.Exchange(ref _spareDeltaScratch, null);
+        if (s is null) return new BaseDeltaScratch(new WriteBatchWithIndexIterator(this, cf, comparator, options?.IterateLowerBound, options?.IterateUpperBound));
+        s.Delta.Reset(cf, comparator, options?.IterateLowerBound, options?.IterateUpperBound);
+        return s;
+    }
+
+    /// <summary>Keeps a disposed BaseDeltaIterator's state as the spare (disposes it when there already is one).</summary>
+    internal void ReturnDeltaScratch(BaseDeltaScratch scratch)
+    {
+        scratch.Clear();
+        if (Interlocked.CompareExchange(ref _spareDeltaScratch, scratch, null) is not null) scratch.Dispose();
     }
 
     internal Comparator ComparatorOf(ColumnFamily? cf) => cf is null ? _defaultComparator : _index.GetComparator(CfId(cf));
@@ -556,8 +574,7 @@ public sealed class WriteBatchWithIndex : IDisposable
         ArgumentNullException.ThrowIfNull(baseIterator);
         uint cf = CfId(columnFamily);
         Comparator cmp = ComparatorOf(columnFamily);
-        var delta = new WriteBatchWithIndexIterator(this, cf, cmp, options?.IterateLowerBound, options?.IterateUpperBound);
-        return new BaseDeltaIterator(baseIterator, delta, cmp, columnFamily?.Data.MergeOperator);
+        return new BaseDeltaIterator(baseIterator, this, RentDeltaScratch(cf, cmp, options), cmp, columnFamily?.Data.MergeOperator);
     }
 
     // =====================================================================================================
@@ -1220,6 +1237,7 @@ public sealed class WriteBatchWithIndex : IDisposable
         _pooled = false;
         _batch.Dispose();
         _mergeContext.Dispose();
+        Interlocked.Exchange(ref _spareDeltaScratch, null)?.Dispose();
     }
 }
 

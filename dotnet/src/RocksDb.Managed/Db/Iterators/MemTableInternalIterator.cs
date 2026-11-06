@@ -40,6 +40,20 @@ public sealed class MemTableInternalIterator : InternalIterator
         _it = memtable.NewIterator();
     }
 
+    /// <summary>Re-targets this iterator at another memtable with the prefix-bloom choice of the constructor taking read options.</summary>
+    internal void Reset(MemTable memtable, ReadOptions? readOptions, SliceTransform? cfPrefixExtractor)
+    {
+        _memtable = memtable;
+        _it = memtable.NewIterator(memtable.UsesPrefixBloom(readOptions, cfPrefixExtractor));
+    }
+
+    /// <summary>Drops the memtable reference (a pooled iterator must not keep its memory alive); <see cref="Reset(MemTable)"/> before reuse.</summary>
+    internal void Clear()
+    {
+        _memtable = null;
+        _it = default;
+    }
+
     public MemTable? MemTable => _memtable;
 
     public override bool Valid => _it.Valid;

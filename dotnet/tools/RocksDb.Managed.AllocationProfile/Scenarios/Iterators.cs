@@ -131,6 +131,39 @@ internal static partial class Scenarios
                 }
             }));
         }, notes: "Typical caller pattern; ReadOptions + boxed ReadOnlyMemory? bounds are caller allocations."));
+        list.Add(S("iter.setbounds-per-scan.sst-cached", "iterator", PathKind.Hot, "reused Iterator: SetBounds(lower, upper) + SeekToFirst + scan 10", ctx =>
+        {
+            (RocksDatabase db, _) = ReadDb(ctx, Location.Cached);
+            byte[][] sorted = ScenarioContext.Keys(ReadKeys);
+            Iterator it = ctx.Own(db.NewIterator());
+            var c = new Cursor(sorted.Length - 10);
+            long sum = 0;
+            return Done(Runner.Sync(n =>
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    int k = c.Next();
+                    it.SetBounds(sorted[k], sorted[k + 10]);
+                    for (it.SeekToFirst(); it.Valid; it.Next()) sum += it.Key.Length;
+                }
+            }));
+        }));
+        list.Add(S("iter.refresh-per-scan.sst-cached", "iterator", PathKind.Hot, "reused Iterator: Refresh + Seek + 10 Next (sees new writes)", ctx =>
+        {
+            (RocksDatabase db, byte[][] keys) = ReadDb(ctx, Location.Cached);
+            Iterator it = ctx.Own(db.NewIterator());
+            var c = new Cursor(keys.Length);
+            long sum = 0;
+            return Done(Runner.Sync(n =>
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    it.Refresh();
+                    it.Seek(keys[c.Next()]);
+                    for (int j = 0; j < 10 && it.Valid; j++, it.Next()) sum += it.Key.Length;
+                }
+            }));
+        }));
         list.Add(S("iter.range-foreach.sst-cached", "iterator", PathKind.Hot, "reused Iterator: foreach over Range(start, end) of 10 keys", ctx =>
         {
             (RocksDatabase db, _) = ReadDb(ctx, Location.Cached);

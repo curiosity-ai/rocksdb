@@ -18,48 +18,91 @@ namespace RocksDb.Managed;
 /// </list>
 /// <para><b>Lifetime rule.</b> <see cref="Key"/>, <see cref="Value"/>, <see cref="KeyValueRef"/> and the memory of a
 /// <see cref="KeyValue"/> produced by <see cref="ScanAsync()"/> are valid only until the iterator moves again
-/// (the next <c>Next</c>/<c>Seek</c>/<c>MoveNext</c>/<c>MoveNextAsync</c>) or is disposed. Copy what must outlive
-/// that. None of the stepping paths allocate.</para>
+/// (the next <c>Next</c>/<c>Seek</c>/<c>MoveNext</c>/<c>MoveNextAsync</c>), is refreshed (<see cref="Refresh()"/>,
+/// <see cref="SetBounds"/>) or is disposed. Copy what must outlive that. None of the stepping paths allocate.</para>
+/// <para><b>Reuse.</b> An iterator created by a DB pins the memtables and files of the moment it was created.
+/// <see cref="Refresh()"/> moves it to the current state (or another snapshot) without building a new iterator, and
+/// <see cref="SetBounds"/> changes its iterate bounds, so one iterator can serve many short scans. Disposed DB
+/// iterators also return their internal iterator stack to a small per-column-family pool, so creating one iterator
+/// per scan does not allocate an iterator stack in steady state either. Using an iterator after
+/// <see cref="Dispose"/> throws <see cref="ObjectDisposedException"/>.</para>
 /// <para>Errors (corruption, I/O, Incomplete when <see cref="ReadOptions.MaxSkippableInternalKeys"/> is exceeded) are
 /// thrown as <see cref="RocksDbException"/> by the positioning call. Not thread-safe. Dispose to release the
 /// resources (table blocks, super version) it pins.</para>
 /// </remarks>
 public sealed class Iterator : IDisposable
 {
-    private DbIter _it;
-    private readonly InternalKeyComparator _icmp;
-    private bool _disposed;
+    // The handle is never pooled (its core is): after Dispose, _core is null and every member throws.
+    private IteratorCore? _core;
+    // The core's DB iterator (the same object for the core's whole life) and value suffix, for the accessors called per
+    // entry (Valid / Key / Value) without going through the core. Cleared on Dispose like _core.
+    private DbIter? _it;
+    private int _valueSuffixLength;
+    private AsyncScan? _scan;
+    private WideColumns? _columns;
 
-    /// <summary>Whether the iterator was disposed (WriteUnprepared transactions track their active iterators).</summary>
-    internal bool IsDisposed => _disposed;
-
-    /// <summary>The wrapped DB iterator (tests).</summary>
-    internal DbIter Inner => _it;
-
-    /// <summary>Wraps a <see cref="DbIter"/> (ownership transferred). Normally created by <see cref="DbIteratorFactory"/>.</summary>
+    /// <summary>Wraps a <see cref="DbIter"/> (ownership transferred). DB iterators are created by <c>NewIterator</c>.</summary>
     public Iterator(DbIter iter)
     {
         ArgumentNullException.ThrowIfNull(iter);
+        _core = new IteratorCore(iter);
         _it = iter;
-        _icmp = iter.Comparator;
-        _keyComparator = _icmp.UserComparator.TimestampSize == 0 ? null : _icmp.UserComparator.RootComparator;
     }
 
-    /// <summary>Keys without timestamps are ordered by the root comparator when the column family has timestamps.</summary>
-    private readonly Comparator? _keyComparator;
+    internal Iterator(IteratorCore core)
+    {
+        _core = core;
+        _it = core.It;
+    }
+
+    private DbIter It
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            DbIter? it = _it;
+            if (it is null) ThrowDisposed();
+            return it;
+        }
+    }
+
+    private IteratorCore Core
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            IteratorCore? c = _core;
+            if (c is null) ThrowDisposed();
+            return c;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ThrowDisposed() => throw new ObjectDisposedException(nameof(Iterator));
+
+    /// <summary>Whether the iterator was disposed (WriteUnprepared transactions track their active iterators).</summary>
+    internal bool IsDisposed => _core is null;
+
+    /// <summary>The wrapped DB iterator (tests).</summary>
+    internal DbIter Inner => Core.It;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private int CompareKeys(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) => _keyComparator is null ? _icmp.CompareUserKey(a, b) : _keyComparator.Compare(a, b);
+    private int CompareKeys(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) => Core.CompareKeys(a, b);
 
     /// <summary>True if positioned at an entry.</summary>
     public bool Valid
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _it.Valid;
+        get => It.Valid;
     }
 
     /// <summary>Current user key. REQUIRES: <see cref="Valid"/>. Valid until the iterator moves.</summary>
-    public ReadOnlySpan<byte> Key => _it.Key;
+    public ReadOnlySpan<byte> Key
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => It.Key;
+    }
 
     /// <summary>Current value. REQUIRES: <see cref="Valid"/>. Valid until the iterator moves.</summary>
     public ReadOnlySpan<byte> Value
@@ -67,7 +110,7 @@ public sealed class Iterator : IDisposable
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get
         {
-            ReadOnlySpan<byte> v = _it.Value;
+            ReadOnlySpan<byte> v = It.Value;
             int strip = _valueSuffixLength;
             if (strip == 0) return v;
             if (v.Length < strip) ThrowHelper.Corruption("Error: value's length less than timestamp's\n");
@@ -75,397 +118,138 @@ public sealed class Iterator : IDisposable
         }
     }
 
-    /// <summary>
-    /// Bytes removed from the end of every value (TtlIterator::value() of utilities/ttl/db_ttl_impl.h strips the 4-byte
-    /// write time of TTL databases); 0 = none. Set once by the creator before the iterator is handed out.
-    /// </summary>
-    private int _valueSuffixLength;
-
-    internal void StripValueSuffix(int length) => _valueSuffixLength = length;
+    internal void StripValueSuffix(int length)
+    {
+        Core.ValueSuffixLength = length;
+        _valueSuffixLength = length;
+    }
 
     /// <summary>
     /// User-defined timestamp of the current entry (Iterator::timestamp()) for column families with timestamps; empty
     /// otherwise. REQUIRES: <see cref="Valid"/>. Valid until the iterator moves.
     /// </summary>
-    public ReadOnlySpan<byte> Timestamp => _it.Timestamp;
+    public ReadOnlySpan<byte> Timestamp => Core.It.Timestamp;
 
     /// <summary>
     /// With <see cref="ReadOptions.IterStartTs"/>: the internal key of the current version (user key | timestamp |
     /// fixed64(seq &lt;&lt; 8 | type)), which tells deletions apart (upstream returns it as key()). Empty otherwise.
     /// </summary>
-    public ReadOnlySpan<byte> InternalKey => _it.InternalKey;
+    public ReadOnlySpan<byte> InternalKey => Core.It.InternalKey;
 
     /// <summary>True if the current entry is a wide-column entity (PutEntity). REQUIRES: <see cref="Valid"/>.</summary>
-    public bool IsEntity => _it.IsEntity;
-
-    private WideColumns? _columns;
-    private Util.PooledBufferWriter? _columnsScratch;
+    public bool IsEntity => Core.It.IsEntity;
 
     /// <summary>
     /// The wide columns of the current entry (Iterator::columns): the entity's columns, or a single default column
-    /// holding <see cref="Value"/> for a plain value. REQUIRES: <see cref="Valid"/>. The returned object is reused and
-    /// refilled on every access; it stays readable after the iterator moves until the next access.
+    /// holding <see cref="Value"/> for a plain value. REQUIRES: <see cref="Valid"/>. The returned object belongs to this
+    /// iterator and is refilled on every access; it stays readable after the iterator moves until the next access.
     /// </summary>
     public WideColumns Columns
     {
         get
         {
+            IteratorCore core = Core;
             WideColumns c = _columns ??= new WideColumns();
-            if (_it.IsEntity)
-            {
-                c.SetSerialized(_it.SerializedEntity);
-            }
-            else
-            {
-                Util.PooledBufferWriter w = _columnsScratch ??= new Util.PooledBufferWriter(64);
-                w.Clear();
-                Db.Wide.WideColumnSerialization.SerializeDefaultColumn(Value, w);
-                c.SetSerialized(w.WrittenSpan);
-            }
+            core.FillColumns(c);
             return c;
         }
     }
 
     /// <summary>Sequence number of the snapshot the iterator reads.</summary>
-    public ulong Sequence => _it.Sequence;
+    public ulong Sequence => Core.It.Sequence;
 
     /// <summary>The user comparator ordering the keys.</summary>
-    public Comparator Comparator => _icmp.UserComparator;
+    public Comparator Comparator => Core.Comparator.UserComparator;
 
-    public void SeekToFirst()
-    {
-        if (_deadlineOptions is not null)
-        {
-            MoveWithDeadline(DeadlineMove.SeekToFirst, default);
-            return;
-        }
-        if (_tailing is not null) _tailing.RenewIfStale(this);
-        if (_stats is null)
-        {
-            _it.SeekToFirst();
-            return;
-        }
-        long t0 = _stats.StartTimer();
-        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
-        try
-        {
-            _it.SeekToFirst();
-        }
-        finally
-        {
-            Monitoring.FileReadActivity.Exit(activity);
-        }
-        RecordSeek(t0);
-    }
+    /// <summary>Positions at the first entry (at <see cref="ReadOptions.IterateLowerBound"/> when set).</summary>
+    public void SeekToFirst() => Core.SeekToFirst();
 
-    public void SeekToLast()
-    {
-        if (_deadlineOptions is not null)
-        {
-            MoveWithDeadline(DeadlineMove.SeekToLast, default);
-            return;
-        }
-        if (_tailing is not null) TailingNotSupported("ForwardIterator::SeekToLast()");
-        if (_stats is null)
-        {
-            _it.SeekToLast();
-            return;
-        }
-        long t0 = _stats.StartTimer();
-        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
-        try
-        {
-            _it.SeekToLast();
-        }
-        finally
-        {
-            Monitoring.FileReadActivity.Exit(activity);
-        }
-        RecordSeek(t0);
-    }
-
-    // Query tracing (DBIter::has_trace_state_ / trace_db_ / trace_cf_id_ / trace_read_options_).
-    private DbImpl? _traceDb;
-    private uint _traceCfId;
-    private ReadOptions? _traceReadOptions;
-
-    /// <summary>Records seeks in the DB's query trace while one runs (set by the DB when it creates the iterator).</summary>
-    internal void SetTraceState(DbImpl db, uint cfId, ReadOptions? options)
-    {
-        _traceDb = db;
-        _traceCfId = cfId;
-        _traceReadOptions = options;
-        if (options is not null && options.Deadline > TimeSpan.Zero) _deadlineOptions = options;
-    }
-
-    // ReadOptions::deadline: table file reads of the iterator's moves fail with TimedOut once it has passed.
-    private ReadOptions? _deadlineOptions;
-
-    private enum DeadlineMove : byte { SeekToFirst, SeekToLast, Seek, SeekForPrev, Next, Prev }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private void MoveWithDeadline(DeadlineMove move, ReadOnlySpan<byte> target)
-    {
-        ReadOptions o = _deadlineOptions!;
-        _deadlineOptions = null;
-        long token = Table.ReadDeadline.Enter(o);
-        try
-        {
-            switch (move)
-            {
-                case DeadlineMove.SeekToFirst: SeekToFirst(); break;
-                case DeadlineMove.SeekToLast: SeekToLast(); break;
-                case DeadlineMove.Seek: Seek(target); break;
-                case DeadlineMove.SeekForPrev: SeekForPrev(target); break;
-                case DeadlineMove.Next: Next(); break;
-                default: Prev(); break;
-            }
-        }
-        finally
-        {
-            Table.ReadDeadline.Exit(token);
-            _deadlineOptions = o;
-        }
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private void TraceSeek(Tracing.QueryTracer t, Tracing.TraceType type, ReadOnlySpan<byte> target)
-    {
-        ReadOptions? o = _traceReadOptions;
-        ReadOnlySpan<byte> lower = o?.IterateLowerBound is { } lb ? lb.Span : default;
-        ReadOnlySpan<byte> upper = o?.IterateUpperBound is { } ub ? ub.Span : default;
-        t.IteratorSeek(type, _traceCfId, target, lower, upper, o);
-    }
+    /// <summary>Positions at the last entry (before <see cref="ReadOptions.IterateUpperBound"/> when set).</summary>
+    public void SeekToLast() => Core.SeekToLast();
 
     /// <summary>Positions at the first key &gt;= <paramref name="target"/>.</summary>
-    public void Seek(ReadOnlySpan<byte> target)
-    {
-        if (_deadlineOptions is not null)
-        {
-            MoveWithDeadline(DeadlineMove.Seek, target);
-            return;
-        }
-        if (_tailing is not null) _tailing.RenewIfStale(this);
-        if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Tracing.TraceType.IteratorSeek, target);
-        if (_stats is null)
-        {
-            _it.Seek(target);
-            return;
-        }
-        long t0 = _stats.StartTimer();
-        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
-        try
-        {
-            _it.Seek(target);
-        }
-        finally
-        {
-            Monitoring.FileReadActivity.Exit(activity);
-        }
-        RecordSeek(t0);
-    }
+    public void Seek(ReadOnlySpan<byte> target) => Core.Seek(target);
 
     /// <summary>Positions at the last key &lt;= <paramref name="target"/>.</summary>
-    public void SeekForPrev(ReadOnlySpan<byte> target)
-    {
-        if (_deadlineOptions is not null)
-        {
-            MoveWithDeadline(DeadlineMove.SeekForPrev, target);
-            return;
-        }
-        if (_tailing is not null) TailingNotSupported("ForwardIterator::SeekForPrev()");
-        if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Tracing.TraceType.IteratorSeekForPrev, target);
-        if (_stats is null)
-        {
-            _it.SeekForPrev(target);
-            return;
-        }
-        long t0 = _stats.StartTimer();
-        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
-        try
-        {
-            _it.SeekForPrev(target);
-        }
-        finally
-        {
-            Monitoring.FileReadActivity.Exit(activity);
-        }
-        RecordSeek(t0);
-    }
+    public void SeekForPrev(ReadOnlySpan<byte> target) => Core.SeekForPrev(target);
 
-    public void Next()
-    {
-        if (_deadlineOptions is not null)
-        {
-            MoveWithDeadline(DeadlineMove.Next, default);
-            return;
-        }
-        if (_tailing is not null && _tailing.IsStale && TailingRenewForNext()) return;
-        if (_stats is null)
-        {
-            _it.Next();
-            return;
-        }
-        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
-        try
-        {
-            _it.Next();
-        }
-        finally
-        {
-            Monitoring.FileReadActivity.Exit(activity);
-        }
-        RecordStep(Ticker.NumberDbNext, Ticker.NumberDbNextFound);
-    }
+    /// <summary>Moves to the next entry. REQUIRES: <see cref="Valid"/>.</summary>
+    public void Next() => Core.Next();
 
-    public void Prev()
-    {
-        if (_deadlineOptions is not null)
-        {
-            MoveWithDeadline(DeadlineMove.Prev, default);
-            return;
-        }
-        if (_tailing is not null) TailingNotSupported("ForwardIterator::Prev");
-        if (_stats is null)
-        {
-            _it.Prev();
-            return;
-        }
-        int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbIteratorMicros);
-        try
-        {
-            _it.Prev();
-        }
-        finally
-        {
-            Monitoring.FileReadActivity.Exit(activity);
-        }
-        RecordStep(Ticker.NumberDbPrev, Ticker.NumberDbPrevFound);
-    }
-
-    // ---- statistics (DBIter::Seek / Next / Prev RecordTick calls) ----
-
-    private Statistics? _stats;
+    /// <summary>Moves to the previous entry. REQUIRES: <see cref="Valid"/>.</summary>
+    public void Prev() => Core.Prev();
 
     /// <summary>Statistics to record NUMBER_DB_SEEK / NEXT / PREV (+ FOUND), ITER_BYTES_READ and DB_SEEK into.</summary>
     internal Statistics? Statistics
     {
-        get => _stats;
-        set
-        {
-            _stats = value;
-            value?.RecordTick(Ticker.NoIteratorCreated);
-        }
+        get => Core.Statistics;
+        set => Core.Statistics = value;
     }
 
-    private void RecordSeek(long startTimestamp)
-    {
-        Statistics st = _stats!;
-        st.RecordElapsedMicros(Histogram.DbSeek, startTimestamp);
-        RecordStep(Ticker.NumberDbSeek, Ticker.NumberDbSeekFound);
-    }
+    /// <summary>Records seeks in the DB's query trace while one runs (set by the DB when it creates the iterator).</summary>
+    internal void SetTraceState(DbImpl db, uint cfId, ReadOptions? options) => Core.SetTraceState(db, cfId, options);
 
-    private void RecordStep(Ticker step, Ticker found)
-    {
-        Statistics st = _stats!;
-        st.RecordTick(step);
-        if (_it.Valid)
-        {
-            st.RecordTick(found);
-            st.RecordTick(Ticker.IterBytesRead, (ulong)(_it.Key.Length + _it.Value.Length));
-        }
-    }
+    /// <summary>Async <see cref="SeekToFirst"/>: data blocks are read with async I/O; completes synchronously on cache hits.</summary>
+    public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) => Core.SeekToFirstAsync(cancellationToken);
 
-    public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default)
-    {
-        _tailing?.RenewIfStale(this);
-        return _it.SeekToFirstAsync(cancellationToken);
-    }
+    /// <summary>Async <see cref="SeekToLast"/>.</summary>
+    public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default) => Core.SeekToLastAsync(cancellationToken);
 
-    public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default)
-    {
-        if (_tailing is not null) TailingNotSupported("ForwardIterator::SeekToLast()");
-        return _it.SeekToLastAsync(cancellationToken);
-    }
+    /// <summary>Async <see cref="Seek"/>.</summary>
+    public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) => Core.SeekAsync(target, cancellationToken);
 
-    public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
-    {
-        _tailing?.RenewIfStale(this);
-        if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Tracing.TraceType.IteratorSeek, target.Span);
-        return _it.SeekAsync(target, cancellationToken);
-    }
+    /// <summary>Async <see cref="SeekForPrev"/>.</summary>
+    public ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) =>
+        Core.SeekForPrevAsync(target, cancellationToken);
 
-    public ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
-    {
-        if (_tailing is not null) TailingNotSupported("ForwardIterator::SeekForPrev()");
-        if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Tracing.TraceType.IteratorSeekForPrev, target.Span);
-        return _it.SeekForPrevAsync(target, cancellationToken);
-    }
-    public ValueTask NextAsync(CancellationToken cancellationToken = default)
-    {
-        if (_tailing is not null && _tailing.IsStale && TailingRenewForNext()) return ValueTask.CompletedTask;
-        return _it.NextAsync(cancellationToken);
-    }
+    /// <summary>Async <see cref="Next"/>.</summary>
+    public ValueTask NextAsync(CancellationToken cancellationToken = default) => Core.NextAsync(cancellationToken);
 
-    public ValueTask PrevAsync(CancellationToken cancellationToken = default)
-    {
-        if (_tailing is not null) TailingNotSupported("ForwardIterator::Prev");
-        return _it.PrevAsync(cancellationToken);
-    }
-
-    // ---- tailing (ReadOptions::tailing, ForwardIterator) ----
-
-    /// <summary>
-    /// Rebuilds the iterator stack of a tailing iterator when the column family's super version changed (a memtable
-    /// switch, flush or compaction), like ForwardIterator::RenewIterators; null for regular iterators.
-    /// </summary>
-    internal abstract class TailingSource
-    {
-        /// <summary>The column family installed a new super version since the current stack was built.</summary>
-        public abstract bool IsStale { get; }
-
-        /// <summary>A new DB iterator over the current super version (at kMaxSequenceNumber).</summary>
-        public abstract DbIter Build();
-
-        public void RenewIfStale(Iterator owner)
-        {
-            if (IsStale) owner.ReplaceInner(Build());
-        }
-    }
-
-    private TailingSource? _tailing;
-
-    internal void SetTailing(TailingSource source) => _tailing = source;
-
-    private void ReplaceInner(DbIter fresh)
-    {
-        DbIter old = _it;
-        _it = fresh;
-        old.Dispose();
-    }
-
-    /// <summary>
-    /// ForwardIterator::Next after a super version change: renew, re-seek to the current key and advance past it.
-    /// Returns true when the re-seek already moved past the old key (nothing left to do).
-    /// </summary>
-    private bool TailingRenewForNext()
-    {
-        byte[] current = _it.Key.ToArray();
-        ReplaceInner(_tailing!.Build());
-        _it.Seek(current);
-        return !_it.Valid || CompareKeys(_it.Key, current) != 0;
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
-    private static void TailingNotSupported(string op) =>
-        throw new RocksDbException(StatusCode.NotSupported, "Not implemented: " + op);
+    /// <summary>Async <see cref="Prev"/>.</summary>
+    public ValueTask PrevAsync(CancellationToken cancellationToken = default) => Core.PrevAsync(cancellationToken);
 
     /// <summary>
     /// Reads the current value with async I/O if it is still pending (a value stored in a blob file is otherwise read
     /// synchronously on first access to <c>Value</c>). Iterator::PrepareValue.
     /// </summary>
-    public ValueTask PrepareValueAsync(CancellationToken cancellationToken = default) => _it.PrepareValueAsync(cancellationToken);
+    public ValueTask PrepareValueAsync(CancellationToken cancellationToken = default) => Core.It.PrepareValueAsync(cancellationToken);
+
+    // ------------------------------------------------------------------ refresh and bounds
+
+    /// <summary>
+    /// Re-targets the iterator at the latest state of the DB (Iterator::Refresh, include/rocksdb/iterator_base.h): later
+    /// positioning calls see the writes, flushes and compactions made since it was created or last refreshed, also when
+    /// it was created with a <see cref="ReadOptions.Snapshot"/>. The iterator is unpositioned afterwards (seek before
+    /// reading) and the internal iterator stack is reused, so this is much cheaper than creating a new iterator and does
+    /// not allocate in steady state. Spans obtained before the call are invalid afterwards.
+    /// </summary>
+    /// <exception cref="RocksDbException"><see cref="StatusCode.NotSupported"/> for iterators that cannot be refreshed:
+    /// tailing iterators (they follow new writes on their own), iterators of WritePrepared / WriteUnprepared transaction
+    /// DBs and transactions, and iterators not created by a DB (e.g. <see cref="SstFileReader"/>).</exception>
+    public void Refresh() => Core.Refresh(null);
+
+    /// <summary>
+    /// Like <see cref="Refresh()"/>, reading at <paramref name="snapshot"/> (null = the latest state) from now on
+    /// (Iterator::Refresh(const Snapshot*)). The snapshot must belong to the iterator's DB and stay alive while the
+    /// iterator reads at it.
+    /// </summary>
+    public void Refresh(Snapshot? snapshot) => Core.Refresh(snapshot);
+
+    /// <summary>Async <see cref="Refresh()"/>: when the DB's files changed, the new table files are opened with async I/O.</summary>
+    public ValueTask RefreshAsync(CancellationToken cancellationToken = default) => Core.RefreshAsync(null, cancellationToken);
+
+    /// <summary>Async <see cref="Refresh(Snapshot?)"/>.</summary>
+    public ValueTask RefreshAsync(Snapshot? snapshot, CancellationToken cancellationToken = default) => Core.RefreshAsync(snapshot, cancellationToken);
+
+    /// <summary>
+    /// Replaces the iterate bounds the iterator was created with (<see cref="ReadOptions.IterateLowerBound"/> inclusive,
+    /// <see cref="ReadOptions.IterateUpperBound"/> exclusive; null = unbounded), so one iterator can scan many ranges.
+    /// The iterator is unpositioned afterwards; the bounds take effect at the next positioning call and stay in effect
+    /// across <see cref="Refresh()"/>. The caller's <see cref="ReadOptions"/> object is not modified. The bound memory
+    /// must stay unchanged while the iterator uses it. Allocation-free, except on column families with a prefix
+    /// extractor, where it copies the read options once per call.
+    /// </summary>
+    public void SetBounds(ReadOnlyMemory<byte>? lowerBound, ReadOnlyMemory<byte>? upperBound) => Core.SetBounds(lowerBound, upperBound);
 
     // ------------------------------------------------------------------ foreach over a range (ref struct)
 
@@ -543,46 +327,70 @@ public sealed class Iterator : IDisposable
 
     // ------------------------------------------------------------------ async scan
 
-    /// <summary>Async scan of all entries. Single-use enumerable; see <see cref="KeyValue"/> for the lifetime rule.</summary>
-    public IAsyncEnumerable<KeyValue> ScanAsync() => new AsyncScan(this, null, null, ownsIterator: false);
+    /// <summary>
+    /// Async scan of all entries. See <see cref="ScanAsync(ReadOnlyMemory{byte}?, ReadOnlyMemory{byte}?)"/> for the reuse
+    /// and lifetime rules.
+    /// </summary>
+    public IAsyncEnumerable<KeyValue> ScanAsync() => StartScan(null, null, ownsIterator: false);
 
     /// <summary>
     /// Async scan of entries with <paramref name="start"/> &lt;= key &lt; <paramref name="end"/> (null = unbounded).
-    /// Single-use. Each <see cref="KeyValue"/> is backed by one buffer reused for every item (no per-item allocation):
-    /// it is valid until the next <c>MoveNextAsync</c>.
+    /// Each <see cref="KeyValue"/> is backed by one buffer reused for every item (no per-item allocation): it is valid
+    /// until the next <c>MoveNextAsync</c>. The returned enumerable can be enumerated once; the iterator reuses one scan
+    /// object for all its scans (no allocation per scan), so a new <c>ScanAsync</c> call is only allowed after the
+    /// previous enumeration was disposed (<c>await foreach</c> does that), else it throws
+    /// <see cref="InvalidOperationException"/>.
     /// </summary>
     public IAsyncEnumerable<KeyValue> ScanAsync(ReadOnlyMemory<byte>? start, ReadOnlyMemory<byte>? end) =>
-        new AsyncScan(this, start, end, ownsIterator: false);
+        StartScan(start, end, ownsIterator: false);
 
     /// <summary>Like <see cref="ScanAsync(ReadOnlyMemory{byte}?, ReadOnlyMemory{byte}?)"/>, disposing this iterator when the enumeration is disposed.</summary>
     public IAsyncEnumerable<KeyValue> ScanAsyncAndDispose(ReadOnlyMemory<byte>? start, ReadOnlyMemory<byte>? end) =>
-        new AsyncScan(this, start, end, ownsIterator: true);
+        StartScan(start, end, ownsIterator: true);
 
+    private AsyncScan StartScan(ReadOnlyMemory<byte>? start, ReadOnlyMemory<byte>? end, bool ownsIterator)
+    {
+        _ = Core; // ObjectDisposedException
+        AsyncScan s = _scan ??= new AsyncScan(this);
+        s.Reset(start, end, ownsIterator);
+        return s;
+    }
+
+    /// <summary>The scan of one iterator, reset by every <c>ScanAsync</c> call (one enumeration at a time).</summary>
     private sealed class AsyncScan : IAsyncEnumerable<KeyValue>, IAsyncEnumerator<KeyValue>
     {
         private readonly Iterator _iterator;
-        private readonly ReadOnlyMemory<byte>? _start;
-        private readonly ReadOnlyMemory<byte>? _end;
-        private readonly bool _ownsIterator;
+        private ReadOnlyMemory<byte>? _start;
+        private ReadOnlyMemory<byte>? _end;
+        private bool _ownsIterator;
         private byte[] _buffer = [];
         private CancellationToken _ct;
         private bool _handedOut;
+        private bool _active;
         private bool _started;
         private bool _done;
         private KeyValue _current;
 
-        public AsyncScan(Iterator iterator, ReadOnlyMemory<byte>? start, ReadOnlyMemory<byte>? end, bool ownsIterator)
+        public AsyncScan(Iterator iterator) => _iterator = iterator;
+
+        public void Reset(ReadOnlyMemory<byte>? start, ReadOnlyMemory<byte>? end, bool ownsIterator)
         {
-            _iterator = iterator;
+            if (_active) throw new InvalidOperationException("The previous ScanAsync enumeration of this iterator was not disposed.");
             _start = start;
             _end = end;
             _ownsIterator = ownsIterator;
+            _ct = default;
+            _handedOut = false;
+            _started = false;
+            _done = false;
+            _current = default;
         }
 
         public IAsyncEnumerator<KeyValue> GetAsyncEnumerator(CancellationToken cancellationToken = default)
         {
             if (_handedOut) throw new InvalidOperationException("ScanAsync results can be enumerated only once.");
             _handedOut = true;
+            _active = true;
             _ct = cancellationToken;
             return this;
         }
@@ -591,24 +399,26 @@ public sealed class Iterator : IDisposable
 
         public ValueTask<bool> MoveNextAsync()
         {
+            if (_iterator._core is null) ThrowDisposed();
             if (_done) return new ValueTask<bool>(false);
             _ct.ThrowIfCancellationRequested();
+            DbIter it = _iterator.Core.It;
             ValueTask t;
             if (!_started)
             {
                 _started = true;
-                t = _start is ReadOnlyMemory<byte> s ? _iterator._it.SeekAsync(s, _ct) : _iterator._it.SeekToFirstAsync(_ct);
+                t = _start is ReadOnlyMemory<byte> s ? it.SeekAsync(s, _ct) : it.SeekToFirstAsync(_ct);
             }
             else
             {
-                t = _iterator._it.NextAsync(_ct);
+                t = it.NextAsync(_ct);
             }
             if (!t.IsCompletedSuccessfully) return MoveNextSlowAsync(t);
             t.GetAwaiter().GetResult();
             // A value in a blob file is read with async I/O before it is captured.
-            if (_iterator._it.Valid)
+            if (it.Valid)
             {
-                t = _iterator._it.PrepareValueAsync(_ct);
+                t = it.PrepareValueAsync(_ct);
                 if (!t.IsCompletedSuccessfully) return MoveNextSlowAsync(t);
                 t.GetAwaiter().GetResult();
             }
@@ -619,20 +429,22 @@ public sealed class Iterator : IDisposable
         private async ValueTask<bool> MoveNextSlowAsync(ValueTask pending)
         {
             await pending.ConfigureAwait(false);
-            if (_iterator._it.Valid) await _iterator._it.PrepareValueAsync(_ct).ConfigureAwait(false);
+            DbIter it = _iterator.Core.It;
+            if (it.Valid) await it.PrepareValueAsync(_ct).ConfigureAwait(false);
             return Capture();
         }
 
         private bool Capture()
         {
-            DbIter it = _iterator._it;
-            if (!it.Valid || (_end is ReadOnlyMemory<byte> e && _iterator.CompareKeys(it.Key, e.Span) >= 0))
+            IteratorCore core = _iterator.Core;
+            DbIter it = core.It;
+            if (!it.Valid || (_end is ReadOnlyMemory<byte> e && core.CompareKeys(it.Key, e.Span) >= 0))
             {
                 _done = true;
                 _current = default;
                 return false;
             }
-            ReadOnlySpan<byte> k = it.Key, v = _iterator.Value;
+            ReadOnlySpan<byte> k = it.Key, v = core.Value;
             int need = k.Length + v.Length;
             if (_buffer.Length < need)
             {
@@ -648,23 +460,34 @@ public sealed class Iterator : IDisposable
 
         public ValueTask DisposeAsync()
         {
+            if (!_active) return ValueTask.CompletedTask;
+            _active = false;
             _current = default;
             _done = true;
-            byte[] b = _buffer;
-            _buffer = [];
-            if (b.Length > 0) ArrayPool<byte>.Shared.Return(b);
             if (_ownsIterator) _iterator.Dispose();
             return ValueTask.CompletedTask;
         }
+
+        /// <summary>Returns the item buffer to the array pool (the iterator is disposed).</summary>
+        public void ReleaseBuffer()
+        {
+            _active = false;
+            _done = true;
+            _current = default;
+            byte[] b = _buffer;
+            _buffer = [];
+            if (b.Length > 0) ArrayPool<byte>.Shared.Return(b);
+        }
     }
 
+    /// <summary>Releases what the iterator pins; a DB iterator's internal stack goes back to the column family's pool.</summary>
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        _stats?.RecordTick(Ticker.NoIteratorDeleted);
-        _columnsScratch?.Dispose();
-        _it.Dispose();
+        IteratorCore? core = Interlocked.Exchange(ref _core, null);
+        if (core is null) return;
+        _it = null;
+        _scan?.ReleaseBuffer();
+        core.Release();
     }
 }
 

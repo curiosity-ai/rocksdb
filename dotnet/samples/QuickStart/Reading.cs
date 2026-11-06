@@ -41,6 +41,20 @@ internal static class Reading
         int n = 0;
         foreach (KeyValueRef _ in check.Range()) n++;
         Check(n == 5, "five keys");
+
+        // <snippet:iterator-reuse>
+        // One long-lived iterator for many short scans: SetBounds changes the range, Refresh moves it to the latest
+        // state (or Refresh(snapshot)). Both keep the iterator's internal stack and allocate nothing.
+        using Iterator scanner = db.NewIterator();
+        scanner.SetBounds("a"u8.ToArray(), "c"u8.ToArray());
+        for (scanner.SeekToFirst(); scanner.Valid; scanner.Next()) { /* a, b */ }
+        db.Put("bb"u8, "BB"u8);
+        scanner.Refresh();                                   // sees "bb" now; unpositioned until the next seek
+        for (scanner.SeekToFirst(); scanner.Valid; scanner.Next()) { /* a, b, bb */ }
+        // </snippet:iterator-reuse>
+        int m = 0;
+        for (scanner.SeekToFirst(); scanner.Valid; scanner.Next()) m++;
+        Check(m == 3, "refreshed bounded scan");
     }
 
     public static Task Snapshots(string path)

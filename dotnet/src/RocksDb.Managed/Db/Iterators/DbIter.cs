@@ -49,30 +49,31 @@ public sealed class DbIter : IDisposable
     private enum StepAction : byte { Done, Next, Seek, NextThenDone, SkipCovered }
     private enum ValueSource : byte { None, Iter, IterPacked, Pinned, Merged }
 
-    private readonly InternalIterator _iter;
+    // Not readonly: Reinitialize / SetSequence / SetBounds re-target a pooled iterator (see IteratorGraph).
+    private InternalIterator _iter;
     private readonly InternalKeyComparator _icmp;
-    private readonly ulong _sequence;
-    private readonly MergeOperator? _mergeOperator;
-    private readonly RangeDelAggregator? _rangeDel;
+    private ulong _sequence;
+    private MergeOperator? _mergeOperator;
+    private RangeDelAggregator? _rangeDel;
     private ulong _maxSkip;
-    private readonly SliceTransform? _prefixExtractor;
-    private readonly bool _prefixSameAsStart;
-    private readonly bool _expectTotalOrderInnerIter;
+    private SliceTransform? _prefixExtractor;
+    private bool _prefixSameAsStart;
+    private bool _expectTotalOrderInnerIter;
     private readonly PooledBufferWriter _prefix = new(16);
     private bool _hasPrefix;
-    private readonly ulong _maxSkippableInternalKeys;
-    private readonly bool _hasLower;
-    private readonly bool _hasUpper;
-    private readonly ReadOnlyMemory<byte> _lower;
-    private readonly ReadOnlyMemory<byte> _upper;
+    private ulong _maxSkippableInternalKeys;
+    private bool _hasLower;
+    private bool _hasUpper;
+    private ReadOnlyMemory<byte> _lower;
+    private ReadOnlyMemory<byte> _upper;
     private IDisposable? _cleanup;
 
     // User-defined timestamps (timestamp_size_, timestamp_ub_, timestamp_lb_, saved_timestamp_).
     private readonly int _tsSize;
     private readonly Comparator _ucmp;
-    private readonly byte[]? _tsUb;
-    private readonly byte[]? _tsLb;
-    private readonly byte[]? _savedTimestamp;
+    private byte[]? _tsUb;
+    private byte[]? _tsLb;
+    private byte[]? _savedTimestamp;
 
     private readonly IterKey _savedKey = new();
     private readonly PooledBufferWriter _seekKey = new(64);
@@ -80,7 +81,7 @@ public sealed class DbIter : IDisposable
     private PinnedSlice _pinnedSlice;                          // pinned_value_: a value in a pinned block / memtable
     private bool _pinnedIsSlice;                               // the Pinned value source is _pinnedSlice
     private readonly PinnedIteratorsManager _pinMgr = new();   // pinned_iters_mgr_
-    private readonly bool _pinThruLifetime;                    // pin_thru_lifetime_ (ReadOptions::pin_data)
+    private bool _pinThruLifetime;                             // pin_thru_lifetime_ (ReadOptions::pin_data)
     private readonly PooledBufferWriter _mergeResult = new(128);
     private PooledBufferWriter? _mergedEntity;      // entity produced by a merge on top of a wide-column entity
     private bool _valueIsEntity;                    // the current value is a wide-column entity (Value = its default column)
@@ -90,7 +91,7 @@ public sealed class DbIter : IDisposable
     private PooledBufferWriter? _blobKey;
     private Blob.BlobSource? _blobSource;
     private VersionStorageInfo? _blobVersion;
-    private readonly ReadOptions? _readOptions;
+    private ReadOptions? _readOptions;
     private readonly MergeOperandBuffer _operands = new();
     // FindValueForCurrentKey (reverse): merge operands referenced in the pinned blocks / memtable instead of copied
     // (merge_context_.PushOperand(iter_.value(), iter_.iter()->IsValuePinned())), oldest first. Used while every
@@ -143,18 +144,31 @@ public sealed class DbIter : IDisposable
         MergeOperator? mergeOperator, RangeDelAggregator? rangeDel, ulong maxSequentialSkipInIterations, IDisposable? cleanup,
         SliceTransform? prefixExtractor)
     {
-        _prefixExtractor = prefixExtractor;
-        _prefixSameAsStart = prefixExtractor is not null && readOptions?.PrefixSameAsStart == true;
-        _expectTotalOrderInnerIter = prefixExtractor is null || readOptions?.TotalOrderSeek == true || readOptions?.AutoPrefixMode == true;
         ArgumentNullException.ThrowIfNull(comparator);
         ArgumentNullException.ThrowIfNull(iter);
         _icmp = comparator;
+        _ucmp = comparator.UserComparator;
+        _tsSize = _ucmp.TimestampSize;
+        _iter = iter;
+        Configure(iter, sequence, readOptions, mergeOperator, rangeDel, maxSequentialSkipInIterations, cleanup, prefixExtractor);
+    }
+
+    /// <summary>Sets what the constructor arguments determine (constructor and <see cref="Reinitialize"/>).</summary>
+    private void Configure(InternalIterator iter, ulong sequence, ReadOptions? readOptions, MergeOperator? mergeOperator,
+        RangeDelAggregator? rangeDel, ulong maxSequentialSkipInIterations, IDisposable? cleanup, SliceTransform? prefixExtractor)
+    {
+        _prefixExtractor = prefixExtractor;
+        _prefixSameAsStart = prefixExtractor is not null && readOptions?.PrefixSameAsStart == true;
+        _expectTotalOrderInnerIter = prefixExtractor is null || readOptions?.TotalOrderSeek == true || readOptions?.AutoPrefixMode == true;
         _iter = iter;
         _sequence = sequence;
         _readOptions = readOptions;
         _mergeOperator = mergeOperator;
         _maxSkip = maxSequentialSkipInIterations;
         _cleanup = cleanup;
+        _hasLower = _hasUpper = false;
+        _lower = _upper = default;
+        _maxSkippableInternalKeys = 0;
         if (readOptions is not null)
         {
             if (readOptions.IterateLowerBound is ReadOnlyMemory<byte> lb)
@@ -173,24 +187,125 @@ public sealed class DbIter : IDisposable
         _rangeDel = rangeDel is null || rangeDel.IsEmpty ? null : rangeDel;
         // Covered-range skipping needs total order (a prefix-mode seek may stop at the prefix end) and plain seqno
         // visibility (no user-defined timestamps; read callbacks disable it in SetReadCallback).
-        _skipCovered = _rangeDel is not null && comparator.UserComparator.TimestampSize == 0 && _expectTotalOrderInnerIter;
-        if (_skipCovered) _skipTarget = new PooledBufferWriter(64);
+        _skipCovered = _rangeDel is not null && _tsSize == 0 && _expectTotalOrderInnerIter;
+        if (_skipCovered) _skipTarget ??= new PooledBufferWriter(64);
         // DBIter::SetIter: iter_.iter()->SetPinnedItersMgr(&pinned_iters_mgr_); with pin_data everything is pinned until
         // the iterator is destroyed.
         _iter.SetPinnedItersMgr(_pinMgr);
         _pinThruLifetime = readOptions?.PinData == true;
         if (_pinThruLifetime) _pinMgr.StartPinning();
-        _ucmp = comparator.UserComparator;
-        _tsSize = _ucmp.TimestampSize;
         if (_tsSize > 0)
         {
             // timestamp_ub_: the read timestamp (the maximum timestamp when none was given).
-            _tsUb = readOptions?.Timestamp is ReadOnlyMemory<byte> ub ? ub.ToArray() : _ucmp.MaxTimestamp.ToArray();
-            _tsLb = readOptions?.IterStartTs is ReadOnlyMemory<byte> lb ? lb.ToArray() : null;
+            _tsUb = CopyTimestamp(readOptions?.Timestamp is ReadOnlyMemory<byte> ub ? ub.Span : _ucmp.MaxTimestamp, _tsUb);
+            _tsLb = readOptions?.IterStartTs is ReadOnlyMemory<byte> lb ? CopyTimestamp(lb.Span, _tsLb) : null;
             if (_tsUb.Length != _tsSize || (_tsLb is not null && _tsLb.Length != _tsSize)) ThrowHelper.InvalidArgument("Timestamp size mismatch");
-            _savedTimestamp = new byte[_tsSize];
+            _savedTimestamp ??= new byte[_tsSize];
         }
     }
+
+    /// <summary><paramref name="ts"/> copied into <paramref name="reuse"/> when it has the same length, else into a new array.</summary>
+    private static byte[] CopyTimestamp(ReadOnlySpan<byte> ts, byte[]? reuse)
+    {
+        byte[] a = reuse is not null && reuse.Length == ts.Length ? reuse : new byte[ts.Length];
+        ts.CopyTo(a);
+        return a;
+    }
+
+    /// <summary>
+    /// Re-targets a <see cref="Detach"/>ed iterator at a new internal iterator stack and read state (same comparator),
+    /// keeping its buffers. Used by the pooled iterator graphs (<see cref="IteratorGraph"/>) and
+    /// <see cref="Iterator.Refresh()"/>, like ArenaWrappedDBIter::DoRefresh re-running DBIter's constructor in its arena.
+    /// The iterator is unpositioned afterwards.
+    /// </summary>
+    internal void Reinitialize(InternalIterator iter, ulong sequence, ReadOptions? readOptions, MergeOperator? mergeOperator,
+        RangeDelAggregator? rangeDel, ulong maxSequentialSkipInIterations, SliceTransform? prefixExtractor)
+    {
+        ArgumentNullException.ThrowIfNull(iter);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ResetPositionState();
+        _readCallback = null;
+        _blobSource = null;
+        _blobVersion = null;
+        Configure(iter, sequence, readOptions, mergeOperator, rangeDel, maxSequentialSkipInIterations, cleanup: null, prefixExtractor);
+    }
+
+    /// <summary>
+    /// Releases what the current position pins (temporarily pinned and pin_data blocks) and drops the references to the
+    /// internal iterator stack, read options, bounds and range tombstones, keeping the buffers for a later
+    /// <see cref="Reinitialize"/>. The owner parks or disposes the internal iterators first, so that blocks they hand
+    /// over while being parked are released here too. Does not run the cleanup object.
+    /// </summary>
+    internal void Detach()
+    {
+        ResetPositionState();
+        _iter = EmptyInternalIterator.Instance;
+        _readOptions = null;
+        _rangeDel = null;
+        _skipCovered = false;
+        _readCallback = null;
+        _blobSource = null;
+        _blobVersion = null;
+        _mergeOperator = null;
+        _prefixExtractor = null;
+        _hasLower = _hasUpper = false;
+        _lower = _upper = default;
+    }
+
+    /// <summary>Invalidates the iterator and clears the per-position state (before a refresh or a reuse).</summary>
+    private void ResetPositionState()
+    {
+        ResetSeekState();
+        if (_pinMgr.IsPinning) _pinMgr.ReleasePinnedData();
+        _forward = true;
+        _skipping = false;
+        _reseekDone = false;
+        _skipPending = false;
+        _numSkipped = 0;
+        _blobFetched = false;
+        ClearOperands();
+    }
+
+    /// <summary>
+    /// ArenaWrappedDBIter::Refresh on an unchanged super version (DBIter::set_sequence + set_valid(false)): reads at
+    /// <paramref name="sequence"/> from now on, with the range tombstones of <paramref name="rangeDel"/>.
+    /// </summary>
+    internal void SetSequence(ulong sequence, RangeDelAggregator? rangeDel)
+    {
+        ResetPositionState();
+        _sequence = sequence;
+        if (_readOptions?.IgnoreRangeDeletions == true) rangeDel = null;
+        _rangeDel = rangeDel is null || rangeDel.IsEmpty ? null : rangeDel;
+        _skipCovered = _rangeDel is not null && _tsSize == 0 && _expectTotalOrderInnerIter && _readCallback is null;
+        if (_skipCovered) _skipTarget ??= new PooledBufferWriter(64);
+        if (_pinThruLifetime) _pinMgr.StartPinning();
+    }
+
+    /// <summary>
+    /// Replaces the iterate bounds (iterate_lower_bound / iterate_upper_bound; null = none) and leaves the iterator
+    /// unpositioned. The memory must stay unchanged while the iterator uses it.
+    /// </summary>
+    internal void SetBounds(ReadOnlyMemory<byte>? lower, ReadOnlyMemory<byte>? upper)
+    {
+        ResetPositionState();
+        _hasLower = lower.HasValue;
+        _lower = lower.GetValueOrDefault();
+        _hasUpper = upper.HasValue;
+        _upper = upper.GetValueOrDefault();
+        if (_pinThruLifetime) _pinMgr.StartPinning();
+    }
+
+    /// <summary>The prefix extractor the iterator was configured with, or null.</summary>
+    internal SliceTransform? PrefixExtractor => _prefixExtractor;
+
+    /// <summary>The read options the iterator was configured with, or null.</summary>
+    internal ReadOptions? ReadOptions => _readOptions;
+
+    /// <summary>The inclusive lower bound in effect, or null.</summary>
+    internal ReadOnlyMemory<byte>? LowerBound => _hasLower ? _lower : null;
+
+    /// <summary>The exclusive upper bound in effect, or null.</summary>
+    internal ReadOnlyMemory<byte>? UpperBound => _hasUpper ? _upper : null;
 
     public bool Valid => _valid;
 
@@ -579,7 +694,7 @@ public sealed class DbIter : IDisposable
     private bool _skipCovered;
     private bool _skipPending;
     private ulong _skipSeq;
-    private readonly PooledBufferWriter? _skipTarget;
+    private PooledBufferWriter? _skipTarget;
 
     /// <summary>
     /// <see cref="IsCoveredByRangeTombstone"/> for a visible point entry about to be dropped as covered; also prepares

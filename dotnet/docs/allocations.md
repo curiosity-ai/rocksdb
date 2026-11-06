@@ -9,9 +9,6 @@ The numbers come from the allocation profiler in `tools/RocksDb.Managed.Allocati
 [Measuring allocations](#measuring-allocations)). "B/op" counts the bytes allocated by every thread per operation in
 steady state, including background flush and compaction work, with 16-byte keys and 100-byte values.
 
-> **Planned additions.** More allocation-free variants are being added: iterator refresh / reuse. This guide will be
-> updated when it ships. Until then, the patterns below are what to use.
-
 ## Summary
 
 | Area | Allocation-free (0 B/op) | Allocates | Instead |
@@ -20,7 +17,7 @@ steady state, including background flush and compaction work, with 16-byte keys 
 | Batched reads | `MultiGetBatch` reused with `Clear()`, `MultiGet` / `MultiGetAsync` / `MultiGetEntity`; `MultiGet(options, keys, values, valueRanges, statuses)` into caller memory and its async version | `byte[]?[] MultiGet(IReadOnlyList<byte[]>)` (the result arrays: 2.2 KB per 16 values of 100 B) | a reused `MultiGetBatch` or the caller-memory `MultiGet` |
 | Writes | `Put` / `Delete` / `SingleDelete` / `Merge` / `PutEntity` with spans, and their async versions (0.0-0.3 B/op on the calling thread) | none on the caller; background work adds 1-3 B/op, see [Writes](#writes) | |
 | Write batches | `db.CreateWriteBatch()` / `db.CreateWriteBatchWithIndex()` + `using`; one batch reused with `Clear()`; `WriteAsync` | `new WriteBatch()` that is never disposed (2.2 KB per batch); `new WriteBatchWithIndex()` per batch (1.1 KB) | `CreateWriteBatch` / `CreateWriteBatchWithIndex`, or `Clear()` |
-| Iterators | a reused `Iterator`: `Seek` / `SeekForPrev` / `Next` / `Prev` / `Key` / `Value` / `Columns`, async moves, `foreach` over `Range(...)` | `NewIterator` (2-4 KB per iterator), `ScanAsync` (128 B per scan) | keep one iterator per thread and `Seek` it |
+| Iterators | a reused `Iterator`: `Seek` / `SeekForPrev` / `Next` / `Prev` / `Key` / `Value` / `Columns`, async moves, `foreach` over `Range(...)`, `ScanAsync`, `Refresh`, `SetBounds` | `NewIterator` / `NewIteratorAsync` + `Dispose` (56 B: the iterator handle), a `new ReadOptions` per scan (184 B) | reuse one iterator with `SetBounds` / `Refresh`, or one `ReadOptions` |
 | Wide columns | `TryGetEntity(key, WideColumns)` and `TryGetEntityLazy(options, key, LazyWideColumns)` with a reused result, `MultiGetEntity`, `Iterator.Columns` | `GetEntity` (312 B), `GetEntityLazy` (1 KB) | `TryGetEntity` / `TryGetEntityLazy` with a reused result |
 | Transactions | `BeginTransaction(writeOptions, options, oldTransaction)` + `SetName` / `Put` / `TryGetForUpdate` / `TryGet` / `Prepare` / `Commit` (sync and async, pessimistic and optimistic) | `using BeginTransaction(writeOptions)` per transaction (the transaction object, 350-470 B) | reuse the transaction object |
 | Monitoring | `Statistics` and `PerfContext` enabled (no allocation on reads), `GetTickerCount`, `GetHistogramData`, `TryGetIntProperty` / `TryGetAggregatedIntProperty`, `ColumnFamilies`, `GetColumnFamily(name)`, `GetLatestSequenceNumber`, `VisitLiveFiles`, `GetApproximateSizes(ranges, Span<ulong>)` | `GetProperty` (the result string), `GetLiveFilesMetadata` (about 400 B per file), `GetApproximateSizes` returning an array | the non-allocating variants; see [Monitoring and metadata APIs](#monitoring-and-metadata-apis) |
@@ -162,35 +159,49 @@ Snapshots matter too: a flush or compaction keeps one tombstone per fragment for
 
 ## Iterators
 
-An iterator holds a consistent view and a stack of per-level and per-file iterators. Creating one allocates that
-structure: about 2 KB for `NewIterator`, plus about 1.2 KB for each table file it is first positioned in. Moving an
-existing iterator allocates nothing.
+Moving an iterator (`Seek`, `Next`, `Prev`, `Key`, `Value`, the async moves, `foreach` over `Range(...)`,
+`await foreach` over `ScanAsync(...)`) allocates nothing. Creating one is cheap too: a disposed iterator returns its
+internal iterator stack to a small pool of its column family, and the next `NewIterator` reuses it, so the per-request
+pattern only allocates the 56-byte `Iterator` object.
 
 ```csharp
-// Keep the iterator and position it again for every scan: Seek, Next, Prev, Key, Value are allocation-free.
-using Iterator it = db.NewIterator(readOptions);
-foreach (byte[] start in requests)
+// Per request: fine. Only the Iterator handle (56 B) is allocated once the pool is warm.
+using (Iterator it = db.NewIterator(readOptions))      // reuse readOptions too (184 B per new ReadOptions)
 {
     for (it.Seek(start); it.Valid && Within(it.Key); it.Next())
-        Use(it.Key, it.Value);                    // spans, valid until the iterator moves
+        Use(it.Key, it.Value);                          // spans, valid until the iterator moves
+}
+
+// Many short scans on one thread: keep one iterator, change its range and refresh its view. Nothing is allocated.
+using Iterator scanner = db.NewIterator();
+foreach ((byte[] lower, byte[] upper) in ranges)
+{
+    scanner.Refresh();                                  // see writes made since the last scan (optional)
+    scanner.SetBounds(lower, upper);                    // like IterateLowerBound / IterateUpperBound
+    for (scanner.SeekToFirst(); scanner.Valid; scanner.Next()) Use(scanner.Key, scanner.Value);
 }
 
 // foreach over a key range uses a ref struct enumerator: no allocation either.
 foreach ((ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) in it.Range(start, end)) Use(key, value);
 ```
 
-- A reused iterator sees the database as of its creation (or its snapshot). To see newer writes, create a new one, or
-  use a tailing iterator (`ReadOptions.Tailing = true`), which follows new writes without being recreated and stays
-  allocation-free per `Seek` (the writes themselves aside).
-- Bounds and prefix mode (`IterateUpperBound`, `PrefixSameAsStart`) are read when the iterator is created. For many short
-  bounded scans, one long-lived iterator with a manual end check (as above) avoids creating an iterator and a
-  `ReadOptions` per scan (together about 3.5 KB).
-- Async: `SeekAsync` / `NextAsync` / `PrevAsync` on a reused iterator allocate nothing, also when a block has to be
-  read. `ScanAsync(start, end)` (`await foreach`) allocates its enumerator (128 B) per scan; the items reuse one buffer
-  (copy a `KeyValue` if you keep it).
+- An iterator sees the database as of its creation (or its snapshot). `Refresh()` moves it to the latest state and
+  `Refresh(snapshot)` to a snapshot, reusing everything it holds; `RefreshAsync` opens new table files with async I/O.
+  Tailing iterators (`ReadOptions.Tailing = true`) follow new writes on their own; they, iterators of WritePrepared /
+  WriteUnprepared transaction databases, and `SstFileReader` iterators cannot be refreshed (`NotSupported`).
+- `SetBounds(lower, upper)` replaces the iterate bounds of an existing iterator without touching your `ReadOptions`;
+  the bounds stay in effect across `Refresh`. On a column family with a prefix extractor it copies the read options
+  once per call (184 B).
+- The pooled stack does not keep files or memtables alive: `Dispose` still releases everything the iterator pinned,
+  and using a disposed iterator throws `ObjectDisposedException`.
+- Async: `NewIteratorAsync`, `SeekAsync` / `NextAsync` / `PrevAsync` allocate nothing beyond the handle, also when a
+  block has to be read. `ScanAsync(start, end)` reuses one enumerator per iterator, and its items reuse one buffer
+  (copy a `KeyValue` if you keep it). Start the next `ScanAsync` of an iterator after the previous enumeration was
+  disposed (`await foreach` does that).
 - Wide-column entries: `it.Columns` reuses one `WideColumns` per iterator.
-- `WriteBatchWithIndex.NewIteratorWithBase` and `Transaction.NewIterator` wrap a new database iterator, so they cost
-  the same as `NewIterator`.
+- `WriteBatchWithIndex.NewIteratorWithBase(db.NewIterator())` allocates about 130 B per call and
+  `Transaction.NewIterator` about 150 B (the iterator objects; the merge buffers are reused).
+- A `Snapshot` per scan adds its handle (72 B).
 
 ## Wide columns
 

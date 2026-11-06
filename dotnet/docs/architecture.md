@@ -33,7 +33,8 @@ Paths on the left are relative to the repository root (C++). Paths on the right 
 | C++ | C# | Notes |
 |---|---|---|
 | `include/rocksdb/db.h`, `db/db_impl/db_impl*.cc` (public surface) | `RocksDatabase*.cs`, `ColumnFamily*.cs` | `RocksDatabase` is the DB, and the default column family's API; `ColumnFamily` is a handle with the same API. Partial files: replication and WAL, timestamps, entities, options, properties |
-| `include/rocksdb/iterator.h` | `Db/Iterators/Iterator.cs` | spans, `foreach` range enumerator, `ScanAsync` |
+| `include/rocksdb/iterator.h` | `Db/Iterators/Iterator.cs` | spans, `foreach` range enumerator, `ScanAsync`, `Refresh`, `SetBounds`; a handle over a pooled `IteratorCore` |
+| `db/arena_wrapped_db_iter.cc` | `Db/Iterators/IteratorCore.cs`, `Db/Iterators/IteratorGraph.cs` | the DBIter + internal iterator stack, rebuilt in place by `Refresh` and recycled through a per-column-family pool |
 | `DB::MultiGet` | `MultiGetBatch.cs` | reusable batch with per-key status |
 | `PinnableSlice` | `PooledValue.cs`, `ReadOnlySpanFunc` callbacks | see "Memory" below |
 | `include/rocksdb/status.h` | `Core/Status.cs` | `RocksDbException`, `StatusCode`, `StatusSubCode`, `ErrorSeverity` |
