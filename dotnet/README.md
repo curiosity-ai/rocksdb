@@ -771,6 +771,11 @@ using (Iterator it = db.NewIterator())                                          
 db.CompactRange();                                                               // expired entries are removed here
 ```
 
+Like native `DBWithTTL`, a column family's merge operator is wrapped in a `TtlMergeOperator` (operands are stored
+with their write time, the user operator sees them without it, merge results get the time of the merge), and every
+column family has its own TTL: open with `TtlDatabase.Open(path, options, columnFamilies, ttls)`, add one with
+`CreateColumnFamilyWithTtl`, change it with `SetTtl`. `TtlColumnFamily` carries Put / Merge / Delete / Get / iterators.
+
 ### Checkpoints, backups and restore
 
 <!-- snippet:checkpoint-backup -->
@@ -1312,6 +1317,8 @@ API and behavior differences:
   with `OperationCanceledException`, because upstream has no cancellation.
 - No optional or defaulted parameters except `CancellationToken`. Options are explicit overloads, and the column family
   is the receiver.
+- `MergeOperator.FullMergeV3` results are a plain value or wide columns; upstream's third form (returning one of the
+  existing operands by reference) is not offered, write its bytes instead.
 
 Performance: on the three-way db_bench-style benchmarks (warm, medians of 5 repetitions, the same librocksdb 11.12
 for the native legs), the managed engine's geometric mean per configuration is 0.67x-0.81x the time of the RocksDB C

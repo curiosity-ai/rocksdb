@@ -73,6 +73,9 @@ internal class PessimisticTransaction : Transaction
         _logNumber = 0;
         _readTimestamp = MaxTimestamp;
         _commitTimestamp = MaxTimestamp;
+        // TransactionBaseImpl::Reinitialize: start_time_ and indexing_enabled_.
+        _startTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+        EnableIndexing();
         _batch.Batch.TrackTimestampSize = options.WriteBatchTrackTimestampSize;
         if (options.SetSnapshot) SetSnapshot();
         if (_expirationTime > 0) _txnDb.InsertExpirableTransaction(_id, this);
@@ -102,7 +105,7 @@ internal class PessimisticTransaction : Transaction
     internal ulong LogNumber => _logNumber;
 
     /// <summary>Lock wait timeout for this transaction (SetLockTimeout); negative waits forever.</summary>
-    internal void SetLockTimeout(TimeSpan timeout) => _lockTimeout = ToMicros(timeout);
+    public override void SetLockTimeout(TimeSpan timeout) => _lockTimeout = ToMicros(timeout);
 
     private bool IsExpired => _expirationTime > 0 && PointLockManager.NowMicros() >= _expirationTime;
 
@@ -277,25 +280,30 @@ internal class PessimisticTransaction : Transaction
     /// PessimisticTransaction::TryLock: locks the key unless already locked by this transaction (or an upgrade from
     /// shared to exclusive is needed), then validates it against the snapshot and tracks it.
     /// </summary>
-    private protected override ValueTask<RocksDbException?> TryLock(ColumnFamilyData cfd, ReadOnlySpan<byte> key, bool readOnly, bool exclusive, bool doValidate,
+    private protected override ValueTask<RocksDbException?> TryLock(ColumnFamilyData cfd, ReadOnlySpan<byte> key, bool readOnly, bool exclusive, bool doValidate, bool assumeTracked,
         bool synchronous, CancellationToken cancellationToken)
     {
         if (_skipConcurrencyControl) return default;
-        if (RangeLocks is not null) return TryRangeModeLock(cfd, key, readOnly, exclusive, doValidate, synchronous, cancellationToken);
+        if (RangeLocks is not null)
+        {
+            // If the record is tracked, we can assume it was locked, too (previously_locked = assume_tracked).
+            if (assumeTracked) return new ValueTask<RocksDbException?>(AfterLock(null, cfd, key, readOnly, exclusive, doValidate, true, true, false, DbFormat.MaxSequenceNumber));
+            return TryRangeModeLock(cfd, key, readOnly, exclusive, doValidate, synchronous, cancellationToken);
+        }
         bool previouslyLocked = _tracked.TryGet(cfd.Id, key, out TrackedKeyInfo status);
         bool lockUpgrade = previouslyLocked && exclusive && !status.Exclusive;
         ulong trackedAtSeq = previouslyLocked ? status.Seq : DbFormat.MaxSequenceNumber;
         // Lock this key if this transactions hasn't already locked it or we require an upgrade.
         if (previouslyLocked && !lockUpgrade)
         {
-            return new ValueTask<RocksDbException?>(AfterLock(null, cfd, key, readOnly, exclusive, doValidate, previouslyLocked, lockUpgrade, trackedAtSeq));
+            return new ValueTask<RocksDbException?>(AfterLock(null, cfd, key, readOnly, exclusive, doValidate, assumeTracked, previouslyLocked, lockUpgrade, trackedAtSeq));
         }
         ValueTask<RocksDbException?> t = _txnDb.LockManager.TryLock(this, cfd.Id, key, exclusive, synchronous, cancellationToken);
         if (t.IsCompletedSuccessfully)
         {
-            return new ValueTask<RocksDbException?>(AfterLock(t.Result, cfd, key, readOnly, exclusive, doValidate, previouslyLocked, lockUpgrade, trackedAtSeq));
+            return new ValueTask<RocksDbException?>(AfterLock(t.Result, cfd, key, readOnly, exclusive, doValidate, assumeTracked, previouslyLocked, lockUpgrade, trackedAtSeq));
         }
-        return AfterLockAsync(t, cfd, key.ToArray(), readOnly, exclusive, doValidate, previouslyLocked, lockUpgrade, trackedAtSeq);
+        return AfterLockAsync(t, cfd, key.ToArray(), readOnly, exclusive, doValidate, assumeTracked, previouslyLocked, lockUpgrade, trackedAtSeq);
     }
 
     /// <summary>
@@ -310,9 +318,9 @@ internal class PessimisticTransaction : Transaction
         ValueTask<RocksDbException?> t = _txnDb.LockManager.TryLock(this, cfd.Id, key, exclusive, synchronous, cancellationToken);
         if (t.IsCompletedSuccessfully)
         {
-            return new ValueTask<RocksDbException?>(AfterLock(t.Result, cfd, key, readOnly, exclusive, doValidate, false, false, trackedAtSeq));
+            return new ValueTask<RocksDbException?>(AfterLock(t.Result, cfd, key, readOnly, exclusive, doValidate, false, false, false, trackedAtSeq));
         }
-        return AfterLockAsync(t, cfd, key.ToArray(), readOnly, exclusive, doValidate, false, false, trackedAtSeq);
+        return AfterLockAsync(t, cfd, key.ToArray(), readOnly, exclusive, doValidate, false, false, false, trackedAtSeq);
     }
 
     /// <summary>
@@ -345,18 +353,28 @@ internal class PessimisticTransaction : Transaction
     }
 
     private async ValueTask<RocksDbException?> AfterLockAsync(ValueTask<RocksDbException?> t, ColumnFamilyData cfd, byte[] key, bool readOnly, bool exclusive,
-        bool doValidate, bool previouslyLocked, bool lockUpgrade, ulong trackedAtSeq)
+        bool doValidate, bool assumeTracked, bool previouslyLocked, bool lockUpgrade, ulong trackedAtSeq)
     {
         RocksDbException? s = await t.ConfigureAwait(false);
-        return AfterLock(s, cfd, key, readOnly, exclusive, doValidate, previouslyLocked, lockUpgrade, trackedAtSeq);
+        return AfterLock(s, cfd, key, readOnly, exclusive, doValidate, assumeTracked, previouslyLocked, lockUpgrade, trackedAtSeq);
     }
 
     private RocksDbException? AfterLock(RocksDbException? s, ColumnFamilyData cfd, ReadOnlySpan<byte> key, bool readOnly, bool exclusive, bool doValidate,
-        bool previouslyLocked, bool lockUpgrade, ulong trackedAtSeq)
+        bool assumeTracked, bool previouslyLocked, bool lockUpgrade, ulong trackedAtSeq)
     {
         SetSnapshotIfNeeded();
         if (!doValidate || (Snapshot is null && (cfd.TimestampSize == 0 || _readTimestamp == MaxTimestamp)))
         {
+            if (assumeTracked && !previouslyLocked && RangeLocks is null)
+            {
+                if (s is null && !lockUpgrade)
+                {
+                    // Deviation: upstream keeps the lock it just took without tracking it (it is never released); the
+                    // port releases it so that a misuse cannot block other transactions on the key forever.
+                    _txnDb.LockManager.UnLock(this, cfd.Id, key);
+                }
+                return new RocksDbException(StatusCode.InvalidArgument, "Invalid argument: assume_tracked is set but it is not tracked yet");
+            }
             // Need to remember the earliest sequence number that we know that this key has not been modified after.
             // Since we haven't checked a snapshot, we only know this key has not been modified since after we locked it.
             if (trackedAtSeq == DbFormat.MaxSequenceNumber) trackedAtSeq = _db.Versions.LastSequence;
@@ -380,7 +398,9 @@ internal class PessimisticTransaction : Transaction
                 }
             }
         }
-        if (s is null)
+        // Recall that if assume_tracked is true, we assume that TrackKey has been called previously since the last
+        // savepoint, with the same exclusive setting, and at a lower sequence number, so skipping here should be safe.
+        if (s is null && !assumeTracked)
         {
             // We must track all the locked keys so that we can unlock them later.
             TrackKey(cfd, key, trackedAtSeq, readOnly, exclusive);

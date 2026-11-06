@@ -95,6 +95,21 @@ internal sealed class IndexedWriteBatch : IDisposable
         _wbwi.MultiGetEntityFromBatchAndDBCore(cf, mergeOperator, timestampSize, options, batch, ref reader);
     }
 
+    /// <summary>MultiGetFromBatchAndDB with the DB read through <paramref name="reader"/>.</summary>
+    public void MultiGet<TReader>(uint cf, MergeOperator? mergeOperator, int timestampSize, ReadOptions? options, MultiGetBatch batch, ref TReader reader)
+        where TReader : struct, WriteBatchWithIndex.IMultiValueDbReader
+    {
+        Register(cf);
+        _wbwi.MultiGetFromBatchAndDBCore(cf, mergeOperator, timestampSize, options, batch, ref reader);
+    }
+
+    /// <summary>indexing_enabled_ (Transaction::DisableIndexing / EnableIndexing).</summary>
+    public bool IndexingEnabled
+    {
+        get => !_wbwi.IndexingDisabled;
+        set => _wbwi.IndexingDisabled = !value;
+    }
+
     public void Delete(uint cf, ReadOnlySpan<byte> key)
     {
         Register(cf);

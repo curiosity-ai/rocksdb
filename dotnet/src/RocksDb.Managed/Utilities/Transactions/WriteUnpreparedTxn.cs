@@ -547,6 +547,45 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         }
     }
 
+    /// <summary>
+    /// WriteUnpreparedTxn::MultiGet's DB part: every key read with one read callback (one snapshot) that sees this
+    /// transaction's unprepared batches.
+    /// </summary>
+    private protected override void MultiGetFromDb(ReadOptions? options, ColumnFamilyData cfd, MultiGetBatch keys)
+    {
+        WriteUnpreparedTxnReadCallback cb = NewReadCallback(options, out SnapshotBackup backed, out ulong snapSeq);
+        var results = new (bool Found, byte[]? Value, RocksDbException? Error)[keys.Count];
+        Util.PooledBufferWriter value = Util.ObjectPools.RentWriter();
+        try
+        {
+            for (int i = 0; i < keys.Count; i++)
+            {
+                try
+                {
+                    value.Clear();
+                    bool found = _db.GetWithCallback(cfd, options, keys.GetKey(i), cb, value);
+                    results[i] = (found, found ? value.WrittenSpan.ToArray() : null, null);
+                }
+                catch (RocksDbException e)
+                {
+                    results[i] = (false, null, e);
+                }
+            }
+        }
+        finally
+        {
+            Util.ObjectPools.ReturnWriter(value);
+        }
+        if (!cb.Valid || !_wpDb.ValidateSnapshot(snapSeq, backed)) throw _wpDb.TryAgain();
+        keys.EntityRun = false;
+        keys.BeginExternalRun(cfd.UserComparator);
+        for (int i = 0; i < results.Length; i++)
+        {
+            if (results[i].Error is { } e) keys.SetError(i, e);
+            else keys.SetExternalResult(i, results[i].Found, results[i].Value);
+        }
+    }
+
     /// <summary>WriteUnpreparedTxnDB::NewIterator: reads at a snapshot plus this transaction's unprepared batches.</summary>
     private protected override Iterator NewDbIterator(ColumnFamily handle, ColumnFamilyData cfd, ReadOptions? options)
     {

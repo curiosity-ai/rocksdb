@@ -463,4 +463,61 @@ public sealed class WriteBatchWithIndexTests
             CollectionAssert.AreEqual(expected, after, ctx);
         }
     }
+
+    /// <summary>
+    /// Batch merges on top of a DB value that is an unresolved merge chain spanning two table files and the memtable
+    /// (GetFromBatchAndDB, MultiGetFromBatchAndDB, GetEntityFromBatchAndDB and the base-delta iterator), also read at a
+    /// snapshot taken in the middle of the chain.
+    /// </summary>
+    [TestMethod]
+    public void BatchMergesOverDbMergeChainAcrossMemtableAndFiles()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { MergeOperator = MergeOperator.StringAppend(",") });
+        db.Put(B("k"), B("base"));
+        db.Merge(B("k"), B("f1"));
+        db.Flush();
+        db.Merge(B("k"), B("f2"));
+        db.Merge(B("n"), B("n1"));
+        db.Flush();
+        using Snapshot snap = db.GetSnapshot();
+        db.Merge(B("k"), B("m1"));
+        db.Merge(B("n"), B("n2"));
+        using var batch = new WriteBatchWithIndex(Comparator.Bytewise, 0, true, 0);
+        batch.Merge(B("k"), B("b1"));
+        batch.Merge(B("k"), B("b2"));
+        batch.Merge(B("n"), B("b"));
+        foreach ((ReadOptions? ro, string k, string n) in new (ReadOptions?, string, string)[]
+                 {
+                     (null, "base,f1,f2,m1,b1,b2", "n1,n2,b"),
+                     (new ReadOptions { Snapshot = snap }, "base,f1,f2,b1,b2", "n1,b"),
+                 })
+        {
+            string ctx = ro is null ? "latest" : "snapshot";
+            Assert.AreEqual(k, S(batch.GetFromBatchAndDB(db, ro, null, B("k"))), ctx);
+            Assert.AreEqual(n, S(batch.GetFromBatchAndDB(db, ro, null, B("n"))), ctx);
+            using (var mg = new MultiGetBatch())
+            {
+                mg.Add(B("n")).Add(B("k")).Add(B("absent"));
+                batch.MultiGetFromBatchAndDB(db, ro, null, mg);
+                Assert.AreEqual(n, S(mg.GetValue(0).ToArray()), ctx);
+                Assert.AreEqual(k, S(mg.GetValue(1).ToArray()), ctx);
+                Assert.AreEqual(MultiGetStatus.NotFound, mg.GetStatus(2), ctx);
+            }
+            WideColumns? e = batch.GetEntityFromBatchAndDB(db, ro, null, B("k"));
+            Assert.IsNotNull(e, ctx);
+            Assert.AreEqual(k, S(e.DefaultColumnValue.ToArray()), ctx);
+            using BaseDeltaIterator it = batch.NewIteratorWithBase(db.DefaultColumnFamily, db.NewIterator(ro), ro);
+            var seen = new List<string>();
+            for (it.SeekToFirst(); it.Valid; it.Next()) seen.Add(S(it.Key.ToArray()) + "=" + S(it.Value.ToArray()));
+            CollectionAssert.AreEqual(new[] { "k=" + k, "n=" + n }, seen, ctx);
+            seen.Clear();
+            for (it.SeekToLast(); it.Valid; it.Prev()) seen.Add(S(it.Key.ToArray()) + "=" + S(it.Value.ToArray()));
+            CollectionAssert.AreEqual(new[] { "n=" + n, "k=" + k }, seen, ctx);
+        }
+        db.Write(batch.WriteBatch);
+        db.CompactRange();
+        Assert.AreEqual("base,f1,f2,m1,b1,b2", S(db.Get(B("k"))));
+        Assert.AreEqual("n1,n2,b", S(db.Get(B("n"))));
+    }
 }

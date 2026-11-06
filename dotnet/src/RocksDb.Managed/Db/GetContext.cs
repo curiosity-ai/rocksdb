@@ -389,8 +389,8 @@ internal sealed class GetContext
         PooledBufferWriter output = ObjectPools.RentWriter();
         try
         {
-            ReadOnlySpan<byte> baseValue = !hasBase ? default : ValueIsEntity ? Wide.WideColumnSerialization.GetValueOfDefaultColumn(Value.WrittenSpan) : Value.WrittenSpan;
-            MergeHelper.TimedFullMerge(MergeOperator, userKey, hasBase, baseValue, MergeContext, output);
+            // TimedFullMerge with kNoBaseValue / kPlainBaseValue / kWideBaseValue and a value-only result.
+            MergeHelper.TimedFullMerge(MergeOperator, userKey, BaseKind(hasBase), hasBase ? Value.WrittenSpan : default, MergeContext, output, null);
             Value.Clear();
             Value.Write(output.WrittenSpan);
         }
@@ -411,6 +411,9 @@ internal sealed class GetContext
     /// are applied to the default column (MergeHelper::TimedFullMergeWithEntity) and the other columns are kept.
     /// Returns false if the key does not exist.
     /// </summary>
+    private MergeExistingValueKind BaseKind(bool hasBase) =>
+        !hasBase ? MergeExistingValueKind.None : ValueIsEntity ? MergeExistingValueKind.WideColumns : MergeExistingValueKind.Plain;
+
     public bool TryResolveEntity(ReadOnlySpan<byte> userKey, IBufferWriter<byte> entity)
     {
         switch (State)
@@ -432,10 +435,13 @@ internal sealed class GetContext
         PooledBufferWriter output = ObjectPools.RentWriter();
         try
         {
-            ReadOnlySpan<byte> baseValue = !hasBase ? default : ValueIsEntity ? Wide.WideColumnSerialization.GetValueOfDefaultColumn(Value.WrittenSpan) : Value.WrittenSpan;
-            MergeHelper.TimedFullMerge(MergeOperator, userKey, hasBase, baseValue, MergeContext, output);
-            if (hasBase && ValueIsEntity) Wide.WideColumnSerialization.ReplaceDefaultColumn(Value.WrittenSpan, output.WrittenSpan, entity);
-            else Wide.WideColumnSerialization.SerializeDefaultColumn(output.WrittenSpan, entity);
+            // A wide-column result goes straight to `entity`; a plain one becomes an entity with only the default column
+            // (PinnableWideColumns::SetPlainValue).
+            if (MergeHelper.TimedFullMerge(MergeOperator, userKey, BaseKind(hasBase), hasBase ? Value.WrittenSpan : default, MergeContext, output, entity)
+                == EntryType.Value)
+            {
+                Wide.WideColumnSerialization.SerializeDefaultColumn(output.WrittenSpan, entity);
+            }
         }
         finally
         {

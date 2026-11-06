@@ -754,22 +754,37 @@ public sealed class DbIter : IDisposable
     private void MergeWithNoBaseValue()
     {
         _valid = false;
-        _mergeResult.Clear();
-        MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, false, default, CurrentOperands(), _mergeResult);
-        _valueSource = ValueSource.Merged;
-        _valueIsEntity = false;
-        _valueIsBlob = false;
-        _valid = true;
+        MergeIntoResult(MergeExistingValueKind.None, default);
     }
 
     private void MergeWithPlainBaseValue(ReadOnlySpan<byte> value)
     {
         _valid = false;
+        MergeIntoResult(MergeExistingValueKind.Plain, value);
+    }
+
+    /// <summary>
+    /// DBIter::Merge: TimedFullMerge with a value-or-entity result. A plain result is the iterator's value; a
+    /// wide-column result (FullMergeV3) is the iterator's entity, its value being the default column.
+    /// </summary>
+    private void MergeIntoResult(MergeExistingValueKind baseKind, ReadOnlySpan<byte> baseValue)
+    {
         _mergeResult.Clear();
-        MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, true, value, CurrentOperands(), _mergeResult);
+        _mergedEntity ??= new PooledBufferWriter(128);
+        _mergedEntity.Clear();
+        EntryType type = MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, baseKind, baseValue, CurrentOperands(), _mergeResult, _mergedEntity);
         _valueSource = ValueSource.Merged;
-        _valueIsEntity = false;
         _valueIsBlob = false;
+        if (type == EntryType.WideColumnEntity)
+        {
+            _mergeResult.Write(Wide.WideColumnSerialization.GetValueOfDefaultColumn(_mergedEntity.WrittenSpan));
+            _valueIsEntity = true;
+            _entityResolved = false;
+        }
+        else
+        {
+            _valueIsEntity = false;
+        }
         _valid = true;
     }
 
@@ -782,17 +797,7 @@ public sealed class DbIter : IDisposable
         _valid = false;
         // MergeWithWideColumnBaseValue -> ResolveEntityForMerge: blob-backed columns are resolved first.
         entity = ResolveEntity(entity);
-        _mergeResult.Clear();
-        MergeHelper.TimedFullMerge(_mergeOperator!, _savedKey.UserKey, true, Wide.WideColumnSerialization.GetValueOfDefaultColumn(entity),
-            CurrentOperands(), _mergeResult);
-        _mergedEntity ??= new PooledBufferWriter(128);
-        _mergedEntity.Clear();
-        Wide.WideColumnSerialization.ReplaceDefaultColumn(entity, _mergeResult.WrittenSpan, _mergedEntity);
-        _valueSource = ValueSource.Merged;
-        _valueIsEntity = true;
-        _valueIsBlob = false;
-        _entityResolved = false;
-        _valid = true;
+        MergeIntoResult(MergeExistingValueKind.WideColumns, entity);
     }
 
     // ==================================================================== forward (FindNextUserEntry)

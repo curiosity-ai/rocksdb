@@ -52,5 +52,26 @@ internal sealed class EntityColumnList : IDisposable
 
     public bool IsBlobIndex(int i) => _columns[i].Blob;
 
+    /// <summary>
+    /// Sorts the columns by name (WideColumnsHelper::SortColumns), for columns added in any order (merge results of
+    /// MergeOperator.FullMergeV3). Insertion sort: column counts are small, and nothing is allocated.
+    /// </summary>
+    public void SortByName()
+    {
+        ReadOnlySpan<byte> data = _data.WrittenSpan;
+        for (int i = 1; i < _columns.Count; i++)
+        {
+            var c = _columns[i];
+            ReadOnlySpan<byte> name = data.Slice(c.NameOffset, c.NameLength);
+            int j = i - 1;
+            while (j >= 0 && data.Slice(_columns[j].NameOffset, _columns[j].NameLength).SequenceCompareTo(name) > 0)
+            {
+                _columns[j + 1] = _columns[j];
+                j--;
+            }
+            _columns[j + 1] = c;
+        }
+    }
+
     public void Dispose() => _data.Dispose();
 }

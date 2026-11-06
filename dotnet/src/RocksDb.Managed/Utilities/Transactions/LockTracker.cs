@@ -98,6 +98,20 @@ internal sealed class LockTracker
 
     public int ColumnFamilyCount => (_first is null ? 0 : 1) + (_more?.Count ?? 0);
 
+    /// <summary>GetNumPointLocks: the number of tracked keys over all column families.</summary>
+    public long NumPointLocks
+    {
+        get
+        {
+            long n = _first?.Keys.Count ?? 0;
+            if (_more is not null)
+            {
+                foreach (TrackedColumnFamily c in _more) n += c.Keys.Count;
+            }
+            return n;
+        }
+    }
+
     public TrackedColumnFamily GetColumnFamily(int i) => i == 0 ? _first! : _more![i - 1];
 
     public TrackedColumnFamily? Find(uint cf)

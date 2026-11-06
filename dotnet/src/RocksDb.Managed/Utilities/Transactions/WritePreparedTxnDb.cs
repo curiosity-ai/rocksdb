@@ -421,7 +421,10 @@ internal sealed class WritePreparedTxnDb : SeqPerBatchHooks
                 ulong prevMax = (ulong)Volatile.Read(ref _maxEvictedSeq);
                 if (prevMax < evicted.CommitSeq)
                 {
-                    ulong last = _db.Versions.LastSequence; // could be 0
+                    // GetLastPublishedSequence (not LastSequence): with two write queues the memtable writes of the main
+                    // queue run ahead of what the commit callbacks have published, and max_evicted_seq must stay below
+                    // what readers can see.
+                    ulong last = _db.LastPublishedSequence; // could be 0
                     ulong maxEvictedSeq;
                     if (evicted.CommitSeq < last)
                     {

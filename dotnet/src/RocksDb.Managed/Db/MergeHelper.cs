@@ -234,7 +234,136 @@ public sealed class MergeHelper : IDisposable
     public static void TimedFullMerge(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, bool hasBaseValue, ReadOnlySpan<byte> baseValue,
         in MergeOperands operands, IBufferWriter<byte> result)
     {
-        if (!mergeOperator.FullMerge(userKey, hasBaseValue, baseValue, operands, result)) ThrowMergeFailed();
+        if (mergeOperator.IsPlainFullMergeV2)
+        {
+            // Neither FullMergeV3 nor the failure-scope overload is overridden: the default FullMergeV3 is this call.
+            if (!mergeOperator.FullMerge(userKey, hasBaseValue, baseValue, operands, result)) ThrowMergeFailed();
+            return;
+        }
+        TimedFullMergeSlow(mergeOperator, userKey, hasBaseValue, baseValue, operands, result);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void TimedFullMergeSlow(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, bool hasBaseValue, ReadOnlySpan<byte> baseValue,
+        in MergeOperands operands, IBufferWriter<byte> result)
+    {
+        if (!TryFullMerge(mergeOperator, userKey, hasBaseValue ? MergeExistingValueKind.Plain : MergeExistingValueKind.None, baseValue, operands,
+                result, null, out _, out _))
+        {
+            ThrowMergeFailed();
+        }
+    }
+
+    /// <summary>
+    /// MergeHelper::TimedFullMerge with an entity-capable result (the overload with result_type /
+    /// PinnableWideColumns): the base value is absent, plain or a serialized entity (<paramref name="baseKind"/>); a
+    /// plain result is written to <paramref name="value"/> (returns <see cref="EntryType.Value"/>), a wide-column result
+    /// to <paramref name="entity"/> serialized with sorted columns (returns <see cref="EntryType.WideColumnEntity"/>).
+    /// Throws Corruption (MergeOperatorFailed) if the operator fails.
+    /// </summary>
+    internal static EntryType TimedFullMerge(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, MergeExistingValueKind baseKind, ReadOnlySpan<byte> baseValue,
+        in MergeOperands operands, IBufferWriter<byte> value, IBufferWriter<byte>? entity)
+    {
+        if (!TryFullMerge(mergeOperator, userKey, baseKind, baseValue, operands, value, entity, out EntryType type, out _)) ThrowMergeFailed();
+        return type;
+    }
+
+    /// <summary>
+    /// <see cref="TimedFullMerge(MergeOperator, ReadOnlySpan{byte}, MergeExistingValueKind, ReadOnlySpan{byte}, in MergeOperands, IBufferWriter{byte}, IBufferWriter{byte})"/>
+    /// over the operands of a point lookup (newest first).
+    /// </summary>
+    internal static EntryType TimedFullMerge(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, MergeExistingValueKind baseKind, ReadOnlySpan<byte> baseValue,
+        MergeContext context, IBufferWriter<byte> value, IBufferWriter<byte>? entity)
+    {
+        MergeOperandBuffer buf = t_contextScratch ??= new MergeOperandBuffer();
+        buf.Clear();
+        for (int i = 0; i < context.Count; i++) buf.PushOlder(context.GetOperandNewestFirst(i));
+        try
+        {
+            return TimedFullMerge(mergeOperator, userKey, baseKind, baseValue, buf.AsOperands(), value, entity);
+        }
+        finally
+        {
+            buf.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Port of MergeHelper::TimedFullMergeCommonImpl + the TimedFullMergeImpl result visitors: runs
+    /// <see cref="MergeOperator.FullMergeV3"/>. With <paramref name="entity"/> null only a value is wanted: a
+    /// wide-column result yields the value of its default column (empty without one). Returns false on failure, with the
+    /// failure scope (kDefault reported as kTryMerge, per merge_operator.h).
+    /// </summary>
+    internal static bool TryFullMerge(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, MergeExistingValueKind baseKind, ReadOnlySpan<byte> baseValue,
+        in MergeOperands operands, IBufferWriter<byte> value, IBufferWriter<byte>? entity, out EntryType resultType, out MergeOperationFailureScope failureScope)
+    {
+        if (!mergeOperator.OverridesFullMergeV3 && baseKind != MergeExistingValueKind.WideColumns)
+        {
+            // The default FullMergeV3 with no or a plain base value is FullMergeV2: call it directly (hot path).
+            resultType = EntryType.Value;
+            bool hasBase = baseKind == MergeExistingValueKind.Plain;
+            if (!mergeOperator.OverridesScopedFullMerge)
+            {
+                failureScope = MergeOperationFailureScope.Default;
+                if (mergeOperator.FullMerge(userKey, hasBase, baseValue, operands, value)) return true;
+                failureScope = MergeOperationFailureScope.TryMerge;
+                return false;
+            }
+            if (mergeOperator.FullMerge(userKey, hasBase, baseValue, operands, value, out failureScope)) return true;
+            if (failureScope == MergeOperationFailureScope.Default) failureScope = MergeOperationFailureScope.TryMerge;
+            return false;
+        }
+        return TryFullMergeV3(mergeOperator, userKey, baseKind, baseValue, operands, value, entity, out resultType, out failureScope);
+    }
+
+    private static bool TryFullMergeV3(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, MergeExistingValueKind baseKind, ReadOnlySpan<byte> baseValue,
+        in MergeOperands operands, IBufferWriter<byte> value, IBufferWriter<byte>? entity, out EntryType resultType, out MergeOperationFailureScope failureScope)
+    {
+        var input = new MergeOperationInputV3(userKey, baseKind, baseValue, operands);
+        var output = new MergeOperationOutputV3(value, entity);
+        resultType = EntryType.Value;
+        if (!mergeOperator.FullMergeV3(in input, ref output))
+        {
+            // Apply default per merge_operator.h
+            failureScope = output.FailureScope == MergeOperationFailureScope.Default ? MergeOperationFailureScope.TryMerge : output.FailureScope;
+            return false;
+        }
+        failureScope = MergeOperationFailureScope.Default;
+        switch (output.Kind)
+        {
+            case MergeResultKind.SerializedEntity:
+                resultType = EntryType.WideColumnEntity;
+                break;
+            case MergeResultKind.Columns:
+                StoreColumnsResult(output.Columns!, value, entity, out resultType);
+                break;
+        }
+        return true;
+    }
+
+    /// <summary>The NewColumns visitor: sorts the columns and serializes them (or keeps only the default column's value).</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void StoreColumnsResult(Wide.EntityColumnList columns, IBufferWriter<byte> value, IBufferWriter<byte>? entity, out EntryType resultType)
+    {
+        try
+        {
+            columns.SortByName();
+            if (entity is null)
+            {
+                // result_value: the value of the default column, if the first column is the default one.
+                if (columns.Count > 0 && columns.GetName(0).IsEmpty) value.Write(columns.GetValue(0));
+                resultType = EntryType.Value;
+            }
+            else
+            {
+                Wide.WideColumnSerialization.Serialize(columns, entity);
+                resultType = EntryType.WideColumnEntity;
+            }
+        }
+        finally
+        {
+            columns.Dispose();
+        }
     }
 
     /// <summary>
@@ -291,13 +420,38 @@ public sealed class MergeHelper : IDisposable
     public ReadOnlySpan<byte> CompactionFilterSkipUntil => _skipUntil.Key;
 
     /// <summary>
-    /// TimedFullMergeWithEntity into <c>_mergeResult</c>; blob-backed columns of the base entity are resolved first
+    /// MergeUntil's TimedFullMerge (entity-capable, with op_failure_scope) into <c>_mergeResult</c>. Returns the result
+    /// type (kTypeValue / kTypeWideColumnEntity), or null when the operator failed with kMustMerge; throws Corruption
+    /// (MergeOperatorFailed) for any other failure.
+    /// </summary>
+    private EntryType? TryMergeForOutput(ReadOnlySpan<byte> userKey, MergeExistingValueKind baseKind, ReadOnlySpan<byte> baseValue)
+    {
+        _mergeResult.Clear();
+        PooledBufferWriter entity = _mergeEntity ??= new PooledBufferWriter(64);
+        entity.Clear();
+        if (!TryFullMerge(_mergeOperator, userKey, baseKind, baseValue, _operands.AsOperands(), _mergeResult, entity, out EntryType type,
+                out MergeOperationFailureScope scope))
+        {
+            if (scope == MergeOperationFailureScope.MustMerge) return null;
+            ThrowMergeFailed();
+        }
+        if (type == EntryType.WideColumnEntity)
+        {
+            _mergeResult.Clear();
+            _mergeResult.Write(entity.WrittenSpan);
+        }
+        return type;
+    }
+
+    private PooledBufferWriter? _mergeEntity;
+
+    /// <summary>
+    /// TimedFullMerge with a kWideBaseValue; blob-backed columns of the base entity are resolved first
     /// (WideColumnSerialization::ResolveEntityForMerge).
     /// </summary>
-    private void MergeWithEntityBase(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> entity)
+    private EntryType? MergeWithEntityBase(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> entity)
     {
         PooledBufferWriter? resolvedEntity = null;
-        PooledBufferWriter merged = ObjectPools.RentWriter();
         try
         {
             if (Wide.WideColumnSerialization.HasBlobColumns(entity))
@@ -307,14 +461,10 @@ public sealed class MergeHelper : IDisposable
                 BlobProcessor!.ResolveEntity(userKey, entity, resolvedEntity);
                 entity = resolvedEntity.WrittenSpan;
             }
-            TimedFullMerge(_mergeOperator, userKey, true, Wide.WideColumnSerialization.GetValueOfDefaultColumn(entity), _operands.AsOperands(), _mergeResult);
-            Wide.WideColumnSerialization.ReplaceDefaultColumn(entity, _mergeResult.WrittenSpan, merged);
-            _mergeResult.Clear();
-            _mergeResult.Write(merged.WrittenSpan);
+            return TryMergeForOutput(userKey, MergeExistingValueKind.WideColumns, entity);
         }
         finally
         {
-            ObjectPools.ReturnWriter(merged);
             if (resolvedEntity is not null) ObjectPools.ReturnWriter(resolvedEntity);
         }
     }
@@ -386,29 +536,25 @@ public sealed class MergeHelper : IDisposable
                 // If there are no operands, the caller writes out the put/delete we are at.
                 if (_keys.Count == 0) return MergeUntilResult.Ok;
 
-                _mergeResult.Clear();
+                EntryType? resultType;
                 if (rangeDel is not null && rangeDel.ShouldDelete(userKey, ikey.Sequence))
                 {
-                    TimedFullMerge(_mergeOperator, userKey, false, default, _operands.AsOperands(), _mergeResult);
+                    resultType = TryMergeForOutput(userKey, MergeExistingValueKind.None, default);
                 }
                 else if (ikey.Type == EntryType.Value)
                 {
-                    TimedFullMerge(_mergeOperator, userKey, true, iter.Value, _operands.AsOperands(), _mergeResult);
+                    resultType = TryMergeForOutput(userKey, MergeExistingValueKind.Plain, iter.Value);
                 }
                 else if (ikey.Type == EntryType.ValuePreferredSeqno)
                 {
-                    // TimedPut merged with operands: the result is a plain kTypeValue.
+                    // TimedPut merged with operands: its write time is obsolete, the result is a kTypeValue (or an entity).
                     ReadOnlySpan<byte> v = iter.Value;
-                    TimedFullMerge(_mergeOperator, userKey, true, v[..^sizeof(ulong)], _operands.AsOperands(), _mergeResult);
+                    resultType = TryMergeForOutput(userKey, MergeExistingValueKind.Plain, v[..^sizeof(ulong)]);
                 }
                 else if (ikey.Type == EntryType.WideColumnEntity)
                 {
-                    // TimedFullMergeWithEntity: the operands apply to the default column; the result is the entity with
-                    // that column replaced (kTypeWideColumnEntity).
-                    MergeWithEntityBase(userKey, iter.Value);
-                    StoreSingleResult(EntryType.WideColumnEntity);
-                    iter.Next();
-                    return MergeUntilResult.Ok;
+                    // kWideBaseValue: by default the operands apply to the default column and the other columns are kept.
+                    resultType = MergeWithEntityBase(userKey, iter.Value);
                 }
                 else if (ikey.Type is EntryType.BlobIndex)
                 {
@@ -418,7 +564,7 @@ public sealed class MergeHelper : IDisposable
                     try
                     {
                         BlobProcessor!.FetchBlob(userKey, iter.Value, blob);
-                        TimedFullMerge(_mergeOperator, userKey, true, blob.WrittenSpan, _operands.AsOperands(), _mergeResult);
+                        resultType = TryMergeForOutput(userKey, MergeExistingValueKind.Plain, blob.WrittenSpan);
                     }
                     finally
                     {
@@ -427,9 +573,15 @@ public sealed class MergeHelper : IDisposable
                 }
                 else
                 {
-                    TimedFullMerge(_mergeOperator, userKey, false, default, _operands.AsOperands(), _mergeResult);
+                    resultType = TryMergeForOutput(userKey, MergeExistingValueKind.None, default);
                 }
-                StoreSingleResult();
+                if (resultType is not { } rt)
+                {
+                    // kMustMerge failure: MergeInProgress denotes that the output consists of merge operands only. Leave
+                    // iter at the non-merge entry so it will be output after (merge_helper.cc).
+                    return MergeUntilResult.MergeInProgress;
+                }
+                StoreSingleResult(rt);
                 // move iter to the next entry
                 iter.Next();
                 return MergeUntilResult.Ok;
@@ -469,9 +621,12 @@ public sealed class MergeHelper : IDisposable
         if (surelySeenTheBeginning)
         {
             // do a final merge with no existing value and say bye to the merge type (it's now converted to a Put)
-            _mergeResult.Clear();
-            TimedFullMerge(_mergeOperator, _origKey.UserKey, false, default, _operands.AsOperands(), _mergeResult);
-            StoreSingleResult();
+            if (TryMergeForOutput(_origKey.UserKey, MergeExistingValueKind.None, default) is not { } rt)
+            {
+                // kMustMerge failure: the output consists of the input merge operands only.
+                return MergeUntilResult.MergeInProgress;
+            }
+            StoreSingleResult(rt);
             return MergeUntilResult.Ok;
         }
 
@@ -490,9 +645,7 @@ public sealed class MergeHelper : IDisposable
         return MergeUntilResult.MergeInProgress;
     }
 
-    /// <summary>keys_ = { newest key with type kTypeValue }, operands = { merge result }.</summary>
-    private void StoreSingleResult() => StoreSingleResult(EntryType.Value);
-
+    /// <summary>keys_ = { newest key with the merge result's type }, operands = { merge result }.</summary>
     private void StoreSingleResult(EntryType resultType)
     {
         _origKey.SetInternalKey(_keys.GetNewestFirst(0));
@@ -535,6 +688,7 @@ public sealed class MergeHelper : IDisposable
         _keys.Dispose();
         _operands.Dispose();
         _mergeResult.Dispose();
+        _mergeEntity?.Dispose();
         _filterValue.Dispose();
         _skipUntilUser.Dispose();
         _origKey.Dispose();

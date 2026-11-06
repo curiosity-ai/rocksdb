@@ -41,8 +41,9 @@ public abstract partial class Transaction
     {
         ThrowIfDisposed();
         BeforeWrite();
-        ThrowIfError(WaitSync(TryLock(cfd, key, readOnly: false, exclusive: true, doValidate: !untracked, synchronous: true, CancellationToken.None)));
+        ThrowIfError(WaitSync(TryLock(cfd, key, readOnly: false, exclusive: true, doValidate: !untracked, assumeTracked: false, synchronous: true, CancellationToken.None)));
         _batch.PutEntity(cfd.Id, key, columns);
+        _numPutEntities++;
         AfterWrite();
     }
 
@@ -50,11 +51,12 @@ public abstract partial class Transaction
     {
         ThrowIfDisposed();
         BeforeWrite();
-        ValueTask<RocksDbException?> t = TryLock(cfd, key.Span, readOnly: false, exclusive: true, doValidate: true, synchronous: false, cancellationToken);
+        ValueTask<RocksDbException?> t = TryLock(cfd, key.Span, readOnly: false, exclusive: true, doValidate: true, assumeTracked: false, synchronous: false, cancellationToken);
         if (t.IsCompletedSuccessfully)
         {
             ThrowIfError(t.Result);
             _batch.PutEntity(cfd.Id, key.Span, columns.Span);
+            _numPutEntities++;
             AfterWrite();
             return default;
         }
@@ -65,6 +67,7 @@ public abstract partial class Transaction
     {
         ThrowIfError(await t.ConfigureAwait(false));
         _batch.PutEntity(cfd.Id, key.Span, columns.Span);
+        _numPutEntities++;
         AfterWrite();
     }
 
@@ -120,7 +123,7 @@ public abstract partial class Transaction
         CheckEntityDoValidate(options, doValidate);
         ColumnFamilyData cfd = Cfd(columnFamily);
         options = PrepareGetForUpdateOptions(options, cfd, doValidate);
-        ThrowIfError(WaitSync(TryLock(cfd, key, readOnly: true, exclusive, doValidate, synchronous: true, CancellationToken.None)));
+        ThrowIfError(WaitSync(TryLock(cfd, key, readOnly: true, exclusive, doValidate, assumeTracked: false, synchronous: true, CancellationToken.None)));
         return GetEntityFromBatchAndDb(options, cfd, key, columns);
     }
 
@@ -135,7 +138,7 @@ public abstract partial class Transaction
         ArgumentNullException.ThrowIfNull(columns);
         ColumnFamilyData cfd = Cfd(columnFamily);
         options = PrepareGetForUpdateOptions(options, cfd, doValidate: true);
-        ThrowIfError(await TryLock(cfd, key.Span, readOnly: true, exclusive, doValidate: true, synchronous: false, cancellationToken).ConfigureAwait(false));
+        ThrowIfError(await TryLock(cfd, key.Span, readOnly: true, exclusive, doValidate: true, assumeTracked: false, synchronous: false, cancellationToken).ConfigureAwait(false));
         return await GetEntityFromBatchAndDbAsync(options, cfd, key, columns, cancellationToken).ConfigureAwait(false);
     }
 
