@@ -26,19 +26,60 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
     /// </summary>
     public IndexBlockSearchType IndexBlockSearchType { get; set; } = IndexBlockSearchType.Binary;
     public DataBlockIndexType DataBlockIndexType { get; set; } = DataBlockIndexType.BinarySearch;
+    private CustomizableOption<UserDefinedIndexFactory> _udiFactory;
+    private BlockBasedIndexMode _indexMode = BlockBasedIndexMode.StandardDefault; // index_mode as set / parsed
+
     /// <summary>
     /// user_defined_index_factory (EXPERIMENTAL): a custom index built in addition to (or instead of) the standard index,
-    /// see <see cref="IndexMode"/>. Like upstream's factory pointer it is not persisted in the OPTIONS file (reattach it
-    /// before opening a database whose files require it).
+    /// see <see cref="IndexMode"/>. Persisted by name like upstream's Customizable (<c>user_defined_index_factory=trie_index</c>,
+    /// <c>nullptr</c> when unset): the built-in <see cref="TrieIndexFactory"/> ("trie_index") is recreated when an
+    /// OPTIONS file is read; other names are kept as <see cref="UnresolvedUserDefinedIndexFactoryName"/> and written back
+    /// verbatim (attach the matching factory before opening a database whose files require it).
     /// </summary>
-    public UserDefinedIndexFactory? UserDefinedIndexFactory { get; set; }
+    public UserDefinedIndexFactory? UserDefinedIndexFactory
+    {
+        get => _udiFactory.Value;
+        set => _udiFactory.Set(value);
+    }
+
+    /// <summary>The user_defined_index_factory name read from an OPTIONS file that is not a built-in factory (null otherwise).</summary>
+    public string? UnresolvedUserDefinedIndexFactoryName => _udiFactory.UnresolvedText;
+
     /// <summary>
     /// index_mode (EXPERIMENTAL): how <see cref="UserDefinedIndexFactory"/>'s index interacts with the standard index
-    /// (default <see cref="BlockBasedIndexMode.StandardDefault"/>). The OPTIONS-file entries (index_mode, the legacy
-    /// use_udi_as_primary_index / fail_if_no_udi_on_open / skip_standard_index booleans) are preserved verbatim but not
-    /// interpreted; set this property explicitly.
+    /// (default <see cref="BlockBasedIndexMode.StandardDefault"/>). Reading returns the effective mode
+    /// (BlockBasedTableOptions::GetEffectiveIndexMode): the index_mode option unless it is StandardDefault, else
+    /// CustomDefault when <see cref="UseUdiAsPrimaryIndex"/>, else StandardRequired when <see cref="FailIfNoUdiOnOpen"/>.
+    /// Setting it sets index_mode and the two legacy booleans to match (so that native releases which route only by the
+    /// booleans, such as 11.12, read the same policy from the OPTIONS file).
     /// </summary>
-    public BlockBasedIndexMode IndexMode { get; set; } = BlockBasedIndexMode.StandardDefault;
+    public BlockBasedIndexMode IndexMode
+    {
+        get => _indexMode != BlockBasedIndexMode.StandardDefault ? _indexMode
+            : UseUdiAsPrimaryIndex ? BlockBasedIndexMode.CustomDefault
+            : FailIfNoUdiOnOpen ? BlockBasedIndexMode.StandardRequired
+            : BlockBasedIndexMode.StandardDefault;
+        set
+        {
+            _indexMode = value;
+            UseUdiAsPrimaryIndex = value == BlockBasedIndexMode.CustomDefault;
+            FailIfNoUdiOnOpen = value == BlockBasedIndexMode.StandardRequired;
+        }
+    }
+
+    /// <summary>
+    /// use_udi_as_primary_index (EXPERIMENTAL, deprecated compatibility input; prefer <see cref="IndexMode"/>): with
+    /// index_mode StandardDefault, routes reads through the custom index (<see cref="BlockBasedIndexMode.CustomDefault"/>).
+    /// Persisted as written; native 11.12 routes by this flag only.
+    /// </summary>
+    public bool UseUdiAsPrimaryIndex { get; set; }
+
+    /// <summary>
+    /// fail_if_no_udi_on_open (EXPERIMENTAL, deprecated compatibility input; prefer <see cref="IndexMode"/>): with
+    /// index_mode StandardDefault and <see cref="UseUdiAsPrimaryIndex"/> false, opening a file without the custom index
+    /// fails (<see cref="BlockBasedIndexMode.StandardRequired"/>).
+    /// </summary>
+    public bool FailIfNoUdiOnOpen { get; set; }
     public double DataBlockHashTableUtilRatio { get; set; } = 0.75;
     private CustomizableOption<FilterPolicy> _filterPolicy;
 
@@ -158,7 +199,22 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
         .UInt64("max_auto_readahead_size", static o => o.MaxAutoReadaheadSize, static (o, v) => o.MaxAutoReadaheadSize = v)
         .UInt64("initial_auto_readahead_size", static o => o.InitialAutoReadaheadSize, static (o, v) => o.InitialAutoReadaheadSize = v)
         .UInt64("num_file_reads_for_auto_readahead", static o => o.NumFileReadsForAutoReadahead, static (o, v) => o.NumFileReadsForAutoReadahead = v)
-        .EnumId("flush_block_policy_factory", OptionEnumMaps.FlushBlockPolicy, static o => o.FlushBlockPolicy, static (o, v) => o.FlushBlockPolicy = v);
+        .EnumId("flush_block_policy_factory", OptionEnumMaps.FlushBlockPolicy, static o => o.FlushBlockPolicy, static (o, v) => o.FlushBlockPolicy = v)
+        // The user-defined index entries native writes (block_based_table_type_info, table/block_based/
+        // block_based_table_factory.cc): the factory by name and the raw index_mode / legacy booleans (11.12 serializes
+        // the fields as set; the effective policy is resolved by IndexMode).
+        .Add("user_defined_index_factory", static o => o._udiFactory.Serialize(static f => f.Name) ?? "nullptr",
+            static (o, v) => o._udiFactory.Parse(v, CreateUserDefinedIndexFactory, static f => f.Name))
+        .Enum("index_mode", OptionEnumMaps.IndexMode, static o => o._indexMode, static (o, v) => o._indexMode = v)
+        .Bool("use_udi_as_primary_index", static o => o.UseUdiAsPrimaryIndex, static (o, v) => o.UseUdiAsPrimaryIndex = v)
+        .Bool("fail_if_no_udi_on_open", static o => o.FailIfNoUdiOnOpen, static (o, v) => o.FailIfNoUdiOnOpen = v);
+
+    /// <summary>
+    /// Resolves a user_defined_index_factory id (IndexFactory::CreateFromString with the built-in registry): "trie_index"
+    /// (also as <c>{id=trie_index}</c>) is <see cref="TrieIndexFactory.Instance"/>; other ids are unknown (null).
+    /// </summary>
+    internal static UserDefinedIndexFactory? CreateUserDefinedIndexFactory(string id) =>
+        OptionStrings.UnwrapId(id) == TrieIndexFactory.ClassName ? TrieIndexFactory.Instance : null;
 
     /// <summary>The persisted id of a filter policy object: the built-in policies' Id (FilterPolicy::GetId), else its name.</summary>
     private static string FilterPolicyId(FilterPolicy p) => p is BloomLikeFilterPolicy b ? b.Id : p.Name;
@@ -171,8 +227,7 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
         c.CopyFrom(this);
         c.BlockCache = BlockCache;
         c.PersistentCache = PersistentCache;
-        c.UserDefinedIndexFactory = UserDefinedIndexFactory;
-        c.IndexMode = IndexMode;
+        c._udiFactory = _udiFactory;
         c._filterPolicy = _filterPolicy;
         return c;
     }
