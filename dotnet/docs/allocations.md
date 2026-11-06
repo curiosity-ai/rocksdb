@@ -21,7 +21,7 @@ steady state, including background flush and compaction work, with 16-byte keys 
 | Batched reads | `MultiGetBatch` reused with `Clear()`, `MultiGet` / `MultiGetAsync` / `MultiGetEntity` | `byte[]?[] MultiGet(IReadOnlyList<byte[]>)` (20 KB per 16 keys) | a reused `MultiGetBatch` |
 | Writes | `Put` / `Delete` / `SingleDelete` / `Merge` / `PutEntity` with spans, and their async versions (0.0-0.3 B/op on the calling thread) | none on the caller; background work adds 1-3 B/op, see [Writes](#writes) | |
 | Write batches | `db.CreateWriteBatch()` / `db.CreateWriteBatchWithIndex()` + `using`; one batch reused with `Clear()`; `WriteAsync` | `new WriteBatch()` that is never disposed (2.2 KB per batch); `new WriteBatchWithIndex()` per batch (1.1 KB) | `CreateWriteBatch` / `CreateWriteBatchWithIndex`, or `Clear()` |
-| Iterators | a reused `Iterator`: `Seek` / `SeekForPrev` / `Next` / `Prev` / `Key` / `Value` / `Columns`, async moves, `foreach` over `Range(...)`, `ScanAsync`, `Refresh`, `SetBounds` | `NewIterator` / `NewIteratorAsync` + `Dispose` (40 B: the iterator handle), a `new ReadOptions` per scan (184 B) | reuse one iterator with `SetBounds` / `Refresh`, or one `ReadOptions` |
+| Iterators | a reused `Iterator`: `Seek` / `SeekForPrev` / `Next` / `Prev` / `Key` / `Value` / `Columns`, async moves, `foreach` over `Range(...)`, `ScanAsync`, `Refresh`, `SetBounds` | `NewIterator` / `NewIteratorAsync` + `Dispose` (56 B: the iterator handle), a `new ReadOptions` per scan (184 B) | reuse one iterator with `SetBounds` / `Refresh`, or one `ReadOptions` |
 | Wide columns | `TryGetEntity(key, WideColumns)` with a reused result, `MultiGetEntity`, `Iterator.Columns` | `GetEntity` (312 B), `GetEntityLazy` (1 KB), `TryGetEntityLazy` (40 B) | `TryGetEntity`; reuse a `LazyWideColumns` |
 | Transactions | `BeginTransaction(writeOptions, options, oldTransaction)` + `SetName` / `Put` / `TryGetForUpdate` / `TryGet` / `Prepare` / `Commit` (sync and async, pessimistic and optimistic) | `using BeginTransaction(writeOptions)` per transaction (the transaction object, 350-470 B) | reuse the transaction object |
 | Monitoring | `Statistics` and `PerfContext` enabled (no allocation on reads), `GetColumnFamily(name)`, `GetLatestSequenceNumber` | `GetProperty` / `TryGetIntProperty` (40 B), `ColumnFamilies` (160 B), `GetLiveFilesMetadata`, `GetApproximateSizes`, `GetHistogramData` (896 B) | call them from monitoring code, not per request |
@@ -146,10 +146,10 @@ Snapshots matter too: a flush or compaction keeps one tombstone per fragment for
 Moving an iterator (`Seek`, `Next`, `Prev`, `Key`, `Value`, the async moves, `foreach` over `Range(...)`,
 `await foreach` over `ScanAsync(...)`) allocates nothing. Creating one is cheap too: a disposed iterator returns its
 internal iterator stack to a small pool of its column family, and the next `NewIterator` reuses it, so the per-request
-pattern only allocates the 40-byte `Iterator` object.
+pattern only allocates the 56-byte `Iterator` object.
 
 ```csharp
-// Per request: fine. Only the Iterator handle (40 B) is allocated once the pool is warm.
+// Per request: fine. Only the Iterator handle (56 B) is allocated once the pool is warm.
 using (Iterator it = db.NewIterator(readOptions))      // reuse readOptions too (184 B per new ReadOptions)
 {
     for (it.Seek(start); it.Valid && Within(it.Key); it.Next())
@@ -183,8 +183,8 @@ foreach ((ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) in it.Range(start, e
   (copy a `KeyValue` if you keep it). Start the next `ScanAsync` of an iterator after the previous enumeration was
   disposed (`await foreach` does that).
 - Wide-column entries: `it.Columns` reuses one `WideColumns` per iterator.
-- `WriteBatchWithIndex.NewIteratorWithBase(db.NewIterator())` allocates about 110 B per call and
-  `Transaction.NewIterator` about 140 B (the iterator objects; the merge buffers are reused).
+- `WriteBatchWithIndex.NewIteratorWithBase(db.NewIterator())` allocates about 130 B per call and
+  `Transaction.NewIterator` about 150 B (the iterator objects; the merge buffers are reused).
 - A `Snapshot` per scan adds its handle (72 B).
 
 ## Wide columns
