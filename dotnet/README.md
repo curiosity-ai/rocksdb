@@ -1087,7 +1087,10 @@ attach any `SecondaryCache` (e.g. `CompressedSecondaryCache`). A `WriteBufferMan
 number of DBs and column families, can stall writes at the limit and charge memtables to a block cache;
 `DbOptions.DbWriteBufferSize` is the per-DB shortcut. `SimCache` reports the hit rate of a hypothetical capacity, and
 `BlockBasedTableOptions.PersistentCache` (`VolatileCacheTier`, file-based `PersistentCache.Create`) is the legacy
-persistent block cache.
+persistent block cache. `CacheDump` writes the blocks a block cache holds for given DBs to a dump file (the upstream
+cache dump format) and loads a dump into a secondary cache, e.g. to warm the cache of a DB moved to another host before
+it is reopened; as upstream, the secondary cache must accept uncompressed `InsertSaved` (`CompressedSecondaryCache`
+ignores it).
 
 <!-- snippet:cache-tiers -->
 ```csharp

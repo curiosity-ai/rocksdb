@@ -21,13 +21,13 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (284 files, about 83,000 lines):
+Summary (285 files, about 83,000 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
-| line-by-line (feature audits) | 106 |
+| line-by-line (feature audits) | 107 |
 | line-by-line (#3) | 17 |
 | line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
@@ -80,26 +80,27 @@ changes there need their own review.
 | `RocksDb.Managed.Replication/Switchover/ReplicationRoleState.cs` | 227 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
 | `RocksDb.Managed.Replication/Switchover/SwitchoverNode.cs` | 542 | rocksdb-sharp Replication/Switchover/Cluster (no C++ counterpart) | managed-only, design-reviewed (#3) |
 | `AttributeGroups.cs` | 286 | include/rocksdb/attribute_groups.h, db/db_impl/db_impl.cc, db/db_impl/db_impl_write.cc | line-by-line (feature audit: user features (wide-column APIs)) |
-| `Cache/BlockCache.cs` | 521 | include/rocksdb/advanced_cache.h | line-by-line (#1); secondary-cache members: feature audit (cache layers) |
+| `Cache/BlockCache.cs` | 552 | include/rocksdb/advanced_cache.h | line-by-line (#1); secondary-cache members: feature audit (cache layers); cache dump/load pass: ApplyToAllEntries (ShardedCache::ApplyToAllEntries) |
+| `Cache/CacheDumpLoad.cs` | 606 | include/rocksdb/utilities/cache_dump_load.h, utilities/cache_dump_load.cc, utilities/cache_dump_load_impl.{h,cc} | line-by-line (feature audit: cache layers, cache dump/load pass) |
 | `Cache/CacheItemHelper.cs` | 133 | include/rocksdb/advanced_cache.h (CacheItemHelper) | line-by-line (feature audit: cache layers) |
 | `Cache/CacheReservationManager.cs` | 172 | cache/cache_reservation_manager.{h,cc} | line-by-line (feature audit: cache layers) |
-| `Cache/CacheSupport.cs` | 103 | include/rocksdb/advanced_cache.h (EvictionCallback, CreateStandalone, AsyncLookupHandle) | line-by-line (feature audit: cache layers) |
+| `Cache/CacheSupport.cs` | 109 | include/rocksdb/advanced_cache.h (EvictionCallback, CreateStandalone, AsyncLookupHandle) | line-by-line (feature audit: cache layers) |
 | `Cache/CacheTypes.cs` | 154 | include/rocksdb/cache.h, cache/cache_entry_roles.cc, include/rocksdb/advanced_options.h (CacheTier) | line-by-line (feature audit: cache layers) |
-| `Cache/CacheWithSecondaryAdapter.cs` | 543 | cache/secondary_cache_adapter.{h,cc}, include/rocksdb/cache.h (TieredCacheOptions) | line-by-line (feature audit: cache layers) |
+| `Cache/CacheWithSecondaryAdapter.cs` | 588 | cache/secondary_cache_adapter.{h,cc}, include/rocksdb/cache.h (TieredCacheOptions) | line-by-line (feature audit: cache layers); cache dump/load pass: WaitAll without per-batch allocations, AdmitsCompressedBlocks |
 | `Cache/CompressedSecondaryCache.cs` | 368 | cache/compressed_secondary_cache.{h,cc} | line-by-line (feature audit: cache layers) |
-| `Cache/PersistentCache/BlockCacheTier.cs` | 751 | utilities/persistent_cache/block_cache_tier*.{h,cc} | line-by-line (feature audit: cache layers) |
-| `Cache/PersistentCache/PersistentCache.cs` | 58 | include/rocksdb/persistent_cache.h | line-by-line (feature audit: cache layers) |
-| `Cache/PersistentCache/PersistentCacheTier.cs` | 301 | utilities/persistent_cache/persistent_cache_tier.{h,cc}, volatile_tier_impl.{h,cc} | line-by-line (feature audit: cache layers) |
+| `Cache/PersistentCache/BlockCacheTier.cs` | 926 | utilities/persistent_cache/block_cache_tier*.{h,cc} | line-by-line (feature audit: cache layers); cache dump/load pass: WaitUntilUsable, LookupAsync (managed addition) |
+| `Cache/PersistentCache/PersistentCache.cs` | 75 | include/rocksdb/persistent_cache.h | line-by-line (feature audit: cache layers) |
+| `Cache/PersistentCache/PersistentCacheTier.cs` | 304 | utilities/persistent_cache/persistent_cache_tier.{h,cc}, volatile_tier_impl.{h,cc} | line-by-line (feature audit: cache layers) |
 | `Cache/SecondaryCache.cs` | 153 | include/rocksdb/secondary_cache.h | line-by-line (feature audit: cache layers) |
-| `Cache/SimCache.cs` | 288 | utilities/simulator_cache/sim_cache.cc, include/rocksdb/utilities/sim_cache.h | line-by-line (feature audit: cache layers) |
+| `Cache/SimCache.cs` | 294 | utilities/simulator_cache/sim_cache.cc, include/rocksdb/utilities/sim_cache.h | line-by-line (feature audit: cache layers) |
 | `Cache/TieredSecondaryCache.cs` | 153 | cache/tiered_secondary_cache.{h,cc} | line-by-line (feature audit: cache layers) |
 | `Db/DbImpl.WriteBufferManager.cs` | 248 | db/db_impl/db_impl_write.cc (PreprocessWrite, HandleWriteBufferManagerFlush, WriteBufferManagerStallWrites), db_impl_compaction_flush.cc (CollectFlushableCFs) | line-by-line (feature audit: cache layers) |
 | `Memory/AllocTracker.cs` | 43 | memory/allocator.h, memtable/alloc_tracker.cc | line-by-line (feature audit: cache layers) |
 | `Memtable/WriteBufferManager.cs` | 364 | include/rocksdb/write_buffer_manager.h, memtable/write_buffer_manager.cc | line-by-line (feature audit: cache layers) |
-| `Table/BlockBasedTableReader.CacheTiers.cs` | 241 | table/block_based/block_cache.h, block_based_table_reader.cc (RetrieveBlock with helper), table/persistent_cache_helper.cc | line-by-line (feature audit: cache layers) |
+| `Table/BlockBasedTableReader.CacheTiers.cs` | 321 | table/block_based/block_cache.h, block_based_table_reader.cc (RetrieveBlock with helper), table/persistent_cache_helper.cc | line-by-line (feature audit: cache layers); cache dump/load pass: async persistent cache reads (managed addition) |
 | `Cache/CacheKey.cs` | 231 | cache/cache_key.h, cache/cache_key.{h,cc}, table/unique_id.cc | line-by-line (#1) |
-| `Cache/HyperClockCache.cs` | 796 | include/rocksdb/cache.h, cache/clock_cache.{h,cc} | line-by-line (#3): FixedHyperClockTable / BaseClockTable (meta word, probing, eviction, strict/non-strict charging, standalone); compaction-features pass: eviction_effort_cap, CalcHashBits overshoot clamp, table metadata charged up front |
-| `Cache/LruCache.cs` | 748 | include/rocksdb/cache.h, cache/lru_cache.{h,cc}, cache/sharded_cache.{h,cc} | line-by-line (#3): LRUCacheShard / LRUHandleTable (insert, release, pools, eviction); metadata charge = CalcuMetaCharge with glibc malloc_usable_size (88) |
+| `Cache/HyperClockCache.cs` | 1094 | include/rocksdb/cache.h, cache/clock_cache.{h,cc} | line-by-line (#3): FixedHyperClockTable / BaseClockTable (meta word, probing, eviction, strict/non-strict charging, standalone); compaction-features pass: eviction_effort_cap, CalcHashBits overshoot clamp, table metadata charged up front; cache dump/load pass: ClockCacheShard::ApplyToSomeEntries / ConstApplyToEntriesRange |
+| `Cache/LruCache.cs` | 833 | include/rocksdb/cache.h, cache/lru_cache.{h,cc}, cache/sharded_cache.{h,cc} | line-by-line (#3): LRUCacheShard / LRUHandleTable (insert, release, pools, eviction); metadata charge = CalcuMetaCharge with glibc malloc_usable_size (88); cache dump/load pass: LRUCacheShard::ApplyToSomeEntries / LRUHandleTable::ApplyToEntriesRange |
 | `ColumnFamily.Entities.cs` | 146 | include/rocksdb/db.h | line-by-line (feature audit: user features (wide columns)) |
 | `ColumnFamily.Options.cs` | 87 | include/rocksdb/db.h (SetOptions) | API wrapper, design-reviewed (#3): delegates to audited DbImpl |
 | `ColumnFamily.Properties.cs` | 145 | include/rocksdb/db.h (GetProperty, GetApproximateSizes, ...) | API wrapper, design-reviewed (#3): delegates to audited DbImpl |
@@ -254,12 +255,12 @@ changes there need their own review.
 | `Table/Block.cs` | 170 | table/block_based/block.{h,cc}, table/block_based/data_block_footer.cc | line-by-line (#1) |
 | `Table/BlockBasedTableBuilder.cs` | 784 | table/block_based/block_based_table_builder.cc | line-by-line (#1); compaction-features pass: EstimatedTailSize |
 | `Table/BlockBasedTableIterator.cs` | 420 | table/block_based/partitioned_index_iterator.cc, table/block_based/block_based_table_iterator.cc | line-by-line (#1) |
-| `Table/BlockBasedTableReader.MultiGet.cs` | 138 | table/block_based/block_based_table_reader_sync_and_async.h | line-by-line (#1) |
-| `Table/BlockBasedTableReader.cs` | 1393 | table/block_based/block_based_table_reader.{h,cc}, meta_blocks.cc | line-by-line (#1) |
+| `Table/BlockBasedTableReader.MultiGet.cs` | 316 | table/block_based/block_based_table_reader_sync_and_async.h | line-by-line (#1); cache dump/load pass: batched data block lookups (StartAsyncLookupFull + WaitAll of BlockBasedTable::MultiGet) |
+| `Table/BlockBasedTableReader.cs` | 2032 | table/block_based/block_based_table_reader.{h,cc}, meta_blocks.cc | line-by-line (#1); cache dump/load pass: PutDataBlockToCache compressed_value, index/filter prefetch through the cache (RetrieveBlock) |
 | `Table/BlockBuilder.cs` | 363 | table/block_based/block_builder.{h,cc} | line-by-line (#1) |
 | `Table/BlockCacheStatistics.cs` | 100 | table/block_based/block_based_table_reader.cc (UpdateCacheHit/MissMetrics) | line-by-line (#1) |
 | `Table/BlockChecksum.cs` | 108 | table/format.cc, table/format.h, table/block_based/reader_common.cc | line-by-line (#1) |
-| `Table/BlockFetcher.cs` | 320 | table/block_based/block_cache.h, table/block_fetcher.cc, table/format.cc | line-by-line (#1) |
+| `Table/BlockFetcher.cs` | 471 | table/block_based/block_cache.h, table/block_fetcher.cc, table/format.cc | line-by-line (#1); cache dump/load pass: GetCompressedBlock (ReadBlockKeepingCompressed) |
 | `Table/BlockHandle.cs` | 146 | table/format.h, table/format.cc | line-by-line (#1) |
 | `Table/BlockIter.cs` | 895 | table/block_based/block.{h,cc}, block_util.h | line-by-line (#1) |
 | `Table/ChecksumType.cs` | 11 | include/rocksdb/table.h | line-by-line (#1) |

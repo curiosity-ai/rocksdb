@@ -59,27 +59,10 @@ public sealed partial class BlockBasedTableReader
         {
             if (_cache is { ExtendedLookup: true } extended)
             {
+                // Kept out of this method so that the state machine of the common path does not grow.
                 lookups = MultiGetCacheLookups.Rent(candidates);
-                for (int i = 0; i < count; i++)
-                {
-                    if (!mayMatch[i]) continue;
-                    if (synchronous)
-                    {
-                        SeekIndex(idx, batch, keys[i]);
-                    }
-                    else
-                    {
-                        ValueTask seek = idx.SeekForGetAsync(batch.InternalKeyMemory(keys[i]), cancellationToken);
-                        if (!seek.IsCompletedSuccessfully) await seek.ConfigureAwait(false);
-                    }
-                    if (idx.Valid) StartDataBlockLookup(extended, lookups, idx.Handle.Offset);
-                }
-                if (lookups.AnyPending)
-                {
-                    if (synchronous) extended.WaitAll(lookups.PendingSpan);
-                    else await extended.WaitAllAsync(lookups.Handles, lookups.Count, cancellationToken).ConfigureAwait(false);
-                }
-                CollectDataBlockLookups(lookups, flags);
+                await LookUpFirstDataBlocksAsync(extended, lookups, idx, batch, keys, count, mayMatch, flags, synchronous, cancellationToken)
+                    .ConfigureAwait(false);
             }
             for (int i = 0; i < count; i++)
             {
@@ -107,21 +90,10 @@ public sealed partial class BlockBasedTableReader
                         currentOffset = ulong.MaxValue;
                         if (lookups is not null && lookups.TryTake(handle.Offset, out BlockRef prefetched))
                         {
-                            if (!prefetched.IsEmpty)
-                            {
-                                current = prefetched;
-                            }
-                            else if (synchronous)
-                            {
-                                // Missed every cache tier: read it (ReadAndInsert records the miss).
-                                current = ReadAndInsert(_cache!, _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset), handle, BlockKind.Data, flags);
-                            }
-                            else
-                            {
-                                _stats?.Record(MissCounter(BlockKind.Data));
-                                current = await ReadAndInsertAsync(_cache!, _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset), handle, BlockKind.Data, flags,
-                                    cancellationToken).ConfigureAwait(false);
-                            }
+                            ValueTask<BlockRef> pending = prefetched.IsEmpty
+                                ? ReadMissedDataBlock(handle, flags, synchronous, cancellationToken)
+                                : new ValueTask<BlockRef>(prefetched);
+                            current = pending.IsCompletedSuccessfully ? pending.Result : await pending.ConfigureAwait(false);
                         }
                         else if (synchronous)
                         {
@@ -156,6 +128,46 @@ public sealed partial class BlockBasedTableReader
             IterPool.Return(data);
             idx.Return();
         }
+    }
+
+    /// <summary>
+    /// The batched lookup of the first data block of every candidate key (the async_handles loop of upstream's MultiGet):
+    /// StartAsyncLookup per distinct block, one WaitAll / WaitAllAsync, then the results.
+    /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask LookUpFirstDataBlocksAsync<TBatch>(BlockCache cache, MultiGetCacheLookups lookups, IndexCursor idx, TBatch batch, int[] keys,
+        int count, bool[] mayMatch, TableReadFlags flags, bool synchronous, CancellationToken cancellationToken) where TBatch : class, ITableMultiGetBatch
+    {
+        for (int i = 0; i < count; i++)
+        {
+            if (!mayMatch[i]) continue;
+            if (synchronous)
+            {
+                SeekIndex(idx, batch, keys[i]);
+            }
+            else
+            {
+                ValueTask seek = idx.SeekForGetAsync(batch.InternalKeyMemory(keys[i]), cancellationToken);
+                if (!seek.IsCompletedSuccessfully) await seek.ConfigureAwait(false);
+            }
+            if (idx.Valid) StartDataBlockLookup(cache, lookups, idx.Handle.Offset);
+        }
+        if (lookups.AnyPending)
+        {
+            if (synchronous) cache.WaitAll(lookups.PendingSpan);
+            else await cache.WaitAllAsync(lookups.Handles, lookups.Count, cancellationToken).ConfigureAwait(false);
+        }
+        CollectDataBlockLookups(lookups, flags);
+    }
+
+    // A block the batched lookup missed in every cache tier: read it from the file without a second lookup.
+    private ValueTask<BlockRef> ReadMissedDataBlock(BlockHandle handle, TableReadFlags flags, bool synchronous, CancellationToken cancellationToken)
+    {
+        CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
+        // ReadAndInsert records the miss itself.
+        if (synchronous) return new ValueTask<BlockRef>(ReadAndInsert(_cache!, key, handle, BlockKind.Data, flags));
+        _stats?.Record(MissCounter(BlockKind.Data));
+        return ReadAndInsertAsync(_cache!, key, handle, BlockKind.Data, flags, cancellationToken);
     }
 
     // StartAsyncLookupFull for the data block at `offset` unless it is the previous key's block (keys are sorted, so a

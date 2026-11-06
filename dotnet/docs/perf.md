@@ -1529,6 +1529,42 @@ medians of 3 alternating runs for LookupHit after the change and of 5 runs for T
 All deltas are within the run-to-run spread (StdDev 6-15% of the mean on this machine), so the unused layers cause no
 measurable regression and no allocations. Raw outputs are in the session scratchpad (`bdn-ab*.txt`).
 
+## Cache dump / load, batched MultiGet secondary lookups: plain-cache hit paths and MultiGet (2026-11-06)
+
+What changed on the read paths: `MultiGetAsync` tests one field (`ExtendedLookup`) per call and one null reference per
+new data block; the batched secondary lookups live in a separate async method so the state machine of the common path
+barely grows. A miss checks `AdmitsCompressedBlocks` (virtual, false except for three-queue tiered caches). A cached
+index / full filter is now looked up before being read at table open (open path only). `CacheWithSecondaryAdapter.WaitAll`
+returns at once when nothing is pending and uses pooled arrays otherwise (it allocated a list and an array per call).
+Nothing changed in `LruCache` / `HyperClockCache` lookups or in the single-key table `Get`.
+
+BenchmarkDotNet, net10.0 Release, `[MemoryDiagnoser]`, baseline `ad38ca3`, runs alternating baseline / new on the
+shared 4-core box (load average 3-5 from other agents; StdDev 5-10% of the mean). Medians of the runs:
+`CacheBenchmarks.LookupHit` and `TableBenchmarks.TableGetCached` 3 runs each (default job); `DbAsyncBenchmarks.MultiGet16*`
+6 runs each (`--warmupCount 6 --iterationCount 15`), sync `MultiGet16` 2 more runs with 3 launches each.
+
+| Benchmark | Baseline | New | Delta | Allocated |
+|---|---:|---:|---:|---|
+| LookupHit, LRU | 211.8 ns | 211.5 ns | -0.1% | - / - |
+| LookupHit, HyperClock | 91.8 ns | 88.8 ns | -3.3% | - / - |
+| LookupHit, AutoHyperClock | 90.6 ns | 88.2 ns | -2.6% | - / - |
+| Table: Get (cached blocks) | 840.1 ns | 823.7 ns | -2.0% | - / - |
+| MultiGet16 (16 keys), block cache | 14.11 us | 14.84 us | +5.2% | - / - |
+| MultiGet16, block cache, 3-launch runs (mean of 2) | 14.27 us | 14.36 us | +0.6% | - / - |
+| MultiGet16Async, block cache | 14.92 us | 15.32 us | +2.7% | 1 B / 1 B |
+| MultiGet16, page cache | 30.86 us | 30.92 us | +0.2% | - / - |
+| MultiGet16, page cache, 3-launch runs (mean of 2) | 31.21 us | 30.33 us | -2.8% | - / - |
+| MultiGet16Async, page cache | 32.23 us | 33.38 us | +3.6% | 1 B / 1 B |
+
+The sync MultiGet deltas change sign between run sets and stay within one standard deviation (MultiGet16 on the block
+cache: -1.1% in the first set, +9% in the second, +0.6% in the 3-launch set; page cache -2.8% in the 3-launch set), so
+no regression is measurable there. MultiGet16Async came out 1.6-5.6% slower in every set (median +2.7% / +3.6%), also
+within one standard deviation; the remaining difference in its state machine is one more reference and one more await
+site in the block loop. Allocations are unchanged.
+The MultiGet "new" medians mix the first build (batched lookup inlined in `MultiGetAsync`) and the final one (moved out)
+for the first three runs; the final build alone: MultiGet16 14.86 us vs 13.59 us baseline in that set, 14.36 us vs
+14.27 us in the 3-launch set. Raw outputs: session scratchpad `bdn-{base,new}-{1..8}.txt`.
+
 ## Trie user-defined index vs the standard index (2026-11-03)
 
 `TrieIndexBenchmarks` (BenchmarkDotNet, net10.0, default job, `[MemoryDiagnoser]`): one table of 200,000 keys
