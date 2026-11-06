@@ -45,6 +45,7 @@ public abstract partial class Transaction : IDisposable
     {
         public Snapshot? Snapshot;
         public bool SnapshotNeeded;
+        public long NumPuts, NumPutEntities, NumDeletes, NumMerges;
         public readonly LockTracker NewLocks = new();
     }
 
@@ -150,14 +151,40 @@ public abstract partial class Transaction : IDisposable
         Merge,
     }
 
-    public void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Write(WriteOp.Put, Cfd(null), key, value, untracked: false);
-    public void Put(ColumnFamily columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Write(WriteOp.Put, Cfd(columnFamily), key, value, untracked: false);
-    public void Delete(ReadOnlySpan<byte> key) => Write(WriteOp.Delete, Cfd(null), key, default, untracked: false);
-    public void Delete(ColumnFamily columnFamily, ReadOnlySpan<byte> key) => Write(WriteOp.Delete, Cfd(columnFamily), key, default, untracked: false);
-    public void SingleDelete(ReadOnlySpan<byte> key) => Write(WriteOp.SingleDelete, Cfd(null), key, default, untracked: false);
-    public void SingleDelete(ColumnFamily columnFamily, ReadOnlySpan<byte> key) => Write(WriteOp.SingleDelete, Cfd(columnFamily), key, default, untracked: false);
-    public void Merge(ReadOnlySpan<byte> key, ReadOnlySpan<byte> operand) => Write(WriteOp.Merge, Cfd(null), key, operand, untracked: false);
-    public void Merge(ColumnFamily columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> operand) => Write(WriteOp.Merge, Cfd(columnFamily), key, operand, untracked: false);
+    public void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Write(WriteOp.Put, Cfd(null), key, value, untracked: false, assumeTracked: false);
+    public void Put(ColumnFamily columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) =>
+        Write(WriteOp.Put, Cfd(columnFamily), key, value, untracked: false, assumeTracked: false);
+    public void Delete(ReadOnlySpan<byte> key) => Write(WriteOp.Delete, Cfd(null), key, default, untracked: false, assumeTracked: false);
+    public void Delete(ColumnFamily columnFamily, ReadOnlySpan<byte> key) => Write(WriteOp.Delete, Cfd(columnFamily), key, default, untracked: false, assumeTracked: false);
+    public void SingleDelete(ReadOnlySpan<byte> key) => Write(WriteOp.SingleDelete, Cfd(null), key, default, untracked: false, assumeTracked: false);
+    public void SingleDelete(ColumnFamily columnFamily, ReadOnlySpan<byte> key) =>
+        Write(WriteOp.SingleDelete, Cfd(columnFamily), key, default, untracked: false, assumeTracked: false);
+    public void Merge(ReadOnlySpan<byte> key, ReadOnlySpan<byte> operand) => Write(WriteOp.Merge, Cfd(null), key, operand, untracked: false, assumeTracked: false);
+    public void Merge(ColumnFamily columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> operand) =>
+        Write(WriteOp.Merge, Cfd(columnFamily), key, operand, untracked: false, assumeTracked: false);
+
+    /// <summary>
+    /// Put with <c>assume_tracked</c> (TransactionBaseImpl::Put): when <paramref name="assumeTracked"/> is true the
+    /// caller asserts that this transaction already locked and tracked the key exclusively since the last save point
+    /// (e.g. with an exclusive <see cref="TryGetForUpdate(ReadOptions?, ColumnFamily, ReadOnlySpan{byte}, IBufferWriter{byte}, bool, bool)"/>),
+    /// so the key is neither validated against the snapshot nor tracked again. A pessimistic transaction fails with
+    /// InvalidArgument ("assume_tracked is set but it is not tracked yet") when the key is not tracked; an optimistic
+    /// one does not support it (upstream asserts) and treats it like an untracked write.
+    /// </summary>
+    public void Put(ColumnFamily columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool assumeTracked) =>
+        Write(WriteOp.Put, Cfd(columnFamily), key, value, untracked: false, assumeTracked);
+
+    /// <summary>Merge with <c>assume_tracked</c> (see <see cref="Put(ColumnFamily, ReadOnlySpan{byte}, ReadOnlySpan{byte}, bool)"/>).</summary>
+    public void Merge(ColumnFamily columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> operand, bool assumeTracked) =>
+        Write(WriteOp.Merge, Cfd(columnFamily), key, operand, untracked: false, assumeTracked);
+
+    /// <summary>Delete with <c>assume_tracked</c> (see <see cref="Put(ColumnFamily, ReadOnlySpan{byte}, ReadOnlySpan{byte}, bool)"/>).</summary>
+    public void Delete(ColumnFamily columnFamily, ReadOnlySpan<byte> key, bool assumeTracked) =>
+        Write(WriteOp.Delete, Cfd(columnFamily), key, default, untracked: false, assumeTracked);
+
+    /// <summary>SingleDelete with <c>assume_tracked</c> (see <see cref="Put(ColumnFamily, ReadOnlySpan{byte}, ReadOnlySpan{byte}, bool)"/>).</summary>
+    public void SingleDelete(ColumnFamily columnFamily, ReadOnlySpan<byte> key, bool assumeTracked) =>
+        Write(WriteOp.SingleDelete, Cfd(columnFamily), key, default, untracked: false, assumeTracked);
 
     /// <summary>
     /// Put without conflict checking (PutUntracked): an optimistic transaction does not validate the key at commit; a
@@ -195,11 +222,17 @@ public abstract partial class Transaction : IDisposable
         _batch.PutLogData(blob);
     }
 
-    private void Write(WriteOp op, ColumnFamilyData cfd, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool untracked)
+    private void Write(WriteOp op, ColumnFamilyData cfd, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool untracked) =>
+        Write(op, cfd, key, value, untracked, assumeTracked: false);
+
+    /// <summary>TransactionBaseImpl::Put / Merge / Delete / SingleDelete (+ the Untracked forms): lock, then append.</summary>
+    private void Write(WriteOp op, ColumnFamilyData cfd, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool untracked, bool assumeTracked)
     {
         ThrowIfDisposed();
         BeforeWrite();
-        ThrowIfError(WaitSync(TryLock(cfd, key, readOnly: false, exclusive: true, doValidate: !untracked, synchronous: true, CancellationToken.None)));
+        // const bool do_validate = !assume_tracked;
+        ThrowIfError(WaitSync(TryLock(cfd, key, readOnly: false, exclusive: true, doValidate: !untracked && !assumeTracked, assumeTracked, synchronous: true,
+            CancellationToken.None)));
         Apply(op, cfd, key, value);
         AfterWrite();
     }
@@ -225,7 +258,8 @@ public abstract partial class Transaction : IDisposable
     {
         ThrowIfDisposed();
         BeforeWrite();
-        ValueTask<RocksDbException?> t = TryLock(cfd, key.Span, readOnly: false, exclusive: true, doValidate: !untracked, synchronous: false, cancellationToken);
+        ValueTask<RocksDbException?> t = TryLock(cfd, key.Span, readOnly: false, exclusive: true, doValidate: !untracked, assumeTracked: false, synchronous: false,
+            cancellationToken);
         if (t.IsCompletedSuccessfully)
         {
             ThrowIfError(t.Result);
@@ -247,12 +281,59 @@ public abstract partial class Transaction : IDisposable
     {
         switch (op)
         {
-            case WriteOp.Put: _batch.Put(cfd.Id, key, value); break;
-            case WriteOp.Delete: _batch.Delete(cfd.Id, key); break;
-            case WriteOp.SingleDelete: _batch.SingleDelete(cfd.Id, key); break;
-            default: _batch.Merge(cfd.Id, key, value); break;
+            case WriteOp.Put: _batch.Put(cfd.Id, key, value); _numPuts++; break;
+            case WriteOp.Delete: _batch.Delete(cfd.Id, key); _numDeletes++; break;
+            case WriteOp.SingleDelete: _batch.SingleDelete(cfd.Id, key); _numDeletes++; break;
+            default: _batch.Merge(cfd.Id, key, value); _numMerges++; break;
         }
     }
+
+    // TransactionBaseImpl::num_puts_ / num_put_entities_ / num_deletes_ / num_merges_ (restored by RollbackToSavePoint).
+    private protected long _numPuts, _numPutEntities, _numDeletes, _numMerges;
+    // start_time_ (Stopwatch ticks), reset by Reinitialize.
+    private protected long _startTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    /// <summary>GetNumPuts: Put operations applied to this transaction so far (incl. untracked ones).</summary>
+    public long NumPuts => _numPuts;
+
+    /// <summary>GetNumPutEntities: PutEntity operations applied so far.</summary>
+    public long NumPutEntities => _numPutEntities;
+
+    /// <summary>GetNumDeletes: Delete and SingleDelete operations applied so far.</summary>
+    public long NumDeletes => _numDeletes;
+
+    /// <summary>GetNumMerges: Merge operations applied so far.</summary>
+    public long NumMerges => _numMerges;
+
+    /// <summary>
+    /// GetNumKeys: the number of distinct keys tracked by this transaction (pessimistic: the keys it holds locks on;
+    /// optimistic: the keys checked for conflicts at commit).
+    /// </summary>
+    public long NumKeys => _tracked.NumPointLocks;
+
+    /// <summary>GetElapsedTime: the time since the transaction began (milliseconds precision upstream).</summary>
+    public TimeSpan ElapsedTime => System.Diagnostics.Stopwatch.GetElapsedTime(_startTimestamp);
+
+    /// <summary>
+    /// SetLockTimeout: changes this transaction's lock wait timeout (TransactionOptions.lock_timeout); a negative value
+    /// waits forever. Has no effect on optimistic transactions.
+    /// </summary>
+    public virtual void SetLockTimeout(TimeSpan timeout)
+    {
+    }
+
+    /// <summary>
+    /// DisableIndexing: later Put / PutEntity / Merge / Delete operations are appended to the batch without being
+    /// indexed, a performance optimization when the keys about to be written are not read back. Reading such a key
+    /// through the transaction (Get, GetForUpdate, iterators) gives an undefined result, like upstream.
+    /// </summary>
+    public void DisableIndexing() => _batch.IndexingEnabled = false;
+
+    /// <summary>EnableIndexing: later writes are indexed again (see <see cref="DisableIndexing"/>).</summary>
+    public void EnableIndexing() => _batch.IndexingEnabled = true;
+
+    /// <summary>Whether writes are currently indexed (indexing_enabled_).</summary>
+    public bool IsIndexingEnabled => _batch.IndexingEnabled;
 
     // =====================================================================================================
     // Reads
@@ -339,7 +420,7 @@ public abstract partial class Transaction : IDisposable
         CheckDoValidate(options, doValidate);
         ColumnFamilyData cfd = Cfd(columnFamily);
         options = PrepareGetForUpdateOptions(options, cfd, doValidate);
-        ThrowIfError(WaitSync(TryLock(cfd, key, readOnly: true, exclusive, doValidate, synchronous: true, CancellationToken.None)));
+        ThrowIfError(WaitSync(TryLock(cfd, key, readOnly: true, exclusive, doValidate, assumeTracked: false, synchronous: true, CancellationToken.None)));
         return value is null ? false : GetFromBatchAndDb(options, cfd, key, value);
     }
 
@@ -397,7 +478,7 @@ public abstract partial class Transaction : IDisposable
         CheckDoValidate(options, doValidate);
         ColumnFamilyData cfd = Cfd(columnFamily);
         options = PrepareGetForUpdateOptions(options, cfd, doValidate);
-        ValueTask<RocksDbException?> t = TryLock(cfd, key.Span, readOnly: true, exclusive, doValidate, synchronous: false, cancellationToken);
+        ValueTask<RocksDbException?> t = TryLock(cfd, key.Span, readOnly: true, exclusive, doValidate, assumeTracked: false, synchronous: false, cancellationToken);
         if (t.IsCompletedSuccessfully)
         {
             ThrowIfError(t.Result);
@@ -489,6 +570,62 @@ public abstract partial class Transaction : IDisposable
         SetSnapshotIfNeeded();
         ColumnFamily handle = columnFamily ?? _database.DefaultColumnFamily;
         return new TransactionIterator(NewDbIterator(handle, cfd, options), _batch, cfd, options);
+    }
+
+    /// <summary>
+    /// Looks up every key of <paramref name="batch"/> as this transaction sees it (Transaction::MultiGet ->
+    /// WriteBatchWithIndex::MultiGetFromBatchAndDB): keys the transaction's writes do not settle are read from the DB
+    /// with one MultiGet (one consistent view), then the transaction's merges are applied. Read the results with
+    /// <see cref="MultiGetBatch.TryGetValue"/>, <see cref="MultiGetBatch.GetStatus"/> and <see cref="MultiGetBatch.GetError"/>;
+    /// a key's failure (e.g. a merge error) does not fail the others. Keys are not locked (see <see cref="MultiGetForUpdate"/>).
+    /// </summary>
+    public void MultiGet(ReadOptions? options, ColumnFamily columnFamily, MultiGetBatch batch)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(batch);
+        ColumnFamilyData cfd = Cfd(columnFamily);
+        SetSnapshotIfNeeded();
+        var reader = new TxnMultiValueReader(this, options, cfd);
+        _batch.MultiGet(cfd.Id, cfd.MergeOperator, cfd.TimestampSize, options, batch, ref reader);
+    }
+
+    /// <summary><see cref="MultiGet(ReadOptions?, ColumnFamily, MultiGetBatch)"/> on the default column family.</summary>
+    public void MultiGet(ReadOptions? options, MultiGetBatch batch) => MultiGet(options, null!, batch);
+
+    /// <summary>
+    /// TransactionBaseImpl::MultiGetForUpdate: locks (pessimistic, exclusively) or tracks (optimistic) every key of
+    /// <paramref name="batch"/> like <see cref="TryGetForUpdate(ReadOptions?, ReadOnlySpan{byte}, IBufferWriter{byte})"/>,
+    /// then reads them like <see cref="MultiGet(ReadOptions?, ColumnFamily, MultiGetBatch)"/>. If a key cannot be locked
+    /// (Busy, TimedOut, ...), the whole call fails with that error (upstream returns it for every key); keys locked
+    /// before it stay locked, like upstream.
+    /// </summary>
+    public void MultiGetForUpdate(ReadOptions? options, ColumnFamily columnFamily, MultiGetBatch batch)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(batch);
+        ColumnFamilyData cfd = Cfd(columnFamily);
+        options = PrepareGetForUpdateOptions(options, cfd, doValidate: true);
+        // Lock all keys; fail entire multiget if we cannot lock all keys.
+        for (int i = 0; i < batch.Count; i++)
+        {
+            ThrowIfError(WaitSync(TryLock(cfd, batch.GetKey(i), readOnly: true, exclusive: true, doValidate: true, assumeTracked: false, synchronous: true,
+                CancellationToken.None)));
+        }
+        SetSnapshotIfNeeded();
+        var reader = new TxnMultiValueReader(this, options, cfd);
+        _batch.MultiGet(cfd.Id, cfd.MergeOperator, cfd.TimestampSize, options, batch, ref reader);
+    }
+
+    /// <summary><see cref="MultiGetForUpdate(ReadOptions?, ColumnFamily, MultiGetBatch)"/> on the default column family.</summary>
+    public void MultiGetForUpdate(ReadOptions? options, MultiGetBatch batch) => MultiGetForUpdate(options, null!, batch);
+
+    /// <summary>The DB part of MultiGetFromBatchAndDB: one MultiGet of <paramref name="keys"/>.</summary>
+    private protected virtual void MultiGetFromDb(ReadOptions? options, ColumnFamilyData cfd, MultiGetBatch keys) =>
+        ColumnFamilyHandle(cfd).MultiGet(options, keys);
+
+    private readonly struct TxnMultiValueReader(Transaction txn, ReadOptions? options, ColumnFamilyData cfd) : WriteBatchWithIndex.IMultiValueDbReader
+    {
+        public void MultiGet(MultiGetBatch keys) => txn.MultiGetFromDb(options, cfd, keys);
     }
 
     private bool GetFromBatchAndDb(ReadOptions? options, ColumnFamilyData cfd, ReadOnlySpan<byte> key, IBufferWriter<byte> value)
@@ -592,7 +729,15 @@ public abstract partial class Transaction : IDisposable
     public virtual void SetSavePoint()
     {
         ThrowIfDisposed();
-        (_savePoints ??= new List<SavePoint>()).Add(new SavePoint { Snapshot = _snapshot, SnapshotNeeded = _snapshotNeeded });
+        (_savePoints ??= new List<SavePoint>()).Add(new SavePoint
+        {
+            Snapshot = _snapshot,
+            SnapshotNeeded = _snapshotNeeded,
+            NumPuts = _numPuts,
+            NumPutEntities = _numPutEntities,
+            NumDeletes = _numDeletes,
+            NumMerges = _numMerges,
+        });
         _batch.SetSavePoint();
     }
 
@@ -607,6 +752,10 @@ public abstract partial class Transaction : IDisposable
         SavePoint sp = sps[^1];
         _snapshot = sp.Snapshot;
         _snapshotNeeded = sp.SnapshotNeeded;
+        _numPuts = sp.NumPuts;
+        _numPutEntities = sp.NumPutEntities;
+        _numDeletes = sp.NumDeletes;
+        _numMerges = sp.NumMerges;
         // Rollback batch
         _batch.RollbackToSavePoint();
         // Rollback any keys that were tracked since the last savepoint
@@ -697,7 +846,7 @@ public abstract partial class Transaction : IDisposable
     /// Locks or tracks a key (TransactionBaseImpl::TryLock). Completes with null on success or the error. Must not
     /// keep <paramref name="key"/> beyond the synchronous part of the call.
     /// </summary>
-    private protected abstract ValueTask<RocksDbException?> TryLock(ColumnFamilyData cfd, ReadOnlySpan<byte> key, bool readOnly, bool exclusive, bool doValidate,
+    private protected abstract ValueTask<RocksDbException?> TryLock(ColumnFamilyData cfd, ReadOnlySpan<byte> key, bool readOnly, bool exclusive, bool doValidate, bool assumeTracked,
         bool synchronous, CancellationToken cancellationToken);
 
     /// <summary>Releases the lock of a key that is no longer tracked (pessimistic only).</summary>
@@ -720,6 +869,7 @@ public abstract partial class Transaction : IDisposable
         _batch.Clear();
         _tracked.Clear();
         _commitTimeBatch?.Clear();
+        _numPuts = _numPutEntities = _numDeletes = _numMerges = 0;
     }
 
     private protected ColumnFamilyData Cfd(ColumnFamily? columnFamily)

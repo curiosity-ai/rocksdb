@@ -209,8 +209,20 @@ public sealed class WriteBatchWithIndex : IDisposable
     /// </summary>
     internal bool HasKeyWithTimestamp => _hasKeyWithTimestamp;
 
-    /// <summary>Rep::AddOrUpdateIndexWithCfId (+ UpdateExistingEntryWithCfId in overwrite_key mode).</summary>
+    /// <summary>
+    /// TransactionBaseImpl::DisableIndexing (GetBatchForWrite returning the plain WriteBatch): while set, new records
+    /// are appended to the batch without being indexed (nor counted in sub-batches); a later rebuild of the index
+    /// (RollbackToSavePoint) indexes them like upstream's ReBuildIndex.
+    /// </summary>
+    internal bool IndexingDisabled { get; set; }
+
     private void AddOrUpdateIndex(uint cf, WriteType type, int recordOffset)
+    {
+        if (!IndexingDisabled) AddOrUpdateIndexCore(cf, type, recordOffset);
+    }
+
+    /// <summary>Rep::AddOrUpdateIndexWithCfId (+ UpdateExistingEntryWithCfId in overwrite_key mode).</summary>
+    private void AddOrUpdateIndexCore(uint cf, WriteType type, int recordOffset)
     {
         DecodeKeyPosition(_batch.Data, recordOffset, out int keyOffset, out int keySize);
         // MakeEntry: the index holds the user key without its timestamp.
@@ -291,7 +303,7 @@ public sealed class WriteBatchWithIndex : IDisposable
                 _ => WriteType.Unknown,
             };
             if (t is WriteType.Unknown or WriteType.DeleteRange) continue; // LogData, XID markers: not indexed
-            AddOrUpdateIndex(e.ColumnFamilyId, t, recordOffset);
+            AddOrUpdateIndexCore(e.ColumnFamilyId, t, recordOffset);
         }
     }
 
@@ -974,17 +986,34 @@ public sealed class WriteBatchWithIndex : IDisposable
         ArgumentNullException.ThrowIfNull(db);
         ArgumentNullException.ThrowIfNull(batch);
         ColumnFamily cfh = columnFamily ?? db.DefaultColumnFamily;
-        uint cf = CfId(cfh);
-        Comparator cmp = ComparatorOf(cfh);
+        var reader = new HandleMultiValueReader(cfh, options);
+        MultiGetFromBatchAndDBCore(CfId(cfh), cfh.Data.MergeOperator, cfh.Data.TimestampSize, options, batch, ref reader);
+    }
+
+    /// <summary>The DB side of a batched value read: one MultiGet of the keys the write batch does not settle.</summary>
+    internal interface IMultiValueDbReader
+    {
+        void MultiGet(MultiGetBatch keys);
+    }
+
+    private readonly struct HandleMultiValueReader(ColumnFamily cfh, ReadOptions? options) : IMultiValueDbReader
+    {
+        public void MultiGet(MultiGetBatch keys) => cfh.MultiGet(options, keys);
+    }
+
+    /// <summary>MultiGetFromBatchAndDB for a registered column family, the DB read through <paramref name="reader"/>.</summary>
+    internal void MultiGetFromBatchAndDBCore<TReader>(uint cf, MergeOperator? op, int timestampSize, ReadOptions? options, MultiGetBatch batch,
+        ref TReader reader) where TReader : struct, IMultiValueDbReader
+    {
+        Comparator cmp = _index.GetComparator(cf);
         int n = batch.Count;
         batch.EntityRun = false; // plain values (the batch may have been used for an entity run before)
-        if (cfh.Data.TimestampSize > 0 && options?.Timestamp is null)
+        if (timestampSize > 0 && options?.Timestamp is null)
         {
             batch.BeginExternalRun(cmp);
             for (int i = 0; i < n; i++) batch.SetError(i, new RocksDbException(StatusCode.InvalidArgument, "Invalid argument: Must specify timestamp"));
             return;
         }
-        MergeOperator? op = cfh.Data.MergeOperator;
         // Per key: the batch result (value bytes or "deleted"), or the index of the key in the DB MultiGet.
         var fromBatch = new byte[]?[n];
         var dbIndex = new int[n];
@@ -1039,7 +1068,7 @@ public sealed class WriteBatchWithIndex : IDisposable
                     errors[i] = e;
                 }
             }
-            if (dbBatch.Count > 0) cfh.MultiGet(options, dbBatch);
+            if (dbBatch.Count > 0) reader.MultiGet(dbBatch);
 
             batch.BeginExternalRun(cmp);
             for (int i = 0; i < n; i++)

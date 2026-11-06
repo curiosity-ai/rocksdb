@@ -392,4 +392,35 @@ public sealed class OptimisticTransactionTests
         AssertFails(StatusCode.InvalidArgument, () => named.SetName("x")); // Optimistic transactions cannot be named.
         AssertFails(StatusCode.InvalidArgument, named.Prepare);
     }
+
+    /// <summary>
+    /// optimistic_transaction_test.cc ColumnFamiliesTest (MultiGetForUpdate / GetNumKeys) and PredicateManyPreceders:
+    /// MultiGetForUpdate tracks every key, so a concurrent write to one of them fails the commit; MultiGet does not.
+    /// </summary>
+    [TestMethod]
+    [DataRow(OccValidationPolicy.ValidateSerial)]
+    [DataRow(OccValidationPolicy.ValidateParallel)]
+    public void MultiGetForUpdateTracksKeys(OccValidationPolicy policy)
+    {
+        using OptimisticTransactionDatabase db = Open(NewFs(), policy);
+        db.Database.Put(B("a"), B("1"));
+        db.Database.Put(B("b"), B("2"));
+        using (Transaction txn = db.BeginTransaction(s_wo))
+        {
+            using var mg = new MultiGetBatch();
+            mg.Add(B("a")).Add(B("b")).Add(B("c"));
+            txn.MultiGet(null, mg);
+            Assert.AreEqual(0, txn.NumKeys);
+            txn.MultiGetForUpdate(null, mg);
+            Assert.AreEqual(3, txn.NumKeys);
+            Assert.AreEqual("1", S(mg.GetValue(0).ToArray()));
+            Assert.AreEqual(MultiGetStatus.NotFound, mg.GetStatus(2));
+            txn.SetLockTimeout(TimeSpan.Zero); // no effect on optimistic transactions
+            db.Database.Put(B("c"), B("conflict"));
+            txn.Put(B("x"), B("y"));
+            Assert.AreEqual(1, txn.NumPuts);
+            AssertFails(StatusCode.Busy, txn.Commit);
+        }
+        Assert.IsNull(GetString(db.Database, "x"));
+    }
 }

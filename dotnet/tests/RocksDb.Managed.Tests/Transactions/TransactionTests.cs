@@ -628,6 +628,267 @@ public class TransactionTests
         txn.Dispose();
     }
 
+    // ---- assume_tracked, MultiGet, indexing, counters, SetLockTimeout ---------------------------------------
+
+    /// <summary>Port of TransactionTest.AssumeExclusiveTracked.</summary>
+    [TestMethod]
+    public void AssumeExclusiveTracked()
+    {
+        using TransactionDatabase db = Open(NewFs());
+        ColumnFamily cf = db.Database.DefaultColumnFamily;
+        using Transaction txn = db.BeginTransaction(s_wo, new TransactionOptions { LockTimeout = TimeSpan.FromMilliseconds(1) });
+        txn.SetSnapshot();
+        // commit a value after the snapshot is taken
+        db.Put(B("foo"), B("bar"));
+        var value = new System.Buffers.ArrayBufferWriter<byte>();
+        // By default write should fail to the commit after our snapshot
+        AssertFails(StatusCode.Busy, () => txn.TryGetForUpdate(null, cf, B("foo"), value, exclusive: true));
+        // But the user could direct the db to skip validating the snapshot. The read value then should be the most
+        // recently committed
+        Assert.IsTrue(txn.TryGetForUpdate(null, cf, B("foo"), value, exclusive: true, doValidate: false));
+        Assert.AreEqual("bar", S(value.WrittenSpan.ToArray()));
+        // Although ValidateSnapshot is skipped the key must have still got locked
+        AssertFails(StatusCode.TimedOut, () => db.Put(B("foo"), B("bar")));
+        // By default the write operations should fail due to the commit after the snapshot
+        AssertFails(StatusCode.Busy, () => txn.Put(B("foo"), B("bar1")));
+        AssertFails(StatusCode.Busy, () => txn.Put(cf, B("foo"), B("bar1"), assumeTracked: false));
+        // But the user could direct the db that it already assumes exclusive lock on the key due to the previous
+        // GetForUpdate call.
+        long keys = txn.NumKeys;
+        txn.Put(cf, B("foo"), B("bar1"), assumeTracked: true);
+        txn.Merge(cf, B("foo"), B("bar2"), assumeTracked: true);
+        txn.Delete(cf, B("foo"), assumeTracked: true);
+        txn.SingleDelete(cf, B("foo"), assumeTracked: true);
+        Assert.AreEqual(keys, txn.NumKeys);
+        Assert.AreEqual(1, txn.NumPuts);
+        Assert.AreEqual(1, txn.NumMerges);
+        Assert.AreEqual(2, txn.NumDeletes);
+        txn.Rollback();
+    }
+
+    /// <summary>PessimisticTransaction::TryLock: assume_tracked on a key that is not tracked is InvalidArgument.</summary>
+    [TestMethod]
+    public void AssumeTrackedOnUntrackedKeyIsInvalidArgument()
+    {
+        using TransactionDatabase db = Open(NewFs());
+        ColumnFamily cf = db.Database.DefaultColumnFamily;
+        using (Transaction txn = db.BeginTransaction(s_wo))
+        {
+            AssertFails(StatusCode.InvalidArgument, () => txn.Put(cf, B("k"), B("v"), assumeTracked: true));
+            StringAssert.Contains(Assert.ThrowsExactly<RocksDbException>(() => txn.Merge(cf, B("k"), B("v"), assumeTracked: true)).Message,
+                "assume_tracked is set but it is not tracked yet");
+            Assert.AreEqual(0, txn.Count);
+            Assert.AreEqual(0, txn.NumKeys);
+            // The port does not leak the lock taken for the rejected write: others can write the key.
+            db.Put(B("k"), B("other"));
+            txn.Commit();
+        }
+        Assert.AreEqual("other", S(db.Database.Get(B("k"))));
+    }
+
+    /// <summary>Port of TransactionTest.MultiGetBatchedTest.</summary>
+    [TestMethod]
+    public void MultiGetBatchedTest()
+    {
+        MemoryFileSystem fs = NewFs();
+        DbOptions o = NewOptions(fs);
+        o.CreateMissingColumnFamilies = true;
+        using TransactionDatabase db = TransactionDatabase.Open(DbPath, o, TxnDbOptions(),
+            [new("default", new ColumnFamilyOptions()), new("CF", new ColumnFamilyOptions { MergeOperator = MergeOperator.StringAppend(",") })]);
+        ColumnFamily cf = db.Database.GetColumnFamily("CF");
+        using (WriteBatch batch = new())
+        {
+            batch.Put(cf, B("aaa"), B("val1")).Put(cf, B("bbb"), B("val2")).Put(cf, B("ccc"), B("val3")).Put(cf, B("ddd"), B("foo"))
+                .Put(cf, B("eee"), B("val5")).Put(cf, B("fff"), B("val6")).Merge(cf, B("ggg"), B("foo"));
+            db.Write(s_wo, batch);
+        }
+        using Transaction txn = db.BeginTransaction(s_wo);
+        txn.SetSnapshot();
+        var snapshotRead = new ReadOptions { Snapshot = txn.Snapshot };
+        txn.Delete(cf, B("bbb"));
+        txn.Put(cf, B("ccc"), B("val3_new"));
+        txn.Merge(cf, B("ddd"), B("bar"));
+        string[] keys = ["aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg"];
+        using var mg = new MultiGetBatch();
+        foreach (string k in keys) mg.Add(B(k));
+        txn.MultiGet(snapshotRead, cf, mg);
+        string?[] expected = ["val1", null, "val3_new", "foo,bar", "val5", "val6", "foo"];
+        for (int i = 0; i < keys.Length; i++)
+        {
+            Assert.AreEqual(expected[i] is null ? MultiGetStatus.NotFound : MultiGetStatus.Found, mg.GetStatus(i), keys[i]);
+            if (expected[i] is not null) Assert.AreEqual(expected[i], S(mg.GetValue(i).ToArray()), keys[i]);
+        }
+        // MultiGet does not lock: another writer is not blocked.
+        db.Put(null, cf, B("aaa"), B("other"));
+    }
+
+    /// <summary>TransactionTest.ColumnFamiliesTest (MultiGetForUpdate part) and PredicateManyPreceders.</summary>
+    [TestMethod]
+    public void MultiGetForUpdateLocksAllKeys()
+    {
+        using TransactionDatabase db = Open(NewFs());
+        db.Put(B("a"), B("1"));
+        db.Put(B("b"), B("2"));
+        using Transaction txn = db.BeginTransaction(s_wo);
+        txn.Put(B("c"), B("own"));
+        using var mg = new MultiGetBatch();
+        mg.Add(B("a")).Add(B("b")).Add(B("c")).Add(B("d"));
+        txn.MultiGetForUpdate(null, mg);
+        CollectionAssert.AreEqual(new[] { MultiGetStatus.Found, MultiGetStatus.Found, MultiGetStatus.Found, MultiGetStatus.NotFound },
+            Enumerable.Range(0, 4).Select(mg.GetStatus).ToArray());
+        Assert.AreEqual("own", S(mg.GetValue(2).ToArray()));
+        Assert.AreEqual(4, txn.NumKeys);
+        // Every key (also the absent one) is locked.
+        using (Transaction txn2 = db.BeginTransaction(s_wo))
+        {
+            AssertFails(StatusCode.TimedOut, () => txn2.Put(B("d"), B("x")));
+            // A MultiGetForUpdate that cannot lock a key fails as a whole.
+            using var mg2 = new MultiGetBatch();
+            mg2.Add(B("z")).Add(B("a"));
+            AssertFails(StatusCode.TimedOut, () => txn2.MultiGetForUpdate(null, mg2));
+        }
+        txn.Commit();
+        db.Put(B("d"), B("x"));
+    }
+
+    /// <summary>Port of TransactionTest.DisableIndexingTest.</summary>
+    [TestMethod]
+    public void DisableIndexingTest()
+    {
+        // Skip for write unprepared: it does not solely rely on WBWI for read your own writes.
+        if (Policy == TransactionWritePolicy.WriteUnprepared) return;
+        using TransactionDatabase db = Open(NewFs());
+        using Transaction txn = db.BeginTransaction(s_wo);
+        txn.Put(B("A"), B("a"));
+        Assert.AreEqual("a", S(txn.Get(B("A"))));
+        txn.DisableIndexing();
+        Assert.IsFalse(txn.IsIndexingEnabled);
+        txn.Put(B("B"), B("b"));
+        Assert.IsNull(txn.Get(B("B")));
+        using (TransactionIterator it = txn.NewIterator(null))
+        {
+            it.Seek(B("B"));
+            Assert.IsFalse(it.Valid);
+        }
+        txn.Delete(B("A"));
+        Assert.AreEqual("a", S(txn.Get(B("A"))));
+        txn.EnableIndexing();
+        txn.Put(B("B"), B("bb"));
+        using (TransactionIterator it = txn.NewIterator(null))
+        {
+            it.Seek(B("B"));
+            Assert.IsTrue(it.Valid);
+            Assert.AreEqual("bb", S(it.Value.ToArray()));
+        }
+        Assert.AreEqual(3, txn.NumPuts);
+        Assert.AreEqual(1, txn.NumDeletes);
+    }
+
+    /// <summary>TransactionTest.SavepointTest counters: RollbackToSavePoint restores GetNumPuts / Deletes / Merges.</summary>
+    [TestMethod]
+    public void CountersFollowSavePoints()
+    {
+        using TransactionDatabase db = Open(NewFs(), null, new ColumnFamilyOptions { MergeOperator = MergeOperator.StringAppend(",") });
+        using Transaction txn = db.BeginTransaction(s_wo);
+        txn.Put(B("a"), B("1"));
+        txn.SetSavePoint();
+        txn.Delete(B("b"));
+        txn.SingleDelete(B("c"));
+        txn.Merge(B("d"), B("x"));
+        txn.PutUntracked(B("e"), B("2"));
+        txn.PutEntity(B("f"), [WideColumn.Default(B("w"))]);
+        Assert.AreEqual(2, txn.NumPuts);
+        Assert.AreEqual(2, txn.NumDeletes);
+        Assert.AreEqual(1, txn.NumMerges);
+        Assert.AreEqual(1, txn.NumPutEntities);
+        Assert.AreEqual(6, txn.NumKeys);
+        Assert.IsTrue(txn.RollbackToSavePoint());
+        Assert.AreEqual(1, txn.NumPuts);
+        Assert.AreEqual(0, txn.NumDeletes);
+        Assert.AreEqual(0, txn.NumMerges);
+        Assert.AreEqual(0, txn.NumPutEntities);
+        Assert.AreEqual(1, txn.NumKeys);
+        txn.Commit();
+        Assert.IsTrue(txn.ElapsedTime >= TimeSpan.Zero);
+    }
+
+    /// <summary>TransactionTest.TimeoutTest (SetLockTimeout / GetElapsedTime part).</summary>
+    [TestMethod]
+    public void SetLockTimeoutChangesTheWait()
+    {
+        using TransactionDatabase db = Open(NewFs(), new TransactionDbOptions { TransactionLockTimeout = s_short, DefaultLockTimeout = s_short });
+        using Transaction holder = db.BeginTransaction(s_wo);
+        holder.Put(B("a"), B("1"));
+        using Transaction waiter = db.BeginTransaction(s_wo, new TransactionOptions { LockTimeout = TimeSpan.FromMilliseconds(1) });
+        waiter.SetLockTimeout(TimeSpan.FromMilliseconds(300));
+        long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        AssertFails(StatusCode.TimedOut, () => waiter.Put(B("a"), B("2")));
+        Assert.IsTrue(System.Diagnostics.Stopwatch.GetElapsedTime(start) >= TimeSpan.FromMilliseconds(250));
+        Assert.IsTrue(waiter.ElapsedTime >= TimeSpan.FromMilliseconds(250));
+        // Released by the holder while waiting: the longer timeout lets the waiter win.
+        waiter.SetLockTimeout(TimeSpan.FromSeconds(30));
+        Task t = Task.Run(() => waiter.Put(B("a"), B("2")));
+        holder.Commit();
+        t.Wait(TimeSpan.FromSeconds(30));
+        waiter.Commit();
+        Assert.AreEqual("2", S(db.Database.Get(B("a"))));
+    }
+
+    // ---- reads over a DB merge chain spanning memtable and table files --------------------------------------
+
+    /// <summary>
+    /// Transaction reads where the batch has merge operands for a key whose DB value is itself an unresolved merge chain
+    /// over a Put in a table file, more operands in another file and in the memtable: GetFromBatchAndDB, GetForUpdate,
+    /// MultiGet and the iterator over the base all resolve the whole chain, then the transaction's operands.
+    /// </summary>
+    [TestMethod]
+    public void BatchMergesOverDbMergeChainAcrossMemtableAndFiles()
+    {
+        using TransactionDatabase db = Open(NewFs(), null, new ColumnFamilyOptions { MergeOperator = MergeOperator.StringAppend(",") });
+        db.Put(B("k"), B("base"));
+        db.Merge(B("k"), B("f1"));
+        db.Database.Flush();
+        db.Merge(B("k"), B("f2"));
+        db.Database.Flush();
+        db.Merge(B("k"), B("m1"));          // memtable
+        db.Merge(B("n"), B("only-db"));     // a chain without a base value
+        db.Database.Flush();
+        db.Merge(B("n"), B("mem"));
+        using Transaction txn = db.BeginTransaction(s_wo);
+        txn.Merge(B("k"), B("t1"));
+        txn.Merge(B("k"), B("t2"));
+        txn.Merge(B("n"), B("t"));
+        const string k = "base,f1,f2,m1,t1,t2";
+        const string n = "only-db,mem,t";
+        Assert.AreEqual(k, S(txn.Get(B("k"))));
+        Assert.AreEqual(n, S(txn.Get(B("n"))));
+        Assert.AreEqual(k, S(txn.GetForUpdate(B("k"))));
+        using (var mg = new MultiGetBatch())
+        {
+            mg.Add(B("k")).Add(B("n"));
+            txn.MultiGet(null, mg);
+            Assert.AreEqual(k, S(mg.GetValue(0).ToArray()));
+            Assert.AreEqual(n, S(mg.GetValue(1).ToArray()));
+        }
+        if (Policy != TransactionWritePolicy.WriteUnprepared)
+        {
+            using TransactionIterator it = txn.NewIterator(null);
+            var seen = new List<string>();
+            for (it.SeekToFirst(); it.Valid; it.Next()) seen.Add(S(it.Key.ToArray()) + "=" + S(it.Value.ToArray()));
+            CollectionAssert.AreEqual(new[] { "k=" + k, "n=" + n }, seen);
+            seen.Clear();
+            for (it.SeekToLast(); it.Valid; it.Prev()) seen.Add(S(it.Key.ToArray())!);
+            CollectionAssert.AreEqual(new[] { "n", "k" }, seen);
+        }
+        txn.Commit();
+        Assert.AreEqual(k, S(db.Database.Get(B("k"))));
+        db.Database.CompactRange();
+        Assert.AreEqual(k, S(db.Database.Get(B("k"))));
+        Assert.AreEqual(n, S(db.Database.Get(B("n"))));
+    }
+
+    private static string? S(byte[]? b) => b is null ? null : System.Text.Encoding.UTF8.GetString(b);
+
     /// <summary>Test-only view of the internal pessimistic transaction.</summary>
     private readonly struct PessimisticTransactionView(Transaction txn)
     {

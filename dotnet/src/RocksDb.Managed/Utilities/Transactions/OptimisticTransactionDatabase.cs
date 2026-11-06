@@ -143,12 +143,17 @@ internal sealed class OptimisticTransaction : Transaction, IWriteCallback
         ReleaseSnapshots();
         _writeOptions = writeOptions ?? new WriteOptions();
         _state = TransactionState.Started;
+        // TransactionBaseImpl::Reinitialize
+        _startTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+        EnableIndexing();
         if (options.SetSnapshot) SetSnapshot();
     }
 
-    private protected override ValueTask<RocksDbException?> TryLock(ColumnFamilyData cfd, ReadOnlySpan<byte> key, bool readOnly, bool exclusive, bool doValidate,
+    private protected override ValueTask<RocksDbException?> TryLock(ColumnFamilyData cfd, ReadOnlySpan<byte> key, bool readOnly, bool exclusive, bool doValidate, bool assumeTracked,
         bool synchronous, CancellationToken cancellationToken)
     {
+        // OptimisticTransaction::TryLock: assert(!assume_tracked) -- not supported; an assumed-tracked write is not
+        // validated (do_validate = !assume_tracked), like a release build upstream.
         if (!doValidate) return default;
         SetSnapshotIfNeeded();
         ulong seq = Snapshot is { } s ? s.SequenceNumber : _db.Versions.LastSequence;
