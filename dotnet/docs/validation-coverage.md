@@ -93,6 +93,7 @@ changes there need their own review.
 | `Cache/PersistentCache/PersistentCache.cs` | 75 | include/rocksdb/persistent_cache.h | line-by-line (feature audit: cache layers) |
 | `Cache/PersistentCache/PersistentCacheTier.cs` | 304 | utilities/persistent_cache/persistent_cache_tier.{h,cc}, volatile_tier_impl.{h,cc} | line-by-line (feature audit: cache layers) |
 | `Cache/SecondaryCache.cs` | 153 | include/rocksdb/secondary_cache.h | line-by-line (feature audit: cache layers) |
+| `Cache/RowCache.cs` | 215 | db/table_cache.cc (row cache), include/rocksdb/options.h (row_cache) | line-by-line (feature audit: read path, second review) |
 | `Cache/SimCache.cs` | 294 | utilities/simulator_cache/sim_cache.cc, include/rocksdb/utilities/sim_cache.h | line-by-line (feature audit: cache layers) |
 | `Cache/TieredSecondaryCache.cs` | 153 | cache/tiered_secondary_cache.{h,cc} | line-by-line (feature audit: cache layers) |
 | `Db/DbImpl.WriteBufferManager.cs` | 248 | db/db_impl/db_impl_write.cc (PreprocessWrite, HandleWriteBufferManagerFlush, WriteBufferManagerStallWrites), db_impl_compaction_flush.cc (CollectFlushableCFs) | line-by-line (feature audit: cache layers) |
@@ -258,6 +259,11 @@ changes there need their own review.
 | `Table/Block.cs` | 170 | table/block_based/block.{h,cc}, table/block_based/data_block_footer.cc | line-by-line (#1) |
 | `Table/BlockBasedTableBuilder.cs` | 784 | table/block_based/block_based_table_builder.cc | line-by-line (#1); compaction-features pass: EstimatedTailSize |
 | `Table/BlockBasedTableIterator.cs` | 420 | table/block_based/partitioned_index_iterator.cc, table/block_based/block_based_table_iterator.cc | line-by-line (#1) |
+| `Table/BlockBasedTableReader.EmbeddedBlobs.cs` | 150 | table/embedded_blob_sst.h, db/blob/blob_gen2_format.cc, table/block_based/block_based_table_reader.cc (ResolveEmbeddedBlob), embedded_blob_resolving_iterator.h | line-by-line (feature audit: read path, second review) |
+| `Table/BlockReadAmpBitmap.cs` | 60 | table/block_based/block.h (BlockReadAmpBitmap) | line-by-line (feature audit: read path, second review) |
+| `Table/ReadDeadline.cs` | 65 | file/file_util.h (PrepareIOFromReadOptions) | line-by-line (feature audit: read path, second review) |
+| `Table/SstFileReader.cs` | 215 | table/sst_file_reader.cc, table/sst_file_reader_sync_and_async.h | line-by-line (feature audit: read path, second review) |
+| `Table/Filters/VerifyingFilterBitsBuilder.cs` | 75 | table/block_based/filter_policy.cc (MaybePostVerify), full_filter_block.cc (MaybePostVerifyFilter) | line-by-line (feature audit: read path, second review) |
 | `Table/BlockBasedTableReader.MultiGet.cs` | 328 | table/block_based/block_based_table_reader_sync_and_async.h | line-by-line (#1); cache dump/load pass: batched data block lookups (StartAsyncLookupFull + WaitAll of BlockBasedTable::MultiGet) |
 | `Table/BlockBasedTableReader.cs` | 2053 | table/block_based/block_based_table_reader.{h,cc}, meta_blocks.cc | line-by-line (#1); cache dump/load pass: PutDataBlockToCache compressed_value, index/filter prefetch through the cache (RetrieveBlock) |
 | `Table/BlockBuilder.cs` | 363 | table/block_based/block_builder.{h,cc} | line-by-line (#1) |
