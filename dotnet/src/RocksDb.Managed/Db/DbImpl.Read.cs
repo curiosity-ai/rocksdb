@@ -384,6 +384,115 @@ internal sealed partial class DbImpl
     /// <summary>TableCache::Get: range tombstones of the file, then the point lookup. Returns true when done.</summary>
     private static bool GetFromFile(ColumnFamilyData cfd, FileMetaData f, ReadOnlySpan<byte> ikey, ReadOnlySpan<byte> userKey, ulong snapshot, GetContext ctx)
     {
+        if (cfd.TableCache.RowCache is not null && UsesRowCache(ctx)) return GetFromFileWithRowCache(cfd, f, ikey, userKey, snapshot, ctx);
+        return GetFromFileCore(cfd, f, ikey, userKey, snapshot, ctx);
+    }
+
+    /// <summary>
+    /// Whether a lookup may use the row cache (TableCache::Get: not for lookups that need the sequence number or track
+    /// newer versions). Deviation: lookups with a read callback (transactions), user-defined timestamps or a merge
+    /// operand callback bypass it.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool UsesRowCache(GetContext ctx) => ctx.Callback is null && ctx.TimestampSize == 0 && ctx.ContinueCallback is null;
+
+    /// <summary>
+    /// TableCache::Get with a row cache: a hit replays the cached entries of the key in this file without opening the
+    /// table (ROW_CACHE_HIT); a miss (ROW_CACHE_MISS) looks the key up and caches the entries it visited when there
+    /// were any.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    [SkipLocalsInit]
+    private static bool GetFromFileWithRowCache(ColumnFamilyData cfd, FileMetaData f, ReadOnlySpan<byte> ikey, ReadOnlySpan<byte> userKey, ulong snapshot,
+        GetContext ctx)
+    {
+        TableCache tc = cfd.TableCache;
+        Cache.RowCache rc = tc.RowCache!;
+        int max = userKey.Length + TableCache.RowCacheKeyPrefixMax;
+        byte[]? rented = null;
+        Span<byte> buf = max <= 256 ? stackalloc byte[256] : (rented = System.Buffers.ArrayPool<byte>.Shared.Rent(max));
+        try
+        {
+            int n = tc.RowCacheKey(buf, f, userKey, snapshot, out ulong replaySeq);
+            ReadOnlySpan<byte> key = buf[..n];
+            if (rc.TryGet(key, out byte[]? log))
+            {
+                tc.Statistics?.RecordTick(Ticker.RowCacheHit);
+                ctx.Replay(log, userKey, replaySeq);
+                return ctx.Done;
+            }
+            tc.Statistics?.RecordTick(Ticker.RowCacheMiss);
+            PooledBufferWriter w = ObjectPools.RentWriter();
+            try
+            {
+                bool done;
+                ctx.ReplayLog = w;
+                try
+                {
+                    done = GetFromFileCore(cfd, f, ikey, userKey, snapshot, ctx);
+                }
+                finally
+                {
+                    ctx.ReplayLog = null;
+                }
+                // Put the replay log in row cache only if something was found.
+                if (w.WrittenCount > 0) rc.Insert(key, w.WrittenSpan);
+                return done;
+            }
+            finally
+            {
+                ObjectPools.ReturnWriter(w);
+            }
+        }
+        finally
+        {
+            if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>Async <see cref="GetFromFileWithRowCache"/>: a miss reads the table with the async visitor lookup.</summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private static async ValueTask<bool> GetFromFileWithRowCacheAsync(ColumnFamilyData cfd, FileMetaData f, ReadOnlyMemory<byte> ikey,
+        ReadOnlyMemory<byte> userKey, ulong snapshot, GetContext ctx, CancellationToken cancellationToken)
+    {
+        TableCache tc = cfd.TableCache;
+        Cache.RowCache rc = tc.RowCache!;
+        byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(userKey.Length + TableCache.RowCacheKeyPrefixMax);
+        PooledBufferWriter? w = null;
+        try
+        {
+            int n = tc.RowCacheKey(buf, f, userKey.Span, snapshot, out ulong replaySeq);
+            if (rc.TryGet(buf.AsSpan(0, n), out byte[]? log))
+            {
+                tc.Statistics?.RecordTick(Ticker.RowCacheHit);
+                ctx.Replay(log, userKey.Span, replaySeq);
+                return ctx.Done;
+            }
+            tc.Statistics?.RecordTick(Ticker.RowCacheMiss);
+            w = ObjectPools.RentWriter();
+            bool done;
+            ctx.ReplayLog = w;
+            try
+            {
+                done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                ctx.ReplayLog = null;
+            }
+            if (w.WrittenCount > 0) rc.Insert(buf.AsSpan(0, n), w.WrittenSpan);
+            return done;
+        }
+        finally
+        {
+            if (w is not null) ObjectPools.ReturnWriter(w);
+            System.Buffers.ArrayPool<byte>.Shared.Return(buf);
+        }
+    }
+
+    /// <summary>The table lookup of <see cref="GetFromFile"/>.</summary>
+    private static bool GetFromFileCore(ColumnFamilyData cfd, FileMetaData f, ReadOnlySpan<byte> ikey, ReadOnlySpan<byte> userKey, ulong snapshot, GetContext ctx)
+    {
         TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels, ctx.ReadFlags);
         try
         {
@@ -674,6 +783,7 @@ internal sealed partial class DbImpl
     private static ValueTask<bool> GetFromFileAsync(ColumnFamilyData cfd, FileMetaData f, ReadOnlyMemory<byte> ikey, ReadOnlyMemory<byte> userKey,
         ulong snapshot, GetContext ctx, CancellationToken cancellationToken)
     {
+        if (cfd.TableCache.RowCache is not null && UsesRowCache(ctx)) return GetFromFileWithRowCacheAsync(cfd, f, ikey, userKey, snapshot, ctx, cancellationToken);
         // Opening a table is synchronous (TableCache.GetReaderAsync); the super version keeps the file's version referenced.
         TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels, ctx.ReadFlags);
         ValueTask<TableGetResult> pending;

@@ -318,6 +318,44 @@ internal sealed class TableCache : ITableCache, IDisposable
     /// </summary>
     internal bool VerifyUniqueIdInManifest { get; set; }
 
+    private Cache.RowCache? _rowCache;
+    private ulong _rowCacheId;
+
+    /// <summary>
+    /// DBOptions::row_cache (TableCache::Get / MultiGet row cache lookups); setting it draws this table cache's key
+    /// prefix (row_cache_id_ = row_cache->NewId()).
+    /// </summary>
+    internal Cache.RowCache? RowCache
+    {
+        get => _rowCache;
+        init
+        {
+            _rowCache = value;
+            _rowCacheId = value?.NewId() ?? 0;
+        }
+    }
+
+    /// <summary>
+    /// TableCache::CreateRowCacheKeyPrefix + the user key: row_cache_id | varint64(file number) | varint64(seq) | user key,
+    /// where seq is 0 when the read sequence exposes all of the file, else 1 + the read sequence. Returns the length
+    /// written to <paramref name="dst"/> and the sequence number entries are replayed with (seq - 1, or 0).
+    /// Deviation: upstream uses 1 + snapshot for a snapshot equal to the file's largest seqno too (which also sees the
+    /// whole file); only the cache key differs, not the result.
+    /// </summary>
+    internal int RowCacheKey(Span<byte> dst, FileMetaData file, ReadOnlySpan<byte> userKey, ulong readSequence, out ulong replaySeq)
+    {
+        ulong entrySeq = readSequence < file.LargestSeqno ? 1 + readSequence : 0;
+        int n = Util.Coding.EncodeVarint64(dst, _rowCacheId);
+        n += Util.Coding.EncodeVarint64(dst[n..], file.FileNumber);
+        n += Util.Coding.EncodeVarint64(dst[n..], entrySeq);
+        userKey.CopyTo(dst[n..]);
+        replaySeq = entrySeq == 0 ? 0 : entrySeq - 1;
+        return n + userKey.Length;
+    }
+
+    /// <summary>Maximum length of the row cache key prefix (three varint64s).</summary>
+    internal const int RowCacheKeyPrefixMax = 30;
+
     /// <summary>
     /// The column family's internal stats: with <see cref="Statistics"/>, reads of a table are also recorded in the
     /// latency histogram of the level it was opened at (InternalStats::GetFileReadHist, shown by rocksdb.cfstats).

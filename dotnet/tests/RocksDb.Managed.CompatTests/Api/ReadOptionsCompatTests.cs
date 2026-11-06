@@ -382,6 +382,97 @@ public sealed class ReadOptionsCompatTests
         CollectionAssert.AreEqual(native, managed, string.Join(", ", native) + " vs " + string.Join(", ", managed));
     }
 
+    // ---- row cache --------------------------------------------------------------------------------------------
+
+    private static void RowCacheWorkload(Action<string> put, Action flush, Func<string, string?> get, Func<Snapshot?> snapshot, Func<string, string?> getAtSnapshot)
+    {
+        put("foo=bar1");
+        snapshot();
+        put("foo=bar2");
+        flush();
+        put("foo2=bar");
+        for (int pass = 0; pass < 2; pass++)
+        {
+            Assert.AreEqual("bar2", get("foo"));
+            Assert.AreEqual("bar1", getAtSnapshot("foo"));
+            Assert.IsNull(get("nope"));
+            Assert.AreEqual("bar", get("foo2"));
+        }
+    }
+
+    /// <summary>
+    /// DBOptions::row_cache: the same Get workload (with a snapshot read) gives the same ROW_CACHE_HIT / ROW_CACHE_MISS
+    /// counts as native, and a DB used with a row cache round-trips with native (row_cache is not an OPTIONS file
+    /// entry on either side, so each side opens the other's OPTIONS file).
+    /// </summary>
+    [TestMethod]
+    public void RowCacheTickersAndOptionsRoundTripMatchNative()
+    {
+        using var nativeDir = new TempDir("rowcache-n");
+        using var managedDir = new TempDir("rowcache-m");
+        var no = new RocksDbSharp.DbOptions().SetCreateIfMissing(true).EnableStatistics();
+        IntPtr nativeCache = RocksDbSharp.Native.Instance.rocksdb_cache_create_lru((UIntPtr)(1 << 20));
+        RocksDbSharp.Native.Instance.rocksdb_options_set_row_cache(no.Handle, nativeCache);
+        s_keepAlive.Add(no);
+        string nativeText;
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(no, nativeDir.Path))
+        {
+            RocksDbSharp.Snapshot? snap = null;
+            RowCacheWorkload(
+                kv => db.Put(B(kv.Split('=')[0]), B(kv.Split('=')[1])),
+                () => db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true)),
+                k => db.Get(B(k)) is { } v ? Encoding.UTF8.GetString(v) : null,
+                () =>
+                {
+                    snap = db.CreateSnapshot();
+                    return null;
+                },
+                k => db.Get(B(k), null, NativeRead().SetSnapshot(snap!)) is { } v ? Encoding.UTF8.GetString(v) : null);
+            nativeText = no.GetStatisticsString();
+            snap!.Dispose();
+        }
+        var stats = new Statistics();
+        var rowCache = new Cache.RowCache(1 << 20);
+        using (RocksDatabase db = RocksDatabase.Open(managedDir.Path, new DbOptions { CreateIfMissing = true, Statistics = stats, RowCache = rowCache }))
+        {
+            Snapshot? snap = null;
+            RowCacheWorkload(
+                kv => db.Put(B(kv.Split('=')[0]), B(kv.Split('=')[1])),
+                db.Flush,
+                k => db.Get(B(k)) is { } v ? Encoding.UTF8.GetString(v) : null,
+                () => snap = db.GetSnapshot(),
+                k => db.Get(new ReadOptions { Snapshot = snap }, B(k)) is { } v ? Encoding.UTF8.GetString(v) : null);
+            snap!.Dispose();
+        }
+        string managedText = stats.ToString();
+        foreach (string name in new[] { "rocksdb.row.cache.hit", "rocksdb.row.cache.miss" })
+        {
+            Assert.AreEqual(TickerValue(nativeText, name), TickerValue(managedText, name), name);
+        }
+        Assert.IsTrue(TickerValue(managedText, "rocksdb.row.cache.hit") > 0);
+
+        // Round trip: native reads the managed DB (and writes to it), managed reads it back with its row cache.
+        using (RocksDbSharp.RocksDb db = OpenNative(managedDir.Path))
+        {
+            Assert.AreEqual("bar2", Encoding.UTF8.GetString(db.Get(B("foo"))));
+            db.Put(B("foo"), B("bar3"));
+            db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+        }
+        using (RocksDatabase db = RocksDatabase.Open(managedDir.Path, new DbOptions { RowCache = rowCache }))
+        {
+            for (int i = 0; i < 2; i++)
+            {
+                Assert.AreEqual("bar3", Encoding.UTF8.GetString(db.Get(B("foo"))!));
+                Assert.AreEqual("bar", Encoding.UTF8.GetString(db.Get(B("foo2"))!));
+            }
+        }
+        using (RocksDatabase db = RocksDatabase.Open(nativeDir.Path, new DbOptions { RowCache = new Cache.RowCache(1 << 20) }))
+        {
+            Assert.AreEqual("bar2", Encoding.UTF8.GetString(db.Get(B("foo"))!));
+            Assert.AreEqual("bar2", Encoding.UTF8.GetString(db.Get(B("foo"))!));
+        }
+    }
+
     // ---- filters and statistics ---------------------------------------------------------------------------
 
     private static ulong TickerValue(string statistics, string name)

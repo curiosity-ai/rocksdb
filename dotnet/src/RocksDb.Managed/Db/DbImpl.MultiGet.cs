@@ -279,6 +279,94 @@ internal sealed partial class DbImpl
     private static ValueTask MultiGetFromFileAsync(ColumnFamilyData cfd, FileMetaData f, MultiGetBatch batch, int count, ulong snapshot, bool synchronous,
         CancellationToken cancellationToken)
     {
+        if (cfd.TableCache.RowCache is not null) return MultiGetFromFileWithRowCacheAsync(cfd, f, batch, count, snapshot, synchronous, cancellationToken);
+        return MultiGetFromFileCoreAsync(cfd, f, batch, count, snapshot, synchronous, cancellationToken);
+    }
+
+    /// <summary>
+    /// TableCache::MultiGet with a row cache: keys with a cached entry for the file are replayed (ROW_CACHE_HIT), the
+    /// others (ROW_CACHE_MISS) are looked up in the table together and their visited entries cached.
+    /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private static async ValueTask MultiGetFromFileWithRowCacheAsync(ColumnFamilyData cfd, FileMetaData f, MultiGetBatch batch, int count, ulong snapshot,
+        bool synchronous, CancellationToken cancellationToken)
+    {
+        TableCache tc = cfd.TableCache;
+        Cache.RowCache rc = tc.RowCache!;
+        int[] sub = batch.Sub;
+        int[] original = System.Buffers.ArrayPool<int>.Shared.Rent(count);
+        Util.PooledBufferWriter?[] logs = System.Buffers.ArrayPool<Util.PooledBufferWriter?>.Shared.Rent(count);
+        byte[] keyBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(256);
+        int misses = 0;
+        try
+        {
+            Array.Copy(sub, original, count);
+            for (int i = 0; i < count; i++)
+            {
+                int k = original[i];
+                ReadOnlySpan<byte> userKey = batch.UserKey(k);
+                if (keyBuf.Length < userKey.Length + TableCache.RowCacheKeyPrefixMax)
+                {
+                    System.Buffers.ArrayPool<byte>.Shared.Return(keyBuf);
+                    keyBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(userKey.Length + TableCache.RowCacheKeyPrefixMax);
+                }
+                int n = tc.RowCacheKey(keyBuf, f, userKey, snapshot, out ulong replaySeq);
+                if (rc.TryGet(keyBuf.AsSpan(0, n), out byte[]? log))
+                {
+                    tc.Statistics?.RecordTick(Ticker.RowCacheHit);
+                    batch.Context(k).Replay(log, userKey, replaySeq);
+                    continue;
+                }
+                tc.Statistics?.RecordTick(Ticker.RowCacheMiss);
+                Util.PooledBufferWriter w = Util.ObjectPools.RentWriter();
+                logs[misses] = w;
+                batch.Context(k).ReplayLog = w;
+                sub[misses++] = k;
+            }
+            if (misses > 0)
+            {
+                try
+                {
+                    await MultiGetFromFileCoreAsync(cfd, f, batch, misses, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    for (int i = 0; i < misses; i++) batch.Context(sub[i]).ReplayLog = null;
+                }
+                for (int i = 0; i < misses; i++)
+                {
+                    Util.PooledBufferWriter w = logs[i]!;
+                    if (w.WrittenCount == 0 || batch.GetStatus(sub[i]) == MultiGetStatus.Error) continue;
+                    ReadOnlySpan<byte> userKey = batch.UserKey(sub[i]);
+                    if (keyBuf.Length < userKey.Length + TableCache.RowCacheKeyPrefixMax)
+                    {
+                        System.Buffers.ArrayPool<byte>.Shared.Return(keyBuf);
+                        keyBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(userKey.Length + TableCache.RowCacheKeyPrefixMax);
+                    }
+                    int n = tc.RowCacheKey(keyBuf, f, userKey, snapshot, out _);
+                    rc.Insert(keyBuf.AsSpan(0, n), w.WrittenSpan);
+                }
+            }
+        }
+        finally
+        {
+            for (int i = 0; i < misses; i++)
+            {
+                Util.ObjectPools.ReturnWriter(logs[i]!);
+                logs[i] = null;
+            }
+            // The caller continues with batch.Sub[0..count) in key order.
+            Array.Copy(original, sub, count);
+            System.Buffers.ArrayPool<int>.Shared.Return(original);
+            System.Buffers.ArrayPool<Util.PooledBufferWriter?>.Shared.Return(logs);
+            System.Buffers.ArrayPool<byte>.Shared.Return(keyBuf);
+        }
+    }
+
+    /// <summary>The table lookup of <see cref="MultiGetFromFileAsync"/>.</summary>
+    private static ValueTask MultiGetFromFileCoreAsync(ColumnFamilyData cfd, FileMetaData f, MultiGetBatch batch, int count, ulong snapshot, bool synchronous,
+        CancellationToken cancellationToken)
+    {
         FragmentedRangeTombstoneList? rangeDels;
         TableReaderLease lease;
         try
