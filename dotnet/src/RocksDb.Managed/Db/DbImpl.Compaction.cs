@@ -793,6 +793,12 @@ internal sealed partial class DbImpl
             else if (c.IsTrivialMove())
             {
                 // Move the files to the next level without rewriting them (BackgroundCompaction trivial move branch).
+                // A trivially moved round-robin size compaction advances the compact cursor too (kLevelMaxLevelSize
+                // only; db_impl_compaction_flush.cc BackgroundCompaction).
+                if (c.Reason == CompactionReason.LevelMaxLevelSize && cfd.Options.CompactionPri == CompactionPri.RoundRobin && c.StartLevel > 0)
+                {
+                    lock (_mutex) edit.CompactCursors.Add(new CompactCursor(c.StartLevel, c.InputStorage.GetNextCompactCursor(c.StartLevel, c.Inputs(0).Count)));
+                }
                 for (int l = 0; l < c.NumInputLevels; l++)
                 {
                     if (c.Level(l) == c.OutputLevel) continue;

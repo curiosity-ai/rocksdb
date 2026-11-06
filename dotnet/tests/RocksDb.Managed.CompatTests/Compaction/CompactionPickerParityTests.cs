@@ -67,7 +67,10 @@ public sealed class CompactionPickerParityTests
         return pool;
     }
 
-    /// <summary>The workload: <paramref name="steps"/> slices of <paramref name="putsPerStep"/> random puts over <paramref name="keySpace"/> keys.</summary>
+    /// <summary>
+    /// The workload: <paramref name="steps"/> slices of <paramref name="putsPerStep"/> random puts over
+    /// <paramref name="keySpace"/> keys (<see cref="SequentialKeys"/>: ascending keys, db_bench fillseq).
+    /// </summary>
     private static Run Drive(Action<byte[], byte[]?> write, Action flushAndWait, Func<(int[] Files, ulong[] Bytes)> shape,
         int steps, int putsPerStep, ulong keySpace, ulong seed, int firstStep, int deletePercent)
     {
@@ -77,11 +80,12 @@ public sealed class CompactionPickerParityTests
         var key = new byte[KeySize];
         var value = new byte[ValueSize];
         int pos = 0;
+        ulong sequence = 0;
         for (int s = 0; s < steps; s++)
         {
             for (int i = 0; i < putsPerStep; i++)
             {
-                FillKey(key, Next(ref state) % keySpace);
+                FillKey(key, keySpace == SequentialKeys ? sequence++ : Next(ref state) % keySpace);
                 if (pos + ValueSize > pool.Length) pos = 0;
                 pool.AsSpan(pos, ValueSize).CopyTo(value);
                 pos += ValueSize;
@@ -439,6 +443,9 @@ public sealed class CompactionPickerParityTests
 
     private const int RoundRobinPri = 4; // kRoundRobin
 
+    /// <summary>keySpace value of <see cref="Drive"/> for ascending keys (non-overlapping files: trivial moves).</summary>
+    private const ulong SequentialKeys = 0;
+
     private static void NativeRoundRobin(RocksDbSharp.DbOptions o, RocksDbSharp.Native native) =>
         native.rocksdb_options_set_compaction_pri(o.Handle, RoundRobinPri);
 
@@ -453,6 +460,31 @@ public sealed class CompactionPickerParityTests
     public void LockStepRoundRobinMatchesNative()
     {
         AssertLockStepParity("parity-roundrobin", steps: 50, putsPerStep: 2200, keySpace: 60000, seed: 404, NativeRoundRobin, ManagedRoundRobin);
+    }
+
+    /// <summary>
+    /// kRoundRobin with ascending keys: most compactions are trivial moves, and a trivially moved kLevelMaxLevelSize
+    /// compaction advances the compact cursor like a rewriting one (db_impl_compaction_flush.cc BackgroundCompaction,
+    /// GetNextCompactCursor). The LSM shapes, the compaction / move sequence and the cursors persisted in the MANIFEST
+    /// must match native.
+    /// </summary>
+    [TestMethod]
+    public void RoundRobinTrivialMovesAdvanceCursorLikeNative()
+    {
+        using var nativeDir = new TempDir("rr-seq-native");
+        using var managedDir = new TempDir("rr-seq-managed");
+        Run native = RunNative(nativeDir.Path, 40, 2200, SequentialKeys, 406, NativeRoundRobin, 0, 0);
+        Run managed = RunManaged(managedDir.Path, 40, 2200, SequentialKeys, 406, ManagedRoundRobin, 0, 0);
+        string trace = Trace(native, managed, out int firstShape, out int firstCompaction);
+        TestContext.WriteLine(trace);
+        Assert.AreEqual(-1, firstShape, "first differing LSM shape\n" + trace);
+        Assert.AreEqual(-1, firstCompaction, "first differing compaction\n" + trace);
+        Assert.IsTrue(native.Compactions.Exists(c => c.StartsWith("move ", StringComparison.Ordinal) && !c.EndsWith("-> L1", StringComparison.Ordinal)),
+            "the workload should trivially move files below L1\n" + trace);
+        SortedDictionary<int, byte[]> nativeCursors = RecordedCursors(nativeDir.Path), managedCursors = RecordedCursors(managedDir.Path);
+        Assert.IsTrue(nativeCursors.Count > 0, "native should record a compact cursor\n" + trace);
+        CollectionAssert.AreEqual(nativeCursors.Keys.ToList(), managedCursors.Keys.ToList());
+        foreach (int level in nativeCursors.Keys) CollectionAssert.AreEqual(nativeCursors[level], managedCursors[level], "cursor of L" + level);
     }
 
     private static void CopyDirectory(string from, string to)
