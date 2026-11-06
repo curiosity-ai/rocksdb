@@ -21,17 +21,17 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (293 files, about 84,000 lines):
+Summary (299 files, about 85,000 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
-| line-by-line (feature audits) | 114 |
+| line-by-line (feature audits, second review) | 119 |
 | line-by-line (#3) | 17 |
 | line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
-| API wrapper, design-reviewed | 12 |
+| API wrapper, design-reviewed | 13 |
 
 Two areas are under active change by other work streams: WritePrepared / WriteUnprepared transactions, and blob direct
 write with entity blob columns. Their files were audited at the revision named in validation.md ("Audit #3"). Later
@@ -154,6 +154,7 @@ changes there need their own review.
 | `Db/DbImpl.Properties.cs` | 657 | db/internal_stats.cc, db/db_impl/db_impl.cc | line-by-line (feature audit: user features (properties)) |
 | `Db/DbImpl.Read.cs` | 477 | db/db_impl/db_impl.cc (GetImpl, NewIterator), db/version_set.cc (Version::Get) | line-by-line (#2) |
 | `Db/DbImpl.ReadOnly.cs` | 330 | db/db_impl/db_impl_readonly.cc, db/db_impl/db_impl_secondary.cc | line-by-line (#3): db_impl_readonly.cc / db_impl_secondary.cc; **fixed** WAL checksum |
+| `Db/DbImpl.Shutdown.cs` | 83 | db/db_impl/db_impl.cc (CancelAllBackgroundWork, NotifyOnDBShutdownBegin) | line-by-line (second review: validation.md "Second review: DB API, properties, EVENT_LOG, PerfContext, Raft") |
 | `Db/DbImpl.SeqnoTime.cs` | 165 | db/db_impl/db_impl.cc, db/db_impl/db_impl_open.cc (seqno-to-time recording) | line-by-line (tiering pass: validation.md "Compaction triggers and tiering") |
 | `Db/DbImpl.Replication.cs` | 539 | db/db_impl/db_impl_files.cc, db/wal_manager.cc, db/db_filesnapshot.cc | line-by-line (#2) |
 | `Db/DbImpl.Timestamps.cs` | 295 | db/db_impl/db_impl.h, db/db_impl/db_impl_compaction_flush.cc | line-by-line (feature audit: user-defined timestamps) |
@@ -161,6 +162,7 @@ changes there need their own review.
 | `Db/DbImpl.Transactions.cs` | 524 | db/logs_with_prep_tracker.cc, db/db_impl/db_impl_files.cc, db/db_impl/db_impl.cc | line-by-line (feature audit: transactions) |
 | `Db/DbImpl.Write.cs` | 760 | db/db_impl/db_impl_write.cc, db/write_batch.cc (MemTableInserter) | line-by-line (#2) |
 | `Db/DbImpl.cs` | 612 | db/db_impl/db_impl.cc, db/db_impl/db_impl_compaction_flush.cc | line-by-line (#2) |
+| `Db/DestroyDb.cs` | 213 | db/db_impl/db_impl.cc (DestroyDB), file/file_util.cc (DeleteUnaccountedDBFile, DeleteExistingTrashDBFile) | line-by-line (second review: validation.md "Second review: DB API, properties, EVENT_LOG, PerfContext, Raft") |
 | `Db/DbWithTtl.cs` | 310 | utilities/ttl/db_ttl_impl.{h,cc}, utilities/ttl/db_ttl_impl.cc | line-by-line (#3): utilities/ttl/db_ttl_impl.cc; **fixed** IsStale sign |
 | `Db/ErrorHandler.cs` | 755 | db/error_handler.{h,cc}, db/event_helpers.cc, db/error_handler.cc | line-by-line (feature audit: errors/listeners/backups (+ #3 severity maps)) |
 | `Db/EventListener.Notifications.cs` | 351 | db/event_helpers.cc, db/db_impl/db_impl_compaction_flush.cc (NotifyOn*) | line-by-line (feature audit: errors/listeners/backups) |
@@ -229,8 +231,11 @@ changes there need their own review.
 | `Memory/BlockBufferPool.cs` | 114 | (managed buffer pool) | managed-only, design-reviewed (#3): pooled block buffers |
 | `Memory/ConcurrentArena.cs` | 235 | memory/concurrent_arena.h, memory/concurrent_arena.cc | line-by-line (#1) |
 | `Memtable/InlineSkipList.cs` | 649 | memtable/inlineskiplist.h | line-by-line (#1) |
+| `Monitoring/CacheEntryRoleStats.cs` | 190 | db/internal_stats.{h,cc} (CacheEntryRoleStats), cache/cache_entry_stats.h, cache/cache_entry_roles.cc | line-by-line (second review: validation.md "Second review: DB API, properties, EVENT_LOG, PerfContext, Raft") |
 | `Monitoring/FileReadSample.cs` | 86 | monitoring/file_read_sample.h | line-by-line (tiering pass: validation.md "Compaction triggers and tiering") |
 | `Monitoring/InternalStats.cs` | 345 | db/internal_stats.h, db/internal_stats.{h,cc} | line-by-line (feature audit: user features (properties)) |
+| `Monitoring/PerfContext.cs` | 264 | include/rocksdb/perf_context.h, perf_level.h, iostats_context.h, monitoring/perf_context.cc, perf_context_imp.h, perf_step_timer.h, perf_level.cc, iostats_context.cc | line-by-line (second review: validation.md "Second review: DB API, properties, EVENT_LOG, PerfContext, Raft") |
+| `Monitoring/PerfContext.g.cs` | 429 | monitoring/perf_context.cc (DEF_PERF_CONTEXT_METRICS), include/rocksdb/iostats_context.h | line-by-line (second review; generated from DEF_PERF_CONTEXT_METRICS) |
 | `Monitoring/Statistics.cs` | 456 | include/rocksdb/statistics.h, monitoring/statistics.cc, monitoring/histogram.cc | line-by-line (feature audit: user features (statistics)) |
 | `Monitoring/StatisticsNames.g.cs` | 1075 | monitoring/statistics.cc, include/rocksdb/statistics.h | line-by-line (feature audit: user features (statistics; generated from TickersNameMap)) |
 | `MultiGetBatch.cs` | 332 | db/db_impl/db_impl.cc (MultiGet key context), table/multiget_context.h | line-by-line (feature audit: UDT / MultiGet) |
@@ -250,6 +255,7 @@ changes there need their own review.
 | `Options/SstPartitioner.cs` | 166 | include/rocksdb/sst_partitioner.h, db/compaction/sst_partitioner.cc | line-by-line (compaction-features pass): SstPartitioner / factory / fixed prefix, ShouldPartitionByPrefix, OPTIONS id form |
 | `Options/SliceTransform.cs` | 180 | include/rocksdb/slice_transform.h, util/slice.cc | line-by-line (feature audit: table prefix (prefix extractor)) |
 | `PooledValue.cs` | 92 | include/rocksdb/metadata.h | managed-only, design-reviewed (#3): pooled Get results / LiveFileMetadata record |
+| `RocksDatabase.Lifecycle.cs` | 62 | include/rocksdb/db.h (DestroyDB, CancelAllBackgroundWork) | API wrapper, design-reviewed (second review): delegates to DestroyDb / DbImpl |
 | `RocksDatabase.Repair.cs` | 26 | include/rocksdb/db.h (RepairDB) | API wrapper, design-reviewed (#3): delegates to Repairer |
 | `RocksDatabase.Replication.cs` | 295 | db/db_impl/db_impl_readonly.cc, db/db_impl/db_impl_secondary.cc | API wrapper, design-reviewed (#3): delegates to audited DbImpl |
 | `RocksDatabase.Timestamps.cs` | 43 | include/rocksdb/db.h (timestamp APIs) | line-by-line (feature audit: user-defined timestamps) |

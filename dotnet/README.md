@@ -1074,10 +1074,28 @@ Console.WriteLine(db.GetIntProperty(DbProperties.EstimateNumKeys));             
 Dictionary<string, TableProperties> tables = db.GetPropertiesOfAllTables();
 ```
 
-`GetProperty` accepts the native property names (constants in `DbProperties`), including `rocksdb.stats`,
-`rocksdb.cfstats`, `rocksdb.levelstats`, `rocksdb.num-files-at-level<N>`, `rocksdb.estimate-num-keys` and the blob and
-block-cache properties. `KeyMayExist`, `GetApproximateSizes`, `GetApproximateMemTableStats`, `GetLiveFilesMetadata`
-and `GetPropertiesOfAllTables` are also available.
+`GetProperty` accepts every native property name of `db/internal_stats.cc` (constants in `DbProperties`), including
+`rocksdb.stats`, `rocksdb.cfstats`, `rocksdb.levelstats`, `rocksdb.num-files-at-level<N>`, `rocksdb.estimate-num-keys`,
+the write stall, blob and block-cache (entry stats) properties; unknown names, and levels at or beyond `num_levels`,
+return null. `KeyMayExist`, `GetApproximateSizes`, `GetApproximateMemTableStats`, `GetLiveFilesMetadata` and
+`GetPropertiesOfAllTables` are also available.
+
+`PerfContext` explains the cost of single operations on the calling thread, like upstream's perf context:
+
+<!-- snippet:perf-context -->
+```csharp
+PerfContext.Level = PerfLevel.EnableTimeExceptForMutex;   // this thread only; the default is Disable (no cost)
+PerfContext.Current.Reset();
+db.Get(BitConverter.GetBytes(42));
+ulong reads = PerfContext.Current[PerfMetric.BlockReadCount];
+Console.WriteLine(PerfContext.Current.ToString(excludeZeroCounters: true));    // "user_key_comparison_count = 9, ..."
+Console.WriteLine(IOStatsContext.Current.ToString(excludeZeroCounters: true)); // "bytes_read = 4155, ..."
+PerfContext.Level = PerfLevel.Disable;
+```
+
+`RocksDatabase.Destroy(path, options)` / `DestroyAsync` (DestroyDB) delete a closed database and its files, and
+`CancelAllBackgroundWork(wait)` begins a shutdown early (flushes unpersisted data, stops flushes and compactions;
+listeners get `OnDBShutdownBegin`).
 
 ### Cache tiers, simulated caches and memtable budgets
 
@@ -1261,6 +1279,12 @@ Not ported yet (tracked in [todo.md](todo.md)):
   and transaction databases and `sst_dump` on PlainTable / CuckooTable files.
 - Not supported, as upstream: user-defined timestamps in optimistic transactions and explicit-timestamp
   `WriteBatchWithIndex` writes.
+- `PerfContext` / `IOStatsContext`: the per-level counters (`EnablePerLevelPerfContext`), the mutex and CPU-time
+  metrics and the per-temperature I/O counters are not ported; the metrics that are updated are listed in
+  [docs/validation.md](docs/validation.md) ("Second review: DB API, properties, EVENT_LOG, PerfContext, Raft"), the
+  others stay 0. The default perf level is `Disable` (upstream: `EnableCount`). `AbortAllCompactions` /
+  `ResumeAllCompactions` are not ported (`rocksdb.compaction-abort-count` stays 0), and `RocksDatabase.Destroy` does
+  not search column family `cf_paths` (not ported either).
 
 API and behavior differences:
 
