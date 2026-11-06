@@ -11,7 +11,7 @@ steady state, including background flush and compaction work, with 16-byte keys 
 
 > **Planned additions.** More allocation-free variants are being added: iterator refresh / reuse, a pooled
 > `MultiGet(IReadOnlyList<byte[]>)`, `TryGetIntProperty` without an intermediate string, span-based metadata and
-> size APIs, pooled `WriteBatchWithIndex`, and fewer background allocations per flushed file. This guide will be updated
+> size APIs, and fewer background allocations per flushed file. This guide will be updated
 > when they ship. Until then, the patterns below are what to use.
 
 ## Summary
@@ -21,10 +21,10 @@ steady state, including background flush and compaction work, with 16-byte keys 
 | Point reads | `TryGet(key, Span<byte>, out len)`, `TryGet(key, IBufferWriter<byte>)`, `Get<TState,TResult>(key, state, callback)`, `GetPooled` + `Dispose`, `ContainsKey`, `KeyMayExist`, the async versions of each | `byte[]? Get` / `GetAsync` (the value array: 128 B for 100 B) | the span / writer / callback / pooled variants |
 | Batched reads | `MultiGetBatch` reused with `Clear()`, `MultiGet` / `MultiGetAsync` / `MultiGetEntity` | `byte[]?[] MultiGet(IReadOnlyList<byte[]>)` (20 KB per 16 keys) | a reused `MultiGetBatch` |
 | Writes | `Put` / `Delete` / `SingleDelete` / `Merge` / `PutEntity` with spans, and their async versions (0.0-0.3 B/op on the calling thread) | none on the caller; background work adds 1-4 B/op, see [Writes](#writes) | |
-| Write batches | `db.CreateWriteBatch()` + `using`; one batch reused with `Clear()`; `WriteAsync` | `new WriteBatch()` that is never disposed (2.2 KB per batch); `new WriteBatchWithIndex()` per batch (1.1 KB) | `CreateWriteBatch`; reuse a `WriteBatchWithIndex` with `Clear()` |
+| Write batches | `db.CreateWriteBatch()` / `db.CreateWriteBatchWithIndex()` + `using`; one batch reused with `Clear()`; `WriteAsync` | `new WriteBatch()` that is never disposed (2.2 KB per batch); `new WriteBatchWithIndex()` per batch (1.1 KB) | `CreateWriteBatch` / `CreateWriteBatchWithIndex`, or `Clear()` |
 | Iterators | a reused `Iterator`: `Seek` / `SeekForPrev` / `Next` / `Prev` / `Key` / `Value` / `Columns`, async moves, `foreach` over `Range(...)` | `NewIterator` (2-4 KB per iterator), `ScanAsync` (128 B per scan) | keep one iterator per thread and `Seek` it |
 | Wide columns | `TryGetEntity(key, WideColumns)` with a reused result, `MultiGetEntity`, `Iterator.Columns` | `GetEntity` (312 B), `GetEntityLazy` (1 KB), `TryGetEntityLazy` (40 B) | `TryGetEntity`; reuse a `LazyWideColumns` |
-| Transactions | `BeginTransaction(writeOptions, options, oldTransaction)` + `Put` / `TryGetForUpdate` / `TryGet` / `Commit` (sync and async) | `BeginTransaction(writeOptions)` per transaction (~3 KB); a new 2PC name per transaction (~32 B); optimistic `Commit` (40 B) | reuse the transaction object |
+| Transactions | `BeginTransaction(writeOptions, options, oldTransaction)` + `SetName` / `Put` / `TryGetForUpdate` / `TryGet` / `Prepare` / `Commit` (sync and async, pessimistic and optimistic) | `using BeginTransaction(writeOptions)` per transaction (the transaction object, 350-470 B) | reuse the transaction object |
 | Monitoring | `Statistics` and `PerfContext` enabled (no allocation on reads), `GetColumnFamily(name)`, `GetLatestSequenceNumber` | `GetProperty` / `TryGetIntProperty` (40 B), `ColumnFamilies` (160 B), `GetLiveFilesMetadata`, `GetApproximateSizes`, `GetHistogramData` (896 B) | call them from monitoring code, not per request |
 
 ## Point reads
@@ -112,8 +112,23 @@ Both patterns cost the same as single writes (about 3 B per Put, all of it backg
 you dispose it. A batch that is dropped without `Dispose` takes its pooled buffer with it, which costs about 2.2 KB per
 batch.
 
-`WriteBatchWithIndex`: keep one and call `Clear()` between transactions (about 3 B per Put). `new WriteBatchWithIndex()`
-per batch builds its index from scratch (1.1 KB). `TryGetFromBatchAndDB(db, key, writer)` allocates nothing.
+`WriteBatchWithIndex` works the same way: take a pooled one per batch, or keep one and call `Clear()` (both about 3 B
+per Put, all of it background). `new WriteBatchWithIndex()` per batch builds its index from scratch (1.1 KB).
+`TryGetFromBatchAndDB(db, key, writer)` allocates nothing.
+
+```csharp
+// Pooled (bytewise order; pass overwriteKey: true for overwrite_key mode). Dispose returns it to the pool.
+using (WriteBatchWithIndex wbwi = db.CreateWriteBatchWithIndex())     // or WriteBatchWithIndex.Rent()
+{
+    wbwi.Put(k1, v1);
+    if (wbwi.TryGetFromBatchAndDB(db, k2, writer)) Use(writer.WrittenSpan);
+    db.Write(wbwi);
+}
+```
+
+A pooled batch must not be used after `Dispose`, nor the `WriteBatch` or iterators taken from it: a call on it while
+it sits in the pool throws `ObjectDisposedException`, but once another caller has rented it again, a stale reference
+would see that caller's batch.
 
 ### Range deletions
 
@@ -171,7 +186,7 @@ reused `MultiGetBatch` and `batch.TryGetEntity(i, columns)` allocate nothing.
 ## Transactions
 
 Reuse the transaction object: `BeginTransaction(writeOptions, transactionOptions, oldTransaction)` reinitialises a
-committed or rolled-back transaction, and keeps its lock-tracking buffers.
+committed or rolled-back transaction, and keeps its write batch and lock-tracking buffers.
 
 ```csharp
 var txnOptions = new TransactionOptions();
@@ -183,11 +198,12 @@ txn.TryGetForUpdate(null, other, writer);
 txn.Commit();                                   // or await txn.CommitAsync()
 ```
 
-- With reuse, pessimistic transactions (`Put`, `TryGetForUpdate`, `TryGet`, `CommitAsync`) allocate nothing.
-  `BeginTransaction(writeOptions)` (a new object per transaction) allocates about 3 KB.
-- Two-phase commit: `SetName` keeps the encoded name when a reused transaction gets the same name again; a different
-  name per transaction allocates about 32 B.
-- Optimistic transactions: `Commit` currently allocates about 40 B for the conflict check.
+- With reuse, pessimistic and optimistic transactions (`Put`, `TryGetForUpdate`, `TryGet`, `Commit`, `CommitAsync`)
+  allocate nothing, also for two-phase commit with a different `SetName` per transaction.
+- `using Transaction txn = txnDb.BeginTransaction(writeOptions)` (a new object per transaction) is fine too: disposing a
+  transaction hands its write batch and lock tracker to the next one, so only the transaction object is new (about
+  470 B pessimistic, 350 B optimistic). Dispose every transaction; one that is dropped without `Dispose` keeps its
+  buffers, and the next one builds new ones (about 3 KB).
 
 ## Async usage
 
@@ -197,10 +213,8 @@ txn.Commit();                                   // or await txn.CommitAsync()
   cold paths.
 - Write your own hot async loops as `async ValueTask` methods with
   `[AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]`, so your own state machine is pooled as well.
-- Under heavy async write concurrency (several writers awaiting the same write group), the runtime's pool of state
-  machines can run out and the write path allocates about 13 B per Put (4 concurrent writers). The pool size per type
-  can be raised with the environment variable `DOTNET_SYSTEM_THREADING_POOLINGASYNCVALUETASKSCACHESIZE`. Synchronous
-  writes from several threads don't have this cost.
+- Concurrent async writers (many tasks awaiting `PutAsync` / `WriteAsync` in the same write groups) allocate nothing
+  either: each waiting write owns its suspended state, so no tuning is needed.
 
 ## Options and settings that matter
 

@@ -266,6 +266,32 @@ internal static partial class Scenarios
                 }
             }));
         }, chunk: 250));
+        list.Add(S("txn.optimistic.history", "txn", PathKind.Hot, "optimistic reused txn: 4 Put + Commit, 2 history memtables to check", ctx =>
+        {
+            var cfo = ScenarioContext.DefaultCfOptions();
+            cfo.WriteBufferSize = 256UL << 20;
+            cfo.MaxWriteBufferSizeToMaintain = 1L << 30;
+            OptimisticTransactionDatabase t = ctx.Own(OptimisticTransactionDatabase.Open(ctx.NewDirectory("db"), ScenarioContext.DefaultDbOptions(),
+                new OptimisticTransactionDbOptions(), [new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, cfo)]));
+            byte[][] keys = ScenarioContext.Keys(KeySpace);
+            for (int f = 0; f < 2; f++)
+            {
+                for (int i = 0; i < 100; i++) t.Database.Put(keys[i], value);
+                t.Database.Flush();
+            }
+            var opts = new OptimisticTransactionOptions();
+            Transaction txn = ctx.Own(t.BeginTransaction(wo, opts));
+            var c = new Cursor(KeySpace);
+            return Done(Runner.Sync(n =>
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    txn = t.BeginTransaction(wo, opts, txn);
+                    for (int j = 0; j < 4; j++) txn.Put(keys[c.Next()], value);
+                    txn.Commit();
+                }
+            }));
+        }, chunk: 250));
         list.Add(S("txn.optimistic.new", "txn", PathKind.Hot, "optimistic using BeginTransaction(wo) + 4 Put + Commit", ctx =>
         {
             OptimisticTransactionDatabase t = ctx.Own(OptimisticTransactionDatabase.Open(ctx.NewDirectory("db"), ScenarioContext.DefaultDbOptions()));
