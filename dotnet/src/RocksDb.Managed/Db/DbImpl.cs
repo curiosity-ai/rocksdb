@@ -54,13 +54,21 @@ internal sealed partial class DbImpl : IAsyncDisposable
         // FileSystemTracingWrapper (DBImpl::fs_): records file operations while an IO trace runs.
         FileSystem = new Tracing.IoTracingFileSystem(options.FileSystem, IoTracer);
         WalDir = string.IsNullOrEmpty(options.WalDir) ? dbname : options.WalDir.TrimEnd('/');
-        var paths = new List<string> { dbname };
-        foreach ((string p, _) in options.DbPaths)
+        // SanitizeOptions (db_impl_open.cc): db_paths as given (path id i = db_paths[i]), or {dbname, UINT64_MAX}.
+        var paths = new List<string>();
+        var targetSizes = new List<ulong>();
+        foreach ((string p, ulong targetSize) in options.DbPaths)
         {
-            if (paths.Count == 1 && p.TrimEnd('/') == dbname) continue;
             paths.Add(p.TrimEnd('/'));
+            targetSizes.Add(targetSize);
+        }
+        if (paths.Count == 0)
+        {
+            paths.Add(dbname);
+            targetSizes.Add(ulong.MaxValue);
         }
         DbPaths = paths;
+        DbPathTargetSizes = targetSizes;
         Versions = new VersionSet(this, FileSystem, dbname);
         ErrorHandler = new ErrorHandler(this);
         _allowConcurrentMemtableWrite = options.AllowConcurrentMemtableWrite;
@@ -123,6 +131,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
     public IFileSystem FileSystem { get; }
     public string WalDir { get; }
     public IReadOnlyList<string> DbPaths { get; }
+
+    /// <summary>The target sizes of <see cref="DbPaths"/> (DbPath::target_size; the DB directory's is unlimited).</summary>
+    internal IReadOnlyList<ulong> DbPathTargetSizes { get; }
     public VersionSet Versions { get; }
     private Cache.BlockCache? _defaultBlockCache;
     private readonly Lock _defaultBlockCacheLock = new();
@@ -695,6 +706,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
             if (FileDeletionsDisabled || _readOnly) return;
             minLog = MinLogNumberToKeepForDeletion();
             var dirs = new List<string>(DbPaths);
+            // FindObsoleteFiles: the DB directory (MANIFEST, OPTIONS, ...) even when db_paths does not name it.
+            if (!dirs.Contains(DbName)) dirs.Add(DbName);
             if (!dirs.Contains(WalDir)) dirs.Add(WalDir);
             foreach (string dir in dirs)
             {

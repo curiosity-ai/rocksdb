@@ -420,8 +420,76 @@ internal abstract partial class CompactionPicker
         return t == CompressionType.DisableCompressionOption ? CompressionType.None : t;
     }
 
-    /// <summary>Port of LevelCompactionBuilder::GetPathId (single path when db_paths has one entry).</summary>
-    public virtual uint GetPathId(int level) => 0;
+    /// <summary>
+    /// The target sizes of the column family's paths (ioptions.cf_paths[i].target_size: db_paths, or the DB directory
+    /// with an unlimited size when db_paths is empty). Set by the column family when the picker is created.
+    /// </summary>
+    public IReadOnlyList<ulong> PathTargetSizes { get; set; } = [ulong.MaxValue];
+
+    /// <summary>
+    /// Port of LevelCompactionBuilder::GetPathId (compaction_picker_level.cc): the first path where the levels up to
+    /// and including <paramref name="level"/> fit (L0 is estimated as large as L1 = max_bytes_for_level_base); the last
+    /// path is the fallback.
+    /// </summary>
+    public uint GetPathId(int level)
+    {
+        IReadOnlyList<ulong> paths = PathTargetSizes;
+        uint p = 0;
+        // size remaining in the most recent path
+        ulong currentPathSize = paths[0];
+        int curLevel = 0;
+        // max_bytes_for_level_base denotes L1 size. We estimate L0 size to be the same as L1.
+        ulong levelSize = Options.MaxBytesForLevelBase;
+        // Last path is the fallback
+        while (p < paths.Count - 1)
+        {
+            if (levelSize <= currentPathSize)
+            {
+                if (curLevel == level)
+                {
+                    // Does desired level fit in this path?
+                    return p;
+                }
+                currentPathSize -= levelSize;
+                if (curLevel > 0)
+                {
+                    double next = Options.LevelCompactionDynamicLevelBytes
+                        ? levelSize * Options.MaxBytesForLevelMultiplier
+                        : levelSize * Options.MaxBytesForLevelMultiplier * MaxBytesMultiplierAdditional(curLevel);
+                    levelSize = next >= ulong.MaxValue ? ulong.MaxValue : (ulong)next;
+                }
+                curLevel++;
+                continue;
+            }
+            p++;
+            currentPathSize = paths[(int)p];
+        }
+        return p;
+    }
+
+    /// <summary>MutableCFOptions::MaxBytesMultiplerAdditional.</summary>
+    private int MaxBytesMultiplierAdditional(int level) =>
+        level < Options.MaxBytesForLevelMultiplierAdditional.Count ? Options.MaxBytesForLevelMultiplierAdditional[level] : 1;
+
+    /// <summary>
+    /// Port of UniversalCompactionBuilder::GetPathId (compaction_picker_universal.cc): the first path that can hold
+    /// <paramref name="fileSize"/> and, with the paths before it, the expected future files (size_ratio) before this
+    /// one is compacted again; the last path is the fallback.
+    /// </summary>
+    public uint GetUniversalPathId(ulong fileSize)
+    {
+        IReadOnlyList<ulong> paths = PathTargetSizes;
+        ulong accumulatedSize = 0;
+        ulong futureSize = fileSize * (100 - Options.CompactionOptionsUniversal.SizeRatio) / 100;
+        uint p = 0;
+        for (; p < paths.Count - 1; p++)
+        {
+            ulong targetSize = paths[(int)p];
+            if (targetSize > fileSize && accumulatedSize + (targetSize - fileSize) > futureSize) return p;
+            accumulatedSize += targetSize;
+        }
+        return p;
+    }
 
     /// <summary>Creates a compaction, registers it and recomputes the scores (the tail of PickCompaction*).</summary>
     protected Compaction NewCompaction(VersionStorageInfo vstorage, CompactionInputFiles[] inputs, int outputLevel, ulong maxOutputFileSize,
@@ -487,8 +555,18 @@ internal abstract partial class CompactionPicker
     /// <paramref name="end"/> are internal keys (null = unbounded). <paramref name="compactionEnd"/> receives the
     /// internal key where the next manual step must resume (null when the whole range was covered).
     /// </summary>
+    public Compaction? PickCompactionForCompactRange(VersionStorageInfo vstorage, int inputLevel, int outputLevel, uint maxSubcompactions,
+        byte[]? begin, byte[]? end, out byte[]? compactionEnd, out bool manualConflict, ulong maxFileNumToIgnore, bool disallowTrivialMove) =>
+        PickCompactionForCompactRange(vstorage, inputLevel, outputLevel, maxSubcompactions, begin, end, out compactionEnd, out manualConflict,
+            maxFileNumToIgnore, disallowTrivialMove, targetPathId: 0);
+
+    /// <summary>
+    /// <see cref="PickCompactionForCompactRange(VersionStorageInfo, int, int, uint, byte[], byte[], out byte[], out bool, ulong, bool)"/>
+    /// writing the outputs to db_paths[<paramref name="targetPathId"/>] (CompactRangeOptions::target_path_id).
+    /// </summary>
     public virtual Compaction? PickCompactionForCompactRange(VersionStorageInfo vstorage, int inputLevel, int outputLevel, uint maxSubcompactions,
-        byte[]? begin, byte[]? end, out byte[]? compactionEnd, out bool manualConflict, ulong maxFileNumToIgnore, bool disallowTrivialMove)
+        byte[]? begin, byte[]? end, out byte[]? compactionEnd, out bool manualConflict, ulong maxFileNumToIgnore, bool disallowTrivialMove,
+        uint targetPathId)
     {
         compactionEnd = null;
         manualConflict = false;
@@ -520,7 +598,7 @@ internal abstract partial class CompactionPicker
                 manualConflict = true;
                 return null;
             }
-            return NewCompaction(vstorage, all, outputLevel, MaxFileSizeForLevel(Options, outputLevel, 1), long.MaxValue, 0, new List<FileMetaData>(),
+            return NewCompaction(vstorage, all, outputLevel, MaxFileSizeForLevel(Options, outputLevel, 1), long.MaxValue, targetPathId, new List<FileMetaData>(),
                 CompactionReason.ManualCompaction, -1, l0FilesMightOverlap: true, isManual: true, disallowTrivialMove: disallowTrivialMove);
         }
 
@@ -631,7 +709,7 @@ internal abstract partial class CompactionPicker
         var grandparents = new List<FileMetaData>();
         GetGrandparents(vstorage, inputs, outputLevelInputs, grandparents);
         return NewCompaction(vstorage, compactionInputs, outputLevel, MaxFileSizeForLevel(Options, outputLevel, vstorage.BaseLevel),
-            Options.MaxCompactionBytes, 0, grandparents, CompactionReason.ManualCompaction, -1, l0FilesMightOverlap: true, isManual: true,
+            Options.MaxCompactionBytes, targetPathId, grandparents, CompactionReason.ManualCompaction, -1, l0FilesMightOverlap: true, isManual: true,
             disallowTrivialMove: disallowTrivialMove);
     }
 }

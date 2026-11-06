@@ -93,4 +93,51 @@ public sealed class CompactionReviewCompatTests
         Assert.AreEqual("2", native.Get("m"));
         Assert.AreEqual("1", native.Get("n"));
     }
+
+    /// <summary>rocksdb_options_set_db_paths with the given directories (unlimited target sizes).</summary>
+    private static unsafe void SetNativeDbPaths(RocksDbSharp.DbOptions options, string[] paths)
+    {
+        RocksDbSharp.Native native = RocksDbSharp.Native.Instance;
+        var handles = new IntPtr[paths.Length];
+        for (int i = 0; i < paths.Length; i++) handles[i] = native.rocksdb_dbpath_create(paths[i], ulong.MaxValue);
+        fixed (IntPtr* p = handles) native.rocksdb_options_set_db_paths(options.Handle, (IntPtr)p, (UIntPtr)paths.Length);
+        foreach (IntPtr h in handles) native.rocksdb_dbpath_destroy(h);
+    }
+
+    /// <summary>
+    /// db_paths path ids agree with native: managed flushes to db_paths[0] and compacts with target_path_id = 1 into
+    /// db_paths[1]; native, opened with the same db_paths, finds every file, and vice versa.
+    /// </summary>
+    [TestMethod]
+    public void DbPathsPlacementMatchesNative()
+    {
+        using var dir = new TempDir("dbpaths");
+        string db = Path.Combine(dir.Path, "db");
+        string[] paths = [Path.Combine(dir.Path, "p0"), Path.Combine(dir.Path, "p1")];
+        var o = new DbOptions { CreateIfMissing = true };
+        foreach (string p in paths) o.DbPaths.Add((p, 1UL << 40));
+        using (RocksDatabase m = RocksDatabase.Open(db, o, new ColumnFamilyOptions { DisableAutoCompactions = true }))
+        {
+            for (int i = 0; i < 200; i++) m.Put(B("k" + i.ToString("D4", System.Globalization.CultureInfo.InvariantCulture)), B("v" + i));
+            m.Flush();
+            m.CompactRange(new CompactRangeOptions { TargetPathId = 1, BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+            m.Put(B("z"), B("flushed"));
+            m.Flush();
+        }
+        Assert.IsTrue(Directory.GetFiles(paths[1], "*.sst").Length > 0);
+        Assert.AreEqual(1, Directory.GetFiles(paths[0], "*.sst").Length);
+        Assert.AreEqual(0, Directory.GetFiles(db, "*.sst").Length);
+        var nativeOptions = new RocksDbSharp.DbOptions();
+        SetNativeDbPaths(nativeOptions, paths);
+        using (var n = RocksDbSharp.RocksDb.Open(nativeOptions, db))
+        {
+            for (int i = 0; i < 200; i++) Assert.AreEqual("v" + i, n.Get("k" + i.ToString("D4", System.Globalization.CultureInfo.InvariantCulture)));
+            Assert.AreEqual("flushed", n.Get("z"));
+            n.Put("y", "native");
+            n.Flush(new RocksDbSharp.FlushOptions());
+        }
+        using RocksDatabase again = RocksDatabase.Open(db, new DbOptions { DbPaths = { (paths[0], 1UL << 40), (paths[1], 1UL << 40) } }, new ColumnFamilyOptions());
+        Assert.AreEqual("native", Encoding.UTF8.GetString(again.Get(B("y"))!));
+        Assert.AreEqual("v7", Encoding.UTF8.GetString(again.Get(B("k0007"))!));
+    }
 }

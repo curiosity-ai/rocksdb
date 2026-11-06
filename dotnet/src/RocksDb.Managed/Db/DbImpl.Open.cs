@@ -140,7 +140,10 @@ internal sealed partial class DbImpl
         {
             FileSystem.CreateDirectoryIfMissing(DbName);
             if (WalDir != DbName) FileSystem.CreateDirectoryIfMissing(WalDir);
-            for (int i = 1; i < DbPaths.Count; i++) FileSystem.CreateDirectoryIfMissing(DbPaths[i]);
+            foreach (string path in DbPaths)
+            {
+                if (path != DbName) FileSystem.CreateDirectoryIfMissing(path);
+            }
         }
         try
         {

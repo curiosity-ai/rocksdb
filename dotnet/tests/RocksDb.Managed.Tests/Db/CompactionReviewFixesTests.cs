@@ -752,4 +752,54 @@ public sealed class CompactionReviewFixesTests
             try { Directory.Delete(dir, recursive: true); } catch (IOException) { }
         }
     }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // db_paths placement (LevelCompactionBuilder::GetPathId, UniversalCompactionBuilder::GetPathId, target_path_id)
+
+    [TestMethod]
+    public void LevelGetPathIdPlacesLevelsByPathTargetSize()
+    {
+        var o = new ColumnFamilyOptions { MaxBytesForLevelBase = 256 * 1024, MaxBytesForLevelMultiplier = 10, LevelCompactionDynamicLevelBytes = false };
+        var picker = new LevelCompactionPicker(o, new InternalKeyComparator(BytewiseComparator.Instance))
+        {
+            PathTargetSizes = [500 * 1024, 5 * 1024 * 1024, ulong.MaxValue],
+        };
+        uint[] expected = [0, 1, 1, 2, 2, 2, 2];
+        for (int level = 0; level < expected.Length; level++) Assert.AreEqual(expected[level], picker.GetPathId(level), "level " + level);
+        picker.PathTargetSizes = [ulong.MaxValue];
+        Assert.AreEqual(0U, picker.GetPathId(6));
+    }
+
+    [TestMethod]
+    public void UniversalGetPathIdPlacesFilesByPathTargetSize()
+    {
+        var o = new ColumnFamilyOptions { CompactionStyle = CompactionStyle.Universal };
+        var picker = new UniversalCompactionPicker(o, new InternalKeyComparator(BytewiseComparator.Instance)) { PathTargetSizes = [1000, 10_000, ulong.MaxValue] };
+        Assert.AreEqual(0U, picker.GetUniversalPathId(500));
+        Assert.AreEqual(1U, picker.GetUniversalPathId(900));
+        Assert.AreEqual(2U, picker.GetUniversalPathId(20_000));
+    }
+
+    /// <summary>Flushes go to db_paths[0], CompactRange(target_path_id) outputs to db_paths[target_path_id].</summary>
+    [TestMethod]
+    public void CompactRangeTargetPathIdPlacesOutputs()
+    {
+        MemoryFileSystem fs = NewFs();
+        DbOptions o = NewOptions(fs);
+        o.DbPaths.Add(("/p0", 1UL << 40));
+        o.DbPaths.Add(("/p1", 1UL << 40));
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, new ColumnFamilyOptions { DisableAutoCompactions = true });
+        for (int i = 0; i < 100; i++) db.Put(Key(i), Value(i, 0));
+        db.Flush();
+        foreach (LiveFileMetadata f in db.GetLiveFilesMetadata()) Assert.AreEqual("/p0", f.Directory.TrimEnd('/'));
+        db.CompactRange(new CompactRangeOptions { TargetPathId = 1, BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+        Assert.IsTrue(db.GetLiveFilesMetadata().Count > 0);
+        foreach (LiveFileMetadata f in db.GetLiveFilesMetadata()) Assert.AreEqual("/p1", f.Directory.TrimEnd('/'));
+        Assert.IsFalse(fs.GetChildren("/p0").Any(n => n.EndsWith(".sst", StringComparison.Ordinal)));
+        db.Dispose();
+        using RocksDatabase again = RocksDatabase.Open(DbPath, o, new ColumnFamilyOptions());
+        for (int i = 0; i < 100; i++) CollectionAssert.AreEqual(Value(i, 0), again.Get(Key(i)));
+        var ex = Assert.ThrowsExactly<RocksDbException>(() => again.CompactRange(new CompactRangeOptions { TargetPathId = 2 }, null, null));
+        Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
+    }
 }

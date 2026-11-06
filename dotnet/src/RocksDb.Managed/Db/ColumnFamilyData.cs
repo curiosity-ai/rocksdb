@@ -123,6 +123,8 @@ internal sealed class ColumnFamilyData
             BlobFileReadHistogram = Stats.BlobFileReadHist,
         };
         CompactionState = new ColumnFamilyCompactionState(options, Icmp);
+        // ioptions.cf_paths (= db_paths): GetPathId of the leveled and universal pickers.
+        CompactionState.Picker.PathTargetSizes = db.DbPathTargetSizes;
         TableCache.LevelStats = Stats;
         if (options.EnableBlobDirectWrite && options.EnableBlobFiles && !db.IsReadOnly)
         {

@@ -1347,7 +1347,7 @@ internal sealed partial class DbImpl
                     {
                         c = cfd.CompactionState.Picker.PickCompactionForCompactRange(cfd.Current.Storage, inputLevel, outputLevel,
                             options.MaxSubcompactions, beginKey, endKey, out compactionEnd, out conflict, maxFileNumToIgnore,
-                            disallowTrivialMove || options.TrimTs is not null);
+                            disallowTrivialMove || options.TrimTs is not null, options.TargetPathId);
                     }
                     if (!conflict)
                     {
