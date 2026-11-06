@@ -16,7 +16,7 @@ namespace RocksDb.Managed.Db.Iterators;
 /// </remarks>
 internal sealed class IteratorCore
 {
-    /// <summary>The DB iterator (replaced only for cores over a caller-built DbIter: never for graph cores).</summary>
+    /// <summary>The DB iterator: one object for the core's whole life (a graph re-initializes it in place), cached by handles.</summary>
     internal DbIter It;
     private readonly InternalKeyComparator _icmp;
     /// <summary>Keys without timestamps are ordered by the root comparator when the column family has timestamps.</summary>

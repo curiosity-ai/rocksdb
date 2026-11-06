@@ -34,6 +34,10 @@ public sealed class Iterator : IDisposable
 {
     // The handle is never pooled (its core is): after Dispose, _core is null and every member throws.
     private IteratorCore? _core;
+    // The core's DB iterator (the same object for the core's whole life) and value suffix, for the accessors called per
+    // entry (Valid / Key / Value) without going through the core. Cleared on Dispose like _core.
+    private DbIter? _it;
+    private int _valueSuffixLength;
     private AsyncScan? _scan;
     private WideColumns? _columns;
 
@@ -42,9 +46,25 @@ public sealed class Iterator : IDisposable
     {
         ArgumentNullException.ThrowIfNull(iter);
         _core = new IteratorCore(iter);
+        _it = iter;
     }
 
-    internal Iterator(IteratorCore core) => _core = core;
+    internal Iterator(IteratorCore core)
+    {
+        _core = core;
+        _it = core.It;
+    }
+
+    private DbIter It
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            DbIter? it = _it;
+            if (it is null) ThrowDisposed();
+            return it;
+        }
+    }
 
     private IteratorCore Core
     {
@@ -74,24 +94,35 @@ public sealed class Iterator : IDisposable
     public bool Valid
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => Core.It.Valid;
+        get => It.Valid;
     }
 
     /// <summary>Current user key. REQUIRES: <see cref="Valid"/>. Valid until the iterator moves.</summary>
     public ReadOnlySpan<byte> Key
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => Core.It.Key;
+        get => It.Key;
     }
 
     /// <summary>Current value. REQUIRES: <see cref="Valid"/>. Valid until the iterator moves.</summary>
     public ReadOnlySpan<byte> Value
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => Core.Value;
+        get
+        {
+            ReadOnlySpan<byte> v = It.Value;
+            int strip = _valueSuffixLength;
+            if (strip == 0) return v;
+            if (v.Length < strip) ThrowHelper.Corruption("Error: value's length less than timestamp's\n");
+            return v[..^strip];
+        }
     }
 
-    internal void StripValueSuffix(int length) => Core.ValueSuffixLength = length;
+    internal void StripValueSuffix(int length)
+    {
+        Core.ValueSuffixLength = length;
+        _valueSuffixLength = length;
+    }
 
     /// <summary>
     /// User-defined timestamp of the current entry (Iterator::timestamp()) for column families with timestamps; empty
@@ -454,6 +485,7 @@ public sealed class Iterator : IDisposable
     {
         IteratorCore? core = Interlocked.Exchange(ref _core, null);
         if (core is null) return;
+        _it = null;
         _scan?.ReleaseBuffer();
         core.Release();
     }
