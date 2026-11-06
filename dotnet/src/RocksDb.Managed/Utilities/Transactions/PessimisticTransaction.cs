@@ -21,9 +21,9 @@ internal class PessimisticTransaction : Transaction
     private int _state; // TransactionState (CAS for expiration / lock stealing)
     private ulong _id;
     private protected string? _name;
-    private protected byte[]? _nameBytes;
-    private string? _lastName;
-    private byte[]? _lastNameBytes;
+    // The UTF-8 name of the transaction (the xid of its 2PC markers) in a buffer kept across reuses of the object.
+    private byte[]? _nameBuffer;
+    private int _nameLength;
     private protected ulong _logNumber;
     private long _expirationTime; // µs (PointLockManager.NowMicros); 0 = none
     private long _lockTimeout;    // µs; < 0 = infinite
@@ -44,13 +44,16 @@ internal class PessimisticTransaction : Transaction
     private uint _waitingCf;
     private byte[]? _waitingKey;
 
-    internal readonly List<ulong> WaitIdsScratch = new();
+    private List<ulong>? _waitIdsScratch;
+
+    /// <summary>Scratch list of the lock manager's waits (created at the first wait).</summary>
+    internal List<ulong> WaitIdsScratch => _waitIdsScratch ??= new List<ulong>();
 
     /// <summary>Range-locking mode: the ranges this transaction locked (RangeTreeLockTracker), else null.</summary>
     internal RangeLockList? RangeLocks { get; }
 
     public PessimisticTransaction(TransactionDatabase txnDb, WriteOptions? writeOptions, TransactionOptions options)
-        : base(txnDb.Database, writeOptions, options.MaxWriteBatchSize)
+        : base(txnDb.Database, writeOptions, options.MaxWriteBatchSize, txnDb.ResourcePool)
     {
         _txnDb = txnDb;
         if (txnDb.LockManager.IsRangeLockSupported) RangeLocks = new RangeLockList();
@@ -69,7 +72,7 @@ internal class PessimisticTransaction : Transaction
         _lockTimeout = ToMicros(options.LockTimeout ?? _txnDb.Options.TransactionLockTimeout);
         _expirationTime = options.Expiration is { } exp && exp >= TimeSpan.Zero ? PointLockManager.NowMicros() + Math.Max(1, (long)(exp.Ticks / 10)) : 0;
         _name = null;
-        _nameBytes = null;
+        _nameLength = 0;
         _logNumber = 0;
         _readTimestamp = MaxTimestamp;
         _commitTimestamp = MaxTimestamp;
@@ -158,20 +161,20 @@ internal class PessimisticTransaction : Transaction
         int len = Encoding.UTF8.GetByteCount(name);
         if (len < 1 || len > 512) throw Invalid("Transaction name length must be between 1 and 512 chars.");
         _name = name;
-        // A reused transaction object is often given the same name again: keep its encoding.
-        if (_lastNameBytes is null || !string.Equals(_lastName, name, StringComparison.Ordinal))
-        {
-            _lastName = name;
-            _lastNameBytes = Encoding.UTF8.GetBytes(name);
-        }
-        _nameBytes = _lastNameBytes;
+        // Encoded into a buffer the object keeps (names are at most 512 bytes), so that a reused transaction object
+        // does not allocate per name.
+        if (_nameBuffer is null || _nameBuffer.Length < len) _nameBuffer = new byte[Math.Max(len, Math.Min(512, Math.Max(32, (_nameBuffer?.Length ?? 0) * 2)))];
+        _nameLength = Encoding.UTF8.GetBytes(name, _nameBuffer);
         if (!_txnDb.RegisterTransaction(this))
         {
             _name = null;
-            _nameBytes = null;
+            _nameLength = 0;
             throw Invalid("Duplicate txn name " + name);
         }
     }
+
+    /// <summary>The UTF-8 encoding of the transaction's name (empty when it has none).</summary>
+    private protected ReadOnlySpan<byte> NameBytes => _nameBuffer.AsSpan(0, _nameLength);
 
     private protected static RocksDbException Invalid(string msg) => new(StatusCode.InvalidArgument, "Invalid argument: " + msg);
 
@@ -345,6 +348,7 @@ internal class PessimisticTransaction : Transaction
         return AfterRangeLockAsync(t, cfd.Id, left, right);
     }
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<RocksDbException?> AfterRangeLockAsync(ValueTask<RocksDbException?> t, uint cf, byte[] left, byte[] right)
     {
         RocksDbException? s = await t.ConfigureAwait(false);
@@ -352,6 +356,7 @@ internal class PessimisticTransaction : Transaction
         return s;
     }
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<RocksDbException?> AfterLockAsync(ValueTask<RocksDbException?> t, ColumnFamilyData cfd, byte[] key, bool readOnly, bool exclusive,
         bool doValidate, bool assumeTracked, bool previouslyLocked, bool lockUpgrade, ulong trackedAtSeq)
     {
@@ -487,8 +492,8 @@ internal class PessimisticTransaction : Transaction
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private protected virtual async ValueTask PrepareInternalAsync(bool synchronous, CancellationToken cancellationToken)
     {
-        _batch.Batch.MarkEndPrepare(_nameBytes!, writeAfterCommit: true, unpreparedBatch: false);
-        WriteOptions wo = _writeOptions.DisableWal ? CloneWithWal(_writeOptions) : _writeOptions;
+        _batch.Batch.MarkEndPrepare(NameBytes, writeAfterCommit: true, unpreparedBatch: false);
+        WriteOptions wo = _writeOptions.DisableWal ? WithWal(_writeOptions) : _writeOptions;
         _writeContext.Reset();
         _writeContext.DisableMemtable = true;
         _writeContext.MarkLogContainingPrepSection = true;
@@ -504,16 +509,25 @@ internal class PessimisticTransaction : Transaction
         }
     }
 
-    private protected static WriteOptions CloneWithWal(WriteOptions o) => new()
+    private WriteOptions? _withWalOptions;
+
+    /// <summary>
+    /// The transaction's write options with the WAL enabled, for a prepare (WriteCommittedTxn::PrepareInternal copies
+    /// write_options_ and clears disableWAL). Filled into an instance the transaction keeps; the copy is only used for
+    /// the duration of one write.
+    /// </summary>
+    private protected WriteOptions WithWal(WriteOptions o)
     {
-        Sync = o.Sync,
-        DisableWal = false,
-        IgnoreMissingColumnFamilies = o.IgnoreMissingColumnFamilies,
-        NoSlowdown = o.NoSlowdown,
-        LowPri = o.LowPri,
-        MemtableInsertHintPerBatch = o.MemtableInsertHintPerBatch,
-        ProtectionBytesPerKey = o.ProtectionBytesPerKey,
-    };
+        WriteOptions w = _withWalOptions ??= new WriteOptions();
+        w.Sync = o.Sync;
+        w.DisableWal = false;
+        w.IgnoreMissingColumnFamilies = o.IgnoreMissingColumnFamilies;
+        w.NoSlowdown = o.NoSlowdown;
+        w.LowPri = o.LowPri;
+        w.MemtableInsertHintPerBatch = o.MemtableInsertHintPerBatch;
+        w.ProtectionBytesPerKey = o.ProtectionBytesPerKey;
+        return w;
+    }
 
     private protected static RocksDbException Expired() => new(StatusCode.Expired, "Operation expired: ");
 
@@ -622,8 +636,8 @@ internal class PessimisticTransaction : Transaction
         // We take the commit-time batch and append the Commit marker. The Memtable will ignore the Commit marker in
         // non-recovery mode.
         WriteBatch marker = WorkingCommitBatch();
-        if (commitTs is null) marker.MarkCommit(_nameBytes!);
-        else marker.MarkCommitWithTimestamp(_nameBytes!, commitTs);
+        if (commitTs is null) marker.MarkCommit(NameBytes);
+        else marker.MarkCommitWithTimestamp(NameBytes, commitTs);
         _writeContext.Reset();
         if (marker.Count == 0)
         {
@@ -654,7 +668,7 @@ internal class PessimisticTransaction : Transaction
     private protected virtual ValueTask RollbackInternalAsync(bool synchronous, CancellationToken cancellationToken)
     {
         WriteBatch marker = MarkerBatch();
-        marker.MarkRollback(_nameBytes!);
+        marker.MarkRollback(NameBytes);
         return _db.WriteAsync(_writeOptions, marker, validateColumnFamilies: false, txn: null, synchronous, cancellationToken);
     }
 
