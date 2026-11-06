@@ -212,104 +212,306 @@ public sealed class TableProperties
         if (LsmInfoAtCreation != 0) b.Add(TablePropertiesNames.LsmInfoAtCreation, LsmInfoAtCreation);
     }
 
-    /// <summary>Port of ParsePropertiesBlock (table/meta_blocks.cc). <paramref name="blockOffset"/> is the file offset of the block.</summary>
+    /// <summary>
+    /// Port of ParsePropertiesBlock (table/meta_blocks.cc). <paramref name="blockOffset"/> is the file offset of the block.
+    /// Runs for every table file a DB opens (after each flush, compaction output and ingestion), so it avoids per-property
+    /// garbage: names are matched as UTF-8 bytes against the known names (no key strings), and string values (comparator,
+    /// compression, column family, DB and session ids, ...), which are the same for most files of a DB, are interned
+    /// (<see cref="Utf8StringCache"/>). Only user-collected values and the seqno-to-time mapping are copied.
+    /// </summary>
     internal static TableProperties Parse(Block block, ulong blockOffset)
     {
         var props = new TableProperties();
         using var it = new BlockIter();
         it.InitializeMeta(block);
-        byte[]? lastKey = null;
-        for (it.SeekToFirst(); it.Valid; it.Next())
+        Span<byte> lastKeyStack = stackalloc byte[128];
+        byte[]? lastKeyRented = null;
+        Span<byte> lastKeyBuf = lastKeyStack;
+        int lastKeyLength = -1;
+        try
         {
-            ReadOnlySpan<byte> keyBytes = it.Key;
-            if (lastKey is not null && keyBytes.SequenceCompareTo(lastKey) <= 0) ThrowHelper.Corruption("properties unsorted");
-            lastKey = keyBytes.ToArray();
-            string key = Encoding.UTF8.GetString(keyBytes);
-            ReadOnlySpan<byte> raw = it.Value;
-            if (key == TablePropertiesNames.ExternalSstFileGlobalSeqno) props.ExternalSstFileGlobalSeqnoOffset = blockOffset + (ulong)it.ValueOffsetInBlock;
-            if (TrySetUInt64(props, key, raw, out bool known))
+            for (it.SeekToFirst(); it.Valid; it.Next())
             {
-                if (key == TablePropertiesNames.DeletedKeys || key == TablePropertiesNames.MergeOperands)
-                    props.UserCollectedProperties[key] = raw.ToArray(); // API backwards compatibility
-                continue;
+                ReadOnlySpan<byte> keyBytes = it.Key;
+                if (lastKeyLength >= 0 && keyBytes.SequenceCompareTo(lastKeyBuf[..lastKeyLength]) <= 0) ThrowHelper.Corruption("properties unsorted");
+                if (keyBytes.Length > lastKeyBuf.Length)
+                {
+                    if (lastKeyRented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(lastKeyRented);
+                    lastKeyRented = System.Buffers.ArrayPool<byte>.Shared.Rent(keyBytes.Length);
+                    lastKeyBuf = lastKeyRented;
+                }
+                keyBytes.CopyTo(lastKeyBuf);
+                lastKeyLength = keyBytes.Length;
+                int known = FindKnownProperty(keyBytes);
+                PropertyId id = known >= 0 ? s_knownProperties[known].Id : PropertyId.UserCollected;
+                ReadOnlySpan<byte> raw = it.Value;
+                if (id == PropertyId.ExternalSstFileGlobalSeqno) props.ExternalSstFileGlobalSeqnoOffset = blockOffset + (ulong)it.ValueOffsetInBlock;
+                if (id < PropertyId.FirstString)
+                {
+                    ReadOnlySpan<byte> input = raw;
+                    // A malformed predefined uint64 value is skipped (logged upstream).
+                    if (!Coding.GetVarint64(ref input, out ulong value)) continue;
+                    SetUInt64(props, id, value);
+                    if (id is PropertyId.DeletedKeys or PropertyId.MergeOperands)
+                        props.UserCollectedProperties[s_knownProperties[known].Name] = raw.ToArray(); // API backwards compatibility
+                    continue;
+                }
+                switch (id)
+                {
+                    case PropertyId.DbId: props.DbId = Utf8StringCache.Get(raw); break;
+                    case PropertyId.DbSessionId: props.DbSessionId = Utf8StringCache.Get(raw); break;
+                    case PropertyId.DbHostId: props.DbHostId = Utf8StringCache.Get(raw); break;
+                    case PropertyId.FilterPolicy: props.FilterPolicyName = Utf8StringCache.Get(raw); break;
+                    case PropertyId.ColumnFamilyName: props.ColumnFamilyName = Utf8StringCache.Get(raw); break;
+                    case PropertyId.Comparator: props.ComparatorName = Utf8StringCache.Get(raw); break;
+                    case PropertyId.MergeOperator: props.MergeOperatorName = Utf8StringCache.Get(raw); break;
+                    case PropertyId.PrefixExtractorName: props.PrefixExtractorName = Utf8StringCache.Get(raw); break;
+                    case PropertyId.PropertyCollectors: props.PropertyCollectorsNames = Utf8StringCache.Get(raw); break;
+                    case PropertyId.Compression: props.CompressionName = Utf8StringCache.Get(raw); break;
+                    case PropertyId.CompressionOptions: props.CompressionOptions = Utf8StringCache.Get(raw); break;
+                    case PropertyId.SequenceNumberTimeMapping: props.SequenceNumberTimeMapping = raw.ToArray(); break;
+                    default:
+                        props.UserCollectedProperties[known >= 0 ? s_knownProperties[known].Name : Utf8StringCache.Get(keyBytes)] = raw.ToArray();
+                        break;
+                }
             }
-            if (known) continue; // malformed predefined uint64 value: skipped (logged upstream)
-            switch (key)
-            {
-                case TablePropertiesNames.DbId: props.DbId = Utf8(raw); break;
-                case TablePropertiesNames.DbSessionId: props.DbSessionId = Utf8(raw); break;
-                case TablePropertiesNames.DbHostId: props.DbHostId = Utf8(raw); break;
-                case TablePropertiesNames.FilterPolicy: props.FilterPolicyName = Utf8(raw); break;
-                case TablePropertiesNames.ColumnFamilyName: props.ColumnFamilyName = Utf8(raw); break;
-                case TablePropertiesNames.Comparator: props.ComparatorName = Utf8(raw); break;
-                case TablePropertiesNames.MergeOperator: props.MergeOperatorName = Utf8(raw); break;
-                case TablePropertiesNames.PrefixExtractorName: props.PrefixExtractorName = Utf8(raw); break;
-                case TablePropertiesNames.PropertyCollectors: props.PropertyCollectorsNames = Utf8(raw); break;
-                case TablePropertiesNames.Compression: props.CompressionName = Utf8(raw); break;
-                case TablePropertiesNames.CompressionOptions: props.CompressionOptions = Utf8(raw); break;
-                case TablePropertiesNames.SequenceNumberTimeMapping: props.SequenceNumberTimeMapping = raw.ToArray(); break;
-                default: props.UserCollectedProperties[key] = raw.ToArray(); break;
-            }
+        }
+        finally
+        {
+            if (lastKeyRented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(lastKeyRented);
         }
         return props;
     }
 
-    private static string Utf8(ReadOnlySpan<byte> raw) => Encoding.UTF8.GetString(raw);
-
-    private static bool TrySetUInt64(TableProperties p, string key, ReadOnlySpan<byte> raw, out bool known)
+    /// <summary>The properties <see cref="Parse"/> recognises: the predefined uint64 ones (up to <see cref="FirstString"/>), then strings, then the rest.</summary>
+    private enum PropertyId : byte
     {
-        known = true;
-        Action<TableProperties, ulong>? setter = key switch
+        OriginalFileNumber,
+        DataSize,
+        UncompressedDataSize,
+        LsmInfoAtCreation,
+        IndexSize,
+        IndexPartitions,
+        TopLevelIndexSize,
+        IndexKeyIsUserKey,
+        IndexValueIsDeltaEncoded,
+        UdiIsPrimaryIndex,
+        StandardIndexIsStub,
+        FilterSize,
+        RawKeySize,
+        RawValueSize,
+        NumDataBlocks,
+        NumDataBlocksCompressionRejected,
+        NumDataBlocksCompressionBypassed,
+        NumUniformBlocks,
+        NumEntries,
+        NumFilterEntries,
+        DeletedKeys,
+        MergeOperands,
+        NumRangeDeletions,
+        FormatVersion,
+        FixedKeyLen,
+        ColumnFamilyId,
+        CreationTime,
+        OldestKeyTime,
+        NewestKeyTime,
+        FileCreationTime,
+        SlowCompressionEstimatedDataSize,
+        FastCompressionEstimatedDataSize,
+        TailStartOffset,
+        UserDefinedTimestampsPersisted,
+        KeyLargestSeqno,
+        KeySmallestSeqno,
+        DataBlockRestartInterval,
+        IndexBlockRestartInterval,
+        SeparateKeyValueInDataBlock,
+        /// <summary>First string-valued property.</summary>
+        FirstString,
+        DbId = FirstString,
+        DbSessionId,
+        DbHostId,
+        FilterPolicy,
+        ColumnFamilyName,
+        Comparator,
+        MergeOperator,
+        PrefixExtractorName,
+        PropertyCollectors,
+        Compression,
+        CompressionOptions,
+        SequenceNumberTimeMapping,
+        ExternalSstFileGlobalSeqno,
+        /// <summary>Stored in <see cref="UserCollectedProperties"/> (a known name: its string is not allocated).</summary>
+        UserCollected,
+    }
+
+    private readonly struct KnownProperty(string name, PropertyId id)
+    {
+        public readonly byte[] Utf8 = Encoding.UTF8.GetBytes(name);
+        public readonly string Name = name;
+        public readonly PropertyId Id = id;
+    }
+
+    /// <summary>Known property names, sorted bytewise (like the properties block) for <see cref="FindKnownProperty"/>.</summary>
+    private static readonly KnownProperty[] s_knownProperties = SortKnown(
+    [
+        new(TablePropertiesNames.OriginalFileNumber, PropertyId.OriginalFileNumber),
+        new(TablePropertiesNames.DataSize, PropertyId.DataSize),
+        new(TablePropertiesNames.UncompressedDataSize, PropertyId.UncompressedDataSize),
+        new(TablePropertiesNames.LsmInfoAtCreation, PropertyId.LsmInfoAtCreation),
+        new(TablePropertiesNames.IndexSize, PropertyId.IndexSize),
+        new(TablePropertiesNames.IndexPartitions, PropertyId.IndexPartitions),
+        new(TablePropertiesNames.TopLevelIndexSize, PropertyId.TopLevelIndexSize),
+        new(TablePropertiesNames.IndexKeyIsUserKey, PropertyId.IndexKeyIsUserKey),
+        new(TablePropertiesNames.IndexValueIsDeltaEncoded, PropertyId.IndexValueIsDeltaEncoded),
+        new(TablePropertiesNames.UdiIsPrimaryIndex, PropertyId.UdiIsPrimaryIndex),
+        new(TablePropertiesNames.StandardIndexIsStub, PropertyId.StandardIndexIsStub),
+        new(TablePropertiesNames.FilterSize, PropertyId.FilterSize),
+        new(TablePropertiesNames.RawKeySize, PropertyId.RawKeySize),
+        new(TablePropertiesNames.RawValueSize, PropertyId.RawValueSize),
+        new(TablePropertiesNames.NumDataBlocks, PropertyId.NumDataBlocks),
+        new(TablePropertiesNames.NumDataBlocksCompressionRejected, PropertyId.NumDataBlocksCompressionRejected),
+        new(TablePropertiesNames.NumDataBlocksCompressionBypassed, PropertyId.NumDataBlocksCompressionBypassed),
+        new(TablePropertiesNames.NumUniformBlocks, PropertyId.NumUniformBlocks),
+        new(TablePropertiesNames.NumEntries, PropertyId.NumEntries),
+        new(TablePropertiesNames.NumFilterEntries, PropertyId.NumFilterEntries),
+        new(TablePropertiesNames.DeletedKeys, PropertyId.DeletedKeys),
+        new(TablePropertiesNames.MergeOperands, PropertyId.MergeOperands),
+        new(TablePropertiesNames.NumRangeDeletions, PropertyId.NumRangeDeletions),
+        new(TablePropertiesNames.FormatVersion, PropertyId.FormatVersion),
+        new(TablePropertiesNames.FixedKeyLen, PropertyId.FixedKeyLen),
+        new(TablePropertiesNames.ColumnFamilyId, PropertyId.ColumnFamilyId),
+        new(TablePropertiesNames.CreationTime, PropertyId.CreationTime),
+        new(TablePropertiesNames.OldestKeyTime, PropertyId.OldestKeyTime),
+        new(TablePropertiesNames.NewestKeyTime, PropertyId.NewestKeyTime),
+        new(TablePropertiesNames.FileCreationTime, PropertyId.FileCreationTime),
+        new(TablePropertiesNames.SlowCompressionEstimatedDataSize, PropertyId.SlowCompressionEstimatedDataSize),
+        new(TablePropertiesNames.FastCompressionEstimatedDataSize, PropertyId.FastCompressionEstimatedDataSize),
+        new(TablePropertiesNames.TailStartOffset, PropertyId.TailStartOffset),
+        new(TablePropertiesNames.UserDefinedTimestampsPersisted, PropertyId.UserDefinedTimestampsPersisted),
+        new(TablePropertiesNames.KeyLargestSeqno, PropertyId.KeyLargestSeqno),
+        new(TablePropertiesNames.KeySmallestSeqno, PropertyId.KeySmallestSeqno),
+        new(TablePropertiesNames.DataBlockRestartInterval, PropertyId.DataBlockRestartInterval),
+        new(TablePropertiesNames.IndexBlockRestartInterval, PropertyId.IndexBlockRestartInterval),
+        new(TablePropertiesNames.SeparateKeyValueInDataBlock, PropertyId.SeparateKeyValueInDataBlock),
+        new(TablePropertiesNames.DbId, PropertyId.DbId),
+        new(TablePropertiesNames.DbSessionId, PropertyId.DbSessionId),
+        new(TablePropertiesNames.DbHostId, PropertyId.DbHostId),
+        new(TablePropertiesNames.FilterPolicy, PropertyId.FilterPolicy),
+        new(TablePropertiesNames.ColumnFamilyName, PropertyId.ColumnFamilyName),
+        new(TablePropertiesNames.Comparator, PropertyId.Comparator),
+        new(TablePropertiesNames.MergeOperator, PropertyId.MergeOperator),
+        new(TablePropertiesNames.PrefixExtractorName, PropertyId.PrefixExtractorName),
+        new(TablePropertiesNames.PropertyCollectors, PropertyId.PropertyCollectors),
+        new(TablePropertiesNames.Compression, PropertyId.Compression),
+        new(TablePropertiesNames.CompressionOptions, PropertyId.CompressionOptions),
+        new(TablePropertiesNames.SequenceNumberTimeMapping, PropertyId.SequenceNumberTimeMapping),
+        new(TablePropertiesNames.ExternalSstFileGlobalSeqno, PropertyId.ExternalSstFileGlobalSeqno),
+        new(TablePropertiesNames.TimestampMin, PropertyId.UserCollected),
+        new(TablePropertiesNames.TimestampMax, PropertyId.UserCollected),
+        new(TablePropertiesNames.BlockBasedIndexType, PropertyId.UserCollected),
+        new(TablePropertiesNames.EmbeddedBlobSstStats, PropertyId.UserCollected),
+        new(TablePropertiesNames.BlockBasedWholeKeyFiltering, PropertyId.UserCollected),
+        new(TablePropertiesNames.BlockBasedPrefixFiltering, PropertyId.UserCollected),
+        new(TablePropertiesNames.BlockBasedDecoupledPartitionedFilters, PropertyId.UserCollected),
+        new(TablePropertiesNames.ExternalSstFileVersion, PropertyId.UserCollected),
+    ]);
+
+    private static KnownProperty[] SortKnown(KnownProperty[] a)
+    {
+        Array.Sort(a, static (x, y) => x.Utf8.AsSpan().SequenceCompareTo(y.Utf8));
+        return a;
+    }
+
+    /// <summary>Index of <paramref name="name"/> in <see cref="s_knownProperties"/>, or -1.</summary>
+    private static int FindKnownProperty(ReadOnlySpan<byte> name)
+    {
+        KnownProperty[] k = s_knownProperties;
+        int lo = 0, hi = k.Length - 1;
+        while (lo <= hi)
         {
-            TablePropertiesNames.OriginalFileNumber => static (p, v) => p.OriginalFileNumber = v,
-            TablePropertiesNames.DataSize => static (p, v) => p.DataSize = v,
-            TablePropertiesNames.UncompressedDataSize => static (p, v) => p.UncompressedDataSize = v,
-            TablePropertiesNames.LsmInfoAtCreation => static (p, v) => p.LsmInfoAtCreation = v,
-            TablePropertiesNames.IndexSize => static (p, v) => p.IndexSize = v,
-            TablePropertiesNames.IndexPartitions => static (p, v) => p.IndexPartitions = v,
-            TablePropertiesNames.TopLevelIndexSize => static (p, v) => p.TopLevelIndexSize = v,
-            TablePropertiesNames.IndexKeyIsUserKey => static (p, v) => p.IndexKeyIsUserKey = v,
-            TablePropertiesNames.IndexValueIsDeltaEncoded => static (p, v) => p.IndexValueIsDeltaEncoded = v,
-            TablePropertiesNames.UdiIsPrimaryIndex => static (p, v) => p.UdiIsPrimaryIndex = v,
-            TablePropertiesNames.StandardIndexIsStub => static (p, v) => p.StandardIndexIsStub = v,
-            TablePropertiesNames.FilterSize => static (p, v) => p.FilterSize = v,
-            TablePropertiesNames.RawKeySize => static (p, v) => p.RawKeySize = v,
-            TablePropertiesNames.RawValueSize => static (p, v) => p.RawValueSize = v,
-            TablePropertiesNames.NumDataBlocks => static (p, v) => p.NumDataBlocks = v,
-            TablePropertiesNames.NumDataBlocksCompressionRejected => static (p, v) => p.NumDataBlocksCompressionRejected = v,
-            TablePropertiesNames.NumDataBlocksCompressionBypassed => static (p, v) => p.NumDataBlocksCompressionBypassed = v,
-            TablePropertiesNames.NumUniformBlocks => static (p, v) => p.NumUniformBlocks = v,
-            TablePropertiesNames.NumEntries => static (p, v) => p.NumEntries = v,
-            TablePropertiesNames.NumFilterEntries => static (p, v) => p.NumFilterEntries = v,
-            TablePropertiesNames.DeletedKeys => static (p, v) => p.NumDeletions = v,
-            TablePropertiesNames.MergeOperands => static (p, v) => p.NumMergeOperands = v,
-            TablePropertiesNames.NumRangeDeletions => static (p, v) => p.NumRangeDeletions = v,
-            TablePropertiesNames.FormatVersion => static (p, v) => p.FormatVersion = v,
-            TablePropertiesNames.FixedKeyLen => static (p, v) => p.FixedKeyLen = v,
-            TablePropertiesNames.ColumnFamilyId => static (p, v) => p.ColumnFamilyId = v,
-            TablePropertiesNames.CreationTime => static (p, v) => p.CreationTime = v,
-            TablePropertiesNames.OldestKeyTime => static (p, v) => p.OldestKeyTime = v,
-            TablePropertiesNames.NewestKeyTime => static (p, v) => p.NewestKeyTime = v,
-            TablePropertiesNames.FileCreationTime => static (p, v) => p.FileCreationTime = v,
-            TablePropertiesNames.SlowCompressionEstimatedDataSize => static (p, v) => p.SlowCompressionEstimatedDataSize = v,
-            TablePropertiesNames.FastCompressionEstimatedDataSize => static (p, v) => p.FastCompressionEstimatedDataSize = v,
-            TablePropertiesNames.TailStartOffset => static (p, v) => p.TailStartOffset = v,
-            TablePropertiesNames.UserDefinedTimestampsPersisted => static (p, v) => p.UserDefinedTimestampsPersisted = v,
-            TablePropertiesNames.KeyLargestSeqno => static (p, v) => p.KeyLargestSeqno = v,
-            TablePropertiesNames.KeySmallestSeqno => static (p, v) => p.KeySmallestSeqno = v,
-            TablePropertiesNames.DataBlockRestartInterval => static (p, v) => p.DataBlockRestartInterval = v,
-            TablePropertiesNames.IndexBlockRestartInterval => static (p, v) => p.IndexBlockRestartInterval = v,
-            TablePropertiesNames.SeparateKeyValueInDataBlock => static (p, v) => p.SeparateKeyValueInDataBlock = v,
-            _ => null,
-        };
-        if (setter is null)
-        {
-            known = false;
-            return false;
+            int mid = (lo + hi) >>> 1;
+            int c = name.SequenceCompareTo(k[mid].Utf8);
+            if (c == 0) return mid;
+            if (c < 0) hi = mid - 1;
+            else lo = mid + 1;
         }
-        if (!Coding.GetVarint64(ref raw, out ulong value)) return false;
-        setter(p, value);
-        return true;
+        return -1;
+    }
+
+    private static void SetUInt64(TableProperties p, PropertyId id, ulong v)
+    {
+        switch (id)
+        {
+            case PropertyId.OriginalFileNumber: p.OriginalFileNumber = v; break;
+            case PropertyId.DataSize: p.DataSize = v; break;
+            case PropertyId.UncompressedDataSize: p.UncompressedDataSize = v; break;
+            case PropertyId.LsmInfoAtCreation: p.LsmInfoAtCreation = v; break;
+            case PropertyId.IndexSize: p.IndexSize = v; break;
+            case PropertyId.IndexPartitions: p.IndexPartitions = v; break;
+            case PropertyId.TopLevelIndexSize: p.TopLevelIndexSize = v; break;
+            case PropertyId.IndexKeyIsUserKey: p.IndexKeyIsUserKey = v; break;
+            case PropertyId.IndexValueIsDeltaEncoded: p.IndexValueIsDeltaEncoded = v; break;
+            case PropertyId.UdiIsPrimaryIndex: p.UdiIsPrimaryIndex = v; break;
+            case PropertyId.StandardIndexIsStub: p.StandardIndexIsStub = v; break;
+            case PropertyId.FilterSize: p.FilterSize = v; break;
+            case PropertyId.RawKeySize: p.RawKeySize = v; break;
+            case PropertyId.RawValueSize: p.RawValueSize = v; break;
+            case PropertyId.NumDataBlocks: p.NumDataBlocks = v; break;
+            case PropertyId.NumDataBlocksCompressionRejected: p.NumDataBlocksCompressionRejected = v; break;
+            case PropertyId.NumDataBlocksCompressionBypassed: p.NumDataBlocksCompressionBypassed = v; break;
+            case PropertyId.NumUniformBlocks: p.NumUniformBlocks = v; break;
+            case PropertyId.NumEntries: p.NumEntries = v; break;
+            case PropertyId.NumFilterEntries: p.NumFilterEntries = v; break;
+            case PropertyId.DeletedKeys: p.NumDeletions = v; break;
+            case PropertyId.MergeOperands: p.NumMergeOperands = v; break;
+            case PropertyId.NumRangeDeletions: p.NumRangeDeletions = v; break;
+            case PropertyId.FormatVersion: p.FormatVersion = v; break;
+            case PropertyId.FixedKeyLen: p.FixedKeyLen = v; break;
+            case PropertyId.ColumnFamilyId: p.ColumnFamilyId = v; break;
+            case PropertyId.CreationTime: p.CreationTime = v; break;
+            case PropertyId.OldestKeyTime: p.OldestKeyTime = v; break;
+            case PropertyId.NewestKeyTime: p.NewestKeyTime = v; break;
+            case PropertyId.FileCreationTime: p.FileCreationTime = v; break;
+            case PropertyId.SlowCompressionEstimatedDataSize: p.SlowCompressionEstimatedDataSize = v; break;
+            case PropertyId.FastCompressionEstimatedDataSize: p.FastCompressionEstimatedDataSize = v; break;
+            case PropertyId.TailStartOffset: p.TailStartOffset = v; break;
+            case PropertyId.UserDefinedTimestampsPersisted: p.UserDefinedTimestampsPersisted = v; break;
+            case PropertyId.KeyLargestSeqno: p.KeyLargestSeqno = v; break;
+            case PropertyId.KeySmallestSeqno: p.KeySmallestSeqno = v; break;
+            case PropertyId.DataBlockRestartInterval: p.DataBlockRestartInterval = v; break;
+            case PropertyId.IndexBlockRestartInterval: p.IndexBlockRestartInterval = v; break;
+            case PropertyId.SeparateKeyValueInDataBlock: p.SeparateKeyValueInDataBlock = v; break;
+        }
+    }
+
+    /// <summary>
+    /// Process-wide intern cache for the UTF-8 strings of table properties: direct-mapped by hash, lock-free (entries are
+    /// immutable; a racing replacement only costs a decode). Values longer than <see cref="MaxLength"/> bytes are not cached.
+    /// </summary>
+    internal static class Utf8StringCache
+    {
+        private const int Slots = 256;
+        internal const int MaxLength = 512;
+        private static readonly Entry?[] s_entries = new Entry?[Slots];
+
+        private sealed class Entry(byte[] utf8, string value)
+        {
+            public readonly byte[] Utf8 = utf8;
+            public readonly string Value = value;
+        }
+
+        /// <summary>The string for <paramref name="utf8"/> (same result as <see cref="Encoding.UTF8"/>.GetString).</summary>
+        public static string Get(ReadOnlySpan<byte> utf8)
+        {
+            if (utf8.IsEmpty) return "";
+            if (utf8.Length > MaxLength) return Encoding.UTF8.GetString(utf8);
+            int slot = (int)(Hash.Hash64(utf8) & (Slots - 1));
+            Entry? e = Volatile.Read(ref s_entries[slot]);
+            if (e is not null && utf8.SequenceEqual(e.Utf8)) return e.Value;
+            string value = Encoding.UTF8.GetString(utf8);
+            Volatile.Write(ref s_entries[slot], new Entry(utf8.ToArray(), value));
+            return value;
+        }
     }
 
     /// <summary>Gets a user-collected property as a UTF-8 string, or null.</summary>

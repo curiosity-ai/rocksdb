@@ -141,14 +141,23 @@ internal sealed partial class VersionStorageInfo
     {
         FileMetaData[] l0 = _files[0];
         if (l0.Length <= 1) return true;
-        var sorted = (FileMetaData[])l0.Clone();
         InternalKeyComparator icmp = Icmp;
-        Array.Sort(sorted, (a, b) => icmp.Compare(a.Smallest, b.Smallest));
-        for (int i = 1; i < sorted.Length; i++)
+        FileMetaData[] rented = System.Buffers.ArrayPool<FileMetaData>.Shared.Rent(l0.Length);
+        try
         {
-            if (icmp.CompareUserKey(DbFormat.ExtractUserKey(sorted[i - 1].Largest), DbFormat.ExtractUserKey(sorted[i].Smallest)) >= 0) return false;
+            Span<FileMetaData> sorted = rented.AsSpan(0, l0.Length);
+            l0.CopyTo(sorted);
+            sorted.Sort(new SmallestKeyComparer(icmp));
+            for (int i = 1; i < sorted.Length; i++)
+            {
+                if (icmp.CompareUserKey(DbFormat.ExtractUserKey(sorted[i - 1].Largest), DbFormat.ExtractUserKey(sorted[i].Smallest)) >= 0) return false;
+            }
+            return true;
         }
-        return true;
+        finally
+        {
+            System.Buffers.ArrayPool<FileMetaData>.Shared.Return(rented, clearArray: true);
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------------
@@ -709,25 +718,13 @@ internal sealed partial class VersionStorageInfo
             switch (_options.CompactionPri)
             {
                 case CompactionPri.ByCompensatedSize:
-                    Array.Sort(temp, (a, b) =>
-                    {
-                        int r = CompensatedFileSize(files[b]).CompareTo(CompensatedFileSize(files[a]));
-                        return r != 0 ? r : a.CompareTo(b);
-                    });
+                    temp.AsSpan().Sort(new FileIndexComparer(files, FileIndexOrder.LargestCompensatedSizeFirst));
                     break;
                 case CompactionPri.OldestLargestSeqFirst:
-                    Array.Sort(temp, (a, b) =>
-                    {
-                        int r = files[a].LargestSeqno.CompareTo(files[b].LargestSeqno);
-                        return r != 0 ? r : a.CompareTo(b);
-                    });
+                    temp.AsSpan().Sort(new FileIndexComparer(files, FileIndexOrder.OldestLargestSeqFirst));
                     break;
                 case CompactionPri.OldestSmallestSeqFirst:
-                    Array.Sort(temp, (a, b) =>
-                    {
-                        int r = files[a].SmallestSeqno.CompareTo(files[b].SmallestSeqno);
-                        return r != 0 ? r : a.CompareTo(b);
-                    });
+                    temp.AsSpan().Sort(new FileIndexComparer(files, FileIndexOrder.OldestSmallestSeqFirst));
                     break;
                 case CompactionPri.MinOverlappingRatio:
                     SortFileByOverlappingRatio(level, files, _files[level + 1], temp);
@@ -744,7 +741,7 @@ internal sealed partial class VersionStorageInfo
     private void SortFileByOverlappingRatio(int level, FileMetaData[] files, FileMetaData[] nextLevelFiles, int[] temp)
     {
         InternalKeyComparator icmp = Icmp;
-        var order = new ulong[files.Length];
+        ulong[] order = System.Buffers.ArrayPool<ulong>.Shared.Rent(files.Length);
         int next = 0;
         for (int i = 0; i < files.Length; i++)
         {
@@ -761,15 +758,8 @@ internal sealed partial class VersionStorageInfo
             ulong compensated = Math.Max(1UL, CompensatedFileSize(file));
             order[i] = overlappingBytes * 1024UL / compensated;
         }
-        Array.Sort(temp, (a, b) =>
-        {
-            // If score is the same, pick file with smaller keys (more deterministic, helps trivial moves).
-            FileMetaData fa = files[a], fb = files[b];
-            if (fa.MarkedForCompaction != fb.MarkedForCompaction) return fa.MarkedForCompaction ? -1 : 1;
-            if (order[a] != order[b]) return order[a].CompareTo(order[b]);
-            int r = icmp.Compare(fa.Smallest, fb.Smallest);
-            return r != 0 ? r : a.CompareTo(b);
-        });
+        temp.AsSpan().Sort(new OverlappingRatioComparer(files, order, icmp));
+        System.Buffers.ArrayPool<ulong>.Shared.Return(order);
         _ = level;
     }
 
@@ -780,14 +770,10 @@ internal sealed partial class VersionStorageInfo
         if (level == 0 && !Level0NonOverlapping)
         {
             // Using kOldestSmallestSeqFirst when level === 0, since the files may overlap (not fully sorted).
-            Array.Sort(temp, (a, b) =>
-            {
-                int r = files[a].SmallestSeqno.CompareTo(files[b].SmallestSeqno);
-                return r != 0 ? r : a.CompareTo(b);
-            });
+            temp.AsSpan().Sort(new FileIndexComparer(files, FileIndexOrder.OldestSmallestSeqFirst));
             return;
         }
-        if (level == 0) Array.Sort(temp, (a, b) => icmp.Compare(files[a].Smallest, files[b].Smallest));
+        if (level == 0) temp.AsSpan().Sort(new IndexBySmallestKeyComparer(files, icmp));
         byte[]? cursor = GetCompactCursor(level);
         if (cursor is null || cursor.Length == 0 || temp.Length <= 1) return;
         // Find the file whose smallest key is >= the cursor.
@@ -799,6 +785,56 @@ internal sealed partial class VersionStorageInfo
         for (int i = start; i < temp.Length; i++) rotated[k++] = temp[i];
         for (int i = 0; i < start; i++) rotated[k++] = temp[i];
         rotated.CopyTo(temp, 0);
+    }
+
+    // Comparers of the sorts above (struct comparers instead of capturing lambdas: no closure and delegate per sort).
+
+    private enum FileIndexOrder : byte
+    {
+        LargestCompensatedSizeFirst,
+        OldestLargestSeqFirst,
+        OldestSmallestSeqFirst,
+    }
+
+    /// <summary>File indexes by a per-file number, ties by index (kByCompensatedSize, kOldestLargestSeqFirst, kOldestSmallestSeqFirst).</summary>
+    private readonly struct FileIndexComparer(FileMetaData[] files, FileIndexOrder order) : IComparer<int>
+    {
+        public int Compare(int a, int b)
+        {
+            int r = order switch
+            {
+                FileIndexOrder.LargestCompensatedSizeFirst => CompensatedFileSize(files[b]).CompareTo(CompensatedFileSize(files[a])),
+                FileIndexOrder.OldestLargestSeqFirst => files[a].LargestSeqno.CompareTo(files[b].LargestSeqno),
+                _ => files[a].SmallestSeqno.CompareTo(files[b].SmallestSeqno),
+            };
+            return r != 0 ? r : a.CompareTo(b);
+        }
+    }
+
+    /// <summary>SortFileByOverlappingRatio's order: marked for compaction first, then by ratio, smallest key, index.</summary>
+    private readonly struct OverlappingRatioComparer(FileMetaData[] files, ulong[] order, InternalKeyComparator icmp) : IComparer<int>
+    {
+        public int Compare(int a, int b)
+        {
+            // If score is the same, pick file with smaller keys (more deterministic, helps trivial moves).
+            FileMetaData fa = files[a], fb = files[b];
+            if (fa.MarkedForCompaction != fb.MarkedForCompaction) return fa.MarkedForCompaction ? -1 : 1;
+            if (order[a] != order[b]) return order[a].CompareTo(order[b]);
+            int r = icmp.Compare(fa.Smallest, fb.Smallest);
+            return r != 0 ? r : a.CompareTo(b);
+        }
+    }
+
+    /// <summary>File indexes by the files' smallest internal key.</summary>
+    private readonly struct IndexBySmallestKeyComparer(FileMetaData[] files, InternalKeyComparator icmp) : IComparer<int>
+    {
+        public int Compare(int a, int b) => icmp.Compare(files[a].Smallest, files[b].Smallest);
+    }
+
+    /// <summary>Files by smallest internal key.</summary>
+    private readonly struct SmallestKeyComparer(InternalKeyComparator icmp) : IComparer<FileMetaData>
+    {
+        public int Compare(FileMetaData? a, FileMetaData? b) => icmp.Compare(a!.Smallest, b!.Smallest);
     }
 
     // ---------------------------------------------------------------------------------------------------------

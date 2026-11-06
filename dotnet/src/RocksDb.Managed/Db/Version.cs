@@ -141,42 +141,103 @@ internal sealed partial class VersionStorageInfo
     /// <summary>
     /// Port of VersionBuilder::Apply + SaveTo (db/version_builder.cc): returns the file lists after applying
     /// <paramref name="edit"/> to this version. Throws Corruption for inconsistent edits.
+    /// <para>
+    /// The per-level arrays are immutable, so a level the edit does not touch keeps this version's array (as long as it
+    /// is in the order SaveTo produces); only the changed levels get a new array (like VersionBuilder, which only
+    /// rebuilds the levels with added or deleted files).
+    /// </para>
     /// </summary>
     public FileMetaData[][] ApplyEdit(VersionEdit edit, int numLevels)
     {
         int levels = numLevels;
         foreach (NewFileEntry nf in edit.NewFiles) levels = Math.Max(levels, nf.Level + 1);
-        var lists = new List<FileMetaData>[levels];
-        for (int l = 0; l < levels; l++)
-        {
-            lists[l] = l < NumLevels ? new List<FileMetaData>(_files[l]) : new List<FileMetaData>();
-        }
+        Span<int> changes = levels <= 64 ? stackalloc int[levels] : new int[levels];
+        changes.Clear();
         foreach ((int level, ulong number) in edit.DeletedFiles)
         {
-            if (level >= levels || lists[level].RemoveAll(f => f.FileNumber == number) == 0)
-            {
-                ThrowHelper.Corruption("VersionBuilder: Cannot delete table file #" + number.ToString(CultureInfo.InvariantCulture) +
-                                       " from level " + level.ToString(CultureInfo.InvariantCulture) + " since it is not in the LSM tree");
-            }
+            if (level >= levels || level >= NumLevels || IndexOfFile(_files[level], number) < 0) ThrowCannotDelete(level, number);
+            changes[level]++;
         }
-        foreach (NewFileEntry nf in edit.NewFiles) lists[nf.Level].Add(nf.Meta);
+        foreach (NewFileEntry nf in edit.NewFiles) changes[nf.Level]++;
         var result = new FileMetaData[levels][];
+        FileSmallestKeyComparer? bySmallest = null;
         for (int l = 0; l < levels; l++)
         {
-            List<FileMetaData> files = lists[l];
-            if (l == 0) files.Sort(static (a, b) => CompareNewestFirst(a, b));
-            else
+            FileMetaData[] current = l < NumLevels ? _files[l] : s_empty;
+            if (changes[l] == 0 && IsSortedForLevel(l, current))
             {
-                InternalKeyComparator icmp = Icmp;
-                files.Sort((a, b) =>
-                {
-                    int r = icmp.Compare(a.Smallest, b.Smallest);
-                    return r != 0 ? r : a.FileNumber.CompareTo(b.FileNumber);
-                });
+                result[l] = current;
+                continue;
             }
-            result[l] = files.ToArray();
+            FileMetaData[] scratch = System.Buffers.ArrayPool<FileMetaData>.Shared.Rent(Math.Max(1, current.Length + changes[l]));
+            int n = current.Length;
+            current.CopyTo(scratch, 0);
+            if (changes[l] != 0)
+            {
+                foreach ((int level, ulong number) in edit.DeletedFiles)
+                {
+                    if (level != l) continue;
+                    int i = IndexOfFile(scratch.AsSpan(0, n), number);
+                    if (i < 0) ThrowCannotDelete(level, number);
+                    Array.Copy(scratch, i + 1, scratch, i, n - i - 1);
+                    n--;
+                }
+                foreach (NewFileEntry nf in edit.NewFiles)
+                {
+                    if (nf.Level == l) scratch[n++] = nf.Meta;
+                }
+            }
+            Span<FileMetaData> files = scratch.AsSpan(0, n);
+            if (l == 0) files.Sort(s_newestFirst);
+            else files.Sort(bySmallest ??= new FileSmallestKeyComparer(Icmp));
+            result[l] = n == 0 ? s_empty : files.ToArray();
+            System.Buffers.ArrayPool<FileMetaData>.Shared.Return(scratch, clearArray: true);
         }
         return result;
+    }
+
+    private static int IndexOfFile(ReadOnlySpan<FileMetaData> files, ulong number)
+    {
+        for (int i = 0; i < files.Length; i++)
+        {
+            if (files[i].FileNumber == number) return i;
+        }
+        return -1;
+    }
+
+    private static void ThrowCannotDelete(int level, ulong number) =>
+        ThrowHelper.Corruption("VersionBuilder: Cannot delete table file #" + number.ToString(CultureInfo.InvariantCulture) +
+                               " from level " + level.ToString(CultureInfo.InvariantCulture) + " since it is not in the LSM tree");
+
+    /// <summary>Whether <paramref name="files"/> is already in the order <see cref="ApplyEdit"/> sorts level <paramref name="level"/> into.</summary>
+    private bool IsSortedForLevel(int level, FileMetaData[] files)
+    {
+        for (int i = 1; i < files.Length; i++)
+        {
+            int c = level == 0 ? CompareNewestFirst(files[i - 1], files[i]) : FileSmallestKeyComparer.Compare(Icmp, files[i - 1], files[i]);
+            if (c > 0) return false;
+        }
+        return true;
+    }
+
+    private static readonly NewestFirstComparer s_newestFirst = new();
+
+    /// <summary>L0 order: NewestFirstByEpochNumber (<see cref="CompareNewestFirst"/>).</summary>
+    private sealed class NewestFirstComparer : IComparer<FileMetaData>
+    {
+        public int Compare(FileMetaData? a, FileMetaData? b) => CompareNewestFirst(a!, b!);
+    }
+
+    /// <summary>Order of levels 1+: by smallest internal key, then by file number (BySmallestKey).</summary>
+    private sealed class FileSmallestKeyComparer(InternalKeyComparator icmp) : IComparer<FileMetaData>
+    {
+        public int Compare(FileMetaData? a, FileMetaData? b) => Compare(icmp, a!, b!);
+
+        public static int Compare(InternalKeyComparator icmp, FileMetaData a, FileMetaData b)
+        {
+            int r = icmp.Compare(a.Smallest, b.Smallest);
+            return r != 0 ? r : a.FileNumber.CompareTo(b.FileNumber);
+        }
     }
 
     /// <summary>

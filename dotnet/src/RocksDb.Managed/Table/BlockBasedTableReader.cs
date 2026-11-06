@@ -2117,8 +2117,8 @@ public sealed partial class BlockBasedTableReader : TableReader
 
 
         byte[]? fb = Interlocked.Exchange(ref _filterBuffer, null);
-        // The pinned full filter (never set when the filter is held by the block cache) is rented from the table buffers.
-        if (fb is not null) TableBuilderBuffers.Bytes.Return(fb);
+        // The pinned full filter (never set when the filter is held by the block cache) is rented from the pinned table buffers.
+        if (fb is not null) TableBuilderBuffers.Return(BlockBufferSource.TableBuffers, fb);
         _file.Dispose();
     }
 
