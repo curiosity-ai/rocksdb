@@ -204,6 +204,130 @@ public sealed class DbBasicTests
         }
     }
 
+    /// <summary>
+    /// DBImpl::ThrottleLowPriWritesIfNeeded: while compaction needs to speed up (the write controller holds a stop,
+    /// delay or compaction pressure token), a low_pri write with no_slowdown fails with Incomplete "Low priority
+    /// write stall", a low_pri write without it goes through the low-priority rate limiter, and normal writes are
+    /// unaffected. With 2PC, commit and rollback markers are exempt. The compaction pressure comes from two L0 files
+    /// (GetL0FileCountForCompactionSpeedup: min(2 * trigger, trigger + (slowdown - trigger) / 4) = 2 with trigger 1);
+    /// auto compactions are disabled so they stay, without a slowdown.
+    /// </summary>
+    [TestMethod]
+    public async Task LowPriWritesAreThrottledUnderCompactionPressure()
+    {
+        MemoryFileSystem fs = NewFs();
+        var cf = new ColumnFamilyOptions { DisableAutoCompactions = true, Level0FileNumCompactionTrigger = 1 };
+        var lowPriNoSlowdown = new WriteOptions { LowPri = true, NoSlowdown = true };
+        DbOptions o = NewOptions(fs);
+        o.Allow2Pc = true;
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, o, cf))
+        {
+            db.Put(B("normal"), B("1"));
+            db.Flush();
+            db.Put(lowPriNoSlowdown, B("lowpri"), B("0")); // one L0 file: no pressure yet
+            // The second flush installs a version with two L0 files: RecalculateWriteStallConditions takes the
+            // compaction pressure token.
+            db.Flush();
+            db.Put(new WriteOptions { NoSlowdown = true }, B("normal2"), B("1"));
+            RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() => db.Put(lowPriNoSlowdown, B("lowpri"), B("1")));
+            Assert.AreEqual(StatusCode.Incomplete, e.Code);
+            StringAssert.Contains(e.Message, "Low priority write stall");
+            Assert.AreEqual("0", GetString(db, "lowpri"));
+            // Rate limited, not rejected (sync and async).
+            db.Put(new WriteOptions { LowPri = true }, B("lowpri"), B("2"));
+            await db.PutAsync(new WriteOptions { LowPri = true }, B("lowpri-async"), B("3"));
+            Assert.AreEqual("2", GetString(db, "lowpri"));
+            Assert.AreEqual("3", GetString(db, "lowpri-async"));
+            // For 2PC, we only rate limit prepare, not commit.
+            using (var commit = new WriteBatch())
+            {
+                commit.MarkCommit(B("xid"));
+                commit.Put(B("committed"), B("4"));
+                db.Write(lowPriNoSlowdown, commit);
+            }
+            Assert.AreEqual("4", GetString(db, "committed"));
+        }
+        // Without compaction pressure low_pri writes are not throttled.
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions()))
+        {
+            db.Put(lowPriNoSlowdown, B("lowpri"), B("5"));
+            Assert.AreEqual("5", GetString(db, "lowpri"));
+        }
+    }
+
+    /// <summary>
+    /// Port of DBBasicTest.DisallowMemtableWrite (db_basic_test.cc): writes to a disallow_memtable_writes column family
+    /// fail with InvalidArgument (single writes and batches; the rest of the DB stays writable), ingestion still works,
+    /// an open fails while the WAL holds writes to a column family that now sets the option, and the default column
+    /// family cannot set it. The option round-trips through the OPTIONS text.
+    /// </summary>
+    [TestMethod]
+    public void DisallowMemtableWrites()
+    {
+        MemoryFileSystem fs = NewFs();
+        fs.CreateDirectoryIfMissing("/ext");
+        var allow = new ColumnFamilyOptions();
+        var disallow = new ColumnFamilyOptions { DisallowMemtableWrites = true };
+        Assert.AreEqual("true", disallow.GetOption("disallow_memtable_writes"));
+        var parsed = new ColumnFamilyOptions();
+        parsed.SetOption("disallow_memtable_writes", "true", preserveUnknown: false);
+        Assert.IsTrue(parsed.DisallowMemtableWrites);
+        Assert.IsTrue(disallow.Clone().DisallowMemtableWrites);
+        DbOptions o = NewOptions(fs);
+        o.CreateMissingColumnFamilies = true;
+        ColumnFamilyDescriptor[] Cfs(ColumnFamilyOptions cf2, ColumnFamilyOptions cf3) =>
+            [new("default", allow), new("cf1", allow), new("cf2", cf2), new("cf3", cf3)];
+        const string Msg = "This column family has disallow_memtable_writes=true";
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, o, Cfs(allow, disallow)))
+        {
+            ColumnFamily cf1 = db.GetColumnFamily("cf1"), cf2 = db.GetColumnFamily("cf2"), cf3 = db.GetColumnFamily("cf3");
+            db.Put(B("a0"), B("1"));
+            cf1.Put(B("a1"), B("1"));
+            cf2.Put(B("a2"), B("1"));
+            RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() => cf3.Put(B("a3"), B("1")));
+            Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+            StringAssert.Contains(e.Message, Msg);
+            Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(() => cf3.Delete(B("z3"))).Code);
+            using (var wb = new WriteBatch())
+            {
+                wb.Put(cf3.Id, B("b3"), B("2"));
+                Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(() => db.Write(wb)).Code);
+                Assert.AreEqual(StatusCode.InvalidArgument,
+                    Assert.ThrowsExactly<RocksDbException>(() => db.Write(new WriteOptions { IgnoreMissingColumnFamilies = true }, wb)).Code);
+            }
+            // The DB is still writable (no background error).
+            db.Put(B("b0"), B("2"));
+            Assert.IsNull(db.BackgroundError);
+            Assert.IsNull(GetString(cf3, "a3"));
+            // Ingestion populates the column family.
+            string sst = "/ext/cf3.sst";
+            using (var w = new SstFileWriter(disallow, fs))
+            {
+                w.Open(sst);
+                w.Put(B("i3"), B("ingested"));
+                w.Finish();
+            }
+            db.IngestExternalFiles(cf3, [sst], new IngestExternalFileOptions());
+            Assert.AreEqual("ingested", GetString(cf3, "i3"));
+        }
+        // When the DB is re-opened with WAL entries for a CF that is newly setting disallow_memtable_writes, the open fails.
+        RocksDbException open = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbPath, o, Cfs(disallow, allow)).Dispose());
+        Assert.AreEqual(StatusCode.InvalidArgument, open.Code);
+        StringAssert.Contains(open.Message, Msg);
+        // Successfully opening with allow creates L0 files from the WAL; then cf2 can disallow.
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, o, Cfs(allow, allow))) Assert.AreEqual("1", GetString(db.GetColumnFamily("cf2"), "a2"));
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, o, Cfs(disallow, allow)))
+        {
+            Assert.AreEqual("1", GetString(db.GetColumnFamily("cf2"), "a2"));
+            db.GetColumnFamily("cf3").Put(B("c3"), B("3"));
+            Assert.AreEqual(StatusCode.InvalidArgument, Assert.ThrowsExactly<RocksDbException>(() => db.GetColumnFamily("cf2").Put(B("c2"), B("3"))).Code);
+        }
+        // disallow_memtable_writes not supported on default column family.
+        RocksDbException def = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open("/other", NewOptions(fs), disallow).Dispose());
+        Assert.AreEqual(StatusCode.InvalidArgument, def.Code);
+        StringAssert.Contains(def.Message, "Default column family cannot use disallow_memtable_writes=true");
+    }
+
     [TestMethod]
     public void CrashDropsOnlyUnsyncedWrites()
     {

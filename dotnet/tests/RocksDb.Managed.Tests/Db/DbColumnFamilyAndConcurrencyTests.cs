@@ -791,4 +791,76 @@ public sealed class DbColumnFamilyAndConcurrencyTests
         }
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new WriteOptions { MemtableInsertParallelism = 0 });
     }
+    /// <summary>
+    /// WriteThread::EnterAsBatchGroupLeader (write_thread.cc): writers incompatible with the leader (a sync write behind a
+    /// non-sync leader, different no_slowdown / disableWAL / protection_bytes_per_key, an unbatched writer, a group that
+    /// would grow too big) are moved to the r_list and stay queued in order, while compatible writers behind them still
+    /// join the group. The first skipped writer leads next.
+    /// </summary>
+    [TestMethod]
+    public void WriteGroupTakesCompatibleWritersBehindIncompatibleOnes()
+    {
+        var wt = new WriteThread(maxWriteBatchGroupSizeBytes: 1 << 20, maxYieldMicros: 0);
+        var batches = new List<WriteBatch>();
+        WriteThread.Writer NewWriter(WriteOptions? o, bool batched = true, int valueSize = 1)
+        {
+            WriteBatch? b = null;
+            if (batched)
+            {
+                b = new WriteBatch();
+                b.Put(B("k"), new byte[valueSize]);
+                if (o is { ProtectionBytesPerKey: not 0 }) b.UpdateProtectionInfo((int)o.ProtectionBytesPerKey);
+                batches.Add(b);
+            }
+            var w = new WriteThread.Writer();
+            w.Prepare(b, o, syncWaiter: true);
+            return w;
+        }
+        try
+        {
+            WriteThread.Writer leader = NewWriter(null);
+            Assert.IsTrue(wt.JoinBatchGroup(leader));
+            WriteThread.Writer sync = NewWriter(new WriteOptions { Sync = true });
+            WriteThread.Writer c1 = NewWriter(null);
+            WriteThread.Writer noSlowdown = NewWriter(new WriteOptions { NoSlowdown = true });
+            WriteThread.Writer c2 = NewWriter(null);
+            WriteThread.Writer noWal = NewWriter(new WriteOptions { DisableWal = true });
+            WriteThread.Writer protectedW = NewWriter(new WriteOptions { ProtectionBytesPerKey = 8 });
+            WriteThread.Writer unbatched = NewWriter(null, batched: false);
+            WriteThread.Writer big = NewWriter(null, valueSize: 200 << 10); // beyond leader size + max/8
+            WriteThread.Writer c3 = NewWriter(null);
+            WriteThread.Writer[] queued = [sync, c1, noSlowdown, c2, noWal, protectedW, unbatched, big, c3];
+            foreach (WriteThread.Writer w in queued) Assert.IsFalse(wt.JoinBatchGroup(w));
+            var group = new List<WriteThread.Writer>();
+            wt.EnterAsBatchGroupLeader(leader, group);
+            CollectionAssert.AreEqual(new[] { leader, c1, c2, c3 }, group);
+            wt.ExitAsBatchGroupLeader(group);
+            foreach (WriteThread.Writer w in new[] { c1, c2, c3 }) Assert.AreEqual(WriteThread.StateCompleted, w.SyncState);
+            // The skipped writers keep their order: the sync writer leads next and takes no one (all others differ).
+            Assert.AreEqual(WriteThread.StateGroupLeader, sync.SyncState);
+            WriteThread.Writer[] rest = [noSlowdown, noWal, protectedW, unbatched, big];
+            foreach (WriteThread.Writer w in rest) Assert.AreEqual(0, w.SyncState);
+            wt.EnterAsBatchGroupLeader(sync, group);
+            // A sync leader may take non-sync writers, but every remaining one differs in another way (or is too big).
+            CollectionAssert.AreEqual(new[] { sync }, group);
+            wt.ExitAsBatchGroupLeader(group);
+            WriteThread.Writer current = noSlowdown;
+            foreach (WriteThread.Writer next in new[] { noWal, protectedW, unbatched, big })
+            {
+                Assert.AreEqual(WriteThread.StateGroupLeader, current.SyncState);
+                wt.EnterAsBatchGroupLeader(current, group);
+                CollectionAssert.AreEqual(new[] { current }, group);
+                wt.ExitAsBatchGroupLeader(group);
+                current = next;
+            }
+            Assert.AreEqual(WriteThread.StateGroupLeader, big.SyncState);
+            wt.EnterAsBatchGroupLeader(big, group);
+            CollectionAssert.AreEqual(new[] { big }, group);
+            wt.ExitAsBatchGroupLeader(group);
+        }
+        finally
+        {
+            foreach (WriteBatch b in batches) b.Dispose();
+        }
+    }
 }
