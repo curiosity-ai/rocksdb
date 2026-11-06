@@ -1550,6 +1550,24 @@ The trie matches the binary-search index within noise for Get and Seek, and allo
 recycled through a per-thread slot (the table's IndexCursor creates one per lookup), and the trie's arrays are decoded
 once when the table is opened.
 
+## Custom transaction mutexes: point-lock cost with and without a factory (2026-11-06)
+
+`PointLockBenchmarks` (BenchmarkDotNet default job, net10.0, loaded 4-core VM): a pessimistic WriteCommitted
+transaction reused through `BeginTransaction(..., old)`, locking 4 random keys (GetForUpdate of missing keys, or Put
+into its batch) and rolling back, per transaction. "Before" is the previous `PointLockManager.cs` (the `CustomDefault`
+row there runs the built-in path too, since the old manager ignores the factory); "after" adds the
+`TransactionDbOptions.CustomMutexFactory` path (one null test per TryLock / UnLock on the default path).
+
+| Benchmark | before (2 runs) | after, built-in (2 runs) | after, `TransactionDbMutexFactory.Default` |
+|---|---:|---:|---:|
+| Begin + 4 GetForUpdate (missing) + Rollback | 1,104 / 1,159 ns | 1,151 / 1,174 ns | 1,521 / 1,533 ns |
+| Begin + 4 Put + Rollback | 976 / 986 ns | 966 / 1,004 ns | 1,363 / 1,469 ns |
+
+Allocated is `-` in every cell. The built-in path is unchanged within the run-to-run noise (+-70 ns stddev); a custom
+factory costs ~90 ns per lock + unlock pair (virtual mutex calls, `Lock` + generation-counting condvar, NotifyAll on
+every unlock as upstream). The existing `TransactionBenchmarks` (Begin + 4 Put + Commit, WAL-bound ~20 us on this
+machine) do not resolve lock-manager costs, hence the dedicated benchmark.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
