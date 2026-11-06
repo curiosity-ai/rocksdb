@@ -329,6 +329,23 @@ using (Iterator it = await db.NewIteratorAsync(null))
 }
 ```
 
+An iterator can be reused for many scans: `Refresh()` / `Refresh(snapshot)` / `RefreshAsync()` (upstream
+`Iterator::Refresh`) move it to the latest state (or another snapshot), and `SetBounds(lower, upper)` replaces its
+iterate bounds. Disposed iterators also return their internal iterator stack to a small per-column-family pool, so
+`using var it = db.NewIterator(ro)` per request does not rebuild one either (see [docs/allocations.md](docs/allocations.md#iterators)).
+
+<!-- snippet:iterator-reuse -->
+```csharp
+// One long-lived iterator for many short scans: SetBounds changes the range, Refresh moves it to the latest
+// state (or Refresh(snapshot)). Both keep the iterator's internal stack and allocate nothing.
+using Iterator scanner = db.NewIterator();
+scanner.SetBounds("a"u8.ToArray(), "c"u8.ToArray());
+for (scanner.SeekToFirst(); scanner.Valid; scanner.Next()) { /* a, b */ }
+db.Put("bb"u8, "BB"u8);
+scanner.Refresh();                                   // sees "bb" now; unpositioned until the next seek
+for (scanner.SeekToFirst(); scanner.Valid; scanner.Next()) { /* a, b, bb */ }
+```
+
 ### Snapshots
 
 <!-- snippet:snapshots -->
