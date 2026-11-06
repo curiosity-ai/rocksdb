@@ -117,7 +117,8 @@ public abstract partial class Transaction : IDisposable
     public void SetSnapshot()
     {
         ThrowIfDisposed();
-        Snapshot s = _database.GetSnapshot();
+        // TransactionBaseImpl::SetSnapshot: a write-conflict-boundary snapshot (WritePreparedTxn::SetSnapshot too).
+        Snapshot s = _database.Impl.GetSnapshotForWriteConflictBoundary();
         _ownedSnapshots.Add(s);
         _snapshot = s;
         _snapshotNeeded = false;

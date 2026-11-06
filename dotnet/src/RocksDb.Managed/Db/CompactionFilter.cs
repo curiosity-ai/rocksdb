@@ -135,9 +135,13 @@ public abstract class CompactionFilter
         IBufferWriter<byte> skipUntil) => CompactionFilterDecision.Undetermined;
 
     /// <summary>
-    /// Port of IgnoreSnapshots. Upstream only supports true (filtering may hide versions still visible to snapshots).
+    /// Port of IgnoreSnapshots. Only true is supported (like upstream): a compaction or flush whose filter returns
+    /// false fails with NotSupported.
     /// </summary>
     public virtual bool IgnoreSnapshots => true;
+
+    /// <summary>The NotSupported message of CompactionJob::SetupAndValidateCompactionFilter and BuildTable.</summary>
+    internal const string IgnoreSnapshotsFalseMessage = "CompactionFilter::IgnoreSnapshots() = false is not supported anymore.";
 }
 
 /// <summary>Port of CompactionFilter::Context: information about the compaction a filter is created for.</summary>

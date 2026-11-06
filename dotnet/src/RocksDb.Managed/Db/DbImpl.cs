@@ -317,17 +317,34 @@ internal sealed partial class DbImpl : IAsyncDisposable
 
     public Snapshot GetSnapshot()
     {
-        if (_txnHooks is { } hooks) return hooks.GetSnapshot();
-        return GetSnapshotImpl();
+        if (_txnHooks is { } hooks) return hooks.GetSnapshot(isWriteConflictBoundary: false);
+        return GetSnapshotImpl(isWriteConflictBoundary: false);
+    }
+
+    /// <summary>
+    /// DBImpl::GetSnapshotForWriteConflictBoundary: a snapshot that transactions use for write-conflict checking.
+    /// Compaction does not drop a SingleDelete + Put pair newer than the oldest such snapshot, so the conflict check
+    /// still sees the write (CompactionIterator earliest_write_conflict_snapshot).
+    /// </summary>
+    internal Snapshot GetSnapshotForWriteConflictBoundary()
+    {
+        if (_txnHooks is { } hooks) return hooks.GetSnapshot(isWriteConflictBoundary: true);
+        return GetSnapshotImpl(isWriteConflictBoundary: true);
     }
 
     /// <summary>DBImpl::GetSnapshotImpl: a snapshot at the last sequence (without transaction-DB enhancements).</summary>
-    internal Snapshot GetSnapshotImpl()
+    internal Snapshot GetSnapshotImpl() => GetSnapshotImpl(isWriteConflictBoundary: false);
+
+    /// <summary>DBImpl::GetSnapshotImpl(is_write_conflict_boundary).</summary>
+    internal Snapshot GetSnapshotImpl(bool isWriteConflictBoundary)
     {
         ThrowIfDisposed();
         lock (_mutex)
         {
-            var s = new Snapshot(this, LastPublishedSequence, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            var s = new Snapshot(this, LastPublishedSequence, DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+            {
+                IsWriteConflictBoundary = isWriteConflictBoundary,
+            };
             _snapshots.Add(s);
             return s;
         }

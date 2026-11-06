@@ -533,6 +533,15 @@ internal sealed partial class DbImpl
         return a;
     }
 
+    /// <summary>
+    /// The oldest live write-conflict-boundary snapshot (kMaxSequenceNumber if none), as SnapshotList::GetAll reports
+    /// it in oldest_write_conflict_snapshot. REQUIRES: mutex.
+    /// </summary>
+    private ulong OldestWriteConflictSnapshot()
+    {
+        return _snapshots.OldestWriteConflictSequence();
+    }
+
     /// <summary>Live snapshot sequence numbers, ascending. REQUIRES: mutex.</summary>
     private ulong[] SnapshotsForCompaction()
     {
@@ -802,6 +811,11 @@ internal sealed partial class DbImpl
                 SnapshotChecker? checker = CurrentSnapshotChecker;
                 Snapshot? jobSnapshot = null;
                 ulong[] jobSnapshots = snapshots;
+                // LoadSnapshots(&snapshot_seqs, &earliest_write_conflict_snapshot): the oldest transaction snapshot. A
+                // write-conflict-boundary snapshot taken after the snapshot list was loaded is newer than every input
+                // entry, so reading it here instead of with the list keeps every pair the conflict check can need.
+                ulong earliestWriteConflict;
+                lock (_mutex) earliestWriteConflict = OldestWriteConflictSnapshot();
                 if (checker is not null)
                 {
                     // GetSnapshotContext: the snapshot list is taken with the job snapshot, not when the compaction was
@@ -835,6 +849,7 @@ internal sealed partial class DbImpl
                     {
                         SnapshotChecker = checker,
                         JobSnapshot = jobSnapshot?.SequenceNumber ?? 0,
+                        EarliestWriteConflictSnapshot = earliestWriteConflict,
                         AcquireSubcompactionResources = n => AcquireSubcompactionResources(n, bottom),
                         ReleaseSubcompactionResources = n => ReleaseSubcompactionResources(n, bottom),
                     };

@@ -73,6 +73,12 @@ internal sealed class CompactionJob
     /// <summary>The snapshot taken for this job when there is a snapshot checker (job_snapshot).</summary>
     internal ulong JobSnapshot { get; init; }
 
+    /// <summary>
+    /// JobContext::earliest_write_conflict_snapshot: the oldest write-conflict-boundary (transaction) snapshot
+    /// (kMaxSequenceNumber if none), loaded with the snapshot list (DBImpl::LoadSnapshots).
+    /// </summary>
+    internal ulong EarliestWriteConflictSnapshot { get; init; } = DbFormat.MaxSequenceNumber;
+
     public CompactionJob(DbImpl db, ColumnFamilyData cfd, Compaction compaction, ulong[] snapshots, Func<ulong> newFileNumber,
         CancellationToken cancellation)
         : this(db, cfd, compaction, snapshots, newFileNumber, cancellation, null, null, 0)
@@ -506,6 +512,7 @@ internal sealed class CompactionJob
             {
                 SnapshotChecker = SnapshotChecker,
                 JobSnapshot = JobSnapshot,
+                EarliestWriteConflictSnapshot = EarliestWriteConflictSnapshot,
                 OutputDirectory = OutputDirectory,
             });
         }
@@ -664,6 +671,9 @@ internal sealed class CompactionJob
         // BlockCacheLookupContext{kCompaction} of the compaction input reads (scoped to this async method).
         if (_db.BlockCacheTracer.IsEnabled) Tracing.BlockCacheTracer.SetCaller(Tracing.TableReaderCaller.Compaction, 0, default, false);
         long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        // CompactionJob::SetupAndValidateCompactionFilter (compaction_job.cc): before any input is opened.
+        CompactionFilter? filter = _c.CreateCompactionFilter(_cfd.Id);
+        if (filter is not null && !filter.IgnoreSnapshots) ThrowHelper.NotSupported(CompactionFilter.IgnoreSnapshotsFalseMessage);
         bool isPart = _subStart is not null || _subEnd is not null;
         Stats.NumInputFiles = isPart ? 0 : _c.TotalInputFiles;
         Stats.BytesRead = isPart ? 0 : _c.TotalInputBytes;
@@ -708,11 +718,10 @@ internal sealed class CompactionJob
             FragmentedRangeTombstoneList frag = FragmentedRangeTombstoneList.Build(_cfd.UserComparator, raw);
             _outputTombstones = frag.IsEmpty ? null : frag;
         }
-        CompactionFilter? filter = _c.CreateCompactionFilter(_cfd.Id);
         MergeOperator? mergeOperator = _cfd.MergeOperator;
         ulong latestSnapshot = _snapshots.Length == 0 ? 0 : _snapshots[^1];
         MergeHelper? merge = mergeOperator is null ? null : new MergeHelper(_icmp, mergeOperator, filter, latestSnapshot, _c.StartLevel);
-        ulong earliestWriteConflict = DbFormat.MaxSequenceNumber;
+        ulong earliestWriteConflict = EarliestWriteConflictSnapshot;
         if (merge is not null)
         {
             merge.FullHistoryTsLow = fullHistoryTsLow;
