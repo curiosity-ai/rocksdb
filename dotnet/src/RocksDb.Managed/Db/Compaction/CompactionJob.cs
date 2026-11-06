@@ -66,6 +66,7 @@ internal sealed class CompactionJob
     private ulong _proximalAfterSeqno = DbFormat.MaxSequenceNumber;
 
     private readonly bool _targetFileSizeIsUpperBound;
+    private readonly bool _enableOutputHash;
 
     /// <summary>The DB's snapshot checker (WritePrepared / WriteUnprepared), or null.</summary>
     internal SnapshotChecker? SnapshotChecker { get; init; }
@@ -121,6 +122,9 @@ internal sealed class CompactionJob
         _proximalOutputs = compaction.SupportsPerKeyPlacement ? new OutputGroup(compaction, isProximalLevel: true, start, end) : null;
         _out = _lastLevelOutputs;
         _targetFileSizeIsUpperBound = compaction.Options.TargetFileSizeIsUpperBound;
+        // CompactionJob::ProcessKeyValueCompaction: enable the output hash if paranoid_file_checks is on or if
+        // verify_output_flags includes kVerifyIteration, so that VerifyOutputFiles() can compare it.
+        _enableOutputHash = compaction.Options.ParanoidFileChecks || (compaction.Options.VerifyOutputFlags & VerifyOutputFlags.Iteration) != 0;
         _preserveSeqnoAfter = _earliestSnapshot;
     }
 
@@ -174,6 +178,9 @@ internal sealed class CompactionJob
         public string? Path;
         public readonly PooledBufferWriter LargestKey = new(64);
         public bool HasPointKey;
+        // OutputValidator::paranoid_hash_ of the open output and the hashes of the finished outputs (parallel to Outputs).
+        public ulong OutputHash;
+        public readonly List<ulong> OutputHashes = new();
         public ulong SmallestPreferredSeqno = DbFormat.MaxSequenceNumber;
 
         // Grandparent tracking.
@@ -782,6 +789,8 @@ internal sealed class CompactionJob
                 }
             }
             _blobGarbageMeter?.AddGarbageTo(BlobFileGarbages);
+            VerifyOutputFiles(_lastLevelOutputs);
+            if (_proximalOutputs is not null) VerifyOutputFiles(_proximalOutputs);
         }
         finally
         {
@@ -793,6 +802,101 @@ internal sealed class CompactionJob
             _lastLevelOutputs.Release();
             _proximalOutputs?.Release();
             Stats.Elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(start);
+        }
+    }
+
+    /// <summary>
+    /// Port of CompactionJob::VerifyOutputFiles (compaction_job.cc) for the outputs of this subcompaction: with
+    /// verify_output_flags (paranoid_file_checks implies kVerifyIteration for local and remote compactions) each output
+    /// is opened (through the table cache for local compactions, like upstream's "verify that the table is usable") and
+    /// read back: kVerifyIteration compares the key/value hash with the one computed while writing (and re-checks the
+    /// key order), kVerifyBlockChecksum reads every data block with checksum verification (the meta blocks were verified
+    /// when the reader opened the file), kVerifyFileChecksum recomputes the file checksum. Mismatches fail the
+    /// compaction with Corruption. Cold path: once per output file.
+    /// </summary>
+    private void VerifyOutputFiles(OutputGroup group)
+    {
+        if (group.Outputs.Count > 0) TestHooks.Invoke("CompactionJob::VerifyOutputFiles:Start");
+        ColumnFamilyOptions o = _c.Options;
+        VerifyOutputFlags flags = o.VerifyOutputFlags;
+        // For backward compatibility
+        if (o.ParanoidFileChecks) flags |= VerifyOutputFlags.Iteration | VerifyOutputFlags.EnableForLocalCompaction | VerifyOutputFlags.EnableForRemoteCompaction;
+        bool remote = OutputDirectory is not null;
+        bool shouldVerify = (flags & (remote ? VerifyOutputFlags.EnableForRemoteCompaction : VerifyOutputFlags.EnableForLocalCompaction)) != 0;
+        if (!shouldVerify || group.Outputs.Count == 0) return;
+        bool verifyIteration = (flags & VerifyOutputFlags.Iteration) != 0;
+        bool verifyBlockChecksum = (flags & VerifyOutputFlags.BlockChecksum) != 0;
+        bool verifyFileChecksum = (flags & VerifyOutputFlags.FileChecksum) != 0 && _db.Options.FileChecksumGenFactory is not null;
+        for (int i = 0; i < group.Outputs.Count; i++)
+        {
+            FileMetaData meta = group.Outputs[i];
+            string path = OutputDirectory is { } dir ? FileNames.MakeTableFileName(dir, meta.FileNumber) : FileNames.TableFileName(_db.DbPaths, meta.FileNumber, meta.PathId);
+            if (verifyIteration || verifyBlockChecksum)
+            {
+                TableReaderLease lease = default;
+                TableReader? owned = null;
+                try
+                {
+                    TableReader reader;
+                    if (remote)
+                    {
+                        IRandomAccessFile f = _db.FileSystem.OpenRandomAccess(path);
+                        try
+                        {
+                            owned = TableReaderFactory.Open(f, _cfd.ReaderOptions with { BlockCache = NoBlockCache.Instance });
+                        }
+                        catch
+                        {
+                            f.Dispose();
+                            throw;
+                        }
+                        reader = owned;
+                    }
+                    else
+                    {
+                        lease = _cfd.TableCache.GetReader(meta);
+                        reader = lease.Reader;
+                    }
+                    ulong hash = 0;
+                    var prev = new PooledBufferWriter(64);
+                    try
+                    {
+                        using InternalIterator it = reader.NewInternalIterator(TableReadFlags.DontFillCache, null, null);
+                        for (it.SeekToFirst(); it.Valid; it.Next())
+                        {
+                            ReadOnlySpan<byte> k = it.Key;
+                            // OutputValidator::Add
+                            if (k.Length < DbFormat.InternalKeyFooterSize) ThrowHelper.Corruption("Compaction tries to write a key without internal bytes.");
+                            if (prev.WrittenCount > 0 && _icmp.Compare(k, prev.WrittenSpan) < 0) ThrowOutOfOrder();
+                            prev.Clear();
+                            prev.Write(k);
+                            if (verifyIteration) hash = Hash.NPHash64(it.Value, Hash.NPHash64(k, hash));
+                        }
+                    }
+                    finally
+                    {
+                        prev.Dispose();
+                    }
+                    if (verifyIteration && hash != group.OutputHashes[i])
+                    {
+                        ThrowHelper.Corruption("Key-value checksum of compaction output doesn't match what was computed when written");
+                    }
+                }
+                finally
+                {
+                    lease.Dispose();
+                    owned?.Dispose();
+                }
+            }
+            if (verifyFileChecksum && meta.FileChecksumFuncName != FileMetaData.UnknownFileChecksumFuncName)
+            {
+                (byte[] checksum, _) = FileChecksumHelper.GenerateOneFileChecksum(_db.FileSystem, path, _db.Options.FileChecksumGenFactory!,
+                    meta.FileChecksumFuncName, null);
+                if (!checksum.AsSpan().SequenceEqual(meta.FileChecksum))
+                {
+                    ThrowHelper.Corruption("File checksum mismatch for compaction output file " + path);
+                }
+            }
         }
     }
 
@@ -870,7 +974,16 @@ internal sealed class CompactionJob
             if (_out.Partitioner is not null) PrepareNewOutputForFirstKey(DbFormat.ExtractUserKey(key));
         }
         ReadOnlySpan<byte> value = iter.Value;
+        // OutputValidator::CanAdd (db/output_validator.cc): one comparison with the previous key of this output file,
+        // which the output keeps as its largest key anyway.
+        if (key.Length < DbFormat.InternalKeyFooterSize) ThrowHelper.Corruption("Compaction tries to write a key without internal bytes.");
+        if (_out.HasPointKey && _icmp.Compare(key, _out.LargestKey.WrittenSpan) < 0) ThrowOutOfOrder();
         _out.Builder!.Add(key, value);
+        if (_enableOutputHash)
+        {
+            // OutputValidator::AddValidated: a rolling 64-bit hash of the keys and values.
+            _out.OutputHash = Hash.NPHash64(value, Hash.NPHash64(key, _out.OutputHash));
+        }
         if (_out.Partitioner is not null && !_out.PartitionerPrefixValid)
         {
             _out.LastKeyForPartitioner!.Clear();
@@ -971,7 +1084,11 @@ internal sealed class CompactionJob
         _out.Builder = TableBuilder.Create(_out.File, _cfd.Format, tbo);
         _out.HasPointKey = false;
         _out.LargestKey.Clear();
+        _out.OutputHash = 0;
     }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowOutOfOrder() => ThrowHelper.Corruption("Compaction sees out-of-order keys.");
 
     /// <summary>
     /// Port of CompactionOutputs::PrepareNewOutputForFirstKey: a new output file starts a fresh partition window; cache
@@ -1083,6 +1200,7 @@ internal sealed class CompactionJob
             meta.UniqueId = new UniqueId64x2(id0, id1);
         }
         _out.Outputs.Add(meta);
+        _out.OutputHashes.Add(_out.OutputHash);
         Stats.NumOutputFiles++;
         Stats.BytesWritten += meta.FileSize;
     }

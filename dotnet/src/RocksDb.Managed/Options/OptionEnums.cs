@@ -1,5 +1,29 @@
 namespace RocksDb.Managed;
 
+/// <summary>
+/// Mirrors rocksdb::VerifyOutputFlags (include/rocksdb/advanced_options.h): what compaction re-checks in its output
+/// files after writing them (verification kinds) and for which compactions (enable bits). Persisted as the
+/// <c>verify_output_flags</c> uint32 option; values are kept identical.
+/// </summary>
+[Flags]
+public enum VerifyOutputFlags : uint
+{
+    /// <summary>kVerifyNone: no verification.</summary>
+    None = 0,
+    /// <summary>kVerifyBlockChecksum: verify block checksums.</summary>
+    BlockChecksum = 1u << 0,
+    /// <summary>kVerifyIteration: iterate the file and compare the key/value hash with the one computed when writing.</summary>
+    Iteration = 1u << 1,
+    /// <summary>kVerifyFileChecksum: recompute the file checksum (needs a file checksum generator).</summary>
+    FileChecksum = 1u << 2,
+    /// <summary>kEnableForLocalCompaction.</summary>
+    EnableForLocalCompaction = 1u << 10,
+    /// <summary>kEnableForRemoteCompaction.</summary>
+    EnableForRemoteCompaction = 1u << 11,
+    /// <summary>kVerifyAll.</summary>
+    All = 0xFFFFFFFF,
+}
+
 /// <summary>Mirrors rocksdb::Temperature (include/rocksdb/types.h). Persisted in the MANIFEST (1 byte).</summary>
 public enum Temperature : byte
 {

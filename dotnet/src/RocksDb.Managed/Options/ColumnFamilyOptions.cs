@@ -246,6 +246,11 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public ulong MaxSequentialSkipInIterations { get; set; } = 8;
     public bool OptimizeFiltersForHits { get; set; }
     public bool ParanoidFileChecks { get; set; }
+    /// <summary>
+    /// verify_output_flags: which checks compaction runs on its output files after writing them, and for which
+    /// compactions (local / remote). <see cref="ParanoidFileChecks"/> implies iteration checks for both. Mutable.
+    /// </summary>
+    public VerifyOutputFlags VerifyOutputFlags { get; set; }
     public bool ForceConsistencyChecks { get; set; } = true;
     public bool ReportBgIoStats { get; set; }
     /// <summary>Seconds; default 30 days (0xfffffffffffffffe "auto" resolves to this for leveled compaction).</summary>
@@ -417,6 +422,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .UInt64("max_sequential_skip_in_iterations", static o => o.MaxSequentialSkipInIterations, static (o, v) => o.MaxSequentialSkipInIterations = v)
         .Bool("optimize_filters_for_hits", static o => o.OptimizeFiltersForHits, static (o, v) => o.OptimizeFiltersForHits = v)
         .Bool("paranoid_file_checks", static o => o.ParanoidFileChecks, static (o, v) => o.ParanoidFileChecks = v)
+        .UInt32("verify_output_flags", static o => (uint)o.VerifyOutputFlags, static (o, v) => o.VerifyOutputFlags = (VerifyOutputFlags)v)
         .Bool("force_consistency_checks", static o => o.ForceConsistencyChecks, static (o, v) => o.ForceConsistencyChecks = v)
         .Bool("report_bg_io_stats", static o => o.ReportBgIoStats, static (o, v) => o.ReportBgIoStats = v)
         .UInt64("ttl", static o => o.Ttl, static (o, v) => o.Ttl = v)

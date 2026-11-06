@@ -405,4 +405,142 @@ public sealed class CompactionReviewFixesTests
         VersionStorageInfo.CheckConsistency(icmp, new[] { new[] { F(2, "x", "z", 5, 10), F(1, "a", "c", 4, 9) } }, [], forceConsistencyChecks: true);
         VersionStorageInfo.CheckConsistency(icmp, l1, [], forceConsistencyChecks: false);
     }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // OutputValidator + paranoid_file_checks / verify_output_flags (output_validator.cc, CompactionJob::VerifyOutputFiles)
+
+    /// <summary>A bytewise comparator whose order can be reversed after data was written (a comparator bug).</summary>
+    private sealed class FlippableComparator : Comparator
+    {
+        public volatile bool Reversed;
+
+        public override string Name => "test.Flippable";
+
+        public override int Compare(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) => Reversed ? b.SequenceCompareTo(a) : a.SequenceCompareTo(b);
+    }
+
+    [TestMethod]
+    public void CompactionSeesOutOfOrderKeys()
+    {
+        MemoryFileSystem fs = NewFs();
+        var cmp = new FlippableComparator();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { Comparator = cmp, DisableAutoCompactions = true });
+        for (int i = 0; i < 20; i++) db.Put(Key(i), Value(i, 0));
+        db.Flush();
+        for (int i = 10; i < 30; i++) db.Put(Key(i), Value(i, 1));
+        db.Flush();
+        // The order changes once the compaction is picked: its input files are read in their stored order.
+        TestHooks.Set("DBImpl::RunCompaction:Start", () => cmp.Reversed = true);
+        RocksDbException ex;
+        try
+        {
+            ex = Assert.ThrowsExactly<RocksDbException>(() => db.CompactRange(s_force, null, null));
+        }
+        finally
+        {
+            TestHooks.Set("DBImpl::RunCompaction:Start", null);
+            cmp.Reversed = false;
+        }
+        Assert.AreEqual(StatusCode.Corruption, ex.Code);
+        StringAssert.Contains(ex.Message, "Compaction sees out-of-order keys.");
+    }
+
+    /// <summary>Fills two overlapping L0 files on a real directory (so the test can corrupt an output on disk).</summary>
+    private static void FillTwoL0Files(RocksDatabase db)
+    {
+        for (int i = 0; i < 300; i++) db.Put(Key(i), Value(i, 0));
+        db.Flush();
+        for (int i = 150; i < 450; i++) db.Put(Key(i), Value(i, 1));
+        db.Flush();
+    }
+
+    /// <summary>Flips a byte of the first data block of every table file not in <paramref name="keep"/>.</summary>
+    private static void CorruptNewTableFiles(string dir, HashSet<string> keep)
+    {
+        foreach (string f in Directory.GetFiles(dir, "*.sst"))
+        {
+            if (keep.Contains(f)) continue;
+            using var s = new FileStream(f, FileMode.Open, FileAccess.ReadWrite);
+            s.Position = 20;
+            int b = s.ReadByte();
+            s.Position = 20;
+            s.WriteByte((byte)(b ^ 0x5a));
+        }
+    }
+
+    [TestMethod]
+    [DataRow(true, VerifyOutputFlags.None)]
+    [DataRow(false, VerifyOutputFlags.Iteration | VerifyOutputFlags.EnableForLocalCompaction)]
+    [DataRow(false, VerifyOutputFlags.BlockChecksum | VerifyOutputFlags.EnableForLocalCompaction)]
+    [DataRow(false, VerifyOutputFlags.FileChecksum | VerifyOutputFlags.EnableForLocalCompaction)]
+    [DataRow(false, VerifyOutputFlags.None)]
+    [DataRow(false, VerifyOutputFlags.All & ~VerifyOutputFlags.EnableForLocalCompaction)]
+    public void VerifyOutputFilesDetectsCorruptedOutput(bool paranoid, VerifyOutputFlags flags)
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "rocksdb-managed-verify-output-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var dbo = new DbOptions { CreateIfMissing = true, FileChecksumGenFactory = FileChecksumGenCrc32cFactory.Instance };
+            var cfo = new ColumnFamilyOptions
+            {
+                DisableAutoCompactions = true,
+                ParanoidFileChecks = paranoid,
+                VerifyOutputFlags = flags,
+                Compression = RocksDb.Managed.Compression.CompressionType.None,
+            };
+            using RocksDatabase db = RocksDatabase.Open(dir, dbo, cfo);
+            FillTwoL0Files(db);
+            var inputs = new HashSet<string>(Directory.GetFiles(dir, "*.sst"));
+            TestHooks.Set("CompactionJob::VerifyOutputFiles:Start", () => CorruptNewTableFiles(dir, inputs));
+            bool verifies = paranoid || (flags & VerifyOutputFlags.EnableForLocalCompaction) != 0 && (flags & (VerifyOutputFlags.Iteration
+                | VerifyOutputFlags.BlockChecksum | VerifyOutputFlags.FileChecksum)) != 0;
+            try
+            {
+                if (verifies)
+                {
+                    var ex = Assert.ThrowsExactly<RocksDbException>(() => db.CompactRange());
+                    Assert.AreEqual(StatusCode.Corruption, ex.Code, ex.Message);
+                }
+                else
+                {
+                    db.CompactRange(); // one L0 -> Lmax compaction: the corruption goes unnoticed until the data is read
+                }
+            }
+            finally
+            {
+                TestHooks.Set("CompactionJob::VerifyOutputFiles:Start", null);
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    /// <summary>Ports of VerifyIterationWithoutParanoidFileChecks / VerifyAllOutputFlagsWithoutParanoidFileChecks.</summary>
+    [TestMethod]
+    [DataRow(VerifyOutputFlags.Iteration | VerifyOutputFlags.EnableForLocalCompaction)]
+    [DataRow(VerifyOutputFlags.BlockChecksum | VerifyOutputFlags.Iteration | VerifyOutputFlags.FileChecksum | VerifyOutputFlags.EnableForLocalCompaction)]
+    public void VerifyOutputFlagsWithoutParanoidFileChecks(VerifyOutputFlags flags)
+    {
+        MemoryFileSystem fs = NewFs();
+        DbOptions dbo = NewOptions(fs);
+        dbo.FileChecksumGenFactory = FileChecksumGenCrc32cFactory.Instance;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, dbo, new ColumnFamilyOptions { DisableAutoCompactions = true, VerifyOutputFlags = flags, TargetFileSizeBase = 4096 });
+        FillTwoL0Files(db);
+        db.CompactRange(s_force, null, null);
+        for (int i = 0; i < 450; i++) CollectionAssert.AreEqual(Value(i, i >= 150 ? 1 : 0), db.Get(Key(i)));
+    }
+
+    [TestMethod]
+    public void VerifyOutputFlagsPersistedAndMutable()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions());
+        db.SetOptions(new Dictionary<string, string> { ["verify_output_flags"] = "1026" });
+        Assert.AreEqual(VerifyOutputFlags.Iteration | VerifyOutputFlags.EnableForLocalCompaction, db.DefaultColumnFamily.Options.VerifyOutputFlags);
+        var cfo = new ColumnFamilyOptions();
+        cfo.SetOption("verify_output_flags", "4294967295", preserveUnknown: false);
+        Assert.AreEqual(VerifyOutputFlags.All, cfo.VerifyOutputFlags);
+    }
 }
