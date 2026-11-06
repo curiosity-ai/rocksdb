@@ -17,6 +17,17 @@ internal sealed class PinnedFilterPartitions : IDisposable
 
     public int Count => _readers.Count;
 
+    /// <summary>Bytes of the pinned partition buffers.</summary>
+    public ulong MemoryUsage
+    {
+        get
+        {
+            ulong n = 0;
+            foreach (byte[] b in _buffers) n += (ulong)b.Length;
+            return n;
+        }
+    }
+
     public bool TryGet(ulong offset, out IFilterBitsReader reader) => _readers.TryGetValue(offset, out reader!);
 
     /// <summary>Reads every partition listed in the top-level filter partition index <paramref name="top"/>.</summary>

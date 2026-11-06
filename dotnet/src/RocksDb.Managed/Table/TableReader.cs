@@ -127,6 +127,12 @@ public abstract class TableReader : IDisposable
     /// <summary>TableReader::ApproximateOffsetOf (plain and cuckoo tables return 0 like upstream).</summary>
     public virtual ulong ApproximateOffsetOf(ReadOnlySpan<byte> internalKey) => 0;
 
+    /// <summary>
+    /// TableReader::ApproximateMemoryUsage: heap bytes the reader keeps outside the block cache (pinned index and
+    /// filter blocks, ...), reported by the "rocksdb.estimate-table-readers-mem" property. 0 by default.
+    /// </summary>
+    public virtual ulong ApproximateMemoryUsage => 0;
+
     /// <summary>TableReader::ApproximateSize (plain and cuckoo tables return 0 like upstream).</summary>
     public virtual ulong ApproximateSize(ReadOnlySpan<byte> startInternalKey, ReadOnlySpan<byte> endInternalKey) => 0;
 

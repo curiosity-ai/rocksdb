@@ -66,6 +66,11 @@ public static class DbProperties
     public const string CurSizeAllMemTables = "rocksdb.cur-size-all-mem-tables";
     /// <summary>Approximate size of all memtables (kSizeAllMemTables).</summary>
     public const string SizeAllMemTables = "rocksdb.size-all-mem-tables";
+    /// <summary>
+    /// Memory used by open table readers outside the block cache, e.g. pinned index and filter blocks
+    /// (kEstimateTableReadersMem).
+    /// </summary>
+    public const string EstimateTableReadersMem = "rocksdb.estimate-table-readers-mem";
     /// <summary>Block cache capacity (kBlockCacheCapacity).</summary>
     public const string BlockCacheCapacity = "rocksdb.block-cache-capacity";
     /// <summary>Block cache usage (kBlockCacheUsage).</summary>

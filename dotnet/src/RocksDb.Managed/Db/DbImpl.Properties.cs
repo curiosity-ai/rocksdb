@@ -35,10 +35,25 @@ internal sealed partial class DbImpl
                 }
             case DbProperties.SizeAllMemTables:
                 {
-                    // Active + immutable memtables (flushed ones are released immediately by the managed port, so this
-                    // equals cur-size-all-mem-tables).
+                    // Active, immutable and flushed-but-still-referenced memtables (pinned by iterators or kept as
+                    // history), like upstream's mem()->ApproximateMemoryUsage() + imm()->ApproximateMemoryUsage().
                     long n = sv.Mem.ApproximateMemoryUsage;
-                    foreach (MemTable m in sv.Imm) n += m.ApproximateMemoryUsage;
+                    var counted = new HashSet<MemTable>(ReferenceEqualityComparer.Instance) { sv.Mem };
+                    foreach (MemTable m in sv.Imm)
+                    {
+                        if (counted.Add(m)) n += m.ApproximateMemoryUsage;
+                    }
+                    lock (_mutex)
+                    {
+                        foreach (MemTable m in cfd.History)
+                        {
+                            if (counted.Add(m)) n += m.ApproximateMemoryUsage;
+                        }
+                        foreach (MemTable m in cfd.FlushedPinnedMemTables)
+                        {
+                            if (counted.Add(m)) n += m.ApproximateMemoryUsage;
+                        }
+                    }
                     value = n.ToString(CultureInfo.InvariantCulture);
                     return true;
                 }
@@ -133,9 +148,23 @@ internal sealed partial class DbImpl
                     value = n.ToString(CultureInfo.InvariantCulture);
                     return true;
                 }
-            case "rocksdb.estimate-table-readers-mem":
-                value = "0";
-                return true;
+            case DbProperties.EstimateTableReadersMem:
+                {
+                    // Version::GetMemoryUsageByTableReaders: TableCache::GetMemoryUsageByTableReader of every live file,
+                    // counting only readers already open (FindTable with no_io = true).
+                    ulong n = 0;
+                    VersionStorageInfo storage = sv.Current.Storage;
+                    for (int l = 0; l < storage.NumLevels; l++)
+                    {
+                        foreach (FileMetaData f in storage.LevelFilesArray(l))
+                        {
+                            if (!cfd.TableCache.TryGetOpenReader(f, out TableReaderLease lease)) continue;
+                            using (lease) n += lease.Reader.ApproximateMemoryUsage;
+                        }
+                    }
+                    value = n.ToString(CultureInfo.InvariantCulture);
+                    return true;
+                }
             case DbProperties.BackgroundErrors:
                 value = ErrorHandler.ErrorCount.ToString(CultureInfo.InvariantCulture);
                 return true;
@@ -178,7 +207,7 @@ internal sealed partial class DbImpl
         return false;
     }
 
-    private Cache.BlockCache? BlockCacheOf(ColumnFamilyData cfd) =>
+    internal Cache.BlockCache? BlockCacheOf(ColumnFamilyData cfd) =>
         cfd.ReaderOptions.BlockCache as Cache.BlockCache ?? (cfd.Options.TableOptions.NoBlockCache ? null : cfd.Options.TableOptions.BlockCache);
 
     /// <summary>

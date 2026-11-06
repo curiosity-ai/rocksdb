@@ -664,6 +664,27 @@ public sealed partial class BlockBasedTableReader : TableReader
     }
 
     private UserDefinedIndexReader? _udiReader;
+
+    /// <summary>
+    /// Port of BlockBasedTable::ApproximateMemoryUsage: the blocks pinned by this reader outside the block cache (index,
+    /// full filter or filter partition index and partitions, range tombstones) and the user-defined index reader.
+    /// Blocks held by the block cache are not counted (they are part of the cache's usage). Unlike upstream,
+    /// sizeof(Rep) and the index/filter reader objects themselves are not included.
+    /// </summary>
+    public override ulong ApproximateMemoryUsage
+    {
+        get
+        {
+            ulong usage = 0;
+            if (_indexBlock is not null) usage += (ulong)_indexBlock.Charge;
+            if (_rangeDelBlock is not null) usage += (ulong)_rangeDelBlock.Charge;
+            if (_filter is not null && _filterBuffer is not null) usage += (ulong)_filterBuffer.Length;
+            if (_filterIndexBlock is not null) usage += (ulong)_filterIndexBlock.Charge;
+            if (_pinnedFilterPartitions is not null) usage += _pinnedFilterPartitions.MemoryUsage;
+            if (_udiReader is not null) usage += _udiReader.ApproximateMemoryUsage;
+            return usage;
+        }
+    }
     private bool _udiStub;
     private bool _udiPrimary;
 

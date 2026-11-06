@@ -289,6 +289,11 @@ internal sealed class ColumnFamilyData
     /// max_write_buffer_size_to_maintain), oldest first; each holds a reference. Guarded by the DB mutex.
     /// </summary>
     public List<MemTable> History { get; } = new();
+    /// <summary>
+    /// Flushed memtables that are still referenced (pinned by iterators or super versions): counted by
+    /// "rocksdb.size-all-mem-tables" like upstream's MemTableList::current_memory_usage_. Guarded by the DB mutex.
+    /// </summary>
+    public HashSet<MemTable> FlushedPinnedMemTables { get; } = new(ReferenceEqualityComparer.Instance);
     public DbVersion Current { get; set; } = null!;
     private SuperVersion? _super;
     public SuperVersion Super => Volatile.Read(ref _super)!;

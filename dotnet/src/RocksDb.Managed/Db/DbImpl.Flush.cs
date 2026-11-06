@@ -120,7 +120,17 @@ internal sealed partial class DbImpl
             {
                 foreach (ImmutableMemTable m in picked)
                 {
-                    if (m.Mem.Unref()) m.Mem.Dispose();
+                    if (m.Mem.Unref())
+                    {
+                        m.Mem.Dispose();
+                    }
+                    else if (m.Mem.FlushedPinnedSet is null)
+                    {
+                        // Still referenced (an iterator's super version, the history list or a failed flush that left
+                        // it in the list): keep counting it in size-all-mem-tables until it is released.
+                        cfd.FlushedPinnedMemTables.Add(m.Mem);
+                        m.Mem.FlushedPinnedSet = cfd.FlushedPinnedMemTables;
+                    }
                 }
                 _pendingOutputs.Remove(fileNumber);
                 // The flush itself is done: release FlushAsync waiters and let the next flush of this CF start before
