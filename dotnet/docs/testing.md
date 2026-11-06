@@ -15,10 +15,10 @@ ships prebuilt libraries for Linux, macOS and Windows, so no C++ build is needed
 
 | Project | Tests (net10.0) | Native code | What it covers |
 |---|---:|---|---|
-| `tests/RocksDb.Managed.Tests` | 1889 | none | formats, data structures, DB behavior, crash consistency, fault injection, concurrency, upstream test vectors |
-| `tests/RocksDb.Managed.CompatTests` | 490 | in process | byte-level and file-level compatibility with `librocksdb` |
-| `tests/RocksDb.Managed.RoundTrip` | 43 | child process | whole-DB managed and native alternation, crashes, features |
-| `tests/RocksDb.Managed.Replication.Tests` | 36 | in process (one test) | replication, switchover, Raft cluster, gRPC transport, native replica |
+| `tests/RocksDb.Managed.Tests` | 1894 | none | formats, data structures, DB behavior, crash consistency, fault injection, concurrency, upstream test vectors |
+| `tests/RocksDb.Managed.CompatTests` | 491 | in process | byte-level and file-level compatibility with `librocksdb` |
+| `tests/RocksDb.Managed.RoundTrip` | 149 | child process | whole-DB managed and native alternation, option and crash matrices, 2PC, features |
+| `tests/RocksDb.Managed.Replication.Tests` | 37 | in process (one test) | replication, switchover, Raft cluster, gRPC transport, native replica |
 
 The counts are test cases as listed by `--list-tests` (data rows count separately) at the time of writing. Both TFMs
 run the same tests.
@@ -224,17 +224,72 @@ How a test works:
   verifies on the other engine that every acknowledged batch survived, to test unclean shutdowns in both directions.
 
 The suites are `AlternatingRoundTripTests` (randomized alternation with 6 option variants: compression, format version,
-filter, write buffer size, auto compaction, WAL-only), `CrashRecoveryRoundTripTests` (writer killed, the other engine
-recovers), `FeatureRoundTripTests` (edge-case keys and values up to 1.5 MiB, 200k to 1M keys across levels, SST
-ingestion, checkpoints, BlobDB, backups, TTL, OPTIONS files, user-defined timestamps) and `HarnessSelfTests` (the
-harness reports crashes, asserts, hangs and verification failures correctly).
+filter, write buffer size, auto compaction, WAL-only), `MatrixRoundTripTests` and `CrashMatrixRoundTripTests` (the
+combinatorial matrices below), `CrashRecoveryRoundTripTests` (writer killed, the other engine recovers),
+`TransactionRoundTripTests` (2PC across engine switches), `FeatureRoundTripTests` (edge-case keys and values up to
+1.5 MiB, 200k to 1M keys across levels, SST ingestion, checkpoints, BlobDB, backups, TTL, OPTIONS files, user-defined
+timestamps), `SecondaryRecyclingRoundTripTests` and `HarnessSelfTests` (the harness reports crashes, asserts, hangs
+and verification failures correctly).
+
+Every option a test uses is a property of `Protocol/DbSpec.cs` (`CfSpec` per column family, `DbWideSpec` for DB
+options), applied by both engines (`Engines/NativeEngine.cs` through rocksdb-sharp and the C API,
+`Engines/ManagedEngine.cs`). The few settings the C API has no setter for (the capped prefix extractor and the
+built-in `max`, `bytesxor` and `StringAppendOperator` with another delimiter) are set natively with
+`rocksdb_get_options_from_string`, so native runs the C++ implementations. A `TransactionDb` spec opens a pessimistic
+TransactionDB (WriteCommitted) on both sides; natively through `rocksdb_transactiondb_*`, which rocksdb-sharp does not
+wrap.
+
+### The option matrix (`MatrixRoundTripTests`)
+
+32 factors, crossed by a seeded greedy pairwise covering array (`Harness/Pairwise.cs`, seed `ArraySeed`): every pair of
+levels of every two factors is in at least one case, which `CoveringArrayCoversEveryAllowedPair` asserts. The data
+pattern is the exception: case i uses pattern i mod 8, so the 8 patterns don't dominate the array size.
+
+| Group | Factors (levels) |
+|---|---|
+| table | format_version 2..7; index binary search / hash / two-level / two-level + partitioned filters / binary search with first key; filter Bloom / Ribbon / Bloom + fixed prefix / Bloom + fixed prefix without whole-key filtering + memtable prefix bloom / Ribbon + capped prefix + memtable bloom with whole-key filtering / none; checksum crc32c / xxHash / xxHash64 / XXH3; block size, block_restart_interval, index_block_restart_interval and the data block hash index (4 layouts); optimize_filters_for_hits x cache_index_and_filter_blocks |
+| compression | none / Snappy / LZ4 with bottommost ZSTD / ZSTD level 5 / per-level with bottommost ZSTD and dictionaries / ZSTD with a dictionary (max_dict_bytes, zstd_max_train_bytes) and 3 parallel threads |
+| LSM | level with dynamic level bytes and small targets (many files and levels) / static levels, num_levels 4 / level defaults / universal (size ratio 1, max_size_amplification_percent 50, trivial moves) / universal (size ratio 10, 5 levels) / FIFO / FIFO with intra-L0 compaction and ttl; compaction_pri (5); max_subcompactions 1 / 4 |
+| memtable | skip list / skip list with inplace_update_support / vector / hash skip list; write buffer size, max_write_buffer_number, min_write_buffer_number_to_merge (4) |
+| WAL | wal_recovery_mode (4); recycle_log_file_num 0 / 2; manual_wal_flush (with FlushWAL calls); wal_compression ZSTD; track_and_verify_wals / track_and_verify_wals_in_manifest; max_total_wal_size; avoid_flush_during_recovery x avoid_flush_during_shutdown; wal_dir |
+| write path | default / pipelined / unordered_write / two_write_queues / no concurrent memtable writes; disableWAL writes mixed in; rare or frequent sync writes |
+| data | merge operators of the varied CFs (stringappend ',' and '\|', max, bytesxor; one CF stays uint64add); blob files (min_blob_size 128, compression, GC); 4 or 10 column families with mixed options; ingestion (none / overlapping files with global seqno / ingest_behind / allow_global_seqno=false); manual compaction (default / bottommost force(optimized) + exclusive / change_level / DeleteFilesInRange + DeleteRange); the managed runs with the same or different compatible options (format version, block size, filter, index, checksum, compression, write buffer, WAL compression) |
+| patterns | random, sequential, reverse, hot keys, 120-byte shared prefixes, tombstone-heavy (wide overlapping range deletes), merge-heavy chains, tiny and 1-3 MiB values |
+| end of a run | clean close / reopen in the middle / process killed after FlushWAL(sync) (`Op.Abandon`) |
+
+Each case has a fixed seed derived from its index (so its op streams repeat run after run) and its configuration in
+its name. A case alternates native, managed, native, managed (300 generated ops each, snapshots held across flushes and
+compactions), every run first verifies what the other engine left, and both engines then compact and verify the final
+state. Combinations upstream rejects, that native 11.12 cannot run, or that are outside the model are excluded
+(`Excluded`, with the reason for each; see also [validation.md](validation.md), "Combinatorial round trips").
+
+### The crash matrix (`CrashMatrixRoundTripTests`)
+
+14 factors, pairwise: the writer engine, wal_recovery_mode, recycling, manual_wal_flush, wal_compression, disableWAL
+writes, atomic_flush, the write mode (default / pipelined / unordered / two queues), avoid_flush_during_recovery, WAL
+tracking, wal_dir, the write buffer size, plain writes or 2PC transactions (each batch prepared and committed, and every
+40th an extra transaction left prepared), and the sync interval. The writer is SIGKILLed after a random number of
+acknowledged batches; the crash image is copied, the other engine recovers it in place and the writer's engine
+recovers the copy. Both must give the same open outcome, batch count, prepared transactions and contents (the image is
+random, so each engine is the oracle for the other), keep every acknowledged batch and a consistent batch prefix.
+Then the recoverer commits or rolls back the prepared transactions and the writer's engine checks the result.
+
+### 2PC round trips (`TransactionRoundTripTests`)
+
+A TransactionDB alternately opened by both engines (6 rounds, 12 long): each round checks the transactions the
+previous engine left prepared were recovered (and are invisible), resolves some, writes, prepares new multi-CF
+transactions, flushes between prepare and commit, and ends cleanly or by killing the process.
+
+Counts (net10.0): 149 round-trip test cases, of which 79 option-matrix and 20 crash-matrix cases; about 3 minutes on
+4 cores. With `ROUNDTRIP_LONG=1`: 279 option-matrix cases (200 random valid rows on top, 900 ops per run, 6 runs) and
+80 crash-matrix cases.
 
 Environment variables:
 
 | Variable | Effect |
 |---|---|
-| `ROUNDTRIP_SEED=<n>` | replay a failed run: the failure message prints `seed=<n> (rerun with ROUNDTRIP_SEED=<n>)` |
-| `ROUNDTRIP_LONG=1` | enable `Long_ManyAlternations` (20 alternations x 6,000 ops x 6 variants); otherwise it is reported as inconclusive |
+| `ROUNDTRIP_SEED=<n>` | replay a failed run: the failure message prints `seed=<n> (rerun with ROUNDTRIP_SEED=<n>)`; it overrides the fixed seeds of the matrix cases too (the crash matrix still kills the writer at a random point) |
+| `ROUNDTRIP_LONG=1` | enable `Long_ManyAlternations` (20 alternations x 6,000 ops x 6 variants; otherwise it is reported as inconclusive), add 200 random rows to the option matrix (with 3x longer runs) and 60 to the crash matrix, and 12 rounds to the 2PC test |
 | `ROUNDTRIP_MANAGED_IN_CHILD=1` | run the managed engine in a child process too (for example, to capture a managed crash or hang) |
 | `ROUNDTRIP_FAILURES_DIR=<dir>` | where failed runs are preserved, instead of `bin/<cfg>/<tfm>/TestResults/roundtrip-failures/` |
 

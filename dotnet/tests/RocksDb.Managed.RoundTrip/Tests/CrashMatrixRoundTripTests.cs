@@ -145,7 +145,7 @@ public sealed class CrashMatrixRoundTripTests : RoundTripTestBase
         string flags = (r[(int)F.NoWal] == 1 ? "n" : "") + (spec.TransactionDb ? "t" : "") + (d.ManualWalFlush ? "w" : "");
         int syncEvery = r[(int)F.SyncEvery] == 0 ? 1 : 7;
 
-        RoundTripHarness h = CreateHarness(spec, "c" + index.ToString("D2", CultureInfo.InvariantCulture));
+        RoundTripHarness h = CreateHarness(spec, "c" + index.ToString("D2", CultureInfo.InvariantCulture), ArraySeed + 7919 * (index + 1));
         h.Model.LenientTransactions = true;
         h.Log("case: " + description);
         long target = 100 + h.Random.Next(300);

@@ -314,10 +314,13 @@ public abstract class RoundTripTestBase
         _harnesses.Clear();
     }
 
-    protected RoundTripHarness CreateHarness(DbSpec spec, string variant)
+    protected RoundTripHarness CreateHarness(DbSpec spec, string variant) => CreateHarness(spec, variant, Random.Shared.Next(1, int.MaxValue));
+
+    /// <summary>A harness with the case's fixed <paramref name="caseSeed"/> (ROUNDTRIP_SEED still overrides it).</summary>
+    protected RoundTripHarness CreateHarness(DbSpec spec, string variant, int caseSeed)
     {
         string? env = Environment.GetEnvironmentVariable("ROUNDTRIP_SEED");
-        int seed = env is not null ? int.Parse(env, CultureInfo.InvariantCulture) : Random.Shared.Next(1, int.MaxValue);
+        int seed = env is not null ? int.Parse(env, CultureInfo.InvariantCulture) : caseSeed;
         var h = new RoundTripHarness(TestContext, TestContext.TestName + (variant.Length > 0 ? "-" + variant : ""), seed, spec);
         _harnesses.Add(h);
         return h;

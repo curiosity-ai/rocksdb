@@ -109,6 +109,10 @@ public sealed class MatrixRoundTripTests : RoundTripTestBase
         if (fa == F.Compaction && fb == F.Blob) return x >= 5 && y == 1;
         if (fa == F.Compaction && fb == F.Ingest) return x >= 5 && y >= 2;
         if (fa == F.Compaction && fb == F.ManualCompaction) return x >= 5 && y == 2;
+        // change_level moves the ingested-behind (sequence number 0) files of the last level up to L1; a later
+        // ingest_behind then fails ("files with 0 seqno ... at upper levels") unless a background compaction has
+        // already moved them back, which is timing-dependent in both engines.
+        if (fa == F.Ingest && fb == F.ManualCompaction) return x == 2 && y == 2;
         return false;
     }
 
@@ -123,6 +127,7 @@ public sealed class MatrixRoundTripTests : RoundTripTestBase
         if (Excluded((int)F.Compaction, r[(int)F.Compaction], (int)F.Blob, r[(int)F.Blob])) r[(int)F.Blob] = 0;
         if (Excluded((int)F.Compaction, r[(int)F.Compaction], (int)F.Ingest, r[(int)F.Ingest])) r[(int)F.Ingest] = 1;
         if (Excluded((int)F.Compaction, r[(int)F.Compaction], (int)F.ManualCompaction, r[(int)F.ManualCompaction])) r[(int)F.ManualCompaction] = 0;
+        if (Excluded((int)F.Ingest, r[(int)F.Ingest], (int)F.ManualCompaction, r[(int)F.ManualCompaction])) r[(int)F.ManualCompaction] = 0;
     }
 
     private static List<int[]>? s_rows;
@@ -404,7 +409,8 @@ public sealed class MatrixRoundTripTests : RoundTripTestBase
         int[] row = Rows()[index];
         Assert.AreEqual(Describe(row), description, "covering array changed under the test");
         Case c = Build(row);
-        RoundTripHarness h = CreateHarness(c.Spec, "m" + index.ToString("D3", CultureInfo.InvariantCulture));
+        // Fixed seed per case (the op streams are reproducible); ROUNDTRIP_SEED overrides it.
+        RoundTripHarness h = CreateHarness(c.Spec, "m" + index.ToString("D3", CultureInfo.InvariantCulture), ArraySeed + 7919 * (index + 1));
         h.Log("case: " + description);
         h.Log("managed spec: " + c.ManagedSpec);
         EngineKind engine = EngineKind.Native;
