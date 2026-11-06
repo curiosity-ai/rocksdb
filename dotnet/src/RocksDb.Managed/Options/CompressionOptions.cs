@@ -37,20 +37,22 @@ public sealed class CompressionOptions : PersistedOptions<CompressionOptions>
     /// </summary>
     public int AutoSkipMinSampleEvery { get; set; }
 
+    // Registered in the order native 11.12 (libstdc++ unordered_map iteration) writes the members, so the struct value is
+    // byte-identical to native's.
     private static readonly OptionTable<CompressionOptions> s_table = new OptionTable<CompressionOptions>()
-        .Int32("window_bits", static o => o.WindowBits, static (o, v) => o.WindowBits = v)
-        .Int32("level", static o => o.Level, static (o, v) => o.Level = v)
-        .Int32("strategy", static o => o.Strategy, static (o, v) => o.Strategy = v)
-        .UInt32("max_dict_bytes", static o => o.MaxDictBytes, static (o, v) => o.MaxDictBytes = v)
-        .UInt32("zstd_max_train_bytes", static o => o.ZstdMaxTrainBytes, static (o, v) => o.ZstdMaxTrainBytes = v)
-        .UInt32("parallel_threads", static o => o.ParallelThreads, static (o, v) => o.ParallelThreads = v)
-        .Bool("enabled", static o => o.Enabled, static (o, v) => o.Enabled = v)
-        .UInt64("max_dict_buffer_bytes", static o => o.MaxDictBufferBytes, static (o, v) => o.MaxDictBufferBytes = v)
-        .Bool("use_zstd_dict_trainer", static o => o.UseZstdDictTrainer, static (o, v) => o.UseZstdDictTrainer = v)
-        .Int32("max_compressed_bytes_per_kb", static o => o.MaxCompressedBytesPerKb, static (o, v) => o.MaxCompressedBytesPerKb = v)
         .Bool("checksum", static o => o.Checksum, static (o, v) => o.Checksum = v)
+        .UInt64("max_dict_buffer_bytes", static o => o.MaxDictBufferBytes, static (o, v) => o.MaxDictBufferBytes = v)
+        .UInt32("max_dict_bytes", static o => o.MaxDictBytes, static (o, v) => o.MaxDictBytes = v)
+        .Int32("auto_skip_min_sample_every", static o => o.AutoSkipMinSampleEvery, static (o, v) => o.AutoSkipMinSampleEvery = v)
+        .Bool("enabled", static o => o.Enabled, static (o, v) => o.Enabled = v)
         .Bool("auto_skip", static o => o.AutoSkip, static (o, v) => o.AutoSkip = v)
-        .Int32("auto_skip_min_sample_every", static o => o.AutoSkipMinSampleEvery, static (o, v) => o.AutoSkipMinSampleEvery = v);
+        .Int32("max_compressed_bytes_per_kb", static o => o.MaxCompressedBytesPerKb, static (o, v) => o.MaxCompressedBytesPerKb = v)
+        .UInt32("parallel_threads", static o => o.ParallelThreads, static (o, v) => o.ParallelThreads = v)
+        .UInt32("zstd_max_train_bytes", static o => o.ZstdMaxTrainBytes, static (o, v) => o.ZstdMaxTrainBytes = v)
+        .Int32("level", static o => o.Level, static (o, v) => o.Level = v)
+        .Bool("use_zstd_dict_trainer", static o => o.UseZstdDictTrainer, static (o, v) => o.UseZstdDictTrainer = v)
+        .Int32("strategy", static o => o.Strategy, static (o, v) => o.Strategy = v)
+        .Int32("window_bits", static o => o.WindowBits, static (o, v) => o.WindowBits = v);
 
     internal override OptionTable<CompressionOptions> OptionTable => s_table;
 

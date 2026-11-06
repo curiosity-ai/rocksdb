@@ -133,7 +133,10 @@ public sealed class OptionsFileTests
         StringAssert.Contains(text, "\n  \n\n[CFOptions \"default\"]\n  ");
         StringAssert.Contains(text, "  compression=kLZ4Compression\n");
         StringAssert.Contains(text, "  max_bytes_for_level_multiplier=10.000000\n");
-        StringAssert.Contains(text, "  compression_opts={window_bits=-14;level=32767;strategy=0;");
+        // Struct members in native 11.12's order (byte-identical to a native default OPTIONS file).
+        StringAssert.Contains(text, "  compression_opts={checksum=false;max_dict_buffer_bytes=0;max_dict_bytes=0;auto_skip_min_sample_every=0;"
+            + "enabled=false;auto_skip=false;max_compressed_bytes_per_kb=896;parallel_threads=1;zstd_max_train_bytes=0;level=32767;"
+            + "use_zstd_dict_trainer=true;strategy=0;window_bits=-14;}\n");
         StringAssert.Contains(text, "  merge_operator=nullptr\n");
         StringAssert.Contains(text, "  checksum=kXXH3\n");
         Assert.IsFalse(text.Contains("compression_per_level", StringComparison.Ordinal)); // empty values are skipped

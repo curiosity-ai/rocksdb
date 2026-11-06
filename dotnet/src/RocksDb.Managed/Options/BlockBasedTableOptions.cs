@@ -259,10 +259,12 @@ public sealed class MetadataCacheOptions : PersistedOptions<MetadataCacheOptions
     /// <summary>Tables whose unpartitioned metadata blocks are pinned (needs cache_index_and_filter_blocks).</summary>
     public PinningTier UnpartitionedPinning { get; set; } = PinningTier.Fallback;
 
+    // Registered in the order native 11.12 (libstdc++ unordered_map iteration) writes the members, so the struct value is
+    // byte-identical to native's.
     private static readonly OptionTable<MetadataCacheOptions> s_table = new OptionTable<MetadataCacheOptions>()
-        .Enum("top_level_index_pinning", OptionEnumMaps.PinningTier, static o => o.TopLevelIndexPinning, static (o, v) => o.TopLevelIndexPinning = v)
+        .Enum("unpartitioned_pinning", OptionEnumMaps.PinningTier, static o => o.UnpartitionedPinning, static (o, v) => o.UnpartitionedPinning = v)
         .Enum("partition_pinning", OptionEnumMaps.PinningTier, static o => o.PartitionPinning, static (o, v) => o.PartitionPinning = v)
-        .Enum("unpartitioned_pinning", OptionEnumMaps.PinningTier, static o => o.UnpartitionedPinning, static (o, v) => o.UnpartitionedPinning = v);
+        .Enum("top_level_index_pinning", OptionEnumMaps.PinningTier, static o => o.TopLevelIndexPinning, static (o, v) => o.TopLevelIndexPinning = v);
 
     internal override OptionTable<MetadataCacheOptions> OptionTable => s_table;
 }

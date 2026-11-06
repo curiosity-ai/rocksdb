@@ -42,14 +42,6 @@ public sealed class OptionsModelCompatTests
         return result;
     }
 
-    /// <summary>A struct value "{a=1;b=2;}" as sorted members (native writes members in hash order).</summary>
-    private static string Normalize(string value)
-    {
-        if (value.Length < 2 || value[0] != '{' || !value.Contains('=', StringComparison.Ordinal)) return value;
-        var members = new SortedSet<string>(value[1..^1].Split(';', StringSplitOptions.RemoveEmptyEntries), StringComparer.Ordinal);
-        return "{" + string.Join(';', members) + ";}";
-    }
-
     private static RocksDbSharp.DbOptions NativeOptions()
     {
         var o = new RocksDbSharp.DbOptions().SetCreateIfMissing(true).SetCreateMissingColumnFamilies(true);
@@ -80,7 +72,7 @@ public sealed class OptionsModelCompatTests
         Assert.AreEqual(0, parsed.DbOptions.UnknownOptions.Count);
         CollectionAssert.AreEquivalent(new[] { "default", "other", StatsCf }, parsed.ColumnFamilies.Select(static c => c.Name).ToArray());
 
-        // Every value native wrote is written back identically by the managed model (struct members compared as sets).
+        // Every value native wrote is written back byte-identically by the managed model (struct members in native's order).
         Dictionary<string, Dictionary<string, string>> native = Sections(nativeText);
         Dictionary<string, Dictionary<string, string>> managed = Sections(parsed.Serialize());
         foreach ((string section, Dictionary<string, string> nativeValues) in native)
@@ -91,7 +83,7 @@ public sealed class OptionsModelCompatTests
             {
                 if (name == "disallow_memtable_writes" && !managedValues.ContainsKey(name)) continue;
                 Assert.IsTrue(managedValues.TryGetValue(name, out string? mv), section + " " + name + " not written back");
-                Assert.AreEqual(Normalize(value), Normalize(mv), section + " " + name);
+                Assert.AreEqual(value, mv, section + " " + name);
             }
         }
 
@@ -143,7 +135,7 @@ public sealed class OptionsModelCompatTests
         ColumnFamilyOptions m = Latest(managedDir.Path, strict: false).FindColumnFamily("default")!;
         foreach (string name in new[] { "compaction_options_universal", "compression_opts", "compaction_options_fifo" })
         {
-            Assert.AreEqual(Normalize(n.GetOption(name)!), Normalize(m.GetOption(name)!), name);
+            Assert.AreEqual(n.GetOption(name), m.GetOption(name), name);
         }
         Assert.AreEqual(7u, m.CompactionOptionsUniversal.SizeRatio);
         Assert.AreEqual(9u, m.CompactionOptionsUniversal.MaxMergeWidth);

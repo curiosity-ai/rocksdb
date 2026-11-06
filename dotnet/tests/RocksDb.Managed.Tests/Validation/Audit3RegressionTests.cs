@@ -91,8 +91,10 @@ public sealed class Audit3RegressionTests
         Assert.AreEqual(12345UL, persisted.CompactionOptionsFifo.MaxTableFilesSize);
         Assert.AreEqual(7u, persisted.CompactionOptionsUniversal.SizeRatio);
         Assert.AreEqual(CompactionStopStyle.SimilarSize, persisted.CompactionOptionsUniversal.StopStyle);
-        Assert.AreEqual("{max_table_files_size=12345;allow_compaction=false;age_for_warm=0;file_temperature_age_thresholds=;"
-            + "allow_trivial_copy_when_change_temperature=false;trivial_copy_buffer_size=4096;max_data_files_size=0;use_kv_ratio_compaction=false;}",
+        // Members in native 11.12's order.
+        Assert.AreEqual("{use_kv_ratio_compaction=false;max_data_files_size=0;trivial_copy_buffer_size=4096;"
+            + "allow_trivial_copy_when_change_temperature=false;file_temperature_age_thresholds=;allow_compaction=false;age_for_warm=0;"
+            + "max_table_files_size=12345;}",
             persisted.GetOption("compaction_options_fifo"));
 
         // Native struct text (with members the port does not model) and the single-scalar FIFO form.
