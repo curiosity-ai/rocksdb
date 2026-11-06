@@ -802,4 +802,26 @@ public sealed class CompactionReviewFixesTests
         var ex = Assert.ThrowsExactly<RocksDbException>(() => again.CompactRange(new CompactRangeOptions { TargetPathId = 2 }, null, null));
         Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
     }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // periodic full scan of obsolete files (db_impl_files.cc FindObsoleteFiles, delete_obsolete_files_period_micros)
+
+    [TestMethod]
+    public void PeriodicFullScanDeletesOrphanTableFiles()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { DisableAutoCompactions = true });
+        const string orphan = DbPath + "/009999.sst";
+        using (IWritableFile f = fs.CreateWritable(orphan)) f.Append("not a table"u8);
+        db.Put(B("a"), B("1"));
+        db.Flush(); // default period (6 h): no full scan, the orphan stays
+        Assert.IsTrue(fs.FileExists(orphan));
+        db.SetDBOptions(new Dictionary<string, string> { ["delete_obsolete_files_period_micros"] = "0" });
+        db.Put(B("b"), B("1"));
+        db.Flush(); // period 0: every purge scans the directories
+        Assert.IsFalse(fs.FileExists(orphan));
+        // Live files are kept.
+        Assert.AreEqual("1", GetString(db, "a"));
+        Assert.AreEqual("1", GetString(db, "b"));
+    }
 }

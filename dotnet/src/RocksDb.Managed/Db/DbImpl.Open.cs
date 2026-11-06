@@ -316,9 +316,10 @@ internal sealed partial class DbImpl
         }
 
         StartSstFileManager();
-        DeleteObsoleteFilesFullScan();
+        DeleteObsoleteFilesFullScan(atOpen: true);
         await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
-        DeleteObsoleteFilesFullScan();
+        DeleteObsoleteFilesFullScan(atOpen: true);
+        lock (_mutex) _deleteObsoleteFilesLastRun = DateTime.UtcNow.Ticks / 10;
         LogOpenSummary();
         LogInfo("DB pointer " + GetHashCode().ToString("x", CultureInfo.InvariantCulture) + " opened " + DbName);
         StartStatsDump();

@@ -689,13 +689,41 @@ internal sealed partial class DbImpl : IAsyncDisposable
         foreach (ulong n in wals) DeleteOrArchiveWal(n);
         foreach (ulong n in manifests) TryDeleteFile(FileNames.DescriptorFileName(DbName, n));
         PurgeObsoleteWalFiles(force: false);
+        if (FullScanDue()) DeleteObsoleteFilesFullScan(atOpen: false);
+    }
+
+    // delete_obsolete_files_last_run_ (UTC microseconds). Guarded by mutex.
+    private long _deleteObsoleteFilesLastRun;
+
+    /// <summary>
+    /// FindObsoleteFiles(force = false): a full scan of the DB directories is due when delete_obsolete_files_period_micros
+    /// is 0 or has elapsed since the last one (which then becomes now).
+    /// </summary>
+    private bool FullScanDue()
+    {
+        ulong period = Options.DeleteObsoleteFilesPeriodMicros;
+        long now = DateTime.UtcNow.Ticks / 10;
+        lock (_mutex)
+        {
+            if (_readOnly || FileDeletionsDisabled) return false;
+            if (period == 0) return true;
+            if (_deleteObsoleteFilesLastRun + (long)Math.Min(period, (ulong)long.MaxValue / 2) < now)
+            {
+                _deleteObsoleteFilesLastRun = now;
+                return true;
+            }
+            return false;
+        }
     }
 
     /// <summary>
-    /// Full scan variant used at open (FindObsoleteFiles(force = true)): any table file that is not live, old
-    /// MANIFESTs, temp files and WALs that hold no unflushed data are deleted; only the two newest OPTIONS files are kept.
+    /// Full scan (FindObsoleteFiles with doing_the_full_scan): any table / blob file that is not live or a pending
+    /// output, old MANIFESTs and WALs that hold no unflushed data are deleted; only the two newest OPTIONS files are kept.
+    /// At open (<paramref name="atOpen"/>) temp files and every MANIFEST but the current one go too. Periodic scans of an
+    /// open DB keep MANIFESTs newer than the current one (a new MANIFEST being written: number &gt;= manifest_file_number)
+    /// and temp files (CURRENT / OPTIONS being written; the managed port does not register them as pending outputs).
     /// </summary>
-    private void DeleteObsoleteFilesFullScan()
+    private void DeleteObsoleteFilesFullScan(bool atOpen)
     {
         var toDelete = new List<string>();
         var options = new List<(ulong Number, string Path)>();
@@ -730,10 +758,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
                                 toDelete.Add(full);
                             break;
                         case FileType.DescriptorFile:
-                            if (dir == DbName && number != Versions.ManifestFileNumber) toDelete.Add(full);
+                            if (dir == DbName && (atOpen ? number != Versions.ManifestFileNumber : number < Versions.ManifestFileNumber)) toDelete.Add(full);
                             break;
                         case FileType.TempFile:
-                            if (dir == DbName) toDelete.Add(full);
+                            if (dir == DbName && atOpen) toDelete.Add(full);
                             break;
                         case FileType.WalFile:
                             // Recycled WALs are kept (PurgeObsoleteFiles: wal_recycle_files_set).
