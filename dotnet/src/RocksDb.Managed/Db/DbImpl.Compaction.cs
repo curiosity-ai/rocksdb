@@ -1525,54 +1525,131 @@ internal sealed partial class DbImpl
         CancellationToken cancellationToken)
     {
         if (targetLevel >= cfd.NumLevels) ThrowHelper.InvalidArgument("Target level exceeds number of levels");
-        if (!alreadyExclusive) await BeginExclusiveManualAsync(synchronous, cancellationToken).ConfigureAwait(false);
+        // DBImpl::CompactRange: DisableManualCompaction + PauseBackgroundWork around ReFitLevel, so that no other
+        // manual or automatic compaction runs on the files while they move (concurrent manual compactions fail with
+        // Incomplete(kManualCompactionPaused)). Flushes are not paused: they only add level-0 files with newer epoch
+        // numbers, and the refit range is registered below like upstream's RegisterCompaction.
+        await DisableManualCompactionAsync(synchronous, cancellationToken).ConfigureAwait(false);
         try
         {
-            // Wait until no other compaction runs (the files must not be in a compaction).
-            while (true)
+            if (!alreadyExclusive) await BeginExclusiveManualAsync(synchronous, cancellationToken).ConfigureAwait(false);
+            try
             {
-                Task wait;
-                lock (_mutex)
-                {
-                    if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0) break;
-                    wait = _bgSignal.Task;
-                }
-                if (synchronous) wait.Wait(cancellationToken);
-                else await wait.WaitAsync(cancellationToken).ConfigureAwait(false);
+                await ReFitLevelPausedAsync(cfd, level, targetLevel, synchronous, cancellationToken).ConfigureAwait(false);
             }
-            var edit = new VersionEdit { ColumnFamily = cfd.Id };
-            lock (_mutex)
+            finally
             {
-                VersionStorageInfo vs = cfd.Current.Storage;
-                int toLevel = targetLevel < 0 ? FindMinimumEmptyLevelFitting(vs, level) : targetLevel;
-                if (toLevel == level || vs.NumLevelFiles(level) == 0) return;
-                if (toLevel > level)
-                {
-                    if (level == 0) ThrowHelper.NotSupported("Cannot change from level 0 to other levels.");
-                    for (int l = level + 1; l <= toLevel; l++)
-                    {
-                        if (vs.NumLevelFiles(l) > 0) ThrowHelper.NotSupported("Levels between source and target are not empty for a move.");
-                    }
-                }
-                else
-                {
-                    for (int l = toLevel; l < level; l++)
-                    {
-                        if (vs.NumLevelFiles(l) > 0) ThrowHelper.NotSupported("Levels between source and target are not empty for a move.");
-                    }
-                }
-                foreach (FileMetaData f in vs.LevelFiles(level))
-                {
-                    edit.DeleteFile(level, f.FileNumber);
-                    edit.AddFile(toLevel, f.Clone());
-                }
+                if (!alreadyExclusive) EndExclusiveManual();
             }
-            await Versions.LogAndApplyAsync(cfd, edit, synchronous, () => InstallSuperVersion(cfd), cancellationToken).ConfigureAwait(false);
         }
         finally
         {
-            if (!alreadyExclusive) EndExclusiveManual();
+            EnableManualCompaction();
         }
+    }
+
+    private bool _refittingLevel; // refitting_level_. Guarded by mutex.
+
+    /// <summary>
+    /// DBImpl::ReFitLevel with background work paused: waits for running compactions, validates the move, registers a
+    /// kRefitLevel compaction over the files (marks them being compacted, so no compaction picked while LogAndApply has
+    /// released the mutex takes them) and applies the MANIFEST-only edit.
+    /// </summary>
+    private async ValueTask ReFitLevelPausedAsync(ColumnFamilyData cfd, int level, int targetLevel, bool synchronous, CancellationToken cancellationToken)
+    {
+        Compaction? c = null;
+        var edit = new VersionEdit { ColumnFamily = cfd.Id };
+        while (true)
+        {
+            Task wait;
+            lock (_mutex)
+            {
+                // PauseBackgroundWork: wait until no other compaction runs (the files must not be in a compaction).
+                if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0)
+                {
+                    c = PrepareReFitLevel(cfd, level, targetLevel, edit);
+                    if (c is null) return;
+                    break;
+                }
+                wait = _bgSignal.Task;
+            }
+            if (synchronous) wait.Wait(cancellationToken);
+            else await wait.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        TestHooks.Invoke("DBImpl::ReFitLevel:PostRegisterCompaction");
+        try
+        {
+            await Versions.LogAndApplyAsync(cfd, edit, synchronous, () => InstallSuperVersion(cfd), CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_mutex)
+            {
+                c.MarkFilesBeingCompacted(false);
+                cfd.CompactionState.Picker.UnregisterCompaction(c);
+                _refittingLevel = false;
+                MaybeScheduleCompaction();
+            }
+        }
+    }
+
+    /// <summary>
+    /// The checks of DBImpl::ReFitLevel and its RegisterCompaction: fills <paramref name="edit"/> and returns the
+    /// registered compaction, or null when there is nothing to move. Throws NotSupported / Aborted like upstream.
+    /// REQUIRES: mutex.
+    /// </summary>
+    private Compaction? PrepareReFitLevel(ColumnFamilyData cfd, int level, int targetLevel, VersionEdit edit)
+    {
+        VersionStorageInfo vs = cfd.Current.Storage;
+        if (vs.NumLevelFiles(level) == 0) return null;
+        // only allow one thread refitting
+        if (_refittingLevel) ThrowHelper.NotSupported("another thread is refitting");
+        int toLevel = targetLevel < 0 ? FindMinimumEmptyLevelFitting(vs, level) : targetLevel;
+        if (toLevel == level) return null;
+        CompactionPicker picker = cfd.CompactionState.Picker;
+        var input = new CompactionInputFiles(level, new List<FileMetaData>(vs.LevelFiles(level).ToArray()));
+        picker.GetRange(input, out byte[] smallest, out byte[] largest);
+        ReadOnlySpan<byte> smallestUser = DbFormat.ExtractUserKey(smallest);
+        ReadOnlySpan<byte> largestUser = DbFormat.ExtractUserKey(largest);
+        int from, to;
+        if (toLevel > level)
+        {
+            if (level == 0) ThrowHelper.NotSupported("Cannot change from level 0 to other levels.");
+            from = level + 1;
+            to = toLevel;
+        }
+        else
+        {
+            if (toLevel == 0 && input.Count > 1)
+            {
+                throw new RocksDbException(StatusCode.Aborted,
+                    "Moving more than 1 file from non-L0 to L0 is not allowed as it does not bring any benefit to read nor write throughput.");
+            }
+            from = toLevel;
+            to = level - 1;
+        }
+        // Check levels are empty for a trivial move
+        for (int l = from; l <= to; l++)
+        {
+            if (vs.NumLevelFiles(l) > 0) ThrowHelper.NotSupported("Levels between source and target are not empty for a move.");
+            if (picker.RangeOverlapWithCompaction(smallestUser, largestUser, l, rangeLimitExclusive: false))
+            {
+                ThrowHelper.NotSupported("Levels between source and target will have some ongoing compaction's output.");
+            }
+        }
+        foreach (FileMetaData f in input.Files)
+        {
+            // The files must not be in a compaction (upstream guarantees it with PauseBackgroundWork).
+            if (f.BeingCompacted) ThrowHelper.NotSupported("Files of the refit level are being compacted.");
+            edit.DeleteFile(level, f.FileNumber);
+            edit.AddFile(toLevel, f.Clone());
+        }
+        ColumnFamilyOptions o = cfd.Options;
+        var c = new Compaction(vs, o, [input], toLevel, CompactionPicker.MaxFileSizeForLevel(o, toLevel, vs.BaseLevel), long.MaxValue, 0,
+            o.Compression, new List<FileMetaData>(), CompactionReason.RefitLevel, -1, l0FilesMightOverlap: false, isManual: false);
+        picker.RegisterCompaction(c);
+        _refittingLevel = true;
+        return c;
     }
 
     /// <summary>Waits until no compaction is running or pending (test/diagnostic helper, like TEST_WaitForCompact).</summary>
