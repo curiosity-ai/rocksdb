@@ -236,6 +236,9 @@ byte[]? copy = db.Get("name"u8);
 // TryGetAsync(key, writer), GetPooledAsync(key), GetAsync(key).
 ```
 
+[docs/allocations.md](docs/allocations.md) lists which APIs and patterns allocate nothing (reads, batches, iterators,
+transactions, async) and the alternatives to the ones that do.
+
 ### WriteBatch
 
 <!-- snippet:write-batch -->
@@ -1219,6 +1222,9 @@ dotnet run --project tools/RocksDb.Managed.Tools -f net10.0 -- sst_dump --file=/
 `recompress` (prints the input file only), with `--show_properties`, `--show_summary`, `--list_meta_blocks`,
 `--from` / `--to` / `--prefix`, `--input_key_hex`, `--read_num` and `--output_hex`.
 
+`tools/RocksDb.Managed.AllocationProfile` measures the GC allocations of about 120 API scenarios (exact bytes per
+operation and the allocating call stacks); see [docs/allocations.md](docs/allocations.md#measuring-allocations).
+
 ## Error handling
 
 Native RocksDB returns a `Status`. The port throws `RocksDbException`, whose `Code` and `SubCode` have the same values
@@ -1348,6 +1354,7 @@ miss. See [docs/benchmarks.md](docs/benchmarks.md).
 | [docs/benchmarks.md](docs/benchmarks.md) | three-way benchmark methodology, `run-all.sh`, latest results, micro-benchmarks |
 | [bench/README.md](bench/README.md) | reference for the benchmark runner's flags and workloads |
 | [docs/perf.md](docs/perf.md) | performance work log with before/after measurements |
+| [docs/allocations.md](docs/allocations.md) | allocation-free usage guide: which APIs and patterns allocate nothing, the alternatives to the ones that do, and the allocation profiler |
 | [docs/validation.md](docs/validation.md) | file-by-file audit of the port against the C++ sources |
 | [src/RocksDb.Managed.Replication/README.md](src/RocksDb.Managed.Replication/README.md) | replication, switchover and Raft cluster layer |
 | [CLAUDE.md](CLAUDE.md) | contributor guide: goals, layout, porting conventions, API design rules |

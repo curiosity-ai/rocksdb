@@ -330,6 +330,24 @@ dotnet run --project samples/QuickStart -f net10.0
 python3 samples/QuickStart/sync-readme.py --check     # README snippets match the sample code
 ```
 
+## Allocation profile (`tools/RocksDb.Managed.AllocationProfile`)
+
+Not a test project, but the check for the "allocation-free hot paths" goal across the whole public API (BenchmarkDotNet
+`[MemoryDiagnoser]` covers single micro-benchmarks). Each scenario runs in a child process: warm-up, an exact measured
+phase (`GC.GetTotalAllocatedBytes(precise: true)` per operation, all threads, plus the calling thread's counter), then a
+Memory.Introspect allocation trace of the steady-state loop for the allocating types and call stacks. Reports go to
+`allocations.md` / `allocations.json`.
+
+```bash
+dotnet run -c Release --project tools/RocksDb.Managed.AllocationProfile -f net10.0 -- list
+dotnet run -c Release --project tools/RocksDb.Managed.AllocationProfile -f net10.0 -- run get iterator --out /tmp/alloc
+dotnet run -c Release --project tools/RocksDb.Managed.AllocationProfile -f net10.0 -- run all --native --trace 0   # exact numbers only
+```
+
+A full traced run takes about 45 minutes; `--trace 0` and a group filter make it a few minutes. After a change on a hot
+path, run the affected group and compare the B/op column. A hot-path scenario that was 0 B/op must stay at 0. See
+[allocations.md](allocations.md#measuring-allocations) for the options and for how to add a scenario.
+
 ## Adding a test
 
 - **Pick the project by what you need**: managed behavior goes in the unit tests; anything persisted needs a

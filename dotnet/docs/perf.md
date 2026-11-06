@@ -3,6 +3,9 @@
 This file records how the hot paths of `RocksDb.Managed` were measured and tuned, with before/after numbers.
 Update it with every perf-sensitive change.
 
+For allocations across the whole public API (which calls and patterns allocate, and how to stay allocation-free) see
+[allocations.md](allocations.md) and its profiler, `tools/RocksDb.Managed.AllocationProfile`.
+
 ## Method
 
 - BenchmarkDotNet (`bench/RocksDb.Managed.Benchmarks`), `net10.0`, Release, `--job short --iterationCount 8
