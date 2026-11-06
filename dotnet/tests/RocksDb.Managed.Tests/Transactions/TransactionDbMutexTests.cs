@@ -175,9 +175,9 @@ public sealed class TransactionDbMutexTests
         t1.Put(B("k"), B("1"));
         // Lock waits block the calling thread with a custom factory, also through the async API.
         Task waiter = Task.Run(() => t2.Put(B("k"), B("2")));
-        while (WaitingFor(t2).Count == 0) await Task.Delay(1);
+        // The waiting transaction is recorded (SetWaitingTxn) before the condvar wait is entered, so wait for both.
+        while (WaitingFor(t2).Count == 0 || Volatile.Read(ref f.Waits) == 0) await Task.Delay(1);
         Assert.IsFalse(waiter.IsCompleted);
-        Assert.IsTrue(f.Waits >= 1);
         t1.Commit();
         await waiter.WaitAsync(TimeSpan.FromSeconds(30));
         await t2.CommitAsync();
