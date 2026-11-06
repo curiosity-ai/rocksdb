@@ -19,6 +19,8 @@ internal sealed partial class DbImpl
     private readonly List<ColumnFamilyData> _flushScheduler = new(); // leader-only: CFs whose memtable became full
     // Column families by id for the write path: copy-on-write array, replaced by an unbatched leader.
     private ColumnFamilyData?[] _cfById = [];
+    /// <summary>Some column family uses disallow_memtable_writes (set once, never reset): writes are checked before the WAL.</summary>
+    private volatile bool _anyDisallowMemtableWrites;
 
     private LogWriter? _log;          // leader-only
     private ulong _logNumber;         // written by leader under mutex
@@ -106,6 +108,15 @@ internal sealed partial class DbImpl
             ValidateColumnFamilies(batch, options?.IgnoreMissingColumnFamilies ?? false);
             if (txn?.MemtableBatch is { } mb) ValidateColumnFamilies(mb, options?.IgnoreMissingColumnFamilies ?? false);
         }
+        else if (_anyDisallowMemtableWrites)
+        {
+            ValidateColumnFamilies(batch, ignoreMissing: true);
+            if (txn?.MemtableBatch is { } mb) ValidateColumnFamilies(mb, ignoreMissing: true);
+        }
+        if (options is { LowPri: true } && WriteControllerInstance.NeedSpeedupCompaction)
+        {
+            await ThrottleLowPriWritesAsync(options, batch, synchronous, cancellationToken).ConfigureAwait(false);
+        }
         if (_twoWriteQueues && txn is { DisableMemtable: true })
         {
             // two_write_queues: WAL-only writes (2PC prepare of WriteCommitted, commit markers of WritePrepared /
@@ -174,6 +185,36 @@ internal sealed partial class DbImpl
         {
             WriteThread.Return(w, synchronous);
             stats?.RecordElapsedMicros(Histogram.DbWrite, writeStart);
+        }
+    }
+
+    /// <summary>
+    /// Port of DBImpl::ThrottleLowPriWritesIfNeeded (db_impl_write.cc), called for WriteOptions.low_pri writes once the
+    /// write controller needs compaction to speed up (stopped, delayed or compaction pressure; checked by the caller
+    /// outside the DB mutex, like upstream, so the condition may be stale). The write is charged to the controller's
+    /// low-priority rate limiter (IO_HIGH, in chunks of at most its burst size) instead of waiting for the stall to end,
+    /// so heavy low-priority writes still make slow progress. With no_slowdown it fails with Incomplete
+    /// "Low priority write stall". With 2PC, only prepare is rate limited, not commit or rollback.
+    /// </summary>
+    private async ValueTask ThrottleLowPriWritesAsync(WriteOptions options, WriteBatch batch, bool synchronous, CancellationToken cancellationToken)
+    {
+        if (Options.Allow2Pc && (batch.HasCommit || batch.HasRollback))
+        {
+            // For 2PC, we only rate limit prepare, not commit.
+            return;
+        }
+        if (options.NoSlowdown) throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Low priority write stall");
+        // Rate limit those writes. The reason that we don't completely wait is that in case the write is heavy, low pri
+        // writes may never have a chance to run. Now we guarantee we are still slowly making progress.
+        GenericRateLimiter limiter = WriteControllerInstance.LowPriRateLimiter;
+        long dataSize = batch.DataSize;
+        while (dataSize > 0)
+        {
+            // RateLimiter::RequestToken: at most one burst per request.
+            long allowed = Math.Min(dataSize, limiter.SingleBurstBytes);
+            if (synchronous) limiter.Request(allowed, IoPriority.High, null, RateLimiterOpType.Write);
+            else await limiter.RequestAsync(allowed, IoPriority.High, null, RateLimiterOpType.Write, cancellationToken).ConfigureAwait(false);
+            dataSize -= allowed;
         }
     }
 
@@ -258,8 +299,14 @@ internal sealed partial class DbImpl
             LaunchParallelMemTableWriters(group, leader, total, last, walRecordBytes: 0, wal: false, needSync: false);
             return WriteThread.StateParallelMemtableWriter;
         }
-        InsertWritersSerially(group);
-        if (total > 0)
+        Exception? insertError = InsertWritersSerially(group);
+        if (insertError is not null)
+        {
+            // PipelinedWriteImpl: the memtable group's status is the leader's.
+            leader.Error ??= insertError;
+            HandleMemTableInsertFailure(insertError);
+        }
+        else if (total > 0) // Don't publish a partial batch write
         {
             Versions.SetLastSequence(last);
             NotifySequenceWaiters();
@@ -664,17 +711,42 @@ internal sealed partial class DbImpl
     private void InsertGroupSerially(List<WriteThread.Writer> group, WriteThread.Writer leader, ulong total, ulong last, int walRecordBytes, bool needSync)
     {
         // A lone writer may ask for its (large) batch to be inserted in parallel ranges (DbImpl.SplitInsert.cs).
-        if (group.Count != 1 || !TryInsertBatchInParallel(group[0])) InsertWritersSerially(group);
-        if (total > 0)
+        Exception? insertError;
+        if (group.Count == 1 && TryInsertBatchInParallel(group[0])) insertError = group[0].Error;
+        else insertError = InsertWritersSerially(group);
+        if (insertError is null)
         {
-            Versions.SetLastSequence(last);
-            NotifySequenceWaiters();
+            // Don't publish a partial batch write
+            if (total > 0)
+            {
+                Versions.SetLastSequence(last);
+                NotifySequenceWaiters();
+            }
+        }
+        else
+        {
+            // DBImpl::WriteImpl: the leader's status is the group's insert status (w.status = InsertInto(write_group)).
+            leader.Error ??= insertError;
+            HandleMemTableInsertFailure(insertError);
         }
         RecordWriteGroup(group, total, walRecordBytes, !leader.DisableWal, needSync);
     }
 
-    /// <summary>WriteBatchInternal::InsertInto(write_group): the memtable inserts of the group's writers, one after another.</summary>
-    private void InsertWritersSerially(List<WriteThread.Writer> group)
+    /// <summary>
+    /// Port of DBImpl::HandleMemTableInsertFailure (db_impl_write.cc): a non-OK status on memtable insert indicates that
+    /// the state implied by the WAL has diverged from the in-memory state (a corrupt write batch, or an invalid column
+    /// family without ignore_missing_column_families): a fatal background error with reason kMemTable stops further
+    /// writes. The group's sequence numbers are not published, so readers never see its partial inserts (they stay in the
+    /// memtable above the last sequence until the DB is reopened).
+    /// </summary>
+    private void HandleMemTableInsertFailure(Exception e) => SetBackgroundError(e, BackgroundErrorReason.MemTable, walRelated: false);
+
+    /// <summary>
+    /// WriteBatchInternal::InsertInto(write_group): the memtable inserts of the group's writers, one after another. Stops
+    /// at the first writer whose insert fails (its Error is set) and returns that error; the writers behind it are not
+    /// inserted. Returns null when every insert succeeded.
+    /// </summary>
+    private Exception? InsertWritersSerially(List<WriteThread.Writer> group)
     {
         var inserter = new MemTableInserter(this, logNumber: 0, ignoreMissingColumnFamilies: false);
         for (int i = 0; i < group.Count; i++)
@@ -697,8 +769,10 @@ internal sealed partial class DbImpl
             catch (Exception e)
             {
                 w.Error = e;
+                return e;
             }
         }
+        return null;
     }
 
     // ---- parallel memtable writes (allow_concurrent_memtable_write) ----------------------------------------
@@ -784,7 +858,13 @@ internal sealed partial class DbImpl
     private void FinishParallelGroup(WriteThread.Writer self)
     {
         List<WriteThread.Writer> group = _parallelGroup!;
-        if (_parallelTotal > 0)
+        // Don't publish a partial batch write. Upstream checks the status of the writer that finished last only (a TODO
+        // there: "propagate status to write_group"); the port checks every writer of the group, so a failed insert of any
+        // of them keeps the group unpublished and stops writes.
+        Exception? insertError = null;
+        for (int i = 0; i < group.Count && insertError is null; i++) insertError = group[i].Error;
+        if (insertError is not null) HandleMemTableInsertFailure(insertError);
+        else if (_parallelTotal > 0)
         {
             Versions.SetLastSequence(_parallelLast);
             NotifySequenceWaiters();
@@ -1300,6 +1380,9 @@ internal sealed partial class DbImpl
             if (c is null && !ignoreMissing && logNumber == 0) ThrowHelper.InvalidArgument("Invalid column family specified in write batch");
             return null;
         }
+        // MemTableInserter::SeekToColumnFamily (write_batch.cc) rejects writes to a disallow_memtable_writes column
+        // family, live and during recovery (the open fails).
+        if (c.Options.DisallowMemtableWrites) ThrowHelper.InvalidArgument("This column family has disallow_memtable_writes=true");
         // During recovery, skip data that was already flushed for this CF.
         if (logNumber != 0 && logNumber < c.LogNumber) return null;
         return c;
@@ -1315,6 +1398,7 @@ internal sealed partial class DbImpl
         RecomputeMaxTotalInMemoryState();
         RefreshTimestampSizes(map);
         if (cfd.BlobDirectWrite is not null) _anyBlobDirectWrite = true;
+        if (cfd.Options.DisallowMemtableWrites) _anyDisallowMemtableWrites = true;
     }
 
     private void UnregisterCfForWrite(ColumnFamilyData cfd)
@@ -1327,18 +1411,31 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>Validates the column family ids of a user batch before it is committed (avoids partially applied batches).</summary>
+    /// <summary>
+    /// Rejects a batch before it reaches the WAL when it names an unknown column family (unless
+    /// <paramref name="ignoreMissing"/>) or a disallow_memtable_writes one. Upstream rejects the latter when the batch is
+    /// built (WriteBatch::Put(handle) -> GetColumnFamilyIdAndTimestampSize: InvalidArgument "This column family has
+    /// disallow_memtable_writes=true"); the managed WriteBatch records ids only, so the check happens here, and
+    /// SeekToColumnFamily (<see cref="CfForInsert"/>) remains the backstop.
+    /// </summary>
     private void ValidateColumnFamilies(WriteBatch batch, bool ignoreMissing)
     {
-        if (ignoreMissing) return;
-        var v = new CfValidator(Volatile.Read(ref _cfById));
+        if (ignoreMissing && !_anyDisallowMemtableWrites) return;
+        var v = new CfValidator(Volatile.Read(ref _cfById), ignoreMissing);
         WriteBatch.Iterate(batch.Data, ref v);
     }
 
-    private readonly struct CfValidator(ColumnFamilyData?[] map) : IWriteBatchHandler
+    private readonly struct CfValidator(ColumnFamilyData?[] map, bool ignoreMissing) : IWriteBatchHandler
     {
         private void Check(uint id)
         {
-            if (id >= (uint)map.Length || map[id] is null) ThrowHelper.InvalidArgument("Invalid column family specified in write batch");
+            ColumnFamilyData? c = id < (uint)map.Length ? map[id] : null;
+            if (c is null)
+            {
+                if (!ignoreMissing) ThrowHelper.InvalidArgument("Invalid column family specified in write batch");
+                return;
+            }
+            if (c.Options.DisallowMemtableWrites) ThrowHelper.InvalidArgument("This column family has disallow_memtable_writes=true");
         }
 
         public bool Continue() => true;

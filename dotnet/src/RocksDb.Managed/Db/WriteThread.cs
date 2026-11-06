@@ -138,6 +138,8 @@ internal sealed class WriteThread
         public bool NoSlowdown;
         public bool IgnoreMissingColumnFamilies;
         public bool IsSyncWaiter;
+        /// <summary>protection_bytes_per_key of the batch (0 for unbatched writers).</summary>
+        public int ProtectionBytesPerKey;
         /// <summary>WriteOptions.MemtableInsertParallelism (see DbImpl.TryInsertBatchInParallel).</summary>
         public int MemtableInsertParallelism;
         public Exception? Error;
@@ -164,6 +166,7 @@ internal sealed class WriteThread
             DisableWal = options?.DisableWal ?? false;
             NoSlowdown = options?.NoSlowdown ?? false;
             IgnoreMissingColumnFamilies = options?.IgnoreMissingColumnFamilies ?? false;
+            ProtectionBytesPerKey = batch?.ProtectionBytesPerKey ?? 0;
             MemtableInsertParallelism = options?.MemtableInsertParallelism ?? 1;
             IsSyncWaiter = syncWaiter;
             Error = null;
@@ -294,9 +297,14 @@ internal sealed class WriteThread
     }
 
     /// <summary>
-    /// Port of EnterAsBatchGroupLeader: appends to <paramref name="group"/> (which starts with the leader) the queued
-    /// writers that can be committed together with it. Stops at the first incompatible writer (unbatched, different
-    /// WAL setting, a sync write behind a non-sync leader, or the group size limit).
+    /// Port of EnterAsBatchGroupLeader (db/write_thread.cc): appends to <paramref name="group"/> (which starts with the
+    /// leader) the queued writers that can be committed together with it. A writer that is incompatible with the leader
+    /// (a sync write behind a non-sync leader, different no_slowdown, disable_wal or protection_bytes_per_key, an
+    /// unbatched writer, a callback that does not allow batching, or one that would make the group too big) stays queued
+    /// in order (upstream's r_list, grafted back after the group), and the compatible writers behind it still join. The
+    /// queue is walked under <c>_lock</c>, so no writer arrives meanwhile and the incompatible ones simply keep their
+    /// places. WriteOptions has no rate_limiter_priority here (WAL writes are not rate limited), and WBWI ingestion is not
+    /// ported, so those two criteria never apply.
     /// </summary>
     public void EnterAsBatchGroupLeader(Writer leader, List<Writer> group)
     {
@@ -307,23 +315,46 @@ internal sealed class WriteThread
         // Allow the group to grow up to a maximum size, but if the original write is small, limit the growth so we do
         // not slow down the small write too much.
         long maxSize = _maxGroupBytes;
-        const long minBatchSizeBytes = 128 << 10;
+        long minBatchSizeBytes = _maxGroupBytes / 8;
         if (size <= minBatchSizeBytes) maxSize = size + minBatchSizeBytes;
         lock (_lock)
         {
-            while (_head is { } w)
+            // prev: the last writer that stays queued (the end of the r_list), null while none was skipped.
+            Writer? prev = null;
+            Writer? w = _head;
+            while (w is not null)
             {
-                if (w.IsUnbatched) break;
-                if (w.Txn?.Callback is { AllowWriteBatching: false }) break; // dont batch writes that don't want to be batched
-                if (w.Sync && !leader.Sync) break; // Do not include a sync write into a batch handled by a non-sync write.
-                if (w.DisableWal != leader.DisableWal) break;
-                if (w.NoSlowdown != leader.NoSlowdown) break;
-                if (size + w.Size > maxSize) break;
-                size += w.Size;
-                _head = w.Next;
-                if (_head is null) _tail = null;
-                w.Next = null;
-                group.Add(w);
+                Writer? next = w.Next;
+                if ((w.Sync && !leader.Sync) ||
+                    // Do not include a sync write into a batch handled by a non-sync write.
+                    w.NoSlowdown != leader.NoSlowdown ||
+                    // Do not mix writes that are ok with delays with the ones that request fail on delays.
+                    w.DisableWal != leader.DisableWal ||
+                    // Do not mix writes that enable WAL with the ones whose WAL disabled.
+                    w.ProtectionBytesPerKey != leader.ProtectionBytesPerKey ||
+                    // Do not mix writes with different levels of integrity protection.
+                    w.IsUnbatched ||
+                    // Do not include those writes with nullptr batch. Those are not writes those are something else.
+                    // They want to be alone
+                    w.Txn?.Callback is { AllowWriteBatching: false } ||
+                    // dont batch writes that don't want to be batched
+                    size + w.Size > maxSize)
+                    // Do not make batch too big
+                {
+                    // Stays in the queue (r_list).
+                    prev = w;
+                }
+                else
+                {
+                    // grow up: unlink from the queue.
+                    size += w.Size;
+                    if (prev is null) _head = next;
+                    else prev.Next = next;
+                    if (next is null) _tail = prev;
+                    w.Next = null;
+                    group.Add(w);
+                }
+                w = next;
             }
         }
     }

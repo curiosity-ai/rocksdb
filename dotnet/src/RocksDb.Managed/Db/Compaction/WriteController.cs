@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using RocksDb.Managed.Env;
 
 namespace RocksDb.Managed.Db;
 
@@ -27,7 +28,7 @@ internal enum WriteStallCause : byte
 /// <see cref="GetDelay"/> is called by the write leader and serialized by an internal lock.
 /// </para>
 /// </summary>
-internal sealed class WriteController
+internal sealed class WriteController : IDisposable
 {
     private const ulong MicrosPerSecond = 1_000_000;
     private const ulong MicrosPerRefill = 1000; // Refill every 1 ms
@@ -39,6 +40,10 @@ internal sealed class WriteController
     private ulong _creditInBytes;
     private ulong _nextRefillTime;
     private ulong _delayedWriteRate;
+    // low_pri_rate_limiter_ (NewGenericRateLimiter(low_pri_rate_bytes_per_sec = 1 MiB/s)): created on first use so a DB
+    // that never throttles a low-priority write does not own one. _lowPriRate is its rate (also before creation).
+    private GenericRateLimiter? _lowPriRateLimiter;
+    private long _lowPriRate = 1024 * 1024;
 
     public WriteController(ulong delayedWriteRate)
     {
@@ -81,6 +86,51 @@ internal sealed class WriteController
 
     /// <summary>NeedSpeedupCompaction(): use all compaction threads.</summary>
     public bool NeedSpeedupCompaction => IsStopped || NeedsDelay || Volatile.Read(ref _totalCompactionPressure) > 0;
+
+    /// <summary>
+    /// low_pri_rate_limiter(): the rate limiter that WriteOptions.low_pri writes go through while compaction needs to
+    /// speed up (DBImpl::ThrottleLowPriWritesIfNeeded). 1 MiB/s until a delay ends, then 1/4 of the delayed write rate.
+    /// </summary>
+    public GenericRateLimiter LowPriRateLimiter
+    {
+        get
+        {
+            GenericRateLimiter? limiter = Volatile.Read(ref _lowPriRateLimiter);
+            if (limiter is not null) return limiter;
+            lock (_lock)
+            {
+                return _lowPriRateLimiter ??= new GenericRateLimiter(_lowPriRate);
+            }
+        }
+    }
+
+    /// <summary>The current rate of <see cref="LowPriRateLimiter"/> (GetBytesPerSecond).</summary>
+    public long LowPriRateBytesPerSecond
+    {
+        get
+        {
+            lock (_lock) return _lowPriRate;
+        }
+    }
+
+    /// <summary>low_pri_rate_limiter()->SetBytesPerSecond (RecalculateWriteStallConditions). Rates below 1 become 1.</summary>
+    public void SetLowPriRate(long bytesPerSecond)
+    {
+        lock (_lock)
+        {
+            _lowPriRate = Math.Max(1, bytesPerSecond);
+            _lowPriRateLimiter?.SetBytesPerSecond(_lowPriRate);
+        }
+    }
+
+    /// <summary>Disposes the low-priority rate limiter (its refill timer), if one was created.</summary>
+    public void Dispose()
+    {
+        lock (_lock)
+        {
+            _lowPriRateLimiter?.Dispose();
+        }
+    }
 
     public void AcquireStop() => Interlocked.Increment(ref _totalStopped);
     public void ReleaseStop() => Interlocked.Decrement(ref _totalStopped);
@@ -282,7 +332,14 @@ internal sealed class ColumnFamilyStallState
             }
             // If the DB recovers from delay conditions, we reward with reducing double the slowdown ratio. This is to
             // balance the long term slowdown increase signal.
-            if (neededDelay) wc.SetDelayedWriteRate((ulong)(wc.DelayedWriteRate * DelayRecoverSlowdownRatio));
+            if (neededDelay)
+            {
+                ulong writeRate = wc.DelayedWriteRate;
+                wc.SetDelayedWriteRate((ulong)(writeRate * DelayRecoverSlowdownRatio));
+                // Set the low pri limit to be 1/4 the delayed write rate. Note we don't reset this value even after delay
+                // condition is released. Low-pri rate will continue to apply if there is a compaction pressure.
+                wc.SetLowPriRate((long)(writeRate / 4));
+            }
         }
         ReleaseToken(wc, previous);
         _prevCompactionNeededBytes = compactionNeededBytes;

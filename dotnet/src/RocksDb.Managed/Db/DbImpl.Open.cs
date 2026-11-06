@@ -99,6 +99,7 @@ internal sealed partial class DbImpl
         _groupBatch.Dispose();
         try { ShutdownMonitoring(); } catch (Exception e) when (e is IOException or RocksDbException) { }
         DisposeOwnedSstFileManager();
+        _writeControllerField?.Dispose();
         SharedTableCache.Dispose();
         _dbLock?.Dispose();
         _dbLock = null;
@@ -111,6 +112,11 @@ internal sealed partial class DbImpl
     /// </summary>
     private static void ValidateWriteModeOptions(DbOptions o, IReadOnlyList<ColumnFamilyDescriptor> columnFamilies)
     {
+        foreach (ColumnFamilyDescriptor d in columnFamilies)
+        {
+            if (d.Name == DefaultColumnFamilyName && d.Options.DisallowMemtableWrites)
+                ThrowHelper.InvalidArgument("Default column family cannot use disallow_memtable_writes=true");
+        }
         foreach (ColumnFamilyDescriptor d in columnFamilies)
         {
             if (d.Options is { EnableBlobDirectWrite: true, EnableBlobFiles: true }) return;
@@ -643,6 +649,7 @@ internal sealed partial class DbImpl
         if (progress.CorruptedWalFound) _recoveredSeq = progress.NextSequence;
         ulong lastSequence = progress.LastSequence;
         bool anyData = progress.AnyData;
+        bool flushed = progress.Flushed;
 
         Versions.SetLastSequence(lastSequence);
         // RecoverLogFiles: last_allocated_sequence_ and last_published_sequence_ follow the recovered last sequence.
@@ -653,14 +660,19 @@ internal sealed partial class DbImpl
             foreach (ColumnFamilyData cfd in GetColumnFamilies())
             {
                 if (cfd.Mem.IsEmpty) continue;
+                // MaybeFlushFinalMemtableOrRestoreActiveLogFiles: if flush happened in the middle of recovery (e.g. due
+                // to memtable being full), we flush at the end. Otherwise we'll need to record where we were on last
+                // flush, which make the logic complicated. Without the final flush the CF's log number could not advance
+                // past the replayed WALs, and the next open would replay them again on top of the recovery flush.
                 // Force flush on DB open if 2PC is enabled, since with 2PC we have no guarantee that consecutive log
                 // files have consecutive sequence id, which make recovery complicated (SanitizeOptions).
-                if (Options.AvoidFlushDuringRecovery && !Options.Allow2Pc)
+                if (!flushed && Options.AvoidFlushDuringRecovery && !Options.Allow2Pc)
                 {
                     // Keep the data in the memtable; the WALs stay alive until it is flushed.
                     continue;
                 }
                 await FlushRecoveredMemTableAsync(cfd, edits, lastSequence, synchronous, ct).ConfigureAwait(false);
+                flushed = true;
             }
         }
         lock (_mutex)
@@ -745,6 +757,7 @@ internal sealed partial class DbImpl
                             foreach (ColumnFamilyData cfd in _flushScheduler)
                             {
                                 await FlushRecoveredMemTableAsync(cfd, edits!, progress.LastSequence, synchronous, ct).ConfigureAwait(false);
+                                progress.Flushed = true;
                             }
                         }
                         _flushScheduler.Clear();
@@ -837,6 +850,8 @@ internal sealed partial class DbImpl
     {
         public ulong LastSequence;
         public bool AnyData;
+        /// <summary>A memtable that filled up during the replay was flushed (flushed; primary opens only).</summary>
+        public bool Flushed;
         /// <summary>Sequence the next record must start with to resume after a corruption (next_sequence), or MaxValue.</summary>
         public ulong NextSequence = ulong.MaxValue;
         /// <summary>Point-in-time recovery hit a corruption: WALs are dropped until one continues the sequence.</summary>

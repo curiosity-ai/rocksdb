@@ -175,6 +175,35 @@ public sealed class DbBasicTests
         }
     }
 
+    /// <summary>
+    /// MaybeFlushFinalMemtableOrRestoreActiveLogFiles (db_impl_open.cc): with avoid_flush_during_recovery, a memtable
+    /// that fills up during WAL replay is flushed, and then every column family is flushed at the end and its log number
+    /// advanced past the replayed WALs. Otherwise the next open replays the WALs again on top of the recovery flush and
+    /// merge operands are applied twice.
+    /// </summary>
+    [TestMethod]
+    public void AvoidFlushDuringRecoveryWithMidRecoveryFlushDoesNotReplayTwice()
+    {
+        MemoryFileSystem fs = NewFs();
+        const int Merges = 3000;
+        byte[] one = new byte[8];
+        Coding.EncodeFixed64(one, 1);
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { MergeOperator = UInt64AddOperator.Instance }))
+        {
+            for (int i = 0; i < Merges; i++) db.Merge(B("k"), one);
+        }
+        DbOptions o = NewOptions(fs);
+        o.AvoidFlushDuringRecovery = true;
+        var small = new ColumnFamilyOptions { MergeOperator = UInt64AddOperator.Instance, WriteBufferSize = 64 << 10, DisableAutoCompactions = true };
+        for (int open = 0; open < 3; open++)
+        {
+            using RocksDatabase db = RocksDatabase.Open(DbPath, o, small);
+            Assert.AreEqual((ulong)Merges, Coding.DecodeFixed64(db.Get(B("k"))), "open " + open);
+            // The replay filled a memtable, so recovery flushed everything: nothing is left in the memtable.
+            Assert.AreEqual("0", db.GetProperty("rocksdb.num-entries-active-mem-table"), "open " + open);
+        }
+    }
+
     [TestMethod]
     public void CrashDropsOnlyUnsyncedWrites()
     {
