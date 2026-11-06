@@ -265,4 +265,70 @@ public sealed unsafe class MergeOperatorCompatTests
         Assert.AreEqual("nullptr", Latest(dir.Path).FindColumnFamily("default")!.GetOption("merge_operator"));
         Assert.AreEqual(id == "NoSuchOperator", MergeOperator.CreateBuiltin(id) is null);
     }
+
+    /// <summary>
+    /// TTL databases with merges (utilities/ttl/db_ttl_impl.cc TtlMergeOperator): native DBWithTTL writes timestamped
+    /// operands over timestamped puts (SST + WAL), the port reads the same merged values through its TtlMergeOperator,
+    /// adds operands, flushes and compacts (merge results carry a fresh timestamp); native reads the port's results back,
+    /// and both name the operator identically in the OPTIONS file.
+    /// </summary>
+    [TestMethod]
+    [DataRow("stringappend")]
+    [DataRow("uint64add")]
+    public void TtlMergesMatchNativeDbWithTtl(string id)
+    {
+        MergeOperator managedOp = MergeOperator.CreateBuiltin(id)!;
+        string name = managedOp.Name;
+        int seed = Environment.TickCount;
+        string trace = id + " seed=" + seed;
+        var rnd = new Random(seed);
+        using var dir = new TempDir("ttl-merge");
+        var nativeValues = new string?[Keys];
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.OpenWithTtl(NativeOptions(id), dir.Path, 3600))
+        {
+            for (int step = 0; step < 240; step++)
+            {
+                byte[] key = Key(rnd.Next(Keys));
+                int a = rnd.Next(100);
+                if (a < 80) db.Merge(key, Operand(name, rnd));
+                else if (a < 92) db.Put(key, Operand(name, rnd));
+                else db.Remove(key);
+                if (step == 120) db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            }
+            for (int i = 0; i < Keys; i++) nativeValues[i] = Hex(db.Get(Key(i)));
+        }
+        string? nativeText = Latest(dir.Path).FindColumnFamily("default")!.GetOption("merge_operator");
+        Assert.AreEqual(new TtlMergeOperator(managedOp).OptionsId, nativeText, trace);
+
+        var managedValues = new string?[Keys];
+        using (TtlDatabase db = TtlDatabase.Open(dir.Path, new DbOptions(), new ColumnFamilyOptions { MergeOperator = managedOp }, 3600))
+        {
+            for (int i = 0; i < Keys; i++) Assert.AreEqual(nativeValues[i], Hex(db.Get(Key(i))), trace + " key " + i);
+            for (int step = 0; step < 150; step++)
+            {
+                byte[] key = Key(rnd.Next(Keys));
+                if (rnd.Next(100) < 85) db.Merge(key, Operand(name, rnd));
+                else db.Put(key, Operand(name, rnd));
+                if (step == 75) db.Flush();
+            }
+            for (int i = 0; i < Keys; i++) managedValues[i] = Hex(db.Get(Key(i)));
+            db.Flush();
+            db.CompactRange();
+            for (int i = 0; i < Keys; i++) Assert.AreEqual(managedValues[i], Hex(db.Get(Key(i))), trace + " compacted key " + i);
+            for (int i = 0; i < Keys; i += 3) db.Merge(Key(i), Operand(name, rnd)); // left in the WAL
+            for (int i = 0; i < Keys; i++) managedValues[i] = Hex(db.Get(Key(i)));
+        }
+        Assert.AreEqual(nativeText, Latest(dir.Path).FindColumnFamily("default")!.GetOption("merge_operator"), trace);
+        // The OPTIONS text recreates the TTL wrapper around the built-in operator.
+        MergeOperator? reloaded = MergeOperator.CreateBuiltin(nativeText!);
+        Assert.IsInstanceOfType<TtlMergeOperator>(reloaded, trace);
+        Assert.AreEqual(name, ((TtlMergeOperator)reloaded).UserMergeOperator.Name, trace);
+
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.OpenWithTtl(NativeOptions(id), dir.Path, 3600))
+        {
+            for (int i = 0; i < Keys; i++) Assert.AreEqual(managedValues[i], Hex(db.Get(Key(i))), trace + " native key " + i);
+            db.CompactRange((byte[]?)null, null);
+            for (int i = 0; i < Keys; i++) Assert.AreEqual(managedValues[i], Hex(db.Get(Key(i))), trace + " native compacted key " + i);
+        }
+    }
 }
