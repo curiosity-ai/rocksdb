@@ -266,7 +266,7 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 
 - [x] PlainTable + CuckooTable (read/write, byte-identical regions vs native SstFileWriter, OPTIONS sections), adaptive reading by magic, user-defined index API
 - [x] trie_index user-defined index (byte-identical trie blocks vs native 11.12, each side reads the other's through the trie, 0-alloc Gets); ingestion opens any table format and applies upstream's checks (plain/cuckoo files are rejected by the comparator/version checks, exactly as native rejects its own)
-- [~] OPTIONS `user_defined_index_factory=trie_index` interpreted into a factory (kept as text today) (S)
+- [x] OPTIONS `user_defined_index_factory=trie_index` resolved to TrieIndexFactory; `index_mode`, `use_udi_as_primary_index`, `fail_if_no_udi_on_open` typed and written like native 11.12 (compat both ways)
 - [x] Cache layers: SecondaryCache + adapter, CompressedSecondaryCache, TieredCache, persistent cache (volatile + file tier), WriteBufferManager (shared across DBs, cache charging, stalls; behaves like native's in compat tests), SimCache, CacheReservationManager; block-cache lookups unchanged when unused
 - [~] cache layers: batched MultiGet secondary lookups, compressed admission to non-volatile tiers, async persistent-cache reads (S each)
 - [x] Column family export/import, remote compaction (CompactionService + OpenAndCompact; job/result format interoperates with native both ways), GetMergeOperands, PromoteL0, SuggestCompactRange, DeleteFilesInRange(s), LockWAL, Disable/EnableManualCompaction, GetCreationTimeOfOldestFile, ClipColumnFamily, GetPropertiesOfTablesInRange, OpenAndTrimHistory (compat vs native), MultiScan
@@ -276,6 +276,11 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [-] Deviation inventory: not needed (user accepted the documented reasons in docs/validation.md)
 - [ ] (upstream NotSupported, kept) timestamps in optimistic transactions and explicit-timestamp WBWI writes
 
+## Gaps found while porting the utilities (2026-11-06)
+
+- [ ] `max_successive_merges` is accepted but ignored (upstream folds merge operands into a Put at write time once the limit is hit) (S)
+- [ ] `min_write_buffer_number_to_merge` is ignored: immutable memtables are flushed as soon as they are sealed (M)
+
 ## Unported utilities (found 2026-11-03)
 
 - [x] Built-in merge operators: max, put / put_v1, sortlist, bytesxor, StringAppendTEST, AggMerge (+ Aggregator API); resolved by name from OPTIONS; native writes / managed reads and compacts and vice versa for 12 ids; string-append delimiter now persisted like native
@@ -283,7 +288,7 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [x] WalFilter (recovery replay rewritten as a port of ProcessLogFiles), track_and_verify_wals predecessor-WAL records written + verified (byte-identical with native both ways), UserWriteCallback; WAL recovery now follows upstream for paranoid_checks=false and point-in-time stops
 - [x] WAL recycling at DB level (recycle list, in-place reuse, recyclable records, option rules; native recovers managed recycled WALs and vice versa)
 - [x] WAL settings x failure-mode matrices: unit 300 scenarios (15 factors pairwise x 15 faults; long 6,299), compat 1,152 managed-vs-native scenarios (long 36,864); 7 managed/native disagreements found and fixed (corruption messages, seqno-set-backwards check, 2PC WAL retention, 2PC after point-in-time stop, blob direct-write crash images, reused-WAL stale tail)
-- [~] GetAllKeyVersions (utilities/debug.h), OptionChangeMigration, MemoryUtil::GetApproximateMemoryUsageByType, InfoLogFinder (S each)
+- [x] GetAllKeyVersions (pooled, 0-alloc enumeration), OptionChangeMigration (all of option_change_migration_test.cc; native opens migrated DBs), MemoryUtil (+ fixed `estimate-table-readers-mem` and `size-all-mem-tables`), InfoLogFinder (finds native LOG files)
 - [~] Cache dump / load (cache_dump_load.h) (M)
-- [~] TransactionDBMutexFactory (custom transaction mutexes) (S)
-- [~] EnvMirror (test utility) (S); StackableDB has no C# equivalent (transactions / TTL are built in)
+- [x] TransactionDBMutexFactory (`TransactionDbOptions.CustomMutexFactory`; default lock path unchanged within noise, PointLockBenchmarks)
+- [x] EnvMirror as `MirrorFileSystem` (env_mirror_test.cc ported + DB workload); StackableDB has no C# equivalent (transactions / TTL are built in)
