@@ -204,22 +204,36 @@ public sealed class CacheLayerTests
         tiered.Close();
     }
 
+    /// <summary>
+    /// Inserts a page; without pipelined writes Insert returns TryAgain (false) while every write buffer is held by
+    /// files whose writes the writer threads have not finished (e.g. under CPU load). Like upstream's
+    /// PersistentCacheTierTest::InsertImpl, retry then, after waiting for the dispatched writes (instead of sleeping):
+    /// once they are done the full files are closed and their buffers are free again, so the retry must succeed.
+    /// </summary>
+    private static void InsertPage(BlockCacheTier tier, bool pipelineWrites, int key, int size)
+    {
+        if (tier.Insert(KeyBytes(key), Page(key, size))) return;
+        Assert.IsFalse(pipelineWrites, "pipelined inserts are queued, never TryAgain");
+        tier.Flush();
+        Assert.IsTrue(tier.Insert(KeyBytes(key), Page(key, size)), "insert after the pending writes completed, key " + key);
+    }
+
     [TestMethod]
     [DataRow(true)]
     [DataRow(false)]
     public void BlockCacheTierInsertLookupAcrossFilesAndEviction(bool pipelineWrites)
     {
         string dir = Path.Combine(Path.GetTempPath(), "pcache-" + Guid.NewGuid().ToString("N"));
+        var config = new PersistentCacheConfig(LocalFileSystem.Instance, dir, 4L << 20, writeBufferSize: 16 * 1024)
+        {
+            CacheFileSize = 256 * 1024, PipelineWrites = pipelineWrites, WriterQueueDepth = 2,
+        };
+        var tier = new BlockCacheTier(config);
         try
         {
-            var config = new PersistentCacheConfig(LocalFileSystem.Instance, dir, 4L << 20, writeBufferSize: 16 * 1024)
-            {
-                CacheFileSize = 256 * 1024, PipelineWrites = pipelineWrites, WriterQueueDepth = 2,
-            };
-            var tier = new BlockCacheTier(config);
             tier.Open();
             // Records can span write buffers; files roll over at cache_file_size.
-            for (int i = 0; i < 200; i++) Assert.IsTrue(tier.Insert(KeyBytes(i), Page(i, 5000 + i)));
+            for (int i = 0; i < 200; i++) InsertPage(tier, pipelineWrites, i, 5000 + i);
             tier.Flush();
             Assert.IsTrue(tier.FileCount > 1);
             Assert.IsTrue(File.Exists(Path.Combine(dir, "cache", "0.rc")));
@@ -232,7 +246,7 @@ public sealed class CacheLayerTests
             Assert.AreEqual(0, file0.Length % BlockCacheTier.FileAlignmentSize);
 
             // Exceeding the cache size evicts whole old files.
-            for (int i = 200; i < 1200; i++) tier.Insert(KeyBytes(i), Page(i, 5000));
+            for (int i = 200; i < 1200; i++) InsertPage(tier, pipelineWrites, i, 5000);
             tier.Flush();
             Assert.IsFalse(tier.TryLookup(KeyBytes(0), out _, out _), "oldest file evicted");
             CollectionAssert.AreEqual(Page(1199, 5000), LookupPage(tier, 1199));
@@ -241,6 +255,7 @@ public sealed class CacheLayerTests
             Assert.IsTrue(diskBytes <= (4L << 20) + 512 * 1024, "disk " + diskBytes);
             IReadOnlyDictionary<string, double> s = tier.Stats()[^1];
             Assert.IsTrue(s["persistentcache.blockcachetier.cache_hits"] >= 201);
+            Assert.AreEqual(0.0, s["persistentcache.blockcachetier.insert_dropped"], "no insert is dropped");
             tier.Close();
 
             // Reopen cleans up the cache folder (not persistent across restarts, as upstream).
@@ -251,6 +266,8 @@ public sealed class CacheLayerTests
         }
         finally
         {
+            // Stop the writer threads before the directory goes away, also when an assertion failed.
+            tier.Close();
             if (Directory.Exists(dir)) Directory.Delete(dir, true);
         }
     }

@@ -95,8 +95,14 @@ public sealed class BlockCacheTier : PersistentCacheTier
         if (Interlocked.Exchange(ref _opened, 0) == 0) return;
         if (_insertOps is not null)
         {
+            // Queued inserts are processed first (as upstream). The insert thread waits for free write buffers, which the
+            // writer threads release; if they cannot make progress for 30 s, stop waiting and drop the remaining inserts.
             _insertOps.Add(new InsertOp(null, null, true));
-            _insertThread!.Join();
+            if (!_insertThread!.Join(TimeSpan.FromSeconds(30)))
+            {
+                _bufferAllocator.Shutdown();
+                _insertThread.Join();
+            }
             _insertOps.Dispose();
             _insertOps = null;
         }
@@ -315,7 +321,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
                     for (LinkedListNode<CacheFile>? n = _fileLru.Last; n is not null; n = n.Previous)
                     {
                         CacheFile f = n.Value;
-                        if (f != _cacheFile && f.IsReadable && Volatile.Read(ref f.Refs) == 0)
+                        if (f != _cacheFile && f.IsEvictable && Volatile.Read(ref f.Refs) == 0)
                         {
                             victim = f;
                             _fileLru.Remove(n);
@@ -447,6 +453,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
         private long _diskWoff; // logical write offset
         private int _pendingIos;
         private bool _eof;
+        private bool _openFailed;
         public int Refs;
         public readonly uint CacheId;
         public readonly List<CacheKey> Keys = new();
@@ -469,11 +476,12 @@ public sealed class BlockCacheTier : PersistentCacheTier
             }
         }
 
-        public bool IsReadable
+        /// <summary>Fully written (readable, or failed to reopen for reading): may be evicted once unreferenced.</summary>
+        public bool IsEvictable
         {
             get
             {
-                lock (_rw) return _reader is not null;
+                lock (_rw) return _reader is not null || _openFailed;
             }
         }
 
@@ -571,15 +579,28 @@ public sealed class BlockCacheTier : PersistentCacheTier
             }
         }
 
+        // WriteableCacheFile::CloseAndOpenForReading. Runs on a writer thread: an I/O error (e.g. the cache directory was
+        // removed underneath the cache) leaves the file unreadable (its lookups count as errors, as upstream's failed
+        // RandomAccessCacheFile::OpenImpl) but evictable, and the write buffers are always returned to the allocator.
         private void CloseAndOpenForReading()
         {
-            _file!.Flush();
-            _file.Dispose();
-            _file = null;
-            foreach (byte[] b in _bufs) _tier._bufferAllocator.Deallocate(b);
-            _bufs.Clear();
-            _bufUsed.Clear();
-            _reader = _tier._opt.FileSystem.OpenRandomAccess(_path);
+            try
+            {
+                _file!.Flush();
+                _file.Dispose();
+                _reader = _tier._opt.FileSystem.OpenRandomAccess(_path);
+            }
+            catch (Exception e) when (e is IOException or ObjectDisposedException or RocksDbException or UnauthorizedAccessException)
+            {
+                _openFailed = true;
+            }
+            finally
+            {
+                _file = null;
+                foreach (byte[] b in _bufs) _tier._bufferAllocator.Deallocate(b);
+                _bufs.Clear();
+                _bufUsed.Clear();
+            }
         }
 
         public bool Read(in Lba lba, byte[] scratch)
@@ -652,6 +673,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
         private readonly object _lock = new();
         private readonly Stack<byte[]> _free = new();
         private int _allocated;
+        private bool _shutdown;
 
         public byte[]? Allocate()
         {
@@ -673,13 +695,28 @@ public sealed class BlockCacheTier : PersistentCacheTier
             }
         }
 
+        /// <summary>
+        /// Blocks until a buffer can be allocated (CacheWriteBufferAllocator::WaitUntilUsable waits on cond_empty_ until
+        /// bufs_ is non-empty) or <see cref="Shutdown"/> is called.
+        /// </summary>
         public void WaitUntilUsable()
         {
             lock (_lock)
             {
-                if (_free.Count == 0 && _allocated >= bufferCount) Monitor.Wait(_lock, 100);
+                while (!_shutdown && _free.Count == 0 && _allocated >= bufferCount) Monitor.Wait(_lock);
             }
         }
+
+        /// <summary>Wakes up and disables <see cref="WaitUntilUsable"/> (the tier is closing).</summary>
+        public void Shutdown()
+        {
+            lock (_lock)
+            {
+                _shutdown = true;
+                Monitor.PulseAll(_lock);
+            }
+        }
+
     }
 
     /// <summary>ThreadedWriter: writer_qdepth threads writing dispatched buffers, reserving cache space first.</summary>
