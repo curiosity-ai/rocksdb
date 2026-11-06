@@ -15,6 +15,10 @@ namespace RocksDb.Managed.Utilities.Transactions;
 /// stolen). Waiting is asynchronous (a <see cref="TaskCompletionSource"/> per wait) unless the caller is synchronous.</item>
 /// <item>Deadlock detection (deadlock_detect): a wait-for graph between transaction ids, searched breadth-first up to
 /// deadlock_detect_depth before waiting; detected cycles are recorded in a bounded buffer.</item>
+/// <item>With <see cref="TransactionDbOptions.CustomMutexFactory"/> each stripe instead uses a
+/// <see cref="TransactionDbMutex"/> and a <see cref="TransactionDbCondVar"/> from the factory, and lock waits follow
+/// upstream's AcquireWithTimeout exactly (blocking the calling thread). The default path is untouched by this (one null
+/// test per TryLock / UnLock).</item>
 /// </list>
 /// </summary>
 internal sealed class PointLockManager : LockManager
@@ -23,6 +27,7 @@ internal sealed class PointLockManager : LockManager
     private readonly int _numStripes;
     private readonly long _maxNumLocks;
     private readonly ConcurrentDictionary<uint, LockMap> _lockMaps = new();
+    private readonly TransactionDbMutexFactory? _mutexFactory; // custom_mutex_factory (null = built-in stripe locks)
 
     // Wait-for graph (wait_txn_map_ / rev_wait_txn_map_), guarded by _waitLock.
     private readonly Lock _waitLock = new();
@@ -37,6 +42,7 @@ internal sealed class PointLockManager : LockManager
         _numStripes = Math.Max(1, options.NumStripes);
         _maxNumLocks = options.MaxNumLocks;
         _maxDeadlocks = Math.Max(0, options.MaxNumDeadlocks);
+        _mutexFactory = options.CustomMutexFactory;
     }
 
     /// <summary>A locked key (LockInfo). Recycled by its stripe together with its key buffer.</summary>
@@ -64,10 +70,19 @@ internal sealed class PointLockManager : LockManager
         private LockInfo? _free;
         private int _freeCount;
 
-        public Stripe()
+        /// <summary>stripe_mutex / stripe_cv from the custom mutex factory (null with the built-in locks).</summary>
+        public readonly TransactionDbMutex? CustomMutex;
+        public readonly TransactionDbCondVar? CustomCv;
+
+        public Stripe(TransactionDbMutexFactory? factory)
         {
             Keys = new Dictionary<PooledKey, LockInfo>(PooledKeyComparer.Instance);
             Lookup = Keys.GetAlternateLookup<ReadOnlySpan<byte>>();
+            if (factory is not null)
+            {
+                CustomMutex = factory.AllocateMutex() ?? throw new InvalidOperationException("AllocateMutex returned null");
+                CustomCv = factory.AllocateCondVar() ?? throw new InvalidOperationException("AllocateCondVar returned null");
+            }
         }
 
         /// <summary>Adds a lock entry for <paramref name="key"/> (a recycled one when available). REQUIRES: <see cref="Mutex"/>.</summary>
@@ -104,22 +119,22 @@ internal sealed class PointLockManager : LockManager
         }
     }
 
-    private sealed class LockMap(int stripes)
+    private sealed class LockMap(int stripes, TransactionDbMutexFactory? factory)
     {
-        public readonly Stripe[] Stripes = CreateStripes(stripes);
+        public readonly Stripe[] Stripes = CreateStripes(stripes, factory);
         public long LockedKeyCount;
 
-        private static Stripe[] CreateStripes(int n)
+        private static Stripe[] CreateStripes(int n, TransactionDbMutexFactory? factory)
         {
             var s = new Stripe[n];
-            for (int i = 0; i < n; i++) s[i] = new Stripe();
+            for (int i = 0; i < n; i++) s[i] = new Stripe(factory);
             return s;
         }
     }
 
     private readonly record struct WaitInfo(ulong[] Neighbors, uint CfId, bool Exclusive, byte[] Key);
 
-    private LockMap GetLockMap(uint cf) => _lockMaps.GetOrAdd(cf, static (_, n) => new LockMap(n), _numStripes);
+    private LockMap GetLockMap(uint cf) => _lockMaps.GetOrAdd(cf, static (_, self) => new LockMap(self._numStripes, self._mutexFactory), this);
 
     private Stripe GetStripe(LockMap map, ReadOnlySpan<byte> key) => map.Stripes[ByteKeyComparer.Bucket(key, 0, map.Stripes.Length)];
 
@@ -141,6 +156,7 @@ internal sealed class PointLockManager : LockManager
     {
         LockMap map = GetLockMap(cf);
         Stripe stripe = GetStripe(map, key);
+        if (_mutexFactory is not null) return new ValueTask<RocksDbException?>(AcquireWithTimeoutCustom(txn, map, stripe, cf, key, exclusive));
         List<ulong> waitIds = txn.WaitIdsScratch;
         waitIds.Clear();
         RocksDbException? result;
@@ -228,6 +244,105 @@ internal sealed class PointLockManager : LockManager
             if (endTime > 0 && NowMicros() >= endTime) timedOut = true;
         }
         if (result is not null) txn.SetWaitingTxn(waitIds, cf, key); // persist the lock information for debugging
+        return result;
+    }
+
+    /// <summary>
+    /// PointLockManager::AcquireWithTimeout over the custom stripe mutex and condition variable
+    /// (<see cref="TransactionDbOptions.CustomMutexFactory"/>): lock the stripe (Lock, or TryLockFor(timeout)), try
+    /// to acquire, and while the lock is held by others wait on the stripe's condition variable (bounded by the lock
+    /// timeout and the holder's expiration), with deadlock detection before each wait. Blocks the calling thread.
+    /// Failures of the custom mutex / condition variable (thrown <see cref="RocksDbException"/>s) are returned.
+    /// </summary>
+    private RocksDbException? AcquireWithTimeoutCustom(PessimisticTransaction txn, LockMap map, Stripe stripe, uint cf, ReadOnlySpan<byte> key,
+        bool exclusive)
+    {
+        TransactionDbMutex mutex = stripe.CustomMutex!;
+        TransactionDbCondVar cv = stripe.CustomCv!;
+        long timeout = txn.LockTimeoutMicros;
+        long endTime = timeout > 0 ? NowMicros() + timeout : 0;
+        try
+        {
+            // If timeout is negative, we wait indefinitely to acquire the lock
+            if (timeout < 0) mutex.Lock();
+            else if (!mutex.TryLockFor(timeout)) return new RocksDbException(StatusCode.TimedOut, "Operation timed out: Timeout waiting to lock key", StatusSubCode.MutexTimeout);
+        }
+        catch (RocksDbException e)
+        {
+            return e; // failed to acquire mutex
+        }
+
+        List<ulong> waitIds = txn.WaitIdsScratch;
+        waitIds.Clear();
+        byte[]? keyCopy = null;
+        RocksDbException? result;
+        try
+        {
+            // Acquire lock if we are able to
+            result = AcquireLocked(map, stripe, key, txn.Id, txn.ExpirationTime, exclusive, out long expireHint, waitIds);
+            if (result is not null && timeout != 0)
+            {
+                // If we weren't able to acquire the lock, we will keep retrying as long as the timeout allows.
+                keyCopy = key.ToArray();
+                waitIds = new List<ulong>(waitIds);
+                bool timedOut = false;
+                do
+                {
+                    // Decide how long to wait
+                    long cvEnd = -1;
+                    if (expireHint > 0 && endTime > 0) cvEnd = Math.Min(expireHint, endTime);
+                    else if (expireHint > 0) cvEnd = expireHint;
+                    else if (endTime > 0) cvEnd = endTime;
+
+                    // We are dependent on a transaction to finish, so perform deadlock detection.
+                    if (waitIds.Count != 0)
+                    {
+                        if (txn.DeadlockDetect && IncrementWaiters(txn, waitIds, keyCopy, cf, exclusive))
+                        {
+                            return new RocksDbException(StatusCode.Busy, "Resource busy: Deadlock", StatusSubCode.Deadlock);
+                        }
+                        txn.SetWaitingTxn(waitIds, cf, keyCopy);
+                    }
+
+                    bool cvTimedOut = false;
+                    RocksDbException? cvFailure = null;
+                    try
+                    {
+                        if (cvEnd < 0)
+                        {
+                            cv.Wait(mutex); // Wait indefinitely
+                        }
+                        else
+                        {
+                            long now = NowMicros();
+                            cvTimedOut = cvEnd <= now || !cv.WaitFor(mutex, cvEnd - now); // now >= cv_end_time: already timed out
+                        }
+                    }
+                    catch (RocksDbException e)
+                    {
+                        cvFailure = e;
+                    }
+
+                    if (waitIds.Count != 0)
+                    {
+                        txn.ClearWaitingTxn();
+                        if (txn.DeadlockDetect) DecrementWaiters(txn, waitIds);
+                    }
+                    if (cvFailure is not null) return cvFailure;
+                    // Even though we timed out, we will still make one more attempt to acquire lock below (it is
+                    // possible the lock expired and we were never signaled).
+                    if (cvTimedOut) timedOut = true;
+                    waitIds.Clear();
+                    result = AcquireLocked(map, stripe, key, txn.Id, txn.ExpirationTime, exclusive, out expireHint, waitIds);
+                } while (result is not null && !timedOut);
+            }
+        }
+        finally
+        {
+            mutex.Unlock();
+        }
+        // On timeout, persist the lock information so we can debug the contention
+        if (result is { Code: StatusCode.TimedOut }) txn.SetWaitingTxn(waitIds, cf, keyCopy ?? key.ToArray());
         return result;
     }
 
@@ -324,6 +439,11 @@ internal sealed class PointLockManager : LockManager
     {
         if (!_lockMaps.TryGetValue(cf, out LockMap? map)) return; // Column Family must have been dropped.
         Stripe stripe = GetStripe(map, key);
+        if (_mutexFactory is not null)
+        {
+            UnLockCustom(txn.Id, key, stripe, map);
+            return;
+        }
         TaskCompletionSource[]? wake = null;
         lock (stripe.Mutex)
         {
@@ -339,6 +459,21 @@ internal sealed class PointLockManager : LockManager
         {
             foreach (TaskCompletionSource w in wake) w.TrySetResult();
         }
+    }
+
+    /// <summary>UnLock with the custom stripe mutex: unlock the key, then signal waiting threads to retry locking.</summary>
+    private void UnLockCustom(ulong txnId, ReadOnlySpan<byte> key, Stripe stripe, LockMap map)
+    {
+        stripe.CustomMutex!.Lock();
+        try
+        {
+            UnLockKey(txnId, key, stripe, map);
+        }
+        finally
+        {
+            stripe.CustomMutex.Unlock();
+        }
+        stripe.CustomCv!.NotifyAll();
     }
 
     /// <summary>Releases all locks tracked by <paramref name="tracker"/>.</summary>
@@ -490,6 +625,14 @@ internal sealed class PointLockManager : LockManager
         }
     }
 
+    private static void AddLockStatus(uint cf, Stripe s, List<KeyLockInfo> result)
+    {
+        foreach (KeyValuePair<PooledKey, LockInfo> k in s.Keys)
+        {
+            result.Add(new KeyLockInfo(cf, k.Key.Span.ToArray(), k.Value.TxnIds.ToArray(), k.Value.Exclusive));
+        }
+    }
+
     /// <summary>Snapshot of all held locks (GetPointLockStatus).</summary>
     public override List<KeyLockInfo> GetLockStatusData()
     {
@@ -498,13 +641,20 @@ internal sealed class PointLockManager : LockManager
         {
             foreach (Stripe s in kv.Value.Stripes)
             {
-                lock (s.Mutex)
+                if (s.CustomMutex is { } m)
                 {
-                    foreach (KeyValuePair<PooledKey, LockInfo> k in s.Keys)
+                    m.Lock();
+                    try
                     {
-                        result.Add(new KeyLockInfo(kv.Key, k.Key.Span.ToArray(), k.Value.TxnIds.ToArray(), k.Value.Exclusive));
+                        AddLockStatus(kv.Key, s, result);
                     }
+                    finally
+                    {
+                        m.Unlock();
+                    }
+                    continue;
                 }
+                lock (s.Mutex) AddLockStatus(kv.Key, s, result);
             }
         }
         return result;
