@@ -22,6 +22,12 @@ internal interface ITableMultiGetBatch
     /// it returns false (like <see cref="TableEntryVisitor{TState}"/>).
     /// </summary>
     bool Visit(int key, ReadOnlySpan<byte> internalKey, ReadOnlySpan<byte> value);
+
+    /// <summary>
+    /// Key <paramref name="key"/> cannot be answered without file I/O (read_tier = kBlockCacheTier): its lookup ends
+    /// with Incomplete (GetContext::MarkKeyMayExist + the Incomplete status of BlockBasedTable::MultiGet).
+    /// </summary>
+    void SetIncomplete(int key);
 }
 
 public sealed partial class BlockBasedTableReader
@@ -68,6 +74,8 @@ public sealed partial class BlockBasedTableReader
             {
                 if (!mayMatch[i]) continue;
                 int key = keys[i];
+                try
+                {
                 if (synchronous)
                 {
                     SeekIndex(idx, batch, key);
@@ -79,6 +87,7 @@ public sealed partial class BlockBasedTableReader
                     if (!seek.IsCompletedSuccessfully) await seek.ConfigureAwait(false);
                 }
                 bool first = true;
+                bool matched = false;
                 while (idx.Valid)
                 {
                     BlockHandle handle = idx.Handle;
@@ -106,7 +115,7 @@ public sealed partial class BlockBasedTableReader
                         }
                         currentOffset = handle.Offset;
                     }
-                    int r = VisitBlock(batch, key, data, current.Block!, first);
+                    int r = VisitBlock(batch, key, data, current.Block!, first, flags, ref matched);
                     if (r <= 0) break; // done with this key
                     first = false;
                     if (synchronous)
@@ -118,6 +127,13 @@ public sealed partial class BlockBasedTableReader
                         ValueTask next = idx.NextAsync(cancellationToken);
                         if (!next.IsCompletedSuccessfully) await next.ConfigureAwait(false);
                     }
+                }
+                }
+                catch (RocksDbException e) when (e.Code == StatusCode.Incomplete && (flags & TableReadFlags.BlockCacheTier) != 0)
+                {
+                    // MultiGet with read_tier = kBlockCacheTier: a block that is not cached makes this key Incomplete
+                    // ("no blocking io", statuses[i] in BlockBasedTable::MultiGet); the other keys go on.
+                    batch.SetIncomplete(key);
                 }
             }
         }
@@ -297,7 +313,8 @@ public sealed partial class BlockBasedTableReader
     /// Visits the entries of <paramref name="key"/> in <paramref name="block"/>. Returns 1 when the key's entries may
     /// continue in the next block, 0 (or -1) when the key is done.
     /// </summary>
-    private int VisitBlock<TBatch>(TBatch batch, int key, BlockIter data, Block block, bool first) where TBatch : class, ITableMultiGetBatch
+    private int VisitBlock<TBatch>(TBatch batch, int key, BlockIter data, Block block, bool first, TableReadFlags flags, ref bool matched)
+        where TBatch : class, ITableMultiGetBatch
     {
         ReadOnlySpan<byte> internalKey = batch.InternalKey(key);
         data.InitializeData(block, _icmp, GlobalSequenceNumber, PadTimestampSize);
@@ -316,6 +333,11 @@ public sealed partial class BlockBasedTableReader
             {
                 ReadOnlySpan<byte> k = data.Key;
                 if (!UserKeyEquals(DbFormat.ExtractUserKey(k), userKey)) return 0;
+                if (!matched)
+                {
+                    matched = true;
+                    RecordFilterTruePositive(flags);
+                }
                 if (!batch.Visit(key, k, data.Value)) return 0;
             }
             return 1;

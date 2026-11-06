@@ -33,6 +33,9 @@ internal sealed partial class DbImpl
         long t0 = st is null ? 0 : st.StartTimer();
         SuperVersion sv = GetAndRefSuperVersion(cfd, out int svSlot);
         ulong snapshot = ReadSequence(options);
+        // ReadOptions::deadline: file reads of a synchronous run check it (the thread-local deadline must not leak to
+        // other work on the threads an async run continues on).
+        long deadlineToken = synchronous ? ReadDeadline.Enter(options) : -1;
         try
         {
             if (cfd.TimestampSize != 0)
@@ -46,19 +49,37 @@ internal sealed partial class DbImpl
             batch.BeginRun(cfd.MergeOperator, snapshot, ucmp);
             batch.ReadFlags = TableReadFlagsExtensions.FromReadOptions(options);
             int n = batch.Count;
+            if (ReadDeadline.IsExceeded(options))
+            {
+                // MultiGetImpl: the deadline is checked before each batch of keys; the keys left are TimedOut.
+                for (int k = 0; k < n; k++) batch.SetTimedOut(k);
+                batch.FinishRun();
+                if (st is not null) RecordMultiGet(st, batch, t0);
+                return;
+            }
             int[] order = batch.Order;
-            bool memtableOnly = options?.ReadTier == ReadTier.MemtableTier;
+            // MultiGetImpl skip_memtable: kPersistedTier reads skip the memtables once data was written without the
+            // WAL. (kMemtableTier does not restrict MultiGet: like Get, it reads the table files.)
+            bool skipMemTables = SkipMemTables(options);
+            // value_size_soft_limit: once the values found so far exceed it, the keys not yet done are Aborted.
+            ulong softLimit = options?.ValueSizeSoftLimit ?? ulong.MaxValue;
+            ulong valueSize = 0;
 
             // Memtables (MultiGetImpl: per key, newest memtable first). Keys still pending stay in sorted order.
             int pending = 0;
             for (int i = 0; i < n; i++)
             {
                 int k = order[i];
-                if (GetFromMemTables(sv, batch.UserKey(k), snapshot, batch.Context(k))) continue;
-                if (memtableOnly)
+                if (!skipMemTables && GetFromMemTables(sv, batch.UserKey(k), snapshot, batch.Context(k)))
                 {
-                    if (batch.Context(k).State != GetContext.GetState.NotFound)
-                        batch.SetError(k, new RocksDbException(StatusCode.Incomplete, "Incomplete: merge operands not all in memtables"));
+                    if (softLimit != ulong.MaxValue && AddValueSize(batch, k, ref valueSize, softLimit))
+                    {
+                        // MemTable::MultiGet: every key still in the range is Aborted.
+                        for (int j = i + 1; j < n; j++) batch.SetAborted(order[j]);
+                        for (int j = 0; j < pending; j++) batch.SetAborted(order[j]);
+                        pending = 0;
+                        break;
+                    }
                     continue;
                 }
                 order[pending++] = k;
@@ -80,9 +101,11 @@ internal sealed partial class DbImpl
                         if (UserKeyInFileRange(ucmp, batch.UserKey(k), f)) sub[m++] = k;
                     }
                     if (m == 0) continue;
+                    batch.ReadFlags = WithFilterSkip(cfd, s, 0, fi == l0.Length - 1, batch.ReadFlags);
                     await MultiGetFromFileAsync(cfd, f, batch, m, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
                     SampleMultiGetReads(f, batch, m);
                     MarkHitLevel(batch, m, 0);
+                    if (softLimit != ulong.MaxValue && ApplySoftLimit(batch, m, ref valueSize, softLimit)) AbortPending(batch, order, pending);
                     pending = RemoveDone(batch, order, pending);
                 }
                 // Sorted levels: one file per key (FindFile on the lookup key); consecutive keys of a file are grouped.
@@ -104,9 +127,15 @@ internal sealed partial class DbImpl
                             if (ucmp.Compare(batch.UserKey(k), DbFormat.ExtractUserKey(f.Smallest)) >= 0) sub[m++] = k;
                         }
                         if (m == 0) continue;
+                        batch.ReadFlags = WithFilterSkip(cfd, s, level, false, batch.ReadFlags);
                         await MultiGetFromFileAsync(cfd, f, batch, m, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
                         SampleMultiGetReads(f, batch, m);
                         MarkHitLevel(batch, m, level);
+                        if (softLimit != ulong.MaxValue && ApplySoftLimit(batch, m, ref valueSize, softLimit))
+                        {
+                            AbortPending(batch, order, pending);
+                            break;
+                        }
                     }
                     pending = RemoveDone(batch, order, pending);
                 }
@@ -116,15 +145,69 @@ internal sealed partial class DbImpl
             {
                 GetContext ctx = batch.Context(k);
                 if (!ctx.NeedsBlobResolution) continue;
-                if (synchronous) ctx.ResolveBlob(cfd.BlobSource, sv.Current.Storage, options, batch.UserKey(k));
-                else await ctx.ResolveBlobAsync(cfd.BlobSource, sv.Current.Storage, options, batch.UserKeyMemory(k), cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    if (synchronous) ctx.ResolveBlob(cfd.BlobSource, sv.Current.Storage, options, batch.UserKey(k));
+                    else await ctx.ResolveBlobAsync(cfd.BlobSource, sv.Current.Storage, options, batch.UserKeyMemory(k), cancellationToken).ConfigureAwait(false);
+                }
+                catch (RocksDbException e) when (e.Code == StatusCode.Incomplete)
+                {
+                    // Version::MultiGetBlob with kBlockCacheTier: a blob that is not cached makes only this key Incomplete.
+                    batch.SetError(k, e);
+                }
             }
             batch.FinishRun();
             if (st is not null) RecordMultiGet(st, batch, t0);
         }
         finally
         {
+            ReadDeadline.Exit(deadlineToken);
             ReturnAndCleanupSuperVersion(cfd, sv, svSlot);
+        }
+    }
+
+    /// <summary>
+    /// MultiGetRange::AddValueSize for key <paramref name="k"/> found with a value; true when the total now exceeds
+    /// <paramref name="limit"/> (read_options.value_size_soft_limit). Deviation: a value still to be merged counts
+    /// with the size of its base value (upstream adds the merged size).
+    /// </summary>
+    private static bool AddValueSize(MultiGetBatch batch, int k, ref ulong valueSize, ulong limit)
+    {
+        GetContext ctx = batch.Context(k);
+        if (ctx.State != GetContext.GetState.Found || batch.GetStatus(k) == MultiGetStatus.Error) return false;
+        valueSize += (ulong)ctx.Value.WrittenCount;
+        return valueSize > limit;
+    }
+
+    /// <summary>
+    /// The value_size_soft_limit check of Version::MultiGetFromSST for the keys batch.Sub[0..count) just looked up in
+    /// one file (in key order): the key whose value crosses the limit is returned, later keys found in the file are
+    /// Aborted. True when the limit was crossed.
+    /// </summary>
+    private static bool ApplySoftLimit(MultiGetBatch batch, int count, ref ulong valueSize, ulong limit)
+    {
+        int[] sub = batch.Sub;
+        bool exceeded = valueSize > limit;
+        for (int i = 0; i < count; i++)
+        {
+            int k = sub[i];
+            if (exceeded)
+            {
+                if (batch.Context(k).State == GetContext.GetState.Found) batch.SetAborted(k);
+                continue;
+            }
+            exceeded = AddValueSize(batch, k, ref valueSize, limit);
+        }
+        return exceeded;
+    }
+
+    /// <summary>Version::MultiGet after Aborted: every key whose lookup is not finished is Aborted.</summary>
+    private static void AbortPending(MultiGetBatch batch, int[] order, int pending)
+    {
+        for (int i = 0; i < pending; i++)
+        {
+            int k = order[i];
+            if (!batch.Context(k).Done) batch.SetAborted(k);
         }
     }
 
@@ -195,7 +278,18 @@ internal sealed partial class DbImpl
     private static ValueTask MultiGetFromFileAsync(ColumnFamilyData cfd, FileMetaData f, MultiGetBatch batch, int count, ulong snapshot, bool synchronous,
         CancellationToken cancellationToken)
     {
-        TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels);
+        FragmentedRangeTombstoneList? rangeDels;
+        TableReaderLease lease;
+        try
+        {
+            lease = cfd.TableCache.GetReaderForVersion(f, out rangeDels, batch.ReadFlags);
+        }
+        catch (RocksDbException e) when (e.Code == StatusCode.Incomplete)
+        {
+            // TableCache::MultiGet with no_io and a table that is not open: the keys of this file are Incomplete.
+            for (int i = 0; i < count; i++) batch.SetIncomplete(batch.Sub[i]);
+            return ValueTask.CompletedTask;
+        }
         ValueTask t;
         try
         {

@@ -236,6 +236,7 @@ public static class TableFactory
             PrefixExtractor = options.PrefixExtractor,
             LevelAtCreation = where.Level,
             IsFlush = where.IsFlush,
+            OptimizeFiltersForHits = options.OptimizeFiltersForHits,
             PersistUserDefinedTimestamps = options.PersistUserDefinedTimestamps,
             TablePropertiesCollectorFactories = options.TablePropertiesCollectorFactories.ToArray(),
             NumLevels = options.NumLevels,
@@ -335,6 +336,7 @@ public static class TableFactory
             BloomLocality = options.BloomLocality,
             UserDefinedIndexFactory = t.UserDefinedIndexFactory,
             IndexMode = t.IndexMode,
+            NumLevels = options.NumLevels,
         };
         if (cache is not null) r = r with { BlockCache = cache };
         if (t.PersistentCache is not null) r = r with { PersistentCache = t.PersistentCache };

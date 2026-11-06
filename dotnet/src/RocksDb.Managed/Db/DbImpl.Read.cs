@@ -44,7 +44,27 @@ internal sealed partial class DbImpl
             GetWithBlockCacheTrace(cfd, options, key, ctx);
             return;
         }
+        if (options is not null && options.Deadline > TimeSpan.Zero)
+        {
+            GetWithDeadline(cfd, options, key, ctx);
+            return;
+        }
         GetImpl(cfd, options, key, ctx);
+    }
+
+    /// <summary>GetImpl with ReadOptions::deadline: table file reads after the deadline fail with TimedOut (<see cref="ReadDeadline"/>).</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void GetWithDeadline(ColumnFamilyData cfd, ReadOptions options, ReadOnlySpan<byte> key, GetContext ctx)
+    {
+        long token = ReadDeadline.Enter(options);
+        try
+        {
+            GetImpl(cfd, options, key, ctx);
+        }
+        finally
+        {
+            ReadDeadline.Exit(token);
+        }
     }
 
     private void GetImpl(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, GetContext ctx)
@@ -224,17 +244,12 @@ internal sealed partial class DbImpl
         var lkey = new LookupKey(key, snapshot, ts, scratch);
         try
         {
-            if (GetFromMemTables(sv, lkey, ctx))
+            if (!SkipMemTables(options) && GetFromMemTables(sv, lkey, ctx))
             {
                 ctx.FromMemTable = true;
                 // A blob index is resolved while the super version (and so its blob files) is referenced.
                 ctx.ResolveBlob(cfd.BlobSource, sv.Current.Storage, options, key);
                 return;
-            }
-            if (options?.ReadTier == ReadTier.MemtableTier)
-            {
-                if (ctx.State == GetContext.GetState.NotFound) return;
-                ThrowHelper.Corruption("Incomplete: merge operands not all in memtables");
             }
             GetFromVersion(cfd, sv.Current, lkey.InternalKey, lkey.UserKey, snapshot, ctx);
             ctx.ResolveBlob(cfd.BlobSource, sv.Current.Storage, options, key);
@@ -244,6 +259,30 @@ internal sealed partial class DbImpl
             lkey.Dispose();
         }
     }
+
+    /// <summary>
+    /// GetImpl's skip_memtable: a read with read_tier = kPersistedTier skips the memtables once the DB holds data
+    /// written without the WAL (has_unpersisted_data_), so it only returns data that survives a crash. (MemtableTier
+    /// does not restrict point lookups upstream: only iterators skip the table files, NewInternalIterator.)
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool SkipMemTables(ReadOptions? options) => options?.ReadTier == ReadTier.PersistedTier && Volatile.Read(ref _hasUnpersistedData);
+
+    /// <summary>
+    /// The read flags for a table file of <paramref name="level"/>: with optimize_filters_for_hits, filters are not
+    /// consulted on the last non-empty level (Version::IsFilterSkipped: level &gt; 0 or the last L0 file, and the level
+    /// is num_non_empty_levels - 1), since reaching it implies misses at all upper levels.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static TableReadFlags WithFilterSkip(ColumnFamilyData cfd, VersionStorageInfo s, int level, bool isFileLastInLevel, TableReadFlags flags)
+    {
+        if (!cfd.Options.OptimizeFiltersForHits) return flags;
+        return IsFilterSkipped(s, level, isFileLastInLevel) ? flags | TableReadFlags.SkipFilters : flags & ~TableReadFlags.SkipFilters;
+    }
+
+    /// <summary>Port of Version::IsFilterSkipped (version_set.cc) for a column family with optimize_filters_for_hits.</summary>
+    internal static bool IsFilterSkipped(VersionStorageInfo s, int level, bool isFileLastInLevel) =>
+        (level > 0 || isFileLastInLevel) && level == s.NumNonEmptyLevels - 1;
 
     /// <summary>Memtable part of GetImpl. Returns true if a final result was found.</summary>
     private static bool GetFromMemTables(SuperVersion sv, scoped in LookupKey lkey, GetContext ctx)
@@ -282,6 +321,7 @@ internal sealed partial class DbImpl
             FileMetaData f = l0[i];
             if (CompareFileBoundary(ucmp, tsSize, userKey, f.Smallest) < 0 || CompareFileBoundary(ucmp, tsSize, userKey, f.Largest) > 0) continue;
             if (sample) FileReadSample.SampleFileReadInc(f);
+            ctx.ReadFlags = WithFilterSkip(cfd, s, 0, i == l0.Length - 1, ctx.ReadFlags);
             bool done = GetFromFile(cfd, f, ikey, userKey, snapshot, ctx);
             if (sample) SampleCollapsibleRead(f, ctx);
             if (done)
@@ -299,6 +339,7 @@ internal sealed partial class DbImpl
             FileMetaData f = files[idx];
             if (CompareFileBoundary(ucmp, tsSize, userKey, f.Smallest) < 0) continue;
             if (sample) FileReadSample.SampleFileReadInc(f);
+            ctx.ReadFlags = WithFilterSkip(cfd, s, level, false, ctx.ReadFlags);
             bool done = GetFromFile(cfd, f, ikey, userKey, snapshot, ctx);
             if (sample) SampleCollapsibleRead(f, ctx);
             if (done)
@@ -334,7 +375,7 @@ internal sealed partial class DbImpl
     /// <summary>TableCache::Get: range tombstones of the file, then the point lookup. Returns true when done.</summary>
     private static bool GetFromFile(ColumnFamilyData cfd, FileMetaData f, ReadOnlySpan<byte> ikey, ReadOnlySpan<byte> userKey, ulong snapshot, GetContext ctx)
     {
-        TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels);
+        TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels, ctx.ReadFlags);
         try
         {
             if (rangeDels is not null)
@@ -393,16 +434,11 @@ internal sealed partial class DbImpl
         PooledBufferWriter ikeyBuf = ObjectPools.RentWriter();
         try
         {
-            if (GetFromMemTables(sv, key.Span, snapshot, ctx))
+            if (!SkipMemTables(options) && GetFromMemTables(sv, key.Span, snapshot, ctx))
             {
                 ctx.FromMemTable = true;
                 await ctx.ResolveBlobAsync(cfd.BlobSource, sv.Current.Storage, options, key, cancellationToken).ConfigureAwait(false);
                 return;
-            }
-            if (options?.ReadTier == ReadTier.MemtableTier)
-            {
-                if (ctx.State == GetContext.GetState.NotFound) return;
-                ThrowHelper.Corruption("Incomplete: merge operands not all in memtables");
             }
             Span<byte> dst = ikeyBuf.GetSpan(key.Length + DbFormat.InternalKeyFooterSize);
             int n = DbFormat.AppendInternalKey(dst, key.Span, snapshot, DbFormat.ValueTypeForSeek);
@@ -418,6 +454,7 @@ internal sealed partial class DbImpl
                 FileMetaData f = l0[i];
                 if (!UserKeyInFileRange(ucmp, key.Span, f)) continue;
                 if (sample) FileReadSample.SampleFileReadInc(f);
+                ctx.ReadFlags = WithFilterSkip(cfd, s, 0, i == l0.Length - 1, ctx.ReadFlags);
                 bool done = await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false);
                 if (sample) SampleCollapsibleRead(f, ctx);
                 if (done)
@@ -437,6 +474,7 @@ internal sealed partial class DbImpl
                     FileMetaData f = files[idx];
                     if (ucmp.Compare(key.Span, DbFormat.ExtractUserKey(f.Smallest)) < 0) continue;
                     if (sample) FileReadSample.SampleFileReadInc(f);
+                    ctx.ReadFlags = WithFilterSkip(cfd, s, level, false, ctx.ReadFlags);
                     bool done = await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false);
                     if (sample) SampleCollapsibleRead(f, ctx);
                     if (done)
@@ -489,16 +527,11 @@ internal sealed partial class DbImpl
         PooledBufferWriter ikeyBuf = ObjectPools.RentWriter();
         try
         {
-            if (LookupMemTablesWithTimestamp(cfd, sv, snapshot, options, key.Span, ctx, ikeyBuf))
+            if (LookupMemTablesWithTimestamp(cfd, sv, snapshot, options, key.Span, ctx, ikeyBuf, SkipMemTables(options)))
             {
                 ctx.FromMemTable = true;
                 await ctx.ResolveBlobAsync(cfd.BlobSource, sv.Current.Storage, options, key, cancellationToken).ConfigureAwait(false);
                 return;
-            }
-            if (options?.ReadTier == ReadTier.MemtableTier)
-            {
-                if (ctx.State == GetContext.GetState.NotFound) return;
-                ThrowHelper.Corruption("Incomplete: merge operands not all in memtables");
             }
             ReadOnlyMemory<byte> ikey = ikeyBuf.WrittenMemory;
             VersionStorageInfo s = sv.Current.Storage;
@@ -512,6 +545,7 @@ internal sealed partial class DbImpl
                 FileMetaData f = l0[i];
                 if (!UserKeyInFileRangeWithoutTimestamp(ucmp, tsSize, ikey, f)) continue;
                 if (sample) FileReadSample.SampleFileReadInc(f);
+                ctx.ReadFlags = WithFilterSkip(cfd, s, 0, i == l0.Length - 1, ctx.ReadFlags);
                 done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);
                 if (sample) SampleCollapsibleRead(f, ctx);
                 if (done) ctx.HitLevel = 0;
@@ -525,6 +559,7 @@ internal sealed partial class DbImpl
                 FileMetaData f = files[idx];
                 if (CompareFileBoundary(ucmp, tsSize, DbFormat.ExtractUserKey(ikey.Span), f.Smallest) < 0) continue;
                 if (sample) FileReadSample.SampleFileReadInc(f);
+                ctx.ReadFlags = WithFilterSkip(cfd, s, level, false, ctx.ReadFlags);
                 done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);
                 if (sample) SampleCollapsibleRead(f, ctx);
                 if (done) ctx.HitLevel = level;
@@ -543,7 +578,7 @@ internal sealed partial class DbImpl
     /// </summary>
     [SkipLocalsInit]
     private static bool LookupMemTablesWithTimestamp(ColumnFamilyData cfd, SuperVersion sv, ulong snapshot, ReadOptions? options, ReadOnlySpan<byte> key,
-        GetContext ctx, PooledBufferWriter ikeyBuf)
+        GetContext ctx, PooledBufferWriter ikeyBuf, bool skipMemTables)
     {
         ReadOnlySpan<byte> ts = GetReadTimestamp(cfd, options);
         ctx.TimestampSize = cfd.TimestampSize;
@@ -554,7 +589,7 @@ internal sealed partial class DbImpl
         try
         {
             ikeyBuf.Write(lkey.InternalKey);
-            return GetFromMemTables(sv, lkey, ctx);
+            return !skipMemTables && GetFromMemTables(sv, lkey, ctx);
         }
         finally
         {
@@ -574,7 +609,7 @@ internal sealed partial class DbImpl
         GetContext ctx, CancellationToken cancellationToken)
     {
         // Opening a table is synchronous (TableCache.GetReaderAsync); the super version keeps the file's version referenced.
-        TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels);
+        TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels, ctx.ReadFlags);
         try
         {
             ApplyFileRangeTombstones(rangeDels, DbFormat.ExtractUserKey(ikey.Span), snapshot, ctx);
@@ -629,7 +664,7 @@ internal sealed partial class DbImpl
         ulong snapshot, GetContext ctx, CancellationToken cancellationToken)
     {
         // Opening a table is synchronous (TableCache.GetReaderAsync); the super version keeps the file's version referenced.
-        TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels);
+        TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels, ctx.ReadFlags);
         ValueTask<TableGetResult> pending;
         try
         {
@@ -721,6 +756,11 @@ internal sealed partial class DbImpl
     /// </summary>
     internal DbIteratorSources NewIteratorSources(ColumnFamilyData cfd, ReadOptions? options, ReadCallback? callback, ulong sequence, Snapshot? ownedSnapshot)
     {
+        // DBImpl::NewIterator (db_impl.cc): kPersistedTier is rejected for iterators.
+        if (options?.ReadTier == ReadTier.PersistedTier)
+        {
+            throw new RocksDbException(StatusCode.NotSupported, "Not implemented: ReadTier::kPersistedData is not yet supported in iterators.");
+        }
         // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
         // in between could drop the versions visible at that sequence (no snapshot protects them).
         ValidateReadSnapshot(options);
@@ -729,6 +769,9 @@ internal sealed partial class DbImpl
         {
             sequence = ReadSequence(options);
             if (callback is not null) sequence = ApplyReadCallback(callback, options, sequence);
+            // A tailing iterator (ForwardIterator under DBIter at kMaxSequenceNumber) sees every write, also those made
+            // after it was created; the snapshot does not apply.
+            if (options?.Tailing == true && callback is null) sequence = DbFormat.MaxSequenceNumber;
         }
         try
         {
@@ -745,7 +788,9 @@ internal sealed partial class DbImpl
         sv.Imm.CopyTo(mems, 1);
         VersionStorageInfo s = sv.Current.Storage;
         var levels = new IReadOnlyList<FileMetaData>[s.NumLevels];
-        for (int l = 0; l < levels.Length; l++) levels[l] = s.LevelFilesArray(l);
+        // NewInternalIterator: with kMemtableTier only the memtables are iterated (no table file, no file tombstone).
+        bool memtableOnly = options?.ReadTier == ReadTier.MemtableTier;
+        for (int l = 0; l < levels.Length; l++) levels[l] = memtableOnly ? [] : s.LevelFilesArray(l);
         return new DbIteratorSources
         {
             Comparator = cfd.Icmp,
@@ -759,9 +804,52 @@ internal sealed partial class DbImpl
             BlobSource = cfd.BlobSource,
             BlobVersion = s,
             PrefixExtractor = sv.MutableOptions.PrefixExtractor,
+            OptimizeFiltersForHits = cfd.Options.OptimizeFiltersForHits,
+            NumNonEmptyLevels = s.NumNonEmptyLevels,
             ReadCallback = callback,
             Cleanup = new SuperVersionRelease(this, sv, ownedSnapshot),
         };
+    }
+
+    /// <summary>
+    /// A tailing iterator (ReadOptions::tailing, port of the ForwardIterator behaviour of DBImpl::NewIterator): reads
+    /// at kMaxSequenceNumber, so writes made after its creation become visible to later Seek / Next calls, and its
+    /// memtable / table iterators are rebuilt from the current super version when the column family installed a new
+    /// one (ForwardIterator::RenewIterators on Seek, SeekToFirst and Next). SeekToLast, SeekForPrev and Prev are
+    /// NotSupported like upstream. Deviation: the stack is the regular DBIter stack rebuilt on renewal, not
+    /// ForwardIterator's incremental per-level iterators.
+    /// </summary>
+    internal Iterator NewTailingIterator(ColumnFamilyData cfd, ReadOptions options)
+    {
+        var source = new TailingIteratorSource(this, cfd, options);
+        var it = new Iterator(source.Build());
+        it.SetTailing(source);
+        return it;
+    }
+
+    private sealed class TailingIteratorSource(DbImpl db, ColumnFamilyData cfd, ReadOptions options) : Iterator.TailingSource
+    {
+        private ulong _number;
+
+        public override bool IsStale => cfd.Super.Number != _number;
+
+        public override DbIter Build()
+        {
+            // Read before the super version is referenced: a change in between only causes one extra renewal.
+            ulong number = cfd.Super.Number;
+            DbIteratorSources sources = db.NewIteratorSources(cfd, options);
+            try
+            {
+                DbIter it = DbIteratorFactory.CreateDbIter(sources);
+                _number = number;
+                return it;
+            }
+            catch
+            {
+                sources.Cleanup?.Dispose();
+                throw;
+            }
+        }
     }
 
     /// <summary>

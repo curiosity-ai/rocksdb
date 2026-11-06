@@ -119,8 +119,14 @@ public sealed record TableReaderOptions
     /// <summary>The DB's block cache tracer (BlockBasedTable::block_cache_tracer_), or null.</summary>
     internal Tracing.BlockCacheTracer? BlockCacheTracer { get; init; }
 
-    /// <summary>LSM level of the file (TableReaderOptions::level, -1 unknown); only used for tracing.</summary>
+    /// <summary>
+    /// LSM level of the file when it was opened (TableReaderOptions::level, -1 unknown): block cache tracing and
+    /// BlockBasedTable::IsLastLevel (the {NON_,}LAST_LEVEL_SEEK_* tickers).
+    /// </summary>
     internal int Level { get; init; } = -1;
+
+    /// <summary>ImmutableOptions::num_levels of the column family (-1 unknown): with <see cref="Level"/>, IsLastLevel.</summary>
+    internal int NumLevels { get; init; } = -1;
 
     /// <summary>block_restart_interval of the table options (estimates the keys of a traced block).</summary>
     internal int BlockRestartInterval { get; init; } = 16;
@@ -996,7 +1002,8 @@ public sealed partial class BlockBasedTableReader : TableReader
         _stats?.Record(MissCounter(kind));
         // Charged per block consumed from the readahead buffer (upstream charges the prefetch reads themselves).
         ChargeRateLimiter(handle, flags);
-        Block b = Protect(BlockFetcher.ReadBlock(prefetch, _footer, handle, _options.VerifyChecksums, DictFor(kind)), kind);
+        ThrowIfNoIo(flags);
+        Block b = Protect(BlockFetcher.ReadBlock(prefetch, _footer, handle, Verify(flags), DictFor(kind)), kind);
         if (cache is not null && _bcTracer is { IsEnabled: true } tr) TraceAccess(tr, key, kind, b, hit: false, flags);
         return cache is null || (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
@@ -1046,12 +1053,37 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
     }
 
+    /// <summary>
+    /// Whether blocks this read loads from the file are checksum-verified: the reader's setting, unless the read opted
+    /// out (ReadOptions::verify_checksums = false, <see cref="TableReadFlags.SkipChecksumVerification"/>).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool Verify(TableReadFlags flags) => _options.VerifyChecksums && (flags & TableReadFlags.SkipChecksumVerification) == 0;
+
+    /// <summary>
+    /// BlockBasedTable::RetrieveBlock with no_io (ReadOptions::read_tier = kBlockCacheTier): a block that is not cached
+    /// fails the read with Incomplete("no blocking io") instead of being read from the file. Also enforces the
+    /// read deadline (<see cref="ReadDeadline"/>) before the file is read.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void ThrowIfNoIo(TableReadFlags flags)
+    {
+        if ((flags & TableReadFlags.BlockCacheTier) != 0) ThrowNoIo();
+        // ReadOptions::deadline (PrepareIOFromReadOptions): no file read once it has passed.
+        ReadDeadline.CheckBeforeIo();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    internal static void ThrowNoIo() => throw new RocksDbException(StatusCode.Incomplete, "Incomplete: no blocking io");
+
     private BlockRef ReadAndInsert(BlockCache cache, in CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
         _stats?.Record(MissCounter(kind));
+        ThrowIfNoIo(flags);
         ChargeRateLimiter(handle, flags);
         if (cache.AdmitsCompressedBlocks && OffersCompressed(kind, flags)) return ReadAndInsertOfferingCompressed(cache, key, handle, kind, flags);
-        Block b = Protect(ReadBlockFromFile(handle, kind), kind);
+        Block b = Protect(ReadBlockFromFile(handle, kind, flags), kind);
         if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, b, hit: false, flags);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
@@ -1061,8 +1093,9 @@ public sealed partial class BlockBasedTableReader : TableReader
         IBlockCache? legacy = _legacyCache;
         if (legacy is null)
         {
+            ThrowIfNoIo(flags);
             ChargeRateLimiter(handle, flags);
-            return BlockRef.FromOwned(Protect(ReadBlockFromFile(handle, kind), kind));
+            return BlockRef.FromOwned(Protect(ReadBlockFromFile(handle, kind, flags), kind));
         }
         var key = new BlockCacheKey(_tableId, handle.Offset);
         if (legacy.TryGet(key, out Block? b))
@@ -1071,8 +1104,9 @@ public sealed partial class BlockBasedTableReader : TableReader
             return BlockRef.FromOwned(b);
         }
         _stats?.Record(MissCounter(kind));
+        ThrowIfNoIo(flags);
         ChargeRateLimiter(handle, flags);
-        b = Protect(ReadBlockFromFile(handle, kind), kind);
+        b = Protect(ReadBlockFromFile(handle, kind, flags), kind);
         if ((flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(key, b);
         return BlockRef.FromOwned(b);
     }
@@ -1093,7 +1127,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     [MethodImpl(MethodImplOptions.NoInlining)]
     private BlockRef ReadAndInsertOfferingCompressed(BlockCache cache, in CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
-        Block b = Protect(BlockFetcher.ReadBlockKeepingCompressed(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), out byte[]? serialized), kind);
+        Block b = Protect(BlockFetcher.ReadBlockKeepingCompressed(_file, _footer, handle, Verify(flags), DictFor(kind), out byte[]? serialized), kind);
         try
         {
             if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, b, hit: false, flags);
@@ -1109,7 +1143,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     private async ValueTask<BlockRef> ReadAndInsertOfferingCompressedAsync(BlockCache cache, CacheKey key, BlockHandle handle, BlockKind kind,
         TableReadFlags flags, CancellationToken ct)
     {
-        BlockFetcher.CompressedRead read = await BlockFetcher.ReadBlockKeepingCompressedAsync(_file, _footer, handle, _options.VerifyChecksums,
+        BlockFetcher.CompressedRead read = await BlockFetcher.ReadBlockKeepingCompressedAsync(_file, _footer, handle, Verify(flags),
             DictFor(kind), ct).ConfigureAwait(false);
         try
         {
@@ -1214,11 +1248,12 @@ public sealed partial class BlockBasedTableReader : TableReader
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<BlockRef> ReadAndInsertAsync(BlockCache cache, CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags, CancellationToken ct)
     {
+        ThrowIfNoIo(flags);
         await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
         if (cache.AdmitsCompressedBlocks && OffersCompressed(kind, flags))
             return await ReadAndInsertOfferingCompressedAsync(cache, key, handle, kind, flags, ct).ConfigureAwait(false);
         Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, ct).ConfigureAwait(false)
-            : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false), kind);
+            : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, Verify(flags), DictFor(kind), ct).ConfigureAwait(false), kind);
         if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, b, hit: false, flags);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
@@ -1226,9 +1261,10 @@ public sealed partial class BlockBasedTableReader : TableReader
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<BlockRef> ReadAndInsertLegacyAsync(BlockHandle handle, BlockKind kind, TableReadFlags flags, CancellationToken ct)
     {
+        ThrowIfNoIo(flags);
         await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
         Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, ct).ConfigureAwait(false)
-            : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false), kind);
+            : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, Verify(flags), DictFor(kind), ct).ConfigureAwait(false), kind);
         if (_legacyCache is { } legacy && (flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(new BlockCacheKey(_tableId, handle.Offset), b);
         return BlockRef.FromOwned(b);
     }
@@ -1466,7 +1502,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     /// </summary>
     public override bool InternalKeyMayMatch(ReadOnlySpan<byte> internalKey, TableReadFlags flags)
     {
-        if (_filterKind == FilterKind.None) return true;
+        if (_filterKind == FilterKind.None || (flags & TableReadFlags.SkipFilters) != 0) return true;
         // FullFilterKeyMayMatch: filters hold user keys without the timestamp.
         ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKeyAndStripTimestamp(internalKey, _tsSize);
         if (WholeKeyFiltering)
@@ -1496,8 +1532,9 @@ public sealed partial class BlockBasedTableReader : TableReader
     /// <see cref="TableIteratorPrefixOptions.NeedUpperBoundCheck"/>, the filter is only consulted when every key in
     /// [seek key, upper bound) has the seek key's prefix.
     /// </summary>
-    internal bool PrefixRangeMayMatch(ReadOnlySpan<byte> internalKey, in TableIteratorPrefixOptions o, TableReadFlags flags)
+    internal bool PrefixRangeMayMatch(ReadOnlySpan<byte> internalKey, in TableIteratorPrefixOptions o, TableReadFlags flags, out bool filterChecked)
     {
+        filterChecked = false;
         if (_filterKind == FilterKind.None) return true;
         SliceTransform? prefixExtractor;
         if (_tablePrefixExtractor is null)
@@ -1513,9 +1550,10 @@ public sealed partial class BlockBasedTableReader : TableReader
         if (prefixExtractor is null || !prefixExtractor.InDomain(userKey)) return true;
         ReadOnlySpan<byte> prefix = prefixExtractor.Transform(userKey);
         if (o.NeedUpperBoundCheck && !IsFilterCompatible(o.UpperBound, prefix)) return true;
-        bool mayMatch = FilterMayMatch(prefix, internalKey, flags);
-        if (!mayMatch) _stats?.Record(BlockCacheCounter.BloomFilterPrefixUseful);
-        return mayMatch;
+        // FullFilterBlockReader::PrefixMayMatch records no BLOOM_FILTER_* ticker: seeks are counted by the iterator
+        // (SEEK_FILTERED / SEEK_FILTER_MATCH); BLOOM_FILTER_PREFIX_USEFUL is for point lookups only.
+        filterChecked = true;
+        return FilterMayMatch(prefix, internalKey, flags);
     }
 
     /// <summary>
@@ -1542,7 +1580,42 @@ public sealed partial class BlockBasedTableReader : TableReader
         return true;
     }
 
-    internal void RecordSeekFiltered() => _stats?.Record(BlockCacheCounter.SeekFiltered);
+    /// <summary>
+    /// BlockBasedTableIterator::SeekImpl / SeekForPrev statistics (block_based_table_iterator.cc): a seek the prefix
+    /// filter ruled out records {NON_,}LAST_LEVEL_SEEK_FILTERED, one it let through after consulting the filter
+    /// {NON_,}LAST_LEVEL_SEEK_FILTER_MATCH, by whether the file is in the last level (BlockBasedTable::IsLastLevel).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal void RecordSeekFilterResult(bool filtered)
+    {
+        if (filtered) _stats?.Record(BlockCacheCounter.SeekFiltered);
+        if (_stats?.Owner is { } st)
+        {
+            bool last = IsLastLevel;
+            st.RecordTick(filtered
+                ? last ? Ticker.LastLevelSeekFiltered : Ticker.NonLastLevelSeekFiltered
+                : last ? Ticker.LastLevelSeekFilterMatch : Ticker.NonLastLevelSeekFilterMatch);
+        }
+    }
+
+    /// <summary>BlockBasedTable::IsLastLevel: the level the file was opened at is the last level of the LSM tree.</summary>
+    internal bool IsLastLevel => _options.Level >= 0 && _options.Level == _options.NumLevels - 1;
+
+    /// <summary>
+    /// BLOOM_FILTER_FULL_TRUE_POSITIVE / BLOOM_FILTER_PREFIX_TRUE_POSITIVE (BlockBasedTable::Get / MultiGet): a point
+    /// lookup that the table's filter let through found an entry with the user key.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void RecordFilterTruePositive(TableReadFlags flags)
+    {
+        if (_stats is not null && _filterKind != FilterKind.None && (flags & TableReadFlags.SkipFilters) == 0) RecordFilterTruePositive();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void RecordFilterTruePositive()
+    {
+        if (_stats?.Owner is { } st) st.RecordTick(WholeKeyFiltering ? Ticker.BloomFilterFullTruePositive : Ticker.BloomFilterPrefixTruePositive);
+    }
 
     /// <summary>MayMatch of the full filter, or of the partition of a partitioned filter covering <paramref name="internalKey"/>.</summary>
     private bool FilterMayMatch(ReadOnlySpan<byte> entry, ReadOnlySpan<byte> internalKey, TableReadFlags flags)
@@ -1611,7 +1684,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
         _stats?.Record(BlockCacheCounter.FilterMiss);
         if ((flags & TableReadFlags.BlockCacheTier) != 0) return true; // no I/O allowed: Incomplete -> may match
-        byte[] buf = BlockFetcher.ReadRawPayload(_file, _footer, handle, _options.VerifyChecksums, out int len);
+        byte[] buf = BlockFetcher.ReadRawPayload(_file, _footer, handle, Verify(flags), out int len);
         if (cache is not null && _bcTracer is { IsEnabled: true } tm) TraceAccess(tm, key, BlockKind.Filter, null, hit: false, flags, (ulong)len);
         IFilterBitsReader reader;
         try
@@ -1654,6 +1727,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         {
             idx.SeekForGet(internalKey);
             bool first = true;
+            bool matched = false;
             while (idx.Valid)
             {
                 BlockRef block = GetBlockRef(idx.Handle, BlockKind.Data, flags);
@@ -1673,6 +1747,11 @@ public sealed partial class BlockBasedTableReader : TableReader
                     {
                         ReadOnlySpan<byte> k = data.Key;
                         if (!UserKeyEquals(DbFormat.ExtractUserKey(k), userKey)) return;
+                        if (!matched)
+                        {
+                            matched = true;
+                            RecordFilterTruePositive(flags);
+                        }
                         if (!visitor(ref state, k, data.Value)) return;
                     }
                 }
@@ -1714,7 +1793,11 @@ public sealed partial class BlockBasedTableReader : TableReader
                 try
                 {
                     int r = ScanBlockForGet(data, block.Block!, internalKey, first, value, out TableGetResult result);
-                    if (r != 0) return result;
+                    if (r != 0)
+                    {
+                        if (r > 0) RecordFilterTruePositive(flags);
+                        return result;
+                    }
                     first = false;
                 }
                 finally
@@ -1764,7 +1847,11 @@ public sealed partial class BlockBasedTableReader : TableReader
                 try
                 {
                     int r = ScanBlockForGet(data, block.Block!, internalKey.Span, first, value, out TableGetResult result);
-                    if (r != 0) return result;
+                    if (r != 0)
+                    {
+                        if (r > 0) RecordFilterTruePositive(flags);
+                        return result;
+                    }
                     first = false;
                 }
                 finally
@@ -1802,13 +1889,14 @@ public sealed partial class BlockBasedTableReader : TableReader
             ValueTask seek = idx.SeekForGetAsync(internalKey, cancellationToken);
             if (!seek.IsCompletedSuccessfully) await seek.ConfigureAwait(false);
             bool first = true;
+            bool matched = false;
             while (idx.Valid)
             {
                 ValueTask<BlockRef> pending = GetBlockRefAsync(idx.Handle, BlockKind.Data, flags, cancellationToken);
                 BlockRef block = pending.IsCompletedSuccessfully ? pending.Result : await pending.ConfigureAwait(false);
                 try
                 {
-                    if (!VisitBlockForGet(data, block.Block!, internalKey.Span, first, state, visitor)) return;
+                    if (!VisitBlockForGet(data, block.Block!, internalKey.Span, first, state, visitor, flags, ref matched)) return;
                     first = false;
                 }
                 finally
@@ -1829,7 +1917,7 @@ public sealed partial class BlockBasedTableReader : TableReader
 
     /// <summary>The per-block part of the visitor Get; returns false when the lookup is done.</summary>
     private bool VisitBlockForGet<TState>(BlockIter data, Block block, ReadOnlySpan<byte> internalKey, bool first, TState state,
-        TableEntryVisitor<TState> visitor)
+        TableEntryVisitor<TState> visitor, TableReadFlags flags, ref bool matched)
     {
         ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKey(internalKey);
         data.InitializeData(block, _icmp, GlobalSequenceNumber, PadTimestampSize);
@@ -1845,6 +1933,11 @@ public sealed partial class BlockBasedTableReader : TableReader
         {
             ReadOnlySpan<byte> k = data.Key;
             if (!UserKeyEquals(DbFormat.ExtractUserKey(k), userKey)) return false;
+            if (!matched)
+            {
+                matched = true;
+                RecordFilterTruePositive(flags);
+            }
             if (!visitor(ref state, k, data.Value)) return false;
         }
         return true;

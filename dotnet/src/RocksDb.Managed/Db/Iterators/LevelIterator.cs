@@ -26,7 +26,7 @@ public sealed class LevelIterator : InternalIterator
     private readonly ReadOnlyMemory<byte>? _upper;
     private readonly ReadOptions? _readOptions;
     // fill_cache / rate_limiter_priority of _readOptions for the file iterators.
-    private readonly TableReadFlags _readFlags;
+    private TableReadFlags _readFlags;
     /// <summary>The column family's prefix extractor (file iterators consult prefix filters), or null.</summary>
     private readonly SliceTransform? _prefixExtractor;
     /// <summary>Non-null in legacy prefix seek mode (no total_order_seek / auto_prefix_mode): Seek invalidates past the prefix.</summary>
@@ -353,6 +353,9 @@ public sealed class LevelIterator : InternalIterator
         int first = Math.Min(FindFile(target), _files.Length - 1);
         return first <= _fileIndex && FilesBelow(first, _fileIndex, tombstoneSeq);
     }
+
+    /// <summary>Adds table read flags for every file of the level (e.g. skip_filters of Version::IsFilterSkipped).</summary>
+    internal void AddReadFlags(TableReadFlags flags) => _readFlags |= flags;
 
     private InternalIterator NewFileIterator(int index, InternalIterator? reuse)
     {

@@ -173,10 +173,10 @@ public sealed partial class BlockBasedTableReader
     /// PersistentCacheHelper): a serialized (compressed) cache stores the payload + trailer and is verified like a file
     /// read; an uncompressed cache stores the block contents.
     /// </summary>
-    private Block ReadBlockFromFile(BlockHandle handle, BlockKind kind)
+    private Block ReadBlockFromFile(BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
         PersistentCache? pc = _persistentCache;
-        if (pc is null) return BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind));
+        if (pc is null) return BlockFetcher.ReadBlock(_file, _footer, handle, Verify(flags), DictFor(kind));
         return ReadBlockThroughPersistentCache(pc, handle, kind);
     }
 

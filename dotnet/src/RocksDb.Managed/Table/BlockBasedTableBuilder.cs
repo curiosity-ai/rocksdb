@@ -152,7 +152,9 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         _prefixExtractor = tableBuilderOptions.PrefixExtractor;
         // Port of CreateFilterBlockBuilder: the policy picks the filter implementation from the full building context
         // (format version, level, flush); a built-in policy with &lt; 0.5 bits/key builds no filter at all.
-        if (options.FilterPolicy is { } policy && policy is not BloomLikeFilterPolicy { CreatesFilters: false })
+        // optimize_filters_for_hits skips filter generation for bottommost outputs (block_based_table_builder.cc Rep()).
+        bool skipFilter = tableBuilderOptions.OptimizeFiltersForHits && tableBuilderOptions.IsBottommost;
+        if (!skipFilter && options.FilterPolicy is { } policy && policy is not BloomLikeFilterPolicy { CreatesFilters: false })
         {
             IFilterBitsBuilder bits = policy.CreateBuilder(new FilterBuildingContext(options.FormatVersion, tableBuilderOptions.LevelAtCreation, tableBuilderOptions.IsFlush)
             {

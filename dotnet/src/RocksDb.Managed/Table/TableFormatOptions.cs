@@ -131,6 +131,16 @@ public sealed record TableBuilderOptions
     public ulong TargetFileSize { get; init; }
     /// <summary>True when the file is written by a memtable flush (TableFileCreationReason::kFlush; Ribbon treats it as level -1).</summary>
     public bool IsFlush { get; init; }
+    /// <summary>
+    /// TableBuilderOptions::is_bottommost: the file is an output of a compaction to the bottommost level
+    /// (Compaction::bottommost_level()). False for flushes, external files and repair.
+    /// </summary>
+    public bool IsBottommost { get; init; }
+    /// <summary>
+    /// ImmutableCFOptions::optimize_filters_for_hits: with <see cref="IsBottommost"/>, no filter block is built
+    /// (the filter policy name is still recorded in the properties, like upstream).
+    /// </summary>
+    public bool OptimizeFiltersForHits { get; init; }
     public ulong OldestKeyTime { get; init; }
     public ulong NewestKeyTime { get; init; }
     public ulong FileCreationTime { get; init; }

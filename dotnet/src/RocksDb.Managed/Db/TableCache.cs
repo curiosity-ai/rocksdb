@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Collections.Concurrent;
 using System.Globalization;
 using RocksDb.Managed.Db.Iterators;
@@ -391,6 +392,36 @@ internal sealed class TableCache : ITableCache, IDisposable
         return GetReader(file, out rangeTombstones);
     }
 
+    /// <summary>
+    /// <see cref="GetReaderForVersion(FileMetaData, out FragmentedRangeTombstoneList?)"/> for a read with
+    /// <paramref name="flags"/>: with <see cref="TableReadFlags.BlockCacheTier"/> a table that is not open is not
+    /// opened (TableCache::FindTable with no_io) and the read fails with Incomplete.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public TableReaderLease GetReaderForVersion(FileMetaData file, out FragmentedRangeTombstoneList? rangeTombstones, TableReadFlags flags)
+    {
+        if ((flags & TableReadFlags.BlockCacheTier) == 0) return GetReaderForVersion(file, out rangeTombstones);
+        return GetOpenReaderNoIo(file, out rangeTombstones);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private TableReaderLease GetOpenReaderNoIo(FileMetaData file, out FragmentedRangeTombstoneList? rangeTombstones)
+    {
+        if (_store.TryGetPinned(file.FileNumber) is { Reader: { } reader } p)
+        {
+            rangeTombstones = p.RangeDels;
+            return new TableReaderLease(reader, null, null);
+        }
+        if (_store.TryGetOpen(file.FileNumber, out TableCacheStore.Handle? h))
+        {
+            rangeTombstones = h.RangeDels;
+            return new TableReaderLease(h.Reader!, TableCacheStore.s_release, h);
+        }
+        rangeTombstones = null;
+        BlockBasedTableReader.ThrowNoIo();
+        return default;
+    }
+
     /// <summary>The fragmented range tombstones of a table (opening it if needed), or null if it has none.</summary>
     public FragmentedRangeTombstoneList? GetRangeTombstones(FileMetaData file)
     {
@@ -432,7 +463,7 @@ internal sealed class TableCache : ITableCache, IDisposable
                     + " and file system " + f.Length.ToString(CultureInfo.InvariantCulture) + " sstable: " + path);
             }
             TableReaderOptions opts = ReaderOptions;
-            if (file.LargestSeqno != opts.LargestSeqno || file.FileNumber != opts.FileNumber || (opts.BlockCacheTracer is not null && file.LevelHint != opts.Level))
+            if (file.LargestSeqno != opts.LargestSeqno || file.FileNumber != opts.FileNumber || file.LevelHint != opts.Level)
                 opts = opts with { LargestSeqno = file.LargestSeqno, FileNumber = file.FileNumber, Level = file.LevelHint };
             reader = TableReaderFactory.Open(f, opts);
         }
