@@ -17,6 +17,11 @@ namespace RocksDb.Managed.Utilities.Transactions;
 public sealed class OptimisticTransactionDatabase : IDisposable, IAsyncDisposable
 {
     private readonly RocksDatabase _db;
+    // BeginTransaction(writeOptions): the options are only read when the transaction begins, never mutated or exposed.
+    private static readonly OptimisticTransactionOptions s_defaultTransactionOptions = new();
+
+    /// <summary>Recycles the write batches and lock trackers of disposed transactions.</summary>
+    internal TransactionResourcePool ResourcePool { get; }
     private readonly OptimisticTransactionDbOptions _options;
     private readonly SemaphoreSlim?[]? _buckets;
     private readonly int _bucketCount;
@@ -24,6 +29,7 @@ public sealed class OptimisticTransactionDatabase : IDisposable, IAsyncDisposabl
     private OptimisticTransactionDatabase(RocksDatabase db, OptimisticTransactionDbOptions options)
     {
         _db = db;
+        ResourcePool = new TransactionResourcePool(db.Impl);
         _options = options;
         if (options.ValidatePolicy == OccValidationPolicy.ValidateParallel)
         {
@@ -75,7 +81,12 @@ public sealed class OptimisticTransactionDatabase : IDisposable, IAsyncDisposabl
     }
 
     /// <summary>Starts a transaction (BeginTransaction).</summary>
-    public Transaction BeginTransaction(WriteOptions writeOptions) => BeginTransaction(writeOptions, new OptimisticTransactionOptions());
+    /// <remarks>
+    /// The write batch and key tracker of a disposed transaction are reused by the next transaction, so beginning
+    /// and disposing transactions allocates little more than the transaction object; to allocate nothing, pass the
+    /// finished transaction to <see cref="BeginTransaction(WriteOptions, OptimisticTransactionOptions, Transaction)"/>.
+    /// </remarks>
+    public Transaction BeginTransaction(WriteOptions writeOptions) => BeginTransaction(writeOptions, s_defaultTransactionOptions);
 
     public Transaction BeginTransaction(WriteOptions writeOptions, OptimisticTransactionOptions transactionOptions)
     {
@@ -118,7 +129,7 @@ internal sealed class OptimisticTransaction : Transaction, IWriteCallback
     private List<int>? _bucketScratch;
 
     public OptimisticTransaction(OptimisticTransactionDatabase owner, WriteOptions? writeOptions, OptimisticTransactionOptions options)
-        : base(owner.Database, writeOptions, 0)
+        : base(owner.Database, writeOptions, 0, owner.ResourcePool)
     {
         _owner = owner;
         if (options.SetSnapshot) SetSnapshot();

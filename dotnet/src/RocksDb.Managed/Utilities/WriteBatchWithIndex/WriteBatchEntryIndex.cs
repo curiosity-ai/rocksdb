@@ -49,6 +49,9 @@ internal sealed class WriteBatchEntryIndex
         _cfComparators[cf] ??= comparator;
     }
 
+    /// <summary>Forgets the column family comparators (a pooled batch returned for reuse with any database).</summary>
+    public void ResetComparators() => Array.Clear(_cfComparators);
+
     /// <summary>WriteBatchEntryComparator::GetComparator(cf): the CF's comparator, or the default one.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Comparator GetComparator(uint cf) => cf < (uint)_cfComparators.Length && _cfComparators[cf] is { } c ? c : _defaultComparator;

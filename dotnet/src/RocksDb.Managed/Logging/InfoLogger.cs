@@ -46,6 +46,17 @@ public abstract class InfoLogger : IDisposable
         if (level is >= InfoLogLevel.Warn and not InfoLogLevel.Header) Flush();
     }
 
+    /// <summary>
+    /// Logs the contents of <paramref name="message"/> at INFO level. The DB formats its flush / compaction / file events
+    /// into a reused builder; the DB's own LOG file writes them without an intermediate message string, other loggers
+    /// receive <see cref="StringBuilder.ToString()"/> through <see cref="LogCore"/>.
+    /// </summary>
+    internal virtual void LogInfo(System.Text.StringBuilder message)
+    {
+        if (InfoLogLevel.Info < Level) return;
+        LogCore(InfoLogLevel.Info, message.ToString());
+    }
+
     /// <summary>Writes a header line (Logger::LogHeader; by default the same as an INFO line). Not filtered by level.</summary>
     public virtual void LogHeader(string message) => LogCore(InfoLogLevel.Header, message);
 

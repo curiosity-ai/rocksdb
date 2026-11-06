@@ -419,20 +419,29 @@ public static class RangeDelTableTombstones
 
     private static FragmentedRangeTombstoneList Build(TableReader reader)
     {
-        var list = new List<FragmentedRangeTombstoneList.Tombstone>();
-        using BlockIter? it = reader.NewRangeTombstoneIterator();
-        if (it is not null)
+        // Tables without persisted timestamps: the end keys (values) come back without a timestamp.
+        RangeTombstoneFragmenter frag = RangeTombstoneFragmenter.Rent(reader.InternalComparator.UserComparator,
+            endIncludesTimestamp: reader.PadTimestampSize == 0);
+        try
         {
-            for (it.SeekToFirst(); it.Valid; it.Next())
+            using BlockIter? it = reader.NewRangeTombstoneIterator();
+            if (it is not null)
             {
-                ReadOnlySpan<byte> k = it.Key;
-                if (!DbFormat.TryParseInternalKey(k, out ParsedInternalKey p) || p.Type != EntryType.RangeDeletion)
+                for (it.SeekToFirst(); it.Valid; it.Next())
                 {
-                    ThrowHelper.Corruption("invalid range tombstone key in range deletion block");
+                    ReadOnlySpan<byte> k = it.Key;
+                    if (!DbFormat.TryParseInternalKey(k, out ParsedInternalKey p) || p.Type != EntryType.RangeDeletion)
+                    {
+                        ThrowHelper.Corruption("invalid range tombstone key in range deletion block");
+                    }
+                    frag.Add(k[..p.UserKeyLength], it.Value, p.Sequence);
                 }
-                list.Add(new FragmentedRangeTombstoneList.Tombstone(k[..p.UserKeyLength].ToArray(), it.Value.ToArray(), p.Sequence));
             }
+            return frag.Finish();
         }
-        return FragmentedRangeTombstoneList.Build(reader.InternalComparator.UserComparator, list, endIncludesTimestamp: reader.PadTimestampSize == 0);
+        finally
+        {
+            RangeTombstoneFragmenter.Return(frag);
+        }
     }
 }

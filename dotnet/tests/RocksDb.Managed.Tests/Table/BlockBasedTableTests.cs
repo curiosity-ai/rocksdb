@@ -250,8 +250,9 @@ public sealed class BlockBasedTableTests
     }
 
     /// <summary>
-    /// The index block and full filter a reader pins come from the table buffer pool (where table builders rent theirs)
-    /// and go back there when the reader is closed, also after iterators over the reader were used; with
+    /// The index block and full filter a reader pins come from the pinned table buffer pool (separate from the pool table
+    /// builders rent from, so live readers never take the builders' arrays) and go back there when the reader is closed,
+    /// also after iterators over the reader were used; with
     /// cache_index_and_filter_blocks they stay in the block buffer pool / ArrayPool.Shared the cache returns them to.
     /// </summary>
     [TestMethod]
@@ -279,17 +280,17 @@ public sealed class BlockBasedTableTests
         }
         // Closed: both buffers are back in the table buffer pool (a LIFO per size class), not dropped or returned to
         // another pool. Rent both before returning either, so they are told apart when they share a size class.
-        byte[] a = TableBuilderBuffers.Bytes.Rent(filter.Length);
-        byte[] b = TableBuilderBuffers.Bytes.Rent(index.Length);
+        byte[] a = TableBuilderBuffers.Pinned.Rent(filter.Length);
+        byte[] b = TableBuilderBuffers.Pinned.Rent(index.Length);
         try
         {
-            Assert.IsTrue(ReferenceEquals(a, filter) || ReferenceEquals(a, index), "filter buffer not returned to the table buffer pool");
-            Assert.IsTrue(ReferenceEquals(b, index) || ReferenceEquals(b, filter), "index buffer not returned to the table buffer pool");
+            Assert.IsTrue(ReferenceEquals(a, filter) || ReferenceEquals(a, index), "filter buffer not returned to the pinned table buffer pool");
+            Assert.IsTrue(ReferenceEquals(b, index) || ReferenceEquals(b, filter), "index buffer not returned to the pinned table buffer pool");
         }
         finally
         {
-            TableBuilderBuffers.Bytes.Return(b);
-            TableBuilderBuffers.Bytes.Return(a);
+            TableBuilderBuffers.Pinned.Return(b);
+            TableBuilderBuffers.Pinned.Return(a);
         }
 
         // cache_index_and_filter_blocks: the cache owns them, charged at the block buffer pool's finer size classes.

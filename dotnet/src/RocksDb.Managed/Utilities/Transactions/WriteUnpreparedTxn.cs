@@ -110,10 +110,10 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         // Keys written without a lock are remembered for rollback.
         var untracked = new UntrackedKeyHandler(this);
         _batch.Batch.Iterate(ref untracked);
-        WriteOptions wo = _writeOptions.DisableWal ? CloneWithWal(_writeOptions) : _writeOptions;
+        WriteOptions wo = _writeOptions.DisableWal ? WithWal(_writeOptions) : _writeOptions;
         bool firstPrepareBatch = _logNumber == 0;
         // MarkEndPrepare will change Noop marker to the appropriate marker.
-        _batch.Batch.MarkEndPrepare(_nameBytes!, writeAfterCommit: false, unpreparedBatch: !prepared);
+        _batch.Batch.MarkEndPrepare(NameBytes, writeAfterCommit: false, unpreparedBatch: !prepared);
         _prepareBatchCnt = _batch.SubBatchCount;
         _addPreparedU.Set(_prepareBatchCnt, firstPrepareBatch);
         _writeContext.Reset();
@@ -287,7 +287,7 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         callback.Init(_wpDb, DbFormat.MaxSequenceNumber, ReadCallback.MinUnCommittedSeq, SnapshotBackup.BackedByDbSnapshot);
         WriteRollbackKeys(_tracked, includeUntracked: true, rollbackBatch, callback, null);
         // The Rollback marker will be used as a batch separator
-        rollbackBatch.WriteBatch.MarkRollback(_nameBytes!);
+        rollbackBatch.WriteBatch.MarkRollback(NameBytes);
         bool doOneWrite = !TwoWriteQueues;
         // Rollback batch may contain duplicate keys, because tracked_keys_ is not comparator aware.
         int rollbackBatchCnt = rollbackBatch.SubBatchCount;

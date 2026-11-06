@@ -200,15 +200,21 @@ their reads carry a `ReadCallback` and their flushes / compactions a `SnapshotCh
 ### Background work
 
 - **Flushes** are scheduled by `MaybeScheduleFlush` (the flush half of `MaybeScheduleFlushOrCompaction`), up to the
-  flush job limit derived from `MaxBackgroundJobs`. Each job runs as a thread-pool task (`Task.Run`). Flushes of one
-  column family are serialized; different column families flush in parallel.
-- **Compactions** are picked under the mutex and run on dedicated threads (`TaskCreationOptions.LongRunning`), up to
-  the compaction limit, because a compaction is long, CPU-bound work that should not occupy the thread pool.
+  flush job limit derived from `MaxBackgroundJobs`. Each job runs synchronously on a thread of the process-wide HIGH
+  pool (`Db/BackgroundThreadPool.cs`, threads named `rocksdb:high:N`). Flushes of one column family are serialized;
+  different column families flush in parallel.
+- **Compactions** are picked under the mutex and run on the LOW pool (`rocksdb:low:N`), up to the compaction limit,
+  because a compaction is long, CPU-bound work that should not occupy the .NET thread pool. The pools are the port of
+  `Env::Schedule`: their threads live across jobs (so per-thread scratch such as compression tables is reused), every
+  DB raises the number of threads a pool keeps to its job limits (`IncBackgroundThreadsIfNeeded`), and a pool starts
+  another thread instead of queueing when none is idle, so the DB's own job limits alone decide concurrency.
   `CompactRange` and `WaitForCompact` have sync and async versions. With `DbOptions.BottomPriorityBackgroundThreads`
-  (upstream's BOTTOM `Env` pool, per DB here) compactions to the last level are queued for that many extra threads;
+  (upstream's BOTTOM `Env` pool; the BOTTOM thread pool runs them, the limit is per DB) compactions to the last level are
+  queued for that many extra threads;
   with `reduce_file_locking` they reserve only their newest input run while queued and are repicked when they start.
   A compaction split into subcompactions (`max_subcompactions`) runs the first range on its own thread and each other
-  range on an extra long-running thread; `CompactFiles` runs on the caller's thread (sync) or one long-running thread.
+  range on another LOW pool thread; `CompactFiles` / `CompactRange` run on the caller's thread (sync) or a LOW pool thread
+  (async).
 - **Periodic tasks** are `System.Threading.Timer`s: the stats dump, the compaction trigger
   (`max_compaction_trigger_wakeup_seconds`: re-evaluates TTL / periodic / read-triggered compaction on idle DBs) and,
   with `preserve_internal_time_seconds` / `preclude_last_level_data_seconds`, the seqno-to-time recorder.
@@ -296,7 +302,7 @@ verified with `[MemoryDiagnoser]` and the benchmark runner's allocated-bytes-per
 | `Version`, `ValueType` | `Db.DbVersion` (internal), `Db.EntryType` | avoid clashing with `System.Version` / `System.ValueType` |
 | `TEST_SYNC_POINT` | `Db/TestHooks.cs` | deterministic concurrency tests |
 | thread-local SuperVersion caching (`local_sv_`) | per-processor slots (`Db/SuperVersionCache.cs`) for point reads; iterators take a plain reference | no thread-exit hook in .NET; a slot shared by two threads falls back to a plain reference |
-| `std::thread` background pools (`Env::Schedule`) | thread-pool tasks for flushes, `LongRunning` tasks for compactions | .NET scheduling; no fixed pool to size |
+| `std::thread` background pools (`Env::Schedule`) | process-wide HIGH / LOW / BOTTOM pools of long-lived threads (`Db/BackgroundThreadPool.cs`) | a pool grows instead of queueing when every thread is busy (the DB's job limits bound concurrency); threads above the kept count exit after 30 s idle |
 | no cancellation | `CancellationToken` on every async API; a cancelled write leader that is delayed by a stall fails its whole group with `OperationCanceledException` | .NET convention |
 | write-group follower wait (spin + yield + futex) | `IValueTaskSource` for async writers, `AwaitState` port (spin, adaptive yield, monitor) for sync writers | async callers do not block a thread |
 

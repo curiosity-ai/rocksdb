@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using RocksDb.Managed.Db;
 
 namespace RocksDb.Managed.Utilities.Transactions;
@@ -63,6 +64,7 @@ public abstract partial class Transaction
         return CompleteWriteEntityAsync(t, cfd, key, columns);
     }
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private async ValueTask CompleteWriteEntityAsync(ValueTask<RocksDbException?> t, ColumnFamilyData cfd, ReadOnlyMemory<byte> key, ReadOnlyMemory<WideColumn> columns)
     {
         ThrowIfError(await t.ConfigureAwait(false));

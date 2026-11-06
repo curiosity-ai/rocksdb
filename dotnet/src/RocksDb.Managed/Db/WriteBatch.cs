@@ -134,6 +134,9 @@ public sealed partial class WriteBatch : IDisposable
 
     // ---- Accessors --------------------------------------------------------------------------------------------
 
+    /// <summary>Capacity of the rep buffer.</summary>
+    internal int Capacity => _rep.Capacity;
+
     /// <summary>The rep: header followed by records. Valid until the batch is modified.</summary>
     public ReadOnlySpan<byte> Data => _rep.WrittenSpan;
     /// <summary>The rep as memory (for async I/O). Valid until the batch is modified.</summary>

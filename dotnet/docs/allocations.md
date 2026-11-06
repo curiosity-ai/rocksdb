@@ -11,8 +11,7 @@ steady state, including background flush and compaction work, with 16-byte keys 
 
 > **Planned additions.** More allocation-free variants are being added: a pooled
 > `MultiGet(IReadOnlyList<byte[]>)`, `TryGetIntProperty` without an intermediate string, span-based metadata and
-> size APIs, pooled `WriteBatchWithIndex`, and fewer background allocations per flushed file. This guide will be updated
-> when they ship. Until then, the patterns below are what to use.
+> size APIs. This guide will be updated when they ship. Until then, the patterns below are what to use.
 
 ## Summary
 
@@ -20,11 +19,11 @@ steady state, including background flush and compaction work, with 16-byte keys 
 |---|---|---|---|
 | Point reads | `TryGet(key, Span<byte>, out len)`, `TryGet(key, IBufferWriter<byte>)`, `Get<TState,TResult>(key, state, callback)`, `GetPooled` + `Dispose`, `ContainsKey`, `KeyMayExist`, the async versions of each | `byte[]? Get` / `GetAsync` (the value array: 128 B for 100 B) | the span / writer / callback / pooled variants |
 | Batched reads | `MultiGetBatch` reused with `Clear()`, `MultiGet` / `MultiGetAsync` / `MultiGetEntity` | `byte[]?[] MultiGet(IReadOnlyList<byte[]>)` (20 KB per 16 keys) | a reused `MultiGetBatch` |
-| Writes | `Put` / `Delete` / `SingleDelete` / `Merge` / `PutEntity` with spans, and their async versions (0.0-0.3 B/op on the calling thread) | none on the caller; background work adds 1-4 B/op, see [Writes](#writes) | |
-| Write batches | `db.CreateWriteBatch()` + `using`; one batch reused with `Clear()`; `WriteAsync` | `new WriteBatch()` that is never disposed (2.2 KB per batch); `new WriteBatchWithIndex()` per batch (1.1 KB) | `CreateWriteBatch`; reuse a `WriteBatchWithIndex` with `Clear()` |
+| Writes | `Put` / `Delete` / `SingleDelete` / `Merge` / `PutEntity` with spans, and their async versions (0.0-0.3 B/op on the calling thread) | none on the caller; background work adds 1-3 B/op, see [Writes](#writes) | |
+| Write batches | `db.CreateWriteBatch()` / `db.CreateWriteBatchWithIndex()` + `using`; one batch reused with `Clear()`; `WriteAsync` | `new WriteBatch()` that is never disposed (2.2 KB per batch); `new WriteBatchWithIndex()` per batch (1.1 KB) | `CreateWriteBatch` / `CreateWriteBatchWithIndex`, or `Clear()` |
 | Iterators | a reused `Iterator`: `Seek` / `SeekForPrev` / `Next` / `Prev` / `Key` / `Value` / `Columns`, async moves, `foreach` over `Range(...)`, `ScanAsync`, `Refresh`, `SetBounds` | `NewIterator` / `NewIteratorAsync` + `Dispose` (40 B: the iterator handle), a `new ReadOptions` per scan (184 B) | reuse one iterator with `SetBounds` / `Refresh`, or one `ReadOptions` |
 | Wide columns | `TryGetEntity(key, WideColumns)` with a reused result, `MultiGetEntity`, `Iterator.Columns` | `GetEntity` (312 B), `GetEntityLazy` (1 KB), `TryGetEntityLazy` (40 B) | `TryGetEntity`; reuse a `LazyWideColumns` |
-| Transactions | `BeginTransaction(writeOptions, options, oldTransaction)` + `Put` / `TryGetForUpdate` / `TryGet` / `Commit` (sync and async) | `BeginTransaction(writeOptions)` per transaction (~3 KB); a new 2PC name per transaction (~32 B); optimistic `Commit` (40 B) | reuse the transaction object |
+| Transactions | `BeginTransaction(writeOptions, options, oldTransaction)` + `SetName` / `Put` / `TryGetForUpdate` / `TryGet` / `Prepare` / `Commit` (sync and async, pessimistic and optimistic) | `using BeginTransaction(writeOptions)` per transaction (the transaction object, 350-470 B) | reuse the transaction object |
 | Monitoring | `Statistics` and `PerfContext` enabled (no allocation on reads), `GetColumnFamily(name)`, `GetLatestSequenceNumber` | `GetProperty` / `TryGetIntProperty` (40 B), `ColumnFamilies` (160 B), `GetLiveFilesMetadata`, `GetApproximateSizes`, `GetHistogramData` (896 B) | call them from monitoring code, not per request |
 
 ## Point reads
@@ -83,10 +82,12 @@ the result arrays. Use it only when the convenience matters more.
 `Put`, `Delete`, `SingleDelete`, `Merge`, `PutEntity` (span overloads) and their async versions allocate nothing on the
 calling thread: the bytes go into the WAL buffer and the memtable arena, and arena slabs are recycled after each flush.
 
-The background work that writes cause does allocate a little: about 1-4 B per 100-byte Put with a 4 MiB write buffer,
-mostly per new file (table properties, file buffers, info LOG lines). This scales with the number of flushes and
-compactions, not with the number of writes: a larger `WriteBufferSize` (the default is 64 MiB) means fewer files and
-less of it. Steady state is reached after the first few memtables of a new database or column family. Before that, the
+The background work that writes cause does allocate a little: about 1-3 B per 100-byte Put with a 4 MiB write buffer,
+mostly per new file (the table reader and the index and filter blocks it keeps, info LOG lines, the version). This
+scales with the number of flushes and compactions, not with the number of writes: a larger `WriteBufferSize` (the
+default is 64 MiB) means fewer files and less of it. Flushes and compactions run on long-lived background threads
+(named `rocksdb:high:N`, `rocksdb:low:N` and `rocksdb:bottom:N`, shared by all databases of the process), so their
+per-thread buffers are reused from one job to the next. Steady state is reached after the first few memtables of a new database or column family. Before that, the
 memtable arena and the block cache grow, which shows up as allocations but is the memory you configured.
 
 Write options: reuse `WriteOptions` instances (`WriteOptions.SyncWrites` is a shared one). Synced writes
@@ -112,15 +113,33 @@ Both patterns cost the same as single writes (about 3 B per Put, all of it backg
 you dispose it. A batch that is dropped without `Dispose` takes its pooled buffer with it, which costs about 2.2 KB per
 batch.
 
-`WriteBatchWithIndex`: keep one and call `Clear()` between transactions (about 3 B per Put). `new WriteBatchWithIndex()`
-per batch builds its index from scratch (1.1 KB). `TryGetFromBatchAndDB(db, key, writer)` allocates nothing.
+`WriteBatchWithIndex` works the same way: take a pooled one per batch, or keep one and call `Clear()` (both about 3 B
+per Put, all of it background). `new WriteBatchWithIndex()` per batch builds its index from scratch (1.1 KB).
+`TryGetFromBatchAndDB(db, key, writer)` allocates nothing.
+
+```csharp
+// Pooled (bytewise order; pass overwriteKey: true for overwrite_key mode). Dispose returns it to the pool.
+using (WriteBatchWithIndex wbwi = db.CreateWriteBatchWithIndex())     // or WriteBatchWithIndex.Rent()
+{
+    wbwi.Put(k1, v1);
+    if (wbwi.TryGetFromBatchAndDB(db, k2, writer)) Use(writer.WrittenSpan);
+    db.Write(wbwi);
+}
+```
+
+A pooled batch must not be used after `Dispose`, nor the `WriteBatch` or iterators taken from it: a call on it while
+it sits in the pool throws `ObjectDisposedException`, but once another caller has rented it again, a stale reference
+would see that caller's batch.
 
 ### Range deletions
 
-`DeleteRange` is cheap to write, but range tombstones are fragmented and rewritten by every flush and compaction that
-covers them. A workload that issues one `DeleteRange` per few keys allocates several KB per range in the background
-today. Prefer a few wide ranges over many narrow ones (as with upstream RocksDB, where many range tombstones also cost
-read and compaction time). Point deletes don't have this cost.
+`DeleteRange` allocates nothing on the calling thread. In the background, range tombstones are fragmented when a
+memtable or table file is first read and rewritten by every flush and compaction that covers them; this costs the
+fragmented copy of each tombstone (about 50 B per fragment, per memtable, table file and compaction) rather than per
+read. A workload that issues one `DeleteRange` per 10 keys measures about 300 B per `DeleteRange` in total, and a batch
+that mixes puts with one `DeleteRange` about 300 B per batch. Many narrow ranges still cost more than a few wide ones in
+memory, read time and compaction work (as with upstream RocksDB), so prefer wide ranges when you have the choice.
+Snapshots matter too: a flush or compaction keeps one tombstone per fragment for each snapshot that separates them.
 
 ## Iterators
 
@@ -185,7 +204,7 @@ reused `MultiGetBatch` and `batch.TryGetEntity(i, columns)` allocate nothing.
 ## Transactions
 
 Reuse the transaction object: `BeginTransaction(writeOptions, transactionOptions, oldTransaction)` reinitialises a
-committed or rolled-back transaction, and keeps its lock-tracking buffers.
+committed or rolled-back transaction, and keeps its write batch and lock-tracking buffers.
 
 ```csharp
 var txnOptions = new TransactionOptions();
@@ -197,11 +216,12 @@ txn.TryGetForUpdate(null, other, writer);
 txn.Commit();                                   // or await txn.CommitAsync()
 ```
 
-- With reuse, pessimistic transactions (`Put`, `TryGetForUpdate`, `TryGet`, `CommitAsync`) allocate nothing.
-  `BeginTransaction(writeOptions)` (a new object per transaction) allocates about 3 KB.
-- Two-phase commit: `SetName` keeps the encoded name when a reused transaction gets the same name again; a different
-  name per transaction allocates about 32 B.
-- Optimistic transactions: `Commit` currently allocates about 40 B for the conflict check.
+- With reuse, pessimistic and optimistic transactions (`Put`, `TryGetForUpdate`, `TryGet`, `Commit`, `CommitAsync`)
+  allocate nothing, also for two-phase commit with a different `SetName` per transaction.
+- `using Transaction txn = txnDb.BeginTransaction(writeOptions)` (a new object per transaction) is fine too: disposing a
+  transaction hands its write batch and lock tracker to the next one, so only the transaction object is new (about
+  470 B pessimistic, 350 B optimistic). Dispose every transaction; one that is dropped without `Dispose` keeps its
+  buffers, and the next one builds new ones (about 3 KB).
 
 ## Async usage
 
@@ -211,10 +231,8 @@ txn.Commit();                                   // or await txn.CommitAsync()
   cold paths.
 - Write your own hot async loops as `async ValueTask` methods with
   `[AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]`, so your own state machine is pooled as well.
-- Under heavy async write concurrency (several writers awaiting the same write group), the runtime's pool of state
-  machines can run out and the write path allocates about 13 B per Put (4 concurrent writers). The pool size per type
-  can be raised with the environment variable `DOTNET_SYSTEM_THREADING_POOLINGASYNCVALUETASKSCACHESIZE`. Synchronous
-  writes from several threads don't have this cost.
+- Concurrent async writers (many tasks awaiting `PutAsync` / `WriteAsync` in the same write groups) allocate nothing
+  either: each waiting write owns its suspended state, so no tuning is needed.
 
 ## Options and settings that matter
 
@@ -225,8 +243,15 @@ txn.Commit();                                   // or await txn.CommitAsync()
 - **Statistics and PerfContext** cost no allocations on the read and write paths when enabled (`DbOptions.Statistics`,
   `PerfContext.Level`). Reading them does: `Statistics.GetHistogramData` (896 B), `ToString()` dumps, and
   `PerfContext.ToString()`. `GetTickerCount` and `PerfContext.Current[metric]` don't allocate.
-- **Info LOG.** Flushes and compactions write event lines to the `LOG` file. Today the event text is built for every new
-  file whatever the log level. This is part of the background allocations above.
+- **Info LOG.** Flushes, compactions and file deletions write INFO lines and `EVENT_LOG_v1` records to the `LOG` file,
+  one string per line. With `DbOptions.InfoLogLevel = InfoLogLevel.Warn` (or higher) they are not formatted at all,
+  which removes about a fifth of the background bytes of a flush or compaction:
+
+  ```csharp
+  var options = new DbOptions { CreateIfMissing = true, InfoLogLevel = InfoLogLevel.Warn };
+  ```
+
+  A custom `DbOptions.InfoLog` receives each line as a `string`; its `Level` is checked before anything is formatted.
 - **Write buffer size.** A larger memtable means fewer flushes and so fewer per-file allocations (see [Writes](#writes)).
 - **Snapshots.** `GetSnapshot()` allocates the snapshot handle (72 B). Take one per logical read view, not per read, and
   pass it through a reused `ReadOptions`.
@@ -252,10 +277,11 @@ steady-state throughput:
 
 - `Open` / `Dispose` (version set, options, caches, LOG): MBs per open; recovery from a WAL adds its replay buffers.
 - `CreateColumnFamily` / `DropColumnFamily`: the new memtable's first arena slab and the OPTIONS file (about 0.8 MB).
-- Flush and compaction: a few KB per output file (properties, file names, events) plus the per-entry building, which
-  reuses pooled buffers. Dictionary compression (`CompressionOptions.MaxDictBytes`) currently buffers a copy of every
-  data block of the file being built.
-- `SstFileWriter` + `IngestExternalFiles`: about 200 KB per ingested file.
+- Flush and compaction: about 20-40 KB per output file (the new table's reader with its pinned index and filter blocks,
+  its properties, the new version, file names and LOG lines) plus the per-entry building, which reuses pooled buffers.
+  This includes dictionary compression (`CompressionOptions.MaxDictBytes`): the data blocks it buffers while sampling
+  go into pooled memory.
+- `SstFileWriter` + `IngestExternalFiles`: about 70 KB per ingested file.
 - `CreateCheckpoint` (about 27 KB) and `BackupEngine.CreateNewBackup` (MBs: file lists and the table properties of every
   file).
 - Text dumps: `GetProperty(rocksdb.stats)`, `Statistics.ToString()`, `PerfContext.ToString()`.

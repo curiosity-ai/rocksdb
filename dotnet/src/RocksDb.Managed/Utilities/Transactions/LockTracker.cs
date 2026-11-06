@@ -96,6 +96,20 @@ internal sealed class LockTracker
         }
     }
 
+    /// <summary>The number of keys the tracking tables can hold without growing.</summary>
+    public int KeyCapacity
+    {
+        get
+        {
+            int n = _first?.Keys.EnsureCapacity(0) ?? 0;
+            if (_more is not null)
+            {
+                foreach (TrackedColumnFamily c in _more) n += c.Keys.EnsureCapacity(0);
+            }
+            return n;
+        }
+    }
+
     public int ColumnFamilyCount => (_first is null ? 0 : 1) + (_more?.Count ?? 0);
 
     /// <summary>GetNumPointLocks: the number of tracked keys over all column families.</summary>

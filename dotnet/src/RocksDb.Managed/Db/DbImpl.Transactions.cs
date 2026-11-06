@@ -303,32 +303,39 @@ internal sealed partial class DbImpl
         private readonly DbImpl _db;
         public readonly ColumnFamilyData Cfd;
         public readonly SuperVersion Sv;
-        /// <summary>History memtables, newest first (referenced); null if none.</summary>
+        /// <summary>
+        /// History memtables, newest first (referenced), in the first <see cref="HistoryCount"/> slots of an array rented
+        /// from <see cref="System.Buffers.ArrayPool{T}.Shared"/> (returned by <see cref="Dispose"/>); null if none.
+        /// </summary>
         public readonly MemTable[]? History;
+        public readonly int HistoryCount;
         /// <summary>GetEarliestMemTableSequenceNumber(sv, include_history = true).</summary>
         public readonly ulong EarliestSequence;
 
-        public ConflictCheckView(DbImpl db, ColumnFamilyData cfd, SuperVersion sv, MemTable[]? history, ulong earliest)
+        public ConflictCheckView(DbImpl db, ColumnFamilyData cfd, SuperVersion sv, MemTable[]? history, int historyCount, ulong earliest)
         {
             _db = db;
             Cfd = cfd;
             Sv = sv;
             History = history;
+            HistoryCount = historyCount;
             EarliestSequence = earliest;
         }
 
         public void Dispose()
         {
             if (_db is null) return;
-            if (History is not null)
+            if (History is { } history)
             {
                 lock (_db._mutex)
                 {
-                    foreach (MemTable m in History)
+                    for (int i = 0; i < HistoryCount; i++)
                     {
+                        MemTable m = history[i];
                         if (m.Unref()) m.Dispose();
                     }
                 }
+                System.Buffers.ArrayPool<MemTable>.Shared.Return(history, clearArray: true);
             }
             _db.ReturnSuperVersion(Sv);
         }
@@ -339,12 +346,14 @@ internal sealed partial class DbImpl
     {
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         MemTable[]? history = null;
+        int n;
         lock (_mutex)
         {
-            int n = cfd.History.Count;
+            n = cfd.History.Count;
             if (n > 0)
             {
-                history = new MemTable[n];
+                // Rented, not allocated: an optimistic commit takes a view per column family.
+                history = System.Buffers.ArrayPool<MemTable>.Shared.Rent(n);
                 for (int i = 0; i < n; i++)
                 {
                     MemTable m = cfd.History[n - 1 - i];
@@ -357,8 +366,8 @@ internal sealed partial class DbImpl
         // check sst files (the oldest memtable's earliest sequence number).
         ulong earliest = sv.Mem.EarliestSequenceNumber;
         if (sv.Imm.Length > 0) earliest = Math.Min(earliest, sv.Imm[^1].EarliestSequenceNumber);
-        if (history is not null) earliest = Math.Min(earliest, history[^1].EarliestSequenceNumber);
-        return new ConflictCheckView(this, cfd, sv, history, earliest);
+        if (history is not null) earliest = Math.Min(earliest, history[n - 1].EarliestSequenceNumber);
+        return new ConflictCheckView(this, cfd, sv, history, history is null ? 0 : n, earliest);
     }
 
     /// <summary>
@@ -486,7 +495,7 @@ internal sealed partial class DbImpl
             }
             if (view.History is { } history)
             {
-                for (int i = 0; i < history.Length; i++)
+                for (int i = 0; i < view.HistoryCount; i++)
                 {
                     if (MemTableSeq(history[i], lkey, out seq, tsSink)) { found = true; return; }
                 }

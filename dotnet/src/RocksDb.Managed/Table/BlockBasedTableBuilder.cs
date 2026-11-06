@@ -70,7 +70,7 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
     private readonly ulong _bufferLimit;
     private readonly int _maxSampleBytes;
     private ulong _dataBeginOffset;
-    private readonly List<byte[]> _dataBlockBuffers = new();
+    private readonly BufferedDataBlocks _dataBlockBuffers = new();
     private CompressionDictionary? _dict;
     private readonly int _blockSizeDeviationLimit;
     private readonly int _alignment;
@@ -447,7 +447,7 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         _collectors?.BlockAdd((ulong)raw.Length);
         if (_buffered)
         {
-            _dataBlockBuffers.Add(raw.ToArray());
+            _dataBlockBuffers.Add(raw);
             _dataBeginOffset += (ulong)raw.Length;
             _dataBlock.Reset();
             MaybeEnterUnbuffered(firstKeyInNextBlock, hasNext);
@@ -481,6 +481,53 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
     }
 
     /// <summary>
+    /// The data blocks buffered while sampling for a compression dictionary (Rep::data_block_buffers, a std::string per
+    /// block upstream). The blocks are copied back to back into 1 MiB chunks rented from
+    /// <see cref="TableBuilderBuffers.Bytes"/> (a larger block gets a chunk of its own), which go back to the pool when the
+    /// builder leaves the buffered state, so building a file with dictionary compression no longer allocates a copy of
+    /// every data block. Single-threaded, like the builder.
+    /// </summary>
+    private sealed class BufferedDataBlocks
+    {
+        private const int ChunkSize = 1 << 20;
+        private readonly List<byte[]> _chunks = new();
+        private readonly List<(int Chunk, int Offset, int Length)> _blocks = new();
+        private int _used;   // bytes used in the last chunk
+
+        public int Count => _blocks.Count;
+
+        public ReadOnlySpan<byte> this[int index]
+        {
+            get
+            {
+                (int chunk, int offset, int length) = _blocks[index];
+                return _chunks[chunk].AsSpan(offset, length);
+            }
+        }
+
+        public void Add(ReadOnlySpan<byte> block)
+        {
+            if (_chunks.Count == 0 || _chunks[^1].Length - _used < block.Length)
+            {
+                _chunks.Add(TableBuilderBuffers.Bytes.Rent(Math.Max(ChunkSize, block.Length)));
+                _used = 0;
+            }
+            block.CopyTo(_chunks[^1].AsSpan(_used));
+            _blocks.Add((_chunks.Count - 1, _used, block.Length));
+            _used += block.Length;
+        }
+
+        /// <summary>Drops the blocks and returns the chunks to the pool.</summary>
+        public void Clear()
+        {
+            foreach (byte[] c in _chunks) TableBuilderBuffers.Bytes.Return(c);
+            _chunks.Clear();
+            _blocks.Clear();
+            _used = 0;
+        }
+    }
+
+    /// <summary>
     /// Port of BlockBasedTableBuilder::MaybeEnterUnbuffered: once the buffered data exceeds buffer_limit (or at the
     /// end of the file), samples the buffered blocks, builds the dictionary, and replays the buffered blocks through
     /// the filter and index builders while compressing them with the dictionary.
@@ -506,9 +553,9 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         var sampleLengths = new List<nuint>();
         for (int i = 0; i < numBlocksBuffered && samples.WrittenCount < _maxSampleBytes; i++)
         {
-            byte[] block = _dataBlockBuffers[bufferIdx];
+            ReadOnlySpan<byte> block = _dataBlockBuffers[bufferIdx];
             int copyLength = Math.Min(_maxSampleBytes - samples.WrittenCount, block.Length);
-            samples.Write(block.AsSpan(0, copyLength));
+            samples.Write(block[..copyLength]);
             sampleLengths.Add((nuint)copyLength);
             bufferIdx += primeGeneratorRemainder;
             if (bufferIdx >= numBlocksBuffered) bufferIdx -= numBlocksBuffered;
@@ -523,7 +570,7 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         using var nextFirstKey = new PooledBufferWriter(64);
         for (int i = 0; i < numBlocksBuffered; i++)
         {
-            byte[] data = _dataBlockBuffers[i];
+            ReadOnlySpan<byte> data = _dataBlockBuffers[i];
             Block block = Block.CreateCopy(data);
             try
             {
@@ -808,13 +855,44 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
     /// <summary>Async <see cref="Finish"/>.</summary>
     public override async ValueTask FinishAsync(CancellationToken cancellationToken = default)
     {
-        FinishCore();
+        using var metaIndex = new MetaIndexBuilder();
+        BlockHandle indexHandle = FinishHead(metaIndex);
+        if (FinishRangeDelBlock() >= OutputFlushThreshold)
+        {
+            // A large range-del block goes to the file directly instead of through the staging buffer (see
+            // WriteRangeDelBlock).
+            await DrainOutputAsync(cancellationToken).ConfigureAwait(false);
+            await _file.AppendAsync(_rangeDelBlock.ContentsMemory, cancellationToken).ConfigureAwait(false);
+            metaIndex.Add(BlockBasedTableConstants.RangeDelBlockName, WriteTrailerOfAppendedBlock(_rangeDelBlock.Contents));
+        }
+        else if (!_rangeDelBlock.IsEmpty)
+        {
+            metaIndex.Add(BlockBasedTableConstants.RangeDelBlockName, WriteMaybeCompressedBlock(_rangeDelBlock.Contents, CompressionType.None));
+        }
+        FinishTail(metaIndex, indexHandle);
         await DrainOutputAsync(cancellationToken).ConfigureAwait(false);
         await _file.FlushAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Port of BlockBasedTableBuilder::Finish (meta block order: filter, index, [dict], range del, properties, metaindex, footer).</summary>
     private void FinishCore()
+    {
+        using var metaIndex = new MetaIndexBuilder();
+        BlockHandle indexHandle = FinishHead(metaIndex);
+        WriteRangeDelBlock(metaIndex);
+        FinishTail(metaIndex, indexHandle);
+    }
+
+    /// <summary>The meta blocks after the range-del block: properties, metaindex, footer.</summary>
+    private void FinishTail(MetaIndexBuilder metaIndex, BlockHandle indexHandle)
+    {
+        WritePropertiesBlock(metaIndex);
+        BlockHandle metaindexHandle = WriteMaybeCompressedBlock(metaIndex.Finish(), CompressionType.None);
+        WriteFooter(metaindexHandle, indexHandle);
+    }
+
+    /// <summary>The remaining data blocks and the meta blocks before the range-del block (filter, index, dictionary).</summary>
+    private BlockHandle FinishHead(MetaIndexBuilder metaIndex)
     {
         if (_closed) throw new InvalidOperationException("Table builder already finished.");
         Flush(default, hasNext: false);
@@ -824,14 +902,10 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         _closed = true;
         _props.TailStartOffset = _offset;
 
-        using var metaIndex = new MetaIndexBuilder();
         WriteFilterBlock(metaIndex);
         BlockHandle indexHandle = WriteIndexBlock(metaIndex);
         WriteCompressionDictBlock(metaIndex);
-        WriteRangeDelBlock(metaIndex);
-        WritePropertiesBlock(metaIndex);
-        BlockHandle metaindexHandle = WriteMaybeCompressedBlock(metaIndex.Finish(), CompressionType.None);
-        WriteFooter(metaindexHandle, indexHandle);
+        return indexHandle;
     }
 
     /// <summary>Port of BlockBasedTableBuilder::WriteFilterBlock (full filter, or filter partitions + partition index).</summary>
@@ -927,8 +1001,43 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
     private void WriteRangeDelBlock(MetaIndexBuilder metaIndex)
     {
         if (_rangeDelBlock.IsEmpty) return;
-        BlockHandle h = WriteMaybeCompressedBlock(_rangeDelBlock.Finish(), CompressionType.None);
+        ReadOnlySpan<byte> contents = _rangeDelBlock.Finish();
+        BlockHandle h;
+        if (contents.Length >= OutputFlushThreshold)
+        {
+            // A range-del block can be much larger than the data blocks (one entry per tombstone, uncompressed): staging
+            // it in _out would grow that buffer past the table builder pool's largest size class on every such file.
+            // Write it to the file directly; only the trailer goes through _out.
+            DrainOutput();
+            _file.Append(contents);
+            h = WriteTrailerOfAppendedBlock(contents);
+        }
+        else
+        {
+            h = WriteMaybeCompressedBlock(contents, CompressionType.None);
+        }
         metaIndex.Add(BlockBasedTableConstants.RangeDelBlockName, h);
+    }
+
+    /// <summary>Finishes the range-del block (if any); returns its size (0 when empty).</summary>
+    private int FinishRangeDelBlock() => _rangeDelBlock.IsEmpty ? 0 : _rangeDelBlock.Finish().Length;
+
+    /// <summary>
+    /// The WriteMaybeCompressedBlockImpl trailer (type kNoCompression, checksum with context) of an uncompressed meta
+    /// block whose <paramref name="contents"/> were just appended to the file directly, after draining <c>_out</c>.
+    /// </summary>
+    private BlockHandle WriteTrailerOfAppendedBlock(ReadOnlySpan<byte> contents)
+    {
+        System.Diagnostics.Debug.Assert(_out.WrittenCount == 0);
+        var handle = new BlockHandle(_offset, (ulong)contents.Length);
+        _compressionTypesUsed |= 1u << (int)CompressionType.None;
+        Span<byte> trailer = _out.GetSpan(BlockBasedTableConstants.BlockTrailerSize);
+        trailer[0] = (byte)CompressionType.None;
+        Coding.EncodeFixed32(trailer[1..], BlockChecksum.ComputeTrailerChecksum(_options.Checksum, _baseContextChecksum, contents,
+            (byte)CompressionType.None, _offset));
+        _out.Advance(BlockBasedTableConstants.BlockTrailerSize);
+        _offset += (ulong)contents.Length + BlockBasedTableConstants.BlockTrailerSize;
+        return handle;
     }
 
     /// <summary>Port of TimestampTablePropertiesCollector::InternalAdd (db/table_properties_collector.h).</summary>
@@ -1071,24 +1180,59 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
     /// <summary>
     /// Port of CompressionOptionsToString (util/compression.cc) plus the "_type=" pseudo-option appended by
     /// Rep::Rep (block_based_table_builder.cc). parallel_threads is skipped upstream; auto_skip is not supported.
+    /// The string is the same for every table file of a column family, so it is built once per distinct set of values
+    /// (<see cref="CompressionOptionsStringCache"/>).
     /// </summary>
-    private string BuildCompressionOptions()
+    private string BuildCompressionOptions() => CompressionOptionsStringCache.Get(_tbo.CompressionOptions, _tbo.CompressionType);
+
+    /// <summary>
+    /// The "rocksdb.compression_options" property strings by option values. <see cref="CompressionOptions"/> is mutable,
+    /// so entries are keyed by the values the string is made of, not by the instance. Direct-mapped and lock-free: entries
+    /// are immutable and a racing replacement only costs a rebuild.
+    /// </summary>
+    internal static class CompressionOptionsStringCache
     {
-        var ci = System.Globalization.CultureInfo.InvariantCulture;
-        CompressionOptions o = _tbo.CompressionOptions;
-        var sb = new StringBuilder(256);
-        sb.Append("window_bits=").Append(o.WindowBits.ToString(ci)).Append("; ");
-        sb.Append("level=").Append(o.Level.ToString(ci)).Append("; ");
-        sb.Append("strategy=").Append(o.Strategy.ToString(ci)).Append("; ");
-        sb.Append("max_dict_bytes=").Append(o.MaxDictBytes.ToString(ci)).Append("; ");
-        sb.Append("zstd_max_train_bytes=").Append(o.ZstdMaxTrainBytes.ToString(ci)).Append("; ");
-        sb.Append("enabled=").Append(o.Enabled ? '1' : '0').Append("; ");
-        sb.Append("max_dict_buffer_bytes=").Append(o.MaxDictBufferBytes.ToString(ci)).Append("; ");
-        sb.Append("use_zstd_dict_trainer=").Append(o.UseZstdDictTrainer ? '1' : '0').Append("; ");
-        sb.Append("max_compressed_bytes_per_kb=").Append(o.MaxCompressedBytesPerKb.ToString(ci)).Append("; ");
-        sb.Append("checksum=").Append(o.Checksum ? '1' : '0').Append("; ");
-        sb.Append("_type=").Append(((int)_tbo.CompressionType).ToString(ci)).Append("; ");
-        return sb.ToString();
+        private const int Slots = 16;
+        private static readonly Entry?[] s_entries = new Entry?[Slots];
+
+        private readonly record struct Key(int WindowBits, int Level, int Strategy, uint MaxDictBytes, uint ZstdMaxTrainBytes, bool Enabled,
+            ulong MaxDictBufferBytes, bool UseZstdDictTrainer, int MaxCompressedBytesPerKb, bool Checksum, CompressionType Type);
+
+        private sealed class Entry(Key key, string value)
+        {
+            public readonly Key Key = key;
+            public readonly string Value = value;
+        }
+
+        public static string Get(CompressionOptions o, CompressionType type)
+        {
+            var key = new Key(o.WindowBits, o.Level, o.Strategy, o.MaxDictBytes, o.ZstdMaxTrainBytes, o.Enabled, o.MaxDictBufferBytes,
+                o.UseZstdDictTrainer, o.MaxCompressedBytesPerKb, o.Checksum, type);
+            int slot = (key.GetHashCode() & int.MaxValue) % Slots;
+            Entry? e = Volatile.Read(ref s_entries[slot]);
+            if (e is not null && e.Key.Equals(key)) return e.Value;
+            string value = Format(key);
+            Volatile.Write(ref s_entries[slot], new Entry(key, value));
+            return value;
+        }
+
+        private static string Format(in Key o)
+        {
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            var sb = new StringBuilder(256);
+            sb.Append("window_bits=").Append(o.WindowBits.ToString(ci)).Append("; ");
+            sb.Append("level=").Append(o.Level.ToString(ci)).Append("; ");
+            sb.Append("strategy=").Append(o.Strategy.ToString(ci)).Append("; ");
+            sb.Append("max_dict_bytes=").Append(o.MaxDictBytes.ToString(ci)).Append("; ");
+            sb.Append("zstd_max_train_bytes=").Append(o.ZstdMaxTrainBytes.ToString(ci)).Append("; ");
+            sb.Append("enabled=").Append(o.Enabled ? '1' : '0').Append("; ");
+            sb.Append("max_dict_buffer_bytes=").Append(o.MaxDictBufferBytes.ToString(ci)).Append("; ");
+            sb.Append("use_zstd_dict_trainer=").Append(o.UseZstdDictTrainer ? '1' : '0').Append("; ");
+            sb.Append("max_compressed_bytes_per_kb=").Append(o.MaxCompressedBytesPerKb.ToString(ci)).Append("; ");
+            sb.Append("checksum=").Append(o.Checksum ? '1' : '0').Append("; ");
+            sb.Append("_type=").Append(((int)o.Type).ToString(ci)).Append("; ");
+            return sb.ToString();
+        }
     }
 
     private void WriteFooter(BlockHandle metaindexHandle, BlockHandle indexHandle)
