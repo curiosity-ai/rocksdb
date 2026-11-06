@@ -51,6 +51,22 @@ public sealed record TableFormatOptions
     /// <summary>Verify block checksums when reading (ReadOptions::verify_checksums default true).</summary>
     public bool VerifyChecksums { get; init; } = true;
     /// <summary>
+    /// verify_compression: every compressed block is decompressed again and compared with its input before it is
+    /// written; a mismatch fails the build with Corruption (CompressAndVerifyBlock). Default false.
+    /// </summary>
+    public bool VerifyCompression { get; init; }
+    /// <summary>
+    /// detect_filter_construct_corruption: after a filter (or filter partition) is built, every key added to it must
+    /// match it, else the build fails with Corruption (FilterBlockBuilder::MaybePostVerifyFilter). Default false.
+    /// </summary>
+    public bool DetectFilterConstructCorruption { get; init; }
+    /// <summary>
+    /// read_amp_bytes_per_bit: when non-zero, data blocks read with this reader track which of their bytes were accessed
+    /// (BlockReadAmpBitmap, one bit per this many bytes) for READ_AMP_ESTIMATE_USEFUL_BYTES / READ_AMP_TOTAL_READ_BYTES.
+    /// Default 0 (off).
+    /// </summary>
+    public uint ReadAmpBytesPerBit { get; init; }
+    /// <summary>
     /// separate_key_value_in_data_block: data blocks store all keys first and the values after them (a value-offset varint
     /// per restart interval). Readable by RocksDB 11.x with the feature (recorded in "rocksdb.separate.key.value.in.data.block").
     /// </summary>

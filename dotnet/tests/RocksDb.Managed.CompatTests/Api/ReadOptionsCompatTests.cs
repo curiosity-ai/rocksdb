@@ -382,6 +382,90 @@ public sealed class ReadOptionsCompatTests
         CollectionAssert.AreEqual(native, managed, string.Join(", ", native) + " vs " + string.Join(", ", managed));
     }
 
+    // ---- verify_compression, detect_filter_construct_corruption, read_amp_bytes_per_bit ------------------------
+
+    /// <summary>
+    /// The three table options round-trip through each side's OPTIONS file, DBs written with verify_compression and
+    /// detect_filter_construct_corruption read back on the other side, and read_amp_bytes_per_bit = 1 reports the same
+    /// READ_AMP_TOTAL_READ_BYTES / READ_AMP_ESTIMATE_USEFUL_BYTES as native for the same workload (all useful once every
+    /// entry was read).
+    /// </summary>
+    [TestMethod]
+    public void TableSafetyOptionsMatchNative()
+    {
+        using var nativeDir = new TempDir("tsafe-n");
+        using var managedDir = new TempDir("tsafe-m");
+        const int n = 3000;
+        static byte[] Value(int i) => Encoding.UTF8.GetBytes("value-" + i.ToString(CultureInfo.InvariantCulture) + new string('x', i % 37));
+        string nativeText;
+        {
+            var no = new RocksDbSharp.DbOptions().SetCreateIfMissing(true).SetCompression(RocksDbSharp.Compression.Snappy).EnableStatistics();
+            var bbto = new RocksDbSharp.BlockBasedTableOptions().SetFilterPolicy(RocksDbSharp.BloomFilterPolicy.Create(10, false)).SetFormatVersion(7);
+            RocksDbSharp.Native.Instance.rocksdb_block_based_options_set_verify_compression(bbto.Handle, 1);
+            RocksDbSharp.Native.Instance.rocksdb_block_based_options_set_detect_filter_construct_corruption(bbto.Handle, 1);
+            RocksDbSharp.Native.Instance.rocksdb_block_based_options_set_read_amp_bytes_per_bit(bbto.Handle, 1);
+            no.SetBlockBasedTableFactory(bbto);
+            s_keepAlive.Add(no);
+            s_keepAlive.Add(bbto);
+            using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(no, nativeDir.Path))
+            {
+                for (int i = 0; i < n; i++) db.Put(B(K(i)), Value(i));
+                db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            }
+            using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(no, nativeDir.Path))
+            {
+                ulong before = TickerValue(no.GetStatisticsString(), "rocksdb.read.amp.total.read.bytes");
+                Assert.AreEqual(0UL, before);
+                for (int i = 0; i < n; i++) db.Get(B(K(i)));
+                nativeText = no.GetStatisticsString();
+            }
+        }
+        var stats = new Statistics();
+        var cfo = new ColumnFamilyOptions { Compression = Managed.Compression.CompressionType.Snappy };
+        cfo.TableOptions.FilterPolicy = new BloomFilterPolicy(10);
+        cfo.TableOptions.FormatVersion = 7;
+        cfo.TableOptions.VerifyCompression = true;
+        cfo.TableOptions.DetectFilterConstructCorruption = true;
+        cfo.TableOptions.ReadAmpBytesPerBit = 1;
+        using (RocksDatabase db = RocksDatabase.Open(managedDir.Path, new DbOptions { CreateIfMissing = true, Statistics = stats }, cfo))
+        {
+            for (int i = 0; i < n; i++) db.Put(B(K(i)), Value(i));
+            db.Flush();
+        }
+        stats.Reset();
+        using (RocksDatabase db = RocksDatabase.Open(managedDir.Path, new DbOptions { Statistics = stats }, cfo))
+        {
+            for (int i = 0; i < n; i++) db.Get(B(K(i)));
+        }
+        string managedText = stats.ToString();
+        ulong nativeTotal = TickerValue(nativeText, "rocksdb.read.amp.total.read.bytes");
+        ulong managedTotal = TickerValue(managedText, "rocksdb.read.amp.total.read.bytes");
+        Assert.IsTrue(managedTotal > 0);
+        Assert.AreEqual(nativeTotal, managedTotal, "READ_AMP_TOTAL_READ_BYTES");
+        Assert.AreEqual(TickerValue(nativeText, "rocksdb.read.amp.estimate.useful.bytes"), TickerValue(managedText, "rocksdb.read.amp.estimate.useful.bytes"));
+        Assert.AreEqual(managedTotal, TickerValue(managedText, "rocksdb.read.amp.estimate.useful.bytes"));
+
+        // OPTIONS files: each side's values as the other parses them; data readable both ways.
+        foreach (string dir in new[] { nativeDir.Path, managedDir.Path })
+        {
+            OptionsFile f = OptionsFile.Load(Managed.Env.LocalFileSystem.Instance, OptionsFile.FindLatestOptionsFile(Managed.Env.LocalFileSystem.Instance, dir)!, preserveUnknownOptions: true);
+            BlockBasedTableOptions t = f.ColumnFamilies[0].Options.TableOptions;
+            Assert.IsTrue(t.VerifyCompression, dir);
+            Assert.IsTrue(t.DetectFilterConstructCorruption, dir);
+            Assert.AreEqual(1U, t.ReadAmpBytesPerBit, dir);
+        }
+        using (RocksDbSharp.RocksDb db = OpenNative(managedDir.Path))
+        {
+            Assert.AreEqual(Encoding.UTF8.GetString(Value(77)), Encoding.UTF8.GetString(db.Get(B(K(77)))));
+        }
+        using (RocksDatabase db = RocksDatabase.Open(nativeDir.Path, new DbOptions(), cfo))
+        {
+            Assert.AreEqual(Encoding.UTF8.GetString(Value(78)), Encoding.UTF8.GetString(db.Get(B(K(78)))!));
+        }
+    }
+
+    private static string K(int i) => "key" + i.ToString("D6", CultureInfo.InvariantCulture);
+
     // ---- row cache --------------------------------------------------------------------------------------------
 
     private static void RowCacheWorkload(Action<string> put, Action flush, Func<string, string?> get, Func<Snapshot?> snapshot, Func<string, string?> getAtSnapshot)

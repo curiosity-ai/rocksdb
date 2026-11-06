@@ -160,6 +160,7 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
             {
                 OptimizeFiltersForMemory = options.OptimizeFiltersForMemory,
             });
+            if (options.DetectFilterConstructCorruption) bits = new VerifyingFilterBitsBuilder(bits, policy);
             if (options.PartitionFilters && partitionedIndex is not null)
             {
                 // Since after partition cut request from filter builder it takes time until index builder actully cuts
@@ -622,10 +623,41 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
                 isDataBlock ? _dict : null)
             && compressed.WrittenCount <= maxCompressed)
         {
+            if (_options.VerifyCompression) VerifyCompressedBlock(raw, compressed.WrittenSpan, isDataBlock);
             return _tbo.CompressionType;
         }
         rejected = isDataBlock;
         return CompressionType.None;
+    }
+
+    /// <summary>
+    /// verify_compression (CompressAndVerifyBlock): decompresses <paramref name="compressed"/> (with the dictionary of
+    /// data blocks) and fails the build with Corruption unless it reproduces <paramref name="raw"/>. Off the default
+    /// write path (only called with the option set).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void VerifyCompressedBlock(ReadOnlySpan<byte> raw, ReadOnlySpan<byte> compressed, bool isDataBlock)
+    {
+        PooledBufferWriter check = ObjectPools.RentWriter();
+        try
+        {
+            try
+            {
+                BlockCompression.Decompress(_tbo.CompressionType, compressed, _options.FormatVersion, check, isDataBlock ? _dict : null);
+            }
+            catch (RocksDbException e)
+            {
+                throw new RocksDbException(StatusCode.Corruption, "Corruption: Could not decompress: " + e.Message, StatusSubCode.None, e);
+            }
+            if (!check.WrittenSpan.SequenceEqual(raw))
+            {
+                ThrowHelper.Corruption("Decompressed block did not match pre-compression block");
+            }
+        }
+        finally
+        {
+            ObjectPools.ReturnWriter(check);
+        }
     }
 
     /// <summary>WriteMaybeCompressedBlockImpl for meta blocks (no alignment).</summary>

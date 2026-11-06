@@ -128,6 +128,12 @@ public sealed record TableReaderOptions
     /// <summary>ImmutableOptions::num_levels of the column family (-1 unknown): with <see cref="Level"/>, IsLastLevel.</summary>
     internal int NumLevels { get; init; } = -1;
 
+    /// <summary>
+    /// read_amp_bytes_per_bit: data blocks read from the file track the bytes read (READ_AMP_* tickers of the DB
+    /// statistics the <see cref="Statistics"/> belong to). 0 (default): off.
+    /// </summary>
+    public uint ReadAmpBytesPerBit { get; init; }
+
     /// <summary>block_restart_interval of the table options (estimates the keys of a traced block).</summary>
     internal int BlockRestartInterval { get; init; } = 16;
 
@@ -1310,7 +1316,15 @@ public sealed partial class BlockBasedTableReader : TableReader
     private Block Protect(Block b, BlockKind kind)
     {
         if (_options.BlockProtectionBytesPerKey != 0 && kind != BlockKind.Filter) b.RequestKvProtection(_options.BlockProtectionBytesPerKey);
+        // Block::Block with read_amp_bytes_per_bit and statistics: data blocks read from the file get a read-amp bitmap.
+        if (_options.ReadAmpBytesPerBit != 0 && kind == BlockKind.Data) AttachReadAmpBitmap(b);
         return b;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void AttachReadAmpBitmap(Block b)
+    {
+        if (_stats?.Owner is { } st && b.RestartOffset > 0) b.ReadAmp = new BlockReadAmpBitmap(b.RestartOffset, _options.ReadAmpBytesPerBit, st);
     }
 
     private static Block Protect(Block b, TableReaderOptions options)
