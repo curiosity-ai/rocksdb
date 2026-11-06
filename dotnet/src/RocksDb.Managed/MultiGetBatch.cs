@@ -196,6 +196,58 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
     /// <summary>Number of keys found by the last run.</summary>
     public int FoundCount { get; private set; }
 
+    // ---- internal pool (the convenience MultiGet overloads; a user batch is never pooled) ------------------
+
+    // One cached batch per thread. A batch that grew past these bounds is disposed instead of being kept, so a rare
+    // huge MultiGet does not pin its buffers on the thread for good.
+    [ThreadStatic] private static MultiGetBatch? t_cached;
+    private const int MaxPooledKeys = 1024;
+    private const int MaxPooledBytes = 1 << 20;
+
+    /// <summary>
+    /// A cleared batch for one internal MultiGet call: the calling thread's cached batch, or a new one. Return it with
+    /// <see cref="ReturnPooled"/> (from any thread) once its results have been copied out.
+    /// </summary>
+    internal static MultiGetBatch RentPooled(int capacity)
+    {
+        MultiGetBatch? b = t_cached;
+        if (b is not null)
+        {
+            // Taken out of the slot while in use, so a nested call on this thread (e.g. from a merge operator) gets
+            // its own batch.
+            t_cached = null;
+            return b;
+        }
+        return new MultiGetBatch(Math.Min(capacity, MaxPooledKeys)) { _pooled = true };
+    }
+
+    /// <summary>Clears <paramref name="batch"/> and caches it on the current thread (or disposes it if too large).</summary>
+    internal static void ReturnPooled(MultiGetBatch batch)
+    {
+        System.Diagnostics.Debug.Assert(batch._pooled);
+        batch.Clear();
+        if (batch._disposed) return;
+        if (t_cached is null && batch.RetainedBytes() <= MaxPooledBytes && batch._keyOffsets.Length <= MaxPooledKeys)
+        {
+            t_cached = batch;
+            return;
+        }
+        batch.Dispose();
+    }
+
+    private bool _pooled;
+
+    private long RetainedBytes()
+    {
+        long bytes = _keyBytes.Length + _ikeys.Length;
+        GetContext?[] ctx = _contexts;
+        for (int i = 0; i < ctx.Length; i++)
+        {
+            if (ctx[i] is { } c) bytes += c.Value.Capacity + c.Scratch.Capacity;
+        }
+        return bytes;
+    }
+
     public void Dispose()
     {
         if (_disposed) return;

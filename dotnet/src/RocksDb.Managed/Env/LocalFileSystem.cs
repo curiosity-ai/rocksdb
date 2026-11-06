@@ -119,14 +119,27 @@ public sealed class LocalFileSystem : IFileSystem
         }
     }
 
+    // EnumerationOptions.Compatible (what Directory.EnumerateFileSystemEntries uses): no attribute is skipped and
+    // inaccessible entries are not ignored.
+    private static readonly EnumerationOptions s_childrenEnumeration = new()
+    {
+        AttributesToSkip = 0,
+        IgnoreInaccessible = false,
+        MatchType = MatchType.Win32,
+        RecurseSubdirectories = false,
+    };
+
     /// <summary>Names (not paths) of the entries in <paramref name="directory"/>.</summary>
     public IEnumerable<string> GetChildren(string directory)
     {
         List<string> result = [];
         try
         {
-            foreach (string entry in Directory.EnumerateFileSystemEntries(directory))
-                result.Add(Path.GetFileName(entry));
+            // Directory.EnumerateFileSystemEntries(directory) without building each entry's full path first: the
+            // transform yields the name only (same entries: compatible options, nothing skipped, "." / ".." excluded).
+            var entries = new System.IO.Enumeration.FileSystemEnumerable<string>(directory,
+                static (ref System.IO.Enumeration.FileSystemEntry e) => e.FileName.ToString(), s_childrenEnumeration);
+            foreach (string name in entries) result.Add(name);
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {

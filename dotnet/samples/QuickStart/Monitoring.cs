@@ -55,10 +55,15 @@ internal static class Monitoring
 
         Console.WriteLine(db.GetIntProperty(DbProperties.EstimateNumKeys));               // 100
         Dictionary<string, TableProperties> tables = db.GetPropertiesOfAllTables();
+        // Allocation-free monitoring: numeric properties, the table files visited in place.
+        db.TryGetIntProperty(DbProperties.CurSizeAllMemTables, out ulong memtableBytes);
+        var sstBytes = new System.Runtime.CompilerServices.StrongBox<ulong>();
+        db.VisitLiveFiles(sstBytes, static (in LiveFileInfo f, System.Runtime.CompilerServices.StrongBox<ulong> sum) => sum.Value += f.Size);
         // </snippet:monitoring>
         Line($"keys written {statistics.GetTickerCount(Ticker.NumberKeysWritten)}, flushes seen {listener.Flushes}, " +
              $"tables {tables.Count}, LOG exists {File.Exists(Path.Combine(path, "LOG"))}, stats text {dump.Length} chars");
         Check(statistics.GetTickerCount(Ticker.NumberKeysWritten) == 100 && listener.Flushes == 1, "statistics + listener");
+        Check(sstBytes.Value > 0 && memtableBytes > 0, "live files visited");
         _ = new ConsoleInfoLogger();
 
         // <snippet:perf-context>

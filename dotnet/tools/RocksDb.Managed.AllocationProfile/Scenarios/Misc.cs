@@ -76,6 +76,30 @@ internal static partial class Scenarios
             long sum = 0;
             return Done(Runner.Sync(n => { for (int i = 0; i < n; i++) sum += db.GetLiveFilesMetadata().Count; }));
         }, chunk: 100));
+        list.Add(S("metadata.livefiles-refill", "property", PathKind.Warm, "GetLiveFilesMetadata(reused list) on 8 SST files", ctx =>
+        {
+            RocksDatabase db = ManyFilesDb(ctx);
+            var files = new List<LiveFileMetadata>();
+            long sum = 0;
+            return Done(Runner.Sync(n => { for (int i = 0; i < n; i++) { db.GetLiveFilesMetadata(files); sum += files.Count; } }));
+        }, chunk: 100, notes: "One LiveFileMetadata record (with its key copies and name) per file by design."));
+        list.Add(S("metadata.visit-livefiles", "property", PathKind.Warm, "VisitLiveFiles(state, static visitor) on 8 SST files", ctx =>
+        {
+            RocksDatabase db = ManyFilesDb(ctx);
+            var total = new System.Runtime.CompilerServices.StrongBox<ulong>();
+            return Done(Runner.Sync(n =>
+            {
+                for (int i = 0; i < n; i++) db.VisitLiveFiles(total, static (in LiveFileInfo f, System.Runtime.CompilerServices.StrongBox<ulong> t) => t.Value += f.Size);
+            }));
+        }, chunk: 100));
+        list.Add(S("metadata.approximate-sizes-span", "property", PathKind.Warm, "GetApproximateSizes(ranges, Span<ulong>) of 1 KeyRange on 8 SST files", ctx =>
+        {
+            RocksDatabase db = ManyFilesDb(ctx);
+            KeyRange[] ranges = [new KeyRange(ScenarioContext.Key(1000), ScenarioContext.Key(50_000))];
+            var sizes = new ulong[1];
+            ulong sum = 0;
+            return Done(Runner.Sync(n => { for (int i = 0; i < n; i++) { db.GetApproximateSizes(ranges, sizes); sum += sizes[0]; } }));
+        }, chunk: 100));
         list.Add(S("metadata.approximate-sizes", "property", PathKind.Warm, "GetApproximateSizes(1 KeyRange) on 8 SST files", ctx =>
         {
             RocksDatabase db = ManyFilesDb(ctx);

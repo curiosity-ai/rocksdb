@@ -22,63 +22,6 @@ internal sealed partial class DbImpl
     {
         switch (property)
         {
-            case DbProperties.EstimateLiveDataSize:
-                value = EstimateLiveDataSize(cfd, sv.Current.Storage).ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.CurSizeAllMemTables:
-                {
-                    // Active + unflushed immutable memtables.
-                    long n = sv.Mem.ApproximateMemoryUsage;
-                    foreach (MemTable m in sv.Imm) n += m.ApproximateMemoryUsage;
-                    value = n.ToString(CultureInfo.InvariantCulture);
-                    return true;
-                }
-            case DbProperties.SizeAllMemTables:
-                {
-                    // Active, immutable and flushed-but-still-referenced memtables (pinned by iterators or kept as
-                    // history), like upstream's mem()->ApproximateMemoryUsage() + imm()->ApproximateMemoryUsage().
-                    long n = sv.Mem.ApproximateMemoryUsage;
-                    var counted = new HashSet<MemTable>(ReferenceEqualityComparer.Instance) { sv.Mem };
-                    foreach (MemTable m in sv.Imm)
-                    {
-                        if (counted.Add(m)) n += m.ApproximateMemoryUsage;
-                    }
-                    lock (_mutex)
-                    {
-                        foreach (MemTable m in cfd.History)
-                        {
-                            if (counted.Add(m)) n += m.ApproximateMemoryUsage;
-                        }
-                        foreach (MemTable m in cfd.FlushedPinnedMemTables)
-                        {
-                            if (counted.Add(m)) n += m.ApproximateMemoryUsage;
-                        }
-                    }
-                    value = n.ToString(CultureInfo.InvariantCulture);
-                    return true;
-                }
-            case DbProperties.BlockCacheUsage:
-            case DbProperties.BlockCacheCapacity:
-            case DbProperties.BlockCachePinnedUsage:
-                {
-                    Cache.BlockCache? cache = BlockCacheOf(cfd);
-                    if (cache is null)
-                    {
-                        value = null;
-                        return true;
-                    }
-                    long v = property switch
-                    {
-                        "rocksdb.block-cache-usage" => cache.Usage,
-                        "rocksdb.block-cache-capacity" => cache.Capacity,
-                        _ => cache.PinnedUsage,
-                    };
-                    value = v.ToString(CultureInfo.InvariantCulture);
-                    return true;
-                }
-            case DbProperties.NumBlobFiles:
-                value = sv.Current.Storage.BlobFiles.Length.ToString(CultureInfo.InvariantCulture);
-                return true;
             case DbProperties.BlobStats:
                 {
                     // InternalStats::HandleBlobStats of the current version.
@@ -92,82 +35,6 @@ internal sealed partial class DbImpl
                             "\nBlob file space amplification: " + spaceAmp.ToString(CultureInfo.InvariantCulture) + "\n";
                     return true;
                 }
-            case DbProperties.TotalBlobFileSize:
-                lock (_mutex) value = Versions.TotalBlobFileSize(cfd).ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.LiveBlobFileSize:
-            case DbProperties.LiveBlobFileGarbageSize:
-                {
-                    VersionStorageInfo cur;
-                    lock (_mutex) cur = cfd.Current.Storage;
-                    (ulong total, ulong garbage) = cur.GetBlobStats();
-                    value = (property == DbProperties.LiveBlobFileSize ? total : garbage).ToString(CultureInfo.InvariantCulture);
-                    return true;
-                }
-            case DbProperties.BlobCacheCapacity:
-            case DbProperties.BlobCacheUsage:
-            case DbProperties.BlobCachePinnedUsage:
-                {
-                    Cache.BlockCache? cache = cfd.BlobSource.Cache;
-                    if (cache is null)
-                    {
-                        value = null;
-                        return true;
-                    }
-                    long v = property switch
-                    {
-                        DbProperties.BlobCacheUsage => cache.Usage,
-                        DbProperties.BlobCacheCapacity => cache.Capacity,
-                        _ => cache.PinnedUsage,
-                    };
-                    value = v.ToString(CultureInfo.InvariantCulture);
-                    return true;
-                }
-            case DbProperties.NumLiveVersions:
-                lock (_mutex) value = cfd.LiveVersions.ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.CurrentSuperVersionNumber:
-                value = sv.Number.ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.OldestSnapshotTime:
-                lock (_mutex) value = (_snapshots.IsEmpty ? 0 : _snapshots.Oldest.UnixTime).ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.OldestSnapshotSequence:
-                lock (_mutex) value = (_snapshots.IsEmpty ? 0 : _snapshots.Oldest.SequenceNumber).ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.NumRunningFlushes:
-                lock (_mutex) value = _runningFlushes.ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.MemTableFlushPending:
-                lock (_mutex) value = cfd.HasPendingFlush ? "1" : "0";
-                return true;
-            case DbProperties.NumDeletesImmMemTables:
-                {
-                    long n = 0;
-                    foreach (MemTable m in sv.Imm) n += m.NumDeletes;
-                    value = n.ToString(CultureInfo.InvariantCulture);
-                    return true;
-                }
-            case DbProperties.EstimateTableReadersMem:
-                {
-                    // Version::GetMemoryUsageByTableReaders: TableCache::GetMemoryUsageByTableReader of every live file,
-                    // counting only readers already open (FindTable with no_io = true).
-                    ulong n = 0;
-                    VersionStorageInfo storage = sv.Current.Storage;
-                    for (int l = 0; l < storage.NumLevels; l++)
-                    {
-                        foreach (FileMetaData f in storage.LevelFilesArray(l))
-                        {
-                            if (!cfd.TableCache.TryGetOpenReader(f, out TableReaderLease lease)) continue;
-                            using (lease) n += lease.Reader.ApproximateMemoryUsage;
-                        }
-                    }
-                    value = n.ToString(CultureInfo.InvariantCulture);
-                    return true;
-                }
-            case DbProperties.BackgroundErrors:
-                value = ErrorHandler.ErrorCount.ToString(CultureInfo.InvariantCulture);
-                return true;
             case DbProperties.CfStats:
                 // HandleCFStats: DumpCFStatsNoFileHistogram(is_periodic = true) starts a new interval, then DumpCFFileHistogram.
                 value = cfd.Stats.Dump(cfd.Name, sv.Current.Storage, isPeriodic: true) + cfd.Stats.DumpFileHistogram(cfd.Name);
@@ -208,49 +75,6 @@ internal sealed partial class DbImpl
                     value = cache is null ? null : CacheEntryRoleStats.Collect(cache, fast: property == DbProperties.FastBlockCacheEntryStats).ToString();
                     return true;
                 }
-            case DbProperties.NumImmutableMemTableFlushed:
-                lock (_mutex) value = cfd.History.Count.ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.NumRunningRemoteCompactions:
-                value = NumRunningRemoteCompactions.ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.NumRunningBottomCompactions:
-                lock (_mutex) value = _bgBottomCompactionRunning.ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.NumRunningCompactionSortedRuns:
-                lock (_mutex) value = NumRunningCompactionSortedRunsLocked().ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.CompactionAbortCount:
-                // compaction_aborted_: AbortAllCompactions / ResumeAllCompactions are not ported, so it never leaves 0.
-                value = "0";
-                return true;
-            case DbProperties.NumUnscheduledCompactions:
-                lock (_mutex) value = _compactionQueue.Count.ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.IsFileDeletionsEnabled:
-                value = IsFileDeletionsEnabled ? "1" : "0";
-                return true;
-            case DbProperties.MinLogNumberToKeep:
-                // DBImpl::MinLogNumberToKeep = versions_->min_log_number_to_keep().
-                lock (_mutex) value = Versions.MinLogNumberToKeep.ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.MinObsoleteSstNumberToKeep:
-                {
-                    // DBImpl::MinObsoleteSstNumberToKeep: the smallest pending output, else uint64 max.
-                    ulong min = ulong.MaxValue;
-                    lock (_mutex)
-                    {
-                        foreach (ulong n in _pendingOutputs) min = Math.Min(min, n);
-                    }
-                    value = min.ToString(CultureInfo.InvariantCulture);
-                    return true;
-                }
-            case DbProperties.ObsoleteSstFilesSize:
-                lock (_mutex) value = Versions.ObsoleteSstFilesSize.ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.EstimateOldestKeyTime:
-                value = EstimateOldestKeyTime(cfd, sv) is ulong t ? t.ToString(CultureInfo.InvariantCulture) : null;
-                return true;
         }
         const string compressionRatio = DbProperties.CompressionRatioAtLevelPrefix;
         if (property.StartsWith(compressionRatio, StringComparison.Ordinal))
@@ -259,27 +83,6 @@ internal sealed partial class DbImpl
             value = TryParseLevel(property.AsSpan(compressionRatio.Length), sv, out int ratioLevel)
                 ? Statistics.Fixed6(EstimatedCompressionRatioAtLevel(sv.Current.Storage, ratioLevel))
                 : null;
-            return true;
-        }
-        const string atTemperature = DbProperties.LiveSstFilesSizeAtTemperaturePrefix;
-        if (property.StartsWith(atTemperature, StringComparison.Ordinal))
-        {
-            // HandleLiveSstFilesSizeAtTemperature: any decimal number, compared with the temperature's byte value.
-            if (!ulong.TryParse(property.AsSpan(atTemperature.Length), NumberStyles.None, CultureInfo.InvariantCulture, out ulong temperature))
-            {
-                value = null;
-                return true;
-            }
-            ulong size = 0;
-            VersionStorageInfo vs = sv.Current.Storage;
-            for (int l = 0; l < vs.NumLevels; l++)
-            {
-                foreach (FileMetaData f in vs.LevelFilesArray(l))
-                {
-                    if ((byte)f.Temperature == temperature) size += f.FileSize;
-                }
-            }
-            value = size.ToString(CultureInfo.InvariantCulture);
             return true;
         }
         const string aggregatedAtLevel = DbProperties.AggregatedTablePropertiesAtLevelPrefix;
@@ -387,6 +190,27 @@ internal sealed partial class DbImpl
     /// </summary>
     public bool TryGetIntProperty(ColumnFamilyData cfd, string property, out ulong value)
     {
+        SuperVersion sv = GetReferencedSuperVersion(cfd);
+        IntPropertyResult r;
+        IntPropertyValue v;
+        try
+        {
+            r = TryGetIntPropertyCore(cfd, sv, property, out v);
+        }
+        finally
+        {
+            ReturnSuperVersion(sv);
+        }
+        switch (r)
+        {
+            case IntPropertyResult.Value:
+                return v.TryGetUInt64(out value);
+            case IntPropertyResult.Unavailable:
+                value = 0;
+                return false;
+        }
+        // A string property whose text happens to be a decimal number (none of the upstream ones have an int handler, but
+        // the managed port has always accepted them here).
         value = 0;
         string? s = GetProperty(cfd, property);
         return s is not null && ulong.TryParse(s, NumberStyles.None, CultureInfo.InvariantCulture, out value);
@@ -446,8 +270,27 @@ internal sealed partial class DbImpl
     {
         InternalKeyComparator icmp = cfd.Icmp;
         ulong size = 0;
-        // Ordered by largest key: the files included in the estimate.
-        var ranges = new List<FileMetaData>();
+        // Ordered by largest key: the files included in the estimate. Per-thread scratch (taken out of the slot while in
+        // use and cleared afterwards, so it holds no FileMetaData between calls).
+        List<FileMetaData> ranges = t_liveDataRanges ?? new List<FileMetaData>();
+        t_liveDataRanges = null;
+        try
+        {
+            size = EstimateLiveDataSize(icmp, s, ranges);
+        }
+        finally
+        {
+            ranges.Clear();
+            if (ranges.Capacity <= 4096) t_liveDataRanges = ranges;
+        }
+        return size;
+    }
+
+    [ThreadStatic] private static List<FileMetaData>? t_liveDataRanges;
+
+    private static ulong EstimateLiveDataSize(InternalKeyComparator icmp, VersionStorageInfo s, List<FileMetaData> ranges)
+    {
+        ulong size = 0;
         for (int l = s.NumLevels - 1; l >= 0; l--)
         {
             bool foundEnd = false;
@@ -647,53 +490,88 @@ internal sealed partial class DbImpl
     /// <summary>
     /// Port of DBImpl::GetApproximateSizes: for each [start, limit) user-key range, the approximate bytes in table files
     /// (<paramref name="includeFiles"/>, VersionSet::ApproximateSize with files_size_error_margin) and/or memtables
-    /// (<paramref name="includeMemtables"/>, MemTable::ApproximateStats).
+    /// (<paramref name="includeMemtables"/>, MemTable::ApproximateStats), written to <paramref name="sizes"/> (at least
+    /// one element per range). Allocates nothing itself (seek keys go to stack / pooled scratch).
     /// </summary>
-    public ulong[] GetApproximateSizes(ColumnFamilyData cfd, IReadOnlyList<(byte[] Start, byte[] Limit)> ranges, bool includeMemtables,
+    public void GetApproximateSizes(ColumnFamilyData cfd, ReadOnlySpan<KeyRange> ranges, Span<ulong> sizes, bool includeMemtables,
         bool includeFiles, double filesSizeErrorMargin)
     {
         if (!includeMemtables && !includeFiles) ThrowHelper.InvalidArgument("Invalid options");
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         try
         {
-            var sizes = new ulong[ranges.Count];
-            for (int i = 0; i < ranges.Count; i++)
+            for (int i = 0; i < ranges.Length; i++)
             {
-                byte[] k1 = ToSeekKey(ranges[i].Start), k2 = ToSeekKey(ranges[i].Limit);
-                if (includeFiles) sizes[i] += ApproximateSize(cfd, sv.Current, k1, k2, filesSizeErrorMargin);
-                if (includeMemtables) sizes[i] += ApproximateMemTableStats(sv, k1, k2).Size;
+                sizes[i] = ApproximateRangeSize(cfd, sv, ranges[i].Start.Span, ranges[i].Limit.Span, includeMemtables, includeFiles, filesSizeErrorMargin);
             }
-            return sizes;
         }
         finally
         {
             ReturnSuperVersion(sv);
+        }
+    }
+
+    /// <summary><see cref="GetApproximateSizes(ColumnFamilyData, ReadOnlySpan{KeyRange}, Span{ulong}, bool, bool, double)"/> of one range.</summary>
+    public ulong GetApproximateSize(ColumnFamilyData cfd, ReadOnlySpan<byte> start, ReadOnlySpan<byte> limit, bool includeMemtables,
+        bool includeFiles, double filesSizeErrorMargin)
+    {
+        if (!includeMemtables && !includeFiles) ThrowHelper.InvalidArgument("Invalid options");
+        SuperVersion sv = GetReferencedSuperVersion(cfd);
+        try
+        {
+            return ApproximateRangeSize(cfd, sv, start, limit, includeMemtables, includeFiles, filesSizeErrorMargin);
+        }
+        finally
+        {
+            ReturnSuperVersion(sv);
+        }
+    }
+
+    /// <summary>One range of DBImpl::GetApproximateSizes; the seek keys are built in stack (or pooled) scratch.</summary>
+    private static ulong ApproximateRangeSize(ColumnFamilyData cfd, SuperVersion sv, ReadOnlySpan<byte> start, ReadOnlySpan<byte> limit,
+        bool includeMemtables, bool includeFiles, double filesSizeErrorMargin)
+    {
+        int n1 = start.Length + DbFormat.InternalKeyFooterSize, n2 = limit.Length + DbFormat.InternalKeyFooterSize;
+        byte[]? rented = null;
+        Span<byte> scratch = n1 + n2 <= 512 ? stackalloc byte[512] : (rented = ArrayPool<byte>.Shared.Rent(n1 + n2));
+        try
+        {
+            ReadOnlySpan<byte> k1 = ToSeekKey(start, scratch[..n1]);
+            ReadOnlySpan<byte> k2 = ToSeekKey(limit, scratch.Slice(n1, n2));
+            ulong size = 0;
+            if (includeFiles) size += ApproximateSize(cfd, sv.Current, k1, k2, filesSizeErrorMargin);
+            if (includeMemtables) size += ApproximateMemTableStats(sv, k1, k2).Size;
+            return size;
+        }
+        finally
+        {
+            if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
         }
     }
 
     /// <summary>Port of DBImpl::GetApproximateMemTableStats: (entries, bytes) of the memtables in [start, limit).</summary>
-    public (ulong Count, ulong Size) GetApproximateMemTableStats(ColumnFamilyData cfd, byte[] start, byte[] limit)
+    public (ulong Count, ulong Size) GetApproximateMemTableStats(ColumnFamilyData cfd, ReadOnlySpan<byte> start, ReadOnlySpan<byte> limit)
     {
         SuperVersion sv = GetReferencedSuperVersion(cfd);
+        int n1 = start.Length + DbFormat.InternalKeyFooterSize, n2 = limit.Length + DbFormat.InternalKeyFooterSize;
+        byte[]? rented = null;
+        Span<byte> scratch = n1 + n2 <= 512 ? stackalloc byte[512] : (rented = ArrayPool<byte>.Shared.Rent(n1 + n2));
         try
         {
-            return ApproximateMemTableStats(sv, ToSeekKey(start), ToSeekKey(limit));
+            return ApproximateMemTableStats(sv, ToSeekKey(start, scratch[..n1]), ToSeekKey(limit, scratch.Slice(n1, n2)));
         }
         finally
         {
+            if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
             ReturnSuperVersion(sv);
         }
     }
 
-    /// <summary>InternalKey(user_key, kMaxSequenceNumber, kValueTypeForSeek).</summary>
-    private static byte[] ToSeekKey(byte[] userKey)
-    {
-        var k = new byte[userKey.Length + DbFormat.InternalKeyFooterSize];
-        DbFormat.AppendInternalKey(k, userKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
-        return k;
-    }
+    /// <summary>InternalKey(user_key, kMaxSequenceNumber, kValueTypeForSeek) in <paramref name="destination"/>.</summary>
+    private static ReadOnlySpan<byte> ToSeekKey(ReadOnlySpan<byte> userKey, Span<byte> destination) =>
+        destination[..DbFormat.AppendInternalKey(destination, userKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek)];
 
-    private static (ulong Count, ulong Size) ApproximateMemTableStats(SuperVersion sv, byte[] k1, byte[] k2)
+    private static (ulong Count, ulong Size) ApproximateMemTableStats(SuperVersion sv, ReadOnlySpan<byte> k1, ReadOnlySpan<byte> k2)
     {
         ulong count = 0, size = 0;
         Add(sv.Mem, k1, k2, ref count, ref size);
@@ -701,7 +579,7 @@ internal sealed partial class DbImpl
         return (count, size);
 
         // MemTable::ApproximateStats
-        static void Add(MemTable m, byte[] k1, byte[] k2, ref ulong count, ref ulong size)
+        static void Add(MemTable m, ReadOnlySpan<byte> k1, ReadOnlySpan<byte> k2, ref ulong count, ref ulong size)
         {
             ulong entryCount = m.ApproximateNumEntries(k1, k2);
             if (entryCount == 0) return;
@@ -716,15 +594,19 @@ internal sealed partial class DbImpl
         }
     }
 
-    /// <summary>Port of VersionSet::ApproximateSize(options, v, start, end, 0, -1).</summary>
-    private static ulong ApproximateSize(ColumnFamilyData cfd, DbVersion v, byte[] start, byte[] end, double margin)
+    /// <summary>
+    /// Port of VersionSet::ApproximateSize(options, v, start, end, 0, -1). Upstream collects the partially covered files
+    /// (all of level 0, the first and last overlapping file of every other level) into first_files / last_files; this
+    /// port visits the same files twice instead (sizes, then the per-file estimates if needed), which keeps the call
+    /// free of list allocations.
+    /// </summary>
+    private static ulong ApproximateSize(ColumnFamilyData cfd, DbVersion v, ReadOnlySpan<byte> start, ReadOnlySpan<byte> end, double margin)
     {
         InternalKeyComparator icmp = cfd.Icmp;
         if (icmp.Compare(start, end) > 0) return 0;
         VersionStorageInfo vs = v.Storage;
         ulong totalFullSize = 0;
-        var firstFiles = new List<FileMetaData>();
-        var lastFiles = new List<FileMetaData>();
+        ulong totalIntersectingSize = 0;
         for (int level = 0; level < vs.NumLevels; level++)
         {
             ReadOnlySpan<FileMetaData> files = vs.LevelFiles(level);
@@ -733,34 +615,48 @@ internal sealed partial class DbImpl
             {
                 // level 0 files are not in sorted order, we need to iterate through the list to compute the total bytes
                 // that require scanning, so handle the case explicitly (similarly to first_files case)
-                foreach (FileMetaData f in files) firstFiles.Add(f);
+                foreach (FileMetaData f in files) totalIntersectingSize += f.FileSize;
                 continue;
             }
-            int idxStart = Math.Min(vs.FindFile(level, start), files.Length - 1);
-            int idxEnd = idxStart;
-            if (icmp.Compare(files[idxEnd].Largest, end) < 0) idxEnd = Math.Min(vs.FindFile(level, end), files.Length - 1);
+            (int idxStart, int idxEnd) = OverlapEnds(icmp, vs, level, files, start, end);
             // first scan all the intermediate full files (excluding first and last)
             for (int i = idxStart + 1; i < idxEnd; i++) totalFullSize += files[i].FileSize;
-            firstFiles.Add(files[idxStart]);
-            if (idxStart != idxEnd) lastFiles.Add(files[idxEnd]);
+            totalIntersectingSize += files[idxStart].FileSize;
+            if (idxStart != idxEnd) totalIntersectingSize += files[idxEnd].FileSize;
         }
-        ulong totalIntersectingSize = 0;
-        foreach (FileMetaData f in firstFiles) totalIntersectingSize += f.FileSize;
-        foreach (FileMetaData f in lastFiles) totalIntersectingSize += f.FileSize;
         if (margin > 0 && totalIntersectingSize < (ulong)(totalFullSize * margin))
         {
             totalFullSize += totalIntersectingSize / 2;
+            return totalFullSize;
         }
-        else
+        // first_files: ApproximateSize(v, f, start, end); last_files: ApproximateOffsetOf(v, f, end).
+        for (int level = 0; level < vs.NumLevels; level++)
         {
-            foreach (FileMetaData f in firstFiles) totalFullSize += ApproximateFileSize(cfd, f, start, end);
-            foreach (FileMetaData f in lastFiles) totalFullSize += ApproximateOffsetOf(cfd, f, end);
+            ReadOnlySpan<FileMetaData> files = vs.LevelFiles(level);
+            if (files.Length == 0) continue;
+            if (level == 0)
+            {
+                foreach (FileMetaData f in files) totalFullSize += ApproximateFileSize(cfd, f, start, end);
+                continue;
+            }
+            (int idxStart, int idxEnd) = OverlapEnds(icmp, vs, level, files, start, end);
+            totalFullSize += ApproximateFileSize(cfd, files[idxStart], start, end);
+            if (idxStart != idxEnd) totalFullSize += ApproximateOffsetOf(cfd, files[idxEnd], end);
         }
         return totalFullSize;
+
+        static (int Start, int End) OverlapEnds(InternalKeyComparator icmp, VersionStorageInfo vs, int level, ReadOnlySpan<FileMetaData> files,
+            ReadOnlySpan<byte> start, ReadOnlySpan<byte> end)
+        {
+            int idxStart = Math.Min(vs.FindFile(level, start), files.Length - 1);
+            int idxEnd = idxStart;
+            if (icmp.Compare(files[idxEnd].Largest, end) < 0) idxEnd = Math.Min(vs.FindFile(level, end), files.Length - 1);
+            return (idxStart, idxEnd);
+        }
     }
 
     /// <summary>Port of VersionSet::ApproximateOffsetOf(v, f, key).</summary>
-    private static ulong ApproximateOffsetOf(ColumnFamilyData cfd, FileMetaData f, byte[] key)
+    private static ulong ApproximateOffsetOf(ColumnFamilyData cfd, FileMetaData f, ReadOnlySpan<byte> key)
     {
         InternalKeyComparator icmp = cfd.Icmp;
         if (icmp.Compare(f.Largest, key) <= 0) return f.FileSize; // Entire file is before "key", so just add the file size
@@ -770,7 +666,7 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>Port of VersionSet::ApproximateSize(v, f, start, end).</summary>
-    private static ulong ApproximateFileSize(ColumnFamilyData cfd, FileMetaData f, byte[] start, byte[] end)
+    private static ulong ApproximateFileSize(ColumnFamilyData cfd, FileMetaData f, ReadOnlySpan<byte> start, ReadOnlySpan<byte> end)
     {
         InternalKeyComparator icmp = cfd.Icmp;
         // Entire file is before or after the start/end keys range

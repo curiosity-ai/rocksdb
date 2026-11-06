@@ -360,7 +360,7 @@ internal sealed class HistogramImpl
         Interlocked.Increment(ref _data[b]); // num last: a reader seeing num sees its bucket
     }
 
-    private void Merge(out ulong num, out ulong sum, out double sumSquares, out ulong min, out ulong max, ulong[] buckets)
+    private void Merge(out ulong num, out ulong sum, out double sumSquares, out ulong min, out ulong max, Span<ulong> buckets)
     {
         num = 0;
         sum = 0;
@@ -381,7 +381,7 @@ internal sealed class HistogramImpl
     }
 
     /// <summary>HistogramStat::Percentile.</summary>
-    private static double Percentile(double p, ulong num, ulong min, ulong max, ulong[] buckets)
+    private static double Percentile(double p, ulong num, ulong min, ulong max, ReadOnlySpan<ulong> buckets)
     {
         double threshold = num * (p / 100.0);
         ulong cumulativeSum = 0;
@@ -411,7 +411,8 @@ internal sealed class HistogramImpl
     /// <summary>HistogramStat::Data.</summary>
     public HistogramData Data()
     {
-        var buckets = new ulong[HistogramBuckets.Count];
+        // The merged buckets are only needed for the percentiles: stack scratch (~110 counters), not a heap array.
+        Span<ulong> buckets = stackalloc ulong[HistogramBuckets.Count];
         Merge(out ulong num, out ulong sum, out double sumSquares, out ulong min, out ulong max, buckets);
         double avg = num == 0 ? 0 : (double)sum / num;
         double stdDev = 0;

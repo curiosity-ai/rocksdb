@@ -195,7 +195,8 @@ internal sealed partial class DbImpl
     /// The open-time header: version, DB summary, session id and the options of the DB and of every column family
     /// (DumpRocksDBBuildVersion, DumpDBFileSummary, DumpSupportInfo, DBOptions::Dump, ColumnFamilyOptions::Dump).
     /// </summary>
-    private void LogOpenSummary()
+    /// <param name="dbDirChildren">The DB directory's entries if just listed, else null (listed here).</param>
+    private void LogOpenSummary(List<string>? dbDirChildren)
     {
         InfoLogger? log = _infoLog;
         if (log is null)
@@ -214,7 +215,7 @@ internal sealed partial class DbImpl
             int sst = 0;
             try
             {
-                foreach (string child in FileSystem.GetChildren(DbName))
+                foreach (string child in dbDirChildren ?? FileSystem.GetChildren(DbName))
                 {
                     if (!FileNames.TryParseFileName(child, out ulong _, out FileType type)) continue;
                     switch (type)

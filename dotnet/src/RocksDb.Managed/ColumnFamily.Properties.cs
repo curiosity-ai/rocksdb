@@ -51,20 +51,62 @@ public sealed partial class ColumnFamily
     /// <summary>
     /// Approximate size of the data in each range (DB::GetApproximateSizes): table files (estimated from the index
     /// blocks) and/or memtables, per <paramref name="options"/>. Throws InvalidArgument when neither is included.
+    /// Allocates the result array; see
+    /// <see cref="GetApproximateSizes(SizeApproximationOptions, ReadOnlySpan{KeyRange}, Span{ulong})"/>.
     /// </summary>
     public ulong[] GetApproximateSizes(SizeApproximationOptions options, IReadOnlyList<KeyRange> ranges)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(ranges);
         _db.ThrowIfDisposed();
-        var list = new (byte[], byte[])[ranges.Count];
-        for (int i = 0; i < list.Length; i++) list[i] = (ranges[i].Start.ToArray(), ranges[i].Limit.ToArray());
-        return _db.GetApproximateSizes(_cfd, list, options.IncludeMemtables, options.IncludeFiles, options.FilesSizeErrorMargin);
+        var sizes = new ulong[ranges.Count];
+        ReadOnlySpan<KeyRange> span = ranges switch
+        {
+            KeyRange[] a => a,
+            List<KeyRange> l => System.Runtime.InteropServices.CollectionsMarshal.AsSpan(l),
+            _ => CopyRanges(ranges),
+        };
+        _db.GetApproximateSizes(_cfd, span, sizes, options.IncludeMemtables, options.IncludeFiles, options.FilesSizeErrorMargin);
+        return sizes;
+
+        static KeyRange[] CopyRanges(IReadOnlyList<KeyRange> ranges)
+        {
+            var a = new KeyRange[ranges.Count];
+            for (int i = 0; i < a.Length; i++) a[i] = ranges[i];
+            return a;
+        }
     }
 
-    /// <summary>Approximate size of the table data in [<paramref name="start"/>, <paramref name="limit"/>).</summary>
-    public ulong GetApproximateSize(ReadOnlySpan<byte> start, ReadOnlySpan<byte> limit) =>
-        _db.GetApproximateSizes(_cfd, [(start.ToArray(), limit.ToArray())], includeMemtables: false, includeFiles: true, filesSizeErrorMargin: -1)[0];
+    /// <summary>
+    /// <see cref="GetApproximateSizes(IReadOnlyList{KeyRange})"/> into caller memory (DB::GetApproximateSizes with a
+    /// <c>uint64_t* sizes</c> output): table files only. Does not allocate.
+    /// </summary>
+    /// <param name="ranges">The user-key ranges [start, limit).</param>
+    /// <param name="sizes">Receives one size per range; at least <c>ranges.Length</c> long.</param>
+    public void GetApproximateSizes(ReadOnlySpan<KeyRange> ranges, Span<ulong> sizes) => GetApproximateSizes(s_defaultSizeOptions, ranges, sizes);
+
+    /// <summary>
+    /// <see cref="GetApproximateSizes(SizeApproximationOptions, IReadOnlyList{KeyRange})"/> into caller memory
+    /// (DB::GetApproximateSizes(options, column_family, ranges, n, sizes)). Does not allocate.
+    /// </summary>
+    /// <param name="options">What to include (files and / or memtables).</param>
+    /// <param name="ranges">The user-key ranges [start, limit).</param>
+    /// <param name="sizes">Receives one size per range; at least <c>ranges.Length</c> long.</param>
+    /// <exception cref="ArgumentException"><paramref name="sizes"/> is shorter than <paramref name="ranges"/>.</exception>
+    public void GetApproximateSizes(SizeApproximationOptions options, ReadOnlySpan<KeyRange> ranges, Span<ulong> sizes)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (sizes.Length < ranges.Length) throw new ArgumentException("The output span must have at least one element per range.", nameof(sizes));
+        _db.ThrowIfDisposed();
+        _db.GetApproximateSizes(_cfd, ranges, sizes, options.IncludeMemtables, options.IncludeFiles, options.FilesSizeErrorMargin);
+    }
+
+    /// <summary>Approximate size of the table data in [<paramref name="start"/>, <paramref name="limit"/>). Does not allocate.</summary>
+    public ulong GetApproximateSize(ReadOnlySpan<byte> start, ReadOnlySpan<byte> limit)
+    {
+        _db.ThrowIfDisposed();
+        return _db.GetApproximateSize(_cfd, start, limit, includeMemtables: false, includeFiles: true, filesSizeErrorMargin: -1);
+    }
 
     /// <summary>
     /// Approximate number of entries and bytes in the memtables (mutable + immutable) for [<paramref name="start"/>,
@@ -73,7 +115,7 @@ public sealed partial class ColumnFamily
     public (ulong Count, ulong Size) GetApproximateMemTableStats(ReadOnlySpan<byte> start, ReadOnlySpan<byte> limit)
     {
         _db.ThrowIfDisposed();
-        return _db.GetApproximateMemTableStats(_cfd, start.ToArray(), limit.ToArray());
+        return _db.GetApproximateMemTableStats(_cfd, start, limit);
     }
 
     // ---- properties --------------------------------------------------------------------------------------
@@ -119,6 +161,13 @@ public sealed partial class RocksDatabase
 
     public ulong[] GetApproximateSizes(SizeApproximationOptions options, IReadOnlyList<KeyRange> ranges) => _default.GetApproximateSizes(options, ranges);
 
+    /// <summary><see cref="ColumnFamily.GetApproximateSizes(ReadOnlySpan{KeyRange}, Span{ulong})"/> on the default column family.</summary>
+    public void GetApproximateSizes(ReadOnlySpan<KeyRange> ranges, Span<ulong> sizes) => _default.GetApproximateSizes(ranges, sizes);
+
+    /// <summary><see cref="ColumnFamily.GetApproximateSizes(SizeApproximationOptions, ReadOnlySpan{KeyRange}, Span{ulong})"/> on the default column family.</summary>
+    public void GetApproximateSizes(SizeApproximationOptions options, ReadOnlySpan<KeyRange> ranges, Span<ulong> sizes) =>
+        _default.GetApproximateSizes(options, ranges, sizes);
+
     public (ulong Count, ulong Size) GetApproximateMemTableStats(ReadOnlySpan<byte> start, ReadOnlySpan<byte> limit) =>
         _default.GetApproximateMemTableStats(start, limit);
 
@@ -135,9 +184,10 @@ public sealed partial class RocksDatabase
     public bool TryGetAggregatedIntProperty(string property, out ulong value)
     {
         value = 0;
-        foreach (ColumnFamily cf in ColumnFamilies)
+        IReadOnlyList<ColumnFamily> cfs = ColumnFamilies;
+        for (int i = 0; i < cfs.Count; i++)
         {
-            if (!cf.TryGetIntProperty(property, out ulong v)) return false;
+            if (!cfs[i].TryGetIntProperty(property, out ulong v)) return false;
             value += v;
         }
         return true;

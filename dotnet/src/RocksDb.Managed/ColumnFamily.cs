@@ -262,8 +262,11 @@ public sealed partial class ColumnFamily
     }
 
     /// <summary>
-    /// Looks up several keys from one consistent view (batched like DB::MultiGet). Missing keys yield null. Allocates the
-    /// result arrays; prefer <see cref="MultiGet(MultiGetBatch)"/> on hot paths.
+    /// Looks up several keys from one consistent view (batched like DB::MultiGet). Missing keys yield null; the first
+    /// per-key failure is thrown. Allocates the result array and one array per found value (the lookup itself uses a
+    /// pooled batch); prefer <see cref="MultiGet(MultiGetBatch)"/> or
+    /// <see cref="MultiGet(ReadOptions?, ReadOnlySpan{ReadOnlyMemory{byte}}, IBufferWriter{byte}, Span{Range}, Span{MultiGetStatus})"/>
+    /// on hot paths.
     /// </summary>
     public byte[]?[] MultiGet(IReadOnlyList<byte[]> keys) => MultiGet(null, keys);
 
@@ -273,16 +276,23 @@ public sealed partial class ColumnFamily
         ArgumentNullException.ThrowIfNull(keys);
         var result = new byte[]?[keys.Count];
         if (keys.Count == 0) return result;
-        using var batch = new MultiGetBatch(keys.Count);
-        for (int i = 0; i < keys.Count; i++) batch.Add(keys[i]);
-        MultiGet(options, batch);
-        for (int i = 0; i < result.Length; i++)
+        MultiGetBatch batch = MultiGetBatch.RentPooled(keys.Count);
+        try
         {
-            switch (batch.GetStatus(i))
+            for (int i = 0; i < keys.Count; i++) batch.Add(keys[i]);
+            MultiGet(options, batch);
+            for (int i = 0; i < result.Length; i++)
             {
-                case MultiGetStatus.Found: result[i] = batch.GetValue(i).ToArray(); break;
-                case MultiGetStatus.Error: throw batch.GetError(i)!;
+                switch (batch.GetStatus(i))
+                {
+                    case MultiGetStatus.Found: result[i] = batch.GetValue(i).ToArray(); break;
+                    case MultiGetStatus.Error: throw batch.GetError(i)!;
+                }
             }
+        }
+        finally
+        {
+            MultiGetBatch.ReturnPooled(batch);
         }
         return result;
     }
@@ -606,9 +616,9 @@ public sealed partial class ColumnFamily
     /// <summary>A numeric DB property of this column family (DB::GetIntProperty); false if unknown or not numeric.</summary>
     public bool TryGetIntProperty(string property, out ulong value)
     {
-        value = 0;
-        return GetProperty(property) is { } s
-            && ulong.TryParse(s, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out value);
+        ArgumentNullException.ThrowIfNull(property);
+        _db.ThrowIfDisposed();
+        return _db.TryGetIntProperty(_cfd, property, out value);
     }
 
     // =====================================================================================================

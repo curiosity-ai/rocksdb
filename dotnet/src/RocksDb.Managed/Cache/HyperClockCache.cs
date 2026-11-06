@@ -330,17 +330,26 @@ internal sealed class ClockShard
     private const double StrictLoadFactor = 0.84;
 
     /// <summary>The slot array with its derived sizes; replaced as a whole when an automatic table grows.</summary>
+    /// <para>
+    /// A table's slot objects are created by the first insert into it (<see cref="ClockShard.MaterializeAll"/>), all at
+    /// once so that they lie together in memory like the slots of upstream's array. Until then (and for positions an
+    /// insert reaches while another thread is still filling the table) an element is null: an empty slot that no probe
+    /// sequence passes over (an insert materializes every slot it probes before changing it), so lookups treat it as the
+    /// end of a probe and scans skip it.
+    /// </para>
     internal sealed class Table
     {
-        public readonly ClockSlot[] Array;
+        public readonly ClockSlot?[] Array;
         public readonly int LengthBits;
         public readonly int Mask;
         /// <summary>Occupancy above which an insert must evict (kStrictLoadFactor).</summary>
         public readonly long OccupancyLimit;
         /// <summary>Occupancy above which an automatic table grows (kLoadFactor); long.MaxValue when it cannot grow.</summary>
         public readonly long GrowLimit;
+        /// <summary>1 once every element holds a slot object (see <see cref="ClockShard.MaterializeAll"/>).</summary>
+        public int Materialized;
 
-        public Table(ClockSlot[] array, int lengthBits, bool canGrow)
+        public Table(ClockSlot?[] array, int lengthBits, bool canGrow)
         {
             Array = array;
             LengthBits = lengthBits;
@@ -395,8 +404,9 @@ internal sealed class ClockShard
             lengthBits = CalcHashBits(capacity, estimatedEntryCharge, policy);
             _maxLengthBits = lengthBits;
         }
-        var array = new ClockSlot[1 << lengthBits];
-        for (int i = 0; i < array.Length; i++) array[i] = new ClockSlot(this, standalone: false);
+        // Slot objects are created by the first insert (MaterializeAll): a cache that is never used (e.g. the default
+        // cache of a DB that is opened and closed without reads) does not pay for one slot object per table position.
+        var array = new ClockSlot?[1 << lengthBits];
         _t = new Table(array, lengthBits, _auto && lengthBits < _maxLengthBits);
         // FixedHyperClockTable::FixedHyperClockTable: the table's metadata is charged up front (an automatic table charges
         // the slots it has grown to).
@@ -449,30 +459,24 @@ internal sealed class ClockShard
             Table old = _t;
             if (old != expected || old.LengthBits >= _maxLengthBits) return;
             int newBits = old.LengthBits + 1;
-            var array = new ClockSlot[1 << newBits];
+            var array = new ClockSlot?[1 << newBits];
             int mask = array.Length - 1;
-            var empty = new List<ClockSlot>(old.Array.Length);
-            foreach (ClockSlot h in old.Array) Volatile.Write(ref h.Displacements, 0);
-            foreach (ClockSlot h in old.Array)
+            // Occupied slots move to their probe position; the positions they pass over hold occupied slots (whose
+            // displacements are recomputed); every other position stays unmaterialized (empty slot objects are dropped).
+            foreach (ClockSlot? h in old.Array)
             {
-                if (ClockSlot.State(h.LoadMeta()) == ClockSlot.StateEmpty)
-                {
-                    empty.Add(h);
-                    continue;
-                }
+                if (h is not null) Volatile.Write(ref h.Displacements, 0);
+            }
+            foreach (ClockSlot? h in old.Array)
+            {
+                if (h is null || ClockSlot.State(h.LoadMeta()) == ClockSlot.StateEmpty) continue;
                 int current = (int)(h.H1 >> 32) & mask, inc = ((int)h.H2 & mask) | 1;
-                while (array[current] is not null)
+                while (array[current] is ClockSlot passed)
                 {
-                    array[current].Displacements++;
+                    passed.Displacements++;
                     current = (current + inc) & mask;
                 }
                 array[current] = h;
-            }
-            int next = 0;
-            for (int i = 0; i < array.Length; i++)
-            {
-                if (array[i] is not null) continue;
-                array[i] = next < empty.Count ? empty[next++] : new ClockSlot(this, standalone: false);
             }
             if (_policy == CacheMetadataChargePolicy.FullCharge)
             {
@@ -527,9 +531,10 @@ internal sealed class ClockShard
     private static void Rollback(Table t, ulong h1, ulong h2, ClockSlot stop)
     {
         int current = Base(t, h1), inc = Increment(t, h2);
+        // Every slot on an inserted entry's probe path was materialized by that insert.
         while (t.Array[current] != stop)
         {
-            Interlocked.Decrement(ref t.Array[current].Displacements);
+            Interlocked.Decrement(ref t.Array[current]!.Displacements);
             current = (current + inc) & t.Mask;
         }
     }
@@ -539,9 +544,41 @@ internal sealed class ClockShard
         int current = Base(t, h1), inc = Increment(t, h2);
         for (int i = 0; i < count; i++)
         {
-            Interlocked.Decrement(ref t.Array[current].Displacements);
+            Interlocked.Decrement(ref t.Array[current]!.Displacements);
             current = (current + inc) & t.Mask;
         }
+    }
+
+    /// <summary>
+    /// Creates the slot objects of every still empty position of <paramref name="t"/> in one pass (first insert into the
+    /// table), so they are allocated together and stay close in memory, as eagerly created slots were. Elements another
+    /// thread materialized meanwhile (<see cref="Materialize"/>) are kept.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal void MaterializeAll(Table t)
+    {
+        lock (t)
+        {
+            if (t.Materialized != 0) return;
+            ClockSlot?[] array = t.Array;
+            for (int i = 0; i < array.Length; i++)
+            {
+                if (array[i] is null) Interlocked.CompareExchange(ref array[i], new ClockSlot(this, standalone: false), null);
+            }
+            Volatile.Write(ref t.Materialized, 1);
+        }
+    }
+
+    /// <summary>
+    /// Creates the slot object of table position <paramref name="index"/> if an insert probes it before the table is
+    /// fully materialized (a fallback: inserts materialize the whole table first). Racing inserts agree on one object
+    /// (CAS); the loser's object is dropped.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private ClockSlot Materialize(ClockSlot?[] array, int index)
+    {
+        var s = new ClockSlot(this, standalone: false);
+        return Interlocked.CompareExchange(ref array[index], s, null) ?? s;
     }
 
     // CorrectNearOverflow: clear the top counter bits once the release counter gets large.
@@ -564,7 +601,8 @@ internal sealed class ClockShard
         int current = Base(t, h1), inc = Increment(t, h2);
         for (int probe = 0; probe <= t.Mask; probe++)
         {
-            ClockSlot h = t.Array[current];
+            ClockSlot? h = t.Array[current];
+            if (h is null) return null; // never materialized: empty, no probe passes over it
             // (Optimistically) increment acquire counter
             ulong oldMeta = h.FetchAdd(ClockSlot.AcquireIncrement);
             ulong state = ClockSlot.State(oldMeta);
@@ -679,12 +717,13 @@ internal sealed class ClockShard
     private ClockSlot? DoInsert(in CacheKey key, ulong h1, ulong h2, in CacheValue value, long totalCharge, ulong initialCountdown, bool takeRef)
     {
         Table t = Volatile.Read(ref _t);
+        if (Volatile.Read(ref t.Materialized) == 0) MaterializeAll(t);
         int current = Base(t, h1), inc = Increment(t, h2);
         int probe = 0;
         bool alreadyMatches = false;
         for (; probe <= t.Mask; probe++)
         {
-            ClockSlot h = t.Array[current];
+            ClockSlot h = t.Array[current] ?? Materialize(t.Array, current);
             if (TryInsert(h, key, h1, h2, value, totalCharge, initialCountdown, takeRef, ref alreadyMatches)) return h;
             if (alreadyMatches) break;
             Interlocked.Increment(ref h.Displacements);
@@ -820,8 +859,8 @@ internal sealed class ClockShard
         {
             for (int i = 0; i < stepSize; i++)
             {
-                ClockSlot h = t.Array[(int)((oldClockPointer + (ulong)i) & (ulong)t.Mask)];
-                if (ClockUpdate(h, ref seenPinnedCount))
+                ClockSlot? h = t.Array[(int)((oldClockPointer + (ulong)i) & (ulong)t.Mask)];
+                if (h is not null && ClockUpdate(h, ref seenPinnedCount))
                 {
                     freedCharge += h.TotalCharge;
                     freedCount++;
@@ -952,7 +991,8 @@ internal sealed class ClockShard
         int current = Base(t, h1), inc = Increment(t, h2);
         for (int probe = 0; probe <= t.Mask; probe++)
         {
-            ClockSlot h = t.Array[current];
+            ClockSlot? h = t.Array[current];
+            if (h is null) break; // never materialized: empty, no probe passes over it
             ulong oldMeta = h.FetchAdd(ClockSlot.AcquireIncrement);
             ulong state = ClockSlot.State(oldMeta);
             if (state == ClockSlot.StateVisible)
@@ -1024,7 +1064,8 @@ internal sealed class ClockShard
         }
         for (long i = indexBegin; i < indexEnd; i++)
         {
-            ClockSlot h = t.Array[i];
+            ClockSlot? h = t.Array[i];
+            if (h is null) continue;
             ulong oldMeta = h.LoadMeta();
             // Check if it's an entry visible to lookups.
             if (ClockSlot.State(oldMeta) != ClockSlot.StateVisible) continue;
@@ -1065,8 +1106,9 @@ internal sealed class ClockShard
     private void EraseUnRefEntriesCore()
     {
         Table t = Volatile.Read(ref _t);
-        foreach (ClockSlot h in t.Array)
+        foreach (ClockSlot? h in t.Array)
         {
+            if (h is null) continue;
             ulong meta = h.LoadMeta();
             if ((ClockSlot.State(meta) & ClockSlot.StateShareableBit) != 0 && ClockSlot.Refcount(meta) == 0
                 && h.Cas(meta, ClockSlot.StateConstruction << ClockSlot.StateShift))
@@ -1083,8 +1125,9 @@ internal sealed class ClockShard
     public long ComputePinnedUsage()
     {
         long pinned = 0;
-        foreach (ClockSlot h in Volatile.Read(ref _t).Array)
+        foreach (ClockSlot? h in Volatile.Read(ref _t).Array)
         {
+            if (h is null) continue;
             ulong meta = h.LoadMeta();
             if ((ClockSlot.State(meta) & ClockSlot.StateShareableBit) != 0 && ClockSlot.Refcount(meta) > 0)
                 pinned += h.TotalCharge;

@@ -153,7 +153,7 @@ public sealed partial class ColumnFamily
         result.Reset();
         _db.ThrowIfDisposed();
         SuperVersion sv = _db.BeginLazyRead(_cfd, options, out ulong snapshot);
-        var pin = new LazyReadPin(_db, sv);
+        LazyReadPin pin = result.RentPin(_db, sv);
         GetContext ctx = GetContext.Rent(_cfd.MergeOperator);
         try
         {
@@ -194,9 +194,9 @@ public sealed partial class ColumnFamily
         result.Reset();
         _db.ThrowIfDisposed();
         if (keys.Count == 0) return;
+        result.Begin(keys.Count);
         SuperVersion sv = _db.BeginLazyRead(_cfd, options, out ulong snapshot);
-        var pin = new LazyReadPin(_db, sv);
-        result.Begin(keys.Count, pin);
+        LazyReadPin pin = result.SetPin(_db, sv);
         GetContext ctx = GetContext.Rent(_cfd.MergeOperator);
         try
         {

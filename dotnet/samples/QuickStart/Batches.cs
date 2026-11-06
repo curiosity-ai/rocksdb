@@ -76,5 +76,20 @@ internal static class Batches
         await db.MultiGetAsync(batch);
         Line($"async found={batch.FoundCount}");
         Check(batch.FoundCount == 1, "multiget async");
+
+        // <snippet:multiget-spans>
+        ReadOnlyMemory<byte>[] keys = ["a"u8.ToArray(), "b"u8.ToArray(), "c"u8.ToArray()];
+        var values = new System.Buffers.ArrayBufferWriter<byte>();     // found values, back to back
+        var ranges = new Range[keys.Length];                           // where each value is in `values`
+        var statuses = new MultiGetStatus[keys.Length];
+        db.MultiGet(null, keys, values, ranges, statuses);             // or: await db.MultiGetAsync(null, keys, values, ranges, statuses)
+        for (int i = 0; i < keys.Length; i++)
+        {
+            if (statuses[i] == MultiGetStatus.Found) Console.WriteLine(System.Text.Encoding.UTF8.GetString(values.WrittenSpan[ranges[i]]));
+        }
+        // </snippet:multiget-spans>
+        Line($"spans: {statuses[0]} {statuses[1]} {statuses[2]} {Utf8(values.WrittenSpan[ranges[2]].ToArray())}");
+        Check(statuses[0] == MultiGetStatus.Found && statuses[1] == MultiGetStatus.NotFound && Utf8(values.WrittenSpan[ranges[2]].ToArray()) == "3",
+            "multiget spans");
     }
 }

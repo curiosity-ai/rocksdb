@@ -10,17 +10,56 @@ namespace RocksDb.Managed;
 /// <summary>
 /// The super version reference of a lazy result (the Cleanable "pin" of LazyWideColumns::Rep / the per-column-family
 /// pin of LazyWideColumnsBatch): keeps the version's blob files alive while deferred reads are possible.
+/// <para>
+/// A pin is owned by one result (<see cref="LazyWideColumns"/> or <see cref="LazyWideColumnsBatch"/>) and re-armed by
+/// <see cref="Rent"/> for its next read once released, so repeated reads into a reused result do not allocate. Only the
+/// owner and the owner's entries reference it, and they drop the reference when the pin is released.
+/// </para>
 /// </summary>
-internal sealed class LazyReadPin(DbImpl db, SuperVersion sv)
+internal sealed class LazyReadPin
 {
+    // Cleared on release so a reset result that is kept for reuse does not keep the old super version (memtables,
+    // version) or the database reachable.
+    private DbImpl? _db;
+    private SuperVersion? _sv;
     private int _released;
 
-    public SuperVersion SuperVersion => sv;
+    private LazyReadPin(DbImpl db, SuperVersion sv)
+    {
+        _db = db;
+        _sv = sv;
+    }
+
+    /// <summary>The referenced super version; only valid while the pin is not <see cref="Released"/>.</summary>
+    public SuperVersion SuperVersion => _sv!;
     public bool Released => Volatile.Read(ref _released) != 0;
+
+    /// <summary>
+    /// A pin holding <paramref name="sv"/> (already referenced by the caller): <paramref name="cached"/> re-armed if it
+    /// is released, else a new pin stored in <paramref name="cached"/>.
+    /// </summary>
+    public static LazyReadPin Rent(ref LazyReadPin? cached, DbImpl db, SuperVersion sv)
+    {
+        LazyReadPin? p = cached;
+        if (p is null || !p.Released)
+        {
+            // First read, or the previous pin is still live (cannot happen for a reset owner): never re-arm a live pin.
+            return cached = new LazyReadPin(db, sv);
+        }
+        p._db = db;
+        p._sv = sv;
+        Volatile.Write(ref p._released, 0);
+        return p;
+    }
 
     public void Release()
     {
-        if (Interlocked.Exchange(ref _released, 1) == 0) db.ReturnSuperVersion(sv);
+        if (Interlocked.Exchange(ref _released, 1) != 0) return;
+        DbImpl db = _db!;
+        SuperVersion sv = _sv!;
+        _db = null;
+        _sv = null;
+        db.ReturnSuperVersion(sv);
     }
 }
 
@@ -69,6 +108,8 @@ public sealed partial class LazyWideColumns : IDisposable
     private readonly List<WideColumnSlot> _slots = new(8);
     private ColumnInfo[] _info = new ColumnInfo[8];
     private LazyReadPin? _pin;
+    // The pin this result owns between reads (re-armed by TryGetEntityLazy, see LazyReadPin.Rent).
+    private LazyReadPin? _cachedPin;
     private bool _ownsPin;
     private BlobSource? _source;
     private VersionStorageInfo? _version;
@@ -262,6 +303,9 @@ public sealed partial class LazyWideColumns : IDisposable
 
     // ---- filling (LazyWideColumnsHelper::Finalize / FinalizeInBatch) --------------------------------------
 
+    /// <summary>A pin for the next standalone read into this (reset) result; reuses the previous one.</summary>
+    internal LazyReadPin RentPin(DbImpl db, SuperVersion sv) => LazyReadPin.Rent(ref _cachedPin, db, sv);
+
     /// <summary>
     /// Fills the result from a finished lazy lookup. Returns false (result left empty) when the key does not exist.
     /// <paramref name="ownsPin"/>: a standalone result releases the pin; a batch entry leaves it to the batch.
@@ -404,6 +448,8 @@ public sealed partial class LazyWideColumnsBatch : IDisposable
     private RocksDbException?[] _errors = [];
     private int _count;
     private LazyReadPin? _pin;
+    // The pin this batch owns between reads (re-armed by MultiGetEntityLazy, see LazyReadPin.Rent).
+    private LazyReadPin? _cachedPin;
     private bool _disposed;
 
     /// <summary>Number of results (the number of keys of the last read).</summary>
@@ -451,7 +497,7 @@ public sealed partial class LazyWideColumnsBatch : IDisposable
         _disposed = true;
     }
 
-    internal void Begin(int count, LazyReadPin pin)
+    internal void Begin(int count)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         Reset();
@@ -464,8 +510,10 @@ public sealed partial class LazyWideColumnsBatch : IDisposable
         Array.Clear(_status, 0, count);
         Array.Clear(_errors, 0, count);
         _count = count;
-        _pin = pin;
     }
+
+    /// <summary>Stores the pin of the read started by <see cref="Begin"/> (reuses the previous, released one).</summary>
+    internal LazyReadPin SetPin(DbImpl db, SuperVersion sv) => _pin = LazyReadPin.Rent(ref _cachedPin, db, sv);
 
     internal LazyWideColumns Entry(int index) => _entries[index];
 

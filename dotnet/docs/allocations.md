@@ -9,23 +9,22 @@ The numbers come from the allocation profiler in `tools/RocksDb.Managed.Allocati
 [Measuring allocations](#measuring-allocations)). "B/op" counts the bytes allocated by every thread per operation in
 steady state, including background flush and compaction work, with 16-byte keys and 100-byte values.
 
-> **Planned additions.** More allocation-free variants are being added: iterator refresh / reuse, a pooled
-> `MultiGet(IReadOnlyList<byte[]>)`, `TryGetIntProperty` without an intermediate string, span-based metadata and
-> size APIs, pooled `WriteBatchWithIndex`, and fewer background allocations per flushed file. This guide will be updated
-> when they ship. Until then, the patterns below are what to use.
+> **Planned additions.** More allocation-free variants are being added: iterator refresh / reuse, pooled
+> `WriteBatchWithIndex`, and fewer background allocations per flushed file. This guide will be updated when they ship.
+> Until then, the patterns below are what to use.
 
 ## Summary
 
 | Area | Allocation-free (0 B/op) | Allocates | Instead |
 |---|---|---|---|
 | Point reads | `TryGet(key, Span<byte>, out len)`, `TryGet(key, IBufferWriter<byte>)`, `Get<TState,TResult>(key, state, callback)`, `GetPooled` + `Dispose`, `ContainsKey`, `KeyMayExist`, the async versions of each | `byte[]? Get` / `GetAsync` (the value array: 128 B for 100 B) | the span / writer / callback / pooled variants |
-| Batched reads | `MultiGetBatch` reused with `Clear()`, `MultiGet` / `MultiGetAsync` / `MultiGetEntity` | `byte[]?[] MultiGet(IReadOnlyList<byte[]>)` (20 KB per 16 keys) | a reused `MultiGetBatch` |
+| Batched reads | `MultiGetBatch` reused with `Clear()`, `MultiGet` / `MultiGetAsync` / `MultiGetEntity`; `MultiGet(options, keys, values, valueRanges, statuses)` into caller memory and its async version | `byte[]?[] MultiGet(IReadOnlyList<byte[]>)` (the result arrays: 2.2 KB per 16 values of 100 B) | a reused `MultiGetBatch` or the caller-memory `MultiGet` |
 | Writes | `Put` / `Delete` / `SingleDelete` / `Merge` / `PutEntity` with spans, and their async versions (0.0-0.3 B/op on the calling thread) | none on the caller; background work adds 1-4 B/op, see [Writes](#writes) | |
 | Write batches | `db.CreateWriteBatch()` + `using`; one batch reused with `Clear()`; `WriteAsync` | `new WriteBatch()` that is never disposed (2.2 KB per batch); `new WriteBatchWithIndex()` per batch (1.1 KB) | `CreateWriteBatch`; reuse a `WriteBatchWithIndex` with `Clear()` |
 | Iterators | a reused `Iterator`: `Seek` / `SeekForPrev` / `Next` / `Prev` / `Key` / `Value` / `Columns`, async moves, `foreach` over `Range(...)` | `NewIterator` (2-4 KB per iterator), `ScanAsync` (128 B per scan) | keep one iterator per thread and `Seek` it |
-| Wide columns | `TryGetEntity(key, WideColumns)` with a reused result, `MultiGetEntity`, `Iterator.Columns` | `GetEntity` (312 B), `GetEntityLazy` (1 KB), `TryGetEntityLazy` (40 B) | `TryGetEntity`; reuse a `LazyWideColumns` |
+| Wide columns | `TryGetEntity(key, WideColumns)` and `TryGetEntityLazy(options, key, LazyWideColumns)` with a reused result, `MultiGetEntity`, `Iterator.Columns` | `GetEntity` (312 B), `GetEntityLazy` (1 KB) | `TryGetEntity` / `TryGetEntityLazy` with a reused result |
 | Transactions | `BeginTransaction(writeOptions, options, oldTransaction)` + `Put` / `TryGetForUpdate` / `TryGet` / `Commit` (sync and async) | `BeginTransaction(writeOptions)` per transaction (~3 KB); a new 2PC name per transaction (~32 B); optimistic `Commit` (40 B) | reuse the transaction object |
-| Monitoring | `Statistics` and `PerfContext` enabled (no allocation on reads), `GetColumnFamily(name)`, `GetLatestSequenceNumber` | `GetProperty` / `TryGetIntProperty` (40 B), `ColumnFamilies` (160 B), `GetLiveFilesMetadata`, `GetApproximateSizes`, `GetHistogramData` (896 B) | call them from monitoring code, not per request |
+| Monitoring | `Statistics` and `PerfContext` enabled (no allocation on reads), `GetTickerCount`, `GetHistogramData`, `TryGetIntProperty` / `TryGetAggregatedIntProperty`, `ColumnFamilies`, `GetColumnFamily(name)`, `GetLatestSequenceNumber`, `VisitLiveFiles`, `GetApproximateSizes(ranges, Span<ulong>)` | `GetProperty` (the result string), `GetLiveFilesMetadata` (about 400 B per file), `GetApproximateSizes` returning an array | the non-allocating variants; see [Monitoring and metadata APIs](#monitoring-and-metadata-apis) |
 
 ## Point reads
 
@@ -75,8 +74,28 @@ for (int i = 0; i < batch.Count; i++)
     if (batch.TryGetValue(i, out ReadOnlySpan<byte> v)) Use(v);
 ```
 
-`byte[]?[] MultiGet(IReadOnlyList<byte[]>)` currently builds a new batch per call (about 20 KB for 16 keys), on top of
-the result arrays. Use it only when the convenience matters more.
+When the keys come from your own memory and the values should land in your own buffer, use the caller-memory
+`MultiGet`. It runs a pooled batch internally, appends the found values back to back to an `IBufferWriter<byte>`, and
+gives each key's position in `valueRanges` (relative to the first byte the call writes) and its outcome in `statuses`.
+It does not allocate after warm-up (apart from the writer growing):
+
+```csharp
+ReadOnlyMemory<byte>[] keys = ...;                  // reused
+var values = new ArrayBufferWriter<byte>(4096);     // reused
+var ranges = new Range[keys.Length];
+var statuses = new MultiGetStatus[keys.Length];
+
+values.ResetWrittenCount();
+db.MultiGet(null, keys, values, ranges, statuses);  // or await db.MultiGetAsync(null, keys, values, ranges, statuses)
+for (int i = 0; i < keys.Length; i++)
+    if (statuses[i] == MultiGetStatus.Found) Use(values.WrittenSpan[ranges[i]]);
+```
+
+A key that fails (I/O error, or `ReadTier.BlockCacheTier` with an uncached block) gets `MultiGetStatus.Error` without
+stopping the others. Use a `MultiGetBatch` when you need the exception of each failed key.
+
+`byte[]?[] MultiGet(IReadOnlyList<byte[]>)` also uses a pooled batch. It allocates only its results: the result array
+and one array per found value (2.2 KB for 16 values of 100 B). It throws the first per-key failure.
 
 ## Writes
 
@@ -165,8 +184,10 @@ if (db.DefaultColumnFamily.TryGetEntityLazy(null, key, lazy)) Use(lazy);
 ```
 
 `GetEntity(key)` returns a new `WideColumns` (312 B for 3 small columns) and `GetEntityLazy` a new `LazyWideColumns`
-(about 1 KB). `TryGetEntityLazy` with a reused result currently allocates 40 B per call. `MultiGetEntity` with a
-reused `MultiGetBatch` and `batch.TryGetEntity(i, columns)` allocate nothing.
+(about 1 KB). `TryGetEntityLazy` with a reused result, `MultiGetEntityLazy` with a reused `LazyWideColumnsBatch`,
+`MultiGetEntity` with a reused `MultiGetBatch` and `batch.TryGetEntity(i, columns)` allocate nothing. A lazy result
+keeps the version it was read from alive until the next read into it, `Reset()` or `Dispose()`. Reset a result you keep
+for later reuse, so it does not hold on to old files.
 
 ## Transactions
 
@@ -206,11 +227,12 @@ txn.Commit();                                   // or await txn.CommitAsync()
 
 - **Block cache.** Set `BlockBasedTableOptions.BlockCache` explicitly (`BlockCache.CreateLru` / `CreateHyperClock`) and
   share one cache across databases and column families when they belong together. Without one, every `Open` creates a
-  default 32 MiB cache, which is several MB of allocations per open. A cache miss allocates a block buffer only while the
-  cache is still filling up. Once it is full, an evicted block's buffer is reused.
+  default 32 MiB cache for that database. Its table entries are created as the cache fills, so opening a database
+  costs little for the cache itself. A cache miss allocates a block buffer only while the cache is still filling up.
+  Once it is full, an evicted block's buffer is reused.
 - **Statistics and PerfContext** cost no allocations on the read and write paths when enabled (`DbOptions.Statistics`,
-  `PerfContext.Level`). Reading them does: `Statistics.GetHistogramData` (896 B), `ToString()` dumps, and
-  `PerfContext.ToString()`. `GetTickerCount` and `PerfContext.Current[metric]` don't allocate.
+  `PerfContext.Level`). Reading them doesn't either: `GetTickerCount`, `GetHistogramData` and
+  `PerfContext.Current[metric]` allocate nothing. Only the text dumps (`ToString()`, `PerfContext.ToString()`) do.
 - **Info LOG.** Flushes and compactions write event lines to the `LOG` file. Today the event text is built for every new
   file whatever the log level. This is part of the background allocations above.
 - **Write buffer size.** A larger memtable means fewer flushes and so fewer per-file allocations (see [Writes](#writes)).
@@ -219,24 +241,42 @@ txn.Commit();                                   // or await txn.CommitAsync()
 
 ## Monitoring and metadata APIs
 
-These return new objects and are meant for monitoring code, not per-request paths:
-
 | API | Allocates |
 |---|---|
+| `TryGetIntProperty(name, out value)`, `GetIntProperty`, `TryGetAggregatedIntProperty` | nothing for the numeric properties (the value is computed as a number) |
 | `GetProperty(name)` | the result string (40 B for a number) |
-| `TryGetIntProperty(name, out value)` | 40 B today (an intermediate string) |
 | `GetMapProperty`, `GetProperty(rocksdb.stats)` | 14-48 KB of strings |
-| `ColumnFamilies` | a new list (160 B for 3 column families); `GetColumnFamily(name)` / `TryGetColumnFamily` allocate nothing |
-| `GetLiveFilesMetadata()` | about 400 B per file |
-| `GetApproximateSizes(ranges)` | about 450 B per call |
-| `Statistics.GetHistogramData` | 896 B |
+| `ColumnFamilies` | nothing: a read-only snapshot, the same object until a column family is created or dropped |
+| `GetColumnFamily(name)` / `TryGetColumnFamily` | nothing |
+| `VisitLiveFiles(state, visitor)` | nothing with a static lambda |
+| `GetLiveFilesMetadata(list)` | one record per file (about 400 B); the list is reused |
+| `GetLiveFilesMetadata()` | a new list plus one record per file |
+| `GetApproximateSizes(ranges, sizes)` (`Span<ulong>` output) | nothing |
+| `GetApproximateSizes(ranges)` | the result array |
+| `Statistics.GetHistogramData`, `GetTickerCount` | nothing |
+
+Prefer `TryGetIntProperty` to `GetProperty` for numbers. To walk the table files, use `VisitLiveFiles` with a static
+lambda and pass what it needs as the state. The `LiveFileInfo` it receives exposes the file's fields and keys as spans.
+These spans are valid only during the call:
+
+```csharp
+var total = new StrongBox<ulong>();                // reused
+total.Value = 0;
+db.VisitLiveFiles(total, static (in LiveFileInfo f, StrongBox<ulong> sum) => sum.Value += f.Size);
+
+ulong[] sizes = new ulong[ranges.Length];          // reused
+db.GetApproximateSizes(ranges, sizes);             // or (SizeApproximationOptions, ranges, sizes)
+
+if (db.TryGetIntProperty(DbProperties.EstimateNumKeys, out ulong keys)) Report(keys);
+```
 
 ## What always allocates
 
 These are one-time or per-file operations. Their allocations are reported for completeness and are not a concern for
 steady-state throughput:
 
-- `Open` / `Dispose` (version set, options, caches, LOG): MBs per open; recovery from a WAL adds its replay buffers.
+- `Open` / `Dispose` (version set, options, memtable, LOG): about 0.7 MB for an empty database; recovery from a WAL adds
+  its replay buffers.
 - `CreateColumnFamily` / `DropColumnFamily`: the new memtable's first arena slab and the OPTIONS file (about 0.8 MB).
 - Flush and compaction: a few KB per output file (properties, file names, events) plus the per-entry building, which
   reuses pooled buffers. Dictionary compression (`CompressionOptions.MaxDictBytes`) currently buffers a copy of every

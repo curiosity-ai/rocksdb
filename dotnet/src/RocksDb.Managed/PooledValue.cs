@@ -109,3 +109,97 @@ public sealed record LiveFileMetadata(string Name, string Directory, ulong FileN
     /// <summary>Oldest blob file referenced by the table (SstFileMetaData::oldest_blob_file_number); 0 = none.</summary>
     public ulong OldestBlobFileNumber { get; init; }
 }
+
+/// <summary>
+/// Receives one live table file of <see cref="RocksDatabase.VisitLiveFiles{TState}(TState, LiveFileVisitor{TState})"/>.
+/// <paramref name="file"/> (and the spans it exposes) is only valid during the call.
+/// </summary>
+public delegate void LiveFileVisitor<in TState>(in LiveFileInfo file, TState state);
+
+/// <summary>
+/// A live table file as seen by <see cref="RocksDatabase.VisitLiveFiles{TState}(TState, LiveFileVisitor{TState})"/>:
+/// the fields of <see cref="LiveFileMetadata"/> (rocksdb::LiveFileMetaData) read in place, without copying the keys or
+/// building the file name. The spans are valid only during the visitor call; copy what must outlive it.
+/// </summary>
+public readonly ref struct LiveFileInfo
+{
+    private readonly Db.FileMetaData _file;
+    private readonly Db.ColumnFamilyData _cfd;
+
+    internal LiveFileInfo(Db.FileMetaData file, int level, Db.ColumnFamilyData cfd, string directory)
+    {
+        _file = file;
+        _cfd = cfd;
+        Level = level;
+        Directory = directory;
+    }
+
+    /// <summary>
+    /// Table file number. The file is <see cref="Directory"/> + <see cref="LiveFileMetadata.Name"/>, i.e. the number
+    /// zero-padded to 6 digits with the ".sst" extension (e.g. "/000012.sst").
+    /// </summary>
+    public ulong FileNumber => _file.FileNumber;
+    /// <summary>Directory holding the file (one of the DB paths; an existing string).</summary>
+    public string Directory { get; }
+    /// <summary>LSM level.</summary>
+    public int Level { get; }
+    /// <summary>File size in bytes.</summary>
+    public ulong Size => _file.FileSize;
+    /// <summary>Id of the column family the file belongs to.</summary>
+    public uint ColumnFamilyId => _cfd.Id;
+    /// <summary>Name of the column family the file belongs to (an existing string).</summary>
+    public string ColumnFamilyName => _cfd.Name;
+    /// <summary>Smallest user key.</summary>
+    public ReadOnlySpan<byte> SmallestUserKey => Db.DbFormat.ExtractUserKey(_file.Smallest);
+    /// <summary>Largest user key.</summary>
+    public ReadOnlySpan<byte> LargestUserKey => Db.DbFormat.ExtractUserKey(_file.Largest);
+    /// <summary>Smallest internal key (user key + 8-byte footer).</summary>
+    public ReadOnlySpan<byte> SmallestInternalKey => _file.Smallest;
+    /// <summary>Largest internal key (user key + 8-byte footer).</summary>
+    public ReadOnlySpan<byte> LargestInternalKey => _file.Largest;
+    /// <summary>Smallest sequence number in the file.</summary>
+    public ulong SmallestSeqno => _file.SmallestSeqno;
+    /// <summary>Largest sequence number in the file.</summary>
+    public ulong LargestSeqno => _file.LargestSeqno;
+    /// <summary>Epoch number (L0 ordering).</summary>
+    public ulong EpochNumber => _file.EpochNumber;
+    /// <summary>File temperature recorded in the MANIFEST.</summary>
+    public Temperature Temperature => _file.Temperature;
+    /// <summary>Oldest ancestor time, unix seconds; 0 = unknown.</summary>
+    public ulong OldestAncestorTime => _file.OldestAncestorTime;
+    /// <summary>File creation time, unix seconds; 0 = unknown.</summary>
+    public ulong FileCreationTime => _file.FileCreationTime;
+    /// <summary>Whole-file checksum recorded in the MANIFEST; empty when unknown.</summary>
+    public ReadOnlySpan<byte> FileChecksum => _file.FileChecksum;
+    /// <summary>Its function name, "Unknown" when none was recorded (an existing string).</summary>
+    public string FileChecksumFuncName => _file.FileChecksumFuncName;
+    /// <summary>Estimated number of user reads of the file (see <see cref="LiveFileMetadata.NumReadsSampled"/>).</summary>
+    public ulong NumReadsSampled => _file.NumReadsSampled;
+    /// <summary>Oldest blob file referenced by the table; 0 = none.</summary>
+    public ulong OldestBlobFileNumber => _file.OldestBlobFileNumber;
+
+    /// <summary>A <see cref="LiveFileMetadata"/> copy of this file (allocates).</summary>
+    public LiveFileMetadata ToMetadata() => new(
+        "/" + Db.FileNames.MakeTableFileName(_file.FileNumber),
+        Directory,
+        _file.FileNumber,
+        _cfd.Name,
+        Level,
+        _file.FileSize,
+        SmallestUserKey.ToArray(),
+        LargestUserKey.ToArray(),
+        _file.SmallestSeqno,
+        _file.LargestSeqno,
+        _file.EpochNumber)
+    {
+        Temperature = _file.Temperature,
+        FileChecksum = _file.FileChecksum,
+        FileChecksumFuncName = _file.FileChecksumFuncName,
+        OldestAncestorTime = _file.OldestAncestorTime,
+        FileCreationTime = _file.FileCreationTime,
+        NumReadsSampled = _file.NumReadsSampled,
+        SmallestInternalKey = _file.Smallest,
+        LargestInternalKey = _file.Largest,
+        OldestBlobFileNumber = _file.OldestBlobFileNumber,
+    };
+}

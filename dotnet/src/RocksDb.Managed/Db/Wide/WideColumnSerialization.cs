@@ -391,6 +391,8 @@ internal static class WideColumnSerialization
             if (!TryGetVarint32(input, ref pos, out valueSizes[i])) return "Error decoding wide column value size";
         }
         long dataPos = pos;
+        // Size a fresh result list once (numColumns is bounded by the input: every column was decoded above).
+        slots.EnsureCapacity(slots.Count + (int)numColumns);
         for (int i = 0; i < numColumns; i++)
         {
             if (dataPos + valueSizes[i] > input.Length) return "Error decoding wide column value payload";
@@ -424,6 +426,8 @@ internal static class WideColumnSerialization
         int s6 = s5Limit;
         int s7 = s6 + (int)namesBytes;
         long namePos = 0, valuePos = 0;
+        // Size a fresh result list once (numColumns is bounded by the input: one type byte per column, checked above).
+        slots.EnsureCapacity(slots.Count + (int)numColumns);
         for (int i = 0; i < numColumns; i++)
         {
             if (!TryGetVarint32(input[..s4Limit], ref s4, out uint ns)) return "Error decoding wide column name size";

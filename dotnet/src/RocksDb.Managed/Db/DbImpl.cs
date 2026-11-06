@@ -201,6 +201,32 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
     }
 
+    // Cached id-ordered snapshot of the live column families (ColumnFamiliesSnapshot); rebuilt when the set changes.
+    private ColumnFamilyData[] _cfSnapshot = [];
+    private int _cfSnapshotVersion = -1;
+
+    /// <summary>
+    /// The live column families in id order, as a shared immutable snapshot: the same array is returned until a column
+    /// family is created or dropped, so callers that only iterate do not allocate. Never modify the returned array.
+    /// </summary>
+    internal ColumnFamilyData[] ColumnFamiliesSnapshot()
+    {
+        lock (_mutex)
+        {
+            int version = Versions.ColumnFamilySetVersion;
+            if (version != _cfSnapshotVersion)
+            {
+                var cfds = new ColumnFamilyData[Versions.ColumnFamilies.Count];
+                int i = 0;
+                foreach (ColumnFamilyData c in Versions.ColumnFamilies) cfds[i++] = c;
+                Array.Sort(cfds, static (a, b) => a.Id.CompareTo(b.Id));
+                _cfSnapshot = cfds;
+                _cfSnapshotVersion = version;
+            }
+            return _cfSnapshot;
+        }
+    }
+
     // ---- super versions ---------------------------------------------------------------------------------
 
     /// <summary>Port of ColumnFamilyData::GetReferencedSuperVersion (without thread-local caching).</summary>
@@ -400,49 +426,14 @@ internal sealed partial class DbImpl : IAsyncDisposable
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         try
         {
+            // Numeric properties: computed as an integer and formatted once (DBImpl::GetProperty on a handle_int property).
+            switch (TryGetIntPropertyCore(cfd, sv, property, out IntPropertyValue intValue))
+            {
+                case IntPropertyResult.Value: return intValue.ToString();
+                case IntPropertyResult.Unavailable: return null;
+            }
             if (TryGetExtendedProperty(cfd, sv, property, out string? extendedValue)) return extendedValue;
             if (TryGetCompactionProperty(cfd, sv, property, out string? compactionValue)) return compactionValue;
-            switch (property)
-            {
-                case DbProperties.NumEntriesActiveMemTable:
-                    return sv.Mem.NumEntries.ToString(CultureInfo.InvariantCulture);
-                case DbProperties.NumEntriesImmMemTables:
-                    {
-                        long n = 0;
-                        foreach (MemTable m in sv.Imm) n += m.NumEntries;
-                        return n.ToString(CultureInfo.InvariantCulture);
-                    }
-                case DbProperties.NumDeletesActiveMemTable:
-                    return sv.Mem.NumDeletes.ToString(CultureInfo.InvariantCulture);
-                case DbProperties.NumImmutableMemTable:
-                    return sv.Imm.Length.ToString(CultureInfo.InvariantCulture);
-                case DbProperties.CurSizeActiveMemTable:
-                    return sv.Mem.ApproximateMemoryUsage.ToString(CultureInfo.InvariantCulture);
-                case DbProperties.EstimateNumKeys:
-                    return EstimateNumKeys(sv).ToString(CultureInfo.InvariantCulture);
-                case DbProperties.TotalSstFilesSize:
-                    // ColumnFamilyData::GetTotalSstFilesSize: the distinct files of every live version (incl. versions
-                    // pinned by iterators or snapshots of the file set), not only the current one.
-                    lock (_mutex) return cfd.AllVersionsSstFilesSize.ToString(CultureInfo.InvariantCulture);
-                case DbProperties.LiveSstFilesSize:
-                    {
-                        ulong n = 0;
-                        for (int l = 0; l < sv.Current.Storage.NumLevels; l++) n += sv.Current.Storage.NumLevelBytes(l);
-                        return n.ToString(CultureInfo.InvariantCulture);
-                    }
-                case DbProperties.LevelStats:
-                    return sv.Current.Storage.LevelSummary();
-                case DbProperties.NumSnapshots:
-                    return SnapshotCount.ToString(CultureInfo.InvariantCulture);
-                case DbProperties.IsWriteStopped:
-                    lock (_mutex) return IsWriteStalled() ? "1" : "0";
-            }
-            if (property.StartsWith(DbProperties.NumFilesAtLevelPrefix, StringComparison.Ordinal)
-                && int.TryParse(property.AsSpan(DbProperties.NumFilesAtLevelPrefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out int level))
-            {
-                // HandleNumFilesAtLevel: a level at or beyond num_levels is not a property (returns false).
-                return level < sv.Current.Storage.NumLevels ? sv.Current.Storage.NumLevelFiles(level).ToString(CultureInfo.InvariantCulture) : null;
-            }
             return null;
         }
         finally
@@ -510,40 +501,46 @@ internal sealed partial class DbImpl : IAsyncDisposable
     public List<LiveFileMetadata> GetLiveFilesMetadata()
     {
         var result = new List<LiveFileMetadata>();
-        foreach (ColumnFamilyData cfd in GetColumnFamilies())
+        GetLiveFilesMetadata(result);
+        return result;
+    }
+
+    /// <summary>
+    /// Port of DB::GetLiveFilesMetaData(std::vector&lt;LiveFileMetaData&gt;*): replaces the contents of
+    /// <paramref name="result"/> (its capacity is reused and grown once per column family).
+    /// </summary>
+    public void GetLiveFilesMetadata(List<LiveFileMetadata> result)
+    {
+        result.Clear();
+        VisitLiveFiles(result, static (in LiveFileInfo f, List<LiveFileMetadata> r) => r.Add(f.ToMetadata()), static (count, r) => r.EnsureCapacity(r.Count + count));
+    }
+
+    /// <summary>
+    /// Calls <paramref name="visitor"/> for every live table file of every column family (in column family id, then level,
+    /// then level order: the order of DB::GetLiveFilesMetaData), reading the files of a column family from one referenced
+    /// super version. <paramref name="sizeHint"/>, when given, is told each column family's file count first.
+    /// </summary>
+    public void VisitLiveFiles<TState>(TState state, LiveFileVisitor<TState> visitor, Action<int, TState>? sizeHint)
+    {
+        foreach (ColumnFamilyData cfd in ColumnFamiliesSnapshot())
         {
             SuperVersion sv = GetReferencedSuperVersion(cfd);
             try
             {
                 VersionStorageInfo s = sv.Current.Storage;
+                if (sizeHint is not null)
+                {
+                    int count = 0;
+                    for (int l = 0; l < s.NumLevels; l++) count += s.NumLevelFiles(l);
+                    sizeHint(count, state);
+                }
+                IReadOnlyList<string> paths = DbPaths;
                 for (int l = 0; l < s.NumLevels; l++)
                 {
                     foreach (FileMetaData f in s.LevelFiles(l))
                     {
-                        string dir = DbPaths[(int)Math.Min(f.PathId, (uint)(DbPaths.Count - 1))];
-                        result.Add(new LiveFileMetadata(
-                            "/" + FileNames.MakeTableFileName(f.FileNumber),
-                            dir,
-                            f.FileNumber,
-                            cfd.Name,
-                            l,
-                            f.FileSize,
-                            DbFormat.ExtractUserKey(f.Smallest).ToArray(),
-                            DbFormat.ExtractUserKey(f.Largest).ToArray(),
-                            f.SmallestSeqno,
-                            f.LargestSeqno,
-                            f.EpochNumber)
-                        {
-                            Temperature = f.Temperature,
-                            FileChecksum = f.FileChecksum,
-                            FileChecksumFuncName = f.FileChecksumFuncName,
-                            OldestAncestorTime = f.OldestAncestorTime,
-                            FileCreationTime = f.FileCreationTime,
-                            NumReadsSampled = f.NumReadsSampled,
-                            SmallestInternalKey = f.Smallest,
-                            LargestInternalKey = f.Largest,
-                            OldestBlobFileNumber = f.OldestBlobFileNumber,
-                        });
+                        string dir = paths[(int)Math.Min(f.PathId, (uint)(paths.Count - 1))];
+                        visitor(new LiveFileInfo(f, l, cfd, dir), state);
                     }
                 }
             }
@@ -552,7 +549,6 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 ReturnSuperVersion(sv);
             }
         }
-        return result;
     }
 
     // ---- background error ----------------------------------------------------------------------------------
@@ -729,7 +725,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         foreach (ulong n in wals) DeleteOrArchiveWal(n);
         foreach (ulong n in manifests) TryDeleteFile(FileNames.DescriptorFileName(DbName, n));
         PurgeObsoleteWalFiles(force: false);
-        if (FullScanDue()) DeleteObsoleteFilesFullScan(atOpen: false);
+        if (FullScanDue()) DeleteObsoleteFilesFullScan(atOpen: false, dbDirChildren: null);
     }
 
     // delete_obsolete_files_last_run_ (UTC microseconds). Guarded by mutex.
@@ -762,16 +758,20 @@ internal sealed partial class DbImpl : IAsyncDisposable
     /// At open (<paramref name="atOpen"/>) temp files and every MANIFEST but the current one go too. Periodic scans of an
     /// open DB keep MANIFESTs newer than the current one (a new MANIFEST being written: number &gt;= manifest_file_number)
     /// and temp files (CURRENT / OPTIONS being written; the managed port does not register them as pending outputs).
+    /// When <paramref name="dbDirChildren"/> is not null it receives the DB directory's entries that the scan did not
+    /// delete, so a caller that needs the listing right after the scan (the open summary) does not list it again; the
+    /// method then returns false if the DB directory was not listed (scan skipped or listing failed).
     /// </summary>
-    private void DeleteObsoleteFilesFullScan(bool atOpen)
+    private bool DeleteObsoleteFilesFullScan(bool atOpen, List<string>? dbDirChildren)
     {
+        bool listedDbDir = false;
         var toDelete = new List<string>();
         var options = new List<(ulong Number, string Path)>();
         var walsToDelete = new List<ulong>();
         ulong minLog;
         lock (_mutex)
         {
-            if (FileDeletionsDisabled || _readOnly) return;
+            if (FileDeletionsDisabled || _readOnly) return false;
             minLog = MinLogNumberToKeepForDeletion();
             var dirs = new List<string>(DbPaths);
             // FindObsoleteFiles: the DB directory (MANIFEST, OPTIONS, ...) even when db_paths does not name it.
@@ -782,8 +782,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 IEnumerable<string> children;
                 try { children = FileSystem.GetChildren(dir); }
                 catch (Exception e) when (e is IOException or RocksDbException) { continue; }
+                if (dir == DbName) listedDbDir = true;
                 foreach (string child in children)
                 {
+                    if (dbDirChildren is not null && dir == DbName) dbDirChildren.Add(child);
                     if (!FileNames.TryParseFileName(child, out ulong number, out FileType type)) continue;
                     string full = dir + "/" + child;
                     switch (type)
@@ -822,6 +824,11 @@ internal sealed partial class DbImpl : IAsyncDisposable
         options.Sort(static (a, b) => b.Number.CompareTo(a.Number));
         for (int i = 2; i < options.Count; i++) toDelete.Add(options[i].Path);
         foreach (string p in toDelete) TryDeleteFile(p);
+        if (dbDirChildren is not null && toDelete.Count > 0)
+        {
+            string prefix = DbName + "/";
+            dbDirChildren.RemoveAll(child => toDelete.Contains(prefix + child));
+        }
         if (walsToDelete.Count > 0 && !TryPersistWalDeletion(minLog))
         {
             lock (_mutex) _aliveWals.AddRange(walsToDelete);
@@ -829,6 +836,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
         foreach (ulong n in walsToDelete) DeleteOrArchiveWal(n);
         PurgeObsoleteWalFiles(force: true);
+        return listedDbDir;
     }
 
     /// <summary>

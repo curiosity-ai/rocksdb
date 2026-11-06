@@ -330,11 +330,13 @@ internal sealed partial class DbImpl
         if (Options.PersistStatsToDisk) await InitPersistStatsColumnFamilyAsync(synchronous, ct).ConfigureAwait(false);
 
         StartSstFileManager();
-        DeleteObsoleteFilesFullScan(atOpen: true);
+        DeleteObsoleteFilesFullScan(atOpen: true, dbDirChildren: null);
         await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
-        DeleteObsoleteFilesFullScan(atOpen: true);
+        // The second scan's listing of the DB directory (minus what it deleted) is also the open summary's listing.
+        List<string>? dbDirChildren = new();
+        if (!DeleteObsoleteFilesFullScan(atOpen: true, dbDirChildren)) dbDirChildren = null;
         lock (_mutex) _deleteObsoleteFilesLastRun = DateTime.UtcNow.Ticks / 10;
-        LogOpenSummary();
+        LogOpenSummary(dbDirChildren);
         LogInfo("DB pointer " + GetHashCode().ToString("x", CultureInfo.InvariantCulture) + " opened " + DbName);
         StartStatsDump();
         StartStatsPersist();

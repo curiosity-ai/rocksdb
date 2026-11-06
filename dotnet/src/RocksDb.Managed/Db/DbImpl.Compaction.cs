@@ -1767,32 +1767,8 @@ internal sealed partial class DbImpl
     {
         switch (property)
         {
-            case DbProperties.CompactionPending:
-                lock (_mutex)
-                {
-                    // 1 if the system already determines at least one compaction is needed (HandleCompactionPending:
-                    // the picker's NeedsCompaction, also with disable_auto_compactions).
-                    bool pending = !cfd.Dropped && cfd.CompactionState.Picker.NeedsCompaction(cfd.Current.Storage);
-                    value = pending ? "1" : "0";
-                }
-                return true;
-            case DbProperties.NumRunningCompactions:
-                value = NumRunningCompactions.ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.EstimatePendingCompactionBytes:
-                lock (_mutex) value = sv.Current.Storage.EstimatedCompactionNeededBytes.ToString(CultureInfo.InvariantCulture);
-                return true;
             case DbProperties.LevelStats:
                 lock (_mutex) value = sv.Current.Storage.LevelStats();
-                return true;
-            case DbProperties.BaseLevel:
-                value = sv.Current.Storage.BaseLevel.ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.ActualDelayedWriteRate:
-                value = (WriteControllerInstance.NeedsDelay ? WriteControllerInstance.DelayedWriteRate : 0).ToString(CultureInfo.InvariantCulture);
-                return true;
-            case DbProperties.IsWriteStopped:
-                value = WriteControllerInstance.IsStopped ? "1" : "0";
                 return true;
             case DbProperties.Stats:
             case DbProperties.CfStats:

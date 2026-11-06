@@ -298,6 +298,24 @@ for (int i = 0; i < batch.Count; i++)
 batch.Clear();                                  // keep the buffers for the next batch
 ```
 
+To keep the keys and results in your own memory, `MultiGet(options, keys, values, valueRanges, statuses)` (and
+`MultiGetAsync`) runs a pooled batch and appends the found values to an `IBufferWriter<byte>`; it allocates nothing once
+warmed up. A failed key gets `MultiGetStatus.Error` (use a `MultiGetBatch` for the exception). The convenience
+`byte[]?[] MultiGet(IReadOnlyList<byte[]>)` also uses a pooled batch and allocates only its results.
+
+<!-- snippet:multiget-spans -->
+```csharp
+ReadOnlyMemory<byte>[] keys = ["a"u8.ToArray(), "b"u8.ToArray(), "c"u8.ToArray()];
+var values = new System.Buffers.ArrayBufferWriter<byte>();     // found values, back to back
+var ranges = new Range[keys.Length];                           // where each value is in `values`
+var statuses = new MultiGetStatus[keys.Length];
+db.MultiGet(null, keys, values, ranges, statuses);             // or: await db.MultiGetAsync(null, keys, values, ranges, statuses)
+for (int i = 0; i < keys.Length; i++)
+{
+    if (statuses[i] == MultiGetStatus.Found) Console.WriteLine(System.Text.Encoding.UTF8.GetString(values.WrittenSpan[ranges[i]]));
+}
+```
+
 ### Iterators
 
 An `Iterator` supports cursor-style movement (`Seek`, `SeekForPrev`, `SeekToFirst`, `SeekToLast`, `Next`, `Prev`), each
@@ -1081,13 +1099,20 @@ string dump = statistics.ToString();                 // same text as native Stat
 
 Console.WriteLine(db.GetIntProperty(DbProperties.EstimateNumKeys));               // 100
 Dictionary<string, TableProperties> tables = db.GetPropertiesOfAllTables();
+// Allocation-free monitoring: numeric properties, the table files visited in place.
+db.TryGetIntProperty(DbProperties.CurSizeAllMemTables, out ulong memtableBytes);
+var sstBytes = new System.Runtime.CompilerServices.StrongBox<ulong>();
+db.VisitLiveFiles(sstBytes, static (in LiveFileInfo f, System.Runtime.CompilerServices.StrongBox<ulong> sum) => sum.Value += f.Size);
 ```
 
 `GetProperty` accepts every native property name of `db/internal_stats.cc` (constants in `DbProperties`), including
 `rocksdb.stats`, `rocksdb.cfstats`, `rocksdb.levelstats`, `rocksdb.num-files-at-level<N>`, `rocksdb.estimate-num-keys`,
 the write stall, blob and block-cache (entry stats) properties; unknown names, and levels at or beyond `num_levels`,
-return null. `KeyMayExist`, `GetApproximateSizes`, `GetApproximateMemTableStats`, `GetLiveFilesMetadata` and
-`GetPropertiesOfAllTables` are also available.
+return null. `TryGetIntProperty` / `GetIntProperty` / `TryGetAggregatedIntProperty` compute numeric properties without a
+string. `KeyMayExist`, `GetApproximateSizes` (also into a `Span<ulong>`), `GetApproximateMemTableStats`,
+`GetLiveFilesMetadata` (also refilling a caller's list), `VisitLiveFiles` (each file as a `LiveFileInfo` ref struct,
+nothing allocated) and `GetPropertiesOfAllTables` are also available. `ColumnFamilies` returns a cached read-only
+snapshot.
 
 `PerfContext` explains the cost of single operations on the calling thread, like upstream's perf context:
 

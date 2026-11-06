@@ -113,17 +113,30 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
         return cfd is not null;
     }
 
-    /// <summary>All live column families, in id order.</summary>
+    /// <summary>
+    /// All live column families, in id order: a read-only snapshot taken at the time of the call (later creates and drops
+    /// are not reflected in it). The same snapshot object is returned until a column family is created or dropped, so
+    /// reading this property in a loop does not allocate.
+    /// </summary>
     public IReadOnlyList<ColumnFamily> ColumnFamilies
     {
         get
         {
-            List<ColumnFamilyData> cfds = _db.GetColumnFamilies();
-            var list = new List<ColumnFamily>(cfds.Count);
-            foreach (ColumnFamilyData c in cfds) list.Add(Handle(c));
-            return list;
+            ColumnFamilyData[] cfds = _db.ColumnFamiliesSnapshot();
+            HandleSnapshot? cached = Volatile.Read(ref _handleSnapshot);
+            if (cached is not null && ReferenceEquals(cached.Source, cfds)) return cached.Handles;
+            var handles = new ColumnFamily[cfds.Length];
+            for (int i = 0; i < cfds.Length; i++) handles[i] = Handle(cfds[i]);
+            cached = new HandleSnapshot(cfds, new System.Collections.ObjectModel.ReadOnlyCollection<ColumnFamily>(handles));
+            Volatile.Write(ref _handleSnapshot, cached);
+            return cached.Handles;
         }
     }
+
+    // The handles of one DbImpl.ColumnFamiliesSnapshot array (published atomically; the handle of a live column family
+    // never changes, see Handle).
+    private sealed record HandleSnapshot(ColumnFamilyData[] Source, IReadOnlyList<ColumnFamily> Handles);
+    private HandleSnapshot? _handleSnapshot;
 
     /// <summary>
     /// Creates a column family (DB::CreateColumnFamily); the change is recorded in the MANIFEST and the OPTIONS file.
@@ -264,11 +277,50 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     /// <summary>A numeric DB property of the default column family (DB::GetIntProperty); false if unknown or not numeric.</summary>
     public bool TryGetIntProperty(string property, out ulong value) => _default.TryGetIntProperty(property, out value);
 
-    /// <summary>Metadata of all live table files (DB::GetLiveFilesMetaData).</summary>
+    /// <summary>
+    /// Metadata of all live table files (DB::GetLiveFilesMetaData), in column family id, level and in-level order.
+    /// Allocates a new list and one record (with copied keys and file name) per file; see
+    /// <see cref="GetLiveFilesMetadata(List{LiveFileMetadata})"/> and <see cref="VisitLiveFiles{TState}"/>.
+    /// </summary>
     public List<LiveFileMetadata> GetLiveFilesMetadata()
     {
         _db.ThrowIfDisposed();
         return _db.GetLiveFilesMetadata();
+    }
+
+    /// <summary>
+    /// <see cref="GetLiveFilesMetadata()"/> into a caller-owned list (DB::GetLiveFilesMetaData(std::vector*)): clears
+    /// <paramref name="result"/> and refills it, reusing its capacity. Still allocates one record per file.
+    /// </summary>
+    public void GetLiveFilesMetadata(List<LiveFileMetadata> result)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        _db.ThrowIfDisposed();
+        _db.GetLiveFilesMetadata(result);
+    }
+
+    /// <summary>
+    /// Calls <paramref name="visitor"/> once per live table file, in the order of <see cref="GetLiveFilesMetadata()"/>,
+    /// with the file's metadata read in place (<see cref="LiveFileInfo"/>: keys as spans, no file name string). Does not
+    /// allocate when <paramref name="visitor"/> is a static lambda (state goes through <paramref name="state"/>).
+    /// <para>
+    /// Each column family's files are read from one consistent version, which stays referenced (its files cannot be
+    /// deleted) while the visitor runs for that column family, so keep the visitor short. The visitor may call other
+    /// read APIs of the database but must not dispose it. An exception thrown by the visitor stops the visit and is
+    /// propagated.
+    /// </para>
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// var total = new StrongBox&lt;ulong&gt;();   // reuse it across calls to stay allocation-free
+    /// db.VisitLiveFiles(total, static (in LiveFileInfo f, StrongBox&lt;ulong&gt; sum) =&gt; sum.Value += f.Size);
+    /// </code>
+    /// </example>
+    public void VisitLiveFiles<TState>(TState state, LiveFileVisitor<TState> visitor)
+    {
+        ArgumentNullException.ThrowIfNull(visitor);
+        _db.ThrowIfDisposed();
+        _db.VisitLiveFiles(state, visitor, sizeHint: null);
     }
 
     /// <summary>The DB directory.</summary>
@@ -361,7 +413,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public byte[]? Get(ReadOnlySpan<byte> key) => _default.Get(key);
     public byte[]? Get(ReadOptions? options, ReadOnlySpan<byte> key) => _default.Get(options, key);
     public bool ContainsKey(ReadOnlySpan<byte> key) => _default.ContainsKey(key);
-    /// <summary>Looks up several keys from one consistent view; null entries are keys that were not found. Allocates; see <see cref="MultiGetBatch"/>.</summary>
+    /// <summary>Looks up several keys from one consistent view; null entries are keys that were not found. Allocates the results; see <see cref="MultiGetBatch"/>.</summary>
     public byte[]?[] MultiGet(IReadOnlyList<byte[]> keys) => _default.MultiGet(keys);
     public byte[]?[] MultiGet(ReadOptions? options, IReadOnlyList<byte[]> keys) => _default.MultiGet(options, keys);
     /// <summary>Runs a reusable <see cref="MultiGetBatch"/> against the default column family (DB::MultiGet).</summary>
@@ -371,6 +423,21 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public ValueTask MultiGetAsync(MultiGetBatch batch, CancellationToken cancellationToken = default) => _default.MultiGetAsync(batch, cancellationToken);
     public ValueTask MultiGetAsync(ReadOptions? options, MultiGetBatch batch, CancellationToken cancellationToken = default) =>
         _default.MultiGetAsync(options, batch, cancellationToken);
+    /// <summary>
+    /// Looks up <paramref name="keys"/> in the default column family with every result in caller memory (DB::MultiGet with
+    /// a values and statuses array); see
+    /// <see cref="ColumnFamily.MultiGet(ReadOptions?, ReadOnlySpan{ReadOnlyMemory{byte}}, IBufferWriter{byte}, Span{Range}, Span{MultiGetStatus})"/>.
+    /// Does not allocate after warm-up.
+    /// </summary>
+    public void MultiGet(ReadOptions? options, ReadOnlySpan<ReadOnlyMemory<byte>> keys, IBufferWriter<byte> values, Span<Range> valueRanges,
+        Span<MultiGetStatus> statuses) => _default.MultiGet(options, keys, values, valueRanges, statuses);
+    /// <summary>
+    /// Async <see cref="MultiGet(ReadOptions?, ReadOnlySpan{ReadOnlyMemory{byte}}, IBufferWriter{byte}, Span{Range}, Span{MultiGetStatus})"/>;
+    /// see <see cref="ColumnFamily.MultiGetAsync(ReadOptions?, ReadOnlyMemory{ReadOnlyMemory{byte}}, IBufferWriter{byte}, Memory{Range}, Memory{MultiGetStatus}, CancellationToken)"/>.
+    /// </summary>
+    public ValueTask MultiGetAsync(ReadOptions? options, ReadOnlyMemory<ReadOnlyMemory<byte>> keys, IBufferWriter<byte> values,
+        Memory<Range> valueRanges, Memory<MultiGetStatus> statuses, CancellationToken cancellationToken = default) =>
+        _default.MultiGetAsync(options, keys, values, valueRanges, statuses, cancellationToken);
 
     /// <summary>Async <see cref="TryGet(ReadOnlySpan{byte}, IBufferWriter{byte})"/>; completes synchronously on memtable and cache hits.</summary>
     public ValueTask<bool> TryGetAsync(ReadOnlyMemory<byte> key, IBufferWriter<byte> value, CancellationToken cancellationToken = default) =>

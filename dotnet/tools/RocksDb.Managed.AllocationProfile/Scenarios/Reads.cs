@@ -313,6 +313,28 @@ internal static partial class Scenarios
             long found = 0;
             return Done(Runner.Sync(n => { for (int i = 0; i < n; i++) found += db.MultiGet(groups[c.Next()]).Length; }));
         }, chunk: 50, notes: "Allocates the result array and one byte[] per found value by design."));
+        list.Add(S("multiget.span16.sst-cached", "multiget", PathKind.Hot, "MultiGet(options, keys, IBufferWriter, Span<Range>, Span<MultiGetStatus>) of 16 keys", ctx =>
+        {
+            (RocksDatabase db, byte[][] keys) = ReadDb(ctx, Location.Cached);
+            var groups = new ReadOnlyMemory<byte>[keys.Length / 16][];
+            for (int g = 0; g < groups.Length; g++)
+            {
+                groups[g] = new ReadOnlyMemory<byte>[16];
+                for (int j = 0; j < 16; j++) groups[g][j] = keys[g * 16 + j];
+            }
+            var values = new System.Buffers.ArrayBufferWriter<byte>(4096);
+            var ranges = new Range[16];
+            var statuses = new MultiGetStatus[16];
+            var c = new Cursor(groups.Length);
+            return Done(Runner.Sync(n =>
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    values.ResetWrittenCount();
+                    db.MultiGet(null, groups[c.Next()], values, ranges, statuses);
+                }
+            }));
+        }, chunk: 50));
 
         // Wide columns.
         list.Add(S("getentity.new", "entity", PathKind.Hot, "WideColumns? GetEntity(key) (new result per call)", ctx =>

@@ -76,6 +76,12 @@ internal sealed class VersionSet : IAsyncDisposable
 
     public IReadOnlyCollection<ColumnFamilyData> ColumnFamilies => _cfs.Values;
 
+    /// <summary>
+    /// Incremented whenever a column family is added or removed, so readers can cache a snapshot of
+    /// <see cref="ColumnFamilies"/> (DbImpl.ColumnFamiliesSnapshot). REQUIRES: DB mutex (like the set itself).
+    /// </summary>
+    public int ColumnFamilySetVersion { get; private set; }
+
     // ---- counters -------------------------------------------------------------------------------
 
     /// <summary>VersionSet::NewFileNumber.</summary>
@@ -194,6 +200,7 @@ internal sealed class VersionSet : IAsyncDisposable
         IReadOnlyList<CompactCursor>? compactCursors, bool updateStats)
     {
         _cfs[cfd.Id] = cfd;
+        ColumnFamilySetVersion++;
         if (cfd.Id > MaxColumnFamily) MaxColumnFamily = cfd.Id;
         Blob.BlobFileMetaData[] blobs = [];
         if (blobFiles is not null)
@@ -624,6 +631,7 @@ internal sealed class VersionSet : IAsyncDisposable
             {
                 cfd.Dropped = true;
                 _cfs.Remove(cfd.Id);
+                ColumnFamilySetVersion++;
             }
         }
         else if (cfd is not null)
