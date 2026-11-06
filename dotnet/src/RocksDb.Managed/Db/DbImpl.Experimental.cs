@@ -101,6 +101,8 @@ internal sealed partial class DbImpl
         Comparator ucmp = cfd.UserComparator;
         int tsSize = cfd.TimestampSize;
         var edit = new VersionEdit { ColumnFamily = cfd.Id };
+        // DeleteFilesInRanges: edit.MarkForegroundOperation().
+        edit.MarkForegroundOperation();
         var deleted = new HashSet<FileMetaData>(ReferenceEqualityComparer.Instance);
         DbVersion inputVersion;
         lock (_mutex)

@@ -132,8 +132,10 @@ internal abstract class SeqPerBatchHooks
     /// <summary>The read callback of an iterator reading at <paramref name="snapshot"/> (WritePreparedTxnDB::NewIterator).</summary>
     public abstract ReadCallback NewIteratorCallback(Snapshot snapshot);
 
-    /// <summary>Takes a snapshot with min_uncommitted (WritePreparedTxnDB::GetSnapshot).</summary>
-    public abstract Snapshot GetSnapshot();
+    /// <summary>
+    /// Takes a snapshot with min_uncommitted (WritePreparedTxnDB::GetSnapshotInternal(for_ww_conflict_check)).
+    /// </summary>
+    public abstract Snapshot GetSnapshot(bool isWriteConflictBoundary);
 
     /// <summary>
     /// Writes a batch that did not come from a transaction (WritePreparedTxnDB::Write with skip_concurrency_control ->

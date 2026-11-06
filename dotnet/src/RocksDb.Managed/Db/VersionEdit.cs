@@ -138,6 +138,17 @@ public sealed class VersionEdit
 
     public bool IsColumnFamilyAdd => ColumnFamilyAddName is not null;
     public bool IsColumnFamilyManipulation => IsColumnFamilyAdd || IsColumnFamilyDrop;
+
+    private bool _isForegroundOperation;
+
+    /// <summary>
+    /// VersionEdit::MarkForegroundOperation (not persisted): the edit belongs to a user operation (ingestion, import,
+    /// DeleteFilesInRanges), so its MANIFEST write may exceed the rotation limit by 25% instead of blocking on a rotation.
+    /// </summary>
+    public void MarkForegroundOperation() => _isForegroundOperation = true;
+
+    /// <summary>VersionEdit::IsForegroundOperation: marked, or a column family add / drop.</summary>
+    public bool IsForegroundOperation => _isForegroundOperation || IsColumnFamilyManipulation;
     public bool IsWalAddition => WalAdditions.Count > 0;
     public bool IsWalDeletion => WalDeletionBefore != 0;
 

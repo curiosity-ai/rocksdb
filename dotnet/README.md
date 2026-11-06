@@ -1277,6 +1277,10 @@ Not ported yet (tracked in [todo.md](todo.md)):
   filter object cannot be recreated from an OPTIONS file). `max_manifest_space_amp_pct`,
   `verify_manifest_content_on_close` and `verify_output_flags` are typed here; their behaviour belongs to the
   compaction / MANIFEST work.
+- Not ported yet: flush-time compaction filtering (a `CompactionFilterFactory` whose `ShouldFilterTableFileCreation`
+  accepts flushes is only checked for `IgnoreSnapshots`, its filter is not applied to flushes); the read-back of flush
+  outputs with `ParanoidFileChecks` (compaction outputs are verified); the MANIFEST size check on close (upstream
+  rewrites the MANIFEST when its size differs from the expected one; `VerifyManifestContentOnClose` is ported).
 
 API and behavior differences:
 

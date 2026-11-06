@@ -246,6 +246,14 @@ internal sealed class Compaction
         && InputStorage.Icmp.CompareUserKey(userKey, DbFormat.ExtractUserKey(_proximalLevelLargest)) <= 0;
 
     /// <summary>
+    /// Compaction::is_trivial_copy_compaction: a FIFO kChangeTemperature compaction with
+    /// allow_trivial_copy_when_change_temperature copies its input files instead of rewriting them.
+    /// </summary>
+    public bool IsTrivialCopyCompaction =>
+        Options.CompactionStyle == CompactionStyle.Fifo && Reason == CompactionReason.ChangeTemperature
+        && Options.CompactionOptionsFifo.AllowTrivialCopyWhenChangeTemperature;
+
+    /// <summary>
     /// Port of Compaction::GetOutputTemperature: the picker's override (FIFO kChangeTemperature), else
     /// last_level_temperature for last-level (not proximal) outputs, else default_write_temperature.
     /// </summary>
@@ -572,19 +580,41 @@ internal sealed class Compaction
         }
     }
 
-    /// <summary>Port of Compaction::MinInputFileOldestAncestorTime (0 when unknown).</summary>
-    public ulong MinInputFileOldestAncestorTime()
+    /// <summary>
+    /// Port of Compaction::MinInputFileOldestAncestorTime: the minimum oldest ancestor time of the input files that
+    /// overlap [<paramref name="start"/>, <paramref name="end"/>] (internal keys; null = unbounded), ulong.MaxValue when
+    /// none is known. A file's time is FileMetaData::TryGetOldestAncestorTime: the MANIFEST value, else the
+    /// rocksdb.creation.time table property when the table is already open in <paramref name="tableCache"/> (no I/O).
+    /// </summary>
+    public ulong MinInputFileOldestAncestorTime(ReadOnlySpan<byte> start, ReadOnlySpan<byte> end, TableCache? tableCache)
     {
         ulong min = ulong.MaxValue;
+        InternalKeyComparator icmp = InputStorage.Icmp;
         foreach (CompactionInputFiles l in _inputs)
         {
             foreach (FileMetaData f in l.Files)
             {
-                ulong t = f.OldestAncestorTime != 0 ? f.OldestAncestorTime : f.FileCreationTime;
+                if (!start.IsEmpty && icmp.Compare(f.Largest, start) < 0) continue;
+                if (!end.IsEmpty && icmp.Compare(f.Smallest, end) > 0) continue;
+                ulong t = TryGetOldestAncestorTime(f, tableCache);
                 if (t != 0) min = Math.Min(min, t);
             }
         }
         return min;
+    }
+
+    /// <summary>The whole compaction's <see cref="MinInputFileOldestAncestorTime(ReadOnlySpan{byte}, ReadOnlySpan{byte}, TableCache?)"/>.</summary>
+    public ulong MinInputFileOldestAncestorTime(TableCache? tableCache) => MinInputFileOldestAncestorTime(default, default, tableCache);
+
+    /// <summary>FileMetaData::TryGetOldestAncestorTime (0 = kUnknownOldestAncestorTime).</summary>
+    private static ulong TryGetOldestAncestorTime(FileMetaData f, TableCache? tableCache)
+    {
+        if (f.OldestAncestorTime != 0) return f.OldestAncestorTime;
+        if (tableCache is not null && tableCache.TryGetOpenReader(f, out TableReaderLease lease))
+        {
+            using (lease) return lease.Reader.Properties.CreationTime;
+        }
+        return 0;
     }
 
     /// <summary>

@@ -129,7 +129,7 @@ changes there need their own review.
 | `Db/Compaction/ColumnFamilyCompactionState.cs` | 34 | db/compaction/compaction_picker.h (NullCompactionPicker), db/column_family.h | line-by-line (#2) |
 | `Db/Compaction/Compaction.cs` | 446 | include/rocksdb/listener.h, db/compaction/compaction.{h,cc} | line-by-line (#2); #3: MaxOutputFileSize, MaxInputFileNewestKeyTime (new), MinInputFileOldestAncestorTime; compaction-features pass: output_split_key_, CreateSstPartitioner, IsTrivialMove partitioner check, GetOutputTemperature inputs |
 | `Db/Compaction/CompactionIterator.cs` | 762 | db/compaction/compaction_iteration_stats.h, db/compaction/compaction_iterator.cc | line-by-line (#3): NextFromInput / InvokeFilterIfNeeded / PrepareOutput / findEarliestVisibleSnapshot vs compaction_iterator.cc (main) |
-| `Db/Compaction/CompactionJob.cs` | 1347 | db/compaction/compaction_job.cc, db/compaction/compaction_outputs.cc, db/compaction/subcompaction_state.h | line-by-line (#2); #3: ShouldStopBefore / grandparent boundaries, output time properties (fixed newest_key_time); compaction-features pass: full ShouldStopBefore (TTL cuts, partitioner, upper-bound size, round-robin split), GetOutputTemperature, compression switch; completeness pass: GenSubcompactionBoundaries, subcompaction execution and aggregation, AddRangeDels subcompaction bounds, SetOutputSlitKey |
+| `Db/Compaction/CompactionJob.cs` | 1347 | db/compaction/compaction_job.cc, db/compaction/compaction_outputs.cc, db/compaction/subcompaction_state.h | line-by-line (#2); #3: ShouldStopBefore / grandparent boundaries, output time properties (fixed newest_key_time); compaction-features pass: full ShouldStopBefore (TTL cuts, partitioner, upper-bound size, round-robin split), GetOutputTemperature, compression switch; completeness pass: GenSubcompactionBoundaries, subcompaction execution and aggregation, AddRangeDels subcompaction bounds, SetOutputSlitKey; second review (2026-11-06): OutputValidator, VerifyOutputFiles, per-output oldest_ancestor_time, earliest_write_conflict_snapshot, IgnoreSnapshots check |
 | `Db/Compaction/CompactionPicker.cs` | 623 | db/compaction/compaction_picker.{h,cc} | line-by-line (#2); compaction-features pass: enable_compression / output temperature / output split key in NewCompaction; completeness pass: split key from the input version's cursors |
 | `Db/Compaction/FifoCompactionPicker.cs` | 311 | db/compaction/compaction_picker_fifo.cc | line-by-line (#3): PickTTL/Size/IntraL0/PickCompaction; **fixed** TTL expiry by newest key time; compaction-features pass: whole file (blob-aware sizing, PickRatioBasedIntraL0Compaction, PickTemperatureChangeCompaction) |
 | `Db/Compaction/LevelCompactionPicker.cs` | 506 | db/compaction/compaction_picker_level.cc | line-by-line (#2); completeness pass: kBottommostFiles, cursors moved to the version |
@@ -142,7 +142,7 @@ changes there need their own review.
 | `Db/DbImpl.Checkpoint.cs` | 280 | include/rocksdb/metadata.h, db/db_filesnapshot.cc, utilities/checkpoint/checkpoint_impl.cc | line-by-line (#2) |
 | `Db/DbImpl.ColumnFamilies.cs` | 128 | db/db_impl/db_impl.cc (CreateColumnFamilyImpl, DropColumnFamilyImpl) | line-by-line (#2) |
 | `Db/DbImpl.Debug.cs` | 105 | utilities/debug.cc (GetAllKeyVersions), util/udt_util.cc (MaybeAddTimestampsToRange), db/db_impl/db_impl.cc (NewInternalIterator) | line-by-line (feature audit: utilities) |
-| `Db/DbImpl.Compaction.cs` | 912 | db/db_impl/db_impl_compaction_flush.cc, db/db_impl/db_impl_write.cc | line-by-line (#2) |
+| `Db/DbImpl.Compaction.cs` | 912 | db/db_impl/db_impl_compaction_flush.cc, db/db_impl/db_impl_write.cc | line-by-line (#2); second review (2026-11-06): ReFitLevel guards, trivial-move compact cursor, CopyTrivialCompactionFiles, target_path_id |
 | `Db/DbImpl.Comparators.cs` | 136 | db/version_edit_handler.cc, db/version_builder.cc, util/udt_util.cc | line-by-line (feature audit: user features (comparators) + UDT memtable-only) |
 | `Db/DbImpl.Flush.cs` | 418 | db/db_impl/db_impl_compaction_flush.cc (flush), db/flush_job.cc | line-by-line (#2) |
 | `Db/DbImpl.Ingest.cs` | 107 | db/db_impl/db_impl.cc | line-by-line (#2) |
@@ -185,7 +185,7 @@ changes there need their own review.
 | `Db/Iterators/MergingIterator.cs` | 363 | table/merging_iterator.cc | line-by-line (#1) |
 | `Db/Iterators/MultiCfIterator.cs` | 335 | db/multi_cf_iterator_impl.h, db/coalescing_iterator.{h,cc}, db/attribute_group_iterator_impl.{h,cc} | line-by-line (feature audit: user features (wide-column APIs)) |
 | `Db/Iterators/TableInternalIterator.cs` | 126 | table/block_based/block_based_table_iterator.cc | line-by-line (#1) |
-| `Db/Manifest.cs` | 608 | db/log_reader.cc, db/log_writer.cc, db/blob/blob_file_meta.h | line-by-line (#1) |
+| `Db/Manifest.cs` | 608 | db/log_reader.cc, db/log_writer.cc, db/blob/blob_file_meta.h | line-by-line (#1); second review (2026-11-06): kLastCompactedManifestFileSize record in WriteCurrentStateToManifest |
 | `Db/ManifestLog.cs` | 84 | db/version_set.cc | line-by-line (#1) |
 | `Db/MemTable.cs` | 673 | db/memtable.h, db/memtable.cc, memtable/skiplistrep.cc | line-by-line (#1); compaction-features pass: UpdateOldestKeyTime / ApproximateOldestKeyTime |
 | `Db/MemTableRangeTombstones.cs` | 291 | db/range_tombstone_fragmenter.{h,cc} | line-by-line (#1) |
@@ -196,7 +196,7 @@ changes there need their own review.
 | `Db/RangeDelAggregator.cs` | 363 | db/range_del_aggregator.{h,cc}, db/dbformat.h | line-by-line (#1) |
 | `Db/Repair.cs` | 348 | db/repair.cc (Repairer) | line-by-line (feature audit: tracing, tools and repair) |
 | `Db/SeqnoToTimeMapping.cs` | 485 | db/seqno_to_time_mapping.{h,cc} | line-by-line (tiering pass: validation.md "Compaction triggers and tiering") |
-| `Db/Snapshot.cs` | 101 | include/rocksdb/snapshot.h, db/snapshot_impl.h | line-by-line (#2) |
+| `Db/Snapshot.cs` | 101 | include/rocksdb/snapshot.h, db/snapshot_impl.h | line-by-line (#2); second review (2026-11-06): is_write_conflict_boundary_ / oldest write-conflict snapshot |
 | `Db/SstFileWriter.cs` | 329 | include/rocksdb/sst_file_writer.h, table/sst_file_writer.cc | line-by-line (#2) |
 | `Db/TableCache.cs` | 263 | db/table_cache.cc, db/db_impl/db_impl.cc | line-by-line (#2); #3: records newest_key_time from opened readers |
 | `Db/TableFactory.cs` | 300 | table/table_builder.h, table/block_based/block_based_table_factory.cc, table/block_based/filter_policy.cc | line-by-line (feature audit: table prefix / comparators) |
@@ -204,9 +204,9 @@ changes there need their own review.
 | `Db/TransactionLogIterator.cs` | 396 | db/transaction_log_impl.cc | line-by-line (#3): wal_iterator_impl.cc (renamed from transaction_log_impl.cc); compaction-features pass: **fixed** sequence gap ends the run with NotFound (identical in 11.12) |
 | `Db/TransactionWriteContext.cs` | 60 | db/write_callback.h, db/db_impl/db_impl_write.cc | line-by-line (feature audit: transactions) |
 | `Db/UserWriteCallback.cs` | 22 | include/rocksdb/user_write_callback.h | line-by-line (feature audit: WAL filter / predecessor WALs / UserWriteCallback) |
-| `Db/Version.cs` | 199 | db/version_set.h, db/version_set.cc, db/version_builder.cc | line-by-line (#2) |
+| `Db/Version.cs` | 199 | db/version_set.h, db/version_set.cc, db/version_builder.cc | line-by-line (#2); second review (2026-11-06): VersionBuilder::CheckConsistency (force_consistency_checks) |
 | `Db/VersionEdit.cs` | 805 | db/version_edit.h, db/version_edit.{h,cc} | line-by-line (#1) |
-| `Db/VersionSet.cs` | 523 | db/version_set.cc, db/column_family.cc | line-by-line (#2) |
+| `Db/VersionSet.cs` | 523 | db/version_set.cc, db/column_family.cc | line-by-line (#2); second review (2026-11-06): consistency checks on LogAndApply / recovery, TuneMaxManifestFileSize, foreground relaxation, verify_manifest_content_on_close |
 | `Db/WalFilter.cs` | 87 | include/rocksdb/wal_filter.h, db/db_impl/db_impl_open.cc | line-by-line (feature audit: WAL filter / predecessor WALs / UserWriteCallback) |
 | `Db/Wide/WideColumnSerialization.cs` | 264 | db/wide/wide_column_serialization.{h,cc} | line-by-line (feature audit: user features (wide columns)) |
 | `Db/Wide/WideColumns.cs` | 140 | include/rocksdb/wide_columns.h, db/wide/wide_columns.cc | line-by-line (feature audit: user features (wide columns)) |

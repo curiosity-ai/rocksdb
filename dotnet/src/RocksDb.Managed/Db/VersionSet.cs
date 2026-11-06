@@ -210,6 +210,8 @@ internal sealed class VersionSet : IAsyncDisposable
             AllowIngestBehind = AllowIngestBehind(cfd),
             FullHistoryTsLow = cfd.FullHistoryTsLow,
         };
+        // VersionBuilder::SaveTo -> CheckConsistency of the recovered version (MANIFEST replay).
+        if (files is not null) VersionStorageInfo.CheckConsistency(cfd.Icmp, files, blobs, cfd.Options.ForceConsistencyChecks);
         var storage = new VersionStorageInfo(cfd.Icmp, Math.Max(cfd.NumLevels, files?.Length ?? 0), cfd.Options, files, blobs, context);
         var v = new DbVersion(cfd, storage, ++_versionNumber);
         InstallVersion(cfd, v);
@@ -456,6 +458,8 @@ internal sealed class VersionSet : IAsyncDisposable
                         VersionStorageInfo cur = cfd.Current.Storage;
                         newFiles[i] = cur.ApplyEdit(edit, cfd.NumLevels);
                         newBlobFiles[i] = Blob.BlobFileMetaData.Build(cur.BlobFiles, edit, newFiles[i]);
+                        // VersionBuilder::SaveTo -> CheckConsistency, before the edit is written.
+                        VersionStorageInfo.CheckConsistency(cfd.Icmp, newFiles[i], newBlobFiles[i], cfd.Options.ForceConsistencyChecks);
                         baseStats[i] = cur.AccumulatedStats;
                     }
                     // WalSet::AddWal fails for a WAL created twice: check before anything is written.
@@ -472,7 +476,7 @@ internal sealed class VersionSet : IAsyncDisposable
                     if (edit.LastSequence is ulong own && own > lastSeq) lastSeq = own;
                     tsSizes[i] = TimestampSizeOfEdit(edit);
                 }
-                newManifest = _manifest is null || (ulong)_manifestLog!.Log.File!.Size >= _db.Options.MaxManifestFileSize;
+                newManifest = _manifest is null || (ulong)_manifestLog!.Log.File!.Size >= EnforcedManifestLimit(editList);
                 if (newManifest)
                 {
                     snapshot = BuildSnapshotState();
@@ -500,7 +504,8 @@ internal sealed class VersionSet : IAsyncDisposable
                     manifestNumber = NewFileNumber();
                     snapshot!.NextFileNumber = CurrentNextFileNumber;
                     newLog = ManifestLogWriter.Create(_fs, FileNames.DescriptorFileName(_dbname, manifestNumber));
-                    var writer = new ManifestWriter(newLog);
+                    Wal.LogWriter sizeOf = newLog.Log;
+                    var writer = new ManifestWriter(newLog) { FileSizeProvider = () => (ulong)sizeOf.File!.Size };
                     // WriteCurrentStateToManifest (synced at the end).
                     await Await(writer.WriteSnapshotAsync(snapshot, TimestampSizeOfColumnFamily, cancellationToken), synchronous).ConfigureAwait(false);
                     ulong next = CurrentNextFileNumber;
@@ -510,6 +515,9 @@ internal sealed class VersionSet : IAsyncDisposable
                     await Await(FileNames.SetCurrentFileAsync(_fs, _dbname, manifestNumber, syncDirectory: true, cancellationToken), synchronous)
                         .ConfigureAwait(false);
                     ManifestLogWriter? old = _manifestLog;
+                    // ProcessManifestWrites: last_compacted_manifest_file_size_ = new_manifest_file_size (after the
+                    // batch's edits), then TuneMaxManifestFileSize().
+                    _lastCompactedManifestFileSize = (ulong)newLog.Log.File!.Size;
                     _manifestLog = newLog;
                     _manifest = writer;
                     newLog = null;
@@ -698,6 +706,45 @@ internal sealed class VersionSet : IAsyncDisposable
         return state;
     }
 
+    // last_compacted_manifest_file_size_: the size of the last newly written (compacted) MANIFEST, or the value of its
+    // kLastCompactedManifestFileSize record when recovered. Guarded by _manifestLock (read under the DB mutex too).
+    private ulong _lastCompactedManifestFileSize;
+
+    /// <summary>
+    /// VersionSet::TuneMaxManifestFileSize: max(max_manifest_file_size, last compacted size * (100 +
+    /// max_manifest_space_amp_pct) / 100) (computed from the live, mutable DB options).
+    /// </summary>
+    internal ulong TunedMaxManifestFileSize
+    {
+        get
+        {
+            ulong pct = (ulong)Math.Max(_db.Options.MaxManifestSpaceAmpPct, 0);
+            ulong last = _lastCompactedManifestFileSize;
+            ulong tuned = last > ulong.MaxValue / (100 + pct) ? ulong.MaxValue : last * (100 + pct) / 100;
+            return Math.Max(_db.Options.MaxManifestFileSize, tuned);
+        }
+    }
+
+    /// <summary>
+    /// ProcessManifestWrites: for MANIFEST write batches with any foreground operation (external file ingestion/import,
+    /// DeleteFilesInRange(s), column family create / drop), relax the size limit by 25% to reduce the likelihood of a
+    /// user operation blocking on MANIFEST rotation. Background-only batches rotate at the normal threshold.
+    /// </summary>
+    private ulong EnforcedManifestLimit(VersionEdit[] batch)
+    {
+        ulong limit = TunedMaxManifestFileSize;
+        foreach (VersionEdit e in batch)
+        {
+            if (e.IsForegroundOperation)
+            {
+                ulong relaxed = limit + limit / 4;
+                // don't keep in case of overflow
+                return Math.Max(limit, relaxed);
+            }
+        }
+        return limit;
+    }
+
     /// <summary>Recovers counters from a replayed MANIFEST (VersionEditHandler::CheckIterationResult).</summary>
     public void RecoverFrom(RecoveredVersionState state, ulong manifestFileNumber)
     {
@@ -718,6 +765,75 @@ internal sealed class VersionSet : IAsyncDisposable
         _wals.Clear();
         foreach (KeyValuePair<ulong, ulong?> w in state.Wals) _wals[w.Key] = w.Value;
         _minWalNumberToKeep = state.MinWalNumberToKeep;
+        // VersionEditHandler: edit.HasLastCompactedManifestFileSize() -> TuneMaxManifestFileSize().
+        _lastCompactedManifestFileSize = state.LastCompactedManifestFileSize ?? 0;
+    }
+
+    /// <summary>
+    /// The content validation of VersionSet::Close (verify_manifest_content_on_close): reads the current MANIFEST back,
+    /// checking every record's CRC and VersionEdit encoding. A corrupt MANIFEST is counted
+    /// (MANIFEST_VALIDATION_FAILURE_COUNT) and rewritten once (a new compacted MANIFEST via an empty edit), then checked
+    /// again; a second failure throws Corruption. Called by close before <see cref="DisposeAsync"/>.
+    /// </summary>
+    internal async ValueTask VerifyManifestContentOnCloseAsync(ColumnFamilyData defaultCfd)
+    {
+        // Loop up to 2 checks with 1 rewrite attempt in between, so we also verify the rewritten manifest is healthy.
+        const int MaxContentChecks = 2;
+        for (int check = 0; check < MaxContentChecks; check++)
+        {
+            string path;
+            await _manifestLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (_manifestLog is null) return;
+                // Re-read the manifest file name in case it was rotated by a rewrite.
+                path = FileNames.DescriptorFileName(_dbname, ManifestFileNumber);
+            }
+            finally
+            {
+                _manifestLock.Release();
+            }
+            bool corrupt = false;
+            try
+            {
+                using ManifestLogReader reader = ManifestLogReader.Open(_fs, path);
+                while (reader.TryReadRecord(out ReadOnlySpan<byte> record)) VersionEdit.DecodeFrom(record);
+            }
+            catch (RocksDbException e) when (e.Code == StatusCode.Corruption)
+            {
+                corrupt = true;
+            }
+            if (!corrupt) return; // Manifest is healthy, no need to check again
+            _db.Stats?.RecordTick(Ticker.ManifestValidationFailureCount);
+            if (check == 0)
+            {
+                // First check failed -- rewrite and verify again.
+                _db.LogError("MANIFEST content verification on Close failed, filename " + path + ", rewriting manifest");
+                await _manifestLock.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    if (_manifestLog is not null)
+                    {
+                        try { await _manifestLog.DisposeAsync().ConfigureAwait(false); }
+                        catch (Exception e) when (e is IOException or RocksDbException) { }
+                    }
+                    // The next LogAndApply writes a new MANIFEST (ProcessManifestWrites without descriptor_log_).
+                    _manifestLog = null;
+                    _manifest = null;
+                }
+                finally
+                {
+                    _manifestLock.Release();
+                }
+                await LogAndApplyAsync(defaultCfd, new VersionEdit(), synchronous: false, CancellationToken.None).ConfigureAwait(false);
+            }
+            else
+            {
+                // Rewritten manifest is also corrupt -- likely a recurring filesystem issue.
+                _db.LogError("MANIFEST content verification on Close failed again after rewrite, filename " + path);
+                ThrowHelper.Corruption("MANIFEST content verification failed after rewrite: " + path);
+            }
+        }
     }
 
     public async ValueTask DisposeAsync()

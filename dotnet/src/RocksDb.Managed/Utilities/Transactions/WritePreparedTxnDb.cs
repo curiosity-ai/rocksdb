@@ -722,7 +722,7 @@ internal sealed class WritePreparedTxnDb : SeqPerBatchHooks
     /// GetSnapshotInternal: a DB snapshot whose sequence is above future_max_evicted_seq (advancing the sequence with an
     /// empty transaction when needed), enhanced with min_uncommitted.
     /// </summary>
-    public override Snapshot GetSnapshot()
+    public override Snapshot GetSnapshot(bool isWriteConflictBoundary)
     {
         // Note: for this optimization setting the last sequence number and obtaining the smallest uncommitted seq should
         // be done atomically. However to avoid the mutex overhead, we call SmallestUnCommittedSeq BEFORE taking the
@@ -731,7 +731,7 @@ internal sealed class WritePreparedTxnDb : SeqPerBatchHooks
         // the value that would be obtained otherwise atomically. That is ok since this optimization works as long as
         // min_uncommitted is less than or equal than the smallest uncommitted seq when the snapshot was taken.
         ulong minUncommitted = SmallestUnCommittedSeq();
-        Snapshot snap = _db.GetSnapshotImpl();
+        Snapshot snap = _db.GetSnapshotImpl(isWriteConflictBoundary);
         ulong snapSeq = snap.SequenceNumber;
         // Note: Check against future_max_evicted_seq_ (in contrast with max_evicted_seq_) in case there is a concurrent
         // AdvanceMaxEvictedSeq.
@@ -746,7 +746,7 @@ internal sealed class WritePreparedTxnDb : SeqPerBatchHooks
             {
                 snap.Dispose();
                 AdvanceSeqByOne();
-                snap = _db.GetSnapshotImpl();
+                snap = _db.GetSnapshotImpl(isWriteConflictBoundary);
                 retry++;
             }
             if (snap.SequenceNumber <= max)

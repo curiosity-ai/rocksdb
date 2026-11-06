@@ -699,7 +699,7 @@ internal sealed partial class DbImpl
         {
             // WritePreparedTxnDB::NewIterator: the iterator reads at a snapshot (its own when none is given, released
             // with the iterator) through a read callback backed by that snapshot.
-            Snapshot? own = options?.Snapshot is null ? hooks.GetSnapshot() : null;
+            Snapshot? own = options?.Snapshot is null ? hooks.GetSnapshot(isWriteConflictBoundary: false) : null;
             Snapshot snap = options?.Snapshot ?? own!;
             try
             {

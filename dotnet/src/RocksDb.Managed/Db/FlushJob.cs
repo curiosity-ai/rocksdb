@@ -48,6 +48,7 @@ internal static class FlushJob
         bool synchronous, CancellationToken cancellationToken)
     {
         bool stripTimestamps = cfd.TimestampsInMemtableOnly;
+        ValidateFlushCompactionFilter(cfd);
         ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         // FlushJob::WriteLevel0Table: oldest_key_time = mems_.front()->ApproximateOldestKeyTime() (the oldest memtable,
         // whose first insert precedes every insert into the later ones: the minimum over all of them). It is not
@@ -158,6 +159,21 @@ internal static class FlushJob
             meta.UniqueId = new UniqueId64x2(id0, id1);
         }
         return meta;
+    }
+
+    /// <summary>
+    /// BuildTable (db/builder.cc): a filter the CF's compaction filter factory creates for the flush
+    /// (ShouldFilterTableFileCreation(kFlush)) must ignore snapshots, else the flush fails with NotSupported. Flush-time
+    /// filtering itself is not ported: such a filter is not applied (see README "Not ported yet").
+    /// </summary>
+    private static void ValidateFlushCompactionFilter(ColumnFamilyData cfd)
+    {
+        if (cfd.Options.CompactionFilterFactory is not { } factory || !factory.ShouldFilterTableFileCreation(isFlush: true)) return;
+        CompactionFilter? filter = factory.CreateCompactionFilter(new CompactionFilterContext(false, false, cfd.Id, IsFlush: true));
+        if (filter is not null && !filter.IgnoreSnapshots)
+        {
+            ThrowHelper.NotSupported(CompactionFilter.IgnoreSnapshotsFalseMessage);
+        }
     }
 
     /// <summary>

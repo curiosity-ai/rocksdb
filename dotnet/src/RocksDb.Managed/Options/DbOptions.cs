@@ -115,7 +115,24 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     /// like SanitizeOptions. With a non-zero value, writes with <see cref="WriteOptions.DisableWal"/> are rejected.
     /// </summary>
     public ulong RecycleLogFileNum { get; set; }
+    /// <summary>
+    /// max_manifest_file_size: the MANIFEST is rolled over (rewritten compacted) on reaching this size AND the space amp
+    /// limit of <see cref="MaxManifestSpaceAmpPct"/>. Mutable.
+    /// </summary>
     public ulong MaxManifestFileSize { get; set; } = 1024UL * 1024 * 1024;
+    /// <summary>
+    /// max_manifest_space_amp_pct: a new compacted MANIFEST is written once the current one exceeds
+    /// max(<see cref="MaxManifestFileSize"/>, last compacted size * (1 + pct/100)); foreground operations (ingestion,
+    /// import, DeleteFilesInRanges, column family create/drop) get 25% more. 500 (default) is about 0.2 write amp and up
+    /// to 5x space amp; 0 rewrites on every MANIFEST write (testing only); negative values act as 0. Mutable.
+    /// </summary>
+    public int MaxManifestSpaceAmpPct { get; set; } = 500;
+    /// <summary>
+    /// verify_manifest_content_on_close: on close, read the MANIFEST back and check every record's CRC and encoding;
+    /// a corrupt MANIFEST is rewritten once (and checked again), a second failure makes close fail with Corruption.
+    /// Mutable.
+    /// </summary>
+    public bool VerifyManifestContentOnClose { get; set; }
     public int TableCacheNumShardBits { get; set; } = 6;
     public ulong WalTtlSeconds { get; set; }
     public ulong WalSizeLimitMb { get; set; }
@@ -212,13 +229,6 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     public InfoLogLevel InfoLogLevel { get; set; } = InfoLogLevel.Info;
 
     // ---- RocksDB 11.x options (options/db_options.cc) that native 11.12 writes ----------------
-    /// <summary>
-    /// max_manifest_space_amp_pct: the MANIFEST is rewritten once its size exceeds the size of a compacted MANIFEST by this
-    /// percentage (bounded by <see cref="MaxManifestFileSize"/>). Default 500. Mutable.
-    /// </summary>
-    public int MaxManifestSpaceAmpPct { get; set; } = 500;
-    /// <summary>verify_manifest_content_on_close: re-read and verify the MANIFEST when the DB is closed. Default false. Mutable.</summary>
-    public bool VerifyManifestContentOnClose { get; set; }
     /// <summary>
     /// optimize_manifest_for_recovery: write MANIFEST records that make recovery faster. Typed and persisted only (listed
     /// under "Not ported yet"). Default false. Mutable.

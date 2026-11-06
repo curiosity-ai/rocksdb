@@ -568,6 +568,12 @@ public sealed class ManifestWriter
 
     public ManifestWriter(IManifestRecordWriter sink) => _sink = sink;
 
+    /// <summary>
+    /// The current size of the MANIFEST file being written. When set, <see cref="WriteSnapshotAsync"/> ends the
+    /// snapshot with a kLastCompactedManifestFileSize record (VersionSet::WriteCurrentStateToManifest).
+    /// </summary>
+    public Func<ulong>? FileSizeProvider { get; init; }
+
     /// <summary>Encodes and appends one edit (optionally syncing).</summary>
     public async ValueTask AddEditAsync(VersionEdit edit, int timestampSize, bool sync, CancellationToken cancellationToken)
     {
@@ -636,6 +642,16 @@ public sealed class ManifestWriter
         if (state.CommittedOptionsFileNumber is ulong opts)
         {
             await AddRecordAsync(new VersionEdit { CommittedOptionsFileNumber = opts }, 0, cancellationToken).ConfigureAwait(false);
+        }
+        if (FileSizeProvider is { } size)
+        {
+            // Record the approximate compacted manifest size so it's available at recovery time for
+            // TuneMaxManifestFileSize(). This record comes last in WriteCurrentStateToManifest (the managed writer's
+            // next_file_number record that follows belongs to the batch edit upstream). Include a rough estimate of this
+            // record's own size (~15 bytes for the VersionEdit payload + log record header).
+            const ulong EstimatedRecordOverhead = 15;
+            var lcm = new VersionEdit { LastCompactedManifestFileSize = size() + EstimatedRecordOverhead };
+            await AddRecordAsync(lcm, 0, cancellationToken).ConfigureAwait(false);
         }
         var tail = new VersionEdit { NextFileNumber = state.NextFileNumber, LastSequence = state.LastSequence, MaxColumnFamily = state.MaxColumnFamily };
         if (state.PrevLogNumber != 0) tail.PrevLogNumber = state.PrevLogNumber;

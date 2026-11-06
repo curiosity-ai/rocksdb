@@ -12,8 +12,8 @@ namespace RocksDb.Managed.Db;
 /// Read-triggered compaction (PickReadTriggeredCompaction) picks the files marked from the sampled reads
 /// (monitoring/file_read_sample.h, VersionStorageInfo::ComputeFilesMarkedForReadTriggeredCompaction).
 /// Not ported: standalone range tombstone files (FileIsStandAloneRangeTombstone needs the
-/// per-file entry counts, which the port does not keep: such files are treated like other marked files), multiple
-/// db_paths (GetPathId returns 0). require_max_output_level is used by the bottom-priority repick of
+/// per-file entry counts, which the port does not keep: such files are treated like other marked files).
+/// Outputs are placed on db_paths with GetUniversalPathId. require_max_output_level is used by the bottom-priority repick of
 /// reduce_file_locking (DBImpl::BackgroundCompaction). REQUIRES: DB mutex.
 /// </para>
 /// </summary>
@@ -279,7 +279,9 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         // intra L0 compactions outputs could have overlap
         if (outputLevel != 0 && FilesRangeOverlapWithCompaction(b.Vstorage, inputs, outputLevel)) return null;
         CompactionReason reason = maxNumberOfFilesToCompact == uint.MaxValue ? CompactionReason.UniversalSizeRatio : CompactionReason.UniversalSortedRunNum;
-        return Create(b, inputs, outputLevel, grandparents, reason, enableCompression);
+        ulong estimatedTotalSize = 0;
+        for (int i = 0; i < firstIndexAfter; i++) estimatedTotalSize += runs[i].Size;
+        return Create(b, inputs, outputLevel, grandparents, reason, enableCompression, GetUniversalPathId(estimatedTotalSize));
     }
 
     /// <summary>
@@ -487,7 +489,8 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         while (inputs.Count > 1 && inputs[0].IsEmpty) inputs.RemoveAt(0);
         // intra L0 compactions outputs could have overlap
         if (outputLevel != 0 && FilesRangeOverlapWithCompaction(b.Vstorage, inputs, outputLevel)) return null;
-        return Create(b, DropEmptyInnerLevels(inputs), outputLevel, new List<FileMetaData>(), CompactionReason.UniversalSizeAmplification, true);
+        // PickIncrementalForReduceSizeAmp: path_id = 0.
+        return Create(b, DropEmptyInnerLevels(inputs), outputLevel, new List<FileMetaData>(), CompactionReason.UniversalSizeAmplification, true, 0);
     }
 
     /// <summary>
@@ -613,8 +616,10 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         {
             inputs.Add(startLevelInputs);
         }
+        ulong estimatedTotalSize = 0;
+        foreach (FileMetaData f in vstorage.LevelFiles(outputLevel)) estimatedTotalSize += f.FileSize;
         // GetCompressionType(vstorage, mutable_cf_options, output_level, 1): compression always enabled.
-        return Create(b, inputs.ToArray(), outputLevel, grandparents, reason, true);
+        return Create(b, inputs.ToArray(), outputLevel, grandparents, reason, true, GetUniversalPathId(estimatedTotalSize));
     }
 
     /// <summary>
@@ -669,7 +674,9 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         if (outputLevel != 0 && FilesRangeOverlapWithCompaction(b.Vstorage, inputs, outputLevel)) return null;
         // We never check size for compaction_options_universal.compression_size_percent, because we always compact all
         // the files, so always compress.
-        return Create(b, inputs, outputLevel, new List<FileMetaData>(), reason, true);
+        ulong estimatedTotalSize = 0;
+        for (int i = startIndex; i <= endIndex; i++) estimatedTotalSize += runs[i].Size;
+        return Create(b, inputs, outputLevel, new List<FileMetaData>(), reason, true, GetUniversalPathId(estimatedTotalSize));
     }
 
     /// <summary>`std::vector&lt;CompactionInputFiles&gt; inputs(max_output_level + 1)` with levels start_level + i.</summary>
@@ -703,12 +710,12 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
     /// periodic compactions) and the compression switch.
     /// </summary>
     private Compaction Create(Builder b, IReadOnlyList<CompactionInputFiles> inputs, int outputLevel, List<FileMetaData> grandparents,
-        CompactionReason reason, bool enableCompression)
+        CompactionReason reason, bool enableCompression, uint pathId)
     {
         CompactionInputFiles[] compact = DropEmptyInnerLevels(inputs);
         bool trivial = Options.CompactionOptionsUniversal.AllowTrivialMove && reason != CompactionReason.PeriodicCompaction
             && IsInputFilesNonOverlapping(compact);
-        var c = new Compaction(b.Vstorage, Options, compact, outputLevel, MaxFileSizeForLevel(Options, outputLevel, 1), GetMaxOverlappingBytes(), 0,
+        var c = new Compaction(b.Vstorage, Options, compact, outputLevel, MaxFileSizeForLevel(Options, outputLevel, 1), GetMaxOverlappingBytes(), pathId,
             enableCompression ? GetCompressionType(b.Vstorage, Options, outputLevel, 1) : Compression.CompressionType.None, grandparents, reason,
             b.Score, l0FilesMightOverlap: true, isManual: false)
         {

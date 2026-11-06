@@ -142,7 +142,10 @@ internal sealed partial class DbImpl
         {
             FileSystem.CreateDirectoryIfMissing(DbName);
             if (WalDir != DbName) FileSystem.CreateDirectoryIfMissing(WalDir);
-            for (int i = 1; i < DbPaths.Count; i++) FileSystem.CreateDirectoryIfMissing(DbPaths[i]);
+            foreach (string path in DbPaths)
+            {
+                if (path != DbName) FileSystem.CreateDirectoryIfMissing(path);
+            }
         }
         try
         {
@@ -317,9 +320,10 @@ internal sealed partial class DbImpl
         if (Options.PersistStatsToDisk) await InitPersistStatsColumnFamilyAsync(synchronous, ct).ConfigureAwait(false);
 
         StartSstFileManager();
-        DeleteObsoleteFilesFullScan();
+        DeleteObsoleteFilesFullScan(atOpen: true);
         await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
-        DeleteObsoleteFilesFullScan();
+        DeleteObsoleteFilesFullScan(atOpen: true);
+        lock (_mutex) _deleteObsoleteFilesLastRun = DateTime.UtcNow.Ticks / 10;
         LogOpenSummary();
         LogInfo("DB pointer " + GetHashCode().ToString("x", CultureInfo.InvariantCulture) + " opened " + DbName);
         StartStatsDump();

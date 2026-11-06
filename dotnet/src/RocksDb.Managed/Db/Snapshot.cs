@@ -32,6 +32,13 @@ namespace RocksDb.Managed
         /// </summary>
         internal ulong MinUncommitted = ReadCallback.MinUnCommittedSeq;
 
+        /// <summary>
+        /// SnapshotImpl::is_write_conflict_boundary_: taken by a transaction for write-conflict checking
+        /// (DBImpl::GetSnapshotForWriteConflictBoundary). Compaction keeps a record of every write newer than the
+        /// oldest such snapshot (a SingleDelete + Put pair is not dropped). Set before the snapshot is linked.
+        /// </summary>
+        internal bool IsWriteConflictBoundary;
+
         /// <summary>Creation time (Unix seconds).</summary>
         public long UnixTime { get; }
 
@@ -99,6 +106,16 @@ namespace RocksDb.Managed.Db
                 // Avoid duplicates
                 if (result.Count == 0 || result[^1] != s.SequenceNumber) result.Add(s.SequenceNumber);
             }
+        }
+
+        /// <summary>The oldest write-conflict-boundary snapshot's sequence (kMaxSequenceNumber if none): the oldest_write_conflict_snapshot output of SnapshotList::GetAll.</summary>
+        public ulong OldestWriteConflictSequence()
+        {
+            for (Snapshot? s = _list.Next; s != _list; s = s!.Next)
+            {
+                if (s!.IsWriteConflictBoundary) return s.SequenceNumber;
+            }
+            return DbFormat.MaxSequenceNumber;
         }
 
         /// <summary>Oldest snapshot sequence, or <paramref name="defaultValue"/> when there are none (GetOldestSnapshotSequence).</summary>

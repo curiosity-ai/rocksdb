@@ -24,7 +24,7 @@ internal sealed partial class DbImpl
     /// <summary>cf_mutable_options_type_info names supported by the managed options model.</summary>
     internal static readonly HashSet<string> MutableCfOptionNames = new(StringComparer.Ordinal)
     {
-        "report_bg_io_stats", "disable_auto_compactions", "paranoid_file_checks", "soft_pending_compaction_bytes_limit",
+        "report_bg_io_stats", "disable_auto_compactions", "paranoid_file_checks", "verify_output_flags", "soft_pending_compaction_bytes_limit",
         "hard_pending_compaction_bytes_limit", "max_compaction_bytes", "level0_file_num_compaction_trigger",
         "level0_slowdown_writes_trigger", "level0_stop_writes_trigger", "max_write_buffer_number", "target_file_size_multiplier",
         "arena_block_size", "inplace_update_num_locks", "max_successive_merges", "memtable_huge_page_size", "write_buffer_size",

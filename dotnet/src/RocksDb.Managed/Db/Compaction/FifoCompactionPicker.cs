@@ -302,7 +302,8 @@ internal sealed class FifoCompactionPicker : CompactionPicker
 
     /// <summary>Port of FIFOCompactionPicker::PickCompactionForCompactRange: runs the regular picker.</summary>
     public override Compaction? PickCompactionForCompactRange(VersionStorageInfo vstorage, int inputLevel, int outputLevel, uint maxSubcompactions,
-        byte[]? begin, byte[]? end, out byte[]? compactionEnd, out bool manualConflict, ulong maxFileNumToIgnore, bool disallowTrivialMove)
+        byte[]? begin, byte[]? end, out byte[]? compactionEnd, out bool manualConflict, ulong maxFileNumToIgnore, bool disallowTrivialMove,
+        uint targetPathId)
     {
         compactionEnd = null;
         manualConflict = false;

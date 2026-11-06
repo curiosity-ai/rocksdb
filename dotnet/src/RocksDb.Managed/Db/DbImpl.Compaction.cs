@@ -533,6 +533,15 @@ internal sealed partial class DbImpl
         return a;
     }
 
+    /// <summary>
+    /// The oldest live write-conflict-boundary snapshot (kMaxSequenceNumber if none), as SnapshotList::GetAll reports
+    /// it in oldest_write_conflict_snapshot. REQUIRES: mutex.
+    /// </summary>
+    private ulong OldestWriteConflictSnapshot()
+    {
+        return _snapshots.OldestWriteConflictSequence();
+    }
+
     /// <summary>Live snapshot sequence numbers, ascending. REQUIRES: mutex.</summary>
     private ulong[] SnapshotsForCompaction()
     {
@@ -761,6 +770,7 @@ internal sealed partial class DbImpl
         bool ok = false;
         CompactionJob? job = null;
         RemoteCompactionOutcome? remote = null;
+        List<ulong>? copiedFiles = null;
         Exception? failure = null;
         long compactionStart = 0;
         int jobId = 0;
@@ -781,9 +791,22 @@ internal sealed partial class DbImpl
             {
                 c.AddInputDeletions(edit);
             }
+            else if (c.IsTrivialCopyCompaction)
+            {
+                // BackgroundCompaction: is_trivial_copy_compaction (FIFO kChangeTemperature with
+                // allow_trivial_copy_when_change_temperature): byte copies of the inputs with the new temperature.
+                copiedFiles = new List<ulong>();
+                CopyTrivialCompactionFiles(c, edit, copiedFiles, ct);
+            }
             else if (c.IsTrivialMove())
             {
                 // Move the files to the next level without rewriting them (BackgroundCompaction trivial move branch).
+                // A trivially moved round-robin size compaction advances the compact cursor too (kLevelMaxLevelSize
+                // only; db_impl_compaction_flush.cc BackgroundCompaction).
+                if (c.Reason == CompactionReason.LevelMaxLevelSize && cfd.Options.CompactionPri == CompactionPri.RoundRobin && c.StartLevel > 0)
+                {
+                    lock (_mutex) edit.CompactCursors.Add(new CompactCursor(c.StartLevel, c.InputStorage.GetNextCompactCursor(c.StartLevel, c.Inputs(0).Count)));
+                }
                 for (int l = 0; l < c.NumInputLevels; l++)
                 {
                     if (c.Level(l) == c.OutputLevel) continue;
@@ -802,6 +825,11 @@ internal sealed partial class DbImpl
                 SnapshotChecker? checker = CurrentSnapshotChecker;
                 Snapshot? jobSnapshot = null;
                 ulong[] jobSnapshots = snapshots;
+                // LoadSnapshots(&snapshot_seqs, &earliest_write_conflict_snapshot): the oldest transaction snapshot. A
+                // write-conflict-boundary snapshot taken after the snapshot list was loaded is newer than every input
+                // entry, so reading it here instead of with the list keeps every pair the conflict check can need.
+                ulong earliestWriteConflict;
+                lock (_mutex) earliestWriteConflict = OldestWriteConflictSnapshot();
                 if (checker is not null)
                 {
                     // GetSnapshotContext: the snapshot list is taken with the job snapshot, not when the compaction was
@@ -835,6 +863,7 @@ internal sealed partial class DbImpl
                     {
                         SnapshotChecker = checker,
                         JobSnapshot = jobSnapshot?.SequenceNumber ?? 0,
+                        EarliestWriteConflictSnapshot = earliestWriteConflict,
                         AcquireSubcompactionResources = n => AcquireSubcompactionResources(n, bottom),
                         ReleaseSubcompactionResources = n => ReleaseSubcompactionResources(n, bottom),
                     };
@@ -948,6 +977,10 @@ internal sealed partial class DbImpl
                 {
                     foreach (ulong n in remote.CreatedFileNumbers) _pendingOutputs.Remove(n);
                 }
+                if (copiedFiles is not null)
+                {
+                    foreach (ulong n in copiedFiles) _pendingOutputs.Remove(n);
+                }
                 cfd.CompactionState.Picker.ReleaseCompactionFiles(c, ok);
                 ReleaseCompactionRoom(c);
                 if (c.InputVersion is not null) Versions.UnrefVersion(c.InputVersion);
@@ -963,6 +996,10 @@ internal sealed partial class DbImpl
             if (!ok && remote is not null)
             {
                 foreach (ulong n in remote.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
+            }
+            if (!ok && copiedFiles is not null)
+            {
+                foreach (ulong n in copiedFiles) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
             }
             if (job is not null)
             {
@@ -1042,6 +1079,58 @@ internal sealed partial class DbImpl
     /// its inputs in the input version's compaction-priority order -- in the version edit (persisted in the MANIFEST).
     /// Trivial moves don't run a compaction job and leave the cursor unchanged, as upstream.
     /// </summary>
+    /// <summary>
+    /// Port of DBImpl::CopyTrivialCompactionFiles (db_impl_compaction_flush.cc): copies each input file byte for byte
+    /// (trivial_copy_buffer_size reads, IO_LOW, synced) to a new file number with the compaction's output temperature,
+    /// and replaces the input by the copy at the same level in <paramref name="edit"/>. The copy keeps the input's
+    /// metadata (boundaries, seqnos, unique id, oldest ancestor time, ...) with a new creation time, the compaction's
+    /// epoch number and its own file checksum. <paramref name="created"/> receives the new file numbers (pending
+    /// outputs).
+    /// </summary>
+    private void CopyTrivialCompactionFiles(Compaction c, VersionEdit edit, List<ulong> created, CancellationToken ct)
+    {
+        int bufferSize = (int)Math.Clamp(c.Options.CompactionOptionsFifo.TrivialCopyBufferSize, 1UL, 64UL << 20);
+        byte[] buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(bufferSize);
+        try
+        {
+            Temperature temperature = c.GetOutputTemperature(isProximalLevel: false);
+            foreach (FileMetaData input in c.Inputs(0).Files)
+            {
+                ct.ThrowIfCancellationRequested();
+                ulong number = NewPendingOutputFileNumber();
+                created.Add(number);
+                string inPath = FileNames.TableFileName(DbPaths, input.FileNumber, input.PathId);
+                string outPath = FileNames.TableFileName(DbPaths, number, c.OutputPathId);
+                byte[] checksum;
+                string checksumFunc;
+                using (Env.ISequentialFile src = FileSystem.OpenSequential(inPath))
+                using (Env.IWritableFile dst = FileChecksumHelper.CreateWritable(FileSystem, outPath, TableFileWriteOptions(Env.IoPriority.Low)))
+                {
+                    int n;
+                    while ((n = src.Read(buffer.AsSpan(0, bufferSize))) > 0) dst.Append(buffer.AsSpan(0, n));
+                    dst.Sync();
+                    (checksum, checksumFunc) = FileChecksumHelper.GetChecksum(dst);
+                }
+                FileMetaData copy = input.Clone();
+                copy.FileNumber = number;
+                copy.PathId = c.OutputPathId;
+                copy.MarkedForCompaction = false;
+                copy.Temperature = temperature;
+                copy.FileCreationTime = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                copy.EpochNumber = c.MinInputFileEpochNumber();
+                copy.FileChecksum = checksum;
+                copy.FileChecksumFuncName = checksumFunc;
+                edit.DeleteFile(c.StartLevel, input.FileNumber);
+                edit.AddFile(c.StartLevel, copy);
+            }
+            FileSystem.SyncDirectory(DbPaths[(int)Math.Min(c.OutputPathId, (uint)(DbPaths.Count - 1))]);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
     private void AddCompactCursorEdit(ColumnFamilyData cfd, Compaction c, VersionEdit edit)
     {
         if ((c.Reason is CompactionReason.LevelMaxLevelSize or CompactionReason.RoundRobinTtl) && cfd.Options.CompactionPri == CompactionPri.RoundRobin
@@ -1332,7 +1421,7 @@ internal sealed partial class DbImpl
                     {
                         c = cfd.CompactionState.Picker.PickCompactionForCompactRange(cfd.Current.Storage, inputLevel, outputLevel,
                             options.MaxSubcompactions, beginKey, endKey, out compactionEnd, out conflict, maxFileNumToIgnore,
-                            disallowTrivialMove || options.TrimTs is not null);
+                            disallowTrivialMove || options.TrimTs is not null, options.TargetPathId);
                     }
                     if (!conflict)
                     {
@@ -1510,54 +1599,131 @@ internal sealed partial class DbImpl
         CancellationToken cancellationToken)
     {
         if (targetLevel >= cfd.NumLevels) ThrowHelper.InvalidArgument("Target level exceeds number of levels");
-        if (!alreadyExclusive) await BeginExclusiveManualAsync(synchronous, cancellationToken).ConfigureAwait(false);
+        // DBImpl::CompactRange: DisableManualCompaction + PauseBackgroundWork around ReFitLevel, so that no other
+        // manual or automatic compaction runs on the files while they move (concurrent manual compactions fail with
+        // Incomplete(kManualCompactionPaused)). Flushes are not paused: they only add level-0 files with newer epoch
+        // numbers, and the refit range is registered below like upstream's RegisterCompaction.
+        await DisableManualCompactionAsync(synchronous, cancellationToken).ConfigureAwait(false);
         try
         {
-            // Wait until no other compaction runs (the files must not be in a compaction).
-            while (true)
+            if (!alreadyExclusive) await BeginExclusiveManualAsync(synchronous, cancellationToken).ConfigureAwait(false);
+            try
             {
-                Task wait;
-                lock (_mutex)
-                {
-                    if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0) break;
-                    wait = _bgSignal.Task;
-                }
-                if (synchronous) wait.Wait(cancellationToken);
-                else await wait.WaitAsync(cancellationToken).ConfigureAwait(false);
+                await ReFitLevelPausedAsync(cfd, level, targetLevel, synchronous, cancellationToken).ConfigureAwait(false);
             }
-            var edit = new VersionEdit { ColumnFamily = cfd.Id };
-            lock (_mutex)
+            finally
             {
-                VersionStorageInfo vs = cfd.Current.Storage;
-                int toLevel = targetLevel < 0 ? FindMinimumEmptyLevelFitting(vs, level) : targetLevel;
-                if (toLevel == level || vs.NumLevelFiles(level) == 0) return;
-                if (toLevel > level)
-                {
-                    if (level == 0) ThrowHelper.NotSupported("Cannot change from level 0 to other levels.");
-                    for (int l = level + 1; l <= toLevel; l++)
-                    {
-                        if (vs.NumLevelFiles(l) > 0) ThrowHelper.NotSupported("Levels between source and target are not empty for a move.");
-                    }
-                }
-                else
-                {
-                    for (int l = toLevel; l < level; l++)
-                    {
-                        if (vs.NumLevelFiles(l) > 0) ThrowHelper.NotSupported("Levels between source and target are not empty for a move.");
-                    }
-                }
-                foreach (FileMetaData f in vs.LevelFiles(level))
-                {
-                    edit.DeleteFile(level, f.FileNumber);
-                    edit.AddFile(toLevel, f.Clone());
-                }
+                if (!alreadyExclusive) EndExclusiveManual();
             }
-            await Versions.LogAndApplyAsync(cfd, edit, synchronous, () => InstallSuperVersion(cfd), cancellationToken).ConfigureAwait(false);
         }
         finally
         {
-            if (!alreadyExclusive) EndExclusiveManual();
+            EnableManualCompaction();
         }
+    }
+
+    private bool _refittingLevel; // refitting_level_. Guarded by mutex.
+
+    /// <summary>
+    /// DBImpl::ReFitLevel with background work paused: waits for running compactions, validates the move, registers a
+    /// kRefitLevel compaction over the files (marks them being compacted, so no compaction picked while LogAndApply has
+    /// released the mutex takes them) and applies the MANIFEST-only edit.
+    /// </summary>
+    private async ValueTask ReFitLevelPausedAsync(ColumnFamilyData cfd, int level, int targetLevel, bool synchronous, CancellationToken cancellationToken)
+    {
+        Compaction? c = null;
+        var edit = new VersionEdit { ColumnFamily = cfd.Id };
+        while (true)
+        {
+            Task wait;
+            lock (_mutex)
+            {
+                // PauseBackgroundWork: wait until no other compaction runs (the files must not be in a compaction).
+                if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0)
+                {
+                    c = PrepareReFitLevel(cfd, level, targetLevel, edit);
+                    if (c is null) return;
+                    break;
+                }
+                wait = _bgSignal.Task;
+            }
+            if (synchronous) wait.Wait(cancellationToken);
+            else await wait.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        TestHooks.Invoke("DBImpl::ReFitLevel:PostRegisterCompaction");
+        try
+        {
+            await Versions.LogAndApplyAsync(cfd, edit, synchronous, () => InstallSuperVersion(cfd), CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_mutex)
+            {
+                c.MarkFilesBeingCompacted(false);
+                cfd.CompactionState.Picker.UnregisterCompaction(c);
+                _refittingLevel = false;
+                MaybeScheduleCompaction();
+            }
+        }
+    }
+
+    /// <summary>
+    /// The checks of DBImpl::ReFitLevel and its RegisterCompaction: fills <paramref name="edit"/> and returns the
+    /// registered compaction, or null when there is nothing to move. Throws NotSupported / Aborted like upstream.
+    /// REQUIRES: mutex.
+    /// </summary>
+    private Compaction? PrepareReFitLevel(ColumnFamilyData cfd, int level, int targetLevel, VersionEdit edit)
+    {
+        VersionStorageInfo vs = cfd.Current.Storage;
+        if (vs.NumLevelFiles(level) == 0) return null;
+        // only allow one thread refitting
+        if (_refittingLevel) ThrowHelper.NotSupported("another thread is refitting");
+        int toLevel = targetLevel < 0 ? FindMinimumEmptyLevelFitting(vs, level) : targetLevel;
+        if (toLevel == level) return null;
+        CompactionPicker picker = cfd.CompactionState.Picker;
+        var input = new CompactionInputFiles(level, new List<FileMetaData>(vs.LevelFiles(level).ToArray()));
+        picker.GetRange(input, out byte[] smallest, out byte[] largest);
+        ReadOnlySpan<byte> smallestUser = DbFormat.ExtractUserKey(smallest);
+        ReadOnlySpan<byte> largestUser = DbFormat.ExtractUserKey(largest);
+        int from, to;
+        if (toLevel > level)
+        {
+            if (level == 0) ThrowHelper.NotSupported("Cannot change from level 0 to other levels.");
+            from = level + 1;
+            to = toLevel;
+        }
+        else
+        {
+            if (toLevel == 0 && input.Count > 1)
+            {
+                throw new RocksDbException(StatusCode.Aborted,
+                    "Moving more than 1 file from non-L0 to L0 is not allowed as it does not bring any benefit to read nor write throughput.");
+            }
+            from = toLevel;
+            to = level - 1;
+        }
+        // Check levels are empty for a trivial move
+        for (int l = from; l <= to; l++)
+        {
+            if (vs.NumLevelFiles(l) > 0) ThrowHelper.NotSupported("Levels between source and target are not empty for a move.");
+            if (picker.RangeOverlapWithCompaction(smallestUser, largestUser, l, rangeLimitExclusive: false))
+            {
+                ThrowHelper.NotSupported("Levels between source and target will have some ongoing compaction's output.");
+            }
+        }
+        foreach (FileMetaData f in input.Files)
+        {
+            // The files must not be in a compaction (upstream guarantees it with PauseBackgroundWork).
+            if (f.BeingCompacted) ThrowHelper.NotSupported("Files of the refit level are being compacted.");
+            edit.DeleteFile(level, f.FileNumber);
+            edit.AddFile(toLevel, f.Clone());
+        }
+        ColumnFamilyOptions o = cfd.Options;
+        var c = new Compaction(vs, o, [input], toLevel, CompactionPicker.MaxFileSizeForLevel(o, toLevel, vs.BaseLevel), long.MaxValue, 0,
+            o.Compression, new List<FileMetaData>(), CompactionReason.RefitLevel, -1, l0FilesMightOverlap: false, isManual: false);
+        picker.RegisterCompaction(c);
+        _refittingLevel = true;
+        return c;
     }
 
     /// <summary>Waits until no compaction is running or pending (test/diagnostic helper, like TEST_WaitForCompact).</summary>

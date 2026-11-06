@@ -169,7 +169,7 @@ public sealed class DynamicOptionsTests
             P("fast_sst_open", "true")]);
         ColumnFamilyOptions o = db.DefaultColumnFamily.Options;
         Assert.AreEqual(2u, o.MemtableMaxRangeDeletions);
-        Assert.AreEqual(VerifyOutputFlags.VerifyBlockChecksum | VerifyOutputFlags.EnableForLocalCompaction, o.VerifyOutputFlags);
+        Assert.AreEqual(VerifyOutputFlags.BlockChecksum | VerifyOutputFlags.EnableForLocalCompaction, o.VerifyOutputFlags);
         Assert.AreEqual(3, o.BlobCompressionOpts.Level);
         Assert.IsTrue(o.CompressionOpts.AutoSkip);
         OptionsFile f = LatestOptions(fs);

@@ -54,13 +54,21 @@ internal sealed partial class DbImpl : IAsyncDisposable
         // FileSystemTracingWrapper (DBImpl::fs_): records file operations while an IO trace runs.
         FileSystem = new Tracing.IoTracingFileSystem(options.FileSystem, IoTracer);
         WalDir = string.IsNullOrEmpty(options.WalDir) ? dbname : options.WalDir.TrimEnd('/');
-        var paths = new List<string> { dbname };
-        foreach ((string p, _) in options.DbPaths)
+        // SanitizeOptions (db_impl_open.cc): db_paths as given (path id i = db_paths[i]), or {dbname, UINT64_MAX}.
+        var paths = new List<string>();
+        var targetSizes = new List<ulong>();
+        foreach ((string p, ulong targetSize) in options.DbPaths)
         {
-            if (paths.Count == 1 && p.TrimEnd('/') == dbname) continue;
             paths.Add(p.TrimEnd('/'));
+            targetSizes.Add(targetSize);
+        }
+        if (paths.Count == 0)
+        {
+            paths.Add(dbname);
+            targetSizes.Add(ulong.MaxValue);
         }
         DbPaths = paths;
+        DbPathTargetSizes = targetSizes;
         Versions = new VersionSet(this, FileSystem, dbname);
         ErrorHandler = new ErrorHandler(this);
         _allowConcurrentMemtableWrite = options.AllowConcurrentMemtableWrite;
@@ -123,6 +131,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
     public IFileSystem FileSystem { get; }
     public string WalDir { get; }
     public IReadOnlyList<string> DbPaths { get; }
+
+    /// <summary>The target sizes of <see cref="DbPaths"/> (DbPath::target_size; the DB directory's is unlimited).</summary>
+    internal IReadOnlyList<ulong> DbPathTargetSizes { get; }
     public VersionSet Versions { get; }
     private Cache.BlockCache? _defaultBlockCache;
     private readonly Lock _defaultBlockCacheLock = new();
@@ -317,17 +328,34 @@ internal sealed partial class DbImpl : IAsyncDisposable
 
     public Snapshot GetSnapshot()
     {
-        if (_txnHooks is { } hooks) return hooks.GetSnapshot();
-        return GetSnapshotImpl();
+        if (_txnHooks is { } hooks) return hooks.GetSnapshot(isWriteConflictBoundary: false);
+        return GetSnapshotImpl(isWriteConflictBoundary: false);
+    }
+
+    /// <summary>
+    /// DBImpl::GetSnapshotForWriteConflictBoundary: a snapshot that transactions use for write-conflict checking.
+    /// Compaction does not drop a SingleDelete + Put pair newer than the oldest such snapshot, so the conflict check
+    /// still sees the write (CompactionIterator earliest_write_conflict_snapshot).
+    /// </summary>
+    internal Snapshot GetSnapshotForWriteConflictBoundary()
+    {
+        if (_txnHooks is { } hooks) return hooks.GetSnapshot(isWriteConflictBoundary: true);
+        return GetSnapshotImpl(isWriteConflictBoundary: true);
     }
 
     /// <summary>DBImpl::GetSnapshotImpl: a snapshot at the last sequence (without transaction-DB enhancements).</summary>
-    internal Snapshot GetSnapshotImpl()
+    internal Snapshot GetSnapshotImpl() => GetSnapshotImpl(isWriteConflictBoundary: false);
+
+    /// <summary>DBImpl::GetSnapshotImpl(is_write_conflict_boundary).</summary>
+    internal Snapshot GetSnapshotImpl(bool isWriteConflictBoundary)
     {
         ThrowIfDisposed();
         lock (_mutex)
         {
-            var s = new Snapshot(this, LastPublishedSequence, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            var s = new Snapshot(this, LastPublishedSequence, DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+            {
+                IsWriteConflictBoundary = isWriteConflictBoundary,
+            };
             _snapshots.Add(s);
             return s;
         }
@@ -661,13 +689,41 @@ internal sealed partial class DbImpl : IAsyncDisposable
         foreach (ulong n in wals) DeleteOrArchiveWal(n);
         foreach (ulong n in manifests) TryDeleteFile(FileNames.DescriptorFileName(DbName, n));
         PurgeObsoleteWalFiles(force: false);
+        if (FullScanDue()) DeleteObsoleteFilesFullScan(atOpen: false);
+    }
+
+    // delete_obsolete_files_last_run_ (UTC microseconds). Guarded by mutex.
+    private long _deleteObsoleteFilesLastRun;
+
+    /// <summary>
+    /// FindObsoleteFiles(force = false): a full scan of the DB directories is due when delete_obsolete_files_period_micros
+    /// is 0 or has elapsed since the last one (which then becomes now).
+    /// </summary>
+    private bool FullScanDue()
+    {
+        ulong period = Options.DeleteObsoleteFilesPeriodMicros;
+        long now = DateTime.UtcNow.Ticks / 10;
+        lock (_mutex)
+        {
+            if (_readOnly || FileDeletionsDisabled) return false;
+            if (period == 0) return true;
+            if (_deleteObsoleteFilesLastRun + (long)Math.Min(period, (ulong)long.MaxValue / 2) < now)
+            {
+                _deleteObsoleteFilesLastRun = now;
+                return true;
+            }
+            return false;
+        }
     }
 
     /// <summary>
-    /// Full scan variant used at open (FindObsoleteFiles(force = true)): any table file that is not live, old
-    /// MANIFESTs, temp files and WALs that hold no unflushed data are deleted; only the two newest OPTIONS files are kept.
+    /// Full scan (FindObsoleteFiles with doing_the_full_scan): any table / blob file that is not live or a pending
+    /// output, old MANIFESTs and WALs that hold no unflushed data are deleted; only the two newest OPTIONS files are kept.
+    /// At open (<paramref name="atOpen"/>) temp files and every MANIFEST but the current one go too. Periodic scans of an
+    /// open DB keep MANIFESTs newer than the current one (a new MANIFEST being written: number &gt;= manifest_file_number)
+    /// and temp files (CURRENT / OPTIONS being written; the managed port does not register them as pending outputs).
     /// </summary>
-    private void DeleteObsoleteFilesFullScan()
+    private void DeleteObsoleteFilesFullScan(bool atOpen)
     {
         var toDelete = new List<string>();
         var options = new List<(ulong Number, string Path)>();
@@ -678,6 +734,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
             if (FileDeletionsDisabled || _readOnly) return;
             minLog = MinLogNumberToKeepForDeletion();
             var dirs = new List<string>(DbPaths);
+            // FindObsoleteFiles: the DB directory (MANIFEST, OPTIONS, ...) even when db_paths does not name it.
+            if (!dirs.Contains(DbName)) dirs.Add(DbName);
             if (!dirs.Contains(WalDir)) dirs.Add(WalDir);
             foreach (string dir in dirs)
             {
@@ -700,10 +758,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
                                 toDelete.Add(full);
                             break;
                         case FileType.DescriptorFile:
-                            if (dir == DbName && number != Versions.ManifestFileNumber) toDelete.Add(full);
+                            if (dir == DbName && (atOpen ? number != Versions.ManifestFileNumber : number < Versions.ManifestFileNumber)) toDelete.Add(full);
                             break;
                         case FileType.TempFile:
-                            if (dir == DbName) toDelete.Add(full);
+                            if (dir == DbName && atOpen) toDelete.Add(full);
                             break;
                         case FileType.WalFile:
                             // Recycled WALs are kept (PurgeObsoleteFiles: wal_recycle_files_set).
@@ -870,6 +928,20 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 try { PurgeObsoleteFiles(); }
                 catch (Exception e) when (e is IOException or RocksDbException) { }
             }
+            // VersionSet::Close: verify_manifest_content_on_close. A failure is reported once the close has finished
+            // (DB::Close returns the status).
+            RocksDbException? closeError = null;
+            if (Options.VerifyManifestContentOnClose && !_readOnly && Versions.GetColumnFamily(0) is { } defaultCfd)
+            {
+                try
+                {
+                    await Versions.VerifyManifestContentOnCloseAsync(defaultCfd).ConfigureAwait(false);
+                }
+                catch (Exception e) when (e is IOException or RocksDbException)
+                {
+                    closeError = RocksDbException.FromException(e);
+                }
+            }
             await Versions.DisposeAsync().ConfigureAwait(false);
             lock (_mutex)
             {
@@ -884,6 +956,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 }
                 _droppedColumnFamilies.Clear();
             }
+            if (closeError is not null) throw closeError;
         }
         finally
         {

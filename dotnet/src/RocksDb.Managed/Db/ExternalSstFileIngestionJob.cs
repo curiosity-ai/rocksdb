@@ -785,6 +785,8 @@ internal sealed class ExternalSstFileIngestionJob
         // we have snapshots.
         bool forceGlobalSeqno = _options.SnapshotConsistency && hasSnapshots;
         var edit = new VersionEdit { ColumnFamily = _cfd.Id };
+        // CommitFileIngestionHandles: edit->MarkForegroundOperation() (relaxed MANIFEST rotation limit).
+        edit.MarkForegroundOperation();
         MaxAssignedSeqno = 0;
         // A grouped MANIFEST write can advance current before publishing its SV: work on the current version.
         VersionStorageInfo vstorage = _cfd.Current.Storage;
