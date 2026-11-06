@@ -65,7 +65,9 @@ internal static class BlockFetcher
         byte[] buf = TableBuilderBuffers.Rent(source, n);
         try
         {
+            long perfRead = PerfContext.StartTimer(); // PERF_TIMER_GUARD(block_read_time)
             int read = ReadFully(file, (long)handle.Offset, buf.AsSpan(0, n));
+            PerfContext.RecordBlockRead(read, perfRead);
             if (read != n) ThrowTruncated(handle, read);
         }
         catch
@@ -84,6 +86,7 @@ internal static class BlockFetcher
     {
         int n = CheckedLength(handle);
         byte[] buf = BlockBufferPool.Rent(n);
+        PerfContext.RecordBlockRead(n, 0); // async: counted, not timed
         ValueTask<int> first;
         try
         {
@@ -197,7 +200,9 @@ internal static class BlockFetcher
         byte[] buf = BlockBufferPool.Rent(n);
         try
         {
+            long perfRead = PerfContext.StartTimer(); // PERF_TIMER_GUARD(block_read_time)
             int read = ReadFully(file, (long)handle.Offset, buf.AsSpan(0, n));
+            PerfContext.RecordBlockRead(read, perfRead);
             if (read != n) ThrowTruncated(handle, read);
         }
         catch
@@ -215,6 +220,7 @@ internal static class BlockFetcher
     {
         int n = CheckedLength(handle);
         byte[] buf = BlockBufferPool.Rent(n);
+        PerfContext.RecordBlockRead(n, 0); // async: counted, not timed
         try
         {
             int total = 0;
@@ -357,7 +363,9 @@ internal static class BlockFetcher
         byte[] buf = TableBuilderBuffers.Rent(source, n);
         try
         {
+            long perfRead = PerfContext.StartTimer(); // PERF_TIMER_GUARD(block_read_time)
             int read = ReadFully(file, (long)handle.Offset, buf.AsSpan(0, n));
+            PerfContext.RecordBlockRead(read, perfRead);
             if (read != n) ThrowTruncated(handle, read);
             int size = (int)handle.Size;
             if (verifyChecksums && !BlockChecksum.Verify(footer.ChecksumType, footer.BaseContextChecksum, buf.AsSpan(0, n), handle.Offset))

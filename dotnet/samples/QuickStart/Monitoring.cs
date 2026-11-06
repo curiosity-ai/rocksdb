@@ -60,6 +60,18 @@ internal static class Monitoring
              $"tables {tables.Count}, LOG exists {File.Exists(Path.Combine(path, "LOG"))}, stats text {dump.Length} chars");
         Check(statistics.GetTickerCount(Ticker.NumberKeysWritten) == 100 && listener.Flushes == 1, "statistics + listener");
         _ = new ConsoleInfoLogger();
+
+        // <snippet:perf-context>
+        PerfContext.Level = PerfLevel.EnableTimeExceptForMutex;   // this thread only; the default is Disable (no cost)
+        PerfContext.Current.Reset();
+        db.Get(BitConverter.GetBytes(42));
+        ulong reads = PerfContext.Current[PerfMetric.BlockReadCount];
+        Console.WriteLine(PerfContext.Current.ToString(excludeZeroCounters: true));    // "user_key_comparison_count = 9, ..."
+        Console.WriteLine(IOStatsContext.Current.ToString(excludeZeroCounters: true)); // "bytes_read = 4155, ..."
+        PerfContext.Level = PerfLevel.Disable;
+        // </snippet:perf-context>
+        Check(PerfContext.Current[PerfMetric.GetFromMemtableCount] == 1, "perf context");
+        Line($"perf context: {reads} block reads");
         return Task.CompletedTask;
     }
 }

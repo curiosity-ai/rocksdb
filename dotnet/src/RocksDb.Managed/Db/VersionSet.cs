@@ -265,7 +265,9 @@ internal sealed class VersionSet : IAsyncDisposable
         {
             foreach (FileMetaData f in s.LevelFiles(l))
             {
-                _fileRefs[f.FileNumber] = _fileRefs.GetValueOrDefault(f.FileNumber) + 1;
+                int refs = _fileRefs.GetValueOrDefault(f.FileNumber);
+                if (refs == 0) v.Cfd.AllVersionsSstFilesSize += f.FileSize; // GetTotalSstFilesSize: each file once
+                _fileRefs[f.FileNumber] = refs + 1;
             }
         }
         foreach (Blob.BlobFileMetaData b in s.BlobFiles)
@@ -289,6 +291,7 @@ internal sealed class VersionSet : IAsyncDisposable
                 if (r == 0)
                 {
                     _fileRefs.Remove(f.FileNumber);
+                    v.Cfd.AllVersionsSstFilesSize -= f.FileSize;
                     _obsoleteFiles.Add(new ObsoleteTableFile(f, v.Cfd));
                 }
                 else
@@ -334,6 +337,20 @@ internal sealed class VersionSet : IAsyncDisposable
     {
         into.AddRange(_obsoleteBlobFiles);
         _obsoleteBlobFiles.Clear();
+    }
+
+    /// <summary>
+    /// VersionSet::GetObsoleteSstFilesSize: total size of the table files no longer referenced by any version that were
+    /// not yet taken for deletion ("rocksdb.obsolete-sst-files-size"). REQUIRES: DB mutex.
+    /// </summary>
+    public ulong ObsoleteSstFilesSize
+    {
+        get
+        {
+            ulong total = 0;
+            foreach (ObsoleteTableFile f in _obsoleteFiles) total += f.Meta.FileSize;
+            return total;
+        }
     }
 
     /// <summary>True if some live version references the table file. REQUIRES: DB mutex.</summary>

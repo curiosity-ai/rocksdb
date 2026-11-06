@@ -841,6 +841,7 @@ public sealed class DbIter : IDisposable
             if ((!isPrevKeySeqnumZero || _tsSize > 0) && _skipping && CompareKeyForSkip(userKey, _savedKey.UserKey) <= 0)
             {
                 _numSkipped++; // skip this entry
+                PerfContext.Add(PerfMetric.InternalKeySkippedCount, 1);
             }
             else if (_tsSize != 0 && IsCoveredByRangeTombstone(userKey, seq))
             {
@@ -869,6 +870,7 @@ public sealed class DbIter : IDisposable
                         // Arrange to skip all upcoming entries for this key since they are hidden by this deletion.
                         _savedKey.SetUserKey(userKey);
                         _skipping = true;
+                        PerfContext.Add(PerfMetric.InternalDeleteSkippedCount, 1);
                         break;
                     case EntryType.Value:
                     case EntryType.ValuePreferredSeqno:
@@ -914,6 +916,7 @@ public sealed class DbIter : IDisposable
         }
         else
         {
+            if (seq > _sequence) PerfContext.Add(PerfMetric.InternalRecentSkippedCount, 1);
             // This key was inserted after our snapshot was taken or skipped by timestamp range. If this happens too many
             // times in a row for the same user key, we want to seek to the target sequence number.
             int cmp = CompareWithoutTimestamp(userKey, _savedKey.UserKey);
@@ -1124,6 +1127,7 @@ public sealed class DbIter : IDisposable
     public void Next()
     {
         if (!_valid) ThrowHelper.InvalidArgument("Next on an invalid iterator");
+        PerfContext.Add(PerfMetric.IterNextCount, 1);
         // Release temporarily pinned blocks from last operation
         ReleaseTempPinnedData();
         _numInternalKeysSkipped = 0;
@@ -1139,6 +1143,7 @@ public sealed class DbIter : IDisposable
             // likely iter already points to the next internal position.
             Debug.Assert(_iter.Valid);
             _iter.Next();
+            PerfContext.Add(PerfMetric.InternalKeySkippedCount, 1);
         }
         if (_iter.Valid)
         {
@@ -1155,6 +1160,7 @@ public sealed class DbIter : IDisposable
     public void Prev()
     {
         if (!_valid) ThrowHelper.InvalidArgument("Prev on an invalid iterator");
+        PerfContext.Add(PerfMetric.IterPrevCount, 1);
         ReleaseTempPinnedData();
         _numInternalKeysSkipped = 0;
         BeginPrev();
@@ -1163,10 +1169,13 @@ public sealed class DbIter : IDisposable
 
     public void Seek(ReadOnlySpan<byte> target)
     {
+        PerfContext.Add(PerfMetric.IterSeekCount, 1);
         ResetSeekState();
         SetSavedKeyToSeekTarget(target);
         _forward = true;
+        long perfSeek = PerfContext.StartTimer(); // PERF_TIMER_GUARD(seek_internal_seek_time)
         _iter.Seek(_seekKey.WrittenSpan);
+        PerfContext.StopTimer(PerfMetric.SeekInternalSeekTime, perfSeek);
         if (!_iter.Valid) return;
         // Now the inner iterator is placed to the target position. From there, we need to find out the next key
         // that is visible to the user.
@@ -1178,6 +1187,7 @@ public sealed class DbIter : IDisposable
 
     public void SeekForPrev(ReadOnlySpan<byte> target)
     {
+        PerfContext.Add(PerfMetric.IterSeekCount, 1);
         ResetSeekState();
         SetSavedKeyToSeekForPrevTarget(target);
         _forward = false;
@@ -1196,6 +1206,7 @@ public sealed class DbIter : IDisposable
             Seek(_lower.Span);
             return;
         }
+        PerfContext.Add(PerfMetric.IterSeekCount, 1);
         // Don't use iter_::Seek() if we set a prefix extractor because prefix seek will be used.
         if (!_expectTotalOrderInnerIter) _maxSkip = ulong.MaxValue;
         ResetSeekState();
@@ -1216,6 +1227,7 @@ public sealed class DbIter : IDisposable
             SeekForPrev(_upper.Span);
             return;
         }
+        PerfContext.Add(PerfMetric.IterSeekCount, 1);
         // Don't use iter_::Seek() if we set a prefix extractor because prefix seek will be used.
         if (!_expectTotalOrderInnerIter) _maxSkip = ulong.MaxValue;
         ResetSeekState();
@@ -1277,6 +1289,7 @@ public sealed class DbIter : IDisposable
     /// <summary>Async <see cref="Seek"/>: completes synchronously unless a table block must be read.</summary>
     public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
+        PerfContext.Add(PerfMetric.IterSeekCount, 1);
         ResetSeekState();
         SetSavedKeyToSeekTarget(target.Span);
         _forward = true;
@@ -1304,6 +1317,7 @@ public sealed class DbIter : IDisposable
             return ValueTask.CompletedTask;
         }
         if (!_expectTotalOrderInnerIter) _maxSkip = ulong.MaxValue;
+        PerfContext.Add(PerfMetric.IterSeekCount, 1);
         ResetSeekState();
         _forward = true;
         ValueTask t = _iter.SeekToFirstAsync(cancellationToken);
@@ -1330,6 +1344,7 @@ public sealed class DbIter : IDisposable
     public ValueTask NextAsync(CancellationToken cancellationToken = default)
     {
         if (!_valid) ThrowHelper.InvalidArgument("Next on an invalid iterator");
+        PerfContext.Add(PerfMetric.IterNextCount, 1);
         // Release temporarily pinned blocks from last operation
         ReleaseTempPinnedData();
         _numInternalKeysSkipped = 0;

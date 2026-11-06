@@ -328,4 +328,80 @@ public sealed class PropertiesAndStatisticsTests
         Assert.IsTrue(log.Any("** DB Stats **"));
         Assert.IsTrue(log.Any("STATISTICS:"));
     }
+
+    /// <summary>
+    /// rocksdb.block-cache-entry-stats / fast-block-cache-entry-stats (InternalStats::CacheEntryRoleStats,
+    /// CacheEntryStatsCollector): per-role counts and charges; the fast form reuses a recent collection.
+    /// </summary>
+    [TestMethod]
+    public void BlockCacheEntryStatsCountRoles()
+    {
+        MemoryFileSystem fs = NewFs();
+        var cf = new ColumnFamilyOptions
+        {
+            Compression = RocksDb.Managed.Compression.CompressionType.None,
+            TableOptions = new BlockBasedTableOptions { BlockCache = RocksDb.Managed.Cache.BlockCache.CreateLru(8 << 20) },
+        };
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cf);
+        FillAndFlush(db, 2000, 100);
+        for (int i = 0; i < 2000; i += 7) Assert.IsNotNull(db.Get(Key(i)));
+        Dictionary<string, string> map = db.GetMapProperty(DbProperties.BlockCacheEntryStats)!;
+        Assert.AreEqual((8 << 20).ToString(System.Globalization.CultureInfo.InvariantCulture), map["capacity"]);
+        Assert.IsTrue(long.Parse(map["count.data-block"], System.Globalization.CultureInfo.InvariantCulture) > 0);
+        Assert.IsTrue(long.Parse(map["bytes.data-block"], System.Globalization.CultureInfo.InvariantCulture) > 0);
+        Assert.AreEqual(4 + 3 * 14, map.Count, "id, capacity, two collection times, count/bytes/percent of 14 roles");
+        StringAssert.Contains(map["id"], "@0x");
+        string text = db.GetProperty(DbProperties.FastBlockCacheEntryStats)!;
+        StringAssert.Contains(text, " collections: 1 last_copies: 1 ");
+        StringAssert.Contains(text, "\nBlock cache entry stats(count,size,portion): DataBlock(");
+        // A DB without a block cache has no such property.
+        using RocksDatabase noCache = RocksDatabase.Open("/db2", new DbOptions { CreateIfMissing = true, FileSystem = fs },
+            new ColumnFamilyOptions { TableOptions = new BlockBasedTableOptions { NoBlockCache = true } });
+        Assert.IsNull(noCache.GetProperty(DbProperties.BlockCacheEntryStats));
+        Assert.IsNull(noCache.GetMapProperty(DbProperties.FastBlockCacheEntryStats));
+    }
+
+    /// <summary>The file-number and file-size properties of DBImpl / VersionSet (db_impl_files.cc, version_set.cc).</summary>
+    [TestMethod]
+    public void FileNumberAndObsoleteSizeProperties()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { DisableAutoCompactions = true, MaxWriteBufferSizeToMaintain = 64 << 20 });
+        Assert.AreEqual(ulong.MaxValue.ToString(System.Globalization.CultureInfo.InvariantCulture), db.GetProperty(DbProperties.MinObsoleteSstNumberToKeep));
+        FillAndFlush(db, 100, 10);
+        FillAndFlush(db, 100, 10);
+        Assert.AreEqual("2", db.GetProperty(DbProperties.NumImmutableMemTableFlushed), "flushed memtables kept as history");
+        Assert.AreEqual("0", db.GetProperty(DbProperties.ObsoleteSstFilesSize));
+        db.DisableFileDeletions();
+        Assert.AreEqual("0", db.GetProperty(DbProperties.IsFileDeletionsEnabled));
+        string live = db.GetProperty(DbProperties.LiveSstFilesSize)!;
+        db.CompactRange(null, null);
+        // The compaction inputs are obsolete but kept while deletions are disabled... until a purge takes them.
+        Assert.IsNotNull(db.GetProperty(DbProperties.ObsoleteSstFilesSize));
+        db.EnableFileDeletions();
+        Assert.AreEqual("1", db.GetProperty(DbProperties.IsFileDeletionsEnabled));
+        Assert.AreEqual("0", db.GetProperty(DbProperties.ObsoleteSstFilesSize), "purged");
+        Assert.AreNotEqual(live, db.GetProperty(DbProperties.LiveSstFilesSize));
+        Assert.AreEqual(db.GetProperty(DbProperties.LiveSstFilesSize), db.GetProperty(DbProperties.LiveSstFilesSizeAtTemperaturePrefix + "0"));
+        Assert.AreEqual("0", db.GetProperty(DbProperties.LiveSstFilesSizeAtTemperaturePrefix + "4"));
+        Assert.IsNull(db.GetProperty(DbProperties.EstimateOldestKeyTime), "level compaction");
+        Assert.IsNull(db.GetProperty(DbProperties.NumFilesAtLevel(7)), "beyond num_levels");
+        Assert.IsNull(db.GetProperty(DbProperties.CompressionRatioAtLevelPrefix + "7"));
+        Assert.IsNull(db.GetProperty(DbProperties.CompressionRatioAtLevelPrefix + "x"));
+    }
+
+    /// <summary>HandleEstimateOldestKeyTime: FIFO compaction without allow_compaction, min over tables and memtables.</summary>
+    [TestMethod]
+    public void EstimateOldestKeyTimeForFifo()
+    {
+        MemoryFileSystem fs = NewFs();
+        long before = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var cf = new ColumnFamilyOptions { CompactionStyle = CompactionStyle.Fifo };
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cf);
+        Assert.IsNull(db.GetProperty(DbProperties.EstimateOldestKeyTime), "no data");
+        FillAndFlush(db, 10, 10);
+        db.Put(B("m"), B("v"));
+        ulong t = ulong.Parse(db.GetProperty(DbProperties.EstimateOldestKeyTime)!, System.Globalization.CultureInfo.InvariantCulture);
+        Assert.IsTrue(t >= (ulong)before && t <= (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds(), t.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    }
 }

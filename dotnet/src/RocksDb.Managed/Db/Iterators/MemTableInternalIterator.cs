@@ -47,10 +47,29 @@ public sealed class MemTableInternalIterator : InternalIterator
     public override ReadOnlySpan<byte> Value => _it.Value;
     public override void SeekToFirst() => _it.SeekToFirst();
     public override void SeekToLast() => _it.SeekToLast();
-    public override void Seek(ReadOnlySpan<byte> target) => _it.Seek(target);
-    public override void SeekForPrev(ReadOnlySpan<byte> target) => _it.SeekForPrev(target);
-    public override void Next() => _it.Next();
-    public override void Prev() => _it.Prev();
+    public override void Seek(ReadOnlySpan<byte> target)
+    {
+        PerfContext.Add(PerfMetric.SeekOnMemtableCount, 1); // MemTableIterator::Seek
+        _it.Seek(target);
+    }
+
+    public override void SeekForPrev(ReadOnlySpan<byte> target)
+    {
+        PerfContext.Add(PerfMetric.SeekOnMemtableCount, 1);
+        _it.SeekForPrev(target);
+    }
+
+    public override void Next()
+    {
+        PerfContext.Add(PerfMetric.NextOnMemtableCount, 1);
+        _it.Next();
+    }
+
+    public override void Prev()
+    {
+        PerfContext.Add(PerfMetric.PrevOnMemtableCount, 1);
+        _it.Prev();
+    }
 
     /// <summary>Memtable values live in arena memory at a fixed address while the memtable is alive (MemTableIterator::IsValuePinned).</summary>
     public override bool TryGetPinnedValue(out PinnedSlice value)

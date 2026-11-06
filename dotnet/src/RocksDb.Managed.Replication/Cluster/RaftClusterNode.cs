@@ -249,7 +249,10 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             }
             else
             {
-                ulong newCommit = Math.Min(heartbeat.LeaderCommit, myLatest);
+                // Raft (AppendEntries receiver rule 5): commitIndex = min(leaderCommit, index of last new entry). A
+                // heartbeat carries no entries, so the last entry known to match the leader's log is PrevLogSeq;
+                // entries past it may be a deposed leader's divergent tail and must not be marked committed.
+                ulong newCommit = Math.Min(heartbeat.LeaderCommit, heartbeat.PrevLogSeq);
                 if (newCommit > _commitSeq) SetCommitLocked(newCommit);
                 result = new AppendEntriesResult(_state.CurrentTerm, true, myLatest, AppendEntriesRejectReason.None);
             }

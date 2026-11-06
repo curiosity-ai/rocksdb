@@ -122,6 +122,7 @@ where noted below. Out of scope as before: pre-vote, membership changes, ReadInd
 | promoted replica spins until it reaches the handoff point | `WaitForSequenceAsync` | no polling |
 | promote RPC sent cold while writes are held | a probe promote (`PromoteRequest.Probe`, refused without side effects) warms the RPC path on both nodes before the hold | the first promote of a process paid 15-30 ms per side over MagicOnion |
 | promoted replica persists its epoch map and role separately; old primary persists its demotion, then closes the gate | one combined write (`ReplicationRoleState.BecomePrimary`); the gate closes first (the node is durably `HandingOff`) | 3 fewer fsyncs while writes are held |
+| a follower sets its commit index to `min(leaderCommit, myLatestSeq)` | `min(leaderCommit, prevLogSeq)`: only the prefix the heartbeat verified against the leader's log | Raft's "index of last new entry"; a deposed leader's divergent tail past `prevLogSeq` is never reported committed |
 | hosts poll `CommitSeq` every 15 ms to acknowledge writes | `RaftClusterNode.WaitForCommitAsync` | signalled |
 | hosts wait fixed 500-1000 ms for "in-flight handlers" before disposing a DB on resync | `DatabaseUsageGate` drain | deterministic |
 | snapshot stream ends without a marker | plan + files + `Complete` marker | a truncated transfer is detected |

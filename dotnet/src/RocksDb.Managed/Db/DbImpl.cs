@@ -419,8 +419,11 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 case DbProperties.CurSizeActiveMemTable:
                     return sv.Mem.ApproximateMemoryUsage.ToString(CultureInfo.InvariantCulture);
                 case DbProperties.EstimateNumKeys:
-                    return EstimateNumKeys(cfd, sv).ToString(CultureInfo.InvariantCulture);
+                    return EstimateNumKeys(sv).ToString(CultureInfo.InvariantCulture);
                 case DbProperties.TotalSstFilesSize:
+                    // ColumnFamilyData::GetTotalSstFilesSize: the distinct files of every live version (incl. versions
+                    // pinned by iterators or snapshots of the file set), not only the current one.
+                    lock (_mutex) return cfd.AllVersionsSstFilesSize.ToString(CultureInfo.InvariantCulture);
                 case DbProperties.LiveSstFilesSize:
                     {
                         ulong n = 0;
@@ -437,7 +440,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
             if (property.StartsWith(DbProperties.NumFilesAtLevelPrefix, StringComparison.Ordinal)
                 && int.TryParse(property.AsSpan(DbProperties.NumFilesAtLevelPrefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out int level))
             {
-                return level < sv.Current.Storage.NumLevels ? sv.Current.Storage.NumLevelFiles(level).ToString(CultureInfo.InvariantCulture) : "0";
+                // HandleNumFilesAtLevel: a level at or beyond num_levels is not a property (returns false).
+                return level < sv.Current.Storage.NumLevels ? sv.Current.Storage.NumLevelFiles(level).ToString(CultureInfo.InvariantCulture) : null;
             }
             return null;
         }
@@ -447,24 +451,59 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
     }
 
-    /// <summary>Port of "rocksdb.estimate-num-keys": memtable entries minus 2x deletes plus table-property estimates.</summary>
-    private static ulong EstimateNumKeys(ColumnFamilyData cfd, SuperVersion sv)
+    /// <summary>
+    /// Port of InternalStats::HandleEstimateNumKeys (db/internal_stats.cc): memtable entries + immutable memtable
+    /// entries + VersionStorageInfo::GetEstimatedActiveKeys, minus twice the memtable deletes, clamped at 0 once (the
+    /// memtable parts are not clamped on their own: memtable deletes of keys in tables cancel those keys).
+    /// </summary>
+    private static ulong EstimateNumKeys(SuperVersion sv)
     {
-        long mem = sv.Mem.NumEntries - 2 * sv.Mem.NumDeletes;
-        foreach (MemTable m in sv.Imm) mem += m.NumEntries - 2 * m.NumDeletes;
-        long files = 0;
-        VersionStorageInfo s = sv.Current.Storage;
+        ulong keys = (ulong)sv.Mem.NumEntries;
+        ulong deletes = (ulong)sv.Mem.NumDeletes;
+        foreach (MemTable m in sv.Imm)
+        {
+            keys += (ulong)m.NumEntries;
+            deletes += (ulong)m.NumDeletes;
+        }
+        ulong est = EstimatedActiveKeys(sv.Current.Storage);
+        // Saturating, like the uint64 arithmetic upstream can only overflow at GetEstimatedActiveKeys' max value.
+        keys = est > ulong.MaxValue - keys ? ulong.MaxValue : keys + est;
+        return keys > deletes * 2 ? keys - deletes * 2 : 0;
+    }
+
+    /// <summary>
+    /// Port of VersionStorageInfo::GetEstimatedActiveKeys (db/version_set.cc): non-deletions minus deletions of the
+    /// current version's files whose entry stats are loaded (current_num_non_deletions_ / current_num_deletions_ /
+    /// current_num_samples_), clamped at 0 and scaled up by files / samples when not every file was sampled.
+    /// </summary>
+    private static ulong EstimatedActiveKeys(VersionStorageInfo s)
+    {
+        ulong nonDeletions = 0, deletions = 0, samples = 0, fileCount = 0;
         for (int l = 0; l < s.NumLevels; l++)
         {
-            foreach (FileMetaData f in s.LevelFiles(l))
+            foreach (FileMetaData f in s.LevelFilesArray(l))
             {
-                using TableReaderLease lease = cfd.TableCache.GetReader(f);
-                Table.TableProperties p = lease.Reader.Properties;
-                files += (long)p.NumEntries - 2 * (long)p.NumDeletions;
+                fileCount++;
+                if (!f.EntryStatsKnown) continue;
+                nonDeletions += f.NumEntries - f.NumDeletions;
+                deletions += f.NumDeletions;
+                samples++;
             }
         }
-        long total = Math.Max(0, mem) + Math.Max(0, files);
-        return (ulong)total;
+        // Estimation will be inaccurate when: (1) there exist merge keys (2) keys are directly overwritten
+        // (3) deletion on non-existing keys (4) low number of samples
+        if (samples == 0) return 0;
+        if (nonDeletions <= deletions) return 0;
+        ulong est = nonDeletions - deletions;
+        if (samples < fileCount)
+        {
+            double multiplier = (double)fileCount / samples;
+            double maximumMultiplier = (double)ulong.MaxValue / est;
+            // If it can overflow, we return the maximum unsigned long.
+            if (multiplier >= maximumMultiplier) return ulong.MaxValue;
+            return (ulong)(est * multiplier);
+        }
+        return est;
     }
 
     /// <summary>Port of DB::GetLiveFilesMetaData.</summary>
@@ -653,14 +692,15 @@ internal sealed partial class DbImpl : IAsyncDisposable
         foreach (ObsoleteTableFile t in tables)
         {
             t.Cfd.TableCache.Evict(t.Meta.FileNumber);
-            DeleteObsoleteTableFile(FileNames.TableFileName(DbPaths, t.Meta.FileNumber, t.Meta.PathId));
+            DeleteObsoleteTableFile(FileNames.TableFileName(DbPaths, t.Meta.FileNumber, t.Meta.PathId), t.Meta.FileNumber);
         }
         foreach (ObsoleteBlobFile b in blobs)
         {
             // The SharedBlobFileMetaData deleter: evict the reader, then delete the file (AddObsoleteBlobFile).
             b.Cfd.BlobSource.Evict(b.BlobFileNumber);
             b.Cfd.BlobDirectWrite?.Forget(b.BlobFileNumber);
-            DeleteDbFile(FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber), DbPaths[0]);
+            Exception? failure = DeleteDbFile(FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber), DbPaths[0]);
+            LogFileDeletionEvent("blob_file_deletion", 0, b.BlobFileNumber, failure); // EventHelpers::LogAndNotifyBlobFileDeletion
         }
         if (releasedBlobs is not null)
         {
@@ -863,22 +903,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
         DeregisterFromWriteBufferManager();
         // CancelErrorRecoveryForShutDown: stop automatic recovery first (it needs the write thread and background work).
         await ErrorHandler.EndAutoRecoveryAsync(synchronous).ConfigureAwait(false);
-        // force_flush_for_blob_direct_write: blob direct write files are only registered by flushes (WAL recovery of
-        // unregistered files is out of scope, like upstream v1), so they are flushed even with avoid_flush_during_shutdown.
-        if (((!Options.AvoidFlushDuringShutdown && Volatile.Read(ref _hasUnpersistedData)) || HasInFlightBlobDirectWriteFiles()) && BackgroundError is null)
-        {
-            try
-            {
-                foreach (ColumnFamilyData cfd in GetColumnFamilies())
-                {
-                    await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.ShutDown, synchronous, CancellationToken.None).ConfigureAwait(false);
-                }
-            }
-            catch (RocksDbException)
-            {
-                // Best effort, like upstream's shutdown flush.
-            }
-        }
+        // CloseHelper -> CancelAllBackgroundWork(false): the shutdown flush and OnDBShutdownBegin, unless a public
+        // CancelAllBackgroundWork already began the shutdown (DbImpl.Shutdown.cs).
+        bool alreadyShuttingDown = IsShuttingDown;
+        if (!alreadyShuttingDown) await ShutdownFlushAsync(synchronous).ConfigureAwait(false);
         // Become the (last) write leader so no write is in flight.
         WriteThread.Writer w = await EnterUnbatchedCoreAsync(synchronous).ConfigureAwait(false);
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -891,6 +919,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         {
             EndAllTraces();
             LogInfo("Shutdown: canceling all background work");
+            if (!alreadyShuttingDown) NotifyOnDBShutdownBegin();
             lock (_mutex)
             {
                 _shuttingDown = true;

@@ -81,6 +81,10 @@ internal sealed partial class DbImpl
 
     private void AbortOpen()
     {
+        // ~DBImpl of a failed open runs CloseHelper, which notifies OnDBShutdownBegin (listener_test.cc
+        // OnDBShutdownBeginOnFailedOpen); the managed DB object was never created, so listeners receive null.
+        NotifyOnDBShutdownBegin();
+        FlushDeferredEvents(); // e.g. recovery_failed
         DeregisterFromWriteBufferManager();
         Volatile.Write(ref _disposed, 1);
         try
@@ -626,23 +630,44 @@ internal sealed partial class DbImpl
         }
 
         var wals = new List<ulong>();
-        int walFiles = 0;
+        var allWals = new List<ulong>();
         foreach (string child in FileSystem.GetChildren(WalDir))
         {
             if (FileNames.TryParseFileName(child, out ulong number, out FileType type) && type == FileType.WalFile)
             {
-                walFiles++;
+                allWals.Add(number);
                 Versions.MarkFileNumberUsed(number);
                 if (number >= minLog) wals.Add(number);
             }
         }
         wals.Sort();
-        CheckWalFilesExist(isNewDb, walFiles);
+        allWals.Sort();
+        CheckWalFilesExist(isNewDb, allWals.Count);
         // Best-efforts recovery does not replay WALs (DBImpl::Recover does not list the WAL directory); their numbers are
         // still marked used, and they become obsolete once the recovery edits advance every column family.
-        if (wals.Count == 0 || Options.BestEffortsRecovery) return edits;
+        if (allWals.Count == 0 || Options.BestEffortsRecovery) return edits;
 
-        ReplayProgress progress = await ProcessLogFilesAsync(wals, minLog, readOnly: false, edits, synchronous, ct).ConfigureAwait(false);
+        // DBImpl::RecoverLogFiles (SetupLogFilesRecovery / FinishLogFilesRecovery): the recovery_started event lists every
+        // WAL of the directory (ProcessLogFiles skips those below the minimum log number), recovery_finished or
+        // recovery_failed follows the replay.
+        int recoveryJobId = NewJobId();
+        LogRecoveryStartedEvent(recoveryJobId, allWals);
+        if (wals.Count == 0)
+        {
+            LogRecoveryFinishedEvent(recoveryJobId, null);
+            return edits;
+        }
+        ReplayProgress progress;
+        try
+        {
+            progress = await ProcessLogFilesAsync(wals, minLog, readOnly: false, edits, synchronous, ct).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is RocksDbException or IOException)
+        {
+            LogRecoveryFinishedEvent(recoveryJobId, e);
+            throw;
+        }
+        LogRecoveryFinishedEvent(recoveryJobId, null);
         // DBImpl::Recover: a point-in-time recovery that stopped at a corrupted WAL hands next_sequence to Open
         // (recovered_seq), which writes it to the new WAL as a dummy record.
         if (progress.CorruptedWalFound) _recoveredSeq = progress.NextSequence;

@@ -94,6 +94,90 @@ internal sealed class InternalStats
 
     private readonly CfStatsSnapshot _snapshot = new();
 
+    // cf_stats_count_ of the write stall types (MEMTABLE_LIMIT_DELAYS ... L0_FILE_COUNT_LIMIT_STOPS_WITH_ONGOING_COMPACTION),
+    // indexed by StallIndex; changed under the DB mutex (RecalculateWriteStallConditions), read with Interlocked.
+    private readonly long[] _writeStallCounts = new long[8];
+    private const int L0DelaysWithOngoingCompaction = 6, L0StopsWithOngoingCompaction = 7;
+    private ulong _snapStallCount;
+
+    /// <summary>
+    /// The InternalStats::AddCFStats calls of ColumnFamilyData::RecalculateWriteStallConditions: one count per
+    /// recalculation that delays or stops writes, plus the "with ongoing compaction" L0 counters.
+    /// </summary>
+    public void AddWriteStall(WriteStallCause cause, WriteStallCondition condition, bool level0CompactionInProgress)
+    {
+        if (condition == WriteStallCondition.Normal || cause == WriteStallCause.None) return;
+        Interlocked.Increment(ref _writeStallCounts[StallIndex(cause, condition)]);
+        if (cause == WriteStallCause.L0FileCountLimit && level0CompactionInProgress)
+        {
+            Interlocked.Increment(ref _writeStallCounts[condition == WriteStallCondition.Delayed ? L0DelaysWithOngoingCompaction : L0StopsWithOngoingCompaction]);
+        }
+    }
+
+    private static int StallIndex(WriteStallCause cause, WriteStallCondition condition) =>
+        ((int)cause - 1) * 2 + (condition == WriteStallCondition.Stopped ? 1 : 0);
+
+    /// <summary>WriteStallCauseToHyphenString (db/write_stall_stats.cc).</summary>
+    private static string CauseName(WriteStallCause cause) => cause switch
+    {
+        WriteStallCause.MemtableLimit => "memtable-limit",
+        WriteStallCause.L0FileCountLimit => "l0-file-count-limit",
+        _ => "pending-compaction-bytes",
+    };
+
+    /// <summary>InternalStats::DumpCFMapStatsWriteStall ("rocksdb.cf-write-stall-stats" map; std::map key order).</summary>
+    public SortedDictionary<string, string> WriteStallMap()
+    {
+        var map = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        long totalDelays = 0, totalStops = 0;
+        for (WriteStallCause cause = WriteStallCause.MemtableLimit; cause <= WriteStallCause.PendingCompactionBytes; cause++)
+        {
+            long delays = Interlocked.Read(ref _writeStallCounts[StallIndex(cause, WriteStallCondition.Delayed)]);
+            long stops = Interlocked.Read(ref _writeStallCounts[StallIndex(cause, WriteStallCondition.Stopped)]);
+            map[CauseName(cause) + "-delays"] = delays.ToString(CultureInfo.InvariantCulture);
+            map[CauseName(cause) + "-stops"] = stops.ToString(CultureInfo.InvariantCulture);
+            totalDelays += delays;
+            totalStops += stops;
+        }
+        map["cf-l0-file-count-limit-delays-with-ongoing-compaction"] =
+            Interlocked.Read(ref _writeStallCounts[L0DelaysWithOngoingCompaction]).ToString(CultureInfo.InvariantCulture);
+        map["cf-l0-file-count-limit-stops-with-ongoing-compaction"] =
+            Interlocked.Read(ref _writeStallCounts[L0StopsWithOngoingCompaction]).ToString(CultureInfo.InvariantCulture);
+        map["total-stops"] = totalStops.ToString(CultureInfo.InvariantCulture);
+        map["total-delays"] = totalDelays.ToString(CultureInfo.InvariantCulture);
+        return map;
+    }
+
+    /// <summary>InternalStats::DumpCFStatsWriteStall without the interval line ("rocksdb.cf-write-stall-stats").</summary>
+    public string DumpWriteStall() => FormatWriteStall(WriteStallMap());
+
+    /// <summary>"Write Stall (count): k1: v1, k2: v2\n" (DumpCFStatsWriteStall / DumpDBStatsWriteStall).</summary>
+    internal static string FormatWriteStall(SortedDictionary<string, string> map)
+    {
+        var sb = new StringBuilder("Write Stall (count): ");
+        int i = 0;
+        foreach (KeyValuePair<string, string> kv in map)
+        {
+            sb.Append(kv.Key).Append(": ").Append(kv.Value).Append(++i == map.Count ? "\n" : ", ");
+        }
+        if (map.Count == 0) sb.Append('\n');
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// The write stall part of DumpCFStatsNoFileHistogram: the map line, then "interval: N total count" when there were
+    /// stalls; a periodic dump starts a new interval.
+    /// </summary>
+    private string DumpWriteStallWithInterval(bool isPeriodic)
+    {
+        SortedDictionary<string, string> map = WriteStallMap();
+        string s = FormatWriteStall(map);
+        ulong total = ulong.Parse(map["total-stops"], CultureInfo.InvariantCulture) + ulong.Parse(map["total-delays"], CultureInfo.InvariantCulture);
+        if (total > 0) s += "interval: " + (total - _snapStallCount).ToString(CultureInfo.InvariantCulture) + " total count\n";
+        if (isPeriodic) _snapStallCount = total;
+        return s;
+    }
+
     // file_read_latency_: per-level table read latency (micros), filled only when the DB has statistics.
     private readonly HistogramImpl?[] _fileReadLatency;
 
@@ -296,6 +380,8 @@ internal sealed class InternalStats
             string l = level == -1 ? "Sum" : "L" + level.ToString(CultureInfo.InvariantCulture);
             for (int i = 0; i < v.Length; i++) map["compaction." + l + "." + s_propertyNames[i]] = Statistics.Fixed6(v[i]);
         }
+        // DumpCFMapStats ends with DumpCFMapStatsWriteStall(cf_stats).
+        foreach (KeyValuePair<string, string> kv in WriteStallMap()) map[kv.Key] = kv.Value;
         return map;
     }
 
@@ -355,6 +441,8 @@ internal sealed class InternalStats
         sb.Append(string.Format(CultureInfo.InvariantCulture,
             "Interval compaction: {0:F2} GB write, {1:F2} MB/s write, {2:F2} GB read, {3:F2} MB/s read, {4:F1} seconds\n",
             iWrite / GB, iWrite / MB / Math.Max(intervalUp, 0.001), iRead / GB, iRead / MB / Math.Max(intervalUp, 0.001), iMicros / MicrosInSec));
+        sb.Append("Estimated pending compaction bytes: ").Append(vstorage.EstimatedCompactionNeededBytes.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append(DumpWriteStallWithInterval(isPeriodic));
         if (isPeriodic)
         {
             snap.SecondsUp = uptime;
@@ -422,7 +510,42 @@ internal sealed class DbWriteStats
     public long WriteDoneByOther;
     public long WriteWithWal;
     public long WriteStallMicros;
+    /// <summary>kIntStatsWriteBufferManagerLimitStopsCounts: writes that found the WriteBufferManager stalling.</summary>
+    public long WriteBufferManagerLimitStops;
     private readonly long _startTicks = Environment.TickCount64;
+
+    /// <summary>Seconds since the DB opened ("db.uptime").</summary>
+    public double UptimeSeconds => (Environment.TickCount64 - _startTicks) / 1000.0;
+
+    /// <summary>
+    /// InternalStats::DumpDBMapStats ("rocksdb.dbstats" map): the db_stats_type_to_info names (db.wal_bytes_written,
+    /// ..., write-buffer-manager-limit-stops) and db.uptime.
+    /// </summary>
+    public Dictionary<string, string> ToMap() => new(StringComparer.Ordinal)
+    {
+        ["db.wal_bytes_written"] = Interlocked.Read(ref WalFileBytes).ToString(CultureInfo.InvariantCulture),
+        ["db.wal_syncs"] = Interlocked.Read(ref WalFileSynced).ToString(CultureInfo.InvariantCulture),
+        ["db.user_bytes_written"] = Interlocked.Read(ref BytesWritten).ToString(CultureInfo.InvariantCulture),
+        ["db.user_keys_written"] = Interlocked.Read(ref NumKeysWritten).ToString(CultureInfo.InvariantCulture),
+        ["db.user_writes_by_other"] = Interlocked.Read(ref WriteDoneByOther).ToString(CultureInfo.InvariantCulture),
+        ["db.user_writes_by_self"] = Interlocked.Read(ref WriteDoneBySelf).ToString(CultureInfo.InvariantCulture),
+        ["db.user_writes_with_wal"] = Interlocked.Read(ref WriteWithWal).ToString(CultureInfo.InvariantCulture),
+        ["db.user_write_stall_micros"] = Interlocked.Read(ref WriteStallMicros).ToString(CultureInfo.InvariantCulture),
+        [WriteBufferManagerLimitStopsKey] = Interlocked.Read(ref WriteBufferManagerLimitStops).ToString(CultureInfo.InvariantCulture),
+        ["db.uptime"] = Statistics.Fixed6(UptimeSeconds),
+    };
+
+    /// <summary>WriteStallStatsMapKeys::CauseConditionCount(kWriteBufferManagerLimit, kStopped).</summary>
+    public const string WriteBufferManagerLimitStopsKey = "write-buffer-manager-limit-stops";
+
+    /// <summary>InternalStats::DumpDBMapStatsWriteStall ("rocksdb.db-write-stall-stats" map).</summary>
+    public SortedDictionary<string, string> WriteStallMap() => new(StringComparer.Ordinal)
+    {
+        [WriteBufferManagerLimitStopsKey] = Interlocked.Read(ref WriteBufferManagerLimitStops).ToString(CultureInfo.InvariantCulture),
+    };
+
+    /// <summary>InternalStats::DumpDBStatsWriteStall ("rocksdb.db-write-stall-stats").</summary>
+    public string DumpWriteStall() => InternalStats.FormatWriteStall(WriteStallMap());
 
     /// <summary>db_stats_snapshot_ (DBStatsSnapshot): values at the previous dump.</summary>
     private double _snapSecondsUp;
@@ -470,6 +593,7 @@ internal sealed class DbWriteStats
             long iStall = stall - _snapStall;
             sb.Append("Interval stall: ").Append(HumanMicrosFixed(iStall))
                 .Append(string.Format(CultureInfo.InvariantCulture, ", {0:F1} percent\n", iStall / 10000.0 / Math.Max(intervalUp, 0.001)));
+            sb.Append(DumpWriteStall());
 
             _snapSecondsUp = uptime;
             _snapIngestBytes = bytes;

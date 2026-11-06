@@ -122,6 +122,55 @@ public sealed class BuildingBlockTests
         Assert.AreEqual("CURRENT", ReplicationSession.OrderForTransfer(["CURRENT", "b.sst", "a.sst"])[2]);
     }
 
+    private sealed class NullPeerTransport : IPeerTransport
+    {
+        public Task<RequestVoteResult?> SendRequestVoteAsync(ClusterMember peer, RequestVotePayload request, CancellationToken cancellationToken) =>
+            Task.FromResult<RequestVoteResult?>(null);
+
+        public Task<AppendEntriesResult?> SendHeartbeatAsync(ClusterMember peer, HeartbeatPayload payload, CancellationToken cancellationToken) =>
+            Task.FromResult<AppendEntriesResult?>(null);
+    }
+
+    /// <summary>
+    /// A deposed leader keeps an uncommitted tail from its own term. The new leader's heartbeat only proves that the log
+    /// matches up to PrevLogSeq, so the follower's commit index must stop there (Raft: min(leaderCommit, index of last
+    /// new entry)) even though leaderCommit and the follower's latest sequence are both higher.
+    /// </summary>
+    [TestMethod]
+    public void FollowerCommitIndexStopsAtTheLastEntryKnownToMatchTheLeader()
+    {
+        using var dir = new TempDir("raft-commit");
+        using RocksDatabase db = RocksDatabase.Open(dir.Sub("db"), new DbOptions { CreateIfMissing = true });
+        for (int i = 1; i <= 10; i++) db.Put(U(K(i)), U("v"));
+        Assert.AreEqual(10UL, db.GetLatestSequenceNumber());
+        var state = new RaftPersistentState(dir.Sub("raft"));
+        state.SetMode(ClusterMode.Cluster);
+        state.UpdateTermAndVote(2, "n1");
+        state.RecordTermRange(1, 1);
+        state.RecordTermRange(6, 2); // entries 6..10: this node's own (divergent, uncommitted) term-2 tail
+        var cfg = new RaftConfig("n1", "e1", [new ClusterMember("n2", "e2"), new ClusterMember("n3", "e3")]);
+        using var node = new RaftClusterNode(cfg, state, db, new NullPeerTransport());
+
+        // New leader n2 (term 3) has entries 1..5 of term 1 followed by its own term-3 entries 6..7, committed up to 7.
+        AppendEntriesResult r = node.HandleAppendEntries(3, "n2", prevLogSeq: 5, prevLogTerm: 1, leaderCommit: 7, ClusterMode.Cluster);
+        Assert.IsTrue(r.Success);
+        Assert.AreEqual(5UL, node.CommitSeq, "the divergent tail past PrevLogSeq was marked committed");
+
+        // Probing further back never lowers the commit index.
+        r = node.HandleAppendEntries(3, "n2", prevLogSeq: 3, prevLogTerm: 1, leaderCommit: 7, ClusterMode.Cluster);
+        Assert.IsTrue(r.Success);
+        Assert.AreEqual(5UL, node.CommitSeq);
+
+        // A heartbeat whose PrevLogSeq is inside the divergent tail fails the term check and asks for a resync.
+        bool resync = false;
+        node.ResyncRequired += (_, _) => resync = true;
+        r = node.HandleAppendEntries(3, "n2", prevLogSeq: 7, prevLogTerm: 3, leaderCommit: 7, ClusterMode.Cluster);
+        Assert.IsFalse(r.Success);
+        Assert.AreEqual(AppendEntriesRejectReason.TermMismatch, r.Reason);
+        Assert.IsTrue(resync);
+        Assert.AreEqual(5UL, node.CommitSeq);
+    }
+
     [TestMethod]
     public void WalBatchRejectsShortInput()
     {

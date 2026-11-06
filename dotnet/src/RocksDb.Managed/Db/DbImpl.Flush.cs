@@ -169,9 +169,9 @@ internal sealed partial class DbImpl
         int jobId = NewJobId();
         var mems = new List<MemTable>(picked.Count);
         foreach (ImmutableMemTable m in picked) mems.Add(m.Mem);
-        OnFlushStarted(cfd, jobId, mems);
-        string path = FileNames.TableFileName(DbPaths, fileNumber, 0);
         FlushReason reason = picked[^1].FlushReason;
+        OnFlushStarted(cfd, jobId, mems, reason);
+        string path = FileNames.TableFileName(DbPaths, fileNumber, 0);
         NotifyOnFlushBegin(cfd, jobId, fileNumber, path, mems, reason);
         using Blob.BlobFileBuilder? blobBuilder = CreateBlobFileBuilder(cfd, outputLevel: 0, Blob.BlobFileCreationReason.Flush);
         try
@@ -261,7 +261,9 @@ internal sealed partial class DbImpl
                 // PrecomputeMinLogNumberToKeepNon2PC: minimum of the other CFs' log numbers and this edit's (an atomic
                 // flush computes it over all its members when it commits).
                 minWalToKeep = Math.Min(Versions.MinLogNumberWithUnflushedData(cfd), edit.LogNumber.Value);
-                if (Versions.ColumnFamilies.Count > 1 && group is null) edit.MinLogNumberToKeep = minWalToKeep;
+                // GetDBRecoveryEditForObsoletingMemTables records it for every flush (also with a single column family),
+                // which keeps versions_->min_log_number_to_keep ("rocksdb.min-log-number-to-keep") current.
+                if (group is null) edit.MinLogNumberToKeep = minWalToKeep;
             }
             // GetDBRecoveryEditForObsoletingMemTables: with track_and_verify_wals_in_manifest the WALs the flush makes
             // obsolete are recorded as deleted in a separate edit of the same MANIFEST write.
@@ -309,6 +311,7 @@ internal sealed partial class DbImpl
         }
         if (meta is not null) MaybeReportMaxAllowedSpaceReached(BackgroundErrorReason.Flush);
         if (dropped) return;
+        if (blobBuilder is not null && meta is not null) LogBlobFileCreationEvents(cfd, jobId, blobBuilder.Additions);
         OnFlushCompleted(cfd, jobId, meta, BlobBytesWritten(blobBuilder), flushStart);
         NotifyOnFlushCompleted(cfd, jobId, meta, path, mems, reason);
     }

@@ -212,6 +212,13 @@ internal sealed class ColumnFamilyData
     /// <summary>Versions of this column family still referenced ("rocksdb.num-live-versions"). Guarded by the DB mutex.</summary>
     public int LiveVersions;
 
+    /// <summary>
+    /// Size of the distinct table files referenced by any live version of this column family
+    /// (ColumnFamilyData::GetTotalSstFilesSize, "rocksdb.total-sst-files-size"). Maintained by VersionSet's file
+    /// reference counts; guarded by the DB mutex.
+    /// </summary>
+    public ulong AllVersionsSstFilesSize;
+
     /// <summary>Cumulative flush / compaction statistics ("rocksdb.cfstats").</summary>
     public InternalStats Stats { get; }
 
