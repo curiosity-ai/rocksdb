@@ -543,4 +543,72 @@ public sealed class CompactionReviewFixesTests
         cfo.SetOption("verify_output_flags", "4294967295", preserveUnknown: false);
         Assert.AreEqual(VerifyOutputFlags.All, cfo.VerifyOutputFlags);
     }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // oldest_ancestor_time of compaction outputs (compaction_job.cc OpenCompactionOutputFile / FinishCompactionOutputFile)
+
+    /// <summary>Rewrites the oldest ancestor time of every file at <paramref name="level"/> whose keys are below <paramref name="limit"/>.</summary>
+    private static void SetOldestAncestorTime(RocksDatabase db, int level, byte[] limit, ulong time)
+    {
+        ColumnFamilyData cfd = db.DefaultColumnFamily.Data;
+        var edit = new VersionEdit { ColumnFamily = cfd.Id };
+        foreach (FileMetaData f in cfd.Current.Storage.LevelFiles(level))
+        {
+            if (DbFormat.ExtractUserKey(f.Largest).SequenceCompareTo(limit) >= 0) continue;
+            FileMetaData c = f.Clone();
+            c.OldestAncestorTime = time;
+            edit.DeleteFile(level, f.FileNumber);
+            edit.AddFile(level, c);
+        }
+        db.Impl.Versions.LogAndApplyAsync(cfd, edit, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Each output of a multi-output compaction gets the oldest ancestor time of the inputs overlapping its own key
+    /// range, not the whole compaction's minimum: outputs made only of new data are not TTL-expired.
+    /// </summary>
+    [TestMethod]
+    public void MultiOutputCompactionNarrowsOldestAncestorTimePerOutput()
+    {
+        MemoryFileSystem fs = NewFs();
+        var cfo = new ColumnFamilyOptions
+        {
+            DisableAutoCompactions = true,
+            TargetFileSizeBase = 4 * 1024,
+            Compression = RocksDb.Managed.Compression.CompressionType.None,
+            Ttl = 10_000,
+        };
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+        ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        ulong old = now - 100_000; // older than the TTL
+        for (int i = 0; i < 500; i++) db.Put(Key(i), Value(i, 0));
+        db.Flush();
+        db.CompactRange(); // several L6 files over keys 0..499
+        SetOldestAncestorTime(db, 6, Key(1000), old); // all files with keys 0..499
+        for (int i = 500; i < 1000; i++) db.Put(Key(i), Value(i, 0));
+        db.Flush();
+        db.CompactRange(s_force, null, null); // rewrites everything into many outputs
+        int oldOutputs = 0, newOutputs = 0;
+        foreach (LiveFileMetadata f in db.GetLiveFilesMetadata())
+        {
+            Assert.AreEqual(6, f.Level);
+            byte[] largestUser = f.LargestKey;
+            byte[] smallestUser = f.SmallestKey;
+            if (largestUser.AsSpan().SequenceCompareTo(Key(500)) < 0)
+            {
+                Assert.AreEqual(old, f.OldestAncestorTime, "file " + f.Name);
+                oldOutputs++;
+            }
+            else if (smallestUser.AsSpan().SequenceCompareTo(Key(500)) >= 0)
+            {
+                Assert.IsTrue(f.OldestAncestorTime >= now - 60, "file " + f.Name + " time " + f.OldestAncestorTime);
+                newOutputs++;
+            }
+        }
+        Assert.IsTrue(oldOutputs > 0 && newOutputs > 0, oldOutputs + " / " + newOutputs);
+        // Moved above the last level, only the outputs holding old data are TTL-expired (ComputeExpiredTtlFiles).
+        db.CompactRange(new CompactRangeOptions { ChangeLevel = true, TargetLevel = 5 }, null, null);
+        int expired = db.DefaultColumnFamily.Data.Current.Storage.ExpiredTtlFiles.Count;
+        Assert.IsTrue(expired >= oldOutputs && expired < oldOutputs + newOutputs, "expired " + expired + " old " + oldOutputs + " new " + newOutputs);
+    }
 }

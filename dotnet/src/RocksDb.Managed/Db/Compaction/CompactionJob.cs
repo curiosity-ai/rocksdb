@@ -1034,13 +1034,21 @@ internal sealed class CompactionJob
         return _fullHistoryTsLow is not null && _cfd.UserComparator.CompareTimestamp(t.GetTimestamp(i, k), _fullHistoryTsLow) < 0;
     }
 
+    // The subcompaction bounds as internal keys for MinInputFileOldestAncestorTime (empty = unbounded), built once.
+    private byte[]? _subStartKey;
+    private byte[]? _subEndKey;
+
     private void OpenOutput()
     {
         ulong fileNumber = _newFileNumber();
         CreatedFileNumbers.Add(fileNumber);
         _out.Path = OutputDirectory is { } outDir ? FileNames.MakeTableFileName(outDir, fileNumber) : FileNames.TableFileName(_db.DbPaths, fileNumber, _c.OutputPathId);
         ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        ulong oldestAncestor = _c.MinInputFileOldestAncestorTime();
+        // CompactionJob::OpenCompactionOutputFile: the oldest ancestor time of the input files overlapping this
+        // subcompaction (bounds SetMinPossibleForUserKey(start / end)), else the current time.
+        _subStartKey ??= _subStart is null ? [] : BoundaryKey(_subStart, DbFormat.ValueTypeForSeek);
+        _subEndKey ??= _subEnd is null ? [] : BoundaryKey(_subEnd, DbFormat.ValueTypeForSeek);
+        ulong oldestAncestor = _c.MinInputFileOldestAncestorTime(_subStartKey, _subEndKey, _cfd.TableCache);
         if (oldestAncestor == ulong.MaxValue) oldestAncestor = now;
         ulong newestKeyTime = _c.MaxInputFileNewestKeyTime();
         VersionStorageInfo vs = _c.InputStorage;
@@ -1174,6 +1182,13 @@ internal sealed class CompactionJob
                 meta.MarkedForCompaction = builder.NeedCompact;
                 // Entry stats as the version would load them from the table properties (no table read needed).
                 meta.SetEntryStats(builder.Properties);
+                // CompactionJob::FinishCompactionOutputFile: with accurate smallest and largest key, we can get a
+                // slightly more accurate oldest ancestor time (more accurate in the MANIFEST than in the table property).
+                if (meta.Smallest.Length > DbFormat.InternalKeyFooterSize && meta.Largest.Length > DbFormat.InternalKeyFooterSize)
+                {
+                    ulong refined = _c.MinInputFileOldestAncestorTime(meta.Smallest, meta.Largest, _cfd.TableCache);
+                    if (refined != ulong.MaxValue) meta.OldestAncestorTime = refined;
+                }
                 Stats.NumOutputRangeDeletions += (long)builder.Properties.NumRangeDeletions;
                 keep = true;
             }
