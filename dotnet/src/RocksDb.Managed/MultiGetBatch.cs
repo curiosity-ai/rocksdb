@@ -400,7 +400,7 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
     internal void SetIncomplete(int key)
     {
         _contexts[key]!.State = GetContext.GetState.Found;
-        SetError(key, new RocksDbException(StatusCode.Incomplete, "Incomplete: no blocking io"));
+        SetError(key, new RocksDbException(StatusCode.Incomplete, "Result incomplete: no blocking io"));
     }
 
     /// <summary>

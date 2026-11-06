@@ -53,12 +53,12 @@ internal static class ReadDeadline
     public static void CheckBeforeIo()
     {
         long d = t_deadlineMicros;
-        if (d != 0 && NowMicros() > d) ThrowTimedOut();
+        if (d != 0 && NowMicros() >= d) ThrowTimedOut();
     }
 
     private static long NowMicros() => (DateTimeOffset.UtcNow - DateTimeOffset.UnixEpoch).Ticks / TimeSpan.TicksPerMicrosecond;
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     [System.Diagnostics.CodeAnalysis.DoesNotReturn]
-    internal static void ThrowTimedOut() => throw new RocksDbException(StatusCode.TimedOut, "Operation timed out: ");
+    internal static void ThrowTimedOut() => throw new RocksDbException(StatusCode.TimedOut, "Operation timed out: Deadline exceeded");
 }

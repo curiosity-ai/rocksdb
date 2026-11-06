@@ -1075,7 +1075,7 @@ public sealed partial class BlockBasedTableReader : TableReader
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     [System.Diagnostics.CodeAnalysis.DoesNotReturn]
-    internal static void ThrowNoIo() => throw new RocksDbException(StatusCode.Incomplete, "Incomplete: no blocking io");
+    internal static void ThrowNoIo() => throw new RocksDbException(StatusCode.Incomplete, "Result incomplete: no blocking io");
 
     private BlockRef ReadAndInsert(BlockCache cache, in CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {

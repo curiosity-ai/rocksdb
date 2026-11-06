@@ -31,6 +31,13 @@ public sealed class ReadOptions
     /// <see cref="Db.Iterators.Iterator.InternalKey"/>). Requires <see cref="Timestamp"/>.
     /// </summary>
     public ReadOnlyMemory<byte>? IterStartTs { get; set; }
+    /// <summary>
+    /// ReadOptions::read_tier. <see cref="ReadTier.BlockCacheTier"/>: no file I/O, data that is not in the memtables or
+    /// the block cache makes Get / MultiGet keys / iterator moves fail with <see cref="StatusCode.Incomplete"/>.
+    /// <see cref="ReadTier.PersistedTier"/>: point lookups skip the memtables once data was written with
+    /// <see cref="WriteOptions.DisableWal"/>; iterators are NotSupported. <see cref="ReadTier.MemtableTier"/>: iterators
+    /// only see the memtables (point lookups are not restricted, like upstream).
+    /// </summary>
     public ReadTier ReadTier { get; set; } = ReadTier.ReadAllTier;
     public bool IgnoreRangeDeletions { get; set; }
     public bool AsyncIo { get; set; }
@@ -38,6 +45,11 @@ public sealed class ReadOptions
     /// <summary>Iterator readahead in bytes; 0 enables automatic readahead.</summary>
     public ulong ReadaheadSize { get; set; }
     public ulong MaxSkippableInternalKeys { get; set; }
+    /// <summary>
+    /// ReadOptions::tailing: the iterator sees data written after its creation (it reads at the latest sequence and
+    /// renews its view after memtable switches, flushes and compactions on Seek / SeekToFirst / Next; the snapshot is
+    /// ignored). SeekToLast, SeekForPrev and Prev are NotSupported, like upstream's ForwardIterator.
+    /// </summary>
     public bool Tailing { get; set; }
     public bool TotalOrderSeek { get; set; }
     public bool AutoPrefixMode { get; set; }
@@ -52,9 +64,23 @@ public sealed class ReadOptions
     public bool BackgroundPurgeOnIteratorCleanup { get; set; }
     public bool AutoReadaheadSize { get; set; } = true;
     public bool AllowUnpreparedValue { get; set; }
-    /// <summary>Per-operation deadline; <see cref="TimeSpan.Zero"/> means none.</summary>
+    /// <summary>
+    /// ReadOptions::deadline: an absolute point in time, as the time elapsed since the Unix epoch (upstream compares it
+    /// with SystemClock::NowMicros); <see cref="TimeSpan.Zero"/> (default) means none. Get, MultiGet and iterator moves
+    /// that need a table file read once it has passed fail with <see cref="StatusCode.TimedOut"/> (reads served by the
+    /// memtables or the block cache still succeed); MultiGet fails every key with TimedOut when it starts after the
+    /// deadline. E.g. <c>DateTimeOffset.UtcNow.AddMilliseconds(5) - DateTimeOffset.UnixEpoch</c>.
+    /// </summary>
     public TimeSpan Deadline { get; set; }
+    /// <summary>
+    /// ReadOptions::io_timeout: the timeout of each file read, passed to file systems that support it. Like upstream's
+    /// PosixFileSystem, the built-in file systems do not enforce it.
+    /// </summary>
     public TimeSpan IoTimeout { get; set; }
+    /// <summary>
+    /// ReadOptions::value_size_soft_limit: once the values a MultiGet has found exceed this many bytes, the keys not
+    /// looked up yet fail with <see cref="StatusCode.Aborted"/> (the key whose value crosses the limit is returned).
+    /// </summary>
     public ulong ValueSizeSoftLimit { get; set; } = ulong.MaxValue;
     /// <summary>
     /// rate_limiter_priority: charge the table block reads of this operation (Get, MultiGet, iterators) to

@@ -284,6 +284,14 @@ internal sealed partial class DbImpl
     internal static bool IsFilterSkipped(VersionStorageInfo s, int level, bool isFileLastInLevel) =>
         (level > 0 || isFileLastInLevel) && level == s.NumNonEmptyLevels - 1;
 
+    /// <summary>
+    /// FilePicker::GetNextFile: L0 files are skipped by key range unless the DB has a single non-empty level of at most
+    /// three files ("the system is highly tuned to minimize number of tables queried by each query"); then every file
+    /// is queried and its filter decides.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool CheckL0KeyRange(VersionStorageInfo s, int l0Files) => s.NumNonEmptyLevels > 1 || l0Files > 3;
+
     /// <summary>Memtable part of GetImpl. Returns true if a final result was found.</summary>
     private static bool GetFromMemTables(SuperVersion sv, scoped in LookupKey lkey, GetContext ctx)
     {
@@ -316,10 +324,11 @@ internal sealed partial class DbImpl
         int tsSize = cfd.TimestampSize;
         bool sample = FileReadSample.ShouldSampleFileRead();
         ReadOnlySpan<FileMetaData> l0 = s.LevelFiles(0);
+        bool checkL0Range = CheckL0KeyRange(s, l0.Length);
         for (int i = 0; i < l0.Length; i++)
         {
             FileMetaData f = l0[i];
-            if (CompareFileBoundary(ucmp, tsSize, userKey, f.Smallest) < 0 || CompareFileBoundary(ucmp, tsSize, userKey, f.Largest) > 0) continue;
+            if (checkL0Range && (CompareFileBoundary(ucmp, tsSize, userKey, f.Smallest) < 0 || CompareFileBoundary(ucmp, tsSize, userKey, f.Largest) > 0)) continue;
             if (sample) FileReadSample.SampleFileReadInc(f);
             ctx.ReadFlags = WithFilterSkip(cfd, s, 0, i == l0.Length - 1, ctx.ReadFlags);
             bool done = GetFromFile(cfd, f, ikey, userKey, snapshot, ctx);
@@ -449,10 +458,11 @@ internal sealed partial class DbImpl
             Comparator ucmp = cfd.UserComparator;
             bool sample = FileReadSample.ShouldSampleFileRead();
             FileMetaData[] l0 = s.LevelFilesArray(0);
+            bool checkL0Range = CheckL0KeyRange(s, l0.Length);
             for (int i = 0; i < l0.Length; i++)
             {
                 FileMetaData f = l0[i];
-                if (!UserKeyInFileRange(ucmp, key.Span, f)) continue;
+                if (checkL0Range && !UserKeyInFileRange(ucmp, key.Span, f)) continue;
                 if (sample) FileReadSample.SampleFileReadInc(f);
                 ctx.ReadFlags = WithFilterSkip(cfd, s, 0, i == l0.Length - 1, ctx.ReadFlags);
                 bool done = await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false);
@@ -538,12 +548,13 @@ internal sealed partial class DbImpl
             Comparator ucmp = cfd.UserComparator;
             int tsSize = cfd.TimestampSize;
             FileMetaData[] l0 = s.LevelFilesArray(0);
+            bool checkL0Range = CheckL0KeyRange(s, l0.Length);
             bool done = false;
             bool sample = FileReadSample.ShouldSampleFileRead();
             for (int i = 0; i < l0.Length && !done; i++)
             {
                 FileMetaData f = l0[i];
-                if (!UserKeyInFileRangeWithoutTimestamp(ucmp, tsSize, ikey, f)) continue;
+                if (checkL0Range && !UserKeyInFileRangeWithoutTimestamp(ucmp, tsSize, ikey, f)) continue;
                 if (sample) FileReadSample.SampleFileReadInc(f);
                 ctx.ReadFlags = WithFilterSkip(cfd, s, 0, i == l0.Length - 1, ctx.ReadFlags);
                 done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);

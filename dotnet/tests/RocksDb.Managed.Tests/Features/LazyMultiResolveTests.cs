@@ -136,6 +136,9 @@ public sealed class LazyMultiResolveTests
             using var keys = new MultiGetBatch();
             keys.Add(B("k1")).Add(B("k2"));
             using var result = new LazyWideColumnsBatch();
+            // Caches the table block (the lazy lookup reads no blob).
+            db.DefaultColumnFamily.MultiGetEntityLazy(null, keys, result);
+            result.Reset();
             // Block cache tier: blob reads that would need I/O fail with Incomplete, inline reads succeed.
             db.DefaultColumnFamily.MultiGetEntityLazy(new ReadOptions { ReadTier = ReadTier.BlockCacheTier }, keys, result);
             int v1 = result[0].IndexOf("v"u8), i1 = result[0].IndexOf("i"u8);

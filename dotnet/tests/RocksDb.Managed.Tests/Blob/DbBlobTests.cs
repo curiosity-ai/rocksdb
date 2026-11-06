@@ -391,7 +391,11 @@ public sealed class DbBlobTests
         db.Flush();
         Assert.IsTrue(IntProperty(db, DbProperties.BlobCacheUsage) > 0);
         Assert.AreEqual((ulong)(1 << 20), IntProperty(db, DbProperties.BlobCacheCapacity));
-        // Served from the cache even when no I/O is allowed.
+        // Served from the cache even when no I/O is allowed (once the table's data block holding the blob index is
+        // cached too: kBlockCacheTier makes an uncached table block Incomplete).
+        Assert.AreEqual(StatusCode.Incomplete,
+            Assert.ThrowsExactly<RocksDbException>(() => db.Get(new ReadOptions { ReadTier = ReadTier.BlockCacheTier }, B("k"))).Code);
+        Assert.AreEqual("blob-value", GetString(db, "k"));
         Assert.AreEqual("blob-value", S(db.Get(new ReadOptions { ReadTier = ReadTier.BlockCacheTier }, B("k"))));
 
         // Without prepopulation a block-cache-tier read of an uncached blob is Incomplete.

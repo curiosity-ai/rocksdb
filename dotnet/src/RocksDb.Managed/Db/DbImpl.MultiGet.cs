@@ -91,6 +91,7 @@ internal sealed partial class DbImpl
                 int[] sub = batch.Sub;
                 // L0: every file may overlap every key; newest first.
                 FileMetaData[] l0 = s.LevelFilesArray(0);
+                bool checkL0Range = CheckL0KeyRange(s, l0.Length); // FilePickerMultiGet
                 for (int fi = 0; fi < l0.Length && pending > 0; fi++)
                 {
                     FileMetaData f = l0[fi];
@@ -98,7 +99,7 @@ internal sealed partial class DbImpl
                     for (int j = 0; j < pending; j++)
                     {
                         int k = order[j];
-                        if (UserKeyInFileRange(ucmp, batch.UserKey(k), f)) sub[m++] = k;
+                        if (!checkL0Range || UserKeyInFileRange(ucmp, batch.UserKey(k), f)) sub[m++] = k;
                     }
                     if (m == 0) continue;
                     batch.ReadFlags = WithFilterSkip(cfd, s, 0, fi == l0.Length - 1, batch.ReadFlags);

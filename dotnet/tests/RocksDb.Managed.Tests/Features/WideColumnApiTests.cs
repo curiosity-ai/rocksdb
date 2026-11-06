@@ -486,6 +486,7 @@ public sealed class WideColumnApiTests
         db.Flush();
         ColumnFamily cf = db.DefaultColumnFamily;
         using var lazy = new LazyWideColumns();
+        Assert.IsTrue(cf.TryGetEntityLazy(null, B("k"), lazy)); // caches the table block (no blob read)
         Assert.IsTrue(cf.TryGetEntityLazy(new ReadOptions { ReadTier = ReadTier.BlockCacheTier }, B("k"), lazy));
         Assert.AreEqual(StatusCode.Incomplete, Assert.ThrowsExactly<RocksDbException>(() => lazy.ResolveColumn(1)).Code);
         // A merge operand on top: the entity is resolved eagerly (merged default column, inline columns).
