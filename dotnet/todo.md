@@ -284,7 +284,7 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [ ] `max_successive_merges` is accepted but ignored (upstream folds merge operands into a Put at write time once the limit is hit) (S)
 - [ ] `min_write_buffer_number_to_merge` is ignored: immutable memtables are flushed as soon as they are sealed (M)
 
-## Second correctness review (2026-11-06; 5 reviewers vs C++ 11.14 / native 11.12; evidence in each item's source refs)
+## Second correctness review (2026-11-06; all items being fixed by 6 agents: recovery+write, options, compaction, read path, TTL+merge+txn, APIs+properties+events; 5 reviewers vs C++ 11.14 / native 11.12; evidence in each item's source refs)
 
 P1/P2 confirmed bugs (reproduced):
 - [ ] avoid_flush_during_recovery: a flush during WAL replay doesn't advance the CF log number (upstream flushes all CFs at the end if any recovery flush happened, db_impl_open.cc MaybeFlushFinalMemtableOrRestoreActiveLogFiles) -> next open replays again, merge operands applied twice (DbImpl.Open.cs RecoverLogFilesAsync) (S)
