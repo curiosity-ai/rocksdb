@@ -1261,6 +1261,10 @@ Not ported yet (tracked in [todo.md](todo.md)):
   and transaction databases and `sst_dump` on PlainTable / CuckooTable files.
 - Not supported, as upstream: user-defined timestamps in optimistic transactions and explicit-timestamp
   `WriteBatchWithIndex` writes.
+- Not ported yet: flush-time compaction filtering (a `CompactionFilterFactory` whose `ShouldFilterTableFileCreation`
+  accepts flushes is only checked for `IgnoreSnapshots`, its filter is not applied to flushes); the read-back of flush
+  outputs with `ParanoidFileChecks` (compaction outputs are verified); the MANIFEST size check on close (upstream
+  rewrites the MANIFEST when its size differs from the expected one; `VerifyManifestContentOnClose` is ported).
 
 API and behavior differences:
 

@@ -1604,6 +1604,23 @@ factory costs ~90 ns per lock + unlock pair (virtual mutex calls, `Lock` + gener
 every unlock as upstream). The existing `TransactionBenchmarks` (Begin + 4 Put + Commit, WAL-bound ~20 us on this
 machine) do not resolve lock-manager costs, hence the dedicated benchmark.
 
+## Compaction OutputValidator: per-key order check (2026-11-06)
+
+The second correctness review added upstream's `OutputValidator` to `CompactionJob.AddToOutput`: one internal-key
+comparison of each output key with the previous key of its output file (the output's largest key, already kept), plus a
+rolling `NPHash64` of keys and values only with `paranoid_file_checks` / `verify_output_flags` kVerifyIteration (off by
+default). Measured with the dbbench runner, Release net10.0, `--engine managed --benchmarks
+fillrandom,compact,overwrite,compact --num 300000 --value_size 100 --compression none`, 7 runs each on a shared,
+loaded machine (other agents building); CPU time of the full-range `compact` rows (median, us per compaction):
+
+| row | before | after |
+|---|---|---|
+| compact after fillrandom (300k keys) | 107,847 | 109,119 (+1.2%) |
+| compact after overwrite (2 x 300k keys) | 196,751 | 202,950 (+3.1%) |
+
+Both within the run-to-run spread (96,996-116,389 and 183,614-300,723 before; 99,588-125,548 and 184,037-235,061
+after). Allocations per compaction unchanged (5.13 MB / 0.93-1.0 MB, per-file buffers).
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
