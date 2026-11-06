@@ -995,7 +995,15 @@ public sealed unsafe class MemTable : IDisposable
         _arena.Dispose();
         _memTracker?.FreeMem();
         Interlocked.Exchange(ref OnDisposed, null)?.Invoke();
+        FlushedPinnedSet?.Remove(this);
     }
+
+    /// <summary>
+    /// The column family's set of flushed memtables still referenced (by iterators' super versions) that this memtable
+    /// was added to after its flush; it leaves the set when disposed. Guarded by the DB mutex (Dispose of a referenced
+    /// flushed memtable runs in CleanupSuperVersion, under the mutex).
+    /// </summary>
+    internal HashSet<MemTable>? FlushedPinnedSet;
 
     /// <summary>
     /// Called once when the memtable is disposed (the last reference is gone): releases the blob direct write files it

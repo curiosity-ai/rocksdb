@@ -306,6 +306,16 @@ internal static class OptionEnumMaps
         ("FlushBlockBySizePolicyFactory", FlushBlockPolicyType.BySize),
         ("FlushBlockEveryKeyPolicyFactory", FlushBlockPolicyType.EveryKey),
     ]);
+
+    /// <summary>index_mode: block_base_table_index_mode_string_map (table/block_based/block_based_table_factory.cc).</summary>
+    public static readonly EnumMap<BlockBasedIndexMode> IndexMode = new(
+    [
+        ("kStandardOnly", BlockBasedIndexMode.StandardOnly),
+        ("kStandardDefault", BlockBasedIndexMode.StandardDefault),
+        ("kCustomDefault", BlockBasedIndexMode.CustomDefault),
+        ("kCustomOnly", BlockBasedIndexMode.CustomOnly),
+        ("kStandardRequired", BlockBasedIndexMode.StandardRequired),
+    ]);
 }
 
 /// <summary>String helpers matching RocksDB's option (de)serialization (util/string_util.cc, options/options_helper.cc).</summary>

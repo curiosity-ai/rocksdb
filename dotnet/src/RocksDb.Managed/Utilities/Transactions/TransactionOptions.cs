@@ -77,6 +77,14 @@ public sealed class TransactionDbOptions
     public int NumStripes { get; set; } = 16;
 
     /// <summary>
+    /// custom_mutex_factory: when set, the point lock manager guards each lock-table stripe with a mutex and a
+    /// condition variable from this factory instead of its built-in ones (see <see cref="TransactionDbMutexFactory"/>).
+    /// Lock waits then block the calling thread, also from the async APIs. Null (default): the built-in lock-free-wait
+    /// implementation (asynchronous waits, no allocation per lock). Not used by range locking.
+    /// </summary>
+    public TransactionDbMutexFactory? CustomMutexFactory { get; set; }
+
+    /// <summary>
     /// Default lock wait timeout of transactions that do not set <see cref="TransactionOptions.LockTimeout"/>
     /// (transaction_lock_timeout, default 1 s). <see cref="Timeout.InfiniteTimeSpan"/> waits forever,
     /// <see cref="TimeSpan.Zero"/> fails immediately.

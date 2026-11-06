@@ -151,3 +151,97 @@ public class TransactionBenchmarks
         }
     }
 }
+
+/// <summary>Which lock-table mutexes a <see cref="PointLockBenchmarks"/> run uses.</summary>
+public enum TxnMutexKind
+{
+    /// <summary>The built-in stripe locks (TransactionDbOptions.CustomMutexFactory = null).</summary>
+    Builtin,
+    /// <summary>TransactionDbMutexFactory.Default through the custom-mutex path.</summary>
+    CustomDefault,
+}
+
+/// <summary>
+/// Point-lock acquire/release cost of a pessimistic (WriteCommitted) transaction without writes: Begin, lock 4 keys
+/// (GetForUpdate of missing keys / Put into the transaction's batch), Rollback releases them. Measures the lock manager
+/// with the built-in stripe locks and with a custom mutex factory (TransactionDbOptions.CustomMutexFactory).
+/// </summary>
+[MemoryDiagnoser]
+[BenchmarkCategory("Txn")]
+public class PointLockBenchmarks
+{
+    private const int KeyCount = 4096;
+    private const int LocksPerTxn = 4;
+    private const int TxnsPerInvoke = 1000;
+
+    [Params(TxnMutexKind.Builtin, TxnMutexKind.CustomDefault)]
+    public TxnMutexKind Mutex { get; set; }
+
+    private string _dir = "";
+    private TransactionDatabase _db = null!;
+    private readonly WriteOptions _wo = new();
+    private readonly TransactionOptions _txnOptions = new();
+    private readonly System.Buffers.ArrayBufferWriter<byte> _sink = new();
+    private Transaction? _txn;
+    private byte[][] _keys = null!;
+    private readonly byte[] _value = new byte[100];
+    private int _next;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        _dir = Path.Combine(Path.GetTempPath(), "rocksdb-lockbench-" + Environment.ProcessId + "-" + Mutex);
+        if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true);
+        var tdo = new TransactionDbOptions { CustomMutexFactory = Mutex == TxnMutexKind.CustomDefault ? TransactionDbMutexFactory.Default : null };
+        _db = TransactionDatabase.Open(_dir, new DbOptions { CreateIfMissing = true }, tdo,
+            [new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, new ColumnFamilyOptions())]);
+        _keys = new byte[KeyCount][];
+        var rnd = new Random(42);
+        for (int i = 0; i < KeyCount; i++)
+        {
+            _keys[i] = new byte[16];
+            rnd.NextBytes(_keys[i]);
+        }
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _txn?.Dispose();
+        _db.Dispose();
+        try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
+    }
+
+    private byte[] NextKey()
+    {
+        byte[] k = _keys[_next];
+        _next = (_next + 1) & (KeyCount - 1);
+        return k;
+    }
+
+    [Benchmark(OperationsPerInvoke = TxnsPerInvoke, Description = "Begin + 4 GetForUpdate (missing) + Rollback")]
+    public void GetForUpdateRollback()
+    {
+        for (int t = 0; t < TxnsPerInvoke; t++)
+        {
+            Transaction txn = _txn = _txn is null ? _db.BeginTransaction(_wo, _txnOptions) : _db.BeginTransaction(_wo, _txnOptions, _txn);
+            for (int i = 0; i < LocksPerTxn; i++)
+            {
+                _sink.ResetWrittenCount();
+                txn.TryGetForUpdate(null, NextKey(), _sink);
+            }
+            txn.Rollback();
+        }
+    }
+
+    [Benchmark(OperationsPerInvoke = TxnsPerInvoke, Description = "Begin + 4 Put + Rollback")]
+    public void PutRollback()
+    {
+        for (int t = 0; t < TxnsPerInvoke; t++)
+        {
+            Transaction txn = _txn = _txn is null ? _db.BeginTransaction(_wo, _txnOptions) : _db.BeginTransaction(_wo, _txnOptions, _txn);
+            for (int i = 0; i < LocksPerTxn; i++) txn.Put(NextKey(), _value);
+            txn.Rollback();
+        }
+    }
+}
