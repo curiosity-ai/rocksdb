@@ -787,6 +787,8 @@ public sealed class DbBasicTests
         db.Flush();
         byte[] missing = B("missing");
         for (int i = 0; i < 100; i++) db.TryGet(missing, buffer, out _); // opens the table reader
+        // A first hit fills the default block cache (its first insert creates the cache's table slots).
+        Assert.IsTrue(db.TryGet(key, buffer, out _));
         long before = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < 2000; i++)
         {
