@@ -201,3 +201,42 @@ public enum FlushBlockPolicyType : byte
     /// <summary>"FlushBlockEveryKeyPolicyFactory": one entry per data block.</summary>
     EveryKey,
 }
+
+/// <summary>
+/// Port of rocksdb::VerifyOutputFlags (include/rocksdb/advanced_options.h): a bitmask of what to verify on compaction
+/// output files (low bits) and for which compactions (bits 10+). Persisted as its uint32 value (verify_output_flags).
+/// </summary>
+[Flags]
+public enum VerifyOutputFlags : uint
+{
+    /// <summary>kVerifyNone: no verification (default).</summary>
+    None = 0x0,
+    /// <summary>kVerifyBlockChecksum: verify block checksums.</summary>
+    VerifyBlockChecksum = 1u << 0,
+    /// <summary>kVerifyIteration: iterate the output and compare the full key/value hash with what was written.</summary>
+    VerifyIteration = 1u << 1,
+    /// <summary>kVerifyFileChecksum: verify the file-level checksum.</summary>
+    VerifyFileChecksum = 1u << 2,
+    /// <summary>kEnableForLocalCompaction: verify outputs of local compactions.</summary>
+    EnableForLocalCompaction = 1u << 10,
+    /// <summary>kEnableForRemoteCompaction: verify outputs of remote compactions.</summary>
+    EnableForRemoteCompaction = 1u << 11,
+    /// <summary>kVerifyAll.</summary>
+    VerifyAll = 0xFFFFFFFF,
+}
+
+/// <summary>
+/// Port of rocksdb::PinningTier (include/rocksdb/table.h): which block-based tables' metadata blocks are pinned in the
+/// block cache (<see cref="MetadataCacheOptions"/>).
+/// </summary>
+public enum PinningTier : byte
+{
+    /// <summary>kFallback: use pin_l0_filter_and_index_blocks_in_cache / pin_top_level_index_and_filter (default).</summary>
+    Fallback,
+    /// <summary>kNone: no tables.</summary>
+    None,
+    /// <summary>kFlushedAndSimilar: L0 tables smaller than 1.5 times write_buffer_size.</summary>
+    FlushedAndSimilar,
+    /// <summary>kAll: all tables.</summary>
+    All,
+}

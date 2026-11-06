@@ -54,17 +54,20 @@ public sealed class CompactionOptionsFifo : PersistedOptions<CompactionOptionsFi
     /// </summary>
     public bool UseKvRatioCompaction { get; set; }
 
+    // Registered in the order native 11.12 (libstdc++ unordered_map iteration) writes the members, so the struct value is
+    // byte-identical to native's.
     private static readonly OptionTable<CompactionOptionsFifo> s_table = new OptionTable<CompactionOptionsFifo>()
-        .UInt64("max_table_files_size", static o => o.MaxTableFilesSize, static (o, v) => o.MaxTableFilesSize = v)
-        .Bool("allow_compaction", static o => o.AllowCompaction, static (o, v) => o.AllowCompaction = v)
-        .UInt64("age_for_warm", static o => o.AgeForWarm, static (o, v) => o.AgeForWarm = v)
-        .Add("file_temperature_age_thresholds", static o => FileTemperatureAge.FormatVector(o.FileTemperatureAgeThresholds),
-            static (o, v) => o.FileTemperatureAgeThresholds = FileTemperatureAge.ParseVector("file_temperature_age_thresholds", v))
+        .Bool("use_kv_ratio_compaction", static o => o.UseKvRatioCompaction, static (o, v) => o.UseKvRatioCompaction = v)
+        .UInt64("max_data_files_size", static o => o.MaxDataFilesSize, static (o, v) => o.MaxDataFilesSize = v)
+        .UInt64("trivial_copy_buffer_size", static o => o.TrivialCopyBufferSize, static (o, v) => o.TrivialCopyBufferSize = v)
         .Bool("allow_trivial_copy_when_change_temperature", static o => o.AllowTrivialCopyWhenChangeTemperature,
             static (o, v) => o.AllowTrivialCopyWhenChangeTemperature = v)
-        .UInt64("trivial_copy_buffer_size", static o => o.TrivialCopyBufferSize, static (o, v) => o.TrivialCopyBufferSize = v)
-        .UInt64("max_data_files_size", static o => o.MaxDataFilesSize, static (o, v) => o.MaxDataFilesSize = v)
-        .Bool("use_kv_ratio_compaction", static o => o.UseKvRatioCompaction, static (o, v) => o.UseKvRatioCompaction = v);
+        .Add("file_temperature_age_thresholds", static o => FileTemperatureAge.FormatVector(o.FileTemperatureAgeThresholds),
+            static (o, v) => o.FileTemperatureAgeThresholds = FileTemperatureAge.ParseVector("file_temperature_age_thresholds", v))
+        .Bool("allow_compaction", static o => o.AllowCompaction, static (o, v) => o.AllowCompaction = v)
+        .UInt64("age_for_warm", static o => o.AgeForWarm, static (o, v) => o.AgeForWarm = v)
+        .UInt64("max_table_files_size", static o => o.MaxTableFilesSize, static (o, v) => o.MaxTableFilesSize = v)
+        .Deprecated("ttl");
 
     internal override OptionTable<CompactionOptionsFifo> OptionTable => s_table;
 
@@ -79,20 +82,11 @@ public sealed class CompactionOptionsFifo : PersistedOptions<CompactionOptionsFi
     internal string ToStructString() => OptionStrings.FormatStruct(ToOptionsList());
 
     /// <summary>
-    /// Parses the struct value. Like upstream's parse function for compaction_options_fifo, a single scalar (no '=')
-    /// is assigned to max_table_files_size.
+    /// Upstream's parse function for compaction_options_fifo (options/cf_options.cc): a single scalar (no '=') is the old
+    /// format and is assigned to max_table_files_size.
     /// </summary>
-    internal static CompactionOptionsFifo ParseStructString(string name, string value)
-    {
-        var c = new CompactionOptionsFifo();
-        if (!value.Contains('=', StringComparison.Ordinal))
-        {
-            c.SetOption("max_table_files_size", value.Trim(), preserveUnknown: false);
-            return c;
-        }
-        c.SetOptions(OptionStrings.ParseStruct(name, value), preserveUnknown: true);
-        return c;
-    }
+    internal static void ParseLegacy(CompactionOptionsFifo o, string value) =>
+        o.MaxTableFilesSize = OptionStrings.ParseUInt64("compaction_options_fifo", value);
 }
 
 /// <summary>Port of rocksdb::FileTemperatureAge (include/rocksdb/advanced_options.h).</summary>
@@ -210,17 +204,19 @@ public sealed class CompactionOptionsUniversal : PersistedOptions<CompactionOpti
     /// </summary>
     public bool ReduceFileLocking { get; set; } = true;
 
+    // Registered in the order native 11.12 (libstdc++ unordered_map iteration) writes the members, so the struct value is
+    // byte-identical to native's.
     private static readonly OptionTable<CompactionOptionsUniversal> s_table = new OptionTable<CompactionOptionsUniversal>()
-        .UInt32("size_ratio", static o => o.SizeRatio, static (o, v) => o.SizeRatio = v)
-        .UInt32("min_merge_width", static o => o.MinMergeWidth, static (o, v) => o.MinMergeWidth = v)
-        .UInt32("max_merge_width", static o => o.MaxMergeWidth, static (o, v) => o.MaxMergeWidth = v)
-        .UInt32("max_size_amplification_percent", static o => o.MaxSizeAmplificationPercent, static (o, v) => o.MaxSizeAmplificationPercent = v)
-        .Int32("compression_size_percent", static o => o.CompressionSizePercent, static (o, v) => o.CompressionSizePercent = v)
-        .Enum("stop_style", OptionEnumMaps.CompactionStopStyle, static o => o.StopStyle, static (o, v) => o.StopStyle = v)
-        .Bool("allow_trivial_move", static o => o.AllowTrivialMove, static (o, v) => o.AllowTrivialMove = v)
-        .Int32("max_read_amp", static o => o.MaxReadAmp, static (o, v) => o.MaxReadAmp = v)
+        .Bool("reduce_file_locking", static o => o.ReduceFileLocking, static (o, v) => o.ReduceFileLocking = v)
         .Bool("incremental", static o => o.Incremental, static (o, v) => o.Incremental = v)
-        .Bool("reduce_file_locking", static o => o.ReduceFileLocking, static (o, v) => o.ReduceFileLocking = v);
+        .Int32("compression_size_percent", static o => o.CompressionSizePercent, static (o, v) => o.CompressionSizePercent = v)
+        .Bool("allow_trivial_move", static o => o.AllowTrivialMove, static (o, v) => o.AllowTrivialMove = v)
+        .UInt32("max_size_amplification_percent", static o => o.MaxSizeAmplificationPercent, static (o, v) => o.MaxSizeAmplificationPercent = v)
+        .UInt32("max_merge_width", static o => o.MaxMergeWidth, static (o, v) => o.MaxMergeWidth = v)
+        .Enum("stop_style", OptionEnumMaps.CompactionStopStyle, static o => o.StopStyle, static (o, v) => o.StopStyle = v)
+        .UInt32("min_merge_width", static o => o.MinMergeWidth, static (o, v) => o.MinMergeWidth = v)
+        .Int32("max_read_amp", static o => o.MaxReadAmp, static (o, v) => o.MaxReadAmp = v)
+        .UInt32("size_ratio", static o => o.SizeRatio, static (o, v) => o.SizeRatio = v);
 
     internal override OptionTable<CompactionOptionsUniversal> OptionTable => s_table;
 
@@ -232,11 +228,4 @@ public sealed class CompactionOptionsUniversal : PersistedOptions<CompactionOpti
     }
 
     internal string ToStructString() => OptionStrings.FormatStruct(ToOptionsList());
-
-    internal static CompactionOptionsUniversal ParseStructString(string name, string value)
-    {
-        var c = new CompactionOptionsUniversal();
-        c.SetOptions(OptionStrings.ParseStruct(name, value), preserveUnknown: true);
-        return c;
-    }
 }

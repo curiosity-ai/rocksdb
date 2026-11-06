@@ -20,6 +20,8 @@ internal sealed partial class DbImpl
         ArgumentNullException.ThrowIfNull(columnFamilies);
         string dbname = path.Length > 1 ? path.TrimEnd('/') : path;
         DbOptions sanitized = options.Clone();
+        ValidateDbOptions(sanitized);
+        SanitizeDbOptions(sanitized);
         SanitizeWalOptions(sanitized);
         var db = new DbImpl(dbname, sanitized);
         try
@@ -179,6 +181,7 @@ internal sealed partial class DbImpl
             state = ManifestReader.RecoverFromDirectory(FileSystem, DbName, _comparatorResolver, out manifestNumber);
         }
         Versions.RecoverFrom(state, manifestNumber);
+        AddImplicitStatsColumnFamily(descriptors, state.FindColumnFamily(PersistentStatsColumnFamilyName) is not null);
 
         // Missing descriptors for existing CFs ("Column families not opened").
         var notOpened = new List<string>();
@@ -311,6 +314,7 @@ internal sealed partial class DbImpl
         {
             await CreateColumnFamilyCoreAsync(name, descriptors[name], writeOptionsFile: false, synchronous, ct).ConfigureAwait(false);
         }
+        if (Options.PersistStatsToDisk) await InitPersistStatsColumnFamilyAsync(synchronous, ct).ConfigureAwait(false);
 
         StartSstFileManager();
         DeleteObsoleteFilesFullScan();
@@ -319,6 +323,7 @@ internal sealed partial class DbImpl
         LogOpenSummary();
         LogInfo("DB pointer " + GetHashCode().ToString("x", CultureInfo.InvariantCulture) + " opened " + DbName);
         StartStatsDump();
+        StartStatsPersist();
         EnableBackgroundCompactions();
         RegisterRecordSeqnoTimeWorker();
     }
@@ -380,19 +385,9 @@ internal sealed partial class DbImpl
     {
         ColumnFamilyOptions o = options.Clone();
         SanitizeCfOptions(o, Options.AllowIngestBehind, DbPaths.Count);
-        // ColumnFamilyData::ValidateOptions (DB::Open / CreateColumnFamily): blob garbage collection ranges.
-        if (o.EnableBlobGarbageCollection)
-        {
-            if (o.BlobGarbageCollectionAgeCutoff is < 0 or > 1)
-            {
-                ThrowHelper.InvalidArgument("The age cutoff for blob garbage collection should be in the range [0.0, 1.0].");
-            }
-            if (o.BlobGarbageCollectionForceThreshold is < 0 or > 1)
-            {
-                ThrowHelper.InvalidArgument("The garbage ratio threshold for forcing blob garbage collection should be in the range [0.0, 1.0].");
-            }
-        }
-        ValidateReadTriggeredCompactionThreshold(o);
+        // ColumnFamilyData::ValidateOptions (DB::Open / CreateColumnFamily).
+        ValidateCfOptions(Options, o);
+        o.DbOffpeakTime = OffpeakTime;
         return o;
     }
 

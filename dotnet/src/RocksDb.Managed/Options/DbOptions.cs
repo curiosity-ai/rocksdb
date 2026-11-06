@@ -216,6 +216,70 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     public bool EnforceSingleDelContracts { get; set; } = true;
     public InfoLogLevel InfoLogLevel { get; set; } = InfoLogLevel.Info;
 
+    // ---- RocksDB 11.x options (options/db_options.cc) that native 11.12 writes ----------------
+    /// <summary>
+    /// max_manifest_space_amp_pct: the MANIFEST is rewritten once its size exceeds the size of a compacted MANIFEST by this
+    /// percentage (bounded by <see cref="MaxManifestFileSize"/>). Default 500. Mutable.
+    /// </summary>
+    public int MaxManifestSpaceAmpPct { get; set; } = 500;
+    /// <summary>verify_manifest_content_on_close: re-read and verify the MANIFEST when the DB is closed. Default false. Mutable.</summary>
+    public bool VerifyManifestContentOnClose { get; set; }
+    /// <summary>
+    /// optimize_manifest_for_recovery: write MANIFEST records that make recovery faster. Typed and persisted only (listed
+    /// under "Not ported yet"). Default false. Mutable.
+    /// </summary>
+    public bool OptimizeManifestForRecovery { get; set; }
+    /// <summary>
+    /// daily_offpeak_time_utc: the daily off-peak window "HH:mm-HH:mm" (UTC; empty = none). Validated at open and by
+    /// SetDBOptions like upstream (InvalidArgument for a malformed value or an empty window); during the window, files
+    /// due for periodic compaction before the next window starts are compacted early. Mutable.
+    /// </summary>
+    public string DailyOffpeakTimeUtc { get; set; } = "";
+    /// <summary>
+    /// periodic_compaction_phase_recovery_percent: spreads periodic compactions over time. Typed and persisted only
+    /// (listed under "Not ported yet"); 0 (default) is the classic behaviour, which the port implements. Mutable.
+    /// </summary>
+    public int PeriodicCompactionPhaseRecoveryPercent { get; set; }
+    /// <summary>fast_sst_open (EXPERIMENTAL): open table files lazily. Typed and persisted only. Default false. Mutable.</summary>
+    public bool FastSstOpen { get; set; }
+    /// <summary>remote_compaction_manifest_floor: typed and persisted only (remote compaction detail). Default true. Mutable.</summary>
+    public bool RemoteCompactionManifestFloor { get; set; } = true;
+    /// <summary>open_files_async: open table files in the background after DB::Open. Typed and persisted only. Default false.</summary>
+    public bool OpenFilesAsync { get; set; }
+    /// <summary>read_io_executor_threads: threads of the read IO executor. Typed and persisted only. Default 1.</summary>
+    public int ReadIoExecutorThreads { get; set; } = 1;
+    /// <summary>reuse_manifest_on_open: append to the existing MANIFEST at open. Typed and persisted only. Default false.</summary>
+    public bool ReuseManifestOnOpen { get; set; }
+    /// <summary>use_session_tmp_dir_for_remote_compaction: typed and persisted only. Default false.</summary>
+    public bool UseSessionTmpDirForRemoteCompaction { get; set; }
+    /// <summary>async_wal_precreate: create the next WAL file in the background. Typed and persisted only. Default false.</summary>
+    public bool AsyncWalPrecreate { get; set; }
+    /// <summary>background_close_inactive_wals: close inactive WAL files in the background. Typed and persisted only. Default false.</summary>
+    public bool BackgroundCloseInactiveWals { get; set; }
+    /// <summary>
+    /// enforce_write_buffer_manager_during_recovery: flush recovered memtables when the write buffer manager is full during
+    /// WAL replay. Typed and persisted only. Default true.
+    /// </summary>
+    public bool EnforceWriteBufferManagerDuringRecovery { get; set; } = true;
+    /// <summary>
+    /// prefix_seek_opt_in_only: when true, iterators only use prefix seek (the prefix extractor) when
+    /// <see cref="ReadOptions.PrefixSameAsStart"/> or <see cref="ReadOptions.AutoPrefixMode"/> is set, as if
+    /// <see cref="ReadOptions.TotalOrderSeek"/> were set otherwise. Default false.
+    /// </summary>
+    public bool PrefixSeekOptInOnly { get; set; }
+    /// <summary>use_direct_io_for_compaction_reads: direct I/O for compaction inputs. Typed and persisted only. Default false.</summary>
+    public bool UseDirectIoForCompactionReads { get; set; }
+    /// <summary>metadata_write_temperature: temperature hint for MANIFEST / OPTIONS files (single tier: persisted only).</summary>
+    public Temperature MetadataWriteTemperature { get; set; } = Temperature.Unknown;
+    /// <summary>wal_write_temperature: temperature hint for WAL files (single tier: persisted only).</summary>
+    public Temperature WalWriteTemperature { get; set; } = Temperature.Unknown;
+    /// <summary>follower_refresh_catchup_period_ms (follower DBs are not ported; persisted only). Default 10000.</summary>
+    public ulong FollowerRefreshCatchupPeriodMs { get; set; } = 10000;
+    /// <summary>follower_catchup_retry_count (persisted only). Default 10.</summary>
+    public ulong FollowerCatchupRetryCount { get; set; } = 10;
+    /// <summary>follower_catchup_retry_wait_ms (persisted only). Default 100.</summary>
+    public ulong FollowerCatchupRetryWaitMs { get; set; } = 100;
+
     private static readonly OptionTable<DbOptions> s_table = new OptionTable<DbOptions>()
         .Bool("create_if_missing", static o => o.CreateIfMissing, static (o, v) => o.CreateIfMissing = v)
         .Bool("create_missing_column_families", static o => o.CreateMissingColumnFamilies, static (o, v) => o.CreateMissingColumnFamilies = v)
@@ -295,11 +359,44 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
         .String("db_host_id", static o => o.DbHostId, static (o, v) => o.DbHostId = v)
         // AsCustomSharedPtr<FileChecksumGenFactory> (kByNameAllowFromNull): the factory's name; only the built-in
         // FileChecksumGenCrc32cFactory is recreated from an OPTIONS file, other names load as null.
-        .Add("file_checksum_gen_factory", static o => o.FileChecksumGenFactory?.Name ?? "",
+        .Add("file_checksum_gen_factory", static o => o.FileChecksumGenFactory?.Name ?? "nullptr",
             static (o, v) => o.FileChecksumGenFactory = OptionStrings.UnwrapId(v) == FileChecksumGenCrc32cFactory.ClassName ? FileChecksumGenCrc32cFactory.Instance : null)
         .Bool("enforce_single_del_contracts", static o => o.EnforceSingleDelContracts, static (o, v) => o.EnforceSingleDelContracts = v)
         .Enum("lowest_used_cache_tier", OptionEnumMaps.CacheTier, static o => o.LowestUsedCacheTier, static (o, v) => o.LowestUsedCacheTier = v)
-        .Enum("info_log_level", OptionEnumMaps.InfoLogLevel, static o => o.InfoLogLevel, static (o, v) => o.InfoLogLevel = v);
+        .Enum("info_log_level", OptionEnumMaps.InfoLogLevel, static o => o.InfoLogLevel, static (o, v) => o.InfoLogLevel = v)
+        // wal_filter: AsCustomRawPtr<WalFilter> (kByName, kAllowNull): written as the filter's name or "nullptr"; the
+        // object cannot be recreated from a name, so parsing keeps the current filter.
+        .Add("wal_filter", static o => o.WalFilter?.Name ?? "nullptr", static (_, _) => { })
+        .Int32("max_manifest_space_amp_pct", static o => o.MaxManifestSpaceAmpPct, static (o, v) => o.MaxManifestSpaceAmpPct = v)
+        .Bool("verify_manifest_content_on_close", static o => o.VerifyManifestContentOnClose, static (o, v) => o.VerifyManifestContentOnClose = v)
+        .Bool("optimize_manifest_for_recovery", static o => o.OptimizeManifestForRecovery, static (o, v) => o.OptimizeManifestForRecovery = v)
+        .String("daily_offpeak_time_utc", static o => o.DailyOffpeakTimeUtc, static (o, v) => o.DailyOffpeakTimeUtc = v)
+        .Int32("periodic_compaction_phase_recovery_percent", static o => o.PeriodicCompactionPhaseRecoveryPercent,
+            static (o, v) => o.PeriodicCompactionPhaseRecoveryPercent = v)
+        .Bool("fast_sst_open", static o => o.FastSstOpen, static (o, v) => o.FastSstOpen = v)
+        .Bool("remote_compaction_manifest_floor", static o => o.RemoteCompactionManifestFloor, static (o, v) => o.RemoteCompactionManifestFloor = v)
+        .Bool("open_files_async", static o => o.OpenFilesAsync, static (o, v) => o.OpenFilesAsync = v)
+        .Int32("read_io_executor_threads", static o => o.ReadIoExecutorThreads, static (o, v) => o.ReadIoExecutorThreads = v)
+        .Bool("reuse_manifest_on_open", static o => o.ReuseManifestOnOpen, static (o, v) => o.ReuseManifestOnOpen = v)
+        .Bool("use_session_tmp_dir_for_remote_compaction", static o => o.UseSessionTmpDirForRemoteCompaction,
+            static (o, v) => o.UseSessionTmpDirForRemoteCompaction = v)
+        .Bool("async_wal_precreate", static o => o.AsyncWalPrecreate, static (o, v) => o.AsyncWalPrecreate = v)
+        .Bool("background_close_inactive_wals", static o => o.BackgroundCloseInactiveWals, static (o, v) => o.BackgroundCloseInactiveWals = v)
+        .Bool("enforce_write_buffer_manager_during_recovery", static o => o.EnforceWriteBufferManagerDuringRecovery,
+            static (o, v) => o.EnforceWriteBufferManagerDuringRecovery = v)
+        .Bool("prefix_seek_opt_in_only", static o => o.PrefixSeekOptInOnly, static (o, v) => o.PrefixSeekOptInOnly = v)
+        .Bool("use_direct_io_for_compaction_reads", static o => o.UseDirectIoForCompactionReads, static (o, v) => o.UseDirectIoForCompactionReads = v)
+        .Enum("metadata_write_temperature", OptionEnumMaps.Temperature, static o => o.MetadataWriteTemperature, static (o, v) => o.MetadataWriteTemperature = v)
+        .Enum("wal_write_temperature", OptionEnumMaps.Temperature, static o => o.WalWriteTemperature, static (o, v) => o.WalWriteTemperature = v)
+        .UInt64("follower_refresh_catchup_period_ms", static o => o.FollowerRefreshCatchupPeriodMs, static (o, v) => o.FollowerRefreshCatchupPeriodMs = v)
+        .UInt64("follower_catchup_retry_count", static o => o.FollowerCatchupRetryCount, static (o, v) => o.FollowerCatchupRetryCount = v)
+        .UInt64("follower_catchup_retry_wait_ms", static o => o.FollowerCatchupRetryWaitMs, static (o, v) => o.FollowerCatchupRetryWaitMs = v)
+        // OptionVerificationType::kDeprecated entries of db_options.cc: accepted and ignored.
+        .Deprecated("allow_os_buffer", "base_background_compactions", "use_direct_writes", "disableDataSync", "disable_data_sync",
+            "experimental_allow_mempurge", "experimental_mempurge_policy", "experimental_mempurge_threshold", "skip_log_error_on_recovery",
+            "skip_checking_sst_file_sizes_on_db_open", "new_table_reader_for_compaction_inputs", "random_access_max_buffer_size",
+            "fail_if_options_file_error", "access_hint_on_compaction_start", "preserve_deletes", "concurrent_prepare", "seq_per_batch",
+            "rate_limiter");
 
     internal override OptionTable<DbOptions> OptionTable => s_table;
 

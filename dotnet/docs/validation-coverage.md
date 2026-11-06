@@ -151,7 +151,7 @@ changes there need their own review.
 | `Db/DbImpl.Monitoring.cs` | 420 | db/event_helpers.cc | line-by-line (feature audit: user features (LOG)) |
 | `Db/DbImpl.MultiGet.cs` | 234 | db/db_impl/db_impl.cc, db/version_set.cc | line-by-line (feature audit: UDT / MultiGet (+ #3 read-sequence rule)) |
 | `Db/DbImpl.Open.cs` | 596 | db/db_impl/db_impl_open.cc | line-by-line (#2); #3: fixed WAL checksum, blob GC option validation, FIFO TTL reader preload |
-| `Db/DbImpl.Options.cs` | 283 | db/db_impl/db_impl.cc, db/column_family.cc, options/cf_options.cc | line-by-line (feature audit: user features (SetOptions) (+ #3)) |
+| `Db/DbImpl.Options.cs` | 283 | db/db_impl/db_impl.cc, db/column_family.cc, options/cf_options.cc | line-by-line (feature audit: user features (SetOptions) (+ #3)); second review: ColumnFamilyData::ValidateOptions on the candidate, SetDBOptions (no-op, per-CF validation, SwitchWAL), SanitizeOptions (max_open_files, delayed_write_rate) |
 | `Db/DbImpl.Properties.cs` | 657 | db/internal_stats.cc, db/db_impl/db_impl.cc | line-by-line (feature audit: user features (properties)) |
 | `Db/DbImpl.Read.cs` | 477 | db/db_impl/db_impl.cc (GetImpl, NewIterator), db/version_set.cc (Version::Get) | line-by-line (#2) |
 | `Db/DbImpl.ReadOnly.cs` | 330 | db/db_impl/db_impl_readonly.cc, db/db_impl/db_impl_secondary.cc | line-by-line (#3): db_impl_readonly.cc / db_impl_secondary.cc; **fixed** WAL checksum |
@@ -244,8 +244,10 @@ changes there need their own review.
 | `Options/IngestExternalFileOptions.cs` | 33 | include/rocksdb/options.h | line-by-line (#3): defaults vs options.h |
 | `Options/OperationOptions.cs` | 100 | include/rocksdb/options.h | line-by-line (#3): defaults vs ReadOptions/WriteOptions/FlushOptions/CompactRangeOptions |
 | `Options/OptionEnums.cs` | 178 | include/rocksdb/types.h, include/rocksdb/advanced_options.h, include/rocksdb/options.h | line-by-line (#3): enum values / names |
-| `Options/OptionTypeInfo.cs` | 484 | options/cf_options.cc, options/db_options.cc, table/block_based/block_based_table_factory.cc | line-by-line (#1) |
-| `Options/OptionsBase.cs` | 77 | options/options_helper.cc (unknown-option preservation) | managed-only, design-reviewed (#3): OPTIONS round-trip plumbing |
+| `Options/OptionTypeInfo.cs` | 590 | options/cf_options.cc, options/db_options.cc, table/block_based/block_based_table_factory.cc, options/options_helper.cc (ParseStruct) | line-by-line (#1); second review: struct options (ParseStruct), kDeprecated names, aliases |
+| `Options/OptionsBase.cs` | 120 | options/options_helper.cc (unknown-option preservation, OptionTypeInfo::Find) | managed-only, design-reviewed (#3): OPTIONS round-trip plumbing; second review: "struct.field" names |
+| `Options/OffpeakTimeOption.cs` | 110 | options/offpeak_time_info.{h,cc}, util/string_util.cc (ParseTimeStringToSeconds, TryParseTimeRangeString) | line-by-line (second review) |
+| `Db/DbImpl.StatsHistory.cs` | 360 | db/db_impl/db_impl.cc (PersistStats, GetStatsHistory), db/db_impl/db_impl_open.cc (InitPersistStatsColumnFamily, PersistentStatsProcessFormatVersion), monitoring/persistent_stats_history.cc, monitoring/in_memory_stats_history.cc, db/version_edit_handler.cc | line-by-line (second review) |
 | `Options/PlainAndCuckooTableOptions.cs` | 117 | include/rocksdb/table.h (PlainTableOptions, CuckooTableOptions), table/plain/plain_table_factory.cc, table/cuckoo/cuckoo_table_factory.cc (type info) | line-by-line (feature audit: other SST formats) |
 | `Options/OptionsFile.cs` | 408 | options/options_parser.cc, include/rocksdb/version.h | line-by-line (#1) |
 | `Options/SstPartitioner.cs` | 166 | include/rocksdb/sst_partitioner.h, db/compaction/sst_partitioner.cc | line-by-line (compaction-features pass): SstPartitioner / factory / fixed prefix, ShouldPartitionByPrefix, OPTIONS id form |

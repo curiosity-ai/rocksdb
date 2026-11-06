@@ -26,8 +26,23 @@ public abstract class PersistedOptions<TSelf> where TSelf : PersistedOptions<TSe
     {
         if (OptionTable.TryGet(name, out OptionTypeInfo<TSelf> info))
         {
-            info.Parse((TSelf)this, OptionStrings.Unescape(value));
+            // Struct values are split into fields first; each field value is unescaped by the struct's own SetOption.
+            if (info.StructParse is { } structParse) structParse((TSelf)this, null, value, preserveUnknown);
+            else info.Parse((TSelf)this, OptionStrings.Unescape(value));
             UnknownOptions.Remove(name);
+        }
+        else if (TryGetStructField(name, out OptionTypeInfo<TSelf>? structInfo, out string? field))
+        {
+            // "struct.field" (OptionTypeInfo::Find + ParseStruct, options/options_helper.cc): sets one field.
+            structInfo.StructParse!((TSelf)this, field, value, preserveUnknown);
+        }
+        else if (OptionTable.TryGetAlias(name, out OptionTypeInfo<TSelf> aliased))
+        {
+            aliased.Parse((TSelf)this, OptionStrings.Unescape(value));
+        }
+        else if (OptionTable.IsDeprecated(name))
+        {
+            // OptionVerificationType::kDeprecated: accepted and ignored, never serialized.
         }
         else if (preserveUnknown)
         {
@@ -38,6 +53,30 @@ public abstract class PersistedOptions<TSelf> where TSelf : PersistedOptions<TSe
             ThrowHelper.InvalidArgument("Unrecognized option " + typeof(TSelf).Name + ":: " + name);
         }
     }
+
+    /// <summary>Resolves "struct.field" to the struct option's info (OptionTypeInfo::Find for a name with a '.').</summary>
+    private bool TryGetStructField(string name, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out OptionTypeInfo<TSelf>? info,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? field)
+    {
+        int dot = name.IndexOf('.', StringComparison.Ordinal);
+        if (dot > 0 && dot < name.Length - 1 && OptionTable.TryGet(name[..dot], out OptionTypeInfo<TSelf> i) && i.StructParse is not null)
+        {
+            info = i;
+            field = name[(dot + 1)..];
+            return true;
+        }
+        info = null;
+        field = null;
+        return false;
+    }
+
+    /// <summary>
+    /// True if <paramref name="name"/> is a typed option, a field of a typed struct option ("struct.field") or a
+    /// deprecated name that is accepted and ignored.
+    /// </summary>
+    internal bool IsKnownOption(string name) =>
+        OptionTable.TryGet(name, out _) || TryGetStructField(name, out _, out _) || OptionTable.TryGetAlias(name, out _)
+        || OptionTable.IsDeprecated(name);
 
     /// <summary>Applies a set of name/value pairs (see <see cref="SetOption"/>).</summary>
     public void SetOptions(IEnumerable<KeyValuePair<string, string>> options, bool preserveUnknown)

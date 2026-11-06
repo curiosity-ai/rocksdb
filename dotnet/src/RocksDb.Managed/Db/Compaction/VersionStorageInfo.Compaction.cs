@@ -612,7 +612,11 @@ internal sealed partial class VersionStorageInfo
         if (period == 0 || period >= ulong.MaxValue - 1) return;
         long now = NowSeconds();
         if ((ulong)now < period) return;
-        ulong allowedTimeLimit = (ulong)now - period;
+        // Offpeak pulls a file's deadline earlier by the time until the next daily offpeak window (so a whole period's
+        // worth can be marked at the start of offpeak): marked when now + offpeak_pull > modification time + period.
+        ulong offpeakPull = 0;
+        if (_options.DbOffpeakTime?.GetOffpeakTimeInfo(now) is { IsNowOffpeak: true } offpeak) offpeakPull = (ulong)offpeak.SecondsTillNextOffpeakStart;
+        ulong allowedTimeLimit = (ulong)now + offpeakPull - period;
         for (int level = 0; level <= lastLevel && level < NumLevels; level++)
         {
             foreach (FileMetaData f in _files[level])

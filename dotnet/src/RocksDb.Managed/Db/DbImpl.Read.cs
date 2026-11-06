@@ -875,6 +875,14 @@ internal sealed partial class DbImpl
     /// (<see cref="DbFormat.MaxSequenceNumber"/> = the snapshot's or the latest); <paramref name="ownedSnapshot"/> is
     /// released with the iterator.
     /// </summary>
+    /// <summary>A copy of <paramref name="options"/> (or default read options) with total_order_seek set.</summary>
+    private static ReadOptions WithTotalOrderSeek(ReadOptions? options)
+    {
+        ReadOptions o = options?.Clone() ?? new ReadOptions();
+        o.TotalOrderSeek = true;
+        return o;
+    }
+
     internal DbIteratorSources NewIteratorSources(ColumnFamilyData cfd, ReadOptions? options, ReadCallback? callback, ulong sequence, Snapshot? ownedSnapshot)
     {
         // DBImpl::NewIterator (db_impl.cc): kPersistedTier is rejected for iterators.
@@ -904,6 +912,8 @@ internal sealed partial class DbImpl
             ReturnSuperVersion(sv);
             throw;
         }
+        // ArenaWrappedDBIter::Init: read_options_.total_order_seek |= prefix_seek_opt_in_only.
+        if (Options.PrefixSeekOptInOnly && options?.TotalOrderSeek != true) options = WithTotalOrderSeek(options);
         var mems = new MemTable[1 + sv.Imm.Length];
         mems[0] = sv.Mem;
         sv.Imm.CopyTo(mems, 1);

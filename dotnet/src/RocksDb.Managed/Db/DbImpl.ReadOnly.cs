@@ -68,7 +68,9 @@ internal sealed partial class DbImpl
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(columnFamilies);
         string dbname = path.Length > 1 ? path.TrimEnd('/') : path;
-        var db = new DbImpl(dbname, options.Clone())
+        DbOptions sanitized = options.Clone();
+        SanitizeDbOptions(sanitized); // SanitizeOptions(read_only = true)
+        var db = new DbImpl(dbname, sanitized)
         {
             _readOnly = true, _secondary = secondaryPath is not null, _secondaryPath = secondaryPath, _secondaryRecoverWal = recoverWal,
         };
@@ -118,6 +120,7 @@ internal sealed partial class DbImpl
         {
             if (state.FindColumnFamily(name) is null) ThrowHelper.InvalidArgument("Column family not found: " + name);
         }
+        AddImplicitStatsColumnFamily(descriptors, state.FindColumnFamily(PersistentStatsColumnFamilyName) is not null);
 
         string? dbId = state.DbId;
         if (dbId is null && FileSystem.FileExists(FileNames.IdentityFileName(DbName))) dbId = FileNames.ReadIdentityFile(FileSystem, DbName);

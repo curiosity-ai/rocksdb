@@ -29,6 +29,12 @@ public interface IRateLimiter
     /// <summary>Maximum bytes that can be granted in a single request (GetSingleBurstBytes).</summary>
     long SingleBurstBytes { get; }
 
+    /// <summary>
+    /// GetBytesPerSecond: the current rate, used by the DB for delayed_write_rate = 0 (SanitizeOptions). The default 0
+    /// means unknown (the DB then uses 16 MiB/s).
+    /// </summary>
+    long BytesPerSecond => 0;
+
     /// <summary>Blocks until <paramref name="bytes"/> (≤ <see cref="SingleBurstBytes"/>) may be written.</summary>
     void Request(long bytes, IoPriority priority);
 

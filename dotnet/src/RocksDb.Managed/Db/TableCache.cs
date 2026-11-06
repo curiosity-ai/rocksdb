@@ -34,8 +34,12 @@ internal sealed class TableCacheStore : IDisposable
     /// <param name="maxOpenFiles">DbOptions.max_open_files (-1 = unbounded).</param>
     public TableCacheStore(int maxOpenFiles) => _capacity = CapacityFor(maxOpenFiles);
 
-    /// <summary>table_cache_size = max_open_files - kNumNonTableCacheFiles (db/db_impl/db_impl.cc), at least 20.</summary>
-    private static int CapacityFor(int maxOpenFiles) => maxOpenFiles < 0 ? int.MaxValue : Math.Max(maxOpenFiles - 10, 20);
+    /// <summary>
+    /// table_cache_size = max_open_files - kNumNonTableCacheFiles (10; db/db_impl/db_impl.cc). DB::Open clips
+    /// max_open_files to at least 20 (SanitizeOptions), so the capacity is at least 10 there; SetDBOptions does not clip
+    /// (upstream then passes a negative size to the LRU cache), so the capacity is kept at least 1 here.
+    /// </summary>
+    private static int CapacityFor(int maxOpenFiles) => maxOpenFiles < 0 ? int.MaxValue : Math.Max(maxOpenFiles - 10, 1);
 
     /// <summary>Number of cached readers (open or being opened) over all column families.</summary>
     public int Count => _handles.Count;
