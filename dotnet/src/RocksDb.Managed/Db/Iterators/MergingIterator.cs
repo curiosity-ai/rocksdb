@@ -24,8 +24,8 @@ namespace RocksDb.Managed.Db.Iterators;
 public sealed class MergingIterator : InternalIterator
 {
     private readonly InternalKeyComparator _icmp;
-    private readonly InternalIterator[] _children;
-    private readonly int[] _heap;
+    private InternalIterator[] _children;
+    private int[] _heap;
     private int _heapSize;
     private int _current = -1;
     private bool _forward = true;
@@ -40,6 +40,27 @@ public sealed class MergingIterator : InternalIterator
         _icmp = comparator;
         _children = children.ToArray();
         _heap = new int[Math.Max(1, _children.Length)];
+    }
+
+    /// <summary>
+    /// Replaces the children (unpositioned afterwards) without disposing the previous ones: the owner of a pooled
+    /// iterator graph (<see cref="IteratorGraph"/>) recycles them. Reuses the arrays when the child count is unchanged.
+    /// </summary>
+    internal void Reset(ReadOnlySpan<InternalIterator> children)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (children.Length == _children.Length)
+        {
+            children.CopyTo(_children);
+        }
+        else
+        {
+            _children = children.ToArray();
+            _heap = new int[Math.Max(1, _children.Length)];
+        }
+        _heapSize = 0;
+        _current = -1;
+        _forward = true;
     }
 
     public int ChildCount => _children.Length;

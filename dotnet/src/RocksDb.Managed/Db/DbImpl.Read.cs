@@ -207,28 +207,27 @@ internal sealed partial class DbImpl
     /// <summary>An iterator reading through <paramref name="callback"/> up to <paramref name="sequence"/> (NewIteratorImpl with a read callback).</summary>
     internal Iterator NewIteratorWithCallback(ColumnFamilyData cfd, ReadOptions? options, ReadCallback callback, ulong sequence, Snapshot? ownedSnapshot)
     {
-        ThrowIfDisposed();
-        DbIteratorSources sources;
         try
         {
-            sources = NewIteratorSources(cfd, options, callback, sequence, ownedSnapshot);
+            ThrowIfDisposed();
         }
         catch
         {
             ownedSnapshot?.Dispose();
             throw;
         }
+        IteratorCore core = cfd.IteratorPool.Rent(this, cfd);
         try
         {
-            Iterator it = DbIteratorFactory.Create(sources);
-            it.Statistics = Stats;
-            return it;
+            core.Build(options, options?.Snapshot, callback, sequence, ownedSnapshot, tailing: false);
         }
         catch
         {
-            sources.Cleanup?.Dispose();
+            cfd.IteratorPool.Return(core);
             throw;
         }
+        core.Statistics = Stats;
+        return new Iterator(core);
     }
 
     /// <summary>The lookup part of GetImpl on a referenced super version at <paramref name="snapshot"/>.</summary>
@@ -909,35 +908,7 @@ internal sealed partial class DbImpl
 
     internal DbIteratorSources NewIteratorSources(ColumnFamilyData cfd, ReadOptions? options, ReadCallback? callback, ulong sequence, Snapshot? ownedSnapshot)
     {
-        // DBImpl::NewIterator (db_impl.cc): kPersistedTier is rejected for iterators.
-        if (options?.ReadTier == ReadTier.PersistedTier)
-        {
-            throw new RocksDbException(StatusCode.NotSupported, "Not implemented: ReadTier::kPersistedData is not yet supported in iterators.");
-        }
-        // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
-        // in between could drop the versions visible at that sequence (no snapshot protects them).
-        ValidateReadSnapshot(options);
-        SuperVersion sv = GetReferencedSuperVersion(cfd);
-        if (sequence == DbFormat.MaxSequenceNumber)
-        {
-            sequence = ReadSequence(options);
-            if (callback is not null) sequence = ApplyReadCallback(callback, options, sequence);
-            // A tailing iterator (ForwardIterator under DBIter at kMaxSequenceNumber) sees every write, also those made
-            // after it was created; the snapshot does not apply.
-            if (options?.Tailing == true && callback is null) sequence = DbFormat.MaxSequenceNumber;
-        }
-        try
-        {
-            GetReadTimestamp(cfd, options);
-            if (options?.IterStartTs is not null && options.Timestamp is null) ThrowHelper.InvalidArgument("iter_start_ts requires timestamp");
-        }
-        catch
-        {
-            ReturnSuperVersion(sv);
-            throw;
-        }
-        // ArenaWrappedDBIter::Init: read_options_.total_order_seek |= prefix_seek_opt_in_only.
-        if (Options.PrefixSeekOptInOnly && options?.TotalOrderSeek != true) options = WithTotalOrderSeek(options);
+        SuperVersion sv = ReferenceIteratorView(cfd, ref options, options?.Snapshot, callback, ref sequence);
         var mems = new MemTable[1 + sv.Imm.Length];
         mems[0] = sv.Mem;
         sv.Imm.CopyTo(mems, 1);
@@ -967,44 +938,132 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
-    /// A tailing iterator (ReadOptions::tailing, port of the ForwardIterator behaviour of DBImpl::NewIterator): reads
-    /// at kMaxSequenceNumber, so writes made after its creation become visible to later Seek / Next calls, and its
-    /// memtable / table iterators are rebuilt from the current super version when the column family installed a new
-    /// one (ForwardIterator::RenewIterators on Seek, SeekToFirst and Next). SeekToLast, SeekForPrev and Prev are
-    /// NotSupported like upstream. Deviation: the stack is the regular DBIter stack rebuilt on renewal, not
-    /// ForwardIterator's incremental per-level iterators.
+    /// The view of an iterator (first part of DBImpl::NewIterator / NewIteratorImpl): validates the options, references
+    /// the column family's super version and then (unless <paramref name="sequence"/> is given) takes the read sequence
+    /// of <paramref name="snapshot"/> or the latest. The super version is referenced BEFORE the read sequence is taken
+    /// (GetImpl): otherwise a flush + compaction in between could drop the versions visible at that sequence. May replace
+    /// <paramref name="options"/> by a copy (prefix_seek_opt_in_only). The caller releases the returned reference.
     /// </summary>
-    internal Iterator NewTailingIterator(ColumnFamilyData cfd, ReadOptions options)
+    internal SuperVersion ReferenceIteratorView(ColumnFamilyData cfd, ref ReadOptions? options, Snapshot? snapshot, ReadCallback? callback,
+        ref ulong sequence)
     {
-        var source = new TailingIteratorSource(this, cfd, options);
-        var it = new Iterator(source.Build());
-        it.SetTailing(source);
-        return it;
+        // DBImpl::NewIterator (db_impl.cc): kPersistedTier is rejected for iterators.
+        if (options?.ReadTier == ReadTier.PersistedTier)
+        {
+            throw new RocksDbException(StatusCode.NotSupported, "Not implemented: ReadTier::kPersistedData is not yet supported in iterators.");
+        }
+        if (snapshot is not null && snapshot.Owner != this) ThrowHelper.InvalidArgument("snapshot does not belong to this DB or was released");
+        SuperVersion sv = GetReferencedSuperVersion(cfd);
+        if (sequence == DbFormat.MaxSequenceNumber)
+        {
+            sequence = snapshot is null ? LastPublishedSequence : snapshot.SequenceNumber;
+            if (callback is not null) sequence = ApplyReadCallback(callback, options, sequence);
+            // A tailing iterator (ForwardIterator under DBIter at kMaxSequenceNumber) sees every write, also those made
+            // after it was created; the snapshot does not apply.
+            if (options?.Tailing == true && callback is null) sequence = DbFormat.MaxSequenceNumber;
+        }
+        try
+        {
+            GetReadTimestamp(cfd, options);
+            if (options?.IterStartTs is not null && options.Timestamp is null) ThrowHelper.InvalidArgument("iter_start_ts requires timestamp");
+        }
+        catch
+        {
+            ReturnSuperVersion(sv);
+            throw;
+        }
+        // ArenaWrappedDBIter::Init: read_options_.total_order_seek |= prefix_seek_opt_in_only.
+        if (Options.PrefixSeekOptInOnly && options?.TotalOrderSeek != true) options = WithTotalOrderSeek(options);
+        return sv;
     }
 
-    private sealed class TailingIteratorSource(DbImpl db, ColumnFamilyData cfd, ReadOptions options) : Iterator.TailingSource
+    /// <summary>The read sequence of an iterator refresh at <paramref name="snapshot"/> (GetSeqNum of arena_wrapped_db_iter.cc).</summary>
+    internal ulong IteratorReadSequence(Snapshot? snapshot)
     {
-        private ulong _number;
+        if (snapshot is null) return LastPublishedSequence;
+        if (snapshot.Owner != this) ThrowHelper.InvalidArgument("snapshot does not belong to this DB or was released");
+        return snapshot.SequenceNumber;
+    }
 
-        public override bool IsStale => cfd.Super.Number != _number;
-
-        public override DbIter Build()
+    /// <summary>
+    /// DB::NewIterator through the column family's pool of iterator graphs (<see cref="IteratorCorePool"/>): steady-state
+    /// iterator creation reuses a released iterator stack instead of allocating one.
+    /// </summary>
+    internal Iterator NewPooledIterator(ColumnFamilyData cfd, ReadOptions? options)
+    {
+        IteratorCore core = cfd.IteratorPool.Rent(this, cfd);
+        try
         {
-            // Read before the super version is referenced: a change in between only causes one extra renewal.
-            ulong number = cfd.Super.Number;
-            DbIteratorSources sources = db.NewIteratorSources(cfd, options);
-            try
+            if (_txnHooks is { } hooks)
             {
-                DbIter it = DbIteratorFactory.CreateDbIter(sources);
-                _number = number;
-                return it;
+                // WritePreparedTxnDB::NewIterator: the iterator reads at a snapshot (its own when none is given, released
+                // with the iterator) through a read callback backed by that snapshot; such iterators cannot be refreshed.
+                Snapshot? own = options?.Snapshot is null ? hooks.GetSnapshot(isWriteConflictBoundary: false) : null;
+                Snapshot snap = options?.Snapshot ?? own!;
+                ReadCallback cb;
+                try
+                {
+                    cb = hooks.NewIteratorCallback(snap);
+                }
+                catch
+                {
+                    own?.Dispose();
+                    throw;
+                }
+                core.Build(options, snap, cb, snap.SequenceNumber, own, tailing: false);
             }
-            catch
+            else
             {
-                sources.Cleanup?.Dispose();
-                throw;
+                core.Build(options, options?.Snapshot, null, DbFormat.MaxSequenceNumber, null, tailing: options?.Tailing == true);
             }
         }
+        catch
+        {
+            cfd.IteratorPool.Return(core);
+            throw;
+        }
+        core.Statistics = Stats;
+        core.SetTraceState(this, cfd.Id, options);
+        return new Iterator(core);
+    }
+
+    /// <summary>Async <see cref="NewPooledIterator"/>: table files are opened with async I/O.</summary>
+    internal ValueTask<Iterator> NewPooledIteratorAsync(ColumnFamilyData cfd, ReadOptions? options, CancellationToken cancellationToken)
+    {
+        // Transaction DBs and tailing iterators are built synchronously (renewed synchronously on demand).
+        if (_txnHooks is not null || options?.Tailing == true) return new ValueTask<Iterator>(NewPooledIterator(cfd, options));
+        IteratorCore core = cfd.IteratorPool.Rent(this, cfd);
+        ValueTask pending;
+        try
+        {
+            pending = core.BuildAsync(options, cancellationToken);
+        }
+        catch
+        {
+            cfd.IteratorPool.Return(core);
+            throw;
+        }
+        if (!pending.IsCompletedSuccessfully) return FinishPooledIteratorAsync(cfd, core, options, pending);
+        pending.GetAwaiter().GetResult();
+        core.Statistics = Stats;
+        core.SetTraceState(this, cfd.Id, options);
+        return new ValueTask<Iterator>(new Iterator(core));
+    }
+
+    private async ValueTask<Iterator> FinishPooledIteratorAsync(ColumnFamilyData cfd, IteratorCore core, ReadOptions? options, ValueTask pending)
+    {
+        try
+        {
+            await pending.ConfigureAwait(false);
+        }
+        catch
+        {
+            cfd.IteratorPool.Return(core);
+            throw;
+        }
+        core.Statistics = Stats;
+        core.SetTraceState(this, cfd.Id, options);
+        return new Iterator(core);
     }
 
     /// <summary>

@@ -621,51 +621,26 @@ public sealed partial class ColumnFamily
     /// </summary>
     public Iterator NewIterator() => NewIterator(null);
 
-    /// <summary>ReadOptions::tailing (ForwardIterator semantics, see DbImpl.NewTailingIterator).</summary>
-    private Iterator NewTailingIterator(ReadOptions options)
-    {
-        Iterator it = _db.NewTailingIterator(_cfd, options);
-        it.Statistics = _db.Stats;
-        it.SetTraceState(_db, _cfd.Id, options);
-        return it;
-    }
-
+    /// <summary>
+    /// Creates an iterator over this column family (DB::NewIterator), reading at <see cref="ReadOptions.Snapshot"/> or the
+    /// latest state, honoring the iterate bounds. Dispose it to release the memtables/files it pins.
+    /// </summary>
+    /// <remarks>
+    /// Disposed iterators return their internal iterator stack to a small per-column-family pool, so creating an
+    /// iterator per scan does not allocate one in steady state (only the iterator handle itself). With
+    /// <see cref="ReadOptions.Tailing"/> the iterator follows ForwardIterator semantics: it reads at the newest sequence
+    /// and rebuilds its stack when the column family installed a new super version.
+    /// </remarks>
     public Iterator NewIterator(ReadOptions? options)
     {
         _db.ThrowIfDisposed();
-        if (options is { Tailing: true }) return NewTailingIterator(options);
-        DbIteratorSources sources = _db.NewIteratorSources(_cfd, options);
-        try
-        {
-            Iterator it = DbIteratorFactory.Create(sources);
-            it.Statistics = _db.Stats;
-            it.SetTraceState(_db, _cfd.Id, options);
-            return it;
-        }
-        catch
-        {
-            sources.Cleanup?.Dispose();
-            throw;
-        }
+        return _db.NewPooledIterator(_cfd, options);
     }
 
     /// <summary>Async <see cref="NewIterator(ReadOptions?)"/>: table files are opened with async I/O.</summary>
-    public async ValueTask<Iterator> NewIteratorAsync(ReadOptions? options, CancellationToken cancellationToken = default)
+    public ValueTask<Iterator> NewIteratorAsync(ReadOptions? options, CancellationToken cancellationToken = default)
     {
         _db.ThrowIfDisposed();
-        if (options is { Tailing: true }) return NewTailingIterator(options); // renewed synchronously on demand
-        DbIteratorSources sources = _db.NewIteratorSources(_cfd, options);
-        try
-        {
-            Iterator it = await DbIteratorFactory.CreateAsync(sources, cancellationToken).ConfigureAwait(false);
-            it.Statistics = _db.Stats;
-            it.SetTraceState(_db, _cfd.Id, options);
-            return it;
-        }
-        catch
-        {
-            sources.Cleanup?.Dispose();
-            throw;
-        }
+        return _db.NewPooledIteratorAsync(_cfd, options, cancellationToken);
     }
 }

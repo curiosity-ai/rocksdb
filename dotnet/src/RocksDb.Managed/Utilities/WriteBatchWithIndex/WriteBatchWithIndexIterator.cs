@@ -14,10 +14,10 @@ public sealed class WriteBatchWithIndexIterator
 {
     private readonly WriteBatchWithIndex _wbwi;
     private readonly WriteBatchEntryIndex _index;
-    private readonly uint _cf;
-    private readonly Comparator _cmp;
-    private readonly ReadOnlyMemory<byte>? _lower;
-    private readonly ReadOnlyMemory<byte>? _upper;
+    private uint _cf;
+    private Comparator _cmp;
+    private ReadOnlyMemory<byte>? _lower;
+    private ReadOnlyMemory<byte>? _upper;
     private int _node = -1;
     private bool _outOfBound;
 
@@ -29,6 +29,17 @@ public sealed class WriteBatchWithIndexIterator
         _cmp = cmp;
         _lower = lower;
         _upper = upper;
+    }
+
+    /// <summary>Re-targets this iterator (unpositioned) at another column family / bounds of the same batch (pooled delta iterators).</summary>
+    internal void Reset(uint cf, Comparator cmp, ReadOnlyMemory<byte>? lower, ReadOnlyMemory<byte>? upper)
+    {
+        _cf = cf;
+        _cmp = cmp;
+        _lower = lower;
+        _upper = upper;
+        _node = -1;
+        _outOfBound = false;
     }
 
     private bool ValidRegardlessOfBoundLimit => _node >= 0 && _index.ColumnFamily(_node) == _cf;

@@ -21,16 +21,17 @@ public sealed class LevelIterator : InternalIterator
 {
     private readonly ITableCache _tableCache;
     private readonly InternalKeyComparator _icmp;
-    private readonly FileMetaData[] _files;
-    private readonly ReadOnlyMemory<byte>? _lower;
-    private readonly ReadOnlyMemory<byte>? _upper;
-    private readonly ReadOptions? _readOptions;
+    // Not readonly: Reset re-targets a pooled level iterator at another version's files (IteratorGraph).
+    private FileMetaData[] _files;
+    private ReadOnlyMemory<byte>? _lower;
+    private ReadOnlyMemory<byte>? _upper;
+    private ReadOptions? _readOptions;
     // fill_cache / rate_limiter_priority of _readOptions for the file iterators.
     private TableReadFlags _readFlags;
     /// <summary>The column family's prefix extractor (file iterators consult prefix filters), or null.</summary>
-    private readonly SliceTransform? _prefixExtractor;
+    private SliceTransform? _prefixExtractor;
     /// <summary>Non-null in legacy prefix seek mode (no total_order_seek / auto_prefix_mode): Seek invalidates past the prefix.</summary>
-    private readonly SliceTransform? _prefixSeekExtractor;
+    private SliceTransform? _prefixSeekExtractor;
     private InternalIterator? _fileIter;
     private InternalIterator? _spare; // a file iterator parked for reuse while the level iterator is exhausted
     private int _fileIndex = -1;
@@ -68,6 +69,59 @@ public sealed class LevelIterator : InternalIterator
         for (int i = 0; i < _files.Length; i++) _files[i] = files[i];
         _lower = readOptions?.IterateLowerBound;
         _upper = readOptions?.IterateUpperBound;
+    }
+
+    /// <summary>
+    /// Re-targets this level iterator (unpositioned afterwards) at <paramref name="files"/> (sorted, non-overlapping; the
+    /// array is referenced, not copied: version file lists are immutable) with new read settings. The parked file
+    /// iterator is kept for reuse. Used by pooled iterator graphs (<see cref="IteratorGraph"/>).
+    /// </summary>
+    internal void Reset(FileMetaData[] files, ReadOptions? readOptions, SliceTransform? prefixExtractor)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        SetFileIterator(null, -1);
+        _files = files;
+        _readOptions = readOptions;
+        _readFlags = TableReadFlagsExtensions.FromReadOptions(readOptions);
+        _prefixExtractor = prefixExtractor;
+        _prefixSeekExtractor = prefixExtractor is not null && readOptions?.TotalOrderSeek != true && readOptions?.AutoPrefixMode != true
+            ? prefixExtractor
+            : null;
+        _lower = readOptions?.IterateLowerBound;
+        _upper = readOptions?.IterateUpperBound;
+    }
+
+    /// <summary>
+    /// Releases the current file (its blocks and table reader lease) and the file list, keeping the file iterator
+    /// objects for a later <see cref="Reset"/>.
+    /// </summary>
+    internal void Park()
+    {
+        if (_disposed) return;
+        SetFileIterator(null, -1);
+        _files = [];
+        _readOptions = null;
+        _lower = _upper = null;
+    }
+
+    /// <summary>
+    /// Replaces the iterate bounds used to skip files (the DB iterator enforces the bounds themselves); takes effect at
+    /// the next positioning call.
+    /// </summary>
+    internal void SetBounds(ReadOnlyMemory<byte>? lower, ReadOnlyMemory<byte>? upper)
+    {
+        _lower = lower;
+        _upper = upper;
+    }
+
+    /// <summary>
+    /// Drops the parked file iterator when it was configured differently (readahead), so that the next file
+    /// iterator is created with the current settings.
+    /// </summary>
+    internal void DiscardSpare()
+    {
+        _spare?.Dispose();
+        _spare = null;
     }
 
     public int FileCount => _files.Length;
@@ -365,23 +419,8 @@ public sealed class LevelIterator : InternalIterator
         return it;
     }
 
-    private InternalIterator NewFileIteratorCore(int index, InternalIterator? reuse)
-    {
-        if (_prefixExtractor is null)
-        {
-            return _readFlags == TableReadFlags.None
-                ? _tableCache.NewIterator(_files[index], reuse)
-                : TableCache.Recycle(reuse, _tableCache.GetReader(_files[index]), _readFlags);
-        }
-        TableReaderLease lease = _tableCache.GetReader(_files[index]);
-        if (reuse is TableInternalIterator t && t.Flags == _readFlags && lease.Reader is BlockBasedTableReader)
-        {
-            t.Retarget(lease, _readOptions, _prefixExtractor);
-            return t;
-        }
-        reuse?.Dispose();
-        return TableInternalIterator.Create(lease, _readFlags, _readOptions, _prefixExtractor);
-    }
+    private InternalIterator NewFileIteratorCore(int index, InternalIterator? reuse) =>
+        TableInternalIterator.OpenOrRecycle(_tableCache, _files[index], reuse, _readFlags, _readOptions, _prefixExtractor);
 
     private void SetFileIterator(InternalIterator? iter, int index)
     {

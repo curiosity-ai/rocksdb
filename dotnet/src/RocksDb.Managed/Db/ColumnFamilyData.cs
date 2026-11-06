@@ -309,6 +309,8 @@ internal sealed class ColumnFamilyData
     public SuperVersion Super => Volatile.Read(ref _super)!;
     public SuperVersion? SuperOrNull() => Volatile.Read(ref _super);
     public void SetSuper(SuperVersion sv) => Volatile.Write(ref _super, sv);
+    /// <summary>Released iterator stacks reused by NewIterator (see <see cref="Iterators.IteratorCorePool"/>).</summary>
+    internal Iterators.IteratorCorePool IteratorPool { get; } = new();
     /// <summary>Per-processor cached super version references for point reads (local_sv_).</summary>
     public SuperVersionCache LocalSuperVersions { get; } = new();
 

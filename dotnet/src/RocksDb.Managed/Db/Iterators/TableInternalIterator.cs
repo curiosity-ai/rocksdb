@@ -87,6 +87,31 @@ public sealed class TableInternalIterator : InternalIterator
         }
     }
 
+    /// <summary>
+    /// The iterator over <paramref name="file"/> that a level iterator or an iterator graph uses: <paramref name="reuse"/>
+    /// re-targeted when it is a table iterator with <paramref name="flags"/> (no allocation), else a new one
+    /// (<paramref name="reuse"/> is disposed). Prefix options come from <paramref name="readOptions"/> only with a
+    /// <paramref name="prefixExtractor"/>, like <see cref="DbIteratorFactory.NewInternalIterator"/>.
+    /// </summary>
+    internal static InternalIterator OpenOrRecycle(ITableCache tableCache, FileMetaData file, InternalIterator? reuse, TableReadFlags flags,
+        ReadOptions? readOptions, SliceTransform? prefixExtractor)
+    {
+        if (prefixExtractor is null)
+        {
+            return flags == TableReadFlags.None
+                ? tableCache.NewIterator(file, reuse)
+                : TableCache.Recycle(reuse, tableCache.GetReader(file), flags);
+        }
+        TableReaderLease lease = tableCache.GetReader(file);
+        if (reuse is TableInternalIterator t && t.Flags == flags && lease.Reader is BlockBasedTableReader)
+        {
+            t.Retarget(lease, readOptions, prefixExtractor);
+            return t;
+        }
+        reuse?.Dispose();
+        return Create(lease, flags, readOptions, prefixExtractor);
+    }
+
     public override bool Valid { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _it.Valid; }
     public override ReadOnlySpan<byte> Key { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _embedded ? EmbeddedKey() : _it.Key; }
     public override ReadOnlySpan<byte> Value { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _embedded ? EmbeddedValue() : _it.Value; }

@@ -18,13 +18,13 @@ namespace RocksDb.Managed;
 public sealed class BaseDeltaIterator : IDisposable
 {
     private readonly Iterator _base;
-    private readonly WriteBatchWithIndexIterator _delta;
+    private readonly WriteBatchWithIndex _wbwi;
+    // The delta iterator and merge buffers, taken from the batch's spare (WriteBatchWithIndex.RentDeltaScratch) and
+    // returned on Dispose: creating an iterator per scan does not allocate them. Null once disposed.
+    private BaseDeltaScratch? _scratch;
+    private WideColumns? _columns;
     private readonly Comparator _cmp;
     private readonly MergeOperator? _mergeOperator;
-    private readonly MergeContext _mergeContext = new();
-    private readonly PooledBufferWriter _mergeResult = new(128);
-    private readonly PooledBufferWriter _entityScratch = new(128);
-    private readonly WideColumns _columns = new();
     private bool _forward = true;
     private bool _currentAtBase = true;
     private bool _equalKeys;
@@ -33,16 +33,32 @@ public sealed class BaseDeltaIterator : IDisposable
     private DeltaValue _deltaValue;
     private bool _disposed;
 
-    internal BaseDeltaIterator(Iterator baseIterator, WriteBatchWithIndexIterator delta, Comparator comparator, MergeOperator? mergeOperator)
+    internal BaseDeltaIterator(Iterator baseIterator, WriteBatchWithIndex wbwi, BaseDeltaScratch scratch, Comparator comparator, MergeOperator? mergeOperator)
     {
         _base = baseIterator;
-        _delta = delta;
+        _wbwi = wbwi;
+        _scratch = scratch;
         _cmp = comparator;
         _mergeOperator = mergeOperator;
     }
 
+    private BaseDeltaScratch S
+    {
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            BaseDeltaScratch? s = _scratch;
+            if (s is null) ThrowDisposed();
+            return s;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ThrowDisposed() => throw new ObjectDisposedException(nameof(BaseDeltaIterator));
+
     private bool BaseValid => _base.Valid;
-    private bool DeltaValid => _delta.Valid;
+    private bool DeltaValid => S.Delta.Valid;
 
     public bool Valid => _currentAtBase ? BaseValid : DeltaValid;
 
@@ -50,7 +66,7 @@ public sealed class BaseDeltaIterator : IDisposable
     {
         _forward = true;
         _base.SeekToFirst();
-        _delta.SeekToFirst();
+        S.Delta.SeekToFirst();
         UpdateCurrent();
     }
 
@@ -58,7 +74,7 @@ public sealed class BaseDeltaIterator : IDisposable
     {
         _forward = false;
         _base.SeekToLast();
-        _delta.SeekToLast();
+        S.Delta.SeekToLast();
         UpdateCurrent();
     }
 
@@ -66,7 +82,7 @@ public sealed class BaseDeltaIterator : IDisposable
     {
         _forward = true;
         _base.Seek(key);
-        _delta.Seek(key);
+        S.Delta.Seek(key);
         UpdateCurrent();
     }
 
@@ -74,7 +90,7 @@ public sealed class BaseDeltaIterator : IDisposable
     {
         _forward = false;
         _base.SeekForPrev(key);
-        _delta.SeekForPrev(key);
+        S.Delta.SeekForPrev(key);
         UpdateCurrent();
     }
 
@@ -88,10 +104,10 @@ public sealed class BaseDeltaIterator : IDisposable
             _forward = true;
             _equalKeys = false;
             if (!BaseValid) _base.SeekToFirst();
-            else if (!DeltaValid) _delta.SeekToFirst();
+            else if (!DeltaValid) S.Delta.SeekToFirst();
             else if (_currentAtBase) AdvanceDelta();
             else AdvanceBase();
-            if (DeltaValid && BaseValid && _cmp.CompareWithoutTimestamp(_delta.Key, false, _base.Key, false) == 0) _equalKeys = true;
+            if (DeltaValid && BaseValid && _cmp.CompareWithoutTimestamp(S.Delta.Key, false, _base.Key, false) == 0) _equalKeys = true;
         }
         Advance();
     }
@@ -104,16 +120,16 @@ public sealed class BaseDeltaIterator : IDisposable
             _forward = false;
             _equalKeys = false;
             if (!BaseValid) _base.SeekToLast();
-            else if (!DeltaValid) _delta.SeekToLast();
+            else if (!DeltaValid) S.Delta.SeekToLast();
             else if (_currentAtBase) AdvanceDelta(); // Change delta from less advanced than base to more advanced
             else AdvanceBase();                      // Change base from less advanced than delta to more advanced
-            if (DeltaValid && BaseValid && _cmp.CompareWithoutTimestamp(_delta.Key, false, _base.Key, false) == 0) _equalKeys = true;
+            if (DeltaValid && BaseValid && _cmp.CompareWithoutTimestamp(S.Delta.Key, false, _base.Key, false) == 0) _equalKeys = true;
         }
         Advance();
     }
 
     /// <summary>The current key.</summary>
-    public ReadOnlySpan<byte> Key => _currentAtBase ? _base.Key : _delta.Key;
+    public ReadOnlySpan<byte> Key => _currentAtBase ? _base.Key : S.Delta.Key;
 
     /// <summary>
     /// BaseDeltaIterator::timestamp: the base iterator's timestamp when positioned on a DB entry, empty for an entry
@@ -130,13 +146,13 @@ public sealed class BaseDeltaIterator : IDisposable
             switch (_deltaValue)
             {
                 case DeltaValue.Plain:
-                    return _delta.Value;
+                    return S.Delta.Value;
                 case DeltaValue.Entity:
-                    return WideColumnSerialization.GetValueOfDefaultColumn(_delta.Value);
+                    return WideColumnSerialization.GetValueOfDefaultColumn(S.Delta.Value);
                 case DeltaValue.MergedValue:
-                    return _mergeResult.WrittenSpan;
+                    return S.MergeResult.WrittenSpan;
                 default:
-                    return WideColumnSerialization.GetValueOfDefaultColumn(_entityScratch.WrittenSpan);
+                    return WideColumnSerialization.GetValueOfDefaultColumn(S.EntityScratch.WrittenSpan);
             }
         }
     }
@@ -150,13 +166,14 @@ public sealed class BaseDeltaIterator : IDisposable
         get
         {
             if (_currentAtBase) return _base.Columns;
+            WideColumns c = _columns ??= new WideColumns();
             switch (_deltaValue)
             {
                 case DeltaValue.Entity:
-                    _columns.SetSerialized(_delta.Value);
+                    c.SetSerialized(S.Delta.Value);
                     break;
                 case DeltaValue.MergedEntity:
-                    _columns.SetSerialized(_entityScratch.WrittenSpan);
+                    c.SetSerialized(S.EntityScratch.WrittenSpan);
                     break;
                 default:
                     {
@@ -164,7 +181,7 @@ public sealed class BaseDeltaIterator : IDisposable
                         try
                         {
                             WideColumnSerialization.SerializeDefaultColumn(Value, w);
-                            _columns.SetSerialized(w.WrittenSpan);
+                            c.SetSerialized(w.WrittenSpan);
                         }
                         finally
                         {
@@ -173,7 +190,7 @@ public sealed class BaseDeltaIterator : IDisposable
                         break;
                     }
             }
-            return _columns;
+            return c;
         }
     }
 
@@ -197,8 +214,8 @@ public sealed class BaseDeltaIterator : IDisposable
 
     private void AdvanceDelta()
     {
-        if (_forward) _delta.NextKey();
-        else _delta.PrevKey();
+        if (_forward) S.Delta.NextKey();
+        else S.Delta.PrevKey();
     }
 
     private void AdvanceBase()
@@ -216,23 +233,23 @@ public sealed class BaseDeltaIterator : IDisposable
     /// <summary>SetValueAndColumnsFromDelta: the delta's value, merged with its Put/PutEntity or the base when needed.</summary>
     private void SetValueFromDelta()
     {
-        WriteType type = _delta.Entry(out ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value);
-        if (_mergeContext.Count == 0)
+        WriteType type = S.Delta.Entry(out ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value);
+        if (S.MergeContext.Count == 0)
         {
             _deltaValue = type == WriteType.PutEntity ? DeltaValue.Entity : DeltaValue.Plain;
             return;
         }
-        _mergeResult.Clear();
-        _entityScratch.Clear();
+        S.MergeResult.Clear();
+        S.EntityScratch.Clear();
         switch (type)
         {
             case WriteType.Delete:
             case WriteType.SingleDelete:
-                MergeHelper.TimedFullMerge(RequireMergeOperator(), key, false, default, _mergeContext, _mergeResult);
+                MergeHelper.TimedFullMerge(RequireMergeOperator(), key, false, default, S.MergeContext, S.MergeResult);
                 _deltaValue = DeltaValue.MergedValue;
                 break;
             case WriteType.Put:
-                MergeHelper.TimedFullMerge(RequireMergeOperator(), key, true, value, _mergeContext, _mergeResult);
+                MergeHelper.TimedFullMerge(RequireMergeOperator(), key, true, value, S.MergeContext, S.MergeResult);
                 _deltaValue = DeltaValue.MergedValue;
                 break;
             case WriteType.PutEntity:
@@ -257,13 +274,13 @@ public sealed class BaseDeltaIterator : IDisposable
                     }
                     else
                     {
-                        MergeHelper.TimedFullMerge(RequireMergeOperator(), key, true, _base.Value, _mergeContext, _mergeResult);
+                        MergeHelper.TimedFullMerge(RequireMergeOperator(), key, true, _base.Value, S.MergeContext, S.MergeResult);
                         _deltaValue = DeltaValue.MergedValue;
                     }
                 }
                 else
                 {
-                    MergeHelper.TimedFullMerge(RequireMergeOperator(), key, false, default, _mergeContext, _mergeResult);
+                    MergeHelper.TimedFullMerge(RequireMergeOperator(), key, false, default, S.MergeContext, S.MergeResult);
                     _deltaValue = DeltaValue.MergedValue;
                 }
                 break;
@@ -275,8 +292,8 @@ public sealed class BaseDeltaIterator : IDisposable
 
     private void MergeEntity(ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity)
     {
-        MergeHelper.TimedFullMerge(RequireMergeOperator(), key, true, WideColumnSerialization.GetValueOfDefaultColumn(entity), _mergeContext, _mergeResult);
-        WideColumnSerialization.ReplaceDefaultColumn(entity, _mergeResult.WrittenSpan, _entityScratch);
+        MergeHelper.TimedFullMerge(RequireMergeOperator(), key, true, WideColumnSerialization.GetValueOfDefaultColumn(entity), S.MergeContext, S.MergeResult);
+        WideColumnSerialization.ReplaceDefaultColumn(entity, S.MergeResult.WrittenSpan, S.EntityScratch);
         _deltaValue = DeltaValue.MergedEntity;
     }
 
@@ -286,14 +303,14 @@ public sealed class BaseDeltaIterator : IDisposable
         while (true)
         {
             var deltaResult = WriteBatchWithIndex.LookupResult.NotFound;
-            if (DeltaValid) deltaResult = _delta.FindLatestUpdate(_mergeContext);
-            else _mergeContext.Clear();
+            if (DeltaValid) deltaResult = S.Delta.FindLatestUpdate(S.MergeContext);
+            else S.MergeContext.Clear();
             _equalKeys = false;
             if (!BaseValid)
             {
                 if (!DeltaValid) return; // Finished, neither base nor delta is valid.
                 // Base is done, delta has value.
-                if (deltaResult == WriteBatchWithIndex.LookupResult.Deleted && _mergeContext.Count == 0)
+                if (deltaResult == WriteBatchWithIndex.LookupResult.Deleted && S.MergeContext.Count == 0)
                 {
                     // This key is deleted and no Merge is done after Delete.
                     AdvanceDelta();
@@ -313,12 +330,12 @@ public sealed class BaseDeltaIterator : IDisposable
             }
             else
             {
-                int compare = (_forward ? 1 : -1) * _cmp.CompareWithoutTimestamp(_delta.Key, false, _base.Key, false);
+                int compare = (_forward ? 1 : -1) * _cmp.CompareWithoutTimestamp(S.Delta.Key, false, _base.Key, false);
                 if (compare <= 0)
                 {
                     // delta bigger or equal
                     if (compare == 0) _equalKeys = true;
-                    if (deltaResult != WriteBatchWithIndex.LookupResult.Deleted || _mergeContext.Count > 0)
+                    if (deltaResult != WriteBatchWithIndex.LookupResult.Deleted || S.MergeContext.Count > 0)
                     {
                         // delta is visible
                         _currentAtBase = false;
@@ -345,8 +362,37 @@ public sealed class BaseDeltaIterator : IDisposable
         if (_disposed) return;
         _disposed = true;
         _base.Dispose();
-        _mergeContext.Dispose();
-        _mergeResult.Dispose();
-        _entityScratch.Dispose();
+        BaseDeltaScratch? scratch = _scratch;
+        _scratch = null;
+        if (scratch is not null) _wbwi.ReturnDeltaScratch(scratch);
+    }
+}
+
+/// <summary>
+/// The reusable parts of a <see cref="BaseDeltaIterator"/>: the delta (batch) iterator and the merge buffers. A batch
+/// keeps one spare (WriteBatchWithIndex.RentDeltaScratch / ReturnDeltaScratch).
+/// </summary>
+internal sealed class BaseDeltaScratch : IDisposable
+{
+    public BaseDeltaScratch(WriteBatchWithIndexIterator delta) => Delta = delta;
+
+    public WriteBatchWithIndexIterator Delta { get; }
+    public MergeContext MergeContext { get; } = new();
+    public PooledBufferWriter MergeResult { get; } = new(128);
+    public PooledBufferWriter EntityScratch { get; } = new(128);
+
+    /// <summary>Clears the buffers before the scratch is kept as the batch's spare.</summary>
+    public void Clear()
+    {
+        MergeContext.Clear();
+        MergeResult.Clear();
+        EntityScratch.Clear();
+    }
+
+    public void Dispose()
+    {
+        MergeContext.Dispose();
+        MergeResult.Dispose();
+        EntityScratch.Dispose();
     }
 }
