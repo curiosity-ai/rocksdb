@@ -1,6 +1,12 @@
 namespace RocksDb.Managed.Cache;
 
 /// <summary>
+/// Callback of <see cref="BlockCache.ApplyToAllEntries{TState}(TState, CacheEntryVisitor{TState})"/>: the entry's key,
+/// value (valid only during the call; not owned by the callee), charge and helper (null: none).
+/// </summary>
+public delegate void CacheEntryVisitor<TState>(TState state, in CacheKey key, in CacheValue value, long charge, CacheItemHelper? helper);
+
+/// <summary>
 /// Receives entries evicted from a cache (the Cache::EvictionCallback, include/rocksdb/advanced_cache.h). Never takes
 /// ownership of the value (the callback always returns false upstream for the secondary cache adapter).
 /// </summary>

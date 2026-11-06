@@ -191,6 +191,26 @@ public sealed class LruCache : BlockCache
         foreach (LruCacheShard s in _shards) s.EraseUnRefEntries();
     }
 
+    /// <summary>ShardedCache::ApplyToAllEntries: a slice of each shard per round, rotating between shards.</summary>
+    public override void ApplyToAllEntries<TState>(TState state, CacheEntryVisitor<TState> callback, int averageEntriesPerLock)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        int aepl = Math.Max(averageEntriesPerLock, 1);
+        Span<ulong> states = _shards.Length <= 64 ? stackalloc ulong[_shards.Length] : new ulong[_shards.Length];
+        states.Clear();
+        bool remainingWork;
+        do
+        {
+            remainingWork = false;
+            for (int i = 0; i < _shards.Length; i++)
+            {
+                if (states[i] == ulong.MaxValue) continue;
+                _shards[i].ApplyToSomeEntries(state, callback, aepl, ref states[i]);
+                remainingWork |= states[i] != ulong.MaxValue;
+            }
+        } while (remainingWork);
+    }
+
     /// <summary>Test hook: the shard holding <paramref name="key"/>.</summary>
     internal LruCacheShard GetShardForTest(in CacheKey key) => ShardFor(key.Hash32());
 }
@@ -286,6 +306,19 @@ internal sealed class LruHandleTable
             cur.NextHash = null;
         }
         return cur;
+    }
+
+    /// <summary>Visits the entries of buckets [<paramref name="begin"/>, <paramref name="end"/>) (ApplyToEntriesRange).</summary>
+    public void ApplyToEntriesRange<TState>(TState state, CacheEntryVisitor<TState> callback, int begin, int end, long metadataCharge)
+    {
+        for (int i = begin; i < end; i++)
+        {
+            for (LruEntry? h = _list[i]; h is not null; h = h.NextHash)
+            {
+                CacheValue v = h.GetValue();
+                callback(state, h.Key, v, h.TotalCharge - metadataCharge, h.Helper);
+            }
+        }
     }
 
     public LruEntry? Remove(in CacheKey key, uint hash)
@@ -574,6 +607,34 @@ internal sealed class LruCacheShard
         }
         if (mustFree) FreePending(e);
         return true;
+    }
+
+    /// <summary>
+    /// LRUCacheShard::ApplyToSomeEntries: visits the next ~<paramref name="averageEntriesPerLock"/> buckets under the
+    /// shard mutex. The state is the starting hash (upper bits = bucket index), which stays valid across a table resize;
+    /// ulong.MaxValue when done.
+    /// </summary>
+    public void ApplyToSomeEntries<TState>(TState state, CacheEntryVisitor<TState> callback, int averageEntriesPerLock, ref ulong position)
+    {
+        lock (_mutex)
+        {
+            int lengthBits = _table.LengthBits;
+            long length = 1L << lengthBits;
+            long indexBegin = (long)(position >> (64 - lengthBits));
+            long indexEnd = indexBegin + averageEntriesPerLock;
+            if (indexEnd >= length)
+            {
+                // Going to end.
+                indexEnd = length;
+                position = ulong.MaxValue;
+            }
+            else
+            {
+                position = (ulong)indexEnd << (64 - lengthBits);
+            }
+            long meta = _metadataChargePolicy == CacheMetadataChargePolicy.FullCharge ? LruCache.EntryMetadataCharge : 0;
+            _table.ApplyToEntriesRange(state, callback, (int)indexBegin, (int)indexEnd, meta);
+        }
     }
 
     public void EraseUnRefEntries()

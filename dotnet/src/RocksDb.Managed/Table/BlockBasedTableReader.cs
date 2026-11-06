@@ -566,24 +566,29 @@ public sealed partial class BlockBasedTableReader : TableReader
         // the builders of later flushes / compactions find them again once this reader is closed. Blocks that go to the
         // block cache keep the block buffer pool's finer size classes (the cache is charged the buffer length).
         BlockBufferSource pinnedSource = metaCache is null ? BlockBufferSource.TableBuffers : BlockBufferSource.BlockBufferPool;
-        Block? indexBlock = Protect(BlockFetcher.ReadBlock(file, footer, indexHandle, verify, null, pinnedSource), options);
+        // pin_top_level_index_and_filter (partitioned index / filter only; unpartitioned ones are not pinned when cached).
+        bool pinTopLevel = options.PinTopLevelIndexAndFilter;
+        // A cached index that is not pinned is looked up in the block cache (and its secondary tiers) once the reader
+        // exists, and read only on a miss (RetrieveBlock in IndexReaderCommon::ReadIndexBlock with prefetch).
+        bool prefetchIndexIntoCache = metaCache is not null && !(pinTopLevel && ReadIndexType(props) == IndexType.TwoLevelIndexSearch);
+        Block? indexBlock = prefetchIndexIntoCache ? null : Protect(BlockFetcher.ReadBlock(file, footer, indexHandle, verify, null, pinnedSource), options);
+        bool prefetchFilterIntoCache = false;
+        BlockHandle prefetchFilterHandle = default;
         Block? rangeDel = null;
         byte[]? filterBuf = null;
         BlockBufferSource filterSource = BlockBufferSource.NotRented;
         Block? filterIndex = null;
         PinnedFilterPartitions? pinnedParts = null;
         Compression.CompressionDictionary? compressionDict = null;
-        // pin_top_level_index_and_filter (partitioned index / filter only; unpartitioned ones are not pinned when cached).
-        bool pinTopLevel = options.PinTopLevelIndexAndFilter;
+        BlockBasedTableReader reader;
         try
         {
-            if (metaCache is not null)
+            if (metaCache is not null && indexBlock is not null)
             {
-                // PrefetchIndexAndFilterBlocks with prefetch_index_and_filter_in_cache: warm the cache; pin only the top
-                // level of a partitioned index with pin_top_level_index_and_filter.
+                // PrefetchIndexAndFilterBlocks with prefetch_index_and_filter_in_cache and pin_top_level_index_and_filter:
+                // the pinned top level of a partitioned index is cached too.
                 Block b = indexBlock;
-                if (pinTopLevel && ReadIndexType(props) == IndexType.TwoLevelIndexSearch) b.AddRef();
-                else indexBlock = null;
+                b.AddRef();
                 if (metaCache.Insert(baseCacheKey.WithOffsetForMinSizeRecord(indexHandle.Offset), CacheValue.FromObject(b).WithHelper(HelpersFor(options)[(int)BlockKind.Index]), b.Charge, metaPriority))
                     RecordAdd(options.Statistics, BlockKind.Index, b.Charge);
             }
@@ -630,26 +635,25 @@ public sealed partial class BlockBasedTableReader : TableReader
                 && metaBlocks.TryGetValue(BlockBasedTableConstants.FullFilterBlockPrefix + policy.CompatibilityName, out fh))
             {
                 filterKind = FilterKind.Full;
-                // A cached filter's buffer is returned to ArrayPool.Shared by the cache entry (CacheValue).
-                filterSource = metaCache is null ? BlockBufferSource.TableBuffers : BlockBufferSource.Shared;
-                filterBuf = BlockFetcher.ReadRawPayload(file, footer, fh, verify, filterSource, out int flen);
-                filter = CreateFilterReader(policy, filterBuf, flen);
                 if (metaCache is not null)
                 {
-                    byte[] fb = filterBuf;
-                    filterBuf = null;
-                    if (metaCache.Insert(baseCacheKey.WithOffsetForMinSizeRecord(fh.Offset), new CacheValue(fb, flen, filter, true).WithHelper(FilterHelperFor(options)), fb.Length, metaPriority))
-                        RecordAdd(options.Statistics, BlockKind.Filter, fb.Length);
-                    filter = null;
+                    // Looked up in the block cache (and its secondary tiers) once the reader exists; read on a miss.
+                    prefetchFilterIntoCache = true;
+                    prefetchFilterHandle = fh;
+                }
+                else
+                {
+                    filterSource = BlockBufferSource.TableBuffers;
+                    filterBuf = BlockFetcher.ReadRawPayload(file, footer, fh, verify, filterSource, out int flen);
+                    filter = CreateFilterReader(policy, filterBuf, flen);
                 }
             }
             UserDefinedIndexReader? udi = OpenUserDefinedIndex(file, options, footer, metaBlocks, props, verify, out bool udiStub);
-            var reader = new BlockBasedTableReader(ownedFile ?? file, options, footer, metaBlocks, props, indexHandle, indexBlock, rangeDel, filter, filterBuf,
+            reader = new BlockBasedTableReader(ownedFile ?? file, options, footer, metaBlocks, props, indexHandle, indexBlock, rangeDel, filter, filterBuf,
                 filterKind, fh, filterIndex, pinnedParts, compressionDict, baseCacheKey, fileSize);
             reader._udiReader = udi;
             reader._udiStub = udiStub;
             reader._udiPrimary = options.IndexMode is BlockBasedIndexMode.CustomDefault or BlockBasedIndexMode.CustomOnly;
-            return reader;
         }
         catch
         {
@@ -661,6 +665,67 @@ public sealed partial class BlockBasedTableReader : TableReader
             if (filterBuf is not null) TableBuilderBuffers.Return(filterSource, filterBuf);
             throw;
         }
+        if (prefetchIndexIntoCache || prefetchFilterIntoCache)
+        {
+            try
+            {
+                // PrefetchIndexAndFilterBlocks with prefetch_index_and_filter_in_cache: warm the block cache, reading through
+                // `file` (the tail prefetch buffer of an async open).
+                if (prefetchIndexIntoCache) reader.PrefetchIndexIntoCache(metaCache!, file);
+                if (prefetchFilterIntoCache) reader.PrefetchFilterIntoCache(metaCache!, file, prefetchFilterHandle);
+            }
+            catch
+            {
+                reader.Dispose();
+                throw;
+            }
+        }
+        return reader;
+    }
+
+    /// <summary>
+    /// Looks the index block up in the block cache (with the secondary tiers, as RetrieveBlock does) and reads and inserts
+    /// it on a miss. Hits and misses are recorded like any index block lookup.
+    /// </summary>
+    private void PrefetchIndexIntoCache(BlockCache cache, IRandomAccessFile file)
+    {
+        CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(IndexHandle.Offset);
+        if (LookupCache(cache, key, BlockKind.Index, out CachedBlock h))
+        {
+            _stats?.Record(HitCounter(BlockKind.Index));
+            h.Dispose();
+            return;
+        }
+        _stats?.Record(MissCounter(BlockKind.Index));
+        Block b = Protect(BlockFetcher.ReadBlock(file, _footer, IndexHandle, _options.VerifyChecksums, null, BlockBufferSource.BlockBufferPool), BlockKind.Index);
+        InsertIntoCache(cache, key, b, BlockKind.Index).Release();
+    }
+
+    /// <summary>The full filter counterpart of <see cref="PrefetchIndexIntoCache"/>.</summary>
+    private void PrefetchFilterIntoCache(BlockCache cache, IRandomAccessFile file, BlockHandle handle)
+    {
+        CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
+        if (LookupFilterCache(cache, key, out CachedBlock h))
+        {
+            _stats?.Record(BlockCacheCounter.FilterHit);
+            h.Dispose();
+            return;
+        }
+        _stats?.Record(BlockCacheCounter.FilterMiss);
+        // A cached filter's buffer is returned to ArrayPool.Shared by the cache entry (CacheValue).
+        byte[] buf = BlockFetcher.ReadRawPayload(file, _footer, handle, _options.VerifyChecksums, BlockBufferSource.Shared, out int len);
+        IFilterBitsReader filter;
+        try
+        {
+            filter = CreateFilterReader(_options.FilterPolicy!, buf, len);
+        }
+        catch
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+            throw;
+        }
+        if (cache.Insert(key, new CacheValue(buf, len, filter, true).WithHelper(FilterHelperFor(_options)), buf.Length, _metaPriority))
+            RecordAdd(_stats, BlockKind.Filter, buf.Length);
     }
 
     private UserDefinedIndexReader? _udiReader;
@@ -774,6 +839,23 @@ public sealed partial class BlockBasedTableReader : TableReader
             return new OffsetableCacheKey("unknown", currentDbSessionId, currentFileNumber);
         }
         return OffsetableCacheKey.FromInternalUniqueId(s_processNonce, (ulong)Interlocked.Increment(ref s_uniqueBaseKeyCounter));
+    }
+
+    /// <summary>
+    /// The stable base cache key of a table (the "newer SST file" case of BlockBasedTable::SetupBaseCacheKey, where
+    /// out_is_stable is true): false when the properties lack the session id or the original file number, so the keys
+    /// of the file depend on the current DB session.
+    /// </summary>
+    public static bool TryGetStableBaseCacheKey(TableProperties properties, out OffsetableCacheKey baseKey)
+    {
+        ArgumentNullException.ThrowIfNull(properties);
+        if (properties.DbSessionId.Length > 0 && properties.OriginalFileNumber > 0)
+        {
+            baseKey = new OffsetableCacheKey(properties.DbId, properties.DbSessionId, properties.OriginalFileNumber);
+            return true;
+        }
+        baseKey = default;
+        return false;
     }
 
     /// <summary>
@@ -947,6 +1029,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     {
         _stats?.Record(MissCounter(kind));
         ChargeRateLimiter(handle, flags);
+        if (cache.AdmitsCompressedBlocks && OffersCompressed(kind, flags)) return ReadAndInsertOfferingCompressed(cache, key, handle, kind, flags);
         Block b = Protect(ReadBlockFromFile(handle, kind), kind);
         if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, b, hit: false, flags);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
@@ -970,6 +1053,67 @@ public sealed partial class BlockBasedTableReader : TableReader
         ChargeRateLimiter(handle, flags);
         b = Protect(ReadBlockFromFile(handle, kind), kind);
         if ((flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(key, b);
+        return BlockRef.FromOwned(b);
+    }
+
+    /// <summary>
+    /// Whether a block read from the file is offered compressed to the cache's secondary tiers: secondary-cache compatible
+    /// helpers (lowest_used_cache_tier), the cache is filled, and the block comes from the file rather than a persistent
+    /// cache (whose compressed copy is not kept).
+    /// </summary>
+    private bool OffersCompressed(BlockKind kind, TableReadFlags flags) =>
+        (flags & TableReadFlags.DontFillCache) == 0 && _persistentCache is null && _helpers[(int)kind].IsSecondaryCacheCompatible;
+
+    /// <summary>
+    /// MaybeReadBlockAndLoadToCache + PutDataBlockToCache with a cache using <see cref="TieredAdmissionPolicy.ThreeQueue"/>:
+    /// the uncompressed block goes to the primary cache and the compressed payload (when the block is stored compressed)
+    /// is passed along as Cache::Insert's compressed_value, which the adapter hands to the secondary tiers (InsertSaved).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private BlockRef ReadAndInsertOfferingCompressed(BlockCache cache, in CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags)
+    {
+        Block b = Protect(BlockFetcher.ReadBlockKeepingCompressed(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), out byte[]? serialized), kind);
+        try
+        {
+            if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, b, hit: false, flags);
+            return InsertIntoCache(cache, key, b, kind, serialized, (int)handle.Size);
+        }
+        finally
+        {
+            if (serialized is not null) Memory.BlockBufferPool.Return(serialized);
+        }
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<BlockRef> ReadAndInsertOfferingCompressedAsync(BlockCache cache, CacheKey key, BlockHandle handle, BlockKind kind,
+        TableReadFlags flags, CancellationToken ct)
+    {
+        BlockFetcher.CompressedRead read = await BlockFetcher.ReadBlockKeepingCompressedAsync(_file, _footer, handle, _options.VerifyChecksums,
+            DictFor(kind), ct).ConfigureAwait(false);
+        try
+        {
+            Block b = Protect(read.Block, kind);
+            if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, b, hit: false, flags);
+            return InsertIntoCache(cache, key, b, kind, read.Serialized, (int)handle.Size);
+        }
+        finally
+        {
+            if (read.Serialized is not null) Memory.BlockBufferPool.Return(read.Serialized);
+        }
+    }
+
+    // InsertIntoCache with the serialized block: its payload ([0, size), compression type at [size]) is the compressed value.
+    private BlockRef InsertIntoCache(BlockCache cache, in CacheKey key, Block b, BlockKind kind, byte[]? serialized, int size)
+    {
+        if (serialized is null) return InsertIntoCache(cache, key, b, kind);
+        CachePriority priority = kind == BlockKind.Data ? CachePriority.Low : _metaPriority;
+        if (cache.TryInsert(key, CacheValue.FromObject(b).WithHelper(_helpers[(int)kind]), b.Charge, priority, serialized.AsSpan(0, size),
+                (Compression.CompressionType)serialized[size], out CachedBlock h))
+        {
+            RecordAdd(_stats, kind, b.Charge);
+            return BlockRef.FromCache(b, h);
+        }
+        _stats?.Record(BlockCacheCounter.AddFailure);
         return BlockRef.FromOwned(b);
     }
 
@@ -1050,7 +1194,9 @@ public sealed partial class BlockBasedTableReader : TableReader
     private async ValueTask<BlockRef> ReadAndInsertAsync(BlockCache cache, CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags, CancellationToken ct)
     {
         await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
-        Block b = Protect(_persistentCache is not null ? ReadBlockFromFile(handle, kind)
+        if (cache.AdmitsCompressedBlocks && OffersCompressed(kind, flags))
+            return await ReadAndInsertOfferingCompressedAsync(cache, key, handle, kind, flags, ct).ConfigureAwait(false);
+        Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, ct).ConfigureAwait(false)
             : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false), kind);
         if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, b, hit: false, flags);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
@@ -1060,7 +1206,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     private async ValueTask<BlockRef> ReadAndInsertLegacyAsync(BlockHandle handle, BlockKind kind, TableReadFlags flags, CancellationToken ct)
     {
         await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
-        Block b = Protect(_persistentCache is not null ? ReadBlockFromFile(handle, kind)
+        Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, ct).ConfigureAwait(false)
             : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false), kind);
         if (_legacyCache is { } legacy && (flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(new BlockCacheKey(_tableId, handle.Offset), b);
         return BlockRef.FromOwned(b);

@@ -247,6 +247,130 @@ public sealed class BlockCacheTier : PersistentCacheTier
         }
     }
 
+    /// <summary>
+    /// Async lookup: the index and the write buffers are consulted synchronously; a record in a closed cache file is
+    /// read with async I/O (the file stays referenced, so it cannot be evicted meanwhile). Misses go to the next tier.
+    /// </summary>
+    public override ValueTask<PersistentCacheLookupResult> LookupAsync(ReadOnlyMemory<byte> key, CancellationToken cancellationToken)
+    {
+        CacheKey k = CacheKey.Read(key.Span);
+        CacheFile? file;
+        Lba lba;
+        _lock.EnterReadLock();
+        try
+        {
+            if (!_blockIndex.TryGetValue(k, out lba) || !_files.TryGetValue(lba.CacheId, out file))
+            {
+                Interlocked.Increment(ref _cacheMisses);
+                return MissAsync(key, cancellationToken);
+            }
+            Interlocked.Increment(ref file.Refs);
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
+        TouchFile(file);
+        byte[] scratch = ArrayPool<byte>.Shared.Rent(lba.Size);
+        bool releaseHere = true;
+        try
+        {
+            Env.IRandomAccessFile? reader;
+            bool ok;
+            try
+            {
+                ok = file.TryReadBuffered(lba, scratch, out reader);
+            }
+            catch (IOException)
+            {
+                ok = false;
+                reader = null;
+            }
+            if (reader is not null)
+            {
+                releaseHere = false;
+                return ReadRecordAsync(file, reader, lba, scratch, key, cancellationToken);
+            }
+            if (!ok) return ErrorMissAsync(key, cancellationToken);
+            PersistentCacheLookupResult result = Found(scratch, lba, key.Span);
+            return result.Found ? new ValueTask<PersistentCacheLookupResult>(result) : MissAsync(key, cancellationToken);
+        }
+        finally
+        {
+            if (releaseHere)
+            {
+                ArrayPool<byte>.Shared.Return(scratch);
+                Interlocked.Decrement(ref file.Refs);
+            }
+        }
+    }
+
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<PersistentCacheLookupResult> ReadRecordAsync(CacheFile file, Env.IRandomAccessFile reader, Lba lba, byte[] scratch,
+        ReadOnlyMemory<byte> key, CancellationToken cancellationToken)
+    {
+        bool ok;
+        try
+        {
+            int total = 0;
+            while (total < lba.Size)
+            {
+                int r = await reader.ReadAsync(lba.Offset + total, scratch.AsMemory(total, lba.Size - total), cancellationToken).ConfigureAwait(false);
+                if (r <= 0) break;
+                total += r;
+            }
+            ok = total == lba.Size;
+        }
+        catch (Exception e) when (e is IOException or ObjectDisposedException)
+        {
+            ok = false;
+        }
+        try
+        {
+            if (ok)
+            {
+                PersistentCacheLookupResult found = Found(scratch, lba, key.Span);
+                if (found.Found) return found;
+            }
+            else
+            {
+                Interlocked.Increment(ref _cacheMisses);
+                Interlocked.Increment(ref _cacheErrors);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(scratch);
+            Interlocked.Decrement(ref file.Refs);
+        }
+        return await MissAsync(key, cancellationToken).ConfigureAwait(false);
+    }
+
+    // Parses the record read into scratch; counts the hit, or the miss + error of a bad record (Found = false).
+    private PersistentCacheLookupResult Found(byte[] scratch, in Lba lba, ReadOnlySpan<byte> key)
+    {
+        if (ParseRecord(scratch.AsSpan(0, lba.Size), key, out int valOffset, out int valSize))
+        {
+            CopyOut(scratch.AsSpan(valOffset, valSize), out byte[] data, out int length);
+            Interlocked.Add(ref _bytesRead, length);
+            Interlocked.Increment(ref _cacheHits);
+            return new PersistentCacheLookupResult(true, data, length);
+        }
+        Interlocked.Increment(ref _cacheMisses);
+        Interlocked.Increment(ref _cacheErrors);
+        return default;
+    }
+
+    private ValueTask<PersistentCacheLookupResult> ErrorMissAsync(ReadOnlyMemory<byte> key, CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref _cacheMisses);
+        Interlocked.Increment(ref _cacheErrors);
+        return MissAsync(key, cancellationToken);
+    }
+
+    private ValueTask<PersistentCacheLookupResult> MissAsync(ReadOnlyMemory<byte> key, CancellationToken cancellationToken) =>
+        NextTier is { } next ? next.LookupAsync(key, cancellationToken) : new ValueTask<PersistentCacheLookupResult>(new PersistentCacheLookupResult(false, [], 0));
+
     private bool Miss(ReadOnlySpan<byte> key, out byte[] data, out int length)
     {
         if (NextTier is { } next) return next.TryLookup(key, out data, out length);
@@ -601,6 +725,20 @@ public sealed class BlockCacheTier : PersistentCacheTier
                 _bufs.Clear();
                 _bufUsed.Clear();
             }
+        }
+
+        /// <summary>
+        /// Reads a record still in the write buffers into <paramref name="scratch"/> (true when complete); for a closed
+        /// file returns false with the reader to read it from (the caller holds a reference on the file).
+        /// </summary>
+        public bool TryReadBuffered(in Lba lba, byte[] scratch, out Env.IRandomAccessFile? reader)
+        {
+            lock (_rw)
+            {
+                reader = _reader;
+                if (reader is not null) return false;
+            }
+            return Read(lba, scratch);
         }
 
         public bool Read(in Lba lba, byte[] scratch)

@@ -167,6 +167,9 @@ public sealed class PersistentTieredCache : PersistentCacheTier
 
     public override bool TryLookup(ReadOnlySpan<byte> key, out byte[] data, out int length) => Front.TryLookup(key, out data, out length);
 
+    public override ValueTask<PersistentCacheLookupResult> LookupAsync(ReadOnlyMemory<byte> key, CancellationToken cancellationToken) =>
+        Front.LookupAsync(key, cancellationToken);
+
     public override bool IsCompressed => Front.IsCompressed;
 
     public override string GetPrintableOptions() => "PersistentTieredCache";

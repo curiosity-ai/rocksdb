@@ -180,6 +180,12 @@ public sealed class SimCache : BlockCache
         _keyOnlyCache.EraseUnreferencedEntries();
     }
 
+    internal override bool AdmitsCompressedBlocks => _target.AdmitsCompressedBlocks;
+
+    // SimCacheImpl::ApplyToAllEntries: the real cache's entries.
+    public override void ApplyToAllEntries<TState>(TState state, CacheEntryVisitor<TState> callback, int averageEntriesPerLock) =>
+        _target.ApplyToAllEntries(state, callback, averageEntriesPerLock);
+
     public override long Capacity => _target.Capacity;
 
     public override void SetCapacity(long capacity) => _target.SetCapacity(capacity);

@@ -235,6 +235,26 @@ public sealed class HyperClockCache : BlockCache
     {
         foreach (ClockShard s in _shards) s.EraseUnRefEntries();
     }
+
+    /// <summary>ShardedCache::ApplyToAllEntries: a slice of each shard per round, rotating between shards.</summary>
+    public override void ApplyToAllEntries<TState>(TState state, CacheEntryVisitor<TState> callback, int averageEntriesPerLock)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        int aepl = Math.Max(averageEntriesPerLock, 1);
+        Span<long> states = _shards.Length <= 64 ? stackalloc long[_shards.Length] : new long[_shards.Length];
+        states.Clear();
+        bool remainingWork;
+        do
+        {
+            remainingWork = false;
+            for (int i = 0; i < _shards.Length; i++)
+            {
+                if (states[i] == long.MaxValue) continue;
+                _shards[i].ApplyToSomeEntries(state, callback, aepl, ref states[i]);
+                remainingWork |= states[i] != long.MaxValue;
+            }
+        } while (remainingWork);
+    }
 }
 
 /// <summary>A table slot (ClockHandle) or a standalone (detached) entry.</summary>
@@ -979,6 +999,53 @@ internal sealed class ClockShard
             current = (current + inc) & t.Mask;
         }
         return found;
+    }
+
+    /// <summary>
+    /// ClockCacheShard::ApplyToSomeEntries + ConstApplyToEntriesRange: the state is a slot index (long.MaxValue when done).
+    /// Each visible slot is pinned with an optimistic acquire for the duration of the callback, then released like a
+    /// handle (so an entry erased meanwhile is freed by this release, as by any last reference).
+    /// </summary>
+    public void ApplyToSomeEntries<TState>(TState state, CacheEntryVisitor<TState> callback, int averageEntriesPerLock, ref long position)
+    {
+        Table t = Volatile.Read(ref _t);
+        long length = t.Array.Length;
+        long indexBegin = position;
+        long indexEnd = indexBegin + averageEntriesPerLock;
+        if (indexEnd >= length)
+        {
+            // Going to end.
+            indexEnd = length;
+            position = long.MaxValue;
+        }
+        else
+        {
+            position = indexEnd;
+        }
+        for (long i = indexBegin; i < indexEnd; i++)
+        {
+            ClockSlot h = t.Array[i];
+            ulong oldMeta = h.LoadMeta();
+            // Check if it's an entry visible to lookups.
+            if (ClockSlot.State(oldMeta) != ClockSlot.StateVisible) continue;
+            // Increment acquire counter; check whether we actually acquired a reference.
+            oldMeta = h.FetchAdd(ClockSlot.AcquireIncrement);
+            ulong st = ClockSlot.State(oldMeta);
+            if ((st & ClockSlot.StateShareableBit) == 0) continue; // other states: the increment has no effect
+            var handle = new CachedBlock(h);
+            try
+            {
+                if (st == ClockSlot.StateVisible)
+                {
+                    CacheValue v = h.GetValue();
+                    callback(state, h.Key, v, h.TotalCharge, h.Helper);
+                }
+            }
+            finally
+            {
+                handle.Release(false);
+            }
+        }
     }
 
     // EraseUnRefEntries: take ownership of every unreferenced shareable slot.

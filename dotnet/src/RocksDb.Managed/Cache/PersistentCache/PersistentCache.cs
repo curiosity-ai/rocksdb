@@ -1,6 +1,12 @@
 namespace RocksDb.Managed.Cache;
 
 /// <summary>
+/// Result of <see cref="PersistentCache.LookupAsync"/>: when <see cref="Found"/>, <see cref="Data"/>[0..<see cref="Length"/>)
+/// holds a copy rented from <see cref="System.Buffers.ArrayPool{T}.Shared"/> that the caller returns.
+/// </summary>
+public readonly record struct PersistentCacheLookupResult(bool Found, byte[] Data, int Length);
+
+/// <summary>
 /// A cache of table blocks that may live outside memory (flash), consulted by block-based table readers before reading a
 /// block from its file (BlockBasedTableOptions::persistent_cache). Port of include/rocksdb/persistent_cache.h; the
 /// table-side logic is table/persistent_cache_helper.cc. Upstream marks this API legacy (the SecondaryCache API is its
@@ -23,6 +29,17 @@ public abstract class PersistentCache
     /// <see cref="System.Buffers.ArrayPool{T}.Shared"/>; the caller returns it.
     /// </summary>
     public abstract bool TryLookup(ReadOnlySpan<byte> key, out byte[] data, out int length);
+
+    /// <summary>
+    /// Async <see cref="TryLookup"/>: a tier that reads from storage does so with async I/O (the managed counterpart of the
+    /// async block reads of BlockFetcher, which upstream does not have for the persistent cache). The default completes
+    /// synchronously with <see cref="TryLookup"/>.
+    /// </summary>
+    public virtual ValueTask<PersistentCacheLookupResult> LookupAsync(ReadOnlyMemory<byte> key, CancellationToken cancellationToken)
+    {
+        bool found = TryLookup(key.Span, out byte[] data, out int length);
+        return new ValueTask<PersistentCacheLookupResult>(new PersistentCacheLookupResult(found, data, length));
+    }
 
     /// <summary>True if the cache stores serialized (possibly compressed, with trailer) blocks (IsCompressed).</summary>
     public abstract bool IsCompressed { get; }

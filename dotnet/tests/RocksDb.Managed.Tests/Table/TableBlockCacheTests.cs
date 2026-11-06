@@ -121,10 +121,13 @@ public sealed class TableBlockCacheTests
         Assert.AreEqual(2, cache.Count, "index and filter prefetched into the cache at open");
         Assert.AreEqual(1, stats.Get(BlockCacheCounter.IndexAdd));
         Assert.AreEqual(1, stats.Get(BlockCacheCounter.FilterAdd));
+        // The prefetch at open looks both blocks up first and counts the misses (RetrieveBlock, as upstream).
+        Assert.AreEqual(1, stats.IndexMisses);
+        Assert.AreEqual(1, stats.FilterMisses);
 
         GetAll(reader, entries, 3);
-        Assert.AreEqual(0, stats.IndexMisses);
-        Assert.AreEqual(0, stats.FilterMisses);
+        Assert.AreEqual(1, stats.IndexMisses);
+        Assert.AreEqual(1, stats.FilterMisses);
         Assert.IsTrue(stats.IndexHits > 0);
         Assert.IsTrue(stats.FilterHits > 0);
         // Filtered out: the filter answers without touching the index.
@@ -137,8 +140,8 @@ public sealed class TableBlockCacheTests
         Assert.AreEqual(0, cache.Count);
         GetAll(reader, entries, 5);
         ScanAll(reader, entries);
-        Assert.AreEqual(1, stats.IndexMisses);
-        Assert.AreEqual(1, stats.FilterMisses);
+        Assert.AreEqual(2, stats.IndexMisses);
+        Assert.AreEqual(2, stats.FilterMisses);
         Assert.AreEqual(0, cache.PinnedUsage);
 
         // Without a native cache the option is ignored (the reader owns index and filter).
@@ -160,8 +163,9 @@ public sealed class TableBlockCacheTests
         for (int pass = 0; pass < 3; pass++) ScanAll(reader, entries);
         Assert.IsTrue(stats.DataMisses > (long)reader.Properties.NumDataBlocks, "the cache is smaller than the data");
         GetAll(reader, entries, 13);
-        Assert.AreEqual(0, stats.IndexMisses);
-        Assert.AreEqual(0, stats.FilterMisses);
+        // Only the lookups of the prefetch at open missed.
+        Assert.AreEqual(1, stats.IndexMisses);
+        Assert.AreEqual(1, stats.FilterMisses);
     }
 
     [TestMethod]

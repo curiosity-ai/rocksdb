@@ -71,6 +71,9 @@ internal sealed class CacheWithSecondaryAdapter : BlockCache
 
     public TieredAdmissionPolicy AdmissionPolicy => _admPolicy;
 
+    // The compressed value is only used with kAdmPolicyThreeQueue (Insert below).
+    internal override bool AdmitsCompressedBlocks => _admPolicy == TieredAdmissionPolicy.ThreeQueue;
+
     private sealed class Evictions(CacheWithSecondaryAdapter owner) : CacheEvictionHandler
     {
         internal override void OnEvicted(in CacheKey key, CacheEntry entry, bool wasHit) => owner.EvictionHandlerImpl(key, entry, wasHit);
@@ -187,49 +190,86 @@ internal sealed class CacheWithSecondaryAdapter : BlockCache
         }
     }
 
+    // WaitAll / WaitAllAsync collect the handles pending on this adapter's secondary cache into arrays rented from
+    // ArrayPool (no allocation per batch); a batch with nothing pending returns without collecting.
     public override void WaitAll(ReadOnlySpan<AsyncLookupHandle> handles)
     {
-        if (handles.IsEmpty) return;
-        List<AsyncLookupHandle> mine = CollectPending(handles, out bool innerPending);
-        if (innerPending)
+        if (!AnyPending(handles)) return;
+        AsyncLookupHandle[] mine = System.Buffers.ArrayPool<AsyncLookupHandle>.Shared.Rent(handles.Length);
+        SecondaryCacheResultHandle[]? sec = null;
+        int n = 0;
+        try
         {
-            _target.WaitAll(handles);
-            ConvertInner(handles, mine);
+            n = CollectPending(handles, mine, out bool innerPending);
+            if (innerPending)
+            {
+                _target.WaitAll(handles);
+                n = ConvertInner(handles, mine, n);
+            }
+            sec = System.Buffers.ArrayPool<SecondaryCacheResultHandle>.Shared.Rent(Math.Max(1, n));
+            for (int i = 0; i < n; i++) sec[i] = mine[i].PendingHandle!;
+            _secondary.WaitAll(sec.AsSpan(0, n));
+            for (int i = 0; i < n; i++) Complete(mine[i]);
         }
-        var sec = new SecondaryCacheResultHandle[mine.Count];
-        for (int i = 0; i < sec.Length; i++) sec[i] = mine[i].PendingHandle!;
-        _secondary.WaitAll(sec);
-        foreach (AsyncLookupHandle cur in mine) Complete(cur);
+        finally
+        {
+            if (sec is not null) System.Buffers.ArrayPool<SecondaryCacheResultHandle>.Shared.Return(sec, clearArray: true);
+            System.Buffers.ArrayPool<AsyncLookupHandle>.Shared.Return(mine, clearArray: true);
+        }
     }
 
-    public override async ValueTask WaitAllAsync(AsyncLookupHandle[] handles, int count, CancellationToken cancellationToken)
+    public override ValueTask WaitAllAsync(AsyncLookupHandle[] handles, int count, CancellationToken cancellationToken)
     {
-        if (count == 0) return;
-        List<AsyncLookupHandle> mine = CollectPending(handles.AsSpan(0, count), out bool innerPending);
-        if (innerPending)
-        {
-            await _target.WaitAllAsync(handles, count, cancellationToken).ConfigureAwait(false);
-            ConvertInner(handles.AsSpan(0, count), mine);
-        }
-        foreach (AsyncLookupHandle cur in mine)
-        {
-            SecondaryCacheResultHandle sh = cur.PendingHandle!;
-            if (!sh.IsReady) await sh.WaitAsync(cancellationToken).ConfigureAwait(false);
-        }
-        foreach (AsyncLookupHandle cur in mine) Complete(cur);
+        if (count == 0 || !AnyPending(handles.AsSpan(0, count))) return ValueTask.CompletedTask;
+        return WaitAllSlowAsync(handles, count, cancellationToken);
     }
 
-    // Requests pending on *my* secondary (marked as handled by this caller), and whether any are pending on an inner one.
-    private List<AsyncLookupHandle> CollectPending(ReadOnlySpan<AsyncLookupHandle> handles, out bool innerPending)
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask WaitAllSlowAsync(AsyncLookupHandle[] handles, int count, CancellationToken cancellationToken)
     {
-        var mine = new List<AsyncLookupHandle>();
+        AsyncLookupHandle[] mine = System.Buffers.ArrayPool<AsyncLookupHandle>.Shared.Rent(count);
+        try
+        {
+            int n = CollectPending(handles.AsSpan(0, count), mine, out bool innerPending);
+            if (innerPending)
+            {
+                await _target.WaitAllAsync(handles, count, cancellationToken).ConfigureAwait(false);
+                n = ConvertInner(handles.AsSpan(0, count), mine, n);
+            }
+            for (int i = 0; i < n; i++)
+            {
+                SecondaryCacheResultHandle sh = mine[i].PendingHandle!;
+                if (!sh.IsReady) await sh.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            for (int i = 0; i < n; i++) Complete(mine[i]);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<AsyncLookupHandle>.Shared.Return(mine, clearArray: true);
+        }
+    }
+
+    private static bool AnyPending(ReadOnlySpan<AsyncLookupHandle> handles)
+    {
+        foreach (AsyncLookupHandle h in handles)
+        {
+            if (h.PendingCache is not null) return true;
+        }
+        return false;
+    }
+
+    // Requests pending on *my* secondary (marked as handled by this caller) go to `mine`; returns their number and
+    // whether any are pending on an inner one.
+    private int CollectPending(ReadOnlySpan<AsyncLookupHandle> handles, AsyncLookupHandle[] mine, out bool innerPending)
+    {
+        int n = 0;
         innerPending = false;
         foreach (AsyncLookupHandle cur in handles)
         {
             if (cur.PendingCache is null) continue;
             if (ReferenceEquals(cur.PendingCache, _secondary))
             {
-                mine.Add(cur);
+                mine[n++] = cur;
                 cur.PendingCache = null;
             }
             else
@@ -237,23 +277,24 @@ internal sealed class CacheWithSecondaryAdapter : BlockCache
                 innerPending = true;
             }
         }
-        return mine;
+        return n;
     }
 
     // For those that failed to find something in an inner cache, convert to a lookup in my secondary cache.
-    private void ConvertInner(ReadOnlySpan<AsyncLookupHandle> handles, List<AsyncLookupHandle> mine)
+    private int ConvertInner(ReadOnlySpan<AsyncLookupHandle> handles, AsyncLookupHandle[] mine, int n)
     {
         foreach (AsyncLookupHandle cur in handles)
         {
-            if (cur.IsPending || cur.ResultRef.HasValue || mine.Contains(cur)) continue;
+            if (cur.IsPending || cur.ResultRef.HasValue || Array.IndexOf(mine, cur, 0, n) >= 0) continue;
             if (cur.Helper is null || !cur.Helper.IsSecondaryCacheCompatible) continue;
             StartAsyncLookupOnMySecondary(cur);
             if (cur.IsPending)
             {
-                mine.Add(cur);
+                mine[n++] = cur;
                 cur.PendingCache = null;
             }
         }
+        return n;
     }
 
     private void Complete(AsyncLookupHandle cur)
@@ -336,6 +377,10 @@ internal sealed class CacheWithSecondaryAdapter : BlockCache
     public override bool Erase(in CacheKey key) => _target.Erase(key);
 
     public override void EraseUnreferencedEntries() => _target.EraseUnreferencedEntries();
+
+    // CacheWrapper::ApplyToAllEntries. Dummy entries carry a helper without secondary-cache support.
+    public override void ApplyToAllEntries<TState>(TState state, CacheEntryVisitor<TState> callback, int averageEntriesPerLock) =>
+        _target.ApplyToAllEntries(state, callback, averageEntriesPerLock);
 
     // ---- capacity / properties ---------------------------------------------------------------------
 

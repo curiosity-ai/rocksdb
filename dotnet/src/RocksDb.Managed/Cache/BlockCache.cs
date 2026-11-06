@@ -340,6 +340,29 @@ public abstract class BlockCache : Table.IBlockCache
     /// <summary>Returns a new id unique for this cache's lifetime (Cache::NewId).</summary>
     public virtual long NewId() => Interlocked.Increment(ref _lastId);
 
+    /// <summary>Default <c>average_entries_per_lock</c> of <see cref="ApplyToAllEntries{TState}(TState, CacheEntryVisitor{TState})"/>.</summary>
+    public const int DefaultAverageEntriesPerLock = 256;
+
+    /// <summary>
+    /// Calls <paramref name="callback"/> for every entry visible to lookups (Cache::ApplyToAllEntries with the default
+    /// ApplyToAllEntriesOptions). See <see cref="ApplyToAllEntries{TState}(TState, CacheEntryVisitor{TState}, int)"/>.
+    /// </summary>
+    public void ApplyToAllEntries<TState>(TState state, CacheEntryVisitor<TState> callback) =>
+        ApplyToAllEntries(state, callback, DefaultAverageEntriesPerLock);
+
+    /// <summary>
+    /// Calls <paramref name="callback"/> for every entry in the cache (Cache::ApplyToAllEntries). Shards are visited in
+    /// rotation, about <paramref name="averageEntriesPerLock"/> entries at a time, to limit the latency impact on concurrent
+    /// operations. The callback may run while internal locks are held: it must not call into this cache, and the value
+    /// is only valid during the call. Entries inserted or erased concurrently may or may not be visited; standalone
+    /// entries are not. The charge passed is the entry's charge (the LRU cache excludes its metadata charge, the clock
+    /// cache includes it, as upstream). NotSupported for caches that cannot enumerate their entries.
+    /// </summary>
+    public virtual void ApplyToAllEntries<TState>(TState state, CacheEntryVisitor<TState> callback, int averageEntriesPerLock)
+    {
+        ThrowHelper.NotSupported("ApplyToAllEntries is not supported by " + Name);
+    }
+
     // ---- secondary-cache support (advanced_cache.h) ------------------------------------------------
 
     /// <summary>
@@ -357,6 +380,14 @@ public abstract class BlockCache : Table.IBlockCache
     public virtual bool TryInsert(in CacheKey key, in CacheValue value, long charge, CachePriority priority,
         ReadOnlySpan<byte> compressedValue, Compression.CompressionType compressionType, out CachedBlock block) =>
         TryInsert(key, value, charge, priority, out block);
+
+    /// <summary>
+    /// True when inserts should offer the compressed form of blocks read from files (the compressed_value argument of
+    /// <see cref="TryInsert(in CacheKey, in CacheValue, long, CachePriority, ReadOnlySpan{byte}, Compression.CompressionType, out CachedBlock)"/>):
+    /// a tiered cache with <see cref="TieredAdmissionPolicy.ThreeQueue"/>. Readers check it on a cache miss only, so other
+    /// caches do not pay for keeping the compressed block.
+    /// </summary>
+    internal virtual bool AdmitsCompressedBlocks => false;
 
     /// <summary>
     /// Starts a lookup that may complete later (Cache::StartAsyncLookup): the primary cache is probed immediately; on a

@@ -184,6 +184,87 @@ internal static class BlockFetcher
     }
 
     /// <summary>
+    /// Reads a block like <see cref="ReadBlock(IRandomAccessFile, in Footer, BlockHandle, bool, CompressionDictionary?)"/>
+    /// and, when it is stored compressed, also returns the verified serialized block (payload + trailer, compression type
+    /// at <c>handle.Size</c>) in <paramref name="serialized"/>, rented from <see cref="BlockBufferPool"/>: the caller
+    /// returns it. This is BlockFetcher::GetCompressedBlock for MaybeReadBlockAndLoadToCache, which offers the compressed
+    /// block to the secondary cache tiers. Uncompressed blocks keep their read buffer and set it to null.
+    /// </summary>
+    public static Block ReadBlockKeepingCompressed(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums,
+        CompressionDictionary? dictionary, out byte[]? serialized)
+    {
+        int n = CheckedLength(handle);
+        byte[] buf = BlockBufferPool.Rent(n);
+        try
+        {
+            int read = ReadFully(file, (long)handle.Offset, buf.AsSpan(0, n));
+            if (read != n) ThrowTruncated(handle, read);
+        }
+        catch
+        {
+            BlockBufferPool.Return(buf);
+            throw;
+        }
+        return ProcessSerializedKeepingCompressed(buf, footer, handle, verifyChecksums, dictionary, out serialized);
+    }
+
+    /// <summary>Async <see cref="ReadBlockKeepingCompressed"/>; the serialized block (if compressed) is <see cref="CompressedRead.Serialized"/>.</summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    public static async ValueTask<CompressedRead> ReadBlockKeepingCompressedAsync(IRandomAccessFile file, Footer footer, BlockHandle handle,
+        bool verifyChecksums, CompressionDictionary? dictionary, CancellationToken ct)
+    {
+        int n = CheckedLength(handle);
+        byte[] buf = BlockBufferPool.Rent(n);
+        try
+        {
+            int total = 0;
+            while (total < n)
+            {
+                int r = await file.ReadAsync((long)handle.Offset + total, buf.AsMemory(total, n - total), ct).ConfigureAwait(false);
+                if (r <= 0) break;
+                total += r;
+            }
+            if (total != n) ThrowTruncated(handle, total);
+        }
+        catch
+        {
+            BlockBufferPool.Return(buf);
+            throw;
+        }
+        Block b = ProcessSerializedKeepingCompressed(buf, footer, handle, verifyChecksums, dictionary, out byte[]? serialized);
+        return new CompressedRead(b, serialized);
+    }
+
+    /// <summary>A block read by <see cref="ReadBlockKeepingCompressedAsync"/> and its serialized form (null: not compressed).</summary>
+    public readonly record struct CompressedRead(Block Block, byte[]? Serialized);
+
+    // Takes ownership of buf (from BlockBufferPool); hands it back through `serialized` when the block is compressed.
+    private static Block ProcessSerializedKeepingCompressed(byte[] buf, in Footer footer, BlockHandle handle, bool verifyChecksums,
+        CompressionDictionary? dictionary, out byte[]? serialized)
+    {
+        int size = (int)handle.Size;
+        var type = (CompressionType)buf[size];
+        if (type == CompressionType.None)
+        {
+            serialized = null;
+            return ProcessSerialized(buf, footer, handle, verifyChecksums, dictionary, BlockBufferSource.BlockBufferPool);
+        }
+        try
+        {
+            if (verifyChecksums && !BlockChecksum.Verify(footer.ChecksumType, footer.BaseContextChecksum, buf.AsSpan(0, size + BlockBasedTableConstants.BlockTrailerSize), handle.Offset))
+                ThrowHelper.Corruption("block checksum mismatch at offset " + handle.Offset + " size " + size);
+            Block b = Decompress(type, buf.AsSpan(0, size), footer.FormatVersion, dictionary, BlockBufferSource.BlockBufferPool);
+            serialized = buf;
+            return b;
+        }
+        catch
+        {
+            BlockBufferPool.Return(buf);
+            throw;
+        }
+    }
+
+    /// <summary>
     /// Verifies and unpacks a serialized block (payload + trailer) held by the caller, e.g. from a persistent cache
     /// (BlockFetcher's ProcessTrailerIfPresent + decompression on a serialized persistent cache hit).
     /// </summary>

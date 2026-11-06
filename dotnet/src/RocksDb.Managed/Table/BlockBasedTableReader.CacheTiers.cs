@@ -180,6 +180,85 @@ public sealed partial class BlockBasedTableReader
         return ReadBlockThroughPersistentCache(pc, handle, kind);
     }
 
+    /// <summary>
+    /// Async <see cref="ReadBlockThroughPersistentCache"/>: the persistent cache lookup (<see cref="PersistentCache.LookupAsync"/>)
+    /// and the file read on a miss use async I/O.
+    /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<Block> ReadBlockThroughPersistentCacheAsync(PersistentCache pc, BlockHandle handle, BlockKind kind, CancellationToken ct)
+    {
+        byte[] key = ArrayPool<byte>.Shared.Rent(CacheKey.Size);
+        try
+        {
+            _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset).WriteTo(key);
+            ReadOnlyMemory<byte> k = key.AsMemory(0, CacheKey.Size);
+            Statistics? stats = _stats?.Owner;
+            int serializedSize = checked((int)handle.Size + BlockBasedTableConstants.BlockTrailerSize);
+            PersistentCacheLookupResult hit = await pc.LookupAsync(k, ct).ConfigureAwait(false);
+            if (pc.IsCompressed)
+            {
+                if (hit.Found)
+                {
+                    try
+                    {
+                        if (hit.Length == serializedSize)
+                        {
+                            stats?.RecordTick(Ticker.PersistentCacheHit);
+                            return BlockFetcher.ProcessSerializedCopy(hit.Data.AsSpan(0, hit.Length), _footer, handle, _options.VerifyChecksums, DictFor(kind));
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(hit.Data);
+                    }
+                }
+                stats?.RecordTick(Ticker.PersistentCacheMiss);
+                byte[] raw = ArrayPool<byte>.Shared.Rent(serializedSize);
+                try
+                {
+                    int read = 0;
+                    while (read < serializedSize)
+                    {
+                        int r = await _file.ReadAsync((long)handle.Offset + read, raw.AsMemory(read, serializedSize - read), ct).ConfigureAwait(false);
+                        if (r <= 0) break;
+                        read += r;
+                    }
+                    if (read != serializedSize) ThrowHelper.Corruption("truncated block read from file at offset " + handle.Offset);
+                    Block b = BlockFetcher.ProcessSerializedCopy(raw.AsSpan(0, serializedSize), _footer, handle, _options.VerifyChecksums, DictFor(kind));
+                    // Only verified blocks are cached (InsertSerialized after the checksum check).
+                    pc.Insert(k.Span, raw.AsSpan(0, serializedSize));
+                    return b;
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(raw);
+                }
+            }
+            if (hit.Found)
+            {
+                try
+                {
+                    stats?.RecordTick(Ticker.PersistentCacheHit);
+                    byte[] copy = BlockBufferPool.Rent(Math.Max(hit.Length, 1));
+                    hit.Data.AsSpan(0, hit.Length).CopyTo(copy);
+                    return Block.Create(copy, hit.Length, rentedFromSharedPool: true);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(hit.Data);
+                }
+            }
+            stats?.RecordTick(Ticker.PersistentCacheMiss);
+            Block block = await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false);
+            pc.Insert(k.Span, block.Data);
+            return block;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(key);
+        }
+    }
+
     [MethodImpl(MethodImplOptions.NoInlining)]
     private Block ReadBlockThroughPersistentCache(PersistentCache pc, BlockHandle handle, BlockKind kind)
     {

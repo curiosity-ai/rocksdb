@@ -1,4 +1,6 @@
+using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using RocksDb.Managed.Cache;
 using RocksDb.Managed.Db;
 
 namespace RocksDb.Managed.Table;
@@ -35,6 +37,12 @@ public sealed partial class BlockBasedTableReader
     /// <paramref name="synchronous"/> the returned task is always complete; otherwise data blocks missing from the block
     /// cache are read with async I/O.
     /// </para>
+    /// <para>
+    /// With a cache that has secondary tiers (<see cref="BlockCache.ExtendedLookup"/>), the first data block of every key
+    /// is looked up up front: one StartAsyncLookup per distinct block, then a single WaitAll (WaitAllAsync when not
+    /// <paramref name="synchronous"/>) for all of them, as upstream's MultiGet does, so the lookups a non-volatile tier
+    /// does asynchronously overlap. Blocks that miss are then read from the file without a second cache lookup.
+    /// </para>
     /// </summary>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     internal override async ValueTask MultiGetAsync<TBatch>(TBatch batch, int[] keys, int count, bool[] mayMatch, TableReadFlags flags, bool synchronous,
@@ -46,8 +54,33 @@ public sealed partial class BlockBasedTableReader
         BlockIter data = IterPool.Rent();
         BlockRef current = default;
         ulong currentOffset = ulong.MaxValue;
+        MultiGetCacheLookups? lookups = null;
         try
         {
+            if (_cache is { ExtendedLookup: true } extended)
+            {
+                lookups = MultiGetCacheLookups.Rent(candidates);
+                for (int i = 0; i < count; i++)
+                {
+                    if (!mayMatch[i]) continue;
+                    if (synchronous)
+                    {
+                        SeekIndex(idx, batch, keys[i]);
+                    }
+                    else
+                    {
+                        ValueTask seek = idx.SeekForGetAsync(batch.InternalKeyMemory(keys[i]), cancellationToken);
+                        if (!seek.IsCompletedSuccessfully) await seek.ConfigureAwait(false);
+                    }
+                    if (idx.Valid) StartDataBlockLookup(extended, lookups, idx.Handle.Offset);
+                }
+                if (lookups.AnyPending)
+                {
+                    if (synchronous) extended.WaitAll(lookups.PendingSpan);
+                    else await extended.WaitAllAsync(lookups.Handles, lookups.Count, cancellationToken).ConfigureAwait(false);
+                }
+                CollectDataBlockLookups(lookups, flags);
+            }
             for (int i = 0; i < count; i++)
             {
                 if (!mayMatch[i]) continue;
@@ -72,7 +105,25 @@ public sealed partial class BlockBasedTableReader
                         if (!current.IsEmpty) current.Release();
                         current = default;
                         currentOffset = ulong.MaxValue;
-                        if (synchronous)
+                        if (lookups is not null && lookups.TryTake(handle.Offset, out BlockRef prefetched))
+                        {
+                            if (!prefetched.IsEmpty)
+                            {
+                                current = prefetched;
+                            }
+                            else if (synchronous)
+                            {
+                                // Missed every cache tier: read it (ReadAndInsert records the miss).
+                                current = ReadAndInsert(_cache!, _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset), handle, BlockKind.Data, flags);
+                            }
+                            else
+                            {
+                                _stats?.Record(MissCounter(BlockKind.Data));
+                                current = await ReadAndInsertAsync(_cache!, _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset), handle, BlockKind.Data, flags,
+                                    cancellationToken).ConfigureAwait(false);
+                            }
+                        }
+                        else if (synchronous)
                         {
                             current = GetBlockRef(handle, BlockKind.Data, flags);
                         }
@@ -101,8 +152,116 @@ public sealed partial class BlockBasedTableReader
         finally
         {
             if (!current.IsEmpty) current.Release();
+            lookups?.Return();
             IterPool.Return(data);
             idx.Return();
+        }
+    }
+
+    // StartAsyncLookupFull for the data block at `offset` unless it is the previous key's block (keys are sorted, so a
+    // block shared by consecutive keys is looked up once).
+    private void StartDataBlockLookup(BlockCache cache, MultiGetCacheLookups lookups, ulong offset)
+    {
+        if (lookups.Count > 0 && lookups.Offsets[lookups.Count - 1] == offset) return;
+        AsyncLookupHandle h = lookups.Add(offset);
+        h.Key = _baseCacheKey.WithOffsetForMinSizeRecord(offset);
+        h.Helper = _helpers[(int)BlockKind.Data];
+        h.CreateContext = this;
+        h.Priority = CachePriority.Low;
+        h.Statistics = _stats?.Owner;
+        cache.StartAsyncLookup(h);
+        if (h.IsPending) lookups.AnyPending = true;
+    }
+
+    // The results of the batched lookups: hits become the keys' blocks (and count as block cache hits).
+    private void CollectDataBlockLookups(MultiGetCacheLookups lookups, TableReadFlags flags)
+    {
+        for (int j = 0; j < lookups.Count; j++)
+        {
+            CachedBlock h = lookups.Handles[j].TakeResult();
+            if (!h.HasValue) continue;
+            var block = Unsafe.As<Block>(h.Value)!;
+            _stats?.Record(HitCounter(BlockKind.Data));
+            if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, h.Key, BlockKind.Data, block, hit: true, flags);
+            lookups.Blocks[j] = BlockRef.FromCache(block, h);
+        }
+    }
+
+    /// <summary>
+    /// Scratch of the batched data block lookups of one MultiGet (the async_handles / cache_keys arrays of upstream's
+    /// MultiGet): lookup handles, block offsets (ascending) and the blocks found. Pooled.
+    /// </summary>
+    private sealed class MultiGetCacheLookups
+    {
+        private static readonly ConcurrentBag<MultiGetCacheLookups> s_pool = new();
+
+        public AsyncLookupHandle[] Handles = [];
+        public ulong[] Offsets = [];
+        public BlockRef[] Blocks = [];
+        public int Count;
+        public bool AnyPending;
+        private int _next;
+
+        public ReadOnlySpan<AsyncLookupHandle> PendingSpan => Handles.AsSpan(0, Count);
+
+        public static MultiGetCacheLookups Rent(int capacity)
+        {
+            if (!s_pool.TryTake(out MultiGetCacheLookups? l)) l = new MultiGetCacheLookups();
+            if (l.Handles.Length < capacity)
+            {
+                int n = Math.Max(capacity, 2 * l.Handles.Length);
+                var handles = new AsyncLookupHandle[n];
+                Array.Copy(l.Handles, handles, l.Handles.Length);
+                for (int i = l.Handles.Length; i < n; i++) handles[i] = new AsyncLookupHandle();
+                l.Handles = handles;
+                l.Offsets = new ulong[n];
+                l.Blocks = new BlockRef[n];
+            }
+            return l;
+        }
+
+        public AsyncLookupHandle Add(ulong offset)
+        {
+            AsyncLookupHandle h = Handles[Count];
+            h.Reset();
+            Offsets[Count] = offset;
+            Count++;
+            return h;
+        }
+
+        /// <summary>
+        /// Takes the lookup result of the block at <paramref name="offset"/> (empty block: it missed every tier). False
+        /// when the block was not looked up (a later block of a key whose entries continue).
+        /// </summary>
+        public bool TryTake(ulong offset, out BlockRef block)
+        {
+            while (_next < Count && Offsets[_next] < offset) _next++;
+            if (_next < Count && Offsets[_next] == offset)
+            {
+                block = Blocks[_next];
+                Blocks[_next] = default;
+                _next++;
+                return true;
+            }
+            block = default;
+            return false;
+        }
+
+        public void Return()
+        {
+            for (int j = 0; j < Count; j++)
+            {
+                // Results never taken (e.g. an exception): release them.
+                if (!Blocks[j].IsEmpty) Blocks[j].Release();
+                Blocks[j] = default;
+                CachedBlock stray = Handles[j].TakeResult();
+                stray.Dispose();
+                Handles[j].Reset();
+            }
+            Count = 0;
+            _next = 0;
+            AnyPending = false;
+            s_pool.Add(this);
         }
     }
 
