@@ -1,6 +1,7 @@
 using System.Buffers;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
+using RocksDb.Managed.Util;
 using RocksDb.Managed.Utilities.Transactions;
 using static RocksDb.Managed.Tests.Db.DbTestUtil;
 
@@ -303,5 +304,105 @@ public sealed class CompactionReviewFixesTests
             byte[]? v = db.Get(Key(i));
             Assert.IsNotNull(v, "key " + i);
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // VersionBuilder::CheckConsistency + force_consistency_checks (db/version_builder.cc)
+
+    /// <summary>
+    /// Moves every L0 file of the default column family to <paramref name="level"/> with a raw MANIFEST edit (the files
+    /// overlap, so the result is an inconsistent LSM unless the consistency checks reject it).
+    /// </summary>
+    internal static void MoveL0FilesTo(RocksDatabase db, int level)
+    {
+        ColumnFamilyData cfd = db.DefaultColumnFamily.Data;
+        var edit = new VersionEdit { ColumnFamily = cfd.Id };
+        foreach (FileMetaData f in cfd.Current.Storage.LevelFiles(0))
+        {
+            edit.DeleteFile(0, f.FileNumber);
+            edit.AddFile(level, f.Clone());
+        }
+        db.Impl.Versions.LogAndApplyAsync(cfd, edit, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+    }
+
+    /// <summary>Two overlapping L0 files (keys a..c and b..d).</summary>
+    internal static void WriteOverlappingL0Files(RocksDatabase db)
+    {
+        db.Put(B("a"), B("1"));
+        db.Put(B("c"), B("1"));
+        db.Flush();
+        db.Put(B("b"), B("2"));
+        db.Put(B("d"), B("2"));
+        db.Flush();
+    }
+
+    [TestMethod]
+    public void LiveEditWithOverlappingL1FilesFailsConsistencyCheck()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { DisableAutoCompactions = true });
+        WriteOverlappingL0Files(db);
+        var ex = Assert.ThrowsExactly<RocksDbException>(() => MoveL0FilesTo(db, 1));
+        Assert.AreEqual(StatusCode.Corruption, ex.Code);
+        StringAssert.Contains(ex.Message, "force_consistency_checks: VersionBuilder: L1 has overlapping ranges");
+        // Nothing was written: the DB reopens with its two L0 files.
+        db.Dispose();
+        using RocksDatabase again = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { DisableAutoCompactions = true });
+        Assert.AreEqual("2", GetString(again, "d"));
+        Assert.AreEqual(2, CountLevelFiles(again, 0));
+    }
+
+    [TestMethod]
+    public void ManifestWithOverlappingL1FilesFailsToOpen()
+    {
+        MemoryFileSystem fs = NewFs();
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { DisableAutoCompactions = true, ForceConsistencyChecks = false }))
+        {
+            WriteOverlappingL0Files(db);
+            MoveL0FilesTo(db, 1); // accepted without the checks
+        }
+        var ex = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions()));
+        Assert.AreEqual(StatusCode.Corruption, ex.Code);
+        StringAssert.Contains(ex.Message, "L1 has overlapping ranges");
+        // Like upstream, the checks can be turned off.
+        using RocksDatabase unchecked_ = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { DisableAutoCompactions = true, ForceConsistencyChecks = false });
+        Assert.AreEqual(2, CountLevelFiles(unchecked_, 1));
+    }
+
+    private static int CountLevelFiles(RocksDatabase db, int level)
+    {
+        int n = 0;
+        foreach (LiveFileMetadata f in db.GetLiveFilesMetadata()) n += f.Level == level ? 1 : 0;
+        return n;
+    }
+
+    [TestMethod]
+    public void ConsistencyCheckRejectsUnsortedAndSameEpochOverlappingL0()
+    {
+        var icmp = new InternalKeyComparator(BytewiseComparator.Instance);
+        FileMetaData F(ulong number, string smallest, string largest, ulong epoch, ulong seq) => new()
+        {
+            FileNumber = number,
+            Smallest = new InternalKey(B(smallest), seq, EntryType.Value).Encoded.ToArray(),
+            Largest = new InternalKey(B(largest), seq, EntryType.Value).Encoded.ToArray(),
+            EpochNumber = epoch,
+            SmallestSeqno = seq,
+            LargestSeqno = seq,
+        };
+        // Same epoch, overlapping (e.g. two outputs of one atomic flush that overlap).
+        var sameEpoch = new[] { new[] { F(2, "a", "c", 5, 10), F(1, "b", "d", 5, 9) } };
+        var ex = Assert.ThrowsExactly<RocksDbException>(() => VersionStorageInfo.CheckConsistency(icmp, sameEpoch, [], forceConsistencyChecks: true));
+        StringAssert.Contains(ex.Message, "L0 files of same epoch number but overlapping range");
+        // Older epoch first.
+        var unsorted = new[] { new[] { F(1, "a", "c", 4, 9), F(2, "x", "z", 5, 10) } };
+        ex = Assert.ThrowsExactly<RocksDbException>(() => VersionStorageInfo.CheckConsistency(icmp, unsorted, [], forceConsistencyChecks: true));
+        StringAssert.Contains(ex.Message, "L0 files are not sorted properly");
+        // Levels 1+ must be sorted by smallest key.
+        var l1 = new[] { Array.Empty<FileMetaData>(), new[] { F(2, "m", "n", 1, 1), F(1, "a", "b", 1, 1) } };
+        ex = Assert.ThrowsExactly<RocksDbException>(() => VersionStorageInfo.CheckConsistency(icmp, l1, [], forceConsistencyChecks: true));
+        StringAssert.Contains(ex.Message, "L1 files are not sorted properly");
+        // A sound version and disabled checks pass.
+        VersionStorageInfo.CheckConsistency(icmp, new[] { new[] { F(2, "x", "z", 5, 10), F(1, "a", "c", 4, 9) } }, [], forceConsistencyChecks: true);
+        VersionStorageInfo.CheckConsistency(icmp, l1, [], forceConsistencyChecks: false);
     }
 }

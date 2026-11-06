@@ -210,6 +210,8 @@ internal sealed class VersionSet : IAsyncDisposable
             AllowIngestBehind = AllowIngestBehind(cfd),
             FullHistoryTsLow = cfd.FullHistoryTsLow,
         };
+        // VersionBuilder::SaveTo -> CheckConsistency of the recovered version (MANIFEST replay).
+        if (files is not null) VersionStorageInfo.CheckConsistency(cfd.Icmp, files, blobs, cfd.Options.ForceConsistencyChecks);
         var storage = new VersionStorageInfo(cfd.Icmp, Math.Max(cfd.NumLevels, files?.Length ?? 0), cfd.Options, files, blobs, context);
         var v = new DbVersion(cfd, storage, ++_versionNumber);
         InstallVersion(cfd, v);
@@ -456,6 +458,8 @@ internal sealed class VersionSet : IAsyncDisposable
                         VersionStorageInfo cur = cfd.Current.Storage;
                         newFiles[i] = cur.ApplyEdit(edit, cfd.NumLevels);
                         newBlobFiles[i] = Blob.BlobFileMetaData.Build(cur.BlobFiles, edit, newFiles[i]);
+                        // VersionBuilder::SaveTo -> CheckConsistency, before the edit is written.
+                        VersionStorageInfo.CheckConsistency(cfd.Icmp, newFiles[i], newBlobFiles[i], cfd.Options.ForceConsistencyChecks);
                         baseStats[i] = cur.AccumulatedStats;
                     }
                     // WalSet::AddWal fails for a WAL created twice: check before anything is written.

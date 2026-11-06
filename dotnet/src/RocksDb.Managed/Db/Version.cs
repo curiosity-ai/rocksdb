@@ -179,6 +179,98 @@ internal sealed partial class VersionStorageInfo
         return result;
     }
 
+    /// <summary>
+    /// Port of VersionBuilder::CheckConsistency / CheckConsistencyDetails (db/version_builder.cc) for the files of a
+    /// version about to be saved: L0 sorted newest first (by epoch number, or by sequence numbers when some L0 file has
+    /// no epoch number: EpochNumberRequirement::kMightMissing) without overlapping files of the same epoch, levels 1+
+    /// sorted by smallest key without overlap, and no blob file consisting entirely of garbage. The table-to-blob links
+    /// are consistent by construction (<see cref="Blob.BlobFileMetaData.Build"/> derives them from the table files).
+    /// Only runs with force_consistency_checks (upstream also always runs it in debug builds). Throws
+    /// Corruption("force_consistency_checks: VersionBuilder: ...") like upstream.
+    /// </summary>
+    internal static void CheckConsistency(InternalKeyComparator icmp, IReadOnlyList<FileMetaData[]> levels, Blob.BlobFileMetaData[] blobFiles,
+        bool forceConsistencyChecks)
+    {
+        if (!forceConsistencyChecks) return;
+        if (levels.Count > 0)
+        {
+            FileMetaData[] l0 = levels[0];
+            bool epochMightMiss = false;
+            foreach (FileMetaData f in l0) epochMightMiss |= f.EpochNumber == FileMetaData.UnknownEpochNumber;
+            for (int i = 1; i < l0.Length; i++)
+            {
+                FileMetaData lhs = l0[i - 1], rhs = l0[i];
+                if (epochMightMiss)
+                {
+                    if (!NewestFirstBySeqNo(lhs, rhs))
+                    {
+                        ConsistencyCorruption("L0 files are not sorted properly: files #" + Num(lhs.FileNumber) + " with seqnos (largest, smallest) " +
+                            Num(lhs.LargestSeqno) + " , " + Num(lhs.SmallestSeqno) + ", #" + Num(rhs.FileNumber) + " with seqnos (largest, smallest) " +
+                            Num(rhs.LargestSeqno) + " , " + Num(rhs.SmallestSeqno));
+                    }
+                    continue;
+                }
+                if (lhs.EpochNumber == rhs.EpochNumber && icmp.Compare(lhs.Smallest, rhs.Largest) <= 0 && icmp.Compare(lhs.Largest, rhs.Smallest) >= 0)
+                {
+                    ConsistencyCorruption("L0 files of same epoch number but overlapping range #" + Num(lhs.FileNumber) +
+                        " , smallest key: " + InternalKey.DebugString(lhs.Smallest, hex: true) + " , largest key: " + InternalKey.DebugString(lhs.Largest, hex: true) +
+                        " , epoch number: " + Num(lhs.EpochNumber) + " vs. file #" + Num(rhs.FileNumber) +
+                        " , smallest key: " + InternalKey.DebugString(rhs.Smallest, hex: true) + " , largest key: " + InternalKey.DebugString(rhs.Largest, hex: true) +
+                        " , epoch number: " + Num(rhs.EpochNumber));
+                }
+                // NewestFirstByEpochNumber
+                if (!(lhs.EpochNumber > rhs.EpochNumber || (lhs.EpochNumber == rhs.EpochNumber && NewestFirstBySeqNo(lhs, rhs))))
+                {
+                    ConsistencyCorruption("L0 files are not sorted properly: files #" + Num(lhs.FileNumber) + " with epoch number " + Num(lhs.EpochNumber) +
+                        ", #" + Num(rhs.FileNumber) + " with epoch number " + Num(rhs.EpochNumber));
+                }
+            }
+        }
+        for (int level = 1; level < levels.Count; level++)
+        {
+            FileMetaData[] files = levels[level];
+            for (int i = 1; i < files.Length; i++)
+            {
+                FileMetaData lhs = files[i - 1], rhs = files[i];
+                // BySmallestKey
+                int r = icmp.Compare(lhs.Smallest, rhs.Smallest);
+                if (!(r < 0 || (r == 0 && lhs.FileNumber < rhs.FileNumber)))
+                {
+                    ConsistencyCorruption("L" + Num((ulong)level) + " files are not sorted properly: files #" + Num(lhs.FileNumber) + ", #" + Num(rhs.FileNumber));
+                }
+                // Make sure there is no overlap in level
+                if (icmp.Compare(lhs.Largest, rhs.Smallest) >= 0)
+                {
+                    ConsistencyCorruption("L" + Num((ulong)level) + " has overlapping ranges: file #" + Num(lhs.FileNumber) +
+                        " largest key: " + InternalKey.DebugString(lhs.Largest, hex: true) + " vs. file #" + Num(rhs.FileNumber) +
+                        " smallest key: " + InternalKey.DebugString(rhs.Smallest, hex: true));
+                }
+            }
+        }
+        // Make sure that all blob files in the version have non-garbage data.
+        foreach (Blob.BlobFileMetaData b in blobFiles)
+        {
+            if (b.GarbageBlobCount >= b.TotalBlobCount)
+            {
+                ConsistencyCorruption("Blob file #" + Num(b.BlobFileNumber) + " consists entirely of garbage");
+            }
+        }
+
+        static string Num(ulong n) => n.ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>NewestFirstBySeqNo (db/version_set.h): lhs strictly precedes rhs.</summary>
+    private static bool NewestFirstBySeqNo(FileMetaData a, FileMetaData b)
+    {
+        if (a.LargestSeqno != b.LargestSeqno) return a.LargestSeqno > b.LargestSeqno;
+        if (a.SmallestSeqno != b.SmallestSeqno) return a.SmallestSeqno > b.SmallestSeqno;
+        // Break ties by file number
+        return a.FileNumber > b.FileNumber;
+    }
+
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ConsistencyCorruption(string message) => ThrowHelper.Corruption("force_consistency_checks: VersionBuilder: " + message);
+
     /// <summary>NewestFirstByEpochNumber (db/version_set.h), with seqno/file number tie breakers.</summary>
     internal static int CompareNewestFirst(FileMetaData a, FileMetaData b)
     {
