@@ -526,12 +526,13 @@ internal sealed class CompactionJob
         _db.Stats?.RecordInHistogram(Histogram.NumSubcompactionsScheduled, (ulong)_subcompactions.Count);
         try
         {
-            // Launch a thread for each of subcompactions 1...num_threads-1; subcompaction 0 runs on this thread.
+            // Launch a thread for each of subcompactions 1...num_threads-1 (on the LOW pool, which starts a thread when none
+            // is idle, so they never wait for one); subcompaction 0 runs on this thread.
             var others = new Task[_subcompactions.Count - 1];
             for (int i = 1; i < _subcompactions.Count; i++)
             {
-                others[i - 1] = Task.Factory.StartNew(static s => ((CompactionJob)s!).RunSubcompactionAsync(synchronous: true).AsTask().GetAwaiter().GetResult(),
-                    _subcompactions[i], CancellationToken.None, TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
+                others[i - 1] = BackgroundThreadPool.Low.Run(static s => ((CompactionJob)s!).RunSubcompactionAsync(synchronous: true).AsTask().GetAwaiter().GetResult(),
+                    _subcompactions[i]);
             }
             Exception? first = null;
             try

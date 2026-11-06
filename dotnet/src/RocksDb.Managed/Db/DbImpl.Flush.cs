@@ -42,7 +42,7 @@ internal sealed partial class DbImpl
             cfd.FlushRunning = true;
             _runningFlushes++;
             _backgroundJobs++;
-            _ = Task.Run(() => BackgroundFlushAsync(cfd));
+            BackgroundThreadPool.High.Schedule(new FlushRun(this, cfd));
         }
     }
 
@@ -51,13 +51,29 @@ internal sealed partial class DbImpl
     /// immutable memtables of the CF that are not being flushed into one L0 file, records it in the MANIFEST together
     /// with the CF's new log number, then drops the memtables and deletes obsolete WALs.
     /// </summary>
-    private Task BackgroundFlushAsync(ColumnFamilyData cfd) => BackgroundFlushAsync(cfd, null);
+    private Task BackgroundFlushAsync(ColumnFamilyData cfd) => BackgroundFlushAsync(cfd, null, synchronous: false);
+
+    /// <summary>
+    /// <see cref="BackgroundFlushAsync(ColumnFamilyData, AtomicFlushGroup?)"/> as a member of <paramref name="group"/>, run
+    /// asynchronously (error recovery flushes).
+    /// </summary>
+    private Task BackgroundFlushAsync(ColumnFamilyData cfd, AtomicFlushGroup? group) => BackgroundFlushAsync(cfd, group, synchronous: false);
+
+    /// <summary>
+    /// A scheduled flush (BGWorkFlush on the HIGH pool): runs the flush synchronously on a <see cref="BackgroundThreadPool.High"/>
+    /// thread, like upstream's flush threads (table building is CPU-bound; it does not belong on the .NET thread pool).
+    /// </summary>
+    private sealed class FlushRun(DbImpl db, ColumnFamilyData cfd) : IThreadPoolWorkItem
+    {
+        public void Execute() => db.BackgroundFlushAsync(cfd, null, synchronous: true).GetAwaiter().GetResult();
+    }
 
     /// <summary>
     /// <see cref="BackgroundFlushAsync(ColumnFamilyData)"/> as a member of <paramref name="group"/> (an atomic flush:
     /// the flush result is committed to the MANIFEST together with the other members' results), or alone when null.
+    /// With <paramref name="synchronous"/> the file and MANIFEST I/O is synchronous (on a background pool thread).
     /// </summary>
-    private async Task BackgroundFlushAsync(ColumnFamilyData cfd, AtomicFlushGroup? group)
+    private async Task BackgroundFlushAsync(ColumnFamilyData cfd, AtomicFlushGroup? group, bool synchronous)
     {
         Exception? failure = null;
         var picked = new List<ImmutableMemTable>();
@@ -86,8 +102,8 @@ internal sealed partial class DbImpl
         try
         {
             // SyncClosedWals + ApplyWALToManifest (FlushMemTableToOutputFile): record the synced sizes of closed WALs.
-            await TrackClosedWalsAsync().ConfigureAwait(false);
-            if (picked.Count > 0) await FlushMemTablesAsync(cfd, picked, fileNumber, epoch, synchronous: false, group).ConfigureAwait(false);
+            await TrackClosedWalsAsync(synchronous).ConfigureAwait(false);
+            if (picked.Count > 0) await FlushMemTablesAsync(cfd, picked, fileNumber, epoch, synchronous, group).ConfigureAwait(false);
         }
         catch (RocksDbException e) when (e.Code == StatusCode.ColumnFamilyDropped || cfd.Dropped)
         {
@@ -221,7 +237,7 @@ internal sealed partial class DbImpl
             FileSystem.SyncDirectory(DbPaths[0]);
             RecordFlushBytes(meta.FileSize + BlobBytesWritten(blobBuilder));
             // FlushJob::WriteLevel0Table logs this before the result is installed (and compactions are scheduled).
-            LogInfo("[" + cfd.Name + "] [JOB " + jobId + "] Level-0 flush table #" + meta.FileNumber + ": " + meta.FileSize + " bytes OK");
+            LogLevel0FlushTable(cfd, jobId, meta);
         }
 
         var edit = new VersionEdit

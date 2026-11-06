@@ -116,7 +116,7 @@ internal sealed partial class DbImpl
     /// column families, or the lazy sync of closed WALs (sync writes of either write queue, SyncWAL / FlushWAL(sync)),
     /// including the switches made by SwitchWAL (max_total_wal_size). A WAL whose write or sync failed is never recorded.
     /// </summary>
-    private async ValueTask TrackClosedWalsAsync()
+    private async ValueTask TrackClosedWalsAsync(bool synchronous)
     {
         if (!Options.TrackAndVerifyWalsInManifest || _readOnly) return;
         VersionEdit? edit = null;
@@ -135,7 +135,7 @@ internal sealed partial class DbImpl
         if (edit is null) return;
         try
         {
-            await Versions.LogAndApplyAsync(null, edit, synchronous: false, CancellationToken.None).ConfigureAwait(false);
+            await Versions.LogAndApplyAsync(null, edit, synchronous, CancellationToken.None).ConfigureAwait(false);
         }
         catch
         {
