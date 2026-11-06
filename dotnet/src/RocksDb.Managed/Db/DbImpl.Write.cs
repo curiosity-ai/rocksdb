@@ -19,8 +19,15 @@ internal sealed partial class DbImpl
     private readonly List<ColumnFamilyData> _flushScheduler = new(); // leader-only: CFs whose memtable became full
     // Column families by id for the write path: copy-on-write array, replaced by an unbatched leader.
     private ColumnFamilyData?[] _cfById = [];
-    /// <summary>Some column family uses disallow_memtable_writes (set once, never reset): writes are checked before the WAL.</summary>
+    /// <summary>Some column family uses disallow_memtable_writes (set once, never reset).</summary>
     private volatile bool _anyDisallowMemtableWrites;
+    /// <summary>
+    /// Some column family uses disallow_memtable_writes or was dropped (set once, never reset): batches written without
+    /// column family validation (writes through a <see cref="ColumnFamily"/> receiver, internal transaction batches) are
+    /// checked before the WAL too, so that a write to such a column family fails without reaching the memtable insert,
+    /// where the failure would be a fatal background error (HandleMemTableInsertFailure).
+    /// </summary>
+    private volatile bool _checkUnvalidatedBatches;
 
     private LogWriter? _log;          // leader-only
     private ulong _logNumber;         // written by leader under mutex
@@ -108,10 +115,10 @@ internal sealed partial class DbImpl
             ValidateColumnFamilies(batch, options?.IgnoreMissingColumnFamilies ?? false);
             if (txn?.MemtableBatch is { } mb) ValidateColumnFamilies(mb, options?.IgnoreMissingColumnFamilies ?? false);
         }
-        else if (_anyDisallowMemtableWrites)
+        else if (_checkUnvalidatedBatches)
         {
-            ValidateColumnFamilies(batch, ignoreMissing: true);
-            if (txn?.MemtableBatch is { } mb) ValidateColumnFamilies(mb, ignoreMissing: true);
+            ValidateColumnFamilies(batch, options?.IgnoreMissingColumnFamilies ?? false);
+            if (txn?.MemtableBatch is { } mb) ValidateColumnFamilies(mb, options?.IgnoreMissingColumnFamilies ?? false);
         }
         if (options is { LowPri: true } && WriteControllerInstance.NeedSpeedupCompaction)
         {
@@ -1398,7 +1405,7 @@ internal sealed partial class DbImpl
         RecomputeMaxTotalInMemoryState();
         RefreshTimestampSizes(map);
         if (cfd.BlobDirectWrite is not null) _anyBlobDirectWrite = true;
-        if (cfd.Options.DisallowMemtableWrites) _anyDisallowMemtableWrites = true;
+        if (cfd.Options.DisallowMemtableWrites) _anyDisallowMemtableWrites = _checkUnvalidatedBatches = true;
     }
 
     private void UnregisterCfForWrite(ColumnFamilyData cfd)
@@ -1406,6 +1413,7 @@ internal sealed partial class DbImpl
         ColumnFamilyData?[] map = (ColumnFamilyData?[])_cfById.Clone();
         if (cfd.Id < (uint)map.Length) map[cfd.Id] = null;
         Volatile.Write(ref _cfById, map);
+        _checkUnvalidatedBatches = true;
         RecomputeMaxTotalInMemoryState();
         RefreshTimestampSizes(map);
     }
