@@ -19,10 +19,50 @@ public sealed class ScriptRunner(IEngine engine, string dbPath, DbSpec spec, Tex
     private bool _inBatch;
     private bool _batchSync;
     private bool _sync;
+    private bool _noWal;
+    private bool _inTxn;
     private List<Op>? _sst;
     private string? _sstCf, _sstPath;
 
     public List<string> Skipped { get; } = [];
+
+    /// <summary>Last line printed by <see cref="OpKind.Abandon"/> before the process kills itself.</summary>
+    public const string AbandonLine = "ABANDONING";
+
+    /// <summary>Set by <see cref="Harness.ChildHost"/>: the runner is in a child process (Abandon may kill it).</summary>
+    public static bool ChildMode { get; set; }
+
+    /// <summary>
+    /// Opens the DB; with <see cref="DbSpec.ReportOpenFailure"/> an open failure prints
+    /// "OPENFAIL &lt;status&gt; &lt;message&gt;" and returns false instead of throwing. The status is normalized across
+    /// engines (native "Corruption: ..." / managed StatusCode.Corruption both give "corruption").
+    /// </summary>
+    public static bool OpenOrReport(IEngine engine, string dbPath, DbSpec spec, TextWriter output)
+    {
+        if (!spec.ReportOpenFailure)
+        {
+            engine.Open(dbPath, spec);
+            return true;
+        }
+        try
+        {
+            engine.Open(dbPath, spec);
+            return true;
+        }
+        catch (Exception ex) when (ex is RocksDbException or RocksDbSharp.RocksDbException)
+        {
+            output.WriteLine("OPENFAIL " + NormalizeStatus(ex) + " " + ex.Message.Replace('\n', ' '));
+            output.Flush();
+            return false;
+        }
+    }
+
+    public static string NormalizeStatus(Exception ex)
+    {
+        string s = ex is RocksDbException m ? m.Code.ToString() : ex.Message.Split(':')[0];
+        s = s.Replace(" ", "", StringComparison.Ordinal).ToLowerInvariant();
+        return s == "notimplemented" ? "notsupported" : s;
+    }
 
     public void Run(IEnumerable<Op> ops)
     {
@@ -58,7 +98,8 @@ public sealed class ScriptRunner(IEngine engine, string dbPath, DbSpec spec, Tex
         if (op.IsDataOp)
         {
             if (_inBatch) _batch.Add(op);
-            else engine.Write([op], _sync);
+            else if (_inTxn) engine.TransactionWrite(op);
+            else engine.Write([op], _sync && !_noWal, _noWal);
             return;
         }
         switch (op.Kind)
@@ -69,7 +110,7 @@ public sealed class ScriptRunner(IEngine engine, string dbPath, DbSpec spec, Tex
                 _batch.Clear();
                 break;
             case OpKind.BatchEnd:
-                engine.Write(_batch, _batchSync);
+                engine.Write(_batch, _batchSync && !_noWal, _noWal);
                 _inBatch = false;
                 _batch.Clear();
                 break;
@@ -94,7 +135,41 @@ public sealed class ScriptRunner(IEngine engine, string dbPath, DbSpec spec, Tex
                 engine.WriteSst(_sstCf!, _sstPath!, _sst!);
                 _sst = null;
                 break;
-            case OpKind.Ingest: engine.Ingest(op.Cf!, op.Arg!.Split('|'), op.N != 0); break;
+            case OpKind.Ingest: engine.Ingest(op.Cf!, op.Arg!.Split('|'), (IngestFlags)op.N); break;
+            // disableWAL writes are never synced (upstream: "Sync writes has to enable WAL").
+            case OpKind.NoWal: _noWal = op.N != 0; break;
+            case OpKind.FlushWal: engine.FlushWal(op.N != 0); break;
+            case OpKind.FlushAll: engine.FlushAll(); break;
+            case OpKind.CompactEx: engine.CompactRange(op.Cf!, op.Key, op.Value, CompactSpec.Decode(op.Arg!)); break;
+            case OpKind.DeleteFiles: engine.DeleteFilesInRange(op.Cf!, op.Key!, op.Value!); break;
+            case OpKind.TxnBegin:
+                engine.BeginTransaction(op.Arg!);
+                _inTxn = true;
+                break;
+            case OpKind.TxnPrepare:
+                engine.PrepareTransaction(op.Arg!);
+                _inTxn = false;
+                break;
+            case OpKind.TxnCommit: engine.CommitTransaction(op.Arg!); break;
+            case OpKind.TxnRollback: engine.RollbackTransaction(op.Arg!); break;
+            case OpKind.TxnCheckPrepared:
+                {
+                    var expected = new List<string>(op.Arg!.Split('|', StringSplitOptions.RemoveEmptyEntries));
+                    var actual = new List<string>(engine.PreparedTransactionNames());
+                    expected.Sort(StringComparer.Ordinal);
+                    actual.Sort(StringComparer.Ordinal);
+                    if (!expected.SequenceEqual(actual))
+                        throw new VerificationException($"{engine.Kind} engine: prepared transactions are [{string.Join(",", actual)}], expected [{string.Join(",", expected)}]");
+                    break;
+                }
+            case OpKind.Abandon:
+                output.WriteLine(AbandonLine);
+                output.Flush();
+                if (!ChildMode) throw new InvalidOperationException("Abandon is only valid in a child process");
+                // SIGKILL ourselves (TerminateProcess on Windows): no close, no destructors, no buffered output.
+                System.Diagnostics.Process.GetCurrentProcess().Kill();
+                Thread.Sleep(Timeout.Infinite);
+                break;
             case OpKind.Checkpoint: engine.Checkpoint(op.Arg!); break;
             case OpKind.Backup: engine.Backup(op.Arg!, op.N != 0); break;
             case OpKind.Restore:
@@ -125,10 +200,21 @@ public sealed class ScriptRunner(IEngine engine, string dbPath, DbSpec spec, Tex
                 engine.Close();
                 engine.Open(dbPath, spec);
                 break;
-            case OpKind.CrashWriter: CrashWorkload.Write(engine, op.N, int.Parse(op.Arg!, CultureInfo.InvariantCulture), output); break;
+            case OpKind.CrashWriter:
+                {
+                    string[] a = op.Arg!.Split(':');
+                    CrashWorkload.Write(engine, op.N, int.Parse(a[0], CultureInfo.InvariantCulture), a.Length > 1 ? a[1] : "", output);
+                    break;
+                }
             case OpKind.CrashCheck:
                 long n = CrashWorkload.Check(engine, op.N);
                 output.WriteLine("RECOVERED " + n.ToString(CultureInfo.InvariantCulture));
+                if (spec.TransactionDb)
+                {
+                    var prepared = new List<string>(engine.PreparedTransactionNames());
+                    prepared.Sort(StringComparer.Ordinal);
+                    output.WriteLine("PREPARED |" + string.Join('|', prepared));
+                }
                 output.Flush();
                 break;
             case OpKind.Props:
@@ -228,12 +314,20 @@ public static class CrashWorkload
     private static int SmallSize(long i) => (int)(i % 97) * 3;
     private static int BigSize(long i) => 500 + (int)(i % 13) * 700;
 
-    public static void Write(IEngine engine, long batches, int syncEvery, TextWriter output)
+    /// <summary>
+    /// Writes the batches. <paramref name="flags"/>: 'n' adds a disableWAL put of "nowal/i" after every third batch
+    /// (outside the prefix invariant: whether it survives depends on flushes, the same for both engines on one image);
+    /// 't' (TransactionDB) writes every batch as a 2PC transaction "t&lt;i&gt;" (prepare + commit, both synced, so every
+    /// batch is acknowledged) and leaves every 40th an extra transaction "p&lt;i&gt;" (put "prep/i") prepared;
+    /// 'w' calls FlushWAL(false) after every unsynced batch (manual_wal_flush).
+    /// </summary>
+    public static void Write(IEngine engine, long batches, int syncEvery, string flags, TextWriter output)
     {
         byte[] one = ReferenceModel.U64(1);
+        bool noWal = flags.Contains('n'), txn = flags.Contains('t'), flushWal = flags.Contains('w');
         for (long i = 0; i < batches; i++)
         {
-            bool sync = (i + 1) % syncEvery == 0;
+            bool sync = txn || (i + 1) % syncEvery == 0;
             var ops = new List<Op>
             {
                 Op.Put("default", Key("crash/", i), Value(i, SmallSize(i))),
@@ -242,7 +336,24 @@ public static class CrashWorkload
                 Op.Put("default", Key("tmp/", i), Value(i, 5)),
             };
             if (i > 0) ops.Add(Op.Delete("default", Key("tmp/", i - 1)));
-            engine.Write(ops, sync);
+            if (txn)
+            {
+                string name = "t" + i.ToString(CultureInfo.InvariantCulture);
+                engine.BeginTransaction(name);
+                foreach (Op op in ops) engine.TransactionWrite(op);
+                engine.PrepareTransaction(name);
+                engine.CommitTransaction(name);
+                if (i % 40 == 39)
+                {
+                    string left = "p" + i.ToString(CultureInfo.InvariantCulture);
+                    engine.BeginTransaction(left);
+                    engine.TransactionWrite(Op.Put("default", Key("prep/", i), Value(i, 7)));
+                    engine.PrepareTransaction(left);
+                }
+            }
+            else engine.Write(ops, sync);
+            if (noWal && i % 3 == 2) engine.Write([Op.Put("default", Key("nowal/", i), Value(i, 9))], false, disableWal: true);
+            if (flushWal && !sync) engine.FlushWal(false);
             if (sync)
             {
                 // Batch i and everything before it is durable now.
@@ -274,6 +385,7 @@ public static class CrashWorkload
                 n = i + 1;
             }
             else if (k.StartsWith("tmp/", StringComparison.Ordinal)) tmpKeys.Add(kv.Key);
+            else if (k.StartsWith("nowal/", StringComparison.Ordinal) || k.StartsWith("prep/", StringComparison.Ordinal)) continue;
             else problems.Add("default: unexpected key " + k);
         }
         if (blobs.Live.Count != n) problems.Add($"blobs has {blobs.Live.Count} entries but default has {n} batches (batch not atomic)");

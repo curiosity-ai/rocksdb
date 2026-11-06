@@ -67,11 +67,14 @@ internal static class ChildHost
         };
         try
         {
+            ScriptRunner.ChildMode = true;
             DbSpec spec = DbSpec.FromJson(File.ReadAllText(specPath));
-            engine.Open(db, spec);
-            var runner = new ScriptRunner(engine, db, spec, stdout);
-            runner.Run(Script.Read(scriptPath));
-            engine.Close();
+            if (ScriptRunner.OpenOrReport(engine, db, spec, stdout))
+            {
+                var runner = new ScriptRunner(engine, db, spec, stdout);
+                runner.Run(Script.Read(scriptPath));
+                engine.Close();
+            }
             stdout.WriteLine("OK");
             stdout.Flush();
             return 0;

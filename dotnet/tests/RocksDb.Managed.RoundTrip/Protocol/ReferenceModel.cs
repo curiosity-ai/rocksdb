@@ -10,6 +10,10 @@ namespace RocksDb.Managed.RoundTrip.Protocol;
 public sealed class ReferenceModel
 {
     private readonly Dictionary<string, MergeKind> _merge = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, byte[]> _delimiter = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, List<Op>> _preparedTxns = new(StringComparer.Ordinal);
+    private List<Op>? _openTxn;
+    private string? _openTxnName;
     private readonly Dictionary<string, List<Op>> _sstFiles = new(StringComparer.Ordinal);
     private readonly Dictionary<long, Contents> _snapshots = new();
     private List<Op>? _openSst;
@@ -21,6 +25,13 @@ public sealed class ReferenceModel
 
     /// <summary>Contents of the latest backup added to each backup directory.</summary>
     public Dictionary<string, Contents> Backups { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>Number of generated ingestion files so far (their fresh keys must increase over the DB's life).</summary>
+    public int IngestCounter { get; set; }
+
+    /// <summary>Commit / rollback of transactions the model never saw prepared are ignored (scripts that resolve
+    /// transactions recovered from a crash image the model does not describe).</summary>
+    public bool LenientTransactions { get; set; }
 
     /// <summary>Upper bound on remembered deleted keys per CF (they become "must be absent" checks).</summary>
     public int MaxAbsentPerCf { get; set; } = 4096;
@@ -42,6 +53,7 @@ public sealed class ReferenceModel
         {
             m.Current.ColumnFamilies.Add(cf.Key, cf.Value.Clone());
             m._merge[cf.Key] = spec.Cf(cf.Key).Merge;
+            m._delimiter[cf.Key] = System.Text.Encoding.UTF8.GetBytes(spec.Cf(cf.Key).MergeDelimiter);
         }
         return m.WithSpec(spec);
     }
@@ -51,6 +63,7 @@ public sealed class ReferenceModel
         Spec = spec;
         Current = other.Current;
         _merge = other._merge;
+        _delimiter = other._delimiter;
     }
 
     private ReferenceModel WithSpec(DbSpec spec) => new(this, spec);
@@ -67,6 +80,7 @@ public sealed class ReferenceModel
     {
         Current.ColumnFamilies.Add(name, new CfContents());
         _merge[name] = Spec.Cf(name).Merge;
+        _delimiter[name] = System.Text.Encoding.UTF8.GetBytes(Spec.Cf(name).MergeDelimiter);
     }
 
     public void ApplyAll(IEnumerable<Op> ops)
@@ -79,6 +93,11 @@ public sealed class ReferenceModel
         if (_openSst is not null && op.Kind is OpKind.SstPut or OpKind.SstMerge or OpKind.SstDelete or OpKind.SstDeleteRange)
         {
             _openSst.Add(op);
+            return;
+        }
+        if (_openTxn is not null && op.IsDataOp)
+        {
+            _openTxn.Add(op);
             return;
         }
         switch (op.Kind)
@@ -105,6 +124,28 @@ public sealed class ReferenceModel
             case OpKind.Backup: Backups[op.Arg!] = Current.Clone(); break;
             case OpKind.Snap: _snapshots[op.N] = Current.Clone(); break;
             case OpKind.SnapRelease: _snapshots.Remove(op.N); break;
+            case OpKind.TxnBegin:
+                if (_openTxn is not null) throw new InvalidOperationException("nested transaction " + op.Arg);
+                _openTxn = [];
+                _openTxnName = op.Arg!;
+                break;
+            case OpKind.TxnPrepare:
+                if (_openTxnName != op.Arg) throw new InvalidOperationException("prepare of a transaction that is not open: " + op.Arg);
+                _preparedTxns.Add(op.Arg!, _openTxn!);
+                _openTxn = null;
+                _openTxnName = null;
+                break;
+            case OpKind.TxnCommit:
+                if (!_preparedTxns.Remove(op.Arg!, out List<Op>? txnOps))
+                {
+                    if (LenientTransactions) break;
+                    throw new InvalidOperationException("commit of an unknown transaction " + op.Arg);
+                }
+                foreach (Op t in txnOps) Apply(t);
+                break;
+            case OpKind.TxnRollback:
+                if (!_preparedTxns.Remove(op.Arg!) && !LenientTransactions) throw new InvalidOperationException("rollback of an unknown transaction " + op.Arg);
+                break;
             default: break; // control / verification ops don't change contents
         }
     }
@@ -159,13 +200,44 @@ public sealed class ReferenceModel
     {
         CfContents c = Current[cf];
         bool has = c.Live.TryGetValue(k, out byte[]? existing);
-        c.Live[k] = FullMerge(_merge[cf], has ? existing : null, operand);
+        c.Live[k] = FullMerge(_merge[cf], _delimiter[cf], has ? existing : null, operand);
         c.Absent.Remove(k);
     }
 
     /// <summary>Upstream merge semantics (utilities/merge_operators/uint64add.cc, string_append/stringappend.cc).</summary>
-    public static byte[] FullMerge(MergeKind kind, byte[]? existing, byte[] operand)
+    public static byte[] FullMerge(MergeKind kind, byte[]? existing, byte[] operand) => FullMerge(kind, ","u8.ToArray(), existing, operand);
+
+    /// <summary>The prepared (not committed or rolled back) transactions, by name.</summary>
+    public IReadOnlyCollection<string> PreparedTransactions => _preparedTxns.Keys;
+
+    /// <summary>
+    /// Upstream merge semantics, one operand at a time (all supported operators are associative):
+    /// utilities/merge_operators/uint64add.cc, string_append/stringappend.cc (delimiter), max.cc (bytewise maximum,
+    /// a missing existing value counts as the empty string), bytesxor.cc (XOR over the shorter length, the longer
+    /// input's tail is kept).
+    /// </summary>
+    public static byte[] FullMerge(MergeKind kind, byte[] delimiter, byte[]? existing, byte[] operand)
     {
+        switch (kind)
+        {
+            case MergeKind.Max:
+                {
+                    byte[] cur = existing ?? [];
+                    return cur.AsSpan().SequenceCompareTo(operand) < 0 ? operand : cur;
+                }
+            case MergeKind.BytesXor:
+                {
+                    if (existing is null) return operand;
+                    byte[] r = new byte[Math.Max(existing.Length, operand.Length)];
+                    for (int i = 0; i < r.Length; i++)
+                    {
+                        r[i] = i < existing.Length && i < operand.Length ? (byte)(existing[i] ^ operand[i]) : i < existing.Length ? existing[i] : operand[i];
+                    }
+                    return r;
+                }
+            case MergeKind.StringAppend when delimiter.Length != 1 || delimiter[0] != (byte)',':
+                return existing is null ? operand : [.. existing, .. delimiter, .. operand];
+        }
         switch (kind)
         {
             case MergeKind.UInt64Add:

@@ -181,11 +181,15 @@ public sealed class RoundTripHarness : IDisposable
     /// <summary>Runs <paramref name="b"/> on <paramref name="engine"/> and checks its dumps against the model.</summary>
     public async Task RunAsync(EngineKind engine, ScriptBuilder b)
     {
-        if (engine == EngineKind.Managed && !ManagedInChild) RunManagedInProcess(b);
+        bool abandons = b.Ops.Count > 0 && b.Ops[^1].Kind == OpKind.Abandon;
+        if (engine == EngineKind.Managed && !ManagedInChild && !abandons) RunManagedInProcess(b);
         else
         {
             ChildResult r = await RunChildAsync(engine, b, DefaultTimeout, null);
-            if (!r.Succeeded) Fail($"{engine} child failed running script {b.Tag} ({b.Ops.Count} ops):\n{r.Describe()}");
+            bool ok = abandons
+                ? r.Stdout.Count > 0 && r.Stdout[^1] == ScriptRunner.AbandonLine && !r.TimedOut
+                : r.Succeeded;
+            if (!ok) Fail($"{engine} child failed running script {b.Tag} ({b.Ops.Count} ops):\n{r.Describe()}");
         }
         CheckDumps(engine, b);
         DeleteBulkFiles(b);
@@ -218,11 +222,13 @@ public sealed class RoundTripHarness : IDisposable
         using var engine = new ManagedEngine();
         try
         {
-            engine.Open(b.DbPath, b.Spec);
-            var runner = new ScriptRunner(engine, b.DbPath, b.Spec, output);
-            runner.Run(b.Ops);
-            engine.Close();
-            foreach (string s in runner.Skipped) Log("  " + s);
+            if (ScriptRunner.OpenOrReport(engine, b.DbPath, b.Spec, output))
+            {
+                var runner = new ScriptRunner(engine, b.DbPath, b.Spec, output);
+                runner.Run(b.Ops);
+                engine.Close();
+                foreach (string s in runner.Skipped) Log("  " + s);
+            }
             LastOutput.Clear();
             LastOutput.AddRange(output.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
         }

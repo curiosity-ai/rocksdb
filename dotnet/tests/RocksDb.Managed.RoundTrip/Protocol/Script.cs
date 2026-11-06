@@ -52,6 +52,57 @@ public enum OpKind
     CrashCheck,
     /// <summary>Prints "PROP cf name value" lines for the per-level file counts of <see cref="Op.Cf"/>.</summary>
     Props,
+    /// <summary>FlushWAL(sync = <see cref="Op.N"/> != 0).</summary>
+    FlushWal,
+    /// <summary>Subsequent single writes and batches use disableWAL (<see cref="Op.N"/> = 1) or not.</summary>
+    NoWal,
+    /// <summary>Flushes every column family in one call (rocksdb_flush_cfs / FlushAll; atomic with atomic_flush).</summary>
+    FlushAll,
+    /// <summary>CompactRange of <see cref="Op.Cf"/> over [Key, Value) (null = open) with the options in <see cref="Op.Arg"/>
+    /// (<see cref="CompactSpec"/>).</summary>
+    CompactEx,
+    /// <summary>DeleteFilesInRange(Key, Value) on <see cref="Op.Cf"/>; the model is unchanged (the generator follows it
+    /// with a DeleteRange over the same range, which makes the result deterministic).</summary>
+    DeleteFiles,
+    /// <summary>Begins transaction <see cref="Op.Arg"/>; data ops up to the TxnPrepare go into it.</summary>
+    TxnBegin,
+    /// <summary>Names the transaction (2PC) and prepares it (sync write).</summary>
+    TxnPrepare,
+    /// <summary>Commits the prepared (possibly recovered) transaction <see cref="Op.Arg"/>.</summary>
+    TxnCommit,
+    /// <summary>Rolls back the prepared (possibly recovered) transaction <see cref="Op.Arg"/>.</summary>
+    TxnRollback,
+    /// <summary>Checks that the prepared transactions are exactly the '|'-separated names in <see cref="Op.Arg"/>.</summary>
+    TxnCheckPrepared,
+    /// <summary>Ends the child process abruptly (SIGKILL itself) with the DB open: no close, no flush, no destructors.
+    /// Data that reached the OS survives, as after a process crash. Child runs only.</summary>
+    Abandon,
+}
+
+/// <summary>Flags of <see cref="OpKind.Ingest"/> (<see cref="Op.N"/>).</summary>
+[Flags]
+public enum IngestFlags
+{
+    None = 0,
+    Move = 1,
+    /// <summary>ingest_behind (needs allow_ingest_behind); files must only hold keys the CF never had.</summary>
+    IngestBehind = 2,
+    /// <summary>allow_global_seqno = false (files must not overlap existing data).</summary>
+    NoGlobalSeqno = 4,
+}
+
+/// <summary>Options of <see cref="OpKind.CompactEx"/>, serialized in <see cref="Op.Arg"/> as "b,e,c,t,s"
+/// (bottommost_level_compaction, exclusive, change_level, target_level, max_subcompactions).</summary>
+public readonly record struct CompactSpec(BottommostLevelCompaction Bottommost, bool Exclusive, bool ChangeLevel, int TargetLevel, uint MaxSubcompactions)
+{
+    public string Encode() => string.Join(',', (int)Bottommost, Exclusive ? 1 : 0, ChangeLevel ? 1 : 0, TargetLevel, MaxSubcompactions);
+
+    public static CompactSpec Decode(string s)
+    {
+        string[] f = s.Split(',');
+        return new CompactSpec((BottommostLevelCompaction)int.Parse(f[0], CultureInfo.InvariantCulture), f[1] == "1", f[2] == "1",
+            int.Parse(f[3], CultureInfo.InvariantCulture), uint.Parse(f[4], CultureInfo.InvariantCulture));
+    }
 }
 
 /// <summary>One script line. Serialized as tab-separated fields; byte strings are hex, "~" = empty, "." = absent.</summary>
@@ -90,8 +141,23 @@ public sealed record Op(OpKind Kind, string? Cf, byte[]? Key, byte[]? Value, str
     public static Op Reopen() => new(OpKind.Reopen, null, null, null, null, 0);
     public static Op CrashWriter(long batches, int syncEvery) =>
         new(OpKind.CrashWriter, null, null, null, syncEvery.ToString(CultureInfo.InvariantCulture), batches);
+    /// <summary>Crash writer with <see cref="Engines.CrashWorkload.Write"/> flags ('n', 't', 'w').</summary>
+    public static Op CrashWriter(long batches, int syncEvery, string flags) =>
+        new(OpKind.CrashWriter, null, null, null, syncEvery.ToString(CultureInfo.InvariantCulture) + ":" + flags, batches);
     public static Op CrashCheck(long minBatches) => new(OpKind.CrashCheck, null, null, null, null, minBatches);
     public static Op Props(string cf) => new(OpKind.Props, cf, null, null, null, 0);
+    public static Op FlushWal(bool sync) => new(OpKind.FlushWal, null, null, null, null, sync ? 1 : 0);
+    public static Op NoWal(bool on) => new(OpKind.NoWal, null, null, null, null, on ? 1 : 0);
+    public static Op FlushAll() => new(OpKind.FlushAll, null, null, null, null, 0);
+    public static Op CompactEx(string cf, byte[]? begin, byte[]? end, CompactSpec spec) => new(OpKind.CompactEx, cf, begin, end, spec.Encode(), 0);
+    public static Op DeleteFiles(string cf, byte[] begin, byte[] end) => new(OpKind.DeleteFiles, cf, begin, end, null, 0);
+    public static Op Ingest(string cf, IEnumerable<string> files, IngestFlags flags) => new(OpKind.Ingest, cf, null, null, string.Join('|', files), (long)flags);
+    public static Op TxnBegin(string name) => new(OpKind.TxnBegin, null, null, null, name, 0);
+    public static Op TxnPrepare(string name) => new(OpKind.TxnPrepare, null, null, null, name, 0);
+    public static Op TxnCommit(string name) => new(OpKind.TxnCommit, null, null, null, name, 0);
+    public static Op TxnRollback(string name) => new(OpKind.TxnRollback, null, null, null, name, 0);
+    public static Op TxnCheckPrepared(IEnumerable<string> names) => new(OpKind.TxnCheckPrepared, null, null, null, "|" + string.Join('|', names), 0);
+    public static Op Abandon() => new(OpKind.Abandon, null, null, null, null, 0);
 
     public bool IsDataOp => Kind is OpKind.Put or OpKind.Merge or OpKind.Delete or OpKind.SingleDelete or OpKind.DeleteRange;
 
