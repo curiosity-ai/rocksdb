@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Allocation profiler for the public API: runs each scenario in a child process (setup, warm-up, exact measured
+    phase with GC.GetTotalAllocatedBytes(precise: true)), then traces the child's steady-state loop with
+    Memory.Introspect (GCAllocationTick sampling + call stacks). See docs/allocations.md.
+    Usage: see docs/allocations.md ("How to rerun").
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>RocksDb.Managed.AllocationProfile</AssemblyName>
+    <RootNamespace>RocksDb.Managed.AllocationProfile</RootNamespace>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RocksDb.Managed\RocksDb.Managed.csproj" />
+    <!-- build/buildTransitive excluded: the package extracts its Claude skills into the nearest .claude folder on build. -->
+    <PackageReference Include="Memory.Introspect" ExcludeAssets="build;buildTransitive" />
+    <PackageReference Include="RocksDB" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- librocksdb under a .NET 11 apphost: see the file's remarks. -->
+    <Compile Include="..\..\tests\Shared\NativeStdCxxPreload.cs" Link="NativeStdCxxPreload.cs" />
+  </ItemGroup>
+</Project>

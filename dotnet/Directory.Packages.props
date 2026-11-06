@@ -14,6 +14,8 @@
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
     <PackageVersion Include="MSTest" Version="4.5.2" />
     <PackageVersion Include="BenchmarkDotNet" Version="0.15.8" />
+    <!-- Allocation tracing (GCAllocationTick + call stacks) for tools/RocksDb.Managed.AllocationProfile. -->
+    <PackageVersion Include="Memory.Introspect" Version="26.10.7230" />
     <!-- Reference native implementation (rocksdb-sharp + native librocksdb). -->
     <PackageVersion Include="RocksDB" Version="$(NativeRocksDbPackageVersion)" />
   </ItemGroup>

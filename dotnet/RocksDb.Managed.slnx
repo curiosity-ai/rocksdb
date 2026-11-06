@@ -17,6 +17,7 @@
     <Project Path="samples/QuickStart/QuickStart.csproj" />
   </Folder>
   <Folder Name="/tools/">
+    <Project Path="tools/RocksDb.Managed.AllocationProfile/RocksDb.Managed.AllocationProfile.csproj" />
     <Project Path="tools/RocksDb.Managed.Tools/RocksDb.Managed.Tools.csproj" />
   </Folder>
   <Folder Name="/bench/">
