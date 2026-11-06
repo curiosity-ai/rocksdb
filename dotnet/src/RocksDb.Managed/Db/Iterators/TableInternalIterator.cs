@@ -30,6 +30,7 @@ public sealed class TableInternalIterator : InternalIterator
         _lease = lease;
         Flags = flags;
         _it = Bbt(lease).NewIterator(flags);
+        _embedded = Bbt(lease).HasEmbeddedBlobRecords;
     }
 
     /// <summary>
@@ -45,6 +46,7 @@ public sealed class TableInternalIterator : InternalIterator
         {
             BlockBasedTableReader r = Bbt(lease);
             _it = r.NewIterator(flags, r.GetPrefixOptions(readOptions, prefixExtractor));
+            _embedded = r.HasEmbeddedBlobRecords;
         }
         catch
         {
@@ -86,25 +88,126 @@ public sealed class TableInternalIterator : InternalIterator
     }
 
     public override bool Valid { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _it.Valid; }
-    public override ReadOnlySpan<byte> Key { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _it.Key; }
-    public override ReadOnlySpan<byte> Value { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _it.Value; }
-    public override void SeekToFirst() => _it.SeekToFirst();
-    public override void SeekToLast() => _it.SeekToLast();
-    public override void Seek(ReadOnlySpan<byte> target) => _it.Seek(target);
-    public override void SeekForPrev(ReadOnlySpan<byte> target) => _it.SeekForPrev(target);
+    public override ReadOnlySpan<byte> Key { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _embedded ? EmbeddedKey() : _it.Key; }
+    public override ReadOnlySpan<byte> Value { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _embedded ? EmbeddedValue() : _it.Value; }
+    public override void SeekToFirst()
+    {
+        _stale = true;
+        _it.SeekToFirst();
+    }
+
+    public override void SeekToLast()
+    {
+        _stale = true;
+        _it.SeekToLast();
+    }
+
+    public override void Seek(ReadOnlySpan<byte> target)
+    {
+        _stale = true;
+        _it.Seek(target);
+    }
+
+    public override void SeekForPrev(ReadOnlySpan<byte> target)
+    {
+        _stale = true;
+        _it.SeekForPrev(target);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public override void Next() => _it.Next();
-    public override void Prev() => _it.Prev();
+    public override void Next()
+    {
+        _stale = true;
+        _it.Next();
+    }
+
+    public override void Prev()
+    {
+        _stale = true;
+        _it.Prev();
+    }
 
     public override void SetPinnedItersMgr(PinnedIteratorsManager? manager) => _it.SetPinnedItersMgr(manager);
-    public override bool TryGetPinnedValue(out PinnedSlice value) => _it.TryGetPinnedValue(out value);
+    public override bool TryGetPinnedValue(out PinnedSlice value)
+    {
+        if (_embedded && ResolveEmbedded())
+        {
+            value = default;
+            return false;
+        }
+        return _it.TryGetPinnedValue(out value);
+    }
 
-    public override ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) => _it.SeekToFirstAsync(cancellationToken);
-    public override ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) => _it.SeekAsync(target, cancellationToken);
-    public override ValueTask NextAsync(CancellationToken cancellationToken = default) => _it.NextAsync(cancellationToken);
-    public override ValueTask SeekToLastAsync(CancellationToken cancellationToken = default) => _it.SeekToLastAsync(cancellationToken);
-    public override ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) => _it.SeekForPrevAsync(target, cancellationToken);
-    public override ValueTask PrevAsync(CancellationToken cancellationToken = default) => _it.PrevAsync(cancellationToken);
+    public override ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default)
+    {
+        _stale = true;
+        return _it.SeekToFirstAsync(cancellationToken);
+    }
+
+    public override ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
+    {
+        _stale = true;
+        return _it.SeekAsync(target, cancellationToken);
+    }
+
+    public override ValueTask NextAsync(CancellationToken cancellationToken = default)
+    {
+        _stale = true;
+        return _it.NextAsync(cancellationToken);
+    }
+
+    public override ValueTask SeekToLastAsync(CancellationToken cancellationToken = default)
+    {
+        _stale = true;
+        return _it.SeekToLastAsync(cancellationToken);
+    }
+
+    public override ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
+    {
+        _stale = true;
+        return _it.SeekForPrevAsync(target, cancellationToken);
+    }
+
+    public override ValueTask PrevAsync(CancellationToken cancellationToken = default)
+    {
+        _stale = true;
+        return _it.PrevAsync(cancellationToken);
+    }
+
+    // ---- embedded-blob SSTs (EmbeddedBlobResolvingIterator, table/block_based/embedded_blob_resolving_iterator.h) ----
+    // A table with same-file blob records exposes each blob index entry that references them as a kTypeValue entry
+    // holding the payload (resolved on first access of the position's key or value).
+
+    private bool _embedded;   // the table has embedded blob records
+    private bool _stale = true; // the position moved since the last resolution
+    private bool _useResolved;
+    private byte[] _resolvedKey = [];
+    private Util.PooledBufferWriter? _resolvedValue;
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private ReadOnlySpan<byte> EmbeddedKey() => ResolveEmbedded() ? _resolvedKey.AsSpan(0, _it.Key.Length) : _it.Key;
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private ReadOnlySpan<byte> EmbeddedValue() => ResolveEmbedded() ? _resolvedValue!.WrittenSpan : _it.Value;
+
+    /// <summary>Whether the current entry is a resolved same-file blob reference (resolving it when the position moved).</summary>
+    private bool ResolveEmbedded()
+    {
+        if (!_stale) return _useResolved;
+        _stale = false;
+        _useResolved = false;
+        if (!_it.Valid) return false;
+        ReadOnlySpan<byte> k = _it.Key;
+        if (!BlockBasedTableReader.IsBlobIndexEntry(k)) return false;
+        ReadOnlySpan<byte> v = _it.Value;
+        if (!BlockBasedTableReader.IsSameFileBlobIndex(v)) return false;
+        if (_resolvedKey.Length < k.Length) _resolvedKey = new byte[Math.Max(k.Length, 64)];
+        Util.PooledBufferWriter w = _resolvedValue ??= new Util.PooledBufferWriter(256);
+        w.Clear();
+        ((BlockBasedTableReader)_lease.Reader).ResolveEmbeddedEntry(k, v, _resolvedKey, w, Flags);
+        _useResolved = true;
+        return true;
+    }
 
     private ulong _smallestSeqno = DbFormat.MaxSequenceNumber;
     private ulong _largestSeqno;
@@ -125,6 +228,7 @@ public sealed class TableInternalIterator : InternalIterator
     public override bool SkipCoveredForward(ReadOnlySpan<byte> target, ulong tombstoneSeq)
     {
         if (!AllSeqnosBelow(tombstoneSeq) || !_it.Valid || _lease.Reader.InternalComparator.Compare(target, _it.Key) <= 0) return false;
+        _stale = true;
         _it.Seek(target);
         return true;
     }
@@ -132,6 +236,7 @@ public sealed class TableInternalIterator : InternalIterator
     public override bool SkipCoveredBackward(ReadOnlySpan<byte> target, ulong tombstoneSeq)
     {
         if (!AllSeqnosBelow(tombstoneSeq) || !_it.Valid || _lease.Reader.InternalComparator.Compare(target, _it.Key) >= 0) return false;
+        _stale = true;
         _it.SeekForPrev(target);
         return true;
     }
@@ -139,12 +244,14 @@ public sealed class TableInternalIterator : InternalIterator
     public override ValueTask<bool> SkipCoveredForwardAsync(ReadOnlyMemory<byte> target, ulong tombstoneSeq, CancellationToken cancellationToken = default)
     {
         if (!AllSeqnosBelow(tombstoneSeq) || !_it.Valid || _lease.Reader.InternalComparator.Compare(target.Span, _it.Key) <= 0) return new(false);
+        _stale = true;
         return Moved(_it.SeekAsync(target, cancellationToken));
     }
 
     public override ValueTask<bool> SkipCoveredBackwardAsync(ReadOnlyMemory<byte> target, ulong tombstoneSeq, CancellationToken cancellationToken = default)
     {
         if (!AllSeqnosBelow(tombstoneSeq) || !_it.Valid || _lease.Reader.InternalComparator.Compare(target.Span, _it.Key) >= 0) return new(false);
+        _stale = true;
         return Moved(_it.SeekForPrevAsync(target, cancellationToken));
     }
 
@@ -191,6 +298,8 @@ public sealed class TableInternalIterator : InternalIterator
                 ? default
                 : r.GetPrefixOptions(readOptions, prefixExtractor);
             _it.Retarget(r, prefix);
+            _embedded = r.HasEmbeddedBlobRecords;
+            _stale = true;
             _smallestSeqno = DbFormat.MaxSequenceNumber;
             _largestSeqno = 0;
         }
@@ -221,6 +330,7 @@ public sealed class TableInternalIterator : InternalIterator
         if (_disposed) return;
         _disposed = true;
         _it.Dispose();
+        _resolvedValue?.Dispose();
         TableReaderLease l = _lease;
         _lease = default;
         l.Dispose();

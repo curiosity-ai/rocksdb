@@ -64,6 +64,11 @@ public static class TablePropertiesNames
 
     // BlockBasedTablePropertyNames (block_based_table_factory.cc)
     public const string BlockBasedIndexType = "rocksdb.block.based.table.index.type";
+    /// <summary>
+    /// kEmbeddedBlobSstStatsPropertyName (table/embedded_blob_sst.h): varint64 blob_count + varint64 payload_bytes of
+    /// the same-file blob records; its presence marks an embedded-blob SST (the counters are diagnostic only).
+    /// </summary>
+    public const string EmbeddedBlobSstStats = "rocksdb.embedded.blob.stats";
     public const string BlockBasedWholeKeyFiltering = "rocksdb.block.based.table.whole.key.filtering";
     public const string BlockBasedPrefixFiltering = "rocksdb.block.based.table.prefix.filtering";
     public const string BlockBasedDecoupledPartitionedFilters = "rocksdb.block.based.table.decoupled.partitioned.filters";

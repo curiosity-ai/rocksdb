@@ -279,6 +279,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     private readonly OffsetableCacheKey _baseCacheKey;
     private readonly CachePriority _metaPriority;
     private readonly BlockCacheStatistics? _stats;
+    private readonly bool _hasEmbeddedBlobs;
     private readonly Cache.CacheItemHelper[] _helpers;      // per BlockKind (secondary-cache callbacks)
     private readonly Cache.PersistentCache? _persistentCache;
     private readonly Tracing.BlockCacheTracer? _bcTracer;
@@ -346,6 +347,8 @@ public sealed partial class BlockBasedTableReader : TableReader
         _baseCacheKey = baseCacheKey;
         _metaPriority = MetaPriority(options);
         _stats = options.Statistics;
+        // The presence of the embedded blob stats property signals same-file ("embedded") blob records.
+        _hasEmbeddedBlobs = props.UserCollectedProperties.ContainsKey(TablePropertiesNames.EmbeddedBlobSstStats);
         _helpers = HelpersFor(options);
         _persistentCache = options.PersistentCache;
         _bcTracer = options.BlockCacheTracer;
@@ -1799,7 +1802,7 @@ public sealed partial class BlockBasedTableReader : TableReader
                             matched = true;
                             RecordFilterTruePositive(flags);
                         }
-                        if (!visitor(ref state, k, data.Value)) return;
+                        if (!(_hasEmbeddedBlobs && IsBlobIndexEntry(k) ? VisitEmbedded(ref state, visitor, k, data.Value, flags) : visitor(ref state, k, data.Value))) return;
                     }
                 }
                 finally
@@ -1839,7 +1842,7 @@ public sealed partial class BlockBasedTableReader : TableReader
                 BlockRef block = GetBlockRef(idx.Handle, BlockKind.Data, flags);
                 try
                 {
-                    int r = ScanBlockForGet(data, block.Block!, internalKey, first, value, out TableGetResult result);
+                    int r = ScanBlockForGet(data, block.Block!, internalKey, first, value, flags, out TableGetResult result);
                     if (r != 0)
                     {
                         if (r > 0) RecordFilterTruePositive(flags);
@@ -1893,7 +1896,7 @@ public sealed partial class BlockBasedTableReader : TableReader
                 BlockRef block = pending.IsCompletedSuccessfully ? pending.Result : await pending.ConfigureAwait(false);
                 try
                 {
-                    int r = ScanBlockForGet(data, block.Block!, internalKey.Span, first, value, out TableGetResult result);
+                    int r = ScanBlockForGet(data, block.Block!, internalKey.Span, first, value, flags, out TableGetResult result);
                     if (r != 0)
                     {
                         if (r > 0) RecordFilterTruePositive(flags);
@@ -1985,13 +1988,14 @@ public sealed partial class BlockBasedTableReader : TableReader
                 matched = true;
                 RecordFilterTruePositive(flags);
             }
-            if (!visitor(ref state, k, data.Value)) return false;
+            if (!(_hasEmbeddedBlobs && IsBlobIndexEntry(k) ? VisitEmbedded(ref state, visitor, k, data.Value, flags) : visitor(ref state, k, data.Value))) return false;
         }
         return true;
     }
 
     /// <summary>Returns 1 = found, -1 = definitely absent, 0 = continue with the next block.</summary>
-    private int ScanBlockForGet(BlockIter data, Block block, ReadOnlySpan<byte> internalKey, bool first, IBufferWriter<byte>? value, out TableGetResult result)
+    private int ScanBlockForGet(BlockIter data, Block block, ReadOnlySpan<byte> internalKey, bool first, IBufferWriter<byte>? value, TableReadFlags flags,
+        out TableGetResult result)
     {
         result = default;
         data.InitializeData(block, _icmp, GlobalSequenceNumber, PadTimestampSize);
@@ -2007,7 +2011,16 @@ public sealed partial class BlockBasedTableReader : TableReader
         ReadOnlySpan<byte> k = data.Key;
         if (!UserKeyEquals(DbFormat.ExtractUserKey(k), DbFormat.ExtractUserKey(internalKey))) return -1;
         DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(k), out ulong seq, out EntryType t);
-        value?.Write(data.Value);
+        if (_hasEmbeddedBlobs && t == EntryType.BlobIndex && IsSameFileBlobIndex(data.Value))
+        {
+            // A same-file blob index reads as the value it references (BlockBasedTable::Get with embedded blobs).
+            if (value is not null) ResolveEmbeddedBlob(data.Value, value, flags);
+            t = EntryType.Value;
+        }
+        else
+        {
+            value?.Write(data.Value);
+        }
         result = new TableGetResult(true, seq, t);
         return 1;
     }

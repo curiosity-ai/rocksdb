@@ -56,6 +56,8 @@ public sealed partial class BlockBasedTableBuilder
     {
         uint threads = _tbo.CompressionOptions.ParallelThreads;
         if (threads <= 1) return;
+        // Embedded blob records are written at the running offset: single-threaded writes only.
+        if (_embeddedBlobMinSize is not null) return;
         // Force the generally best configuration for no compression: no parallelism.
         if (_tbo.CompressionType == CompressionType.None) return;
         // partition_filters without decoupling requires single-threaded compression.

@@ -76,7 +76,26 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     public ulong FileSize => _builder?.FileSize ?? 0;
 
     /// <summary>Port of SstFileWriter::Open: creates (truncates) <paramref name="filePath"/>.</summary>
-    public void Open(string filePath)
+    public void Open(string filePath) => Open(filePath, embeddedBlobMinSize: null);
+
+    /// <summary><see cref="OpenWithEmbeddedBlobs(string, ulong)"/> with upstream's default min_blob_size (2048 bytes).</summary>
+    public void OpenWithEmbeddedBlobs(string filePath) => OpenWithEmbeddedBlobs(filePath, 2048);
+
+    /// <summary>
+    /// Port of SstFileWriter::OpenWithEmbeddedBlobs: like <see cref="Open(string)"/>, but Put values of at least
+    /// <paramref name="minBlobSize"/> bytes (SstFileWriterEmbeddedBlobOptions::min_blob_size, upstream default 2048)
+    /// are stored as same-file blob records between the data blocks, referenced by blob indexes with file number 0
+    /// (table/embedded_blob_sst.h). Requires format_version &gt;= 7. Deviation: wide-column entities are written
+    /// unchanged (upstream also embeds their large column values).
+    /// </summary>
+    public void OpenWithEmbeddedBlobs(string filePath, ulong minBlobSize)
+    {
+        if (_format.FormatVersion < 7) ThrowHelper.InvalidArgument("Embedded blob SSTs require block-based table format_version >= 7");
+        if (_options.TableFactory != TableFactoryType.BlockBasedTable) ThrowHelper.InvalidArgument("Embedded blob SSTs require block-based table format");
+        Open(filePath, minBlobSize);
+    }
+
+    private void Open(string filePath, ulong? embeddedBlobMinSize)
     {
         ArgumentException.ThrowIfNullOrEmpty(filePath);
         if (_builder is not null) ThrowHelper.InvalidArgument("SstFileWriter is already open");
@@ -89,6 +108,7 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
             CreationTime = 0,
             OldestKeyTime = 0,
             FileCreationTime = now,
+            EmbeddedBlobMinSize = embeddedBlobMinSize,
         };
         _file = _fs.CreateWritable(filePath, truncate: true);
         try

@@ -338,7 +338,7 @@ public sealed partial class BlockBasedTableReader
                     matched = true;
                     RecordFilterTruePositive(flags);
                 }
-                if (!batch.Visit(key, k, data.Value)) return 0;
+                if (!(_hasEmbeddedBlobs && IsBlobIndexEntry(k) ? VisitEmbedded(batch, key, k, data.Value, flags) : batch.Visit(key, k, data.Value))) return 0;
             }
             return 1;
         }

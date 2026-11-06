@@ -153,6 +153,12 @@ public sealed record TableBuilderOptions
     /// </summary>
     public bool IsBottommost { get; init; }
     /// <summary>
+    /// TableBuilderOptions::embedded_blob_options (SstFileWriter::OpenWithEmbeddedBlobs): Put values of at least this
+    /// many bytes are written as same-file blob records (SimpleGen2Blob format) and referenced by blob indexes with
+    /// file number 0. Null (default): off.
+    /// </summary>
+    public ulong? EmbeddedBlobMinSize { get; init; }
+    /// <summary>
     /// ImmutableCFOptions::optimize_filters_for_hits: with <see cref="IsBottommost"/>, no filter block is built
     /// (the filter policy name is still recorded in the properties, like upstream).
     /// </summary>
