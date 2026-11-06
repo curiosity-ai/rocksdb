@@ -331,6 +331,15 @@ Still open from this round:
 - [ ] flush does not run the merge helper / compaction filter (TTL merge results are stamped at the first compaction, flush filtering not applied) (M)
 - [ ] paranoid_file_checks read-back of flush outputs; MANIFEST size check on close (S)
 
+## Combinatorial round trips (2026-11-06)
+
+- [x] Pairwise option/pattern matrix (79 cases, long 279), crash matrix (20, long 80), 2PC engine-switch suite; seeded, see docs/testing.md
+- [x] Get / MultiGet (sync + async) stopped at the first file of a level when a key's versions span the file boundary (FilePicker::GetNextFile); fixed + `DbMultiGetTests.KeyVersionsSpanningFilesOfALevel`
+- [x] TransactionDB::Write accepted SingleDelete (non-default CF), DeleteRange, TimedPut and blob indexes that upstream LockBatch rejects; fixed + `TransactionTests.WriteBatchWithUnsupportedRecordsIsRejected`
+- [ ] Multi-CF `Flush(FlushOptions, IReadOnlyList<ColumnFamily>)` overload (rocksdb_flush_cfs equivalent) (S)
+- [ ] Native 11.12 bugs found (same code on main; could be reported upstream): unordered_write + manual_wal_flush self-deadlock on wal_write_mutex_; DBIter::MergeWithBlobBaseValue returns freed memory; hash index / hash skiplist call Transform without InDomain (see docs/validation.md "Combinatorial round trips")
+- [ ] Round-trip matrix not yet crossing: wide columns (no C API PutEntity in 11.12), preclude_last_level_data_seconds, separate_key_value_in_data_block, db_paths / cf_paths, last_level_temperature
+
 ## Unported utilities (found 2026-11-03)
 
 - [x] Built-in merge operators: max, put / put_v1, sortlist, bytesxor, StringAppendTEST, AggMerge (+ Aggregator API); resolved by name from OPTIONS; native writes / managed reads and compacts and vice versa for 12 ids; string-append delimiter now persisted like native
