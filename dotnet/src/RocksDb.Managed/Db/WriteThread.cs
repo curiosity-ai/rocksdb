@@ -319,8 +319,8 @@ internal sealed class WriteThread
         if (size <= minBatchSizeBytes) maxSize = size + minBatchSizeBytes;
         lock (_lock)
         {
-            // prev: the last writer that stays queued (the end of the r_list), null while none was skipped.
-            Writer? prev = null;
+            // The writers that stay queued (the r_list) are relinked in order; the queue is rewritten once at the end.
+            Writer? keptHead = null, keptTail = null;
             Writer? w = _head;
             while (w is not null)
             {
@@ -342,20 +342,22 @@ internal sealed class WriteThread
                     // Do not make batch too big
                 {
                     // Stays in the queue (r_list).
-                    prev = w;
+                    if (keptTail is null) keptHead = w;
+                    else keptTail.Next = w;
+                    keptTail = w;
                 }
                 else
                 {
-                    // grow up: unlink from the queue.
+                    // grow up
                     size += w.Size;
-                    if (prev is null) _head = next;
-                    else prev.Next = next;
-                    if (next is null) _tail = prev;
                     w.Next = null;
                     group.Add(w);
                 }
                 w = next;
             }
+            if (keptTail is not null) keptTail.Next = null;
+            _head = keptHead;
+            _tail = keptTail;
         }
     }
 

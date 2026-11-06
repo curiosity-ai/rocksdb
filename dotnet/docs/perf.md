@@ -1604,6 +1604,29 @@ factory costs ~90 ns per lock + unlock pair (virtual mutex calls, `Lock` + gener
 every unlock as upstream). The existing `TransactionBenchmarks` (Begin + 4 Put + Commit, WAL-bound ~20 us on this
 machine) do not resolve lock-manager costs, hence the dedicated benchmark.
 
+## Write group r_list, low-pri throttling, disallow_memtable_writes checks (2026-11-06)
+
+Second-review write path changes: `EnterAsBatchGroupLeader` keeps scanning past incompatible writers (upstream's
+r_list) and relinks the skipped ones once at the end; the write path gained a `LowPri` check (one field test unless
+the write is low-priority) and a per-entry `disallow_memtable_writes` test in `CfForInsert` (one bool of the column
+family's options). Measured on the shared 4-core container under load from other builds (load average 7-13).
+
+BenchmarkDotNet `WriteThreadBenchmarks` (join + EnterAsBatchGroupLeader + ExitAsBatchGroupLeader of one group,
+single-threaded; base `c744671` run between two runs of the branch):
+
+| Followers | base | branch (run 1 / run 2) |
+|---:|---:|---:|
+| 1 | 101.8 ns | 94.3 / 103.5 ns |
+| 7 | 330.8 ns | 306.8 / 310.9 ns |
+| 31 | 1,214 ns | 1,171 / 1,178 ns |
+
+Allocated: `-` in all rows. A first version that updated `_head` / `_tail` per removed writer was 7-15% slower than
+base; rewriting the queue once at the end removed that.
+
+dbbench `fillrandom --num 400000 --value_size 100`, managed sync engine, 6 alternating runs each, median ops/s:
+4 threads base 152.9k / branch 153.4k; 8 threads base 108.1k / branch 141.3k (spread 79k-234k on this machine, so
+only "no regression" can be read from it). Allocations per op are equal (~118 B/op runner overhead in both).
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
