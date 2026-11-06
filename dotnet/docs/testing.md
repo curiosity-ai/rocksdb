@@ -15,10 +15,10 @@ ships prebuilt libraries for Linux, macOS and Windows, so no C++ build is needed
 
 | Project | Tests (net10.0) | Native code | What it covers |
 |---|---:|---|---|
-| `tests/RocksDb.Managed.Tests` | 1894 | none | formats, data structures, DB behavior, crash consistency, fault injection, concurrency, upstream test vectors |
-| `tests/RocksDb.Managed.CompatTests` | 491 | in process | byte-level and file-level compatibility with `librocksdb` |
-| `tests/RocksDb.Managed.RoundTrip` | 149 | child process | whole-DB managed and native alternation, option and crash matrices, 2PC, features |
-| `tests/RocksDb.Managed.Replication.Tests` | 37 | in process (one test) | replication, switchover, Raft cluster, gRPC transport, native replica |
+| `tests/RocksDb.Managed.Tests` | 1893 | none | formats, data structures, DB behavior, crash consistency, fault injection, concurrency, upstream test vectors |
+| `tests/RocksDb.Managed.CompatTests` | 490 | in process | byte-level and file-level compatibility with `librocksdb` |
+| `tests/RocksDb.Managed.RoundTrip` | 148 | child process | whole-DB managed and native alternation, option and crash matrices, 2PC, features |
+| `tests/RocksDb.Managed.Replication.Tests` | 36 | in process (one test) | replication, switchover, Raft cluster, gRPC transport, native replica |
 
 The counts are test cases as listed by `--list-tests` (data rows count separately) at the time of writing. Both TFMs
 run the same tests.
@@ -280,7 +280,7 @@ A TransactionDB alternately opened by both engines (6 rounds, 12 long): each rou
 previous engine left prepared were recovered (and are invisible), resolves some, writes, prepares new multi-CF
 transactions, flushes between prepare and commit, and ends cleanly or by killing the process.
 
-Counts (net10.0): 149 round-trip test cases, of which 79 option-matrix and 20 crash-matrix cases; about 3 minutes on
+Counts (net10.0): 148 round-trip test cases, of which 79 option-matrix and 20 crash-matrix cases; about 3 minutes on
 4 cores. With `ROUNDTRIP_LONG=1`: 279 option-matrix cases (200 random valid rows on top, 900 ops per run, 6 runs) and
 80 crash-matrix cases.
 
