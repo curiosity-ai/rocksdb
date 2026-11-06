@@ -34,6 +34,27 @@ internal sealed class IndexedWriteBatch : IDisposable
     {
         _wbwi = new WriteBatchWithIndex(maxBytes, withNoop);
         _comparatorOf = comparatorOf;
+        MaxBytes = maxBytes;
+    }
+
+    /// <summary>The batch size limit it was created with (0 = none).</summary>
+    public int MaxBytes { get; }
+
+    /// <summary>Capacity of the batch rep buffer.</summary>
+    public int Capacity => _wbwi.WriteBatch.Capacity;
+
+    /// <summary>
+    /// Makes the batch like a new one for another transaction of the same DB (<see cref="TransactionResourcePool"/>):
+    /// empty, indexing enabled, no registered column family comparators.
+    /// </summary>
+    public void ResetForReuse()
+    {
+        _wbwi.Clear();
+        _wbwi.IndexingDisabled = false;
+        _wbwi.Index.ResetComparators();
+        _registered = 0;
+        _findKeyLength = 0;
+        _findCf = 0;
     }
 
     /// <summary>The indexed batch.</summary>

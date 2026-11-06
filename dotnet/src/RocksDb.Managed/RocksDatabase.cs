@@ -198,6 +198,18 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     /// <summary>A pooled, empty write batch; disposing it returns it to the pool.</summary>
     public WriteBatch CreateWriteBatch() => WriteBatch.Rent();
 
+    /// <summary>
+    /// A pooled, empty, bytewise-ordered <see cref="WriteBatchWithIndex"/> (<see cref="WriteBatchWithIndex.Rent()"/>);
+    /// disposing it returns it to the pool.
+    /// </summary>
+    public WriteBatchWithIndex CreateWriteBatchWithIndex() => WriteBatchWithIndex.Rent();
+
+    /// <summary>
+    /// <see cref="CreateWriteBatchWithIndex()"/> in overwrite_key mode when <paramref name="overwriteKey"/> is set
+    /// (<see cref="WriteBatchWithIndex.Rent(bool)"/>).
+    /// </summary>
+    public WriteBatchWithIndex CreateWriteBatchWithIndex(bool overwriteKey) => WriteBatchWithIndex.Rent(overwriteKey);
+
     /// <summary>Atomically applies <paramref name="batch"/> (DB::Write). Records name column families by <see cref="ColumnFamily.Id"/>.</summary>
     public void Write(WriteBatch batch) => Write(null, batch);
 

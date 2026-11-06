@@ -106,7 +106,7 @@ internal class WritePreparedTxn : PessimisticTransaction
             throw Invalid("Commit-time-batch can only be used if use_only_the_last_commit_time_batch_for_recovery is true");
         }
         // The Memtable will ignore the Commit marker in non-recovery mode
-        working.MarkCommit(_nameBytes!);
+        working.MarkCommit(NameBytes);
         // When not writing to memtable, we can still cache the latest write batch. The cached batch will be written to
         // memtable in WriteRecoverableState during FlushMemTable.
         if (!empty) working.IsLatestPersistentState = true;
@@ -130,9 +130,9 @@ internal class WritePreparedTxn : PessimisticTransaction
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private protected override async ValueTask PrepareInternalAsync(bool synchronous, CancellationToken cancellationToken)
     {
-        WriteOptions wo = _writeOptions.DisableWal ? CloneWithWal(_writeOptions) : _writeOptions;
+        WriteOptions wo = _writeOptions.DisableWal ? WithWal(_writeOptions) : _writeOptions;
         // For each duplicate key we account for a new sub-batch
-        _batch.Batch.MarkEndPrepare(_nameBytes!, writeAfterCommit: false, unpreparedBatch: false);
+        _batch.Batch.MarkEndPrepare(NameBytes, writeAfterCommit: false, unpreparedBatch: false);
         _prepareBatchCnt = _batch.SubBatchCount;
         _addPrepared.Set(_prepareBatchCnt, firstPrepareBatch: true);
         _writeContext.Reset();
@@ -244,7 +244,7 @@ internal class WritePreparedTxn : PessimisticTransaction
         var builder = new RollbackBatchBuilder(this, rollbackBatch, callback);
         _batch.Batch.Iterate(ref builder);
         // The Rollback marker will be used as a batch separator
-        rollbackBatch.MarkRollback(_nameBytes!);
+        rollbackBatch.MarkRollback(NameBytes);
         ulong prepareSeq = PrepareSequence;
         bool doOneWrite = !TwoWriteQueues;
         _writeContext.Reset();

@@ -819,6 +819,9 @@ public sealed class CompactionReviewFixesTests
         db.SetDBOptions(new Dictionary<string, string> { ["delete_obsolete_files_period_micros"] = "0" });
         db.Put(B("b"), B("1"));
         db.Flush(); // period 0: every purge scans the directories
+        // Flush returns once the new version is installed; the purge runs afterwards in the same background job
+        // (BackgroundCallFlush: PurgeObsoleteFiles after the bg_cv_ signal), so wait for the job to finish.
+        db.DefaultColumnFamily.Db.WaitForBackgroundWorkForTest();
         Assert.IsFalse(fs.FileExists(orphan));
         // Live files are kept.
         Assert.AreEqual("1", GetString(db, "a"));

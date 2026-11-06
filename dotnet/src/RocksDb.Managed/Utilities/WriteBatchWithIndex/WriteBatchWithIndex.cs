@@ -34,6 +34,11 @@ public enum WriteType : byte
 /// merge operator passed to the reading method). DeleteRange is not supported (NotSupported, like upstream). Not
 /// thread-safe. Dispose to return the batch buffer.
 /// </para>
+/// <para>
+/// <see cref="Rent()"/> (or <see cref="RocksDatabase.CreateWriteBatchWithIndex()"/>) takes a bytewise-ordered batch from
+/// a process-wide pool; its <see cref="Dispose"/> clears it and returns it to the pool, so building a batch per
+/// operation does not allocate once the pooled batches have grown to their working size.
+/// </para>
 /// </summary>
 public sealed class WriteBatchWithIndex : IDisposable
 {
@@ -72,13 +77,95 @@ public sealed class WriteBatchWithIndex : IDisposable
     private readonly bool _withNoop;
 
     /// <summary>overwrite_key mode.</summary>
-    public bool OverwriteKey { get; }
+    public bool OverwriteKey { get; private set; }
 
     /// <summary>The underlying batch (WriteBatchWithIndex::GetWriteBatch). Do not modify it directly.</summary>
-    public WriteBatch WriteBatch => _batch;
+    public WriteBatch WriteBatch
+    {
+        get
+        {
+            ThrowIfInPool();
+            return _batch;
+        }
+    }
 
     /// <summary>The batch rep (WriteBatch::Data()).</summary>
-    public ReadOnlySpan<byte> Data => _batch.Data;
+    public ReadOnlySpan<byte> Data
+    {
+        get
+        {
+            ThrowIfInPool();
+            return _batch.Data;
+        }
+    }
+
+    // ---- Pooling ----------------------------------------------------------------------------------------------
+
+    private static readonly WriteBatchWithIndex?[] s_pool = new WriteBatchWithIndex?[Math.Min(64, Environment.ProcessorCount * 4)];
+    private const int MaxPooledBatchBytes = 1 << 20;
+    private const int MaxPooledIndexEntries = 1 << 16;
+    // Rented with Rent: Dispose returns the batch to s_pool. _inPool: it is in s_pool (any use is a use after Dispose).
+    private bool _pooled;
+    private bool _inPool;
+
+    /// <summary>
+    /// Gets an empty, bytewise-ordered batch without overwrite_key from a process-wide pool (or a new one, like
+    /// <see cref="WriteBatchWithIndex()"/>). <see cref="Dispose"/> clears it and returns it to the pool: the batch, its
+    /// iterators and the <see cref="WriteBatch"/> it exposes must not be used afterwards.
+    /// </summary>
+    public static WriteBatchWithIndex Rent() => Rent(overwriteKey: false);
+
+    /// <summary>
+    /// <see cref="Rent()"/> with overwrite_key mode selected by <paramref name="overwriteKey"/> (see
+    /// <see cref="WriteBatchWithIndex(Comparator, int, bool, int)"/>).
+    /// </summary>
+    public static WriteBatchWithIndex Rent(bool overwriteKey)
+    {
+        WriteBatchWithIndex?[] pool = s_pool;
+        for (int i = 0; i < pool.Length; i++)
+        {
+            WriteBatchWithIndex? b = pool[i];
+            if (b is not null && Interlocked.CompareExchange(ref pool[i], null, b) == b)
+            {
+                b._inPool = false;
+                b._pooled = true;
+                b.OverwriteKey = overwriteKey;
+                return b;
+            }
+        }
+        return new WriteBatchWithIndex(Comparator.Bytewise, 0, overwriteKey, 0) { _pooled = true };
+    }
+
+    /// <summary>
+    /// Returns a rented batch to the pool: cleared, without column family comparators (the next renter may use other
+    /// databases) and with indexing enabled. Batches that grew very large are dropped instead.
+    /// </summary>
+    private bool TryReturnToPool()
+    {
+        _pooled = false;
+        if (_batch.Capacity > MaxPooledBatchBytes || _index.Count > MaxPooledIndexEntries) return false;
+        Clear();
+        _index.ResetComparators();
+        IndexingDisabled = false;
+        _mergeContext.Clear();
+        _inPool = true;
+        WriteBatchWithIndex?[] pool = s_pool;
+        for (int i = 0; i < pool.Length; i++)
+        {
+            if (pool[i] is null && Interlocked.CompareExchange(ref pool[i], this, null) is null) return true;
+        }
+        _inPool = false;
+        return false;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private void ThrowIfInPool()
+    {
+        if (_inPool) ThrowInPool();
+    }
+
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ThrowInPool() => throw new ObjectDisposedException(nameof(WriteBatchWithIndex));
 
     /// <summary>Number of operations in the batch.</summary>
     public int Count => _batch.Count;
@@ -92,6 +179,7 @@ public sealed class WriteBatchWithIndex : IDisposable
 
     private uint CfId(ColumnFamily? cf)
     {
+        ThrowIfInPool();
         if (cf is null) return 0;
         _index.SetComparator(cf.Id, cf.Data.UserComparator);
         return cf.Id;
@@ -162,6 +250,7 @@ public sealed class WriteBatchWithIndex : IDisposable
     /// <summary>Removes every update (WriteBatchWithIndex::Clear).</summary>
     public void Clear()
     {
+        ThrowIfInPool();
         _batch.Clear();
         if (_withNoop) _batch.InsertNoop();
         _index.Clear();
@@ -1120,8 +1209,15 @@ public sealed class WriteBatchWithIndex : IDisposable
     /// <summary><see cref="MultiGetFromBatchAndDB(RocksDatabase, ReadOptions?, ColumnFamily?, MultiGetBatch)"/> on the default column family.</summary>
     public void MultiGetFromBatchAndDB(RocksDatabase db, MultiGetBatch batch) => MultiGetFromBatchAndDB(db, null, null, batch);
 
+    /// <summary>
+    /// Releases the batch. A batch obtained from <see cref="Rent()"/> is cleared and returned to the pool (disposing it
+    /// again does nothing); otherwise its buffers are released. The batch must not be used afterwards.
+    /// </summary>
     public void Dispose()
     {
+        if (_inPool) return;
+        if (_pooled && _defaultComparator == Comparator.Bytewise && !_withNoop && TryReturnToPool()) return;
+        _pooled = false;
         _batch.Dispose();
         _mergeContext.Dispose();
     }

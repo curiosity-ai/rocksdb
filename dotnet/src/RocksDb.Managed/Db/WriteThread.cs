@@ -154,6 +154,12 @@ internal sealed class WriteThread
         public WriteThread? Owner;
         /// <summary>DB::WriteWithCallback's user_write_cb (null for every other write).</summary>
         public UserWriteCallback? UserCallback;
+        /// <summary>
+        /// The reusable state machine box of DbImpl.LeadWriteGroupAsync when this writer leads a group and the leader
+        /// suspends (see <see cref="Util.OwnedValueTaskMethodBuilder{TResult}"/>): a writer leads at most one group per
+        /// write, and the write awaits it before the writer is returned to the pool.
+        /// </summary>
+        public readonly Util.OwnedAsyncBoxSlot<int> LeadBox = new();
 
         /// <summary>CheckPostWalWriteCallback: the writer's WAL record is written.</summary>
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]

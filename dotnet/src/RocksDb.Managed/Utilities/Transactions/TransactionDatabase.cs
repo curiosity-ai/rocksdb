@@ -29,6 +29,11 @@ namespace RocksDb.Managed.Utilities.Transactions;
 public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
 {
     private readonly RocksDatabase _db;
+    // BeginTransaction(writeOptions): the options are only read when the transaction begins, never mutated or exposed.
+    private static readonly TransactionOptions s_defaultTransactionOptions = new();
+
+    /// <summary>Recycles the write batches and lock trackers of disposed transactions.</summary>
+    internal TransactionResourcePool ResourcePool { get; }
     private readonly TransactionDbOptions _options;
     private readonly Dictionary<string, PessimisticTransaction> _transactions = new(StringComparer.Ordinal);
     private readonly Lock _nameMapLock = new();
@@ -39,6 +44,7 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     private TransactionDatabase(RocksDatabase db, TransactionDbOptions options)
     {
         _db = db;
+        ResourcePool = new TransactionResourcePool(db.Impl);
         _options = options;
         if (options.RangeLockManager is { } rangeLocks)
         {
@@ -302,7 +308,12 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     // =====================================================================================================
 
     /// <summary>Starts a transaction (BeginTransaction).</summary>
-    public Transaction BeginTransaction(WriteOptions writeOptions) => BeginTransaction(writeOptions, new TransactionOptions());
+    /// <remarks>
+    /// The write batch and lock tracker of a disposed transaction are reused by the next transaction, so beginning
+    /// and disposing transactions allocates little more than the transaction object; to allocate nothing, pass the
+    /// finished transaction to <see cref="BeginTransaction(WriteOptions, TransactionOptions, Transaction)"/>.
+    /// </remarks>
+    public Transaction BeginTransaction(WriteOptions writeOptions) => BeginTransaction(writeOptions, s_defaultTransactionOptions);
 
     public Transaction BeginTransaction(WriteOptions writeOptions, TransactionOptions transactionOptions)
     {

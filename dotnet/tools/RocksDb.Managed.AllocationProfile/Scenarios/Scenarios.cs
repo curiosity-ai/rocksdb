@@ -102,6 +102,16 @@ internal static partial class Scenarios
                 for (int i = 0; i < n; i++) await db.PutAsync(keys[start + i % (KeySpace / 4)], value);
             }));
         }, chunk: 40_000));
+        list.Add(S("put.async.16tasks", "write", PathKind.Hot, "await PutAsync from 16 concurrent tasks, per Put", ctx =>
+        {
+            RocksDatabase db = ctx.OpenDb("db");
+            byte[][] keys = ScenarioContext.Keys(KeySpace);
+            return Done(Runner.Concurrent(16, [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))] async ValueTask (int w, int n) =>
+            {
+                int start = w * (KeySpace / 16);
+                for (int i = 0; i < n; i++) await db.PutAsync(keys[start + i % (KeySpace / 16)], value);
+            }));
+        }, chunk: 80_000));
         list.Add(S("put.cf", "write", PathKind.Hot, "ColumnFamily.Put(key, value) on a second column family", ctx =>
         {
             RocksDatabase db = ctx.OpenDb("db");
@@ -304,6 +314,21 @@ internal static partial class Scenarios
                 for (int i = 0; i < n; i++)
                 {
                     using var b = new WriteBatchWithIndex();
+                    for (int j = 0; j < 10; j++) b.Put(keys[c.Next()], value);
+                    db.Write(b);
+                }
+            }));
+        }, chunk: 200));
+        list.Add(S("wbwi.pooled", "batch", PathKind.Hot, "CreateWriteBatchWithIndex + 10 Put + Write + Dispose", ctx =>
+        {
+            RocksDatabase db = ctx.OpenDb("db");
+            byte[][] keys = ScenarioContext.Keys(KeySpace);
+            var c = new Cursor(keys.Length);
+            return Done(Runner.Sync(n =>
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    using WriteBatchWithIndex b = db.CreateWriteBatchWithIndex();
                     for (int j = 0; j < 10; j++) b.Put(keys[c.Next()], value);
                     db.Write(b);
                 }

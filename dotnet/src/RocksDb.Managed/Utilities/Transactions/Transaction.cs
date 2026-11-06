@@ -32,12 +32,15 @@ public abstract partial class Transaction : IDisposable
     private protected readonly RocksDatabase _database;
     private protected readonly DbImpl _db;
     private protected WriteOptions _writeOptions;
-    private protected readonly IndexedWriteBatch _batch;
-    private protected readonly LockTracker _tracked = new();
-    private protected readonly TransactionWriteContext _writeContext = new();
+    // Rented from the database's TransactionResourcePool (when given) and returned to it by Dispose, which also drops
+    // these references (a disposed transaction must not reach the internals of the next transaction).
+    private protected IndexedWriteBatch _batch;
+    private protected LockTracker _tracked;
+    private readonly TransactionResourcePool? _resourcePool;
+    private protected TransactionWriteContext _writeContext;
     private Snapshot? _snapshot;
     private bool _snapshotNeeded;
-    private readonly List<Snapshot> _ownedSnapshots = new();
+    private List<Snapshot>? _ownedSnapshots; // created by the first SetSnapshot
     private List<SavePoint>? _savePoints;
     private protected bool _disposed;
 
@@ -49,14 +52,31 @@ public abstract partial class Transaction : IDisposable
         public readonly LockTracker NewLocks = new();
     }
 
-    private protected Transaction(RocksDatabase database, WriteOptions? writeOptions, int maxWriteBatchSize)
+    /// <param name="database">The database.</param>
+    /// <param name="writeOptions">The commit's write options (null: defaults).</param>
+    /// <param name="maxWriteBatchSize">max_write_batch_size (0: unlimited).</param>
+    /// <param name="resourcePool">Where the write batch and the lock tracker come from and go back to on Dispose; null
+    /// to allocate them.</param>
+    private protected Transaction(RocksDatabase database, WriteOptions? writeOptions, int maxWriteBatchSize, TransactionResourcePool? resourcePool)
     {
         _database = database;
         _db = database.Impl;
         _writeOptions = writeOptions ?? new WriteOptions();
+        _resourcePool = resourcePool;
         // TransactionBaseImpl::InitWriteBatch: with allow_2pc the batch starts with a Noop that Prepare turns into the
         // begin-prepare marker.
-        _batch = new IndexedWriteBatch(_db.Options.Allow2Pc, maxWriteBatchSize, _db.UserComparatorOf);
+        if (resourcePool is not null)
+        {
+            _batch = resourcePool.RentBatch(maxWriteBatchSize);
+            _tracked = resourcePool.RentTracker();
+            _writeContext = resourcePool.RentWriteContext();
+        }
+        else
+        {
+            _batch = new IndexedWriteBatch(_db.Options.Allow2Pc, maxWriteBatchSize, _db.UserComparatorOf);
+            _tracked = new LockTracker();
+            _writeContext = new TransactionWriteContext();
+        }
     }
 
     /// <summary>The database this transaction belongs to.</summary>
@@ -75,10 +95,24 @@ public abstract partial class Transaction : IDisposable
     public virtual string? Name => null;
 
     /// <summary>Number of operations (puts, deletes, merges) in the transaction's write batch.</summary>
-    public int Count => _batch.Count;
+    public int Count
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return _batch.Count;
+        }
+    }
 
-    /// <summary>The write batch holding the transaction's writes. Do not modify it.</summary>
-    public WriteBatch WriteBatch => _batch.Batch;
+    /// <summary>The write batch holding the transaction's writes. Do not modify it, nor use it after disposing the transaction.</summary>
+    public WriteBatch WriteBatch
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return _batch.Batch;
+        }
+    }
 
     private protected WriteBatch? _commitTimeBatch;
 
@@ -120,7 +154,7 @@ public abstract partial class Transaction : IDisposable
         ThrowIfDisposed();
         // TransactionBaseImpl::SetSnapshot: a write-conflict-boundary snapshot (WritePreparedTxn::SetSnapshot too).
         Snapshot s = _database.Impl.GetSnapshotForWriteConflictBoundary();
-        _ownedSnapshots.Add(s);
+        (_ownedSnapshots ??= new List<Snapshot>()).Add(s);
         _snapshot = s;
         _snapshotNeeded = false;
     }
@@ -271,6 +305,7 @@ public abstract partial class Transaction : IDisposable
         return CompleteWriteAsync(t, op, cfd, key, value);
     }
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private async ValueTask CompleteWriteAsync(ValueTask<RocksDbException?> t, WriteOp op, ColumnFamilyData cfd, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value)
     {
         ThrowIfError(await t.ConfigureAwait(false));
@@ -488,6 +523,7 @@ public abstract partial class Transaction : IDisposable
         return CompleteGetForUpdateAsync(t, options, cfd, key, value, cancellationToken);
     }
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<bool> CompleteGetForUpdateAsync(ValueTask<RocksDbException?> t, ReadOptions? options, ColumnFamilyData cfd, ReadOnlyMemory<byte> key,
         IBufferWriter<byte> value, CancellationToken cancellationToken)
     {
@@ -935,8 +971,11 @@ public abstract partial class Transaction : IDisposable
 
     private protected void ReleaseSnapshots()
     {
-        foreach (Snapshot s in _ownedSnapshots) s.Dispose();
-        _ownedSnapshots.Clear();
+        if (_ownedSnapshots is { } owned)
+        {
+            foreach (Snapshot s in owned) s.Dispose();
+            owned.Clear();
+        }
         _snapshot = null;
         _snapshotNeeded = false;
     }
@@ -948,7 +987,11 @@ public abstract partial class Transaction : IDisposable
         _disposed = true;
         DisposeCore();
         ReleaseSnapshots();
-        _batch.Dispose();
+        if (_resourcePool is not null) _resourcePool.Return(_batch, _tracked, _writeContext);
+        else _batch.Dispose();
+        _batch = null!;
+        _tracked = null!;
+        _writeContext = null!;
         GC.SuppressFinalize(this);
     }
 
