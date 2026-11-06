@@ -104,3 +104,51 @@ public sealed class MemoryUtilCompatTests
         GC.KeepAlive(nativeCache);
     }
 }
+
+/// <summary>
+/// InfoLogFinder over native RocksDB 11.12's info LOG files: the managed GetInfoLogFiles finds the LOG files native
+/// writes (and rolls) in the DB directory and in db_log_dir, and a managed open of the same DB continues the series.
+/// </summary>
+[TestClass]
+public sealed class InfoLogFinderCompatTests
+{
+    [TestMethod]
+    public void FindsNativeLogsInDbDirAndLogDir()
+    {
+        using var dir = new TempDir("infolog");
+        string dbPath = System.IO.Path.Combine(dir.Path, "db");
+        string logDir = System.IO.Path.Combine(dir.Path, "logs");
+        for (int i = 0; i < 2; i++)
+        {
+            using RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions().SetCreateIfMissing(true), dbPath);
+        }
+        List<string> inDb = InfoLogFinder.GetInfoLogFiles(RocksDb.Managed.Env.LocalFileSystem.Instance, "", dbPath, out string parent);
+        inDb.Sort(StringComparer.Ordinal);
+        Assert.AreEqual(dbPath, parent);
+        Assert.AreEqual(2, inDb.Count, string.Join(",", inDb));
+        Assert.AreEqual("LOG", inDb[0]);
+        StringAssert.StartsWith(inDb[1], "LOG.old.");
+
+        // A managed open rolls native's LOG like native does.
+        using (RocksDatabase managed = RocksDatabase.Open(dbPath, new DbOptions()))
+        {
+            Assert.AreEqual(3, InfoLogFinder.GetInfoLogList(managed).Count);
+        }
+
+        for (int i = 0; i < 2; i++)
+        {
+            using RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions().SetCreateIfMissing(true).SetDbLogDir(logDir), dbPath);
+        }
+        List<string> inLogDir = InfoLogFinder.GetInfoLogFiles(RocksDb.Managed.Env.LocalFileSystem.Instance, logDir, dbPath, out parent);
+        inLogDir.Sort(StringComparer.Ordinal);
+        Assert.AreEqual(logDir, parent);
+        Assert.AreEqual(2, inLogDir.Count, string.Join(",", inLogDir));
+        Assert.AreEqual(RocksDb.Managed.Db.FileNames.InfoLogPrefix(true, dbPath), inLogDir[0]);
+        using (RocksDatabase managed = RocksDatabase.Open(dbPath, new DbOptions { DbLogDir = logDir }))
+        {
+            List<string> logs = InfoLogFinder.GetInfoLogList(managed);
+            Assert.AreEqual(3, logs.Count, string.Join(",", logs));
+            Assert.IsTrue(logs.Contains(inLogDir[0]));
+        }
+    }
+}

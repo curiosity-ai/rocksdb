@@ -192,3 +192,68 @@ public sealed class DebugUtilitiesTests
         return t;
     }
 }
+
+/// <summary>
+/// InfoLogFinder (utilities/convenience/info_log_finder.cc, GetInfoLogFiles in file/filename.cc) over the port's info
+/// LOG naming: LOG / LOG.old / LOG.old.&lt;micros&gt; in the DB directory, &lt;escaped db path&gt;_LOG... in db_log_dir.
+/// </summary>
+[TestClass]
+public sealed class InfoLogFinderTests
+{
+    [TestMethod]
+    public void ListsLogAndRolledLogsInDbDirectory()
+    {
+        MemoryFileSystem fs = NewFs();
+        // Every open rolls the previous LOG to LOG.old.<micros> (CreateLoggerFromOptions).
+        for (int i = 0; i < 3; i++)
+        {
+            using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+            db.Put(B("k"), B("v" + i));
+        }
+        // Names that only look like info logs are ignored; "LOG.old" is one (ParseFileName).
+        foreach (string decoy in new[] { "LOGX", "LOG.old.abc", "LOG.oldx", "xLOG" }) fs.CreateWritable(DbPath + "/" + decoy).Dispose();
+        fs.CreateWritable(DbPath + "/LOG.old").Dispose();
+
+        using RocksDatabase opened = RocksDatabase.Open(DbPath, NewOptions(fs));
+        List<string> logs = InfoLogFinder.GetInfoLogList(opened);
+        logs.Sort(StringComparer.Ordinal);
+        Assert.AreEqual(5, logs.Count, string.Join(",", logs)); // LOG, LOG.old, 3 x LOG.old.<micros>
+        Assert.AreEqual("LOG", logs[0]);
+        Assert.AreEqual("LOG.old", logs[1]);
+        for (int i = 2; i < logs.Count; i++) StringAssert.StartsWith(logs[i], "LOG.old.");
+        Assert.AreEqual(DbPath, InfoLogFinder.GetInfoLogDirectory(opened));
+        foreach (string l in logs) Assert.IsTrue(fs.FileExists(DbPath + "/" + l), l);
+    }
+
+    [TestMethod]
+    public void ListsOnlyThisDatabasesLogsInDbLogDir()
+    {
+        MemoryFileSystem fs = NewFs();
+        const string logDir = "/logs";
+        static DbOptions WithLogDir(IFileSystem f)
+        {
+            DbOptions o = NewOptions(f);
+            o.DbLogDir = logDir;
+            return o;
+        }
+        RocksDatabase.Open(DbPath, WithLogDir(fs)).Dispose();
+        fs.CreateDirectoryIfMissing("/other");
+        RocksDatabase.Open("/other", WithLogDir(fs)).Dispose(); // another DB's logs in the same directory
+        using RocksDatabase db = RocksDatabase.Open(DbPath, WithLogDir(fs));
+
+        List<string> logs = InfoLogFinder.GetInfoLogList(db);
+        logs.Sort(StringComparer.Ordinal);
+        string prefix = FileNames.InfoLogPrefix(true, Path.GetFullPath(DbPath));
+        Assert.AreEqual(2, logs.Count, string.Join(",", logs));
+        Assert.AreEqual(prefix, logs[0]);
+        StringAssert.StartsWith(logs[1], prefix + ".old.");
+        Assert.AreEqual(logDir, InfoLogFinder.GetInfoLogDirectory(db));
+        Assert.IsFalse(fs.FileExists(DbPath + "/LOG"));
+
+        // The free function, with the other DB's name.
+        List<string> other = InfoLogFinder.GetInfoLogFiles(fs, logDir, Path.GetFullPath("/other"), out string parent);
+        Assert.AreEqual(logDir, parent);
+        Assert.AreEqual(1, other.Count);
+        Assert.AreEqual(FileNames.InfoLogPrefix(true, Path.GetFullPath("/other")), other[0]);
+    }
+}
