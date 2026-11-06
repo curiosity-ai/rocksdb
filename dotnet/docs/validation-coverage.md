@@ -10,7 +10,7 @@ Status values:
   (DB layer) or audit #3. For audit #3 the entry names the functions compared and any fix.
 - **line-by-line (feature audit: ...)**: compared when the feature was ported. The findings are in the named section of
   validation.md: "Background errors, listeners and backups", "Transactions", "User features", "User-defined
-  timestamps", "Integrated BlobDB", "Other SST formats", "Tracing, RepairDB and tools", "Built-in merge operators" or "WAL filter, predecessor-WAL records (track_and_verify_wals) and UserWriteCallback". Audit #3 re-checked defaults and constants where noted.
+  timestamps", "Integrated BlobDB", "Other SST formats", "Tracing, RepairDB and tools", "Built-in merge operators", "Utilities: debug, migration, memory, info logs, mutexes, EnvMirror, UDI options" or "WAL filter, predecessor-WAL records (track_and_verify_wals) and UserWriteCallback". Audit #3 re-checked defaults and constants where noted.
 - **compaction-features pass**: the pass that ported audit #3's remaining compaction deviations (validation.md,
   "Compaction features (audit #3 remaining deviations)"); the named functions were compared with `main` and with the
   11.12 sources (identical except where noted).
@@ -21,17 +21,17 @@ Status values:
 
 No file is left as "spot-checked" or "not audited".
 
-Summary (284 files, about 83,000 lines):
+Summary (292 files, about 84,000 lines):
 
 | Status | Files |
 |---|---:|
 | line-by-line (#1) | 78 |
 | line-by-line (#2) | 27 |
-| line-by-line (feature audits) | 106 |
+| line-by-line (feature audits) | 113 |
 | line-by-line (#3) | 17 |
 | line-by-line (compaction-features pass) | 2 |
 | managed-only, design-reviewed | 43 |
-| API wrapper, design-reviewed | 11 |
+| API wrapper, design-reviewed | 12 |
 
 Two areas are under active change by other work streams: WritePrepared / WriteUnprepared transactions, and blob direct
 write with entity blob columns. Their files were audited at the revision named in validation.md ("Audit #3"). Later
@@ -39,6 +39,7 @@ changes there need their own review.
 
 | Managed file | Lines | C++ source(s) | Audit status |
 |---|---:|---|---|
+| `ColumnFamily.Debug.cs` | 48 | include/rocksdb/utilities/debug.h (GetAllKeyVersions overloads) | API wrapper, design-reviewed (utilities): delegates to DbImpl.Debug |
 | `ColumnFamily.DbApis.cs` | 274 | include/rocksdb/db.h (GetMergeOperands, SuggestCompactRange, PromoteL0, DeleteFilesInRanges, ClipColumnFamily, GetPropertiesOfTablesInRange/ByLevel, LockWAL, Disable/EnableManualCompaction, GetCreationTimeOfOldestFile), include/rocksdb/options.h (GetMergeOperandsOptions) | API wrapper, design-reviewed (DB API wave): delegates to audited DbImpl |
 | `ColumnFamily.ExportImport.cs` | 54 | include/rocksdb/utilities/checkpoint.h (ExportColumnFamily), include/rocksdb/db.h (CreateColumnFamilyWithImport) | API wrapper, design-reviewed (DB API wave): delegates to audited DbImpl |
 | `Db/Compaction/CompactionService.cs` | 133 | include/rocksdb/options.h (CompactionService, CompactionServiceJobInfo, CompactionServiceJobStatus, CompactionServiceScheduleResponse, OpenAndCompactOptions, CompactionServiceOptionsOverride) | line-by-line (feature audit: DB API wave) |
@@ -139,6 +140,7 @@ changes there need their own review.
 | `Db/DbFormat.cs` | 158 | db/dbformat.h | line-by-line (#1) |
 | `Db/DbImpl.Checkpoint.cs` | 280 | include/rocksdb/metadata.h, db/db_filesnapshot.cc, utilities/checkpoint/checkpoint_impl.cc | line-by-line (#2) |
 | `Db/DbImpl.ColumnFamilies.cs` | 128 | db/db_impl/db_impl.cc (CreateColumnFamilyImpl, DropColumnFamilyImpl) | line-by-line (#2) |
+| `Db/DbImpl.Debug.cs` | 105 | utilities/debug.cc (GetAllKeyVersions), util/udt_util.cc (MaybeAddTimestampsToRange), db/db_impl/db_impl.cc (NewInternalIterator) | line-by-line (feature audit: utilities) |
 | `Db/DbImpl.Compaction.cs` | 912 | db/db_impl/db_impl_compaction_flush.cc, db/db_impl/db_impl_write.cc | line-by-line (#2) |
 | `Db/DbImpl.Comparators.cs` | 136 | db/version_edit_handler.cc, db/version_builder.cc, util/udt_util.cc | line-by-line (feature audit: user features (comparators) + UDT memtable-only) |
 | `Db/DbImpl.Flush.cs` | 418 | db/db_impl/db_impl_compaction_flush.cc (flush), db/flush_job.cc | line-by-line (#2) |
@@ -215,6 +217,7 @@ changes there need their own review.
 | `Env/FileContracts.cs` | 96 | file/writable_file_writer.h | managed-only, design-reviewed (#3): IFileSystem contracts (FileSystem / RandomAccessFileReader roles) |
 | `Env/FilePrefetchBuffer.cs` | 136 | file/file_prefetch_buffer.{h,cc} (lite) | managed-only, design-reviewed (#3): lite readahead buffer (file_prefetch_buffer.cc semantics for auto-readahead) |
 | `Env/LocalFileSystem.cs` | 1021 | env/fs_posix.cc, env/io_posix.cc, file/writable_file_writer.cc | managed-only, design-reviewed (#3): POSIX/Windows file system: rename(2) overwrite, fdatasync, dir fsync, OFD LOCK, truncate-on-close |
+| `Env/MirrorFileSystem.cs` | 435 | include/rocksdb/utilities/env_mirror.h, utilities/env_mirror.cc | line-by-line (feature audit: utilities) |
 | `Env/MemoryFileSystem.cs` | 491 | env/mock_env.cc, utilities/fault_injection_fs.{h,cc} | managed-only, design-reviewed (#3): in-memory FS for tests (mock_env idea), crash simulation |
 | `Env/UnixNative.cs` | 431 | env/io_posix.cc, env/fs_posix.cc | managed-only, design-reviewed (#3): P/Invoke (fdatasync, fsync dir, OFD locks, preadv2/pwritev2) |
 | `LazyWideColumns.cs` | 483 | include/rocksdb/lazy_wide_columns.h, db/wide/lazy_wide_columns.cc, db/wide/read_path_blob_resolver.cc | line-by-line (feature audit: user features (wide-column APIs)) |
@@ -230,7 +233,7 @@ changes there need their own review.
 | `Monitoring/Statistics.cs` | 456 | include/rocksdb/statistics.h, monitoring/statistics.cc, monitoring/histogram.cc | line-by-line (feature audit: user features (statistics)) |
 | `Monitoring/StatisticsNames.g.cs` | 1075 | monitoring/statistics.cc, include/rocksdb/statistics.h | line-by-line (feature audit: user features (statistics; generated from TickersNameMap)) |
 | `MultiGetBatch.cs` | 332 | db/db_impl/db_impl.cc (MultiGet key context), table/multiget_context.h | line-by-line (feature audit: UDT / MultiGet) |
-| `Options/BlockBasedTableOptions.cs` | 125 | include/rocksdb/table.h, table/block_based/block_based_table_factory.cc | line-by-line (#1) |
+| `Options/BlockBasedTableOptions.cs` | 234 | include/rocksdb/table.h, table/block_based/block_based_table_factory.cc | line-by-line (#1); user_defined_index_factory / index_mode / legacy UDI booleans: line-by-line (feature audit: utilities) |
 | `Options/ColumnFamilyOptions.cs` | 400 | include/rocksdb/options.h, options/cf_options.cc | line-by-line (#3): defaults vs advanced_options.h/options.h; **fixed** compaction_options_* persistence; compaction-features pass: sst_partitioner_factory object, target_file_size_is_upper_bound |
 | `Options/CompactionStyleOptions.cs` | 240 | include/rocksdb/advanced_options.h, options/cf_options.cc, include/rocksdb/universal_compaction.h | line-by-line (#3): universal_compaction.h / advanced_options.h defaults; **fixed** OPTIONS struct; compaction-features pass: every member typed (FileTemperatureAge vector format) |
 | `Options/CompressionOptions.cs` | 57 | include/rocksdb/advanced_compression.h | line-by-line (#3): defaults vs advanced_compression.h |
@@ -308,6 +311,10 @@ changes there need their own review.
 | `Util/Hash.cs` | 225 | util/hash.h, util/hash.cc, util/fastrange.h | line-by-line (#1) |
 | `Util/HashXxph3.cs` | 274 | util/xxph3.h | line-by-line (#1) |
 | `Util/PooledBufferWriter.cs` | 123 | (std::string buffers) | managed-only, design-reviewed (#3): std::string buffers |
+| `Utilities/Debug/KeyVersions.cs` | 165 | include/rocksdb/utilities/debug.h (KeyVersion), utilities/debug.cc (value_type_string_map) | line-by-line (feature audit: utilities) |
+| `Utilities/InfoLogFinder.cs` | 72 | include/rocksdb/utilities/info_log_finder.h, utilities/convenience/info_log_finder.cc, file/filename.cc (GetInfoLogFiles) | line-by-line (feature audit: utilities) |
+| `Utilities/MemoryUtil.cs` | 91 | include/rocksdb/utilities/memory_util.h, utilities/memory/memory_util.cc | line-by-line (feature audit: utilities) |
+| `Utilities/OptionChangeMigration.cs` | 233 | include/rocksdb/utilities/option_change_migration.h, utilities/option_change_migration/option_change_migration.cc | line-by-line (feature audit: utilities) |
 | `Utilities/Backup/BackupEngine.cs` | 383 | utilities/backup/backup_engine.cc, include/rocksdb/utilities/backup_engine.h | line-by-line (feature audit: errors/listeners/backups) |
 | `Utilities/Backup/BackupEngineOptions.cs` | 215 | include/rocksdb/utilities/backup_engine.h | line-by-line (feature audit: errors/listeners/backups (+ #3 defaults)) |
 | `Utilities/Backup/BackupEngineReadOnly.cs` | 798 | include/rocksdb/utilities/backup_engine.h, utilities/backup/backup_engine.cc | line-by-line (feature audit: errors/listeners/backups) |
@@ -321,13 +328,14 @@ changes there need their own review.
 | `Utilities/Transactions/LockTracker.cs` | 194 | utilities/transactions/lock/point/point_lock_tracker.h, utilities/transactions/lock/point/point_lock_tracker.cc | line-by-line (feature audit: transactions) |
 | `Utilities/Transactions/OptimisticTransactionDatabase.cs` | 257 | utilities/transactions/optimistic_transaction_db_impl.cc, utilities/transactions/optimistic_transaction.cc | line-by-line (feature audit: transactions) |
 | `Utilities/Transactions/PessimisticTransaction.cs` | 671 | utilities/transactions/pessimistic_transaction.cc | line-by-line (feature audit: transactions) |
-| `Utilities/Transactions/PointLockManager.cs` | 465 | utilities/transactions/lock/point/point_lock_manager.cc | line-by-line (feature audit: transactions) |
+| `Utilities/Transactions/PointLockManager.cs` | 662 | utilities/transactions/lock/point/point_lock_manager.cc | line-by-line (feature audit: transactions); custom mutex path (AcquireWithTimeout / UnLock over TransactionDBMutex): line-by-line (feature audit: utilities) |
 | `Utilities/Transactions/RangeLockManager.cs` | 361 | include/rocksdb/utilities/transaction_db.h (RangeLockManagerHandle), utilities/transactions/lock/range/range_lock_manager.h, utilities/transactions/lock/range/range_tree/range_tree_lock_manager.{h,cc} | line-by-line (feature audit: transactions (range locking)) |
 | `Utilities/Transactions/RangeLockTree.cs` | 861 | utilities/transactions/lock/range/range_tree/range_tree_lock_tracker.cc, lib/locktree/{locktree,lock_request,manager,keyrange,treenode,concurrent_tree,wfg,range_buffer}.cc | line-by-line (feature audit: transactions (range locking)) |
 | `Utilities/Transactions/RangeLockTypes.cs` | 57 | include/rocksdb/utilities/transaction.h (Endpoint), include/rocksdb/utilities/transaction_db.h (RangeLockInfo, RangeDeadlockInfo/Path, Counters) | line-by-line (feature audit: transactions (range locking)) |
 | `Utilities/Transactions/RocksDatabase.Transactions.cs` | 9 | (API glue) | managed-only, design-reviewed (#3): API glue |
 | `Utilities/Transactions/Transaction.cs` | 679 | include/rocksdb/utilities/transaction.h, utilities/transactions/transaction_base.cc | line-by-line (feature audit: transactions) |
 | `Utilities/Transactions/Transaction.Entities.cs` | 286 | include/rocksdb/utilities/transaction.h, utilities/transactions/transaction_base.cc (PutEntity, GetEntity, MultiGetEntity, GetEntityForUpdate, NewMultiCfIterator), pessimistic_transaction.cc (WriteCommittedTxn::GetEntityForUpdate) | line-by-line (feature audit: transactions (entities)) |
+| `Utilities/Transactions/TransactionDbMutex.cs` | 170 | include/rocksdb/utilities/transaction_db_mutex.h, utilities/transactions/transaction_db_mutex_impl.cc | line-by-line (feature audit: utilities) |
 | `Utilities/Transactions/TransactionDatabase.cs` | 347 | utilities/transactions/pessimistic_transaction_db.cc | line-by-line (feature audit: transactions) |
 | `Utilities/Transactions/TransactionIterator.cs` | 74 | utilities/write_batch_with_index (BaseDeltaIterator adapter) | managed-only, design-reviewed (#3): adapter over BaseDeltaIterator |
 | `Utilities/Transactions/TransactionMultiCfIterator.cs` | 268 | db/multi_cf_iterator_impl.h, db/coalescing_iterator.cc, db/attribute_group_iterator_impl.cc (over transaction iterators) | line-by-line (feature audit: transactions (entities)) |

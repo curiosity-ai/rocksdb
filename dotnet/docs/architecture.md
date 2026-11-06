@@ -115,6 +115,12 @@ Paths on the left are relative to the repository root (C++). Paths on the right 
 | `db/read_callback.h`, `db/snapshot_checker.h`, `db/pre_release_callback.h` | `Db/ReadCallback.cs` (`ReadCallback`, `SnapshotChecker`, `IPreReleaseCallback`, `SeqPerBatchHooks`) |
 | `utilities/write_batch_with_index/*` | `Utilities/WriteBatchWithIndex/*` |
 | `utilities/backup/backup_engine.cc` | `Utilities/Backup/*` |
+| `transaction_db_mutex.h`, `transaction_db_mutex_impl.cc` | `Utilities/Transactions/TransactionDbMutex.cs` (`TransactionDbOptions.CustomMutexFactory`; the point lock manager uses it instead of its built-in stripe locks when set) |
+| `utilities/debug.cc` | `Db/DbImpl.Debug.cs`, `Utilities/Debug/KeyVersions.cs` (`GetAllKeyVersions` into a pooled `KeyVersionCollection`) |
+| `utilities/option_change_migration/*` | `Utilities/OptionChangeMigration.cs` |
+| `utilities/memory/memory_util.cc` | `Utilities/MemoryUtil.cs` |
+| `utilities/convenience/info_log_finder.cc` | `Utilities/InfoLogFinder.cs` |
+| `utilities/env_mirror.cc` | `Env/MirrorFileSystem.cs` (an `IFileSystem` over two file systems that fails on any disagreement; testing utility) |
 
 ## Threading and async model
 
@@ -283,7 +289,8 @@ verified with `[MemoryDiagnoser]` and the benchmark runner's allocated-bytes-per
 | `ColumnFamilyHandle*` parameter on every call | the `ColumnFamily` object is the receiver; `RocksDatabase` methods act on the default column family | no defaulted or nullable column family parameters |
 | defaulted arguments, `Options` structs passed by value | explicit overloads; options are classes with readable properties (`GetDBOptions()`, `ColumnFamily.Options`) | no hidden behavior; options can be inspected after open |
 | string-typed option values, `CreateFromString` | C# enums and typed objects (`FilterPolicy`, `Comparator`, `MergeOperator`, `CompactionFilter`, `SliceTransform`, `BlockCache`); strings only in OPTIONS files and `SetOptions(name, value)` | compile-time checking; the persisted text stays byte-identical |
-| `Env` / `FileSystem` | `IFileSystem` (`LocalFileSystem`, `MemoryFileSystem` with crash simulation) | async-first file contracts |
+| `Env` / `FileSystem` | `IFileSystem` (`LocalFileSystem`, `MemoryFileSystem` with crash simulation, `MirrorFileSystem` = EnvMirror) | async-first file contracts |
+| `TransactionDBMutex` / `TransactionDBCondVar` (blocking) | built-in stripe locks with `TaskCompletionSource` waiters (async waits); a custom `TransactionDbMutexFactory` switches the stripes to the blocking upstream algorithm | async lock waits by default; custom factories keep upstream semantics |
 | `rocksdb::DB` | `RocksDatabase` | a class named `RocksDb` would clash with the `RocksDb.Managed` namespace |
 | `Version`, `ValueType` | `Db.DbVersion` (internal), `Db.EntryType` | avoid clashing with `System.Version` / `System.ValueType` |
 | `TEST_SYNC_POINT` | `Db/TestHooks.cs` | deterministic concurrency tests |
