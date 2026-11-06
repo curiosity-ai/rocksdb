@@ -808,13 +808,44 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
     /// <summary>Async <see cref="Finish"/>.</summary>
     public override async ValueTask FinishAsync(CancellationToken cancellationToken = default)
     {
-        FinishCore();
+        using var metaIndex = new MetaIndexBuilder();
+        BlockHandle indexHandle = FinishHead(metaIndex);
+        if (FinishRangeDelBlock() >= OutputFlushThreshold)
+        {
+            // A large range-del block goes to the file directly instead of through the staging buffer (see
+            // WriteRangeDelBlock).
+            await DrainOutputAsync(cancellationToken).ConfigureAwait(false);
+            await _file.AppendAsync(_rangeDelBlock.ContentsMemory, cancellationToken).ConfigureAwait(false);
+            metaIndex.Add(BlockBasedTableConstants.RangeDelBlockName, WriteTrailerOfAppendedBlock(_rangeDelBlock.Contents));
+        }
+        else if (!_rangeDelBlock.IsEmpty)
+        {
+            metaIndex.Add(BlockBasedTableConstants.RangeDelBlockName, WriteMaybeCompressedBlock(_rangeDelBlock.Contents, CompressionType.None));
+        }
+        FinishTail(metaIndex, indexHandle);
         await DrainOutputAsync(cancellationToken).ConfigureAwait(false);
         await _file.FlushAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Port of BlockBasedTableBuilder::Finish (meta block order: filter, index, [dict], range del, properties, metaindex, footer).</summary>
     private void FinishCore()
+    {
+        using var metaIndex = new MetaIndexBuilder();
+        BlockHandle indexHandle = FinishHead(metaIndex);
+        WriteRangeDelBlock(metaIndex);
+        FinishTail(metaIndex, indexHandle);
+    }
+
+    /// <summary>The meta blocks after the range-del block: properties, metaindex, footer.</summary>
+    private void FinishTail(MetaIndexBuilder metaIndex, BlockHandle indexHandle)
+    {
+        WritePropertiesBlock(metaIndex);
+        BlockHandle metaindexHandle = WriteMaybeCompressedBlock(metaIndex.Finish(), CompressionType.None);
+        WriteFooter(metaindexHandle, indexHandle);
+    }
+
+    /// <summary>The remaining data blocks and the meta blocks before the range-del block (filter, index, dictionary).</summary>
+    private BlockHandle FinishHead(MetaIndexBuilder metaIndex)
     {
         if (_closed) throw new InvalidOperationException("Table builder already finished.");
         Flush(default, hasNext: false);
@@ -824,14 +855,10 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         _closed = true;
         _props.TailStartOffset = _offset;
 
-        using var metaIndex = new MetaIndexBuilder();
         WriteFilterBlock(metaIndex);
         BlockHandle indexHandle = WriteIndexBlock(metaIndex);
         WriteCompressionDictBlock(metaIndex);
-        WriteRangeDelBlock(metaIndex);
-        WritePropertiesBlock(metaIndex);
-        BlockHandle metaindexHandle = WriteMaybeCompressedBlock(metaIndex.Finish(), CompressionType.None);
-        WriteFooter(metaindexHandle, indexHandle);
+        return indexHandle;
     }
 
     /// <summary>Port of BlockBasedTableBuilder::WriteFilterBlock (full filter, or filter partitions + partition index).</summary>
@@ -927,8 +954,43 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
     private void WriteRangeDelBlock(MetaIndexBuilder metaIndex)
     {
         if (_rangeDelBlock.IsEmpty) return;
-        BlockHandle h = WriteMaybeCompressedBlock(_rangeDelBlock.Finish(), CompressionType.None);
+        ReadOnlySpan<byte> contents = _rangeDelBlock.Finish();
+        BlockHandle h;
+        if (contents.Length >= OutputFlushThreshold)
+        {
+            // A range-del block can be much larger than the data blocks (one entry per tombstone, uncompressed): staging
+            // it in _out would grow that buffer past the table builder pool's largest size class on every such file.
+            // Write it to the file directly; only the trailer goes through _out.
+            DrainOutput();
+            _file.Append(contents);
+            h = WriteTrailerOfAppendedBlock(contents);
+        }
+        else
+        {
+            h = WriteMaybeCompressedBlock(contents, CompressionType.None);
+        }
         metaIndex.Add(BlockBasedTableConstants.RangeDelBlockName, h);
+    }
+
+    /// <summary>Finishes the range-del block (if any); returns its size (0 when empty).</summary>
+    private int FinishRangeDelBlock() => _rangeDelBlock.IsEmpty ? 0 : _rangeDelBlock.Finish().Length;
+
+    /// <summary>
+    /// The WriteMaybeCompressedBlockImpl trailer (type kNoCompression, checksum with context) of an uncompressed meta
+    /// block whose <paramref name="contents"/> were just appended to the file directly, after draining <c>_out</c>.
+    /// </summary>
+    private BlockHandle WriteTrailerOfAppendedBlock(ReadOnlySpan<byte> contents)
+    {
+        System.Diagnostics.Debug.Assert(_out.WrittenCount == 0);
+        var handle = new BlockHandle(_offset, (ulong)contents.Length);
+        _compressionTypesUsed |= 1u << (int)CompressionType.None;
+        Span<byte> trailer = _out.GetSpan(BlockBasedTableConstants.BlockTrailerSize);
+        trailer[0] = (byte)CompressionType.None;
+        Coding.EncodeFixed32(trailer[1..], BlockChecksum.ComputeTrailerChecksum(_options.Checksum, _baseContextChecksum, contents,
+            (byte)CompressionType.None, _offset));
+        _out.Advance(BlockBasedTableConstants.BlockTrailerSize);
+        _offset += (ulong)contents.Length + BlockBasedTableConstants.BlockTrailerSize;
+        return handle;
     }
 
     /// <summary>Port of TimestampTablePropertiesCollector::InternalAdd (db/table_properties_collector.h).</summary>
