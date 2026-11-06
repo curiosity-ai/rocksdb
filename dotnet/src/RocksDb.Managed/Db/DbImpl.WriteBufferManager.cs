@@ -72,6 +72,7 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
         // Writers of all DBs using the manager stall once memory usage exceeds the limit; the current write too.
         if (wbm.ShouldStall())
         {
+            Interlocked.Increment(ref _writeStats.WriteBufferManagerLimitStops); // kIntStatsWriteBufferManagerLimitStopsCounts
             if (noSlowdown) throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Write stall");
             await WriteBufferManagerStallWritesAsync(synchronous, cancellationToken).ConfigureAwait(false);
         }

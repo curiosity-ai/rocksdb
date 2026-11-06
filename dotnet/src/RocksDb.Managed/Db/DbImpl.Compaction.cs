@@ -329,6 +329,7 @@ internal sealed partial class DbImpl
         else
         {
             state.Stall.Recalculate(wc, cfd.NumNotFlushed, cfd.Current.Storage, cfd.Options);
+            cfd.Stats.AddWriteStall(state.Stall.Cause, state.Stall.Condition, state.Picker.IsLevel0CompactionInProgress);
             _stallTokenHolders.Add(cfd);
             MaybeEnqueueStallNotification(cfd, previous, state.Stall.Condition);
         }

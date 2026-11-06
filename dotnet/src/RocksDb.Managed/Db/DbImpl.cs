@@ -393,6 +393,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 case DbProperties.EstimateNumKeys:
                     return EstimateNumKeys(sv).ToString(CultureInfo.InvariantCulture);
                 case DbProperties.TotalSstFilesSize:
+                    // ColumnFamilyData::GetTotalSstFilesSize: the distinct files of every live version (incl. versions
+                    // pinned by iterators or snapshots of the file set), not only the current one.
+                    lock (_mutex) return cfd.AllVersionsSstFilesSize.ToString(CultureInfo.InvariantCulture);
                 case DbProperties.LiveSstFilesSize:
                     {
                         ulong n = 0;
@@ -409,7 +412,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
             if (property.StartsWith(DbProperties.NumFilesAtLevelPrefix, StringComparison.Ordinal)
                 && int.TryParse(property.AsSpan(DbProperties.NumFilesAtLevelPrefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out int level))
             {
-                return level < sv.Current.Storage.NumLevels ? sv.Current.Storage.NumLevelFiles(level).ToString(CultureInfo.InvariantCulture) : "0";
+                // HandleNumFilesAtLevel: a level at or beyond num_levels is not a property (returns false).
+                return level < sv.Current.Storage.NumLevels ? sv.Current.Storage.NumLevelFiles(level).ToString(CultureInfo.InvariantCulture) : null;
             }
             return null;
         }
@@ -660,14 +664,15 @@ internal sealed partial class DbImpl : IAsyncDisposable
         foreach (ObsoleteTableFile t in tables)
         {
             t.Cfd.TableCache.Evict(t.Meta.FileNumber);
-            DeleteObsoleteTableFile(FileNames.TableFileName(DbPaths, t.Meta.FileNumber, t.Meta.PathId));
+            DeleteObsoleteTableFile(FileNames.TableFileName(DbPaths, t.Meta.FileNumber, t.Meta.PathId), t.Meta.FileNumber);
         }
         foreach (ObsoleteBlobFile b in blobs)
         {
             // The SharedBlobFileMetaData deleter: evict the reader, then delete the file (AddObsoleteBlobFile).
             b.Cfd.BlobSource.Evict(b.BlobFileNumber);
             b.Cfd.BlobDirectWrite?.Forget(b.BlobFileNumber);
-            DeleteDbFile(FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber), DbPaths[0]);
+            Exception? failure = DeleteDbFile(FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber), DbPaths[0]);
+            LogFileDeletionEvent("blob_file_deletion", 0, b.BlobFileNumber, failure); // EventHelpers::LogAndNotifyBlobFileDeletion
         }
         if (releasedBlobs is not null)
         {

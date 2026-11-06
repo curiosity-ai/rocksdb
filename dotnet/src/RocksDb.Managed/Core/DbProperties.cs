@@ -118,6 +118,51 @@ public static class DbProperties
     /// <summary>The Statistics text, if statistics are enabled (kOptionsStatistics).</summary>
     public const string OptionsStatistics = "rocksdb.options-statistics";
 
+    /// <summary>
+    /// "rocksdb.compression-ratio-at-level&lt;N&gt;" prefix (kCompressionRatioAtLevelPrefix): uncompressed (raw key +
+    /// value) bytes over file bytes of the files at level N whose table properties were loaded, -1 if none.
+    /// </summary>
+    public const string CompressionRatioAtLevelPrefix = "rocksdb.compression-ratio-at-level";
+    /// <summary>Write stall counts of the column family by cause (kCFWriteStallStats); map form via GetMapProperty.</summary>
+    public const string CfWriteStallStats = "rocksdb.cf-write-stall-stats";
+    /// <summary>DB-wide write stall counts (WriteBufferManager stops; kDBWriteStallStats); map form via GetMapProperty.</summary>
+    public const string DbWriteStallStats = "rocksdb.db-write-stall-stats";
+    /// <summary>
+    /// Like <see cref="BlockCacheEntryStats"/> but returns the last collected stats unless they are more than 3 minutes
+    /// old (kFastBlockCacheEntryStats); <see cref="BlockCacheEntryStats"/> collects again when they are older than 10 s.
+    /// </summary>
+    public const string FastBlockCacheEntryStats = "rocksdb.fast-block-cache-entry-stats";
+    /// <summary>Flushed memtables kept in memory as history (max_write_buffer_size_to_maintain; kNumImmutableMemTableFlushed).</summary>
+    public const string NumImmutableMemTableFlushed = "rocksdb.num-immutable-mem-table-flushed";
+    /// <summary>Running remote (CompactionService) compactions (kNumRunningRemoteCompactions).</summary>
+    public const string NumRunningRemoteCompactions = "rocksdb.num-running-remote-compactions";
+    /// <summary>Running compactions on the bottom-priority pool (kNumRunningBottomCompactions).</summary>
+    public const string NumRunningBottomCompactions = "rocksdb.num-running-bottom-compactions";
+    /// <summary>Sorted runs (L0 files and non-empty levels) read by the running compactions (kNumRunningCompactionSortedRuns).</summary>
+    public const string NumRunningCompactionSortedRuns = "rocksdb.num-running-compaction-sorted-runs";
+    /// <summary>Outstanding AbortAllCompactions calls (kCompactionAbortCount); always 0, AbortAllCompactions is not ported.</summary>
+    public const string CompactionAbortCount = "rocksdb.compaction-abort-count";
+    /// <summary>Column families queued for an automatic compaction that is not scheduled yet (kNumUnscheduledCompactions).</summary>
+    public const string NumUnscheduledCompactions = "rocksdb.num-unscheduled-compactions";
+    /// <summary>1 if obsolete files are deleted, 0 while DisableFileDeletions is in effect (kIsFileDeletionsEnabled).</summary>
+    public const string IsFileDeletionsEnabled = "rocksdb.is-file-deletions-enabled";
+    /// <summary>The minimum WAL number to keep, from the MANIFEST (kMinLogNumberToKeep).</summary>
+    public const string MinLogNumberToKeep = "rocksdb.min-log-number-to-keep";
+    /// <summary>The smallest table file number being written; 2^64-1 when none (kMinObsoleteSstNumberToKeep).</summary>
+    public const string MinObsoleteSstNumberToKeep = "rocksdb.min-obsolete-sst-number-to-keep";
+    /// <summary>Total size of table files no longer referenced by any version, not yet deleted (kObsoleteSstFilesSize).</summary>
+    public const string ObsoleteSstFilesSize = "rocksdb.obsolete-sst-files-size";
+    /// <summary>
+    /// Estimated unix time of the oldest key (kEstimateOldestKeyTime); only for FIFO compaction without
+    /// allow_compaction (null otherwise or when unknown).
+    /// </summary>
+    public const string EstimateOldestKeyTime = "rocksdb.estimate-oldest-key-time";
+    /// <summary>
+    /// "rocksdb.live-sst-files-size-at-temperature&lt;T&gt;" prefix (kLiveSstFilesSizeAtTemperature): total size of the
+    /// current version's files with the numeric <see cref="Temperature"/> T.
+    /// </summary>
+    public const string LiveSstFilesSizeAtTemperaturePrefix = "rocksdb.live-sst-files-size-at-temperature";
+
     /// <summary>"rocksdb.num-files-at-level&lt;level&gt;": number of files at <paramref name="level"/>.</summary>
     public static string NumFilesAtLevel(int level)
     {

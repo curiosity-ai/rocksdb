@@ -158,10 +158,11 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>Deletes an obsolete table file and reports it to the listeners (DeleteObsoleteFileImpl).</summary>
-    private void DeleteObsoleteTableFile(string path)
+    private void DeleteObsoleteTableFile(string path, ulong fileNumber)
     {
         // DeleteDBFile: through the SstFileManager (trash + rate limit) when there is one.
         Exception? failure = DeleteDbFile(path, Path.GetDirectoryName(path) ?? DbName);
+        LogFileDeletionEvent("table_file_deletion", 0, fileNumber, failure);
         if (HasListeners) NotifyOnTableFileDeleted(path, 0, failure);
     }
 

@@ -195,6 +195,92 @@ internal sealed partial class DbImpl
             case DbProperties.OptionsStatistics:
                 value = Stats?.ToString();
                 return true;
+            case DbProperties.CfWriteStallStats:
+                value = cfd.Stats.DumpWriteStall();
+                return true;
+            case DbProperties.DbWriteStallStats:
+                value = _writeStats.DumpWriteStall();
+                return true;
+            case DbProperties.BlockCacheEntryStats:
+            case DbProperties.FastBlockCacheEntryStats:
+                {
+                    Cache.BlockCache? cache = BlockCacheOf(cfd);
+                    value = cache is null ? null : CacheEntryRoleStats.Collect(cache, fast: property == DbProperties.FastBlockCacheEntryStats).ToString();
+                    return true;
+                }
+            case DbProperties.NumImmutableMemTableFlushed:
+                lock (_mutex) value = cfd.History.Count.ToString(CultureInfo.InvariantCulture);
+                return true;
+            case DbProperties.NumRunningRemoteCompactions:
+                value = NumRunningRemoteCompactions.ToString(CultureInfo.InvariantCulture);
+                return true;
+            case DbProperties.NumRunningBottomCompactions:
+                lock (_mutex) value = _bgBottomCompactionRunning.ToString(CultureInfo.InvariantCulture);
+                return true;
+            case DbProperties.NumRunningCompactionSortedRuns:
+                lock (_mutex) value = NumRunningCompactionSortedRunsLocked().ToString(CultureInfo.InvariantCulture);
+                return true;
+            case DbProperties.CompactionAbortCount:
+                // compaction_aborted_: AbortAllCompactions / ResumeAllCompactions are not ported, so it never leaves 0.
+                value = "0";
+                return true;
+            case DbProperties.NumUnscheduledCompactions:
+                lock (_mutex) value = _compactionQueue.Count.ToString(CultureInfo.InvariantCulture);
+                return true;
+            case DbProperties.IsFileDeletionsEnabled:
+                value = IsFileDeletionsEnabled ? "1" : "0";
+                return true;
+            case DbProperties.MinLogNumberToKeep:
+                // DBImpl::MinLogNumberToKeep = versions_->min_log_number_to_keep().
+                lock (_mutex) value = Versions.MinLogNumberToKeep.ToString(CultureInfo.InvariantCulture);
+                return true;
+            case DbProperties.MinObsoleteSstNumberToKeep:
+                {
+                    // DBImpl::MinObsoleteSstNumberToKeep: the smallest pending output, else uint64 max.
+                    ulong min = ulong.MaxValue;
+                    lock (_mutex)
+                    {
+                        foreach (ulong n in _pendingOutputs) min = Math.Min(min, n);
+                    }
+                    value = min.ToString(CultureInfo.InvariantCulture);
+                    return true;
+                }
+            case DbProperties.ObsoleteSstFilesSize:
+                lock (_mutex) value = Versions.ObsoleteSstFilesSize.ToString(CultureInfo.InvariantCulture);
+                return true;
+            case DbProperties.EstimateOldestKeyTime:
+                value = EstimateOldestKeyTime(cfd, sv) is ulong t ? t.ToString(CultureInfo.InvariantCulture) : null;
+                return true;
+        }
+        const string compressionRatio = DbProperties.CompressionRatioAtLevelPrefix;
+        if (property.StartsWith(compressionRatio, StringComparison.Ordinal))
+        {
+            // HandleCompressionRatioAtLevelPrefix: std::to_string(GetEstimatedCompressionRatioAtLevel(level)).
+            value = TryParseLevel(property.AsSpan(compressionRatio.Length), sv, out int ratioLevel)
+                ? Statistics.Fixed6(EstimatedCompressionRatioAtLevel(sv.Current.Storage, ratioLevel))
+                : null;
+            return true;
+        }
+        const string atTemperature = DbProperties.LiveSstFilesSizeAtTemperaturePrefix;
+        if (property.StartsWith(atTemperature, StringComparison.Ordinal))
+        {
+            // HandleLiveSstFilesSizeAtTemperature: any decimal number, compared with the temperature's byte value.
+            if (!ulong.TryParse(property.AsSpan(atTemperature.Length), NumberStyles.None, CultureInfo.InvariantCulture, out ulong temperature))
+            {
+                value = null;
+                return true;
+            }
+            ulong size = 0;
+            VersionStorageInfo vs = sv.Current.Storage;
+            for (int l = 0; l < vs.NumLevels; l++)
+            {
+                foreach (FileMetaData f in vs.LevelFilesArray(l))
+                {
+                    if ((byte)f.Temperature == temperature) size += f.FileSize;
+                }
+            }
+            value = size.ToString(CultureInfo.InvariantCulture);
+            return true;
         }
         const string aggregatedAtLevel = DbProperties.AggregatedTablePropertiesAtLevelPrefix;
         if (property.StartsWith(aggregatedAtLevel, StringComparison.Ordinal)
@@ -205,6 +291,91 @@ internal sealed partial class DbImpl
         }
         value = null;
         return false;
+    }
+
+    /// <summary>ConsumeDecimalNumber(&amp;suffix, &amp;level) &amp;&amp; suffix.empty() &amp;&amp; level &lt; number_levels_.</summary>
+    private static bool TryParseLevel(ReadOnlySpan<char> suffix, SuperVersion sv, out int level)
+    {
+        level = 0;
+        if (!ulong.TryParse(suffix, NumberStyles.None, CultureInfo.InvariantCulture, out ulong l) || l >= (ulong)sv.Current.Storage.NumLevels) return false;
+        level = (int)l;
+        return true;
+    }
+
+    /// <summary>
+    /// Port of VersionStorageInfo::GetEstimatedCompressionRatioAtLevel: raw key + value bytes over file bytes of the
+    /// files whose entry stats are loaded; -1 when there are none.
+    /// </summary>
+    private static double EstimatedCompressionRatioAtLevel(VersionStorageInfo s, int level)
+    {
+        ulong sumFileSize = 0, sumDataSize = 0;
+        foreach (FileMetaData f in s.LevelFilesArray(level))
+        {
+            ulong raw = f.RawKeySize + f.RawValueSize;
+            // Check if the table property is properly initialized. It might not be because in UpdateAccumulatedStats
+            // we limit the maximum number of properties to read once.
+            if (raw > 0)
+            {
+                sumFileSize += f.FileSize;
+                sumDataSize += raw;
+            }
+        }
+        if (sumFileSize == 0) return -1.0;
+        return (double)sumDataSize / sumFileSize;
+    }
+
+    /// <summary>
+    /// InternalStats::NumRunningCompactionSortedRuns: upstream's CompactionMergingIterator adds its number of children
+    /// (one per L0 file, one per other input level) while it exists. Here: the same count over the registered, not
+    /// trivially moved compactions of every column family. REQUIRES: mutex.
+    /// </summary>
+    private ulong NumRunningCompactionSortedRunsLocked()
+    {
+        ulong runs = 0;
+        foreach (ColumnFamilyData c in Versions.ColumnFamilies)
+        {
+            if (c.Dropped) continue;
+            foreach (Compaction comp in c.CompactionState.Picker.CompactionsInProgress)
+            {
+                if (comp.IsTrivialMove()) continue;
+                for (int i = 0; i < comp.NumInputLevels; i++)
+                {
+                    int n = comp.Inputs(i).Files.Count;
+                    if (n == 0) continue;
+                    runs += comp.Level(i) == 0 ? (ulong)n : 1;
+                }
+            }
+        }
+        return runs;
+    }
+
+    /// <summary>
+    /// Port of InternalStats::HandleEstimateOldestKeyTime: only for FIFO compaction without allow_compaction (oldest
+    /// key times are not propagated by compactions); the minimum oldest_key_time of the tables, then of the memtables.
+    /// Null when unavailable or unknown (a table without the property, or no data).
+    /// </summary>
+    private static ulong? EstimateOldestKeyTime(ColumnFamilyData cfd, SuperVersion sv)
+    {
+        if (cfd.Options.CompactionStyle != CompactionStyle.Fifo || cfd.Options.CompactionOptionsFifo.AllowCompaction) return null;
+        ulong value = ulong.MaxValue;
+        VersionStorageInfo s = sv.Current.Storage;
+        for (int l = 0; l < s.NumLevels && value != 0; l++)
+        {
+            foreach (FileMetaData f in s.LevelFilesArray(l))
+            {
+                using TableReaderLease lease = cfd.TableCache.GetReader(f);
+                value = Math.Min(value, lease.Reader.Properties.OldestKeyTime);
+                if (value == 0) break;
+            }
+        }
+        if (value > 0)
+        {
+            ulong imm = ulong.MaxValue;
+            // MemTableList::ApproximateOldestKeyTime: the oldest unflushed immutable memtable.
+            if (sv.Imm.Length > 0) imm = sv.Imm[^1].ApproximateOldestKeyTime; // newest first
+            value = Math.Min(Math.Min(sv.Mem.ApproximateOldestKeyTime, imm), value);
+        }
+        return value > 0 && value < ulong.MaxValue ? value : null;
     }
 
     internal Cache.BlockCache? BlockCacheOf(ColumnFamilyData cfd) =>
@@ -236,32 +407,18 @@ internal sealed partial class DbImpl
                 case DbProperties.CfStats:
                     return cfd.Stats.ToMap(sv.Current.Storage);
                 case DbProperties.DbStats:
-                    {
-                        DbWriteStats w = _writeStats;
-                        return new Dictionary<string, string>(StringComparer.Ordinal)
-                        {
-                            ["db.wal_bytes"] = Interlocked.Read(ref w.WalFileBytes).ToString(CultureInfo.InvariantCulture),
-                            ["db.wal_syncs"] = Interlocked.Read(ref w.WalFileSynced).ToString(CultureInfo.InvariantCulture),
-                            ["db.user_bytes_written"] = Interlocked.Read(ref w.BytesWritten).ToString(CultureInfo.InvariantCulture),
-                            ["db.user_keys_written"] = Interlocked.Read(ref w.NumKeysWritten).ToString(CultureInfo.InvariantCulture),
-                            ["db.user_writes_by_self"] = Interlocked.Read(ref w.WriteDoneBySelf).ToString(CultureInfo.InvariantCulture),
-                            ["db.user_writes_by_other"] = Interlocked.Read(ref w.WriteDoneByOther).ToString(CultureInfo.InvariantCulture),
-                            ["db.user_writes_with_wal"] = Interlocked.Read(ref w.WriteWithWal).ToString(CultureInfo.InvariantCulture),
-                            ["db.user_write_stall_micros"] = Interlocked.Read(ref w.WriteStallMicros).ToString(CultureInfo.InvariantCulture),
-                        };
-                    }
+                    return _writeStats.ToMap();
+                case DbProperties.CfWriteStallStats:
+                    return new Dictionary<string, string>(cfd.Stats.WriteStallMap(), StringComparer.Ordinal);
+                case DbProperties.DbWriteStallStats:
+                    return new Dictionary<string, string>(_writeStats.WriteStallMap(), StringComparer.Ordinal);
                 case DbProperties.AggregatedTableProperties:
                     return TablePropertiesToMap(AggregateTableProperties(cfd, sv.Current, -1));
                 case DbProperties.BlockCacheEntryStats:
+                case DbProperties.FastBlockCacheEntryStats:
                     {
                         Cache.BlockCache? cache = BlockCacheOf(cfd);
-                        if (cache is null) return null;
-                        return new Dictionary<string, string>(StringComparer.Ordinal)
-                        {
-                            ["capacity"] = cache.Capacity.ToString(CultureInfo.InvariantCulture),
-                            ["usage"] = cache.Usage.ToString(CultureInfo.InvariantCulture),
-                            ["pinned_usage"] = cache.PinnedUsage.ToString(CultureInfo.InvariantCulture),
-                        };
+                        return cache is null ? null : CacheEntryRoleStats.Collect(cache, fast: property == DbProperties.FastBlockCacheEntryStats).ToMap();
                     }
             }
             const string aggregatedAtLevel = DbProperties.AggregatedTablePropertiesAtLevelPrefix;

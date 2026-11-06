@@ -226,6 +226,13 @@ internal sealed partial class DbImpl
             job.DeleteExternalLinks();
             // Replaced files (atomic_replace_range) are obsolete now.
             if (job.NumFilesReplaced > 0) PurgeObsoleteFiles();
+            if (InfoLog is not null)
+            {
+                // ExternalSstFileIngestionJob::UpdateStats: the ingest_finished event.
+                var ingested = new List<(string Path, int Level)>(job.Files.Count);
+                foreach (IngestedFileInfo f in job.Files) ingested.Add((f.InternalFilePath, f.PickedLevel));
+                LogIngestFinishedEvent(cfd, ingested);
+            }
             NotifyOnExternalFileIngested(cfd, job);
         }
         finally
