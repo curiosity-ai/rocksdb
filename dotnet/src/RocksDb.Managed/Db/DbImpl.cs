@@ -966,6 +966,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             _nonmemGroupBatch.Dispose();
             try { ShutdownMonitoring(); } catch (Exception e) when (e is IOException or RocksDbException) { }
             DisposeOwnedSstFileManager();
+            _writeControllerField?.Dispose();
             SharedTableCache.Dispose();
             _dbLock?.Dispose();
             _dbLock = null;

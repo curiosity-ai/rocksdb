@@ -363,6 +363,15 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public bool CfAllowIngestBehind { get; set; }
 
     /// <summary>
+    /// disallow_memtable_writes (advanced_options.h): ordinary writes to this column family fail with InvalidArgument
+    /// "This column family has disallow_memtable_writes=true"; it can only be populated through ingestion and import.
+    /// Not supported on the default column family (DB open fails with InvalidArgument). Not mutable with SetOptions; it
+    /// can be changed between opens, but an open fails with InvalidArgument when the WAL holds writes to a column family
+    /// that now sets it. Default false.
+    /// </summary>
+    public bool DisallowMemtableWrites { get; set; }
+
+    /// <summary>
     /// The deprecated DBOptions::allow_ingest_behind, copied in by the DB's option sanitization (not persisted in the
     /// column family section of the OPTIONS file).
     /// </summary>
@@ -516,6 +525,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .UInt32("block_protection_bytes_per_key", static o => o.BlockProtectionBytesPerKey, static (o, v) => o.BlockProtectionBytesPerKey = v)
         .Bool("persist_user_defined_timestamps", static o => o.PersistUserDefinedTimestamps, static (o, v) => o.PersistUserDefinedTimestamps = v)
         .Bool("cf_allow_ingest_behind", static o => o.CfAllowIngestBehind, static (o, v) => o.CfAllowIngestBehind = v)
+        .Bool("disallow_memtable_writes", static o => o.DisallowMemtableWrites, static (o, v) => o.DisallowMemtableWrites = v)
         .Bool("enable_blob_files", static o => o.EnableBlobFiles, static (o, v) => o.EnableBlobFiles = v)
         .UInt64("min_blob_size", static o => o.MinBlobSize, static (o, v) => o.MinBlobSize = v)
         .UInt64("blob_file_size", static o => o.BlobFileSize, static (o, v) => o.BlobFileSize = v)

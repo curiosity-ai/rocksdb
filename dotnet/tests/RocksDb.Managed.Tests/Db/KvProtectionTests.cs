@@ -116,7 +116,10 @@ public sealed class KvProtectionTests
 
     /// <summary>
     /// MemTableAddCorrupted on the parallel insert path: one entry's encoded bytes are corrupted after encoding (one
-    /// writer thread, while the others insert concurrently); exactly that write fails with Corruption, the others succeed.
+    /// writer thread, while the others insert concurrently). That write fails with Corruption and, like upstream
+    /// (DBImpl::HandleMemTableInsertFailure), the failed insert is a fatal background error with reason kMemTable: its
+    /// write group is not published (readers see none of its entries) and every later write fails. The WAL holds the
+    /// intact batch, so a reopen recovers it.
     /// </summary>
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
@@ -132,16 +135,37 @@ public sealed class KvProtectionTests
                 data[1 + ikeyLen + 1]++;
         });
         MemoryFileSystem fs = NewFs();
-        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), CfOptions());
-        List<Exception> errors = RunParallelProtectedWriters(db);
-        Assert.AreEqual(1, armed);
-        Assert.AreEqual(1, errors.Count, string.Join("\n", errors));
-        var ex = errors[0] as RocksDbException;
-        Assert.IsNotNull(ex, errors[0].ToString());
-        Assert.AreEqual(StatusCode.Corruption, ex.Code);
-        StringAssert.Contains(ex.ToString(), KvChecksum.MismatchMessage);
-        Assert.IsNull(db.Get(ParallelKey(5, 100)));
-        CollectionAssert.AreEqual(Value(99, 5), db.Get(ParallelKey(5, 99)));
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), CfOptions()))
+        {
+            List<Exception> errors = RunParallelProtectedWriters(db);
+            Assert.AreEqual(1, armed);
+            Assert.IsTrue(errors.Count >= 1);
+            int mismatches = 0;
+            foreach (Exception e in errors)
+            {
+                var ex = e as RocksDbException;
+                Assert.IsNotNull(ex, e.ToString());
+                // The failed insert itself, or a later write rejected by the background error it set.
+                Assert.AreEqual(StatusCode.Corruption, ex.Code, ex.ToString());
+                if (ex.ToString().Contains(KvChecksum.MismatchMessage, StringComparison.Ordinal)) mismatches++;
+            }
+            Assert.IsTrue(mismatches >= 1, string.Join(Environment.NewLine, errors));
+            Assert.IsNotNull(db.BackgroundError);
+            Assert.AreEqual(StatusCode.Corruption, db.BackgroundError.Code);
+            var later = Assert.ThrowsExactly<RocksDbException>(() => db.Put(B("after"), B("x")));
+            Assert.AreEqual(StatusCode.Corruption, later.Code);
+            // The group with the corrupted entry was not published.
+            Assert.IsNull(db.Get(ParallelKey(5, 100)));
+            CollectionAssert.AreEqual(Value(99, 5), db.Get(ParallelKey(5, 99)));
+        }
+        TestHooks.ClearAll();
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), CfOptions()))
+        {
+            // The WAL record is intact: recovery inserts the batch.
+            CollectionAssert.AreEqual(Value(100, 5), db.Get(ParallelKey(5, 100)));
+            CollectionAssert.AreEqual(Value(99, 5), db.Get(ParallelKey(5, 99)));
+            Assert.IsNull(db.BackgroundError);
+        }
     }
 
     private static IEnumerable<object[]> Ops()

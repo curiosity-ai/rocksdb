@@ -136,7 +136,7 @@ changes there need their own review.
 | `Db/Compaction/UniversalCompactionPicker.cs` | 680 | db/compaction/compaction_picker_universal.cc | line-by-line (compaction-features pass): whole file (read-triggered compaction, require_max_output_level and ShouldSkipLastSortedRunForSizeAmpCompaction added in the tiering pass; periodic, size amp with MightExcludeNewL0sToReduceWriteStop and incremental mode, size ratio, max_read_amp, delete-triggered, compression_size_percent) |
 | `Db/Compaction/VersionStorageInfo.Compaction.cs` | 1040 | db/version_set.cc | line-by-line (#2); #3: FIFO score / GetExpiredTtlFilesCount; compaction-features pass: blob-aware FIFO score, ShouldChangeFileTemperature, **fixed** periodic-compaction file age (file_creation_time first); completeness pass: compensated sizes, bottommost marking in ComputeCompactionScore, version cursors in SortFileByRoundRobin |
 | `Db/Compaction/VersionStorageInfo.Inherited.cs` | 354 | db/version_set.{h,cc} (UpdateAccumulatedStats, MaybeInitializeFileMetaData, ComputeCompensatedSizes, GenerateBottommostFiles, UpdateOldestSnapshot, ComputeBottommostFilesMarkedForCompaction, compact_cursor_ / GetNextCompactCursor), db/dbformat.h (BottommostSeqnoCanBeZeroed) | line-by-line (completeness pass) |
-| `Db/Compaction/WriteController.cs` | 346 | db/write_controller.{h,cc}, db/column_family.cc (RecalculateWriteStallConditions, SetupDelay, GetPendingCompactionBytesForCompactionSpeedup) | line-by-line (#2); completeness pass: **fixed** delay recovery reward, rate carried between delays, compaction-speedup thresholds |
+| `Db/Compaction/WriteController.cs` | 346 | db/write_controller.{h,cc}, db/column_family.cc (RecalculateWriteStallConditions, SetupDelay, GetPendingCompactionBytesForCompactionSpeedup) | line-by-line (#2); completeness pass: **fixed** delay recovery reward, rate carried between delays, compaction-speedup thresholds; second review: low_pri_rate_limiter |
 | `Db/CompactionFilter.cs` | 95 | include/rocksdb/compaction_filter.h | line-by-line (#3): compaction_filter.h decisions / value types |
 | `Db/DbFormat.cs` | 158 | db/dbformat.h | line-by-line (#1) |
 | `Db/DbImpl.Checkpoint.cs` | 280 | include/rocksdb/metadata.h, db/db_filesnapshot.cc, utilities/checkpoint/checkpoint_impl.cc | line-by-line (#2) |
@@ -149,7 +149,7 @@ changes there need their own review.
 | `Db/DbImpl.LazyEntity.cs` | 34 | db/db_impl/db_impl.cc (GetEntityLazyImpl / GetEntityLazyForBatch) | line-by-line (feature audit: user features (wide-column APIs)) |
 | `Db/DbImpl.Monitoring.cs` | 420 | db/event_helpers.cc | line-by-line (feature audit: user features (LOG)) |
 | `Db/DbImpl.MultiGet.cs` | 234 | db/db_impl/db_impl.cc, db/version_set.cc | line-by-line (feature audit: UDT / MultiGet (+ #3 read-sequence rule)) |
-| `Db/DbImpl.Open.cs` | 596 | db/db_impl/db_impl_open.cc | line-by-line (#2); #3: fixed WAL checksum, blob GC option validation, FIFO TTL reader preload |
+| `Db/DbImpl.Open.cs` | 596 | db/db_impl/db_impl_open.cc | line-by-line (#2); #3: fixed WAL checksum, blob GC option validation, FIFO TTL reader preload; second review: MaybeFlushFinalMemtableOrRestoreActiveLogFiles, disallow_memtable_writes on the default CF |
 | `Db/DbImpl.Options.cs` | 283 | db/db_impl/db_impl.cc, db/column_family.cc, options/cf_options.cc | line-by-line (feature audit: user features (SetOptions) (+ #3)); second review: ColumnFamilyData::ValidateOptions on the candidate, SetDBOptions (no-op, per-CF validation, SwitchWAL), SanitizeOptions (max_open_files, delayed_write_rate) |
 | `Db/DbImpl.Properties.cs` | 657 | db/internal_stats.cc, db/db_impl/db_impl.cc | line-by-line (feature audit: user features (properties)) |
 | `Db/DbImpl.Read.cs` | 477 | db/db_impl/db_impl.cc (GetImpl, NewIterator), db/version_set.cc (Version::Get) | line-by-line (#2) |
@@ -159,7 +159,7 @@ changes there need their own review.
 | `Db/DbImpl.Timestamps.cs` | 295 | db/db_impl/db_impl.h, db/db_impl/db_impl_compaction_flush.cc | line-by-line (feature audit: user-defined timestamps) |
 | `Db/DbImpl.Tracing.cs` | 119 | db/db_impl/db_impl.cc (StartTrace, EndTrace, TraceIteratorSeek*), db_impl_write.cc (WriteImpl / PipelinedWriteImpl tracing), db_impl_sync_and_async.h (GetImpl tracing) | line-by-line (feature audit: tracing, tools and repair) |
 | `Db/DbImpl.Transactions.cs` | 524 | db/logs_with_prep_tracker.cc, db/db_impl/db_impl_files.cc, db/db_impl/db_impl.cc | line-by-line (feature audit: transactions) |
-| `Db/DbImpl.Write.cs` | 760 | db/db_impl/db_impl_write.cc, db/write_batch.cc (MemTableInserter) | line-by-line (#2) |
+| `Db/DbImpl.Write.cs` | 760 | db/db_impl/db_impl_write.cc, db/write_batch.cc (MemTableInserter) | line-by-line (#2); second review: ThrottleLowPriWritesIfNeeded, HandleMemTableInsertFailure, disallow_memtable_writes |
 | `Db/DbImpl.cs` | 612 | db/db_impl/db_impl.cc, db/db_impl/db_impl_compaction_flush.cc | line-by-line (#2) |
 | `Db/DbWithTtl.cs` | 310 | utilities/ttl/db_ttl_impl.{h,cc}, utilities/ttl/db_ttl_impl.cc | line-by-line (#3): utilities/ttl/db_ttl_impl.cc; **fixed** IsStale sign |
 | `Db/ErrorHandler.cs` | 755 | db/error_handler.{h,cc}, db/event_helpers.cc, db/error_handler.cc | line-by-line (feature audit: errors/listeners/backups (+ #3 severity maps)) |
@@ -212,7 +212,7 @@ changes there need their own review.
 | `Db/Wide/WideColumns.cs` | 140 | include/rocksdb/wide_columns.h, db/wide/wide_columns.cc | line-by-line (feature audit: user features (wide columns)) |
 | `Db/WriteBatch.cs` | 812 | db/write_batch.cc, db/write_batch_internal.h, include/rocksdb/write_batch.h | line-by-line (#1) |
 | `Db/WriteBatchReader.cs` | 300 | db/write_batch.cc | line-by-line (#1) |
-| `Db/WriteThread.cs` | 251 | db/write_thread.cc | line-by-line (#2); JoinBatchGroup's CheckWriteEnqueuedCallback: feature audit: WAL filter / predecessor WALs / UserWriteCallback |
+| `Db/WriteThread.cs` | 251 | db/write_thread.cc | line-by-line (#2); JoinBatchGroup's CheckWriteEnqueuedCallback: feature audit: WAL filter / predecessor WALs / UserWriteCallback; second review: EnterAsBatchGroupLeader r_list |
 | `Env/AlignedBuffer.cs` | 81 | util/aligned_buffer.h | managed-only, design-reviewed (#3): aligned buffers for O_DIRECT (util/aligned_buffer.h idea) |
 | `Env/EnvFileOptions.cs` | 99 | include/rocksdb/env.h, include/rocksdb/rate_limiter.h, file/sequence_file_reader.cc | managed-only, design-reviewed (#3): file options records |
 | `Env/FileContracts.cs` | 96 | file/writable_file_writer.h | managed-only, design-reviewed (#3): IFileSystem contracts (FileSystem / RandomAccessFileReader roles) |
