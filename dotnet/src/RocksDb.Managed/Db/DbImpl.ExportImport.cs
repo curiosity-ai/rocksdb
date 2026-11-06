@@ -134,7 +134,9 @@ internal sealed partial class DbImpl
             await job.PrepareAsync(ReserveFileNumberForIngestion, synchronous, ct).ConfigureAwait(false);
             // If a crash happens after a hard link was established, recovery must not reuse the file numbers already
             // assigned to the internal files: persist the next file number with a dummy edit.
-            await Versions.LogAndApplyAsync(cfd, new VersionEdit { ColumnFamily = cfd.Id }, synchronous, ct).ConfigureAwait(false);
+            var dummy = new VersionEdit { ColumnFamily = cfd.Id };
+            dummy.MarkForegroundOperation(); // dummy_edit.MarkForegroundOperation()
+            await Versions.LogAndApplyAsync(cfd, dummy, synchronous, ct).ConfigureAwait(false);
 
             // Stop writes to the DB by entering the write thread(s).
             WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);

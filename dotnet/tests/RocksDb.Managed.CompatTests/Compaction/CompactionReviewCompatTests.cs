@@ -51,4 +51,46 @@ public sealed class CompactionReviewCompatTests
         using var native = RocksDbSharp.RocksDb.Open(options, dir.Path);
         Assert.AreEqual("0", native.GetProperty("rocksdb.num-files-at-level1"));
     }
+
+    private static ulong CurrentManifestNumber(string dir)
+    {
+        string current = File.ReadAllText(Path.Combine(dir, "CURRENT")).Trim();
+        return ulong.Parse(current.AsSpan("MANIFEST-".Length), System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static List<VersionEdit> ReadManifest(string dir)
+    {
+        var edits = new List<VersionEdit>();
+        using ManifestLogReader reader = ManifestLogReader.Open(RocksDb.Managed.Env.LocalFileSystem.Instance, FileNames.DescriptorFileName(dir, CurrentManifestNumber(dir)));
+        while (reader.TryReadRecord(out ReadOnlySpan<byte> record)) edits.Add(VersionEdit.DecodeFrom(record));
+        return edits;
+    }
+
+    /// <summary>
+    /// kLastCompactedManifestFileSize both ways: the record native 11.12 writes at the end of a new MANIFEST's snapshot
+    /// is decoded by the managed port (and its MANIFEST opens), and the record the managed port writes is accepted by
+    /// native, which opens and reads the DB.
+    /// </summary>
+    [TestMethod]
+    public void LastCompactedManifestFileSizeRecordBothWays()
+    {
+        using var dir = new TempDir("lcm");
+        using (var ndb = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions().SetCreateIfMissing(true), dir.Path))
+        {
+            ndb.Put(B("n"), B("1"));
+            ndb.Flush(new RocksDbSharp.FlushOptions());
+        }
+        VersionEdit? nativeRecord = ReadManifest(dir.Path).Find(e => e.LastCompactedManifestFileSize is not null);
+        Assert.IsNotNull(nativeRecord, "native MANIFEST has no kLastCompactedManifestFileSize record");
+        using (RocksDatabase db = RocksDatabase.Open(dir.Path, new DbOptions(), new ColumnFamilyOptions()))
+        {
+            Assert.AreEqual("1", Encoding.UTF8.GetString(db.Get(B("n"))!));
+            db.Put(B("m"), B("2"));
+            db.Flush();
+        }
+        Assert.IsNotNull(ReadManifest(dir.Path).Find(e => e.LastCompactedManifestFileSize is not null), "managed MANIFEST has no record");
+        using var native = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions(), dir.Path);
+        Assert.AreEqual("2", native.Get("m"));
+        Assert.AreEqual("1", native.Get("n"));
+    }
 }

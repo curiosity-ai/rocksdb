@@ -129,6 +129,8 @@ internal sealed class ImportColumnFamilyJob
     {
         ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var edit = new VersionEdit { ColumnFamily = _cfd.Id };
+        // CreateColumnFamilyWithImport: edit->MarkForegroundOperation().
+        edit.MarkForegroundOperation();
         largestSeqno = 0;
         int numLevels = _cfd.NumLevels;
         for (int i = 0; i < _files.Count; i++)

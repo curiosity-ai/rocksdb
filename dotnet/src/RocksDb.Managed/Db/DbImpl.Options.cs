@@ -47,6 +47,7 @@ internal sealed partial class DbImpl
         "stats_dump_period_sec", "stats_persist_period_sec", "stats_history_buffer_size", "max_open_files", "bytes_per_sync",
         "wal_bytes_per_sync", "strict_bytes_per_sync", "compaction_readahead_size", "max_background_flushes",
         "max_manifest_file_size", "manifest_preallocation_size", "max_compaction_trigger_wakeup_seconds",
+        "max_manifest_space_amp_pct", "verify_manifest_content_on_close",
     };
 
 

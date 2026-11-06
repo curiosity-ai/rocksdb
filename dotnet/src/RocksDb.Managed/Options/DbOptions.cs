@@ -115,7 +115,24 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
     /// like SanitizeOptions. With a non-zero value, writes with <see cref="WriteOptions.DisableWal"/> are rejected.
     /// </summary>
     public ulong RecycleLogFileNum { get; set; }
+    /// <summary>
+    /// max_manifest_file_size: the MANIFEST is rolled over (rewritten compacted) on reaching this size AND the space amp
+    /// limit of <see cref="MaxManifestSpaceAmpPct"/>. Mutable.
+    /// </summary>
     public ulong MaxManifestFileSize { get; set; } = 1024UL * 1024 * 1024;
+    /// <summary>
+    /// max_manifest_space_amp_pct: a new compacted MANIFEST is written once the current one exceeds
+    /// max(<see cref="MaxManifestFileSize"/>, last compacted size * (1 + pct/100)); foreground operations (ingestion,
+    /// import, DeleteFilesInRanges, column family create/drop) get 25% more. 500 (default) is about 0.2 write amp and up
+    /// to 5x space amp; 0 rewrites on every MANIFEST write (testing only); negative values act as 0. Mutable.
+    /// </summary>
+    public int MaxManifestSpaceAmpPct { get; set; } = 500;
+    /// <summary>
+    /// verify_manifest_content_on_close: on close, read the MANIFEST back and check every record's CRC and encoding;
+    /// a corrupt MANIFEST is rewritten once (and checked again), a second failure makes close fail with Corruption.
+    /// Mutable.
+    /// </summary>
+    public bool VerifyManifestContentOnClose { get; set; }
     public int TableCacheNumShardBits { get; set; } = 6;
     public ulong WalTtlSeconds { get; set; }
     public ulong WalSizeLimitMb { get; set; }
@@ -235,6 +252,8 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
         .UInt64("keep_log_file_num", static o => o.KeepLogFileNum, static (o, v) => o.KeepLogFileNum = v)
         .UInt64("recycle_log_file_num", static o => o.RecycleLogFileNum, static (o, v) => o.RecycleLogFileNum = v)
         .UInt64("max_manifest_file_size", static o => o.MaxManifestFileSize, static (o, v) => o.MaxManifestFileSize = v)
+        .Int32("max_manifest_space_amp_pct", static o => o.MaxManifestSpaceAmpPct, static (o, v) => o.MaxManifestSpaceAmpPct = v)
+        .Bool("verify_manifest_content_on_close", static o => o.VerifyManifestContentOnClose, static (o, v) => o.VerifyManifestContentOnClose = v)
         .Int32("table_cache_numshardbits", static o => o.TableCacheNumShardBits, static (o, v) => o.TableCacheNumShardBits = v)
         .UInt64("WAL_ttl_seconds", static o => o.WalTtlSeconds, static (o, v) => o.WalTtlSeconds = v)
         .UInt64("WAL_size_limit_MB", static o => o.WalSizeLimitMb, static (o, v) => o.WalSizeLimitMb = v)

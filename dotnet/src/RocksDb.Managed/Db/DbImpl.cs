@@ -887,6 +887,20 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 try { PurgeObsoleteFiles(); }
                 catch (Exception e) when (e is IOException or RocksDbException) { }
             }
+            // VersionSet::Close: verify_manifest_content_on_close. A failure is reported once the close has finished
+            // (DB::Close returns the status).
+            RocksDbException? closeError = null;
+            if (Options.VerifyManifestContentOnClose && !_readOnly && Versions.GetColumnFamily(0) is { } defaultCfd)
+            {
+                try
+                {
+                    await Versions.VerifyManifestContentOnCloseAsync(defaultCfd).ConfigureAwait(false);
+                }
+                catch (Exception e) when (e is IOException or RocksDbException)
+                {
+                    closeError = RocksDbException.FromException(e);
+                }
+            }
             await Versions.DisposeAsync().ConfigureAwait(false);
             lock (_mutex)
             {
@@ -901,6 +915,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 }
                 _droppedColumnFamilies.Clear();
             }
+            if (closeError is not null) throw closeError;
         }
         finally
         {

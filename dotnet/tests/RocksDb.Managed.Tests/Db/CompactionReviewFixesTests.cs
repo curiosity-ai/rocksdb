@@ -611,4 +611,145 @@ public sealed class CompactionReviewFixesTests
         int expired = db.DefaultColumnFamily.Data.Current.Storage.ExpiredTtlFiles.Count;
         Assert.IsTrue(expired >= oldOutputs && expired < oldOutputs + newOutputs, "expired " + expired + " old " + oldOutputs + " new " + newOutputs);
     }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // MANIFEST size auto-tuning (version_set.cc TuneMaxManifestFileSize, ProcessManifestWrites, WriteCurrentStateToManifest)
+
+    private static ulong ManifestNumber(RocksDatabase db) => db.Impl.Versions.ManifestFileNumber;
+
+    private static long ManifestSize(IFileSystem fs, RocksDatabase db) => fs.GetFileSize(FileNames.DescriptorFileName(DbPath, ManifestNumber(db)));
+
+    /// <summary>Decodes every record of the current MANIFEST.</summary>
+    internal static List<VersionEdit> ReadManifest(IFileSystem fs, string dbPath, ulong number)
+    {
+        var edits = new List<VersionEdit>();
+        using ManifestLogReader reader = ManifestLogReader.Open(fs, FileNames.DescriptorFileName(dbPath, number));
+        while (reader.TryReadRecord(out ReadOnlySpan<byte> record)) edits.Add(VersionEdit.DecodeFrom(record));
+        return edits;
+    }
+
+    [TestMethod]
+    public void NewManifestRecordsLastCompactedManifestFileSize()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions());
+        List<VersionEdit> edits = ReadManifest(fs, DbPath, ManifestNumber(db));
+        int index = edits.FindIndex(e => e.LastCompactedManifestFileSize is not null);
+        Assert.IsTrue(index > 0, "no kLastCompactedManifestFileSize record");
+        // Last record of the snapshot (only the batch's next-file-number edit and the edits after it follow).
+        Assert.IsTrue(edits[index].LastCompactedManifestFileSize > 0UL && edits[index].LastCompactedManifestFileSize < (ulong)ManifestSize(fs, db) + 16);
+        // max(max_manifest_file_size = 1 GiB, ~6 x a few hundred bytes).
+        Assert.AreEqual(1024UL * 1024 * 1024, db.Impl.Versions.TunedMaxManifestFileSize);
+    }
+
+    /// <summary>
+    /// With a tiny max_manifest_file_size, the MANIFEST is rewritten only once it exceeds the compacted size by
+    /// max_manifest_space_amp_pct (0 = on every write).
+    /// </summary>
+    [TestMethod]
+    [DataRow(0)]
+    [DataRow(100)]
+    [DataRow(500)]
+    public void ManifestRotationFollowsSpaceAmp(int pct)
+    {
+        MemoryFileSystem fs = NewFs();
+        DbOptions o = NewOptions(fs);
+        o.MaxManifestFileSize = 1;
+        o.MaxManifestSpaceAmpPct = pct;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, new ColumnFamilyOptions { DisableAutoCompactions = true });
+        int rotations = 0;
+        for (int i = 0; i < 40; i++)
+        {
+            ulong before = ManifestNumber(db);
+            long size = ManifestSize(fs, db);
+            ulong limit = db.Impl.Versions.TunedMaxManifestFileSize;
+            db.Put(Key(i), Value(i, 0));
+            db.Flush();
+            bool rotated = ManifestNumber(db) != before;
+            // ProcessManifestWrites: rotate when prev_manifest_file_size >= the tuned limit (background batch).
+            Assert.AreEqual((ulong)size >= limit, rotated, "flush " + i + " size " + size + " limit " + limit);
+            if (rotated) rotations++;
+        }
+        if (pct == 0) Assert.AreEqual(40, rotations);
+        else Assert.IsTrue(rotations > 0 && rotations < 40, "rotations " + rotations);
+    }
+
+    /// <summary>A foreground batch (ingestion) may exceed the limit by 25% before it rotates; a flush does not.</summary>
+    [TestMethod]
+    public void ForegroundManifestWriteGetsRelaxedLimit()
+    {
+        MemoryFileSystem fs = NewFs();
+        DbOptions o = NewOptions(fs);
+        o.MaxManifestSpaceAmpPct = 0;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, new ColumnFamilyOptions { DisableAutoCompactions = true });
+        for (int i = 0; i < 30; i++)
+        {
+            db.Put(Key(i), Value(i, 0));
+            db.Flush();
+        }
+        long size = ManifestSize(fs, db);
+        // size is in [limit, 1.25 * limit) and above the last compacted size.
+        db.SetDBOptions(new Dictionary<string, string> { ["max_manifest_file_size"] = (size * 9 / 10).ToString(System.Globalization.CultureInfo.InvariantCulture) });
+        Assert.IsTrue(db.Impl.Versions.TunedMaxManifestFileSize <= (ulong)size);
+        ulong before = ManifestNumber(db);
+        string sst = "/ingest.sst";
+        using (var w = new SstFileWriter(new ColumnFamilyOptions(), fs))
+        {
+            w.Open(sst);
+            w.Put(Key(1000), B("x"));
+            w.Finish();
+        }
+        db.IngestExternalFiles([sst], new IngestExternalFileOptions());
+        Assert.AreEqual(before, ManifestNumber(db), "the foreground write rotated the MANIFEST");
+        db.Put(Key(2000), B("y"));
+        db.Flush();
+        Assert.AreNotEqual(before, ManifestNumber(db), "the background write did not rotate the MANIFEST");
+    }
+
+    [TestMethod]
+    public void ManifestSpaceAmpOptionsPersistedAndMutable()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions());
+        Assert.AreEqual(500, db.Impl.Options.MaxManifestSpaceAmpPct);
+        db.SetDBOptions(new Dictionary<string, string> { ["max_manifest_space_amp_pct"] = "7", ["verify_manifest_content_on_close"] = "true" });
+        Assert.AreEqual(7, db.Impl.Options.MaxManifestSpaceAmpPct);
+        Assert.IsTrue(db.Impl.Options.VerifyManifestContentOnClose);
+    }
+
+    /// <summary>verify_manifest_content_on_close: a corrupt MANIFEST is detected on close and rewritten.</summary>
+    [TestMethod]
+    public void VerifyManifestContentOnCloseRewritesCorruptManifest()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "rocksdb-managed-verify-manifest-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var stats = new Statistics();
+            var o = new DbOptions { CreateIfMissing = true, VerifyManifestContentOnClose = true, Statistics = stats };
+            ulong corrupted;
+            using (RocksDatabase db = RocksDatabase.Open(dir, o, new ColumnFamilyOptions()))
+            {
+                for (int i = 0; i < 5; i++)
+                {
+                    db.Put(Key(i), Value(i, 0));
+                    db.Flush();
+                }
+                corrupted = db.Impl.Versions.ManifestFileNumber;
+                // Flip a byte inside a record payload of the (live) MANIFEST.
+                using var s = new FileStream(FileNames.DescriptorFileName(dir, corrupted), FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+                s.Position = s.Length / 2;
+                int b = s.ReadByte();
+                s.Position = s.Length / 2;
+                s.WriteByte((byte)(b ^ 0xff));
+            }
+            Assert.AreEqual(1UL, stats.GetTickerCount(Ticker.ManifestValidationFailureCount));
+            using RocksDatabase again = RocksDatabase.Open(dir, new DbOptions(), new ColumnFamilyOptions());
+            Assert.AreNotEqual(corrupted, again.Impl.Versions.ManifestFileNumber);
+            for (int i = 0; i < 5; i++) CollectionAssert.AreEqual(Value(i, 0), again.Get(Key(i)));
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch (IOException) { }
+        }
+    }
 }
