@@ -321,8 +321,12 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
-    /// Port of Version::Get: L0 files (all overlapping, newest first), then one file per sorted level found by binary
-    /// search on the largest key.
+    /// Port of Version::Get: L0 files (all overlapping, newest first), then per sorted level the file found by binary
+    /// search on the largest key, and the following files of that level while the key is a file's largest user key
+    /// (FilePicker::GetNextFile: "if (curr_level_ > 0 &amp;&amp; cmp_largest &lt; 0)" ends the level, so cmp_largest == 0
+    /// continues with the next file). The versions of one user key can span adjacent files of a level (a compaction
+    /// output cut between two of them), and a lookup that is not done in the first (merge operands, or only versions
+    /// newer than the snapshot) must go on to the next one.
     /// </summary>
     private static void GetFromVersion(ColumnFamilyData cfd, DbVersion v, ReadOnlySpan<byte> ikey, ReadOnlySpan<byte> userKey, ulong snapshot, GetContext ctx)
     {
@@ -349,19 +353,21 @@ internal sealed partial class DbImpl
         for (int level = 1; level < s.NumLevels; level++)
         {
             if (s.NumLevelFiles(level) == 0) continue;
-            int idx = s.FindFile(level, ikey);
             ReadOnlySpan<FileMetaData> files = s.LevelFiles(level);
-            if (idx >= files.Length) continue;
-            FileMetaData f = files[idx];
-            if (CompareFileBoundary(ucmp, tsSize, userKey, f.Smallest) < 0) continue;
-            if (sample) FileReadSample.SampleFileReadInc(f);
-            ctx.ReadFlags = WithFilterSkip(cfd, s, level, false, ctx.ReadFlags);
-            bool done = GetFromFile(cfd, f, ikey, userKey, snapshot, ctx);
-            if (sample) SampleCollapsibleRead(f, ctx);
-            if (done)
+            for (int idx = s.FindFile(level, ikey); idx < files.Length; idx++)
             {
-                ctx.HitLevel = level;
-                return;
+                FileMetaData f = files[idx];
+                if (CompareFileBoundary(ucmp, tsSize, userKey, f.Smallest) < 0) break;
+                if (sample) FileReadSample.SampleFileReadInc(f);
+                ctx.ReadFlags = WithFilterSkip(cfd, s, level, false, ctx.ReadFlags);
+                bool done = GetFromFile(cfd, f, ikey, userKey, snapshot, ctx);
+                if (sample) SampleCollapsibleRead(f, ctx);
+                if (done)
+                {
+                    ctx.HitLevel = level;
+                    return;
+                }
+                if (CompareFileBoundary(ucmp, tsSize, userKey, f.Largest) != 0) break;
             }
         }
     }
@@ -594,15 +600,19 @@ internal sealed partial class DbImpl
                 for (int level = 1; level < s.NumLevels; level++)
                 {
                     if (s.NumLevelFiles(level) == 0) continue;
-                    int idx = s.FindFile(level, ikey.Span);
                     FileMetaData[] files = s.LevelFilesArray(level);
-                    if (idx >= files.Length) continue;
-                    FileMetaData f = files[idx];
-                    if (ucmp.Compare(key.Span, DbFormat.ExtractUserKey(f.Smallest)) < 0) continue;
-                    if (sample) FileReadSample.SampleFileReadInc(f);
-                    ctx.ReadFlags = WithFilterSkip(cfd, s, level, false, ctx.ReadFlags);
-                    bool done = await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false);
-                    if (sample) SampleCollapsibleRead(f, ctx);
+                    bool done = false;
+                    // As GetFromVersion: the key's versions may continue in the next file of the level.
+                    for (int idx = s.FindFile(level, ikey.Span); idx < files.Length; idx++)
+                    {
+                        FileMetaData f = files[idx];
+                        if (ucmp.Compare(key.Span, DbFormat.ExtractUserKey(f.Smallest)) < 0) break;
+                        if (sample) FileReadSample.SampleFileReadInc(f);
+                        ctx.ReadFlags = WithFilterSkip(cfd, s, level, false, ctx.ReadFlags);
+                        done = await GetFromFileAsync(cfd, f, ikey, key, snapshot, ctx, cancellationToken).ConfigureAwait(false);
+                        if (sample) SampleCollapsibleRead(f, ctx);
+                        if (done || ucmp.Compare(key.Span, DbFormat.ExtractUserKey(f.Largest)) != 0) break;
+                    }
                     if (done)
                     {
                         ctx.HitLevel = level;
@@ -680,16 +690,23 @@ internal sealed partial class DbImpl
             for (int level = 1; level < s.NumLevels && !done; level++)
             {
                 if (s.NumLevelFiles(level) == 0) continue;
-                int idx = s.FindFile(level, ikey.Span);
                 FileMetaData[] files = s.LevelFilesArray(level);
-                if (idx >= files.Length) continue;
-                FileMetaData f = files[idx];
-                if (CompareFileBoundary(ucmp, tsSize, DbFormat.ExtractUserKey(ikey.Span), f.Smallest) < 0) continue;
-                if (sample) FileReadSample.SampleFileReadInc(f);
-                ctx.ReadFlags = WithFilterSkip(cfd, s, level, false, ctx.ReadFlags);
-                done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);
-                if (sample) SampleCollapsibleRead(f, ctx);
-                if (done) ctx.HitLevel = level;
+                // As GetFromVersion: the key's versions may continue in the next file of the level.
+                for (int idx = s.FindFile(level, ikey.Span); idx < files.Length; idx++)
+                {
+                    FileMetaData f = files[idx];
+                    if (CompareFileBoundary(ucmp, tsSize, DbFormat.ExtractUserKey(ikey.Span), f.Smallest) < 0) break;
+                    if (sample) FileReadSample.SampleFileReadInc(f);
+                    ctx.ReadFlags = WithFilterSkip(cfd, s, level, false, ctx.ReadFlags);
+                    done = await GetFromFileWithTimestampAsync(cfd, f, ikey, snapshot, ctx, cancellationToken).ConfigureAwait(false);
+                    if (sample) SampleCollapsibleRead(f, ctx);
+                    if (done)
+                    {
+                        ctx.HitLevel = level;
+                        break;
+                    }
+                    if (CompareFileBoundary(ucmp, tsSize, DbFormat.ExtractUserKey(ikey.Span), f.Largest) != 0) break;
+                }
             }
             if (ctx.NeedsBlobResolution) await ctx.ResolveBlobAsync(cfd.BlobSource, s, options, key, cancellationToken).ConfigureAwait(false);
         }

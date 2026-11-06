@@ -47,6 +47,73 @@ public sealed class DbMultiGetTests
         for (int i = 0; i < count; i++) batch.Add(Key(rnd.Next(keySpace + 10))); // a few keys past the key space
     }
 
+    /// <summary>
+    /// The versions of one user key spanning adjacent files of a level (snapshots keep every version, the compaction
+    /// output is cut inside the key): Get, GetAsync, MultiGet and MultiGetAsync must continue in the next file of the
+    /// level when the key is a file's largest user key and the lookup is not done (FilePicker::GetNextFile continues on
+    /// cmp_largest == 0). Before the fix they stopped after the first file and returned the merge operands without
+    /// their base value, or nothing for a snapshot older than the first file's versions. Found by the managed/native
+    /// round-trip matrix.
+    /// </summary>
+    [TestMethod]
+    public async Task KeyVersionsSpanningFilesOfALevel()
+    {
+        var fs = NewFs();
+        var cfo = new ColumnFamilyOptions
+        {
+            MergeOperator = new StringAppendMergeOperator(),
+            DisableAutoCompactions = true,
+            TargetFileSizeBase = 4 << 10,
+            Compression = RocksDb.Managed.Compression.CompressionType.None,
+        };
+        using var db = RocksDatabase.Open(DbPath, NewOptions(fs), [new ColumnFamilyDescriptor("default", cfo)]);
+        var snapshots = new List<(Snapshot S, string Expected)>();
+        db.Put(B("a"), B("first"));
+        string expected = new('b', 3000);
+        db.Put(B("k"), B(expected));
+        snapshots.Add((db.GetSnapshot(), expected));
+        for (int i = 0; i < 6; i++)
+        {
+            string op = new((char)('c' + i), 3000);
+            db.Merge(B("k"), B(op));
+            expected += "," + op;
+            snapshots.Add((db.GetSnapshot(), expected));
+        }
+        db.Put(B("z"), B("last"));
+        db.Flush();
+        db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+        // Every version is kept (one snapshot each) and the 4 KiB target cuts the key across several L1 files.
+        List<LiveFileMetadata> files = db.GetLiveFilesMetadata().FindAll(f => f.Level > 0);
+        Assert.IsTrue(files.Count >= 3, "files: " + files.Count);
+        int boundaries = 0;
+        foreach (LiveFileMetadata f in files)
+        {
+            if (S(f.LargestKey) == "k" && S(f.SmallestKey) == "k") boundaries++; // user keys
+        }
+        Assert.IsTrue(boundaries > 0, "no file holds only versions of k");
+
+        Assert.AreEqual(expected, GetString(db, "k"));
+        Assert.AreEqual(expected, S(await db.GetAsync(B("k"))));
+        CollectionAssert.AreEqual(new[] { "first", expected, "last" }, Array.ConvertAll(db.MultiGet([B("a"), B("k"), B("z")]), S));
+        foreach ((Snapshot s, string value) in snapshots)
+        {
+            var ro = new ReadOptions { Snapshot = s };
+            Assert.AreEqual(value, S(db.Get(ro, B("k"))));
+            Assert.AreEqual(value, S(await db.GetAsync(ro, B("k"))));
+            using var batch = new MultiGetBatch();
+            batch.Add(B("a"));
+            batch.Add(B("k"));
+            batch.Add(B("z"));
+            db.MultiGet(ro, batch);
+            Assert.AreEqual(value, S(batch.GetValue(1).ToArray()));
+            batch.Clear();
+            batch.Add(B("k"));
+            await db.MultiGetAsync(ro, batch);
+            Assert.AreEqual(value, S(batch.GetValue(0).ToArray()));
+        }
+        foreach ((Snapshot s, _) in snapshots) s.Dispose();
+    }
+
     [TestMethod]
     public async Task RandomizedAgainstGetAcrossMemtablesAndLevels()
     {

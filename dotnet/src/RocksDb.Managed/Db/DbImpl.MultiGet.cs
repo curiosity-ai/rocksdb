@@ -129,10 +129,36 @@ internal sealed partial class DbImpl
                         }
                         if (m == 0) continue;
                         batch.ReadFlags = WithFilterSkip(cfd, s, level, false, batch.ReadFlags);
-                        await MultiGetFromFileAsync(cfd, f, batch, m, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
-                        SampleMultiGetReads(f, batch, m);
-                        MarkHitLevel(batch, m, level);
-                        if (softLimit != ulong.MaxValue && ApplySoftLimit(batch, m, ref valueSize, softLimit))
+                        bool aborted = false;
+                        // FilePickerMultiGet: a key that is the file's largest user key and not done yet continues in
+                        // the next file of the level (its versions can span adjacent files; see GetFromVersion).
+                        for (int fileIdx = idx; ; )
+                        {
+                            await MultiGetFromFileAsync(cfd, f, batch, m, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
+                            SampleMultiGetReads(f, batch, m);
+                            MarkHitLevel(batch, m, level);
+                            if (softLimit != ulong.MaxValue && ApplySoftLimit(batch, m, ref valueSize, softLimit))
+                            {
+                                aborted = true;
+                                break;
+                            }
+                            if (++fileIdx >= files.Length) break;
+                            FileMetaData next = files[fileIdx];
+                            int carried = 0;
+                            for (int q = 0; q < m; q++)
+                            {
+                                int k = sub[q];
+                                if (!batch.Context(k).Done && ucmp.Compare(batch.UserKey(k), DbFormat.ExtractUserKey(f.Largest)) == 0 &&
+                                    ucmp.Compare(batch.UserKey(k), DbFormat.ExtractUserKey(next.Smallest)) >= 0)
+                                {
+                                    sub[carried++] = k;
+                                }
+                            }
+                            if (carried == 0) break;
+                            f = next;
+                            m = carried;
+                        }
+                        if (aborted)
                         {
                             AbortPending(batch, order, pending);
                             break;
