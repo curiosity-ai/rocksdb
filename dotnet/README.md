@@ -641,7 +641,7 @@ untracked writes, `TransactionIterator` (reads the transaction's writes merged w
 
 <!-- snippet:write-batch-with-index -->
 ```csharp
-using var wbwi = new WriteBatchWithIndex();
+using WriteBatchWithIndex wbwi = db.CreateWriteBatchWithIndex();   // pooled; or new WriteBatchWithIndex()
 wbwi.Put("b"u8, "batch"u8).Delete("c"u8);
 
 // Read your own uncommitted writes, falling back to the DB.
