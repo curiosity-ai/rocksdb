@@ -202,6 +202,78 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public uint MemtableProtectionBytesPerKey { get; set; }
     public double ExperimentalMempurgeThreshold { get; set; }
 
+    /// <summary>
+    /// strict_max_successive_merges: with <see cref="MaxSuccessiveMerges"/>, merge even when the base value must be read
+    /// from SST files. Typed and persisted only: the managed port does not implement max_successive_merges (both are
+    /// listed under "Not ported yet"). Default false. Mutable.
+    /// </summary>
+    public bool StrictMaxSuccessiveMerges { get; set; }
+
+    /// <summary>
+    /// memtable_max_range_deletions: the mutable memtable is marked for flush once it holds this many range deletions
+    /// (MemTable::ShouldFlushNow). 0 (default) disables the limit. Applies to memtables created after a SetOptions.
+    /// </summary>
+    public uint MemtableMaxRangeDeletions { get; set; }
+
+    /// <summary>
+    /// paranoid_memory_checks: validate the key order of skiplist memtables during reads and scans. Typed and persisted
+    /// only (listed under "Not ported yet"). Default false. Mutable.
+    /// </summary>
+    public bool ParanoidMemoryChecks { get; set; }
+
+    /// <summary>
+    /// memtable_verify_per_key_checksum_on_seek: verify the per-key checksum (memtable_protection_bytes_per_key) of
+    /// memtable entries visited by seeks. Typed and persisted only (listed under "Not ported yet"); the misspelled
+    /// name memtable_veirfy_per_key_checksum_on_seek is accepted when parsing, like upstream. Default false. Mutable.
+    /// </summary>
+    public bool MemtableVerifyPerKeyChecksumOnSeek { get; set; }
+
+    /// <summary>
+    /// memtable_op_scan_flush_trigger: an iterator that skips at least this many invisible (hidden) memtable entries
+    /// between two user-visible entries marks the memtable for flush. Typed and persisted only (listed under "Not
+    /// ported yet"); sanitized to 0 for read-only DBs like upstream. 0 (default) disables it. Mutable.
+    /// </summary>
+    public uint MemtableOpScanFlushTrigger { get; set; }
+
+    /// <summary>
+    /// memtable_avg_op_scan_flush_trigger: like <see cref="MemtableOpScanFlushTrigger"/> but on the average number of
+    /// hidden entries per visible entry since the last seek. Typed and persisted only. Default 0. Mutable.
+    /// </summary>
+    public uint MemtableAvgOpScanFlushTrigger { get; set; }
+
+    /// <summary>
+    /// memtable_batch_lookup_optimization: MultiGet reuses the skiplist search path between sorted keys. Typed and
+    /// persisted only (a performance hint; results are the same). Default false. Immutable.
+    /// </summary>
+    public bool MemtableBatchLookupOptimization { get; set; }
+
+    /// <summary>
+    /// uncache_aggressiveness: how much effort is spent erasing the block cache entries of table files that became
+    /// obsolete. A cache-efficiency hint with no effect on results; the managed port leaves such entries to be evicted
+    /// normally (as with the default 0). Default 0. Mutable.
+    /// </summary>
+    public uint UncacheAggressiveness { get; set; }
+
+    /// <summary>
+    /// min_tombstones_for_range_conversion: flushes and compactions convert runs of at least this many consecutive point
+    /// tombstones into a range tombstone. Typed and persisted only (listed under "Not ported yet"). Default 0
+    /// (disabled). Mutable.
+    /// </summary>
+    public uint MinTombstonesForRangeConversion { get; set; }
+
+    /// <summary>
+    /// verify_output_flags: what to verify on compaction outputs and when (VerifyOutputFlags,
+    /// include/rocksdb/advanced_options.h). Default <see cref="Managed.VerifyOutputFlags.None"/>. Mutable.
+    /// </summary>
+    public VerifyOutputFlags VerifyOutputFlags { get; set; }
+
+    /// <summary>
+    /// compression_manager: the name of a custom CompressionManager (null = built-in compression). The managed port has
+    /// no compression manager plugins: the name is persisted and written back, and only null is supported when a DB is
+    /// opened (NotSupported otherwise). Mutable.
+    /// </summary>
+    public string? CompressionManagerName { get; set; }
+
     // ---- compression -------------------------------------------------------------------------
     /// <summary>Default kLZ4Compression (GetDefaultCompressionType: LZ4 when supported).</summary>
     public CompressionType Compression { get; set; } = CompressionType.LZ4;
@@ -297,6 +369,12 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     internal bool DbAllowIngestBehind { get; set; }
 
     /// <summary>
+    /// The DB's daily_offpeak_time_utc window (VersionSet::offpeak_time_option), shared by all column families of a DB and
+    /// set when the column family is opened; not persisted. Null outside a DB.
+    /// </summary>
+    internal OffpeakTimeOption? DbOffpeakTime { get; set; }
+
+    /// <summary>
     /// cf_allow_ingest_behind || DBOptions::allow_ingest_behind (ColumnFamilyData::AllowIngestBehind): the last level is
     /// reserved for files ingested with <see cref="IngestExternalFileOptions.IngestBehind"/>.
     /// </summary>
@@ -307,6 +385,11 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public ulong MinBlobSize { get; set; }
     public ulong BlobFileSize { get; set; } = 1UL << 28;
     public CompressionType BlobCompressionType { get; set; } = CompressionType.None;
+    /// <summary>
+    /// blob_compression_opts: compression options for blob files (struct like <see cref="CompressionOpts"/>). Typed and
+    /// persisted; blob files are compressed with the codec's default settings (listed under "Not ported yet"). Mutable.
+    /// </summary>
+    public CompressionOptions BlobCompressionOpts { get; set; } = new();
     public bool EnableBlobGarbageCollection { get; set; }
     public double BlobGarbageCollectionAgeCutoff { get; set; } = 0.25;
     public double BlobGarbageCollectionForceThreshold { get; set; } = 1.0;
@@ -383,10 +466,14 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .Double("experimental_mempurge_threshold", static o => o.ExperimentalMempurgeThreshold, static (o, v) => o.ExperimentalMempurgeThreshold = v)
         .Enum("compression", OptionEnumMaps.Compression, static o => o.Compression, static (o, v) => o.Compression = v)
         .Enum("bottommost_compression", OptionEnumMaps.Compression, static o => o.BottommostCompression, static (o, v) => o.BottommostCompression = v)
-        .Add("compression_opts", static o => o.CompressionOpts.ToStructString(),
-            static (o, v) => o.CompressionOpts = CompressionOptions.ParseStructString("compression_opts", v))
-        .Add("bottommost_compression_opts", static o => o.BottommostCompressionOpts.ToStructString(),
-            static (o, v) => o.BottommostCompressionOpts = CompressionOptions.ParseStructString("bottommost_compression_opts", v))
+        .Struct("compression_opts", static o => o.CompressionOpts, static (o, v) => o.CompressionOpts = v,
+            static (c, v) => CompressionOptions.ParseLegacy(c, v, "compression_opts"))
+        .Struct("bottommost_compression_opts", static o => o.BottommostCompressionOpts, static (o, v) => o.BottommostCompressionOpts = v,
+            static (c, v) => CompressionOptions.ParseLegacy(c, v, "bottommost_compression_opts"))
+        // blob_compression_opts has no legacy ':' form upstream (plain OptionTypeInfo::Struct).
+        .Struct("blob_compression_opts", static o => o.BlobCompressionOpts, static (o, v) => o.BlobCompressionOpts = v, null)
+        .Add("compression_manager", static o => o.CompressionManagerName ?? "nullptr",
+            static (o, v) => { string id = OptionStrings.UnwrapId(v); o.CompressionManagerName = id.Length == 0 || id == "nullptr" ? null : id; })
         .Add("compression_per_level", static o => FormatCompressionList(o.CompressionPerLevel),
             static (o, v) => o.CompressionPerLevel = ParseCompressionList(v))
         .UInt64("sample_for_compression", static o => o.SampleForCompression, static (o, v) => o.SampleForCompression = v)
@@ -410,10 +497,9 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .Bool("disable_auto_compactions", static o => o.DisableAutoCompactions, static (o, v) => o.DisableAutoCompactions = v)
         .Enum("compaction_style", OptionEnumMaps.CompactionStyle, static o => o.CompactionStyle, static (o, v) => o.CompactionStyle = v)
         .Enum("compaction_pri", OptionEnumMaps.CompactionPri, static o => o.CompactionPri, static (o, v) => o.CompactionPri = v)
-        .Add("compaction_options_fifo", static o => o.CompactionOptionsFifo.ToStructString(),
-            static (o, v) => o.CompactionOptionsFifo = CompactionOptionsFifo.ParseStructString("compaction_options_fifo", v))
-        .Add("compaction_options_universal", static o => o.CompactionOptionsUniversal.ToStructString(),
-            static (o, v) => o.CompactionOptionsUniversal = CompactionOptionsUniversal.ParseStructString("compaction_options_universal", v))
+        .Struct("compaction_options_fifo", static o => o.CompactionOptionsFifo, static (o, v) => o.CompactionOptionsFifo = v,
+            static (c, v) => CompactionOptionsFifo.ParseLegacy(c, v))
+        .Struct("compaction_options_universal", static o => o.CompactionOptionsUniversal, static (o, v) => o.CompactionOptionsUniversal = v, null)
         .UInt64("max_sequential_skip_in_iterations", static o => o.MaxSequentialSkipInIterations, static (o, v) => o.MaxSequentialSkipInIterations = v)
         .Bool("optimize_filters_for_hits", static o => o.OptimizeFiltersForHits, static (o, v) => o.OptimizeFiltersForHits = v)
         .Bool("paranoid_file_checks", static o => o.ParanoidFileChecks, static (o, v) => o.ParanoidFileChecks = v)
@@ -444,7 +530,30 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .UInt64("blob_file_writable_file_max_buffer_size", static o => o.BlobFileWritableFileMaxBufferSize,
             static (o, v) => o.BlobFileWritableFileMaxBufferSize = v)
         .Bool("enable_blob_direct_write", static o => o.EnableBlobDirectWrite, static (o, v) => o.EnableBlobDirectWrite = v)
-        .UInt32("blob_direct_write_partitions", static o => o.BlobDirectWritePartitions, static (o, v) => o.BlobDirectWritePartitions = v);
+        .UInt32("blob_direct_write_partitions", static o => o.BlobDirectWritePartitions, static (o, v) => o.BlobDirectWritePartitions = v)
+        // Options of RocksDB 11.x (options/cf_options.cc) that native 11.12 writes.
+        .Bool("strict_max_successive_merges", static o => o.StrictMaxSuccessiveMerges, static (o, v) => o.StrictMaxSuccessiveMerges = v)
+        .UInt32("memtable_max_range_deletions", static o => o.MemtableMaxRangeDeletions, static (o, v) => o.MemtableMaxRangeDeletions = v)
+        .Bool("paranoid_memory_checks", static o => o.ParanoidMemoryChecks, static (o, v) => o.ParanoidMemoryChecks = v)
+        .Bool("memtable_verify_per_key_checksum_on_seek", static o => o.MemtableVerifyPerKeyChecksumOnSeek,
+            static (o, v) => o.MemtableVerifyPerKeyChecksumOnSeek = v)
+        .UInt32("memtable_op_scan_flush_trigger", static o => o.MemtableOpScanFlushTrigger, static (o, v) => o.MemtableOpScanFlushTrigger = v)
+        .UInt32("memtable_avg_op_scan_flush_trigger", static o => o.MemtableAvgOpScanFlushTrigger, static (o, v) => o.MemtableAvgOpScanFlushTrigger = v)
+        .Bool("memtable_batch_lookup_optimization", static o => o.MemtableBatchLookupOptimization,
+            static (o, v) => o.MemtableBatchLookupOptimization = v)
+        .UInt32("uncache_aggressiveness", static o => o.UncacheAggressiveness, static (o, v) => o.UncacheAggressiveness = v)
+        .UInt32("min_tombstones_for_range_conversion", static o => o.MinTombstonesForRangeConversion,
+            static (o, v) => o.MinTombstonesForRangeConversion = v)
+        .UInt32("verify_output_flags", static o => (uint)o.VerifyOutputFlags, static (o, v) => o.VerifyOutputFlags = (VerifyOutputFlags)v)
+        // The old misspelled name, still parsed (never written) by upstream.
+        .Alias("memtable_veirfy_per_key_checksum_on_seek", "memtable_verify_per_key_checksum_on_seek")
+        // OptionVerificationType::kDeprecated entries of cf_mutable/immutable_options_type_info: accepted and ignored.
+        .Deprecated("filter_deletes", "check_flush_compaction_key_order", "verify_checksums_in_compaction", "hard_rate_limit",
+            "soft_rate_limit", "ignore_max_compaction_bytes_for_input", "expanded_compaction_factor", "max_grandparent_overlap_factor",
+            "source_compaction_factor", "memtable_prefix_bloom_huge_page_tlb_size", "memtable_prefix_bloom_bits",
+            "memtable_prefix_bloom_probes", "min_partial_merge_operands", "snap_refresh_nanos", "bottommost_temperature",
+            "compaction_measure_io_stats", "purge_redundant_kvs_while_flush", "level_compaction_dynamic_file_size",
+            "max_mem_compaction_level", "max_write_buffer_number_to_maintain", "rate_limit_delay_max_milliseconds");
 
     private static string MergeOperatorId(MergeOperator m) => m.Name;
     private static string MergeOperatorOptionsId(MergeOperator m) => m.OptionsId;
@@ -470,6 +579,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         c._compactionFilter = _compactionFilter;
         c._compactionFilterFactory = _compactionFilterFactory;
         c.DbAllowIngestBehind = DbAllowIngestBehind;
+        c.DbOffpeakTime = DbOffpeakTime;
         c.CompactionOptionsFifo = CompactionOptionsFifo.Clone();
         c.CompactionOptionsUniversal = CompactionOptionsUniversal.Clone();
         c.TableOptions = TableOptions.Clone();

@@ -64,7 +64,8 @@ public sealed class CompactionOptionsFifo : PersistedOptions<CompactionOptionsFi
             static (o, v) => o.AllowTrivialCopyWhenChangeTemperature = v)
         .UInt64("trivial_copy_buffer_size", static o => o.TrivialCopyBufferSize, static (o, v) => o.TrivialCopyBufferSize = v)
         .UInt64("max_data_files_size", static o => o.MaxDataFilesSize, static (o, v) => o.MaxDataFilesSize = v)
-        .Bool("use_kv_ratio_compaction", static o => o.UseKvRatioCompaction, static (o, v) => o.UseKvRatioCompaction = v);
+        .Bool("use_kv_ratio_compaction", static o => o.UseKvRatioCompaction, static (o, v) => o.UseKvRatioCompaction = v)
+        .Deprecated("ttl");
 
     internal override OptionTable<CompactionOptionsFifo> OptionTable => s_table;
 
@@ -79,20 +80,11 @@ public sealed class CompactionOptionsFifo : PersistedOptions<CompactionOptionsFi
     internal string ToStructString() => OptionStrings.FormatStruct(ToOptionsList());
 
     /// <summary>
-    /// Parses the struct value. Like upstream's parse function for compaction_options_fifo, a single scalar (no '=')
-    /// is assigned to max_table_files_size.
+    /// Upstream's parse function for compaction_options_fifo (options/cf_options.cc): a single scalar (no '=') is the old
+    /// format and is assigned to max_table_files_size.
     /// </summary>
-    internal static CompactionOptionsFifo ParseStructString(string name, string value)
-    {
-        var c = new CompactionOptionsFifo();
-        if (!value.Contains('=', StringComparison.Ordinal))
-        {
-            c.SetOption("max_table_files_size", value.Trim(), preserveUnknown: false);
-            return c;
-        }
-        c.SetOptions(OptionStrings.ParseStruct(name, value), preserveUnknown: true);
-        return c;
-    }
+    internal static void ParseLegacy(CompactionOptionsFifo o, string value) =>
+        o.MaxTableFilesSize = OptionStrings.ParseUInt64("compaction_options_fifo", value);
 }
 
 /// <summary>Port of rocksdb::FileTemperatureAge (include/rocksdb/advanced_options.h).</summary>
@@ -232,11 +224,4 @@ public sealed class CompactionOptionsUniversal : PersistedOptions<CompactionOpti
     }
 
     internal string ToStructString() => OptionStrings.FormatStruct(ToOptionsList());
-
-    internal static CompactionOptionsUniversal ParseStructString(string name, string value)
-    {
-        var c = new CompactionOptionsUniversal();
-        c.SetOptions(OptionStrings.ParseStruct(name, value), preserveUnknown: true);
-        return c;
-    }
 }

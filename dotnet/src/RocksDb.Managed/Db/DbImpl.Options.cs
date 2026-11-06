@@ -1,4 +1,5 @@
 using System.Text;
+using RocksDb.Managed.Options;
 
 namespace RocksDb.Managed.Db;
 
@@ -37,7 +38,22 @@ internal sealed partial class DbImpl
         "memtable_protection_bytes_per_key", "block_protection_bytes_per_key", "compression_opts", "bottommost_compression_opts",
         "compaction_options_fifo", "compaction_options_universal", "target_file_size_is_upper_bound",
         "read_triggered_compaction_threshold", "bottommost_file_compaction_delay",
+        "strict_max_successive_merges", "verify_output_flags", "blob_compression_opts", "uncache_aggressiveness",
+        "paranoid_memory_checks", "memtable_verify_per_key_checksum_on_seek", "compression_manager",
+        "memtable_max_range_deletions", "memtable_op_scan_flush_trigger", "memtable_avg_op_scan_flush_trigger",
+        "min_tombstones_for_range_conversion",
     };
+
+    /// <summary>
+    /// True if <paramref name="name"/> is a mutable CF option: a name of <see cref="MutableCfOptionNames"/>, the old
+    /// misspelled memtable_veirfy_per_key_checksum_on_seek, or a field of a mutable struct option ("struct.field").
+    /// </summary>
+    private static bool IsMutableCfOptionName(string name)
+    {
+        if (MutableCfOptionNames.Contains(name) || name == "memtable_veirfy_per_key_checksum_on_seek") return true;
+        int dot = name.IndexOf('.', StringComparison.Ordinal);
+        return dot > 0 && MutableCfOptionNames.Contains(name[..dot]);
+    }
 
     /// <summary>db_mutable_options_type_info names supported by the managed options model.</summary>
     internal static readonly HashSet<string> MutableDbOptionNames = new(StringComparer.Ordinal)
@@ -47,6 +63,8 @@ internal sealed partial class DbImpl
         "stats_dump_period_sec", "stats_persist_period_sec", "stats_history_buffer_size", "max_open_files", "bytes_per_sync",
         "wal_bytes_per_sync", "strict_bytes_per_sync", "compaction_readahead_size", "max_background_flushes",
         "max_manifest_file_size", "manifest_preallocation_size", "max_compaction_trigger_wakeup_seconds",
+        "max_manifest_space_amp_pct", "verify_manifest_content_on_close", "optimize_manifest_for_recovery", "daily_offpeak_time_utc",
+        "periodic_compaction_phase_recovery_percent", "fast_sst_open", "remote_compaction_manifest_floor",
     };
 
 
@@ -118,6 +136,15 @@ internal sealed partial class DbImpl
 
     private readonly SemaphoreSlim _setOptionsLock = new(1, 1);
 
+    private OffpeakTimeOption? _offpeakTime;
+
+    /// <summary>
+    /// VersionSet::offpeak_time_option: the daily off-peak window of this DB, shared by the options of all its column
+    /// families (<see cref="ColumnFamilyOptions.DbOffpeakTime"/>); changed in place by SetDBOptions. First created by the
+    /// open (single-threaded).
+    /// </summary>
+    internal OffpeakTimeOption OffpeakTime => _offpeakTime ??= new OffpeakTimeOption(Options.DailyOffpeakTimeUtc);
+
     /// <summary>
     /// Port of DBImpl::SetOptions for one column family: applies mutable CF options given as OPTIONS-file name/value pairs.
     /// Fails with InvalidArgument on empty input, unknown names ("Unrecognized option"), immutable options ("Option not
@@ -139,9 +166,9 @@ internal sealed partial class DbImpl
         foreach (KeyValuePair<string, string> kv in list)
         {
             if (TrySetTableOption(candidate, kv.Key, kv.Value)) continue;
-            if (!MutableCfOptionNames.Contains(kv.Key))
+            if (!IsMutableCfOptionName(kv.Key))
             {
-                if (candidate.GetOption(kv.Key) is null) ThrowHelper.InvalidArgument("Unrecognized option: " + kv.Key);
+                if (!candidate.IsKnownOption(kv.Key)) ThrowHelper.InvalidArgument("Unrecognized option: " + kv.Key);
                 ThrowHelper.InvalidArgument("Option not changeable: " + kv.Key);
             }
             try
@@ -204,7 +231,10 @@ internal sealed partial class DbImpl
     {
         // Same invariants as at open (SanitizeCfOptions); num_levels and the compaction style are immutable.
         SanitizeCfOptions(candidate, Options.AllowIngestBehind, DbPaths.Count);
-        ValidateMutableCfOptions(candidate);
+        // ColumnFamilyData::SetOptions (db/column_family.cc): the complete new option set is validated
+        // (ColumnFamilyData::ValidateOptions) before anything is installed, so a rejected call changes nothing.
+        ValidateMutableSizes(candidate);
+        ValidateCfOptions(Options, candidate);
         if (synchronous) _setOptionsLock.Wait(ct);
         else await _setOptionsLock.WaitAsync(ct).ConfigureAwait(false);
         try
@@ -254,22 +284,124 @@ internal sealed partial class DbImpl
         }
     }
 
-    /// <summary>The checks of ColumnFamilyData::ValidateOptions / CheckCompressionSupported that apply to mutable options.</summary>
-    private static void ValidateMutableCfOptions(ColumnFamilyOptions o)
+    /// <summary>
+    /// Managed guards of SetOptions (no upstream equivalent; the engine divides by these): sizes that must not be 0.
+    /// </summary>
+    private static void ValidateMutableSizes(ColumnFamilyOptions o)
     {
         if (o.WriteBufferSize == 0) ThrowHelper.InvalidArgument("write_buffer_size must be > 0");
         if (o.TargetFileSizeBase == 0) ThrowHelper.InvalidArgument("target_file_size_base must be > 0");
         if (o.TargetFileSizeMultiplier <= 0) ThrowHelper.InvalidArgument("target_file_size_multiplier must be > 0");
         if (o.MaxBytesForLevelBase == 0) ThrowHelper.InvalidArgument("max_bytes_for_level_base must be > 0");
-        if (o.EnableBlobGarbageCollection && o.BlobGarbageCollectionAgeCutoff is < 0 or > 1)
+    }
+
+    /// <summary>
+    /// Port of ColumnFamilyData::ValidateOptions (db/column_family.cc) against <paramref name="db"/>: run by DB::Open and
+    /// CreateColumnFamily, by SetOptions on the complete new option set, and by SetDBOptions for every column family with
+    /// the new DB options. Messages are copied verbatim. The managed port additionally rejects a compression_manager
+    /// (no compression manager plugins). Checks done where the objects are built: the
+    /// concurrent-write / unordered-write / blob direct write / memtable-only timestamp checks (ColumnFamilyData).
+    /// Not ported: CheckCompressionSupported (every compression type the OPTIONS model accepts is either supported or
+    /// rejected when a table is written) and CheckCFPathsSupported (no cf_paths).
+    /// </summary>
+    internal static void ValidateCfOptions(DbOptions db, ColumnFamilyOptions o)
+    {
+        if (db.UnorderedWrite && o.MaxSuccessiveMerges != 0)
+            ThrowHelper.InvalidArgument("max_successive_merges > 0 is incompatible with unordered_write");
+        if (o.CompressionManagerName is not null)
+            ThrowHelper.NotSupported("compression_manager " + o.CompressionManagerName + " is not supported by the managed port");
+        // kDefaultTtl: the managed default is the value upstream sanitizes it to for block-based tables (30 days), so that
+        // value is treated as the default here (upstream sanitizes it to 0 for other table formats).
+        const ulong defaultTtl = 30UL * 24 * 60 * 60;
+        bool blockBased = o.TableFactory == TableFactoryType.BlockBasedTable;
+        if (o.Ttl > 0 && o.Ttl != defaultTtl && o.Ttl != ColumnFamilyOptions.DefaultPeriodicCompactionSeconds && !blockBased)
         {
-            ThrowHelper.InvalidArgument("The age cutoff for blob garbage collection should be in the range [0.0, 1.0].");
+            ThrowHelper.NotSupported("TTL is only supported in Block-Based Table format. ");
         }
-        if (o.EnableBlobGarbageCollection && o.BlobGarbageCollectionForceThreshold is < 0 or > 1)
+        if (o.PeriodicCompactionSeconds > 0 && o.PeriodicCompactionSeconds != ColumnFamilyOptions.DefaultPeriodicCompactionSeconds && !blockBased)
         {
-            ThrowHelper.InvalidArgument("The garbage ratio threshold for forcing blob garbage collection should be in the range [0.0, 1.0].");
+            ThrowHelper.NotSupported("Periodic Compaction is only supported in Block-Based Table format. ");
+        }
+        if (o.EnableBlobGarbageCollection)
+        {
+            if (o.BlobGarbageCollectionAgeCutoff is < 0 or > 1)
+                ThrowHelper.InvalidArgument("The age cutoff for blob garbage collection should be in the range [0.0, 1.0].");
+            if (o.BlobGarbageCollectionForceThreshold is < 0 or > 1)
+                ThrowHelper.InvalidArgument("The garbage ratio threshold for forcing blob garbage collection should be in the range [0.0, 1.0].");
         }
         ValidateReadTriggeredCompactionThreshold(o);
+        if (o.CompactionStyle == CompactionStyle.Fifo && db.MaxOpenFiles != -1 && o.Ttl > 0)
+            ThrowHelper.NotSupported("FIFO compaction only supported with max_open_files = -1.");
+        if (db.OpenFilesAsync)
+        {
+            if (o.CompactionStyle == CompactionStyle.Fifo) ThrowHelper.NotSupported("FIFO compaction is not supported with open_files_async = true.");
+            if (!db.SkipStatsUpdateOnDbOpen) ThrowHelper.InvalidArgument("open_files_async requires skip_stats_update_on_db_open = true.");
+        }
+        if (!KvChecksum.IsSupportedLength(o.MemtableProtectionBytesPerKey))
+            ThrowHelper.NotSupported("Memtable per key-value checksum protection only supports 0, 1, 2, 4 or 8 bytes per key.");
+        if (!KvChecksum.IsSupportedLength(o.BlockProtectionBytesPerKey))
+            ThrowHelper.NotSupported("Block per key-value checksum protection only supports 0, 1, 2, 4 or 8 bytes per key.");
+        List<FileTemperatureAge> ages = o.CompactionOptionsFifo.FileTemperatureAgeThresholds;
+        if (ages.Count > 0)
+        {
+            if (o.CompactionStyle != CompactionStyle.Fifo)
+                ThrowHelper.NotSupported("Option file_temperature_age_thresholds only supports FIFO compaction.");
+            if (o.NumLevels > 1)
+                ThrowHelper.NotSupported("Option file_temperature_age_thresholds is only supported when num_levels = 1.");
+            for (int i = 0; i < ages.Count - 1; i++)
+            {
+                if (ages[i].Age >= ages[i + 1].Age)
+                {
+                    ThrowHelper.NotSupported("Option file_temperature_age_thresholds requires elements to be sorted in increasing order with respect to `age` field.");
+                }
+            }
+        }
+        if (o.CompactionStyle == CompactionStyle.Universal)
+        {
+            int maxReadAmp = o.CompactionOptionsUniversal.MaxReadAmp;
+            if (maxReadAmp < -1)
+                ThrowHelper.NotSupported("CompactionOptionsUniversal::max_read_amp should be at least -1.");
+            if (maxReadAmp > 0 && maxReadAmp < o.Level0FileNumCompactionTrigger)
+            {
+                ThrowHelper.NotSupported("CompactionOptionsUniversal::max_read_amp limits the number of sorted runs but is smaller than the compaction trigger level0_file_num_compaction_trigger.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// The checks of DBImpl::ValidateOptions(const DBOptions&amp;) (db/db_impl/db_impl_open.cc) that apply to options
+    /// SetDBOptions can change (also run at open): daily_offpeak_time_utc, background job counts.
+    /// </summary>
+    internal static void ValidateDbOptions(DbOptions o)
+    {
+        if (o.DailyOffpeakTimeUtc.Length != 0)
+        {
+            if (!OffpeakTimeOption.TryParseTimeRange(o.DailyOffpeakTimeUtc, out int start, out int end))
+                ThrowHelper.InvalidArgument("daily_offpeak_time_utc should be set in the format HH:mm-HH:mm (e.g. 04:30-07:30)");
+            if (start == end) ThrowHelper.InvalidArgument("start_time and end_time cannot be the same");
+        }
+    }
+
+    /// <summary>
+    /// Port of the DBOptions part of SanitizeOptions (db/db_impl/db_impl_open.cc) not covered by
+    /// <see cref="SanitizeWalOptions"/>, in place: max_open_files is clipped to [20, port::GetMaxOpenFiles()] (0x400000
+    /// when the OS limit is unknown) unless it is -1, and delayed_write_rate = 0 becomes the rate limiter's rate, or
+    /// 16 MiB/s.
+    /// </summary>
+    internal static void SanitizeDbOptions(DbOptions result)
+    {
+        if (result.MaxOpenFiles != -1)
+        {
+            int maxMaxOpenFiles = Env.UnixNative.GetMaxOpenFiles();
+            if (maxMaxOpenFiles == -1) maxMaxOpenFiles = 0x400000;
+            result.MaxOpenFiles = Math.Clamp(result.MaxOpenFiles, 20, Math.Max(20, maxMaxOpenFiles));
+        }
+        if (result.RateLimiter is not null && result.BytesPerSync == 0) result.BytesPerSync = 1024 * 1024;
+        if (result.DelayedWriteRate == 0)
+        {
+            if (result.RateLimiter is not null) result.DelayedWriteRate = (ulong)Math.Max(0, result.RateLimiter.BytesPerSecond);
+            if (result.DelayedWriteRate == 0) result.DelayedWriteRate = 16 * 1024 * 1024;
+        }
     }
 
     /// <summary>ColumnFamilyData::ValidateOptions: read_triggered_compaction_threshold must be &gt;= 0 and finite.</summary>
@@ -301,7 +433,7 @@ internal sealed partial class DbImpl
         {
             if (!MutableDbOptionNames.Contains(kv.Key))
             {
-                if (candidate.GetOption(kv.Key) is null) ThrowHelper.InvalidArgument("Unrecognized option: " + kv.Key);
+                if (!candidate.IsKnownOption(kv.Key)) ThrowHelper.InvalidArgument("Unrecognized option: " + kv.Key);
                 ThrowHelper.InvalidArgument("Option not changeable: " + kv.Key);
             }
             try
@@ -338,14 +470,38 @@ internal sealed partial class DbImpl
     private async ValueTask ApplyDbOptionsAsync(DbOptions candidate, string description, bool synchronous, CancellationToken ct)
     {
         if (candidate.BytesPerSync == 0) candidate.BytesPerSync = 1024 * 1024;
-        // DBImpl::ValidateOptions subset for mutable options.
-        if (candidate.MaxBackgroundJobs < 1 && candidate.MaxBackgroundJobs != -1) ThrowHelper.InvalidArgument("max_background_jobs must be > 0");
-        if (candidate.MaxSubcompactions == 0) ThrowHelper.InvalidArgument("max_subcompactions must be > 0");
         if (synchronous) _setOptionsLock.Wait(ct);
         else await _setOptionsLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            // MutableDBOptionsAreEqual: nothing changes (and no OPTIONS file is written) when every value is the same.
+            bool anyChange = false;
+            foreach (string name in MutableDbOptionNames)
+            {
+                if (candidate.GetOption(name) != Options.GetOption(name))
+                {
+                    anyChange = true;
+                    break;
+                }
+            }
+            if (!anyChange)
+            {
+                LogInfo("SetDBOptions(), input option value is not changed, skipping updating.");
+                return;
+            }
+            // DBImpl::ValidateOptions(new_db_options), then ColumnFamilyData::ValidateOptions(new_db_options, cf_options)
+            // for every live column family.
+            if (candidate.MaxBackgroundJobs < 1 && candidate.MaxBackgroundJobs != -1) ThrowHelper.InvalidArgument("max_background_jobs must be > 0");
+            if (candidate.MaxSubcompactions == 0) ThrowHelper.InvalidArgument("max_subcompactions must be > 0");
+            ValidateDbOptions(candidate);
+            foreach (ColumnFamilyData c in GetColumnFamilies())
+            {
+                if (!c.Dropped) ValidateCfOptions(candidate, c.Options);
+            }
             uint oldDumpPeriod = Options.StatsDumpPeriodSec;
+            uint oldPersistPeriod = Options.StatsPersistPeriodSec;
+            bool walOtherOptionChanged = candidate.WalBytesPerSync != Options.WalBytesPerSync;
+            bool walSizeOptionChanged = candidate.MaxTotalWalSize != Options.MaxTotalWalSize;
             lock (_mutex)
             {
                 foreach (string name in MutableDbOptionNames)
@@ -353,6 +509,8 @@ internal sealed partial class DbImpl
                     string? v = candidate.GetOption(name);
                     if (v is not null && v != Options.GetOption(name)) Options.SetOption(name, v, preserveUnknown: false);
                 }
+                // versions_->ChangeOffpeakTimeOption: shared by the options of every column family.
+                if (OffpeakTime.DailyOffpeakTimeUtc != Options.DailyOffpeakTimeUtc) OffpeakTime.SetFromOffpeakTimeString(Options.DailyOffpeakTimeUtc);
                 // GetBGJobLimits (flush part); the compaction limit is read from the options on each scheduling decision.
                 int maxFlushes = Options.MaxBackgroundFlushes;
                 if (maxFlushes == -1 && Options.MaxBackgroundCompactions == -1) maxFlushes = Math.Max(1, Options.MaxBackgroundJobs / 4);
@@ -370,7 +528,33 @@ internal sealed partial class DbImpl
                 _statsDumpTimer = null;
                 StartStatsDump();
             }
+            // periodic_task_scheduler_.Register / Unregister(kPersistStats).
+            if (Options.StatsPersistPeriodSec != oldPersistPeriod) RestartStatsPersist();
             RescheduleCompactionTrigger();
+            if (walOtherOptionChanged || walSizeOptionChanged)
+            {
+                // SwitchWAL when wal_bytes_per_sync changed or the WALs already exceed a lowered max_total_wal_size: the
+                // column families holding the oldest WAL are flushed so it can be released.
+                WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
+                try
+                {
+                    if (walOtherOptionChanged || Volatile.Read(ref _walsTotalSize) > (long)GetMaxTotalWalSize())
+                    {
+                        try
+                        {
+                            await SwitchWalAsync(synchronous, ct).ConfigureAwait(false);
+                        }
+                        catch (Exception e) when (e is RocksDbException or IOException)
+                        {
+                            LogWarn("Unable to purge WAL files in SetDBOptions() -- " + e.Message);
+                        }
+                    }
+                }
+                finally
+                {
+                    ExitUnbatched(w, synchronous);
+                }
+            }
             LogInfo("SetDBOptions(), inputs:" + description);
             await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
             LogInfo("SetDBOptions() succeeded");

@@ -117,10 +117,10 @@ public sealed class DbOpenErrorTests
     {
         var fs = DbTestUtil.NewFs();
         List<string> tables = BuildTables(fs, 8);
-        // L0 is loaded newest first: the oldest table is past the limit of min(16, 20 / 4) = 5.
+        // L0 is loaded newest first: the oldest table is past the limit of min(16, (30 - 10) / 4) = 5.
         Truncate(fs, tables[0], 3);
         DbOptions o = DbTestUtil.NewOptions(fs);
-        o.MaxOpenFiles = 20;
+        o.MaxOpenFiles = 30;
         o.SkipStatsUpdateOnDbOpen = true;
         using (RocksDatabase db = RocksDatabase.Open(DbTestUtil.DbPath, o))
         {

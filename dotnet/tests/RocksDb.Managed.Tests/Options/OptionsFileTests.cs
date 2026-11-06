@@ -71,7 +71,8 @@ public sealed class OptionsFileTests
         Assert.AreEqual(CompressionType.Zstd, d.Compression);
         Assert.AreEqual(CompressionType.DisableCompressionOption, d.BottommostCompression);
         Assert.AreEqual(3, d.CompressionOpts.Level);
-        Assert.AreEqual("false", d.CompressionOpts.UnknownOptions["auto_skip"]);
+        Assert.IsFalse(d.CompressionOpts.AutoSkip);
+        Assert.AreEqual(0, d.CompressionOpts.UnknownOptions.Count);
         CollectionAssert.AreEqual(new List<int> { 1, 2, 3 }, d.MaxBytesForLevelMultiplierAdditional);
         Assert.AreEqual(8.5, d.MaxBytesForLevelMultiplier);
         Assert.AreEqual(128UL << 20, d.WriteBufferSize);

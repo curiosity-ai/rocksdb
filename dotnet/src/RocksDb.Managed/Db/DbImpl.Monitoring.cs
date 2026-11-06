@@ -418,6 +418,7 @@ internal sealed partial class DbImpl
     {
         _statsDumpTimer?.Dispose();
         _statsDumpTimer = null;
+        StopStatsPersist();
         StopCompactionTrigger();
         StopRecordSeqnoTimeWorker();
         InfoLogger? log = _infoLog;

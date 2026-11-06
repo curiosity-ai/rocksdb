@@ -56,6 +56,36 @@ internal static partial class UnixNative
         public int l_pid;
     }
 
+    /// <summary>struct rlimit (rlim_t is unsigned long on Linux, macOS and FreeBSD).</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RLimit
+    {
+        public nuint rlim_cur;
+        public nuint rlim_max;
+    }
+
+    [LibraryImport(LibC)]
+    private static partial int getrlimit(int resource, out RLimit rlim);
+
+    /// <summary>
+    /// Port of port::GetMaxOpenFiles (port/port_posix.cc): the soft RLIMIT_NOFILE limit capped at int.MaxValue, or -1
+    /// when unknown (Windows, or getrlimit unavailable / failing).
+    /// </summary>
+    public static int GetMaxOpenFiles()
+    {
+        if (!IsUnix) return -1;
+        try
+        {
+            int resource = IsLinux ? 7 : 8; // RLIMIT_NOFILE
+            if (getrlimit(resource, out RLimit l) != 0) return -1;
+            return l.rlim_cur >= int.MaxValue ? int.MaxValue : (int)l.rlim_cur;
+        }
+        catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException)
+        {
+            return -1;
+        }
+    }
+
     [LibraryImport(LibC, SetLastError = true)]
     private static partial int fdatasync(int fd);
 

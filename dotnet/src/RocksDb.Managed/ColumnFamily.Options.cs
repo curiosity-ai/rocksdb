@@ -86,4 +86,22 @@ public sealed partial class RocksDatabase
 
     /// <summary>A copy of the DB options currently in effect (DB::GetDBOptions).</summary>
     public DbOptions GetDBOptions() => _db.Options.Clone();
+
+    /// <summary>
+    /// The statistics history (DB::GetStatsHistory) in the window [<paramref name="startTime"/>,
+    /// <paramref name="endTime"/>) of seconds since the Unix epoch, oldest sample first. Every
+    /// <see cref="DbOptions.StatsPersistPeriodSec"/> seconds the DB samples the tickers of <see cref="DbOptions.Statistics"/>
+    /// (nothing is recorded without statistics) and keeps the deltas since the previous sample: in memory, bounded by
+    /// <see cref="DbOptions.StatsHistoryBufferSize"/> (oldest samples dropped first), or with
+    /// <see cref="DbOptions.PersistStatsToDisk"/> in the column family "___rocksdb_stats_history___" in native RocksDB's
+    /// key format, so native and managed read each other's history (a persisted sample at exactly
+    /// <paramref name="endTime"/> is included, like upstream's persistent iterator). Thread-safe.
+    /// </summary>
+    public IReadOnlyList<StatsHistorySlice> GetStatsHistory(ulong startTime, ulong endTime) => _db.GetStatsHistory(startTime, endTime);
 }
+
+/// <summary>
+/// One sample of the statistics history (StatsHistoryIterator::GetStatsTime / GetStatsMap): the ticker deltas
+/// (by upstream ticker name) since the previous sample, taken at <see cref="Time"/> (seconds since the Unix epoch).
+/// </summary>
+public sealed record StatsHistorySlice(ulong Time, IReadOnlyDictionary<string, ulong> Stats);

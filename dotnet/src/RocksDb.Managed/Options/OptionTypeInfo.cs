@@ -19,10 +19,26 @@ internal sealed class OptionTypeInfo<TOwner>
         Parse = parse;
     }
 
+    public OptionTypeInfo(string name, Func<TOwner, string> serialize, Action<TOwner, string?, string, bool> structParse)
+    {
+        Name = name;
+        Serialize = serialize;
+        StructParse = structParse;
+        Parse = (o, v) => structParse(o, null, v, false);
+    }
+
     public string Name { get; }
     public Func<TOwner, string> Serialize { get; }
     /// <summary>Parses the (unescaped) value; throws <see cref="RocksDbException"/> (InvalidArgument) on bad input.</summary>
     public Action<TOwner, string> Parse { get; }
+
+    /// <summary>
+    /// Struct options only (OptionTypeInfo::Struct / ParseStruct, options/options_helper.cc): parses the whole struct
+    /// (field = null, value "{a=1;b=2;}") or one field (field = "a" for the option name "struct.a"), applying only the
+    /// named fields to a copy of the current struct. Unknown fields fail with InvalidArgument ("Unrecognized option:
+    /// struct.field") unless preserveUnknown is set, in which case they are kept verbatim.
+    /// </summary>
+    public Action<TOwner, string?, string, bool>? StructParse { get; }
 }
 
 /// <summary>Builder + lookup for an option table.</summary>
@@ -35,12 +51,98 @@ internal sealed class OptionTable<TOwner>
 
     public bool TryGet(string name, out OptionTypeInfo<TOwner> info) => _byName.TryGetValue(name, out info!);
 
+    private readonly HashSet<string> _deprecated = new(StringComparer.Ordinal);
+
+    /// <summary>True for names registered with <see cref="Deprecated"/>.</summary>
+    public bool IsDeprecated(string name) => _deprecated.Contains(name);
+
+    /// <summary>
+    /// Names upstream still accepts but ignores (OptionVerificationType::kDeprecated): parsing them succeeds and does
+    /// nothing, and they are never written.
+    /// </summary>
+    public OptionTable<TOwner> Deprecated(params string[] names)
+    {
+        foreach (string n in names) _deprecated.Add(n);
+        return this;
+    }
+
+    /// <summary>
+    /// An alternative name accepted when parsing (never written), e.g. upstream's misspelled
+    /// memtable_veirfy_per_key_checksum_on_seek. <paramref name="target"/> must already be registered.
+    /// </summary>
+    public OptionTable<TOwner> Alias(string alias, string target)
+    {
+        _aliases.Add(alias, _byName[target]);
+        return this;
+    }
+
+    private readonly Dictionary<string, OptionTypeInfo<TOwner>> _aliases = new(StringComparer.Ordinal);
+
+    /// <summary>Resolves a name registered with <see cref="Alias"/>.</summary>
+    public bool TryGetAlias(string name, out OptionTypeInfo<TOwner> info) => _aliases.TryGetValue(name, out info!);
+
     public OptionTable<TOwner> Add(string name, Func<TOwner, string> serialize, Action<TOwner, string> parse)
     {
         var info = new OptionTypeInfo<TOwner>(name, serialize, parse);
         _list.Add(info);
         _byName.Add(name, info);
         return this;
+    }
+
+    /// <summary>
+    /// A struct option (OptionTypeInfo::Struct): serialized as "{a=1;b=2;}". Parsing applies only the named fields onto
+    /// a copy of the current value (a partial update keeps the other fields, like OptionTypeInfo::ParseStruct), and the
+    /// option name "name.field" sets one field. <paramref name="legacyParse"/> handles an old scalar form (a value
+    /// without '=' given for the whole struct), e.g. compaction_options_fifo=23 or compression_opts=-14:32767:0.
+    /// </summary>
+    public OptionTable<TOwner> Struct<TStruct>(string name, Func<TOwner, TStruct> get, Action<TOwner, TStruct> set,
+        Action<TStruct, string>? legacyParse) where TStruct : PersistedOptions<TStruct>, new()
+    {
+        var info = new OptionTypeInfo<TOwner>(name, o => OptionStrings.FormatStruct(get(o).ToOptionsList()),
+            (o, field, value, preserveUnknown) =>
+            {
+                var copy = new TStruct();
+                copy.CopyFrom(get(o));
+                if (field is null)
+                {
+                    if (legacyParse is not null && !value.Contains('=', StringComparison.Ordinal))
+                    {
+                        legacyParse(copy, value.Trim());
+                    }
+                    else
+                    {
+                        foreach (KeyValuePair<string, string> kv in OptionStrings.ParseStruct(name, value))
+                        {
+                            ApplyStructField(copy, name, kv.Key, kv.Value, preserveUnknown);
+                        }
+                    }
+                }
+                else
+                {
+                    ApplyStructField(copy, name, field, value, preserveUnknown);
+                }
+                set(o, copy);
+            });
+        _list.Add(info);
+        _byName.Add(name, info);
+        return this;
+    }
+
+    private static void ApplyStructField<TStruct>(TStruct target, string structName, string field, string value, bool preserveUnknown)
+        where TStruct : PersistedOptions<TStruct>
+    {
+        if (target.IsKnownOption(field))
+        {
+            target.SetOption(field, value, preserveUnknown);
+        }
+        else if (preserveUnknown)
+        {
+            target.UnknownOptions[field] = value;
+        }
+        else
+        {
+            ThrowHelper.InvalidArgument("Unrecognized option: " + structName + "." + field);
+        }
     }
 
     public OptionTable<TOwner> Bool(string name, Func<TOwner, bool> get, Action<TOwner, bool> set) =>
@@ -256,6 +358,15 @@ internal static class OptionEnumMaps
         ("kVolatileTier", Cache.CacheTier.VolatileTier),
         ("kVolatileCompressedTier", Cache.CacheTier.VolatileCompressedTier),
         ("kNonVolatileBlockTier", Cache.CacheTier.NonVolatileBlockTier),
+    ]);
+
+    /// <summary>pinning_tier_type_string_map (table/block_based/block_based_table_factory.cc).</summary>
+    public static readonly EnumMap<Managed.PinningTier> PinningTier = new(
+    [
+        ("kFallback", Managed.PinningTier.Fallback),
+        ("kNone", Managed.PinningTier.None),
+        ("kFlushedAndSimilar", Managed.PinningTier.FlushedAndSimilar),
+        ("kAll", Managed.PinningTier.All),
     ]);
 
     public static readonly EnumMap<PrepopulateBlockCache> PrepopulateBlockCache = new(

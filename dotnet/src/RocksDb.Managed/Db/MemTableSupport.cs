@@ -92,6 +92,8 @@ public sealed class MemTableOptions
         if (!KvChecksum.IsSupportedLength(options.BlockProtectionBytesPerKey))
             ThrowHelper.NotSupported("Block per key-value checksum protection only supports 0, 1, 2, 4 or 8 bytes per key.");
         ProtectionBytesPerKey = options.MemtableProtectionBytesPerKey;
+        // memtable_max_range_deletions (MutableCFOptions): read by memtables created from now on.
+        MaxRangeDeletions = options.MemtableMaxRangeDeletions;
         InplaceCallback = options.InplaceCallback;
         InsertWithHintPrefixExtractor = options.MemtableInsertWithHintPrefixExtractor;
     }

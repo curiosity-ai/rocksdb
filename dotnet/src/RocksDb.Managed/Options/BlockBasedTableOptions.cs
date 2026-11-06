@@ -207,7 +207,19 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
             static (o, v) => o._udiFactory.Parse(v, CreateUserDefinedIndexFactory, static f => f.Name))
         .Enum("index_mode", OptionEnumMaps.IndexMode, static o => o._indexMode, static (o, v) => o._indexMode = v)
         .Bool("use_udi_as_primary_index", static o => o.UseUdiAsPrimaryIndex, static (o, v) => o.UseUdiAsPrimaryIndex = v)
-        .Bool("fail_if_no_udi_on_open", static o => o.FailIfNoUdiOnOpen, static (o, v) => o.FailIfNoUdiOnOpen = v);
+        .Bool("fail_if_no_udi_on_open", static o => o.FailIfNoUdiOnOpen, static (o, v) => o.FailIfNoUdiOnOpen = v)
+        .Struct("metadata_cache_options", static o => o.MetadataCacheOptions, static (o, v) => o.MetadataCacheOptions = v, null)
+        // OptionVerificationType::kDeprecated entries of block_based_table_type_info: accepted and ignored.
+        .Deprecated("hash_index_allow_collision", "index_per_partition", "reserve_table_builder_memory",
+            "reserve_table_reader_memory", "skip_table_builder_flush", "block_cache_compressed");
+
+    /// <summary>
+    /// metadata_cache_options: per-tier pinning of metadata blocks in the block cache (MetadataCacheOptions,
+    /// include/rocksdb/table.h). Typed and persisted; the managed reader pins by
+    /// <see cref="PinL0FilterAndIndexBlocksInCache"/> / <see cref="PinTopLevelIndexAndFilter"/> (the kFallback behaviour)
+    /// whatever the tiers say (listed under "Not ported yet").
+    /// </summary>
+    public MetadataCacheOptions MetadataCacheOptions { get; set; } = new();
 
     /// <summary>
     /// Resolves a user_defined_index_factory id (IndexFactory::CreateFromString with the built-in registry): "trie_index"
@@ -231,4 +243,26 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
         c._filterPolicy = _filterPolicy;
         return c;
     }
+}
+
+/// <summary>
+/// Port of rocksdb::MetadataCacheOptions (include/rocksdb/table.h); persisted as the struct
+/// <c>metadata_cache_options={top_level_index_pinning=...;partition_pinning=...;unpartitioned_pinning=...;}</c>
+/// (metadata_cache_options_type_info, table/block_based/block_based_table_factory.cc).
+/// </summary>
+public sealed class MetadataCacheOptions : PersistedOptions<MetadataCacheOptions>
+{
+    /// <summary>Tables whose top-level index into metadata partitions is pinned (needs cache_index_and_filter_blocks).</summary>
+    public PinningTier TopLevelIndexPinning { get; set; } = PinningTier.Fallback;
+    /// <summary>Tables whose metadata partitions are pinned.</summary>
+    public PinningTier PartitionPinning { get; set; } = PinningTier.Fallback;
+    /// <summary>Tables whose unpartitioned metadata blocks are pinned (needs cache_index_and_filter_blocks).</summary>
+    public PinningTier UnpartitionedPinning { get; set; } = PinningTier.Fallback;
+
+    private static readonly OptionTable<MetadataCacheOptions> s_table = new OptionTable<MetadataCacheOptions>()
+        .Enum("top_level_index_pinning", OptionEnumMaps.PinningTier, static o => o.TopLevelIndexPinning, static (o, v) => o.TopLevelIndexPinning = v)
+        .Enum("partition_pinning", OptionEnumMaps.PinningTier, static o => o.PartitionPinning, static (o, v) => o.PartitionPinning = v)
+        .Enum("unpartitioned_pinning", OptionEnumMaps.PinningTier, static o => o.UnpartitionedPinning, static (o, v) => o.UnpartitionedPinning = v);
+
+    internal override OptionTable<MetadataCacheOptions> OptionTable => s_table;
 }
