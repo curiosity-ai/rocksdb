@@ -47,6 +47,7 @@ public sealed class InternalKeyComparator
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int CompareUserKey(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
     {
+        PerfContext.Add(PerfMetric.UserKeyComparisonCount, 1); // UserComparatorWrapper::Compare
         if (_kind == ComparatorKind.Bytewise) return ByteCompare.Compare(a, b);
         if (_kind == ComparatorKind.ReverseBytewise) return ByteCompare.Compare(b, a);
         return _user.Compare(a, b);

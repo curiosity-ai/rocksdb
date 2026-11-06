@@ -224,7 +224,10 @@ internal sealed partial class DbImpl
         var lkey = new LookupKey(key, snapshot, ts, scratch);
         try
         {
-            if (GetFromMemTables(sv, lkey, ctx))
+            long perfMem = PerfContext.StartTimer(); // PERF_TIMER_GUARD(get_from_memtable_time)
+            bool fromMemTable = GetFromMemTables(sv, lkey, ctx);
+            PerfContext.StopTimer(PerfMetric.GetFromMemtableTime, perfMem);
+            if (fromMemTable)
             {
                 ctx.FromMemTable = true;
                 // A blob index is resolved while the super version (and so its blob files) is referenced.
@@ -236,8 +239,10 @@ internal sealed partial class DbImpl
                 if (ctx.State == GetContext.GetState.NotFound) return;
                 ThrowHelper.Corruption("Incomplete: merge operands not all in memtables");
             }
+            long perfFiles = PerfContext.StartTimer(); // PERF_TIMER_GUARD(get_from_output_files_time)
             GetFromVersion(cfd, sv.Current, lkey.InternalKey, lkey.UserKey, snapshot, ctx);
             ctx.ResolveBlob(cfd.BlobSource, sv.Current.Storage, options, key);
+            PerfContext.StopTimer(PerfMetric.GetFromOutputFilesTime, perfFiles);
         }
         finally
         {
@@ -251,6 +256,7 @@ internal sealed partial class DbImpl
         GetContext? tsSink = ctx.TimestampSize != 0 ? ctx : null;
         ReadCallback? cb = ctx.Callback;
         int operands = ctx.MergeContext.Count;
+        PerfContext.Add(PerfMetric.GetFromMemtableCount, 1); // MemTable::Get, once per memtable searched
         MemTableGetResult r = sv.Mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb);
         // GetMergeOperands with continue_cb: the callback may end the lookup at an operand of this memtable.
         if (ctx.ContinueCallback is not null && ctx.ApplyContinueCallback(operands)) return true;
@@ -259,6 +265,7 @@ internal sealed partial class DbImpl
         for (int i = 0; i < imm.Length; i++)
         {
             operands = ctx.MergeContext.Count;
+            PerfContext.Add(PerfMetric.GetFromMemtableCount, 1);
             r = imm[i].Get(lkey, out v, out t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb);
             if (ctx.ContinueCallback is not null && ctx.ApplyContinueCallback(operands)) return true;
             if (ctx.ApplyMemTableResult(r, v, t)) return true;

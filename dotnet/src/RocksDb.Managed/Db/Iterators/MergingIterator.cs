@@ -136,6 +136,7 @@ public sealed class MergingIterator : InternalIterator
     public override void Seek(ReadOnlySpan<byte> target)
     {
         ClearHeap(forward: true);
+        PerfContext.Add(PerfMetric.SeekChildSeekCount, (ulong)_children.Length); // MergingIterator::SeekImpl, per child
         for (int i = 0; i < _children.Length; i++)
         {
             InternalIterator c = _children[i];
@@ -148,6 +149,7 @@ public sealed class MergingIterator : InternalIterator
     public override void SeekForPrev(ReadOnlySpan<byte> target)
     {
         ClearHeap(forward: false);
+        PerfContext.Add(PerfMetric.SeekChildSeekCount, (ulong)_children.Length);
         for (int i = 0; i < _children.Length; i++)
         {
             InternalIterator c = _children[i];

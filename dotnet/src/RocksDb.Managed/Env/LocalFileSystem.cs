@@ -307,6 +307,7 @@ internal sealed class LocalRandomAccessFile : IRandomAccessFile
                 if (n == 0) break;
                 total += n;
             }
+            IOStatsContext.Add(IOStatsMetric.BytesRead, (ulong)total); // RandomAccessFileReader::Read: IOSTATS_ADD(bytes_read)
             return total;
         }
         catch (IOException e)
@@ -327,6 +328,7 @@ internal sealed class LocalRandomAccessFile : IRandomAccessFile
             // Page cache hit: complete synchronously instead of a thread pool round trip (RandomAccess.ReadAsync on
             // Unix runs a blocking pread on the pool). A short count means only part of the range is cached.
             int got = UnixNative.TryReadNoWait(_handle, destination.Span, offset);
+            IOStatsContext.Add(IOStatsMetric.BytesRead, (ulong)Math.Max(got, 0));
             if (got == destination.Length || got == 0) return new ValueTask<int>(got);
             if (got > 0) return ReadAsyncSlow(default, got, offset, destination, cancellationToken);
         }
@@ -855,6 +857,7 @@ internal sealed class LocalWritableFile : IWritableFile
 
     private void WriteRaw(ReadOnlySpan<byte> data, long offset)
     {
+        IOStatsContext.Add(IOStatsMetric.BytesWritten, (ulong)data.Length); // WritableFileWriter: IOSTATS_ADD(bytes_written)
         Preallocate(offset + data.Length);
         try
         {
@@ -883,6 +886,7 @@ internal sealed class LocalWritableFile : IWritableFile
 
     private ValueTask WriteRawAsync(ReadOnlyMemory<byte> data, long offset, CancellationToken cancellationToken)
     {
+        IOStatsContext.Add(IOStatsMetric.BytesWritten, (ulong)data.Length);
         if (_alignment == 0 && _options.RateLimiter is null && !data.IsEmpty)
         {
             if (UnixNative.NoWaitWriteSupported)
@@ -978,7 +982,9 @@ internal sealed class LocalWritableFile : IWritableFile
     public void Sync()
     {
         Flush();
+        long perfSync = PerfContext.StartTimer(); // IOSTATS_TIMER_GUARD(fsync_nanos)
         UnixNative.DataSync(_handle, _path);
+        IOStatsContext.StopTimer(IOStatsMetric.FsyncNanos, perfSync);
     }
 
     public ValueTask SyncAsync(CancellationToken cancellationToken = default)

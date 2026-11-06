@@ -37,7 +37,9 @@ internal sealed partial class DbImpl
     /// </summary>
     private void InitInfoLog()
     {
-        if (Environment.GetEnvironmentVariable("RDB_NOLOG") == "1") return; // TEMP
+        // Upstream writes the open header (version, DB summary, options) in the DBImpl constructor, before Recover; the
+        // managed header needs the recovered state, so events of the recovery are held back until it was written.
+        _deferredEvents = [];
         if (Options.InfoLog is { } user)
         {
             _infoLog = user;
@@ -68,7 +70,35 @@ internal sealed partial class DbImpl
     {
         if (_infoLog is null || !_infoLog.IsEnabled(InfoLogLevel.Info)) return;
         ulong micros = (ulong)(DateTime.UtcNow - DateTime.UnixEpoch).Ticks / 10;
-        _infoLog.Log(InfoLogLevel.Info, "EVENT_LOG_v1 {\"time_micros\": " + micros.ToString(CultureInfo.InvariantCulture) + ", " + fields + "}");
+        string line = "EVENT_LOG_v1 {\"time_micros\": " + micros.ToString(CultureInfo.InvariantCulture) + ", " + fields + "}";
+        List<string>? deferred = _deferredEvents;
+        if (deferred is not null)
+        {
+            lock (deferred)
+            {
+                if (_deferredEvents is not null)
+                {
+                    deferred.Add(line);
+                    return;
+                }
+            }
+        }
+        _infoLog.Log(InfoLogLevel.Info, line);
+    }
+
+    // Events logged during open before the header (see InitInfoLog); null once written.
+    private List<string>? _deferredEvents;
+
+    /// <summary>Writes the events held back during open (after the open header, or when the open failed).</summary>
+    private void FlushDeferredEvents()
+    {
+        List<string>? deferred = _deferredEvents;
+        if (deferred is null) return;
+        lock (deferred)
+        {
+            _deferredEvents = null;
+            foreach (string line in deferred) _infoLog?.Log(InfoLogLevel.Info, line);
+        }
     }
 
     /// <summary>Status::ToString of a file operation's outcome ("OK", or the error).</summary>
@@ -168,7 +198,11 @@ internal sealed partial class DbImpl
     private void LogOpenSummary()
     {
         InfoLogger? log = _infoLog;
-        if (log is null) return;
+        if (log is null)
+        {
+            _deferredEvents = null;
+            return;
+        }
         try
         {
             LogHeader("RocksDB version: 11.14.0 (RocksDb.Managed " + typeof(DbImpl).Assembly.GetName().Version + ")");
@@ -204,6 +238,10 @@ internal sealed partial class DbImpl
         catch (Exception e) when (e is IOException or RocksDbException or InvalidOperationException)
         {
             // Never fail the open because of logging.
+        }
+        finally
+        {
+            FlushDeferredEvents();
         }
     }
 

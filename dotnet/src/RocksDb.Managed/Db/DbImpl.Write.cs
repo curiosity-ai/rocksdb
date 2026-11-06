@@ -392,8 +392,10 @@ internal sealed partial class DbImpl
                     bdw.ClearTouched();
                 }
             }
+            long perfWal = PerfContext.StartTimer(); // PERF_TIMER_GUARD(write_wal_time)
             ValueTask<(ulong Last, int WalBytes)> commit = AllocateAndWriteGroupToWalAsync(group, leader, firstValid, valid, total, needSync, synchronous);
             (ulong last, int walRecordBytes) = commit.IsCompletedSuccessfully ? commit.Result : await commit.ConfigureAwait(false);
+            PerfContext.StopTimer(PerfMetric.WriteWalTime, perfWal);
             if (_seqPerBatch && valid > 0) RunGroupPreReleaseCallbacks(group, leader);
 
             if (_pipelined)
@@ -410,7 +412,9 @@ internal sealed partial class DbImpl
             }
             else
             {
+                long perfMem = PerfContext.StartTimer(); // PERF_TIMER_GUARD(write_memtable_time)
                 InsertGroupSerially(group, leader, total, last, walRecordBytes, needSync);
+                PerfContext.StopTimer(PerfMetric.WriteMemtableTime, perfMem);
             }
         }
         catch (Exception e)

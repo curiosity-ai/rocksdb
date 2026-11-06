@@ -962,6 +962,7 @@ public sealed partial class BlockBasedTableReader : TableReader
             if (LookupCache(cache, key, kind, out CachedBlock h))
             {
                 _stats?.Record(HitCounter(kind));
+                PerfContext.Add(PerfMetric.BlockCacheHitCount, 1); // BlockBasedTable::UpdateCacheHitMetrics
                 if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, Unsafe.As<Block>(h.Value), hit: true, flags);
                 return BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h);
             }
@@ -1473,6 +1474,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         {
             bool mayMatch = FilterMayMatch(userKey, internalKey, flags);
             _stats?.Record(mayMatch ? BlockCacheCounter.BloomFilterFullPositive : BlockCacheCounter.BloomFilterUseful);
+            PerfContext.Add(mayMatch ? PerfMetric.BloomSstHitCount : PerfMetric.BloomSstMissCount, 1);
             return mayMatch;
         }
         SliceTransform? pe = _options.PrefixExtractor;
