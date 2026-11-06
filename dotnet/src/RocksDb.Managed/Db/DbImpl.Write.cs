@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using RocksDb.Managed.Env;
+using RocksDb.Managed.Util;
 using RocksDb.Managed.Wal;
 
 namespace RocksDb.Managed.Db;
@@ -178,15 +179,24 @@ internal sealed partial class DbImpl
                 }
                 Debug.Assert(state == WriteThread.StateGroupLeader);
             }
-            ValueTask<int> lead = LeadWriteGroupAsync(w, synchronous, cancellationToken);
+            ValueTask<int> lead = LeadWriteGroup(w, synchronous, cancellationToken);
+            int leadState;
             if (synchronous)
             {
                 Debug.Assert(lead.IsCompleted);
-                lead.GetAwaiter().GetResult();
+                leadState = lead.GetAwaiter().GetResult();
             }
             else
             {
-                await lead.ConfigureAwait(false);
+                leadState = await lead.ConfigureAwait(false);
+            }
+            if (leadState == WriteThread.StateParallelMemtableWriter)
+            {
+                // The leader launched a parallel memtable group: insert its own batch, then wait for the others.
+                ParallelMemTableInsert(w);
+                if (CompleteParallelMemTableWriter()) FinishParallelGroup(w);
+                else if (synchronous) w.WaitSync();
+                else await w.WaitAsync().ConfigureAwait(false);
             }
             if (w.Error is { } err) ThrowWriteError(err);
         }
@@ -256,7 +266,7 @@ internal sealed partial class DbImpl
             if (!_writeThread.JoinBatchGroup(w)) state = synchronous ? w.WaitSync() : await w.WaitAsync().ConfigureAwait(false);
             if (state == WriteThread.StateGroupLeader)
             {
-                ValueTask<int> lead = LeadWriteGroupAsync(w, synchronous, cancellationToken);
+                ValueTask<int> lead = LeadWriteGroup(w, synchronous, cancellationToken);
                 if (synchronous)
                 {
                     Debug.Assert(lead.IsCompleted);
@@ -407,14 +417,29 @@ internal sealed partial class DbImpl
 
     // ---- leader -----------------------------------------------------------------------------------------
 
+    /// <summary><see cref="LeadWriteGroupAsync"/> with the leader's own reusable state machine box.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ValueTask<int> LeadWriteGroup(WriteThread.Writer leader, bool synchronous, CancellationToken cancellationToken)
+    {
+        OwnedValueTaskMethodBuilder<int>.SetNextSlot(leader.LeadBox);
+        return LeadWriteGroupAsync(leader, synchronous, cancellationToken);
+    }
+
     /// <summary>
     /// Commits the group led by <paramref name="leader"/>: PreprocessWrite, sequence allocation, one WAL record for the
     /// whole group, memtable inserts, publication of the last sequence, then wakes the followers
     /// (DBImpl::WriteImpl, non-pipelined). With pipelined writes only the WAL stage: the group is then linked to the
     /// memtable writer queue, and the result is the leader's next state (see
-    /// <see cref="WriteThread.ExitAsPipelinedWalLeader"/>); otherwise it is <see cref="WriteThread.StateCompleted"/>.
+    /// <see cref="WriteThread.ExitAsPipelinedWalLeader"/>); otherwise it is <see cref="WriteThread.StateCompleted"/>, or
+    /// <see cref="WriteThread.StateParallelMemtableWriter"/> when the group's memtable inserts run in parallel (the caller
+    /// then inserts the leader's own batch and waits for the group like a parallel follower).
     /// </summary>
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    /// <remarks>
+    /// Built with <see cref="OwnedValueTaskMethodBuilder{TResult}"/>: when the leader suspends (async WAL write, write
+    /// stall), its state machine lives in the leader writer's <see cref="WriteThread.Writer.LeadBox"/>,
+    /// so concurrent async writers do not allocate boxes. Callers go through <see cref="LeadWriteGroup"/>.
+    /// </remarks>
+    [AsyncMethodBuilder(typeof(OwnedValueTaskMethodBuilder<>))]
     private async ValueTask<int> LeadWriteGroupAsync(WriteThread.Writer leader, bool synchronous, CancellationToken cancellationToken)
     {
         List<WriteThread.Writer> group = _group;
@@ -490,14 +515,11 @@ internal sealed partial class DbImpl
                 _writeThread.ExitAsBatchGroupLeader(group);
             }
         }
-        if (parallel)
-        {
-            ParallelMemTableInsert(leader);
-            if (CompleteParallelMemTableWriter()) FinishParallelGroup(leader);
-            else if (synchronous) leader.WaitSync();
-            else await leader.WaitAsync().ConfigureAwait(false);
-        }
-        return leaderState;
+        // LaunchParallelMemTableWriters: the leader inserts its own batch like any parallel memtable writer. That part
+        // (and its wait for the other writers) is run by the caller, so that the wait suspends the caller's pooled state
+        // machine rather than this one (a wake-up of this method's box would be queued to the thread pool through an
+        // allocated work item).
+        return parallel ? WriteThread.StateParallelMemtableWriter : leaderState;
     }
 
     /// <summary>
