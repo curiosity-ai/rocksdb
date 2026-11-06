@@ -9,8 +9,43 @@ namespace RocksDb.Managed;
 /// The <see cref="Name"/> is persisted in the OPTIONS file and table properties ("rocksdb.merge.operator").
 /// Implementations must be thread-safe (called concurrently from reads, flush and compaction).
 /// </summary>
+[System.Diagnostics.CodeAnalysis.DynamicallyAccessedMembers(System.Diagnostics.CodeAnalysis.DynamicallyAccessedMemberTypes.PublicMethods)]
 public abstract class MergeOperator
 {
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, byte> s_overrides = new();
+    private const byte OverridesV3Flag = 1, OverridesScopedFlag = 2;
+    private readonly byte _overrides;
+
+    protected MergeOperator()
+    {
+        // Which merge entry points the concrete type overrides, so that the common case (a FullMergeV2-style operator
+        // and a plain or no base value) calls FullMerge directly instead of going through the FullMergeV3 adapter.
+        // The class annotation keeps the public methods of derived types for this lookup under trimming / AOT.
+        Type t = GetType();
+        if (!s_overrides.TryGetValue(t, out _overrides))
+        {
+            byte f = 0;
+            System.Reflection.MethodInfo? v3 = t.GetMethod(nameof(FullMergeV3), System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance,
+                [typeof(MergeOperationInputV3).MakeByRefType(), typeof(MergeOperationOutputV3).MakeByRefType()]);
+            if (v3 is null || v3.DeclaringType != typeof(MergeOperator)) f |= OverridesV3Flag;
+            System.Reflection.MethodInfo? scoped = t.GetMethod(nameof(FullMerge), System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance,
+                [typeof(ReadOnlySpan<byte>), typeof(bool), typeof(ReadOnlySpan<byte>), typeof(MergeOperands).MakeByRefType(), typeof(IBufferWriter<byte>),
+                    typeof(MergeOperationFailureScope).MakeByRefType()]);
+            if (scoped is null || scoped.DeclaringType != typeof(MergeOperator)) f |= OverridesScopedFlag;
+            _overrides = f;
+            s_overrides.TryAdd(t, f);
+        }
+    }
+
+    /// <summary>True if the concrete type overrides <see cref="FullMergeV3"/> (otherwise its default adapter applies).</summary>
+    internal bool OverridesFullMergeV3 => (_overrides & OverridesV3Flag) != 0;
+
+    /// <summary>True if the concrete type overrides the FullMerge overload that reports a failure scope.</summary>
+    internal bool OverridesScopedFullMerge => (_overrides & OverridesScopedFlag) != 0;
+
+    /// <summary>Neither is overridden: every non-entity merge is the five-argument FullMerge.</summary>
+    internal bool IsPlainFullMergeV2 => _overrides == 0;
+
     public abstract string Name { get; }
 
     /// <summary>

@@ -161,7 +161,7 @@ changes there need their own review.
 | `Db/DbImpl.Transactions.cs` | 524 | db/logs_with_prep_tracker.cc, db/db_impl/db_impl_files.cc, db/db_impl/db_impl.cc | line-by-line (feature audit: transactions) |
 | `Db/DbImpl.Write.cs` | 760 | db/db_impl/db_impl_write.cc, db/write_batch.cc (MemTableInserter) | line-by-line (#2) |
 | `Db/DbImpl.cs` | 612 | db/db_impl/db_impl.cc, db/db_impl/db_impl_compaction_flush.cc | line-by-line (#2) |
-| `Db/DbWithTtl.cs` | 310 | utilities/ttl/db_ttl_impl.{h,cc}, utilities/ttl/db_ttl_impl.cc | line-by-line (#3): utilities/ttl/db_ttl_impl.cc; **fixed** IsStale sign |
+| `Db/DbWithTtl.cs` | 310 | utilities/ttl/db_ttl_impl.{h,cc}, utilities/ttl/db_ttl_impl.cc | line-by-line (#3): utilities/ttl/db_ttl_impl.cc; **fixed** IsStale sign; second review: TtlMergeOperator, SanitizeOptions (filter vs factory), column families / ttls, SetTtl / GetTtl, CreateColumnFamilyWithTtl |
 | `Db/ErrorHandler.cs` | 755 | db/error_handler.{h,cc}, db/event_helpers.cc, db/error_handler.cc | line-by-line (feature audit: errors/listeners/backups (+ #3 severity maps)) |
 | `Db/EventListener.Notifications.cs` | 351 | db/event_helpers.cc, db/db_impl/db_impl_compaction_flush.cc (NotifyOn*) | line-by-line (feature audit: errors/listeners/backups) |
 | `Db/EventListener.cs` | 293 | include/rocksdb/listener.h | line-by-line (feature audit: errors/listeners/backups) |
@@ -191,8 +191,8 @@ changes there need their own review.
 | `Db/MemTableRangeTombstones.cs` | 291 | db/range_tombstone_fragmenter.{h,cc} | line-by-line (#1) |
 | `Db/MemTableSupport.cs` | 185 | db/memtable.cc, db/column_family.cc, db/merge_context.h | line-by-line (#1) |
 | `Db/MergeHelper.BuiltinOperators.cs` | 415 | utilities/merge_operators/uint64add.cc, utilities/merge_operators/string_append/stringappend.cc, stringappend2.cc, utilities/merge_operators/max.cc, put.cc, sortlist.cc, bytesxor.cc, db/merge_operator.cc | line-by-line (#1); line-by-line (feature audit: built-in merge operators) |
-| `Db/MergeHelper.cs` | 517 | db/merge_context.h | line-by-line (#1) |
-| `Db/MergeOperator.cs` | 139 | include/rocksdb/merge_operator.h, utilities/merge_operators.cc | line-by-line (#1); line-by-line (feature audit: built-in merge operators): RegisterBuiltinMergeOperators names |
+| `Db/MergeHelper.cs` | 517 | db/merge_context.h | line-by-line (#1); second review: db/merge_helper.cc TimedFullMergeCommonImpl / TimedFullMergeImpl visitors, MergeUntil op_failure_scope (kMustMerge) |
+| `Db/MergeOperator.cs` | 139 | include/rocksdb/merge_operator.h, utilities/merge_operators.cc | line-by-line (#1); line-by-line (feature audit: built-in merge operators): RegisterBuiltinMergeOperators names; second review: db/merge_operator.cc FullMergeV3 default, OpFailureScope, MergeOperationInputV3 / OutputV3 |
 | `Db/RangeDelAggregator.cs` | 363 | db/range_del_aggregator.{h,cc}, db/dbformat.h | line-by-line (#1) |
 | `Db/Repair.cs` | 348 | db/repair.cc (Repairer) | line-by-line (feature audit: tracing, tools and repair) |
 | `Db/SeqnoToTimeMapping.cs` | 485 | db/seqno_to_time_mapping.{h,cc} | line-by-line (tiering pass: validation.md "Compaction triggers and tiering") |
@@ -334,7 +334,7 @@ changes there need their own review.
 | `Utilities/Transactions/RangeLockTree.cs` | 861 | utilities/transactions/lock/range/range_tree/range_tree_lock_tracker.cc, lib/locktree/{locktree,lock_request,manager,keyrange,treenode,concurrent_tree,wfg,range_buffer}.cc | line-by-line (feature audit: transactions (range locking)) |
 | `Utilities/Transactions/RangeLockTypes.cs` | 57 | include/rocksdb/utilities/transaction.h (Endpoint), include/rocksdb/utilities/transaction_db.h (RangeLockInfo, RangeDeadlockInfo/Path, Counters) | line-by-line (feature audit: transactions (range locking)) |
 | `Utilities/Transactions/RocksDatabase.Transactions.cs` | 9 | (API glue) | managed-only, design-reviewed (#3): API glue |
-| `Utilities/Transactions/Transaction.cs` | 679 | include/rocksdb/utilities/transaction.h, utilities/transactions/transaction_base.cc | line-by-line (feature audit: transactions) |
+| `Utilities/Transactions/Transaction.cs` | 679 | include/rocksdb/utilities/transaction.h, utilities/transactions/transaction_base.cc | line-by-line (feature audit: transactions); second review: transaction_base.cc MultiGet / MultiGetForUpdate, assume_tracked writes, counters, DisableIndexing, SetLockTimeout |
 | `Utilities/Transactions/Transaction.Entities.cs` | 286 | include/rocksdb/utilities/transaction.h, utilities/transactions/transaction_base.cc (PutEntity, GetEntity, MultiGetEntity, GetEntityForUpdate, NewMultiCfIterator), pessimistic_transaction.cc (WriteCommittedTxn::GetEntityForUpdate) | line-by-line (feature audit: transactions (entities)) |
 | `Utilities/Transactions/TransactionDbMutex.cs` | 170 | include/rocksdb/utilities/transaction_db_mutex.h, utilities/transactions/transaction_db_mutex_impl.cc | line-by-line (feature audit: utilities) |
 | `Utilities/Transactions/TransactionDatabase.cs` | 347 | utilities/transactions/pessimistic_transaction_db.cc | line-by-line (feature audit: transactions) |

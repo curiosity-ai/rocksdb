@@ -268,6 +268,19 @@ public sealed class MergeOperatorV3Tests
         Assert.AreEqual("fail", S(r[r.Count - 1]));
     }
 
+    /// <summary>The override detection behind the direct FullMergeV2 fast path.</summary>
+    [TestMethod]
+    public void OverrideDetection()
+    {
+        Assert.IsFalse(MergeOperator.UInt64Add.OverridesFullMergeV3);
+        Assert.IsFalse(MergeOperator.UInt64Add.OverridesScopedFullMerge);
+        Assert.IsFalse(MergeOperator.StringAppend(",").OverridesFullMergeV3);
+        Assert.IsTrue(new CountingV3Operator().OverridesFullMergeV3);
+        Assert.IsFalse(new TestPutOperator().OverridesFullMergeV3);
+        Assert.IsTrue(new TestPutOperator().OverridesScopedFullMerge);
+        Assert.IsTrue(new TtlMergeOperator(MergeOperator.UInt64Add).OverridesScopedFullMerge);
+    }
+
     /// <summary>The default FullMergeV3 (FullMergeV2 fallback) on an entity base merges the default column only.</summary>
     [TestMethod]
     public void DefaultFullMergeV3KeepsOtherColumns()

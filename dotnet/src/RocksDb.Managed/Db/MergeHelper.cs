@@ -234,6 +234,19 @@ public sealed class MergeHelper : IDisposable
     public static void TimedFullMerge(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, bool hasBaseValue, ReadOnlySpan<byte> baseValue,
         in MergeOperands operands, IBufferWriter<byte> result)
     {
+        if (mergeOperator.IsPlainFullMergeV2)
+        {
+            // Neither FullMergeV3 nor the failure-scope overload is overridden: the default FullMergeV3 is this call.
+            if (!mergeOperator.FullMerge(userKey, hasBaseValue, baseValue, operands, result)) ThrowMergeFailed();
+            return;
+        }
+        TimedFullMergeSlow(mergeOperator, userKey, hasBaseValue, baseValue, operands, result);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void TimedFullMergeSlow(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, bool hasBaseValue, ReadOnlySpan<byte> baseValue,
+        in MergeOperands operands, IBufferWriter<byte> result)
+    {
         if (!TryFullMerge(mergeOperator, userKey, hasBaseValue ? MergeExistingValueKind.Plain : MergeExistingValueKind.None, baseValue, operands,
                 result, null, out _, out _))
         {
@@ -282,6 +295,28 @@ public sealed class MergeHelper : IDisposable
     /// failure scope (kDefault reported as kTryMerge, per merge_operator.h).
     /// </summary>
     internal static bool TryFullMerge(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, MergeExistingValueKind baseKind, ReadOnlySpan<byte> baseValue,
+        in MergeOperands operands, IBufferWriter<byte> value, IBufferWriter<byte>? entity, out EntryType resultType, out MergeOperationFailureScope failureScope)
+    {
+        if (!mergeOperator.OverridesFullMergeV3 && baseKind != MergeExistingValueKind.WideColumns)
+        {
+            // The default FullMergeV3 with no or a plain base value is FullMergeV2: call it directly (hot path).
+            resultType = EntryType.Value;
+            bool hasBase = baseKind == MergeExistingValueKind.Plain;
+            if (!mergeOperator.OverridesScopedFullMerge)
+            {
+                failureScope = MergeOperationFailureScope.Default;
+                if (mergeOperator.FullMerge(userKey, hasBase, baseValue, operands, value)) return true;
+                failureScope = MergeOperationFailureScope.TryMerge;
+                return false;
+            }
+            if (mergeOperator.FullMerge(userKey, hasBase, baseValue, operands, value, out failureScope)) return true;
+            if (failureScope == MergeOperationFailureScope.Default) failureScope = MergeOperationFailureScope.TryMerge;
+            return false;
+        }
+        return TryFullMergeV3(mergeOperator, userKey, baseKind, baseValue, operands, value, entity, out resultType, out failureScope);
+    }
+
+    private static bool TryFullMergeV3(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, MergeExistingValueKind baseKind, ReadOnlySpan<byte> baseValue,
         in MergeOperands operands, IBufferWriter<byte> value, IBufferWriter<byte>? entity, out EntryType resultType, out MergeOperationFailureScope failureScope)
     {
         var input = new MergeOperationInputV3(userKey, baseKind, baseValue, operands);
