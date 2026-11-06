@@ -886,6 +886,39 @@ public sealed partial class BlockBasedTableReader : TableReader
     }
 
     /// <summary>
+    /// Port of BlockBasedTable::VerifyChecksum (+ VerifyChecksumInMetaBlocks / VerifyChecksumInBlocks): reads every meta
+    /// block (the properties block with the global seqno special case; the index block only when it was not verified
+    /// at open) and every data block listed by the index, raw, and verifies its checksum. Corruption on a mismatch.
+    /// Like upstream, index and filter partitions are not checked.
+    /// </summary>
+    public void VerifyChecksum()
+    {
+        foreach (KeyValuePair<string, BlockHandle> kv in MetaBlocks)
+        {
+            if (kv.Key == BlockBasedTableConstants.PropertiesBlockName)
+            {
+                VerifyPropertiesBlockChecksum(_file, _footer, kv.Value, Properties.ExternalSstFileGlobalSeqnoOffset);
+                continue;
+            }
+            // WART (upstream): the index block checksum is skipped when it was checked on open.
+            if (kv.Key == BlockBasedTableConstants.IndexBlockName && _options.VerifyChecksums) continue;
+            ArrayPool<byte>.Shared.Return(BlockFetcher.ReadRawPayload(_file, _footer, kv.Value, verifyChecksums: true, out _));
+        }
+        IndexCursor idx = IndexCursor.Rent(this, TableReadFlags.DontFillCache);
+        try
+        {
+            for (idx.SeekToFirst(); idx.Valid; idx.Next())
+            {
+                ArrayPool<byte>.Shared.Return(BlockFetcher.ReadRawPayload(_file, _footer, idx.Handle, verifyChecksums: true, out _));
+            }
+        }
+        finally
+        {
+            idx.Return();
+        }
+    }
+
+    /// <summary>
     /// Properties block checksum check of ReadTablePropertiesHelper (table/meta_blocks.cc): on a mismatch, retry with
     /// the rocksdb.external_sst_file.global_seqno value restored to its original zero placeholder, since older
     /// ingestion (write_global_seqno) rewrote it without updating the block checksum. Other mismatches are Corruption.
