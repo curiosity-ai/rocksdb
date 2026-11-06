@@ -290,4 +290,15 @@ public abstract class EventListener
     public virtual void OnExternalFileIngested(RocksDatabase? db, ExternalFileIngestionInfo info)
     {
     }
+
+    /// <summary>
+    /// The DB begins shutting down (EventListener::OnDBShutdownBegin): called once per DB, by
+    /// <see cref="RocksDatabase.CancelAllBackgroundWork"/> or by close / dispose, before the shutdown state is published.
+    /// Also called while cleaning up a failed open, with a null <paramref name="db"/> (the DB object was never
+    /// returned). Background work may still be running and other callbacks may still run concurrently or afterwards;
+    /// implementations should not call blocking DB APIs.
+    /// </summary>
+    public virtual void OnDBShutdownBegin(RocksDatabase? db)
+    {
+    }
 }

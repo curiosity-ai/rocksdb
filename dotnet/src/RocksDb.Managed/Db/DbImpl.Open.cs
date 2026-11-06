@@ -79,6 +79,9 @@ internal sealed partial class DbImpl
 
     private void AbortOpen()
     {
+        // ~DBImpl of a failed open runs CloseHelper, which notifies OnDBShutdownBegin (listener_test.cc
+        // OnDBShutdownBeginOnFailedOpen); the managed DB object was never created, so listeners receive null.
+        NotifyOnDBShutdownBegin();
         DeregisterFromWriteBufferManager();
         Volatile.Write(ref _disposed, 1);
         try

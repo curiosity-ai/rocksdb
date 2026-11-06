@@ -840,22 +840,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
         DeregisterFromWriteBufferManager();
         // CancelErrorRecoveryForShutDown: stop automatic recovery first (it needs the write thread and background work).
         await ErrorHandler.EndAutoRecoveryAsync(synchronous).ConfigureAwait(false);
-        // force_flush_for_blob_direct_write: blob direct write files are only registered by flushes (WAL recovery of
-        // unregistered files is out of scope, like upstream v1), so they are flushed even with avoid_flush_during_shutdown.
-        if (((!Options.AvoidFlushDuringShutdown && Volatile.Read(ref _hasUnpersistedData)) || HasInFlightBlobDirectWriteFiles()) && BackgroundError is null)
-        {
-            try
-            {
-                foreach (ColumnFamilyData cfd in GetColumnFamilies())
-                {
-                    await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.ShutDown, synchronous, CancellationToken.None).ConfigureAwait(false);
-                }
-            }
-            catch (RocksDbException)
-            {
-                // Best effort, like upstream's shutdown flush.
-            }
-        }
+        // CloseHelper -> CancelAllBackgroundWork(false): the shutdown flush and OnDBShutdownBegin, unless a public
+        // CancelAllBackgroundWork already began the shutdown (DbImpl.Shutdown.cs).
+        bool alreadyShuttingDown = IsShuttingDown;
+        if (!alreadyShuttingDown) await ShutdownFlushAsync(synchronous).ConfigureAwait(false);
         // Become the (last) write leader so no write is in flight.
         WriteThread.Writer w = await EnterUnbatchedCoreAsync(synchronous).ConfigureAwait(false);
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -868,6 +856,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         {
             EndAllTraces();
             LogInfo("Shutdown: canceling all background work");
+            if (!alreadyShuttingDown) NotifyOnDBShutdownBegin();
             lock (_mutex)
             {
                 _shuttingDown = true;
