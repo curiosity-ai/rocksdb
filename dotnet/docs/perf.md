@@ -1604,6 +1604,28 @@ factory costs ~90 ns per lock + unlock pair (virtual mutex calls, `Lock` + gener
 every unlock as upstream). The existing `TransactionBenchmarks` (Begin + 4 Put + Commit, WAL-bound ~20 us on this
 machine) do not resolve lock-manager costs, hence the dedicated benchmark.
 
+## PerfContext instrumentation with the perf level off (2026-11-06)
+
+`PerfContextBenchmarks` (BenchmarkDotNet in-process, 5 warm-up + 15 iterations, net10.0, `PERFCTX_LEVELS=disable`):
+Get of 1000 random memtable keys, of 1000 random keys in a compacted SST with the block cache warm, 100 x (Seek + 10 x
+Next) over memtable + SST, and 1000 Puts without WAL. "Before" is the RocksDb.Managed.dll built from the hot-path files
+before the instrumentation (InternalKeyComparator, DbIter, MergingIterator, MemTableInternalIterator, DbImpl.Read /
+Write, BlockFetcher, BlockBasedTableReader, LocalFileSystem), "after" the instrumented one; the two were swapped into the
+same benchmark build and run alternately, 3 rounds, on the shared 4-core VM (load average 8-21 during the runs).
+
+| Benchmark | before, 3 rounds (ns) | after, 3 rounds (ns) | best before / after |
+|---|---:|---:|---:|
+| GetMemtable | 301 / 408 / 234 | 243 / 268 / 380 | 234 / 243 (+4%) |
+| GetSstCached | 1,050 / 1,087 / 888 | 930 / 916 / 2,001 | 888 / 916 (+3%) |
+| Seek + 10 x Next | 1,553 / 1,968 / 1,396 | 1,408 / 1,558 / 2,914 | 1,396 / 1,408 (+1%) |
+| Put (no WAL) | 1,695 / 2,086 / 1,938 | 1,892 / 1,743 / 3,090 | 1,695 / 1,743 (+3%) |
+
+Allocated is `-` everywhere. Every difference is far inside the run-to-run spread of either build (20-50% on this
+machine), so the disabled instrumentation (one static read of the enabled-thread count per point) is not measurable
+here. Enabled on the benchmark thread (one earlier "after" run, same noise): EnableCount costs GetMemtable +19%,
+GetSstCached +3%, and EnableTimeExceptForMutex (two `Stopwatch` reads per timed section) GetMemtable +73%,
+GetSstCached +56%, Seek + Next +38%.
+
 ## Gaps / follow-ups
 
 - HyperClock table as a struct array (one cache line per probe, like upstream `ClockHandle`).
