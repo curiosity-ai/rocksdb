@@ -284,47 +284,52 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [ ] `max_successive_merges` is accepted but ignored (upstream folds merge operands into a Put at write time once the limit is hit) (S)
 - [ ] `min_write_buffer_number_to_merge` is ignored: immutable memtables are flushed as soon as they are sealed (M)
 
-## Second correctness review (2026-11-06; all items being fixed by 6 agents: recovery+write, options, compaction, read path, TTL+merge+txn, APIs+properties+events; 5 reviewers vs C++ 11.14 / native 11.12; evidence in each item's source refs)
+## Second correctness review (2026-11-06; all items fixed 2026-11-06 with regression tests and native comparisons where observable; remaining deliberate deviations are listed in docs/validation.md (second-review sections) and README "Not ported yet"; 5 reviewers vs C++ 11.14 / native 11.12; evidence in each item's source refs)
 
 P1/P2 confirmed bugs (reproduced):
-- [ ] avoid_flush_during_recovery: a flush during WAL replay doesn't advance the CF log number (upstream flushes all CFs at the end if any recovery flush happened, db_impl_open.cc MaybeFlushFinalMemtableOrRestoreActiveLogFiles) -> next open replays again, merge operands applied twice (DbImpl.Open.cs RecoverLogFilesAsync) (S)
-- [ ] rejected SetOptions writes live CF options before validating (DbImpl.Options.cs ValidateMutableCfOptions): bad protection-bytes value poisons later SetOptions/Flush and is persisted to OPTIONS; validate a copy and run ValidateOptions (FIFO ttl, temperature thresholds, max_read_amp) (S)
-- [ ] TtlDatabase has no TtlMergeOperator wrapper: merges see the 4-byte time suffix (wrong values / Corruption); native TTL DBs with merges misread; TtlDatabase lacks Merge and column families (S)
-- [ ] SingleDelete+Put dropped under a transaction snapshot: no write-conflict-boundary snapshots (CompactionJob earliestWriteConflict = Max) -> later conflicting txn write succeeds instead of Busy (M)
-- [ ] ReadTier: BlockCacheTier ignored (Get/MultiGet/iterators do I/O, upstream Incomplete); MemtableTier inverted (Get/MultiGet skip SSTs, iterators don't; Get throws Corruption); PersistedTier iterators should be NotSupported (S)
-- [ ] SetOptions on struct options (compression_opts, compaction_options_universal/fifo): partial update resets other fields, unknown sub-fields accepted and persisted, dotted names rejected (S)
-- [ ] can't open a native DB with the `___rocksdb_stats_history___` CF (persist_stats_to_disk); stats persistence options are no-ops (S/M)
-- [ ] `rocksdb.estimate-num-keys` clamps memtable and table parts separately (native 50, managed 100 after deletes) (S)
-- [ ] CompactionFilter.IgnoreSnapshots=false accepted (upstream NotSupported) (S)
-- [ ] ReFitLevel: missing "Moving more than 1 file from non-L0 to L0" Aborted check; files not marked being-compacted while the mutex is released (race with concurrent CompactRange -> Corruption bg error) (S)
-- [ ] native embedded-blob SSTs (SstFileWriter::OpenWithEmbeddedBlobs, blob file number 0) fail with Corruption: port or NotSupported at open + README (suspected, native C API can't produce one) (M)
+- [x] avoid_flush_during_recovery: a flush during WAL replay doesn't advance the CF log number (upstream flushes all CFs at the end if any recovery flush happened, db_impl_open.cc MaybeFlushFinalMemtableOrRestoreActiveLogFiles) -> next open replays again, merge operands applied twice (DbImpl.Open.cs RecoverLogFilesAsync) (S)
+- [x] rejected SetOptions writes live CF options before validating (DbImpl.Options.cs ValidateMutableCfOptions): bad protection-bytes value poisons later SetOptions/Flush and is persisted to OPTIONS; validate a copy and run ValidateOptions (FIFO ttl, temperature thresholds, max_read_amp) (S)
+- [x] TtlDatabase has no TtlMergeOperator wrapper: merges see the 4-byte time suffix (wrong values / Corruption); native TTL DBs with merges misread; TtlDatabase lacks Merge and column families (S)
+- [x] SingleDelete+Put dropped under a transaction snapshot: no write-conflict-boundary snapshots (CompactionJob earliestWriteConflict = Max) -> later conflicting txn write succeeds instead of Busy (M)
+- [x] ReadTier: BlockCacheTier ignored (Get/MultiGet/iterators do I/O, upstream Incomplete); MemtableTier inverted (Get/MultiGet skip SSTs, iterators don't; Get throws Corruption); PersistedTier iterators should be NotSupported (S)
+- [x] SetOptions on struct options (compression_opts, compaction_options_universal/fifo): partial update resets other fields, unknown sub-fields accepted and persisted, dotted names rejected (S)
+- [x] can't open a native DB with the `___rocksdb_stats_history___` CF (persist_stats_to_disk); stats persistence options are no-ops (S/M)
+- [x] `rocksdb.estimate-num-keys` clamps memtable and table parts separately (native 50, managed 100 after deletes) (S)
+- [x] CompactionFilter.IgnoreSnapshots=false accepted (upstream NotSupported) (S)
+- [x] ReFitLevel: missing "Moving more than 1 file from non-L0 to L0" Aborted check; files not marked being-compacted while the mutex is released (race with concurrent CompactRange -> Corruption bg error) (S)
+- [x] native embedded-blob SSTs (SstFileWriter::OpenWithEmbeddedBlobs, blob file number 0) fail with Corruption: port or NotSupported at open + README (suspected, native C API can't produce one) (M)
 
 Unported / silently ignored (undocumented):
-- [ ] ~35 options native 11.12 writes are untyped (memtable_max_range_deletions, paranoid_memory_checks, disallow_memtable_writes, strict_max_successive_merges, memtable_op_scan_flush_trigger, compression_opts.auto_skip, max_manifest_space_amp_pct, daily_offpeak_time_utc, background_close_inactive_wals, metadata_cache_options, ...); strict OptionsFile.Load fails on every default native OPTIONS file (M)
-- [ ] WriteOptions.LowPri (ThrottleLowPriWritesIfNeeded, low_pri_rate_limiter) (S)
-- [ ] ReadOptions.Tailing, ValueSizeSoftLimit, per-read VerifyChecksums, Deadline/IoTimeout (S each)
-- [ ] optimize_filters_for_hits; verify_compression, detect_filter_construct_corruption, read_amp_bytes_per_bit parsed but unused (S each)
-- [ ] VersionBuilder consistency checks + force_consistency_checks; compaction OutputValidator (out-of-order keys) + paranoid_file_checks (S/M)
-- [ ] oldest_ancestor_time of compaction outputs too old (not narrowed per output) -> early TTL recompaction (S)
-- [ ] MANIFEST size auto-tuning (max_manifest_space_amp_pct, kLastCompactedManifestFileSize record) (S)
-- [ ] db_paths / CompactRangeOptions.TargetPathId placement; periodic obsolete-file full scan (delete_obsolete_files_period_micros); trivial copy for temperature change (S each)
-- [ ] trivial moves don't advance the round-robin compact cursor (upstream now does; validation.md claim is wrong) (S)
-- [ ] MergeOperator OpFailureScope (kMustMerge) and FullMergeV3 (S/M)
-- [ ] Transaction: MultiGet / MultiGetForUpdate, public SetLockTimeout, assume_tracked overloads, Disable/EnableIndexing, GetNum* counters, GetElapsedTime (S)
-- [ ] DestroyDB, public CancelAllBackgroundWork, OnDBShutdownBegin; SstFileReader; row_cache; PerfContext / IOStatsContext (S-M each)
-- [ ] ~15 properties missing (compression-ratio-at-level, *-write-stall-stats, num-running-bottom-compactions, min-log-number-to-keep, ...); num-files-at-level out of range returns "0"; total-sst-files-size ignores pinned versions (S)
-- [ ] statistics: seeks inflate BLOOM_FILTER_PREFIX_USEFUL, SEEK_* tickers always 0, *_TRUE_POSITIVE never recorded (S)
-- [ ] EVENT_LOG: table_file_deletion, blob_file_*, trivial_move, recovery_*, ingest_finished not written (S)
+- [x] ~35 options native 11.12 writes are untyped (memtable_max_range_deletions, paranoid_memory_checks, disallow_memtable_writes, strict_max_successive_merges, memtable_op_scan_flush_trigger, compression_opts.auto_skip, max_manifest_space_amp_pct, daily_offpeak_time_utc, background_close_inactive_wals, metadata_cache_options, ...); strict OptionsFile.Load fails on every default native OPTIONS file (M)
+- [x] WriteOptions.LowPri (ThrottleLowPriWritesIfNeeded, low_pri_rate_limiter) (S)
+- [x] ReadOptions.Tailing, ValueSizeSoftLimit, per-read VerifyChecksums, Deadline/IoTimeout (S each)
+- [x] optimize_filters_for_hits; verify_compression, detect_filter_construct_corruption, read_amp_bytes_per_bit parsed but unused (S each)
+- [x] VersionBuilder consistency checks + force_consistency_checks; compaction OutputValidator (out-of-order keys) + paranoid_file_checks (S/M)
+- [x] oldest_ancestor_time of compaction outputs too old (not narrowed per output) -> early TTL recompaction (S)
+- [x] MANIFEST size auto-tuning (max_manifest_space_amp_pct, kLastCompactedManifestFileSize record) (S)
+- [x] db_paths / CompactRangeOptions.TargetPathId placement; periodic obsolete-file full scan (delete_obsolete_files_period_micros); trivial copy for temperature change (S each)
+- [x] trivial moves don't advance the round-robin compact cursor (upstream now does; validation.md claim is wrong) (S)
+- [x] MergeOperator OpFailureScope (kMustMerge) and FullMergeV3 (S/M)
+- [x] Transaction: MultiGet / MultiGetForUpdate, public SetLockTimeout, assume_tracked overloads, Disable/EnableIndexing, GetNum* counters, GetElapsedTime (S)
+- [x] DestroyDB, public CancelAllBackgroundWork, OnDBShutdownBegin; SstFileReader; row_cache; PerfContext / IOStatsContext (S-M each)
+- [x] ~15 properties missing (compression-ratio-at-level, *-write-stall-stats, num-running-bottom-compactions, min-log-number-to-keep, ...); num-files-at-level out of range returns "0"; total-sst-files-size ignores pinned versions (S)
+- [x] statistics: seeks inflate BLOOM_FILTER_PREFIX_USEFUL, SEEK_* tickers always 0, *_TRUE_POSITIVE never recorded (S)
+- [x] EVENT_LOG: table_file_deletion, blob_file_*, trivial_move, recovery_*, ingest_finished not written (S)
 
 Minor divergences:
-- [ ] write group stops at the first incompatible writer (upstream keeps scanning with an r_list): throughput only (S)
-- [ ] SetDBOptions: no immediate SwitchWAL on lower max_total_wal_size / wal_bytes_per_sync, rewrites OPTIONS on no-op, no per-CF validation (S)
-- [ ] max_open_files not clipped to [20, OS max]; delayed_write_rate=0 with a rate limiter uses 16 MiB, not the limiter rate (S)
-- [ ] Raft follower commit index uses min(leaderCommit, myLatest) instead of prevLogSeq (inherited from rocksdb-sharp; CommitSeq is status-only today) (S)
-- [ ] docs: validation.md claims readers never see a partial write group; false on memtable insert failure (published, no fatal bg error) -- fix behaviour (HandleMemTableInsertFailure) or the doc (S)
+- [x] write group stops at the first incompatible writer (upstream keeps scanning with an r_list): throughput only (S)
+- [x] SetDBOptions: no immediate SwitchWAL on lower max_total_wal_size / wal_bytes_per_sync, rewrites OPTIONS on no-op, no per-CF validation (S)
+- [x] max_open_files not clipped to [20, OS max]; delayed_write_rate=0 with a rate limiter uses 16 MiB, not the limiter rate (S)
+- [x] Raft follower commit index uses min(leaderCommit, myLatest) instead of prevLogSeq (inherited from rocksdb-sharp; CommitSeq is status-only today) (S)
+- [x] docs: validation.md claims readers never see a partial write group; false on memtable insert failure (published, no fatal bg error) -- fix behaviour (HandleMemTableInsertFailure) or the doc (S)
 
-Missing tests: ReadTier matrix; TTL + merge; avoid_flush with full memtable during recovery; SingleDelete under txn snapshot through compaction; IgnoreSnapshots=false; ReFitLevel guards; MANIFEST with overlapping L1 files; oldest_ancestor_time on multi-output compactions; SEEK_* tickers; txn/WBWI merges over a DB merge chain spanning memtable+SST.
-Not reviewed in depth: WritePrepared/WriteUnprepared commit-cache internals, RangeLockTree, multi-CF iterators.
+Missing tests (all added): ReadTier matrix; TTL + merge; avoid_flush with full memtable during recovery; SingleDelete under txn snapshot through compaction; IgnoreSnapshots=false; ReFitLevel guards; MANIFEST with overlapping L1 files; oldest_ancestor_time on multi-output compactions; SEEK_* tickers; txn/WBWI merges over a DB merge chain spanning memtable+SST.
+Follow-up review: IsInSnapshot, RangeLockTree and the multi-CF iterator checked consistent; WritePrepared AddCommitted now caps max_evicted_seq by the last published seq (two_write_queues). Not reviewed: the rest of WritePrepared/WriteUnprepared recovery.
+
+Still open from this round:
+- [ ] `max_successive_merges` (and `strict_max_successive_merges`), `paranoid_memory_checks`, `memtable_op_scan_flush_trigger` and the other typed-only options listed in README "Not ported yet" (S-M each)
+- [ ] flush does not run the merge helper / compaction filter (TTL merge results are stamped at the first compaction, flush filtering not applied) (M)
+- [ ] paranoid_file_checks read-back of flush outputs; MANIFEST size check on close (S)
 
 ## Unported utilities (found 2026-11-03)
 
