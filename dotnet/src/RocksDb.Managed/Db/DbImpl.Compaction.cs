@@ -770,6 +770,7 @@ internal sealed partial class DbImpl
         bool ok = false;
         CompactionJob? job = null;
         RemoteCompactionOutcome? remote = null;
+        List<ulong>? copiedFiles = null;
         Exception? failure = null;
         long compactionStart = 0;
         int jobId = 0;
@@ -789,6 +790,13 @@ internal sealed partial class DbImpl
             if (c.IsDeletionCompaction)
             {
                 c.AddInputDeletions(edit);
+            }
+            else if (c.IsTrivialCopyCompaction)
+            {
+                // BackgroundCompaction: is_trivial_copy_compaction (FIFO kChangeTemperature with
+                // allow_trivial_copy_when_change_temperature): byte copies of the inputs with the new temperature.
+                copiedFiles = new List<ulong>();
+                CopyTrivialCompactionFiles(c, edit, copiedFiles, ct);
             }
             else if (c.IsTrivialMove())
             {
@@ -969,6 +977,10 @@ internal sealed partial class DbImpl
                 {
                     foreach (ulong n in remote.CreatedFileNumbers) _pendingOutputs.Remove(n);
                 }
+                if (copiedFiles is not null)
+                {
+                    foreach (ulong n in copiedFiles) _pendingOutputs.Remove(n);
+                }
                 cfd.CompactionState.Picker.ReleaseCompactionFiles(c, ok);
                 ReleaseCompactionRoom(c);
                 if (c.InputVersion is not null) Versions.UnrefVersion(c.InputVersion);
@@ -984,6 +996,10 @@ internal sealed partial class DbImpl
             if (!ok && remote is not null)
             {
                 foreach (ulong n in remote.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
+            }
+            if (!ok && copiedFiles is not null)
+            {
+                foreach (ulong n in copiedFiles) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
             }
             if (job is not null)
             {
@@ -1063,6 +1079,58 @@ internal sealed partial class DbImpl
     /// its inputs in the input version's compaction-priority order -- in the version edit (persisted in the MANIFEST).
     /// Trivial moves don't run a compaction job and leave the cursor unchanged, as upstream.
     /// </summary>
+    /// <summary>
+    /// Port of DBImpl::CopyTrivialCompactionFiles (db_impl_compaction_flush.cc): copies each input file byte for byte
+    /// (trivial_copy_buffer_size reads, IO_LOW, synced) to a new file number with the compaction's output temperature,
+    /// and replaces the input by the copy at the same level in <paramref name="edit"/>. The copy keeps the input's
+    /// metadata (boundaries, seqnos, unique id, oldest ancestor time, ...) with a new creation time, the compaction's
+    /// epoch number and its own file checksum. <paramref name="created"/> receives the new file numbers (pending
+    /// outputs).
+    /// </summary>
+    private void CopyTrivialCompactionFiles(Compaction c, VersionEdit edit, List<ulong> created, CancellationToken ct)
+    {
+        int bufferSize = (int)Math.Clamp(c.Options.CompactionOptionsFifo.TrivialCopyBufferSize, 1UL, 64UL << 20);
+        byte[] buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(bufferSize);
+        try
+        {
+            Temperature temperature = c.GetOutputTemperature(isProximalLevel: false);
+            foreach (FileMetaData input in c.Inputs(0).Files)
+            {
+                ct.ThrowIfCancellationRequested();
+                ulong number = NewPendingOutputFileNumber();
+                created.Add(number);
+                string inPath = FileNames.TableFileName(DbPaths, input.FileNumber, input.PathId);
+                string outPath = FileNames.TableFileName(DbPaths, number, c.OutputPathId);
+                byte[] checksum;
+                string checksumFunc;
+                using (Env.ISequentialFile src = FileSystem.OpenSequential(inPath))
+                using (Env.IWritableFile dst = FileChecksumHelper.CreateWritable(FileSystem, outPath, TableFileWriteOptions(Env.IoPriority.Low)))
+                {
+                    int n;
+                    while ((n = src.Read(buffer.AsSpan(0, bufferSize))) > 0) dst.Append(buffer.AsSpan(0, n));
+                    dst.Sync();
+                    (checksum, checksumFunc) = FileChecksumHelper.GetChecksum(dst);
+                }
+                FileMetaData copy = input.Clone();
+                copy.FileNumber = number;
+                copy.PathId = c.OutputPathId;
+                copy.MarkedForCompaction = false;
+                copy.Temperature = temperature;
+                copy.FileCreationTime = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                copy.EpochNumber = c.MinInputFileEpochNumber();
+                copy.FileChecksum = checksum;
+                copy.FileChecksumFuncName = checksumFunc;
+                edit.DeleteFile(c.StartLevel, input.FileNumber);
+                edit.AddFile(c.StartLevel, copy);
+            }
+            FileSystem.SyncDirectory(DbPaths[(int)Math.Min(c.OutputPathId, (uint)(DbPaths.Count - 1))]);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
     private void AddCompactCursorEdit(ColumnFamilyData cfd, Compaction c, VersionEdit edit)
     {
         if ((c.Reason is CompactionReason.LevelMaxLevelSize or CompactionReason.RoundRobinTtl) && cfd.Options.CompactionPri == CompactionPri.RoundRobin

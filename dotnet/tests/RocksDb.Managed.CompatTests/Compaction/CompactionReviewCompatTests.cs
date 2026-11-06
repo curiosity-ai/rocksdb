@@ -140,4 +140,37 @@ public sealed class CompactionReviewCompatTests
         Assert.AreEqual("native", Encoding.UTF8.GetString(again.Get(B("y"))!));
         Assert.AreEqual("v7", Encoding.UTF8.GetString(again.Get(B("k0007"))!));
     }
+
+    /// <summary>
+    /// A FIFO temperature change done as a trivial copy (allow_trivial_copy_when_change_temperature) keeps the input's
+    /// SST unique id in the copy and in the MANIFEST: native opens the DB (verify_sst_unique_id_in_manifest, paranoid
+    /// file checks of the table properties) and reads the copied file.
+    /// </summary>
+    [TestMethod]
+    public void FifoTrivialCopyReadableByNative()
+    {
+        using var dir = new TempDir("fifo-copy");
+        var cf = new ColumnFamilyOptions { CompactionStyle = CompactionStyle.Fifo, NumLevels = 1, DisableAutoCompactions = true };
+        cf.CompactionOptionsFifo.FileTemperatureAgeThresholds = [new FileTemperatureAge(Temperature.Cold, 0)];
+        cf.CompactionOptionsFifo.AllowTrivialCopyWhenChangeTemperature = true;
+        using (RocksDatabase db = RocksDatabase.Open(dir.Path, new DbOptions { CreateIfMissing = true }, cf))
+        {
+            for (int i = 0; i < 100; i++) db.Put(B("k" + i.ToString("D3", System.Globalization.CultureInfo.InvariantCulture)), B("v" + i));
+            db.Flush();
+            ulong first = db.GetLiveFilesMetadata()[0].FileNumber;
+            db.SetOptions(new Dictionary<string, string> { ["disable_auto_compactions"] = "false" });
+            db.Put(B("z"), B("z"));
+            db.Flush();
+            db.WaitForCompact();
+            Assert.IsFalse(db.GetLiveFilesMetadata().Exists(f => f.FileNumber == first), "the file was not copied");
+        }
+        RocksDbSharp.Native native = RocksDbSharp.Native.Instance;
+        var options = new RocksDbSharp.DbOptions().SetCompactionStyle(RocksDbSharp.Compaction.Fifo);
+        native.rocksdb_options_set_num_levels(options.Handle, 1);
+        native.rocksdb_options_set_disable_auto_compactions(options.Handle, 1);
+        native.rocksdb_options_set_paranoid_checks(options.Handle, 1);
+        using var ndb = RocksDbSharp.RocksDb.Open(options, dir.Path);
+        for (int i = 0; i < 100; i++) Assert.AreEqual("v" + i, ndb.Get("k" + i.ToString("D3", System.Globalization.CultureInfo.InvariantCulture)));
+        GC.KeepAlive(options);
+    }
 }

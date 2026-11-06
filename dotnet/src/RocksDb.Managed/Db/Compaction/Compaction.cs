@@ -246,6 +246,14 @@ internal sealed class Compaction
         && InputStorage.Icmp.CompareUserKey(userKey, DbFormat.ExtractUserKey(_proximalLevelLargest)) <= 0;
 
     /// <summary>
+    /// Compaction::is_trivial_copy_compaction: a FIFO kChangeTemperature compaction with
+    /// allow_trivial_copy_when_change_temperature copies its input files instead of rewriting them.
+    /// </summary>
+    public bool IsTrivialCopyCompaction =>
+        Options.CompactionStyle == CompactionStyle.Fifo && Reason == CompactionReason.ChangeTemperature
+        && Options.CompactionOptionsFifo.AllowTrivialCopyWhenChangeTemperature;
+
+    /// <summary>
     /// Port of Compaction::GetOutputTemperature: the picker's override (FIFO kChangeTemperature), else
     /// last_level_temperature for last-level (not proximal) outputs, else default_write_temperature.
     /// </summary>

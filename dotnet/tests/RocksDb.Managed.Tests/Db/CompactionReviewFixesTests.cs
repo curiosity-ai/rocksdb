@@ -824,4 +824,54 @@ public sealed class CompactionReviewFixesTests
         Assert.AreEqual("1", GetString(db, "a"));
         Assert.AreEqual("1", GetString(db, "b"));
     }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // FIFO trivial copy on temperature change (CopyTrivialCompactionFiles, allow_trivial_copy_when_change_temperature)
+
+    private static byte[] ReadAll(IFileSystem fs, string path)
+    {
+        using ISequentialFile f = fs.OpenSequential(path);
+        var ms = new MemoryStream();
+        var buf = new byte[4096];
+        int n;
+        while ((n = f.Read(buf)) > 0) ms.Write(buf, 0, n);
+        return ms.ToArray();
+    }
+
+    [TestMethod]
+    [DataRow(true)]
+    [DataRow(false)]
+    public void FifoTemperatureChangeTrivialCopy(bool allowTrivialCopy)
+    {
+        MemoryFileSystem fs = NewFs();
+        var cfo = new ColumnFamilyOptions
+        {
+            CompactionStyle = CompactionStyle.Fifo,
+            NumLevels = 1,
+            DisableAutoCompactions = true,
+        };
+        cfo.CompactionOptionsFifo.FileTemperatureAgeThresholds = [new FileTemperatureAge(Temperature.Cold, 0)];
+        cfo.CompactionOptionsFifo.AllowTrivialCopyWhenChangeTemperature = allowTrivialCopy;
+        cfo.CompactionOptionsFifo.TrivialCopyBufferSize = 100; // several reads per file
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+        for (int i = 0; i < 50; i++) db.Put(Key(i), Value(i, 0));
+        db.Flush();
+        LiveFileMetadata before = db.GetLiveFilesMetadata()[0];
+        byte[] original = ReadAll(fs, before.Directory.TrimEnd('/') + "/" + before.Name.TrimStart('/'));
+        db.SetOptions(new Dictionary<string, string> { ["disable_auto_compactions"] = "false" });
+        db.Put(Key(100), B("x"));
+        db.Flush();
+        db.WaitForCompact();
+        LiveFileMetadata? after = db.GetLiveFilesMetadata().Find(f => f.SmallestKey.AsSpan().SequenceEqual(before.SmallestKey) && f.Temperature == Temperature.Cold);
+        Assert.IsNotNull(after, "the old file was not moved to the cold temperature");
+        Assert.AreNotEqual(before.FileNumber, after.FileNumber);
+        byte[] copy = ReadAll(fs, after.Directory.TrimEnd('/') + "/" + after.Name.TrimStart('/'));
+        if (allowTrivialCopy) CollectionAssert.AreEqual(original, copy, "a trivial copy is byte-identical");
+        else CollectionAssert.AreNotEqual(original, copy, "a rewrite has a new file number in its properties");
+        for (int i = 0; i < 50; i++) CollectionAssert.AreEqual(Value(i, 0), db.Get(Key(i)));
+        db.Dispose();
+        using RocksDatabase again = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+        Assert.AreEqual(Temperature.Cold, again.GetLiveFilesMetadata().Find(f => f.FileNumber == after.FileNumber)!.Temperature);
+        CollectionAssert.AreEqual(Value(7, 0), again.Get(Key(7)));
+    }
 }
