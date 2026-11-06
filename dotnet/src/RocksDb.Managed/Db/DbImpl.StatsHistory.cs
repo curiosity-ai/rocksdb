@@ -328,8 +328,9 @@ internal sealed partial class DbImpl
             // no more entries with timestamp >= start_time is found or version key is found to be incompatible
             if (!it.Valid) return;
             ulong time = ParseStatsKey(it.Key, startTime, out _);
-            // check parsed time and invalid if it exceeds end_time
-            if (time > endTime) return;
+            // check parsed time and invalid if it exceeds end_time. A key that does not parse (the version keys sort after
+            // the samples) also ends the scan; upstream relies on end_time < UINT64_MAX for that.
+            if (time > endTime || time == ulong.MaxValue) return;
             var stats = new Dictionary<string, ulong>(StringComparer.Ordinal);
             for (; it.Valid; it.Next())
             {

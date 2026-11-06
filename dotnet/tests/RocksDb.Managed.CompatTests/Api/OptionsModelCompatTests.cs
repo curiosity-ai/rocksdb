@@ -188,6 +188,40 @@ public sealed class OptionsModelCompatTests
     }
 
     [TestMethod]
+    public void SetDbOptionsNoOpAndWalSwitchMatchNative()
+    {
+        using var nativeDir = new TempDir("opt-setdb-n");
+        using var managedDir = new TempDir("opt-setdb-m");
+        static void NativeSetDb(RocksDbSharp.RocksDb db, string k, string v) =>
+            RocksDbSharp.Native.Instance.rocksdb_set_db_options(db.Handle, 1, [k], [v]);
+        bool nativeNoOpWrote, nativeFlushed;
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(NativeOptions(), nativeDir.Path))
+        {
+            NativeSetDb(db, "bytes_per_sync", "1048576");
+            string before = LatestPath(nativeDir.Path);
+            NativeSetDb(db, "max_background_jobs", "2");
+            nativeNoOpWrote = before != LatestPath(nativeDir.Path);
+            for (int i = 0; i < 100; i++) db.Put("key" + i, "value" + i);
+            NativeSetDb(db, "max_total_wal_size", "1");
+            // SwitchWAL switched the memtable (its flush runs in the background).
+            nativeFlushed = db.GetProperty("rocksdb.num-entries-active-mem-table") == "0";
+        }
+        using (RocksDatabase db = RocksDatabase.Open(managedDir.Path, new DbOptions { CreateIfMissing = true }))
+        {
+            db.SetDBOptions([P("bytes_per_sync", "1048576")]);
+            string before = LatestPath(managedDir.Path);
+            db.SetDBOptions([P("max_background_jobs", "2")]);
+            Assert.AreEqual(nativeNoOpWrote, before != LatestPath(managedDir.Path), "no-op SetDBOptions writes an OPTIONS file");
+            Assert.IsFalse(nativeNoOpWrote);
+            for (int i = 0; i < 100; i++) db.Put(Encoding.UTF8.GetBytes("key" + i), Encoding.UTF8.GetBytes("value" + i));
+            db.SetDBOptions([P("max_total_wal_size", "1")]);
+            db.WaitForCompact();
+            Assert.AreEqual(nativeFlushed, db.GetProperty("rocksdb.num-entries-active-mem-table") == "0");
+            Assert.IsTrue(nativeFlushed);
+        }
+    }
+
+    [TestMethod]
     public void MaxOpenFilesAndDelayedWriteRateSanitizedLikeNative()
     {
         foreach (int maxOpenFiles in new[] { 5, 25 })
@@ -225,7 +259,10 @@ public sealed class OptionsModelCompatTests
         RocksDbSharp.DbOptions o = NativeOptions().EnableStatistics();
         RocksDbSharp.Native.Instance.rocksdb_options_set_persist_stats_to_disk(o.Handle, 1);
         RocksDbSharp.Native.Instance.rocksdb_options_set_stats_persist_period_sec(o.Handle, 1);
-        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(o, dir.Path))
+        // The first open creates the stats column family; the second names it to get a handle (naming it at creation
+        // would make native recreate it, as it then has no version keys).
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(o, dir.Path)) db.Put("k", "v");
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(o, dir.Path, StatsColumnFamilies()))
         {
             // Native persists on its own timer: wait for at least one delta sample (the first run only sets the baseline).
             DateTime deadline = DateTime.UtcNow.AddSeconds(30);
@@ -251,6 +288,13 @@ public sealed class OptionsModelCompatTests
             Assert.IsTrue(h[0].Stats.ContainsKey(Statistics.GetTickerName(Ticker.NumberKeysWritten)));
             Assert.IsTrue(h[0].Time > 1_600_000_000UL, h[0].Time.ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
+    }
+
+    private static RocksDbSharp.ColumnFamilies StatsColumnFamilies()
+    {
+        var cfo = new RocksDbSharp.ColumnFamilyOptions();
+        s_keepAlive.Add(cfo);
+        return new RocksDbSharp.ColumnFamilies { { StatsCf, cfo } };
     }
 
     private static bool HasNativeSample(RocksDbSharp.RocksDb db, RocksDbSharp.ColumnFamilyHandle cf)
@@ -286,7 +330,7 @@ public sealed class OptionsModelCompatTests
         RocksDbSharp.DbOptions o = NativeOptions();
         RocksDbSharp.Native.Instance.rocksdb_options_set_persist_stats_to_disk(o.Handle, 1);
         RocksDbSharp.Native.Instance.rocksdb_options_set_stats_persist_period_sec(o.Handle, 0);
-        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(o, dir.Path))
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(o, dir.Path, StatsColumnFamilies()))
         {
             RocksDbSharp.ColumnFamilyHandle stats = db.GetColumnFamily(StatsCf);
             Assert.AreEqual("1", db.Get("__persistent_stats_format_version__", stats));

@@ -1261,6 +1261,22 @@ Not ported yet (tracked in [todo.md](todo.md)):
   and transaction databases and `sst_dump` on PlainTable / CuckooTable files.
 - Not supported, as upstream: user-defined timestamps in optimistic transactions and explicit-timestamp
   `WriteBatchWithIndex` writes.
+- Options typed and persisted (round-tripped with native 11.12, accepted by SetOptions / SetDBOptions where upstream
+  marks them mutable) but without behaviour yet: `paranoid_memory_checks`, `memtable_verify_per_key_checksum_on_seek`,
+  `memtable_op_scan_flush_trigger` / `memtable_avg_op_scan_flush_trigger`, `memtable_batch_lookup_optimization`,
+  `min_tombstones_for_range_conversion`, `strict_max_successive_merges` (and `max_successive_merges` itself),
+  `blob_compression_opts` (blob files use the codec's default settings), `compression_opts.auto_skip` /
+  `auto_skip_min_sample_every`, `metadata_cache_options` (pinning follows the kFallback booleans),
+  `uncache_aggressiveness` (a cache hint; obsolete files' blocks are left to normal eviction), `compression_manager`
+  (only `nullptr`; a named manager is NotSupported at open / SetOptions), `fast_sst_open`, `open_files_async`,
+  `read_io_executor_threads`, `reuse_manifest_on_open`, `optimize_manifest_for_recovery`,
+  `periodic_compaction_phase_recovery_percent`, `remote_compaction_manifest_floor`,
+  `use_session_tmp_dir_for_remote_compaction`, `async_wal_precreate`, `background_close_inactive_wals`,
+  `enforce_write_buffer_manager_during_recovery`, `use_direct_io_for_compaction_reads`, `metadata_write_temperature`,
+  `wal_write_temperature` (single storage tier), `follower_*` (no follower DBs), and `wal_filter` (written by name; the
+  filter object cannot be recreated from an OPTIONS file). `max_manifest_space_amp_pct`,
+  `verify_manifest_content_on_close` and `verify_output_flags` are typed here; their behaviour belongs to the
+  compaction / MANIFEST work.
 
 API and behavior differences:
 

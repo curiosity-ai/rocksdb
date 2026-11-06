@@ -354,7 +354,7 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
         .String("db_host_id", static o => o.DbHostId, static (o, v) => o.DbHostId = v)
         // AsCustomSharedPtr<FileChecksumGenFactory> (kByNameAllowFromNull): the factory's name; only the built-in
         // FileChecksumGenCrc32cFactory is recreated from an OPTIONS file, other names load as null.
-        .Add("file_checksum_gen_factory", static o => o.FileChecksumGenFactory?.Name ?? "",
+        .Add("file_checksum_gen_factory", static o => o.FileChecksumGenFactory?.Name ?? "nullptr",
             static (o, v) => o.FileChecksumGenFactory = OptionStrings.UnwrapId(v) == FileChecksumGenCrc32cFactory.ClassName ? FileChecksumGenCrc32cFactory.Instance : null)
         .Bool("enforce_single_del_contracts", static o => o.EnforceSingleDelContracts, static (o, v) => o.EnforceSingleDelContracts = v)
         .Enum("lowest_used_cache_tier", OptionEnumMaps.CacheTier, static o => o.LowestUsedCacheTier, static (o, v) => o.LowestUsedCacheTier = v)
