@@ -117,10 +117,13 @@ per batch builds its index from scratch (1.1 KB). `TryGetFromBatchAndDB(db, key,
 
 ### Range deletions
 
-`DeleteRange` is cheap to write, but range tombstones are fragmented and rewritten by every flush and compaction that
-covers them. A workload that issues one `DeleteRange` per few keys allocates several KB per range in the background
-today. Prefer a few wide ranges over many narrow ones (as with upstream RocksDB, where many range tombstones also cost
-read and compaction time). Point deletes don't have this cost.
+`DeleteRange` allocates nothing on the calling thread. In the background, range tombstones are fragmented when a
+memtable or table file is first read and rewritten by every flush and compaction that covers them; this costs the
+fragmented copy of each tombstone (about 50 B per fragment, per memtable, table file and compaction) rather than per
+read. A workload that issues one `DeleteRange` per 10 keys measures about 300 B per `DeleteRange` in total, and a batch
+that mixes puts with one `DeleteRange` about 300 B per batch. Many narrow ranges still cost more than a few wide ones in
+memory, read time and compaction work (as with upstream RocksDB), so prefer wide ranges when you have the choice.
+Snapshots matter too: a flush or compaction keeps one tombstone per fragment for each snapshot that separates them.
 
 ## Iterators
 

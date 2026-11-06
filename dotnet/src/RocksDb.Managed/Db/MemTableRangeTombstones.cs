@@ -26,28 +26,31 @@ public sealed class FragmentedRangeTombstoneList
 {
     private static readonly int[] s_zero = [0];
 
-    // Every distinct fragment boundary is stored once, in order: boundary j is _keys[_boundOffsets[j].._boundOffsets[j + 1]].
-    // Fragment i covers [boundary _fragBound[i], boundary _fragBound[i] + 1), so adjacent fragments share their common
-    // boundary.
+    /// <summary>Where fragment i's start and end keys are in the key buffer.</summary>
+    internal struct FragmentKeys
+    {
+        public int StartOffset, StartLength, EndOffset, EndLength;
+    }
+
+    // Every distinct fragment boundary is stored once, in order, in _keys; adjacent fragments share their common
+    // boundary. Offsets and lengths are validated when the list is built (RangeTombstoneFragmenter.Finish).
     private readonly byte[] _keys;
-    private readonly int[] _boundOffsets;
-    private readonly int[] _fragBound;
+    private readonly FragmentKeys[] _frags;
     private readonly int[] _seqStart; // fragment i's seqnums are _seqs[_seqStart[i].._seqStart[i+1]]
     private readonly ulong[] _seqs;
     private readonly byte[] _timestamps; // _seqs.Length * TimestampSize bytes, parallel to _seqs
     private readonly Comparator _ucmp;
     private readonly int _tsSize;
 
-    public static FragmentedRangeTombstoneList Empty(Comparator ucmp) => new(ucmp, [], s_zero, [], s_zero, [], []);
+    public static FragmentedRangeTombstoneList Empty(Comparator ucmp) => new(ucmp, [], [], s_zero, [], []);
 
-    internal FragmentedRangeTombstoneList(Comparator ucmp, byte[] keys, int[] boundOffsets, int[] fragBound, int[] seqStart,
-        ulong[] seqs, byte[] timestamps)
+    internal FragmentedRangeTombstoneList(Comparator ucmp, byte[] keys, FragmentKeys[] frags, int[] seqStart, ulong[] seqs,
+        byte[] timestamps)
     {
         _ucmp = ucmp;
         _tsSize = ucmp.TimestampSize;
         _keys = keys;
-        _boundOffsets = boundOffsets;
-        _fragBound = fragBound;
+        _frags = frags;
         _seqStart = seqStart;
         _seqs = seqs;
         _timestamps = timestamps;
@@ -64,25 +67,33 @@ public sealed class FragmentedRangeTombstoneList
         public Tombstone(byte[] Start, byte[] End, ulong Sequence) : this(Start, End, Sequence, null) { }
     }
 
-    public int Count => _fragBound.Length;
-    public bool IsEmpty => _fragBound.Length == 0;
+    public int Count => _frags.Length;
+    public bool IsEmpty => _frags.Length == 0;
     /// <summary>Number of (fragment, covering sequence number) pairs, i.e. the tombstones a writer of this list emits.</summary>
     public int SequenceCount => _seqs.Length;
     /// <summary>User-defined timestamp size of the comparator (0 = none).</summary>
     public int TimestampSize => _tsSize;
 
     /// <summary>Start of fragment <paramref name="i"/> (with the maximum timestamp when timestamps are enabled).</summary>
-    public ReadOnlySpan<byte> GetStart(int i) => Bound(_fragBound[i]);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ReadOnlySpan<byte> GetStart(int i)
+    {
+        ref FragmentKeys f = ref _frags[i];
+        return KeyAt(f.StartOffset, f.StartLength);
+    }
 
     /// <summary>Exclusive end of fragment <paramref name="i"/> (with the maximum timestamp when timestamps are enabled).</summary>
-    public ReadOnlySpan<byte> GetEnd(int i) => Bound(_fragBound[i] + 1);
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private ReadOnlySpan<byte> Bound(int j)
+    public ReadOnlySpan<byte> GetEnd(int i)
     {
-        int off = _boundOffsets[j];
-        return _keys.AsSpan(off, _boundOffsets[j + 1] - off);
+        ref FragmentKeys f = ref _frags[i];
+        return KeyAt(f.EndOffset, f.EndLength);
     }
+
+    // The offsets were checked against _keys when the list was built, so no bounds check here (read path).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ReadOnlySpan<byte> KeyAt(int offset, int length) =>
+        MemoryMarshal.CreateReadOnlySpan(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_keys), (nint)(uint)offset), length);
 
     /// <summary>Sequence numbers covering fragment <paramref name="i"/>, in descending order.</summary>
     public ReadOnlySpan<ulong> GetSequences(int i) => _seqs.AsSpan(_seqStart[i], _seqStart[i + 1] - _seqStart[i]);
@@ -144,7 +155,7 @@ public sealed class FragmentedRangeTombstoneList
     public int FindCovering(ReadOnlySpan<byte> userKey)
     {
         // Binary search for the last fragment whose start <= userKey.
-        int lo = 0, hi = _fragBound.Length - 1, found = -1;
+        int lo = 0, hi = _frags.Length - 1, found = -1;
         while (lo <= hi)
         {
             int mid = (lo + hi) >>> 1;
@@ -449,28 +460,35 @@ internal sealed class RangeTombstoneFragmenter
             for (int j = 0; j < nb; j++) total += b[j].Len + tsSize;
             if (total > Array.MaxLength) ThrowHelper.InvalidArgument("range tombstone keys too large");
             byte[] keys = total == 0 ? [] : GC.AllocateUninitializedArray<byte>((int)total);
-            int[] boundOffsets = new int[nb + 1];
+            // Copy the boundaries into keys; b[j] is rewritten to boundary j's position there.
             int pos = 0;
             for (int j = 0; j < nb; j++)
             {
-                boundOffsets[j] = pos;
-                buf.AsSpan(b[j].Off, b[j].Len).CopyTo(keys.AsSpan(pos));
-                pos += b[j].Len;
+                int len = b[j].Len;
+                buf.AsSpan(b[j].Off, len).CopyTo(keys.AsSpan(pos));
+                b[j] = new KeyRef(pos, len + tsSize);
+                pos += len;
                 if (hasTs)
                 {
                     keys.AsSpan(pos, tsSize).Fill(0xff);
                     pos += tsSize;
                 }
             }
-            boundOffsets[nb] = pos;
+            System.Diagnostics.Debug.Assert(pos == keys.Length);
+            var frags = new FragmentedRangeTombstoneList.FragmentKeys[nf];
+            for (int i = 0; i < nf; i++)
+            {
+                KeyRef s = b[fragScratch[i]], e = b[fragScratch[i] + 1];
+                frags[i] = new FragmentedRangeTombstoneList.FragmentKeys { StartOffset = s.Off, StartLength = s.Len, EndOffset = e.Off, EndLength = e.Len };
+            }
             byte[] timestamps = [];
             if (hasTs && ns > 0)
             {
                 timestamps = GC.AllocateUninitializedArray<byte>(ns * tsSize);
                 for (int i = 0; i < ns; i++) buf.AsSpan(tsOut[i], tsSize).CopyTo(timestamps.AsSpan(i * tsSize));
             }
-            return new FragmentedRangeTombstoneList(_ucmp, keys, boundOffsets, fragScratch.AsSpan(0, nf).ToArray(),
-                seqStartScratch.AsSpan(0, nf + 1).ToArray(), seqOut.AsSpan(0, ns).ToArray(), timestamps);
+            return new FragmentedRangeTombstoneList(_ucmp, keys, frags, seqStartScratch.AsSpan(0, nf + 1).ToArray(),
+                seqOut.AsSpan(0, ns).ToArray(), timestamps);
         }
         finally
         {
