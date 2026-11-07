@@ -40,6 +40,17 @@ public sealed class ReplicationConsumer
         set => _writeOptions.MemtableInsertParallelism = value;
     }
 
+    /// <summary>
+    /// Whether every applied chunk is fsync'd before the write returns (and before the replica's latest sequence number
+    /// moves past it). A Raft follower must not report an entry it could lose in a power loss. Off by default (a plain
+    /// replica relies on the source for durability). Set it before applying.
+    /// </summary>
+    public bool SyncWrites
+    {
+        get => _writeOptions.Sync;
+        set => _writeOptions.Sync = value;
+    }
+
     /// <summary>The sequence number the next applied batch must start with (latest + 1).</summary>
     public ulong ExpectedNextSequence => _db.GetLatestSequenceNumber() + 1;
 

@@ -78,6 +78,28 @@ public sealed class ClusterHarness : IAsyncDisposable
         if (_hosts.TryRemove(id, out ClusterNodeHost? h)) await h.DisposeAsync();
     }
 
+    /// <summary>
+    /// A power loss of every node at once: the file system stops accepting writes (nothing written while the hosts shut
+    /// down reaches it), the hosts are disposed, and everything not synced is dropped.
+    /// </summary>
+    public async Task PowerLossAllAsync(MemoryFileSystem fs)
+    {
+        fs.SetFilesystemActive(false);
+        foreach (string id in _hosts.Keys)
+        {
+            try
+            {
+                await StopAsync(id);
+            }
+            catch (RocksDbException)
+            {
+                // closing on an inactive file system fails; the crash below decides what survives
+            }
+        }
+        fs.SimulateCrash();
+        fs.SetFilesystemActive(true);
+    }
+
     /// <summary>Statuses of the running nodes, checked for Election Safety and monotonic terms.</summary>
     public List<ClusterNodeStatus> Statuses()
     {

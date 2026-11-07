@@ -171,4 +171,27 @@ public sealed class ClusterTests
         await c.AssertConvergedAsync(leader);
         Assert.AreEqual(0, restarted.Resyncs);
     }
+
+    /// <summary>
+    /// Raft's durability contract: an acknowledged (committed) write survives the loss of every node's unsynced data.
+    /// The leader counted itself and the followers counted towards the quorum on entries that were only in the page
+    /// cache (no WAL fsync before acknowledging / reporting progress), so a power loss of the whole cluster (or of the
+    /// leader plus one follower, which the cluster soak hit) lost acknowledged writes.
+    /// </summary>
+    [TestMethod]
+    public async Task AcknowledgedWritesSurviveAPowerLossOfTheWholeCluster()
+    {
+        var fs = new MemoryFileSystem();
+        await using ClusterHarness c = await StartClusterAsync(fs, 50);
+        await WriteCommittedAsync(c, 50, 120);
+
+        await c.PowerLossAllAsync(fs);
+        foreach (string id in new[] { "n1", "n2", "n3" }) await c.StartAsync(id);
+        ClusterNodeHost leader = await c.WaitForLeaderAsync(null);
+        await c.AssertConvergedAsync(leader);
+        foreach (ClusterNodeHost h in c.Running)
+        {
+            for (int i = 50; i < 120; i++) Assert.IsNotNull(h.Db.Get(U(K(i))), "acknowledged key " + i + " lost on " + h.NodeId + " after the power loss\n" + c.LogText);
+        }
+    }
 }

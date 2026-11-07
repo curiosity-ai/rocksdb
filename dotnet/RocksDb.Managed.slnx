@@ -20,6 +20,7 @@
     <Project Path="tools/RocksDb.Managed.AllocationProfile/RocksDb.Managed.AllocationProfile.csproj" />
     <Project Path="tools/RocksDb.Managed.Tools/RocksDb.Managed.Tools.csproj" />
     <Project Path="tools/RocksDb.Managed.Soak/RocksDb.Managed.Soak.csproj" />
+    <Project Path="tools/RocksDb.Managed.ClusterSoak/RocksDb.Managed.ClusterSoak.csproj" />
   </Folder>
   <Folder Name="/bench/">
     <Project Path="bench/RocksDb.Managed.Benchmarks/RocksDb.Managed.Benchmarks.csproj" />
