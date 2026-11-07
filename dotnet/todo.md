@@ -361,6 +361,14 @@ Still open from this round:
 - [ ] Managed pure-write throughput drops from 1 to 4 threads (422k -> 369k ops/s; C 279k -> 289k)
 - [ ] bench/README.md lists txnwriteprepared / txnwriteunprepared for the native legs, but native-c implements only txnoptimistic / txnpessimistic
 
+## Jepsen-style soak (2026-11-07; tools/RocksDb.Managed.Soak, docs/soak.md)
+
+- [x] Supervisor / worker / verifier cycles; faults kill, graceful, recovery-kill, pause, I/O errors, power loss, torn-op, torn-seq, crash at N-th fsync; corruption trials on a copy; native cross-check; selftest (13 injected bugs caught)
+- [x] 45 min soak: 190 cycles, ~101.8M ops, 0 failures
+- [x] Bug: memtable switch synced the closed WAL but not the WAL directory (fixed, DbCrashConsistencyTests regression test)
+- [ ] Real LazyFS mode (`--lazyfs-bin`): exercise in the container
+- [ ] Soak with a separate `wal_dir`; pessimistic / WritePrepared transactions in the workload; native writer worker; torn MANIFEST writes
+
 ## Unported utilities (found 2026-11-03)
 
 - [x] Built-in merge operators: max, put / put_v1, sortlist, bytesxor, StringAppendTEST, AggMerge (+ Aggregator API); resolved by name from OPTIONS; native writes / managed reads and compacts and vice versa for 12 ids; string-append delimiter now persisted like native
