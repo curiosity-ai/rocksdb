@@ -257,6 +257,9 @@ were `flush` (1.02-2.06x) and 1 KiB single-threaded `seekrandom` (1.21x). The fi
 (managed 0.66x, rocksdb-sharp 1.03x) are not comparable 1:1. [perf.md](perf.md) ("Final three-way results", "Final run
 on a new VM CPU", "Definitive run") compares the three.
 
+**Mixed reads / writes** (`readrandomwriterandom`, 0-100% writes in steps of 25%, 1 and 4 threads, reads/s and
+writes/s per engine): `bench/results/2026-11-07-mixed-readwrite.md` (raw rows: `.csv`).
+
 Older reports in `bench/results/` are single runs on the shared, loaded VM: `2026-11-02-vm*.md` before perf pass #2,
 `-vm-perf2*.md` after it, `-vm-perf3*.md` after perf pass #3, `-vm-picker-compaction.md` after the compaction-picking
 parity fixes, and `-vm-warm*.md` / `-vm-cold*.md` for the warm-up comparison. [perf.md](perf.md) keeps their numbers.
