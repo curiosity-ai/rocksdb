@@ -48,7 +48,12 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     private Task _leaderLoop = Task.CompletedTask;
     private bool _resyncing;
     private int _bootstrapInSyncFollowers;
-    private TaskCompletionSource _commitChanged = NewSignal();
+    // Woken whenever the commit index advances or leadership ends (WaitForCommitAsync). Signalled under _gate.
+    private readonly RocksDb.Managed.Util.AsyncBroadcastSignal _commitChanged = new();
+    // Scratch for the quorum computation (self + peers). Guarded by _gate.
+    private readonly ulong[] _matchScratch;
+    // The last successful heartbeat answer (reused while term and log tail are unchanged). Guarded by _gate.
+    private AppendEntriesResult? _lastAccepted;
     private int _disposed;
 
     public event EventHandler<LeaderChangedEventArgs>? LeaderChanged;
@@ -78,6 +83,7 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         _peers = new Dictionary<string, PeerState>(StringComparer.Ordinal);
         ulong next = db.GetLatestSequenceNumber() + 1;
         foreach (ClusterMember p in config.Peers) _peers.Add(p.NodeId, new PeerState(p, next));
+        _matchScratch = new ulong[_peers.Count + 1];
 
         _electionTimer = new ElectionTimer(config.ElectionTimeoutMinMs, config.ElectionTimeoutMaxMs, OnElectionTimeout, _time);
 
@@ -152,7 +158,7 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
         _cts.Cancel();
         _electionTimer.Dispose();
-        lock (_gate) _commitChanged.TrySetResult();
+        lock (_gate) _commitChanged.SignalAll();
     }
 
     /// <summary>Stops the node and waits for its heartbeat loop to finish.</summary>
@@ -254,7 +260,14 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
                 // entries past it may be a deposed leader's divergent tail and must not be marked committed.
                 ulong newCommit = Math.Min(heartbeat.LeaderCommit, heartbeat.PrevLogSeq);
                 if (newCommit > _commitSeq) SetCommitLocked(newCommit);
-                result = new AppendEntriesResult(_state.CurrentTerm, true, myLatest, AppendEntriesRejectReason.None);
+                // Results are immutable: an idle follower answers every heartbeat with the same one.
+                AppendEntriesResult? last = _lastAccepted;
+                long term = _state.CurrentTerm;
+                if (last is null || last.Term != term || last.LastSeq != myLatest)
+                {
+                    _lastAccepted = last = new AppendEntriesResult(term, true, myLatest, AppendEntriesRejectReason.None);
+                }
+                result = last;
             }
         }
         if (conflict) ResyncRequired?.Invoke(this, EventArgs.Empty);
@@ -351,8 +364,10 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     /// <summary>
     /// For a leader acknowledging a client write: completes with true once <see cref="CommitSeq"/> reaches
     /// <paramref name="sequence"/> (the write is replicated to a quorum), or with false as soon as this node is no longer
-    /// leader of the term it led when called (the write may never commit). Signalled, no polling.
+    /// leader of the term it led when called (the write may never commit). Signalled, no polling; allocation-free in
+    /// steady state (pooled state machine and wait, cancellation included).
     /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<bool> WaitForCommitAsync(ulong sequence, CancellationToken cancellationToken)
     {
         long term;
@@ -363,14 +378,15 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         }
         while (true)
         {
-            Task changed;
+            RocksDb.Managed.Util.AsyncBroadcastSignal.Waiter changed;
             lock (_gate)
             {
                 if (CommitSeq >= sequence) return true;
                 if (_role != RaftRole.Leader || _state.CurrentTerm != term || _disposed != 0) return false;
-                changed = _commitChanged.Task;
+                // Registered under _gate, where every signal is raised: no wake-up can be missed.
+                changed = _commitChanged.Register();
             }
-            await changed.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await _commitChanged.WaitAsync(changed, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -380,26 +396,20 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         SignalCommitWaitersLocked();
     }
 
-    private void SignalCommitWaitersLocked()
-    {
-        TaskCompletionSource prev = _commitChanged;
-        _commitChanged = NewSignal();
-        prev.TrySetResult();
-    }
-
-    private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private void SignalCommitWaitersLocked() => _commitChanged.SignalAll();
 
     private void TryAdvanceCommitLocked()
     {
         if (_role != RaftRole.Leader) return;
-        // Sort matchSeqs descending; the quorum-th value is the new commit index.
-        var seqs = new List<ulong>(_peers.Count + 1);
-        foreach (PeerState p in _peers.Values) seqs.Add(p.MatchSeq);
-        seqs.Add(_db.GetLatestSequenceNumber()); // self
-        seqs.Sort(static (a, b) => b.CompareTo(a));
+        // The quorum-th largest matchSeq (self included) is the new commit index.
+        Span<ulong> seqs = _matchScratch;
+        int n = 0;
+        foreach (PeerState p in _peers.Values) seqs[n++] = p.MatchSeq;
+        seqs[n++] = _db.GetLatestSequenceNumber(); // self
         int q = _config.Quorum;
-        if (seqs.Count < q) return;
-        ulong candidate = seqs[q - 1];
+        if (n < q) return;
+        seqs[..n].Sort();
+        ulong candidate = seqs[n - q];
         if (candidate <= _commitSeq) return;
         // §5.4.2: a leader may only commit entries from its own term by counting replicas; entries from earlier terms
         // become committed implicitly once a current-term entry is committed.

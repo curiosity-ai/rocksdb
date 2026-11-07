@@ -37,7 +37,12 @@ internal sealed partial class DbImpl
     private string? _secondaryPath;
     private readonly SemaphoreSlim _catchUpLock = new(1, 1);
     // Secondary: open WAL readers by log number (incremental tailing). Guarded by _catchUpLock.
-    private readonly SortedDictionary<ulong, FragmentBufferedLogReader> _secondaryWalReaders = new();
+    // (A SortedList: indexed access, so a catch-up poll enumerates it without allocating.)
+    private readonly SortedList<ulong, FragmentBufferedLogReader> _secondaryWalReaders = new();
+    // Secondary catch-up scratch (guarded by _catchUpLock): WAL numbers listed by a poll, and the reporter of the WAL readers.
+    private readonly List<ulong> _secondaryWalNumbers = new();
+    private WalRecoveryReporter? _secondaryWalReporter;
+    private string? _currentFilePath;
     // Secondary: position in the primary's current MANIFEST + replayed state. Guarded by _catchUpLock.
     private SecondaryManifestTailer? _manifestTailer;
     private int _secondaryManifestOpens;
@@ -178,9 +183,12 @@ internal sealed partial class DbImpl
         return files;
     }
 
-    private List<ulong> ListWalNumbers(ulong minLog)
+    private List<ulong> ListWalNumbers(ulong minLog) => ListWalNumbers(minLog, new List<ulong>());
+
+    /// <summary>Fills <paramref name="wals"/> (cleared first) with the sorted numbers of the WALs at or after <paramref name="minLog"/>.</summary>
+    private List<ulong> ListWalNumbers(ulong minLog, List<ulong> wals)
     {
-        var wals = new List<ulong>();
+        wals.Clear();
         foreach (string child in FileSystem.GetChildren(WalDir))
         {
             if (FileNames.TryParseFileName(child, out ulong number, out FileType type) && type == FileType.WalFile && number >= minLog) wals.Add(number);
@@ -236,19 +244,23 @@ internal sealed partial class DbImpl
     private RecoveredVersionState TailManifest(out bool changed)
     {
         changed = false;
-        string path = FileNames.GetCurrentManifestPath(FileSystem, DbName, out ulong manifestNumber);
         SecondaryManifestTailer? tailer = _manifestTailer;
-        if (tailer is null || tailer.ManifestNumber != manifestNumber)
+        // The common poll: CURRENT still names the tailed MANIFEST (parsed without building the path).
+        if (tailer is null || !TryReadCurrentManifestNumber(out ulong manifestNumber) || tailer.ManifestNumber != manifestNumber)
         {
-            // Like C++, the rest of the old MANIFEST is not read: the new one starts with a snapshot of the full state.
-            DisposeManifestTailer();
-            var reporter = new WalRecoveryReporter { FileName = path };
-            // log::FragmentBufferedReader(..., checksum=true, log_number=0), as in MaybeSwitchManifest.
-            var reader = new FragmentBufferedLogReader(FileSystem.OpenSequential(path), reporter, checksum: true, logNumber: 0);
-            tailer = new SecondaryManifestTailer(manifestNumber, reader, reporter, new ManifestReplayer(_comparatorResolver));
-            _manifestTailer = tailer;
-            Interlocked.Increment(ref _secondaryManifestOpens);
-            changed = true;
+            string path = FileNames.GetCurrentManifestPath(FileSystem, DbName, out manifestNumber);
+            if (tailer is null || tailer.ManifestNumber != manifestNumber)
+            {
+                // Like C++, the rest of the old MANIFEST is not read: the new one starts with a snapshot of the full state.
+                DisposeManifestTailer();
+                var reporter = new WalRecoveryReporter { FileName = path };
+                // log::FragmentBufferedReader(..., checksum=true, log_number=0), as in MaybeSwitchManifest.
+                var reader = new FragmentBufferedLogReader(FileSystem.OpenSequential(path), reporter, checksum: true, logNumber: 0);
+                tailer = new SecondaryManifestTailer(manifestNumber, reader, reporter, new ManifestReplayer(_comparatorResolver));
+                _manifestTailer = tailer;
+                Interlocked.Increment(ref _secondaryManifestOpens);
+                changed = true;
+            }
         }
         long applied = 0;
         while (tailer.Reader.TryReadRecord(out ReadOnlySpan<byte> record))
@@ -266,6 +278,43 @@ internal sealed partial class DbImpl
         // CurrentState validates and re-sorts the levels: only needed after new edits.
         if (changed) tailer.State = tailer.Replayer.CurrentState();
         return tailer.State!;
+    }
+
+    /// <summary>
+    /// Reads CURRENT into a stack buffer and parses "MANIFEST-&lt;number&gt;\n" (the format GetCurrentManifestPath
+    /// accepts). False for anything else (including read errors): the caller then uses GetCurrentManifestPath, which
+    /// reports the problem.
+    /// </summary>
+    private bool TryReadCurrentManifestNumber(out ulong manifestNumber)
+    {
+        manifestNumber = 0;
+        Span<byte> buf = stackalloc byte[64];
+        int len = 0;
+        try
+        {
+            using Env.ISequentialFile f = FileSystem.OpenSequential(_currentFilePath ??= FileNames.CurrentFilePath(DbName));
+            while (len < buf.Length)
+            {
+                int n = f.Read(buf[len..]);
+                if (n <= 0) break;
+                len += n;
+            }
+        }
+        catch (Exception e) when (e is RocksDbException or IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+        ReadOnlySpan<byte> prefix = "MANIFEST-"u8;
+        if (len == buf.Length || len <= prefix.Length + 1 || buf[len - 1] != (byte)'\n' || !buf.StartsWith(prefix)) return false;
+        ulong v = 0;
+        for (int i = prefix.Length; i < len - 1; i++)
+        {
+            uint d = (uint)(buf[i] - (byte)'0');
+            if (d > 9 || v > (ulong.MaxValue - d) / 10) return false;
+            v = v * 10 + d;
+        }
+        manifestNumber = v;
+        return true;
     }
 
     private void DisposeManifestTailer()
@@ -304,8 +353,10 @@ internal sealed partial class DbImpl
     {
         _ = synchronous;
         ct.ThrowIfCancellationRequested();
+        bool versionsChanged = false;
         for (int attempt = 0; manifestChanged || _secondaryInstallDeferred; attempt++)
         {
+            versionsChanged = true;
             var obsolete = new List<ObsoleteTableFile>();
             var obsoleteBlobs = new List<ObsoleteBlobFile>();
             bool resetMemtables = InstallManifestState(state, obsolete, obsoleteBlobs);
@@ -321,8 +372,8 @@ internal sealed partial class DbImpl
             state = TailManifestWithRetry(out manifestChanged);
             if (!manifestChanged) break;
         }
-        if (_secondaryRecoverWal) ApplyWalTail(state);
-        else
+        if (_secondaryRecoverWal) ApplyWalTail(state, versionsChanged);
+        else if (versionsChanged)
         {
             lock (_mutex)
             {
@@ -387,27 +438,29 @@ internal sealed partial class DbImpl
         return resetMemtables;
     }
 
-    /// <summary>Applies WAL records appended since the previous catch-up (DBImplSecondary::RecoverLogFiles).</summary>
-    private void ApplyWalTail(RecoveredVersionState state)
+    /// <summary>
+    /// Applies WAL records appended since the previous catch-up (DBImplSecondary::RecoverLogFiles). New super versions
+    /// are installed when <paramref name="versionsChanged"/> (the MANIFEST state was installed) or records were applied
+    /// (upstream installs them for the changed column families only); an idle poll installs nothing.
+    /// </summary>
+    private void ApplyWalTail(RecoveredVersionState state, bool versionsChanged)
     {
         ulong minLog;
         lock (_mutex) minLog = Versions.MinLogNumberWithUnflushedData(null);
-        // Readers of WALs whose data is now in table files are no longer needed.
-        var stale = new List<ulong>();
-        foreach (ulong n in _secondaryWalReaders.Keys)
+        // Readers of WALs whose data is now in table files are no longer needed (sorted: the stale ones come first).
+        while (_secondaryWalReaders.Count > 0 && _secondaryWalReaders.Keys[0] < minLog)
         {
-            if (n < minLog) stale.Add(n);
-        }
-        foreach (ulong n in stale)
-        {
-            _secondaryWalReaders[n].Dispose();
-            _secondaryWalReaders.Remove(n);
+            _secondaryWalReaders.Values[0].Dispose();
+            _secondaryWalReaders.RemoveAt(0);
         }
 
         ulong last = Math.Max(Versions.LastSequence, state.LastSequence);
-        var reporter = new WalRecoveryReporter();
-        foreach (ulong walNumber in ListWalNumbers(minLog))
+        bool applied = false;
+        WalRecoveryReporter reporter = _secondaryWalReporter ??= new WalRecoveryReporter();
+        List<ulong> walNumbers = ListWalNumbers(minLog, _secondaryWalNumbers);
+        for (int w = 0; w < walNumbers.Count; w++)
         {
+            ulong walNumber = walNumbers[w];
             if (!_secondaryWalReaders.TryGetValue(walNumber, out FragmentBufferedLogReader? reader))
             {
                 Env.ISequentialFile file;
@@ -433,12 +486,14 @@ internal sealed partial class DbImpl
                 uint count = Util.Coding.DecodeFixed32(record[8..]);
                 var inserter = new MemTableInserter(this, walNumber, ignoreMissingColumnFamilies: true) { Sequence = seq };
                 inserter.Run(record);
+                applied = true;
                 _flushScheduler.Clear();
                 // The inserter's next sequence (not the header count): prepared sections consume no sequence numbers.
                 if (count > 0 && inserter.Sequence > seq) last = Math.Max(last, inserter.Sequence - 1);
             }
         }
         Versions.SetLastSequence(last);
+        if (!versionsChanged && !applied) return;
         lock (_mutex)
         {
             foreach (ColumnFamilyData cfd in Versions.ColumnFamilies) InstallSuperVersion(cfd);
@@ -550,7 +605,7 @@ internal sealed partial class DbImpl
 
     private void DisposeSecondaryWalReaders()
     {
-        foreach (FragmentBufferedLogReader r in _secondaryWalReaders.Values) r.Dispose();
+        for (int i = 0; i < _secondaryWalReaders.Count; i++) _secondaryWalReaders.Values[i].Dispose();
         _secondaryWalReaders.Clear();
     }
 }

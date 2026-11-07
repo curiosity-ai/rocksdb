@@ -15,6 +15,9 @@ public sealed class ReplicationPrimary
     private readonly string _checkpointRoot;
     private readonly ReplicationSource _source;
     private readonly AdaptiveCommitDelayController? _delay;
+    // "replica-N" ids by index (copy-on-grow), so progress reports do not build a string each.
+    private volatile string[] _replicaIds = [];
+    private readonly Lock _idsLock = new();
 
     /// <param name="db">The primary database.</param>
     /// <param name="checkpointRoot">Directory (on the database's file system) under which per-request checkpoints are created.</param>
@@ -61,10 +64,29 @@ public sealed class ReplicationPrimary
     /// </summary>
     public int ReportProgress(int replicaIndex, ulong appliedThrough)
     {
-        _source.ReportReplicaProgress("replica-" + replicaIndex, appliedThrough);
+        _source.ReportReplicaProgress(ReplicaId(replicaIndex), appliedThrough);
         ulong latest = _db.GetLatestSequenceNumber();
         _delay?.ReportLag(replicaIndex, latest > appliedThrough ? (long)(latest - appliedThrough) : 0);
         return _source.RetireArchivedWals();
+    }
+
+    private string ReplicaId(int replicaIndex)
+    {
+        string[] ids = _replicaIds;
+        if ((uint)replicaIndex < (uint)ids.Length) return ids[replicaIndex];
+        if (replicaIndex < 0 || replicaIndex >= 1024) return "replica-" + replicaIndex;
+        lock (_idsLock)
+        {
+            ids = _replicaIds;
+            if (replicaIndex >= ids.Length)
+            {
+                var grown = new string[replicaIndex + 1];
+                ids.CopyTo(grown, 0);
+                for (int i = ids.Length; i < grown.Length; i++) grown[i] = "replica-" + i;
+                _replicaIds = ids = grown;
+            }
+            return ids[replicaIndex];
+        }
     }
 
     /// <summary>Waits as long as the commit-delay controller recommends (writers call this between batches).</summary>

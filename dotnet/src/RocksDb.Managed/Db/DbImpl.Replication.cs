@@ -21,8 +21,8 @@ internal sealed partial class DbImpl
     private readonly Dictionary<ulong, ulong> _readFirstRecordCache = new();
     // WalManager::purge_wal_files_last_run_ (unix seconds). Guarded by mutex.
     private long _purgeWalFilesLastRun;
-    // Woken (and replaced) whenever new sequence numbers are published; see WaitForSequenceAsync.
-    private TaskCompletionSource? _sequenceWaiters;
+    // Waiters for newly published sequence numbers (WAL tailers, replicas); see WaitForSequenceAsync.
+    private readonly Util.AsyncBroadcastSignal _sequenceSignal = new();
 
     /// <summary>kDefaultIntervalToDeleteObsoleteWAL (db/wal_manager.h): 600 seconds.</summary>
     private const long DefaultIntervalToDeleteObsoleteWal = 600;
@@ -302,6 +302,15 @@ internal sealed partial class DbImpl
         return true;
     }
 
+    /// <summary>The number of the WAL currently written to (0 if none); no file system access.</summary>
+    public ulong CurrentWalNumber
+    {
+        get
+        {
+            lock (_mutex) return _logNumber;
+        }
+    }
+
     /// <summary>Port of DBImpl::GetCurrentWalFile (WalManager::GetLiveWalFile): the WAL currently written to.</summary>
     public WalFileInfo GetCurrentWalFile()
     {
@@ -371,35 +380,37 @@ internal sealed partial class DbImpl
 
     /// <summary>
     /// Wakes tailers waiting for new sequence numbers. Called by the write leader right after publishing a group
-    /// (and by read-only/secondary catch-up). One interlocked exchange per write group, which also orders the
-    /// published sequence before the waiter check (see <see cref="WaitForSequenceAsync"/>).
+    /// (and by read-only/secondary catch-up and close). A full fence and one read when nobody waits; the fence also
+    /// orders the published sequence before the waiter check (see <see cref="WaitForSequenceAsync"/>).
     /// </summary>
-    internal void NotifySequenceWaiters()
-    {
-        TaskCompletionSource? waiters = Interlocked.Exchange(ref _sequenceWaiters, null);
-        waiters?.TrySetResult();
-    }
+    internal void NotifySequenceWaiters() => _sequenceSignal.SignalAll();
 
     /// <summary>
     /// Completes when the DB has published sequence number <paramref name="sequence"/> (LastSequence &gt;=
-    /// sequence) or when the DB is closed (returns false then). Allocation-free when already satisfied.
+    /// sequence) or when the DB is closed (returns false then). Allocation-free: synchronous when already satisfied, and
+    /// a wait uses a pooled waiter node and a pooled state machine (cancellation included).
     /// </summary>
-    public async ValueTask<bool> WaitForSequenceAsync(ulong sequence, CancellationToken cancellationToken)
+    public ValueTask<bool> WaitForSequenceAsync(ulong sequence, CancellationToken cancellationToken)
+    {
+        if (Versions.LastSequence >= sequence) return new ValueTask<bool>(true);
+        return WaitForSequenceSlowAsync(sequence, cancellationToken);
+    }
+
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<bool> WaitForSequenceSlowAsync(ulong sequence, CancellationToken cancellationToken)
     {
         while (Versions.LastSequence < sequence)
         {
             if (IsDisposed) return false;
-            TaskCompletionSource? tcs = Volatile.Read(ref _sequenceWaiters);
-            if (tcs is null)
+            Util.AsyncBroadcastSignal.Waiter waiter = _sequenceSignal.Register();
+            // Re-check after registering (Register's fence pairs with the one in NotifySequenceWaiters; close sets
+            // _disposed with an interlocked exchange before notifying).
+            if (Versions.LastSequence >= sequence || IsDisposed)
             {
-                var created = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                tcs = Interlocked.CompareExchange(ref _sequenceWaiters, created, null) ?? created;
+                _sequenceSignal.Unregister(waiter);
+                continue;
             }
-            // Re-check after registering (the CompareExchange / writer's Exchange are full fences).
-            Interlocked.MemoryBarrier();
-            if (Versions.LastSequence >= sequence) break;
-            if (IsDisposed) return false;
-            await tcs.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await _sequenceSignal.WaitAsync(waiter, cancellationToken).ConfigureAwait(false);
         }
         return true;
     }

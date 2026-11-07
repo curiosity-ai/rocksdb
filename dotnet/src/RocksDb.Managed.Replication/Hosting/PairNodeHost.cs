@@ -153,7 +153,9 @@ public sealed class PairNodeHost : IAsyncDisposable
     /// <summary>
     /// Applies a client write if this node is the primary; while a handoff holds writes it waits up to
     /// <paramref name="holdTimeout"/>. Otherwise answers <see cref="PairWriteStatus.NotPrimary"/> with a hint.
+    /// Allocation-free in steady state.
     /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<PairWriteResult> WriteAsync(WriteBatch batch, TimeSpan holdTimeout, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(batch);

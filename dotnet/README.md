@@ -1048,8 +1048,10 @@ await writer;
 
 Set `DbOptions.WalTtlSeconds` / `WalSizeLimitMb` to archive obsolete WALs for readers that fall behind, and
 `DisableFileDeletions` / `EnableFileDeletions` to pin files. `WaitForSequenceAsync`, `GetSortedWalFiles`,
+`CurrentWalNumber` (the WAL being written, without touching the file system: it changes when the WAL rotates),
 `GetLiveFiles` and `CreateCheckpointAsync` cover the rest of what a replication layer needs; see
-[src/RocksDb.Managed.Replication](src/RocksDb.Managed.Replication/README.md).
+[src/RocksDb.Managed.Replication](src/RocksDb.Managed.Replication/README.md). A held iterator, `TailUpdatesAsync` and
+`WaitForSequenceAsync` allocate nothing per batch, also while they wait (see [docs/allocations.md](docs/allocations.md)).
 
 ### Read-only and secondary instances
 

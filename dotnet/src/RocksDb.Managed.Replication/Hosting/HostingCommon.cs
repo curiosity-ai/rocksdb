@@ -1,5 +1,4 @@
 using System.Runtime.CompilerServices;
-using System.Threading.Channels;
 using RocksDb.Managed.Replication.Switchover;
 
 namespace RocksDb.Managed.Replication.Hosting;
@@ -115,47 +114,74 @@ public delegate bool StreamTagProvider(out string sourceId, out long term);
 /// <summary>
 /// Coalescing progress reporter for a follower: <see cref="Report"/> is cheap and never blocks the ingest loop; one
 /// background loop sends only the newest value through the callback (a lost report is superseded by the next).
+/// Allocation-free per report (beyond what the callback's transport allocates).
 /// </summary>
 public sealed class ProgressReporter : IAsyncDisposable
 {
-    private readonly Channel<ulong> _channel = Channel.CreateBounded<ulong>(new BoundedChannelOptions(1)
-    {
-        FullMode = BoundedChannelFullMode.DropOldest,
-        SingleReader = true,
-    });
+    private readonly Func<ulong, CancellationToken, Task> _send;
     private readonly CancellationTokenSource _cts = new();
+    private readonly RocksDb.Managed.Util.AsyncBroadcastSignal _signal = new();
     private readonly Task _loop;
+    private ulong _latest;
+    // 1 while a reported value has not been picked up by the loop.
+    private int _pending;
+    private volatile bool _completed;
 
     public ProgressReporter(Func<ulong, CancellationToken, Task> send)
     {
         ArgumentNullException.ThrowIfNull(send);
-        _loop = Task.Run(async () =>
+        _send = send;
+        _loop = Task.Run(RunAsync);
+    }
+
+    private async Task RunAsync()
+    {
+        CancellationToken ct = _cts.Token;
+        try
         {
-            try
+            while (true)
             {
-                await foreach (ulong seq in _channel.Reader.ReadAllAsync(_cts.Token).ConfigureAwait(false))
+                if (Interlocked.Exchange(ref _pending, 0) == 1)
                 {
+                    ulong seq = Interlocked.Read(ref _latest);
                     try
                     {
-                        await send(seq, _cts.Token).ConfigureAwait(false);
+                        await _send(seq, ct).ConfigureAwait(false);
                     }
                     catch (Exception e) when (e is not OperationCanceledException)
                     {
                         // Best effort: the next report carries newer progress.
                     }
+                    continue;
                 }
+                if (_completed) return;
+                RocksDb.Managed.Util.AsyncBroadcastSignal.Waiter w = _signal.Register();
+                // Re-check after registering (Report sets _pending with an interlocked exchange before signalling).
+                if (Volatile.Read(ref _pending) == 1 || _completed)
+                {
+                    _signal.Unregister(w);
+                    continue;
+                }
+                await _signal.WaitAsync(w, ct).ConfigureAwait(false);
             }
-            catch (OperationCanceledException)
-            {
-            }
-        });
+        }
+        catch (OperationCanceledException)
+        {
+        }
     }
 
-    public void Report(ulong sequence) => _channel.Writer.TryWrite(sequence);
+    public void Report(ulong sequence)
+    {
+        if (_completed) return;
+        Interlocked.Exchange(ref _latest, sequence);
+        Interlocked.Exchange(ref _pending, 1);
+        _signal.SignalAll();
+    }
 
     public async ValueTask DisposeAsync()
     {
-        _channel.Writer.TryComplete();
+        _completed = true;
+        _signal.SignalAll();
         await _cts.CancelAsync().ConfigureAwait(false);
         await _loop.ConfigureAwait(false);
         _cts.Dispose();
