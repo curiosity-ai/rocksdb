@@ -354,6 +354,13 @@ Still open from this round:
 - [x] Replication / WAL tailing (32 scenarios, Scenarios/Replication.cs): pooled `AsyncBroadcastSignal` for sequence / commit / progress waits (tailing waits ~520 -> ~25 B), pooled async builders across WalTailer / consumer / hosts, WAL listing only after rotation (TransactionLogIterator, ReplicationSource retirement), Raft quorum and heartbeat answers 0 B, lockstep replica round trip 2.3 KB -> <200 B, secondary idle catch-up 7.1 -> 1.4 KB; `RocksDatabase.CurrentWalNumber`
 - [ ] Replication left as is: GetUpdatesSince per poll ~3 KB (hold one tail instead), idle TryCatchUpWithPrimary ~1.4 KB (directory listing + CURRENT), Raft leader heartbeat per interval, MagicOnion / gRPC DTOs, checkpoints
 
+## Mixed read/write sweep (2026-11-07, bench/results/2026-11-07-mixed-readwrite.md)
+
+- [x] `readrandomwriterandom` + `--readwritepercent` on all four legs; 0-100% writes, 1 and 4 threads, 3 reps: managed 1.25-1.65x c-native ops/s, rocksdb-sharp 0.91-1.02x
+- [ ] Write-heavy cells JIT-compile up to ~630 methods during measurement (memtable switch / flush paths not covered by the warm-up)
+- [ ] Managed pure-write throughput drops from 1 to 4 threads (422k -> 369k ops/s; C 279k -> 289k)
+- [ ] bench/README.md lists txnwriteprepared / txnwriteunprepared for the native legs, but native-c implements only txnoptimistic / txnpessimistic
+
 ## Unported utilities (found 2026-11-03)
 
 - [x] Built-in merge operators: max, put / put_v1, sortlist, bytesxor, StringAppendTEST, AggMerge (+ Aggregator API); resolved by name from OPTIONS; native writes / managed reads and compacts and vice versa for 12 ids; string-append delimiter now persisted like native
