@@ -276,7 +276,8 @@ writes two Jepsen histories, one op map per line:
 - `bank.edn`: `{:f :transfer, :value {:from 3, :to 7, :amount 34}}` and `{:f :read, :value {0 1005, 1 1011, ...}}`
   (balances as signed integers; they may go negative; the total is accounts x 1000).
 
-Process ids are `cycle * 1000 + worker part * 100 + thread`, and every op left open by a killed worker gets an `:info`
+Process ids are `cycle * 1000 + worker part * 100 + thread` (plus 1,000,000 per earlier `:info` op of the thread: a
+process is never reused after `:info`), and every op left open by a killed worker gets an `:info`
 completion, as Jepsen requires. Check them with [elle-cli](https://github.com/ligurio/elle-cli), e.g.
 `java -jar elle-cli.jar --model rw-register --consistency-models strict-serializable register.edn` and
 `--model bank bank.edn` (exporting all kept cycles gives the checker the writes that later reads observe; values
