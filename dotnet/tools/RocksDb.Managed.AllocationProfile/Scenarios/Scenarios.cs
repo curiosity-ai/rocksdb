@@ -20,6 +20,7 @@ internal static partial class Scenarios
         AddMisc(list);
         AddTransactions(list);
         AddBackground(list);
+        AddFeatures(list);
         AddNative(list);
         return s_all = list;
     }
