@@ -169,6 +169,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     // Client-facing writes (leader side)
 
     /// <summary>Writes without waiting for commit; false when this node is not the leader (or is rebuilding).</summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<bool> TryWriteAsLeaderAsync(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, CancellationToken cancellationToken)
     {
         if (_resyncing || _node.Role != RaftRole.Leader || !_dbGate.TryEnter()) return false;
@@ -186,8 +187,11 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     /// <summary>
     /// Writes and acknowledges only once the entry is committed (replicated to a quorum) - the durability contract Raft
     /// offers clients. False when this node is not (or stops being) the leader, or the commit takes longer than
-    /// <paramref name="timeout"/> (the write may still commit later).
+    /// <paramref name="timeout"/> (the write may still commit later). Allocation-free in steady state when
+    /// <paramref name="cancellationToken"/> cannot be cancelled (the timeout source is pooled); a cancellable token costs a
+    /// linked token source per write.
     /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<bool> WriteCommittedAsync(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, TimeSpan timeout, CancellationToken cancellationToken)
     {
         if (_resyncing || _node.Role != RaftRole.Leader || !_dbGate.TryEnter()) return false;
@@ -203,16 +207,51 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         {
             _dbGate.Exit();
         }
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        cts.CancelAfter(timeout);
+        if (_node.CommitSeq >= seq) return true;
+        bool linked = cancellationToken.CanBeCanceled;
+        CancellationTokenSource cts = linked ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken) : RentTimeoutSource();
         try
         {
+            cts.CancelAfter(timeout);
             return await _node.WaitForCommitAsync(seq, cts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             return false;
         }
+        finally
+        {
+            if (linked) cts.Dispose();
+            else ReturnTimeoutSource(cts);
+        }
+    }
+
+    // Timeout sources of WriteCommittedAsync: reset (TryReset stops the timer) and reused while they did not fire.
+    private readonly Stack<CancellationTokenSource> _timeoutSources = new();
+
+    private CancellationTokenSource RentTimeoutSource()
+    {
+        lock (_timeoutSources)
+        {
+            if (_timeoutSources.TryPop(out CancellationTokenSource? cts)) return cts;
+        }
+        return new CancellationTokenSource();
+    }
+
+    private void ReturnTimeoutSource(CancellationTokenSource cts)
+    {
+        if (cts.TryReset())
+        {
+            lock (_timeoutSources)
+            {
+                if (_timeoutSources.Count < 64)
+                {
+                    _timeoutSources.Push(cts);
+                    return;
+                }
+            }
+        }
+        cts.Dispose();
     }
 
     /// <summary>A digest of the database (null while resyncing).</summary>

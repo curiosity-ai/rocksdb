@@ -174,8 +174,9 @@ public sealed class WalTailer : IDisposable
 
     /// <summary>
     /// Waits until the database publishes a sequence number this tailer has not read (signalled by the write path, no
-    /// polling). Returns false if the database was closed.
+    /// polling). Returns false if the database was closed. Allocation-free in steady state.
     /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<bool> WaitForUpdatesAsync(CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);

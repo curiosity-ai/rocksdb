@@ -170,6 +170,21 @@ public sealed partial class RocksDatabase
     /// <summary>The file system the DB was opened with (<see cref="DbOptions.FileSystem"/>); checkpoints are written through it.</summary>
     public Env.IFileSystem FileSystem => _db.Options.FileSystem;
 
+    /// <summary>
+    /// The number of the WAL currently being written (the <see cref="WalFileInfo.LogNumber"/> of
+    /// <see cref="GetCurrentWalFile"/>), without touching the file system or allocating; it changes when the WAL rotates.
+    /// 0 when the instance writes no WAL (read-only, secondary). Lets a replication source notice rotations cheaply, e.g.
+    /// to list WAL files (<see cref="GetSortedWalFiles"/>) only when the set can have changed.
+    /// </summary>
+    public ulong CurrentWalNumber
+    {
+        get
+        {
+            _db.ThrowIfDisposed();
+            return _db.CurrentWalNumber;
+        }
+    }
+
     /// <summary>The WAL currently being written (DB::GetCurrentWalFile).</summary>
     public WalFileInfo GetCurrentWalFile() => _db.GetCurrentWalFile();
 

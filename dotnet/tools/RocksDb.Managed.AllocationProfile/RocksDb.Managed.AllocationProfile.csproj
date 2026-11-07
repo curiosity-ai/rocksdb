@@ -15,6 +15,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\RocksDb.Managed\RocksDb.Managed.csproj" />
+    <ProjectReference Include="..\..\src\RocksDb.Managed.Replication\RocksDb.Managed.Replication.csproj" />
     <!-- build/buildTransitive excluded: the package extracts its Claude skills into the nearest .claude folder on build. -->
     <PackageReference Include="Memory.Introspect" ExcludeAssets="build;buildTransitive" />
     <PackageReference Include="RocksDB" />

@@ -26,6 +26,10 @@ public sealed class ReplicationSource
     private readonly Lock _gate = new();
     private readonly Dictionary<string, ulong> _replicaProgress = new(StringComparer.Ordinal);
     private int _sessionsInFlight;
+    // From the last WAL listing (see RetireArchivedWals): the replica progress below which no listed WAL can be retired,
+    // and the WAL being written then (a rotation adds a WAL that may become retirable). Guarded by _gate.
+    private ulong _retireThreshold;
+    private ulong _retireListedWal = ulong.MaxValue;
 
     public ReplicationSource(RocksDatabase db)
     {
@@ -150,8 +154,19 @@ public sealed class ReplicationSource
             if (_sessionsInFlight > 0 || _replicaProgress.Count == 0) return 0;
             slowest = ulong.MaxValue;
             foreach (ulong v in _replicaProgress.Values) slowest = Math.Min(slowest, v);
+            // Nothing can be retirable yet - no listed WAL ends at or below the slowest replica and the WAL has not rotated
+            // since: skip the WAL listing (directory scans), which progress reports would otherwise pay for every chunk.
+            if (slowest < _retireThreshold && _db.CurrentWalNumber == _retireListedWal) return 0;
         }
-        return RetireArchivedWals(_db, slowest);
+        // Read before listing: a rotation after this read makes the next call list again.
+        ulong currentWal = _db.CurrentWalNumber;
+        int deleted = RetireArchivedWals(_db, slowest, out ulong threshold);
+        lock (_gate)
+        {
+            _retireThreshold = threshold;
+            _retireListedWal = currentWal;
+        }
+        return deleted;
     }
 
     /// <summary>
@@ -159,17 +174,42 @@ public sealed class ReplicationSource
     /// <paramref name="appliedThrough"/>. A WAL's last entry is the next WAL's first sequence number minus one, so the
     /// newest WAL is always kept.
     /// </summary>
-    public static int RetireArchivedWals(RocksDatabase db, ulong appliedThrough)
+    public static int RetireArchivedWals(RocksDatabase db, ulong appliedThrough) => RetireArchivedWals(db, appliedThrough, out _);
+
+    /// <summary>
+    /// <see cref="RetireArchivedWals(RocksDatabase, ulong)"/>; <paramref name="nextThreshold"/> is the smallest replica progress
+    /// at which a listed WAL other than the newest could be retired: the last sequence number of the oldest one kept, or
+    /// at most <paramref name="appliedThrough"/> while an applied WAL is not archived yet; ulong.MaxValue when none.
+    /// </summary>
+    private static int RetireArchivedWals(RocksDatabase db, ulong appliedThrough, out ulong nextThreshold)
     {
         ArgumentNullException.ThrowIfNull(db);
         IReadOnlyList<WalFileInfo> files = db.GetSortedWalFiles();
         int deleted = 0;
+        nextThreshold = ulong.MaxValue;
         for (int i = 0; i + 1 < files.Count; i++)
         {
             WalFileInfo f = files[i];
-            if (f.Type != WalFileType.ArchivedLogFile) continue;
-            ulong last = files[i + 1].StartSequence - 1;
-            if (last > appliedThrough) break;
+            ulong nextStart = files[i + 1].StartSequence;
+            if (nextStart == 0)
+            {
+                // The next WAL has no record yet, so where this one ends is unknown (not retirable now); it becomes known
+                // with the next write, without a rotation: look again next time.
+                nextThreshold = Math.Min(nextThreshold, appliedThrough);
+                break;
+            }
+            ulong last = nextStart - 1;
+            if (last > appliedThrough)
+            {
+                nextThreshold = Math.Min(nextThreshold, last);
+                break;
+            }
+            if (f.Type != WalFileType.ArchivedLogFile)
+            {
+                // Applied but still live: retirable once the database archives it (after its flush), without a rotation.
+                nextThreshold = Math.Min(nextThreshold, last);
+                continue;
+            }
             try
             {
                 db.DeleteArchivedWalFile(f.LogNumber);

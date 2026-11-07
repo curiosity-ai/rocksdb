@@ -181,8 +181,10 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
 
     /// <summary>
     /// Advances to the next batch, waiting for new writes when the WAL is exhausted. Returns false when the DB is
-    /// closed or the iterator hit an error (see <see cref="Error"/>).
+    /// closed or the iterator hit an error (see <see cref="Error"/>). Allocation-free in steady state (pooled state
+    /// machine and wait).
     /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<bool> MoveNextTailingAsync(CancellationToken cancellationToken)
     {
         if (_started && _isValid) Next();
@@ -348,6 +350,10 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
     private bool RefreshFileList()
     {
         ulong lastKnown = _files.Count > 0 ? _files[^1].LogNumber : 0;
+        // No WAL newer than the last known one exists while the DB still writes that one (or an older one): skip the
+        // directory listing, which a tailer that keeps reaching the end of the WAL would otherwise pay on every Next.
+        ulong current = _db.CurrentWalNumber;
+        if (current != 0 && current <= lastKnown) return false;
         List<WalFileInfo> all;
         try
         {

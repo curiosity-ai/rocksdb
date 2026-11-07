@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using RocksDb.Managed.Replication.Internal;
 
 namespace RocksDb.Managed.Replication;
@@ -42,7 +43,8 @@ public sealed class ReplicationConsumer
     /// <summary>The sequence number the next applied batch must start with (latest + 1).</summary>
     public ulong ExpectedNextSequence => _db.GetLatestSequenceNumber() + 1;
 
-    /// <summary>Applies one serialized write batch - a WAL batch or a merged chunk - as one write.</summary>
+    /// <summary>Applies one serialized write batch - a WAL batch or a merged chunk - as one write. Allocation-free in steady state.</summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     public async ValueTask IngestChunkAsync(ReadOnlyMemory<byte> chunk, CancellationToken cancellationToken)
     {
         WriteBatch batch = WriteBatch.Rent();
@@ -73,6 +75,7 @@ public sealed class ReplicationConsumer
     /// something else wrote to the replica. Either way the replica diverged and must be rebuilt from a checkpoint. The
     /// check assumes this consumer is the replica's only writer.
     /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<bool> TryIngestChunkAsync(ReadOnlyMemory<byte> chunk, CancellationToken cancellationToken)
     {
         if (new WalBatch(chunk).Sequence != ExpectedNextSequence) return false;
