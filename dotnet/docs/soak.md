@@ -330,7 +330,7 @@ It is a documented command, not a unit test, so it does not slow the existing su
 The in-process fault file system models the page cache inside the worker. A real
 [LazyFS](https://github.com/dsrhaslab/lazyfs) mount also exercises the real `LocalFileSystem` fsync calls
 (`fdatasync`, directory fsyncs) through the kernel. The supervisor implements it the way Jepsen's `jepsen.lazyfs`
-does; this mode has not been exercised in the development container, so treat it as untested.
+does. It was run in the development container (see "LazyFS results" below).
 
 Setup (Ubuntu):
 
@@ -338,6 +338,10 @@ Setup (Ubuntu):
 sudo apt-get install -y libfuse3-dev fuse3 g++ cmake
 git clone https://github.com/dsrhaslab/lazyfs.git && cd lazyfs
 (cd libs/libpcache && ./build.sh) && (cd lazyfs && ./build.sh)      # binary: lazyfs/build/lazyfs
+# If GitHub release tarballs are blocked (libpcache fetches spdlog as a tarball), use a git clone instead:
+#   git clone --depth 1 -b v1.10.0 https://github.com/gabime/spdlog.git /path/to/spdlog
+#   (cd libs/libpcache && mkdir -p build && cd build && cmake .. -DFETCHCONTENT_SOURCE_DIR_SPDLOG=/path/to/spdlog && cmake --build .)
+#   (cd lazyfs && mkdir -p build && cd build && CXXFLAGS=-I/path/to/spdlog/include cmake -DLAZYFS_BUILD_TESTS=OFF .. && cmake --build .)
 sudo sed -i '/\s*user_allow_other/s/^#//g' /etc/fuse.conf           # allow_other, as Jepsen does
 ```
 
@@ -358,6 +362,28 @@ With LazyFS the worker runs on the plain `LocalFileSystem`. The in-process power
 yourself, pass `--lazyfs-fifo <fifo> [--lazyfs-fifo-completed <fifo>]` instead of `--lazyfs-bin` and put `--dir` so
 that `<dir>/db` is on the mount. LazyFS's own `torn-op` / `torn-seq` faults (configured in its TOML `[[injection]]`
 sections, which crash LazyFS itself) are not driven by the supervisor.
+
+Options: `--lazyfs-cache 1GB` (LazyFS `custom_size`), `--lazyfs-eviction` (`apply_eviction = true`: dirty pages are
+written back when the cache is full, like a real page cache; off by default, as in Jepsen).
+
+**LazyFS hangs.** LazyFS (checked at dsrhaslab/lazyfs d93e54a) can deadlock: `lfs_create` -> `lfs_getattr` ->
+`put_data_blocks` holds the global inode lock and waits for a file's item lock, while `lfs_write` holds that item
+lock and waits for the global lock. Every process touching the mount then sits in uninterruptible sleep. In the
+container this happened after 10 to 15 minutes of soak. The supervisor therefore runs a watchdog: every 15 s it runs
+`ls -l` on the mount (a `stat` of the mount point alone still answers during the deadlock); after 3 misses it kills
+the daemon and aborts the FUSE connection, so the blocked calls fail with `ENOTCONN` and the phase ends. With
+`--lazyfs-bin` the supervisor then remounts LazyFS and verifies the cycle again with power-loss expectations
+(restarting LazyFS loses exactly its unsynced cache, i.e. a power loss; synced data was on the backing disk before
+LazyFS acknowledged the fsync), counts it as fault `LazyFsHangRestart` and continues; the cycle's logs and
+`lazyfs.log` are kept in `failures/cycle-N-lazyfs-hung/`. With `--lazyfs-fifo` (a mount you own) it stops with exit
+code 3 and `status.json` result `infrastructure-failure`. A hang is never reported as a failure of the port.
+
+**Proving the checks bite.** `--unsafe-skip-fsync` (test only, LazyFS mode) makes the worker drop every fsync and
+directory fsync, also on the real file system. The first `LazyFsClear` must then fail the durability check:
+
+```bash
+tools/soak.sh --dir /tmp/soak-skip --duration 5m --lazyfs-bin /path/to/lazyfs --unsafe-skip-fsync   # must exit 1
+```
 
 Cleanup: on exit (end of the duration, Ctrl-C, SIGTERM, or a failure, after the failure copy) the supervisor drops
 the cache (`clear-cache`), unmounts with `fusermount3 -uz <dir>/db` and waits for the daemon. After a hard kill of the
