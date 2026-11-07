@@ -111,6 +111,13 @@ internal sealed class LazyFaultFileSystem : IFileSystem
     /// </summary>
     public bool SkipRealSync { get; set; }
 
+    /// <summary>
+    /// Test-only, with <see cref="SkipRealSync"/> on a LazyFS mount: deleted or truncated files are not kept in the
+    /// graveyard (it is on another file system there, so hard links fail with EXDEV). The in-process power loss
+    /// (<see cref="Crash"/>) is then not available; LazyFS's clear-cache is the fault.
+    /// </summary>
+    public bool NoGraveyard { get; set; }
+
     public long InjectedErrors => Interlocked.Read(ref _injectedErrors);
 
     /// <summary>Kind of injected I/O error: "plain" IOError, "retryable" (IOStatus retryable) or "nospace".</summary>
@@ -232,7 +239,7 @@ internal sealed class LazyFaultFileSystem : IFileSystem
     /// <summary>Keeps the file's inode reachable (hard link in the graveyard) before its last name goes away.</summary>
     private void PreserveIfNeeded(Tracked t, string name)
     {
-        if (t.GraveyardPath is null && IsDurablyReferenced(t) && !IsCurrentlyNamedElsewhere(t, name))
+        if (!NoGraveyard && t.GraveyardPath is null && IsDurablyReferenced(t) && !IsCurrentlyNamedElsewhere(t, name))
         {
             string g = Path.Combine(_graveyard, t.Id.ToString(System.Globalization.CultureInfo.InvariantCulture));
             _inner.LinkFile(Path.Combine(_root, name), g);
@@ -259,7 +266,7 @@ internal sealed class LazyFaultFileSystem : IFileSystem
                     if (truncate)
                     {
                         // The old contents may still be needed after a power loss: keep a copy in the graveyard.
-                        if (IsDurablyReferenced(existing) && !IsCurrentlyNamedElsewhere(existing, name) && existing.GraveyardPath is null)
+                        if (!NoGraveyard && IsDurablyReferenced(existing) && !IsCurrentlyNamedElsewhere(existing, name) && existing.GraveyardPath is null)
                         {
                             string g = Path.Combine(_graveyard, existing.Id.ToString(System.Globalization.CultureInfo.InvariantCulture));
                             File.Copy(Path.Combine(_root, name), g);

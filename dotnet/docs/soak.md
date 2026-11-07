@@ -378,8 +378,15 @@ LazyFS acknowledged the fsync), counts it as fault `LazyFsHangRestart` and conti
 `lazyfs.log` are kept in `failures/cycle-N-lazyfs-hung/`. With `--lazyfs-fifo` (a mount you own) it stops with exit
 code 3 and `status.json` result `infrastructure-failure`. A hang is never reported as a failure of the port.
 
+**LazyFS results (development container, 2026-11-07).** A 20-minute run (seed 4242) verified 22 cycles with ~24M
+operations: 14 `LazyFsClear`, 4 kills, 2 kills during recovery, 1 graceful shutdown, 3 native cross-checks and 7
+corruption trials, no failures. An earlier run with the same configuration hit the LazyFS deadlock described above
+after 13 cycles (before the watchdog existed); no deadlock occurred in the final run.
+
 **Proving the checks bite.** `--unsafe-skip-fsync` (test only, LazyFS mode) makes the worker drop every fsync and
-directory fsync, also on the real file system. The first `LazyFsClear` must then fail the durability check:
+directory fsync, also on the real file system. The first `LazyFsClear` must then fail VERIFY. In the container it
+failed at `open` (`Corruption: CURRENT file does not end with newline`: the never-synced CURRENT was dropped, as on
+a real power loss), otherwise `durability` catches the lost synced writes:
 
 ```bash
 tools/soak.sh --dir /tmp/soak-skip --duration 5m --lazyfs-bin /path/to/lazyfs --unsafe-skip-fsync   # must exit 1
