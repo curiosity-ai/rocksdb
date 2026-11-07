@@ -190,9 +190,10 @@ compaction, so wall-clock jumps cannot change the result).
 ## Running for days
 
 Disk: the DB stays small (bounded key spaces: about 10..50 MB with the defaults). The histories take about
-HISTORY_RATE of RUN time (every write, sync, transfer and bank read, and one in eight register reads, is recorded);
-only the last `--keep-history` cycles (default 20) are kept, so plan for 1..2 GB in the run directory plus the failure
-copies (each about the DB size plus one history). Memory: about 300 MB per worker.
+50..60 MB per minute of RUN time with the defaults (every write, sync and transfer, and one in eight reads, is
+recorded); only the last `--keep-history` cycles (default 20, about 40 s each on average) are kept, so plan for about
+1..2 GB in the run directory plus the failure copies (each about the DB size plus one history). Memory: about 300 MB
+per worker.
 
 ```bash
 # in tmux / screen

@@ -593,7 +593,8 @@ internal sealed class Worker
         using Snapshot snap = _db.GetSnapshot();
         var ro = new ReadOptions { Snapshot = snap };
         long id = _history.NewOpId();
-        _history.Append(Phase.Invoke, OpType.BankRead, proc, 0, id, 0, 0, 0, 0, 0);
+        bool record = r.Next(8) == 0; // every snapshot read is checked; one in eight is recorded
+        if (record) _history.Append(Phase.Invoke, OpType.BankRead, proc, 0, id, 0, 0, 0, 0, 0);
         var balances = new ulong[_l.Accounts];
         using (var batch = new MultiGetBatch(_l.Accounts))
         {
@@ -627,7 +628,7 @@ internal sealed class Worker
         }
         byte[] extra = new byte[8 * _l.Accounts];
         for (int a = 0; a < _l.Accounts; a++) System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(extra.AsSpan(a * 8), balances[a]);
-        _history.Append(Phase.Ok, OpType.BankRead, proc, 0, id, 0, 0, (long)total, 0, 0, extra);
+        if (record) _history.Append(Phase.Ok, OpType.BankRead, proc, 0, id, 0, 0, (long)total, 0, 0, extra);
     }
 
     private void ScanCheck(Random r)
