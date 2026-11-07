@@ -131,7 +131,7 @@ internal sealed class RunConfig
     /// <summary>File-corruption trial on a copy every N cycles (0 = never).</summary>
     public int CorruptEvery { get; set; } = 3;
     /// <summary>Histories of the last N successful cycles are kept (for export-history).</summary>
-    public int KeepHistory { get; set; } = 50;
+    public int KeepHistory { get; set; } = 20;
     /// <summary>A FIFO of a user-mounted LazyFS (the DB directory must be on that mount), or null.</summary>
     public string? LazyFsFifo { get; set; }
     /// <summary>The completion FIFO of that LazyFS (fifo_path_completed), or null.</summary>

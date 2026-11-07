@@ -19,6 +19,7 @@ ships prebuilt libraries for Linux, macOS and Windows, so no C++ build is needed
 | `tests/RocksDb.Managed.CompatTests` | 490 | in process | byte-level and file-level compatibility with `librocksdb` |
 | `tests/RocksDb.Managed.RoundTrip` | 148 | child process | whole-DB managed and native alternation, option and crash matrices, 2PC, features |
 | `tests/RocksDb.Managed.Replication.Tests` | 44 | in process (one test) | replication, switchover, Raft cluster, gRPC transport, native replica |
+| `tools/RocksDb.Managed.Soak` (not a test project) | 13 self-test cases | child process (cross-check) | Jepsen-style soak for hours or days: kill, power loss, torn writes, I/O errors, pauses, crash during recovery, file corruption; history checked against a model; see [soak.md](soak.md) |
 
 The counts are test cases as listed by `--list-tests` (data rows count separately) at the time of writing. Both TFMs
 run the same tests.
@@ -320,6 +321,20 @@ connection. `testconfig.json` caps each test at 60 s.
 The multi-process versions are the programs in `samples/ReplicationTest`, `samples/SwitchoverTest` and
 `samples/ClusterTest` (`dotnet run --project samples/ClusterTest`). Each coordinator checks the final digests and
 exits non-zero on a mismatch.
+
+## Soak test (`tools/RocksDb.Managed.Soak`)
+
+A Jepsen-style stability test to leave running for days: a supervisor runs a worker process on one database, ends it
+with a fault (SIGKILL, simulated power loss and LazyFS-style torn writes on an in-process fault file system, I/O
+errors, SIGSTOP pauses, a crash during recovery, a clean shutdown), and a verifier process checks the recovered
+database against the recorded history (durability per fault type, per-writer prefixes, bank total, counters,
+range deletes, scans, file checksums, a native cross-check). See [soak.md](soak.md).
+
+```bash
+tools/soak.sh --dir /data/soak --duration 72h      # the soak
+tools/soak.sh --dir "$(mktemp -d)" --smoke         # 2-minute smoke run
+tools/soak.sh selftest                             # every check catches its injected bug (about 1 minute)
+```
 
 ## The QuickStart sample
 

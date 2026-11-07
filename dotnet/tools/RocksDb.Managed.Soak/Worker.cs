@@ -538,7 +538,9 @@ internal sealed class Worker
         byte[] key = Keys.Register(w, i);
         long before = Volatile.Read(ref _acked[idx]);
         long id = _history.NewOpId();
-        _history.Append(Phase.Invoke, OpType.RegRead, proc, 0, id, w, i, 0, 0, 0);
+        // Every read is checked online; one in eight is also recorded (for export-history), to bound the history size.
+        bool record = r.Next(8) == 0;
+        if (record) _history.Append(Phase.Invoke, OpType.RegRead, proc, 0, id, w, i, 0, 0, 0);
         byte[]? value;
         switch (r.Next(4))
         {
@@ -582,7 +584,7 @@ internal sealed class Worker
         {
             Violation($"monotonic read: register w{w} key {i} absent after v{VersionOf(before)} was acknowledged (no newer op in flight)");
         }
-        _history.Append(Phase.Ok, OpType.RegRead, proc, 0, id, w, i, seen, 0, 0);
+        if (record) _history.Append(Phase.Ok, OpType.RegRead, proc, 0, id, w, i, seen, 0, 0);
     }
 
     private async Task BankRead(Random r, int proc, CancellationToken ct)
