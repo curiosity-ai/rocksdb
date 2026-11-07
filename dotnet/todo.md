@@ -351,7 +351,8 @@ Still open from this round:
 - [ ] Open still lists the DB directory more than once (sharing one listing across WAL recovery and obsolete-file scans is unsafe; a few KB per open)
 - [x] Features (64 scenarios, Scenarios/Features.cs): attribute-group Get / MultiGet 0 B (were 1.8-18.8 KB; reused internal snapshot for multi-CF consistency) + `GetAttributeGroupsAsync` / `MultiGetAttributeGroupsAsync`; MultiScan 1080 -> 104 B; coalescing-iterator direction switch 0 B; block-cache / IO trace records 0 B; `TryGetFullHistoryTsLow(IBufferWriter)` 0 B; pooled async builders for merge operands, TTL writes, MultiScan; TTL, Plain/Cuckoo reads, blob reads, rate limiter, query tracing, UDT and merge reads already 0 B
 - [ ] Features left as is: NewCoalescingIterator ~3 KB per iterator (reuse it), rate-limiter wait ~216 B, async Get under block cache tracing 168 B (AsyncLocal), remote-compaction worker open ~1 MB per job
-- [ ] Not profiled yet: GetUpdatesSince, secondary / read-only, replication layer (round 2 agent running)
+- [x] Replication / WAL tailing (32 scenarios, Scenarios/Replication.cs): pooled `AsyncBroadcastSignal` for sequence / commit / progress waits (tailing waits ~520 -> ~25 B), pooled async builders across WalTailer / consumer / hosts, WAL listing only after rotation (TransactionLogIterator, ReplicationSource retirement), Raft quorum and heartbeat answers 0 B, lockstep replica round trip 2.3 KB -> <200 B, secondary idle catch-up 7.1 -> 1.4 KB; `RocksDatabase.CurrentWalNumber`
+- [ ] Replication left as is: GetUpdatesSince per poll ~3 KB (hold one tail instead), idle TryCatchUpWithPrimary ~1.4 KB (directory listing + CURRENT), Raft leader heartbeat per interval, MagicOnion / gRPC DTOs, checkpoints
 
 ## Unported utilities (found 2026-11-03)
 

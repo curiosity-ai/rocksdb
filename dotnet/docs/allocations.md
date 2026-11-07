@@ -410,7 +410,7 @@ steady-state throughput:
 
 ## Measuring allocations
 
-`tools/RocksDb.Managed.AllocationProfile` runs about 150 scenarios that cover the public API. Each one runs in its own
+`tools/RocksDb.Managed.AllocationProfile` runs about 220 scenarios that cover the public API. Each one runs in its own
 child process: setup, warm-up, then a measured phase that counts the exact bytes (`GC.GetTotalAllocatedBytes(precise:
 true)` and the calling thread's counter). After that the parent traces the child with
 [Memory.Introspect](https://www.nuget.org/packages/Memory.Introspect/) (GC allocation ticks, about one per 100 KB) to
