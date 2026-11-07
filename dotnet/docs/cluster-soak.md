@@ -298,7 +298,18 @@ missed, and keeps its state then.
 
 ## Results
 
-See the end of this file for the latest validation runs (filled in by the runs below).
+Development container (4 vCPUs, one machine), 2026-11-07, with all four fixes:
+
+| Run | Epochs (VERIFY) | Faults | Ops ok / fail / info | Elections | Availability | Result |
+|---|---|---|---|---|---|---|
+| 3 nodes, 45 min, seed 20261107, 5-min epochs | 9 (3 native cross-checks) | 353: 26 PartitionHalves, 33 IsolateLeader, 20 IsolateNode, 13 Bridge, 11 OneWay, 13 Slow, 11 ClientCut, 22 Kill, 37 KillLeader, 12 Pause, 20 PauseLeader, 26 PowerLoss, 25 PowerLossLeader, 19 KillDuringCatchup (4 during a snapshot, 15 during stream catch-up), 19 ClockSkew, 6 RollingRestart | writes 2,080,296 / 10,998 / 6,634; transfers 498,623 / 2,602 / 1,655; adds 498,341 / 2,707 / 1,617; reads 736,802 ok, bank reads 326,523 ok | 185 terms with a leader | leaderless 414 s of 2700 s in 173 intervals (p50 1.3 s, p99 10.8 s, max 11.6 s); write latency p50 1.4 ms, p99 5.5 ms | passed |
+| 5 nodes, 15 min, seed 5005, 3-min epochs | 5 (1 native cross-check) | 100: 9 PartitionHalves, 12 IsolateLeader, 6 IsolateNode, 3 Ring, 5 OneWay, 2 Slow, 2 ClientCut, 8 Kill, 10 KillLeader, 6 Pause, 8 PauseLeader, 3 PowerLoss, 13 PowerLossLeader, 7 KillDuringCatchup (2 during a snapshot), 5 ClockSkew, 1 RollingRestart | writes 565,905 / 4,096 / 1,421; transfers 135,400 / 970 / 363; adds 135,493 / 1,011 / 345; reads 199,513 ok, bank reads 89,000 ok | 81 terms with a leader | leaderless 102 s of 910 s in 65 intervals (p50 1.0 s, max 6.3 s); write latency p50 2.0 ms, p99 6.9 ms | passed |
+| smoke (`--smoke`), then resumed for 60 s | 4 + 2 | every kind | - | - | - | passed |
+
+Stale reads (statistics, no ReadIndex): 3 nodes 36,508 stale follower reads and 196 stale leader reads (a deposed
+leader that did not know yet) of 1.84 M keys read; 5 nodes 13,405 stale follower reads, no stale leader read.
+The self-test caught all 13 injected bugs and passed both controls. The first smoke run, before fix 1, failed
+`counters` (an acknowledged increment lost after two overlapping leader power losses).
 
 ## Limitations
 
