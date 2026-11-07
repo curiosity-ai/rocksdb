@@ -24,7 +24,7 @@ namespace RocksDb.Managed
         }
 
         /// <summary>The sequence number this snapshot reads at.</summary>
-        public ulong SequenceNumber { get; }
+        public ulong SequenceNumber { get; private set; }
 
         /// <summary>
         /// SnapshotImpl::min_uncommitted_ (WritePrepared / WriteUnprepared transactions): every sequence number below it
@@ -40,9 +40,23 @@ namespace RocksDb.Managed
         internal bool IsWriteConflictBoundary;
 
         /// <summary>Creation time (Unix seconds).</summary>
-        public long UnixTime { get; }
+        public long UnixTime { get; private set; }
 
         internal DbImpl? Owner => _db;
+
+        /// <summary>
+        /// Re-targets a released internal snapshot (<see cref="DbImpl.AcquireInternalSnapshot"/>) before it is linked
+        /// again. REQUIRES: the DB mutex; the snapshot is released and was never handed to user code.
+        /// </summary>
+        internal void Rearm(DbImpl db, ulong sequenceNumber, long unixTimeSeconds)
+        {
+            System.Diagnostics.Debug.Assert(_db is null && Prev is null && Next is null);
+            SequenceNumber = sequenceNumber;
+            UnixTime = unixTimeSeconds;
+            IsWriteConflictBoundary = false;
+            MinUncommitted = ReadCallback.MinUnCommittedSeq;
+            _db = db;
+        }
 
         /// <summary>Releases the snapshot (DB::ReleaseSnapshot). Idempotent.</summary>
         public void Dispose()

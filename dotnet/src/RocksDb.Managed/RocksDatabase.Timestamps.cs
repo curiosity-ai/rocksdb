@@ -85,6 +85,9 @@ public sealed partial class RocksDatabase
     /// <inheritdoc cref="ColumnFamily.GetFullHistoryTsLow"/>
     public byte[]? GetFullHistoryTsLow() => _default.GetFullHistoryTsLow();
 
+    /// <inheritdoc cref="ColumnFamily.TryGetFullHistoryTsLow(IBufferWriter{byte})"/>
+    public bool TryGetFullHistoryTsLow(IBufferWriter<byte> destination) => _default.TryGetFullHistoryTsLow(destination);
+
     /// <inheritdoc cref="ColumnFamily.IncreaseFullHistoryTsLow"/>
     public void IncreaseFullHistoryTsLow(ReadOnlySpan<byte> tsLow) => _default.IncreaseFullHistoryTsLow(tsLow);
 

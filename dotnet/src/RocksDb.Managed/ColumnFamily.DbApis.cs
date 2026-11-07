@@ -123,6 +123,7 @@ public sealed partial class ColumnFamily
     }
 
     /// <summary>Async <see cref="TryGetMergeOperands(ReadOptions, ReadOnlySpan{byte}, GetMergeOperandsOptions, MergeOperandsResult)"/>.</summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<bool> TryGetMergeOperandsAsync(ReadOptions? readOptions, ReadOnlyMemory<byte> key, GetMergeOperandsOptions options,
         MergeOperandsResult result, CancellationToken cancellationToken = default)
     {

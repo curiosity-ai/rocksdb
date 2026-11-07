@@ -388,6 +388,36 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
     }
 
+    // One released internal snapshot kept for reuse (AcquireInternalSnapshot); never a user's snapshot.
+    private Snapshot? _spareInternalSnapshot;
+
+    /// <summary>
+    /// A snapshot at the last published sequence for an internal multi-column-family read that needs one consistent
+    /// view (upstream: MultiCFSnapshot). Unlike <see cref="GetSnapshot"/> it reuses one released snapshot object, so it
+    /// must never reach user code; release it with <see cref="ReleaseInternalSnapshot"/>. Transaction DBs take their
+    /// snapshot through the transaction hooks (not reused).
+    /// </summary>
+    internal Snapshot AcquireInternalSnapshot()
+    {
+        if (_txnHooks is not null) return GetSnapshot();
+        Snapshot? s = Interlocked.Exchange(ref _spareInternalSnapshot, null);
+        if (s is null) return GetSnapshotImpl(isWriteConflictBoundary: false);
+        ThrowIfDisposed();
+        lock (_mutex)
+        {
+            s.Rearm(this, LastPublishedSequence, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            _snapshots.Add(s);
+        }
+        return s;
+    }
+
+    /// <summary>Releases a snapshot of <see cref="AcquireInternalSnapshot"/> and keeps it for the next one.</summary>
+    internal void ReleaseInternalSnapshot(Snapshot s)
+    {
+        s.Dispose();
+        if (_txnHooks is null) Volatile.Write(ref _spareInternalSnapshot, s);
+    }
+
     internal void ReleaseSnapshot(Snapshot s)
     {
         lock (_mutex)

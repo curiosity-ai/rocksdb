@@ -93,7 +93,7 @@ internal sealed partial class DbImpl
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void GetWithBlockCacheTrace(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, GetContext ctx)
     {
-        object? prev = Tracing.BlockCacheTracer.SetCaller(Tracing.TableReaderCaller.UserGet, BlockCacheTracer.NextGetId(), key,
+        object? prev = Tracing.BlockCacheTracer.SetSyncCaller(Tracing.TableReaderCaller.UserGet, BlockCacheTracer.NextGetId(), key,
             options?.Snapshot is not null);
         try
         {
@@ -101,7 +101,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            Tracing.BlockCacheTracer.RestoreCaller(prev);
+            Tracing.BlockCacheTracer.RestoreSyncCaller(prev);
         }
     }
 

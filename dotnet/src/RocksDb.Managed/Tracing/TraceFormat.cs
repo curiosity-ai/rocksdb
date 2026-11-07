@@ -131,6 +131,15 @@ internal static class TraceFormat
     public static ulong NowMicros() => (ulong)(DateTime.UtcNow.Ticks - DateTime.UnixEpoch.Ticks) / 10;
 
     /// <summary>A monotonic nanosecond clock (SystemClock::NowNanos on Linux is CLOCK_MONOTONIC).</summary>
+    /// <summary>PutLengthPrefixedSlice of the UTF-8 bytes of <paramref name="s"/>, encoded in place (no temporary array).</summary>
+    internal static void PutLengthPrefixedUtf8(IBufferWriter<byte> dst, ReadOnlySpan<char> s)
+    {
+        int n = Encoding.UTF8.GetByteCount(s);
+        Coding.PutVarint32(dst, (uint)n);
+        int written = Encoding.UTF8.GetBytes(s, dst.GetSpan(n));
+        dst.Advance(written);
+    }
+
     public static ulong NowNanos() => (ulong)((UInt128)(ulong)System.Diagnostics.Stopwatch.GetTimestamp() * 1_000_000_000UL / (ulong)System.Diagnostics.Stopwatch.Frequency);
 
     /// <summary>TracerHelper::EncodeTrace.</summary>

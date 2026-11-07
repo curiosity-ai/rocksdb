@@ -32,6 +32,7 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>Async <see cref="GetMergeOperands"/>: table data blocks are read with async I/O.</summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder))]
     public async ValueTask GetMergeOperandsAsync(ColumnFamilyData cfd, ReadOptions? options, ReadOnlyMemory<byte> key, GetMergeOperandsOptions mergeOptions,
         MergeOperandsResult result, CancellationToken ct)
     {

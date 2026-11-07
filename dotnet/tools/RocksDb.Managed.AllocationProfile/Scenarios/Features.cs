@@ -221,6 +221,40 @@ internal static partial class Scenarios
             var c = new Cursor(keys.Length);
             return Done(Runner.Sync(n => { for (int i = 0; i < n; i++) db.GetAttributeGroups(null, keys[c.Next()], read); }));
         }));
+        list.Add(S("attrgroup.get-async", "attrgroup", PathKind.Hot, "await GetAttributeGroupsAsync(key, 2 reused PinnableAttributeGroups), sst-cached", ctx =>
+        {
+            (RocksDatabase db, ColumnFamily hot, ColumnFamily cold, byte[][] keys) = AttributeGroupDb(ctx, fill: true);
+            PinnableAttributeGroup[] read = [new PinnableAttributeGroup(hot), new PinnableAttributeGroup(cold)];
+            var c = new Cursor(keys.Length);
+            return Done(Runner.Async([AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))] async ValueTask (int n) =>
+            {
+                for (int i = 0; i < n; i++) await db.GetAttributeGroupsAsync(null, keys[c.Next()], read);
+            }));
+        }));
+        list.Add(S("attrgroup.get-snapshot", "attrgroup", PathKind.Hot, "GetAttributeGroups(ReadOptions{Snapshot} reused, key, 2 reused groups), sst-cached", ctx =>
+        {
+            (RocksDatabase db, ColumnFamily hot, ColumnFamily cold, byte[][] keys) = AttributeGroupDb(ctx, fill: true);
+            var ro = new ReadOptions { Snapshot = ctx.Own(db.GetSnapshot()) };
+            PinnableAttributeGroup[] read = [new PinnableAttributeGroup(hot), new PinnableAttributeGroup(cold)];
+            var c = new Cursor(keys.Length);
+            return Done(Runner.Sync(n => { for (int i = 0; i < n; i++) db.GetAttributeGroups(ro, keys[c.Next()], read); }));
+        }));
+        list.Add(S("attrgroup.multiget16-async", "attrgroup", PathKind.Hot, "await MultiGetAttributeGroupsAsync(16 keys x 2 reused groups) (per batch)", ctx =>
+        {
+            (RocksDatabase db, ColumnFamily hot, ColumnFamily cold, byte[][] keys) = AttributeGroupDb(ctx, fill: true);
+            var k16 = new ReadOnlyMemory<byte>[16];
+            var results = new PinnableAttributeGroup[16][];
+            for (int j = 0; j < 16; j++) results[j] = [new PinnableAttributeGroup(hot), new PinnableAttributeGroup(cold)];
+            var c = new Cursor(keys.Length);
+            return Done(Runner.Async([AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))] async ValueTask (int n) =>
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    for (int j = 0; j < 16; j++) k16[j] = keys[c.Next()];
+                    await db.MultiGetAttributeGroupsAsync(null, k16, results);
+                }
+            }));
+        }, chunk: 50));
         list.Add(S("attrgroup.multiget16", "attrgroup", PathKind.Hot, "MultiGetAttributeGroups(16 keys x 2 reused groups) (per batch)", ctx =>
         {
             (RocksDatabase db, ColumnFamily hot, ColumnFamily cold, byte[][] keys) = AttributeGroupDb(ctx, fill: true);
@@ -381,6 +415,8 @@ internal static partial class Scenarios
                 {
                     d.AllowMmapReads = true;
                     o.TableFactory = tf;
+                    // PlainTable's default (hash) mode needs a prefix extractor: 8-byte prefixes of "k%015d" keys.
+                    if (tf == TableFactoryType.PlainTable) o.PrefixExtractor = SliceTransform.CreateFixedPrefix(8);
                     // Cuckoo tables are written by flush only (one file per memtable; no compaction into them).
                     o.WriteBufferSize = 64UL << 20;
                 });
@@ -445,6 +481,7 @@ internal static partial class Scenarios
                 o.WriteBufferSize = 64UL << 20;
                 o.DisableAutoCompactions = true;
                 o.TableFactory = tf;
+                if (tf == TableFactoryType.PlainTable) o.PrefixExtractor = SliceTransform.CreateFixedPrefix(8);
                 DbOptions d = ScenarioContext.DefaultDbOptions();
                 d.AllowMmapReads = true;
                 RocksDatabase db = ctx.OpenDb("db", d, o);
@@ -676,6 +713,17 @@ internal static partial class Scenarios
             var c = new Cursor(keys.Length);
             return Done(Runner.Sync(n => { for (int i = 0; i < n; i++) db.TryGet(keys[c.Next()], buf, out _); }));
         }));
+        list.Add(S("trace.blockcache.get-async.sst-cached", "trace", PathKind.Hot, "await TryGetAsync(key, IBufferWriter) while StartBlockCacheTrace is active", ctx =>
+        {
+            (RocksDatabase db, byte[][] keys) = ReadDb(ctx, Location.Cached);
+            db.StartBlockCacheTrace(new BlockCacheTraceOptions(), new NullTraceWriter());
+            var w = new ArrayBufferWriter<byte>(256);
+            var c = new Cursor(keys.Length);
+            return Done(Runner.Async([AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))] async ValueTask (int n) =>
+            {
+                for (int i = 0; i < n; i++) { w.ResetWrittenCount(); await db.TryGetAsync(keys[c.Next()], w); }
+            }));
+        }));
         list.Add(S("trace.io.get.sst-uncached", "trace", PathKind.Hot, "TryGet(key, Span) with block reads while StartIOTrace is active (null writer)", ctx =>
         {
             (RocksDatabase db, byte[][] keys) = ReadDb(ctx, Location.Uncached);
@@ -804,6 +852,15 @@ internal static partial class Scenarios
             long sum = 0;
             return Done(Runner.Sync(n => { for (int i = 0; i < n; i++) sum += db.GetFullHistoryTsLow()!.Length; }));
         }));
+        list.Add(S("udt.try-get-full-history-ts-low", "udt", PathKind.Warm, "TryGetFullHistoryTsLow(reused IBufferWriter) (set once)", ctx =>
+        {
+            (RocksDatabase db, _) = UdtDb(ctx, flush: false);
+            byte[] low = new byte[8];
+            BinaryPrimitives.WriteUInt64LittleEndian(low, 5);
+            db.IncreaseFullHistoryTsLow(low);
+            var w = new ArrayBufferWriter<byte>(16);
+            return Done(Runner.Sync(n => { for (int i = 0; i < n; i++) { w.ResetWrittenCount(); db.TryGetFullHistoryTsLow(w); } }));
+        }));
         list.Add(S("udt.delete", "udt", PathKind.Hot, "Delete(key, timestamp) with Comparator.BytewiseWithU64Ts", ctx =>
         {
             ColumnFamilyOptions o = ScenarioContext.DefaultCfOptions();
@@ -825,9 +882,9 @@ internal static partial class Scenarios
 
         // ---------------------------------------------------------------------------------------------- merge operands / user merge operators
 
-        (RocksDatabase Db, byte[][] Keys) MergeDb(ScenarioContext ctx, MergeOperator op, bool flush)
+        (RocksDatabase Db, byte[][] Keys) MergeDb(ScenarioContext ctx, MergeOperator op, bool flush, long blockCache = 64L << 20)
         {
-            ColumnFamilyOptions o = ScenarioContext.DefaultCfOptions();
+            ColumnFamilyOptions o = ScenarioContext.DefaultCfOptions(blockCache);
             o.MergeOperator = op;
             o.WriteBufferSize = 64UL << 20;
             o.DisableAutoCompactions = true;
@@ -874,6 +931,17 @@ internal static partial class Scenarios
         list.Add(S("getmergeoperands-async.sst-cached", "merge", PathKind.Hot, "await TryGetMergeOperandsAsync(null, key, options, reused result), 4 operands in 4 SSTs", ctx =>
         {
             (RocksDatabase db, byte[][] keys) = MergeDb(ctx, MergeOperator.UInt64Add, flush: true);
+            var mo = new GetMergeOperandsOptions { ExpectedMaxNumberOfOperands = 16 };
+            var result = ctx.Own(new MergeOperandsResult());
+            var c = new Cursor(keys.Length);
+            return Done(Runner.Async([AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))] async ValueTask (int n) =>
+            {
+                for (int i = 0; i < n; i++) await db.DefaultColumnFamily.TryGetMergeOperandsAsync(null, keys[c.Next()], mo, result);
+            }));
+        }));
+        list.Add(S("getmergeoperands-async.sst-uncached", "merge", PathKind.Hot, "await TryGetMergeOperandsAsync, 4 operands in 4 SSTs, 256 KiB block cache (block reads)", ctx =>
+        {
+            (RocksDatabase db, byte[][] keys) = MergeDb(ctx, MergeOperator.UInt64Add, flush: true, blockCache: 256L << 10);
             var mo = new GetMergeOperandsOptions { ExpectedMaxNumberOfOperands = 16 };
             var result = ctx.Own(new MergeOperandsResult());
             var c = new Cursor(keys.Length);

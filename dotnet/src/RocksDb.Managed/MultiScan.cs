@@ -1,3 +1,4 @@
+using System.Buffers;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Table;
 
@@ -59,6 +60,8 @@ public sealed class MultiScan : IDisposable
     private readonly IReadOnlyList<ScanRange> _ranges;
     private readonly bool _reverse;
     private int _index = -1;
+    // Prefetch planning scratch of Prepare (per thread; Prepare does not suspend).
+    [ThreadStatic] private static List<(long Offset, long Length)>? t_spans;
     private bool _valid;
 
     internal MultiScan(DbImpl db, ColumnFamilyData cfd, Iterator it, MultiScanArgs args)
@@ -109,51 +112,67 @@ public sealed class MultiScan : IDisposable
         {
             VersionStorageInfo vs = sv.Current.Storage;
             Comparator ucmp = cfd.UserComparator;
-            var spans = new List<(long Offset, long Length)>();
-            for (int level = 0; level < vs.NumLevels; level++)
+            IReadOnlyList<ScanRange> ranges = args.Ranges;
+            List<(long Offset, long Length)> spans = t_spans ??= new List<(long Offset, long Length)>();
+            // Internal-key scratch for the range bounds (two keys per range; grown for long keys).
+            byte[] keyBuf = ArrayPool<byte>.Shared.Rent(256);
+            try
             {
-                foreach (FileMetaData f in vs.LevelFiles(level))
+                for (int level = 0; level < vs.NumLevels; level++)
                 {
-                    spans.Clear();
-                    foreach (ScanRange r in args.Ranges)
+                    foreach (FileMetaData f in vs.LevelFiles(level))
                     {
-                        // Skip ranges that don't overlap the file.
-                        if (ucmp.Compare(DbFormat.ExtractUserKey(f.Largest), r.Start.Span) < 0) continue;
-                        if (r.Limit is { } lim && ucmp.Compare(DbFormat.ExtractUserKey(f.Smallest), lim.Span) >= 0) continue;
-                        using TableReaderLease lease = cfd.TableCache.GetReader(f);
-                        byte[] start = new byte[r.Start.Length + DbFormat.InternalKeyFooterSize];
-                        DbFormat.AppendInternalKey(start, r.Start.Span, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
-                        byte[] end = [];
-                        if (r.Limit is { } l)
+                        spans.Clear();
+                        for (int ri = 0; ri < ranges.Count; ri++)
                         {
-                            end = new byte[l.Length + DbFormat.InternalKeyFooterSize];
-                            DbFormat.AppendInternalKey(end, l.Span, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
+                            ScanRange r = ranges[ri];
+                            // Skip ranges that don't overlap the file.
+                            if (ucmp.Compare(DbFormat.ExtractUserKey(f.Largest), r.Start.Span) < 0) continue;
+                            if (r.Limit is { } lim && ucmp.Compare(DbFormat.ExtractUserKey(f.Smallest), lim.Span) >= 0) continue;
+                            using TableReaderLease lease = cfd.TableCache.GetReader(f);
+                            // Data-block prefetch planning needs the block-based index; other table formats are scanned without it.
+                            if (lease.Reader is not Table.BlockBasedTableReader bbt) continue;
+                            int startLen = r.Start.Length + DbFormat.InternalKeyFooterSize;
+                            int endLen = r.Limit is { } l0 ? l0.Length + DbFormat.InternalKeyFooterSize : 0;
+                            if (keyBuf.Length < startLen + endLen)
+                            {
+                                ArrayPool<byte>.Shared.Return(keyBuf);
+                                keyBuf = ArrayPool<byte>.Shared.Rent(startLen + endLen);
+                            }
+                            Span<byte> start = keyBuf.AsSpan(0, startLen);
+                            DbFormat.AppendInternalKey(start, r.Start.Span, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
+                            Span<byte> end = keyBuf.AsSpan(startLen, endLen);
+                            if (r.Limit is { } l) DbFormat.AppendInternalKey(end, l.Span, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
+                            if (bbt.TryGetDataBlockSpan(start, end, r.Limit is not null, out long off, out long len)) spans.Add((off, len));
                         }
-                        // Data-block prefetch planning needs the block-based index; other table formats are scanned without it.
-                        if (lease.Reader is Table.BlockBasedTableReader bbt && bbt.TryGetDataBlockSpan(start, end, r.Limit is not null, out long off, out long len)) spans.Add((off, len));
-                    }
-                    if (spans.Count == 0) continue;
-                    spans.Sort(static (a, b) => a.Offset.CompareTo(b.Offset));
-                    long budget = args.MaxPrefetchSize == 0 ? long.MaxValue : (long)Math.Min(args.MaxPrefetchSize, long.MaxValue);
-                    long curOff = spans[0].Offset, curEnd = spans[0].Offset + spans[0].Length;
-                    using TableReaderLease reader = cfd.TableCache.GetReader(f);
-                    for (int i = 1; i <= spans.Count && budget > 0; i++)
-                    {
-                        if (i < spans.Count && spans[i].Offset <= curEnd + (long)args.IoCoalesceThreshold)
+                        if (spans.Count == 0) continue;
+                        spans.Sort(static (a, b) => a.Offset.CompareTo(b.Offset));
+                        long budget = args.MaxPrefetchSize == 0 ? long.MaxValue : (long)Math.Min(args.MaxPrefetchSize, long.MaxValue);
+                        long curOff = spans[0].Offset, curEnd = spans[0].Offset + spans[0].Length;
+                        using TableReaderLease reader = cfd.TableCache.GetReader(f);
+                        for (int i = 1; i <= spans.Count && budget > 0; i++)
                         {
-                            curEnd = Math.Max(curEnd, spans[i].Offset + spans[i].Length);
-                            continue;
-                        }
-                        long n = Math.Min(curEnd - curOff, budget);
-                        ((Table.BlockBasedTableReader)reader.Reader).File.Prefetch(curOff, n);
-                        budget -= n;
-                        if (i < spans.Count)
-                        {
-                            curOff = spans[i].Offset;
-                            curEnd = curOff + spans[i].Length;
+                            if (i < spans.Count && spans[i].Offset <= curEnd + (long)args.IoCoalesceThreshold)
+                            {
+                                curEnd = Math.Max(curEnd, spans[i].Offset + spans[i].Length);
+                                continue;
+                            }
+                            long n = Math.Min(curEnd - curOff, budget);
+                            ((Table.BlockBasedTableReader)reader.Reader).File.Prefetch(curOff, n);
+                            budget -= n;
+                            if (i < spans.Count)
+                            {
+                                curOff = spans[i].Offset;
+                                curEnd = curOff + spans[i].Length;
+                            }
                         }
                     }
                 }
+            }
+            finally
+            {
+                spans.Clear();
+                ArrayPool<byte>.Shared.Return(keyBuf);
             }
         }
         finally
@@ -196,6 +215,7 @@ public sealed class MultiScan : IDisposable
     }
 
     /// <summary>Async <see cref="MoveNextRange"/> (table blocks are read with async I/O).</summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<bool> MoveNextRangeAsync(CancellationToken cancellationToken = default)
     {
         if (++_index >= _ranges.Count)
@@ -251,6 +271,7 @@ public sealed class MultiScan : IDisposable
     }
 
     /// <summary>Async <see cref="Next"/>.</summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder))]
     public async ValueTask NextAsync(CancellationToken cancellationToken = default)
     {
         if (!_valid) throw new InvalidOperationException("Trying to advance invalid iterator");
@@ -272,10 +293,15 @@ public sealed partial class ColumnFamily
     public MultiScan NewMultiScan(ReadOptions? options, MultiScanArgs args)
     {
         MultiScan.Validate(_cfd, args);
-        // The iterate bounds come from the ranges (MultiScan sets iterate_lower/upper_bound per range).
-        ReadOptions ro = options?.Clone() ?? new ReadOptions();
-        ro.IterateLowerBound = null;
-        ro.IterateUpperBound = null;
+        // The iterate bounds come from the ranges (MultiScan sets iterate_lower/upper_bound per range): options with
+        // bounds are copied without them; options without bounds are used as they are.
+        ReadOptions? ro = options;
+        if (options is not null && (options.IterateLowerBound is not null || options.IterateUpperBound is not null))
+        {
+            ro = options.Clone();
+            ro.IterateLowerBound = null;
+            ro.IterateUpperBound = null;
+        }
         Iterator it = NewIterator(ro);
         try
         {

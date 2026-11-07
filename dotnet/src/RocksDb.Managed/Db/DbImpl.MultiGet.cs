@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using RocksDb.Managed.Table;
 
@@ -15,12 +16,23 @@ internal sealed partial class DbImpl
     /// always complete; otherwise data blocks missing from the block cache are read with async I/O.
     /// Per-key outcomes are recorded in <paramref name="batch"/>; I/O errors fail the whole call.
     /// </summary>
+    public ValueTask MultiGetAsync(ColumnFamilyData cfd, ReadOptions? options, MultiGetBatch batch, bool synchronous, CancellationToken cancellationToken) =>
+        MultiGetAsync(cfd, options, options?.Snapshot, batch, synchronous, cancellationToken);
+
+    /// <summary>
+    /// <see cref="MultiGetAsync(ColumnFamilyData, ReadOptions?, MultiGetBatch, bool, CancellationToken)"/> reading at
+    /// <paramref name="snapshot"/> instead of <see cref="ReadOptions.Snapshot"/> (null = the latest sequence). Used by
+    /// multi-column-family reads that pin one view without cloning the caller's options. Not for transaction DBs or
+    /// column families with user-defined timestamps (their paths read the snapshot from <paramref name="options"/>).
+    /// </summary>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    public async ValueTask MultiGetAsync(ColumnFamilyData cfd, ReadOptions? options, MultiGetBatch batch, bool synchronous, CancellationToken cancellationToken)
+    internal async ValueTask MultiGetAsync(ColumnFamilyData cfd, ReadOptions? options, Snapshot? snapshotOverride, MultiGetBatch batch, bool synchronous,
+        CancellationToken cancellationToken)
     {
         // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
         // in between could drop the versions visible at that sequence (no snapshot protects them).
-        ValidateReadSnapshot(options);
+        if (snapshotOverride is not null && snapshotOverride.Owner != this) ThrowHelper.InvalidArgument("snapshot does not belong to this DB or was released");
+        Debug.Assert(snapshotOverride == options?.Snapshot || (_txnHooks is null && cfd.TimestampSize == 0));
         if (_txnHooks is not null)
         {
             // WritePreparedTxnDB::MultiGet: one GetImpl (with its read callback) per key.
@@ -32,7 +44,7 @@ internal sealed partial class DbImpl
         Statistics? st = Stats;
         long t0 = st is null ? 0 : st.StartTimer();
         SuperVersion sv = GetAndRefSuperVersion(cfd, out int svSlot);
-        ulong snapshot = ReadSequence(options);
+        ulong snapshot = snapshotOverride is null ? LastPublishedSequence : snapshotOverride.SequenceNumber;
         // ReadOptions::deadline: file reads of a synchronous run check it (the thread-local deadline must not leak to
         // other work on the threads an async run continues on).
         long deadlineToken = synchronous ? ReadDeadline.Enter(options) : -1;

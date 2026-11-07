@@ -85,18 +85,18 @@ internal sealed class IoTracer
     public void WriteIoOp(string operation, long startTimestamp, string? error, string path, IoTraceOp ops, ulong length, ulong offset, ulong fileSize)
     {
         ulong latency = (ulong)((UInt128)(ulong)(Stopwatch.GetTimestamp() - startTimestamp) * 1_000_000_000UL / (ulong)Stopwatch.Frequency);
-        int slash = path.LastIndexOfAny(['/', '\\']);
-        string name = slash < 0 ? path : path[(slash + 1)..];
+        int slash = path.AsSpan().LastIndexOfAny('/', '\\');
+        ReadOnlySpan<char> name = path.AsSpan(slash + 1);
         lock (_lock)
         {
             TraceWriter? w = _writer;
             if (w is null || w.FileSize > _maxFileSize) return;
             _payload.Clear();
             Coding.PutFixed64(_payload, (ulong)ops);
-            Coding.PutLengthPrefixedSlice(_payload, System.Text.Encoding.UTF8.GetBytes(operation));
+            TraceFormat.PutLengthPrefixedUtf8(_payload, operation);
             Coding.PutFixed64(_payload, latency);
-            Coding.PutLengthPrefixedSlice(_payload, System.Text.Encoding.UTF8.GetBytes(error ?? "OK"));
-            Coding.PutLengthPrefixedSlice(_payload, System.Text.Encoding.UTF8.GetBytes(name));
+            TraceFormat.PutLengthPrefixedUtf8(_payload, error ?? "OK");
+            TraceFormat.PutLengthPrefixedUtf8(_payload, name);
             // Optional fields in bit order (kIOFileSize, kIOLen, kIOOffset).
             if ((ops & IoTraceOp.FileSize) != 0) Coding.PutFixed64(_payload, fileSize);
             if ((ops & IoTraceOp.Length) != 0) Coding.PutFixed64(_payload, length);
@@ -302,6 +302,7 @@ internal sealed class IoTracingFileSystem(IFileSystem inner, IoTracer tracer) : 
         public ValueTask<int> ReadAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken = default) =>
             tracer.IsEnabled ? ReadAsyncTraced(offset, destination, cancellationToken) : inner.ReadAsync(offset, destination, cancellationToken);
 
+        [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder<>))]
         private async ValueTask<int> ReadAsyncTraced(long offset, Memory<byte> destination, CancellationToken ct)
         {
             long start = Stopwatch.GetTimestamp();

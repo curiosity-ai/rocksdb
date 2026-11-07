@@ -138,12 +138,6 @@ public sealed partial class RocksDatabase
         }
     }
 
-    private static bool ContainsColumnFamily(List<ColumnFamily> list, ColumnFamily cf)
-    {
-        foreach (ColumnFamily c in list) if (c.Data == cf.Data) return true;
-        return false;
-    }
-
     private void CheckOwnColumnFamily(ColumnFamily cf)
     {
         if (cf.Db != _db) ThrowHelper.InvalidArgument("column family does not belong to this DB");
@@ -153,21 +147,89 @@ public sealed partial class RocksDatabase
     /// Reads the attribute groups of <paramref name="key"/> (DB::GetEntity(options, key, PinnableAttributeGroups*)): for
     /// each group, the entity of <paramref name="key"/> in the group's column family (a plain value reads as an entity
     /// with only the default column). All groups are read from one consistent view (the snapshot of
-    /// <paramref name="options"/>, or an implicit one). Per-group outcomes are stored in the groups.
+    /// <paramref name="options"/>, or an implicit one). Per-group outcomes are stored in the groups. Reusing the same
+    /// <see cref="PinnableAttributeGroup"/> objects makes repeated reads allocation-free.
     /// </summary>
     public void GetAttributeGroups(ReadOptions? options, ReadOnlySpan<byte> key, ReadOnlySpan<PinnableAttributeGroup> attributeGroups)
     {
         _db.ThrowIfDisposed();
         if (attributeGroups.IsEmpty) return;
-        var batch = new MultiGetBatch(1);
+        AttributeGroupReadScratch scratch = AttributeGroupReadScratch.Rent();
         try
         {
-            batch.Add(key);
-            ReadAttributeGroups(options, batch, attributeGroups, null);
+            ReadAttributeGroupsPrepare(scratch, key, null, attributeGroups, null);
+            Snapshot? owned = ReadAttributeGroupsView(scratch, options, out ReadOptions? ro, out Snapshot? snap);
+            try
+            {
+                for (int c = 0; c < scratch.CfCount; c++)
+                {
+                    ColumnFamily cf = scratch.Cfs[c];
+                    int m = ReadAttributeGroupsFill(scratch, cf, key, null, attributeGroups, null);
+                    RocksDbException? callError = null;
+                    try
+                    {
+                        _db.MultiGetAsync(cf.Data, ro, snap, scratch.Batch, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+                    }
+                    catch (RocksDbException e)
+                    {
+                        callError = e;
+                    }
+                    ReadAttributeGroupsDistribute(scratch, cf, m, callError, attributeGroups, null);
+                }
+            }
+            finally
+            {
+                if (owned is not null) _db.ReleaseInternalSnapshot(owned);
+            }
         }
         finally
         {
-            batch.Dispose();
+            AttributeGroupReadScratch.Return(scratch);
+        }
+    }
+
+    /// <summary>
+    /// Async <see cref="GetAttributeGroups(ReadOptions?, ReadOnlySpan{byte}, ReadOnlySpan{PinnableAttributeGroup})"/>:
+    /// data blocks missing from the block cache are read with async I/O (completes synchronously when everything is
+    /// cached or in memtables).
+    /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    public async ValueTask GetAttributeGroupsAsync(ReadOptions? options, ReadOnlyMemory<byte> key, ReadOnlyMemory<PinnableAttributeGroup> attributeGroups,
+        CancellationToken cancellationToken = default)
+    {
+        _db.ThrowIfDisposed();
+        if (attributeGroups.IsEmpty) return;
+        AttributeGroupReadScratch scratch = AttributeGroupReadScratch.Rent();
+        try
+        {
+            ReadAttributeGroupsPrepare(scratch, key.Span, null, attributeGroups.Span, null);
+            Snapshot? owned = ReadAttributeGroupsView(scratch, options, out ReadOptions? ro, out Snapshot? snap);
+            try
+            {
+                for (int c = 0; c < scratch.CfCount; c++)
+                {
+                    ColumnFamily cf = scratch.Cfs[c];
+                    int m = ReadAttributeGroupsFill(scratch, cf, key.Span, null, attributeGroups.Span, null);
+                    RocksDbException? callError = null;
+                    try
+                    {
+                        await _db.MultiGetAsync(cf.Data, ro, snap, scratch.Batch, synchronous: false, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (RocksDbException e)
+                    {
+                        callError = e;
+                    }
+                    ReadAttributeGroupsDistribute(scratch, cf, m, callError, attributeGroups.Span, null);
+                }
+            }
+            finally
+            {
+                if (owned is not null) _db.ReleaseInternalSnapshot(owned);
+            }
+        }
+        finally
+        {
+            AttributeGroupReadScratch.Return(scratch);
         }
     }
 
@@ -175,7 +237,8 @@ public sealed partial class RocksDatabase
     /// Batched <see cref="GetAttributeGroups(ReadOptions?, ReadOnlySpan{byte}, ReadOnlySpan{PinnableAttributeGroup})"/>
     /// (DB::MultiGetEntity(options, num_keys, keys, PinnableAttributeGroups* results)): <paramref name="results"/>[i]
     /// holds the attribute groups to read for <paramref name="keys"/>[i]. Every (key, column family) pair is read from
-    /// one consistent view; each column family's keys are looked up with one batched MultiGet.
+    /// one consistent view; each column family's keys are looked up with one batched MultiGet. Reusing the same key list
+    /// and result groups makes repeated calls allocation-free.
     /// </summary>
     public void MultiGetAttributeGroups(ReadOptions? options, IReadOnlyList<ReadOnlyMemory<byte>> keys, IReadOnlyList<PinnableAttributeGroup[]> results)
     {
@@ -184,29 +247,97 @@ public sealed partial class RocksDatabase
         if (keys.Count != results.Count) throw new ArgumentException("keys and results must have the same length");
         _db.ThrowIfDisposed();
         if (keys.Count == 0) return;
-        var batch = new MultiGetBatch(keys.Count);
+        AttributeGroupReadScratch scratch = AttributeGroupReadScratch.Rent();
         try
         {
-            for (int i = 0; i < keys.Count; i++) batch.Add(keys[i].Span);
-            ReadAttributeGroups(options, batch, default, results);
+            ReadAttributeGroupsPrepare(scratch, default, keys, default, results);
+            Snapshot? owned = ReadAttributeGroupsView(scratch, options, out ReadOptions? ro, out Snapshot? snap);
+            try
+            {
+                for (int c = 0; c < scratch.CfCount; c++)
+                {
+                    ColumnFamily cf = scratch.Cfs[c];
+                    int m = ReadAttributeGroupsFill(scratch, cf, default, keys, default, results);
+                    RocksDbException? callError = null;
+                    try
+                    {
+                        _db.MultiGetAsync(cf.Data, ro, snap, scratch.Batch, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+                    }
+                    catch (RocksDbException e)
+                    {
+                        callError = e;
+                    }
+                    ReadAttributeGroupsDistribute(scratch, cf, m, callError, default, results);
+                }
+            }
+            finally
+            {
+                if (owned is not null) _db.ReleaseInternalSnapshot(owned);
+            }
         }
         finally
         {
-            batch.Dispose();
+            AttributeGroupReadScratch.Return(scratch);
         }
     }
 
     /// <summary>
-    /// The shared part of the attribute-group reads: under one snapshot, one MultiGetEntity per distinct column family
-    /// over the keys of <paramref name="keys"/> that ask for it. <paramref name="single"/> are the groups of the only key
-    /// (GetEntity) when <paramref name="perKey"/> is null.
+    /// Async <see cref="MultiGetAttributeGroups(ReadOptions?, IReadOnlyList{ReadOnlyMemory{byte}}, IReadOnlyList{PinnableAttributeGroup[]})"/>:
+    /// data blocks missing from the block cache are read with async I/O.
     /// </summary>
-    private void ReadAttributeGroups(ReadOptions? options, MultiGetBatch keys, ReadOnlySpan<PinnableAttributeGroup> single,
-        IReadOnlyList<PinnableAttributeGroup[]>? perKey)
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    public async ValueTask MultiGetAttributeGroupsAsync(ReadOptions? options, IReadOnlyList<ReadOnlyMemory<byte>> keys,
+        IReadOnlyList<PinnableAttributeGroup[]> results, CancellationToken cancellationToken = default)
     {
-        int n = keys.Count;
-        // Distinct column families in first-use order.
-        var cfs = new List<ColumnFamily>();
+        ArgumentNullException.ThrowIfNull(keys);
+        ArgumentNullException.ThrowIfNull(results);
+        if (keys.Count != results.Count) throw new ArgumentException("keys and results must have the same length");
+        _db.ThrowIfDisposed();
+        if (keys.Count == 0) return;
+        AttributeGroupReadScratch scratch = AttributeGroupReadScratch.Rent();
+        try
+        {
+            ReadAttributeGroupsPrepare(scratch, default, keys, default, results);
+            Snapshot? owned = ReadAttributeGroupsView(scratch, options, out ReadOptions? ro, out Snapshot? snap);
+            try
+            {
+                for (int c = 0; c < scratch.CfCount; c++)
+                {
+                    ColumnFamily cf = scratch.Cfs[c];
+                    int m = ReadAttributeGroupsFill(scratch, cf, default, keys, default, results);
+                    RocksDbException? callError = null;
+                    try
+                    {
+                        await _db.MultiGetAsync(cf.Data, ro, snap, scratch.Batch, synchronous: false, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (RocksDbException e)
+                    {
+                        callError = e;
+                    }
+                    ReadAttributeGroupsDistribute(scratch, cf, m, callError, default, results);
+                }
+            }
+            finally
+            {
+                if (owned is not null) _db.ReleaseInternalSnapshot(owned);
+            }
+        }
+        finally
+        {
+            AttributeGroupReadScratch.Return(scratch);
+        }
+    }
+
+    // The attribute-group reads in phases (shared by the sync and async methods): one MultiGetEntity per distinct column
+    // family over the keys that ask for it, under one view. Keys are the single key (perKey == null) or keys[i]; groups
+    // are the single key's groups or perKey[i].
+
+    /// <summary>Validates and resets every group and collects the distinct column families in first-use order.</summary>
+    private void ReadAttributeGroupsPrepare(AttributeGroupReadScratch scratch, ReadOnlySpan<byte> singleKey, IReadOnlyList<ReadOnlyMemory<byte>>? keys,
+        ReadOnlySpan<PinnableAttributeGroup> single, IReadOnlyList<PinnableAttributeGroup[]>? perKey)
+    {
+        int n = perKey is null ? 1 : perKey.Count;
+        scratch.Begin(n);
         for (int i = 0; i < n; i++)
         {
             ReadOnlySpan<PinnableAttributeGroup> groups = perKey is null ? single : perKey[i];
@@ -215,72 +346,137 @@ public sealed partial class RocksDatabase
                 ArgumentNullException.ThrowIfNull(g);
                 CheckOwnColumnFamily(g.ColumnFamily);
                 g.Reset();
-                if (!ContainsColumnFamily(cfs, g.ColumnFamily)) cfs.Add(g.ColumnFamily);
+                scratch.AddColumnFamily(g.ColumnFamily);
             }
         }
-        // One consistent view across column families (upstream: MultiCFSnapshot). An explicit snapshot already is one;
-        // otherwise an implicit snapshot pins the sequence, and each column family's super version is referenced after it.
-        Snapshot? owned = null;
-        ReadOptions? ro = options;
-        if (cfs.Count > 1 && options?.Snapshot is null)
+    }
+
+    /// <summary>
+    /// The consistent view across column families (upstream: MultiCFSnapshot). An explicit snapshot already is one;
+    /// otherwise an internal snapshot pins the sequence (returned as the snapshot to release), and each column family's
+    /// super version is referenced after it. <paramref name="ro"/> / <paramref name="snapshot"/> are what the per-column
+    /// family MultiGets read with.
+    /// </summary>
+    private Snapshot? ReadAttributeGroupsView(AttributeGroupReadScratch scratch, ReadOptions? options, out ReadOptions? ro, out Snapshot? snapshot)
+    {
+        ro = options;
+        snapshot = options?.Snapshot;
+        if (scratch.CfCount <= 1 || snapshot is not null) return null;
+        Snapshot owned = _db.AcquireInternalSnapshot();
+        bool overridable = _db.TxnHooks is null;
+        for (int c = 0; c < scratch.CfCount && overridable; c++) overridable = scratch.Cfs[c].TimestampSize == 0;
+        if (!overridable)
         {
-            owned = _db.GetSnapshot();
+            // Transaction DBs and timestamped column families read the snapshot from the options.
             ro = options?.Clone() ?? new ReadOptions();
             ro.Snapshot = owned;
         }
-        var sub = new MultiGetBatch(n);
-        var subKey = new int[n];
-        try
+        snapshot = owned;
+        return owned;
+    }
+
+    /// <summary>Fills the scratch batch with the keys asking for <paramref name="cf"/>; returns their count.</summary>
+    private static int ReadAttributeGroupsFill(AttributeGroupReadScratch scratch, ColumnFamily cf, ReadOnlySpan<byte> singleKey,
+        IReadOnlyList<ReadOnlyMemory<byte>>? keys, ReadOnlySpan<PinnableAttributeGroup> single, IReadOnlyList<PinnableAttributeGroup[]>? perKey)
+    {
+        MultiGetBatch sub = scratch.Batch;
+        sub.Clear();
+        sub.EntityRun = true;
+        int n = perKey is null ? 1 : perKey.Count;
+        int m = 0;
+        for (int i = 0; i < n; i++)
         {
-            foreach (ColumnFamily cf in cfs)
+            ReadOnlySpan<PinnableAttributeGroup> groups = perKey is null ? single : perKey[i];
+            foreach (PinnableAttributeGroup g in groups)
             {
-                sub.Clear();
-                int m = 0;
-                for (int i = 0; i < n; i++)
+                if (g.ColumnFamily.Data != cf.Data) continue;
+                sub.Add(keys is null ? singleKey : keys[i].Span);
+                scratch.SubKey[m++] = i;
+                break;
+            }
+        }
+        return m;
+    }
+
+    /// <summary>Stores the outcome of the MultiGet over <paramref name="cf"/>'s keys in their groups.</summary>
+    private static void ReadAttributeGroupsDistribute(AttributeGroupReadScratch scratch, ColumnFamily cf, int m, RocksDbException? callError,
+        ReadOnlySpan<PinnableAttributeGroup> single, IReadOnlyList<PinnableAttributeGroup[]>? perKey)
+    {
+        MultiGetBatch sub = scratch.Batch;
+        for (int j = 0; j < m; j++)
+        {
+            int i = scratch.SubKey[j];
+            ReadOnlySpan<PinnableAttributeGroup> groups = perKey is null ? single : perKey[i];
+            foreach (PinnableAttributeGroup g in groups)
+            {
+                if (g.ColumnFamily.Data != cf.Data) continue;
+                if (callError is not null) g.SetError(callError);
+                else
                 {
-                    ReadOnlySpan<PinnableAttributeGroup> groups = perKey is null ? single : perKey[i];
-                    foreach (PinnableAttributeGroup g in groups)
+                    switch (sub.GetStatus(j))
                     {
-                        if (g.ColumnFamily.Data != cf.Data) continue;
-                        sub.Add(keys.GetKey(i));
-                        subKey[m++] = i;
-                        break;
-                    }
-                }
-                RocksDbException? callError = null;
-                try
-                {
-                    cf.MultiGetEntity(ro, sub);
-                }
-                catch (RocksDbException e)
-                {
-                    callError = e;
-                }
-                for (int j = 0; j < m; j++)
-                {
-                    int i = subKey[j];
-                    ReadOnlySpan<PinnableAttributeGroup> groups = perKey is null ? single : perKey[i];
-                    foreach (PinnableAttributeGroup g in groups)
-                    {
-                        if (g.ColumnFamily.Data != cf.Data) continue;
-                        if (callError is not null) g.SetError(callError);
-                        else
-                        {
-                            switch (sub.GetStatus(j))
-                            {
-                                case MultiGetStatus.Found: g.SetFound(sub.GetSerializedEntity(j)); break;
-                                case MultiGetStatus.Error: g.SetError(sub.GetError(j)!); break;
-                                default: g.Reset(); break;
-                            }
-                        }
+                        case MultiGetStatus.Found: g.SetFound(sub.GetSerializedEntity(j)); break;
+                        case MultiGetStatus.Error: g.SetError(sub.GetError(j)!); break;
+                        default: g.Reset(); break;
                     }
                 }
             }
         }
-        finally
+    }
+}
+
+/// <summary>
+/// Reusable scratch of the attribute-group reads: the per-column-family MultiGet batch, the batch-index-to-key map and
+/// the distinct column families. One instance is cached per thread (a read that suspends returns it on whichever
+/// thread it completes on; a nested read on the same thread gets its own).
+/// </summary>
+internal sealed class AttributeGroupReadScratch
+{
+    private const int MaxCachedKeys = 1024;
+
+    [ThreadStatic] private static AttributeGroupReadScratch? t_cached;
+
+    public readonly MultiGetBatch Batch = new(16);
+    public int[] SubKey = new int[16];
+    public ColumnFamily[] Cfs = new ColumnFamily[4];
+    public int CfCount;
+
+    public static AttributeGroupReadScratch Rent()
+    {
+        AttributeGroupReadScratch? s = t_cached;
+        if (s is null) return new AttributeGroupReadScratch();
+        t_cached = null;
+        return s;
+    }
+
+    public static void Return(AttributeGroupReadScratch s)
+    {
+        s.Batch.Clear();
+        Array.Clear(s.Cfs, 0, s.CfCount);
+        s.CfCount = 0;
+        if (s.SubKey.Length > MaxCachedKeys || t_cached is not null)
         {
-            sub.Dispose();
-            owned?.Dispose();
+            s.Batch.Dispose();
+            return;
         }
+        t_cached = s;
+    }
+
+    /// <summary>Prepares for <paramref name="keys"/> keys.</summary>
+    public void Begin(int keys)
+    {
+        if (SubKey.Length < keys) SubKey = new int[Math.Max(keys, SubKey.Length * 2)];
+        CfCount = 0;
+    }
+
+    /// <summary>Appends <paramref name="cf"/> unless already present (the handful of column families of a read: linear scan).</summary>
+    public void AddColumnFamily(ColumnFamily cf)
+    {
+        for (int i = 0; i < CfCount; i++)
+        {
+            if (Cfs[i].Data == cf.Data) return;
+        }
+        if (CfCount == Cfs.Length) Array.Resize(ref Cfs, CfCount * 2);
+        Cfs[CfCount++] = cf;
     }
 }

@@ -192,6 +192,21 @@ public sealed partial class ColumnFamily
     }
 
     /// <summary>
+    /// Allocation-free <see cref="GetFullHistoryTsLow"/>: appends the current full_history_ts_low to
+    /// <paramref name="destination"/> and returns true, or returns false (nothing written) when it was never set.
+    /// </summary>
+    public bool TryGetFullHistoryTsLow(IBufferWriter<byte> destination)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        _db.ThrowIfDisposed();
+        if (_cfd.TimestampSize == 0) ThrowHelper.InvalidArgument("Timestamp is not enabled in this column family");
+        byte[]? ts = _cfd.FullHistoryTsLow;
+        if (ts is null) return false;
+        destination.Write(ts);
+        return true;
+    }
+
+    /// <summary>
     /// Raises full_history_ts_low to <paramref name="tsLow"/> (DB::IncreaseFullHistoryTsLow): recorded in the MANIFEST.
     /// Throws InvalidArgument when it would decrease the current value or the size does not match.
     /// </summary>

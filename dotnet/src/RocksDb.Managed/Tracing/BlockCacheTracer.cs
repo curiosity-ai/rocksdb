@@ -89,13 +89,35 @@ internal sealed class BlockCacheTracer
     // An AsyncLocal so that it flows across awaits; it is only read and written while a trace runs.
     private static readonly AsyncLocal<LookupContext?> s_context = new();
 
-    private sealed class LookupContext(TableReaderCaller caller, ulong getId, byte[]? referencedKey, bool userSnapshot)
+    // Synchronous callers (DBImpl::Get) use a per-thread context instead: setting an AsyncLocal copies the execution
+    // context (an allocation per set and per restore). The context object of the outermost synchronous call is reused.
+    [ThreadStatic] private static LookupContext? t_sync;
+    [ThreadStatic] private static LookupContext? t_spareSync;
+
+    private sealed class LookupContext
     {
-        public readonly TableReaderCaller Caller = caller;
-        public readonly ulong GetId = getId;
-        public readonly byte[]? ReferencedKey = referencedKey;
-        public readonly bool UserSnapshot = userSnapshot;
+        public TableReaderCaller Caller;
+        public ulong GetId;
+        public bool UserSnapshot;
+        private byte[] _key = [];
+        private int _keyLength;
+
+        public ReadOnlySpan<byte> ReferencedKey => _key.AsSpan(0, _keyLength);
+
+        public LookupContext Set(TableReaderCaller caller, ulong getId, ReadOnlySpan<byte> referencedKey, bool userSnapshot)
+        {
+            Caller = caller;
+            GetId = getId;
+            UserSnapshot = userSnapshot;
+            if (_key.Length < referencedKey.Length) _key = new byte[Math.Max(referencedKey.Length, 32)];
+            referencedKey.CopyTo(_key);
+            _keyLength = referencedKey.Length;
+            return this;
+        }
     }
+
+    /// <summary>The lookup context of the current call: the synchronous one of this thread, else the async-flowing one.</summary>
+    private static LookupContext? Current => t_sync ?? s_context.Value;
 
     public bool IsEnabled => _writer is not null;
 
@@ -145,14 +167,41 @@ internal sealed class BlockCacheTracer
     public static object? SetCaller(TableReaderCaller caller, ulong getId, ReadOnlySpan<byte> referencedKey, bool userSnapshot)
     {
         LookupContext? prev = s_context.Value;
-        s_context.Value = new LookupContext(caller, getId, referencedKey.IsEmpty ? null : referencedKey.ToArray(), userSnapshot);
+        s_context.Value = new LookupContext().Set(caller, getId, referencedKey, userSnapshot);
         return prev;
     }
 
     public static void RestoreCaller(object? previous) => s_context.Value = (LookupContext?)previous;
 
+    /// <summary>
+    /// <see cref="SetCaller"/> for a synchronous call that does not suspend: the context is per thread (no
+    /// execution-context copy) and its object is reused. Returns the previous synchronous context for
+    /// <see cref="RestoreSyncCaller"/>, which must run on the same thread.
+    /// </summary>
+    public static object? SetSyncCaller(TableReaderCaller caller, ulong getId, ReadOnlySpan<byte> referencedKey, bool userSnapshot)
+    {
+        LookupContext? prev = t_sync;
+        LookupContext? c = null;
+        if (prev is null)
+        {
+            c = t_spareSync;
+            t_spareSync = null;
+        }
+        // A nested synchronous call (e.g. a Get from a merge operator) gets its own context.
+        t_sync = (c ?? new LookupContext()).Set(caller, getId, referencedKey, userSnapshot);
+        return prev;
+    }
+
+    /// <summary>Ends the scope of <see cref="SetSyncCaller"/>.</summary>
+    public static void RestoreSyncCaller(object? previous)
+    {
+        LookupContext? cur = t_sync;
+        t_sync = (LookupContext?)previous;
+        if (previous is null) t_spareSync = cur;
+    }
+
     /// <summary>The caller of the current lookups (iterators when no context was set).</summary>
-    public static TableReaderCaller CurrentCaller => s_context.Value?.Caller ?? TableReaderCaller.UserIterator;
+    public static TableReaderCaller CurrentCaller => Current?.Caller ?? TableReaderCaller.UserIterator;
 
     /// <summary>
     /// BlockBasedTable::SaveLookupContextOrTraceRecord + FinishTraceRecord + BlockCacheTraceWriterImpl::WriteBlockAccess
@@ -167,7 +216,7 @@ internal sealed class BlockCacheTracer
         // ShouldTrace: spatial downsampling so that a sampled block has its complete access history.
         ulong freq = _options.SamplingFrequency;
         if (freq > 1 && Hash.GetSliceRangedNPHash(blockKey, freq) != 0) return;
-        LookupContext? ctx = s_context.Value;
+        LookupContext? ctx = Current;
         TableReaderCaller caller = ctx?.Caller ?? TableReaderCaller.UserIterator;
         bool get = BlockCacheTraceRecord.IsGetOrMultiGet(caller);
         lock (_lock)
@@ -178,7 +227,7 @@ internal sealed class BlockCacheTracer
             Coding.PutLengthPrefixedSlice(_payload, blockKey);
             Coding.PutFixed64(_payload, blockSize);
             Coding.PutFixed64(_payload, cfId);
-            Coding.PutLengthPrefixedSlice(_payload, System.Text.Encoding.UTF8.GetBytes(cfName));
+            TraceFormat.PutLengthPrefixedUtf8(_payload, cfName);
             Coding.PutFixed32(_payload, level);
             Coding.PutFixed64(_payload, sstNumber);
             _payload.WriteByte((byte)caller);

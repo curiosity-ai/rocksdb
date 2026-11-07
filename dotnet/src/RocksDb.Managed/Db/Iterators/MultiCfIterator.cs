@@ -37,6 +37,8 @@ public abstract class MultiCfIteratorBase : IDisposable
     private readonly Comparator _cmp;
     private readonly Snapshot? _ownedSnapshot;
     private readonly PooledBufferWriter _key = new(64);
+    // The current key copied for the re-seek of a direction switch (Seek rewrites _key while the children move).
+    private readonly PooledBufferWriter _switchKey = new(64);
     private bool _forward = true;
     private bool _disposed;
 
@@ -98,8 +100,7 @@ public abstract class MultiCfIteratorBase : IDisposable
         if (!_forward)
         {
             // GetHeap<MultiCfMinHeap>: re-seek every child to the current key in the forward direction.
-            byte[] target = _key.WrittenSpan.ToArray();
-            Seek(target);
+            Seek(CopySwitchKey());
             if (!Valid) return;
         }
         Advance(static it => it.Next());
@@ -110,11 +111,17 @@ public abstract class MultiCfIteratorBase : IDisposable
         ThrowIfInvalid();
         if (_forward)
         {
-            byte[] target = _key.WrittenSpan.ToArray();
-            SeekForPrev(target);
+            SeekForPrev(CopySwitchKey());
             if (!Valid) return;
         }
         Advance(static it => it.Prev());
+    }
+
+    private ReadOnlySpan<byte> CopySwitchKey()
+    {
+        _switchKey.Clear();
+        _switchKey.Write(_key.WrittenSpan);
+        return _switchKey.WrittenSpan;
     }
 
     private delegate void SeekAction(Iterator it, ReadOnlySpan<byte> target);
@@ -189,6 +196,7 @@ public abstract class MultiCfIteratorBase : IDisposable
         _currentCount = 0;
         DisposeChildren();
         _key.Dispose();
+        _switchKey.Dispose();
         GC.SuppressFinalize(this);
     }
 }

@@ -588,6 +588,7 @@ public sealed class TtlDatabase : IDisposable, IAsyncDisposable
         _db.Write(options, rewritten);
     }
 
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder))]
     public async ValueTask WriteAsync(WriteOptions? options, WriteBatch batch, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(batch);
@@ -637,6 +638,7 @@ public sealed class TtlDatabase : IDisposable, IAsyncDisposable
         _db.Write(options, b);
     }
 
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder))]
     internal async ValueTask WriteOneAsync(WriteOptions? options, uint cf, byte op, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value,
         CancellationToken cancellationToken)
     {
