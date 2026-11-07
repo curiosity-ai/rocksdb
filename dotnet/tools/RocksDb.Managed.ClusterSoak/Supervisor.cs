@@ -201,13 +201,14 @@ internal sealed class Supervisor
     {
         public Func<ClusterControl, Task>? BeforeConverge;
         public Func<ClusterControl, Task>? AfterConverge;
+        /// <summary>Runs after the checks (e.g. repairs an injected bug before the next epoch's clients start).</summary>
+        public Func<ClusterControl, Task>? AfterVerify;
         public Action<Dictionary<string, DumpDto>>? OnDumps;
         public Func<List<Op>, List<Op>>? OnHistory;
         public Func<Model, Model>? OnModel;
         public string? EventsDir;
         public TimeSpan? RunTime;
         public bool NoNemesis;
-        public bool NoFold;
         public Func<ClusterControl, CancellationToken, Task>? DuringRun;
     }
 
@@ -334,10 +335,11 @@ internal sealed class Supervisor
             Log("  " + (st.Pass ? "PASS " : "FAIL ") + st.Name.PadRight(20) + " " + st.Ms.ToString("F0", CultureInfo.InvariantCulture).PadLeft(7) + " ms  " + st.Detail);
             foreach (string pr in st.Problems) Log("       " + pr);
         }
+        if (hooks?.AfterVerify is { } av) await av(cluster).ConfigureAwait(false);
         if (!rep.Pass && hooks is null)
             return await FailAsync(cluster, epoch, "VERIFY failed: " + string.Join(", ", rep.Steps.FindAll(x => !x.Pass).ConvertAll(x => x.Name)), rep).ConfigureAwait(false);
 
-        if (hooks?.NoFold != true && dumps.TryGetValue(cluster.Ids[0], out DumpDto? d0) && d0.Available)
+        if (dumps.TryGetValue(cluster.Ids[0], out DumpDto? d0) && d0.Available)
         {
             Checker.Fold(model, _cfg, d0, state);
             model.Epoch = epoch;

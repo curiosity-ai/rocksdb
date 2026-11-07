@@ -279,12 +279,14 @@ internal sealed class NodeHandle : IAsyncDisposable
         return false;
     }
 
-    private static async Task<bool> WaitExitAsync(Process p, TimeSpan timeout)
+    /// <summary>Waits for the process to exit and for <see cref="OnExited"/> to have run (State is Down afterwards).</summary>
+    private async Task<bool> WaitExitAsync(Process p, TimeSpan timeout)
     {
         using var cts = new CancellationTokenSource(timeout);
         try
         {
             await p.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+            while (State != NodeState.Down && ReferenceEquals(_proc, p)) await Task.Delay(5, cts.Token).ConfigureAwait(false);
             return true;
         }
         catch (OperationCanceledException)
