@@ -366,7 +366,9 @@ Still open from this round:
 - [x] Supervisor / worker / verifier cycles; faults kill, graceful, recovery-kill, pause, I/O errors, power loss, torn-op, torn-seq, crash at N-th fsync; corruption trials on a copy; native cross-check; selftest (13 injected bugs caught)
 - [x] 45 min soak: 190 cycles, ~101.8M ops, 0 failures
 - [x] Bug: memtable switch synced the closed WAL but not the WAL directory (fixed, DbCrashConsistencyTests regression test)
-- [ ] Real LazyFS mode (`--lazyfs-bin`): exercise in the container
+- [x] Real LazyFS mode (`--lazyfs-bin`): 20 min, 22 cycles, ~24M ops, 0 failures; `--unsafe-skip-fsync` makes VERIFY fail as it must
+- [x] LazyFS hangs (its own create/write lock-order deadlock) and silent daemon deaths: watchdog, remount, re-verify with power-loss expectations
+- [x] `RocksArrayPool<T>.Shared` (private copy of the runtime's SharedArrayPool, incl. main's zeroing of non-primitive arrays) replaces `ArrayPool<T>.Shared` everywhere; guard test
 - [ ] Soak with a separate `wal_dir`; pessimistic / WritePrepared transactions in the workload; native writer worker; torn MANIFEST writes
 
 ## Unported utilities (found 2026-11-03)
