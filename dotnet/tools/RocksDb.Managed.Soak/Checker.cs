@@ -235,6 +235,23 @@ internal static class Checker
             perKeySets[k] = set;
             allowed = allowed.Intersect(set);
         }
+        // Durability first: a key whose own possible cuts all lie before the op that must have survived lost an
+        // acknowledged write (reported as durability even though it usually also leaves a hole).
+        var lostKeys = new List<string>();
+        CutSet mustReach = CutSet.Of(required, n - 1);
+        foreach (KeyValuePair<int, CutSet> kv in perKeySets)
+        {
+            if (!kv.Value.Intersect(mustReach).IsEmpty) continue;
+            if (lostKeys.Count < 6) lostKeys.Add($"key {kv.Key - keyOffset} (observed {observed[kv.Key]}, consistent with cuts {kv.Value})");
+            else if (lostKeys.Count == 6) lostKeys.Add("...");
+        }
+        if (lostKeys.Count > 0)
+        {
+            Op must = ops[(int)required];
+            durable.Fail($"{what} w{writer}: acknowledged writes lost: op #{required} of {n} ({must.Invoke.Type} key {must.Invoke.A} v{must.Invoke.V}" +
+                $"{((must.Invoke.Flags & OpFlags.Sync) != 0 ? " sync" : "")}) and everything before it must have survived; keys: {string.Join("; ", lostKeys)}");
+            return;
+        }
         if (allowed.IsEmpty && perKeySets.Count > 0)
         {
             // No single prefix explains every key: a hole. Name the keys that disagree with the latest prefix.

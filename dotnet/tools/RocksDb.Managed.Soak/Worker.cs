@@ -81,10 +81,18 @@ internal sealed class Worker
     public async Task<int> RunAsync()
     {
         Log($"worker pid {Environment.ProcessId} cycle {_plan.Cycle} fault {_plan.Fault} fs {(_faultFs is null ? "local" : "fault-injecting")} options: {_plan.Options}");
+        // The workload mixes blocking (sync) and async calls on pool threads; enough threads so that blocked callers
+        // do not starve the continuations of the async ones (thread injection is slow).
+        ThreadPool.SetMinThreads(64, 64);
         var sw = Stopwatch.StartNew();
         BlockCache cache = BlockCache.CreateLru(_plan.Options.BlockCacheSize);
         List<ColumnFamilyDescriptor> cfs = DbSetup.Descriptors(_paths.Db, _fs, _cfg.Db, _plan.Options, cache);
-        _occ = await OptimisticTransactionDatabase.OpenAsync(_paths.Db, DbSetup.DbOptions(_plan.Options, _fs), new OptimisticTransactionDbOptions(), cfs)
+        // ValidateSerial: the conflict check runs inside the write group, so it also sees the plain (non-transactional)
+        // merge-batch transfers on the same accounts. With ValidateParallel (upstream's default) the check runs before
+        // the write group and only excludes other optimistic transactions: a plain write landing between the check and
+        // the write is lost, upstream as well, so that policy cannot be mixed with plain writes to the same keys.
+        _occ = await OptimisticTransactionDatabase.OpenAsync(_paths.Db, DbSetup.DbOptions(_plan.Options, _fs),
+                new OptimisticTransactionDbOptions { ValidatePolicy = OccValidationPolicy.ValidateSerial }, cfs)
             .ConfigureAwait(false);
         _db = _occ.Database;
         Console.WriteLine($"OPENED {sw.Elapsed.TotalMilliseconds:F0}");

@@ -443,6 +443,14 @@ internal sealed class Supervisor
             w.Kill();
             return "the simulated crash did not end the worker (3 min)\n" + w.Tail;
         }
+        foreach (string line in w.Tail.Split('\n'))
+        {
+            if (line.Contains(" CRASH ", StringComparison.Ordinal) || line.Contains("fsync trigger", StringComparison.Ordinal))
+                Log("    worker: " + line[(line.IndexOf(' ') + 1)..]);
+            if (line.Contains("torn-seq on", StringComparison.Ordinal)) Bump(_status.Notes, "torn-seq-applied");
+            else if (line.Contains("torn-op on", StringComparison.Ordinal)) Bump(_status.Notes, "torn-op-applied");
+            else if (line.Contains("no torn candidate", StringComparison.Ordinal)) Bump(_status.Notes, "torn-no-candidate");
+        }
         return c == Worker.ExitCrash ? null : Unexpected(w, c);
     }
 
