@@ -110,6 +110,17 @@ one-way Bootstrap -> Cluster transition (a designated primary leads without elec
 Divergence is detected at stream attach (`CheckFollowerLogConsistency`), per chunk (sequence check) and per heartbeat
 (prev term); since a WAL cannot be truncated, a diverged follower rebuilds from a leader snapshot (`BeginResync` /
 `CompleteResync`). `ClusterNodeHost` implements the follower stream, progress reports, attach check and resync.
+
+Durability: every log entry (client writes, the leader no-op, replicated chunks on followers) is fsync'd before it
+counts - before the leader counts itself towards the commit quorum, before a follower reports or acknowledges it, and
+before a node's latest sequence number (used in votes and heartbeats) moves past it (`ClusterNodeHostOptions.SyncWal`,
+default true; concurrent client writes share one fsync, a follower syncs once per chunk). Without it a power loss of
+the leader and one follower lost acknowledged writes (found by the cluster soak). A node that finds Raft state but no
+database (killed during a snapshot restore) rebuilds from the current leader before it takes part, and a follower that
+attaches adopts the leader's term map for everything past its own log. `WriteCommittedAsync(WriteBatch, ...)` writes a
+batch atomically and returns a `ClusterWriteStatus` that separates a definite rejection (`NotLeader`: nothing written)
+from the indeterminate outcomes (`LeadershipLost`, `TimedOut`). A brand-new cluster stays in Bootstrap mode until the
+bootstrap primary has written something (an empty log never counts as in sync).
 rocksdb-sharp's `Cluster/README.md` describes the protocol, failure modes and tuning; it applies unchanged, except
 where noted below. Out of scope as before: pre-vote, membership changes, ReadIndex, leadership transfer.
 
@@ -157,4 +168,6 @@ remaining spread of the 60-220 ms measured earlier is machine load. `bench/Rocks
 ClusterTest in process over an in-memory network (plus a native rocksdb-sharp replica fed with managed WAL chunks, and
 2-node replication / switchover / 3-node cluster over real gRPC on localhost). The samples are the multi-process
 versions (`dotnet run --project samples/ClusterTest`, etc.); each coordinator validates the final digests and exits
-non-zero on a mismatch.
+non-zero on a mismatch. `tools/RocksDb.Managed.ClusterSoak` (`tools/cluster-soak.sh`) is a Jepsen-style soak of the
+Raft cluster mode over gRPC with network partitions through user-space proxies, kills, pauses, power loss, clock skew
+and rolling restarts, for hours or days; see [docs/cluster-soak.md](../../docs/cluster-soak.md).
