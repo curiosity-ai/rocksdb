@@ -349,7 +349,9 @@ Still open from this round:
 - [x] Background: EVENT_LOG / LOG formatted only when enabled, table-property string interning, pooled file write buffers, long-lived background thread pool (BackgroundThreadPool), pooled dictionary-compression blocks, cached compression-options string, version installation and filter buffers
 - [x] Reads / monitoring / open: pooled legacy MultiGet (20 KB -> 2.2 KB per 16 keys), caller-memory `MultiGet` (+async) 0 B, lazy-entity pin reuse, integer property path (`TryGetIntProperty` 0 B), cached `ColumnFamilies`, `VisitLiveFiles` / list-refill `GetLiveFilesMetadata`, span `GetApproximateSizes`, non-allocating `GetHistogramData`, lazy HyperClock slot table (open 2.7 MB -> 0.75 MB)
 - [ ] Open still lists the DB directory more than once (sharing one listing across WAL recovery and obsolete-file scans is unsafe; a few KB per open)
-- [ ] Not profiled yet: GetUpdatesSince, secondary / read-only, TTL, remote compaction, attribute groups, coalescing iterator, MultiScan, PlainTable / CuckooTable, blob GC, rate limiter, tracing, replication layer
+- [x] Features (64 scenarios, Scenarios/Features.cs): attribute-group Get / MultiGet 0 B (were 1.8-18.8 KB; reused internal snapshot for multi-CF consistency) + `GetAttributeGroupsAsync` / `MultiGetAttributeGroupsAsync`; MultiScan 1080 -> 104 B; coalescing-iterator direction switch 0 B; block-cache / IO trace records 0 B; `TryGetFullHistoryTsLow(IBufferWriter)` 0 B; pooled async builders for merge operands, TTL writes, MultiScan; TTL, Plain/Cuckoo reads, blob reads, rate limiter, query tracing, UDT and merge reads already 0 B
+- [ ] Features left as is: NewCoalescingIterator ~3 KB per iterator (reuse it), rate-limiter wait ~216 B, async Get under block cache tracing 168 B (AsyncLocal), remote-compaction worker open ~1 MB per job
+- [ ] Not profiled yet: GetUpdatesSince, secondary / read-only, replication layer (round 2 agent running)
 
 ## Unported utilities (found 2026-11-03)
 

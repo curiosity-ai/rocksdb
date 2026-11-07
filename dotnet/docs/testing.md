@@ -15,7 +15,7 @@ ships prebuilt libraries for Linux, macOS and Windows, so no C++ build is needed
 
 | Project | Tests (net10.0) | Native code | What it covers |
 |---|---:|---|---|
-| `tests/RocksDb.Managed.Tests` | 1982 | none | formats, data structures, DB behavior, crash consistency, fault injection, concurrency, upstream test vectors |
+| `tests/RocksDb.Managed.Tests` | 1991 | none | formats, data structures, DB behavior, crash consistency, fault injection, concurrency, upstream test vectors |
 | `tests/RocksDb.Managed.CompatTests` | 490 | in process | byte-level and file-level compatibility with `librocksdb` |
 | `tests/RocksDb.Managed.RoundTrip` | 148 | child process | whole-DB managed and native alternation, option and crash matrices, 2PC, features |
 | `tests/RocksDb.Managed.Replication.Tests` | 36 | in process (one test) | replication, switchover, Raft cluster, gRPC transport, native replica |
