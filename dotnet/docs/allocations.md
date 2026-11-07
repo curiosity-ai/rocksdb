@@ -103,8 +103,10 @@ mostly per new file (the table reader and the index and filter blocks it keeps, 
 scales with the number of flushes and compactions, not with the number of writes: a larger `WriteBufferSize` (the
 default is 64 MiB) means fewer files and less of it. Flushes and compactions run on long-lived background threads
 (named `rocksdb:high:N`, `rocksdb:low:N` and `rocksdb:bottom:N`, shared by all databases of the process), so their
-per-thread buffers are reused from one job to the next. Steady state is reached after the first few memtables of a new database or column family. Before that, the
-memtable arena and the block cache grow, which shows up as allocations but is the memory you configured.
+per-thread buffers are reused from one job to the next.
+
+Steady state is reached after the first few memtables of a new database or column family. Before that, the memtable
+arena and the block cache grow, which shows up as allocations but is the memory you configured.
 
 Write options: reuse `WriteOptions` instances (`WriteOptions.SyncWrites` is a shared one). Synced writes
 (`WriteOptions.SyncWrites`), `DisableWal`, writes to several column families and timestamped writes behave the same.

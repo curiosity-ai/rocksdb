@@ -506,6 +506,8 @@ public sealed class DbBlobTests
         // Only blob files of the current version remain on disk (obsolete files are purged after the next job).
         db.Put(B("zz"), B("x"));
         db.Flush();
+        // Flush returns once the version is installed; the purge runs afterwards in the same background job.
+        db.DefaultColumnFamily.Db.WaitForBackgroundWorkForTest();
         Assert.AreEqual((int)IntProperty(db, DbProperties.NumBlobFiles), BlobFilesOnDisk(fs).Count);
     }
 
