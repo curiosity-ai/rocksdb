@@ -117,7 +117,9 @@ before a node's latest sequence number (used in votes and heartbeats) moves past
 default true; concurrent client writes share one fsync, a follower syncs once per chunk). Without it a power loss of
 the leader and one follower lost acknowledged writes (found by the cluster soak). A node that finds Raft state but no
 database (killed during a snapshot restore) rebuilds from the current leader before it takes part, and a follower that
-attaches adopts the leader's term map for everything past its own log. `WriteCommittedAsync(WriteBatch, ...)` writes a
+attaches adopts the leader's term map for everything past its own log. A follower reports progress only while its term
+is at most the term of the leader it follows (a vote it granted in a later term may have been for a candidate without
+the entries it is applying), and it stops applying a stream from a leader of an older term. `WriteCommittedAsync(WriteBatch, ...)` writes a
 batch atomically and returns a `ClusterWriteStatus` that separates a definite rejection (`NotLeader`: nothing written)
 from the indeterminate outcomes (`LeadershipLost`, `TimedOut`). A brand-new cluster stays in Bootstrap mode until the
 bootstrap primary has written something (an empty log never counts as in sync).

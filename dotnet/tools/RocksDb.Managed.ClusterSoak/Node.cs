@@ -207,6 +207,9 @@ internal sealed class NodeFaultFs : IFileSystem
 /// <summary>The <c>node</c> sub-command: one cluster member as its own process.</summary>
 internal static class NodeMain
 {
+    private static string LatestSeq(ClusterNodeHost h) =>
+        h.TryUseDatabase(0, static (db, _) => db.GetLatestSequenceNumber(), out ulong s) ? s.ToString(CultureInfo.InvariantCulture) : "-";
+
     public static async Task<int> RunAsync(string configPath)
     {
         NodeConfig cfg = JsonSerializer.Deserialize<NodeConfig>(File.ReadAllText(configPath))!;
@@ -280,8 +283,9 @@ internal static class NodeMain
         RaftClusterNode node = host.Node;
         events.Write("start term=" + node.CurrentTerm + " role=" + node.Role + " leader=" + (node.CurrentLeaderId ?? "-") + " seq=" +
                      host.Db.GetLatestSequenceNumber() + " mode=" + node.Mode + " pid=" + Environment.ProcessId);
-        node.RoleChanged += (_, e) => events.Write("role " + e.Role + " term=" + e.Term);
-        node.LeaderChanged += (_, e) => events.Write("leader " + (e.LeaderId ?? "-") + " term=" + e.Term);
+        // Raised under the node's lock: only volatile reads here (commit index; the latest sequence of the current instance).
+        node.RoleChanged += (_, e) => events.Write("role " + e.Role + " term=" + e.Term + " commit=" + node.CommitSeq + " seq=" + LatestSeq(host));
+        node.LeaderChanged += (_, e) => events.Write("leader " + (e.LeaderId ?? "-") + " term=" + e.Term + " commit=" + node.CommitSeq + " seq=" + LatestSeq(host));
         Out("READY " + cfg.NodeId);
 
         // Commands from the supervisor (stdin).

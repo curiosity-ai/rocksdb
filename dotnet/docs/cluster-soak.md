@@ -84,7 +84,8 @@ supervisor (control node, never faulted)                       per node process 
   covered by a directory fsync) and ends the process with `_exit(77)`: a power loss of that node.
 - Each node uses a `SkewedTimeProvider` as `ClusterNodeHostOptions.TimeProvider` (`RaftConfig.TimeProvider`): the
   `clock R` command makes its election timer and heartbeats run R times as fast.
-- Each node appends role, leader, vote, start, resync and power-loss events to `events/<node>.log` (outside the
+- Each node appends role and leader changes (with term, commit index and latest sequence), granted votes, starts
+  (term, role, mode), resyncs and power losses to `events/<node>.log` (outside the
   fault file system, one `write` per line); the election-safety check reads them.
 - Timings: election timeout 800..1600 ms, heartbeat 150 ms, RPC deadline 450 ms, client write timeout 2 s; memtable
   size (128 KiB .. 2 MiB) and WAL retention (0, 5 or 30 s: how often a lagging follower needs a snapshot instead of the
@@ -281,7 +282,18 @@ missed, and keeps its state then.
    before a power loss) won, mislabelling the incoming entries (wrong `lastLogTerm` in votes, spurious resyncs).
    `RaftPersistentState.AdoptTermsAfter` replaces our ranges past the attach point with the leader's. Test:
    `BuildingBlockTests.AttachingFollowerAdoptsTheLeadersTermsPastItsLog`.
-4. Behaviour worth knowing (not a bug, documented): a brand-new cluster stays in Bootstrap mode until the bootstrap
+4. **A follower acknowledged the old leader's entries after voting in a later term** (fixed, found while reading the
+   follower stream for the committed-prefix check). Progress reports carry no term: a follower that granted a vote in
+   term T+1 while a chunk from the term-T leader was being applied (so the vote's `lastLogSeq` did not include it) then
+   reported that chunk to the old leader, which counted it, committed and acknowledged the write, while the candidate
+   it voted for lacks the entry and can win. The follower now reports only while its term is at most the followed
+   leader's (checked after the chunk is applied) and stops applying a stream whose source term is older than its own.
+   Regression test (a WAL-sync gate holds the chunk in mid-write, a one-way link cut keeps the old leader's heartbeats
+   away): `ClusterPartitionTests.FollowerThatVotedInALaterTermDoesNotAcknowledgeTheOldLeadersEntries`.
+5. Soak harness bugs found on the way (not in the library): a restart that raced the exit handler left a rolling
+   restart with every node down; clients spinning on connection errors; leader-targeted faults aimed at a leader the
+   monitor had not yet seen die.
+6. Behaviour worth knowing (not a bug, documented): a brand-new cluster stays in Bootstrap mode until the bootstrap
    primary wrote something, because an empty log never counts as in sync.
 
 ## Results
