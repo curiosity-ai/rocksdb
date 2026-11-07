@@ -363,12 +363,24 @@ Cleanup: on exit (end of the duration, Ctrl-C, SIGTERM, or a failure, after the 
 the cache (`clear-cache`), unmounts with `fusermount3 -uz <dir>/db` and waits for the daemon. After a hard kill of the
 supervisor, run `fusermount3 -uz <dir>/db` yourself and check `pgrep lazyfs`.
 
+## What it has found
+
+- Engine: with several column families a memtable switch synced the closed WAL but not the WAL directory
+  (upstream's `SyncClosedWals` fsyncs it when it was not synced since the WAL was created). With a separate `wal_dir`
+  a power loss could drop the closed WAL while the flushed column family kept its half of a cross-column-family
+  batch. The fault file system's diagnostics showed a synced WAL without a durable directory entry; fixed, with the
+  regression test `DbCrashConsistencyTests.MemtableSwitchMakesTheClosedWalDurableIncludingItsDirectoryEntry`.
+- Usage: optimistic transactions with `ValidateParallel` lose plain (non-transactional) writes to the same keys that
+  land between validation and commit, as upstream does (see "The workload" above).
+
 ## Limitations
 
 - Power loss is simulated inside the worker process for the files directly in the DB directory; the real file system
   is not power-cycled (use the LazyFS mode for that). File metadata other than names and sizes (permissions, times)
   is not modelled.
 - Torn writes are not applied to the MANIFEST (see above).
+- The DB uses the default `wal_dir` (the DB directory); the fault file system tracks one directory, so a separate WAL
+  directory (where the bug above showed) is covered by the unit test, not by the soak.
 - Pessimistic `TransactionDatabase` and WritePrepared transactions are not part of the workload (they are covered by
   the unit, round-trip and 2PC round-trip suites); only optimistic transactions are.
 - The native cross-check reads; native RocksDB does not write to the soak DB.
