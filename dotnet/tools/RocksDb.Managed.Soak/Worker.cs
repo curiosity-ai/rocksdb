@@ -229,10 +229,11 @@ internal sealed class Worker
     private async Task OnError(Exception e)
     {
         Interlocked.Increment(ref _errors);
-        if (e is not RocksDbException)
-        {
-            Log("unexpected exception: " + e);
-        }
+        // The public API reports failures as RocksDbException; anything else (other than our own cancellation at stop)
+        // is an engine bug, and so is a Corruption status while the files are intact.
+        if (e is OperationCanceledException && _stop.IsCancellationRequested) return;
+        if (e is not RocksDbException) Violation("unexpected exception from the engine: " + e);
+        if (e is RocksDbException { Code: StatusCode.Corruption } c) Violation("Corruption status during the workload: " + c);
         await Task.Delay(5).ConfigureAwait(false);
     }
 
@@ -523,8 +524,7 @@ internal sealed class Worker
             }
             catch (Exception e)
             {
-                // Reads may fail with injected I/O errors; anything else is reported.
-                if (e is not RocksDbException { Code: StatusCode.IOError }) Log("reader error: " + e.Message);
+                if (e is not RocksDbException { Code: StatusCode.IOError }) Log("reader error: " + e.GetType().Name + ": " + e.Message);
                 await OnError(e).ConfigureAwait(false);
             }
         }
@@ -746,7 +746,7 @@ internal sealed class Worker
             catch (Exception e)
             {
                 _history.Append(Phase.Info, OpType.Admin, Procs.Admin, 0, id, x, 0, 0, 0, 0);
-                if (e is not RocksDbException) Log("admin op failed: " + e);
+                Log("admin op " + x + " failed: " + e.GetType().Name + ": " + e.Message);
                 await OnError(e).ConfigureAwait(false);
                 continue;
             }
@@ -763,7 +763,10 @@ internal sealed class Worker
             if (f.SmallestKey.AsSpan().SequenceCompareTo(f.LargestKey) > 0) Violation($"live file {f.Name}: smallest key > largest key");
             if (f.SmallestSeqno > f.LargestSeqno) Violation($"live file {f.Name}: smallest seqno > largest seqno");
             string path = Path.Combine(f.Directory, f.Name.TrimStart('/'));
-            if (!_fs.FileExists(path)) Violation($"live file {path} does not exist");
+            if (_fs.FileExists(path)) continue;
+            // A compaction may have finished and deleted it since the listing: only a file that is still live counts.
+            if (_db.GetLiveFilesMetadata().Exists(g => g.FileNumber == f.FileNumber) && !_fs.FileExists(path))
+                Violation($"live file {path} does not exist");
         }
     }
 
