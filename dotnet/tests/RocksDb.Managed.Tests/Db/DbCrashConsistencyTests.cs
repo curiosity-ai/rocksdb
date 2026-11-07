@@ -406,4 +406,55 @@ public sealed class DbCrashConsistencyTests
         }
         using RocksDatabase final = Open(fs, out _);
     }
+
+    /// <summary>
+    /// Regression (found by tools/RocksDb.Managed.Soak): with several column families a memtable switch syncs the closed
+    /// WAL so that flushing one column family never leaves the other column families' data of the same write batches
+    /// only in a non-durable WAL. Upstream does this in SyncClosedWals (SyncWalImpl), which also fsyncs the WAL
+    /// directory when it was not synced since the WAL was created; the port synced the WAL file but not the directory.
+    /// With a separate wal_dir the flush's DB directory fsync does not cover the WAL either, so after a power loss the
+    /// closed WAL vanished while the flushed half of a cross-column-family batch survived.
+    /// </summary>
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void MemtableSwitchMakesTheClosedWalDurableIncludingItsDirectoryEntry(bool separateWalDir)
+    {
+        MemoryFileSystem fs = NewFs();
+        DbOptions o = NewOptions(fs);
+        o.CreateMissingColumnFamilies = true;
+        if (separateWalDir)
+        {
+            fs.CreateDirectoryIfMissing("/wal");
+            fs.SyncDirectory("/");
+            o.WalDir = "/wal";
+        }
+        var cfs = new List<ColumnFamilyDescriptor>
+        {
+            new(ColumnFamilyDescriptor.DefaultColumnFamilyName, new ColumnFamilyOptions()),
+            new("b", new ColumnFamilyOptions()),
+        };
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, o, cfs))
+        {
+            ColumnFamily b = db.GetColumnFamily("b");
+            db.Put(B("a0"), B("v"));
+            db.Flush(); // switches to a new WAL whose directory entry is not synced yet
+            // An atomic batch across both column families, not synced.
+            using (RocksDb.Managed.Db.WriteBatch batch = db.CreateWriteBatch())
+            {
+                batch.Put(B("a1"), B("v1")).Put(b.Id, B("b1"), B("v1"));
+                db.Write(batch);
+            }
+            // Flushing the default column family closes (and syncs) that WAL; "b"'s half of the batch is only there.
+            db.Flush();
+            Assert.AreEqual("v1", GetString(db, "a1"));
+            fs.SetFilesystemActive(false); // power loss: nothing reaches the files any more
+            fs.SimulateCrash();
+            fs.SetFilesystemActive(true);
+        }
+        using RocksDatabase reopened = RocksDatabase.Open(DbPath, o, cfs);
+        // The default column family's half survived in the flushed SST, so the other half must have survived too.
+        Assert.AreEqual("v1", GetString(reopened, "a1"));
+        Assert.AreEqual("v1", GetString(reopened.GetColumnFamily("b"), "b1"), "half of an atomic cross-column-family batch was lost");
+    }
 }

@@ -547,8 +547,15 @@ internal sealed class LazyFaultFileSystem : IFileSystem
                         if (!_durable.TryGetValue(kv.Key, out Tracked? d) || !ReferenceEquals(d, kv.Value)) notDurable++;
                         if (kv.Value.Undo.Count > 0) recycled++;
                     }
+                    var wals = new List<string>();
+                    foreach (KeyValuePair<string, Tracked> kv in _current)
+                    {
+                        if (DbFiles.KindOf(kv.Key) != DbFileKind.Wal) continue;
+                        bool durable = _durable.TryGetValue(kv.Key, out Tracked? d) && ReferenceEquals(d, kv.Value);
+                        wals.Add($"{kv.Key}: synced {kv.Value.SyncedLen}, {kv.Value.Unsynced.Count} unsynced writes{(durable ? "" : ", entry not durable")}");
+                    }
                     tornInfo = $" (no torn candidate: {unsynced} files with unsynced writes, {notDurable} of them without a durable" +
-                        $" directory entry, {recycled} recycled; plain clear-cache)";
+                        $" directory entry, {recycled} recycled; WALs: {string.Join("; ", wals)}; plain clear-cache)";
                 }
             }
 
