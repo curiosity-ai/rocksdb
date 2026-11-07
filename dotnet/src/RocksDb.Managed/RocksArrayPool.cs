@@ -1,6 +1,7 @@
 // Port of the .NET runtime's System.Buffers.SharedArrayPool<T> (the implementation behind ArrayPool<T>.Shared),
 // src/libraries/System.Private.CoreLib/src/System/Buffers/SharedArrayPool.cs, Utilities.cs and
-// src/libraries/System.Private.CoreLib/src/System/Gen2GcCallback.cs at v10.0.0.
+// src/libraries/System.Private.CoreLib/src/System/Gen2GcCallback.cs at v10.0.0, with the later changes of runtime main
+// (2026-11): non-primitive element types get zeroed arrays, NoInlining on Rent/Return.
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
@@ -67,6 +68,7 @@ internal sealed class PrivateSharedArrayPool<T> : ArrayPool<T>
         return Interlocked.CompareExchange(ref _buckets[bucketIndex], inst, null) ?? inst;
     }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
     public override T[] Rent(int minimumLength)
     {
         T[]? buffer;
@@ -110,9 +112,14 @@ internal sealed class PrivateSharedArrayPool<T> : ArrayPool<T>
             ArgumentOutOfRangeException.ThrowIfNegative(minimumLength);
         }
 
-        return GC.AllocateUninitializedArray<T>(minimumLength);
+        // For large arrays avoid the zero-initialization cost, but only for types for which every bit pattern is
+        // valid (an uninitialized struct with a bool field could otherwise hold an invalid value).
+        return typeof(T).IsPrimitive && typeof(T) != typeof(bool)
+            ? GC.AllocateUninitializedArray<T>(minimumLength)
+            : new T[minimumLength];
     }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
     public override void Return(T[] array, bool clearArray = false)
     {
         ArgumentNullException.ThrowIfNull(array);

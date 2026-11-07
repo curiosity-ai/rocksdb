@@ -44,6 +44,26 @@ public sealed class RocksArrayPoolTests
         Assert.AreEqual(1 << 30, PrivateSharedArrayPool<byte>.GetMaxSizeForBucket(26));
     }
 
+    private struct FlagAndValue
+    {
+        public bool Flag;
+        public long Value;
+    }
+
+    [TestMethod]
+    public void NewArraysOfNonPrimitiveTypesAreZeroed()
+    {
+        // Only primitive element types (except bool) may come back uninitialized; a struct with a bool field must
+        // never see an arbitrary bit pattern. The type is private to this test, so these rents are fresh allocations.
+        FlagAndValue[] a = RocksArrayPool<FlagAndValue>.Shared.Rent(1 << 16);
+        foreach (FlagAndValue v in a)
+        {
+            Assert.IsFalse(v.Flag);
+            Assert.AreEqual(0L, v.Value);
+        }
+        RocksArrayPool<FlagAndValue>.Shared.Return(a);
+    }
+
     [TestMethod]
     public void ClearArrayZeroesOnReturn()
     {
