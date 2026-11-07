@@ -107,8 +107,12 @@ internal sealed class LazyFaultFileSystem : IFileSystem
 
     public long InjectedErrors => Interlocked.Read(ref _injectedErrors);
 
-    public void SetErrorRates(int writePpm, int syncPpm, int readPpm)
+    /// <summary>Kind of injected I/O error: "plain" IOError, "retryable" (IOStatus retryable) or "nospace".</summary>
+    private volatile string _errorKind = "plain";
+
+    public void SetErrorRates(int writePpm, int syncPpm, int readPpm, string kind)
     {
+        _errorKind = kind;
         _writeErrorPpm = writePpm;
         _syncErrorPpm = syncPpm;
         _readErrorPpm = readPpm;
@@ -173,7 +177,13 @@ internal sealed class LazyFaultFileSystem : IFileSystem
     private RocksDbException Injected(string what, string path)
     {
         Interlocked.Increment(ref _injectedErrors);
-        return new RocksDbException(StatusCode.IOError, "IO error: injected " + what + " error: " + path);
+        string msg = "injected " + what + " error: " + path;
+        return _errorKind switch
+        {
+            "retryable" => RocksDbException.RetryableIOError(msg),
+            "nospace" => RocksDbException.NoSpace(msg),
+            _ => new RocksDbException(StatusCode.IOError, "IO error: " + msg),
+        };
     }
 
     // ---- tracked state ----

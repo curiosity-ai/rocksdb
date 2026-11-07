@@ -198,10 +198,11 @@ internal sealed class Worker
             }
             case "ioerr":
                 _faultFs!.SetErrorRates(int.Parse(p[1], System.Globalization.CultureInfo.InvariantCulture),
-                    int.Parse(p[2], System.Globalization.CultureInfo.InvariantCulture), int.Parse(p[3], System.Globalization.CultureInfo.InvariantCulture));
+                    int.Parse(p[2], System.Globalization.CultureInfo.InvariantCulture), int.Parse(p[3], System.Globalization.CultureInfo.InvariantCulture),
+                    p.Length > 4 ? p[4] : "plain");
                 break;
             case "ioerr-off":
-                _faultFs!.SetErrorRates(0, 0, 0);
+                _faultFs!.SetErrorRates(0, 0, 0, "plain");
                 Log($"I/O errors off ({_faultFs.InjectedErrors} injected); resuming");
                 TryResume();
                 break;

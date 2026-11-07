@@ -402,18 +402,54 @@ internal sealed class Supervisor
             {
                 if (!Wait(run / 3, w)) return Unexpected(w, w.WaitAsync(TimeSpan.FromSeconds(10)).Result);
                 int[] rates = [200, 1000, 5000];
-                w.Send($"ioerr {rates[r.Next(3)]} {rates[r.Next(3)]} {rates[r.Next(3)] / 2}");
+                // Plain IOErrors in flush / WAL writes are fatal background errors upstream (Resume refuses them until a
+                // reopen); retryable ones and NoSpace are recoverable (auto-recovery or Resume).
+                string[] kinds = ["plain", "retryable", "nospace"];
+                string kind = kinds[r.Next(kinds.Length)];
+                Bump(_status.Notes, "io-error-kind-" + kind);
+                w.Send($"ioerr {rates[r.Next(3)]} {rates[r.Next(3)]} {rates[r.Next(3)] / 2} {kind}");
                 if (!Wait(run / 3, w)) return Unexpected(w, w.WaitAsync(TimeSpan.FromSeconds(10)).Result);
                 w.Send("ioerr-off");
                 if (!Wait(run / 3 + TimeSpan.FromSeconds(1), w)) return Unexpected(w, w.WaitAsync(TimeSpan.FromSeconds(10)).Result);
-                if (r.Next(2) == 0) return Stop(w, TimeSpan.Zero, allowCloseFailure: true);
-                w.Kill();
-                w.WaitAsync(TimeSpan.FromSeconds(60)).Wait();
-                return null;
+                string? result;
+                if (r.Next(2) == 0) result = Stop(w, TimeSpan.Zero, allowCloseFailure: true);
+                else
+                {
+                    w.Kill();
+                    w.WaitAsync(TimeSpan.FromSeconds(60)).Wait();
+                    result = null;
+                }
+                CountIoErrorNotes(plan);
+                return result;
             }
             default:
                 return "unknown fault " + plan.Fault;
         }
+    }
+
+    /// <summary>Background errors and Resume after an I/O error window, from the worker log.</summary>
+    private void CountIoErrorNotes(CyclePlan plan)
+    {
+        string log = _paths.LogFile(plan.Cycle, "worker");
+        if (!File.Exists(log)) return;
+        long injected = 0;
+        int resumeOk = 0, resumeFailed = 0;
+        foreach (string line in File.ReadLines(log))
+        {
+            int i = line.IndexOf("I/O errors off (", StringComparison.Ordinal);
+            if (i >= 0)
+            {
+                string n = line[(i + 16)..];
+                n = n[..n.IndexOf(' ')];
+                injected += long.Parse(n, System.Globalization.CultureInfo.InvariantCulture);
+            }
+            if (line.Contains("RESUME ok", StringComparison.Ordinal)) resumeOk++;
+            if (line.Contains("RESUME failed", StringComparison.Ordinal)) resumeFailed++;
+        }
+        Bump(_status.Notes, "io-errors-injected", injected);
+        Bump(_status.Notes, "resume-ok", resumeOk);
+        if (resumeFailed > 0) Bump(_status.Notes, "resume-attempts-failed", resumeFailed);
+        Log($"cycle {plan.Cycle}: {injected} I/O errors injected; Resume ok {resumeOk}, failed attempts {resumeFailed}");
     }
 
     private string? Stop(ChildProcess w, TimeSpan after, bool allowCloseFailure)
