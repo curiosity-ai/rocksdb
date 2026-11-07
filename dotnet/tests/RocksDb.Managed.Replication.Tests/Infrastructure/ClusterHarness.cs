@@ -32,6 +32,8 @@ public sealed class ClusterHarness : IAsyncDisposable
     public IFileSystem FileSystem { get; }
     public string Root { get; }
     public ulong BootstrapInSyncLagThreshold { get; set; } = 1000;
+    /// <summary>Per-node file system wrapper (node id, shared file system) -> the node's file system.</summary>
+    public Func<string, IFileSystem, IFileSystem>? WrapFileSystem { get; set; }
     /// <summary>When false, obsolete WALs are deleted at once (no archive): a follower that falls behind needs a snapshot.</summary>
     public bool ArchiveWals { get; set; } = true;
 
@@ -45,7 +47,7 @@ public sealed class ClusterHarness : IAsyncDisposable
 
     public async Task<ClusterNodeHost> StartAsync(string id)
     {
-        IFileSystem fs = FileSystem;
+        IFileSystem fs = WrapFileSystem?.Invoke(id, FileSystem) ?? FileSystem;
         bool archive = ArchiveWals;
         var host = new ClusterNodeHost(new ClusterNodeHostOptions
         {

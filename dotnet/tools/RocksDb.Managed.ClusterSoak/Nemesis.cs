@@ -184,10 +184,13 @@ internal sealed class Nemesis
         return l;
     }
 
+    /// <summary>The monitor's leader if its process is still running (the monitor polls every 250 ms).</summary>
+    private string? LiveLeader => _c.Leader is { } l && _c.Nodes[l].State == NodeState.Running ? l : null;
+
     private string? FreeNode(bool leader)
     {
         HashSet<string> busy = BusyNodes();
-        if (leader && _c.Leader is { } l && !busy.Contains(l)) return l;
+        if (leader && LiveLeader is { } l && !busy.Contains(l)) return l;
         foreach (string n in Shuffled())
             if (!busy.Contains(n) && _c.Nodes[n].State == NodeState.Running) return n;
         return null;
@@ -223,7 +226,7 @@ internal sealed class Nemesis
                     int majority = n / 2 + 1;
                     List<string> a = order.GetRange(0, majority), b = order.GetRange(majority, n - majority);
                     // Sometimes the leader ends up on the minority side on purpose.
-                    if (_c.Leader is { } l && _rng.Next(2) == 0 && a.Contains(l) && b.Count > 0)
+                    if (LiveLeader is { } l && _rng.Next(2) == 0 && a.Contains(l) && b.Count > 0)
                     {
                         a.Remove(l);
                         a.Add(b[0]);
@@ -235,7 +238,7 @@ internal sealed class Nemesis
                 }
                 else if (kind is FaultKind.IsolateLeader or FaultKind.IsolateNode)
                 {
-                    string victim = kind == FaultKind.IsolateLeader && _c.Leader is { } l ? l : order[0];
+                    string victim = kind == FaultKind.IsolateLeader && LiveLeader is { } l ? l : order[0];
                     net.CutBetween([victim], _c.Ids);
                     desc = victim + (kind == FaultKind.IsolateLeader ? " (leader)" : "") + " isolated; clients still reach it";
                 }
@@ -261,7 +264,7 @@ internal sealed class Nemesis
                 }
                 else if (kind == FaultKind.OneWay)
                 {
-                    string a = _c.Leader is { } l && _rng.Next(2) == 0 ? l : order[0];
+                    string a = LiveLeader is { } l && _rng.Next(2) == 0 ? l : order[0];
                     int mode = _rng.Next(3);
                     if (mode == 0)
                     {

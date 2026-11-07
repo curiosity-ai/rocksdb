@@ -576,7 +576,13 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                 Log("following " + leaderId + " from seq " + (myLatest + 1));
                 // Synced chunks: the progress reports and heartbeat answers below only ever cover durable entries.
                 var consumer = new ReplicationConsumer(_db) { SyncWrites = _cfg.SyncWal };
-                await using var progress = new ProgressReporter((seq, c) => client.ReportProgressAsync(_cfg.NodeId, seq, c));
+                // A progress report acknowledges entries of the leader's term: once this node moved to a later term (it
+                // granted a vote, possibly while a chunk was being applied, to a candidate whose log ends before that
+                // chunk), the old leader must not count them towards a quorum - the new term's leader may lack them.
+                // Checked after the entries were applied: a vote granted later saw them in our log.
+                long followTerm = check.Term;
+                await using var progress = new ProgressReporter((seq, c) =>
+                    _node.CurrentTerm <= followTerm ? client.ReportProgressAsync(_cfg.NodeId, seq, c) : Task.CompletedTask);
                 progress.Report(myLatest);
                 await foreach (WalStreamMessage m in client.StreamUpdatesAsync(_cfg.NodeId, myLatest + 1, ct).ConfigureAwait(false))
                 {
@@ -586,6 +592,8 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                         return;
                     }
                     _node.HandleObservedLeader(m.SourceId, m.SourceTerm);
+                    // A deposed leader's chunk (we already are in a later term): Raft rejects stale AppendEntries.
+                    if (m.SourceTerm < _node.CurrentTerm) break;
                     if (m.EntryTerm > 0) _state.RecordTermRange(m.FirstSequence, m.EntryTerm);
                     // A faithful replica ingests the leader's batches at exactly the same sequence numbers; a gap or an
                     // overlap diverges the copy.
