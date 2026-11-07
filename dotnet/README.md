@@ -727,6 +727,7 @@ db.PutAttributeGroups("user:1"u8,
 PinnableAttributeGroup[] groups = [new(profile), new(media)];
 db.GetAttributeGroups(null, "user:1"u8, groups);
 Console.WriteLine(groups[1].Columns.Count);                        // 1
+await db.GetAttributeGroupsAsync(null, "user:1"u8.ToArray(), groups);   // async I/O for uncached blocks
 
 // Batched entity reads on one column family.
 using var batch = new MultiGetBatch();
@@ -776,6 +777,8 @@ db.TryGet(new ReadOptions { Timestamp = Ts(25) }, "k"u8, value, timestamp);   //
 
 // History below full_history_ts_low may be garbage collected by compaction.
 db.IncreaseFullHistoryTsLow(Ts(20));
+var low = new ArrayBufferWriter<byte>();
+if (db.TryGetFullHistoryTsLow(low)) Console.WriteLine(BinaryPrimitives.ReadUInt64LittleEndian(low.WrittenSpan));   // 20
 ```
 
 ### Blob files (integrated BlobDB)

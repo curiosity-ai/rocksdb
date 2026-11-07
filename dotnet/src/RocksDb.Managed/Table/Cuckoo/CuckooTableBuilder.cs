@@ -260,6 +260,8 @@ public sealed class CuckooTableBuilder : TableBuilder
 
     private readonly record struct CuckooNode(ulong BucketId, uint Depth, uint ParentPos);
 
+    private readonly List<CuckooNode> _bfsTree = new();
+
     /// <summary>
     /// Port of CuckooTableBuilder::MakeSpaceForKey: a BFS over the buckets the keys in <paramref name="hashVals"/>' buckets
     /// could move to; on finding an empty bucket, moves the keys along the path and returns the first-level bucket.
@@ -267,7 +269,9 @@ public sealed class CuckooTableBuilder : TableBuilder
     private bool MakeSpaceForKey(List<ulong> hashVals, uint callId, CuckooBucket[] buckets, ref ulong bucketId)
     {
         // This is BFS search tree that is stored simply as a vector. Each node stores the index of parent node in the vector.
-        var tree = new List<CuckooNode>();
+        // (One list per builder, cleared per call: upstream's local vector.)
+        List<CuckooNode> tree = _bfsTree;
+        tree.Clear();
         // We want to identify already visited buckets in the current method call so that we don't add same buckets
         // again for exploration in the tree.
         for (int hashCnt = 0; hashCnt < _numHashFunc; ++hashCnt)

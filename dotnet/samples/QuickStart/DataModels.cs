@@ -33,7 +33,7 @@ internal static class DataModels
         return Task.CompletedTask;
     }
 
-    public static Task AttributeGroups(string path)
+    public static async Task AttributeGroups(string path)
     {
         using RocksDatabase db = RocksDatabase.Open(path, new DbOptions { CreateIfMissing = true, CreateMissingColumnFamilies = true },
             [new("default", new ColumnFamilyOptions()), new("profile", new ColumnFamilyOptions()),
@@ -52,6 +52,7 @@ internal static class DataModels
         PinnableAttributeGroup[] groups = [new(profile), new(media)];
         db.GetAttributeGroups(null, "user:1"u8, groups);
         Console.WriteLine(groups[1].Columns.Count);                        // 1
+        await db.GetAttributeGroupsAsync(null, "user:1"u8.ToArray(), groups);   // async I/O for uncached blocks
 
         // Batched entity reads on one column family.
         using var batch = new MultiGetBatch();
@@ -72,7 +73,6 @@ internal static class DataModels
         int read = lazy!.ReadColumnRange(lazy.IndexOf("avatar"u8), 0, header);   // reads 16 bytes, not 4 KiB
         // </snippet:attribute-groups>
         Check(groups[0].Status == MultiGetStatus.Found && read == 16 && lazy.IsReference(0), "attribute groups and lazy read");
-        return Task.CompletedTask;
     }
 
     public static Task UserDefinedTimestamps(string path)
@@ -103,6 +103,8 @@ internal static class DataModels
 
         // History below full_history_ts_low may be garbage collected by compaction.
         db.IncreaseFullHistoryTsLow(Ts(20));
+        var low = new ArrayBufferWriter<byte>();
+        if (db.TryGetFullHistoryTsLow(low)) Console.WriteLine(BinaryPrimitives.ReadUInt64LittleEndian(low.WrittenSpan));   // 20
         // </snippet:user-defined-timestamps>
         ulong ts = BinaryPrimitives.ReadUInt64LittleEndian(timestamp.WrittenSpan);
         Line($"at 25: {Utf8(value.WrittenSpan)} @ {ts}");

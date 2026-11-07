@@ -21,6 +21,7 @@ steady state, including background flush and compaction work, with 16-byte keys 
 | Wide columns | `TryGetEntity(key, WideColumns)` and `TryGetEntityLazy(options, key, LazyWideColumns)` with a reused result, `MultiGetEntity`, `Iterator.Columns` | `GetEntity` (312 B), `GetEntityLazy` (1 KB) | `TryGetEntity` / `TryGetEntityLazy` with a reused result |
 | Transactions | `BeginTransaction(writeOptions, options, oldTransaction)` + `SetName` / `Put` / `TryGetForUpdate` / `TryGet` / `Prepare` / `Commit` (sync and async, pessimistic and optimistic) | `using BeginTransaction(writeOptions)` per transaction (the transaction object, 350-470 B) | reuse the transaction object |
 | Monitoring | `Statistics` and `PerfContext` enabled (no allocation on reads), `GetTickerCount`, `GetHistogramData`, `TryGetIntProperty` / `TryGetAggregatedIntProperty`, `ColumnFamilies`, `GetColumnFamily(name)`, `GetLatestSequenceNumber`, `VisitLiveFiles`, `GetApproximateSizes(ranges, Span<ulong>)` | `GetProperty` (the result string), `GetLiveFilesMetadata` (about 400 B per file), `GetApproximateSizes` returning an array | the non-allocating variants; see [Monitoring and metadata APIs](#monitoring-and-metadata-apis) |
+| Optional features | TTL `Put` / `TryGet` / iterators, attribute-group reads with reused `PinnableAttributeGroup`s (`GetAttributeGroups`, `MultiGetAttributeGroups` and their async versions), reused coalescing / attribute-group iterators, PlainTable / CuckooTable reads, blob reads (with or without a blob cache), rate-limited I/O that does not wait, query / block cache / IO tracing of synchronous reads, `TryGetFullHistoryTsLow`, `TryGetMergeOperands` | `NewMultiScan` (104 B: its handles), `NewCoalescingIterator` (about 3 KB), a rate-limiter wait (about 220 B), async reads while a block cache trace runs (168 B), `GetFullHistoryTsLow` (the copy) | see [Optional features](#optional-features) |
 
 ## Point reads
 
@@ -307,6 +308,49 @@ db.GetApproximateSizes(ranges, sizes);             // or (SizeApproximationOptio
 
 if (db.TryGetIntProperty(DbProperties.EstimateNumKeys, out ulong keys)) Report(keys);
 ```
+
+## Optional features
+
+```csharp
+// Attribute groups: reuse the PinnableAttributeGroup objects (and the key list / result arrays for the batched read).
+PinnableAttributeGroup[] groups = [new PinnableAttributeGroup(hot), new PinnableAttributeGroup(cold)];
+db.GetAttributeGroups(null, key, groups);            // or await db.GetAttributeGroupsAsync(null, key, groups)
+if (groups[1].Status == MultiGetStatus.Found) Use(groups[1].Columns);
+
+// MultiScan: reuse the MultiScanArgs; pass ReadOptions without IterateLowerBound / IterateUpperBound (or null).
+using (MultiScan scan = db.NewMultiScan(args))
+    while (scan.MoveNextRange())
+        for (; scan.Valid; scan.Next()) Use(scan.Key, scan.Value);
+
+var low = new ArrayBufferWriter<byte>(8);           // reused
+if (db.TryGetFullHistoryTsLow(low)) Use(low.WrittenSpan);
+```
+
+- **TTL databases** (`TtlDatabase`): `Put`, `Merge`, `Delete`, `Write(batch)`, their async versions, `TryGet(key,
+  IBufferWriter)` and a reused iterator allocate nothing on the calling thread. `Get` returns a new array.
+- **Attribute groups**: `GetAttributeGroups` / `MultiGetAttributeGroups` (and `GetAttributeGroupsAsync` /
+  `MultiGetAttributeGroupsAsync`) allocate nothing once the group objects are reused, also when they read several
+  column families under one implicit consistent view. `PutAttributeGroups` costs what `PutEntity` costs.
+- **Cross-column-family iterators**: a reused `CoalescingIterator` / `AttributeGroupIterator` allocates nothing,
+  including when it changes direction. Creating one costs about 3 KB (one iterator per column family, buffers and the
+  implicit snapshot); keep it for many seeks.
+- **MultiScan**: `NewMultiScan` allocates only the scan and iterator handles (104 B); the prefetch planning uses pooled
+  scratch. `ReadOptions` that set iterate bounds are copied (184 B) to clear them, so pass options without bounds.
+- **PlainTable, CuckooTable, blob files**: point reads, async reads and iteration allocate nothing; the blob cache does
+  not change that.
+- **Rate limiter**: a request granted from the bucket allocates nothing. A request that has to wait for a refill
+  allocates its waiter (about 220 B), which is small next to the wait itself.
+- **Tracing**: while `StartTrace`, `StartBlockCacheTrace` or `StartIOTrace` runs, synchronous reads and writes allocate
+  nothing for the trace records. Async reads under a block cache trace allocate 168 B each (the lookup context that
+  flows across awaits).
+- **User-defined timestamps**: `TryGet` with a timestamp writer, its async version, the span overloads, a reused
+  iterator (`Iterator.Timestamp`) and the timestamped writes allocate nothing; `GetFullHistoryTsLow` returns a copy, use
+  `TryGetFullHistoryTsLow(writer)` in loops.
+- **Merge operands**: `TryGetMergeOperands` / `TryGetMergeOperandsAsync` with a reused `MergeOperandsResult`, and reads
+  or iterators over keys with operands of a user `MergeOperator` (which writes its result to an `IBufferWriter<byte>`)
+  allocate nothing.
+- **Remote compaction**: each job allocates the serialized input and result and the worker's database open
+  (about 1 MB per job in-process); this is per job, not per key.
 
 ## What always allocates
 
