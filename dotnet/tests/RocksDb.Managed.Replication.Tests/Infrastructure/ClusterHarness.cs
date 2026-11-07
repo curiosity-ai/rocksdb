@@ -32,6 +32,8 @@ public sealed class ClusterHarness : IAsyncDisposable
     public IFileSystem FileSystem { get; }
     public string Root { get; }
     public ulong BootstrapInSyncLagThreshold { get; set; } = 1000;
+    /// <summary>Per-node file system wrapper (node id, shared file system) -> the node's file system.</summary>
+    public Func<string, IFileSystem, IFileSystem>? WrapFileSystem { get; set; }
     /// <summary>When false, obsolete WALs are deleted at once (no archive): a follower that falls behind needs a snapshot.</summary>
     public bool ArchiveWals { get; set; } = true;
 
@@ -45,7 +47,7 @@ public sealed class ClusterHarness : IAsyncDisposable
 
     public async Task<ClusterNodeHost> StartAsync(string id)
     {
-        IFileSystem fs = FileSystem;
+        IFileSystem fs = WrapFileSystem?.Invoke(id, FileSystem) ?? FileSystem;
         bool archive = ArchiveWals;
         var host = new ClusterNodeHost(new ClusterNodeHostOptions
         {
@@ -76,6 +78,28 @@ public sealed class ClusterHarness : IAsyncDisposable
     {
         Network.Unregister(id);
         if (_hosts.TryRemove(id, out ClusterNodeHost? h)) await h.DisposeAsync();
+    }
+
+    /// <summary>
+    /// A power loss of every node at once: the file system stops accepting writes (nothing written while the hosts shut
+    /// down reaches it), the hosts are disposed, and everything not synced is dropped.
+    /// </summary>
+    public async Task PowerLossAllAsync(MemoryFileSystem fs)
+    {
+        fs.SetFilesystemActive(false);
+        foreach (string id in _hosts.Keys)
+        {
+            try
+            {
+                await StopAsync(id);
+            }
+            catch (RocksDbException)
+            {
+                // closing on an inactive file system fails; the crash below decides what survives
+            }
+        }
+        fs.SimulateCrash();
+        fs.SetFilesystemActive(true);
     }
 
     /// <summary>Statuses of the running nodes, checked for Election Safety and monotonic terms.</summary>

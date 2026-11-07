@@ -114,11 +114,20 @@ public sealed class GrpcClusterClient : IClusterNodeClient, IDisposable
     private readonly IClusterService _client;
     private readonly TimeSpan _unaryTimeout;
 
-    public GrpcClusterClient(ClusterMember peer, TimeSpan unaryTimeout)
+    public GrpcClusterClient(ClusterMember peer, TimeSpan unaryTimeout) : this(peer, unaryTimeout, new GrpcChannelOptions())
+    {
+    }
+
+    /// <summary>
+    /// A client whose channel uses <paramref name="channelOptions"/> (e.g. a short <see cref="GrpcChannelOptions.MaxReconnectBackoff"/>
+    /// so a healed network partition is noticed quickly).
+    /// </summary>
+    public GrpcClusterClient(ClusterMember peer, TimeSpan unaryTimeout, GrpcChannelOptions channelOptions)
     {
         ArgumentNullException.ThrowIfNull(peer);
+        ArgumentNullException.ThrowIfNull(channelOptions);
         NodeId = peer.NodeId;
-        _channel = GrpcChannel.ForAddress(peer.Endpoint);
+        _channel = GrpcChannel.ForAddress(peer.Endpoint, channelOptions);
         _client = MagicOnionClient.Create<IClusterService>(_channel);
         _unaryTimeout = unaryTimeout;
     }

@@ -476,7 +476,10 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         _state.RecordTermRange(nextSeq, _state.CurrentTerm);
         // Replicate one entry from the new term right away so the commit index can advance past entries inherited
         // from previous terms (§5.4.2).
-        _db.Put(LeaderNoOpKey, Encoding.UTF8.GetBytes(_state.CurrentTerm.ToString(CultureInfo.InvariantCulture)));
+        // Synced like every log entry: the leader counts its own latest sequence towards the quorum.
+        byte[] noop = Encoding.UTF8.GetBytes(_state.CurrentTerm.ToString(CultureInfo.InvariantCulture));
+        if (_config.SyncLogWrites) _db.Put(WriteOptions.SyncWrites, LeaderNoOpKey, noop);
+        else _db.Put(LeaderNoOpKey, noop);
         RoleChanged?.Invoke(this, new RoleChangedEventArgs(_role, _state.CurrentTerm));
         LeaderChanged?.Invoke(this, new LeaderChangedEventArgs(_config.NodeId, _state.CurrentTerm));
         _electionTimer.Pause();

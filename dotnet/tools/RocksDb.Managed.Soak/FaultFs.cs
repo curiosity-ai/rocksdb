@@ -170,7 +170,8 @@ internal sealed class LazyFaultFileSystem : IFileSystem
 
     private void Exit() => Interlocked.Decrement(ref _inflight);
 
-    private void Freeze(int ownInflight)
+    /// <summary>Stops all file system activity (waits for in-flight operations, blocks new ones forever); used before <see cref="Apply"/>.</summary>
+    internal void Freeze(int ownInflight)
     {
         _frozen = true;
         var sw = System.Diagnostics.Stopwatch.StartNew();

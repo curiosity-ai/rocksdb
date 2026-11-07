@@ -43,6 +43,17 @@ public sealed class RaftLogTerms
         }
     }
 
+    /// <summary>Removes every range that starts after <paramref name="seq"/>; returns true if the map changed.</summary>
+    public bool TruncateAfter(ulong seq)
+    {
+        lock (_gate)
+        {
+            int n = _ranges.Count;
+            while (_ranges.Count > 0 && _ranges[^1].StartSeq > seq) _ranges.RemoveAt(_ranges.Count - 1);
+            return _ranges.Count != n;
+        }
+    }
+
     /// <summary>The term of the WAL entry at <paramref name="seq"/>; 0 if nothing is recorded at or before it.</summary>
     public long GetTermForSeq(ulong seq)
     {

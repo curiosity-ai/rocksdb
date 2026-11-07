@@ -61,6 +61,19 @@ public sealed class InMemoryNetwork
         }
     }
 
+    /// <summary>
+    /// Cuts only the directed link <paramref name="from"/> -> <paramref name="to"/>: calls made by <paramref name="from"/>
+    /// fail (and its streams from <paramref name="to"/> break), calls the other way still work.
+    /// </summary>
+    public void CutLink(string from, string to)
+    {
+        lock (_linkLock)
+        {
+            _cut[(from, to)] = true;
+            if (_links.TryRemove((from, to), out CancellationTokenSource? l)) l.Cancel();
+        }
+    }
+
     /// <summary>Partitions <paramref name="node"/> from every node in <paramref name="others"/>.</summary>
     public void Isolate(string node, IEnumerable<string> others)
     {

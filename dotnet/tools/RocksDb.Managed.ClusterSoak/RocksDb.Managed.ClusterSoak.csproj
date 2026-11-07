@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Long-running Jepsen-style soak test of the Raft cluster mode (RocksDb.Managed.Replication): a supervisor (control
+    node) runs N ClusterNodeHost processes over MagicOnion gRPC, routes every node->node and client->node link through
+    its own TCP proxies, drives a client workload, and injects partitions, kills, pauses, power loss, clock skew and
+    rolling restarts; VERIFY phases heal everything and check the history. See docs/cluster-soak.md.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>RocksDb.Managed.ClusterSoak</AssemblyName>
+    <RootNamespace>RocksDb.Managed.ClusterSoak</RootNamespace>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RocksDb.Managed\RocksDb.Managed.csproj" />
+    <ProjectReference Include="..\..\src\RocksDb.Managed.Replication\RocksDb.Managed.Replication.csproj" />
+    <ProjectReference Include="..\..\src\RocksDb.Managed.Replication.MagicOnion\RocksDb.Managed.Replication.MagicOnion.csproj" />
+    <PackageReference Include="RocksDB" />
+    <PackageReference Include="System.IO.Hashing" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The single-node soak's in-process LazyFS equivalent (power loss on a node). -->
+    <Compile Include="..\RocksDb.Managed.Soak\FaultFs.cs" Link="FaultFs.cs" />
+    <!-- librocksdb under a .NET 11 apphost: see the file's remarks. -->
+    <Compile Include="..\..\tests\Shared\NativeStdCxxPreload.cs" Link="NativeStdCxxPreload.cs" />
+  </ItemGroup>
+</Project>
