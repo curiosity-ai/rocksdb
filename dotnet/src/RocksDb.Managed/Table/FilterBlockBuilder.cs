@@ -242,7 +242,7 @@ internal sealed class PartitionedFilterBlockBuilder : FilterBlockBuilder
         _totalAddedInBuilt += (ulong)_bits.EstimatedEntries;
         _scratch.Clear();
         _bits.Finish(_scratch);
-        byte[] filter = ArrayPool<byte>.Shared.Rent(Math.Max(1, _scratch.WrittenCount));
+        byte[] filter = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, _scratch.WrittenCount));
         _scratch.WrittenSpan.CopyTo(filter);
         byte[] ikey;
         if (_decoupleFromIndexPartitions)
@@ -354,7 +354,7 @@ internal sealed class PartitionedFilterBlockBuilder : FilterBlockBuilder
     {
         if (_returnedFilter is not null)
         {
-            ArrayPool<byte>.Shared.Return(_returnedFilter);
+            RocksArrayPool<byte>.Shared.Return(_returnedFilter);
             _returnedFilter = null;
         }
     }
@@ -363,7 +363,7 @@ internal sealed class PartitionedFilterBlockBuilder : FilterBlockBuilder
     {
         while (_filters.TryDequeue(out FilterEntry e))
         {
-            if (!ReferenceEquals(e.Filter, _returnedFilter)) ArrayPool<byte>.Shared.Return(e.Filter);
+            if (!ReferenceEquals(e.Filter, _returnedFilter)) RocksArrayPool<byte>.Shared.Return(e.Filter);
         }
         ReturnFilterBuffer();
         _bits.Dispose();

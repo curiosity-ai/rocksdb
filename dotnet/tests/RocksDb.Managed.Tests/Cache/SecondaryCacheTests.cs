@@ -32,7 +32,7 @@ public sealed class SecondaryCacheTests
 
     private static CacheValue Value(byte[] payload)
     {
-        byte[] buf = ArrayPool<byte>.Shared.Rent(payload.Length);
+        byte[] buf = RocksArrayPool<byte>.Shared.Rent(payload.Length);
         payload.CopyTo(buf, 0);
         return CacheValue.FromPooledBuffer(buf, payload.Length).WithHelper(s_helper);
     }
@@ -108,7 +108,7 @@ public sealed class SecondaryCacheTests
         });
         var filterHelper = new BytesCacheItemHelper(CacheEntryRole.FilterBlock);
         byte[] p = Payload(4, 4000);
-        byte[] buf = ArrayPool<byte>.Shared.Rent(p.Length);
+        byte[] buf = RocksArrayPool<byte>.Shared.Rent(p.Length);
         p.CopyTo(buf, 0);
         sec.Insert(KeyBytes(4), CacheValue.FromPooledBuffer(buf, p.Length).WithHelper(filterHelper), filterHelper, forceInsert: true);
         // Filter blocks are stored uncompressed: tag (2 bytes) + data.

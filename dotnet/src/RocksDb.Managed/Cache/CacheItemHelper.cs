@@ -113,7 +113,7 @@ public sealed class BytesCacheItemHelper : CacheItemHelper
             try
             {
                 BlockCompression.Decompress(type, data, 2, w);
-                byte[] copy = System.Buffers.ArrayPool<byte>.Shared.Rent(Math.Max(1, w.WrittenCount));
+                byte[] copy = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, w.WrittenCount));
                 w.WrittenSpan.CopyTo(copy);
                 value = CacheValue.FromPooledBuffer(copy, w.WrittenCount).WithHelper(this);
                 charge = w.WrittenCount;
@@ -124,7 +124,7 @@ public sealed class BytesCacheItemHelper : CacheItemHelper
                 w.Dispose();
             }
         }
-        byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(Math.Max(1, data.Length));
+        byte[] buf = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, data.Length));
         data.CopyTo(buf);
         value = CacheValue.FromPooledBuffer(buf, data.Length).WithHelper(this);
         charge = data.Length;

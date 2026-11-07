@@ -141,7 +141,7 @@ public struct MemTablePostProcessInfo
 public sealed class MergeContext : IDisposable
 {
     private readonly PooledBufferWriter _data = new(256);
-    private int[] _ends = ArrayPool<int>.Shared.Rent(8);
+    private int[] _ends = RocksArrayPool<int>.Shared.Rent(8);
     private int _count;
 
     /// <summary>Number of operands collected.</summary>
@@ -158,9 +158,9 @@ public sealed class MergeContext : IDisposable
     {
         if (_count == _ends.Length)
         {
-            int[] n = ArrayPool<int>.Shared.Rent(_count * 2);
+            int[] n = RocksArrayPool<int>.Shared.Rent(_count * 2);
             _ends.AsSpan(0, _count).CopyTo(n);
-            ArrayPool<int>.Shared.Return(_ends);
+            RocksArrayPool<int>.Shared.Return(_ends);
             _ends = n;
         }
         _data.Write(operand);
@@ -192,7 +192,7 @@ public sealed class MergeContext : IDisposable
         int[] e = _ends;
         _ends = [];
         _count = 0;
-        if (e.Length > 0) ArrayPool<int>.Shared.Return(e);
+        if (e.Length > 0) RocksArrayPool<int>.Shared.Return(e);
     }
 }
 

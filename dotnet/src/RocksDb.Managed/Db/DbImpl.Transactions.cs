@@ -305,7 +305,7 @@ internal sealed partial class DbImpl
         public readonly SuperVersion Sv;
         /// <summary>
         /// History memtables, newest first (referenced), in the first <see cref="HistoryCount"/> slots of an array rented
-        /// from <see cref="System.Buffers.ArrayPool{T}.Shared"/> (returned by <see cref="Dispose"/>); null if none.
+        /// from <see cref="RocksArrayPool{T}.Shared"/> (returned by <see cref="Dispose"/>); null if none.
         /// </summary>
         public readonly MemTable[]? History;
         public readonly int HistoryCount;
@@ -335,7 +335,7 @@ internal sealed partial class DbImpl
                         if (m.Unref()) m.Dispose();
                     }
                 }
-                System.Buffers.ArrayPool<MemTable>.Shared.Return(history, clearArray: true);
+                RocksArrayPool<MemTable>.Shared.Return(history, clearArray: true);
             }
             _db.ReturnSuperVersion(Sv);
         }
@@ -353,7 +353,7 @@ internal sealed partial class DbImpl
             if (n > 0)
             {
                 // Rented, not allocated: an optimistic commit takes a view per column family.
-                history = System.Buffers.ArrayPool<MemTable>.Shared.Rent(n);
+                history = RocksArrayPool<MemTable>.Shared.Rent(n);
                 for (int i = 0; i < n; i++)
                 {
                     MemTable m = cfd.History[n - 1 - i];

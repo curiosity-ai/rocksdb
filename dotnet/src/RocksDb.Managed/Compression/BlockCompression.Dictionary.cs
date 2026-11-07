@@ -79,7 +79,7 @@ public static unsafe partial class BlockCompression
         if (dict.Length > 64 * 1024) dict = dict[^(64 * 1024)..];
         Span<byte> dst = output.GetSpan(maxSize)[..maxSize];
         int header = Coding.EncodeVarint32(dst, (uint)raw.Length);
-        byte[] scratch = ArrayPool<byte>.Shared.Rent(LZ4Codec.MaximumOutputSize(dict.Length));
+        byte[] scratch = RocksArrayPool<byte>.Shared.Rent(LZ4Codec.MaximumOutputSize(dict.Length));
         int outLen;
         try
         {
@@ -95,7 +95,7 @@ public static unsafe partial class BlockCompression
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(scratch);
+            RocksArrayPool<byte>.Shared.Return(scratch);
         }
         if (outLen <= 0) return false;
         output.Advance(header + outLen);
@@ -175,8 +175,8 @@ public static unsafe partial class BlockCompression
         const int window = 1 << 15; // inflate accepts distances up to its 32 KiB window
         if (dict.Length > window) dict = dict[^window..];
         int prefixLen = 5 + dict.Length;
-        byte[] input = ArrayPool<byte>.Shared.Rent(prefixLen + payload.Length);
-        byte[] output = ArrayPool<byte>.Shared.Rent(dict.Length + dst.Length + 1);
+        byte[] input = RocksArrayPool<byte>.Shared.Rent(prefixLen + payload.Length);
+        byte[] output = RocksArrayPool<byte>.Shared.Rent(dict.Length + dst.Length + 1);
         try
         {
             // Stored block header: BFINAL=0, BTYPE=00, then LEN / NLEN (little endian) on the next byte boundary.
@@ -206,8 +206,8 @@ public static unsafe partial class BlockCompression
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(input);
-            ArrayPool<byte>.Shared.Return(output);
+            RocksArrayPool<byte>.Shared.Return(input);
+            RocksArrayPool<byte>.Shared.Return(output);
         }
     }
 

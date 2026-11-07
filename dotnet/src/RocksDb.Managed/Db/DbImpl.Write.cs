@@ -1767,7 +1767,7 @@ internal sealed partial class DbImpl
                 return;
             }
             // PackValueAndWriteTime: value | fixed64(write_unix_time), stored as kTypeValuePreferredSeqno.
-            byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(value.Length + 8);
+            byte[] buf = RocksArrayPool<byte>.Shared.Rent(value.Length + 8);
             try
             {
                 value.CopyTo(buf);
@@ -1776,7 +1776,7 @@ internal sealed partial class DbImpl
             }
             finally
             {
-                System.Buffers.ArrayPool<byte>.Shared.Return(buf);
+                RocksArrayPool<byte>.Shared.Return(buf);
             }
             _rebuilding?.TimedPut(columnFamilyId, key, value, writeUnixTime);
         }

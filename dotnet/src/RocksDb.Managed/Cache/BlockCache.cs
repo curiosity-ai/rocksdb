@@ -25,7 +25,7 @@ public enum CacheMetadataChargePolicy : byte
 /// <summary>
 /// A value handed to the cache. Ownership passes to the cache on successful insertion (and always for
 /// <see cref="BlockCache.Insert"/>); when the entry is freed (evicted/erased and unreferenced) the cache returns
-/// <see cref="Buffer"/> to <see cref="ArrayPool{T}.Shared"/> if <see cref="ReturnBufferToPool"/> is set and disposes
+/// <see cref="Buffer"/> to <see cref="RocksArrayPool{T}.Shared"/> if <see cref="ReturnBufferToPool"/> is set and disposes
 /// <see cref="Object"/> if it implements <see cref="IDisposable"/> (the CacheItemHelper::del_cb equivalent).
 /// <para>
 /// Typical use by the table reader: <c>CacheValue.FromPooledBuffer(rented, blockLength)</c> for raw block bytes, or
@@ -70,7 +70,7 @@ public readonly struct CacheValue
     /// <summary>A placeholder value (no bytes, no object): a memory reservation (CacheReservationManager dummy entry).</summary>
     public bool IsPlaceholder => Buffer is null && Object is null;
 
-    /// <summary>Bytes rented from <see cref="ArrayPool{T}.Shared"/>; returned to the pool when the entry is freed.</summary>
+    /// <summary>Bytes rented from <see cref="RocksArrayPool{T}.Shared"/>; returned to the pool when the entry is freed.</summary>
     public static CacheValue FromPooledBuffer(byte[] buffer, int length) => new(buffer, length, null, true);
 
     /// <summary>Bytes the cache must not return to any pool.</summary>
@@ -82,7 +82,7 @@ public readonly struct CacheValue
     /// <summary>Frees a value the cache took ownership of but did not retain.</summary>
     internal void FreeForCache()
     {
-        if (ReturnBufferToPool && Buffer is not null) ArrayPool<byte>.Shared.Return(Buffer);
+        if (ReturnBufferToPool && Buffer is not null) RocksArrayPool<byte>.Shared.Return(Buffer);
         (Object as IDisposable)?.Dispose();
     }
 }
@@ -127,7 +127,7 @@ internal abstract class CacheEntry
         Length = 0;
         ReturnBufferToPool = false;
         Helper = null;
-        if (toPool && buffer is not null) ArrayPool<byte>.Shared.Return(buffer);
+        if (toPool && buffer is not null) RocksArrayPool<byte>.Shared.Return(buffer);
         (obj as IDisposable)?.Dispose();
     }
 

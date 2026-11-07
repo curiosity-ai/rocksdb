@@ -137,7 +137,7 @@ internal static class FileChecksumHelper
                 + requestedFuncName + " from checksum factory: " + factory.Name);
         }
         const int ChunkSize = 256 << 10;
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(ChunkSize);
+        byte[] buffer = RocksArrayPool<byte>.Shared.Rent(ChunkSize);
         try
         {
             IRandomAccessFile raw = fs.OpenRandomAccess(path);
@@ -155,7 +155,7 @@ internal static class FileChecksumHelper
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            RocksArrayPool<byte>.Shared.Return(buffer);
         }
         gen!.Finish();
         return (gen.GetChecksum(), gen.Name);

@@ -195,8 +195,8 @@ public sealed partial class BlockBasedTableBuilder
                 if (_raw.Length < raw.Length)
                 {
                     byte[] old = _raw;
-                    _raw = System.Buffers.ArrayPool<byte>.Shared.Rent(Math.Max(raw.Length, 4096));
-                    if (old.Length > 0) System.Buffers.ArrayPool<byte>.Shared.Return(old);
+                    _raw = RocksArrayPool<byte>.Shared.Rent(Math.Max(raw.Length, 4096));
+                    if (old.Length > 0) RocksArrayPool<byte>.Shared.Return(old);
                 }
                 raw.CopyTo(_raw);
                 _rawLength = raw.Length;

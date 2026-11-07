@@ -151,10 +151,10 @@ internal sealed class SstFileDumper : IDisposable
             foreach (BlockHandle h in reader.MetaBlocks.Values)
             {
                 byte[] buf = BlockFetcher.ReadRawPayload(file, reader.Footer, h, verifyChecksums: true, out _);
-                System.Buffers.ArrayPool<byte>.Shared.Return(buf);
+                RocksArrayPool<byte>.Shared.Return(buf);
             }
             byte[] ib = BlockFetcher.ReadRawPayload(file, reader.Footer, reader.IndexHandle, verifyChecksums: true, out _);
-            System.Buffers.ArrayPool<byte>.Shared.Return(ib);
+            RocksArrayPool<byte>.Shared.Return(ib);
             return null;
         }
         catch (RocksDbException e)

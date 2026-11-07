@@ -21,7 +21,7 @@ The parent `../CLAUDE.md` applies to the C++ code. For work under `dotnet/`, thi
      full filters (FastLocalBloom, legacy Bloom, Ribbon)
    - File naming (`file/filename.cc`)
 2. **Allocation-free hot paths.** Reads, writes, iteration and compaction must not allocate per
-   operation in steady state. Use `Span<T>`/`ReadOnlySpan<T>`, `ArrayPool<byte>`,
+   operation in steady state. Use `Span<T>`/`ReadOnlySpan<T>`, `RocksArrayPool<byte>` (never `ArrayPool<T>.Shared`, see below),
    `PooledBufferWriter`, pooled objects, `ref struct` enumerators, `stackalloc` for small
    scratch, and `PoolingAsyncValueTaskMethodBuilder` for async methods on hot paths.
    Verify with BenchmarkDotNet `[MemoryDiagnoser]` — "Allocated" should be `-` for hot paths.
@@ -141,6 +141,14 @@ compat tests pass.
 - **Naming**: the DB class is `RocksDatabase` (a class named `RocksDb` breaks `RocksDb.Managed.*` qualified names); C++ `Version` is `DbVersion`; C++ `ValueType` is `Db.EntryType` (avoids clashing with `System.ValueType`). Public user-facing options live in `Options/` (`RocksDb.Managed.*Options`); runtime/resolved settings used internally by a subsystem get distinct names (e.g. `Table.TableFormatOptions`). Enums are defined once.
 - **No stringy enums**: closed sets of values are C# enums (or typed objects for extensible identities like filter policies, comparators, merge operators). Strings appear only at boundaries (OPTIONS file text, CLI flags, text protocols) and are parsed into enums immediately; the enum ↔ native string mapping must stay byte-identical.
 - **Encoding helpers**: use `Util.Coding` (varints/fixed LE) and `Util.Crc32C` — don't re-implement.
+- **Array pooling: never `ArrayPool<T>.Shared`.** Rent and return pooled arrays with `RocksArrayPool<T>.Shared`
+  (`src/RocksDb.Managed/RocksArrayPool.cs`, a private copy of the runtime's shared-pool implementation with the same
+  performance). The process-wide `ArrayPool<T>.Shared` is shared with every other library in the process; a double
+  return or use-after-return there could hand our block, key, WAL or cache buffers to someone else and corrupt data.
+  This applies to `src/`, `tools/` and `bench/` (and to tests that exchange buffers with the engine); public contracts
+  that pass buffers across the API (`CacheValue.ReturnBufferToPool`, `PersistentCache.TryLookup`) name
+  `RocksArrayPool<byte>.Shared`. Dedicated pools from `ArrayPool<T>.Create(...)` remain fine where documented.
+  `RocksArrayPoolTests.SourcesDoNotUseArrayPoolShared` fails the unit suite on any new use.
 - **No LINQ, no closures, no boxing, no `params` arrays, no string formatting** on hot paths.
   Prefer `sealed` classes, `readonly struct`, `static` lambdas, `[SkipLocalsInit]` where it helps.
 - **Unsafe code** is allowed where it measurably helps (pinning, `Unsafe.ReadUnaligned`), but

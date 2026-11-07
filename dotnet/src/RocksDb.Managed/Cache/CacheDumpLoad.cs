@@ -353,7 +353,7 @@ internal sealed class CacheDumperImpl : CacheDumper
         }
         finally
         {
-            if (_buf.Length > 0) ArrayPool<byte>.Shared.Return(_buf);
+            if (_buf.Length > 0) RocksArrayPool<byte>.Shared.Return(_buf);
             _buf = [];
         }
     }
@@ -382,8 +382,8 @@ internal sealed class CacheDumperImpl : CacheDumper
         int len = helper.GetSaveSize(value);
         if (_buf.Length < len)
         {
-            if (_buf.Length > 0) ArrayPool<byte>.Shared.Return(_buf);
-            _buf = ArrayPool<byte>.Shared.Rent(Math.Max(len, 4096));
+            if (_buf.Length > 0) RocksArrayPool<byte>.Shared.Return(_buf);
+            _buf = RocksArrayPool<byte>.Shared.Rent(Math.Max(len, 4096));
         }
         helper.SaveTo(value, _buf.AsSpan(0, len));
         Span<byte> k = stackalloc byte[CacheKey.Size];

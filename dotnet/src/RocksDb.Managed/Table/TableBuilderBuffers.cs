@@ -8,9 +8,9 @@ internal enum BlockBufferSource : byte
 {
     /// <summary>Not rented: left to the GC.</summary>
     NotRented,
-    /// <summary><see cref="Memory.BlockBufferPool"/>, or <see cref="ArrayPool{T}.Shared"/> for its power-of-two sizes (routed by length).</summary>
+    /// <summary><see cref="Memory.BlockBufferPool"/>, or <see cref="RocksArrayPool{T}.Shared"/> for its power-of-two sizes (routed by length).</summary>
     BlockBufferPool,
-    /// <summary><see cref="ArrayPool{T}.Shared"/> (raw payloads handed to code that returns them there, e.g. cached filters).</summary>
+    /// <summary><see cref="RocksArrayPool{T}.Shared"/> (raw payloads handed to code that returns them there, e.g. cached filters).</summary>
     Shared,
     /// <summary><see cref="TableBuilderBuffers.Pinned"/> (blocks a table reader pins for its lifetime).</summary>
     TableBuffers,
@@ -22,7 +22,7 @@ internal enum BlockBufferSource : byte
 /// <para>
 /// Builders: the growable block contents and restart arrays, the compressed-block buffer, the full filter and the output
 /// staging buffer. The index block, its restart array and the filter of a 64 MiB flush grow to 100 KiB - 1 MiB.
-/// <see cref="ArrayPool{T}.Shared"/> keeps a returned array in the returning thread's local slot first, and flushes /
+/// <see cref="RocksArrayPool{T}.Shared"/> keeps a returned array in the returning thread's local slot first, and flushes /
 /// compactions run on whichever thread-pool or background thread is free, so the next builder often did not find them
 /// and allocated them again (100 - 300 KB per flush).
 /// </para>
@@ -51,7 +51,7 @@ internal static class TableBuilderBuffers
     public static byte[] Rent(BlockBufferSource source, int minimumLength) => source switch
     {
         BlockBufferSource.TableBuffers => Pinned.Rent(minimumLength),
-        BlockBufferSource.Shared => ArrayPool<byte>.Shared.Rent(minimumLength),
+        BlockBufferSource.Shared => RocksArrayPool<byte>.Shared.Rent(minimumLength),
         BlockBufferSource.BlockBufferPool => BlockBufferPool.Rent(minimumLength),
         _ => GC.AllocateUninitializedArray<byte>(minimumLength),
     };
@@ -65,7 +65,7 @@ internal static class TableBuilderBuffers
                 Pinned.Return(array);
                 break;
             case BlockBufferSource.Shared:
-                ArrayPool<byte>.Shared.Return(array);
+                RocksArrayPool<byte>.Shared.Return(array);
                 break;
             case BlockBufferSource.BlockBufferPool:
                 BlockBufferPool.Return(array);

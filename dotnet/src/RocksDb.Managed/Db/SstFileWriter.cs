@@ -170,7 +170,7 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
             // Rep::AddImpl (strip_timestamp): in this mode, users always provide a min timestamp.
             ThrowHelper.InvalidArgument("persist_user_defined_timestamps flag is set to false, only minimum timestamp is accepted.");
         }
-        byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(key.Length + timestamp.Length);
+        byte[] rented = RocksArrayPool<byte>.Shared.Rent(key.Length + timestamp.Length);
         try
         {
             key.CopyTo(rented);
@@ -179,7 +179,7 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
         }
         finally
         {
-            System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+            RocksArrayPool<byte>.Shared.Return(rented);
         }
     }
 

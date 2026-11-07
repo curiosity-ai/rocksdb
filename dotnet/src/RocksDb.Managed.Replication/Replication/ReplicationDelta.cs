@@ -76,7 +76,7 @@ public static class ReplicationDelta
         BinaryPrimitives.WriteInt64LittleEndian(header, length);
         sha.AppendData(header);
         long offset = Math.Max(0, length - tailBytes);
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        byte[] buffer = RocksArrayPool<byte>.Shared.Rent(64 * 1024);
         try
         {
             while (offset < length)
@@ -89,7 +89,7 @@ public static class ReplicationDelta
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            RocksArrayPool<byte>.Shared.Return(buffer);
         }
         return Convert.ToHexString(sha.GetHashAndReset());
     }

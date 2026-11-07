@@ -263,8 +263,12 @@ verified with `[MemoryDiagnoser]` and the benchmark runner's allocated-bytes-per
   original lookup call (one extra field test on the hit path). Entries carry their helper, so primary evictions can be
   saved to the secondary tier; promoted entries are standalone handles or regular entries, with "dummy" entries
   recording recent secondary hits as upstream.
+- **Array pool**: pooled arrays come from `RocksArrayPool<T>.Shared`, a private copy of the runtime's shared-pool
+  implementation (per-thread slot, per-core stacks, trimming after gen 2 GCs), never from `ArrayPool<T>.Shared`, so a
+  misuse of the process-wide pool by other code cannot reach engine buffers. Public contracts that hand buffers across
+  the API (`CacheValue.ReturnBufferToPool`, `PersistentCache.TryLookup`) use it too.
 - **Block buffers**: blocks in the block cache are rented from `BlockBufferPool`, which has finer size classes than
-  `ArrayPool<byte>.Shared` (at most 25% padding instead of up to 100%), and are returned when evicted. `CachedBlock`
+  the power-of-two array pool (at most 25% padding instead of up to 100%), and are returned when evicted. `CachedBlock`
   handles are reference counted. Iterators pin the blocks they point into, which is why `Key`/`Value` spans are valid
   until the iterator moves.
 - **Table buffers**: the large buffers of table builders (block contents, restart arrays, the full filter, the

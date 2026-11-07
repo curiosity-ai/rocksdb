@@ -169,7 +169,7 @@ internal sealed partial class VersionStorageInfo
                 result[l] = current;
                 continue;
             }
-            FileMetaData[] scratch = System.Buffers.ArrayPool<FileMetaData>.Shared.Rent(Math.Max(1, current.Length + changes[l]));
+            FileMetaData[] scratch = RocksArrayPool<FileMetaData>.Shared.Rent(Math.Max(1, current.Length + changes[l]));
             int n = current.Length;
             current.CopyTo(scratch, 0);
             if (changes[l] != 0)
@@ -191,7 +191,7 @@ internal sealed partial class VersionStorageInfo
             if (l == 0) files.Sort(s_newestFirst);
             else files.Sort(bySmallest ??= new FileSmallestKeyComparer(Icmp));
             result[l] = n == 0 ? s_empty : files.ToArray();
-            System.Buffers.ArrayPool<FileMetaData>.Shared.Return(scratch, clearArray: true);
+            RocksArrayPool<FileMetaData>.Shared.Return(scratch, clearArray: true);
         }
         return result;
     }

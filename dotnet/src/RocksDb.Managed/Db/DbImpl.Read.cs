@@ -422,7 +422,7 @@ internal sealed partial class DbImpl
         Cache.RowCache rc = tc.RowCache!;
         int max = userKey.Length + TableCache.RowCacheKeyPrefixMax;
         byte[]? rented = null;
-        Span<byte> buf = max <= 256 ? stackalloc byte[256] : (rented = System.Buffers.ArrayPool<byte>.Shared.Rent(max));
+        Span<byte> buf = max <= 256 ? stackalloc byte[256] : (rented = RocksArrayPool<byte>.Shared.Rent(max));
         try
         {
             int n = tc.RowCacheKey(buf, f, userKey, snapshot, out ulong replaySeq);
@@ -458,7 +458,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+            if (rented is not null) RocksArrayPool<byte>.Shared.Return(rented);
         }
     }
 
@@ -469,7 +469,7 @@ internal sealed partial class DbImpl
     {
         TableCache tc = cfd.TableCache;
         Cache.RowCache rc = tc.RowCache!;
-        byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(userKey.Length + TableCache.RowCacheKeyPrefixMax);
+        byte[] buf = RocksArrayPool<byte>.Shared.Rent(userKey.Length + TableCache.RowCacheKeyPrefixMax);
         PooledBufferWriter? w = null;
         try
         {
@@ -498,7 +498,7 @@ internal sealed partial class DbImpl
         finally
         {
             if (w is not null) ObjectPools.ReturnWriter(w);
-            System.Buffers.ArrayPool<byte>.Shared.Return(buf);
+            RocksArrayPool<byte>.Shared.Return(buf);
         }
     }
 

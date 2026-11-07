@@ -2,7 +2,7 @@ namespace RocksDb.Managed.Cache;
 
 /// <summary>
 /// Result of <see cref="PersistentCache.LookupAsync"/>: when <see cref="Found"/>, <see cref="Data"/>[0..<see cref="Length"/>)
-/// holds a copy rented from <see cref="System.Buffers.ArrayPool{T}.Shared"/> that the caller returns.
+/// holds a copy rented from <see cref="RocksArrayPool{T}.Shared"/> that the caller returns.
 /// </summary>
 public readonly record struct PersistentCacheLookupResult(bool Found, byte[] Data, int Length);
 
@@ -26,7 +26,7 @@ public abstract class PersistentCache
 
     /// <summary>
     /// Looks a page up (Lookup). On success <paramref name="data"/>[0..<paramref name="length"/>) holds a copy rented from
-    /// <see cref="System.Buffers.ArrayPool{T}.Shared"/>; the caller returns it.
+    /// <see cref="RocksArrayPool{T}.Shared"/>; the caller returns it.
     /// </summary>
     public abstract bool TryLookup(ReadOnlySpan<byte> key, out byte[] data, out int length);
 

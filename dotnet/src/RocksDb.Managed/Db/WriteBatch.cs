@@ -556,7 +556,7 @@ public sealed partial class WriteBatch : IDisposable
     /// </summary>
     public WriteBatch PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns)
     {
-        WideColumn[] sorted = System.Buffers.ArrayPool<WideColumn>.Shared.Rent(Math.Max(1, columns.Length));
+        WideColumn[] sorted = RocksArrayPool<WideColumn>.Shared.Rent(Math.Max(1, columns.Length));
         PooledBufferWriter entity = ObjectPools.RentWriter();
         try
         {
@@ -569,7 +569,7 @@ public sealed partial class WriteBatch : IDisposable
         finally
         {
             ObjectPools.ReturnWriter(entity);
-            System.Buffers.ArrayPool<WideColumn>.Shared.Return(sorted, clearArray: true);
+            RocksArrayPool<WideColumn>.Shared.Return(sorted, clearArray: true);
         }
     }
 

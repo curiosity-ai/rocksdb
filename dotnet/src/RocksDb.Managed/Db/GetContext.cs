@@ -210,7 +210,7 @@ internal sealed class GetContext
     {
         int n = userKey.Length + DbFormat.InternalKeyFooterSize;
         byte[]? rented = null;
-        Span<byte> ikey = n <= 256 ? stackalloc byte[256] : (rented = System.Buffers.ArrayPool<byte>.Shared.Rent(n));
+        Span<byte> ikey = n <= 256 ? stackalloc byte[256] : (rented = RocksArrayPool<byte>.Shared.Rent(n));
         try
         {
             userKey.CopyTo(ikey);
@@ -225,7 +225,7 @@ internal sealed class GetContext
         }
         finally
         {
-            if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+            if (rented is not null) RocksArrayPool<byte>.Shared.Return(rented);
         }
     }
 

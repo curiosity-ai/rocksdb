@@ -76,7 +76,7 @@ public sealed partial class BlockBasedTableReader
             else
             {
                 len = data.Length;
-                buf = ArrayPool<byte>.Shared.Rent(Math.Max(1, len));
+                buf = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, len));
                 data.CopyTo(buf);
             }
             Filters.IFilterBitsReader filter;
@@ -86,7 +86,7 @@ public sealed partial class BlockBasedTableReader
             }
             catch
             {
-                ArrayPool<byte>.Shared.Return(buf);
+                RocksArrayPool<byte>.Shared.Return(buf);
                 throw;
             }
             value = new CacheValue(buf, len, filter, true).WithHelper(this);
@@ -187,7 +187,7 @@ public sealed partial class BlockBasedTableReader
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<Block> ReadBlockThroughPersistentCacheAsync(PersistentCache pc, BlockHandle handle, BlockKind kind, CancellationToken ct)
     {
-        byte[] key = ArrayPool<byte>.Shared.Rent(CacheKey.Size);
+        byte[] key = RocksArrayPool<byte>.Shared.Rent(CacheKey.Size);
         try
         {
             _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset).WriteTo(key);
@@ -209,11 +209,11 @@ public sealed partial class BlockBasedTableReader
                     }
                     finally
                     {
-                        ArrayPool<byte>.Shared.Return(hit.Data);
+                        RocksArrayPool<byte>.Shared.Return(hit.Data);
                     }
                 }
                 stats?.RecordTick(Ticker.PersistentCacheMiss);
-                byte[] raw = ArrayPool<byte>.Shared.Rent(serializedSize);
+                byte[] raw = RocksArrayPool<byte>.Shared.Rent(serializedSize);
                 try
                 {
                     int read = 0;
@@ -231,7 +231,7 @@ public sealed partial class BlockBasedTableReader
                 }
                 finally
                 {
-                    ArrayPool<byte>.Shared.Return(raw);
+                    RocksArrayPool<byte>.Shared.Return(raw);
                 }
             }
             if (hit.Found)
@@ -245,7 +245,7 @@ public sealed partial class BlockBasedTableReader
                 }
                 finally
                 {
-                    ArrayPool<byte>.Shared.Return(hit.Data);
+                    RocksArrayPool<byte>.Shared.Return(hit.Data);
                 }
             }
             stats?.RecordTick(Ticker.PersistentCacheMiss);
@@ -255,7 +255,7 @@ public sealed partial class BlockBasedTableReader
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(key);
+            RocksArrayPool<byte>.Shared.Return(key);
         }
     }
 
@@ -280,11 +280,11 @@ public sealed partial class BlockBasedTableReader
                 }
                 finally
                 {
-                    ArrayPool<byte>.Shared.Return(data);
+                    RocksArrayPool<byte>.Shared.Return(data);
                 }
             }
             stats?.RecordTick(Ticker.PersistentCacheMiss);
-            byte[] raw = ArrayPool<byte>.Shared.Rent(serializedSize);
+            byte[] raw = RocksArrayPool<byte>.Shared.Rent(serializedSize);
             try
             {
                 int read = BlockFetcher.ReadFully(_file, (long)handle.Offset, raw.AsSpan(0, serializedSize));
@@ -296,7 +296,7 @@ public sealed partial class BlockBasedTableReader
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(raw);
+                RocksArrayPool<byte>.Shared.Return(raw);
             }
         }
         if (pc.TryLookup(key, out byte[] contents, out int contentLength))
@@ -310,7 +310,7 @@ public sealed partial class BlockBasedTableReader
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(contents);
+                RocksArrayPool<byte>.Shared.Return(contents);
             }
         }
         stats?.RecordTick(Ticker.PersistentCacheMiss);

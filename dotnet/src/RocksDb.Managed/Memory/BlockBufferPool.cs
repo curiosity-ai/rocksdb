@@ -6,14 +6,14 @@ namespace RocksDb.Managed.Memory;
 
 /// <summary>
 /// Pool for block buffers (data/index blocks kept in the block cache) with finer size classes than
-/// <see cref="ArrayPool{T}.Shared"/>. The shared pool rounds every request up to a power of two, so a typical 4 KiB
+/// <see cref="RocksArrayPool{T}.Shared"/>. The shared pool rounds every request up to a power of two, so a typical 4 KiB
 /// data block (4096+ bytes payload plus the 5-byte trailer) occupies an 8 KiB array: half of a block cache's capacity
 /// would be padding. Here requests above 4 KiB use four size classes per power of two (at most 25% padding, usually
 /// much less: a 4101-byte block gets a 5 KiB array), closer to upstream, which charges malloc's usable size.
 /// </summary>
 /// <remarks>
 /// <para>Power-of-two sizes (including everything up to 4 KiB and above 1 MiB) are delegated to
-/// <see cref="ArrayPool{T}.Shared"/>, so <see cref="Return"/> accepts any array obtained from either pool and routes
+/// <see cref="RocksArrayPool{T}.Shared"/>, so <see cref="Return"/> accepts any array obtained from either pool and routes
 /// it by length. Arrays whose length is not a class size are dropped (left to the GC).</para>
 /// <para>Each intermediate class keeps a small bounded stack guarded by a spin lock. Renting happens on block cache
 /// misses (which also do I/O), so the lock is never on a cache-hit path.</para>
@@ -68,7 +68,7 @@ internal static class BlockBufferPool
     {
         int size = RoundUp(minimumLength);
         int idx = ClassIndex(size);
-        if (idx < 0) return ArrayPool<byte>.Shared.Rent(minimumLength);
+        if (idx < 0) return RocksArrayPool<byte>.Shared.Rent(minimumLength);
         Bucket b = s_buckets[idx];
         byte[]? array = null;
         Enter(ref b.Lock);
@@ -81,13 +81,13 @@ internal static class BlockBufferPool
         return array ?? GC.AllocateUninitializedArray<byte>(size);
     }
 
-    /// <summary>Returns an array obtained from <see cref="Rent"/> or from <see cref="ArrayPool{T}.Shared"/>.</summary>
+    /// <summary>Returns an array obtained from <see cref="Rent"/> or from <see cref="RocksArrayPool{T}.Shared"/>.</summary>
     public static void Return(byte[] array)
     {
         int idx = ClassIndex(array.Length);
         if (idx < 0)
         {
-            if (BitOperations.IsPow2(array.Length) && array.Length >= 16) ArrayPool<byte>.Shared.Return(array);
+            if (BitOperations.IsPow2(array.Length) && array.Length >= 16) RocksArrayPool<byte>.Shared.Return(array);
             return;
         }
         Bucket b = s_buckets[idx];

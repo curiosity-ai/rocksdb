@@ -37,7 +37,7 @@ internal sealed class CompactionBlobResolver : WideColumnBlobResolver, IDisposab
     /// <summary>Releases the resolved values (end of the FilterV4 call).</summary>
     public void Clear()
     {
-        foreach ((int _, byte[] buf, int _) in _resolved) ArrayPool<byte>.Shared.Return(buf);
+        foreach ((int _, byte[] buf, int _) in _resolved) RocksArrayPool<byte>.Shared.Return(buf);
         _resolved.Clear();
         _userKey.Clear();
         _columns = null;
@@ -76,7 +76,7 @@ internal sealed class CompactionBlobResolver : WideColumnBlobResolver, IDisposab
             throw Track(e);
         }
         int n = _fetch.WrittenCount;
-        byte[] copy = ArrayPool<byte>.Shared.Rent(Math.Max(1, n));
+        byte[] copy = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, n));
         _fetch.WrittenSpan.CopyTo(copy);
         _resolved.Add((columnIndex, copy, n));
         return copy.AsSpan(0, n);

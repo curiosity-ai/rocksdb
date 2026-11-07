@@ -58,7 +58,7 @@ public sealed partial class BlockBasedTableReader
         ReadDeadline.CheckBeforeIo();
         int payloadSize = (int)index.Size;
         int n = (int)recordSize;
-        byte[] buf = ArrayPool<byte>.Shared.Rent(n);
+        byte[] buf = RocksArrayPool<byte>.Shared.Rent(n);
         try
         {
             Span<byte> record = buf.AsSpan(0, n);
@@ -86,7 +86,7 @@ public sealed partial class BlockBasedTableReader
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buf);
+            RocksArrayPool<byte>.Shared.Return(buf);
         }
     }
 
@@ -109,7 +109,7 @@ public sealed partial class BlockBasedTableReader
     {
         if (!IsSameFileBlobIndex(blobIndex)) return visitor(ref state, internalKey, blobIndex);
         PooledBufferWriter w = ObjectPools.RentWriter();
-        byte[] key = ArrayPool<byte>.Shared.Rent(internalKey.Length);
+        byte[] key = RocksArrayPool<byte>.Shared.Rent(internalKey.Length);
         try
         {
             ResolveEmbeddedEntry(internalKey, blobIndex, key, w, flags);
@@ -117,7 +117,7 @@ public sealed partial class BlockBasedTableReader
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(key);
+            RocksArrayPool<byte>.Shared.Return(key);
             ObjectPools.ReturnWriter(w);
         }
     }
@@ -129,7 +129,7 @@ public sealed partial class BlockBasedTableReader
     {
         if (!IsSameFileBlobIndex(blobIndex)) return batch.Visit(k, internalKey, blobIndex);
         PooledBufferWriter w = ObjectPools.RentWriter();
-        byte[] key = ArrayPool<byte>.Shared.Rent(internalKey.Length);
+        byte[] key = RocksArrayPool<byte>.Shared.Rent(internalKey.Length);
         try
         {
             ResolveEmbeddedEntry(internalKey, blobIndex, key, w, flags);
@@ -137,7 +137,7 @@ public sealed partial class BlockBasedTableReader
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(key);
+            RocksArrayPool<byte>.Shared.Return(key);
             ObjectPools.ReturnWriter(w);
         }
     }

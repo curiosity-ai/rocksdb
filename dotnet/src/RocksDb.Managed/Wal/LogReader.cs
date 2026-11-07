@@ -116,7 +116,7 @@ public sealed class LogReader : IDisposable
         _reporter = reporter;
         _checksum = checksum;
         _logNumber = logNumber;
-        _backingStore = ArrayPool<byte>.Shared.Rent(LogFormat.BlockSize);
+        _backingStore = RocksArrayPool<byte>.Shared.Rent(LogFormat.BlockSize);
         _scratch = new PooledBufferWriter(0);
     }
 
@@ -827,7 +827,7 @@ public sealed class LogReader : IDisposable
     {
         byte[] b = _backingStore;
         _backingStore = [];
-        if (b.Length != 0) ArrayPool<byte>.Shared.Return(b);
+        if (b.Length != 0) RocksArrayPool<byte>.Shared.Return(b);
         _scratch.Dispose();
         _uncompressedRecord?.Dispose();
         _uncompress?.Dispose();

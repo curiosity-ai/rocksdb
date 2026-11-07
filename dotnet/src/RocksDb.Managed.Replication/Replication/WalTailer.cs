@@ -84,7 +84,7 @@ public sealed class WalTailer : IDisposable
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(maxChunkBytes, HeaderSize);
         _db = db;
         _maxChunkBytes = maxChunkBytes;
-        _buffer = ArrayPool<byte>.Shared.Rent(Math.Min(maxChunkBytes, 64 * 1024));
+        _buffer = RocksArrayPool<byte>.Shared.Rent(Math.Min(maxChunkBytes, 64 * 1024));
         _nextSequenceNumber = sequenceNumber;
     }
 
@@ -231,9 +231,9 @@ public sealed class WalTailer : IDisposable
         if (_buffer.Length >= length) return;
         int size = _buffer.Length;
         while (size < length) size *= 2;
-        byte[] bigger = ArrayPool<byte>.Shared.Rent(size);
+        byte[] bigger = RocksArrayPool<byte>.Shared.Rent(size);
         _buffer.AsSpan().CopyTo(bigger);
-        ArrayPool<byte>.Shared.Return(_buffer);
+        RocksArrayPool<byte>.Shared.Return(_buffer);
         _buffer = bigger;
     }
 
@@ -243,7 +243,7 @@ public sealed class WalTailer : IDisposable
         _disposed = true;
         _iterator?.Dispose();
         _iterator = null;
-        ArrayPool<byte>.Shared.Return(_buffer);
+        RocksArrayPool<byte>.Shared.Return(_buffer);
         _buffer = [];
     }
 }

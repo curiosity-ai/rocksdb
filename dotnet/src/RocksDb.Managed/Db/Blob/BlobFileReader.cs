@@ -156,7 +156,7 @@ internal sealed class BlobFileReader : IDisposable
         IBufferWriter<byte> output)
     {
         Prepare(userKey.Length, offset, valueSize, compression, verifyChecksums, out long recordOffset, out int recordSize, out int adjustment);
-        byte[] rented = ArrayPool<byte>.Shared.Rent(recordSize);
+        byte[] rented = RocksArrayPool<byte>.Shared.Rent(recordSize);
         try
         {
             Span<byte> record = rented.AsSpan(0, recordSize);
@@ -167,7 +167,7 @@ internal sealed class BlobFileReader : IDisposable
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(rented);
+            RocksArrayPool<byte>.Shared.Return(rented);
         }
         return (ulong)recordSize;
     }
@@ -195,7 +195,7 @@ internal sealed class BlobFileReader : IDisposable
         IBufferWriter<byte> output, CancellationToken cancellationToken)
     {
         Prepare(userKey.Length, offset, valueSize, compression, verifyChecksums, out long recordOffset, out int recordSize, out int adjustment);
-        byte[] rented = ArrayPool<byte>.Shared.Rent(recordSize);
+        byte[] rented = RocksArrayPool<byte>.Shared.Rent(recordSize);
         try
         {
             _stats?.RecordTick(Ticker.BlobDbBlobFileBytesRead, (ulong)recordSize);
@@ -205,7 +205,7 @@ internal sealed class BlobFileReader : IDisposable
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(rented);
+            RocksArrayPool<byte>.Shared.Return(rented);
         }
         return (ulong)recordSize;
     }

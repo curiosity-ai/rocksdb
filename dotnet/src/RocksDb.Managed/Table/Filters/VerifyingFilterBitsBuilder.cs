@@ -47,7 +47,7 @@ internal sealed class VerifyingFilterBitsBuilder(IFilterBitsBuilder inner, Filte
         _filter.Clear();
         inner.Finish(_filter);
         ReadOnlySpan<byte> contents = _filter.WrittenSpan;
-        byte[] copy = ArrayPool<byte>.Shared.Rent(Math.Max(1, contents.Length));
+        byte[] copy = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, contents.Length));
         try
         {
             contents.CopyTo(copy);
@@ -61,7 +61,7 @@ internal sealed class VerifyingFilterBitsBuilder(IFilterBitsBuilder inner, Filte
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(copy);
+            RocksArrayPool<byte>.Shared.Return(copy);
             _entries.Clear();
         }
         output.Write(contents);

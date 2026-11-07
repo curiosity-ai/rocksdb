@@ -714,7 +714,7 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
 
         Span<byte> index = stackalloc byte[Db.Blob.BlobIndex.MaxEncodedLength];
         int n = Db.Blob.BlobIndex.EncodeBlob(index, Db.Blob.BlobIndex.CurrentFileBlobIndexFileNumber, offset, (ulong)value.Length, compression);
-        byte[] key = ArrayPool<byte>.Shared.Rent(internalKey.Length);
+        byte[] key = RocksArrayPool<byte>.Shared.Rent(internalKey.Length);
         try
         {
             internalKey.CopyTo(key);
@@ -723,7 +723,7 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(key);
+            RocksArrayPool<byte>.Shared.Return(key);
         }
     }
 

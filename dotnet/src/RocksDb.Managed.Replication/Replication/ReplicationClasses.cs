@@ -37,7 +37,7 @@ public sealed class ReplicationFile : IDisposable
     public async ValueTask CopyToAsync(IWritableFile destination, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(destination);
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
+        byte[] buffer = RocksArrayPool<byte>.Shared.Rent(256 * 1024);
         try
         {
             long offset = 0;
@@ -51,7 +51,7 @@ public sealed class ReplicationFile : IDisposable
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            RocksArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
@@ -306,7 +306,7 @@ public sealed class ReplicationSession : IDisposable
         ReplicationDeltaPlan plan = ReplicationDelta.Compute(GetManifest(), consumerInventory);
         yield return SnapshotChunk.Plan(SequenceNumber, plan.FilesToReuse);
         int transferred = 0;
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
+        byte[] buffer = RocksArrayPool<byte>.Shared.Rent(chunkSize);
         try
         {
             foreach (string name in OrderForTransfer(plan.FilesToTransfer))
@@ -328,7 +328,7 @@ public sealed class ReplicationSession : IDisposable
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            RocksArrayPool<byte>.Shared.Return(buffer);
         }
         yield return SnapshotChunk.Complete(transferred);
     }

@@ -218,7 +218,7 @@ public static partial class BlockCompression
         {
             return TryCompressZlibChunked(raw, zlevel, maxSize, output);
         }
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(maxSize);
+        byte[] buffer = RocksArrayPool<byte>.Shared.Rent(maxSize);
         try
         {
             int header = Coding.EncodeVarint32(buffer, (uint)raw.Length);
@@ -241,7 +241,7 @@ public static partial class BlockCompression
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            RocksArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
@@ -437,7 +437,7 @@ public static partial class BlockCompression
 
     private static void DecompressZlib(ReadOnlySpan<byte> payload, Span<byte> dst)
     {
-        byte[] input = ArrayPool<byte>.Shared.Rent(Math.Max(payload.Length, 1));
+        byte[] input = RocksArrayPool<byte>.Shared.Rent(Math.Max(payload.Length, 1));
         try
         {
             payload.CopyTo(input);
@@ -462,7 +462,7 @@ public static partial class BlockCompression
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(input);
+            RocksArrayPool<byte>.Shared.Return(input);
         }
     }
 }

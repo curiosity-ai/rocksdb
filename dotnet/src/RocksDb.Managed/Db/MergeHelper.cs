@@ -28,8 +28,8 @@ public sealed class MergeOperandBuffer : IDisposable
 
     public MergeOperandBuffer(int initialBytes, int initialCount)
     {
-        _data = ArrayPool<byte>.Shared.Rent(Math.Max(16, initialBytes));
-        _bounds = ArrayPool<int>.Shared.Rent(Math.Max(4, initialCount + 1));
+        _data = RocksArrayPool<byte>.Shared.Rent(Math.Max(16, initialBytes));
+        _bounds = RocksArrayPool<int>.Shared.Rent(Math.Max(4, initialCount + 1));
     }
 
     /// <summary>Number of entries.</summary>
@@ -114,8 +114,8 @@ public sealed class MergeOperandBuffer : IDisposable
     {
         if (_data.Length < bytes)
         {
-            ArrayPool<byte>.Shared.Return(_data);
-            _data = ArrayPool<byte>.Shared.Rent(Math.Max(bytes, _data.Length * 2));
+            RocksArrayPool<byte>.Shared.Return(_data);
+            _data = RocksArrayPool<byte>.Shared.Rent(Math.Max(bytes, _data.Length * 2));
         }
     }
 
@@ -126,8 +126,8 @@ public sealed class MergeOperandBuffer : IDisposable
         int dataEnd = _bounds[_bStart + _count];
         int used = dataEnd - dataStart;
         // Re-center in place when there is enough total room (e.g. after the other end was used); grow otherwise.
-        byte[] nd = _data.Length - used >= extraBytes + 16 ? _data : ArrayPool<byte>.Shared.Rent(Math.Max(_data.Length * 2, used + extraBytes + 16));
-        int[] nb = _bounds.Length >= _count + 4 ? _bounds : ArrayPool<int>.Shared.Rent(Math.Max(_bounds.Length * 2, _count + 4));
+        byte[] nd = _data.Length - used >= extraBytes + 16 ? _data : RocksArrayPool<byte>.Shared.Rent(Math.Max(_data.Length * 2, used + extraBytes + 16));
+        int[] nb = _bounds.Length >= _count + 4 ? _bounds : RocksArrayPool<int>.Shared.Rent(Math.Max(_bounds.Length * 2, _count + 4));
         // Leave at least the requested room on the growing side and split the rest, so alternating directions
         // cannot trigger repeated growth.
         int freeData = nd.Length - used;
@@ -144,9 +144,9 @@ public sealed class MergeOperandBuffer : IDisposable
         else
         {
             for (int i = 0; i <= _count; i++) nb[newBStart + i] = _bounds[_bStart + i] + delta;
-            ArrayPool<int>.Shared.Return(_bounds);
+            RocksArrayPool<int>.Shared.Return(_bounds);
         }
-        if (nd != _data) ArrayPool<byte>.Shared.Return(_data);
+        if (nd != _data) RocksArrayPool<byte>.Shared.Return(_data);
         _data = nd;
         _bounds = nb;
         _bStart = newBStart;
@@ -159,8 +159,8 @@ public sealed class MergeOperandBuffer : IDisposable
         int[] b = _bounds;
         _data = [];
         _bounds = [];
-        if (d.Length > 0) ArrayPool<byte>.Shared.Return(d);
-        if (b.Length > 0) ArrayPool<int>.Shared.Return(b);
+        if (d.Length > 0) RocksArrayPool<byte>.Shared.Return(d);
+        if (b.Length > 0) RocksArrayPool<int>.Shared.Return(b);
     }
 }
 

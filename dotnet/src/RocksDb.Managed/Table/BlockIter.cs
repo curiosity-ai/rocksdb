@@ -393,9 +393,9 @@ public sealed class BlockIter : IDisposable
         // Delta-encoded key: keep a copy (the key buffer is overwritten by the next entry).
         if (_prevKeyBuf.Length - _prevKeyBytes < _keyLen)
         {
-            byte[] bigger = ArrayPool<byte>.Shared.Rent(Math.Max(256, (_prevKeyBytes + _keyLen) * 2));
+            byte[] bigger = RocksArrayPool<byte>.Shared.Rent(Math.Max(256, (_prevKeyBytes + _keyLen) * 2));
             _prevKeyBuf.AsSpan(0, _prevKeyBytes).CopyTo(bigger);
-            if (_prevKeyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_prevKeyBuf);
+            if (_prevKeyBuf.Length > 0) RocksArrayPool<byte>.Shared.Return(_prevKeyBuf);
             _prevKeyBuf = bigger;
         }
         _keyBuf.AsSpan(0, _keyLen).CopyTo(_prevKeyBuf.AsSpan(_prevKeyBytes));
@@ -838,9 +838,9 @@ public sealed class BlockIter : IDisposable
         int rawLen = (int)(shared + nonShared);
         if (_rawKeyBuf.Length < rawLen)
         {
-            byte[] n = ArrayPool<byte>.Shared.Rent(Math.Max(rawLen, 64));
+            byte[] n = RocksArrayPool<byte>.Shared.Rent(Math.Max(rawLen, 64));
             _rawKeyBuf.AsSpan(0, _rawKeyLen).CopyTo(n);
-            if (_rawKeyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_rawKeyBuf);
+            if (_rawKeyBuf.Length > 0) RocksArrayPool<byte>.Shared.Return(_rawKeyBuf);
             _rawKeyBuf = n;
         }
         Buffer.BlockCopy(_data, p, _rawKeyBuf, (int)shared, (int)nonShared);
@@ -907,8 +907,8 @@ public sealed class BlockIter : IDisposable
     private static void GrowScratch(ref byte[] buf, int len)
     {
         if (buf.Length >= len) return;
-        if (buf.Length > 0) ArrayPool<byte>.Shared.Return(buf);
-        buf = ArrayPool<byte>.Shared.Rent(Math.Max(len, 64));
+        if (buf.Length > 0) RocksArrayPool<byte>.Shared.Return(buf);
+        buf = RocksArrayPool<byte>.Shared.Rent(Math.Max(len, 64));
     }
 
     /// <summary>Applies a decoded entry header at key-delta offset <paramref name="p"/>.</summary>
@@ -1014,9 +1014,9 @@ public sealed class BlockIter : IDisposable
     private void EnsureKeyCapacity(int len)
     {
         if (_keyBuf.Length >= len) return;
-        byte[] n = ArrayPool<byte>.Shared.Rent(Math.Max(len, 64));
+        byte[] n = RocksArrayPool<byte>.Shared.Rent(Math.Max(len, 64));
         if (_keyInBuf && _keyLen > 0) Buffer.BlockCopy(_keyBuf, 0, n, 0, Math.Min(_keyLen, _keyBuf.Length));
-        if (_keyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_keyBuf);
+        if (_keyBuf.Length > 0) RocksArrayPool<byte>.Shared.Return(_keyBuf);
         _keyBuf = n;
     }
 
@@ -1258,8 +1258,8 @@ public sealed class BlockIter : IDisposable
         int len = _prefixLength + (int)nonShared;
         if (_restartKeyBuf.Length < len)
         {
-            if (_restartKeyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_restartKeyBuf);
-            _restartKeyBuf = ArrayPool<byte>.Shared.Rent(Math.Max(len, 64));
+            if (_restartKeyBuf.Length > 0) RocksArrayPool<byte>.Shared.Return(_restartKeyBuf);
+            _restartKeyBuf = RocksArrayPool<byte>.Shared.Rent(Math.Max(len, 64));
         }
         Buffer.BlockCopy(_data, 0, _restartKeyBuf, 0, _prefixLength);
         Buffer.BlockCopy(_data, p, _restartKeyBuf, _prefixLength, (int)nonShared);
@@ -1287,17 +1287,17 @@ public sealed class BlockIter : IDisposable
     public void Dispose()
     {
         Clear();
-        if (_keyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_keyBuf);
+        if (_keyBuf.Length > 0) RocksArrayPool<byte>.Shared.Return(_keyBuf);
         _keyBuf = [];
-        if (_restartKeyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_restartKeyBuf);
+        if (_restartKeyBuf.Length > 0) RocksArrayPool<byte>.Shared.Return(_restartKeyBuf);
         _restartKeyBuf = [];
-        if (_prevKeyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_prevKeyBuf);
+        if (_prevKeyBuf.Length > 0) RocksArrayPool<byte>.Shared.Return(_prevKeyBuf);
         _prevKeyBuf = [];
-        if (_rawKeyBuf.Length > 0) ArrayPool<byte>.Shared.Return(_rawKeyBuf);
+        if (_rawKeyBuf.Length > 0) RocksArrayPool<byte>.Shared.Return(_rawKeyBuf);
         _rawKeyBuf = [];
-        if (_firstKeyPadBuf.Length > 0) ArrayPool<byte>.Shared.Return(_firstKeyPadBuf);
+        if (_firstKeyPadBuf.Length > 0) RocksArrayPool<byte>.Shared.Return(_firstKeyPadBuf);
         _firstKeyPadBuf = [];
-        if (_restartPadBuf.Length > 0) ArrayPool<byte>.Shared.Return(_restartPadBuf);
+        if (_restartPadBuf.Length > 0) RocksArrayPool<byte>.Shared.Return(_restartPadBuf);
         _restartPadBuf = [];
         _keyLen = 0;
         _keyInBuf = true;
