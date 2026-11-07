@@ -409,6 +409,21 @@ internal sealed class LazyFaultFileSystem : IFileSystem
         finally { Exit(); }
     }
 
+    /// <summary>True when a WAL file with a durable directory entry has at least <paramref name="need"/> unsynced writes.</summary>
+    public bool HasWalTornCandidate(int need)
+    {
+        lock (_meta)
+        {
+            foreach (KeyValuePair<string, Tracked> kv in _durable)
+            {
+                if (DbFiles.KindOf(kv.Key) != DbFileKind.Wal || !_current.TryGetValue(kv.Key, out Tracked? cur) || !ReferenceEquals(cur, kv.Value)) continue;
+                lock (cur.L)
+                    if (cur.Unsynced.Count >= need && cur.Undo.Count == 0) return true;
+            }
+        }
+        return false;
+    }
+
     // ---- the crash ----
 
     /// <summary>
@@ -522,7 +537,19 @@ internal sealed class LazyFaultFileSystem : IFileSystem
                         tornInfo = $" torn-seq on {victimName}: {n} unsynced writes, kept #{string.Join(",#", kept)}";
                     }
                 }
-                else tornInfo = " (no torn candidate: plain clear-cache)";
+                else
+                {
+                    int unsynced = 0, notDurable = 0, recycled = 0;
+                    foreach (KeyValuePair<string, Tracked> kv in _current)
+                    {
+                        if (kv.Value.Unsynced.Count == 0) continue;
+                        unsynced++;
+                        if (!_durable.TryGetValue(kv.Key, out Tracked? d) || !ReferenceEquals(d, kv.Value)) notDurable++;
+                        if (kv.Value.Undo.Count > 0) recycled++;
+                    }
+                    tornInfo = $" (no torn candidate: {unsynced} files with unsynced writes, {notDurable} of them without a durable" +
+                        $" directory entry, {recycled} recycled; plain clear-cache)";
+                }
             }
 
             // 1. Where does each durable entry's data come from?

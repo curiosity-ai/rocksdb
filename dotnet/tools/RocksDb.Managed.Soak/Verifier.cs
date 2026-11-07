@@ -252,6 +252,8 @@ internal sealed class Verifier
     public static StepResult Integrity(RocksDatabase db, string dir, IFileSystem fs)
     {
         var s = new StepResult { Name = "integrity" };
+        // Compactions started by the open would change the file set between the listing and the properties below.
+        db.WaitForCompact();
         try
         {
             db.VerifyFileChecksums();

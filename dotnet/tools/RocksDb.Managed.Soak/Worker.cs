@@ -39,6 +39,9 @@ internal sealed class Worker
     private readonly long[] _invoked;
     private long _errors;
     private int _scratchCount;
+    // Probability of WriteOptions.Sync per write, per 100,000 (chosen per worker: 0, 0.05% or 0.5%). Sync writes
+    // sync the whole WAL, so they must stay rare for the power-loss faults to find unsynced data.
+    private readonly int _syncPer100k;
 
     public Worker(RunPaths paths, int part)
     {
@@ -48,6 +51,7 @@ internal sealed class Worker
         _model = Model.Load(paths.ModelFile);
         _l = _cfg.Layout;
         _seed = Keys.Mix(_plan.CycleSeed ^ (ulong)part * 0x51ED27);
+        _syncPer100k = (int)(_seed % 3) switch { 0 => 0, 1 => 50, _ => 500 };
         _history = new HistoryWriter(paths.History(_plan.Cycle, part), (long)Environment.ProcessId << 32);
         if (_plan.FaultFs)
         {
@@ -62,6 +66,22 @@ internal sealed class Worker
         {
             Cell c = _model.Registers[i];
             _acked[i] = _invoked[i] = Pack(c.Version, !c.Present);
+        }
+        // A later worker of the same cycle (after a crash during recovery) continues the versions of the earlier ones,
+        // and their invoked writes may be in the DB.
+        var earlier = new List<string>();
+        for (int p = 0; p < part; p++) earlier.Add(paths.History(_plan.Cycle, p));
+        foreach (HistoryRecord r in HistoryReader.ReadParts(earlier))
+        {
+            if (r.Phase != Phase.Invoke) continue;
+            if (r.Type is OpType.RegPut or OpType.RegDel && r.Process < _l.Writers)
+            {
+                _model.NextVersion[r.Process] = Math.Max(_model.NextVersion[r.Process], r.V + 1);
+                int idx = r.Process * _l.KeysPerWriter + r.A;
+                if (r.V > VersionOf(_invoked[idx])) _invoked[idx] = Pack(r.V, r.Type == OpType.RegDel);
+            }
+            else if (r.Type is OpType.RdelPut or OpType.RdelRange)
+                _model.RdelNextVersion = Math.Max(_model.RdelNextVersion, r.V + 1);
         }
     }
 
@@ -80,7 +100,7 @@ internal sealed class Worker
 
     public async Task<int> RunAsync()
     {
-        Log($"worker pid {Environment.ProcessId} cycle {_plan.Cycle} fault {_plan.Fault} fs {(_faultFs is null ? "local" : "fault-injecting")} options: {_plan.Options}");
+        Log($"worker pid {Environment.ProcessId} cycle {_plan.Cycle} fault {_plan.Fault} fs {(_faultFs is null ? "local" : "fault-injecting")} sync writes {_syncPer100k / 1000.0:F2}% options: {_plan.Options}");
         // The workload mixes blocking (sync) and async calls on pool threads; enough threads so that blocked callers
         // do not starve the continuations of the async ones (thread injection is slow).
         ThreadPool.SetMinThreads(64, 64);
@@ -180,6 +200,12 @@ internal sealed class Worker
             {
                 CacheFault f = p[1] switch { "tornop" => CacheFault.TornOp, "tornseq" => CacheFault.TornSeq, _ => CacheFault.ClearCache };
                 var rng = new Random(int.Parse(p[2], System.Globalization.CultureInfo.InvariantCulture));
+                if (f != CacheFault.ClearCache)
+                {
+                    // Like choosing LazyFS's "occurrence": wait (up to 3 s) for a WAL with unsynced writes to tear.
+                    var wait = Stopwatch.StartNew();
+                    while (!_faultFs!.HasWalTornCandidate(f == CacheFault.TornSeq ? 3 : 1) && wait.Elapsed < TimeSpan.FromSeconds(3)) Thread.Sleep(1);
+                }
                 _faultFs!.Crash(f, rng, _history.Freeze, ownInflight: 0);
                 break;
             }
@@ -259,7 +285,7 @@ internal sealed class Worker
         {
             int i = r.Next(10) < 2 ? r.Next(Math.Min(32, K)) : r.Next(K);
             bool del = r.Next(100) < 12;
-            bool sync = r.Next(100) < 2;
+            bool sync = r.Next(100_000) < _syncPer100k;
             int api = r.Next(4);
             long v = version++;
             ColumnFamily cf = (i & 1) == 0 ? _reg0 : _reg1;
@@ -333,7 +359,7 @@ internal sealed class Worker
             if (to >= from) to++;
             long amount = r.Next(1, 50);
             bool occ = r.Next(2) == 0;
-            bool sync = r.Next(100) < 2;
+            bool sync = r.Next(100_000) < _syncPer100k;
             OpType type = occ ? OpType.BankTxn : OpType.BankBatch;
             OpFlags flags = sync ? OpFlags.Sync : 0;
             long id = _history.NewOpId();
@@ -385,7 +411,7 @@ internal sealed class Worker
         {
             int c = r.Next(_l.Counters);
             long delta = r.Next(1, 10);
-            bool sync = r.Next(100) < 2;
+            bool sync = r.Next(100_000) < _syncPer100k;
             int api = r.Next(3);
             OpFlags flags = (sync ? OpFlags.Sync : 0) | (api == 1 ? OpFlags.Async : 0);
             long id = _history.NewOpId();
@@ -424,7 +450,7 @@ internal sealed class Worker
         {
             long v = version++;
             bool range = r.Next(100) < 15;
-            bool sync = r.Next(100) < 2;
+            bool sync = r.Next(100_000) < _syncPer100k;
             bool async = r.Next(2) == 0;
             WriteOptions wo = sync ? _syncWrite : _plainWrite;
             OpFlags flags = (sync ? OpFlags.Sync : 0) | (async ? OpFlags.Async : 0);
