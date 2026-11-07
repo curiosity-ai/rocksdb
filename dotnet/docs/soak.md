@@ -50,7 +50,7 @@ these column families. All sizes are fixed per run (`run.json`), so the model an
 
 | Key space | Column family | Threads | Operations | Invariant |
 |---|---|---|---|---|
-| Registers | `reg0`, `reg1` (key index parity) | 4 writers, one writer per key, 1500 keys each | `Put`/`Delete` through `cf.Put`, `cf.PutAsync`, `WriteBatch` + `Write` / `WriteAsync`; 2% with `Sync = true` | value = (writer, key, version, payload length, CRC32 of the payload, a payload of 0..4 KiB derived from the version); versions strictly increase per writer, so a writer's ops are totally ordered |
+| Registers | `reg0`, `reg1` (key index parity) | 4 writers, one writer per key, 1500 keys each | `Put`/`Delete` through `cf.Put`, `cf.PutAsync`, `WriteBatch` + `Write` / `WriteAsync`; `Sync = true` on 0, 0.05% or 0.5% of all writes (chosen per worker; sync writes sync the whole WAL, so they stay rare) | value = (writer, key, version, payload length, CRC32 of the payload, a payload of 0..4 KiB derived from the version); versions strictly increase per writer, so a writer's ops are totally ordered |
 | Bank | `bank` (UInt64Add) | 2 | transfers as a `WriteBatch` of two merges (+x, -x as wrapping uint64) and as optimistic transactions (`GetForUpdate` both, `Put` both, `Commit`; `Busy`/`TryAgain` = `:fail`) | 24 accounts, total constant |
 | Counters | `ctr` (UInt64Add) | 2 | `Merge` (+1..9) sync, async and in a batch | acked increments <= value <= acked + indeterminate |
 | Range deletes | `rdel` | 1 | `Put` with a version, `DeleteRange` over up to 64 keys (sync and async) | the key space equals the effect of a prefix of the thread's ops |
@@ -98,7 +98,7 @@ levels deep.
 | `FsyncTrigger` (8) | `clear-cache` right after the N-th fsync of a WAL (N 1..39), MANIFEST or SST file (N 1..11) completes, before the engine sees it return | as `PowerLoss` |
 | `RecoveryKill` (8) | SIGKILL; then a second worker is started and SIGKILLed after a random delay in [0, 1.5 x the last open time + 100 ms] (during or right after recovery); a third process verifies | every acknowledged write survives |
 | `Pause` (6) | SIGSTOP / SIGCONT for 0.1..5 s every 0.3..3 s during the RUN phase, then a clean stop or SIGKILL | every acknowledged write survives; online checks keep holding after each pause |
-| `IoError` (8) | the fault file system fails appends, fsyncs (and directory fsyncs, creates, renames, deletes) and reads at random (200..5000 per million) for a third of the RUN phase, then stops failing and the worker calls `Resume`; then a clean stop or SIGKILL | failed writes are `:info` (or `:fail` for a transaction conflict), never `:ok`; every acknowledged write survives; a close that fails after unrecovered background errors is counted (`close-failed-after-io-errors`), not a failure |
+| `IoError` (8) | the fault file system fails appends, fsyncs (and directory fsyncs, creates, renames, deletes) and reads at random (200..5000 per million) for a third of the RUN phase, with one error kind per cycle: plain IOError, retryable IOError or NoSpace; then it stops failing and the worker calls `Resume`; then a clean stop or SIGKILL. As upstream, a plain IOError in a flush or WAL write is a fatal background error that `Resume` refuses until a reopen, while retryable and NoSpace errors recover (counted as `resume-ok`) | failed writes are `:info` (or `:fail` for a transaction conflict), never `:ok`; every acknowledged write survives; a close that fails after unrecovered background errors is counted (`close-failed-after-io-errors`), not a failure |
 | `LazyFsClear` (0; only with LazyFS) | SIGKILL, then `lazyfs::clear-cache` through the LazyFS FIFO (see "Real LazyFS mode") | as `PowerLoss` |
 
 ### The in-process fault file system
@@ -119,6 +119,10 @@ parts are written back), and the process ends with `_exit(77)`. Files that exist
 durable (we do not model a power loss across cycles). The history is on the real file system and is never subject to
 the injected loss.
 
+For `TornOp` / `TornSeq` the worker first waits (up to 3 s) until a WAL file with a durable directory entry has
+unsynced writes (1, or 3 for torn-seq), like picking LazyFS's `occurrence`; the victim is a WAL file 3 times in 4
+when one qualifies. If no file qualifies the fault degrades to clear-cache (counted as `torn-no-candidate`).
+
 Torn writes are applied to WAL, SST and blob files only. A torn MANIFEST tail is a corrupted record to upstream as
 well (`VersionSet::Recover` fails with Corruption), so the MANIFEST gets clear-cache only. Unsynced SST and blob files
 are not referenced yet, so tearing them must be harmless; tearing the WAL is the interesting case.
@@ -136,7 +140,7 @@ Each step is reported separately (pass/fail, count, time) in `verify/cycle-N.jso
 | 5 | `counters` | each counter within [model + increments that must have survived, model + all non-failed increments] |
 | 6 | `range-deletes` | as registers, for the `rdel` key space (a `DeleteRange` is a delete of every key in its range) |
 | 7 | `scans` | full forward and reverse scan of every column family with `VerifyChecksums = true`: strictly sorted, unique, reverse = forward, every entry equal to the point read, per column family counts equal to the point reads |
-| 8 | `integrity` | `VerifyFileChecksums` (whole-file crc32c of every live table and blob file), live-file metadata against the directory (exists, size equals the MANIFEST size, level, key order), `rocksdb.num-files-at-level<N>` sums equal the live files, `rocksdb.estimate-num-keys` available |
+| 8 | `integrity` | after `WaitForCompact`: `VerifyFileChecksums` (whole-file crc32c of every live table and blob file), live-file metadata against the directory (exists, size equals the MANIFEST size, level, key order), `rocksdb.num-files-at-level<N>` sums equal the live files, `rocksdb.estimate-num-keys` available |
 | 9 | `native-cross-check` | every `--native-every` cycles (default 10) and at the end: checkpoint, then native librocksdb (rocksdb-sharp, read-only, in a child process) scans every column family; per column family entry count and xxHash64 of the scan must equal the managed scan |
 | 10 | `close` | the DB closes cleanly |
 
@@ -234,7 +238,9 @@ The run directory holds:
 `status.json` fields: `Phase` (`init`, `run`, `verify`, `corrupt`, `folded`, `done`, `failed`), `Cycle`, `Fault`,
 `Seed`, `ElapsedSeconds`, `DurationSeconds`, `CyclesCompleted`, `Faults` (cycles per fault), `Ops` (`Type.outcome` ->
 count, summed over the verified histories), `Notes` (e.g. `fsync-trigger-wal`, `fsync-trigger-not-reached`,
-`torn-seq-applied`, `recovery-kill-during-open`, `pauses`), `Corruption` (`target/mode/outcome` -> count),
+`torn-seq-applied`, `torn-op-applied`, `torn-no-candidate`, `recovery-kill-during-open` / `-after-open`, `pauses`,
+`io-error-kind-plain|retryable|nospace`, `io-errors-injected`, `resume-ok`, `resume-attempts-failed`,
+`close-failed-after-io-errors`), `Corruption` (`target/mode/outcome` -> count),
 `NativeChecks`, `LastVerify` (cycle, pass, each step), `Failures`, `Result` (`running`, `passed`, `failed`).
 
 `tools/soak.sh report --dir /data/soak` prints the result, the faults per type, the operations per type and outcome
