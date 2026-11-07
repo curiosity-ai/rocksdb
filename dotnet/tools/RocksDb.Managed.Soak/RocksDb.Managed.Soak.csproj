@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Long-running Jepsen-style soak test: a supervisor runs a worker child process on one database, ends it with a
+    fault (SIGKILL, simulated power loss / torn writes on an in-process LazyFS-like file system, I/O errors, pauses,
+    graceful shutdown, crash during recovery), then checks the recovered database against a model of the history in
+    a verifier child process. See docs/soak.md.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>RocksDb.Managed.Soak</AssemblyName>
+    <RootNamespace>RocksDb.Managed.Soak</RootNamespace>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RocksDb.Managed\RocksDb.Managed.csproj" />
+    <PackageReference Include="RocksDB" />
+    <PackageReference Include="System.IO.Hashing" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- librocksdb under a .NET 11 apphost: see the file's remarks. -->
+    <Compile Include="..\..\tests\Shared\NativeStdCxxPreload.cs" Link="NativeStdCxxPreload.cs" />
+  </ItemGroup>
+</Project>
