@@ -613,7 +613,7 @@ public class BackupEngineReadOnly : IDisposable
         CancellationToken ct)
     {
         if (sizeLimit == 0) sizeLimit = ulong.MaxValue;
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(Math.Min(IoBufferSize, 1 << 20));
+        byte[] buffer = RocksArrayPool<byte>.Shared.Rent(Math.Min(IoBufferSize, 1 << 20));
         try
         {
             using ISequentialFile src = fs.OpenSequential(path);
@@ -636,7 +636,7 @@ public class BackupEngineReadOnly : IDisposable
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            RocksArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
@@ -649,7 +649,7 @@ public class BackupEngineReadOnly : IDisposable
         BackupRateLimiter? limiter, Action? progress, bool synchronous, CancellationToken ct)
     {
         if (sizeLimit == 0) sizeLimit = ulong.MaxValue;
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(IoBufferSize);
+        byte[] buffer = RocksArrayPool<byte>.Shared.Rent(IoBufferSize);
         IWritableFile? dstFile = null;
         try
         {
@@ -690,7 +690,7 @@ public class BackupEngineReadOnly : IDisposable
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            RocksArrayPool<byte>.Shared.Return(buffer);
             if (dstFile is not null)
             {
                 if (synchronous) dstFile.Dispose();

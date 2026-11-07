@@ -930,7 +930,7 @@ internal sealed class CompactionIterator : IDisposable
     {
         ReadOnlySpan<byte> userKey = _currentKey.UserKey;
         int n = userKey.Length + DbFormat.InternalKeyFooterSize;
-        byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(n);
+        byte[] buf = RocksArrayPool<byte>.Shared.Rent(n);
         try
         {
             userKey[..^_tsSize].CopyTo(buf);
@@ -940,7 +940,7 @@ internal sealed class CompactionIterator : IDisposable
         }
         finally
         {
-            System.Buffers.ArrayPool<byte>.Shared.Return(buf);
+            RocksArrayPool<byte>.Shared.Return(buf);
         }
     }
 

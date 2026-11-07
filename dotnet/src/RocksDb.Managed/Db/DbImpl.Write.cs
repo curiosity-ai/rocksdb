@@ -1108,6 +1108,10 @@ internal sealed partial class DbImpl
                     if (_closedWalsToSync.Count > 0) await SyncClosedWalsAsync(synchronous).ConfigureAwait(false);
                     if (synchronous) old.Sync();
                     else await old.SyncAsync(CancellationToken.None).ConfigureAwait(false);
+                    // SyncWalImpl (via SyncClosedWals) also fsyncs the WAL directory when it was not synced since the
+                    // closed WAL was created (need_wal_dir_sync = !wal_dir_synced_): a synced WAL whose directory entry
+                    // can vanish is not durable. With a separate wal_dir the flush's DB directory fsync does not cover it.
+                    SyncWalDirIfNeeded();
                     NoteClosedWalSynced(old);
                     if (synchronous) old.Dispose();
                     else await old.DisposeAsync().ConfigureAwait(false);
@@ -1763,7 +1767,7 @@ internal sealed partial class DbImpl
                 return;
             }
             // PackValueAndWriteTime: value | fixed64(write_unix_time), stored as kTypeValuePreferredSeqno.
-            byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(value.Length + 8);
+            byte[] buf = RocksArrayPool<byte>.Shared.Rent(value.Length + 8);
             try
             {
                 value.CopyTo(buf);
@@ -1772,7 +1776,7 @@ internal sealed partial class DbImpl
             }
             finally
             {
-                System.Buffers.ArrayPool<byte>.Shared.Return(buf);
+                RocksArrayPool<byte>.Shared.Return(buf);
             }
             _rebuilding?.TimedPut(columnFamilyId, key, value, writeUnixTime);
         }

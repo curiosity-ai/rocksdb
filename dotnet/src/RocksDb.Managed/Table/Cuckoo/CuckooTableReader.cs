@@ -141,7 +141,7 @@ public sealed class CuckooTableReader : TableReader
         where TState : allows ref struct
     {
         int n = userKey.Length + 8;
-        byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(n);
+        byte[] buf = RocksArrayPool<byte>.Shared.Rent(n);
         try
         {
             DbFormat.AppendInternalKey(buf, userKey, DbFormat.MaxSequenceNumber, EntryType.Value);
@@ -149,7 +149,7 @@ public sealed class CuckooTableReader : TableReader
         }
         finally
         {
-            System.Buffers.ArrayPool<byte>.Shared.Return(buf);
+            RocksArrayPool<byte>.Shared.Return(buf);
         }
     }
 

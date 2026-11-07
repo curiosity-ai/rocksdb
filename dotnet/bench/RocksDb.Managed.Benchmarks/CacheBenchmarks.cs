@@ -50,7 +50,7 @@ public class CacheBenchmarks
         for (int i = 0; i < NumKeys; i++)
         {
             _keys[i] = baseKey.WithOffsetForMinSizeRecord((ulong)i * BlockSize);
-            byte[] buf = ArrayPool<byte>.Shared.Rent(BlockSize);
+            byte[] buf = RocksArrayPool<byte>.Shared.Rent(BlockSize);
             _cache.Insert(_keys[i], CacheValue.FromPooledBuffer(buf, BlockSize), BlockSize, CachePriority.Low);
         }
         // 4 MiB: inserts constantly evict.
@@ -74,7 +74,7 @@ public class CacheBenchmarks
     public bool InsertWithEviction()
     {
         CacheKey k = new(42, (ulong)_next++);
-        byte[] buf = ArrayPool<byte>.Shared.Rent(BlockSize);
+        byte[] buf = RocksArrayPool<byte>.Shared.Rent(BlockSize);
         return _small.Insert(k, CacheValue.FromPooledBuffer(buf, BlockSize), BlockSize, CachePriority.Low);
     }
 

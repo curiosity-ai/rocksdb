@@ -74,7 +74,7 @@ public readonly struct InternalKey : IEquatable<InternalKey>
 /// <remarks>
 /// Allocation-free: the bytes are built in caller-provided scratch (typically
 /// <c>stackalloc byte[LookupKey.StackBufferSize]</c>); if that is too small, a buffer is rented from
-/// <see cref="ArrayPool{T}.Shared"/> and returned by <see cref="Dispose"/>. Usage:
+/// <see cref="RocksArrayPool{T}.Shared"/> and returned by <see cref="Dispose"/>. Usage:
 /// <code>using var lkey = new LookupKey(userKey, seq, stackalloc byte[LookupKey.StackBufferSize]);</code>
 /// </remarks>
 public ref struct LookupKey
@@ -99,7 +99,7 @@ public ref struct LookupKey
         int needed = ikeyLen + Coding.MaxVarint32Length;
         if (needed > scratch.Length)
         {
-            _rented = ArrayPool<byte>.Shared.Rent(needed);
+            _rented = RocksArrayPool<byte>.Shared.Rent(needed);
             scratch = _rented;
         }
         _buf = scratch;
@@ -125,13 +125,13 @@ public ref struct LookupKey
     {
         byte[]? r = _rented;
         _rented = null;
-        if (r is not null) ArrayPool<byte>.Shared.Return(r);
+        if (r is not null) RocksArrayPool<byte>.Shared.Return(r);
     }
 }
 
 /// <summary>
 /// Reusable growable key buffer for iterators (block iterator prefix decoding, DBIter saved keys). Port of the
-/// copying subset of rocksdb::IterKey (db/dbformat.h). The buffer is rented from <see cref="ArrayPool{T}.Shared"/>
+/// copying subset of rocksdb::IterKey (db/dbformat.h). The buffer is rented from <see cref="RocksArrayPool{T}.Shared"/>
 /// and returned by <see cref="Dispose"/>; it never shrinks, so steady state is allocation-free. Not thread-safe.
 /// </summary>
 public sealed class IterKey : IDisposable
@@ -141,7 +141,7 @@ public sealed class IterKey : IDisposable
     private int _size;
     private bool _isUserKey = true;
 
-    public IterKey() => _buf = ArrayPool<byte>.Shared.Rent(InitialSize);
+    public IterKey() => _buf = RocksArrayPool<byte>.Shared.Rent(InitialSize);
 
     /// <summary>The key in whichever format it was set (user or internal).</summary>
     public ReadOnlySpan<byte> Key => _buf.AsSpan(0, _size);
@@ -219,9 +219,9 @@ public sealed class IterKey : IDisposable
     private void EnsureCapacity(int size, int preserve)
     {
         if (size <= _buf.Length) return;
-        byte[] n = ArrayPool<byte>.Shared.Rent(Math.Max(size, _buf.Length * 2));
+        byte[] n = RocksArrayPool<byte>.Shared.Rent(Math.Max(size, _buf.Length * 2));
         _buf.AsSpan(0, preserve).CopyTo(n);
-        ArrayPool<byte>.Shared.Return(_buf);
+        RocksArrayPool<byte>.Shared.Return(_buf);
         _buf = n;
     }
 
@@ -230,6 +230,6 @@ public sealed class IterKey : IDisposable
         byte[] b = _buf;
         _buf = [];
         _size = 0;
-        if (b.Length > 0) ArrayPool<byte>.Shared.Return(b);
+        if (b.Length > 0) RocksArrayPool<byte>.Shared.Return(b);
     }
 }

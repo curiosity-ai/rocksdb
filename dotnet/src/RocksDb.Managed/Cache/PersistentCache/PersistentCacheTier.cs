@@ -253,7 +253,7 @@ public sealed class VolatileCacheTier : PersistentCacheTier
                 _lru.Remove(node);
                 _lru.AddFirst(node);
                 byte[] v = node.Value.Value;
-                data = ArrayPool<byte>.Shared.Rent(Math.Max(1, v.Length));
+                data = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, v.Length));
                 v.CopyTo(data, 0);
                 length = v.Length;
                 _hits++;

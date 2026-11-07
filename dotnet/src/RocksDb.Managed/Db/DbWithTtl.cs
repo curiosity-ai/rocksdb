@@ -667,7 +667,7 @@ public sealed class TtlDatabase : IDisposable, IAsyncDisposable
     /// <summary>DBWithTTLImpl::AppendTS + WriteBatchInternal::Put / Merge.</summary>
     private static void WithTimestamp(WriteBatch b, uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, int now, bool merge)
     {
-        byte[] buf = ArrayPool<byte>.Shared.Rent(value.Length + TtlValue.TimestampLength);
+        byte[] buf = RocksArrayPool<byte>.Shared.Rent(value.Length + TtlValue.TimestampLength);
         try
         {
             value.CopyTo(buf);
@@ -678,7 +678,7 @@ public sealed class TtlDatabase : IDisposable, IAsyncDisposable
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buf);
+            RocksArrayPool<byte>.Shared.Return(buf);
         }
     }
 

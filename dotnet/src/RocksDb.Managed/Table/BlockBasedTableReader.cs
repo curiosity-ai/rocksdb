@@ -386,8 +386,8 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
         finally
         {
-            if (prefixes is { Length: > 0 }) ArrayPool<byte>.Shared.Return(prefixes);
-            if (meta is { Length: > 0 }) ArrayPool<byte>.Shared.Return(meta);
+            if (prefixes is { Length: > 0 }) RocksArrayPool<byte>.Shared.Return(prefixes);
+            if (meta is { Length: > 0 }) RocksArrayPool<byte>.Shared.Return(meta);
         }
     }
 
@@ -617,7 +617,7 @@ public sealed partial class BlockBasedTableReader : TableReader
             {
                 byte[] raw = BlockFetcher.ReadRawPayload(file, footer, dictHandle, verify, out int dictLength);
                 try { compressionDict = new Compression.CompressionDictionary(raw.AsSpan(0, dictLength).ToArray()); }
-                finally { ArrayPool<byte>.Shared.Return(raw); }
+                finally { RocksArrayPool<byte>.Shared.Return(raw); }
             }
 
             // Port of the filter lookup in BlockBasedTable::PrefetchIndexAndFilterBlocks: the filter is keyed by the
@@ -727,7 +727,7 @@ public sealed partial class BlockBasedTableReader : TableReader
             return;
         }
         _stats?.Record(BlockCacheCounter.FilterMiss);
-        // A cached filter's buffer is returned to ArrayPool.Shared by the cache entry (CacheValue).
+        // A cached filter's buffer is returned to RocksArrayPool.Shared by the cache entry (CacheValue).
         byte[] buf = BlockFetcher.ReadRawPayload(file, _footer, handle, _options.VerifyChecksums, BlockBufferSource.Shared, out int len);
         IFilterBitsReader filter;
         try
@@ -736,7 +736,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
         catch
         {
-            ArrayPool<byte>.Shared.Return(buf);
+            RocksArrayPool<byte>.Shared.Return(buf);
             throw;
         }
         if (cache.Insert(key, new CacheValue(buf, len, filter, true).WithHelper(FilterHelperFor(_options)), buf.Length, _metaPriority))
@@ -808,7 +808,7 @@ public sealed partial class BlockBasedTableReader : TableReader
                 byte[] raw = BlockFetcher.ReadRawPayload(file, footer, h, verify, out int length);
                 byte[] contents;
                 try { contents = raw.AsSpan(0, length).ToArray(); }
-                finally { if (raw.Length > 0) ArrayPool<byte>.Shared.Return(raw); }
+                finally { if (raw.Length > 0) RocksArrayPool<byte>.Shared.Return(raw); }
                 reader = factory.NewReader(new UserDefinedIndexOptions { Comparator = options.Comparator }, contents)
                     ?? throw RocksDbException.Corruption("Failed to create UDI reader for " + name);
             }
@@ -911,14 +911,14 @@ public sealed partial class BlockBasedTableReader : TableReader
             }
             // WART (upstream): the index block checksum is skipped when it was checked on open.
             if (kv.Key == BlockBasedTableConstants.IndexBlockName && _options.VerifyChecksums) continue;
-            ArrayPool<byte>.Shared.Return(BlockFetcher.ReadRawPayload(_file, _footer, kv.Value, verifyChecksums: true, out _));
+            RocksArrayPool<byte>.Shared.Return(BlockFetcher.ReadRawPayload(_file, _footer, kv.Value, verifyChecksums: true, out _));
         }
         IndexCursor idx = IndexCursor.Rent(this, TableReadFlags.DontFillCache);
         try
         {
             for (idx.SeekToFirst(); idx.Valid; idx.Next())
             {
-                ArrayPool<byte>.Shared.Return(BlockFetcher.ReadRawPayload(_file, _footer, idx.Handle, verifyChecksums: true, out _));
+                RocksArrayPool<byte>.Shared.Return(BlockFetcher.ReadRawPayload(_file, _footer, idx.Handle, verifyChecksums: true, out _));
             }
         }
         finally
@@ -936,7 +936,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     {
         if (handle.Size + BlockBasedTableConstants.BlockTrailerSize > int.MaxValue) ThrowHelper.Corruption("block too large: " + handle);
         int n = (int)(handle.Size + BlockBasedTableConstants.BlockTrailerSize);
-        byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(n);
+        byte[] buf = RocksArrayPool<byte>.Shared.Rent(n);
         try
         {
             Span<byte> block = buf.AsSpan(0, n);
@@ -954,7 +954,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
         finally
         {
-            System.Buffers.ArrayPool<byte>.Shared.Return(buf);
+            RocksArrayPool<byte>.Shared.Return(buf);
         }
     }
 
@@ -1534,7 +1534,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         if (_filterKind == FilterKind.None) return true;
         int n = userKey.Length + DbFormat.InternalKeyFooterSize;
         byte[]? rented = null;
-        Span<byte> ikey = n <= 256 ? stackalloc byte[256] : (rented = ArrayPool<byte>.Shared.Rent(n));
+        Span<byte> ikey = n <= 256 ? stackalloc byte[256] : (rented = RocksArrayPool<byte>.Shared.Rent(n));
         try
         {
             DbFormat.AppendInternalKey(ikey, userKey, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
@@ -1542,7 +1542,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
         finally
         {
-            if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+            if (rented is not null) RocksArrayPool<byte>.Shared.Return(rented);
         }
     }
 
@@ -1745,13 +1745,13 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
         catch
         {
-            ArrayPool<byte>.Shared.Return(buf);
+            RocksArrayPool<byte>.Shared.Return(buf);
             throw;
         }
         bool result = reader.MayMatch(entry);
         if (cache is null || (flags & TableReadFlags.DontFillCache) != 0)
         {
-            ArrayPool<byte>.Shared.Return(buf);
+            RocksArrayPool<byte>.Shared.Return(buf);
         }
         else if (cache.Insert(key, new CacheValue(buf, len, reader, true).WithHelper(FilterHelperFor(_options)), buf.Length, _metaPriority))
         {
@@ -2142,7 +2142,7 @@ public sealed partial class BlockBasedTableReader : TableReader
             start = Math.Min(start, (long)footer.MetaindexHandle.Offset);
             long len = fileSize - start;
             if (len <= 0 || len > 64L << 20) return;
-            byte[] buf = ArrayPool<byte>.Shared.Rent((int)len);
+            byte[] buf = RocksArrayPool<byte>.Shared.Rent((int)len);
             int total = 0;
             while (total < len)
             {
@@ -2172,7 +2172,7 @@ public sealed partial class BlockBasedTableReader : TableReader
 
         public void ReleaseBuffer()
         {
-            if (_tail is not null) ArrayPool<byte>.Shared.Return(_tail);
+            if (_tail is not null) RocksArrayPool<byte>.Shared.Return(_tail);
             _tail = null;
         }
 

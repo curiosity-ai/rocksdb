@@ -235,7 +235,7 @@ internal sealed class FileInfoLogger : InfoLogger
     {
         int max = Encoding.UTF8.GetMaxByteCount(line.Length);
         byte[]? rented = null;
-        Span<byte> buf = max <= 1024 ? stackalloc byte[1024] : (rented = System.Buffers.ArrayPool<byte>.Shared.Rent(max));
+        Span<byte> buf = max <= 1024 ? stackalloc byte[1024] : (rented = RocksArrayPool<byte>.Shared.Rent(max));
         try
         {
             int n = Encoding.UTF8.GetBytes(line, buf);
@@ -243,7 +243,7 @@ internal sealed class FileInfoLogger : InfoLogger
         }
         finally
         {
-            if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+            if (rented is not null) RocksArrayPool<byte>.Shared.Return(rented);
         }
     }
 

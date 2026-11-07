@@ -213,7 +213,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
             _lock.ExitReadLock();
         }
         TouchFile(file);
-        byte[] scratch = ArrayPool<byte>.Shared.Rent(lba.Size);
+        byte[] scratch = RocksArrayPool<byte>.Shared.Rent(lba.Size);
         try
         {
             bool ok;
@@ -242,7 +242,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(scratch);
+            RocksArrayPool<byte>.Shared.Return(scratch);
             Interlocked.Decrement(ref file.Refs);
         }
     }
@@ -271,7 +271,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
             _lock.ExitReadLock();
         }
         TouchFile(file);
-        byte[] scratch = ArrayPool<byte>.Shared.Rent(lba.Size);
+        byte[] scratch = RocksArrayPool<byte>.Shared.Rent(lba.Size);
         bool releaseHere = true;
         try
         {
@@ -299,7 +299,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
         {
             if (releaseHere)
             {
-                ArrayPool<byte>.Shared.Return(scratch);
+                RocksArrayPool<byte>.Shared.Return(scratch);
                 Interlocked.Decrement(ref file.Refs);
             }
         }
@@ -340,7 +340,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(scratch);
+            RocksArrayPool<byte>.Shared.Return(scratch);
             Interlocked.Decrement(ref file.Refs);
         }
         return await MissAsync(key, cancellationToken).ConfigureAwait(false);
@@ -381,7 +381,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
 
     private static bool CopyOut(ReadOnlySpan<byte> value, out byte[] data, out int length)
     {
-        data = ArrayPool<byte>.Shared.Rent(Math.Max(1, value.Length));
+        data = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, value.Length));
         value.CopyTo(data);
         length = value.Length;
         return true;

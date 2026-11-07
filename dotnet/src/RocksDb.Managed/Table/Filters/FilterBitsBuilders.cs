@@ -34,7 +34,7 @@ public static class BuiltinFilterFormat
 /// <summary>
 /// Keeps the hash-entry arrays of finished filter builders for the next builder. There is one builder per table file
 /// being written and its array grows to the file's key count (hundreds of KiB to MiBs, i.e. large object heap arrays).
-/// <see cref="ArrayPool{T}.Shared"/> did not keep these across the flush and compaction threads, so output files
+/// <see cref="RocksArrayPool{T}.Shared"/> did not keep these across the flush and compaction threads, so output files
 /// reallocated their array (and the doubling chain before it), which triggered gen2 collections under sustained
 /// writes. <see cref="Rent"/> hands out the largest retained array, so a new builder normally never grows.
 /// </summary>
@@ -683,9 +683,9 @@ public sealed class LegacyBloomBitsBuilder : IFilterBitsBuilder
     {
         if (_count == _entries.Length)
         {
-            uint[] bigger = ArrayPool<uint>.Shared.Rent(Math.Max(256, _entries.Length * 2));
+            uint[] bigger = RocksArrayPool<uint>.Shared.Rent(Math.Max(256, _entries.Length * 2));
             _entries.AsSpan(0, _count).CopyTo(bigger);
-            if (_entries.Length > 0) ArrayPool<uint>.Shared.Return(_entries);
+            if (_entries.Length > 0) RocksArrayPool<uint>.Shared.Return(_entries);
             _entries = bigger;
         }
         _entries[_count] = h;
@@ -785,7 +785,7 @@ public sealed class LegacyBloomBitsBuilder : IFilterBitsBuilder
 
     public void Dispose()
     {
-        if (_entries.Length > 0) ArrayPool<uint>.Shared.Return(_entries);
+        if (_entries.Length > 0) RocksArrayPool<uint>.Shared.Return(_entries);
         _entries = [];
         _count = 0;
     }

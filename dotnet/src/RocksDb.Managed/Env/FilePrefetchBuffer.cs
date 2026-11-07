@@ -111,8 +111,8 @@ public sealed class FilePrefetchBuffer : IDisposable
         if (_buffer.Length < want)
         {
             byte[] old = _buffer;
-            _buffer = ArrayPool<byte>.Shared.Rent(want);
-            if (old.Length > 0) ArrayPool<byte>.Shared.Return(old);
+            _buffer = RocksArrayPool<byte>.Shared.Rent(want);
+            if (old.Length > 0) RocksArrayPool<byte>.Shared.Return(old);
         }
         _bufferLength = 0;
         return want;
@@ -131,6 +131,6 @@ public sealed class FilePrefetchBuffer : IDisposable
         byte[] old = _buffer;
         _buffer = [];
         _bufferLength = 0;
-        if (old.Length > 0) ArrayPool<byte>.Shared.Return(old);
+        if (old.Length > 0) RocksArrayPool<byte>.Shared.Return(old);
     }
 }

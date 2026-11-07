@@ -332,9 +332,9 @@ internal sealed partial class DbImpl
         TableCache tc = cfd.TableCache;
         Cache.RowCache rc = tc.RowCache!;
         int[] sub = batch.Sub;
-        int[] original = System.Buffers.ArrayPool<int>.Shared.Rent(count);
-        Util.PooledBufferWriter?[] logs = System.Buffers.ArrayPool<Util.PooledBufferWriter?>.Shared.Rent(count);
-        byte[] keyBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(256);
+        int[] original = RocksArrayPool<int>.Shared.Rent(count);
+        Util.PooledBufferWriter?[] logs = RocksArrayPool<Util.PooledBufferWriter?>.Shared.Rent(count);
+        byte[] keyBuf = RocksArrayPool<byte>.Shared.Rent(256);
         int misses = 0;
         try
         {
@@ -345,8 +345,8 @@ internal sealed partial class DbImpl
                 ReadOnlySpan<byte> userKey = batch.UserKey(k);
                 if (keyBuf.Length < userKey.Length + TableCache.RowCacheKeyPrefixMax)
                 {
-                    System.Buffers.ArrayPool<byte>.Shared.Return(keyBuf);
-                    keyBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(userKey.Length + TableCache.RowCacheKeyPrefixMax);
+                    RocksArrayPool<byte>.Shared.Return(keyBuf);
+                    keyBuf = RocksArrayPool<byte>.Shared.Rent(userKey.Length + TableCache.RowCacheKeyPrefixMax);
                 }
                 int n = tc.RowCacheKey(keyBuf, f, userKey, snapshot, out ulong replaySeq);
                 if (rc.TryGet(keyBuf.AsSpan(0, n), out byte[]? log))
@@ -378,8 +378,8 @@ internal sealed partial class DbImpl
                     ReadOnlySpan<byte> userKey = batch.UserKey(sub[i]);
                     if (keyBuf.Length < userKey.Length + TableCache.RowCacheKeyPrefixMax)
                     {
-                        System.Buffers.ArrayPool<byte>.Shared.Return(keyBuf);
-                        keyBuf = System.Buffers.ArrayPool<byte>.Shared.Rent(userKey.Length + TableCache.RowCacheKeyPrefixMax);
+                        RocksArrayPool<byte>.Shared.Return(keyBuf);
+                        keyBuf = RocksArrayPool<byte>.Shared.Rent(userKey.Length + TableCache.RowCacheKeyPrefixMax);
                     }
                     int n = tc.RowCacheKey(keyBuf, f, userKey, snapshot, out _);
                     rc.Insert(keyBuf.AsSpan(0, n), w.WrittenSpan);
@@ -395,9 +395,9 @@ internal sealed partial class DbImpl
             }
             // The caller continues with batch.Sub[0..count) in key order.
             Array.Copy(original, sub, count);
-            System.Buffers.ArrayPool<int>.Shared.Return(original);
-            System.Buffers.ArrayPool<Util.PooledBufferWriter?>.Shared.Return(logs);
-            System.Buffers.ArrayPool<byte>.Shared.Return(keyBuf);
+            RocksArrayPool<int>.Shared.Return(original);
+            RocksArrayPool<Util.PooledBufferWriter?>.Shared.Return(logs);
+            RocksArrayPool<byte>.Shared.Return(keyBuf);
         }
     }
 

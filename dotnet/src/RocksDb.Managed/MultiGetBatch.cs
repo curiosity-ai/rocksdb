@@ -64,7 +64,7 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
     {
         ArgumentOutOfRangeException.ThrowIfNegative(capacity);
         capacity = Math.Max(capacity, 1);
-        _keyBytes = ArrayPool<byte>.Shared.Rent(capacity * 24);
+        _keyBytes = RocksArrayPool<byte>.Shared.Rent(capacity * 24);
         _keyOffsets = new int[capacity];
         _keyLengths = new int[capacity];
     }
@@ -93,9 +93,9 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
         }
         if (_keyBytes.Length - _keyBytesUsed < key.Length)
         {
-            byte[] bigger = ArrayPool<byte>.Shared.Rent(Math.Max(_keyBytes.Length * 2, _keyBytesUsed + key.Length));
+            byte[] bigger = RocksArrayPool<byte>.Shared.Rent(Math.Max(_keyBytes.Length * 2, _keyBytesUsed + key.Length));
             _keyBytes.AsSpan(0, _keyBytesUsed).CopyTo(bigger);
-            ArrayPool<byte>.Shared.Return(_keyBytes);
+            RocksArrayPool<byte>.Shared.Return(_keyBytes);
             _keyBytes = bigger;
         }
         key.CopyTo(_keyBytes.AsSpan(_keyBytesUsed));
@@ -252,9 +252,9 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
     {
         if (_disposed) return;
         _disposed = true;
-        ArrayPool<byte>.Shared.Return(_keyBytes);
+        RocksArrayPool<byte>.Shared.Return(_keyBytes);
         _keyBytes = [];
-        if (_ikeys.Length > 0) ArrayPool<byte>.Shared.Return(_ikeys);
+        if (_ikeys.Length > 0) RocksArrayPool<byte>.Shared.Return(_ikeys);
         _ikeys = [];
         GetContext?[] ctx = _contexts;
         for (int i = 0; i < ctx.Length; i++) ctx[i]?.Value.Dispose();
@@ -320,8 +320,8 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
         int ikeyBytes = _keyBytesUsed + n * DbFormat.InternalKeyFooterSize;
         if (_ikeys.Length < ikeyBytes)
         {
-            if (_ikeys.Length > 0) ArrayPool<byte>.Shared.Return(_ikeys);
-            _ikeys = ArrayPool<byte>.Shared.Rent(ikeyBytes);
+            if (_ikeys.Length > 0) RocksArrayPool<byte>.Shared.Return(_ikeys);
+            _ikeys = RocksArrayPool<byte>.Shared.Rent(ikeyBytes);
         }
         int off = 0;
         for (int i = 0; i < n; i++)

@@ -17,7 +17,7 @@ public sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
 
     public PooledBufferWriter(int initialCapacity = 256, ArrayPool<byte>? pool = null)
     {
-        _pool = pool ?? ArrayPool<byte>.Shared;
+        _pool = pool ?? RocksArrayPool<byte>.Shared;
         _buffer = initialCapacity == 0 ? [] : _pool.Rent(initialCapacity);
     }
 

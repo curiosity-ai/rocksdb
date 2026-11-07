@@ -314,7 +314,7 @@ public sealed class MirrorFileSystem : IFileSystem
         public int Read(long offset, Span<byte> destination)
         {
             int na = a.Read(offset, destination);
-            byte[] scratch = ArrayPool<byte>.Shared.Rent(Math.Max(1, destination.Length));
+            byte[] scratch = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, destination.Length));
             try
             {
                 int nb = b.Read(offset, scratch.AsSpan(0, destination.Length));
@@ -322,7 +322,7 @@ public sealed class MirrorFileSystem : IFileSystem
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(scratch);
+                RocksArrayPool<byte>.Shared.Return(scratch);
             }
             return na;
         }
@@ -330,7 +330,7 @@ public sealed class MirrorFileSystem : IFileSystem
         public async ValueTask<int> ReadAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken = default)
         {
             int na = await a.ReadAsync(offset, destination, cancellationToken).ConfigureAwait(false);
-            byte[] scratch = ArrayPool<byte>.Shared.Rent(Math.Max(1, destination.Length));
+            byte[] scratch = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, destination.Length));
             try
             {
                 int nb = await b.ReadAsync(offset, scratch.AsMemory(0, destination.Length), cancellationToken).ConfigureAwait(false);
@@ -338,7 +338,7 @@ public sealed class MirrorFileSystem : IFileSystem
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(scratch);
+                RocksArrayPool<byte>.Shared.Return(scratch);
             }
             return na;
         }
@@ -370,7 +370,7 @@ public sealed class MirrorFileSystem : IFileSystem
         public int Read(Span<byte> destination)
         {
             int na = a.Read(destination);
-            byte[] scratch = ArrayPool<byte>.Shared.Rent(Math.Max(1, na));
+            byte[] scratch = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, na));
             try
             {
                 // Read the same number of bytes from b (it may return them in several short reads).
@@ -388,7 +388,7 @@ public sealed class MirrorFileSystem : IFileSystem
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(scratch);
+                RocksArrayPool<byte>.Shared.Return(scratch);
             }
             _position += na;
             return na;
@@ -397,7 +397,7 @@ public sealed class MirrorFileSystem : IFileSystem
         public async ValueTask<int> ReadAsync(Memory<byte> destination, CancellationToken cancellationToken = default)
         {
             int na = await a.ReadAsync(destination, cancellationToken).ConfigureAwait(false);
-            byte[] scratch = ArrayPool<byte>.Shared.Rent(Math.Max(1, na));
+            byte[] scratch = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, na));
             try
             {
                 int nb = 0;
@@ -414,7 +414,7 @@ public sealed class MirrorFileSystem : IFileSystem
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(scratch);
+                RocksArrayPool<byte>.Shared.Return(scratch);
             }
             _position += na;
             return na;

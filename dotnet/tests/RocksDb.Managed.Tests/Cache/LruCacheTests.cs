@@ -316,7 +316,7 @@ public sealed class LruCacheTests
     public void PooledBuffersReturnedAndSpanAccess()
     {
         BlockCache c = NewCache(1 << 20, 2, false);
-        byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(100);
+        byte[] rented = RocksArrayPool<byte>.Shared.Rent(100);
         "hello block"u8.CopyTo(rented);
         Assert.IsTrue(c.TryInsert(Key(1), CacheValue.FromPooledBuffer(rented, 11), 11, CachePriority.Low, out CachedBlock h));
         Assert.IsTrue(h.Span.SequenceEqual("hello block"u8));
@@ -524,7 +524,7 @@ public sealed class LruCacheTests
                             }
                             else if (op < 9)
                             {
-                                byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(64);
+                                byte[] buf = RocksArrayPool<byte>.Shared.Rent(64);
                                 buf.AsSpan(0, 64).Fill((byte)k);
                                 c.Insert(Key(k), CacheValue.FromPooledBuffer(buf, 64), 64, rnd.Next(2) == 0 ? CachePriority.High : CachePriority.Low);
                             }

@@ -471,7 +471,7 @@ internal sealed class LocalSequentialFile : ISequentialFile
     {
         _path = path;
         _handle = LocalFileSystem.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, FileOptions.SequentialScan | FileOptions.Asynchronous);
-        if (options.ReadaheadSize > 0) _buffer = ArrayPool<byte>.Shared.Rent(options.ReadaheadSize);
+        if (options.ReadaheadSize > 0) _buffer = RocksArrayPool<byte>.Shared.Rent(options.ReadaheadSize);
     }
 
     private int Buffered => _bufferEnd - _bufferStart;
@@ -590,14 +590,14 @@ internal sealed class LocalSequentialFile : ISequentialFile
         _handle.Dispose();
         byte[]? b = _buffer;
         _buffer = null;
-        if (b is not null) ArrayPool<byte>.Shared.Return(b);
+        if (b is not null) RocksArrayPool<byte>.Shared.Return(b);
     }
 }
 
 /// <summary>
 /// The write buffers of <see cref="LocalWritableFile"/> (WritableFileWriter::buf_ upstream, an AlignedBuffer per file).
 /// Every WAL, table file, MANIFEST and OPTIONS file rents one (64 KiB growing up to 1 MiB by default). With
-/// <see cref="ArrayPool{T}.Shared"/> the buffer of the previous file was usually returned to another thread's local
+/// <see cref="RocksArrayPool{T}.Shared"/> the buffer of the previous file was usually returned to another thread's local
 /// slot (files are closed by whichever background or writer thread finishes them) and the shared pool trims under GC,
 /// so most files allocated a new buffer. This pool is lock-based and shared by all threads: the next file takes the
 /// buffer the last closed one returned. At most 16 buffers are retained per power-of-two size class.

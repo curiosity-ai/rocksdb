@@ -115,7 +115,7 @@ public sealed class MultiScan : IDisposable
             IReadOnlyList<ScanRange> ranges = args.Ranges;
             List<(long Offset, long Length)> spans = t_spans ??= new List<(long Offset, long Length)>();
             // Internal-key scratch for the range bounds (two keys per range; grown for long keys).
-            byte[] keyBuf = ArrayPool<byte>.Shared.Rent(256);
+            byte[] keyBuf = RocksArrayPool<byte>.Shared.Rent(256);
             try
             {
                 for (int level = 0; level < vs.NumLevels; level++)
@@ -136,8 +136,8 @@ public sealed class MultiScan : IDisposable
                             int endLen = r.Limit is { } l0 ? l0.Length + DbFormat.InternalKeyFooterSize : 0;
                             if (keyBuf.Length < startLen + endLen)
                             {
-                                ArrayPool<byte>.Shared.Return(keyBuf);
-                                keyBuf = ArrayPool<byte>.Shared.Rent(startLen + endLen);
+                                RocksArrayPool<byte>.Shared.Return(keyBuf);
+                                keyBuf = RocksArrayPool<byte>.Shared.Rent(startLen + endLen);
                             }
                             Span<byte> start = keyBuf.AsSpan(0, startLen);
                             DbFormat.AppendInternalKey(start, r.Start.Span, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
@@ -172,7 +172,7 @@ public sealed class MultiScan : IDisposable
             finally
             {
                 spans.Clear();
-                ArrayPool<byte>.Shared.Return(keyBuf);
+                RocksArrayPool<byte>.Shared.Return(keyBuf);
             }
         }
         finally

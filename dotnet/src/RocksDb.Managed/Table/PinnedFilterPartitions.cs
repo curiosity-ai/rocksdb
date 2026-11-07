@@ -60,7 +60,7 @@ internal sealed class PinnedFilterPartitions : IDisposable
 
     public void Dispose()
     {
-        foreach (byte[] b in _buffers) ArrayPool<byte>.Shared.Return(b);
+        foreach (byte[] b in _buffers) RocksArrayPool<byte>.Shared.Return(b);
         _buffers.Clear();
         _readers.Clear();
     }

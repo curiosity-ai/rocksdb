@@ -24,7 +24,7 @@ public sealed class CacheLayerTests
 
     private static CacheValue Bytes(int size)
     {
-        byte[] b = ArrayPool<byte>.Shared.Rent(size);
+        byte[] b = RocksArrayPool<byte>.Shared.Rent(size);
         return CacheValue.FromPooledBuffer(b, size);
     }
 
@@ -179,7 +179,7 @@ public sealed class CacheLayerTests
     {
         Assert.IsTrue(pc.TryLookup(KeyBytes(key), out byte[] data, out int len), "key " + key);
         byte[] r = data.AsSpan(0, len).ToArray();
-        ArrayPool<byte>.Shared.Return(data);
+        RocksArrayPool<byte>.Shared.Return(data);
         return r;
     }
 
@@ -288,7 +288,7 @@ public sealed class CacheLayerTests
                     if (tier.TryLookup(KeyBytes(t * 1000 + i / 2), out byte[] d, out int len))
                     {
                         Assert.IsTrue(d.AsSpan(0, len).SequenceEqual(Page(t * 1000 + i / 2, 2000)));
-                        ArrayPool<byte>.Shared.Return(d);
+                        RocksArrayPool<byte>.Shared.Return(d);
                     }
                 }
             });

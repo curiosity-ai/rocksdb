@@ -346,7 +346,7 @@ internal static class BlockFetcher
     }
 
     /// <summary>
-    /// Unpacks a serialized block's payload into an array rented from <see cref="ArrayPool{T}.Shared"/> (used for filters,
+    /// Unpacks a serialized block's payload into an array rented from <see cref="RocksArrayPool{T}.Shared"/> (used for filters,
     /// which aren't parsed as blocks).
     /// </summary>
     public static byte[] ReadRawPayload(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums, out int length) =>
@@ -400,7 +400,7 @@ internal static class BlockFetcher
 /// <summary>
 /// Minimal growable writer over a rented array whose buffer can be detached (ownership transfer). Arrays come from
 /// <see cref="Source"/>: <see cref="BlockBufferPool"/> for buffers that become <see cref="Block"/>s,
-/// <see cref="ArrayPool{T}.Shared"/> for buffers handed to code that returns them there (e.g. cached filters), or the
+/// <see cref="RocksArrayPool{T}.Shared"/> for buffers handed to code that returns them there (e.g. cached filters), or the
 /// table buffers for the blocks a table reader pins.
 /// </summary>
 internal sealed class RentedBufferWriter : IBufferWriter<byte>, IDisposable

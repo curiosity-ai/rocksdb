@@ -4,7 +4,7 @@ namespace RocksDb.Managed;
 
 /// <summary>
 /// A value returned by <see cref="ColumnFamily.GetPooled(ReadOnlySpan{byte})"/>: the bytes live in a buffer rented
-/// from <see cref="ArrayPool{T}.Shared"/> and the object itself is pooled. Dispose exactly once; neither the object
+/// from <see cref="RocksArrayPool{T}.Shared"/> and the object itself is pooled. Dispose exactly once; neither the object
 /// nor <see cref="Memory"/> may be used afterwards.
 /// </summary>
 public sealed class PooledValue : IDisposable
@@ -41,7 +41,7 @@ public sealed class PooledValue : IDisposable
             }
         }
         v ??= new PooledValue();
-        v._buffer = ArrayPool<byte>.Shared.Rent(Math.Max(value.Length, 1));
+        v._buffer = RocksArrayPool<byte>.Shared.Rent(Math.Max(value.Length, 1));
         v._length = value.Length;
         v._rented = true;
         value.CopyTo(v._buffer);
@@ -56,7 +56,7 @@ public sealed class PooledValue : IDisposable
         byte[] b = _buffer;
         _buffer = [];
         _length = 0;
-        ArrayPool<byte>.Shared.Return(b);
+        RocksArrayPool<byte>.Shared.Return(b);
         PooledValue?[] pool = s_pool;
         for (int i = 0; i < pool.Length; i++)
         {

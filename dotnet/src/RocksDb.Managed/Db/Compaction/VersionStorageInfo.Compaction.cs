@@ -142,7 +142,7 @@ internal sealed partial class VersionStorageInfo
         FileMetaData[] l0 = _files[0];
         if (l0.Length <= 1) return true;
         InternalKeyComparator icmp = Icmp;
-        FileMetaData[] rented = System.Buffers.ArrayPool<FileMetaData>.Shared.Rent(l0.Length);
+        FileMetaData[] rented = RocksArrayPool<FileMetaData>.Shared.Rent(l0.Length);
         try
         {
             Span<FileMetaData> sorted = rented.AsSpan(0, l0.Length);
@@ -156,7 +156,7 @@ internal sealed partial class VersionStorageInfo
         }
         finally
         {
-            System.Buffers.ArrayPool<FileMetaData>.Shared.Return(rented, clearArray: true);
+            RocksArrayPool<FileMetaData>.Shared.Return(rented, clearArray: true);
         }
     }
 
@@ -741,7 +741,7 @@ internal sealed partial class VersionStorageInfo
     private void SortFileByOverlappingRatio(int level, FileMetaData[] files, FileMetaData[] nextLevelFiles, int[] temp)
     {
         InternalKeyComparator icmp = Icmp;
-        ulong[] order = System.Buffers.ArrayPool<ulong>.Shared.Rent(files.Length);
+        ulong[] order = RocksArrayPool<ulong>.Shared.Rent(files.Length);
         int next = 0;
         for (int i = 0; i < files.Length; i++)
         {
@@ -759,7 +759,7 @@ internal sealed partial class VersionStorageInfo
             order[i] = overlappingBytes * 1024UL / compensated;
         }
         temp.AsSpan().Sort(new OverlappingRatioComparer(files, order, icmp));
-        System.Buffers.ArrayPool<ulong>.Shared.Return(order);
+        RocksArrayPool<ulong>.Shared.Return(order);
         _ = level;
     }
 

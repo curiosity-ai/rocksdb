@@ -68,9 +68,9 @@ internal sealed class DataBlockHashIndexBuilder
         uint hash = Hash.GetSliceHash(userKey);
         if (_count == _pairs.Length)
         {
-            ulong[] n = ArrayPool<ulong>.Shared.Rent(Math.Max(64, _count * 2));
+            ulong[] n = RocksArrayPool<ulong>.Shared.Rent(Math.Max(64, _count * 2));
             _pairs.AsSpan(0, _count).CopyTo(n);
-            if (_pairs.Length > 0) ArrayPool<ulong>.Shared.Return(_pairs);
+            if (_pairs.Length > 0) RocksArrayPool<ulong>.Shared.Return(_pairs);
             _pairs = n;
         }
         _pairs[_count++] = ((ulong)hash << 8) | (byte)restartIndex;
@@ -113,7 +113,7 @@ internal sealed class DataBlockHashIndexBuilder
 
     public void Release()
     {
-        if (_pairs.Length > 0) ArrayPool<ulong>.Shared.Return(_pairs);
+        if (_pairs.Length > 0) RocksArrayPool<ulong>.Shared.Return(_pairs);
         _pairs = [];
         _count = 0;
     }

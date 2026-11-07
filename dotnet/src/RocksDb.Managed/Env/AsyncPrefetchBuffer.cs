@@ -17,7 +17,7 @@ namespace RocksDb.Managed.Env;
 /// <para>The prefetch target is chunk-aligned to the previous read's end, so a block may straddle two chunks: the
 /// prefetch lands behind a reserved gap at the start of its buffer and the straddling tail of the current chunk is
 /// copied into that gap on the swap (no re-read). Blocks larger than the gap are read directly.</para>
-/// <para>Not thread-safe (one per iterator). Buffers come from <see cref="ArrayPool{T}.Shared"/>; dispose (or
+/// <para>Not thread-safe (one per iterator). Buffers come from <see cref="RocksArrayPool{T}.Shared"/>; dispose (or
 /// <see cref="Reset"/>) waits for a pending prefetch before reusing them.</para>
 /// <para>Allocation-free in steady state: the pending read is kept as its <see cref="ValueTask{TResult}"/> (no
 /// <c>AsTask</c> / <c>Task.FromResult</c> per prefetch); one that has not completed when it is started gets a cached
@@ -249,8 +249,8 @@ public sealed class AsyncPrefetchBuffer : IDisposable
     private static void Rent(ref byte[] buffer, int size)
     {
         byte[] old = buffer;
-        buffer = ArrayPool<byte>.Shared.Rent(size);
-        if (old.Length > 0) ArrayPool<byte>.Shared.Return(old);
+        buffer = RocksArrayPool<byte>.Shared.Rent(size);
+        if (old.Length > 0) RocksArrayPool<byte>.Shared.Return(old);
     }
 
     private void WaitPendingIgnoringErrors()
@@ -271,8 +271,8 @@ public sealed class AsyncPrefetchBuffer : IDisposable
         WaitPendingIgnoringErrors();
         _file = null;
         _curLen = 0;
-        if (_cur.Length > 0) ArrayPool<byte>.Shared.Return(_cur);
-        if (_next.Length > 0) ArrayPool<byte>.Shared.Return(_next);
+        if (_cur.Length > 0) RocksArrayPool<byte>.Shared.Return(_cur);
+        if (_next.Length > 0) RocksArrayPool<byte>.Shared.Return(_next);
         _cur = [];
         _next = [];
         _done?.Dispose();

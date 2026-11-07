@@ -207,7 +207,7 @@ public sealed class HyperClockCacheTests
         var c = new HyperClockCache(new HyperClockCacheOptions { Capacity = 1 << 20, EstimatedEntryCharge = 4096 });
         for (int i = 0; i < 100; i++)
         {
-            byte[] b = System.Buffers.ArrayPool<byte>.Shared.Rent(4096);
+            byte[] b = RocksArrayPool<byte>.Shared.Rent(4096);
             b[0] = (byte)i;
             Assert.IsTrue(c.Insert(Key(i), CacheValue.FromPooledBuffer(b, 4096), 4096, CachePriority.Low));
         }
@@ -259,7 +259,7 @@ public sealed class HyperClockCacheTests
                             }
                             else if (op < 9)
                             {
-                                byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(64);
+                                byte[] buf = RocksArrayPool<byte>.Shared.Rent(64);
                                 buf.AsSpan(0, 64).Fill((byte)k);
                                 if (rnd.Next(2) == 0)
                                 {
@@ -272,7 +272,7 @@ public sealed class HyperClockCacheTests
                                 }
                                 else
                                 {
-                                    System.Buffers.ArrayPool<byte>.Shared.Return(buf);
+                                    RocksArrayPool<byte>.Shared.Return(buf);
                                 }
                             }
                             else

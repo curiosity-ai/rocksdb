@@ -449,8 +449,8 @@ public sealed class Iterator : IDisposable
             if (_buffer.Length < need)
             {
                 byte[] old = _buffer;
-                _buffer = ArrayPool<byte>.Shared.Rent(Math.Max(need, old.Length * 2));
-                if (old.Length > 0) ArrayPool<byte>.Shared.Return(old);
+                _buffer = RocksArrayPool<byte>.Shared.Rent(Math.Max(need, old.Length * 2));
+                if (old.Length > 0) RocksArrayPool<byte>.Shared.Return(old);
             }
             k.CopyTo(_buffer);
             v.CopyTo(_buffer.AsSpan(k.Length));
@@ -476,7 +476,7 @@ public sealed class Iterator : IDisposable
             _current = default;
             byte[] b = _buffer;
             _buffer = [];
-            if (b.Length > 0) ArrayPool<byte>.Shared.Return(b);
+            if (b.Length > 0) RocksArrayPool<byte>.Shared.Return(b);
         }
     }
 

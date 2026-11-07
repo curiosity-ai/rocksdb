@@ -533,7 +533,7 @@ internal sealed partial class DbImpl
     {
         int n1 = start.Length + DbFormat.InternalKeyFooterSize, n2 = limit.Length + DbFormat.InternalKeyFooterSize;
         byte[]? rented = null;
-        Span<byte> scratch = n1 + n2 <= 512 ? stackalloc byte[512] : (rented = ArrayPool<byte>.Shared.Rent(n1 + n2));
+        Span<byte> scratch = n1 + n2 <= 512 ? stackalloc byte[512] : (rented = RocksArrayPool<byte>.Shared.Rent(n1 + n2));
         try
         {
             ReadOnlySpan<byte> k1 = ToSeekKey(start, scratch[..n1]);
@@ -545,7 +545,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+            if (rented is not null) RocksArrayPool<byte>.Shared.Return(rented);
         }
     }
 
@@ -555,14 +555,14 @@ internal sealed partial class DbImpl
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         int n1 = start.Length + DbFormat.InternalKeyFooterSize, n2 = limit.Length + DbFormat.InternalKeyFooterSize;
         byte[]? rented = null;
-        Span<byte> scratch = n1 + n2 <= 512 ? stackalloc byte[512] : (rented = ArrayPool<byte>.Shared.Rent(n1 + n2));
+        Span<byte> scratch = n1 + n2 <= 512 ? stackalloc byte[512] : (rented = RocksArrayPool<byte>.Shared.Rent(n1 + n2));
         try
         {
             return ApproximateMemTableStats(sv, ToSeekKey(start, scratch[..n1]), ToSeekKey(limit, scratch.Slice(n1, n2)));
         }
         finally
         {
-            if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+            if (rented is not null) RocksArrayPool<byte>.Shared.Return(rented);
             ReturnSuperVersion(sv);
         }
     }

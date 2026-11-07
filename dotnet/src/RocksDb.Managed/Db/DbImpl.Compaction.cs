@@ -1107,7 +1107,7 @@ internal sealed partial class DbImpl
     private void CopyTrivialCompactionFiles(Compaction c, VersionEdit edit, List<ulong> created, CancellationToken ct)
     {
         int bufferSize = (int)Math.Clamp(c.Options.CompactionOptionsFifo.TrivialCopyBufferSize, 1UL, 64UL << 20);
-        byte[] buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(bufferSize);
+        byte[] buffer = RocksArrayPool<byte>.Shared.Rent(bufferSize);
         try
         {
             Temperature temperature = c.GetOutputTemperature(isProximalLevel: false);
@@ -1144,7 +1144,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+            RocksArrayPool<byte>.Shared.Return(buffer);
         }
     }
 

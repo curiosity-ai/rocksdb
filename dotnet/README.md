@@ -92,8 +92,8 @@ dotnet run --project samples/QuickStart -f net11.0 -- Transactions WalTailing   
 ```
 
 `global.json` pins the .NET 11 SDK (`rollForward: latestMajor`), which builds both `net10.0` and `net11.0`. See
-[docs/testing.md](docs/testing.md) for the test suites and [docs/benchmarks.md](docs/benchmarks.md) for the
-benchmarks.
+[docs/testing.md](docs/testing.md) for the test suites, [docs/soak.md](docs/soak.md) for the multi-day soak test
+(`tools/soak.sh --dir /data/soak --duration 72h`) and [docs/benchmarks.md](docs/benchmarks.md) for the benchmarks.
 
 ## Quick start
 
@@ -1398,6 +1398,7 @@ miss. See [docs/benchmarks.md](docs/benchmarks.md).
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | module map (C++ to C#), threading and async model, memory and pooling, design deviations from C++ |
 | [docs/testing.md](docs/testing.md) | the test suites (unit, native compat, crash-isolated round trips, replication, crash consistency) and how to run and extend them |
+| [docs/soak.md](docs/soak.md) | the Jepsen-style soak test (`tools/soak.sh`): process kills, power loss, torn writes, I/O errors and file corruption over days, checked against a model |
 | [docs/benchmarks.md](docs/benchmarks.md) | three-way benchmark methodology, `run-all.sh`, latest results, micro-benchmarks |
 | [bench/README.md](bench/README.md) | reference for the benchmark runner's flags and workloads |
 | [docs/perf.md](docs/perf.md) | performance work log with before/after measurements |

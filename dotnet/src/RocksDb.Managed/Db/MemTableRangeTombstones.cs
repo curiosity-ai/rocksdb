@@ -202,7 +202,7 @@ public sealed class FragmentedRangeTombstoneList
 /// </summary>
 /// <remarks>
 /// <para>Input keys are copied into one pooled buffer and all scratch (entries, boundaries, the active set, sequence
-/// lists) is rented from <see cref="ArrayPool{T}.Shared"/>, so a build allocates only the arrays of the resulting list.
+/// lists) is rented from <see cref="RocksArrayPool{T}.Shared"/>, so a build allocates only the arrays of the resulting list.
 /// Use <see cref="Rent"/> / <see cref="Return"/> (a per-thread cached instance); an instance is used by one thread at a
 /// time and must not be used after <see cref="Return"/>.</para>
 /// </remarks>
@@ -255,8 +255,8 @@ internal sealed class RangeTombstoneFragmenter
     {
         if (!f._rented) throw new InvalidOperationException("RangeTombstoneFragmenter returned twice.");
         f._rented = false;
-        if (f._buf.Length != 0) ArrayPool<byte>.Shared.Return(f._buf);
-        if (f._entries.Length != 0) ArrayPool<Entry>.Shared.Return(f._entries);
+        if (f._buf.Length != 0) RocksArrayPool<byte>.Shared.Return(f._buf);
+        if (f._entries.Length != 0) RocksArrayPool<Entry>.Shared.Return(f._entries);
         f._buf = [];
         f._entries = [];
         f._count = 0;
@@ -321,18 +321,18 @@ internal sealed class RangeTombstoneFragmenter
     {
         int size = Math.Max(_bufLen + need, Math.Max(_buf.Length * 2, 4096));
         if ((uint)size > (uint)Array.MaxLength) size = Math.Max(_bufLen + need, Array.MaxLength);
-        byte[] n = ArrayPool<byte>.Shared.Rent(size);
+        byte[] n = RocksArrayPool<byte>.Shared.Rent(size);
         _buf.AsSpan(0, _bufLen).CopyTo(n);
-        if (_buf.Length != 0) ArrayPool<byte>.Shared.Return(_buf);
+        if (_buf.Length != 0) RocksArrayPool<byte>.Shared.Return(_buf);
         _buf = n;
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void GrowEntries()
     {
-        Entry[] n = ArrayPool<Entry>.Shared.Rent(Math.Max(_entries.Length * 2, 64));
+        Entry[] n = RocksArrayPool<Entry>.Shared.Rent(Math.Max(_entries.Length * 2, 64));
         _entries.AsSpan(0, _count).CopyTo(n);
-        if (_entries.Length != 0) ArrayPool<Entry>.Shared.Return(_entries);
+        if (_entries.Length != 0) RocksArrayPool<Entry>.Shared.Return(_entries);
         _entries = n;
     }
 
@@ -379,14 +379,14 @@ internal sealed class RangeTombstoneFragmenter
         Span<Entry> entries = _entries.AsSpan(0, n);
         entries.Sort(new StartComparer(buf, _ucmp, hasTs));
 
-        KeyRef[] bounds = ArrayPool<KeyRef>.Shared.Rent(2 * n);
-        int[] active = ArrayPool<int>.Shared.Rent(n);
-        ulong[] seqScratch = ArrayPool<ulong>.Shared.Rent(n);
-        int[] tsScratch = hasTs ? ArrayPool<int>.Shared.Rent(n) : [];
-        int[] fragScratch = ArrayPool<int>.Shared.Rent(2 * n);
-        int[] seqStartScratch = ArrayPool<int>.Shared.Rent(2 * n + 1);
-        ulong[] seqOut = ArrayPool<ulong>.Shared.Rent(Math.Max(n, 16));
-        int[] tsOut = hasTs ? ArrayPool<int>.Shared.Rent(Math.Max(n, 16)) : [];
+        KeyRef[] bounds = RocksArrayPool<KeyRef>.Shared.Rent(2 * n);
+        int[] active = RocksArrayPool<int>.Shared.Rent(n);
+        ulong[] seqScratch = RocksArrayPool<ulong>.Shared.Rent(n);
+        int[] tsScratch = hasTs ? RocksArrayPool<int>.Shared.Rent(n) : [];
+        int[] fragScratch = RocksArrayPool<int>.Shared.Rent(2 * n);
+        int[] seqStartScratch = RocksArrayPool<int>.Shared.Rent(2 * n + 1);
+        ulong[] seqOut = RocksArrayPool<ulong>.Shared.Rent(Math.Max(n, 16));
+        int[] tsOut = hasTs ? RocksArrayPool<int>.Shared.Rent(Math.Max(n, 16)) : [];
         Comparison<int>? tsComparison = hasTs ? new TimestampDescComparer(buf, _ucmp, tsSize).Compare : null;
         try
         {
@@ -492,22 +492,22 @@ internal sealed class RangeTombstoneFragmenter
         }
         finally
         {
-            ArrayPool<KeyRef>.Shared.Return(bounds);
-            ArrayPool<int>.Shared.Return(active);
-            ArrayPool<ulong>.Shared.Return(seqScratch);
-            if (hasTs) ArrayPool<int>.Shared.Return(tsScratch);
-            ArrayPool<int>.Shared.Return(fragScratch);
-            ArrayPool<int>.Shared.Return(seqStartScratch);
-            ArrayPool<ulong>.Shared.Return(seqOut);
-            if (hasTs) ArrayPool<int>.Shared.Return(tsOut);
+            RocksArrayPool<KeyRef>.Shared.Return(bounds);
+            RocksArrayPool<int>.Shared.Return(active);
+            RocksArrayPool<ulong>.Shared.Return(seqScratch);
+            if (hasTs) RocksArrayPool<int>.Shared.Return(tsScratch);
+            RocksArrayPool<int>.Shared.Return(fragScratch);
+            RocksArrayPool<int>.Shared.Return(seqStartScratch);
+            RocksArrayPool<ulong>.Shared.Return(seqOut);
+            if (hasTs) RocksArrayPool<int>.Shared.Return(tsOut);
         }
     }
 
     private static void Grow<T>(ref T[] array, int used, int needed)
     {
-        T[] n = ArrayPool<T>.Shared.Rent(Math.Max(needed, array.Length * 2));
+        T[] n = RocksArrayPool<T>.Shared.Rent(Math.Max(needed, array.Length * 2));
         array.AsSpan(0, used).CopyTo(n);
-        ArrayPool<T>.Shared.Return(array);
+        RocksArrayPool<T>.Shared.Return(array);
         array = n;
     }
 }

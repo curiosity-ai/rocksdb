@@ -456,7 +456,7 @@ public sealed unsafe class MemTable : IDisposable
     {
         int n = userKey.Length + DbFormat.InternalKeyFooterSize;
         byte[]? rented = null;
-        Span<byte> ikey = n <= 256 ? stackalloc byte[n] : (rented = System.Buffers.ArrayPool<byte>.Shared.Rent(n)).AsSpan(0, n);
+        Span<byte> ikey = n <= 256 ? stackalloc byte[n] : (rented = RocksArrayPool<byte>.Shared.Rent(n)).AsSpan(0, n);
         try
         {
             userKey.CopyTo(ikey);
@@ -472,7 +472,7 @@ public sealed unsafe class MemTable : IDisposable
         }
         finally
         {
-            if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+            if (rented is not null) RocksArrayPool<byte>.Shared.Return(rented);
         }
     }
 

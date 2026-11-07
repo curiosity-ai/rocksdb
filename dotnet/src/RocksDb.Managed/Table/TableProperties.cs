@@ -236,8 +236,8 @@ public sealed class TableProperties
                 if (lastKeyLength >= 0 && keyBytes.SequenceCompareTo(lastKeyBuf[..lastKeyLength]) <= 0) ThrowHelper.Corruption("properties unsorted");
                 if (keyBytes.Length > lastKeyBuf.Length)
                 {
-                    if (lastKeyRented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(lastKeyRented);
-                    lastKeyRented = System.Buffers.ArrayPool<byte>.Shared.Rent(keyBytes.Length);
+                    if (lastKeyRented is not null) RocksArrayPool<byte>.Shared.Return(lastKeyRented);
+                    lastKeyRented = RocksArrayPool<byte>.Shared.Rent(keyBytes.Length);
                     lastKeyBuf = lastKeyRented;
                 }
                 keyBytes.CopyTo(lastKeyBuf);
@@ -278,7 +278,7 @@ public sealed class TableProperties
         }
         finally
         {
-            if (lastKeyRented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(lastKeyRented);
+            if (lastKeyRented is not null) RocksArrayPool<byte>.Shared.Return(lastKeyRented);
         }
         return props;
     }

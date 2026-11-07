@@ -195,7 +195,7 @@ internal sealed class CacheWithSecondaryAdapter : BlockCache
     public override void WaitAll(ReadOnlySpan<AsyncLookupHandle> handles)
     {
         if (!AnyPending(handles)) return;
-        AsyncLookupHandle[] mine = System.Buffers.ArrayPool<AsyncLookupHandle>.Shared.Rent(handles.Length);
+        AsyncLookupHandle[] mine = RocksArrayPool<AsyncLookupHandle>.Shared.Rent(handles.Length);
         SecondaryCacheResultHandle[]? sec = null;
         int n = 0;
         try
@@ -206,15 +206,15 @@ internal sealed class CacheWithSecondaryAdapter : BlockCache
                 _target.WaitAll(handles);
                 n = ConvertInner(handles, mine, n);
             }
-            sec = System.Buffers.ArrayPool<SecondaryCacheResultHandle>.Shared.Rent(Math.Max(1, n));
+            sec = RocksArrayPool<SecondaryCacheResultHandle>.Shared.Rent(Math.Max(1, n));
             for (int i = 0; i < n; i++) sec[i] = mine[i].PendingHandle!;
             _secondary.WaitAll(sec.AsSpan(0, n));
             for (int i = 0; i < n; i++) Complete(mine[i]);
         }
         finally
         {
-            if (sec is not null) System.Buffers.ArrayPool<SecondaryCacheResultHandle>.Shared.Return(sec, clearArray: true);
-            System.Buffers.ArrayPool<AsyncLookupHandle>.Shared.Return(mine, clearArray: true);
+            if (sec is not null) RocksArrayPool<SecondaryCacheResultHandle>.Shared.Return(sec, clearArray: true);
+            RocksArrayPool<AsyncLookupHandle>.Shared.Return(mine, clearArray: true);
         }
     }
 
@@ -227,7 +227,7 @@ internal sealed class CacheWithSecondaryAdapter : BlockCache
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private async ValueTask WaitAllSlowAsync(AsyncLookupHandle[] handles, int count, CancellationToken cancellationToken)
     {
-        AsyncLookupHandle[] mine = System.Buffers.ArrayPool<AsyncLookupHandle>.Shared.Rent(count);
+        AsyncLookupHandle[] mine = RocksArrayPool<AsyncLookupHandle>.Shared.Rent(count);
         try
         {
             int n = CollectPending(handles.AsSpan(0, count), mine, out bool innerPending);
@@ -245,7 +245,7 @@ internal sealed class CacheWithSecondaryAdapter : BlockCache
         }
         finally
         {
-            System.Buffers.ArrayPool<AsyncLookupHandle>.Shared.Return(mine, clearArray: true);
+            RocksArrayPool<AsyncLookupHandle>.Shared.Return(mine, clearArray: true);
         }
     }
 

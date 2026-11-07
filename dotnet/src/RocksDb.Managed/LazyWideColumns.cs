@@ -283,7 +283,7 @@ public sealed partial class LazyWideColumns : IDisposable
         _stats = null;
         for (int i = 0; i < _slots.Count; i++)
         {
-            if (_info[i].Resolved is { } buf) ArrayPool<byte>.Shared.Return(buf);
+            if (_info[i].Resolved is { } buf) RocksArrayPool<byte>.Shared.Return(buf);
             _info[i] = default;
         }
         _slots.Clear();
@@ -409,7 +409,7 @@ public sealed partial class LazyWideColumns : IDisposable
     private void Adopt(int index)
     {
         int n = _fetch.WrittenCount;
-        byte[] buf = ArrayPool<byte>.Shared.Rent(Math.Max(1, n));
+        byte[] buf = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, n));
         _fetch.WrittenSpan.CopyTo(buf);
         _info[index].Resolved = buf;
         _info[index].ResolvedLength = n;

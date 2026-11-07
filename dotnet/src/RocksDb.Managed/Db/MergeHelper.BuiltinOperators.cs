@@ -217,9 +217,9 @@ public sealed class SortListOperator : MergeOperator
     {
         int capacity = 0;
         for (int i = 0; i < operands.Count; i++) capacity += operands[i].Length / 2 + 1; // each number takes a byte + ','
-        int[] left = ArrayPool<int>.Shared.Rent(capacity);
-        int[] right = ArrayPool<int>.Shared.Rent(capacity);
-        int[] merged = ArrayPool<int>.Shared.Rent(capacity);
+        int[] left = RocksArrayPool<int>.Shared.Rent(capacity);
+        int[] right = RocksArrayPool<int>.Shared.Rent(capacity);
+        int[] merged = RocksArrayPool<int>.Shared.Rent(capacity);
         try
         {
             int leftCount = 0;
@@ -242,9 +242,9 @@ public sealed class SortListOperator : MergeOperator
         }
         finally
         {
-            ArrayPool<int>.Shared.Return(left);
-            ArrayPool<int>.Shared.Return(right);
-            ArrayPool<int>.Shared.Return(merged);
+            RocksArrayPool<int>.Shared.Return(left);
+            RocksArrayPool<int>.Shared.Return(right);
+            RocksArrayPool<int>.Shared.Return(merged);
         }
     }
 

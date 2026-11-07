@@ -286,7 +286,7 @@ internal sealed partial class DbImpl
         if (size == 0) size = (ulong)FileSystem.GetFileSize(source);
         using Env.ISequentialFile src = FileSystem.OpenSequential(source);
         Env.IWritableFile dst = FileSystem.CreateWritable(destination, truncate: true);
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        byte[] buffer = RocksArrayPool<byte>.Shared.Rent(64 * 1024);
         try
         {
             ulong remaining = size;
@@ -304,7 +304,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            RocksArrayPool<byte>.Shared.Return(buffer);
             if (synchronous) dst.Dispose();
             else await dst.DisposeAsync().ConfigureAwait(false);
         }

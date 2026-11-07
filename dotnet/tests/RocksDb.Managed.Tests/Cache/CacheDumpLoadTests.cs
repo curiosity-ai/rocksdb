@@ -96,7 +96,7 @@ public sealed class CacheDumpLoadTests
 
     private static CacheValue Value(CacheItemHelper helper, byte[] payload)
     {
-        byte[] buf = ArrayPool<byte>.Shared.Rent(Math.Max(1, payload.Length));
+        byte[] buf = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, payload.Length));
         payload.CopyTo(buf, 0);
         return CacheValue.FromPooledBuffer(buf, payload.Length).WithHelper(helper);
     }

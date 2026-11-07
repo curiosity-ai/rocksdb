@@ -127,7 +127,7 @@ public sealed class CompressedSecondaryCache : SecondaryCache
             ReadOnlySpan<byte> tagged;
             if (e.Object is ValueChunks chunks)
             {
-                merged = ArrayPool<byte>.Shared.Rent(chunks.Total);
+                merged = RocksArrayPool<byte>.Shared.Rent(chunks.Total);
                 int off = 0;
                 for (int i = 0; i < chunks.Chunks.Length; i++)
                 {
@@ -151,7 +151,7 @@ public sealed class CompressedSecondaryCache : SecondaryCache
                     try
                     {
                         BlockCompression.Decompress(type, saved, 2, w);
-                        uncompressed = ArrayPool<byte>.Shared.Rent(Math.Max(1, w.WrittenCount));
+                        uncompressed = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, w.WrittenCount));
                         w.WrittenSpan.CopyTo(uncompressed);
                         saved = uncompressed.AsSpan(0, w.WrittenCount);
                     }
@@ -191,8 +191,8 @@ public sealed class CompressedSecondaryCache : SecondaryCache
         }
         finally
         {
-            if (merged is not null) ArrayPool<byte>.Shared.Return(merged);
-            if (uncompressed is not null) ArrayPool<byte>.Shared.Return(uncompressed);
+            if (merged is not null) RocksArrayPool<byte>.Shared.Return(merged);
+            if (uncompressed is not null) RocksArrayPool<byte>.Shared.Return(uncompressed);
         }
     }
 
@@ -215,7 +215,7 @@ public sealed class CompressedSecondaryCache : SecondaryCache
         CacheKey k = CacheKey.Read(key);
         if (!forceInsert && MaybeInsertDummy(k)) return;
         int size = helper.GetSaveSize(value);
-        byte[] data = ArrayPool<byte>.Shared.Rent(Math.Max(1, size));
+        byte[] data = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, size));
         try
         {
             helper.SaveTo(value, data.AsSpan(0, size));
@@ -223,7 +223,7 @@ public sealed class CompressedSecondaryCache : SecondaryCache
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(data);
+            RocksArrayPool<byte>.Shared.Return(data);
         }
     }
 
@@ -264,7 +264,7 @@ public sealed class CompressedSecondaryCache : SecondaryCache
             }
             else
             {
-                byte[] buf = ArrayPool<byte>.Shared.Rent(taggedLength);
+                byte[] buf = RocksArrayPool<byte>.Shared.Rent(taggedLength);
                 buf[0] = tagSource;
                 buf[1] = tagType;
                 data.CopyTo(buf.AsSpan(TagSize));

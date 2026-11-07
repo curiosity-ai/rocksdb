@@ -54,7 +54,7 @@ public sealed class BlockBufferPoolTests
     [TestMethod]
     public void ReturnAcceptsSharedPoolArraysAndIgnoresForeignSizes()
     {
-        byte[] shared = ArrayPool<byte>.Shared.Rent(8192);
+        byte[] shared = RocksArrayPool<byte>.Shared.Rent(8192);
         Assert.IsTrue(BitOperations.IsPow2(shared.Length));
         BlockBufferPool.Return(shared); // routed back to ArrayPool.Shared (must not throw)
         BlockBufferPool.Return(new byte[5000]); // not a class size: dropped

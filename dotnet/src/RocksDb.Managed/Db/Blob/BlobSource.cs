@@ -385,7 +385,7 @@ internal sealed class BlobSource : IDisposable
     {
         BlockCache? cache = _cache;
         if (cache is null) return;
-        byte[] buf = ArrayPool<byte>.Shared.Rent(Math.Max(1, blob.Length));
+        byte[] buf = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, blob.Length));
         blob.CopyTo(buf);
         if (cache.Insert(CacheKeyFor(fileNumber, offset), CacheValue.FromPooledBuffer(buf, blob.Length), blob.Length, CachePriority.Bottom))
         {

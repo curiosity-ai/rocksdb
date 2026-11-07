@@ -463,12 +463,12 @@ public sealed class CacheTierReadPathTests
                 PersistentCacheLookupResult r = lookups[i].Result;
                 Assert.IsTrue(r.Found, "key " + i);
                 CollectionAssert.AreEqual(PageOf(i), r.Data.AsSpan(0, r.Length).ToArray());
-                ArrayPool<byte>.Shared.Return(r.Data);
+                RocksArrayPool<byte>.Shared.Return(r.Data);
             }
             PersistentCacheLookupResult fromNext = lookups[300].Result;
             Assert.IsTrue(fromNext.Found, "a miss goes to the next tier");
             CollectionAssert.AreEqual(PageOf(7), fromNext.Data.AsSpan(0, fromNext.Length).ToArray());
-            ArrayPool<byte>.Shared.Return(fromNext.Data);
+            RocksArrayPool<byte>.Shared.Return(fromNext.Data);
             Assert.IsFalse((await tier.LookupAsync(KeyOf(12345), CancellationToken.None)).Found);
             Assert.AreEqual(300.0, tier.Stats()[^1]["persistentcache.blockcachetier.cache_hits"]);
         }

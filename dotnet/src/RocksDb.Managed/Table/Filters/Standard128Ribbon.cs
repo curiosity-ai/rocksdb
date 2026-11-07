@@ -339,9 +339,9 @@ internal static class Standard128Ribbon
             if (_coeffLo.Length < numSlots)
             {
                 ReturnArrays();
-                _coeffLo = ArrayPool<ulong>.Shared.Rent((int)numSlots);
-                _coeffHi = ArrayPool<ulong>.Shared.Rent((int)numSlots);
-                _result = ArrayPool<uint>.Shared.Rent((int)numSlots);
+                _coeffLo = RocksArrayPool<ulong>.Shared.Rent((int)numSlots);
+                _coeffHi = RocksArrayPool<ulong>.Shared.Rent((int)numSlots);
+                _result = RocksArrayPool<uint>.Shared.Rent((int)numSlots);
             }
             Array.Clear(_coeffLo, 0, (int)numSlots);
             Array.Clear(_coeffHi, 0, (int)numSlots);
@@ -495,9 +495,9 @@ internal static class Standard128Ribbon
         {
             if (_coeffLo.Length > 0)
             {
-                ArrayPool<ulong>.Shared.Return(_coeffLo);
-                ArrayPool<ulong>.Shared.Return(_coeffHi);
-                ArrayPool<uint>.Shared.Return(_result);
+                RocksArrayPool<ulong>.Shared.Return(_coeffLo);
+                RocksArrayPool<ulong>.Shared.Return(_coeffHi);
+                RocksArrayPool<uint>.Shared.Return(_result);
             }
             _coeffLo = [];
             _coeffHi = [];
