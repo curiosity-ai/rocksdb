@@ -20,6 +20,7 @@ steady state, including background flush and compaction work, with 16-byte keys 
 | Iterators | a reused `Iterator`: `Seek` / `SeekForPrev` / `Next` / `Prev` / `Key` / `Value` / `Columns`, async moves, `foreach` over `Range(...)`, `ScanAsync`, `Refresh`, `SetBounds` | `NewIterator` / `NewIteratorAsync` + `Dispose` (56 B: the iterator handle), a `new ReadOptions` per scan (184 B) | reuse one iterator with `SetBounds` / `Refresh`, or one `ReadOptions` |
 | Wide columns | `TryGetEntity(key, WideColumns)` and `TryGetEntityLazy(options, key, LazyWideColumns)` with a reused result, `MultiGetEntity`, `Iterator.Columns` | `GetEntity` (312 B), `GetEntityLazy` (1 KB) | `TryGetEntity` / `TryGetEntityLazy` with a reused result |
 | Transactions | `BeginTransaction(writeOptions, options, oldTransaction)` + `SetName` / `Put` / `TryGetForUpdate` / `TryGet` / `Prepare` / `Commit` (sync and async, pessimistic and optimistic) | `using BeginTransaction(writeOptions)` per transaction (the transaction object, 350-470 B) | reuse the transaction object |
+| WAL tailing and replication | a held `GetUpdatesSince` iterator (`Next`, `MoveNextTailingAsync`), `TailUpdatesAsync`, `WaitForSequenceAsync`, `WriteBatchReader` / `WriteBatch.Iterate` over a `WalBatch`, `WalTailer`, `ReplicationConsumer`, `ProgressReporter`, `RaftClusterNode.WaitForCommitAsync`, reads on secondary and read-only instances | `GetUpdatesSince` per poll (about 3 KB: WAL listing and file open), an idle `TryCatchUpWithPrimary` (about 1.4 KB: WAL directory listing, opening CURRENT) | keep one iterator or tail; see [Replication and WAL tailing](#replication-and-wal-tailing) |
 | Monitoring | `Statistics` and `PerfContext` enabled (no allocation on reads), `GetTickerCount`, `GetHistogramData`, `TryGetIntProperty` / `TryGetAggregatedIntProperty`, `ColumnFamilies`, `GetColumnFamily(name)`, `GetLatestSequenceNumber`, `VisitLiveFiles`, `GetApproximateSizes(ranges, Span<ulong>)` | `GetProperty` (the result string), `GetLiveFilesMetadata` (about 400 B per file), `GetApproximateSizes` returning an array | the non-allocating variants; see [Monitoring and metadata APIs](#monitoring-and-metadata-apis) |
 
 ## Point reads
@@ -254,6 +255,44 @@ txn.Commit();                                   // or await txn.CommitAsync()
 - Concurrent async writers (many tasks awaiting `PutAsync` / `WriteAsync` in the same write groups) allocate nothing
   either: each waiting write owns its suspended state, so no tuning is needed.
 
+## Replication and WAL tailing
+
+A replica or WAL consumer that keeps up with a write stream allocates nothing per replicated batch in our code:
+waiting for the next write, reading it from the WAL, applying it and reporting progress all reuse pooled state.
+
+- **Keep one tail open.** Hold a `TransactionLogIterator` (or `TailUpdatesAsync` / `WalTailer.ReadChunksAsync`) for the
+  life of the stream. It follows WAL rotations itself and waits for new writes without polling. Opening
+  `GetUpdatesSince` per poll lists the WAL files and opens one each time (about 3 KB per call).
+
+  ```csharp
+  using TransactionLogIterator it = db.GetUpdatesSince(nextSeq);
+  while (await it.MoveNextTailingAsync(ct))           // waits for the next write; no allocation per batch
+  {
+      WalBatch b = it.Current;                         // a view, valid until the iterator moves
+      foreach (WriteBatchEntry e in b.GetReader()) Apply(e.Key, e.Value);
+  }
+  ```
+
+- `WaitForSequenceAsync`, `MoveNextTailingAsync`, `TailUpdatesAsync`, `WalTailer.WaitForUpdatesAsync` and
+  `RaftClusterNode.WaitForCommitAsync` allocate nothing while they wait, also with a cancellable token; a cancelled
+  wait throws `OperationCanceledException`.
+- **Apply without copies.** `ReplicationConsumer.IngestChunk` / `IngestChunkAsync` / `TryIngestChunkAsync` copy the
+  batch into a pooled `WriteBatch`; `WalBatch.ToWriteBatch()` does the same for your own `Write` (dispose the batch).
+  `WriteBatchReader` and `WriteBatch.Iterate(rep, ref handler)` with a struct handler read a batch without allocating.
+- **Progress reports.** `ProgressReporter.Report` and `ReplicationPrimary.ReportProgress` /
+  `ReplicationSource.RetireArchivedWals` allocate nothing while no archived WAL can be retired. They list the WAL files
+  only after a WAL rotation or once the slowest replica has applied a whole archived WAL. `RocksDatabase.CurrentWalNumber`
+  tells you cheaply whether the WAL rotated, if you write your own retention logic.
+- **Hosts.** `PairNodeHost.WriteAsync`, `ClusterNodeHost.TryWriteAsLeaderAsync` and `WriteCommittedAsync` allocate
+  nothing in steady state. `WriteCommittedAsync` pools its timeout source when its `CancellationToken` cannot be
+  cancelled; with a cancellable token it creates a linked token source per write. The Raft heartbeat loop allocates a
+  little per heartbeat (a payload and a timer per interval, not per write); an idle follower answers heartbeats with a
+  cached result. A real transport adds its own serialization costs.
+- **Secondary and read-only instances.** Reads (`TryGet`, `GetPooledAsync`, iterators) cost the same as on a primary.
+  `TryCatchUpWithPrimary` lists the WAL directory and reads CURRENT on every call, like upstream (about 1.4 KB for an
+  idle poll); applying new WAL data or MANIFEST edits adds a new super version per column family. Poll at the rate you
+  need, not in a tight loop.
+
 ## Options and settings that matter
 
 - **Block cache.** Set `BlockBasedTableOptions.BlockCache` explicitly (`BlockCache.CreateLru` / `CreateHyperClock`) and
@@ -327,7 +366,7 @@ steady-state throughput:
 
 ## Measuring allocations
 
-`tools/RocksDb.Managed.AllocationProfile` runs about 120 scenarios that cover the public API. Each one runs in its own
+`tools/RocksDb.Managed.AllocationProfile` runs about 150 scenarios that cover the public API. Each one runs in its own
 child process: setup, warm-up, then a measured phase that counts the exact bytes (`GC.GetTotalAllocatedBytes(precise:
 true)` and the calling thread's counter). After that the parent traces the child with
 [Memory.Introspect](https://www.nuget.org/packages/Memory.Introspect/) (GC allocation ticks, about one per 100 KB) to
@@ -342,7 +381,7 @@ dotnet run -c Release --project tools/RocksDb.Managed.AllocationProfile -f net10
 ```
 
 - Filters select a scenario name, a group (`write`, `batch`, `get`, `multiget`, `entity`, `iterator`, `txn`,
-  `property`, `background`, `lifecycle`, `native`, ...) or a prefix with a trailing `*`. `all` runs every managed
+  `property`, `background`, `lifecycle`, `wal-tail`, `secondary`, `replication`, `raft`, `native`, ...) or a prefix with a trailing `*`. `all` runs every managed
   scenario, and `--native` adds the rocksdb-sharp comparisons.
 - `--warmup S` / `--measure S` / `--trace S` set the phase lengths in seconds. Use a longer warm-up for write and
   transaction scenarios so memtable arenas and pools reach steady state. `--trace 0` skips tracing (exact numbers

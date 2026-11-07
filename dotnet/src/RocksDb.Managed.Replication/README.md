@@ -79,6 +79,12 @@ if (!await consumer.TryIngestChunkAsync(chunkBytes, ct)) Resync();   // must sta
 * WAL retention: with `DbOptions.WalTtlSeconds`/`WalSizeLimitMb` obsolete WALs are archived;
   `ReplicationSource.ReportReplicaProgress` + `RetireArchivedWals()` delete archived WALs once every replica applied
   them (nothing while a checkpoint session is in flight). Size the archive for the longest expected replica downtime.
+* Steady-state streaming allocates nothing per replicated batch in this library: the tailer's and the replica's waits,
+  the chunk buffer, the pooled `WriteBatch` the consumer applies, `ProgressReporter`, the WAL-retention check of
+  `ReportReplicaProgress` / `RetireArchivedWals()` (the WAL files are listed only after a WAL rotation or once the
+  slowest replica finished an archived WAL), Raft progress and commit waits, and `PairNodeHost.WriteAsync` /
+  `ClusterNodeHost.WriteCommittedAsync` (with a non-cancellable token; a cancellable one costs a linked token source per
+  write). The transport's own serialization is extra; see `docs/allocations.md` ("Replication and WAL tailing").
 * Use the same column families on the replica (batches carry column family ids) and keep the WAL in the DB directory
   (`WalDir` empty) on replicas restored from a checkpoint (a checkpoint stores its WALs next to the tables).
 
