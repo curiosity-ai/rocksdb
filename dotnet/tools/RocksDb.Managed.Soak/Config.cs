@@ -143,6 +143,13 @@ internal sealed class RunConfig
     /// first durability check after a clear-cache. Proves the LazyFS mode catches a missing fsync.
     /// </summary>
     public bool UnsafeSkipFsync { get; set; }
+    /// <summary>LazyFS cache size (<c>--lazyfs-cache</c>, LazyFS syntax such as <c>1GB</c>).</summary>
+    public string LazyFsCache { get; set; } = "1GB";
+    /// <summary>
+    /// LazyFS <c>apply_eviction</c> (<c>--lazyfs-eviction</c>): write dirty pages back when the cache is full, like a
+    /// real page cache. Without it a full cache makes LazyFS stop answering.
+    /// </summary>
+    public bool LazyFsEviction { get; set; }
     public string StartedUtc { get; set; } = "";
 
     public static Dictionary<string, int> DefaultWeights() => new()

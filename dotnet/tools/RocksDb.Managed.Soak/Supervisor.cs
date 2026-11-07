@@ -59,6 +59,9 @@ internal sealed class Supervisor
     private readonly CancellationTokenSource _stopCts = new();
     private double _lastOpenMs = 300;
     private readonly LazyFsMount? _lazyfs;
+    private Thread? _watchdog;
+    /// <summary>Set by the watchdog when the LazyFS mount stopped answering (an infrastructure failure).</summary>
+    private volatile string? _lazyfsHung;
 
     public Supervisor(RunPaths paths, RunConfig cfg, TimeSpan duration)
     {
@@ -69,7 +72,7 @@ internal sealed class Supervisor
         _elapsedBefore = _status.ElapsedSeconds;
         _status.DurationSeconds = _elapsedBefore + duration.TotalSeconds;
         _status.Result = "running";
-        if (cfg.LazyFsBinary is not null) _lazyfs = new LazyFsMount(cfg.LazyFsBinary, paths, Log);
+        if (cfg.LazyFsBinary is not null) _lazyfs = new LazyFsMount(cfg.LazyFsBinary, paths, cfg.LazyFsCache, cfg.LazyFsEviction, Log);
     }
 
     private void Log(string s)
@@ -88,6 +91,108 @@ internal sealed class Supervisor
         _status.Save(_paths.Status);
     }
 
+    /// <summary>
+    /// Probes the LazyFS mount every 15 s with an external <c>stat</c> (a stuck FUSE request would also block a
+    /// thread of this process). After 3 consecutive probes without an answer the mount is declared hung: the FUSE
+    /// connection is aborted (every blocked request fails with ENOTCONN, so the current phase ends) and the cycle is
+    /// reported as an infrastructure failure, not as a failure of the port.
+    /// </summary>
+    private void StartWatchdog()
+    {
+        if (!_cfg.UsesLazyFs) return;
+        _watchdog = new Thread(LazyFsWatchdog) { IsBackground = true, Name = "lazyfs-watchdog" };
+        _watchdog.Start();
+    }
+
+    /// <summary>
+    /// After a LazyFS hang (the daemon was killed and the connection aborted): remount LazyFS and verify the cycle
+    /// again with power-loss expectations. Restarting LazyFS loses its unsynced cache, which is exactly a power loss;
+    /// writes acknowledged as synced were on the backing disk before LazyFS acknowledged the fsync, so the
+    /// power-loss checks apply unchanged. Returns 0 when the re-verification passed (the cycle is folded).
+    /// </summary>
+    private int RecoverFromLazyFsHang(CyclePlan plan)
+    {
+        Bump(_status.Notes, "lazyfs-hang-restarts");
+        Log($"cycle {plan.Cycle}: restarting LazyFS after the hang (its unsynced cache is lost: a power loss); " +
+            "verifying the cycle again with power-loss expectations");
+        try
+        {
+            _lazyfs!.Unmount();
+            _lazyfs.Mount();
+            _lazyfsHung = null;
+            StartWatchdog();
+            plan.Fault = FaultKind.LazyFsClear;
+            plan.CorruptTrial = false;
+            plan.Save(_paths.CycleJson);
+            Bump(_status.Faults, "LazyFsHangRestart");
+            int v = Verify(plan);
+            if (v != 0) return v;
+            Fold(plan);
+            return 0;
+        }
+        catch (IOException e) when (_lazyfsHung is not null)
+        {
+            return LazyFsHungFailure(plan, e.Message);
+        }
+        catch (InvalidOperationException e)
+        {
+            Log("could not restart LazyFS: " + e.Message);
+            return 3;
+        }
+    }
+
+    private void LazyFsWatchdog()
+    {
+        int misses = 0;
+        while (_lazyfsHung is null)
+        {
+            Thread.Sleep(15_000);
+            if (_status.Result is "passed" or "failed") return;
+            if (LazyFsMount.Probe(_paths.Db, TimeSpan.FromSeconds(20)))
+            {
+                misses = 0;
+                continue;
+            }
+            if (++misses < 3) continue;
+            _lazyfsHung = $"the LazyFS mount {_paths.Db} did not answer `ls -l` for 3 probes (~2 min)";
+            Log("LAZYFS HUNG: " + _lazyfsHung + "; aborting the FUSE connection");
+            if (_lazyfs is not null) _lazyfs.Abort();
+            else LazyFsMount.AbortConnection(_paths.Db, Log);
+            return;
+        }
+    }
+
+    /// <summary>
+    /// The LazyFS daemon stopped answering: keep the cycle's logs and the LazyFS log, return 3. The run loop restarts
+    /// LazyFS when the supervisor owns the mount (<c>--lazyfs-bin</c>), otherwise it stops with exit code 3.
+    /// </summary>
+    private int LazyFsHungFailure(CyclePlan plan, string reason)
+    {
+        string dir = Path.Combine(_paths.Failures, $"cycle-{plan.Cycle:D6}-lazyfs-hung");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(dir, "logs"));
+            foreach (string f in Directory.GetFiles(_paths.Logs, $"cycle-{plan.Cycle:D6}-*")) File.Copy(f, Path.Combine(dir, "logs", Path.GetFileName(f)), true);
+            if (_lazyfs is not null && File.Exists(_lazyfs.LogFile)) File.Copy(_lazyfs.LogFile, Path.Combine(dir, "lazyfs.log"), true);
+        }
+        catch (Exception e)
+        {
+            Log("could not preserve everything: " + e.Message);
+        }
+        string summary =
+            $"INFRASTRUCTURE FAILURE in cycle {plan.Cycle}: {_lazyfsHung}\n" +
+            $"This is not a check failure of the port: LazyFS stopped answering FUSE requests (a lock-order deadlock " +
+            $"inside LazyFS; see docs/soak.md, " +
+            $"\"Real LazyFS mode\"). The phase then ended with: {reason.Split('\n')[0]}\n" +
+            $"seed {_cfg.Seed}, cycle seed {plan.CycleSeed}, fault {plan.Fault}; LazyFS cache {_cfg.LazyFsCache}, eviction {_cfg.LazyFsEviction}\n";
+        File.WriteAllText(Path.Combine(dir, "summary.txt"), summary);
+        Bump(_status.Notes, "lazyfs-hangs");
+        Log(summary);
+        Log("preserved in " + dir);
+        return 3;
+    }
+
     private static void Bump(SortedDictionary<string, long> d, string k, long n = 1) => d[k] = d.GetValueOrDefault(k) + n;
 
     public int Run()
@@ -97,6 +202,7 @@ internal sealed class Supervisor
         try
         {
             _lazyfs?.Mount();
+            StartWatchdog();
             if (!File.Exists(_paths.ModelFile))
             {
                 SetPhase("init", 0, "");
@@ -114,7 +220,16 @@ internal sealed class Supervisor
             {
                 Model model = Model.Load(_paths.ModelFile);
                 CyclePlan plan = Plan(model.Cycle);
-                int r = RunCycle(plan);
+                int r;
+                try { r = RunCycle(plan); }
+                catch (IOException e) when (_lazyfsHung is not null) { r = LazyFsHungFailure(plan, e.Message); }
+                for (int restarts = 0; r == 3 && _lazyfs is not null && restarts < 3; restarts++)
+                    r = RecoverFromLazyFsHang(plan);
+                if (r == 3)
+                {
+                    _status.Result = "infrastructure-failure";
+                    SetPhase("failed", plan.Cycle, plan.Fault.ToString());
+                }
                 if (r != 0) return r;
                 lastNative = plan.NativeCheck;
             }
@@ -258,6 +373,7 @@ internal sealed class Supervisor
     /// <summary>Preserves everything about a failed cycle (DB first) and stops.</summary>
     private int Fail(CyclePlan plan, string reason)
     {
+        if (_lazyfsHung is not null) return LazyFsHungFailure(plan, reason);
         string dir = Path.Combine(_paths.Failures, $"cycle-{plan.Cycle:D6}");
         Directory.CreateDirectory(dir);
         try
@@ -506,11 +622,12 @@ internal sealed class Supervisor
 /// (lazyfs/data), the FIFOs, a config file, and the daemon started with <c>-o allow_other -o modules=subdir
 /// -o subdir=root</c>. Requires the lazyfs binary, FUSE 3 and <c>user_allow_other</c> in /etc/fuse.conf.
 /// </summary>
-internal sealed class LazyFsMount(string binary, RunPaths paths, Action<string> log)
+internal sealed class LazyFsMount(string binary, RunPaths paths, string cacheSize, bool eviction, Action<string> log)
 {
     private Process? _daemon;
     private string Dir => Path.Combine(paths.Root, "lazyfs");
-    private string Data => Path.Combine(Dir, "data");
+    public string Data => Path.Combine(Dir, "data");
+    public string LogFile => Path.Combine(Dir, "lazyfs.log");
     public string Fifo => Path.Combine(Dir, "fifo");
     public string FifoCompleted => Path.Combine(Dir, "fifo-completed");
     private string ConfigFile => Path.Combine(Dir, "config.toml");
@@ -522,8 +639,8 @@ internal sealed class LazyFsMount(string binary, RunPaths paths, Action<string> 
         foreach (string f in new[] { Fifo, FifoCompleted })
             if (!File.Exists(f)) Exec("mkfifo", f);
         File.WriteAllText(ConfigFile,
-            $"[faults]\nfifo_path=\"{Fifo}\"\nfifo_path_completed=\"{FifoCompleted}\"\n\n[cache]\napply_eviction=false\n\n" +
-            $"[cache.simple]\ncustom_size=\"1GB\"\nblocks_per_page=1\n\n[filesystem]\nlogfile=\"{Path.Combine(Dir, "lazyfs.log")}\"\nlog_all_operations=false\n");
+            $"[faults]\nfifo_path=\"{Fifo}\"\nfifo_path_completed=\"{FifoCompleted}\"\n\n[cache]\napply_eviction={(eviction ? "true" : "false")}\n\n" +
+            $"[cache.simple]\ncustom_size=\"{cacheSize}\"\nblocks_per_page=1\n\n[filesystem]\nlogfile=\"{Path.Combine(Dir, "lazyfs.log")}\"\nlog_all_operations=false\n");
         var psi = new ProcessStartInfo(binary) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
         foreach (string a in new[] { paths.Db, "--config-path", ConfigFile, "-o", "allow_other", "-o", "modules=subdir", "-o", "subdir=" + Data, "-f" })
             psi.ArgumentList.Add(a);
@@ -550,8 +667,10 @@ internal sealed class LazyFsMount(string binary, RunPaths paths, Action<string> 
                 // Like Jepsen: drop the cache first, so the unmount does not flush it.
                 try { ClearCache(Fifo, FifoCompleted, log); }
                 catch (Exception) { /* best effort */ }
-                Exec("fusermount3", "-uz", paths.Db);
             }
+            // Also when mountpoint fails: an aborted connection leaves a stale mount ("Transport endpoint is not
+            // connected") that only the lazy unmount removes.
+            Exec("fusermount3", "-uz", paths.Db);
             if (_daemon is { HasExited: false })
             {
                 if (!_daemon.WaitForExit(10_000)) _daemon.Kill();
@@ -562,6 +681,55 @@ internal sealed class LazyFsMount(string binary, RunPaths paths, Action<string> 
         {
             log("lazyfs unmount failed: " + e.Message);
         }
+    }
+
+    /// <summary>Kills the daemon; the kernel then aborts the FUSE connection (pending requests fail with ENOTCONN).</summary>
+    public void Abort()
+    {
+        try
+        {
+            if (_daemon is { HasExited: false }) _daemon.Kill();
+        }
+        catch (InvalidOperationException) { }
+        AbortConnection(paths.Db, log);
+    }
+
+    /// <summary>Aborts the FUSE connection of a mount through fusectl (<c>/sys/fs/fuse/connections/N/abort</c>).</summary>
+    public static void AbortConnection(string mountPoint, Action<string> log)
+    {
+        try
+        {
+            string mp = Path.TrimEndingDirectorySeparator(Path.GetFullPath(mountPoint));
+            foreach (string line in File.ReadLines("/proc/self/mountinfo"))
+            {
+                string[] f = line.Split(' ');
+                if (f.Length < 5 || f[4] != mp) continue;
+                string minor = f[2][(f[2].IndexOf(':') + 1)..];
+                string abort = $"/sys/fs/fuse/connections/{minor}/abort";
+                if (File.Exists(abort)) File.WriteAllText(abort, "1");
+                log("FUSE connection " + minor + " aborted");
+                return;
+            }
+        }
+        catch (Exception e)
+        {
+            log("could not abort the FUSE connection: " + e.Message);
+        }
+    }
+
+    /// <summary>True when <c>ls -l</c> of the mount point answers within the timeout (run as a separate process).</summary>
+    public static bool Probe(string mountPoint, TimeSpan timeout)
+    {
+        // ls -l: readdir plus a getattr of every file. A stat of the mount point alone is not enough: LazyFS can
+        // deadlock its per-file locks against its global inode lock while still answering the root's getattr.
+        var psi = new ProcessStartInfo("ls") { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
+        psi.ArgumentList.Add("-l");
+        psi.ArgumentList.Add(mountPoint);
+        using Process p = Process.Start(psi)!;
+        if (p.WaitForExit(timeout)) return true; // any answer, even an error, means the daemon replied
+        try { p.Kill(); }
+        catch (InvalidOperationException) { }
+        return false;
     }
 
     /// <summary>Writes lazyfs::clear-cache to the FIFO and waits for finished::clear-cache on the completion FIFO.</summary>
