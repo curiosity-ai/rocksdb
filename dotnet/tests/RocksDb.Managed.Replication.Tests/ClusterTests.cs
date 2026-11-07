@@ -194,4 +194,51 @@ public sealed class ClusterTests
             for (int i = 50; i < 120; i++) Assert.IsNotNull(h.Db.Get(U(K(i))), "acknowledged key " + i + " lost on " + h.NodeId + " after the power loss\n" + c.LogText);
         }
     }
+
+    /// <summary>
+    /// A node killed during a snapshot resync (after the restore deleted its old files, before CURRENT arrived) restarts
+    /// without a database but with its Raft term and vote. It must rebuild from the current leader before it takes part
+    /// again: with an empty log it would vote for any candidate, and the bootstrap primary used to open an empty
+    /// database right away, so a candidate missing a committed write could win with its vote and the write was lost.
+    /// (Non-bootstrap nodes pulled only from the bootstrap member, which may not lead, and gave up after 100 tries.)
+    /// </summary>
+    [TestMethod]
+    public async Task NodeRestartedWithoutItsDatabaseRebuildsFromTheLeaderBeforeVoting()
+    {
+        await using var c = new ClusterHarness(3, null) { ArchiveWals = false };
+        await c.StartAsync("n1");
+        for (int i = 0; i < 50; i++) await c["n1"].TryWriteAsLeaderAsync(U(K(i)), U(V(i, 0)), CancellationToken.None);
+        await c.StartAsync("n2");
+        await c.StartAsync("n3");
+        await WaitUntilAsync(() => c.Statuses().TrueForAll(s => s.Mode == ClusterMode.Cluster), "cluster mode\n" + c.LogText);
+        // n1 (the bootstrap primary) becomes a follower.
+        await c.StopAsync("n1");
+        ClusterNodeHost leader = await c.WaitForLeaderAsync("n1");
+        await c.StartAsync("n1");
+        await WriteCommittedAsync(c, 50, 80);
+        await c.AssertConvergedAsync(leader);
+        string other = leader.NodeId == "n2" ? "n3" : "n2";
+
+        // The other follower is down; an acknowledged write commits on the leader and n1.
+        await c.StopAsync(other);
+        Assert.IsTrue(await leader.WriteCommittedAsync(U("acked"), U("must survive"), TimeSpan.FromSeconds(5), CancellationToken.None));
+        // n1 dies in the middle of a resync: its database files are gone, its Raft state is not.
+        await c.StopAsync("n1");
+        foreach (string f in Directory.GetFiles(c.DbPath("n1"))) File.Delete(f);
+        // The only node with the write besides n1 goes down; the lagging node and n1 come back.
+        string leaderId = leader.NodeId;
+        await c.StopAsync(leaderId);
+        await c.StartAsync(other);
+        Task n1Start = c.StartAsync("n1");
+        await Task.Delay(3000);
+        foreach (ClusterNodeStatus s in c.Statuses())
+            Assert.AreNotEqual(RaftRole.Leader, s.Role, s.NodeId + " was elected without the acknowledged write\n" + c.LogText);
+
+        await c.StartAsync(leaderId);
+        await n1Start;
+        ClusterNodeHost final = await c.WaitForLeaderAsync(null);
+        await WriteCommittedAsync(c, 80, 90);
+        await c.AssertConvergedAsync(final);
+        foreach (ClusterNodeHost h in c.Running) Assert.IsNotNull(h.Db.Get(U("acked")), "acknowledged write lost on " + h.NodeId + "\n" + c.LogText);
+    }
 }

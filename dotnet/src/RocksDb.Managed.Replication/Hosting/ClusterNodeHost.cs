@@ -136,10 +136,15 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         _fs.CreateDirectoryIfMissing(_cfg.DbPath);
         _state = new RaftPersistentState(_fs, RaftDir);
 
-        // Non-bootstrap nodes pull an initial snapshot only when the DB is fresh.
-        if (!IsBootstrapPrimary && !_fs.FileExists(FileSystemHelpers.Combine(_cfg.DbPath, "CURRENT")))
+        // A node without a database pulls a snapshot before it takes part: a new follower, and any node whose Raft state
+        // outlived its database (killed during a snapshot restore, which deletes the old files before CURRENT arrives).
+        // With an empty log such a node would grant its vote to any candidate, including one that lacks entries this
+        // node had helped commit. Only the bootstrap primary of a new cluster (or one still in Bootstrap mode, where no
+        // other node can lead) starts from an empty database.
+        if (!_fs.FileExists(FileSystemHelpers.Combine(_cfg.DbPath, "CURRENT")) &&
+            (!IsBootstrapPrimary || (!_state.IsFresh && _state.Mode == ClusterMode.Cluster)))
         {
-            await PullSnapshotWithRetryAsync(BootstrapMember(), cancellationToken).ConfigureAwait(false);
+            await PullInitialSnapshotAsync(cancellationToken).ConfigureAwait(false);
         }
         _db = await OpenDatabaseAsync(cancellationToken).ConfigureAwait(false);
 
@@ -617,21 +622,31 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     // ---------------------------------------------------------------------------------------------------
     // Snapshot pull + full resync
 
-    private async Task PullSnapshotWithRetryAsync(ClusterMember source, CancellationToken cancellationToken)
+    /// <summary>
+    /// Pulls the initial snapshot from the current leader (any member that leads or knows the leader), or from the
+    /// bootstrap primary while the cluster is still in Bootstrap mode; retries until it succeeds or the host stops.
+    /// </summary>
+    private async Task PullInitialSnapshotAsync(CancellationToken cancellationToken)
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
-        for (int attempt = 0; ; attempt++)
+        CancellationToken ct = linked.Token;
+        while (true)
         {
-            try
+            ClusterMember? source = await FindLeaderAsync(ct).ConfigureAwait(false);
+            if (source == null && _state.Mode == ClusterMode.Bootstrap && !IsBootstrapPrimary) source = BootstrapMember();
+            if (source != null)
             {
-                await PullSnapshotAsync(source, linked.Token).ConfigureAwait(false);
-                return;
+                try
+                {
+                    await PullSnapshotAsync(source, ct).ConfigureAwait(false);
+                    return;
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    Log("snapshot from " + source.NodeId + " failed: " + ex.Message + "; retrying");
+                }
             }
-            catch (Exception ex) when (attempt < 100 && !linked.IsCancellationRequested)
-            {
-                Log("snapshot from " + source.NodeId + " failed: " + ex.Message + "; retrying");
-                await Task.Delay(_cfg.RetryDelay, linked.Token).ConfigureAwait(false);
-            }
+            await Task.Delay(_cfg.RetryDelay, ct).ConfigureAwait(false);
         }
     }
 
