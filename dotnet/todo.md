@@ -340,6 +340,17 @@ Still open from this round:
 - [ ] Native 11.12 bugs found (same code on main; could be reported upstream): unordered_write + manual_wal_flush self-deadlock on wal_write_mutex_; DBIter::MergeWithBlobBaseValue returns freed memory; hash index / hash skiplist call Transform without InDomain (see docs/validation.md "Combinatorial round trips"; ready-to-file reports with C API repros in docs/upstream-issues/)
 - [ ] Round-trip matrix not yet crossing: wide columns (no C API PutEntity in 11.12), preclude_last_level_data_seconds, separate_key_value_in_data_block, db_paths / cf_paths, last_level_temperature
 
+## Allocation-free pass (2026-11-07; tool: tools/RocksDb.Managed.AllocationProfile, user guide: docs/allocations.md)
+
+- [x] Profiler tool (Memory.Introspect allocation ticks + exact B/op per scenario, 121+ scenarios, child process per scenario)
+- [x] Iterators: pooled iterator stacks per CF (NewIterator+Dispose 2.1-4 KB -> 56 B handle), `Iterator.Refresh` / `Refresh(Snapshot)` / `RefreshAsync`, `SetBounds`, cached ScanAsync enumerator; base-delta and transaction iterators pooled
+- [x] Writes / transactions: concurrent async write-group leader without state-machine boxes (OwnedValueTaskMethodBuilder), transaction resource reuse, optimistic commit and 2PC SetName 0 B, `WriteBatchWithIndex.Rent` / `CreateWriteBatchWithIndex`, undisposed `new WriteBatch()` no longer drains the shared pool
+- [x] Range tombstones: closure/lambda-free fragmenter (differential tests), flush / compaction / range-del block without per-tombstone keys or list growth; per-reader tombstone cache lookup without a closure
+- [x] Background: EVENT_LOG / LOG formatted only when enabled, table-property string interning, pooled file write buffers, long-lived background thread pool (BackgroundThreadPool), pooled dictionary-compression blocks, cached compression-options string, version installation and filter buffers
+- [x] Reads / monitoring / open: pooled legacy MultiGet (20 KB -> 2.2 KB per 16 keys), caller-memory `MultiGet` (+async) 0 B, lazy-entity pin reuse, integer property path (`TryGetIntProperty` 0 B), cached `ColumnFamilies`, `VisitLiveFiles` / list-refill `GetLiveFilesMetadata`, span `GetApproximateSizes`, non-allocating `GetHistogramData`, lazy HyperClock slot table (open 2.7 MB -> 0.75 MB)
+- [ ] Open still lists the DB directory more than once (sharing one listing across WAL recovery and obsolete-file scans is unsafe; a few KB per open)
+- [ ] Not profiled yet: GetUpdatesSince, secondary / read-only, TTL, remote compaction, attribute groups, coalescing iterator, MultiScan, PlainTable / CuckooTable, blob GC, rate limiter, tracing, replication layer
+
 ## Unported utilities (found 2026-11-03)
 
 - [x] Built-in merge operators: max, put / put_v1, sortlist, bytesxor, StringAppendTEST, AggMerge (+ Aggregator API); resolved by name from OPTIONS; native writes / managed reads and compacts and vice versa for 12 ids; string-append delimiter now persisted like native

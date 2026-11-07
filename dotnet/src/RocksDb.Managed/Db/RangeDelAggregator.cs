@@ -414,7 +414,10 @@ public static class RangeDelTableTombstones
         if (!reader.HasRangeTombstones) return null;
         if (s_cache.TryGetValue(reader, out FragmentedRangeTombstoneList? cached)) return cached;
         FragmentedRangeTombstoneList built = Build(reader);
-        return s_cache.GetValue(reader, _ => built);
+        // TryAdd instead of GetValue(reader, _ => built): a lambda capturing a method-level local makes the compiler
+        // allocate its closure on entry, i.e. on every call including cache hits. A racing builder keeps the winner.
+        if (!s_cache.TryAdd(reader, built) && s_cache.TryGetValue(reader, out FragmentedRangeTombstoneList? winner)) return winner;
+        return built;
     }
 
     private static FragmentedRangeTombstoneList Build(TableReader reader)

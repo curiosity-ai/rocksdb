@@ -494,6 +494,24 @@ public sealed class RangeTombstoneFragmenterTests
         Assert.IsTrue(allocated < 4L * data.Length + (256 << 10), "allocated " + allocated + " B for a " + data.Length + " B table");
     }
 
+    /// <summary>The per-reader tombstone cache (RangeDelTableTombstones.Get) allocates nothing on a hit.</summary>
+    [TestMethod]
+    public void CachedTableTombstonesLookupDoesNotAllocate()
+    {
+        var tombstones = new List<(byte[] Key, byte[] Value)>
+        {
+            (TableTestUtil.IKey("a", 2, EntryType.RangeDeletion), DbTestUtil.B("c")),
+            (TableTestUtil.IKey("m", 3, EntryType.RangeDeletion), DbTestUtil.B("p")),
+        };
+        using BlockBasedTableReader reader = TableTestUtil.Open(Build(tombstones, new TableFormatOptions()));
+        FragmentedRangeTombstoneList? first = RangeDelTableTombstones.Get(reader);
+        Assert.IsNotNull(first);
+        Assert.AreSame(first, RangeDelTableTombstones.Get(reader));
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 1000; i++) RangeDelTableTombstones.Get(reader);
+        Assert.AreEqual(0L, GC.GetAllocatedBytesForCurrentThread() - before);
+    }
+
     private static void VerifyLargeRangeDelTable(byte[] data, int n)
     {
         // Block checksums (incl. the context checksum of the directly written block) are verified on read.
