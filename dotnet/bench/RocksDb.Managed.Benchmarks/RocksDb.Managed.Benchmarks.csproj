@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RocksDb.Managed\RocksDb.Managed.csproj" />
+    <PackageReference Include="RocksDB" />
+    <PackageReference Include="BenchmarkDotNet" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- librocksdb under a .NET 11 apphost: see the file's remarks. -->
+    <Compile Include="..\..\tests\Shared\NativeStdCxxPreload.cs" Link="NativeStdCxxPreload.cs" />
+  </ItemGroup>
+</Project>

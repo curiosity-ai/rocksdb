@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Tests of the replication / switchover / Raft cluster layer: in-process nodes over an in-memory transport,
+       plus a native (rocksdb-sharp) replica fed with the managed WAL stream. -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <OutputType>Exe</OutputType>
+    <EnableMSTestRunner>true</EnableMSTestRunner>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="MSTest" />
+    <PackageReference Include="RocksDB" />
+    <ProjectReference Include="..\..\src\RocksDb.Managed\RocksDb.Managed.csproj" />
+    <ProjectReference Include="..\..\src\RocksDb.Managed.Replication\RocksDb.Managed.Replication.csproj" />
+    <ProjectReference Include="..\..\src\RocksDb.Managed.Replication.MagicOnion\RocksDb.Managed.Replication.MagicOnion.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- librocksdb under a .NET 11 apphost: see the file's remarks. -->
+    <Compile Include="..\Shared\NativeStdCxxPreload.cs" Link="NativeStdCxxPreload.cs" />
+  </ItemGroup>
+</Project>

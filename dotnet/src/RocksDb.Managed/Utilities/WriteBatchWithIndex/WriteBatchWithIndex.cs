@@ -1,0 +1,1264 @@
+using System.Buffers;
+using RocksDb.Managed.Db;
+using RocksDb.Managed.Utilities.Wbwi;
+using RocksDb.Managed.Util;
+
+namespace RocksDb.Managed;
+
+/// <summary>Kind of a <see cref="WriteBatchWithIndex"/> entry (rocksdb::WriteType); values match upstream.</summary>
+public enum WriteType : byte
+{
+    Put = 0,
+    Merge = 1,
+    Delete = 2,
+    SingleDelete = 3,
+    DeleteRange = 4,
+    LogData = 5,
+    Xid = 6,
+    PutEntity = 7,
+    Unknown = 8,
+}
+
+/// <summary>
+/// A <see cref="WriteBatch"/> with a searchable index of its keys, so that the pending writes can be read back
+/// (<see cref="TryGetFromBatch(ColumnFamily?, ReadOnlySpan{byte}, IBufferWriter{byte})"/>), combined with the DB
+/// (<see cref="TryGetFromBatchAndDB(RocksDatabase, ReadOptions?, ColumnFamily?, ReadOnlySpan{byte}, IBufferWriter{byte})"/>,
+/// <see cref="NewIteratorWithBase(ColumnFamily?, Iterator, ReadOptions?)"/>) before being written atomically with
+/// <see cref="RocksDatabase.Write(WriteBatchWithIndex)"/>. Port of rocksdb::WriteBatchWithIndex
+/// (utilities/write_batch_with_index/write_batch_with_index.cc).
+/// <para>
+/// The batch rep is byte-identical to the one native WriteBatchWithIndex builds for the same operations. With
+/// <c>overwriteKey</c> the index keeps one entry per key for Put/Delete/SingleDelete/PutEntity (merges always add an
+/// entry), like upstream's overwrite_key mode; otherwise every update is indexed. Merges are resolved with the column
+/// family's merge operator (operations on the default column family without a <see cref="ColumnFamily"/> use the
+/// merge operator passed to the reading method). DeleteRange is not supported (NotSupported, like upstream). Not
+/// thread-safe. Dispose to return the batch buffer.
+/// </para>
+/// <para>
+/// <see cref="Rent()"/> (or <see cref="RocksDatabase.CreateWriteBatchWithIndex()"/>) takes a bytewise-ordered batch from
+/// a process-wide pool; its <see cref="Dispose"/> clears it and returns it to the pool, so building a batch per
+/// operation does not allocate once the pooled batches have grown to their working size.
+/// </para>
+/// </summary>
+public sealed class WriteBatchWithIndex : IDisposable
+{
+    private readonly WriteBatch _batch;
+    private readonly WriteBatchEntryIndex _index;
+    private readonly Comparator _defaultComparator;
+    private readonly MergeContext _mergeContext = new();
+
+    /// <summary>A bytewise-ordered batch without overwrite_key.</summary>
+    public WriteBatchWithIndex() : this(Comparator.Bytewise, 0, false, 0) { }
+
+    /// <summary>
+    /// <paramref name="defaultComparator"/> orders keys of column families for which no <see cref="ColumnFamily"/> was
+    /// given (upstream: backup_index_comparator); <paramref name="overwriteKey"/> selects overwrite_key mode;
+    /// <paramref name="maxBytes"/> &gt; 0 caps the batch size (MemoryLimit).
+    /// </summary>
+    public WriteBatchWithIndex(Comparator defaultComparator, int reservedBytes, bool overwriteKey, int maxBytes)
+    {
+        ArgumentNullException.ThrowIfNull(defaultComparator);
+        _defaultComparator = defaultComparator;
+        _batch = new WriteBatch(reservedBytes, maxBytes);
+        _index = new WriteBatchEntryIndex(_batch, defaultComparator);
+        OverwriteKey = overwriteKey;
+    }
+
+    /// <summary>
+    /// The batch of a transaction (TransactionBaseImpl): overwrite_key mode, and with <paramref name="withNoop"/> (2PC) the
+    /// batch starts with a Noop record that Prepare turns into the begin-prepare marker (also after <see cref="Clear"/>).
+    /// </summary>
+    internal WriteBatchWithIndex(int maxBytes, bool withNoop) : this(Comparator.Bytewise, 0, true, maxBytes)
+    {
+        _withNoop = withNoop;
+        if (withNoop) _batch.InsertNoop();
+    }
+
+    private readonly bool _withNoop;
+
+    /// <summary>overwrite_key mode.</summary>
+    public bool OverwriteKey { get; private set; }
+
+    /// <summary>The underlying batch (WriteBatchWithIndex::GetWriteBatch). Do not modify it directly.</summary>
+    public WriteBatch WriteBatch
+    {
+        get
+        {
+            ThrowIfInPool();
+            return _batch;
+        }
+    }
+
+    /// <summary>The batch rep (WriteBatch::Data()).</summary>
+    public ReadOnlySpan<byte> Data
+    {
+        get
+        {
+            ThrowIfInPool();
+            return _batch.Data;
+        }
+    }
+
+    // ---- Pooling ----------------------------------------------------------------------------------------------
+
+    private static readonly WriteBatchWithIndex?[] s_pool = new WriteBatchWithIndex?[Math.Min(64, Environment.ProcessorCount * 4)];
+    private const int MaxPooledBatchBytes = 1 << 20;
+    private const int MaxPooledIndexEntries = 1 << 16;
+    // Rented with Rent: Dispose returns the batch to s_pool. _inPool: it is in s_pool (any use is a use after Dispose).
+    private bool _pooled;
+    private bool _inPool;
+
+    /// <summary>
+    /// Gets an empty, bytewise-ordered batch without overwrite_key from a process-wide pool (or a new one, like
+    /// <see cref="WriteBatchWithIndex()"/>). <see cref="Dispose"/> clears it and returns it to the pool: the batch, its
+    /// iterators and the <see cref="WriteBatch"/> it exposes must not be used afterwards.
+    /// </summary>
+    public static WriteBatchWithIndex Rent() => Rent(overwriteKey: false);
+
+    /// <summary>
+    /// <see cref="Rent()"/> with overwrite_key mode selected by <paramref name="overwriteKey"/> (see
+    /// <see cref="WriteBatchWithIndex(Comparator, int, bool, int)"/>).
+    /// </summary>
+    public static WriteBatchWithIndex Rent(bool overwriteKey)
+    {
+        WriteBatchWithIndex?[] pool = s_pool;
+        for (int i = 0; i < pool.Length; i++)
+        {
+            WriteBatchWithIndex? b = pool[i];
+            if (b is not null && Interlocked.CompareExchange(ref pool[i], null, b) == b)
+            {
+                b._inPool = false;
+                b._pooled = true;
+                b.OverwriteKey = overwriteKey;
+                return b;
+            }
+        }
+        return new WriteBatchWithIndex(Comparator.Bytewise, 0, overwriteKey, 0) { _pooled = true };
+    }
+
+    /// <summary>
+    /// Returns a rented batch to the pool: cleared, without column family comparators (the next renter may use other
+    /// databases) and with indexing enabled. Batches that grew very large are dropped instead.
+    /// </summary>
+    private bool TryReturnToPool()
+    {
+        _pooled = false;
+        if (_batch.Capacity > MaxPooledBatchBytes || _index.Count > MaxPooledIndexEntries) return false;
+        Clear();
+        _index.ResetComparators();
+        IndexingDisabled = false;
+        _mergeContext.Clear();
+        _inPool = true;
+        WriteBatchWithIndex?[] pool = s_pool;
+        for (int i = 0; i < pool.Length; i++)
+        {
+            if (pool[i] is null && Interlocked.CompareExchange(ref pool[i], this, null) is null) return true;
+        }
+        _inPool = false;
+        return false;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private void ThrowIfInPool()
+    {
+        if (_inPool) ThrowInPool();
+    }
+
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ThrowInPool() => throw new ObjectDisposedException(nameof(WriteBatchWithIndex));
+
+    /// <summary>Number of operations in the batch.</summary>
+    public int Count => _batch.Count;
+
+    /// <summary>Bytes in the batch rep (GetDataSize).</summary>
+    public int DataSize => _batch.DataSize;
+
+    // =====================================================================================================
+    // Writes
+    // =====================================================================================================
+
+    private uint CfId(ColumnFamily? cf)
+    {
+        ThrowIfInPool();
+        if (cf is null) return 0;
+        _index.SetComparator(cf.Id, cf.Data.UserComparator);
+        return cf.Id;
+    }
+
+    public WriteBatchWithIndex Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Put(null, key, value);
+
+    public WriteBatchWithIndex Put(ColumnFamily? columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+    {
+        Put(CfId(columnFamily), key, value);
+        return this;
+    }
+
+    public WriteBatchWithIndex PutEntity(ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns) => PutEntity(null, key, columns);
+
+    public WriteBatchWithIndex PutEntity(ColumnFamily? columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns)
+    {
+        PutEntity(CfId(columnFamily), key, columns);
+        return this;
+    }
+
+    internal void PutEntity(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns)
+    {
+        if (TimestampSizeOf(cf) != 0) ThrowHelper.NotSupported("PutEntity on a column family with user-defined timestamps in WriteBatchWithIndex");
+        int offset = _batch.DataSize;
+        _batch.PutEntity(cf, key, columns);
+        AddOrUpdateIndex(cf, WriteType.PutEntity, offset);
+    }
+
+    public WriteBatchWithIndex Delete(ReadOnlySpan<byte> key) => Delete(null, key);
+
+    public WriteBatchWithIndex Delete(ColumnFamily? columnFamily, ReadOnlySpan<byte> key)
+    {
+        Delete(CfId(columnFamily), key);
+        return this;
+    }
+
+    public WriteBatchWithIndex SingleDelete(ReadOnlySpan<byte> key) => SingleDelete(null, key);
+
+    public WriteBatchWithIndex SingleDelete(ColumnFamily? columnFamily, ReadOnlySpan<byte> key)
+    {
+        SingleDelete(CfId(columnFamily), key);
+        return this;
+    }
+
+    public WriteBatchWithIndex Merge(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => Merge(null, key, value);
+
+    public WriteBatchWithIndex Merge(ColumnFamily? columnFamily, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+    {
+        Merge(CfId(columnFamily), key, value);
+        return this;
+    }
+
+    /// <summary>Appends a blob that is written to the WAL but not applied (not indexed).</summary>
+    public WriteBatchWithIndex PutLogData(ReadOnlySpan<byte> blob)
+    {
+        _batch.PutLogData(blob);
+        return this;
+    }
+
+    /// <summary>Not supported by WriteBatchWithIndex (like upstream): throws NotSupported.</summary>
+    public WriteBatchWithIndex DeleteRange(ColumnFamily? columnFamily, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey)
+    {
+        ThrowHelper.NotSupported("DeleteRange unsupported in WriteBatchWithIndex");
+        return this;
+    }
+
+    /// <summary>Removes every update (WriteBatchWithIndex::Clear).</summary>
+    public void Clear()
+    {
+        ThrowIfInPool();
+        _batch.Clear();
+        if (_withNoop) _batch.InsertNoop();
+        _index.Clear();
+        _lastSubBatchOffset = 0;
+        _subBatchCount = 1;
+        _hasKeyWithTimestamp = false;
+    }
+
+    /// <summary>Records the current state; see <see cref="RollbackToSavePoint"/>.</summary>
+    public void SetSavePoint() => _batch.SetSavePoint();
+
+    /// <summary>
+    /// Removes the updates added since the most recent save point and rebuilds the index (ReBuildIndex). Returns false
+    /// when there is no save point (upstream: NotFound).
+    /// </summary>
+    public bool RollbackToSavePoint()
+    {
+        if (!_batch.RollbackToSavePoint()) return false;
+        RebuildIndex();
+        return true;
+    }
+
+    /// <summary>Removes the most recent save point. Returns false when there is none.</summary>
+    public bool PopSavePoint() => _batch.PopSavePoint();
+
+    /// <summary>User-defined timestamp size of column family <paramref name="cf"/> (its index comparator's).</summary>
+    private int TimestampSizeOf(uint cf) => _index.GetComparator(cf).TimestampSize;
+
+    /// <summary>
+    /// WriteBatch::Put(column_family, key, value) on a column family with timestamps: the key gets a dummy (all-zero)
+    /// timestamp that the commit replaces (needs_in_place_update_ts_ / UpdateTimestamps).
+    /// </summary>
+    private ReadOnlySpan<byte> PlaceholderTimestamp(uint cf)
+    {
+        _hasKeyWithTimestamp = true;
+        return s_zeroTimestamp.AsSpan(0, TimestampSizeOf(cf));
+    }
+
+    private static readonly byte[] s_zeroTimestamp = new byte[64];
+    private bool _hasKeyWithTimestamp;
+
+    /// <summary>
+    /// True when a key of a column family with user-defined timestamps was added with a placeholder timestamp
+    /// (WriteBatchInternal::HasKeyWithTimestamp): the batch must get its timestamps (commit timestamp) before it is written.
+    /// </summary>
+    internal bool HasKeyWithTimestamp => _hasKeyWithTimestamp;
+
+    /// <summary>
+    /// TransactionBaseImpl::DisableIndexing (GetBatchForWrite returning the plain WriteBatch): while set, new records
+    /// are appended to the batch without being indexed (nor counted in sub-batches); a later rebuild of the index
+    /// (RollbackToSavePoint) indexes them like upstream's ReBuildIndex.
+    /// </summary>
+    internal bool IndexingDisabled { get; set; }
+
+    private void AddOrUpdateIndex(uint cf, WriteType type, int recordOffset)
+    {
+        if (!IndexingDisabled) AddOrUpdateIndexCore(cf, type, recordOffset);
+    }
+
+    /// <summary>Rep::AddOrUpdateIndexWithCfId (+ UpdateExistingEntryWithCfId in overwrite_key mode).</summary>
+    private void AddOrUpdateIndexCore(uint cf, WriteType type, int recordOffset)
+    {
+        DecodeKeyPosition(_batch.Data, recordOffset, out int keyOffset, out int keySize);
+        // MakeEntry: the index holds the user key without its timestamp.
+        int tsSize = TimestampSizeOf(cf);
+        if (tsSize > 0 && keySize >= tsSize) keySize -= tsSize;
+        if (OverwriteKey)
+        {
+            ReadOnlySpan<byte> key = _batch.Data.Slice(keyOffset, keySize);
+            // Seek() finds the first entry with key == `key`: the most recent update.
+            int node = _index.Seek(cf, key, long.MaxValue);
+            if (node >= 0 && _index.ColumnFamily(node) == cf &&
+                _index.GetComparator(cf).CompareWithoutTimestamp(_index.Key(node), false, key, false) == 0)
+            {
+                // A sub-batch starts right before inserting a key that is a duplicate of a key in the last sub-batch.
+                if (_lastSubBatchOffset <= _index.RecordOffset(node))
+                {
+                    _lastSubBatchOffset = recordOffset;
+                    _subBatchCount++;
+                }
+                if (type != WriteType.Merge)
+                {
+                    _index.UpdateOffset(node, recordOffset);
+                    return;
+                }
+            }
+        }
+        _index.Insert(cf, recordOffset, keyOffset, keySize);
+    }
+
+    // Rep::last_sub_batch_offset / sub_batch_cnt: the starting offset of the last sub-batch (0 = no duplicate key so far)
+    // and the number of sub-batches (overwrite_key mode only).
+    private int _lastSubBatchOffset;
+    private int _subBatchCount = 1;
+
+    /// <summary>
+    /// SubBatchCnt: the number of sub-batches of the batch (a new one starts at each key that repeats a key of the
+    /// current sub-batch). WritePrepared / WriteUnprepared transactions consume one sequence number per sub-batch.
+    /// </summary>
+    internal int SubBatchCount => _subBatchCount;
+
+    /// <summary>ReadKeyFromWriteBatchEntry: the position of the key of the record at <paramref name="offset"/>.</summary>
+    private static void DecodeKeyPosition(ReadOnlySpan<byte> rep, int offset, out int keyOffset, out int keySize)
+    {
+        int pos = offset;
+        var tag = (EntryType)rep[pos++];
+        if (tag is EntryType.ColumnFamilyValue or EntryType.ColumnFamilyDeletion or EntryType.ColumnFamilySingleDeletion or EntryType.ColumnFamilyMerge
+            or EntryType.ColumnFamilyRangeDeletion or EntryType.ColumnFamilyWideColumnEntity or EntryType.ColumnFamilyBlobIndex
+            or EntryType.ColumnFamilyValuePreferredSeqno)
+        {
+            pos += Coding.DecodeVarint32(rep[pos..], out _);
+        }
+        pos += Coding.DecodeVarint32(rep[pos..], out uint len);
+        keyOffset = pos;
+        keySize = (int)len;
+    }
+
+    /// <summary>Rep::ReBuildIndex: re-reads every record of the batch into a fresh index.</summary>
+    private void RebuildIndex()
+    {
+        _index.Clear();
+        _lastSubBatchOffset = 0;
+        _subBatchCount = 1;
+        ReadOnlySpan<byte> rep = _batch.Data;
+        int pos = WriteBatch.HeaderSize;
+        while (pos < rep.Length)
+        {
+            int recordOffset = pos;
+            string? error = WriteBatchReader.TryReadRecord(rep, ref pos, out WriteBatchEntry e);
+            if (error is not null) ThrowHelper.Corruption(error);
+            WriteType t = e.Type switch
+            {
+                EntryType.Value => WriteType.Put,
+                EntryType.Deletion => WriteType.Delete,
+                EntryType.SingleDeletion => WriteType.SingleDelete,
+                EntryType.Merge => WriteType.Merge,
+                EntryType.WideColumnEntity => WriteType.PutEntity,
+                EntryType.RangeDeletion => WriteType.DeleteRange,
+                _ => WriteType.Unknown,
+            };
+            if (t is WriteType.Unknown or WriteType.DeleteRange) continue; // LogData, XID markers: not indexed
+            AddOrUpdateIndexCore(e.ColumnFamilyId, t, recordOffset);
+        }
+    }
+
+    // =====================================================================================================
+    // Entries
+    // =====================================================================================================
+
+    /// <summary>ReadableWriteBatch::GetEntryFromDataOffset.</summary>
+    internal WriteType GetEntry(int recordOffset, out ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value)
+    {
+        ReadOnlySpan<byte> rep = _batch.Data;
+        int pos = recordOffset;
+        string? error = WriteBatchReader.TryReadRecord(rep, ref pos, out WriteBatchEntry e);
+        if (error is not null) ThrowHelper.Corruption(error);
+        key = e.Key;
+        // WBWIIteratorImpl::Entry: the entry key never includes the user-defined timestamp.
+        int tsSize = TimestampSizeOf(e.ColumnFamilyId);
+        if (tsSize > 0 && key.Length >= tsSize) key = key[..^tsSize];
+        value = e.Value;
+        return e.Type switch
+        {
+            EntryType.Value => WriteType.Put,
+            EntryType.Deletion => WriteType.Delete,
+            EntryType.SingleDeletion => WriteType.SingleDelete,
+            EntryType.Merge => WriteType.Merge,
+            EntryType.WideColumnEntity => WriteType.PutEntity,
+            EntryType.RangeDeletion => WriteType.DeleteRange,
+            EntryType.LogData => WriteType.LogData,
+            _ => WriteType.Xid,
+        };
+    }
+
+    internal WriteBatchEntryIndex Index => _index;
+
+    // ---- internal column-family-id API (transactions) ----
+
+    /// <summary>Registers the comparator ordering column family <paramref name="cf"/> (SetComparatorForCF).</summary>
+    internal void RegisterColumnFamily(uint cf, Comparator comparator) => _index.SetComparator(cf, comparator);
+
+    internal void Put(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+    {
+        int offset = _batch.DataSize;
+        if (TimestampSizeOf(cf) != 0) _batch.Put(cf, key, PlaceholderTimestamp(cf), value);
+        else _batch.Put(cf, key, value);
+        AddOrUpdateIndex(cf, WriteType.Put, offset);
+    }
+
+    internal void PutEntitySerialized(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity)
+    {
+        if (TimestampSizeOf(cf) != 0) ThrowHelper.NotSupported("PutEntity on a column family with user-defined timestamps in WriteBatchWithIndex");
+        int offset = _batch.DataSize;
+        _batch.PutEntitySerialized(cf, key, entity);
+        AddOrUpdateIndex(cf, WriteType.PutEntity, offset);
+    }
+
+    internal void Delete(uint cf, ReadOnlySpan<byte> key)
+    {
+        int offset = _batch.DataSize;
+        if (TimestampSizeOf(cf) != 0) _batch.Delete(cf, key, PlaceholderTimestamp(cf));
+        else _batch.Delete(cf, key);
+        AddOrUpdateIndex(cf, WriteType.Delete, offset);
+    }
+
+    internal void SingleDelete(uint cf, ReadOnlySpan<byte> key)
+    {
+        int offset = _batch.DataSize;
+        if (TimestampSizeOf(cf) != 0) _batch.SingleDelete(cf, key, PlaceholderTimestamp(cf));
+        else _batch.SingleDelete(cf, key);
+        AddOrUpdateIndex(cf, WriteType.SingleDelete, offset);
+    }
+
+    internal void Merge(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+    {
+        int offset = _batch.DataSize;
+        if (TimestampSizeOf(cf) != 0) _batch.Merge(cf, key, PlaceholderTimestamp(cf), value);
+        else _batch.Merge(cf, key, value);
+        AddOrUpdateIndex(cf, WriteType.Merge, offset);
+    }
+
+    /// <summary>
+    /// GetFromBatchAndDB's batch part for column family <paramref name="cf"/>: the lookup result, with
+    /// <see cref="LookupResult.Deleted"/> reported as <see cref="LookupResult.Found"/> when merge operands follow the delete.
+    /// </summary>
+    internal LookupResult Lookup(uint cf, ReadOnlySpan<byte> key)
+    {
+        LookupResult r = FindLatestUpdate(cf, _index.GetComparator(cf), key, _mergeContext, out _, out _);
+        return r == LookupResult.Deleted && _mergeContext.Count > 0 ? LookupResult.Found : r;
+    }
+
+    /// <summary>
+    /// Computes the value of <paramref name="key"/> (MergeKey): the batch's Put/PutEntity (or, when the batch holds only
+    /// merges, <paramref name="dbValue"/> when <paramref name="dbHasValue"/>) with the batch's merge operands applied.
+    /// Returns false if the key does not exist.
+    /// </summary>
+    internal bool ComputeValue(uint cf, ReadOnlySpan<byte> key, MergeOperator? mergeOperator, bool dbHasValue, ReadOnlySpan<byte> dbValue,
+        IBufferWriter<byte> result)
+    {
+        LookupResult r = FindLatestUpdate(cf, _index.GetComparator(cf), key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+        bool hasBase;
+        ReadOnlySpan<byte> baseValue;
+        switch (r)
+        {
+            case LookupResult.Found:
+                hasBase = true;
+                baseValue = type == WriteType.PutEntity ? Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(v) : v;
+                break;
+            case LookupResult.MergeInProgress:
+                hasBase = dbHasValue;
+                baseValue = dbValue;
+                break;
+            case LookupResult.Deleted:
+                hasBase = false;
+                baseValue = default;
+                break;
+            default:
+                if (!dbHasValue) return false;
+                result.Write(dbValue);
+                return true;
+        }
+        if (_mergeContext.Count == 0)
+        {
+            if (!hasBase) return false;
+            result.Write(baseValue);
+            return true;
+        }
+        if (mergeOperator is null) ThrowHelper.InvalidArgument("Merge operator not specified for the column family");
+        MergeHelper.TimedFullMerge(mergeOperator!, key, hasBase, baseValue, _mergeContext, result);
+        return true;
+    }
+
+    /// <summary>NewIteratorWithBase for a column family id (transactions).</summary>
+    internal BaseDeltaIterator NewIteratorWithBase(uint cf, Comparator comparator, MergeOperator? mergeOperator, Iterator baseIterator,
+        ReadOptions? options)
+    {
+        _index.SetComparator(cf, comparator);
+        return new BaseDeltaIterator(baseIterator, this, RentDeltaScratch(cf, comparator, options), comparator, mergeOperator);
+    }
+
+    // One spare delta iterator + merge buffers for NewIteratorWithBase (iterators are usually created one at a time).
+    private BaseDeltaScratch? _spareDeltaScratch;
+
+    /// <summary>The spare delta iterator state re-targeted at <paramref name="cf"/> (or a new one).</summary>
+    private BaseDeltaScratch RentDeltaScratch(uint cf, Comparator comparator, ReadOptions? options)
+    {
+        BaseDeltaScratch? s = Interlocked.Exchange(ref _spareDeltaScratch, null);
+        if (s is null) return new BaseDeltaScratch(new WriteBatchWithIndexIterator(this, cf, comparator, options?.IterateLowerBound, options?.IterateUpperBound));
+        s.Delta.Reset(cf, comparator, options?.IterateLowerBound, options?.IterateUpperBound);
+        return s;
+    }
+
+    /// <summary>Keeps a disposed BaseDeltaIterator's state as the spare (disposes it when there already is one).</summary>
+    internal void ReturnDeltaScratch(BaseDeltaScratch scratch)
+    {
+        scratch.Clear();
+        if (Interlocked.CompareExchange(ref _spareDeltaScratch, scratch, null) is not null) scratch.Dispose();
+    }
+
+    internal Comparator ComparatorOf(ColumnFamily? cf) => cf is null ? _defaultComparator : _index.GetComparator(CfId(cf));
+
+    /// <summary>
+    /// An iterator over the indexed entries of a column family (WriteBatchWithIndex::NewIterator): every update of each
+    /// key, keys in comparator order, the most recent update of a key first.
+    /// </summary>
+    public WriteBatchWithIndexIterator NewIterator() => NewIterator(null);
+
+    public WriteBatchWithIndexIterator NewIterator(ColumnFamily? columnFamily) => new(this, CfId(columnFamily), ComparatorOf(columnFamily), null, null);
+
+    /// <summary>
+    /// An iterator over the DB (<paramref name="baseIterator"/>, which the returned iterator owns) with the batch's
+    /// updates applied on top (WriteBatchWithIndex::NewIteratorWithBase / BaseDeltaIterator): puts and entities
+    /// override, deletes hide, merges are applied to the base value. <see cref="ReadOptions.IterateLowerBound"/> /
+    /// <see cref="ReadOptions.IterateUpperBound"/> of <paramref name="options"/> bound the batch side (the base iterator
+    /// should be created with the same options).
+    /// </summary>
+    public BaseDeltaIterator NewIteratorWithBase(Iterator baseIterator) => NewIteratorWithBase(null, baseIterator, null);
+
+    public BaseDeltaIterator NewIteratorWithBase(ColumnFamily? columnFamily, Iterator baseIterator, ReadOptions? options)
+    {
+        ArgumentNullException.ThrowIfNull(baseIterator);
+        uint cf = CfId(columnFamily);
+        Comparator cmp = ComparatorOf(columnFamily);
+        return new BaseDeltaIterator(baseIterator, this, RentDeltaScratch(cf, cmp, options), cmp, columnFamily?.Data.MergeOperator);
+    }
+
+    // =====================================================================================================
+    // Reads
+    // =====================================================================================================
+
+    internal enum LookupResult : byte { NotFound, Found, Deleted, MergeInProgress }
+
+    /// <summary>
+    /// GetFromBatchImpl's search: the most recent Put/PutEntity/Delete of <paramref name="key"/> in the batch, with the
+    /// merge operands above it collected (newest first) into <paramref name="context"/>.
+    /// </summary>
+    internal LookupResult FindLatestUpdate(uint cf, Comparator cmp, ReadOnlySpan<byte> key, MergeContext context, out WriteType type,
+        out ReadOnlySpan<byte> value)
+    {
+        context.Clear();
+        type = WriteType.Unknown;
+        value = default;
+        LookupResult result = LookupResult.NotFound;
+        for (int node = _index.Seek(cf, key, long.MaxValue); node >= 0; node = _index.NextNode(node))
+        {
+            if (_index.ColumnFamily(node) != cf || cmp.CompareWithoutTimestamp(_index.Key(node), false, key, false) != 0) break;
+            WriteType t = GetEntry(_index.RecordOffset(node), out _, out ReadOnlySpan<byte> v);
+            switch (t)
+            {
+                case WriteType.Put:
+                case WriteType.PutEntity:
+                    type = t;
+                    value = v;
+                    return LookupResult.Found;
+                case WriteType.Delete:
+                case WriteType.SingleDelete:
+                    type = t;
+                    return LookupResult.Deleted;
+                case WriteType.Merge:
+                    result = LookupResult.MergeInProgress;
+                    context.PushOperand(v);
+                    break;
+            }
+        }
+        return result;
+    }
+
+    private static MergeOperator RequireMergeOperator(MergeOperator? op)
+    {
+        if (op is null) ThrowHelper.InvalidArgument("Merge operator must be set for column family");
+        return op!;
+    }
+
+    /// <summary>
+    /// Reads <paramref name="key"/> from the batch only (WriteBatchWithIndex::GetFromBatch) and appends its value to
+    /// <paramref name="value"/>. Returns false if the key is not in the batch or deleted there. Throws
+    /// <see cref="StatusCode.MergeInProgress"/> when the batch only holds merge operands for the key (the base value is
+    /// in the DB). Merge operands on top of a Put/Delete are applied with the column family's merge operator.
+    /// </summary>
+    public bool TryGetFromBatch(ColumnFamily? columnFamily, ReadOnlySpan<byte> key, IBufferWriter<byte> value) =>
+        TryGetFromBatch(columnFamily, columnFamily?.Data.MergeOperator, key, value);
+
+    public bool TryGetFromBatch(ReadOnlySpan<byte> key, IBufferWriter<byte> value) => TryGetFromBatch(null, null, key, value);
+
+    /// <summary><see cref="TryGetFromBatch(ColumnFamily?, ReadOnlySpan{byte}, IBufferWriter{byte})"/> with an explicit merge operator.</summary>
+    public bool TryGetFromBatch(ColumnFamily? columnFamily, MergeOperator? mergeOperator, ReadOnlySpan<byte> key, IBufferWriter<byte> value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        uint cf = CfId(columnFamily);
+        LookupResult r = FindLatestUpdate(cf, ComparatorOf(columnFamily), key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+        switch (r)
+        {
+            case LookupResult.NotFound:
+                return false;
+            case LookupResult.MergeInProgress:
+                throw new RocksDbException(StatusCode.MergeInProgress, "Merge in progress");
+            case LookupResult.Deleted:
+                if (_mergeContext.Count == 0) return false;
+                MergeHelper.TimedFullMerge(RequireMergeOperator(mergeOperator), key, false, default, _mergeContext, value);
+                return true;
+            default: // Found
+                ReadOnlySpan<byte> baseValue = type == WriteType.PutEntity ? Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(v) : v;
+                if (_mergeContext.Count == 0) value.Write(baseValue);
+                else MergeHelper.TimedFullMerge(RequireMergeOperator(mergeOperator), key, true, baseValue, _mergeContext, value);
+                return true;
+        }
+    }
+
+    /// <summary>Copying convenience form of <see cref="TryGetFromBatch(ColumnFamily?, ReadOnlySpan{byte}, IBufferWriter{byte})"/>.</summary>
+    public byte[]? GetFromBatch(ColumnFamily? columnFamily, ReadOnlySpan<byte> key)
+    {
+        var w = new ArrayBufferWriter<byte>();
+        return TryGetFromBatch(columnFamily, key, w) ? w.WrittenSpan.ToArray() : null;
+    }
+
+    public byte[]? GetFromBatch(ReadOnlySpan<byte> key) => GetFromBatch(null, key);
+
+    /// <summary>
+    /// Reads the entity of <paramref name="key"/> from the batch only (GetEntityFromBatch): a Put reads as a single default
+    /// column; merges apply to the default column. Same not-found / MergeInProgress rules as
+    /// <see cref="TryGetFromBatch(ColumnFamily?, ReadOnlySpan{byte}, IBufferWriter{byte})"/>.
+    /// </summary>
+    public bool TryGetEntityFromBatch(ColumnFamily? columnFamily, ReadOnlySpan<byte> key, WideColumns columns)
+    {
+        ArgumentNullException.ThrowIfNull(columns);
+        uint cf = CfId(columnFamily);
+        LookupResult r = FindLatestUpdate(cf, ComparatorOf(columnFamily), key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+        if (r == LookupResult.MergeInProgress)
+        {
+            columns.Clear();
+            throw new RocksDbException(StatusCode.MergeInProgress, "Merge in progress");
+        }
+        return ResolveBatchEntity(r, type, v, columnFamily?.Data.MergeOperator, key, columns);
+    }
+
+    /// <summary>
+    /// WriteBatchWithIndexInternal::GetEntityFromBatch for a settled lookup (NotFound, Deleted or Found, with the merge
+    /// operands of <c>_mergeContext</c>): the entity of the key, or false (columns emptied).
+    /// </summary>
+    private bool ResolveBatchEntity(LookupResult r, WriteType type, ReadOnlySpan<byte> v, MergeOperator? mergeOperator, ReadOnlySpan<byte> key,
+        WideColumns columns)
+    {
+        PooledBufferWriter w = ObjectPools.RentWriter();
+        try
+        {
+            switch (r)
+            {
+                case LookupResult.NotFound:
+                    columns.Clear();
+                    return false;
+                case LookupResult.Deleted:
+                    if (_mergeContext.Count == 0)
+                    {
+                        columns.Clear();
+                        return false;
+                    }
+                    MergeHelper.TimedFullMerge(RequireMergeOperator(mergeOperator), key, false, default, _mergeContext, w);
+                    WrapDefault(w, columns);
+                    return true;
+                default:
+                    if (_mergeContext.Count == 0)
+                    {
+                        if (type == WriteType.PutEntity) columns.SetSerialized(v);
+                        else
+                        {
+                            Db.Wide.WideColumnSerialization.SerializeDefaultColumn(v, w);
+                            columns.SetSerialized(w.WrittenSpan);
+                        }
+                        return true;
+                    }
+                    MergeOperator op = RequireMergeOperator(mergeOperator);
+                    if (type == WriteType.PutEntity)
+                    {
+                        MergeHelper.TimedFullMerge(op, key, true, Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(v), _mergeContext, w);
+                        ReplaceDefault(v, w, columns);
+                        return true;
+                    }
+                    MergeHelper.TimedFullMerge(op, key, true, v, _mergeContext, w);
+                    WrapDefault(w, columns);
+                    return true;
+            }
+        }
+        finally
+        {
+            ObjectPools.ReturnWriter(w);
+        }
+    }
+
+    private static void ReplaceDefault(ReadOnlySpan<byte> entity, PooledBufferWriter newDefault, WideColumns columns)
+    {
+        PooledBufferWriter e = ObjectPools.RentWriter();
+        try
+        {
+            Db.Wide.WideColumnSerialization.ReplaceDefaultColumn(entity, newDefault.WrittenSpan, e);
+            columns.SetSerialized(e.WrittenSpan);
+        }
+        finally
+        {
+            ObjectPools.ReturnWriter(e);
+        }
+    }
+
+    // ---- entities from the batch and the DB ----------------------------------------------------------------
+
+    /// <summary>The DB side of an entity read from the batch and the DB (DBImpl::GetImpl with columns).</summary>
+    internal interface IEntityDbReader
+    {
+        /// <summary>Reads the entity of <paramref name="key"/> from the DB into <paramref name="columns"/>; false if absent.</summary>
+        bool TryGetEntity(ReadOnlySpan<byte> key, WideColumns columns);
+    }
+
+    private readonly struct HandleEntityReader(ColumnFamily cfh, ReadOptions? options) : IEntityDbReader
+    {
+        public bool TryGetEntity(ReadOnlySpan<byte> key, WideColumns columns) => cfh.TryGetEntity(options, key, columns);
+    }
+
+    /// <summary>
+    /// GetEntityFromBatchAndDB / MultiGetEntityFromBatchAndDB timestamp checks: a column family with timestamps needs a
+    /// read timestamp of its size; one without must not get one.
+    /// </summary>
+    internal static RocksDbException? CheckEntityReadTimestamp(int timestampSize, ReadOptions? options)
+    {
+        if (timestampSize > 0)
+        {
+            if (options?.Timestamp is not { } ts) return new RocksDbException(StatusCode.InvalidArgument, "Invalid argument: Must specify timestamp");
+            if (ts.Length != timestampSize)
+            {
+                return new RocksDbException(StatusCode.InvalidArgument,
+                    "Invalid argument: Timestamp size does not match the timestamp size of the column family");
+            }
+        }
+        else if (options?.Timestamp is not null)
+        {
+            return new RocksDbException(StatusCode.InvalidArgument,
+                "Invalid argument: Cannot specify timestamp since the column family does not have timestamps enabled");
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Reads the entity of <paramref name="key"/> from the batch, falling back to (and merging with) the DB
+    /// (WriteBatchWithIndex::GetEntityFromBatchAndDB): a Put / PutEntity / Delete in the batch wins (a plain value reads
+    /// as a single default column); merge operands in the batch apply to the default column of the DB entity read with
+    /// <paramref name="options"/>, keeping its other columns. Returns false (columns emptied) if the key does not exist.
+    /// A column family with timestamps requires <see cref="ReadOptions.Timestamp"/> of its timestamp size; one without
+    /// rejects it (InvalidArgument).
+    /// </summary>
+    public bool TryGetEntityFromBatchAndDB(RocksDatabase db, ReadOptions? options, ColumnFamily? columnFamily, ReadOnlySpan<byte> key, WideColumns columns)
+    {
+        ArgumentNullException.ThrowIfNull(db);
+        ArgumentNullException.ThrowIfNull(columns);
+        ColumnFamily cfh = columnFamily ?? db.DefaultColumnFamily;
+        if (CheckEntityReadTimestamp(cfh.Data.TimestampSize, options) is { } e) throw e;
+        var reader = new HandleEntityReader(cfh, options);
+        return GetEntityFromBatchAndDBCore(CfId(cfh), cfh.Data.MergeOperator, key, columns, ref reader);
+    }
+
+    public bool TryGetEntityFromBatchAndDB(RocksDatabase db, ReadOnlySpan<byte> key, WideColumns columns) =>
+        TryGetEntityFromBatchAndDB(db, null, null, key, columns);
+
+    /// <summary>Allocating convenience form of <see cref="TryGetEntityFromBatchAndDB(RocksDatabase, ReadOptions?, ColumnFamily?, ReadOnlySpan{byte}, WideColumns)"/>.</summary>
+    public WideColumns? GetEntityFromBatchAndDB(RocksDatabase db, ReadOptions? options, ColumnFamily? columnFamily, ReadOnlySpan<byte> key)
+    {
+        var c = new WideColumns();
+        return TryGetEntityFromBatchAndDB(db, options, columnFamily, key, c) ? c : null;
+    }
+
+    /// <summary>
+    /// GetEntityFromBatchAndDB for a registered column family: the batch lookup, then the DB read through
+    /// <paramref name="reader"/> when the batch does not settle the key.
+    /// </summary>
+    internal bool GetEntityFromBatchAndDBCore<TReader>(uint cf, MergeOperator? mergeOperator, ReadOnlySpan<byte> key, WideColumns columns, ref TReader reader)
+        where TReader : struct, IEntityDbReader
+    {
+        LookupResult r = FindLatestUpdate(cf, _index.GetComparator(cf), key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+        switch (r)
+        {
+            case LookupResult.NotFound:
+                return reader.TryGetEntity(key, columns);
+            case LookupResult.MergeInProgress:
+                {
+                    MergeOperator op = RequireMergeOperator(mergeOperator);
+                    // The DB read does not touch the batch: the operands collected in _mergeContext stay valid.
+                    var existing = new WideColumns();
+                    bool found = reader.TryGetEntity(key, existing);
+                    MergeEntityAcrossBatchAndDB(op, key, found, existing, _mergeContext, columns);
+                    return true;
+                }
+            default:
+                return ResolveBatchEntity(r, type, v, mergeOperator, key, columns);
+        }
+    }
+
+    /// <summary>
+    /// MergeAcrossBatchAndDB for an entity: the batch's operands on top of the DB entity's default column (a plain base
+    /// when the entity has only the default column, kWideBaseValue keeping the other columns otherwise; no base value
+    /// when the key is absent from the DB).
+    /// </summary>
+    private static void MergeEntityAcrossBatchAndDB(MergeOperator op, ReadOnlySpan<byte> key, bool found, WideColumns existing, MergeContext operands,
+        WideColumns columns)
+    {
+        PooledBufferWriter w = ObjectPools.RentWriter();
+        try
+        {
+            if (!found)
+            {
+                MergeHelper.TimedFullMerge(op, key, false, default, operands, w);
+                WrapDefault(w, columns);
+            }
+            else if (existing.Count == 1 && existing.HasDefaultColumn)
+            {
+                MergeHelper.TimedFullMerge(op, key, true, existing.DefaultColumnValue, operands, w);
+                WrapDefault(w, columns);
+            }
+            else
+            {
+                MergeHelper.TimedFullMerge(op, key, true, existing.DefaultColumnValue, operands, w);
+                ReplaceDefault(existing.Serialized, w, columns);
+            }
+        }
+        finally
+        {
+            ObjectPools.ReturnWriter(w);
+        }
+    }
+
+    /// <summary>
+    /// Port of WriteBatchWithIndex::MultiGetEntityFromBatchAndDB: looks up the entity of every key of
+    /// <paramref name="batch"/> like <see cref="TryGetEntityFromBatchAndDB(RocksDatabase, ReadOptions?, ColumnFamily?, ReadOnlySpan{byte}, WideColumns)"/>,
+    /// reading all keys the write batch does not settle (absent, or only merge operands) with one DB MultiGetEntity, so
+    /// they come from one consistent view of the DB. Read the results from <paramref name="batch"/> per key with
+    /// <see cref="MultiGetBatch.TryGetEntity"/> (status, columns, error), in the order the keys were added. Timestamp
+    /// rules as for the single-key form (every key fails with InvalidArgument otherwise).
+    /// </summary>
+    public void MultiGetEntityFromBatchAndDB(RocksDatabase db, ReadOptions? options, ColumnFamily? columnFamily, MultiGetBatch batch)
+    {
+        ArgumentNullException.ThrowIfNull(db);
+        ArgumentNullException.ThrowIfNull(batch);
+        ColumnFamily cfh = columnFamily ?? db.DefaultColumnFamily;
+        var reader = new HandleMultiEntityReader(cfh, options);
+        MultiGetEntityFromBatchAndDBCore(CfId(cfh), cfh.Data.MergeOperator, cfh.Data.TimestampSize, options, batch, ref reader);
+    }
+
+    /// <summary><see cref="MultiGetEntityFromBatchAndDB(RocksDatabase, ReadOptions?, ColumnFamily?, MultiGetBatch)"/> on the default column family.</summary>
+    public void MultiGetEntityFromBatchAndDB(RocksDatabase db, MultiGetBatch batch) => MultiGetEntityFromBatchAndDB(db, null, null, batch);
+
+    /// <summary>The DB side of a batched entity read: one MultiGetEntity of the keys the write batch does not settle.</summary>
+    internal interface IMultiEntityDbReader
+    {
+        void MultiGetEntity(MultiGetBatch keys);
+    }
+
+    private readonly struct HandleMultiEntityReader(ColumnFamily cfh, ReadOptions? options) : IMultiEntityDbReader
+    {
+        public void MultiGetEntity(MultiGetBatch keys) => cfh.MultiGetEntity(options, keys);
+    }
+
+    internal void MultiGetEntityFromBatchAndDBCore<TReader>(uint cf, MergeOperator? op, int timestampSize, ReadOptions? options, MultiGetBatch batch,
+        ref TReader reader) where TReader : struct, IMultiEntityDbReader
+    {
+        Comparator cmp = _index.GetComparator(cf);
+        int n = batch.Count;
+        batch.EntityRun = true;
+        if (CheckEntityReadTimestamp(timestampSize, options) is { } tsError)
+        {
+            batch.BeginExternalRun(cmp);
+            for (int i = 0; i < n; i++) batch.SetError(i, tsError);
+            return;
+        }
+        // Per key: the entity from the batch (serialized; empty array = not found), or the index of the key in the DB read.
+        var fromBatch = new byte[]?[n];
+        var dbIndex = new int[n];
+        var errors = new RocksDbException?[n];
+        MergeContext?[]? merges = null;
+        using var dbBatch = new MultiGetBatch(Math.Max(1, n));
+        var scratch = new WideColumns();
+        for (int i = 0; i < n; i++)
+        {
+            dbIndex[i] = -1;
+            ReadOnlySpan<byte> key = batch.GetKey(i);
+            try
+            {
+                LookupResult r = FindLatestUpdate(cf, cmp, key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+                switch (r)
+                {
+                    case LookupResult.NotFound:
+                        dbIndex[i] = dbBatch.Count;
+                        dbBatch.Add(key);
+                        break;
+                    case LookupResult.MergeInProgress:
+                        {
+                            RequireMergeOperator(op);
+                            var operands = new MergeContext();
+                            for (int j = 0; j < _mergeContext.Count; j++) operands.PushOperand(_mergeContext.GetOperandNewestFirst(j));
+                            (merges ??= new MergeContext?[n])[i] = operands;
+                            dbIndex[i] = dbBatch.Count;
+                            dbBatch.Add(key);
+                            break;
+                        }
+                    default:
+                        fromBatch[i] = ResolveBatchEntity(r, type, v, op, key, scratch) ? scratch.Serialized.ToArray() : [];
+                        break;
+                }
+            }
+            catch (RocksDbException e)
+            {
+                errors[i] = e;
+            }
+        }
+        try
+        {
+            if (dbBatch.Count > 0) reader.MultiGetEntity(dbBatch);
+            batch.BeginExternalRun(cmp);
+            for (int i = 0; i < n; i++)
+            {
+                if (errors[i] is { } err)
+                {
+                    batch.SetError(i, err);
+                    continue;
+                }
+                int d = dbIndex[i];
+                if (d < 0)
+                {
+                    byte[] entity = fromBatch[i]!;
+                    batch.SetExternalResult(i, entity.Length > 0, entity);
+                    continue;
+                }
+                if (dbBatch.GetStatus(d) == MultiGetStatus.Error)
+                {
+                    batch.SetError(i, dbBatch.GetError(d)!);
+                    continue;
+                }
+                bool found = dbBatch.TryGetEntity(d, scratch);
+                if (merges?[i] is not { } operands)
+                {
+                    batch.SetExternalResult(i, found, found ? scratch.Serialized : default);
+                    continue;
+                }
+                try
+                {
+                    var merged = new WideColumns();
+                    MergeEntityAcrossBatchAndDB(op!, batch.GetKey(i), found, scratch, operands, merged);
+                    batch.SetExternalResult(i, true, merged.Serialized);
+                }
+                catch (RocksDbException e)
+                {
+                    batch.SetError(i, e);
+                }
+            }
+        }
+        finally
+        {
+            if (merges is not null)
+            {
+                foreach (MergeContext? m in merges) m?.Dispose();
+            }
+        }
+    }
+
+    private static void WrapDefault(PooledBufferWriter value, WideColumns columns)
+    {
+        PooledBufferWriter e = ObjectPools.RentWriter();
+        try
+        {
+            Db.Wide.WideColumnSerialization.SerializeDefaultColumn(value.WrittenSpan, e);
+            columns.SetSerialized(e.WrittenSpan);
+        }
+        finally
+        {
+            ObjectPools.ReturnWriter(e);
+        }
+    }
+
+    /// <summary>
+    /// Reads <paramref name="key"/> from the batch, falling back to (and merging with) the DB
+    /// (WriteBatchWithIndex::GetFromBatchAndDB): a Put/Delete in the batch wins; merge operands in the batch are applied
+    /// on top of the DB value read with <paramref name="options"/>. Returns false if the key does not exist.
+    /// </summary>
+    public bool TryGetFromBatchAndDB(RocksDatabase db, ReadOptions? options, ColumnFamily? columnFamily, ReadOnlySpan<byte> key, IBufferWriter<byte> value)
+    {
+        ArgumentNullException.ThrowIfNull(db);
+        ArgumentNullException.ThrowIfNull(value);
+        ColumnFamily cfh = columnFamily ?? db.DefaultColumnFamily;
+        uint cf = CfId(cfh);
+        if (cfh.Data.TimestampSize > 0 && options?.Timestamp is null) ThrowHelper.InvalidArgument("Must specify timestamp");
+        LookupResult r = FindLatestUpdate(cf, ComparatorOf(cfh), key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+        MergeOperator? op = cfh.Data.MergeOperator;
+        switch (r)
+        {
+            case LookupResult.Found:
+                {
+                    ReadOnlySpan<byte> baseValue = type == WriteType.PutEntity ? Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(v) : v;
+                    if (_mergeContext.Count == 0) value.Write(baseValue);
+                    else MergeHelper.TimedFullMerge(RequireMergeOperator(op), key, true, baseValue, _mergeContext, value);
+                    return true;
+                }
+            case LookupResult.Deleted:
+                if (_mergeContext.Count == 0) return false;
+                MergeHelper.TimedFullMerge(RequireMergeOperator(op), key, false, default, _mergeContext, value);
+                return true;
+            case LookupResult.NotFound:
+                return cfh.TryGet(options, key, value);
+            default: // MergeInProgress: merge the batch operands on top of the DB value (MergeAcrossBatchAndDB).
+                {
+                    MergeOperator mop = RequireMergeOperator(op);
+                    // The DB read may reuse pooled state: keep the operands while it runs.
+                    var existing = new WideColumns();
+                    bool found = cfh.TryGetEntity(options, key, existing);
+                    MergeHelper.TimedFullMerge(mop, key, found, found ? existing.DefaultColumnValue : default, _mergeContext, value);
+                    return true;
+                }
+        }
+    }
+
+    public bool TryGetFromBatchAndDB(RocksDatabase db, ReadOnlySpan<byte> key, IBufferWriter<byte> value) =>
+        TryGetFromBatchAndDB(db, null, null, key, value);
+
+    /// <summary>Copying convenience form of <see cref="TryGetFromBatchAndDB(RocksDatabase, ReadOptions?, ColumnFamily?, ReadOnlySpan{byte}, IBufferWriter{byte})"/>.</summary>
+    public byte[]? GetFromBatchAndDB(RocksDatabase db, ReadOptions? options, ColumnFamily? columnFamily, ReadOnlySpan<byte> key)
+    {
+        var w = new ArrayBufferWriter<byte>();
+        return TryGetFromBatchAndDB(db, options, columnFamily, key, w) ? w.WrittenSpan.ToArray() : null;
+    }
+
+    public byte[]? GetFromBatchAndDB(RocksDatabase db, ReadOnlySpan<byte> key) => GetFromBatchAndDB(db, null, null, key);
+
+    /// <summary>
+    /// Port of WriteBatchWithIndex::MultiGetFromBatchAndDB (utilities/write_batch_with_index/write_batch_with_index.cc):
+    /// looks up every key of <paramref name="batch"/> like
+    /// <see cref="TryGetFromBatchAndDB(RocksDatabase, ReadOptions?, ColumnFamily?, ReadOnlySpan{byte}, IBufferWriter{byte})"/>,
+    /// but reads all keys that the batch does not settle (absent, or only merge operands) with one DB MultiGet, so they
+    /// come from one consistent view of the DB. Results are read from <paramref name="batch"/> per key (status, value,
+    /// error), in the order the keys were added. A column family with user-defined timestamps requires
+    /// <see cref="ReadOptions.Timestamp"/> (every key fails with InvalidArgument otherwise). Values found in the write
+    /// batch are copied into <paramref name="batch"/> (upstream does not pin batch values either).
+    /// </summary>
+    public void MultiGetFromBatchAndDB(RocksDatabase db, ReadOptions? options, ColumnFamily? columnFamily, MultiGetBatch batch)
+    {
+        ArgumentNullException.ThrowIfNull(db);
+        ArgumentNullException.ThrowIfNull(batch);
+        ColumnFamily cfh = columnFamily ?? db.DefaultColumnFamily;
+        var reader = new HandleMultiValueReader(cfh, options);
+        MultiGetFromBatchAndDBCore(CfId(cfh), cfh.Data.MergeOperator, cfh.Data.TimestampSize, options, batch, ref reader);
+    }
+
+    /// <summary>The DB side of a batched value read: one MultiGet of the keys the write batch does not settle.</summary>
+    internal interface IMultiValueDbReader
+    {
+        void MultiGet(MultiGetBatch keys);
+    }
+
+    private readonly struct HandleMultiValueReader(ColumnFamily cfh, ReadOptions? options) : IMultiValueDbReader
+    {
+        public void MultiGet(MultiGetBatch keys) => cfh.MultiGet(options, keys);
+    }
+
+    /// <summary>MultiGetFromBatchAndDB for a registered column family, the DB read through <paramref name="reader"/>.</summary>
+    internal void MultiGetFromBatchAndDBCore<TReader>(uint cf, MergeOperator? op, int timestampSize, ReadOptions? options, MultiGetBatch batch,
+        ref TReader reader) where TReader : struct, IMultiValueDbReader
+    {
+        Comparator cmp = _index.GetComparator(cf);
+        int n = batch.Count;
+        batch.EntityRun = false; // plain values (the batch may have been used for an entity run before)
+        if (timestampSize > 0 && options?.Timestamp is null)
+        {
+            batch.BeginExternalRun(cmp);
+            for (int i = 0; i < n; i++) batch.SetError(i, new RocksDbException(StatusCode.InvalidArgument, "Invalid argument: Must specify timestamp"));
+            return;
+        }
+        // Per key: the batch result (value bytes or "deleted"), or the index of the key in the DB MultiGet.
+        var fromBatch = new byte[]?[n];
+        var dbIndex = new int[n];
+        var errors = new RocksDbException?[n];
+        MergeContext?[]? merges = null;
+        using var dbBatch = new MultiGetBatch(Math.Max(1, n));
+        PooledBufferWriter w = ObjectPools.RentWriter();
+        try
+        {
+            for (int i = 0; i < n; i++)
+            {
+                dbIndex[i] = -1;
+                ReadOnlySpan<byte> key = batch.GetKey(i);
+                try
+                {
+                    LookupResult r = FindLatestUpdate(cf, cmp, key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+                    switch (r)
+                    {
+                        case LookupResult.Found:
+                            {
+                                ReadOnlySpan<byte> baseValue = type == WriteType.PutEntity ? Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(v) : v;
+                                w.Clear();
+                                if (_mergeContext.Count == 0) w.Write(baseValue);
+                                else MergeHelper.TimedFullMerge(RequireMergeOperator(op), key, true, baseValue, _mergeContext, w);
+                                fromBatch[i] = w.WrittenSpan.ToArray();
+                                break;
+                            }
+                        case LookupResult.Deleted:
+                            if (_mergeContext.Count == 0) break; // NotFound
+                            w.Clear();
+                            MergeHelper.TimedFullMerge(RequireMergeOperator(op), key, false, default, _mergeContext, w);
+                            fromBatch[i] = w.WrittenSpan.ToArray();
+                            break;
+                        case LookupResult.NotFound:
+                            dbIndex[i] = dbBatch.Count;
+                            dbBatch.Add(key);
+                            break;
+                        default: // MergeInProgress: the operands are merged on top of the DB value.
+                            {
+                                RequireMergeOperator(op);
+                                var operands = new MergeContext();
+                                for (int j = 0; j < _mergeContext.Count; j++) operands.PushOperand(_mergeContext.GetOperandNewestFirst(j));
+                                (merges ??= new MergeContext?[n])[i] = operands;
+                                dbIndex[i] = dbBatch.Count;
+                                dbBatch.Add(key);
+                                break;
+                            }
+                    }
+                }
+                catch (RocksDbException e)
+                {
+                    errors[i] = e;
+                }
+            }
+            if (dbBatch.Count > 0) reader.MultiGet(dbBatch);
+
+            batch.BeginExternalRun(cmp);
+            for (int i = 0; i < n; i++)
+            {
+                if (errors[i] is { } err)
+                {
+                    batch.SetError(i, err);
+                    continue;
+                }
+                int d = dbIndex[i];
+                if (d < 0)
+                {
+                    batch.SetExternalResult(i, fromBatch[i] is not null, fromBatch[i]);
+                    continue;
+                }
+                if (dbBatch.GetStatus(d) == MultiGetStatus.Error)
+                {
+                    batch.SetError(i, dbBatch.GetError(d)!);
+                    continue;
+                }
+                bool found = dbBatch.TryGetValue(d, out ReadOnlySpan<byte> dbValue);
+                if (merges?[i] is not { } operands)
+                {
+                    batch.SetExternalResult(i, found, dbValue);
+                    continue;
+                }
+                try
+                {
+                    w.Clear();
+                    MergeHelper.TimedFullMerge(op!, batch.GetKey(i), found, found ? dbValue : default, operands, w);
+                    batch.SetExternalResult(i, true, w.WrittenSpan);
+                }
+                catch (RocksDbException e)
+                {
+                    batch.SetError(i, e);
+                }
+            }
+        }
+        finally
+        {
+            ObjectPools.ReturnWriter(w);
+            if (merges is not null)
+            {
+                foreach (MergeContext? m in merges) m?.Dispose();
+            }
+        }
+    }
+
+    /// <summary><see cref="MultiGetFromBatchAndDB(RocksDatabase, ReadOptions?, ColumnFamily?, MultiGetBatch)"/> on the default column family.</summary>
+    public void MultiGetFromBatchAndDB(RocksDatabase db, MultiGetBatch batch) => MultiGetFromBatchAndDB(db, null, null, batch);
+
+    /// <summary>
+    /// Releases the batch. A batch obtained from <see cref="Rent()"/> is cleared and returned to the pool (disposing it
+    /// again does nothing); otherwise its buffers are released. The batch must not be used afterwards.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_inPool) return;
+        if (_pooled && _defaultComparator == Comparator.Bytewise && !_withNoop && TryReturnToPool()) return;
+        _pooled = false;
+        _batch.Dispose();
+        _mergeContext.Dispose();
+        Interlocked.Exchange(ref _spareDeltaScratch, null)?.Dispose();
+    }
+}
+
+public sealed partial class RocksDatabase
+{
+    /// <summary>Atomically applies the batch of <paramref name="batch"/> (DB::Write(batch->GetWriteBatch())).</summary>
+    public void Write(WriteBatchWithIndex batch)
+    {
+        ArgumentNullException.ThrowIfNull(batch);
+        Write(null, batch.WriteBatch);
+    }
+
+    public void Write(WriteOptions? options, WriteBatchWithIndex batch)
+    {
+        ArgumentNullException.ThrowIfNull(batch);
+        Write(options, batch.WriteBatch);
+    }
+
+    public ValueTask WriteAsync(WriteOptions? options, WriteBatchWithIndex batch, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(batch);
+        return WriteAsync(options, batch.WriteBatch, cancellationToken);
+    }
+}

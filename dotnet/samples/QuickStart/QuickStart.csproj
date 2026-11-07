@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Runnable versions of every example in dotnet/README.md. The README snippets are copied from the regions marked
+    "// <snippet:NAME>" ... "// </snippet:NAME>" in these files. After editing a region run
+    `python3 samples/QuickStart/sync-readme.py` (from dotnet/) to refresh the README; the check flag of the script
+    fails when the README is out of date.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RocksDb.Managed\RocksDb.Managed.csproj" />
+  </ItemGroup>
+</Project>

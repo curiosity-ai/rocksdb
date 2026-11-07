@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Binary compatibility tests: data written by native RocksDB (via rocksdb-sharp's RocksDB NuGet
+       package, which ships librocksdb) must be readable by the managed port, and vice versa. -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <OutputType>Exe</OutputType>
+    <EnableMSTestRunner>true</EnableMSTestRunner>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="MSTest" />
+    <ProjectReference Include="..\..\src\RocksDb.Managed\RocksDb.Managed.csproj" />
+    <ProjectReference Include="..\..\tools\RocksDb.Managed.Tools\RocksDb.Managed.Tools.csproj" />
+    <PackageReference Include="RocksDB" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- librocksdb under a .NET 11 apphost: see the file's remarks. -->
+    <Compile Include="..\Shared\NativeStdCxxPreload.cs" Link="NativeStdCxxPreload.cs" />
+    <!-- The managed side of the WAL error recovery crash images (WalErrorRecyclingCompatTests). -->
+    <Compile Include="..\RocksDb.Managed.Tests\Db\FaultInjectionFileSystem.cs" Link="Wal\FaultInjectionFileSystem.cs" />
+  </ItemGroup>
+</Project>

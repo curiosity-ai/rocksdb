@@ -1,0 +1,254 @@
+using System.Globalization;
+using System.Text;
+using RocksDb.Managed.Cluster;
+using RocksDb.Managed.Replication.Internal;
+
+namespace RocksDb.Managed.Replication.Switchover;
+
+/// <summary>The role a node of a primary/replica pair holds. Only a <see cref="Primary"/> accepts writes.</summary>
+public enum ReplicationRole
+{
+    Replica = 0,
+    Primary = 1,
+
+    /// <summary>
+    /// The node was the primary and has started handing the role to its replica: writes are held, and whether the
+    /// replica took over is not settled yet. A node that restarts in this role stays read-only until it has asked the
+    /// other node how the handoff ended.
+    /// </summary>
+    HandingOff = 2,
+}
+
+/// <summary>
+/// Crash-safe role state of one node in a primary/replica pair (port of rocksdb-sharp <c>ReplicationRoleState</c>, the
+/// switchover counterpart of <see cref="RaftPersistentState"/>):
+/// <list type="bullet">
+/// <item>the epoch of the primary this node is or follows - it grows on every change of primary and each epoch belongs
+/// to at most one primary ever (the equivalent of a Raft term);</item>
+/// <item>the promised epoch: the highest epoch this node has been asked to take over in; like a Raft vote it is
+/// persisted before the node acts, and no promotion to an epoch at or below it is accepted again;</item>
+/// <item>the node's role, which node it believes is primary and, while <see cref="ReplicationRole.HandingOff"/>, the
+/// target;</item>
+/// <item>the epoch map: the WAL sequence number each epoch's writes start at, which lets a node rejoining the pair prove
+/// its log is a prefix of the primary's.</item>
+/// </list>
+/// Files <c>role.state</c> and <c>role.epochs</c>, written through a temp file that is fsync'd and renamed over the
+/// target via an <see cref="IFileSystem"/>.
+/// </summary>
+public sealed class ReplicationRoleState
+{
+    private readonly IFileSystem _fs;
+    private readonly string _statePath;
+    private readonly string _epochsPath;
+    private readonly Lock _gate = new();
+
+    private long _epoch;
+    private long _promisedEpoch;
+    private ReplicationRole _role;
+    private string? _primaryId;
+    private string? _handoffTarget;
+    private RaftLogTerms _epochs = new();
+
+    public ReplicationRoleState(string directory) : this(LocalFileSystem.Instance, directory)
+    {
+    }
+
+    public ReplicationRoleState(IFileSystem fileSystem, string directory)
+    {
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        ArgumentException.ThrowIfNullOrEmpty(directory);
+        _fs = fileSystem;
+        _fs.CreateDirectoryIfMissing(directory);
+        _statePath = FileSystemHelpers.Combine(directory, "role.state");
+        _epochsPath = FileSystemHelpers.Combine(directory, "role.epochs");
+        IsFresh = !_fs.FileExists(_statePath);
+        Load();
+    }
+
+    /// <summary>True when no state had been written before this instance was created.</summary>
+    public bool IsFresh { get; }
+
+    public long Epoch
+    {
+        get
+        {
+            lock (_gate) return _epoch;
+        }
+    }
+
+    public long PromisedEpoch
+    {
+        get
+        {
+            lock (_gate) return Math.Max(_epoch, _promisedEpoch);
+        }
+    }
+
+    public ReplicationRole Role
+    {
+        get
+        {
+            lock (_gate) return _role;
+        }
+    }
+
+    public string? PrimaryId
+    {
+        get
+        {
+            lock (_gate) return _primaryId;
+        }
+    }
+
+    public string? HandoffTarget
+    {
+        get
+        {
+            lock (_gate) return _handoffTarget;
+        }
+    }
+
+    public long GetEpochForSeq(ulong seq)
+    {
+        lock (_gate) return _epochs.GetTermForSeq(seq);
+    }
+
+    public string SerializeEpochs()
+    {
+        lock (_gate) return _epochs.Serialize();
+    }
+
+    /// <summary>
+    /// Sets the role state and persists it. The epoch may never go backwards: an epoch a node has seen is a promise not to
+    /// accept anything older.
+    /// </summary>
+    public void Set(long epoch, ReplicationRole role, string? primaryId) => Set(epoch, role, primaryId, null);
+
+    public void Set(long epoch, ReplicationRole role, string? primaryId, string? handoffTarget)
+    {
+        lock (_gate)
+        {
+            if (epoch < _epoch) throw new InvalidOperationException("epoch may not go backwards (" + _epoch + " -> " + epoch + ")");
+            _epoch = epoch;
+            _role = role;
+            _primaryId = primaryId;
+            _handoffTarget = handoffTarget;
+            Persist();
+        }
+    }
+
+    /// <summary>
+    /// Persists that no promotion to <paramref name="epoch"/> or below may be accepted from now on. Returns false when an
+    /// equal or higher epoch was already promised.
+    /// </summary>
+    public bool Promise(long epoch)
+    {
+        lock (_gate)
+        {
+            if (epoch <= Math.Max(_epoch, _promisedEpoch)) return false;
+            _promisedEpoch = epoch;
+            Persist();
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Records that this node's own writes from <paramref name="startSeq"/> on belong to <paramref name="epoch"/>, for a
+    /// node becoming primary. Ranges starting at or after <paramref name="startSeq"/> are dropped first: a replica may
+    /// have learned them from a primary whose entries it never received, and its own writes take those sequence numbers
+    /// now. Left in place they would make <see cref="RaftLogTerms.Record"/> ignore the new epoch, and a diverged replica
+    /// pass the attach check.
+    /// </summary>
+    public void StartEpoch(ulong startSeq, long epoch)
+    {
+        lock (_gate)
+        {
+            _epochs = WithEpochStart(startSeq, epoch);
+            FileSystemHelpers.AtomicWrite(_fs, _epochsPath, _epochs.Serialize());
+        }
+    }
+
+    /// <summary>
+    /// <see cref="StartEpoch"/> followed by <see cref="Set(long, ReplicationRole, string?)"/> for a node becoming primary
+    /// in <paramref name="epoch"/>, persisted together (one directory fsync instead of two): this runs while the old
+    /// primary holds writes. The epoch map is renamed into place before the role, as with the two separate calls.
+    /// </summary>
+    public void BecomePrimary(ulong startSeq, long epoch, string nodeId)
+    {
+        lock (_gate)
+        {
+            if (epoch < _epoch) throw new InvalidOperationException("epoch may not go backwards (" + _epoch + " -> " + epoch + ")");
+            RaftLogTerms epochs = WithEpochStart(startSeq, epoch);
+            _epochs = epochs;
+            _epoch = epoch;
+            _role = ReplicationRole.Primary;
+            _primaryId = nodeId;
+            _handoffTarget = null;
+            FileSystemHelpers.AtomicWriteBoth(_fs, _epochsPath, _epochs.Serialize(), _statePath, SerializeState());
+        }
+    }
+
+    private RaftLogTerms WithEpochStart(ulong startSeq, long epoch)
+    {
+        var kept = new RaftLogTerms();
+        foreach ((ulong start, long e) in _epochs.GetRanges())
+        {
+            if (start < startSeq) kept.Record(start, e);
+        }
+        if (!kept.Record(startSeq, epoch)) throw new InvalidOperationException("epoch " + epoch + " is not newer than the epochs already recorded");
+        return kept;
+    }
+
+    /// <summary>
+    /// Adds the ranges of another node's epoch map in order. Ranges this map already covers are ignored, so this is how a
+    /// replica that passed the attach check picks up the epochs it is about to receive entries for.
+    /// </summary>
+    public void MergeEpochs(string serialized)
+    {
+        RaftLogTerms other = RaftLogTerms.Deserialize(serialized);
+        lock (_gate)
+        {
+            bool changed = false;
+            foreach ((ulong startSeq, long epoch) in other.GetRanges()) changed |= _epochs.Record(startSeq, epoch);
+            if (changed) FileSystemHelpers.AtomicWrite(_fs, _epochsPath, _epochs.Serialize());
+        }
+    }
+
+    /// <summary>Replaces the epoch map wholesale - after a snapshot restore, when the local log is the primary's.</summary>
+    public void ReplaceEpochs(string serialized)
+    {
+        lock (_gate)
+        {
+            _epochs = RaftLogTerms.Deserialize(serialized);
+            FileSystemHelpers.AtomicWrite(_fs, _epochsPath, _epochs.Serialize());
+        }
+    }
+
+    private void Persist() => FileSystemHelpers.AtomicWrite(_fs, _statePath, SerializeState());
+
+    private string SerializeState()
+    {
+        var sb = new StringBuilder();
+        sb.Append(_epoch.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append(((int)_role).ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append(_primaryId ?? string.Empty).Append('\n');
+        sb.Append(_handoffTarget ?? string.Empty).Append('\n');
+        sb.Append(_promisedEpoch.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        return sb.ToString();
+    }
+
+    private void Load()
+    {
+        string? state = FileSystemHelpers.TryReadAllText(_fs, _statePath);
+        if (state != null)
+        {
+            string[] lines = state.Split('\n');
+            if (lines.Length >= 1 && long.TryParse(lines[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out long e)) _epoch = e;
+            if (lines.Length >= 2 && int.TryParse(lines[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int r)) _role = (ReplicationRole)r;
+            if (lines.Length >= 3) _primaryId = string.IsNullOrEmpty(lines[2]) ? null : lines[2];
+            if (lines.Length >= 4) _handoffTarget = string.IsNullOrEmpty(lines[3]) ? null : lines[3];
+            if (lines.Length >= 5 && long.TryParse(lines[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out long p)) _promisedEpoch = p;
+        }
+        _epochs = RaftLogTerms.Deserialize(FileSystemHelpers.TryReadAllText(_fs, _epochsPath));
+    }
+}

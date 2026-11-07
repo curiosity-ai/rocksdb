@@ -1,0 +1,697 @@
+using System.Buffers;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using RocksDb.Managed.Db.Iterators;
+using RocksDb.Managed.Util;
+
+namespace RocksDb.Managed.Db;
+
+/// <summary>
+/// Reusable list of byte strings (merge operands or internal keys) that can grow at both ends, exposing them oldest
+/// first as a <see cref="MergeOperands"/> view without copying. Port of the operand list of rocksdb::MergeContext
+/// (db/merge_context.h): forward scans (DBIter::MergeValuesNewToOld, MergeHelper::MergeUntil) meet operands newest
+/// first and <see cref="PushOlder"/> them; reverse scans (DBIter::FindValueForCurrentKey) meet them oldest first and
+/// <see cref="PushNewer"/> them.
+/// </summary>
+/// <remarks>
+/// Storage is one pooled byte array plus one pooled array of boundaries, both used as a double-ended region; nothing
+/// is allocated in steady state. Not thread-safe. Index 0 is always the oldest entry.
+/// </remarks>
+public sealed class MergeOperandBuffer : IDisposable
+{
+    private byte[] _data;
+    private int[] _bounds;   // _bounds[_bStart.._bStart+_count+1) are absolute positions in _data (ascending)
+    private int _bStart;
+    private int _count;
+
+    public MergeOperandBuffer() : this(256, 16) { }
+
+    public MergeOperandBuffer(int initialBytes, int initialCount)
+    {
+        _data = ArrayPool<byte>.Shared.Rent(Math.Max(16, initialBytes));
+        _bounds = ArrayPool<int>.Shared.Rent(Math.Max(4, initialCount + 1));
+    }
+
+    /// <summary>Number of entries.</summary>
+    public int Count => _count;
+
+    public void Clear() => _count = 0;
+
+    /// <summary>Entry by age: index 0 is the oldest.</summary>
+    public ReadOnlySpan<byte> this[int index]
+    {
+        get
+        {
+            ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual((uint)index, (uint)_count);
+            int b = _bStart + index;
+            return _data.AsSpan(_bounds[b], _bounds[b + 1] - _bounds[b]);
+        }
+    }
+
+    /// <summary>Entry by recency: index 0 is the newest.</summary>
+    public ReadOnlySpan<byte> GetNewestFirst(int index) => this[_count - 1 - index];
+
+    /// <summary>The entries, oldest first, as a merge operand view (valid until the next mutation).</summary>
+    public MergeOperands AsOperands() =>
+        _count == 0 ? default : new MergeOperands(_data, _bounds.AsSpan(_bStart, _count + 1));
+
+    /// <summary>Adds an entry older than all present ones.</summary>
+    public void PushOlder(ReadOnlySpan<byte> value)
+    {
+        if (_count == 0)
+        {
+            // Lay out from the end so further PushOlder calls grow towards the front.
+            EnsureEmptyCapacity(value.Length);
+            int end = _data.Length;
+            int start = end - value.Length;
+            value.CopyTo(_data.AsSpan(start));
+            _bStart = _bounds.Length - 2;
+            _bounds[_bStart] = start;
+            _bounds[_bStart + 1] = end;
+            _count = 1;
+            return;
+        }
+        int dataStart = _bounds[_bStart];
+        if (dataStart < value.Length || _bStart == 0) Grow(value.Length, front: true);
+        dataStart = _bounds[_bStart];
+        int ns = dataStart - value.Length;
+        value.CopyTo(_data.AsSpan(ns));
+        _bounds[--_bStart] = ns;
+        _count++;
+    }
+
+    /// <summary>Adds an entry newer than all present ones.</summary>
+    public void PushNewer(ReadOnlySpan<byte> value)
+    {
+        if (_count == 0)
+        {
+            EnsureEmptyCapacity(value.Length);
+            value.CopyTo(_data);
+            _bStart = 0;
+            _bounds[0] = 0;
+            _bounds[1] = value.Length;
+            _count = 1;
+            return;
+        }
+        int bEnd = _bStart + _count; // index of the last boundary
+        int dataEnd = _bounds[bEnd];
+        if (_data.Length - dataEnd < value.Length || bEnd + 1 >= _bounds.Length) Grow(value.Length, front: false);
+        bEnd = _bStart + _count;
+        dataEnd = _bounds[bEnd];
+        value.CopyTo(_data.AsSpan(dataEnd));
+        _bounds[bEnd + 1] = dataEnd + value.Length;
+        _count++;
+    }
+
+    /// <summary>Replaces all entries with <paramref name="value"/>.</summary>
+    public void Reset(ReadOnlySpan<byte> value)
+    {
+        _count = 0;
+        PushNewer(value);
+    }
+
+    private void EnsureEmptyCapacity(int bytes)
+    {
+        if (_data.Length < bytes)
+        {
+            ArrayPool<byte>.Shared.Return(_data);
+            _data = ArrayPool<byte>.Shared.Rent(Math.Max(bytes, _data.Length * 2));
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void Grow(int extraBytes, bool front)
+    {
+        int dataStart = _bounds[_bStart];
+        int dataEnd = _bounds[_bStart + _count];
+        int used = dataEnd - dataStart;
+        // Re-center in place when there is enough total room (e.g. after the other end was used); grow otherwise.
+        byte[] nd = _data.Length - used >= extraBytes + 16 ? _data : ArrayPool<byte>.Shared.Rent(Math.Max(_data.Length * 2, used + extraBytes + 16));
+        int[] nb = _bounds.Length >= _count + 4 ? _bounds : ArrayPool<int>.Shared.Rent(Math.Max(_bounds.Length * 2, _count + 4));
+        // Leave at least the requested room on the growing side and split the rest, so alternating directions
+        // cannot trigger repeated growth.
+        int freeData = nd.Length - used;
+        int newDataStart = front ? Math.Max(extraBytes, freeData / 2) : Math.Min(freeData - extraBytes, freeData / 2);
+        int freeBounds = nb.Length - (_count + 1);
+        int newBStart = front ? Math.Max(1, freeBounds / 2) : Math.Min(freeBounds - 1, freeBounds / 2);
+        _data.AsSpan(dataStart, used).CopyTo(nd.AsSpan(newDataStart)); // memmove semantics when in place
+        int delta = newDataStart - dataStart;
+        if (nb == _bounds)
+        {
+            _bounds.AsSpan(_bStart, _count + 1).CopyTo(nb.AsSpan(newBStart));
+            for (int i = 0; i <= _count; i++) nb[newBStart + i] += delta;
+        }
+        else
+        {
+            for (int i = 0; i <= _count; i++) nb[newBStart + i] = _bounds[_bStart + i] + delta;
+            ArrayPool<int>.Shared.Return(_bounds);
+        }
+        if (nd != _data) ArrayPool<byte>.Shared.Return(_data);
+        _data = nd;
+        _bounds = nb;
+        _bStart = newBStart;
+    }
+
+    public void Dispose()
+    {
+        _count = 0;
+        byte[] d = _data;
+        int[] b = _bounds;
+        _data = [];
+        _bounds = [];
+        if (d.Length > 0) ArrayPool<byte>.Shared.Return(d);
+        if (b.Length > 0) ArrayPool<int>.Shared.Return(b);
+    }
+}
+
+/// <summary>Outcome of <see cref="MergeHelper.MergeUntil"/> (the OK / MergeInProgress statuses of upstream).</summary>
+public enum MergeUntilResult : byte
+{
+    /// <summary>
+    /// Either the operands were fully merged (one output entry of type Value), or the iterator was not on a merge
+    /// chain worth processing (no output: the caller writes the current entry), or a compaction filter asked to skip.
+    /// </summary>
+    Ok = 0,
+    /// <summary>The beginning of the key's history was not seen: outputs are (possibly partially merged) operands.</summary>
+    MergeInProgress = 1,
+}
+
+/// <summary>
+/// Merge resolution. Port of rocksdb::MergeHelper (db/merge_helper.{h,cc}): <see cref="TimedFullMerge"/> (used by
+/// DBIter and point lookups) and <see cref="MergeUntil"/> (used by compaction/flush).
+/// </summary>
+/// <remarks>
+/// Statistics, timers, blob base values and snapshot checkers are not ported (user-defined timestamps: see
+/// <see cref="FullHistoryTsLow"/>).
+/// A merge operator failure throws <see cref="RocksDbException"/> (Corruption / MergeOperatorFailed). An instance
+/// is not thread-safe (it owns reusable buffers); the static helpers are.
+/// </remarks>
+public sealed class MergeHelper : IDisposable
+{
+    [ThreadStatic] private static MergeOperandBuffer? t_contextScratch;
+
+    private readonly InternalKeyComparator _icmp;
+    private readonly MergeOperator _mergeOperator;
+    private readonly CompactionFilter? _compactionFilter;
+    private readonly ulong _latestSnapshot;
+    private readonly int _level;
+    private readonly MergeOperandBuffer _keys = new();
+    private readonly MergeOperandBuffer _operands = new();
+    private readonly PooledBufferWriter _mergeResult = new(256);
+    private readonly PooledBufferWriter _filterValue = new(64);
+    private readonly PooledBufferWriter _skipUntilUser = new(64);
+    private readonly IterKey _origKey = new();
+    private readonly IterKey _skipUntil = new();
+
+    /// <param name="comparator">Internal key comparator of the column family.</param>
+    /// <param name="mergeOperator">The column family's merge operator.</param>
+    /// <param name="compactionFilter">Compaction filter applied to merge operands newer than <paramref name="latestSnapshot"/>, or null.</param>
+    /// <param name="latestSnapshot">Operands with seqno &lt;= this are always kept (visible to a snapshot).</param>
+    /// <param name="level">Level passed to the compaction filter.</param>
+    public MergeHelper(InternalKeyComparator comparator, MergeOperator mergeOperator, CompactionFilter? compactionFilter, ulong latestSnapshot, int level)
+    {
+        ArgumentNullException.ThrowIfNull(comparator);
+        ArgumentNullException.ThrowIfNull(mergeOperator);
+        _icmp = comparator;
+        _mergeOperator = mergeOperator;
+        _compactionFilter = compactionFilter;
+        _latestSnapshot = latestSnapshot;
+        _level = level;
+    }
+
+    /// <summary>The DB's snapshot checker (WritePrepared / WriteUnprepared), or null.</summary>
+    internal SnapshotChecker? SnapshotChecker { get; set; }
+
+    /// <summary>Resolves blob base values in <see cref="MergeUntil"/> (the compaction's BlobFetcher); null = NotSupported.</summary>
+    internal Blob.CompactionBlobProcessor? BlobProcessor { get; set; }
+
+    // ------------------------------------------------------------------ TimedFullMerge
+
+    /// <summary>
+    /// Port of MergeHelper::TimedFullMerge (plain / no base value). Writes the merge result to
+    /// <paramref name="result"/>; throws Corruption (subcode MergeOperatorFailed) if the operator fails.
+    /// </summary>
+    public static void TimedFullMerge(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, bool hasBaseValue, ReadOnlySpan<byte> baseValue,
+        in MergeOperands operands, IBufferWriter<byte> result)
+    {
+        if (mergeOperator.IsPlainFullMergeV2)
+        {
+            // Neither FullMergeV3 nor the failure-scope overload is overridden: the default FullMergeV3 is this call.
+            if (!mergeOperator.FullMerge(userKey, hasBaseValue, baseValue, operands, result)) ThrowMergeFailed();
+            return;
+        }
+        TimedFullMergeSlow(mergeOperator, userKey, hasBaseValue, baseValue, operands, result);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void TimedFullMergeSlow(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, bool hasBaseValue, ReadOnlySpan<byte> baseValue,
+        in MergeOperands operands, IBufferWriter<byte> result)
+    {
+        if (!TryFullMerge(mergeOperator, userKey, hasBaseValue ? MergeExistingValueKind.Plain : MergeExistingValueKind.None, baseValue, operands,
+                result, null, out _, out _))
+        {
+            ThrowMergeFailed();
+        }
+    }
+
+    /// <summary>
+    /// MergeHelper::TimedFullMerge with an entity-capable result (the overload with result_type /
+    /// PinnableWideColumns): the base value is absent, plain or a serialized entity (<paramref name="baseKind"/>); a
+    /// plain result is written to <paramref name="value"/> (returns <see cref="EntryType.Value"/>), a wide-column result
+    /// to <paramref name="entity"/> serialized with sorted columns (returns <see cref="EntryType.WideColumnEntity"/>).
+    /// Throws Corruption (MergeOperatorFailed) if the operator fails.
+    /// </summary>
+    internal static EntryType TimedFullMerge(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, MergeExistingValueKind baseKind, ReadOnlySpan<byte> baseValue,
+        in MergeOperands operands, IBufferWriter<byte> value, IBufferWriter<byte>? entity)
+    {
+        if (!TryFullMerge(mergeOperator, userKey, baseKind, baseValue, operands, value, entity, out EntryType type, out _)) ThrowMergeFailed();
+        return type;
+    }
+
+    /// <summary>
+    /// <see cref="TimedFullMerge(MergeOperator, ReadOnlySpan{byte}, MergeExistingValueKind, ReadOnlySpan{byte}, in MergeOperands, IBufferWriter{byte}, IBufferWriter{byte})"/>
+    /// over the operands of a point lookup (newest first).
+    /// </summary>
+    internal static EntryType TimedFullMerge(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, MergeExistingValueKind baseKind, ReadOnlySpan<byte> baseValue,
+        MergeContext context, IBufferWriter<byte> value, IBufferWriter<byte>? entity)
+    {
+        MergeOperandBuffer buf = t_contextScratch ??= new MergeOperandBuffer();
+        buf.Clear();
+        for (int i = 0; i < context.Count; i++) buf.PushOlder(context.GetOperandNewestFirst(i));
+        try
+        {
+            return TimedFullMerge(mergeOperator, userKey, baseKind, baseValue, buf.AsOperands(), value, entity);
+        }
+        finally
+        {
+            buf.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Port of MergeHelper::TimedFullMergeCommonImpl + the TimedFullMergeImpl result visitors: runs
+    /// <see cref="MergeOperator.FullMergeV3"/>. With <paramref name="entity"/> null only a value is wanted: a
+    /// wide-column result yields the value of its default column (empty without one). Returns false on failure, with the
+    /// failure scope (kDefault reported as kTryMerge, per merge_operator.h).
+    /// </summary>
+    internal static bool TryFullMerge(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, MergeExistingValueKind baseKind, ReadOnlySpan<byte> baseValue,
+        in MergeOperands operands, IBufferWriter<byte> value, IBufferWriter<byte>? entity, out EntryType resultType, out MergeOperationFailureScope failureScope)
+    {
+        if (!mergeOperator.OverridesFullMergeV3 && baseKind != MergeExistingValueKind.WideColumns)
+        {
+            // The default FullMergeV3 with no or a plain base value is FullMergeV2: call it directly (hot path).
+            resultType = EntryType.Value;
+            bool hasBase = baseKind == MergeExistingValueKind.Plain;
+            if (!mergeOperator.OverridesScopedFullMerge)
+            {
+                failureScope = MergeOperationFailureScope.Default;
+                if (mergeOperator.FullMerge(userKey, hasBase, baseValue, operands, value)) return true;
+                failureScope = MergeOperationFailureScope.TryMerge;
+                return false;
+            }
+            if (mergeOperator.FullMerge(userKey, hasBase, baseValue, operands, value, out failureScope)) return true;
+            if (failureScope == MergeOperationFailureScope.Default) failureScope = MergeOperationFailureScope.TryMerge;
+            return false;
+        }
+        return TryFullMergeV3(mergeOperator, userKey, baseKind, baseValue, operands, value, entity, out resultType, out failureScope);
+    }
+
+    private static bool TryFullMergeV3(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, MergeExistingValueKind baseKind, ReadOnlySpan<byte> baseValue,
+        in MergeOperands operands, IBufferWriter<byte> value, IBufferWriter<byte>? entity, out EntryType resultType, out MergeOperationFailureScope failureScope)
+    {
+        var input = new MergeOperationInputV3(userKey, baseKind, baseValue, operands);
+        var output = new MergeOperationOutputV3(value, entity);
+        resultType = EntryType.Value;
+        if (!mergeOperator.FullMergeV3(in input, ref output))
+        {
+            // Apply default per merge_operator.h
+            failureScope = output.FailureScope == MergeOperationFailureScope.Default ? MergeOperationFailureScope.TryMerge : output.FailureScope;
+            return false;
+        }
+        failureScope = MergeOperationFailureScope.Default;
+        switch (output.Kind)
+        {
+            case MergeResultKind.SerializedEntity:
+                resultType = EntryType.WideColumnEntity;
+                break;
+            case MergeResultKind.Columns:
+                StoreColumnsResult(output.Columns!, value, entity, out resultType);
+                break;
+        }
+        return true;
+    }
+
+    /// <summary>The NewColumns visitor: sorts the columns and serializes them (or keeps only the default column's value).</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void StoreColumnsResult(Wide.EntityColumnList columns, IBufferWriter<byte> value, IBufferWriter<byte>? entity, out EntryType resultType)
+    {
+        try
+        {
+            columns.SortByName();
+            if (entity is null)
+            {
+                // result_value: the value of the default column, if the first column is the default one.
+                if (columns.Count > 0 && columns.GetName(0).IsEmpty) value.Write(columns.GetValue(0));
+                resultType = EntryType.Value;
+            }
+            else
+            {
+                Wide.WideColumnSerialization.Serialize(columns, entity);
+                resultType = EntryType.WideColumnEntity;
+            }
+        }
+        finally
+        {
+            columns.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// <see cref="TimedFullMerge(MergeOperator, ReadOnlySpan{byte}, bool, ReadOnlySpan{byte}, in MergeOperands, IBufferWriter{byte})"/>
+    /// over the operands collected by a point lookup in a <see cref="MergeContext"/> (newest first).
+    /// </summary>
+    public static void TimedFullMerge(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, bool hasBaseValue, ReadOnlySpan<byte> baseValue,
+        MergeContext context, IBufferWriter<byte> result)
+    {
+        MergeOperandBuffer buf = t_contextScratch ??= new MergeOperandBuffer();
+        buf.Clear();
+        for (int i = 0; i < context.Count; i++) buf.PushOlder(context.GetOperandNewestFirst(i));
+        try
+        {
+            TimedFullMerge(mergeOperator, userKey, hasBaseValue, baseValue, buf.AsOperands(), result);
+        }
+        finally
+        {
+            buf.Clear();
+        }
+    }
+
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    internal static void ThrowMergeFailed() =>
+        throw new RocksDbException(StatusCode.Corruption, "Corruption: Merge operator failed", StatusSubCode.MergeOperatorFailed);
+
+    // ------------------------------------------------------------------ MergeUntil (compaction)
+
+    /// <summary>
+    /// assert_valid_internal_key: when true (default, as in compaction) a corrupted key throws Corruption; when false
+    /// MergeUntil stops at it (upstream flush/test behaviour).
+    /// </summary>
+    public bool AssertValidInternalKey { get; set; } = true;
+
+    /// <summary>
+    /// full_history_ts_low of the compaction (null when unset or without user-defined timestamps): versions of a key
+    /// with different timestamps are only merged together below it.
+    /// </summary>
+    internal byte[]? FullHistoryTsLow { get; set; }
+
+    /// <summary>Number of output entries after <see cref="MergeUntil"/>.</summary>
+    public int OutputCount => _keys.Count;
+
+    /// <summary>Output internal key, newest first (MergeOutputIterator order).</summary>
+    public ReadOnlySpan<byte> GetOutputKey(int index) => _keys.GetNewestFirst(index);
+
+    /// <summary>Output value (merge result or operand), newest first.</summary>
+    public ReadOnlySpan<byte> GetOutputValue(int index) => _operands.GetNewestFirst(index);
+
+    /// <summary>True when the compaction filter returned RemoveAndSkipUntil during the last <see cref="MergeUntil"/>.</summary>
+    public bool HasCompactionFilterSkipUntil { get; private set; }
+
+    /// <summary>The internal key to skip to (user key + kMaxSequenceNumber/kValueTypeForSeek). REQUIRES: <see cref="HasCompactionFilterSkipUntil"/>.</summary>
+    public ReadOnlySpan<byte> CompactionFilterSkipUntil => _skipUntil.Key;
+
+    /// <summary>
+    /// MergeUntil's TimedFullMerge (entity-capable, with op_failure_scope) into <c>_mergeResult</c>. Returns the result
+    /// type (kTypeValue / kTypeWideColumnEntity), or null when the operator failed with kMustMerge; throws Corruption
+    /// (MergeOperatorFailed) for any other failure.
+    /// </summary>
+    private EntryType? TryMergeForOutput(ReadOnlySpan<byte> userKey, MergeExistingValueKind baseKind, ReadOnlySpan<byte> baseValue)
+    {
+        _mergeResult.Clear();
+        PooledBufferWriter entity = _mergeEntity ??= new PooledBufferWriter(64);
+        entity.Clear();
+        if (!TryFullMerge(_mergeOperator, userKey, baseKind, baseValue, _operands.AsOperands(), _mergeResult, entity, out EntryType type,
+                out MergeOperationFailureScope scope))
+        {
+            if (scope == MergeOperationFailureScope.MustMerge) return null;
+            ThrowMergeFailed();
+        }
+        if (type == EntryType.WideColumnEntity)
+        {
+            _mergeResult.Clear();
+            _mergeResult.Write(entity.WrittenSpan);
+        }
+        return type;
+    }
+
+    private PooledBufferWriter? _mergeEntity;
+
+    /// <summary>
+    /// TimedFullMerge with a kWideBaseValue; blob-backed columns of the base entity are resolved first
+    /// (WideColumnSerialization::ResolveEntityForMerge).
+    /// </summary>
+    private EntryType? MergeWithEntityBase(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> entity)
+    {
+        PooledBufferWriter? resolvedEntity = null;
+        try
+        {
+            if (Wide.WideColumnSerialization.HasBlobColumns(entity))
+            {
+                if (BlobProcessor is null) ThrowHelper.Corruption("Cannot resolve blob columns in entity without a blob fetcher");
+                resolvedEntity = ObjectPools.RentWriter();
+                BlobProcessor!.ResolveEntity(userKey, entity, resolvedEntity);
+                entity = resolvedEntity.WrittenSpan;
+            }
+            return TryMergeForOutput(userKey, MergeExistingValueKind.WideColumns, entity);
+        }
+        finally
+        {
+            if (resolvedEntity is not null) ObjectPools.ReturnWriter(resolvedEntity);
+        }
+    }
+
+    /// <summary>
+    /// Port of MergeHelper::MergeUntil. PRE: <paramref name="iter"/> is on a merge entry. Consumes the merge chain of
+    /// that user key, stopping at a different user key, at an entry with seqno &lt;= <paramref name="stopBefore"/>
+    /// (when &gt; 0; visible to an earlier snapshot), or at a put/delete (which is merged in and consumed).
+    /// Results are read with <see cref="OutputCount"/> / <see cref="GetOutputKey"/> / <see cref="GetOutputValue"/>.
+    /// </summary>
+    /// <param name="iter">Input; left on the first entry not consumed.</param>
+    /// <param name="rangeDel">Range tombstones of the compaction (null if none).</param>
+    /// <param name="stopBefore">Earliest snapshot boundary not to cross (0 for none).</param>
+    /// <param name="atBottom">True if no older version of the key can exist below this compaction's output.</param>
+    public MergeUntilResult MergeUntil(InternalIterator iter, RangeDelAggregator? rangeDel, ulong stopBefore, bool atBottom)
+    {
+        Debug.Assert(iter.Valid);
+        _keys.Clear();
+        _operands.Clear();
+        HasCompactionFilterSkipUntil = false;
+        bool firstKey = true;
+
+        _origKey.SetInternalKey(iter.Key);
+        if (!DbFormat.TryParseInternalKey(_origKey.Key, out ParsedInternalKey orig)) ThrowHelper.Corruption("MergeUntil: corrupted internal key");
+        Debug.Assert(orig.Type == EntryType.Merge);
+
+        bool hitTheNextUserKey = false;
+        Comparator ucmp = _icmp.UserComparator;
+        int tsSize = ucmp.TimestampSize;
+        byte[]? tsLow = FullHistoryTsLow;
+        int cmpWithFullHistoryTsLow = 0;
+        for (; iter.Valid; iter.Next())
+        {
+            ReadOnlySpan<byte> ikeyBytes = iter.Key;
+            if (!DbFormat.TryParseInternalKey(ikeyBytes, out ParsedInternalKey ikey))
+            {
+                // stop at corrupted key
+                if (AssertValidInternalKey) ThrowHelper.Corruption("MergeUntil: corrupted internal key");
+                break;
+            }
+            ReadOnlySpan<byte> userKey = ikeyBytes[..ikey.UserKeyLength];
+            ReadOnlySpan<byte> origUserKey = _origKey.UserKey;
+            if (tsLow is not null) cmpWithFullHistoryTsLow = ucmp.CompareTimestamp(DbFormat.ExtractTimestampFromUserKey(userKey, tsSize), tsLow);
+            if (firstKey)
+            {
+                Debug.Assert(_icmp.EqualUserKey(userKey, origUserKey));
+                firstKey = false;
+            }
+            else if (tsSize == 0
+                ? !_icmp.EqualUserKey(userKey, origUserKey)
+                : !ucmp.EqualWithoutTimestamp(userKey, origUserKey) || (!ucmp.Equal(userKey, origUserKey) && cmpWithFullHistoryTsLow >= 0))
+            {
+                // 1) hit a different user key, or 2) user-defined timestamp is enabled, and hit a version of the user key
+                // NOT eligible for GC: stop right here.
+                hitTheNextUserKey = true;
+                break;
+            }
+            else if (stopBefore > 0 && ikey.Sequence <= stopBefore
+                     && (SnapshotChecker is null || SnapshotChecker.CheckInSnapshot(ikey.Sequence, stopBefore) != SnapshotCheckerResult.NotInSnapshot))
+            {
+                // hit an entry that's possibly visible by the previous snapshot, can't touch that
+                break;
+            }
+
+            // At this point we are guaranteed that we need to process this key.
+            if (ikey.Type != EntryType.Merge)
+            {
+                // hit a put/delete/single delete => merge the put value or nothing with the operands; done.
+                // If there are no operands, the caller writes out the put/delete we are at.
+                if (_keys.Count == 0) return MergeUntilResult.Ok;
+
+                EntryType? resultType;
+                if (rangeDel is not null && rangeDel.ShouldDelete(userKey, ikey.Sequence))
+                {
+                    resultType = TryMergeForOutput(userKey, MergeExistingValueKind.None, default);
+                }
+                else if (ikey.Type == EntryType.Value)
+                {
+                    resultType = TryMergeForOutput(userKey, MergeExistingValueKind.Plain, iter.Value);
+                }
+                else if (ikey.Type == EntryType.ValuePreferredSeqno)
+                {
+                    // TimedPut merged with operands: its write time is obsolete, the result is a kTypeValue (or an entity).
+                    ReadOnlySpan<byte> v = iter.Value;
+                    resultType = TryMergeForOutput(userKey, MergeExistingValueKind.Plain, v[..^sizeof(ulong)]);
+                }
+                else if (ikey.Type == EntryType.WideColumnEntity)
+                {
+                    // kWideBaseValue: by default the operands apply to the default column and the other columns are kept.
+                    resultType = MergeWithEntityBase(userKey, iter.Value);
+                }
+                else if (ikey.Type is EntryType.BlobIndex)
+                {
+                    // MergeUntil with a blob base value: fetch it through the compaction's BlobFetcher.
+                    if (BlobProcessor is null) ThrowHelper.NotSupported("merge on top of blob index");
+                    PooledBufferWriter blob = ObjectPools.RentWriter();
+                    try
+                    {
+                        BlobProcessor!.FetchBlob(userKey, iter.Value, blob);
+                        resultType = TryMergeForOutput(userKey, MergeExistingValueKind.Plain, blob.WrittenSpan);
+                    }
+                    finally
+                    {
+                        ObjectPools.ReturnWriter(blob);
+                    }
+                }
+                else
+                {
+                    resultType = TryMergeForOutput(userKey, MergeExistingValueKind.None, default);
+                }
+                if (resultType is not { } rt)
+                {
+                    // kMustMerge failure: MergeInProgress denotes that the output consists of merge operands only. Leave
+                    // iter at the non-merge entry so it will be output after (merge_helper.cc).
+                    return MergeUntilResult.MergeInProgress;
+                }
+                StoreSingleResult(rt);
+                // move iter to the next entry
+                iter.Next();
+                return MergeUntilResult.Ok;
+            }
+
+            // hit a merge: apply the compaction filter, check range tombstones, queue the operand.
+            ReadOnlySpan<byte> value = iter.Value;
+            CompactionFilterDecision filter = ikey.Sequence <= _latestSnapshot
+                ? CompactionFilterDecision.Keep
+                : FilterMerge(origUserKey, value);
+            // FIXME (upstream): should also check for kRemove here
+            if (filter != CompactionFilterDecision.RemoveAndSkipUntil && rangeDel is not null && rangeDel.ShouldDelete(userKey, ikey.Sequence))
+            {
+                filter = CompactionFilterDecision.Remove;
+            }
+            if (filter is CompactionFilterDecision.Keep or CompactionFilterDecision.ChangeValue)
+            {
+                _keys.PushOlder(ikeyBytes);
+                _operands.PushOlder(filter == CompactionFilterDecision.Keep ? value : _filterValue.WrittenSpan);
+            }
+            else if (filter == CompactionFilterDecision.RemoveAndSkipUntil)
+            {
+                // Compaction filter asked us to remove this key altogether, along with some keys following it.
+                _keys.Clear();
+                _operands.Clear();
+                HasCompactionFilterSkipUntil = true;
+                return MergeUntilResult.Ok;
+            }
+        }
+
+        // we filtered out all the merge operands
+        if (_operands.Count == 0) return MergeUntilResult.Ok;
+
+        // We are sure we have seen this key's entire history if at_bottom and we either hit another key or the end.
+        // With user-defined timestamps, the beginning is only known for versions below full_history_ts_low.
+        bool surelySeenTheBeginning = (hitTheNextUserKey || !iter.Valid) && atBottom && (tsSize == 0 || cmpWithFullHistoryTsLow < 0);
+        if (surelySeenTheBeginning)
+        {
+            // do a final merge with no existing value and say bye to the merge type (it's now converted to a Put)
+            if (TryMergeForOutput(_origKey.UserKey, MergeExistingValueKind.None, default) is not { } rt)
+            {
+                // kMustMerge failure: the output consists of the input merge operands only.
+                return MergeUntilResult.MergeInProgress;
+            }
+            StoreSingleResult(rt);
+            return MergeUntilResult.Ok;
+        }
+
+        // We haven't seen the beginning of the key nor a Put/Delete: attempt a partial merge of the stacked operands.
+        if (_operands.Count >= 2 || (_mergeOperator.AllowSingleOperand && _operands.Count == 1))
+        {
+            _mergeResult.Clear();
+            if (_mergeOperator.PartialMerge(_origKey.UserKey, _operands.AsOperands(), _mergeResult))
+            {
+                // Replace operands with the merge result; keep only the newest key.
+                _origKey.SetInternalKey(_keys.GetNewestFirst(0));
+                _keys.Reset(_origKey.Key);
+                _operands.Reset(_mergeResult.WrittenSpan);
+            }
+        }
+        return MergeUntilResult.MergeInProgress;
+    }
+
+    /// <summary>keys_ = { newest key with the merge result's type }, operands = { merge result }.</summary>
+    private void StoreSingleResult(EntryType resultType)
+    {
+        _origKey.SetInternalKey(_keys.GetNewestFirst(0));
+        ulong seq = DbFormat.ExtractFooter(_origKey.Key) >> 8;
+        _origKey.UpdateInternalKey(seq, resultType);
+        _keys.Reset(_origKey.Key);
+        _operands.Reset(_mergeResult.WrittenSpan);
+    }
+
+    private List<WideColumn>? _filterNewColumns;
+
+    /// <summary>Port of MergeHelper::FilterMerge.</summary>
+    private CompactionFilterDecision FilterMerge(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> value)
+    {
+        if (_compactionFilter is null) return CompactionFilterDecision.Keep;
+        _filterValue.Clear();
+        _skipUntilUser.Clear();
+        List<WideColumn> newColumns = _filterNewColumns ??= new List<WideColumn>();
+        newColumns.Clear();
+        // FilterV4 (default: FilterV3 -> FilterV2/Filter) with existing_columns, new_columns and blob_resolver unused.
+        CompactionFilterDecision ret = _compactionFilter.FilterV4(_level, userKey, CompactionFilterValueType.MergeOperand, value, null, _filterValue,
+            newColumns, _skipUntilUser, null);
+        if (ret == CompactionFilterDecision.RemoveAndSkipUntil)
+        {
+            if (_icmp.CompareUserKey(_skipUntilUser.WrittenSpan, userKey) <= 0)
+            {
+                // Invalid skip_until returned from compaction filter. Keep the key as per FilterV2 documentation.
+                ret = CompactionFilterDecision.Keep;
+            }
+            else
+            {
+                _skipUntil.SetInternalKey(_skipUntilUser.WrittenSpan, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
+            }
+        }
+        return ret;
+    }
+
+    public void Dispose()
+    {
+        _keys.Dispose();
+        _operands.Dispose();
+        _mergeResult.Dispose();
+        _mergeEntity?.Dispose();
+        _filterValue.Dispose();
+        _skipUntilUser.Dispose();
+        _origKey.Dispose();
+        _skipUntil.Dispose();
+    }
+}

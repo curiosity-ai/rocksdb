@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Multi-process primary/replica pair with planned switchover over gRPC (port of rocksdb-sharp's Tests/SwitchoverTest). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RocksDb.Managed.Replication.MagicOnion\RocksDb.Managed.Replication.MagicOnion.csproj" />
+  </ItemGroup>
+</Project>
