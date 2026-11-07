@@ -17,7 +17,8 @@ namespace RocksDb.Managed.Benchmarks.DbBench;
 /// </code>
 /// <para><c>--rep N</c> tags the rows with repetition N (last CSV column); <c>report</c> aggregates repeated rows into
 /// medians, min-max, coefficients of variation and bootstrap confidence intervals of the geometric means.</para>
-/// <para><c>report</c>: turns a CSV into a markdown comparison (one table per configuration plus a summary):</para>
+/// <para><c>report</c>: turns a CSV into a markdown comparison (one table per configuration plus a summary, and a
+/// reads/sec + writes/sec table for readrandomwriterandom rows):</para>
 /// <code>
 /// RocksDb.Managed.Benchmarks report --csv results.csv --out results.md [--title T] [--machine machine.txt] [--notes notes.txt]
 /// </code>
@@ -25,7 +26,7 @@ namespace RocksDb.Managed.Benchmarks.DbBench;
 public static class CompareRunner
 {
     public const string CsvHeader =
-        "label,engine,benchmark,num,value_size,threads,compression,ops,seconds,micros_per_op,ops_per_sec,mb_per_sec,p50_us,p99_us,p999_us,found,alloc_b_per_op,gc0,gc1,gc2,jit_methods,jit_ms,rep";
+        "label,engine,benchmark,num,value_size,threads,compression,ops,seconds,micros_per_op,ops_per_sec,mb_per_sec,p50_us,p99_us,p999_us,found,alloc_b_per_op,gc0,gc1,gc2,jit_methods,jit_ms,rep,reads,writes";
 
     public const string LsmCsvHeader = "label,engine,num,value_size,threads,compression,files_per_level,user_bytes,written_bytes,write_amp,pending_compaction_bytes,rep";
 
@@ -34,6 +35,12 @@ public static class CompareRunner
 
     /// <summary>Fields of a RESULT line (RESULT,engine,...,jit_ms); shorter lines are padded so the rep column lines up.</summary>
     private const int ResultColumns = 19;
+
+    /// <summary>
+    /// Fields of a RESULT line after <see cref="ResultColumns"/>: reads, writes (readrandomwriterandom only). They go to
+    /// the CSV after the rep column, so older CSVs keep their layout.
+    /// </summary>
+    private const int ResultMixedColumns = 2;
 
     public static readonly string[] DefaultEngines = ["c-native", "rocksdb-sharp", "managed", "managed-async"];
 
@@ -107,14 +114,14 @@ public static class CompareRunner
                         if (writer is not null)
                         {
                             string[] c = line.Split(',');
-                            // RESULT,engine,benchmark,threads,ops,seconds,us,ops/s,MB/s,p50,p99,p999,found,alloc,gc0,gc1,gc2,jit_methods,jit_ms
+                            // RESULT,engine,benchmark,threads,ops,seconds,us,ops/s,MB/s,p50,p99,p999,found,alloc,gc0,gc1,gc2,jit_methods,jit_ms[,reads,writes]
                             var sb = new StringBuilder();
                             sb.Append(label).Append(',').Append(c[1]).Append(',').Append(c[2]).Append(',')
                               .Append(flags.Num).Append(',').Append(flags.ValueSize).Append(',').Append(c[3]).Append(',')
                               .Append(BenchFlags.Name(flags.Options.Compression));
-                            for (int k = 4; k < c.Length; k++) sb.Append(',').Append(c[k]);
-                            for (int k = c.Length; k < ResultColumns; k++) sb.Append(',');
+                            for (int k = 4; k < ResultColumns; k++) sb.Append(',').Append(k < c.Length ? c[k] : "");
                             sb.Append(',').Append(repetition.ToString(CultureInfo.InvariantCulture));
+                            for (int k = ResultColumns; k < ResultColumns + ResultMixedColumns; k++) sb.Append(',').Append(k < c.Length ? c[k] : "");
                             writer.WriteLine(sb.ToString());
                             writer.Flush();
                         }
@@ -197,10 +204,30 @@ public static class CompareRunner
     // ---------------------------------------------------------------------- report
 
     private sealed record Row(string Label, string Engine, string Benchmark, long Num, int ValueSize, int Threads, string Compression,
-        long Ops, double Micros, double OpsPerSec, double MBs, double P50, double P99, double P999, string Alloc, string JitMethods, int Rep)
+        long Ops, double Micros, double OpsPerSec, double MBs, double P50, double P99, double P999, string Alloc, string JitMethods, int Rep,
+        long Reads, long Writes)
     {
         public bool Available => Ops > 0;
+
+        /// <summary>readrandomwriterandom row with read / write counts.</summary>
+        public bool Mixed => Reads >= 0 && Writes >= 0 && Reads + Writes > 0;
+
+        /// <summary>Percentage of the ops that were writes (readrandomwriterandom), rounded.</summary>
+        public int WritePercent => (int)Math.Round(100.0 * Writes / (Reads + Writes));
+
+        public double ReadsPerSec => Mixed ? OpsPerSec * Reads / (Reads + Writes) : 0;
+
+        public double WritesPerSec => Mixed ? OpsPerSec * Writes / (Reads + Writes) : 0;
     }
+
+    /// <summary>
+    /// Benchmark name used to group rows: readrandomwriterandom rows of different --readwritepercent are distinct
+    /// benchmarks ("readrandomwriterandom w25%" = 25% writes).
+    /// </summary>
+    private static string GroupName(string benchmark, long reads, long writes) =>
+        benchmark == "readrandomwriterandom" && reads >= 0 && writes >= 0 && reads + writes > 0
+            ? benchmark + " w" + ((int)Math.Round(100.0 * writes / (reads + writes))).ToString(CultureInfo.InvariantCulture) + "%"
+            : benchmark;
 
     /// <summary>All repetitions of one (configuration, engine, benchmark); statistics over the available ones.</summary>
     private sealed class Agg
@@ -344,8 +371,10 @@ public static class CompareRunner
                 if (line.Length == 0 || line.StartsWith("label,", StringComparison.Ordinal)) continue;
                 string[] c = line.Split(',');
                 if (c.Length < 17) continue;
-                rows.Add(new Row(c[0], c[1], c[2], L(c[3]), (int)L(c[4]), (int)L(c[5]), c[6], L(c[7]), D(c[9]), D(c[10]), D(c[11]),
-                    D(c[12]), D(c[13]), D(c[14]), c.Length > 16 ? c[16] : "", c.Length > 20 ? c[20] : "", c.Length > 22 ? (int)L(c[22]) : 0));
+                long reads = c.Length > 24 && c[23].Length > 0 ? L(c[23]) : -1, writes = c.Length > 24 && c[24].Length > 0 ? L(c[24]) : -1;
+                rows.Add(new Row(c[0], c[1], GroupName(c[2], reads, writes), L(c[3]), (int)L(c[4]), (int)L(c[5]), c[6], L(c[7]), D(c[9]), D(c[10]), D(c[11]),
+                    D(c[12]), D(c[13]), D(c[14]), c.Length > 16 ? c[16] : "", c.Length > 20 ? c[20] : "", c.Length > 22 ? (int)L(c[22]) : 0,
+                    reads, writes));
             }
         }
 
@@ -506,6 +535,8 @@ public static class CompareRunner
             md.AppendLine();
         }
 
+        if (rows.Exists(r => r.Mixed)) AppendMixed(md, configs, engines, rows, repeated);
+
         var noisy = new List<string>();
         foreach (CfgKey cfg in configs)
         {
@@ -611,6 +642,71 @@ public static class CompareRunner
         else File.WriteAllText(output, md.ToString());
         return 0;
     }
+
+    /// <summary>
+    /// "Mixed reads / writes" section: for every configuration with readrandomwriterandom rows, one row per write
+    /// percentage with reads/sec and writes/sec (= ops/sec x read / write fraction) and ops/sec of every engine (medians
+    /// over the repetitions), each engine's ops/sec relative to c-native, and the managed engines' allocations.
+    /// </summary>
+    private static void AppendMixed(StringBuilder md, List<CfgKey> configs, List<string> engines, List<Row> rows, bool repeated)
+    {
+        var ci = CultureInfo.InvariantCulture;
+        md.AppendLine("## Mixed reads / writes (`readrandomwriterandom`)").AppendLine();
+        md.AppendLine("Throughput, higher is better" + (repeated ? " (medians over the repetitions)" : "")
+            + ": reads/s and writes/s = ops/s x the fraction of the ops that were reads / writes; vs C = ops/s of the engine / "
+            + "ops/s of c-native (< 1 = slower). alloc = managed bytes allocated per op.").AppendLine();
+        List<string> managed = engines.FindAll(e => e.StartsWith("managed", StringComparison.Ordinal));
+        foreach (CfgKey cfg in configs)
+        {
+            List<Row> mixed = rows.FindAll(r => r.Mixed && r.Available && Same(r, cfg));
+            if (mixed.Count == 0) continue;
+            var percents = mixed.Select(r => r.WritePercent).Distinct().OrderBy(x => x).ToList();
+            md.Append("### ").AppendLine(ConfigName(cfg)).AppendLine();
+            md.Append("| writes |");
+            foreach (string e in engines) md.Append(' ').Append(e).Append(" reads/s | ").Append(e).Append(" writes/s | ").Append(e).Append(" ops/s |");
+            foreach (string e in engines) if (e != "c-native") md.Append(' ').Append(e).Append(" vs C |");
+            foreach (string e in managed) md.Append(' ').Append(e).Append(" alloc B/op |");
+            md.AppendLine();
+            md.Append("|---:|");
+            int cols = engines.Count * 3 + engines.FindAll(e => e != "c-native").Count + managed.Count;
+            for (int k = 0; k < cols; k++) md.Append("---:|");
+            md.AppendLine();
+            foreach (int pct in percents)
+            {
+                double Median(string e, Func<Row, double> f)
+                {
+                    double[] v = [.. mixed.FindAll(r => r.Engine == e && r.WritePercent == pct).Select(f)];
+                    return v.Length == 0 ? -1 : Stats.Median(v);
+                }
+                md.Append("| ").Append(pct.ToString(ci)).Append("% |");
+                foreach (string e in engines)
+                {
+                    double rd = Median(e, r => r.ReadsPerSec), wr = Median(e, r => r.WritesPerSec), ops = Median(e, r => r.OpsPerSec);
+                    md.Append(' ').Append(FormatRate(rd)).Append(" | ").Append(FormatRate(wr)).Append(" | ").Append(FormatRate(ops)).Append(" |");
+                }
+                double cOps = Median("c-native", r => r.OpsPerSec);
+                foreach (string e in engines)
+                {
+                    if (e == "c-native") continue;
+                    double ops = Median(e, r => r.OpsPerSec);
+                    md.Append(' ').Append(ops > 0 && cOps > 0 ? (ops / cOps).ToString("F2", ci) + "x" : "-").Append(" |");
+                }
+                foreach (string e in managed)
+                {
+                    double alloc = Median(e, r => D(r.Alloc));
+                    md.Append(' ').Append(alloc >= 0 ? alloc.ToString("F1", ci) : "-").Append(" |");
+                }
+                md.AppendLine();
+            }
+            md.AppendLine();
+        }
+    }
+
+    /// <summary>Operations per second: "-" when missing, 1234 / "123.4k" / "1.23M".</summary>
+    private static string FormatRate(double r) => r < 0 ? "-"
+        : r >= 1e6 ? (r / 1e6).ToString("F2", CultureInfo.InvariantCulture) + "M"
+        : r >= 1e4 ? (r / 1e3).ToString("F1", CultureInfo.InvariantCulture) + "k"
+        : r.ToString("F0", CultureInfo.InvariantCulture);
 
     /// <summary>"LSM shape and write amplification" section from the STATS rows of the <c>stats</c> benchmark.</summary>
     private static void AppendLsm(StringBuilder md, List<string> lsmFiles, List<string> engines)

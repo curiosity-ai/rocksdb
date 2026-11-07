@@ -27,6 +27,11 @@ public enum DbBenchmark
     SeekRandom,
     MultiReadRandom,
     ReadWhileWriting,
+    /// <summary>
+    /// db_bench ReadRandomWriteRandom: every thread mixes point Gets and Puts of random keys, --readwritepercent of the
+    /// operations being reads (exact in every block of 100 ops).
+    /// </summary>
+    ReadRandomWriteRandom,
     DeleteRandom,
     Flush,
     Compact,
@@ -63,6 +68,7 @@ public static class BenchFlags
         ("fillsync", DbBenchmark.FillSync), ("readrandom", DbBenchmark.ReadRandom), ("readmissing", DbBenchmark.ReadMissing),
         ("readseq", DbBenchmark.ReadSeq), ("readreverse", DbBenchmark.ReadReverse), ("seekrandom", DbBenchmark.SeekRandom),
         ("multireadrandom", DbBenchmark.MultiReadRandom), ("readwhilewriting", DbBenchmark.ReadWhileWriting),
+        ("readrandomwriterandom", DbBenchmark.ReadRandomWriteRandom),
         ("deleterandom", DbBenchmark.DeleteRandom), ("flush", DbBenchmark.Flush), ("compact", DbBenchmark.Compact),
         ("waitforcompaction", DbBenchmark.WaitForCompaction), ("stats", DbBenchmark.Stats),
         ("txnoptimistic", DbBenchmark.TxnOptimistic), ("txnpessimistic", DbBenchmark.TxnPessimistic),

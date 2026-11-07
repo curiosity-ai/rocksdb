@@ -89,7 +89,8 @@ REPEATS=5 LOAD_MAX=1.5 NUM=300000 NUM_LARGE=100000 COMPACTION_NUM=500000 bench/r
 - `LOAD_MAX=1.5` waits before each repetition until the 1-minute load average is at most 1.5 (at most
   `LOAD_WAIT_MAX_S`, default 900 s). The report lists the load average at the start of each repetition and the
   min / median / max load before every engine-set run.
-- `compare --rep N` writes the repetition number into the last CSV column (`rep`; also in `.lsm.csv`).
+- `compare --rep N` writes the repetition number into the `rep` CSV column (the last one of `.lsm.csv`; in the main
+  CSV it is followed by the `reads`, `writes` columns of `readrandomwriterandom`).
 - `report` detects repeated rows and shows, per benchmark and engine, the **median** µs/op with the min-max range and
   the coefficient of variation (sample stddev / mean). Ratios use medians. Rows where any engine has CV > 10% are
   marked `!` and listed in a "Noisy rows" section. The summary geometric means use the medians and come with a 95%
@@ -97,6 +98,10 @@ REPEATS=5 LOAD_MAX=1.5 NUM=300000 NUM_LARGE=100000 COMPACTION_NUM=500000 bench/r
   engine and benchmark with replacement and recomputing medians, ratios and their geometric mean. The report also has
   a geometric mean over all matrix configurations and one per benchmark. The LSM section gives the median write-amp
   (min-max) and the most frequent LSM shape per engine, then every repetition.
+- `readrandomwriterandom` rows are grouped by their write percentage (benchmark `readrandomwriterandom w25%` = 25% of the
+  ops were Puts), so runs with different `--readwritepercent` can share a CSV and a label. The report adds a "Mixed reads
+  / writes" table per configuration: one row per write percentage with reads/s and writes/s (= ops/s x the read / write
+  fraction) and ops/s of every engine, ops/s relative to c-native, and the managed allocations (medians).
 
 ## Warm-up
 
@@ -173,7 +178,12 @@ bench/native-c/rocksdb_bench --benchmarks fillrandom,readrandom --num 1000000   
 
 Benchmarks: `fillseq`, `fillrandom`, `overwrite`, `fillsync` (num/1000 synced puts), `readrandom`, `readmissing`,
 `readseq`, `readreverse`, `seekrandom` (Seek + `--seek_nexts` Next), `multireadrandom` (batched MultiGet of
-`--multiget_size` keys), `readwhilewriting` (`--threads` readers + 1 writer), `deleterandom`, `flush`, `compact`
+`--multiget_size` keys), `readwhilewriting` (`--threads` readers + 1 writer), `readrandomwriterandom` (db_bench's
+ReadRandomWriteRandom: every thread mixes point Gets and Puts of random keys; in each block of 100 ops of a thread the
+first `--readwritepercent` are Gets, the rest Puts, so the ratio is exact; the Gets / Puts are the calls of
+`readrandom` / `fillrandom` of each engine, `TryGetAsync` / `PutAsync` for managed-async; total ops = `--reads`, as
+db_bench's `readwrites_` = max(`--reads`, `--writes`) with no `--writes` flag here; the output adds
+`(F of R reads found) (reads R writes W)`), `deleterandom`, `flush`, `compact`
 (full-range CompactRange), `waitforcompaction` (DB::WaitForCompact with default options: `rocksdb_wait_for_compact` in C and
 rocksdb-sharp, `WaitForCompact` in managed), `stats` (see below), `txnoptimistic` / `txnpessimistic` (num/txn_puts
 transactions of `--txn_puts` random puts each, default 10, on a fresh OptimisticTransactionDB (parallel validation, the
@@ -186,7 +196,7 @@ select the policy with `rocksdb_transactiondb_options_set_write_policy`).
 Flags (same for all engines): `--num`, `--reads` (default num), `--key_size` (16), `--value_size` (100), `--threads`,
 `--batch_size` (puts per WriteBatch in fill benchmarks, default 1 = Put), `--multiget_size` (16), `--seek_nexts` (10),
 `--reverse_iterator` (seekrandom: SeekForPrev + `--seek_nexts` Prev, db_bench's flag), `--compaction_readahead_size`
-(2 MiB), `--drop_page_cache` (`compact` evicts the SSTs from the OS page cache first: fsync + POSIX_FADV_DONTNEED), `--txn_puts` (10),
+(2 MiB), `--drop_page_cache` (`compact` evicts the SSTs from the OS page cache first: fsync + POSIX_FADV_DONTNEED), `--txn_puts` (10), `--readwritepercent` (90),
 `--disable_wal`, `--sync`, `--cache_size` (8 MiB), `--cache_type` (lru|hyperclock), `--bloom_bits` (10),
 `--write_buffer_size` (64 MiB), `--block_size` (4096), `--compression` (none|snappy|lz4|zstd), `--compression_parallel_threads` (1; managed only),
 `--compression_ratio` (0.5), `--target_file_size_base` (64 MiB), `--max_bytes_for_level_base` (256 MiB),
@@ -205,8 +215,8 @@ stats             : user 110.6 MB, flush+compaction written 327.7 MB, write-amp 
 STATS,c-native,3 0 0 0 0 4 15,116000000,343597384,2.96,0        machine-readable (compare -> <csv>.lsm.csv)
 ```
 
-`user` = key + value bytes written by `fillseq`/`fillrandom`/`overwrite`/`fillsync` and the `readwhilewriting` writer
-since the DB was created; write-amp = flush + compaction bytes written / user bytes (the WAL is not counted). The written
+`user` = key + value bytes written by `fillseq`/`fillrandom`/`overwrite`/`fillsync`, the `readwhilewriting` writer and
+the Puts of `readrandomwriterandom` since the DB was created; write-amp = flush + compaction bytes written / user bytes (the WAL is not counted). The written
 bytes come from the "Cumulative compaction: X GB write" line, i.e. have a resolution of 0.01 GB.
 
 Equivalence guarantees (see `DbBench/Workload.cs` and `native-c/rocksdb_bench.c`, which must stay in sync):
@@ -217,14 +227,14 @@ Equivalence guarantees (see `DbBench/Workload.cs` and `native-c/rocksdb_bench.c`
   `100 * compression_ratio` bytes repeated; values are consecutive windows of it;
 - random keys: SplitMix64 seeded per (benchmark position, thread), uniform in `[0, num)` — all engines read and write
   the same key sequence;
-- total ops (`--num` for writes, `--reads` for reads) are split across threads; a fresh DB for
+- total ops (`--num` for writes, `--reads` for reads and `readrandomwriterandom`) are split across threads; a fresh DB for
   `fillseq`/`fillrandom`/`fillsync` unless `--use_existing_db`;
 - options: create_if_missing, compression on all levels, write_buffer_size, block-based table format_version 6,
   block_size, LRU (or HyperClock) block cache, full bloom filter (`bloomfilter:N:false`), WAL/sync from flags; all
   other options are the engines' defaults;
 - output: `name : X micros/op Y ops/sec Z seconds N operations; M MB/s | p50 p99 p99.9 us`, then a
-  machine-readable `RESULT,engine,benchmark,threads,ops,seconds,micros_per_op,ops_per_sec,mb_per_sec,p50_us,p99_us,p999_us,found,alloc_b_per_op,gc0,gc1,gc2,jit_methods,jit_ms`
-  line. µs/op = wall time / total ops (like db_bench); percentiles come from a per-operation latency histogram
+  machine-readable `RESULT,engine,benchmark,threads,ops,seconds,micros_per_op,ops_per_sec,mb_per_sec,p50_us,p99_us,p999_us,found,alloc_b_per_op,gc0,gc1,gc2,jit_methods,jit_ms,reads,writes`
+  line (`reads`, `writes`: the Gets and Puts of `readrandomwriterandom`, empty for the other benchmarks). µs/op = wall time / total ops (like db_bench); percentiles come from a per-operation latency histogram
   (log-linear buckets, <= 1.6% error; per batch for `multireadrandom` and batched writes). The managed runner adds
   allocated bytes per op (all threads, `GC.GetTotalAllocatedBytes`, minus the runner's own worker / histogram
   objects; see "Allocations" below), gen0/1/2 collection counts and the methods

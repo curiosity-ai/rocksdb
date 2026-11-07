@@ -80,6 +80,7 @@ typedef struct {
   const char* db;
   bool histogram;
   int txn_puts;
+  int readwritepercent;   // readrandomwriterandom: % of ops that are reads
   bool warmup;            // warm-up phase on a separate DB (see warmup())
   int64_t warmup_ops;     // -1 = max(50k, num / 10), <= 200k, <= num
   int warmup_min_ms;      // minimum time per repeated warm-up benchmark
@@ -121,6 +122,7 @@ static Flags FLAGS = {
     .db = "/tmp/rocksdb-c-bench",
     .histogram = true,
     .txn_puts = 10,
+    .readwritepercent = 90,
     .warmup = true,
     .warmup_ops = -1,
     .warmup_min_ms = 1000,
@@ -132,6 +134,7 @@ static void usage(void) {
           "[--key_size 16] [--value_size 100]\n"
           "  [--threads 1] [--batch_size 1] [--multiget_size 16] "
           "[--seek_nexts 10] [--reverse_iterator] [--txn_puts 10] [--disable_wal] [--sync]\n"
+          "  [--readwritepercent 90]\n"
           "  [--cache_size BYTES] [--cache_type lru|hyperclock] [--bloom_bits "
           "10] [--write_buffer_size BYTES]\n"
           "  [--block_size 4096] [--compression none|snappy|lz4|zstd] "
@@ -148,7 +151,8 @@ static void usage(void) {
           "readmissing readseq readreverse\n"
           "            seekrandom multireadrandom readwhilewriting "
           "deleterandom flush compact\n"
-          "            waitforcompaction stats txnoptimistic txnpessimistic\n");
+          "            waitforcompaction stats txnoptimistic txnpessimistic\n"
+          "            readrandomwriterandom\n");
 }
 
 static bool parse_bool(const char* v) {
@@ -233,6 +237,8 @@ static void parse_flags(int argc, char** argv) {
     else if (FLAG("db")) FLAGS.db = value;
     else if (FLAG("histogram")) FLAGS.histogram = parse_bool(value);
     else if (FLAG("txn_puts")) FLAGS.txn_puts = atoi(value);
+    else if (FLAG("readwritepercent"))
+      FLAGS.readwritepercent = atoi(value);
     else if (FLAG("warmup")) FLAGS.warmup = parse_bool(value);
     else if (FLAG("warmup_ops")) FLAGS.warmup_ops = strtoll(value, NULL, 10);
     else if (FLAG("warmup_min_ms")) FLAGS.warmup_min_ms = atoi(value);
@@ -252,6 +258,8 @@ static void parse_flags(int argc, char** argv) {
   if (FLAGS.batch_size < 1) FLAGS.batch_size = 1;
   if (FLAGS.multiget_size < 1) FLAGS.multiget_size = 1;
   if (FLAGS.txn_puts < 1) FLAGS.txn_puts = 1;
+  if (FLAGS.readwritepercent < 0) FLAGS.readwritepercent = 0;
+  if (FLAGS.readwritepercent > 100) FLAGS.readwritepercent = 100;
   if (FLAGS.reads < 0) FLAGS.reads = FLAGS.num;
   if (FLAGS.warmup_min_ms < 0) FLAGS.warmup_min_ms = 0;
   if (FLAGS.warmup_ops <= 0) {
@@ -531,6 +539,7 @@ typedef enum {
   B_STATS,
   B_TXNOPTIMISTIC,
   B_TXNPESSIMISTIC,
+  B_READRANDOMWRITERANDOM,
   B_UNKNOWN
 } BenchId;
 
@@ -539,7 +548,7 @@ static const char* kBenchNames[] = {
     "readrandom",  "readmissing",  "readseq",         "readreverse",
     "seekrandom",  "multireadrandom", "readwhilewriting", "deleterandom",
     "flush",       "compact",      "waitforcompaction", "stats",
-    "txnoptimistic", "txnpessimistic"};
+    "txnoptimistic", "txnpessimistic", "readrandomwriterandom"};
 
 static BenchId bench_from_name(const char* n) {
   for (int i = 0; i < B_UNKNOWN; i++)
@@ -553,8 +562,9 @@ static inline uint64_t now_ns(void) {
   return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-// User bytes (key + value) written by the fill/overwrite benchmarks and the
-// readwhilewriting writer since the DB was created; the denominator of the
+// User bytes (key + value) written by the fill/overwrite benchmarks, the
+// readwhilewriting writer and the readrandomwriterandom puts since the DB was
+// created; the denominator of the
 // write amplification printed by the stats benchmark.
 static int64_t g_user_bytes_written;
 
@@ -574,6 +584,7 @@ typedef struct {
   int64_t ops;
   int64_t bytes;
   int64_t found;
+  int64_t writes;  // readrandomwriterandom: puts among ops (the rest are gets)
   uint64_t start_ns;
   uint64_t end_ns;
 } ThreadState;
@@ -646,6 +657,47 @@ static void do_reads(ThreadState* t, BenchId b, int64_t n, uint64_t* rng) {
     if (FLAGS.histogram) hist_add(&t->hist, now_ns() - t0);
   }
   t->ops = n;
+}
+
+// readrandomwriterandom (db_bench ReadRandomWriteRandom): one random key per
+// op; in every block of 100 ops the first --readwritepercent are point Gets
+// and the rest Puts (get_weight / put_weight counters).
+static void do_reads_writes(ThreadState* t, int64_t n, uint64_t* rng) {
+  char key[256];
+  ValueGen vg = {0};
+  int ks = FLAGS.key_size, vs = FLAGS.value_size;
+  int get_weight = 0, put_weight = 0;
+  int64_t writes = 0;
+  for (int64_t i = 0; i < n; i++) {
+    make_key(key, ks, rng_uniform(rng, (uint64_t)FLAGS.num));
+    if (get_weight == 0 && put_weight == 0) {
+      get_weight = FLAGS.readwritepercent;
+      put_weight = 100 - get_weight;
+    }
+    uint64_t t0 = now_ns();
+    char* err = NULL;
+    if (get_weight > 0) {
+      size_t vlen = 0;
+      char* v = rocksdb_get(g_db, g_ro, key, (size_t)ks, &vlen, &err);
+      check(err, "get");
+      if (v != NULL) {
+        t->found++;
+        t->bytes += (int64_t)(ks + vlen);
+        rocksdb_free(v);
+      }
+      get_weight--;
+    } else {
+      rocksdb_put(g_db, g_wo, key, (size_t)ks, next_value(&vg, vs), (size_t)vs,
+                  &err);
+      check(err, "put");
+      t->bytes += ks + vs;
+      writes++;
+      put_weight--;
+    }
+    if (FLAGS.histogram) hist_add(&t->hist, now_ns() - t0);
+  }
+  t->ops = n;
+  t->writes = writes;
 }
 
 static void do_deletes(ThreadState* t, int64_t n, uint64_t* rng) {
@@ -901,6 +953,9 @@ static void* thread_main(void* arg) {
     case B_DELETERANDOM:
       do_deletes(t, n, &rng);
       break;
+    case B_READRANDOMWRITERANDOM:
+      do_reads_writes(t, n, &rng);
+      break;
     case B_TXNOPTIMISTIC:
     case B_TXNPESSIMISTIC:
       do_txns(t, s->bench, n, &rng);
@@ -921,7 +976,8 @@ static int64_t g_ops_override = -1;
 
 static void report(const char* name, int64_t ops, double seconds,
                    int64_t bytes, int64_t found, bool show_found,
-                   const Histogram* h, const char* extra) {
+                   const Histogram* h, const char* extra, int64_t mixed_reads,
+                   int64_t mixed_writes) {
   if (g_quiet) return;
   double micros_per_op = ops > 0 ? seconds * 1e6 / (double)ops : 0;
   double ops_per_sec = seconds > 0 ? (double)ops / seconds : 0;
@@ -938,14 +994,21 @@ static void report(const char* name, int64_t ops, double seconds,
   if (h != NULL && h->count > 0)
     printf(" | p50 %.3f p99 %.3f p99.9 %.3f us", p50, p99, p999);
   if (show_found) printf(" (%" PRId64 " of %" PRId64 " found)", found, ops);
+  if (mixed_reads >= 0)
+    printf(" (%" PRId64 " of %" PRId64 " reads found)", found, mixed_reads);
   if (extra != NULL && extra[0] != 0) printf(" %s", extra);
   printf("\n");
   // Machine-readable line; the C# runner prints the same columns and fills
-  // the allocation/GC/JIT columns.
+  // the allocation/GC/JIT columns. The last two (reads, writes) are only
+  // filled by readrandomwriterandom.
   printf("RESULT,%s,%s,%d,%" PRId64 ",%.6f,%.4f,%.1f,%.2f,%.4f,%.4f,%.4f,%" PRId64
-         ",,,,,,\n",
+         ",,,,,,",
          kEngineName, name, FLAGS.threads, ops, seconds, micros_per_op,
          ops_per_sec, mbs, p50, p99, p999, found);
+  if (mixed_reads >= 0)
+    printf(",%" PRId64 ",%" PRId64 "\n", mixed_reads, mixed_writes);
+  else
+    printf(",,\n");
   fflush(stdout);
 }
 
@@ -956,7 +1019,9 @@ static void run_threaded(BenchId b, int bench_index, const char* name) {
   s.bench_index = bench_index;
   bool is_read = b == B_READRANDOM || b == B_READMISSING || b == B_READSEQ ||
                  b == B_READREVERSE || b == B_SEEKRANDOM ||
-                 b == B_MULTIREADRANDOM || b == B_READWHILEWRITING;
+                 b == B_MULTIREADRANDOM || b == B_READWHILEWRITING ||
+                 // db_bench sizes it by readwrites_ = max(--reads, --writes)
+                 b == B_READRANDOMWRITERANDOM;
   int64_t nominal = g_ops_override >= 0 ? g_ops_override
                     : is_read           ? FLAGS.reads
                                         : FLAGS.num;
@@ -992,7 +1057,7 @@ static void run_threaded(BenchId b, int bench_index, const char* name) {
   Histogram* merged = (Histogram*)malloc(sizeof(Histogram));
   hist_init(merged);
   uint64_t start = UINT64_MAX, end = 0;
-  int64_t ops = 0, bytes = 0, found = 0;
+  int64_t ops = 0, bytes = 0, found = 0, writes = 0;
   for (int i = 0; i < FLAGS.threads; i++) {  // readers only for rww
     hist_merge(merged, &ts[i].hist);
     if (ts[i].start_ns < start) start = ts[i].start_ns;
@@ -1000,6 +1065,7 @@ static void run_threaded(BenchId b, int bench_index, const char* name) {
     ops += ts[i].ops;
     bytes += ts[i].bytes;
     found += ts[i].found;
+    writes += ts[i].writes;
   }
   bool show_found = b == B_READRANDOM || b == B_READMISSING ||
                     b == B_MULTIREADRANDOM || b == B_READWHILEWRITING ||
@@ -1008,6 +1074,13 @@ static void run_threaded(BenchId b, int bench_index, const char* name) {
   if (b == B_READWHILEWRITING)
     snprintf(extra, sizeof(extra), "(writer: %lld puts)",
              (long long)atomic_load(&s.writer_ops));
+  int64_t mixed_reads = -1, mixed_writes = -1;
+  if (b == B_READRANDOMWRITERANDOM) {
+    mixed_reads = ops - writes;
+    mixed_writes = writes;
+    snprintf(extra, sizeof(extra), "(reads %lld writes %lld)",
+             (long long)mixed_reads, (long long)mixed_writes);
+  }
   if (b == B_TXNOPTIMISTIC || b == B_TXNPESSIMISTIC)
     snprintf(extra, sizeof(extra), "(%d puts/txn, %lld retries)",
              FLAGS.txn_puts, (long long)atomic_load(&g_txn_retries));
@@ -1017,8 +1090,10 @@ static void run_threaded(BenchId b, int bench_index, const char* name) {
   else if (b == B_READWHILEWRITING)
     g_user_bytes_written += (int64_t)atomic_load(&s.writer_ops) *
                             (FLAGS.key_size + FLAGS.value_size);
+  else if (b == B_READRANDOMWRITERANDOM)
+    g_user_bytes_written += writes * (FLAGS.key_size + FLAGS.value_size);
   report(name, ops, (double)(end - start) / 1e9, bytes, found, show_found,
-         merged, extra);
+         merged, extra, mixed_reads, mixed_writes);
   free(merged);
   free(ts);
   free(th);
@@ -1063,7 +1138,7 @@ static void run_single(BenchId b, const char* name) {
     check(err, "wait_for_compact");
   }
   double seconds = (double)(now_ns() - t0) / 1e9;
-  report(name, 1, seconds, 0, 0, false, NULL, "");
+  report(name, 1, seconds, 0, 0, false, NULL, "", -1, -1);
 }
 
 // The stats benchmark; same output as PrintStats in DbBenchRunner.cs.
@@ -1269,12 +1344,12 @@ static void print_header(void) {
   printf("Options:     compression=%s cache=%s:%" PRId64
          " bloom_bits=%d write_buffer_size=%" PRId64
          " block_size=%d batch_size=%d multiget_size=%d seek_nexts=%d "
-         "disable_wal=%d sync=%d pipelined=%d unordered=%d\n",
+         "disable_wal=%d sync=%d pipelined=%d unordered=%d readwritepercent=%d\n",
          FLAGS.compression, FLAGS.cache_type, FLAGS.cache_size,
          FLAGS.bloom_bits, FLAGS.write_buffer_size, FLAGS.block_size,
          FLAGS.batch_size, FLAGS.multiget_size, FLAGS.seek_nexts,
          FLAGS.disable_wal, FLAGS.sync, FLAGS.enable_pipelined_write,
-         FLAGS.unordered_write);
+         FLAGS.unordered_write, FLAGS.readwritepercent);
   printf("Compaction:  target_file_size_base=%" PRId64
          " max_bytes_for_level_base=%" PRId64
          " level0_file_num_compaction_trigger=%d disable_auto_compactions=%d "

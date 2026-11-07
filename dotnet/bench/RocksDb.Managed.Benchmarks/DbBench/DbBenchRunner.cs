@@ -17,7 +17,8 @@ namespace RocksDb.Managed.Benchmarks.DbBench;
 /// <item>Keys: db_bench GenerateKeyFromInt (8-byte big-endian number padded with '0' to --key_size).</item>
 /// <item>Values: db_bench's compressible random buffer (--compression_ratio, default 0.5).</item>
 /// <item>Random keys: SplitMix64 per (benchmark position, thread), uniform in [0, num).</item>
-/// <item>Work split: --num (writes) / --reads (reads, default num) ops in total, divided across --threads.</item>
+/// <item>Work split: --num (writes) / --reads (reads and readrandomwriterandom, default num) ops in total, divided across
+/// --threads.</item>
 /// <item>Fresh DB for fillseq/fillrandom/fillsync (unless --use_existing_db); others reuse the DB.</item>
 /// <item>Latency histogram per operation (per batch for multireadrandom / batched writes); percentiles in µs.</item>
 /// </list>
@@ -46,6 +47,11 @@ public static class DbBenchRunner
         public bool ReverseIterator;
         public bool DropPageCache;
         public int TxnPuts = 10;
+
+        /// <summary>
+        /// --readwritepercent: percentage of the readrandomwriterandom operations that are reads (db_bench's flag, default 90).
+        /// </summary>
+        public int ReadWritePercent = 90;
         public double CompressionRatio = 0.5;
         public string Db = Path.Combine(Path.GetTempPath(), "rocksdb-managed-dbbench");
         public bool UseExistingDb;
@@ -104,7 +110,8 @@ public static class DbBenchRunner
     public static long DefaultWarmupOps(long num) => Math.Max(1, Math.Min(num, Math.Min(200_000, Math.Max(50_000, num / 10))));
 
     /// <summary>
-    /// User bytes (key + value) written by the fill/overwrite benchmarks and the readwhilewriting writer since the DB
+    /// User bytes (key + value) written by the fill/overwrite benchmarks, the readwhilewriting writer and the puts of
+    /// readrandomwriterandom since the DB
     /// was (re)created; the denominator of the write amplification printed by <c>stats</c>.
     /// </summary>
     private static long s_userBytesWritten;
@@ -135,7 +142,7 @@ public static class DbBenchRunner
         Console.WriteLine("Values:      " + f.ValueSize + " bytes each (" + f.CompressionRatio.ToString("F2", CultureInfo.InvariantCulture) + " compression ratio)");
         Console.WriteLine("Entries:     " + f.Num + " (reads " + f.Reads + ")");
         Console.WriteLine("Threads:     " + f.Threads + (f.Async ? " (async tasks)" : ""));
-        Console.WriteLine("Options:     " + f.Options + " batch_size=" + f.BatchSize + " multiget_size=" + f.MultiGetSize + " seek_nexts=" + f.SeekNexts + (f.ReverseIterator ? " reverse_iterator" : ""));
+        Console.WriteLine("Options:     " + f.Options + " batch_size=" + f.BatchSize + " multiget_size=" + f.MultiGetSize + " seek_nexts=" + f.SeekNexts + (f.ReverseIterator ? " reverse_iterator" : "") + " readwritepercent=" + f.ReadWritePercent);
         Console.WriteLine("DB path:     " + f.Db);
         Console.WriteLine("Warm-up:     " + (f.Warmup
             ? "on (" + f.WarmupOps + " ops per benchmark, >= " + WarmupMinReps + " repetitions and >= " + f.WarmupMinMs + " ms, then " + WarmupFlushCompactionCycles + " x " + WarmupFlushesPerCycle + " flushes + compactions; separate DB " + f.Db + "-warmup)"
@@ -413,6 +420,9 @@ public static class DbBenchRunner
         public readonly int Tid = tid;
         public readonly Histogram Hist = new();
         public long Ops, Bytes, Found, Start, End;
+
+        /// <summary>readrandomwriterandom: the puts among <see cref="Ops"/> (the rest are gets).</summary>
+        public long Writes;
     }
 
     /// <summary>One benchmark execution: spawns the workers, merges and reports.</summary>
@@ -423,6 +433,9 @@ public static class DbBenchRunner
         private int _readersDone;
         private long _writerOps;
         private long _txnRetries;
+
+        /// <summary>readrandomwriterandom: gets and puts of all workers (-1 for the other benchmarks).</summary>
+        private long _mixedReads = -1, _mixedWrites = -1;
 
         private long _jitMethodsBefore;
         private TimeSpan _jitTimeBefore;
@@ -470,7 +483,9 @@ public static class DbBenchRunner
             }
 
             bool isRead = bench is DbBenchmark.ReadRandom or DbBenchmark.ReadMissing or DbBenchmark.ReadSeq or DbBenchmark.ReadReverse
-                or DbBenchmark.SeekRandom or DbBenchmark.MultiReadRandom or DbBenchmark.ReadWhileWriting;
+                or DbBenchmark.SeekRandom or DbBenchmark.MultiReadRandom or DbBenchmark.ReadWhileWriting
+                // db_bench sizes readrandomwriterandom by readwrites_ = max(--reads, --writes), i.e. --reads here.
+                or DbBenchmark.ReadRandomWriteRandom;
             long nominal = f.OpsOverride >= 0 ? f.OpsOverride : isRead ? f.Reads : f.Num;
             _totalOps = bench switch
             {
@@ -493,7 +508,7 @@ public static class DbBenchRunner
 
             harnessStart = GC.GetTotalAllocatedBytes(precise: true);
             var merged = new Histogram();
-            long start = long.MaxValue, end = 0, ops = 0, bytes = 0, found = 0;
+            long start = long.MaxValue, end = 0, ops = 0, bytes = 0, found = 0, writes = 0;
             for (int i = 0; i < f.Threads; i++) // readers only for readwhilewriting
             {
                 Worker w = workers[i];
@@ -503,11 +518,19 @@ public static class DbBenchRunner
                 ops += w.Ops;
                 bytes += w.Bytes;
                 found += w.Found;
+                writes += w.Writes;
+            }
+            if (bench == DbBenchmark.ReadRandomWriteRandom)
+            {
+                _mixedReads = ops - writes;
+                _mixedWrites = writes;
             }
             string extra = bench == DbBenchmark.ReadWhileWriting ? "(writer: " + Interlocked.Read(ref _writerOps) + " puts)"
-                : Txn is not null ? "(" + f.TxnPuts + " puts/txn, " + Interlocked.Read(ref _txnRetries) + " retries)" : "";
+                : Txn is not null ? "(" + f.TxnPuts + " puts/txn, " + Interlocked.Read(ref _txnRetries) + " retries)"
+                : bench == DbBenchmark.ReadRandomWriteRandom ? "(reads " + _mixedReads + " writes " + _mixedWrites + ")" : "";
             if (bench is DbBenchmark.FillSeq or DbBenchmark.FillRandom or DbBenchmark.Overwrite or DbBenchmark.FillSync) s_userBytesWritten += bytes;
             else if (bench == DbBenchmark.ReadWhileWriting) s_userBytesWritten += Interlocked.Read(ref _writerOps) * (f.KeySize + f.ValueSize);
+            else if (bench == DbBenchmark.ReadRandomWriteRandom) s_userBytesWritten += writes * (f.KeySize + f.ValueSize);
             harnessBytes += GC.GetTotalAllocatedBytes(precise: true) - harnessStart;
             Report(ops, Clock.ToNs(end - start) / 1e9, bytes, found, merged, allocBefore + harnessBytes, g0, g1, g2, extra);
         }
@@ -536,6 +559,8 @@ public static class DbBenchRunner
             if (hasHist) line += string.Format(ci, " | p50 {0:F3} p99 {1:F3} p99.9 {2:F3} us", p50, p99, p999);
             if (bench is DbBenchmark.ReadRandom or DbBenchmark.ReadMissing or DbBenchmark.MultiReadRandom or DbBenchmark.ReadWhileWriting or DbBenchmark.SeekRandom)
                 line += " (" + found + " of " + ops + " found)";
+            else if (bench == DbBenchmark.ReadRandomWriteRandom)
+                line += " (" + found + " of " + _mixedReads + " reads found)";
             if (extra.Length > 0) line += " " + extra;
             double allocPerOp = allocated / (double)Math.Max(ops, 1);
             // Managed allocations (all threads) per operation; native engines only allocate in unmanaged memory.
@@ -545,8 +570,10 @@ public static class DbBenchRunner
             double cpuPerOp = (Environment.CpuUsage.TotalTime - _cpuBefore).TotalMicroseconds / Math.Max(ops, 1);
             line += string.Format(ci, " cpu {0:F3} us/op", cpuPerOp);
             Console.WriteLine(line);
-            Console.WriteLine(string.Format(ci, "RESULT,{0},{1},{2},{3},{4:F6},{5:F4},{6:F1},{7:F2},{8:F4},{9:F4},{10:F4},{11},{12:F1},{13},{14},{15},{16},{17:F1}",
-                f.EngineLabel, _name, f.Threads, ops, seconds, microsPerOp, opsPerSec, mbs, p50, p99, p999, found, allocPerOp, d0, d1, d2, jitMethods, jitMs));
+            // The last two columns (reads, writes) are only filled by readrandomwriterandom.
+            Console.WriteLine(string.Format(ci, "RESULT,{0},{1},{2},{3},{4:F6},{5:F4},{6:F1},{7:F2},{8:F4},{9:F4},{10:F4},{11},{12:F1},{13},{14},{15},{16},{17:F1},{18},{19}",
+                f.EngineLabel, _name, f.Threads, ops, seconds, microsPerOp, opsPerSec, mbs, p50, p99, p999, found, allocPerOp, d0, d1, d2, jitMethods, jitMs,
+                _mixedReads >= 0 ? _mixedReads.ToString(ci) : "", _mixedWrites >= 0 ? _mixedWrites.ToString(ci) : ""));
             AllocationTracer.Instance?.Print(_name);
             Console.Out.Flush();
         }
@@ -616,6 +643,9 @@ public static class DbBenchRunner
                     break;
                 case DbBenchmark.MultiReadRandom:
                     DoMultiGet(w, n, ref rng);
+                    break;
+                case DbBenchmark.ReadRandomWriteRandom:
+                    DoReadsWrites(w, n, ref rng);
                     break;
                 case DbBenchmark.DeleteRandom:
                     DoDeletes(w, n, ref rng);
@@ -731,6 +761,51 @@ public static class DbBenchRunner
                 if (hist) w.Hist.Add(Clock.ElapsedNs(t0));
             }
             w.Ops = n;
+        }
+
+        /// <summary>
+        /// readrandomwriterandom (db_bench ReadRandomWriteRandom): one random key per op; in every block of 100 ops the
+        /// first --readwritepercent are point Gets and the rest Puts (get_weight / put_weight counters).
+        /// </summary>
+        private void DoReadsWrites(Worker w, long n, ref SplitMix64 rng)
+        {
+            int ks = f.KeySize, vs = f.ValueSize, readPercent = f.ReadWritePercent;
+            bool hist = f.Histogram;
+            ulong num = (ulong)f.Num;
+            byte[] key = new byte[ks];
+            byte[] buffer = new byte[Math.Max(vs, 1) * 2];
+            var vc = new ValueCursor(values);
+            int getWeight = 0, putWeight = 0;
+            long writes = 0;
+            for (long i = 0; i < n; i++)
+            {
+                KeyFormat.Make(key, rng.Uniform(num));
+                if (getWeight == 0 && putWeight == 0)
+                {
+                    getWeight = readPercent;
+                    putWeight = 100 - readPercent;
+                }
+                long t0 = Clock.Now();
+                if (getWeight > 0)
+                {
+                    if (engine.TryGet(key, buffer, out int len))
+                    {
+                        w.Found++;
+                        w.Bytes += ks + len;
+                    }
+                    getWeight--;
+                }
+                else
+                {
+                    engine.Put(key, vc.Next(vs).Span);
+                    w.Bytes += ks + vs;
+                    writes++;
+                    putWeight--;
+                }
+                if (hist) w.Hist.Add(Clock.ElapsedNs(t0));
+            }
+            w.Ops = n;
+            w.Writes = writes;
         }
 
         private void DoDeletes(Worker w, long n, ref SplitMix64 rng)
@@ -893,6 +968,9 @@ public static class DbBenchRunner
                 case DbBenchmark.MultiReadRandom:
                     await MultiGetAsync(w, n, rng).ConfigureAwait(false);
                     break;
+                case DbBenchmark.ReadRandomWriteRandom:
+                    await ReadsWritesAsync(me, w, n, rng).ConfigureAwait(false);
+                    break;
                 case DbBenchmark.DeleteRandom:
                     await DeletesAsync(me, w, n, rng).ConfigureAwait(false);
                     break;
@@ -963,6 +1041,49 @@ public static class DbBenchRunner
                 if (hist) w.Hist.Add(Clock.ElapsedNs(t0));
             }
             w.Ops = n;
+        }
+
+        /// <summary>readrandomwriterandom over TryGetAsync / PutAsync (see <see cref="DoReadsWrites"/>).</summary>
+        private async Task ReadsWritesAsync(ManagedEngine me, Worker w, long n, SplitMix64 rng)
+        {
+            int ks = f.KeySize, vs = f.ValueSize, readPercent = f.ReadWritePercent;
+            bool hist = f.Histogram;
+            ulong num = (ulong)f.Num;
+            byte[] key = new byte[ks];
+            var buffer = new ArrayBufferWriter<byte>(Math.Max(vs, 1) * 2);
+            var vc = new ValueCursor(values);
+            int getWeight = 0, putWeight = 0;
+            long writes = 0;
+            for (long i = 0; i < n; i++)
+            {
+                KeyFormat.Make(key, rng.Uniform(num));
+                if (getWeight == 0 && putWeight == 0)
+                {
+                    getWeight = readPercent;
+                    putWeight = 100 - readPercent;
+                }
+                long t0 = Clock.Now();
+                if (getWeight > 0)
+                {
+                    buffer.ResetWrittenCount();
+                    if (await me.Db.TryGetAsync(key, buffer).ConfigureAwait(false))
+                    {
+                        w.Found++;
+                        w.Bytes += ks + buffer.WrittenCount;
+                    }
+                    getWeight--;
+                }
+                else
+                {
+                    await me.Db.PutAsync(me.WriteOptions, key, vc.Next(vs)).ConfigureAwait(false);
+                    w.Bytes += ks + vs;
+                    writes++;
+                    putWeight--;
+                }
+                if (hist) w.Hist.Add(Clock.ElapsedNs(t0));
+            }
+            w.Ops = n;
+            w.Writes = writes;
         }
 
         private async Task MultiGetAsync(Worker w, long n, SplitMix64 rng)
@@ -1108,6 +1229,7 @@ public static class DbBenchRunner
                 case "reverse_iterator": f.ReverseIterator = ParseBool(value); break;
                 case "drop_page_cache": f.DropPageCache = ParseBool(value); break;
                 case "txn_puts": f.TxnPuts = Math.Max(1, int.Parse(value, ci)); break;
+                case "readwritepercent": f.ReadWritePercent = Math.Clamp(int.Parse(value, ci), 0, 100); break;
                 case "compression_ratio": f.CompressionRatio = double.Parse(value, ci); break;
                 case "db": f.Db = value; break;
                 case "use_existing_db": f.UseExistingDb = ParseBool(value); break;
@@ -1198,6 +1320,7 @@ public static class DbBenchRunner
     {
         Console.Error.WriteLine("usage: dbbench [--engine rocksdb-sharp|managed|c-native] [--async] [--benchmarks a,b,...] [--num N] [--reads N]");
         Console.Error.WriteLine("               [--key_size 16] [--value_size 100] [--threads 1] [--batch_size 1] [--multiget_size 16] [--seek_nexts 10] [--txn_puts 10]");
+        Console.Error.WriteLine("               [--readwritepercent 90 (readrandomwriterandom: % of ops that are reads)]");
         Console.Error.WriteLine("               [--disable_wal] [--sync] [--cache_size BYTES] [--cache_type lru|hyperclock] [--bloom_bits 10]");
         Console.Error.WriteLine("               [--write_buffer_size BYTES] [--block_size 4096] [--compression none|snappy|lz4|zstd] [--compression_parallel_threads 1] [--compression_ratio 0.5]");
         Console.Error.WriteLine("               [--target_file_size_base BYTES] [--max_bytes_for_level_base BYTES] [--level0_file_num_compaction_trigger 4]");
