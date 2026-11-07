@@ -102,6 +102,13 @@ public sealed class RaftConfig
         init;
     }
 
+    /// <summary>
+    /// Whether the entries this node writes itself (the leader no-op) are fsync'd before they count as part of its log.
+    /// Raft counts an entry towards the commit quorum only once it is on stable storage; see
+    /// <c>ClusterNodeHostOptions.SyncWal</c>, which sets this for the host.
+    /// </summary>
+    public bool SyncLogWrites { get; init; } = true;
+
     /// <summary>Clock for election timeouts and heartbeats (tests can use a fake one).</summary>
     public TimeProvider TimeProvider { get; init; } = TimeProvider.System;
 

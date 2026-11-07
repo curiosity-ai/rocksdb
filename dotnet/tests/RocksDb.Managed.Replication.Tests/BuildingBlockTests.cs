@@ -27,6 +27,37 @@ public sealed class BuildingBlockTests
         Assert.AreEqual((200UL, 4L), back.GetLast());
     }
 
+    /// <summary>
+    /// A follower at seq 90 that learned term 3 from seq 100 (a leader whose term-3 entries were never committed) then
+    /// attaches to the term-4 leader, whose term starts at 96. The stale range must not win: entries 96.. are term 4.
+    /// Before AdoptTermsAfter the follower kept (100, 3) and ignored (96, 4), so 96..99 read as term 1 and 100.. as 3.
+    /// </summary>
+    [TestMethod]
+    public void AttachingFollowerAdoptsTheLeadersTermsPastItsLog()
+    {
+        var fs = new MemoryFileSystem();
+        var s = new RaftPersistentState(fs, "/f/raft");
+        s.RecordTermRange(1, 1);
+        s.RecordTermRange(100, 3);
+        var leader = new RaftLogTerms();
+        leader.Record(1, 1);
+        leader.Record(96, 4);
+        s.AdoptTermsAfter(90, leader);
+        Assert.AreEqual(1, s.Terms.GetTermForSeq(90));
+        Assert.AreEqual(4, s.Terms.GetTermForSeq(96));
+        Assert.AreEqual(4, s.Terms.GetTermForSeq(120));
+        Assert.AreEqual(leader.Serialize(), s.Terms.Serialize());
+        Assert.AreEqual(leader.Serialize(), new RaftPersistentState(fs, "/f/raft").Terms.Serialize(), "persisted");
+
+        // Ranges at or before our log's end are ours (the attach check verified the term at it) and stay.
+        var t = new RaftLogTerms();
+        t.Record(1, 1);
+        t.Record(50, 2);
+        Assert.IsFalse(t.TruncateAfter(50));
+        Assert.IsTrue(t.TruncateAfter(49));
+        Assert.AreEqual((1UL, 1L), t.GetLast());
+    }
+
     [TestMethod]
     public void RaftPersistentStateSurvivesReopenOnMemoryFileSystem()
     {

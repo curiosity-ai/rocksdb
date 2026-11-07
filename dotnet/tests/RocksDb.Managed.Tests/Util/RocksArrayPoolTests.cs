@@ -44,11 +44,7 @@ public sealed class RocksArrayPoolTests
         Assert.AreEqual(1 << 30, PrivateSharedArrayPool<byte>.GetMaxSizeForBucket(26));
     }
 
-    private struct FlagAndValue
-    {
-        public bool Flag;
-        public long Value;
-    }
+    private readonly record struct FlagAndValue(bool Flag, long Value);
 
     [TestMethod]
     public void NewArraysOfNonPrimitiveTypesAreZeroed()

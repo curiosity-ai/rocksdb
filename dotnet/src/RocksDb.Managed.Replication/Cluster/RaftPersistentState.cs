@@ -109,6 +109,28 @@ public sealed class RaftPersistentState
     }
 
     /// <summary>
+    /// A follower attaching to a leader whose log matches ours up to <paramref name="lastLocalSeq"/>: the leader's term map
+    /// is the truth for every entry after it. Our own ranges past that point describe entries we never received or lost
+    /// (a deposed leader's discarded tail learned at an earlier attach, a range recorded just before a power loss) and
+    /// are dropped first; otherwise <see cref="RaftLogTerms.Record"/> would ignore the leader's earlier-starting ranges
+    /// and the entries about to arrive would carry the wrong term (wrong lastLogTerm in votes, spurious resyncs).
+    /// Persists if the map changed.
+    /// </summary>
+    public void AdoptTermsAfter(ulong lastLocalSeq, RaftLogTerms leaderTerms)
+    {
+        ArgumentNullException.ThrowIfNull(leaderTerms);
+        lock (_gate)
+        {
+            bool changed = _terms.TruncateAfter(lastLocalSeq);
+            foreach ((ulong start, long term) in leaderTerms.GetRanges())
+            {
+                if (start > lastLocalSeq) changed |= _terms.Record(start, term);
+            }
+            if (changed) FileSystemHelpers.AtomicWrite(_fs, _termsPath, _terms.Serialize());
+        }
+    }
+
+    /// <summary>
     /// Replaces the whole term map. Used after a snapshot restore, when the local log is byte-for-byte the leader's log,
     /// so the leader's term map is the correct description of it.
     /// </summary>

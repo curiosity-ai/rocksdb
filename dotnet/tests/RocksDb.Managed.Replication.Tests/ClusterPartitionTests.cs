@@ -172,4 +172,52 @@ public sealed class ClusterPartitionTests
         await c.AssertConvergedAsync(finalLeader);
         AssertAckedEverywhere(c, client.Acked, "after healing");
     }
+
+    /// <summary>
+    /// A follower's progress report belongs to the term it follows. Here the follower grants its vote in a later term
+    /// (to a candidate whose log ends where the follower's did at the time of the vote) while a chunk from the old leader
+    /// is in the middle of being applied; when that write completes the follower must not report it to the old leader,
+    /// which would count it towards a quorum the new term's candidate never had: the write would be acknowledged and
+    /// then lost when that candidate wins. The old leader's heartbeats to the follower are cut, so it does not learn of
+    /// the new term from the follower.
+    /// </summary>
+    [TestMethod]
+    public async Task FollowerThatVotedInALaterTermDoesNotAcknowledgeTheOldLeadersEntries()
+    {
+        var gates = new Dictionary<string, GatedFileSystem>(StringComparer.Ordinal);
+        var c = new ClusterHarness(3, null)
+        {
+            WrapFileSystem = (id, fs) => gates[id] = new GatedFileSystem(fs),
+        };
+        await using (c)
+        {
+            ClusterNodeHost n1 = await c.StartAsync("n1");
+            for (int i = 0; i < 50; i++) Assert.IsTrue(await n1.TryWriteAsLeaderAsync(U(K(i)), U(V(i, 0)), CancellationToken.None));
+            await c.StartAsync("n2");
+            await c.StartAsync("n3");
+            await WaitUntilAsync(() => c.Statuses().TrueForAll(s => s.Mode == ClusterMode.Cluster), "cluster mode\n" + c.LogText);
+            ClusterNodeHost leader = await c.WaitForLeaderAsync(null);
+            await c.AssertConvergedAsync(leader);
+            string[] others = Array.FindAll(s_nodes, id => id != leader.NodeId);
+            string follower = others[0], candidate = others[1];
+            long term = leader.Node.CurrentTerm;
+
+            // The candidate does not get the next entry; the leader cannot reach the follower (its stream and progress
+            // reports to the leader still flow).
+            c.Network.SetPartitioned(leader.NodeId, candidate, true);
+            c.Network.CutLink(leader.NodeId, follower);
+            ulong followerLatest = c[follower].Db.GetLatestSequenceNumber();
+
+            gates[follower].Arm();
+            Task<bool> write = leader.WriteCommittedAsync(U("contested"), U("x"), TimeSpan.FromSeconds(3), CancellationToken.None).AsTask();
+            await gates[follower].Blocked.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.AreEqual(followerLatest, c[follower].Db.GetLatestSequenceNumber(), "the chunk is not applied yet");
+            RequestVoteResult vote = c[follower].HandleRequestVote(new RequestVotePayload(term + 1, candidate, followerLatest, leader.Node.GetTermForSeq(followerLatest)));
+            Assert.IsTrue(vote.VoteGranted, "the follower votes for the candidate in term " + (term + 1));
+            gates[follower].Release();
+
+            Assert.IsFalse(await write, "the old leader acknowledged an entry only the leader and a follower that had voted for a candidate without it held\n" + c.LogText);
+            c.Network.Heal();
+        }
+    }
 }

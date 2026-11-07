@@ -8,6 +8,20 @@ namespace RocksDb.Managed.Replication.Hosting;
 public sealed record ClusterNodeStatus(string NodeId, RaftRole Role, long Term, string? LeaderId, ulong LatestSeq, ulong CommitSeq, ClusterMode Mode,
     int BootstrapInSyncCount, bool Resyncing, int Resyncs);
 
+/// <summary>Outcome of <see cref="ClusterNodeHost.WriteCommittedAsync(WriteBatch, TimeSpan, CancellationToken)"/>.</summary>
+public enum ClusterWriteStatus
+{
+    /// <summary>The write is committed (replicated to a quorum).</summary>
+    Committed = 0,
+    /// <summary>Definitely not applied: this node was not the leader (or was rebuilding) and wrote nothing.</summary>
+    NotLeader = 1,
+    /// <summary>Indeterminate: written to this node's log, but it stopped leading before the write committed. A later
+    /// leader may still commit it (if it was replicated) or discard it.</summary>
+    LeadershipLost = 2,
+    /// <summary>Indeterminate: written to this node's log, not committed within the timeout (it may still commit).</summary>
+    TimedOut = 3,
+}
+
 /// <summary>Answer to a follower's attach check: <see cref="LogConsistencyResult"/> plus the leader's term map.</summary>
 public sealed record ClusterAttachResult(bool IsLeader, bool Consistent, long Term, string Terms);
 
@@ -43,6 +57,20 @@ public sealed class ClusterNodeHostOptions
     public required string BootstrapPrimaryId { get; init; }
     /// <summary>Creates the options the database is opened with (CreateIfMissing is forced on; FileSystem selects the storage).</summary>
     public required Func<DbOptions> DbOptionsFactory { get; init; }
+    /// <summary>Options of the default column family (e.g. a merge operator); null opens it with default options.</summary>
+    public Func<ColumnFamilyOptions>? DefaultColumnFamilyOptionsFactory { get; init; }
+    /// <summary>
+    /// Whether every log entry (client writes, the leader no-op, replicated chunks on followers) is fsync'd before it
+    /// counts: before the leader counts itself towards the commit quorum, before a follower reports or acknowledges it,
+    /// before a node's latest sequence number (used in votes and heartbeats) moves past it. This is Raft's stable-storage
+    /// rule; without it a power loss of a node can drop entries the quorum relied on and lose acknowledged writes. Writes
+    /// of concurrent clients share one fsync (group commit) and a follower syncs once per replicated chunk. False keeps
+    /// only process-crash durability (the OS still has the data) for lower latency.
+    /// </summary>
+    public bool SyncWal { get; init; } = true;
+
+    /// <summary>Clock of the Raft election timer and heartbeats (<see cref="RaftConfig.TimeProvider"/>).</summary>
+    public TimeProvider TimeProvider { get; init; } = TimeProvider.System;
     public int ElectionTimeoutMinMs { get; init; } = 1500;
     public int ElectionTimeoutMaxMs { get; init; } = 3000;
     public int HeartbeatIntervalMs { get; init; } = 300;
@@ -108,10 +136,15 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         _fs.CreateDirectoryIfMissing(_cfg.DbPath);
         _state = new RaftPersistentState(_fs, RaftDir);
 
-        // Non-bootstrap nodes pull an initial snapshot only when the DB is fresh.
-        if (!IsBootstrapPrimary && !_fs.FileExists(FileSystemHelpers.Combine(_cfg.DbPath, "CURRENT")))
+        // A node without a database pulls a snapshot before it takes part: a new follower, and any node whose Raft state
+        // outlived its database (killed during a snapshot restore, which deletes the old files before CURRENT arrives).
+        // With an empty log such a node would grant its vote to any candidate, including one that lacks entries this
+        // node had helped commit. Only the bootstrap primary of a new cluster (or one still in Bootstrap mode, where no
+        // other node can lead) starts from an empty database.
+        if (!_fs.FileExists(FileSystemHelpers.Combine(_cfg.DbPath, "CURRENT")) &&
+            (!IsBootstrapPrimary || (!_state.IsFresh && _state.Mode == ClusterMode.Cluster)))
         {
-            await PullSnapshotWithRetryAsync(BootstrapMember(), cancellationToken).ConfigureAwait(false);
+            await PullInitialSnapshotAsync(cancellationToken).ConfigureAwait(false);
         }
         _db = await OpenDatabaseAsync(cancellationToken).ConfigureAwait(false);
 
@@ -128,6 +161,8 @@ public sealed class ClusterNodeHost : IAsyncDisposable
             HeartbeatIntervalMs = _cfg.HeartbeatIntervalMs,
             BootstrapInSyncLagThreshold = _cfg.BootstrapInSyncLagThreshold,
             BootstrapPromotionQuorum = _cfg.BootstrapPromotionQuorum,
+            TimeProvider = _cfg.TimeProvider,
+            SyncLogWrites = _cfg.SyncWal,
         };
         _node = new RaftClusterNode(raft, _state, _db, new Transport(this));
         _node.LeaderChanged += OnLeaderChanged;
@@ -149,6 +184,8 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         throw new InvalidOperationException("bootstrap primary " + _cfg.BootstrapPrimaryId + " is not a member");
     }
 
+    private WriteOptions? LogWriteOptions => _cfg.SyncWal ? WriteOptions.SyncWrites : null;
+
     private ClusterMember? Member(string nodeId)
     {
         foreach (ClusterMember m in _cfg.Members)
@@ -162,7 +199,10 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     {
         DbOptions o = _cfg.DbOptionsFactory();
         o.CreateIfMissing = true;
-        return await RocksDatabase.OpenAsync(_cfg.DbPath, o, cancellationToken).ConfigureAwait(false);
+        Func<ColumnFamilyOptions>? cf = _cfg.DefaultColumnFamilyOptionsFactory;
+        return cf is null
+            ? await RocksDatabase.OpenAsync(_cfg.DbPath, o, cancellationToken).ConfigureAwait(false)
+            : await RocksDatabase.OpenAsync(_cfg.DbPath, o, cf(), cancellationToken).ConfigureAwait(false);
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -175,7 +215,9 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         if (_resyncing || _node.Role != RaftRole.Leader || !_dbGate.TryEnter()) return false;
         try
         {
-            await _db.PutAsync(key, value, cancellationToken).ConfigureAwait(false);
+            using WriteBatch b = _db.CreateWriteBatch();
+            b.Put(key.Span, value.Span);
+            await _db.WriteAsync(LogWriteOptions, b, cancellationToken).ConfigureAwait(false);
             return true;
         }
         finally
@@ -200,29 +242,84 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         {
             using WriteBatch b = _db.CreateWriteBatch();
             b.Put(key.Span, value.Span);
-            await _db.WriteAsync(b, cancellationToken).ConfigureAwait(false);
+            await _db.WriteAsync(LogWriteOptions, b, cancellationToken).ConfigureAwait(false);
             seq = _db.GetLatestSequenceNumber();
         }
         finally
         {
             _dbGate.Exit();
         }
-        if (_node.CommitSeq >= seq) return true;
+        return await WaitForCommitAsync(seq, timeout, cancellationToken).ConfigureAwait(false) == ClusterWriteStatus.Committed;
+    }
+
+    /// <summary>
+    /// Writes <paramref name="batch"/> (atomically: one log entry range) and waits until it is committed. Unlike the
+    /// key/value overload the result tells a definite rejection (<see cref="ClusterWriteStatus.NotLeader"/>: nothing was
+    /// written) from the indeterminate outcomes (<see cref="ClusterWriteStatus.LeadershipLost"/>,
+    /// <see cref="ClusterWriteStatus.TimedOut"/>: the entry is in this node's log and may or may not commit). An exception
+    /// from the database write is indeterminate as well.
+    /// </summary>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<ClusterWriteStatus> WriteCommittedAsync(WriteBatch batch, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(batch);
+        if (_resyncing || _node.Role != RaftRole.Leader || !_dbGate.TryEnter()) return ClusterWriteStatus.NotLeader;
+        ulong seq;
+        try
+        {
+            await _db.WriteAsync(LogWriteOptions, batch, cancellationToken).ConfigureAwait(false);
+            seq = _db.GetLatestSequenceNumber();
+        }
+        finally
+        {
+            _dbGate.Exit();
+        }
+        return await WaitForCommitAsync(seq, timeout, cancellationToken).ConfigureAwait(false);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    private async ValueTask<ClusterWriteStatus> WaitForCommitAsync(ulong seq, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        if (_node.CommitSeq >= seq) return ClusterWriteStatus.Committed;
         bool linked = cancellationToken.CanBeCanceled;
         CancellationTokenSource cts = linked ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken) : RentTimeoutSource();
         try
         {
             cts.CancelAfter(timeout);
-            return await _node.WaitForCommitAsync(seq, cts.Token).ConfigureAwait(false);
+            return await _node.WaitForCommitAsync(seq, cts.Token).ConfigureAwait(false) ? ClusterWriteStatus.Committed : ClusterWriteStatus.LeadershipLost;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            return false;
+            return ClusterWriteStatus.TimedOut;
         }
         finally
         {
             if (linked) cts.Dispose();
             else ReturnTimeoutSource(cts);
+        }
+    }
+
+    /// <summary>
+    /// Runs <paramref name="use"/> on the current database instance unless it is being rebuilt (resync) or closed; the
+    /// instance cannot be disposed while <paramref name="use"/> runs. For reads and diagnostics: writing to a node's
+    /// database outside the Raft log diverges the replica.
+    /// </summary>
+    public bool TryUseDatabase<TState, TResult>(TState state, Func<RocksDatabase, TState, TResult> use, out TResult result)
+    {
+        ArgumentNullException.ThrowIfNull(use);
+        if (!_dbGate.TryEnter())
+        {
+            result = default!;
+            return false;
+        }
+        try
+        {
+            result = use(_db, state);
+            return true;
+        }
+        finally
+        {
+            _dbGate.Exit();
         }
     }
 
@@ -472,15 +569,20 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                     TriggerResync("log at " + myLatest + " diverged from leader " + leaderId);
                     return;
                 }
-                // Learn the term ranges of the entries about to arrive (the stream merges batches across terms).
-                foreach ((ulong start, long term) in RaftLogTerms.Deserialize(check.Terms).GetRanges())
-                {
-                    if (start > myLatest) _state.RecordTermRange(start, term);
-                }
+                // Learn the term ranges of the entries about to arrive (the stream merges batches across terms); the
+                // leader's map replaces whatever we recorded past our log's end.
+                _state.AdoptTermsAfter(myLatest, RaftLogTerms.Deserialize(check.Terms));
 
                 Log("following " + leaderId + " from seq " + (myLatest + 1));
-                var consumer = new ReplicationConsumer(_db);
-                await using var progress = new ProgressReporter((seq, c) => client.ReportProgressAsync(_cfg.NodeId, seq, c));
+                // Synced chunks: the progress reports and heartbeat answers below only ever cover durable entries.
+                var consumer = new ReplicationConsumer(_db) { SyncWrites = _cfg.SyncWal };
+                // A progress report acknowledges entries of the leader's term: once this node moved to a later term (it
+                // granted a vote, possibly while a chunk was being applied, to a candidate whose log ends before that
+                // chunk), the old leader must not count them towards a quorum - the new term's leader may lack them.
+                // Checked after the entries were applied: a vote granted later saw them in our log.
+                long followTerm = check.Term;
+                await using var progress = new ProgressReporter((seq, c) =>
+                    _node.CurrentTerm <= followTerm ? client.ReportProgressAsync(_cfg.NodeId, seq, c) : Task.CompletedTask);
                 progress.Report(myLatest);
                 await foreach (WalStreamMessage m in client.StreamUpdatesAsync(_cfg.NodeId, myLatest + 1, ct).ConfigureAwait(false))
                 {
@@ -490,6 +592,8 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                         return;
                     }
                     _node.HandleObservedLeader(m.SourceId, m.SourceTerm);
+                    // A deposed leader's chunk (we already are in a later term): Raft rejects stale AppendEntries.
+                    if (m.SourceTerm < _node.CurrentTerm) break;
                     if (m.EntryTerm > 0) _state.RecordTermRange(m.FirstSequence, m.EntryTerm);
                     // A faithful replica ingests the leader's batches at exactly the same sequence numbers; a gap or an
                     // overlap diverges the copy.
@@ -524,21 +628,31 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     // ---------------------------------------------------------------------------------------------------
     // Snapshot pull + full resync
 
-    private async Task PullSnapshotWithRetryAsync(ClusterMember source, CancellationToken cancellationToken)
+    /// <summary>
+    /// Pulls the initial snapshot from the current leader (any member that leads or knows the leader), or from the
+    /// bootstrap primary while the cluster is still in Bootstrap mode; retries until it succeeds or the host stops.
+    /// </summary>
+    private async Task PullInitialSnapshotAsync(CancellationToken cancellationToken)
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
-        for (int attempt = 0; ; attempt++)
+        CancellationToken ct = linked.Token;
+        while (true)
         {
-            try
+            ClusterMember? source = await FindLeaderAsync(ct).ConfigureAwait(false);
+            if (source == null && _state.Mode == ClusterMode.Bootstrap && !IsBootstrapPrimary) source = BootstrapMember();
+            if (source != null)
             {
-                await PullSnapshotAsync(source, linked.Token).ConfigureAwait(false);
-                return;
+                try
+                {
+                    await PullSnapshotAsync(source, ct).ConfigureAwait(false);
+                    return;
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    Log("snapshot from " + source.NodeId + " failed: " + ex.Message + "; retrying");
+                }
             }
-            catch (Exception ex) when (attempt < 100 && !linked.IsCancellationRequested)
-            {
-                Log("snapshot from " + source.NodeId + " failed: " + ex.Message + "; retrying");
-                await Task.Delay(_cfg.RetryDelay, linked.Token).ConfigureAwait(false);
-            }
+            await Task.Delay(_cfg.RetryDelay, ct).ConfigureAwait(false);
         }
     }
 

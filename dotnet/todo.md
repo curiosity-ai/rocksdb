@@ -110,7 +110,7 @@ P = perf + block cache wiring (Table/, Cache/, Memtable/, Util/).
 - [x] Replication round trip (checkpoint + tail into managed and native replicas)
 - [ ] Ingestion: WriteGlobalSeqno, IngestBehind, overlapping files in one call, running-compaction checks
 - [x] Ported rocksdb-sharp Replication/ + Switchover/ + Cluster/ (Raft) into `src/RocksDb.Managed.Replication` (transport-agnostic, no polling, pooled WalBatch, IFileSystem-aware) + `src/RocksDb.Managed.Replication.MagicOnion` (gRPC) + `samples/` — 30 tests incl. gRPC on localhost and a native replica
-- [ ] Replication: network-partition cluster test; handoff hold 100–220 ms vs 10–50 ms reported by rocksdb-sharp (investigate); replication benchmarks
+- [ ] Replication (partition tests: done, see Cluster soak); handoff hold 100–220 ms vs 10–50 ms reported by rocksdb-sharp (investigate); replication benchmarks
 - [x] Read-only and secondary open (+TryCatchUpWithPrimary over a live native primary)
 - [ ] Secondary: tail MANIFEST incrementally instead of re-reading
 - [x] GetProperty (subset)
@@ -370,6 +370,17 @@ Still open from this round:
 - [x] LazyFS hangs (its own create/write lock-order deadlock) and silent daemon deaths: watchdog, remount, re-verify with power-loss expectations
 - [x] `RocksArrayPool<T>.Shared` (private copy of the runtime's SharedArrayPool, incl. main's zeroing of non-primitive arrays) replaces `ArrayPool<T>.Shared` everywhere; guard test
 - [ ] Soak with a separate `wal_dir`; pessimistic / WritePrepared transactions in the workload; native writer worker; torn MANIFEST writes
+
+## Cluster soak (2026-11-07; tools/RocksDb.Managed.ClusterSoak, docs/cluster-soak.md)
+
+- [x] Supervisor + N node processes over MagicOnion gRPC through supervisor-owned TCP proxies; partitions (halves, leader, node, bridge, ring, one-way, slow, client cut), kill / pause / power loss (incl. leader, during snapshot catch-up), clock-rate skew, rolling restart; up to 2 overlapping faults
+- [x] Checks: no lost acks, no phantoms, bank, counters, monotonic versions, election safety, log matching, convergence, reads (stale reads as stats), native checkpoint cross-check; Elle EDN export; selftest (13 injected bugs caught)
+- [x] Runs: 3 nodes 45 min (353 faults, ~2.08M writes ok, 9 VERIFY passed); 5 nodes 15 min (100 faults, 5 VERIFY passed)
+- [x] Bug: Raft log entries (leader writes, no-op, follower chunks) counted towards quorum before fsync; acked writes lost on power loss (fixed, `SyncWal`/`SyncLogWrites`, group fsync; regression test)
+- [x] Bug: node killed during snapshot resync restarted empty but kept term/vote and could elect a leader missing a committed write (rebuild from leader before voting; regression test)
+- [x] Bug: attaching follower kept stale term ranges past its log (`AdoptTermsAfter`; regression test)
+- [x] Bug: follower acknowledged an older-term leader's entries after voting in a later term (term-gated progress; regression test)
+- [ ] ReadIndex / linearizable reads, pre-vote, membership changes (then soak them); transactions on the cluster host
 
 ## Unported utilities (found 2026-11-03)
 
