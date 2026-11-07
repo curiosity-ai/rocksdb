@@ -147,7 +147,14 @@ internal sealed class Supervisor
         while (_lazyfsHung is null)
         {
             Thread.Sleep(15_000);
-            if (_status.Result is "passed" or "failed") return;
+            if (_status.Result is "passed" or "failed" or "infrastructure-failure") return;
+            if (_lazyfs?.DaemonExit is string died)
+            {
+                _lazyfsHung = died;
+                Log("LAZYFS DIED: " + died + " (its output is in lazyfs/lazyfs.out)");
+                _lazyfs.Abort();
+                return;
+            }
             if (LazyFsMount.Probe(_paths.Db, TimeSpan.FromSeconds(20)))
             {
                 misses = 0;
@@ -175,6 +182,7 @@ internal sealed class Supervisor
             Directory.CreateDirectory(Path.Combine(dir, "logs"));
             foreach (string f in Directory.GetFiles(_paths.Logs, $"cycle-{plan.Cycle:D6}-*")) File.Copy(f, Path.Combine(dir, "logs", Path.GetFileName(f)), true);
             if (_lazyfs is not null && File.Exists(_lazyfs.LogFile)) File.Copy(_lazyfs.LogFile, Path.Combine(dir, "lazyfs.log"), true);
+            if (_lazyfs is not null && File.Exists(_lazyfs.OutFile)) File.Copy(_lazyfs.OutFile, Path.Combine(dir, "lazyfs.out"), true);
         }
         catch (Exception e)
         {
@@ -375,6 +383,12 @@ internal sealed class Supervisor
     {
         // A phase can give up on a blocked child just before the watchdog decides; probe once more before blaming
         // the port.
+        if (_lazyfsHung is null && _lazyfs?.DaemonExit is string died)
+        {
+            _lazyfsHung = died;
+            Log("LAZYFS DIED: " + died + " (its output is in lazyfs/lazyfs.out)");
+            _lazyfs.Abort();
+        }
         if (_lazyfsHung is null && _cfg.UsesLazyFs && !LazyFsMount.Probe(_paths.Db, TimeSpan.FromSeconds(30)))
         {
             _lazyfsHung = $"the LazyFS mount {_paths.Db} did not answer `ls -f` within 30 s after: {reason.Split('\n')[0]}";
@@ -637,6 +651,19 @@ internal sealed class LazyFsMount(string binary, RunPaths paths, string cacheSiz
     private string Dir => Path.Combine(paths.Root, "lazyfs");
     public string Data => Path.Combine(Dir, "data");
     public string LogFile => Path.Combine(Dir, "lazyfs.log");
+    public string OutFile => Path.Combine(Dir, "lazyfs.out");
+
+    /// <summary>Non-null when the daemon this supervisor started has exited (it crashed or was killed).</summary>
+    public string? DaemonExit
+    {
+        get
+        {
+            Process? d = _daemon;
+            if (d is null || !d.HasExited) return null;
+            int code = d.ExitCode;
+            return code > 128 ? $"the lazyfs daemon died with signal {code - 128}" : $"the lazyfs daemon exited with code {code}";
+        }
+    }
     public string Fifo => Path.Combine(Dir, "fifo");
     public string FifoCompleted => Path.Combine(Dir, "fifo-completed");
     private string ConfigFile => Path.Combine(Dir, "config.toml");
@@ -654,8 +681,10 @@ internal sealed class LazyFsMount(string binary, RunPaths paths, string cacheSiz
         foreach (string a in new[] { paths.Db, "--config-path", ConfigFile, "-o", "allow_other", "-o", "modules=subdir", "-o", "subdir=" + Data, "-f" })
             psi.ArgumentList.Add(a);
         _daemon = Process.Start(psi) ?? throw new InvalidOperationException("could not start lazyfs");
-        _daemon.OutputDataReceived += (_, _) => { };
-        _daemon.ErrorDataReceived += (_, _) => { };
+        var output = new StreamWriter(new FileStream(Path.Combine(Dir, "lazyfs.out"), FileMode.Append, FileAccess.Write, FileShare.ReadWrite)) { AutoFlush = true };
+        output.WriteLine($"--- lazyfs started {DateTime.UtcNow:O} pid {_daemon.Id}");
+        _daemon.OutputDataReceived += (_, e) => { if (e.Data is not null) lock (output) output.WriteLine(e.Data); };
+        _daemon.ErrorDataReceived += (_, e) => { if (e.Data is not null) lock (output) output.WriteLine("[stderr] " + e.Data); };
         _daemon.BeginOutputReadLine();
         _daemon.BeginErrorReadLine();
         var sw = Stopwatch.StartNew();
@@ -736,7 +765,8 @@ internal sealed class LazyFsMount(string binary, RunPaths paths, string cacheSiz
         psi.ArgumentList.Add("-f");
         psi.ArgumentList.Add(mountPoint);
         using Process p = Process.Start(psi)!;
-        if (p.WaitForExit(timeout)) return true; // any answer, even an error, means the daemon replied
+        // Exit code 0 only: a dead daemon answers at once with ENOTCONN / ECONNABORTED.
+        if (p.WaitForExit(timeout)) return p.ExitCode == 0;
         try { p.Kill(); }
         catch (InvalidOperationException) { }
         return false;
