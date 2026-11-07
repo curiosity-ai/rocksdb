@@ -23,7 +23,7 @@ internal static class Program
               [--mean-run S] [--min-run S] [--max-run S] [--native-every N] [--corrupt-every N] [--keep-history N]
               [--faults Kill=30,Graceful=8,PowerLoss=12,TornOp=7,TornSeq=7,FsyncTrigger=8,RecoveryKill=8,Pause=6,IoError=8]
               [--writers N] [--keys-per-writer N]
-              [--lazyfs-bin PATH | --lazyfs-fifo PATH [--lazyfs-fifo-completed PATH]]
+              [--lazyfs-bin PATH | --lazyfs-fifo PATH [--lazyfs-fifo-completed PATH]] [--unsafe-skip-fsync]
           report --dir DIR
           export-history --run-dir DIR [--cycle N|all] --format edn --out OUTDIR
           selftest [--dir DIR]
@@ -137,6 +137,12 @@ internal static class Program
             cfg.LazyFsBinary = o.GetValueOrDefault("lazyfs-bin");
             cfg.LazyFsFifo = o.GetValueOrDefault("lazyfs-fifo");
             cfg.LazyFsFifoCompleted = o.GetValueOrDefault("lazyfs-fifo-completed");
+            cfg.UnsafeSkipFsync = o.ContainsKey("unsafe-skip-fsync");
+            if (cfg.UnsafeSkipFsync && !cfg.UsesLazyFs)
+            {
+                Console.Error.WriteLine("--unsafe-skip-fsync needs --lazyfs-bin or --lazyfs-fifo");
+                return 2;
+            }
             if (cfg.UsesLazyFs && cfg.FaultWeights.GetValueOrDefault(nameof(FaultKind.LazyFsClear)) == 0)
                 cfg.FaultWeights[nameof(FaultKind.LazyFsClear)] = 30;
             paths.CreateDirectories();

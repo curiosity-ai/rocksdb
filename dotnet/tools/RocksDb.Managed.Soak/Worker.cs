@@ -55,7 +55,7 @@ internal sealed class Worker
         _history = new HistoryWriter(paths.History(_plan.Cycle, part), (long)Environment.ProcessId << 32);
         if (_plan.FaultFs)
         {
-            _faultFs = new LazyFaultFileSystem(paths.Db, Path.Combine(paths.Tmp, "graveyard-" + Environment.ProcessId), Log) { SkipSync = _plan.SkipSync };
+            _faultFs = new LazyFaultFileSystem(paths.Db, Path.Combine(paths.Tmp, "graveyard-" + Environment.ProcessId), Log) { SkipSync = _plan.SkipSync, SkipRealSync = _plan.SkipRealSync };
             _fs = _faultFs;
         }
         else _fs = LocalFileSystem.Instance;

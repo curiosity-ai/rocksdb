@@ -138,6 +138,11 @@ internal sealed class RunConfig
     public string? LazyFsFifoCompleted { get; set; }
     /// <summary>A lazyfs binary: the supervisor mounts LazyFS itself (Jepsen's jepsen.lazyfs layout), or null.</summary>
     public string? LazyFsBinary { get; set; }
+    /// <summary>
+    /// Test-only (<c>--unsafe-skip-fsync</c>, LazyFS mode): the worker drops every fsync, so the run must FAIL at the
+    /// first durability check after a clear-cache. Proves the LazyFS mode catches a missing fsync.
+    /// </summary>
+    public bool UnsafeSkipFsync { get; set; }
     public string StartedUtc { get; set; } = "";
 
     public static Dictionary<string, int> DefaultWeights() => new()
@@ -181,6 +186,8 @@ internal sealed class CyclePlan
     public bool FaultFs { get; set; }
     /// <summary>Test-only: the fault file system ignores fsync (data never becomes durable).</summary>
     public bool SkipSync { get; set; }
+    /// <summary>Test-only: fsyncs are not passed to the real file system either (see <see cref="RunConfig.UnsafeSkipFsync"/>).</summary>
+    public bool SkipRealSync { get; set; }
     public CycleOptions Options { get; set; } = new();
     public bool NativeCheck { get; set; }
     public bool CorruptTrial { get; set; }

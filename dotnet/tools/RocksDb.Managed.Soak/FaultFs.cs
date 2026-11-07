@@ -105,6 +105,12 @@ internal sealed class LazyFaultFileSystem : IFileSystem
     /// <summary>Test-only: fsync does not make data or directory entries durable.</summary>
     public bool SkipSync { get; set; }
 
+    /// <summary>
+    /// Test-only: fsync and directory fsync are not passed to the real file system either. With the DB on a LazyFS
+    /// mount this is a port that never fsyncs; the next <c>lazyfs::clear-cache</c> must make the durability check fail.
+    /// </summary>
+    public bool SkipRealSync { get; set; }
+
     public long InjectedErrors => Interlocked.Read(ref _injectedErrors);
 
     /// <summary>Kind of injected I/O error: "plain" IOError, "retryable" (IOStatus retryable) or "nospace".</summary>
@@ -392,14 +398,14 @@ internal sealed class LazyFaultFileSystem : IFileSystem
     {
         if (Normalize(path) != _root)
         {
-            _inner.SyncDirectory(path);
+            if (!SkipRealSync) _inner.SyncDirectory(path);
             return;
         }
         Enter();
         try
         {
             if (Roll(_syncErrorPpm)) throw Injected("directory sync", path);
-            _inner.SyncDirectory(path);
+            if (!SkipRealSync) _inner.SyncDirectory(path);
             if (SkipSync) return;
             lock (_meta)
             {
@@ -733,7 +739,7 @@ internal sealed class LazyFaultFileSystem : IFileSystem
             {
                 if (fs.Roll(fs._syncErrorPpm)) throw fs.Injected("fsync", path);
                 long size = inner.Size;
-                inner.Sync();
+                if (!fs.SkipRealSync) inner.Sync();
                 trigger = AfterSync(size);
                 if (trigger) fs._onTrigger!();
             }
@@ -747,7 +753,7 @@ internal sealed class LazyFaultFileSystem : IFileSystem
             {
                 if (fs.Roll(fs._syncErrorPpm)) throw fs.Injected("fsync", path);
                 long size = inner.Size;
-                await inner.SyncAsync(cancellationToken).ConfigureAwait(false);
+                if (!fs.SkipRealSync) await inner.SyncAsync(cancellationToken).ConfigureAwait(false);
                 if (AfterSync(size)) fs._onTrigger!();
             }
             finally { fs.Exit(); }
