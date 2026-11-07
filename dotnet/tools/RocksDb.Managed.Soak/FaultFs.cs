@@ -447,7 +447,10 @@ internal sealed class LazyFaultFileSystem : IFileSystem
                 {
                     if (!_current.TryGetValue(kv.Key, out Tracked? cur) || !ReferenceEquals(cur, kv.Value)) continue;
                     int need = fault == CacheFault.TornSeq ? 2 : 1;
-                    if (kv.Value.Unsynced.Count >= need && kv.Value.Undo.Count == 0) candidates.Add(kv);
+                    DbFileKind vk = DbFiles.KindOf(kv.Key);
+                    // Torn writes hit table, blob and WAL files. A torn MANIFEST tail is reported as Corruption by
+                    // upstream too (VersionSet::Recover fails on a bad record), so it only gets clear-cache.
+                    if (vk is DbFileKind.Wal or DbFileKind.Sst or DbFileKind.Blob && kv.Value.Unsynced.Count >= need && kv.Value.Undo.Count == 0) candidates.Add(kv);
                 }
                 // Prefer WAL files (the interesting case for point-in-time recovery).
                 var wal = candidates.FindAll(static kv => DbFiles.KindOf(kv.Key) == DbFileKind.Wal);

@@ -252,7 +252,7 @@ internal sealed class CorruptionNemesis(RunPaths paths, Action<string> log)
             catch (RocksDbException e)
             {
                 res.Outcome = "detected-open";
-                res.Detail = e.Code + ": " + e.Message;
+                res.Detail = e.Message;
                 return Write(res, outFile);
             }
             var v = new Verifier(paths);
@@ -265,7 +265,7 @@ internal sealed class CorruptionNemesis(RunPaths paths, Action<string> log)
             catch (RocksDbException e) when (e.Code is StatusCode.Corruption or StatusCode.IOError)
             {
                 res.Outcome = "detected-read";
-                res.Detail = e.Code + ": " + e.Message;
+                res.Detail = e.Message;
                 return Write(res, outFile);
             }
             var diffs = new List<string>(valueErrors.Errors);
@@ -287,7 +287,7 @@ internal sealed class CorruptionNemesis(RunPaths paths, Action<string> log)
             catch (RocksDbException e) when (e.Code is StatusCode.Corruption or StatusCode.IOError)
             {
                 res.Outcome = diffs.Count == 0 ? "detected-read" : "silent-wrong";
-                res.Detail = (diffs.Count == 0 ? "" : string.Join("; ", diffs.GetRange(0, Math.Min(5, diffs.Count))) + "; then ") + e.Code + ": " + e.Message;
+                res.Detail = (diffs.Count == 0 ? "" : string.Join("; ", diffs.GetRange(0, Math.Min(5, diffs.Count))) + "; then ") + e.Message;
                 return Write(res, outFile);
             }
             diffs.AddRange(scans.Errors);
