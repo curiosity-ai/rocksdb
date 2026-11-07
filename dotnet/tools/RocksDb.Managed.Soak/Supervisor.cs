@@ -154,7 +154,7 @@ internal sealed class Supervisor
                 continue;
             }
             if (++misses < 3) continue;
-            _lazyfsHung = $"the LazyFS mount {_paths.Db} did not answer `ls -l` for 3 probes (~2 min)";
+            _lazyfsHung = $"the LazyFS mount {_paths.Db} did not answer `ls -f` for 3 probes (~2 min)";
             Log("LAZYFS HUNG: " + _lazyfsHung + "; aborting the FUSE connection");
             if (_lazyfs is not null) _lazyfs.Abort();
             else LazyFsMount.AbortConnection(_paths.Db, Log);
@@ -373,6 +373,15 @@ internal sealed class Supervisor
     /// <summary>Preserves everything about a failed cycle (DB first) and stops.</summary>
     private int Fail(CyclePlan plan, string reason)
     {
+        // A phase can give up on a blocked child just before the watchdog decides; probe once more before blaming
+        // the port.
+        if (_lazyfsHung is null && _cfg.UsesLazyFs && !LazyFsMount.Probe(_paths.Db, TimeSpan.FromSeconds(30)))
+        {
+            _lazyfsHung = $"the LazyFS mount {_paths.Db} did not answer `ls -f` within 30 s after: {reason.Split('\n')[0]}";
+            Log("LAZYFS HUNG: " + _lazyfsHung + "; aborting the FUSE connection");
+            if (_lazyfs is not null) _lazyfs.Abort();
+            else LazyFsMount.AbortConnection(_paths.Db, Log);
+        }
         if (_lazyfsHung is not null) return LazyFsHungFailure(plan, reason);
         string dir = Path.Combine(_paths.Failures, $"cycle-{plan.Cycle:D6}");
         Directory.CreateDirectory(dir);
@@ -717,13 +726,14 @@ internal sealed class LazyFsMount(string binary, RunPaths paths, string cacheSiz
         }
     }
 
-    /// <summary>True when <c>ls -l</c> of the mount point answers within the timeout (run as a separate process).</summary>
+    /// <summary>True when <c>ls -f</c> of the mount point answers within the timeout (run as a separate process).</summary>
     public static bool Probe(string mountPoint, TimeSpan timeout)
     {
-        // ls -l: readdir plus a getattr of every file. A stat of the mount point alone is not enough: LazyFS can
-        // deadlock its per-file locks against its global inode lock while still answering the root's getattr.
+        // ls -f: a readdir without per-file getattrs. A stat of the mount point alone is not enough (LazyFS can
+        // deadlock its per-file locks against its global inode lock while still answering the root's getattr), and
+        // getattrs of every file would add load on exactly the LazyFS path that deadlocks.
         var psi = new ProcessStartInfo("ls") { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
-        psi.ArgumentList.Add("-l");
+        psi.ArgumentList.Add("-f");
         psi.ArgumentList.Add(mountPoint);
         using Process p = Process.Start(psi)!;
         if (p.WaitForExit(timeout)) return true; // any answer, even an error, means the daemon replied

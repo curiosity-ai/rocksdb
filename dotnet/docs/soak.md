@@ -370,7 +370,7 @@ written back when the cache is full, like a real page cache; off by default, as 
 `put_data_blocks` holds the global inode lock and waits for a file's item lock, while `lfs_write` holds that item
 lock and waits for the global lock. Every process touching the mount then sits in uninterruptible sleep. In the
 container this happened after 10 to 15 minutes of soak. The supervisor therefore runs a watchdog: every 15 s it runs
-`ls -l` on the mount (a `stat` of the mount point alone still answers during the deadlock); after 3 misses it kills
+`ls -f` (a readdir) on the mount (a `stat` of the mount point alone still answers during the deadlock); after 3 misses it kills
 the daemon and aborts the FUSE connection, so the blocked calls fail with `ENOTCONN` and the phase ends. With
 `--lazyfs-bin` the supervisor then remounts LazyFS and verifies the cycle again with power-loss expectations
 (restarting LazyFS loses exactly its unsynced cache, i.e. a power loss; synced data was on the backing disk before
