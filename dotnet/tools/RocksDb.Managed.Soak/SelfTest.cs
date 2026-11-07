@@ -47,6 +47,7 @@ internal static class SelfTest
         results.Add(Case(root, basePaths, "silently corrupted register value", false, ["registers", "scans"], SilentValue));
         results.Add(Case(root, basePaths, "range-delete key space changed", false, ["range-deletes", "durability"], BreakRdel));
         results.Add(Case(root, basePaths, "mishandled torn-seq image (hole: older write lost, newer survived)", false, ["registers"], Hole));
+        results.Add(CorruptCheckCase(root, basePaths));
         results.Add(FaultFsCase(root, basePaths, "control: power loss (clear-cache) on the fault file system", skipSync: false, "clear"));
         results.Add(FaultFsCase(root, basePaths, "control: torn-seq on the fault file system", skipSync: false, "tornseq"));
         results.Add(FaultFsCase(root, basePaths, "missing fsync (SkipSync) + power loss", skipSync: true, "clear"));
@@ -251,6 +252,51 @@ internal static class SelfTest
         foreach (int i in new[] { 0, 2 })
             db.GetColumnFamily(Keys.RegisterCf(keys[i])).Put(Keys.Register(0, keys[i]), Keys.MakeValue((byte)'V', 0, keys[i], v + i, 20, out _));
         return $"w0 v{v} and v{v + 2} survived, v{v + 1} (in between) lost";
+    }
+
+    /// <summary>
+    /// The corruption trial's classifier: a copy whose register holds an older, perfectly valid version (a lost
+    /// write that no checksum can see) must be classified silent-wrong, and an unmodified copy correct.
+    /// </summary>
+    private static Result CorruptCheckCase(string root, RunPaths basePaths)
+    {
+        const string name = "corruption trial: a silently wrong (older, valid) value is classified silent-wrong";
+        var p = new RunPaths(Path.Combine(root, "case-corrupt-check"));
+        Supervisor.CopyDirectory(basePaths.Root, p.Root);
+        try
+        {
+            Check(Child.Run(["verify", "--run-dir", p.Root], TimeSpan.FromMinutes(5), p.LogFile(1, "verify")), "baseline verify");
+            RunConfig cfg = RunConfig.Load(p.RunJson);
+            List<Op> ops = Op.Pair(HistoryReader.ReadParts(p.HistoryParts(1)));
+            string copy = Path.Combine(p.Root, "copy");
+            Supervisor.CopyDirectory(p.Db, copy);
+            string outFile = Path.Combine(p.Root, "check.json");
+            Check(Child.Run(["corrupt-check", "--run-dir", p.Root, "--db", copy, "--target", "Sst", "--out", outFile], TimeSpan.FromMinutes(3), null), "corrupt-check");
+            string control = JsonSerializer.Deserialize<CorruptCheckResult>(File.ReadAllText(outFile), RunConfig.Json)!.Outcome;
+            // Roll one register back to an earlier acknowledged version of the same key.
+            Op? older = null;
+            Op? last = LastAckedPut(ops);
+            foreach (Op op in ops)
+            {
+                if (last is not null && op.IsOk && op.Invoke.Type == OpType.RegPut && op.Invoke.Process == last.Invoke.Process &&
+                    op.Invoke.A == last.Invoke.A && op.Invoke.V < last.Invoke.V) older = op;
+            }
+            if (older is null) return new Result(name, false, ["silent-wrong"], false, "no key with two acknowledged puts");
+            using (RocksDatabase db = Verifier.Open(copy, cfg, LocalFileSystem.Instance))
+            {
+                HistoryRecord o = older.Invoke;
+                db.GetColumnFamily(Keys.RegisterCf(o.A)).Put(Keys.Register(o.Process, o.A), Keys.MakeValue((byte)'V', o.Process, o.A, o.V, o.Len, out _));
+            }
+            Check(Child.Run(["corrupt-check", "--run-dir", p.Root, "--db", copy, "--target", "Sst", "--out", outFile], TimeSpan.FromMinutes(3), null), "corrupt-check");
+            string outcome = JsonSerializer.Deserialize<CorruptCheckResult>(File.ReadAllText(outFile), RunConfig.Json)!.Outcome;
+            bool ok = control == "correct" && outcome == "silent-wrong";
+            if (ok) Directory.Delete(p.Root, true);
+            return new Result(name, false, ["silent-wrong"], ok, $"unmodified copy -> {control}; w{older.Invoke.Process} key {older.Invoke.A} rolled back to v{older.Invoke.V} -> {outcome}");
+        }
+        catch (Exception e)
+        {
+            return new Result(name, false, ["silent-wrong"], false, "setup failed: " + e.Message);
+        }
     }
 
     /// <summary>Verifies and folds the baseline cycle, then runs a cycle on the fault file system ending with a crash command.</summary>

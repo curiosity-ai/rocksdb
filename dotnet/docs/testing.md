@@ -19,7 +19,7 @@ ships prebuilt libraries for Linux, macOS and Windows, so no C++ build is needed
 | `tests/RocksDb.Managed.CompatTests` | 490 | in process | byte-level and file-level compatibility with `librocksdb` |
 | `tests/RocksDb.Managed.RoundTrip` | 148 | child process | whole-DB managed and native alternation, option and crash matrices, 2PC, features |
 | `tests/RocksDb.Managed.Replication.Tests` | 44 | in process (one test) | replication, switchover, Raft cluster, gRPC transport, native replica |
-| `tools/RocksDb.Managed.Soak` (not a test project) | 13 self-test cases | child process (cross-check) | Jepsen-style soak for hours or days: kill, power loss, torn writes, I/O errors, pauses, crash during recovery, file corruption; history checked against a model; see [soak.md](soak.md) |
+| `tools/RocksDb.Managed.Soak` (not a test project) | 14 self-test cases | child process (cross-check) | Jepsen-style soak for hours or days: kill, power loss, torn writes, I/O errors, pauses, crash during recovery, file corruption; history checked against a model; see [soak.md](soak.md) |
 
 The counts are test cases as listed by `--list-tests` (data rows count separately) at the time of writing. Both TFMs
 run the same tests.

@@ -300,6 +300,7 @@ the state, injects one bug behind the model's back, runs the verifier, and expec
 | a silently corrupted value (payload byte changed, header kept) | `registers` |
 | a range-delete key removed | `range-deletes` / `durability` |
 | a mishandled torn-seq image (older write lost, newer one survived) | `registers` (hole) |
+| corruption trial classifier: an unmodified copy, then a copy with a register rolled back to an older valid version | `correct`, then `silent-wrong` |
 | control: power loss (clear-cache) on the fault file system | none (must pass) |
 | control: torn-seq on the fault file system | none (must pass) |
 | missing fsync (`SkipSync`: fsync makes nothing durable) + power loss | `durability` |
