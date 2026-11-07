@@ -569,11 +569,9 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                     TriggerResync("log at " + myLatest + " diverged from leader " + leaderId);
                     return;
                 }
-                // Learn the term ranges of the entries about to arrive (the stream merges batches across terms).
-                foreach ((ulong start, long term) in RaftLogTerms.Deserialize(check.Terms).GetRanges())
-                {
-                    if (start > myLatest) _state.RecordTermRange(start, term);
-                }
+                // Learn the term ranges of the entries about to arrive (the stream merges batches across terms); the
+                // leader's map replaces whatever we recorded past our log's end.
+                _state.AdoptTermsAfter(myLatest, RaftLogTerms.Deserialize(check.Terms));
 
                 Log("following " + leaderId + " from seq " + (myLatest + 1));
                 // Synced chunks: the progress reports and heartbeat answers below only ever cover durable entries.
