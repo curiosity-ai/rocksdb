@@ -798,9 +798,9 @@ public sealed class DbBasicTests
             db.TryGet(missing, buffer, out _);
         }
         long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
-        // TODO(block cache): BlockBasedTableReader.Get currently allocates ~32 bytes per data block read without a
-        // block cache (Table/, perf stream); tighten to 0 once the block cache is wired. The DB layer adds nothing.
-        Assert.IsTrue(allocated <= 4000 * 40, "bytes allocated by 4000 TryGet (table): " + allocated);
+        // Served from the block cache, table reads allocate nothing per read; the measured total is a single one-time
+        // object (72 bytes), so the bound is a small constant rather than per read: one allocating read in 4000 fails it.
+        Assert.IsTrue(allocated <= 256, "bytes allocated by 4000 TryGet (table): " + allocated);
         // MemoryFileSystem grows its in-memory files by reallocation, so the WAL is disabled here; with
         // LocalFileSystem the WAL path is allocation-free too (see the dbbench "alloc B/op" column).
         var noWal = new WriteOptions { DisableWal = true };
