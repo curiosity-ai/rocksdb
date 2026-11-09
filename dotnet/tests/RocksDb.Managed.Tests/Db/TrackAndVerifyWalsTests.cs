@@ -76,25 +76,26 @@ public sealed class TrackAndVerifyWalsTests
         using var flushReached = new ManualResetEventSlim(false);
         _flushGate.Set();
         ManualResetEventSlim gate = _flushGate = new ManualResetEventSlim(false);
-        if (!letFlushFinish)
+        // The flush is held back in every case until both WALs are listed: a flush that finished first would purge the
+        // first WAL. With letFlushFinish it is released afterwards.
+        TestHooks.Set("DBImpl::FlushMemTables:Start", () =>
         {
-            TestHooks.Set("DBImpl::FlushMemTables:Start", () =>
-            {
-                flushReached.Set();
-                gate.Wait();
-            });
-        }
+            flushReached.Set();
+            gate.Wait();
+        });
         RocksDatabase db = RocksDatabase.Open(DbPath, Options(fs, mode), new ColumnFamilyOptions { WriteBufferSize = 64 << 20, MaxWriteBufferNumber = 6 });
         db.Put(WriteOptions.SyncWrites, B("key1"), B("old_value"));
         ulong lastSeqInFirst = db.GetLatestSequenceNumber();
         db.DefaultColumnFamily.Db.SwitchMemtableForTest();
         // The flush of the old memtable is blocked before it does anything: the first WAL stays.
-        if (!letFlushFinish) Assert.IsTrue(flushReached.Wait(TimeSpan.FromSeconds(30)));
+        Assert.IsTrue(flushReached.Wait(TimeSpan.FromSeconds(30)));
         db.Put(WriteOptions.SyncWrites, B("key1"), B("new_value"));
         List<ulong> wals = WalNumbers(fs);
         Assert.AreEqual(2, wals.Count);
         if (letFlushFinish)
         {
+            TestHooks.ClearAll();
+            gate.Set();
             db.Flush();
             db.Dispose();
             return (wals[0], wals[1], lastSeqInFirst);
