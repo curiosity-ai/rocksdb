@@ -895,4 +895,220 @@ public sealed class MosaikMaintenanceCompatTests
         Assert.AreEqual(StatusCode.NotFound, ex.Code);
         Assert.ThrowsExactly<RocksDbSharp.RocksDbException>(() => NativeMosaikRestore(mBackups, db4, wal4, 1));
     }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Lifecycle (Mosaik's RocksDbStorageLifecycleTests and RocksDbBase.Dispose)
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Port of Mosaik's RocksDbStorageLifecycleTests.OpeningClosingAndCollectingAStorageRepeatedlyKeepsTheProcessAlive:
+    /// a storage opened, written, closed and collected three times in one process, with the process-wide objects shared
+    /// across the databases as Mosaik shares them (the block cache, the write buffer manager, the comparator, one prefix
+    /// extractor per options object), finalizers run after each close. Every reopen sees the data, and the shared write
+    /// buffer manager is back to 0 once the database is closed.
+    /// </summary>
+    [TestMethod]
+    public void OpeningClosingAndCollectingRepeatedlyKeepsSharedObjectsUsable()
+    {
+        using var dir = new TempDir("mosaik-lifecycle");
+        string db = Path.Combine(dir.Path, "rocks"), wal = Path.Combine(dir.Path, "journal");
+        (DbOptions shared, List<ColumnFamilyDescriptor> sharedCfs) = ManagedOptions(wal);
+        for (int round = 0; round < 3; round++)
+        {
+            (DbOptions o, List<ColumnFamilyDescriptor> cfs) = ManagedOptions(wal);
+            o.WriteBufferManager = shared.WriteBufferManager;
+            o.Statistics = shared.Statistics;
+            for (int i = 0; i < cfs.Count; i++)
+            {
+                cfs[i].Options.TableOptions.BlockCache = sharedCfs[i].Options.TableOptions.BlockCache;
+                if (cfs[i].Name == "tracker") cfs[i].Options.Comparator = sharedCfs[i].Options.Comparator;
+            }
+            using (RocksDatabase d = RocksDatabase.Open(db, o, cfs))
+            {
+                for (int r = 0; r < round; r++) Assert.IsNotNull(d.GetColumnFamily("nodes").Get(Key("round", r)), "round " + r + " lost");
+                d.GetColumnFamily("nodes").Put(Key("round", round), Value(round, 10));
+                d.GetColumnFamily("tracker").Put(TrackerKey((ulong)round + 1), Value(round, 10));
+                d.Flush();
+            }
+            Assert.AreEqual(0L, shared.WriteBufferManager!.MemoryUsage, "round " + round);
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+        }
+    }
+
+    /// <summary>
+    /// RocksDbBase.Dispose closes the database while other threads may still hold what it handed out (Mosaik's flush
+    /// thread, a SafeIterator not yet disposed, a snapshot, column family handles, the background compaction thread of
+    /// ClearToIndexQueue). Native RocksDB requires those to be released first (using one afterwards is undefined
+    /// behaviour); the managed port must instead fail them with an exception, never hang or return wrong data: the close
+    /// completes with an iterator and a snapshot still open, a running manual compaction ends (completed or with
+    /// ShutdownInProgress / ObjectDisposedException), and every later use of the DB, a column family or the iterator
+    /// throws ObjectDisposedException or a RocksDbException.
+    /// </summary>
+    [TestMethod]
+    public void DisposeWithLiveIteratorSnapshotHandlesAndCompaction()
+    {
+        using var dir = new TempDir("mosaik-dispose");
+        ManagedEnv m = OpenManaged(Path.Combine(dir.Path, "db"), Path.Combine(dir.Path, "journal"));
+        ColumnFamily nodes = m["nodes"], content = m["content"];
+        for (int f = 0; f < 4; f++)
+        {
+            for (int i = 0; i < 2000; i++) content.Put(QueueKey(77, i + f * 2000), Value(i, 100));
+            content.Flush();
+        }
+        for (int i = 0; i < 100; i++) nodes.Put(Key("n", i), Value(i, 20));
+        Iterator it = nodes.NewIterator();
+        it.SeekToFirst();
+        Assert.IsTrue(it.Valid);
+        Iterator tableIt = content.NewIterator();
+        tableIt.SeekToFirst();
+        Assert.IsTrue(tableIt.Valid);
+        Snapshot snap = m.Db.GetSnapshot();
+
+        Exception? compactionError = null;
+        using var started = new ManualResetEventSlim();
+        var compaction = new Thread(() =>
+        {
+            try
+            {
+                started.Set();
+                for (int i = 0; i < 20; i++)
+                {
+                    content.CompactRange(new CompactRangeOptions { ExclusiveManualCompaction = false, TargetLevel = -1, BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+                }
+            }
+            catch (Exception e)
+            {
+                compactionError = e;
+            }
+        });
+        compaction.Start();
+        started.Wait();
+
+        var close = Task.Run(m.Db.Dispose);
+        Assert.IsTrue(close.Wait(TimeSpan.FromSeconds(30)), "Dispose hung with a live iterator / snapshot / compaction");
+        Assert.IsTrue(compaction.Join(TimeSpan.FromSeconds(30)), "manual compaction did not end after Dispose");
+        if (compactionError is not null)
+        {
+            Assert.IsTrue(compactionError is ObjectDisposedException || compactionError is RocksDbException { Code: StatusCode.ShutdownInProgress },
+                compactionError.ToString());
+        }
+
+        AssertClosed(() => nodes.Get(Key("n", 1)), "ColumnFamily.Get");
+        AssertClosed(() => nodes.Put(Key("n", 1), Value(1, 1)), "ColumnFamily.Put");
+        AssertClosed(() => m.Db.Flush(), "Flush");
+        AssertClosed(() => nodes.CompactRange(null, null), "CompactRange");
+        AssertClosed(() => nodes.GetProperty("rocksdb.estimate-num-keys"), "GetProperty");
+        AssertClosed(() => m.Db.GetSnapshot(), "GetSnapshot");
+        // An iterator left open reads the memtables and table files it pinned: it either goes on returning exactly the
+        // data of its view or fails; it never returns other data.
+        AssertSameDataOrThrows(it, i => (Key("n", i), Value(i, 20)), 100, "memtable iterator");
+        AssertSameDataOrThrows(tableIt, i => (QueueKey(77, i), Value(i % 2000, 100)), 8000, "table iterator");
+        // Releasing what is left after the close is harmless.
+        it.Dispose();
+        tableIt.Dispose();
+        snap.Dispose();
+        m.Db.Dispose();
+    }
+
+    /// <summary>
+    /// Mosaik compacts while it writes (ClearToIndexQueue's compaction thread with exclusive_manual_compaction = false,
+    /// the replica-acknowledgement CompactRange on the ulong-comparator family, the flush thread): manual compactions and
+    /// flushes running concurrently with puts and deletes on the same families lose nothing and resurrect nothing.
+    /// </summary>
+    [TestMethod]
+    public void CompactRangeConcurrentWithWritesKeepsEveryWrite()
+    {
+        using var dir = new TempDir("mosaik-compact-concurrent");
+        using ManagedEnv m = OpenManaged(Path.Combine(dir.Path, "db"), Path.Combine(dir.Path, "journal"));
+        ColumnFamily content = m["content"], tracker = m["tracker"];
+        using var stop = new CancellationTokenSource();
+        Exception? backgroundError = null;
+        var compactor = new Thread(() =>
+        {
+            try
+            {
+                byte[] from = new byte[24], to = new byte[24];
+                BinaryPrimitives.WriteUInt64LittleEndian(from, 77);
+                to.AsSpan().Fill(0xFF);
+                BinaryPrimitives.WriteUInt64LittleEndian(to, 77);
+                var opts = new CompactRangeOptions { ExclusiveManualCompaction = false, TargetLevel = -1 };
+                while (!stop.IsCancellationRequested)
+                {
+                    content.CompactRange(opts, from, to);
+                    tracker.CompactRange(Version(0), Version(5000));
+                    m.Db.Flush();
+                }
+            }
+            catch (Exception e)
+            {
+                backgroundError = e;
+            }
+        });
+        compactor.Start();
+        for (int round = 0; round < 5; round++)
+        {
+            for (int i = 0; i < 2000; i++)
+            {
+                content.Put(QueueKey(77, i), Value(i + round, 50));
+                tracker.Put(TrackerKey((ulong)(round * 2000 + i + 1)), Value(i, 20));
+            }
+            for (int i = round % 2; i < 2000; i += 2) content.Delete(QueueKey(77, i));
+            for (int i = 0; i < 1000; i++) tracker.Delete(TrackerKey((ulong)(round * 2000 + i + 1)));
+            content.Flush();
+            tracker.Flush();
+        }
+        stop.Cancel();
+        Assert.IsTrue(compactor.Join(TimeSpan.FromSeconds(60)));
+        Assert.IsNull(backgroundError, backgroundError?.ToString());
+        // Round 4 deleted the even keys (4 % 2 == 0): the odd ones hold their round-4 value.
+        var expectedContent = new List<string>();
+        for (int i = 1; i < 2000; i += 2) expectedContent.Add(Convert.ToHexString(QueueKey(77, i)) + "=" + Convert.ToHexString(Value(i + 4, 50)));
+        CollectionAssert.AreEqual(expectedContent, ManagedKeys(content));
+        var expectedTracker = new List<string>();
+        for (int round = 0; round < 5; round++)
+        {
+            for (int i = 1000; i < 2000; i++) expectedTracker.Add(Convert.ToHexString(TrackerKey((ulong)(round * 2000 + i + 1))) + "=" + Convert.ToHexString(Value(i, 20)));
+        }
+        CollectionAssert.AreEqual(expectedTracker, ManagedKeys(tracker));
+    }
+
+    private static void AssertSameDataOrThrows(Iterator it, Func<int, (byte[] Key, byte[] Value)> expected, int count, string what)
+    {
+        int i = 0;
+        try
+        {
+            for (it.SeekToFirst(); it.Valid; it.Next(), i++)
+            {
+                (byte[] k, byte[] v) = expected(i);
+                CollectionAssert.AreEqual(k, it.Key.ToArray(), what + " key " + i);
+                CollectionAssert.AreEqual(v, it.Value.ToArray(), what + " value " + i);
+            }
+            Assert.AreEqual(count, i, what);
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (RocksDbException)
+        {
+        }
+    }
+
+    private static void AssertClosed(Action action, string what)
+    {
+        try
+        {
+            action();
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+        catch (RocksDbException)
+        {
+            return;
+        }
+        Assert.Fail(what + " after Dispose did not throw");
+    }
 }
