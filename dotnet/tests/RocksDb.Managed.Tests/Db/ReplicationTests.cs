@@ -75,6 +75,34 @@ public sealed class ReplicationTests
         Assert.AreEqual(StatusCode.NotFound, e.Code);
     }
 
+    /// <summary>
+    /// Flush(wait) returns only after the purge that follows the flush, so the WAL the flush made obsolete is already
+    /// archived (and obsolete table files deleted) when it returns: upstream's WaitForFlushMemTables waiters are woken by
+    /// the bg_cv_ signal at the end of BackgroundCallFlush, after PurgeObsoleteFiles. The purge is slowed down to make
+    /// the order observable.
+    /// </summary>
+    [TestMethod]
+    public void FlushReturnsAfterTheObsoleteWalIsArchived()
+    {
+        MemoryFileSystem fs = NewFs();
+        DbOptions o = NewOptions(fs);
+        o.WalTtlSeconds = 3600;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o);
+        WriteBatches(db, 0, 10, 2);
+        TestHooks.Set("DBImpl::PurgeObsoleteFiles:Start", static () => Thread.Sleep(200));
+        try
+        {
+            db.Flush();
+            Assert.AreEqual(1, fs.GetChildren(DbPath + "/archive").Count(static c => c.EndsWith(".log", StringComparison.Ordinal)),
+                "the flushed WAL is archived when Flush returns");
+            Assert.AreEqual(1, fs.GetChildren(DbPath).Count(static c => c.EndsWith(".log", StringComparison.Ordinal)), "only the new WAL is live");
+        }
+        finally
+        {
+            TestHooks.Set("DBImpl::PurgeObsoleteFiles:Start", null);
+        }
+    }
+
     [TestMethod]
     public void DisableFileDeletionsKeepsWals()
     {
