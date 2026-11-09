@@ -325,11 +325,18 @@ public sealed unsafe class ArenaTests
     {
         const int block = 8192;
         using var arena = new Arena(block);
-        Assert.AreEqual(0L, arena.MemoryAllocatedBytes);
+        // Upstream arena_test: allocation starts in the 2 KiB inline block, which counts as allocated.
+        Assert.AreEqual((long)Arena.InlineSize, arena.MemoryAllocatedBytes);
         arena.Allocate(100);
-        Assert.AreEqual((long)block, arena.MemoryAllocatedBytes);
+        Assert.IsTrue(arena.IsEmpty);
+        Assert.AreEqual((long)Arena.InlineSize, arena.MemoryAllocatedBytes);
+        Assert.AreEqual(100L, arena.ApproximateMemoryUsage);
+        // More than the inline block has left: a regular block, the rest of the inline block is wasted.
+        arena.Allocate(Arena.InlineSize);
+        Assert.IsFalse(arena.IsEmpty);
+        Assert.AreEqual((long)Arena.InlineSize + block, arena.MemoryAllocatedBytes);
         long usage = arena.ApproximateMemoryUsage;
-        Assert.IsTrue(usage >= 100 && usage < block / 2, "usage=" + usage);
+        Assert.IsTrue(usage >= Arena.InlineSize + 100 && usage < Arena.InlineSize + block, "usage=" + usage);
         // Large allocation goes to an irregular block and does not disturb the current block.
         int unused = arena.AllocatedAndUnused;
         arena.Allocate(block);

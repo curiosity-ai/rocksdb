@@ -196,19 +196,25 @@ internal sealed partial class DbImpl
     // ---- sorted WAL files ------------------------------------------------------------------------------
 
     /// <summary>
-    /// Port of WalManager::GetSortedWalFiles: the alive WALs of wal_dir and (optionally) the archived ones, sorted
-    /// by log number, each with the sequence number of its first record. Empty WALs are left out. A WAL seen in both
-    /// places (archived while listing) is reported once, as archived.
+    /// Port of WalManager::GetSortedWalFiles (need_seqnos = true): the alive WALs of wal_dir and (optionally) the
+    /// archived ones, sorted by log number, each with the sequence number of its first record. Empty WALs are left out.
+    /// A WAL seen in both places (archived while listing) is reported once, as archived.
     /// </summary>
-    public List<WalFileInfo> GetSortedWalFiles(bool includeArchived)
+    public List<WalFileInfo> GetSortedWalFiles(bool includeArchived) => GetSortedWalFiles(includeArchived, needSeqnos: true);
+
+    /// <summary>
+    /// Port of WalManager::GetSortedWalFiles. With <paramref name="needSeqnos"/> false (GetLiveFilesStorageInfo) the
+    /// first records are not read: every WAL is listed, empty ones included, with a first sequence number of 0.
+    /// </summary>
+    public List<WalFileInfo> GetSortedWalFiles(bool includeArchived, bool needSeqnos)
     {
         // First get sorted files in db dir, then get sorted files from archived dir, to avoid a race condition where
         // a log file is moved to archived dir in between.
-        List<WalFileInfo> logs = GetSortedWalsOfType(WalDir, WalFileType.AliveLogFile);
+        List<WalFileInfo> logs = GetSortedWalsOfType(WalDir, WalFileType.AliveLogFile, needSeqnos);
         if (!includeArchived) return logs;
         string archivedir = FileNames.ArchivalDirectory(WalDir);
         List<WalFileInfo> files = FileSystem.DirectoryExistsSafe(archivedir)
-            ? GetSortedWalsOfType(archivedir, WalFileType.ArchivedLogFile)
+            ? GetSortedWalsOfType(archivedir, WalFileType.ArchivedLogFile, needSeqnos)
             : new List<WalFileInfo>();
         ulong latestArchived = files.Count > 0 ? files[^1].LogNumber : 0;
         foreach (WalFileInfo log in logs)
@@ -220,15 +226,22 @@ internal sealed partial class DbImpl
         return files;
     }
 
+    /// <summary>Port of WalManager::GetSortedWalsOfType with need_seqnos = true.</summary>
+    private List<WalFileInfo> GetSortedWalsOfType(string path, WalFileType type) => GetSortedWalsOfType(path, type, needSeqnos: true);
+
     /// <summary>Port of WalManager::GetSortedWalsOfType.</summary>
-    private List<WalFileInfo> GetSortedWalsOfType(string path, WalFileType type)
+    private List<WalFileInfo> GetSortedWalsOfType(string path, WalFileType type, bool needSeqnos)
     {
         var result = new List<WalFileInfo>();
         foreach (string f in FileSystem.GetChildren(path))
         {
             if (!FileNames.TryParseFileName(f, out ulong number, out FileType ft) || ft != FileType.WalFile) continue;
-            ulong sequence = ReadFirstRecord(type, number);
-            if (sequence == 0) continue; // empty file
+            ulong sequence = 0;
+            if (needSeqnos)
+            {
+                sequence = ReadFirstRecord(type, number);
+                if (sequence == 0) continue; // empty file
+            }
             long size;
             try
             {

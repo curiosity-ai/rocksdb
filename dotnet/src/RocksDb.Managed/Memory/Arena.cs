@@ -50,14 +50,35 @@ public sealed unsafe class Arena : Allocator, IDisposable
     private int _irregularBlockNum;
     private bool _disposed;
     private readonly AllocTracker? _tracker;
+    /// <summary>
+    /// The first <see cref="InlineSize"/> bytes come from this block (upstream: the inline_block_ member), so an empty
+    /// memtable (its skip list heads) costs 2 KiB, not a whole arena block. Pinned like the slabs; not in <see cref="_blocks"/>.
+    /// </summary>
+    private readonly byte[] _inlineBlock;
 
-    public Arena(int blockSize)
+    /// <summary>kInlineSize (memory/arena.h).</summary>
+    public const int InlineSize = 2048;
+
+    public Arena(int blockSize) : this(blockSize, null) { }
+
+    /// <summary>
+    /// An arena whose block allocations are reported to <paramref name="tracker"/> (Arena(block_size, tracker)). Port of
+    /// Arena::Arena (memory/arena.cc): allocation starts in the inline block, which is counted in the memory allocated and
+    /// reported to the tracker.
+    /// </summary>
+    internal Arena(int blockSize, AllocTracker? tracker)
     {
         _blockSize = OptimizeBlockSize(blockSize);
+        _tracker = tracker;
+        _inlineBlock = GC.AllocateUninitializedArray<byte>(InlineSize + AlignUnit, pinned: true);
+        // POH data is only 8-aligned: align the start, keeping InlineSize usable bytes.
+        byte* head = AlignUp((byte*)Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(_inlineBlock)));
+        _allocBytesRemaining = InlineSize;
+        _blocksMemory += _allocBytesRemaining;
+        _alignedAllocPtr = head;
+        _unalignedAllocPtr = head + _allocBytesRemaining;
+        _tracker?.Allocate(InlineSize);
     }
-
-    /// <summary>An arena whose block allocations are reported to <paramref name="tracker"/> (Arena(block_size, tracker)).</summary>
-    internal Arena(int blockSize, AllocTracker? tracker) : this(blockSize) => _tracker = tracker;
 
     public Arena() : this(MinBlockSize) { }
 
@@ -83,7 +104,7 @@ public sealed unsafe class Arena : Allocator, IDisposable
     /// <summary>Number of dedicated blocks allocated for large requests.</summary>
     public int IrregularBlockNum => _irregularBlockNum;
 
-    /// <summary>True until the first block is allocated (upstream: still in the inline block).</summary>
+    /// <summary>True until the first block is allocated: allocations still come from the inline block (IsInInlineBlock).</summary>
     public bool IsEmpty => _blocks.Count == 0;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

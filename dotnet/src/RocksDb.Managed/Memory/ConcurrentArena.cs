@@ -134,6 +134,15 @@ public sealed unsafe class ConcurrentArena : Allocator, IDisposable
                     // If the arena's current block is within a factor of 2 of the right size, we adjust our request
                     // to avoid arena waste.
                     long exact = _arena.AllocatedAndUnused;
+                    if (exact >= bytes && _arena.IsEmpty)
+                    {
+                        // If we haven't exhausted the arena's inline block yet, allocate from the arena directly, so the
+                        // first few small allocations of a memtable (about 1 KB at creation) do not take a full arena
+                        // block, which matters with thousands of empty memtables.
+                        byte* direct = aligned ? _arena.AllocateAligned(bytes) : _arena.Allocate(bytes);
+                        Fixup();
+                        return direct;
+                    }
                     avail = exact >= _shardBlockSize / 2 && exact < _shardBlockSize * 2 ? exact : _shardBlockSize;
                     s.FreeBegin = _arena.AllocateAligned((int)avail);
                     Fixup();
