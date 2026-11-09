@@ -310,6 +310,9 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
         .Int32("max_background_flushes", static o => o.MaxBackgroundFlushes, static (o, v) => o.MaxBackgroundFlushes = v)
         .UInt32("max_subcompactions", static o => o.MaxSubcompactions, static (o, v) => o.MaxSubcompactions = v)
         .UInt64("max_log_file_size", static o => o.MaxLogFileSize, static (o, v) => o.MaxLogFileSize = v)
+        // kString options of db_options.cc: written escaped, and left out of the OPTIONS file when empty (the default).
+        .String("db_log_dir", static o => o.DbLogDir, static (o, v) => o.DbLogDir = v)
+        .String("wal_dir", static o => o.WalDir, static (o, v) => o.WalDir = v)
         .UInt64("log_file_time_to_roll", static o => o.LogFileTimeToRoll, static (o, v) => o.LogFileTimeToRoll = v)
         .UInt64("keep_log_file_num", static o => o.KeepLogFileNum, static (o, v) => o.KeepLogFileNum = v)
         .UInt64("recycle_log_file_num", static o => o.RecycleLogFileNum, static (o, v) => o.RecycleLogFileNum = v)

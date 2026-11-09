@@ -149,13 +149,14 @@ internal sealed partial class DbImpl
                     }
                 }
                 _pendingOutputs.Remove(fileNumber);
-                // The flush itself is done: release FlushAsync waiters and let the next flush of this CF start before
-                // the (slow) obsolete-file purge, like upstream's bg_cv_ signal after the install.
+                // The flush itself is done: let the next flush of this CF start before the (slow) obsolete-file purge.
+                // Waiters (FlushAsync, write stalls) are signalled after the purge, like upstream's WaitForFlushMemTables
+                // woken by the bg_cv_ signal at the end of BackgroundCallFlush: a Flush(wait) that returns has the WAL
+                // it made obsolete archived or deleted, and the obsolete table files deleted.
                 cfd.FlushRunning = false;
                 _runningFlushes--;
                 EnqueueFlush(cfd);
                 MaybeScheduleFlush();
-                SignalBackgroundWork();
             }
             try
             {
