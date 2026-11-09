@@ -655,4 +655,244 @@ public sealed class MosaikMaintenanceCompatTests
         Assert.AreEqual(nKeys.Count, mKeys.Count);
         for (int i = 0; i < nKeys.Count; i++) CollectionAssert.AreEqual(nKeys[i], mKeys[i], "step " + i + "\n" + report);
     }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // BackupEngine
+    // ---------------------------------------------------------------------------------------------------------------
+
+    private readonly record struct BackupRow(uint Id, uint Files, ulong Size, long Timestamp);
+
+    /// <summary>
+    /// RocksDbBase.Backup: rocksdb_backup_engine_open(DB options, dir), create_new_backup_flush(flush = true),
+    /// purge_old_backups(2), get_backup_info.
+    /// </summary>
+    private static List<BackupRow> NativeMosaikBackup(NativeEnv n, string dir)
+    {
+        IntPtr be = N.rocksdb_backup_engine_open(n.Options.Handle, dir);
+        IntPtr info = IntPtr.Zero;
+        try
+        {
+            N.rocksdb_backup_engine_create_new_backup_flush(be, n.Db.Handle, 1);
+            N.rocksdb_backup_engine_purge_old_backups(be, 2);
+            info = N.rocksdb_backup_engine_get_backup_info(be);
+            var rows = new List<BackupRow>();
+            int count = N.rocksdb_backup_engine_info_count(info);
+            for (int i = 0; i < count; i++)
+            {
+                rows.Add(new BackupRow(N.rocksdb_backup_engine_info_backup_id(info, i), N.rocksdb_backup_engine_info_number_files(info, i),
+                    N.rocksdb_backup_engine_info_size(info, i), N.rocksdb_backup_engine_info_timestamp(info, i)));
+            }
+            return rows;
+        }
+        finally
+        {
+            if (info != IntPtr.Zero) N.rocksdb_backup_engine_info_destroy(info);
+            N.rocksdb_backup_engine_close(be);
+        }
+    }
+
+    private static List<BackupRow> ManagedMosaikBackup(ManagedEnv m, string dir)
+    {
+        using BackupEngine be = BackupEngine.Open(new BackupEngineOptions(dir));
+        be.CreateNewBackup(m.Db, flushBeforeBackup: true);
+        be.PurgeOldBackups(2);
+        var rows = new List<BackupRow>();
+        foreach (BackupInfo i in be.GetBackupInfo()) rows.Add(new BackupRow(i.BackupId, i.NumberFiles, i.Size, i.Timestamp));
+        return rows;
+    }
+
+    /// <summary>RocksDbBase.RestoreFrom: restore_db_from_latest_backup (index &lt; 0) or restore_db_from_backup, default restore options.</summary>
+    private static void NativeMosaikRestore(string backupDir, string dbDir, string walDir, int backupIndex)
+    {
+        var o = new RocksDbSharp.DbOptions();
+        IntPtr be = N.rocksdb_backup_engine_open(o.Handle, backupDir);
+        IntPtr ro = N.rocksdb_restore_options_create();
+        try
+        {
+            if (backupIndex < 0) N.rocksdb_backup_engine_restore_db_from_latest_backup(be, dbDir, walDir, ro);
+            else N.rocksdb_backup_engine_restore_db_from_backup(be, dbDir, walDir, ro, (uint)backupIndex);
+        }
+        finally
+        {
+            N.rocksdb_backup_engine_close(be);
+            N.rocksdb_restore_options_destroy(ro);
+        }
+    }
+
+    private static void ManagedMosaikRestore(string backupDir, string dbDir, string walDir, int backupIndex)
+    {
+        using BackupEngineReadOnly be = BackupEngineReadOnly.Open(new BackupEngineOptions(backupDir));
+        if (backupIndex < 0) be.RestoreDbFromLatestBackup(dbDir, walDir, new RestoreOptions());
+        else be.RestoreDbFromBackup((uint)backupIndex, dbDir, walDir, new RestoreOptions());
+    }
+
+    /// <summary>
+    /// The three backup steps (puts, deletes, overwrites in several families; data left in the memtables each time,
+    /// so flush_before_backup matters), each followed by <paramref name="backup"/>, then a write no backup has.
+    /// </summary>
+    private static void BackupWorkload(Action<string, byte[], byte[]> put, Action<string, byte[]> del, Action backup)
+    {
+        for (int i = 0; i < 1000; i++) put("nodes", Key("n", i), Value(i, 60));
+        backup();
+        for (ulong v = 1; v <= 500; v++) put("tracker", TrackerKey(v), Value((int)v, 40));
+        for (int i = 0; i < 300; i++) put("content", Key("c", i), Value(i, 300));
+        backup();
+        for (int i = 0; i < 500; i++) put("nodes", Key("n", i), Value(i + 7, 60));
+        for (int i = 500; i < 600; i++) del("nodes", Key("n", i));
+        for (ulong v = 1; v <= 100; v++) del("tracker", TrackerKey(v));
+        backup();
+        put("nodes", Key("n", 9999), Value(9999, 60));
+    }
+
+    /// <summary>The expected contents after backup <paramref name="step"/> (1-based) as hex key=value lines per family.</summary>
+    private static Dictionary<string, List<string>> ExpectedAfter(int step)
+    {
+        var state = new Dictionary<string, SortedDictionary<string, string>>(StringComparer.Ordinal)
+        {
+            ["nodes"] = new(StringComparer.Ordinal), ["content"] = new(StringComparer.Ordinal), ["tracker"] = new(StringComparer.Ordinal),
+        };
+        int backups = 0;
+        bool stop = false;
+        BackupWorkload((cf, k, v) => { if (!stop) state[cf][Convert.ToHexString(k)] = Convert.ToHexString(v); },
+            (cf, k) => { if (!stop) state[cf].Remove(Convert.ToHexString(k)); },
+            () => { if (++backups == step) stop = true; });
+        var result = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach ((string cf, SortedDictionary<string, string> kv) in state)
+        {
+            var lines = new List<string>();
+            foreach ((string k, string v) in kv) lines.Add(k + "=" + v);
+            // The tracker family is ordered by the little-endian version, not bytewise.
+            if (cf == "tracker") lines.Sort((a, b) => BinaryPrimitives.ReadUInt64LittleEndian(Convert.FromHexString(a[..16])).CompareTo(BinaryPrimitives.ReadUInt64LittleEndian(Convert.FromHexString(b[..16]))));
+            result[cf] = lines;
+        }
+        return result;
+    }
+
+    /// <summary>A destination that already holds files: an info LOG, a stale table file, a stale WAL and a file RocksDB does not name.</summary>
+    private static (string Db, string Wal) PopulatedDestination(string root)
+    {
+        string db = Path.Combine(root, "db"), wal = Path.Combine(root, "journal");
+        Directory.CreateDirectory(db);
+        Directory.CreateDirectory(wal);
+        File.WriteAllText(Path.Combine(db, "LOG"), "old log");
+        File.WriteAllText(Path.Combine(db, "000077.sst"), "stale table");
+        File.WriteAllText(Path.Combine(db, "keep.txt"), "not a RocksDB file");
+        File.WriteAllText(Path.Combine(wal, "000099.log"), "stale wal");
+        return (db, wal);
+    }
+
+    /// <summary>The names in the destination directories, with the file numbers RocksDB chose replaced by kinds.</summary>
+    private static string DestinationShape(string db, string wal)
+    {
+        static string Kind(string name)
+        {
+            if (name.StartsWith("MANIFEST-", StringComparison.Ordinal)) return "MANIFEST";
+            if (name.StartsWith("OPTIONS-", StringComparison.Ordinal)) return "OPTIONS";
+            string ext = Path.GetExtension(name);
+            return ext is ".sst" or ".log" ? "*" + ext : name;
+        }
+        var dbNames = Directory.GetFiles(db).Select(p => Kind(Path.GetFileName(p))).Order(StringComparer.Ordinal);
+        var walNames = Directory.GetFiles(wal).Select(p => Kind(Path.GetFileName(p))).Order(StringComparer.Ordinal);
+        return "db: " + string.Join(",", dbNames.Distinct()) + " | wal: " + string.Join(",", walNames.Distinct())
+            + " | stale sst kept: " + File.Exists(Path.Combine(db, "000077.sst")) + " | stale wal kept: " + File.Exists(Path.Combine(wal, "000099.log"));
+    }
+
+    private static void CheckRestoredWithManaged(string db, string wal, int step, string what)
+    {
+        (DbOptions o, List<ColumnFamilyDescriptor> cfs) = ManagedOptions(wal);
+        o.CreateIfMissing = false;
+        using RocksDatabase restored = RocksDatabase.Open(db, o, cfs);
+        Dictionary<string, List<string>> expected = ExpectedAfter(step);
+        foreach (string cf in s_families) CollectionAssert.AreEqual(expected[cf], ManagedKeys(restored.GetColumnFamily(cf)), what + " " + cf);
+    }
+
+    private static void CheckRestoredWithNative(string db, string wal, int step, string what)
+    {
+        using NativeEnv n = OpenNative(db, wal);
+        Dictionary<string, List<string>> expected = ExpectedAfter(step);
+        foreach (string cf in s_families) CollectionAssert.AreEqual(expected[cf], NativeKeys(n.Db, n[cf]), what + " " + cf);
+    }
+
+    /// <summary>
+    /// RocksDbBase.Backup / RestoreFrom on both engines: three flushed backups of a DB with a separate WAL dir, purged to
+    /// the newest two after each; the info rows (ids, file counts, sizes, timestamps) agree; each engine restores the
+    /// other's latest backup and an older one by id into destinations that already hold files, removes the same files
+    /// (all of them), puts the WALs into the WAL dir, and the restored DB has exactly the
+    /// contents at backup time (not the write made after the last backup) when opened by either engine.
+    /// </summary>
+    [TestMethod]
+    public void MosaikBackupAndRestoreMatchNative()
+    {
+        using var root = new TempDir("mosaik-backup");
+        string nBackups = Path.Combine(root.Path, "backups-n"), mBackups = Path.Combine(root.Path, "backups-m");
+        var nRows = new List<List<BackupRow>>();
+        var mRows = new List<List<BackupRow>>();
+        long before = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        Directory.CreateDirectory(Path.Combine(root.Path, "src-n"));
+        Directory.CreateDirectory(Path.Combine(root.Path, "src-m"));
+
+        using (NativeEnv n = OpenNative(Path.Combine(root.Path, "src-n", "db"), Path.Combine(root.Path, "src-n", "journal")))
+        {
+            BackupWorkload((cf, k, v) => n.Db.Put(k, v, n[cf]), (cf, k) => n.Db.Remove(k, n[cf]), () => nRows.Add(NativeMosaikBackup(n, nBackups)));
+        }
+        using (ManagedEnv m = OpenManaged(Path.Combine(root.Path, "src-m", "db"), Path.Combine(root.Path, "src-m", "journal")))
+        {
+            BackupWorkload((cf, k, v) => m[cf].Put(k, v), (cf, k) => m[cf].Delete(k), () => mRows.Add(ManagedMosaikBackup(m, mBackups)));
+        }
+        long after = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        string rows = "native: " + string.Join(" / ", nRows.Select(r => string.Join(",", r))) + "\nmanaged: " + string.Join(" / ", mRows.Select(r => string.Join(",", r)));
+        rows += "\nnative meta 3:\n" + File.ReadAllText(Path.Combine(nBackups, "meta", "3")) + "\nmanaged meta 3:\n" + File.ReadAllText(Path.Combine(mBackups, "meta", "3"));
+        Console.WriteLine(rows);
+        Assert.AreEqual(3, nRows.Count);
+        Assert.AreEqual(3, mRows.Count);
+        for (int b = 0; b < 3; b++)
+        {
+            CollectionAssert.AreEqual(nRows[b].Select(r => r.Id).ToList(), mRows[b].Select(r => r.Id).ToList(), rows);
+            for (int i = 0; i < nRows[b].Count; i++)
+            {
+                BackupRow nr = nRows[b][i], mr = mRows[b][i];
+                Assert.AreEqual(nr.Files, mr.Files, "number_files of backup " + nr.Id + "\n" + rows);
+                Assert.IsTrue(Math.Abs((double)nr.Size - mr.Size) <= nr.Size * 0.2, "size of backup " + nr.Id + "\n" + rows);
+                Assert.IsTrue(nr.Timestamp >= before && nr.Timestamp <= after && mr.Timestamp >= before && mr.Timestamp <= after, rows);
+            }
+        }
+        CollectionAssert.AreEqual(new uint[] { 2, 3 }, mRows[2].Select(r => r.Id).ToArray(), "purge keeps the newest two");
+
+        // Each engine restores the other's latest backup, and its own (control), into populated destinations.
+        var shapes = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach ((string name, Action<string, string, string, int> restore, string from) in new (string, Action<string, string, string, int>, string)[]
+                 {
+                     ("native<-native", NativeMosaikRestore, nBackups), ("native<-managed", NativeMosaikRestore, mBackups),
+                     ("managed<-managed", ManagedMosaikRestore, mBackups), ("managed<-native", ManagedMosaikRestore, nBackups),
+                 })
+        {
+            (string db, string wal) = PopulatedDestination(Path.Combine(root.Path, name.Replace('<', '_')));
+            restore(from, db, wal, -1);
+            shapes[name] = DestinationShape(db, wal);
+            CheckRestoredWithManaged(db, wal, 3, name);
+            CheckRestoredWithNative(db, wal, 3, name);
+        }
+        string shapeReport = string.Join("\n", shapes.Select(kv => kv.Key + ": " + kv.Value));
+        Console.WriteLine(shapeReport);
+        Assert.AreEqual(shapes["native<-native"], shapes["managed<-managed"], shapeReport);
+        Assert.AreEqual(shapes["native<-managed"], shapes["managed<-native"], shapeReport);
+        Assert.AreEqual(shapes["native<-native"], shapes["managed<-native"], shapeReport);
+        // DeleteChildren removes every child of the destination, also files RocksDB does not name.
+        Assert.IsFalse(shapes["managed<-native"].Contains("keep.txt", StringComparison.Ordinal), shapeReport);
+
+        // An older backup by id (restore_db_from_backup), across engines both ways.
+        (string db2, string wal2) = PopulatedDestination(Path.Combine(root.Path, "by-id-m"));
+        ManagedMosaikRestore(nBackups, db2, wal2, 2);
+        CheckRestoredWithNative(db2, wal2, 2, "managed restore of native backup 2");
+        (string db3, string wal3) = PopulatedDestination(Path.Combine(root.Path, "by-id-n"));
+        NativeMosaikRestore(mBackups, db3, wal3, 2);
+        CheckRestoredWithManaged(db3, wal3, 2, "native restore of managed backup 2");
+
+        // A purged backup: both engines refuse it.
+        (string db4, string wal4) = PopulatedDestination(Path.Combine(root.Path, "purged"));
+        var ex = Assert.ThrowsExactly<RocksDbException>(() => ManagedMosaikRestore(nBackups, db4, wal4, 1));
+        Assert.AreEqual(StatusCode.NotFound, ex.Code);
+        Assert.ThrowsExactly<RocksDbSharp.RocksDbException>(() => NativeMosaikRestore(mBackups, db4, wal4, 1));
+    }
 }

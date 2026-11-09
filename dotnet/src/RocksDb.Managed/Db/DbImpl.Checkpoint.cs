@@ -151,7 +151,7 @@ internal sealed partial class DbImpl
         {
             // If the outstanding WAL files are small, we skip the flush.
             ulong total = 0;
-            foreach (WalFileInfo w in GetSortedWalFiles(includeArchived: false)) total += w.SizeBytes;
+            foreach (WalFileInfo w in GetSortedWalFiles(includeArchived: false, needSeqnos: false)) total += w.SizeBytes;
             if (total < walSizeForFlush) flushMemtable = false;
         }
         if (flushMemtable)
@@ -223,7 +223,8 @@ internal sealed partial class DbImpl
         // FlushWAL is required to ensure we can physically copy everything logically written to the WAL.
         if (!_readOnly) await FlushWalAsync(sync: false, synchronous, ct).ConfigureAwait(false);
 
-        List<WalFileInfo> liveWalFiles = GetSortedWalFiles(includeArchived: false);
+        // GetSortedWalFilesImpl(need_seqnos = false): empty WALs (e.g. the one created by the flush above) are live too.
+        List<WalFileInfo> liveWalFiles = GetSortedWalFiles(includeArchived: false, needSeqnos: false);
         // Link WAL files. Copy exact size of last one because it is the only one that has changes after the last flush.
         for (int i = 0; i < liveWalFiles.Count; i++)
         {
