@@ -50,14 +50,29 @@ public sealed unsafe class Arena : Allocator, IDisposable
     private int _irregularBlockNum;
     private bool _disposed;
     private readonly AllocTracker? _tracker;
+    // inline_block_: the first allocations are served from this small block, so an arena that holds little (an empty
+    // memtable: the skiplist heads) owns and reports kInlineSize bytes instead of a whole block.
+    private readonly byte[] _inlineBlock;
 
-    public Arena(int blockSize)
-    {
-        _blockSize = OptimizeBlockSize(blockSize);
-    }
+    /// <summary>kInlineSize: size of the block an arena starts with.</summary>
+    public const int InlineSize = 2048;
+
+    public Arena(int blockSize) : this(blockSize, null) { }
 
     /// <summary>An arena whose block allocations are reported to <paramref name="tracker"/> (Arena(block_size, tracker)).</summary>
-    internal Arena(int blockSize, AllocTracker? tracker) : this(blockSize) => _tracker = tracker;
+    internal Arena(int blockSize, AllocTracker? tracker)
+    {
+        _blockSize = OptimizeBlockSize(blockSize);
+        _tracker = tracker;
+        // Over-allocated by AlignUnit so the usable kInlineSize bytes start aligned (POH data is only 8-aligned).
+        _inlineBlock = GC.AllocateUninitializedArray<byte>(InlineSize + AlignUnit, pinned: true);
+        byte* head = AlignUp((byte*)Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(_inlineBlock)));
+        _allocBytesRemaining = InlineSize;
+        _blocksMemory += InlineSize;
+        _alignedAllocPtr = head;
+        _unalignedAllocPtr = head + InlineSize;
+        _tracker?.Allocate(InlineSize);
+    }
 
     public Arena() : this(MinBlockSize) { }
 
@@ -83,7 +98,7 @@ public sealed unsafe class Arena : Allocator, IDisposable
     /// <summary>Number of dedicated blocks allocated for large requests.</summary>
     public int IrregularBlockNum => _irregularBlockNum;
 
-    /// <summary>True until the first block is allocated (upstream: still in the inline block).</summary>
+    /// <summary>True until the first block is allocated (upstream IsInInlineBlock: still in the inline block).</summary>
     public bool IsEmpty => _blocks.Count == 0;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
