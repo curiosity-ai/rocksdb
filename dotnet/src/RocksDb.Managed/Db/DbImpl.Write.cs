@@ -1519,6 +1519,14 @@ internal sealed partial class DbImpl
     /// </summary>
     private sealed class DuplicateKeySeqException() : Exception("two consecutive TryAgain in WriteBatch handler; this is either a software bug or data corruption.");
 
+    /// <summary>
+    /// A non-OK status of a MemTableInserter handler for an entry the DB refuses (an inverted DeleteRange, a Merge
+    /// without merge operator). Live writes fail with it (the memtable now diverges from the WAL: a background error,
+    /// HandleMemTableInsertFailure); WAL recovery reports it like upstream's InsertLogRecordToMemtable failure.
+    /// </summary>
+    private sealed class InsertRejectedException(StatusCode code, string message)
+        : RocksDbException(code, (code == StatusCode.InvalidArgument ? "Invalid argument: " : "") + message);
+
     private struct MemTableInserter : IWriteBatchHandler
     {
         private readonly DbImpl _db;
@@ -1821,6 +1829,20 @@ internal sealed partial class DbImpl
                 _rebuilding!.DeleteRange(columnFamilyId, beginKey, endKey);
                 return;
             }
+            // MemTableInserter::DeleteRangeCF (write_batch.cc): once the column family is found, a range whose end
+            // comes before its start is an error (the write fails, see InsertRejectedException), and an empty range is
+            // not applied: no entry, and the sequence number does not advance.
+            if (_db.CfForInsert(columnFamilyId, _logNumber, IgnoreMissingColumnFamilies) is { } c)
+            {
+                int cmp = c.UserComparator.CompareWithoutTimestamp(beginKey, true, endKey, true);
+                if (cmp > 0) throw new InsertRejectedException(StatusCode.InvalidArgument, "end key comes before start key");
+                if (cmp == 0)
+                {
+                    // NextProtectionInfo() was consumed for the entry
+                    if (_protBatch is not null && _protIdx < _protBatch.ProtectionInfo.Length) _protIdx++;
+                    return;
+                }
+            }
             Add(columnFamilyId, EntryType.RangeDeletion, beginKey, endKey);
             _rebuilding?.DeleteRange(columnFamilyId, beginKey, endKey);
         }
@@ -1831,6 +1853,11 @@ internal sealed partial class DbImpl
             {
                 _rebuilding!.Merge(columnFamilyId, key, value);
                 return;
+            }
+            // MemTableInserter::MergeCF: a merge into a column family without a merge operator fails the write.
+            if (_db.CfForInsert(columnFamilyId, _logNumber, IgnoreMissingColumnFamilies) is { MergeOperator: null })
+            {
+                throw new InsertRejectedException(StatusCode.InvalidArgument, "Merge requires `ColumnFamilyOptions::merge_operator != nullptr`");
             }
             Add(columnFamilyId, EntryType.Merge, key, value);
             _rebuilding?.Merge(columnFamilyId, key, value);

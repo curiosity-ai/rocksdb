@@ -26,6 +26,8 @@ public class TransactionTests
         return o;
     }
 
+    private static ColumnFamilyOptions MergeCfo() => new() { MergeOperator = MergeOperator.StringAppend(",") };
+
     private TransactionDatabase Open(MemoryFileSystem fs, TransactionDbOptions? options = null, ColumnFamilyOptions? cfo = null) =>
         TransactionDatabase.Open(DbPath, NewOptions(fs), options is null ? TxnDbOptions() : WithPolicy(options),
             [new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, cfo ?? new ColumnFamilyOptions())]);
@@ -392,12 +394,12 @@ public class TransactionTests
         MemoryFileSystem fs = NewFs();
         ulong prepLog;
         {
-            TransactionDatabase db = Open(fs);
+            TransactionDatabase db = Open(fs, cfo: MergeCfo());
             db.Put(B("before"), B("1"));
             Transaction txn = db.BeginTransaction(s_sync);
             txn.SetName("xid#1");
             txn.Put(B("foo"), B("bar"));
-            txn.Merge(B("m"), B("op")); // no merge operator needed until read
+            txn.Merge(B("m"), B("op")); // inserted into the memtable: the family needs a merge operator (MergeCF)
             txn.Delete(B("before"));
             txn.Prepare();
             prepLog = ((PessimisticTransactionView)txn).LogNumber;
@@ -415,7 +417,7 @@ public class TransactionTests
             t3.Rollback();
             Crash(fs, db);
         }
-        using (TransactionDatabase db = Open(fs))
+        using (TransactionDatabase db = Open(fs, cfo: MergeCfo()))
         {
             Assert.AreEqual("yes", GetString(db.Database, "committed"));
             Assert.IsNull(GetString(db.Database, "rolledback"));
@@ -432,7 +434,7 @@ public class TransactionTests
             Assert.AreEqual("bar", GetString(db.Database, "foo"));
             Assert.IsNull(GetString(db.Database, "before"));
         }
-        using (TransactionDatabase db = Open(fs))
+        using (TransactionDatabase db = Open(fs, cfo: MergeCfo()))
         {
             Assert.AreEqual(0, db.GetAllPreparedTransactions().Count);
             Assert.AreEqual("bar", GetString(db.Database, "foo"));
