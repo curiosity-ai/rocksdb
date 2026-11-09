@@ -475,6 +475,36 @@ public sealed class MosaikReadPathCompatTests
             }
         }
 
+        /// <summary>New keys (fresh versions on the change tracker family).</summary>
+        public List<byte[]> ExtraKeys(int n)
+        {
+            var r = new List<byte[]>();
+            for (int i = 0; i < n; i++)
+            {
+                byte[] k;
+                if (_family == Family.ULongChangeTracker)
+                {
+                    _version += 1;
+                    k = U64(_version);
+                }
+                else
+                {
+                    k = RandomKey(Prefixes[_rnd.Next(Prefixes.Count)]);
+                }
+                Written.Add(k);
+                r.Add(k);
+            }
+            return r;
+        }
+
+        /// <summary>Some written keys (to delete).</summary>
+        public List<byte[]> SomeWritten(int n)
+        {
+            var r = new List<byte[]>();
+            for (int i = 0; i < n; i++) r.Add(Written[_rnd.Next(Written.Count)]);
+            return r;
+        }
+
         /// <summary>Keys for point lookups: written keys, absent keys under present and absent prefixes, short keys.</summary>
         public List<byte[]> Probes()
         {
@@ -620,6 +650,34 @@ public sealed class MosaikReadPathCompatTests
         return o;
     }
 
+    /// <summary>
+    /// A forward full scan (and a bounded one) that, halfway, writes <paramref name="extra"/>, deletes
+    /// <paramref name="victims"/>, flushes and compacts everything: the open iterators keep returning the state they were
+    /// created on (the implicit snapshot and pinned version), as Mosaik's scans do while the flush thread and
+    /// compactions run.
+    /// </summary>
+    private static List<string> ScanAcrossFlushAndCompaction(IEngine e, Family family, byte[] prefix, List<byte[]> extra, List<byte[]> victims)
+    {
+        var o = new List<string>();
+        byte[] value = Encoding.ASCII.GetBytes("under-iterator");
+        using IIter full = e.NewIterator(new ReadSpec(null, null, TotalOrderSeek: true));
+        using IIter bounded = family == Family.ULongChangeTracker
+            ? e.NewIterator(new ReadSpec(U64(0), null))
+            : e.NewIterator(new ReadSpec(Filled(prefix, UidKeyLength, 0), Filled(prefix, UidKeyLength, 0xFF)));
+        full.SeekToFirst();
+        bounded.SeekToFirst();
+        for (int i = 0; i < 300 && full.Valid; i++, full.Next()) o.Add(Hex(full.Key) + "=" + Hex(full.Value));
+        for (int i = 0; i < 100 && bounded.Valid; i++, bounded.Next()) o.Add(Hex(bounded.Key) + "=" + Hex(bounded.Value));
+        foreach (byte[] k in extra) e.Put(k, value);
+        foreach (byte[] k in victims) e.Delete(k);
+        e.Flush();
+        e.CompactAll();
+        o.Add("-- after flush + compaction");
+        Collect(full, true, o);
+        Collect(bounded, true, o);
+        return o;
+    }
+
     /// <summary>ClearSimpleTextIndex / ClearVectors: delete every key while iterating the bounded range.</summary>
     private static void DeleteWhileIterating(IEngine e, byte[] p)
     {
@@ -684,17 +742,25 @@ public sealed class MosaikReadPathCompatTests
             Compare(native, managed, w, family, ctx + " memtable");
             foreach (IEngine e in both) e.Flush();
             Compare(native, managed, w, family, ctx + " one L0 file");
-            w.Round(both, 6000, rangeAndSingleDeletes: true);
-            foreach (IEngine e in both) e.Flush();
-            w.Round(both, 3000, rangeAndSingleDeletes: true);
-            foreach (IEngine e in both) e.Flush();
-            Compare(native, managed, w, family, ctx + " three L0 files");
+            // More L0 files than the table cache holds (max_open_files 8 is clipped to 20: 10 readers): table readers are
+            // evicted while iterators and lookups use them.
+            for (int i = 0; i < 13; i++)
+            {
+                w.Round(both, 1000, rangeAndSingleDeletes: true);
+                foreach (IEngine e in both) e.Flush();
+            }
+            Compare(native, managed, w, family, ctx + " fourteen L0 files");
             foreach (IEngine e in both) e.CompactAll();
             Compare(native, managed, w, family, ctx + " compacted (bottommost, no filter with optimize_filters_for_hits)");
             w.Round(both, 3000, rangeAndSingleDeletes: true);
             foreach (IEngine e in both) e.Flush();
             w.Round(both, 1500, rangeAndSingleDeletes: true);
             Compare(native, managed, w, family, ctx + " memtable + L0 over the compacted level");
+            List<byte[]> extra = w.ExtraKeys(200);
+            List<byte[]> victims = w.SomeWritten(200);
+            AssertSame(ScanAcrossFlushAndCompaction(native, family, w.Prefixes[0], extra, victims), ScanAcrossFlushAndCompaction(managed, family, w.Prefixes[0], extra, victims),
+                ctx + " iterator across writes, flush and compaction");
+            Compare(native, managed, w, family, ctx + " after the writes made under an open iterator");
             if (family != Family.ULongChangeTracker)
             {
                 for (int i = 0; i < 4; i++)
