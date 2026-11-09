@@ -127,12 +127,28 @@ public sealed partial class ColumnFamily
         WriteOneAsync(options, Op.DeleteRange, beginKey, endKey, cancellationToken);
 
     /// <summary>Adds a merge operand for <paramref name="key"/> (requires <see cref="ColumnFamilyOptions.MergeOperator"/>).</summary>
-    public void Merge(ReadOnlySpan<byte> key, ReadOnlySpan<byte> operand) => WriteOne(null, Op.Merge, key, operand);
-    public void Merge(WriteOptions options, ReadOnlySpan<byte> key, ReadOnlySpan<byte> operand) => WriteOne(options, Op.Merge, key, operand);
+    /// <exception cref="RocksDbException"><see cref="StatusCode.NotSupported"/> when the column family has no merge operator.</exception>
+    public void Merge(ReadOnlySpan<byte> key, ReadOnlySpan<byte> operand) => MergeOne(null, key, operand);
+    public void Merge(WriteOptions options, ReadOnlySpan<byte> key, ReadOnlySpan<byte> operand) => MergeOne(options, key, operand);
     public ValueTask MergeAsync(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> operand, CancellationToken cancellationToken = default) =>
-        WriteOneAsync(null, Op.Merge, key, operand, cancellationToken);
+        MergeOneAsync(null, key, operand, cancellationToken);
     public ValueTask MergeAsync(WriteOptions options, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> operand, CancellationToken cancellationToken = default) =>
-        WriteOneAsync(options, Op.Merge, key, operand, cancellationToken);
+        MergeOneAsync(options, key, operand, cancellationToken);
+
+    // DBImpl::Merge (db_impl_write.cc): NotSupported before anything is written when the family has no merge operator.
+    // A Merge in a WriteBatch is rejected by the memtable insert instead (MemTableInserter::MergeCF).
+    private void MergeOne(WriteOptions? options, ReadOnlySpan<byte> key, ReadOnlySpan<byte> operand)
+    {
+        if (_cfd.MergeOperator is null) ThrowHelper.NotSupported(NoMergeOperatorMessage);
+        WriteOne(options, Op.Merge, key, operand);
+    }
+
+    private ValueTask MergeOneAsync(WriteOptions? options, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> operand, CancellationToken cancellationToken) =>
+        _cfd.MergeOperator is null
+            ? ValueTask.FromException(RocksDbException.NotSupported(NoMergeOperatorMessage))
+            : WriteOneAsync(options, Op.Merge, key, operand, cancellationToken);
+
+    private const string NoMergeOperatorMessage = "Provide a merge_operator when opening DB";
 
     // =====================================================================================================
     // Reads

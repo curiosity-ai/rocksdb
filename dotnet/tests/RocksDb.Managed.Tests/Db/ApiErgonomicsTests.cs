@@ -16,7 +16,8 @@ public sealed class ApiErgonomicsTests
     {
         MemoryFileSystem fs = NewFs();
         using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
-        ColumnFamily cf = db.CreateColumnFamily("users", new ColumnFamilyOptions());
+        // A Merge needs a merge operator in the family (MemTableInserter::MergeCF rejects it otherwise)
+        ColumnFamily cf = db.CreateColumnFamily("users", new ColumnFamilyOptions { MergeOperator = MergeOperator.StringAppend(",") });
         using WriteBatch byHandle = db.CreateWriteBatch();
         using WriteBatch byId = db.CreateWriteBatch();
         byHandle.Put(cf, B("a"), B("1")).Put(cf, B("b"), B("2")).Merge(cf, B("m"), B("x")).Delete(cf, B("b")).SingleDelete(cf, B("s"))
@@ -27,6 +28,7 @@ public sealed class ApiErgonomicsTests
         db.Write(WriteOptions.SyncWrites, byHandle);
         Assert.AreEqual("1", GetString(cf, "a"));
         Assert.IsNull(GetString(cf, "b"));
+        Assert.AreEqual("x", GetString(cf, "m"));
         Assert.AreEqual("default", GetString(db, "d"));
         Assert.IsNull(GetString(db, "a"));
         Assert.ThrowsExactly<ArgumentNullException>(() => byHandle.Put((ColumnFamily)null!, B("a"), B("1")));

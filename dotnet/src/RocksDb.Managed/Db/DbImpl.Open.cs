@@ -939,11 +939,14 @@ internal sealed partial class DbImpl
         {
             inserter.Run(record);
         }
-        catch (DuplicateKeySeqException e)
+        catch (Exception e) when (e is DuplicateKeySeqException or InsertRejectedException)
         {
             // InsertLogRecordToMemtable failed: MaybeIgnoreError, else the failure becomes the WAL's status (reported
             // like a read error). next_sequence is the inserter's sequence at the failing entry.
-            if (Options.ParanoidChecks) reporter.Corruption(record.Length, StatusCode.Corruption, e.Message, LogReporter.UnspecifiedLogNumber);
+            if (Options.ParanoidChecks)
+            {
+                reporter.Corruption(record.Length, e is RocksDbException r ? r.Code : StatusCode.Corruption, e.Message, LogReporter.UnspecifiedLogNumber);
+            }
             else LogWarn("Ignoring error Corruption: " + e.Message);
             CheckSeqnoNotSetBackDuringRecovery(progress.NextSequence, inserter.Sequence);
             progress.NextSequence = inserter.Sequence;
