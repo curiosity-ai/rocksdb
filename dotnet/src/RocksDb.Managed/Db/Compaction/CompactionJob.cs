@@ -817,6 +817,12 @@ internal sealed class CompactionJob
                     // Only range tombstones: they still need an output file.
                     OpenOutput();
                 }
+                else if (_out.Builder is null && _outputTombstones is not null && _out.FirstOutput)
+                {
+                    // CompactionOutputs::CloseOutput opens a file for a subcompaction with range tombstones only, and
+                    // AddRangeDels counts the ones it drops; no file is needed here, but the drops are counted.
+                    CountDroppedRangeDelsWithoutOutput();
+                }
                 if (_out.Builder is not null) await FinishOutputAsync(ReadOnlySpan<byte>.Empty, synchronous).ConfigureAwait(false);
             }
             if (BlobBuilder is not null)
@@ -1070,6 +1076,45 @@ internal sealed class CompactionJob
             }
         }
         return true;
+    }
+
+    /// <summary>
+    /// The statistics of AddRangeDels for an output group that gets no file because every tombstone is dropped at the
+    /// bottommost level (<see cref="AllTombstonesDroppable"/>): each tombstone AddRangeDels would visit for the
+    /// subcompaction's only (never opened) output counts in num_range_del_drop_obsolete and num_record_drop_obsolete.
+    /// </summary>
+    private void CountDroppedRangeDelsWithoutOutput()
+    {
+        FragmentedRangeTombstoneList t = _outputTombstones!;
+        int tsSize = t.TimestampSize;
+        byte[]? lowerBound = _subStart is null ? null : BoundaryKey(_subStart, EntryType.RangeDeletion);
+        byte[]? upperBound = _subEnd is null ? null : BoundaryKey(_subEnd, EntryType.RangeDeletion);
+        if (lowerBound is not null && upperBound is not null && _icmp.Compare(lowerBound, upperBound) > 0) return;
+        for (int i = 0; i < t.Count; i++)
+        {
+            ReadOnlySpan<byte> fStart = t.GetStart(i);
+            if (lowerBound is not null && _icmp.Compare(lowerBound, t.GetEnd(i), DbFormat.MaxSequenceNumber, EntryType.RangeDeletion) >= 0) continue;
+            ulong prevKeptStripe = ulong.MaxValue;
+            ReadOnlySpan<ulong> seqs = t.GetSequences(i);
+            for (int k = 0; k < seqs.Length; k++)
+            {
+                ulong seq = seqs[k];
+                if (tsSize == 0)
+                {
+                    ulong stripe = StripeOf(seq);
+                    if (stripe == prevKeptStripe) continue;
+                    prevKeptStripe = stripe;
+                }
+                if (_proximalOutputs is not null)
+                {
+                    ulong split = _proximalAfterSeqno < DbFormat.MaxSequenceNumber ? _proximalAfterSeqno + 1 : _proximalAfterSeqno;
+                    if (_out.IsProximalLevel ? seq < split : seq >= split) continue;
+                }
+                if (tsSize == 0 && upperBound is not null && _icmp.Compare(upperBound, fStart, seq, EntryType.RangeDeletion) < 0) return;
+                Stats.IterStats.NumRangeDelDropObsolete++;
+                Stats.IterStats.NumRecordDropObsolete++;
+            }
+        }
     }
 
     /// <summary>
@@ -1362,6 +1407,7 @@ internal sealed class CompactionJob
                 ReadOnlySpan<byte> tEnd = upperBound is not null && _icmp.Compare(upperBound, endBuf.WrittenSpan) < 0 ? upperBound : endBuf.WrittenSpan;
                 ulong prevKeptStripe = ulong.MaxValue;
                 bool stop = false;
+                bool compensated = false;
                 ReadOnlySpan<ulong> seqs = tombstones.GetSequences(i);
                 for (int k = 0; k < seqs.Length; k++)
                 {
@@ -1447,6 +1493,16 @@ internal sealed class CompactionJob
                         fragEnd.Write(fEnd[..^tsSize]);
                         fragEnd.Write(ts);
                         builder.Add(fragKey.WrittenSpan, fragEnd.WrittenSpan);
+                    }
+                    // The first tombstone written for each start user key compensates the file by the approximate size of
+                    // the data it covers below the output level (error margin 0.1), unless the truncated range is empty.
+                    if (!bottommost && (!compensated || (tsSize == 0 && fStart.Length == 0)))
+                    {
+                        compensated = true;
+                        if (_cfd.UserComparator.CompareWithoutTimestamp(DbFormat.ExtractUserKey(tStart), DbFormat.ExtractUserKey(tEnd)) < 0)
+                        {
+                            meta.CompensatedRangeDeletionSize += DbImpl.ApproximateSize(_cfd, _c.InputStorage, tStart, tEnd, _c.OutputLevel + 1, 0.1);
+                        }
                     }
                     // FileMetaData::UpdateBoundariesForRange
                     if (smallest.WrittenCount == 0 || _icmp.Compare(tStart, smallest.WrittenSpan) < 0)

@@ -208,17 +208,30 @@ internal sealed partial class DbImpl
     {
         ulong[] snapshots;
         SeqnoToTimeMapping? seqnoToTime;
+        DbVersion baseVersion;
         lock (_mutex)
         {
             snapshots = SnapshotsForCompaction();
             seqnoToTime = CopySeqnoToTimeMapping(cfd);
+            // FlushJob::PickMemTable: base_ = cfd_->current(); base_->Ref(). BuildTable estimates the data covered by
+            // the flushed range tombstones in it (compensated_range_deletion_size).
+            baseVersion = cfd.Current;
+            baseVersion.Ref();
         }
         // PrepareFlushAdditions: the blob direct write files of the flushed memtables are sealed and registered with the
         // table file; their blobs the output does not reference (hidden versions, failed writes) are garbage.
         (List<BlobFileAddition> Additions, Blob.BlobGarbageMeter Meter)? directWrite = PrepareBlobDirectWriteFlush(cfd, picked);
-        FileMetaData? meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, TableFileWriteOptions(Env.IoPriority.High), cfd, mems, fileNumber, epoch, Identity, snapshots, CurrentSnapshotChecker, blobBuilder,
-                directWrite?.Meter, seqnoToTime, synchronous, CancellationToken.None)
-            .ConfigureAwait(false);
+        FileMetaData? meta;
+        try
+        {
+            meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, TableFileWriteOptions(Env.IoPriority.High), cfd, mems, fileNumber, epoch, Identity, snapshots, CurrentSnapshotChecker, blobBuilder,
+                    directWrite?.Meter, seqnoToTime, baseVersion.Storage, synchronous, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_mutex) Versions.UnrefVersion(baseVersion);
+        }
         if (meta is not null)
         {
             // BuildTable: "Verify that the table is usable" (table_cache->NewIterator): the new table is opened and stays

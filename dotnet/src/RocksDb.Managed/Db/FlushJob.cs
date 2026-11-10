@@ -35,7 +35,10 @@ internal static class FlushJob
     /// to blob files and replaced by blob indexes (BuildTable with a BlobFileBuilder); the builder is finished here and
     /// its <see cref="Blob.BlobFileBuilder.Additions"/> belong in the same version edit as the table file. On failure
     /// the caller deletes the builder's files. <paramref name="snapshots"/> are the live snapshot sequence numbers
-    /// (ascending) when the flush job was created (FlushJob's existing_snapshots_).
+    /// (ascending) when the flush job was created (FlushJob's existing_snapshots_). <paramref name="baseVersion"/> is the
+    /// version the flush is based on (FlushJob's base_, which the caller keeps referenced; null for a recovery flush):
+    /// with it the file's compensated_range_deletion_size is the approximate size of the data in that version its range
+    /// tombstones cover.
     /// </summary>
     /// <remarks>
     /// <paramref name="snapshotChecker"/> is the DB's snapshot checker (WritePrepared / WriteUnprepared, or
@@ -45,7 +48,7 @@ internal static class FlushJob
     /// </remarks>
     public static async ValueTask<FileMetaData?> WriteLevel0TableAsync(IFileSystem fs, string path, WritableFileOptions fileOptions, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
         ulong fileNumber, ulong epochNumber, DbIdentity identity, ulong[] snapshots, SnapshotChecker? snapshotChecker, Blob.BlobFileBuilder? blobBuilder,
-        Blob.BlobGarbageMeter? blobOutflow, SeqnoToTimeMapping? seqnoToTimeMapping,
+        Blob.BlobGarbageMeter? blobOutflow, SeqnoToTimeMapping? seqnoToTimeMapping, VersionStorageInfo? baseVersion,
         bool synchronous, CancellationToken cancellationToken)
     {
         bool stripTimestamps = cfd.TimestampsInMemtableOnly;
@@ -112,7 +115,7 @@ internal static class FlushJob
                 // like the point entries above).
                 if (tombstones is not null)
                 {
-                    AddRangeTombstones(builder, cfd, tombstones, meta, cfd.TimestampSize == 0 && snapshotChecker is null ? snapshots : null);
+                    AddRangeTombstones(builder, cfd, tombstones, meta, cfd.TimestampSize == 0 && snapshotChecker is null ? snapshots : null, baseVersion);
                 }
                 if (builder.IsEmpty && meta.Smallest.Length == 0)
                 {
@@ -610,7 +613,7 @@ internal static class FlushJob
     /// fragments for_compaction with the job's snapshots); null writes all of them.
     /// </summary>
     private static void AddRangeTombstones(TableBuilder builder, ColumnFamilyData cfd, FragmentedRangeTombstoneList frag, FileMetaData meta,
-        ulong[]? stripeSnapshots)
+        ulong[]? stripeSnapshots, VersionStorageInfo? baseVersion)
     {
         InternalKeyComparator icmp = cfd.Icmp;
         int tsSize = frag.TimestampSize;
@@ -642,6 +645,7 @@ internal static class FlushJob
                     largestChanged = true;
                 }
                 ulong prevStripe = 0;
+                bool compensated = false;
                 for (int k = 0; k < seqs.Length; k++)
                 {
                     ulong seq = seqs[k];
@@ -670,6 +674,14 @@ internal static class FlushJob
                         AppendInternalKey(startKey, start, default, seq);
                     }
                     builder.Add(startKey.WrittenSpan, tEnd);
+                    // BuildTable: the first tombstone of each start user key (the newest of the fragment) compensates the
+                    // file by the approximate size of the data it covers in the base version (all levels, error margin
+                    // 0.1). Upstream's "last start key is empty" test also re-counts a fragment starting at the empty key.
+                    if (baseVersion is not null && (!compensated || start.Length == 0))
+                    {
+                        compensated = true;
+                        meta.CompensatedRangeDeletionSize += DbImpl.ApproximateSize(cfd, baseVersion, startKey.WrittenSpan, endKey.WrittenSpan, 0, 0.1);
+                    }
                     if (smallest.WrittenCount == 0 || icmp.Compare(startKey.WrittenSpan, smallest.WrittenSpan) < 0)
                     {
                         smallest.Clear();

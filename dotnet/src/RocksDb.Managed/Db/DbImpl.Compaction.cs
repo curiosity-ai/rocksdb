@@ -811,6 +811,10 @@ internal sealed partial class DbImpl
         List<ulong>? copiedFiles = null;
         Exception? failure = null;
         long compactionStart = 0;
+        // Set once the edit is handed to the MANIFEST writer: a failure after that may have left the record in the
+        // MANIFEST that CURRENT names, so the new files must stay (upstream quarantines them, ErrorHandler::
+        // AddFilesToQuarantine); they are removed by the full scan of a later open if the edit did not survive.
+        bool editSubmitted = false;
         int jobId = 0;
         CancellationTokenSource? manualCancellation = null;
         try
@@ -942,6 +946,7 @@ internal sealed partial class DbImpl
             }
             // The super version (and with it the write stall) is installed in the critical section that installs the
             // version (InstallSuperVersionAndScheduleWork right after LogAndApply, under the same mutex hold).
+            editSubmitted = true;
             Versions.LogAndApplyAsync(cfd, edit, synchronous: true, () => InstallSuperVersion(cfd), CancellationToken.None).GetAwaiter().GetResult();
             TestHooks.Invoke("DBImpl::RunCompaction:AfterLogAndApply");
             var installed = new List<FileMetaData>(edit.NewFiles.Count);
@@ -982,7 +987,9 @@ internal sealed partial class DbImpl
         catch (Exception e)
         {
             failure = e;
-            SetBackgroundError(e, BackgroundErrorReason.Compaction, walRelated: false);
+            // BackgroundCompaction: "err_reason = versions_->io_status().ok() ? kCompaction : kManifestWrite".
+            SetBackgroundError(e, editSubmitted && Versions.IoStatus is not null ? BackgroundErrorReason.ManifestWrite : BackgroundErrorReason.Compaction,
+                walRelated: false);
             if (!isManual)
             {
                 // BackgroundCallCompaction: wait a little bit before retrying in case this is an environmental problem
@@ -1027,15 +1034,18 @@ internal sealed partial class DbImpl
                     cfd.Current.Storage.ComputeCompactionScore();
                 }
             }
-            if (!ok && job is not null)
+            // LogAndApply can also fail before writing anything (dropped column family, a refused edit): only a MANIFEST
+            // I/O error (VersionSet::io_status_) leaves the record's fate unknown.
+            bool deleteOutputs = !ok && !(editSubmitted && Versions.IoStatus is not null);
+            if (deleteOutputs && job is not null)
             {
                 foreach (ulong n in job.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
             }
-            if (!ok && remote is not null)
+            if (deleteOutputs && remote is not null)
             {
                 foreach (ulong n in remote.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
             }
-            if (!ok && copiedFiles is not null)
+            if (deleteOutputs && copiedFiles is not null)
             {
                 foreach (ulong n in copiedFiles) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
             }
@@ -1236,10 +1246,34 @@ internal sealed partial class DbImpl
             await IncreaseFullHistoryTsLowAsync(cfd, tsLow.ToArray(), synchronous, cancellationToken).ConfigureAwait(false);
         }
 
+        // DBImpl::CompactRange: with user-defined timestamps the bounds are user keys without a timestamp;
+        // MaybeAddTimestampsToRange(exclusive_end = false) gives the begin key the maximum timestamp and the end key the
+        // minimum one, so every version of both keys is inside the range.
+        if (cfd.TimestampSize != 0)
+        {
+            if (begin is not null) begin = AddTimestamp(cfd, begin, max: true);
+            if (end is not null) end = AddTimestamp(cfd, end, max: false);
+        }
+
         // Flush first, unless there is nothing in memory (flushing takes write-leadership, which a writer waiting on a
         // write stop holds; skipping the no-op flush lets a manual compaction resolve the stop).
         bool flushNeeded;
         lock (_mutex) flushNeeded = !cfd.Mem.IsEmpty || cfd.Imm.Count > 0;
+        if (flushNeeded && begin is not null && end is not null && cfd.TimestampSize == 0)
+        {
+            // CompactRangeInternal: with both bounds, flush only if the memtables overlap the range
+            // (ColumnFamilyData::RangesOverlapWithMemtables, inclusive limit). Column families with user-defined
+            // timestamps always flush here.
+            SuperVersion sv = GetReferencedSuperVersion(cfd);
+            try
+            {
+                flushNeeded = RangeOverlapsWithMemtables(cfd, sv, begin, end);
+            }
+            finally
+            {
+                ReturnSuperVersion(sv);
+            }
+        }
         if (flushNeeded) await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.ManualCompaction, synchronous, cancellationToken).ConfigureAwait(false);
 
         bool exclusive = options.ExclusiveManualCompaction;
@@ -1381,6 +1415,40 @@ internal sealed partial class DbImpl
         finally
         {
             if (exclusive) EndExclusiveManual();
+        }
+    }
+
+    /// <summary>
+    /// Port of ColumnFamilyData::RangesOverlapWithMemtables for one user key range [<paramref name="start"/>,
+    /// <paramref name="limit"/>] (limit inclusive, no user-defined timestamps): true if a memtable of
+    /// <paramref name="sv"/> holds a key in the range or a range tombstone intersecting it.
+    /// </summary>
+    private static bool RangeOverlapsWithMemtables(ColumnFamilyData cfd, SuperVersion sv, byte[] start, byte[] limit)
+    {
+        Comparator ucmp = cfd.UserComparator;
+        byte[] seek = MakeInternalKey(start, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
+        if (Overlaps(sv.Mem)) return true;
+        foreach (MemTable m in sv.Imm)
+        {
+            if (Overlaps(m)) return true;
+        }
+        return false;
+
+        bool Overlaps(MemTable mem)
+        {
+            if (mem.IsEmpty) return false;
+            MemTableIterator it = mem.NewIterator();
+            it.Seek(seek);
+            if (it.Valid && ucmp.Compare(DbFormat.ExtractUserKey(it.Key), limit) <= 0) return true;
+            if (mem.NumRangeDeletes == 0) return false;
+            // RangeDelAggregator::IsRangeOverlapped: a tombstone [ts, te) with ts <= limit and start < te.
+            FragmentedRangeTombstoneList list = mem.GetFragmentedRangeTombstones();
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (ucmp.Compare(list.GetStart(i), limit) > 0) break; // fragments are ordered by start key
+                if (ucmp.Compare(start, list.GetEnd(i)) < 0) return true;
+            }
+            return false;
         }
     }
 

@@ -94,10 +94,9 @@ public sealed class Audit4CompactionJobTests
     /// BuildTable (db/builder.cc) and CompactionOutputs::AddRangeDels: "meta->compensated_range_deletion_size +=
     /// versions->ApproximateSize(...)" -- a file with range tombstones is compensated by the size of the older data its
     /// tombstones cover, which raises its compaction priority and is persisted in the MANIFEST (NewFileCustomTag 14).
-    /// The port never computes it.
+    /// The port never computed it.
     /// </summary>
     [TestMethod]
-    [Ignore("audit4: compensated_range_deletion_size is not computed by flush / compaction (needs VersionSet::ApproximateSize with a start level, outside this slice)")]
     public void FlushCompensatesFilesForTheDataTheirRangeTombstonesCover()
     {
         MemoryFileSystem fs = NewFs();

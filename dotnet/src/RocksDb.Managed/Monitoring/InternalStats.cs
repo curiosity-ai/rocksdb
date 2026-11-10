@@ -347,6 +347,7 @@ internal sealed class InternalStats
         sum = new CompactionLevelStats();
         int totalFiles = 0;
         double totalSize = 0;
+        int totalBeingCompacted = 0;
         lock (_lock)
         {
             ulong currIngest = _bytesFlushed + _bytesIngestedAddFile;
@@ -355,6 +356,13 @@ internal sealed class InternalStats
                 CompactionLevelStats s = level < _levels.Length ? _levels[level] : new CompactionLevelStats();
                 int files = vstorage.NumLevelFiles(level);
                 totalFiles += files;
+                // Count # of files being compacted for each level (also of levels without a row, like upstream).
+                int beingCompacted = 0;
+                foreach (FileMetaData f in vstorage.LevelFiles(level))
+                {
+                    if (f.BeingCompacted) beingCompacted++;
+                }
+                totalBeingCompacted += beingCompacted;
                 if (s.Micros > 0 || s.CpuMicros > 0 || files > 0)
                 {
                     sum.Add(s);
@@ -362,11 +370,11 @@ internal sealed class InternalStats
                     totalSize += size;
                     ulong inputBytes = level == 0 ? currIngest : s.BytesReadNonOutputLevels;
                     double wAmp = inputBytes == 0 ? 0 : (double)s.BytesWritten / inputBytes;
-                    rows.Add((level, PrepareLevelStats(files, 0, size, vstorage.ScoreOfLevel(level), wAmp, s)));
+                    rows.Add((level, PrepareLevelStats(files, beingCompacted, size, vstorage.ScoreOfLevel(level), wAmp, s)));
                 }
             }
             double sumWAmp = currIngest == 0 ? 0 : (double)(sum.BytesWritten) / currIngest;
-            rows.Add((-1, PrepareLevelStats(totalFiles, 0, totalSize, 0, sumWAmp, sum)));
+            rows.Add((-1, PrepareLevelStats(totalFiles, totalBeingCompacted, totalSize, 0, sumWAmp, sum)));
         }
         return rows;
     }

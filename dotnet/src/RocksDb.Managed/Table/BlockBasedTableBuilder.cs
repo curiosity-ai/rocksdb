@@ -650,7 +650,9 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
     private BlockHandle WriteBlock(ReadOnlySpan<byte> raw, bool isDataBlock, out bool skipDeltaEncoding)
     {
         CompressionType type = CompressBlock(raw, isDataBlock, _compressed, out bool rejected);
+        // CompressAndVerifyBlock: a data block stored uncompressed after an attempt is rejected, without one bypassed.
         if (rejected) _props.NumDataBlocksCompressionRejected++;
+        else if (isDataBlock && type == CompressionType.None) _props.NumDataBlocksCompressionBypassed++;
         BlockHandle h = type == CompressionType.None
             ? WriteMaybeCompressedBlock(raw, type, isDataBlock, out skipDeltaEncoding)
             : WriteMaybeCompressedBlock(_compressed.WrittenSpan, type, isDataBlock, out skipDeltaEncoding);
