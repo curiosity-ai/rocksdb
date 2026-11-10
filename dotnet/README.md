@@ -76,14 +76,21 @@ Raft cluster, optional gRPC transport) is a separate library on top of the engin
 
 ## Build and install
 
-There is no NuGet package yet. Reference the project from your solution:
+Install from NuGet:
 
-```xml
-<ProjectReference Include="path/to/dotnet/src/RocksDb.Managed/RocksDb.Managed.csproj" />
+| Package | Contents |
+|---|---|
+| [`RocksDb.Managed`](https://www.nuget.org/packages/RocksDb.Managed) | the storage engine |
+| [`RocksDb.Managed.Replication`](https://www.nuget.org/packages/RocksDb.Managed.Replication) | replication, planned switchover and the Raft cluster layer |
+| [`RocksDb.Managed.Replication.MagicOnion`](https://www.nuget.org/packages/RocksDb.Managed.Replication.MagicOnion) | gRPC (MagicOnion) transport for the replication layer |
+
+```bash
+dotnet add package RocksDb.Managed
 ```
 
-The library depends on `System.IO.Hashing`, `Snappier`, `K4os.Compression.LZ4` and `ZstdSharp.Port` (all managed)
-and is AOT-compatible. To build the solution and run the examples:
+The packages are built and published by [`.azure-devops/nuget-rocksdb-managed.yml`](.azure-devops/nuget-rocksdb-managed.yml)
+(version `yy.M.<build id>`). The library depends on `System.IO.Hashing`, `Snappier`, `K4os.Compression.LZ4` and
+`ZstdSharp.Port` (all managed) and is AOT-compatible. To build from source and run the examples:
 
 ```bash
 cd dotnet
