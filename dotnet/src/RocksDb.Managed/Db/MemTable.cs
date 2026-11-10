@@ -761,8 +761,9 @@ public sealed unsafe class MemTable : IDisposable
                     valueType = type;
                     return MemTableGetResult.Found;
                 case EntryType.ValuePreferredSeqno:
-                    // ParsePackedValueForValue: strip the trailing packed preferred seqno.
-                    value = EntryValue(ek);
+                    // ParsePackedValueForValue: strip the trailing packed preferred seqno. TimedPut entries are updated in
+                    // place too (MemTable::Update with kTypeValuePreferredSeqno), so they are read under the same lock.
+                    value = _locks is null ? EntryValue(ek) : CopyValueLocked(ek, entryUserKey);
                     value = value[..^sizeof(ulong)];
                     valueType = EntryType.Value;
                     return MemTableGetResult.Found;
@@ -931,10 +932,13 @@ public sealed unsafe class MemTable : IDisposable
 
     public bool IsEmpty => Volatile.Read(ref _firstSeqno) == 0;
 
-    /// <summary>Dynamically changes write_buffer_size (SetOptions).</summary>
+    /// <summary>
+    /// Dynamically changes write_buffer_size (SetOptions). Port of MemTable::UpdateWriteBufferSize: a memtable with a
+    /// bloom filter (sized for the write buffer size it was created with) only ever shrinks.
+    /// </summary>
     public void UpdateWriteBufferSize(long newWriteBufferSize)
     {
-        if (Volatile.Read(ref _flushState) == FlushNotRequested) Volatile.Write(ref _writeBufferSize, newWriteBufferSize);
+        if (_bloom is null || newWriteBufferSize < Volatile.Read(ref _writeBufferSize)) Volatile.Write(ref _writeBufferSize, newWriteBufferSize);
     }
 
     /// <summary>True once the memtable became full and nobody scheduled its flush yet.</summary>
