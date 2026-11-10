@@ -262,13 +262,11 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     /// <summary>RollbackWriteBatchBuilder of RollbackRecoveredTransaction (always Delete, no SingleDelete callback).</summary>
     private struct RecoveredRollbackBuilder(DbImpl db, WriteBatch dst, ReadCallback callback, bool rollbackMergeOperands) : IWriteBatchHandler
     {
-        private Dictionary<uint, HashSet<byte[]>>? _keys;
+        private RollbackKeySet? _keys;
 
         private void Rollback(uint cf, ReadOnlySpan<byte> key)
         {
-            _keys ??= new Dictionary<uint, HashSet<byte[]>>();
-            if (!_keys.TryGetValue(cf, out HashSet<byte[]>? set)) _keys[cf] = set = new HashSet<byte[]>(ByteKeyComparer.Instance);
-            if (!set.Add(key.ToArray())) return;
+            if (!(_keys ??= new RollbackKeySet(db)).Add(cf, key)) return;
             ColumnFamilyData cfd = db.GetColumnFamilyDataById(cf);
             Util.PooledBufferWriter value = Util.ObjectPools.RentWriter();
             try

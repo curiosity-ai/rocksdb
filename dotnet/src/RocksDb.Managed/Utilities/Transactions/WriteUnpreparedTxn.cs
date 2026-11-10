@@ -80,7 +80,7 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
     private protected override void AfterWrite()
     {
         if (Snapshot is { } snap) _largestValidatedSeq = Math.Max(_largestValidatedSeq, snap.SequenceNumber);
-        else _largestValidatedSeq = _db.Versions.LastSequence;
+        else _largestValidatedSeq = _db.LastPublishedSequence; // GetLastPublishedSequence (differs from LastSequence with two write queues)
     }
 
     private void PruneIterators() => _activeIterators.RemoveAll(static it => it.IsDisposed);
@@ -285,7 +285,7 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         using var rollbackBatch = new WriteBatchWithIndex(0, withNoop: false);
         var callback = new WritePreparedTxnReadCallback();
         callback.Init(_wpDb, DbFormat.MaxSequenceNumber, ReadCallback.MinUnCommittedSeq, SnapshotBackup.BackedByDbSnapshot);
-        WriteRollbackKeys(_tracked, includeUntracked: true, rollbackBatch, callback, null);
+        WriteRollbackKeys(_tracked, rollbackBatch, callback, null);
         // The Rollback marker will be used as a batch separator
         rollbackBatch.WriteBatch.MarkRollback(NameBytes);
         bool doOneWrite = !TwoWriteQueues;
@@ -337,9 +337,11 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         _unflushedSavePoints = null;
     }
 
-    /// <summary>WriteRollbackKeys: one Put / Delete per key into <paramref name="rollbackBatch"/>.</summary>
-    private void WriteRollbackKeys(LockTracker trackedKeys, bool includeUntracked, WriteBatchWithIndex rollbackBatch, ReadCallback callback,
-        ReadOptions? options)
+    /// <summary>
+    /// WriteRollbackKeys: one Put / Delete per key of <paramref name="trackedKeys"/> and, always (also for a rollback to
+    /// a save point), per untracked key into <paramref name="rollbackBatch"/>.
+    /// </summary>
+    private void WriteRollbackKeys(LockTracker trackedKeys, WriteBatchWithIndex rollbackBatch, ReadCallback callback, ReadOptions? options)
     {
         using var scratch = new WriteBatch();
         for (int i = 0; i < trackedKeys.ColumnFamilyCount; i++)
@@ -347,7 +349,6 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
             TrackedColumnFamily c = trackedKeys.GetColumnFamily(i);
             foreach (PooledKey key in c.Keys.Keys) WriteRollbackKey(rollbackBatch, c.Cfd, key.Span, options, callback);
         }
-        if (!includeUntracked) return;
         foreach (KeyValuePair<uint, List<byte[]>> cfKeys in _untrackedKeys)
         {
             ColumnFamilyData cfd = _db.GetColumnFamilyDataById(cfKeys.Key);
@@ -449,7 +450,7 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         var callback = new WriteUnpreparedTxnReadCallback(_wpDb, topSnapshot.SequenceNumber, topSnapshot.MinUncommitted, topSeqs,
             SnapshotBackup.BackedByDbSnapshot);
         using var restore = new WriteBatchWithIndex(0, withNoop: false);
-        WriteRollbackKeys(trackedKeys, includeUntracked: false, restore, callback, options);
+        WriteRollbackKeys(trackedKeys, restore, callback, options);
         var copy = new SavePointBatchHandler(_batch);
         restore.WriteBatch.Iterate(ref copy);
         FlushWriteBatchToDbInternal(prepared: false, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
