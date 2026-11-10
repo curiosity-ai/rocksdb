@@ -56,7 +56,8 @@ public static class TableFactory
             BlockRestartInterval = restart,
             IndexBlockRestartInterval = indexRestart,
             MetadataBlockSize = (int)options.MetadataBlockSize,
-            FormatVersion = (int)options.FormatVersion,
+            // InitializeOptions: a format_version older than the oldest one that can be written is raised to it.
+            FormatVersion = Math.Max((int)options.FormatVersion, BlockBasedTableConstants.MinSupportedFormatVersionForWrite),
             Checksum = options.Checksum,
             IndexType = options.IndexType,
             IndexShortening = options.IndexShortening,

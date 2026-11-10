@@ -972,7 +972,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
         if (versionBytes!.Length < 4) ThrowHelper.Corruption("bad external sst file version");
         uint version = Coding.DecodeFixed32(versionBytes);
-        if (version != 2)
+        if (version < 2)
         {
             if (version != 1) ThrowHelper.Corruption("An external sst file has corrupted version " + version + ".");
             if (hasSeqno) ThrowHelper.Corruption("An external sst file with version 1 has global seqno property");

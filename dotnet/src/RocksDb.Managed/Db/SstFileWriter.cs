@@ -45,6 +45,9 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     private byte[] _largestRangeDel = [];
     private ulong _numEntries;
     private ulong _numRangeDelEntries;
+    // Rep::db_session_id / next_file_number.
+    private readonly string _dbSessionId = NewSessionId();
+    private ulong _nextFileNumber = 1;
 
     /// <summary>Creates a writer for files ingested into a column family configured like <paramref name="options"/>.</summary>
     public SstFileWriter(ColumnFamilyOptions options) : this(options, LocalFileSystem.Instance)
@@ -99,15 +102,18 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     {
         ArgumentException.ThrowIfNullOrEmpty(filePath);
         if (_builder is not null) ThrowHelper.InvalidArgument("SstFileWriter is already open");
-        ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         TableBuilderOptions tbo = TableFactory.CreateExternalSstFileBuilderOptions(_options) with
         {
             ColumnFamilyId = _columnFamilyId,
             ColumnFamilyName = _columnFamilyName,
-            DbSessionId = NewSessionId(),
+            // SstFileWriter::Open: creation_time, oldest_key_time and file_creation_time are 0 (the ingesting DB stamps
+            // the file), the session id is kept for the life of the writer and each file gets the next fake file number
+            // ("rocksdb.original.file.number" 1, 2, ...).
+            DbSessionId = _dbSessionId,
+            FileNumber = _nextFileNumber,
             CreationTime = 0,
             OldestKeyTime = 0,
-            FileCreationTime = now,
+            FileCreationTime = 0,
             EmbeddedBlobMinSize = embeddedBlobMinSize,
         };
         _file = _fs.CreateWritable(filePath, truncate: true);
@@ -121,6 +127,7 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
             _file = null;
             throw;
         }
+        _nextFileNumber++;
         _path = filePath;
         _smallestKey = _smallestRangeDel = _largestRangeDel = [];
         _largestKey.Clear();
