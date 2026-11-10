@@ -23,6 +23,7 @@ internal sealed partial class DbImpl
         ValidateDbOptions(sanitized);
         SanitizeDbOptions(sanitized);
         SanitizeWalOptions(sanitized);
+        SanitizeWalDir(sanitized, dbname);
         var db = new DbImpl(dbname, sanitized);
         try
         {
@@ -35,6 +36,43 @@ internal sealed partial class DbImpl
             db.AbortOpen();
             throw;
         }
+    }
+
+    /// <summary>
+    /// The wal_dir part of SanitizeOptions (db/db_impl/db_impl_open.cc), in place: a wal_dir naming the DB directory
+    /// (with the default db_paths) is cleared, and one trailing '/' is removed, so the OPTIONS file records the same
+    /// value as native.
+    /// </summary>
+    internal static void SanitizeWalDir(DbOptions result, string dbname)
+    {
+        string walDir = result.WalDir;
+        // With explicit db_paths an empty wal_dir means the DB directory.
+        if (result.DbPaths.Count > 0 && walDir.Length == 0) walDir = dbname;
+        if (walDir.Length > 0)
+        {
+            string npath = NormalizePath(dbname + "/");
+            if (npath == NormalizePath(walDir + "/")
+                && (result.DbPaths.Count == 0 || npath == NormalizePath(result.DbPaths[0].Path + "/")))
+            {
+                walDir = "";
+            }
+        }
+        if (walDir.Length > 0 && walDir[^1] == '/') walDir = walDir[..^1];
+        result.WalDir = walDir;
+    }
+
+    /// <summary>Port of NormalizePath (file/filename.cc): collapses runs of separators, keeping a leading UNC "//".</summary>
+    private static string NormalizePath(string path)
+    {
+        char sep = Path.DirectorySeparatorChar;
+        var sb = new System.Text.StringBuilder(path.Length);
+        if (path.Length > 2 && path[0] == sep && path[1] == sep) sb.Append(sep, 2); // Handle UNC names
+        foreach (char c in path)
+        {
+            if (sb.Length > 0 && (c == sep || c == '/') && (sb[^1] == sep || sb[^1] == '/')) continue;
+            sb.Append(c);
+        }
+        return sb.ToString();
     }
 
     /// <summary>recovered_seq of DBImpl::Open: the next sequence after a point-in-time recovery found corruption, else MaxValue.</summary>
@@ -939,11 +977,14 @@ internal sealed partial class DbImpl
         {
             inserter.Run(record);
         }
-        catch (DuplicateKeySeqException e)
+        catch (Exception e) when (e is DuplicateKeySeqException or InsertRejectedException)
         {
             // InsertLogRecordToMemtable failed: MaybeIgnoreError, else the failure becomes the WAL's status (reported
             // like a read error). next_sequence is the inserter's sequence at the failing entry.
-            if (Options.ParanoidChecks) reporter.Corruption(record.Length, StatusCode.Corruption, e.Message, LogReporter.UnspecifiedLogNumber);
+            if (Options.ParanoidChecks)
+            {
+                reporter.Corruption(record.Length, e is RocksDbException r ? r.Code : StatusCode.Corruption, e.Message, LogReporter.UnspecifiedLogNumber);
+            }
             else LogWarn("Ignoring error Corruption: " + e.Message);
             CheckSeqnoNotSetBackDuringRecovery(progress.NextSequence, inserter.Sequence);
             progress.NextSequence = inserter.Sequence;

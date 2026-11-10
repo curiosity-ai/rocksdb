@@ -15,4 +15,24 @@
     <!-- Version of the native rocksdb NuGet package (rocksdb-sharp) used as the reference implementation in tests/benchmarks. -->
     <NativeRocksDbPackageVersion>11.12.0.7385</NativeRocksDbPackageVersion>
   </PropertyGroup>
+
+  <!-- NuGet metadata for the packages built from src/ (.azure-devops/nuget-rocksdb-managed.yml); the pipeline sets Version. -->
+  <PropertyGroup>
+    <Authors>Curiosity GmbH</Authors>
+    <Company>Curiosity GmbH</Company>
+    <!-- Upstream RocksDB is GPLv2 or Apache 2.0 at the licensee's option; the port takes Apache 2.0. Code derived from
+         other components is attributed in THIRD-PARTY-NOTICES.txt, which every package carries. -->
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/curiosity-ai/rocksdb/tree/main/dotnet</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/curiosity-ai/rocksdb</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>rocksdb;key-value;storage;database;lsm;embedded</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(TF_BUILD)' == 'true'">
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+  </PropertyGroup>
 </Project>

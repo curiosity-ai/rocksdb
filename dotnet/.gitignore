@@ -3,3 +3,4 @@ obj/
 BenchmarkDotNet.Artifacts/
 TestResults/
 *.user
+artifacts/

@@ -18,7 +18,8 @@ byte[]? value = await db.GetAsync("hello"u8.ToArray());
 
 Contents: [Status and compatibility](#status-and-compatibility) |
 [Build](#build-and-install) | [Quick start](#quick-start) | [API tour](#api-tour) |
-[Error handling](#error-handling) | [Known deviations and gaps](#known-deviations-and-gaps) | [Documentation](#documentation)
+[Error handling](#error-handling) | [Known deviations and gaps](#known-deviations-and-gaps) | [Documentation](#documentation) |
+[License](#license)
 
 ## Status and compatibility
 
@@ -75,14 +76,21 @@ Raft cluster, optional gRPC transport) is a separate library on top of the engin
 
 ## Build and install
 
-There is no NuGet package yet. Reference the project from your solution:
+Install from NuGet:
 
-```xml
-<ProjectReference Include="path/to/dotnet/src/RocksDb.Managed/RocksDb.Managed.csproj" />
+| Package | Contents |
+|---|---|
+| [`RocksDb.Managed`](https://www.nuget.org/packages/RocksDb.Managed) | the storage engine |
+| [`RocksDb.Managed.Replication`](https://www.nuget.org/packages/RocksDb.Managed.Replication) | replication, planned switchover and the Raft cluster layer |
+| [`RocksDb.Managed.Replication.MagicOnion`](https://www.nuget.org/packages/RocksDb.Managed.Replication.MagicOnion) | gRPC (MagicOnion) transport for the replication layer |
+
+```bash
+dotnet add package RocksDb.Managed
 ```
 
-The library depends on `System.IO.Hashing`, `Snappier`, `K4os.Compression.LZ4` and `ZstdSharp.Port` (all managed)
-and is AOT-compatible. To build the solution and run the examples:
+The packages are built and published by [`.azure-devops/nuget-rocksdb-managed.yml`](.azure-devops/nuget-rocksdb-managed.yml)
+(version `yy.M.<build id>`). The library depends on `System.IO.Hashing`, `Snappier`, `K4os.Compression.LZ4` and
+`ZstdSharp.Port` (all managed) and is AOT-compatible. To build from source and run the examples:
 
 ```bash
 cd dotnet
@@ -1409,3 +1417,10 @@ miss. See [docs/benchmarks.md](docs/benchmarks.md).
 | [docs/validation.md](docs/validation.md) | file-by-file audit of the port against the C++ sources |
 | [src/RocksDb.Managed.Replication/README.md](src/RocksDb.Managed.Replication/README.md) | replication, switchover and Raft cluster layer |
 | [CLAUDE.md](CLAUDE.md) | contributor guide: goals, layout, porting conventions, API design rules |
+
+## License
+
+RocksDb.Managed is licensed under the [Apache License, Version 2.0](../LICENSE.Apache). It is a port of RocksDB, which
+is available under the GPLv2 or the Apache License 2.0 at the licensee's option; this port uses it under Apache 2.0.
+Code derived from LevelDB, xxHash, MurmurHash and the .NET runtime is attributed in
+[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), which every package also carries.

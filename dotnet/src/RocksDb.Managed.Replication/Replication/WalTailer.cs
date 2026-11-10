@@ -14,13 +14,14 @@ namespace RocksDb.Managed.Replication;
 /// </summary>
 public readonly struct WalChunk
 {
-    internal WalChunk(ulong firstSequenceNumber, ulong nextSequenceNumber, int entryCount, int batchCount, ReadOnlyMemory<byte> memory)
+    internal WalChunk(ulong firstSequenceNumber, ulong nextSequenceNumber, int entryCount, int batchCount, byte[] buffer, int length)
     {
         FirstSequenceNumber = firstSequenceNumber;
         NextSequenceNumber = nextSequenceNumber;
         EntryCount = entryCount;
         BatchCount = batchCount;
-        Memory = memory;
+        Buffer = buffer;
+        Memory = buffer.AsMemory(0, length);
     }
 
     /// <summary>The sequence number of the first entry in the chunk.</summary>
@@ -37,6 +38,12 @@ public readonly struct WalChunk
 
     /// <summary>The serialized merged write batch.</summary>
     public ReadOnlyMemory<byte> Memory { get; }
+
+    /// <summary>
+    /// The tailer's buffer holding the chunk: the merged write batch is its first <see cref="Length"/> bytes (rocksdb-sharp
+    /// <c>WalChunk.Buffer</c>). Same lifetime as <see cref="Memory"/>; never write to it.
+    /// </summary>
+    public byte[] Buffer { get; }
 
     public ReadOnlySpan<byte> Data => Memory.Span;
     public int Length => Memory.Length;
@@ -90,6 +97,25 @@ public sealed class WalTailer : IDisposable
 
     /// <summary>The first sequence number this tailer has not handed out yet.</summary>
     public ulong NextSequenceNumber => _nextSequenceNumber;
+
+    /// <summary>
+    /// How a start sequence number inside a multi-entry write batch is handled. False (default): the first read throws
+    /// <see cref="RocksDbException"/> with <see cref="StatusCode.InvalidArgument"/>, since a batch is applied atomically.
+    /// True: the first chunk starts with that whole batch (<see cref="WalChunk.FirstSequenceNumber"/> is the batch's own
+    /// first sequence, below the requested one), like rocksdb-sharp's <c>WalTailer</c> and <c>GetUpdatesSince</c>; the
+    /// receiver must skip the entries it already has. Set it before the first read.
+    /// </summary>
+    public bool IncludeBatchContainingStart
+    {
+        get => _includeBatchContainingStart;
+        set
+        {
+            if (_iterator is not null) throw new InvalidOperationException("IncludeBatchContainingStart must be set before the first read.");
+            _includeBatchContainingStart = value;
+        }
+    }
+
+    private bool _includeBatchContainingStart;
 
     /// <summary>True when the database holds sequence numbers this tailer has not read yet.</summary>
     public bool HasUpdates => _nextSequenceNumber <= _db.GetLatestSequenceNumber();
@@ -149,8 +175,12 @@ public sealed class WalTailer : IDisposable
                             "NotFound: WAL data for sequence " + _nextSequenceNumber + " is no longer available (next batch starts at " + batchSeq + ")");
                     }
                     // The requested sequence is inside a batch: a batch is applied atomically, so it cannot be split.
-                    throw new RocksDbException(StatusCode.InvalidArgument,
-                        "Invalid argument: sequence " + _nextSequenceNumber + " is inside the WAL batch " + batchSeq + ".." + (afterBatch - 1));
+                    // Only the start can be inside one; later batches follow on from the previous one.
+                    if (_started || !_includeBatchContainingStart)
+                    {
+                        throw new RocksDbException(StatusCode.InvalidArgument,
+                            "Invalid argument: sequence " + _nextSequenceNumber + " is inside the WAL batch " + batchSeq + ".." + (afterBatch - 1));
+                    }
                 }
                 ReadOnlySpan<byte> body = batch.Span[HeaderSize..];
                 EnsureCapacity(length + body.Length);
@@ -168,7 +198,7 @@ public sealed class WalTailer : IDisposable
         if (entryCount == 0) return false;
         BinaryPrimitives.WriteUInt64LittleEndian(_buffer, firstSequenceNumber);
         BinaryPrimitives.WriteInt32LittleEndian(_buffer.AsSpan(sizeof(ulong)), entryCount);
-        chunk = new WalChunk(firstSequenceNumber, _nextSequenceNumber, entryCount, batchCount, _buffer.AsMemory(0, length));
+        chunk = new WalChunk(firstSequenceNumber, _nextSequenceNumber, entryCount, batchCount, _buffer, length);
         return true;
     }
 

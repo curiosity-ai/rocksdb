@@ -338,6 +338,12 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     /// <summary>The DB directory.</summary>
     public string Path => _db.DbName;
 
+    /// <summary>
+    /// The directory the WAL files are written to (ImmutableDBOptions::GetWalDir): <see cref="DbOptions.WalDir"/>, or
+    /// the DB directory when that is empty. Archived WALs are in its <c>archive</c> subdirectory.
+    /// </summary>
+    public string WalDir => _db.WalDir;
+
     /// <summary>The DB identity (IDENTITY file / MANIFEST db id).</summary>
     public string DbId => _db.Identity.DbId;
 

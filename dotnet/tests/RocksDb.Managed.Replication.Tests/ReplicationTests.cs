@@ -434,6 +434,27 @@ public sealed class ReplicationTests
             t.TryReadChunk(out _);
         });
         Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+
+        // Opted in (rocksdb-sharp's behaviour), the tail starts with the whole batch containing the requested sequence.
+        using (WalTailer t = new ReplicationSource(source).TailWal(2))
+        {
+            t.IncludeBatchContainingStart = true;
+            Assert.IsTrue(t.TryReadChunk(out WalChunk chunk));
+            Assert.AreEqual(1UL, chunk.FirstSequenceNumber, "the containing batch's own first sequence");
+            // The merged chunk's header carries the summed entry count; the containing batch's records come first.
+            CollectionAssert.AreEqual(batches[0][..8], chunk.Data[..8].ToArray(), "header sequence");
+            CollectionAssert.AreEqual(batches[0][12..], chunk.Data[12..batches[0].Length].ToArray(), "the containing batch's records, whole");
+            CollectionAssert.AreEqual(chunk.Data.ToArray(), chunk.Buffer.AsSpan(0, chunk.Length).ToArray(), "Buffer starts with the chunk");
+            Assert.ThrowsExactly<InvalidOperationException>(() => t.IncludeBatchContainingStart = false);
+        }
+        // A start on a batch boundary is unaffected by the option.
+        ulong boundary = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(batches[1]);
+        using (WalTailer t = new ReplicationSource(source).TailWal(boundary))
+        {
+            t.IncludeBatchContainingStart = true;
+            Assert.IsTrue(t.TryReadChunk(out WalChunk chunk));
+            Assert.AreEqual(boundary, chunk.FirstSequenceNumber);
+        }
     }
 
     [TestMethod]

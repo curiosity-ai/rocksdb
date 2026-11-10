@@ -329,4 +329,27 @@ public sealed class WriteBufferManagerTests
         Assert.AreEqual(0, wbm.MemoryUsage);
         WaitFor(() => wbm.DummyEntriesInCacheUsage == 0);
     }
+
+    /// <summary>
+    /// An empty memtable charges the manager only the arena's 2 KiB inline block (memory/arena.cc Arena::Arena), so many
+    /// idle column families do not fill it; the managed arena used to take a whole arena block (1 MiB) per memtable.
+    /// A flushed memtable's block is released and its successor again charges only the inline block.
+    /// </summary>
+    [TestMethod]
+    public void EmptyMemtablesChargeOnlyTheInlineBlock()
+    {
+        MemoryFileSystem fs = DbTestUtil.NewFs();
+        var wbm = new WriteBufferManager(32 * Mib, null, allowStall: false);
+        var cfs = new List<ColumnFamilyDescriptor> { new(ColumnFamilyDescriptor.DefaultColumnFamilyName, new ColumnFamilyOptions()) };
+        for (int i = 0; i < 40; i++) cfs.Add(new ColumnFamilyDescriptor("cf" + i, new ColumnFamilyOptions()));
+        using RocksDatabase db = RocksDatabase.Open(DbTestUtil.DbPath, new DbOptions { CreateIfMissing = true, CreateMissingColumnFamilies = true, FileSystem = fs, WriteBufferManager = wbm }, cfs);
+        Assert.AreEqual(41 * (long)Memory.Arena.InlineSize, wbm.MemoryUsage);
+        Assert.IsFalse(wbm.ShouldFlush());
+        ColumnFamily cf = db.GetColumnFamily("cf0");
+        for (int i = 0; i < 2000; i++) cf.Put(DbTestUtil.Key(i), new byte[100]);
+        Assert.IsTrue(wbm.MemoryUsage > 41 * (long)Memory.Arena.InlineSize);
+        cf.Flush();
+        Assert.AreEqual(41 * (long)Memory.Arena.InlineSize, wbm.MemoryUsage);
+        Assert.IsTrue(cf.GetIntProperty(DbProperties.CurSizeActiveMemTable) <= (ulong)Memory.Arena.InlineSize);
+    }
 }
