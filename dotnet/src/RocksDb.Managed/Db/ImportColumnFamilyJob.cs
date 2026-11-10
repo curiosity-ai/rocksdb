@@ -162,12 +162,13 @@ internal sealed class ImportColumnFamilyJob
                 if (f.Properties is not null) meta.SetEntryStats(f.Properties);
                 levels[src.Level].Add(meta);
             }
-            // VersionBuilder::SaveTo: L0 newest first (by epoch number, then seqno), other levels by smallest key; the
-            // consistency check rejects overlapping files in a sorted level.
+            // VersionBuilder::SaveTo on the dummy VersionStorageInfo (EpochNumberRequirement::kMightMissing): L0 is ordered
+            // newest first by NewestFirstBySeqNo (largest seqno, smallest seqno, file number), not by the exported epoch
+            // numbers, which are reassigned below; other levels by smallest key; the consistency check rejects
+            // overlapping files in a sorted level.
             levels[0].Sort(static (a, b) =>
             {
-                int c = b.EpochNumber.CompareTo(a.EpochNumber);
-                if (c == 0) c = b.LargestSeqno.CompareTo(a.LargestSeqno);
+                int c = b.LargestSeqno.CompareTo(a.LargestSeqno);
                 if (c == 0) c = b.SmallestSeqno.CompareTo(a.SmallestSeqno);
                 return c != 0 ? c : b.FileNumber.CompareTo(a.FileNumber);
             });

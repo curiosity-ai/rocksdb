@@ -136,10 +136,9 @@ internal sealed class ExternalSstFileIngestionJob
         IReadOnlyList<string>? filesChecksumFuncNames, Temperature fileTemperature, IngestReplaceRange? atomicReplaceRange, VersionStorageInfo vstorage,
         bool synchronous, CancellationToken ct)
     {
-        var paths = new HashSet<string>(StringComparer.Ordinal);
+        // Like upstream, a path listed twice is not rejected: the copies are overlapping files with their own seqnos.
         foreach (string path in externalFiles)
         {
-            if (!paths.Add(path)) ThrowHelper.InvalidArgument("External files should be distinct: duplicate " + path);
             FileInfoResult f = GetIngestedFileInfo(path);
             // Files generated in another DB or CF may have a different column family ID, so we let it pass here.
             if (f.CfId != TableProperties.UnknownColumnFamily && f.CfId != _cfd.Id && !_options.AllowDbGeneratedFiles)
@@ -751,12 +750,51 @@ internal sealed class ExternalSstFileIngestionJob
     private bool MemOverlaps(MemTable mem, ReadOnlySpan<byte> start, ReadOnlySpan<byte> limit, bool rangeLimitExclusive)
     {
         if (mem.IsEmpty) return false;
-        if (mem.NumRangeDeletes > 0) return true; // conservative
         MemTableIterator it = mem.NewIterator();
         it.Seek(SeekKey(start));
-        if (!it.Valid) return false;
-        int cmp = _cfd.UserComparator.CompareWithoutTimestamp(DbFormat.ExtractUserKey(it.Key), limit);
-        return rangeLimitExclusive ? cmp < 0 : cmp <= 0;
+        if (it.Valid)
+        {
+            int cmp = _cfd.UserComparator.CompareWithoutTimestamp(DbFormat.ExtractUserKey(it.Key), limit);
+            if (rangeLimitExclusive ? cmp < 0 : cmp <= 0) return true;
+        }
+        // ColumnFamilyData::RangesOverlapWithMemtables: range_del_agg.IsRangeOverlapped(start, limit, exclusive). Only a
+        // range tombstone intersecting the range counts, not the mere presence of one in the memtable.
+        return mem.NumRangeDeletes > 0 && RangeTombstonesOverlap(mem.GetFragmentedRangeTombstones(), start, limit, rangeLimitExclusive, null);
+    }
+
+    /// <summary>
+    /// Port of RangeDelAggregator::StripeRep::IsRangeOverlapped for one fragmented tombstone list: true if a tombstone
+    /// [ts, te) intersects the user key range [<paramref name="start"/>, <paramref name="limit"/>] (or [start, limit)
+    /// with <paramref name="limitExclusive"/>). With <paramref name="file"/> the tombstones are truncated to the table
+    /// file's boundaries like TruncatedRangeDelIterator (a largest key that is a range tombstone sentinel is exclusive).
+    /// Keys are compared without timestamps.
+    /// </summary>
+    private bool RangeTombstonesOverlap(FragmentedRangeTombstoneList list, ReadOnlySpan<byte> start, ReadOnlySpan<byte> limit, bool limitExclusive,
+        FileMetaData? file)
+    {
+        Comparator ucmp = _cfd.UserComparator;
+        for (int i = 0; i < list.Count; i++)
+        {
+            // Fragments are ordered by start key: nothing past the limit can overlap.
+            int c = ucmp.CompareWithoutTimestamp(list.GetStart(i), limit);
+            if (limitExclusive ? c >= 0 : c > 0) break;
+            ReadOnlySpan<byte> end = list.GetEnd(i);
+            if (file is not null)
+            {
+                ReadOnlySpan<byte> fileLargest = DbFormat.ExtractUserKey(file.Largest);
+                if (ucmp.CompareWithoutTimestamp(end, fileLargest) > 0)
+                {
+                    // Truncated at the file's largest key: inclusive for a point key, exclusive for a sentinel.
+                    DbFormat.UnpackSequenceAndType(DbFormat.ExtractFooter(file.Largest), out ulong seq, out EntryType type);
+                    bool sentinel = seq == DbFormat.MaxSequenceNumber && type == EntryType.RangeDeletion;
+                    int cl = ucmp.CompareWithoutTimestamp(start, fileLargest);
+                    if (sentinel ? cl < 0 : cl <= 0) return true;
+                    continue;
+                }
+            }
+            if (ucmp.CompareWithoutTimestamp(start, end) < 0) return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -1109,10 +1147,18 @@ internal sealed class ExternalSstFileIngestionJob
             {
                 continue;
             }
-            if (_cfd.TableCache.GetRangeTombstones(lf) is not null) return true; // conservative
-            using Iterators.InternalIterator it = _cfd.TableCache.NewIterator(lf);
-            it.Seek(seek);
-            if (it.Valid && ucmp.CompareWithoutTimestamp(DbFormat.ExtractUserKey(it.Key), f.LargestUserKey) <= 0) return true;
+            using (Iterators.InternalIterator it = _cfd.TableCache.NewIterator(lf))
+            {
+                it.Seek(seek);
+                if (it.Valid && ucmp.CompareWithoutTimestamp(DbFormat.ExtractUserKey(it.Key), f.LargestUserKey) <= 0) return true;
+            }
+            // range_del_agg.IsRangeOverlapped(smallest_user_key, largest_user_key, end_exclusive = false) over the range
+            // tombstones of the files the level iterator opened.
+            if (_cfd.TableCache.GetRangeTombstones(lf) is { } tombstones
+                && RangeTombstonesOverlap(tombstones, f.SmallestUserKey, f.LargestUserKey, limitExclusive: false, lf))
+            {
+                return true;
+            }
         }
         return false;
     }
