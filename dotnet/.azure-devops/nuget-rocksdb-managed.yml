@@ -46,14 +46,14 @@ steps:
       Write-Host "##vso[task.setvariable variable=targetVersion;]$newTargetVersion"
       Write-Host "Package version: $newTargetVersion"
 
-# The SDK pinned by dotnet/global.json (a .NET 11 prerelease, hence includePreviewVersions) builds both
-# target frameworks, net10.0 and net11.0.
+# One .NET 11 SDK builds both target frameworks, net10.0 and net11.0. .NET 11 is still a prerelease, so
+# includePreviewVersions is required: without it 11.x matches no SDK. dotnet/global.json pins the minimum
+# (rollForward latestMajor, allowPrerelease), which the latest 11.x preview satisfies.
 - task: UseDotNet@2
   displayName: 'Use .NET 11.0 SDK'
   inputs:
     packageType: sdk
-    useGlobalJson: true
-    workingDirectory: '$(dotnetDir)'
+    version: 11.x
     includePreviewVersions: true
     installationPath: $(Agent.ToolsDirectory)/dotnet
 
