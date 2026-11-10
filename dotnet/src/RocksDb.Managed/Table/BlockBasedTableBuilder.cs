@@ -163,6 +163,7 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
             IFilterBitsBuilder bits = policy.CreateBuilder(new FilterBuildingContext(options.FormatVersion, tableBuilderOptions.LevelAtCreation, tableBuilderOptions.IsFlush)
             {
                 OptimizeFiltersForMemory = options.OptimizeFiltersForMemory,
+                CompactionStyle = tableBuilderOptions.CompactionStyle,
             });
             if (options.DetectFilterConstructCorruption) bits = new VerifyingFilterBitsBuilder(bits, policy);
             if (options.PartitionFilters && partitionedIndex is not null)

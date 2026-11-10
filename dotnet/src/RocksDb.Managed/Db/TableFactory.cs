@@ -240,6 +240,7 @@ public static class TableFactory
             PrefixExtractor = options.PrefixExtractor,
             LevelAtCreation = where.Level,
             IsFlush = where.IsFlush,
+            CompactionStyle = options.CompactionStyle,
             OptimizeFiltersForHits = options.OptimizeFiltersForHits,
             PersistUserDefinedTimestamps = options.PersistUserDefinedTimestamps,
             TablePropertiesCollectorFactories = options.TablePropertiesCollectorFactories.ToArray(),

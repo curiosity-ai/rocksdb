@@ -197,7 +197,8 @@ public sealed class RibbonFilterPolicy : BloomLikeFilterPolicy
         // INT_MAX is reserved for "always use Bloom".
         int levelish = int.MaxValue - 1;
         int bloomBeforeLevel = _bloomBeforeLevel;
-        if (bloomBeforeLevel < int.MaxValue)
+        // FIFO and "none" compaction styles are treated as bottommost (RibbonFilterPolicy::GetBuilderWithContext).
+        if (bloomBeforeLevel < int.MaxValue && context.CompactionStyle is CompactionStyle.Level or CompactionStyle.Universal)
         {
             if (context.IsFlush)
             {

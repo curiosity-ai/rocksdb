@@ -163,6 +163,9 @@ public abstract class BuiltinFilterBitsReader : IFilterBitsReader
 
         if (subImplVal == 0 && log2BlockBytes == 6) // FastLocalBloom; only block size supported for now
         {
+            // A filter shorter than one cache line has no line to probe (upstream would read past its end; the builder
+            // never writes one). Return something safe.
+            if (len < 64) return AlwaysTrueFilter.Instance;
             return new FastLocalBloomBitsReader(contents[..len], numProbes);
         }
         // otherwise

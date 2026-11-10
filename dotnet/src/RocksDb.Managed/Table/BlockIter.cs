@@ -76,6 +76,14 @@ public sealed class BlockIter : IDisposable
     private bool _valueDeltaEscape;
     private bool _haveFirstKey;
     private ulong _globalSeqno = DisableGlobalSequenceNumber;
+    // Global seqno override: the key buffer holds the exposed key (footer rewritten by ApplyGlobalSeqno) while delta
+    // decoding needs the stored key (upstream keeps raw_key_ and key_buf_ apart). _rawFooter is the stored footer of the
+    // key in _keyBuf; it is put back before the next entry is delta-decoded against it.
+    private bool _footerPatched;
+    private ulong _rawFooter;
+    // Shortest well-formed key: internal keys carry an 8-byte footer. Shorter ones are reported as Corruption instead
+    // of reaching the comparator (upstream only asserts).
+    private int _minKeyLen;
 
     // persist_user_defined_timestamps = false (pad_min_timestamp_): keys are stored without their user-defined timestamp
     // of _padTsSize bytes; the stored ("raw") key is kept in _rawKeyBuf as the delta base and the exposed key in _keyBuf
@@ -161,6 +169,8 @@ public sealed class BlockIter : IDisposable
     {
         _slowParse = _valueDeltaEncoded || _padTsSize != 0 || _valuesSection >= 0;
         _restartKeyFixup = _padTsSize != 0 || (_globalSeqno != DisableGlobalSequenceNumber && _keysAreInternal);
+        // With stripped timestamps the stored key is validated when it is padded (PadMinTimestampInternal).
+        _minKeyLen = _keysAreInternal && _padTsSize == 0 ? DbFormat.InternalKeyFooterSize : 0;
     }
 
     /// <summary>
@@ -210,10 +220,12 @@ public sealed class BlockIter : IDisposable
         _rawKeyLen = 0;
         _slowParse = false;
         _restartKeyFixup = false;
+        _minKeyLen = 0;
         _interpolationSearch = false;
         _handle = default;
         _keyLen = 0;
         _keyInBuf = true;
+        _footerPatched = false;
         _prevIdx = -1;
         _prevCount = 0;
         Invalidate();
@@ -384,6 +396,7 @@ public sealed class BlockIter : IDisposable
         e.ValueOffset = _valueOffset;
         e.ValueLength = _valueLength;
         e.KeyLength = _keyLen;
+        e.RawFooter = _rawFooter;
         e.KeyInBlock = !_keyInBuf;
         if (!_keyInBuf)
         {
@@ -422,6 +435,9 @@ public sealed class BlockIter : IDisposable
             if (_keyBuf.Length < e.KeyLength) EnsureKeyCapacity(e.KeyLength);
             _prevKeyBuf.AsSpan(e.KeyOffset, e.KeyLength).CopyTo(_keyBuf);
             _keyInBuf = true;
+            // The cached key is the exposed one: a following Next must delta-decode against the stored footer.
+            _rawFooter = e.RawFooter;
+            _footerPatched = _globalSeqno != DisableGlobalSequenceNumber && _keysAreInternal;
         }
     }
 
@@ -434,6 +450,7 @@ public sealed class BlockIter : IDisposable
         public int KeyLength;
         public int ValueOffset;
         public int ValueLength;
+        public ulong RawFooter; // stored footer of a key whose footer carries the global seqno
         public bool KeyInBlock;
     }
 
@@ -955,9 +972,14 @@ public sealed class BlockIter : IDisposable
                 CopyKeyBytes(ref kb, ref Unsafe.Add(ref db, (uint)_keyBlockOffset), shared);
                 _keyInBuf = true;
             }
+            else if (_footerPatched)
+            {
+                RestoreRawFooter();
+            }
             CopyKeyBytes(ref Unsafe.Add(ref kb, shared), ref Unsafe.Add(ref db, (uint)p), nonShared);
             _keyLen = newLen;
         }
+        if (_keyLen < _minKeyLen) return CorruptionError();
 
         int valueStart = p + (int)nonShared;
         if (_kind == BlockIterKind.Index)
@@ -1008,7 +1030,21 @@ public sealed class BlockIter : IDisposable
         if (_keyLen < DbFormat.InternalKeyFooterSize) { CorruptionError(); return; }
         Span<byte> footer = _keyBuf.AsSpan(_keyLen - DbFormat.InternalKeyFooterSize, DbFormat.InternalKeyFooterSize);
         EntryType t = (EntryType)footer[0];
+        _rawFooter = Coding.DecodeFixed64(footer);
+        _footerPatched = true;
         Coding.EncodeFixed64(footer, DbFormat.PackSequenceAndType(_globalSeqno, t));
+    }
+
+    /// <summary>
+    /// Puts the stored footer back into the key buffer before the next entry is delta-decoded against it: its shared
+    /// bytes may reach into the previous key's footer (a user key that extends the previous user key by footer bytes).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void RestoreRawFooter()
+    {
+        _footerPatched = false;
+        if (_keyLen >= DbFormat.InternalKeyFooterSize)
+            Coding.EncodeFixed64(_keyBuf.AsSpan(_keyLen - DbFormat.InternalKeyFooterSize, DbFormat.InternalKeyFooterSize), _rawFooter);
     }
 
     private void EnsureKeyCapacity(int len)
@@ -1248,7 +1284,7 @@ public sealed class BlockIter : IDisposable
         int p = DecodeEntry(offset, _keysEnd, out uint shared, out uint nonShared, out _);
         // Separated key/value storage: restart entries carry the value offset after the header (DecodeKey with value_offset).
         if (p >= 0 && _valuesSection >= 0) p = SkipVarint32(p, _keysEnd);
-        if (p < 0 || shared != 0 || nonShared > (uint)(_keysEnd - p))
+        if (p < 0 || shared != 0 || nonShared > (uint)(_keysEnd - p) || _prefixLength + (long)nonShared < _minKeyLen)
         {
             CorruptionError();
             return default;
