@@ -345,6 +345,8 @@ internal sealed partial class DbImpl
     public TransactionLogIterator GetUpdatesSince(ulong seq, bool verifyChecksums)
     {
         ThrowIfDisposed();
+        // DBImpl::GetUpdatesSince: the iterator assumes one sequence number per update (batch sequence + count - 1).
+        if (_seqPerBatch) ThrowHelper.NotSupported("This API is not yet compatible with write-prepared/write-unprepared transactions");
         if (seq > Versions.LastSequence) throw new RocksDbException(StatusCode.NotFound, "NotFound: Requested sequence not yet written in the db");
         List<WalFileInfo> files = GetSortedWalFiles(includeArchived: true);
         RetainProbableWalFiles(files, seq);

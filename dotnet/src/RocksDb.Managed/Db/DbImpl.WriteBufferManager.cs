@@ -180,6 +180,11 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
             Task blocked = stall.Block();
             wbm.BeginWriteStall(stall);
             bool retryLocalFlush = false;
+            // First block future writer threads who want to add themselves to the queue of WriteThread (the queued
+            // no_slowdown writers fail with Incomplete "Write stall").
+            _writeThread.BeginWriteStall();
+            try
+            {
             if (wbm.FlushPolicy == WriteBufferFlushPolicy.FlushLargestAcrossDbs)
             {
                 while (true)
@@ -204,6 +209,11 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
                     if (synchronous) blocked.Wait(100, cancellationToken);
                     else await Task.WhenAny(blocked, Task.Delay(100, cancellationToken)).ConfigureAwait(false);
                 }
+            }
+            }
+            finally
+            {
+                _writeThread.EndWriteStall();
             }
             if (IsDisposed || _shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
             if (!retryLocalFlush || !wbm.ShouldStall()) break;

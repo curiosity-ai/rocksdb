@@ -369,6 +369,8 @@ internal sealed partial class DbImpl
     private async ValueTask DelayWriteAsync(bool noSlowdown, bool synchronous, CancellationToken cancellationToken, bool countGroupBytes)
     {
         WriteController wc = WriteControllerInstance;
+        // The write queue whose leader is stalling: the main queue, or the WAL-only queue (two_write_queues).
+        WriteThread stallThread = countGroupBytes || _nonmemWriteThread is null ? _writeThread : _nonmemWriteThread;
         ulong delayMicros = 0;
         lock (_mutex)
         {
@@ -390,10 +392,19 @@ internal sealed partial class DbImpl
             // We will delay the write until we have slept for `delay` microseconds or we don't need a delay anymore
             // (checked every ~1 ms: kDelayInterval, the WriteController's minimum delay).
             long stallEnd = System.Diagnostics.Stopwatch.GetTimestamp() + (long)(delayMicros * (System.Diagnostics.Stopwatch.Frequency / 1e6));
-            while (wc.NeedsDelay && System.Diagnostics.Stopwatch.GetTimestamp() < stallEnd)
+            // Notify write_thread about the stall so it can setup a barrier and fail any pending writers with no_slowdown
+            stallThread.BeginWriteStall();
+            try
             {
-                if (synchronous) Thread.Sleep(1);
-                else await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+                while (wc.NeedsDelay && System.Diagnostics.Stopwatch.GetTimestamp() < stallEnd)
+                {
+                    if (synchronous) Thread.Sleep(1);
+                    else await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                stallThread.EndWriteStall();
             }
         }
         while (true)
@@ -407,8 +418,18 @@ internal sealed partial class DbImpl
                 wait = _bgSignal.Task;
             }
             if (noSlowdown) throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Write stall");
-            if (synchronous) wait.Wait(cancellationToken);
-            else await wait.WaitAsync(cancellationToken).ConfigureAwait(false);
+            // Notify write_thread about the stall so it can setup a barrier and fail any pending writers with no_slowdown
+            stallThread.BeginWriteStall();
+            try
+            {
+                TestHooks.Invoke("DBImpl::DelayWrite:Wait");
+                if (synchronous) wait.Wait(cancellationToken);
+                else await wait.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                stallThread.EndWriteStall();
+            }
         }
     }
 
