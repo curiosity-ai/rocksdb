@@ -58,6 +58,7 @@ public sealed class LruCache : BlockCache
     private readonly uint _shardMask;
     private long _capacity;
     private bool _strict;
+    private readonly CacheMetadataChargePolicy _metadataChargePolicy;
 
     public LruCache(LruCacheOptions options)
     {
@@ -71,6 +72,7 @@ public sealed class LruCache : BlockCache
         _shardMask = (uint)(numShards - 1);
         _capacity = options.Capacity;
         _strict = options.StrictCapacityLimit;
+        _metadataChargePolicy = options.MetadataChargePolicy;
         _shards = new LruCacheShard[numShards];
         long perShard = PerShardCapacity(options.Capacity, numShards);
         for (int i = 0; i < numShards; i++)
@@ -81,6 +83,11 @@ public sealed class LruCache : BlockCache
     }
 
     public override string Name => "LRUCache";
+
+    // LRUCache::GetCharge: total_charge minus the metadata charge (LRUHandle::GetCharge). Standalone entries created
+    // through the base class carry no metadata charge.
+    internal override long GetCharge(in CachedBlock handle) =>
+        handle.Entry is LruEntry && _metadataChargePolicy == CacheMetadataChargePolicy.FullCharge ? handle.Charge - EntryMetadataCharge : handle.Charge;
 
     public int NumShards => _shards.Length;
 

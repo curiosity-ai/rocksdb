@@ -741,15 +741,17 @@ internal sealed class ClockShard
         ulong oldState = ClockSlot.State(oldMeta);
         if (oldState == ClockSlot.StateEmpty)
         {
-            // Took ownership of an available slot: save data fields, then publish (MarkVisible).
+            // Took ownership of an available slot: save data fields, then publish (FinishSlotInsert: the acquire counter
+            // is the initial countdown and a kept reference lowers the release counter, so releasing the insert's handle
+            // leaves the countdown at its initial value instead of counting as a use).
             h.SetValue(value);
             h.Key = key;
             h.H1 = h1;
             h.H2 = h2;
             h.TotalCharge = totalCharge;
             ulong meta = (ClockSlot.StateVisible << ClockSlot.StateShift)
-                | ((initialCountdown + (takeRef ? 1UL : 0)) << ClockSlot.AcquireCounterShift)
-                | (initialCountdown << ClockSlot.ReleaseCounterShift);
+                | (initialCountdown << ClockSlot.AcquireCounterShift)
+                | ((initialCountdown - (takeRef ? 1UL : 0)) << ClockSlot.ReleaseCounterShift);
             Volatile.Write(ref h.Meta, unchecked((long)meta));
             return true;
         }

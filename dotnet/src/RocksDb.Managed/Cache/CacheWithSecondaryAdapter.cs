@@ -311,7 +311,7 @@ internal sealed class CacheWithSecondaryAdapter : BlockCache
     public override bool TryInsert(in CacheKey key, in CacheValue value, long charge, CachePriority priority, out CachedBlock block)
     {
         if (!_target.TryInsert(key, value, charge, priority, out block)) return false;
-        if (value.IsPlaceholder && _distributeCacheRes) OnPlaceholderInserted(block.Charge);
+        if (value.IsPlaceholder && _distributeCacheRes) OnPlaceholderInserted(_target.GetCharge(block)); // target_->GetCharge(*handle)
         return true;
     }
 
@@ -355,7 +355,7 @@ internal sealed class CacheWithSecondaryAdapter : BlockCache
     {
         if (eraseIfLastRef && _distributeCacheRes && handle.HasValue && handle.IsPlaceholder)
         {
-            long charge = handle.Charge;
+            long charge = _target.GetCharge(handle);
             lock (_cacheResMutex)
             {
                 _placeholderUsage -= charge;
@@ -373,6 +373,8 @@ internal sealed class CacheWithSecondaryAdapter : BlockCache
         }
         handle.Release(eraseIfLastRef);
     }
+
+    internal override long GetCharge(in CachedBlock handle) => _target.GetCharge(handle);
 
     public override bool Erase(in CacheKey key) => _target.Erase(key);
 

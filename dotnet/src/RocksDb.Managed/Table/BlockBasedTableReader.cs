@@ -1295,7 +1295,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
         if (cache.AdmitsCompressedBlocks && OffersCompressed(kind, flags))
             return await ReadAndInsertOfferingCompressedAsync(cache, key, handle, kind, flags, ct).ConfigureAwait(false);
-        Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, ct).ConfigureAwait(false)
+        Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, flags, ct).ConfigureAwait(false)
             : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, Verify(flags), DictFor(kind), ct).ConfigureAwait(false), kind);
         if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, b, hit: false, flags);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
@@ -1306,7 +1306,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     {
         ThrowIfNoIo(flags);
         await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
-        Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, ct).ConfigureAwait(false)
+        Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, flags, ct).ConfigureAwait(false)
             : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, Verify(flags), DictFor(kind), ct).ConfigureAwait(false), kind);
         if (_legacyCache is { } legacy && (flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(new BlockCacheKey(_tableId, handle.Offset), b);
         return BlockRef.FromOwned(b);

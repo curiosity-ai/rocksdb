@@ -177,7 +177,7 @@ public sealed partial class BlockBasedTableReader
     {
         PersistentCache? pc = _persistentCache;
         if (pc is null) return BlockFetcher.ReadBlock(_file, _footer, handle, Verify(flags), DictFor(kind));
-        return ReadBlockThroughPersistentCache(pc, handle, kind);
+        return ReadBlockThroughPersistentCache(pc, handle, kind, flags);
     }
 
     /// <summary>
@@ -185,8 +185,12 @@ public sealed partial class BlockBasedTableReader
     /// and the file read on a miss use async I/O.
     /// </summary>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    private async ValueTask<Block> ReadBlockThroughPersistentCacheAsync(PersistentCache pc, BlockHandle handle, BlockKind kind, CancellationToken ct)
+    private async ValueTask<Block> ReadBlockThroughPersistentCacheAsync(PersistentCache pc, BlockHandle handle, BlockKind kind, TableReadFlags flags,
+        CancellationToken ct)
     {
+        // BlockFetcher: read_options.fill_cache gates the persistent cache inserts, read_options.verify_checksums the checks.
+        bool fill = (flags & TableReadFlags.DontFillCache) == 0;
+        bool verify = Verify(flags);
         byte[] key = RocksArrayPool<byte>.Shared.Rent(CacheKey.Size);
         try
         {
@@ -204,7 +208,7 @@ public sealed partial class BlockBasedTableReader
                         if (hit.Length == serializedSize)
                         {
                             stats?.RecordTick(Ticker.PersistentCacheHit);
-                            return BlockFetcher.ProcessSerializedCopy(hit.Data.AsSpan(0, hit.Length), _footer, handle, _options.VerifyChecksums, DictFor(kind));
+                            return BlockFetcher.ProcessSerializedCopy(hit.Data.AsSpan(0, hit.Length), _footer, handle, verify, DictFor(kind));
                         }
                     }
                     finally
@@ -224,9 +228,9 @@ public sealed partial class BlockBasedTableReader
                         read += r;
                     }
                     if (read != serializedSize) ThrowHelper.Corruption("truncated block read from file at offset " + handle.Offset);
-                    Block b = BlockFetcher.ProcessSerializedCopy(raw.AsSpan(0, serializedSize), _footer, handle, _options.VerifyChecksums, DictFor(kind));
+                    Block b = BlockFetcher.ProcessSerializedCopy(raw.AsSpan(0, serializedSize), _footer, handle, verify, DictFor(kind));
                     // Only verified blocks are cached (InsertSerialized after the checksum check).
-                    pc.Insert(k.Span, raw.AsSpan(0, serializedSize));
+                    if (fill) pc.Insert(k.Span, raw.AsSpan(0, serializedSize));
                     return b;
                 }
                 finally
@@ -249,8 +253,8 @@ public sealed partial class BlockBasedTableReader
                 }
             }
             stats?.RecordTick(Ticker.PersistentCacheMiss);
-            Block block = await BlockFetcher.ReadBlockAsync(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind), ct).ConfigureAwait(false);
-            pc.Insert(k.Span, block.Data);
+            Block block = await BlockFetcher.ReadBlockAsync(_file, _footer, handle, verify, DictFor(kind), ct).ConfigureAwait(false);
+            if (fill) pc.Insert(k.Span, block.Data);
             return block;
         }
         finally
@@ -260,8 +264,11 @@ public sealed partial class BlockBasedTableReader
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private Block ReadBlockThroughPersistentCache(PersistentCache pc, BlockHandle handle, BlockKind kind)
+    private Block ReadBlockThroughPersistentCache(PersistentCache pc, BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
+        // BlockFetcher: read_options.fill_cache gates the persistent cache inserts, read_options.verify_checksums the checks.
+        bool fill = (flags & TableReadFlags.DontFillCache) == 0;
+        bool verify = Verify(flags);
         Span<byte> key = stackalloc byte[CacheKey.Size];
         _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset).WriteTo(key);
         Statistics? stats = _stats?.Owner;
@@ -275,7 +282,7 @@ public sealed partial class BlockBasedTableReader
                     if (length == serializedSize)
                     {
                         stats?.RecordTick(Ticker.PersistentCacheHit);
-                        return BlockFetcher.ProcessSerializedCopy(data.AsSpan(0, length), _footer, handle, _options.VerifyChecksums, DictFor(kind));
+                        return BlockFetcher.ProcessSerializedCopy(data.AsSpan(0, length), _footer, handle, verify, DictFor(kind));
                     }
                 }
                 finally
@@ -289,9 +296,9 @@ public sealed partial class BlockBasedTableReader
             {
                 int read = BlockFetcher.ReadFully(_file, (long)handle.Offset, raw.AsSpan(0, serializedSize));
                 if (read != serializedSize) ThrowHelper.Corruption("truncated block read from file at offset " + handle.Offset);
-                Block b = BlockFetcher.ProcessSerializedCopy(raw.AsSpan(0, serializedSize), _footer, handle, _options.VerifyChecksums, DictFor(kind));
+                Block b = BlockFetcher.ProcessSerializedCopy(raw.AsSpan(0, serializedSize), _footer, handle, verify, DictFor(kind));
                 // Only verified blocks are cached (InsertSerialized after the checksum check).
-                pc.Insert(key, raw.AsSpan(0, serializedSize));
+                if (fill) pc.Insert(key, raw.AsSpan(0, serializedSize));
                 return b;
             }
             finally
@@ -314,8 +321,8 @@ public sealed partial class BlockBasedTableReader
             }
         }
         stats?.RecordTick(Ticker.PersistentCacheMiss);
-        Block block = BlockFetcher.ReadBlock(_file, _footer, handle, _options.VerifyChecksums, DictFor(kind));
-        pc.Insert(key, block.Data);
+        Block block = BlockFetcher.ReadBlock(_file, _footer, handle, verify, DictFor(kind));
+        if (fill) pc.Insert(key, block.Data);
         return block;
     }
 }
