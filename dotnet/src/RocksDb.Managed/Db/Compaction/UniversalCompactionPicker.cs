@@ -490,7 +490,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         // intra L0 compactions outputs could have overlap
         if (outputLevel != 0 && FilesRangeOverlapWithCompaction(b.Vstorage, inputs, outputLevel)) return null;
         // PickIncrementalForReduceSizeAmp: path_id = 0.
-        return Create(b, DropEmptyInnerLevels(inputs), outputLevel, new List<FileMetaData>(), CompactionReason.UniversalSizeAmplification, true, 0);
+        return Create(b, inputs, outputLevel, new List<FileMetaData>(), CompactionReason.UniversalSizeAmplification, true, 0);
     }
 
     /// <summary>
@@ -708,6 +708,12 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
     /// Creates the compaction (new Compaction(...) in the builder) without registering it: max output file size of the
     /// output level, GetMaxOverlappingBytes, the trivial-move decision of PickCompaction (allow_trivial_move, not for
     /// periodic compactions) and the compression switch.
+    /// <para>
+    /// <paramref name="inputs"/> is the builder's input vector, empty levels included ("inputs(max_output_level + 1)" for
+    /// the sorted-run compactions). The port's compaction only keeps the non-empty ones, but Compaction::IsTrivialMove
+    /// tests num_input_levels() == 1 on the full vector: without allow_trivial_move a compaction built from more than one
+    /// input level (even empty ones) is never a trivial move.
+    /// </para>
     /// </summary>
     private Compaction Create(Builder b, IReadOnlyList<CompactionInputFiles> inputs, int outputLevel, List<FileMetaData> grandparents,
         CompactionReason reason, bool enableCompression, uint pathId)
@@ -720,6 +726,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
             b.Score, l0FilesMightOverlap: true, isManual: false)
         {
             IsTrivialMoveForced = trivial,
+            DisallowTrivialMove = !Options.CompactionOptionsUniversal.AllowTrivialMove && inputs.Count > 1,
             EnableCompression = enableCompression,
         };
         return c;

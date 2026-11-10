@@ -308,7 +308,8 @@ internal sealed class LevelCompactionPicker : CompactionPicker
         private bool TryPickL0TrivialMove()
         {
             if (_vstorage.BaseLevel <= 0) return false;
-            if (_startLevel == 0 && _o.CompressionPerLevel.Count == 0 && _vstorage.NumLevelFiles(_outputLevel) > 0)
+            if (_startLevel == 0 && _o.CompressionPerLevel.Count == 0 && _vstorage.NumLevelFiles(_outputLevel) > 0
+                && _picker.PathTargetSizes.Count <= 1)
             {
                 // Try to pick trivial move from L0 to L1. We start from the oldest file. We keep expanding to newer files
                 // if it would form a trivial move.
@@ -354,10 +355,11 @@ internal sealed class LevelCompactionPicker : CompactionPicker
         /// <summary>Port of TryExtendNonL0TrivialMove.</summary>
         private bool TryExtendNonL0TrivialMove(int startIndex, bool onlyExpandRight)
         {
-            if (_startLevelInputs.Count == 1 && _o.CompressionPerLevel.Count == 0)
+            if (_startLevelInputs.Count == 1 && _picker.PathTargetSizes.Count <= 1 && _o.CompressionPerLevel.Count == 0)
             {
                 // Only file of `index`, and it is likely a trivial move. Try to expand if it is still a trivial move, but
-                // not beyond max_compaction_bytes or 4 files.
+                // not beyond max_compaction_bytes or 4 files. Ignore if there are more than one DB path, as it would be
+                // hard to predict whether it is a trivial move.
                 ReadOnlySpan<FileMetaData> levelFiles = _vstorage.LevelFiles(_startLevel);
                 const int MaxMultiTrivialMove = 4;
                 FileMetaData initialFile = _startLevelInputs[0];

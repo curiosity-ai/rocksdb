@@ -1124,6 +1124,12 @@ internal sealed class CompactionJob
             // GetCompressionType / GetCompressionOptions with enable_compression = false.
             tbo = tbo with { CompressionType = Compression.CompressionType.None, CompressionOptions = _cfd.Options.CompressionOpts };
         }
+        else if (tbo.CompressionType != _c.OutputCompression)
+        {
+            // The builder uses Compaction::output_compression(): the picker's choice (CompactFiles'
+            // CompactionOptions::compression, FIFO's plain `compression`), not the level's default.
+            tbo = tbo with { CompressionType = _c.OutputCompression };
+        }
         _out.Meta = new FileMetaData
         {
             FileNumber = fileNumber,
