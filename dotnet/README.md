@@ -18,7 +18,8 @@ byte[]? value = await db.GetAsync("hello"u8.ToArray());
 
 Contents: [Status and compatibility](#status-and-compatibility) |
 [Build](#build-and-install) | [Quick start](#quick-start) | [API tour](#api-tour) |
-[Error handling](#error-handling) | [Known deviations and gaps](#known-deviations-and-gaps) | [Documentation](#documentation)
+[Error handling](#error-handling) | [Known deviations and gaps](#known-deviations-and-gaps) | [Documentation](#documentation) |
+[License](#license)
 
 ## Status and compatibility
 
@@ -1409,3 +1410,10 @@ miss. See [docs/benchmarks.md](docs/benchmarks.md).
 | [docs/validation.md](docs/validation.md) | file-by-file audit of the port against the C++ sources |
 | [src/RocksDb.Managed.Replication/README.md](src/RocksDb.Managed.Replication/README.md) | replication, switchover and Raft cluster layer |
 | [CLAUDE.md](CLAUDE.md) | contributor guide: goals, layout, porting conventions, API design rules |
+
+## License
+
+RocksDb.Managed is licensed under the [Apache License, Version 2.0](../LICENSE.Apache). It is a port of RocksDB, which
+is available under the GPLv2 or the Apache License 2.0 at the licensee's option; this port uses it under Apache 2.0.
+Code derived from LevelDB, xxHash, MurmurHash and the .NET runtime is attributed in
+[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), which every package also carries.

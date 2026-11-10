@@ -20,8 +20,9 @@
   <PropertyGroup>
     <Authors>Curiosity GmbH</Authors>
     <Company>Curiosity GmbH</Company>
-    <!-- Same dual license as upstream RocksDB (LICENSE.Apache / COPYING in the repository root). -->
-    <PackageLicenseExpression>Apache-2.0 OR GPL-2.0-only</PackageLicenseExpression>
+    <!-- Upstream RocksDB is GPLv2 or Apache 2.0 at the licensee's option; the port takes Apache 2.0. Code derived from
+         other components is attributed in THIRD-PARTY-NOTICES.txt, which every package carries. -->
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/curiosity-ai/rocksdb/tree/main/dotnet</PackageProjectUrl>
     <RepositoryUrl>https://github.com/curiosity-ai/rocksdb</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
