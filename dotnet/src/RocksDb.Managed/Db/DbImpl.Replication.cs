@@ -165,7 +165,10 @@ internal sealed partial class DbImpl
         ulong filesKeepNum = Options.WalSizeLimitMb * 1024 * 1024 / logFileSize;
         if ((ulong)logFilesNum <= filesKeepNum) return;
         int filesDelNum = logFilesNum - (int)filesKeepNum;
-        List<WalFileInfo> archived = GetSortedWalsOfType(archivalDir, WalFileType.ArchivedLogFile);
+        // need_seqno = false: every archived WAL is a candidate, also one without a readable first record.
+        List<WalFileInfo> archived;
+        try { archived = GetSortedWalsOfType(archivalDir, WalFileType.ArchivedLogFile, needSeqnos: false); }
+        catch (RocksDbException) { return; }
         if (filesDelNum > archived.Count) filesDelNum = archived.Count;
         for (int i = 0; i < filesDelNum; i++)
         {
@@ -226,9 +229,6 @@ internal sealed partial class DbImpl
         return files;
     }
 
-    /// <summary>Port of WalManager::GetSortedWalsOfType with need_seqnos = true.</summary>
-    private List<WalFileInfo> GetSortedWalsOfType(string path, WalFileType type) => GetSortedWalsOfType(path, type, needSeqnos: true);
-
     /// <summary>Port of WalManager::GetSortedWalsOfType.</summary>
     private List<WalFileInfo> GetSortedWalsOfType(string path, WalFileType type, bool needSeqnos)
     {
@@ -265,7 +265,10 @@ internal sealed partial class DbImpl
         return result;
     }
 
-    /// <summary>Port of WalManager::ReadFirstRecord: the first sequence number of a WAL, or 0 when it has no record.</summary>
+    /// <summary>
+    /// Port of WalManager::ReadFirstRecord: the first sequence number of a WAL, or 0 when it has no record (or was
+    /// deleted from the archive meanwhile). An error reading a file that exists is thrown.
+    /// </summary>
     private ulong ReadFirstRecord(WalFileType type, ulong number)
     {
         lock (_readFirstRecordCache)
@@ -273,18 +276,23 @@ internal sealed partial class DbImpl
             if (_readFirstRecordCache.TryGetValue(number, out ulong cached)) return cached;
         }
         ulong sequence = 0;
+        RocksDbException? status = null;
         if (type == WalFileType.AliveLogFile)
         {
-            if (!TryReadFirstLine(FileNames.LogFileName(WalDir, number), number, out sequence))
-            {
-                // Check if the file got moved to the archive.
-                if (!TryReadFirstLine(FileNames.ArchivedLogFileName(WalDir, number), number, out sequence)) sequence = 0;
-            }
+            string fname = FileNames.LogFileName(WalDir, number);
+            status = ReadFirstLine(fname, number, out sequence);
+            // Return any error that is not caused by non-existing file.
+            if (status is not null && FileSystem.FileExists(fname)) throw status.Rethrowable();
         }
-        else if (!TryReadFirstLine(FileNames.ArchivedLogFileName(WalDir, number), number, out sequence))
+        if (type == WalFileType.ArchivedLogFile || status is not null)
         {
-            sequence = 0;
+            // Check if the file got moved to the archive.
+            string archived = FileNames.ArchivedLogFileName(WalDir, number);
+            status = ReadFirstLine(archived, number, out sequence);
+            // Maybe the file was deleted from the archive dir: the caller identifies this as an empty file.
+            if (status is not null && !FileSystem.FileExists(archived)) return 0;
         }
+        if (status is not null) throw status.Rethrowable();
         if (sequence != 0)
         {
             lock (_readFirstRecordCache) _readFirstRecordCache[number] = sequence;
@@ -292,8 +300,23 @@ internal sealed partial class DbImpl
         return sequence;
     }
 
-    /// <summary>Port of WalManager::ReadFirstLine. Returns false if the file does not exist.</summary>
-    private bool TryReadFirstLine(string fname, ulong number, out ulong sequence)
+    /// <summary>The LogReporter of WalManager::ReadFirstLine: keeps the first error only.</summary>
+    private sealed class FirstLineReporter : LogReporter
+    {
+        public RocksDbException? Status;
+
+        public override void Corruption(long bytes, StatusCode code, string reason, ulong logNumber) =>
+            Status ??= code == StatusCode.Corruption ? RocksDbException.Corruption(reason) : new RocksDbException(code, "IO error: " + reason);
+    }
+
+    /// <summary>
+    /// Port of WalManager::ReadFirstLine: reads the first record only. Returns null with the sequence number of that
+    /// record, null with 0 for a file without a record (1 for an empty compressed WAL, which holds only the
+    /// kSetCompressionType record and must still be listed), or the error: the file cannot be opened, corruption was
+    /// reported before the first record (ignored without paranoid_checks) or the first record is too small to be a
+    /// write batch.
+    /// </summary>
+    private RocksDbException? ReadFirstLine(string fname, ulong number, out ulong sequence)
     {
         sequence = 0;
         Env.ISequentialFile file;
@@ -301,18 +324,32 @@ internal sealed partial class DbImpl
         {
             file = FileSystem.OpenSequential(fname);
         }
-        catch (RocksDbException e) when (e.SubCode == StatusSubCode.PathNotFound || !FileSystem.FileExists(fname))
+        catch (RocksDbException e)
         {
-            return false;
+            return e;
         }
-        using var reader = new LogReader(file, null, checksum: true, number) { RecoveryMode = WalRecoveryMode.PointInTimeRecovery };
-        while (reader.TryReadRecord(out ReadOnlySpan<byte> record))
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
-            if (record.Length < WriteBatch.HeaderSize) continue; // "very small log record"
-            sequence = Util.Coding.DecodeFixed64(record);
-            return true;
+            return RocksDbException.FromException(e);
         }
-        return true;
+        var reporter = new FirstLineReporter();
+        using var reader = new LogReader(file, reporter, checksum: true, number);
+        if (reader.TryReadRecord(out ReadOnlySpan<byte> record) && (reporter.Status is null || !Options.ParanoidChecks))
+        {
+            if (record.Length < WriteBatch.HeaderSize)
+            {
+                reporter.Corruption(record.Length, StatusCode.Corruption, "log record too small", number);
+            }
+            else
+            {
+                sequence = Util.Coding.DecodeFixed64(record);
+                return null;
+            }
+        }
+        // ReadRecord might have returned false on EOF, which means that the log file is empty. Or, a failure may have
+        // occurred while processing the first entry.
+        if (reporter.Status is null && reader.IsCompressedAndEmptyFile) sequence = 1;
+        return reporter.Status;
     }
 
     /// <summary>The number of the WAL currently written to (0 if none); no file system access.</summary>

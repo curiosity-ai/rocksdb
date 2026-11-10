@@ -257,6 +257,12 @@ public class BackupEngineReadOnly : IDisposable
         try
         {
             if (backupId == 0) backupId = _latestValidBackupId; // kLatestBackupIDMarker
+            // GetBackupInfo reports a corrupt backup as Corruption whatever made it unusable (Status::Corruption of
+            // the stored status' text); VerifyBackup and RestoreDBFromBackup return the stored status itself.
+            if (_corruptBackups.TryGetValue(backupId, out (RocksDbException Error, BackupMeta Meta) corrupt) && corrupt.Error.Code != StatusCode.Corruption)
+            {
+                throw RocksDbException.Corruption(corrupt.Error.Message);
+            }
             return ToBackupInfo(backupId, FindValidBackup(backupId), includeFileDetails);
         }
         finally
@@ -606,6 +612,34 @@ public class BackupEngineReadOnly : IDisposable
         }
     }
 
+    /// <summary>
+    /// GetFileDbIdentities as used by AddBackupFileWorkItem: the DB session id of a table file, "" when its properties
+    /// have none (NotFound upstream, fine for old files). A file that cannot be read as a table fails the backup.
+    /// </summary>
+    private protected static string GetFileDbSessionId(IFileSystem fs, string path)
+    {
+        try
+        {
+            using TableReader reader = TableReaderFactory.Open(fs.OpenRandomAccess(path), new TableReaderOptions
+            {
+                VerifyChecksums = true,
+                TableFactory = TableFactoryType.AdaptiveTable,
+                AllowMmapReads = true,
+                PlainTableOptions = new PlainTableOptions { FullScanMode = true },
+            });
+            return reader.Properties.DbSessionId;
+        }
+        catch (Exception e) when (e is IOException or InvalidOperationException or ArgumentException)
+        {
+            throw RocksDbException.FromException(e).Rethrowable();
+        }
+    }
+
+    // bytes_toward_next_callback of the copy engine's worker (carried over from file to file and from one operation
+    // to the next). One counter for all workers here.
+    private ulong _bytesTowardNextCallback;
+    private readonly Lock _progressLock = new();
+
     private int IoBufferSize => _options.IoBufferSize > 0 ? _options.IoBufferSize : DefaultIoBufferSize;
 
     /// <summary>ReadFileAndComputeChecksum: crc32c of the first <paramref name="sizeLimit"/> bytes (0 = all).</summary>
@@ -656,7 +690,6 @@ public class BackupEngineReadOnly : IDisposable
             using ISequentialFile srcFile = srcFs.OpenSequential(src);
             dstFile = dstFs.CreateWritable(dst, truncate: true);
             uint crc = 0;
-            ulong sinceProgress = 0;
             ulong interval = Math.Max(1, _options.CallbackTriggerIntervalSize);
             while (sizeLimit > 0)
             {
@@ -674,11 +707,15 @@ public class BackupEngineReadOnly : IDisposable
                 if (synchronous) dstFile.Append(buffer.AsSpan(0, n));
                 else await dstFile.AppendAsync(buffer.AsMemory(0, n), ct).ConfigureAwait(false);
                 sizeLimit -= (ulong)n;
-                sinceProgress += (ulong)n;
-                if (progress is not null && sinceProgress >= interval)
+                // CopyOrCreateFile: one callback per callback_trigger_interval_size bytes read, counted across files.
+                lock (_progressLock)
                 {
-                    sinceProgress %= interval;
-                    InvokeProgress(progress);
+                    _bytesTowardNextCallback += (ulong)n;
+                    while (_bytesTowardNextCallback >= interval)
+                    {
+                        _bytesTowardNextCallback -= interval;
+                        if (progress is not null) InvokeProgress(progress);
+                    }
                 }
             }
             if (sync)

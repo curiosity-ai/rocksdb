@@ -330,8 +330,9 @@ public sealed class BackupEngine : BackupEngineReadOnly
         {
             if (NamingNoFlags != ShareFilesNaming.LegacyCrc32cAndFileSize && fileType != FileType.BlobFile)
             {
-                // Prepare db_session_id to add to the file name (empty for old files).
-                TryGetFileDbIdentities(srcFs, srcPath, out _, out dbSessionId);
+                // Prepare db_session_id to add to the file name (empty for old files). Any other failure to read the
+                // table (GetFileDbIdentities: not NotFound) fails the backup.
+                dbSessionId = GetFileDbSessionId(srcFs, srcPath);
             }
             // Calculate the checksum when no db session id is available (the name then contains it).
             if (crc is null && dbSessionId.Length == 0) crc = await ComputeChecksumAsync(srcFs, srcPath, sizeLimit, _options.BackupRateLimiter, synchronous, ct).ConfigureAwait(false);
