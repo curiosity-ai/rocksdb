@@ -180,4 +180,116 @@ public sealed class Audit4BlobWideIngestTests
         Assert.AreEqual("ingested-a", GetString(imported, "a"));
         Assert.AreEqual("mem", GetString(imported, "m"));
     }
+
+    [TestMethod]
+    public void ExportFailsOnStaleStagingDirectoryAndRemovesIt()
+    {
+        // CheckpointImpl::ExportColumnFamily (utilities/checkpoint/checkpoint_impl.cc): `s = CreateDir(tmp_export_dir)`
+        // fails when "<export_dir>.tmp" exists (unlike CreateCheckpoint there is no CleanStagingDirectory first), and the
+        // failure path deletes the children of the staging directory and the directory itself. The port reused the
+        // stale directory, so its leftover files ended up in the exported directory.
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(Path, NewOptions(fs));
+        ColumnFamily cf = db.CreateColumnFamily("data", new ColumnFamilyOptions());
+        cf.Put(B("k"), B("v"));
+        fs.CreateDirectoryIfMissing("/export.tmp");
+        using (IWritableFile stale = fs.CreateWritable("/export.tmp/000099.sst", truncate: true)) stale.Append(B("garbage"));
+        RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() => cf.ExportColumnFamily("/export"));
+        Assert.AreEqual(StatusCode.IOError, e.Code);
+        Assert.IsFalse(fs.DirectoryExists("/export"));
+        Assert.IsFalse(fs.DirectoryExists("/export.tmp"), "the failed export cleans the staging directory");
+        ExportImportFilesMetadata meta = cf.ExportColumnFamily("/export");
+        Assert.AreEqual(1, meta.Files.Count);
+        Assert.IsFalse(fs.FileExists("/export/000099.sst"));
+    }
+
+    // ---- ingestion: move_files with the copy fallback -------------------------------------------------------
+
+    /// <summary>A file system without hard links: LinkFile keeps the interface default (NotSupported).</summary>
+    private sealed class NoLinkFileSystem(MemoryFileSystem inner) : IFileSystem
+    {
+        public IWritableFile CreateWritable(string path, bool truncate = true) => inner.CreateWritable(path, truncate);
+        public IWritableFile CreateWritable(string path, bool truncate, WritableFileOptions options) => inner.CreateWritable(path, truncate, options);
+        public IWritableFile ReopenWritable(string path, WritableFileOptions options) => inner.ReopenWritable(path, options);
+        public IRandomAccessFile OpenRandomAccess(string path) => inner.OpenRandomAccess(path);
+        public ISequentialFile OpenSequential(string path) => inner.OpenSequential(path);
+        public bool FileExists(string path) => inner.FileExists(path);
+        public long GetFileSize(string path) => inner.GetFileSize(path);
+        public void DeleteFile(string path) => inner.DeleteFile(path);
+        public void RenameFile(string source, string target) => inner.RenameFile(source, target);
+        public void CreateDirectoryIfMissing(string path) => inner.CreateDirectoryIfMissing(path);
+        public IEnumerable<string> GetChildren(string directory) => inner.GetChildren(directory);
+        public IDisposable LockFile(string path) => inner.LockFile(path);
+        public void SyncDirectory(string path) => inner.SyncDirectory(path);
+        public bool DirectoryExists(string path) => inner.DirectoryExists(path);
+        public void DeleteDirectory(string path) => inner.DeleteDirectory(path);
+        public void WriteAt(string path, long offset, ReadOnlySpan<byte> data) => inner.WriteAt(path, offset, data);
+        public long GetFreeSpace(string path) => inner.GetFreeSpace(path);
+    }
+
+    [TestMethod]
+    public void MoveFilesDeletesTheOriginalAlsoAfterTheCopyFallback()
+    {
+        // ExternalSstFileIngestionJob::Cleanup (db/external_sst_file_ingestion_job.cc): `if (status.ok() &&
+        // ingestion_options_.move_files)` deletes f.external_file_path of every file that was not generated for the
+        // ingestion, whether Prepare hard-linked it or fell back to a copy (LinkFile NotSupported with
+        // failed_move_fall_back_to_copy). The port kept the original of a copied file, so a "move" left the data twice.
+        MemoryFileSystem mem = NewFs();
+        var fs = new NoLinkFileSystem(mem);
+        mem.CreateDirectoryIfMissing("/ext");
+        using RocksDatabase db = RocksDatabase.Open(Path, new DbOptions { CreateIfMissing = true, FileSystem = fs },
+            new ColumnFamilyOptions { DisableAutoCompactions = true });
+        string moved = WriteSst(fs, "/ext/moved.sst", "a", "b");
+        db.IngestExternalFiles([moved], new IngestExternalFileOptions { MoveFiles = true });
+        Assert.AreEqual("ingested-a", GetString(db, "a"));
+        Assert.IsFalse(mem.FileExists(moved), "move_files removes the original after a successful ingestion");
+
+        // link_files (and the default copy) keep the original.
+        string linked = WriteSst(fs, "/ext/linked.sst", "c", "d");
+        db.IngestExternalFiles([linked], new IngestExternalFileOptions { LinkFiles = true });
+        Assert.IsTrue(mem.FileExists(linked));
+        // Without the fallback the unsupported link fails the ingestion and nothing is deleted or added.
+        string strict = WriteSst(fs, "/ext/strict.sst", "e", "f");
+        RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() =>
+            db.IngestExternalFiles([strict], new IngestExternalFileOptions { MoveFiles = true, FailedMoveFallBackToCopy = false }));
+        Assert.AreEqual(StatusCode.NotSupported, e.Code);
+        Assert.IsTrue(mem.FileExists(strict));
+        Assert.IsNull(GetString(db, "e"));
+        Assert.AreEqual(2, db.GetLiveFilesMetadata().Count);
+    }
+
+    // ---- checkpoint: blob direct write ----------------------------------------------------------------------
+
+    [TestMethod]
+    public void CheckpointWithoutFlushIsRefusedWhileBlobDirectWriteFilesAreInFlight()
+    {
+        // DBImpl::GetLiveFilesStorageInfoImpl (db/db_filesnapshot.cc): `if (needs_blob_direct_write_flush &&
+        // !flush_memtable) return Status::NotSupported("Blob direct write requires flushing active blob files before
+        // capturing live files. Retry with flush enabled.")`. The blob files written by blob direct write are only
+        // registered in the MANIFEST by the flush of their memtable; a checkpoint taken without that flush would carry
+        // WAL records whose blob indexes point at files it does not contain. The port created such a checkpoint.
+        MemoryFileSystem fs = NewFs();
+        var dbo = new DbOptions { CreateIfMissing = true, FileSystem = fs, AllowConcurrentMemtableWrite = false };
+        var cfo = new ColumnFamilyOptions { EnableBlobFiles = true, EnableBlobDirectWrite = true, MinBlobSize = 32, DisableAutoCompactions = true };
+        string large = new('v', 200);
+        using (RocksDatabase db = RocksDatabase.Open(Path, dbo, cfo))
+        {
+            db.Put(B("k"), B(large));
+            RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() => db.CreateCheckpoint("/cp-noflush", ulong.MaxValue));
+            Assert.AreEqual(StatusCode.NotSupported, e.Code);
+            StringAssert.Contains(e.Message, "Retry with flush enabled");
+            Assert.IsFalse(fs.DirectoryExists("/cp-noflush"));
+            Assert.IsFalse(fs.DirectoryExists("/cp-noflush.tmp"), "the staging directory is cleaned up");
+
+            // With the flush (the default) the checkpoint holds the blob file and is complete.
+            db.CreateCheckpoint("/cp");
+            // Nothing in flight any more: a checkpoint without flush is fine again.
+            db.CreateCheckpoint("/cp2", ulong.MaxValue);
+        }
+        foreach (string dir in new[] { "/cp", "/cp2" })
+        {
+            using RocksDatabase c = RocksDatabase.Open(dir, new DbOptions { FileSystem = fs, AllowConcurrentMemtableWrite = false }, cfo);
+            Assert.AreEqual(large, GetString(c, "k"), dir);
+        }
+    }
 }

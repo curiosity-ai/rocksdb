@@ -1259,7 +1259,8 @@ internal sealed class ExternalSstFileIngestionJob
         if (!_options.MoveFiles) return;
         foreach (IngestedFileInfo f in _files)
         {
-            if (f.Copied || f.GeneratedForIngestion) continue;
+            // Cleanup removes the original of every file but the generated one, also when Prepare fell back to a copy.
+            if (f.GeneratedForIngestion) continue;
             try { _fs.DeleteFile(f.ExternalFilePath); }
             catch (Exception e) when (e is IOException or RocksDbException) { }
         }

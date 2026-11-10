@@ -86,9 +86,12 @@ public sealed class Audit4BlobWideIngestCompatTests
         public static Step Put(string k) => new('P', k, "");
         public static Step DelRange(string a, string b) => new('R', a, b);
         public static readonly Step Flush = new('F', "", "");
+        public static readonly Step Compact = new('C', "", "");
+        public static Step Delete(string k) => new('D', k, "");
     }
 
-    private sealed record Scenario(string Name, Step[] Steps, string[][] Files, bool AllowBlockingFlush, bool AllowGlobalSeqno);
+    private sealed record Scenario(string Name, Step[] Steps, string[][] Files, bool AllowBlockingFlush, bool AllowGlobalSeqno, bool Snapshot = false,
+        bool Universal = false);
 
     private static void NativeApply(RocksDbSharp.RocksDb db, Step s)
     {
@@ -105,6 +108,12 @@ public sealed class Audit4BlobWideIngestCompatTests
                     db.Write(batch);
                     break;
                 }
+            case 'D':
+                db.Remove(U(s.Key));
+                break;
+            case 'C':
+                db.CompactRange((byte[]?)null, null);
+                break;
             default:
                 db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
                 break;
@@ -121,26 +130,39 @@ public sealed class Audit4BlobWideIngestCompatTests
             case 'R':
                 db.DeleteRange(U(s.Key), U(s.End));
                 break;
+            case 'D':
+                db.Delete(U(s.Key));
+                break;
+            case 'C':
+                db.CompactRange();
+                break;
             default:
                 db.Flush();
                 break;
         }
     }
 
-    private static void RunScenario(Scenario sc)
+    /// <summary>
+    /// Runs one scenario on both engines. With <paramref name="skipIfShapesDiffer"/> a scenario whose LSM shape already
+    /// differs before the ingestion (a flush / compaction difference, not ingestion's) is skipped: returns false.
+    /// </summary>
+    private static bool RunScenario(Scenario sc, bool skipIfShapesDiffer = false)
     {
         using var dir = new TempDir("audit4-ingest");
         var files = new string[sc.Files.Length];
         for (int i = 0; i < files.Length; i++) files[i] = WriteSst(Path.Combine(dir.Path, i + ".sst"), sc.Files[i]);
 
         string nativeOutcome = "ok";
-        List<FileInfo> nativeFiles;
+        List<FileInfo> nativeFiles, nativeBefore;
         SortedDictionary<string, string> nativeData;
         // Auto compactions off on both sides: the placement under test is ingestion's.
         var no = new RocksDbSharp.DbOptions().SetCreateIfMissing(true).SetDisableAutoCompactions(1);
+        if (sc.Universal) no.SetCompactionStyle(RocksDbSharp.Compaction.Universal);
         using (var db = RocksDbSharp.RocksDb.Open(no, Path.Combine(dir.Path, "native")))
         {
             foreach (Step s in sc.Steps) NativeApply(db, s);
+            nativeBefore = NativeFiles(db);
+            using RocksDbSharp.Snapshot? snapshot = sc.Snapshot ? db.CreateSnapshot() : null;
             try
             {
                 db.IngestExternalFiles(files, new RocksDbSharp.IngestExternalFileOptions().SetAllowBlockingFlush(sc.AllowBlockingFlush)
@@ -156,9 +178,11 @@ public sealed class Audit4BlobWideIngestCompatTests
 
         string managedOutcome = "ok";
         using (RocksDatabase db = RocksDatabase.Open(Path.Combine(dir.Path, "managed"), new DbOptions { CreateIfMissing = true },
-                   new ColumnFamilyOptions { DisableAutoCompactions = true }))
+                   new ColumnFamilyOptions { DisableAutoCompactions = true, CompactionStyle = sc.Universal ? CompactionStyle.Universal : CompactionStyle.Level }))
         {
             foreach (Step s in sc.Steps) ManagedApply(db, s);
+            if (skipIfShapesDiffer && Describe(nativeBefore) != Describe(ManagedFiles(db))) return false;
+            using Snapshot? snapshot = sc.Snapshot ? db.GetSnapshot() : null;
             try
             {
                 db.IngestExternalFiles(files, new IngestExternalFileOptions { AllowBlockingFlush = sc.AllowBlockingFlush, AllowGlobalSeqNo = sc.AllowGlobalSeqno });
@@ -178,6 +202,7 @@ public sealed class Audit4BlobWideIngestCompatTests
             Assert.AreEqual(Describe(nativeFiles), Describe(ManagedFiles(db)), sc.Name + ": levels and sequence numbers");
             CollectionAssert.AreEqual(nativeData, ManagedScan(db), sc.Name + ": contents");
         }
+        return true;
     }
 
     /// <summary>
@@ -259,5 +284,48 @@ public sealed class Audit4BlobWideIngestCompatTests
             Assert.AreEqual(Describe(nativeFiles), Describe(ManagedFiles(db)));
             Assert.AreEqual("ingested-b", Encoding.UTF8.GetString(db.Get(U("b"))!));
         }
+    }
+
+    /// <summary>
+    /// ExternalSstFileIngestionJob::Run / AssignLevelsForOneBatch / AssignLevelAndSeqnoForIngestedFile, NeedsFlush and
+    /// DivideInputFilesIntoBatches as a whole: random LSM shapes (puts, deletes, flushes, full compactions; range
+    /// tombstones are covered by the scenarios above, the flush keeps keys they cover unlike native), random sets of one to three external files (possibly overlapping each other and the DB), with and
+    /// without allow_blocking_flush / allow_global_seqno and an open snapshot (snapshot_consistency forces a global
+    /// seqno), leveled and universal compaction. Outcome, level and sequence numbers of every live file and the visible
+    /// contents must match native.
+    /// </summary>
+    [TestMethod]
+    public void RandomizedIngestionMatchesNative()
+    {
+        string[] dbKeys = ["a", "c", "e", "g", "i", "k", "m", "o", "q"];
+        string[] fileKeys = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r"];
+        const int Iterations = 120;
+        var rnd = new Random(20261110);
+        int compared = 0;
+        for (int iter = 0; iter < Iterations; iter++)
+        {
+            var steps = new List<Step>();
+            int n = rnd.Next(2, 11);
+            for (int i = 0; i < n; i++)
+            {
+                int r = rnd.Next(12);
+                if (r < 6) steps.Add(Step.Put(dbKeys[rnd.Next(dbKeys.Length)]));
+                else if (r < 7) steps.Add(Step.Delete(dbKeys[rnd.Next(dbKeys.Length)]));
+                else if (r < 9) steps.Add(Step.Flush);
+                else if (r < 10) steps.Add(Step.Compact);
+                else steps.Add(Step.Put(dbKeys[rnd.Next(dbKeys.Length)]));
+            }
+            var files = new string[rnd.Next(1, 4)][];
+            for (int f = 0; f < files.Length; f++)
+            {
+                int start = rnd.Next(fileKeys.Length);
+                int len = Math.Min(rnd.Next(1, 4), fileKeys.Length - start);
+                files[f] = fileKeys[start..(start + len)];
+            }
+            var sc = new Scenario("random-" + iter + " [" + string.Join(" ", steps.Select(s => s.Op + s.Key + (s.End.Length > 0 ? "-" + s.End : ""))) + "] files ["
+                + string.Join(" | ", files.Select(f => string.Join(",", f))) + "]", steps.ToArray(), files, rnd.Next(5) != 0, rnd.Next(5) != 0, rnd.Next(4) == 0, rnd.Next(3) == 0);
+            if (RunScenario(sc, skipIfShapesDiffer: true)) compared++;
+        }
+        Assert.IsTrue(compared >= Iterations * 3 / 4, "only " + compared + " scenarios had the same shape before the ingestion");
     }
 }

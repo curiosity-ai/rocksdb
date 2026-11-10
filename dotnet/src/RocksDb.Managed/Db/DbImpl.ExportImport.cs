@@ -21,10 +21,13 @@ internal sealed partial class DbImpl
         string trimmed = exportDir.TrimEnd('/');
         if (trimmed.Length == 0) ThrowHelper.InvalidArgument("Specified export_dir invalid");
         string tmpExportDir = trimmed + ".tmp";
-        FileSystem.CreateDirectoryIfMissing(tmpExportDir);
         bool movedToUserDir = false;
         try
         {
+            // Env::CreateDir fails on an existing directory: a staging directory left behind by an interrupted export
+            // fails this export, and the failure path below removes it (so the next attempt succeeds).
+            if (FileSystem.DirectoryExistsSafe(tmpExportDir)) throw RocksDbException.IOError("While mkdir: " + tmpExportDir + ": File exists");
+            FileSystem.CreateDirectoryIfMissing(tmpExportDir);
             // FIXME upstream: should respect atomic_flush and flush all CFs if needed.
             if (!_readOnly) await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.ManualFlush, synchronous, ct).ConfigureAwait(false);
             var files = new List<(int Level, FileMetaData File)>();
