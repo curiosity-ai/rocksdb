@@ -14,4 +14,7 @@
     <ProjectReference Include="..\RocksDb.Managed\RocksDb.Managed.csproj" />
     <ProjectReference Include="..\RocksDb.Managed.Replication\RocksDb.Managed.Replication.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
 </Project>

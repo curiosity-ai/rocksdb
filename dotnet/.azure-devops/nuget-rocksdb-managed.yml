@@ -1,0 +1,99 @@
+# Builds and publishes the RocksDb.Managed packages to nuget.org:
+#   RocksDb.Managed                          the engine
+#   RocksDb.Managed.Replication              replication, switchover and the Raft cluster layer
+#   RocksDb.Managed.Replication.MagicOnion   the gRPC (MagicOnion) transport for it
+#
+# Version: CalVer yy.M.<build id>, like the other Curiosity NuGet pipelines. The test suites are not run here.
+# Package metadata (license, readme, repository) lives in dotnet/Directory.Build.props.
+
+variables:
+  buildConfiguration: 'Release'
+  targetVersion: yy.M.$(Build.BuildId)
+  dotnetDir: '$(Build.SourcesDirectory)/dotnet'
+
+pool:
+  vmImage: 'ubuntu-22.04'
+
+trigger:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - dotnet/src/*
+    - dotnet/Directory.Build.props
+    - dotnet/Directory.Packages.props
+    - dotnet/global.json
+    - dotnet/README.md
+    - dotnet/.azure-devops/nuget-rocksdb-managed.yml
+
+pr: none
+
+steps:
+
+# Only dotnet/ is needed; the C++ tree beside it is not built here.
+- checkout: self
+  fetchDepth: 1
+
+- task: PowerShell@2
+  displayName: 'Create CalVer version'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $dottedDate = (Get-Date).ToString("yy.M")
+      $modBuildID = [int]$($env:BUILD_BUILDID) % 65536  # ensure fits in int16
+      $newTargetVersion = "$dottedDate.$modBuildID"
+      Write-Host "##vso[task.setvariable variable=targetVersion;]$newTargetVersion"
+      Write-Host "Package version: $newTargetVersion"
+
+# The SDK pinned by dotnet/global.json (a .NET 11 prerelease, hence includePreviewVersions) builds both
+# target frameworks, net10.0 and net11.0.
+- task: UseDotNet@2
+  displayName: 'Use .NET 11.0 SDK'
+  inputs:
+    packageType: sdk
+    useGlobalJson: true
+    workingDirectory: '$(dotnetDir)'
+    includePreviewVersions: true
+    installationPath: $(Agent.ToolsDirectory)/dotnet
+
+- task: CmdLine@2
+  displayName: 'Build'
+  inputs:
+    workingDirectory: '$(dotnetDir)'
+    script: |
+      set -e
+      for p in src/RocksDb.Managed src/RocksDb.Managed.Replication src/RocksDb.Managed.Replication.MagicOnion; do
+        dotnet build "$p" -c $(buildConfiguration) /p:Version=$(targetVersion)
+      done
+
+- task: CmdLine@2
+  displayName: 'Pack'
+  inputs:
+    workingDirectory: '$(dotnetDir)'
+    script: |
+      set -e
+      for p in src/RocksDb.Managed src/RocksDb.Managed.Replication src/RocksDb.Managed.Replication.MagicOnion; do
+        dotnet pack "$p" -c $(buildConfiguration) --no-build /p:Version=$(targetVersion) -o "$(Build.ArtifactStagingDirectory)/packages"
+      done
+
+- task: PublishPipelineArtifact@1
+  displayName: 'Publish packages artifact'
+  inputs:
+    targetPath: '$(Build.ArtifactStagingDirectory)/packages'
+    artifact: 'packages'
+
+# nuget push uploads each .snupkg beside its .nupkg to the symbol server.
+- task: NuGetToolInstaller@1
+  displayName: 'Use NuGet 7.6 or later'
+  inputs:
+    versionSpec: '>=7.6'
+    checkLatest: true
+
+- task: NuGetCommand@2
+  displayName: 'Push to NuGet'
+  inputs:
+    command: 'push'
+    packagesToPush: '$(Build.ArtifactStagingDirectory)/packages/*.$(targetVersion).nupkg'
+    nuGetFeedType: 'external'
+    publishFeedCredentials: 'nuget-curiosity-org'
