@@ -60,6 +60,11 @@ internal sealed class GetContext
     public bool DeferEntityBlobColumns;
     public ulong MaxCoveringTombstoneSeq;
     /// <summary>
+    /// ReadOptions::ignore_range_deletions: the range tombstones of memtables and table files are not consulted
+    /// (MemTable::Get, TableCache::Get / MultiGet), so keys they cover stay visible.
+    /// </summary>
+    public bool IgnoreRangeDeletions;
+    /// <summary>
     /// Sequence number of the read. With user-defined timestamps table entries with a larger seqno are skipped (they
     /// sort after the lookup key when their timestamp is older).
     /// </summary>
@@ -172,6 +177,7 @@ internal sealed class GetContext
         ValueEntityHasBlobColumns = false;
         DeferEntityBlobColumns = false;
         MaxCoveringTombstoneSeq = 0;
+        IgnoreRangeDeletions = false;
         ReadSequence = DbFormat.MaxSequenceNumber;
         MergeOperator = mergeOperator;
         Callback = null;

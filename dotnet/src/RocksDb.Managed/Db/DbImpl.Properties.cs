@@ -708,6 +708,7 @@ internal sealed partial class DbImpl
             var lkey = new LookupKey(key, snapshot, scratch);
             try
             {
+                ctx.IgnoreRangeDeletions = options is not null && options.IgnoreRangeDeletions;
                 if (GetFromMemTables(sv, lkey, ctx))
                 {
                     if (ctx.State is GetContext.GetState.Deleted) return false;
@@ -720,6 +721,9 @@ internal sealed partial class DbImpl
                     return true;
                 }
                 if (ctx.State == GetContext.GetState.Merge) return true; // merge operands found: the key exists
+                // Version::Get: a memtable range tombstone covers the key ("the remaining files we look at will only
+                // contain covered keys, so we stop here"): NotFound, the key definitely does not exist.
+                if (ctx.MaxCoveringTombstoneSeq > 0) return false;
                 // Table files: whether any file's filter may contain the key.
                 Comparator ucmp = cfd.UserComparator;
                 VersionStorageInfo s = sv.Current.Storage;

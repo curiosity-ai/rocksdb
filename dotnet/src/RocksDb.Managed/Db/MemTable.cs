@@ -678,7 +678,13 @@ public sealed unsafe class MemTable : IDisposable
     /// <inheritdoc cref="Get(in LookupKey, out ReadOnlySpan{byte}, out EntryType, out ulong, MergeContext?, ref ulong)"/>
     /// <param name="callback">Read callback (SaveValue's CheckCallback): entries it reports as invisible are skipped.</param>
     internal MemTableGetResult Get(scoped in LookupKey key, out ReadOnlySpan<byte> value, out EntryType valueType, out ulong sequence,
-        MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq, GetContext? timestampSink, ReadCallback? callback)
+        MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq, GetContext? timestampSink, ReadCallback? callback) =>
+        Get(key, out value, out valueType, out sequence, mergeContext, ref maxCoveringTombstoneSeq, timestampSink, callback, ignoreRangeDeletions: false);
+
+    /// <inheritdoc cref="Get(in LookupKey, out ReadOnlySpan{byte}, out EntryType, out ulong, MergeContext?, ref ulong)"/>
+    /// <param name="ignoreRangeDeletions">ReadOptions::ignore_range_deletions: this memtable's range tombstones are not consulted (MemTable::Get).</param>
+    internal MemTableGetResult Get(scoped in LookupKey key, out ReadOnlySpan<byte> value, out EntryType valueType, out ulong sequence,
+        MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq, GetContext? timestampSink, ReadCallback? callback, bool ignoreRangeDeletions)
     {
         value = default;
         valueType = EntryType.Value;
@@ -689,7 +695,7 @@ public sealed unsafe class MemTable : IDisposable
         ReadOnlySpan<byte> lookupUserKey = key.UserKey;
         ulong lookupSeq = key.Sequence;
         int tsSize = _ucmp.TimestampSize;
-        if (Volatile.Read(ref _isRangeDelTableEmpty) == 0)
+        if (!ignoreRangeDeletions && Volatile.Read(ref _isRangeDelTableEmpty) == 0)
         {
             // With user-defined timestamps the lookup key carries the read timestamp, which bounds the visible
             // tombstones (NewRangeTombstoneIterator(read_opts, ...) with read_opts.timestamp).

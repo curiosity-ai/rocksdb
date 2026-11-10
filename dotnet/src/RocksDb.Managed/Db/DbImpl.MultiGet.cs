@@ -41,6 +41,9 @@ internal sealed partial class DbImpl
         }
         if (_queryTracer is { } tracer) TraceMultiGet(tracer, cfd, batch, options);
         if (BlockCacheTracer.IsEnabled) SetBlockCacheTraceContext(Tracing.TableReaderCaller.UserMultiGet, default, options);
+        // MultiGetCommon: FailIfTsMismatchCf, a read timestamp on a column family without timestamps is InvalidArgument
+        // (for the whole call, like the timestamp checks of the timestamped path).
+        if (cfd.TimestampSize == 0) GetReadTimestamp(cfd, options);
         Statistics? st = Stats;
         long t0 = st is null ? 0 : st.StartTimer();
         SuperVersion sv = GetAndRefSuperVersion(cfd, out int svSlot);
@@ -70,6 +73,11 @@ internal sealed partial class DbImpl
                 return;
             }
             int[] order = batch.Order;
+            // ReadOptions::ignore_range_deletions (MemTable::MultiGet, TableCache::MultiGet).
+            if (options is not null && options.IgnoreRangeDeletions)
+            {
+                for (int k = 0; k < n; k++) batch.Context(k).IgnoreRangeDeletions = true;
+            }
             // MultiGetImpl skip_memtable: kPersistedTier reads skip the memtables once data was written without the
             // WAL. (kMemtableTier does not restrict MultiGet: like Get, it reads the table files.)
             bool skipMemTables = SkipMemTables(options);
@@ -426,6 +434,7 @@ internal sealed partial class DbImpl
                 for (int i = 0; i < count; i++)
                 {
                     GetContext ctx = batch.Context(sub[i]);
+                    if (ctx.IgnoreRangeDeletions) continue;
                     ulong cov = rangeDels.MaxCoveringTombstoneSeqnum(batch.UserKey(sub[i]), snapshot);
                     if (cov > ctx.MaxCoveringTombstoneSeq) ctx.MaxCoveringTombstoneSeq = cov;
                 }
