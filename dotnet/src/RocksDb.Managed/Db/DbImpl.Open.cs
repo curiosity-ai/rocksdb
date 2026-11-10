@@ -1031,7 +1031,9 @@ internal sealed partial class DbImpl
             progress.NextSequence = inserter.Sequence;
             // The entries applied before the failure stay in the memtables, and FinishLogFileProcessing publishes
             // next_sequence - 1 whenever the WAL's final status is OK (error ignored, or a point-in-time stop).
-            if (inserter.Sequence > seq)
+            // Only for a malformed batch body: a batch the memtable refused (e.g. an inverted DeleteRange) leaves the last
+            // sequence where it was, as native does (MosaikWritePathCompatTests.InvertedDeleteRangeFailsTheWriteLikeNative).
+            if (e is RocksDbException { Code: StatusCode.Corruption } and not InsertRejectedException && inserter.Sequence > seq)
             {
                 progress.AnyData = true;
                 if (inserter.Sequence - 1 > progress.LastSequence) progress.LastSequence = inserter.Sequence - 1;
