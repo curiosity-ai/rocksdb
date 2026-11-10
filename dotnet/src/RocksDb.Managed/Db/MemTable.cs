@@ -730,16 +730,18 @@ public sealed unsafe class MemTable : IDisposable
 
             ulong tag = Coding.DecodeFixed64(new ReadOnlySpan<byte>(ek.Ptr + userKeyLen, DbFormat.InternalKeyFooterSize));
             ulong seq = tag >> 8;
-            if (callback is not null && !callback.IsVisible(seq)) continue; // CheckCallback: to continue to the next seq
-            // With user-defined timestamps older timestamps sort after the lookup key whatever their seqno: entries
-            // newer than the read snapshot are skipped (native returns NotFound for keys written after the snapshot).
-            if (tsSize != 0 && seq > lookupSeq) continue;
+            // SaveValue (db/memtable.cc) verifies the entry before the visibility check: a corrupted entry of the key
+            // fails the lookup even when the read would skip it.
             if (_protectionBytes != 0)
             {
                 TestHooks.InvokeSpan("Memtable::SaveValue:Found:entry", new Span<byte>(entry, EncodedEntryLength(entry, _protectionBytes)));
                 // Memtable entry corrupted: Corruption ends the lookup (found_final_value).
                 VerifyEntryChecksum(entry, _protectionBytes);
             }
+            if (callback is not null && !callback.IsVisible(seq)) continue; // CheckCallback: to continue to the next seq
+            // With user-defined timestamps older timestamps sort after the lookup key whatever their seqno: entries
+            // newer than the read snapshot are skipped (native returns NotFound for keys written after the snapshot).
+            if (tsSize != 0 && seq > lookupSeq) continue;
             if (timestampSink is { TimestampSize: not 0 }) timestampSink.RecordTimestampOfUserKey(entryUserKey, seq);
             var type = (EntryType)(byte)tag;
             if (sequence == DbFormat.MaxSequenceNumber)

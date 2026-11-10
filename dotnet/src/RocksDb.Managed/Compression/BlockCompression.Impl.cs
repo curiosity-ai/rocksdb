@@ -358,7 +358,11 @@ public static partial class BlockCompression
             case CompressionType.LZ4:
             case CompressionType.LZ4HC:
             {
-                int got = LZ4Codec.Decode(payload, dst);
+                // LZ4_decompress_safe: an empty input is an error, and an empty output is only valid for the one-byte
+                // stream { 0 } (the encoding of an empty block).
+                int got = payload.IsEmpty ? -1
+                    : size == 0 ? (payload.Length == 1 && payload[0] == 0 ? 0 : -1)
+                    : LZ4Codec.Decode(payload, dst);
                 if (got != size)
                 {
                     ThrowHelper.Corruption(got < 0 ? "Error decompressing LZ4 data" : "Size mismatch decompressing LZ4 data");
@@ -441,19 +445,15 @@ public static partial class BlockCompression
         try
         {
             payload.CopyTo(input);
-            using var ms = new MemoryStream(input, 0, payload.Length, writable: false);
-            using var inflate = new DeflateStream(ms, CompressionMode.Decompress);
-            int total = 0;
-            while (total < dst.Length)
-            {
-                int r = inflate.Read(dst[total..]);
-                if (r == 0) break;
-                total += r;
-            }
-            Span<byte> extra = stackalloc byte[1];
-            if (total != dst.Length || inflate.Read(extra) != 0)
+            if (!TryInflate(input, payload.Length, dst, out bool streamEnded))
             {
                 ThrowHelper.Corruption("Size mismatch decompressing zlib data");
+            }
+            // Zlib_DecompressBlock: "if (st != Z_STREAM_END) return Corruption(...)": Z_OK is still corruption, the
+            // deflate stream must end within the block.
+            if (!streamEnded && s_zlibStreamEndDetectable)
+            {
+                ThrowHelper.Corruption("Failed zlib inflate: the deflate stream does not end");
             }
         }
         catch (InvalidDataException e)
@@ -464,5 +464,94 @@ public static partial class BlockCompression
         {
             RocksArrayPool<byte>.Shared.Return(input);
         }
+    }
+
+    /// <summary>
+    /// Inflates <paramref name="input"/>[0..<paramref name="length"/>) into <paramref name="dst"/>; false unless it
+    /// yields exactly dst.Length bytes. <paramref name="streamEnded"/>: the inflater reached the end of the deflate
+    /// stream (Z_STREAM_END) without asking for input past the payload. DeflateStream does not expose that state, but it
+    /// only reads its base stream when the inflater needs input and is not finished, so a read at the end of the payload
+    /// means the stream was cut before its end marker.
+    /// </summary>
+    private static bool TryInflate(byte[] input, int length, Span<byte> dst, out bool streamEnded)
+    {
+        using var source = new PayloadStream(input, length);
+        using var inflate = new DeflateStream(source, CompressionMode.Decompress);
+        int total = 0;
+        while (total < dst.Length)
+        {
+            int r = inflate.Read(dst[total..]);
+            if (r == 0) break;
+            total += r;
+        }
+        Span<byte> extra = stackalloc byte[1];
+        bool exact = total == dst.Length && inflate.Read(extra) == 0;
+        streamEnded = source.ReadsAtEnd == 0;
+        return exact;
+    }
+
+    /// <summary>
+    /// Whether <see cref="TryInflate"/> tells a complete deflate stream from one cut inside its last byte with this
+    /// runtime's DeflateStream (probed once; if not, the stream end check is skipped and such a block is accepted, its
+    /// bytes being the right ones).
+    /// </summary>
+    private static readonly bool s_zlibStreamEndDetectable = ProbeZlibStreamEndDetection();
+
+    private static bool ProbeZlibStreamEndDetection()
+    {
+        try
+        {
+            byte[] raw = new byte[600];
+            for (int i = 0; i < raw.Length; i++) raw[i] = (byte)('a' + (i % 7) + (i / 100));
+            byte[] deflated;
+            using (var ms = new MemoryStream())
+            {
+                using (var deflate = new DeflateStream(ms, CompressionLevel.Optimal, leaveOpen: true)) deflate.Write(raw);
+                deflated = ms.ToArray();
+            }
+            byte[] dst = new byte[raw.Length];
+            if (!TryInflate(deflated, deflated.Length, dst, out bool ended) || !ended) return false;
+            // Cut inside the last byte: either the output is short or the end must be reported as missing.
+            return !TryInflate(deflated, deflated.Length - 1, dst, out ended) || !ended;
+        }
+        catch (Exception e) when (e is InvalidDataException or IOException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Read-only stream over a payload that counts the reads made once all of it was handed out.</summary>
+    private sealed class PayloadStream(byte[] buffer, int length) : Stream
+    {
+        private int _position;
+
+        /// <summary>Reads requested after the whole payload had been returned.</summary>
+        public int ReadsAtEnd { get; private set; }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => length;
+        public override long Position { get => _position; set => throw new NotSupportedException(); }
+
+        public override int Read(Span<byte> destination)
+        {
+            if (destination.IsEmpty) return 0;
+            int n = Math.Min(destination.Length, length - _position);
+            if (n == 0)
+            {
+                ReadsAtEnd++;
+                return 0;
+            }
+            buffer.AsSpan(_position, n).CopyTo(destination);
+            _position += n;
+            return n;
+        }
+
+        public override int Read(byte[] destination, int offset, int count) => Read(destination.AsSpan(offset, count));
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] source, int offset, int count) => throw new NotSupportedException();
     }
 }

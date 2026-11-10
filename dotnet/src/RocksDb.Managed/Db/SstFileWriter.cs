@@ -273,6 +273,11 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
             _file!.Sync();
             return MakeInfo(builder);
         }
+        catch
+        {
+            DeleteAfterFailedFinish();
+            throw;
+        }
         finally
         {
             Close();
@@ -289,6 +294,11 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
             await builder.FinishAsync(cancellationToken).ConfigureAwait(false);
             await _file!.SyncAsync(cancellationToken).ConfigureAwait(false);
             return MakeInfo(builder);
+        }
+        catch
+        {
+            DeleteAfterFailedFinish();
+            throw;
         }
         finally
         {
@@ -324,6 +334,22 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
             }
         }
         return new(_path, smallest, largest, smallestRangeDel, largestRangeDel, 0, builder.FileSize, _numEntries, _numRangeDelEntries, 2);
+    }
+
+    /// <summary>
+    /// SstFileWriter::Finish: when finishing, syncing or closing the file fails, the file is deleted (a failure to
+    /// delete it is ignored).
+    /// </summary>
+    private void DeleteAfterFailedFinish()
+    {
+        Close();
+        try
+        {
+            _fs.DeleteFile(_path);
+        }
+        catch (Exception e) when (e is IOException or RocksDbException)
+        {
+        }
     }
 
     private static byte[] StripUserKey(byte[] key, int ts) => key.Length >= ts ? key.AsSpan(0, key.Length - ts).ToArray() : key;

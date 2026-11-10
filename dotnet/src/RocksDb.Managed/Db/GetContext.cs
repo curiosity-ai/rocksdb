@@ -101,8 +101,16 @@ internal sealed class GetContext
         int n = TimestampSize;
         if (HasTimestamp)
         {
-            if (!_tsFromRangeTombstone || sequence <= MaxCoveringTombstoneSeq) return;
-            _tsFromRangeTombstone = false;
+            if (_tsFromRangeTombstone && sequence > MaxCoveringTombstoneSeq)
+            {
+                _tsFromRangeTombstone = false;
+            }
+            else if (_timestamp.AsSpan(0, n).ContainsAnyExcept((byte)0xff))
+            {
+                return;
+            }
+            // else: a timestamp equal to kMaxTs is replaced by the one of the next entry processed (GetContext::SaveValue
+            // and MemTable's SaveValue: "timestamp->empty() || CompareTimestamp(*timestamp, kMaxTs) == 0").
         }
         if (_timestamp.Length < n) _timestamp = new byte[n];
         userKeyWithTimestamp[^n..].CopyTo(_timestamp);

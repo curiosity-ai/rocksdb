@@ -701,6 +701,18 @@ internal sealed partial class DbImpl
     {
         valueFound = false;
         ValidateReadSnapshot(options);
+        // DBImpl::KeyMayExist returns s.ok() || s.IsIncomplete() of GetImpl: its timestamp checks (FailIfCfHasTs /
+        // FailIfTsMismatchCf, InvalidArgument) answer false.
+        try
+        {
+            GetReadTimestamp(cfd, options);
+        }
+        catch (RocksDbException e) when (e.Code == StatusCode.InvalidArgument)
+        {
+            return false;
+        }
+        // Deviation: with user-defined timestamps the lookup itself is not run (always "may exist").
+        if (cfd.TimestampSize != 0) return true;
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         ulong snapshot = ReadSequence(options);
         GetContext ctx = GetContext.Rent(cfd.MergeOperator);

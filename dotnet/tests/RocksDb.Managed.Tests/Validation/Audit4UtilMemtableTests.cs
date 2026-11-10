@@ -386,7 +386,6 @@ public sealed class Audit4UtilMemtableTests
     }
 
     [TestMethod]
-    [Ignore("audit4: .NET's DeflateStream does not report whether the deflate stream ended (Z_STREAM_END); no local fix")]
     public void ZlibStreamWithoutEndMarkerIsCorruption()
     {
         // Zlib_DecompressBlock (util/compression.cc): `if (st != Z_STREAM_END) return Corruption("Failed zlib inflate")`

@@ -659,8 +659,20 @@ public sealed partial class BlockBasedTableReader : TableReader
                 else
                 {
                     filterSource = BlockBufferSource.TableBuffers;
-                    filterBuf = BlockFetcher.ReadRawPayload(file, footer, fh, verify, filterSource, out int flen);
-                    filter = CreateFilterReader(policy, filterBuf, flen);
+                    try
+                    {
+                        filterBuf = BlockFetcher.ReadRawPayload(file, footer, fh, verify, filterSource, out int flen);
+                        filter = CreateFilterReader(policy, filterBuf, flen);
+                    }
+                    catch (Exception e) when (e is RocksDbException or IOException)
+                    {
+                        // FullFilterBlockReader::Create (full_filter_block.cc): a filter block that cannot be read is
+                        // ignored (IGNORE_STATUS_IF_ERROR) and the table is opened without a filter.
+                        if (filterBuf is not null) TableBuilderBuffers.Return(filterSource, filterBuf);
+                        filterBuf = null;
+                        filter = null;
+                        filterKind = FilterKind.None;
+                    }
                 }
             }
             UserDefinedIndexReader? udi = OpenUserDefinedIndex(file, options, footer, metaBlocks, props, verify, out bool udiStub);
@@ -687,7 +699,18 @@ public sealed partial class BlockBasedTableReader : TableReader
                 // PrefetchIndexAndFilterBlocks with prefetch_index_and_filter_in_cache: warm the block cache, reading through
                 // `file` (the tail prefetch buffer of an async open).
                 if (prefetchIndexIntoCache) reader.PrefetchIndexIntoCache(metaCache!, file);
-                if (prefetchFilterIntoCache) reader.PrefetchFilterIntoCache(metaCache!, file, prefetchFilterHandle);
+                if (prefetchFilterIntoCache)
+                {
+                    try
+                    {
+                        reader.PrefetchFilterIntoCache(metaCache!, file, prefetchFilterHandle);
+                    }
+                    catch (Exception e) when (e is RocksDbException or IOException)
+                    {
+                        // FullFilterBlockReader::Create: a failed prefetch of the filter is ignored; lookups retry the read
+                        // (and answer "may match" while it fails).
+                    }
+                }
             }
             catch
             {
@@ -1688,7 +1711,23 @@ public sealed partial class BlockBasedTableReader : TableReader
     {
         // kBlockCacheTier: the partition index would have to be read (conservatively "may match").
         if (_filterIndexBlock is null && (flags & TableReadFlags.BlockCacheTier) != 0) return true;
-        BlockRef top = _filterIndexBlock is not null ? BlockRef.FromPinned(_filterIndexBlock) : GetBlockRef(_filterHandle, BlockKind.Filter, flags);
+        BlockRef top;
+        if (_filterIndexBlock is not null)
+        {
+            top = BlockRef.FromPinned(_filterIndexBlock);
+        }
+        else
+        {
+            try
+            {
+                top = GetBlockRef(_filterHandle, BlockKind.Filter, flags);
+            }
+            catch (Exception e) when (e is RocksDbException or IOException)
+            {
+                // PartitionedFilterBlockReader::MayMatch: GetOrReadFilterBlock failed (IGNORE_STATUS_IF_ERROR).
+                return true;
+            }
+        }
         BlockHandle partition;
         BlockIter it = IterPool.Rent();
         try
@@ -1736,12 +1775,28 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
         _stats?.Record(BlockCacheCounter.FilterMiss);
         if ((flags & TableReadFlags.BlockCacheTier) != 0) return true; // no I/O allowed: Incomplete -> may match
-        byte[] buf = BlockFetcher.ReadRawPayload(_file, _footer, handle, Verify(flags), out int len);
+        // FullFilterBlockReader::MayMatch / PartitionedFilterBlockReader::MayMatch: a filter block (or partition) that
+        // cannot be read is ignored (IGNORE_STATUS_IF_ERROR) and the key may match.
+        byte[] buf;
+        int len;
+        try
+        {
+            buf = BlockFetcher.ReadRawPayload(_file, _footer, handle, Verify(flags), out len);
+        }
+        catch (Exception e) when (e is RocksDbException or IOException)
+        {
+            return true;
+        }
         if (cache is not null && _bcTracer is { IsEnabled: true } tm) TraceAccess(tm, key, BlockKind.Filter, null, hit: false, flags, (ulong)len);
         IFilterBitsReader reader;
         try
         {
             reader = CreateFilterReader(_options.FilterPolicy!, buf, len);
+        }
+        catch (RocksDbException)
+        {
+            RocksArrayPool<byte>.Shared.Return(buf);
+            return true;
         }
         catch
         {
