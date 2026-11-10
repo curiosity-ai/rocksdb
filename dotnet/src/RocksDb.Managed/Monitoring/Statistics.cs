@@ -447,7 +447,7 @@ internal sealed class HistogramImpl
             ulong bucketValue = buckets[b];
             if (bucketValue == 0) continue;
             cumulative += bucketValue;
-            sb.Append(string.Format(CultureInfo.InvariantCulture, "{0} {1,7} , {2,7} ] {3,8} {4,7:F3}% {5,7:F3}% ",
+            sb.Append(string.Format(CultureInfo.InvariantCulture, "{0} {1,7}, {2,7} ] {3,8} {4,7:F3}% {5,7:F3}% ",
                 b == 0 ? '[' : '(', b == 0 ? 0 : HistogramBuckets.Limits[b - 1], HistogramBuckets.Limits[b], bucketValue,
                 mult * bucketValue, mult * cumulative));
             int marks = (int)(20 * ((double)bucketValue / num) + 0.5);

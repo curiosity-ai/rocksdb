@@ -454,6 +454,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     /// <summary>Port of the supported subset of DB::GetProperty (db/internal_stats.cc).</summary>
     public string? GetProperty(ColumnFamilyData cfd, string property)
     {
+        property = PropertyNameForLookup(property);
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         try
         {

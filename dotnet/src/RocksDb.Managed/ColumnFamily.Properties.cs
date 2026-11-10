@@ -185,9 +185,21 @@ public sealed partial class RocksDatabase
     {
         value = 0;
         IReadOnlyList<ColumnFamily> cfs = ColumnFamilies;
+        // CreateIntPropertyAggregator (db/internal_stats.cc): a block cache may be shared by several column families;
+        // BlockCachePropertyAggregator adds each cache once. Every other property is a plain sum.
+        bool perCache = property is DbProperties.BlockCacheCapacity or DbProperties.BlockCacheUsage or DbProperties.BlockCachePinnedUsage;
+        List<Cache.BlockCache>? seen = null;
         for (int i = 0; i < cfs.Count; i++)
         {
             if (!cfs[i].TryGetIntProperty(property, out ulong v)) return false;
+            if (perCache && _db.BlockCacheOf(cfs[i].Data) is Cache.BlockCache cache)
+            {
+                seen ??= new List<Cache.BlockCache>();
+                bool counted = false;
+                foreach (Cache.BlockCache c in seen) counted |= ReferenceEquals(c, cache);
+                if (counted) continue;
+                seen.Add(cache);
+            }
             value += v;
         }
         return true;

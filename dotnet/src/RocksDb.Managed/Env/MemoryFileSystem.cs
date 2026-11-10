@@ -139,8 +139,10 @@ public sealed class MemoryFileSystem : IFileSystem
                 RenameDirectoryLocked(s, t);
                 return;
             }
-            if (!_files.Remove(s, out MemFile? f)) throw NotFound("While renaming a file to " + target, source);
+            if (!_files.TryGetValue(s, out MemFile? f)) throw NotFound("While renaming a file to " + target, source);
+            // rename(2) fails with ENOENT and leaves the source in place when the target's directory does not exist.
             EnsureParentExists(t);
+            _files.Remove(s);
             _files[t] = f;
         }
     }

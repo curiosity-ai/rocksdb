@@ -190,6 +190,7 @@ internal sealed partial class DbImpl
     /// </summary>
     public bool TryGetIntProperty(ColumnFamilyData cfd, string property, out ulong value)
     {
+        property = PropertyNameForLookup(property);
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         IntPropertyResult r;
         IntPropertyValue v;
@@ -223,6 +224,7 @@ internal sealed partial class DbImpl
     /// </summary>
     public Dictionary<string, string>? GetMapProperty(ColumnFamilyData cfd, string property)
     {
+        property = PropertyNameForLookup(property);
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         try
         {
