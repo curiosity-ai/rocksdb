@@ -123,8 +123,9 @@ public sealed class TransactionDbOptions
     public int WpCommitCacheBits { get; set; } = 23;
 
     /// <summary>
-    /// Skip locking for writes made directly on the <see cref="TransactionDatabase"/> (skip_concurrency_control). Only
-    /// safe when the application guarantees no conflicts with concurrent transactions.
+    /// Skip locking for batches written directly on the <see cref="TransactionDatabase"/> with Write / WriteAsync
+    /// (skip_concurrency_control). Only safe when the application guarantees no conflicts with concurrent transactions.
+    /// Like upstream, the single-key writes (Put, Delete, SingleDelete, Merge) still lock their key.
     /// </summary>
     public bool SkipConcurrencyControl { get; set; }
 

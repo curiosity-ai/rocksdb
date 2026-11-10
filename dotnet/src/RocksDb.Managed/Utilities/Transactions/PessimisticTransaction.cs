@@ -78,6 +78,7 @@ internal class PessimisticTransaction : Transaction
         _commitTimestamp = MaxTimestamp;
         // TransactionBaseImpl::Reinitialize: start_time_ and indexing_enabled_.
         _startTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+        SetMaxWriteBatchSize(options.MaxWriteBatchSize);
         EnableIndexing();
         _batch.Batch.TrackTimestampSize = options.WriteBatchTrackTimestampSize;
         if (options.SetSnapshot) SetSnapshot();

@@ -98,7 +98,7 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     {
         DbOptions o = PrepareWrap(options, transactionDbOptions);
         RocksDatabase db = RocksDatabase.Open(path, o, OptimisticTransactionDatabase.PrepareColumnFamilies(columnFamilies));
-        return Initialize(db, transactionDbOptions);
+        return Initialize(db, transactionDbOptions, columnFamilies);
     }
 
     public static ValueTask<TransactionDatabase> OpenAsync(string path, DbOptions options, CancellationToken cancellationToken = default) =>
@@ -111,7 +111,7 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
         DbOptions o = PrepareWrap(options, transactionDbOptions);
         RocksDatabase db = await RocksDatabase.OpenAsync(path, o, OptimisticTransactionDatabase.PrepareColumnFamilies(columnFamilies), cancellationToken)
             .ConfigureAwait(false);
-        return Initialize(db, transactionDbOptions);
+        return Initialize(db, transactionDbOptions, columnFamilies);
     }
 
     /// <summary>TransactionDB::PrepareWrap: enables allow_2pc (on a copy of the options).</summary>
@@ -144,11 +144,13 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     /// PessimisticTransactionDB::Initialize: creates 'real' transactions from the prepared transactions recovered from
     /// the WAL (in the prepared state, without locks: skip_concurrency_control).
     /// </summary>
-    private static TransactionDatabase Initialize(RocksDatabase db, TransactionDbOptions options)
+    private static TransactionDatabase Initialize(RocksDatabase db, TransactionDbOptions options, IReadOnlyList<ColumnFamilyDescriptor> columnFamilies)
     {
         TransactionDatabase txnDb;
         try
         {
+            // PessimisticTransactionDB::Initialize: verify cf options (after the DB is open; a failure closes it).
+            foreach (ColumnFamilyDescriptor d in columnFamilies) VerifyCfOptions(d.Options, options.WritePolicy);
             txnDb = new TransactionDatabase(db, options);
             if (txnDb._wpDb is { } wp) txnDb.InitializeWritePrepared(wp);
             else txnDb.RebuildRecoveredTransactions();
@@ -162,6 +164,23 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     }
 
     /// <summary>PessimisticTransactionDB::Initialize: recovered prepared transactions become real ones (WriteCommitted).</summary>
+    /// <summary>
+    /// PessimisticTransactionDB::VerifyCFOptions: a transaction timestamp is 8 bytes (TxnTimestamp), and only
+    /// WriteCommitted transactions support column families with user-defined timestamps.
+    /// </summary>
+    private static void VerifyCfOptions(ColumnFamilyOptions cfOptions, TransactionWritePolicy policy)
+    {
+        Comparator ucmp = cfOptions.Comparator ?? Comparator.Bytewise;
+        int tsSize = ucmp.TimestampSize;
+        if (tsSize == 0) return;
+        if (tsSize != sizeof(ulong))
+        {
+            ThrowHelper.InvalidArgument("Timestamp of transaction must have " + sizeof(ulong) + " bytes. CF comparator " + ucmp.Name + " timestamp size is " +
+                tsSize.ToString(System.Globalization.CultureInfo.InvariantCulture) + " bytes");
+        }
+        if (policy != TransactionWritePolicy.WriteCommitted) ThrowHelper.NotSupported("Only WriteCommittedTxn supports timestamp");
+    }
+
     private void RebuildRecoveredTransactions()
     {
         foreach (RecoveredTransaction r in _db.Impl.TakeRecoveredTransactions())
@@ -467,13 +486,8 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
 
     private void Direct(WriteOptions? options, ColumnFamily? cf, DirectOp op, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
-        if (_options.SkipConcurrencyControl)
-        {
-            using WriteBatch b = WriteBatch.Rent();
-            AddOp(b, cf, op, key, value);
-            _db.Impl.WriteAsync(options, b, validateColumnFamilies: true, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
-            return;
-        }
+        // PessimisticTransactionDB::Put / Delete / SingleDelete / Merge do not consult skip_concurrency_control (only
+        // Write(batch) does): the key is always locked through an internal transaction.
         // Since the client didn't create a transaction, they don't care about conflict checking for this write. So we
         // just need to do PutUntracked().
         using PessimisticTransaction txn = BeginInternalTransaction(options);
@@ -490,28 +504,9 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     private async ValueTask DirectAsync(WriteOptions? options, ColumnFamily? cf, DirectOp op, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value,
         CancellationToken cancellationToken)
     {
-        if (_options.SkipConcurrencyControl)
-        {
-            using WriteBatch b = WriteBatch.Rent();
-            AddOp(b, cf, op, key.Span, value.Span);
-            await _db.Impl.WriteAsync(options, b, validateColumnFamilies: true, synchronous: false, cancellationToken).ConfigureAwait(false);
-            return;
-        }
         using PessimisticTransaction txn = BeginInternalTransaction(options);
         await txn.WriteUntrackedAsync(cf, (byte)op, key, value, cancellationToken).ConfigureAwait(false);
         await txn.CommitAsync(cancellationToken).ConfigureAwait(false);
-    }
-
-    private static void AddOp(WriteBatch b, ColumnFamily? cf, DirectOp op, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
-    {
-        uint id = cf?.Id ?? 0;
-        switch (op)
-        {
-            case DirectOp.Put: b.Put(id, key, value); break;
-            case DirectOp.Delete: b.Delete(id, key); break;
-            case DirectOp.SingleDelete: b.SingleDelete(id, key); break;
-            default: b.Merge(id, key, value); break;
-        }
     }
 
     // =====================================================================================================

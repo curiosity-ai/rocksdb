@@ -79,6 +79,20 @@ public abstract partial class Transaction : IDisposable
         }
     }
 
+    /// <summary>
+    /// write_batch_.SetMaxBytes (PessimisticTransaction::Initialize): the batch size limit of a transaction object that is
+    /// being reused. The (empty) batch is exchanged for one with the new limit when it differs.
+    /// </summary>
+    private protected void SetMaxWriteBatchSize(int maxBytes)
+    {
+        if (_batch.MaxBytes == maxBytes) return;
+        IndexedWriteBatch old = _batch;
+        _batch = _resourcePool is not null
+            ? _resourcePool.RentBatch(maxBytes)
+            : new IndexedWriteBatch(_db.Options.Allow2Pc, maxBytes, _db.UserComparatorOf);
+        old.Dispose();
+    }
+
     /// <summary>The database this transaction belongs to.</summary>
     public RocksDatabase Database => _database;
 
@@ -159,7 +173,11 @@ public abstract partial class Transaction : IDisposable
         _snapshotNeeded = false;
     }
 
-    /// <summary>Takes the snapshot lazily, at the next read or write through the transaction (SetSnapshotOnNextOperation).</summary>
+    /// <summary>
+    /// Takes the snapshot lazily, right before the next write or GetForUpdate / MultiGetForUpdate of the transaction
+    /// (SetSnapshotOnNextOperation). Like upstream, plain reads (Get, MultiGet, iterators) do not take it and
+    /// <see cref="Snapshot"/> stays unchanged until then.
+    /// </summary>
     public void SetSnapshotOnNextOperation() => _snapshotNeeded = true;
 
     /// <summary>Clears the snapshot (ClearSnapshot): later operations are not checked against it.</summary>
@@ -386,7 +404,6 @@ public abstract partial class Transaction : IDisposable
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(value);
         ColumnFamilyData cfd = Cfd(columnFamily);
-        SetSnapshotIfNeeded();
         return GetFromBatchAndDb(options, cfd, key, value);
     }
 
@@ -415,7 +432,6 @@ public abstract partial class Transaction : IDisposable
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(value);
         ColumnFamilyData cfd = Cfd(columnFamily);
-        SetSnapshotIfNeeded();
         return GetFromBatchAndDbAsync(options, cfd, key, value, cancellationToken);
     }
 
@@ -604,7 +620,6 @@ public abstract partial class Transaction : IDisposable
     {
         ThrowIfDisposed();
         ColumnFamilyData cfd = Cfd(columnFamily);
-        SetSnapshotIfNeeded();
         ColumnFamily handle = columnFamily ?? _database.DefaultColumnFamily;
         return new TransactionIterator(NewDbIterator(handle, cfd, options), _batch, cfd, options);
     }
@@ -621,7 +636,6 @@ public abstract partial class Transaction : IDisposable
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(batch);
         ColumnFamilyData cfd = Cfd(columnFamily);
-        SetSnapshotIfNeeded();
         var reader = new TxnMultiValueReader(this, options, cfd);
         _batch.MultiGet(cfd.Id, cfd.MergeOperator, cfd.TimestampSize, options, batch, ref reader);
     }
@@ -648,7 +662,6 @@ public abstract partial class Transaction : IDisposable
             ThrowIfError(WaitSync(TryLock(cfd, batch.GetKey(i), readOnly: true, exclusive: true, doValidate: true, assumeTracked: false, synchronous: true,
                 CancellationToken.None)));
         }
-        SetSnapshotIfNeeded();
         var reader = new TxnMultiValueReader(this, options, cfd);
         _batch.MultiGet(cfd.Id, cfd.MergeOperator, cfd.TimestampSize, options, batch, ref reader);
     }
