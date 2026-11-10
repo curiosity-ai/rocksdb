@@ -149,10 +149,10 @@ internal sealed class OptionTable<TOwner>
         Add(name, o => OptionStrings.FormatBool(get(o)), (o, v) => set(o, OptionStrings.ParseBool(name, v)));
 
     public OptionTable<TOwner> Int32(string name, Func<TOwner, int> get, Action<TOwner, int> set) =>
-        Add(name, o => get(o).ToString(CultureInfo.InvariantCulture), (o, v) => set(o, checked((int)OptionStrings.ParseInt64(name, v))));
+        Add(name, o => get(o).ToString(CultureInfo.InvariantCulture), (o, v) => set(o, OptionStrings.ParseInt32(name, v)));
 
     public OptionTable<TOwner> UInt32(string name, Func<TOwner, uint> get, Action<TOwner, uint> set) =>
-        Add(name, o => get(o).ToString(CultureInfo.InvariantCulture), (o, v) => set(o, checked((uint)OptionStrings.ParseUInt64(name, v))));
+        Add(name, o => get(o).ToString(CultureInfo.InvariantCulture), (o, v) => set(o, OptionStrings.ParseUInt32(name, v)));
 
     public OptionTable<TOwner> Int64(string name, Func<TOwner, long> get, Action<TOwner, long> set) =>
         Add(name, o => get(o).ToString(CultureInfo.InvariantCulture), (o, v) => set(o, OptionStrings.ParseInt64(name, v)));
@@ -373,6 +373,7 @@ internal static class OptionEnumMaps
     [
         ("kDisable", Managed.PrepopulateBlockCache.Disable),
         ("kFlushOnly", Managed.PrepopulateBlockCache.FlushOnly),
+        ("kFlushAndCompaction", Managed.PrepopulateBlockCache.FlushAndCompaction),
     ]);
 
     /// <summary>memtable_factory: class names (written) and nick names (accepted, optionally with ":args").</summary>
@@ -464,38 +465,89 @@ internal static class OptionStrings
         throw RocksDbException.InvalidArgument("Error parsing " + name + ": invalid number '" + v + "'");
     }
 
-    /// <summary>ParseUint64: decimal with optional k/K, m/M, g/G, t/T multiplier suffix.</summary>
-    public static ulong ParseUInt64(string name, string v)
+    /// <summary>
+    /// The number std::stoull / std::stoll read from the start of <paramref name="v"/> (util/string_util.cc): optional
+    /// whitespace, an optional sign, then decimal digits; the rest of the string is left to the caller. No digits is
+    /// std::invalid_argument, more than 64 bits std::out_of_range (both InvalidArgument here).
+    /// </summary>
+    private static ulong ParseLeadingNumber(string name, string v, out bool negative, out int end)
     {
-        ReadOnlySpan<char> s = v.AsSpan();
-        ulong mult = 1;
-        if (s.Length > 1)
+        int i = 0;
+        while (i < v.Length && v[i] is ' ' or '\t' or '\n' or '\v' or '\f' or '\r') i++;
+        negative = false;
+        if (i < v.Length && v[i] is '+' or '-')
         {
-            switch (s[^1])
-            {
-                case 'k' or 'K': mult = 1UL << 10; s = s[..^1]; break;
-                case 'm' or 'M': mult = 1UL << 20; s = s[..^1]; break;
-                case 'g' or 'G': mult = 1UL << 30; s = s[..^1]; break;
-                case 't' or 'T': mult = 1UL << 40; s = s[..^1]; break;
-            }
+            negative = v[i] == '-';
+            i++;
         }
-        if (!ulong.TryParse(s, NumberStyles.None, CultureInfo.InvariantCulture, out ulong n))
+        int digits = i;
+        ulong n = 0;
+        for (; i < v.Length && v[i] is >= '0' and <= '9'; i++)
         {
-            throw RocksDbException.InvalidArgument("Error parsing " + name + ": invalid unsigned integer '" + v + "'");
+            ulong d = (ulong)(v[i] - '0');
+            if (n > (ulong.MaxValue - d) / 10) throw RocksDbException.InvalidArgument("Error parsing " + name + ": out of range '" + v + "'");
+            n = n * 10 + d;
         }
-        return checked(n * mult);
+        if (i == digits) throw RocksDbException.InvalidArgument("Error parsing " + name + ": invalid integer '" + v + "'");
+        end = i;
+        return n;
     }
 
+    /// <summary>The shift of the k/K, m/M, g/G, t/T suffix: only the character right after the number counts.</summary>
+    private static int SuffixShift(string v, int end)
+    {
+        if (end >= v.Length) return 0;
+        return v[end] switch
+        {
+            'k' or 'K' => 10,
+            'm' or 'M' => 20,
+            'g' or 'G' => 30,
+            't' or 'T' => 40,
+            _ => 0,
+        };
+    }
+
+    /// <summary>
+    /// ParseUint64 (util/string_util.cc): std::stoull, then a k/m/g/t suffix shifts the value (without an overflow
+    /// check, like upstream); characters after that are ignored ("64MB" is 64 MiB). A leading '-' negates modulo 2^64,
+    /// as strtoull does.
+    /// </summary>
+    public static ulong ParseUInt64(string name, string v)
+    {
+        ulong n = ParseLeadingNumber(name, v, out bool negative, out int end);
+        if (negative) n = unchecked(0 - n);
+        return n << SuffixShift(v, end);
+    }
+
+    /// <summary>ParseInt64 (util/string_util.cc): std::stoll (out of range is an error), then the suffix shift.</summary>
     public static long ParseInt64(string name, string v)
     {
-        bool neg = v.StartsWith('-');
-        ulong mag = ParseUInt64(name, neg ? v[1..] : v);
-        if (neg)
+        ulong mag = ParseLeadingNumber(name, v, out bool negative, out int end);
+        if (mag > (negative ? (ulong)long.MaxValue + 1 : (ulong)long.MaxValue))
         {
-            if (mag > (ulong)long.MaxValue + 1) throw RocksDbException.InvalidArgument("Error parsing " + name + ": out of range");
-            return (long)(0 - mag);
+            throw RocksDbException.InvalidArgument("Error parsing " + name + ": out of range '" + v + "'");
         }
-        return checked((long)mag);
+        long n = negative ? unchecked((long)(0 - mag)) : (long)mag;
+        return n << SuffixShift(v, end);
+    }
+
+    /// <summary>
+    /// ParseInt / ParseInt32 (util/string_util.cc) for int options: a value that does not fit an int, also after the
+    /// suffix shift, is InvalidArgument (upstream's ParseInt32 throws std::out_of_range).
+    /// </summary>
+    public static int ParseInt32(string name, string v)
+    {
+        long n = ParseInt64(name, v);
+        if (n is < int.MinValue or > int.MaxValue) throw RocksDbException.InvalidArgument("Error parsing " + name + ": out of range '" + v + "'");
+        return (int)n;
+    }
+
+    /// <summary>ParseUint32 (util/string_util.cc): ParseUint64, std::out_of_range when the value needs more than 32 bits.</summary>
+    public static uint ParseUInt32(string name, string v)
+    {
+        ulong n = ParseUInt64(name, v);
+        if (n >> 32 != 0) throw RocksDbException.InvalidArgument("Error parsing " + name + ": out of range '" + v + "'");
+        return (uint)n;
     }
 
     /// <summary>isSpecialChar: '\\', '#', ':', '\r', '\n' are backslash-escaped.</summary>
@@ -569,7 +621,7 @@ internal static class OptionStrings
         if (v.Length == 0) return list;
         foreach (string part in v.Split(':'))
         {
-            list.Add(checked((int)ParseInt64(name, part.Trim())));
+            list.Add(ParseInt32(name, part.Trim()));
         }
         return list;
     }

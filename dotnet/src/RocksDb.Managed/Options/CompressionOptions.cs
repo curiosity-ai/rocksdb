@@ -75,15 +75,15 @@ public sealed class CompressionOptions : PersistedOptions<CompressionOptions>
     {
         string[] f = value.Split(':');
         if (f.Length < 3 || f.Length > 9) ThrowHelper.InvalidArgument("unable to parse the specified CF option " + name);
-        o.WindowBits = checked((int)OptionStrings.ParseInt64(name, f[0]));
-        o.Level = checked((int)OptionStrings.ParseInt64(name, f[1]));
-        o.Strategy = checked((int)OptionStrings.ParseInt64(name, f[2]));
+        o.WindowBits = OptionStrings.ParseInt32(name, f[0]);
+        o.Level = OptionStrings.ParseInt32(name, f[1]);
+        o.Strategy = OptionStrings.ParseInt32(name, f[2]);
         int i = 3;
-        if (i < f.Length) o.MaxDictBytes = unchecked((uint)checked((int)OptionStrings.ParseInt64(name, f[i++])));
-        if (i < f.Length) o.ZstdMaxTrainBytes = unchecked((uint)checked((int)OptionStrings.ParseInt64(name, f[i++])));
+        if (i < f.Length) o.MaxDictBytes = unchecked((uint)OptionStrings.ParseInt32(name, f[i++]));
+        if (i < f.Length) o.ZstdMaxTrainBytes = unchecked((uint)OptionStrings.ParseInt32(name, f[i++]));
         if (i < f.Length)
         {
-            if (i + 1 < f.Length) o.ParallelThreads = unchecked((uint)checked((int)OptionStrings.ParseInt64(name, f[i++])));
+            if (i + 1 < f.Length) o.ParallelThreads = unchecked((uint)OptionStrings.ParseInt32(name, f[i++]));
             else o.Enabled = OptionStrings.ParseBool(name, f[i++]);
         }
         if (i < f.Length) o.Enabled = OptionStrings.ParseBool(name, f[i++]);

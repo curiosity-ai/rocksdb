@@ -177,6 +177,7 @@ internal sealed partial class DbImpl
     {
         // ---- descriptors (DB::Open requires the default CF; we add it with default options when omitted) ----
         ValidateWriteModeOptions(Options, columnFamilies);
+        foreach (ColumnFamilyDescriptor d in columnFamilies) ValidateTableOptions(d.Options); // ValidateOptionsByTable
         var descriptors = new Dictionary<string, ColumnFamilyOptions>(StringComparer.Ordinal);
         foreach (ColumnFamilyDescriptor d in columnFamilies)
         {
@@ -467,6 +468,9 @@ internal sealed partial class DbImpl
     {
         ColumnFamilyOptions o = options.Clone();
         SanitizeCfOptions(o, Options.AllowIngestBehind, DbPaths.Count);
+        // SanitizeCfOptions: with atomic_flush an internal flush covers all column families even with fewer memtables
+        // than min_write_buffer_number_to_merge, so the option is sanitized to 1.
+        if (Options.AtomicFlush && o.MinWriteBufferNumberToMerge > 1) o.MinWriteBufferNumberToMerge = 1;
         // ColumnFamilyData::ValidateOptions (DB::Open / CreateColumnFamily).
         ValidateCfOptions(Options, o);
         o.DbOffpeakTime = OffpeakTime;
@@ -544,19 +548,24 @@ internal sealed partial class DbImpl
                 result.MaxCompactionBytes = result.TargetFileSizeBase * 25;
             }
         }
-        // periodic_compaction_seconds defaults (the managed port only has block-based tables).
+        // The ttl and periodic_compaction_seconds defaults apply to block-based tables only (is_block_based_table). The
+        // managed ttl default is the block-based value (30 days), so that value means "default" for other formats,
+        // where upstream sanitizes kDefaultTtl to 0.
+        bool isBlockBasedTable = result.TableFactory == TableFactoryType.BlockBasedTable;
         const ulong adjustedPeriodicCompSecs = 30UL * 24 * 60 * 60;
+        if (!isBlockBasedTable && result.Ttl == adjustedPeriodicCompSecs) result.Ttl = 0;
+        SanitizeTableOptions(result.TableOptions);
         if (result.CompactionStyle == CompactionStyle.Level)
         {
             if ((result.CompactionFilter is not null || result.CompactionFilterFactory is not null)
-                && result.PeriodicCompactionSeconds == ColumnFamilyOptions.DefaultPeriodicCompactionSeconds)
+                && result.PeriodicCompactionSeconds == ColumnFamilyOptions.DefaultPeriodicCompactionSeconds && isBlockBasedTable)
             {
                 result.PeriodicCompactionSeconds = adjustedPeriodicCompSecs;
             }
         }
         else if (result.CompactionStyle == CompactionStyle.Universal)
         {
-            if (result.PeriodicCompactionSeconds == ColumnFamilyOptions.DefaultPeriodicCompactionSeconds)
+            if (result.PeriodicCompactionSeconds == ColumnFamilyOptions.DefaultPeriodicCompactionSeconds && isBlockBasedTable)
             {
                 result.PeriodicCompactionSeconds = adjustedPeriodicCompSecs;
             }

@@ -441,6 +441,8 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
         c.DbPaths.AddRange(DbPaths);
         c.Listeners.AddRange(Listeners);
         c.CopyFrom(this);
+        // CopyFrom re-parses file_checksum_gen_factory by name, which only recreates the built-in factory.
+        c.FileChecksumGenFactory = FileChecksumGenFactory;
         c.SeqPerBatch = SeqPerBatch;
         c.BatchPerTxn = BatchPerTxn;
         c.BottomPriorityBackgroundThreads = BottomPriorityBackgroundThreads;

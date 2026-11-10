@@ -146,6 +146,8 @@ public enum PrepopulateBlockCache : byte
 {
     Disable,
     FlushOnly,
+    /// <summary>kFlushAndCompaction: also warm the cache with compaction outputs (typed and persisted only).</summary>
+    FlushAndCompaction,
 }
 
 /// <summary>Mirrors rocksdb::ReadTier.</summary>
