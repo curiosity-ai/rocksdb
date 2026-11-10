@@ -46,6 +46,16 @@ internal sealed partial class DbImpl
         }
     }
 
+    /// <summary>Test hook: merges a sample into the DB-wide mapping (e.g. an old write time for existing data).</summary>
+    internal void TestAddSeqnoToTimeSample(ulong seqno, ulong time)
+    {
+        lock (_mutex)
+        {
+            _seqnoToTimeMapping.AddUnenforced(seqno, time);
+            _seqnoToTimeMapping.Enforce(0);
+        }
+    }
+
     /// <summary>
     /// Port of DBImpl::EnsureSeqnoToTimeMapping (with InstallSuperVersionForConfigChange): data written after
     /// preserve / preclude is set on a column family must get a reasonable time estimate, so the mapping gets an entry

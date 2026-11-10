@@ -47,6 +47,9 @@ internal sealed partial class DbImpl
             OptionsFileNumber = LatestOptionsFileNumber(),
             PreserveInternalTimeSeconds = cfd.Options.PreserveInternalTimeSeconds,
             PrecludeLastLevelDataSeconds = cfd.Options.PrecludeLastLevelDataSeconds,
+            // CompactionJob::Prepare: preserve_time_min_seqno_floor_ of a bottommost-file compaction (else 0). The worker
+            // knows neither the reason nor the DB-wide seqno-to-time mapping.
+            PreserveTimeMinSeqnoFloor = c.Reason == CompactionReason.BottommostFiles ? c.InputStorage.PreserveTimeMinSeqno : 0,
         };
         (input.MinManifestFileNumber, input.MinManifestFileSize) = Versions.InstalledManifest;
         for (int l = 0; l < c.NumInputLevels; l++)
@@ -358,7 +361,7 @@ internal sealed partial class DbImpl
             if (ci.DbId.Length > 0) Identity = Identity with { DbId = ci.DbId };
             CancellationToken ct = options.Canceled;
             job = CompactionJob.ForRange(this, cfd, c, ci.Snapshots.ToArray(), Versions.NewFileNumber, ct,
-                ci.HasBegin ? ci.Begin : null, ci.HasEnd ? ci.End : null, outputPath);
+                ci.HasBegin ? ci.Begin : null, ci.HasEnd ? ci.End : null, outputPath, ci.PreserveTimeMinSeqnoFloor);
             await job.RunAsync(synchronous).ConfigureAwait(false);
             FileSystem.SyncDirectory(outputPath);
             FillResult(result, cfd, c, job, System.Diagnostics.Stopwatch.GetElapsedTime(start));

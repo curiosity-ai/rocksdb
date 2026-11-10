@@ -80,6 +80,13 @@ internal sealed class CompactionJob
     /// </summary>
     internal ulong EarliestWriteConflictSnapshot { get; init; } = DbFormat.MaxSequenceNumber;
 
+    /// <summary>
+    /// preserve_time_min_seqno_floor_ of a remote worker's job (CompactionServiceInput::preserve_time_min_seqno_floor):
+    /// sequence numbers below it may be zeroed even when the input files' own seqno-to-time mappings say otherwise.
+    /// 0 = none. A local bottommost-file compaction takes it from its input version instead (PrepareTimes).
+    /// </summary>
+    internal ulong PreserveTimeMinSeqnoFloor { get; init; }
+
     public CompactionJob(DbImpl db, ColumnFamilyData cfd, Compaction compaction, ulong[] snapshots, Func<ulong> newFileNumber,
         CancellationToken cancellation)
         : this(db, cfd, compaction, snapshots, newFileNumber, cancellation, null, null, 0)
@@ -91,8 +98,12 @@ internal sealed class CompactionJob
     /// worker running one subcompaction of the primary (CompactionServiceInput begin / end).
     /// </summary>
     internal static CompactionJob ForRange(DbImpl db, ColumnFamilyData cfd, Compaction compaction, ulong[] snapshots, Func<ulong> newFileNumber,
-        CancellationToken cancellation, byte[]? start, byte[]? end, string outputDirectory) =>
-        new(db, cfd, compaction, snapshots, newFileNumber, cancellation, start, end, 0) { OutputDirectory = outputDirectory };
+        CancellationToken cancellation, byte[]? start, byte[]? end, string outputDirectory, ulong preserveTimeMinSeqnoFloor) =>
+        new(db, cfd, compaction, snapshots, newFileNumber, cancellation, start, end, 0)
+        {
+            OutputDirectory = outputDirectory,
+            PreserveTimeMinSeqnoFloor = preserveTimeMinSeqnoFloor,
+        };
 
     /// <summary>
     /// Directory the output tables are written to instead of the DB paths (CompactionServiceCompactionJob::output_path_
@@ -520,6 +531,7 @@ internal sealed class CompactionJob
                 SnapshotChecker = SnapshotChecker,
                 JobSnapshot = JobSnapshot,
                 EarliestWriteConflictSnapshot = EarliestWriteConflictSnapshot,
+                PreserveTimeMinSeqnoFloor = PreserveTimeMinSeqnoFloor,
                 OutputDirectory = OutputDirectory,
             });
         }
@@ -787,7 +799,12 @@ internal sealed class CompactionJob
                 }
                 AddToOutput(iter);
             }
+            // The iterator's counters plus the range tombstone counters of the outputs finished during the loop
+            // (FinishCompactionOutputFile -> RecordDroppedKeys(range_del_out_stats) per output file).
+            CompactionIterationStats rangeDelOutStats = Stats.IterStats;
             Stats.IterStats = iter.Stats;
+            Stats.IterStats.NumRangeDelDropObsolete += rangeDelOutStats.NumRangeDelDropObsolete;
+            Stats.IterStats.NumRecordDropObsolete += rangeDelOutStats.NumRecordDropObsolete;
             Stats.NumInputRecords = iter.Stats.NumInputRecords;
             // SubcompactionState::CloseCompactionFiles: the output level's outputs, then the proximal level's.
             for (int g = 0; g < 2; g++)
@@ -969,6 +986,14 @@ internal sealed class CompactionJob
         if (preserveTimeDuration > 0 && TestPrecludeLastLevelMinSeqno is { } forced) precludeLastLevelMinSeqno = forced(precludeLastLevelMinSeqno);
         // Restore the invariant preserve_time_min_seqno <= preclude_last_level_min_seqno (test override).
         preserveTimeMinSeqno = Math.Min(precludeLastLevelMinSeqno, preserveTimeMinSeqno);
+        // CompactionJob::Prepare: a bottommost-file compaction exists only because the marker
+        // (ComputeBottommostFilesMarkedForCompaction) decided the file's largest seqno could be zeroed. The marker reads
+        // the DB-wide mapping, the value above only the input files' persisted mappings (sparse or empty for a file
+        // written before preserve / preclude was enabled): honor the version's boundary so the marked file makes progress
+        // instead of being re-marked forever. A remote worker gets the boundary from the primary.
+        ulong floor = PreserveTimeMinSeqnoFloor;
+        if (_c.Reason == CompactionReason.BottommostFiles) floor = _c.InputStorage.PreserveTimeMinSeqno;
+        preserveTimeMinSeqno = Math.Max(preserveTimeMinSeqno, floor);
         // Preserve sequence numbers for preserved write times and snapshots, though the specific sequence number of the
         // earliest snapshot can be zeroed.
         _preserveSeqnoAfter = Math.Min(Math.Max(preserveTimeMinSeqno, 1UL) - 1, _earliestSnapshot);
@@ -1352,10 +1377,18 @@ internal sealed class CompactionJob
                     }
                     ReadOnlySpan<byte> ts = tsSize == 0 ? default : tombstones.GetTimestamp(i, k);
 
+                    // TruncatedRangeDelMergingIter::Valid (AfterEndKey): a tombstone starting after the upper bound does not
+                    // belong to this output, so it is not counted as dropped for it either.
+                    if (tsSize == 0 && upperBound is not null && _icmp.Compare(upperBound, fStart, seq, EntryType.RangeDeletion) < 0)
+                    {
+                        stop = true;
+                        break;
+                    }
                     bool considerDrop = TombstoneConsiderDrop(tombstones, i, k);
                     if (considerDrop && bottommost)
                     {
                         Stats.IterStats.NumRangeDelDropObsolete++;
+                        Stats.IterStats.NumRecordDropObsolete++;
                         continue;
                     }
                     // tombstone_start (user key raised to the lower bound's) / truncated to [lower, upper]. With timestamps
@@ -1391,6 +1424,7 @@ internal sealed class CompactionJob
                     if (considerDrop && _c.KeyRangeNotExistsBeyondOutputLevel(DbFormat.ExtractUserKey(tStart), DbFormat.ExtractUserKey(tEnd), _out.RangeDelLevelPtrs))
                     {
                         Stats.IterStats.NumRangeDelDropObsolete++;
+                        Stats.IterStats.NumRecordDropObsolete++;
                         continue;
                     }
                     // The file stores the untruncated fragment; its boundaries do the truncation on read.
