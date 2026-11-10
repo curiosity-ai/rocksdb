@@ -219,7 +219,7 @@ public sealed class CheckpointIngestReadOnlyTests
         CollectionAssert.AreEqual(before, fs.GetChildren(DbPath).OrderBy(x => x, StringComparer.Ordinal).ToList(), "read-only open must not write");
         RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() =>
             RocksDatabase.OpenReadOnly(DbPath, new DbOptions { FileSystem = fs }, [new ColumnFamilyDescriptor("default", new ColumnFamilyOptions())], true));
-        Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+        Assert.AreEqual(StatusCode.Corruption, e.Code); // DBImpl::Recover: a non-empty WAL with error_if_wal_file_exists (audit4)
     }
 
     [TestMethod]

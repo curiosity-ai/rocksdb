@@ -358,14 +358,43 @@ internal sealed class ColumnFamilyData
         return m;
     }
 
-    /// <summary>Recomputes the next epoch number from the current files (recovery).</summary>
+    /// <summary>
+    /// Port of ColumnFamilyData::RecoverEpochNumbers / VersionStorageInfo::RecoverEpochNumbers(restart_epoch = true)
+    /// (db/version_set.cc), run on the version recovered from the MANIFEST: the epoch counter restarts at 1, with
+    /// allow_ingest_behind the first number is reserved (kReservedEpochNumberForFileIngestedBehind), and then either
+    /// the files' epoch numbers are inferred (some file has none: a MANIFEST written before epoch numbers existed) --
+    /// one number per non-empty level from the bottom up, then one per L0 file from oldest to newest -- or the counter
+    /// continues after the largest one. REQUIRES: the version is not shared yet (DB open).
+    /// </summary>
     public void RecoverEpochNumbers()
     {
-        ulong max = 0;
-        for (int l = 0; l < Current.Storage.NumLevels; l++)
+        NextEpochNumber = 1;
+        if (Options.AllowIngestBehind) NewEpochNumber();
+        VersionStorageInfo storage = Current.Storage;
+        ulong max = FileMetaData.UnknownEpochNumber;
+        bool missing = false;
+        for (int l = 0; l < storage.NumLevels; l++)
         {
-            foreach (FileMetaData f in Current.Storage.LevelFiles(l)) max = Math.Max(max, f.EpochNumber);
+            foreach (FileMetaData f in storage.LevelFiles(l))
+            {
+                missing |= f.EpochNumber == FileMetaData.UnknownEpochNumber;
+                max = Math.Max(max, f.EpochNumber);
+            }
         }
-        NextEpochNumber = max + 1;
+        if (!missing)
+        {
+            NextEpochNumber = Math.Max(max + 1, NextEpochNumber);
+            return;
+        }
+        for (int l = storage.NumLevels - 1; l >= 1; l--)
+        {
+            ReadOnlySpan<FileMetaData> files = storage.LevelFiles(l);
+            if (files.IsEmpty) continue;
+            ulong epoch = NewEpochNumber();
+            foreach (FileMetaData f in files) f.EpochNumber = epoch;
+        }
+        // L0 is ordered newest first (by sequence numbers while epoch numbers are missing).
+        ReadOnlySpan<FileMetaData> l0 = storage.NumLevels > 0 ? storage.LevelFiles(0) : default;
+        for (int i = l0.Length - 1; i >= 0; i--) l0[i].EpochNumber = NewEpochNumber();
     }
 }

@@ -107,7 +107,10 @@ internal sealed partial class DbImpl
 
         if (!FileSystem.FileExists(FileNames.CurrentFilePath(DbName)))
         {
-            throw new RocksDbException(StatusCode.InvalidArgument, "Invalid argument: " + DbName + ": does not exist (read-only open)");
+            // OpenForReadOnlyCheckExistence / VersionSet::Recover -> GetCurrentManifestPath: the failed read of CURRENT
+            // is the status (IOError with the PathNotFound subcode).
+            throw new RocksDbException(StatusCode.IOError, "IO error: No such file or directory: While opening a file for sequentially reading: " +
+                FileNames.CurrentFilePath(DbName), StatusSubCode.PathNotFound);
         }
         ulong manifestNumber;
         RecoveredVersionState state;
@@ -158,9 +161,16 @@ internal sealed partial class DbImpl
             ulong minLog;
             lock (_mutex) minLog = Math.Max(Versions.MinLogNumberWithUnflushedData(null), Versions.MinLogNumberToKeep);
             var wals = ListWalNumbers(minLog);
-            if (wals.Count > 0 && errorIfWalFileExists)
+            if (errorIfWalFileExists)
             {
-                ThrowHelper.InvalidArgument("Write Ahead Log file in " + WalDir + " exists, but error_if_wal_file_exists is true");
+                // DBImpl::Recover: every WAL file of the directory is checked; only a non-empty one is an error.
+                foreach (ulong n in ListWalNumbers(0))
+                {
+                    if (FileSystem.GetFileSize(FileNames.LogFileName(WalDir, n)) > 0)
+                    {
+                        ThrowHelper.Corruption("The db was opened in readonly mode with error_if_wal_file_exists flag but a non-empty WAL file already exists");
+                    }
+                }
             }
             // DBImpl::Recover(read_only = true): the same WAL checks and replay as the primary (ProcessLogFiles).
             CheckWalFilesExist(isNewDb: false, ListWalNumbers(0).Count);

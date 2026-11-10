@@ -232,6 +232,7 @@ internal sealed partial class DbImpl
             state = ManifestReader.RecoverFromDirectory(FileSystem, DbName, _comparatorResolver, out manifestNumber);
         }
         Versions.RecoverFrom(state, manifestNumber);
+        MarkExistingFileNumbersUsed();
         AddImplicitStatsColumnFamily(descriptors, state.FindColumnFamily(PersistentStatsColumnFamilyName) is not null);
 
         // Missing descriptors for existing CFs ("Column families not opened").
@@ -341,6 +342,8 @@ internal sealed partial class DbImpl
             if (cfd.Mem.IsEmpty && cfd.Imm.Count == 0) edit.LogNumber = Math.Max(cfd.LogNumber, newLogNumber);
             await Versions.LogAndApplyAsync(cfd, edit, synchronous, ct).ConfigureAwait(false);
         }
+        // DBImpl::Open: "Handle obsolete IDENTITY file", only after the recovery was committed.
+        if (!Options.WriteIdentityFile) TryDeleteFile(FileNames.IdentityFileName(DbName));
         // After reaching the post-recovery seqno but before creating SuperVersions ensure seqno to time mapping is
         // pre-populated as needed (a new DB with preserve / preclude set on any column family it is opened with).
         if (!exists)
@@ -380,6 +383,31 @@ internal sealed partial class DbImpl
         StartStatsPersist();
         EnableBackgroundCompactions();
         RegisterRecordSeqnoTimeWorker();
+    }
+
+    /// <summary>
+    /// Port of the file-number part of DBImpl::MaybeUpdateNextFileNumber (db/db_impl/db_impl_files.cc): a file of the DB
+    /// paths numbered at or above next_file_number (its number was allocated after the last MANIFEST write, then the
+    /// process died) advances next_file_number past the largest such number, so that no new file collides with it.
+    /// COMPACTION_PROGRESS files carry a timestamp, not a file number, and are left out.
+    /// </summary>
+    private void MarkExistingFileNumbersUsed()
+    {
+        var dirs = new List<string>(DbPaths);
+        if (!dirs.Contains(DbName)) dirs.Add(DbName);
+        foreach (string dir in dirs)
+        {
+            IEnumerable<string> children;
+            try { children = FileSystem.GetChildren(dir); }
+            catch (RocksDbException e) when (e.SubCode == StatusSubCode.PathNotFound) { continue; }
+            foreach (string child in children)
+            {
+                if (FileNames.TryParseFileName(child, out ulong number, out FileType type) && type != FileType.CompactionProgressFile)
+                {
+                    Versions.MarkFileNumberUsed(number);
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -675,6 +703,11 @@ internal sealed partial class DbImpl
         {
             if (FileNames.TryParseFileName(child, out ulong number, out FileType type) && type == FileType.WalFile)
             {
+                // DBImpl::Recover (best-efforts recovery does not list the WAL directory).
+                if (isNewDb && !Options.BestEffortsRecovery)
+                {
+                    ThrowHelper.Corruption("While creating a new Db, wal_dir contains existing log file: : " + child);
+                }
                 allWals.Add(number);
                 Versions.MarkFileNumberUsed(number);
                 if (number >= minLog) wals.Add(number);
@@ -952,6 +985,13 @@ internal sealed partial class DbImpl
         if (reconciled is not null) record = reconciled;
         ulong seq = Util.Coding.DecodeFixed64(record);
         progress.LastSeqnoObserved = seq;
+        if (seq > DbFormat.MaxSequenceNumber)
+        {
+            // DBImpl::ProcessLogRecord: a sequence that does not fit in 56 bits is reported as a corrupted record.
+            reporter.Corruption(record.Length, StatusCode.Corruption, "sequence " + seq.ToString(CultureInfo.InvariantCulture) + " is too large",
+                LogReporter.UnspecifiedLogNumber);
+            return true;
+        }
         if (progress.StopReplay)
         {
             // MaybeReviseStopReplayForCorruption: in point-in-time recovery mode, if sequence ids are consecutive we
@@ -977,8 +1017,9 @@ internal sealed partial class DbImpl
         {
             inserter.Run(record);
         }
-        catch (Exception e) when (e is DuplicateKeySeqException or InsertRejectedException)
+        catch (Exception e) when (e is DuplicateKeySeqException or InsertRejectedException or RocksDbException { Code: StatusCode.Corruption })
         {
+            // A Corruption is WriteBatchInternal::Iterate rejecting the batch body (unknown tag, bad entry, wrong count).
             // InsertLogRecordToMemtable failed: MaybeIgnoreError, else the failure becomes the WAL's status (reported
             // like a read error). next_sequence is the inserter's sequence at the failing entry.
             if (Options.ParanoidChecks)
@@ -988,6 +1029,13 @@ internal sealed partial class DbImpl
             else LogWarn("Ignoring error Corruption: " + e.Message);
             CheckSeqnoNotSetBackDuringRecovery(progress.NextSequence, inserter.Sequence);
             progress.NextSequence = inserter.Sequence;
+            // The entries applied before the failure stay in the memtables, and FinishLogFileProcessing publishes
+            // next_sequence - 1 whenever the WAL's final status is OK (error ignored, or a point-in-time stop).
+            if (inserter.Sequence > seq)
+            {
+                progress.AnyData = true;
+                if (inserter.Sequence - 1 > progress.LastSequence) progress.LastSequence = inserter.Sequence - 1;
+            }
             return true;
         }
         // next_sequence comes from the inserter, not the record header: a prepared section counts its entries but
