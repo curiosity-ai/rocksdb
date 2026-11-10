@@ -69,7 +69,7 @@ public sealed class Replayer : IDisposable
         record = null;
         if (!_prepared) throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Not prepared!");
         if (_traceEnd) return false;
-        if (!ReadTrace(out TraceEntry trace)) return false;
+        if (!ReadTrace(out TraceEntry trace, endOnUndecodable: false)) return false;
         if (trace.Type == TraceType.End)
         {
             _traceEnd = true;
@@ -108,7 +108,7 @@ public sealed class Replayer : IDisposable
         long epoch = Stopwatch.GetTimestamp();
         if (options.NumThreads <= 1)
         {
-            while (ReadTrace(out TraceEntry trace))
+            while (ReadTrace(out TraceEntry trace, endOnUndecodable: true))
             {
                 if (trace.Type == TraceType.End)
                 {
@@ -184,7 +184,7 @@ public sealed class Replayer : IDisposable
         }
         try
         {
-            while (Volatile.Read(ref failed) == 0 && ReadTrace(out TraceEntry trace))
+            while (Volatile.Read(ref failed) == 0 && ReadTrace(out TraceEntry trace, endOnUndecodable: true))
             {
                 if (trace.Type == TraceType.End)
                 {
@@ -215,8 +215,12 @@ public sealed class Replayer : IDisposable
         if (wait > 0) Thread.Sleep(TimeSpan.FromSeconds((double)wait / Stopwatch.Frequency));
     }
 
-    /// <summary>ReplayerImpl::ReadTrace: reads are serialized; false at the end of the data.</summary>
-    private bool ReadTrace(out TraceEntry trace)
+    /// <summary>
+    /// ReplayerImpl::ReadTrace: reads are serialized; false at the end of the data. A record shorter than its metadata
+    /// is Status::Incomplete upstream: Next reports it, Replay treats it like the end of the data
+    /// (<paramref name="endOnUndecodable"/>).
+    /// </summary>
+    private bool ReadTrace(out TraceEntry trace, bool endOnUndecodable)
     {
         byte[] encoded;
         lock (_readLock)
@@ -229,7 +233,11 @@ public sealed class Replayer : IDisposable
             }
             encoded = _buffer.WrittenSpan.ToArray();
         }
-        if (!TraceFormat.TryDecodeTrace(encoded, out trace)) throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Decode trace string failed");
+        if (!TraceFormat.TryDecodeTrace(encoded, out trace))
+        {
+            if (endOnUndecodable) return false;
+            throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Decode trace string failed");
+        }
         return true;
     }
 

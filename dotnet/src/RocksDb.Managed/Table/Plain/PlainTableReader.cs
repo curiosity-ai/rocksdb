@@ -176,6 +176,9 @@ public sealed class PlainTableReader : TableReader
                 if (!Coding.GetVarint32(ref s, out numBlocks)) numBlocks = 0;
             }
             TableMetaReader.Slice(_data, bloomHandle);
+            // num_blocks addresses cache lines of the bloom block (upstream reads out of bounds for a larger value).
+            if ((ulong)numBlocks * 64 /* CACHE_LINE_SIZE */ > bloomHandle.Size)
+                ThrowHelper.Corruption("plain table bloom filter: " + numBlocks + " blocks do not fit in a bloom block of " + bloomHandle.Size + " bytes");
             _bloom.SetRawData(_data, (int)bloomHandle.Offset, (uint)bloomHandle.Size * 8, numBlocks);
         }
         else

@@ -59,7 +59,9 @@ public sealed class PlainTableBuilder : TableBuilder
         _props.IndexSize = 0;
         _props.FilterSize = 0;
         // To support roll-back to previous version, now still use version 0 for plain encoding.
-        _props.FormatVersion = _encoder.EncodingType == PlainTableEncodingType.Plain ? 0UL : 1UL;
+        // Upstream tests the configured encoding_type here, not encoder_.GetEncodingType(): kPrefix without a prefix
+        // extractor writes kPlain keys (and the kPlain encoding-type property) but still records format_version 1.
+        _props.FormatVersion = tableOptions.EncodingType == PlainTableEncodingType.Plain ? 0UL : 1UL;
         _props.ColumnFamilyId = tableBuilderOptions.ColumnFamilyId;
         _props.ColumnFamilyName = tableBuilderOptions.ColumnFamilyName;
         _props.DbId = tableBuilderOptions.DbId;
