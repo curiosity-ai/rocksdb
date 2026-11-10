@@ -1752,7 +1752,7 @@ internal sealed partial class DbImpl
         }
 
         /// <summary>IsDuplicateKeySeq (util/duplicate_detector.h): recovery of a column family whose insert is skipped.</summary>
-        private bool IsDuplicateKeySeq(uint cf, ReadOnlySpan<byte> key) => (_dupDetector ??= new DuplicateDetector()).IsDuplicateKeySeq(cf, key, Sequence);
+        private bool IsDuplicateKeySeq(uint cf, ReadOnlySpan<byte> key) => (_dupDetector ??= new DuplicateDetector(_db)).IsDuplicateKeySeq(cf, key, Sequence);
 
         public void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
         {
@@ -1985,12 +1985,14 @@ internal sealed partial class DbImpl
 
     /// <summary>
     /// Port of DuplicateDetector (util/duplicate_detector.h): detects a key repeated within the current sub-batch
-    /// sequence number (recovery of a column family whose memtable insert is skipped). Keys are compared bytewise.
+    /// sequence number (recovery of a column family whose memtable insert is skipped). Like upstream's
+    /// std::set&lt;Slice, SetComparator&gt; (InitWithComp), keys are compared with the column family's comparator: keys it
+    /// considers equal are duplicates even when their bytes differ (the memtable would have refused the second one).
     /// </summary>
-    private sealed class DuplicateDetector
+    private sealed class DuplicateDetector(DbImpl db)
     {
         private ulong _batchSeq;
-        private readonly Dictionary<uint, HashSet<byte[]>> _keys = new();
+        private readonly Dictionary<uint, ISet<byte[]>> _keys = new();
 
         public bool IsDuplicateKeySeq(uint cf, ReadOnlySpan<byte> key, ulong seq)
         {
@@ -2000,11 +2002,22 @@ internal sealed partial class DbImpl
                 _keys.Clear();
             }
             _batchSeq = seq;
-            if (!_keys.TryGetValue(cf, out HashSet<byte[]>? set)) _keys[cf] = set = new HashSet<byte[]>(ByteArrayContentComparer.Instance);
+            if (!_keys.TryGetValue(cf, out ISet<byte[]>? set)) _keys[cf] = set = NewSet(cf);
             if (set.Add(key.ToArray())) return false;
             _keys.Clear();
-            _keys[cf] = new HashSet<byte[]>(ByteArrayContentComparer.Instance) { key.ToArray() };
+            set = NewSet(cf);
+            set.Add(key.ToArray());
+            _keys[cf] = set;
             return true;
+        }
+
+        /// <summary>InitWithComp: the key set of a column family, ordered by its comparator.</summary>
+        private ISet<byte[]> NewSet(uint cf)
+        {
+            Comparator cmp = db.UserComparatorOf(cf);
+            return cmp.CanKeysWithDifferentByteContentsBeEqual
+                ? new SortedSet<byte[]>(Comparer<byte[]>.Create((a, b) => cmp.Compare(a, b)))
+                : new HashSet<byte[]>(ByteArrayContentComparer.Instance);
         }
     }
 

@@ -4,6 +4,13 @@ internal sealed partial class DbImpl
 {
     private readonly SemaphoreSlim _optionsFileLock = new(1, 1);
 
+    /// <summary>
+    /// Set by a transaction DB: PessimisticTransactionDB::CreateColumnFamily / CreateColumnFamilies /
+    /// CreateColumnFamilyWithImport run VerifyCFOptions on the options of a column family created after the open, before
+    /// creating it (the managed transaction DB exposes the RocksDatabase itself, so the check hooks in here).
+    /// </summary>
+    internal Action<ColumnFamilyOptions>? VerifyNewColumnFamilyOptions { get; set; }
+
     /// <summary>Port of DBImpl::CreateColumnFamily(Impl).</summary>
     public async ValueTask<ColumnFamilyData> CreateColumnFamilyAsync(string name, ColumnFamilyOptions options, bool synchronous, CancellationToken ct)
     {
@@ -21,6 +28,7 @@ internal sealed partial class DbImpl
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
         ArgumentNullException.ThrowIfNull(options);
+        VerifyNewColumnFamilyOptions?.Invoke(options);
         ColumnFamilyOptions opts = PrepareCfOptions(options);
         RegisterComparator(opts);
         WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);

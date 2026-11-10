@@ -167,7 +167,13 @@ internal sealed class PointLockManager : LockManager
         }
         if (result is null) return default;
         long timeout = txn.LockTimeoutMicros;
-        if (timeout == 0) return new ValueTask<RocksDbException?>(result);
+        if (timeout == 0)
+        {
+            // AcquireWithTimeout: "On timeout, persist the lock information so we can debug the contention", also when
+            // the transaction does not wait at all (timeout == 0 skips only the retry loop).
+            if (result.Code == StatusCode.TimedOut) txn.SetWaitingTxn(waitIds, cf, key.ToArray());
+            return new ValueTask<RocksDbException?>(result);
+        }
         return AcquireWithTimeoutAsync(txn, map, stripe, cf, key.ToArray(), exclusive, timeout, synchronous, cancellationToken);
     }
 

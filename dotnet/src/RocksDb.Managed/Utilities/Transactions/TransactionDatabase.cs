@@ -152,6 +152,9 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
             // PessimisticTransactionDB::Initialize: verify cf options (after the DB is open; a failure closes it).
             foreach (ColumnFamilyDescriptor d in columnFamilies) VerifyCfOptions(d.Options, options.WritePolicy);
             txnDb = new TransactionDatabase(db, options);
+            // PessimisticTransactionDB::CreateColumnFamily*: column families created later are verified too.
+            TransactionWritePolicy policy = options.WritePolicy;
+            db.Impl.VerifyNewColumnFamilyOptions = o => VerifyCfOptions(o, policy);
             if (txnDb._wpDb is { } wp) txnDb.InitializeWritePrepared(wp);
             else txnDb.RebuildRecoveredTransactions();
         }

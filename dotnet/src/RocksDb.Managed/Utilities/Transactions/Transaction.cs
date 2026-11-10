@@ -187,6 +187,9 @@ public abstract partial class Transaction : IDisposable
         _snapshotNeeded = false;
     }
 
+    /// <summary>snapshot_needed_: a snapshot requested with <see cref="SetSnapshotOnNextOperation"/> was not taken yet.</summary>
+    private protected bool SnapshotNeeded => _snapshotNeeded;
+
     private protected void SetSnapshotIfNeeded()
     {
         if (_snapshotNeeded) SetSnapshot();

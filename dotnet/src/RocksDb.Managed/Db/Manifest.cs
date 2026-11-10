@@ -293,7 +293,17 @@ public sealed class ManifestReplayer
                 cf.ComparatorName = edit.ComparatorName;
                 cf.PersistUserDefinedTimestamps = edit.PersistUserDefinedTimestamps ?? true;
             }
-            if (edit.FullHistoryTsLow is { Length: > 0 } ts) cf.FullHistoryTsLow = ts;
+            if (edit.FullHistoryTsLow is { Length: > 0 } ts)
+            {
+                // VersionEditHandler::ExtractInfoFromVersionEdit -> ColumnFamilyData::SetFullHistoryTsLow: only increases
+                // (two racing IncreaseFullHistoryTsLow calls can log a lower value after a higher one). The comparator is
+                // only known here when it is a built-in one; otherwise the last value wins.
+                if (cf.FullHistoryTsLow is not { } cur || cur.Length != ts.Length || cf.ComparatorName is null
+                    || !Comparator.TryGetBuiltin(cf.ComparatorName, out Comparator? ucmp) || ucmp.CompareTimestamp(ts, cur) > 0)
+                {
+                    cf.FullHistoryTsLow = ts;
+                }
+            }
         }
         if (edit.PrevLogNumber is ulong prev) _state.PrevLogNumber = prev;
         if (edit.NextFileNumber is ulong next)

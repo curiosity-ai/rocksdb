@@ -201,14 +201,14 @@ public sealed class Audit4TransactionsTests
     }
 
     [TestMethod]
-    [Ignore("audit4: needs timestamped snapshots (DBImpl::CreateTimestampedSnapshot / SnapshotCreationCallback), not ported")]
     public void CommitWithPendingSnapshotRequestNeedsACommitTimestamp()
     {
         // WriteCommittedTxn::CommitWithoutPrepareInternal / CommitInternal (pessimistic_transaction.cc): "if
         // (snapshot_needed_) { if (commit_timestamp_ == kMaxTxnTimestamp) return Status::InvalidArgument("Must set
         // transaction commit timestamp"); else post_mem_cb = &snapshot_creation_cb; }" -- a snapshot requested with
         // SetSnapshotOnNextOperation and still pending at Commit (no write / GetForUpdate took it) is created by the
-        // commit as a timestamped snapshot, which requires a commit timestamp. The port commits and takes no snapshot.
+        // commit as a timestamped snapshot, which requires a commit timestamp. The port raises this error; timestamped
+        // snapshots themselves are not ported (with a commit timestamp the commit takes no snapshot).
         using TransactionDatabase db = Open();
         using Transaction txn = db.BeginTransaction(s_wo);
         txn.SetSnapshotOnNextOperation();

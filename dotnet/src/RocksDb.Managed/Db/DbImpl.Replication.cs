@@ -106,7 +106,7 @@ internal sealed partial class DbImpl
     /// <summary>
     /// Port of WalManager::PurgeObsoleteWALFiles: deletes archived WALs older than WAL_ttl_seconds and, with
     /// WAL_size_limit_MB, the oldest archived WALs beyond the size budget. Runs at most every
-    /// min(600s, ttl/2) unless <paramref name="force"/>.
+    /// min(600s, max(1s, ttl/2)) unless <paramref name="force"/>.
     /// </summary>
     internal void PurgeObsoleteWalFiles(bool force)
     {
@@ -114,7 +114,7 @@ internal sealed partial class DbImpl
         bool sizeLimitEnabled = Options.WalSizeLimitMb > 0;
         if (!ttlEnabled && !sizeLimitEnabled) return;
         long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        long timeToCheck = ttlEnabled ? (long)Math.Min((ulong)DefaultIntervalToDeleteObsoleteWal, Options.WalTtlSeconds / 2) : DefaultIntervalToDeleteObsoleteWal;
+        long timeToCheck = ttlEnabled ? (long)Math.Min((ulong)DefaultIntervalToDeleteObsoleteWal, Math.Max(1UL, Options.WalTtlSeconds / 2)) : DefaultIntervalToDeleteObsoleteWal;
         lock (_mutex)
         {
             if (FileDeletionsDisabled) return;

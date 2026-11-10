@@ -123,6 +123,9 @@ internal class WritePreparedTxn : PessimisticTransaction
         PrepareSequence = 0;
     }
 
+    // WritePreparedTxn::CommitWithoutPrepareInternal / CommitInternal do not read snapshot_needed_.
+    private protected override bool CommitChecksPendingSnapshotRequest => false;
+
     // WritePrepared transactions do not support user-defined timestamps (TransactionDB::Open fails with them).
     private protected override bool SupportsUserDefinedTimestamps => false;
 
