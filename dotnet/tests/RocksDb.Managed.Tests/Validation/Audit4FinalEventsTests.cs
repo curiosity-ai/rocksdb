@@ -607,7 +607,6 @@ public sealed partial class Audit4FinalEventsTests
     // ---- atomic flush request tickers ---------------------------------------------------------------------------
 
     [TestMethod]
-    [Ignore("audit4: the recording site is SwitchMemtablesForFlushAsync in Db/DbImpl.Flush.cs (owned by another change); DbImpl.RecordAtomicFlushRequestReason is ready to be called there")]
     public void AtomicFlushRequestReasonTickers()
     {
         // DBImpl::EnqueuePendingFlush (db_impl_compaction_flush.cc:4548): every queued atomic FlushRequest records

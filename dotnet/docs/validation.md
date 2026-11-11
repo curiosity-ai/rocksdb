@@ -1246,13 +1246,34 @@ slice did not reach. Every finding below was proven by a test that failed before
 | PlainTable, CuckooTable, tracing, tools | `plain_table_*.cc`, `cuckoo_table_reader.cc`, `trace_replay.cc`, `replayer_impl.cc`, `ldb_cmd.cc` | PlainTable format_version property; corrupt sizes / geometry / trace record sizes are Corruption; replay ends on an undecodable record; ldb entity columns, `dump --to` in comparator order, `idump --max_keys=0`, map properties; sst_dump TimedPut values. |
 | Trie index | `louds_trie.cc` | A data block ending with the empty user key failed the flush for good. The empty separator is stored as the root's prefix key (upstream drops the handle and writes a broken index). |
 
-### Open (tests kept with `[Ignore]`)
+### Closing round (2026-11-11)
 
-- **atomic_flush**: a full memtable switches and flushes only its own column family; upstream switches every column
-  family with unflushed data and commits one atomic flush (`DBImpl::ScheduleFlushes`). Only error recovery and manual
-  recovery flushes are atomic. `Audit4FollowUpCompactionTests.AtomicFlushFlushesEveryColumnFamilyWhenOneMemtableIsFull`.
-- **DBWithTTL and SingleDelete**: native `DBWithTTL::Write` drops a SingleDelete inside a user batch (its handler has no
-  SingleDeleteCF); the port applies it. `Audit4FollowUpReadCompatTests.ManagedTtlWriteTreatsSingleDeleteOfABatchLikeNative`.
+A second round closed the items the first one left open, read the files it had not reached and settled its unproven
+suspicions one by one (tests: `Audit4Closing*Tests.cs`, `Audit4Final*Tests.cs`). No audit test is `[Ignore]`d.
+
+| Area | C++ source | What was wrong (now fixed) |
+|---|---|---|
+| atomic_flush | `DBImpl::ScheduleFlushes` / `HandleWriteBufferManagerFlush` / `SwitchWAL`, `AtomicFlushMemTables`, `AtomicFlushMemTablesToOutputFiles` | With atomic_flush a full memtable flushed only its own column family. Automatic (memtable full, write buffer manager, WAL size) and manual flushes, and the flushes of CompactRange, ingestion, checkpoint and shutdown, now switch every column family holding data and commit one MANIFEST atomic group; a failed member installs nothing. The reason tickers are recorded. |
+| File quarantine | `VersionSet::AddFilesToQuarantine`, `FindObsoleteFiles` | The files of an edit whose MANIFEST write failed are kept (flush, compaction, ingestion, import outputs: the record may be durable) and skipped by the obsolete-file full scan until the next successful MANIFEST write. Without it the scan, which now also runs at every writable close like `CloseHelper`, deleted a file the MANIFEST may reference. |
+| Writers | `WritableFileWriter::seen_error_` | Table and blob file writers keep a sticky error: a file whose append or sync failed cannot be finished or installed by a retry. (The MANIFEST writer is dropped after any failure and a new MANIFEST is started.) |
+| Flush | `FlushJob::Run` (RollbackMemtableFlush), `FlushMemTableImpl`, `BackgroundCallFlush`, `DBImpl::SwitchMemtable` | A finished flush is not installed once a background error stopped background work; a manual flush seals the memtable before reporting a background error; a failed flush that does not stop background work is retried after one second (it spun); empty column families' memtables get a new creation sequence at a switch. |
+| Best-efforts recovery | `VersionEditHandlerPointInTime` (`MaybeCreateVersionBeforeApplyEdit`, `LoadTables`), `VersionBuilder` (edited_in_atomic_group) | Versions are created on negative edges (and at an atomic group begin / at the end), must load their tables (a Corruption skips that point in time instead of failing the open), are not created while log number / next file number / last sequence are unknown, and a group member without file changes still accepts a missing L0 suffix. |
+| Versions | `VersionBuilder::CheckConsistency`, `SaveSSTFilesTo`, `ColumnFamilySet::GetNextColumnFamilyID` | L0 order and the consistency check with files lacking an epoch number; a failed CreateColumnFamily consumes its id. |
+| Error recovery, WaitForCompact | `error_handler.cc` (recovery half), `DBImpl::WaitForCompact`, `BackgroundCompaction` | WaitForCompact returns the background error / ShutdownInProgress; recovery end is notified at shutdown; non-retryable file-scoped recovery errors end the retry loop; a manual Resume that throws does not stay "in progress"; a compaction cancelled for lack of room is requeued. |
+| Remote compaction | `compaction_service_job.cc`, `DBImplSecondary::CompactWithoutInstallation` / `OpenAndCompact`, `DBImpl::CaptureOptionsFileNumber` | The worker declines a MANIFEST recovered short of the primary's size and a differing per-key placement decision; the primary sends that decision; a non-OK result fails before the blob checks; the job's OPTIONS file is kept while it runs; CompactFiles with a service is never a trivial move. |
+| MultiGet | `DBImpl::MultiGetImpl` | With a soft limit the active memtable is read for the whole batch before the immutable ones; the deadline is checked before each batch of 32 keys; MEMTABLE_HIT / MISS are counted. |
+| Iterators, entities | `DBIter::MergeWithWideColumnBaseValue`, `GetContext` (default column), `read_path_blob_resolver.cc` | A merge on an entity with blob columns reused the entity resolved for the previous key (wrong result); Get of an entity reads only the default column; an empty range of a lazy blob column does no I/O. |
+| Table files | `FileMetaData::CalculateTailSize`, `block_based_table_builder.cc`, `filter_policy.cc`, `block_builder.cc` | Tail size of files without data blocks (ingested, imported, repaired, remote outputs); `rocksdb.lsm.info.at.creation`; the read-only `rocksdb.BuiltinBloomFilter` policy id; the key distribution CV histogram of index blocks; IsFilterCompatible with timestamps; ApproximateOffsetOf on index errors. |
+| Caches | `clock_cache.cc`, `cache_reservation_manager.h`, `block_cache_tier.cc`, `persistent_cache_util.h`, `sharded_cache.cc` | HyperClockCache pinned usage; concurrent reservations under one lock; the block cache tier accepts keys of any length; pipelined insert backlog bound; the row cache shard count follows its capacity. |
+| Backup, WAL files | `backup_engine.cc` (InferDBFilesToRetainInRestore), `wal_iterator_impl.cc`, `writable_file_writer.cc` | Incremental restore keeps a file only under its exact name; meta lines with a trailing delimiter; the WAL iterator without files stops at a known recovery gap; range sync leaves the last mebibyte and is off with direct I/O. |
+| Transactions | `write_unprepared_txn_db.cc`, `point_lock_manager.cc` | A recovered unprepared rollback rejects DeleteRange; waiting info only for lock timeouts. |
+| Statistics, EVENT_LOG, listeners | `block_fetcher.cc`, `delete_scheduler.cc`, `builder.cc`, `random_access_file_reader.cc`, `event_helpers.cc`, `compaction_job.cc` | Tickers now recorded: block checksum compute / mismatch, compression bypassed / rejected, files deleted immediately / marked trash, memtable payload / garbage at flush, block cache bytes read / insert, last-level and non-last-level reads, NO_FILE_OPENS, NUMBER_ITER_SKIP. table_file_creation is logged with its status for failed and empty outputs; compaction_started carries the placement cutoffs; seqno-to-time mapping text. An obsolete WAL in the DB directory is deleted through the SstFileManager. |
+| Tools, tracing, misc | `ldb_cmd.cc`, `ldb_tool.cc`, `sst_file_dumper.cc`, `louds_trie.cc`, `env_mirror.cc`, `io_tracer.cc`, `db_impl.cc` (CloseHelper) | ldb: per-command option validation, argument and integer parsing, option overrides, idump --count_delim, dump / dump_wal / manifest_dump error handling, blob files in list_live_files_metadata; sst_dump --decode_blob_index; an inconsistent trie block is Corruption; EnvMirror short reads; an unknown IO trace bit is ignored; StartTrace over a running trace; obsolete files are purged at close. |
+
+Tickers still not recorded: `number.superversion_acquires` / `releases` (no thread-local super version cache),
+`compaction.total.time.cpu_micros` (no per-thread CPU clock), `non.last.level.seek.*`,
+`block.cache.compression.dict.bytes.insert`; COMPACT_READ_BYTES / COMPACT_WRITE_BYTES / FLUSH_WRITE_BYTES are file
+sizes (upstream: the job thread's IOSTATS). `Audit4ClosingToolsCompatTests` compares the others with native.
 
 ### Known deviations recorded by this audit
 
@@ -1283,9 +1304,32 @@ slice did not reach. Every finding below was proven by a test that failed before
   SeekToLast / SeekForPrev (its reverse descent never looks at a label-less root's prefix key).
 - **Plain-write sub-batch counting** accepts PutEntity / TimedPut / DeleteRange in a WritePrepared DB (upstream's
   SubBatchCounter has no handler for them).
-- **Sticky writer errors** exist for the WAL writer only (not for MANIFEST / SST writers).
 - **CompactRange on a UDT column family** always flushes the memtable; `ClipColumnFamily` rejects a UDT column family
   up front.
+- **DBWithTTL and SingleDelete.** Native `DBWithTTL::Write` drops a SingleDelete inside a user batch (its handler
+  has no SingleDeleteCF); the port applies it. Pinned by
+  `Audit4FollowUpReadCompatTests.ManagedTtlWriteAppliesSingleDeleteOfABatchWhereNativeDropsIt`.
+- **Close.** `Dispose` corresponds to `~DBImpl`: unreleased snapshots do not fail it (upstream's explicit
+  `DB::Close` returns Aborted).
+- **Flush retry.** The port retries a failed flush by itself after the back-off (upstream consumes the request);
+  when the error stopped background work the column family stays queued for the recovery.
+- **Atomic flush accounting.** An atomic flush over N column families counts as N running flushes.
+- **Remote worker options.** preserve_internal_time_seconds / preclude_last_level_data_seconds come from the OPTIONS
+  file named in the job input, not from the input fields.
+- **Entity reads.** MultiGet, GetMergeOperands and transaction reads resolve every blob column of an entity (Get
+  reads only the default column, as upstream).
+- **MultiGet soft limit.** A merge resolved at the end of history counts with its base value's size.
+- **OPTIONS parsing.** Unknown options are kept regardless of the file's version (upstream rejects them when the
+  file is not newer than the library).
+- **Listener details.** OnFlushBegin reports the allocated file number (upstream: 0 at that point);
+  OnTableFileDeleted reports job id 0; an empty flush output's creation event reports file number 0; creation events
+  are not raised for remote compaction outputs on the primary (as upstream); compactions run by a compaction
+  service log compaction_started without the placement cutoffs.
+- **EVENT_LOG blob_file_creation** prints the file checksum as hex (upstream streams the raw bytes).
+- **WritePrepared transaction Get** throws TryAgain for an invalidated read that found nothing (upstream only for a
+  found value).
+- **Best-efforts recovery** opens every table of a candidate version (upstream at most 16 with a finite
+  max_open_files).
 - Not ported, found by this audit: `MergeOperator::ShouldMerge`, `ReadOptions::merge_operand_count_threshold`,
   `SstFileWriter::PutEntity`, `ReadOptions::auto_refresh_iterator_with_snapshot`,
   `FlushOptions::allow_write_stall` / `CompactRangeOptions::allow_write_stall` (accepted, ignored),
@@ -1296,28 +1340,27 @@ slice did not reach. Every finding below was proven by a test that failed before
 
 ### Coverage of this audit
 
-Read side by side with the C++ sources (first pass or follow-up): compaction iterator and job, MergeUntil, flush
-(BuildTable), CompactRange / CompactFiles / ReFitLevel, the pickers and VersionStorageInfo, DBIter and the multi-CF
-iterators, Get / MultiGet (DB, version and table level), GetContext, table cache and row cache, level iterator, range
-tombstone fragmenter and aggregator, inline skip list, block iterators and index builders, footer, SstFileWriter /
-SstFileReader, the memtable, WriteBatch, write thread, write path incl. the WAL-only queue, WAL reader for tailing,
-transaction log iterator, VersionEdit, MANIFEST replay, DB open and WAL recovery, the error handler's classification
-and SetBGError, obsolete-file deletion (C# side), secondary WAL replay, ingestion, import / export, checkpoint, blob
-files, wide-column serialization, pessimistic / optimistic / write-prepared / write-unprepared transactions, point and
-range lock managers, WriteBatchWithIndex and BaseDeltaIterator, options parsing / sanitization / validation, the
-secondary cache adapter and compressed / tiered secondary caches, backup engine (from line 940), WAL manager,
-seqno-to-time mapping, internal stats properties, histograms, rate limiter, file systems, PlainTable, CuckooTable,
-trace formats, trie index factory. Option defaults and the ticker / histogram name tables were diffed by script.
+Read side by side with the C++ sources over the two rounds: compaction iterator and job, MergeUntil, flush
+(BuildTable, FlushJob::Run, the manual and background flush paths), CompactRange / CompactFiles / ReFitLevel, the
+pickers and VersionStorageInfo, the job-running branch of BackgroundCompaction and the compaction queue, the remote
+compaction driver and worker, DBIter and the multi-CF / attribute-group iterators, Get / MultiGet at DB, version and
+table level, GetContext, table cache and row cache, level iterator, range tombstone fragmenter and aggregator, inline
+skip list, block iterators, block and index builders, footer, meta blocks, block fetcher, filter block readers,
+filter builders, Bloom and Ribbon, SstFileWriter / SstFileReader, the memtable, WriteBatch, write thread, write path
+incl. the WAL-only queue, WAL reader for tailing, transaction log iterator, VersionEdit, VersionBuilder, MANIFEST
+replay, best-efforts recovery, DB open and WAL recovery, close, the error handler, obsolete-file deletion, column
+family creation / drop / super versions, secondary WAL replay, ingestion, import / export, checkpoint, blob files,
+wide-column serialization and lazy columns, pessimistic / optimistic / write-prepared / write-unprepared
+transactions, point and range lock managers, WriteBatchWithIndex and BaseDeltaIterator, options parsing /
+sanitization / validation, LRU and HyperClock (fixed table) caches, reservation manager, cache keys, secondary cache
+adapter, compressed / tiered secondary caches, persistent cache, cache dump / load, SimCache, backup engine (from
+line 940), WAL manager, seqno-to-time mapping, internal stats properties, histograms, rate limiter, file systems,
+EnvMirror, PlainTable, CuckooTable, trace formats, the trie index (builder, reader, iterator, bitvector), the `ldb`
+and `sst_dump` tools, EVENT_LOG. Option defaults, ticker / histogram names and perf-context names were diffed by
+script; the most used tickers are compared with native on a deterministic workload.
 
-Not read against the C++ in this audit (previous audits and the byte-identical compat tests still apply): the filter
-builders of `filter_policy.cc`, the Ribbon banding (`ribbon_alg.h` up to the interleaved query; `bloom_impl.h`, the
-Ribbon query / configuration and the filter block readers were read), `block_builder.cc`, `meta_blocks.cc` /
-`table_properties.cc`, `block_fetcher.cc`; `lru_cache.cc` and the
-lookup / release / evict half of `clock_cache.cc`, the persistent cache, cache dump / load; the recovery half of the
-error handler (Resume), `version_builder.cc` beyond ApplyFileAddition, `repair.cc` beyond the WAL conversion; the
-background flush / compaction scheduling bodies (BackgroundFlush, FlushMemTableToOutputFile, the job-running branch of
-BackgroundCompaction, MaybeScheduleFlushOrCompaction) and the remote compaction driver; `PerKeyPointLockManager` (not
-ported); EVENT_LOG JSON; where tickers are incremented;
-`MirrorFileSystem`; the LOUDS trie bitvector / iterator; most of the `ldb` / `sst_dump` tools beyond the commands
-fixed above; `LazyWideColumns*`; small option files (SliceTransform, SstPartitioner, OffpeakTimeOption,
-AttributeGroups). Unproven suspicions left by the auditors are listed in the pull request of this audit.
+Not read against the C++ (previous audits and the compat tests still apply): `AutoHyperClockTable`'s grow / chain
+logic (the port is a behavioural port without chains), `PerKeyPointLockManager` (not ported), the first 940 lines of
+`backup_engine.cc`, `repair.cc` beyond the WAL conversion, `db_impl_files.cc` 760-880, parts of `column_family.cc`
+outside creation / drop / super versions, `BackgroundThreadPool.cs`, the worker-side serialization type info of
+`compaction_service_job.cc`. `RocksDb.Managed.Replication` has no C++ original.

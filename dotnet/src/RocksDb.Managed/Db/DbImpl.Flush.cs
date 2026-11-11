@@ -103,6 +103,7 @@ internal sealed partial class DbImpl
             cfds = all;
         }
         if (cfds.Count == 0) return;
+        bool switched = false;
         BeginAtomicSwitch();
         try
         {
@@ -111,12 +112,15 @@ internal sealed partial class DbImpl
                 ColumnFamilyData cfd = cfds[i];
                 if (cfd.Dropped || cfd.Mem.IsEmpty) continue;
                 await SwitchMemtableAsync(cfd, reason, synchronous, cancellationToken).ConfigureAwait(false);
+                switched = true;
             }
         }
         finally
         {
             EndAtomicSwitch();
         }
+        // DBImpl::EnqueuePendingFlush: one atomic FlushRequest records its reason ticker.
+        if (switched && Options.AtomicFlush) RecordAtomicFlushRequestReason(reason);
     }
 
     /// <summary>True if an atomic flush is running or could be started (sealed memtables of a completed switch). REQUIRES: mutex.</summary>
@@ -470,9 +474,10 @@ internal sealed partial class DbImpl
                     directWrite?.Meter, seqnoToTime, baseVersion.Storage, Options.Statistics, synchronous, CancellationToken.None)
                 .ConfigureAwait(false);
         }
-        catch (Exception e) when (HasListeners)
+        catch (Exception e)
         {
-            // BuildTable: LogAndNotifyTableFileCreationFinished also reports a failed file, with its status.
+            // BuildTable: LogAndNotifyTableFileCreationFinished also reports a failed file, with its status (the
+            // EVENT_LOG line is written with or without listeners).
             NotifyOnTableFileCreated(cfd, jobId, path, 0, TableFileCreationReason.Flush, e, null);
             throw;
         }

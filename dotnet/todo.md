@@ -396,8 +396,7 @@ Still open from this round:
 
 ## Audit #4 (2026-11-10 / 11; docs/validation.md "Audit #4")
 
-- [x] 17 slices + follow-ups against the C++ sources; fixes with regression tests in `tests/RocksDb.Managed.Tests/Validation/Audit4*Tests.cs` and native differentials in `tests/RocksDb.Managed.CompatTests/Audit4/`
-- [ ] atomic_flush for automatic flushes (switch and flush every column family as one atomic group; `[Ignore]`d test)
-- [ ] DBWithTTL: decide whether a SingleDelete inside a batch is dropped like native (`[Ignore]`d compat test)
-- [ ] Sticky error state for MANIFEST / SST writers (WAL writer done)
-- [ ] Parts not read against C++ in audit #4 (listed at the end of the validation.md section)
+- [x] 17 slices, follow-ups and a closing round against the C++ sources; fixes with regression tests in `tests/RocksDb.Managed.Tests/Validation/Audit4*Tests.cs` and native differentials in `tests/RocksDb.Managed.CompatTests/Audit4/`; no ignored audit test
+- [x] atomic_flush for automatic and manual flushes; file quarantine; sticky errors for WAL, table and blob writers
+- [ ] Tickers not recorded and the IOSTATS-based flush / compaction byte tickers (list in validation.md)
+- [ ] Parts not read against C++ (end of the validation.md section)
