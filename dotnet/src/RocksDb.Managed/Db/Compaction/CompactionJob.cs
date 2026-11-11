@@ -146,6 +146,12 @@ internal sealed class CompactionJob
     /// <summary>SubcompactionState::sub_job_id (0 for the first or only subcompaction).</summary>
     internal int SubJobId { get; }
 
+    /// <summary>
+    /// The bytes the job's threads read from table files (IOSTATS(bytes_read) of the compaction threads, the source of
+    /// COMPACT_READ_BYTES); shared with the subcompactions.
+    /// </summary>
+    internal Monitoring.JobIoCounter IoCounter { get; init; } = new();
+
     /// <summary>CompactionJob::job_id_ (the job id of the table file creation events of outputs that are not kept).</summary>
     internal int JobId { get; init; }
 
@@ -551,6 +557,7 @@ internal sealed class CompactionJob
                 PreserveTimeMinSeqnoFloor = PreserveTimeMinSeqnoFloor,
                 OutputDirectory = OutputDirectory,
                 JobId = JobId,
+                IoCounter = IoCounter,
             });
         }
         _db.Stats?.RecordInHistogram(Histogram.NumSubcompactionsScheduled, (ulong)_subcompactions.Count);
@@ -561,7 +568,20 @@ internal sealed class CompactionJob
             var others = new Task[_subcompactions.Count - 1];
             for (int i = 1; i < _subcompactions.Count; i++)
             {
-                others[i - 1] = BackgroundThreadPool.Low.Run(static s => ((CompactionJob)s!).RunSubcompactionAsync(synchronous: true).AsTask().GetAwaiter().GetResult(),
+                others[i - 1] = BackgroundThreadPool.Low.Run(static s =>
+                    {
+                        var sub = (CompactionJob)s!;
+                        // The subcompaction thread's reads count for the job (IOSTATS of each compaction thread).
+                        Monitoring.JobIoCounter? previous = Monitoring.JobIoCounter.Enter(sub.IoCounter);
+                        try
+                        {
+                            sub.RunSubcompactionAsync(synchronous: true).AsTask().GetAwaiter().GetResult();
+                        }
+                        finally
+                        {
+                            Monitoring.JobIoCounter.Exit(previous);
+                        }
+                    },
                     _subcompactions[i]);
             }
             Exception? first = null;
@@ -841,7 +861,7 @@ internal sealed class CompactionJob
                     // AddRangeDels counts the ones it drops; no file is needed here, but the drops are counted. Upstream
                     // then finds the file empty and reports its creation as "(nil)", Aborted("Empty SST file not kept").
                     CountDroppedRangeDelsWithoutOutput();
-                    _db.NotifyOnEmptyTableFile(_cfd, JobId, TableFileCreationReason.Compaction);
+                    _db.NotifyOnEmptyTableFile(_cfd, JobId, 0, TableFileCreationReason.Compaction); // compaction_job.cc:2428-2445: a default FileDescriptor
                 }
                 if (_out.Builder is not null) await FinishOutputAsync(ReadOnlySpan<byte>.Empty, synchronous).ConfigureAwait(false);
             }
@@ -1365,7 +1385,7 @@ internal sealed class CompactionJob
         {
             // FinishCompactionOutputFile: "If there is nothing to output, no necessary to generate a sst file"; the
             // creation event names "(nil)" with Status::Aborted("Empty SST file not kept").
-            _db.NotifyOnEmptyTableFile(_cfd, JobId, TableFileCreationReason.Compaction);
+            _db.NotifyOnEmptyTableFile(_cfd, JobId, 0, TableFileCreationReason.Compaction); // compaction_job.cc:2428-2445: a default FileDescriptor
             return;
         }
         if (_out.IsProximalLevel) Stats.NumProximalOutputFiles++;

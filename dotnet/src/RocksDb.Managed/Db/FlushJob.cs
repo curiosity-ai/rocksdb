@@ -29,6 +29,12 @@ internal readonly record struct DbIdentity(string DbId, string SessionId, string
 internal static class FlushJob
 {
     /// <summary>
+    /// Test hook: when it returns true the flush behaves as if every entry had been dropped (BuildTable with an empty
+    /// output: the file is abandoned and the flush installs no table).
+    /// </summary>
+    internal static Func<bool>? TestForceEmptyOutput;
+
+    /// <summary>
     /// Builds table file #<paramref name="fileNumber"/> from <paramref name="mems"/> (any order). Returns null (and
     /// deletes the file) if the memtables contain nothing. With <paramref name="synchronous"/>, all I/O is blocking.
     /// With a <paramref name="blobBuilder"/> (enable_blob_files), plain values of at least min_blob_size bytes are written
@@ -122,7 +128,7 @@ internal static class FlushJob
                 {
                     AddRangeTombstones(builder, cfd, tombstones, meta, cfd.TimestampSize == 0 && snapshotChecker is null ? snapshots : null, baseVersion);
                 }
-                if (builder.IsEmpty && meta.Smallest.Length == 0)
+                if ((builder.IsEmpty && meta.Smallest.Length == 0) || TestForceEmptyOutput is { } force && force())
                 {
                     builder.Abandon();
                 }

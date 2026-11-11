@@ -261,6 +261,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
     [MethodImpl(MethodImplOptions.NoInlining)]
     private SuperVersion GetAndRefSuperVersionSlow(ColumnFamilyData cfd, object? cached, ref int slot)
     {
+        // ColumnFamilyData::GetThreadLocalSuperVersion: "if (sv == SuperVersion::kSVObsolete) RecordTick(
+        // NUMBER_SUPERVERSION_ACQUIRES)" - the cached reference could not be used and one is taken from the installed
+        // super version. (Counted per processor slot here, per thread upstream.)
+        Options.Statistics?.RecordTick(Ticker.NumberSuperversionAcquires);
         if (ReferenceEquals(cached, SuperVersionCache.InUse))
         {
             // Another thread uses this processor's slot (it was preempted while reading): plain reference.
@@ -270,7 +274,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         try
         {
             // An obsolete super version stored back by a reader that raced with a reset: drop the slot's reference.
-            if (cached is SuperVersion stale) ReturnSuperVersion(stale);
+            if (cached is SuperVersion stale) ReleaseReaderSuperVersion(stale);
             return GetReferencedSuperVersion(cfd);
         }
         catch
@@ -285,7 +289,23 @@ internal sealed partial class DbImpl : IAsyncDisposable
     internal void ReturnAndCleanupSuperVersion(ColumnFamilyData cfd, SuperVersion sv, int slot)
     {
         if (slot >= 0 && cfd.LocalSuperVersions.TryPut(slot, sv)) return;
-        ReturnSuperVersion(sv);
+        ReleaseReaderSuperVersion(sv);
+    }
+
+    /// <summary>
+    /// DBImpl::CleanupSuperVersion as called by ReturnAndCleanupSuperVersion when the reference could not go back to
+    /// the cache: NUMBER_SUPERVERSION_RELEASES, and NUMBER_SUPERVERSION_CLEANUPS when it was the last reference.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void ReleaseReaderSuperVersion(SuperVersion sv)
+    {
+        Statistics? st = Options.Statistics;
+        if (sv.Unref())
+        {
+            lock (_mutex) CleanupSuperVersion(sv);
+            st?.RecordTick(Ticker.NumberSuperversionCleanups);
+        }
+        st?.RecordTick(Ticker.NumberSuperversionReleases);
     }
 
     private static void ThrowDropped(ColumnFamilyData cfd) =>

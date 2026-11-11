@@ -928,12 +928,14 @@ internal sealed partial class DbImpl
                         ReleaseSubcompactionResources = n => ReleaseSubcompactionResources(n, bottom),
                     };
                     int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadCompactionMicros);
+                    Monitoring.JobIoCounter? previousCounter = Monitoring.JobIoCounter.Enter(job.IoCounter);
                     try
                     {
                         job.RunAsync(synchronous: true).GetAwaiter().GetResult();
                     }
                     finally
                     {
+                        Monitoring.JobIoCounter.Exit(previousCounter);
                         Monitoring.FileReadActivity.Exit(activity);
                     }
                 }

@@ -485,7 +485,7 @@ internal sealed partial class DbImpl
         {
             lock (_mutex) Versions.UnrefVersion(baseVersion);
         }
-        if (meta is null) NotifyOnEmptyTableFile(cfd, jobId, TableFileCreationReason.Flush);
+        if (meta is null) NotifyOnEmptyTableFile(cfd, jobId, fileNumber, TableFileCreationReason.Flush);
         if (meta is not null)
         {
             // BuildTable: "Verify that the table is usable" (table_cache->NewIterator): the new table is opened and stays

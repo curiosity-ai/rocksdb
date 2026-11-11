@@ -127,11 +127,13 @@ internal sealed partial class DbImpl
 
     /// <summary>
     /// BuildTable / CompactionJob::FinishCompactionOutputFile for an output that kept no file: the creation event names
-    /// "(nil)" with Status::Aborted("Empty SST file not kept").
+    /// "(nil)" with Status::Aborted("Empty SST file not kept") and the file number allocated for the output.
     /// </summary>
-    internal void NotifyOnEmptyTableFile(ColumnFamilyData cfd, int jobId, TableFileCreationReason reason)
+    internal void NotifyOnEmptyTableFile(ColumnFamilyData cfd, int jobId, ulong fileNumber, TableFileCreationReason reason)
     {
-        NotifyOnTableFileCreated(cfd, jobId, "(nil)", 0, reason, new RocksDbException(StatusCode.Aborted, "Operation aborted: Empty SST file not kept"), null);
+        // db/builder.cc:590-602: the path is "(nil)" but the event is logged with meta->fd, whose number is the one
+        // allocated for the output.
+        NotifyOnTableFileNotKept(cfd, jobId, "(nil)", fileNumber, reason, new RocksDbException(StatusCode.Aborted, "Operation aborted: Empty SST file not kept"));
     }
 
     private static TableProperties? TryGetTableProperties(ColumnFamilyData cfd, FileMetaData meta)

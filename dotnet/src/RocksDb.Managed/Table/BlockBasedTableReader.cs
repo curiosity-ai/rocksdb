@@ -555,10 +555,30 @@ public sealed partial class BlockBasedTableReader : TableReader
         {
             // ReadTablePropertiesHelper: read and parse without checksum verification, then verify (an ingested file
             // whose global seqno was rewritten by the legacy write_global_seqno has a stale properties checksum).
-            Block pb = BlockFetcher.ReadBlock(file, footer, propsHandle, verifyChecksums: false);
-            try { props = TableProperties.Parse(pb, propsHandle.Offset); }
-            finally { pb.Release(); }
-            if (verify.Enabled) VerifyPropertiesBlockChecksum(file, footer, propsHandle, props.ExternalSstFileGlobalSeqnoOffset);
+            // The block is read from the file once (upstream's single BlockFetcher read); parsing and the checksum
+            // verification below both work on those bytes.
+            IRandomAccessFile propsFile = file;
+            byte[]? propsRaw = null;
+            ulong propsLength = propsHandle.Size + BlockBasedTableConstants.BlockTrailerSize;
+            if (verify.Enabled && propsLength <= 1 << 26)
+            {
+                propsRaw = RocksArrayPool<byte>.Shared.Rent((int)propsLength);
+                if (BlockFetcher.ReadFully(file, (long)propsHandle.Offset, propsRaw.AsSpan(0, (int)propsLength)) == (int)propsLength)
+                {
+                    propsFile = new RangeCachedFile(file, (long)propsHandle.Offset, propsRaw, (int)propsLength);
+                }
+            }
+            try
+            {
+                Block pb = BlockFetcher.ReadBlock(propsFile, footer, propsHandle, verifyChecksums: false);
+                try { props = TableProperties.Parse(pb, propsHandle.Offset); }
+                finally { pb.Release(); }
+                if (verify.Enabled) VerifyPropertiesBlockChecksum(propsFile, footer, propsHandle, props.ExternalSstFileGlobalSeqnoOffset);
+            }
+            finally
+            {
+                if (propsRaw is not null) RocksArrayPool<byte>.Shared.Return(propsRaw);
+            }
         }
         else
         {
@@ -1711,6 +1731,27 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
     }
 
+    /// <summary>
+    /// BlockBasedTableIterator::InitDataBlock: {NON_,}LAST_LEVEL_SEEK_DATA for the first data block a seek loads. False
+    /// (nothing recorded) without a statistics object.
+    /// </summary>
+    internal bool RecordSeekData()
+    {
+        if (_stats?.Owner is not { } st) return false;
+        st.RecordTick(IsLastLevel ? Ticker.LastLevelSeekData : Ticker.NonLastLevelSeekData);
+        return true;
+    }
+
+    /// <summary>BlockBasedTableIterator::value(): {NON_,}LAST_LEVEL_SEEK_DATA_USEFUL_{FILTER_MATCH,NO_FILTER}.</summary>
+    internal void RecordSeekDataUseful(bool filterUsed)
+    {
+        if (_stats?.Owner is not { } st) return;
+        bool last = IsLastLevel;
+        st.RecordTick(filterUsed
+            ? last ? Ticker.LastLevelSeekDataUsefulFilterMatch : Ticker.NonLastLevelSeekDataUsefulFilterMatch
+            : last ? Ticker.LastLevelSeekDataUsefulNoFilter : Ticker.NonLastLevelSeekDataUsefulNoFilter);
+    }
+
     /// <summary>BlockBasedTable::IsLastLevel: the level the file was opened at is the last level of the LSM tree.</summary>
     internal bool IsLastLevel => _options.Level >= 0 && _options.Level == _options.NumLevels - 1;
 
@@ -2213,6 +2254,31 @@ public sealed partial class BlockBasedTableReader : TableReader
         // The pinned full filter (never set when the filter is held by the block cache) is rented from the pinned table buffers.
         if (fb is not null) TableBuilderBuffers.Return(BlockBufferSource.TableBuffers, fb);
         _file.Dispose();
+    }
+
+    /// <summary>Serves reads inside one byte range already read from <paramref name="inner"/> from memory; other reads go to the file.</summary>
+    private sealed class RangeCachedFile(IRandomAccessFile inner, long offset, byte[] buffer, int length) : IRandomAccessFile
+    {
+        public long Length => inner.Length;
+
+        public int Read(long position, Span<byte> destination)
+        {
+            if (position >= offset && position + destination.Length <= offset + length)
+            {
+                buffer.AsSpan((int)(position - offset), destination.Length).CopyTo(destination);
+                return destination.Length;
+            }
+            return inner.Read(position, destination);
+        }
+
+        public ValueTask<int> ReadAsync(long position, Memory<byte> destination, CancellationToken cancellationToken = default) =>
+            new(Read(position, destination.Span));
+
+        public bool Prefetch(long position, long count) => inner.Prefetch(position, count);
+
+        public void Dispose()
+        {
+        }
     }
 
     /// <summary>Wraps a file and serves reads within an asynchronously prefetched tail region from memory (port of tail prefetching in BlockBasedTable::PrefetchTail).</summary>

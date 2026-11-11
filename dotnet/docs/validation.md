@@ -1272,10 +1272,15 @@ suspicions one by one (tests: `Audit4Closing*Tests.cs`, `Audit4Final*Tests.cs`).
 
 | RepairDB, obsolete files (last pass) | `db/repair.cc` (ScanTable, AddTables, RepairDB overloads), `DeleteObsoleteFileImpl` | Repair used the default column family's comparator for a table's key range (other comparators: swapped boundaries, missed keys); a table without a column family name is archived; a column family named by a table exists even when that table is archived; descriptors without "default" are InvalidArgument; epoch 1 is reserved with allow_ingest_behind; oldest_blob_file_number is recorded. Orphan table / blob files found by the full scan are deleted through the SstFileManager with event log and listener notification. |
 
-Tickers still not recorded: `number.superversion_acquires` / `releases` (no thread-local super version cache),
-`compaction.total.time.cpu_micros` (no per-thread CPU clock), `non.last.level.seek.*`,
-`block.cache.compression.dict.bytes.insert`; COMPACT_READ_BYTES / COMPACT_WRITE_BYTES / FLUSH_WRITE_BYTES are file
-sizes (upstream: the job thread's IOSTATS). `Audit4ClosingToolsCompatTests` compares the others with native.
+Tickers: the seek-data tickers per level, the superversion tickers and the job-read based COMPACT_READ_BYTES were
+added in the last pass, and a table open reads its properties block once (the per-level read tickers now equal
+native's). Still not recorded: `compaction.total.time.cpu_micros` (no managed per-thread CPU clock) and the
+compression dictionary block cache tickers (the dictionary is always pinned by the reader, never cached). Not equal
+to native by construction: the superversion tickers (the port caches per processor slot for Get / MultiGet, upstream
+per thread), the block cache byte tickers (native charges malloc_usable_size), FLUSH_WRITE_BYTES (file bytes;
+native's also include the flush thread's MANIFEST write) and COMPACT_READ_BYTES (job reads; about 20% below native
+in the differential, cause not located). `Audit4ClosingToolsCompatTests` compares every other ticker of a
+deterministic workload with native.
 
 ### Known deviations recorded by this audit
 

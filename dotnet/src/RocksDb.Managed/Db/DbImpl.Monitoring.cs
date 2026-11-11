@@ -681,7 +681,10 @@ internal sealed partial class DbImpl
         cfd.Stats.AddCompaction(c.OutputLevel, ls);
         if (Stats is { } st && job is not null)
         {
-            st.RecordTick(Ticker.CompactReadBytes, job.Stats.BytesRead);
+            // CompactionJob::RecordCompactionIOStats: COMPACT_READ_BYTES is IOSTATS(bytes_read) of the compaction threads,
+            // i.e. the bytes they really read (blocks found in the block cache are not read), where the compaction
+            // stats above count the input file sizes. COMPACT_WRITE_BYTES: the outputs, which are all the job writes.
+            st.RecordTick(Ticker.CompactReadBytes, job.IoCounter.BytesRead);
             st.RecordTick(Ticker.CompactWriteBytes, job.Stats.BytesWritten);
             CompactionIterationStats it = job.Stats.IterStats;
             st.RecordTick(Ticker.CompactionKeyDropNewerEntry, (ulong)it.NumRecordDropHidden);

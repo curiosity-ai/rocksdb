@@ -284,17 +284,23 @@ public sealed class Audit4ClosingToolsCompatTests
     }
 
     /// <summary>
-    /// Tickers that cannot be compared exactly: native takes them from the thread's IOStatsContext (the bytes the flush
-    /// / compaction thread really read or wrote, MANIFEST included) or from the allocator's usable size, where the
-    /// port counts file sizes and block sizes; and CPU time.
+    /// Tickers that cannot be compared exactly, each with its reason (the recorded ones are still checked to be within
+    /// 25% of native by <see cref="FormerlyMissingTickersMatchNativeOrAreExcluded"/>).
     /// </summary>
     private static readonly HashSet<string> s_notComparable = new(StringComparer.Ordinal)
     {
-        "rocksdb.compact.read.bytes", "rocksdb.compact.write.bytes", "rocksdb.flush.write.bytes", // IOSTATS(bytes_read / bytes_written)
-        "rocksdb.block.cache.bytes.write", "rocksdb.block.cache.bytes.read", "rocksdb.block.cache.data.bytes.insert", // charge incl. malloc_usable_size
+        // CompactionJob::RecordCompactionIOStats, IOSTATS(bytes_read): the port counts the bytes the job's threads read
+        // from table files (JobIoCounter); native reads 1700 bytes more in this workload (not explained: the size of
+        // two data blocks).
+        "rocksdb.compact.read.bytes",
+        // FlushJob::RecordFlushIOStats, IOSTATS(bytes_written) of the flush thread: the table (and blob) file plus the
+        // MANIFEST record the thread writes when it installs the result (115 bytes per flush here); the port counts the
+        // table and blob files.
+        "rocksdb.flush.write.bytes",
+        // The cache charge: native adds malloc_usable_size of the block and its metadata.
+        "rocksdb.block.cache.bytes.write", "rocksdb.block.cache.bytes.read", "rocksdb.block.cache.data.bytes.insert",
+        // CPU time of the compaction threads, see s_notIncremented.
         "rocksdb.compaction.total.time.cpu_micros",
-        "rocksdb.last.level.read.bytes", "rocksdb.non.last.level.read.bytes", // file sizes differ by the property block
-        "rocksdb.last.level.read.count", "rocksdb.non.last.level.read.count", // one more read per table open than native
     };
 
     /// <summary>
@@ -303,16 +309,11 @@ public sealed class Audit4ClosingToolsCompatTests
     /// </summary>
     private static readonly string[] s_notIncremented =
     [
-        // ColumnFamilyData::GetThreadLocalSuperVersion / DBImpl::CleanupSuperVersion: they count refreshes of the
-        // thread-local super version cache; the port has no thread-local super version (readers take a reference on the
-        // installed one), so there is no equivalent point.
-        "rocksdb.number.superversion_acquires", "rocksdb.number.superversion_releases",
-        // CompactionJob::UpdateCompactionStats: per-thread CPU time of the compaction thread (clock->CPUMicros()), for
-        // which .NET has no portable per-thread clock.
+        // CompactionJob::UpdateCompactionStats: CPU time of the compaction threads (clock->CPUMicros(), i.e.
+        // clock_gettime(CLOCK_THREAD_CPUTIME_ID)). .NET has no managed per-thread CPU clock (Process.TotalProcessorTime
+        // is process-wide; ProcessThread needs the OS thread id of a managed thread, which is not exposed): it would
+        // take a P/Invoke per platform. Not ported; CompactionJobStats.CpuMicros stays 0.
         "rocksdb.compaction.total.time.cpu_micros",
-        // BlockBasedTableIterator seek stats (per level seek / seek-data / useful-filter matrix, RecordTick in
-        // LevelIterator / ForwardLevelIterator): needs per-seek accounting in the iterator hot path.
-        "rocksdb.non.last.level.seek.data", "rocksdb.non.last.level.seek.data.useful.no.filter",
     ];
 
     /// <summary>Formerly missing tickers that now have the same value as native for the workload.</summary>
@@ -322,18 +323,32 @@ public sealed class Audit4ClosingToolsCompatTests
         "rocksdb.files.deleted.immediately", // DeleteScheduler::DeleteFileImmediately
         "rocksdb.memtable.payload.bytes.at.flush", "rocksdb.memtable.garbage.bytes.at.flush", // FlushJob::WriteLevel0Table
         "rocksdb.block.checksum.compute.count", // BlockFetcher::ProcessTrailerIfPresent
+        "rocksdb.non.last.level.seek.data", "rocksdb.non.last.level.seek.data.useful.no.filter", // BlockBasedTableIterator::InitDataBlock / value()
+        "rocksdb.last.level.read.bytes", "rocksdb.last.level.read.count", "rocksdb.non.last.level.read.bytes", "rocksdb.non.last.level.read.count", // RecordIOStats
+        "rocksdb.compact.write.bytes", // CompactionJob::RecordCompactionIOStats, IOSTATS(bytes_written): the outputs
     ];
 
     /// <summary>
     /// Formerly missing tickers that are recorded at the upstream call site but whose value cannot equal native's:
-    /// the block cache byte tickers count the cache charge (native: malloc_usable_size of the block plus metadata), and
-    /// the read tickers of RandomAccessFileReader depend on the read pattern at table open (the port issues one more
-    /// read per table open than native, and the file tails differ by the properties block).
+    /// the block cache byte tickers count the cache charge (native: malloc_usable_size of the block plus metadata); for
+    /// the job I/O tickers see <see cref="s_notComparable"/>.
     /// </summary>
     private static readonly string[] s_implementedNotComparable =
     [
         "rocksdb.block.cache.bytes.read", "rocksdb.block.cache.data.bytes.insert", // BlockBasedTable::UpdateCacheHitMetrics / UpdateCacheInsertionMetrics
-        "rocksdb.last.level.read.bytes", "rocksdb.last.level.read.count", "rocksdb.non.last.level.read.bytes", "rocksdb.non.last.level.read.count", // RecordIOStats
+        "rocksdb.compact.read.bytes", "rocksdb.flush.write.bytes", // RecordCompactionIOStats / RecordFlushIOStats
+    ];
+
+    /// <summary>
+    /// Recorded at the corresponding points (ColumnFamilyData::GetThreadLocalSuperVersion finding its cached reference
+    /// obsolete, DBImpl::CleanupSuperVersion from ReturnAndCleanupSuperVersion) but not comparable: upstream caches one
+    /// super version reference per thread and routes every GetReferencedSuperVersion caller (iterators, CompactRange)
+    /// through it, the port caches one per processor slot for Get / MultiGet only, so the counts depend on the
+    /// processor the thread runs on. Only checked to be recorded.
+    /// </summary>
+    private static readonly string[] s_implementedSlotDependent =
+    [
+        "rocksdb.number.superversion_acquires",
     ];
 
     /// <summary>
@@ -353,6 +368,7 @@ public sealed class Audit4ClosingToolsCompatTests
         foreach (KeyValuePair<string, ulong> kv in nt)
         {
             if (s_notComparable.Contains(kv.Key) || Array.IndexOf(s_notIncremented, kv.Key) >= 0) continue;
+            if (kv.Key.StartsWith("rocksdb.number.superversion_", StringComparison.Ordinal)) continue; // s_implementedSlotDependent
             if (!mt.TryGetValue(kv.Key, out ulong m)) continue; // a ticker newer / older than the package
             compared++;
             if (m != kv.Value) diff.Append(kv.Key).Append(": native ").Append(kv.Value).Append(", managed ").Append(m).Append('\n');
@@ -398,6 +414,11 @@ public sealed class Audit4ClosingToolsCompatTests
             Assert.IsTrue(nt[name] > 0, name + " is not exercised");
             double ratio = mt[name] / (double)nt[name];
             if (ratio < 0.75 || ratio > 1.25) diff.Append(name).Append(": native ").Append(nt[name]).Append(", managed ").Append(mt[name]).Append('\n');
+        }
+        foreach (string name in s_implementedSlotDependent)
+        {
+            Assert.IsTrue(nt[name] > 0, name + " is not exercised");
+            if (mt[name] == 0) diff.Append(name).Append(" is not recorded\n");
         }
         foreach (string name in s_notIncremented)
         {

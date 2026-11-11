@@ -377,6 +377,15 @@ public sealed class BlockBasedTableIterator : IDisposable
     private ulong _readaheadLimit;
     private bool _autoPrefetching;
 
+    // BlockBasedTableIterator::SeekStatState (block_based_table_iterator.h): kNone, kDataBlockReadSinceLastSeek,
+    // kReportOnUseful and kFilterUsed, for the {NON_,}LAST_LEVEL_SEEK_DATA* tickers.
+    private const byte SeekStatDataBlockRead = 1;
+    private const byte SeekStatReportOnUseful = 2;
+    private const byte SeekStatFilterUsed = 4;
+    private byte _seekStat;
+    /// <summary>The iterator reads a compaction input (lookup_context_.caller == kCompaction): no seek tickers.</summary>
+    private bool _forCompaction;
+
     internal BlockBasedTableIterator(BlockBasedTableReader reader, TableReadFlags flags, in TableIteratorPrefixOptions prefixOptions)
     {
         _reader = reader;
@@ -404,7 +413,11 @@ public sealed class BlockBasedTableIterator : IDisposable
             _reader.RecordSeekFilterResult(filtered: true);
             return false;
         }
-        if (filterChecked) _reader.RecordSeekFilterResult(filtered: false);
+        if (filterChecked)
+        {
+            _reader.RecordSeekFilterResult(filtered: false);
+            _seekStat = SeekStatFilterUsed; // SeekImpl / SeekForPrev: seek_stat_state_ = kFilterUsed
+        }
         return true;
     }
 
@@ -416,10 +429,42 @@ public sealed class BlockBasedTableIterator : IDisposable
 
     /// <summary>Current internal key.</summary>
     public ReadOnlySpan<byte> Key { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _data.Key; }
-    public ReadOnlySpan<byte> Value { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _data.Value; }
+    public ReadOnlySpan<byte> Value
+    {
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        get
+        {
+            if ((_seekStat & SeekStatReportOnUseful) != 0) ReportSeekDataUseful();
+            return _data.Value;
+        }
+    }
+
+    /// <summary>
+    /// BlockBasedTableIterator::value(): the first value read after a seek that had to load a data block records
+    /// {NON_,}LAST_LEVEL_SEEK_DATA_USEFUL_{FILTER_MATCH,NO_FILTER}.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void ReportSeekDataUseful()
+    {
+        _reader.RecordSeekDataUseful((_seekStat & SeekStatFilterUsed) != 0);
+        _seekStat = SeekStatDataBlockRead;
+    }
+
+    /// <summary>
+    /// InitDataBlock / AsyncInitDataBlock: the first data block loaded since the last seek records
+    /// {NON_,}LAST_LEVEL_SEEK_DATA (not for a compaction input, and nothing without a statistics object).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void RecordSeekDataBlockRead()
+    {
+        _seekStat |= SeekStatDataBlockRead;
+        if (_forCompaction || !_reader.RecordSeekData()) return;
+        _seekStat |= SeekStatReportOnUseful;
+    }
 
     public void SeekToFirst()
     {
+        _seekStat = 0;
         _index.SeekToFirst();
         if (!LoadCurrentBlock()) return;
         _data.SeekToFirst();
@@ -428,6 +473,7 @@ public sealed class BlockBasedTableIterator : IDisposable
 
     public void SeekToLast()
     {
+        _seekStat = 0;
         _index.SeekToLast();
         if (!LoadCurrentBlock()) return;
         _data.SeekToLast();
@@ -437,6 +483,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     /// <summary>Positions at the first entry with internal key &gt;= <paramref name="target"/>.</summary>
     public void Seek(ReadOnlySpan<byte> target)
     {
+        _seekStat = 0;
         if (_prefix.CheckFilter && !CheckPrefixMayMatch(target, backward: false))
         {
             ReleaseBlock();
@@ -451,6 +498,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     /// <summary>Positions at the last entry with internal key &lt;= <paramref name="target"/>.</summary>
     public void SeekForPrev(ReadOnlySpan<byte> target)
     {
+        _seekStat = 0;
         if (_prefix.CheckFilter && !CheckPrefixMayMatch(target, backward: true))
         {
             ReleaseBlock();
@@ -622,6 +670,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     {
         _block = b;
         _blockHandle = h;
+        if ((_seekStat & SeekStatDataBlockRead) == 0) RecordSeekDataBlockRead();
         _data.InitializeData(b.Block!, _reader.InternalComparator, _reader.GlobalSequenceNumber, _reader.PadTimestampSize);
     }
 
@@ -651,6 +700,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     {
         if (_pinMgr is { IsPinning: true } && Valid)
         {
+            if ((_seekStat & SeekStatReportOnUseful) != 0) ReportSeekDataUseful();
             value = _data.PinnedValue;
             return true;
         }
@@ -661,11 +711,15 @@ public sealed class BlockBasedTableIterator : IDisposable
     // ---------------------------------------------------------------------------------------------
     // Async variants: identical positioning, but data block reads are awaited.
 
-    public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) =>
-        ThenPositionAsync(_index.SeekToFirstAsync(cancellationToken), Op.First, default, backward: false, cancellationToken);
+    public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default)
+    {
+        _seekStat = 0;
+        return ThenPositionAsync(_index.SeekToFirstAsync(cancellationToken), Op.First, default, backward: false, cancellationToken);
+    }
 
     public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
+        _seekStat = 0;
         if (_prefix.CheckFilter && !CheckPrefixMayMatch(target.Span, backward: false))
         {
             ReleaseBlock();
@@ -738,12 +792,16 @@ public sealed class BlockBasedTableIterator : IDisposable
         await PositionAsync(Op.First, default, ct).ConfigureAwait(false);
     }
 
-    public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default) =>
-        ThenPositionAsync(_index.SeekToLastAsync(cancellationToken), Op.First, default, backward: true, cancellationToken);
+    public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default)
+    {
+        _seekStat = 0;
+        return ThenPositionAsync(_index.SeekToLastAsync(cancellationToken), Op.First, default, backward: true, cancellationToken);
+    }
 
     /// <summary>Async <see cref="SeekForPrev"/>: completes synchronously unless a data block or index partition must be read from the file.</summary>
     public ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
+        _seekStat = 0;
         if (_prefix.CheckFilter && !CheckPrefixMayMatch(target.Span, backward: true))
         {
             ReleaseBlock();
@@ -838,6 +896,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     /// </summary>
     internal void EnableReadahead(int readaheadSize)
     {
+        _forCompaction = true;
         if (readaheadSize <= 0)
         {
             if (_prefetch is null) _readaheadMode = ReadaheadMode.None;
@@ -872,6 +931,7 @@ public sealed class BlockBasedTableIterator : IDisposable
         ReleaseBlock();
         _reader = reader;
         _prefix = prefixOptions;
+        _seekStat = 0;
         _index.Init(reader, _flags);
         _prefetch?.Reset(reader.File);
         ResetAutoReadahead();
