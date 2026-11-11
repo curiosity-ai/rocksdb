@@ -140,7 +140,7 @@ public sealed partial class ColumnFamily
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(value);
         ArgumentNullException.ThrowIfNull(timestamp);
-        GetContext ctx = Lookup(options, key);
+        GetContext ctx = Lookup(options, key, defaultColumnOnly: true);
         try
         {
             if (ctx.HasTimestamp) timestamp.Write(ctx.FoundTimestamp);
@@ -165,7 +165,7 @@ public sealed partial class ColumnFamily
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(value);
         ArgumentNullException.ThrowIfNull(timestamp);
-        GetContext ctx = await LookupAsync(options, key, cancellationToken).ConfigureAwait(false);
+        GetContext ctx = await LookupAsync(options, key, defaultColumnOnly: true, cancellationToken).ConfigureAwait(false);
         try
         {
             if (ctx.HasTimestamp) timestamp.Write(ctx.FoundTimestamp);

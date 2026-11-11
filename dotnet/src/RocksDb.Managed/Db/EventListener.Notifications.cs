@@ -131,7 +131,6 @@ internal sealed partial class DbImpl
     /// </summary>
     internal void NotifyOnEmptyTableFile(ColumnFamilyData cfd, int jobId, TableFileCreationReason reason)
     {
-        if (!HasListeners) return;
         NotifyOnTableFileCreated(cfd, jobId, "(nil)", 0, reason, new RocksDbException(StatusCode.Aborted, "Operation aborted: Empty SST file not kept"), null);
     }
 
@@ -154,17 +153,48 @@ internal sealed partial class DbImpl
     internal void NotifyOnTableFileCreated(ColumnFamilyData cfd, int jobId, string path, ulong size, TableFileCreationReason reason,
         Exception? failure, TableProperties? props)
     {
+        if (failure is not null)
+        {
+            // The file number is the one in the path ("(nil)" for an empty output, whose number the callers do not pass).
+            ulong fileNumber = 0;
+            if (FileNames.TryParseFileName(Path.GetFileName(path), out ulong parsed, out FileType type) && type == FileType.TableFile) fileNumber = parsed;
+            NotifyOnTableFileNotKept(cfd, jobId, path, fileNumber, reason, failure);
+            return;
+        }
         if (!HasListeners) return;
         var info = new TableFileCreationInfo
         {
             DbName = DbName,
             ColumnFamilyName = cfd.Name,
             FilePath = path,
-            FileSize = failure is null ? size : 0,
+            FileSize = size,
             JobId = jobId,
             Reason = reason,
-            Status = failure is null ? null : RocksDbException.FromException(failure),
             TableProperties = props,
+        };
+        InvokeListeners(info, static (l, _, i) => l.OnTableFileCreated(i), nameof(EventListener.OnTableFileCreated));
+    }
+
+    /// <summary>
+    /// EventHelpers::LogAndNotifyTableFileCreationFinished for a table that was not kept (a failed or an empty output):
+    /// the EVENT_LOG line carries the failure (the events of kept tables are written by OnFlushCompleted /
+    /// OnCompactionCompleted), then the listeners are told. <paramref name="fileNumber"/>: the number of the file
+    /// descriptor upstream logs (0 for an output that never got one). Called without the mutex.
+    /// </summary>
+    internal void NotifyOnTableFileNotKept(ColumnFamilyData cfd, int jobId, string path, ulong fileNumber, TableFileCreationReason reason, Exception failure)
+    {
+        RocksDbException status = RocksDbException.FromException(failure);
+        LogTableFileCreationFailedEvent(cfd, jobId, fileNumber, status.Message);
+        if (!HasListeners) return;
+        var info = new TableFileCreationInfo
+        {
+            DbName = DbName,
+            ColumnFamilyName = cfd.Name,
+            FilePath = path,
+            FileSize = 0,
+            JobId = jobId,
+            Reason = reason,
+            Status = status,
         };
         InvokeListeners(info, static (l, _, i) => l.OnTableFileCreated(i), nameof(EventListener.OnTableFileCreated));
     }

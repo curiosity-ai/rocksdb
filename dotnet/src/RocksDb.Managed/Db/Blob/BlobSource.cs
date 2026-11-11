@@ -268,13 +268,30 @@ internal sealed class BlobSource : IDisposable
         }
     }
 
-    /// <summary>BlobSource::GetBlob for a decoded reference (no version check). Returns the bytes read from the file (0 on a cache hit).</summary>
+    /// <summary>
+    /// BlobSource::GetBlob for a decoded reference (no version check). Returns bytes_read: the bytes read from the
+    /// file, or on a blob cache hit the size of the on-disk record ("for consistency": the value size of the reference
+    /// plus the record header adjustment under verify_checksums).
+    /// </summary>
     public ulong GetBlob(ReadOptions? options, ReadOnlySpan<byte> userKey, ulong fileNumber, ulong offset, ulong size, CompressionType compression,
-        IBufferWriter<byte> output)
+        IBufferWriter<byte> output) =>
+        GetBlob(options, userKey, fileNumber, offset, size, compression, output, out _);
+
+    /// <summary>
+    /// <see cref="GetBlob(ReadOptions?, ReadOnlySpan{byte}, ulong, ulong, ulong, CompressionType, IBufferWriter{byte})"/>;
+    /// <paramref name="cacheHit"/> tells whether the blob came from the blob cache (no file read).
+    /// </summary>
+    public ulong GetBlob(ReadOptions? options, ReadOnlySpan<byte> userKey, ulong fileNumber, ulong offset, ulong size, CompressionType compression,
+        IBufferWriter<byte> output, out bool cacheHit)
     {
-        if (TryGetFromCache(fileNumber, offset, output)) return 0;
-        CheckCanRead(options);
         bool verify = options?.VerifyChecksums ?? true;
+        if (TryGetFromCache(fileNumber, offset, output))
+        {
+            cacheHit = true;
+            return size + (verify ? BlobLogFormat.RecordHeaderAdjustment((ulong)userKey.Length) : 0);
+        }
+        cacheHit = false;
+        CheckCanRead(options);
         ReaderEntry entry = AcquireReader(fileNumber);
         try
         {

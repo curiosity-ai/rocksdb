@@ -146,6 +146,17 @@ internal sealed class CompactionJob
     /// <summary>SubcompactionState::sub_job_id (0 for the first or only subcompaction).</summary>
     internal int SubJobId { get; }
 
+    /// <summary>CompactionJob::job_id_ (the job id of the table file creation events of outputs that are not kept).</summary>
+    internal int JobId { get; init; }
+
+    /// <summary>
+    /// Called once with (proximal_after_seqno_, preserve_seqno_after_) when CompactionJob::Prepare has computed them,
+    /// before any input is processed (CompactionJob::LogCompaction reads them for the compaction_started event).
+    /// </summary>
+    internal Action<ulong, ulong>? OnTimesPrepared { get; init; }
+
+    private bool _timesPrepared;
+
     /// <summary>
     /// The output files of one output level (CompactionOutputs, db/compaction/compaction_outputs.{h,cc}): the open file
     /// and builder, the grandparent / TTL / partitioner / split-key state of ShouldStopBefore, the range-del level
@@ -513,6 +524,12 @@ internal sealed class CompactionJob
     /// </summary>
     public async ValueTask RunAsync(bool synchronous)
     {
+        if (OnTimesPrepared is { } onTimesPrepared)
+        {
+            PrepareTimes();
+            _timesPrepared = true;
+            onTimesPrepared(_proximalAfterSeqno, _preserveSeqnoAfter);
+        }
         List<byte[]> boundaries = SubJobId == 0 && _subStart is null && _subEnd is null && ShouldFormSubcompactions(_c, MaxSubcompactions)
             ? GenSubcompactionBoundaries()
             : [];
@@ -533,6 +550,7 @@ internal sealed class CompactionJob
                 EarliestWriteConflictSnapshot = EarliestWriteConflictSnapshot,
                 PreserveTimeMinSeqnoFloor = PreserveTimeMinSeqnoFloor,
                 OutputDirectory = OutputDirectory,
+                JobId = JobId,
             });
         }
         _db.Stats?.RecordInHistogram(Histogram.NumSubcompactionsScheduled, (ulong)_subcompactions.Count);
@@ -820,8 +838,10 @@ internal sealed class CompactionJob
                 else if (_out.Builder is null && _outputTombstones is not null && _out.FirstOutput)
                 {
                     // CompactionOutputs::CloseOutput opens a file for a subcompaction with range tombstones only, and
-                    // AddRangeDels counts the ones it drops; no file is needed here, but the drops are counted.
+                    // AddRangeDels counts the ones it drops; no file is needed here, but the drops are counted. Upstream
+                    // then finds the file empty and reports its creation as "(nil)", Aborted("Empty SST file not kept").
                     CountDroppedRangeDelsWithoutOutput();
+                    _db.NotifyOnEmptyTableFile(_cfd, JobId, TableFileCreationReason.Compaction);
                 }
                 if (_out.Builder is not null) await FinishOutputAsync(ReadOnlySpan<byte>.Empty, synchronous).ConfigureAwait(false);
             }
@@ -838,6 +858,14 @@ internal sealed class CompactionJob
             _blobGarbageMeter?.AddGarbageTo(BlobFileGarbages);
             VerifyOutputFiles(_lastLevelOutputs);
             if (_proximalOutputs is not null) VerifyOutputFiles(_proximalOutputs);
+        }
+        catch (Exception e)
+        {
+            // SubcompactionState::CloseCompactionFiles -> FinishCompactionOutputFile(input_status): the output that was
+            // open when the input failed is reported (EVENT_LOG and OnTableFileCreated) with that status.
+            NotifyOutputNotKept(_lastLevelOutputs, e);
+            if (_proximalOutputs is not null) NotifyOutputNotKept(_proximalOutputs, e);
+            throw;
         }
         finally
         {
@@ -956,6 +984,7 @@ internal sealed class CompactionJob
     /// </summary>
     private void PrepareTimes()
     {
+        if (_timesPrepared) return; // already done for the compaction_started event (OnTimesPrepared)
         ulong preserveTimeMinSeqno = DbFormat.MaxSequenceNumber;
         ulong precludeLastLevelMinSeqno = DbFormat.MaxSequenceNumber;
         ColumnFamilyOptions o = _c.Options;
@@ -1190,7 +1219,17 @@ internal sealed class CompactionJob
         };
         // Compaction outputs (of every subcompaction and of the proximal level) are charged to the DB's rate limiter at IO_LOW.
         WritableFileOptions fileOptions = _db.TableFileWriteOptions(IoPriority.Low);
-        _out.File = FileChecksumHelper.CreateWritable(_db.FileSystem, _out.Path, fileOptions);
+        try
+        {
+            _out.File = FileChecksumHelper.CreateWritable(_db.FileSystem, _out.Path, fileOptions);
+        }
+        catch (Exception e) when (e is IOException or RocksDbException)
+        {
+            // CompactionJob::OpenCompactionOutputFile: "fails at NewWritableFile": the creation event of the file that
+            // could not be created (an empty FileDescriptor: file number 0) with the failure.
+            _db.NotifyOnTableFileNotKept(_cfd, JobId, _out.Path, 0, TableFileCreationReason.Compaction, e);
+            throw;
+        }
         _out.Builder = TableBuilder.Create(_out.File, _cfd.Format, tbo);
         _out.HasPointKey = false;
         _out.LargestKey.Clear();
@@ -1237,6 +1276,13 @@ internal sealed class CompactionJob
     /// file and records its metadata. <paramref name="nextTableMinKey"/> is the first key of the next output (empty
     /// for the last output).
     /// </summary>
+    /// <summary>The creation event of the output of <paramref name="group"/> that is still open when the job fails.</summary>
+    private void NotifyOutputNotKept(OutputGroup group, Exception failure)
+    {
+        if (group.Builder is null || group.Path is null) return;
+        _db.NotifyOnTableFileCreated(_cfd, JobId, group.Path, 0, TableFileCreationReason.Compaction, failure, null);
+    }
+
     private ValueTask FinishOutputAsync(ReadOnlySpan<byte> nextTableMinKey, bool synchronous)
     {
         // Copy the (once per output file) cut key so it can cross the await.
@@ -1254,6 +1300,7 @@ internal sealed class CompactionJob
         _out.Builder = null;
         _out.File = null;
         bool keep = false;
+        string outputPath = _out.Path!;
         try
         {
             if (builder.IsEmpty && meta.Smallest.Length == 0)
@@ -1295,6 +1342,12 @@ internal sealed class CompactionJob
                 keep = true;
             }
         }
+        catch (Exception e)
+        {
+            // FinishCompactionOutputFile: LogAndNotifyTableFileCreationFinished with the failure.
+            _db.NotifyOnTableFileCreated(_cfd, JobId, outputPath, 0, TableFileCreationReason.Compaction, e, null);
+            throw;
+        }
         finally
         {
             builder.Dispose();
@@ -1308,7 +1361,13 @@ internal sealed class CompactionJob
             }
         }
         _out.FirstOutput = false;
-        if (!keep) return;
+        if (!keep)
+        {
+            // FinishCompactionOutputFile: "If there is nothing to output, no necessary to generate a sst file"; the
+            // creation event names "(nil)" with Status::Aborted("Empty SST file not kept").
+            _db.NotifyOnEmptyTableFile(_cfd, JobId, TableFileCreationReason.Compaction);
+            return;
+        }
         if (_out.IsProximalLevel) Stats.NumProximalOutputFiles++;
         DbIdentity id = _db.Identity;
         if (id.DbId.Length > 0 && id.SessionId.Length > 0)

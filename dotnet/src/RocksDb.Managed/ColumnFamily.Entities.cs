@@ -60,7 +60,7 @@ public sealed partial class ColumnFamily
     public bool TryGetEntity(ReadOptions? options, ReadOnlySpan<byte> key, WideColumns columns)
     {
         ArgumentNullException.ThrowIfNull(columns);
-        GetContext ctx = Lookup(options, key);
+        GetContext ctx = Lookup(options, key, defaultColumnOnly: false);
         PooledBufferWriter entity = ObjectPools.RentWriter();
         try
         {
@@ -93,7 +93,7 @@ public sealed partial class ColumnFamily
     public async ValueTask<bool> TryGetEntityAsync(ReadOptions? options, ReadOnlyMemory<byte> key, WideColumns columns, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(columns);
-        GetContext ctx = await LookupAsync(options, key, cancellationToken).ConfigureAwait(false);
+        GetContext ctx = await LookupAsync(options, key, defaultColumnOnly: false, cancellationToken).ConfigureAwait(false);
         try
         {
             return ResolveEntity(ctx, key.Span, columns);

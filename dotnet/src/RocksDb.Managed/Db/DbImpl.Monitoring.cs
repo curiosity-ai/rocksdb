@@ -403,12 +403,32 @@ internal sealed partial class DbImpl
         catch (Exception e) when (e is IOException or RocksDbException)
         {
         }
+        LogTableFileCreationEvent(cfd, jobId, meta.FileNumber, meta.FileSize, meta.FileChecksum, meta.FileChecksumFuncName, meta.SmallestSeqno,
+            meta.LargestSeqno, tp, meta.OldestBlobFileNumber, "OK");
+    }
+
+    /// <summary>
+    /// The table_file_creation event of an output that was not kept: a failed table (BuildTable /
+    /// CompactionJob::FinishCompactionOutputFile pass the failure as the status) or an empty one (Status::Aborted
+    /// "Empty SST file not kept"). Upstream logs the file descriptor as it stands (no size, the sequence range of an
+    /// empty FileDescriptor) with default TableProperties and the unknown checksum. <paramref name="fileNumber"/> is 0
+    /// when the caller does not know it.
+    /// </summary>
+    internal void LogTableFileCreationFailedEvent(ColumnFamilyData cfd, int jobId, ulong fileNumber, string status)
+    {
+        if (!InfoLogEnabled) return;
+        LogTableFileCreationEvent(cfd, jobId, fileNumber, 0, null, null, DbFormat.MaxSequenceNumber, 0, new Table.TableProperties(), 0, status);
+    }
+
+    private void LogTableFileCreationEvent(ColumnFamilyData cfd, int jobId, ulong fileNumber, ulong fileSize, byte[]? fileChecksum,
+        string? fileChecksumFuncName, ulong smallestSeqno, ulong largestSeqno, Table.TableProperties? tp, ulong oldestBlobFileNumber, string status)
+    {
         if (BeginEvent() is not { } sb) return;
         sb.Append("\"cf_name\": ").AppendJsonString(cfd.Name).Append(", \"job\": ").Append(jobId).Append(", \"event\": \"table_file_creation\", \"file_number\": ")
-            .Append(meta.FileNumber).Append(", \"file_size\": ").Append(meta.FileSize)
-            .Append(", \"file_checksum\": ").AppendJsonString(meta.FileChecksum is { Length: > 0 } c ? Convert.ToHexString(c) : "")
-            .Append(", \"file_checksum_func_name\": ").AppendJsonString(string.IsNullOrEmpty(meta.FileChecksumFuncName) ? "Unknown" : meta.FileChecksumFuncName)
-            .Append(", \"smallest_seqno\": ").Append(meta.SmallestSeqno).Append(", \"largest_seqno\": ").Append(meta.LargestSeqno)
+            .Append(fileNumber).Append(", \"file_size\": ").Append(fileSize)
+            .Append(", \"file_checksum\": ").AppendJsonString(fileChecksum is { Length: > 0 } c ? Convert.ToHexString(c) : "")
+            .Append(", \"file_checksum_func_name\": ").AppendJsonString(string.IsNullOrEmpty(fileChecksumFuncName) ? "Unknown" : fileChecksumFuncName)
+            .Append(", \"smallest_seqno\": ").Append(smallestSeqno).Append(", \"largest_seqno\": ").Append(largestSeqno)
             .Append(", \"table_properties\": {");
         if (tp is not null)
         {
@@ -439,8 +459,8 @@ internal sealed partial class DbImpl
                 .Append(", \"seqno_to_time_mapping\": ").AppendJsonString(SeqnoToTimeMappingText(tp.SequenceNumberTimeMapping));
         }
         sb.Append('}');
-        if (meta.OldestBlobFileNumber != 0) sb.Append(", \"oldest_blob_file_number\": ").Append(meta.OldestBlobFileNumber);
-        sb.Append(", \"status\": \"OK\"");
+        if (oldestBlobFileNumber != 0) sb.Append(", \"oldest_blob_file_number\": ").Append(oldestBlobFileNumber);
+        sb.Append(", \"status\": ").AppendJsonString(status);
         EndEvent(sb);
     }
 
@@ -482,6 +502,23 @@ internal sealed partial class DbImpl
         EndEvent(sb);
     }
 
+    /// <summary>
+    /// RecordAtomicFlushRequestReason (db_impl_compaction_flush.cc): the rocksdb.atomic_flush.request.reason.* ticker of
+    /// one atomic FlushRequest. Upstream records it in DBImpl::EnqueuePendingFlush when the atomic request is queued;
+    /// the place that forms the request here is SwitchMemtablesForFlushAsync (once per call that switched a memtable
+    /// with atomic_flush). The port's FlushReason has no kMemtableMaxRangeDeletions value.
+    /// </summary>
+    internal void RecordAtomicFlushRequestReason(FlushReason reason)
+    {
+        if (Stats is not { } st) return;
+        st.RecordTick(reason switch
+        {
+            FlushReason.WriteBufferFull => Ticker.AtomicFlushRequestReasonWriteBufferFull,
+            FlushReason.WriteBufferManager => Ticker.AtomicFlushRequestReasonWriteBufferManager,
+            _ => Ticker.AtomicFlushRequestReasonOther,
+        });
+    }
+
     /// <summary>Appends ", "blob_file_head": N, "blob_file_tail": M" of the current version's blob files, or nothing.</summary>
     private static StringBuilder AppendBlobFileHeadTail(StringBuilder sb, ColumnFamilyData cfd)
     {
@@ -516,6 +553,25 @@ internal sealed partial class DbImpl
         }
         line.Append(" files to L").Append(c.OutputLevel).Append(", score ").Append(c.Score.ToString("F2", CultureInfo.InvariantCulture));
         EndInfoLine(line);
+        // With per-key placement the event also carries the seqno cutoffs CompactionJob::Prepare computes: it is
+        // written by LogCompactionStartedEvent once the job has them.
+        if (!c.SupportsPerKeyPlacement) LogCompactionStartedEvent(cfd, c, jobId, null, null);
+    }
+
+    /// <summary>
+    /// CompactionJob::LogCompaction, the "compaction_started" event. For a compaction with per-key placement
+    /// <paramref name="proximalAfterSeqno"/> / <paramref name="preserveSeqnoAfter"/> are proximal_after_seqno_ and
+    /// preserve_seqno_after_ of the job (null when no local job computed them: a compaction run by the compaction
+    /// service, whose event then has no placement keys).
+    /// </summary>
+    internal void LogCompactionStartedEvent(ColumnFamilyData cfd, Compaction c, int jobId, ulong? proximalAfterSeqno, ulong? preserveSeqnoAfter)
+    {
+        if (!InfoLogEnabled) return;
+        ulong inputBytes = 0;
+        for (int i = 0; i < c.NumInputLevels; i++)
+        {
+            foreach (FileMetaData f in c.Inputs(i).Files) inputBytes += f.FileSize;
+        }
         if (BeginEvent() is not { } sb) return;
         sb.Append("\"job\": ").Append(jobId).Append(", \"event\": \"compaction_started\", \"cf_name\": ");
         sb.AppendJsonString(cfd.Name).Append(", \"compaction_reason\": ");
@@ -538,6 +594,20 @@ internal sealed partial class DbImpl
         {
             if (_snapshots.IsEmpty) sb.Append("-1");
             else sb.Append(_snapshots.Oldest.SequenceNumber);
+        }
+        if (c.SupportsPerKeyPlacement && proximalAfterSeqno is { } proximalAfter && preserveSeqnoAfter is { } preserveAfter)
+        {
+            // GetCompactionProximalOutputRangeTypeString.
+            string range = c.ProximalOutputRangeType switch
+            {
+                0 => "NotSupported",
+                1 => "FullRange",
+                2 => "NonLastRange",
+                3 => "Disabled",
+                _ => "Invalid",
+            };
+            sb.Append(", \"proximal_after_seqno\": ").Append(proximalAfter).Append(", \"preserve_seqno_after\": ").Append(preserveAfter)
+                .Append(", \"proximal_output_level\": ").Append(c.ProximalLevel).Append(", \"proximal_output_range\": ").AppendJsonString(range);
         }
         EndEvent(sb);
     }

@@ -893,8 +893,15 @@ internal sealed partial class DbImpl
                 }
                 bool bottom = thread == CompactionThread.Bottom;
                 // ProcessKeyValueCompactionWithCompactionService (no snapshot checker support in remote compaction).
+                bool startedEventLogged = !c.SupportsPerKeyPlacement; // else deferred by OnCompactionStarted
                 if (Options.CompactionService is { } service && checker is null)
                 {
+                    if (!startedEventLogged)
+                    {
+                        // No local job computes the placement cutoffs for a compaction handed to the service.
+                        LogCompactionStartedEvent(cfd, c, jobId, null, null);
+                        startedEventLogged = true;
+                    }
                     remote = TryRunRemoteCompaction(service, cfd, c, jobSnapshots, jobId, bottom, ct);
                 }
                 if (remote is not null)
@@ -914,6 +921,9 @@ internal sealed partial class DbImpl
                         SnapshotChecker = checker,
                         JobSnapshot = jobSnapshot?.SequenceNumber ?? 0,
                         EarliestWriteConflictSnapshot = earliestWriteConflict,
+                        JobId = jobId,
+                        // CompactionJob::LogCompaction: proximal_after_seqno / preserve_seqno_after of the started event.
+                        OnTimesPrepared = startedEventLogged ? null : (proximalAfter, preserveAfter) => LogCompactionStartedEvent(cfd, c, jobId, proximalAfter, preserveAfter),
                         AcquireSubcompactionResources = n => AcquireSubcompactionResources(n, bottom),
                         ReleaseSubcompactionResources = n => ReleaseSubcompactionResources(n, bottom),
                     };

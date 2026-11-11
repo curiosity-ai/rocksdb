@@ -935,7 +935,9 @@ public sealed class DbIter : IDisposable
     private void MergeWithEntityBaseValue(ReadOnlySpan<byte> entity)
     {
         _valid = false;
-        // MergeWithWideColumnBaseValue -> ResolveEntityForMerge: blob-backed columns are resolved first.
+        // MergeWithWideColumnBaseValue -> ResolveEntityForMerge: blob-backed columns are resolved first. The entity
+        // resolved for the previous position (cached by ResolveEntity) is not this one.
+        _entityResolved = false;
         entity = ResolveEntity(entity);
         MergeIntoResult(MergeExistingValueKind.WideColumns, entity);
     }

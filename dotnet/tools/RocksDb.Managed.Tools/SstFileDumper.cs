@@ -188,7 +188,8 @@ internal sealed class SstFileDumper : IDisposable
     {
         text = "";
         var slots = new List<Db.Wide.WideColumnSlot>();
-        if (Db.Wide.WideColumnSerialization.TryDeserialize(entity, slots, out _) is not null) return false;
+        // DeserializeSimple: a blob reference (version 2 kTypeBlobIndex column) is Corruption for this caller too.
+        if (Db.Wide.WideColumnSerialization.TryDeserialize(entity, slots, out bool hasBlobColumns) is not null || hasBlobColumns) return false;
         var sb = new System.Text.StringBuilder();
         for (int c = 0; c < slots.Count; c++)
         {

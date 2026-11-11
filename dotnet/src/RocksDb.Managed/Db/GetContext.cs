@@ -58,6 +58,12 @@ internal sealed class GetContext
     /// operand applies to it; the caller then reads <see cref="Value"/> as the serialized (version 2) entity.
     /// </summary>
     public bool DeferEntityBlobColumns;
+    /// <summary>
+    /// The caller reads only the value (DB::Get with a PinnableSlice, GetContext::SaveWideColumnEntityToPinnable): for a
+    /// found version 2 entity that no merge operand applies to, <see cref="ResolveBlob"/> leaves the other columns'
+    /// blobs unread and replaces the entity with the value of its default column.
+    /// </summary>
+    public bool DefaultColumnOnly;
     public ulong MaxCoveringTombstoneSeq;
     /// <summary>
     /// ReadOptions::ignore_range_deletions: the range tombstones of memtables and table files are not consulted
@@ -184,6 +190,7 @@ internal sealed class GetContext
         ValueIsBlobIndex = false;
         ValueEntityHasBlobColumns = false;
         DeferEntityBlobColumns = false;
+        DefaultColumnOnly = false;
         MaxCoveringTombstoneSeq = 0;
         IgnoreRangeDeletions = false;
         ReadSequence = DbFormat.MaxSequenceNumber;
@@ -354,7 +361,8 @@ internal sealed class GetContext
         if (ValueEntityHasBlobColumns)
         {
             if (DeferEntityBlobColumns && MergeContext.Count == 0 && State == GetState.Found) return;
-            ResolveEntityBlobColumns(source, version, options, userKey);
+            if (DefaultColumnOnly && MergeContext.Count == 0 && State == GetState.Found) ResolveDefaultColumn(source, version, options, userKey);
+            else ResolveEntityBlobColumns(source, version, options, userKey);
             return;
         }
         if (!ValueIsBlobIndex) return;
@@ -373,7 +381,8 @@ internal sealed class GetContext
         if (ValueEntityHasBlobColumns)
         {
             // Entity blob columns are resolved with synchronous reads (cache hits are the common case for hot entities).
-            ResolveEntityBlobColumns(source, version, options, userKey.Span);
+            if (DefaultColumnOnly && MergeContext.Count == 0 && State == GetState.Found) ResolveDefaultColumn(source, version, options, userKey.Span);
+            else ResolveEntityBlobColumns(source, version, options, userKey.Span);
             return ValueTask.CompletedTask;
         }
         if (!ValueIsBlobIndex) return ValueTask.CompletedTask;
@@ -407,6 +416,36 @@ internal sealed class GetContext
             _entityScratch, Scratch);
         Value.Clear();
         Value.Write(Scratch.WrittenSpan);
+        ValueEntityHasBlobColumns = false;
+    }
+
+    /// <summary>
+    /// GetContext::SaveWideColumnEntityToPinnable for a version 2 entity: replaces the found entity with the value of
+    /// its default column (WideColumnSerialization::GetValueOfDefaultColumn); only a blob-backed default column is
+    /// fetched (ResolveDefaultColumnBlobReference), the other columns' blobs are not read.
+    /// </summary>
+    private void ResolveDefaultColumn(Blob.BlobSource source, VersionStorageInfo version, ReadOptions? options, ReadOnlySpan<byte> userKey)
+    {
+        if (TimestampSize != 0 && _blobUserKey.WrittenCount > 0) userKey = _blobUserKey.WrittenSpan;
+        ReadOnlySpan<byte> value = Wide.WideColumnSerialization.GetValueOfDefaultColumn(Value.WrittenSpan, out bool isBlobReference);
+        Scratch.Clear();
+        if (!isBlobReference)
+        {
+            Scratch.Write(value);
+        }
+        else
+        {
+            if (value.IsEmpty) ThrowHelper.Corruption("Empty blob index in wide column default value");
+            if (Blob.BlobIndex.TryDecode(value, out Blob.BlobIndex index) is not null)
+            {
+                ThrowHelper.Corruption("Error decoding blob index in wide column default value");
+            }
+            if (index.IsInlined) Scratch.Write(index.InlinedValue);
+            else source.GetBlob(version, options, userKey, value, Scratch);
+        }
+        Value.Clear();
+        Value.Write(Scratch.WrittenSpan);
+        ValueIsEntity = false;
         ValueEntityHasBlobColumns = false;
     }
 

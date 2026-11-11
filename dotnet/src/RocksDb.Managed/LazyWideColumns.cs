@@ -220,7 +220,11 @@ public sealed partial class LazyWideColumns : IDisposable
             _fetch.Clear();
             await _source.GetBlobAsync(_version!, _readOptions, _key.WrittenMemory, _entity.WrittenSpan.Slice(s.ValueOffset, s.ValueLength), _fetch,
                 cancellationToken).ConfigureAwait(false);
-            if (!cached) RecordRead(c.Size);
+            // The bytes BlobFileReader::GetBlob reads: the whole record under verify_checksums, else the value.
+            if (!cached)
+            {
+                RecordRead(c.Size + (_readOptions.VerifyChecksums ? BlobLogFormat.RecordHeaderAdjustment((ulong)_key.WrittenCount) : 0));
+            }
             Adopt(index);
         }
         return _info[index].Resolved.AsMemory(0, _info[index].ResolvedLength);
@@ -248,12 +252,13 @@ public sealed partial class LazyWideColumns : IDisposable
         if (c.Kind == ColumnKind.BlobFile && c.Resolved is null && !forceVerify && c.Compression == CompressionType.None
             && _version!.GetBlobFileMetaData(c.FileNumber) is not null)
         {
-            if (offset >= c.Size) return 0;
-            ulong remaining = c.Size - offset;
-            int length = (ulong)destination.Length < remaining ? destination.Length : (int)remaining;
-            if (length == 0) return 0;
-            if (offset != 0 || (ulong)length < c.Size)
+            // strict_subrange (ReadPathBlobResolver::ResolveColumnRange): a whole-column request, which includes any
+            // request at offset 0 for a zero-size blob, takes the verifying whole read below.
+            if (offset > 0 || (ulong)destination.Length < c.Size)
             {
+                if (offset >= c.Size || destination.Length == 0) return 0; // empty range: no I/O
+                ulong remaining = c.Size - offset;
+                int length = (ulong)destination.Length < remaining ? destination.Length : (int)remaining;
                 ulong read = _source!.ReadBlobRange(_readOptions, _key.WrittenSpan, c.FileNumber, c.Offset, c.Size, offset, destination[..length]);
                 RecordRead(read);
                 if (_stats is { } st)
@@ -379,8 +384,9 @@ public sealed partial class LazyWideColumns : IDisposable
         _fetch.Clear();
         if (_version!.GetBlobFileMetaData(c.FileNumber) is not null)
         {
-            ulong read = _source!.GetBlob(_readOptions, _key.WrittenSpan, c.FileNumber, c.Offset, c.Size, c.Compression, _fetch);
-            if (read != 0) RecordRead(read);
+            // BlobSource::GetBlob records the lazy read (RecordLazyRead) only when it reads the file.
+            ulong read = _source!.GetBlob(_readOptions, _key.WrittenSpan, c.FileNumber, c.Offset, c.Size, c.Compression, _fetch, out bool cacheHit);
+            if (!cacheHit) RecordRead(read);
         }
         else
         {
