@@ -404,5 +404,5 @@ Still open from this round:
 - [x] Compression dictionary in the block cache: hit / miss / add / bytes-insert tickers, pinning per `unpartitioned_pinning` / `pin_l0_filter_and_index_blocks_in_cache`, re-read after eviction (`Audit4CompressionDictCacheTests`, native differential in `Audit4CompressionDictCacheCompatTests`)
 - [ ] `BLOCK_CACHE_*_ADD_REDUNDANT` tickers (all block kinds, the dictionary included) are not recorded
 - [ ] `pin_l0_filter_and_index_blocks_in_cache` / `unpartitioned_pinning` for the index and full filter (only the dictionary follows them)
-- [ ] `AutoHyperClockTable` grow / chain logic read line by line against C++
+- [x] `AutoHyperClockTable` read against C++ (behavioural port without chains): eviction circles kMaxCountdown + 1 times, the table grows at its occupancy limit also over capacity, ApplyToAllEntries is stable across a grow, small shards start at 4 / grow to 64 slots (`Audit4AutoHyperClockTests`)
 - [ ] Replication compared with the rocksdb-sharp original (that repository was not available to the audit)
