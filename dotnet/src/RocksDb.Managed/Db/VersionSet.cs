@@ -494,6 +494,10 @@ internal sealed class VersionSet : IAsyncDisposable
             bool newManifest;
             lock (_db.Mutex)
             {
+                // Deviation from ProcessManifestWrites ("max_last_sequence = descriptor_last_sequence_", the largest value
+                // recorded so far): the port starts from the DB's current last sequence, so every edit records it. The
+                // sequence reservation of a WAL write error recovery relies on that (the failed write's sequence range
+                // is published, then persisted by the next edit); a larger last_sequence is harmless to native.
                 ulong lastSeq = Math.Max(LastSequence, _descriptorLastSequence);
                 for (int i = 0; i < n; i++)
                 {
@@ -507,9 +511,12 @@ internal sealed class VersionSet : IAsyncDisposable
                     {
                         throw new RocksDbException(StatusCode.ColumnFamilyDropped, "Column family drop: column family " + cfd.Name + " was dropped");
                     }
-                    if (edit.IsColumnFamilyAdd)
+                    if (edit.IsColumnFamilyDrop)
                     {
-                        edit.MaxColumnFamily = Math.Max(MaxColumnFamily, edit.ColumnFamily);
+                        // LogAndApplyCFHelper: "if we drop column family, we have to make sure to save max column family,
+                        // so that we don't reuse existing ID". An add records none (recovery raises the maximum to the
+                        // id of every column family it creates).
+                        edit.MaxColumnFamily = MaxColumnFamily;
                     }
                     else if (cfd is not null && !edit.IsColumnFamilyDrop && (edit.NewFiles.Count > 0 || edit.DeletedFiles.Count > 0 ||
                                                                              edit.BlobFileAdditions.Count > 0 || edit.BlobFileGarbages.Count > 0 ||
@@ -538,15 +545,28 @@ internal sealed class VersionSet : IAsyncDisposable
                     // Like LogAndApplyHelper: last_sequence never goes backwards and covers the largest seqno of the files
                     // an edit adds (ingested files are assigned a seqno above the published last sequence, which is only
                     // advanced after the edit is durable).
-                    if (edit.LastSequence is ulong own && own > lastSeq) lastSeq = own;
+                    if (edit.IsColumnFamilyManipulation)
+                    {
+                        // LogAndApplyCFHelper: next_file (below) and last_sequence only.
+                        edit.LastSequence = lastSeq;
+                    }
+                    else
+                    {
+                        // LogAndApplyHelper: prev_log_number on every edit that has none, next_file (below), and the
+                        // running maximum of last_sequence (an edit keeps its own when that is larger).
+                        edit.PrevLogNumber ??= PrevLogNumber;
+                        if (edit.LastSequence is ulong own && own > lastSeq) lastSeq = own;
+                        else edit.LastSequence = lastSeq;
+                    }
                     tsSizes[i] = TimestampSizeOfEdit(edit);
                 }
                 newManifest = _manifest is null || (ulong)_manifestLog!.Log.File!.Size >= EnforcedManifestLimit(editList);
                 if (newManifest)
                 {
                     snapshot = BuildSnapshotState();
+                    // ProcessManifestWrites: "if we are writing out new snapshot make sure to persist max column family".
+                    if (MaxColumnFamily > 0) editList[0].MaxColumnFamily = MaxColumnFamily;
                 }
-                for (int i = 0; i < n; i++) editList[i].LastSequence = lastSeq;
                 _descriptorLastSequence = lastSeq;
             }
 
@@ -572,7 +592,7 @@ internal sealed class VersionSet : IAsyncDisposable
                     Wal.LogWriter sizeOf = newLog.Log;
                     var writer = new ManifestWriter(newLog) { FileSizeProvider = () => (ulong)sizeOf.File!.Size };
                     // WriteCurrentStateToManifest (synced at the end).
-                    await Await(writer.WriteSnapshotAsync(snapshot, TimestampSizeOfColumnFamily, cancellationToken), synchronous).ConfigureAwait(false);
+                    await Await(writer.WriteCurrentStateAsync(snapshot, TimestampSizeOfColumnFamily, cancellationToken), synchronous).ConfigureAwait(false);
                     ulong next = CurrentNextFileNumber;
                     foreach (VersionEdit e in editList) e.NextFileNumber = next;
                     await Await(writer.AddEditsAsync(editList, tsSizes, atomicGroup, cancellationToken), synchronous).ConfigureAwait(false);

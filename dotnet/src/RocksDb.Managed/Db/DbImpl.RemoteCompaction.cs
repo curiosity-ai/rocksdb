@@ -25,6 +25,8 @@ internal sealed partial class DbImpl
     {
         public readonly List<FileMetaData> Outputs = new();
         public readonly List<FileMetaData> ProximalOutputs = new();
+        /// <summary>The worker's key/value hash of each of <see cref="Outputs"/> (CompactionServiceOutputFile::paranoid_hash).</summary>
+        public readonly List<ulong> OutputHashes = new();
         public readonly List<ulong> CreatedFileNumbers = new();
         public ulong BytesRead;
         public ulong BytesWritten;
@@ -250,6 +252,7 @@ internal sealed partial class DbImpl
                 };
                 if (props.NumEntries > 0) meta.SetEntryStats(props);
                 outcome.Outputs.Add(meta);
+                outcome.OutputHashes.Add(f.ParanoidHash);
             }
         }
         catch (Exception e) when (e is IOException or RocksDbException)
@@ -266,6 +269,23 @@ internal sealed partial class DbImpl
         Stats?.RecordTick(Ticker.RemoteCompactWriteBytes, result.BytesWritten);
         service.OnInstallation(response.ScheduledJobId, CompactionServiceJobStatus.Success);
         return outcome;
+    }
+
+    /// <summary>
+    /// CompactionJob::VerifyOutputFiles on the primary for a compaction the service ran (the subcompaction's
+    /// is_remote_compaction): every imported output is opened through the table cache, and with
+    /// kEnableForRemoteCompaction it is verified against the worker's hash / its block and file checksums.
+    /// </summary>
+    private void VerifyRemoteCompactionOutputs(ColumnFamilyData cfd, Compaction c, RemoteCompactionOutcome remote)
+    {
+        VerifyOutputFlags flags = CompactionJob.EffectiveVerifyOutputFlags(c.Options);
+        if ((flags & VerifyOutputFlags.EnableForRemoteCompaction) == 0) flags = VerifyOutputFlags.None;
+        for (int i = 0; i < remote.Outputs.Count; i++)
+        {
+            FileMetaData output = remote.Outputs[i];
+            if (output.LevelHint < 0) output.LevelHint = c.OutputLevel;
+            CompactionJob.VerifyOutputFile(this, cfd, output, remote.OutputHashes[i], flags);
+        }
     }
 
     private int _numRunningRemoteCompactions; // rocksdb.num-running-remote-compactions (waiting in CompactionService::Wait)
@@ -502,8 +522,9 @@ internal sealed partial class DbImpl
     {
         CompactionJobStats s = job.Stats;
         ulong micros = (ulong)elapsed.TotalMicroseconds;
-        foreach (FileMetaData f in job.Outputs)
+        for (int i = 0; i < job.Outputs.Count; i++)
         {
+            FileMetaData f = job.Outputs[i];
             string path = FileNames.MakeTableFileName(r.OutputPath, f.FileNumber);
             TableProperties props;
             using (BlockBasedTableReader reader = BlockBasedTableReader.Open(FileSystem.OpenRandomAccess(path), cfd.ReaderOptions with { BlockCache = NoBlockCache.Instance }))
@@ -524,6 +545,7 @@ internal sealed partial class DbImpl
                 EpochNumber = f.EpochNumber,
                 FileChecksum = f.FileChecksum,
                 FileChecksumFuncName = f.FileChecksumFuncName,
+                ParanoidHash = job.OutputHashes[i], // output_file.validator.GetHash()
                 MarkedForCompaction = f.MarkedForCompaction,
                 UniqueId = f.UniqueId,
                 TableProperties = props,

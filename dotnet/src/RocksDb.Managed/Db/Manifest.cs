@@ -255,6 +255,8 @@ public sealed class ManifestReplayer
             }
             cf = new ColumnFamilyVersion { Id = edit.ColumnFamily, Name = edit.ColumnFamilyAddName! };
             _state.ColumnFamilies[edit.ColumnFamily] = cf;
+            // ColumnFamilySet::CreateColumnFamily: max_column_family_ = max(max_column_family_, id).
+            if (edit.ColumnFamily > _state.MaxColumnFamily) _state.MaxColumnFamily = edit.ColumnFamily;
         }
         else if (edit.IsColumnFamilyDrop)
         {
@@ -635,6 +637,21 @@ public sealed class ManifestWriter
     /// </summary>
     public async ValueTask WriteSnapshotAsync(RecoveredVersionState state, Func<ColumnFamilyVersion, int> timestampSize, CancellationToken cancellationToken)
     {
+        await WriteCurrentStateAsync(state, timestampSize, cancellationToken).ConfigureAwait(false);
+        // A self-contained MANIFEST needs next_file_number (and max_column_family); VersionSet stamps them on the edits
+        // of the batch that follows the state instead, as ProcessManifestWrites does.
+        var tail = new VersionEdit { NextFileNumber = state.NextFileNumber, LastSequence = state.LastSequence, MaxColumnFamily = state.MaxColumnFamily };
+        if (state.PrevLogNumber != 0) tail.PrevLogNumber = state.PrevLogNumber;
+        await AddRecordAsync(tail, 0, cancellationToken).ConfigureAwait(false);
+        await _sink.SyncAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// VersionSet::WriteCurrentStateToManifest: the records of the current state, without next_file_number and
+    /// max_column_family (the caller's edits that follow carry them). Not synced.
+    /// </summary>
+    internal async ValueTask WriteCurrentStateAsync(RecoveredVersionState state, Func<ColumnFamilyVersion, int> timestampSize, CancellationToken cancellationToken)
+    {
         if (state.DbId is not null)
         {
             await AddRecordAsync(new VersionEdit { DbId = state.DbId }, 0, cancellationToken).ConfigureAwait(false);
@@ -688,10 +705,6 @@ public sealed class ManifestWriter
             var lcm = new VersionEdit { LastCompactedManifestFileSize = size() + EstimatedRecordOverhead };
             await AddRecordAsync(lcm, 0, cancellationToken).ConfigureAwait(false);
         }
-        var tail = new VersionEdit { NextFileNumber = state.NextFileNumber, LastSequence = state.LastSequence, MaxColumnFamily = state.MaxColumnFamily };
-        if (state.PrevLogNumber != 0) tail.PrevLogNumber = state.PrevLogNumber;
-        await AddRecordAsync(tail, 0, cancellationToken).ConfigureAwait(false);
-        await _sink.SyncAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private ValueTask AddRecordAsync(VersionEdit edit, int timestampSize, CancellationToken cancellationToken)

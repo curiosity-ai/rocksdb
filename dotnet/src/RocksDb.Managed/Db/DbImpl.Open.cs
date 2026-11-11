@@ -336,20 +336,30 @@ internal sealed partial class DbImpl
         }
         if (_recoveredSeq != ulong.MaxValue) WriteRecoveredSequenceRecord(_recoveredSeq);
         if (untrackWals is not null) await Versions.LogAndApplyAsync(null, untrackWals, synchronous, ct).ConfigureAwait(false);
+        bool wroteRecoveryEdit = untrackWals is not null;
         foreach (ColumnFamilyData cfd in GetColumnFamilies())
         {
-            if (!recoveryEdits.TryGetValue(cfd.Id, out VersionEdit? edit))
-            {
-                edit = new VersionEdit { ColumnFamily = cfd.Id };
-            }
-            // All data of this CF in the replayed WALs is now in table files (or there was none).
-            if (cfd.Mem.IsEmpty && cfd.Imm.Count == 0) edit.LogNumber = Math.Max(cfd.LogNumber, newLogNumber);
+            bool hasEdit = recoveryEdits.TryGetValue(cfd.Id, out VersionEdit? edit);
             // recovery_ctx->UpdateVersionEdits: the move-down edit comes before the edits of the WAL replay.
             if (moveDownEdits is not null && moveDownEdits.TryGetValue(cfd.Id, out VersionEdit? moveDown))
             {
                 await Versions.LogAndApplyAsync(cfd, moveDown, synchronous, ct).ConfigureAwait(false);
+                wroteRecoveryEdit = true;
             }
+            // DBImpl::Recover calls RecoverLogFiles only when the WAL directory holds a WAL: without one no column family
+            // gets a recovery edit (their log numbers stay as recovered).
+            if (!hasEdit && _noWalsFoundAtOpen) continue;
+            edit ??= new VersionEdit { ColumnFamily = cfd.Id };
+            // All data of this CF in the replayed WALs is now in table files (or there was none).
+            if (!_noWalsFoundAtOpen && cfd.Mem.IsEmpty && cfd.Imm.Count == 0) edit.LogNumber = Math.Max(cfd.LogNumber, newLogNumber);
             await Versions.LogAndApplyAsync(cfd, edit, synchronous, ct).ConfigureAwait(false);
+            wroteRecoveryEdit = true;
+        }
+        if (!wroteRecoveryEdit)
+        {
+            // DBImpl::LogAndApplyForRecovery: "force_new_manifest_on_open_ && !recovery_ctx.HasVersionEdits()": an empty
+            // edit of the default column family starts the new MANIFEST.
+            await Versions.LogAndApplyAsync(Versions.GetColumnFamily(0)!, new VersionEdit(), synchronous, ct).ConfigureAwait(false);
         }
         // DBImpl::Open: "Handle obsolete IDENTITY file", only after the recovery was committed.
         if (!Options.WriteIdentityFile) TryDeleteFile(FileNames.IdentityFileName(DbName));
@@ -766,6 +776,8 @@ internal sealed partial class DbImpl
     /// (<see cref="ProcessLogFilesAsync"/>). Recovered memtables are flushed to L0 (WriteLevel0TableForRecovery) when they
     /// fill up and, unless avoid_flush_during_recovery, at the end. Returns the per-CF edits to apply.
     /// </summary>
+    private bool _noWalsFoundAtOpen; // the WAL directory held no WAL when the DB was opened (set by RecoverLogFilesAsync)
+
     private async ValueTask<Dictionary<uint, VersionEdit>> RecoverLogFilesAsync(bool isNewDb, bool synchronous, CancellationToken ct)
     {
         var edits = new Dictionary<uint, VersionEdit>();
@@ -803,6 +815,7 @@ internal sealed partial class DbImpl
         CheckWalFilesExist(isNewDb, allWals.Count);
         // Best-efforts recovery does not replay WALs (DBImpl::Recover does not list the WAL directory); their numbers are
         // still marked used, and they become obsolete once the recovery edits advance every column family.
+        _noWalsFoundAtOpen = allWals.Count == 0;
         if (allWals.Count == 0 || Options.BestEffortsRecovery) return edits;
 
         // DBImpl::RecoverLogFiles (SetupLogFilesRecovery / FinishLogFilesRecovery): the recovery_started event lists every

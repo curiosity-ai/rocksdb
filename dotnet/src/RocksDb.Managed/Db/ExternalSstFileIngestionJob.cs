@@ -199,6 +199,11 @@ internal sealed class ExternalSstFileIngestionJob
         {
             f.FileNumber = _db.ReserveFileNumberForIngestion();
             _reservedFileNumbers.Add(f.FileNumber);
+        }
+        // DBImpl::ReserveFileNumbersBeforeIngestion: the reserved numbers are persisted before a file is linked.
+        await _db.PersistReservedIngestionFileNumbersAsync(_cfd, synchronous, ct).ConfigureAwait(false);
+        foreach (IngestedFileInfo f in _files)
+        {
             string pathInsideDb = FileNames.TableFileName(_db.DbPaths, f.FileNumber, 0);
             bool linked = false;
             if (_options.MoveFiles || _options.LinkFiles)

@@ -906,6 +906,7 @@ internal sealed partial class DbImpl
                 }
                 if (remote is not null)
                 {
+                    VerifyRemoteCompactionOutputs(cfd, c, remote);
                     jobSnapshot?.Dispose();
                     c.AddInputDeletions(edit);
                     foreach (FileMetaData f in remote.Outputs) edit.AddFile(c.OutputLevel, f);
