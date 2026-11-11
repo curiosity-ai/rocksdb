@@ -365,7 +365,9 @@ internal sealed partial class DbImpl
                 cfd.Current.Ref();
                 // The worker re-derives per-key placement; the primary only schedules compactions without it (or an
                 // older primary sends no decision: proximal_level 0).
-                if (ci.ProximalLevel != 0 && c.ProximalLevel != ci.ProximalLevel)
+                if (ci.ProximalLevel != 0
+                    && (c.ProximalLevel != ci.ProximalLevel || c.ProximalOutputRangeType != ci.ProximalOutputRangeType
+                        || c.KeepInLastLevelThroughSeqno != ci.KeepInLastLevelThroughSeqno))
                 {
                     throw new RocksDbException(StatusCode.Incomplete,
                         "Incomplete: Remote compaction worker's per-key placement differs from the primary's");
