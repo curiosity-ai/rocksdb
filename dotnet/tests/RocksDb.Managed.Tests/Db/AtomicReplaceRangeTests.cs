@@ -378,7 +378,7 @@ public sealed class AtomicReplaceRangeTests
 
     /// <summary>
     /// A failure while writing the MANIFEST leaves the column family as it was: the replaced files are released (no
-    /// longer marked as being compacted) and compactable, and the generated tombstone file is deleted.
+    /// longer marked as being compacted) and compactable. The files written for the edit are kept (see below).
     /// </summary>
     [TestMethod]
     public void FailedCommitReleasesReplacedFiles()
@@ -397,7 +397,10 @@ public sealed class AtomicReplaceRangeTests
         fs.FailMatching("MANIFEST", FaultOps.Append | FaultOps.Sync, 1, InjectedFaultKind.IOError);
         Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles(db.DefaultColumnFamily, ReplaceArg(replacement, "b", "e")));
         fs.ClearFailMatching();
-        Assert.AreEqual(2, fs.Inner.GetChildren(DbPath).Count(n => n.EndsWith(".sst", StringComparison.Ordinal)), "generated tombstone / copies left behind");
+        // The edit's record may have reached the MANIFEST before the I/O error, so the copied file and the generated
+        // tombstone file are kept (upstream quarantines the files of such an edit); the obsolete-file scan of a later
+        // open removes them when the record is not there.
+        Assert.AreEqual(4, fs.Inner.GetChildren(DbPath).Count(n => n.EndsWith(".sst", StringComparison.Ordinal)), "files of an edit that hit a MANIFEST I/O error are kept");
         foreach (LiveFileMetadata m in db.GetLiveFilesMetadata()) Assert.AreEqual(6, m.Level);
     }
 
