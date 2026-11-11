@@ -632,15 +632,28 @@ public sealed partial class BlockBasedTableReader : TableReader
                 && fh.Size > 0)
             {
                 filterKind = FilterKind.Partitioned;
-                Block top = BlockFetcher.ReadBlock(file, footer, fh, verify);
+                Block? top = null;
+                try
+                {
+                    top = BlockFetcher.ReadBlock(file, footer, fh, verify);
+                }
+                catch (Exception e) when (e is RocksDbException or IOException)
+                {
+                    // PartitionedFilterBlockReader::Create (partitioned_filter_block.cc): a top-level filter index that
+                    // cannot be read is ignored (IGNORE_STATUS_IF_ERROR) and the table is opened without a filter.
+                    filterKind = FilterKind.None;
+                }
                 filterIndex = top;
-                if (!options.CacheIndexAndFilterBlocks || metaCache is null)
+                if (top is not null && (!options.CacheIndexAndFilterBlocks || metaCache is null))
                 {
                     // Partition pinning (MetadataCacheOptions kFallback without cache_index_and_filter_blocks):
-                    // PartitionedFilterBlockReader::CacheDependencies loads all partitions up front and keeps them.
-                    pinnedParts = PinnedFilterPartitions.Load(file, footer, verify, ppolicy, top, props, options.Comparator);
+                    // PartitionedFilterBlockReader::CacheDependencies loads all partitions up front and keeps them. Its
+                    // read errors fail the open, except without a block cache, where C++ loads nothing at open
+                    // (MaybeReadBlockAndLoadToCache is a no-op) and a lookup ignores an unreadable partition.
+                    pinnedParts = PinnedFilterPartitions.Load(file, footer, verify, ppolicy, top, props, options.Comparator,
+                        ignoreUnreadablePartitions: options.BlockCache is NoBlockCache);
                 }
-                if (metaCache is not null)
+                if (top is not null && metaCache is not null)
                 {
                     if (pinTopLevel) top.AddRef();
                     else filterIndex = null;

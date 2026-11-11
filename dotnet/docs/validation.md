@@ -1223,7 +1223,7 @@ slice did not reach. Every finding below was proven by a test that failed before
 | Point lookups | `MemTable::Get`, `TableCache::Get`, `DBImpl::GetImpl`, `MultiGetCommon`, `DBImpl::KeyMayExist`, `GetContext::SaveValue` | `ignore_range_deletions` was ignored by Get / MultiGet; a read timestamp on a CF without timestamps was accepted by GetAsync / MultiGet; KeyMayExist under a memtable range tombstone and with a mismatched timestamp; the timestamp reported when the newest entry carries kMaxTs; the memtable entry checksum is verified before the visibility check. |
 | MultiGet | `DBImpl::MultiGetImpl` (MAX_BATCH_SIZE), `hash_index_reader.cc` | `value_size_soft_limit` is applied per batch of 32 sorted keys. A kHashSearch table whose prefixes block cannot be read fails to open. |
 | Level iterator | `LevelIterator::Seek` | The prefix check after a skipped file passed keys with the user-defined timestamp to the prefix extractor (a key could be skipped). |
-| Table reader | `full_filter_block.cc`, `partitioned_filter_block.cc`, `meta_blocks.cc` (GetGlobalSequenceNumber), `sst_file_reader` | An unreadable filter block failed the open / lookup (upstream ignores it); external file version > 2 was Corruption; `SstFileReader.MultiGet` ignored the snapshot. |
+| Table reader | `full_filter_block.cc`, `partitioned_filter_block.cc`, `meta_blocks.cc` (GetGlobalSequenceNumber), `sst_file_reader` | An unreadable filter block failed the open / lookup (upstream ignores it); the same for a partitioned filter's top-level index, and for a filter partition when there is no block cache; external file version > 2 was Corruption; `SstFileReader.MultiGet` ignored the snapshot. |
 | Blocks | `block.cc` (raw_key_ as delta base), `filter_policy.cc` | With a global sequence number BlockIter patched the footer in the buffer that is the delta base of the next entry: a following key sharing those bytes got the seqno spliced into its user key (ingested files). Internal keys shorter than their footer and a FastLocalBloom shorter than a cache line no longer throw non-RocksDb exceptions. RibbonFilterPolicy honors the compaction style (FIFO / none are "bottommost"). |
 | Table builder, SstFileWriter | `block_based_table_factory.cc` (InitializeOptions), `sst_file_writer.cc`, `block_based_table_builder.cc` | format_version < 2 is raised to 2 (and persisted so); SstFileWriter wrote a creation time, no original file number and a new session id per Open, and left the file behind when Finish failed; uncompressed data blocks are counted as "bypassed". |
 | Compression | `util/compression.cc` | A zlib stream cut before its end marker and an LZ4 block without payload are Corruption. |
@@ -1308,9 +1308,10 @@ secondary cache adapter and compressed / tiered secondary caches, backup engine 
 seqno-to-time mapping, internal stats properties, histograms, rate limiter, file systems, PlainTable, CuckooTable,
 trace formats, trie index factory. Option defaults and the ticker / histogram name tables were diffed by script.
 
-Not read against the C++ in this audit (previous audits and the byte-identical compat tests still apply): the Bloom
-and Ribbon implementations and filter builders (`bloom_impl.h`, `ribbon_*.h`, `filter_policy.cc` builders),
-`block_builder.cc`, `meta_blocks.cc` / `table_properties.cc`, the filter block reader bodies; `lru_cache.cc` and the
+Not read against the C++ in this audit (previous audits and the byte-identical compat tests still apply): the filter
+builders of `filter_policy.cc`, the Ribbon banding (`ribbon_alg.h` up to the interleaved query; `bloom_impl.h`, the
+Ribbon query / configuration and the filter block readers were read), `block_builder.cc`, `meta_blocks.cc` /
+`table_properties.cc`, `block_fetcher.cc`; `lru_cache.cc` and the
 lookup / release / evict half of `clock_cache.cc`, the persistent cache, cache dump / load; the recovery half of the
 error handler (Resume), `version_builder.cc` beyond ApplyFileAddition, `repair.cc` beyond the WAL conversion; the
 background flush / compaction scheduling bodies (BackgroundFlush, FlushMemTableToOutputFile, the job-running branch of
