@@ -127,6 +127,14 @@ public sealed partial class LazyWideColumns
                 return;
             }
             ref ColumnInfo c = ref _info[read.Column];
+            // ReadPathBlobResolver::ResolveColumnRange: an empty strict sub-range (offset at or past the end, or a zero
+            // length) of a reference that would be read partially is empty without any I/O.
+            if (c.Kind == ColumnKind.BlobFile && c.Resolved is null && !read.ForceVerify && c.Compression == CompressionType.None
+                && (read.Offset >= c.Size || read.Length == 0) && (read.Offset > 0 || c.Size > 0)
+                && _version!.GetBlobFileMetaData(c.FileNumber) is not null)
+            {
+                return;
+            }
             WideColumnSlot s = _slots[read.Column];
             ReadOnlyMemory<byte> whole;
             if (c.Kind == ColumnKind.Inline) whole = _entity.WrittenMemory.Slice(s.ValueOffset, s.ValueLength);

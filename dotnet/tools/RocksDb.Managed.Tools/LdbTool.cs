@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using RocksDb.Managed.Compression;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Db.Iterators;
 using RocksDb.Managed.Env;
@@ -310,10 +311,104 @@ internal sealed class LdbTool
             // The DB may not exist yet ("create if not existing" case); Open reports the real problem.
         }
         if (descriptors.Count == 0) descriptors.Add(new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, CfOptions(file, "default")));
+        // LDBCommand::PrepareOptions: the overrides are validated on the base options first; with column families from
+        // the OPTIONS file they apply only to the column family of --column_family, otherwise to all of them.
+        OverrideBaseCfOptions(null);
+        foreach (ColumnFamilyDescriptor d in descriptors)
+        {
+            if (file is null || d.Name == _cfName) OverrideBaseCfOptions(d.Options);
+        }
         var o = new DbOptions { FileSystem = _fs, CreateIfMissing = createIfMissing };
         _db = readOnly ? RocksDatabase.OpenReadOnly(_dbPath, o, descriptors, errorIfWalFileExists: false) : RocksDatabase.Open(_dbPath, o, descriptors);
         if (!_db.TryGetColumnFamily(_cfName, out _)) throw new ToolException("Non-existing column family " + _cfName);
         return _db;
+    }
+
+    /// <summary>
+    /// LDBCommand::OverrideBaseCFOptions (the options of the port's tool): --bloom_bits / --block_size (a block-based
+    /// table factory with only these set), --auto_compaction, --compression_type, --compression_max_dict_bytes,
+    /// --write_buffer_size, --file_size. Like upstream every option is checked and the last failure is the one
+    /// reported. <paramref name="cf"/> null only validates.
+    /// </summary>
+    private void OverrideBaseCfOptions(ColumnFamilyOptions? cf)
+    {
+        string? failure = null;
+        int? Int(string name)
+        {
+            if (Opt(name) is null) return null;
+            try
+            {
+                return IntOpt(name, 0, dot: true);
+            }
+            catch (ToolException e)
+            {
+                failure = e.Message;
+                return null;
+            }
+        }
+
+        BlockBasedTableOptions? table = null;
+        if (Int("bloom_bits") is { } bits)
+        {
+            if (bits > 0) (table ??= new BlockBasedTableOptions()).FilterPolicy = new RocksDb.Managed.Table.Filters.BloomFilterPolicy(bits);
+            else failure = "bloom_bits must be > 0.";
+        }
+        if (Int("block_size") is { } blockSize)
+        {
+            if (blockSize > 0) (table ??= new BlockBasedTableOptions()).BlockSize = (ulong)blockSize;
+            else failure = "block_size must be > 0.";
+        }
+        if (table is not null && cf is not null)
+        {
+            cf.TableFactory = TableFactoryType.BlockBasedTable;
+            cf.TableOptions = table;
+        }
+        if (Opt("auto_compaction") is { } auto)
+        {
+            // LDBCommand::StringToBool
+            bool on = auto.ToLowerInvariant() switch
+            {
+                "true" => true,
+                "false" => false,
+                _ => throw new ToolException("Invalid value for boolean argument"),
+            };
+            if (cf is not null) cf.DisableAutoCompactions = !on;
+        }
+        if (Opt("compression_type") is { } comp)
+        {
+            // LDBCommand::ParseCompressionTypeOption
+            CompressionType? type = comp switch
+            {
+                "no" => CompressionType.None,
+                "snappy" => CompressionType.Snappy,
+                "zlib" => CompressionType.Zlib,
+                "bzip2" => CompressionType.BZip2,
+                "lz4" => CompressionType.LZ4,
+                "lz4hc" => CompressionType.LZ4HC,
+                "xpress" => CompressionType.Xpress,
+                "zstd" => CompressionType.Zstd,
+                _ => null,
+            };
+            if (type is null) failure = "Unknown compression algorithm: " + comp;
+            else if (!RocksDb.Managed.Compression.BlockCompression.IsSupported(type.Value)) failure = comp + " compression is not supported in this build.";
+            else if (cf is not null) cf.Compression = type.Value;
+        }
+        if (Int("compression_max_dict_bytes") is { } dict)
+        {
+            if (dict < 0) failure = "compression_max_dict_bytes must be >= 0.";
+            else if (cf is not null) cf.CompressionOpts.MaxDictBytes = (uint)dict;
+        }
+        if (Int("write_buffer_size") is { } wbs)
+        {
+            if (wbs <= 0) failure = "write_buffer_size must be > 0.";
+            else if (cf is not null) cf.WriteBufferSize = (ulong)wbs;
+        }
+        if (Int("file_size") is { } fileSize)
+        {
+            if (fileSize <= 0) failure = "file_size must be > 0.";
+            else if (cf is not null) cf.TargetFileSizeBase = (ulong)fileSize;
+        }
+        if (failure is not null) throw new ToolException(failure);
     }
 
     private ColumnFamily Cf(RocksDatabase db) => db.GetColumnFamily(_cfName);
@@ -462,7 +557,8 @@ internal sealed class LdbTool
         bool countOnly = Flag("count_only");
         bool countDelim = Opt("count_delim") is not null || Flag("count_delim");
         string delim = Opt("count_delim") ?? ".";
-        if (Opt("path") is { } path)
+        // LDBCommand::Run opens the DB of --db first and DBDumperCommand::DoCommand then dumps it (the path is ignored).
+        if (Opt("path") is { } path && _dbPath.Length == 0)
         {
             // DBDumperCommand on a single file: dispatch on its type.
             string name = Path.GetFileName(path);
@@ -838,13 +934,22 @@ internal sealed class LdbTool
             W("Live SST and Blob Files:\n");
             var all = new List<(string Name, int Level, string Cf)>();
             foreach (LiveFileMetadata f in files) all.Add((NormalizePath(f.Directory + "/" + f.Name), f.Level, f.ColumnFamilyName));
+            // Blob files are listed with level -1.
+            foreach (ColumnFamily cf in db.ColumnFamilies)
+            {
+                foreach (string blob in LiveBlobFiles(cf)) all.Add((blob, -1, cf.Name));
+            }
             all.Sort(static (a, b) =>
             {
                 int c = string.CompareOrdinal(a.Name, b.Name);
                 if (c == 0) c = a.Level.CompareTo(b.Level);
                 return c != 0 ? c : string.CompareOrdinal(a.Cf, b.Cf);
             });
-            foreach ((string name, int level, string cf) in all) W(name + " : level " + level.ToString(CultureInfo.InvariantCulture) + ", column family '" + cf + "'\n");
+            foreach ((string name, int level, string cf) in all)
+            {
+                if (level == -1) W(name + ", column family '" + cf + "'\n");
+                else W(name + " : level " + level.ToString(CultureInfo.InvariantCulture) + ", column family '" + cf + "'\n");
+            }
         }
         else
         {
@@ -861,9 +966,21 @@ internal sealed class LdbTool
                     }
                 }
                 W("Live Blob Files:\n");
+                foreach (string blob in LiveBlobFiles(cf)) W(blob + "\n");
             }
         }
         W("------------------------------\n");
+    }
+
+    /// <summary>ColumnFamilyMetaData::blob_files of the current version as blob_file_path + "/" + blob_file_name, normalized.</summary>
+    private List<string> LiveBlobFiles(ColumnFamily cf)
+    {
+        var names = new List<string>();
+        if (cf.Data.Current?.Storage is { } storage)
+        {
+            foreach (RocksDb.Managed.Db.Blob.BlobFileMetaData b in storage.BlobFiles) names.Add(NormalizePath(_dbPath + "//" + FileNames.BlobFileName(b.BlobFileNumber)));
+        }
+        return names;
     }
 
     private static string NormalizePath(string p)
