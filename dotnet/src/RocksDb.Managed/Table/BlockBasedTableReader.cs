@@ -365,18 +365,20 @@ public sealed partial class BlockBasedTableReader : TableReader
 
     /// <summary>
     /// Port of HashIndexReader::Create (table/block_based/hash_index_reader.cc): builds the <see cref="BlockPrefixIndex"/>
-    /// from the hash index meta blocks. Failure to create the prefix hash index is not a hard error; the index is then
-    /// searched with binary search (null).
+    /// from the hash index meta blocks. Missing meta blocks, an unreadable prefixes metadata block or a failure to create the
+    /// prefix hash index are not hard errors; the index is then searched with binary search (null).
     /// </summary>
     private static BlockPrefixIndex? TryCreatePrefixIndex(IRandomAccessFile file, in Footer footer, Dictionary<string, BlockHandle> metaBlocks, bool verify)
     {
         if (!metaBlocks.TryGetValue(BlockBasedTableConstants.HashIndexPrefixesBlockName, out BlockHandle prefixesHandle)
             || !metaBlocks.TryGetValue(BlockBasedTableConstants.HashIndexPrefixesMetadataBlockName, out BlockHandle metaHandle))
             return null;
-        byte[]? prefixes = null, meta = null;
+        // A prefixes block that cannot be read fails the open ("return s" after prefixes_block_fetcher.ReadBlockContents);
+        // only a bad prefixes metadata block or BlockPrefixIndex::Create failure falls back to binary search.
+        byte[]? prefixes = BlockFetcher.ReadRawPayload(file, footer, prefixesHandle, verify, out int prefixesLength);
+        byte[]? meta = null;
         try
         {
-            prefixes = BlockFetcher.ReadRawPayload(file, footer, prefixesHandle, verify, out int prefixesLength);
             meta = BlockFetcher.ReadRawPayload(file, footer, metaHandle, verify, out int metaLength);
             return BlockPrefixIndex.Create(prefixes.AsSpan(0, prefixesLength), meta.AsSpan(0, metaLength));
         }
