@@ -127,7 +127,8 @@ internal sealed partial class DbImpl
         {
             // Cache::CreateFromString with a plain capacity (kDontSerialize: not written to the OPTIONS file).
             ulong capacity = RocksDb.Managed.Options.OptionStrings.ParseUInt64("table_factory.block_cache", value.Trim());
-            options.BlockCache = Cache.BlockCache.CreateLru(checked((long)capacity));
+            // size_t upstream: a capacity above long.MaxValue is as unbounded as the largest managed capacity.
+            options.BlockCache = Cache.BlockCache.CreateLru(capacity > long.MaxValue ? long.MaxValue : unchecked((long)capacity));
             return;
         }
         if (options.GetOption(name) is null) ThrowHelper.InvalidArgument("Unrecognized option: table_factory." + name);

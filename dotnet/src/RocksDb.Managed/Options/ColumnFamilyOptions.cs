@@ -305,7 +305,20 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public double MaxBytesForLevelMultiplier { get; set; } = 10;
     public List<int> MaxBytesForLevelMultiplierAdditional { get; set; } = new() { 1, 1, 1, 1, 1, 1, 1 };
     public bool LevelCompactionDynamicLevelBytes { get; set; } = true;
-    public ulong MaxCompactionBytes { get; set; } = 64UL * 1048576 * 25;
+    /// <summary>
+    /// max_compaction_bytes. Upstream's default is 0, which SanitizeCfOptions (db/column_family.cc) turns into
+    /// target_file_size_base * 25 (and leaves at 0 for FIFO with use_kv_ratio_compaction, where 0 means "derive the
+    /// target from the capacity"). Until it is set, this property reads as that derived value, so it follows
+    /// <see cref="TargetFileSizeBase"/>.
+    /// </summary>
+    public ulong MaxCompactionBytes
+    {
+        get => _maxCompactionBytes
+               ?? (CompactionStyle == CompactionStyle.Fifo && CompactionOptionsFifo.UseKvRatioCompaction ? 0 : unchecked(TargetFileSizeBase * 25));
+        set => _maxCompactionBytes = value;
+    }
+
+    private ulong? _maxCompactionBytes;
     public ulong SoftPendingCompactionBytesLimit { get; set; } = 64UL * 1073741824;
     public ulong HardPendingCompactionBytesLimit { get; set; } = 256UL * 1073741824;
     public bool DisableAutoCompactions { get; set; }

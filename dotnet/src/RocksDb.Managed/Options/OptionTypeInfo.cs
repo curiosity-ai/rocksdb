@@ -461,7 +461,40 @@ internal static class OptionStrings
 
     public static double ParseDouble(string name, string v)
     {
-        if (double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out double d)) return d;
+        // ParseDouble (util/string_util.cc) is std::stod: leading whitespace, then the longest prefix that is a
+        // number ("inf" / "infinity" / "nan" included, any case); what follows is ignored. No number is
+        // std::invalid_argument, a value out of range std::out_of_range (both InvalidArgument here). Hexadecimal
+        // floats are not recognized.
+        int i = 0;
+        while (i < v.Length && v[i] is ' ' or '\t' or '\n' or '\v' or '\f' or '\r') i++;
+        int start = i;
+        bool negative = false;
+        if (i < v.Length && v[i] is '+' or '-') negative = v[i++] == '-';
+        ReadOnlySpan<char> rest = v.AsSpan(i);
+        if (rest.StartsWith("inf", StringComparison.OrdinalIgnoreCase)) return negative ? double.NegativeInfinity : double.PositiveInfinity;
+        if (rest.StartsWith("nan", StringComparison.OrdinalIgnoreCase)) return double.NaN;
+        int digits = 0;
+        while (i < v.Length && char.IsAsciiDigit(v[i])) { i++; digits++; }
+        if (i < v.Length && v[i] == '.')
+        {
+            i++;
+            while (i < v.Length && char.IsAsciiDigit(v[i])) { i++; digits++; }
+        }
+        if (digits > 0 && i < v.Length && v[i] is 'e' or 'E')
+        {
+            int e = i + 1;
+            if (e < v.Length && v[e] is '+' or '-') e++;
+            if (e < v.Length && char.IsAsciiDigit(v[e]))
+            {
+                while (e < v.Length && char.IsAsciiDigit(v[e])) e++;
+                i = e;
+            }
+        }
+        if (digits > 0 && double.TryParse(v.AsSpan(start, i - start), NumberStyles.Float, CultureInfo.InvariantCulture, out double d)
+            && !double.IsInfinity(d))
+        {
+            return d;
+        }
         throw RocksDbException.InvalidArgument("Error parsing " + name + ": invalid number '" + v + "'");
     }
 

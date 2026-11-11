@@ -64,9 +64,13 @@ internal sealed partial class DbImpl
         bool slowdown, stop;
         lock (_mutex)
         {
-            WriteStallCondition c = cfd.CompactionState.Stall.Condition;
-            slowdown = c == WriteStallCondition.Delayed;
-            stop = c == WriteStallCondition.Stopped;
+            // NotifyOnFlushBegin / NotifyOnFlushCompleted: the current version's L0 file count against the triggers
+            // (not the column family's write stall condition, which also has other causes and ignores L0 while auto
+            // compactions are disabled).
+            int l0 = cfd.Current.Storage.NumLevelFiles(0);
+            ColumnFamilyOptions o = cfd.Options;
+            slowdown = l0 >= o.Level0SlowdownWritesTrigger;
+            stop = l0 >= o.Level0StopWritesTrigger;
         }
         return new FlushJobInfo
         {

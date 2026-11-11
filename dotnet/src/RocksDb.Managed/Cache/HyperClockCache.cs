@@ -950,7 +950,12 @@ internal sealed class ClockShard
             // Take ownership if no refs.
             while (true)
             {
-                if (ClockSlot.Refcount(oldMeta) != 0) return; // not last ref
+                if (ClockSlot.Refcount(oldMeta) != 0)
+                {
+                    // Not last ref at some point during this Release call: correct for possible (but rare) overflow.
+                    CorrectNearOverflow(oldMeta, h);
+                    return;
+                }
                 if ((ClockSlot.State(oldMeta) & ClockSlot.StateShareableBit) == 0) return; // someone else took ownership
                 ulong seen = unchecked((ulong)Interlocked.CompareExchange(ref h.Meta,
                     unchecked((long)(ClockSlot.StateConstruction << ClockSlot.StateShift)), unchecked((long)oldMeta)));

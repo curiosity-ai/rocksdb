@@ -155,4 +155,106 @@ public sealed partial class Audit4FollowUpMiscTests
         }
         CollectionAssert.AreEqual(expected, forward);
     }
+
+    // ---- listeners (GAP-13) ------------------------------------------------------------------------------------
+
+    private sealed class FlushListener : EventListener
+    {
+        public readonly List<FlushJobInfo> Completed = new();
+
+        public override void OnFlushCompleted(RocksDatabase? db, FlushJobInfo info)
+        {
+            lock (Completed) Completed.Add(info);
+        }
+    }
+
+    [TestMethod]
+    public void FlushJobInfoStallFlagsCompareTheL0FileCountWithTheTriggers()
+    {
+        // DBImpl::NotifyOnFlushCompleted (db/db_impl/db_impl_compaction_flush.cc): triggered_writes_slowdown =
+        // NumLevelFiles(0) >= level0_slowdown_writes_trigger, triggered_writes_stop = NumLevelFiles(0) >=
+        // level0_stop_writes_trigger, whatever the write controller says. The port reported the column family's write
+        // stall condition, which ignores L0 while auto compactions are disabled (and is Stopped for other causes).
+        MemoryFileSystem fs = NewFs();
+        var listener = new FlushListener();
+        DbOptions o = NewOptions(fs);
+        o.Listeners.Add(listener);
+        var cfo = new ColumnFamilyOptions { DisableAutoCompactions = true, Level0FileNumCompactionTrigger = 2, Level0SlowdownWritesTrigger = 2, Level0StopWritesTrigger = 3 };
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, [new ColumnFamilyDescriptor("default", cfo)]);
+        for (int i = 0; i < 3; i++)
+        {
+            db.Put(Key(i), B("v"));
+            db.Flush();
+        }
+        lock (listener.Completed)
+        {
+            Assert.AreEqual(3, listener.Completed.Count);
+            Assert.IsFalse(listener.Completed[0].TriggeredWritesSlowdown);
+            Assert.IsFalse(listener.Completed[0].TriggeredWritesStop);
+            Assert.IsTrue(listener.Completed[1].TriggeredWritesSlowdown, "2 L0 files >= level0_slowdown_writes_trigger");
+            Assert.IsFalse(listener.Completed[1].TriggeredWritesStop);
+            Assert.IsTrue(listener.Completed[2].TriggeredWritesSlowdown);
+            Assert.IsTrue(listener.Completed[2].TriggeredWritesStop, "3 L0 files >= level0_stop_writes_trigger");
+        }
+    }
+
+    // ---- option defaults (GAP-13) ------------------------------------------------------------------------------
+
+    [TestMethod]
+    public void MaxCompactionBytesDefaultFollowsTargetFileSizeBase()
+    {
+        // advanced_options.h: max_compaction_bytes = 0; SanitizeCfOptions (db/column_family.cc): 0 becomes
+        // target_file_size_base * 25, except for FIFO with use_kv_ratio_compaction where 0 is kept ("derive the target
+        // from the capacity"). The port defaulted to the fixed 64 MiB * 25.
+        Assert.AreEqual(64UL * 1048576 * 25, new ColumnFamilyOptions().MaxCompactionBytes);
+        Assert.AreEqual(8UL * 1048576 * 25, new ColumnFamilyOptions { TargetFileSizeBase = 8UL << 20 }.MaxCompactionBytes);
+        Assert.AreEqual(123UL, new ColumnFamilyOptions { TargetFileSizeBase = 8UL << 20, MaxCompactionBytes = 123 }.MaxCompactionBytes);
+        var fifo = new ColumnFamilyOptions { CompactionStyle = CompactionStyle.Fifo };
+        fifo.CompactionOptionsFifo.UseKvRatioCompaction = true;
+        Assert.AreEqual(0UL, fifo.MaxCompactionBytes);
+
+        MemoryFileSystem fs = NewFs();
+        var cfo = new ColumnFamilyOptions { TargetFileSizeBase = 8UL << 20 };
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), [new ColumnFamilyDescriptor("default", cfo)]);
+        Assert.AreEqual(8UL * 1048576 * 25, db.DefaultColumnFamily.Options.MaxCompactionBytes);
+        // Like upstream, the value is fixed at open: a later target_file_size_base change does not move it.
+        db.DefaultColumnFamily.SetOptions([new KeyValuePair<string, string>("target_file_size_base", "1048576")]);
+        Assert.AreEqual(8UL * 1048576 * 25, db.DefaultColumnFamily.Options.MaxCompactionBytes);
+    }
+
+    // ---- option parsing (S58, S60) -----------------------------------------------------------------------------
+
+    [TestMethod]
+    public void ParseDoubleReadsTheLongestNumericPrefixLikeStod()
+    {
+        // ParseDouble (util/string_util.cc) is std::stod: leading whitespace is skipped, the longest numeric prefix is
+        // converted and the rest ignored; "inf" / "nan" are numbers; no digits (std::invalid_argument) and overflow
+        // (std::out_of_range) fail. The port rejected trailing characters and "inf" / "nan".
+        Assert.AreEqual(0.5, RocksDb.Managed.Options.OptionStrings.ParseDouble("x", "0.5abc"));
+        Assert.AreEqual(10.0, RocksDb.Managed.Options.OptionStrings.ParseDouble("x", " 10 "));
+        Assert.AreEqual(-2.5e3, RocksDb.Managed.Options.OptionStrings.ParseDouble("x", "-2.5e3x"));
+        Assert.AreEqual(1.0, RocksDb.Managed.Options.OptionStrings.ParseDouble("x", "1e"));
+        Assert.AreEqual(0.5, RocksDb.Managed.Options.OptionStrings.ParseDouble("x", ".5"));
+        Assert.AreEqual(double.PositiveInfinity, RocksDb.Managed.Options.OptionStrings.ParseDouble("x", "inf"));
+        Assert.AreEqual(double.NegativeInfinity, RocksDb.Managed.Options.OptionStrings.ParseDouble("x", "-Infinity"));
+        Assert.IsTrue(double.IsNaN(RocksDb.Managed.Options.OptionStrings.ParseDouble("x", "nan")));
+        foreach (string bad in new[] { "", "abc", ".", "-", "e5", "1e999" })
+        {
+            var ex = Assert.ThrowsExactly<RocksDbException>(() => RocksDb.Managed.Options.OptionStrings.ParseDouble("x", bad), bad);
+            Assert.AreEqual(StatusCode.InvalidArgument, ex.Code, bad);
+        }
+    }
+
+    [TestMethod]
+    public void SetOptionsBlockCacheCapacityAboveInt64MaxIsAccepted()
+    {
+        // Cache::CreateFromString with a plain capacity: a size_t, so 2^64-1 is a valid (unbounded) LRU cache. The
+        // port's checked cast to long threw OverflowException out of SetOptions.
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        db.DefaultColumnFamily.SetOptions([new KeyValuePair<string, string>("table_factory.block_cache", "18446744073709551615")]);
+        db.Put(B("a"), B("1"));
+        db.Flush();
+        CollectionAssert.AreEqual(B("1"), db.Get(B("a")));
+    }
 }

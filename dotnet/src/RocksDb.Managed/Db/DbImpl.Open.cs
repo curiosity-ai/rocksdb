@@ -604,6 +604,13 @@ internal sealed partial class DbImpl
                 result.MaxCompactionBytes = result.TargetFileSizeBase * 25;
             }
         }
+        else
+        {
+            // Pin a still-derived default (the property follows TargetFileSizeBase until it is set): upstream fixes
+            // the value here, a later target_file_size_base change does not move it.
+            ulong pinned = result.MaxCompactionBytes;
+            result.MaxCompactionBytes = pinned;
+        }
         // The ttl and periodic_compaction_seconds defaults apply to block-based tables only (is_block_based_table). The
         // managed ttl default is the block-based value (30 days), so that value means "default" for other formats,
         // where upstream sanitizes kDefaultTtl to 0.
