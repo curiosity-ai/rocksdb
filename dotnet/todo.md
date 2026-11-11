@@ -401,6 +401,8 @@ Still open from this round:
 - [x] Flush / compaction byte and CPU tickers match native; MANIFEST edits match native record by record; the primary verifies remote compaction outputs
 - [x] `RocksDb.Managed.Replication` reviewed on its own terms (Raft persistence, switchover promise, restore, resync); fixes in `Audit4ReplicationTests`
 - [x] Iterator cost of the audit's checks removed (docs/perf.md: forward +0.9%, reverse -5.4% against the pre-audit base)
-- [ ] Compression dictionary in the block cache (`BLOCK_CACHE_COMPRESSION_DICT_*` tickers stay 0)
+- [x] Compression dictionary in the block cache: hit / miss / add / bytes-insert tickers, pinning per `unpartitioned_pinning` / `pin_l0_filter_and_index_blocks_in_cache`, re-read after eviction (`Audit4CompressionDictCacheTests`, native differential in `Audit4CompressionDictCacheCompatTests`)
+- [ ] `BLOCK_CACHE_*_ADD_REDUNDANT` tickers (all block kinds, the dictionary included) are not recorded
+- [ ] `pin_l0_filter_and_index_blocks_in_cache` / `unpartitioned_pinning` for the index and full filter (only the dictionary follows them)
 - [ ] `AutoHyperClockTable` grow / chain logic read line by line against C++
 - [ ] Replication compared with the rocksdb-sharp original (that repository was not available to the audit)

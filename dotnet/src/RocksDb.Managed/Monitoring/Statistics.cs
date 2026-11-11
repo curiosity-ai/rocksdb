@@ -140,7 +140,8 @@ public sealed class Statistics
         {
             Ticker.BlockCacheMiss => b.Misses,
             Ticker.BlockCacheHit => b.Hits,
-            Ticker.BlockCacheAdd => b.Get(BlockCacheCounter.DataAdd) + b.Get(BlockCacheCounter.IndexAdd) + b.Get(BlockCacheCounter.FilterAdd),
+            Ticker.BlockCacheAdd => b.Get(BlockCacheCounter.DataAdd) + b.Get(BlockCacheCounter.IndexAdd) + b.Get(BlockCacheCounter.FilterAdd)
+                + b.Get(BlockCacheCounter.CompressionDictAdd),
             Ticker.BlockCacheAddFailures => b.Get(BlockCacheCounter.AddFailure),
             Ticker.BlockCacheIndexMiss => b.IndexMisses,
             Ticker.BlockCacheIndexHit => b.IndexHits,
@@ -148,6 +149,10 @@ public sealed class Statistics
             Ticker.BlockCacheFilterMiss => b.FilterMisses,
             Ticker.BlockCacheFilterHit => b.FilterHits,
             Ticker.BlockCacheFilterAdd => b.Get(BlockCacheCounter.FilterAdd),
+            Ticker.BlockCacheCompressionDictMiss => b.Get(BlockCacheCounter.CompressionDictMiss),
+            Ticker.BlockCacheCompressionDictHit => b.Get(BlockCacheCounter.CompressionDictHit),
+            Ticker.BlockCacheCompressionDictAdd => b.Get(BlockCacheCounter.CompressionDictAdd),
+            Ticker.BlockCacheCompressionDictBytesInsert => b.Get(BlockCacheCounter.CompressionDictBytesInsert),
             Ticker.BlockCacheDataMiss => b.DataMisses,
             Ticker.BlockCacheDataHit => b.DataHits,
             Ticker.BlockCacheDataAdd => b.Get(BlockCacheCounter.DataAdd),

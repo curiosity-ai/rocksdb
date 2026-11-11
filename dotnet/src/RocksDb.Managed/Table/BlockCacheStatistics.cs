@@ -45,6 +45,14 @@ public enum BlockCacheCounter
     IndexBytesInsert = 18,
     /// <summary>BLOCK_CACHE_FILTER_BYTES_INSERT.</summary>
     FilterBytesInsert = 19,
+    /// <summary>BLOCK_CACHE_COMPRESSION_DICT_HIT (the compression dictionary block, with cache_index_and_filter_blocks).</summary>
+    CompressionDictHit = 20,
+    /// <summary>BLOCK_CACHE_COMPRESSION_DICT_MISS.</summary>
+    CompressionDictMiss = 21,
+    /// <summary>BLOCK_CACHE_COMPRESSION_DICT_ADD.</summary>
+    CompressionDictAdd = 22,
+    /// <summary>BLOCK_CACHE_COMPRESSION_DICT_BYTES_INSERT.</summary>
+    CompressionDictBytesInsert = 23,
 }
 
 /// <summary>
@@ -100,10 +108,10 @@ public sealed class BlockCacheStatistics
     public long FilterMisses => Get(BlockCacheCounter.FilterMiss);
 
     /// <summary>Total hits over all block kinds (BLOCK_CACHE_HIT).</summary>
-    public long Hits => DataHits + IndexHits + FilterHits;
+    public long Hits => DataHits + IndexHits + FilterHits + Get(BlockCacheCounter.CompressionDictHit);
 
     /// <summary>Total misses over all block kinds (BLOCK_CACHE_MISS).</summary>
-    public long Misses => DataMisses + IndexMisses + FilterMisses;
+    public long Misses => DataMisses + IndexMisses + FilterMisses + Get(BlockCacheCounter.CompressionDictMiss);
 
     /// <summary>Resets all counters to zero (not atomic with respect to concurrent updates).</summary>
     public void Reset()

@@ -162,7 +162,11 @@ public sealed partial class BlockBasedTableReader
     /// <summary>Re-creates a block from its saved form (uncompressed contents, or a compressed payload kept by a tier).</summary>
     private Block CreateBlockFromSaved(ReadOnlySpan<byte> data, CompressionType type, BlockKind kind)
     {
-        if (type != CompressionType.None) return Protect(BlockFetcher.Decompress(type, data, _footer.FormatVersion, DictFor(kind)), kind);
+        if (type != CompressionType.None)
+        {
+            if (_dictLookupPerRead && kind == BlockKind.Data) return CreateDataBlockFromSavedWithDictionaryRead(data, type);
+            return Protect(BlockFetcher.Decompress(type, data, _footer.FormatVersion, DictFor(kind)), kind);
+        }
         byte[] buf = BlockBufferPool.Rent(Math.Max(data.Length, 1));
         data.CopyTo(buf);
         return Protect(Block.Create(buf, data.Length, rentedFromSharedPool: true), kind);
@@ -173,11 +177,11 @@ public sealed partial class BlockBasedTableReader
     /// PersistentCacheHelper): a serialized (compressed) cache stores the payload + trailer and is verified like a file
     /// read; an uncompressed cache stores the block contents.
     /// </summary>
-    private Block ReadBlockFromFile(BlockHandle handle, BlockKind kind, TableReadFlags flags)
+    private Block ReadBlockFromFile(BlockHandle handle, BlockKind kind, TableReadFlags flags, CompressionDictionary? dict)
     {
         PersistentCache? pc = _persistentCache;
-        if (pc is null) return BlockFetcher.ReadBlock(_file, _footer, handle, VerifyRead(flags), DictFor(kind));
-        return ReadBlockThroughPersistentCache(pc, handle, kind, flags);
+        if (pc is null) return BlockFetcher.ReadBlock(_file, _footer, handle, VerifyRead(flags), dict);
+        return ReadBlockThroughPersistentCache(pc, handle, kind, flags, dict);
     }
 
     /// <summary>
@@ -186,7 +190,7 @@ public sealed partial class BlockBasedTableReader
     /// </summary>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<Block> ReadBlockThroughPersistentCacheAsync(PersistentCache pc, BlockHandle handle, BlockKind kind, TableReadFlags flags,
-        CancellationToken ct)
+        CompressionDictionary? dict, CancellationToken ct)
     {
         // BlockFetcher: read_options.fill_cache gates the persistent cache inserts, read_options.verify_checksums the checks.
         bool fill = (flags & TableReadFlags.DontFillCache) == 0;
@@ -208,7 +212,7 @@ public sealed partial class BlockBasedTableReader
                         if (hit.Length == serializedSize)
                         {
                             stats?.RecordTick(Ticker.PersistentCacheHit);
-                            return BlockFetcher.ProcessSerializedCopy(hit.Data.AsSpan(0, hit.Length), _footer, handle, verify, DictFor(kind));
+                            return BlockFetcher.ProcessSerializedCopy(hit.Data.AsSpan(0, hit.Length), _footer, handle, verify, dict);
                         }
                     }
                     finally
@@ -228,7 +232,7 @@ public sealed partial class BlockBasedTableReader
                         read += r;
                     }
                     if (read != serializedSize) ThrowHelper.Corruption("truncated block read from file at offset " + handle.Offset);
-                    Block b = BlockFetcher.ProcessSerializedCopy(raw.AsSpan(0, serializedSize), _footer, handle, verify, DictFor(kind));
+                    Block b = BlockFetcher.ProcessSerializedCopy(raw.AsSpan(0, serializedSize), _footer, handle, verify, dict);
                     // Only verified blocks are cached (InsertSerialized after the checksum check).
                     if (fill) pc.Insert(k.Span, raw.AsSpan(0, serializedSize));
                     return b;
@@ -253,7 +257,7 @@ public sealed partial class BlockBasedTableReader
                 }
             }
             stats?.RecordTick(Ticker.PersistentCacheMiss);
-            Block block = await BlockFetcher.ReadBlockAsync(_file, _footer, handle, verify, DictFor(kind), ct).ConfigureAwait(false);
+            Block block = await BlockFetcher.ReadBlockAsync(_file, _footer, handle, verify, dict, ct).ConfigureAwait(false);
             if (fill) pc.Insert(k.Span, block.Data);
             return block;
         }
@@ -264,7 +268,7 @@ public sealed partial class BlockBasedTableReader
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private Block ReadBlockThroughPersistentCache(PersistentCache pc, BlockHandle handle, BlockKind kind, TableReadFlags flags)
+    private Block ReadBlockThroughPersistentCache(PersistentCache pc, BlockHandle handle, BlockKind kind, TableReadFlags flags, CompressionDictionary? dict)
     {
         // BlockFetcher: read_options.fill_cache gates the persistent cache inserts, read_options.verify_checksums the checks.
         bool fill = (flags & TableReadFlags.DontFillCache) == 0;
@@ -282,7 +286,7 @@ public sealed partial class BlockBasedTableReader
                     if (length == serializedSize)
                     {
                         stats?.RecordTick(Ticker.PersistentCacheHit);
-                        return BlockFetcher.ProcessSerializedCopy(data.AsSpan(0, length), _footer, handle, verify, DictFor(kind));
+                        return BlockFetcher.ProcessSerializedCopy(data.AsSpan(0, length), _footer, handle, verify, dict);
                     }
                 }
                 finally
@@ -296,7 +300,7 @@ public sealed partial class BlockBasedTableReader
             {
                 int read = BlockFetcher.ReadFully(_file, (long)handle.Offset, raw.AsSpan(0, serializedSize));
                 if (read != serializedSize) ThrowHelper.Corruption("truncated block read from file at offset " + handle.Offset);
-                Block b = BlockFetcher.ProcessSerializedCopy(raw.AsSpan(0, serializedSize), _footer, handle, verify, DictFor(kind));
+                Block b = BlockFetcher.ProcessSerializedCopy(raw.AsSpan(0, serializedSize), _footer, handle, verify, dict);
                 // Only verified blocks are cached (InsertSerialized after the checksum check).
                 if (fill) pc.Insert(key, raw.AsSpan(0, serializedSize));
                 return b;
@@ -321,7 +325,7 @@ public sealed partial class BlockBasedTableReader
             }
         }
         stats?.RecordTick(Ticker.PersistentCacheMiss);
-        Block block = BlockFetcher.ReadBlock(_file, _footer, handle, verify, DictFor(kind));
+        Block block = BlockFetcher.ReadBlock(_file, _footer, handle, verify, dict);
         if (fill) pc.Insert(key, block.Data);
         return block;
     }

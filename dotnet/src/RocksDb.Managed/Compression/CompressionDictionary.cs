@@ -70,6 +70,29 @@ public sealed unsafe class CompressionDictionary : IDisposable
         }
     }
 
+    /// <summary>
+    /// Port of DecompressorDict::ApproximateMemoryUsage (util/compression.cc, DecompressorDict::Populate): the object, the
+    /// dictionary bytes and the digested ZSTD dictionary once it exists. The charge of a dictionary in the block cache.
+    /// </summary>
+    internal long ApproximateMemoryUsage
+    {
+        get
+        {
+            long usage = ObjectOverhead + _dict.Length;
+            lock (_lock)
+            {
+                if (_ddict != null) usage += (long)Methods.ZSTD_sizeof_DDict(_ddict);
+            }
+            return usage;
+        }
+    }
+
+    // sizeof(DecompressorDict) stand-in: the object, its lock and the array header.
+    private const int ObjectOverhead = 96;
+
+    /// <summary>Creates the digested ZSTD decompression dictionary now rather than on first use.</summary>
+    internal void DigestForDecompression() => GetZstdDDict();
+
     private void Free()
     {
         lock (_lock)

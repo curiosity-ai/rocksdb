@@ -61,9 +61,11 @@ public sealed partial class BlockBasedTableReader
         BlockRef current = default;
         ulong currentOffset = ulong.MaxValue;
         MultiGetCacheLookups? lookups = null;
+        // A dictionary in the block cache that the reader does not pin: looked up once per batch (see BatchDictionary).
+        BatchDictionary? batchDict = null;
         try
         {
-            if (_cache is { ExtendedLookup: true } extended)
+            if (_cache is { ExtendedLookup: true } extended && !_dictLookupPerRead)
             {
                 // Kept out of this method so that the state machine of the common path does not grow.
                 lookups = MultiGetCacheLookups.Rent(candidates);
@@ -97,7 +99,15 @@ public sealed partial class BlockBasedTableReader
                         if (!current.IsEmpty) current.Release();
                         current = default;
                         currentOffset = ulong.MaxValue;
-                        if (lookups is not null && lookups.TryTake(handle.Offset, out BlockRef prefetched))
+                        // The first block of a key uses the batch's dictionary; a key that continues into the next block
+                        // retrieves it like any single read (NewDataBlockIterator), with its own dictionary lookup.
+                        if (_dictLookupPerRead && first)
+                        {
+                            batchDict ??= RentBatchDictionary();
+                            ValueTask<BlockRef> pending = GetDataBlockRefForBatch(batchDict, handle, flags, synchronous, cancellationToken);
+                            current = pending.IsCompletedSuccessfully ? pending.Result : await pending.ConfigureAwait(false);
+                        }
+                        else if (lookups is not null && lookups.TryTake(handle.Offset, out BlockRef prefetched))
                         {
                             ValueTask<BlockRef> pending = prefetched.IsEmpty
                                 ? ReadMissedDataBlock(handle, flags, synchronous, cancellationToken)
@@ -140,6 +150,7 @@ public sealed partial class BlockBasedTableReader
         finally
         {
             if (!current.IsEmpty) current.Release();
+            if (batchDict is not null) ReturnBatchDictionary(batchDict);
             lookups?.Return();
             IterPool.Return(data);
             idx.Return();

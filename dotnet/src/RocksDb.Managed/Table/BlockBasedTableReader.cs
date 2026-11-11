@@ -116,6 +116,24 @@ public sealed record TableReaderOptions
     /// <summary>num_file_reads_for_auto_readahead: sequential data block reads before automatic readahead starts. Default 2.</summary>
     public ulong NumFileReadsForAutoReadahead { get; init; } = 2;
 
+    /// <summary>
+    /// pin_l0_filter_and_index_blocks_in_cache: the fallback of <see cref="UnpartitionedPinning"/> (kFlushedAndSimilar
+    /// when set, kNone otherwise). Applied to the compression dictionary block (BlockBasedTable::PrefetchIndexAndFilterBlocks).
+    /// </summary>
+    public bool PinL0FilterAndIndexBlocksInCache { get; init; }
+    /// <summary>
+    /// metadata_cache_options.unpartitioned_pinning: which tables keep their unpartitioned metadata blocks pinned while
+    /// those live in the block cache (<see cref="CacheIndexAndFilterBlocks"/>). Applied to the compression dictionary
+    /// block: a pinned dictionary is looked up once at open and held for the reader's lifetime; an unpinned one is
+    /// looked up in the block cache for every data block retrieval and re-read after eviction.
+    /// </summary>
+    public PinningTier UnpartitionedPinning { get; init; } = PinningTier.Fallback;
+    /// <summary>
+    /// TableReaderOptions::max_file_size_for_l0_meta_pin (MaxFileSizeForL0MetaPin: 1.5 times write_buffer_size): the
+    /// largest level-0 file <see cref="PinningTier.FlushedAndSimilar"/> pins. Default 0, as upstream.
+    /// </summary>
+    public long MaxFileSizeForL0MetaPin { get; init; }
+
     /// <summary>The DB's block cache tracer (BlockBasedTable::block_cache_tracer_), or null.</summary>
     internal Tracing.BlockCacheTracer? BlockCacheTracer { get; init; }
 
@@ -272,7 +290,10 @@ public sealed partial class BlockBasedTableReader : TableReader
     private readonly PinnedFilterPartitions? _pinnedFilterPartitions;
     private readonly SliceTransform? _tablePrefixExtractor;
     private readonly bool _prefixExtractorChanged; // relative to TableReaderOptions.PrefixExtractor
-    private readonly Compression.CompressionDictionary? _compressionDict; // "rocksdb.compression_dict" (data blocks)
+    // "rocksdb.compression_dict" (data blocks): the dictionary the reader owns or pins; null when the table has none or
+    // when it lives in the block cache unpinned (see BlockBasedTableReader.CompressionDict.cs). Set before the reader
+    // is published and never changed afterwards.
+    private Compression.CompressionDictionary? _compressionDict;
     private readonly ulong _tableId;
     private readonly BlockCache? _cache;          // native block cache (null: none or legacy seam)
     private readonly IBlockCache? _legacyCache;   // legacy IBlockCache seam (null: none or native)
@@ -321,6 +342,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         Compression.CompressionDictionary? compressionDict, in OffsetableCacheKey baseCacheKey, long fileSize)
     {
         _compressionDict = compressionDict;
+        if (compressionDict is not null) _dictLease = DictLease.Owned(compressionDict);
         bool hasFilter = filterKind != FilterKind.None;
         _filterKind = filterKind;
         _filterIndexBlock = filterIndexBlock;
@@ -476,8 +498,23 @@ public sealed partial class BlockBasedTableReader : TableReader
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private Compression.CompressionDictionary? DictFor(BlockKind kind) => kind == BlockKind.Data ? _compressionDict : null;
 
-    /// <summary>The table's compression dictionary ("rocksdb.compression_dict"), empty when none.</summary>
-    public ReadOnlySpan<byte> CompressionDictionary => _compressionDict is null ? default : _compressionDict.Data;
+    /// <summary>
+    /// The table's compression dictionary ("rocksdb.compression_dict"), empty when none. A dictionary that lives in the
+    /// block cache unpinned is looked up there (and read on a miss), like the dictionary dump of BlockBasedTable::DumpTable.
+    /// </summary>
+    public ReadOnlySpan<byte> CompressionDictionary
+    {
+        get
+        {
+            if (_compressionDict is not null) return _compressionDict.Data;
+            if (!_dictLookupPerRead) return default;
+            DictLease lease = GetOrReadDictionary(TableReadFlags.None, _file);
+            // The bytes are a managed array that outlives the lease (only the digested dictionary is freed with it).
+            ReadOnlySpan<byte> data = lease.Dict!.Data;
+            lease.Release();
+            return data;
+        }
+    }
 
     // ---------------------------------------------------------------------------------------------
     // Open
@@ -617,6 +654,8 @@ public sealed partial class BlockBasedTableReader : TableReader
         Block? filterIndex = null;
         PinnedFilterPartitions? pinnedParts = null;
         Compression.CompressionDictionary? compressionDict = null;
+        bool hasDict = false;
+        BlockHandle dictHandle = default;
         BlockBasedTableReader reader;
         try
         {
@@ -633,14 +672,12 @@ public sealed partial class BlockBasedTableReader : TableReader
             if (metaBlocks.TryGetValue(BlockBasedTableConstants.RangeDelBlockName, out BlockHandle rdHandle))
                 rangeDel = Protect(BlockFetcher.ReadBlock(file, footer, rdHandle, verify), options);
 
-            // Port of the compression dictionary setup (ReadCompressionDictBlock / UncompressionDictReader): pinned by
-            // the reader for its lifetime and used to decompress data blocks.
-            if (metaBlocks.TryGetValue(BlockBasedTableConstants.CompressionDictBlockName, out BlockHandle dictHandle) && dictHandle.Size > 0)
-            {
-                byte[] raw = BlockFetcher.ReadRawPayload(file, footer, dictHandle, verify, out int dictLength);
-                try { compressionDict = new Compression.CompressionDictionary(raw.AsSpan(0, dictLength).ToArray()); }
-                finally { RocksArrayPool<byte>.Shared.Return(raw); }
-            }
+            // Port of the compression dictionary setup of BlockBasedTable::PrefetchIndexAndFilterBlocks
+            // (UncompressionDictReader::Create): without cache_index_and_filter_blocks (use_cache = false) the reader
+            // owns the dictionary; with it the dictionary goes through the block cache once the reader exists.
+            hasDict = metaBlocks.TryGetValue(BlockBasedTableConstants.CompressionDictBlockName, out dictHandle) && dictHandle.Size > 0;
+            if (hasDict && metaCache is null)
+                compressionDict = ReadDictionaryBlock(file, footer, dictHandle, verify, digest: false);
 
             // Port of the filter lookup in BlockBasedTable::PrefetchIndexAndFilterBlocks: the filter is keyed by the
             // configured policy's CompatibilityName (no policy -> filters ignored), as a full or a partitioned filter.
@@ -713,6 +750,7 @@ public sealed partial class BlockBasedTableReader : TableReader
             UserDefinedIndexReader? udi = OpenUserDefinedIndex(file, options, footer, metaBlocks, props, verify, out bool udiStub);
             reader = new BlockBasedTableReader(ownedFile ?? file, options, footer, metaBlocks, props, indexHandle, indexBlock, rangeDel, filter, filterBuf,
                 filterKind, fh, filterIndex, pinnedParts, compressionDict, baseCacheKey, fileSize);
+            if (hasDict) reader._dictHandle = dictHandle;
             reader._udiReader = udi;
             reader._udiStub = udiStub;
             reader._udiPrimary = options.IndexMode is BlockBasedIndexMode.CustomDefault or BlockBasedIndexMode.CustomOnly;
@@ -727,7 +765,8 @@ public sealed partial class BlockBasedTableReader : TableReader
             if (filterBuf is not null) TableBuilderBuffers.Return(filterSource, filterBuf);
             throw;
         }
-        if (prefetchIndexIntoCache || prefetchFilterIntoCache)
+        bool dictIntoCache = hasDict && metaCache is not null;
+        if (prefetchIndexIntoCache || prefetchFilterIntoCache || dictIntoCache)
         {
             try
             {
@@ -746,6 +785,9 @@ public sealed partial class BlockBasedTableReader : TableReader
                         // (and answer "may match" while it fails).
                     }
                 }
+                // UncompressionDictReader::Create with use_cache: looked up (read and inserted on a miss) at open and
+                // kept only when pinned. Unlike the filter, a dictionary that cannot be read fails the open.
+                if (dictIntoCache) reader.PrefetchDictionaryIntoCache(file, PinUnpartitioned(options, fileSize));
             }
             catch
             {
@@ -820,6 +862,9 @@ public sealed partial class BlockBasedTableReader : TableReader
             if (_filterIndexBlock is not null) usage += (ulong)_filterIndexBlock.Charge;
             if (_pinnedFilterPartitions is not null) usage += _pinnedFilterPartitions.MemoryUsage;
             if (_udiReader is not null) usage += _udiReader.ApproximateMemoryUsage;
+            // UncompressionDictReader::ApproximateMemoryUsage: only a dictionary the reader owns (GetOwnValue); one held
+            // by the block cache, pinned or not, is part of the cache's usage.
+            if (_compressionDict is not null && _dictLease.IsOwned) usage += (ulong)_compressionDict.ApproximateMemoryUsage;
             return usage;
         }
     }
@@ -1061,6 +1106,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     /// </summary>
     internal BlockRef GetBlockRef(BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
+        if (_dictLookupPerRead && kind == BlockKind.Data) return GetDataBlockRefWithCachedDictionary(handle, flags, null);
         BlockCache? cache = _cache;
         if (cache is not null)
         {
@@ -1084,6 +1130,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     internal BlockRef GetBlockRef(BlockHandle handle, BlockKind kind, TableReadFlags flags, AsyncPrefetchBuffer? prefetch)
     {
         if (prefetch is null) return GetBlockRef(handle, kind, flags);
+        if (_dictLookupPerRead && kind == BlockKind.Data) return GetDataBlockRefWithCachedDictionary(handle, flags, prefetch);
         BlockCache? cache = _cache;
         CacheKey key = default;
         if (cache is not null)
@@ -1187,7 +1234,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         ThrowIfNoIo(flags);
         ChargeRateLimiter(handle, flags);
         if (cache.AdmitsCompressedBlocks && OffersCompressed(kind, flags)) return ReadAndInsertOfferingCompressed(cache, key, handle, kind, flags);
-        Block b = Protect(ReadBlockFromFile(handle, kind, flags), kind);
+        Block b = Protect(ReadBlockFromFile(handle, kind, flags, DictFor(kind)), kind);
         if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, b, hit: false, flags);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
@@ -1199,7 +1246,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         {
             ThrowIfNoIo(flags);
             ChargeRateLimiter(handle, flags);
-            return BlockRef.FromOwned(Protect(ReadBlockFromFile(handle, kind, flags), kind));
+            return BlockRef.FromOwned(Protect(ReadBlockFromFile(handle, kind, flags, DictFor(kind)), kind));
         }
         var key = new BlockCacheKey(_tableId, handle.Offset);
         if (legacy.TryGet(key, out Block? b))
@@ -1210,7 +1257,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         _stats?.Record(MissCounter(kind));
         ThrowIfNoIo(flags);
         ChargeRateLimiter(handle, flags);
-        b = Protect(ReadBlockFromFile(handle, kind, flags), kind);
+        b = Protect(ReadBlockFromFile(handle, kind, flags, DictFor(kind)), kind);
         if ((flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(key, b);
         return BlockRef.FromOwned(b);
     }
@@ -1221,7 +1268,10 @@ public sealed partial class BlockBasedTableReader : TableReader
     /// cache (whose compressed copy is not kept).
     /// </summary>
     private bool OffersCompressed(BlockKind kind, TableReadFlags flags) =>
-        (flags & TableReadFlags.DontFillCache) == 0 && _persistentCache is null && _helpers[(int)kind].IsSecondaryCacheCompatible;
+        (flags & TableReadFlags.DontFillCache) == 0 && _persistentCache is null && _helpers[(int)kind].IsSecondaryCacheCompatible
+        // Deviation: data blocks of a table whose dictionary is in the block cache unpinned are not offered compressed (a
+        // tier re-creating one would need the dictionary, which may have been evicted by then).
+        && !(_dictLookupPerRead && kind == BlockKind.Data);
 
     /// <summary>
     /// MaybeReadBlockAndLoadToCache + PutDataBlockToCache with a cache using <see cref="TieredAdmissionPolicy.ThreeQueue"/>:
@@ -1322,6 +1372,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     /// <summary>Async <see cref="GetBlockRef"/>; completes synchronously on a cache hit.</summary>
     internal ValueTask<BlockRef> GetBlockRefAsync(BlockHandle handle, BlockKind kind, TableReadFlags flags, CancellationToken ct)
     {
+        if (_dictLookupPerRead && kind == BlockKind.Data) return GetDataBlockRefWithCachedDictionaryAsync(handle, flags, ct);
         BlockCache? cache = _cache;
         if (cache is not null)
         {
@@ -1356,7 +1407,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
         if (cache.AdmitsCompressedBlocks && OffersCompressed(kind, flags))
             return await ReadAndInsertOfferingCompressedAsync(cache, key, handle, kind, flags, ct).ConfigureAwait(false);
-        Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, flags, ct).ConfigureAwait(false)
+        Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, flags, DictFor(kind), ct).ConfigureAwait(false)
             : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, VerifyRead(flags), DictFor(kind), ct).ConfigureAwait(false), kind);
         if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, b, hit: false, flags);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
@@ -1367,7 +1418,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     {
         ThrowIfNoIo(flags);
         await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
-        Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, flags, ct).ConfigureAwait(false)
+        Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, flags, DictFor(kind), ct).ConfigureAwait(false)
             : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, VerifyRead(flags), DictFor(kind), ct).ConfigureAwait(false), kind);
         if (_legacyCache is { } legacy && (flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(new BlockCacheKey(_tableId, handle.Offset), b);
         return BlockRef.FromOwned(b);
@@ -2246,7 +2297,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         _rangeDelBlock?.Release();
         _filterIndexBlock?.Release();
         _pinnedFilterPartitions?.Dispose();
-        _compressionDict?.Dispose();
+        _dictLease.Release(); // the owned dictionary, or the block cache handle of a pinned one
         _udiReader?.Dispose();
 
 

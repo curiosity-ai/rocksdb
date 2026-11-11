@@ -1388,8 +1388,24 @@ logic (the port is a behavioural port without chains; only the lookup-during-gro
 `PerKeyPointLockManager` (not ported), the restore / verify / garbage-collection bodies of the backup engine on the
 C# side beyond what the earlier slices compared.
 
-Not ported, found by the ticker comparison: the compression dictionary is not stored in the block cache, so the
-five `BLOCK_CACHE_COMPRESSION_DICT_*` tickers stay 0.
+Found by the ticker comparison and ported afterwards: the compression dictionary block in the block cache
+(`uncompression_dict_reader.cc`, `Table/BlockBasedTableReader.CompressionDict.cs`). Without
+`cache_index_and_filter_blocks` the table reader owns the dictionary, as before, and it now counts in
+`ApproximateMemoryUsage`. With it the dictionary is a block cache entry (role `OtherBlock`, the priority of the other
+metadata blocks): looked up at open and read and inserted on a miss, kept pinned when
+`metadata_cache_options.unpartitioned_pinning` / `pin_l0_filter_and_index_blocks_in_cache` say so
+(`pin_unpartitioned`, level 0 and at most 1.5 times `write_buffer_size`), otherwise looked up for every data block
+retrieval and once per file in MultiGet, and re-read after eviction. `read_tier = kBlockCacheTier` fails with
+Incomplete when the dictionary is not cached, `fill_cache = false` reads it without inserting it, and a read error
+fails the open or the read. `BLOCK_CACHE_COMPRESSION_DICT_{MISS,HIT,ADD}` match native step by step on a workload
+with flushes, Get, MultiGet, scans and a compaction, in four pinning modes (`Audit4CompressionDictCacheCompatTests`;
+unit tests in `Audit4CompressionDictCacheTests`). Differences that remain: `..._DICT_BYTES_INSERT` is recorded but the
+charge of a dictionary is engine-specific (dictionary bytes plus the digested ZSTD dictionary, within a factor of two
+of native in the test); `..._DICT_ADD_REDUNDANT` stays 0 because the port records no `*_ADD_REDUNDANT` ticker for any
+block kind; data blocks of a table whose dictionary is cached unpinned are not offered compressed to secondary cache
+tiers; and the unpartitioned pinning rules are applied to the dictionary only, the index and full filter of a table
+with `cache_index_and_filter_blocks` are still never pinned (`pin_l0_filter_and_index_blocks_in_cache` and
+`unpartitioned_pinning` have no effect on them).
 
 `RocksDb.Managed.Replication` is a port of rocksdb-sharp, which is not in this repository, so it could not be
 compared with its original. It was reviewed on its own terms instead (Raft persistence and election rules, the
