@@ -472,8 +472,11 @@ public sealed class Audit4ClosingOpenItemsTests
         {
             db.Put(B("a"), B("1"));
             string ext = WriteSst(fs, "/ext/1.sst", 0, 10, "x");
-            fs.FailMatching("MANIFEST", FaultOps.Sync, 1, InjectedFaultKind.Retryable);
+            // Armed at the commit: the ingestion's first MANIFEST write is the edit that persists the reserved file
+            // numbers (DBImpl::ReserveFileNumbersBeforeIngestion).
+            TestHooks.Set("DBImpl::IngestExternalFiles:BeforeLogAndApply", () => fs.FailMatching("MANIFEST", FaultOps.Sync, 1, InjectedFaultKind.Retryable));
             RocksDbException ex = Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles([ext], new IngestExternalFileOptions()));
+            TestHooks.ClearAll();
             Assert.AreEqual(StatusCode.IOError, ex.Code);
             Assert.AreEqual(1, fs.TargetedFaults);
             // The failed ingestion is not visible in this process.
