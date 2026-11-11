@@ -99,7 +99,10 @@ replica promises the epoch, so a delayed promote can never succeed); an unreacha
 `Unresolved` with writes refused - two writable primaries are worse than none. Epochs are the Raft-term equivalent and
 an epoch map (`startSeq -> epoch`, a `RaftLogTerms`) lets a rejoining node prove its log is a prefix of the primary's;
 a diverged node (after `ForcePromoteAsync`) is rebuilt from a snapshot. `PairNodeHost` wires this with the WAL stream,
-client writes with primary hints, snapshot resync and fault injection. See rocksdb-sharp's
+client writes with primary hints, snapshot resync and fault injection; while a node is `HandingOff` outside a running
+handoff (target unreachable, or a restart in the middle of one) it asks the other node every
+`PairNodeHostOptions.ResolveInterval` how the handoff ended. Client writes of a pair are not fsync'd: a power loss of the
+primary can lose acknowledged writes (the replica that still holds them is rebuilt from the restarted primary). See rocksdb-sharp's
 `Replication/Switchover/README.md` for the full protocol discussion; it applies unchanged.
 
 ## Raft cluster
@@ -153,6 +156,10 @@ where noted below. Out of scope as before: pre-vote, membership changes, ReadInd
 | signature length prefix in machine byte order | little-endian | identical signatures across architectures |
 | per-batch `EntryTerm` on the Raft stream | chunks merge batches, so a follower also merges the leader's term map at attach | a chunk may span a term boundary |
 | MagicOnion in the samples only | same: `RocksDb.Managed.Replication.MagicOnion` is optional | the core stays transport-agnostic |
+| hosts report follower progress on a 200 ms timer | one report per applied chunk (coalesced); a report whose send failed is repeated every `RetryDelay` until one arrives | no idle traffic, and the last report of a burst still cannot be lost (the leader could not commit a quorum-held entry without it) |
+| `HandleRejectEpochAsync` looks for a running promotion, releases the node's lock, takes it again to promise the epoch | one critical section | a promote for that epoch landing in between was promoted although the reject answered "replica, epoch promised": two primaries |
+| a pair primary that restarts continues in its epoch; a bootstrap primary that restarts continues in its term | a new epoch / term starts at the end of the recovered log (`SwitchoverNode.StartNewEpochAfterRestart`, `RaftPersistentState.StartTerm`) | after a power loss the recovered log may end before entries a replica holds (pair writes, and Raft with `SyncWal = false`, are not fsync'd); new entries at those sequence numbers in the same epoch / term let the replica's stale tail pass the attach check - silent divergence |
+| a Raft state file that cannot be read starts the node "fresh" (term 0, no vote) | the read error is thrown | a node that forgot its vote can vote twice in one term |
 
 ## Switchover cost
 

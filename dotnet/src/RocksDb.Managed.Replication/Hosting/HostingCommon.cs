@@ -194,7 +194,10 @@ public delegate bool StreamTagProvider(out string sourceId, out long term);
 
 /// <summary>
 /// Coalescing progress reporter for a follower: <see cref="Report"/> is cheap and never blocks the ingest loop; one
-/// background loop sends only the newest value through the callback (a lost report is superseded by the next).
+/// background loop sends only the newest value through the callback. A report whose send failed is sent again after
+/// <see cref="RetryDelay"/> (with the newest value) until one arrives: the last report of a burst is the only statement
+/// of the follower's position until the next write, and in a Raft cluster the leader cannot commit a quorum-held entry
+/// without it (rocksdb-sharp's hosts report on a 200 ms timer for the same reason).
 /// Allocation-free per report (beyond what the callback's transport allocates).
 /// </summary>
 public sealed class ProgressReporter : IAsyncDisposable
@@ -208,10 +211,19 @@ public sealed class ProgressReporter : IAsyncDisposable
     private int _pending;
     private volatile bool _completed;
 
-    public ProgressReporter(Func<ulong, CancellationToken, Task> send)
+    /// <summary>How long the loop waits before it sends a failed report again.</summary>
+    public TimeSpan RetryDelay { get; }
+
+    public ProgressReporter(Func<ulong, CancellationToken, Task> send) : this(send, TimeSpan.FromMilliseconds(200))
+    {
+    }
+
+    public ProgressReporter(Func<ulong, CancellationToken, Task> send, TimeSpan retryDelay)
     {
         ArgumentNullException.ThrowIfNull(send);
+        ArgumentOutOfRangeException.ThrowIfLessThan(retryDelay, TimeSpan.Zero);
         _send = send;
+        RetryDelay = retryDelay;
         _loop = Task.Run(RunAsync);
     }
 
@@ -231,7 +243,10 @@ public sealed class ProgressReporter : IAsyncDisposable
                     }
                     catch (Exception e) when (e is not OperationCanceledException)
                     {
-                        // Best effort: the next report carries newer progress.
+                        // Not delivered: send the newest value again (nothing may follow this report for a long time).
+                        if (_completed) return;
+                        Interlocked.Exchange(ref _pending, 1);
+                        await Task.Delay(RetryDelay, ct).ConfigureAwait(false);
                     }
                     continue;
                 }

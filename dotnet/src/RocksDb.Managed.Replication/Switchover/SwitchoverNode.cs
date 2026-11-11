@@ -332,6 +332,28 @@ public sealed class SwitchoverNode
     }
 
     /// <summary>
+    /// For a node that restarted as primary: starts a new epoch at the end of the log it recovered, and returns it.
+    /// Client writes are not necessarily fsync'd, so after a power loss the recovered log may end before entries the
+    /// replica already holds. Continuing in the old epoch would write different entries at those sequence numbers in
+    /// the same epoch, and the attach check (<see cref="CheckReplicaLog"/>: same sequence number, same epoch) could no
+    /// longer tell the replica's stale tail from this log - the replica would keep it and stream on, diverged. With a
+    /// new epoch a replica that holds nothing past the recovered log attaches as before (its last entry is in an epoch
+    /// both know), and one that holds more is rebuilt. Call it before the node serves writes or streams; no
+    /// <see cref="RoleChanged"/> is raised (the role does not change).
+    /// </summary>
+    public long StartNewEpochAfterRestart()
+    {
+        lock (_gate)
+        {
+            if (_state.Role != ReplicationRole.Primary || _db == null)
+                throw new InvalidOperationException(_nodeId + " is " + _state.Role + ", not a primary with a database");
+            long epoch = _state.PromisedEpoch + 1;
+            _state.BecomePrimary(_db.GetLatestSequenceNumber() + 1, epoch, _nodeId);
+            return epoch;
+        }
+    }
+
+    /// <summary>
     /// Primary-side half of the replica attach check: the replica sends its latest sequence number and the epoch it has
     /// for it; its log is a prefix of ours exactly when we hold that entry in the same epoch. A replica that is ahead of
     /// us, or whose tail carries another epoch (an old primary's unreplicated writes after an unplanned promotion), must
@@ -452,31 +474,32 @@ public sealed class SwitchoverNode
     /// </summary>
     public async Task<ReplicationNodeStatus> HandleRejectEpochAsync(long epoch)
     {
-        Task<PromoteResult>? running;
-        lock (_gate)
+        while (true)
         {
-            running = _promotion;
-            if (running != null)
+            Task<PromoteResult> running;
+            lock (_gate)
             {
+                if (_promotion == null)
+                {
+                    // The promise is made in the critical section that saw no promotion. Released in between (as
+                    // rocksdb-sharp does), a promote for this epoch that was still on the wire could start here, and
+                    // this call would then report "replica, epoch promised" - the old primary resumes on that - while
+                    // the promotion completes: two primaries.
+                    if (_state.Role == ReplicationRole.Replica) _state.Promise(epoch);
+                    return GetStatus();
+                }
+                running = _promotion;
                 _rejected = true;
                 _promotionCts?.Cancel();
             }
-        }
-        if (running != null)
-        {
             try
             {
                 await running.ConfigureAwait(false);
             }
             catch (Exception)
             {
-                // The outcome is read from the state below.
+                // The outcome is read from the state in the next round.
             }
-        }
-        lock (_gate)
-        {
-            if (_state.Role == ReplicationRole.Replica) _state.Promise(epoch);
-            return GetStatus();
         }
     }
 

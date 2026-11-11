@@ -613,7 +613,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                 // The report names the leadership (term) it belongs to; the leader ignores it in any other term.
                 long followTerm = check.Term;
                 await using var progress = new ProgressReporter((seq, c) =>
-                    _node.CurrentTerm <= followTerm ? client.ReportProgressAsync(_cfg.NodeId, seq, followTerm, c) : Task.CompletedTask);
+                    _node.CurrentTerm <= followTerm ? client.ReportProgressAsync(_cfg.NodeId, seq, followTerm, c) : Task.CompletedTask, _cfg.RetryDelay);
                 progress.Report(myLatest);
                 await foreach (WalStreamMessage m in client.StreamUpdatesAsync(_cfg.NodeId, myLatest + 1, ct).ConfigureAwait(false))
                 {

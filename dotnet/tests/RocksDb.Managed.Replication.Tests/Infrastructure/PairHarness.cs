@@ -31,6 +31,8 @@ public sealed class PairHarness : IAsyncDisposable
 
     /// <summary><see cref="PairNodeHostOptions.DisposeDrainTimeout"/> of the hosts started from now on.</summary>
     public TimeSpan DisposeDrainTimeout { get; set; } = TimeSpan.FromSeconds(10);
+    /// <summary><see cref="PairNodeHostOptions.ResolveInterval"/> of the hosts started from now on.</summary>
+    public TimeSpan ResolveInterval { get; set; } = TimeSpan.FromSeconds(1);
     public string DbPath(string id) => _dir.Sub(id);
     /// <summary>Called (on the logging thread, synchronously) with the node id and every line a host logs.</summary>
     public Action<string, string>? OnLog { get; set; }
@@ -51,6 +53,7 @@ public sealed class PairHarness : IAsyncDisposable
             MaxChunkBytes = 16 * 1024,
             RetryDelay = TimeSpan.FromMilliseconds(50),
             DisposeDrainTimeout = DisposeDrainTimeout,
+            ResolveInterval = ResolveInterval,
             Log = line =>
             {
                 _log.Enqueue(line);

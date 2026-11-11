@@ -156,6 +156,8 @@ public sealed class SwitchoverTests
     {
         await using var h = new PairHarness();
         h.Switchover = new SwitchoverOptions { CatchUpTimeout = TimeSpan.FromMilliseconds(200), RpcGrace = TimeSpan.FromMilliseconds(100) };
+        // This test settles the handoff itself (the host's own resolve loop would race it).
+        h.ResolveInterval = System.Threading.Timeout.InfiniteTimeSpan;
         await h.StartAsync("A");
         await h.StartAsync("B");
         await WaitFollowingAsync(h, "B");

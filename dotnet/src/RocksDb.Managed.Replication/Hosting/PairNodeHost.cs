@@ -32,6 +32,13 @@ public sealed class PairNodeHostOptions
     public int SnapshotChunkBytes { get; init; } = 1024 * 1024;
     public TimeSpan RetryDelay { get; init; } = TimeSpan.FromMilliseconds(200);
     /// <summary>
+    /// How often a node that is <see cref="ReplicationRole.HandingOff"/> outside a running handoff (the other node was
+    /// unreachable when the handoff had to be settled, or this node restarted in the middle of one) asks the other node
+    /// how the handoff ended. Until one of these attempts succeeds the pair has no writable primary.
+    /// <see cref="Timeout.InfiniteTimeSpan"/> leaves it to the caller (<see cref="PairNodeHost.ResolveAsync"/>).
+    /// </summary>
+    public TimeSpan ResolveInterval { get; init; } = TimeSpan.FromSeconds(1);
+    /// <summary>
     /// How long <see cref="PairNodeHost.DisposeAsync"/> waits for RPC handlers that still use the database (a stream
     /// whose consumer stopped reading holds it until its transport gives up) before it closes the database anyway.
     /// </summary>
@@ -91,6 +98,7 @@ public sealed class PairNodeHost : IAsyncDisposable
     private readonly FollowerResyncPolicy _resyncPolicy = new();
     // Cancelled whenever this node becomes a replica: ends the WAL streams it serves as primary.
     private CancellationTokenSource _primaryCts = new();
+    private Task _resolveTask = Task.CompletedTask;
 
     public PairNodeHost(PairNodeHostOptions options, IPairNodeClient peer)
     {
@@ -134,6 +142,7 @@ public sealed class PairNodeHost : IAsyncDisposable
         }
         _db = await OpenDatabaseAsync(cancellationToken).ConfigureAwait(false);
         if (_cfg.InitialRole == ReplicationRole.Primary) SwitchoverNode.BootstrapPrimary(_state, _db, _cfg.NodeId);
+        bool restarted = !_state.IsFresh;
         _node = new SwitchoverNode(_cfg.NodeId, _state, _db, DetachFromPrimaryAsync);
 
         // A node restarting as primary may have been replaced while it was down (ForcePromoteAsync on the other node):
@@ -143,6 +152,11 @@ public sealed class PairNodeHost : IAsyncDisposable
         {
             SwitchoverResult? resolved = await _node.ResolveAsync(_peer, _cfg.Switchover, cancellationToken).ConfigureAwait(false);
             if (resolved != null) Log("resolve at startup: " + resolved.Outcome + " (epoch " + resolved.Epoch + ") " + resolved.Reason);
+            // Still primary after a restart: the recovered log may end before entries the replica holds (writes are
+            // not fsync'd), so what this node writes from here on belongs to a new epoch. A handoff aborted just now
+            // already started one.
+            if (restarted && _node.Role == ReplicationRole.Primary && resolved?.Outcome != SwitchoverOutcome.Aborted)
+                _node.StartNewEpochAfterRestart();
         }
         _node.RoleChanged += (_, e) =>
         {
@@ -159,6 +173,45 @@ public sealed class PairNodeHost : IAsyncDisposable
         if (_node.Role == ReplicationRole.Replica) _primaryCts.Cancel();
         Log("started as " + _node.Role + " in epoch " + _node.Epoch + " at seq " + _db.GetLatestSequenceNumber());
         if (_node.Role == ReplicationRole.Replica) EnsureFollowerStream();
+        _resolveTask = Task.Run(ResolveLoopAsync);
+    }
+
+    /// <summary>
+    /// Settles a handoff this node could not finish - the other node was unreachable, or this node restarted while
+    /// handing off (rocksdb-sharp PairNodeHost.ResolveLoopAsync). <see cref="SwitchoverNode.ResolveAsync"/> does nothing
+    /// while a handoff is running.
+    /// </summary>
+    private async Task ResolveLoopAsync()
+    {
+        CancellationToken ct = _cts.Token;
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                if (_node.Role == ReplicationRole.HandingOff)
+                {
+                    SwitchoverResult? r = await _node.ResolveAsync(_peer, _cfg.Switchover, ct).ConfigureAwait(false);
+                    if (r != null) Log("resolve: " + r.Outcome + " (epoch " + r.Epoch + ") " + r.Reason);
+                }
+                await Task.Delay(_cfg.ResolveInterval, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                Log("resolve failed: " + ex.Message);
+                try
+                {
+                    await Task.Delay(_cfg.ResolveInterval, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
+        }
     }
 
     private async ValueTask<RocksDatabase> OpenDatabaseAsync(CancellationToken cancellationToken)
@@ -582,6 +635,13 @@ public sealed class PairNodeHost : IAsyncDisposable
         try
         {
             await _resyncTask.ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+        }
+        try
+        {
+            await _resolveTask.ConfigureAwait(false);
         }
         catch (Exception)
         {

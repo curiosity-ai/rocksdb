@@ -106,15 +106,16 @@ public sealed class ReplicationSource
 
     /// <summary>
     /// Records that <paramref name="replicaId"/> has applied every entry up to <paramref name="appliedThrough"/>. The
-    /// slowest replica decides what may be retired - a minimum across replicas, not across time, and a replica never
-    /// moves backwards.
+    /// slowest replica decides what may be retired - a minimum across replicas, not across time. The latest report of a
+    /// replica is its position, also when it is lower than an earlier one: a replica that lost the unsynced tail of its
+    /// log in a crash, or was restored from an older copy, reads on from there and still needs that WAL.
     /// </summary>
     public void ReportReplicaProgress(string replicaId, ulong appliedThrough)
     {
         ArgumentException.ThrowIfNullOrEmpty(replicaId);
         lock (_gate)
         {
-            if (!_replicaProgress.TryGetValue(replicaId, out ulong prev) || appliedThrough > prev) _replicaProgress[replicaId] = appliedThrough;
+            _replicaProgress[replicaId] = appliedThrough;
         }
     }
 

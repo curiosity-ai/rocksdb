@@ -103,6 +103,18 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
                 state.UpdateTermAndVote(1, config.NodeId);
                 state.RecordTermRange(db.GetLatestSequenceNumber() + 1, 1);
             }
+            else
+            {
+                // A restart. Leading again without an election must not continue the term of the previous run: if
+                // the recovered log ends before entries a follower already holds (log writes not fsync'd, see
+                // RaftConfig.SyncLogWrites, and a power loss), this node would write different entries at those
+                // sequence numbers in the same term, and (sequence, term) would no longer identify an entry - the
+                // follower's stale tail passes the attach check and the heartbeat check. A new term starting at the
+                // end of the recovered log keeps Raft's log matching property, as an election would.
+                long term = state.CurrentTerm + 1;
+                state.UpdateTermAndVote(term, config.NodeId);
+                state.StartTerm(db.GetLatestSequenceNumber() + 1, term);
+            }
         }
         else
         {
@@ -490,7 +502,7 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         ulong nextSeq = _db.GetLatestSequenceNumber() + 1;
         try
         {
-            _state.RecordTermRange(nextSeq, _state.CurrentTerm);
+            _state.StartTerm(nextSeq, _state.CurrentTerm);
             // Replicate one entry from the new term right away so the commit index can advance past entries inherited
             // from previous terms (§5.4.2).
             // Synced like every log entry: the leader counts its own latest sequence towards the quorum.
