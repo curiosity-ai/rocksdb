@@ -241,4 +241,105 @@ public sealed class Audit4FollowUpTablesTests
             }
         }
     }
+
+    private static RangeDelAggregator OneFileAggregator(ulong tombstoneSeq, byte[] smallest, byte[] largest)
+    {
+        var icmp = new InternalKeyComparator(Comparator.Bytewise);
+        FragmentedRangeTombstoneList list = FragmentedRangeTombstoneList.Build(Comparator.Bytewise,
+            [new FragmentedRangeTombstoneList.Tombstone(B("b"), B("x"), tombstoneSeq)]);
+        var agg = new RangeDelAggregator(icmp, DbFormat.MaxSequenceNumber);
+        agg.AddTombstones(list, smallest, largest);
+        return agg;
+    }
+
+    /// <summary>
+    /// TruncatedRangeDelIterator's constructor (db/range_del_aggregator.cc:23-80) and ForwardRangeDelIterator::ShouldDelete
+    /// (:186-212): an entry is covered iff start_key() &lt;= entry &lt; end_key() in internal key order, with
+    /// smallest' = (smallest, kTypeMaxValid) and largest' = (largest.seq - 1, kTypeMaxValid), a seqno-0 largest left
+    /// unchanged and a range-deletion sentinel left unchanged. The versions of the boundary user keys that belong to the
+    /// neighbouring files are not covered, whatever the entry's type.
+    /// </summary>
+    [TestMethod]
+    public void TruncatedTombstoneCoversOnlyTheBoundaryVersionsOfItsFile()
+    {
+        byte[] d = B("d"), m = B("m");
+        // Tombstone [b, x)@30; file [d@20 .. m@7].
+        RangeDelAggregator agg = OneFileAggregator(30, TableTestUtil.IKey(d, 20, EntryType.Value), TableTestUtil.IKey(m, 7, EntryType.Value));
+        foreach (EntryType type in new[] { EntryType.Deletion, EntryType.Value, EntryType.Merge, EntryType.SingleDeletion })
+        {
+            string ctx = type.ToString();
+            Assert.IsFalse(agg.ShouldDelete(TableTestUtil.IKey(d, 25, type)), ctx);  // before smallest': the previous file's
+            Assert.IsFalse(agg.ShouldDelete(TableTestUtil.IKey(d, 21, type)), ctx);
+            Assert.IsTrue(agg.ShouldDelete(TableTestUtil.IKey(d, 20, type)), ctx);   // smallest itself (kTypeMaxValid sorts first)
+            Assert.IsTrue(agg.ShouldDelete(TableTestUtil.IKey(d, 3, type)), ctx);
+            Assert.IsFalse(agg.ShouldDelete(TableTestUtil.IKey(B("c~"), 1, type)), ctx); // user key before the file
+            Assert.IsTrue(agg.ShouldDelete(TableTestUtil.IKey(B("g"), 29, type)), ctx);
+            Assert.IsFalse(agg.ShouldDelete(TableTestUtil.IKey(B("g"), 30, type)), ctx); // not newer than the entry
+            Assert.IsTrue(agg.ShouldDelete(TableTestUtil.IKey(m, 8, type)), ctx);
+            Assert.IsTrue(agg.ShouldDelete(TableTestUtil.IKey(m, 7, type)), ctx);    // largest itself: seq - 1 keeps it covered
+            Assert.IsFalse(agg.ShouldDelete(TableTestUtil.IKey(m, 6, type)), ctx);   // largest' = (m, 6, kTypeMaxValid) is exclusive
+            Assert.IsFalse(agg.ShouldDelete(TableTestUtil.IKey(m, 1, type)), ctx);
+            Assert.IsFalse(agg.ShouldDelete(TableTestUtil.IKey(B("n"), 1, type)), ctx);
+        }
+        // The point lookup (user-key granularity) sees the tombstone for both boundary user keys.
+        Assert.AreEqual(30UL, agg.MaxCoveringTombstoneSeqnum(d));
+        Assert.AreEqual(30UL, agg.MaxCoveringTombstoneSeqnum(m));
+        Assert.AreEqual(0UL, agg.MaxCoveringTombstoneSeqnum(B("c")));
+        Assert.AreEqual(0UL, agg.MaxCoveringTombstoneSeqnum(B("n")));
+
+        // Largest with seqno 0: left unchanged, so it is exclusive (the entry equal to it is not covered).
+        agg = OneFileAggregator(30, TableTestUtil.IKey(d, 20, EntryType.Value), TableTestUtil.IKey(m, 0, EntryType.Value));
+        Assert.IsTrue(agg.ShouldDelete(TableTestUtil.IKey(m, 1, EntryType.Value)));
+        Assert.IsFalse(agg.ShouldDelete(TableTestUtil.IKey(m, 0, EntryType.Value)));
+        // The same with a deletion as the largest key (type 0 sorts last): parsed < largest_ is false for the key itself.
+        agg = OneFileAggregator(30, TableTestUtil.IKey(d, 20, EntryType.Value), TableTestUtil.IKey(m, 0, EntryType.Deletion));
+        Assert.IsTrue(agg.ShouldDelete(TableTestUtil.IKey(m, 1, EntryType.Deletion)));
+        Assert.IsFalse(agg.ShouldDelete(TableTestUtil.IKey(m, 0, EntryType.Deletion)));
+
+        // Range-deletion sentinel (m, kMaxSequenceNumber, kTypeRangeDeletion): no version of m is covered.
+        agg = OneFileAggregator(30, TableTestUtil.IKey(d, 20, EntryType.Value), TableTestUtil.IKey(m, DbFormat.MaxSequenceNumber, EntryType.RangeDeletion));
+        Assert.IsTrue(agg.ShouldDelete(TableTestUtil.IKey(B("l~"), 1, EntryType.Value)));
+        Assert.IsFalse(agg.ShouldDelete(TableTestUtil.IKey(m, 29, EntryType.Value)));
+        Assert.IsFalse(agg.ShouldDelete(TableTestUtil.IKey(m, 0, EntryType.Value)));
+        Assert.AreEqual(0UL, agg.MaxCoveringTombstoneSeqnum(m));
+    }
+
+    /// <summary>
+    /// RangeDelAggregator::StripeRep::IsRangeOverlapped (db/range_del_aggregator.cc:298-336) over a truncated tombstone:
+    /// overlap iff (start, kMaxSequenceNumber, 0) &lt; end_key() and start_key() &lt;= (end, exclusive ? kMaxSequenceNumber
+    /// : 0, 0). The truncated end (largest.seq - 1, kTypeMaxValid) therefore includes the largest user key, a sentinel
+    /// largest and an untruncated end do not; the truncated start includes the smallest user key only for an inclusive
+    /// range end.
+    /// </summary>
+    [TestMethod]
+    public void IsRangeOverlappedHonoursTruncatedBoundaries()
+    {
+        byte[] sm = TableTestUtil.IKey(B("d"), 20, EntryType.Value);
+        RangeDelAggregator agg = OneFileAggregator(10, sm, TableTestUtil.IKey(B("m"), 7, EntryType.Value));
+        Assert.IsTrue(agg.IsRangeOverlapped(B("m"), B("z"), false));   // starts at the largest user key: covered
+        Assert.IsTrue(agg.IsRangeOverlapped(B("m"), B("z"), true));
+        Assert.IsFalse(agg.IsRangeOverlapped(B("n"), B("z"), false));  // the tombstone's [n, x) part is outside the file
+        Assert.IsFalse(agg.IsRangeOverlapped(B("a"), B("c"), false));  // and so is [b, d)
+        Assert.IsTrue(agg.IsRangeOverlapped(B("a"), B("d"), false));
+        Assert.IsFalse(agg.IsRangeOverlapped(B("a"), B("d"), true));
+        Assert.IsTrue(agg.IsRangeOverlapped(B("e"), B("f"), true));
+        Assert.IsTrue(agg.IsRangeOverlapped(B("a"), B("z"), true));
+
+        agg = OneFileAggregator(10, sm, TableTestUtil.IKey(B("m"), DbFormat.MaxSequenceNumber, EntryType.RangeDeletion));
+        Assert.IsFalse(agg.IsRangeOverlapped(B("m"), B("z"), false));  // sentinel: the end is exclusive
+        Assert.IsTrue(agg.IsRangeOverlapped(B("l"), B("z"), false));
+
+        // Untruncated (memtable): [b, x), end exclusive, start inclusive.
+        var icmp = new InternalKeyComparator(Comparator.Bytewise);
+        var mem = new RangeDelAggregator(icmp, DbFormat.MaxSequenceNumber);
+        mem.AddTombstones(FragmentedRangeTombstoneList.Build(Comparator.Bytewise, [new FragmentedRangeTombstoneList.Tombstone(B("b"), B("x"), 10)]));
+        Assert.IsFalse(mem.IsRangeOverlapped(B("x"), B("z"), false));
+        Assert.IsTrue(mem.IsRangeOverlapped(B("w"), B("z"), false));
+        Assert.IsTrue(mem.IsRangeOverlapped(B("a"), B("b"), false));
+        Assert.IsFalse(mem.IsRangeOverlapped(B("a"), B("b"), true));
+        // A tombstone newer than the read sequence is invisible.
+        var old = new RangeDelAggregator(icmp, 9);
+        old.AddTombstones(FragmentedRangeTombstoneList.Build(Comparator.Bytewise, [new FragmentedRangeTombstoneList.Tombstone(B("b"), B("x"), 10)]));
+        Assert.IsFalse(old.IsRangeOverlapped(B("c"), B("d"), false));
+    }
 }
