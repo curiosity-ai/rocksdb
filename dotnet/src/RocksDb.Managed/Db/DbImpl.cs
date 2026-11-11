@@ -993,9 +993,16 @@ internal sealed partial class DbImpl : IAsyncDisposable
                     releasedDropped = true;
                 }
             }
-            if (releasedDropped)
+            // CloseHelper: FindObsoleteFiles(force = true) + PurgeObsoleteFiles on every close of a writable DB ("clean up
+            // obsolete files due to SuperVersion release", and so that RepairDB does not find unreferenced files).
+            _ = releasedDropped;
+            if (!_readOnly)
             {
-                try { PurgeObsoleteFiles(); }
+                try
+                {
+                    PurgeObsoleteFiles();
+                    DeleteObsoleteFilesFullScan(atOpen: false, dbDirChildren: null);
+                }
                 catch (Exception e) when (e is IOException or RocksDbException) { }
             }
             // VersionSet::Close: verify_manifest_content_on_close. A failure is reported once the close has finished

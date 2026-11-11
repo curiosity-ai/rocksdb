@@ -29,7 +29,8 @@ public sealed class BlockCacheTier : PersistentCacheTier
 
     private readonly PersistentCacheConfig _opt;
     private readonly ReaderWriterLockSlim _lock = new(LockRecursionPolicy.SupportsRecursion);
-    private readonly Dictionary<CacheKey, Lba> _blockIndex = new();
+    // Keys are arbitrary byte strings, as upstream (BlockInfo::key_ is a std::string); the DB passes 16-byte cache keys.
+    private readonly Dictionary<byte[], Lba> _blockIndex = new(Utilities.Transactions.ByteKeyComparer.Instance);
     private readonly Dictionary<uint, CacheFile> _files = new();
     private readonly LinkedList<CacheFile> _fileLru = new(); // first = most recently used
     private readonly WriteBufferAllocator _bufferAllocator;
@@ -129,9 +130,11 @@ public sealed class BlockCacheTier : PersistentCacheTier
         if (_insertOps is { } q)
         {
             // Off load the write to the write thread; drop it when the backlog is too large.
-            if (Interlocked.Add(ref _pendingBytes, data.Length) > _opt.MaxWritePipelineBacklogSize)
+            // BoundedQueue::Push: an op (InsertOp::Size = key + data) is discarded when size_ + t.Size() >= max_size_.
+            long opSize = (long)key.Length + data.Length;
+            if (Interlocked.Add(ref _pendingBytes, opSize) >= _opt.MaxWritePipelineBacklogSize)
             {
-                Interlocked.Add(ref _pendingBytes, -data.Length);
+                Interlocked.Add(ref _pendingBytes, -opSize);
                 Interlocked.Increment(ref _insertDropped);
                 return false;
             }
@@ -162,7 +165,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
                 // This can happen when the buffers are full: wait till some buffers are free.
                 _bufferAllocator.WaitUntilUsable();
             }
-            Interlocked.Add(ref _pendingBytes, -op.Data!.Length);
+            Interlocked.Add(ref _pendingBytes, -((long)op.Key!.Length + op.Data!.Length));
             if (!ok) Interlocked.Increment(ref _insertDropped);
         }
     }
@@ -170,18 +173,18 @@ public sealed class BlockCacheTier : PersistentCacheTier
     // InsertImpl: false = TryAgain (no buffer space).
     private bool InsertImpl(ReadOnlySpan<byte> key, ReadOnlySpan<byte> data)
     {
-        CacheKey k = CacheKey.Read(key);
         _lock.EnterWriteLock();
         try
         {
             // The key already exists: duplicate insert.
-            if (_blockIndex.ContainsKey(k)) return true;
+            if (_blockIndex.GetAlternateLookup<ReadOnlySpan<byte>>().ContainsKey(key)) return true;
             Lba lba;
             while (!_cacheFile!.Append(key, data, out lba))
             {
                 if (!_cacheFile.Eof) return false;
                 NewCacheFile();
             }
+            byte[] k = key.ToArray();
             _blockIndex[k] = lba;
             _cacheFile.Keys.Add(k);
             Interlocked.Add(ref _bytesWritten, data.Length);
@@ -195,13 +198,12 @@ public sealed class BlockCacheTier : PersistentCacheTier
 
     public override bool TryLookup(ReadOnlySpan<byte> key, out byte[] data, out int length)
     {
-        CacheKey k = CacheKey.Read(key);
         CacheFile? file;
         Lba lba;
         _lock.EnterReadLock();
         try
         {
-            if (!_blockIndex.TryGetValue(k, out lba) || !_files.TryGetValue(lba.CacheId, out file))
+            if (!_blockIndex.GetAlternateLookup<ReadOnlySpan<byte>>().TryGetValue(key, out lba) || !_files.TryGetValue(lba.CacheId, out file))
             {
                 Interlocked.Increment(ref _cacheMisses);
                 return Miss(key, out data, out length);
@@ -253,13 +255,12 @@ public sealed class BlockCacheTier : PersistentCacheTier
     /// </summary>
     public override ValueTask<PersistentCacheLookupResult> LookupAsync(ReadOnlyMemory<byte> key, CancellationToken cancellationToken)
     {
-        CacheKey k = CacheKey.Read(key.Span);
         CacheFile? file;
         Lba lba;
         _lock.EnterReadLock();
         try
         {
-            if (!_blockIndex.TryGetValue(k, out lba) || !_files.TryGetValue(lba.CacheId, out file))
+            if (!_blockIndex.GetAlternateLookup<ReadOnlySpan<byte>>().TryGetValue(key.Span, out lba) || !_files.TryGetValue(lba.CacheId, out file))
             {
                 Interlocked.Increment(ref _cacheMisses);
                 return MissAsync(key, cancellationToken);
@@ -392,7 +393,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
         _lock.EnterWriteLock();
         try
         {
-            _blockIndex.Remove(CacheKey.Read(key));
+            _blockIndex.GetAlternateLookup<ReadOnlySpan<byte>>().Remove(key);
             return true;
         }
         finally
@@ -455,7 +456,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
                 }
                 if (victim is null) return false; // nothing is evictable
                 _files.Remove(victim.CacheId);
-                foreach (CacheKey k in victim.Keys)
+                foreach (byte[] k in victim.Keys)
                 {
                     if (_blockIndex.TryGetValue(k, out Lba l) && l.CacheId == victim.CacheId) _blockIndex.Remove(k);
                 }
@@ -580,7 +581,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
         private bool _openFailed;
         public int Refs;
         public readonly uint CacheId;
-        public readonly List<CacheKey> Keys = new();
+        public readonly List<byte[]> Keys = new();
         public readonly LinkedListNode<CacheFile> LruNode;
 
         public CacheFile(BlockCacheTier tier, uint cacheId, string path, int maxSize)
