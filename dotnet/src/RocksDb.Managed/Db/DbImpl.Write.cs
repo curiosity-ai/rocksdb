@@ -665,6 +665,12 @@ internal sealed partial class DbImpl
             if (Volatile.Read(ref _protectedWrites) != 0)
                 VerifyWalRecordProtection(valid == 1 && !firstValid!.Batch!.HasWalTerminationPoint ? firstValid.Batch : _groupBatch);
             LogWriter log = _log!;
+            // wal_context.prev_size (DBImpl::WriteImpl, one write queue only): the WAL's size before this group's record.
+            if (!_twoWriteQueues)
+            {
+                _walPrevSize = log.File?.Size ?? -1;
+                _walPrevSizeNumber = _logNumber;
+            }
             // DBImpl::WriteToWAL: record the timestamp sizes of column families with timestamps not yet recorded
             // in this WAL (recovery uses them to reconcile timestamp-size changes).
             if (_cfTimestampSizes is { } tsSizes) log.MaybeAddUserDefinedTimestampSizeRecord(tsSizes);
@@ -702,8 +708,11 @@ internal sealed partial class DbImpl
             // replaces the WAL and never writes to or syncs the failed one again. Its record may be complete in the
             // failed WAL while the write is not in the DB: fence the range from WAL iterators (WALIOStatusCheck ->
             // RecordIndeterminateWriteSequence).
-            WalRecoverySequences.Record(_logNumber, Util.Coding.DecodeFixed64(record.Span), last);
-            SetBackgroundError(e, BackgroundErrorReason.WriteCallback, walRelated: true);
+            if (WalErrorStopsWrites(e))
+            {
+                WalRecoverySequences.Record(_logNumber, Util.Coding.DecodeFixed64(record.Span), last);
+                SetBackgroundError(e, BackgroundErrorReason.WriteCallback, walRelated: true);
+            }
             throw;
         }
         for (int i = 0; i < group.Count; i++)
@@ -762,6 +771,15 @@ internal sealed partial class DbImpl
         {
             // DBImpl::WriteImpl: the leader's status is the group's insert status (w.status = InsertInto(write_group)).
             leader.Error ??= insertError;
+            // DBImpl::WriteImpl: "logs_.back().SetAttemptTruncateSize(wal_context.prev_size)". The group's record is in
+            // the WAL but the group is not in the DB: closing the DB cuts the WAL back to its size before the record
+            // (CloseAsync), so the next open does not replay the refused write.
+            if (walRecordBytes > 0 && !leader.DisableWal && !_twoWriteQueues && _walPrevSize >= 0 && _walPrevSizeNumber == _logNumber &&
+                _walAttemptTruncateSize < 0)
+            {
+                _walAttemptTruncateSize = _walPrevSize;
+                _walAttemptTruncateNumber = _logNumber;
+            }
             HandleMemTableInsertFailure(insertError);
         }
         RecordWriteGroup(group, total, walRecordBytes, !leader.DisableWal, needSync);
@@ -775,6 +793,50 @@ internal sealed partial class DbImpl
     /// memtable above the last sequence until the DB is reopened).
     /// </summary>
     private void HandleMemTableInsertFailure(Exception e) => SetBackgroundError(e, BackgroundErrorReason.MemTable, walRelated: false);
+
+    /// <summary>
+    /// Port of the condition of DBImpl::WALIOStatusCheck: a failed WAL write or sync becomes a background error only
+    /// with paranoid_checks (and not for Busy / Incomplete), or when the error is IOFenced. Otherwise the write just
+    /// fails and the current WAL stays writable ("Force writable file to be continue writable":
+    /// logs_.back().writer->file()->reset_seen_error()); returns false then.
+    /// </summary>
+    private bool WalErrorStopsWrites(Exception e)
+    {
+        RocksDbException status = RocksDbException.FromException(e);
+        if ((Options.ParanoidChecks && status.Code is not (StatusCode.Busy or StatusCode.Incomplete)) || status.SubCode == StatusSubCode.IOFenced)
+        {
+            return true;
+        }
+        _log?.ResetSeenError();
+        return false;
+    }
+
+    // wal_context.prev_size / LogWriterNumber::attempt_truncate_size (db_impl.h). Written by the write leader; the
+    // truncate size is read when the DB closes (no writer is active then).
+    private long _walPrevSize = -1;
+    private ulong _walPrevSizeNumber;
+    private long _walAttemptTruncateSize = -1;
+    private ulong _walAttemptTruncateNumber;
+
+    /// <summary>
+    /// Port of LogWriterNumber::ClearWriter's truncation (db_impl.h): after a failed memtable insert the current WAL is
+    /// cut back to its size before the failed write's record. Best effort, like upstream: errors are ignored and a file
+    /// that cannot be truncated while open is left alone.
+    /// </summary>
+    private void MaybeTruncateWalOnClose(LogWriter log)
+    {
+        long size = _walAttemptTruncateSize;
+        if (size < 0 || log.LogNumber != _walAttemptTruncateNumber) return;
+        try
+        {
+            log.WriteBuffer();
+            if (log.File is Env.ITruncatableWritableFile file && size < log.File.Size) file.Truncate(size);
+        }
+        catch (Exception e) when (e is IOException or RocksDbException)
+        {
+            LogWarn("Unable to truncate WAL " + FileNames.LogFileName(WalDir, log.LogNumber) + " -- " + e.Message);
+        }
+    }
 
     /// <summary>
     /// WriteBatchInternal::InsertInto(write_group): the memtable inserts of the group's writers, one after another. Stops

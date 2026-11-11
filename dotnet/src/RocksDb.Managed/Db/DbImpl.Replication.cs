@@ -573,7 +573,8 @@ internal sealed partial class DbImpl
         }
         catch (Exception e) when (e is not OperationCanceledException && e is not RocksDbException { Code: StatusCode.NotSupported })
         {
-            SetBackgroundError(e, BackgroundErrorReason.WriteCallback, walRelated: true);
+            // DBImpl::FlushWAL / SyncWAL: WALIOStatusCheck.
+            if (WalErrorStopsWrites(e)) SetBackgroundError(e, BackgroundErrorReason.WriteCallback, walRelated: true);
             throw;
         }
         finally

@@ -240,6 +240,20 @@ public sealed class LogWriter : IDisposable, IAsyncDisposable
     /// <summary>Appends a logical record that contains updates up to sequence <paramref name="sequence"/>.</summary>
     public void AddRecord(ReadOnlySpan<byte> record, ulong sequence)
     {
+        ThrowIfSeenError();
+        try
+        {
+            AddRecordCore(record, sequence);
+        }
+        catch
+        {
+            _seenError = true;
+            throw;
+        }
+    }
+
+    private void AddRecordCore(ReadOnlySpan<byte> record, ulong sequence)
+    {
         IWritableFile dest = Dest;
         // Fragment the record if necessary and emit it. Note that if record is empty, we still want to iterate once
         // to emit a single zero-length record.
@@ -266,23 +280,32 @@ public sealed class LogWriter : IDisposable, IAsyncDisposable
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     public async ValueTask AddRecordAsync(ReadOnlyMemory<byte> record, ulong sequence, CancellationToken cancellationToken = default)
     {
-        IWritableFile dest = Dest;
-        AddState st = BeginRecord(record.Length);
-        do
+        ThrowIfSeenError();
+        try
         {
-            int trailer = TakeTrailer();
-            if (trailer > 0) await dest.AppendAsync(s_zeros.AsMemory(0, trailer), cancellationToken).ConfigureAwait(false);
-            if (!PrepareFragment(record.Span, ref st, out int headerSize, out int fragmentLength)) break;
-            await dest.AppendAsync(_header.AsMemory(0, headerSize), cancellationToken).ConfigureAwait(false);
-            ReadOnlyMemory<byte> payload = st.FromCompressed
-                ? _compressedBuffer.AsMemory(st.Pos, fragmentLength)
-                : record.Slice(st.Pos, fragmentLength);
-            await dest.AppendAsync(payload, cancellationToken).ConfigureAwait(false);
-            AdvanceFragment(ref st, fragmentLength);
-        } while (st.Left > 0 || st.CompressRemaining > 0);
+            IWritableFile dest = Dest;
+            AddState st = BeginRecord(record.Length);
+            do
+            {
+                int trailer = TakeTrailer();
+                if (trailer > 0) await dest.AppendAsync(s_zeros.AsMemory(0, trailer), cancellationToken).ConfigureAwait(false);
+                if (!PrepareFragment(record.Span, ref st, out int headerSize, out int fragmentLength)) break;
+                await dest.AppendAsync(_header.AsMemory(0, headerSize), cancellationToken).ConfigureAwait(false);
+                ReadOnlyMemory<byte> payload = st.FromCompressed
+                    ? _compressedBuffer.AsMemory(st.Pos, fragmentLength)
+                    : record.Slice(st.Pos, fragmentLength);
+                await dest.AppendAsync(payload, cancellationToken).ConfigureAwait(false);
+                AdvanceFragment(ref st, fragmentLength);
+            } while (st.Left > 0 || st.CompressRemaining > 0);
 
-        if (!_manualFlush) await dest.FlushAsync(cancellationToken).ConfigureAwait(false);
-        if (sequence > LastSequenceRecorded) LastSequenceRecorded = sequence;
+            if (!_manualFlush) await dest.FlushAsync(cancellationToken).ConfigureAwait(false);
+            if (sequence > LastSequenceRecorded) LastSequenceRecorded = sequence;
+        }
+        catch
+        {
+            _seenError = true;
+            throw;
+        }
     }
 
     // ---- Metadata records ---------------------------------------------------------------------------------------
@@ -402,12 +425,55 @@ public sealed class LogWriter : IDisposable, IAsyncDisposable
 
     // ---- Flush / sync / close -----------------------------------------------------------------------------------
 
+    // WritableFileWriter::seen_error_: set by a failed record append or sync. The file's contents and durability are
+    // unknown from then on, so later appends and syncs fail ("Writer has previous error.") instead of reaching the file:
+    // an fsync retried after a failure can report success although the data was dropped, and the WAL must never be
+    // treated as synced then. Written and read by the WAL's single writer (write leader / WAL write lock).
+    private bool _seenError;
+
+    /// <summary>A record append or a sync of this WAL failed (WritableFileWriter::seen_error).</summary>
+    public bool SeenError => _seenError;
+
+    /// <summary>WritableFileWriter::reset_seen_error: makes the file writable again (DBImpl::WALIOStatusCheck).</summary>
+    public void ResetSeenError() => _seenError = false;
+
+    private void ThrowIfSeenError()
+    {
+        if (_seenError) throw new RocksDbException(StatusCode.IOError, "IO error: Writer has previous error.");
+    }
+
     /// <summary>Pushes buffered data to the OS (<c>Writer::WriteBuffer</c>).</summary>
     public void WriteBuffer() => Dest.Flush();
     public ValueTask WriteBufferAsync(CancellationToken cancellationToken = default) => Dest.FlushAsync(cancellationToken);
+
     /// <summary>Flushes and fsyncs the log file.</summary>
-    public void Sync() => Dest.Sync();
-    public ValueTask SyncAsync(CancellationToken cancellationToken = default) => Dest.SyncAsync(cancellationToken);
+    public void Sync()
+    {
+        ThrowIfSeenError();
+        try
+        {
+            Dest.Sync();
+        }
+        catch
+        {
+            _seenError = true;
+            throw;
+        }
+    }
+
+    public async ValueTask SyncAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfSeenError();
+        try
+        {
+            await Dest.SyncAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            _seenError = true;
+            throw;
+        }
+    }
 
     /// <summary>Closes (flushes and disposes) the underlying file.</summary>
     public void Dispose()

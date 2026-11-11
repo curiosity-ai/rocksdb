@@ -166,7 +166,13 @@ public sealed class ManifestReplayer
         // AtomicGroupReadBuffer::AddEdit
         if (edit.IsInAtomicGroup)
         {
-            if (_atomicGroup.Count == 0) _atomicGroupSize = checked((int)edit.RemainingEntries + 1);
+            if (_atomicGroup.Count == 0)
+            {
+                // A count that cannot be a real group (upstream would try to allocate replay_buffer_ for it) is corruption,
+                // not an arithmetic overflow.
+                if (edit.RemainingEntries >= int.MaxValue) ThrowHelper.Corruption("corrupted atomic group");
+                _atomicGroupSize = (int)edit.RemainingEntries + 1;
+            }
             _atomicGroup.Add(edit);
             if (_atomicGroup.Count + edit.RemainingEntries != _atomicGroupSize) ThrowHelper.Corruption("corrupted atomic group");
             if (_atomicGroup.Count == _atomicGroupSize)

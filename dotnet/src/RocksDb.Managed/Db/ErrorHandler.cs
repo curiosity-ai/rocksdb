@@ -177,7 +177,7 @@ internal sealed class ErrorHandler
             RocksDbException? s = NotifyOnBackgroundError(reason, err.WithSeverity(ErrorSeverity.UnrecoverableError), autoRecovery: false, out _);
             lock (_db.Mutex)
             {
-                if (s is not null) CheckAndSetRecoveryAndBgError(s, walRelated);
+                if (s is not null) CheckAndSetRecoveryAndBgError(s, walRelated, FlushReason.ErrorRecovery);
                 return _bgError;
             }
         }
@@ -187,7 +187,7 @@ internal sealed class ErrorHandler
             RocksDbException? s = NotifyOnBackgroundError(reason, err.WithSeverity(ErrorSeverity.FatalError), autoRecovery: false, out _);
             lock (_db.Mutex)
             {
-                if (s is not null) CheckAndSetRecoveryAndBgError(s, walRelated);
+                if (s is not null) CheckAndSetRecoveryAndBgError(s, walRelated, FlushReason.ErrorRecovery);
                 return _bgError;
             }
         }
@@ -226,12 +226,10 @@ internal sealed class ErrorHandler
             lock (_db.Mutex)
             {
                 if (s is null) return _bgError;
-                if (noBgWork)
-                {
-                    _softErrorNoBgWork = true;
-                    _recoveryFlushReason = FlushReason.ErrorRecoveryRetryFlush;
-                }
-                CheckAndSetRecoveryAndBgError(s, walRelated);
+                // soft_error_no_bg_work_ is set whatever the current error is; the recovery context (flush reason) is
+                // only replaced when this error becomes the background error (UpdateRecoveryContext).
+                if (noBgWork) _softErrorNoBgWork = true;
+                CheckAndSetRecoveryAndBgError(s, walRelated, noBgWork ? FlushReason.ErrorRecoveryRetryFlush : FlushReason.ErrorRecovery);
                 if (autoRecovery) StartRecoverFromRetryableBgIoError();
                 return _bgError;
             }
@@ -286,6 +284,7 @@ internal sealed class ErrorHandler
             if (s is not null && s.Severity > Severity(_bgError))
             {
                 _bgError = s;
+                _recoveryFlushReason = FlushReason.ErrorRecovery; // UpdateRecoveryContext(context, replace_existing_context = true)
                 if (walRelated) _walWriteError = true;
             }
             else
@@ -308,11 +307,19 @@ internal sealed class ErrorHandler
 
     private static ErrorSeverity Severity(RocksDbException? e) => e?.Severity ?? ErrorSeverity.NoError;
 
-    /// <summary>Port of CheckAndSetRecoveryAndBGError. REQUIRES: mutex.</summary>
-    private void CheckAndSetRecoveryAndBgError(RocksDbException err, bool walRelated)
+    /// <summary>
+    /// Port of CheckAndSetRecoveryAndBGError. The recovery context of <paramref name="err"/> (its flush reason) replaces
+    /// the current one only when the error becomes the background error (UpdateRecoveryContext with
+    /// replace_existing_context = severity above the current one). REQUIRES: mutex.
+    /// </summary>
+    private void CheckAndSetRecoveryAndBgError(RocksDbException err, bool walRelated, FlushReason flushReason)
     {
         if (_recoveryInProgress && _recoveryError is null) _recoveryError = err;
-        if (err.Severity > Severity(_bgError)) _bgError = err;
+        if (err.Severity > Severity(_bgError))
+        {
+            _bgError = err;
+            _recoveryFlushReason = flushReason;
+        }
         if (walRelated) _walWriteError = true;
         if (Severity(_bgError) >= ErrorSeverity.HardError) _isDbStopped = true;
     }

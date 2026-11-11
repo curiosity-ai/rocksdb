@@ -621,7 +621,7 @@ internal static class WritableFileBuffers
 /// Not thread-safe: a writable file has a single writer, as in RocksDB.
 /// Async methods complete synchronously while data fits in the buffer; slow paths use pooled state machines.
 /// </summary>
-internal sealed class LocalWritableFile : IWritableFile
+internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFile
 {
     private readonly SafeFileHandle _handle;
     private readonly string _path;
@@ -689,6 +689,26 @@ internal sealed class LocalWritableFile : IWritableFile
     }
 
     public long Size => _filePos + _buffered;
+
+    /// <summary>PosixWritableFile::Truncate (buffered mode only; a direct I/O file is left as is).</summary>
+    public void Truncate(long size)
+    {
+        ThrowIfDisposed();
+        if (_alignment != 0) return;
+        Flush();
+        if (size < 0 || size >= _filePos) return;
+        try
+        {
+            RandomAccess.SetLength(_handle, size);
+        }
+        catch (IOException e)
+        {
+            throw LocalFileSystem.MapException("While ftruncate", _path, e);
+        }
+        _filePos = size;
+        if (_lastRangeSync > size) _lastRangeSync = size;
+        if (_preallocatedEnd > size) _preallocatedEnd = size;
+    }
 
     private Span<byte> BufferSpan => _array is not null ? _array.AsSpan(0, _capacity) : _aligned!.Span;
     private Memory<byte> BufferMemory => _array is not null ? _array.AsMemory(0, _capacity) : _aligned!.Memory;

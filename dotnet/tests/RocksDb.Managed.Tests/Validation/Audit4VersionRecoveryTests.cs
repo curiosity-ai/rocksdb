@@ -81,59 +81,23 @@ public sealed class Audit4VersionRecoveryTests
     }
 
     [TestMethod]
-    public void MalformedBatchInWalStopsPointInTimeRecovery()
+    public void MalformedBatchInWalFailsTheOpenInEveryRecoveryMode()
     {
-        // DBImpl::ProcessLogRecord: a failed InsertLogRecordToMemtable (here WriteBatchInternal::Iterate ->
-        // Corruption "unknown WriteBatch tag") is reported through reporter->Corruption and becomes the WAL's status,
-        // which HandleNonOkStatusOrOldLogRecord handles by wal_recovery_mode. kPointInTimeRecovery (the default) stops
-        // the replay there and the open succeeds. The port let the exception escape, so the open failed in every mode.
-        MemoryFileSystem fs = DbWithMalformedBatchInWal();
-        using RocksDatabase db = RocksDatabase.Open(DbPath, new DbOptions { FileSystem = fs, WalRecoveryMode = WalRecoveryMode.PointInTimeRecovery });
-        Assert.AreEqual("1", GetString(db, "a"));
-        Assert.AreEqual("2", GetString(db, "b"));
-        Assert.AreEqual("3", GetString(db, "c"));
-        Assert.IsNull(GetString(db, "d")); // after the point of corruption
-        // WriteBatchInternal::InsertInto reports the inserter's sequence even when it fails, and FinishLogFileProcessing
-        // publishes next_sequence - 1: the entry applied before the bad tag is part of the recovered state.
-        Assert.AreEqual("4", GetString(db, "e"));
-        Assert.AreEqual(4UL, db.GetLatestSequenceNumber());
-    }
-
-    [TestMethod]
-    public void MalformedBatchInWalIsSkippedBySkipAnyCorruptedRecords()
-    {
-        // kSkipAnyCorruptedRecords: the reporter has no status (InitializeLogReader), so the failed record is only
-        // logged and the replay goes on with the next record.
-        MemoryFileSystem fs = DbWithMalformedBatchInWal();
-        using RocksDatabase db = RocksDatabase.Open(DbPath, new DbOptions { FileSystem = fs, WalRecoveryMode = WalRecoveryMode.SkipAnyCorruptedRecords });
-        Assert.AreEqual("2", GetString(db, "b"));
-        Assert.AreEqual("3", GetString(db, "c"));
-        Assert.AreEqual("4", GetString(db, "e"));
-        Assert.AreEqual("5", GetString(db, "d"));
-        Assert.AreEqual(5UL, db.GetLatestSequenceNumber());
-    }
-
-    [TestMethod]
-    public void MalformedBatchInWalIsIgnoredWithoutParanoidChecks()
-    {
-        // DBImpl::MaybeIgnoreError: without paranoid_checks the InsertLogRecordToMemtable failure is ignored in every
-        // recovery mode, and the replay continues.
-        MemoryFileSystem fs = DbWithMalformedBatchInWal();
-        using RocksDatabase db = RocksDatabase.Open(DbPath,
-            new DbOptions { FileSystem = fs, ParanoidChecks = false, WalRecoveryMode = WalRecoveryMode.AbsoluteConsistency });
-        Assert.AreEqual("3", GetString(db, "c"));
-        Assert.AreEqual("5", GetString(db, "d"));
-    }
-
-    [TestMethod]
-    public void MalformedBatchInWalFailsStrictRecoveryModes()
-    {
-        // HandleNonOkStatusOrOldLogRecord: kTolerateCorruptedTailRecords and kAbsoluteConsistency return the status.
-        foreach (WalRecoveryMode mode in new[] { WalRecoveryMode.TolerateCorruptedTailRecords, WalRecoveryMode.AbsoluteConsistency })
+        // DBImpl::InitializeWriteBatchForLogRecord: WriteBatchInternal::UpdateProtectionInfo iterates the batch
+        // (WriteBatch::Iterate -> Corruption "unknown WriteBatch tag") and ProcessLogRecord / ProcessLogFile return that
+        // status directly: it never reaches MaybeIgnoreError or HandleNonOkStatusOrOldLogRecord, so the open fails in
+        // every wal_recovery_mode, with or without paranoid_checks. Native does exactly that
+        // (Audit4FollowUpRecoveryCompatTests.MalformedOrRefusedBatchInWalRecoversLikeNative). The first audit #4 pass
+        // had the port treat it like a read error (point-in-time stop, skip, ignore without paranoid_checks).
+        foreach (WalRecoveryMode mode in Enum.GetValues<WalRecoveryMode>())
         {
-            MemoryFileSystem fs = DbWithMalformedBatchInWal();
-            var ex = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbPath, new DbOptions { FileSystem = fs, WalRecoveryMode = mode }).Dispose());
-            Assert.AreEqual(StatusCode.Corruption, ex.Code, mode.ToString());
+            foreach (bool paranoid in new[] { true, false })
+            {
+                MemoryFileSystem fs = DbWithMalformedBatchInWal();
+                var ex = Assert.ThrowsExactly<RocksDbException>(
+                    () => RocksDatabase.Open(DbPath, new DbOptions { FileSystem = fs, WalRecoveryMode = mode, ParanoidChecks = paranoid }).Dispose());
+                Assert.AreEqual(StatusCode.Corruption, ex.Code, mode + " paranoid=" + paranoid);
+            }
         }
     }
 

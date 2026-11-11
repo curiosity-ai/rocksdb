@@ -975,6 +975,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             _log = null;
             if (log is not null)
             {
+                MaybeTruncateWalOnClose(log);
                 if (synchronous) log.Dispose();
                 else await log.DisposeAsync().ConfigureAwait(false);
             }

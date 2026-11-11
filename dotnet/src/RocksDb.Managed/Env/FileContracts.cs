@@ -3,6 +3,16 @@ using Microsoft.Win32.SafeHandles;
 namespace RocksDb.Managed.Env;
 
 /// <summary>
+/// A writable file that can be cut back to a smaller size while open (FSWritableFile::Truncate). Optional: callers
+/// treat a file without it as not truncatable (best effort).
+/// </summary>
+internal interface ITruncatableWritableFile
+{
+    /// <summary>Flushes buffered data, then truncates the file to <paramref name="size"/> bytes when it is longer.</summary>
+    void Truncate(long size);
+}
+
+/// <summary>
 /// CONTRACT (owned by stream F). Append-only file used for WAL, MANIFEST, SST output. Port of the
 /// WritableFile/WritableFileWriter pair (file/writable_file_writer.h). Implementations buffer internally;
 /// <see cref="Append"/> copies the data so callers may reuse their buffers immediately.

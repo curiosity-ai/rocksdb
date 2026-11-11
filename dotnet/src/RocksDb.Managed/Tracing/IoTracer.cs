@@ -366,9 +366,15 @@ internal sealed class IoTracingFileSystem(IFileSystem inner, IoTracer tracer) : 
         public void Dispose() => inner.Dispose();
     }
 
-    private sealed class TracedWritable(IWritableFile inner, IoTracer tracer, string path) : IWritableFile
+    private sealed class TracedWritable(IWritableFile inner, IoTracer tracer, string path) : IWritableFile, ITruncatableWritableFile
     {
         public long Size => inner.Size;
+
+        /// <summary>Forwarded when the wrapped file supports it (not traced); a no-op otherwise.</summary>
+        public void Truncate(long size)
+        {
+            if (inner is ITruncatableWritableFile t) t.Truncate(size);
+        }
 
         public void Append(ReadOnlySpan<byte> data)
         {

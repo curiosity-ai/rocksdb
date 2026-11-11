@@ -410,12 +410,21 @@ public sealed class MemoryFileSystem : IFileSystem
         }
     }
 
-    private sealed class MemWritableFile(MemoryFileSystem fs, MemFile file, long position, bool truncateOnClose) : IWritableFile
+    private sealed class MemWritableFile(MemoryFileSystem fs, MemFile file, long position, bool truncateOnClose) : IWritableFile, ITruncatableWritableFile
     {
         private long _position = position;
         private bool _disposed;
 
         public long Size => _position;
+
+        public void Truncate(long size)
+        {
+            if (_disposed) ThrowHelper.InvalidArgument("file already closed");
+            fs.ThrowIfInactive();
+            if (size < 0 || size >= _position) return;
+            file.Truncate(size);
+            _position = size;
+        }
 
         public void Append(ReadOnlySpan<byte> data)
         {
