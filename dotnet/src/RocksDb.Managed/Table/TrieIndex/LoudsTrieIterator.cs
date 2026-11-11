@@ -658,7 +658,16 @@ internal sealed class LoudsTrieIterator
                 else
                 {
                     ulong start = SparseNodeStartPos(nodeNum);
-                    if (start >= t.SLabelsSize) return Invalid();
+                    if (start >= t.SLabelsSize)
+                    {
+                        // A trie holding only the empty key (the label-less root's prefix key, see LoudsTrieBuilder).
+                        if (nodeNum == 0 && t.SLabelsSize == 0 && _pathLen == 0 && IsSparsePrefixKey(0))
+                        {
+                            _isAtPrefixKey = true;
+                            return SetLeaf(SparsePrefixKeyLeafIndex(0));
+                        }
+                        return Invalid();
+                    }
                     end = SparseNodeEndPos(start);
                 }
                 ulong lastPos = end - 1;

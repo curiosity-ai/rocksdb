@@ -286,7 +286,16 @@ internal sealed class LdbTool
 
     private string KeyValueLine(Iterator it)
     {
-        // PrintKeyValueOrWideColumns: entities other than a plain default column print their columns.
+        // PrintKeyValueOrWideColumns: entities other than a plain default column print their columns
+        // (WideColumnsHelper::DumpWideColumns honors value_hex itself, so the dump is not hexed again).
+        if (it.IsEntity)
+        {
+            WideColumns columns = it.Columns;
+            if (!(columns.Count == 1 && columns.HasDefaultColumn))
+            {
+                return Key(it.Key) + Delim + SstFileDumper.WideColumnsToString(columns.Serialized, _valueHex);
+            }
+        }
         return Key(it.Key) + Delim + Val(it.Value);
     }
 
@@ -334,6 +343,7 @@ internal sealed class LdbTool
         ColumnFamily cf = Cf(db);
         if (Flag("stats") && db.GetProperty("rocksdb.stats") is { } stats) W(stats + "\n");
         using Iterator it = cf.NewIterator(new ReadOptions { TotalOrderSeek = true });
+        Comparator dumpUcmp = cf.Data.UserComparator;
         if (from is not null) it.Seek(from);
         else it.SeekToFirst();
         ulong count = 0, c = 0, s2 = 0;
@@ -341,7 +351,8 @@ internal sealed class LdbTool
         var sizes = new List<ulong>();
         for (; it.Valid; it.Next())
         {
-            if (to is not null && it.Key.SequenceCompareTo(to) >= 0) break;
+            // DoDumpCommand: "ucmp->Compare(iter->key(), to_) >= 0" (the scan command compares the raw strings).
+            if (to is not null && dumpUcmp.Compare(it.Key, to) >= 0) break;
             if (maxKeys == 0) break;
             if (maxKeys > 0) --maxKeys;
             ++count;
@@ -424,7 +435,8 @@ internal sealed class LdbTool
                     string v = p.Type == EntryType.WideColumnEntity ? SstFileDumper.WideColumnsToString(it.Value, _valueHex) : ToolText.ToString(it.Value, _valueHex);
                     W(ToolText.InternalKeyDebugString(ikey, _keyHex) + " => " + v + "\n");
                 }
-                if (maxKeys > 0 && count >= maxKeys) break;
+                // GetAllKeyVersions stops at "++num_keys >= max_num_ikeys" after adding a key: --max_keys=0 yields one key.
+                if (maxKeys >= 0 && count >= Math.Max(maxKeys, 1)) break;
             }
         }
         finally
@@ -690,8 +702,21 @@ internal sealed class LdbTool
     {
         if (_params.Count != 1) throw new ToolException("property name must be specified");
         RocksDatabase db = OpenDb(readOnly: true);
+        // GetPropertyCommand::DoCommand tries the map property first.
+        if (Cf(db).GetMapProperty(_params[0]) is { } map)
+        {
+            if (map.Count == 0)
+            {
+                W(_params[0] + ": <empty map>\n");
+                return;
+            }
+            var names = new List<string>(map.Keys);
+            names.Sort(StringComparer.Ordinal);
+            foreach (string name in names) W(_params[0] + "." + name + ": " + map[name] + "\n");
+            return;
+        }
         string? v = Cf(db).GetProperty(_params[0]);
-        if (v is null) throw new ToolException("Failed to get property: " + _params[0]);
+        if (v is null) throw new ToolException("failed to get property: " + _params[0]);
         W(_params[0] + ": " + v + "\n");
     }
 

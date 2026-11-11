@@ -100,7 +100,22 @@ internal sealed class SstFileDumper : IDisposable
                 if (hasTo && ucmp.Compare(userKey, to) >= 0) break;
                 if (printKv)
                 {
-                    string v = p.Type == EntryType.WideColumnEntity ? WideColumnsToString(it.Value, _outputHex) : ToolText.ToString(it.Value, _outputHex);
+                    string v;
+                    if (p.Type == EntryType.WideColumnEntity)
+                    {
+                        v = WideColumnsToString(it.Value, _outputHex);
+                    }
+                    else if (p.Type == EntryType.ValuePreferredSeqno && it.Value.Length >= sizeof(ulong))
+                    {
+                        // ParsePackedValueWithSeqno: "value, preferred_seqno".
+                        ReadOnlySpan<byte> packed = it.Value;
+                        v = ToolText.ToString(packed[..^sizeof(ulong)], _outputHex) + ", "
+                            + Util.Coding.DecodeFixed64(packed[^sizeof(ulong)..]).ToString(CultureInfo.InvariantCulture);
+                    }
+                    else
+                    {
+                        v = ToolText.ToString(it.Value, _outputHex);
+                    }
                     _out.Write(ToolText.InternalKeyDebugString(key, _outputHex) + " => " + v + "\n");
                 }
             }
