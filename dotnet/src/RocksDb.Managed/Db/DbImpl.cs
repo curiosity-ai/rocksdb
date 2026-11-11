@@ -825,6 +825,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
     {
         bool listedDbDir = false;
         var toDelete = new List<string>();
+        // Table and blob files found by the scan: deleted like the queued ones (DeleteObsoleteFileImpl).
+        Dictionary<string, (FileType Type, ulong Number, string Directory)>? dataFiles = null;
         var options = new List<(ulong Number, string Path)>();
         var walsToDelete = new List<ulong>();
         ulong minLog;
@@ -852,13 +854,20 @@ internal sealed partial class DbImpl : IAsyncDisposable
                     switch (type)
                     {
                         case FileType.TableFile:
-                            if (!Versions.IsLiveFile(number) && !_pendingOutputs.Contains(number)) toDelete.Add(full);
+                            if (!Versions.IsLiveFile(number) && !_pendingOutputs.Contains(number))
+                            {
+                                toDelete.Add(full);
+                                (dataFiles ??= new())[full] = (type, number, dir);
+                            }
                             break;
                         case FileType.BlobFile:
                             // ShouldKeepBlobFileDuringPurge: a footer-less blob file may be a blob direct write file
                             // (of this instance, or of a crashed one whose blob indexes were recovered from the WAL).
                             if (!Versions.IsLiveBlobFile(number) && !_pendingOutputs.Contains(number) && !ShouldKeepFooterlessBlobFile(full))
+                            {
                                 toDelete.Add(full);
+                                (dataFiles ??= new())[full] = (type, number, dir);
+                            }
                             break;
                         case FileType.DescriptorFile:
                             if (dir == DbName && (atOpen ? number != Versions.ManifestFileNumber : number < Versions.ManifestFileNumber)) toDelete.Add(full);
@@ -891,7 +900,17 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 if (options[i].Number < keepOptionsFrom) toDelete.Add(options[i].Path);
             }
         }
-        foreach (string p in toDelete) TryDeleteFile(p);
+        foreach (string p in toDelete)
+        {
+            // DeleteObsoleteFileImpl: table and blob files go through DeleteDBFile (the SstFileManager when there is
+            // one) and are reported (event log; OnTableFileDeleted), also when only the full scan found them.
+            if (dataFiles is not null && dataFiles.TryGetValue(p, out (FileType Type, ulong Number, string Directory) f))
+            {
+                if (f.Type == FileType.TableFile) DeleteObsoleteTableFile(p, f.Number);
+                else LogFileDeletionEvent("blob_file_deletion", 0, f.Number, DeleteDbFile(p, f.Directory));
+            }
+            else TryDeleteFile(p);
+        }
         if (dbDirChildren is not null && toDelete.Count > 0)
         {
             string prefix = DbName + "/";

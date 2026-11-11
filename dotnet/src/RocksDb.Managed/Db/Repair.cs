@@ -40,6 +40,9 @@ internal sealed class Repairer
     private readonly List<TableInfo> _tables = new();
     private ulong _nextFileNumber = 1;
     private readonly List<string> _paths = new();
+    // The column families of the repaired DB (the VersionSet's ColumnFamilySet of the C++ Repairer): the default one
+    // and each one added by ScanTable (Repairer::AddColumnFamily), also when the table that named it is then archived.
+    private readonly SortedDictionary<uint, string> _cfNames = new() { [0] = ColumnFamilyDescriptor.DefaultColumnFamilyName };
 
     private sealed class TableInfo
     {
@@ -221,28 +224,33 @@ internal sealed class Repairer
                 meta.UniqueId = new UniqueId64x2(id0, id1);
             }
             var t = new TableInfo { Meta = meta, ColumnFamilyId = (uint)props.ColumnFamilyId, ColumnFamilyName = props.ColumnFamilyName };
-            if (props.ColumnFamilyId == TableProperties.UnknownColumnFamily)
+            // "column family unknown (probably due to legacy format); adding to default column family id 0." The name
+            // stays the recorded one, as upstream: a table without a column family name (legacy, or written by
+            // SstFileWriter without a column family) then fails the name check below and is archived.
+            if (props.ColumnFamilyId == TableProperties.UnknownColumnFamily) t.ColumnFamilyId = 0;
+            if (!_cfNames.TryGetValue(t.ColumnFamilyId, out string? cfName))
             {
-                // "column family unknown (probably due to legacy format); adding to default column family id 0."
-                t.ColumnFamilyId = 0;
-                t.ColumnFamilyName = ColumnFamilyDescriptor.DefaultColumnFamilyName;
-            }
-            if (t.ColumnFamilyId == 0 && t.ColumnFamilyName.Length == 0) t.ColumnFamilyName = ColumnFamilyDescriptor.DefaultColumnFamilyName;
-            foreach (TableInfo other in _tables)
-            {
-                if (other.ColumnFamilyId == t.ColumnFamilyId && other.ColumnFamilyName != t.ColumnFamilyName)
-                    throw RocksDbException.Corruption(_dbname + ": inconsistent column family name");
-            }
-            if (GetColumnFamilyOptions(t.ColumnFamilyName) is null && t.ColumnFamilyName != ColumnFamilyDescriptor.DefaultColumnFamilyName)
-            {
-                throw RocksDbException.Corruption("Encountered unknown column family with name=" + t.ColumnFamilyName + ", id="
-                    + t.ColumnFamilyId.ToString(CultureInfo.InvariantCulture));
+                // Repairer::AddColumnFamily: the column family exists from here on, whatever happens to this table.
+                if (GetColumnFamilyOptions(t.ColumnFamilyName) is null)
+                {
+                    throw RocksDbException.Corruption("Encountered unknown column family with name=" + t.ColumnFamilyName + ", id="
+                        + t.ColumnFamilyId.ToString(CultureInfo.InvariantCulture));
+                }
+                cfName = t.ColumnFamilyName;
+                _cfNames.Add(t.ColumnFamilyId, cfName);
             }
             meta.OldestAncestorTime = props.CreationTime;
             meta.UserDefinedTimestampsPersisted = props.UserDefinedTimestampsPersisted != 0;
             meta.TailSize = FileMetaData.CalculateTailSize(fileSize, props);
+            if (cfName != t.ColumnFamilyName) throw RocksDbException.Corruption(_dbname + ": inconsistent column family name");
 
+            // cfd->internal_comparator(): the boundaries are ordered by the comparator of the table's column family,
+            // not by the one of the default column family the table was opened with.
             InternalKeyComparator icmp = reader.InternalComparator;
+            if ((GetColumnFamilyOptions(cfName) ?? _defaultCfOptions).Comparator is { } cfComparator && !ReferenceEquals(cfComparator, icmp.UserComparator))
+            {
+                icmp = new InternalKeyComparator(cfComparator);
+            }
             using (BlockBasedTableIterator it = reader.NewIterator(TableReadFlags.DontFillCache))
             {
                 for (it.SeekToFirst(); it.Valid; it.Next())
@@ -250,6 +258,8 @@ internal sealed class Repairer
                     ReadOnlySpan<byte> key = it.Key;
                     if (!DbFormat.TryParseInternalKey(key, out ParsedInternalKey parsed)) continue; // unparsable key
                     UpdateBoundaries(meta, icmp, key, parsed.Sequence);
+                    // FileMetaData::UpdateBoundaries: the oldest blob file the table refers to (Corruption archives the table).
+                    if (parsed.Type == EntryType.BlobIndex) FlushJob.UpdateOldestBlobFileNumber(meta, it.Value);
                 }
             }
             if (reader.NewRangeTombstoneIterator() is { } rit)
@@ -289,11 +299,10 @@ internal sealed class Repairer
     private void WriteManifest()
     {
         // Column families: default first, then by id.
-        var cfs = new SortedDictionary<uint, string> { [0] = ColumnFamilyDescriptor.DefaultColumnFamilyName };
+        SortedDictionary<uint, string> cfs = _cfNames;
         ulong maxSequence = 0;
         foreach (TableInfo t in _tables)
         {
-            cfs.TryAdd(t.ColumnFamilyId, t.ColumnFamilyName);
             maxSequence = Math.Max(maxSequence, t.Meta.LargestSeqno);
         }
         const ulong manifestNumber = 1;
@@ -347,7 +356,9 @@ internal sealed class Repairer
                     NextFileNumber = _nextFileNumber,
                     ColumnFamily = id,
                 };
-                ulong epoch = 1;
+                // VersionStorageInfo::RecoverEpochNumbers: with allow_ingest_behind the first epoch number is reserved
+                // (kReservedEpochNumberForFileIngestedBehind).
+                ulong epoch = _options.AllowIngestBehind || o.CfAllowIngestBehind ? 2UL : 1UL;
                 foreach (TableInfo t in files)
                 {
                     t.Meta.EpochNumber = epoch++;

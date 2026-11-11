@@ -1270,6 +1270,8 @@ suspicions one by one (tests: `Audit4Closing*Tests.cs`, `Audit4Final*Tests.cs`).
 | Statistics, EVENT_LOG, listeners | `block_fetcher.cc`, `delete_scheduler.cc`, `builder.cc`, `random_access_file_reader.cc`, `event_helpers.cc`, `compaction_job.cc` | Tickers now recorded: block checksum compute / mismatch, compression bypassed / rejected, files deleted immediately / marked trash, memtable payload / garbage at flush, block cache bytes read / insert, last-level and non-last-level reads, NO_FILE_OPENS, NUMBER_ITER_SKIP. table_file_creation is logged with its status for failed and empty outputs; compaction_started carries the placement cutoffs; seqno-to-time mapping text. An obsolete WAL in the DB directory is deleted through the SstFileManager. |
 | Tools, tracing, misc | `ldb_cmd.cc`, `ldb_tool.cc`, `sst_file_dumper.cc`, `louds_trie.cc`, `env_mirror.cc`, `io_tracer.cc`, `db_impl.cc` (CloseHelper) | ldb: per-command option validation, argument and integer parsing, option overrides, idump --count_delim, dump / dump_wal / manifest_dump error handling, blob files in list_live_files_metadata; sst_dump --decode_blob_index; an inconsistent trie block is Corruption; EnvMirror short reads; an unknown IO trace bit is ignored; StartTrace over a running trace; obsolete files are purged at close. |
 
+| RepairDB, obsolete files (last pass) | `db/repair.cc` (ScanTable, AddTables, RepairDB overloads), `DeleteObsoleteFileImpl` | Repair used the default column family's comparator for a table's key range (other comparators: swapped boundaries, missed keys); a table without a column family name is archived; a column family named by a table exists even when that table is archived; descriptors without "default" are InvalidArgument; epoch 1 is reserved with allow_ingest_behind; oldest_blob_file_number is recorded. Orphan table / blob files found by the full scan are deleted through the SstFileManager with event log and listener notification. |
+
 Tickers still not recorded: `number.superversion_acquires` / `releases` (no thread-local super version cache),
 `compaction.total.time.cpu_micros` (no per-thread CPU clock), `non.last.level.seek.*`,
 `block.cache.compression.dict.bytes.insert`; COMPACT_READ_BYTES / COMPACT_WRITE_BYTES / FLUSH_WRITE_BYTES are file
@@ -1330,6 +1332,10 @@ sizes (upstream: the job thread's IOSTATS). `Audit4ClosingToolsCompatTests` comp
   found value).
 - **Best-efforts recovery** opens every table of a candidate version (upstream at most 16 with a finite
   max_open_files).
+- **Backup.** Backup id 0 means "latest" (native: NotFound); `BackupInfo.env_for_open` is not ported (a backup
+  with shared files cannot be opened in place); BackupStatistics and the options dump are not ported.
+- **BackgroundThreadPool** ports the idea of `threadpool_imp.cc` only: no fixed thread limit, no UnSchedule, no
+  reserved / waiting-thread accounting, no priority lowering.
 - Not ported, found by this audit: `MergeOperator::ShouldMerge`, `ReadOptions::merge_operand_count_threshold`,
   `SstFileWriter::PutEntity`, `ReadOptions::auto_refresh_iterator_with_snapshot`,
   `FlushOptions::allow_write_stall` / `CompactRangeOptions::allow_write_stall` (accepted, ignored),
@@ -1359,8 +1365,12 @@ EnvMirror, PlainTable, CuckooTable, trace formats, the trie index (builder, read
 and `sst_dump` tools, EVENT_LOG. Option defaults, ticker / histogram names and perf-context names were diffed by
 script; the most used tickers are compared with native on a deterministic workload.
 
+Also read in the last pass: `backup_engine.cc` from its start, `repair.cc` in full, the deletion tail of
+`PurgeObsoleteFiles`, the rest of `column_family.cc` (sanitization, write-stall conditions, range overlap helpers,
+ColumnFamilySet) and `threadpool_imp.cc`.
+
 Not read against the C++ (previous audits and the compat tests still apply): `AutoHyperClockTable`'s grow / chain
-logic (the port is a behavioural port without chains), `PerKeyPointLockManager` (not ported), the first 940 lines of
-`backup_engine.cc`, `repair.cc` beyond the WAL conversion, `db_impl_files.cc` 760-880, parts of `column_family.cc`
-outside creation / drop / super versions, `BackgroundThreadPool.cs`, the worker-side serialization type info of
-`compaction_service_job.cc`. `RocksDb.Managed.Replication` has no C++ original.
+logic (the port is a behavioural port without chains), `PerKeyPointLockManager` (not ported), the worker-side
+serialization type info of `compaction_service_job.cc`, the restore / verify / garbage-collection bodies of the
+backup engine on the C# side beyond what the earlier slices compared. `RocksDb.Managed.Replication` is a port of
+rocksdb-sharp, which is not in this repository, and was not audited.
