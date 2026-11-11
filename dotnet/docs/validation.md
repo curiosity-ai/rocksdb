@@ -1208,7 +1208,8 @@ A fourth pass over the whole library, split into 17 slices plus follow-up passes
 slice did not reach. Every finding below was proven by a test that failed before the fix; native comparisons use the
 11.12 package. Tests: `tests/RocksDb.Managed.Tests/Validation/Audit4*Tests.cs` (unit) and
 `tests/RocksDb.Managed.CompatTests/Audit4/Audit4*CompatTests.cs` (differential against native), one file per slice.
-`RocksDb.Managed.Replication` (a port of rocksdb-sharp, not of the C++ tree) was not part of the audit.
+`RocksDb.Managed.Replication` (a port of rocksdb-sharp, not of the C++ tree) was reviewed on its own terms; see
+"Coverage of this audit".
 
 ### Fixed
 
@@ -1383,7 +1384,23 @@ Also read in the last pass: `backup_engine.cc` from its start, `repair.cc` in fu
 ColumnFamilySet) and `threadpool_imp.cc`.
 
 Not read against the C++ (previous audits and the compat tests still apply): `AutoHyperClockTable`'s grow / chain
-logic (the port is a behavioural port without chains), `PerKeyPointLockManager` (not ported), the worker-side
-serialization type info of `compaction_service_job.cc`, the restore / verify / garbage-collection bodies of the
-backup engine on the C# side beyond what the earlier slices compared. `RocksDb.Managed.Replication` is a port of
-rocksdb-sharp, which is not in this repository, and was not audited.
+logic (the port is a behavioural port without chains; only the lookup-during-grow path was checked),
+`PerKeyPointLockManager` (not ported), the restore / verify / garbage-collection bodies of the backup engine on the
+C# side beyond what the earlier slices compared.
+
+Not ported, found by the ticker comparison: the compression dictionary is not stored in the block cache, so the
+five `BLOCK_CACHE_COMPRESSION_DICT_*` tickers stay 0.
+
+`RocksDb.Managed.Replication` is a port of rocksdb-sharp, which is not in this repository, so it could not be
+compared with its original. It was reviewed on its own terms instead (Raft persistence and election rules, the
+switchover promise, WAL tailing, snapshot restore, host lifetime). Fixed there, each with a test in
+`tests/RocksDb.Managed.Replication.Tests/Audit4ReplicationTests.cs`:
+
+- The Raft vote / term and the switchover promise are written to disk before they are held in memory.
+- A snapshot restore deletes `CURRENT` first, so an interrupted restore cannot leave an openable half-restored DB.
+- A WAL listing error on the source is surfaced instead of read as "no WAL".
+- A follower that is ahead of its source is rebuilt, not streamed to.
+- Raft progress reports carry their term; a report from an older term is dropped.
+- A source whose WAL is corrupt rebuilds the follower once, not in a loop.
+- `ForcePromote` with a detached database no longer throws `NullReferenceException`; host dispose is bounded; a
+  snapshot whose size does not match its header is refused.

@@ -398,5 +398,9 @@ Still open from this round:
 
 - [x] 17 slices, follow-ups and a closing round against the C++ sources; fixes with regression tests in `tests/RocksDb.Managed.Tests/Validation/Audit4*Tests.cs` and native differentials in `tests/RocksDb.Managed.CompatTests/Audit4/`; no ignored audit test
 - [x] atomic_flush for automatic and manual flushes; file quarantine; sticky errors for WAL, table and blob writers
-- [ ] Tickers not recorded and the IOSTATS-based flush / compaction byte tickers (list in validation.md)
-- [ ] Parts not read against C++ (end of the validation.md section)
+- [x] Flush / compaction byte and CPU tickers match native; MANIFEST edits match native record by record; the primary verifies remote compaction outputs
+- [x] `RocksDb.Managed.Replication` reviewed on its own terms (Raft persistence, switchover promise, restore, resync); fixes in `Audit4ReplicationTests`
+- [x] Iterator cost of the audit's checks removed (docs/perf.md: forward +0.9%, reverse -5.4% against the pre-audit base)
+- [ ] Compression dictionary in the block cache (`BLOCK_CACHE_COMPRESSION_DICT_*` tickers stay 0)
+- [ ] `AutoHyperClockTable` grow / chain logic read line by line against C++
+- [ ] Replication compared with the rocksdb-sharp original (that repository was not available to the audit)
