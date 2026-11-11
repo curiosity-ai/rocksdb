@@ -1648,7 +1648,9 @@ internal sealed partial class DbImpl
             try
             {
                 c = picker.PickCompactionForCompactFiles(vstorage, inputs, outputLevel, (uint)outputPathId, options.OutputFileSizeLimit, options.Compression,
-                    options.OutputTemperatureOverride, options.MaxSubcompactions, options.AllowTrivialMove);
+                    options.OutputTemperatureOverride, options.MaxSubcompactions,
+                    // CompactFilesImpl: no trivial move with a compaction_service (it expects every compaction to go through CompactionJob).
+                    options.AllowTrivialMove && Options.CompactionService is null);
             }
             catch
             {

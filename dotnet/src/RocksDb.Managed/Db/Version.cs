@@ -155,7 +155,7 @@ internal sealed partial class VersionStorageInfo
         changes.Clear();
         foreach ((int level, ulong number) in edit.DeletedFiles)
         {
-            if (level >= levels || level >= NumLevels || IndexOfFile(_files[level], number) < 0) ThrowCannotDelete(level, number);
+            if (level >= levels || level >= NumLevels || IndexOfFile(_files[level], number) < 0) ThrowCannotDelete(level, number, LevelOfFile(number));
             changes[level]++;
         }
         foreach (NewFileEntry nf in edit.NewFiles) changes[nf.Level]++;
@@ -178,7 +178,7 @@ internal sealed partial class VersionStorageInfo
                 {
                     if (level != l) continue;
                     int i = IndexOfFile(scratch.AsSpan(0, n), number);
-                    if (i < 0) ThrowCannotDelete(level, number);
+                    if (i < 0) ThrowCannotDelete(level, number, -1); // deleted twice by this edit
                     Array.Copy(scratch, i + 1, scratch, i, n - i - 1);
                     n--;
                 }
@@ -205,9 +205,21 @@ internal sealed partial class VersionStorageInfo
         return -1;
     }
 
-    private static void ThrowCannotDelete(int level, ulong number) =>
+    /// <summary>The level holding table file <paramref name="number"/>, or -1 (VersionStorageInfo::GetFileLocation).</summary>
+    private int LevelOfFile(ulong number)
+    {
+        for (int l = 0; l < NumLevels; l++)
+        {
+            if (IndexOfFile(_files[l], number) >= 0) return l;
+        }
+        return -1;
+    }
+
+    /// <summary>The Corruption of VersionBuilder::ApplyFileDeletion; <paramref name="currentLevel"/> is -1 for an unknown file.</summary>
+    private static void ThrowCannotDelete(int level, ulong number, int currentLevel) =>
         ThrowHelper.Corruption("VersionBuilder: Cannot delete table file #" + number.ToString(CultureInfo.InvariantCulture) +
-                               " from level " + level.ToString(CultureInfo.InvariantCulture) + " since it is not in the LSM tree");
+                               " from level " + level.ToString(CultureInfo.InvariantCulture) + " since it is " +
+                               (currentLevel < 0 ? "not in the LSM tree" : "on level " + currentLevel.ToString(CultureInfo.InvariantCulture)));
 
     /// <summary>Whether <paramref name="files"/> is already in the order <see cref="ApplyEdit"/> sorts level <paramref name="level"/> into.</summary>
     private bool IsSortedForLevel(int level, FileMetaData[] files)
@@ -256,8 +268,12 @@ internal sealed partial class VersionStorageInfo
         if (levels.Count > 0)
         {
             FileMetaData[] l0 = levels[0];
+            // VersionStorageInfo::HasMissingEpochNumber looks at the files of every level.
             bool epochMightMiss = false;
-            foreach (FileMetaData f in l0) epochMightMiss |= f.EpochNumber == FileMetaData.UnknownEpochNumber;
+            foreach (FileMetaData[] lf in levels)
+            {
+                foreach (FileMetaData f in lf) epochMightMiss |= f.EpochNumber == FileMetaData.UnknownEpochNumber;
+            }
             for (int i = 1; i < l0.Length; i++)
             {
                 FileMetaData lhs = l0[i - 1], rhs = l0[i];

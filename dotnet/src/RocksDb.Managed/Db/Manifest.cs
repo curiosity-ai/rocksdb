@@ -461,12 +461,17 @@ public sealed class ManifestReplayer
     private void SortLevels(ColumnFamilyVersion cf)
     {
         Comparator ucmp = (cf.ComparatorName is not null ? _comparatorResolver?.Invoke(cf.ComparatorName) : null) ?? Comparator.Bytewise;
+        // VersionBuilder::SaveSSTFilesTo: while some file of the column family has no epoch number
+        // (EpochNumberRequirement::kMightMissing is not promoted), L0 is ordered by NewestFirstBySeqNo only.
+        bool epochMightMiss = false;
+        foreach ((_, FileMetaData f) in cf.AllFiles()) epochMightMiss |= f.EpochNumber == FileMetaData.UnknownEpochNumber;
         for (int level = 0; level < cf.NumLevels; level++)
         {
             List<FileMetaData> files = cf.MutableLevel(level);
             if (level == 0)
             {
-                files.Sort(static (a, b) => CompareNewestFirst(a, b)); // NewestFirstByEpochNumber
+                if (epochMightMiss) files.Sort(static (a, b) => CompareNewestFirstBySeqNo(a, b));
+                else files.Sort(static (a, b) => CompareNewestFirst(a, b)); // NewestFirstByEpochNumber
             }
             else
             {
@@ -482,6 +487,12 @@ public sealed class ManifestReplayer
     internal static int CompareNewestFirst(FileMetaData a, FileMetaData b)
     {
         if (a.EpochNumber != b.EpochNumber) return b.EpochNumber.CompareTo(a.EpochNumber);
+        return CompareNewestFirstBySeqNo(a, b);
+    }
+
+    /// <summary>NewestFirstBySeqNo (db/version_set.h).</summary>
+    internal static int CompareNewestFirstBySeqNo(FileMetaData a, FileMetaData b)
+    {
         if (a.LargestSeqno != b.LargestSeqno) return b.LargestSeqno.CompareTo(a.LargestSeqno);
         if (a.SmallestSeqno != b.SmallestSeqno) return b.SmallestSeqno.CompareTo(a.SmallestSeqno);
         return b.FileNumber.CompareTo(a.FileNumber);
