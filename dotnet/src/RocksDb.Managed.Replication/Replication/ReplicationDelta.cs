@@ -203,7 +203,8 @@ public static class ReplicationDelta
     /// directory) and every top-level file that is not reused is deleted, so files absent from the source - stale SSTs,
     /// the old MANIFEST/CURRENT, divergent WALs - cannot leak into the restored database. Entries named in
     /// <paramref name="preserveNames"/> (e.g. the directory holding Raft or role state) are kept regardless.
-    /// Creates <paramref name="dbPath"/> if missing.
+    /// Creates <paramref name="dbPath"/> if missing. CURRENT is deleted before anything else, so an interrupted call never
+    /// leaves a directory that still opens as a database with files missing.
     /// </summary>
     public static void PrepareForRestore(IFileSystem fileSystem, string dbPath, IEnumerable<string> filesToReuse, IEnumerable<string> preserveNames)
     {
@@ -211,6 +212,16 @@ public static class ReplicationDelta
         var keep = new HashSet<string>(filesToReuse ?? [], StringComparer.Ordinal);
         var preserve = new HashSet<string>(preserveNames ?? [], StringComparer.OrdinalIgnoreCase);
         fileSystem.CreateDirectoryIfMissing(dbPath);
+        // CURRENT goes first (and durably): it is what marks the directory as an openable database. Deleting in listing
+        // order could remove WALs or tables before it, and a process killed in between would restart on a database that
+        // opens but lost part of its log - for a Raft node, entries it had acknowledged and would then vote without.
+        const string CurrentFileName = "CURRENT";
+        string currentPath = FileSystemHelpers.Combine(dbPath, CurrentFileName);
+        if (!keep.Contains(CurrentFileName) && !preserve.Contains(CurrentFileName) && fileSystem.FileExists(currentPath))
+        {
+            fileSystem.DeleteFile(currentPath);
+            fileSystem.SyncDirectory(dbPath);
+        }
         foreach (string name in fileSystem.GetChildren(dbPath))
         {
             if (preserve.Contains(name)) continue;

@@ -129,11 +129,13 @@ public sealed class ReplicationRoleState
         lock (_gate)
         {
             if (epoch < _epoch) throw new InvalidOperationException("epoch may not go backwards (" + _epoch + " -> " + epoch + ")");
+            // Durable first (here and below): a role, epoch or promise this node acts on must survive a restart, so the
+            // in-memory state only changes once the write succeeded.
+            FileSystemHelpers.AtomicWrite(_fs, _statePath, SerializeState(epoch, role, primaryId, handoffTarget, _promisedEpoch));
             _epoch = epoch;
             _role = role;
             _primaryId = primaryId;
             _handoffTarget = handoffTarget;
-            Persist();
         }
     }
 
@@ -146,8 +148,8 @@ public sealed class ReplicationRoleState
         lock (_gate)
         {
             if (epoch <= Math.Max(_epoch, _promisedEpoch)) return false;
+            FileSystemHelpers.AtomicWrite(_fs, _statePath, SerializeState(_epoch, _role, _primaryId, _handoffTarget, epoch));
             _promisedEpoch = epoch;
-            Persist();
             return true;
         }
     }
@@ -163,8 +165,9 @@ public sealed class ReplicationRoleState
     {
         lock (_gate)
         {
-            _epochs = WithEpochStart(startSeq, epoch);
-            FileSystemHelpers.AtomicWrite(_fs, _epochsPath, _epochs.Serialize());
+            RaftLogTerms epochs = WithEpochStart(startSeq, epoch);
+            FileSystemHelpers.AtomicWrite(_fs, _epochsPath, epochs.Serialize());
+            _epochs = epochs;
         }
     }
 
@@ -179,12 +182,13 @@ public sealed class ReplicationRoleState
         {
             if (epoch < _epoch) throw new InvalidOperationException("epoch may not go backwards (" + _epoch + " -> " + epoch + ")");
             RaftLogTerms epochs = WithEpochStart(startSeq, epoch);
+            FileSystemHelpers.AtomicWriteBoth(_fs, _epochsPath, epochs.Serialize(), _statePath,
+                SerializeState(epoch, ReplicationRole.Primary, nodeId, null, _promisedEpoch));
             _epochs = epochs;
             _epoch = epoch;
             _role = ReplicationRole.Primary;
             _primaryId = nodeId;
             _handoffTarget = null;
-            FileSystemHelpers.AtomicWriteBoth(_fs, _epochsPath, _epochs.Serialize(), _statePath, SerializeState());
         }
     }
 
@@ -219,21 +223,20 @@ public sealed class ReplicationRoleState
     {
         lock (_gate)
         {
-            _epochs = RaftLogTerms.Deserialize(serialized);
-            FileSystemHelpers.AtomicWrite(_fs, _epochsPath, _epochs.Serialize());
+            RaftLogTerms epochs = RaftLogTerms.Deserialize(serialized);
+            FileSystemHelpers.AtomicWrite(_fs, _epochsPath, epochs.Serialize());
+            _epochs = epochs;
         }
     }
 
-    private void Persist() => FileSystemHelpers.AtomicWrite(_fs, _statePath, SerializeState());
-
-    private string SerializeState()
+    private static string SerializeState(long epoch, ReplicationRole role, string? primaryId, string? handoffTarget, long promisedEpoch)
     {
         var sb = new StringBuilder();
-        sb.Append(_epoch.ToString(CultureInfo.InvariantCulture)).Append('\n');
-        sb.Append(((int)_role).ToString(CultureInfo.InvariantCulture)).Append('\n');
-        sb.Append(_primaryId ?? string.Empty).Append('\n');
-        sb.Append(_handoffTarget ?? string.Empty).Append('\n');
-        sb.Append(_promisedEpoch.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append(epoch.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append(((int)role).ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append(primaryId ?? string.Empty).Append('\n');
+        sb.Append(handoffTarget ?? string.Empty).Append('\n');
+        sb.Append(promisedEpoch.ToString(CultureInfo.InvariantCulture)).Append('\n');
         return sb.ToString();
     }
 

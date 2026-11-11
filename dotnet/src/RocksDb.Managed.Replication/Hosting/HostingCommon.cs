@@ -59,7 +59,8 @@ public static class WalStreamSender
     /// is cancelled (e.g. the node stopped leading) or the database closes. <paramref name="tag"/> is asked before every
     /// chunk for the (source id, term) to stamp on it, and ends the stream by returning false.
     /// <paramref name="entryTerm"/> maps a sequence number to its term. When the WAL for <paramref name="startSequence"/>
-    /// is gone, a single <see cref="WalStreamMessage.Resync"/> message ends the stream.
+    /// is gone, or <paramref name="startSequence"/> is past the end of this database's log (the follower holds entries
+    /// this database never wrote), a single <see cref="WalStreamMessage.Resync"/> message ends the stream.
     /// </summary>
     public static async IAsyncEnumerable<WalStreamMessage> StreamAsync(RocksDatabase db, ulong startSequence, StreamTagProvider tag,
         Func<ulong, long> entryTerm, int maxChunkBytes, [EnumeratorCancellation] CancellationToken cancellationToken)
@@ -67,6 +68,19 @@ public static class WalStreamSender
         ArgumentNullException.ThrowIfNull(db);
         ArgumentNullException.ThrowIfNull(tag);
         ArgumentNullException.ThrowIfNull(entryTerm);
+        // A follower that asks for entries past the end of this log holds entries this node never wrote: its log is not
+        // a prefix of ours. Waiting until our log grows to that point would then stream our entries on top of its
+        // unrelated ones (same sequence numbers, different history), so tell it to rebuild instead.
+        ulong latest = db.GetLatestSequenceNumber();
+        if (startSequence > latest + 1)
+        {
+            if (tag(out string id, out long t))
+            {
+                yield return WalStreamMessage.Resync(id, t,
+                    "the follower asks for sequence " + startSequence + " but the source log ends at " + latest + ": the logs diverged");
+            }
+            yield break;
+        }
         using WalTailer tailer = new ReplicationSource(db).TailWal(startSequence, maxChunkBytes);
         while (!cancellationToken.IsCancellationRequested)
         {

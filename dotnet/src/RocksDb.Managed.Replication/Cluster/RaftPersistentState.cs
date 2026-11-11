@@ -11,6 +11,7 @@ namespace RocksDb.Managed.Cluster;
 /// <para>
 /// Everything is written through a temp file that is fsync'd and renamed over the target (and the directory fsync'd),
 /// so a crash mid-write cannot corrupt the state and an acknowledged vote/term is never rolled back by power loss.
+/// The in-memory term, vote and mode change only after that write succeeded.
 /// Managed difference: the files go through an <see cref="IFileSystem"/> (e.g. the database's), not System.IO.
 /// </para>
 /// </summary>
@@ -69,8 +70,8 @@ public sealed class RaftPersistentState
     {
         lock (_gate)
         {
+            Persist(_currentTerm, _votedFor, (int)mode);
             Volatile.Write(ref _mode, (int)mode);
-            Persist();
         }
     }
 
@@ -82,20 +83,27 @@ public sealed class RaftPersistentState
     {
         lock (_gate)
         {
-            if (newTerm > _currentTerm)
+            long term = _currentTerm;
+            string? votedFor = _votedFor;
+            if (newTerm > term)
             {
-                Interlocked.Exchange(ref _currentTerm, newTerm);
-                _votedFor = newVotedFor;
+                term = newTerm;
+                votedFor = newVotedFor;
             }
-            else if (newTerm == _currentTerm && newVotedFor != null && _votedFor == null)
+            else if (newTerm == term && newVotedFor != null && votedFor == null)
             {
-                _votedFor = newVotedFor;
+                votedFor = newVotedFor;
             }
             else
             {
                 return;
             }
-            Persist();
+            // Durable first: if the write fails nothing changes in memory either, so a term or vote this node acts on
+            // (answers an RPC with) is always one it will still hold after a restart. Updating memory first would let a
+            // retried RequestVote be granted from memory without ever reaching the disk.
+            Persist(term, votedFor, _mode);
+            Interlocked.Exchange(ref _currentTerm, term);
+            _votedFor = votedFor;
         }
     }
 
@@ -144,12 +152,12 @@ public sealed class RaftPersistentState
         }
     }
 
-    private void Persist()
+    private void Persist(long currentTerm, string? votedFor, int mode)
     {
         var sb = new StringBuilder();
-        sb.Append(_currentTerm.ToString(CultureInfo.InvariantCulture)).Append('\n');
-        sb.Append(_votedFor ?? string.Empty).Append('\n');
-        sb.Append(_mode.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append(currentTerm.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append(votedFor ?? string.Empty).Append('\n');
+        sb.Append(mode.ToString(CultureInfo.InvariantCulture)).Append('\n');
         FileSystemHelpers.AtomicWrite(_fs, _statePath, sb.ToString());
     }
 
