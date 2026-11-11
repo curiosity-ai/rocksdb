@@ -233,11 +233,17 @@ internal sealed class ErrorHandler
             // nothing). Managed extension kept: OnErrorRecoveryBegin can still veto the automatic recovery (upstream
             // ignores the listeners' auto_recovery here and always calls StartRecoverFromRetryableBGIOError).
             NotifyOnBackgroundError(reason, retryable, autoResumeEnabled, out bool autoRecovery);
+            RocksDbException? current;
+            bool recoveryEndedByShutdown = false;
             lock (_db.Mutex)
             {
-                if (autoRecovery) StartRecoverFromRetryableBgIoError();
-                return _bgError;
+                if (autoRecovery) recoveryEndedByShutdown = StartRecoverFromRetryableBgIoError();
+                current = _bgError;
             }
+            // StartRecoverFromRetryableBGIOError with end_recovery_ set: the listeners are still told that the recovery
+            // of this error ended with ShutdownInProgress (error_handler.cc).
+            if (recoveryEndedByShutdown && current is not null) NotifyOnErrorRecoveryEnd(current, ShutdownStatus());
+            return current;
         }
         return HandleKnownErrors(err, reason, walRelated);
     }
@@ -383,7 +389,17 @@ internal sealed class ErrorHandler
             if (cleared is not null) NotifyOnErrorRecoveryEnd(cleared, null);
             return null;
         }
-        RocksDbException? s = await _db.ResumeImplAsync().ConfigureAwait(false);
+        RocksDbException? s;
+        try
+        {
+            s = await _db.ResumeImplAsync().ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            // A failure thrown by the resume is its status: recovery_in_prog_ must not stay set (a later Resume would
+            // be refused with Busy forever).
+            s = RocksDbException.FromException(e);
+        }
         lock (_db.Mutex)
         {
             if (s is not null) _softErrorNoBgWork = softNoBgWorkOnEntry;
@@ -396,12 +412,16 @@ internal sealed class ErrorHandler
         return s;
     }
 
-    /// <summary>Port of StartRecoverFromRetryableBGIOError. REQUIRES: mutex.</summary>
-    private void StartRecoverFromRetryableBgIoError()
+    /// <summary>
+    /// Port of StartRecoverFromRetryableBGIOError. Returns true when no recovery is started because recovery was ended
+    /// for shutdown (end_recovery_): the caller then reports OnErrorRecoveryEnd(bg_error, ShutdownInProgress) outside
+    /// the mutex. REQUIRES: mutex.
+    /// </summary>
+    private bool StartRecoverFromRetryableBgIoError()
     {
-        if (_bgError is null) return;
-        if (_db.Options.MaxBgErrorResumeCount <= 0 || _recoveryInProgress) return;
-        if (_endRecovery) return;
+        if (_bgError is null) return false;
+        if (_db.Options.MaxBgErrorResumeCount <= 0 || _recoveryInProgress) return false;
+        if (_endRecovery) return true;
         _db.Stats?.RecordTick(Ticker.ErrorHandlerAutoresumeCount);
         _db.LogInfo("ErrorHandler: Call StartRecoverFromRetryableBGIOError to resume");
         // Set in the same lock hold as the error, otherwise intervening writes could see an error without a recovery.
@@ -413,6 +433,7 @@ internal sealed class ErrorHandler
             catch (Exception e) when (e is RocksDbException or IOException or ObjectDisposedException or OperationCanceledException) { }
             await RecoverFromRetryableBgIoErrorAsync().ConfigureAwait(false);
         });
+        return false;
     }
 
     /// <summary>Port of ErrorHandler::RecoverFromRetryableBGIOError (the automatic recovery loop).</summary>
@@ -465,8 +486,8 @@ internal sealed class ErrorHandler
                 NotifyOnErrorRecoveryEnd(bg ?? oldError!, bg ?? s);
                 return;
             }
-            if (recoveryError is not null && recoveryError.Severity <= ErrorSeverity.HardError &&
-                (recoveryError.Retryable || recoveryError.Scope == IOErrorScope.File))
+            // recovery_error_.GetRetryable() only: a file-scoped error that is not retryable ends the recovery.
+            if (recoveryError is not null && recoveryError.Severity <= ErrorSeverity.HardError && recoveryError.Retryable)
             {
                 // A new retryable error happened during the recovery: wait and retry.
                 TestHooks.Invoke("RecoverFromRetryableBGIOError:BeforeWait");

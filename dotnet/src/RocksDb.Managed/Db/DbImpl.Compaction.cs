@@ -498,7 +498,15 @@ internal sealed partial class DbImpl
             ulong[] snapshots = SnapshotsForCompaction();
             Compaction? c = cfd.CompactionState.Picker.PickCompaction(cfd.Current.Storage, snapshots);
             if (c is null) continue;
-            if (!EnoughRoomForCompaction(cfd, c)) continue;
+            if (!EnoughRoomForCompaction(cfd, c))
+            {
+                // BackgroundCompaction: the files were released, so the score takes them into account again and the
+                // column family goes back into the queue (picked again at the next scheduling round; upstream retries
+                // after BackgroundCallCompaction's one-second pause).
+                cfd.Current.Storage.ComputeCompactionScore();
+                SchedulePendingCompaction(cfd);
+                continue;
+            }
             if (ShouldForwardToBottomPriorityPool(cfd, c))
             {
                 ForwardToBottomPriorityPool(cfd, c, snapshots);
@@ -1842,9 +1850,12 @@ internal sealed partial class DbImpl
             Task wait;
             lock (_mutex)
             {
-                if (IsBgWorkStopped && ErrorHandler.BgError is { } e) ThrowBackgroundError(e);
+                // DBImpl::WaitForCompact (default options): ShutdownInProgress once shutdown began; a background error
+                // of any severity (also a soft one, also while jobs still run) ends the wait and is returned.
+                if (_shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
+                if (ErrorHandler.BgError is { } e) ThrowBackgroundError(e);
                 bool pending = false;
-                if (_compactionsEnabled && !_shuttingDown)
+                if (_compactionsEnabled)
                 {
                     foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
                     {
@@ -1858,7 +1869,6 @@ internal sealed partial class DbImpl
                     // Pending work that cannot be scheduled (e.g. picker found nothing to do).
                     return;
                 }
-                if (_shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
                 wait = _bgSignal.Task;
             }
             if (synchronous) wait.Wait(cancellationToken);
