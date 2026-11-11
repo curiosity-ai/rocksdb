@@ -88,7 +88,10 @@ internal sealed partial class DbImpl
             // table files, per batch) and stops with Aborted once a finished batch left the values above the limit, so
             // which keys are returned and which are Aborted depends on the batches. Without a limit the batches are not
             // observable and all keys are looked up together.
-            int batchSize = softLimit != ulong.MaxValue ? MultiGetMaxBatchSize : n;
+            // The same goes for ReadOptions::deadline, checked before each batch: the keys of the batches not started
+            // when it passes are TimedOut, wherever their values are.
+            bool hasDeadline = options is not null && options.Deadline > TimeSpan.Zero;
+            int batchSize = softLimit != ulong.MaxValue || hasDeadline ? MultiGetMaxBatchSize : n;
             for (int start = 0; start < n; start += batchSize)
             {
                 int len = Math.Min(batchSize, n - start);
@@ -99,28 +102,36 @@ internal sealed partial class DbImpl
                         for (int j = start; j < n; j++) batch.SetAborted(order[j]);
                         break;
                     }
+                    TestHooks.Invoke("DBImpl::MultiGetImpl:BeforeBatch");
+                    if (hasDeadline && ReadDeadline.IsExceeded(options))
+                    {
+                        for (int j = start; j < n; j++) batch.SetTimedOut(order[j]);
+                        break;
+                    }
                     // The front of `order` (the pending keys of the batches before) is free again.
                     Array.Copy(order, start, order, 0, len);
                 }
-                // Memtables (MultiGetImpl: per key, newest memtable first). Keys still pending stay in sorted order.
+                // Memtables. Keys still pending stay in sorted order.
                 int pending = 0;
-                for (int i = 0; i < len; i++)
+                if (softLimit != ulong.MaxValue && !skipMemTables)
                 {
-                    int k = order[i];
-                    if (!skipMemTables && GetFromMemTables(sv, batch.UserKey(k), snapshot, batch.Context(k)))
+                    // MultiGetImpl with a limit: mem->MultiGet for all keys of the batch, then each immutable memtable
+                    // (MemTableListVersion::MultiGet), so the values are counted memtable by memtable.
+                    pending = MultiGetFromMemTablesWithSoftLimit(sv, batch, order, len, snapshot, st, ref valueSize, softLimit);
+                }
+                else
+                {
+                    // Without a limit the order is not observable: per key, newest memtable first.
+                    for (int i = 0; i < len; i++)
                     {
-                        st?.RecordTick(Ticker.MemtableHit); // MemTable::MultiGet, per key it finished
-                        if (softLimit != ulong.MaxValue && AddValueSize(batch, k, ref valueSize, softLimit))
+                        int k = order[i];
+                        if (!skipMemTables && GetFromMemTables(sv, batch.UserKey(k), snapshot, batch.Context(k)))
                         {
-                            // MemTable::MultiGet: every key still in the range is Aborted.
-                            for (int j = i + 1; j < len; j++) batch.SetAborted(order[j]);
-                            for (int j = 0; j < pending; j++) batch.SetAborted(order[j]);
-                            pending = 0;
-                            break;
+                            st?.RecordTick(Ticker.MemtableHit); // MemTable::MultiGet, per key it finished
+                            continue;
                         }
-                        continue;
+                        order[pending++] = k;
                     }
-                    order[pending++] = k;
                 }
                 // DBImpl::MultiGetImpl: the keys the memtables left for the table files.
                 if (!skipMemTables && pending > 0) st?.RecordTick(Ticker.MemtableMiss, (ulong)pending);
@@ -232,6 +243,53 @@ internal sealed partial class DbImpl
             ReadDeadline.Exit(deadlineToken);
             ReturnAndCleanupSuperVersion(cfd, sv, svSlot);
         }
+    }
+
+    /// <summary>
+    /// The memtable part of MultiGetImpl under value_size_soft_limit for the keys order[0..count): the active memtable
+    /// for every key, then each immutable memtable for the keys left (db_impl_sync_and_async.h:592-598). Once a found
+    /// value takes the total above the limit every key of the batch not done yet is Aborted (MemTable::MultiGet,
+    /// db/memtable.cc:1960-1966). Returns the number of keys left for the table files, compacted to the front of
+    /// <paramref name="order"/>.
+    /// </summary>
+    [SkipLocalsInit]
+    private static int MultiGetFromMemTablesWithSoftLimit(SuperVersion sv, MultiGetBatch batch, int[] order, int count, ulong snapshot, Statistics? st,
+        ref ulong valueSize, ulong softLimit)
+    {
+        Span<byte> scratch = stackalloc byte[LookupKey.StackBufferSize];
+        MemTable[] imm = sv.Imm;
+        int pending = count;
+        for (int m = -1; m < imm.Length && pending > 0; m++)
+        {
+            MemTable mem = m < 0 ? sv.Mem : imm[m];
+            for (int i = 0; i < pending; i++)
+            {
+                int k = order[i];
+                GetContext ctx = batch.Context(k);
+                var lkey = new LookupKey(batch.UserKey(k), snapshot, scratch);
+                bool done;
+                try
+                {
+                    PerfContext.Add(PerfMetric.GetFromMemtableCount, 1);
+                    MemTableGetResult r = mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq,
+                        null, ctx.Callback, ctx.IgnoreRangeDeletions);
+                    done = ctx.ApplyMemTableResult(r, v, t);
+                }
+                finally
+                {
+                    lkey.Dispose();
+                }
+                if (!done) continue;
+                st?.RecordTick(Ticker.MemtableHit);
+                if (AddValueSize(batch, k, ref valueSize, softLimit))
+                {
+                    AbortPending(batch, order, pending);
+                    return 0;
+                }
+            }
+            pending = RemoveDone(batch, order, pending);
+        }
+        return pending;
     }
 
     /// <summary>MultiGetContext::MAX_BATCH_SIZE (table/multiget_context.h).</summary>

@@ -1023,16 +1023,24 @@ internal sealed class ExternalSstFileIngestionJob
                 FileChecksumFuncName = f.FileChecksumFuncName,
                 Temperature = f.Temperature,
             };
-            if (f.DbId.Length > 0 && f.DbSessionId.Length > 0)
-            {
-                // GetSstInternalUniqueId(db_id, db_session_id, orig_file_number)
-                Cache.OffsetableCacheKey.GetSstInternalUniqueId(f.DbId, f.DbSessionId, f.OrigFileNumber, out ulong id0, out ulong id1);
-                meta.UniqueId = new UniqueId64x2(id0, id1);
-            }
+            meta.UniqueId = IngestedFileUniqueId(f.DbId, f.DbSessionId, f.OrigFileNumber);
             edit.AddFile(f.PickedLevel, meta);
             batchUppermostLevel = Math.Min(batchUppermostLevel, f.PickedLevel);
         }
         return batchUppermostLevel;
+    }
+
+    /// <summary>
+    /// The unique id recorded for an ingested file (GetIngestedFileInfo): GetSstInternalUniqueId without force, so a
+    /// missing db id, a missing or malformed session id or a zero original file number (NotSupported upstream, "Failed
+    /// to get SST unique id") leave it null.
+    /// </summary>
+    internal static UniqueId64x2 IngestedFileUniqueId(string dbId, string dbSessionId, ulong origFileNumber)
+    {
+        if (dbId.Length == 0 || origFileNumber == 0 || dbSessionId.Length == 0) return UniqueId64x2.Null;
+        if (!Cache.OffsetableCacheKey.TryDecodeSessionId(dbSessionId, out _, out _)) return UniqueId64x2.Null;
+        Cache.OffsetableCacheKey.GetSstInternalUniqueId(dbId, dbSessionId, origFileNumber, out ulong id0, out ulong id1);
+        return new UniqueId64x2(id0, id1);
     }
 
     /// <summary>Port of ExternalSstFileIngestionJob::AssignLevelAndSeqnoForIngestedFile. Returns the assigned seqno.</summary>

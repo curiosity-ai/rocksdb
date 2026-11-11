@@ -264,7 +264,8 @@ internal sealed class PointLockManager : LockManager
             // expired and we were never signaled).
             if (endTime > 0 && NowMicros() >= endTime) timedOut = true;
         }
-        if (result is not null) txn.SetWaitingTxn(waitIds, cf, key); // persist the lock information for debugging
+        // On timeout, persist the lock information so we can debug the contention (not for a lock limit failure).
+        if (result is { Code: StatusCode.TimedOut }) txn.SetWaitingTxn(waitIds, cf, key);
         return result;
     }
 

@@ -202,7 +202,10 @@ internal sealed class BackupMeta
         while (li < lines.Count)
         {
             line = lines[li++];
+            // StringSplit (util/string_util.cc, std::getline): no component after a trailing delimiter, none for "".
             string[] components = line.Split(' ');
+            if (components[^1].Length == 0) components = components[..^1];
+            if (components.Length < 1) ThrowHelper.Corruption("Empty line instead of file entry.");
             if (schemaMajorVersion >= 2 && components.Length == 2 && line == FooterMarker)
             {
                 footerPresent = true;

@@ -104,6 +104,13 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
+    /// time_to_check of WalManager::PurgeObsoleteWALFiles: min(kDefaultIntervalToDeleteObsoleteWAL, max(1, ttl / 2))
+    /// seconds with WAL_ttl_seconds, else kDefaultIntervalToDeleteObsoleteWAL (600).
+    /// </summary>
+    internal static long WalPurgeIntervalSeconds(ulong walTtlSeconds) =>
+        walTtlSeconds > 0 ? (long)Math.Min((ulong)DefaultIntervalToDeleteObsoleteWal, Math.Max(1UL, walTtlSeconds / 2)) : DefaultIntervalToDeleteObsoleteWal;
+
+    /// <summary>
     /// Port of WalManager::PurgeObsoleteWALFiles: deletes archived WALs older than WAL_ttl_seconds and, with
     /// WAL_size_limit_MB, the oldest archived WALs beyond the size budget. Runs at most every
     /// min(600s, max(1s, ttl/2)) unless <paramref name="force"/>.
@@ -114,7 +121,7 @@ internal sealed partial class DbImpl
         bool sizeLimitEnabled = Options.WalSizeLimitMb > 0;
         if (!ttlEnabled && !sizeLimitEnabled) return;
         long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        long timeToCheck = ttlEnabled ? (long)Math.Min((ulong)DefaultIntervalToDeleteObsoleteWal, Math.Max(1UL, Options.WalTtlSeconds / 2)) : DefaultIntervalToDeleteObsoleteWal;
+        long timeToCheck = WalPurgeIntervalSeconds(Options.WalTtlSeconds);
         lock (_mutex)
         {
             if (FileDeletionsDisabled) return;

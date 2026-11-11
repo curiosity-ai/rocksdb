@@ -565,13 +565,21 @@ public class BackupEngineReadOnly : IDisposable
             ulong size;
             try { size = (ulong)_dbFs.GetFileSize(path); }
             catch (Exception e) when (e is IOException or RocksDbException) { continue; }
-            if (size != bf.Size) continue;
             if (mode == RestoreMode.KeepLatestDbSessionIdFiles)
             {
-                if (bf.DbSessionId.Length > 0 && TryGetFileDbIdentities(_dbFs, path, out _, out string sid) && sid == bf.DbSessionId) keep.Add(number);
+                // The existing file is kept only when the backup file has exactly the shared_checksum name the existing
+                // file would get (GenerateSharedFileWithDbSessionIdAndSize: <number>_s<session id>_<size>.sst).
+                if (!TryGetFileDbIdentities(_dbFs, path, out _, out string sid)) continue;
+                int dot = child.LastIndexOf('.');
+                string shared = "shared_checksum/" + child[..dot] + "_s" + sid + "_" + size.ToString(System.Globalization.CultureInfo.InvariantCulture) + child[dot..];
+                if (bf.Filename == shared) keep.Add(number);
             }
             else
             {
+                // "Existing file is not present in the backup": same number under another name (000012.ldb, or a blob
+                // file against a table file).
+                if (bf.GetDbFileName() != child) continue;
+                if (size != bf.Size) continue;
                 uint expected = bf.Crc32c ?? await ComputeChecksumAsync(entry.From._backupFs, entry.From.GetAbsolutePath(bf.Filename), 0,
                     _options.RestoreRateLimiter, synchronous, ct).ConfigureAwait(false);
                 uint actual = await ComputeChecksumAsync(_dbFs, path, 0, _options.RestoreRateLimiter, synchronous, ct).ConfigureAwait(false);

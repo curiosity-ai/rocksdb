@@ -282,7 +282,7 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     }
 
     /// <summary>RollbackWriteBatchBuilder of RollbackRecoveredTransaction (always Delete, no SingleDelete callback).</summary>
-    private struct RecoveredRollbackBuilder(DbImpl db, WriteBatch dst, ReadCallback callback, bool rollbackMergeOperands) : IWriteBatchHandler
+    internal struct RecoveredRollbackBuilder(DbImpl db, WriteBatch dst, ReadCallback callback, bool rollbackMergeOperands) : IWriteBatchHandler
     {
         private RollbackKeySet? _keys;
 
@@ -308,7 +308,9 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
         public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) => Rollback(columnFamilyId, key);
         public void Delete(uint columnFamilyId, ReadOnlySpan<byte> key) => Rollback(columnFamilyId, key);
         public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key) => Rollback(columnFamilyId, key);
-        public readonly void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) { }
+        // WriteBatch::Handler::DeleteRangeCF is not overridden by the rollback handler: the recovery fails.
+        public readonly void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) =>
+            ThrowHelper.InvalidArgument("DeleteRangeCF not implemented");
         public void Merge(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
         {
             if (rollbackMergeOperands) Rollback(columnFamilyId, key);
