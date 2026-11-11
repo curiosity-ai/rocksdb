@@ -1456,7 +1456,8 @@ public sealed partial class BlockBasedTableReader : TableReader
         // Hmm. Let's just split in half to avoid skewing one way or another, since we don't know whether we're
         // operating on lower bound or upper bound.
         if (dataSize == 0) return (ulong)FileSize / 2;
-        ulong offset = ApproximateDataOffsetOf(internalKey, dataSize);
+        // An index iterator error: split in half as well.
+        if (!TryApproximateDataOffsetOf(internalKey, dataSize, out ulong offset)) return (ulong)FileSize / 2;
         // Pro-rate file metadata (incl filters) size-proportionally across data blocks.
         double sizeRatio = (double)offset / dataSize;
         return (ulong)(sizeRatio * FileSize);
@@ -1468,8 +1469,9 @@ public sealed partial class BlockBasedTableReader : TableReader
         ulong dataSize = Properties.DataSize;
         // Hmm. Assume whole file is involved, since we have lower and upper bound.
         if (dataSize == 0) return (ulong)FileSize;
-        ulong startOffset = ApproximateDataOffsetOf(startInternalKey, dataSize);
-        ulong endOffset = ApproximateDataOffsetOf(endInternalKey, dataSize);
+        // An index iterator error: assume the file is involved from the start / until the end.
+        if (!TryApproximateDataOffsetOf(startInternalKey, dataSize, out ulong startOffset)) startOffset = 0;
+        if (!TryApproximateDataOffsetOf(endInternalKey, dataSize, out ulong endOffset)) endOffset = dataSize;
         double sizeRatio = (double)(endOffset - Math.Min(startOffset, endOffset)) / dataSize;
         return (ulong)(sizeRatio * FileSize);
     }
@@ -1545,13 +1547,20 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
     }
 
-    private ulong ApproximateDataOffsetOf(ReadOnlySpan<byte> internalKey, ulong dataSize)
+    // False when the index seek failed (index_iter->status() not ok upstream: an unreadable index partition).
+    private bool TryApproximateDataOffsetOf(ReadOnlySpan<byte> internalKey, ulong dataSize, out ulong offset)
     {
         IndexCursor cursor = IndexCursor.Rent(this, TableReadFlags.DontFillCache);
         try
         {
             cursor.Seek(internalKey);
-            return cursor.Valid ? cursor.Handle.Offset : dataSize;
+            offset = cursor.Valid ? cursor.Handle.Offset : dataSize;
+            return true;
+        }
+        catch (RocksDbException)
+        {
+            offset = 0;
+            return false;
         }
         finally
         {
@@ -1664,7 +1673,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         ReadOnlySpan<byte> upperBoundXform = pe.Transform(upperBound);
         Comparator ucmp = _icmp.UserComparator;
         // first check if user_key and upper_bound all share the same prefix
-        if (ucmp.Compare(prefix, upperBoundXform) != 0)
+        if (ucmp.CompareWithoutTimestamp(prefix, false, upperBoundXform, false) != 0)
         {
             // second check if user_key's prefix is the immediate predecessor of upper_bound and have the same length. If
             // so, we know for sure all keys in the range [user_key, upper_bound) share the same prefix. Also need to make

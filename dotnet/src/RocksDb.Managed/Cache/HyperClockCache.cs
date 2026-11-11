@@ -1137,7 +1137,11 @@ internal sealed class ClockShard
             if (h is null) continue;
             ulong meta = h.LoadMeta();
             if ((ClockSlot.State(meta) & ClockSlot.StateShareableBit) != 0 && ClockSlot.Refcount(meta) > 0)
+            {
                 pinned += h.TotalCharge;
+                // ClockCacheShard::GetPinnedUsage: with full metadata charging a pinned entry also pins its slot.
+                if (_policy == CacheMetadataChargePolicy.FullCharge) pinned += HyperClockCache.SlotMetadataCharge;
+            }
         }
         return pinned + Volatile.Read(ref _standaloneUsage);
     }
