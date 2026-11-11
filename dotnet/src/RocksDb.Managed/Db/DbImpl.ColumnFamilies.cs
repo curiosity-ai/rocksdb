@@ -113,7 +113,8 @@ internal sealed partial class DbImpl
 
     /// <summary>
     /// Port of DBImpl::WriteOptionsFile + DeleteObsoleteOptionsFiles: persists the DB options and every live CF's
-    /// options to a new OPTIONS-N file and keeps only the two newest OPTIONS files.
+    /// options to a new OPTIONS-N file and keeps only the two newest OPTIONS files (and those a running remote compaction
+    /// may read).
     /// </summary>
     private async ValueTask WriteOptionsFileAsync(bool synchronous, CancellationToken ct)
     {
@@ -134,7 +135,14 @@ internal sealed partial class DbImpl
                 if (FileNames.TryParseFileName(child, out ulong n, out FileType type) && type == FileType.OptionsFile) existing.Add((n, child));
             }
             existing.Sort(static (a, b) => b.Number.CompareTo(a.Number));
-            for (int i = 2; i < existing.Count; i++) TryDeleteFile(DbName + "/" + existing[i].Name);
+            if (existing.Count > 2)
+            {
+                ulong keepFrom = MinOptionsFileNumberToKeep(existing[1].Number);
+                for (int i = 2; i < existing.Count; i++)
+                {
+                    if (existing[i].Number < keepFrom) TryDeleteFile(DbName + "/" + existing[i].Name);
+                }
+            }
         }
         finally
         {

@@ -32,10 +32,25 @@ public sealed unsafe class Audit4FinalLifecycleCompatTests
     /// with the right size and a destroyed footer must give the same recovered contents as native.
     /// </summary>
     [TestMethod]
-    [Ignore("audit4: with verify_sst_unique_id_in_manifest=false the managed open fails with Corruption where native skips the point in time (0 keys); needs negative-edge version creation with a table-open check in PointInTimeTracker")]
     [DataRow(0)]
     [DataRow(3)]
-    public void CorruptTableWithoutUniqueIdVerificationRecoversLikeNative(int victimIndex)
+    public void CorruptTableWithoutUniqueIdVerificationRecoversLikeNative(int victimIndex) => RecoverLikeNative(victimIndex, -1);
+
+    /// <summary>
+    /// Same, combined with a missing table file, which decides where versions are created: only on a negative edge
+    /// (valid before an edit, invalid after) and at the end (MaybeCreateVersionBeforeApplyEdit, 906-908). (2,3): the
+    /// newest file is missing, so no edit is a negative edge and the only version is the final one, which holds the
+    /// corrupt file and is skipped (an implementation saving before every edit would keep the older files). (3,2): the
+    /// edit adding the corrupt newest file is the negative edge; the version before it loads.
+    /// </summary>
+    [TestMethod]
+    [DataRow(2, 3)]
+    [DataRow(3, 2)]
+    [DataRow(1, 3)]
+    [DataRow(0, 2)]
+    public void CorruptAndMissingTablesRecoverLikeNative(int corruptIndex, int missingIndex) => RecoverLikeNative(corruptIndex, missingIndex);
+
+    private static void RecoverLikeNative(int victimIndex, int missingIndex)
     {
         using var dir = new TempDir("a4ber");
         string src = Path.Combine(dir.Path, "src");
@@ -61,6 +76,7 @@ public sealed unsafe class Audit4FinalLifecycleCompatTests
             fs.Seek(-8, SeekOrigin.End);
             fs.Write(new byte[8]); // the magic number: same size, unreadable table
         }
+        if (missingIndex >= 0) File.Delete(sst[missingIndex].Item2);
         string nativeCopy = Path.Combine(dir.Path, "native");
         string managedCopy = Path.Combine(dir.Path, "managed");
         foreach (string to in new[] { nativeCopy, managedCopy })

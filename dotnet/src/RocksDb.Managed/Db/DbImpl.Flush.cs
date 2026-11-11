@@ -77,6 +77,7 @@ internal sealed partial class DbImpl
         {
             _atomicCutCompleted = _atomicSwitchCut;
             _atomicSwitchCut = 0;
+            _atomicFlushBackoff = false; // a new flush request is not held back by the back-off of a failed flush
             MaybeScheduleFlush();
         }
     }
@@ -140,6 +141,7 @@ internal sealed partial class DbImpl
     /// </summary>
     private void MaybeScheduleAtomicFlush()
     {
+        if (_atomicFlushBackoff) return; // a failed atomic flush is retried after the back-off or at the next request
         if (_atomicFlushRunning || _runningFlushes >= _maxBackgroundFlushes) return;
         ulong cut = _atomicCutCompleted;
         List<ColumnFamilyData>? members = null;
@@ -173,18 +175,25 @@ internal sealed partial class DbImpl
     /// </summary>
     private async Task RunAtomicFlushAsync(List<ColumnFamilyData> members, ulong cut)
     {
+        bool backoff = false;
         try
         {
             var group = new AtomicFlushGroup(this, members);
-            var tasks = new Task[members.Count];
+            var tasks = new Task<bool>[members.Count];
             for (int i = 0; i < members.Count; i++) tasks[i] = BackgroundFlushAsync(members[i], group, synchronous: true, cut);
-            await Task.WhenAll(tasks).ConfigureAwait(false);
+            bool[] results = await Task.WhenAll(tasks).ConfigureAwait(false);
+            foreach (bool b in results) backoff |= b;
         }
         finally
         {
             lock (_mutex)
             {
                 _atomicFlushRunning = false;
+                if (backoff && !_shuttingDown && !IsBgWorkStopped)
+                {
+                    _atomicFlushBackoff = true;
+                    ScheduleFlushRetryAfterBackoff(null);
+                }
                 MaybeScheduleFlush();
                 SignalBackgroundWork();
             }
@@ -215,8 +224,57 @@ internal sealed partial class DbImpl
     /// Only memtables sealed by a switch up to <paramref name="maxCut"/> are picked (the max memtable id of
     /// MemTableList::PickMemtablesToFlush).
     /// </summary>
-    private async Task BackgroundFlushAsync(ColumnFamilyData cfd, AtomicFlushGroup? group, bool synchronous, ulong maxCut)
+    /// <summary>
+    /// The pause before a failed background flush is retried (BackgroundCallFlush, db/db_impl/db_impl_compaction_flush.cc:
+    /// "Wait a little bit before retrying background flush in case this is an environmental problem and we do not want
+    /// to chew up resources for failed flushes for the duration of the problem", SleepForMicroseconds(1000000)).
+    /// </summary>
+    private static readonly TimeSpan s_flushRetryBackoff = TimeSpan.FromSeconds(1);
+
+    /// <summary>Test seam: replaces the back-off wait (the returned task completes when the retry may run).</summary>
+    internal Func<CancellationToken, Task>? FlushRetryDelayForTest { get; set; }
+
+    /// <summary>Number of failed background flushes that waited before a retry (BumpAndGetBackgroundErrorCount).</summary>
+    internal long FlushRetryBackoffCount => Interlocked.Read(ref _flushRetryBackoffCount);
+
+    private long _flushRetryBackoffCount;
+    private bool _atomicFlushBackoff; // guarded by _mutex
+
+    /// <summary>
+    /// Retries the flush of <paramref name="cfd"/> (null: the atomic flush) after the back-off. Upstream consumes the
+    /// FlushRequest of a failed flush and sleeps one second on the flush thread; here the memtables are flushed again
+    /// after the same pause, or earlier by a new flush request (the next memtable switch), instead of at once: without
+    /// it a failure that does not stop background work (paranoid_checks = false, a soft error) spins. REQUIRES: mutex.
+    /// </summary>
+    private void ScheduleFlushRetryAfterBackoff(ColumnFamilyData? cfd)
     {
+        Interlocked.Increment(ref _flushRetryBackoffCount);
+        _ = RetryFlushAfterBackoffAsync(cfd);
+    }
+
+    private async Task RetryFlushAfterBackoffAsync(ColumnFamilyData? cfd)
+    {
+        try
+        {
+            CancellationToken ct = _bgCancellation.Token;
+            await (FlushRetryDelayForTest?.Invoke(ct) ?? Task.Delay(s_flushRetryBackoff, ct)).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Background work was cancelled (shutdown): MaybeScheduleFlush below does nothing.
+        }
+        lock (_mutex)
+        {
+            if (cfd is null) _atomicFlushBackoff = false;
+            else EnqueueFlush(cfd);
+            MaybeScheduleFlush();
+        }
+    }
+
+    /// <summary>Returns true when an atomic flush member failed in a way that calls for the retry back-off.</summary>
+    private async Task<bool> BackgroundFlushAsync(ColumnFamilyData cfd, AtomicFlushGroup? group, bool synchronous, ulong maxCut)
+    {
+        bool atomicBackoff = false;
         Exception? failure = null;
         bool cfDropped = false;
         var picked = new List<ImmutableMemTable>();
@@ -229,7 +287,7 @@ internal sealed partial class DbImpl
             if (group is null && ShouldRescheduleFlushToRetainUdt(cfd))
             {
                 RescheduleFlushToRetainUdt(cfd);
-                return;
+                return false;
             }
             foreach (ImmutableMemTable m in cfd.Imm)
             {
@@ -319,8 +377,21 @@ internal sealed partial class DbImpl
                 // it made obsolete archived or deleted, and the obsolete table files deleted.
                 cfd.FlushRunning = false;
                 _runningFlushes--;
-                EnqueueFlush(cfd);
-                MaybeScheduleFlush();
+                // BackgroundCallFlush: "!s.ok() && !s.IsShutdownInProgress() && !s.IsColumnFamilyDropped() && reason !=
+                // FlushReason::kErrorRecovery" waits before the next flush. When the error stopped background work nothing
+                // is scheduled until the recovery, which finds the column family queued.
+                bool backoff = failure is not null && !cfDropped && !_shuttingDown && !IsBgWorkStopped && picked.Count > 0
+                    && picked[^1].FlushReason is not (FlushReason.ErrorRecovery or FlushReason.ErrorRecoveryRetryFlush);
+                if (backoff && group is null)
+                {
+                    ScheduleFlushRetryAfterBackoff(cfd);
+                }
+                else
+                {
+                    atomicBackoff = backoff;
+                    EnqueueFlush(cfd);
+                    MaybeScheduleFlush();
+                }
             }
             try
             {
@@ -339,6 +410,7 @@ internal sealed partial class DbImpl
                 SignalBackgroundWork();
             }
         }
+        return atomicBackoff;
     }
 
     /// <summary>Thrown by a flush that built its table but must not install it (skipped_since_bg_error of FlushJob::Run).</summary>

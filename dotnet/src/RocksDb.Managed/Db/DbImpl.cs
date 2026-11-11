@@ -883,7 +883,14 @@ internal sealed partial class DbImpl : IAsyncDisposable
             }
         }
         options.Sort(static (a, b) => b.Number.CompareTo(a.Number));
-        for (int i = 2; i < options.Count; i++) toDelete.Add(options[i].Path);
+        if (options.Count > 2)
+        {
+            ulong keepOptionsFrom = MinOptionsFileNumberToKeep(options[1].Number);
+            for (int i = 2; i < options.Count; i++)
+            {
+                if (options[i].Number < keepOptionsFrom) toDelete.Add(options[i].Path);
+            }
+        }
         foreach (string p in toDelete) TryDeleteFile(p);
         if (dbDirChildren is not null && toDelete.Count > 0)
         {

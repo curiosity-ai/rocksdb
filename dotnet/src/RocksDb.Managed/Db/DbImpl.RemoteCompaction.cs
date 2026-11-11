@@ -39,12 +39,68 @@ internal sealed partial class DbImpl
         bool bottom, CancellationToken ct)
     {
         if (c.DoesInputReferenceBlobFiles() || cfd.Options.EnableBlobFiles || c.SupportsPerKeyPlacement || c.TrimTs is not null) return null;
+        // DBImpl::CaptureOptionsFileNumber / ReleaseOptionsFileNumber around CompactionJob::Run (BackgroundCompaction,
+        // CompactFilesImpl, db/db_impl/db_impl_compaction_flush.cc): the OPTIONS file the worker is told to read must
+        // survive the OPTIONS files written while the job runs.
+        ulong optionsFileNumber = CaptureOptionsFileNumber(ct);
+        try
+        {
+            return RunRemoteCompaction(service, cfd, c, snapshots, jobId, bottom, optionsFileNumber, ct);
+        }
+        finally
+        {
+            lock (_mutex) _minOptionsFileNumbers.Remove(optionsFileNumber);
+        }
+    }
+
+    /// <summary>
+    /// OPTIONS file numbers named in the inputs of running remote compactions (min_options_file_numbers_). Guarded by
+    /// the mutex.
+    /// </summary>
+    private readonly List<ulong> _minOptionsFileNumbers = new();
+
+    /// <summary>
+    /// DBImpl::CaptureOptionsFileNumber: registers the newest OPTIONS file, under the lock that serializes OPTIONS file
+    /// writes (so it cannot be deleted between being chosen and being registered).
+    /// </summary>
+    private ulong CaptureOptionsFileNumber(CancellationToken ct)
+    {
+        _optionsFileLock.Wait(ct);
+        try
+        {
+            ulong number = LatestOptionsFileNumber();
+            lock (_mutex) _minOptionsFileNumbers.Add(number);
+            return number;
+        }
+        finally
+        {
+            _optionsFileLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// DBImpl::MinOptionsFileNumberToKeep + PurgeObsoleteFiles ("optsfile_num2 = std::min(optsfile_num2,
+    /// state.min_options_file_number)", db/db_impl/db_impl_files.cc): OPTIONS files below the returned number are
+    /// obsolete, given the second newest one.
+    /// </summary>
+    private ulong MinOptionsFileNumberToKeep(ulong secondNewest)
+    {
+        lock (_mutex)
+        {
+            foreach (ulong n in _minOptionsFileNumbers) secondNewest = Math.Min(secondNewest, n);
+        }
+        return secondNewest;
+    }
+
+    private RemoteCompactionOutcome? RunRemoteCompaction(CompactionService service, ColumnFamilyData cfd, Compaction c, ulong[] snapshots, int jobId,
+        bool bottom, ulong optionsFileNumber, CancellationToken ct)
+    {
         var input = new CompactionServiceInput
         {
             CfName = cfd.Name,
             OutputLevel = c.OutputLevel,
             DbId = Identity.DbId,
-            OptionsFileNumber = LatestOptionsFileNumber(),
+            OptionsFileNumber = optionsFileNumber,
             PreserveInternalTimeSeconds = cfd.Options.PreserveInternalTimeSeconds,
             PrecludeLastLevelDataSeconds = cfd.Options.PrecludeLastLevelDataSeconds,
             // CompactionJob::Prepare: preserve_time_min_seqno_floor_ of a bottommost-file compaction (else 0). The worker
