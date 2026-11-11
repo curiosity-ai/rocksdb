@@ -136,6 +136,7 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
             partitionedIndex = new PartitionedIndexBuilder(_icmp, options.IndexBlockRestartInterval, options.FormatVersion, _useDeltaEncodingForIndexValues,
                 options.IndexShortening, options.MetadataBlockSize, options.BlockSizeDeviation, useCommonPrefixIndex, useCommonPrefixIndex, _stripTsSize,
                 options.UniformCvThreshold);
+            partitionedIndex.Statistics = tableBuilderOptions.Statistics;
             _indexBuilder = partitionedIndex;
         }
         else if (options.IndexType == IndexType.HashSearch)
@@ -151,7 +152,12 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         {
             _indexBuilder = new ShortenedIndexBuilder(_icmp, options.IndexBlockRestartInterval, options.FormatVersion, _useDeltaEncodingForIndexValues,
                 options.IndexShortening, options.IndexType == IndexType.BinarySearchWithFirstKey, useCommonPrefixIndex, _stripTsSize,
-                options.UniformCvThreshold);
+                options.UniformCvThreshold)
+            {
+                // IndexBuilder::CreateIndexBuilder: kBinarySearch / kBinarySearchWithFirstKey get the statistics (the
+                // hash index's primary builder does not).
+                Statistics = tableBuilderOptions.Statistics,
+            };
         }
         _prefixExtractor = tableBuilderOptions.PrefixExtractor;
         // Port of CreateFilterBlockBuilder: the policy picks the filter implementation from the full building context
@@ -1069,6 +1075,19 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
     {
         // WritePropertiesBlock: the policy's Name(), even when it built no filter.
         _props.FilterPolicyName = _options.FilterPolicy?.Name ?? "";
+        // BlockBasedTableBuilder::Rep (block_based_table_builder.cc): files written into the LSM (flush, compaction,
+        // recovery) record LsmInfoAtCreation::Applicable(level, is_bottommost), SstFileWriter files NotApplicable.
+        // LsmInfoAtCreation::Encode: bits 0..7 level (0xff unknown / out of range), bits 8..9 state (1 not
+        // bottommost, 2 bottommost, 3 not applicable).
+        if (_tbo.ExternalSstFile)
+        {
+            _props.LsmInfoAtCreation = 3UL << 8;
+        }
+        else
+        {
+            ulong levelField = _tbo.LevelAtCreation is >= 0 and < 0xff ? (ulong)_tbo.LevelAtCreation : 0xffUL;
+            _props.LsmInfoAtCreation = levelField | ((_tbo.IsBottommost ? 2UL : 1UL) << 8);
+        }
         _props.ComparatorName = _ucmp.Name;
         _props.MergeOperatorName = _tbo.MergeOperatorName;
         _props.PrefixExtractorName = _tbo.PrefixExtractorName;

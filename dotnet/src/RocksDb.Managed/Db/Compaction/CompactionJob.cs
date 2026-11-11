@@ -1151,6 +1151,7 @@ internal sealed class CompactionJob
             new TableFileLevel(_c.OutputLevel, Math.Max(1, vs.BaseLevel), IsFlush: false, IsBottommost: bottommostCompression)) with
         {
             ColumnFamilyId = _cfd.Id,
+            Statistics = _db.Stats,
             IsBottommost = _c.BottommostLevel,
             ColumnFamilyName = _cfd.Name,
             FileNumber = fileNumber,

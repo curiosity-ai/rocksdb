@@ -56,6 +56,12 @@ public sealed class BlockBuilder : IDisposable
     private int _estimate;
     private bool _finished;
 
+    /// <summary>
+    /// statistics_ of the upstream BlockBuilder: when set, <see cref="ScanForUniformity"/> records the coefficient of
+    /// variation it computed (times 10000) in <see cref="Histogram.BlockKeyDistributionCv"/>. Null: nothing is recorded.
+    /// </summary>
+    internal Statistics? Statistics { get; set; }
+
     /// <param name="restartInterval">Number of keys between restart points (&gt;= 1).</param>
     /// <param name="useDeltaEncoding">Share key prefixes with the previous key.</param>
     /// <param name="useValueDeltaEncoding">Index blocks with format_version &gt;= 4: omit value length; non-restart entries store the caller's delta value.</param>
@@ -449,6 +455,8 @@ public sealed class BlockBuilder : IDisposable
         }
         long gapCount = numKeys > 0 ? numKeys - 1 : 0;
         double cv = gapCount < 2 || mean <= 0 ? -1.0 : Math.Sqrt(m2 / gapCount) / mean;
+        // BlockBuilder::ScanForUniformity: RecordInHistogram(statistics_, BLOCK_KEY_DISTRIBUTION_CV, cv * 10000).
+        if (cv >= 0) Statistics?.RecordInHistogram(Histogram.BlockKeyDistributionCv, (ulong)(cv * 10000));
         return cv >= 0 && cv < _uniformCvThreshold;
     }
 

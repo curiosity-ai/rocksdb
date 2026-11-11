@@ -147,6 +147,11 @@ public sealed record TableBuilderOptions
     public ulong TargetFileSize { get; init; }
     /// <summary>True when the file is written by a memtable flush (TableFileCreationReason::kFlush; Ribbon treats it as level -1).</summary>
     public bool IsFlush { get; init; }
+    /// <summary>
+    /// ImmutableOptions::stats as given to the table builder (BlockBasedTableBuilder::Rep passes it to the index
+    /// builders): the BLOCK_KEY_DISTRIBUTION_CV histogram of BlockBuilder::ScanForUniformity is recorded in it. Null: no statistics.
+    /// </summary>
+    public Statistics? Statistics { get; init; }
     /// <summary>The column family's compaction_style (FilterBuildingContext::compaction_style).</summary>
     public CompactionStyle CompactionStyle { get; init; }
     /// <summary>

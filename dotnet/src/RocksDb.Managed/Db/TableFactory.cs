@@ -98,6 +98,8 @@ public static class TableFactory
     public static FilterPolicy? CreateFilterPolicy(string? id)
     {
         if (string.IsNullOrEmpty(id) || id == "nullptr") return null;
+        // FilterPolicy::CreateFromString: value == ReadOnlyBuiltinFilterPolicy::kClassName().
+        if (id == BloomLikeFilterPolicy.BuiltinFilterMetadataName) return new ReadOnlyBuiltinFilterPolicy();
         if (id.Length >= 2 && id[0] == '{' && id[^1] == '}') return CreateFilterPolicyFromStruct(id);
         string[] parts = id.Split(':');
         string name = parts[0];

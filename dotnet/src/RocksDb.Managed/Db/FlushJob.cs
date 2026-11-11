@@ -63,6 +63,7 @@ internal static class FlushJob
         TableBuilderOptions tbo = TableFactory.CreateBuilderOptions(cfd.Options, TableFileLevel.Flush) with
         {
             ColumnFamilyId = cfd.Id,
+            Statistics = cfd.TableCache.Statistics,
             ColumnFamilyName = cfd.Name,
             FileNumber = fileNumber,
             DbId = identity.DbId,
