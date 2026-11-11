@@ -1606,6 +1606,8 @@ public sealed partial class BlockBasedTableReader : TableReader
         {
             // FIXME (upstream): there should be no reason for Get() to depend on current prefix_extractor at all.
             bool mayMatch = FilterMayMatch(pe.Transform(userKey), internalKey, flags);
+            // FullFilterBlockReader::PrefixMayMatch -> MayMatch counts the probe like a whole key probe.
+            PerfContext.Add(mayMatch ? PerfMetric.BloomSstHitCount : PerfMetric.BloomSstMissCount, 1);
             if (_stats is { } s)
             {
                 s.Record(BlockCacheCounter.BloomFilterPrefixChecked);
@@ -1643,7 +1645,10 @@ public sealed partial class BlockBasedTableReader : TableReader
         // FullFilterBlockReader::PrefixMayMatch records no BLOOM_FILTER_* ticker: seeks are counted by the iterator
         // (SEEK_FILTERED / SEEK_FILTER_MATCH); BLOOM_FILTER_PREFIX_USEFUL is for point lookups only.
         filterChecked = true;
-        return FilterMayMatch(prefix, internalKey, flags);
+        bool prefixMayMatch = FilterMayMatch(prefix, internalKey, flags);
+        // FilterBlockReaderCommon::RangeMayExist -> PrefixMayMatch -> FullFilterBlockReader::MayMatch.
+        PerfContext.Add(prefixMayMatch ? PerfMetric.BloomSstHitCount : PerfMetric.BloomSstMissCount, 1);
+        return prefixMayMatch;
     }
 
     /// <summary>

@@ -43,14 +43,20 @@ internal sealed partial class DbImpl
 
     // ---- flush ------------------------------------------------------------------------------------------
 
-    private FlushJobInfo NewFlushJobInfo(ColumnFamilyData cfd, int jobId, ulong fileNumber, string path, IReadOnlyList<MemTable> mems, FlushReason reason,
-        FileMetaData? meta, TableProperties? props)
+    private FlushJobInfo? NewFlushJobInfo(ColumnFamilyData cfd, int jobId, ulong fileNumber, string path, IReadOnlyList<MemTable> mems, FlushReason reason,
+        FileMetaData? meta, TableProperties? props, bool completed)
     {
         ulong smallest = ulong.MaxValue, largest = 0;
         if (meta is not null)
         {
             smallest = meta.SmallestSeqno;
             largest = meta.LargestSeqno;
+        }
+        else if (completed)
+        {
+            // FlushJob::GetFlushJobInfo for a flush without an output file: meta_.fd keeps the allocated file number and
+            // the bounds of an empty FileDescriptor (smallest_seqno = kMaxSequenceNumber, largest_seqno = 0).
+            smallest = DbFormat.MaxSequenceNumber;
         }
         else
         {
@@ -64,6 +70,8 @@ internal sealed partial class DbImpl
         bool slowdown, stop;
         lock (_mutex)
         {
+            // NotifyOnFlushBegin / NotifyOnFlushCompleted: "if (shutting_down_.load()) return".
+            if (_shuttingDown) return null;
             // NotifyOnFlushBegin / NotifyOnFlushCompleted: the current version's L0 file count against the triggers
             // (not the column family's write stall condition, which also has other causes and ignores L0 while auto
             // compactions are disabled).
@@ -93,24 +101,38 @@ internal sealed partial class DbImpl
     internal void NotifyOnFlushBegin(ColumnFamilyData cfd, int jobId, ulong fileNumber, string path, IReadOnlyList<MemTable> mems, FlushReason reason)
     {
         if (!HasListeners) return;
-        FlushJobInfo info = NewFlushJobInfo(cfd, jobId, fileNumber, path, mems, reason, null, null);
+        FlushJobInfo? info = NewFlushJobInfo(cfd, jobId, fileNumber, path, mems, reason, null, null, completed: false);
+        if (info is null) return;
         InvokeListeners(info, static (l, db, i) => l.OnFlushBegin(db, i), nameof(EventListener.OnFlushBegin));
     }
 
     /// <summary>
-    /// DBImpl::NotifyOnFlushCompleted, preceded by the table file creation event of the flush output. Called without
-    /// the mutex, after the flush result was installed.
+    /// DBImpl::NotifyOnFlushCompleted with the FlushJobInfo of FlushJob::GetFlushJobInfo: the file number and path are
+    /// the ones allocated for the flush, also when the flush kept no file. Called without the mutex, after the flush
+    /// result was installed.
     /// </summary>
-    internal void NotifyOnFlushCompleted(ColumnFamilyData cfd, int jobId, FileMetaData? meta, string path, IReadOnlyList<MemTable> mems, FlushReason reason)
+    internal void NotifyOnFlushCompleted(ColumnFamilyData cfd, int jobId, ulong fileNumber, FileMetaData? meta, string path, IReadOnlyList<MemTable> mems,
+        FlushReason reason)
     {
         if (!HasListeners) return;
-        TableProperties? props = meta is null ? null : TryGetTableProperties(cfd, meta);
-        if (meta is not null)
+        lock (_mutex)
         {
-            NotifyOnTableFileCreated(cfd, jobId, path, meta.FileSize, TableFileCreationReason.Flush, null, props);
+            if (_shuttingDown) return;
         }
-        FlushJobInfo info = NewFlushJobInfo(cfd, jobId, meta?.FileNumber ?? 0, meta is null ? "" : path, mems, reason, meta, props);
+        TableProperties? props = meta is null ? null : TryGetTableProperties(cfd, meta);
+        FlushJobInfo? info = NewFlushJobInfo(cfd, jobId, fileNumber, path, mems, reason, meta, props, completed: true);
+        if (info is null) return;
         InvokeListeners(info, static (l, db, i) => l.OnFlushCompleted(db, i), nameof(EventListener.OnFlushCompleted));
+    }
+
+    /// <summary>
+    /// BuildTable / CompactionJob::FinishCompactionOutputFile for an output that kept no file: the creation event names
+    /// "(nil)" with Status::Aborted("Empty SST file not kept").
+    /// </summary>
+    internal void NotifyOnEmptyTableFile(ColumnFamilyData cfd, int jobId, TableFileCreationReason reason)
+    {
+        if (!HasListeners) return;
+        NotifyOnTableFileCreated(cfd, jobId, "(nil)", 0, reason, new RocksDbException(StatusCode.Aborted, "Operation aborted: Empty SST file not kept"), null);
     }
 
     private static TableProperties? TryGetTableProperties(ColumnFamilyData cfd, FileMetaData meta)
@@ -225,10 +247,20 @@ internal sealed partial class DbImpl
         };
     }
 
-    /// <summary>DBImpl::NotifyOnCompactionBegin. Called without the mutex.</summary>
+    /// <summary>
+    /// DBImpl::NotifyOnCompactionBegin. Called without the mutex. Skipped while shutting down and, for a manual
+    /// compaction, while manual compactions are paused; OnCompactionCompleted is only raised for a compaction whose
+    /// begin was (Compaction::SetNotifyOnCompactionCompleted).
+    /// </summary>
     private void NotifyOnCompactionBegin(ColumnFamilyData cfd, Compaction c, int jobId)
     {
         if (!HasListeners) return;
+        lock (_mutex)
+        {
+            if (_shuttingDown) return;
+            if (c.IsManual && _manualCompactionPaused > 0) return;
+        }
+        c.NotifyOnCompactionCompleted = true;
         CompactionJobInfo info = WithoutOutputs(NewCompactionJobInfo(cfd, c, null, jobId, null));
         InvokeListeners(info, static (l, db, i) => l.OnCompactionBegin(db, i), nameof(EventListener.OnCompactionBegin));
     }
@@ -249,20 +281,31 @@ internal sealed partial class DbImpl
     };
 
     /// <summary>
-    /// DBImpl::NotifyOnCompactionCompleted, preceded by the table file creation events of the outputs. Called without
-    /// the mutex, after the result was installed (or the compaction failed).
+    /// The table file creation events of a finished compaction job's outputs (CompactionJob::FinishCompactionOutputFile
+    /// -> LogAndNotifyTableFileCreationFinished). Called without the mutex, before the result is installed.
+    /// </summary>
+    private void NotifyOnCompactionOutputsCreated(ColumnFamilyData cfd, CompactionJob job, int jobId)
+    {
+        if (!HasListeners) return;
+        foreach (FileMetaData f in job.AllOutputs)
+        {
+            NotifyOnTableFileCreated(cfd, jobId, FileNames.TableFileName(DbPaths, f.FileNumber, f.PathId), f.FileSize,
+                TableFileCreationReason.Compaction, null, TryGetTableProperties(cfd, f));
+        }
+    }
+
+    /// <summary>
+    /// DBImpl::NotifyOnCompactionCompleted. Called without the mutex, after the result was installed (or the compaction
+    /// failed). Skipped while shutting down and when OnCompactionBegin was not raised for the compaction.
     /// </summary>
     private void NotifyOnCompactionCompleted(ColumnFamilyData cfd, Compaction c, CompactionJob? job, int jobId, Exception? failure)
     {
         if (!HasListeners) return;
-        if (job is not null && failure is null)
+        lock (_mutex)
         {
-            foreach (FileMetaData f in job.AllOutputs)
-            {
-                NotifyOnTableFileCreated(cfd, jobId, FileNames.TableFileName(DbPaths, f.FileNumber, f.PathId), f.FileSize,
-                    TableFileCreationReason.Compaction, null, TryGetTableProperties(cfd, f));
-            }
+            if (_shuttingDown) return;
         }
+        if (!c.NotifyOnCompactionCompleted) return;
         CompactionJobInfo info = NewCompactionJobInfo(cfd, c, job, jobId, failure);
         InvokeListeners(info, static (l, db, i) => l.OnCompactionCompleted(db, i), nameof(EventListener.OnCompactionCompleted));
     }
@@ -300,6 +343,8 @@ internal sealed partial class DbImpl
     /// <summary>Queues OnMemTableSealed for <paramref name="mem"/> (DBImpl::NotifyOnMemTableSealed). REQUIRES: mutex.</summary>
     private void EnqueueMemTableSealed(ColumnFamilyData cfd, MemTable mem)
     {
+        // NotifyOnMemTableSealed: "if (shutting_down_.load(std::memory_order_acquire)) return".
+        if (_shuttingDown) return;
         EnqueueNotification(new MemTableInfo
         {
             ColumnFamilyName = cfd.Name,

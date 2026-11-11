@@ -923,6 +923,8 @@ internal sealed partial class DbImpl
                 {
                     jobSnapshot?.Dispose();
                 }
+                // CompactionJob::FinishCompactionOutputFile: the creation event of each output, before the install.
+                NotifyOnCompactionOutputsCreated(cfd, job, jobId);
                 c.AddInputDeletions(edit);
                 foreach (FileMetaData f in job.Outputs) edit.AddFile(c.OutputLevel, f);
                 // Per-key placement: entries too new for the last level were written to the proximal level.

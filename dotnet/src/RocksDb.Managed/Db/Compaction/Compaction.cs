@@ -299,6 +299,9 @@ internal sealed class Compaction
     /// <summary>The files the compaction added to the LSM (outputs or trivially moved files), set once it is installed.</summary>
     public List<FileMetaData>? InstalledFiles { get; set; }
 
+    /// <summary>Compaction::ShouldNotifyOnCompactionCompleted: set once OnCompactionBegin was raised for this compaction.</summary>
+    internal bool NotifyOnCompactionCompleted { get; set; }
+
     /// <summary>CompactFiles with a compaction_job_info output: the job builds <see cref="JobInfo"/> when it finishes.</summary>
     internal bool BuildJobInfo { get; set; }
 

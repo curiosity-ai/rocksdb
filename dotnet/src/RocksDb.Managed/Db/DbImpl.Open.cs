@@ -1266,6 +1266,12 @@ internal sealed partial class DbImpl
             edit = new VersionEdit { ColumnFamily = cfd.Id };
             edits[cfd.Id] = edit;
         }
+        if (HasListeners)
+        {
+            // WriteLevel0TableForRecovery -> BuildTable: the creation event of the recovery flush (kRecovery).
+            if (meta is null) NotifyOnEmptyTableFile(cfd, 0, TableFileCreationReason.Recovery);
+            else NotifyOnTableFileCreated(cfd, 0, path, meta.FileSize, TableFileCreationReason.Recovery, null, TryGetTableProperties(cfd, meta));
+        }
         if (meta is not null)
         {
             FileSystem.SyncDirectory(DbPaths[0]);

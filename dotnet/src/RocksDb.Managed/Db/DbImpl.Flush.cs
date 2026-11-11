@@ -228,10 +228,17 @@ internal sealed partial class DbImpl
                     directWrite?.Meter, seqnoToTime, baseVersion.Storage, synchronous, CancellationToken.None)
                 .ConfigureAwait(false);
         }
+        catch (Exception e) when (HasListeners)
+        {
+            // BuildTable: LogAndNotifyTableFileCreationFinished also reports a failed file, with its status.
+            NotifyOnTableFileCreated(cfd, jobId, path, 0, TableFileCreationReason.Flush, e, null);
+            throw;
+        }
         finally
         {
             lock (_mutex) Versions.UnrefVersion(baseVersion);
         }
+        if (meta is null) NotifyOnEmptyTableFile(cfd, jobId, TableFileCreationReason.Flush);
         if (meta is not null)
         {
             // BuildTable: "Verify that the table is usable" (table_cache->NewIterator): the new table is opened and stays
@@ -249,6 +256,8 @@ internal sealed partial class DbImpl
                 Monitoring.FileReadActivity.Exit(activity);
             }
             FileSystem.SyncDirectory(DbPaths[0]);
+            // BuildTable: the file creation event is raised when the table is finished, before the result is installed.
+            if (HasListeners) NotifyOnTableFileCreated(cfd, jobId, path, meta.FileSize, TableFileCreationReason.Flush, null, TryGetTableProperties(cfd, meta));
             RecordFlushBytes(meta.FileSize + BlobBytesWritten(blobBuilder));
             // FlushJob::WriteLevel0Table logs this before the result is installed (and compactions are scheduled).
             LogLevel0FlushTable(cfd, jobId, meta);
@@ -343,7 +352,7 @@ internal sealed partial class DbImpl
         if (dropped) return;
         if (blobBuilder is not null && meta is not null) LogBlobFileCreationEvents(cfd, jobId, blobBuilder.Additions);
         OnFlushCompleted(cfd, jobId, meta, BlobBytesWritten(blobBuilder), flushStart);
-        NotifyOnFlushCompleted(cfd, jobId, meta, path, mems, reason);
+        NotifyOnFlushCompleted(cfd, jobId, fileNumber, meta, path, mems, reason);
     }
 
     /// <summary>
