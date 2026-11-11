@@ -359,12 +359,14 @@ public sealed class SoakClusterService(ClusterNodeHost host, NodeContext ctx) : 
     public async Task<ServerStreamingResult<WalChunkDto>> SyncUpdatesAsync(string followerId, ulong startSeq)
     {
         ServerStreamingContext<WalChunkDto> stream = GetServerStreamingContext<WalChunkDto>();
-        CancellationToken ct = Context.CallContext.CancellationToken;
+        // As in ClusterService: the call's token or the host shutting down ends a write a stalled client blocks.
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(Context.CallContext.CancellationToken, host.Stopping);
+        CancellationToken ct = linked.Token;
         try
         {
             await foreach (WalStreamMessage m in host.StreamUpdatesAsync(followerId, startSeq, ct).ConfigureAwait(false))
             {
-                await stream.WriteAsync(WalChunkDto.From(m)).ConfigureAwait(false);
+                await stream.WriteAsync(WalChunkDto.From(m)).WaitAsync(ct).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -386,9 +388,11 @@ public sealed class SoakClusterService(ClusterNodeHost host, NodeContext ctx) : 
     public async Task<ServerStreamingResult<SnapshotChunkDto>> SyncInitialStateAsync(List<FileInfoDto> verifiedInventory)
     {
         ServerStreamingContext<SnapshotChunkDto> stream = GetServerStreamingContext<SnapshotChunkDto>();
-        await foreach (SnapshotChunk c in host.StreamSnapshotAsync(FileInfoDto.To(verifiedInventory), Context.CallContext.CancellationToken).ConfigureAwait(false))
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(Context.CallContext.CancellationToken, host.Stopping);
+        CancellationToken ct = linked.Token;
+        await foreach (SnapshotChunk c in host.StreamSnapshotAsync(FileInfoDto.To(verifiedInventory), ct).ConfigureAwait(false))
         {
-            await stream.WriteAsync(SnapshotChunkDto.From(c)).ConfigureAwait(false);
+            await stream.WriteAsync(SnapshotChunkDto.From(c)).WaitAsync(ct).ConfigureAwait(false);
         }
         return stream.Result();
     }

@@ -21,18 +21,26 @@ public readonly struct WalStreamMessage
         SourceTerm = sourceTerm;
         EntryTerm = entryTerm;
         ResyncRequired = false;
+        SourceFault = false;
         Reason = null;
     }
 
-    private WalStreamMessage(string sourceId, long sourceTerm, string reason)
+    private WalStreamMessage(string sourceId, long sourceTerm, string reason, bool sourceFault)
     {
         SourceId = sourceId;
         SourceTerm = sourceTerm;
         ResyncRequired = true;
+        SourceFault = sourceFault;
         Reason = reason;
     }
 
-    public static WalStreamMessage Resync(string sourceId, long sourceTerm, string reason) => new(sourceId, sourceTerm, reason);
+    public static WalStreamMessage Resync(string sourceId, long sourceTerm, string reason) => new(sourceId, sourceTerm, reason, false);
+
+    /// <summary>
+    /// A resync request sent because the source failed to read its own WAL (<see cref="SourceFault"/>), not because of
+    /// the follower's position.
+    /// </summary>
+    public static WalStreamMessage ResyncAfterSourceFault(string sourceId, long sourceTerm, string reason) => new(sourceId, sourceTerm, reason, true);
 
     public ulong FirstSequence { get; }
     public int EntryCount { get; }
@@ -45,10 +53,36 @@ public readonly struct WalStreamMessage
     /// <summary>The term of <see cref="FirstSequence"/> in the source's term log (0 if none).</summary>
     public long EntryTerm { get; }
     public bool ResyncRequired { get; }
+    /// <summary>
+    /// With <see cref="ResyncRequired"/>: the source could not read its own WAL. A snapshot helps the follower only if
+    /// the stream it opens afterwards gets past the fault, so a follower that has applied nothing since its last rebuild
+    /// retries the stream instead of rebuilding again (<see cref="FollowerResyncPolicy"/>).
+    /// </summary>
+    public bool SourceFault { get; }
     public string? Reason { get; }
 
     public WalStreamMessage Detach() =>
         ResyncRequired ? this : new WalStreamMessage(FirstSequence, EntryCount, Data.ToArray(), SourceId, SourceTerm, EntryTerm);
+}
+
+/// <summary>
+/// Follower-side rule that keeps a resync requested for a fault of the source's own WAL
+/// (<see cref="WalStreamMessage.SourceFault"/>) from repeating without end: a rebuild is only worth it if this node has
+/// applied something since its last one. Otherwise the snapshot it just restored did not get it past the fault, the next
+/// one would not either, and the node retries the stream until the source can read its WAL again.
+/// </summary>
+public sealed class FollowerResyncPolicy
+{
+    private const long None = -1;
+    // The log end right after the last rebuild, or None.
+    private long _rebuiltAtSeq = None;
+
+    /// <summary>Records that a rebuild just completed with the log ending at <paramref name="latestSeq"/>.</summary>
+    public void OnRebuilt(ulong latestSeq) => Volatile.Write(ref _rebuiltAtSeq, unchecked((long)latestSeq));
+
+    /// <summary>Whether a resync request <paramref name="message"/> should rebuild a node whose log ends at <paramref name="latestSeq"/>.</summary>
+    public bool ShouldRebuild(in WalStreamMessage message, ulong latestSeq) =>
+        !message.SourceFault || Volatile.Read(ref _rebuiltAtSeq) != unchecked((long)latestSeq);
 }
 
 /// <summary>Source-side producer of <see cref="WalStreamMessage"/>s over a <see cref="WalTailer"/>.</summary>
@@ -71,8 +105,10 @@ public static class WalStreamSender
     /// callback for errors of the source's own WAL that retrying the stream cannot cure:
     /// <list type="bullet">
     /// <item>Corruption (a WAL the follower still needs cannot be read): <paramref name="onSourceFault"/> is called and a
-    /// <see cref="WalStreamMessage.Resync"/> message ends the stream - a snapshot does not need the damaged WAL (the
-    /// checkpoint flushes the memtables), and the follower streams from the snapshot's end afterwards.</item>
+    /// <see cref="WalStreamMessage.ResyncAfterSourceFault"/> message ends the stream - a snapshot does not need the
+    /// damaged WAL (the checkpoint flushes the memtables), and the follower streams from the snapshot's end afterwards.
+    /// If that stream fails the same way (the source cannot even list its WAL files) the follower does not rebuild
+    /// again, see <see cref="FollowerResyncPolicy"/>.</item>
     /// <item>NotSupported (the database cannot be tailed at all, e.g. a write-prepared / write-unprepared transaction
     /// database): <paramref name="onSourceFault"/> is called and the exception is thrown to the consumer. A snapshot
     /// would not help - the stream after it would fail the same way - so no resync is requested.</item>
@@ -105,6 +141,7 @@ public static class WalStreamSender
             WalChunk chunk;
             bool has;
             string? resync = null;
+            bool sourceFault = false;
             try
             {
                 has = tailer.TryReadChunk(out chunk);
@@ -120,6 +157,7 @@ public static class WalStreamSender
                 onSourceFault?.Invoke(e);
                 has = false;
                 chunk = default;
+                sourceFault = true;
                 resync = "the source cannot read its WAL: " + e.Message;
             }
             catch (RocksDbException e) when (e.Code is StatusCode.NotSupported)
@@ -129,7 +167,7 @@ public static class WalStreamSender
             }
             if (resync != null)
             {
-                yield return WalStreamMessage.Resync(sourceId, term, resync);
+                yield return sourceFault ? WalStreamMessage.ResyncAfterSourceFault(sourceId, term, resync) : WalStreamMessage.Resync(sourceId, term, resync);
                 yield break;
             }
             if (has)

@@ -88,6 +88,7 @@ public sealed class PairNodeHost : IAsyncDisposable
     private ulong _attachedFromSeq;
     private int _walStreamFaults;
     private string? _lastWalStreamFault;
+    private readonly FollowerResyncPolicy _resyncPolicy = new();
     // Cancelled whenever this node becomes a replica: ends the WAL streams it serves as primary.
     private CancellationTokenSource _primaryCts = new();
 
@@ -362,6 +363,7 @@ public sealed class PairNodeHost : IAsyncDisposable
 
     private async Task RunFollowerStreamAsync(CancellationToken ct)
     {
+        bool stalled = false;
         while (!ct.IsCancellationRequested)
         {
             try
@@ -395,9 +397,18 @@ public sealed class PairNodeHost : IAsyncDisposable
                 {
                     if (m.ResyncRequired)
                     {
+                        if (!_resyncPolicy.ShouldRebuild(m, _db.GetLatestSequenceNumber()))
+                        {
+                            // The snapshot this node was just rebuilt from did not get it past the fault of the
+                            // primary's WAL; another one would not either.
+                            if (!stalled) Log(_cfg.PeerId + " still cannot stream from " + (_db.GetLatestSequenceNumber() + 1) + " after a resync; retrying the stream: " + m.Reason);
+                            stalled = true;
+                            break;
+                        }
                         TriggerResync(_cfg.PeerId + " cannot stream from " + (_db.GetLatestSequenceNumber() + 1) + ": " + m.Reason);
                         return;
                     }
+                    stalled = false;
                     while (Faults.PauseIngest) await Task.Delay(5, ct).ConfigureAwait(false);
                     if (!_node.AcceptStream(m.SourceId, m.SourceTerm))
                     {
@@ -533,6 +544,7 @@ public sealed class PairNodeHost : IAsyncDisposable
                     await PullSnapshotAsync(_cts.Token).ConfigureAwait(false);
                     _db = await OpenDatabaseAsync(_cts.Token).ConfigureAwait(false);
                     _node.AttachDatabase(_db);
+                    _resyncPolicy.OnRebuilt(_db.GetLatestSequenceNumber());
                     _dbGate.Reopen();
                     Interlocked.Increment(ref _resyncs);
                     lock (_followerLock) _resyncing = false;

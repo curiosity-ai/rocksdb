@@ -123,6 +123,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     private int _resyncs;
     private int _walStreamFaults;
     private string? _lastWalStreamFault;
+    private readonly FollowerResyncPolicy _resyncPolicy = new();
 
     public ClusterNodeHost(ClusterNodeHostOptions options, Func<ClusterMember, IClusterNodeClient> clientFactory)
     {
@@ -578,6 +579,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         ClusterMember? leader = Member(leaderId);
         if (leader == null) return;
         IClusterNodeClient client = _clients(leader);
+        bool stalled = false;
         while (!ct.IsCancellationRequested)
         {
             try
@@ -617,9 +619,18 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                 {
                     if (m.ResyncRequired)
                     {
+                        if (!_resyncPolicy.ShouldRebuild(m, _db.GetLatestSequenceNumber()))
+                        {
+                            // The snapshot this node was just rebuilt from did not get it past the fault of the leader's
+                            // WAL; another one would not either.
+                            if (!stalled) Log("leader still cannot stream from " + (_db.GetLatestSequenceNumber() + 1) + " after a resync; retrying the stream: " + m.Reason);
+                            stalled = true;
+                            break;
+                        }
                         TriggerResync("leader cannot stream from " + (_db.GetLatestSequenceNumber() + 1) + ": " + m.Reason);
                         return;
                     }
+                    stalled = false;
                     _node.HandleObservedLeader(m.SourceId, m.SourceTerm);
                     // A deposed leader's chunk (we already are in a later term): Raft rejects stale AppendEntries.
                     if (m.SourceTerm < _node.CurrentTerm) break;
@@ -768,6 +779,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                     await PullSnapshotAsync(leader, _cts.Token).ConfigureAwait(false);
                     _db = await OpenDatabaseAsync(_cts.Token).ConfigureAwait(false);
                     _node.CompleteResync(_db);
+                    _resyncPolicy.OnRebuilt(_db.GetLatestSequenceNumber());
                     _dbGate.Reopen();
                     Interlocked.Increment(ref _resyncs);
                     lock (_followerLock) _resyncing = false;

@@ -548,4 +548,171 @@ public sealed class Audit4ReplicationTests
         await WaitUntilAsync(() => follower.Resyncs >= 1 && !follower.IsResyncing, "the resync\n" + c.LogText);
         Assert.IsTrue(Contents(follower.Db).ContainsKey("second-term"), "the node replaced its log with a deposed leader's and lost an entry it had acknowledged\n" + c.LogText);
     }
+
+    // Third pass.
+
+    private static async Task PutAsync(Hosting.PairNodeHost primary, string key, string value)
+    {
+        using var batch = new WriteBatch();
+        batch.Put(U(key), U(value));
+        Assert.AreEqual(Hosting.PairWriteStatus.Applied, (await primary.WriteAsync(batch, TimeSpan.FromSeconds(1), CancellationToken.None)).Status);
+    }
+
+    /// <summary>
+    /// A source that cannot list its WAL files (a damaged WAL it still keeps) answers every stream that has something to
+    /// send with "resync: I cannot read my WAL" - also the stream of a replica it has just rebuilt. The replica rebuilt
+    /// itself again on every such answer, for as long as the source took writes. A snapshot that did not get the replica
+    /// past the fault is not taken again: the replica retries the stream until the source can read its WAL.
+    /// </summary>
+    [TestMethod]
+    public async Task ReplicaIsRebuiltOnceNotInALoopWhileTheSourceCannotReadItsWal()
+    {
+        await using var h = new PairHarness();
+        Hosting.PairNodeHost a = await h.StartAsync("A");
+        await PutAsync(a, "a", "1");
+        Hosting.PairNodeHost b = await h.StartAsync("B");
+        await WaitUntilAsync(() => Contents(b.Db).ContainsKey("a"), "B to follow A\n" + h.LogText);
+
+        a.Db.DisableFileDeletions();
+        byte[] damaged = new byte[64];
+        damaged[4] = 20;
+        damaged[6] = 1;
+        string damagedWal = Path.Combine(h.DbPath("A"), "000001.log");
+        File.WriteAllBytes(damagedWal, damaged);
+        await a.Db.FlushAsync();
+        await PutAsync(a, "b", "2");
+        await WaitUntilAsync(() => b.Resyncs >= 1 && !b.IsResyncing, "the resync\n" + h.LogText);
+        Assert.IsTrue(Contents(b.Db).ContainsKey("b"), "the snapshot carried what the WAL stream could not");
+
+        // The fault is still there: the streams the rebuilt replica opens are refused the same way.
+        Assert.AreEqual(StatusCode.Corruption, CodeOf(() => a.Db.GetSortedWalFiles()));
+        int faults = a.WalStreamFaults;
+        for (int i = 0; i < 20; i++) await PutAsync(a, "c" + i, "3");
+        await WaitUntilAsync(() => a.WalStreamFaults >= faults + 4, "further refused streams\n" + h.LogText);
+        Assert.AreEqual(1, b.Resyncs, h.LogText);
+        Assert.IsFalse(b.IsResyncing, h.LogText);
+
+        // Once the source can read its WAL again the replica catches up through the stream.
+        File.Delete(damagedWal);
+        await PutAsync(a, "d", "4");
+        await WaitUntilAsync(() => !b.IsResyncing && Contents(b.Db).ContainsKey("d"), "B to follow A again\n" + h.LogText);
+        Assert.IsTrue(Contents(b.Db).ContainsKey("c19"));
+        Assert.AreEqual(1, b.Resyncs, h.LogText);
+    }
+
+    /// <summary>
+    /// The race behind <see cref="PairResyncOnAPromotedNodeDoesNotLeaveItResyncingForever"/> itself: the node is still a
+    /// replica when the resync is triggered and primary when the rebuild starts.
+    /// </summary>
+    [TestMethod]
+    public async Task PairResyncTriggeredJustBeforeAPromotionIsAbandoned()
+    {
+        await using var h = new PairHarness();
+        await h.StartAsync("A");
+        Hosting.PairNodeHost b = await h.StartAsync("B");
+        await WaitUntilAsync(() => b.GetStatus().AttachedFromSeq > 0, "B to follow A\n" + h.LogText);
+        await h.StopAsync("A");
+
+        // The host logs "resync: ..." after it decided to rebuild and before the rebuild task exists.
+        Task<long>? promotion = null;
+        h.OnLog = (id, line) =>
+        {
+            if (id == "B" && line.Contains("resync: test", StringComparison.Ordinal)) promotion = b.ForcePromoteAsync(CancellationToken.None);
+        };
+        b.TriggerResync("test");
+        Assert.IsNotNull(promotion, h.LogText);
+        await promotion.WaitAsync(TestUtil.Timeout);
+        await b.WaitForResyncAsync().WaitAsync(TestUtil.Timeout);
+        Assert.AreEqual(ReplicationRole.Primary, b.Node.Role);
+        Assert.IsFalse(b.IsResyncing, h.LogText);
+        Assert.IsNotNull(b.HandleGetStatus());
+        Assert.AreEqual(0, b.Resyncs);
+        StringAssert.Contains(h.LogText, "resync abandoned");
+        await PutAsync(b, "after", "1");
+    }
+
+    /// <summary>
+    /// The pair's version of <see cref="NodeRestartedBetweenSnapshotRestoreAndTermMapReplacementRebuildsItself"/>: a
+    /// replica that died after restoring the primary's snapshot and before replacing its epoch map restarts with the
+    /// primary's log and its own older map (here: none, a new replica). It labels the log's end with an older epoch than
+    /// the primary does, so the attach check fails and the replica is rebuilt - it never follows on a wrong map.
+    /// </summary>
+    [TestMethod]
+    public async Task ReplicaRestartedBetweenSnapshotRestoreAndEpochMapReplacementRebuildsItself()
+    {
+        await using var h = new PairHarness();
+        Hosting.PairNodeHost a = await h.StartAsync("A");
+        await PutAsync(a, "a", "1");
+        Hosting.PairNodeHost b = await h.StartAsync("B");
+        await WaitUntilAsync(() => Contents(b.Db).ContainsKey("a"), "B to follow A\n" + h.LogText);
+        ulong latest = a.Db.GetLatestSequenceNumber();
+        Assert.AreEqual(1L, b.Node.GetEpochForSeq(latest));
+
+        await h.StopAsync("B");
+        File.WriteAllText(Path.Combine(h.DbPath("B"), "role", "role.epochs"), "");
+        b = await h.StartAsync("B");
+        Assert.AreEqual(0, b.Resyncs);
+        await WaitUntilAsync(() => b.Resyncs >= 1 && !b.IsResyncing, "the replica to rebuild itself\n" + h.LogText);
+        Assert.AreEqual(1L, b.Node.GetEpochForSeq(latest));
+        await PutAsync(a, "b", "2");
+        await WaitUntilAsync(() => Contents(b.Db).ContainsKey("b"), "B to follow A again\n" + h.LogText);
+        Assert.AreEqual(1, b.Resyncs, h.LogText);
+    }
+
+    /// <summary>
+    /// The commit delay controller's range checks let NaN through (every comparison with NaN is false) and accepted
+    /// infinite weights: the EMA and the score then became NaN and the recommended delay fell below MinDelayMs.
+    /// </summary>
+    [TestMethod]
+    public void CommitDelayControllerRejectsNonFiniteTuning()
+    {
+        AdaptiveCommitDelayOptions[] invalid =
+        [
+            new() { EmaAlpha = double.NaN },
+            new() { DelayPerLagUnitMs = double.NaN },
+            new() { DelayPerLagUnitMs = double.PositiveInfinity },
+            new() { LagUnit = double.NaN },
+            new() { LagUnit = double.PositiveInfinity },
+            new() { TrendWeight = double.NaN },
+            new() { TrendWeight = double.PositiveInfinity },
+            new() { BurstWeight = double.NaN },
+            new() { BurstWeight = double.PositiveInfinity },
+        ];
+        for (int i = 0; i < invalid.Length; i++)
+        {
+            AdaptiveCommitDelayOptions options = invalid[i];
+            Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new AdaptiveCommitDelayController(1, options), "case " + i);
+        }
+        var controller = new AdaptiveCommitDelayController(2, new AdaptiveCommitDelayOptions { MinDelayMs = 3, MaxDelayMs = 50, EmaAlpha = 1 });
+        Assert.AreEqual(3, controller.GetRecommendedDelayMs());
+        controller.ReportLag(0, 4);
+        Assert.AreEqual(20, controller.GetRecommendedDelayMs());
+        controller.ReportLag(1, long.MaxValue);
+        Assert.AreEqual(50, controller.GetRecommendedDelayMs());
+    }
+
+    /// <summary>
+    /// A forced promotion whose replica starts rebuilding its database while the promotion waits for the stream to
+    /// detach dereferenced the detached database (NullReferenceException) instead of refusing.
+    /// </summary>
+    [TestMethod]
+    public async Task ForcePromoteRefusesWhenTheDatabaseIsDetachedMeanwhile()
+    {
+        await using RocksDatabase db = await RocksDatabase.OpenAsync("/db", DbOpts(new MemoryFileSystem()));
+        var state = new ReplicationRoleState(new MemoryFileSystem(), "/role");
+        state.Set(0, ReplicationRole.Replica, "A");
+        SwitchoverNode? node = null;
+        bool detach = true;
+        node = new SwitchoverNode("B", state, db, _ =>
+        {
+            if (detach) node!.DetachDatabase();
+            detach = false;
+            return Task.CompletedTask;
+        });
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () => await node.ForcePromoteAsync(CancellationToken.None));
+        Assert.AreEqual(ReplicationRole.Replica, node.Role);
+        node.AttachDatabase(db);
+        Assert.IsTrue(await node.ForcePromoteAsync(CancellationToken.None) > 0);
+        Assert.AreEqual(ReplicationRole.Primary, node.Role);
+    }
 }
