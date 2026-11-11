@@ -171,7 +171,8 @@ public sealed class Audit4LastTickersTests
         Assert.IsTrue(SpinWait.SpinUntil(() => l.Count("FlushCompleted") == 1, s_timeout));
         Assert.AreEqual("1", db.GetProperty("rocksdb.num-files-at-level0"), "managed flush keeps the pair (upstream: no file)");
         Assert.IsNull(db.Get(B("a")));
-        db.CompactRange();
+        // A plain CompactRange only moves the single file; a compaction that rewrites it drops the pair.
+        db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
         Assert.IsNull(db.Get(B("a")));
         Assert.AreEqual(0, db.GetLiveFilesMetadata().Count, "the compaction drops the pair");
     }
