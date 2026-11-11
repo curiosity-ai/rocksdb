@@ -240,7 +240,7 @@ internal sealed class Repairer
             }
             meta.OldestAncestorTime = props.CreationTime;
             meta.UserDefinedTimestampsPersisted = props.UserDefinedTimestampsPersisted != 0;
-            meta.TailSize = props.TailStartOffset > 0 && props.TailStartOffset <= fileSize ? fileSize - props.TailStartOffset : 0;
+            meta.TailSize = FileMetaData.CalculateTailSize(fileSize, props);
 
             InternalKeyComparator icmp = reader.InternalComparator;
             using (BlockBasedTableIterator it = reader.NewIterator(TableReadFlags.DontFillCache))

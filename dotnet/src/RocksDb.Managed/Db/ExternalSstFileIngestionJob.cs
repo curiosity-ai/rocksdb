@@ -486,7 +486,7 @@ internal sealed class ExternalSstFileIngestionJob
         IReadOnlyDictionary<string, byte[]> uprops = props.UserCollectedProperties;
         if (uprops.TryGetValue(TablePropertiesNames.TimestampMin, out byte[]? tsMin)) info.MinTimestamp = tsMin;
         if (uprops.TryGetValue(TablePropertiesNames.TimestampMax, out byte[]? tsMax)) info.MaxTimestamp = tsMax;
-        info.TailSize = props.TailStartOffset > 0 && props.TailStartOffset <= info.FileSize ? info.FileSize - props.TailStartOffset : 0;
+        info.TailSize = FileMetaData.CalculateTailSize(info.FileSize, props);
         info.DbId = props.DbId;
         info.DbSessionId = props.DbSessionId;
         info.OrigFileNumber = props.OriginalFileNumber;

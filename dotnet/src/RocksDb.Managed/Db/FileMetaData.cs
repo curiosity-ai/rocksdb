@@ -134,6 +134,17 @@ public sealed class FileMetaData
     internal void AddReadsSampled(uint n) => Interlocked.Add(ref _numReadsSampled, n);
     internal void AddCollapsibleEntryReadsSampled(uint n) => Interlocked.Add(ref _numCollapsibleEntryReadsSampled, n);
 
+    /// <summary>
+    /// FileMetaData::CalculateTailSize: the bytes after the last data block. A tail_start_offset of 0 means "unknown"
+    /// (tail size 0) unless the file has no data blocks (no entries, or range deletions only): then the whole file is tail.
+    /// </summary>
+    internal static ulong CalculateTailSize(ulong fileSize, Table.TableProperties props)
+    {
+        bool containNoDataBlocks = props.NumEntries == 0 || props.NumEntries == props.NumRangeDeletions;
+        if (props.TailStartOffset == 0 && !containNoDataBlocks) return 0;
+        return props.TailStartOffset <= fileSize ? fileSize - props.TailStartOffset : 0;
+    }
+
     /// <summary>PackFileNumberAndPathId.</summary>
     public ulong PackedNumberAndPathId => PackFileNumberAndPathId(FileNumber, PathId);
 

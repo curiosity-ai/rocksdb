@@ -279,7 +279,7 @@ internal sealed class ImportColumnFamilyJob
             f.Smallest = fm.SmallestInternalKey;
             f.Largest = fm.LargestInternalKey;
         }
-        f.TailSize = props.TailStartOffset > 0 && props.TailStartOffset <= f.FileSize ? f.FileSize - props.TailStartOffset : 0;
+        f.TailSize = FileMetaData.CalculateTailSize(f.FileSize, props);
         f.UserDefinedTimestampsPersisted = props.UserDefinedTimestampsPersisted != 0;
         if (props.DbId.Length > 0 && props.DbSessionId.Length > 0)
         {
