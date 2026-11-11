@@ -177,7 +177,11 @@ public sealed class ManifestReplayer
             if (_atomicGroup.Count + edit.RemainingEntries != _atomicGroupSize) ThrowHelper.Corruption("corrupted atomic group");
             if (_atomicGroup.Count == _atomicGroupSize)
             {
-                _pit?.OnAtomicGroupBegin(_state);
+                if (_pit is not null)
+                {
+                    _pit.MissingInfo = !_hasLogNumber || !_hasNextFile || !_hasLastSequence;
+                    _pit.OnAtomicGroupBegin(_state);
+                }
                 foreach (VersionEdit e in _atomicGroup) ApplyVersionEdit(e);
                 _pit?.OnAtomicGroupEnd();
                 _atomicGroup.Clear();
@@ -271,7 +275,11 @@ public sealed class ManifestReplayer
             {
                 ThrowHelper.Corruption("MANIFEST record referencing unknown column family");
             }
-            _pit?.BeforeApply(cf, edit);
+            if (_pit is not null)
+            {
+                _pit.MissingInfo = !_hasLogNumber || !_hasNextFile || !_hasLastSequence;
+                _pit.BeforeApply(cf, edit);
+            }
             ApplyFileChanges(cf, edit, RecordedTimestampSize(cf));
             _pit?.AfterApply(cf, edit);
         }

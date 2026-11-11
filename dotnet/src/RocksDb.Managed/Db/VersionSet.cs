@@ -604,6 +604,10 @@ internal sealed class VersionSet : IAsyncDisposable
                 // VersionSet::io_status_: remembered so the error handler can classify the failure as a MANIFEST write
                 // error and recovery forces a new MANIFEST.
                 if (writeError is not OperationCanceledException) Volatile.Write(ref _ioError, RocksDbException.FromException(writeError));
+                // ProcessManifestWrites: error_handler_->AddFilesToQuarantine(files_to_quarantine_if_commit_fail). The record
+                // may have reached a MANIFEST that CURRENT names, so the files it adds must survive obsolete-file scans
+                // until a later MANIFEST write succeeds.
+                _db.QuarantineFiles(editList);
                 // If the MANIFEST append failed for whatever reason, the file could be corrupted (torn record), and after a
                 // failed CURRENT update it is unknown which MANIFEST CURRENT names. Force the next version update to start a
                 // new MANIFEST and point CURRENT at it (ProcessManifestWrites: descriptor_log_.reset()).
@@ -633,6 +637,7 @@ internal sealed class VersionSet : IAsyncDisposable
             Volatile.Write(ref _ioError, null);
             lock (_db.Mutex)
             {
+                _db.ClearQuarantinedFiles(); // ProcessManifestWrites: error_handler_->ClearFilesToQuarantine()
                 InstalledManifest = (ManifestFileNumber, (ulong)_manifestLog!.Log.File!.Size);
                 for (int i = 0; i < n; i++) InstallEdit(edits[i].Cfd, editList[i], newFiles[i], newBlobFiles[i], newStats[i]);
                 installedUnderMutex?.Invoke();

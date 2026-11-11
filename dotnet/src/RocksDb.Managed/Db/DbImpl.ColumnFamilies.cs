@@ -40,7 +40,9 @@ internal sealed partial class DbImpl
             lock (_mutex)
             {
                 if (Versions.GetColumnFamily(name) is not null) ThrowHelper.InvalidArgument("Column family already exists");
-                id = Versions.MaxColumnFamily + 1;
+                // ColumnFamilySet::GetNextColumnFamilyID (++max_column_family_): the id is consumed before the MANIFEST
+                // write, so a failed creation does not hand its id to the next column family.
+                id = ++Versions.MaxColumnFamily;
                 logNumber = _logNumber;
             }
             cfd = new ColumnFamilyData(id, name, opts, this);
@@ -85,7 +87,7 @@ internal sealed partial class DbImpl
         WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
         try
         {
-            if (cfd.Dropped) ThrowHelper.InvalidArgument("Column family already dropped!");
+            if (cfd.Dropped) ThrowHelper.InvalidArgument("Column family already dropped!\n");
             var edit = new VersionEdit { ColumnFamily = cfd.Id };
             edit.DropColumnFamily();
             await Versions.LogAndApplyAsync(cfd, edit, synchronous, ct).ConfigureAwait(false);

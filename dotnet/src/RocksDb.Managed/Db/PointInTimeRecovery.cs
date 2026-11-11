@@ -55,6 +55,13 @@ internal sealed class PointInTimeTracker
         _verifier = verifier;
     }
 
+    /// <summary>
+    /// MaybeCreateVersionBeforeApplyEdit's missing_info: no version is created while the edits replayed so far (not
+    /// counting the one being applied) have not given a log number, a next file number and a last sequence. Set by the
+    /// replayer before <see cref="BeforeApply"/> and <see cref="OnAtomicGroupBegin"/>.
+    /// </summary>
+    public bool MissingInfo { get; set; }
+
     public bool HasMissingFiles
     {
         get
@@ -79,11 +86,18 @@ internal sealed class PointInTimeTracker
         CfState s = State(cf.Id);
         if (_inAtomicGroup)
         {
-            s.EditedInAtomicGroup = true;
+            // VersionBuilder::Rep::Apply (db/version_builder.cc): "if (track_found_and_missing_files_ && version_updated)
+            // ... if (!edited_in_atomic_group_ && edit->IsInAtomicGroup()) edited_in_atomic_group_ = true" - only an edit
+            // that changes table or blob files counts (an atomic flush member without an output only carries a log number).
+            if (edit.NewFiles.Count != 0 || edit.DeletedFiles.Count != 0 || edit.BlobFileAdditions.Count != 0 || edit.BlobFileGarbages.Count != 0)
+            {
+                s.EditedInAtomicGroup = true;
+            }
             return;
         }
         // Only added table or blob files can turn a valid state invalid.
         if (edit.NewFiles.Count == 0 && edit.BlobFileAdditions.Count == 0) return;
+        if (MissingInfo) return;
         if (IsValid(cf, s)) SaveVersion(cf, s);
     }
 
@@ -117,7 +131,7 @@ internal sealed class PointInTimeTracker
         foreach (ColumnFamilyVersion cf in state.ColumnFamilies.Values)
         {
             CfState s = State(cf.Id);
-            if (IsValid(cf, s)) SaveVersion(cf, s);
+            if (!MissingInfo && IsValid(cf, s)) SaveVersion(cf, s);
         }
         _inAtomicGroup = true;
         // Older incomplete atomic updates are dropped; every column family existing now takes part in this one.

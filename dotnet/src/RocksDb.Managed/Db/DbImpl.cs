@@ -662,6 +662,33 @@ internal sealed partial class DbImpl : IAsyncDisposable
         lock (_mutex) _obsoleteManifests.Add(number);
     }
 
+    // ErrorHandler::files_to_quarantine_: table / blob files added by a MANIFEST write that failed. Guarded by mutex.
+    private readonly HashSet<ulong> _quarantinedFiles = new();
+
+    /// <summary>
+    /// Port of ErrorHandler::AddFilesToQuarantine (VersionEdit::GetFilesToQuarantineIfCommitFail: the table and blob files
+    /// the edits add): after a failed MANIFEST write the record may still be in the MANIFEST that CURRENT names, so these
+    /// files are kept by the full scan (PurgeObsoleteFiles: quarantine_files_set) until a MANIFEST write succeeds.
+    /// </summary>
+    internal void QuarantineFiles(VersionEdit[] edits)
+    {
+        lock (_mutex)
+        {
+            foreach (VersionEdit e in edits)
+            {
+                if (e is null) continue;
+                foreach (NewFileEntry nf in e.NewFiles) _quarantinedFiles.Add(nf.Meta.FileNumber);
+                foreach (BlobFileAddition b in e.BlobFileAdditions) _quarantinedFiles.Add(b.BlobFileNumber);
+            }
+        }
+    }
+
+    /// <summary>Port of ErrorHandler::ClearFilesToQuarantine (a MANIFEST write succeeded). REQUIRES: mutex.</summary>
+    internal void ClearQuarantinedFiles()
+    {
+        if (_quarantinedFiles.Count > 0) _quarantinedFiles.Clear();
+    }
+
     /// <summary>
     /// Port of FindObsoleteFiles(force = false) + PurgeObsoleteFiles (db/db_impl/db_impl_files.cc): deletes table files
     /// no version references, WALs below the minimum log number with unflushed data, and old MANIFESTs.
@@ -820,6 +847,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
                     if (dbDirChildren is not null && dir == DbName) dbDirChildren.Add(child);
                     if (!FileNames.TryParseFileName(child, out ulong number, out FileType type)) continue;
                     string full = dir + "/" + child;
+                    // PurgeObsoleteFiles: "if (quarantine_files_set.find(number) != quarantine_files_set.end()) continue".
+                    if (_quarantinedFiles.Count > 0 && _quarantinedFiles.Contains(number)) continue;
                     switch (type)
                     {
                         case FileType.TableFile:

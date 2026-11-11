@@ -49,8 +49,7 @@ internal sealed partial class DbImpl
             try
             {
                 if (!_db.FileSystem.FileExists(path) || (ulong)_db.FileSystem.GetFileSize(path) != meta.FileSize) return false;
-                if (!_db.Options.VerifySstUniqueIdInManifest) return true;
-                if (!_readerOptions.TryGetValue(cf.Name, out TableReaderOptions? opts))
+                if (!_db.Options.VerifySstUniqueIdInManifest) return true;                if (!_readerOptions.TryGetValue(cf.Name, out TableReaderOptions? opts))
                 {
                     ColumnFamilyOptions o = _descriptors.TryGetValue(cf.Name, out ColumnFamilyOptions? d) ? d : new ColumnFamilyOptions();
                     opts = TableFactory.CreateReaderOptions(o, TableFactory.CreateFormatOptions(o.TableOptions));
