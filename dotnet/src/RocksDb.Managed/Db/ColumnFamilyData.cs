@@ -21,6 +21,13 @@ internal sealed class ImmutableMemTable
     public FlushReason FlushReason { get; init; }
     public bool FlushInProgress { get; set; }
     public bool FlushCompleted { get; set; }
+    /// <summary>
+    /// The memtable switch this memtable was sealed by (<see cref="DbImpl.BeginAtomicSwitch"/>): memtables of different
+    /// column families switched together share it. An atomic flush picks the memtables of every column family up to one
+    /// completed switch (the max memtable id of a FlushRequest, DBImpl::GenerateFlushRequest), so it never contains data
+    /// written after the switch in one column family only.
+    /// </summary>
+    public ulong AtomicCut { get; init; }
     /// <summary>Blob files written by blob direct write while this memtable was mutable (registered by its flush).</summary>
     public Blob.BlobDirectWriteGeneration? BlobGeneration { get; init; }
 }
@@ -333,6 +340,16 @@ internal sealed class ColumnFamilyData
             }
             return n;
         }
+    }
+
+    /// <summary>True if some immutable memtable sealed by a switch up to <paramref name="cut"/> is waiting for a flush to be picked.</summary>
+    public bool HasPendingFlushUpTo(ulong cut)
+    {
+        foreach (ImmutableMemTable m in Imm)
+        {
+            if (!m.FlushInProgress && !m.FlushCompleted && m.AtomicCut <= cut) return true;
+        }
+        return false;
     }
 
     /// <summary>True if some immutable memtable is waiting for a flush to be picked (MemTableList::IsFlushPending).</summary>

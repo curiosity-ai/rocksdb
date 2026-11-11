@@ -7,6 +7,11 @@ internal sealed partial class DbImpl
     private int _runningFlushes;   // guarded by mutex
     private int _backgroundJobs;   // guarded by mutex
     private bool _shuttingDown;    // guarded by mutex
+    // ---- atomic_flush (guarded by mutex) ----
+    private bool _atomicFlushRunning;   // a scheduled atomic flush (all its members) is running
+    private ulong _atomicCutNext;       // last memtable switch id handed out
+    private ulong _atomicCutCompleted;  // newest switch whose memtables are all sealed (flushable)
+    private ulong _atomicSwitchCut;     // the multi column family switch in progress, or 0
     // Completed (and replaced) whenever background work finishes or fails; waiters re-check their condition.
     private TaskCompletionSource _bgSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -21,6 +26,9 @@ internal sealed partial class DbImpl
     /// <summary>Port of SchedulePendingFlush. REQUIRES: mutex.</summary>
     private void EnqueueFlush(ColumnFamilyData cfd)
     {
+        // atomic_flush: there is no per column family request; MaybeScheduleFlush starts one flush for every column
+        // family with sealed memtables.
+        if (Options.AtomicFlush) return;
         if (cfd.QueuedForFlush || cfd.Dropped || !cfd.HasPendingFlush) return;
         cfd.QueuedForFlush = true;
         _flushQueue.Enqueue(cfd);
@@ -33,6 +41,11 @@ internal sealed partial class DbImpl
     private void MaybeScheduleFlush()
     {
         if (_shuttingDown || IsBgWorkStopped) return;
+        if (Options.AtomicFlush)
+        {
+            MaybeScheduleAtomicFlush();
+            return;
+        }
         int attempts = _flushQueue.Count;
         while (_runningFlushes < _maxBackgroundFlushes && attempts-- > 0 && _flushQueue.TryDequeue(out ColumnFamilyData? cfd))
         {
@@ -47,17 +60,144 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
+    /// Starts a switch of the memtables of several column families that must be flushed together (DBImpl::ScheduleFlushes /
+    /// AtomicFlushMemTables: every selected column family is switched, then one FlushRequest with their max memtable ids
+    /// is generated). Until <see cref="EndAtomicSwitch"/> the memtables sealed by it are not picked by an atomic flush.
+    /// REQUIRES: write leader.
+    /// </summary>
+    internal void BeginAtomicSwitch()
+    {
+        lock (_mutex) _atomicSwitchCut = ++_atomicCutNext;
+    }
+
+    /// <summary>Ends <see cref="BeginAtomicSwitch"/>: the sealed memtables become flushable and the flush is scheduled.</summary>
+    internal void EndAtomicSwitch()
+    {
+        lock (_mutex)
+        {
+            _atomicCutCompleted = _atomicSwitchCut;
+            _atomicSwitchCut = 0;
+            MaybeScheduleFlush();
+        }
+    }
+
+    /// <summary>
+    /// Switches the memtables of <paramref name="cfds"/> that hold data, for a flush with <paramref name="reason"/>. With
+    /// atomic_flush the memtables of every column family holding data are switched instead
+    /// (DBImpl::SelectColumnFamiliesForAtomicFlush) and flushed as one atomic flush. REQUIRES: write leader.
+    /// </summary>
+    private async ValueTask SwitchMemtablesForFlushAsync(IReadOnlyList<ColumnFamilyData> cfds, FlushReason reason, bool synchronous,
+        CancellationToken cancellationToken)
+    {
+        if (Options.AtomicFlush)
+        {
+            var all = new List<ColumnFamilyData>();
+            lock (_mutex)
+            {
+                foreach (ColumnFamilyData c in Versions.ColumnFamilies)
+                {
+                    if (!c.Dropped && !c.Mem.IsEmpty) all.Add(c);
+                }
+            }
+            cfds = all;
+        }
+        if (cfds.Count == 0) return;
+        BeginAtomicSwitch();
+        try
+        {
+            for (int i = 0; i < cfds.Count; i++)
+            {
+                ColumnFamilyData cfd = cfds[i];
+                if (cfd.Dropped || cfd.Mem.IsEmpty) continue;
+                await SwitchMemtableAsync(cfd, reason, synchronous, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            EndAtomicSwitch();
+        }
+    }
+
+    /// <summary>True if an atomic flush is running or could be started (sealed memtables of a completed switch). REQUIRES: mutex.</summary>
+    private bool AtomicFlushPending
+    {
+        get
+        {
+            if (!Options.AtomicFlush) return false;
+            if (_atomicFlushRunning) return true;
+            foreach (ColumnFamilyData c in Versions.ColumnFamilies)
+            {
+                if (!c.Dropped && c.HasPendingFlushUpTo(_atomicCutCompleted)) return true;
+            }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// atomic_flush part of MaybeScheduleFlushOrCompaction / BackgroundFlush: one flush job covers every column family
+    /// with sealed memtables up to the newest completed switch (the FlushRequest of DBImpl::GenerateFlushRequest). Atomic
+    /// flushes run one at a time. REQUIRES: mutex.
+    /// </summary>
+    private void MaybeScheduleAtomicFlush()
+    {
+        if (_atomicFlushRunning || _runningFlushes >= _maxBackgroundFlushes) return;
+        ulong cut = _atomicCutCompleted;
+        List<ColumnFamilyData>? members = null;
+        foreach (ColumnFamilyData c in Versions.ColumnFamilies)
+        {
+            if (c.Dropped || !c.HasPendingFlushUpTo(cut)) continue;
+            if (c.FlushRunning) return; // an error recovery flush owns it; rescheduled when recovery ends
+            (members ??= new List<ColumnFamilyData>()).Add(c);
+        }
+        if (members is null) return;
+        foreach (ColumnFamilyData c in members)
+        {
+            c.FlushRunning = true;
+            _runningFlushes++;
+            _backgroundJobs++;
+        }
+        _atomicFlushRunning = true;
+        BackgroundThreadPool.High.Schedule(new AtomicFlushRun(this, members, cut));
+    }
+
+    /// <summary>A scheduled atomic flush (DBImpl::AtomicFlushMemTablesToOutputFiles) on the HIGH pool.</summary>
+    private sealed class AtomicFlushRun(DbImpl db, List<ColumnFamilyData> members, ulong cut) : IThreadPoolWorkItem
+    {
+        public void Execute() => db.RunAtomicFlushAsync(members, cut).GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Port of DBImpl::AtomicFlushMemTablesToOutputFiles: every member writes its L0 file, then one MANIFEST atomic group
+    /// installs all results (MemTableList::InstallMemtableAtomicFlushResults). If a member fails nothing is installed
+    /// and the memtables of all members stay to be flushed again (RollbackMemtableFlush).
+    /// </summary>
+    private async Task RunAtomicFlushAsync(List<ColumnFamilyData> members, ulong cut)
+    {
+        try
+        {
+            var group = new AtomicFlushGroup(this, members);
+            var tasks = new Task[members.Count];
+            for (int i = 0; i < members.Count; i++) tasks[i] = BackgroundFlushAsync(members[i], group, synchronous: true, cut);
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_mutex)
+            {
+                _atomicFlushRunning = false;
+                MaybeScheduleFlush();
+                SignalBackgroundWork();
+            }
+        }
+    }
+
+    /// <summary>
     /// Port of BackgroundFlush + FlushMemTableToOutputFile + MemTableList::TryInstallMemtableFlushResults: flushes all
     /// immutable memtables of the CF that are not being flushed into one L0 file, records it in the MANIFEST together
     /// with the CF's new log number, then drops the memtables and deletes obsolete WALs.
     /// </summary>
-    private Task BackgroundFlushAsync(ColumnFamilyData cfd) => BackgroundFlushAsync(cfd, null, synchronous: false);
+    private Task BackgroundFlushAsync(ColumnFamilyData cfd) => BackgroundFlushAsync(cfd, null, synchronous: false, ulong.MaxValue);
 
-    /// <summary>
-    /// <see cref="BackgroundFlushAsync(ColumnFamilyData, AtomicFlushGroup?)"/> as a member of <paramref name="group"/>, run
-    /// asynchronously (error recovery flushes).
-    /// </summary>
-    private Task BackgroundFlushAsync(ColumnFamilyData cfd, AtomicFlushGroup? group) => BackgroundFlushAsync(cfd, group, synchronous: false);
 
     /// <summary>
     /// A scheduled flush (BGWorkFlush on the HIGH pool): runs the flush synchronously on a <see cref="BackgroundThreadPool.High"/>
@@ -65,17 +205,20 @@ internal sealed partial class DbImpl
     /// </summary>
     private sealed class FlushRun(DbImpl db, ColumnFamilyData cfd) : IThreadPoolWorkItem
     {
-        public void Execute() => db.BackgroundFlushAsync(cfd, null, synchronous: true).GetAwaiter().GetResult();
+        public void Execute() => db.BackgroundFlushAsync(cfd, null, synchronous: true, ulong.MaxValue).GetAwaiter().GetResult();
     }
 
     /// <summary>
     /// <see cref="BackgroundFlushAsync(ColumnFamilyData)"/> as a member of <paramref name="group"/> (an atomic flush:
     /// the flush result is committed to the MANIFEST together with the other members' results), or alone when null.
     /// With <paramref name="synchronous"/> the file and MANIFEST I/O is synchronous (on a background pool thread).
+    /// Only memtables sealed by a switch up to <paramref name="maxCut"/> are picked (the max memtable id of
+    /// MemTableList::PickMemtablesToFlush).
     /// </summary>
-    private async Task BackgroundFlushAsync(ColumnFamilyData cfd, AtomicFlushGroup? group, bool synchronous)
+    private async Task BackgroundFlushAsync(ColumnFamilyData cfd, AtomicFlushGroup? group, bool synchronous, ulong maxCut)
     {
         Exception? failure = null;
+        bool cfDropped = false;
         var picked = new List<ImmutableMemTable>();
         ulong fileNumber;
         ulong epoch;
@@ -89,6 +232,7 @@ internal sealed partial class DbImpl
             foreach (ImmutableMemTable m in cfd.Imm)
             {
                 if (m.FlushInProgress || m.FlushCompleted) continue;
+                if (m.AtomicCut > maxCut) break;
                 m.FlushInProgress = true;
                 // The flush reads the memtable without the mutex: keep it alive even if the CF is dropped meanwhile
                 // (DropColumnFamily releases the CF's memtable references).
@@ -108,6 +252,7 @@ internal sealed partial class DbImpl
         catch (RocksDbException e) when (e.Code == StatusCode.ColumnFamilyDropped || cfd.Dropped)
         {
             failure = e;
+            cfDropped = true;
             lock (_mutex)
             {
                 foreach (ImmutableMemTable m in picked) m.FlushInProgress = false;
@@ -122,7 +267,10 @@ internal sealed partial class DbImpl
                 foreach (ImmutableMemTable m in picked) m.FlushInProgress = false;
             }
             // The output is left for the full scan at the next open: after a failed MANIFEST write it may already be
-            // referenced by a MANIFEST that CURRENT names (upstream quarantines such files).
+            // referenced by a MANIFEST that CURRENT names (upstream quarantines such files). An atomic flush that
+            // failed before its MANIFEST write (another member's job failed) installed nothing: its output is deleted
+            // (AtomicFlushMemTablesToOutputFiles deletes the outputs of a failed atomic flush).
+            if (group is not null && !group.ManifestWriteAttempted) TryDeleteFile(FileNames.TableFileName(DbPaths, fileNumber, 0));
             // FlushMemTableToOutputFile: the WAL is synced at memtable switch, so a failed MANIFEST write maps to
             // kManifestWriteNoWAL and any other failure (table file write) to kFlushNoWAL.
             SetBackgroundError(e, Versions.IoStatus is not null ? BackgroundErrorReason.ManifestWriteNoWal : BackgroundErrorReason.FlushNoWal,
@@ -130,8 +278,9 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            // A member that failed or had nothing to flush leaves the atomic flush (a failure fails the whole group).
-            group?.Leave(cfd, failure);
+            // A member that failed or had nothing to flush leaves the atomic flush (a failure fails the whole group; a
+            // dropped column family is skipped, AtomicFlushMemTablesToOutputFiles: "if (cfds[i]->IsDropped()) continue").
+            group?.Leave(cfd, cfDropped ? null : failure);
             lock (_mutex)
             {
                 foreach (ImmutableMemTable m in picked)
@@ -364,7 +513,9 @@ internal sealed partial class DbImpl
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
         WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, cancellationToken).ConfigureAwait(false);
-        ImmutableMemTable? target = null;
+        // The newest sealed memtable of every column family to wait for (flush_memtable_ids): the requested one, or with
+        // atomic_flush every column family (DBImpl::AtomicFlushMemTables).
+        var targets = new List<(ColumnFamilyData Cfd, ImmutableMemTable Mem)>(1);
         try
         {
             lock (_mutex)
@@ -372,13 +523,20 @@ internal sealed partial class DbImpl
                 if (IsBgWorkStopped && ErrorHandler.BgError is { } bg) ThrowBackgroundError(bg);
             }
             if (cfd.Dropped) ThrowDropped(cfd);
-            if (!cfd.Mem.IsEmpty)
-            {
-                await SwitchMemtableAsync(cfd, reason, synchronous, cancellationToken).ConfigureAwait(false);
-            }
+            await SwitchMemtablesForFlushAsync([cfd], reason, synchronous, cancellationToken).ConfigureAwait(false);
             lock (_mutex)
             {
-                if (cfd.Imm.Count > 0) target = cfd.Imm[^1];
+                if (Options.AtomicFlush)
+                {
+                    foreach (ColumnFamilyData c in Versions.ColumnFamilies)
+                    {
+                        if (!c.Dropped && c.Imm.Count > 0) targets.Add((c, c.Imm[^1]));
+                    }
+                }
+                else if (cfd.Imm.Count > 0)
+                {
+                    targets.Add((cfd, cfd.Imm[^1]));
+                }
                 // DBImpl::FlushMemTable: a manual flush is never postponed to retain user-defined timestamps.
                 if (cfd.TimestampsInMemtableOnly && cfd.HasPendingFlush) cfd.FlushSkipReschedule = true;
                 EnqueueFlush(cfd);
@@ -389,13 +547,18 @@ internal sealed partial class DbImpl
         {
             ExitUnbatched(w, synchronous);
         }
-        if (!wait || target is null) return;
+        if (!wait || targets.Count == 0) return;
         while (true)
         {
             Task signal;
             lock (_mutex)
             {
-                if (target.FlushCompleted || !cfd.Imm.Contains(target))
+                bool done = true;
+                foreach ((ColumnFamilyData c, ImmutableMemTable target) in targets)
+                {
+                    if (!target.FlushCompleted && !c.Dropped && c.Imm.Contains(target)) done = false;
+                }
+                if (done)
                 {
                     // WaitForFlushMemTables: an error that stopped the DB (e.g. SpaceLimit after the flush) is reported.
                     if (ErrorHandler.IsDbStopped && ErrorHandler.BgError is { } stopped) ThrowBackgroundError(stopped);

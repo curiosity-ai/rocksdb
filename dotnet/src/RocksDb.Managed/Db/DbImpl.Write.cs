@@ -1049,13 +1049,15 @@ internal sealed partial class DbImpl
             if (_pipelined) await WaitForMemTableWritersAsync(synchronous).ConfigureAwait(false);
             // unordered_write: likewise for the memtable inserts of earlier write groups (WaitForPendingWrites).
             await WaitForPendingWritesAsync(synchronous).ConfigureAwait(false);
-            for (int i = 0; i < _flushScheduler.Count; i++)
+            // ScheduleFlushes: with atomic_flush every column family with data is switched and one request flushes them.
+            try
             {
-                ColumnFamilyData cfd = _flushScheduler[i];
-                if (cfd.Dropped || cfd.Mem.IsEmpty) continue;
-                await SwitchMemtableAsync(cfd, FlushReason.WriteBufferFull, synchronous, cancellationToken).ConfigureAwait(false);
+                await SwitchMemtablesForFlushAsync(_flushScheduler, FlushReason.WriteBufferFull, synchronous, cancellationToken).ConfigureAwait(false);
             }
-            _flushScheduler.Clear();
+            finally
+            {
+                _flushScheduler.Clear();
+            }
         }
         WriteBufferManager wbm = WriteBufferManager;
         if (wbm.Enabled && (wbm.ShouldFlush() || wbm.ShouldStall()))
@@ -1207,7 +1209,10 @@ internal sealed partial class DbImpl
             MemTable mem = cfd.Mem;
             // RotateCurrentGeneration: the blob direct write files of this memtable are registered by its flush.
             Blob.BlobDirectWriteGeneration? generation = cfd.BlobDirectWrite?.RotateGeneration();
-            cfd.Imm.Add(new ImmutableMemTable(mem, newLogNumber) { FlushReason = reason, BlobGeneration = generation });
+            // A switch outside BeginAtomicSwitch / EndAtomicSwitch is complete (flushable) by itself.
+            ulong cut = _atomicSwitchCut != 0 ? _atomicSwitchCut : ++_atomicCutNext;
+            if (_atomicSwitchCut == 0) _atomicCutCompleted = cut;
+            cfd.Imm.Add(new ImmutableMemTable(mem, newLogNumber) { FlushReason = reason, BlobGeneration = generation, AtomicCut = cut });
             mem.MarkImmutable();
             if (generation is not null) ProtectBlobDirectWriteFiles(cfd, mem, generation);
             if (HasListeners) EnqueueMemTableSealed(cfd, mem);
@@ -1371,8 +1376,8 @@ internal sealed partial class DbImpl
     /// family whose data is in the oldest alive WAL (OldestLogToKeep &lt;= that WAL) and flush them (FlushReason
     /// kWalFull), letting the WAL be released. Done once per oldest WAL (getting_flushed). Only called with more than
     /// one column family (a single CF's memtables already bound its WALs). REQUIRES: write leader.
-    /// Not ported: the 2PC check for outstanding prepared transactions in the oldest WAL (unable_to_release_oldest_log_)
-    /// and atomic_flush column family selection.
+    /// With atomic_flush every column family with data is switched (SelectColumnFamiliesForAtomicFlush).
+    /// Not ported: the 2PC check for outstanding prepared transactions in the oldest WAL (unable_to_release_oldest_log_).
     /// </summary>
     private async ValueTask SwitchWalAsync(bool synchronous, CancellationToken cancellationToken)
     {
@@ -1393,12 +1398,8 @@ internal sealed partial class DbImpl
         }
         LogInfo("Flushing all column families with data in WAL number " + oldest + ". Total log size is " + Volatile.Read(ref _walsTotalSize) +
                 " while max_total_wal_size is " + GetMaxTotalWalSize());
-        foreach (ColumnFamilyData cfd in cfds)
-        {
-            // An empty memtable is not switched: its log number advances with the next WAL switch (SwitchMemtable).
-            if (cfd.Dropped || cfd.Mem.IsEmpty) continue;
-            await SwitchMemtableAsync(cfd, FlushReason.WalFull, synchronous, cancellationToken).ConfigureAwait(false);
-        }
+        // An empty memtable is not switched: its log number advances with the next WAL switch (SwitchMemtable).
+        await SwitchMemtablesForFlushAsync(cfds, FlushReason.WalFull, synchronous, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Test helper (TEST_SwitchMemtable): switches the default column family's memtable and WAL.</summary>

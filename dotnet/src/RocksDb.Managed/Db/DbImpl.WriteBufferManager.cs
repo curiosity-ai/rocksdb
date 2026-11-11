@@ -109,11 +109,7 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
         WriteBufferManager wbm = WriteBufferManager;
         LogInfo("Flushing triggered to alleviate write buffer memory usage. Write buffer is using " + wbm.MemoryUsage +
                 " bytes out of a total of " + wbm.BufferSize + ".");
-        foreach (ColumnFamilyData cfd in cfds)
-        {
-            if (cfd.Dropped || cfd.Mem.IsEmpty) continue;
-            await SwitchMemtableAsync(cfd, FlushReason.WriteBufferManager, synchronous, cancellationToken).ConfigureAwait(false);
-        }
+        await SwitchMemtablesForFlushAsync(cfds, FlushReason.WriteBufferManager, synchronous, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -248,8 +244,8 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
         {
             ColumnFamilyData? cfd;
             lock (_mutex) cfd = CollectFlushableColumnFamilies(includeWaitingImmutable: true, out _, out _);
-            if (cfd is not null && !cfd.Dropped && !cfd.Mem.IsEmpty)
-                await SwitchMemtableAsync(cfd, FlushReason.WriteBufferManager, synchronous: false, CancellationToken.None).ConfigureAwait(false);
+            if (cfd is not null)
+                await SwitchMemtablesForFlushAsync([cfd], FlushReason.WriteBufferManager, synchronous: false, CancellationToken.None).ConfigureAwait(false);
         }
         finally
         {

@@ -40,10 +40,9 @@ public sealed class Audit4FollowUpCompactionTests
     /// DBImpl::ScheduleFlushes (db_impl_write.cc: "if (immutable_db_options_.atomic_flush) { ...
     /// SelectColumnFamiliesForAtomicFlush(&amp;cfds); }"): with atomic_flush a full memtable switches the memtables of
     /// every column family with unflushed data and one flush request covers them all, so that their results are
-    /// committed together (AtomicFlushMemTablesToOutputFiles). The port switches and flushes only the full one.
+    /// committed together (AtomicFlushMemTablesToOutputFiles).
     /// </summary>
     [TestMethod]
-    [Ignore("audit4: automatic flushes ignore atomic_flush (only the full column family is switched and flushed); needs ScheduleFlushes / the flush queue to carry multi-CF requests")]
     public void AtomicFlushFlushesEveryColumnFamilyWhenOneMemtableIsFull()
     {
         MemoryFileSystem fs = NewFs();

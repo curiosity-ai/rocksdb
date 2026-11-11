@@ -116,7 +116,9 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
             FileCreationTime = 0,
             EmbeddedBlobMinSize = embeddedBlobMinSize,
         };
-        _file = _fs.CreateWritable(filePath, truncate: true);
+        // WritableFileWriter::seen_error_: after a failed append the file cannot be finished (SstFileWriter::Finish
+        // returns the builder's error status upstream).
+        _file = FileChecksumHelper.WithStickyError(_fs.CreateWritable(filePath, truncate: true));
         try
         {
             _builder = TableBuilder.Create(_file, _format, tbo);

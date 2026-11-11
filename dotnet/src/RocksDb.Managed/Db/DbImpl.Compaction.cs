@@ -1851,9 +1851,9 @@ internal sealed partial class DbImpl
                         if (!cfd.Options.DisableAutoCompactions && cfd.CompactionState.Picker.NeedsCompaction(cfd.Current.Storage)) pending = true;
                     }
                 }
-                if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0 && _runningFlushes == 0 && _flushQueue.Count == 0 && !pending) return;
+                if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0 && _runningFlushes == 0 && _flushQueue.Count == 0 && !AtomicFlushPending && !pending) return;
                 if (pending) MaybeScheduleCompaction();
-                if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0 && _runningFlushes == 0 && _flushQueue.Count == 0)
+                if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0 && _runningFlushes == 0 && _flushQueue.Count == 0 && !AtomicFlushPending)
                 {
                     // Pending work that cannot be scheduled (e.g. picker found nothing to do).
                     return;

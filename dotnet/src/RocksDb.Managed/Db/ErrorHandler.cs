@@ -770,10 +770,19 @@ internal sealed partial class DbImpl
                     // edits below persist it (their last_sequence covers it).
                     Versions.SetLastSequence(Versions.LastAllocatedSequence);
                 }
-                foreach (ColumnFamilyData cfd in cfds)
+                // One switch for all column families: the recovery flush below picks exactly these memtables.
+                BeginAtomicSwitch();
+                try
                 {
-                    if (cfd.Dropped) continue;
-                    if (walError || !cfd.Mem.IsEmpty) await SwitchMemtableAsync(cfd, FlushReason.ErrorRecovery, synchronous: false, CancellationToken.None).ConfigureAwait(false);
+                    foreach (ColumnFamilyData cfd in cfds)
+                    {
+                        if (cfd.Dropped) continue;
+                        if (walError || !cfd.Mem.IsEmpty) await SwitchMemtableAsync(cfd, FlushReason.ErrorRecovery, synchronous: false, CancellationToken.None).ConfigureAwait(false);
+                    }
+                }
+                finally
+                {
+                    EndAtomicSwitch();
                 }
             }
             catch (Exception e) when (e is not OutOfMemoryException)
@@ -785,19 +794,35 @@ internal sealed partial class DbImpl
                 ExitUnbatched(w, synchronous: false);
             }
         }
+        // atomic_flush: a background atomic flush still running (it will fail or finish) owns some of the memtables;
+        // flushing the others now would install a partial result.
+        while (true)
+        {
+            Task signal;
+            lock (_mutex)
+            {
+                if (!_atomicFlushRunning) break;
+                signal = _bgSignal.Task;
+            }
+            await signal.ConfigureAwait(false);
+        }
         var members = new List<ColumnFamilyData>();
+        ulong cut;
         lock (_mutex)
         {
+            // Memtables of a switch still in progress (soft errors do not stop writes) are left to the next flush.
+            cut = _atomicCutCompleted;
             foreach (ColumnFamilyData cfd in cfds)
             {
-                if (cfd.Dropped || cfd.FlushRunning || !cfd.HasPendingFlush) continue;
+                if (cfd.Dropped || cfd.FlushRunning || !cfd.HasPendingFlushUpTo(cut)) continue;
                 cfd.FlushRunning = true;
                 _runningFlushes++;
                 _backgroundJobs++;
                 members.Add(cfd);
             }
         }
-        if (retryOnly)
+        // RetryFlushesForErrorRecovery: with atomic_flush the retry is an atomic flush too.
+        if (retryOnly && !Options.AtomicFlush)
         {
             foreach (ColumnFamilyData cfd in members)
             {
@@ -815,7 +840,7 @@ internal sealed partial class DbImpl
         // write batch that spans column families.
         var group = new AtomicFlushGroup(this, members);
         var tasks = new Task[members.Count];
-        for (int i = 0; i < members.Count; i++) tasks[i] = BackgroundFlushAsync(members[i], group);
+        for (int i = 0; i < members.Count; i++) tasks[i] = BackgroundFlushAsync(members[i], group, synchronous: false, cut);
         await Task.WhenAll(tasks).ConfigureAwait(false);
         lock (_mutex)
         {
