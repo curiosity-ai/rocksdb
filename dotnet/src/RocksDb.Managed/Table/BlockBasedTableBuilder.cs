@@ -648,6 +648,18 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         return samples.ToArray();
     }
 
+    /// <summary>
+    /// CompressAndVerifyBlock, "if (type == kNoCompression)": a block (data or not) stored uncompressed counts in
+    /// NUMBER_BLOCK_COMPRESSION_REJECTED / BYTES_COMPRESSION_REJECTED after a compression attempt, else in
+    /// NUMBER_BLOCK_COMPRESSION_BYPASSED / BYTES_COMPRESSION_BYPASSED.
+    /// </summary>
+    private void RecordUncompressedBlock(bool rejected, int uncompressedSize)
+    {
+        if (_tbo.Statistics is not { } stats) return;
+        stats.RecordTick(rejected ? Ticker.NumberBlockCompressionRejected : Ticker.NumberBlockCompressionBypassed);
+        stats.RecordTick(rejected ? Ticker.BytesCompressionRejected : Ticker.BytesCompressionBypassed, (ulong)uncompressedSize);
+    }
+
     /// <summary>Port of WriteBlock + CompressAndVerifyBlock (compression via the facade, with the ratio check).</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private BlockHandle WriteBlock(ReadOnlySpan<byte> raw, bool isDataBlock) => WriteBlock(raw, isDataBlock, out _);
@@ -659,6 +671,7 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         // CompressAndVerifyBlock: a data block stored uncompressed after an attempt is rejected, without one bypassed.
         if (rejected) _props.NumDataBlocksCompressionRejected++;
         else if (isDataBlock && type == CompressionType.None) _props.NumDataBlocksCompressionBypassed++;
+        if (type == CompressionType.None) RecordUncompressedBlock(rejected, raw.Length);
         BlockHandle h = type == CompressionType.None
             ? WriteMaybeCompressedBlock(raw, type, isDataBlock, out skipDeltaEncoding)
             : WriteMaybeCompressedBlock(_compressed.WrittenSpan, type, isDataBlock, out skipDeltaEncoding);

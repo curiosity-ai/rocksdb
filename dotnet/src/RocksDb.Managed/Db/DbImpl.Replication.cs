@@ -88,7 +88,10 @@ internal sealed partial class DbImpl
         string fname = FileNames.LogFileName(WalDir, number);
         if (!WalArchivalEnabled)
         {
-            TryDeleteFile(fname);
+            // DeleteObsoleteFileImpl: "Rate limit WAL deletion only if its in the DB dir" (DeleteDBFile with
+            // force_fg = !wal_in_db_path_): a WAL in the DB directory is deleted through the SstFileManager.
+            if (WalDir == DbName) DeleteDbFile(fname, WalDir);
+            else TryDeleteFile(fname);
             return;
         }
         // WalManager::ArchiveWALFile.

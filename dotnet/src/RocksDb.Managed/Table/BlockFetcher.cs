@@ -45,20 +45,46 @@ public sealed class NoBlockCache : IBlockCache
 /// </summary>
 internal static class BlockFetcher
 {
+    /// <summary>
+    /// Whether a block read verifies the block checksum (ReadOptions::verify_checksums) and the statistics that count
+    /// the verifications (BlockFetcher::ProcessTrailerIfPresent, table/block_fetcher.cc: BLOCK_CHECKSUM_COMPUTE_COUNT
+    /// for every verified block, BLOCK_CHECKSUM_MISMATCH_COUNT for a mismatch). A plain bool converts to a
+    /// verification without statistics.
+    /// </summary>
+    internal readonly struct ChecksumVerification(bool enabled, Statistics? statistics)
+    {
+        public bool Enabled { get; } = enabled;
+
+        public static implicit operator ChecksumVerification(bool enabled) => new(enabled, null);
+
+        /// <summary>False if the checksum of <paramref name="blockWithTrailer"/> is verified and does not match.</summary>
+        public bool Check(in Footer footer, ReadOnlySpan<byte> blockWithTrailer, ulong offset)
+        {
+            if (!Enabled) return true;
+            bool ok = BlockChecksum.Verify(footer.ChecksumType, footer.BaseContextChecksum, blockWithTrailer, offset);
+            if (statistics is not null)
+            {
+                statistics.RecordTick(Ticker.BlockChecksumComputeCount);
+                if (!ok) statistics.RecordTick(Ticker.BlockChecksumMismatchCount);
+            }
+            return ok;
+        }
+    }
+
     // Block buffers come from BlockBufferPool (fine size classes): an uncompressed block keeps its read buffer for its
     // whole life in the block cache, and its length is what the cache is charged.
-    public static Block ReadBlock(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums) =>
+    public static Block ReadBlock(IRandomAccessFile file, in Footer footer, BlockHandle handle, ChecksumVerification verifyChecksums) =>
         ReadBlock(file, footer, handle, verifyChecksums, null);
 
     /// <summary>Reads a block, decompressing with <paramref name="dictionary"/> (data blocks of dictionary-compressed tables).</summary>
-    public static Block ReadBlock(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums, CompressionDictionary? dictionary) =>
+    public static Block ReadBlock(IRandomAccessFile file, in Footer footer, BlockHandle handle, ChecksumVerification verifyChecksums, CompressionDictionary? dictionary) =>
         ReadBlock(file, footer, handle, verifyChecksums, dictionary, BlockBufferSource.BlockBufferPool);
 
     /// <summary>
     /// Reads a block into a buffer rented from <paramref name="source"/> (the block returns it there when released):
     /// <see cref="BlockBufferSource.TableBuffers"/> for the blocks a table reader pins for its lifetime.
     /// </summary>
-    public static Block ReadBlock(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums, CompressionDictionary? dictionary,
+    public static Block ReadBlock(IRandomAccessFile file, in Footer footer, BlockHandle handle, ChecksumVerification verifyChecksums, CompressionDictionary? dictionary,
         BlockBufferSource source)
     {
         int n = CheckedLength(handle);
@@ -78,10 +104,10 @@ internal static class BlockFetcher
         return ProcessSerialized(buf, footer, handle, verifyChecksums, dictionary, source);
     }
 
-    public static ValueTask<Block> ReadBlockAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, bool verifyChecksums, CancellationToken ct) =>
+    public static ValueTask<Block> ReadBlockAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, ChecksumVerification verifyChecksums, CancellationToken ct) =>
         ReadBlockAsync(file, footer, handle, verifyChecksums, null, ct);
 
-    public static ValueTask<Block> ReadBlockAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, bool verifyChecksums,
+    public static ValueTask<Block> ReadBlockAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, ChecksumVerification verifyChecksums,
         CompressionDictionary? dictionary, CancellationToken ct)
     {
         int n = CheckedLength(handle);
@@ -119,7 +145,7 @@ internal static class BlockFetcher
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    private static async ValueTask<Block> ReadBlockSlowAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, bool verifyChecksums,
+    private static async ValueTask<Block> ReadBlockSlowAsync(IRandomAccessFile file, Footer footer, BlockHandle handle, ChecksumVerification verifyChecksums,
         CompressionDictionary? dictionary, byte[] buf, int n, ValueTask<int> first, int alreadyRead, CancellationToken ct)
     {
         try
@@ -172,12 +198,12 @@ internal static class BlockFetcher
     /// verified in the buffer, uncompressed blocks are copied into their own buffer, compressed ones decompressed
     /// straight from it.
     /// </summary>
-    public static Block ReadBlock(AsyncPrefetchBuffer prefetch, in Footer footer, BlockHandle handle, bool verifyChecksums, CompressionDictionary? dictionary)
+    public static Block ReadBlock(AsyncPrefetchBuffer prefetch, in Footer footer, BlockHandle handle, ChecksumVerification verifyChecksums, CompressionDictionary? dictionary)
     {
         int n = CheckedLength(handle);
         if (!prefetch.TryRead((long)handle.Offset, n, out ReadOnlySpan<byte> serialized)) ThrowTruncated(handle, 0);
         int size = (int)handle.Size;
-        if (verifyChecksums && !BlockChecksum.Verify(footer.ChecksumType, footer.BaseContextChecksum, serialized, handle.Offset))
+        if (!verifyChecksums.Check(footer, serialized, handle.Offset))
             ThrowHelper.Corruption("block checksum mismatch at offset " + handle.Offset + " size " + size);
         var type = (CompressionType)serialized[size];
         if (type != CompressionType.None) return Decompress(type, serialized[..size], footer.FormatVersion, dictionary, BlockBufferSource.BlockBufferPool);
@@ -193,7 +219,7 @@ internal static class BlockFetcher
     /// returns it. This is BlockFetcher::GetCompressedBlock for MaybeReadBlockAndLoadToCache, which offers the compressed
     /// block to the secondary cache tiers. Uncompressed blocks keep their read buffer and set it to null.
     /// </summary>
-    public static Block ReadBlockKeepingCompressed(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums,
+    public static Block ReadBlockKeepingCompressed(IRandomAccessFile file, in Footer footer, BlockHandle handle, ChecksumVerification verifyChecksums,
         CompressionDictionary? dictionary, out byte[]? serialized)
     {
         int n = CheckedLength(handle);
@@ -216,7 +242,7 @@ internal static class BlockFetcher
     /// <summary>Async <see cref="ReadBlockKeepingCompressed"/>; the serialized block (if compressed) is <see cref="CompressedRead.Serialized"/>.</summary>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public static async ValueTask<CompressedRead> ReadBlockKeepingCompressedAsync(IRandomAccessFile file, Footer footer, BlockHandle handle,
-        bool verifyChecksums, CompressionDictionary? dictionary, CancellationToken ct)
+        ChecksumVerification verifyChecksums, CompressionDictionary? dictionary, CancellationToken ct)
     {
         int n = CheckedLength(handle);
         byte[] buf = BlockBufferPool.Rent(n);
@@ -245,7 +271,7 @@ internal static class BlockFetcher
     public readonly record struct CompressedRead(Block Block, byte[]? Serialized);
 
     // Takes ownership of buf (from BlockBufferPool); hands it back through `serialized` when the block is compressed.
-    private static Block ProcessSerializedKeepingCompressed(byte[] buf, in Footer footer, BlockHandle handle, bool verifyChecksums,
+    private static Block ProcessSerializedKeepingCompressed(byte[] buf, in Footer footer, BlockHandle handle, ChecksumVerification verifyChecksums,
         CompressionDictionary? dictionary, out byte[]? serialized)
     {
         int size = (int)handle.Size;
@@ -257,7 +283,7 @@ internal static class BlockFetcher
         }
         try
         {
-            if (verifyChecksums && !BlockChecksum.Verify(footer.ChecksumType, footer.BaseContextChecksum, buf.AsSpan(0, size + BlockBasedTableConstants.BlockTrailerSize), handle.Offset))
+            if (!verifyChecksums.Check(footer, buf.AsSpan(0, size + BlockBasedTableConstants.BlockTrailerSize), handle.Offset))
                 ThrowHelper.Corruption("block checksum mismatch at offset " + handle.Offset + " size " + size);
             Block b = Decompress(type, buf.AsSpan(0, size), footer.FormatVersion, dictionary, BlockBufferSource.BlockBufferPool);
             serialized = buf;
@@ -274,7 +300,7 @@ internal static class BlockFetcher
     /// Verifies and unpacks a serialized block (payload + trailer) held by the caller, e.g. from a persistent cache
     /// (BlockFetcher's ProcessTrailerIfPresent + decompression on a serialized persistent cache hit).
     /// </summary>
-    internal static Block ProcessSerializedCopy(ReadOnlySpan<byte> serialized, in Footer footer, BlockHandle handle, bool verifyChecksums,
+    internal static Block ProcessSerializedCopy(ReadOnlySpan<byte> serialized, in Footer footer, BlockHandle handle, ChecksumVerification verifyChecksums,
         CompressionDictionary? dictionary)
     {
         byte[] buf = BlockBufferPool.Rent(Math.Max(serialized.Length, 1));
@@ -283,13 +309,13 @@ internal static class BlockFetcher
     }
 
     /// <summary>Takes ownership of <paramref name="buf"/> (rented from <paramref name="source"/>) holding payload + trailer.</summary>
-    private static Block ProcessSerialized(byte[] buf, in Footer footer, BlockHandle handle, bool verifyChecksums, CompressionDictionary? dictionary,
+    private static Block ProcessSerialized(byte[] buf, in Footer footer, BlockHandle handle, ChecksumVerification verifyChecksums, CompressionDictionary? dictionary,
         BlockBufferSource source)
     {
         int size = (int)handle.Size;
         try
         {
-            if (verifyChecksums && !BlockChecksum.Verify(footer.ChecksumType, footer.BaseContextChecksum, buf.AsSpan(0, size + BlockBasedTableConstants.BlockTrailerSize), handle.Offset))
+            if (!verifyChecksums.Check(footer, buf.AsSpan(0, size + BlockBasedTableConstants.BlockTrailerSize), handle.Offset))
                 ThrowHelper.Corruption("block checksum mismatch at offset " + handle.Offset + " size " + size);
         }
         catch
@@ -349,14 +375,14 @@ internal static class BlockFetcher
     /// Unpacks a serialized block's payload into an array rented from <see cref="RocksArrayPool{T}.Shared"/> (used for filters,
     /// which aren't parsed as blocks).
     /// </summary>
-    public static byte[] ReadRawPayload(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums, out int length) =>
+    public static byte[] ReadRawPayload(IRandomAccessFile file, in Footer footer, BlockHandle handle, ChecksumVerification verifyChecksums, out int length) =>
         ReadRawPayload(file, footer, handle, verifyChecksums, BlockBufferSource.Shared, out length);
 
     /// <summary>
     /// Unpacks a serialized block's payload into an array rented from <paramref name="source"/> (the caller returns it
     /// there).
     /// </summary>
-    public static byte[] ReadRawPayload(IRandomAccessFile file, in Footer footer, BlockHandle handle, bool verifyChecksums, BlockBufferSource source,
+    public static byte[] ReadRawPayload(IRandomAccessFile file, in Footer footer, BlockHandle handle, ChecksumVerification verifyChecksums, BlockBufferSource source,
         out int length)
     {
         int n = CheckedLength(handle);
@@ -368,7 +394,7 @@ internal static class BlockFetcher
             PerfContext.RecordBlockRead(read, perfRead);
             if (read != n) ThrowTruncated(handle, read);
             int size = (int)handle.Size;
-            if (verifyChecksums && !BlockChecksum.Verify(footer.ChecksumType, footer.BaseContextChecksum, buf.AsSpan(0, n), handle.Offset))
+            if (!verifyChecksums.Check(footer, buf.AsSpan(0, n), handle.Offset))
                 ThrowHelper.Corruption("block checksum mismatch at offset " + handle.Offset + " size " + size);
             var type = (CompressionType)buf[size];
             if (type == CompressionType.None)

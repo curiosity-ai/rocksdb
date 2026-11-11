@@ -294,20 +294,46 @@ public sealed class Audit4ClosingToolsCompatTests
         "rocksdb.block.cache.bytes.write", "rocksdb.block.cache.bytes.read", "rocksdb.block.cache.data.bytes.insert", // charge incl. malloc_usable_size
         "rocksdb.compaction.total.time.cpu_micros",
         "rocksdb.last.level.read.bytes", "rocksdb.non.last.level.read.bytes", // file sizes differ by the property block
+        "rocksdb.last.level.read.count", "rocksdb.non.last.level.read.count", // one more read per table open than native
     };
 
-    /// <summary>Tickers the port never increments (open; see <see cref="TickersThePortDoesNotIncrement"/>).</summary>
+    /// <summary>
+    /// Tickers native increments in the workload that the port does not (the explicit exclusion list of
+    /// <see cref="FormerlyMissingTickersMatchNativeOrAreExcluded"/>, which fails when one of them starts being recorded).
+    /// </summary>
     private static readonly string[] s_notIncremented =
     [
-        "rocksdb.block.cache.bytes.read", "rocksdb.block.cache.data.bytes.insert", // BlockBasedTable::UpdateCacheHitMetrics / UpdateCacheInsertionMetrics
-        "rocksdb.number.superversion_acquires", "rocksdb.number.superversion_releases", // ColumnFamilyData::GetThreadLocalSuperVersion / SuperVersion cleanup
-        "rocksdb.bytes.compression_bypassed", "rocksdb.number.block_compression_bypassed", // BlockBasedTableBuilder (kNoCompression blocks)
-        "rocksdb.compaction.total.time.cpu_micros", // CompactionJob::UpdateCompactionStats
-        "rocksdb.files.deleted.immediately", // DeleteScheduler::DeleteFile
+        // ColumnFamilyData::GetThreadLocalSuperVersion / DBImpl::CleanupSuperVersion: they count refreshes of the
+        // thread-local super version cache; the port has no thread-local super version (readers take a reference on the
+        // installed one), so there is no equivalent point.
+        "rocksdb.number.superversion_acquires", "rocksdb.number.superversion_releases",
+        // CompactionJob::UpdateCompactionStats: per-thread CPU time of the compaction thread (clock->CPUMicros()), for
+        // which .NET has no portable per-thread clock.
+        "rocksdb.compaction.total.time.cpu_micros",
+        // BlockBasedTableIterator seek stats (per level seek / seek-data / useful-filter matrix, RecordTick in
+        // LevelIterator / ForwardLevelIterator): needs per-seek accounting in the iterator hot path.
+        "rocksdb.non.last.level.seek.data", "rocksdb.non.last.level.seek.data.useful.no.filter",
+    ];
+
+    /// <summary>Formerly missing tickers that now have the same value as native for the workload.</summary>
+    private static readonly string[] s_implementedExact =
+    [
+        "rocksdb.bytes.compression_bypassed", "rocksdb.number.block_compression_bypassed", // BlockBasedTableBuilder::CompressAndVerifyBlock
+        "rocksdb.files.deleted.immediately", // DeleteScheduler::DeleteFileImmediately
         "rocksdb.memtable.payload.bytes.at.flush", "rocksdb.memtable.garbage.bytes.at.flush", // FlushJob::WriteLevel0Table
-        "rocksdb.last.level.read.bytes", "rocksdb.last.level.read.count", "rocksdb.non.last.level.read.bytes", "rocksdb.non.last.level.read.count", // RandomAccessFileReader
-        "rocksdb.non.last.level.seek.data", "rocksdb.non.last.level.seek.data.useful.no.filter", // BlockBasedTableIterator seek stats
         "rocksdb.block.checksum.compute.count", // BlockFetcher::ProcessTrailerIfPresent
+    ];
+
+    /// <summary>
+    /// Formerly missing tickers that are recorded at the upstream call site but whose value cannot equal native's:
+    /// the block cache byte tickers count the cache charge (native: malloc_usable_size of the block plus metadata), and
+    /// the read tickers of RandomAccessFileReader depend on the read pattern at table open (the port issues one more
+    /// read per table open than native, and the file tails differ by the properties block).
+    /// </summary>
+    private static readonly string[] s_implementedNotComparable =
+    [
+        "rocksdb.block.cache.bytes.read", "rocksdb.block.cache.data.bytes.insert", // BlockBasedTable::UpdateCacheHitMetrics / UpdateCacheInsertionMetrics
+        "rocksdb.last.level.read.bytes", "rocksdb.last.level.read.count", "rocksdb.non.last.level.read.bytes", "rocksdb.non.last.level.read.count", // RecordIOStats
     ];
 
     /// <summary>
@@ -350,21 +376,34 @@ public sealed class Audit4ClosingToolsCompatTests
     }
 
     /// <summary>
-    /// Open: tickers native increments in the workload above that the port never touches (each needs a new call site
-    /// in a hot path or a counter the port does not keep).
+    /// The tickers the first ticker comparison found missing in the port: each one is now either equal to native
+    /// (<see cref="s_implementedExact"/>), recorded but not comparable (<see cref="s_implementedNotComparable"/>, within
+    /// 25% of native) or explicitly excluded with its reason (<see cref="s_notIncremented"/>).
     /// </summary>
     [TestMethod]
-    [Ignore("audit4: tickers never incremented by the port (block cache bytes read / data bytes insert, superversion acquires, compression bypassed, memtable payload at flush, last-level read stats, checksum compute count, files deleted immediately); each needs new accounting in a hot path")]
-    public void TickersThePortDoesNotIncrement()
+    public void FormerlyMissingTickersMatchNativeOrAreExcluded()
     {
         using var nativeDir = new TempDir("a4-tick0-n");
         using var managedDir = new TempDir("a4-tick0-m");
         Dictionary<string, ulong> nt = Tickers(NativeTickerWorkload(nativeDir.Path));
         Dictionary<string, ulong> mt = Tickers(ManagedTickerWorkload(managedDir.Path));
+        var diff = new StringBuilder();
+        foreach (string name in s_implementedExact)
+        {
+            Assert.IsTrue(nt[name] > 0, name + " is not exercised");
+            if (mt[name] != nt[name]) diff.Append(name).Append(": native ").Append(nt[name]).Append(", managed ").Append(mt[name]).Append('\n');
+        }
+        foreach (string name in s_implementedNotComparable)
+        {
+            Assert.IsTrue(nt[name] > 0, name + " is not exercised");
+            double ratio = mt[name] / (double)nt[name];
+            if (ratio < 0.75 || ratio > 1.25) diff.Append(name).Append(": native ").Append(nt[name]).Append(", managed ").Append(mt[name]).Append('\n');
+        }
         foreach (string name in s_notIncremented)
         {
-            Assert.IsTrue(nt[name] > 0, name);
-            Assert.IsTrue(mt[name] > 0, name + " is never incremented");
+            Assert.IsTrue(nt[name] > 0, name + " is not exercised");
+            if (mt[name] != 0) diff.Append(name).Append(" is recorded now (").Append(mt[name]).Append("): compare it with native\n");
         }
+        Assert.AreEqual("", diff.ToString());
     }
 }

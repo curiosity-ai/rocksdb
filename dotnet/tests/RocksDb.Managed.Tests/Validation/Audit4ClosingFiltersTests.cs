@@ -157,7 +157,6 @@ public sealed class Audit4ClosingFiltersTests
     // read ticks BLOCK_CHECKSUM_COMPUTE_COUNT (and BLOCK_CHECKSUM_MISMATCH_COUNT on a mismatch). Reading "a" back from
     // the flushed table reads at least its index and data block from the file.
     [TestMethod]
-    [Ignore("audit4: BLOCK_CHECKSUM_COMPUTE_COUNT / BLOCK_CHECKSUM_MISMATCH_COUNT are never recorded: the static Table.BlockFetcher has no statistics and plumbing one through every reader call site is not a local change")]
     public void BlockReadsTickChecksumComputeCount()
     {
         RocksDb.Managed.Env.MemoryFileSystem fs =Db.DbTestUtil.NewFs();

@@ -44,7 +44,7 @@ public sealed unsafe class MemTable : IDisposable
     private readonly InlineSkipList<MemTableKeyComparer> _table;
     private readonly InlineSkipList<MemTableKeyComparer> _rangeDelTable;
     private readonly long _maxRangeDeletions;
-    private readonly ulong _creationSeq;
+    private ulong _creationSeq; // SetCreationSeq: DB mutex; read under the mutex or by the write leader
     // newest_udt_ (persist_user_defined_timestamps = false only): the newest timestamp added, guarded by _newestUdtLock.
     private readonly int _newestUdtSize;
     private readonly byte[]? _newestUdt;
@@ -930,7 +930,10 @@ public sealed unsafe class MemTable : IDisposable
     /// <summary>Sets the earliest seqno (used when a memtable is created before its first write's seqno is known).</summary>
     public void SetEarliestSequenceNumber(ulong value) => Volatile.Write(ref _earliestSeqno, value);
 
-    public ulong CreationSequence => _creationSeq;
+    public ulong CreationSequence => Volatile.Read(ref _creationSeq);
+
+    /// <summary>Port of MemTable::SetCreationSeq (an empty memtable that survives a memtable switch of another column family).</summary>
+    public void SetCreationSequence(ulong value) => Volatile.Write(ref _creationSeq, value);
 
     public bool IsEmpty => Volatile.Read(ref _firstSeqno) == 0;
 

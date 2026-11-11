@@ -151,7 +151,7 @@ public sealed partial class BlockBasedTableReader
         CachedBlock h = lookup.TakeResult();
         if (h.HasValue)
         {
-            _stats?.Record(HitCounter(kind));
+            _stats?.RecordHit(HitCounter(kind), h.Charge);
             if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, Unsafe.As<Block>(h.Value), hit: true, flags);
             return BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h);
         }
@@ -176,7 +176,7 @@ public sealed partial class BlockBasedTableReader
     private Block ReadBlockFromFile(BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
         PersistentCache? pc = _persistentCache;
-        if (pc is null) return BlockFetcher.ReadBlock(_file, _footer, handle, Verify(flags), DictFor(kind));
+        if (pc is null) return BlockFetcher.ReadBlock(_file, _footer, handle, VerifyRead(flags), DictFor(kind));
         return ReadBlockThroughPersistentCache(pc, handle, kind, flags);
     }
 
@@ -190,7 +190,7 @@ public sealed partial class BlockBasedTableReader
     {
         // BlockFetcher: read_options.fill_cache gates the persistent cache inserts, read_options.verify_checksums the checks.
         bool fill = (flags & TableReadFlags.DontFillCache) == 0;
-        bool verify = Verify(flags);
+        BlockFetcher.ChecksumVerification verify = VerifyRead(flags);
         byte[] key = RocksArrayPool<byte>.Shared.Rent(CacheKey.Size);
         try
         {
@@ -268,7 +268,7 @@ public sealed partial class BlockBasedTableReader
     {
         // BlockFetcher: read_options.fill_cache gates the persistent cache inserts, read_options.verify_checksums the checks.
         bool fill = (flags & TableReadFlags.DontFillCache) == 0;
-        bool verify = Verify(flags);
+        BlockFetcher.ChecksumVerification verify = VerifyRead(flags);
         Span<byte> key = stackalloc byte[CacheKey.Size];
         _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset).WriteTo(key);
         Statistics? stats = _stats?.Owner;

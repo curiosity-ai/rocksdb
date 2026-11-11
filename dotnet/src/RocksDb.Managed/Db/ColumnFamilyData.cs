@@ -134,6 +134,7 @@ internal sealed class ColumnFamilyData
         // ioptions.cf_paths (= db_paths): GetPathId of the leveled and universal pickers.
         CompactionState.Picker.PathTargetSizes = db.DbPathTargetSizes;
         TableCache.LevelStats = Stats;
+        TableCache.NumLevels = NumLevels;
         if (options.EnableBlobDirectWrite && options.EnableBlobFiles && !db.IsReadOnly)
         {
             // DBImpl::MaybeInitBlobDirectWriteColumnFamily.

@@ -224,7 +224,9 @@ internal sealed partial class DbImpl
         ulong epoch;
         lock (_mutex)
         {
-            if (ShouldRescheduleFlushToRetainUdt(cfd))
+            // BackgroundFlush: "if (!flush_req.atomic_flush && ShouldRescheduleFlushRequestToRetainUDT(flush_req))" - a
+            // member of an atomic flush is never postponed (it would leave the group waiting for it forever).
+            if (group is null && ShouldRescheduleFlushToRetainUdt(cfd))
             {
                 RescheduleFlushToRetainUdt(cfd);
                 return;
@@ -257,6 +259,19 @@ internal sealed partial class DbImpl
             {
                 foreach (ImmutableMemTable m in picked) m.FlushInProgress = false;
             }
+            TryDeleteFile(FileNames.TableFileName(DbPaths, fileNumber, 0));
+        }
+        catch (FlushSkippedSinceBgErrorException e)
+        {
+            // FlushJob::Run: the memtables are rolled back (RollbackMemtableFlush) and the flush returns the background
+            // error; FlushMemTableToOutputFile does not set it again (skip_set_bg_error). Nothing was written to the
+            // MANIFEST: the output is dropped from the table cache and deleted.
+            failure = e.BackgroundError;
+            lock (_mutex)
+            {
+                foreach (ImmutableMemTable m in picked) m.FlushInProgress = false;
+            }
+            cfd.TableCache.Evict(fileNumber);
             TryDeleteFile(FileNames.TableFileName(DbPaths, fileNumber, 0));
         }
         catch (Exception e)
@@ -326,6 +341,12 @@ internal sealed partial class DbImpl
         }
     }
 
+    /// <summary>Thrown by a flush that built its table but must not install it (skipped_since_bg_error of FlushJob::Run).</summary>
+    private sealed class FlushSkippedSinceBgErrorException(RocksDbException backgroundError) : Exception
+    {
+        public RocksDbException BackgroundError { get; } = backgroundError;
+    }
+
     /// <summary>Builds the L0 file for <paramref name="picked"/> and installs the result (FlushJob::Run + install).</summary>
     private async ValueTask FlushMemTablesAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch,
         bool synchronous, AtomicFlushGroup? group)
@@ -374,7 +395,7 @@ internal sealed partial class DbImpl
         try
         {
             meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, TableFileWriteOptions(Env.IoPriority.High), cfd, mems, fileNumber, epoch, Identity, snapshots, CurrentSnapshotChecker, blobBuilder,
-                    directWrite?.Meter, seqnoToTime, baseVersion.Storage, synchronous, CancellationToken.None)
+                    directWrite?.Meter, seqnoToTime, baseVersion.Storage, Options.Statistics, synchronous, CancellationToken.None)
                 .ConfigureAwait(false);
         }
         catch (Exception e) when (HasListeners)
@@ -461,6 +482,18 @@ internal sealed partial class DbImpl
             }
         }
         TestHooks.Invoke("DBImpl::FlushMemTables:BeforeLogAndApply");
+        if (group is null && reason != FlushReason.ErrorRecovery && reason != FlushReason.ErrorRecoveryRetryFlush)
+        {
+            // FlushJob::Run: a flush that is not an error recovery flush does not install its result once a background
+            // error stopped background work ("!error_handler->GetBGError().ok() && error_handler->IsBGWorkStopped()").
+            // (A flush running for an error recovery in progress is not skipped either: the recovery flushes every
+            // sealed memtable, whatever the reason it was sealed for.)
+            lock (_mutex)
+            {
+                if (IsBgWorkStopped && !ErrorHandler.IsRecoveryInProgress && ErrorHandler.BgError is { } bgError)
+                    throw new FlushSkippedSinceBgErrorException(bgError);
+            }
+        }
         // From here on a failure may still have made the edit durable: leave the blob files to the obsolete-file scan.
         if (blobBuilder is not null) blobBuilder.Committed = true;
         // Removes the flushed memtables and installs the super version (which recalculates the write stall); runs in the
@@ -518,10 +551,8 @@ internal sealed partial class DbImpl
         var targets = new List<(ColumnFamilyData Cfd, ImmutableMemTable Mem)>(1);
         try
         {
-            lock (_mutex)
-            {
-                if (IsBgWorkStopped && ErrorHandler.BgError is { } bg) ThrowBackgroundError(bg);
-            }
+            // DBImpl::FlushMemTable does not look at the background error before SwitchMemtable: the memtable is sealed
+            // and the flush requested; WaitForFlushMemTables reports the error (only with FlushOptions::wait).
             if (cfd.Dropped) ThrowDropped(cfd);
             await SwitchMemtablesForFlushAsync([cfd], reason, synchronous, cancellationToken).ConfigureAwait(false);
             lock (_mutex)
@@ -547,12 +578,18 @@ internal sealed partial class DbImpl
         {
             ExitUnbatched(w, synchronous);
         }
-        if (!wait || targets.Count == 0) return;
+        if (!wait) return;
+        // DBImpl::WaitForFlushMemTables (also entered with nothing to wait for).
         while (true)
         {
             Task signal;
             lock (_mutex)
             {
+                // "If BGWorkStopped, which indicate that there is a BG error and 1) soft error but requires no BG work,
+                // 2) no in auto_recovery_": reported even when the memtables were flushed meanwhile. (An error that
+                // stopped the DB ends the wait and is reported below.)
+                if (!ErrorHandler.IsDbStopped && IsBgWorkStopped && ErrorHandler.BgError is { Severity: < ErrorSeverity.HardError } soft)
+                    ThrowBackgroundError(soft);
                 bool done = true;
                 foreach ((ColumnFamilyData c, ImmutableMemTable target) in targets)
                 {

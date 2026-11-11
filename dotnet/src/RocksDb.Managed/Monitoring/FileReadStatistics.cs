@@ -54,13 +54,27 @@ internal sealed class StatisticsRandomAccessFile(IRandomAccessFile inner, Statis
     {
     }
 
+    /// <summary>
+    /// The file is a table file of the last level (RandomAccessFileReader's is_last_level, "level == num_levels - 1"
+    /// when TableCache::GetTableReader opened it): its reads count in LAST_LEVEL_READ_BYTES / _COUNT, those of every
+    /// other file in NON_LAST_LEVEL_READ_BYTES / _COUNT (RecordIOStats, file/random_access_file_reader.cc).
+    /// </summary>
+    public bool IsLastLevel { get; init; }
+
     public long Length => inner.Length;
+
+    private void RecordIoStats(int bytes)
+    {
+        statistics.RecordTick(IsLastLevel ? Ticker.LastLevelReadBytes : Ticker.NonLastLevelReadBytes, (ulong)Math.Max(bytes, 0));
+        statistics.RecordTick(IsLastLevel ? Ticker.LastLevelReadCount : Ticker.NonLastLevelReadCount);
+    }
 
     public int Read(long offset, Span<byte> destination)
     {
         long t0 = statistics.StartTimer();
         int activity = FileReadActivity.Current;
         int n = inner.Read(offset, destination);
+        RecordIoStats(n);
         if (t0 != 0) Record(t0, activity);
         return n;
     }
@@ -70,11 +84,12 @@ internal sealed class StatisticsRandomAccessFile(IRandomAccessFile inner, Statis
         long t0 = statistics.StartTimer();
         int activity = FileReadActivity.Current;
         ValueTask<int> t = inner.ReadAsync(offset, destination, cancellationToken);
-        if (t0 == 0) return t;
         if (t.IsCompletedSuccessfully)
         {
-            Record(t0, activity);
-            return t;
+            int n = t.Result;
+            RecordIoStats(n);
+            if (t0 != 0) Record(t0, activity);
+            return new ValueTask<int>(n);
         }
         return Await(t, t0, activity);
     }
@@ -83,7 +98,8 @@ internal sealed class StatisticsRandomAccessFile(IRandomAccessFile inner, Statis
     private async ValueTask<int> Await(ValueTask<int> t, long t0, int activity)
     {
         int n = await t.ConfigureAwait(false);
-        Record(t0, activity);
+        RecordIoStats(n);
+        if (t0 != 0) Record(t0, activity);
         return n;
     }
 

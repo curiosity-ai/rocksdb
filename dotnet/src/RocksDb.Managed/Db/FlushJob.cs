@@ -38,7 +38,8 @@ internal static class FlushJob
     /// (ascending) when the flush job was created (FlushJob's existing_snapshots_). <paramref name="baseVersion"/> is the
     /// version the flush is based on (FlushJob's base_, which the caller keeps referenced; null for a recovery flush):
     /// with it the file's compensated_range_deletion_size is the approximate size of the data in that version its range
-    /// tombstones cover.
+    /// tombstones cover. <paramref name="flushStatistics"/>: where the memtable payload and garbage bytes of the flush
+    /// are recorded (TableFileCreationReason::kFlush only), or null.
     /// </summary>
     /// <remarks>
     /// <paramref name="snapshotChecker"/> is the DB's snapshot checker (WritePrepared / WriteUnprepared, or
@@ -49,7 +50,7 @@ internal static class FlushJob
     public static async ValueTask<FileMetaData?> WriteLevel0TableAsync(IFileSystem fs, string path, WritableFileOptions fileOptions, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
         ulong fileNumber, ulong epochNumber, DbIdentity identity, ulong[] snapshots, SnapshotChecker? snapshotChecker, Blob.BlobFileBuilder? blobBuilder,
         Blob.BlobGarbageMeter? blobOutflow, SeqnoToTimeMapping? seqnoToTimeMapping, VersionStorageInfo? baseVersion,
-        bool synchronous, CancellationToken cancellationToken)
+        Statistics? flushStatistics, bool synchronous, CancellationToken cancellationToken)
     {
         bool stripTimestamps = cfd.TimestampsInMemtableOnly;
         ValidateFlushCompactionFilter(cfd);
@@ -98,17 +99,20 @@ internal static class FlushJob
             using (TableBuilder builder = TableBuilder.Create(file, cfd.Format, tbo))
             {
                 ulong smallestPreferredSeqno = DbFormat.MaxSequenceNumber;
+                // BuildTable: total_input_raw_key_bytes + total_input_raw_value_bytes of the point entries read, plus
+                // the key and value bytes of the range tombstones (total_tombstone_payload_bytes).
+                ulong inputPayloadBytes = RangeTombstonePayloadBytes(mems);
                 FragmentedRangeTombstoneList? tombstones = FragmentRangeTombstones(cfd, mems, stripTimestamps);
                 if (stripTimestamps)
                 {
-                    AddPointEntriesWithMinTimestamp(builder, cfd, mems, meta, blobBuilder, snapshots, tombstones);
+                    AddPointEntriesWithMinTimestamp(builder, cfd, mems, meta, blobBuilder, snapshots, tombstones, ref inputPayloadBytes);
                 }
                 else
                 {
                     // Collapsing versions of a key compares user keys without their timestamp and needs full_history_ts_low;
                     // with persisted user-defined timestamps every version is kept (always correct).
                     smallestPreferredSeqno = AddPointEntries(builder, cfd.Icmp, mems, meta, snapshots,
-                        dropHidden: cfd.TimestampSize == 0 && snapshotChecker is null, blobBuilder, blobOutflow, seqnoToTimeMapping);
+                        dropHidden: cfd.TimestampSize == 0 && snapshotChecker is null, blobBuilder, blobOutflow, seqnoToTimeMapping, ref inputPayloadBytes);
                 }
                 blobBuilder?.Finish();
                 // BuildTable writes CompactionRangeDelAggregator::NewIterator(): only the newest tombstone of each snapshot
@@ -147,6 +151,15 @@ internal static class FlushJob
                     meta.MarkedForCompaction = builder.NeedCompact;
                     // Entry stats as the version would load them from the table properties (no table read needed).
                     meta.SetEntryStats(builder.Properties);
+                    if (flushStatistics is not null)
+                    {
+                        // BuildTable / FlushJob::WriteLevel0Table: MEMTABLE_PAYLOAD_BYTES_AT_FLUSH and
+                        // MEMTABLE_GARBAGE_BYTES_AT_FLUSH (payload read minus payload written; "Prevent underflow").
+                        ulong written = builder.Properties.RawKeySize + builder.Properties.RawValueSize;
+                        bool consistent = written <= inputPayloadBytes;
+                        flushStatistics.RecordTick(Ticker.MemtablePayloadBytesAtFlush, consistent ? inputPayloadBytes : 0);
+                        flushStatistics.RecordTick(Ticker.MemtableGarbageBytesAtFlush, consistent ? inputPayloadBytes - written : 0);
+                    }
                     keep = true;
                 }
             }
@@ -213,7 +226,8 @@ internal static class FlushJob
 
     /// <summary>Returns the smallest preferred seqno assigned to a TimedPut entry (kMaxSequenceNumber if none).</summary>
     private static ulong AddPointEntries(TableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
-        ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder, Blob.BlobGarbageMeter? blobOutflow, SeqnoToTimeMapping? seqnoToTimeMapping)
+        ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder, Blob.BlobGarbageMeter? blobOutflow, SeqnoToTimeMapping? seqnoToTimeMapping,
+        ref ulong inputPayloadBytes)
     {
         Util.PooledBufferWriter? blobIndex = blobBuilder is null ? null : new Util.PooledBufferWriter(Blob.BlobIndex.MaxEncodedLength);
         Util.PooledBufferWriter? blobKey = blobBuilder is null ? null : new Util.PooledBufferWriter(64);
@@ -221,7 +235,7 @@ internal static class FlushJob
         var timed = new TimedPutRewriter(seqnoToTimeMapping);
         try
         {
-            AddPointEntries(builder, icmp, mems, meta, snapshots, dropHidden, blobBuilder, blobIndex, blobKey, entities, blobOutflow, ref timed);
+            AddPointEntries(builder, icmp, mems, meta, snapshots, dropHidden, blobBuilder, blobIndex, blobKey, entities, blobOutflow, ref timed, ref inputPayloadBytes);
             return timed.SmallestPreferredSeqno;
         }
         finally
@@ -282,7 +296,7 @@ internal static class FlushJob
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void AddPointEntries(TableBuilder builder, InternalKeyComparator icmp, IReadOnlyList<MemTable> mems, FileMetaData meta,
         ulong[] snapshots, bool dropHidden, Blob.BlobFileBuilder? blobBuilder, Util.PooledBufferWriter? blobIndex, Util.PooledBufferWriter? blobKey,
-        Blob.EntityBlobRewriter? entities, Blob.BlobGarbageMeter? blobOutflow, ref TimedPutRewriter timed)
+        Blob.EntityBlobRewriter? entities, Blob.BlobGarbageMeter? blobOutflow, ref TimedPutRewriter timed, ref ulong inputPayloadBytes)
     {
         int n = mems.Count;
         var its = new MemTableIterator[n];
@@ -306,6 +320,7 @@ internal static class FlushJob
             }
             if (best < 0) break;
             ReadOnlySpan<byte> key = its[best].Key;
+            inputPayloadBytes += (ulong)(key.Length + its[best].Value.Length);
             ulong footer = DbFormat.ExtractFooter(key);
             var type = (EntryType)(byte)footer;
             ulong seq = footer >> 8;
@@ -378,7 +393,7 @@ internal static class FlushJob
     /// <paramref name="snapshots"/> are the live snapshot sequence numbers, ascending. Cold path (allocates per flush).
     /// </summary>
     private static void AddPointEntriesWithMinTimestamp(TableBuilder builder, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
-        FileMetaData meta, Blob.BlobFileBuilder? blobBuilder, ulong[] snapshots, FragmentedRangeTombstoneList? tombstones)
+        FileMetaData meta, Blob.BlobFileBuilder? blobBuilder, ulong[] snapshots, FragmentedRangeTombstoneList? tombstones, ref ulong inputPayloadBytes)
     {
         InternalKeyComparator icmp = cfd.Icmp;
         int ts = cfd.TimestampSize;
@@ -408,6 +423,7 @@ internal static class FlushJob
             if (best < 0) break;
             ReadOnlySpan<byte> original = its[best].Key;
             ReadOnlySpan<byte> value = its[best].Value;
+            inputPayloadBytes += (ulong)(original.Length + value.Length);
             ulong footer = DbFormat.ExtractFooter(original);
             var type = (EntryType)(byte)footer;
             ulong seq = footer >> 8;
@@ -553,6 +569,22 @@ internal static class FlushJob
     /// The fragmented range tombstones of all memtables (null when there are none); with <paramref name="minTimestamps"/>
     /// read through NewTimestampStrippingRangeTombstoneIterator.
     /// </summary>
+    /// <summary>
+    /// FragmentedRangeTombstoneList::total_tombstone_payload_bytes summed over the memtables: internal key plus value
+    /// (end key) bytes of every range tombstone entry.
+    /// </summary>
+    private static ulong RangeTombstonePayloadBytes(IReadOnlyList<MemTable> mems)
+    {
+        ulong bytes = 0;
+        foreach (MemTable m in mems)
+        {
+            if (m.NumRangeDeletes == 0) continue;
+            MemTableIterator it = m.NewRangeTombstoneEntryIterator();
+            for (it.SeekToFirst(); it.Valid; it.Next()) bytes += (ulong)(it.UserKey.Length + DbFormat.InternalKeyFooterSize + it.Value.Length);
+        }
+        return bytes;
+    }
+
     private static FragmentedRangeTombstoneList? FragmentRangeTombstones(ColumnFamilyData cfd, IReadOnlyList<MemTable> mems, bool minTimestamps)
     {
         int withRangeDels = 0;

@@ -1206,6 +1206,14 @@ internal sealed partial class DbImpl
                 _walDirSynced = false;
                 _aliveWals.Add(newLogNumber);
             }
+            // SwitchMemtable: "if (cf->IsEmpty()) ... cf->mem()->SetCreationSeq(versions_->LastSequence())" for every
+            // column family, with or without a new WAL (the creation sequence orders memtables by age for the write
+            // buffer manager's flush pick).
+            ulong lastSequence = Versions.LastSequence;
+            foreach (ColumnFamilyData c in Versions.ColumnFamilies)
+            {
+                if (c.Mem.IsEmpty && c.NumNotFlushed == 0) c.Mem.SetCreationSequence(lastSequence);
+            }
             MemTable mem = cfd.Mem;
             // RotateCurrentGeneration: the blob direct write files of this memtable are registered by its flush.
             Blob.BlobDirectWriteGeneration? generation = cfd.BlobDirectWrite?.RotateGeneration();

@@ -31,7 +31,7 @@ internal sealed class PinnedFilterPartitions : IDisposable
     public bool TryGet(ulong offset, out IFilterBitsReader reader) => _readers.TryGetValue(offset, out reader!);
 
     /// <summary>Reads every partition listed in the top-level filter partition index <paramref name="top"/>.</summary>
-    public static PinnedFilterPartitions Load(IRandomAccessFile file, in Footer footer, bool verifyChecksums, FilterPolicy policy, Block top,
+    public static PinnedFilterPartitions Load(IRandomAccessFile file, in Footer footer, BlockFetcher.ChecksumVerification verifyChecksums, FilterPolicy policy, Block top,
         TableProperties props, Comparator comparator, bool ignoreUnreadablePartitions)
     {
         var result = new PinnedFilterPartitions();

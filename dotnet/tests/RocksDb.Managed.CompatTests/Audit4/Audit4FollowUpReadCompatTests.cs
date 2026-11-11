@@ -39,7 +39,7 @@ public sealed unsafe class Audit4FollowUpReadCompatTests
     /// WriteBatch::Handler::SingleDeleteCF (include/rocksdb/write_batch.h): for the default column family the no-op
     /// SingleDelete(key) and OK, so the entry is silently left out of the rewritten batch and the key stays.
     /// The native half pins that down. The managed TTL database applies the SingleDelete (its handler forwards it):
-    /// the comparison is kept ignored until it is decided whether to mirror upstream's behaviour.
+    /// a documented deviation, pinned by <see cref="ManagedTtlWriteAppliesSingleDeleteOfABatchWhereNativeDropsIt"/>.
     /// </summary>
     [TestMethod]
     public void NativeTtlWriteDropsSingleDeleteOfABatch()
@@ -60,18 +60,43 @@ public sealed unsafe class Audit4FollowUpReadCompatTests
         Assert.AreEqual("1", Encoding.UTF8.GetString(ndb.Get(U("p"))));
     }
 
+    /// <summary>
+    /// Documented deviation (decided: keep the port's behaviour). The same batch written to a native and to a managed
+    /// TTL database: native's DBWithTTLImpl::Write silently drops the SingleDelete (see
+    /// <see cref="NativeTtlWriteDropsSingleDeleteOfABatch"/>), the managed TTL database applies it like every other
+    /// entry of the batch. Both sides are pinned so a change of either is noticed.
+    /// </summary>
     [TestMethod]
-    [Ignore("audit4: upstream DBWithTTL::Write silently drops a batch's SingleDelete (handler without SingleDeleteCF); the port applies it")]
-    public void ManagedTtlWriteTreatsSingleDeleteOfABatchLikeNative()
+    public void ManagedTtlWriteAppliesSingleDeleteOfABatchWhereNativeDropsIt()
     {
+        using var nativeDir = new TempDir("audit4-fur-ttl-n2");
+        using (RocksDbSharp.RocksDb ndb = RocksDbSharp.RocksDb.OpenWithTtl(new RocksDbSharp.DbOptions().SetCreateIfMissing(true), nativeDir.Path, 3600))
+        {
+            ndb.Put(U("k"), U("v"));
+            using (var b = new RocksDbSharp.WriteBatch())
+            {
+                NativeSingleDelete(b, U("k"));
+                b.Delete(U("d"));
+                b.Put(U("p"), U("1"));
+                ndb.Write(b);
+            }
+            Assert.AreEqual("v", Encoding.UTF8.GetString(ndb.Get(U("k"))), "native: the SingleDelete of the batch is dropped");
+            Assert.AreEqual("1", Encoding.UTF8.GetString(ndb.Get(U("p"))));
+        }
+
         using var dir = new TempDir("audit4-fur-ttl-m");
         using TtlDatabase db = TtlDatabase.Open(dir.Path, new DbOptions { CreateIfMissing = true }, 3600);
         db.Put(U("k"), U("v"));
+        db.Put(U("d"), U("v"));
         using (var b = new WriteBatch())
         {
             b.SingleDelete(U("k"));
+            b.Delete(U("d"));
+            b.Put(U("p"), U("1"));
             db.Write(b);
         }
-        Assert.AreEqual("v", Encoding.UTF8.GetString(db.Get(U("k"))!));
+        Assert.IsNull(db.Get(U("k")), "managed: the SingleDelete of the batch is applied");
+        Assert.IsNull(db.Get(U("d")));
+        Assert.AreEqual("1", Encoding.UTF8.GetString(db.Get(U("p"))!));
     }
 }

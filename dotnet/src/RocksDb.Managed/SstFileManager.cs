@@ -243,6 +243,12 @@ public sealed class SstFileManager : IDisposable
     /// ScheduleFileDeletion: deletes a tracked file, through the trash queue when a deletion rate is set (and
     /// <paramref name="forceBackground"/> or the trash is small enough), else immediately.
     /// </summary>
+    /// <summary>
+    /// SstFileManagerImpl::SetStatisticsPtr: the statistics of the DB that uses this manager (DBImpl::Open sets it), for
+    /// FILES_DELETED_IMMEDIATELY and FILES_MARKED_TRASH.
+    /// </summary>
+    internal Statistics? Statistics { get; set; }
+
     internal void ScheduleFileDeletion(string path, string directoryToSync, bool forceBackground) =>
         _deleteScheduler.DeleteFile(path, directoryToSync, forceBackground);
 
@@ -464,6 +470,7 @@ public sealed class SstFileManager : IDisposable
                     return;
                 }
                 _sfm.OnMoveFile(path, trash);
+                _sfm.Statistics?.RecordTick(Ticker.FilesMarkedTrash); // DeleteScheduler::MarkAsTrash
             }
             ulong size = 0;
             try { size = (ulong)_fs.GetFileSize(trash); }
@@ -482,6 +489,7 @@ public sealed class SstFileManager : IDisposable
             try
             {
                 _fs.DeleteFile(path);
+                _sfm.Statistics?.RecordTick(Ticker.FilesDeletedImmediately); // DeleteScheduler::DeleteFileImmediately
             }
             catch (Exception e) when (e is IOException or RocksDbException)
             {

@@ -206,7 +206,6 @@ public sealed class Audit4ClosingSchedulingTests
     /// rolled back (RollbackMemtableFlush) and the flush returns the background error.
     /// </summary>
     [TestMethod]
-    [Ignore("audit4: open, Db/DbImpl.Flush.cs is being changed by the atomic-flush work (read-only for this slice): FlushAndInstallAsync installs the flush result although a background error stopped background work meanwhile")]
     public void FlushDoesNotInstallItsResultOnceBackgroundWorkIsStopped()
     {
         try
