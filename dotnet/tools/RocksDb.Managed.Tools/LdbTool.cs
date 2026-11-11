@@ -20,6 +20,7 @@ internal sealed class LdbTool
     private readonly Dictionary<string, string> _options = new(StringComparer.Ordinal);
     private readonly HashSet<string> _flags = new(StringComparer.Ordinal);
     private readonly List<string> _params = new();
+    private readonly List<string> _flagOrder = new();
     private readonly IFileSystem _fs;
     private readonly TextWriter _out;
     private readonly TextWriter _err;
@@ -43,6 +44,12 @@ internal sealed class LdbTool
             PrintHelp(stderr);
             return 1;
         }
+        if (args.Count == 1 && args[0] is not ("--version" or "--help"))
+        {
+            // LDBCommandRunner::RunCommand: "argc <= 2" with anything but --version / --help prints the help, exit 1.
+            PrintHelp(stderr);
+            return 1;
+        }
         if (args.Count == 1 && args[0] == "--version")
         {
             Version v = OptionsFile.CurrentRocksDbVersion;
@@ -59,9 +66,23 @@ internal sealed class LdbTool
         {
             if (a.StartsWith("--", StringComparison.Ordinal))
             {
-                int eq = a.IndexOf('=', StringComparison.Ordinal);
-                if (eq >= 0) tool._options[a[2..eq]] = a[(eq + 1)..];
-                else tool._flags.Add(a[2..]);
+                // LDBCommand::ParseSingleParam: StringSplit(param, '=') drops a trailing empty piece, so "--x=" is the
+                // flag x and "--x=y=" is x -> y; with three or more pieces the value is everything after the first '='.
+                string[] splits = a.Split('=');
+                int pieces = splits[^1].Length == 0 ? splits.Length - 1 : splits.Length;
+                if (pieces <= 1)
+                {
+                    tool._flags.Add(splits[0][2..]);
+                    tool._flagOrder.Add(splits[0][2..]);
+                }
+                else if (pieces == 2)
+                {
+                    tool._options[splits[0][2..]] = splits[1];
+                }
+                else
+                {
+                    tool._options[splits[0][2..]] = a[(splits[0].Length + 1)..];
+                }
             }
             else if (tool._command.Length == 0)
             {
@@ -81,6 +102,34 @@ internal sealed class LdbTool
         try
         {
             tool.Init();
+            if (ValidOptions(tool._command, out bool noDbOpen) is { } valid)
+            {
+                // LDBCommand::ValidateCmdLineOptions: options in map (sorted) order, then flags in command-line order.
+                var names = new List<string>(tool._options.Keys);
+                names.Sort(StringComparer.Ordinal);
+                foreach (string name in names)
+                {
+                    if (!IsValidOption(valid, name))
+                    {
+                        stderr.Write("Invalid command-line option " + name + "\n");
+                        return 1;
+                    }
+                }
+                foreach (string flag in tool._flagOrder)
+                {
+                    if (!IsValidOption(valid, flag))
+                    {
+                        stderr.Write("Invalid command-line flag " + flag + "\n");
+                        return 1;
+                    }
+                }
+                if (tool._command == "dump_wal" && tool._options.ContainsKey("db")) noDbOpen = false;
+                if (!noDbOpen && !tool._options.ContainsKey("db") && !tool._options.ContainsKey("path"))
+                {
+                    stderr.Write("Either --db or --path must be specified.\n");
+                    return 1;
+                }
+            }
             if (!tool.Execute())
             {
                 stderr.Write("Unknown command\n");
@@ -107,6 +156,69 @@ internal sealed class LdbTool
         finally
         {
             tool._db?.Dispose();
+        }
+    }
+
+    /// <summary>LDBCommand::BuildCmdLineOptions: the options every command built with it accepts.</summary>
+    private static readonly string[] CommonOptions =
+    [
+        "env_uri", "fs_uri", "db", "secondary_path", "leader_path", "bloom_bits", "block_size", "uniform_cv_threshold", "auto_compaction",
+        "compression_type", "compression_max_dict_bytes", "write_buffer_size", "file_size", "fix_prefix_len", "try_load_options",
+        "disable_consistency_checks", "enable_blob_files", "min_blob_size", "blob_file_size", "blob_compression_type",
+        "enable_blob_garbage_collection", "blob_garbage_collection_age_cutoff", "blob_garbage_collection_force_threshold",
+        "blob_compaction_readahead_size", "blob_file_starting_level", "prepopulate_blob_cache", "ignore_unknown_options", "column_family",
+        "use_txn", "txn_write_policy",
+    ];
+
+    private const string NoCommonOptions = "-";
+
+    private static bool IsValidOption(string[] valid, string name)
+    {
+        if (Array.IndexOf(valid, name, 1) >= 0) return true;
+        return valid[0] != NoCommonOptions && Array.IndexOf(CommonOptions, name) >= 0;
+    }
+
+    /// <summary>
+    /// The valid_cmd_line_options each command's constructor passes to LDBCommand (tools/ldb_cmd.cc) and its NoDBOpen();
+    /// null for an unknown command. The first element says whether the list was built with BuildCmdLineOptions ("") or
+    /// stands alone (<see cref="NoCommonOptions"/>: create_column_family / drop_column_family pass {ARG_DB}).
+    /// </summary>
+    private static string[]? ValidOptions(string command, out bool noDbOpen)
+    {
+        noDbOpen = false;
+        switch (command)
+        {
+            case "get": return ["", "ttl", "hex", "key_hex", "value_hex", "read_timestamp"];
+            case "multi_get": return ["", "hex", "key_hex", "value_hex", "read_timestamp"];
+            case "put":
+            case "batchput": return ["", "ttl", "hex", "key_hex", "value_hex", "create_if_missing"];
+            case "delete":
+            case "singledelete":
+            case "deleterange": return ["", "hex", "key_hex", "value_hex"];
+            case "scan":
+                return ["", "ttl", "no_value", "hex", "key_hex", "to", "value_hex", "from", "timestamp", "max_keys", "start_time", "end_time",
+                    "read_timestamp", "get_write_unix_time"];
+            case "dump":
+                return ["", "ttl", "hex", "key_hex", "value_hex", "from", "to", "max_keys", "count_only", "count_delim", "stats", "start_time",
+                    "end_time", "bucket", "timestamp", "path", "decode_blob_index", "dump_uncompressed_blobs"];
+            case "idump":
+                return ["", "hex", "key_hex", "value_hex", "from", "to", "max_keys", "count_only", "count_delim", "stats", "input_key_hex",
+                    "decode_blob_index"];
+            case "manifest_dump": noDbOpen = true; return ["", "verbose", "path", "hex", "json"];
+            case "dump_wal": noDbOpen = true; return ["", "walfile", "db", "write_committed", "header", "print_value", "only_print_seqno_gaps"];
+            case "list_column_families": noDbOpen = true; return [""];
+            case "create_column_family":
+            case "drop_column_family": return [NoCommonOptions, "db"];
+            case "compact": return ["", "from", "to", "hex", "key_hex", "value_hex", "ttl"];
+            case "checkconsistency": noDbOpen = true; return [""];
+            case "repair": noDbOpen = true; return ["", "verbose"];
+            case "approxsize": return ["", "hex", "key_hex", "value_hex", "from", "to"];
+            case "reduce_levels": noDbOpen = true; return ["", "new_levels", "print_old_levels"];
+            case "file_checksum_dump": noDbOpen = true; return ["", "path", "hex"];
+            case "list_live_files_metadata": return ["", "sort_by_filename"];
+            case "get_property": return [""];
+            case "checkpoint": return ["", "checkpoint_dir"];
+            default: return null;
         }
     }
 
@@ -139,12 +251,31 @@ internal sealed class LdbTool
         if (_dbPath.Length == 0) throw new ToolException("--db must be specified");
     }
 
-    private int IntOpt(string name, int def)
+    /// <summary>
+    /// std::stoi of an option: leading white space, a sign and the longest run of digits (trailing text is ignored); no digits is
+    /// "has an invalid value", overflow "has a value out-of-range". LDBCommand::ParseIntOption ends both messages with a dot
+    /// (<paramref name="dot"/>), the scan / dump constructors do not.
+    /// </summary>
+    private int IntOpt(string name, int def, bool dot)
     {
         string? v = Opt(name);
         if (v is null) return def;
-        if (!int.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out int r)) throw new ToolException(name + " has an invalid value");
-        return r;
+        int i = 0;
+        while (i < v.Length && (v[i] == ' ' || (v[i] >= '\t' && v[i] <= '\r'))) i++;
+        bool neg = false;
+        if (i < v.Length && (v[i] == '+' || v[i] == '-')) neg = v[i++] == '-';
+        int digits = i;
+        long r = 0;
+        bool overflow = false;
+        for (; i < v.Length && v[i] >= '0' && v[i] <= '9'; i++)
+        {
+            if (!overflow) r = r * 10 + (v[i] - '0');
+            if (r > (long)int.MaxValue + 1) overflow = true;
+        }
+        if (i == digits) throw new ToolException(name + " has an invalid value" + (dot ? "." : ""));
+        if (neg) r = -r;
+        if (overflow || r > int.MaxValue || r < int.MinValue) throw new ToolException(name + " has a value out-of-range" + (dot ? "." : ""));
+        return (int)r;
     }
 
     // ---- DB open (LDBCommand::OpenDB / PrepareOptions) ------------------------------------------------------------
@@ -226,7 +357,15 @@ internal sealed class LdbTool
         if (_params.Count != 1) throw new ToolException("<key> must be specified for the get command");
         byte[] key = KeyArg(_params[0]);
         RocksDatabase db = OpenDb(readOnly: true);
-        byte[]? v = Cf(db).Get(key);
+        byte[]? v;
+        try
+        {
+            v = Cf(db).Get(key);
+        }
+        catch (RocksDbException e)
+        {
+            throw new ToolException("Get failed: " + e.Message);
+        }
         W(v is null ? "Key not found\n" : Val(v) + "\n");
     }
 
@@ -303,7 +442,7 @@ internal sealed class LdbTool
     {
         byte[]? from = Opt("from") is { } f ? KeyArg(f) : null;
         byte[]? to = Opt("to") is { } t ? KeyArg(t) : null;
-        int maxKeys = IntOpt("max_keys", -1);
+        int maxKeys = IntOpt("max_keys", -1, dot: false);
         bool noValue = Flag("no_value");
         RocksDatabase db = OpenDb(readOnly: true);
         using Iterator it = Cf(db).NewIterator(new ReadOptions { TotalOrderSeek = true });
@@ -331,14 +470,14 @@ internal sealed class LdbTool
             switch (type)
             {
                 case FileType.WalFile: DumpWalFiles(path, printHeader: true, printValues: true, onlySeqnoGaps: false); return;
-                case FileType.TableFile: DumpSstFile(path, _keyHex, showProperties: true, Opt("from") ?? "", Opt("to") ?? ""); return;
+                case FileType.TableFile: DumpSstFile(path, _keyHex, showProperties: true, Opt("from") is { } sf ? KeyArg(sf) : [], Opt("to") is { } st ? KeyArg(st) : []); return;
                 case FileType.DescriptorFile: DumpManifestFile(path, verbose: false, hex: _keyHex); return;
                 default: throw new ToolException("File type not supported: " + path);
             }
         }
         byte[]? from = Opt("from") is { } f ? KeyArg(f) : null;
         byte[]? to = Opt("to") is { } t ? KeyArg(t) : null;
-        int maxKeys = IntOpt("max_keys", -1);
+        int maxKeys = IntOpt("max_keys", -1, dot: false);
         RocksDatabase db = OpenDb(readOnly: true);
         ColumnFamily cf = Cf(db);
         if (Flag("stats") && db.GetProperty("rocksdb.stats") is { } stats) W(stats + "\n");
@@ -399,14 +538,18 @@ internal sealed class LdbTool
         bool inputKeyHex = Flag("input_key_hex");
         byte[]? from = Opt("from") is { } f ? (inputKeyHex ? ToolText.HexToBytes(f) : ToolText.ArgBytes(f)) : null;
         byte[]? to = Opt("to") is { } t ? (inputKeyHex ? ToolText.HexToBytes(t) : ToolText.ArgBytes(t)) : null;
-        int maxKeys = IntOpt("max_keys", -1);
+        int maxKeys = IntOpt("max_keys", -1, dot: true);
         bool countOnly = Flag("count_only");
+        bool countDelim = Opt("count_delim") is not null || Flag("count_delim");
+        string delim = Opt("count_delim") ?? ".";
         RocksDatabase db = OpenDb(readOnly: true);
         ColumnFamily cf = Cf(db);
         if (Flag("stats") && cf.GetProperty("rocksdb.stats") is { } stats) W(stats + "\n");
         Comparator ucmp = cf.Data.UserComparator;
         DbIteratorSources sources = cf.Db.NewIteratorSources(cf.Data, null);
         long count = 0;
+        ulong c = 0, s2 = 0;
+        string rtype2 = "";
         try
         {
             using InternalIterator it = DbIteratorFactory.NewInternalIterator(sources, null);
@@ -430,10 +573,43 @@ internal sealed class LdbTool
                 if (to is not null && ucmp.Compare(uk, to) > 0) break;
                 if (to is not null && ucmp.Compare(uk, to) == 0) break;
                 ++count;
-                if (!countOnly)
+                if (countDelim)
                 {
-                    string v = p.Type == EntryType.WideColumnEntity ? SstFileDumper.WideColumnsToString(it.Value, _valueHex) : ToolText.ToString(it.Value, _valueHex);
-                    W(ToolText.InternalKeyDebugString(ikey, _keyHex) + " => " + v + "\n");
+                    // InternalDumpCommand::DoCommand reads the encoded internal key and the value as C strings that also end
+                    // at 0x01: the size is the two prefixes' lengths, the group the key up to the delimiter.
+                    ReadOnlySpan<byte> val = it.Value;
+                    ulong s1 = 0;
+                    for (int k = 0; k < ikey.Length && ikey[k] != 1 && ikey[k] != 0; k++) s1++;
+                    for (int k = 0; k < val.Length && val[k] != 1 && val[k] != 0; k++) s1++;
+                    int j = 0;
+                    byte d = delim.Length == 0 ? (byte)0 : (byte)delim[0];
+                    while (j < ikey.Length && ikey[j] != d && ikey[j] != 0 && ikey[j] != 1) j++;
+                    string rtype1 = ToolText.Raw(ikey[..j]);
+                    if (rtype2.Length != 0 && rtype2 != rtype1)
+                    {
+                        W(rtype2 + " => count:" + c.ToString(CultureInfo.InvariantCulture) + "\tsize:" + s2.ToString(CultureInfo.InvariantCulture) + "\n");
+                        c = 1;
+                        s2 = s1;
+                    }
+                    else
+                    {
+                        c++;
+                        s2 += s1;
+                    }
+                    rtype2 = rtype1;
+                }
+                if (!countOnly && !countDelim)
+                {
+                    string keyText = ToolText.InternalKeyDebugString(ikey, _keyHex);
+                    if (p.Type == EntryType.WideColumnEntity)
+                    {
+                        if (SstFileDumper.TryWideColumnsToString(it.Value, _valueHex, out string wide)) W(keyText + " => " + wide + "\n");
+                        else _err.Write(keyText + " => error deserializing wide columns\n");
+                    }
+                    else
+                    {
+                        W(keyText + " => " + ToolText.ToString(it.Value, _valueHex) + "\n");
+                    }
                 }
                 // GetAllKeyVersions stops at "++num_keys >= max_num_ikeys" after adding a key: --max_keys=0 yields one key.
                 if (maxKeys >= 0 && count >= Math.Max(maxKeys, 1)) break;
@@ -443,7 +619,8 @@ internal sealed class LdbTool
         {
             sources.Cleanup?.Dispose();
         }
-        W("Internal keys in range: " + count.ToString(CultureInfo.InvariantCulture) + "\n");
+        if (countDelim) W(rtype2 + " => count:" + c.ToString(CultureInfo.InvariantCulture) + "\tsize:" + s2.ToString(CultureInfo.InvariantCulture) + "\n");
+        else W("Internal keys in range: " + count.ToString(CultureInfo.InvariantCulture) + "\n");
     }
 
     private void ListColumnFamilies()
@@ -566,7 +743,9 @@ internal sealed class LdbTool
     /// </summary>
     private void ReduceLevels()
     {
-        int newLevels = IntOpt("new_levels", -1);
+        int newLevels = IntOpt("new_levels", -1, dot: true);
+        // The constructor rejects new_levels <= 0 (also when the option is missing) before DoCommand's "<= 1" check.
+        if (newLevels <= 0) throw new ToolException(" Use --new_levels to specify a new level number\n");
         if (newLevels <= 1) throw new ToolException("Invalid number of levels.\n");
         RequireDb();
         RecoveredVersionState state = ManifestReader.RecoverFromDirectory(_fs, _dbPath, null, out _);
@@ -767,6 +946,7 @@ internal sealed class LdbTool
     private void DumpManifestFile(string manifest, bool verbose, bool hex)
     {
         var replayer = new ManifestReplayer(null);
+        RecoveredVersionState state;
         try
         {
             using ManifestLogReader reader = ManifestLogReader.Open(_fs, manifest);
@@ -776,13 +956,14 @@ internal sealed class LdbTool
                 if (verbose) W(EditDebugString(edit, hex));
                 replayer.Apply(edit);
             }
+            state = replayer.Finish();
         }
-        catch (RocksDbException e)
+        catch (Exception e) when (e is RocksDbException or IOException)
         {
-            W(e.Message + "\n");
+            // DumpManifestFile: the status goes to stderr and the command still succeeds.
+            _err.Write("Error in processing file " + manifest + " " + (e is IOException ? "IO error: " : "") + e.Message + "\n");
             return;
         }
-        RecoveredVersionState state = replayer.Finish();
         int cfCount = state.ColumnFamilies.Count;
         int index = 0;
         foreach (ColumnFamilyVersion cf in state.ColumnFamilies.Values)
@@ -893,9 +1074,11 @@ internal sealed class LdbTool
         bool isDir = false;
         try { isDir = _fs.DirectoryExists(dirOrFile); }
         catch (RocksDbException) { isDir = Directory.Exists(dirOrFile); }
-        if (!isDir)
+        // DumpWalFiles: "!st.ok() || filenames.empty()" -- an empty directory is handled like a file name.
+        bool emptyDir = isDir && !HasChildren(dirOrFile);
+        if (!isDir || emptyDir)
         {
-            if (!_fs.FileExists(dirOrFile)) throw new ToolException(dirOrFile + ": No such file or directory");
+            if (!emptyDir && !_fs.FileExists(dirOrFile)) throw new ToolException(dirOrFile + ": No such file or directory");
             if (dirOrFile.Length <= 4 || !dirOrFile.EndsWith(".log", StringComparison.Ordinal)) throw new ToolException(dirOrFile + ": Invalid log file name");
             DumpWalFile(dirOrFile, printHeader, printValues, onlySeqnoGaps, ref prevSeq, ref prevCount);
             return;
@@ -913,6 +1096,12 @@ internal sealed class LdbTool
             W("Checking wal file: " + path + "\n");
             DumpWalFile(path, printHeader, printValues, onlySeqnoGaps, ref prevSeq, ref prevCount);
         }
+    }
+
+    private bool HasChildren(string dir)
+    {
+        foreach (string _ in _fs.GetChildren(dir)) return true;
+        return false;
     }
 
     private sealed class StdErrReporter(TextWriter err) : LogReporter
@@ -967,8 +1156,7 @@ internal sealed class LdbTool
             }
             catch (RocksDbException e)
             {
-                row.Append("error: ").Append(e.Message);
-                W(row.ToString());
+                // DumpWalFile breaks out of the record loop before the row is printed.
                 throw new ToolException("Print write batch error: " + e.Message);
             }
             row.Append('\n');
@@ -1008,13 +1196,22 @@ internal sealed class LdbTool
         }
 
         public readonly void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => PutMerge("PUT", columnFamilyId, key, value);
-        public readonly void TimedPut(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong writeUnixTime) => PutMerge("PUT", columnFamilyId, key, value);
+        public readonly void TimedPut(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong writeUnixTime)
+        {
+            // InMemoryHandler does not override TimedPutCF: WriteBatch::Handler's default fails the dump.
+            throw RocksDbException.InvalidArgument("TimedPutCF not implemented");
+        }
 
         public readonly void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity)
         {
             cfs.Add(columnFamilyId);
             row.Append("PUT_ENTITY(").Append(columnFamilyId).Append(") : ").Append(ToolText.StringToHex(key));
-            if (printValues) row.Append(" : ").Append(SstFileDumper.WideColumnsToString(entity, hex: true));
+            if (printValues)
+            {
+                row.Append(" : ");
+                if (!SstFileDumper.TryWideColumnsToString(entity, hex: true, out string wide)) throw RocksDbException.Corruption("Error while decoding wide column");
+                row.Append(wide);
+            }
             row.Append(' ');
         }
 
@@ -1055,7 +1252,7 @@ internal sealed class LdbTool
     }
 
     /// <summary>DumpSstFile (tools/ldb_cmd.cc): a table file with its properties.</summary>
-    private void DumpSstFile(string path, bool hex, bool showProperties, string from, string to)
+    private void DumpSstFile(string path, bool hex, bool showProperties, byte[] from, byte[] to)
     {
         if (path.Length <= 4 || !path.EndsWith(".sst", StringComparison.Ordinal))
         {
@@ -1068,7 +1265,7 @@ internal sealed class LdbTool
             _err.Write("Error in reading SST file " + path + e.Message + "\n");
             return;
         }
-        string? err = dumper.ReadSequential(true, ulong.MaxValue, from.Length > 0, ToolText.ArgBytes(from), to.Length > 0, ToolText.ArgBytes(to), false);
+        string? err = dumper.ReadSequential(true, ulong.MaxValue, from.Length > 0, from, to.Length > 0, to, false);
         if (err is not null)
         {
             _err.Write("Error in reading SST file " + path + err + "\n");

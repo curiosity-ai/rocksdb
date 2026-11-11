@@ -112,7 +112,12 @@ internal sealed class SstFileDumper : IDisposable
                     }
                     else if (p.Type == EntryType.WideColumnEntity)
                     {
-                        v = WideColumnsToString(it.Value, _outputHex);
+                        if (!TryWideColumnsToString(it.Value, _outputHex, out v))
+                        {
+                            // SstFileDumper::ReadSequential: the error goes to stderr and the entry is skipped.
+                            Console.Error.Write(ToolText.InternalKeyDebugString(key, _outputHex) + " => error deserializing wide columns\n");
+                            continue;
+                        }
                     }
                     else if (p.Type == EntryType.ValuePreferredSeqno && it.Value.Length >= sizeof(ulong))
                     {
@@ -175,10 +180,15 @@ internal sealed class SstFileDumper : IDisposable
     }
 
     /// <summary>WideColumnsHelper::DumpSliceAsWideColumns: "name:value name:value" (the default column name is empty).</summary>
-    internal static string WideColumnsToString(ReadOnlySpan<byte> entity, bool hex)
+    internal static string WideColumnsToString(ReadOnlySpan<byte> entity, bool hex) =>
+        TryWideColumnsToString(entity, hex, out string s) ? s : "error deserializing wide columns";
+
+    /// <summary>WideColumnsHelper::DumpSliceAsWideColumns: false when the entity does not deserialize.</summary>
+    internal static bool TryWideColumnsToString(ReadOnlySpan<byte> entity, bool hex, out string text)
     {
+        text = "";
         var slots = new List<Db.Wide.WideColumnSlot>();
-        if (Db.Wide.WideColumnSerialization.TryDeserialize(entity, slots, out _) is not null) return "error deserializing wide columns";
+        if (Db.Wide.WideColumnSerialization.TryDeserialize(entity, slots, out _) is not null) return false;
         var sb = new System.Text.StringBuilder();
         for (int c = 0; c < slots.Count; c++)
         {
@@ -187,7 +197,8 @@ internal sealed class SstFileDumper : IDisposable
             if (c > 0) sb.Append(' ');
             sb.Append(Col(name, hex)).Append(':').Append(Col(value, hex));
         }
-        return sb.ToString();
+        text = sb.ToString();
+        return true;
     }
 
     private static string Col(ReadOnlySpan<byte> s, bool hex) => s.IsEmpty ? "" : hex ? ToolText.StringToHex(s) : ToolText.Raw(s);

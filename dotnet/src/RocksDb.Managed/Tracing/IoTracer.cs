@@ -149,13 +149,17 @@ public sealed class IoTraceReader(TraceReader reader) : IDisposable
         while (bits != 0)
         {
             int pos = System.Numerics.BitOperations.TrailingZeroCount(bits);
-            if (!Coding.GetFixed64(ref p, out ulong v)) throw Incomplete("io op field");
-            switch (pos)
+            // IOTraceReader::ReadIOOp: only the three known bits carry a field; an unknown bit hits "default:
+            // assert(false)", which reads nothing and is ignored in release builds.
+            if (pos <= 2)
             {
-                case 0: r.FileSize = v; break;
-                case 1: r.Length = v; break;
-                case 2: r.Offset = v; break;
-                default: throw RocksDbException.Corruption("unknown IO trace op " + pos);
+                if (!Coding.GetFixed64(ref p, out ulong v)) throw Incomplete(pos == 0 ? "file size" : pos == 1 ? "length" : "offset");
+                switch (pos)
+                {
+                    case 0: r.FileSize = v; break;
+                    case 1: r.Length = v; break;
+                    default: r.Offset = v; break;
+                }
             }
             bits &= bits - 1;
         }
