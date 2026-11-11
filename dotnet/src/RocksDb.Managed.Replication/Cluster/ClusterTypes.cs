@@ -57,6 +57,12 @@ public sealed class RoleChangedEventArgs(RaftRole role, long term) : EventArgs
     public long Term { get; } = term;
 }
 
+public sealed class LeadershipFailedEventArgs(long term, Exception error) : EventArgs
+{
+    public long Term { get; } = term;
+    public Exception Error { get; } = error;
+}
+
 /// <summary>
 /// Per-node configuration (rocksdb-sharp <c>RaftConfig</c>). The required values are constructor parameters; timings
 /// and bootstrap tuning are init properties (instead of defaulted constructor parameters) and are validated by
@@ -122,6 +128,9 @@ public sealed class RaftConfig
         if (HeartbeatIntervalMs <= 0 || HeartbeatIntervalMs >= ElectionTimeoutMinMs)
             throw new ArgumentOutOfRangeException(nameof(HeartbeatIntervalMs), "Heartbeat must be smaller than ElectionTimeoutMin");
         ArgumentNullException.ThrowIfNull(TimeProvider);
+        // More in-sync members than the cluster has could never be reached: the cluster would stay in Bootstrap forever.
+        if (BootstrapPromotionQuorum > Peers.Count + 1)
+            throw new ArgumentOutOfRangeException(nameof(BootstrapPromotionQuorum), "larger than the number of members");
         foreach (ClusterMember p in Peers)
         {
             if (p.NodeId == NodeId) throw new ArgumentException("the peer list must not contain this node", nameof(Peers));

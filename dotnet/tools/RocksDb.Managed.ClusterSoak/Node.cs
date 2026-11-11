@@ -373,11 +373,8 @@ public sealed class SoakClusterService(ClusterNodeHost host, NodeContext ctx) : 
         return stream.Result();
     }
 
-    public UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seq)
-    {
-        host.HandleReportProgress(nodeId, seq);
-        return UnaryResult.FromResult(true);
-    }
+    public UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seq, long leaderTerm) =>
+        UnaryResult.FromResult(host.HandleReportProgress(nodeId, seq, leaderTerm));
 
     public async UnaryResult<Dictionary<string, string>> GetFileHashesAsync(List<FileInfoDto> candidates)
     {

@@ -29,6 +29,9 @@ public sealed class PairHarness : IAsyncDisposable
         BtoA = new InMemoryPairClient(Network, "B", "A");
     }
 
+    /// <summary><see cref="PairNodeHostOptions.DisposeDrainTimeout"/> of the hosts started from now on.</summary>
+    public TimeSpan DisposeDrainTimeout { get; set; } = TimeSpan.FromSeconds(10);
+    public string DbPath(string id) => _dir.Sub(id);
     public PairNodeHost this[string id] => _hosts[id];
 
     public string Peer(string id) => id == "A" ? "B" : "A";
@@ -45,6 +48,7 @@ public sealed class PairHarness : IAsyncDisposable
             Switchover = Switchover,
             MaxChunkBytes = 16 * 1024,
             RetryDelay = TimeSpan.FromMilliseconds(50),
+            DisposeDrainTimeout = DisposeDrainTimeout,
             Log = _log.Enqueue,
         }, id == "A" ? AtoB : BtoA);
         await host.StartAsync(CancellationToken.None);

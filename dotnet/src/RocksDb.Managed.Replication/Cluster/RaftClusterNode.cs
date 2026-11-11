@@ -67,6 +67,12 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     /// </summary>
     public event EventHandler? ResyncRequired;
 
+    /// <summary>
+    /// Raised when this node won an election but could not write the first entry of its term (or record the term) and
+    /// therefore gave the leadership up. The node keeps campaigning when its election timer fires.
+    /// </summary>
+    public event EventHandler<LeadershipFailedEventArgs>? LeadershipFailed;
+
     public RaftClusterNode(RaftConfig config, RaftPersistentState state, RocksDatabase db, IPeerTransport transport)
     {
         ArgumentNullException.ThrowIfNull(config);
@@ -320,6 +326,10 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         lock (_gate)
         {
             _resyncing = true;
+            // A node whose log is about to be replaced cannot lead (or win a pending election): as a leader it would
+            // keep sending heartbeats - holding the other nodes' election timers - while refusing every stream and
+            // attach check, and its own resync would find no leader to pull from.
+            if (_role != RaftRole.Follower) BecomeFollowerLocked(null);
             _electionTimer.Pause();
         }
     }
@@ -338,16 +348,26 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
 
     // ===== Leader-only: log replication advance =====
 
-    /// <summary>A follower applied every entry up to <paramref name="matchSeq"/> (its WAL-stream progress report).</summary>
-    public void RecordFollowerProgress(string nodeId, ulong matchSeq)
+    /// <summary>
+    /// A follower applied every entry up to <paramref name="matchSeq"/> of the log this node streamed to it while leading
+    /// <paramref name="leaderTerm"/> (its WAL-stream progress report). Returns false, changing nothing, unless this node
+    /// currently leads exactly that term and its own log reaches <paramref name="matchSeq"/>: a report is a statement
+    /// about one leadership's log. One that was addressed to an earlier leadership of this node (delayed across
+    /// elections) may name entries the follower has since discarded in a resync, and counting it could commit an entry
+    /// that fewer than a quorum hold.
+    /// </summary>
+    public bool RecordFollowerProgress(string nodeId, ulong matchSeq, long leaderTerm)
     {
-        if (!_peers.TryGetValue(nodeId, out PeerState? peer)) return;
+        if (!_peers.TryGetValue(nodeId, out PeerState? peer)) return false;
         lock (_gate)
         {
-            if (_resyncing) return;
+            if (_resyncing || _role != RaftRole.Leader || leaderTerm != _state.CurrentTerm) return false;
+            // A follower of this leadership holds a prefix of this log, never more.
+            if (matchSeq > _db.GetLatestSequenceNumber()) return false;
             peer.OnAppendSucceeded(matchSeq);
             TryAdvanceCommitLocked();
             MaybePromoteToClusterLocked();
+            return true;
         }
     }
 
@@ -467,19 +487,34 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
 
     private void BecomeLeaderLocked()
     {
+        ulong nextSeq = _db.GetLatestSequenceNumber() + 1;
+        try
+        {
+            _state.RecordTermRange(nextSeq, _state.CurrentTerm);
+            // Replicate one entry from the new term right away so the commit index can advance past entries inherited
+            // from previous terms (§5.4.2).
+            // Synced like every log entry: the leader counts its own latest sequence towards the quorum.
+            byte[] noop = Encoding.UTF8.GetBytes(_state.CurrentTerm.ToString(CultureInfo.InvariantCulture));
+            if (_config.SyncLogWrites) _db.Put(WriteOptions.SyncWrites, LeaderNoOpKey, noop);
+            else _db.Put(LeaderNoOpKey, noop);
+        }
+        catch (Exception e) when (e is RocksDbException or ObjectDisposedException or IOException)
+        {
+            // A node that cannot write its log cannot lead. Taking the role first would leave a leader without a
+            // heartbeat loop that its own election timer ignores: give the election up instead (the timer runs on, and
+            // the other nodes elect someone once their timers fire).
+            _role = RaftRole.Follower;
+            _currentLeaderId = null;
+            RoleChanged?.Invoke(this, new RoleChangedEventArgs(_role, _state.CurrentTerm));
+            LeadershipFailed?.Invoke(this, new LeadershipFailedEventArgs(_state.CurrentTerm, e));
+            if (!_resyncing) _electionTimer.Reset();
+            return;
+        }
         _role = RaftRole.Leader;
         _currentLeaderId = _config.NodeId;
-        ulong nextSeq = _db.GetLatestSequenceNumber() + 1;
         // matchSeq must be reset on every election: values learned during a previous leadership are stale and could
         // falsely advance the commit index before this term replicated anything.
         foreach (PeerState p in _peers.Values) p.ResetForNewTerm(nextSeq);
-        _state.RecordTermRange(nextSeq, _state.CurrentTerm);
-        // Replicate one entry from the new term right away so the commit index can advance past entries inherited
-        // from previous terms (§5.4.2).
-        // Synced like every log entry: the leader counts its own latest sequence towards the quorum.
-        byte[] noop = Encoding.UTF8.GetBytes(_state.CurrentTerm.ToString(CultureInfo.InvariantCulture));
-        if (_config.SyncLogWrites) _db.Put(WriteOptions.SyncWrites, LeaderNoOpKey, noop);
-        else _db.Put(LeaderNoOpKey, noop);
         RoleChanged?.Invoke(this, new RoleChangedEventArgs(_role, _state.CurrentTerm));
         LeaderChanged?.Invoke(this, new LeaderChangedEventArgs(_config.NodeId, _state.CurrentTerm));
         _electionTimer.Pause();
@@ -628,7 +663,7 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         {
             lock (_gate)
             {
-                if (_role == RaftRole.Candidate && _state.CurrentTerm == term) BecomeLeaderLocked();
+                if (_role == RaftRole.Candidate && _state.CurrentTerm == term && !_resyncing && _disposed == 0) BecomeLeaderLocked();
             }
             return;
         }
@@ -657,7 +692,7 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
                 lock (_gate)
                 {
                     // Still candidate for this term?
-                    if (_role == RaftRole.Candidate && _state.CurrentTerm == term && _disposed == 0) BecomeLeaderLocked();
+                    if (_role == RaftRole.Candidate && _state.CurrentTerm == term && !_resyncing && _disposed == 0) BecomeLeaderLocked();
                 }
                 return;
             }

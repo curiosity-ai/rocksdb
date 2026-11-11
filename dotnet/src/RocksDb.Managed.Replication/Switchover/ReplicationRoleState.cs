@@ -212,9 +212,14 @@ public sealed class ReplicationRoleState
         RaftLogTerms other = RaftLogTerms.Deserialize(serialized);
         lock (_gate)
         {
+            RaftLogTerms updated = _epochs.Clone();
             bool changed = false;
-            foreach ((ulong startSeq, long epoch) in other.GetRanges()) changed |= _epochs.Record(startSeq, epoch);
-            if (changed) FileSystemHelpers.AtomicWrite(_fs, _epochsPath, _epochs.Serialize());
+            foreach ((ulong startSeq, long epoch) in other.GetRanges()) changed |= updated.Record(startSeq, epoch);
+            if (!changed) return;
+            // Durable first: ranges kept in memory after a failed write would make the retry a no-op and be gone
+            // after a restart.
+            FileSystemHelpers.AtomicWrite(_fs, _epochsPath, updated.Serialize());
+            _epochs = updated;
         }
     }
 

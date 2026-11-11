@@ -62,8 +62,25 @@ public static class WalStreamSender
     /// is gone, or <paramref name="startSequence"/> is past the end of this database's log (the follower holds entries
     /// this database never wrote), a single <see cref="WalStreamMessage.Resync"/> message ends the stream.
     /// </summary>
+    public static IAsyncEnumerable<WalStreamMessage> StreamAsync(RocksDatabase db, ulong startSequence, StreamTagProvider tag,
+        Func<ulong, long> entryTerm, int maxChunkBytes, CancellationToken cancellationToken) =>
+        StreamAsync(db, startSequence, tag, entryTerm, maxChunkBytes, null, cancellationToken);
+
+    /// <summary>
+    /// <see cref="StreamAsync(RocksDatabase, ulong, StreamTagProvider, Func{ulong, long}, int, CancellationToken)"/> with a
+    /// callback for errors of the source's own WAL that retrying the stream cannot cure:
+    /// <list type="bullet">
+    /// <item>Corruption (a WAL the follower still needs cannot be read): <paramref name="onSourceFault"/> is called and a
+    /// <see cref="WalStreamMessage.Resync"/> message ends the stream - a snapshot does not need the damaged WAL (the
+    /// checkpoint flushes the memtables), and the follower streams from the snapshot's end afterwards.</item>
+    /// <item>NotSupported (the database cannot be tailed at all, e.g. a write-prepared / write-unprepared transaction
+    /// database): <paramref name="onSourceFault"/> is called and the exception is thrown to the consumer. A snapshot
+    /// would not help - the stream after it would fail the same way - so no resync is requested.</item>
+    /// </list>
+    /// </summary>
     public static async IAsyncEnumerable<WalStreamMessage> StreamAsync(RocksDatabase db, ulong startSequence, StreamTagProvider tag,
-        Func<ulong, long> entryTerm, int maxChunkBytes, [EnumeratorCancellation] CancellationToken cancellationToken)
+        Func<ulong, long> entryTerm, int maxChunkBytes, Action<RocksDbException>? onSourceFault,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(db);
         ArgumentNullException.ThrowIfNull(tag);
@@ -97,6 +114,18 @@ public static class WalStreamSender
                 has = false;
                 chunk = default;
                 resync = e.Message;
+            }
+            catch (RocksDbException e) when (e.Code is StatusCode.Corruption)
+            {
+                onSourceFault?.Invoke(e);
+                has = false;
+                chunk = default;
+                resync = "the source cannot read its WAL: " + e.Message;
+            }
+            catch (RocksDbException e) when (e.Code is StatusCode.NotSupported)
+            {
+                onSourceFault?.Invoke(e);
+                throw;
             }
             if (resync != null)
             {

@@ -21,7 +21,12 @@ public interface IClusterService : IService<IClusterService>
     UnaryResult<ClusterStatusDto> GetStatusAsync();
     UnaryResult<AttachDto> CheckLogConsistencyAsync(string followerId, ulong latestSeq, long termAtLatest);
     Task<ServerStreamingResult<WalChunkDto>> SyncUpdatesAsync(string followerId, ulong startSeq);
-    UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seq);
+    /// <summary>
+    /// <paramref name="leaderTerm"/> (appended last: a caller built against the two-argument contract sends none and is
+    /// read as term 0, which no leader accepts) is the term of the leadership the report is for. The result is false
+    /// when the report was ignored.
+    /// </summary>
+    UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seq, long leaderTerm);
     UnaryResult<Dictionary<string, string>> GetFileHashesAsync(List<FileInfoDto> candidates);
     Task<ServerStreamingResult<SnapshotChunkDto>> SyncInitialStateAsync(List<FileInfoDto> verifiedInventory);
     UnaryResult<string> GetRaftTermsAsync();
@@ -58,12 +63,15 @@ public sealed class ClusterService(ClusterNodeHost host) : ServiceBase<IClusterS
     public async Task<ServerStreamingResult<WalChunkDto>> SyncUpdatesAsync(string followerId, ulong startSeq)
     {
         ServerStreamingContext<WalChunkDto> stream = GetServerStreamingContext<WalChunkDto>();
-        CancellationToken ct = Context.CallContext.CancellationToken;
+        // The call's token (client gone, deadline, server stopping) or the host shutting down ends a write that a
+        // stalled client would otherwise block forever - with the host's database still in use by this handler.
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(Context.CallContext.CancellationToken, host.Stopping);
+        CancellationToken ct = linked.Token;
         try
         {
             await foreach (WalStreamMessage m in host.StreamUpdatesAsync(followerId, startSeq, ct).ConfigureAwait(false))
             {
-                await stream.WriteAsync(WalChunkDto.From(m)).ConfigureAwait(false);
+                await stream.WriteAsync(WalChunkDto.From(m)).WaitAsync(ct).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -72,11 +80,8 @@ public sealed class ClusterService(ClusterNodeHost host) : ServiceBase<IClusterS
         return stream.Result();
     }
 
-    public UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seq)
-    {
-        host.HandleReportProgress(nodeId, seq);
-        return UnaryResult.FromResult(true);
-    }
+    public UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seq, long leaderTerm) =>
+        UnaryResult.FromResult(host.HandleReportProgress(nodeId, seq, leaderTerm));
 
     public async UnaryResult<Dictionary<string, string>> GetFileHashesAsync(List<FileInfoDto> candidates)
     {
@@ -88,9 +93,11 @@ public sealed class ClusterService(ClusterNodeHost host) : ServiceBase<IClusterS
     public async Task<ServerStreamingResult<SnapshotChunkDto>> SyncInitialStateAsync(List<FileInfoDto> verifiedInventory)
     {
         ServerStreamingContext<SnapshotChunkDto> stream = GetServerStreamingContext<SnapshotChunkDto>();
-        await foreach (SnapshotChunk c in host.StreamSnapshotAsync(FileInfoDto.To(verifiedInventory), Context.CallContext.CancellationToken).ConfigureAwait(false))
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(Context.CallContext.CancellationToken, host.Stopping);
+        CancellationToken ct = linked.Token;
+        await foreach (SnapshotChunk c in host.StreamSnapshotAsync(FileInfoDto.To(verifiedInventory), ct).ConfigureAwait(false))
         {
-            await stream.WriteAsync(SnapshotChunkDto.From(c)).ConfigureAwait(false);
+            await stream.WriteAsync(SnapshotChunkDto.From(c)).WaitAsync(ct).ConfigureAwait(false);
         }
         return stream.Result();
     }
@@ -214,8 +221,8 @@ public sealed class GrpcClusterClient : IClusterNodeClient, IDisposable
         }
     }
 
-    public async Task ReportProgressAsync(string followerId, ulong appliedThrough, CancellationToken cancellationToken) =>
-        await Unary(cancellationToken).ReportLastSyncSequenceNumber(followerId, appliedThrough);
+    public async Task ReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken) =>
+        await Unary(cancellationToken).ReportLastSyncSequenceNumber(followerId, appliedThrough, leaderTerm);
 
     public async Task<IReadOnlyDictionary<string, string>> GetFileHashesAsync(IReadOnlyList<ReplicationFileInfo> candidates, CancellationToken cancellationToken) =>
         await _client.WithCancellationToken(cancellationToken).GetFileHashesAsync(FileInfoDto.From(candidates));

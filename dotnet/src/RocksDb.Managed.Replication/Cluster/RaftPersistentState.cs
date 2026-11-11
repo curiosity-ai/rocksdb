@@ -112,7 +112,14 @@ public sealed class RaftPersistentState
     {
         lock (_gate)
         {
-            if (_terms.Record(startSeq, term)) FileSystemHelpers.AtomicWrite(_fs, _termsPath, _terms.Serialize());
+            // Called for every replicated chunk: the copy is only made when the map changes (once per term).
+            if (!_terms.WouldRecord(startSeq, term)) return;
+            // Durable first (like the term and the vote): a range kept in memory after a failed write would make the
+            // retry a no-op, and the range would be gone after a restart.
+            RaftLogTerms updated = _terms.Clone();
+            updated.Record(startSeq, term);
+            FileSystemHelpers.AtomicWrite(_fs, _termsPath, updated.Serialize());
+            _terms = updated;
         }
     }
 
@@ -129,12 +136,16 @@ public sealed class RaftPersistentState
         ArgumentNullException.ThrowIfNull(leaderTerms);
         lock (_gate)
         {
-            bool changed = _terms.TruncateAfter(lastLocalSeq);
+            RaftLogTerms updated = _terms.Clone();
+            bool changed = updated.TruncateAfter(lastLocalSeq);
             foreach ((ulong start, long term) in leaderTerms.GetRanges())
             {
-                if (start > lastLocalSeq) changed |= _terms.Record(start, term);
+                if (start > lastLocalSeq) changed |= updated.Record(start, term);
             }
-            if (changed) FileSystemHelpers.AtomicWrite(_fs, _termsPath, _terms.Serialize());
+            if (!changed) return;
+            // Durable first, see RecordTermRange.
+            FileSystemHelpers.AtomicWrite(_fs, _termsPath, updated.Serialize());
+            _terms = updated;
         }
     }
 
@@ -147,8 +158,8 @@ public sealed class RaftPersistentState
         ArgumentNullException.ThrowIfNull(terms);
         lock (_gate)
         {
+            FileSystemHelpers.AtomicWrite(_fs, _termsPath, terms.Serialize());
             _terms = terms;
-            FileSystemHelpers.AtomicWrite(_fs, _termsPath, _terms.Serialize());
         }
     }
 

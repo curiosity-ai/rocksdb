@@ -138,6 +138,7 @@ public sealed class SnapshotReceiver : IAsyncDisposable
     private long _bytes;
     private IWritableFile? _current;
     private string? _currentName;
+    private long _currentSize;
 
     public SnapshotReceiver(IFileSystem fileSystem, string dbPath, IEnumerable<string> preserveNames)
     {
@@ -187,8 +188,12 @@ public sealed class SnapshotReceiver : IAsyncDisposable
             await CloseCurrentAsync(cancellationToken).ConfigureAwait(false);
             _currentName = chunk.FileName;
             _current = _fs.CreateWritable(FileSystemHelpers.Combine(_dbPath, chunk.FileName!), truncate: true);
+            _currentSize = chunk.FileSize;
             _files++;
         }
+        if (chunk.FileSize != _currentSize || chunk.Offset + chunk.Content.Length > _currentSize)
+            throw new InvalidOperationException("snapshot stream chunk of " + chunk.FileName + " at " + chunk.Offset + " (" + chunk.Content.Length +
+                " bytes, file size " + chunk.FileSize + ") does not fit the announced size " + _currentSize);
         if (chunk.Offset != _current!.Size)
             throw new InvalidOperationException("snapshot stream chunk of " + chunk.FileName + " at " + chunk.Offset + " does not follow " + _current.Size);
         if (!chunk.Content.IsEmpty)
@@ -213,11 +218,16 @@ public sealed class SnapshotReceiver : IAsyncDisposable
     private async ValueTask CloseCurrentAsync(CancellationToken cancellationToken)
     {
         IWritableFile? f = _current;
+        string? name = _currentName;
         _current = null;
         _currentName = null;
         if (f is null) return;
         try
         {
+            // Chunk offsets only prove the chunks were contiguous; a file whose tail never arrived (the next file or the
+            // end marker followed a short last chunk) would otherwise be restored truncated.
+            if (f.Size != _currentSize)
+                throw new InvalidOperationException("snapshot stream sent " + f.Size + " bytes of " + name + ", announced " + _currentSize);
             await f.SyncAsync(cancellationToken).ConfigureAwait(false);
         }
         finally

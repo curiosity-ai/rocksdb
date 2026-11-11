@@ -265,7 +265,7 @@ public sealed class AllocationTests
             db.Put(Key(k++), Value100);
             ulong latest = db.GetLatestSequenceNumber();
             long before = GC.GetAllocatedBytesForCurrentThread();
-            node.RecordFollowerProgress("n2", latest);
+            node.RecordFollowerProgress("n2", latest, node.CurrentTerm);
             if (i >= 100) bytes += GC.GetAllocatedBytesForCurrentThread() - before;
             Assert.AreEqual(latest, node.CommitSeq);
         }
@@ -276,7 +276,7 @@ public sealed class AllocationTests
         double baseline = await MeasureAllThreadsAsync([AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))] async ValueTask (int i) =>
         {
             db.Put(Key(k++), Value100);
-            node.RecordFollowerProgress("n2", db.GetLatestSequenceNumber());
+            node.RecordFollowerProgress("n2", db.GetLatestSequenceNumber(), node.CurrentTerm);
             await Task.CompletedTask;
         }, 300, 1000);
         double waitBytes = await MeasureAllThreadsAsync([AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))] async ValueTask (int i) =>
@@ -284,7 +284,7 @@ public sealed class AllocationTests
             db.Put(Key(k++), Value100);
             ulong latest = db.GetLatestSequenceNumber();
             ValueTask<bool> committed = node.WaitForCommitAsync(latest, cts.Token);
-            node.RecordFollowerProgress("n2", latest);
+            node.RecordFollowerProgress("n2", latest, node.CurrentTerm);
             Assert.IsTrue(await committed);
         }, 300, 1000);
         waitBytes -= baseline;
@@ -311,7 +311,7 @@ public sealed class AllocationTests
         Task<bool> waiting = node.WaitForCommitAsync(seq, CancellationToken.None).AsTask();
         Task<bool> waiting2 = node.WaitForCommitAsync(seq + 10, CancellationToken.None).AsTask();
         Assert.IsFalse(waiting.IsCompleted);
-        node.RecordFollowerProgress("n2", seq);
+        node.RecordFollowerProgress("n2", seq, node.CurrentTerm);
         Assert.IsTrue(await waiting.WaitAsync(TestUtil.Timeout));
         Assert.IsFalse(waiting2.IsCompleted, "a later sequence is not committed yet");
         // A higher term deposes the leader: the wait ends with false.
@@ -381,7 +381,7 @@ public sealed class AllocationTests
             ValueTask<bool> w = host.WriteCommittedAsync(Key(20 + i), Value100, TimeSpan.FromSeconds(30), CancellationToken.None);
             await WaitUntilAsync(() =>
             {
-                host.HandleReportProgress("n2", host.Db.GetLatestSequenceNumber());
+                host.HandleReportProgress("n2", host.Db.GetLatestSequenceNumber(), host.Node.CurrentTerm);
                 return host.Node.CommitSeq == host.Db.GetLatestSequenceNumber();
             }, "commit");
             Assert.IsTrue(await w);
