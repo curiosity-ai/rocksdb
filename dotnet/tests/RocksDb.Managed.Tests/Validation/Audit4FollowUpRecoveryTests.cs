@@ -1,5 +1,6 @@
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
+using RocksDb.Managed.Tests.Db;
 using RocksDb.Managed.Wal;
 using static RocksDb.Managed.Tests.Db.DbTestUtil;
 
@@ -204,6 +205,114 @@ public sealed class Audit4FollowUpRecoveryTests
         }
         // The WALs are archived, like upstream's ArchiveFile.
         Assert.IsTrue(fs.FileExists(DbPath + "/lost/" + staleWal[(staleWal.LastIndexOf('/') + 1)..]));
+    }
+
+    [TestMethod]
+    public void LiveEditCannotAddATableFileThatIsAlreadyInTheLsmTree()
+    {
+        // S30. VersionBuilder::ApplyFileAddition (db/version_builder.cc): "Cannot add table file #N to level L since it
+        // is already in the LSM tree on level M" (Corruption), for every edit, not only during MANIFEST replay. The
+        // port's live path (VersionStorageInfo.ApplyEdit) had no such check: the edit was written to the MANIFEST (which
+        // then no longer replays: ManifestReplayer has the check) and the version listed the file on two levels.
+        // An edit that also deletes the file (a trivial move) is fine: deletions are applied first.
+        MemoryFileSystem fs = NewDbFs();
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, new DbOptions { CreateIfMissing = true, FileSystem = fs }))
+        {
+            db.Put(B("a"), B("1"));
+            db.Flush();
+            ColumnFamilyData cfd = db.Impl.GetColumnFamilies()[0];
+            FileMetaData file = cfd.Current.Storage.LevelFiles(0)[0];
+            var duplicate = new VersionEdit { ColumnFamily = cfd.Id };
+            duplicate.AddFile(3, file.Clone());
+            RocksDbException ex = Assert.ThrowsExactly<RocksDbException>(() =>
+                db.Impl.Versions.LogAndApplyAsync(cfd, duplicate, synchronous: true, CancellationToken.None).GetAwaiter().GetResult());
+            Assert.AreEqual(StatusCode.Corruption, ex.Code);
+            StringAssert.Contains(ex.Message, "Cannot add table file #" + file.FileNumber + " to level 3 since it is already in the LSM tree on level 0");
+            Assert.AreEqual(1, cfd.Current.Storage.LevelFiles(0).Length);
+            Assert.AreEqual(0, cfd.Current.Storage.LevelFiles(3).Length);
+
+            var move = new VersionEdit { ColumnFamily = cfd.Id };
+            move.DeleteFile(0, file.FileNumber);
+            move.AddFile(3, file.Clone());
+            db.Impl.Versions.LogAndApplyAsync(cfd, move, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+            Assert.AreEqual(0, cfd.Current.Storage.LevelFiles(0).Length);
+            Assert.AreEqual(1, cfd.Current.Storage.LevelFiles(3).Length);
+        }
+        // The MANIFEST replays: the refused edit was not written.
+        using RocksDatabase reopened = RocksDatabase.Open(DbPath, new DbOptions { FileSystem = fs });
+        Assert.AreEqual("1", GetString(reopened, "a"));
+    }
+
+    private sealed class SuppressingListener : EventListener
+    {
+        public int Errors;
+
+        public override void OnBackgroundError(BackgroundErrorEventArgs e)
+        {
+            Interlocked.Increment(ref Errors);
+            e.Error = null;
+        }
+    }
+
+    [TestMethod]
+    public void ListenerCannotSuppressARetryableIoError()
+    {
+        // ErrorHandler::SetBGErrorImpl (db/error_handler.cc), retryable / file-scoped IO error:
+        // "CheckAndSetRecoveryAndBGError(bg_err, context); ... EventHelpers::NotifyOnBackgroundError(listeners, reason,
+        // &new_bg_io_err, ...)": the background error is set before the listeners run and they get a copy, so a
+        // listener that clears the status does not suppress it (only HandleKnownErrors uses the listeners' status:
+        // ErrorHandlerTests.ListenerCanSuppressBackgroundError). The port notified first and dropped the error.
+        // max_bgerror_resume_count = 0: "severity = Status::Severity::kHardError", no automatic recovery.
+        var fs = new FaultInjectionFileSystem(NewDbFs());
+        var listener = new SuppressingListener();
+        var options = new DbOptions { CreateIfMissing = true, FileSystem = fs, MaxBgErrorResumeCount = 0 };
+        options.Listeners.Add(listener);
+        using RocksDatabase db = RocksDatabase.Open(DbPath, options);
+        db.Put(B("a"), B("1"));
+        fs.FailMatching(".sst", FaultOps.Append, 1, InjectedFaultKind.Retryable);
+        RocksDbException ex = Assert.ThrowsExactly<RocksDbException>(() => db.Flush());
+        Assert.AreEqual(StatusCode.IOError, ex.Code);
+        Assert.AreEqual(1, listener.Errors);
+        Assert.IsNotNull(db.BackgroundError);
+        Assert.AreEqual(ErrorSeverity.HardError, db.BackgroundError.Severity);
+        ex = Assert.ThrowsExactly<RocksDbException>(() => db.Put(B("b"), B("2")));
+        Assert.AreEqual(StatusCode.IOError, ex.Code);
+        db.Resume();
+        Assert.IsNull(db.BackgroundError);
+        db.Put(B("b"), B("2"));
+        Assert.AreEqual("1", GetString(db, "a"));
+    }
+
+    [TestMethod]
+    public void SecondaryCatchUpReportsACorruptWalRecord()
+    {
+        // DBImplSecondary::RecoverLogFiles: "while (reader->ReadRecord(...) && wal_read_status->ok() && status.ok())"
+        // and "if (status.ok() && !wal_read_status->ok()) status = *wal_read_status": a corruption reported by the WAL
+        // reader (here a checksum mismatch) fails TryCatchUpWithPrimary. The port never looked at the reporter: the
+        // dropped records were skipped silently and the catch-up reported success.
+        MemoryFileSystem fs = NewDbFs();
+        fs.CreateDirectoryIfMissing("/audit4fr-sec");
+        using RocksDatabase primary = RocksDatabase.Open(DbPath, new DbOptions { CreateIfMissing = true, FileSystem = fs });
+        primary.Put(B("a"), B("1"));
+        using RocksDatabase secondary = RocksDatabase.OpenAsSecondary(DbPath, "/audit4fr-sec", new DbOptions { FileSystem = fs },
+            [new ColumnFamilyDescriptor("default", new ColumnFamilyOptions())]);
+        Assert.AreEqual("1", GetString(secondary, "a"));
+        primary.Put(B("b"), B("2222222222"));
+        primary.Put(B("c"), B("3"));
+        string wal = FileNames.LogFileName(DbPath, WalNumbers(fs)[^1]);
+        byte[] bytes = fs.ReadAllBytes(wal);
+        int at = bytes.AsSpan().IndexOf(B("2222222222"));
+        Assert.IsTrue(at > 0);
+        // Payload of the second record, changed in place (the secondary's reader has the file open): its checksum no
+        // longer matches.
+        fs.WriteAt(wal, at, [(byte)(bytes[at] ^ 0x40)]);
+        RocksDbException ex = Assert.ThrowsExactly<RocksDbException>(() => secondary.TryCatchUpWithPrimary());
+        Assert.AreEqual(StatusCode.Corruption, ex.Code);
+        Assert.IsNull(GetString(secondary, "c"));
+        // The WAL's status sticks (LogReaderContainer::status_) while the WAL is needed.
+        ex = Assert.ThrowsExactly<RocksDbException>(() => secondary.TryCatchUpWithPrimary());
+        Assert.AreEqual(StatusCode.Corruption, ex.Code);
+        Assert.AreEqual("1", GetString(secondary, "a"));
     }
 
     [TestMethod]

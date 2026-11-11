@@ -174,22 +174,21 @@ internal sealed class ErrorHandler
         // 1. Data loss (not file scoped): unrecoverable, overrides any existing error.
         if (err.Scope != IOErrorScope.File && err.DataLoss)
         {
-            RocksDbException? s = NotifyOnBackgroundError(reason, err.WithSeverity(ErrorSeverity.UnrecoverableError), autoRecovery: false, out _);
-            lock (_db.Mutex)
-            {
-                if (s is not null) CheckAndSetRecoveryAndBgError(s, walRelated, FlushReason.ErrorRecovery);
-                return _bgError;
-            }
+            // SetBGErrorImpl sets the error BEFORE notifying the listeners (CheckAndSetRecoveryAndBGError, then
+            // NotifyOnBackgroundError on a copy): unlike an error classified by HandleKnownErrors, a listener can neither
+            // suppress nor replace it. The same holds for the two cases below.
+            RocksDbException unrecoverable = err.WithSeverity(ErrorSeverity.UnrecoverableError);
+            lock (_db.Mutex) CheckAndSetRecoveryAndBgError(unrecoverable, walRelated, FlushReason.ErrorRecovery);
+            NotifyOnBackgroundError(reason, unrecoverable, autoRecovery: false, out _);
+            lock (_db.Mutex) return _bgError;
         }
         // 2. With manual_wal_flush a WAL failure may drop buffered WAL writes: fatal until reopen.
         if (o.ManualWalFlush && walRelated && err.Code == StatusCode.IOError)
         {
-            RocksDbException? s = NotifyOnBackgroundError(reason, err.WithSeverity(ErrorSeverity.FatalError), autoRecovery: false, out _);
-            lock (_db.Mutex)
-            {
-                if (s is not null) CheckAndSetRecoveryAndBgError(s, walRelated, FlushReason.ErrorRecovery);
-                return _bgError;
-            }
+            RocksDbException fatal = err.WithSeverity(ErrorSeverity.FatalError);
+            lock (_db.Mutex) CheckAndSetRecoveryAndBgError(fatal, walRelated, FlushReason.ErrorRecovery);
+            NotifyOnBackgroundError(reason, fatal, autoRecovery: false, out _);
+            lock (_db.Mutex) return _bgError;
         }
         // 3. Retryable (or file scoped) IO errors, except out-of-space ones (left to the SstFileManager upstream).
         if (err.SubCode != StatusSubCode.NoSpace && (err.Scope == IOErrorScope.File || err.Retryable))
@@ -222,14 +221,20 @@ internal sealed class ErrorHandler
             {
                 severity = ErrorSeverity.HardError;
             }
-            RocksDbException? s = NotifyOnBackgroundError(reason, err.WithSeverity(severity), autoResumeEnabled, out bool autoRecovery);
+            RocksDbException retryable = err.WithSeverity(severity);
             lock (_db.Mutex)
             {
-                if (s is null) return _bgError;
                 // soft_error_no_bg_work_ is set whatever the current error is; the recovery context (flush reason) is
                 // only replaced when this error becomes the background error (UpdateRecoveryContext).
                 if (noBgWork) _softErrorNoBgWork = true;
-                CheckAndSetRecoveryAndBgError(s, walRelated, noBgWork ? FlushReason.ErrorRecoveryRetryFlush : FlushReason.ErrorRecovery);
+                CheckAndSetRecoveryAndBgError(retryable, walRelated, noBgWork ? FlushReason.ErrorRecoveryRetryFlush : FlushReason.ErrorRecovery);
+            }
+            // The error is already set: the listeners are only told about it (a suppressed or replaced error changes
+            // nothing). Managed extension kept: OnErrorRecoveryBegin can still veto the automatic recovery (upstream
+            // ignores the listeners' auto_recovery here and always calls StartRecoverFromRetryableBGIOError).
+            NotifyOnBackgroundError(reason, retryable, autoResumeEnabled, out bool autoRecovery);
+            lock (_db.Mutex)
+            {
                 if (autoRecovery) StartRecoverFromRetryableBgIoError();
                 return _bgError;
             }

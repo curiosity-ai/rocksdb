@@ -360,6 +360,46 @@ internal sealed class VersionSet : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Port of the check of VersionBuilder::ApplyFileAddition (db/version_builder.cc): a table file the edit adds must
+    /// not be in the version already, unless the same edit deletes it (deletions are applied first: a trivial move).
+    /// Only a file some live version references can be in the current one, so the usual case is one dictionary lookup
+    /// per added file. REQUIRES: DB mutex.
+    /// </summary>
+    private void CheckFileAdditions(VersionStorageInfo current, VersionEdit edit)
+    {
+        foreach (NewFileEntry nf in edit.NewFiles)
+        {
+            ulong number = nf.Meta.FileNumber;
+            if (!_fileRefs.ContainsKey(number)) continue;
+            for (int level = 0; level < current.NumLevels; level++)
+            {
+                bool found = false;
+                foreach (FileMetaData f in current.LevelFiles(level))
+                {
+                    if (f.FileNumber == number)
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) continue;
+                bool deleted = false;
+                foreach ((int deletedLevel, ulong deletedNumber) in edit.DeletedFiles)
+                {
+                    if (deletedLevel == level && deletedNumber == number) deleted = true;
+                }
+                if (!deleted)
+                {
+                    ThrowHelper.Corruption("VersionBuilder: Cannot add table file #" + number.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                        " to level " + nf.Level.ToString(System.Globalization.CultureInfo.InvariantCulture) + " since it is already in the LSM tree on level " +
+                        level.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                }
+                break;
+            }
+        }
+    }
+
     /// <summary>True if some live version references the table file. REQUIRES: DB mutex.</summary>
     public bool IsLiveFile(ulong fileNumber) => _fileRefs.ContainsKey(fileNumber);
 
@@ -480,6 +520,7 @@ internal sealed class VersionSet : IAsyncDisposable
                             if (edits[j].Cfd == cfd && newFiles[j] is not null) ThrowHelper.InvalidArgument("two file edits of one column family in a batch");
                         }
                         VersionStorageInfo cur = cfd.Current.Storage;
+                        CheckFileAdditions(cur, edit);
                         newFiles[i] = cur.ApplyEdit(edit, cfd.NumLevels);
                         newBlobFiles[i] = Blob.BlobFileMetaData.Build(cur.BlobFiles, edit, newFiles[i]);
                         // VersionBuilder::SaveTo -> CheckConsistency, before the edit is written.
