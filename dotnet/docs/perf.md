@@ -1693,3 +1693,22 @@ GetSstCached +56%, Seek + Next +38%.
   subcompaction scaling"), confirmed by the definitive run (see "Definitive run (2026-11-03)"). Still open: `readrandom` with 1 KiB values allocates ~86 B/op (100 B: ~29 B/op) in every
   tree since `0f866b8` (block cache misses with the 8 MiB cache; not investigated); the dbbench `overwrite` row of the
   300k x 100 B matrix configuration allocates ~80 B/op (not investigated).
+
+## Audit #4 (2026-11-11): before / after check
+
+Audit #4 (docs/validation.md) added per-entry checks and counters on read paths (internal key length check in
+`BlockIter`, block cache byte counters, file read tickers, iterator skip counter). A/B of the tree before the audit
+(`5b3265f`) and after it, `dbbench --engine managed`, 100-byte values, no compression, one thread, warm-up on,
+runs alternated on the same VM (4 vCPU, shared, noisy), micros/op, median of 5:
+
+| benchmark (2M keys flushed and compacted, 1M reads) | before | after | change |
+|---|---:|---:|---:|
+| compact (one full compaction) | 593,266 | 598,229 | +0.8% |
+| readrandom | 2.230 | 2.204 | -1.2% |
+| seekrandom (seek + 10 next) | 4.059 | 4.221 | +4.0% |
+| readseq (median of 15) | 0.169 | 0.180 | +6.5% |
+
+With 300k keys read from the memtable (median of 3): fillrandom 2.487 / 2.376, overwrite 2.580 / 2.790, readrandom
+1.955 / 1.950, seekrandom 4.001 / 4.224, readseq 0.309 / 0.299. Run-to-run spread on this machine is about +/-7%, so
+only the iterator rows (seekrandom, readseq on tables) suggest a small cost, of a few percent; it was not profiled.
+No statistics object was set in these runs.
