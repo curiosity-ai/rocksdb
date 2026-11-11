@@ -66,7 +66,8 @@ public readonly struct WalChunk
 /// </para>
 /// <para>
 /// Errors: a requested sequence number whose WAL was already purged throws <see cref="RocksDbException"/> with
-/// <see cref="StatusCode.NotFound"/> - the replica must be rebuilt from a checkpoint. Not thread-safe (one reader).
+/// <see cref="StatusCode.NotFound"/> - the replica must be rebuilt from a checkpoint; an unreadable WAL throws
+/// <see cref="StatusCode.Corruption"/>. Not thread-safe (one reader).
 /// Dispose the tailer before closing the database.
 /// </para>
 /// </summary>
@@ -159,6 +160,7 @@ public sealed class WalTailer : IDisposable
                 {
                     it.ThrowIfError();
                     if (!_started) ThrowIfStartPurged();
+                    else ThrowIfRotationCannotBeFollowed(it);
                     break;
                 }
             }
@@ -254,6 +256,20 @@ public sealed class WalTailer : IDisposable
         throw new RocksDbException(StatusCode.NotFound,
             "NotFound: WAL data for sequence " + _nextSequenceNumber + " is no longer available" +
             (files.Count > 0 ? " (oldest WAL starts at " + files[0].StartSequence + ")" : " (no WAL files)"));
+    }
+
+    /// <summary>
+    /// After the first batch: the database is ahead, the iterator found nothing and the database writes a WAL the
+    /// iterator does not know. The iterator follows rotations by listing the WAL files and treats a failed listing as
+    /// "nothing new" - e.g. <see cref="StatusCode.Corruption"/> for a WAL whose first record cannot be read. List them
+    /// here so that error reaches the caller instead of the tail waiting forever on a stream that cannot advance.
+    /// </summary>
+    private void ThrowIfRotationCannotBeFollowed(TransactionLogIterator iterator)
+    {
+        if (!HasUpdates) return;
+        IReadOnlyList<WalFileInfo> known = iterator.Files;
+        if (known.Count > 0 && _db.CurrentWalNumber <= known[^1].LogNumber) return;
+        _db.GetSortedWalFiles();
     }
 
     private void EnsureCapacity(int length)

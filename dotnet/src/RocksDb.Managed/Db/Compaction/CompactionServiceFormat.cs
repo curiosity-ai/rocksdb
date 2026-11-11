@@ -414,9 +414,9 @@ internal static class CompactionServiceFormat
         if (m.TryGetValue("status", out string? st))
         {
             Dictionary<string, string> sm = ToMap(st);
-            r.StatusCode = (StatusCode)ParseU64("code", sm.GetValueOrDefault("code", "0"));
-            r.StatusSubCode = (StatusSubCode)ParseU64("subcode", sm.GetValueOrDefault("subcode", "0"));
-            r.StatusSeverity = (byte)ParseU64("severity", sm.GetValueOrDefault("severity", "0"));
+            r.StatusCode = (StatusCode)ParseU8("code", StripOuterBraces(sm.GetValueOrDefault("code", "0")));
+            r.StatusSubCode = (StatusSubCode)ParseU8("subcode", StripOuterBraces(sm.GetValueOrDefault("subcode", "0")));
+            r.StatusSeverity = ParseU8("severity", StripOuterBraces(sm.GetValueOrDefault("severity", "0")));
             r.StatusMessage = GetStr(sm, "message");
         }
         r.OutputFiles = GetVector(m, "output_files", ParseOutputFile);
@@ -545,7 +545,7 @@ internal static class CompactionServiceFormat
             Count = GetU64(m, "count"),
         };
         // SizeTolerantDeserializeArray: extra elements are ignored, missing ones zero-filled.
-        List<int> counts = GetVector(m, "counts", static v => checked((int)ParseI64("counts", v)));
+        List<int> counts = GetVector(m, "counts", static v => ParseI32("counts", v));
         for (int i = 0; i < s.Counts.Length && i < counts.Count; i++) s.Counts[i] = counts[i];
         return s;
     }
@@ -679,7 +679,7 @@ internal static class CompactionServiceFormat
     private static ulong GetU64(Dictionary<string, string> m, string name) => m.TryGetValue(name, out string? v) ? ParseU64(name, StripOuterBraces(v)) : 0;
 
     private static int GetI32(Dictionary<string, string> m, string name) =>
-        m.TryGetValue(name, out string? v) ? checked((int)ParseI64(name, StripOuterBraces(v))) : 0;
+        m.TryGetValue(name, out string? v) ? ParseI32(name, StripOuterBraces(v)) : 0;
 
     private static bool GetBool(Dictionary<string, string> m, string name) =>
         m.TryGetValue(name, out string? v) && OptionStrings.ParseBool(name, StripOuterBraces(v));
@@ -687,6 +687,25 @@ internal static class CompactionServiceFormat
     private static ulong ParseU64(string name, string v) => OptionStrings.ParseUInt64(name, v);
 
     private static long ParseI64(string name, string v) => OptionStrings.ParseInt64(name, v);
+
+    /// <summary>
+    /// kInt (ParseInt, std::stoi): a value outside int is std::out_of_range, which OptionTypeInfo::Parse turns into
+    /// InvalidArgument("Error parsing name:...").
+    /// </summary>
+    private static int ParseI32(string name, string v)
+    {
+        long n = ParseI64(name, v);
+        if (n < int.MinValue || n > int.MaxValue) ThrowHelper.InvalidArgument("Error parsing " + name + ": out of range '" + v + "'");
+        return (int)n;
+    }
+
+    /// <summary>kUInt8T (ParseUint8): a value above 255 is std::out_of_range, i.e. InvalidArgument.</summary>
+    private static byte ParseU8(string name, string v)
+    {
+        ulong n = ParseU64(name, v);
+        if (n > byte.MaxValue) ThrowHelper.InvalidArgument("Error parsing " + name + ": out of range '" + v + "'");
+        return (byte)n;
+    }
 
     /// <summary>Slice::DecodeHex (upper or lower case).</summary>
     private static byte[] DecodeHex(string name, string v)

@@ -21,6 +21,11 @@ internal sealed class CompactionJobStats
     public int NumProximalOutputFiles;
     public CompactionIterationStats IterStats;
     public TimeSpan Elapsed;
+    /// <summary>
+    /// CPU time of the compaction threads (CompactionJobStats::cpu_micros: SystemClock::CPUMicros around each
+    /// subcompaction); 0 where the platform has no per-thread CPU clock or the subcompaction changed threads.
+    /// </summary>
+    public ulong CpuMicros;
 }
 
 /// <summary>
@@ -327,6 +332,9 @@ internal sealed class CompactionJob
 
     /// <summary>The output files of the output level.</summary>
     public List<FileMetaData> Outputs => _lastLevelOutputs.Outputs;
+
+    /// <summary>OutputValidator::GetHash of each of <see cref="Outputs"/> (0 when the output hash is not enabled).</summary>
+    internal List<ulong> OutputHashes => _lastLevelOutputs.OutputHashes;
 
     /// <summary>With per-key placement: the output files of the proximal level (<see cref="Compaction.ProximalLevel"/>).</summary>
     public List<FileMetaData> ProximalOutputs => _proximalOutputs?.Outputs ?? s_noOutputs;
@@ -641,6 +649,7 @@ internal sealed class CompactionJob
             CompactionJobStats s = sub.Stats;
             Stats.NumOutputFiles += s.NumOutputFiles;
             Stats.BytesWritten += s.BytesWritten;
+            Stats.CpuMicros += s.CpuMicros;
             Stats.NumInputRecords += s.NumInputRecords;
             Stats.NumOutputRecords += s.NumOutputRecords;
             Stats.NumOutputRangeDeletions += s.NumOutputRangeDeletions;
@@ -737,6 +746,10 @@ internal sealed class CompactionJob
         // BlockCacheLookupContext{kCompaction} of the compaction input reads (scoped to this async method).
         if (_db.BlockCacheTracer.IsEnabled) Tracing.BlockCacheTracer.SetCaller(Tracing.TableReaderCaller.Compaction, 0, default, false);
         long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        // ProcessKeyValueCompaction: start_cpu_micros = db_options_.clock->CPUMicros(). A thread CPU clock: only read back
+        // on the thread that started (always the case for a synchronous run).
+        int cpuThread = Environment.CurrentManagedThreadId;
+        ulong startCpuMicros = Env.ThreadCpuClock.CpuMicros();
         // CompactionJob::SetupAndValidateCompactionFilter (compaction_job.cc): before any input is opened.
         CompactionFilter? filter = _c.CreateCompactionFilter(_cfd.Id);
         if (filter is not null && !filter.IgnoreSnapshots) ThrowHelper.NotSupported(CompactionFilter.IgnoreSnapshotsFalseMessage);
@@ -897,100 +910,103 @@ internal sealed class CompactionJob
             _lastLevelOutputs.Release();
             _proximalOutputs?.Release();
             Stats.Elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(start);
+            if (Environment.CurrentManagedThreadId == cpuThread)
+            {
+                // FinalizeSubcompactionJobStats / UpdateSubcompactionJobStatsIncrementally: cpu_micros of the
+                // subcompaction and COMPACTION_CPU_TOTAL_TIME.
+                ulong cpuNow = Env.ThreadCpuClock.CpuMicros();
+                if (cpuNow > startCpuMicros)
+                {
+                    Stats.CpuMicros = cpuNow - startCpuMicros;
+                    _db.Stats?.RecordTick(Ticker.CompactionCpuTotalTime, Stats.CpuMicros);
+                }
+            }
         }
     }
 
     /// <summary>
-    /// Port of CompactionJob::VerifyOutputFiles (compaction_job.cc) for the outputs of this subcompaction: with
-    /// verify_output_flags (paranoid_file_checks implies kVerifyIteration for local and remote compactions) each output
-    /// is opened (through the table cache for local compactions, like upstream's "verify that the table is usable") and
-    /// read back: kVerifyIteration compares the key/value hash with the one computed while writing (and re-checks the
-    /// key order), kVerifyBlockChecksum reads every data block with checksum verification (the meta blocks were verified
-    /// when the reader opened the file), kVerifyFileChecksum recomputes the file checksum. Mismatches fail the
-    /// compaction with Corruption. Cold path: once per output file.
+    /// Port of CompactionJob::VerifyOutputFiles (compaction_job.cc) for the outputs of this subcompaction, see
+    /// <see cref="VerifyOutputFile"/>. The compaction worker verifies nothing (CompactionServiceCompactionJob::Run has
+    /// no VerifyOutputFiles): the primary opens and verifies the worker's outputs once they are in the DB, with the
+    /// key/value hash the worker reports (paranoid_hash).
     /// </summary>
     private void VerifyOutputFiles(OutputGroup group)
     {
+        if (OutputDirectory is not null) return;
         if (group.Outputs.Count > 0) TestHooks.Invoke("CompactionJob::VerifyOutputFiles:Start");
-        ColumnFamilyOptions o = _c.Options;
-        VerifyOutputFlags flags = o.VerifyOutputFlags;
-        // For backward compatibility
-        if (o.ParanoidFileChecks) flags |= VerifyOutputFlags.Iteration | VerifyOutputFlags.EnableForLocalCompaction | VerifyOutputFlags.EnableForRemoteCompaction;
-        bool remote = OutputDirectory is not null;
-        bool shouldVerify = (flags & (remote ? VerifyOutputFlags.EnableForRemoteCompaction : VerifyOutputFlags.EnableForLocalCompaction)) != 0;
-        if (!shouldVerify || group.Outputs.Count == 0) return;
-        bool verifyIteration = (flags & VerifyOutputFlags.Iteration) != 0;
-        bool verifyBlockChecksum = (flags & VerifyOutputFlags.BlockChecksum) != 0;
-        bool verifyFileChecksum = (flags & VerifyOutputFlags.FileChecksum) != 0 && _db.Options.FileChecksumGenFactory is not null;
+        VerifyOutputFlags flags = EffectiveVerifyOutputFlags(_c.Options);
+        bool shouldVerify = (flags & VerifyOutputFlags.EnableForLocalCompaction) != 0;
         for (int i = 0; i < group.Outputs.Count; i++)
         {
-            FileMetaData meta = group.Outputs[i];
-            string path = OutputDirectory is { } dir ? FileNames.MakeTableFileName(dir, meta.FileNumber) : FileNames.TableFileName(_db.DbPaths, meta.FileNumber, meta.PathId);
+            FileMetaData output = group.Outputs[i];
+            // The level the file is about to be installed on (the reader's per-level read statistics).
+            if (output.LevelHint < 0) output.LevelHint = ReferenceEquals(group, _proximalOutputs) ? _c.ProximalLevel : _c.OutputLevel;
+            VerifyOutputFile(_db, _cfd, output, group.OutputHashes[i], shouldVerify ? flags : VerifyOutputFlags.None);
+        }
+    }
+
+    /// <summary>verify_output_flags with paranoid_file_checks folded in ("For backward compatibility").</summary>
+    internal static VerifyOutputFlags EffectiveVerifyOutputFlags(ColumnFamilyOptions o)
+    {
+        VerifyOutputFlags flags = o.VerifyOutputFlags;
+        if (o.ParanoidFileChecks) flags |= VerifyOutputFlags.Iteration | VerifyOutputFlags.EnableForLocalCompaction | VerifyOutputFlags.EnableForRemoteCompaction;
+        return flags;
+    }
+
+    /// <summary>
+    /// The per-file body of CompactionJob::VerifyOutputFiles (verify_table). "Verify that the table is usable": the
+    /// output is opened through the table cache on the compaction thread whatever the flags, so an output that does not
+    /// open fails the compaction and the open's reads (footer, metaindex, properties, index) count in the job's
+    /// IOSTATS(bytes_read), i.e. COMPACT_READ_BYTES. With <paramref name="flags"/> (None when verification is not
+    /// enabled for this kind of compaction) the file is read back: kVerifyIteration compares the key/value hash with
+    /// <paramref name="expectedHash"/> (computed while writing; the worker's paranoid_hash for a remote compaction) and
+    /// re-checks the key order, kVerifyBlockChecksum reads every data block with checksum verification (the meta blocks
+    /// were verified when the reader opened the file), kVerifyFileChecksum recomputes the file checksum. Mismatches
+    /// are Corruption. Cold path: once per output file.
+    /// </summary>
+    internal static void VerifyOutputFile(DbImpl db, ColumnFamilyData cfd, FileMetaData meta, ulong expectedHash, VerifyOutputFlags flags)
+    {
+        bool verifyIteration = (flags & VerifyOutputFlags.Iteration) != 0;
+        bool verifyBlockChecksum = (flags & VerifyOutputFlags.BlockChecksum) != 0;
+        bool verifyFileChecksum = (flags & VerifyOutputFlags.FileChecksum) != 0 && db.Options.FileChecksumGenFactory is not null;
+        using (TableReaderLease lease = cfd.TableCache.GetReader(meta))
+        {
             if (verifyIteration || verifyBlockChecksum)
             {
-                TableReaderLease lease = default;
-                TableReader? owned = null;
+                ulong hash = 0;
+                var prev = new PooledBufferWriter(64);
                 try
                 {
-                    TableReader reader;
-                    if (remote)
+                    using InternalIterator it = lease.Reader.NewInternalIterator(TableReadFlags.DontFillCache, null, null);
+                    for (it.SeekToFirst(); it.Valid; it.Next())
                     {
-                        IRandomAccessFile f = _db.FileSystem.OpenRandomAccess(path);
-                        try
-                        {
-                            owned = TableReaderFactory.Open(f, _cfd.ReaderOptions with { BlockCache = NoBlockCache.Instance });
-                        }
-                        catch
-                        {
-                            f.Dispose();
-                            throw;
-                        }
-                        reader = owned;
-                    }
-                    else
-                    {
-                        lease = _cfd.TableCache.GetReader(meta);
-                        reader = lease.Reader;
-                    }
-                    ulong hash = 0;
-                    var prev = new PooledBufferWriter(64);
-                    try
-                    {
-                        using InternalIterator it = reader.NewInternalIterator(TableReadFlags.DontFillCache, null, null);
-                        for (it.SeekToFirst(); it.Valid; it.Next())
-                        {
-                            ReadOnlySpan<byte> k = it.Key;
-                            // OutputValidator::Add
-                            if (k.Length < DbFormat.InternalKeyFooterSize) ThrowHelper.Corruption("Compaction tries to write a key without internal bytes.");
-                            if (prev.WrittenCount > 0 && _icmp.Compare(k, prev.WrittenSpan) < 0) ThrowOutOfOrder();
-                            prev.Clear();
-                            prev.Write(k);
-                            if (verifyIteration) hash = Hash.NPHash64(it.Value, Hash.NPHash64(k, hash));
-                        }
-                    }
-                    finally
-                    {
-                        prev.Dispose();
-                    }
-                    if (verifyIteration && hash != group.OutputHashes[i])
-                    {
-                        ThrowHelper.Corruption("Key-value checksum of compaction output doesn't match what was computed when written");
+                        ReadOnlySpan<byte> k = it.Key;
+                        // OutputValidator::Add
+                        if (k.Length < DbFormat.InternalKeyFooterSize) ThrowHelper.Corruption("Compaction tries to write a key without internal bytes.");
+                        if (prev.WrittenCount > 0 && cfd.Icmp.Compare(k, prev.WrittenSpan) < 0) ThrowOutOfOrder();
+                        prev.Clear();
+                        prev.Write(k);
+                        if (verifyIteration) hash = Hash.NPHash64(it.Value, Hash.NPHash64(k, hash));
                     }
                 }
                 finally
                 {
-                    lease.Dispose();
-                    owned?.Dispose();
+                    prev.Dispose();
+                }
+                if (verifyIteration && hash != expectedHash)
+                {
+                    ThrowHelper.Corruption("Key-value checksum of compaction output doesn't match what was computed when written");
                 }
             }
-            if (verifyFileChecksum && meta.FileChecksumFuncName != FileMetaData.UnknownFileChecksumFuncName)
+        }
+        if (verifyFileChecksum && meta.FileChecksumFuncName != FileMetaData.UnknownFileChecksumFuncName)
+        {
+            string path = FileNames.TableFileName(db.DbPaths, meta.FileNumber, meta.PathId);
+            (byte[] checksum, _) = FileChecksumHelper.GenerateOneFileChecksum(db.FileSystem, path, db.Options.FileChecksumGenFactory!,
+                meta.FileChecksumFuncName, null);
+            if (!checksum.AsSpan().SequenceEqual(meta.FileChecksum))
             {
-                (byte[] checksum, _) = FileChecksumHelper.GenerateOneFileChecksum(_db.FileSystem, path, _db.Options.FileChecksumGenFactory!,
-                    meta.FileChecksumFuncName, null);
-                if (!checksum.AsSpan().SequenceEqual(meta.FileChecksum))
-                {
-                    ThrowHelper.Corruption("File checksum mismatch for compaction output file " + path);
-                }
+                ThrowHelper.Corruption("File checksum mismatch for compaction output file " + path);
             }
         }
     }

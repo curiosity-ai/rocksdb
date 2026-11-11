@@ -31,6 +31,11 @@ public sealed class PairNodeHostOptions
     public int MaxChunkBytes { get; init; } = WalTailer.DefaultMaxChunkBytes;
     public int SnapshotChunkBytes { get; init; } = 1024 * 1024;
     public TimeSpan RetryDelay { get; init; } = TimeSpan.FromMilliseconds(200);
+    /// <summary>
+    /// How long <see cref="PairNodeHost.DisposeAsync"/> waits for RPC handlers that still use the database (a stream
+    /// whose consumer stopped reading holds it until its transport gives up) before it closes the database anyway.
+    /// </summary>
+    public TimeSpan DisposeDrainTimeout { get; init; } = TimeSpan.FromSeconds(10);
     public Action<string>? Log { get; init; }
 }
 
@@ -81,6 +86,9 @@ public sealed class PairNodeHost : IAsyncDisposable
     private Task _resyncTask = Task.CompletedTask;
     private int _resyncs;
     private ulong _attachedFromSeq;
+    private int _walStreamFaults;
+    private string? _lastWalStreamFault;
+    private readonly FollowerResyncPolicy _resyncPolicy = new();
     // Cancelled whenever this node becomes a replica: ends the WAL streams it serves as primary.
     private CancellationTokenSource _primaryCts = new();
 
@@ -99,6 +107,19 @@ public sealed class PairNodeHost : IAsyncDisposable
     public bool IsResyncing => _resyncing;
     public int Resyncs => Volatile.Read(ref _resyncs);
     public PairFaults Faults { get; } = new();
+    /// <summary>Cancelled when the host starts shutting down; transports use it to abandon a blocked stream write.</summary>
+    public CancellationToken Stopping => _cts.Token;
+    /// <summary>How often a WAL stream served by this node ended on an error of its own WAL (Corruption, NotSupported).</summary>
+    public int WalStreamFaults => Volatile.Read(ref _walStreamFaults);
+    /// <summary>The message of the latest such error, or null.</summary>
+    public string? LastWalStreamFault => Volatile.Read(ref _lastWalStreamFault);
+
+    private void OnWalStreamFault(RocksDbException e)
+    {
+        Interlocked.Increment(ref _walStreamFaults);
+        Volatile.Write(ref _lastWalStreamFault, e.Message);
+        Log("WAL stream fault (" + e.Code + "): " + e.Message);
+    }
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
@@ -235,7 +256,7 @@ public sealed class PairNodeHost : IAsyncDisposable
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token, primary);
             SwitchoverNode node = _node;
-            await foreach (WalStreamMessage m in WalStreamSender.StreamAsync(_db, startSeq, Tag, node.GetEpochForSeq, _cfg.MaxChunkBytes, cts.Token)
+            await foreach (WalStreamMessage m in WalStreamSender.StreamAsync(_db, startSeq, Tag, node.GetEpochForSeq, _cfg.MaxChunkBytes, OnWalStreamFault, cts.Token)
                                .ConfigureAwait(false))
             {
                 yield return m;
@@ -342,6 +363,7 @@ public sealed class PairNodeHost : IAsyncDisposable
 
     private async Task RunFollowerStreamAsync(CancellationToken ct)
     {
+        bool stalled = false;
         while (!ct.IsCancellationRequested)
         {
             try
@@ -375,9 +397,18 @@ public sealed class PairNodeHost : IAsyncDisposable
                 {
                     if (m.ResyncRequired)
                     {
+                        if (!_resyncPolicy.ShouldRebuild(m, _db.GetLatestSequenceNumber()))
+                        {
+                            // The snapshot this node was just rebuilt from did not get it past the fault of the
+                            // primary's WAL; another one would not either.
+                            if (!stalled) Log(_cfg.PeerId + " still cannot stream from " + (_db.GetLatestSequenceNumber() + 1) + " after a resync; retrying the stream: " + m.Reason);
+                            stalled = true;
+                            break;
+                        }
                         TriggerResync(_cfg.PeerId + " cannot stream from " + (_db.GetLatestSequenceNumber() + 1) + ": " + m.Reason);
                         return;
                     }
+                    stalled = false;
                     while (Faults.PauseIngest) await Task.Delay(5, ct).ConfigureAwait(false);
                     if (!_node.AcceptStream(m.SourceId, m.SourceTerm))
                     {
@@ -459,8 +490,18 @@ public sealed class PairNodeHost : IAsyncDisposable
         Log("snapshot from " + _cfg.PeerId + ": " + r.TransferredFiles + " files, " + r.TransferredBytes + " bytes");
     }
 
-    private void TriggerResync(string reason)
+    /// <summary>
+    /// Rebuilds this replica from the primary's snapshot (also triggered automatically when the logs diverged or the
+    /// primary can no longer stream from this node's position). Ignored on a node that is not a replica.
+    /// </summary>
+    public void TriggerResync(string reason)
     {
+        // Read outside _followerLock: role changes are raised under the node's lock and take _followerLock.
+        if (_node.Role != ReplicationRole.Replica)
+        {
+            Log("resync not started (" + reason + "): this node is " + _node.Role);
+            return;
+        }
         lock (_followerLock)
         {
             if (_resyncing || _cts.IsCancellationRequested) return;
@@ -481,7 +522,18 @@ public sealed class PairNodeHost : IAsyncDisposable
         await _resyncGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            _node.DetachDatabase();
+            try
+            {
+                _node.DetachDatabase();
+            }
+            catch (InvalidOperationException e)
+            {
+                // Promoted between the trigger and here: a primary keeps its database. Leaving the flag set would make
+                // this node answer "no status" for good.
+                lock (_followerLock) _resyncing = false;
+                Log("resync abandoned: " + e.Message);
+                return;
+            }
             await StopFollowerStreamAsync().ConfigureAwait(false);
             await _dbGate.DrainAsync(_cts.Token).ConfigureAwait(false);
             await _db.DisposeAsync().ConfigureAwait(false);
@@ -492,6 +544,7 @@ public sealed class PairNodeHost : IAsyncDisposable
                     await PullSnapshotAsync(_cts.Token).ConfigureAwait(false);
                     _db = await OpenDatabaseAsync(_cts.Token).ConfigureAwait(false);
                     _node.AttachDatabase(_db);
+                    _resyncPolicy.OnRebuilt(_db.GetLatestSequenceNumber());
                     _dbGate.Reopen();
                     Interlocked.Increment(ref _resyncs);
                     lock (_followerLock) _resyncing = false;
@@ -533,12 +586,20 @@ public sealed class PairNodeHost : IAsyncDisposable
         catch (Exception)
         {
         }
-        try
+        // Bounded: a stream whose consumer stopped reading keeps its handler (and the gate) until the transport gives up.
+        using (var drain = new CancellationTokenSource(_cfg.DisposeDrainTimeout))
         {
-            await _dbGate.DrainAsync(CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (Exception)
-        {
+            try
+            {
+                await _dbGate.DrainAsync(drain.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                Log("closing the database although an RPC handler still uses it (not finished within " + _cfg.DisposeDrainTimeout + ")");
+            }
+            catch (Exception)
+            {
+            }
         }
         if (_db != null) await _db.DisposeAsync().ConfigureAwait(false);
     }

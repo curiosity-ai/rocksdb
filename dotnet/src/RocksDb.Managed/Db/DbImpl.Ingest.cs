@@ -65,6 +65,21 @@ internal sealed partial class DbImpl
         }
     }
 
+    /// <summary>
+    /// The MANIFEST write of DBImpl::ReserveFileNumbersBeforeIngestion: "If crash happen after a hard link established,
+    /// Recover function may reuse the file number that has already assigned to the internal file, and this will
+    /// overwrite the external file. To protect the external file, we have to make sure the file number will never
+    /// being reused." A dummy edit persists the next file number.
+    /// </summary>
+    internal async ValueTask PersistReservedIngestionFileNumbersAsync(ColumnFamilyData cfd, bool synchronous, CancellationToken ct)
+    {
+        // Do not ingest files when there is a bg_error.
+        ThrowIfDbStopped();
+        var dummy = new VersionEdit { ColumnFamily = cfd.Id };
+        dummy.MarkForegroundOperation();
+        await Versions.LogAndApplyAsync(cfd, dummy, synchronous, ct).ConfigureAwait(false);
+    }
+
     internal ulong ReserveFileNumberForIngestion()
     {
         ulong n = Versions.NewFileNumber();

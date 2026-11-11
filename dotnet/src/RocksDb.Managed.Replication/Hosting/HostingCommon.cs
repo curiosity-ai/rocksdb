@@ -21,18 +21,26 @@ public readonly struct WalStreamMessage
         SourceTerm = sourceTerm;
         EntryTerm = entryTerm;
         ResyncRequired = false;
+        SourceFault = false;
         Reason = null;
     }
 
-    private WalStreamMessage(string sourceId, long sourceTerm, string reason)
+    private WalStreamMessage(string sourceId, long sourceTerm, string reason, bool sourceFault)
     {
         SourceId = sourceId;
         SourceTerm = sourceTerm;
         ResyncRequired = true;
+        SourceFault = sourceFault;
         Reason = reason;
     }
 
-    public static WalStreamMessage Resync(string sourceId, long sourceTerm, string reason) => new(sourceId, sourceTerm, reason);
+    public static WalStreamMessage Resync(string sourceId, long sourceTerm, string reason) => new(sourceId, sourceTerm, reason, false);
+
+    /// <summary>
+    /// A resync request sent because the source failed to read its own WAL (<see cref="SourceFault"/>), not because of
+    /// the follower's position.
+    /// </summary>
+    public static WalStreamMessage ResyncAfterSourceFault(string sourceId, long sourceTerm, string reason) => new(sourceId, sourceTerm, reason, true);
 
     public ulong FirstSequence { get; }
     public int EntryCount { get; }
@@ -45,10 +53,36 @@ public readonly struct WalStreamMessage
     /// <summary>The term of <see cref="FirstSequence"/> in the source's term log (0 if none).</summary>
     public long EntryTerm { get; }
     public bool ResyncRequired { get; }
+    /// <summary>
+    /// With <see cref="ResyncRequired"/>: the source could not read its own WAL. A snapshot helps the follower only if
+    /// the stream it opens afterwards gets past the fault, so a follower that has applied nothing since its last rebuild
+    /// retries the stream instead of rebuilding again (<see cref="FollowerResyncPolicy"/>).
+    /// </summary>
+    public bool SourceFault { get; }
     public string? Reason { get; }
 
     public WalStreamMessage Detach() =>
         ResyncRequired ? this : new WalStreamMessage(FirstSequence, EntryCount, Data.ToArray(), SourceId, SourceTerm, EntryTerm);
+}
+
+/// <summary>
+/// Follower-side rule that keeps a resync requested for a fault of the source's own WAL
+/// (<see cref="WalStreamMessage.SourceFault"/>) from repeating without end: a rebuild is only worth it if this node has
+/// applied something since its last one. Otherwise the snapshot it just restored did not get it past the fault, the next
+/// one would not either, and the node retries the stream until the source can read its WAL again.
+/// </summary>
+public sealed class FollowerResyncPolicy
+{
+    private const long None = -1;
+    // The log end right after the last rebuild, or None.
+    private long _rebuiltAtSeq = None;
+
+    /// <summary>Records that a rebuild just completed with the log ending at <paramref name="latestSeq"/>.</summary>
+    public void OnRebuilt(ulong latestSeq) => Volatile.Write(ref _rebuiltAtSeq, unchecked((long)latestSeq));
+
+    /// <summary>Whether a resync request <paramref name="message"/> should rebuild a node whose log ends at <paramref name="latestSeq"/>.</summary>
+    public bool ShouldRebuild(in WalStreamMessage message, ulong latestSeq) =>
+        !message.SourceFault || Volatile.Read(ref _rebuiltAtSeq) != unchecked((long)latestSeq);
 }
 
 /// <summary>Source-side producer of <see cref="WalStreamMessage"/>s over a <see cref="WalTailer"/>.</summary>
@@ -59,14 +93,47 @@ public static class WalStreamSender
     /// is cancelled (e.g. the node stopped leading) or the database closes. <paramref name="tag"/> is asked before every
     /// chunk for the (source id, term) to stamp on it, and ends the stream by returning false.
     /// <paramref name="entryTerm"/> maps a sequence number to its term. When the WAL for <paramref name="startSequence"/>
-    /// is gone, a single <see cref="WalStreamMessage.Resync"/> message ends the stream.
+    /// is gone, or <paramref name="startSequence"/> is past the end of this database's log (the follower holds entries
+    /// this database never wrote), a single <see cref="WalStreamMessage.Resync"/> message ends the stream.
+    /// </summary>
+    public static IAsyncEnumerable<WalStreamMessage> StreamAsync(RocksDatabase db, ulong startSequence, StreamTagProvider tag,
+        Func<ulong, long> entryTerm, int maxChunkBytes, CancellationToken cancellationToken) =>
+        StreamAsync(db, startSequence, tag, entryTerm, maxChunkBytes, null, cancellationToken);
+
+    /// <summary>
+    /// <see cref="StreamAsync(RocksDatabase, ulong, StreamTagProvider, Func{ulong, long}, int, CancellationToken)"/> with a
+    /// callback for errors of the source's own WAL that retrying the stream cannot cure:
+    /// <list type="bullet">
+    /// <item>Corruption (a WAL the follower still needs cannot be read): <paramref name="onSourceFault"/> is called and a
+    /// <see cref="WalStreamMessage.ResyncAfterSourceFault"/> message ends the stream - a snapshot does not need the
+    /// damaged WAL (the checkpoint flushes the memtables), and the follower streams from the snapshot's end afterwards.
+    /// If that stream fails the same way (the source cannot even list its WAL files) the follower does not rebuild
+    /// again, see <see cref="FollowerResyncPolicy"/>.</item>
+    /// <item>NotSupported (the database cannot be tailed at all, e.g. a write-prepared / write-unprepared transaction
+    /// database): <paramref name="onSourceFault"/> is called and the exception is thrown to the consumer. A snapshot
+    /// would not help - the stream after it would fail the same way - so no resync is requested.</item>
+    /// </list>
     /// </summary>
     public static async IAsyncEnumerable<WalStreamMessage> StreamAsync(RocksDatabase db, ulong startSequence, StreamTagProvider tag,
-        Func<ulong, long> entryTerm, int maxChunkBytes, [EnumeratorCancellation] CancellationToken cancellationToken)
+        Func<ulong, long> entryTerm, int maxChunkBytes, Action<RocksDbException>? onSourceFault,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(db);
         ArgumentNullException.ThrowIfNull(tag);
         ArgumentNullException.ThrowIfNull(entryTerm);
+        // A follower that asks for entries past the end of this log holds entries this node never wrote: its log is not
+        // a prefix of ours. Waiting until our log grows to that point would then stream our entries on top of its
+        // unrelated ones (same sequence numbers, different history), so tell it to rebuild instead.
+        ulong latest = db.GetLatestSequenceNumber();
+        if (startSequence > latest + 1)
+        {
+            if (tag(out string id, out long t))
+            {
+                yield return WalStreamMessage.Resync(id, t,
+                    "the follower asks for sequence " + startSequence + " but the source log ends at " + latest + ": the logs diverged");
+            }
+            yield break;
+        }
         using WalTailer tailer = new ReplicationSource(db).TailWal(startSequence, maxChunkBytes);
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -74,6 +141,7 @@ public static class WalStreamSender
             WalChunk chunk;
             bool has;
             string? resync = null;
+            bool sourceFault = false;
             try
             {
                 has = tailer.TryReadChunk(out chunk);
@@ -84,9 +152,22 @@ public static class WalStreamSender
                 chunk = default;
                 resync = e.Message;
             }
+            catch (RocksDbException e) when (e.Code is StatusCode.Corruption)
+            {
+                onSourceFault?.Invoke(e);
+                has = false;
+                chunk = default;
+                sourceFault = true;
+                resync = "the source cannot read its WAL: " + e.Message;
+            }
+            catch (RocksDbException e) when (e.Code is StatusCode.NotSupported)
+            {
+                onSourceFault?.Invoke(e);
+                throw;
+            }
             if (resync != null)
             {
-                yield return WalStreamMessage.Resync(sourceId, term, resync);
+                yield return sourceFault ? WalStreamMessage.ResyncAfterSourceFault(sourceId, term, resync) : WalStreamMessage.Resync(sourceId, term, resync);
                 yield break;
             }
             if (has)

@@ -23,7 +23,7 @@ public sealed class ReplicationService(ReplicationPrimary primary) : ServiceBase
         ServerStreamingContext<SnapshotChunkDto> stream = GetServerStreamingContext<SnapshotChunkDto>();
         await foreach (SnapshotChunk c in primary.StreamInitialStateAsync(Context.CallContext.CancellationToken).ConfigureAwait(false))
         {
-            await stream.WriteAsync(SnapshotChunkDto.From(c)).ConfigureAwait(false);
+            await stream.WriteAsync(SnapshotChunkDto.From(c)).WaitAsync(Context.CallContext.CancellationToken).ConfigureAwait(false);
         }
         return stream.Result();
     }
@@ -36,7 +36,7 @@ public sealed class ReplicationService(ReplicationPrimary primary) : ServiceBase
         {
             await foreach (WalStreamMessage m in primary.StreamUpdatesAsync(startSeq, ct).ConfigureAwait(false))
             {
-                await stream.WriteAsync(WalChunkDto.From(m)).ConfigureAwait(false);
+                await stream.WriteAsync(WalChunkDto.From(m)).WaitAsync(ct).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)

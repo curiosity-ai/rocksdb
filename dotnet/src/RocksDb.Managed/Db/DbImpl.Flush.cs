@@ -540,22 +540,24 @@ internal sealed partial class DbImpl
                 // In 2PC mode the WALs holding outstanding prepared sections (or prepared sections of committed data
                 // still in memtables) must survive (PrecomputeMinLogNumberToKeep2PC).
                 minWalToKeep = PrecomputeMinLogNumberToKeep2PC(cfd, edit.LogNumber.Value, picked);
-                edit.MinLogNumberToKeep = minWalToKeep;
+                if (group is not null) edit.MinLogNumberToKeep = minWalToKeep;
             }
             else
             {
                 // PrecomputeMinLogNumberToKeepNon2PC: minimum of the other CFs' log numbers and this edit's (an atomic
                 // flush computes it over all its members when it commits).
                 minWalToKeep = Math.Min(Versions.MinLogNumberWithUnflushedData(cfd), edit.LogNumber.Value);
-                // GetDBRecoveryEditForObsoletingMemTables records it for every flush (also with a single column family),
-                // which keeps versions_->min_log_number_to_keep ("rocksdb.min-log-number-to-keep") current.
-                if (group is null) edit.MinLogNumberToKeep = minWalToKeep;
             }
-            // GetDBRecoveryEditForObsoletingMemTables: with track_and_verify_wals_in_manifest the WALs the flush makes
-            // obsolete are recorded as deleted in a separate edit of the same MANIFEST write.
-            if (group is null && Options.TrackAndVerifyWalsInManifest && minWalToKeep > Versions.MinWalNumberToKeep)
+            // GetDBRecoveryEditForObsoletingMemTables (db/memtable_list.cc), appended to the flush's edit list by
+            // TryInstallMemtableFlushResults: a separate edit of the same MANIFEST write records min_log_number_to_keep
+            // for every flush (also with a single column family; it keeps versions_->min_log_number_to_keep,
+            // "rocksdb.min-log-number-to-keep", current) and, with track_and_verify_wals_in_manifest, the WALs the flush
+            // makes obsolete as deleted.
+            if (group is null)
             {
-                walDeletion = new VersionEdit { WalDeletionBefore = minWalToKeep };
+                // LogAndApplyHelper: "if (!edit->HasPrevLogNumber()) edit->SetPrevLogNumber(prev_log_number_)".
+                walDeletion = new VersionEdit { MinLogNumberToKeep = minWalToKeep, PrevLogNumber = Versions.PrevLogNumber };
+                if (Options.TrackAndVerifyWalsInManifest && minWalToKeep > Versions.MinWalNumberToKeep) walDeletion.WalDeletionBefore = minWalToKeep;
             }
         }
         TestHooks.Invoke("DBImpl::FlushMemTables:BeforeLogAndApply");
@@ -610,7 +612,7 @@ internal sealed partial class DbImpl
         if (meta is not null) MaybeReportMaxAllowedSpaceReached(BackgroundErrorReason.Flush);
         if (dropped) return;
         if (blobBuilder is not null && meta is not null) LogBlobFileCreationEvents(cfd, jobId, blobBuilder.Additions);
-        OnFlushCompleted(cfd, jobId, meta, BlobBytesWritten(blobBuilder), flushStart);
+        OnFlushCompleted(cfd, jobId, meta, BlobBytesWritten(blobBuilder), edit.ManifestBytesWritten, flushStart);
         NotifyOnFlushCompleted(cfd, jobId, fileNumber, meta, path, mems, reason);
     }
 

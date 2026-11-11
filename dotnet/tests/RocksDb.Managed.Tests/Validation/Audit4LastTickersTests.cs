@@ -171,7 +171,8 @@ public sealed class Audit4LastTickersTests
         Assert.IsTrue(SpinWait.SpinUntil(() => l.Count("FlushCompleted") == 1, s_timeout));
         Assert.AreEqual("1", db.GetProperty("rocksdb.num-files-at-level0"), "managed flush keeps the pair (upstream: no file)");
         Assert.IsNull(db.Get(B("a")));
-        db.CompactRange();
+        // A plain CompactRange only moves the single file; a compaction that rewrites it drops the pair.
+        db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
         Assert.IsNull(db.Get(B("a")));
         Assert.AreEqual(0, db.GetLiveFilesMetadata().Count, "the compaction drops the pair");
     }
@@ -457,11 +458,13 @@ public sealed class Audit4LastTickersTests
             foreach (LiveFileMetadata f in db.GetLiveFilesMetadata()) inputFileBytes += f.Size;
             db.CompactRange();
             ulong read = st.GetTickerCount(Ticker.CompactReadBytes);
-            // At most the input files (all of them here: MemoryFileSystem has no OS prefetch, so the compaction
-            // readahead buffer reads each file through to its end, as upstream's FilePrefetchBuffer does).
-            Assert.IsTrue(read > 0 && read <= inputFileBytes, read + " of " + inputFileBytes);
             ulong outputBytes = 0;
             foreach (LiveFileMetadata f in db.GetLiveFilesMetadata()) outputBytes += f.Size;
+            // At most the input files (all of them here: MemoryFileSystem has no OS prefetch, so the compaction
+            // readahead buffer reads each file through to its end, as upstream's FilePrefetchBuffer does), plus the
+            // open of the output on the compaction thread (verify_table: "Verify that the table is usable"), which
+            // reads its footer and meta blocks.
+            Assert.IsTrue(read > inputFileBytes / 2 && read < inputFileBytes + outputBytes / 2, read + " of " + inputFileBytes + " + " + outputBytes);
             Assert.AreEqual(outputBytes, st.GetTickerCount(Ticker.CompactWriteBytes));
 
             // Inputs whose data blocks are all in the block cache: the compaction reads nothing from the files.
@@ -474,7 +477,11 @@ public sealed class Audit4LastTickersTests
                 }
             }
             db.CompactRange();
-            Assert.AreEqual(read, st.GetTickerCount(Ticker.CompactReadBytes));
+            // Only the open of the new output (footer and meta blocks, a fraction of the file).
+            ulong openBytes = st.GetTickerCount(Ticker.CompactReadBytes) - read;
+            ulong newOutputBytes = 0;
+            foreach (LiveFileMetadata f in db.GetLiveFilesMetadata()) newOutputBytes += f.Size;
+            Assert.IsTrue(openBytes > 53 && openBytes < newOutputBytes / 2, openBytes + " of " + newOutputBytes);
         }
     }
 }

@@ -708,8 +708,11 @@ public sealed class DbIter : IDisposable
         return _skipPending = _rangeDel.ShouldDeleteWithSkipTarget(userKey, sequence, forward, _skipTarget!, out _skipSeq);
     }
 
-    // LocalStatistics::skip_count_ (db/db_iter.h): reported as NUMBER_ITER_SKIP when the iterator is released.
-    private ulong _skipCount;
+    // _numInternalKeysSkipped is a running total that doubles as LocalStatistics::skip_count_ (db/db_iter.h, reported
+    // as NUMBER_ITER_SKIP when the iterator is released); _skipMark is its value when the current move started, so
+    // upstream's num_internal_keys_skipped_ is the difference of the two (modulo 2^64, like upstream's counters). A
+    // move then starts with one load and two stores instead of a separate accumulator update.
+    private ulong _skipMark;
 
     /// <summary>
     /// Port of ResetInternalKeysSkippedCounter: the internal keys the finished move looked at, less the one it stopped
@@ -718,9 +721,10 @@ public sealed class DbIter : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void ResetInternalKeysSkippedCounter(bool wasValid)
     {
-        _skipCount += _numInternalKeysSkipped;
-        if (wasValid) _skipCount--;
-        _numInternalKeysSkipped = 0;
+        ulong total = _numInternalKeysSkipped;
+        if (wasValid) total--;
+        _numInternalKeysSkipped = total;
+        _skipMark = total;
     }
 
     /// <summary>~DBIter: the NUMBER_ITER_SKIP count of this use of the iterator (BumpGlobalStatistics); invalidates it.</summary>
@@ -728,8 +732,9 @@ public sealed class DbIter : IDisposable
     {
         ResetInternalKeysSkippedCounter(_valid);
         _valid = false;
-        ulong n = _skipCount;
-        _skipCount = 0;
+        ulong n = _numInternalKeysSkipped;
+        _numInternalKeysSkipped = 0;
+        _skipMark = 0;
         return n;
     }
 
@@ -737,7 +742,7 @@ public sealed class DbIter : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void TooManyInternalKeysSkipped(bool increment)
     {
-        if (_maxSkippableInternalKeys > 0 && _numInternalKeysSkipped > _maxSkippableInternalKeys) ThrowIncomplete();
+        if (_maxSkippableInternalKeys > 0 && _numInternalKeysSkipped - _skipMark > _maxSkippableInternalKeys) ThrowIncomplete();
         else if (increment) _numInternalKeysSkipped++;
     }
 
@@ -1327,6 +1332,8 @@ public sealed class DbIter : IDisposable
     {
         if (!_valid) ThrowHelper.InvalidArgument("Prev on an invalid iterator");
         PerfContext.Add(PerfMetric.IterPrevCount, 1);
+        // Invalid until the reverse state machine has finished (see RunReverse).
+        _valid = false;
         ReleaseTempPinnedData();
         ResetInternalKeysSkippedCounter(wasValid: true); // Next / Prev require a valid iterator
         BeginPrev();
@@ -1557,6 +1564,7 @@ public sealed class DbIter : IDisposable
     public ValueTask PrevAsync(CancellationToken cancellationToken = default)
     {
         if (!_valid) ThrowHelper.InvalidArgument("Prev on an invalid iterator");
+        _valid = false; // until the reverse state machine has finished (see RunReverse)
         ReleaseTempPinnedData();
         ResetInternalKeysSkippedCounter(wasValid: true); // Next / Prev require a valid iterator
         BeginPrev();
@@ -1718,6 +1726,7 @@ public sealed class DbIter : IDisposable
     private RevPhase _revPhase;
     private RevFinish _revFinish;
     private bool _fukFromPrevInternal;      // FindUserKeyBeforeSavedKey was called by PrevInternal (else ReverseToBackward)
+    private bool _fukValid;                 // valid_ as found for saved_key_, held while FindUserKeyBeforeSavedKey runs
     private ulong _fukNumSkipped;           // FindUserKeyBeforeSavedKey's num_skipped
     // FindValueForCurrentKey's locals.
     private EntryType _fvLastNotMergeType;
@@ -1732,98 +1741,78 @@ public sealed class DbIter : IDisposable
         _revPhase = _forward ? RevPhase.ToBackward : RevPhase.PrevTop;
     }
 
-    /// <summary>Sync driver of the reverse state machine.</summary>
+    /// <summary>
+    /// Sync driver of the reverse state machine. The reverse functions move the inner iterator after the value was found
+    /// (FindUserKeyBeforeSavedKey) and before the current one is given up (ReverseToBackward): a failure there
+    /// invalidates the iterator, like upstream's "if (!iter_.status().ok()) { valid_ = false; return false; }". No
+    /// try / catch is needed for that: _valid is false whenever the machine can throw. Prev clears it before starting
+    /// (the seeks through ResetSeekState), a found value is held in _fukValid while FindUserKeyBeforeSavedKey moves the
+    /// inner iterator (HoldValid), and _valid is assigned from it only when that loop is done.
+    /// </summary>
     private void RunReverse()
     {
-        try
+        while (true)
         {
-            while (true)
+            switch (ReverseStep())
             {
-                switch (ReverseStep())
-                {
-                    case InnerOp.Done:
-                        ReverseFinished();
-                        return;
-                    case InnerOp.Continue:
-                        break;
-                    case InnerOp.Prev:
-                        _iter.Prev();
-                        break;
-                    case InnerOp.Next:
-                        _iter.Next();
-                        break;
-                    case InnerOp.Seek:
-                        _iter.Seek(_seekKey.WrittenSpan);
-                        break;
-                    case InnerOp.SeekForPrev:
-                        _iter.SeekForPrev(_seekKey.WrittenSpan);
-                        break;
-                    case InnerOp.SeekToLast:
-                        _iter.SeekToLast();
-                        break;
-                    case InnerOp.SkipCovered:
-                        if (!_iter.SkipCoveredBackward(_skipTarget!.WrittenSpan, _skipSeq)) _iter.Prev();
-                        break;
-                }
+                case InnerOp.Done:
+                    ReverseFinished();
+                    return;
+                case InnerOp.Continue:
+                    break;
+                case InnerOp.Prev:
+                    _iter.Prev();
+                    break;
+                case InnerOp.Next:
+                    _iter.Next();
+                    break;
+                case InnerOp.Seek:
+                    _iter.Seek(_seekKey.WrittenSpan);
+                    break;
+                case InnerOp.SeekForPrev:
+                    _iter.SeekForPrev(_seekKey.WrittenSpan);
+                    break;
+                case InnerOp.SeekToLast:
+                    _iter.SeekToLast();
+                    break;
+                case InnerOp.SkipCovered:
+                    if (!_iter.SkipCoveredBackward(_skipTarget!.WrittenSpan, _skipSeq)) _iter.Prev();
+                    break;
             }
-        }
-        catch
-        {
-            // The reverse functions move the inner iterator after the value was found (FindUserKeyBeforeSavedKey) and
-            // before the current one is given up (ReverseToBackward): a failure there invalidates the iterator, like
-            // upstream's "if (!iter_.status().ok()) { valid_ = false; return false; }".
-            _valid = false;
-            throw;
         }
     }
 
     /// <summary>Async driver of the reverse state machine; completes synchronously when the inner iterator does.</summary>
     private ValueTask RunReverseAsync(CancellationToken ct)
     {
-        try
+        while (true)
         {
-            while (true)
+            InnerOp op = ReverseStep();
+            if (op == InnerOp.Done)
             {
-                InnerOp op = ReverseStep();
-                if (op == InnerOp.Done)
-                {
-                    ReverseFinished();
-                    return ValueTask.CompletedTask;
-                }
-                if (op == InnerOp.Continue) continue;
-                ValueTask t = IssueAsync(op, ct);
-                if (!t.IsCompletedSuccessfully) return RunReverseSlowAsync(t, ct);
-                t.GetAwaiter().GetResult();
+                ReverseFinished();
+                return ValueTask.CompletedTask;
             }
-        }
-        catch
-        {
-            _valid = false; // see RunReverse
-            throw;
+            if (op == InnerOp.Continue) continue;
+            ValueTask t = IssueAsync(op, ct);
+            if (!t.IsCompletedSuccessfully) return RunReverseSlowAsync(t, ct);
+            t.GetAwaiter().GetResult();
         }
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private async ValueTask RunReverseSlowAsync(ValueTask pending, CancellationToken ct)
     {
-        try
+        await pending.ConfigureAwait(false);
+        while (true)
         {
-            await pending.ConfigureAwait(false);
-            while (true)
+            InnerOp op = ReverseStep();
+            if (op == InnerOp.Done)
             {
-                InnerOp op = ReverseStep();
-                if (op == InnerOp.Done)
-                {
-                    ReverseFinished();
-                    return;
-                }
-                if (op != InnerOp.Continue) await IssueAsync(op, ct).ConfigureAwait(false);
+                ReverseFinished();
+                return;
             }
-        }
-        catch
-        {
-            _valid = false; // see RunReverse
-            throw;
+            if (op != InnerOp.Continue) await IssueAsync(op, ct).ConfigureAwait(false);
         }
     }
 
@@ -1845,7 +1834,12 @@ public sealed class DbIter : IDisposable
                 if (!_valid) _hasPrefix = false;
                 break;
             case RevFinish.SetPrefixIfValid:
-                if (_valid) MaybeSetPrefix(StripTs(_savedKey.UserKey));
+                if (_valid)
+                {
+                    _valid = false; // the prefix extractor is user code: invalid if it throws
+                    MaybeSetPrefix(StripTs(_savedKey.UserKey));
+                    _valid = true;
+                }
                 break;
         }
     }
@@ -1904,7 +1898,7 @@ public sealed class DbIter : IDisposable
                 return _iter.Valid ? InnerOp.Continue : InnerOp.SeekToLast;
 
             case RevPhase.SeekRestored:
-                _valid = true;
+                _fukValid = true; // the merge result (held by UsingSeekMergeStep)
                 BeginFindUserKeyBeforeSavedKey(fromPrevInternal: true);
                 return InnerOp.Continue;
 
@@ -1946,7 +1940,7 @@ public sealed class DbIter : IDisposable
         // FindValueForCurrentKey() assigns _valid; whether or not we found a value for the current key, iter_ then has to
         // end up on a smaller key (FindUserKeyBeforeSavedKey).
         BeginFindValueForCurrentKey();
-        return InnerOp.Continue;
+        return FindValueStep(); // the first iteration of its loop, without a round through the driver
     }
 
     /// <summary>
@@ -1975,17 +1969,21 @@ public sealed class DbIter : IDisposable
     private InnerOp FindValueStep()
     {
         _skipPending = false;
+        // The exits of the loop go on with FindUserKeyBeforeSavedKey in the same step (what the driver would do after
+        // a Continue), which saves a round through the driver per key.
         if (!_iter.Valid)
         {
             FindValueForCurrentKeyEnd();
-            return InnerOp.Continue;
+            return FindUserKeyBeforeSavedKeyDone(); // FindUserKeyBeforeSavedKey: if (!iter_.Valid()) return true
         }
         ReadOnlySpan<byte> userKey = ParseCurrent(out ulong seq, out EntryType type);
         if (!SameUserKey(userKey, _savedKey.UserKey))
         {
-            // Found a smaller user key, thus we are done with current user key.
+            // Found a smaller user key, thus we are done with current user key. Without timestamps that is also the
+            // first test of FindUserKeyBeforeSavedKey's loop (the inner iterator moves backwards, so a different user
+            // key is a smaller one), which then returns at once.
             FindValueForCurrentKeyEnd();
-            return InnerOp.Continue;
+            return _tsSize == 0 ? FindUserKeyBeforeSavedKeyDone() : FindUserKeyBeforeSavedKeyStep();
         }
         bool visible = IsVisible(seq, userKey);
         if (!visible && (_tsLb is null || _ucmp.CompareTimestamp(DbFormat.ExtractTimestampFromUserKey(userKey, _tsSize), _tsUb) > 0))
@@ -1993,7 +1991,7 @@ public sealed class DbIter : IDisposable
             // Found an invisible version of the current user key, and it must have a higher sequence number or
             // timestamp. Therefore, we are done with the current user key.
             FindValueForCurrentKeyEnd();
-            return InnerOp.Continue;
+            return FindUserKeyBeforeSavedKeyStep();
         }
         if (_tsSize != 0 && IsCoveredByRangeTombstone(userKey, seq))
         {
@@ -2066,10 +2064,28 @@ public sealed class DbIter : IDisposable
         return _skipPending ? InnerOp.SkipCovered : InnerOp.Prev;
     }
 
+    /// <summary>
+    /// Moves the validity just found for saved_key_ into _fukValid: the iterator stays invalid while
+    /// FindUserKeyBeforeSavedKey moves the inner iterator, and becomes valid in FindUserKeyBeforeSavedKeyDone.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void HoldValid()
+    {
+        _fukValid = _valid;
+        _valid = false;
+    }
+
     /// <summary>The end of FindValueForCurrentKey (after its loop); continues with FindUserKeyBeforeSavedKey.</summary>
     private void FindValueForCurrentKeyEnd()
     {
         BeginFindUserKeyBeforeSavedKey(fromPrevInternal: true);
+        ResolveValueForCurrentKey();
+        HoldValid();
+    }
+
+    /// <summary>The tail of FindValueForCurrentKey: assigns _valid and the value from what its loop saw.</summary>
+    private void ResolveValueForCurrentKey()
+    {
         if (!_fvValidEntrySeen)
         {
             _valid = false;
@@ -2120,6 +2136,7 @@ public sealed class DbIter : IDisposable
     private InnerOp UsingSeekDone()
     {
         BeginFindUserKeyBeforeSavedKey(fromPrevInternal: true);
+        HoldValid();
         return InnerOp.Continue;
     }
 
@@ -2217,6 +2234,7 @@ public sealed class DbIter : IDisposable
         }
 
         MergeWithNoBaseValue();
+        _valid = false; // held while the inner iterator is restored and moved on (RevPhase.SeekRestored)
 
         // Make sure we leave iter_ in a good state. If it's valid and we don't care about prefixes, that's already
         // good enough. Otherwise it needs to be seeked to the current key (last_key, still in _seekKey).
@@ -2272,7 +2290,11 @@ public sealed class DbIter : IDisposable
     {
         _revPhase = RevPhase.PrevTop;
         if (!_fukFromPrevInternal) return InnerOp.Continue;
-        if (_valid) return InnerOp.Done; // Found the value.
+        if (_fukValid)
+        {
+            _valid = true;
+            return InnerOp.Done; // Found the value.
+        }
         TooManyInternalKeysSkipped(false);
         return InnerOp.Continue;
     }

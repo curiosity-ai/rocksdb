@@ -233,7 +233,7 @@ Tests: `tests/RocksDb.Managed.Tests/Db/WalTrackingTests.cs`, `SstFileManagerTest
 | `SstFileManager.cs`, `Db/DbImpl.SstFileManager.cs`, `Db/ErrorHandler.cs`, `Env/FileContracts.cs` (`GetFreeSpace`) | `file/sst_file_manager_impl.cc`, `file/delete_scheduler.cc`, `ErrorHandler::OverrideNoSpaceError` / `RecoverFromNoSpace` / `CancelErrorRecoveryForShutDown`, `SanitizeOptions`, `DBImpl::Open` (TrackExistingDataFiles, ReserveDiskBuffer, CleanupDirectory), `DeleteDBFile` | **ported.** Public `SstFileManager` (`DbOptions.SstFileManager`, shareable; every DB gets a private one by default like SanitizeOptions): tracks table and blob files (live files at open, files added by installed edits), max allowed space (after a flush / compaction the DB stops with SpaceLimit "Max allowed space was reached"; Flush() reports it like WaitForFlushMemTables), compaction buffer and reservation accounting, deletion rate limit through `*.trash` renames and a background deletion task (max_trash_db_ratio), trash cleanup at open, and out-of-space recovery: NoSpace / SpaceLimit background errors start ClearError, which polls the free space (`IFileSystem.GetFreeSpace`, statvfs for the local file system) every 5 s and resumes the DB once it exceeds the reserved disk buffer (hard errors) or the compaction trigger (soft errors); listeners can veto it; close cancels it. Automatically picked (non trivial-move) compactions reserve their input size and are cancelled (COMPACTION_CANCELLED) when the space limit with the compaction buffer, or after an out-of-space error the free space, does not allow them (EnoughRoomForCompaction / OnCompactionCompletion). Known deviations: manual compactions are not checked; the space limit is checked after a compaction installs (upstream fails the output file); files are always deleted whole (no bytes_max_delete_chunk truncation, no hard-link count check); ingested files are tracked when their edit installs; no DeleteScheduler statistics or trash buckets. |
 | `Env/GenericRateLimiter.cs`, `DbOptions.RateLimiter`, `Db/DbImpl.Flush.cs` (`TableFileWriteOptions`), `Db/Compaction/CompactionJob.cs` | `util/rate_limiter.cc` (GenericRateLimiter, NewGenericRateLimiter), `WritableFileWriter` rate limiting | **ported.** Token bucket refilled every refill period (default 100 ms; no carry-over), single burst bytes, priorities with IO_USER first and the fairness lottery (GeneratePriorityIterationOrderLocked), partial grants, auto-tuning (TuneLocked), SetBytesPerSecond / SetSingleBurstBytes, GetTotalBytesThrough / GetTotalRequests / GetTotalPendingRequests, modes. Waiters do not hold a thread: a one-shot timer performs the refill duty while requests are queued, and RequestAsync waits asynchronously. Flush (and recovery flush) table and blob files are charged at IO_HIGH, compaction outputs at IO_LOW, WAL / MANIFEST not at all (IO_TOTAL). Reads are charged and the RATE_LIMITER_* statistics recorded since the 2026-11-03 pass (see "Small gaps closed (2026-11-03)"). |
 | `Db/TableCache.cs` (`TableCacheStore`, per-CF `TableCache` view) | `db/table_cache.cc`, `DBImpl::table_cache_` (db/db_impl/db_impl.cc) | **ported.** One reader cache per DB shared by all column families (handles keyed by file number, each opened with its column family's reader options), bounded by max_open_files - 10 (max_open_files is clipped to at least 20 at open, like SanitizeOptions; unbounded with -1), resized by SetDBOptions(max_open_files); least recently used unreferenced readers are evicted by last-use stamps copied before sorting (lookups stamp them without the lock; `DbColumnFamilyAndConcurrencyTests.BoundedTableCacheEvictsUnderConcurrentLookups`). Blob file readers keep their own per-CF bound. |
-| `Cache/HyperClockCache.cs` (automatic table) | `cache/clock_cache.{h,cc}` AutoHyperClockTable | **partial (behavioral port).** estimated_entry_charge = 0 selects a table that starts at 64 slots per shard and doubles while it is more than 70 % occupied and the usage is below capacity, up to capacity / min_avg_entry_charge (default 450) slots; growth moves the slot objects to a new array under a mutator gate (inserts, evictions and erases wait; lookups stay lock-free and may miss during a move), and with full metadata charging the grown slots are charged. Not ported: upstream's lock-free linear-hashing chains (head pointers with shift, incremental splitting). Benchmarks: see docs/perf.md. |
+| `Cache/HyperClockCache.cs` (automatic table) | `cache/clock_cache.{h,cc}` AutoHyperClockTable | **partial (behavioral port).** estimated_entry_charge = 0 selects a table that starts at 64 slots per shard and doubles while it is more than 70 % occupied and the usage is below capacity, up to capacity / min_avg_entry_charge (default 450) slots; growth moves the slot objects to a new array under a mutator gate (inserts, evictions and erases wait; lookups stay lock-free and may miss during a move (no longer: since audit #4 a miss is only trusted when no grow is running)), and with full metadata charging the grown slots are charged. Not ported: upstream's lock-free linear-hashing chains (head pointers with shift, incremental splitting). Benchmarks: see docs/perf.md. |
 
 ## Transactions (utilities/transactions)
 
@@ -1208,7 +1208,8 @@ A fourth pass over the whole library, split into 17 slices plus follow-up passes
 slice did not reach. Every finding below was proven by a test that failed before the fix; native comparisons use the
 11.12 package. Tests: `tests/RocksDb.Managed.Tests/Validation/Audit4*Tests.cs` (unit) and
 `tests/RocksDb.Managed.CompatTests/Audit4/Audit4*CompatTests.cs` (differential against native), one file per slice.
-`RocksDb.Managed.Replication` (a port of rocksdb-sharp, not of the C++ tree) was not part of the audit.
+`RocksDb.Managed.Replication` (a port of rocksdb-sharp, not of the C++ tree) was reviewed on its own terms; see
+"Coverage of this audit".
 
 ### Fixed
 
@@ -1272,15 +1273,23 @@ suspicions one by one (tests: `Audit4Closing*Tests.cs`, `Audit4Final*Tests.cs`).
 
 | RepairDB, obsolete files (last pass) | `db/repair.cc` (ScanTable, AddTables, RepairDB overloads), `DeleteObsoleteFileImpl` | Repair used the default column family's comparator for a table's key range (other comparators: swapped boundaries, missed keys); a table without a column family name is archived; a column family named by a table exists even when that table is archived; descriptors without "default" are InvalidArgument; epoch 1 is reserved with allow_ingest_behind; oldest_blob_file_number is recorded. Orphan table / blob files found by the full scan are deleted through the SstFileManager with event log and listener notification. |
 
-Tickers: the seek-data tickers per level, the superversion tickers and the job-read based COMPACT_READ_BYTES were
-added in the last pass, and a table open reads its properties block once (the per-level read tickers now equal
-native's). Still not recorded: `compaction.total.time.cpu_micros` (no managed per-thread CPU clock) and the
-compression dictionary block cache tickers (the dictionary is always pinned by the reader, never cached). Not equal
-to native by construction: the superversion tickers (the port caches per processor slot for Get / MultiGet, upstream
-per thread), the block cache byte tickers (native charges malloc_usable_size), FLUSH_WRITE_BYTES (file bytes;
-native's also include the flush thread's MANIFEST write) and COMPACT_READ_BYTES (job reads; about 20% below native
-in the differential, cause not located). `Audit4ClosingToolsCompatTests` compares every other ticker of a
-deterministic workload with native.
+Tickers: the seek-data tickers per level, the superversion tickers, COMPACT_READ_BYTES (job reads, including the
+open of each output through the table cache), FLUSH_WRITE_BYTES (file bytes plus the MANIFEST bytes of the install)
+and the compaction CPU time (per-thread CPU clock by P/Invoke) were added in the last passes, and a table open reads
+its properties block once. `Audit4ClosingToolsCompatTests` compares every ticker of a deterministic workload with
+native; COMPACT_READ_BYTES, COMPACT_WRITE_BYTES, FLUSH_WRITE_BYTES and the per-level read tickers are equal. Not
+equal by construction: the superversion tickers (the port caches per processor slot for Get / MultiGet, upstream per
+thread) and the block cache byte tickers (native charges malloc_usable_size). Not recorded: the compression
+dictionary block cache tickers (the dictionary is pinned by the reader, never cached: see "not ported").
+
+| Last residuals | C++ source | What was wrong (now fixed) |
+|---|---|---|
+| Compaction outputs | `CompactionJob::VerifyOutputFiles` ("Verify that the table is usable") | Every local compaction output is opened through the table cache on the compaction thread; an unusable output fails the compaction. |
+| Flush MANIFEST edits | `MemTableList::TryInstallMemtableFlushResults` | A non-atomic flush writes min_log_number_to_keep as a separate edit of the same MANIFEST write, as native (it was folded into the flush edit). |
+| Remote compaction format | `options_helper.cc` (ParseInt32 / kUInt8T) | Out-of-range integers in a CompactionServiceInput / Result are InvalidArgument (OverflowException, silent truncation of the status code). |
+| HyperClockCache (automatic table) | `AutoHyperClockTable::Lookup` / `Grow` | A lookup of a present entry could miss while the table grew. |
+| MANIFEST edits | `VersionSet::LogAndApplyHelper`, `LogAndApplyCFHelper`, `ProcessManifestWrites`, `DBImpl::IngestExternalFiles` | Every non column-family edit carries prev_log_number; max_column_family is written on a drop (not an add) and on the first edit of a new MANIFEST; a new MANIFEST has no extra tail record; an open without WALs writes one empty edit; ingestion persists its reserved file numbers before linking or copying files. A flush, a compaction, an ingestion and a column family creation now match native record by record. Remaining differences: the last_sequence base (the port's value is never below native's) and the edits of a reopen that replays a WAL (one combined edit; native writes four). |
+| Remote compaction outputs | `CompactionJob::VerifyOutputFiles`, `CompactionServiceCompactionJob::Run` | The primary opens and verifies the outputs a worker returns (with kEnableForRemoteCompaction: iteration hash against the worker's paranoid_hash, block and file checksums); the worker fills paranoid_hash and no longer verifies its own outputs. |
 
 ### Known deviations recorded by this audit
 
@@ -1375,7 +1384,23 @@ Also read in the last pass: `backup_engine.cc` from its start, `repair.cc` in fu
 ColumnFamilySet) and `threadpool_imp.cc`.
 
 Not read against the C++ (previous audits and the compat tests still apply): `AutoHyperClockTable`'s grow / chain
-logic (the port is a behavioural port without chains), `PerKeyPointLockManager` (not ported), the worker-side
-serialization type info of `compaction_service_job.cc`, the restore / verify / garbage-collection bodies of the
-backup engine on the C# side beyond what the earlier slices compared. `RocksDb.Managed.Replication` is a port of
-rocksdb-sharp, which is not in this repository, and was not audited.
+logic (the port is a behavioural port without chains; only the lookup-during-grow path was checked),
+`PerKeyPointLockManager` (not ported), the restore / verify / garbage-collection bodies of the backup engine on the
+C# side beyond what the earlier slices compared.
+
+Not ported, found by the ticker comparison: the compression dictionary is not stored in the block cache, so the
+five `BLOCK_CACHE_COMPRESSION_DICT_*` tickers stay 0.
+
+`RocksDb.Managed.Replication` is a port of rocksdb-sharp, which is not in this repository, so it could not be
+compared with its original. It was reviewed on its own terms instead (Raft persistence and election rules, the
+switchover promise, WAL tailing, snapshot restore, host lifetime). Fixed there, each with a test in
+`tests/RocksDb.Managed.Replication.Tests/Audit4ReplicationTests.cs`:
+
+- The Raft vote / term and the switchover promise are written to disk before they are held in memory.
+- A snapshot restore deletes `CURRENT` first, so an interrupted restore cannot leave an openable half-restored DB.
+- A WAL listing error on the source is surfaced instead of read as "no WAL".
+- A follower that is ahead of its source is rebuilt, not streamed to.
+- Raft progress reports carry their term; a report from an older term is dropped.
+- A source whose WAL is corrupt rebuilds the follower once, not in a loop.
+- `ForcePromote` with a detached database no longer throws `NullReferenceException`; host dispose is bounded; a
+  snapshot whose size does not match its header is refused.

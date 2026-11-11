@@ -499,7 +499,11 @@ public sealed class SwitchoverNode
         await _detachFromPrimaryAsync(cancellationToken).ConfigureAwait(false);
         lock (_gate)
         {
-            _state.BecomePrimary(_db!.GetLatestSequenceNumber() + 1, epoch, _nodeId);
+            // Checked again: the lock was released while the stream detached, and a resync (DetachDatabase) or a
+            // planned promotion may have run meanwhile.
+            if (_state.Role != ReplicationRole.Replica || _db == null)
+                throw new InvalidOperationException(_nodeId + " is " + _state.Role + ", not a replica with a database");
+            _state.BecomePrimary(_db.GetLatestSequenceNumber() + 1, epoch, _nodeId);
         }
         Writes.OpenGate();
         RaiseRoleChanged();

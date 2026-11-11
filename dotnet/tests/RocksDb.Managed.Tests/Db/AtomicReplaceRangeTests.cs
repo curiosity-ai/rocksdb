@@ -394,8 +394,18 @@ public sealed class AtomicReplaceRangeTests
             WriteSst(fs, "/ext/old-1.sst", ("d", "old-d")),
         ], new IngestExternalFileOptions());
         string replacement = WriteSst(fs, "/ext/replacement.sst", ("c", "new-c"));
-        fs.FailMatching("MANIFEST", FaultOps.Append | FaultOps.Sync, 1, InjectedFaultKind.IOError);
-        Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles(db.DefaultColumnFamily, ReplaceArg(replacement, "b", "e")));
+        // The fault is armed at the commit: the ingestion's first MANIFEST write is the dummy edit that persists the
+        // reserved file numbers (DBImpl::ReserveFileNumbersBeforeIngestion), before any file is copied.
+        RocksDb.Managed.Db.TestHooks.Set("DBImpl::IngestExternalFiles:BeforeLogAndApply",
+            () => fs.FailMatching("MANIFEST", FaultOps.Append | FaultOps.Sync, 1, InjectedFaultKind.IOError));
+        try
+        {
+            Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles(db.DefaultColumnFamily, ReplaceArg(replacement, "b", "e")));
+        }
+        finally
+        {
+            RocksDb.Managed.Db.TestHooks.Set("DBImpl::IngestExternalFiles:BeforeLogAndApply", null);
+        }
         fs.ClearFailMatching();
         // The edit's record may have reached the MANIFEST before the I/O error, so the copied file and the generated
         // tombstone file are kept (upstream quarantines the files of such an edit); the obsolete-file scan of a later

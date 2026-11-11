@@ -1712,3 +1712,133 @@ With 300k keys read from the memtable (median of 3): fillrandom 2.487 / 2.376, o
 1.955 / 1.950, seekrandom 4.001 / 4.224, readseq 0.309 / 0.299. Run-to-run spread on this machine is about +/-7%, so
 only the iterator rows (seekrandom, readseq on tables) suggest a small cost, of a few percent; it was not profiled.
 No statistics object was set in these runs.
+
+### Iterator rows re-measured, and the inline-budget fix
+
+The two iterator rows above were re-measured with more repetitions, and then with a measurement that is less
+sensitive to the VM's noise.
+
+`dbbench` (same flags as above, one DB in /dev/shm built once and reopened with `--use_existing_db`; processes of the
+two builds alternated; 26 processes per build, each one `seekrandom` and 5-8 `readseq`), micros/op:
+
+| benchmark | before audit #4 (`5b3265f`) median / min | after audit #4 (`027de20`) median / min |
+|---|---:|---:|
+| seekrandom (n = 26) | 5.139 / 4.835 | 5.171 / 4.838 (+0.6% / +0.1%) |
+| readseq (n = 184) | 0.208 / 0.181 | 0.210 / 0.182 (+1.0% / +0.6%) |
+
+So the +4% / +6.5% of the table above was noise: with the 8 MiB block cache these benchmarks are dominated by block
+reads (about 200 ns per key against 60 ns per key when the blocks are cached), and the audit's cost there is below 1%.
+
+In-process loop (a 500k-key, 100-byte-value DB on a `MemoryFileSystem`, flushed and compacted, 512 MiB block cache so
+that every block is cached; full forward scan, full reverse scan, 100k x (Seek + 10 Next); 30 timed repetitions per
+process after warm-up, the minimum of each process taken; processes of the builds alternated; 20 processes per build,
+14 for the seek row), ns/op, median of the per-process minima / smallest minimum:
+
+| loop | before audit #4 | after audit #4 | after the fix below |
+|---|---:|---:|---:|
+| forward scan (per key) | 60.89 / 58.77 | 63.14 / 59.64 (+3.7%) | 61.45 / 59.49 (+0.9%) |
+| reverse scan (per key) | 118.50 / 115.90 | 125.31 / 119.19 (+5.7%) | 122.13 / 118.58 (+3.1%) |
+| Seek + 10 x Next (per seek) | 3,115 / 2,998 | 3,215 / 3,001 (+3.2%) | 3,163 / 2,878 (+1.5%) |
+
+With an 8 MiB cache (6 processes per build) the same loops give forward 68.42 / 71.12 / 69.07, reverse 114.97 /
+123.47 / 119.89, seek 2,623 / 2,628 / 2,612. Batches of 6-8 processes differ from each other by up to 3%, and in one
+batch of 6 the audit tree's forward scan was level with the tree before it, so the forward difference is at the edge of
+what this resolves; the reverse difference had the same sign in every batch. With `DOTNET_TieredCompilation=0` (no
+tiering, no PGO) the builds are equal (forward 71.30 / 72.15, reverse 162.13 / 162.84): the added instructions
+themselves cost at most 1%, the rest came from the JIT's inlining decisions.
+
+Cause, from the Tier-1 listings (`DOTNET_JitDisasm`, one process per build): `BlockIter.ParseEntry` is
+`AggressiveInlining` and ends up, through `ParseNextKey`, in the Tier-1 bodies of `LevelIterator.Next`, `DbIter.Next`,
+`MergingIterator.Prev`, `TableInternalIterator.Prev` and `DbIter.RunReverse`. The audit added to it the
+`_footerPatched` test with a call of `RestoreRawFooter` and the `_minKeyLen` test; `DbIter.Next` / `Prev` grew by the
+skip counter, and `RunReverse` got a try/catch around its loop. In the audit tree, small callees that were inlined
+before became calls: `BlockIter.get_Valid` (three call sites), `CachedBlock.get_HasValue`, `Block.Release`,
+`BlockIter.Clear` and `FileReadSample.ShouldSampleFileReadNext` in `LevelIterator.Next`;
+`BlockBasedTableIterator.FindKeyBackward` in `TableInternalIterator.Prev`; `MergingIterator.ChildValid` / `PopTop` in
+`MergingIterator.Prev`. That is what an exhausted inline budget of those root methods looks like; the budget itself was
+not read out.
+
+Fix (no behaviour change):
+
+- `BlockIter`: blocks whose keys expose the global seqno (`_applyGlobalSeqno`, ingested files only) are decoded by
+  `ParseNextKeySlow` -> `ParseEntryGlobalSeqno`, which restores the stored footer, calls `ParseEntry` and rewrites the
+  footer. The inlined `ParseEntry` no longer has the footer restore nor the `_globalSeqno` test it had before the audit;
+  the `_minKeyLen` check stays. Entries of such files now pay the generic header decoder instead of the
+  three-single-byte fast path (not measured).
+- `DbIter`: `_numInternalKeysSkipped` is a running total that is also the NUMBER_ITER_SKIP count, with `_skipMark`
+  the total at the start of the move, so a move starts with one load and two stores instead of updating a second
+  accumulator; the try/catch of the reverse driver is in a thin `RunReverse` frame around the loop (`RunReverseLoop`,
+  `RunReverseLoopAsync`), which has no exception-handling region.
+
+After the fix the Tier-1 call lists of the methods above are those of the tree before the audit, less the
+`ApplyGlobalSeqno` call site (in `RunReverse`, `MaybeSetPrefix` stays a call and the loop is one call deeper). What is
+left in the reverse scan (+3%) was not attributed: moving the catch into `Prev` / `SeekForPrev` / `SeekToLast` (no
+extra frame) measured 124.49 against 124.69 for the audit tree in a batch of 6, and was dropped. `dbbench` with the fix
+(8 processes per build, alternated, medians, before / after / fixed): seekrandom 5.139 / 5.158 / 5.168, readseq 0.210 /
+0.208 / 0.206.
+
+### Reverse scan and global-seqno blocks after audit #4
+
+Same in-process loop as above (500k keys, 100-byte values, `MemoryFileSystem`, flushed and compacted, 512 MiB block
+cache; 30 timed repetitions per process after warm-up, the minimum of each process; processes of the builds strictly
+alternated; ns/op, median of the per-process minima / smallest minimum). "Before audit #4" is `5b3265f`, "audit tree"
+is `2e49da5` (with the inline-budget fix above), "now" is this change. Two batches of 16 processes per build (n = 32):
+
+| loop | before audit #4 | audit tree | now |
+|---|---:|---:|---:|
+| forward scan (per key) | 58.61 / 54.34 | 59.80 / 54.92 (+2.0%) | 59.16 / 54.57 (+0.9%) |
+| reverse scan (per key) | 114.94 / 106.11 | 118.09 / 108.18 (+2.7%) | 108.74 / 102.33 (-5.4%) |
+| Seek + 10 x Next (per seek) | 2,959 / 2,691 | 2,966 / 2,649 (+0.2%) | 2,961 / 2,532 (+0.1%) |
+
+Processes that run the reverse scan only (n = 20 per build): 119.72 / 113.85 before the audit, 124.63 / 118.67 (+4.1%)
+audit tree, 112.68 / 107.05 (-5.9%) now. The two 16-process batches differ from each other by up to 3% per row (forward
+scan of the audit tree: +3.8% and +0.7%), so differences under about 2% are not resolved by this measurement.
+
+Where the reverse difference came from (variants built from the audit tree, reverse-only processes, n = 16-20 each):
+
+- The try/catch frame of `DbIter.RunReverse` (an extra non-inlined call per `Prev`): removing it gives 120.69 against
+  122.48 (n = 18) and 122.25 against 124.63 (n = 20), about 1.5-2%.
+- The 8-byte `RawFooter` field of `BlockIter.PrevEntry` (entries of 40 instead of 28 bytes, one more load and store per
+  cached entry): not measurable (121.01 against 120.69).
+- The rest, about 2% (122.25 against 119.72 before the audit), is not one thing. The Tier-1 listings of the reverse
+  path (`DbIter.RunReverse`, `FindValueStep`, `FindUserKeyBeforeSavedKeyStep`, `PrevInternalStep`,
+  `MergingIterator.Prev`, `TableInternalIterator.Prev`, `BlockBasedTableIterator.Prev`, `BlockIter.Prev` / `PrevImpl`)
+  have the same calls and, within 1-2%, the same number of instructions, branches and stack accesses as before the
+  audit. Putting the pre-audit file back into the tree: `BlockIter.cs` 120.92, `DbIter.cs` 121.19, both 119.61,
+  against 122.57 for the tree and 119.25 before the audit (n = 16): half in each file, each half below what the
+  measurement resolves. What the audit added per key there: the `_minKeyLen` test of `BlockIter.ParseEntry`, the
+  skip counter kept as a running total (`ResetInternalKeysSkippedCounter`: a load, a decrement and two stores instead
+  of one store), the `_tsLb` test and sequence decode in `FindUserKeyBeforeSavedKeyStep`, the `_seekStat` test in
+  `BlockBasedTableIterator.Value`.
+
+Changes (no behaviour change; the audit's tests pass):
+
+- `DbIter`: no try/catch in the reverse drivers. `_valid` is false whenever the reverse state machine can throw:
+  `Prev` / `PrevAsync` clear it before starting (as `Next` does), and the validity found for the current key is held
+  in `_fukValid` while `FindUserKeyBeforeSavedKey` moves the inner iterator (`HoldValid`), then assigned in
+  `FindUserKeyBeforeSavedKeyDone`. `RunReverse` is the loop again, as before the audit.
+- `DbIter`: the reverse state machine continues with the next phase in the same step where the driver would only loop
+  (`PrevInternalStep` -> `FindValueStep`; the exits of `FindValueStep` -> `FindUserKeyBeforeSavedKeyStep`, or directly
+  `FindUserKeyBeforeSavedKeyDone` when the inner iterator is exhausted or, without timestamps, stands on a smaller user
+  key, which is the first test of that loop). A `Prev` over distinct keys takes 2 rounds through the driver instead of
+  5 and parses the inner key twice instead of three times. This is what puts the reverse scan below the pre-audit
+  tree (112.68 against 122.25 with only the try/catch removed).
+- `BlockIter`: the stored footer of a cached previous entry is kept behind the key in `_prevKeyBuf`, for blocks that
+  expose the global seqno only; `PrevEntry` is as before the audit.
+- `BlockIter`: blocks that expose the global seqno decode entries with three single-byte header varints in
+  `ParseNextKeySlow` with the inlined `ParseEntry` and footer rewrite (`ExposeGlobalSeqno`); the stored footer is put
+  back only when the shared bytes of the entry reach into it.
+
+Global-seqno blocks: 500k keys written with `SstFileWriter` and ingested over one flushed key, so that the file gets a
+non-zero global sequence number (two L0 files, no compaction); forward scan, reverse scan, 100k random `TryGet`; 16
+processes per build. The tree before the audit returned wrong keys from such blocks when a key shared footer bytes
+with its predecessor, so it is a speed reference only.
+
+| loop | before audit #4 | audit tree | now |
+|---|---:|---:|---:|
+| forward scan (per key) | 58.74 / 55.87 | 61.20 / 59.22 (+4.2%) | 57.14 / 54.82 (-2.7%) |
+| reverse scan (per key) | 120.42 / 113.11 | 125.20 / 119.78 (+4.0%) | 112.86 / 109.06 (-6.3%) |
+| TryGet (per lookup) | 2,396 / 2,202 | 1,975 / 1,943 (-17.6%) | 1,929 / 1,885 (-19.5%) |
+
+An earlier batch of 14 processes had the audit tree at +2.9% (forward), +0.7% (reverse) and -17.5% (TryGet). The
+lookups are faster since the audit for reasons outside the block decoder (not investigated).

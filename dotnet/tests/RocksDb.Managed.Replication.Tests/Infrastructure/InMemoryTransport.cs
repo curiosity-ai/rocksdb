@@ -83,6 +83,12 @@ public sealed class InMemoryNetwork
         }
     }
 
+    /// <summary>Heals only the directed link <paramref name="from"/> -> <paramref name="to"/>.</summary>
+    public void HealLink(string from, string to)
+    {
+        lock (_linkLock) _cut.TryRemove((from, to), out _);
+    }
+
     /// <summary>Heals every cut link.</summary>
     public void Heal()
     {
@@ -183,9 +189,9 @@ public sealed class InMemoryClusterClient(InMemoryNetwork network, string from, 
     public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, CancellationToken cancellationToken) =>
         InMemoryNetwork.Pump(ct => network.Require<ClusterNodeHost>(from, to).StreamUpdatesAsync(followerId, startSeq, ct), static m => m.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken);
 
-    public Task ReportProgressAsync(string followerId, ulong appliedThrough, CancellationToken cancellationToken)
+    public Task ReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken)
     {
-        Target?.HandleReportProgress(followerId, appliedThrough);
+        Target?.HandleReportProgress(followerId, appliedThrough, leaderTerm);
         return Task.CompletedTask;
     }
 

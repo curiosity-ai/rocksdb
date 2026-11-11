@@ -90,13 +90,15 @@ public sealed class AdaptiveCommitDelayController
         ArgumentNullException.ThrowIfNull(timeProvider);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(replicaCount, 0);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(options.HistorySize, 0, nameof(options.HistorySize));
-        if (options.EmaAlpha <= 0 || options.EmaAlpha > 1) throw new ArgumentOutOfRangeException(nameof(options.EmaAlpha));
+        // Written so that NaN fails every check (a comparison with NaN is false), and infinities are refused: either
+        // would turn the score into NaN, which no clamp brings back into [MinDelayMs, MaxDelayMs].
+        if (!(options.EmaAlpha > 0 && options.EmaAlpha <= 1)) throw new ArgumentOutOfRangeException(nameof(options.EmaAlpha));
         ArgumentOutOfRangeException.ThrowIfNegative(options.MinDelayMs, nameof(options.MinDelayMs));
         ArgumentOutOfRangeException.ThrowIfLessThan(options.MaxDelayMs, options.MinDelayMs, nameof(options.MaxDelayMs));
-        ArgumentOutOfRangeException.ThrowIfNegative(options.DelayPerLagUnitMs, nameof(options.DelayPerLagUnitMs));
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(options.LagUnit, nameof(options.LagUnit));
-        ArgumentOutOfRangeException.ThrowIfNegative(options.TrendWeight, nameof(options.TrendWeight));
-        ArgumentOutOfRangeException.ThrowIfNegative(options.BurstWeight, nameof(options.BurstWeight));
+        if (!(options.DelayPerLagUnitMs >= 0) || !double.IsFinite(options.DelayPerLagUnitMs)) throw new ArgumentOutOfRangeException(nameof(options.DelayPerLagUnitMs));
+        if (!(options.LagUnit > 0) || !double.IsFinite(options.LagUnit)) throw new ArgumentOutOfRangeException(nameof(options.LagUnit));
+        if (!(options.TrendWeight >= 0) || !double.IsFinite(options.TrendWeight)) throw new ArgumentOutOfRangeException(nameof(options.TrendWeight));
+        if (!(options.BurstWeight >= 0) || !double.IsFinite(options.BurstWeight)) throw new ArgumentOutOfRangeException(nameof(options.BurstWeight));
 
         _latestReplicaLag = new long[replicaCount];
         _history = new long[options.HistorySize];

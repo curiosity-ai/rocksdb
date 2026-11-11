@@ -73,7 +73,9 @@ if (!await consumer.TryIngestChunkAsync(chunkBytes, ct)) Resync();   // must sta
 * When the WAL a replica needs was purged, the tailer throws `RocksDbException(NotFound)` (the hosts turn this into a
   "resync required" stream message) and the replica rebuilds from a new snapshot. `ReplicationDelta` keeps the
   immutable SST/blob files both sides hold byte-identically (name + size + SHA-256 of length and last 1 MiB), so a
-  rebuild only transfers what changed.
+  rebuild only transfers what changed. A source that cannot read its own WAL (Corruption) also asks for a resync,
+  marked `WalStreamMessage.SourceFault` and counted in the host's `WalStreamFaults`; a follower that has applied
+  nothing since its last rebuild then retries the stream instead of rebuilding again (`FollowerResyncPolicy`).
 * A snapshot stream is: plan (files the consumer keeps), file chunks with CURRENT last, end marker.
   `SnapshotReceiver` refuses a stream without plan or end marker, so a cut-off transfer is never opened as a database.
 * WAL retention: with `DbOptions.WalTtlSeconds`/`WalSizeLimitMb` obsolete WALs are archived;

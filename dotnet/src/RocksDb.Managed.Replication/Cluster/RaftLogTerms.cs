@@ -43,6 +43,25 @@ public sealed class RaftLogTerms
         }
     }
 
+    /// <summary>Whether <see cref="Record"/> with these arguments would change the map.</summary>
+    public bool WouldRecord(ulong startSeq, long term)
+    {
+        lock (_gate)
+        {
+            if (_ranges.Count == 0) return true;
+            (ulong lastStart, long lastTerm) = _ranges[^1];
+            return term > lastTerm && startSeq >= lastStart;
+        }
+    }
+
+    /// <summary>An independent copy.</summary>
+    public RaftLogTerms Clone()
+    {
+        var copy = new RaftLogTerms();
+        lock (_gate) copy._ranges.AddRange(_ranges);
+        return copy;
+    }
+
     /// <summary>Removes every range that starts after <paramref name="seq"/>; returns true if the map changed.</summary>
     public bool TruncateAfter(ulong seq)
     {

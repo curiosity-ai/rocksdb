@@ -559,9 +559,9 @@ internal static partial class Scenarios
         public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, CancellationToken cancellationToken) =>
             Require.StreamUpdatesAsync(followerId, startSeq, cancellationToken);
 
-        public Task ReportProgressAsync(string followerId, ulong appliedThrough, CancellationToken cancellationToken)
+        public Task ReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken)
         {
-            Target?.HandleReportProgress(followerId, appliedThrough);
+            Target?.HandleReportProgress(followerId, appliedThrough, leaderTerm);
             return Task.CompletedTask;
         }
 
@@ -778,7 +778,7 @@ internal static partial class Scenarios
                 {
                     db.Put(keys[c.Next()], value);
                     ulong latest = db.GetLatestSequenceNumber();
-                    node.RecordFollowerProgress("n2", latest);
+                    node.RecordFollowerProgress("n2", latest, node.CurrentTerm);
                     if (node.CommitSeq != latest) throw new InvalidOperationException("commit did not advance");
                 }
             }));
@@ -798,7 +798,7 @@ internal static partial class Scenarios
                     db.Put(keys[c.Next()], value);
                     ulong latest = db.GetLatestSequenceNumber();
                     ValueTask<bool> committed = node.WaitForCommitAsync(latest, cts.Token);
-                    node.RecordFollowerProgress("n2", latest);
+                    node.RecordFollowerProgress("n2", latest, node.CurrentTerm);
                     if (!await committed) throw new InvalidOperationException("not committed");
                 }
             }));

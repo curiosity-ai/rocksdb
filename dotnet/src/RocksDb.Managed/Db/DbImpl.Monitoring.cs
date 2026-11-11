@@ -479,7 +479,7 @@ internal sealed partial class DbImpl
     /// After a flush installed its result: InternalStats (BYTES_FLUSHED, L0 compaction stats), FLUSH_WRITE_BYTES /
     /// FLUSH_TIME statistics and the "table_file_creation" / "flush_finished" events.
     /// </summary>
-    internal void OnFlushCompleted(ColumnFamilyData cfd, int jobId, FileMetaData? meta, ulong blobBytes, long startTimestamp)
+    internal void OnFlushCompleted(ColumnFamilyData cfd, int jobId, FileMetaData? meta, ulong blobBytes, ulong manifestBytes, long startTimestamp)
     {
         TimeSpan elapsed = Stopwatch.GetElapsedTime(startTimestamp);
         // Table file plus the blob files the flush wrote (bytes_written + bytes_written_blob).
@@ -487,7 +487,10 @@ internal sealed partial class DbImpl
         cfd.Stats.AddFlush(bytes, (long)elapsed.TotalMicroseconds);
         if (Stats is { } st)
         {
-            st.RecordTick(Ticker.FlushWriteBytes, bytes);
+            // FlushJob::RecordFlushIOStats ticks IOSTATS(bytes_written) of the flush thread twice: after WriteLevel0Table
+            // (the table and blob files) and after TryInstallMemtableFlushResults (the MANIFEST record of the install,
+            // which the thread wrote in LogAndApply).
+            st.RecordTick(Ticker.FlushWriteBytes, bytes + manifestBytes);
             st.RecordInHistogram(Histogram.FlushTime, (ulong)elapsed.TotalMicroseconds);
         }
         if (!InfoLogEnabled) return;
@@ -648,7 +651,10 @@ internal sealed partial class DbImpl
     internal void OnCompactionCompleted(ColumnFamilyData cfd, Compaction c, CompactionJob? job, int jobId, long startTimestamp)
     {
         long micros = (long)Stopwatch.GetElapsedTime(startTimestamp).TotalMicroseconds;
-        var ls = new CompactionLevelStats { Micros = micros, CpuMicros = micros, Count = 1 };
+        // compaction_stats.cpu_micros: the CPU time of the job's threads; the elapsed time where the platform has no
+        // per-thread CPU clock, and for a job that ran elsewhere (trivial move: nothing ran).
+        long cpuMicros = job is not null && Env.ThreadCpuClock.IsSupported ? (long)job.Stats.CpuMicros : micros;
+        var ls = new CompactionLevelStats { Micros = micros, CpuMicros = cpuMicros, Count = 1 };
         for (int i = 0; i < c.NumInputLevels; i++)
         {
             ulong bytes = 0;
@@ -694,7 +700,7 @@ internal sealed partial class DbImpl
             st.RecordTick(Ticker.CompactionRangeDelDropObsolete, (ulong)it.NumRangeDelDropObsolete);
             st.RecordTick(Ticker.CompactionOptimizedDelDropObsolete, (ulong)it.NumOptimizedDelDropObsolete);
             st.RecordInHistogram(Histogram.CompactionTime, (ulong)micros);
-            st.RecordInHistogram(Histogram.CompactionCpuTime, (ulong)micros);
+            st.RecordInHistogram(Histogram.CompactionCpuTime, (ulong)cpuMicros);
             st.RecordInHistogram(Histogram.NumFilesInSingleCompaction, (ulong)(ls.NumInputFilesInNonOutputLevels + ls.NumInputFilesInOutputLevel));
         }
         if (!InfoLogEnabled) return;

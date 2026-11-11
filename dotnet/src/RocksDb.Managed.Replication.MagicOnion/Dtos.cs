@@ -20,6 +20,8 @@ public sealed class WalChunkDto
     [Key(5)] public long EntryTerm { get; set; }
     [Key(6)] public bool ResyncRequired { get; set; }
     [Key(7)] public string? Reason { get; set; }
+    /// <summary>Appended last: a sender built without it is read as false (an ordinary resync request).</summary>
+    [Key(8)] public bool SourceFault { get; set; }
 
     public static WalChunkDto From(in WalStreamMessage m) => new()
     {
@@ -31,10 +33,13 @@ public sealed class WalChunkDto
         EntryTerm = m.EntryTerm,
         ResyncRequired = m.ResyncRequired,
         Reason = m.Reason,
+        SourceFault = m.SourceFault,
     };
 
     public WalStreamMessage ToMessage() => ResyncRequired
-        ? WalStreamMessage.Resync(SourceId, SourceTerm, Reason ?? "resync required")
+        ? SourceFault
+            ? WalStreamMessage.ResyncAfterSourceFault(SourceId, SourceTerm, Reason ?? "resync required")
+            : WalStreamMessage.Resync(SourceId, SourceTerm, Reason ?? "resync required")
         : new WalStreamMessage(FirstSequence, EntryCount, Data, SourceId, SourceTerm, EntryTerm);
 }
 

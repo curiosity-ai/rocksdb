@@ -38,7 +38,12 @@ public interface IClusterNodeClient
     Task<ClusterNodeStatus?> GetStatusAsync(CancellationToken cancellationToken);
     Task<ClusterAttachResult?> CheckLogConsistencyAsync(string followerId, ulong latestSeq, long termAtLatest, CancellationToken cancellationToken);
     IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, CancellationToken cancellationToken);
-    Task ReportProgressAsync(string followerId, ulong appliedThrough, CancellationToken cancellationToken);
+    /// <summary>
+    /// Tells the leader that <paramref name="followerId"/> holds its log through <paramref name="appliedThrough"/>.
+    /// <paramref name="leaderTerm"/> is the term of the leadership whose stream produced that position (the term of the
+    /// attach check and of every chunk); the leader ignores a report for any other term.
+    /// </summary>
+    Task ReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken);
     Task<IReadOnlyDictionary<string, string>> GetFileHashesAsync(IReadOnlyList<ReplicationFileInfo> candidates, CancellationToken cancellationToken);
     IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(IReadOnlyList<ReplicationFileInfo> verifiedInventory, CancellationToken cancellationToken);
     Task<string?> GetTermsAsync(CancellationToken cancellationToken);
@@ -80,6 +85,11 @@ public sealed class ClusterNodeHostOptions
     public int SnapshotChunkBytes { get; init; } = 1024 * 1024;
     /// <summary>Back-off between attempts to reach a leader / retry a failed stream or snapshot.</summary>
     public TimeSpan RetryDelay { get; init; } = TimeSpan.FromMilliseconds(200);
+    /// <summary>
+    /// How long <see cref="ClusterNodeHost.DisposeAsync"/> waits for RPC handlers that still use the database (a stream
+    /// whose consumer stopped reading holds it until its transport gives up) before it closes the database anyway.
+    /// </summary>
+    public TimeSpan DisposeDrainTimeout { get; init; } = TimeSpan.FromSeconds(10);
     public Action<string>? Log { get; init; }
 }
 
@@ -111,6 +121,9 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     private volatile bool _resyncing;
     private Task _resyncTask = Task.CompletedTask;
     private int _resyncs;
+    private int _walStreamFaults;
+    private string? _lastWalStreamFault;
+    private readonly FollowerResyncPolicy _resyncPolicy = new();
 
     public ClusterNodeHost(ClusterNodeHostOptions options, Func<ClusterMember, IClusterNodeClient> clientFactory)
     {
@@ -127,6 +140,12 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     public bool IsResyncing => _resyncing;
     public int Resyncs => Volatile.Read(ref _resyncs);
     public string DbPath => _cfg.DbPath;
+    /// <summary>Cancelled when the host starts shutting down; transports use it to abandon a blocked stream write.</summary>
+    public CancellationToken Stopping => _cts.Token;
+    /// <summary>How often a WAL stream served by this node ended on an error of its own WAL (Corruption, NotSupported).</summary>
+    public int WalStreamFaults => Volatile.Read(ref _walStreamFaults);
+    /// <summary>The message of the latest such error, or null.</summary>
+    public string? LastWalStreamFault => Volatile.Read(ref _lastWalStreamFault);
 
     private bool IsBootstrapPrimary => _cfg.BootstrapPrimaryId == _cfg.NodeId;
     private string RaftDir => FileSystemHelpers.Combine(_cfg.DbPath, RaftDirName);
@@ -169,6 +188,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         _node.RoleChanged += OnRoleChanged;
         _node.ModeChanged += (_, e) => Log("mode -> " + e.Mode);
         _node.ResyncRequired += (_, _) => TriggerResync("heartbeat term mismatch");
+        _node.LeadershipFailed += (_, e) => Log("won the election of term " + e.Term + " but cannot write the log: " + e.Error.Message);
         _node.Start();
         Log("started as " + _node.Role + " in term " + _node.CurrentTerm + " (" + _node.Mode + ") at seq " + _db.GetLatestSequenceNumber());
 
@@ -397,7 +417,9 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         return new ClusterAttachResult(r.IsLeader, r.Consistent, r.Term, r.IsLeader ? _node.SerializeTerms() : string.Empty);
     }
 
-    public void HandleReportProgress(string followerId, ulong appliedThrough) => _node.RecordFollowerProgress(followerId, appliedThrough);
+    /// <summary>A follower's progress report; false when it was not for this node's current leadership (see <see cref="RaftClusterNode.RecordFollowerProgress"/>).</summary>
+    public bool HandleReportProgress(string followerId, ulong appliedThrough, long leaderTerm) =>
+        _node.RecordFollowerProgress(followerId, appliedThrough, leaderTerm);
 
     public string HandleGetTerms() => _node.SerializeTerms();
 
@@ -455,7 +477,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, leadership, _cts.Token);
             Log("streaming to " + followerId + " from seq " + startSeq);
             RaftClusterNode node = _node;
-            await foreach (WalStreamMessage m in WalStreamSender.StreamAsync(_db, startSeq, Tag, node.GetTermForSeq, _cfg.MaxChunkBytes, cts.Token)
+            await foreach (WalStreamMessage m in WalStreamSender.StreamAsync(_db, startSeq, Tag, node.GetTermForSeq, _cfg.MaxChunkBytes, OnWalStreamFault, cts.Token)
                                .ConfigureAwait(false))
             {
                 yield return m;
@@ -465,6 +487,13 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         {
             _dbGate.Exit();
         }
+    }
+
+    private void OnWalStreamFault(RocksDbException e)
+    {
+        Interlocked.Increment(ref _walStreamFaults);
+        Volatile.Write(ref _lastWalStreamFault, e.Message);
+        Log("WAL stream fault (" + e.Code + "): " + e.Message);
     }
 
     // Read the term before the role: if the role still says Leader afterwards, the term belongs to this leadership. A node
@@ -550,6 +579,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         ClusterMember? leader = Member(leaderId);
         if (leader == null) return;
         IClusterNodeClient client = _clients(leader);
+        bool stalled = false;
         while (!ct.IsCancellationRequested)
         {
             try
@@ -580,20 +610,34 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                 // granted a vote, possibly while a chunk was being applied, to a candidate whose log ends before that
                 // chunk), the old leader must not count them towards a quorum - the new term's leader may lack them.
                 // Checked after the entries were applied: a vote granted later saw them in our log.
+                // The report names the leadership (term) it belongs to; the leader ignores it in any other term.
                 long followTerm = check.Term;
                 await using var progress = new ProgressReporter((seq, c) =>
-                    _node.CurrentTerm <= followTerm ? client.ReportProgressAsync(_cfg.NodeId, seq, c) : Task.CompletedTask);
+                    _node.CurrentTerm <= followTerm ? client.ReportProgressAsync(_cfg.NodeId, seq, followTerm, c) : Task.CompletedTask);
                 progress.Report(myLatest);
                 await foreach (WalStreamMessage m in client.StreamUpdatesAsync(_cfg.NodeId, myLatest + 1, ct).ConfigureAwait(false))
                 {
                     if (m.ResyncRequired)
                     {
+                        if (!_resyncPolicy.ShouldRebuild(m, _db.GetLatestSequenceNumber()))
+                        {
+                            // The snapshot this node was just rebuilt from did not get it past the fault of the leader's
+                            // WAL; another one would not either.
+                            if (!stalled) Log("leader still cannot stream from " + (_db.GetLatestSequenceNumber() + 1) + " after a resync; retrying the stream: " + m.Reason);
+                            stalled = true;
+                            break;
+                        }
                         TriggerResync("leader cannot stream from " + (_db.GetLatestSequenceNumber() + 1) + ": " + m.Reason);
                         return;
                     }
+                    stalled = false;
                     _node.HandleObservedLeader(m.SourceId, m.SourceTerm);
                     // A deposed leader's chunk (we already are in a later term): Raft rejects stale AppendEntries.
                     if (m.SourceTerm < _node.CurrentTerm) break;
+                    // The attach check compared our log with the leader's log of followTerm. A chunk of another term
+                    // comes from a different leadership of that node (it lost and regained the role in between, possibly
+                    // rebuilding its log): check again before applying anything of it.
+                    if (m.SourceTerm != followTerm) break;
                     if (m.EntryTerm > 0) _state.RecordTermRange(m.FirstSequence, m.EntryTerm);
                     // A faithful replica ingests the leader's batches at exactly the same sequence numbers; a gap or an
                     // overlap diverges the copy.
@@ -735,6 +779,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                     await PullSnapshotAsync(leader, _cts.Token).ConfigureAwait(false);
                     _db = await OpenDatabaseAsync(_cts.Token).ConfigureAwait(false);
                     _node.CompleteResync(_db);
+                    _resyncPolicy.OnRebuilt(_db.GetLatestSequenceNumber());
                     _dbGate.Reopen();
                     Interlocked.Increment(ref _resyncs);
                     lock (_followerLock) _resyncing = false;
@@ -760,6 +805,11 @@ public sealed class ClusterNodeHost : IAsyncDisposable
 
     private async Task<ClusterMember?> FindLeaderAsync(CancellationToken ct)
     {
+        // Every reachable member is asked and the answer of the highest term wins: a deposed leader that has not heard of
+        // its successor still reports itself as leader, and a snapshot of its log may lack entries this node already
+        // acknowledged to the real one. A member in a newer term that knows no leader yet means "wait".
+        ClusterMember? best = null;
+        long bestTerm = long.MinValue;
         foreach (ClusterMember m in _cfg.Members)
         {
             if (m.NodeId == _cfg.NodeId) continue;
@@ -767,18 +817,24 @@ public sealed class ClusterNodeHost : IAsyncDisposable
             {
                 ClusterNodeStatus? s = await _clients(m).GetStatusAsync(ct).ConfigureAwait(false);
                 if (s == null) continue;
-                if (s.Role == RaftRole.Leader && !s.Resyncing) return m;
-                if (!string.IsNullOrEmpty(s.LeaderId) && s.LeaderId != _cfg.NodeId)
+                ClusterMember? named = null;
+                if (s.Role == RaftRole.Leader && !s.Resyncing) named = m;
+                else if (!string.IsNullOrEmpty(s.LeaderId) && s.LeaderId != _cfg.NodeId) named = Member(s.LeaderId);
+                if (s.Term > bestTerm)
                 {
-                    ClusterMember? l = Member(s.LeaderId);
-                    if (l != null) return l;
+                    bestTerm = s.Term;
+                    best = named;
+                }
+                else if (s.Term == bestTerm && best == null)
+                {
+                    best = named;
                 }
             }
             catch (Exception) when (!ct.IsCancellationRequested)
             {
             }
         }
-        return null;
+        return best;
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -804,12 +860,20 @@ public sealed class ClusterNodeHost : IAsyncDisposable
             }
         }
         // Wait for RPC handlers (streams end with the cancelled tokens) before closing the database.
-        try
+        // Bounded: a stream whose consumer stopped reading keeps its handler (and the gate) until the transport gives up.
+        using (var drain = new CancellationTokenSource(_cfg.DisposeDrainTimeout))
         {
-            await _dbGate.DrainAsync(CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (Exception)
-        {
+            try
+            {
+                await _dbGate.DrainAsync(drain.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                Log("closing the database although an RPC handler still uses it (not finished within " + _cfg.DisposeDrainTimeout + ")");
+            }
+            catch (Exception)
+            {
+            }
         }
         // Closing is idempotent, so a database already closed by an unfinished resync is fine.
         if (_db != null) await _db.DisposeAsync().ConfigureAwait(false);
