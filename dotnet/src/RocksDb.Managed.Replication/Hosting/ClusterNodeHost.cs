@@ -258,6 +258,8 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     {
         if (_resyncing || _node.Role != RaftRole.Leader || !_dbGate.TryEnter()) return false;
         ulong seq;
+        // Read before the write: the commit wait accepts the entry only as one of this term.
+        long term = _node.CurrentTerm;
         try
         {
             using WriteBatch b = _db.CreateWriteBatch();
@@ -269,7 +271,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         {
             _dbGate.Exit();
         }
-        return await WaitForCommitAsync(seq, timeout, cancellationToken).ConfigureAwait(false) == ClusterWriteStatus.Committed;
+        return await WaitForCommitAsync(seq, term, timeout, cancellationToken).ConfigureAwait(false) == ClusterWriteStatus.Committed;
     }
 
     /// <summary>
@@ -285,6 +287,8 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(batch);
         if (_resyncing || _node.Role != RaftRole.Leader || !_dbGate.TryEnter()) return ClusterWriteStatus.NotLeader;
         ulong seq;
+        // Read before the write: the commit wait accepts the entry only as one of this term.
+        long term = _node.CurrentTerm;
         try
         {
             await _db.WriteAsync(LogWriteOptions, batch, cancellationToken).ConfigureAwait(false);
@@ -294,19 +298,18 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         {
             _dbGate.Exit();
         }
-        return await WaitForCommitAsync(seq, timeout, cancellationToken).ConfigureAwait(false);
+        return await WaitForCommitAsync(seq, term, timeout, cancellationToken).ConfigureAwait(false);
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    private async ValueTask<ClusterWriteStatus> WaitForCommitAsync(ulong seq, TimeSpan timeout, CancellationToken cancellationToken)
+    private async ValueTask<ClusterWriteStatus> WaitForCommitAsync(ulong seq, long term, TimeSpan timeout, CancellationToken cancellationToken)
     {
-        if (_node.CommitSeq >= seq) return ClusterWriteStatus.Committed;
         bool linked = cancellationToken.CanBeCanceled;
         CancellationTokenSource cts = linked ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken) : RentTimeoutSource();
         try
         {
             cts.CancelAfter(timeout);
-            return await _node.WaitForCommitAsync(seq, cts.Token).ConfigureAwait(false) ? ClusterWriteStatus.Committed : ClusterWriteStatus.LeadershipLost;
+            return await _node.WaitForCommitAsync(seq, term, cts.Token).ConfigureAwait(false) ? ClusterWriteStatus.Committed : ClusterWriteStatus.LeadershipLost;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {

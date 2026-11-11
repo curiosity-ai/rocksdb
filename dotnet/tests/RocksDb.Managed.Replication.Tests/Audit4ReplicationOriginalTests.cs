@@ -457,6 +457,42 @@ public sealed class Audit4ReplicationOriginalTests
     }
 
     /// <summary>
+    /// Approach review (a write is acknowledged only if it is committed): the commit wait of the port compared the
+    /// commit index with the write's sequence number only. A leader that wrote an entry, lost the leadership and had
+    /// its log rebuilt from the new leader holds another entry at that sequence number; once that one is committed a
+    /// delayed caller was told its lost write was committed. The wait now takes the term the entry was written in.
+    /// </summary>
+    [TestMethod]
+    public async Task CommitWaitDoesNotAcknowledgeAnEntryThatWasReplacedAfterAStepDown()
+    {
+        await using RocksDatabase db = await RocksDatabase.OpenAsync("/db", DbOpts(new MemoryFileSystem()));
+        var config = new RaftConfig("n1", "mem://n1", [new ClusterMember("n2", "mem://n2")]) { BootstrapPrimary = true };
+        var state = new RaftPersistentState(new MemoryFileSystem(), "/raft");
+        await using var node = new RaftClusterNode(config, state, db, new NoTransport());
+        Assert.AreEqual(RaftRole.Leader, node.Role);
+        long writeTerm = node.CurrentTerm;
+        db.Put(U("mine"), U("v"));
+        ulong seq = db.GetLatestSequenceNumber();
+        Assert.AreEqual(writeTerm, node.GetTermForSeq(seq));
+
+        // n2 leads the next term. This node's log is rebuilt from it (simulated: the term map of the new leader says
+        // the entry at seq is one of the new term), and the new leader commits that entry.
+        long newTerm = writeTerm + 1;
+        node.HandleAppendEntries(newTerm, "n2", 0, 0, 0, ClusterMode.Bootstrap);
+        Assert.AreEqual(RaftRole.Follower, node.Role);
+        var terms = new RaftLogTerms();
+        terms.Record(1, newTerm);
+        state.ReplaceTerms(terms);
+        Assert.IsTrue(node.HandleAppendEntries(newTerm, "n2", seq, newTerm, seq, ClusterMode.Bootstrap).Success);
+        Assert.IsTrue(node.CommitSeq >= seq);
+
+        Assert.IsFalse(await node.WaitForCommitAsync(seq, writeTerm, CancellationToken.None), "a replaced entry was acknowledged as committed");
+        Assert.IsFalse(await node.WaitForCommitAsync(seq, CancellationToken.None), "a node that does not lead cannot tell whose entry is committed");
+        // The entry that is there is the new leader's: a wait for that one succeeds, also on a follower.
+        Assert.IsTrue(await node.WaitForCommitAsync(seq, newTerm, CancellationToken.None));
+    }
+
+    /// <summary>
     /// Approach review (Raft election safety: at most one vote per term, on stable storage), in rocksdb-sharp
     /// (RaftPersistentState.cs Load: "corrupt file; start fresh") and the port: a node that could not read its state
     /// file at startup started with term 0 and no vote - and voted again in a term it had already voted in.

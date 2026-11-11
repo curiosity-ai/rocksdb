@@ -398,23 +398,42 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     /// <paramref name="sequence"/> (the write is replicated to a quorum), or with false as soon as this node is no longer
     /// leader of the term it led when called (the write may never commit). Signalled, no polling; allocation-free in
     /// steady state (pooled state machine and wait, cancellation included).
+    /// <para>
+    /// This overload takes the term at the time of the call. A caller that may have been delayed between its write and
+    /// this call must use <see cref="WaitForCommitAsync(ulong, long, CancellationToken)"/> with the term it read
+    /// before the write: after a step-down and a rebuild of this node's log, another entry can stand at
+    /// <paramref name="sequence"/>.
+    /// </para>
     /// </summary>
-    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder<>))]
-    public async ValueTask<bool> WaitForCommitAsync(ulong sequence, CancellationToken cancellationToken)
+    public ValueTask<bool> WaitForCommitAsync(ulong sequence, CancellationToken cancellationToken)
     {
         long term;
         lock (_gate)
         {
-            if (_role != RaftRole.Leader) return CommitSeq >= sequence;
+            if (_role != RaftRole.Leader) return new ValueTask<bool>(false);
             term = _state.CurrentTerm;
         }
+        return WaitForCommitAsync(sequence, term, cancellationToken);
+    }
+
+    /// <summary>
+    /// As <see cref="WaitForCommitAsync(ulong, CancellationToken)"/>, for an entry this node wrote as leader of
+    /// <paramref name="term"/> (read <see cref="CurrentTerm"/> before the write). True only when the entry at
+    /// <paramref name="sequence"/> is committed and still carries <paramref name="term"/> in this node's log: by the
+    /// log matching property that is the caller's entry. False once this node no longer leads <paramref name="term"/>
+    /// and the entry is not known to be committed.
+    /// </summary>
+    [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<bool> WaitForCommitAsync(ulong sequence, long term, CancellationToken cancellationToken)
+    {
         while (true)
         {
             RocksDb.Managed.Util.AsyncBroadcastSignal.Waiter changed;
             lock (_gate)
             {
-                if (CommitSeq >= sequence) return true;
-                if (_role != RaftRole.Leader || _state.CurrentTerm != term || _disposed != 0) return false;
+                bool leading = _role == RaftRole.Leader && _state.CurrentTerm == term && _disposed == 0;
+                if (CommitSeq >= sequence) return leading || _state.Terms.GetTermForSeq(sequence) == term;
+                if (!leading) return false;
                 // Registered under _gate, where every signal is raised: no wake-up can be missed.
                 changed = _commitChanged.Register();
             }

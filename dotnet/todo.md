@@ -405,4 +405,5 @@ Still open from this round:
 - [ ] `BLOCK_CACHE_*_ADD_REDUNDANT` tickers (all block kinds, the dictionary included) are not recorded
 - [ ] `pin_l0_filter_and_index_blocks_in_cache` / `unpartitioned_pinning` for the index and full filter (only the dictionary follows them)
 - [x] `AutoHyperClockTable` read against C++ (behavioural port without chains): eviction circles kMaxCountdown + 1 times, the table grows at its occupancy limit also over capacity, ApplyToAllEntries is stable across a grow, small shards start at 4 / grow to 64 slots (`Audit4AutoHyperClockTests`)
-- [ ] Replication compared with the rocksdb-sharp original (that repository was not available to the audit)
+- [x] Replication compared with the rocksdb-sharp original and tested under faults; 8 fixes, 4 of them bugs in both implementations (`Audit4ReplicationOriginalTests`)
+- [ ] Replication: pair writes are not fsync'd (acknowledged writes can be lost on a primary power loss); MagicOnion services and `StreamSnapshotAsync` not read

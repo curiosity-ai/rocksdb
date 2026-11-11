@@ -1427,9 +1427,13 @@ tiers; and the unpartitioned pinning rules are applied to the dictionary only, t
 with `cache_index_and_filter_blocks` are still never pinned (`pin_l0_filter_and_index_blocks_in_cache` and
 `unpartitioned_pinning` have no effect on them).
 
-`RocksDb.Managed.Replication` is a port of rocksdb-sharp, which is not in this repository, so it could not be
-compared with its original. It was reviewed on its own terms instead (Raft persistence and election rules, the
-switchover promise, WAL tailing, snapshot restore, host lifetime). Fixed there, each with a test in
+`RocksDb.Managed.Replication` is a port of rocksdb-sharp, which is not in this repository. It was reviewed twice:
+first on its own terms, then side by side with the original (`csharp/src/Replication`, `Switchover`, `Cluster` and
+the hosts under `Tests/`). The original was treated as a second implementation, not as a reference: each difference
+was judged against the safety rules of the protocol, and the shared design was tested under faults.
+
+First review (Raft persistence and election rules, the switchover promise, WAL tailing, snapshot restore, host
+lifetime). Fixed there, each with a test in
 `tests/RocksDb.Managed.Replication.Tests/Audit4ReplicationTests.cs`:
 
 - The Raft vote / term and the switchover promise are written to disk before they are held in memory.
@@ -1440,3 +1444,35 @@ switchover promise, WAL tailing, snapshot restore, host lifetime). Fixed there, 
 - A source whose WAL is corrupt rebuilds the follower once, not in a loop.
 - `ForcePromote` with a detached database no longer throws `NullReferenceException`; host dispose is bounded; a
   snapshot whose size does not match its header is refused.
+
+Comparison with the original, each fix with a test in `Audit4ReplicationOriginalTests.cs`:
+
+| Where | Both implementations? | What was wrong |
+|---|---|---|
+| `SwitchoverNode.HandleRejectEpochAsync` | both | A promote racing a reject of the same epoch could be promoted while the reject answered "promised": two primaries. |
+| `PairNodeHost` start | both | A restarted primary kept its epoch. Pair writes are not fsync'd, so after a power loss it reused sequence numbers the replica already held and the attach check passed. It now starts a new epoch. |
+| `RaftClusterNode` bootstrap restart | both | Same for a bootstrap primary and its term. |
+| `RaftPersistentState.Load` | both | An unreadable `raft.state` started the node at term 0 without its vote; it could vote twice in a term. The read error is now thrown. |
+| `RaftClusterNode` election | port only | A leader elected before it received a term range adopted at attach did not record its own term for those entries. |
+| `ProgressReporter` | port only | A lost progress report was not sent again; a write held by a quorum stayed uncommitted until the next write. |
+| `PairNodeHost` | port only | No resolve loop: an unresolved handoff left the pair without a writable primary until `ResolveAsync` was called. |
+| `ReplicationSource` WAL retention | port only | Kept each replica's highest reported position; a replica restarting lower lost WAL it still needed. |
+
+Design limits that remain (same in the original):
+
+- Pair client writes are not fsync'd. A power loss of the primary can lose acknowledged writes even when the replica
+  holds them, because the replica is then rebuilt from the primary. The new epoch only stops this from being silent.
+  Raft with `SyncWal = false` has the same property.
+- A two-node pair cannot tell a dead peer from an unreachable one; `ForcePromote` can create two primaries.
+- Snapshot delta reuse trusts name, size and a hash of the length plus the last 1 MiB of a file.
+
+Validated by reading only, not by test: the Raft election restriction, the current-term-only commit rule, two
+candidates in one term; the write gate's hold / drain order; the tailer's chunk merging across batches. Not read:
+the MagicOnion service classes beyond their timeouts, `ReplicationSession.StreamSnapshotAsync`, the samples.
+
+Found while checking a suspicion of that comparison (port only; the original has no commit wait): the commit wait
+compared only the commit index with the write's sequence number. A leader that wrote an entry, lost the leadership
+and had its log rebuilt holds another entry at that number, and a delayed caller was told its lost write was
+committed. `RaftClusterNode.WaitForCommitAsync(sequence, term, ...)` now takes the term the entry was written in, and
+`ClusterNodeHost.WriteCommittedAsync` reads the term before the write
+(`CommitWaitDoesNotAcknowledgeAnEntryThatWasReplacedAfterAStepDown`).
