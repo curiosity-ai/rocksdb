@@ -101,6 +101,13 @@ public sealed class VersionEdit
 {
     private readonly SortedSet<(int Level, ulong FileNumber)> _deletedFiles = new();
 
+    /// <summary>
+    /// Not persisted. Set by VersionSet.LogAndApply on the first edit of its batch: the bytes the call appended to the
+    /// MANIFEST for the whole batch (a new MANIFEST: its snapshot, the batch and CURRENT). The job thread's
+    /// IOSTATS(bytes_written) share of the install upstream (FlushJob::RecordFlushIOStats after the install).
+    /// </summary>
+    internal ulong ManifestBytesWritten { get; set; }
+
     public string? DbId { get; set; }
     /// <summary>User comparator name; native always writes <see cref="PersistUserDefinedTimestamps"/> alongside.</summary>
     public string? ComparatorName { get; set; }

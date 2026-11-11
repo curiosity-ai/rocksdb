@@ -289,17 +289,10 @@ public sealed class Audit4ClosingToolsCompatTests
     /// </summary>
     private static readonly HashSet<string> s_notComparable = new(StringComparer.Ordinal)
     {
-        // CompactionJob::RecordCompactionIOStats, IOSTATS(bytes_read): the port counts the bytes the job's threads read
-        // from table files (JobIoCounter); native reads 1700 bytes more in this workload (not explained: the size of
-        // two data blocks).
-        "rocksdb.compact.read.bytes",
-        // FlushJob::RecordFlushIOStats, IOSTATS(bytes_written) of the flush thread: the table (and blob) file plus the
-        // MANIFEST record the thread writes when it installs the result (115 bytes per flush here); the port counts the
-        // table and blob files.
-        "rocksdb.flush.write.bytes",
         // The cache charge: native adds malloc_usable_size of the block and its metadata.
         "rocksdb.block.cache.bytes.write", "rocksdb.block.cache.bytes.read", "rocksdb.block.cache.data.bytes.insert",
-        // CPU time of the compaction threads, see s_notIncremented.
+        // CompactionJob::UpdateSubcompactionJobStatsIncrementally: CPU time of the compaction threads
+        // (clock->CPUMicros(), clock_gettime(CLOCK_THREAD_CPUTIME_ID)); recorded by both, a measurement.
         "rocksdb.compaction.total.time.cpu_micros",
     };
 
@@ -309,11 +302,6 @@ public sealed class Audit4ClosingToolsCompatTests
     /// </summary>
     private static readonly string[] s_notIncremented =
     [
-        // CompactionJob::UpdateCompactionStats: CPU time of the compaction threads (clock->CPUMicros(), i.e.
-        // clock_gettime(CLOCK_THREAD_CPUTIME_ID)). .NET has no managed per-thread CPU clock (Process.TotalProcessorTime
-        // is process-wide; ProcessThread needs the OS thread id of a managed thread, which is not exposed): it would
-        // take a P/Invoke per platform. Not ported; CompactionJobStats.CpuMicros stays 0.
-        "rocksdb.compaction.total.time.cpu_micros",
     ];
 
     /// <summary>Formerly missing tickers that now have the same value as native for the workload.</summary>
@@ -326,17 +314,17 @@ public sealed class Audit4ClosingToolsCompatTests
         "rocksdb.non.last.level.seek.data", "rocksdb.non.last.level.seek.data.useful.no.filter", // BlockBasedTableIterator::InitDataBlock / value()
         "rocksdb.last.level.read.bytes", "rocksdb.last.level.read.count", "rocksdb.non.last.level.read.bytes", "rocksdb.non.last.level.read.count", // RecordIOStats
         "rocksdb.compact.write.bytes", // CompactionJob::RecordCompactionIOStats, IOSTATS(bytes_written): the outputs
+        "rocksdb.flush.write.bytes", // FlushJob::RecordFlushIOStats, IOSTATS(bytes_written): the table file + the install's MANIFEST record
+        "rocksdb.compact.read.bytes", // CompactionJob::RecordCompactionIOStats, IOSTATS(bytes_read): input blocks + the output's open
     ];
 
     /// <summary>
     /// Formerly missing tickers that are recorded at the upstream call site but whose value cannot equal native's:
-    /// the block cache byte tickers count the cache charge (native: malloc_usable_size of the block plus metadata); for
-    /// the job I/O tickers see <see cref="s_notComparable"/>.
+    /// the block cache byte tickers count the cache charge (native: malloc_usable_size of the block plus metadata).
     /// </summary>
     private static readonly string[] s_implementedNotComparable =
     [
         "rocksdb.block.cache.bytes.read", "rocksdb.block.cache.data.bytes.insert", // BlockBasedTable::UpdateCacheHitMetrics / UpdateCacheInsertionMetrics
-        "rocksdb.compact.read.bytes", "rocksdb.flush.write.bytes", // RecordCompactionIOStats / RecordFlushIOStats
     ];
 
     /// <summary>
@@ -349,6 +337,8 @@ public sealed class Audit4ClosingToolsCompatTests
     private static readonly string[] s_implementedSlotDependent =
     [
         "rocksdb.number.superversion_acquires",
+        // A measurement (thread CPU time of the compaction, Env/ThreadCpuClock.cs): only checked to be recorded.
+        "rocksdb.compaction.total.time.cpu_micros",
     ];
 
     /// <summary>

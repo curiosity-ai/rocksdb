@@ -21,6 +21,11 @@ internal sealed class CompactionJobStats
     public int NumProximalOutputFiles;
     public CompactionIterationStats IterStats;
     public TimeSpan Elapsed;
+    /// <summary>
+    /// CPU time of the compaction threads (CompactionJobStats::cpu_micros: SystemClock::CPUMicros around each
+    /// subcompaction); 0 where the platform has no per-thread CPU clock or the subcompaction changed threads.
+    /// </summary>
+    public ulong CpuMicros;
 }
 
 /// <summary>
@@ -641,6 +646,7 @@ internal sealed class CompactionJob
             CompactionJobStats s = sub.Stats;
             Stats.NumOutputFiles += s.NumOutputFiles;
             Stats.BytesWritten += s.BytesWritten;
+            Stats.CpuMicros += s.CpuMicros;
             Stats.NumInputRecords += s.NumInputRecords;
             Stats.NumOutputRecords += s.NumOutputRecords;
             Stats.NumOutputRangeDeletions += s.NumOutputRangeDeletions;
@@ -737,6 +743,10 @@ internal sealed class CompactionJob
         // BlockCacheLookupContext{kCompaction} of the compaction input reads (scoped to this async method).
         if (_db.BlockCacheTracer.IsEnabled) Tracing.BlockCacheTracer.SetCaller(Tracing.TableReaderCaller.Compaction, 0, default, false);
         long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        // ProcessKeyValueCompaction: start_cpu_micros = db_options_.clock->CPUMicros(). A thread CPU clock: only read back
+        // on the thread that started (always the case for a synchronous run).
+        int cpuThread = Environment.CurrentManagedThreadId;
+        ulong startCpuMicros = Env.ThreadCpuClock.CpuMicros();
         // CompactionJob::SetupAndValidateCompactionFilter (compaction_job.cc): before any input is opened.
         CompactionFilter? filter = _c.CreateCompactionFilter(_cfd.Id);
         if (filter is not null && !filter.IgnoreSnapshots) ThrowHelper.NotSupported(CompactionFilter.IgnoreSnapshotsFalseMessage);
@@ -897,6 +907,17 @@ internal sealed class CompactionJob
             _lastLevelOutputs.Release();
             _proximalOutputs?.Release();
             Stats.Elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(start);
+            if (Environment.CurrentManagedThreadId == cpuThread)
+            {
+                // FinalizeSubcompactionJobStats / UpdateSubcompactionJobStatsIncrementally: cpu_micros of the
+                // subcompaction and COMPACTION_CPU_TOTAL_TIME.
+                ulong cpuNow = Env.ThreadCpuClock.CpuMicros();
+                if (cpuNow > startCpuMicros)
+                {
+                    Stats.CpuMicros = cpuNow - startCpuMicros;
+                    _db.Stats?.RecordTick(Ticker.CompactionCpuTotalTime, Stats.CpuMicros);
+                }
+            }
         }
     }
 
@@ -918,7 +939,23 @@ internal sealed class CompactionJob
         if (o.ParanoidFileChecks) flags |= VerifyOutputFlags.Iteration | VerifyOutputFlags.EnableForLocalCompaction | VerifyOutputFlags.EnableForRemoteCompaction;
         bool remote = OutputDirectory is not null;
         bool shouldVerify = (flags & (remote ? VerifyOutputFlags.EnableForRemoteCompaction : VerifyOutputFlags.EnableForLocalCompaction)) != 0;
-        if (!shouldVerify || group.Outputs.Count == 0) return;
+        if (group.Outputs.Count == 0) return;
+        if (!shouldVerify)
+        {
+            // "Verify that the table is usable": upstream opens every output through the table cache on the compaction
+            // thread whatever the flags (cfd->table_cache()->NewIterator, compaction_job.cc verify_table), so an output
+            // that does not open fails the compaction and the open's reads (footer, metaindex, properties, index) count
+            // in the job's IOSTATS(bytes_read), i.e. COMPACT_READ_BYTES. The compaction worker's outputs live in its
+            // output directory, outside the table cache.
+            if (remote) return;
+            foreach (FileMetaData output in group.Outputs)
+            {
+                // The level the file is about to be installed on (the reader's per-level read statistics).
+                if (output.LevelHint < 0) output.LevelHint = ReferenceEquals(group, _proximalOutputs) ? _c.ProximalLevel : _c.OutputLevel;
+                _cfd.TableCache.GetReader(output).Dispose();
+            }
+            return;
+        }
         bool verifyIteration = (flags & VerifyOutputFlags.Iteration) != 0;
         bool verifyBlockChecksum = (flags & VerifyOutputFlags.BlockChecksum) != 0;
         bool verifyFileChecksum = (flags & VerifyOutputFlags.FileChecksum) != 0 && _db.Options.FileChecksumGenFactory is not null;

@@ -577,6 +577,8 @@ internal sealed class VersionSet : IAsyncDisposable
                     foreach (VersionEdit e in editList) e.NextFileNumber = next;
                     await Await(writer.AddEditsAsync(editList, tsSizes, atomicGroup, cancellationToken), synchronous).ConfigureAwait(false);
                     newManifestWritten = true;
+                    // The new MANIFEST (snapshot and edits) plus CURRENT ("MANIFEST-nnnnnn\n").
+                    editList[0].ManifestBytesWritten = (ulong)newLog.Log.File!.Size + (ulong)FileNames.DescriptorFileName(manifestNumber).Length + 1;
                     await Await(FileNames.SetCurrentFileAsync(_fs, _dbname, manifestNumber, syncDirectory: true, cancellationToken), synchronous)
                         .ConfigureAwait(false);
                     ManifestLogWriter? old = _manifestLog;
@@ -596,7 +598,9 @@ internal sealed class VersionSet : IAsyncDisposable
                 {
                     ulong next = CurrentNextFileNumber;
                     foreach (VersionEdit e in editList) e.NextFileNumber = next;
+                    long sizeBefore = _manifestLog!.Log.File!.Size;
                     await Await(_manifest!.AddEditsAsync(editList, tsSizes, atomicGroup, cancellationToken), synchronous).ConfigureAwait(false);
+                    editList[0].ManifestBytesWritten = (ulong)(_manifestLog!.Log.File!.Size - sizeBefore);
                 }
             }
             catch (Exception writeError)

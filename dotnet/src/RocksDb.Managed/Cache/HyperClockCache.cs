@@ -597,7 +597,25 @@ internal sealed class ClockShard
 
     public ClockSlot? Lookup(in CacheKey key, ulong h1, ulong h2)
     {
-        Table t = Volatile.Read(ref _t);
+        if (!_auto) return LookupIn(Volatile.Read(ref _t), key, h1, h2);
+        // AutoHyperClockTable::Lookup never misses an entry that is present, also while the table grows. Here a grow
+        // rewrites the displacement counts the probe sequence relies on (and moves the slots to a new array), so a miss
+        // that may have raced with a grow (one is running, or the table was replaced) is not trusted: wait for the
+        // grow and look again in the current table. The grower sets _resizing before it touches a displacement and
+        // publishes the new table before it clears _resizing, so a miss with neither sign saw a stable table.
+        while (true)
+        {
+            Table t = Volatile.Read(ref _t);
+            ClockSlot? h = LookupIn(t, key, h1, h2);
+            if (h is not null) return h;
+            if (Volatile.Read(ref _resizing) == 0 && ReferenceEquals(Volatile.Read(ref _t), t)) return null;
+            var spin = new SpinWait();
+            while (Volatile.Read(ref _resizing) != 0) spin.SpinOnce();
+        }
+    }
+
+    private static ClockSlot? LookupIn(Table t, in CacheKey key, ulong h1, ulong h2)
+    {
         int current = Base(t, h1), inc = Increment(t, h2);
         for (int probe = 0; probe <= t.Mask; probe++)
         {

@@ -537,7 +537,7 @@ internal sealed partial class DbImpl
         r.Stats = new RemoteCompactionJobStats
         {
             ElapsedMicros = micros,
-            CpuMicros = micros,
+            CpuMicros = Env.ThreadCpuClock.IsSupported ? s.CpuMicros : micros, // the CPU time of the job threads (the elapsed time without a thread CPU clock)
             HasAccurateNumInputRecords = true,
             NumInputRecords = (ulong)s.NumInputRecords,
             NumOutputRecords = (ulong)s.NumOutputRecords,
@@ -551,7 +551,7 @@ internal sealed partial class DbImpl
         var levelStats = new RemoteCompactionLevelStats
         {
             Micros = micros,
-            CpuMicros = micros,
+            CpuMicros = Env.ThreadCpuClock.IsSupported ? s.CpuMicros : micros, // the CPU time of the job threads (the elapsed time without a thread CPU clock)
             BytesWritten = s.BytesWritten,
             NumOutputFiles = s.NumOutputFiles,
             NumOutputRecords = (ulong)s.NumOutputRecords,
