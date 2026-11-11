@@ -109,6 +109,7 @@ internal sealed partial class DbImpl
                     int k = order[i];
                     if (!skipMemTables && GetFromMemTables(sv, batch.UserKey(k), snapshot, batch.Context(k)))
                     {
+                        st?.RecordTick(Ticker.MemtableHit); // MemTable::MultiGet, per key it finished
                         if (softLimit != ulong.MaxValue && AddValueSize(batch, k, ref valueSize, softLimit))
                         {
                             // MemTable::MultiGet: every key still in the range is Aborted.
@@ -121,6 +122,8 @@ internal sealed partial class DbImpl
                     }
                     order[pending++] = k;
                 }
+                // DBImpl::MultiGetImpl: the keys the memtables left for the table files.
+                if (!skipMemTables && pending > 0) st?.RecordTick(Ticker.MemtableMiss, (ulong)pending);
 
                 if (pending > 0)
                 {

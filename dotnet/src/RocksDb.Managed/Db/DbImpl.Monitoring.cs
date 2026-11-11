@@ -436,12 +436,23 @@ internal sealed partial class DbImpl
                 .Append(", \"fast_compression_estimated_data_size\": ").Append(tp.FastCompressionEstimatedDataSize)
                 .Append(", \"db_id\": ").AppendJsonString(tp.DbId).Append(", \"db_session_id\": ").AppendJsonString(tp.DbSessionId)
                 .Append(", \"orig_file_number\": ").Append(tp.OriginalFileNumber)
-                .Append(", \"seqno_to_time_mapping\": ").Append(tp.SequenceNumberTimeMapping is { Length: > 0 } ? "\"(mapping)\"" : "\"N/A\"");
+                .Append(", \"seqno_to_time_mapping\": ").AppendJsonString(SeqnoToTimeMappingText(tp.SequenceNumberTimeMapping));
         }
         sb.Append('}');
         if (meta.OldestBlobFileNumber != 0) sb.Append(", \"oldest_blob_file_number\": ").Append(meta.OldestBlobFileNumber);
         sb.Append(", \"status\": \"OK\"");
         EndEvent(sb);
+    }
+
+    /// <summary>
+    /// The "seqno_to_time_mapping" value of the table_file_creation event: "N/A" without a mapping, else its
+    /// SeqnoToTimeMapping::ToHumanString, or "Invalid" when it does not decode.
+    /// </summary>
+    internal static string SeqnoToTimeMappingText(byte[]? encoded)
+    {
+        if (encoded is not { Length: > 0 }) return "N/A";
+        var mapping = new SeqnoToTimeMapping();
+        return mapping.DecodeFrom(encoded) is null ? mapping.ToHumanString() : "Invalid";
     }
 
     /// <summary>
@@ -521,7 +532,7 @@ internal sealed partial class DbImpl
             }
             sb.Append(']');
         }
-        sb.Append(", \"score\": ").Append(c.Score.ToString("0.######", CultureInfo.InvariantCulture)).Append(", \"input_data_size\": ").Append(inputBytes)
+        sb.Append(", \"score\": ").Append(EventLogJson.FormatDouble(c.Score)).Append(", \"input_data_size\": ").Append(inputBytes)
             .Append(", \"oldest_snapshot_seqno\": ");
         lock (_mutex)
         {
@@ -804,6 +815,13 @@ internal sealed partial class DbImpl
 /// <summary>JSON string values of the EVENT_LOG records (JSONWriter::AddValue of a string).</summary>
 internal static class EventLogJson
 {
+    /// <summary>
+    /// JSONWriter's operator&lt;&lt; for a double (logging/event_logger.h: the std::ostream default, i.e. printf "%g":
+    /// six significant digits, trailing zeros dropped, "e-07" style exponents).
+    /// </summary>
+    public static string FormatDouble(double value) =>
+        value.ToString("G6", System.Globalization.CultureInfo.InvariantCulture).Replace('E', 'e');
+
     /// <summary>Appends <paramref name="s"/> as a JSON string: quotes and backslashes escaped (as DbImpl.Json does).</summary>
     public static StringBuilder AppendJsonString(this StringBuilder sb, string s)
     {

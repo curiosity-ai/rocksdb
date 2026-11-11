@@ -494,6 +494,7 @@ internal sealed class TableCache : ITableCache, IDisposable
     {
         string path = TableFilePath(file);
         IRandomAccessFile f = _fs.OpenRandomAccess(path);
+        Statistics?.RecordTick(Ticker.NoFileOpens); // TableCache::GetTableReader, after NewRandomAccessFile succeeded
         if (Statistics is { } st) f = new Monitoring.StatisticsRandomAccessFile(f, st, LevelStats?.GetFileReadHist(file.LevelHint));
         TableReader reader;
         try

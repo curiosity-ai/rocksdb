@@ -18,7 +18,7 @@ internal static class SstDumpTool
         var paths = new List<(string Path, PathKind Kind)>();
         string command = "";
         bool outputHex = false, inputKeyHex = false, verifyChecksum = false, showProperties = false, showSummary = false, listMetaBlocks = false;
-        bool hasFrom = false, hasTo = false, useFromAsPrefix = false;
+        bool hasFrom = false, hasTo = false, useFromAsPrefix = false, decodeBlobIndex = false;
         string fromKey = "", toKey = "";
         ulong readNum = ulong.MaxValue;
         for (int i = 0; i < args.Count; i++)
@@ -36,7 +36,8 @@ internal static class SstDumpTool
             else if (a == "--show_summary") showSummary = true;
             else if (a == "--list_meta_blocks") listMetaBlocks = true;
             else if (a.StartsWith("--read_num=", StringComparison.Ordinal) && ulong.TryParse(a.AsSpan(11), NumberStyles.None, CultureInfo.InvariantCulture, out ulong n)) readNum = n;
-            else if (a is "--decode_blob_index" or "--show_sequence_number_type" or "--json") { /* accepted, no effect */ }
+            else if (a == "--decode_blob_index") decodeBlobIndex = true;
+            else if (a is "--show_sequence_number_type" or "--json") { /* accepted, no effect */ }
             else if (a.StartsWith("--compression_types=", StringComparison.Ordinal) || a.StartsWith("--block_size=", StringComparison.Ordinal)
                 || a.StartsWith("--compression_level", StringComparison.Ordinal) || a.StartsWith("--readahead_size=", StringComparison.Ordinal))
             {
@@ -121,7 +122,7 @@ internal static class SstDumpTool
         {
             if (filename.Length <= 4 || !filename.EndsWith(".sst", StringComparison.Ordinal)) continue;
             if (command == "verify") verifyChecksum = true;
-            using var dumper = new SstFileDumper(fs, filename, verifyChecksum, outputHex, silent: false, stdout);
+            using var dumper = new SstFileDumper(fs, filename, verifyChecksum, outputHex, silent: false, stdout) { DecodeBlobIndex = decodeBlobIndex };
             if (dumper.InitError is { } initError)
             {
                 stderr.Write(filename + ": " + initError.Message + "\n");

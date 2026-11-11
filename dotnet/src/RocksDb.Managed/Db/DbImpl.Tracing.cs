@@ -37,7 +37,8 @@ internal sealed partial class DbImpl
         {
             QueryTracer? old = _queryTracer;
             Volatile.Write(ref _queryTracer, new QueryTracer(options, writer));
-            old?.Close();
+            // The running tracer is dropped (~Tracer), not ended (Tracer::Close), so its file gets no footer.
+            old?.Abandon();
         }
     }
 

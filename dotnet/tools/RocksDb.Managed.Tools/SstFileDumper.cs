@@ -101,7 +101,16 @@ internal sealed class SstFileDumper : IDisposable
                 if (printKv)
                 {
                     string v;
-                    if (p.Type == EntryType.WideColumnEntity)
+                    if (DecodeBlobIndex && p.Type == EntryType.BlobIndex)
+                    {
+                        if (Db.Blob.BlobIndex.TryDecode(it.Value, out Db.Blob.BlobIndex blobIndex) is not null)
+                        {
+                            Console.Error.Write(ToolText.InternalKeyDebugString(key, _outputHex) + " => error decoding blob index\n");
+                            continue;
+                        }
+                        v = BlobIndexDebugString(blobIndex, _outputHex);
+                    }
+                    else if (p.Type == EntryType.WideColumnEntity)
                     {
                         v = WideColumnsToString(it.Value, _outputHex);
                     }
@@ -129,6 +138,40 @@ internal sealed class SstFileDumper : IDisposable
                 + " entries when excluding range deletions, but scanning the table returned " + i.ToString(CultureInfo.InvariantCulture) + " entries";
         }
         return null;
+    }
+
+    /// <summary>--decode_blob_index: blob references are printed as BlobIndex::DebugString instead of their raw bytes.</summary>
+    public bool DecodeBlobIndex { get; init; }
+
+    /// <summary>BlobIndex::DebugString(output_hex) (db/blob/blob_index.h).</summary>
+    private static string BlobIndexDebugString(in Db.Blob.BlobIndex index, bool hex)
+    {
+        var sb = new System.Text.StringBuilder();
+        if (index.IsInlined)
+        {
+            sb.Append("[inlined blob] value:").Append(ToolText.ToString(index.InlinedValue, hex));
+        }
+        else
+        {
+            sb.Append("[blob ref] file:").Append(index.IsSameFile ? "same" : index.FileNumber.ToString(CultureInfo.InvariantCulture))
+                .Append(" offset:").Append(index.Offset.ToString(CultureInfo.InvariantCulture))
+                .Append(" size:").Append(index.Size.ToString(CultureInfo.InvariantCulture))
+                .Append(" compression: ").Append(index.Compression switch
+                {
+                    // CompressionTypeToString (util/compression.cc).
+                    Compression.CompressionType.None => "NoCompression",
+                    Compression.CompressionType.Snappy => "Snappy",
+                    Compression.CompressionType.Zlib => "Zlib",
+                    Compression.CompressionType.BZip2 => "BZip2",
+                    Compression.CompressionType.LZ4 => "LZ4",
+                    Compression.CompressionType.LZ4HC => "LZ4HC",
+                    Compression.CompressionType.Xpress => "Xpress",
+                    Compression.CompressionType.Zstd => "ZSTD",
+                    _ => "",
+                });
+        }
+        if (index.HasTtl) sb.Append(" exp:").Append(index.Expiration.ToString(CultureInfo.InvariantCulture));
+        return sb.ToString();
     }
 
     /// <summary>WideColumnsHelper::DumpSliceAsWideColumns: "name:value name:value" (the default column name is empty).</summary>

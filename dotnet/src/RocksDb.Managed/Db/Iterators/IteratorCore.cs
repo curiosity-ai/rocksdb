@@ -560,7 +560,12 @@ internal sealed class IteratorCore
     /// </summary>
     public void Release()
     {
-        _stats?.RecordTick(Ticker.NoIteratorDeleted);
+        if (_stats is { } st)
+        {
+            ulong skipped = It.TakeSkipCount();
+            if (skipped != 0) st.RecordTick(Ticker.NumberIterSkip, skipped);
+            st.RecordTick(Ticker.NoIteratorDeleted);
+        }
         if (_pool is null)
         {
             _columnsScratch?.Dispose();

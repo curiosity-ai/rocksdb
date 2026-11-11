@@ -708,6 +708,31 @@ public sealed class DbIter : IDisposable
         return _skipPending = _rangeDel.ShouldDeleteWithSkipTarget(userKey, sequence, forward, _skipTarget!, out _skipSeq);
     }
 
+    // LocalStatistics::skip_count_ (db/db_iter.h): reported as NUMBER_ITER_SKIP when the iterator is released.
+    private ulong _skipCount;
+
+    /// <summary>
+    /// Port of ResetInternalKeysSkippedCounter: the internal keys the finished move looked at, less the one it stopped
+    /// on when the iterator was valid, go to the NUMBER_ITER_SKIP count.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ResetInternalKeysSkippedCounter(bool wasValid)
+    {
+        _skipCount += _numInternalKeysSkipped;
+        if (wasValid) _skipCount--;
+        _numInternalKeysSkipped = 0;
+    }
+
+    /// <summary>~DBIter: the NUMBER_ITER_SKIP count of this use of the iterator (BumpGlobalStatistics); invalidates it.</summary>
+    internal ulong TakeSkipCount()
+    {
+        ResetInternalKeysSkippedCounter(_valid);
+        _valid = false;
+        ulong n = _skipCount;
+        _skipCount = 0;
+        return n;
+    }
+
     /// <summary>Port of TooManyInternalKeysSkipped; throws Incomplete instead of returning true.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void TooManyInternalKeysSkipped(bool increment)
@@ -754,7 +779,7 @@ public sealed class DbIter : IDisposable
     {
         ReleaseTempPinnedData();
         _hasPrefix = false;
-        _numInternalKeysSkipped = 0;
+        ResetInternalKeysSkippedCounter(_valid);
         _isKeySeqnumZero = false;
         _valid = false;
         _merging = false;
@@ -1269,7 +1294,7 @@ public sealed class DbIter : IDisposable
         _valid = false;
         // Release temporarily pinned blocks from last operation
         ReleaseTempPinnedData();
-        _numInternalKeysSkipped = 0;
+        ResetInternalKeysSkippedCounter(wasValid: true); // Next / Prev require a valid iterator
         if (!_forward)
         {
             _isKeySeqnumZero = false;
@@ -1301,7 +1326,7 @@ public sealed class DbIter : IDisposable
         if (!_valid) ThrowHelper.InvalidArgument("Prev on an invalid iterator");
         PerfContext.Add(PerfMetric.IterPrevCount, 1);
         ReleaseTempPinnedData();
-        _numInternalKeysSkipped = 0;
+        ResetInternalKeysSkippedCounter(wasValid: true); // Next / Prev require a valid iterator
         BeginPrev();
         RunReverse();
     }
@@ -1489,7 +1514,7 @@ public sealed class DbIter : IDisposable
         _valid = false;
         // Release temporarily pinned blocks from last operation
         ReleaseTempPinnedData();
-        _numInternalKeysSkipped = 0;
+        ResetInternalKeysSkippedCounter(wasValid: true); // Next / Prev require a valid iterator
         if (!_forward)
         {
             _isKeySeqnumZero = false;
@@ -1531,7 +1556,7 @@ public sealed class DbIter : IDisposable
     {
         if (!_valid) ThrowHelper.InvalidArgument("Prev on an invalid iterator");
         ReleaseTempPinnedData();
-        _numInternalKeysSkipped = 0;
+        ResetInternalKeysSkippedCounter(wasValid: true); // Next / Prev require a valid iterator
         BeginPrev();
         return RunReverseAsync(cancellationToken);
     }
