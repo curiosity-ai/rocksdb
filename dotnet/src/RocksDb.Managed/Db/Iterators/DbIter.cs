@@ -708,8 +708,11 @@ public sealed class DbIter : IDisposable
         return _skipPending = _rangeDel.ShouldDeleteWithSkipTarget(userKey, sequence, forward, _skipTarget!, out _skipSeq);
     }
 
-    // LocalStatistics::skip_count_ (db/db_iter.h): reported as NUMBER_ITER_SKIP when the iterator is released.
-    private ulong _skipCount;
+    // _numInternalKeysSkipped is a running total that doubles as LocalStatistics::skip_count_ (db/db_iter.h, reported
+    // as NUMBER_ITER_SKIP when the iterator is released); _skipMark is its value when the current move started, so
+    // upstream's num_internal_keys_skipped_ is the difference of the two (modulo 2^64, like upstream's counters). A
+    // move then starts with one load and two stores instead of a separate accumulator update.
+    private ulong _skipMark;
 
     /// <summary>
     /// Port of ResetInternalKeysSkippedCounter: the internal keys the finished move looked at, less the one it stopped
@@ -718,9 +721,10 @@ public sealed class DbIter : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void ResetInternalKeysSkippedCounter(bool wasValid)
     {
-        _skipCount += _numInternalKeysSkipped;
-        if (wasValid) _skipCount--;
-        _numInternalKeysSkipped = 0;
+        ulong total = _numInternalKeysSkipped;
+        if (wasValid) total--;
+        _numInternalKeysSkipped = total;
+        _skipMark = total;
     }
 
     /// <summary>~DBIter: the NUMBER_ITER_SKIP count of this use of the iterator (BumpGlobalStatistics); invalidates it.</summary>
@@ -728,8 +732,9 @@ public sealed class DbIter : IDisposable
     {
         ResetInternalKeysSkippedCounter(_valid);
         _valid = false;
-        ulong n = _skipCount;
-        _skipCount = 0;
+        ulong n = _numInternalKeysSkipped;
+        _numInternalKeysSkipped = 0;
+        _skipMark = 0;
         return n;
     }
 
@@ -737,7 +742,7 @@ public sealed class DbIter : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void TooManyInternalKeysSkipped(bool increment)
     {
-        if (_maxSkippableInternalKeys > 0 && _numInternalKeysSkipped > _maxSkippableInternalKeys) ThrowIncomplete();
+        if (_maxSkippableInternalKeys > 0 && _numInternalKeysSkipped - _skipMark > _maxSkippableInternalKeys) ThrowIncomplete();
         else if (increment) _numInternalKeysSkipped++;
     }
 
@@ -1732,48 +1737,56 @@ public sealed class DbIter : IDisposable
         _revPhase = _forward ? RevPhase.ToBackward : RevPhase.PrevTop;
     }
 
-    /// <summary>Sync driver of the reverse state machine.</summary>
+    /// <summary>
+    /// Sync driver of the reverse state machine. The reverse functions move the inner iterator after the value was found
+    /// (FindUserKeyBeforeSavedKey) and before the current one is given up (ReverseToBackward): a failure there
+    /// invalidates the iterator, like upstream's "if (!iter_.status().ok()) { valid_ = false; return false; }". The
+    /// catch lives in this thin frame so that the loop itself (RunReverseLoop) has no exception-handling region.
+    /// </summary>
     private void RunReverse()
     {
         try
         {
-            while (true)
-            {
-                switch (ReverseStep())
-                {
-                    case InnerOp.Done:
-                        ReverseFinished();
-                        return;
-                    case InnerOp.Continue:
-                        break;
-                    case InnerOp.Prev:
-                        _iter.Prev();
-                        break;
-                    case InnerOp.Next:
-                        _iter.Next();
-                        break;
-                    case InnerOp.Seek:
-                        _iter.Seek(_seekKey.WrittenSpan);
-                        break;
-                    case InnerOp.SeekForPrev:
-                        _iter.SeekForPrev(_seekKey.WrittenSpan);
-                        break;
-                    case InnerOp.SeekToLast:
-                        _iter.SeekToLast();
-                        break;
-                    case InnerOp.SkipCovered:
-                        if (!_iter.SkipCoveredBackward(_skipTarget!.WrittenSpan, _skipSeq)) _iter.Prev();
-                        break;
-                }
-            }
+            RunReverseLoop();
         }
         catch
         {
-            // The reverse functions move the inner iterator after the value was found (FindUserKeyBeforeSavedKey) and
-            // before the current one is given up (ReverseToBackward): a failure there invalidates the iterator, like
-            // upstream's "if (!iter_.status().ok()) { valid_ = false; return false; }".
             _valid = false;
             throw;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void RunReverseLoop()
+    {
+        while (true)
+        {
+            switch (ReverseStep())
+            {
+                case InnerOp.Done:
+                    ReverseFinished();
+                    return;
+                case InnerOp.Continue:
+                    break;
+                case InnerOp.Prev:
+                    _iter.Prev();
+                    break;
+                case InnerOp.Next:
+                    _iter.Next();
+                    break;
+                case InnerOp.Seek:
+                    _iter.Seek(_seekKey.WrittenSpan);
+                    break;
+                case InnerOp.SeekForPrev:
+                    _iter.SeekForPrev(_seekKey.WrittenSpan);
+                    break;
+                case InnerOp.SeekToLast:
+                    _iter.SeekToLast();
+                    break;
+                case InnerOp.SkipCovered:
+                    if (!_iter.SkipCoveredBackward(_skipTarget!.WrittenSpan, _skipSeq)) _iter.Prev();
+                    break;
+            }
         }
     }
 
@@ -1782,24 +1795,30 @@ public sealed class DbIter : IDisposable
     {
         try
         {
-            while (true)
-            {
-                InnerOp op = ReverseStep();
-                if (op == InnerOp.Done)
-                {
-                    ReverseFinished();
-                    return ValueTask.CompletedTask;
-                }
-                if (op == InnerOp.Continue) continue;
-                ValueTask t = IssueAsync(op, ct);
-                if (!t.IsCompletedSuccessfully) return RunReverseSlowAsync(t, ct);
-                t.GetAwaiter().GetResult();
-            }
+            return RunReverseLoopAsync(ct);
         }
         catch
         {
             _valid = false; // see RunReverse
             throw;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private ValueTask RunReverseLoopAsync(CancellationToken ct)
+    {
+        while (true)
+        {
+            InnerOp op = ReverseStep();
+            if (op == InnerOp.Done)
+            {
+                ReverseFinished();
+                return ValueTask.CompletedTask;
+            }
+            if (op == InnerOp.Continue) continue;
+            ValueTask t = IssueAsync(op, ct);
+            if (!t.IsCompletedSuccessfully) return RunReverseSlowAsync(t, ct);
+            t.GetAwaiter().GetResult();
         }
     }
 

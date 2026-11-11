@@ -95,6 +95,8 @@ public sealed class BlockIter : IDisposable
     private int _firstKeyPadLen;
     // Entries need the generic decoder (value delta encoding or timestamp padding).
     private bool _slowParse;
+    // The exposed keys are internal keys whose footer is rewritten with the global seqno (see UpdateModes).
+    private bool _applyGlobalSeqno;
     // Restart keys need rewriting before comparisons (global seqno or timestamp padding).
     private bool _restartKeyFixup;
     // block_protection_bytes_per_key of the block (0: no per key-value verification) and the block itself.
@@ -167,8 +169,11 @@ public sealed class BlockIter : IDisposable
 
     private void UpdateModes()
     {
-        _slowParse = _valueDeltaEncoded || _padTsSize != 0 || _valuesSection >= 0;
-        _restartKeyFixup = _padTsSize != 0 || (_globalSeqno != DisableGlobalSequenceNumber && _keysAreInternal);
+        // Keys whose footer carries the global seqno go through ParseNextKeySlow -> ParseEntryGlobalSeqno, so that the
+        // inlined fast path (ParseNextKey -> ParseEntry) has neither the footer restore nor the footer rewrite.
+        _applyGlobalSeqno = _globalSeqno != DisableGlobalSequenceNumber && _keysAreInternal;
+        _slowParse = _valueDeltaEncoded || _padTsSize != 0 || _valuesSection >= 0 || _applyGlobalSeqno;
+        _restartKeyFixup = _padTsSize != 0 || _applyGlobalSeqno;
         // With stripped timestamps the stored key is validated when it is padded (PadMinTimestampInternal).
         _minKeyLen = _keysAreInternal && _padTsSize == 0 ? DbFormat.InternalKeyFooterSize : 0;
     }
@@ -219,6 +224,7 @@ public sealed class BlockIter : IDisposable
         _padTsSize = 0;
         _rawKeyLen = 0;
         _slowParse = false;
+        _applyGlobalSeqno = false;
         _restartKeyFixup = false;
         _minKeyLen = 0;
         _interpolationSearch = false;
@@ -437,7 +443,7 @@ public sealed class BlockIter : IDisposable
             _keyInBuf = true;
             // The cached key is the exposed one: a following Next must delta-decode against the stored footer.
             _rawFooter = e.RawFooter;
-            _footerPatched = _globalSeqno != DisableGlobalSequenceNumber && _keysAreInternal;
+            _footerPatched = _applyGlobalSeqno;
         }
     }
 
@@ -788,6 +794,7 @@ public sealed class BlockIter : IDisposable
         int p = DecodeEntry(cur, limit, out uint shared, out uint nonShared, out uint valueLength);
         if (p < 0) return CorruptionError();
         if (_padTsSize != 0) return ParseEntryPadded(p, limit, shared, nonShared, valueLength);
+        if (_applyGlobalSeqno) return ParseEntryGlobalSeqno(p, limit, shared, nonShared, valueLength);
         return ParseEntry(p, limit, shared, nonShared, valueLength);
     }
 
@@ -813,7 +820,9 @@ public sealed class BlockIter : IDisposable
         }
         if (p < 0) return CorruptionError();
         int previousValueEnd = _valueOffset + _valueLength;
-        bool ok = _padTsSize != 0 ? ParseEntryPadded(p, limit, shared, nonShared, 0) : ParseEntry(p, limit, shared, nonShared, 0);
+        bool ok = _padTsSize != 0 ? ParseEntryPadded(p, limit, shared, nonShared, 0)
+            : _applyGlobalSeqno ? ParseEntryGlobalSeqno(p, limit, shared, nonShared, 0)
+            : ParseEntry(p, limit, shared, nonShared, 0);
         if (!ok) return false;
         int valuesEnd = _restarts;
         int valueStart;
@@ -889,7 +898,7 @@ public sealed class BlockIter : IDisposable
             _valueLength = (int)valueLength;
             _next = valueStart + (int)valueLength;
         }
-        if (_globalSeqno != DisableGlobalSequenceNumber && _keysAreInternal) ApplyGlobalSeqno();
+        if (_applyGlobalSeqno) ApplyGlobalSeqno();
         return true;
     }
 
@@ -928,7 +937,24 @@ public sealed class BlockIter : IDisposable
         buf = RocksArrayPool<byte>.Shared.Rent(Math.Max(len, 64));
     }
 
-    /// <summary>Applies a decoded entry header at key-delta offset <paramref name="p"/>.</summary>
+    /// <summary>
+    /// ParseEntry for blocks whose keys expose the global seqno: the key buffer holds the exposed key (footer rewritten
+    /// by <see cref="ApplyGlobalSeqno"/>), so the stored footer is put back before the entry is delta-decoded against
+    /// it and the footer of the new key is rewritten afterwards. Kept out of <see cref="ParseEntry"/>, which is inlined
+    /// into every iterator move.
+    /// </summary>
+    private bool ParseEntryGlobalSeqno(int p, int limit, uint shared, uint nonShared, uint valueLength)
+    {
+        if (_footerPatched) RestoreRawFooter();
+        if (!ParseEntry(p, limit, shared, nonShared, valueLength)) return false;
+        ApplyGlobalSeqno();
+        return true;
+    }
+
+    /// <summary>
+    /// Applies a decoded entry header at key-delta offset <paramref name="p"/>. Not for keys that expose the global
+    /// seqno (<see cref="ParseEntryGlobalSeqno"/>) or stripped timestamps (<see cref="ParseEntryPadded"/>).
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool ParseEntry(int p, int limit, uint shared, uint nonShared, uint valueLength)
     {
@@ -972,10 +998,6 @@ public sealed class BlockIter : IDisposable
                 CopyKeyBytes(ref kb, ref Unsafe.Add(ref db, (uint)_keyBlockOffset), shared);
                 _keyInBuf = true;
             }
-            else if (_footerPatched)
-            {
-                RestoreRawFooter();
-            }
             CopyKeyBytes(ref Unsafe.Add(ref kb, shared), ref Unsafe.Add(ref db, (uint)p), nonShared);
             _keyLen = newLen;
         }
@@ -993,7 +1015,6 @@ public sealed class BlockIter : IDisposable
             _next = valueStart + (int)valueLength;
         }
 
-        if (_globalSeqno != DisableGlobalSequenceNumber && _keysAreInternal) ApplyGlobalSeqno();
         return true;
     }
 
@@ -1039,11 +1060,10 @@ public sealed class BlockIter : IDisposable
     /// Puts the stored footer back into the key buffer before the next entry is delta-decoded against it: its shared
     /// bytes may reach into the previous key's footer (a user key that extends the previous user key by footer bytes).
     /// </summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
     private void RestoreRawFooter()
     {
         _footerPatched = false;
-        if (_keyLen >= DbFormat.InternalKeyFooterSize)
+        if (_keyInBuf && _keyLen >= DbFormat.InternalKeyFooterSize)
             Coding.EncodeFixed64(_keyBuf.AsSpan(_keyLen - DbFormat.InternalKeyFooterSize, DbFormat.InternalKeyFooterSize), _rawFooter);
     }
 
