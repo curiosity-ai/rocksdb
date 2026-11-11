@@ -63,7 +63,14 @@ internal sealed class CacheEntryRoleStats
 
     private CacheEntryRoleStats Clone()
     {
-        var c = (CacheEntryRoleStats)MemberwiseClone();
+        // Not MemberwiseClone: that would share the two arrays with the collector's working copy (upstream copies the
+        // stats by value), so a later collection would rewrite a snapshot already handed out.
+        var c = new CacheEntryRoleStats
+        {
+            CacheId = CacheId, CacheCapacity = CacheCapacity, CacheUsage = CacheUsage, Occupancy = Occupancy,
+            CollectionCount = CollectionCount, CopiesOfLastCollection = CopiesOfLastCollection,
+            LastStartTimeMicros = LastStartTimeMicros, LastEndTimeMicros = LastEndTimeMicros,
+        };
         Array.Copy(EntryCounts, c.EntryCounts, NumRoles);
         Array.Copy(TotalCharges, c.TotalCharges, NumRoles);
         return c;

@@ -63,4 +63,11 @@ public readonly record struct FilterBuildingContext(int FormatVersion, int Level
     /// sizes to the allocator's usable size (see <see cref="FilterAllocationModel"/>).
     /// </summary>
     public bool OptimizeFiltersForMemory { get; init; }
+
+    /// <summary>
+    /// FilterBuildingContext::compaction_style of the column family. Level-aware policies (Ribbon's bloom_before_level)
+    /// only use the level and flush information under level and universal compaction; FIFO and "none" are treated as
+    /// bottommost.
+    /// </summary>
+    public CompactionStyle CompactionStyle { get; init; }
 }

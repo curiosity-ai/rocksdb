@@ -96,7 +96,7 @@ internal sealed class FileInfoLogger : InfoLogger
         _fileCreatedTicks = Environment.TickCount64;
     }
 
-    /// <summary>AutoRollLogger::TrimOldLogFiles / DBImpl info-log purge: keeps the newest keep_log_file_num old LOG files.</summary>
+    /// <summary>AutoRollLogger::TrimOldLogFiles / DBImpl info-log purge: keeps the newest keep_log_file_num - 1 old LOG files.</summary>
     private void TrimOldLogFiles()
     {
         string dir = _logDir.Length == 0 ? _dbname : _logDir;
@@ -114,9 +114,12 @@ internal sealed class FileInfoLogger : InfoLogger
         {
             return;
         }
-        if ((ulong)old.Count <= _keepLogFileNum) return;
+        // keep_log_file_num counts the current LOG: upstream deletes the oldest files while "old files >= keep_log_file_num"
+        // (AutoRollLogger::TrimOldLogFiles; DBImpl::PurgeObsoleteFiles for the plain logger), leaving keep - 1 old files.
+        if ((ulong)old.Count < _keepLogFileNum) return;
         old.Sort(static (a, b) => a.Ts.CompareTo(b.Ts));
-        for (int i = 0; i < old.Count - (int)_keepLogFileNum; i++)
+        int delete = (int)((ulong)old.Count - _keepLogFileNum + 1);
+        for (int i = 0; i < delete; i++)
         {
             try { _fs.DeleteFile(dir + "/" + old[i].Name); }
             catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException) { }

@@ -42,9 +42,20 @@ internal sealed partial class DbImpl
         string trimmed = checkpointDir.TrimEnd('/');
         if (trimmed.Length == 0) ThrowHelper.InvalidArgument("invalid checkpoint directory name");
         string fullPrivatePath = trimmed + ".tmp";
+        // CheckpointImpl::CleanStagingDirectory: a staging directory left behind by an earlier, interrupted checkpoint
+        // is emptied and removed first.
         if (FileSystem.DirectoryExistsSafe(fullPrivatePath))
         {
-            throw RocksDbException.IOError("While mkdir: " + fullPrivatePath + ": File exists");
+            try
+            {
+                foreach (string child in FileSystem.GetChildren(fullPrivatePath)) FileSystem.DeleteFile(fullPrivatePath + "/" + child);
+                FileSystem.DeleteDirectory(fullPrivatePath);
+            }
+            catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException)
+            {
+                throw new RocksDbException(StatusCode.Aborted, "Operation aborted: Failed to clean the temporary directory " + fullPrivatePath
+                    + " needed before checkpoint creation : " + e.Message);
+            }
         }
         FileSystem.CreateDirectoryIfMissing(fullPrivatePath);
         ulong sequenceNumber;
@@ -142,17 +153,38 @@ internal sealed partial class DbImpl
     {
         var results = new List<LiveFileStorageInfo>();
         bool flushMemtable = !_readOnly;
-        // While the WAL is locked (LockWAL) the flush is skipped: the frozen state is checkpointed with its WALs.
-        if (walSizeForFlush == ulong.MaxValue || IsWalLocked)
+        bool walLocked = IsWalLocked;
+        if (Options.Allow2Pc)
+        {
+            // GetLiveFilesStorageInfoImpl: wal_size_for_flush is only honoured without allow_2pc (a 2PC DB always
+            // flushes).
+        }
+        else if (walSizeForFlush == ulong.MaxValue)
         {
             flushMemtable = false;
         }
-        else if (walSizeForFlush > 0 && flushMemtable)
+        else if (walSizeForFlush > 0 && flushMemtable && !walLocked)
         {
             // If the outstanding WAL files are small, we skip the flush.
             ulong total = 0;
             foreach (WalFileInfo w in GetSortedWalFiles(includeArchived: false, needSeqnos: false)) total += w.SizeBytes;
             if (total < walSizeForFlush) flushMemtable = false;
+        }
+        // Blob files written by blob direct write are registered in the MANIFEST by the flush of their memtable: without
+        // that flush the captured WALs would reference blob files that are not among the live files.
+        bool needsBlobDirectWriteFlush = !_readOnly && HasInFlightBlobDirectWriteFiles();
+        if (needsBlobDirectWriteFlush && !flushMemtable)
+        {
+            ThrowHelper.NotSupported("Blob direct write requires flushing active blob files before capturing live files. Retry with flush enabled.");
+        }
+        // While the WAL is locked (LockWAL) the flush is skipped: the frozen state is checkpointed with its WALs.
+        if (walLocked)
+        {
+            if (needsBlobDirectWriteFlush)
+            {
+                ThrowHelper.NotSupported("Blob direct write requires flushing active blob files before capturing live files. Retry with WAL unlocked.");
+            }
+            flushMemtable = false;
         }
         if (flushMemtable)
         {

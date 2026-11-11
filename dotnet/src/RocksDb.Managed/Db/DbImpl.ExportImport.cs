@@ -21,10 +21,13 @@ internal sealed partial class DbImpl
         string trimmed = exportDir.TrimEnd('/');
         if (trimmed.Length == 0) ThrowHelper.InvalidArgument("Specified export_dir invalid");
         string tmpExportDir = trimmed + ".tmp";
-        FileSystem.CreateDirectoryIfMissing(tmpExportDir);
         bool movedToUserDir = false;
         try
         {
+            // Env::CreateDir fails on an existing directory: a staging directory left behind by an interrupted export
+            // fails this export, and the failure path below removes it (so the next attempt succeeds).
+            if (FileSystem.DirectoryExistsSafe(tmpExportDir)) throw RocksDbException.IOError("While mkdir: " + tmpExportDir + ": File exists");
+            FileSystem.CreateDirectoryIfMissing(tmpExportDir);
             // FIXME upstream: should respect atomic_flush and flush all CFs if needed.
             if (!_readOnly) await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.ManualFlush, synchronous, ct).ConfigureAwait(false);
             var files = new List<(int Level, FileMetaData File)>();
@@ -124,6 +127,7 @@ internal sealed partial class DbImpl
         ColumnFamilyData cfd = await CreateColumnFamilyAsync(name, options, synchronous, ct).ConfigureAwait(false);
         var job = new ImportColumnFamilyJob(this, cfd, importOptions, metadatas);
         bool ok = false;
+        bool keepFiles = false;
         try
         {
             lock (_mutex)
@@ -147,7 +151,18 @@ internal sealed partial class DbImpl
                 VersionEdit edit;
                 ulong largestSeqno;
                 lock (_mutex) edit = job.Run(out largestSeqno);
-                await Versions.LogAndApplyAsync(cfd, edit, synchronous, ct).ConfigureAwait(false);
+                TestHooks.Invoke("DBImpl::CreateColumnFamilyWithImport:BeforeLogAndApply");
+                try
+                {
+                    await Versions.LogAndApplyAsync(cfd, edit, synchronous, ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // After a MANIFEST I/O error (VersionSet::io_status_) the import record may be durable in the
+                    // MANIFEST that CURRENT names: the imported files must stay (see IngestExternalFilesAsync).
+                    keepFiles = Versions.IoStatus is not null;
+                    throw;
+                }
                 lock (_mutex)
                 {
                     // Imported files keep their sequence numbers: the DB's last sequence must cover them.
@@ -172,7 +187,7 @@ internal sealed partial class DbImpl
             {
                 foreach (ulong n in job.ReservedFileNumbers) _pendingOutputs.Remove(n);
             }
-            job.Cleanup(ok);
+            if (ok || !keepFiles) job.Cleanup(ok);
             if (!ok)
             {
                 try

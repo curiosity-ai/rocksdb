@@ -336,9 +336,11 @@ public sealed class RangeDelAggregator
     private bool InBounds(ref Source s, ReadOnlySpan<byte> userKey, ulong sequence)
     {
         // key >= smallest' and key < largest' (internal key order); the key's type is irrelevant against
-        // kTypeMaxValid / sentinel bounds, use kTypeValue.
+        // kTypeMaxValid / sentinel bounds, use kTypeValue. A seqno-0 largest is kept with its own type: the only entry
+        // with its user key and seqno is that key itself, which upstream excludes (parsed < largest is false), so the
+        // lowest type is used there (kTypeValue would sort before a kTypeDeletion largest and count as inside).
         if (s.Smallest is not null && _icmp.Compare(s.Smallest, userKey, sequence, EntryType.Value) > 0) return false;
-        if (s.Largest is not null && _icmp.Compare(s.Largest, userKey, sequence, EntryType.Value) <= 0) return false;
+        if (s.Largest is not null && _icmp.Compare(s.Largest, userKey, sequence, EntryType.Deletion) <= 0) return false;
         return true;
     }
 

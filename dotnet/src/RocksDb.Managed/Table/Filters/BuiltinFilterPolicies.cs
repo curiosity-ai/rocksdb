@@ -124,6 +124,27 @@ public abstract class BloomLikeFilterPolicy : FilterPolicy
 }
 
 /// <summary>
+/// Port of ReadOnlyBuiltinFilterPolicy (table/block_based/filter_policy_internal.h): reads every built-in filter format
+/// but writes no filters (GetBuilderWithContext returns nullptr). Its name and id are "rocksdb.BuiltinBloomFilter", the
+/// value FilterPolicy::CreateFromString maps to it.
+/// </summary>
+public sealed class ReadOnlyBuiltinFilterPolicy : BloomLikeFilterPolicy
+{
+    /// <summary>bits/key 0: <see cref="BloomLikeFilterPolicy.CreatesFilters"/> is false, so table builders write no filter.</summary>
+    public ReadOnlyBuiltinFilterPolicy() : base(0) { }
+
+    public override string Name => BuiltinFilterMetadataName;
+
+    public override string Id => BuiltinFilterMetadataName;
+
+    public override IFilterBitsBuilder CreateBuilder(int formatVersion)
+    {
+        ThrowIfNoFilter();
+        throw new InvalidOperationException();
+    }
+}
+
+/// <summary>
 /// Port of BloomFilterPolicy (<c>NewBloomFilterPolicy(bits_per_key)</c>): legacy Bloom for
 /// format_version &lt; 5, FastLocalBloom for format_version &gt;= 5.
 /// </summary>
@@ -197,7 +218,8 @@ public sealed class RibbonFilterPolicy : BloomLikeFilterPolicy
         // INT_MAX is reserved for "always use Bloom".
         int levelish = int.MaxValue - 1;
         int bloomBeforeLevel = _bloomBeforeLevel;
-        if (bloomBeforeLevel < int.MaxValue)
+        // FIFO and "none" compaction styles are treated as bottommost (RibbonFilterPolicy::GetBuilderWithContext).
+        if (bloomBeforeLevel < int.MaxValue && context.CompactionStyle is CompactionStyle.Level or CompactionStyle.Universal)
         {
             if (context.IsFlush)
             {

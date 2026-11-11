@@ -121,6 +121,16 @@ internal sealed class ShortenedIndexBuilder : IndexBuilder
     private bool _isUniform;
     private bool _finished;
 
+    /// <summary>The statistics the index block builders record BLOCK_KEY_DISTRIBUTION_CV in (ShortenedIndexBuilder's statistics argument).</summary>
+    internal Statistics? Statistics
+    {
+        set
+        {
+            _withSeq.Statistics = value;
+            _withoutSeq.Statistics = value;
+        }
+    }
+
     /// <param name="stripTimestampSize">Timestamp size stripped from every index key and first key
     /// (persist_user_defined_timestamps = false), 0 to keep keys whole.</param>
     /// <param name="uniformCvThreshold">uniform_cv_threshold for the index block (negative: never "is_uniform").</param>
@@ -370,6 +380,18 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
     private int _indexSize;
     private int _topLevelIndexSize;
 
+    private Statistics? _statistics;
+
+    /// <summary>statistics_: given to every partition's index block builder (not to the top-level index).</summary>
+    internal Statistics? Statistics
+    {
+        set
+        {
+            _statistics = value;
+            if (_subIndexBuilder is { } sub) sub.Statistics = value;
+        }
+    }
+
     public PartitionedIndexBuilder(InternalKeyComparator icmp, int indexBlockRestartInterval, int formatVersion, bool useValueDeltaEncoding,
         IndexShorteningMode shortening, int metadataBlockSize, int blockSizeDeviation, bool useCommonPrefixTop, bool useCommonPrefixSub,
         int stripTimestampSize, double uniformCvThreshold)
@@ -433,6 +455,9 @@ internal sealed class PartitionedIndexBuilder : IndexBuilder
     {
         var sub = new ShortenedIndexBuilder(_icmp, _indexBlockRestartInterval, _formatVersion, _useValueDeltaEncoding, _shortening,
             includeFirstKey: false, _useCommonPrefixSub, _stripTsSize, _uniformCvThreshold);
+        // PartitionedIndexBuilder::MakeNewSubIndexBuilder passes statistics_ to the partition builders (the top-level
+        // index gets none).
+        sub.Statistics = _statistics;
         _subIndexBuilder = sub;
         // Start next partition entry, where we will modify the key
         _entries.Add(new Entry(sub));

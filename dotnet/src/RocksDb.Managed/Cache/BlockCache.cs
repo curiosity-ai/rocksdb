@@ -407,6 +407,12 @@ public abstract class BlockCache : Table.IBlockCache
     /// </summary>
     public virtual void Release(ref CachedBlock handle, bool eraseIfLastRef) => handle.Release(eraseIfLastRef);
 
+    /// <summary>
+    /// The charge of <paramref name="handle"/>'s entry as passed to the insert (Cache::GetCharge): without the per-entry
+    /// metadata charge that <see cref="CachedBlock.Charge"/> includes for the LRU cache.
+    /// </summary>
+    internal virtual long GetCharge(in CachedBlock handle) => handle.Charge;
+
     /// <summary>Completes the pending lookups among <paramref name="handles"/> (Cache::WaitAll).</summary>
     public virtual void WaitAll(ReadOnlySpan<AsyncLookupHandle> handles) { }
 

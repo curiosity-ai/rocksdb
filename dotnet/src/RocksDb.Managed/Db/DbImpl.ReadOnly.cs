@@ -107,7 +107,10 @@ internal sealed partial class DbImpl
 
         if (!FileSystem.FileExists(FileNames.CurrentFilePath(DbName)))
         {
-            throw new RocksDbException(StatusCode.InvalidArgument, "Invalid argument: " + DbName + ": does not exist (read-only open)");
+            // OpenForReadOnlyCheckExistence / VersionSet::Recover -> GetCurrentManifestPath: the failed read of CURRENT
+            // is the status (IOError with the PathNotFound subcode).
+            throw new RocksDbException(StatusCode.IOError, "IO error: No such file or directory: While opening a file for sequentially reading: " +
+                FileNames.CurrentFilePath(DbName), StatusSubCode.PathNotFound);
         }
         ulong manifestNumber;
         RecoveredVersionState state;
@@ -158,9 +161,16 @@ internal sealed partial class DbImpl
             ulong minLog;
             lock (_mutex) minLog = Math.Max(Versions.MinLogNumberWithUnflushedData(null), Versions.MinLogNumberToKeep);
             var wals = ListWalNumbers(minLog);
-            if (wals.Count > 0 && errorIfWalFileExists)
+            if (errorIfWalFileExists)
             {
-                ThrowHelper.InvalidArgument("Write Ahead Log file in " + WalDir + " exists, but error_if_wal_file_exists is true");
+                // DBImpl::Recover: every WAL file of the directory is checked; only a non-empty one is an error.
+                foreach (ulong n in ListWalNumbers(0))
+                {
+                    if (FileSystem.GetFileSize(FileNames.LogFileName(WalDir, n)) > 0)
+                    {
+                        ThrowHelper.Corruption("The db was opened in readonly mode with error_if_wal_file_exists flag but a non-empty WAL file already exists");
+                    }
+                }
             }
             // DBImpl::Recover(read_only = true): the same WAL checks and replay as the primary (ProcessLogFiles).
             CheckWalFilesExist(isNewDb: false, ListWalNumbers(0).Count);
@@ -457,6 +467,13 @@ internal sealed partial class DbImpl
         ulong last = Math.Max(Versions.LastSequence, state.LastSequence);
         bool applied = false;
         WalRecoveryReporter reporter = _secondaryWalReporter ??= new WalRecoveryReporter();
+        // LogReaderContainer::status_ (DBImplSecondary::RecoverLogFiles: "wal_read_status->ok()"): a WAL that reported
+        // a corruption keeps failing the catch-up until its reader is dropped (the primary flushed its data).
+        if (reporter.Error is { } earlier)
+        {
+            if (_secondaryWalReaders.ContainsKey(_secondaryCorruptWal)) throw earlier.Rethrowable();
+            reporter.Error = null;
+        }
         List<ulong> walNumbers = ListWalNumbers(minLog, _secondaryWalNumbers);
         for (int w = 0; w < walNumbers.Count; w++)
         {
@@ -481,7 +498,12 @@ internal sealed partial class DbImpl
             }
             while (reader.TryReadRecord(out ReadOnlySpan<byte> record))
             {
-                if (record.Length < WriteBatch.HeaderSize) continue;
+                if (reporter.Error is not null) break;
+                if (record.Length < WriteBatch.HeaderSize)
+                {
+                    reporter.Corruption(record.Length, StatusCode.Corruption, "log record too small", LogReporter.UnspecifiedLogNumber);
+                    break;
+                }
                 ulong seq = Util.Coding.DecodeFixed64(record);
                 uint count = Util.Coding.DecodeFixed32(record[8..]);
                 var inserter = new MemTableInserter(this, walNumber, ignoreMissingColumnFamilies: true) { Sequence = seq };
@@ -490,6 +512,15 @@ internal sealed partial class DbImpl
                 _flushScheduler.Clear();
                 // The inserter's next sequence (not the header count): prepared sections consume no sequence numbers.
                 if (count > 0 && inserter.Sequence > seq) last = Math.Max(last, inserter.Sequence - 1);
+            }
+            if (reporter.Error is { } walError)
+            {
+                // RecoverLogFiles returns the WAL's read status: the catch-up fails instead of silently skipping the
+                // records the reader dropped (the rest of the block) and going on with later ones.
+                // The records applied before it are published, as upstream does per record (SetLastSequence).
+                _secondaryCorruptWal = walNumber;
+                Versions.SetLastSequence(last);
+                throw walError.Rethrowable();
             }
         }
         Versions.SetLastSequence(last);
@@ -607,5 +638,9 @@ internal sealed partial class DbImpl
     {
         for (int i = 0; i < _secondaryWalReaders.Count; i++) _secondaryWalReaders.Values[i].Dispose();
         _secondaryWalReaders.Clear();
+        if (_secondaryWalReporter is { } reporter) reporter.Error = null;
     }
+
+    /// <summary>The WAL whose reader reported the corruption held by <see cref="_secondaryWalReporter"/>.</summary>
+    private ulong _secondaryCorruptWal;
 }

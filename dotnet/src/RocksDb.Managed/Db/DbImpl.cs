@@ -261,6 +261,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
     [MethodImpl(MethodImplOptions.NoInlining)]
     private SuperVersion GetAndRefSuperVersionSlow(ColumnFamilyData cfd, object? cached, ref int slot)
     {
+        // ColumnFamilyData::GetThreadLocalSuperVersion: "if (sv == SuperVersion::kSVObsolete) RecordTick(
+        // NUMBER_SUPERVERSION_ACQUIRES)" - the cached reference could not be used and one is taken from the installed
+        // super version. (Counted per processor slot here, per thread upstream.)
+        Options.Statistics?.RecordTick(Ticker.NumberSuperversionAcquires);
         if (ReferenceEquals(cached, SuperVersionCache.InUse))
         {
             // Another thread uses this processor's slot (it was preempted while reading): plain reference.
@@ -270,7 +274,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         try
         {
             // An obsolete super version stored back by a reader that raced with a reset: drop the slot's reference.
-            if (cached is SuperVersion stale) ReturnSuperVersion(stale);
+            if (cached is SuperVersion stale) ReleaseReaderSuperVersion(stale);
             return GetReferencedSuperVersion(cfd);
         }
         catch
@@ -285,7 +289,23 @@ internal sealed partial class DbImpl : IAsyncDisposable
     internal void ReturnAndCleanupSuperVersion(ColumnFamilyData cfd, SuperVersion sv, int slot)
     {
         if (slot >= 0 && cfd.LocalSuperVersions.TryPut(slot, sv)) return;
-        ReturnSuperVersion(sv);
+        ReleaseReaderSuperVersion(sv);
+    }
+
+    /// <summary>
+    /// DBImpl::CleanupSuperVersion as called by ReturnAndCleanupSuperVersion when the reference could not go back to
+    /// the cache: NUMBER_SUPERVERSION_RELEASES, and NUMBER_SUPERVERSION_CLEANUPS when it was the last reference.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void ReleaseReaderSuperVersion(SuperVersion sv)
+    {
+        Statistics? st = Options.Statistics;
+        if (sv.Unref())
+        {
+            lock (_mutex) CleanupSuperVersion(sv);
+            st?.RecordTick(Ticker.NumberSuperversionCleanups);
+        }
+        st?.RecordTick(Ticker.NumberSuperversionReleases);
     }
 
     private static void ThrowDropped(ColumnFamilyData cfd) =>
@@ -454,6 +474,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     /// <summary>Port of the supported subset of DB::GetProperty (db/internal_stats.cc).</summary>
     public string? GetProperty(ColumnFamilyData cfd, string property)
     {
+        property = PropertyNameForLookup(property);
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         try
         {
@@ -661,6 +682,33 @@ internal sealed partial class DbImpl : IAsyncDisposable
         lock (_mutex) _obsoleteManifests.Add(number);
     }
 
+    // ErrorHandler::files_to_quarantine_: table / blob files added by a MANIFEST write that failed. Guarded by mutex.
+    private readonly HashSet<ulong> _quarantinedFiles = new();
+
+    /// <summary>
+    /// Port of ErrorHandler::AddFilesToQuarantine (VersionEdit::GetFilesToQuarantineIfCommitFail: the table and blob files
+    /// the edits add): after a failed MANIFEST write the record may still be in the MANIFEST that CURRENT names, so these
+    /// files are kept by the full scan (PurgeObsoleteFiles: quarantine_files_set) until a MANIFEST write succeeds.
+    /// </summary>
+    internal void QuarantineFiles(VersionEdit[] edits)
+    {
+        lock (_mutex)
+        {
+            foreach (VersionEdit e in edits)
+            {
+                if (e is null) continue;
+                foreach (NewFileEntry nf in e.NewFiles) _quarantinedFiles.Add(nf.Meta.FileNumber);
+                foreach (BlobFileAddition b in e.BlobFileAdditions) _quarantinedFiles.Add(b.BlobFileNumber);
+            }
+        }
+    }
+
+    /// <summary>Port of ErrorHandler::ClearFilesToQuarantine (a MANIFEST write succeeded). REQUIRES: mutex.</summary>
+    internal void ClearQuarantinedFiles()
+    {
+        if (_quarantinedFiles.Count > 0) _quarantinedFiles.Clear();
+    }
+
     /// <summary>
     /// Port of FindObsoleteFiles(force = false) + PurgeObsoleteFiles (db/db_impl/db_impl_files.cc): deletes table files
     /// no version references, WALs below the minimum log number with unflushed data, and old MANIFESTs.
@@ -797,6 +845,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
     {
         bool listedDbDir = false;
         var toDelete = new List<string>();
+        // Table and blob files found by the scan: deleted like the queued ones (DeleteObsoleteFileImpl).
+        Dictionary<string, (FileType Type, ulong Number, string Directory)>? dataFiles = null;
         var options = new List<(ulong Number, string Path)>();
         var walsToDelete = new List<ulong>();
         ulong minLog;
@@ -819,16 +869,25 @@ internal sealed partial class DbImpl : IAsyncDisposable
                     if (dbDirChildren is not null && dir == DbName) dbDirChildren.Add(child);
                     if (!FileNames.TryParseFileName(child, out ulong number, out FileType type)) continue;
                     string full = dir + "/" + child;
+                    // PurgeObsoleteFiles: "if (quarantine_files_set.find(number) != quarantine_files_set.end()) continue".
+                    if (_quarantinedFiles.Count > 0 && _quarantinedFiles.Contains(number)) continue;
                     switch (type)
                     {
                         case FileType.TableFile:
-                            if (!Versions.IsLiveFile(number) && !_pendingOutputs.Contains(number)) toDelete.Add(full);
+                            if (!Versions.IsLiveFile(number) && !_pendingOutputs.Contains(number))
+                            {
+                                toDelete.Add(full);
+                                (dataFiles ??= new())[full] = (type, number, dir);
+                            }
                             break;
                         case FileType.BlobFile:
                             // ShouldKeepBlobFileDuringPurge: a footer-less blob file may be a blob direct write file
                             // (of this instance, or of a crashed one whose blob indexes were recovered from the WAL).
                             if (!Versions.IsLiveBlobFile(number) && !_pendingOutputs.Contains(number) && !ShouldKeepFooterlessBlobFile(full))
+                            {
                                 toDelete.Add(full);
+                                (dataFiles ??= new())[full] = (type, number, dir);
+                            }
                             break;
                         case FileType.DescriptorFile:
                             if (dir == DbName && (atOpen ? number != Versions.ManifestFileNumber : number < Versions.ManifestFileNumber)) toDelete.Add(full);
@@ -853,8 +912,25 @@ internal sealed partial class DbImpl : IAsyncDisposable
             }
         }
         options.Sort(static (a, b) => b.Number.CompareTo(a.Number));
-        for (int i = 2; i < options.Count; i++) toDelete.Add(options[i].Path);
-        foreach (string p in toDelete) TryDeleteFile(p);
+        if (options.Count > 2)
+        {
+            ulong keepOptionsFrom = MinOptionsFileNumberToKeep(options[1].Number);
+            for (int i = 2; i < options.Count; i++)
+            {
+                if (options[i].Number < keepOptionsFrom) toDelete.Add(options[i].Path);
+            }
+        }
+        foreach (string p in toDelete)
+        {
+            // DeleteObsoleteFileImpl: table and blob files go through DeleteDBFile (the SstFileManager when there is
+            // one) and are reported (event log; OnTableFileDeleted), also when only the full scan found them.
+            if (dataFiles is not null && dataFiles.TryGetValue(p, out (FileType Type, ulong Number, string Directory) f))
+            {
+                if (f.Type == FileType.TableFile) DeleteObsoleteTableFile(p, f.Number);
+                else LogFileDeletionEvent("blob_file_deletion", 0, f.Number, DeleteDbFile(p, f.Directory));
+            }
+            else TryDeleteFile(p);
+        }
         if (dbDirChildren is not null && toDelete.Count > 0)
         {
             string prefix = DbName + "/";
@@ -974,6 +1050,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             _log = null;
             if (log is not null)
             {
+                MaybeTruncateWalOnClose(log);
                 if (synchronous) log.Dispose();
                 else await log.DisposeAsync().ConfigureAwait(false);
             }
@@ -991,9 +1068,16 @@ internal sealed partial class DbImpl : IAsyncDisposable
                     releasedDropped = true;
                 }
             }
-            if (releasedDropped)
+            // CloseHelper: FindObsoleteFiles(force = true) + PurgeObsoleteFiles on every close of a writable DB ("clean up
+            // obsolete files due to SuperVersion release", and so that RepairDB does not find unreferenced files).
+            _ = releasedDropped;
+            if (!_readOnly)
             {
-                try { PurgeObsoleteFiles(); }
+                try
+                {
+                    PurgeObsoleteFiles();
+                    DeleteObsoleteFilesFullScan(atOpen: false, dbDirChildren: null);
+                }
                 catch (Exception e) when (e is IOException or RocksDbException) { }
             }
             // VersionSet::Close: verify_manifest_content_on_close. A failure is reported once the close has finished

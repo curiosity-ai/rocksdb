@@ -182,8 +182,21 @@ public sealed partial class WriteBatch : IDisposable
         ContentFlags rv = _contentFlags;
         if ((rv & ContentFlags.Deferred) != 0)
         {
-            // BatchContentClassifier
-            rv = ContentFlags.None;
+            // BatchContentClassifier. Like upstream (Iterate(&classifier).PermitUncheckedError()), a malformed rep does
+            // not fail the classification: the flags of the records before the damage are kept, and the batch fails
+            // where it is applied (the memtable insert). Throwing here would fail a write group after its WAL record
+            // was written, without the background error of a failed memtable insert.
+            rv = ClassifyContents();
+            _contentFlags = rv;
+        }
+        return rv;
+    }
+
+    private ContentFlags ClassifyContents()
+    {
+        ContentFlags rv = ContentFlags.None;
+        try
+        {
             var reader = new WriteBatchReader(_rep.WrittenSpan[HeaderSize..], wholeBatch: false, count: 0);
             while (reader.TryReadNext(out WriteBatchEntry e))
             {
@@ -205,7 +218,10 @@ public sealed partial class WriteBatch : IDisposable
                     _ => ContentFlags.None,
                 };
             }
-            _contentFlags = rv;
+        }
+        catch (RocksDbException)
+        {
+            // malformed rep: see ComputeContentFlags
         }
         return rv;
     }

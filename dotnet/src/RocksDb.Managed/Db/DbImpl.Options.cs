@@ -42,6 +42,11 @@ internal sealed partial class DbImpl
         "paranoid_memory_checks", "memtable_verify_per_key_checksum_on_seek", "compression_manager",
         "memtable_max_range_deletions", "memtable_op_scan_flush_trigger", "memtable_avg_op_scan_flush_trigger",
         "min_tombstones_for_range_conversion",
+        // OptionVerificationType::kDeprecated entries flagged kMutable: accepted and ignored by SetOptions.
+        "filter_deletes", "check_flush_compaction_key_order", "verify_checksums_in_compaction", "hard_rate_limit", "soft_rate_limit",
+        "ignore_max_compaction_bytes_for_input", "expanded_compaction_factor", "max_grandparent_overlap_factor",
+        "source_compaction_factor", "memtable_prefix_bloom_huge_page_tlb_size", "memtable_prefix_bloom_bits",
+        "memtable_prefix_bloom_probes", "min_partial_merge_operands", "snap_refresh_nanos", "bottommost_temperature",
     };
 
     /// <summary>
@@ -65,6 +70,8 @@ internal sealed partial class DbImpl
         "max_manifest_file_size", "manifest_preallocation_size", "max_compaction_trigger_wakeup_seconds",
         "max_manifest_space_amp_pct", "verify_manifest_content_on_close", "optimize_manifest_for_recovery", "daily_offpeak_time_utc",
         "periodic_compaction_phase_recovery_percent", "fast_sst_open", "remote_compaction_manifest_floor",
+        // OptionVerificationType::kDeprecated entries flagged kMutable: accepted and ignored by SetDBOptions.
+        "allow_os_buffer", "base_background_compactions",
     };
 
 
@@ -120,7 +127,8 @@ internal sealed partial class DbImpl
         {
             // Cache::CreateFromString with a plain capacity (kDontSerialize: not written to the OPTIONS file).
             ulong capacity = RocksDb.Managed.Options.OptionStrings.ParseUInt64("table_factory.block_cache", value.Trim());
-            options.BlockCache = Cache.BlockCache.CreateLru(checked((long)capacity));
+            // size_t upstream: a capacity above long.MaxValue is as unbounded as the largest managed capacity.
+            options.BlockCache = Cache.BlockCache.CreateLru(capacity > long.MaxValue ? long.MaxValue : unchecked((long)capacity));
             return;
         }
         if (options.GetOption(name) is null) ThrowHelper.InvalidArgument("Unrecognized option: table_factory." + name);
@@ -374,12 +382,121 @@ internal sealed partial class DbImpl
     /// </summary>
     internal static void ValidateDbOptions(DbOptions o)
     {
+        if (o.ReadIoExecutorThreads <= 0) ThrowHelper.InvalidArgument("read_io_executor_threads must be greater than zero");
+        if (o.DbPaths.Count > 4) ThrowHelper.NotSupported("More than four DB paths are not supported yet. ");
+        if (o.AllowMmapReads && o.UseDirectReads)
+        {
+            ThrowHelper.NotSupported("If memory mapped reads (allow_mmap_reads) are enabled then direct I/O reads (use_direct_reads) must be disabled. ");
+        }
+        if (o.AllowMmapReads && o.UseDirectIoForCompactionReads)
+        {
+            ThrowHelper.NotSupported("If memory mapped reads (allow_mmap_reads) are enabled then compaction-only direct I/O reads " +
+                "(use_direct_io_for_compaction_reads) must be disabled. ");
+        }
+        if (o.AllowMmapWrites && o.UseDirectIoForFlushAndCompaction)
+        {
+            ThrowHelper.NotSupported("If memory mapped writes (allow_mmap_writes) are enabled then direct I/O writes " +
+                "(use_direct_io_for_flush_and_compaction) must be disabled. ");
+        }
+        if (o.KeepLogFileNum == 0) ThrowHelper.InvalidArgument("keep_log_file_num must be greater than 0");
+        if (o.UseDirectIoForFlushAndCompaction && o.WritableFileMaxBufferSize == 0)
+            ThrowHelper.InvalidArgument("writes in direct IO require writable_file_max_buffer_size > 0");
         if (o.DailyOffpeakTimeUtc.Length != 0)
         {
             if (!OffpeakTimeOption.TryParseTimeRange(o.DailyOffpeakTimeUtc, out int start, out int end))
                 ThrowHelper.InvalidArgument("daily_offpeak_time_utc should be set in the format HH:mm-HH:mm (e.g. 04:30-07:30)");
             if (start == end) ThrowHelper.InvalidArgument("start_time and end_time cannot be the same");
         }
+        if (!o.WriteDbIdToManifest && !o.WriteIdentityFile)
+            ThrowHelper.InvalidArgument("write_dbid_to_manifest and write_identity_file cannot both be false");
+    }
+
+    /// <summary>
+    /// Port of the sanitization of BlockBasedTableFactory::InitializeOptions (table/block_based/
+    /// block_based_table_factory.cc), in place: the factory holds (and the OPTIONS file records) the sanitized values.
+    /// </summary>
+    internal static void SanitizeTableOptions(BlockBasedTableOptions t)
+    {
+        if (t.BlockSizeDeviation is < 0 or > 100) t.BlockSizeDeviation = 0;
+        if (t.BlockRestartInterval < 1) t.BlockRestartInterval = 1;
+        if (t.IndexBlockRestartInterval < 1) t.IndexBlockRestartInterval = 1;
+        // Currently kHashSearch is incompatible with index_block_restart_interval > 1
+        if (t.IndexType == IndexType.HashSearch && t.IndexBlockRestartInterval != 1) t.IndexBlockRestartInterval = 1;
+        // We do not support partitioned filters without partitioning indexes
+        if (t.PartitionFilters && t.IndexType != IndexType.TwoLevelIndexSearch) t.PartitionFilters = false;
+        // A too high format_version is not sanitized, so that it is rejected in validation.
+        if (t.FormatVersion < MinFormatVersionForWrite) t.FormatVersion = MinFormatVersionForWrite;
+    }
+
+    /// <summary>kMinSupportedBbtFormatVersionForWrite (table/format.h).</summary>
+    private const uint MinFormatVersionForWrite = Table.BlockBasedTableConstants.MinSupportedFormatVersionForWrite;
+
+    /// <summary>
+    /// Port of BlockBasedTableFactory::ValidateOptions (table/block_based/block_based_table_factory.cc), which DB::Open
+    /// runs on the column family options as given (ValidateOptionsByTable, db/db_impl/db_impl_open.cc); messages copied
+    /// verbatim. Checked elsewhere: interpolation search with a non-bytewise comparator and max_successive_merges with
+    /// unordered_write (ColumnFamilyData). Not ported: custom compression managers and cache_usage_options
+    /// (CacheEntryRoleOptions), which the options model does not have.
+    /// </summary>
+    internal static void ValidateTableOptions(ColumnFamilyOptions cf)
+    {
+        if (cf.TableFactory != TableFactoryType.BlockBasedTable) return;
+        BlockBasedTableOptions t = cf.TableOptions;
+        if (t.IndexType == IndexType.HashSearch && cf.PrefixExtractor is null)
+            ThrowHelper.InvalidArgument("Hash index is specified for block-based table, but prefix_extractor is not given");
+        BlockBasedIndexMode indexMode = t.IndexMode; // GetEffectiveIndexMode
+        if (indexMode != BlockBasedIndexMode.StandardOnly && t.UserDefinedIndexFactory is not null && cf.Comparator is { TimestampSize: > 0 })
+            ThrowHelper.InvalidArgument("user_defined_index_factory is incompatible with user-defined timestamps");
+        if (t.CacheIndexAndFilterBlocks && t.NoBlockCache)
+            ThrowHelper.InvalidArgument("Enable cache_index_and_filter_blocks, , but block cache is disabled");
+        if (t.PinL0FilterAndIndexBlocksInCache && t.NoBlockCache)
+            ThrowHelper.InvalidArgument("Enable pin_l0_filter_and_index_blocks_in_cache, , but block cache is disabled");
+        // A format_version below the minimum for writing is sanitized (InitializeOptions), not rejected.
+        if (t.FormatVersion > Table.BlockBasedTableConstants.LatestSupportedFormatVersion)
+            ThrowHelper.InvalidArgument("Unsupported BlockBasedTable format_version. Please check include/rocksdb/table.h for more info");
+        ValidateTableCompressionType(cf.Compression, "compression", t.BlockAlign);
+        ValidateTableCompressionType(cf.BottommostCompression, "bottommost_compression", t.BlockAlign);
+        foreach (Compression.CompressionType c in cf.CompressionPerLevel) ValidateTableCompressionType(c, "compression_per_level", t.BlockAlign);
+        if (t.BlockAlign && (t.BlockSize & (t.BlockSize - 1)) != 0)
+            ThrowHelper.InvalidArgument("Block alignment requested but block size is not a power of 2");
+        if (t.BlockSize > uint.MaxValue) ThrowHelper.InvalidArgument("block size exceeds maximum number (4GiB) allowed");
+        if ((t.SuperBlockAlignmentSize & (t.SuperBlockAlignmentSize - 1)) != 0)
+            ThrowHelper.InvalidArgument("Super Block alignment requested but super block alignment size is not a power of 2");
+        if (t.SuperBlockAlignmentSize > uint.MaxValue)
+            ThrowHelper.InvalidArgument("Super block alignment size exceeds maximum number (4GiB) allowed");
+        if (t.SuperBlockAlignmentSpaceOverheadRatio is > 0 and < 4)
+            ThrowHelper.InvalidArgument("Super block alignment space overhead is too high");
+        if (t.DataBlockIndexType == DataBlockIndexType.BinaryAndHash && t.DataBlockHashTableUtilRatio <= 0)
+        {
+            ThrowHelper.InvalidArgument("data_block_hash_table_util_ratio should be greater than 0 when data_block_index_type is set to " +
+                "kDataBlockBinaryAndHash");
+        }
+        if (indexMode is BlockBasedIndexMode.CustomDefault or BlockBasedIndexMode.CustomOnly)
+        {
+            if (t.UserDefinedIndexFactory is null)
+                ThrowHelper.InvalidArgument("index_mode kCustomDefault/kCustomOnly requires user_defined_index_factory");
+            if (indexMode == BlockBasedIndexMode.CustomOnly && t.FormatVersion < 6)
+            {
+                ThrowHelper.InvalidArgument("index_mode kCustomOnly requires format_version >= 6; got " +
+                    t.FormatVersion.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+            if (t.IndexType == IndexType.TwoLevelIndexSearch)
+                ThrowHelper.InvalidArgument("index_mode kCustomDefault/kCustomOnly is incompatible with partitioned index (kTwoLevelIndexSearch).");
+            if (t.PartitionFilters)
+                ThrowHelper.InvalidArgument("index_mode kCustomDefault/kCustomOnly is incompatible with partitioned filters.");
+        }
+    }
+
+    /// <summary>validate_compression_type_fn of BlockBasedTableFactory::ValidateOptions.</summary>
+    private static void ValidateTableCompressionType(Compression.CompressionType type, string context, bool blockAlign)
+    {
+        if (type == Compression.CompressionType.None) return;
+        if (type == Compression.CompressionType.DisableCompressionOption)
+        {
+            if (context == "compression") ThrowHelper.InvalidArgument("kDisableCompressionOption not permitted for option: compression");
+            return;
+        }
+        if (blockAlign) ThrowHelper.InvalidArgument("Enable block_align, but " + context + " enabled");
     }
 
     /// <summary>

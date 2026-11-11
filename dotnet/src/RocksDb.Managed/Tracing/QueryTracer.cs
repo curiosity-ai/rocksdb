@@ -122,14 +122,22 @@ internal sealed class QueryTracer
     }
 
     /// <summary>Tracer::Close: writes the footer and closes the writer.</summary>
-    public void Close()
+    public void Close() => Close(writeFooter: true);
+
+    /// <summary>
+    /// Tracer::~Tracer: releases the writer without a footer (a trace replaced by DBImpl::StartTrace is not ended; only
+    /// DBImpl::EndTrace calls Tracer::Close).
+    /// </summary>
+    public void Abandon() => Close(writeFooter: false);
+
+    private void Close(bool writeFooter)
     {
         lock (_lock)
         {
             if (_closed) return;
             try
             {
-                WriteTrace(TraceFormat.NowMicros(), TraceType.End, default);
+                if (writeFooter) WriteTrace(TraceFormat.NowMicros(), TraceType.End, default);
             }
             finally
             {

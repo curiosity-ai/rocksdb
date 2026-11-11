@@ -281,7 +281,8 @@ public sealed class PropertiesAndStatisticsTests
         StringAssert.Contains(text, "Options.create_if_missing: true");
         StringAssert.Contains(text, "flush_finished");
         StringAssert.Contains(text, "Shutdown complete");
-        Assert.AreEqual(2, OldLogs(fs).Count);
+        // keep_log_file_num counts the current LOG (audit 4: this asserted 2 old files; native keeps keep - 1).
+        Assert.AreEqual(1, OldLogs(fs).Count);
 
         // Size-based rolling (max_log_file_size): headers are replayed into each new file.
         MemoryFileSystem fs2 = NewFs();

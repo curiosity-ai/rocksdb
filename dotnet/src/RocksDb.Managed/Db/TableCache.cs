@@ -366,6 +366,9 @@ internal sealed class TableCache : ITableCache, IDisposable
     /// </summary>
     internal InternalStats? LevelStats { get; set; }
 
+    /// <summary>The column family's num_levels (a reader opened for a file of level num_levels - 1 is a last level reader); 0: unknown.</summary>
+    internal int NumLevels { get; set; }
+
     /// <summary>When set (DBOptions::statistics), table file reads are timed (SST_READ_MICROS, FILE_READ_*_MICROS).</summary>
     internal Statistics? Statistics { get; set; }
 
@@ -494,7 +497,11 @@ internal sealed class TableCache : ITableCache, IDisposable
     {
         string path = TableFilePath(file);
         IRandomAccessFile f = _fs.OpenRandomAccess(path);
-        if (Statistics is { } st) f = new Monitoring.StatisticsRandomAccessFile(f, st, LevelStats?.GetFileReadHist(file.LevelHint));
+        Statistics?.RecordTick(Ticker.NoFileOpens); // TableCache::GetTableReader, after NewRandomAccessFile succeeded
+        if (Statistics is { } st)
+        {
+            f = new Monitoring.StatisticsRandomAccessFile(f, st, LevelStats?.GetFileReadHist(file.LevelHint)) { IsLastLevel = file.LevelHint == NumLevels - 1 };
+        }
         TableReader reader;
         try
         {

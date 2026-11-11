@@ -252,7 +252,11 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
     {
         _started = false;
         _isValid = false;
-        if (_files.Count <= startFileIndex) return;
+        if (_files.Count <= startFileIndex)
+        {
+            StopBeforeRecoveryGap(0, ulong.MaxValue); // WalIteratorImpl::SeekToStartSequence: files_->size() <= start_file_index
+            return;
+        }
         _currentFileIndex = startFileIndex;
         if (!OpenLogReader(_files[startFileIndex])) return;
         while (RestrictedRead(out ReadOnlySpan<byte> record))

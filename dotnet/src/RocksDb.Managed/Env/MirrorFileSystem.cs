@@ -314,10 +314,18 @@ public sealed class MirrorFileSystem : IFileSystem
         public int Read(long offset, Span<byte> destination)
         {
             int na = a.Read(offset, destination);
-            byte[] scratch = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, destination.Length));
+            byte[] scratch = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, na));
             try
             {
-                int nb = b.Read(offset, scratch.AsSpan(0, destination.Length));
+                // RandomAccessFileMirror::Read: the bytes the first file returned are read from the second one, which may
+                // deliver them in several short reads ("while (left)").
+                int nb = 0;
+                while (nb < na)
+                {
+                    int r = b.Read(offset + nb, scratch.AsSpan(nb, na - nb));
+                    if (r <= 0) break;
+                    nb += r;
+                }
                 Compare(offset, destination[..na], scratch.AsSpan(0, nb));
             }
             finally
@@ -330,10 +338,16 @@ public sealed class MirrorFileSystem : IFileSystem
         public async ValueTask<int> ReadAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken = default)
         {
             int na = await a.ReadAsync(offset, destination, cancellationToken).ConfigureAwait(false);
-            byte[] scratch = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, destination.Length));
+            byte[] scratch = RocksArrayPool<byte>.Shared.Rent(Math.Max(1, na));
             try
             {
-                int nb = await b.ReadAsync(offset, scratch.AsMemory(0, destination.Length), cancellationToken).ConfigureAwait(false);
+                int nb = 0;
+                while (nb < na)
+                {
+                    int r = await b.ReadAsync(offset + nb, scratch.AsMemory(nb, na - nb), cancellationToken).ConfigureAwait(false);
+                    if (r <= 0) break;
+                    nb += r;
+                }
                 Compare(offset, destination.Span[..na], scratch.AsSpan(0, nb));
             }
             finally

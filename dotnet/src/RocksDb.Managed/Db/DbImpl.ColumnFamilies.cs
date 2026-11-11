@@ -4,6 +4,13 @@ internal sealed partial class DbImpl
 {
     private readonly SemaphoreSlim _optionsFileLock = new(1, 1);
 
+    /// <summary>
+    /// Set by a transaction DB: PessimisticTransactionDB::CreateColumnFamily / CreateColumnFamilies /
+    /// CreateColumnFamilyWithImport run VerifyCFOptions on the options of a column family created after the open, before
+    /// creating it (the managed transaction DB exposes the RocksDatabase itself, so the check hooks in here).
+    /// </summary>
+    internal Action<ColumnFamilyOptions>? VerifyNewColumnFamilyOptions { get; set; }
+
     /// <summary>Port of DBImpl::CreateColumnFamily(Impl).</summary>
     public async ValueTask<ColumnFamilyData> CreateColumnFamilyAsync(string name, ColumnFamilyOptions options, bool synchronous, CancellationToken ct)
     {
@@ -21,6 +28,7 @@ internal sealed partial class DbImpl
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
         ArgumentNullException.ThrowIfNull(options);
+        VerifyNewColumnFamilyOptions?.Invoke(options);
         ColumnFamilyOptions opts = PrepareCfOptions(options);
         RegisterComparator(opts);
         WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
@@ -32,7 +40,9 @@ internal sealed partial class DbImpl
             lock (_mutex)
             {
                 if (Versions.GetColumnFamily(name) is not null) ThrowHelper.InvalidArgument("Column family already exists");
-                id = Versions.MaxColumnFamily + 1;
+                // ColumnFamilySet::GetNextColumnFamilyID (++max_column_family_): the id is consumed before the MANIFEST
+                // write, so a failed creation does not hand its id to the next column family.
+                id = ++Versions.MaxColumnFamily;
                 logNumber = _logNumber;
             }
             cfd = new ColumnFamilyData(id, name, opts, this);
@@ -77,7 +87,7 @@ internal sealed partial class DbImpl
         WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
         try
         {
-            if (cfd.Dropped) ThrowHelper.InvalidArgument("Column family already dropped!");
+            if (cfd.Dropped) ThrowHelper.InvalidArgument("Column family already dropped!\n");
             var edit = new VersionEdit { ColumnFamily = cfd.Id };
             edit.DropColumnFamily();
             await Versions.LogAndApplyAsync(cfd, edit, synchronous, ct).ConfigureAwait(false);
@@ -103,7 +113,8 @@ internal sealed partial class DbImpl
 
     /// <summary>
     /// Port of DBImpl::WriteOptionsFile + DeleteObsoleteOptionsFiles: persists the DB options and every live CF's
-    /// options to a new OPTIONS-N file and keeps only the two newest OPTIONS files.
+    /// options to a new OPTIONS-N file and keeps only the two newest OPTIONS files (and those a running remote compaction
+    /// may read).
     /// </summary>
     private async ValueTask WriteOptionsFileAsync(bool synchronous, CancellationToken ct)
     {
@@ -124,7 +135,14 @@ internal sealed partial class DbImpl
                 if (FileNames.TryParseFileName(child, out ulong n, out FileType type) && type == FileType.OptionsFile) existing.Add((n, child));
             }
             existing.Sort(static (a, b) => b.Number.CompareTo(a.Number));
-            for (int i = 2; i < existing.Count; i++) TryDeleteFile(DbName + "/" + existing[i].Name);
+            if (existing.Count > 2)
+            {
+                ulong keepFrom = MinOptionsFileNumberToKeep(existing[1].Number);
+                for (int i = 2; i < existing.Count; i++)
+                {
+                    if (existing[i].Number < keepFrom) TryDeleteFile(DbName + "/" + existing[i].Name);
+                }
+            }
         }
         finally
         {

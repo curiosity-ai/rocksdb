@@ -188,13 +188,19 @@ internal sealed class LockTracker
         if (c is null) return UntrackStatus.NotTracked;
         ref TrackedKeyInfo info = ref CollectionsMarshal.GetValueRefOrNullRef(c.Lookup, key);
         if (Unsafe.IsNullRef(ref info)) return UntrackStatus.NotTracked;
-        if (info.NumReads > 0) info.NumReads--;
+        bool untracked = false;
+        if (info.NumReads > 0)
+        {
+            info.NumReads--;
+            untracked = true;
+        }
         if (info.NumReads == 0 && info.NumWrites == 0)
         {
             c.Remove(key);
             return UntrackStatus.Removed;
         }
-        return UntrackStatus.Untracked;
+        // PointLockTracker::Untrack: a key that is only tracked for writes has no read to undo (NOT_TRACKED).
+        return untracked ? UntrackStatus.Untracked : UntrackStatus.NotTracked;
     }
 
     /// <summary>PointLockTracker::Merge: adds the reads and writes tracked by <paramref name="other"/>.</summary>

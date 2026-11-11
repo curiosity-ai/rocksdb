@@ -234,10 +234,13 @@ public sealed class LevelIterator : InternalIterator
     {
         SliceTransform? pe = _prefixSeekExtractor;
         if (pe is null || _fileIter is null || !_fileIter.Valid) return;
-        ReadOnlySpan<byte> targetUserKey = DbFormat.ExtractUserKey(target);
-        ReadOnlySpan<byte> fileUserKey = DbFormat.ExtractUserKey(_fileIter.Key);
+        // The prefix extractor sees user keys without the user-defined timestamp (ExtractUserKeyAndStripTimestamp in
+        // LevelIterator::Seek); the prefixes are compared bytewise (Slice::compare).
+        int tsSize = _icmp.UserComparator.TimestampSize;
+        ReadOnlySpan<byte> targetUserKey = DbFormat.ExtractUserKeyAndStripTimestamp(target, tsSize);
+        ReadOnlySpan<byte> fileUserKey = DbFormat.ExtractUserKeyAndStripTimestamp(_fileIter.Key, tsSize);
         if (pe.InDomain(targetUserKey)
-            && (!pe.InDomain(fileUserKey) || _icmp.CompareUserKey(pe.Transform(targetUserKey), pe.Transform(fileUserKey)) != 0))
+            && (!pe.InDomain(fileUserKey) || !pe.Transform(targetUserKey).SequenceEqual(pe.Transform(fileUserKey))))
         {
             SetFileIterator(null, -1);
         }

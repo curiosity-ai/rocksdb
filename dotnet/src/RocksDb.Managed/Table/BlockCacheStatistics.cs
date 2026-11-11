@@ -37,6 +37,14 @@ public enum BlockCacheCounter
     BloomFilterPrefixUseful = 14,
     /// <summary>NON_LAST_LEVEL_SEEK_FILTERED + LAST_LEVEL_SEEK_FILTERED: table seeks skipped by the prefix filter.</summary>
     SeekFiltered = 15,
+    /// <summary>BLOCK_CACHE_BYTES_READ: charge of the blocks found in the cache (BlockBasedTable::UpdateCacheHitMetrics).</summary>
+    BytesRead = 16,
+    /// <summary>BLOCK_CACHE_DATA_BYTES_INSERT (BlockBasedTable::UpdateCacheInsertionMetrics).</summary>
+    DataBytesInsert = 17,
+    /// <summary>BLOCK_CACHE_INDEX_BYTES_INSERT.</summary>
+    IndexBytesInsert = 18,
+    /// <summary>BLOCK_CACHE_FILTER_BYTES_INSERT.</summary>
+    FilterBytesInsert = 19,
 }
 
 /// <summary>
@@ -47,7 +55,7 @@ public enum BlockCacheCounter
 /// </summary>
 public sealed class BlockCacheStatistics
 {
-    private const int NumCounters = 16;     // 16 * 8 bytes = 128 bytes per stripe (two cache lines, no false sharing)
+    private const int NumCounters = 24;     // 24 * 8 bytes = 192 bytes per stripe (three cache lines, no false sharing)
     private const int NumStripes = 16;       // power of two
     private readonly long[] _counters = new long[NumStripes * NumCounters];
 
@@ -59,6 +67,15 @@ public sealed class BlockCacheStatistics
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void Record(BlockCacheCounter counter) => Add(counter, 1);
+
+    /// <summary>A cache hit of <paramref name="counter"/>'s block kind and the charge of the block found (BLOCK_CACHE_BYTES_READ).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void RecordHit(BlockCacheCounter counter, long charge)
+    {
+        int stripe = Thread.GetCurrentProcessorId() & (NumStripes - 1);
+        Interlocked.Increment(ref _counters[stripe * NumCounters + (int)counter]);
+        Interlocked.Add(ref _counters[stripe * NumCounters + (int)BlockCacheCounter.BytesRead], charge);
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void Add(BlockCacheCounter counter, long delta)

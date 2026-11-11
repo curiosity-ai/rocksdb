@@ -136,7 +136,11 @@ internal sealed partial class VersionStorageInfo
         ComputeCompactionScore();
     }
 
-    /// <summary>Port of the L0 overlap check in VersionStorageInfo::GenerateLevel0NonOverlapping.</summary>
+    /// <summary>
+    /// Port of VersionStorageInfo::GenerateLevel0NonOverlapping: L0 files sorted by smallest key overlap when a file's
+    /// largest INTERNAL key is not before the next file's smallest one. Two files that only share a boundary user key
+    /// (k@9 in one, k@3 in the other) do not overlap; moved to a level &gt; 0 they are adjacent files there.
+    /// </summary>
     private bool ComputeLevel0NonOverlapping()
     {
         FileMetaData[] l0 = _files[0];
@@ -150,7 +154,7 @@ internal sealed partial class VersionStorageInfo
             sorted.Sort(new SmallestKeyComparer(icmp));
             for (int i = 1; i < sorted.Length; i++)
             {
-                if (icmp.CompareUserKey(DbFormat.ExtractUserKey(sorted[i - 1].Largest), DbFormat.ExtractUserKey(sorted[i].Smallest)) >= 0) return false;
+                if (icmp.Compare(sorted[i - 1].Largest, sorted[i].Smallest) >= 0) return false;
             }
             return true;
         }
@@ -737,12 +741,31 @@ internal sealed partial class VersionStorageInfo
         }
     }
 
-    /// <summary>Port of SortFileByOverlappingRatio (TTL boosting not ported).</summary>
+    /// <summary>
+    /// Port of SortFileByOverlappingRatio with FileTtlBooster (db/compaction/file_pri.h): files closer to the TTL limit get
+    /// their overlapping ratio divided by a boost score. No boosting before half of the TTL has passed; the boosting
+    /// range of each level is half of the next one's, and L0 and the last non-empty level are never boosted.
+    /// </summary>
     private void SortFileByOverlappingRatio(int level, FileMetaData[] files, FileMetaData[] nextLevelFiles, int[] temp)
     {
         InternalKeyComparator icmp = Icmp;
         ulong[] order = RocksArrayPool<ulong>.Shared.Rent(files.Length);
         int next = 0;
+        // FileTtlBooster(current_time, ttl, num_non_empty_levels, level)
+        ulong ttl = _options.Ttl;
+        ulong currentTime = (ulong)NowSeconds();
+        bool boostEnabled = !(ttl == 0 || level == 0 || level >= NumNonEmptyLevels - 1);
+        ulong boostAgeStart = 0, boostStep = 1;
+        if (boostEnabled)
+        {
+            ulong allBoostStartAge = ttl / 2;
+            ulong allBoostAgeRange = ttl / 32 * 31 - allBoostStartAge;
+            ulong boostAgeRange = allBoostAgeRange >> Math.Min(63, NumNonEmptyLevels - level - 1);
+            boostAgeStart = allBoostStartAge + boostAgeRange;
+            const ulong BoostRatio = 16;
+            // prevent 0 value to avoid divide 0 error.
+            boostStep = Math.Max(boostAgeRange / BoostRatio, 1UL);
+        }
         for (int i = 0; i < files.Length; i++)
         {
             FileMetaData file = files[i];
@@ -756,24 +779,32 @@ internal sealed partial class VersionStorageInfo
                 next++;
             }
             ulong compensated = Math.Max(1UL, CompensatedFileSize(file));
-            order[i] = overlappingBytes * 1024UL / compensated;
+            // FileTtlBooster::GetBoostScore: boosting is addition to the current value, so +1 (an unknown oldest ancestor
+            // time, 0, counts as the full age like upstream).
+            ulong ttlBoostScore = 1;
+            if (boostEnabled && file.OldestAncestorTime < currentTime)
+            {
+                ulong age = currentTime - file.OldestAncestorTime;
+                if (age > boostAgeStart) ttlBoostScore = (age - boostAgeStart) / boostStep + 1;
+            }
+            order[i] = overlappingBytes * 1024UL / compensated / ttlBoostScore;
         }
         temp.AsSpan().Sort(new OverlappingRatioComparer(files, order, icmp));
         RocksArrayPool<ulong>.Shared.Return(order);
-        _ = level;
     }
 
     /// <summary>Port of SortFileByRoundRobin.</summary>
     private void SortFileByRoundRobin(int level, FileMetaData[] files, int[] temp)
     {
         InternalKeyComparator icmp = Icmp;
-        if (level == 0 && !Level0NonOverlapping)
+        if (level == 0)
         {
-            // Using kOldestSmallestSeqFirst when level === 0, since the files may overlap (not fully sorted).
+            // Using kOldestSmallestSeqFirst when level === 0, since the files may overlap (not fully sorted). Upstream
+            // tests "level == 0 && !level0_non_overlapping", but PrepareForVersionAppend calls UpdateFilesByCompactionPri
+            // before GenerateLevel0NonOverlapping, so the flag is still false here: L0 is always ordered oldest first.
             temp.AsSpan().Sort(new FileIndexComparer(files, FileIndexOrder.OldestSmallestSeqFirst));
             return;
         }
-        if (level == 0) temp.AsSpan().Sort(new IndexBySmallestKeyComparer(files, icmp));
         byte[]? cursor = GetCompactCursor(level);
         if (cursor is null || cursor.Length == 0 || temp.Length <= 1) return;
         // Find the file whose smallest key is >= the cursor.
@@ -823,12 +854,6 @@ internal sealed partial class VersionStorageInfo
             int r = icmp.Compare(fa.Smallest, fb.Smallest);
             return r != 0 ? r : a.CompareTo(b);
         }
-    }
-
-    /// <summary>File indexes by the files' smallest internal key.</summary>
-    private readonly struct IndexBySmallestKeyComparer(FileMetaData[] files, InternalKeyComparator icmp) : IComparer<int>
-    {
-        public int Compare(int a, int b) => icmp.Compare(files[a].Smallest, files[b].Smallest);
     }
 
     /// <summary>Files by smallest internal key.</summary>

@@ -28,7 +28,7 @@ public abstract class CacheReservationManager
     /// Adds <paramref name="incrementalMemoryUsed"/> to the reservation; disposing <paramref name="handle"/> releases it
     /// (MakeCacheReservation). The handle is returned even when the cache refused a placeholder.
     /// </summary>
-    public bool MakeCacheReservation(long incrementalMemoryUsed, out CacheReservationHandle handle)
+    public virtual bool MakeCacheReservation(long incrementalMemoryUsed, out CacheReservationHandle handle)
     {
         bool ok = UpdateCacheReservation(TotalMemoryUsed + incrementalMemoryUsed);
         handle = new CacheReservationHandle(this, incrementalMemoryUsed);
@@ -41,7 +41,7 @@ public abstract class CacheReservationManager
     /// <summary>The memory used that was last reported.</summary>
     public abstract long TotalMemoryUsed { get; }
 
-    internal void ReleaseCacheReservation(long incrementalMemoryUsed) =>
+    internal virtual void ReleaseCacheReservation(long incrementalMemoryUsed) =>
         UpdateCacheReservation(TotalMemoryUsed - Math.Min(incrementalMemoryUsed, TotalMemoryUsed));
 }
 
@@ -158,6 +158,18 @@ public sealed class ConcurrentCacheReservationManager(CacheReservationManager in
     public override bool UpdateCacheReservation(long memoryUsedDelta, bool increase)
     {
         lock (_lock) return _inner.UpdateCacheReservation(memoryUsedDelta, increase);
+    }
+
+    // ConcurrentCacheReservationManager::MakeCacheReservation and ~CacheReservationHandle hold the mutex around the whole
+    // read-modify-write of the memory used (the lock is reentrant: the base implementation calls back into this class).
+    public override bool MakeCacheReservation(long incrementalMemoryUsed, out CacheReservationHandle handle)
+    {
+        lock (_lock) return base.MakeCacheReservation(incrementalMemoryUsed, out handle);
+    }
+
+    internal override void ReleaseCacheReservation(long incrementalMemoryUsed)
+    {
+        lock (_lock) base.ReleaseCacheReservation(incrementalMemoryUsed);
     }
 
     public override long TotalReservedCacheSize => _inner.TotalReservedCacheSize;

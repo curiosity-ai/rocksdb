@@ -136,6 +136,7 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
             partitionedIndex = new PartitionedIndexBuilder(_icmp, options.IndexBlockRestartInterval, options.FormatVersion, _useDeltaEncodingForIndexValues,
                 options.IndexShortening, options.MetadataBlockSize, options.BlockSizeDeviation, useCommonPrefixIndex, useCommonPrefixIndex, _stripTsSize,
                 options.UniformCvThreshold);
+            partitionedIndex.Statistics = tableBuilderOptions.Statistics;
             _indexBuilder = partitionedIndex;
         }
         else if (options.IndexType == IndexType.HashSearch)
@@ -151,7 +152,12 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         {
             _indexBuilder = new ShortenedIndexBuilder(_icmp, options.IndexBlockRestartInterval, options.FormatVersion, _useDeltaEncodingForIndexValues,
                 options.IndexShortening, options.IndexType == IndexType.BinarySearchWithFirstKey, useCommonPrefixIndex, _stripTsSize,
-                options.UniformCvThreshold);
+                options.UniformCvThreshold)
+            {
+                // IndexBuilder::CreateIndexBuilder: kBinarySearch / kBinarySearchWithFirstKey get the statistics (the
+                // hash index's primary builder does not).
+                Statistics = tableBuilderOptions.Statistics,
+            };
         }
         _prefixExtractor = tableBuilderOptions.PrefixExtractor;
         // Port of CreateFilterBlockBuilder: the policy picks the filter implementation from the full building context
@@ -163,6 +169,7 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
             IFilterBitsBuilder bits = policy.CreateBuilder(new FilterBuildingContext(options.FormatVersion, tableBuilderOptions.LevelAtCreation, tableBuilderOptions.IsFlush)
             {
                 OptimizeFiltersForMemory = options.OptimizeFiltersForMemory,
+                CompactionStyle = tableBuilderOptions.CompactionStyle,
             });
             if (options.DetectFilterConstructCorruption) bits = new VerifyingFilterBitsBuilder(bits, policy);
             if (options.PartitionFilters && partitionedIndex is not null)
@@ -641,6 +648,18 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         return samples.ToArray();
     }
 
+    /// <summary>
+    /// CompressAndVerifyBlock, "if (type == kNoCompression)": a block (data or not) stored uncompressed counts in
+    /// NUMBER_BLOCK_COMPRESSION_REJECTED / BYTES_COMPRESSION_REJECTED after a compression attempt, else in
+    /// NUMBER_BLOCK_COMPRESSION_BYPASSED / BYTES_COMPRESSION_BYPASSED.
+    /// </summary>
+    private void RecordUncompressedBlock(bool rejected, int uncompressedSize)
+    {
+        if (_tbo.Statistics is not { } stats) return;
+        stats.RecordTick(rejected ? Ticker.NumberBlockCompressionRejected : Ticker.NumberBlockCompressionBypassed);
+        stats.RecordTick(rejected ? Ticker.BytesCompressionRejected : Ticker.BytesCompressionBypassed, (ulong)uncompressedSize);
+    }
+
     /// <summary>Port of WriteBlock + CompressAndVerifyBlock (compression via the facade, with the ratio check).</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private BlockHandle WriteBlock(ReadOnlySpan<byte> raw, bool isDataBlock) => WriteBlock(raw, isDataBlock, out _);
@@ -649,7 +668,10 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
     private BlockHandle WriteBlock(ReadOnlySpan<byte> raw, bool isDataBlock, out bool skipDeltaEncoding)
     {
         CompressionType type = CompressBlock(raw, isDataBlock, _compressed, out bool rejected);
+        // CompressAndVerifyBlock: a data block stored uncompressed after an attempt is rejected, without one bypassed.
         if (rejected) _props.NumDataBlocksCompressionRejected++;
+        else if (isDataBlock && type == CompressionType.None) _props.NumDataBlocksCompressionBypassed++;
+        if (type == CompressionType.None) RecordUncompressedBlock(rejected, raw.Length);
         BlockHandle h = type == CompressionType.None
             ? WriteMaybeCompressedBlock(raw, type, isDataBlock, out skipDeltaEncoding)
             : WriteMaybeCompressedBlock(_compressed.WrittenSpan, type, isDataBlock, out skipDeltaEncoding);
@@ -1066,6 +1088,19 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
     {
         // WritePropertiesBlock: the policy's Name(), even when it built no filter.
         _props.FilterPolicyName = _options.FilterPolicy?.Name ?? "";
+        // BlockBasedTableBuilder::Rep (block_based_table_builder.cc): files written into the LSM (flush, compaction,
+        // recovery) record LsmInfoAtCreation::Applicable(level, is_bottommost), SstFileWriter files NotApplicable.
+        // LsmInfoAtCreation::Encode: bits 0..7 level (0xff unknown / out of range), bits 8..9 state (1 not
+        // bottommost, 2 bottommost, 3 not applicable).
+        if (_tbo.ExternalSstFile)
+        {
+            _props.LsmInfoAtCreation = 3UL << 8;
+        }
+        else
+        {
+            ulong levelField = _tbo.LevelAtCreation is >= 0 and < 0xff ? (ulong)_tbo.LevelAtCreation : 0xffUL;
+            _props.LsmInfoAtCreation = levelField | ((_tbo.IsBottommost ? 2UL : 1UL) << 8);
+        }
         _props.ComparatorName = _ucmp.Name;
         _props.MergeOperatorName = _tbo.MergeOperatorName;
         _props.PrefixExtractorName = _tbo.PrefixExtractorName;

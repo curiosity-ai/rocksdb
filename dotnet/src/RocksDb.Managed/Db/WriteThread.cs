@@ -277,9 +277,17 @@ internal sealed class WriteThread
     {
         w.Owner = this;
         bool linkedAsLeader;
+        bool stalled = false;
         lock (_lock)
         {
-            if (!_leaderActive)
+            if (_writeStalled && w.NoSlowdown)
+            {
+                // LinkOne: the queue is behind the write stall barrier (write_stall_dummy_); a no_slowdown writer fails
+                // instead of waiting for the stall to clear.
+                stalled = true;
+                linkedAsLeader = false;
+            }
+            else if (!_leaderActive)
             {
                 Debug.Assert(_head is null);
                 _leaderActive = true;
@@ -297,9 +305,74 @@ internal sealed class WriteThread
                 linkedAsLeader = false;
             }
         }
+        if (stalled)
+        {
+            w.Error = NewWriteStallError();
+            w.Complete(StateCompleted);
+        }
         // CheckWriteEnqueuedCallback (after LinkOne, before waiting).
         w.UserCallback?.OnWriteEnqueued();
         return linkedAsLeader;
+    }
+
+    // ---- write stall barrier (BeginWriteStall / EndWriteStall, write_stall_dummy_) -------------------------------
+
+    /// <summary>Set between <see cref="BeginWriteStall"/> and <see cref="EndWriteStall"/>. Guarded by <c>_lock</c>.</summary>
+    private bool _writeStalled;
+
+    private static RocksDbException NewWriteStallError() => new(StatusCode.Incomplete, "Incomplete: Write stall");
+
+    /// <summary>
+    /// Port of WriteThread::BeginWriteStall: called by the leader before it blocks on a write stall (DBImpl::DelayWrite,
+    /// WriteBufferManagerStallWrites). Sets up the barrier and fails the queued writers with no_slowdown with Incomplete
+    /// "Write stall"; until <see cref="EndWriteStall"/>, <see cref="JoinBatchGroup"/> fails new no_slowdown writers the
+    /// same way. The other writers keep waiting in the queue (upstream parks them on stall_cv_ in LinkOne; they cannot
+    /// make progress before the stalled leader either way). The writers of the leader's own group are not in the queue
+    /// (a group never mixes no_slowdown with other writers).
+    /// </summary>
+    public void BeginWriteStall()
+    {
+        Writer? failed = null, failedTail = null;
+        lock (_lock)
+        {
+            _writeStalled = true;
+            Writer? prev = null;
+            Writer? w = _head;
+            while (w is not null)
+            {
+                Writer? next = w.Next;
+                if (w.NoSlowdown)
+                {
+                    if (prev is null) _head = next;
+                    else prev.Next = next;
+                    if (ReferenceEquals(w, _tail)) _tail = prev;
+                    w.Next = null;
+                    if (failedTail is null) failed = w;
+                    else failedTail.Next = w;
+                    failedTail = w;
+                }
+                else
+                {
+                    prev = w;
+                }
+                w = next;
+            }
+        }
+        while (failed is not null)
+        {
+            // Read the link first: once completed, the writer belongs to its caller again (and may be pooled).
+            Writer? next = failed.Next;
+            failed.Next = null;
+            failed.Error = NewWriteStallError();
+            failed.Complete(StateCompleted);
+            failed = next;
+        }
+    }
+
+    /// <summary>Port of WriteThread::EndWriteStall: removes the barrier.</summary>
+    public void EndWriteStall()
+    {
+        lock (_lock) _writeStalled = false;
     }
 
     /// <summary>

@@ -51,9 +51,18 @@ public sealed class CuckooTableReader : TableReader
         _cuckooBlockSize = Coding.DecodeFixed32(Get(user, CuckooTablePropertyNames.CuckooBlockSize, 4, "Cuckoo block size not found"));
         if (_unusedKey.Length != _keyLength || (props.NumEntries > 0 && _userKeyLength + (_isLastLevel ? 0u : 8u) != _keyLength))
             ThrowHelper.Corruption("Inconsistent cuckoo table key lengths");
-        ulong numBuckets = _tableSize + _cuckooBlockSize - 1;
-        if (props.NumEntries > 0 && (_tableSize == 0 || numBuckets * _bucketLength > props.DataSize || props.DataSize > (ulong)data.Length))
-            ThrowHelper.Corruption("Cuckoo table hash table size does not match the data size");
+        if (props.NumEntries > 0)
+        {
+            // bucket_length_ and the bucket count (table_size_ + cuckoo_block_size_ - 1) are computed in 32 / 64 bits
+            // upstream; values for which they wrap around describe a table the file cannot hold.
+            ulong bucketLength = (ulong)_keyLength + _valueLength;
+            ulong numBuckets = _tableSize + _cuckooBlockSize - 1;
+            if (_tableSize == 0 || _cuckooBlockSize == 0 || numBuckets < _tableSize || bucketLength > uint.MaxValue
+                || props.DataSize > (ulong)data.Length || (bucketLength != 0 && numBuckets > props.DataSize / bucketLength))
+            {
+                ThrowHelper.Corruption("Cuckoo table hash table size does not match the data size");
+            }
+        }
     }
 
     private static byte[] Get(Dictionary<string, byte[]> user, string name, int minLength, string missing)

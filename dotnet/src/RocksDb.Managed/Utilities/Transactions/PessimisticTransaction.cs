@@ -78,6 +78,7 @@ internal class PessimisticTransaction : Transaction
         _commitTimestamp = MaxTimestamp;
         // TransactionBaseImpl::Reinitialize: start_time_ and indexing_enabled_.
         _startTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+        SetMaxWriteBatchSize(options.MaxWriteBatchSize);
         EnableIndexing();
         _batch.Batch.TrackTimestampSize = options.WriteBatchTrackTimestampSize;
         if (options.SetSnapshot) SetSnapshot();
@@ -259,6 +260,25 @@ internal class PessimisticTransaction : Transaction
         if (_commitTimestamp == MaxTimestamp) throw Invalid("Must assign a commit timestamp");
         return AssignCommitTimestampToBatch();
     }
+
+    /// <summary>
+    /// WriteCommittedTxn::CommitWithoutPrepareInternal / CommitInternal: "if (snapshot_needed_) { if (commit_timestamp_
+    /// == kMaxTxnTimestamp) return Status::InvalidArgument("Must set transaction commit timestamp"); ... }". A snapshot
+    /// requested with SetSnapshotOnNextOperation and still pending at commit is created by the commit as a timestamped
+    /// snapshot, which needs the commit timestamp. Only this error is ported: timestamped snapshots are not, so with a
+    /// commit timestamp the transaction commits and takes no snapshot. WritePrepared / WriteUnprepared commits do not
+    /// look at the pending request (upstream neither).
+    /// </summary>
+    private void CheckPendingSnapshotRequest()
+    {
+        if (CommitChecksPendingSnapshotRequest && SnapshotNeeded && _commitTimestamp == MaxTimestamp)
+        {
+            throw Invalid("Must set transaction commit timestamp");
+        }
+    }
+
+    /// <summary>True for WriteCommitted transactions (see <see cref="CheckPendingSnapshotRequest"/>).</summary>
+    private protected virtual bool CommitChecksPendingSnapshotRequest => true;
 
     // Separate from AssignCommitTimestamp: the closure below is allocated on entry to the scope that declares the
     // variables it captures, which would otherwise be every commit.
@@ -562,6 +582,7 @@ internal class PessimisticTransaction : Transaction
             {
                 if (_commitTimeBatch is { Count: > 0 }) throw Invalid("Commit-time batch contains values that will not be committed.");
                 AssignCommitTimestamp();
+                CheckPendingSnapshotRequest();
             }
             catch
             {
@@ -633,6 +654,7 @@ internal class PessimisticTransaction : Transaction
     private protected virtual async ValueTask CommitInternalAsync(bool synchronous, CancellationToken cancellationToken)
     {
         byte[]? commitTs = AssignCommitTimestamp();
+        CheckPendingSnapshotRequest();
         // We take the commit-time batch and append the Commit marker. The Memtable will ignore the Commit marker in
         // non-recovery mode.
         WriteBatch marker = WorkingCommitBatch();

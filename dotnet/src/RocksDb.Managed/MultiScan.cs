@@ -88,6 +88,18 @@ public sealed class MultiScan : IDisposable
                 ThrowHelper.InvalidArgument("Scan start key is large or equal than limit at index " + i);
             }
         }
+        // DBIter::ValidateScanOptions, which upstream's MultiScan runs through Iterator::Prepare unless the ranges mix
+        // bounded and unbounded ones (the slow path skips Prepare): only the first of several ranges may be unbounded
+        // (so several unbounded ranges are rejected), and the ranges must be in order and must not overlap.
+        if (MixedBounds(args.Ranges)) return;
+        if (args.Ranges[0].Limit is null && args.Ranges.Count > 1) ThrowHelper.InvalidArgument("Scan has no upper bound");
+        for (int i = 1; i < args.Ranges.Count; i++)
+        {
+            if (cfd.UserComparator.Compare(args.Ranges[i].Start.Span, args.Ranges[i - 1].Limit!.Value.Span) < 0)
+            {
+                ThrowHelper.InvalidArgument("Overlapping ranges at index " + i);
+            }
+        }
     }
 
     /// <summary>Mixed bounded and unbounded ranges take upstream's slow path without Prepare.</summary>

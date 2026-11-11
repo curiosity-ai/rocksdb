@@ -51,8 +51,18 @@ internal sealed partial class DbImpl
                 if (_manualCompactionsRunning == 0 || IsDisposed) return;
                 wait = _bgSignal.Task;
             }
-            if (synchronous) wait.Wait(ct);
-            else await wait.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                if (synchronous) wait.Wait(ct);
+                else await wait.WaitAsync(ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                // The caller gets no chance to call EnableManualCompaction for a disable that failed: undo it here
+                // (the manual compactions canceled above stay canceled).
+                EnableManualCompaction();
+                throw;
+            }
         }
     }
 

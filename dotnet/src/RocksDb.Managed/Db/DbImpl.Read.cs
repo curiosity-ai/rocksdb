@@ -239,6 +239,7 @@ internal sealed partial class DbImpl
         ctx.TimestampSize = cfd.TimestampSize;
         ctx.ReadSequence = snapshot;
         ctx.ReadFlags = TableReadFlagsExtensions.FromReadOptions(options);
+        ctx.IgnoreRangeDeletions = options is not null && options.IgnoreRangeDeletions;
         Span<byte> scratch = stackalloc byte[LookupKey.StackBufferSize];
         var lkey = new LookupKey(key, snapshot, ts, scratch);
         try
@@ -303,7 +304,8 @@ internal sealed partial class DbImpl
         ReadCallback? cb = ctx.Callback;
         int operands = ctx.MergeContext.Count;
         PerfContext.Add(PerfMetric.GetFromMemtableCount, 1); // MemTable::Get, once per memtable searched
-        MemTableGetResult r = sv.Mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb);
+        bool noRangeDel = ctx.IgnoreRangeDeletions;
+        MemTableGetResult r = sv.Mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb, noRangeDel);
         // GetMergeOperands with continue_cb: the callback may end the lookup at an operand of this memtable.
         if (ctx.ContinueCallback is not null && ctx.ApplyContinueCallback(operands)) return true;
         if (ctx.ApplyMemTableResult(r, v, t)) return true;
@@ -312,7 +314,7 @@ internal sealed partial class DbImpl
         {
             operands = ctx.MergeContext.Count;
             PerfContext.Add(PerfMetric.GetFromMemtableCount, 1);
-            r = imm[i].Get(lkey, out v, out t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb);
+            r = imm[i].Get(lkey, out v, out t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb, noRangeDel);
             if (ctx.ContinueCallback is not null && ctx.ApplyContinueCallback(operands)) return true;
             if (ctx.ApplyMemTableResult(r, v, t)) return true;
         }
@@ -508,7 +510,7 @@ internal sealed partial class DbImpl
         TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels, ctx.ReadFlags);
         try
         {
-            if (rangeDels is not null)
+            if (rangeDels is not null && !ctx.IgnoreRangeDeletions)
             {
                 // With user-defined timestamps the user key carries the read timestamp: it bounds the visible tombstones.
                 int tsSize = ctx.TimestampSize;
@@ -558,9 +560,12 @@ internal sealed partial class DbImpl
         // The super version is referenced BEFORE the read sequence is taken (GetImpl): otherwise a flush + compaction
         // in between could drop the versions visible at that sequence (no snapshot protects them).
         ValidateReadSnapshot(options);
+        // GetImpl: FailIfTsMismatchCf, a read timestamp on a column family without timestamps is InvalidArgument.
+        GetReadTimestamp(cfd, options);
         SuperVersion sv = GetAndRefSuperVersion(cfd, out int svSlot);
         ulong snapshot = ReadSequence(options);
         ctx.ReadFlags = TableReadFlagsExtensions.FromReadOptions(options);
+        ctx.IgnoreRangeDeletions = options is not null && options.IgnoreRangeDeletions;
         PooledBufferWriter ikeyBuf = ObjectPools.RentWriter();
         try
         {
@@ -727,6 +732,7 @@ internal sealed partial class DbImpl
         ctx.TimestampSize = cfd.TimestampSize;
         ctx.ReadSequence = snapshot;
         ctx.ReadFlags = TableReadFlagsExtensions.FromReadOptions(options);
+        ctx.IgnoreRangeDeletions = options is not null && options.IgnoreRangeDeletions;
         Span<byte> scratch = stackalloc byte[LookupKey.StackBufferSize];
         var lkey = new LookupKey(key, snapshot, ts, scratch);
         try
@@ -770,7 +776,7 @@ internal sealed partial class DbImpl
 
     private static void ApplyFileRangeTombstones(FragmentedRangeTombstoneList? rangeDels, ReadOnlySpan<byte> userKey, ulong snapshot, GetContext ctx)
     {
-        if (rangeDels is null) return;
+        if (rangeDels is null || ctx.IgnoreRangeDeletions) return;
         int tsSize = ctx.TimestampSize;
         ulong cov = rangeDels.MaxCoveringTombstoneSeqnum(userKey, snapshot, tsSize == 0 ? default : userKey[^tsSize..], out ReadOnlySpan<byte> tombstoneTs);
         if (cov > ctx.MaxCoveringTombstoneSeq)
@@ -812,7 +818,7 @@ internal sealed partial class DbImpl
         ValueTask<TableGetResult> pending;
         try
         {
-            if (rangeDels is not null)
+            if (rangeDels is not null && !ctx.IgnoreRangeDeletions)
             {
                 ulong cov = rangeDels.MaxCoveringTombstoneSeqnum(userKey.Span, snapshot);
                 if (cov > ctx.MaxCoveringTombstoneSeq) ctx.MaxCoveringTombstoneSeq = cov;

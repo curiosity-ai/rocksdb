@@ -99,7 +99,7 @@ public sealed class SstFileReader : IDisposable
         GetContext ctx = GetContext.Rent(_options.MergeOperator);
         try
         {
-            return Lookup(options, key, ctx) ? ctx.Value.WrittenSpan.ToArray() : null;
+            return Lookup(options, key, ctx, DbFormat.MaxSequenceNumber) ? ctx.Value.WrittenSpan.ToArray() : null;
         }
         finally
         {
@@ -116,6 +116,8 @@ public sealed class SstFileReader : IDisposable
         ArgumentNullException.ThrowIfNull(batch);
         Comparator ucmp = Reader.InternalComparator.UserComparator;
         batch.BeginExternalRun(ucmp);
+        // SstFileReader::Rep::MultiGet looks the keys up as of the snapshot (Get always reads the latest version).
+        ulong sequence = options?.Snapshot is { } snap ? snap.SequenceNumber : DbFormat.MaxSequenceNumber;
         GetContext ctx = GetContext.Rent(_options.MergeOperator);
         try
         {
@@ -124,7 +126,7 @@ public sealed class SstFileReader : IDisposable
                 ctx.Reset(_options.MergeOperator);
                 try
                 {
-                    bool found = Lookup(options, batch.UserKey(k), ctx);
+                    bool found = Lookup(options, batch.UserKey(k), ctx, sequence);
                     batch.SetExternalResult(k, found, found ? ctx.Value.WrittenSpan : default);
                 }
                 catch (RocksDbException e)
@@ -142,13 +144,16 @@ public sealed class SstFileReader : IDisposable
     private static readonly TableEntryVisitor<GetContext> s_saveValue =
         static (ref GetContext ctx, ReadOnlySpan<byte> k, ReadOnlySpan<byte> v) => ctx.SaveValue(k, v);
 
-    /// <summary>SstFileReader::Rep::Get: table Get at kMaxSequenceNumber, then the final GetContext state.</summary>
+    /// <summary>
+    /// SstFileReader::Rep::Get / MultiGet: table Get at <paramref name="sequence"/> (kMaxSequenceNumber for Get, the
+    /// snapshot's sequence number for MultiGet), then the final GetContext state.
+    /// </summary>
     [System.Runtime.CompilerServices.SkipLocalsInit]
-    private bool Lookup(ReadOptions? options, ReadOnlySpan<byte> key, GetContext ctx)
+    private bool Lookup(ReadOptions? options, ReadOnlySpan<byte> key, GetContext ctx, ulong sequence)
     {
         TableReader r = Reader;
         Span<byte> scratch = stackalloc byte[LookupKey.StackBufferSize];
-        var lkey = new LookupKey(key, DbFormat.MaxSequenceNumber, scratch);
+        var lkey = new LookupKey(key, sequence, scratch);
         try
         {
             r.Get(lkey.InternalKey, ref ctx, s_saveValue, TableReadFlagsExtensions.FromReadOptions(options));

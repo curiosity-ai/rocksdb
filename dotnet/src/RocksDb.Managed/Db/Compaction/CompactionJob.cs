@@ -80,6 +80,13 @@ internal sealed class CompactionJob
     /// </summary>
     internal ulong EarliestWriteConflictSnapshot { get; init; } = DbFormat.MaxSequenceNumber;
 
+    /// <summary>
+    /// preserve_time_min_seqno_floor_ of a remote worker's job (CompactionServiceInput::preserve_time_min_seqno_floor):
+    /// sequence numbers below it may be zeroed even when the input files' own seqno-to-time mappings say otherwise.
+    /// 0 = none. A local bottommost-file compaction takes it from its input version instead (PrepareTimes).
+    /// </summary>
+    internal ulong PreserveTimeMinSeqnoFloor { get; init; }
+
     public CompactionJob(DbImpl db, ColumnFamilyData cfd, Compaction compaction, ulong[] snapshots, Func<ulong> newFileNumber,
         CancellationToken cancellation)
         : this(db, cfd, compaction, snapshots, newFileNumber, cancellation, null, null, 0)
@@ -91,8 +98,12 @@ internal sealed class CompactionJob
     /// worker running one subcompaction of the primary (CompactionServiceInput begin / end).
     /// </summary>
     internal static CompactionJob ForRange(DbImpl db, ColumnFamilyData cfd, Compaction compaction, ulong[] snapshots, Func<ulong> newFileNumber,
-        CancellationToken cancellation, byte[]? start, byte[]? end, string outputDirectory) =>
-        new(db, cfd, compaction, snapshots, newFileNumber, cancellation, start, end, 0) { OutputDirectory = outputDirectory };
+        CancellationToken cancellation, byte[]? start, byte[]? end, string outputDirectory, ulong preserveTimeMinSeqnoFloor) =>
+        new(db, cfd, compaction, snapshots, newFileNumber, cancellation, start, end, 0)
+        {
+            OutputDirectory = outputDirectory,
+            PreserveTimeMinSeqnoFloor = preserveTimeMinSeqnoFloor,
+        };
 
     /// <summary>
     /// Directory the output tables are written to instead of the DB paths (CompactionServiceCompactionJob::output_path_
@@ -134,6 +145,23 @@ internal sealed class CompactionJob
 
     /// <summary>SubcompactionState::sub_job_id (0 for the first or only subcompaction).</summary>
     internal int SubJobId { get; }
+
+    /// <summary>
+    /// The bytes the job's threads read from table files (IOSTATS(bytes_read) of the compaction threads, the source of
+    /// COMPACT_READ_BYTES); shared with the subcompactions.
+    /// </summary>
+    internal Monitoring.JobIoCounter IoCounter { get; init; } = new();
+
+    /// <summary>CompactionJob::job_id_ (the job id of the table file creation events of outputs that are not kept).</summary>
+    internal int JobId { get; init; }
+
+    /// <summary>
+    /// Called once with (proximal_after_seqno_, preserve_seqno_after_) when CompactionJob::Prepare has computed them,
+    /// before any input is processed (CompactionJob::LogCompaction reads them for the compaction_started event).
+    /// </summary>
+    internal Action<ulong, ulong>? OnTimesPrepared { get; init; }
+
+    private bool _timesPrepared;
 
     /// <summary>
     /// The output files of one output level (CompactionOutputs, db/compaction/compaction_outputs.{h,cc}): the open file
@@ -502,6 +530,12 @@ internal sealed class CompactionJob
     /// </summary>
     public async ValueTask RunAsync(bool synchronous)
     {
+        if (OnTimesPrepared is { } onTimesPrepared)
+        {
+            PrepareTimes();
+            _timesPrepared = true;
+            onTimesPrepared(_proximalAfterSeqno, _preserveSeqnoAfter);
+        }
         List<byte[]> boundaries = SubJobId == 0 && _subStart is null && _subEnd is null && ShouldFormSubcompactions(_c, MaxSubcompactions)
             ? GenSubcompactionBoundaries()
             : [];
@@ -520,7 +554,10 @@ internal sealed class CompactionJob
                 SnapshotChecker = SnapshotChecker,
                 JobSnapshot = JobSnapshot,
                 EarliestWriteConflictSnapshot = EarliestWriteConflictSnapshot,
+                PreserveTimeMinSeqnoFloor = PreserveTimeMinSeqnoFloor,
                 OutputDirectory = OutputDirectory,
+                JobId = JobId,
+                IoCounter = IoCounter,
             });
         }
         _db.Stats?.RecordInHistogram(Histogram.NumSubcompactionsScheduled, (ulong)_subcompactions.Count);
@@ -531,7 +568,20 @@ internal sealed class CompactionJob
             var others = new Task[_subcompactions.Count - 1];
             for (int i = 1; i < _subcompactions.Count; i++)
             {
-                others[i - 1] = BackgroundThreadPool.Low.Run(static s => ((CompactionJob)s!).RunSubcompactionAsync(synchronous: true).AsTask().GetAwaiter().GetResult(),
+                others[i - 1] = BackgroundThreadPool.Low.Run(static s =>
+                    {
+                        var sub = (CompactionJob)s!;
+                        // The subcompaction thread's reads count for the job (IOSTATS of each compaction thread).
+                        Monitoring.JobIoCounter? previous = Monitoring.JobIoCounter.Enter(sub.IoCounter);
+                        try
+                        {
+                            sub.RunSubcompactionAsync(synchronous: true).AsTask().GetAwaiter().GetResult();
+                        }
+                        finally
+                        {
+                            Monitoring.JobIoCounter.Exit(previous);
+                        }
+                    },
                     _subcompactions[i]);
             }
             Exception? first = null;
@@ -787,7 +837,12 @@ internal sealed class CompactionJob
                 }
                 AddToOutput(iter);
             }
+            // The iterator's counters plus the range tombstone counters of the outputs finished during the loop
+            // (FinishCompactionOutputFile -> RecordDroppedKeys(range_del_out_stats) per output file).
+            CompactionIterationStats rangeDelOutStats = Stats.IterStats;
             Stats.IterStats = iter.Stats;
+            Stats.IterStats.NumRangeDelDropObsolete += rangeDelOutStats.NumRangeDelDropObsolete;
+            Stats.IterStats.NumRecordDropObsolete += rangeDelOutStats.NumRecordDropObsolete;
             Stats.NumInputRecords = iter.Stats.NumInputRecords;
             // SubcompactionState::CloseCompactionFiles: the output level's outputs, then the proximal level's.
             for (int g = 0; g < 2; g++)
@@ -799,6 +854,14 @@ internal sealed class CompactionJob
                 {
                     // Only range tombstones: they still need an output file.
                     OpenOutput();
+                }
+                else if (_out.Builder is null && _outputTombstones is not null && _out.FirstOutput)
+                {
+                    // CompactionOutputs::CloseOutput opens a file for a subcompaction with range tombstones only, and
+                    // AddRangeDels counts the ones it drops; no file is needed here, but the drops are counted. Upstream
+                    // then finds the file empty and reports its creation as "(nil)", Aborted("Empty SST file not kept").
+                    CountDroppedRangeDelsWithoutOutput();
+                    _db.NotifyOnEmptyTableFile(_cfd, JobId, 0, TableFileCreationReason.Compaction); // compaction_job.cc:2428-2445: a default FileDescriptor
                 }
                 if (_out.Builder is not null) await FinishOutputAsync(ReadOnlySpan<byte>.Empty, synchronous).ConfigureAwait(false);
             }
@@ -815,6 +878,14 @@ internal sealed class CompactionJob
             _blobGarbageMeter?.AddGarbageTo(BlobFileGarbages);
             VerifyOutputFiles(_lastLevelOutputs);
             if (_proximalOutputs is not null) VerifyOutputFiles(_proximalOutputs);
+        }
+        catch (Exception e)
+        {
+            // SubcompactionState::CloseCompactionFiles -> FinishCompactionOutputFile(input_status): the output that was
+            // open when the input failed is reported (EVENT_LOG and OnTableFileCreated) with that status.
+            NotifyOutputNotKept(_lastLevelOutputs, e);
+            if (_proximalOutputs is not null) NotifyOutputNotKept(_proximalOutputs, e);
+            throw;
         }
         finally
         {
@@ -933,6 +1004,7 @@ internal sealed class CompactionJob
     /// </summary>
     private void PrepareTimes()
     {
+        if (_timesPrepared) return; // already done for the compaction_started event (OnTimesPrepared)
         ulong preserveTimeMinSeqno = DbFormat.MaxSequenceNumber;
         ulong precludeLastLevelMinSeqno = DbFormat.MaxSequenceNumber;
         ColumnFamilyOptions o = _c.Options;
@@ -969,6 +1041,14 @@ internal sealed class CompactionJob
         if (preserveTimeDuration > 0 && TestPrecludeLastLevelMinSeqno is { } forced) precludeLastLevelMinSeqno = forced(precludeLastLevelMinSeqno);
         // Restore the invariant preserve_time_min_seqno <= preclude_last_level_min_seqno (test override).
         preserveTimeMinSeqno = Math.Min(precludeLastLevelMinSeqno, preserveTimeMinSeqno);
+        // CompactionJob::Prepare: a bottommost-file compaction exists only because the marker
+        // (ComputeBottommostFilesMarkedForCompaction) decided the file's largest seqno could be zeroed. The marker reads
+        // the DB-wide mapping, the value above only the input files' persisted mappings (sparse or empty for a file
+        // written before preserve / preclude was enabled): honor the version's boundary so the marked file makes progress
+        // instead of being re-marked forever. A remote worker gets the boundary from the primary.
+        ulong floor = PreserveTimeMinSeqnoFloor;
+        if (_c.Reason == CompactionReason.BottommostFiles) floor = _c.InputStorage.PreserveTimeMinSeqno;
+        preserveTimeMinSeqno = Math.Max(preserveTimeMinSeqno, floor);
         // Preserve sequence numbers for preserved write times and snapshots, though the specific sequence number of the
         // earliest snapshot can be zeroed.
         _preserveSeqnoAfter = Math.Min(Math.Max(preserveTimeMinSeqno, 1UL) - 1, _earliestSnapshot);
@@ -1048,6 +1128,45 @@ internal sealed class CompactionJob
     }
 
     /// <summary>
+    /// The statistics of AddRangeDels for an output group that gets no file because every tombstone is dropped at the
+    /// bottommost level (<see cref="AllTombstonesDroppable"/>): each tombstone AddRangeDels would visit for the
+    /// subcompaction's only (never opened) output counts in num_range_del_drop_obsolete and num_record_drop_obsolete.
+    /// </summary>
+    private void CountDroppedRangeDelsWithoutOutput()
+    {
+        FragmentedRangeTombstoneList t = _outputTombstones!;
+        int tsSize = t.TimestampSize;
+        byte[]? lowerBound = _subStart is null ? null : BoundaryKey(_subStart, EntryType.RangeDeletion);
+        byte[]? upperBound = _subEnd is null ? null : BoundaryKey(_subEnd, EntryType.RangeDeletion);
+        if (lowerBound is not null && upperBound is not null && _icmp.Compare(lowerBound, upperBound) > 0) return;
+        for (int i = 0; i < t.Count; i++)
+        {
+            ReadOnlySpan<byte> fStart = t.GetStart(i);
+            if (lowerBound is not null && _icmp.Compare(lowerBound, t.GetEnd(i), DbFormat.MaxSequenceNumber, EntryType.RangeDeletion) >= 0) continue;
+            ulong prevKeptStripe = ulong.MaxValue;
+            ReadOnlySpan<ulong> seqs = t.GetSequences(i);
+            for (int k = 0; k < seqs.Length; k++)
+            {
+                ulong seq = seqs[k];
+                if (tsSize == 0)
+                {
+                    ulong stripe = StripeOf(seq);
+                    if (stripe == prevKeptStripe) continue;
+                    prevKeptStripe = stripe;
+                }
+                if (_proximalOutputs is not null)
+                {
+                    ulong split = _proximalAfterSeqno < DbFormat.MaxSequenceNumber ? _proximalAfterSeqno + 1 : _proximalAfterSeqno;
+                    if (_out.IsProximalLevel ? seq < split : seq >= split) continue;
+                }
+                if (tsSize == 0 && upperBound is not null && _icmp.Compare(upperBound, fStart, seq, EntryType.RangeDeletion) < 0) return;
+                Stats.IterStats.NumRangeDelDropObsolete++;
+                Stats.IterStats.NumRecordDropObsolete++;
+            }
+        }
+    }
+
+    /// <summary>
     /// consider_drop of AddRangeDels: the tombstone is visible to no snapshot and, with user-defined timestamps, its
     /// timestamp is below full_history_ts_low.
     /// </summary>
@@ -1081,6 +1200,7 @@ internal sealed class CompactionJob
             new TableFileLevel(_c.OutputLevel, Math.Max(1, vs.BaseLevel), IsFlush: false, IsBottommost: bottommostCompression)) with
         {
             ColumnFamilyId = _cfd.Id,
+            Statistics = _db.Stats,
             IsBottommost = _c.BottommostLevel,
             ColumnFamilyName = _cfd.Name,
             FileNumber = fileNumber,
@@ -1099,6 +1219,12 @@ internal sealed class CompactionJob
             // GetCompressionType / GetCompressionOptions with enable_compression = false.
             tbo = tbo with { CompressionType = Compression.CompressionType.None, CompressionOptions = _cfd.Options.CompressionOpts };
         }
+        else if (tbo.CompressionType != _c.OutputCompression)
+        {
+            // The builder uses Compaction::output_compression(): the picker's choice (CompactFiles'
+            // CompactionOptions::compression, FIFO's plain `compression`), not the level's default.
+            tbo = tbo with { CompressionType = _c.OutputCompression };
+        }
         _out.Meta = new FileMetaData
         {
             FileNumber = fileNumber,
@@ -1113,7 +1239,17 @@ internal sealed class CompactionJob
         };
         // Compaction outputs (of every subcompaction and of the proximal level) are charged to the DB's rate limiter at IO_LOW.
         WritableFileOptions fileOptions = _db.TableFileWriteOptions(IoPriority.Low);
-        _out.File = FileChecksumHelper.CreateWritable(_db.FileSystem, _out.Path, fileOptions);
+        try
+        {
+            _out.File = FileChecksumHelper.CreateWritable(_db.FileSystem, _out.Path, fileOptions);
+        }
+        catch (Exception e) when (e is IOException or RocksDbException)
+        {
+            // CompactionJob::OpenCompactionOutputFile: "fails at NewWritableFile": the creation event of the file that
+            // could not be created (an empty FileDescriptor: file number 0) with the failure.
+            _db.NotifyOnTableFileNotKept(_cfd, JobId, _out.Path, 0, TableFileCreationReason.Compaction, e);
+            throw;
+        }
         _out.Builder = TableBuilder.Create(_out.File, _cfd.Format, tbo);
         _out.HasPointKey = false;
         _out.LargestKey.Clear();
@@ -1160,6 +1296,13 @@ internal sealed class CompactionJob
     /// file and records its metadata. <paramref name="nextTableMinKey"/> is the first key of the next output (empty
     /// for the last output).
     /// </summary>
+    /// <summary>The creation event of the output of <paramref name="group"/> that is still open when the job fails.</summary>
+    private void NotifyOutputNotKept(OutputGroup group, Exception failure)
+    {
+        if (group.Builder is null || group.Path is null) return;
+        _db.NotifyOnTableFileCreated(_cfd, JobId, group.Path, 0, TableFileCreationReason.Compaction, failure, null);
+    }
+
     private ValueTask FinishOutputAsync(ReadOnlySpan<byte> nextTableMinKey, bool synchronous)
     {
         // Copy the (once per output file) cut key so it can cross the await.
@@ -1177,6 +1320,7 @@ internal sealed class CompactionJob
         _out.Builder = null;
         _out.File = null;
         bool keep = false;
+        string outputPath = _out.Path!;
         try
         {
             if (builder.IsEmpty && meta.Smallest.Length == 0)
@@ -1218,6 +1362,12 @@ internal sealed class CompactionJob
                 keep = true;
             }
         }
+        catch (Exception e)
+        {
+            // FinishCompactionOutputFile: LogAndNotifyTableFileCreationFinished with the failure.
+            _db.NotifyOnTableFileCreated(_cfd, JobId, outputPath, 0, TableFileCreationReason.Compaction, e, null);
+            throw;
+        }
         finally
         {
             builder.Dispose();
@@ -1231,7 +1381,13 @@ internal sealed class CompactionJob
             }
         }
         _out.FirstOutput = false;
-        if (!keep) return;
+        if (!keep)
+        {
+            // FinishCompactionOutputFile: "If there is nothing to output, no necessary to generate a sst file"; the
+            // creation event names "(nil)" with Status::Aborted("Empty SST file not kept").
+            _db.NotifyOnEmptyTableFile(_cfd, JobId, 0, TableFileCreationReason.Compaction); // compaction_job.cc:2428-2445: a default FileDescriptor
+            return;
+        }
         if (_out.IsProximalLevel) Stats.NumProximalOutputFiles++;
         DbIdentity id = _db.Identity;
         if (id.DbId.Length > 0 && id.SessionId.Length > 0)
@@ -1331,6 +1487,7 @@ internal sealed class CompactionJob
                 ReadOnlySpan<byte> tEnd = upperBound is not null && _icmp.Compare(upperBound, endBuf.WrittenSpan) < 0 ? upperBound : endBuf.WrittenSpan;
                 ulong prevKeptStripe = ulong.MaxValue;
                 bool stop = false;
+                bool compensated = false;
                 ReadOnlySpan<ulong> seqs = tombstones.GetSequences(i);
                 for (int k = 0; k < seqs.Length; k++)
                 {
@@ -1352,10 +1509,18 @@ internal sealed class CompactionJob
                     }
                     ReadOnlySpan<byte> ts = tsSize == 0 ? default : tombstones.GetTimestamp(i, k);
 
+                    // TruncatedRangeDelMergingIter::Valid (AfterEndKey): a tombstone starting after the upper bound does not
+                    // belong to this output, so it is not counted as dropped for it either.
+                    if (tsSize == 0 && upperBound is not null && _icmp.Compare(upperBound, fStart, seq, EntryType.RangeDeletion) < 0)
+                    {
+                        stop = true;
+                        break;
+                    }
                     bool considerDrop = TombstoneConsiderDrop(tombstones, i, k);
                     if (considerDrop && bottommost)
                     {
                         Stats.IterStats.NumRangeDelDropObsolete++;
+                        Stats.IterStats.NumRecordDropObsolete++;
                         continue;
                     }
                     // tombstone_start (user key raised to the lower bound's) / truncated to [lower, upper]. With timestamps
@@ -1391,6 +1556,7 @@ internal sealed class CompactionJob
                     if (considerDrop && _c.KeyRangeNotExistsBeyondOutputLevel(DbFormat.ExtractUserKey(tStart), DbFormat.ExtractUserKey(tEnd), _out.RangeDelLevelPtrs))
                     {
                         Stats.IterStats.NumRangeDelDropObsolete++;
+                        Stats.IterStats.NumRecordDropObsolete++;
                         continue;
                     }
                     // The file stores the untruncated fragment; its boundaries do the truncation on read.
@@ -1407,6 +1573,16 @@ internal sealed class CompactionJob
                         fragEnd.Write(fEnd[..^tsSize]);
                         fragEnd.Write(ts);
                         builder.Add(fragKey.WrittenSpan, fragEnd.WrittenSpan);
+                    }
+                    // The first tombstone written for each start user key compensates the file by the approximate size of
+                    // the data it covers below the output level (error margin 0.1), unless the truncated range is empty.
+                    if (!bottommost && (!compensated || (tsSize == 0 && fStart.Length == 0)))
+                    {
+                        compensated = true;
+                        if (_cfd.UserComparator.CompareWithoutTimestamp(DbFormat.ExtractUserKey(tStart), DbFormat.ExtractUserKey(tEnd)) < 0)
+                        {
+                            meta.CompensatedRangeDeletionSize += DbImpl.ApproximateSize(_cfd, _c.InputStorage, tStart, tEnd, _c.OutputLevel + 1, 0.1);
+                        }
                     }
                     // FileMetaData::UpdateBoundariesForRange
                     if (smallest.WrittenCount == 0 || _icmp.Compare(tStart, smallest.WrittenSpan) < 0)

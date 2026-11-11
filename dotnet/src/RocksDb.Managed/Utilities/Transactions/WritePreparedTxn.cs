@@ -123,6 +123,9 @@ internal class WritePreparedTxn : PessimisticTransaction
         PrepareSequence = 0;
     }
 
+    // WritePreparedTxn::CommitWithoutPrepareInternal / CommitInternal do not read snapshot_needed_.
+    private protected override bool CommitChecksPendingSnapshotRequest => false;
+
     // WritePrepared transactions do not support user-defined timestamps (TransactionDB::Open fails with them).
     private protected override bool SupportsUserDefinedTimestamps => false;
 
@@ -316,13 +319,11 @@ internal class WritePreparedTxn : PessimisticTransaction
     /// <summary>RollbackWriteBatchBuilder of WritePreparedTxn::RollbackInternal: one restore per distinct key.</summary>
     private struct RollbackBatchBuilder(WritePreparedTxn txn, WriteBatch dst, ReadCallback callback) : IWriteBatchHandler
     {
-        private Dictionary<uint, HashSet<byte[]>>? _keys;
+        private RollbackKeySet? _keys;
 
         private void Rollback(uint cf, ReadOnlySpan<byte> key)
         {
-            _keys ??= new Dictionary<uint, HashSet<byte[]>>();
-            if (!_keys.TryGetValue(cf, out HashSet<byte[]>? set)) _keys[cf] = set = new HashSet<byte[]>(ByteKeyComparer.Instance);
-            if (!set.Add(key.ToArray())) return;
+            if (!(_keys ??= new RollbackKeySet(txn._db)).Add(cf, key)) return;
             txn.WriteRollbackKey(cf, key, null, callback, dst);
         }
 
@@ -392,5 +393,29 @@ internal class WritePreparedTxn : PessimisticTransaction
         // prepared heap was given; that one wins if they ever differ).
         int recoveredCnt = recovered.Batches[0].BatchCount;
         _prepareBatchCnt = recoveredCnt > 0 ? recoveredCnt : _batch.SubBatchCount;
+    }
+}
+
+/// <summary>
+/// The keys a rollback batch builder already restored, per column family (RollbackWriteBatchBuilder::keys_, a
+/// std::set&lt;Slice, SetComparator&gt; over the column family's comparator): keys the comparator considers equal are
+/// restored once, so the rollback batch has no duplicate key and is one sub-batch.
+/// </summary>
+internal sealed class RollbackKeySet(DbImpl db)
+{
+    private readonly Dictionary<uint, ISet<byte[]>> _keys = new();
+
+    /// <summary>Adds the key; false if the column family already has an equal one.</summary>
+    public bool Add(uint cf, ReadOnlySpan<byte> key)
+    {
+        if (!_keys.TryGetValue(cf, out ISet<byte[]>? set))
+        {
+            Comparator cmp = db.UserComparatorOf(cf);
+            set = cmp.CanKeysWithDifferentByteContentsBeEqual
+                ? new SortedSet<byte[]>(Comparer<byte[]>.Create((a, b) => cmp.Compare(a, b)))
+                : new HashSet<byte[]>(ByteKeyComparer.Instance);
+            _keys[cf] = set;
+        }
+        return set.Add(key.ToArray());
     }
 }

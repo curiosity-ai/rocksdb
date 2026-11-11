@@ -612,9 +612,10 @@ public sealed class CompactionPickerTests
         Assert.AreEqual(1, c.NumInputFiles(0));
         Assert.AreEqual(6UL, c.Input(0, 0).FileNumber);
         Assert.AreEqual(4, c.OutputLevel);
-        // As upstream (Compaction::IsTrivialMove), a single non-overlapping L0 file may still move; the next periodic
-        // pick then rewrites the single L4 run in place (UniversalPeriodicCompaction6).
-        Assert.IsTrue(c.IsTrivialMove());
+        // Upstream builds this compaction with max_output_level + 1 input levels (PickCompactionWithSortedRunRange), so
+        // Compaction::IsTrivialMove (num_input_levels() == 1) is false: the file is rewritten into L4 (audit #4; native
+        // parity in Audit4CompactionPickersCompatTests).
+        Assert.IsFalse(c.IsTrivialMove());
     }
 
     [TestMethod]

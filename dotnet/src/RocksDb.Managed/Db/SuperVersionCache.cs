@@ -67,6 +67,23 @@ internal sealed class SuperVersionCache
     public void Abandon(int slot) => Interlocked.CompareExchange(ref _slots[slot].Value, null, InUse);
 
     /// <summary>
+    /// Test hook: marks every slot <see cref="InUse"/> (as if a reader held each one) and returns what the slots held,
+    /// for <see cref="TestRestore"/>.
+    /// </summary>
+    internal object?[] TestOccupyAll()
+    {
+        var previous = new object?[_slots.Length];
+        for (int i = 0; i < previous.Length; i++) previous[i] = Interlocked.Exchange(ref _slots[i].Value, InUse);
+        return previous;
+    }
+
+    /// <summary>Test hook: undoes <see cref="TestOccupyAll"/>.</summary>
+    internal void TestRestore(object?[] previous)
+    {
+        for (int i = 0; i < previous.Length; i++) Interlocked.Exchange(ref _slots[i].Value, previous[i]);
+    }
+
+    /// <summary>
     /// Empties every slot (ResetThreadLocalSuperVersions), cleaning up the super versions whose cached reference was the
     /// last one. REQUIRES: DB mutex.
     /// </summary>

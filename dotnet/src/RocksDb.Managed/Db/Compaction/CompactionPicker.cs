@@ -511,6 +511,9 @@ internal abstract partial class CompactionPicker
         CompressionType compression = enableCompression
             ? GetCompressionType(vstorage, Options, outputLevel, Math.Max(1, vstorage.BaseLevel))
             : CompressionType.None;
+        // FIFOCompactionPicker passes mutable_cf_options.compression for the compactions that write outputs (intra-L0,
+        // temperature change): no bottommost_compression / compression_per_level there.
+        if (enableCompression && Options.CompactionStyle == CompactionStyle.Fifo) compression = Options.Compression;
         var c = new Compaction(vstorage, Options, inputs, outputLevel, maxOutputFileSize, maxCompactionBytes, pathId,
             compression, grandparents, reason, score, l0FilesMightOverlap, isManual)
         {

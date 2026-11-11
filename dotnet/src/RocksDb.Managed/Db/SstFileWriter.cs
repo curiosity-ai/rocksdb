@@ -45,6 +45,9 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     private byte[] _largestRangeDel = [];
     private ulong _numEntries;
     private ulong _numRangeDelEntries;
+    // Rep::db_session_id / next_file_number.
+    private readonly string _dbSessionId = NewSessionId();
+    private ulong _nextFileNumber = 1;
 
     /// <summary>Creates a writer for files ingested into a column family configured like <paramref name="options"/>.</summary>
     public SstFileWriter(ColumnFamilyOptions options) : this(options, LocalFileSystem.Instance)
@@ -99,18 +102,23 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     {
         ArgumentException.ThrowIfNullOrEmpty(filePath);
         if (_builder is not null) ThrowHelper.InvalidArgument("SstFileWriter is already open");
-        ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         TableBuilderOptions tbo = TableFactory.CreateExternalSstFileBuilderOptions(_options) with
         {
             ColumnFamilyId = _columnFamilyId,
             ColumnFamilyName = _columnFamilyName,
-            DbSessionId = NewSessionId(),
+            // SstFileWriter::Open: creation_time, oldest_key_time and file_creation_time are 0 (the ingesting DB stamps
+            // the file), the session id is kept for the life of the writer and each file gets the next fake file number
+            // ("rocksdb.original.file.number" 1, 2, ...).
+            DbSessionId = _dbSessionId,
+            FileNumber = _nextFileNumber,
             CreationTime = 0,
             OldestKeyTime = 0,
-            FileCreationTime = now,
+            FileCreationTime = 0,
             EmbeddedBlobMinSize = embeddedBlobMinSize,
         };
-        _file = _fs.CreateWritable(filePath, truncate: true);
+        // WritableFileWriter::seen_error_: after a failed append the file cannot be finished (SstFileWriter::Finish
+        // returns the builder's error status upstream).
+        _file = FileChecksumHelper.WithStickyError(_fs.CreateWritable(filePath, truncate: true));
         try
         {
             _builder = TableBuilder.Create(_file, _format, tbo);
@@ -121,6 +129,7 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
             _file = null;
             throw;
         }
+        _nextFileNumber++;
         _path = filePath;
         _smallestKey = _smallestRangeDel = _largestRangeDel = [];
         _largestKey.Clear();
@@ -266,6 +275,11 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
             _file!.Sync();
             return MakeInfo(builder);
         }
+        catch
+        {
+            DeleteAfterFailedFinish();
+            throw;
+        }
         finally
         {
             Close();
@@ -282,6 +296,11 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
             await builder.FinishAsync(cancellationToken).ConfigureAwait(false);
             await _file!.SyncAsync(cancellationToken).ConfigureAwait(false);
             return MakeInfo(builder);
+        }
+        catch
+        {
+            DeleteAfterFailedFinish();
+            throw;
         }
         finally
         {
@@ -317,6 +336,22 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
             }
         }
         return new(_path, smallest, largest, smallestRangeDel, largestRangeDel, 0, builder.FileSize, _numEntries, _numRangeDelEntries, 2);
+    }
+
+    /// <summary>
+    /// SstFileWriter::Finish: when finishing, syncing or closing the file fails, the file is deleted (a failure to
+    /// delete it is ignored).
+    /// </summary>
+    private void DeleteAfterFailedFinish()
+    {
+        Close();
+        try
+        {
+            _fs.DeleteFile(_path);
+        }
+        catch (Exception e) when (e is IOException or RocksDbException)
+        {
+        }
     }
 
     private static byte[] StripUserKey(byte[] key, int ts) => key.Length >= ts ? key.AsSpan(0, key.Length - ts).ToArray() : key;

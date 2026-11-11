@@ -17,10 +17,13 @@ namespace RocksDb.Managed.Db;
 /// RecoverEpochNumbers) with the largest sequence number as last sequence.</item>
 /// <item>ConvertLogFilesToTables: the WALs are replayed into the repaired DB and flushed to level-0 tables.</item>
 /// </list>
-/// Deviation (structure, same result): upstream converts the WALs into tables before writing the MANIFEST edits and
-/// archives them to <c>lost/</c>; this port writes the MANIFEST first and converts the WALs by opening the repaired DB
-/// once (recovery with <see cref="WalRecoveryMode.SkipAnyCorruptedRecords"/> + flush), which then deletes them like any
-/// recovered WAL. Records of column families that have no table file are dropped in both (upstream: the batch fails
+/// Deviation (structure, same result): upstream converts each WAL into tables with a hand-built memtable before
+/// writing the MANIFEST edits; this port writes a MANIFEST of the existing tables, converts the WALs one at a time by
+/// opening the repaired DB on a copy of the WAL (recovery with <see cref="WalRecoveryMode.SkipAnyCorruptedRecords"/> +
+/// flush, automatic compactions off) and rebuilds the MANIFEST after each, so that, as upstream, every WAL becomes
+/// its own tables and ALL tables of a column family are ordered by sequence number (a WAL can be older than tables:
+/// one kept alive by another column family, not purged before a crash, or recycled). The WALs end up in <c>lost/</c>
+/// like upstream. Records of column families that have no table file are dropped in both (upstream: the batch fails
 /// on the unknown column family; here the column family is unknown to recovery).
 /// </summary>
 internal sealed class Repairer
@@ -37,6 +40,9 @@ internal sealed class Repairer
     private readonly List<TableInfo> _tables = new();
     private ulong _nextFileNumber = 1;
     private readonly List<string> _paths = new();
+    // The column families of the repaired DB (the VersionSet's ColumnFamilySet of the C++ Repairer): the default one
+    // and each one added by ScanTable (Repairer::AddColumnFamily), also when the table that named it is then archived.
+    private readonly SortedDictionary<uint, string> _cfNames = new() { [0] = ColumnFamilyDescriptor.DefaultColumnFamilyName };
 
     private sealed class TableInfo
     {
@@ -81,26 +87,55 @@ internal sealed class Repairer
         return _unknownCfOptions;
     }
 
+    private string WalDir => string.IsNullOrEmpty(_options.WalDir) ? _dbname : _options.WalDir.TrimEnd('/');
+
     /// <summary>Repairer::Run.</summary>
     public void Run()
     {
+        var wals = new List<ulong>();
         using (_fs.LockFile(FileNames.LockFileName(_dbname)))
         {
             FindFiles();
             foreach (string m in _manifests) ArchiveFile(_dbname + "/" + m);
+            // Need to scan existing SST files first so the column families are created before we process WAL files.
             ExtractMetaData();
+            // ConvertLogToTable archives each WAL; here they are moved aside first and replayed one at a time from a copy.
+            wals.AddRange(_logs);
+            wals.Sort();
+            foreach (ulong n in wals) ArchiveFile(FileNames.LogFileName(WalDir, n));
             WriteManifest();
         }
-        ConvertLogFilesToTables();
+        foreach (ulong n in wals)
+        {
+            ConvertLogToTable(n);
+            using (_fs.LockFile(FileNames.LockFileName(_dbname)))
+            {
+                // The conversion wrote tables (and a MANIFEST that orders them as the newest data): scan the new tables
+                // and write the MANIFEST again with every table ordered by sequence number.
+                FindFiles();
+                foreach (string m in _manifests) DeleteQuietly(_dbname + "/" + m);
+                ExtractMetaData();
+                WriteManifest();
+            }
+        }
     }
 
-    /// <summary>Repairer::FindFiles.</summary>
+    /// <summary>
+    /// Repairer::FindFiles. Called again after each WAL conversion: tables already scanned are not scanned again, and
+    /// the next file number moves past the files the conversion created.
+    /// </summary>
     private void FindFiles()
     {
-        if (_options.DbPaths.Count == 0) _paths.Add(_dbname);
-        foreach ((string p, _) in _options.DbPaths) _paths.Add(p.TrimEnd('/'));
+        if (_paths.Count == 0)
+        {
+            if (_options.DbPaths.Count == 0) _paths.Add(_dbname);
+            foreach ((string p, _) in _options.DbPaths) _paths.Add(p.TrimEnd('/'));
+        }
+        _manifests.Clear();
+        _logs.Clear();
+        _tableFds.Clear();
         var searchPaths = new List<string>(_paths);
-        string walDir = string.IsNullOrEmpty(_options.WalDir) ? _dbname : _options.WalDir.TrimEnd('/');
+        string walDir = WalDir;
         if (walDir != _dbname) searchPaths.Add(walDir);
         bool foundFile = false;
         for (int pathId = 0; pathId < searchPaths.Count; pathId++)
@@ -117,11 +152,20 @@ internal sealed class Repairer
                 }
                 if (number + 1 > _nextFileNumber) _nextFileNumber = number + 1;
                 if (type == FileType.WalFile) _logs.Add(number);
-                else if (type == FileType.TableFile && pathId < _paths.Count) _tableFds.Add((number, (uint)pathId));
+                else if (type == FileType.TableFile && pathId < _paths.Count && !IsScanned(number, (uint)pathId)) _tableFds.Add((number, (uint)pathId));
             }
         }
         if (!foundFile) throw RocksDbException.Corruption(_dbname + ": repair found no files");
         _tableFds.Sort();
+    }
+
+    private bool IsScanned(ulong number, uint pathId)
+    {
+        foreach (TableInfo t in _tables)
+        {
+            if (t.Meta.FileNumber == number && t.Meta.PathId == pathId) return true;
+        }
+        return false;
     }
 
     /// <summary>Repairer::ExtractMetaData.</summary>
@@ -140,6 +184,14 @@ internal sealed class Repairer
                 ArchiveFile(fname);
             }
         }
+        // Metadata for these files has been extracted already.
+        _tableFds.Clear();
+    }
+
+    private void DeleteQuietly(string fname)
+    {
+        try { _fs.DeleteFile(fname); }
+        catch (Exception e) when (e is RocksDbException or IOException) { }
     }
 
     /// <summary>Repairer::ScanTable.</summary>
@@ -172,28 +224,33 @@ internal sealed class Repairer
                 meta.UniqueId = new UniqueId64x2(id0, id1);
             }
             var t = new TableInfo { Meta = meta, ColumnFamilyId = (uint)props.ColumnFamilyId, ColumnFamilyName = props.ColumnFamilyName };
-            if (props.ColumnFamilyId == TableProperties.UnknownColumnFamily)
+            // "column family unknown (probably due to legacy format); adding to default column family id 0." The name
+            // stays the recorded one, as upstream: a table without a column family name (legacy, or written by
+            // SstFileWriter without a column family) then fails the name check below and is archived.
+            if (props.ColumnFamilyId == TableProperties.UnknownColumnFamily) t.ColumnFamilyId = 0;
+            if (!_cfNames.TryGetValue(t.ColumnFamilyId, out string? cfName))
             {
-                // "column family unknown (probably due to legacy format); adding to default column family id 0."
-                t.ColumnFamilyId = 0;
-                t.ColumnFamilyName = ColumnFamilyDescriptor.DefaultColumnFamilyName;
-            }
-            if (t.ColumnFamilyId == 0 && t.ColumnFamilyName.Length == 0) t.ColumnFamilyName = ColumnFamilyDescriptor.DefaultColumnFamilyName;
-            foreach (TableInfo other in _tables)
-            {
-                if (other.ColumnFamilyId == t.ColumnFamilyId && other.ColumnFamilyName != t.ColumnFamilyName)
-                    throw RocksDbException.Corruption(_dbname + ": inconsistent column family name");
-            }
-            if (GetColumnFamilyOptions(t.ColumnFamilyName) is null && t.ColumnFamilyName != ColumnFamilyDescriptor.DefaultColumnFamilyName)
-            {
-                throw RocksDbException.Corruption("Encountered unknown column family with name=" + t.ColumnFamilyName + ", id="
-                    + t.ColumnFamilyId.ToString(CultureInfo.InvariantCulture));
+                // Repairer::AddColumnFamily: the column family exists from here on, whatever happens to this table.
+                if (GetColumnFamilyOptions(t.ColumnFamilyName) is null)
+                {
+                    throw RocksDbException.Corruption("Encountered unknown column family with name=" + t.ColumnFamilyName + ", id="
+                        + t.ColumnFamilyId.ToString(CultureInfo.InvariantCulture));
+                }
+                cfName = t.ColumnFamilyName;
+                _cfNames.Add(t.ColumnFamilyId, cfName);
             }
             meta.OldestAncestorTime = props.CreationTime;
             meta.UserDefinedTimestampsPersisted = props.UserDefinedTimestampsPersisted != 0;
-            meta.TailSize = props.TailStartOffset > 0 && props.TailStartOffset <= fileSize ? fileSize - props.TailStartOffset : 0;
+            meta.TailSize = FileMetaData.CalculateTailSize(fileSize, props);
+            if (cfName != t.ColumnFamilyName) throw RocksDbException.Corruption(_dbname + ": inconsistent column family name");
 
+            // cfd->internal_comparator(): the boundaries are ordered by the comparator of the table's column family,
+            // not by the one of the default column family the table was opened with.
             InternalKeyComparator icmp = reader.InternalComparator;
+            if ((GetColumnFamilyOptions(cfName) ?? _defaultCfOptions).Comparator is { } cfComparator && !ReferenceEquals(cfComparator, icmp.UserComparator))
+            {
+                icmp = new InternalKeyComparator(cfComparator);
+            }
             using (BlockBasedTableIterator it = reader.NewIterator(TableReadFlags.DontFillCache))
             {
                 for (it.SeekToFirst(); it.Valid; it.Next())
@@ -201,6 +258,8 @@ internal sealed class Repairer
                     ReadOnlySpan<byte> key = it.Key;
                     if (!DbFormat.TryParseInternalKey(key, out ParsedInternalKey parsed)) continue; // unparsable key
                     UpdateBoundaries(meta, icmp, key, parsed.Sequence);
+                    // FileMetaData::UpdateBoundaries: the oldest blob file the table refers to (Corruption archives the table).
+                    if (parsed.Type == EntryType.BlobIndex) FlushJob.UpdateOldestBlobFileNumber(meta, it.Value);
                 }
             }
             if (reader.NewRangeTombstoneIterator() is { } rit)
@@ -240,11 +299,10 @@ internal sealed class Repairer
     private void WriteManifest()
     {
         // Column families: default first, then by id.
-        var cfs = new SortedDictionary<uint, string> { [0] = ColumnFamilyDescriptor.DefaultColumnFamilyName };
+        SortedDictionary<uint, string> cfs = _cfNames;
         ulong maxSequence = 0;
         foreach (TableInfo t in _tables)
         {
-            cfs.TryAdd(t.ColumnFamilyId, t.ColumnFamilyName);
             maxSequence = Math.Max(maxSequence, t.Meta.LargestSeqno);
         }
         const ulong manifestNumber = 1;
@@ -298,7 +356,9 @@ internal sealed class Repairer
                     NextFileNumber = _nextFileNumber,
                     ColumnFamily = id,
                 };
-                ulong epoch = 1;
+                // VersionStorageInfo::RecoverEpochNumbers: with allow_ingest_behind the first epoch number is reserved
+                // (kReservedEpochNumberForFileIngestedBehind).
+                ulong epoch = _options.AllowIngestBehind || o.CfAllowIngestBehind ? 2UL : 1UL;
                 foreach (TableInfo t in files)
                 {
                     t.Meta.EpochNumber = epoch++;
@@ -312,21 +372,53 @@ internal sealed class Repairer
         FileNames.SetCurrentFileAsync(_fs, _dbname, manifestNumber, syncDirectory: true, CancellationToken.None).AsTask().GetAwaiter().GetResult();
     }
 
-    /// <summary>ConvertLogFilesToTables: replays the WALs into the repaired DB and flushes them to tables.</summary>
-    private void ConvertLogFilesToTables()
+    /// <summary>
+    /// Repairer::ConvertLogToTable: replays WAL #<paramref name="number"/> (archived in lost/ by <see cref="Run"/>) into
+    /// the repaired DB from a copy and flushes it to level-0 tables. A failure is logged and the WAL skipped, as upstream
+    /// ("Log #N: ignoring conversion error"). Automatic compactions stay off: until the MANIFEST is rebuilt the new
+    /// tables are ordered as the newest data, which they may not be.
+    /// </summary>
+    private void ConvertLogToTable(ulong number)
     {
-        if (_logs.Count == 0) return;
-        DbOptions o = _options.Clone();
-        o.CreateIfMissing = false;
-        o.WalRecoveryMode = WalRecoveryMode.SkipAnyCorruptedRecords;
-        o.AvoidFlushDuringRecovery = false;
-        var descriptors = new List<ColumnFamilyDescriptor>();
-        foreach (string name in RocksDatabase.ListColumnFamilies(_dbname, _fs))
+        string walDir = WalDir;
+        string logName = FileNames.LogFileName(walDir, number);
+        string archived = walDir + "/lost/" + logName[(logName.LastIndexOf('/') + 1)..];
+        try
         {
-            descriptors.Add(new ColumnFamilyDescriptor(name, GetColumnFamilyOptions(name) ?? _defaultCfOptions));
+            if (!_fs.FileExists(archived)) return; // could not be archived: left out
+            CopyFile(archived, logName);
+            DbOptions o = _options.Clone();
+            o.CreateIfMissing = false;
+            o.WalRecoveryMode = WalRecoveryMode.SkipAnyCorruptedRecords;
+            o.AvoidFlushDuringRecovery = false;
+            var descriptors = new List<ColumnFamilyDescriptor>();
+            foreach (string name in RocksDatabase.ListColumnFamilies(_dbname, _fs))
+            {
+                ColumnFamilyOptions cfOptions = (GetColumnFamilyOptions(name) ?? _defaultCfOptions).Clone();
+                cfOptions.DisableAutoCompactions = true;
+                descriptors.Add(new ColumnFamilyDescriptor(name, cfOptions));
+            }
+            using (RocksDatabase db = RocksDatabase.Open(_dbname, o, descriptors))
+            {
+                foreach (ColumnFamily cf in db.ColumnFamilies) cf.Flush();
+            }
         }
-        using RocksDatabase db = RocksDatabase.Open(_dbname, o, descriptors);
-        foreach (ColumnFamily cf in db.ColumnFamilies) cf.Flush();
+        catch (Exception e) when (e is RocksDbException or IOException)
+        {
+            _options.InfoLog?.Log(InfoLogLevel.Warn, "Log #" + number.ToString(CultureInfo.InvariantCulture) + ": ignoring conversion error: " + e.Message);
+        }
+        // The copy is obsolete once flushed (the open deletes it); never replay it with a later WAL.
+        if (_fs.FileExists(logName)) DeleteQuietly(logName);
+    }
+
+    private void CopyFile(string source, string target)
+    {
+        using ISequentialFile src = _fs.OpenSequential(source);
+        using IWritableFile dst = _fs.CreateWritable(target, truncate: true);
+        byte[] buffer = new byte[64 * 1024];
+        int n;
+        while ((n = src.Read(buffer)) > 0) dst.Append(buffer.AsSpan(0, n));
+        dst.Sync();
     }
 
     /// <summary>Repairer::ArchiveFile: moves <paramref name="fname"/> into a "lost" directory next to it.</summary>

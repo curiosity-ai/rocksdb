@@ -1241,25 +1241,32 @@ internal struct SubBatchCounter : IWriteBatchHandler
         _fast?.Clear();
     }
 
-    private void AddKey(uint cf, ReadOnlySpan<byte> key)
+    // Range deletions live in the memtable's own range tombstone table (MemTable::Add), so the begin key of a
+    // DeleteRange only repeats another DeleteRange begin key of its column family, never a point key: they are tracked
+    // in a key set of their own (the column family id with this bit set).
+    private const uint RangeDeletionKeySpace = 0x8000_0000;
+
+    private void AddKey(uint cf, ReadOnlySpan<byte> key) => AddKey(cf, cf, key);
+
+    private void AddKey(uint cf, uint keySpace, ReadOnlySpan<byte> key)
     {
         Comparator cmp = _db.UserComparatorOf(cf);
         if (_fast is not null && !cmp.CanKeysWithDifferentByteContentsBeEqual)
         {
-            if (_fast.Add(cf, key)) return;
+            if (_fast.Add(keySpace, key)) return;
             NewSubBatch();
-            _fast.Add(cf, key);
+            _fast.Add(keySpace, key);
             return;
         }
         _keys ??= new Dictionary<uint, SortedSet<byte[]>>();
-        if (!_keys.TryGetValue(cf, out SortedSet<byte[]>? set)) _keys[cf] = set = NewSet(cmp);
+        if (!_keys.TryGetValue(keySpace, out SortedSet<byte[]>? set)) _keys[keySpace] = set = NewSet(cmp);
         if (!set.Add(key.ToArray()))
         {
             // second is false if a element already existed.
             NewSubBatch();
             set = NewSet(cmp);
             set.Add(key.ToArray());
-            _keys[cf] = set;
+            _keys[keySpace] = set;
         }
     }
 
@@ -1271,7 +1278,8 @@ internal struct SubBatchCounter : IWriteBatchHandler
     public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) => AddKey(columnFamilyId, key);
     public void Delete(uint columnFamilyId, ReadOnlySpan<byte> key) => AddKey(columnFamilyId, key);
     public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key) => AddKey(columnFamilyId, key);
-    public void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) => AddKey(columnFamilyId, beginKey);
+    public void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) =>
+        AddKey(columnFamilyId, columnFamilyId | RangeDeletionKeySpace, beginKey);
     public void Merge(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => AddKey(columnFamilyId, key);
     public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex) => AddKey(columnFamilyId, key);
     public readonly void LogData(ReadOnlySpan<byte> blob) { }

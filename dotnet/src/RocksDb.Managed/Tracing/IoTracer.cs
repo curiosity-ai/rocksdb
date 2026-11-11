@@ -149,13 +149,17 @@ public sealed class IoTraceReader(TraceReader reader) : IDisposable
         while (bits != 0)
         {
             int pos = System.Numerics.BitOperations.TrailingZeroCount(bits);
-            if (!Coding.GetFixed64(ref p, out ulong v)) throw Incomplete("io op field");
-            switch (pos)
+            // IOTraceReader::ReadIOOp: only the three known bits carry a field; an unknown bit hits "default:
+            // assert(false)", which reads nothing and is ignored in release builds.
+            if (pos <= 2)
             {
-                case 0: r.FileSize = v; break;
-                case 1: r.Length = v; break;
-                case 2: r.Offset = v; break;
-                default: throw RocksDbException.Corruption("unknown IO trace op " + pos);
+                if (!Coding.GetFixed64(ref p, out ulong v)) throw Incomplete(pos == 0 ? "file size" : pos == 1 ? "length" : "offset");
+                switch (pos)
+                {
+                    case 0: r.FileSize = v; break;
+                    case 1: r.Length = v; break;
+                    default: r.Offset = v; break;
+                }
             }
             bits &= bits - 1;
         }
@@ -366,9 +370,15 @@ internal sealed class IoTracingFileSystem(IFileSystem inner, IoTracer tracer) : 
         public void Dispose() => inner.Dispose();
     }
 
-    private sealed class TracedWritable(IWritableFile inner, IoTracer tracer, string path) : IWritableFile
+    private sealed class TracedWritable(IWritableFile inner, IoTracer tracer, string path) : IWritableFile, ITruncatableWritableFile
     {
         public long Size => inner.Size;
+
+        /// <summary>Forwarded when the wrapped file supports it (not traced); a no-op otherwise.</summary>
+        public void Truncate(long size)
+        {
+            if (inner is ITruncatableWritableFile t) t.Truncate(size);
+        }
 
         public void Append(ReadOnlySpan<byte> data)
         {

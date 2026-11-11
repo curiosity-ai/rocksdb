@@ -467,6 +467,44 @@ internal static class WideColumnSerialization
     [ThreadStatic] private static List<WideColumnSlot>? t_slots;
 
     /// <summary>
+    /// Port of WideColumnSerialization::GetValueOfDefaultColumn(input, value, is_blob_reference): like
+    /// <see cref="GetValueOfDefaultColumn(ReadOnlySpan{byte})"/>, but a version 2 entity is read through its skip info
+    /// without decoding the other columns, so blob-backed columns are allowed. With
+    /// <paramref name="isBlobReference"/> the result is the default column's serialized blob index.
+    /// </summary>
+    public static ReadOnlySpan<byte> GetValueOfDefaultColumn(ReadOnlySpan<byte> entity, out bool isBlobReference)
+    {
+        isBlobReference = false;
+        int pos = 0;
+        if (!TryGetVarint32(entity, ref pos, out uint version)) ThrowHelper.Corruption("Error decoding wide column version");
+        if (version > Version2) ThrowHelper.Corruption("Corrupt or unsupported wide column version");
+        if (version < Version2) return GetValueOfDefaultColumn(entity);
+        if (!TryGetVarint32(entity, ref pos, out uint numColumns)) ThrowHelper.Corruption("Error decoding number of wide columns");
+        if (numColumns == 0) return default;
+        if (!TryGetVarint32(entity, ref pos, out uint nameSizesBytes)) ThrowHelper.Corruption("Error decoding wide column name sizes bytes");
+        if (!TryGetVarint32(entity, ref pos, out uint valueSizesBytes)) ThrowHelper.Corruption("Error decoding wide column value sizes bytes");
+        if (!TryGetVarint32(entity, ref pos, out uint namesBytes)) ThrowHelper.Corruption("Error decoding wide column names bytes");
+        if ((uint)(entity.Length - pos) < numColumns) ThrowHelper.Corruption("Error decoding wide column types");
+        var column0Type = (EntryType)entity[pos];
+        if (column0Type != EntryType.Value && column0Type != EntryType.BlobIndex) ThrowHelper.Corruption("Unsupported wide column ValueType");
+        pos += (int)numColumns;
+        if ((uint)(entity.Length - pos) < nameSizesBytes) ThrowHelper.Corruption("Error decoding wide column name sizes");
+        int p = pos;
+        if (!TryGetVarint32(entity[..(pos + (int)nameSizesBytes)], ref p, out uint firstNameSize)) ThrowHelper.Corruption("Error decoding wide column name size");
+        pos += (int)nameSizesBytes;
+        if ((uint)(entity.Length - pos) < valueSizesBytes) ThrowHelper.Corruption("Error decoding wide column value sizes");
+        p = pos;
+        if (!TryGetVarint32(entity[..(pos + (int)valueSizesBytes)], ref p, out uint firstValueSize)) ThrowHelper.Corruption("Error decoding wide column value size");
+        pos += (int)valueSizesBytes;
+        if (firstNameSize != 0) return default; // no default column
+        if ((uint)(entity.Length - pos) < namesBytes) ThrowHelper.Corruption("Error decoding wide column names");
+        pos += (int)namesBytes;
+        if ((uint)(entity.Length - pos) < firstValueSize) ThrowHelper.Corruption("Error decoding wide column value payload");
+        isBlobReference = column0Type == EntryType.BlobIndex;
+        return entity.Slice(pos, (int)firstValueSize);
+    }
+
+    /// <summary>
     /// Writes <paramref name="entity"/> with its default column replaced by <paramref name="newDefault"/> (added when
     /// missing). Used for merges on top of an entity (MergeHelper::TimedFullMergeWithEntity).
     /// </summary>

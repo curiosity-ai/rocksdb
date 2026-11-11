@@ -209,7 +209,7 @@ public sealed partial class BlockBasedTableReader
             CachedBlock h = lookups.Handles[j].TakeResult();
             if (!h.HasValue) continue;
             var block = Unsafe.As<Block>(h.Value)!;
-            _stats?.Record(HitCounter(BlockKind.Data));
+            _stats?.RecordHit(HitCounter(BlockKind.Data), h.Charge);
             if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, h.Key, BlockKind.Data, block, hit: true, flags);
             lookups.Blocks[j] = BlockRef.FromCache(block, h);
         }

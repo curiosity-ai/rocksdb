@@ -621,7 +621,7 @@ internal static class WritableFileBuffers
 /// Not thread-safe: a writable file has a single writer, as in RocksDB.
 /// Async methods complete synchronously while data fits in the buffer; slow paths use pooled state machines.
 /// </summary>
-internal sealed class LocalWritableFile : IWritableFile
+internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFile
 {
     private readonly SafeFileHandle _handle;
     private readonly string _path;
@@ -634,6 +634,9 @@ internal sealed class LocalWritableFile : IWritableFile
     private long _filePos;                     // buffered: bytes handed to the OS; direct: aligned offset of buffer[0]
     private long _preallocatedEnd;
     private long _lastRangeSync;
+
+    /// <summary>The offset up to which the file was range-synced (last_sync_size_). Tests only.</summary>
+    internal long LastRangeSyncForTest => _lastRangeSync;
     private bool _preallocationFailed;
     private bool _disposed;
     private readonly bool _offloadAsyncSync;  // LocalFileSystem.OffloadAsyncSync
@@ -690,7 +693,35 @@ internal sealed class LocalWritableFile : IWritableFile
 
     public long Size => _filePos + _buffered;
 
-    private Span<byte> BufferSpan => _array is not null ? _array.AsSpan(0, _capacity) : _aligned!.Span;
+    /// <summary>PosixWritableFile::Truncate (buffered mode only; a direct I/O file is left as is).</summary>
+    public void Truncate(long size)
+    {
+        ThrowIfDisposed();
+        if (_alignment != 0) return;
+        Flush();
+        if (size < 0 || size >= _filePos) return;
+        try
+        {
+            RandomAccess.SetLength(_handle, size);
+        }
+        catch (IOException e)
+        {
+            throw LocalFileSystem.MapException("While ftruncate", _path, e);
+        }
+        _filePos = size;
+        if (_lastRangeSync > size) _lastRangeSync = size;
+        if (_preallocatedEnd > size) _preallocatedEnd = size;
+    }
+
+    // After Dispose both buffers are gone: an (empty) append that reaches the buffer fails like any other write.
+    private Span<byte> BufferSpan => _array is not null ? _array.AsSpan(0, _capacity) : (_aligned ?? ThrowClosed()).Span;
+
+    private AlignedBuffer ThrowClosed()
+    {
+        ThrowHelper.InvalidArgument("file already closed: " + _path);
+        return null!;
+    }
+
     private Memory<byte> BufferMemory => _array is not null ? _array.AsMemory(0, _capacity) : _aligned!.Memory;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -996,10 +1027,14 @@ internal sealed class LocalWritableFile : IWritableFile
     // WritableFileWriter: bytes_per_sync => RangeSync(last_sync_size_, offset_sync_to - last_sync_size_).
     private void MaybeRangeSync()
     {
+        // WritableFileWriter::Flush: "if (!use_direct_io() && bytes_per_sync_)", and the most recent 1 MiB is not
+        // synced (kBytesNotSyncRange: the pages may be modified again, and the write could block), aligned to 4 KiB.
         long bps = _options.BytesPerSync;
-        if (bps <= 0) return;
-        long syncTo = AlignedBuffer.RoundDown(_filePos, 4096);
-        if (syncTo - _lastRangeSync >= bps)
+        if (bps <= 0 || _alignment != 0) return;
+        const long BytesNotSyncRange = 1024 * 1024;
+        if (_filePos <= BytesNotSyncRange) return;
+        long syncTo = AlignedBuffer.RoundDown(_filePos - BytesNotSyncRange, 4096);
+        if (syncTo > 0 && syncTo - _lastRangeSync >= bps)
         {
             UnixNative.TryRangeSync(_handle, _lastRangeSync, syncTo - _lastRangeSync);
             _lastRangeSync = syncTo;

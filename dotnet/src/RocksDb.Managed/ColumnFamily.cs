@@ -160,7 +160,7 @@ public sealed partial class ColumnFamily
     public bool TryGet(ReadOptions? options, ReadOnlySpan<byte> key, IBufferWriter<byte> value)
     {
         ArgumentNullException.ThrowIfNull(value);
-        GetContext ctx = Lookup(options, key);
+        GetContext ctx = Lookup(options, key, defaultColumnOnly: true);
         try
         {
             if (!ctx.TryResolve(key, out ReadOnlySpan<byte> v)) return false;
@@ -182,7 +182,7 @@ public sealed partial class ColumnFamily
 
     public bool TryGet(ReadOptions? options, ReadOnlySpan<byte> key, Span<byte> destination, out int valueLength)
     {
-        GetContext ctx = Lookup(options, key);
+        GetContext ctx = Lookup(options, key, defaultColumnOnly: true);
         try
         {
             if (!ctx.TryResolve(key, out ReadOnlySpan<byte> v))
@@ -210,7 +210,7 @@ public sealed partial class ColumnFamily
     public bool TryGet<TState, TResult>(ReadOptions? options, ReadOnlySpan<byte> key, TState state, ReadOnlySpanFunc<TState, TResult> reader, out TResult result)
     {
         ArgumentNullException.ThrowIfNull(reader);
-        GetContext ctx = Lookup(options, key);
+        GetContext ctx = Lookup(options, key, defaultColumnOnly: true);
         try
         {
             if (!ctx.TryResolve(key, out ReadOnlySpan<byte> v))
@@ -236,7 +236,7 @@ public sealed partial class ColumnFamily
 
     public PooledValue? GetPooled(ReadOptions? options, ReadOnlySpan<byte> key)
     {
-        GetContext ctx = Lookup(options, key);
+        GetContext ctx = Lookup(options, key, defaultColumnOnly: true);
         try
         {
             return ctx.TryResolve(key, out ReadOnlySpan<byte> v) ? PooledValue.Create(v) : null;
@@ -252,7 +252,7 @@ public sealed partial class ColumnFamily
 
     public byte[]? Get(ReadOptions? options, ReadOnlySpan<byte> key)
     {
-        GetContext ctx = Lookup(options, key);
+        GetContext ctx = Lookup(options, key, defaultColumnOnly: true);
         try
         {
             return ctx.TryResolve(key, out ReadOnlySpan<byte> v) ? v.ToArray() : null;
@@ -266,7 +266,7 @@ public sealed partial class ColumnFamily
     /// <summary>True if the key exists (with the cost of a full lookup).</summary>
     public bool ContainsKey(ReadOnlySpan<byte> key)
     {
-        GetContext ctx = Lookup(null, key);
+        GetContext ctx = Lookup(null, key, defaultColumnOnly: true);
         try
         {
             return ctx.TryResolve(key, out _);
@@ -356,10 +356,11 @@ public sealed partial class ColumnFamily
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private GetContext Lookup(ReadOptions? options, ReadOnlySpan<byte> key)
+    private GetContext Lookup(ReadOptions? options, ReadOnlySpan<byte> key, bool defaultColumnOnly)
     {
         _db.ThrowIfDisposed();
         GetContext ctx = GetContext.Rent(_cfd.MergeOperator);
+        ctx.DefaultColumnOnly = defaultColumnOnly;
         try
         {
             Statistics? st = _db.Stats;
@@ -400,7 +401,7 @@ public sealed partial class ColumnFamily
     public async ValueTask<bool> TryGetAsync(ReadOptions? options, ReadOnlyMemory<byte> key, IBufferWriter<byte> value, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(value);
-        GetContext ctx = await LookupAsync(options, key, cancellationToken).ConfigureAwait(false);
+        GetContext ctx = await LookupAsync(options, key, defaultColumnOnly: true, cancellationToken).ConfigureAwait(false);
         try
         {
             return Resolve(ctx, key.Span, value);
@@ -425,7 +426,7 @@ public sealed partial class ColumnFamily
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<PooledValue?> GetPooledAsync(ReadOptions? options, ReadOnlyMemory<byte> key, CancellationToken cancellationToken = default)
     {
-        GetContext ctx = await LookupAsync(options, key, cancellationToken).ConfigureAwait(false);
+        GetContext ctx = await LookupAsync(options, key, defaultColumnOnly: true, cancellationToken).ConfigureAwait(false);
         try
         {
             return ToPooled(ctx, key.Span);
@@ -444,7 +445,7 @@ public sealed partial class ColumnFamily
 
     public async ValueTask<byte[]?> GetAsync(ReadOptions? options, ReadOnlyMemory<byte> key, CancellationToken cancellationToken = default)
     {
-        GetContext ctx = await LookupAsync(options, key, cancellationToken).ConfigureAwait(false);
+        GetContext ctx = await LookupAsync(options, key, defaultColumnOnly: true, cancellationToken).ConfigureAwait(false);
         try
         {
             return ToArray(ctx, key.Span);
@@ -458,10 +459,11 @@ public sealed partial class ColumnFamily
     private static byte[]? ToArray(GetContext ctx, ReadOnlySpan<byte> key) => ctx.TryResolve(key, out ReadOnlySpan<byte> v) ? v.ToArray() : null;
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    private async ValueTask<GetContext> LookupAsync(ReadOptions? options, ReadOnlyMemory<byte> key, CancellationToken ct)
+    private async ValueTask<GetContext> LookupAsync(ReadOptions? options, ReadOnlyMemory<byte> key, bool defaultColumnOnly, CancellationToken ct)
     {
         _db.ThrowIfDisposed();
         GetContext ctx = GetContext.Rent(_cfd.MergeOperator);
+        ctx.DefaultColumnOnly = defaultColumnOnly;
         try
         {
             Statistics? st = _db.Stats;

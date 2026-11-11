@@ -31,8 +31,8 @@ internal sealed class PinnedFilterPartitions : IDisposable
     public bool TryGet(ulong offset, out IFilterBitsReader reader) => _readers.TryGetValue(offset, out reader!);
 
     /// <summary>Reads every partition listed in the top-level filter partition index <paramref name="top"/>.</summary>
-    public static PinnedFilterPartitions Load(IRandomAccessFile file, in Footer footer, bool verifyChecksums, FilterPolicy policy, Block top,
-        TableProperties props, Comparator comparator)
+    public static PinnedFilterPartitions Load(IRandomAccessFile file, in Footer footer, BlockFetcher.ChecksumVerification verifyChecksums, FilterPolicy policy, Block top,
+        TableProperties props, Comparator comparator, bool ignoreUnreadablePartitions)
     {
         var result = new PinnedFilterPartitions();
         try
@@ -45,9 +45,29 @@ internal sealed class PinnedFilterPartitions : IDisposable
             {
                 BlockHandle h = it.BlockHandle;
                 if (h.Size == 0 || result._readers.ContainsKey(h.Offset)) continue;
-                byte[] buf = BlockFetcher.ReadRawPayload(file, footer, h, verifyChecksums, out int len);
+                byte[] buf;
+                int len;
+                try
+                {
+                    buf = BlockFetcher.ReadRawPayload(file, footer, h, verifyChecksums, out len);
+                }
+                catch (Exception e) when (ignoreUnreadablePartitions && e is RocksDbException or IOException)
+                {
+                    // Not pinned: lookups read the partition themselves and answer "may match" while that fails
+                    // (PartitionedFilterBlockReader::MayMatch, IGNORE_STATUS_IF_ERROR).
+                    continue;
+                }
                 result._buffers.Add(buf);
-                result._readers.Add(h.Offset, BlockBasedTableReader.CreateFilterReader(policy, buf, len));
+                IFilterBitsReader reader;
+                try
+                {
+                    reader = BlockBasedTableReader.CreateFilterReader(policy, buf, len);
+                }
+                catch (RocksDbException) when (ignoreUnreadablePartitions)
+                {
+                    continue;
+                }
+                result._readers.Add(h.Offset, reader);
             }
             return result;
         }

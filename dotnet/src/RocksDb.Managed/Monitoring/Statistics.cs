@@ -152,6 +152,10 @@ public sealed class Statistics
             Ticker.BlockCacheDataHit => b.DataHits,
             Ticker.BlockCacheDataAdd => b.Get(BlockCacheCounter.DataAdd),
             Ticker.BlockCacheBytesWrite => b.Get(BlockCacheCounter.BytesInserted),
+            Ticker.BlockCacheBytesRead => b.Get(BlockCacheCounter.BytesRead),
+            Ticker.BlockCacheDataBytesInsert => b.Get(BlockCacheCounter.DataBytesInsert),
+            Ticker.BlockCacheIndexBytesInsert => b.Get(BlockCacheCounter.IndexBytesInsert),
+            Ticker.BlockCacheFilterBytesInsert => b.Get(BlockCacheCounter.FilterBytesInsert),
             Ticker.BloomFilterUseful => b.Get(BlockCacheCounter.BloomFilterUseful),
             Ticker.BloomFilterFullPositive => b.Get(BlockCacheCounter.BloomFilterFullPositive),
             Ticker.BloomFilterPrefixChecked => b.Get(BlockCacheCounter.BloomFilterPrefixChecked),
@@ -447,7 +451,7 @@ internal sealed class HistogramImpl
             ulong bucketValue = buckets[b];
             if (bucketValue == 0) continue;
             cumulative += bucketValue;
-            sb.Append(string.Format(CultureInfo.InvariantCulture, "{0} {1,7} , {2,7} ] {3,8} {4,7:F3}% {5,7:F3}% ",
+            sb.Append(string.Format(CultureInfo.InvariantCulture, "{0} {1,7}, {2,7} ] {3,8} {4,7:F3}% {5,7:F3}% ",
                 b == 0 ? '[' : '(', b == 0 ? 0 : HistogramBuckets.Limits[b - 1], HistogramBuckets.Limits[b], bucketValue,
                 mult * bucketValue, mult * cumulative));
             int marks = (int)(20 * ((double)bucketValue / num) + 0.5);

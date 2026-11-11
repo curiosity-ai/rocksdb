@@ -87,7 +87,6 @@ public abstract partial class Transaction
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(columns);
         ColumnFamilyData cfd = Cfd(columnFamily);
-        SetSnapshotIfNeeded();
         return GetEntityFromBatchAndDb(options, cfd, key, columns);
     }
 
@@ -105,7 +104,6 @@ public abstract partial class Transaction
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(columns);
         ColumnFamilyData cfd = Cfd(columnFamily);
-        SetSnapshotIfNeeded();
         return GetEntityFromBatchAndDbAsync(options, cfd, key, columns, cancellationToken);
     }
 
@@ -161,7 +159,6 @@ public abstract partial class Transaction
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(batch);
         ColumnFamilyData cfd = Cfd(columnFamily);
-        SetSnapshotIfNeeded();
         var reader = new TxnMultiEntityReader(this, options, cfd);
         _batch.MultiGetEntity(cfd.Id, cfd.MergeOperator, cfd.TimestampSize, options, batch, ref reader);
     }
@@ -222,7 +219,6 @@ public abstract partial class Transaction
     {
         ThrowIfDisposed();
         CheckMultiCfIterator(columnFamilies);
-        SetSnapshotIfNeeded();
         var it = new TransactionCoalescingIterator(columnFamilies);
         InitMultiCfIterator(it, options);
         return it;
@@ -233,7 +229,6 @@ public abstract partial class Transaction
     {
         ThrowIfDisposed();
         CheckMultiCfIterator(columnFamilies);
-        SetSnapshotIfNeeded();
         var it = new TransactionAttributeGroupIterator(columnFamilies);
         InitMultiCfIterator(it, options);
         return it;

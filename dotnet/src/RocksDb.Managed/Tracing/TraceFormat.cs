@@ -417,6 +417,10 @@ internal static class TraceFormat
                     map &= map - 1;
                 }
                 if (size == 0) throw RocksDbException.InvalidArgument("Empty MultiGet cf_ids or keys.");
+                // Each key takes 4 bytes of cf_ids and at least 1 byte of keys: reject a size the payload cannot hold
+                // before allocating for it.
+                if ((ulong)size * 4 > (ulong)cfIds.Length || size > (uint)keys.Length)
+                    throw RocksDbException.Corruption("Unable to decode the traced MultiGet keys");
                 var ids = new uint[size];
                 var ks = new byte[size][];
                 for (int i = 0; i < size; i++)

@@ -121,6 +121,7 @@ internal sealed partial class DbImpl
         if (options.MoveFiles && options.LinkFiles) ThrowHelper.InvalidArgument("`move_files` and `link_files` can not both be true.");
         var job = new ExternalSstFileIngestionJob(this, cfd, options);
         bool success = false;
+        bool editSubmitted = false;
         BeginIngestion();
         try
         {
@@ -170,6 +171,7 @@ internal sealed partial class DbImpl
                             {
                                 if (consumed) Versions.AllocateSequence(maxAssigned - last);
                                 TestHooks.Invoke("DBImpl::IngestExternalFiles:BeforeLogAndApply");
+                                editSubmitted = true;
                                 // The MANIFEST edit records the files' largest seqno itself (VersionEdit.AddFile), so the
                                 // last sequence is published only once the files are installed: a snapshot taken while
                                 // the MANIFEST is written must not get the ingested files' seqno before they are visible
@@ -240,7 +242,12 @@ internal sealed partial class DbImpl
             EndIngestion();
             if (!success)
             {
-                job.DeleteInternalFiles();
+                // ExternalSstFileIngestionJob::Cleanup removes the files copied into the DB. LogAndApply can fail before
+                // writing anything (dropped column family, a refused edit); but after a MANIFEST I/O error
+                // (VersionSet::io_status_) the record may be durable in the MANIFEST that CURRENT names, and deleting
+                // the files would make the DB unopenable. They are left to the obsolete-file scan (upstream quarantines
+                // the files of such an edit: ErrorHandler::AddFilesToQuarantine).
+                if (!(editSubmitted && Versions.IoStatus is not null)) job.DeleteInternalFiles();
                 lock (_mutex)
                 {
                     foreach (ulong n in job.ReservedFileNumbers) _pendingOutputs.Remove(n);

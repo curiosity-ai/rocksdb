@@ -174,22 +174,21 @@ internal sealed class ErrorHandler
         // 1. Data loss (not file scoped): unrecoverable, overrides any existing error.
         if (err.Scope != IOErrorScope.File && err.DataLoss)
         {
-            RocksDbException? s = NotifyOnBackgroundError(reason, err.WithSeverity(ErrorSeverity.UnrecoverableError), autoRecovery: false, out _);
-            lock (_db.Mutex)
-            {
-                if (s is not null) CheckAndSetRecoveryAndBgError(s, walRelated);
-                return _bgError;
-            }
+            // SetBGErrorImpl sets the error BEFORE notifying the listeners (CheckAndSetRecoveryAndBGError, then
+            // NotifyOnBackgroundError on a copy): unlike an error classified by HandleKnownErrors, a listener can neither
+            // suppress nor replace it. The same holds for the two cases below.
+            RocksDbException unrecoverable = err.WithSeverity(ErrorSeverity.UnrecoverableError);
+            lock (_db.Mutex) CheckAndSetRecoveryAndBgError(unrecoverable, walRelated, FlushReason.ErrorRecovery);
+            NotifyOnBackgroundError(reason, unrecoverable, autoRecovery: false, out _);
+            lock (_db.Mutex) return _bgError;
         }
         // 2. With manual_wal_flush a WAL failure may drop buffered WAL writes: fatal until reopen.
         if (o.ManualWalFlush && walRelated && err.Code == StatusCode.IOError)
         {
-            RocksDbException? s = NotifyOnBackgroundError(reason, err.WithSeverity(ErrorSeverity.FatalError), autoRecovery: false, out _);
-            lock (_db.Mutex)
-            {
-                if (s is not null) CheckAndSetRecoveryAndBgError(s, walRelated);
-                return _bgError;
-            }
+            RocksDbException fatal = err.WithSeverity(ErrorSeverity.FatalError);
+            lock (_db.Mutex) CheckAndSetRecoveryAndBgError(fatal, walRelated, FlushReason.ErrorRecovery);
+            NotifyOnBackgroundError(reason, fatal, autoRecovery: false, out _);
+            lock (_db.Mutex) return _bgError;
         }
         // 3. Retryable (or file scoped) IO errors, except out-of-space ones (left to the SstFileManager upstream).
         if (err.SubCode != StatusSubCode.NoSpace && (err.Scope == IOErrorScope.File || err.Retryable))
@@ -222,19 +221,29 @@ internal sealed class ErrorHandler
             {
                 severity = ErrorSeverity.HardError;
             }
-            RocksDbException? s = NotifyOnBackgroundError(reason, err.WithSeverity(severity), autoResumeEnabled, out bool autoRecovery);
+            RocksDbException retryable = err.WithSeverity(severity);
             lock (_db.Mutex)
             {
-                if (s is null) return _bgError;
-                if (noBgWork)
-                {
-                    _softErrorNoBgWork = true;
-                    _recoveryFlushReason = FlushReason.ErrorRecoveryRetryFlush;
-                }
-                CheckAndSetRecoveryAndBgError(s, walRelated);
-                if (autoRecovery) StartRecoverFromRetryableBgIoError();
-                return _bgError;
+                // soft_error_no_bg_work_ is set whatever the current error is; the recovery context (flush reason) is
+                // only replaced when this error becomes the background error (UpdateRecoveryContext).
+                if (noBgWork) _softErrorNoBgWork = true;
+                CheckAndSetRecoveryAndBgError(retryable, walRelated, noBgWork ? FlushReason.ErrorRecoveryRetryFlush : FlushReason.ErrorRecovery);
             }
+            // The error is already set: the listeners are only told about it (a suppressed or replaced error changes
+            // nothing). Managed extension kept: OnErrorRecoveryBegin can still veto the automatic recovery (upstream
+            // ignores the listeners' auto_recovery here and always calls StartRecoverFromRetryableBGIOError).
+            NotifyOnBackgroundError(reason, retryable, autoResumeEnabled, out bool autoRecovery);
+            RocksDbException? current;
+            bool recoveryEndedByShutdown = false;
+            lock (_db.Mutex)
+            {
+                if (autoRecovery) recoveryEndedByShutdown = StartRecoverFromRetryableBgIoError();
+                current = _bgError;
+            }
+            // StartRecoverFromRetryableBGIOError with end_recovery_ set: the listeners are still told that the recovery
+            // of this error ended with ShutdownInProgress (error_handler.cc).
+            if (recoveryEndedByShutdown && current is not null) NotifyOnErrorRecoveryEnd(current, ShutdownStatus());
+            return current;
         }
         return HandleKnownErrors(err, reason, walRelated);
     }
@@ -286,6 +295,7 @@ internal sealed class ErrorHandler
             if (s is not null && s.Severity > Severity(_bgError))
             {
                 _bgError = s;
+                _recoveryFlushReason = FlushReason.ErrorRecovery; // UpdateRecoveryContext(context, replace_existing_context = true)
                 if (walRelated) _walWriteError = true;
             }
             else
@@ -308,11 +318,19 @@ internal sealed class ErrorHandler
 
     private static ErrorSeverity Severity(RocksDbException? e) => e?.Severity ?? ErrorSeverity.NoError;
 
-    /// <summary>Port of CheckAndSetRecoveryAndBGError. REQUIRES: mutex.</summary>
-    private void CheckAndSetRecoveryAndBgError(RocksDbException err, bool walRelated)
+    /// <summary>
+    /// Port of CheckAndSetRecoveryAndBGError. The recovery context of <paramref name="err"/> (its flush reason) replaces
+    /// the current one only when the error becomes the background error (UpdateRecoveryContext with
+    /// replace_existing_context = severity above the current one). REQUIRES: mutex.
+    /// </summary>
+    private void CheckAndSetRecoveryAndBgError(RocksDbException err, bool walRelated, FlushReason flushReason)
     {
         if (_recoveryInProgress && _recoveryError is null) _recoveryError = err;
-        if (err.Severity > Severity(_bgError)) _bgError = err;
+        if (err.Severity > Severity(_bgError))
+        {
+            _bgError = err;
+            _recoveryFlushReason = flushReason;
+        }
         if (walRelated) _walWriteError = true;
         if (Severity(_bgError) >= ErrorSeverity.HardError) _isDbStopped = true;
     }
@@ -371,7 +389,17 @@ internal sealed class ErrorHandler
             if (cleared is not null) NotifyOnErrorRecoveryEnd(cleared, null);
             return null;
         }
-        RocksDbException? s = await _db.ResumeImplAsync().ConfigureAwait(false);
+        RocksDbException? s;
+        try
+        {
+            s = await _db.ResumeImplAsync().ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            // A failure thrown by the resume is its status: recovery_in_prog_ must not stay set (a later Resume would
+            // be refused with Busy forever).
+            s = RocksDbException.FromException(e);
+        }
         lock (_db.Mutex)
         {
             if (s is not null) _softErrorNoBgWork = softNoBgWorkOnEntry;
@@ -384,12 +412,16 @@ internal sealed class ErrorHandler
         return s;
     }
 
-    /// <summary>Port of StartRecoverFromRetryableBGIOError. REQUIRES: mutex.</summary>
-    private void StartRecoverFromRetryableBgIoError()
+    /// <summary>
+    /// Port of StartRecoverFromRetryableBGIOError. Returns true when no recovery is started because recovery was ended
+    /// for shutdown (end_recovery_): the caller then reports OnErrorRecoveryEnd(bg_error, ShutdownInProgress) outside
+    /// the mutex. REQUIRES: mutex.
+    /// </summary>
+    private bool StartRecoverFromRetryableBgIoError()
     {
-        if (_bgError is null) return;
-        if (_db.Options.MaxBgErrorResumeCount <= 0 || _recoveryInProgress) return;
-        if (_endRecovery) return;
+        if (_bgError is null) return false;
+        if (_db.Options.MaxBgErrorResumeCount <= 0 || _recoveryInProgress) return false;
+        if (_endRecovery) return true;
         _db.Stats?.RecordTick(Ticker.ErrorHandlerAutoresumeCount);
         _db.LogInfo("ErrorHandler: Call StartRecoverFromRetryableBGIOError to resume");
         // Set in the same lock hold as the error, otherwise intervening writes could see an error without a recovery.
@@ -401,6 +433,7 @@ internal sealed class ErrorHandler
             catch (Exception e) when (e is RocksDbException or IOException or ObjectDisposedException or OperationCanceledException) { }
             await RecoverFromRetryableBgIoErrorAsync().ConfigureAwait(false);
         });
+        return false;
     }
 
     /// <summary>Port of ErrorHandler::RecoverFromRetryableBGIOError (the automatic recovery loop).</summary>
@@ -453,8 +486,8 @@ internal sealed class ErrorHandler
                 NotifyOnErrorRecoveryEnd(bg ?? oldError!, bg ?? s);
                 return;
             }
-            if (recoveryError is not null && recoveryError.Severity <= ErrorSeverity.HardError &&
-                (recoveryError.Retryable || recoveryError.Scope == IOErrorScope.File))
+            // recovery_error_.GetRetryable() only: a file-scoped error that is not retryable ends the recovery.
+            if (recoveryError is not null && recoveryError.Severity <= ErrorSeverity.HardError && recoveryError.Retryable)
             {
                 // A new retryable error happened during the recovery: wait and retry.
                 TestHooks.Invoke("RecoverFromRetryableBGIOError:BeforeWait");
@@ -758,10 +791,19 @@ internal sealed partial class DbImpl
                     // edits below persist it (their last_sequence covers it).
                     Versions.SetLastSequence(Versions.LastAllocatedSequence);
                 }
-                foreach (ColumnFamilyData cfd in cfds)
+                // One switch for all column families: the recovery flush below picks exactly these memtables.
+                BeginAtomicSwitch();
+                try
                 {
-                    if (cfd.Dropped) continue;
-                    if (walError || !cfd.Mem.IsEmpty) await SwitchMemtableAsync(cfd, FlushReason.ErrorRecovery, synchronous: false, CancellationToken.None).ConfigureAwait(false);
+                    foreach (ColumnFamilyData cfd in cfds)
+                    {
+                        if (cfd.Dropped) continue;
+                        if (walError || !cfd.Mem.IsEmpty) await SwitchMemtableAsync(cfd, FlushReason.ErrorRecovery, synchronous: false, CancellationToken.None).ConfigureAwait(false);
+                    }
+                }
+                finally
+                {
+                    EndAtomicSwitch();
                 }
             }
             catch (Exception e) when (e is not OutOfMemoryException)
@@ -773,19 +815,35 @@ internal sealed partial class DbImpl
                 ExitUnbatched(w, synchronous: false);
             }
         }
+        // atomic_flush: a background atomic flush still running (it will fail or finish) owns some of the memtables;
+        // flushing the others now would install a partial result.
+        while (true)
+        {
+            Task signal;
+            lock (_mutex)
+            {
+                if (!_atomicFlushRunning) break;
+                signal = _bgSignal.Task;
+            }
+            await signal.ConfigureAwait(false);
+        }
         var members = new List<ColumnFamilyData>();
+        ulong cut;
         lock (_mutex)
         {
+            // Memtables of a switch still in progress (soft errors do not stop writes) are left to the next flush.
+            cut = _atomicCutCompleted;
             foreach (ColumnFamilyData cfd in cfds)
             {
-                if (cfd.Dropped || cfd.FlushRunning || !cfd.HasPendingFlush) continue;
+                if (cfd.Dropped || cfd.FlushRunning || !cfd.HasPendingFlushUpTo(cut)) continue;
                 cfd.FlushRunning = true;
                 _runningFlushes++;
                 _backgroundJobs++;
                 members.Add(cfd);
             }
         }
-        if (retryOnly)
+        // RetryFlushesForErrorRecovery: with atomic_flush the retry is an atomic flush too.
+        if (retryOnly && !Options.AtomicFlush)
         {
             foreach (ColumnFamilyData cfd in members)
             {
@@ -803,7 +861,7 @@ internal sealed partial class DbImpl
         // write batch that spans column families.
         var group = new AtomicFlushGroup(this, members);
         var tasks = new Task[members.Count];
-        for (int i = 0; i < members.Count; i++) tasks[i] = BackgroundFlushAsync(members[i], group);
+        for (int i = 0; i < members.Count; i++) tasks[i] = BackgroundFlushAsync(members[i], group, synchronous: false, cut);
         await Task.WhenAll(tasks).ConfigureAwait(false);
         lock (_mutex)
         {

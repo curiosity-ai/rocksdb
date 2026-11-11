@@ -16,9 +16,11 @@ namespace RocksDb.Managed.Cache;
 /// </remarks>
 public sealed class RowCache
 {
-    private const int NumShards = 16; // power of two
     private const int EntryOverhead = 64;
-    private readonly Shard[] _shards = new Shard[NumShards];
+    // GetDefaultCacheShardBits (cache/sharded_cache.cc) with LRUCache's kMinShardSize.
+    private const long MinShardSize = 512L * 1024;
+    private const int MaxShardBits = 6;
+    private readonly Shard[] _shards; // a power of two
     private long _nextId;
 
     /// <summary>Creates a row cache holding up to <paramref name="capacity"/> bytes of entries.</summary>
@@ -26,9 +28,28 @@ public sealed class RowCache
     {
         ArgumentOutOfRangeException.ThrowIfNegative(capacity);
         Capacity = capacity;
-        long perShard = (capacity + NumShards - 1) / NumShards;
-        for (int i = 0; i < NumShards; i++) _shards[i] = new Shard(perShard);
+        // NewLRUCache(capacity) with num_shard_bits = -1: as many shards as keep each at least 512 KB (at most 64), so
+        // a small cache is one shard and an entry up to its whole capacity can be cached.
+        int numShards = 1 << DefaultShardBits(capacity);
+        _shards = new Shard[numShards];
+        long perShard = (capacity + numShards - 1) / numShards;
+        for (int i = 0; i < numShards; i++) _shards[i] = new Shard(perShard);
     }
+
+    /// <summary>Port of GetDefaultCacheShardBits(capacity, min_shard_size = 512 KB).</summary>
+    internal static int DefaultShardBits(long capacity)
+    {
+        int bits = 0;
+        long numShards = capacity / MinShardSize;
+        while ((numShards >>= 1) != 0)
+        {
+            if (++bits >= MaxShardBits) return bits; // No more than 6.
+        }
+        return bits;
+    }
+
+    /// <summary>Number of shards (ShardedCache::GetNumShardBits as a count).</summary>
+    internal int NumShards => _shards.Length;
 
     /// <summary>Capacity in bytes (Cache::GetCapacity).</summary>
     public long Capacity { get; }
@@ -79,7 +100,7 @@ public sealed class RowCache
     private Shard ShardFor(ReadOnlySpan<byte> key, out int hash)
     {
         hash = KeyComparer.HashOf(key);
-        return _shards[(hash >> 7) & (NumShards - 1)];
+        return _shards[(hash >> 7) & (_shards.Length - 1)];
     }
 
     /// <summary>The replay log cached for <paramref name="key"/>; the array is immutable and may be held by the caller.</summary>

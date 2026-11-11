@@ -665,6 +665,12 @@ internal sealed partial class DbImpl
             if (Volatile.Read(ref _protectedWrites) != 0)
                 VerifyWalRecordProtection(valid == 1 && !firstValid!.Batch!.HasWalTerminationPoint ? firstValid.Batch : _groupBatch);
             LogWriter log = _log!;
+            // wal_context.prev_size (DBImpl::WriteImpl, one write queue only): the WAL's size before this group's record.
+            if (!_twoWriteQueues)
+            {
+                _walPrevSize = log.File?.Size ?? -1;
+                _walPrevSizeNumber = _logNumber;
+            }
             // DBImpl::WriteToWAL: record the timestamp sizes of column families with timestamps not yet recorded
             // in this WAL (recovery uses them to reconcile timestamp-size changes).
             if (_cfTimestampSizes is { } tsSizes) log.MaybeAddUserDefinedTimestampSizeRecord(tsSizes);
@@ -702,8 +708,11 @@ internal sealed partial class DbImpl
             // replaces the WAL and never writes to or syncs the failed one again. Its record may be complete in the
             // failed WAL while the write is not in the DB: fence the range from WAL iterators (WALIOStatusCheck ->
             // RecordIndeterminateWriteSequence).
-            WalRecoverySequences.Record(_logNumber, Util.Coding.DecodeFixed64(record.Span), last);
-            SetBackgroundError(e, BackgroundErrorReason.WriteCallback, walRelated: true);
+            if (WalErrorStopsWrites(e))
+            {
+                WalRecoverySequences.Record(_logNumber, Util.Coding.DecodeFixed64(record.Span), last);
+                SetBackgroundError(e, BackgroundErrorReason.WriteCallback, walRelated: true);
+            }
             throw;
         }
         for (int i = 0; i < group.Count; i++)
@@ -762,6 +771,15 @@ internal sealed partial class DbImpl
         {
             // DBImpl::WriteImpl: the leader's status is the group's insert status (w.status = InsertInto(write_group)).
             leader.Error ??= insertError;
+            // DBImpl::WriteImpl: "logs_.back().SetAttemptTruncateSize(wal_context.prev_size)". The group's record is in
+            // the WAL but the group is not in the DB: closing the DB cuts the WAL back to its size before the record
+            // (CloseAsync), so the next open does not replay the refused write.
+            if (walRecordBytes > 0 && !leader.DisableWal && !_twoWriteQueues && _walPrevSize >= 0 && _walPrevSizeNumber == _logNumber &&
+                _walAttemptTruncateSize < 0)
+            {
+                _walAttemptTruncateSize = _walPrevSize;
+                _walAttemptTruncateNumber = _logNumber;
+            }
             HandleMemTableInsertFailure(insertError);
         }
         RecordWriteGroup(group, total, walRecordBytes, !leader.DisableWal, needSync);
@@ -775,6 +793,50 @@ internal sealed partial class DbImpl
     /// memtable above the last sequence until the DB is reopened).
     /// </summary>
     private void HandleMemTableInsertFailure(Exception e) => SetBackgroundError(e, BackgroundErrorReason.MemTable, walRelated: false);
+
+    /// <summary>
+    /// Port of the condition of DBImpl::WALIOStatusCheck: a failed WAL write or sync becomes a background error only
+    /// with paranoid_checks (and not for Busy / Incomplete), or when the error is IOFenced. Otherwise the write just
+    /// fails and the current WAL stays writable ("Force writable file to be continue writable":
+    /// logs_.back().writer->file()->reset_seen_error()); returns false then.
+    /// </summary>
+    private bool WalErrorStopsWrites(Exception e)
+    {
+        RocksDbException status = RocksDbException.FromException(e);
+        if ((Options.ParanoidChecks && status.Code is not (StatusCode.Busy or StatusCode.Incomplete)) || status.SubCode == StatusSubCode.IOFenced)
+        {
+            return true;
+        }
+        _log?.ResetSeenError();
+        return false;
+    }
+
+    // wal_context.prev_size / LogWriterNumber::attempt_truncate_size (db_impl.h). Written by the write leader; the
+    // truncate size is read when the DB closes (no writer is active then).
+    private long _walPrevSize = -1;
+    private ulong _walPrevSizeNumber;
+    private long _walAttemptTruncateSize = -1;
+    private ulong _walAttemptTruncateNumber;
+
+    /// <summary>
+    /// Port of LogWriterNumber::ClearWriter's truncation (db_impl.h): after a failed memtable insert the current WAL is
+    /// cut back to its size before the failed write's record. Best effort, like upstream: errors are ignored and a file
+    /// that cannot be truncated while open is left alone.
+    /// </summary>
+    private void MaybeTruncateWalOnClose(LogWriter log)
+    {
+        long size = _walAttemptTruncateSize;
+        if (size < 0 || log.LogNumber != _walAttemptTruncateNumber) return;
+        try
+        {
+            log.WriteBuffer();
+            if (log.File is Env.ITruncatableWritableFile file && size < log.File.Size) file.Truncate(size);
+        }
+        catch (Exception e) when (e is IOException or RocksDbException)
+        {
+            LogWarn("Unable to truncate WAL " + FileNames.LogFileName(WalDir, log.LogNumber) + " -- " + e.Message);
+        }
+    }
 
     /// <summary>
     /// WriteBatchInternal::InsertInto(write_group): the memtable inserts of the group's writers, one after another. Stops
@@ -987,13 +1049,15 @@ internal sealed partial class DbImpl
             if (_pipelined) await WaitForMemTableWritersAsync(synchronous).ConfigureAwait(false);
             // unordered_write: likewise for the memtable inserts of earlier write groups (WaitForPendingWrites).
             await WaitForPendingWritesAsync(synchronous).ConfigureAwait(false);
-            for (int i = 0; i < _flushScheduler.Count; i++)
+            // ScheduleFlushes: with atomic_flush every column family with data is switched and one request flushes them.
+            try
             {
-                ColumnFamilyData cfd = _flushScheduler[i];
-                if (cfd.Dropped || cfd.Mem.IsEmpty) continue;
-                await SwitchMemtableAsync(cfd, FlushReason.WriteBufferFull, synchronous, cancellationToken).ConfigureAwait(false);
+                await SwitchMemtablesForFlushAsync(_flushScheduler, FlushReason.WriteBufferFull, synchronous, cancellationToken).ConfigureAwait(false);
             }
-            _flushScheduler.Clear();
+            finally
+            {
+                _flushScheduler.Clear();
+            }
         }
         WriteBufferManager wbm = WriteBufferManager;
         if (wbm.Enabled && (wbm.ShouldFlush() || wbm.ShouldStall()))
@@ -1142,10 +1206,21 @@ internal sealed partial class DbImpl
                 _walDirSynced = false;
                 _aliveWals.Add(newLogNumber);
             }
+            // SwitchMemtable: "if (cf->IsEmpty()) ... cf->mem()->SetCreationSeq(versions_->LastSequence())" for every
+            // column family, with or without a new WAL (the creation sequence orders memtables by age for the write
+            // buffer manager's flush pick).
+            ulong lastSequence = Versions.LastSequence;
+            foreach (ColumnFamilyData c in Versions.ColumnFamilies)
+            {
+                if (c.Mem.IsEmpty && c.NumNotFlushed == 0) c.Mem.SetCreationSequence(lastSequence);
+            }
             MemTable mem = cfd.Mem;
             // RotateCurrentGeneration: the blob direct write files of this memtable are registered by its flush.
             Blob.BlobDirectWriteGeneration? generation = cfd.BlobDirectWrite?.RotateGeneration();
-            cfd.Imm.Add(new ImmutableMemTable(mem, newLogNumber) { FlushReason = reason, BlobGeneration = generation });
+            // A switch outside BeginAtomicSwitch / EndAtomicSwitch is complete (flushable) by itself.
+            ulong cut = _atomicSwitchCut != 0 ? _atomicSwitchCut : ++_atomicCutNext;
+            if (_atomicSwitchCut == 0) _atomicCutCompleted = cut;
+            cfd.Imm.Add(new ImmutableMemTable(mem, newLogNumber) { FlushReason = reason, BlobGeneration = generation, AtomicCut = cut });
             mem.MarkImmutable();
             if (generation is not null) ProtectBlobDirectWriteFiles(cfd, mem, generation);
             if (HasListeners) EnqueueMemTableSealed(cfd, mem);
@@ -1309,8 +1384,8 @@ internal sealed partial class DbImpl
     /// family whose data is in the oldest alive WAL (OldestLogToKeep &lt;= that WAL) and flush them (FlushReason
     /// kWalFull), letting the WAL be released. Done once per oldest WAL (getting_flushed). Only called with more than
     /// one column family (a single CF's memtables already bound its WALs). REQUIRES: write leader.
-    /// Not ported: the 2PC check for outstanding prepared transactions in the oldest WAL (unable_to_release_oldest_log_)
-    /// and atomic_flush column family selection.
+    /// With atomic_flush every column family with data is switched (SelectColumnFamiliesForAtomicFlush).
+    /// Not ported: the 2PC check for outstanding prepared transactions in the oldest WAL (unable_to_release_oldest_log_).
     /// </summary>
     private async ValueTask SwitchWalAsync(bool synchronous, CancellationToken cancellationToken)
     {
@@ -1331,12 +1406,8 @@ internal sealed partial class DbImpl
         }
         LogInfo("Flushing all column families with data in WAL number " + oldest + ". Total log size is " + Volatile.Read(ref _walsTotalSize) +
                 " while max_total_wal_size is " + GetMaxTotalWalSize());
-        foreach (ColumnFamilyData cfd in cfds)
-        {
-            // An empty memtable is not switched: its log number advances with the next WAL switch (SwitchMemtable).
-            if (cfd.Dropped || cfd.Mem.IsEmpty) continue;
-            await SwitchMemtableAsync(cfd, FlushReason.WalFull, synchronous, cancellationToken).ConfigureAwait(false);
-        }
+        // An empty memtable is not switched: its log number advances with the next WAL switch (SwitchMemtable).
+        await SwitchMemtablesForFlushAsync(cfds, FlushReason.WalFull, synchronous, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Test helper (TEST_SwitchMemtable): switches the default column family's memtable and WAL.</summary>
@@ -1752,7 +1823,7 @@ internal sealed partial class DbImpl
         }
 
         /// <summary>IsDuplicateKeySeq (util/duplicate_detector.h): recovery of a column family whose insert is skipped.</summary>
-        private bool IsDuplicateKeySeq(uint cf, ReadOnlySpan<byte> key) => (_dupDetector ??= new DuplicateDetector()).IsDuplicateKeySeq(cf, key, Sequence);
+        private bool IsDuplicateKeySeq(uint cf, ReadOnlySpan<byte> key) => (_dupDetector ??= new DuplicateDetector(_db)).IsDuplicateKeySeq(cf, key, Sequence);
 
         public void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
         {
@@ -1985,12 +2056,14 @@ internal sealed partial class DbImpl
 
     /// <summary>
     /// Port of DuplicateDetector (util/duplicate_detector.h): detects a key repeated within the current sub-batch
-    /// sequence number (recovery of a column family whose memtable insert is skipped). Keys are compared bytewise.
+    /// sequence number (recovery of a column family whose memtable insert is skipped). Like upstream's
+    /// std::set&lt;Slice, SetComparator&gt; (InitWithComp), keys are compared with the column family's comparator: keys it
+    /// considers equal are duplicates even when their bytes differ (the memtable would have refused the second one).
     /// </summary>
-    private sealed class DuplicateDetector
+    private sealed class DuplicateDetector(DbImpl db)
     {
         private ulong _batchSeq;
-        private readonly Dictionary<uint, HashSet<byte[]>> _keys = new();
+        private readonly Dictionary<uint, ISet<byte[]>> _keys = new();
 
         public bool IsDuplicateKeySeq(uint cf, ReadOnlySpan<byte> key, ulong seq)
         {
@@ -2000,11 +2073,22 @@ internal sealed partial class DbImpl
                 _keys.Clear();
             }
             _batchSeq = seq;
-            if (!_keys.TryGetValue(cf, out HashSet<byte[]>? set)) _keys[cf] = set = new HashSet<byte[]>(ByteArrayContentComparer.Instance);
+            if (!_keys.TryGetValue(cf, out ISet<byte[]>? set)) _keys[cf] = set = NewSet(cf);
             if (set.Add(key.ToArray())) return false;
             _keys.Clear();
-            _keys[cf] = new HashSet<byte[]>(ByteArrayContentComparer.Instance) { key.ToArray() };
+            set = NewSet(cf);
+            set.Add(key.ToArray());
+            _keys[cf] = set;
             return true;
+        }
+
+        /// <summary>InitWithComp: the key set of a column family, ordered by its comparator.</summary>
+        private ISet<byte[]> NewSet(uint cf)
+        {
+            Comparator cmp = db.UserComparatorOf(cf);
+            return cmp.CanKeysWithDifferentByteContentsBeEqual
+                ? new SortedSet<byte[]>(Comparer<byte[]>.Create((a, b) => cmp.Compare(a, b)))
+                : new HashSet<byte[]>(ByteArrayContentComparer.Instance);
         }
     }
 

@@ -163,6 +163,15 @@ internal sealed class LoudsTrieBuilder : IDisposable
             ReadOnlySpan<byte> key = Key(ki);
             uint k = (uint)key.Length;
             uint lcp = ki > 0 ? Lcp(Key(ki - 1), key) : 0;
+            if (k == 0 && ki == 0)
+            {
+                // Deviation from upstream (which adds no label for a zero-length key and so loses its handle, see
+                // LoudsTrieBuilder::Finish): the empty key (a data block ending with the empty user key) is the
+                // root's prefix key. The format and the iterators support a prefix key on any node, the root included.
+                levels[0].IsPrefix[0] = true;
+                levels[0].PrefixHandle[0] = ki;
+                continue;
+            }
             // Step 1: retroactive internal marking (leaf -> internal) with handle migration to a prefix-key child.
             if (lcp > 0)
             {
@@ -246,6 +255,9 @@ internal sealed class LoudsTrieBuilder : IDisposable
                 if (labelStart == labelEnd)
                 {
                     if (ld.IsPrefix[ni] && isDense) _denseLeafCount++;
+                    // A trie holding only the empty key: the label-less root still records its prefix bit (always
+                    // sparse: ComputeCutoffLevel returns 0 for a level without labels).
+                    if (level == 0 && ld.IsPrefix[ni] && !isDense) _sIsPrefixKey.Append(true);
                     continue;
                 }
                 if (isDense)
@@ -292,7 +304,7 @@ internal sealed class LoudsTrieBuilder : IDisposable
             }
         }
         if (_cutoffLevel == 0) _denseChildCount = 1;
-        if (bfsHandles.Count != n) ThrowHelper.InvalidArgument("Trie index: keys must be non-empty, distinct and sorted");
+        if (bfsHandles.Count != n) ThrowHelper.InvalidArgument("Trie index: keys must be distinct and sorted");
         _handles = bfsHandles;
         if (_hasSeqnoEncoding)
         {

@@ -130,6 +130,8 @@ public abstract class MultiCfIteratorBase : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         _forward = forward;
+        // A child that fails (throws) leaves the iterator invalid (considerStatus + heap.clear() upstream).
+        _currentCount = 0;
         foreach (Iterator it in _children) seek(it, target);
         Position();
     }
@@ -137,7 +139,10 @@ public abstract class MultiCfIteratorBase : IDisposable
     /// <summary>AdvanceIterator: moves every child at the current key (the top and its equals) one step.</summary>
     private void Advance(Action<Iterator> step)
     {
-        for (int i = 0; i < _currentCount; i++) step(_children[_current[i]]);
+        // A child that fails (throws) leaves the iterator invalid (considerStatus + heap.clear() upstream).
+        int n = _currentCount;
+        _currentCount = 0;
+        for (int i = 0; i < n; i++) step(_children[_current[i]]);
         Position();
     }
 

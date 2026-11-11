@@ -31,6 +31,38 @@ internal static class FileReadActivity
 }
 
 /// <summary>
+/// The bytes a background job really read from table files: the job-scoped stand-in for the job thread's
+/// IOSTATS(bytes_read) (CompactionJob::RecordCompactionIOStats, db/compaction/compaction_job.cc). The job installs
+/// its counter on every thread it runs on (<see cref="Enter"/> / <see cref="Exit"/>); a file read captures the
+/// current counter before it starts, so a read that completes on another thread is still attributed to the job.
+/// </summary>
+internal sealed class JobIoCounter
+{
+    [ThreadStatic] private static JobIoCounter? t_current;
+
+    private long _bytesRead;
+
+    /// <summary>Bytes read from files by the job's threads so far.</summary>
+    public ulong BytesRead => (ulong)Volatile.Read(ref _bytesRead);
+
+    public static JobIoCounter? Current => t_current;
+
+    public static JobIoCounter? Enter(JobIoCounter counter)
+    {
+        JobIoCounter? previous = t_current;
+        t_current = counter;
+        return previous;
+    }
+
+    public static void Exit(JobIoCounter? previous) => t_current = previous;
+
+    public void AddRead(int bytes)
+    {
+        if (bytes > 0) Interlocked.Add(ref _bytesRead, bytes);
+    }
+}
+
+/// <summary>
 /// Timing decorator of a file read through RandomAccessFileReader (its StopWatch in Read / ReadAsync,
 /// file/random_access_file_reader.cc): every read records the reader's hist_type_ (<paramref name="readHistogram"/>:
 /// SST_READ_MICROS for table files, BLOB_DB_BLOB_FILE_READ_MICROS for blob files) and the histogram of the current
@@ -54,13 +86,28 @@ internal sealed class StatisticsRandomAccessFile(IRandomAccessFile inner, Statis
     {
     }
 
+    /// <summary>
+    /// The file is a table file of the last level (RandomAccessFileReader's is_last_level, "level == num_levels - 1"
+    /// when TableCache::GetTableReader opened it): its reads count in LAST_LEVEL_READ_BYTES / _COUNT, those of every
+    /// other file in NON_LAST_LEVEL_READ_BYTES / _COUNT (RecordIOStats, file/random_access_file_reader.cc).
+    /// </summary>
+    public bool IsLastLevel { get; init; }
+
     public long Length => inner.Length;
+
+    private void RecordIoStats(int bytes)
+    {
+        statistics.RecordTick(IsLastLevel ? Ticker.LastLevelReadBytes : Ticker.NonLastLevelReadBytes, (ulong)Math.Max(bytes, 0));
+        statistics.RecordTick(IsLastLevel ? Ticker.LastLevelReadCount : Ticker.NonLastLevelReadCount);
+    }
 
     public int Read(long offset, Span<byte> destination)
     {
         long t0 = statistics.StartTimer();
         int activity = FileReadActivity.Current;
         int n = inner.Read(offset, destination);
+        JobIoCounter.Current?.AddRead(n);
+        RecordIoStats(n);
         if (t0 != 0) Record(t0, activity);
         return n;
     }
@@ -69,21 +116,26 @@ internal sealed class StatisticsRandomAccessFile(IRandomAccessFile inner, Statis
     {
         long t0 = statistics.StartTimer();
         int activity = FileReadActivity.Current;
+        JobIoCounter? job = JobIoCounter.Current;
         ValueTask<int> t = inner.ReadAsync(offset, destination, cancellationToken);
-        if (t0 == 0) return t;
         if (t.IsCompletedSuccessfully)
         {
-            Record(t0, activity);
-            return t;
+            int n = t.Result;
+            job?.AddRead(n);
+            RecordIoStats(n);
+            if (t0 != 0) Record(t0, activity);
+            return new ValueTask<int>(n);
         }
-        return Await(t, t0, activity);
+        return Await(t, t0, activity, job);
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    private async ValueTask<int> Await(ValueTask<int> t, long t0, int activity)
+    private async ValueTask<int> Await(ValueTask<int> t, long t0, int activity, JobIoCounter? job)
     {
         int n = await t.ConfigureAwait(false);
-        Record(t0, activity);
+        job?.AddRead(n);
+        RecordIoStats(n);
+        if (t0 != 0) Record(t0, activity);
         return n;
     }
 

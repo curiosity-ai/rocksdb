@@ -166,12 +166,22 @@ public sealed class ManifestReplayer
         // AtomicGroupReadBuffer::AddEdit
         if (edit.IsInAtomicGroup)
         {
-            if (_atomicGroup.Count == 0) _atomicGroupSize = checked((int)edit.RemainingEntries + 1);
+            if (_atomicGroup.Count == 0)
+            {
+                // A count that cannot be a real group (upstream would try to allocate replay_buffer_ for it) is corruption,
+                // not an arithmetic overflow.
+                if (edit.RemainingEntries >= int.MaxValue) ThrowHelper.Corruption("corrupted atomic group");
+                _atomicGroupSize = (int)edit.RemainingEntries + 1;
+            }
             _atomicGroup.Add(edit);
             if (_atomicGroup.Count + edit.RemainingEntries != _atomicGroupSize) ThrowHelper.Corruption("corrupted atomic group");
             if (_atomicGroup.Count == _atomicGroupSize)
             {
-                _pit?.OnAtomicGroupBegin(_state);
+                if (_pit is not null)
+                {
+                    _pit.MissingInfo = !_hasLogNumber || !_hasNextFile || !_hasLastSequence;
+                    _pit.OnAtomicGroupBegin(_state);
+                }
                 foreach (VersionEdit e in _atomicGroup) ApplyVersionEdit(e);
                 _pit?.OnAtomicGroupEnd();
                 _atomicGroup.Clear();
@@ -265,7 +275,11 @@ public sealed class ManifestReplayer
             {
                 ThrowHelper.Corruption("MANIFEST record referencing unknown column family");
             }
-            _pit?.BeforeApply(cf, edit);
+            if (_pit is not null)
+            {
+                _pit.MissingInfo = !_hasLogNumber || !_hasNextFile || !_hasLastSequence;
+                _pit.BeforeApply(cf, edit);
+            }
             ApplyFileChanges(cf, edit, RecordedTimestampSize(cf));
             _pit?.AfterApply(cf, edit);
         }
@@ -293,7 +307,17 @@ public sealed class ManifestReplayer
                 cf.ComparatorName = edit.ComparatorName;
                 cf.PersistUserDefinedTimestamps = edit.PersistUserDefinedTimestamps ?? true;
             }
-            if (edit.FullHistoryTsLow is { Length: > 0 } ts) cf.FullHistoryTsLow = ts;
+            if (edit.FullHistoryTsLow is { Length: > 0 } ts)
+            {
+                // VersionEditHandler::ExtractInfoFromVersionEdit -> ColumnFamilyData::SetFullHistoryTsLow: only increases
+                // (two racing IncreaseFullHistoryTsLow calls can log a lower value after a higher one). The comparator is
+                // only known here when it is a built-in one; otherwise the last value wins.
+                if (cf.FullHistoryTsLow is not { } cur || cur.Length != ts.Length || cf.ComparatorName is null
+                    || !Comparator.TryGetBuiltin(cf.ComparatorName, out Comparator? ucmp) || ucmp.CompareTimestamp(ts, cur) > 0)
+                {
+                    cf.FullHistoryTsLow = ts;
+                }
+            }
         }
         if (edit.PrevLogNumber is ulong prev) _state.PrevLogNumber = prev;
         if (edit.NextFileNumber is ulong next)
@@ -445,12 +469,17 @@ public sealed class ManifestReplayer
     private void SortLevels(ColumnFamilyVersion cf)
     {
         Comparator ucmp = (cf.ComparatorName is not null ? _comparatorResolver?.Invoke(cf.ComparatorName) : null) ?? Comparator.Bytewise;
+        // VersionBuilder::SaveSSTFilesTo: while some file of the column family has no epoch number
+        // (EpochNumberRequirement::kMightMissing is not promoted), L0 is ordered by NewestFirstBySeqNo only.
+        bool epochMightMiss = false;
+        foreach ((_, FileMetaData f) in cf.AllFiles()) epochMightMiss |= f.EpochNumber == FileMetaData.UnknownEpochNumber;
         for (int level = 0; level < cf.NumLevels; level++)
         {
             List<FileMetaData> files = cf.MutableLevel(level);
             if (level == 0)
             {
-                files.Sort(static (a, b) => CompareNewestFirst(a, b)); // NewestFirstByEpochNumber
+                if (epochMightMiss) files.Sort(static (a, b) => CompareNewestFirstBySeqNo(a, b));
+                else files.Sort(static (a, b) => CompareNewestFirst(a, b)); // NewestFirstByEpochNumber
             }
             else
             {
@@ -466,6 +495,12 @@ public sealed class ManifestReplayer
     internal static int CompareNewestFirst(FileMetaData a, FileMetaData b)
     {
         if (a.EpochNumber != b.EpochNumber) return b.EpochNumber.CompareTo(a.EpochNumber);
+        return CompareNewestFirstBySeqNo(a, b);
+    }
+
+    /// <summary>NewestFirstBySeqNo (db/version_set.h).</summary>
+    internal static int CompareNewestFirstBySeqNo(FileMetaData a, FileMetaData b)
+    {
         if (a.LargestSeqno != b.LargestSeqno) return b.LargestSeqno.CompareTo(a.LargestSeqno);
         if (a.SmallestSeqno != b.SmallestSeqno) return b.SmallestSeqno.CompareTo(a.SmallestSeqno);
         return b.FileNumber.CompareTo(a.FileNumber);

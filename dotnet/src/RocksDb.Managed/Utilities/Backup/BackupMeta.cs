@@ -202,7 +202,10 @@ internal sealed class BackupMeta
         while (li < lines.Count)
         {
             line = lines[li++];
+            // StringSplit (util/string_util.cc, std::getline): no component after a trailing delimiter, none for "".
             string[] components = line.Split(' ');
+            if (components[^1].Length == 0) components = components[..^1];
+            if (components.Length < 1) ThrowHelper.Corruption("Empty line instead of file entry.");
             if (schemaMajorVersion >= 2 && components.Length == 2 && line == FooterMarker)
             {
                 footerPresent = true;
@@ -355,7 +358,10 @@ internal sealed class BackupMeta
         fs.RenameFile(MetaTmpFilename, MetaFilename);
     }
 
-    /// <summary>LineFileReader: lines split on '\n' (a final line without newline is returned too).</summary>
+    /// <summary>
+    /// LineFileReader::ReadLine: the lines terminated by '\n'. Text after the last '\n' is not a line (ReadLine returns
+    /// false at EOF without a delimiter), so a meta file cut in the middle of its last entry misses that entry.
+    /// </summary>
     private static List<string> ReadLines(IFileSystem fs, string path)
     {
         long size = fs.GetFileSize(path);
@@ -373,7 +379,7 @@ internal sealed class BackupMeta
         }
         string text = Encoding.UTF8.GetString(data);
         var lines = new List<string>(text.Split('\n'));
-        if (lines.Count > 0 && lines[^1].Length == 0) lines.RemoveAt(lines.Count - 1);
+        lines.RemoveAt(lines.Count - 1); // empty after a final '\n', else an unterminated fragment
         return lines;
     }
 

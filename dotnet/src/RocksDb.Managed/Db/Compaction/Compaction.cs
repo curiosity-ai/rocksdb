@@ -118,6 +118,12 @@ internal sealed class Compaction
     /// </summary>
     public ulong KeepInLastLevelThroughSeqno { get; private set; } = DbFormat.MaxSequenceNumber;
 
+    /// <summary>
+    /// GetProximalOutputRangeType() as its upstream enum value (db/compaction/compaction.h): 0 = kNotSupported (no
+    /// per-key placement), 1 = kFullRange, 2 = kNonLastRange.
+    /// </summary>
+    public int ProximalOutputRangeType { get; private set; }
+
     private byte[] _proximalLevelSmallest = [];
     private byte[] _proximalLevelLargest = [];
 
@@ -179,6 +185,7 @@ internal sealed class Compaction
         // FIXME upstream: when the last level's input range does not overlap with the proximal level, and the proximal
         // level input is empty, the range stays unset and no key is compacted up.
         GetBoundaryInternalKeys(InputStorage.Icmp, _inputs, excludeLevel, out _proximalLevelSmallest, out _proximalLevelLargest);
+        ProximalOutputRangeType = fullRange ? 1 : 2;
         if (!fullRange)
         {
             // If not full range in proximal level, must keep everything already in the last level there, because moving
@@ -298,6 +305,9 @@ internal sealed class Compaction
     public uint MaxSubcompactions { get; set; }
     /// <summary>The files the compaction added to the LSM (outputs or trivially moved files), set once it is installed.</summary>
     public List<FileMetaData>? InstalledFiles { get; set; }
+
+    /// <summary>Compaction::ShouldNotifyOnCompactionCompleted: set once OnCompactionBegin was raised for this compaction.</summary>
+    internal bool NotifyOnCompactionCompleted { get; set; }
 
     /// <summary>CompactFiles with a compaction_job_info output: the job builds <see cref="JobInfo"/> when it finishes.</summary>
     internal bool BuildJobInfo { get; set; }

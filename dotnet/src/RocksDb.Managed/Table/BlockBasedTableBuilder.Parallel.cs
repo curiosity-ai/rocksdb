@@ -135,9 +135,12 @@ public sealed partial class BlockBasedTableBuilder
             slot.Error = null;
             ExceptionDispatchInfo.Throw(error);
         }
+        // CompressAndVerifyBlock: stored uncompressed after an attempt = rejected, without one = bypassed.
         if (slot.Rejected) _props.NumDataBlocksCompressionRejected++;
+        else if (slot.Type == CompressionType.None) _props.NumDataBlocksCompressionBypassed++;
         ReadOnlySpan<byte> raw = slot.RawSpan;
         bool compressed = slot.Type != CompressionType.None;
+        if (!compressed) RecordUncompressedBlock(slot.Rejected, raw.Length);
         BlockHandle handle = WriteMaybeCompressedBlock(compressed ? slot.Compressed.WrittenSpan : raw, slot.Type, isDataBlock: true,
             out bool skipDeltaEncoding, hasRawChecksum: slot.HasRawChecksum, rawChecksum: slot.RawChecksum);
         _props.DataSize = _offset;

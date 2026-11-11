@@ -100,16 +100,18 @@ internal static class FileChecksumHelper
 {
     /// <summary>
     /// Opens <paramref name="path"/> for writing; with <see cref="WritableFileOptions.FileChecksumGenFactory"/> the file
-    /// computes its checksum while written (WritableFileWriter::checksum_generator_).
+    /// computes its checksum while written (WritableFileWriter::checksum_generator_). The file keeps a sticky error
+    /// state like WritableFileWriter (see <see cref="WriterFile"/>).
     /// </summary>
     public static IWritableFile CreateWritable(IFileSystem fs, string path, WritableFileOptions options)
     {
         IWritableFile file = fs.CreateWritable(path, truncate: true, options);
-        FileChecksumGenFactory? factory = options.FileChecksumGenFactory;
-        if (factory is null) return file;
-        FileChecksumGenerator? gen = factory.CreateFileChecksumGenerator(new FileChecksumGenContext(path, ""));
-        return gen is null ? file : new ChecksummingWritableFile(file, gen);
+        FileChecksumGenerator? gen = options.FileChecksumGenFactory?.CreateFileChecksumGenerator(new FileChecksumGenContext(path, ""));
+        return new WriterFile(file, gen);
     }
+
+    /// <summary>Gives <paramref name="file"/> the sticky error state of WritableFileWriter (no checksum).</summary>
+    public static IWritableFile WithStickyError(IWritableFile file) => new WriterFile(file, null);
 
     /// <summary>
     /// The finalized checksum of a file created by <see cref="CreateWritable"/> after its last append, or the unknown
@@ -117,7 +119,7 @@ internal static class FileChecksumHelper
     /// </summary>
     public static (byte[] Checksum, string FuncName) GetChecksum(IWritableFile file)
     {
-        if (file is not ChecksummingWritableFile c) return ([], Db.FileMetaData.UnknownFileChecksumFuncName);
+        if (file is not WriterFile { HasChecksum: true } c) return ([], Db.FileMetaData.UnknownFileChecksumFuncName);
         return c.FinalizeChecksum();
     }
 
@@ -164,28 +166,123 @@ internal static class FileChecksumHelper
     /// <summary>Slice::ToString(hex = true): upper-case hex.</summary>
     public static string Hex(ReadOnlySpan<byte> data) => Convert.ToHexString(data);
 
-    private sealed class ChecksummingWritableFile(IWritableFile inner, FileChecksumGenerator generator) : IWritableFile
+    /// <summary>
+    /// The part of WritableFileWriter (file/writable_file_writer.cc) the engine's table and blob file writers rely on:
+    /// the optional checksum generator (checksum_generator_) and the sticky error state (seen_error_). After a failed
+    /// Append / Flush / Sync the contents and durability of the file are unknown, so every later Append, Flush and Sync
+    /// fails with IOError "Writer has previous error." instead of reaching the file: such a file can never be reported
+    /// finished or synced by a retry. Dispose still closes the file (WritableFileWriter::Close closes it too).
+    /// Not thread-safe, like the files it wraps (one writer).
+    /// </summary>
+    internal sealed class WriterFile(IWritableFile inner, FileChecksumGenerator? generator) : IWritableFile
     {
         private (byte[], string)? _result;
+        private bool _seenError;
+
+        /// <summary>An append, flush or sync of this file failed (WritableFileWriter::seen_error).</summary>
+        public bool SeenError => _seenError;
+
+        public bool HasChecksum => generator is not null;
 
         public long Size => inner.Size;
 
+        private void ThrowIfSeenError()
+        {
+            if (_seenError) throw new RocksDbException(StatusCode.IOError, "IO error: Writer has previous error.");
+        }
+
         public void Append(ReadOnlySpan<byte> data)
         {
-            generator.Update(data);
-            inner.Append(data);
+            ThrowIfSeenError();
+            generator?.Update(data);
+            try
+            {
+                inner.Append(data);
+            }
+            catch
+            {
+                _seenError = true;
+                throw;
+            }
         }
 
         public ValueTask AppendAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
         {
-            generator.Update(data.Span);
-            return inner.AppendAsync(data, cancellationToken);
+            ThrowIfSeenError();
+            generator?.Update(data.Span);
+            return Guard(inner, static (f, d, ct) => f.AppendAsync(d, ct), data, cancellationToken);
         }
 
-        public ValueTask FlushAsync(CancellationToken cancellationToken = default) => inner.FlushAsync(cancellationToken);
-        public ValueTask SyncAsync(CancellationToken cancellationToken = default) => inner.SyncAsync(cancellationToken);
-        public void Flush() => inner.Flush();
-        public void Sync() => inner.Sync();
+        public ValueTask FlushAsync(CancellationToken cancellationToken = default)
+        {
+            ThrowIfSeenError();
+            return Guard(inner, static (f, _, ct) => f.FlushAsync(ct), default, cancellationToken);
+        }
+
+        public ValueTask SyncAsync(CancellationToken cancellationToken = default)
+        {
+            ThrowIfSeenError();
+            return Guard(inner, static (f, _, ct) => f.SyncAsync(ct), default, cancellationToken);
+        }
+
+        public void Flush()
+        {
+            ThrowIfSeenError();
+            try
+            {
+                inner.Flush();
+            }
+            catch
+            {
+                _seenError = true;
+                throw;
+            }
+        }
+
+        public void Sync()
+        {
+            ThrowIfSeenError();
+            try
+            {
+                inner.Sync();
+            }
+            catch
+            {
+                _seenError = true;
+                throw;
+            }
+        }
+
+        /// <summary>Runs the operation; a failure (synchronous or not) sets the sticky error. No allocation when it completes synchronously.</summary>
+        private ValueTask Guard(IWritableFile file, Func<IWritableFile, ReadOnlyMemory<byte>, CancellationToken, ValueTask> op,
+            ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
+        {
+            ValueTask t;
+            try
+            {
+                t = op(file, data, cancellationToken);
+            }
+            catch
+            {
+                _seenError = true;
+                throw;
+            }
+            return t.IsCompletedSuccessfully ? t : Awaited(t);
+        }
+
+        private async ValueTask Awaited(ValueTask t)
+        {
+            try
+            {
+                await t.ConfigureAwait(false);
+            }
+            catch
+            {
+                _seenError = true;
+                throw;
+            }
+        }
+
         public void Dispose() => inner.Dispose();
         public ValueTask DisposeAsync() => inner.DisposeAsync();
 
@@ -193,7 +290,7 @@ internal static class FileChecksumHelper
         {
             if (_result is null)
             {
-                generator.Finish();
+                generator!.Finish();
                 _result = (generator.GetChecksum(), generator.Name);
             }
             return _result.Value;

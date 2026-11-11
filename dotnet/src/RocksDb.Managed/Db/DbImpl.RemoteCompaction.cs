@@ -39,14 +39,79 @@ internal sealed partial class DbImpl
         bool bottom, CancellationToken ct)
     {
         if (c.DoesInputReferenceBlobFiles() || cfd.Options.EnableBlobFiles || c.SupportsPerKeyPlacement || c.TrimTs is not null) return null;
+        // DBImpl::CaptureOptionsFileNumber / ReleaseOptionsFileNumber around CompactionJob::Run (BackgroundCompaction,
+        // CompactFilesImpl, db/db_impl/db_impl_compaction_flush.cc): the OPTIONS file the worker is told to read must
+        // survive the OPTIONS files written while the job runs.
+        ulong optionsFileNumber = CaptureOptionsFileNumber(ct);
+        try
+        {
+            return RunRemoteCompaction(service, cfd, c, snapshots, jobId, bottom, optionsFileNumber, ct);
+        }
+        finally
+        {
+            lock (_mutex) _minOptionsFileNumbers.Remove(optionsFileNumber);
+        }
+    }
+
+    /// <summary>
+    /// OPTIONS file numbers named in the inputs of running remote compactions (min_options_file_numbers_). Guarded by
+    /// the mutex.
+    /// </summary>
+    private readonly List<ulong> _minOptionsFileNumbers = new();
+
+    /// <summary>
+    /// DBImpl::CaptureOptionsFileNumber: registers the newest OPTIONS file, under the lock that serializes OPTIONS file
+    /// writes (so it cannot be deleted between being chosen and being registered).
+    /// </summary>
+    private ulong CaptureOptionsFileNumber(CancellationToken ct)
+    {
+        _optionsFileLock.Wait(ct);
+        try
+        {
+            ulong number = LatestOptionsFileNumber();
+            lock (_mutex) _minOptionsFileNumbers.Add(number);
+            return number;
+        }
+        finally
+        {
+            _optionsFileLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// DBImpl::MinOptionsFileNumberToKeep + PurgeObsoleteFiles ("optsfile_num2 = std::min(optsfile_num2,
+    /// state.min_options_file_number)", db/db_impl/db_impl_files.cc): OPTIONS files below the returned number are
+    /// obsolete, given the second newest one.
+    /// </summary>
+    private ulong MinOptionsFileNumberToKeep(ulong secondNewest)
+    {
+        lock (_mutex)
+        {
+            foreach (ulong n in _minOptionsFileNumbers) secondNewest = Math.Min(secondNewest, n);
+        }
+        return secondNewest;
+    }
+
+    private RemoteCompactionOutcome? RunRemoteCompaction(CompactionService service, ColumnFamilyData cfd, Compaction c, ulong[] snapshots, int jobId,
+        bool bottom, ulong optionsFileNumber, CancellationToken ct)
+    {
         var input = new CompactionServiceInput
         {
             CfName = cfd.Name,
             OutputLevel = c.OutputLevel,
             DbId = Identity.DbId,
-            OptionsFileNumber = LatestOptionsFileNumber(),
+            OptionsFileNumber = optionsFileNumber,
             PreserveInternalTimeSeconds = cfd.Options.PreserveInternalTimeSeconds,
             PrecludeLastLevelDataSeconds = cfd.Options.PrecludeLastLevelDataSeconds,
+            // CompactionJob::Prepare: preserve_time_min_seqno_floor_ of a bottommost-file compaction (else 0). The worker
+            // knows neither the reason nor the DB-wide seqno-to-time mapping.
+            PreserveTimeMinSeqnoFloor = c.Reason == CompactionReason.BottommostFiles ? c.InputStorage.PreserveTimeMinSeqno : 0,
+            // compaction->GetProximalLevel() / GetProximalOutputRangeType() / GetKeepInLastLevelThroughSeqno(): only
+            // compactions without per-key placement are scheduled (kInvalidLevel, kNotSupported, kMaxSequenceNumber), so
+            // a worker that would place keys differently declines (a proximal_level of 0 means "no decision sent").
+            ProximalLevel = c.ProximalLevel,
+            ProximalOutputRangeType = 0,
+            KeepInLastLevelThroughSeqno = DbFormat.MaxSequenceNumber,
         };
         (input.MinManifestFileNumber, input.MinManifestFileSize) = Versions.InstalledManifest;
         for (int l = 0; l < c.NumInputLevels; l++)
@@ -124,25 +189,29 @@ internal sealed partial class DbImpl
             service.OnInstallation(response.ScheduledJobId, CompactionServiceJobStatus.UseLocal);
             return null;
         }
+        // Upstream's order: the proximal-level backstop, then the worker's status (kFailure), then the BlobDB checks.
         foreach (CompactionServiceOutputFile f in result.OutputFiles)
         {
-            if (f.IsProximalLevelOutput || f.OldestBlobFileNumber != FileMetaData.InvalidBlobFileNumber)
+            if (f.IsProximalLevelOutput)
             {
-                LogWarn(jobTag + "Remote compaction returned proximal-level or blob output; falling back to local compaction");
+                LogWarn(jobTag + "Remote compaction returned proximal-level output, but this compaction has no proximal level; falling back to local compaction");
                 service.OnInstallation(response.ScheduledJobId, CompactionServiceJobStatus.UseLocal);
                 return null;
             }
-        }
-        if (result.BlobFileAdditions.Count > 0 || result.BlobFileGarbages.Count > 0)
-        {
-            service.OnInstallation(response.ScheduledJobId, CompactionServiceJobStatus.UseLocal);
-            return null;
         }
         if (!result.Ok)
         {
             LogWarn(jobTag + "Remote compaction returned a non-OK result: " + result.StatusMessage);
             service.OnInstallation(response.ScheduledJobId, CompactionServiceJobStatus.Failure);
             throw result.ToException();
+        }
+        bool blobResult = result.BlobFileAdditions.Count > 0 || result.BlobFileGarbages.Count > 0;
+        foreach (CompactionServiceOutputFile f in result.OutputFiles) blobResult |= f.OldestBlobFileNumber != FileMetaData.InvalidBlobFileNumber;
+        if (blobResult)
+        {
+            LogWarn(jobTag + "Cannot install remote BlobDB compaction result; falling back to local compaction");
+            service.OnInstallation(response.ScheduledJobId, CompactionServiceJobStatus.UseLocal);
+            return null;
         }
         LogInfo(jobTag + "Received remote compaction result, output path: " + result.OutputPath);
         var outcome = new RemoteCompactionOutcome { BytesRead = result.BytesRead, BytesWritten = result.BytesWritten, ScheduledJobId = response.ScheduledJobId };
@@ -176,7 +245,7 @@ internal sealed partial class DbImpl
                     UniqueId = f.UniqueId,
                     Temperature = f.FileTemperature,
                     // FileMetaData::CalculateTailSize.
-                    TailSize = props.TailStartOffset > 0 && props.TailStartOffset <= fileSize ? fileSize - props.TailStartOffset : 0,
+                    TailSize = FileMetaData.CalculateTailSize(fileSize, props),
                     UserDefinedTimestampsPersisted = props.UserDefinedTimestampsPersisted != 0,
                 };
                 if (props.NumEntries > 0) meta.SetEntryStats(props);
@@ -285,7 +354,11 @@ internal sealed partial class DbImpl
         }
         try
         {
-            if (ci.MinManifestFileNumber != 0 && db._manifestTailer is { } tailer && tailer.ManifestNumber < ci.MinManifestFileNumber)
+            // Manifest floor check: an older MANIFEST, or the same one recovered short of the size the primary scheduled
+            // from (truncated / torn tail), is below the floor.
+            if (ci.MinManifestFileNumber != 0 && db._manifestTailer is { } tailer
+                && (tailer.ManifestNumber < ci.MinManifestFileNumber
+                    || (tailer.ManifestNumber == ci.MinManifestFileNumber && (ulong)tailer.Reader.LastRecordEnd < ci.MinManifestFileSize)))
             {
                 throw new RocksDbException(StatusCode.Incomplete,
                     "Incomplete: Remote compaction worker recovered an older MANIFEST view than the primary scheduled from");
@@ -348,7 +421,9 @@ internal sealed partial class DbImpl
                 cfd.Current.Ref();
                 // The worker re-derives per-key placement; the primary only schedules compactions without it (or an
                 // older primary sends no decision: proximal_level 0).
-                if (ci.ProximalLevel != 0 && c.ProximalLevel != ci.ProximalLevel)
+                if (ci.ProximalLevel != 0
+                    && (c.ProximalLevel != ci.ProximalLevel || c.ProximalOutputRangeType != ci.ProximalOutputRangeType
+                        || c.KeepInLastLevelThroughSeqno != ci.KeepInLastLevelThroughSeqno))
                 {
                     throw new RocksDbException(StatusCode.Incomplete,
                         "Incomplete: Remote compaction worker's per-key placement differs from the primary's");
@@ -358,7 +433,7 @@ internal sealed partial class DbImpl
             if (ci.DbId.Length > 0) Identity = Identity with { DbId = ci.DbId };
             CancellationToken ct = options.Canceled;
             job = CompactionJob.ForRange(this, cfd, c, ci.Snapshots.ToArray(), Versions.NewFileNumber, ct,
-                ci.HasBegin ? ci.Begin : null, ci.HasEnd ? ci.End : null, outputPath);
+                ci.HasBegin ? ci.Begin : null, ci.HasEnd ? ci.End : null, outputPath, ci.PreserveTimeMinSeqnoFloor);
             await job.RunAsync(synchronous).ConfigureAwait(false);
             FileSystem.SyncDirectory(outputPath);
             FillResult(result, cfd, c, job, System.Diagnostics.Stopwatch.GetElapsedTime(start));

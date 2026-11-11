@@ -4,7 +4,7 @@ namespace RocksDb.Managed.Db;
 /// The flushes of one atomic flush (DBImpl::AtomicFlushMemTablesToOutputFiles / InstallMemtableAtomicFlushResults,
 /// db/db_impl/db_impl_compaction_flush.cc, db/memtable_list.cc): every member writes its L0 file independently, then the
 /// edits of all members are committed to the MANIFEST as one atomic group, so recovery sees all of them or none. Used by
-/// error recovery (ResumeImpl flushes with force_atomic_flush). A member that fails before committing fails the group;
+/// every flush with atomic_flush and by error recovery (ResumeImpl flushes with force_atomic_flush). A member that fails before committing fails the group;
 /// a member with nothing to flush leaves it.
 /// <para><b>Synchronization</b>: all state is guarded by the instance lock.</para>
 /// </summary>
@@ -16,6 +16,10 @@ internal sealed class AtomicFlushGroup
     private readonly TaskCompletionSource _done = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Lock _lock = new();
     private Exception? _failure;
+    private volatile bool _manifestWriteAttempted;
+
+    /// <summary>True once the group started its MANIFEST write: a failure after that may have made the edits durable.</summary>
+    public bool ManifestWriteAttempted => _manifestWriteAttempted;
 
     public AtomicFlushGroup(DbImpl db, IEnumerable<ColumnFamilyData> members)
     {
@@ -73,6 +77,7 @@ internal sealed class AtomicFlushGroup
         }
         try
         {
+            _manifestWriteAttempted = true;
             await _db.CommitAtomicFlushAsync(_edits).ConfigureAwait(false);
             _done.TrySetResult();
         }

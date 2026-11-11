@@ -44,7 +44,7 @@ public sealed unsafe class MemTable : IDisposable
     private readonly InlineSkipList<MemTableKeyComparer> _table;
     private readonly InlineSkipList<MemTableKeyComparer> _rangeDelTable;
     private readonly long _maxRangeDeletions;
-    private readonly ulong _creationSeq;
+    private ulong _creationSeq; // SetCreationSeq: DB mutex; read under the mutex or by the write leader
     // newest_udt_ (persist_user_defined_timestamps = false only): the newest timestamp added, guarded by _newestUdtLock.
     private readonly int _newestUdtSize;
     private readonly byte[]? _newestUdt;
@@ -678,7 +678,13 @@ public sealed unsafe class MemTable : IDisposable
     /// <inheritdoc cref="Get(in LookupKey, out ReadOnlySpan{byte}, out EntryType, out ulong, MergeContext?, ref ulong)"/>
     /// <param name="callback">Read callback (SaveValue's CheckCallback): entries it reports as invisible are skipped.</param>
     internal MemTableGetResult Get(scoped in LookupKey key, out ReadOnlySpan<byte> value, out EntryType valueType, out ulong sequence,
-        MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq, GetContext? timestampSink, ReadCallback? callback)
+        MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq, GetContext? timestampSink, ReadCallback? callback) =>
+        Get(key, out value, out valueType, out sequence, mergeContext, ref maxCoveringTombstoneSeq, timestampSink, callback, ignoreRangeDeletions: false);
+
+    /// <inheritdoc cref="Get(in LookupKey, out ReadOnlySpan{byte}, out EntryType, out ulong, MergeContext?, ref ulong)"/>
+    /// <param name="ignoreRangeDeletions">ReadOptions::ignore_range_deletions: this memtable's range tombstones are not consulted (MemTable::Get).</param>
+    internal MemTableGetResult Get(scoped in LookupKey key, out ReadOnlySpan<byte> value, out EntryType valueType, out ulong sequence,
+        MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq, GetContext? timestampSink, ReadCallback? callback, bool ignoreRangeDeletions)
     {
         value = default;
         valueType = EntryType.Value;
@@ -689,7 +695,7 @@ public sealed unsafe class MemTable : IDisposable
         ReadOnlySpan<byte> lookupUserKey = key.UserKey;
         ulong lookupSeq = key.Sequence;
         int tsSize = _ucmp.TimestampSize;
-        if (Volatile.Read(ref _isRangeDelTableEmpty) == 0)
+        if (!ignoreRangeDeletions && Volatile.Read(ref _isRangeDelTableEmpty) == 0)
         {
             // With user-defined timestamps the lookup key carries the read timestamp, which bounds the visible
             // tombstones (NewRangeTombstoneIterator(read_opts, ...) with read_opts.timestamp).
@@ -724,16 +730,18 @@ public sealed unsafe class MemTable : IDisposable
 
             ulong tag = Coding.DecodeFixed64(new ReadOnlySpan<byte>(ek.Ptr + userKeyLen, DbFormat.InternalKeyFooterSize));
             ulong seq = tag >> 8;
-            if (callback is not null && !callback.IsVisible(seq)) continue; // CheckCallback: to continue to the next seq
-            // With user-defined timestamps older timestamps sort after the lookup key whatever their seqno: entries
-            // newer than the read snapshot are skipped (native returns NotFound for keys written after the snapshot).
-            if (tsSize != 0 && seq > lookupSeq) continue;
+            // SaveValue (db/memtable.cc) verifies the entry before the visibility check: a corrupted entry of the key
+            // fails the lookup even when the read would skip it.
             if (_protectionBytes != 0)
             {
                 TestHooks.InvokeSpan("Memtable::SaveValue:Found:entry", new Span<byte>(entry, EncodedEntryLength(entry, _protectionBytes)));
                 // Memtable entry corrupted: Corruption ends the lookup (found_final_value).
                 VerifyEntryChecksum(entry, _protectionBytes);
             }
+            if (callback is not null && !callback.IsVisible(seq)) continue; // CheckCallback: to continue to the next seq
+            // With user-defined timestamps older timestamps sort after the lookup key whatever their seqno: entries
+            // newer than the read snapshot are skipped (native returns NotFound for keys written after the snapshot).
+            if (tsSize != 0 && seq > lookupSeq) continue;
             if (timestampSink is { TimestampSize: not 0 }) timestampSink.RecordTimestampOfUserKey(entryUserKey, seq);
             var type = (EntryType)(byte)tag;
             if (sequence == DbFormat.MaxSequenceNumber)
@@ -755,8 +763,9 @@ public sealed unsafe class MemTable : IDisposable
                     valueType = type;
                     return MemTableGetResult.Found;
                 case EntryType.ValuePreferredSeqno:
-                    // ParsePackedValueForValue: strip the trailing packed preferred seqno.
-                    value = EntryValue(ek);
+                    // ParsePackedValueForValue: strip the trailing packed preferred seqno. TimedPut entries are updated in
+                    // place too (MemTable::Update with kTypeValuePreferredSeqno), so they are read under the same lock.
+                    value = _locks is null ? EntryValue(ek) : CopyValueLocked(ek, entryUserKey);
                     value = value[..^sizeof(ulong)];
                     valueType = EntryType.Value;
                     return MemTableGetResult.Found;
@@ -921,14 +930,20 @@ public sealed unsafe class MemTable : IDisposable
     /// <summary>Sets the earliest seqno (used when a memtable is created before its first write's seqno is known).</summary>
     public void SetEarliestSequenceNumber(ulong value) => Volatile.Write(ref _earliestSeqno, value);
 
-    public ulong CreationSequence => _creationSeq;
+    public ulong CreationSequence => Volatile.Read(ref _creationSeq);
+
+    /// <summary>Port of MemTable::SetCreationSeq (an empty memtable that survives a memtable switch of another column family).</summary>
+    public void SetCreationSequence(ulong value) => Volatile.Write(ref _creationSeq, value);
 
     public bool IsEmpty => Volatile.Read(ref _firstSeqno) == 0;
 
-    /// <summary>Dynamically changes write_buffer_size (SetOptions).</summary>
+    /// <summary>
+    /// Dynamically changes write_buffer_size (SetOptions). Port of MemTable::UpdateWriteBufferSize: a memtable with a
+    /// bloom filter (sized for the write buffer size it was created with) only ever shrinks.
+    /// </summary>
     public void UpdateWriteBufferSize(long newWriteBufferSize)
     {
-        if (Volatile.Read(ref _flushState) == FlushNotRequested) Volatile.Write(ref _writeBufferSize, newWriteBufferSize);
+        if (_bloom is null || newWriteBufferSize < Volatile.Read(ref _writeBufferSize)) Volatile.Write(ref _writeBufferSize, newWriteBufferSize);
     }
 
     /// <summary>True once the memtable became full and nobody scheduled its flush yet.</summary>

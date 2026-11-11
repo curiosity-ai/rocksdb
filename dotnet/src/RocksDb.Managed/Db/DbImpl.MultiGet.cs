@@ -41,6 +41,9 @@ internal sealed partial class DbImpl
         }
         if (_queryTracer is { } tracer) TraceMultiGet(tracer, cfd, batch, options);
         if (BlockCacheTracer.IsEnabled) SetBlockCacheTraceContext(Tracing.TableReaderCaller.UserMultiGet, default, options);
+        // MultiGetCommon: FailIfTsMismatchCf, a read timestamp on a column family without timestamps is InvalidArgument
+        // (for the whole call, like the timestamp checks of the timestamped path).
+        if (cfd.TimestampSize == 0) GetReadTimestamp(cfd, options);
         Statistics? st = Stats;
         long t0 = st is null ? 0 : st.StartTimer();
         SuperVersion sv = GetAndRefSuperVersion(cfd, out int svSlot);
@@ -70,113 +73,150 @@ internal sealed partial class DbImpl
                 return;
             }
             int[] order = batch.Order;
+            // ReadOptions::ignore_range_deletions (MemTable::MultiGet, TableCache::MultiGet).
+            if (options is not null && options.IgnoreRangeDeletions)
+            {
+                for (int k = 0; k < n; k++) batch.Context(k).IgnoreRangeDeletions = true;
+            }
             // MultiGetImpl skip_memtable: kPersistedTier reads skip the memtables once data was written without the
             // WAL. (kMemtableTier does not restrict MultiGet: like Get, it reads the table files.)
             bool skipMemTables = SkipMemTables(options);
             // value_size_soft_limit: once the values found so far exceed it, the keys not yet done are Aborted.
             ulong softLimit = options?.ValueSizeSoftLimit ?? ulong.MaxValue;
             ulong valueSize = 0;
-
-            // Memtables (MultiGetImpl: per key, newest memtable first). Keys still pending stay in sorted order.
-            int pending = 0;
-            for (int i = 0; i < n; i++)
+            // MultiGetImpl looks the sorted keys up in batches of MultiGetContext::MAX_BATCH_SIZE (memtables, then the
+            // table files, per batch) and stops with Aborted once a finished batch left the values above the limit, so
+            // which keys are returned and which are Aborted depends on the batches. Without a limit the batches are not
+            // observable and all keys are looked up together.
+            // The same goes for ReadOptions::deadline, checked before each batch: the keys of the batches not started
+            // when it passes are TimedOut, wherever their values are.
+            bool hasDeadline = options is not null && options.Deadline > TimeSpan.Zero;
+            int batchSize = softLimit != ulong.MaxValue || hasDeadline ? MultiGetMaxBatchSize : n;
+            for (int start = 0; start < n; start += batchSize)
             {
-                int k = order[i];
-                if (!skipMemTables && GetFromMemTables(sv, batch.UserKey(k), snapshot, batch.Context(k)))
+                int len = Math.Min(batchSize, n - start);
+                if (start > 0)
                 {
-                    if (softLimit != ulong.MaxValue && AddValueSize(batch, k, ref valueSize, softLimit))
+                    if (valueSize > softLimit)
                     {
-                        // MemTable::MultiGet: every key still in the range is Aborted.
-                        for (int j = i + 1; j < n; j++) batch.SetAborted(order[j]);
-                        for (int j = 0; j < pending; j++) batch.SetAborted(order[j]);
-                        pending = 0;
+                        for (int j = start; j < n; j++) batch.SetAborted(order[j]);
                         break;
                     }
-                    continue;
-                }
-                order[pending++] = k;
-            }
-
-            if (pending > 0)
-            {
-                VersionStorageInfo s = sv.Current.Storage;
-                int[] sub = batch.Sub;
-                // L0: every file may overlap every key; newest first.
-                FileMetaData[] l0 = s.LevelFilesArray(0);
-                bool checkL0Range = CheckL0KeyRange(s, l0.Length); // FilePickerMultiGet
-                for (int fi = 0; fi < l0.Length && pending > 0; fi++)
-                {
-                    FileMetaData f = l0[fi];
-                    int m = 0;
-                    for (int j = 0; j < pending; j++)
+                    TestHooks.Invoke("DBImpl::MultiGetImpl:BeforeBatch");
+                    if (hasDeadline && ReadDeadline.IsExceeded(options))
                     {
-                        int k = order[j];
-                        if (!checkL0Range || UserKeyInFileRange(ucmp, batch.UserKey(k), f)) sub[m++] = k;
+                        for (int j = start; j < n; j++) batch.SetTimedOut(order[j]);
+                        break;
                     }
-                    if (m == 0) continue;
-                    batch.ReadFlags = WithFilterSkip(cfd, s, 0, fi == l0.Length - 1, batch.ReadFlags);
-                    await MultiGetFromFileAsync(cfd, f, batch, m, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
-                    SampleMultiGetReads(f, batch, m);
-                    MarkHitLevel(batch, m, 0);
-                    if (softLimit != ulong.MaxValue && ApplySoftLimit(batch, m, ref valueSize, softLimit)) AbortPending(batch, order, pending);
-                    pending = RemoveDone(batch, order, pending);
+                    // The front of `order` (the pending keys of the batches before) is free again.
+                    Array.Copy(order, start, order, 0, len);
                 }
-                // Sorted levels: one file per key (FindFile on the lookup key); consecutive keys of a file are grouped.
-                for (int level = 1; level < s.NumLevels && pending > 0; level++)
+                // Memtables. Keys still pending stay in sorted order.
+                int pending = 0;
+                if (softLimit != ulong.MaxValue && !skipMemTables)
                 {
-                    if (s.NumLevelFiles(level) == 0) continue;
-                    FileMetaData[] files = s.LevelFilesArray(level);
-                    int j = 0;
-                    while (j < pending)
+                    // MultiGetImpl with a limit: mem->MultiGet for all keys of the batch, then each immutable memtable
+                    // (MemTableListVersion::MultiGet), so the values are counted memtable by memtable.
+                    pending = MultiGetFromMemTablesWithSoftLimit(sv, batch, order, len, snapshot, st, ref valueSize, softLimit);
+                }
+                else
+                {
+                    // Without a limit the order is not observable: per key, newest memtable first.
+                    for (int i = 0; i < len; i++)
                     {
-                        int idx = s.FindFile(level, batch.InternalKey(order[j]));
-                        if (idx >= files.Length) break; // this and all larger keys are past the last file
-                        FileMetaData f = files[idx];
+                        int k = order[i];
+                        if (!skipMemTables && GetFromMemTables(sv, batch.UserKey(k), snapshot, batch.Context(k)))
+                        {
+                            st?.RecordTick(Ticker.MemtableHit); // MemTable::MultiGet, per key it finished
+                            continue;
+                        }
+                        order[pending++] = k;
+                    }
+                }
+                // DBImpl::MultiGetImpl: the keys the memtables left for the table files.
+                if (!skipMemTables && pending > 0) st?.RecordTick(Ticker.MemtableMiss, (ulong)pending);
+
+                if (pending > 0)
+                {
+                    VersionStorageInfo s = sv.Current.Storage;
+                    int[] sub = batch.Sub;
+                    // L0: every file may overlap every key; newest first.
+                    FileMetaData[] l0 = s.LevelFilesArray(0);
+                    bool checkL0Range = CheckL0KeyRange(s, l0.Length); // FilePickerMultiGet
+                    for (int fi = 0; fi < l0.Length && pending > 0; fi++)
+                    {
+                        FileMetaData f = l0[fi];
                         int m = 0;
-                        for (; j < pending; j++)
+                        for (int j = 0; j < pending; j++)
                         {
                             int k = order[j];
-                            if (cfd.Icmp.Compare(batch.InternalKey(k), f.Largest) > 0) break;
-                            if (ucmp.Compare(batch.UserKey(k), DbFormat.ExtractUserKey(f.Smallest)) >= 0) sub[m++] = k;
+                            if (!checkL0Range || UserKeyInFileRange(ucmp, batch.UserKey(k), f)) sub[m++] = k;
                         }
                         if (m == 0) continue;
-                        batch.ReadFlags = WithFilterSkip(cfd, s, level, false, batch.ReadFlags);
-                        bool aborted = false;
-                        // FilePickerMultiGet: a key that is the file's largest user key and not done yet continues in
-                        // the next file of the level (its versions can span adjacent files; see GetFromVersion).
-                        for (int fileIdx = idx; ; )
+                        batch.ReadFlags = WithFilterSkip(cfd, s, 0, fi == l0.Length - 1, batch.ReadFlags);
+                        await MultiGetFromFileAsync(cfd, f, batch, m, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
+                        SampleMultiGetReads(f, batch, m);
+                        MarkHitLevel(batch, m, 0);
+                        if (softLimit != ulong.MaxValue && ApplySoftLimit(batch, m, ref valueSize, softLimit)) AbortPending(batch, order, pending);
+                        pending = RemoveDone(batch, order, pending);
+                    }
+                    // Sorted levels: one file per key (FindFile on the lookup key); consecutive keys of a file are grouped.
+                    for (int level = 1; level < s.NumLevels && pending > 0; level++)
+                    {
+                        if (s.NumLevelFiles(level) == 0) continue;
+                        FileMetaData[] files = s.LevelFilesArray(level);
+                        int j = 0;
+                        while (j < pending)
                         {
-                            await MultiGetFromFileAsync(cfd, f, batch, m, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
-                            SampleMultiGetReads(f, batch, m);
-                            MarkHitLevel(batch, m, level);
-                            if (softLimit != ulong.MaxValue && ApplySoftLimit(batch, m, ref valueSize, softLimit))
+                            int idx = s.FindFile(level, batch.InternalKey(order[j]));
+                            if (idx >= files.Length) break; // this and all larger keys are past the last file
+                            FileMetaData f = files[idx];
+                            int m = 0;
+                            for (; j < pending; j++)
                             {
-                                aborted = true;
+                                int k = order[j];
+                                if (cfd.Icmp.Compare(batch.InternalKey(k), f.Largest) > 0) break;
+                                if (ucmp.Compare(batch.UserKey(k), DbFormat.ExtractUserKey(f.Smallest)) >= 0) sub[m++] = k;
+                            }
+                            if (m == 0) continue;
+                            batch.ReadFlags = WithFilterSkip(cfd, s, level, false, batch.ReadFlags);
+                            bool aborted = false;
+                            // FilePickerMultiGet: a key that is the file's largest user key and not done yet continues in
+                            // the next file of the level (its versions can span adjacent files; see GetFromVersion).
+                            for (int fileIdx = idx; ; )
+                            {
+                                await MultiGetFromFileAsync(cfd, f, batch, m, snapshot, synchronous, cancellationToken).ConfigureAwait(false);
+                                SampleMultiGetReads(f, batch, m);
+                                MarkHitLevel(batch, m, level);
+                                if (softLimit != ulong.MaxValue && ApplySoftLimit(batch, m, ref valueSize, softLimit))
+                                {
+                                    aborted = true;
+                                    break;
+                                }
+                                if (++fileIdx >= files.Length) break;
+                                FileMetaData next = files[fileIdx];
+                                int carried = 0;
+                                for (int q = 0; q < m; q++)
+                                {
+                                    int k = sub[q];
+                                    if (!batch.Context(k).Done && ucmp.Compare(batch.UserKey(k), DbFormat.ExtractUserKey(f.Largest)) == 0 &&
+                                        ucmp.Compare(batch.UserKey(k), DbFormat.ExtractUserKey(next.Smallest)) >= 0)
+                                    {
+                                        sub[carried++] = k;
+                                    }
+                                }
+                                if (carried == 0) break;
+                                f = next;
+                                m = carried;
+                            }
+                            if (aborted)
+                            {
+                                AbortPending(batch, order, pending);
                                 break;
                             }
-                            if (++fileIdx >= files.Length) break;
-                            FileMetaData next = files[fileIdx];
-                            int carried = 0;
-                            for (int q = 0; q < m; q++)
-                            {
-                                int k = sub[q];
-                                if (!batch.Context(k).Done && ucmp.Compare(batch.UserKey(k), DbFormat.ExtractUserKey(f.Largest)) == 0 &&
-                                    ucmp.Compare(batch.UserKey(k), DbFormat.ExtractUserKey(next.Smallest)) >= 0)
-                                {
-                                    sub[carried++] = k;
-                                }
-                            }
-                            if (carried == 0) break;
-                            f = next;
-                            m = carried;
                         }
-                        if (aborted)
-                        {
-                            AbortPending(batch, order, pending);
-                            break;
-                        }
+                        pending = RemoveDone(batch, order, pending);
                     }
-                    pending = RemoveDone(batch, order, pending);
                 }
             }
             // Blob indexes are resolved while the super version (and so its blob files) is referenced.
@@ -204,6 +244,56 @@ internal sealed partial class DbImpl
             ReturnAndCleanupSuperVersion(cfd, sv, svSlot);
         }
     }
+
+    /// <summary>
+    /// The memtable part of MultiGetImpl under value_size_soft_limit for the keys order[0..count): the active memtable
+    /// for every key, then each immutable memtable for the keys left (db_impl_sync_and_async.h:592-598). Once a found
+    /// value takes the total above the limit every key of the batch not done yet is Aborted (MemTable::MultiGet,
+    /// db/memtable.cc:1960-1966). Returns the number of keys left for the table files, compacted to the front of
+    /// <paramref name="order"/>.
+    /// </summary>
+    [SkipLocalsInit]
+    private static int MultiGetFromMemTablesWithSoftLimit(SuperVersion sv, MultiGetBatch batch, int[] order, int count, ulong snapshot, Statistics? st,
+        ref ulong valueSize, ulong softLimit)
+    {
+        Span<byte> scratch = stackalloc byte[LookupKey.StackBufferSize];
+        MemTable[] imm = sv.Imm;
+        int pending = count;
+        for (int m = -1; m < imm.Length && pending > 0; m++)
+        {
+            MemTable mem = m < 0 ? sv.Mem : imm[m];
+            for (int i = 0; i < pending; i++)
+            {
+                int k = order[i];
+                GetContext ctx = batch.Context(k);
+                var lkey = new LookupKey(batch.UserKey(k), snapshot, scratch);
+                bool done;
+                try
+                {
+                    PerfContext.Add(PerfMetric.GetFromMemtableCount, 1);
+                    MemTableGetResult r = mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq,
+                        null, ctx.Callback, ctx.IgnoreRangeDeletions);
+                    done = ctx.ApplyMemTableResult(r, v, t);
+                }
+                finally
+                {
+                    lkey.Dispose();
+                }
+                if (!done) continue;
+                st?.RecordTick(Ticker.MemtableHit);
+                if (AddValueSize(batch, k, ref valueSize, softLimit))
+                {
+                    AbortPending(batch, order, pending);
+                    return 0;
+                }
+            }
+            pending = RemoveDone(batch, order, pending);
+        }
+        return pending;
+    }
+
+    /// <summary>MultiGetContext::MAX_BATCH_SIZE (table/multiget_context.h).</summary>
+    private const int MultiGetMaxBatchSize = 32;
 
     /// <summary>
     /// MultiGetRange::AddValueSize for key <paramref name="k"/> found with a value; true when the total now exceeds
@@ -426,6 +516,7 @@ internal sealed partial class DbImpl
                 for (int i = 0; i < count; i++)
                 {
                     GetContext ctx = batch.Context(sub[i]);
+                    if (ctx.IgnoreRangeDeletions) continue;
                     ulong cov = rangeDels.MaxCoveringTombstoneSeqnum(batch.UserKey(sub[i]), snapshot);
                     if (cov > ctx.MaxCoveringTombstoneSeq) ctx.MaxCoveringTombstoneSeq = cov;
                 }

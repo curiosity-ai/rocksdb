@@ -167,6 +167,8 @@ public sealed class SimCache : BlockCache
 
     public override void Release(ref CachedBlock handle, bool eraseIfLastRef) => _target.Release(ref handle, eraseIfLastRef);
 
+    internal override long GetCharge(in CachedBlock handle) => _target.GetCharge(handle);
+
     public override bool Erase(in CacheKey key)
     {
         bool r = _target.Erase(key);

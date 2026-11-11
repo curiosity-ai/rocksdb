@@ -28,6 +28,10 @@ internal sealed class PointLockManager : LockManager
     private readonly long _maxNumLocks;
     private readonly ConcurrentDictionary<uint, LockMap> _lockMaps = new();
     private readonly TransactionDbMutexFactory? _mutexFactory; // custom_mutex_factory (null = built-in stripe locks)
+    // Ids of dropped column families (ids are never reused). Upstream registers lock maps in AddColumnFamily and fails
+    // TryLock for an unknown id; here lock maps are created on demand, so the dropped ids are remembered instead.
+    private readonly ConcurrentDictionary<uint, bool> _removedCfs = new();
+    private volatile int _removedCfCount;
 
     // Wait-for graph (wait_txn_map_ / rev_wait_txn_map_), guarded by _waitLock.
     private readonly Lock _waitLock = new();
@@ -139,7 +143,11 @@ internal sealed class PointLockManager : LockManager
     private Stripe GetStripe(LockMap map, ReadOnlySpan<byte> key) => map.Stripes[ByteKeyComparer.Bucket(key, 0, map.Stripes.Length)];
 
     /// <summary>Lets the lock map of a dropped column family be collected (RemoveColumnFamily).</summary>
-    public override void RemoveColumnFamily(uint cf) => _lockMaps.TryRemove(cf, out _);
+    public override void RemoveColumnFamily(uint cf)
+    {
+        if (_removedCfs.TryAdd(cf, true)) Interlocked.Increment(ref _removedCfCount);
+        _lockMaps.TryRemove(cf, out _);
+    }
 
     /// <summary>Monotonic clock in microseconds used for lock timeouts and expirations.</summary>
     public static long NowMicros() => (long)(Stopwatch.GetTimestamp() * (1_000_000.0 / Stopwatch.Frequency));
@@ -155,6 +163,13 @@ internal sealed class PointLockManager : LockManager
         CancellationToken cancellationToken)
     {
         LockMap map = GetLockMap(cf);
+        if (_removedCfCount != 0 && _removedCfs.ContainsKey(cf))
+        {
+            // PointLockManager::TryLock: no lock map for this column family id (it was dropped).
+            _lockMaps.TryRemove(cf, out _);
+            return new ValueTask<RocksDbException?>(new RocksDbException(StatusCode.InvalidArgument,
+                "Invalid argument: Column family id not found: " + cf.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+        }
         Stripe stripe = GetStripe(map, key);
         if (_mutexFactory is not null) return new ValueTask<RocksDbException?>(AcquireWithTimeoutCustom(txn, map, stripe, cf, key, exclusive));
         List<ulong> waitIds = txn.WaitIdsScratch;
@@ -167,7 +182,13 @@ internal sealed class PointLockManager : LockManager
         }
         if (result is null) return default;
         long timeout = txn.LockTimeoutMicros;
-        if (timeout == 0) return new ValueTask<RocksDbException?>(result);
+        if (timeout == 0)
+        {
+            // AcquireWithTimeout: "On timeout, persist the lock information so we can debug the contention", also when
+            // the transaction does not wait at all (timeout == 0 skips only the retry loop).
+            if (result.Code == StatusCode.TimedOut) txn.SetWaitingTxn(waitIds, cf, key.ToArray());
+            return new ValueTask<RocksDbException?>(result);
+        }
         return AcquireWithTimeoutAsync(txn, map, stripe, cf, key.ToArray(), exclusive, timeout, synchronous, cancellationToken);
     }
 
@@ -243,7 +264,8 @@ internal sealed class PointLockManager : LockManager
             // expired and we were never signaled).
             if (endTime > 0 && NowMicros() >= endTime) timedOut = true;
         }
-        if (result is not null) txn.SetWaitingTxn(waitIds, cf, key); // persist the lock information for debugging
+        // On timeout, persist the lock information so we can debug the contention (not for a lock limit failure).
+        if (result is { Code: StatusCode.TimedOut }) txn.SetWaitingTxn(waitIds, cf, key);
         return result;
     }
 

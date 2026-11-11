@@ -454,39 +454,65 @@ internal sealed class IteratorCore
     public ValueTask SeekToFirstAsync(CancellationToken cancellationToken)
     {
         if (_tailing) RenewIfStale();
-        return It.SeekToFirstAsync(cancellationToken);
+        if (_stats is null) return It.SeekToFirstAsync(cancellationToken);
+        return RecordAfter(It.SeekToFirstAsync(cancellationToken), Ticker.NumberDbSeek, Ticker.NumberDbSeekFound, _stats.StartTimer(), seek: true);
     }
 
     public ValueTask SeekToLastAsync(CancellationToken cancellationToken)
     {
         if (_tailing) TailingNotSupported("ForwardIterator::SeekToLast()");
-        return It.SeekToLastAsync(cancellationToken);
+        if (_stats is null) return It.SeekToLastAsync(cancellationToken);
+        return RecordAfter(It.SeekToLastAsync(cancellationToken), Ticker.NumberDbSeek, Ticker.NumberDbSeekFound, _stats.StartTimer(), seek: true);
     }
 
     public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken)
     {
         if (_tailing) RenewIfStale();
         if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Tracing.TraceType.IteratorSeek, target.Span);
-        return It.SeekAsync(target, cancellationToken);
+        if (_stats is null) return It.SeekAsync(target, cancellationToken);
+        return RecordAfter(It.SeekAsync(target, cancellationToken), Ticker.NumberDbSeek, Ticker.NumberDbSeekFound, _stats.StartTimer(), seek: true);
     }
 
     public ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken)
     {
         if (_tailing) TailingNotSupported("ForwardIterator::SeekForPrev()");
         if (_traceDb?.QueryTracer is { } tracer) TraceSeek(tracer, Tracing.TraceType.IteratorSeekForPrev, target.Span);
-        return It.SeekForPrevAsync(target, cancellationToken);
+        if (_stats is null) return It.SeekForPrevAsync(target, cancellationToken);
+        return RecordAfter(It.SeekForPrevAsync(target, cancellationToken), Ticker.NumberDbSeek, Ticker.NumberDbSeekFound, _stats.StartTimer(), seek: true);
     }
 
     public ValueTask NextAsync(CancellationToken cancellationToken)
     {
         if (_tailing && _graph!.IsStale && TailingRenewForNext()) return ValueTask.CompletedTask;
-        return It.NextAsync(cancellationToken);
+        if (_stats is null) return It.NextAsync(cancellationToken);
+        return RecordAfter(It.NextAsync(cancellationToken), Ticker.NumberDbNext, Ticker.NumberDbNextFound, 0, seek: false);
     }
 
     public ValueTask PrevAsync(CancellationToken cancellationToken)
     {
         if (_tailing) TailingNotSupported("ForwardIterator::Prev");
-        return It.PrevAsync(cancellationToken);
+        if (_stats is null) return It.PrevAsync(cancellationToken);
+        return RecordAfter(It.PrevAsync(cancellationToken), Ticker.NumberDbPrev, Ticker.NumberDbPrevFound, 0, seek: false);
+    }
+
+    /// <summary>
+    /// The statistics of the synchronous moves (DBIter::Seek / Next / Prev RecordTick calls, DB_SEEK) for an async move,
+    /// recorded once it completed.
+    /// </summary>
+    private ValueTask RecordAfter(ValueTask pending, Ticker step, Ticker found, long startTimestamp, bool seek)
+    {
+        if (!pending.IsCompletedSuccessfully) return RecordAfterSlowAsync(pending, step, found, startTimestamp, seek);
+        pending.GetAwaiter().GetResult();
+        if (seek) RecordSeek(startTimestamp);
+        else RecordStep(step, found);
+        return ValueTask.CompletedTask;
+    }
+
+    private async ValueTask RecordAfterSlowAsync(ValueTask pending, Ticker step, Ticker found, long startTimestamp, bool seek)
+    {
+        await pending.ConfigureAwait(false);
+        if (seek) RecordSeek(startTimestamp);
+        else RecordStep(step, found);
     }
 
     // ---- tailing (ReadOptions::tailing, ForwardIterator) ----
@@ -534,7 +560,12 @@ internal sealed class IteratorCore
     /// </summary>
     public void Release()
     {
-        _stats?.RecordTick(Ticker.NoIteratorDeleted);
+        if (_stats is { } st)
+        {
+            ulong skipped = It.TakeSkipCount();
+            if (skipped != 0) st.RecordTick(Ticker.NumberIterSkip, skipped);
+            st.RecordTick(Ticker.NoIteratorDeleted);
+        }
         if (_pool is null)
         {
             _columnsScratch?.Dispose();

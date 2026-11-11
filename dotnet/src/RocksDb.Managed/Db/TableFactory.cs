@@ -56,7 +56,8 @@ public static class TableFactory
             BlockRestartInterval = restart,
             IndexBlockRestartInterval = indexRestart,
             MetadataBlockSize = (int)options.MetadataBlockSize,
-            FormatVersion = (int)options.FormatVersion,
+            // InitializeOptions: a format_version older than the oldest one that can be written is raised to it.
+            FormatVersion = Math.Max((int)options.FormatVersion, BlockBasedTableConstants.MinSupportedFormatVersionForWrite),
             Checksum = options.Checksum,
             IndexType = options.IndexType,
             IndexShortening = options.IndexShortening,
@@ -97,6 +98,8 @@ public static class TableFactory
     public static FilterPolicy? CreateFilterPolicy(string? id)
     {
         if (string.IsNullOrEmpty(id) || id == "nullptr") return null;
+        // FilterPolicy::CreateFromString: value == ReadOnlyBuiltinFilterPolicy::kClassName().
+        if (id == BloomLikeFilterPolicy.BuiltinFilterMetadataName) return new ReadOnlyBuiltinFilterPolicy();
         if (id.Length >= 2 && id[0] == '{' && id[^1] == '}') return CreateFilterPolicyFromStruct(id);
         string[] parts = id.Split(':');
         string name = parts[0];
@@ -239,6 +242,7 @@ public static class TableFactory
             PrefixExtractor = options.PrefixExtractor,
             LevelAtCreation = where.Level,
             IsFlush = where.IsFlush,
+            CompactionStyle = options.CompactionStyle,
             OptimizeFiltersForHits = options.OptimizeFiltersForHits,
             PersistUserDefinedTimestamps = options.PersistUserDefinedTimestamps,
             TablePropertiesCollectorFactories = options.TablePropertiesCollectorFactories.ToArray(),

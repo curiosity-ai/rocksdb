@@ -186,9 +186,10 @@ internal sealed class PlainTableKeyDecoder
     /// <summary>The value of the last <see cref="NextKey"/>.</summary>
     public ReadOnlySpan<byte> Value => _data.AsSpan((int)ValueOffset, (int)ValueLength);
 
-    private ReadOnlySpan<byte> Read(uint offset, uint len)
+    private ReadOnlySpan<byte> Read(uint offset, ulong len)
     {
-        if ((ulong)offset + len > _dataEnd) ThrowHelper.Corruption("Unexpected EOF reading plain table entry at " + offset);
+        // 64-bit length: a corrupt key size near 2^32 must not wrap around (user_key_size + 1 / + 8 in ReadInternalKey).
+        if (offset + len > _dataEnd) ThrowHelper.Corruption("Unexpected EOF reading plain table entry at " + offset);
         return _data.AsSpan((int)offset, (int)len);
     }
 
@@ -233,14 +234,14 @@ internal sealed class PlainTableKeyDecoder
     /// </summary>
     private (ulong Seq, EntryType Type, bool InFile) ReadInternalKey(uint fileOffset, uint userKeySize, ref uint bytesRead)
     {
-        ReadOnlySpan<byte> tmp = Read(fileOffset, userKeySize + 1);
+        ReadOnlySpan<byte> tmp = Read(fileOffset, (ulong)userKeySize + 1);
         if (tmp[(int)userKeySize] == PlainTableFormat.ValueTypeSeqId0)
         {
             // Special encoding for the row with seqID=0
             bytesRead += userKeySize + 1;
             return (0, EntryType.Value, false);
         }
-        ReadOnlySpan<byte> ikey = Read(fileOffset, userKeySize + 8);
+        ReadOnlySpan<byte> ikey = Read(fileOffset, (ulong)userKeySize + 8);
         if (!DbFormat.TryParseInternalKey(ikey, out ParsedInternalKey pk))
             ThrowHelper.Corruption("Corrupted key found during next key read. Corrupted Key: invalid internal key type");
         bytesRead += userKeySize + 8;

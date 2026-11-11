@@ -365,18 +365,20 @@ public sealed partial class BlockBasedTableReader : TableReader
 
     /// <summary>
     /// Port of HashIndexReader::Create (table/block_based/hash_index_reader.cc): builds the <see cref="BlockPrefixIndex"/>
-    /// from the hash index meta blocks. Failure to create the prefix hash index is not a hard error; the index is then
-    /// searched with binary search (null).
+    /// from the hash index meta blocks. Missing meta blocks, an unreadable prefixes metadata block or a failure to create the
+    /// prefix hash index are not hard errors; the index is then searched with binary search (null).
     /// </summary>
-    private static BlockPrefixIndex? TryCreatePrefixIndex(IRandomAccessFile file, in Footer footer, Dictionary<string, BlockHandle> metaBlocks, bool verify)
+    private static BlockPrefixIndex? TryCreatePrefixIndex(IRandomAccessFile file, in Footer footer, Dictionary<string, BlockHandle> metaBlocks, BlockFetcher.ChecksumVerification verify)
     {
         if (!metaBlocks.TryGetValue(BlockBasedTableConstants.HashIndexPrefixesBlockName, out BlockHandle prefixesHandle)
             || !metaBlocks.TryGetValue(BlockBasedTableConstants.HashIndexPrefixesMetadataBlockName, out BlockHandle metaHandle))
             return null;
-        byte[]? prefixes = null, meta = null;
+        // A prefixes block that cannot be read fails the open ("return s" after prefixes_block_fetcher.ReadBlockContents);
+        // only a bad prefixes metadata block or BlockPrefixIndex::Create failure falls back to binary search.
+        byte[]? prefixes = BlockFetcher.ReadRawPayload(file, footer, prefixesHandle, verify, out int prefixesLength);
+        byte[]? meta = null;
         try
         {
-            prefixes = BlockFetcher.ReadRawPayload(file, footer, prefixesHandle, verify, out int prefixesLength);
             meta = BlockFetcher.ReadRawPayload(file, footer, metaHandle, verify, out int metaLength);
             return BlockPrefixIndex.Create(prefixes.AsSpan(0, prefixesLength), meta.AsSpan(0, metaLength));
         }
@@ -533,7 +535,7 @@ public sealed partial class BlockBasedTableReader : TableReader
 
     private static BlockBasedTableReader OpenWithFooter(IRandomAccessFile file, TableReaderOptions options, Footer footer, long fileSize, IRandomAccessFile? ownedFile = null)
     {
-        bool verify = options.VerifyChecksums;
+        var verify = new BlockFetcher.ChecksumVerification(options.VerifyChecksums, options.Statistics?.Owner);
         var metaBlocks = new Dictionary<string, BlockHandle>(StringComparer.Ordinal);
         Block metaindex = Protect(BlockFetcher.ReadBlock(file, footer, footer.MetaindexHandle, verify), options);
         try
@@ -553,10 +555,30 @@ public sealed partial class BlockBasedTableReader : TableReader
         {
             // ReadTablePropertiesHelper: read and parse without checksum verification, then verify (an ingested file
             // whose global seqno was rewritten by the legacy write_global_seqno has a stale properties checksum).
-            Block pb = BlockFetcher.ReadBlock(file, footer, propsHandle, verifyChecksums: false);
-            try { props = TableProperties.Parse(pb, propsHandle.Offset); }
-            finally { pb.Release(); }
-            if (verify) VerifyPropertiesBlockChecksum(file, footer, propsHandle, props.ExternalSstFileGlobalSeqnoOffset);
+            // The block is read from the file once (upstream's single BlockFetcher read); parsing and the checksum
+            // verification below both work on those bytes.
+            IRandomAccessFile propsFile = file;
+            byte[]? propsRaw = null;
+            ulong propsLength = propsHandle.Size + BlockBasedTableConstants.BlockTrailerSize;
+            if (verify.Enabled && propsLength <= 1 << 26)
+            {
+                propsRaw = RocksArrayPool<byte>.Shared.Rent((int)propsLength);
+                if (BlockFetcher.ReadFully(file, (long)propsHandle.Offset, propsRaw.AsSpan(0, (int)propsLength)) == (int)propsLength)
+                {
+                    propsFile = new RangeCachedFile(file, (long)propsHandle.Offset, propsRaw, (int)propsLength);
+                }
+            }
+            try
+            {
+                Block pb = BlockFetcher.ReadBlock(propsFile, footer, propsHandle, verifyChecksums: false);
+                try { props = TableProperties.Parse(pb, propsHandle.Offset); }
+                finally { pb.Release(); }
+                if (verify.Enabled) VerifyPropertiesBlockChecksum(propsFile, footer, propsHandle, props.ExternalSstFileGlobalSeqnoOffset);
+            }
+            finally
+            {
+                if (propsRaw is not null) RocksArrayPool<byte>.Shared.Return(propsRaw);
+            }
         }
         else
         {
@@ -630,15 +652,28 @@ public sealed partial class BlockBasedTableReader : TableReader
                 && fh.Size > 0)
             {
                 filterKind = FilterKind.Partitioned;
-                Block top = BlockFetcher.ReadBlock(file, footer, fh, verify);
+                Block? top = null;
+                try
+                {
+                    top = BlockFetcher.ReadBlock(file, footer, fh, verify);
+                }
+                catch (Exception e) when (e is RocksDbException or IOException)
+                {
+                    // PartitionedFilterBlockReader::Create (partitioned_filter_block.cc): a top-level filter index that
+                    // cannot be read is ignored (IGNORE_STATUS_IF_ERROR) and the table is opened without a filter.
+                    filterKind = FilterKind.None;
+                }
                 filterIndex = top;
-                if (!options.CacheIndexAndFilterBlocks || metaCache is null)
+                if (top is not null && (!options.CacheIndexAndFilterBlocks || metaCache is null))
                 {
                     // Partition pinning (MetadataCacheOptions kFallback without cache_index_and_filter_blocks):
-                    // PartitionedFilterBlockReader::CacheDependencies loads all partitions up front and keeps them.
-                    pinnedParts = PinnedFilterPartitions.Load(file, footer, verify, ppolicy, top, props, options.Comparator);
+                    // PartitionedFilterBlockReader::CacheDependencies loads all partitions up front and keeps them. Its
+                    // read errors fail the open, except without a block cache, where C++ loads nothing at open
+                    // (MaybeReadBlockAndLoadToCache is a no-op) and a lookup ignores an unreadable partition.
+                    pinnedParts = PinnedFilterPartitions.Load(file, footer, verify, ppolicy, top, props, options.Comparator,
+                        ignoreUnreadablePartitions: options.BlockCache is NoBlockCache);
                 }
-                if (metaCache is not null)
+                if (top is not null && metaCache is not null)
                 {
                     if (pinTopLevel) top.AddRef();
                     else filterIndex = null;
@@ -659,8 +694,20 @@ public sealed partial class BlockBasedTableReader : TableReader
                 else
                 {
                     filterSource = BlockBufferSource.TableBuffers;
-                    filterBuf = BlockFetcher.ReadRawPayload(file, footer, fh, verify, filterSource, out int flen);
-                    filter = CreateFilterReader(policy, filterBuf, flen);
+                    try
+                    {
+                        filterBuf = BlockFetcher.ReadRawPayload(file, footer, fh, verify, filterSource, out int flen);
+                        filter = CreateFilterReader(policy, filterBuf, flen);
+                    }
+                    catch (Exception e) when (e is RocksDbException or IOException)
+                    {
+                        // FullFilterBlockReader::Create (full_filter_block.cc): a filter block that cannot be read is
+                        // ignored (IGNORE_STATUS_IF_ERROR) and the table is opened without a filter.
+                        if (filterBuf is not null) TableBuilderBuffers.Return(filterSource, filterBuf);
+                        filterBuf = null;
+                        filter = null;
+                        filterKind = FilterKind.None;
+                    }
                 }
             }
             UserDefinedIndexReader? udi = OpenUserDefinedIndex(file, options, footer, metaBlocks, props, verify, out bool udiStub);
@@ -687,7 +734,18 @@ public sealed partial class BlockBasedTableReader : TableReader
                 // PrefetchIndexAndFilterBlocks with prefetch_index_and_filter_in_cache: warm the block cache, reading through
                 // `file` (the tail prefetch buffer of an async open).
                 if (prefetchIndexIntoCache) reader.PrefetchIndexIntoCache(metaCache!, file);
-                if (prefetchFilterIntoCache) reader.PrefetchFilterIntoCache(metaCache!, file, prefetchFilterHandle);
+                if (prefetchFilterIntoCache)
+                {
+                    try
+                    {
+                        reader.PrefetchFilterIntoCache(metaCache!, file, prefetchFilterHandle);
+                    }
+                    catch (Exception e) when (e is RocksDbException or IOException)
+                    {
+                        // FullFilterBlockReader::Create: a failed prefetch of the filter is ignored; lookups retry the read
+                        // (and answer "may match" while it fails).
+                    }
+                }
             }
             catch
             {
@@ -707,12 +765,12 @@ public sealed partial class BlockBasedTableReader : TableReader
         CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(IndexHandle.Offset);
         if (LookupCache(cache, key, BlockKind.Index, out CachedBlock h))
         {
-            _stats?.Record(HitCounter(BlockKind.Index));
+            _stats?.RecordHit(HitCounter(BlockKind.Index), h.Charge);
             h.Dispose();
             return;
         }
         _stats?.Record(MissCounter(BlockKind.Index));
-        Block b = Protect(BlockFetcher.ReadBlock(file, _footer, IndexHandle, _options.VerifyChecksums, null, BlockBufferSource.BlockBufferPool), BlockKind.Index);
+        Block b = Protect(BlockFetcher.ReadBlock(file, _footer, IndexHandle, VerifyRead(TableReadFlags.None), null, BlockBufferSource.BlockBufferPool), BlockKind.Index);
         InsertIntoCache(cache, key, b, BlockKind.Index).Release();
     }
 
@@ -722,13 +780,13 @@ public sealed partial class BlockBasedTableReader : TableReader
         CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
         if (LookupFilterCache(cache, key, out CachedBlock h))
         {
-            _stats?.Record(BlockCacheCounter.FilterHit);
+            _stats?.RecordHit(BlockCacheCounter.FilterHit, h.Charge);
             h.Dispose();
             return;
         }
         _stats?.Record(BlockCacheCounter.FilterMiss);
         // A cached filter's buffer is returned to RocksArrayPool.Shared by the cache entry (CacheValue).
-        byte[] buf = BlockFetcher.ReadRawPayload(file, _footer, handle, _options.VerifyChecksums, BlockBufferSource.Shared, out int len);
+        byte[] buf = BlockFetcher.ReadRawPayload(file, _footer, handle, VerifyRead(TableReadFlags.None), BlockBufferSource.Shared, out int len);
         IFilterBitsReader filter;
         try
         {
@@ -778,7 +836,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     /// factory. In kStandardDefault a missing or unusable custom index falls back to the standard index.
     /// </summary>
     private static UserDefinedIndexReader? OpenUserDefinedIndex(IRandomAccessFile file, TableReaderOptions options, in Footer footer,
-        Dictionary<string, BlockHandle> metaBlocks, TableProperties props, bool verify, out bool requiresCustomReader)
+        Dictionary<string, BlockHandle> metaBlocks, TableProperties props, BlockFetcher.ChecksumVerification verify, out bool requiresCustomReader)
     {
         BlockBasedIndexMode mode = options.IndexMode;
         UserDefinedIndexFactory? factory = options.UserDefinedIndexFactory;
@@ -972,7 +1030,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
         if (versionBytes!.Length < 4) ThrowHelper.Corruption("bad external sst file version");
         uint version = Coding.DecodeFixed32(versionBytes);
-        if (version != 2)
+        if (version < 2)
         {
             if (version != 1) ThrowHelper.Corruption("An external sst file has corrupted version " + version + ".");
             if (hasSeqno) ThrowHelper.Corruption("An external sst file with version 1 has global seqno property");
@@ -1009,7 +1067,7 @@ public sealed partial class BlockBasedTableReader : TableReader
             CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
             if (LookupCache(cache, key, kind, out CachedBlock h))
             {
-                _stats?.Record(HitCounter(kind));
+                _stats?.RecordHit(HitCounter(kind), h.Charge);
                 PerfContext.Add(PerfMetric.BlockCacheHitCount, 1); // BlockBasedTable::UpdateCacheHitMetrics
                 if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, Unsafe.As<Block>(h.Value), hit: true, flags);
                 return BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h);
@@ -1033,7 +1091,7 @@ public sealed partial class BlockBasedTableReader : TableReader
             key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
             if (LookupCache(cache, key, kind, out CachedBlock h))
             {
-                _stats?.Record(HitCounter(kind));
+                _stats?.RecordHit(HitCounter(kind), h.Charge);
                 if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, Unsafe.As<Block>(h.Value), hit: true, flags);
                 return BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h);
             }
@@ -1046,7 +1104,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         // Charged per block consumed from the readahead buffer (upstream charges the prefetch reads themselves).
         ChargeRateLimiter(handle, flags);
         ThrowIfNoIo(flags);
-        Block b = Protect(BlockFetcher.ReadBlock(prefetch, _footer, handle, Verify(flags), DictFor(kind)), kind);
+        Block b = Protect(BlockFetcher.ReadBlock(prefetch, _footer, handle, VerifyRead(flags), DictFor(kind)), kind);
         if (cache is not null && _bcTracer is { IsEnabled: true } tr) TraceAccess(tr, key, kind, b, hit: false, flags);
         return cache is null || (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
@@ -1103,6 +1161,9 @@ public sealed partial class BlockBasedTableReader : TableReader
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool Verify(TableReadFlags flags) => _options.VerifyChecksums && (flags & TableReadFlags.SkipChecksumVerification) == 0;
 
+    /// <summary><see cref="Verify"/> for a block read, with the statistics that count checksum verifications.</summary>
+    private BlockFetcher.ChecksumVerification VerifyRead(TableReadFlags flags) => new(Verify(flags), _stats?.Owner);
+
     /// <summary>
     /// BlockBasedTable::RetrieveBlock with no_io (ReadOptions::read_tier = kBlockCacheTier): a block that is not cached
     /// fails the read with Incomplete("no blocking io") instead of being read from the file. Also enforces the
@@ -1143,7 +1204,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         var key = new BlockCacheKey(_tableId, handle.Offset);
         if (legacy.TryGet(key, out Block? b))
         {
-            _stats?.Record(HitCounter(kind));
+            _stats?.RecordHit(HitCounter(kind), b.Charge);
             return BlockRef.FromOwned(b);
         }
         _stats?.Record(MissCounter(kind));
@@ -1170,7 +1231,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     [MethodImpl(MethodImplOptions.NoInlining)]
     private BlockRef ReadAndInsertOfferingCompressed(BlockCache cache, in CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
-        Block b = Protect(BlockFetcher.ReadBlockKeepingCompressed(_file, _footer, handle, Verify(flags), DictFor(kind), out byte[]? serialized), kind);
+        Block b = Protect(BlockFetcher.ReadBlockKeepingCompressed(_file, _footer, handle, VerifyRead(flags), DictFor(kind), out byte[]? serialized), kind);
         try
         {
             if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, b, hit: false, flags);
@@ -1186,7 +1247,7 @@ public sealed partial class BlockBasedTableReader : TableReader
     private async ValueTask<BlockRef> ReadAndInsertOfferingCompressedAsync(BlockCache cache, CacheKey key, BlockHandle handle, BlockKind kind,
         TableReadFlags flags, CancellationToken ct)
     {
-        BlockFetcher.CompressedRead read = await BlockFetcher.ReadBlockKeepingCompressedAsync(_file, _footer, handle, Verify(flags),
+        BlockFetcher.CompressedRead read = await BlockFetcher.ReadBlockKeepingCompressedAsync(_file, _footer, handle, VerifyRead(flags),
             DictFor(kind), ct).ConfigureAwait(false);
         try
         {
@@ -1268,7 +1329,7 @@ public sealed partial class BlockBasedTableReader : TableReader
             if (cache.ExtendedLookup) return GetBlockRefExtendedAsync(cache, key, handle, kind, flags, ct);
             if (cache.TryLookup(key, out CachedBlock h))
             {
-                _stats?.Record(HitCounter(kind));
+                _stats?.RecordHit(HitCounter(kind), h.Charge);
                 if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, Unsafe.As<Block>(h.Value), hit: true, flags);
                 return new ValueTask<BlockRef>(BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h));
             }
@@ -1280,7 +1341,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         {
             if (legacy.TryGet(new BlockCacheKey(_tableId, handle.Offset), out Block? b))
             {
-                _stats?.Record(HitCounter(kind));
+                _stats?.RecordHit(HitCounter(kind), b.Charge);
                 return new ValueTask<BlockRef>(BlockRef.FromOwned(b));
             }
             _stats?.Record(MissCounter(kind));
@@ -1295,8 +1356,8 @@ public sealed partial class BlockBasedTableReader : TableReader
         await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
         if (cache.AdmitsCompressedBlocks && OffersCompressed(kind, flags))
             return await ReadAndInsertOfferingCompressedAsync(cache, key, handle, kind, flags, ct).ConfigureAwait(false);
-        Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, ct).ConfigureAwait(false)
-            : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, Verify(flags), DictFor(kind), ct).ConfigureAwait(false), kind);
+        Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, flags, ct).ConfigureAwait(false)
+            : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, VerifyRead(flags), DictFor(kind), ct).ConfigureAwait(false), kind);
         if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, kind, b, hit: false, flags);
         return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
@@ -1306,8 +1367,8 @@ public sealed partial class BlockBasedTableReader : TableReader
     {
         ThrowIfNoIo(flags);
         await ChargeRateLimiterAsync(handle, flags, ct).ConfigureAwait(false);
-        Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, ct).ConfigureAwait(false)
-            : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, Verify(flags), DictFor(kind), ct).ConfigureAwait(false), kind);
+        Block b = Protect(_persistentCache is { } pc ? await ReadBlockThroughPersistentCacheAsync(pc, handle, kind, flags, ct).ConfigureAwait(false)
+            : await BlockFetcher.ReadBlockAsync(_file, _footer, handle, VerifyRead(flags), DictFor(kind), ct).ConfigureAwait(false), kind);
         if (_legacyCache is { } legacy && (flags & TableReadFlags.DontFillCache) == 0) legacy.Insert(new BlockCacheKey(_tableId, handle.Offset), b);
         return BlockRef.FromOwned(b);
     }
@@ -1370,6 +1431,12 @@ public sealed partial class BlockBasedTableReader : TableReader
             _ => BlockCacheCounter.FilterAdd,
         });
         stats.Add(BlockCacheCounter.BytesInserted, charge);
+        stats.Add(kind switch
+        {
+            BlockKind.Data => BlockCacheCounter.DataBytesInsert,
+            BlockKind.Index => BlockCacheCounter.IndexBytesInsert,
+            _ => BlockCacheCounter.FilterBytesInsert,
+        }, charge);
     }
 
     /// <summary>
@@ -1418,7 +1485,8 @@ public sealed partial class BlockBasedTableReader : TableReader
         // Hmm. Let's just split in half to avoid skewing one way or another, since we don't know whether we're
         // operating on lower bound or upper bound.
         if (dataSize == 0) return (ulong)FileSize / 2;
-        ulong offset = ApproximateDataOffsetOf(internalKey, dataSize);
+        // An index iterator error: split in half as well.
+        if (!TryApproximateDataOffsetOf(internalKey, dataSize, out ulong offset)) return (ulong)FileSize / 2;
         // Pro-rate file metadata (incl filters) size-proportionally across data blocks.
         double sizeRatio = (double)offset / dataSize;
         return (ulong)(sizeRatio * FileSize);
@@ -1430,8 +1498,9 @@ public sealed partial class BlockBasedTableReader : TableReader
         ulong dataSize = Properties.DataSize;
         // Hmm. Assume whole file is involved, since we have lower and upper bound.
         if (dataSize == 0) return (ulong)FileSize;
-        ulong startOffset = ApproximateDataOffsetOf(startInternalKey, dataSize);
-        ulong endOffset = ApproximateDataOffsetOf(endInternalKey, dataSize);
+        // An index iterator error: assume the file is involved from the start / until the end.
+        if (!TryApproximateDataOffsetOf(startInternalKey, dataSize, out ulong startOffset)) startOffset = 0;
+        if (!TryApproximateDataOffsetOf(endInternalKey, dataSize, out ulong endOffset)) endOffset = dataSize;
         double sizeRatio = (double)(endOffset - Math.Min(startOffset, endOffset)) / dataSize;
         return (ulong)(sizeRatio * FileSize);
     }
@@ -1507,13 +1576,20 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
     }
 
-    private ulong ApproximateDataOffsetOf(ReadOnlySpan<byte> internalKey, ulong dataSize)
+    // False when the index seek failed (index_iter->status() not ok upstream: an unreadable index partition).
+    private bool TryApproximateDataOffsetOf(ReadOnlySpan<byte> internalKey, ulong dataSize, out ulong offset)
     {
         IndexCursor cursor = IndexCursor.Rent(this, TableReadFlags.DontFillCache);
         try
         {
             cursor.Seek(internalKey);
-            return cursor.Valid ? cursor.Handle.Offset : dataSize;
+            offset = cursor.Valid ? cursor.Handle.Offset : dataSize;
+            return true;
+        }
+        catch (RocksDbException)
+        {
+            offset = 0;
+            return false;
         }
         finally
         {
@@ -1568,6 +1644,8 @@ public sealed partial class BlockBasedTableReader : TableReader
         {
             // FIXME (upstream): there should be no reason for Get() to depend on current prefix_extractor at all.
             bool mayMatch = FilterMayMatch(pe.Transform(userKey), internalKey, flags);
+            // FullFilterBlockReader::PrefixMayMatch -> MayMatch counts the probe like a whole key probe.
+            PerfContext.Add(mayMatch ? PerfMetric.BloomSstHitCount : PerfMetric.BloomSstMissCount, 1);
             if (_stats is { } s)
             {
                 s.Record(BlockCacheCounter.BloomFilterPrefixChecked);
@@ -1605,7 +1683,10 @@ public sealed partial class BlockBasedTableReader : TableReader
         // FullFilterBlockReader::PrefixMayMatch records no BLOOM_FILTER_* ticker: seeks are counted by the iterator
         // (SEEK_FILTERED / SEEK_FILTER_MATCH); BLOOM_FILTER_PREFIX_USEFUL is for point lookups only.
         filterChecked = true;
-        return FilterMayMatch(prefix, internalKey, flags);
+        bool prefixMayMatch = FilterMayMatch(prefix, internalKey, flags);
+        // FilterBlockReaderCommon::RangeMayExist -> PrefixMayMatch -> FullFilterBlockReader::MayMatch.
+        PerfContext.Add(prefixMayMatch ? PerfMetric.BloomSstHitCount : PerfMetric.BloomSstMissCount, 1);
+        return prefixMayMatch;
     }
 
     /// <summary>
@@ -1621,7 +1702,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         ReadOnlySpan<byte> upperBoundXform = pe.Transform(upperBound);
         Comparator ucmp = _icmp.UserComparator;
         // first check if user_key and upper_bound all share the same prefix
-        if (ucmp.Compare(prefix, upperBoundXform) != 0)
+        if (ucmp.CompareWithoutTimestamp(prefix, false, upperBoundXform, false) != 0)
         {
             // second check if user_key's prefix is the immediate predecessor of upper_bound and have the same length. If
             // so, we know for sure all keys in the range [user_key, upper_bound) share the same prefix. Also need to make
@@ -1648,6 +1729,27 @@ public sealed partial class BlockBasedTableReader : TableReader
                 ? last ? Ticker.LastLevelSeekFiltered : Ticker.NonLastLevelSeekFiltered
                 : last ? Ticker.LastLevelSeekFilterMatch : Ticker.NonLastLevelSeekFilterMatch);
         }
+    }
+
+    /// <summary>
+    /// BlockBasedTableIterator::InitDataBlock: {NON_,}LAST_LEVEL_SEEK_DATA for the first data block a seek loads. False
+    /// (nothing recorded) without a statistics object.
+    /// </summary>
+    internal bool RecordSeekData()
+    {
+        if (_stats?.Owner is not { } st) return false;
+        st.RecordTick(IsLastLevel ? Ticker.LastLevelSeekData : Ticker.NonLastLevelSeekData);
+        return true;
+    }
+
+    /// <summary>BlockBasedTableIterator::value(): {NON_,}LAST_LEVEL_SEEK_DATA_USEFUL_{FILTER_MATCH,NO_FILTER}.</summary>
+    internal void RecordSeekDataUseful(bool filterUsed)
+    {
+        if (_stats?.Owner is not { } st) return;
+        bool last = IsLastLevel;
+        st.RecordTick(filterUsed
+            ? last ? Ticker.LastLevelSeekDataUsefulFilterMatch : Ticker.NonLastLevelSeekDataUsefulFilterMatch
+            : last ? Ticker.LastLevelSeekDataUsefulNoFilter : Ticker.NonLastLevelSeekDataUsefulNoFilter);
     }
 
     /// <summary>BlockBasedTable::IsLastLevel: the level the file was opened at is the last level of the LSM tree.</summary>
@@ -1688,7 +1790,23 @@ public sealed partial class BlockBasedTableReader : TableReader
     {
         // kBlockCacheTier: the partition index would have to be read (conservatively "may match").
         if (_filterIndexBlock is null && (flags & TableReadFlags.BlockCacheTier) != 0) return true;
-        BlockRef top = _filterIndexBlock is not null ? BlockRef.FromPinned(_filterIndexBlock) : GetBlockRef(_filterHandle, BlockKind.Filter, flags);
+        BlockRef top;
+        if (_filterIndexBlock is not null)
+        {
+            top = BlockRef.FromPinned(_filterIndexBlock);
+        }
+        else
+        {
+            try
+            {
+                top = GetBlockRef(_filterHandle, BlockKind.Filter, flags);
+            }
+            catch (Exception e) when (e is RocksDbException or IOException)
+            {
+                // PartitionedFilterBlockReader::MayMatch: GetOrReadFilterBlock failed (IGNORE_STATUS_IF_ERROR).
+                return true;
+            }
+        }
         BlockHandle partition;
         BlockIter it = IterPool.Rent();
         try
@@ -1727,7 +1845,7 @@ public sealed partial class BlockBasedTableReader : TableReader
             key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
             if (LookupFilterCache(cache, key, out CachedBlock h))
             {
-                _stats?.Record(BlockCacheCounter.FilterHit);
+                _stats?.RecordHit(BlockCacheCounter.FilterHit, h.Charge);
                 if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, BlockKind.Filter, null, hit: true, flags, (ulong)handle.Size);
                 bool r = Unsafe.As<IFilterBitsReader>(h.Value)!.MayMatch(entry);
                 h.Dispose();
@@ -1736,12 +1854,28 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
         _stats?.Record(BlockCacheCounter.FilterMiss);
         if ((flags & TableReadFlags.BlockCacheTier) != 0) return true; // no I/O allowed: Incomplete -> may match
-        byte[] buf = BlockFetcher.ReadRawPayload(_file, _footer, handle, Verify(flags), out int len);
+        // FullFilterBlockReader::MayMatch / PartitionedFilterBlockReader::MayMatch: a filter block (or partition) that
+        // cannot be read is ignored (IGNORE_STATUS_IF_ERROR) and the key may match.
+        byte[] buf;
+        int len;
+        try
+        {
+            buf = BlockFetcher.ReadRawPayload(_file, _footer, handle, VerifyRead(flags), out len);
+        }
+        catch (Exception e) when (e is RocksDbException or IOException)
+        {
+            return true;
+        }
         if (cache is not null && _bcTracer is { IsEnabled: true } tm) TraceAccess(tm, key, BlockKind.Filter, null, hit: false, flags, (ulong)len);
         IFilterBitsReader reader;
         try
         {
             reader = CreateFilterReader(_options.FilterPolicy!, buf, len);
+        }
+        catch (RocksDbException)
+        {
+            RocksArrayPool<byte>.Shared.Return(buf);
+            return true;
         }
         catch
         {
@@ -2120,6 +2254,31 @@ public sealed partial class BlockBasedTableReader : TableReader
         // The pinned full filter (never set when the filter is held by the block cache) is rented from the pinned table buffers.
         if (fb is not null) TableBuilderBuffers.Return(BlockBufferSource.TableBuffers, fb);
         _file.Dispose();
+    }
+
+    /// <summary>Serves reads inside one byte range already read from <paramref name="inner"/> from memory; other reads go to the file.</summary>
+    private sealed class RangeCachedFile(IRandomAccessFile inner, long offset, byte[] buffer, int length) : IRandomAccessFile
+    {
+        public long Length => inner.Length;
+
+        public int Read(long position, Span<byte> destination)
+        {
+            if (position >= offset && position + destination.Length <= offset + length)
+            {
+                buffer.AsSpan((int)(position - offset), destination.Length).CopyTo(destination);
+                return destination.Length;
+            }
+            return inner.Read(position, destination);
+        }
+
+        public ValueTask<int> ReadAsync(long position, Memory<byte> destination, CancellationToken cancellationToken = default) =>
+            new(Read(position, destination.Span));
+
+        public bool Prefetch(long position, long count) => inner.Prefetch(position, count);
+
+        public void Dispose()
+        {
+        }
     }
 
     /// <summary>Wraps a file and serves reads within an asynchronously prefetched tail region from memory (port of tail prefetching in BlockBasedTable::PrefetchTail).</summary>

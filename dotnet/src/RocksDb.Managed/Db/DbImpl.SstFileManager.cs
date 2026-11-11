@@ -13,9 +13,13 @@ internal sealed partial class DbImpl
     /// <summary>SanitizeOptions: every DB has an SstFileManager (a private one with immediate deletion by default).</summary>
     private void SetupSstFileManager()
     {
-        if (Options.SstFileManager is not null) return;
-        Options.SstFileManager = new SstFileManager(FileSystem, 0, 0.25, 64UL << 20);
-        _ownsSstFileManager = true;
+        if (Options.SstFileManager is null)
+        {
+            Options.SstFileManager = new SstFileManager(FileSystem, 0, 0.25, 64UL << 20);
+            _ownsSstFileManager = true;
+        }
+        // DBImpl::Open: sfm->SetStatisticsPtr(immutable_db_options_.statistics).
+        Options.SstFileManager.Statistics = Options.Statistics;
     }
 
     private void DisposeOwnedSstFileManager()

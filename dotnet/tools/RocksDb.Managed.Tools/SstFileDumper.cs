@@ -100,7 +100,36 @@ internal sealed class SstFileDumper : IDisposable
                 if (hasTo && ucmp.Compare(userKey, to) >= 0) break;
                 if (printKv)
                 {
-                    string v = p.Type == EntryType.WideColumnEntity ? WideColumnsToString(it.Value, _outputHex) : ToolText.ToString(it.Value, _outputHex);
+                    string v;
+                    if (DecodeBlobIndex && p.Type == EntryType.BlobIndex)
+                    {
+                        if (Db.Blob.BlobIndex.TryDecode(it.Value, out Db.Blob.BlobIndex blobIndex) is not null)
+                        {
+                            Console.Error.Write(ToolText.InternalKeyDebugString(key, _outputHex) + " => error decoding blob index\n");
+                            continue;
+                        }
+                        v = BlobIndexDebugString(blobIndex, _outputHex);
+                    }
+                    else if (p.Type == EntryType.WideColumnEntity)
+                    {
+                        if (!TryWideColumnsToString(it.Value, _outputHex, out v))
+                        {
+                            // SstFileDumper::ReadSequential: the error goes to stderr and the entry is skipped.
+                            Console.Error.Write(ToolText.InternalKeyDebugString(key, _outputHex) + " => error deserializing wide columns\n");
+                            continue;
+                        }
+                    }
+                    else if (p.Type == EntryType.ValuePreferredSeqno && it.Value.Length >= sizeof(ulong))
+                    {
+                        // ParsePackedValueWithSeqno: "value, preferred_seqno".
+                        ReadOnlySpan<byte> packed = it.Value;
+                        v = ToolText.ToString(packed[..^sizeof(ulong)], _outputHex) + ", "
+                            + Util.Coding.DecodeFixed64(packed[^sizeof(ulong)..]).ToString(CultureInfo.InvariantCulture);
+                    }
+                    else
+                    {
+                        v = ToolText.ToString(it.Value, _outputHex);
+                    }
                     _out.Write(ToolText.InternalKeyDebugString(key, _outputHex) + " => " + v + "\n");
                 }
             }
@@ -116,11 +145,51 @@ internal sealed class SstFileDumper : IDisposable
         return null;
     }
 
-    /// <summary>WideColumnsHelper::DumpSliceAsWideColumns: "name:value name:value" (the default column name is empty).</summary>
-    internal static string WideColumnsToString(ReadOnlySpan<byte> entity, bool hex)
+    /// <summary>--decode_blob_index: blob references are printed as BlobIndex::DebugString instead of their raw bytes.</summary>
+    public bool DecodeBlobIndex { get; init; }
+
+    /// <summary>BlobIndex::DebugString(output_hex) (db/blob/blob_index.h).</summary>
+    private static string BlobIndexDebugString(in Db.Blob.BlobIndex index, bool hex)
     {
+        var sb = new System.Text.StringBuilder();
+        if (index.IsInlined)
+        {
+            sb.Append("[inlined blob] value:").Append(ToolText.ToString(index.InlinedValue, hex));
+        }
+        else
+        {
+            sb.Append("[blob ref] file:").Append(index.IsSameFile ? "same" : index.FileNumber.ToString(CultureInfo.InvariantCulture))
+                .Append(" offset:").Append(index.Offset.ToString(CultureInfo.InvariantCulture))
+                .Append(" size:").Append(index.Size.ToString(CultureInfo.InvariantCulture))
+                .Append(" compression: ").Append(index.Compression switch
+                {
+                    // CompressionTypeToString (util/compression.cc).
+                    Compression.CompressionType.None => "NoCompression",
+                    Compression.CompressionType.Snappy => "Snappy",
+                    Compression.CompressionType.Zlib => "Zlib",
+                    Compression.CompressionType.BZip2 => "BZip2",
+                    Compression.CompressionType.LZ4 => "LZ4",
+                    Compression.CompressionType.LZ4HC => "LZ4HC",
+                    Compression.CompressionType.Xpress => "Xpress",
+                    Compression.CompressionType.Zstd => "ZSTD",
+                    _ => "",
+                });
+        }
+        if (index.HasTtl) sb.Append(" exp:").Append(index.Expiration.ToString(CultureInfo.InvariantCulture));
+        return sb.ToString();
+    }
+
+    /// <summary>WideColumnsHelper::DumpSliceAsWideColumns: "name:value name:value" (the default column name is empty).</summary>
+    internal static string WideColumnsToString(ReadOnlySpan<byte> entity, bool hex) =>
+        TryWideColumnsToString(entity, hex, out string s) ? s : "error deserializing wide columns";
+
+    /// <summary>WideColumnsHelper::DumpSliceAsWideColumns: false when the entity does not deserialize.</summary>
+    internal static bool TryWideColumnsToString(ReadOnlySpan<byte> entity, bool hex, out string text)
+    {
+        text = "";
         var slots = new List<Db.Wide.WideColumnSlot>();
-        if (Db.Wide.WideColumnSerialization.TryDeserialize(entity, slots, out _) is not null) return "error deserializing wide columns";
+        // DeserializeSimple: a blob reference (version 2 kTypeBlobIndex column) is Corruption for this caller too.
+        if (Db.Wide.WideColumnSerialization.TryDeserialize(entity, slots, out bool hasBlobColumns) is not null || hasBlobColumns) return false;
         var sb = new System.Text.StringBuilder();
         for (int c = 0; c < slots.Count; c++)
         {
@@ -129,7 +198,8 @@ internal sealed class SstFileDumper : IDisposable
             if (c > 0) sb.Append(' ');
             sb.Append(Col(name, hex)).Append(':').Append(Col(value, hex));
         }
-        return sb.ToString();
+        text = sb.ToString();
+        return true;
     }
 
     private static string Col(ReadOnlySpan<byte> s, bool hex) => s.IsEmpty ? "" : hex ? ToolText.StringToHex(s) : ToolText.Raw(s);

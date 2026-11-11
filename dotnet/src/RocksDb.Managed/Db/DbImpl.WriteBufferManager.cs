@@ -109,11 +109,7 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
         WriteBufferManager wbm = WriteBufferManager;
         LogInfo("Flushing triggered to alleviate write buffer memory usage. Write buffer is using " + wbm.MemoryUsage +
                 " bytes out of a total of " + wbm.BufferSize + ".");
-        foreach (ColumnFamilyData cfd in cfds)
-        {
-            if (cfd.Dropped || cfd.Mem.IsEmpty) continue;
-            await SwitchMemtableAsync(cfd, FlushReason.WriteBufferManager, synchronous, cancellationToken).ConfigureAwait(false);
-        }
+        await SwitchMemtablesForFlushAsync(cfds, FlushReason.WriteBufferManager, synchronous, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -180,6 +176,11 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
             Task blocked = stall.Block();
             wbm.BeginWriteStall(stall);
             bool retryLocalFlush = false;
+            // First block future writer threads who want to add themselves to the queue of WriteThread (the queued
+            // no_slowdown writers fail with Incomplete "Write stall").
+            _writeThread.BeginWriteStall();
+            try
+            {
             if (wbm.FlushPolicy == WriteBufferFlushPolicy.FlushLargestAcrossDbs)
             {
                 while (true)
@@ -204,6 +205,11 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
                     if (synchronous) blocked.Wait(100, cancellationToken);
                     else await Task.WhenAny(blocked, Task.Delay(100, cancellationToken)).ConfigureAwait(false);
                 }
+            }
+            }
+            finally
+            {
+                _writeThread.EndWriteStall();
             }
             if (IsDisposed || _shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
             if (!retryLocalFlush || !wbm.ShouldStall()) break;
@@ -238,8 +244,8 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
         {
             ColumnFamilyData? cfd;
             lock (_mutex) cfd = CollectFlushableColumnFamilies(includeWaitingImmutable: true, out _, out _);
-            if (cfd is not null && !cfd.Dropped && !cfd.Mem.IsEmpty)
-                await SwitchMemtableAsync(cfd, FlushReason.WriteBufferManager, synchronous: false, CancellationToken.None).ConfigureAwait(false);
+            if (cfd is not null)
+                await SwitchMemtablesForFlushAsync([cfd], FlushReason.WriteBufferManager, synchronous: false, CancellationToken.None).ConfigureAwait(false);
         }
         finally
         {

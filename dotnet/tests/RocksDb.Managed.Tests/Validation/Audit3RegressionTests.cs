@@ -23,8 +23,11 @@ public sealed class Audit3RegressionTests
         using RocksDatabase db = RocksDatabase.Open(DbPath, new DbOptions { CreateIfMissing = true, FileSystem = fs },
             [new ColumnFamilyDescriptor("default", new ColumnFamilyOptions { DisableAutoCompactions = true })]);
         db.Put(B("a"), B("1"));
+        db.Put(B("c"), B("1"));
         db.Flush();
-        db.Put(B("a"), B("2")); // overlaps the first file (no trivial move)
+        // Overlaps the first file's internal key range (no trivial move). Two files holding only versions of one user
+        // key do not overlap (GenerateLevel0NonOverlapping compares internal keys) and would be moved, like upstream.
+        db.Put(B("b"), B("2"));
         db.Flush();
         Dictionary<string, TableProperties> flushed = db.GetPropertiesOfAllTables();
         Assert.AreEqual(2, flushed.Count);

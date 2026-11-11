@@ -177,6 +177,7 @@ internal sealed partial class DbImpl
     {
         // ---- descriptors (DB::Open requires the default CF; we add it with default options when omitted) ----
         ValidateWriteModeOptions(Options, columnFamilies);
+        foreach (ColumnFamilyDescriptor d in columnFamilies) ValidateTableOptions(d.Options); // ValidateOptionsByTable
         var descriptors = new Dictionary<string, ColumnFamilyOptions>(StringComparer.Ordinal);
         foreach (ColumnFamilyDescriptor d in columnFamilies)
         {
@@ -232,6 +233,7 @@ internal sealed partial class DbImpl
             state = ManifestReader.RecoverFromDirectory(FileSystem, DbName, _comparatorResolver, out manifestNumber);
         }
         Versions.RecoverFrom(state, manifestNumber);
+        MarkExistingFileNumbersUsed();
         AddImplicitStatsColumnFamily(descriptors, state.FindColumnFamily(PersistentStatsColumnFamilyName) is not null);
 
         // Missing descriptors for existing CFs ("Column families not opened").
@@ -308,6 +310,9 @@ internal sealed partial class DbImpl
             Monitoring.FileReadActivity.Exit(openActivity);
         }
 
+        // ---- DBImpl::Recover: files moved down for level_compaction_dynamic_level_bytes ----
+        Dictionary<uint, VersionEdit>? moveDownEdits = BuildDynamicLevelMigrationEdits();
+
         // ---- WALs tracked in the MANIFEST (DBImpl::Recover: WalSet::CheckWals) ----
         VersionEdit? untrackWals = VerifyTrackedWalsAtOpen();
 
@@ -339,8 +344,15 @@ internal sealed partial class DbImpl
             }
             // All data of this CF in the replayed WALs is now in table files (or there was none).
             if (cfd.Mem.IsEmpty && cfd.Imm.Count == 0) edit.LogNumber = Math.Max(cfd.LogNumber, newLogNumber);
+            // recovery_ctx->UpdateVersionEdits: the move-down edit comes before the edits of the WAL replay.
+            if (moveDownEdits is not null && moveDownEdits.TryGetValue(cfd.Id, out VersionEdit? moveDown))
+            {
+                await Versions.LogAndApplyAsync(cfd, moveDown, synchronous, ct).ConfigureAwait(false);
+            }
             await Versions.LogAndApplyAsync(cfd, edit, synchronous, ct).ConfigureAwait(false);
         }
+        // DBImpl::Open: "Handle obsolete IDENTITY file", only after the recovery was committed.
+        if (!Options.WriteIdentityFile) TryDeleteFile(FileNames.IdentityFileName(DbName));
         // After reaching the post-recovery seqno but before creating SuperVersions ensure seqno to time mapping is
         // pre-populated as needed (a new DB with preserve / preclude set on any column family it is opened with).
         if (!exists)
@@ -380,6 +392,79 @@ internal sealed partial class DbImpl
         StartStatsPersist();
         EnableBackgroundCompactions();
         RegisterRecordSeqnoTimeWorker();
+    }
+
+    /// <summary>
+    /// Port of the level_compaction_dynamic_level_bytes step of DBImpl::Recover (db/db_impl/db_impl_open.cc): with level
+    /// compaction, dynamic level bytes and automatic compactions enabled, the files of the non-empty levels above the
+    /// last level are trivially moved down so that the LSM is filled from the bottommost level up (useful when the
+    /// option is being turned on for an existing DB). L0 stays; the last level is left free with allow_ingest_behind or
+    /// preclude_last_level_data_seconds. The edits are applied with the recovery edits ("Files are moved only if DB
+    /// Recovery is successful"). Returns null when nothing moves.
+    /// </summary>
+    private Dictionary<uint, VersionEdit>? BuildDynamicLevelMigrationEdits()
+    {
+        Dictionary<uint, VersionEdit>? result = null;
+        foreach (ColumnFamilyData cfd in GetColumnFamilies())
+        {
+            ColumnFamilyOptions o = cfd.Options;
+            if (o.CompactionStyle != CompactionStyle.Level || !o.LevelCompactionDynamicLevelBytes || o.DisableAutoCompactions) continue;
+            VersionStorageInfo storage = cfd.Current.Storage;
+            int toLevel = storage.NumLevels - 1;
+            // last level is reserved
+            if (o.AllowIngestBehind || o.PrecludeLastLevelDataSeconds > 0) toLevel -= 1;
+            VersionEdit? edit = null;
+            // Fill the LSM starting from to_level and going up one level at a time.
+            for (int fromLevel = toLevel; fromLevel >= 0; --fromLevel)
+            {
+                ReadOnlySpan<FileMetaData> files = storage.LevelFiles(fromLevel);
+                if (files.Length == 0 || fromLevel == 0) continue;
+                if (fromLevel < toLevel)
+                {
+                    if (edit is null)
+                    {
+                        edit = new VersionEdit { ColumnFamily = cfd.Id };
+                        LogWarn("[" + cfd.Name + "] Trivially move files down the LSM when open with level_compaction_dynamic_level_bytes=true" +
+                            " (Files are moved only if DB Recovery is successful).");
+                    }
+                    LogWarn("[" + cfd.Name + "] Moving " + files.Length.ToString(CultureInfo.InvariantCulture) + " files from from_level-" +
+                        fromLevel.ToString(CultureInfo.InvariantCulture) + " to from_level-" + toLevel.ToString(CultureInfo.InvariantCulture));
+                    foreach (FileMetaData f in files)
+                    {
+                        edit.DeleteFile(fromLevel, f.FileNumber);
+                        edit.AddFile(toLevel, f.Clone());
+                    }
+                }
+                --toLevel;
+            }
+            if (edit is not null) (result ??= new Dictionary<uint, VersionEdit>())[cfd.Id] = edit;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Port of the file-number part of DBImpl::MaybeUpdateNextFileNumber (db/db_impl/db_impl_files.cc): a file of the DB
+    /// paths numbered at or above next_file_number (its number was allocated after the last MANIFEST write, then the
+    /// process died) advances next_file_number past the largest such number, so that no new file collides with it.
+    /// COMPACTION_PROGRESS files carry a timestamp, not a file number, and are left out.
+    /// </summary>
+    private void MarkExistingFileNumbersUsed()
+    {
+        var dirs = new List<string>(DbPaths);
+        if (!dirs.Contains(DbName)) dirs.Add(DbName);
+        foreach (string dir in dirs)
+        {
+            IEnumerable<string> children;
+            try { children = FileSystem.GetChildren(dir); }
+            catch (RocksDbException e) when (e.SubCode == StatusSubCode.PathNotFound) { continue; }
+            foreach (string child in children)
+            {
+                if (FileNames.TryParseFileName(child, out ulong number, out FileType type) && type != FileType.CompactionProgressFile)
+                {
+                    Versions.MarkFileNumberUsed(number);
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -439,6 +524,9 @@ internal sealed partial class DbImpl
     {
         ColumnFamilyOptions o = options.Clone();
         SanitizeCfOptions(o, Options.AllowIngestBehind, DbPaths.Count);
+        // SanitizeCfOptions: with atomic_flush an internal flush covers all column families even with fewer memtables
+        // than min_write_buffer_number_to_merge, so the option is sanitized to 1.
+        if (Options.AtomicFlush && o.MinWriteBufferNumberToMerge > 1) o.MinWriteBufferNumberToMerge = 1;
         // ColumnFamilyData::ValidateOptions (DB::Open / CreateColumnFamily).
         ValidateCfOptions(Options, o);
         o.DbOffpeakTime = OffpeakTime;
@@ -516,19 +604,31 @@ internal sealed partial class DbImpl
                 result.MaxCompactionBytes = result.TargetFileSizeBase * 25;
             }
         }
-        // periodic_compaction_seconds defaults (the managed port only has block-based tables).
+        else
+        {
+            // Pin a still-derived default (the property follows TargetFileSizeBase until it is set): upstream fixes
+            // the value here, a later target_file_size_base change does not move it.
+            ulong pinned = result.MaxCompactionBytes;
+            result.MaxCompactionBytes = pinned;
+        }
+        // The ttl and periodic_compaction_seconds defaults apply to block-based tables only (is_block_based_table). The
+        // managed ttl default is the block-based value (30 days), so that value means "default" for other formats,
+        // where upstream sanitizes kDefaultTtl to 0.
+        bool isBlockBasedTable = result.TableFactory == TableFactoryType.BlockBasedTable;
         const ulong adjustedPeriodicCompSecs = 30UL * 24 * 60 * 60;
+        if (!isBlockBasedTable && result.Ttl == adjustedPeriodicCompSecs) result.Ttl = 0;
+        SanitizeTableOptions(result.TableOptions);
         if (result.CompactionStyle == CompactionStyle.Level)
         {
             if ((result.CompactionFilter is not null || result.CompactionFilterFactory is not null)
-                && result.PeriodicCompactionSeconds == ColumnFamilyOptions.DefaultPeriodicCompactionSeconds)
+                && result.PeriodicCompactionSeconds == ColumnFamilyOptions.DefaultPeriodicCompactionSeconds && isBlockBasedTable)
             {
                 result.PeriodicCompactionSeconds = adjustedPeriodicCompSecs;
             }
         }
         else if (result.CompactionStyle == CompactionStyle.Universal)
         {
-            if (result.PeriodicCompactionSeconds == ColumnFamilyOptions.DefaultPeriodicCompactionSeconds)
+            if (result.PeriodicCompactionSeconds == ColumnFamilyOptions.DefaultPeriodicCompactionSeconds && isBlockBasedTable)
             {
                 result.PeriodicCompactionSeconds = adjustedPeriodicCompSecs;
             }
@@ -646,6 +746,19 @@ internal sealed partial class DbImpl
             Error = new RocksDbException(code == StatusCode.IOError ? StatusCode.IOError : StatusCode.Corruption, status);
             CorruptedLogNumber = logNumber;
         }
+
+        /// <summary>
+        /// DBOpenLogRecordReadReporter::Corruption with a status that is not a read error (a failed
+        /// InsertLogRecordToMemtable): the status becomes the WAL's status unchanged, whatever its code.
+        /// </summary>
+        public void Report(long bytes, RocksDbException status)
+        {
+            Log?.Log(InfoLogLevel.Warn, (RecordErrors ? "" : "(ignoring error) ") + FileName + ": dropping " +
+                bytes.ToString(CultureInfo.InvariantCulture) + " bytes; " + status.Message);
+            if (!RecordErrors || Error is not null) return;
+            Error = status.GetType() == typeof(RocksDbException) ? status : new RocksDbException(status.Code, status.Message);
+            CorruptedLogNumber = UnspecifiedLogNumber;
+        }
     }
 
     /// <summary>
@@ -675,6 +788,11 @@ internal sealed partial class DbImpl
         {
             if (FileNames.TryParseFileName(child, out ulong number, out FileType type) && type == FileType.WalFile)
             {
+                // DBImpl::Recover (best-efforts recovery does not list the WAL directory).
+                if (isNewDb && !Options.BestEffortsRecovery)
+                {
+                    ThrowHelper.Corruption("While creating a new Db, wal_dir contains existing log file: : " + child);
+                }
                 allWals.Add(number);
                 Versions.MarkFileNumberUsed(number);
                 if (number >= minLog) wals.Add(number);
@@ -950,8 +1068,22 @@ internal sealed partial class DbImpl
         byte[]? reconciled = null;
         if (_cfTimestampSizes is not null || recordedTs.Count > 0) reconciled = HandleRecoveredBatchTimestampSizes(record, recordedTs);
         if (reconciled is not null) record = reconciled;
+        // DBImpl::InitializeWriteBatchForLogRecord: WriteBatchInternal::UpdateProtectionInfo iterates the whole batch
+        // before anything else is done with it, and its status is returned as is by ProcessLogRecord / ProcessLogFile.
+        // A record with a valid checksum and a malformed WriteBatch body (unknown tag, truncated entry, wrong count)
+        // therefore fails the open with Corruption in every wal_recovery_mode, with or without paranoid_checks, and
+        // nothing of it is applied (verified against native).
+        var validation = new WriteBatchReader(record);
+        while (validation.TryReadNext(out _)) { }
         ulong seq = Util.Coding.DecodeFixed64(record);
         progress.LastSeqnoObserved = seq;
+        if (seq > DbFormat.MaxSequenceNumber)
+        {
+            // DBImpl::ProcessLogRecord: a sequence that does not fit in 56 bits is reported as a corrupted record.
+            reporter.Corruption(record.Length, StatusCode.Corruption, "sequence " + seq.ToString(CultureInfo.InvariantCulture) + " is too large",
+                LogReporter.UnspecifiedLogNumber);
+            return true;
+        }
         if (progress.StopReplay)
         {
             // MaybeReviseStopReplayForCorruption: in point-in-time recovery mode, if sequence ids are consecutive we
@@ -977,17 +1109,25 @@ internal sealed partial class DbImpl
         {
             inserter.Run(record);
         }
-        catch (Exception e) when (e is DuplicateKeySeqException or InsertRejectedException)
+        catch (Exception e) when (e is DuplicateKeySeqException or InsertRejectedException or RocksDbException { Code: StatusCode.Corruption })
         {
-            // InsertLogRecordToMemtable failed: MaybeIgnoreError, else the failure becomes the WAL's status (reported
-            // like a read error). next_sequence is the inserter's sequence at the failing entry.
-            if (Options.ParanoidChecks)
-            {
-                reporter.Corruption(record.Length, e is RocksDbException r ? r.Code : StatusCode.Corruption, e.Message, LogReporter.UnspecifiedLogNumber);
-            }
-            else LogWarn("Ignoring error Corruption: " + e.Message);
+            // InsertLogRecordToMemtable failed (the batch body itself was validated above): a handler refused an entry
+            // (an inverted DeleteRange, a Merge without merge operator, a key+sequence already in the memtable).
+            // MaybeIgnoreError: ignored without paranoid_checks; else the failure becomes the WAL's status, as is
+            // (reporter->Corruption(record.size(), process_status)), unless the reporter records nothing
+            // (kSkipAnyCorruptedRecords).
+            if (!Options.ParanoidChecks) LogWarn("Ignoring error " + e.Message);
+            else if (e is RocksDbException status) reporter.Report(record.Length, status);
+            else reporter.Corruption(record.Length, StatusCode.Corruption, e.Message, LogReporter.UnspecifiedLogNumber);
+            // WriteBatchInternal::InsertInto reports the inserter's sequence even when Iterate fails
+            // ("*next_seq = inserter.sequence()"): the entries applied before the refused one stay in the memtables, and
+            // FinishLogFileProcessing publishes next_sequence - 1 whenever the WAL's final status is OK (error ignored,
+            // skipped, or a point-in-time stop), so they are part of the recovered state. Verified against native
+            // (Audit4FollowUpRecoveryCompatTests.MalformedOrRefusedBatchInWalRecoversLikeNative).
             CheckSeqnoNotSetBackDuringRecovery(progress.NextSequence, inserter.Sequence);
             progress.NextSequence = inserter.Sequence;
+            if (inserter.Sequence > seq) progress.AnyData = true;
+            if (inserter.Sequence > 0 && inserter.Sequence - 1 > progress.LastSequence) progress.LastSequence = inserter.Sequence - 1;
             return true;
         }
         // next_sequence comes from the inserter, not the record header: a prepared section counts its entries but
@@ -1109,7 +1249,7 @@ internal sealed partial class DbImpl
             SeqnoToTimeMapping? seqnoToTime;
             lock (_mutex) seqnoToTime = CopySeqnoToTimeMapping(cfd);
             meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, TableFileWriteOptions(Env.IoPriority.High), cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, [],
-                    CurrentSnapshotChecker, blobBuilder, null, seqnoToTime, synchronous, ct)
+                    CurrentSnapshotChecker, blobBuilder, null, seqnoToTime, null /* BuildTable(version = nullptr) */, null, synchronous, ct)
                 .ConfigureAwait(false);
         }
         catch
@@ -1125,6 +1265,12 @@ internal sealed partial class DbImpl
         {
             edit = new VersionEdit { ColumnFamily = cfd.Id };
             edits[cfd.Id] = edit;
+        }
+        if (HasListeners)
+        {
+            // WriteLevel0TableForRecovery -> BuildTable: the creation event of the recovery flush (kRecovery).
+            if (meta is null) NotifyOnEmptyTableFile(cfd, 0, fileNumber, TableFileCreationReason.Recovery);
+            else NotifyOnTableFileCreated(cfd, 0, path, meta.FileSize, TableFileCreationReason.Recovery, null, TryGetTableProperties(cfd, meta));
         }
         if (meta is not null)
         {

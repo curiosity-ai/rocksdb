@@ -58,6 +58,27 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
+    /// GetPropertyNameAndArg / GetPropertyInfo (db/internal_stats.cc): trailing decimal digits of a property name are an
+    /// optional argument and are not part of the name that is looked up, so "rocksdb.estimate-num-keys0" is
+    /// "rocksdb.estimate-num-keys" (handlers without an argument ignore it). The four properties that take the argument
+    /// (a level or a temperature) keep it. Allocates only for a name with a suffix that is dropped.
+    /// </summary>
+    internal static string PropertyNameForLookup(string property)
+    {
+        int end = property.Length;
+        if (end == 0 || !char.IsAsciiDigit(property[end - 1])) return property;
+        while (end > 0 && char.IsAsciiDigit(property[end - 1])) end--;
+        ReadOnlySpan<char> name = property.AsSpan(0, end);
+        if (name.SequenceEqual(DbProperties.NumFilesAtLevelPrefix) || name.SequenceEqual(DbProperties.CompressionRatioAtLevelPrefix)
+            || name.SequenceEqual(DbProperties.AggregatedTablePropertiesAtLevelPrefix)
+            || name.SequenceEqual(DbProperties.LiveSstFilesSizeAtTemperaturePrefix))
+        {
+            return property;
+        }
+        return property[..end];
+    }
+
+    /// <summary>
     /// Computes the numeric property <paramref name="property"/> on <paramref name="sv"/> (the referenced super version of
     /// <paramref name="cfd"/>). Returns <see cref="IntPropertyResult.NotNumeric"/> for every other property, which the
     /// string handlers then serve. Does not allocate.

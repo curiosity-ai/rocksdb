@@ -53,7 +53,9 @@ internal sealed class OffpeakTimeOption
         endTime = 0;
         if (value.Length == 0) return true;
         string[] split = value.Split('-');
-        if (split.Length != 2) return false;
+        // StringSplit (util/string_util.cc) reads with std::getline, which yields no final empty piece: "a-b-" is two.
+        int parts = split[^1].Length == 0 ? split.Length - 1 : split.Length;
+        if (parts != 2) return false;
         startTime = ParseTimeStringToSeconds(split[0]);
         if (startTime < 0) return false;
         endTime = ParseTimeStringToSeconds(split[1]);

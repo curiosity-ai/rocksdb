@@ -190,6 +190,7 @@ internal sealed partial class DbImpl
     /// </summary>
     public bool TryGetIntProperty(ColumnFamilyData cfd, string property, out ulong value)
     {
+        property = PropertyNameForLookup(property);
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         IntPropertyResult r;
         IntPropertyValue v;
@@ -223,6 +224,7 @@ internal sealed partial class DbImpl
     /// </summary>
     public Dictionary<string, string>? GetMapProperty(ColumnFamilyData cfd, string property)
     {
+        property = PropertyNameForLookup(property);
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         try
         {
@@ -539,7 +541,7 @@ internal sealed partial class DbImpl
             ReadOnlySpan<byte> k1 = ToSeekKey(start, scratch[..n1]);
             ReadOnlySpan<byte> k2 = ToSeekKey(limit, scratch.Slice(n1, n2));
             ulong size = 0;
-            if (includeFiles) size += ApproximateSize(cfd, sv.Current, k1, k2, filesSizeErrorMargin);
+            if (includeFiles) size += ApproximateSize(cfd, sv.Current.Storage, k1, k2, 0, filesSizeErrorMargin);
             if (includeMemtables) size += ApproximateMemTableStats(sv, k1, k2).Size;
             return size;
         }
@@ -595,19 +597,18 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
-    /// Port of VersionSet::ApproximateSize(options, v, start, end, 0, -1). Upstream collects the partially covered files
+    /// Port of VersionSet::ApproximateSize(options, v, start, end, start_level, -1). Upstream collects the partially covered files
     /// (all of level 0, the first and last overlapping file of every other level) into first_files / last_files; this
     /// port visits the same files twice instead (sizes, then the per-file estimates if needed), which keeps the call
     /// free of list allocations.
     /// </summary>
-    private static ulong ApproximateSize(ColumnFamilyData cfd, DbVersion v, ReadOnlySpan<byte> start, ReadOnlySpan<byte> end, double margin)
+    internal static ulong ApproximateSize(ColumnFamilyData cfd, VersionStorageInfo vs, ReadOnlySpan<byte> start, ReadOnlySpan<byte> end, int startLevel, double margin)
     {
         InternalKeyComparator icmp = cfd.Icmp;
         if (icmp.Compare(start, end) > 0) return 0;
-        VersionStorageInfo vs = v.Storage;
         ulong totalFullSize = 0;
         ulong totalIntersectingSize = 0;
-        for (int level = 0; level < vs.NumLevels; level++)
+        for (int level = startLevel; level < vs.NumLevels; level++)
         {
             ReadOnlySpan<FileMetaData> files = vs.LevelFiles(level);
             if (files.Length == 0) continue;
@@ -630,7 +631,7 @@ internal sealed partial class DbImpl
             return totalFullSize;
         }
         // first_files: ApproximateSize(v, f, start, end); last_files: ApproximateOffsetOf(v, f, end).
-        for (int level = 0; level < vs.NumLevels; level++)
+        for (int level = startLevel; level < vs.NumLevels; level++)
         {
             ReadOnlySpan<FileMetaData> files = vs.LevelFiles(level);
             if (files.Length == 0) continue;
@@ -699,6 +700,18 @@ internal sealed partial class DbImpl
     {
         valueFound = false;
         ValidateReadSnapshot(options);
+        // DBImpl::KeyMayExist returns s.ok() || s.IsIncomplete() of GetImpl: its timestamp checks (FailIfCfHasTs /
+        // FailIfTsMismatchCf, InvalidArgument) answer false.
+        try
+        {
+            GetReadTimestamp(cfd, options);
+        }
+        catch (RocksDbException e) when (e.Code == StatusCode.InvalidArgument)
+        {
+            return false;
+        }
+        // Deviation: with user-defined timestamps the lookup itself is not run (always "may exist").
+        if (cfd.TimestampSize != 0) return true;
         SuperVersion sv = GetReferencedSuperVersion(cfd);
         ulong snapshot = ReadSequence(options);
         GetContext ctx = GetContext.Rent(cfd.MergeOperator);
@@ -708,6 +721,7 @@ internal sealed partial class DbImpl
             var lkey = new LookupKey(key, snapshot, scratch);
             try
             {
+                ctx.IgnoreRangeDeletions = options is not null && options.IgnoreRangeDeletions;
                 if (GetFromMemTables(sv, lkey, ctx))
                 {
                     if (ctx.State is GetContext.GetState.Deleted) return false;
@@ -720,6 +734,9 @@ internal sealed partial class DbImpl
                     return true;
                 }
                 if (ctx.State == GetContext.GetState.Merge) return true; // merge operands found: the key exists
+                // Version::Get: a memtable range tombstone covers the key ("the remaining files we look at will only
+                // contain covered keys, so we stop here"): NotFound, the key definitely does not exist.
+                if (ctx.MaxCoveringTombstoneSeq > 0) return false;
                 // Table files: whether any file's filter may contain the key.
                 Comparator ucmp = cfd.UserComparator;
                 VersionStorageInfo s = sv.Current.Storage;

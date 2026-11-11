@@ -369,6 +369,8 @@ internal sealed partial class DbImpl
     private async ValueTask DelayWriteAsync(bool noSlowdown, bool synchronous, CancellationToken cancellationToken, bool countGroupBytes)
     {
         WriteController wc = WriteControllerInstance;
+        // The write queue whose leader is stalling: the main queue, or the WAL-only queue (two_write_queues).
+        WriteThread stallThread = countGroupBytes || _nonmemWriteThread is null ? _writeThread : _nonmemWriteThread;
         ulong delayMicros = 0;
         lock (_mutex)
         {
@@ -390,10 +392,19 @@ internal sealed partial class DbImpl
             // We will delay the write until we have slept for `delay` microseconds or we don't need a delay anymore
             // (checked every ~1 ms: kDelayInterval, the WriteController's minimum delay).
             long stallEnd = System.Diagnostics.Stopwatch.GetTimestamp() + (long)(delayMicros * (System.Diagnostics.Stopwatch.Frequency / 1e6));
-            while (wc.NeedsDelay && System.Diagnostics.Stopwatch.GetTimestamp() < stallEnd)
+            // Notify write_thread about the stall so it can setup a barrier and fail any pending writers with no_slowdown
+            stallThread.BeginWriteStall();
+            try
             {
-                if (synchronous) Thread.Sleep(1);
-                else await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+                while (wc.NeedsDelay && System.Diagnostics.Stopwatch.GetTimestamp() < stallEnd)
+                {
+                    if (synchronous) Thread.Sleep(1);
+                    else await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                stallThread.EndWriteStall();
             }
         }
         while (true)
@@ -407,8 +418,18 @@ internal sealed partial class DbImpl
                 wait = _bgSignal.Task;
             }
             if (noSlowdown) throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Write stall");
-            if (synchronous) wait.Wait(cancellationToken);
-            else await wait.WaitAsync(cancellationToken).ConfigureAwait(false);
+            // Notify write_thread about the stall so it can setup a barrier and fail any pending writers with no_slowdown
+            stallThread.BeginWriteStall();
+            try
+            {
+                TestHooks.Invoke("DBImpl::DelayWrite:Wait");
+                if (synchronous) wait.Wait(cancellationToken);
+                else await wait.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                stallThread.EndWriteStall();
+            }
         }
     }
 
@@ -477,7 +498,15 @@ internal sealed partial class DbImpl
             ulong[] snapshots = SnapshotsForCompaction();
             Compaction? c = cfd.CompactionState.Picker.PickCompaction(cfd.Current.Storage, snapshots);
             if (c is null) continue;
-            if (!EnoughRoomForCompaction(cfd, c)) continue;
+            if (!EnoughRoomForCompaction(cfd, c))
+            {
+                // BackgroundCompaction: the files were released, so the score takes them into account again and the
+                // column family goes back into the queue (picked again at the next scheduling round; upstream retries
+                // after BackgroundCallCompaction's one-second pause).
+                cfd.Current.Storage.ComputeCompactionScore();
+                SchedulePendingCompaction(cfd);
+                continue;
+            }
             if (ShouldForwardToBottomPriorityPool(cfd, c))
             {
                 ForwardToBottomPriorityPool(cfd, c, snapshots);
@@ -790,6 +819,10 @@ internal sealed partial class DbImpl
         List<ulong>? copiedFiles = null;
         Exception? failure = null;
         long compactionStart = 0;
+        // Set once the edit is handed to the MANIFEST writer: a failure after that may have left the record in the
+        // MANIFEST that CURRENT names, so the new files must stay (upstream quarantines them, ErrorHandler::
+        // AddFilesToQuarantine); they are removed by the full scan of a later open if the edit did not survive.
+        bool editSubmitted = false;
         int jobId = 0;
         CancellationTokenSource? manualCancellation = null;
         try
@@ -860,8 +893,15 @@ internal sealed partial class DbImpl
                 }
                 bool bottom = thread == CompactionThread.Bottom;
                 // ProcessKeyValueCompactionWithCompactionService (no snapshot checker support in remote compaction).
+                bool startedEventLogged = !c.SupportsPerKeyPlacement; // else deferred by OnCompactionStarted
                 if (Options.CompactionService is { } service && checker is null)
                 {
+                    if (!startedEventLogged)
+                    {
+                        // No local job computes the placement cutoffs for a compaction handed to the service.
+                        LogCompactionStartedEvent(cfd, c, jobId, null, null);
+                        startedEventLogged = true;
+                    }
                     remote = TryRunRemoteCompaction(service, cfd, c, jobSnapshots, jobId, bottom, ct);
                 }
                 if (remote is not null)
@@ -881,16 +921,21 @@ internal sealed partial class DbImpl
                         SnapshotChecker = checker,
                         JobSnapshot = jobSnapshot?.SequenceNumber ?? 0,
                         EarliestWriteConflictSnapshot = earliestWriteConflict,
+                        JobId = jobId,
+                        // CompactionJob::LogCompaction: proximal_after_seqno / preserve_seqno_after of the started event.
+                        OnTimesPrepared = startedEventLogged ? null : (proximalAfter, preserveAfter) => LogCompactionStartedEvent(cfd, c, jobId, proximalAfter, preserveAfter),
                         AcquireSubcompactionResources = n => AcquireSubcompactionResources(n, bottom),
                         ReleaseSubcompactionResources = n => ReleaseSubcompactionResources(n, bottom),
                     };
                     int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadCompactionMicros);
+                    Monitoring.JobIoCounter? previousCounter = Monitoring.JobIoCounter.Enter(job.IoCounter);
                     try
                     {
                         job.RunAsync(synchronous: true).GetAwaiter().GetResult();
                     }
                     finally
                     {
+                        Monitoring.JobIoCounter.Exit(previousCounter);
                         Monitoring.FileReadActivity.Exit(activity);
                     }
                 }
@@ -898,6 +943,8 @@ internal sealed partial class DbImpl
                 {
                     jobSnapshot?.Dispose();
                 }
+                // CompactionJob::FinishCompactionOutputFile: the creation event of each output, before the install.
+                NotifyOnCompactionOutputsCreated(cfd, job, jobId);
                 c.AddInputDeletions(edit);
                 foreach (FileMetaData f in job.Outputs) edit.AddFile(c.OutputLevel, f);
                 // Per-key placement: entries too new for the last level were written to the proximal level.
@@ -921,6 +968,7 @@ internal sealed partial class DbImpl
             }
             // The super version (and with it the write stall) is installed in the critical section that installs the
             // version (InstallSuperVersionAndScheduleWork right after LogAndApply, under the same mutex hold).
+            editSubmitted = true;
             Versions.LogAndApplyAsync(cfd, edit, synchronous: true, () => InstallSuperVersion(cfd), CancellationToken.None).GetAwaiter().GetResult();
             TestHooks.Invoke("DBImpl::RunCompaction:AfterLogAndApply");
             var installed = new List<FileMetaData>(edit.NewFiles.Count);
@@ -961,7 +1009,9 @@ internal sealed partial class DbImpl
         catch (Exception e)
         {
             failure = e;
-            SetBackgroundError(e, BackgroundErrorReason.Compaction, walRelated: false);
+            // BackgroundCompaction: "err_reason = versions_->io_status().ok() ? kCompaction : kManifestWrite".
+            SetBackgroundError(e, editSubmitted && Versions.IoStatus is not null ? BackgroundErrorReason.ManifestWrite : BackgroundErrorReason.Compaction,
+                walRelated: false);
             if (!isManual)
             {
                 // BackgroundCallCompaction: wait a little bit before retrying in case this is an environmental problem
@@ -1006,15 +1056,18 @@ internal sealed partial class DbImpl
                     cfd.Current.Storage.ComputeCompactionScore();
                 }
             }
-            if (!ok && job is not null)
+            // LogAndApply can also fail before writing anything (dropped column family, a refused edit): only a MANIFEST
+            // I/O error (VersionSet::io_status_) leaves the record's fate unknown.
+            bool deleteOutputs = !ok && !(editSubmitted && Versions.IoStatus is not null);
+            if (deleteOutputs && job is not null)
             {
                 foreach (ulong n in job.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
             }
-            if (!ok && remote is not null)
+            if (deleteOutputs && remote is not null)
             {
                 foreach (ulong n in remote.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
             }
-            if (!ok && copiedFiles is not null)
+            if (deleteOutputs && copiedFiles is not null)
             {
                 foreach (ulong n in copiedFiles) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
             }
@@ -1215,10 +1268,34 @@ internal sealed partial class DbImpl
             await IncreaseFullHistoryTsLowAsync(cfd, tsLow.ToArray(), synchronous, cancellationToken).ConfigureAwait(false);
         }
 
+        // DBImpl::CompactRange: with user-defined timestamps the bounds are user keys without a timestamp;
+        // MaybeAddTimestampsToRange(exclusive_end = false) gives the begin key the maximum timestamp and the end key the
+        // minimum one, so every version of both keys is inside the range.
+        if (cfd.TimestampSize != 0)
+        {
+            if (begin is not null) begin = AddTimestamp(cfd, begin, max: true);
+            if (end is not null) end = AddTimestamp(cfd, end, max: false);
+        }
+
         // Flush first, unless there is nothing in memory (flushing takes write-leadership, which a writer waiting on a
         // write stop holds; skipping the no-op flush lets a manual compaction resolve the stop).
         bool flushNeeded;
         lock (_mutex) flushNeeded = !cfd.Mem.IsEmpty || cfd.Imm.Count > 0;
+        if (flushNeeded && begin is not null && end is not null && cfd.TimestampSize == 0)
+        {
+            // CompactRangeInternal: with both bounds, flush only if the memtables overlap the range
+            // (ColumnFamilyData::RangesOverlapWithMemtables, inclusive limit). Column families with user-defined
+            // timestamps always flush here.
+            SuperVersion sv = GetReferencedSuperVersion(cfd);
+            try
+            {
+                flushNeeded = RangeOverlapsWithMemtables(cfd, sv, begin, end);
+            }
+            finally
+            {
+                ReturnSuperVersion(sv);
+            }
+        }
         if (flushNeeded) await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.ManualCompaction, synchronous, cancellationToken).ConfigureAwait(false);
 
         bool exclusive = options.ExclusiveManualCompaction;
@@ -1360,6 +1437,40 @@ internal sealed partial class DbImpl
         finally
         {
             if (exclusive) EndExclusiveManual();
+        }
+    }
+
+    /// <summary>
+    /// Port of ColumnFamilyData::RangesOverlapWithMemtables for one user key range [<paramref name="start"/>,
+    /// <paramref name="limit"/>] (limit inclusive, no user-defined timestamps): true if a memtable of
+    /// <paramref name="sv"/> holds a key in the range or a range tombstone intersecting it.
+    /// </summary>
+    private static bool RangeOverlapsWithMemtables(ColumnFamilyData cfd, SuperVersion sv, byte[] start, byte[] limit)
+    {
+        Comparator ucmp = cfd.UserComparator;
+        byte[] seek = MakeInternalKey(start, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek);
+        if (Overlaps(sv.Mem)) return true;
+        foreach (MemTable m in sv.Imm)
+        {
+            if (Overlaps(m)) return true;
+        }
+        return false;
+
+        bool Overlaps(MemTable mem)
+        {
+            if (mem.IsEmpty) return false;
+            MemTableIterator it = mem.NewIterator();
+            it.Seek(seek);
+            if (it.Valid && ucmp.Compare(DbFormat.ExtractUserKey(it.Key), limit) <= 0) return true;
+            if (mem.NumRangeDeletes == 0) return false;
+            // RangeDelAggregator::IsRangeOverlapped: a tombstone [ts, te) with ts <= limit and start < te.
+            FragmentedRangeTombstoneList list = mem.GetFragmentedRangeTombstones();
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (ucmp.Compare(list.GetStart(i), limit) > 0) break; // fragments are ordered by start key
+                if (ucmp.Compare(start, list.GetEnd(i)) < 0) return true;
+            }
+            return false;
         }
     }
 
@@ -1557,7 +1668,9 @@ internal sealed partial class DbImpl
             try
             {
                 c = picker.PickCompactionForCompactFiles(vstorage, inputs, outputLevel, (uint)outputPathId, options.OutputFileSizeLimit, options.Compression,
-                    options.OutputTemperatureOverride, options.MaxSubcompactions, options.AllowTrivialMove);
+                    options.OutputTemperatureOverride, options.MaxSubcompactions,
+                    // CompactFilesImpl: no trivial move with a compaction_service (it expects every compaction to go through CompactionJob).
+                    options.AllowTrivialMove && Options.CompactionService is null);
             }
             catch
             {
@@ -1749,23 +1862,25 @@ internal sealed partial class DbImpl
             Task wait;
             lock (_mutex)
             {
-                if (IsBgWorkStopped && ErrorHandler.BgError is { } e) ThrowBackgroundError(e);
+                // DBImpl::WaitForCompact (default options): ShutdownInProgress once shutdown began; a background error
+                // of any severity (also a soft one, also while jobs still run) ends the wait and is returned.
+                if (_shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
+                if (ErrorHandler.BgError is { } e) ThrowBackgroundError(e);
                 bool pending = false;
-                if (_compactionsEnabled && !_shuttingDown)
+                if (_compactionsEnabled)
                 {
                     foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
                     {
                         if (!cfd.Options.DisableAutoCompactions && cfd.CompactionState.Picker.NeedsCompaction(cfd.Current.Storage)) pending = true;
                     }
                 }
-                if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0 && _runningFlushes == 0 && _flushQueue.Count == 0 && !pending) return;
+                if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0 && _runningFlushes == 0 && _flushQueue.Count == 0 && !AtomicFlushPending && !pending) return;
                 if (pending) MaybeScheduleCompaction();
-                if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0 && _runningFlushes == 0 && _flushQueue.Count == 0)
+                if (_bgCompactionScheduled + _bgBottomCompactionScheduled == 0 && _manualCompactionsRunning == 0 && _runningFlushes == 0 && _flushQueue.Count == 0 && !AtomicFlushPending)
                 {
                     // Pending work that cannot be scheduled (e.g. picker found nothing to do).
                     return;
                 }
-                if (_shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
                 wait = _bgSignal.Task;
             }
             if (synchronous) wait.Wait(cancellationToken);

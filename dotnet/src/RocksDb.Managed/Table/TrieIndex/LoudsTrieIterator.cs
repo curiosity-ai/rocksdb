@@ -205,6 +205,9 @@ internal sealed class LoudsTrieIterator
 
     private bool SetLeaf(ulong leafIndex)
     {
+        // Upstream trusts the block here (GetHandle only asserts); a corrupt block must not hand out a leaf whose handle
+        // lies outside the handle table.
+        if (leafIndex >= _t.NumKeysValue) ThrowBadStructure();
         _leafIndex = leafIndex;
         _valid = true;
         return true;
@@ -265,15 +268,46 @@ internal sealed class LoudsTrieIterator
     }
 
     /// <summary>SeekToFirst: the leftmost leaf.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowBadStructure() => ThrowHelper.Corruption("Trie index: inconsistent trie structure");
+
+    /// <summary>
+    /// A block that passed LoudsTrie.Read can still be internally inconsistent (flipped label / LOUDS bits, wrong counts).
+    /// Upstream reads out of range in that case; here the bounds checks of the typed arrays fire, and the public entry
+    /// points turn them into Corruption.
+    /// </summary>
+    private static bool IsStructureFault(Exception e) => e is IndexOutOfRangeException or ArgumentOutOfRangeException or OverflowException;
+
     public bool SeekToFirst()
     {
         Reset();
         if (_t.NumKeys == 0) return false;
-        return DescendToLeftmostLeaf(_t.CutoffLevel > 0, 0);
+        try
+        {
+            return DescendToLeftmostLeaf(_t.CutoffLevel > 0, 0);
+        }
+        catch (Exception e) when (IsStructureFault(e))
+        {
+            _valid = false;
+            ThrowBadStructure();
+            return false;
+        }
     }
 
     /// <summary>Seek: the first leaf whose key is &gt;= <paramref name="target"/>.</summary>
-    public bool Seek(ReadOnlySpan<byte> target) => _hasChains ? SeekImpl<WithChains>(target) : SeekImpl<NoChains>(target);
+    public bool Seek(ReadOnlySpan<byte> target)
+    {
+        try
+        {
+            return _hasChains ? SeekImpl<WithChains>(target) : SeekImpl<NoChains>(target);
+        }
+        catch (Exception e) when (IsStructureFault(e))
+        {
+            _valid = false;
+            ThrowBadStructure();
+            return false;
+        }
+    }
 
     private bool SeekImpl<TChains>(ReadOnlySpan<byte> target) where TChains : struct
     {
@@ -531,6 +565,20 @@ internal sealed class LoudsTrieIterator
     /// <summary>Next: the next leaf in key order.</summary>
     public bool Next()
     {
+        try
+        {
+            return NextImpl();
+        }
+        catch (Exception e) when (IsStructureFault(e))
+        {
+            _valid = false;
+            ThrowBadStructure();
+            return false;
+        }
+    }
+
+    private bool NextImpl()
+    {
         if (!_valid) return false;
         if (_isAtPrefixKey)
         {
@@ -658,7 +706,16 @@ internal sealed class LoudsTrieIterator
                 else
                 {
                     ulong start = SparseNodeStartPos(nodeNum);
-                    if (start >= t.SLabelsSize) return Invalid();
+                    if (start >= t.SLabelsSize)
+                    {
+                        // A trie holding only the empty key (the label-less root's prefix key, see LoudsTrieBuilder).
+                        if (nodeNum == 0 && t.SLabelsSize == 0 && _pathLen == 0 && IsSparsePrefixKey(0))
+                        {
+                            _isAtPrefixKey = true;
+                            return SetLeaf(SparsePrefixKeyLeafIndex(0));
+                        }
+                        return Invalid();
+                    }
                     end = SparseNodeEndPos(start);
                 }
                 ulong lastPos = end - 1;
@@ -680,7 +737,16 @@ internal sealed class LoudsTrieIterator
     {
         Reset();
         if (_t.NumKeys == 0) return false;
-        return DescendToRightmostLeaf(_t.CutoffLevel > 0, 0);
+        try
+        {
+            return DescendToRightmostLeaf(_t.CutoffLevel > 0, 0);
+        }
+        catch (Exception e) when (IsStructureFault(e))
+        {
+            _valid = false;
+            ThrowBadStructure();
+            return false;
+        }
     }
 
     private bool Retreat()
@@ -740,6 +806,15 @@ internal sealed class LoudsTrieIterator
     {
         if (!_valid) return false;
         _isAtPrefixKey = false;
-        return Retreat();
+        try
+        {
+            return Retreat();
+        }
+        catch (Exception e) when (IsStructureFault(e))
+        {
+            _valid = false;
+            ThrowBadStructure();
+            return false;
+        }
     }
 }

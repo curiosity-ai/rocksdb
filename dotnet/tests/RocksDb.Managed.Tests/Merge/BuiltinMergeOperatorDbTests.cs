@@ -419,7 +419,9 @@ public sealed class BuiltinMergeOperatorDbTests
         }
         Assert.AreEqual(older.Expected(op), Hex(db.Get(new ReadOptions { Snapshot = snap }, B("k"))));
         Assert.AreEqual(newer.Expected(op), Hex(db.Get(B("k"))));
-        db.CompactRange();
+        // The three L0 files hold different versions of the one key: no internal-key overlap, so the L0 -> Lbase step is
+        // a trivial move like upstream (GenerateLevel0NonOverlapping); force the bottommost level to be compacted.
+        db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
         using var r = new MergeOperandsResult();
         Assert.IsTrue(db.DefaultColumnFamily.TryGetMergeOperands(B("k"), new GetMergeOperandsOptions { ExpectedMaxNumberOfOperands = 100 }, r));
         Assert.AreEqual(partial ? 2 : 4, r.Count, id); // the merged base value + the newer stripe's operand(s)
@@ -450,7 +452,8 @@ public sealed class BuiltinMergeOperatorDbTests
                 Append(db, "k", "2,4");
                 Append(db, "k", "8");
                 db.Flush();
-                db.CompactRange();
+                // Force: the two L0 files (versions of one key) do not overlap as internal keys and are only moved otherwise.
+                db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
                 using var r = new MergeOperandsResult();
                 Assert.IsTrue(db.DefaultColumnFamily.TryGetMergeOperands(B("k"), new GetMergeOperandsOptions { ExpectedMaxNumberOfOperands = 100 }, r));
                 Assert.AreEqual(3, r.Count); // the older stripe's value + both newer operands
