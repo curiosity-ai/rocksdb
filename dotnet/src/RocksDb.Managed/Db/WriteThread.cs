@@ -310,6 +310,10 @@ internal sealed class WriteThread
             w.Error = NewWriteStallError();
             w.Complete(StateCompleted);
         }
+        else if (!linkedAsLeader)
+        {
+            TestHooks.Invoke("WriteThread::JoinBatchGroup:Wait");
+        }
         // CheckWriteEnqueuedCallback (after LinkOne, before waiting).
         w.UserCallback?.OnWriteEnqueued();
         return linkedAsLeader;
