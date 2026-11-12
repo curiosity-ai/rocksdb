@@ -211,6 +211,12 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public WriteBatchWithIndex CreateWriteBatchWithIndex(bool overwriteKey) => WriteBatchWithIndex.Rent(overwriteKey);
 
     /// <summary>Atomically applies <paramref name="batch"/> (DB::Write). Records name column families by <see cref="ColumnFamily.Id"/>.</summary>
+    /// <remarks>
+    /// A write that fails after its WAL record was written (a failed WAL sync, or a memtable insert refused by a per-key
+    /// checksum, which fails every write committed in the same group and stops further writes with a
+    /// <see cref="BackgroundError"/>) has an indeterminate outcome on disk: reopening the database may recover it from
+    /// the WAL.
+    /// </remarks>
     public void Write(WriteBatch batch) => Write(null, batch);
 
     public void Write(WriteOptions? options, WriteBatch batch) =>

@@ -277,6 +277,7 @@ internal sealed partial class DbImpl
                     state = await lead.ConfigureAwait(false);
                 }
                 // 0: linked behind earlier memtable writers; wait for our turn.
+                if (state == 0) TestHooks.Invoke("DBImpl::PipelinedWriteImpl:WaitForMemTableWriterLeader");
                 if (state == 0) state = synchronous ? w.WaitSync() : await w.WaitAsync().ConfigureAwait(false);
             }
             if (state == WriteThread.StateMemtableWriterLeader) state = LeadMemTableGroup(w);
@@ -321,8 +322,10 @@ internal sealed partial class DbImpl
         Exception? insertError = InsertWritersSerially(group);
         if (insertError is not null)
         {
-            // PipelinedWriteImpl: the memtable group's status is the leader's.
-            leader.Error ??= insertError;
+            // PipelinedWriteImpl: memtable_write_group.status is the status of every writer of the group
+            // (ExitAsMemTableWriter: "w->status = write_group.status"). The group's WAL record is not cut (upstream sets
+            // the truncate size in WriteImpl only; later WAL groups may already follow the record).
+            FailWriteGroup(group, insertError);
             HandleMemTableInsertFailure(insertError);
         }
         else if (total > 0) // Don't publish a partial batch write
@@ -770,19 +773,45 @@ internal sealed partial class DbImpl
         else
         {
             // DBImpl::WriteImpl: the leader's status is the group's insert status (w.status = InsertInto(write_group)).
-            leader.Error ??= insertError;
-            // DBImpl::WriteImpl: "logs_.back().SetAttemptTruncateSize(wal_context.prev_size)". The group's record is in
-            // the WAL but the group is not in the DB: closing the DB cuts the WAL back to its size before the record
-            // (CloseAsync), so the next open does not replay the refused write.
-            if (walRecordBytes > 0 && !leader.DisableWal && !_twoWriteQueues && _walPrevSize >= 0 && _walPrevSizeNumber == _logNumber &&
-                _walAttemptTruncateSize < 0)
-            {
-                _walAttemptTruncateSize = _walPrevSize;
-                _walAttemptTruncateNumber = _logNumber;
-            }
+            // Known deviation: upstream completes the followers of a serial group with the leader's WAL status
+            // (ExitAsBatchGroupLeader: "last_writer->status = status", write_group.status is not set on this path), so
+            // they return OK, the failing follower included, although the group is not published and its record is cut
+            // from the WAL below. Here every writer of the group fails: no write of an unpublished group is acknowledged.
+            FailWriteGroup(group, insertError);
+            SetWalAttemptTruncateSize(walRecordBytes, !leader.DisableWal);
             HandleMemTableInsertFailure(insertError);
         }
         RecordWriteGroup(group, total, walRecordBytes, !leader.DisableWal, needSync);
+    }
+
+    /// <summary>
+    /// The status of a write group one of whose memtable inserts failed (WriteThread: write_group.status, given to every
+    /// writer of the group by ExitAsBatchGroupLeader / ExitAsMemTableWriter): every writer without an error of its own
+    /// (failed callback) fails with <paramref name="insertError"/>. None of the group's writes is published, so none is
+    /// acknowledged; each caller gets its own exception object (ThrowWriteError). The writes may still be in the WAL: a
+    /// reopen may recover them (see <see cref="SetWalAttemptTruncateSize"/>). REQUIRES: the other writers of the group
+    /// are waiting to be completed by the caller. Failure path only.
+    /// </summary>
+    private static void FailWriteGroup(List<WriteThread.Writer> group, Exception insertError)
+    {
+        for (int i = 0; i < group.Count; i++) group[i].Error ??= insertError;
+    }
+
+    /// <summary>
+    /// DBImpl::WriteImpl: "logs_.back().SetAttemptTruncateSize(wal_context.prev_size)". The record of a group whose
+    /// memtable insert failed is in the WAL but the group is not in the DB, and every writer of it got the error: closing
+    /// the DB cuts the WAL back to its size before the record (<see cref="MaybeTruncateWalOnClose"/>), so the next open
+    /// does not replay the refused writes. Best effort: a DB that is not closed cleanly (or a file that cannot be
+    /// truncated) keeps the record, and recovery then replays the group. One write queue, non-pipelined only (the record
+    /// is the last of the WAL: its group still holds write leadership). REQUIRES: called by the writer that exits the group.
+    /// </summary>
+    private void SetWalAttemptTruncateSize(int walRecordBytes, bool wal)
+    {
+        if (walRecordBytes > 0 && wal && !_twoWriteQueues && _walPrevSize >= 0 && _walPrevSizeNumber == _logNumber && _walAttemptTruncateSize < 0)
+        {
+            _walAttemptTruncateSize = _walPrevSize;
+            _walAttemptTruncateNumber = _logNumber;
+        }
     }
 
     /// <summary>
@@ -811,7 +840,8 @@ internal sealed partial class DbImpl
         return false;
     }
 
-    // wal_context.prev_size / LogWriterNumber::attempt_truncate_size (db_impl.h). Written by the write leader; the
+    // wal_context.prev_size / LogWriterNumber::attempt_truncate_size (db_impl.h). Written by the write leader (the
+    // truncate size also by the writer of a parallel group that finishes last, while the group holds leadership); the
     // truncate size is read when the DB closes (no writer is active then).
     private long _walPrevSize = -1;
     private ulong _walPrevSizeNumber;
@@ -945,22 +975,43 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>WriteThread::CompleteParallelMemTableWriter: true for the writer that finished last.</summary>
-    private bool CompleteParallelMemTableWriter() => Interlocked.Decrement(ref _parallelRemaining) == 0;
+    private bool CompleteParallelMemTableWriter()
+    {
+        bool last = Interlocked.Decrement(ref _parallelRemaining) == 0;
+        TestHooks.Invoke("WriteThread::CompleteParallelMemTableWriter:AfterCountDown");
+        return last;
+    }
 
     /// <summary>
     /// The end of a parallel group, run by the writer that finished last (DBImpl::WriteImpl after
     /// CompleteParallelMemTableWriter + ExitAsBatchGroupFollower): publishes the last sequence, then completes the other
     /// writers and hands leadership on.
+    /// <para>
+    /// When an insert of the group failed, the outcome does not depend on which writer finishes last: the group is not
+    /// published, every writer of it fails with the insert's error (<see cref="FailWriteGroup"/>), the failure is a fatal
+    /// background error, and without pipelined writes the group's WAL record is cut when the DB closes
+    /// (<see cref="SetWalAttemptTruncateSize"/>). That is what upstream does when the leader finishes last
+    /// (WriteThread::CompleteParallelMemTableWriter: write_group->status is set by the failing writer and becomes the
+    /// status of the last writer; ExitAsBatchGroupLeader gives it to every follower and to the leader's return value)
+    /// and, with pipelined writes, in every order (ExitAsMemTableWriter; no truncation there). Known deviation: when a
+    /// follower finishes last, upstream (release build; ExitAsBatchGroupFollower asserts write_group->status.ok() in
+    /// debug builds) still fails every follower but returns the leader's own insert status, OK unless the leader's
+    /// insert failed, and does not set the WAL truncate size.
+    /// </para>
     /// </summary>
     private void FinishParallelGroup(WriteThread.Writer self)
     {
+        TestHooks.Invoke("DBImpl::WriteImpl:FinishParallelGroup");
         List<WriteThread.Writer> group = _parallelGroup!;
-        // Don't publish a partial batch write. Upstream checks the status of the writer that finished last only (a TODO
-        // there: "propagate status to write_group"); the port checks every writer of the group, so a failed insert of any
-        // of them keeps the group unpublished and stops writes.
+        // Don't publish a partial batch write: the group's status (write_group->status) is the first failed insert's.
         Exception? insertError = null;
         for (int i = 0; i < group.Count && insertError is null; i++) insertError = group[i].Error;
-        if (insertError is not null) HandleMemTableInsertFailure(insertError);
+        if (insertError is not null)
+        {
+            FailWriteGroup(group, insertError);
+            if (!_pipelined) SetWalAttemptTruncateSize(_parallelWalBytes, _parallelWal);
+            HandleMemTableInsertFailure(insertError);
+        }
         else if (_parallelTotal > 0)
         {
             Versions.SetLastSequence(_parallelLast);

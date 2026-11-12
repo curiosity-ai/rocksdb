@@ -138,6 +138,10 @@ internal sealed partial class DbImpl
     /// <summary>
     /// Port of DBImpl::UnorderedWriteMemtable: inserts the writer's batch at its assigned sequence numbers with concurrent
     /// memtable inserts, then counts down pending_memtable_writes_ and wakes a waiting memtable switch at 0.
+    /// A failed insert fails this write only (the other writers of its WAL group are independent). Its sequence numbers
+    /// were published by the WAL stage, so the entries inserted before the failure are visible, and its WAL record is
+    /// kept (a reopen replays it); like upstream (WriteStatusCheck(w.status)) the failure is a background error with
+    /// reason kWriteCallback under paranoid_checks, which stops further writes.
     /// </summary>
     private void UnorderedWriteMemtable(WriteThread.Writer w)
     {
@@ -167,6 +171,17 @@ internal sealed partial class DbImpl
         finally
         {
             if (Interlocked.Decrement(ref _pendingMemtableWrites) == 0) SignalPendingWritesDrained();
+        }
+        // WriteStatusCheck(w.status)
+        if (w.Error is { } error) UnorderedWriteStatusCheck(error);
+    }
+
+    /// <summary>Port of DBImpl::WriteStatusCheck for a failed unordered memtable insert (failure path only).</summary>
+    private void UnorderedWriteStatusCheck(Exception error)
+    {
+        if (Options.ParanoidChecks && RocksDbException.FromException(error).Code is not (StatusCode.Busy or StatusCode.Incomplete))
+        {
+            SetBackgroundError(error, BackgroundErrorReason.WriteCallback, walRelated: false);
         }
     }
 

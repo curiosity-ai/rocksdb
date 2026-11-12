@@ -130,16 +130,14 @@ public sealed class KvProtectionTests
     /// MemTableAddCorrupted with concurrent writers: one entry's encoded bytes are corrupted after encoding (one writer
     /// thread, while the others insert concurrently). That write fails with Corruption and, like upstream
     /// (DBImpl::HandleMemTableInsertFailure), the failed insert is a fatal background error with reason kMemTable: its
-    /// write group is not published (readers see none of its entries) and every later write fails. Every write
-    /// acknowledged before that group stays readable, also after a reopen.
+    /// write group is not published (readers see none of its entries) and every later write fails. Every acknowledged
+    /// write is readable, before and after a reopen.
     /// <para>
-    /// Whether the reopen recovers the failed write depends on the group it was in, which this test does not control
-    /// (Audit4WritePathRaceTests builds both shapes with hooks). Alone in its group (the other writers were not queued
-    /// when it took leadership, typical on a loaded machine), it was inserted serially by its leader, and DBImpl::WriteImpl
-    /// cuts the WAL back to its size before the group's record when the DB closes
-    /// (logs_.back().SetAttemptTruncateSize(wal_context.prev_size)): the write is not replayed. In a group of several
-    /// writers (parallel inserts) the record also holds the batches of the writers whose inserts succeeded and whose
-    /// writes returned without error: it stays in the WAL and recovery inserts the whole group.
+    /// The shape of the failed write's group is not controlled here (Audit4WritePathRaceTests builds each shape and
+    /// finishing order with hooks), and the outcome does not depend on it: alone in its group or in a group of several
+    /// writers (parallel inserts), every writer of the group gets the failed insert's status, so no write of the
+    /// unpublished group is acknowledged, and DBImpl::WriteImpl cuts the WAL back to its size before the group's record
+    /// when the DB closes (logs_.back().SetAttemptTruncateSize(wal_context.prev_size)): the failed write is not replayed.
     /// </para>
     /// </summary>
     [TestMethod]
@@ -157,8 +155,6 @@ public sealed class KvProtectionTests
         });
         MemoryFileSystem fs = NewFs();
         bool[][] acked = NewAcked();
-        // Writes of the failed group that returned without error (the group is not published).
-        int unpublishedAcked = 0;
         ulong published;
         using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), CfOptions()))
         {
@@ -192,31 +188,18 @@ public sealed class KvProtectionTests
                 {
                     if (!acked[t][i]) continue;
                     byte[]? read = db.Get(ParallelKey(t, i));
-                    if (read is null)
-                    {
-                        // Only a writer of the failed group: a writer has one write in flight at a time, so not writer
-                        // 5, and at most one write per other writer (its last acknowledged one).
-                        unpublishedAcked++;
-                        Assert.AreNotEqual(5, t, "acknowledged write " + i + " of writer 5 is not readable, last published sequence " + published);
-                        Assert.IsTrue(i == ParallelWritesPerThread - 1 || !acked[t][i + 1],
-                            "acknowledged write (" + t + "," + i + ") is not readable but a later one of the same writer was acknowledged, last published sequence "
-                            + published);
-                    }
-                    else
-                    {
-                        CollectionAssert.AreEqual(Value(i, t), read, "write (" + t + "," + i + ") read " + Describe(read) + ", last published sequence " + published);
-                    }
+                    // Also the writers of the failed group whose own inserts succeeded got its error: no acknowledged
+                    // write is unpublished.
+                    CollectionAssert.AreEqual(Value(i, t), read, "write (" + t + "," + i + ") read " + Describe(read) + ", last published sequence " + published);
                 }
             }
-            Assert.IsTrue(unpublishedAcked < ParallelThreads);
         }
         TestHooks.ClearAll();
         using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), CfOptions()))
         {
             Assert.IsNull(db.BackgroundError);
-            string context = ", " + unpublishedAcked + " other write(s) in the failed group, last published sequence before the reopen " + published
-                + ", after " + db.GetLatestSequenceNumber();
-            // Every acknowledged write is recovered, including those of the failed group.
+            string context = ", last published sequence before the reopen " + published + ", after " + db.GetLatestSequenceNumber();
+            // Every acknowledged write is recovered.
             for (int t = 0; t < ParallelThreads; t++)
             {
                 for (int i = 0; i < ParallelWritesPerThread; i++)
@@ -227,16 +210,9 @@ public sealed class KvProtectionTests
                 }
             }
             byte[]? failed = db.Get(ParallelKey(5, 100));
-            if (unpublishedAcked > 0)
-            {
-                // Parallel group: its WAL record is intact, recovery inserts the batch.
-                CollectionAssert.AreEqual(Value(100, 5), failed, "failed write read " + Describe(failed) + context);
-            }
-            else
-            {
-                // The failed writer was alone in its group: the record was cut from the WAL at close.
-                Assert.IsNull(failed, "failed write read " + Describe(failed) + context);
-            }
+            // The failed group's record was cut from the WAL at close, whatever the group's size.
+            Assert.IsNull(failed, "failed write read " + Describe(failed) + context);
+            Assert.AreEqual(published, db.GetLatestSequenceNumber());
         }
     }
 
