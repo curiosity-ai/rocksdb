@@ -360,7 +360,7 @@ Still open from this round:
 ## Mixed read/write sweep (2026-11-07, bench/results/2026-11-07-mixed-readwrite.md)
 
 - [x] `readrandomwriterandom` + `--readwritepercent` on all four legs; 0-100% writes, 1 and 4 threads, 3 reps: managed 1.25-1.65x c-native ops/s, rocksdb-sharp 0.91-1.02x
-- [ ] Write-heavy cells JIT-compile up to ~630 methods during measurement (memtable switch / flush paths not covered by the warm-up)
+- [x] Write-heavy cells JIT-compiled up to ~550 methods during measurement: the .NET warm-up now replays the measured write benchmarks on a fresh DB until a round compiles < 10 methods (`--warmup_write_rounds`); 6-12 methods left, warm-up 77-102 s for 2M keys (`bench/results/2026-11-12-warmup-jit.md`); `DBBENCH_JIT_METHODS` names what compiles
 - [ ] Pure writes 1 / 2 / 4 threads, re-measured 2026-11-12 (5 reps, idle VM): native 235k / 185k / 195k, managed 319k / 240k / 240k ops/s; the per-group hand-off cost is the same as native, the larger relative drop comes from the faster 1-thread baseline. Candidates in validation.md "Audit #5: write path" (shared WriteBatch pool scanned per Put, three WriteThread lock acquisitions per group)
 - [ ] bench/README.md lists txnwriteprepared / txnwriteunprepared for the native legs, but native-c implements only txnoptimistic / txnpessimistic
 

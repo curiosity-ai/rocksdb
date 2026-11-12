@@ -70,6 +70,10 @@ public static class DbBenchRunner
 
         /// <summary>Minimum warm-up time per repeated benchmark in milliseconds (--warmup_min_ms, default 1000).</summary>
         public int WarmupMinMs = 1000;
+        /// <summary>--warmup_write_rounds: at most this many write rounds after the warm-up (.NET only; 0 = none).</summary>
+        public int WarmupWriteRounds = 8;
+        /// <summary>--warmup_write_rounds_ms: time budget of the write rounds.</summary>
+        public int WarmupWriteRoundsMs = 90_000;
 
         /// <summary>
         /// Total ops of the next benchmark execution instead of --num / --reads (the key range stays --num); set by
@@ -318,6 +322,7 @@ public static class DbBenchRunner
                 }
             }
             if (engine is not null) RunExtraCompactionCycles(engine, w, values, plan.Count);
+            if (engine is not null) RunWriteRounds(ref engine, f, w, values, plan.Count);
         }
         finally
         {
@@ -342,6 +347,68 @@ public static class DbBenchRunner
             jit2, jitTime2.TotalMilliseconds));
         Console.Out.Flush();
     }
+
+    /// <summary>
+    /// Write rounds that replay the measured run's write benchmarks, after the JIT has quiesced, until a round compiles
+    /// fewer than <see cref="WarmupWriteRoundJitThreshold"/> methods (at most --warmup_write_rounds rounds, default 8, and
+    /// --warmup_write_rounds_ms, default 90 s). Every round starts on a fresh warm-up DB and runs every write benchmark of the
+    /// list with the measured thread count, key range and op count (--num), then waits for the background work: the same
+    /// memtable switches, flushes, compactions from an empty LSM tree up to the measured shape, and trivial moves. The fixed
+    /// warm-up writes --warmup_ops keys, which with the default 64 MiB write buffer never fills a memtable, so the measured
+    /// fill used to run the first automatic flushes, multi-level compactions and trivial moves of the process, compiling
+    /// and tiering up 200-550 methods while it was timed (2026-11-12, DBBENCH_JIT_METHODS). .NET only (the C leg has
+    /// nothing to compile).
+    /// </summary>
+    private static void RunWriteRounds(ref IKeyValueEngine engine, Flags f, Flags w, ValueBuffer values, int index)
+    {
+        var writes = new List<DbBenchmark>();
+        foreach (DbBenchmark b in f.Benchmarks)
+        {
+            if (b is DbBenchmark.FillSeq or DbBenchmark.FillRandom or DbBenchmark.Overwrite or DbBenchmark.DeleteRandom or DbBenchmark.ReadWhileWriting
+                || (b == DbBenchmark.ReadRandomWriteRandom && f.ReadWritePercent < 100))
+            {
+                if (!writes.Contains(b)) writes.Add(b);
+            }
+        }
+        if (writes.Count == 0 || f.WarmupWriteRounds == 0) return;
+
+        var ci = CultureInfo.InvariantCulture;
+        long savedNum = w.Num, savedReads = w.Reads;
+        w.Num = f.Num;
+        w.Reads = f.Reads;
+        var sw = Stopwatch.StartNew();
+        int rounds = 0;
+        long compiled = 0;
+        try
+        {
+            while (rounds < f.WarmupWriteRounds && sw.ElapsedMilliseconds < f.WarmupWriteRoundsMs)
+            {
+                engine.Dispose();
+                engine = EngineFactory.Open(w.Engine, w.Db, w.Options, destroyExisting: true);
+                WaitForJitQuiescence(stableMs: 100, maxMs: 2_000);
+                long before = System.Runtime.JitInfo.GetCompiledMethodCount(currentThread: false);
+                w.OpsOverride = -1;
+                foreach (DbBenchmark b in writes)
+                {
+                    new BenchRun(engine, w, values, b, index + 3000 * (rounds + 1)) { Quiet = true }.Execute();
+                }
+                new BenchRun(engine, w, values, DbBenchmark.WaitForCompaction, index) { Quiet = true }.Execute();
+                WaitForJitQuiescence(stableMs: 100, maxMs: 2_000);
+                compiled = System.Runtime.JitInfo.GetCompiledMethodCount(currentThread: false) - before;
+                rounds++;
+                if (compiled < WarmupWriteRoundJitThreshold) break;
+            }
+        }
+        finally
+        {
+            w.Num = savedNum;
+            w.Reads = savedReads;
+        }
+        Console.WriteLine(string.Format(ci, "{0,-17} : {1} write rounds ({2} x {3} ops) {4:F3} s, last round compiled {5} methods", "warmup",
+            rounds, string.Join(",", writes.ConvertAll(BenchFlags.Name)), f.Num, sw.Elapsed.TotalSeconds, compiled));
+    }
+
+    private const int WarmupWriteRoundJitThreshold = 10;
 
     /// <summary>
     /// Extra warm-up cycles of <see cref="WarmupExtraFlushesPerCycle"/> x (overwrite of --warmup_ops / 50 keys + flush) +
@@ -457,6 +524,7 @@ public static class DbBenchRunner
             _jitTimeBefore = System.Runtime.JitInfo.GetCompilationTime(currentThread: false);
             _cpuBefore = Environment.CpuUsage.TotalTime;
             if (!Quiet) AllocationTracer.Instance?.Reset();
+            if (!Quiet) JitTracer.Instance?.Reset();
             long allocBefore = GC.GetTotalAllocatedBytes(precise: true);
             int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
 
@@ -575,6 +643,7 @@ public static class DbBenchRunner
                 f.EngineLabel, _name, f.Threads, ops, seconds, microsPerOp, opsPerSec, mbs, p50, p99, p999, found, allocPerOp, d0, d1, d2, jitMethods, jitMs,
                 _mixedReads >= 0 ? _mixedReads.ToString(ci) : "", _mixedWrites >= 0 ? _mixedWrites.ToString(ci) : ""));
             AllocationTracer.Instance?.Print(_name);
+            JitTracer.Instance?.Print(_name);
             Console.Out.Flush();
         }
 
@@ -1239,6 +1308,8 @@ public static class DbBenchRunner
                 case "warmup": f.Warmup = ParseBool(value); break;
                 case "warmup_ops": f.WarmupOps = long.Parse(value, ci); break;
                 case "warmup_min_ms": f.WarmupMinMs = Math.Max(0, int.Parse(value, ci)); break;
+                case "warmup_write_rounds": f.WarmupWriteRounds = Math.Max(0, int.Parse(value, ci)); break;
+                case "warmup_write_rounds_ms": f.WarmupWriteRoundsMs = Math.Max(0, int.Parse(value, ci)); break;
                 case "disable_wal": o = o with { DisableWal = ParseBool(value) }; break;
                 case "sync": o = o with { Sync = ParseBool(value) }; break;
                 case "cache_size": o = o with { BlockCacheSize = long.Parse(value, ci) }; break;
@@ -1330,6 +1401,7 @@ public static class DbBenchRunner
         Console.Error.WriteLine("               [--compaction_readahead_size 2097152] [--drop_page_cache false] [--reverse_iterator false]");
         Console.Error.WriteLine("               [--use_existing_db] [--seed 301] [--db PATH] [--histogram 1] [--c_bench PATH-TO-rocksdb_bench]");
         Console.Error.WriteLine("               [--warmup true|false] [--warmup_ops N (default max(50k, num/10), <= 200k, <= num)] [--warmup_min_ms 1000]");
+        Console.Error.WriteLine("               [--warmup_write_rounds 8 (.NET; 0 = none)] [--warmup_write_rounds_ms 90000]");
         Console.Error.WriteLine("benchmarks: " + string.Join(' ', BenchFlags.AllBenchmarkNames));
     }
 }
