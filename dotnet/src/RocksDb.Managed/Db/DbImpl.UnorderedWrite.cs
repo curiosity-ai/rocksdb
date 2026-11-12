@@ -99,11 +99,13 @@ internal sealed partial class DbImpl
     {
         List<WriteThread.Writer> group = _group;
         _writeThread.EnterAsBatchGroupLeader(leader, group);
+        bool preprocessed = false;
         try
         {
             if (IsDisposed) ThrowDisposed();
             ValueTask pre = PreprocessWriteAsync(leader.NoSlowdown, synchronous, cancellationToken);
             if (!pre.IsCompletedSuccessfully) await pre.ConfigureAwait(false);
+            preprocessed = true;
 
             int valid = CheckGroupCallbacks(group, out ulong total, out bool needSync, out WriteThread.Writer? firstValid);
             ValueTask<(ulong Last, int WalBytes)> commit = AllocateAndWriteGroupToWalAsync(group, leader, firstValid, valid, total, needSync, synchronous);
@@ -127,7 +129,8 @@ internal sealed partial class DbImpl
         }
         catch (Exception e)
         {
-            for (int i = 0; i < group.Count; i++) group[i].Error ??= e;
+            if (!preprocessed && IsLeaderCancellation(e, cancellationToken)) CancelStalledLeader(_writeThread, group, leader, e);
+            else for (int i = 0; i < group.Count; i++) group[i].Error ??= e;
         }
         finally
         {

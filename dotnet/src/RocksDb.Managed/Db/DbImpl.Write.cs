@@ -370,6 +370,8 @@ internal sealed partial class DbImpl
         // Each writer gets its own exception object (the original may be shared by the whole group).
         if (e is RocksDbException r) throw r.Rethrowable();
         if (e is ObjectDisposedException) ThrowDisposed();
+        // The writer's own cancellation (see CancelStalledLeader): only the canceled leader carries it.
+        if (e is OperationCanceledException c) throw new OperationCanceledException(c.Message, c, c.CancellationToken);
         throw RocksDbException.IOError(e.Message, e);
     }
 
@@ -451,6 +453,7 @@ internal sealed partial class DbImpl
         if (_pipelined && leader.Txn?.Callback is { AllowWriteBatching: false }) await WaitForMemTableWritersAsync(synchronous).ConfigureAwait(false);
         _writeThread.EnterAsBatchGroupLeader(leader, group);
         bool parallel = false;
+        bool preprocessed = false;
         int leaderState = WriteThread.StateCompleted;
         try
         {
@@ -458,6 +461,7 @@ internal sealed partial class DbImpl
             if (IsDisposed) ThrowDisposed();
             ValueTask pre = PreprocessWriteAsync(leader.NoSlowdown, synchronous, cancellationToken);
             if (!pre.IsCompletedSuccessfully) await pre.ConfigureAwait(false);
+            preprocessed = true;
 
             int valid = CheckGroupCallbacks(group, out ulong total, out bool needSync, out WriteThread.Writer? firstValid);
             if (_queryTracer is { PreserveWriteOrder: true } tracer) TraceWriteGroup(tracer, group);
@@ -503,7 +507,8 @@ internal sealed partial class DbImpl
         }
         catch (Exception e)
         {
-            for (int i = 0; i < group.Count; i++) group[i].Error ??= e;
+            if (!preprocessed && IsLeaderCancellation(e, cancellationToken)) CancelStalledLeader(_writeThread, group, leader, e);
+            else for (int i = 0; i < group.Count; i++) group[i].Error ??= e;
         }
         finally
         {
@@ -523,6 +528,24 @@ internal sealed partial class DbImpl
         // machine rather than this one (a wake-up of this method's box would be queued to the thread pool through an
         // allocated work item).
         return parallel ? WriteThread.StateParallelMemtableWriter : leaderState;
+    }
+
+    /// <summary>The leader's own CancellationToken fired while it waited in PreprocessWrite (a write stall).</summary>
+    private static bool IsLeaderCancellation(Exception e, CancellationToken cancellationToken) =>
+        e is OperationCanceledException && cancellationToken.IsCancellationRequested;
+
+    /// <summary>
+    /// An asynchronous write was canceled while it led a write group and waited for a write stall (DelayWrite, the write
+    /// buffer manager; nothing else observes the token, and the group's commit never does). The cancellation is the
+    /// leader's alone: it fails with <paramref name="cancellation"/>, and its followers, for which nothing was done yet,
+    /// go back to the front of the queue (<see cref="WriteThread.RequeueFollowers"/>), where the leader's exit hands the
+    /// leadership to the first of them. Upstream has no cancellation; failing the whole group with it would fail writes
+    /// that did not ask to be canceled. Cancellation path only.
+    /// </summary>
+    private static void CancelStalledLeader(WriteThread thread, List<WriteThread.Writer> group, WriteThread.Writer leader, Exception cancellation)
+    {
+        leader.Error = cancellation;
+        thread.RequeueFollowers(group);
     }
 
     /// <summary>
@@ -1154,7 +1177,55 @@ internal sealed partial class DbImpl
         }
     }
 
+    /// <summary>
+    /// The part of upstream's wal_write_mutex_ that the write queue does not cover. The WAL writer, the closed WALs
+    /// waiting for a sync and the WAL directory state are used by one thread at a time: the write leader (batched or
+    /// unbatched). The exception is FlushWAL / SyncWAL while LockWAL is held, which cannot enter the write queue (a write
+    /// leader stalled by the lock's write stop holds it until UnlockWAL). It is excluded from batched leaders by that
+    /// stop, but not from: UnlockWAL followed by a write, an unbatched leader that switches the memtable (flush,
+    /// ingestion, error recovery; not stalled), another FlushWAL, or close. So this lock is taken by
+    /// <list type="bullet">
+    /// <item>FlushWAL around its WAL I/O; without the write queue only while LockWAL is still held once it has the lock;</item>
+    /// <item>UnlockWAL, so that the write stop outlives a FlushWAL in flight;</item>
+    /// <item>the memtable switch and close, which write out and replace the WAL as unbatched leaders.</item>
+    /// </list>
+    /// Never by a write group: the write path pays nothing for it. Lock order: write queue leadership, WAL write lock
+    /// (two write queues), this lock, DB mutex; a holder never waits for the write queue.
+    /// </summary>
+    private readonly SemaphoreSlim _walIoLock = new(1, 1);
+
+    /// <summary>Takes <see cref="_walIoLock"/>; pair with <see cref="ReleaseWalIoLock"/>.</summary>
+    private ValueTask AcquireWalIoLockAsync(bool synchronous)
+    {
+        SemaphoreSlim l = _walIoLock;
+        if (l.Wait(0)) return default;
+        TestHooks.Invoke("DBImpl::WalIoLock:Wait");
+        if (synchronous)
+        {
+            l.Wait();
+            return default;
+        }
+        return new ValueTask(l.WaitAsync());
+    }
+
+    private void ReleaseWalIoLock() => _walIoLock.Release();
+
     private async ValueTask SwitchMemtableCoreAsync(ColumnFamilyData cfd, FlushReason reason, bool synchronous)
+    {
+        ValueTask io = AcquireWalIoLockAsync(synchronous);
+        if (!io.IsCompletedSuccessfully) await io.ConfigureAwait(false);
+        try
+        {
+            await SwitchMemtableLockedAsync(cfd, reason, synchronous).ConfigureAwait(false);
+        }
+        finally
+        {
+            ReleaseWalIoLock();
+        }
+    }
+
+    /// <summary>The body of <see cref="SwitchMemtableCoreAsync"/>. REQUIRES: write leader, <see cref="_walIoLock"/>.</summary>
+    private async ValueTask SwitchMemtableLockedAsync(ColumnFamilyData cfd, FlushReason reason, bool synchronous)
     {
         // Recoverable state is persisted in WAL. After memtable switch, WAL might be deleted, so we write the state to
         // memtable to be persisted as well.

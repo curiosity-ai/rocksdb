@@ -1732,3 +1732,80 @@ Left as it was, on purpose:
 
 Not checked: case-insensitive file systems; a backup directory used by two engines at once (unsupported upstream as
 well); temperatures (not modelled); the write-side sync calls of a backup (another slice).
+
+## Audit #5: write path under concurrency
+
+Second pass over the write path, this time on the paths that do not fail: `Db/DbImpl.Write.cs`, `Db/WriteThread.cs`,
+`Db/DbImpl.UnorderedWrite.cs`, `Db/DbImpl.TwoWriteQueues.cs`, `Db/Compaction/WriteController.cs`, the stall code
+(`DelayWriteAsync`, `DbImpl.WriteBufferManager.cs`), `DbImpl.LockWal.cs`, `FlushWalAsync` and `CloseAsync`, read
+against `db/db_impl/db_impl_write.cc`, `db/write_thread.cc`, `db/write_batch.cc` (`WriteBatchInternal::InsertInto`),
+`db/write_controller.cc` and `DBImpl::FlushWAL` / `LockWAL` / `UnlockWAL` / `CloseHelper` in `db/db_impl/db_impl.cc`.
+Where the port is built differently (a lock around the writer queue instead of a lock-free list, value task sources
+and monitors instead of condition variables, cancellation, close as the last write leader) it was judged on its own
+invariants. Tests: `tests/RocksDb.Managed.Tests/Validation/Audit5WritePathTests.cs`.
+
+### Invariants checked, per write mode
+
+| Mode | Publication | Who may touch what |
+|---|---|---|
+| default, serial inserts | the leader inserts the group and then sets the last sequence; nothing is published for a group with a failed insert | WAL, `_group`, `_flushScheduler`: the leader only |
+| default, parallel inserts (`allow_concurrent_memtable_write`, group of 2+, no merge, no transaction) | the writer that counts `_parallelRemaining` down to 0 publishes, then completes the others and hands leadership on; the leader does not return before that | group state is written by the leader before it wakes the followers and read after the countdown; flush scheduling under the list's lock |
+| `enable_pipelined_write` | memtable groups run one at a time in WAL order (`_memLeaderActive`), each publishes its last sequence before the next starts; a memtable switch (WAL leader or unbatched leader) first drains the memtable queue with a marker | WAL stage: WAL leader; memtable stage: memtable leader; the marker is used by the WAL / unbatched leader only, which is also the only one that links writers |
+| `unordered_write` | the WAL stage publishes before the inserts (as upstream; snapshots are not immutable); `_pendingMemtableWrites` is raised before leadership is handed on and every switch, unbatched operation and close waits for 0 under `_switchLock` | inserts are concurrent inserts only; the flush scheduler is read by the leader after the drain |
+| `two_write_queues` | allocation and WAL append under the WAL write lock, so WAL order is sequence order; the published sequence only moves forward (CAS) | both queues stall on the write controller; unbatched operations hold both queues |
+
+For all modes: a writer is completed exactly once per wait (re-armed by its owner before it can be completed again:
+before it is linked to the memtable queue, before the parallel countdown); a follower's fields are written by its
+leader before the completion that publishes them (CAS, monitor or `SetResult`); a writer returns to its pool only
+after its last completion was consumed; `ManualResetValueTaskSourceCore` is reset only after its result was
+observed, which the runtime allows while `SetResult` is returning. Grouping rules match `EnterAsBatchGroupLeader`
+line by line (sync behind non-sync, `no_slowdown`, `disableWAL`, protection bytes, unbatched, non-batching callback,
+size; no rate limiter priority and no WBWI ingestion in the port). The stall barrier (`BeginWriteStall` /
+`EndWriteStall`) fails queued and arriving `no_slowdown` writers and nobody else. Lock-free reads were checked for
+ARM64: every cross-thread hand-off goes through a lock, an interlocked operation or a `Volatile` write on the
+publishing side; the plain read of `_cfById` in `CfForInsert` is a pointer published by a release store and then
+dereferenced (dependency ordered), and the write path orders it through the write queue anyway.
+
+### Fixed
+
+- **A canceled stalled leader failed its whole group.** Only write stalls observe a write's `CancellationToken`
+  (`DelayWriteAsync`, the write buffer manager stall). When it fired, the exception was given to every writer of the
+  group: writers that had not asked for a cancellation failed with `IOError: A task was canceled`, and so did the
+  canceled writer itself instead of `OperationCanceledException`. Now the cancellation is the leader's alone: nothing
+  was done for the group yet, so its followers go back to the front of the queue in order
+  (`WriteThread.RequeueFollowers`) and the first of them leads when the leader exits. Default, pipelined, unordered
+  and the WAL-only queue (`CanceledStalledLeaderDoesNotFailTheFollowersOfItsGroup`).
+- **A write stalled by the write buffer manager ignored its cancellation and spun.** The wait was
+  `Task.WhenAny(blocked, Task.Delay(n, token))`, which does not throw; with a canceled token the delay completes at
+  once, so the loop burned a core (and allocated) until the stall ended. It now throws, leaves the manager's stall
+  queue, and is handled like the case above (`CanceledLeaderStalledByWriteBufferManagerIsCanceledAlone`).
+- **FlushWAL / SyncWAL under LockWAL used the WAL unprotected.** While LockWAL is held, `FlushWalAsync` does not enter
+  the write queue (a write leader stalled by the lock holds it until UnlockWAL) and relied on the write stop alone.
+  That excludes write groups, but not a write issued right after UnlockWAL, the memtable switch of a flush (an
+  unbatched leader is not stalled; it writes out and replaces the WAL), a second FlushWAL / SyncWAL, or close: two
+  threads inside one WAL writer, which is a buffered file without synchronization. Upstream takes
+  `wal_write_mutex_` in all of them. The port now has a WAL I/O lock (`_walIoLock`) taken by FlushWAL, UnlockWAL, the
+  memtable switch and close, never by a write group (`FlushWalUnderLockWalExcludesOtherWalUsers`, three racers).
+- **Close waited for a stalled write.** Close becomes the last write leader, and set the shutdown flag only then; a
+  leader waiting for stopped writes holds the queue, so close waited for the stall (for as long as LockWAL was held).
+  Close now announces itself before it enters the queue, as upstream's `DelayWrite` stops waiting once
+  `shutting_down_` is set; the stalled writers fail with `ObjectDisposedException`, the port's error for a write that
+  races the close (upstream: `ShutdownInProgress`). A write that is only briefly stalled when close begins now fails
+  where it used to be committed first (`CloseReleasesAWriteStalledByStoppedWrites`).
+
+### Left open
+
+- A `CancellationToken` is observed only while the write leads a group in a stall. A token that fires while the
+  write is queued, is a follower, or is being committed is ignored and the write commits (by design: a group commit
+  cannot drop one member once its record is being written; a queued writer could be unlinked, but is not).
+- `FlushWalAsync` outside LockWAL goes through the write queue, so it waits behind a write leader that is stalled
+  (memtable or L0 stop). Upstream's FlushWAL only takes `wal_write_mutex_` and does not wait for stalls.
+- Asynchronous followers and hand-offs resume on the thread pool. If every pool thread is blocked in a synchronous
+  write queued behind them, the queue only moves when the pool adds a thread (a slowdown, not a deadlock). Not
+  reproduced; mixing blocking writes on pool threads with asynchronous writes is the precondition.
+- `UserWriteCallback.OnWriteEnqueued` runs after the writer is linked and outside the queue lock, so a fast leader
+  can call `OnWalWriteFinish` first, on another thread. Upstream has the same order (`LinkOne`, then
+  `CheckWriteEnqueuedCallback`).
+- Not covered by a deterministic test in this pass: two write queues with sequence-per-batch transactions, the
+  split insert of one large batch (`DbImpl.SplitInsert.cs`), and the interaction of error recovery with a write group
+  in flight.

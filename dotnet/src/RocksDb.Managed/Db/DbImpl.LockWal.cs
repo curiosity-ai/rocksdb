@@ -61,15 +61,25 @@ internal sealed partial class DbImpl
     /// <summary>DBImpl::UnlockWAL: the last unlock releases the write stop and wakes the stalled writers.</summary>
     public void UnlockWal()
     {
-        lock (_mutex)
+        // A FlushWAL / SyncWAL called while the WAL is locked uses the WAL outside the write thread, under the WAL I/O
+        // lock: the write stop is released only once none is in flight (the stalled writers append to the same WAL).
+        AcquireWalIoLockAsync(synchronous: true).GetAwaiter().GetResult();
+        try
         {
-            if (_lockWalCount == 0) throw new RocksDbException(StatusCode.Aborted, "No LockWAL() held by current thread");
-            if (--_lockWalCount == 0)
+            lock (_mutex)
             {
-                WriteControllerInstance.ReleaseStop();
-                _maybeStalled = IsWriteStalled();
-                SignalBackgroundWork();
+                if (_lockWalCount == 0) throw new RocksDbException(StatusCode.Aborted, "No LockWAL() held by current thread");
+                if (--_lockWalCount == 0)
+                {
+                    WriteControllerInstance.ReleaseStop();
+                    _maybeStalled = IsWriteStalled();
+                    SignalBackgroundWork();
+                }
             }
+        }
+        finally
+        {
+            ReleaseWalIoLock();
         }
     }
 }

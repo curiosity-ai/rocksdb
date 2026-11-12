@@ -1007,6 +1007,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
 
     // ---- shutdown ---------------------------------------------------------------------------------------
 
+    /// <summary>Close has begun (set before it enters the write queue; see <see cref="CloseAsync"/>). Guarded by mutex.</summary>
+    private bool _closing;
+
     /// <summary>
     /// Port of DBImpl::CloseHelper: waits for in-flight writes and background flushes, flushes memtables holding
     /// data that is not in the WAL (unless avoid_flush_during_shutdown), closes the WAL and MANIFEST and releases the
@@ -1015,6 +1018,16 @@ internal sealed partial class DbImpl : IAsyncDisposable
     public async ValueTask CloseAsync(bool synchronous)
     {
         if (Volatile.Read(ref _disposed) != 0) return;
+        // DBImpl::DelayWrite stops waiting once shutting_down_ is set (CancelAllBackgroundWork signals bg_cv_). Close needs
+        // the write queue, which a leader waiting for stopped writes holds until the stall ends (never, if nothing is
+        // left to end it): tell it first. Its group fails with ObjectDisposedException, like the writes that get the
+        // leadership after the close (upstream: ShutdownInProgress). Writes that are not stalled still commit until
+        // close leads the queue.
+        lock (_mutex)
+        {
+            _closing = true;
+            SignalBackgroundWork();
+        }
         DeregisterFromWriteBufferManager();
         // CancelErrorRecoveryForShutDown: stop automatic recovery first (it needs the write thread and background work).
         await ErrorHandler.EndAutoRecoveryAsync(synchronous).ConfigureAwait(false);
@@ -1043,16 +1056,25 @@ internal sealed partial class DbImpl : IAsyncDisposable
             CancelBackgroundCompactions();
             await WaitForBackgroundWorkAsync(synchronous).ConfigureAwait(false);
             // logs_.clear() (ClearWriter): closed WALs not synced yet are closed without a sync, like the current one.
-            foreach (LogWriter closed in _closedWalsToSync) CloseQuietly(closed);
-            _closedWalsToSync.Clear();
-            CloseFreedWals();
-            LogWriter? log = _log;
-            _log = null;
-            if (log is not null)
+            // Under the WAL I/O lock: a FlushWAL called while LockWAL is held may be using them outside the write thread.
+            await AcquireWalIoLockAsync(synchronous).ConfigureAwait(false);
+            try
             {
-                MaybeTruncateWalOnClose(log);
-                if (synchronous) log.Dispose();
-                else await log.DisposeAsync().ConfigureAwait(false);
+                foreach (LogWriter closed in _closedWalsToSync) CloseQuietly(closed);
+                _closedWalsToSync.Clear();
+                CloseFreedWals();
+                LogWriter? log = _log;
+                _log = null;
+                if (log is not null)
+                {
+                    MaybeTruncateWalOnClose(log);
+                    if (synchronous) log.Dispose();
+                    else await log.DisposeAsync().ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                ReleaseWalIoLock();
             }
             // ~ColumnFamilyHandleImpl of dropped column families (their handles live as long as the DB): release their
             // memtables and current version; their table files become obsolete and are deleted now.

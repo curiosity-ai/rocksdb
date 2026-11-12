@@ -551,10 +551,26 @@ internal sealed partial class DbImpl
     {
         ThrowIfDisposed();
         if (_readOnly) ThrowHelper.NotSupported("FlushWAL is not supported in read-only mode");
-        // While LockWAL holds a write stop no write can be inside the WAL stage (a stalled leader waits before it), so the
-        // WAL is flushed without entering the write thread: a stalled leader holds it until UnlockWAL (upstream's
-        // FlushWAL only takes log_write_mutex_).
-        WriteThread.Writer? w = IsWalLocked ? null : await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
+        // While LockWAL holds a write stop no write group can be inside the WAL stage (a stalled leader waits before it),
+        // and the WAL is flushed without entering the write thread: a stalled leader holds it until UnlockWAL (upstream's
+        // FlushWAL only takes wal_write_mutex_). The WAL I/O lock excludes the other users of the WAL, and UnlockWAL
+        // takes it too: the write stop is still held if the WAL is still locked once this call has the lock.
+        WriteThread.Writer? w = null;
+        while (true)
+        {
+            if (IsWalLocked)
+            {
+                await AcquireWalIoLockAsync(synchronous).ConfigureAwait(false);
+                if (IsWalLocked) break;
+                ReleaseWalIoLock(); // unlocked meanwhile: go through the write thread
+            }
+            else
+            {
+                w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
+                await AcquireWalIoLockAsync(synchronous).ConfigureAwait(false);
+                break;
+            }
+        }
         try
         {
             LogWriter? log = _log;
@@ -589,6 +605,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
+            ReleaseWalIoLock();
             if (w is not null) ExitUnbatched(w, synchronous);
         }
     }

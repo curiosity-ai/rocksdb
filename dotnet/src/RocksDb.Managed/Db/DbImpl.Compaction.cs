@@ -415,6 +415,8 @@ internal sealed partial class DbImpl
                 if (IsDbStopped && ErrorHandler.BgError is { } e) ThrowBackgroundError(e);
                 if (!wc.IsStopped) return;
                 if (_shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
+                // Close waits for the write queue this leader holds: the write fails like one that queued behind the close.
+                if (_closing) ThrowDisposed();
                 wait = _bgSignal.Task;
             }
             if (noSlowdown) throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Write stall");
