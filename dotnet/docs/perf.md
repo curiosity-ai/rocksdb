@@ -1943,7 +1943,7 @@ Compaction-heavy configuration (4 MiB memtables and files, 1,000,000 x 100 B), 1
 | overwrite | 1.152 | 1.169 | 6 / 10 |
 | waitforcompaction (ms) | 212 | 387 | 6 / 10 |
 | readrandom | 3.21 | 3.22 | 4 / 10 |
-| seekrandom | 7.60 vs 6.12 | | 6 / 10 |
+| seekrandom | 6.12 | 7.60 | 6 / 10 |
 
 No regression is confirmed. Every row's before and after ranges overlap, the rows that moved most (2-thread fill, 4-thread
 writes) move in opposite directions between the two write benchmarks that exercise the same path, and in the paired
