@@ -96,6 +96,57 @@ public sealed class Audit4ReplicationProtocolTests
     }
 
     /// <summary>
+    /// Chunk sizes no stream can be built or sent with are refused when the node starts. Failed before: a
+    /// <c>MaxChunkBytes</c> / <c>SnapshotChunkBytes</c> above gRPC's message limit was accepted and every WAL stream
+    /// or snapshot then failed with ResourceExhausted on each attempt; a size of 0 failed (or looped) at first use.
+    /// </summary>
+    [TestMethod]
+    public async Task ChunkSizesAreCheckedAtStart()
+    {
+        using var dir = new TempDir("chunk-sizes");
+        using var peer = new GrpcPairClient("B", "http://127.0.0.1:1", TimeSpan.FromSeconds(1));
+        PairNodeHostOptions Pair(int walChunk, int snapshotChunk) => new()
+        {
+            NodeId = "A",
+            PeerId = "B",
+            DbPath = dir.Sub("pair"),
+            InitialRole = ReplicationRole.Primary,
+            DbOptionsFactory = static () => new DbOptions(),
+            MaxChunkBytes = walChunk,
+            SnapshotChunkBytes = snapshotChunk,
+        };
+
+        // The hosts: lower bounds, whatever the transport.
+        Assert.AreEqual("maxChunkBytes", Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new PairNodeHost(Pair(12, 1024), peer)).ParamName);
+        Assert.AreEqual("snapshotChunkBytes", Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new PairNodeHost(Pair(1024, 0), peer)).ParamName);
+        await using RocksDatabase db = await RocksDatabase.OpenAsync(dir.Sub("primary"), new DbOptions { CreateIfMissing = true });
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new ReplicationPrimary(db, dir.Sub("cp"), null) { MaxChunkBytes = 0 });
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new ReplicationPrimary(db, dir.Sub("cp"), null) { SnapshotChunkBytes = -1 });
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new GrpcWriteOptions { MaxChunkBytes = 0 });
+
+        // The gRPC server: what does not fit into one message of the peers.
+        int limit = GrpcTransportDefaults.MaxPayloadBytes;
+        await using var tooLargeWal = new PairNodeHost(Pair(limit + 1, 1024), peer);
+        ArgumentException wal = await Assert.ThrowsExactlyAsync<ArgumentException>(() =>
+            GrpcNodeServer.StartAsync<PairService, PairNodeHost>(tooLargeWal, CancellationToken.None));
+        StringAssert.Contains(wal.Message, "MaxChunkBytes = " + (limit + 1));
+        var tooLargeSnapshot = new ReplicationPrimary(db, dir.Sub("cp"), null) { SnapshotChunkBytes = 8 * 1024 * 1024 };
+        ArgumentException snapshot = await Assert.ThrowsExactlyAsync<ArgumentException>(() =>
+            GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(tooLargeSnapshot, CancellationToken.None));
+        StringAssert.Contains(snapshot.Message, "SnapshotChunkBytes = " + (8 * 1024 * 1024));
+
+        // At the limit, and above it once the deployment says its peers receive more.
+        var atLimit = new ReplicationPrimary(db, dir.Sub("cp"), null) { MaxChunkBytes = limit, SnapshotChunkBytes = limit };
+        await using (await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(atLimit, CancellationToken.None))
+        {
+        }
+        await using (await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(tooLargeSnapshot, System.Net.IPAddress.Loopback, 0,
+            new GrpcNodeServerOptions { MaxStreamPayloadBytes = 16 * 1024 * 1024 }, CancellationToken.None))
+        {
+        }
+    }
+
+    /// <summary>
     /// A snapshot chunk of an unknown kind was taken for file data. It is refused; so is an end marker with an
     /// impossible file count. The write status of a pair travels as the status itself, and a result without one is
     /// not an acknowledgement. Failed before: the unknown kind became a file data chunk.

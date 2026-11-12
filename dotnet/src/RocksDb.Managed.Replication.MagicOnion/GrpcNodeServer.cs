@@ -24,7 +24,8 @@ namespace RocksDb.Managed.Replication.MagicOnion;
 /// at most <c>MaxChunkBytes</c> (256 KiB by default), a snapshot message at most <c>SnapshotChunkBytes</c> (1 MiB by
 /// default), a piece of a large client write at most <see cref="GrpcWriteOptions.MaxChunkBytes"/>, and a list of files
 /// at most <see cref="MaxFileListBytes"/>. Those chunk sizes are configurable and must stay below the limit - leave
-/// room for the message's other fields (<see cref="MaxPayloadBytes"/>). The one message that grows without a bound of
+/// room for the message's other fields (<see cref="MaxPayloadBytes"/>); a server refuses to start for a host whose
+/// chunk sizes are larger (<see cref="EnsureChunkSizesFit"/>). The one message that grows without a bound of
 /// its own is the term (epoch) map of a node: one short line per leadership (primary) change that wrote entries, so
 /// it reaches the limit only after more than 100 000 such changes.
 /// </para>
@@ -54,6 +55,26 @@ public static class GrpcTransportDefaults
     /// (<see cref="GrpcClusterClient.StreamSnapshotAsync"/>).
     /// </summary>
     public const int MaxFileListBytes = 1024 * 1024;
+
+    /// <summary>
+    /// Throws when a host's chunk sizes do not fit into one message of <paramref name="maxPayloadBytes"/>: every WAL
+    /// stream or snapshot of such a host would fail at its first full chunk, on every attempt.
+    /// <see cref="GrpcNodeServer"/> calls it at start; a host served by another ASP.NET Core application calls it itself.
+    /// </summary>
+    public static void EnsureChunkSizesFit(RocksDb.Managed.Replication.Hosting.IReplicationChunkSizes host, int maxPayloadBytes)
+    {
+        ArgumentNullException.ThrowIfNull(host);
+        if (host.MaxChunkBytes > maxPayloadBytes)
+        {
+            throw new ArgumentException("MaxChunkBytes = " + host.MaxChunkBytes + " does not fit into one gRPC message: at most " + maxPayloadBytes +
+                " bytes (the receive limit of the peers less 64 KiB for the message's other fields).", nameof(host));
+        }
+        if (host.SnapshotChunkBytes > maxPayloadBytes)
+        {
+            throw new ArgumentException("SnapshotChunkBytes = " + host.SnapshotChunkBytes + " does not fit into one gRPC message: at most " + maxPayloadBytes +
+                " bytes (the receive limit of the peers less 64 KiB for the message's other fields).", nameof(host));
+        }
+    }
 
     /// <summary>A handler with keep-alive pings (see the class remarks).</summary>
     public static System.Net.Http.SocketsHttpHandler CreateHttpHandler() => new()
@@ -99,6 +120,15 @@ public sealed class GrpcNodeServerOptions
     /// Raise it only for clients that send large writes through the unary RPC directly.
     /// </summary>
     public int? MaxReceiveMessageSize { get; init; } = DefaultMaxReceiveMessageSize;
+
+    /// <summary>
+    /// The largest <c>MaxChunkBytes</c> / <c>SnapshotChunkBytes</c> the served host may have; a host with more is
+    /// refused at start (<see cref="GrpcTransportDefaults.EnsureChunkSizesFit"/>). What this server streams is
+    /// received by the channels of its peers, so the default matches their default receive limit of 4 MiB
+    /// (<see cref="GrpcTransportDefaults.MaxPayloadBytes"/>). Raise it only together with
+    /// <c>GrpcChannelOptions.MaxReceiveMessageSize</c> of every peer's channel.
+    /// </summary>
+    public int MaxStreamPayloadBytes { get; init; } = GrpcTransportDefaults.MaxPayloadBytes;
 
     /// <summary>The limits of large client writes received in pieces.</summary>
     public FragmentedWriteOptions FragmentedWrites { get; init; } = new();
@@ -149,6 +179,10 @@ public sealed class GrpcNodeServer : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(backend);
         ArgumentNullException.ThrowIfNull(address);
         ArgumentNullException.ThrowIfNull(options);
+        if (backend is RocksDb.Managed.Replication.Hosting.IReplicationChunkSizes sizes)
+        {
+            GrpcTransportDefaults.EnsureChunkSizesFit(sizes, options.MaxStreamPayloadBytes);
+        }
         var fragmentedWrites = new FragmentedWriteBudget(options.FragmentedWrites);
         WebApplicationBuilder builder = WebApplication.CreateSlimBuilder();
         builder.Services.AddGrpc(o => o.MaxReceiveMessageSize = options.MaxReceiveMessageSize);

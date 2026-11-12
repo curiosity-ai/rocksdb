@@ -214,9 +214,13 @@ library sends stays below it whatever the size of the data:
 | term map / epoch map (attach check, `GetRaftTermsAsync`, `GetEpochsAsync`) | not bounded by a setting: one line of at most 41 bytes per term (epoch) that wrote entries - 4 MiB after about 100 000 leadership (primary) changes |
 | votes, heartbeats, status, progress reports, digests | fixed size |
 
-The chunk sizes are options: keep them at or below `GrpcTransportDefaults.MaxPayloadBytes` (4 MiB less 64 KiB), or
-raise the receive limits of every channel and server with them. A message above the limit is refused by the receiver
-with ResourceExhausted - for a WAL or snapshot stream on every attempt. A cluster whose term map has outgrown the
+The chunk sizes are options and are checked when a node starts. A host refuses a `MaxChunkBytes` of 12 bytes or less
+and a `SnapshotChunkBytes` below 1 (ArgumentOutOfRangeException from its constructor), and `GrpcNodeServer.StartAsync`
+refuses a host whose chunk sizes are above `GrpcNodeServerOptions.MaxStreamPayloadBytes` (ArgumentException;
+`GrpcTransportDefaults.MaxPayloadBytes` by default, 4 MiB less 64 KiB) - such a stream would be refused by the receiver
+with ResourceExhausted on every attempt. To use larger chunks, raise `MaxStreamPayloadBytes` together with the receive
+limit of every peer's channel. A host served by another ASP.NET Core application calls
+`GrpcTransportDefaults.EnsureChunkSizesFit` itself. A cluster whose term map has outgrown the
 limit (which takes a leader change per second for more than a day) needs the limits raised on its channels.
 
 ## Planned switchover (two nodes)

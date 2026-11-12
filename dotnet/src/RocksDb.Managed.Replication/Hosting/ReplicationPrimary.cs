@@ -9,7 +9,7 @@ namespace RocksDb.Managed.Replication.Hosting;
 /// and progress reports that retire archived WALs once every replica has applied them and feed an
 /// <see cref="AdaptiveCommitDelayController"/>.
 /// </summary>
-public sealed class ReplicationPrimary
+public sealed class ReplicationPrimary : IReplicationChunkSizes
 {
     private readonly RocksDatabase _db;
     private readonly string _checkpointRoot;
@@ -35,8 +35,34 @@ public sealed class ReplicationPrimary
     public RocksDatabase Database => _db;
     public ReplicationSource Source => _source;
     public string Id { get; init; } = "primary";
-    public int MaxChunkBytes { get; init; } = WalTailer.DefaultMaxChunkBytes;
-    public int SnapshotChunkBytes { get; init; } = 1024 * 1024;
+    /// <summary>
+    /// The most bytes of write batches one message of the WAL stream carries (a larger batch travels in fragments of
+    /// this size). Must be larger than a write batch header (12 bytes) and fit into one message of the transport: over
+    /// gRPC at most <c>GrpcTransportDefaults.MaxPayloadBytes</c>, which <c>GrpcNodeServer</c> checks at start.
+    /// </summary>
+    public int MaxChunkBytes
+    {
+        get => _maxChunkBytes;
+        init
+        {
+            WalTailer.ValidateChunkSizes(value, 1);
+            _maxChunkBytes = value;
+        }
+    }
+
+    /// <summary>The most file bytes one message of a snapshot carries. At least 1; the same transport limit applies.</summary>
+    public int SnapshotChunkBytes
+    {
+        get => _snapshotChunkBytes;
+        init
+        {
+            WalTailer.ValidateChunkSizes(WalTailer.DefaultMaxChunkBytes, value);
+            _snapshotChunkBytes = value;
+        }
+    }
+
+    private readonly int _maxChunkBytes = WalTailer.DefaultMaxChunkBytes;
+    private readonly int _snapshotChunkBytes = 1024 * 1024;
 
     /// <summary>A full snapshot of the primary. File deletions stay disabled while it streams.</summary>
     public async IAsyncEnumerable<SnapshotChunk> StreamInitialStateAsync([EnumeratorCancellation] CancellationToken cancellationToken)

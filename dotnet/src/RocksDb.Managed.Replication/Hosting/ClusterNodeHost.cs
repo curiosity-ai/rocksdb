@@ -81,7 +81,13 @@ public sealed class ClusterNodeHostOptions
     public int HeartbeatIntervalMs { get; init; } = 300;
     public ulong BootstrapInSyncLagThreshold { get; init; } = 1000;
     public int BootstrapPromotionQuorum { get; init; }
+    /// <summary>
+    /// The most bytes of write batches one message of the WAL stream carries (a larger batch travels in fragments of
+    /// this size). Must be larger than a write batch header (12 bytes) and fit into one message of the transport: over
+    /// gRPC at most <c>GrpcTransportDefaults.MaxPayloadBytes</c>, which <c>GrpcNodeServer</c> checks at start.
+    /// </summary>
     public int MaxChunkBytes { get; init; } = WalTailer.DefaultMaxChunkBytes;
+    /// <summary>The most file bytes one message of a snapshot carries. At least 1; the same transport limit applies.</summary>
     public int SnapshotChunkBytes { get; init; } = 1024 * 1024;
     /// <summary>Back-off between attempts to reach a leader / retry a failed stream or snapshot.</summary>
     public TimeSpan RetryDelay { get; init; } = TimeSpan.FromMilliseconds(200);
@@ -109,7 +115,7 @@ public sealed class ClusterNodeHostOptions
 /// with the transport factored out (<see cref="IClusterNodeClient"/> for outgoing calls; incoming calls are the public
 /// <c>Handle*</c>/<c>Stream*</c> methods). See the README for the protocol.
 /// </summary>
-public sealed class ClusterNodeHost : IAsyncDisposable
+public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
 {
     private const string RaftDirName = "raft";
 
@@ -139,12 +145,15 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(clientFactory);
+        WalTailer.ValidateChunkSizes(options.MaxChunkBytes, options.SnapshotChunkBytes);
         _cfg = options;
         _clients = clientFactory;
         _fs = options.DbOptionsFactory().FileSystem;
     }
 
     public string NodeId => _cfg.NodeId;
+    public int MaxChunkBytes => _cfg.MaxChunkBytes;
+    public int SnapshotChunkBytes => _cfg.SnapshotChunkBytes;
     public RocksDatabase Db => _db;
     public RaftClusterNode Node => _node;
     public bool IsResyncing => _resyncing;

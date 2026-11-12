@@ -48,7 +48,13 @@ public sealed class PairNodeHostOptions
     public required ReplicationRole InitialRole { get; init; }
     public required Func<DbOptions> DbOptionsFactory { get; init; }
     public SwitchoverOptions Switchover { get; init; } = new();
+    /// <summary>
+    /// The most bytes of write batches one message of the WAL stream carries (a larger batch travels in fragments of
+    /// this size). Must be larger than a write batch header (12 bytes) and fit into one message of the transport: over
+    /// gRPC at most <c>GrpcTransportDefaults.MaxPayloadBytes</c>, which <c>GrpcNodeServer</c> checks at start.
+    /// </summary>
     public int MaxChunkBytes { get; init; } = WalTailer.DefaultMaxChunkBytes;
+    /// <summary>The most file bytes one message of a snapshot carries. At least 1; the same transport limit applies.</summary>
     public int SnapshotChunkBytes { get; init; } = 1024 * 1024;
     public TimeSpan RetryDelay { get; init; } = TimeSpan.FromMilliseconds(200);
     /// <summary>
@@ -153,7 +159,7 @@ public sealed class PairFaults
 /// while replica, the WAL stream from the other node - the managed port of rocksdb-sharp's
 /// <c>Tests/SwitchoverTest/PairNodeHost</c> with the transport factored out (<see cref="IPairNodeClient"/>).
 /// </summary>
-public sealed class PairNodeHost : IAsyncDisposable
+public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
 {
     private const string RoleDirName = "role";
 
@@ -195,12 +201,15 @@ public sealed class PairNodeHost : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(peer);
+        WalTailer.ValidateChunkSizes(options.MaxChunkBytes, options.SnapshotChunkBytes);
         _cfg = options;
         _peer = peer;
         _fs = options.DbOptionsFactory().FileSystem;
     }
 
     public string NodeId => _cfg.NodeId;
+    public int MaxChunkBytes => _cfg.MaxChunkBytes;
+    public int SnapshotChunkBytes => _cfg.SnapshotChunkBytes;
     public RocksDatabase Db => _db;
     public SwitchoverNode Node => _node;
     public bool IsResyncing => _resyncing;

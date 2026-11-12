@@ -80,6 +80,17 @@ public sealed class WalTailer : IDisposable
 
     private readonly RocksDatabase _db;
     private readonly int _maxChunkBytes;
+
+    /// <summary>
+    /// Refuses chunk sizes no stream could be built with: a WAL chunk must be larger than a write batch header and a
+    /// snapshot chunk must hold at least one byte. Hosts call it when they are created, so a wrong setting fails the
+    /// start instead of every stream. Upper bounds belong to the transport (a message size limit).
+    /// </summary>
+    internal static void ValidateChunkSizes(int maxChunkBytes, int snapshotChunkBytes)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(maxChunkBytes, HeaderSize);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(snapshotChunkBytes, 0);
+    }
     private TransactionLogIterator? _iterator;
     private byte[] _buffer;
     private ulong _nextSequenceNumber;

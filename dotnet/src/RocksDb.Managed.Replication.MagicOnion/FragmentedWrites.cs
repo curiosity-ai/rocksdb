@@ -271,7 +271,17 @@ public sealed class GrpcWriteOptions
     /// stream. 256 KiB by default, the chunk size of the WAL stream (<see cref="WalTailer.DefaultMaxChunkBytes"/>).
     /// Keep it below the node's receive limit (<see cref="GrpcNodeServerOptions.MaxReceiveMessageSize"/>, 4 MiB).
     /// </summary>
-    public int MaxChunkBytes { get; init; } = WalTailer.DefaultMaxChunkBytes;
+    public int MaxChunkBytes
+    {
+        get => _maxChunkBytes;
+        init
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(value, 0);
+            _maxChunkBytes = value;
+        }
+    }
+
+    private readonly int _maxChunkBytes = WalTailer.DefaultMaxChunkBytes;
 
     /// <summary>
     /// The deadline of a write: how long the node may take to apply and acknowledge it (it waits up to 5 s for a
