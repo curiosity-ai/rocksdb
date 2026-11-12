@@ -1432,7 +1432,8 @@ inserts, erases and evictions wait for a running grow.
 
 Not read against the C++ (previous audits and the compat tests still apply):
 `PerKeyPointLockManager` (not ported), the restore / verify / garbage-collection bodies of the backup engine on the
-C# side beyond what the earlier slices compared.
+C# side beyond what the earlier slices compared (read since: "Audit #5: backup engine restore / verify / garbage
+collection" below).
 
 Found by the ticker comparison and ported afterwards: the compression dictionary block in the block cache
 (`uncompression_dict_reader.cc`, `Table/BlockBasedTableReader.CompressionDict.cs`). Without
@@ -1660,3 +1661,74 @@ and had its log rebuilt holds another entry at that number, and a delayed caller
 committed. `RaftClusterNode.WaitForCommitAsync(sequence, term, ...)` now takes the term the entry was written in, and
 `ClusterNodeHost.WriteCommittedAsync` reads the term before the write
 (`CommitWaitDoesNotAcknowledgeAnEntryThatWasReplacedAfterAStepDown`).
+
+## Audit #5: backup engine restore / verify / garbage collection
+
+`Utilities/Backup/` read side by side with `utilities/backup/backup_engine.cc` (and `utilities/copy_engine/copy_engine.cc`
+for the copy loop), function by function. Tests: `Validation/Audit5BackupTests.cs` (14, on `MemoryFileSystem` and
+`FaultInjectionFileSystem`), `CompatTests/Audit5/Audit5BackupCompatTests.cs` (3, native 11.12).
+
+| C++ | Verdict |
+|---|---|
+| `Initialize` (directories, meta file names, `destroy_old_data`, `max_valid_backups_to_open`, corrupt backups, read-only) | matches; a read-only engine writes nothing (`OpenToleratesLeftoversOfInterruptedOperations`) |
+| `BackupMeta::LoadFromFile` (schema 1 / 2.x, sizes, checksums, ignorable and `ni::` fields, footer, counts) | matches (`MetaFileValidation`, 20 rows) |
+| `BackupMeta::AddFile` / `Delete` (reference counts) | matches |
+| `RestoreDBFromBackup` | deviations 2 to 5 below, fixed; otherwise matches: destination emptied first (WAL directory and archive too), `keep_log_files`, every copy checked against the meta file's crc32c, files and directories synced with `sync`, `CURRENT` restored as `CURRENT.tmp` and renamed last |
+| `InferDBFilesToRetainInRestore` (`kKeepLatestDbSessionIdFiles`, `kVerifyChecksum`, `kPurgeAllFiles`) | deviation 3 fixed; otherwise matches (`AnIncrementalRestoreReplacesFilesThatDiffer`) |
+| `DeleteChildren` | deliberately stricter than upstream (2) |
+| `VerifyBackup` | matches (id 0 is not the latest backup here either) |
+| `GarbageCollect`, `DeleteBackupNoGC`, `DeleteBackup`, `PurgeOldBackups` | deliberately different for backups that could not be loaded (1) and for temporary meta files (6); otherwise match |
+| `CreateNewBackupWithMetadata` failure path, `StopBackup` during a backup | matches: only the failed backup's files go (`AFailedOrStoppedBackupKeepsTheFilesOfEarlierBackups`) |
+| `BackupEngineImplThreadSafe::RestoreDBFromBackup` (locks of `alternate_dirs`) | deviation 4 fixed |
+| `GetFileFromChecksumFile` | deviation 5 fixed |
+
+Deviations found and fixed (each test failed before its fix unless noted):
+
+1. **Garbage collection deleted the data of backups that could not be loaded.** A backup whose meta file fails
+   `LoadFromFile` (damaged, or a schema / `ni::` field this version does not know) holds no reference counts and is not
+   in `backups_`. `GarbageCollect` deletes its private directory and the shared files only it uses, `DeleteBackupNoGC`
+   deletes a shared file it shares with a deleted backup, and the garbage collection runs by itself on the first
+   `DeleteBackup` / `PurgeOldBackups` of a writable engine. The port did the same. **This is upstream behaviour and we
+   believe it is wrong**: an older binary that merely purges destroys the backups of a newer one, and a repairable meta
+   file loses its data (`backup_engine_test.cc` says "make sure that no corrupt backups have actually been deleted" but
+   runs no garbage collection there; the compat test shows native 11.12 deleting them). The managed engine now keeps
+   every path the unloadable meta file names (the first word of each line under `shared/`, `shared_checksum/`,
+   `private/`) and that backup's private directory until the backup is deleted by id (`DeleteBackup(id)`, which then
+   garbage collects). `AddBackupFileWorkItem`'s "already present, but not referenced" case no longer deletes the file
+   before copying (the copy is renamed over it), for the same reason. Tests:
+   `GarbageCollectionSparesBackupsThatCouldNotBeLoaded`, `DeletingABackupThatCouldNotBeLoadedRemovesItsFiles` (passed
+   before), compat `BackupsThatCannotBeLoadedSurviveManagedGarbageCollection`. Not covered: a meta file so damaged that
+   its file names cannot be read.
+2. **An incremental restore kept every file carrying the number of a kept table file.** `files_to_keep` holds numbers;
+   `DeleteChildren` and the restore loop test the number alone, so a stale `000012.log` next to a kept `000012.sst`
+   survived the restore and would be replayed by the next open. Upstream does the same; only the table / blob file is
+   kept here. Tests: `AnIncrementalRestoreKeepsOnlyTheMatchingTableFileOfANumber`, compat
+   `ManagedIncrementalRestoreOverANativeRestore`.
+3. **`kKeepLatestDbSessionIdFiles` with excluded files** (`unowned_backups`): an excluded file that no alternate
+   directory holds is acceptable when the destination already has the table file with that session id and size. The
+   port failed with InvalidArgument first. Test: `KeepLatestDbSessionIdFilesAcceptsExcludedFilesTheDestinationHolds`.
+4. **A restore read the file tables of `alternate_dirs` engines without their locks** (upstream read-locks all of
+   them in a fixed order). Test: `RestoreWaitsForAnAlternateDirectoryThatIsBeingWritten`.
+5. **A backup naming something that is not a DB file** emptied the destination before failing with Corruption
+   (upstream too: the names are parsed in the copy loop), and a `shared_checksum` name with no '.' after its '_' threw
+   ArgumentOutOfRangeException. Names are parsed before anything is deleted. Test:
+   `ABackupListingAFileThatIsNotADbFileIsRefusedBeforeTheDestinationIsTouched`.
+6. **`meta/.<id>.tmp` of a failed `StoreToFile` was never removed** (upstream neither: `Initialize` says the auto-GC
+   deletes it, `GarbageCollect` never looks into `meta/`). The garbage collection removes them. Test:
+   `AFailedOrStoppedBackupKeepsTheFilesOfEarlierBackups` (rows "fail the meta file", "fail the meta file rename").
+
+Upstream behaviour seen and not copied (already so before this audit): `GarbageCollect` empties `private/<id>` when it
+meets a `private/<id>.tmp` directory (`GetPrivateFileRel(backup_id)` instead of the child's name), which deletes a
+live backup's private files; the port deletes the `.tmp` directory.
+
+Left as it was, on purpose:
+- `StopBackup` aborts only backups here; upstream's copy engine also aborts restores and checksum reads of that engine.
+- A restore does not check the number of bytes copied when the meta file has no crc32c for a file (never written by
+  either engine; schema 2 allows it). Upstream does not either.
+- `DeleteBackup` does not sync `meta/` between deleting the meta file and the data files (upstream neither); a crash
+  that persisted only the later deletions would leave a backup reported as corrupt, never a silently incomplete one.
+- An I/O error while reading for `VerifyBackup(verify_with_checksum)` surfaces as the I/O error; upstream wraps it in
+  Corruption.
+
+Not checked: case-insensitive file systems; a backup directory used by two engines at once (unsupported upstream as
+well); temperatures (not modelled); the write-side sync calls of a backup (another slice).

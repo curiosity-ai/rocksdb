@@ -362,10 +362,11 @@ public sealed class BackupEngine : BackupEngineReadOnly
             bool known = _backupedFileInfos.TryGetValue(dstRelative, out BackupFileEntry? existing);
             if (!known && !samePath)
             {
+                // Upstream deletes the file here and copies it again. The copy goes to a temporary name and is renamed
+                // over the file, so the delete is not needed, and it must not happen: a backup that could not be loaded
+                // (IsNamedByUnloadedBackup) may be the one that needs this file, and would lose it if this backup failed.
                 LogInfo(fname + " already present, but not referenced by any backup. We will overwrite the file.");
                 needToCopy = true;
-                try { _backupFs.DeleteFile(finalDestPath); }
-                catch (Exception e) when (e is IOException or RocksDbException) { }
             }
             else if (crc is null)
             {
@@ -454,7 +455,12 @@ public sealed class BackupEngine : BackupEngineReadOnly
         }
     }
 
-    /// <summary>Deletes files of the backup directory no backup references (left by failed or interrupted operations).</summary>
+    /// <summary>
+    /// Deletes files of the backup directory no backup references (left by failed or interrupted operations). Unlike
+    /// native RocksDB, the files named by a backup that could not be loaded (<see cref="BackupEngineReadOnly.GetCorruptedBackups"/>:
+    /// a damaged meta file, or one written by a newer version) are kept until that backup is deleted with
+    /// <see cref="DeleteBackup"/>.
+    /// </summary>
     public void GarbageCollect()
     {
         ThrowIfDisposed();

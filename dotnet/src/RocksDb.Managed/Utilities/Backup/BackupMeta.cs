@@ -142,7 +142,7 @@ internal sealed class BackupMeta
     public void LoadFromFile(IFileSystem fs, string backupDir, Dictionary<string, ulong> absPathToSize, HashSet<string> reportedIgnoredFields,
         Action<string>? logWarn)
     {
-        List<string> lines = ReadLines(fs, MetaFilename);
+        List<string> lines = ReadLines(fs, MetaFilename, keepUnterminatedLine: false);
         int li = 0;
         int schemaMajorVersion = 1;
         string? line = null;
@@ -303,6 +303,37 @@ internal sealed class BackupMeta
         foreach (BackupFileEntry f in files) AddFile(f);
     }
 
+    /// <summary>
+    /// The files a meta file that could not be loaded names, read leniently: the first word of every line that is a
+    /// path into shared/, shared_checksum/ or private/ (in every schema version a file entry starts with its path).
+    /// Nothing for a meta file that cannot be read at all.
+    /// </summary>
+    internal static HashSet<string> FilesNamedByUnloadedBackup(IFileSystem fs, string metaFilename)
+    {
+        var files = new HashSet<string>(StringComparer.Ordinal);
+        List<string> lines;
+        try
+        {
+            lines = ReadLines(fs, metaFilename, keepUnterminatedLine: true);
+        }
+        catch (Exception e) when (e is IOException or RocksDbException)
+        {
+            return files;
+        }
+        foreach (string line in lines)
+        {
+            int space = line.IndexOf(' ');
+            string name = space < 0 ? line : line[..space];
+            if (name.StartsWith(BackupEngineReadOnly.SharedDirName + "/", StringComparison.Ordinal) ||
+                name.StartsWith(BackupEngineReadOnly.SharedChecksumDirName + "/", StringComparison.Ordinal) ||
+                name.StartsWith(BackupEngineReadOnly.PrivateDirName + "/", StringComparison.Ordinal))
+            {
+                files.Add(name);
+            }
+        }
+        return files;
+    }
+
     /// <summary>The DB session id embedded in a <c>shared_checksum/&lt;number&gt;_s&lt;session&gt;[_&lt;size&gt;].sst</c> name, or "".</summary>
     internal static string SessionIdFromName(string filename)
     {
@@ -362,7 +393,7 @@ internal sealed class BackupMeta
     /// LineFileReader::ReadLine: the lines terminated by '\n'. Text after the last '\n' is not a line (ReadLine returns
     /// false at EOF without a delimiter), so a meta file cut in the middle of its last entry misses that entry.
     /// </summary>
-    private static List<string> ReadLines(IFileSystem fs, string path)
+    private static List<string> ReadLines(IFileSystem fs, string path, bool keepUnterminatedLine)
     {
         long size = fs.GetFileSize(path);
         var data = new byte[size];
@@ -379,7 +410,8 @@ internal sealed class BackupMeta
         }
         string text = Encoding.UTF8.GetString(data);
         var lines = new List<string>(text.Split('\n'));
-        lines.RemoveAt(lines.Count - 1); // empty after a final '\n', else an unterminated fragment
+        // The last element is empty after a final '\n', else an unterminated fragment.
+        if (!keepUnterminatedLine || lines[^1].Length == 0) lines.RemoveAt(lines.Count - 1);
         return lines;
     }
 

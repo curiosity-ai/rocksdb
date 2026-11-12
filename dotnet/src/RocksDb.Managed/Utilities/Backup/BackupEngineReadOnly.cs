@@ -35,7 +35,12 @@ public class BackupEngineReadOnly : IDisposable
     private protected readonly SortedDictionary<uint, BackupMeta> _backups = new();
     private protected readonly SortedDictionary<uint, (RocksDbException Error, BackupMeta Meta)> _corruptBackups = new();
     private protected readonly Dictionary<string, BackupFileEntry> _backupedFileInfos = new(StringComparer.Ordinal);
+    // What the meta file of each backup of _corruptBackups names (see FilesNamedByUnloadedBackup). Guarded by _lock.
+    private protected readonly Dictionary<uint, HashSet<string>> _unloadedBackupFiles = new();
     private readonly HashSet<string> _reportedIgnoredFields = new(StringComparer.Ordinal);
+    // Engines are locked in this order when a restore needs several (alternate_dirs).
+    private static long s_nextLockOrder;
+    private readonly long _lockOrder = Interlocked.Increment(ref s_nextLockOrder);
     private protected uint _latestBackupId;
     private protected uint _latestValidBackupId;
     private protected bool _mightNeedGarbageCollect;
@@ -97,6 +102,9 @@ public class BackupEngineReadOnly : IDisposable
         int firstUnderscore = file.IndexOf('_');
         if (firstUnderscore < 0) return file;
         int lastDot = file.LastIndexOf('.');
+        // No extension after the '_' (upstream erases with a wrapped-around length): not a shared_checksum name, and
+        // not a DB file name either, which is what the callers report.
+        if (lastDot < firstUnderscore) return file;
         return file.Remove(firstUnderscore, lastDot - firstUnderscore);
     }
 
@@ -165,6 +173,7 @@ public class BackupEngineReadOnly : IDisposable
             {
                 LogInfo("Backup " + id + " corrupted -- " + e.Message);
                 _corruptBackups[id] = (e, meta);
+                _unloadedBackupFiles[id] = BackupMeta.FilesNamedByUnloadedBackup(_backupFs, meta.MetaFilename);
                 _backups.Remove(id);
             }
         }
@@ -407,9 +416,23 @@ public class BackupEngineReadOnly : IDisposable
         ThrowIfDisposed();
         dbDir = dbDir.TrimEnd('/');
         walDir = string.IsNullOrEmpty(walDir) ? dbDir : walDir.TrimEnd('/');
-        await AcquireAsync(synchronous, ct).ConfigureAwait(false);
+        // BackupEngineImplThreadSafe::RestoreDBFromBackup: this engine and those of options.alternate_dirs are locked,
+        // in a consistent order, for the whole restore (their file tables are read and their files copied).
+        var engines = new List<BackupEngineReadOnly> { this };
+        foreach (BackupEngineReadOnly be in options.AlternateDirs)
+        {
+            ArgumentNullException.ThrowIfNull(be);
+            if (!engines.Contains(be)) engines.Add(be);
+        }
+        engines.Sort(static (a, b) => a._lockOrder.CompareTo(b._lockOrder));
+        int locked = 0;
         try
         {
+            for (; locked < engines.Count; locked++)
+            {
+                engines[locked].ThrowIfDisposed();
+                await engines[locked].AcquireAsync(synchronous, ct).ConfigureAwait(false);
+            }
             if (backupId == 0) backupId = _latestValidBackupId;
             BackupMeta backup = FindValidBackup(backupId);
             LogInfo("Restoring backup id " + backupId);
@@ -421,6 +444,7 @@ public class BackupEngineReadOnly : IDisposable
             // Files to restore, and from where (taking into account excluded files): an excluded file comes from the
             // first of options.alternate_dirs that knows it.
             var restoreFiles = new List<(BackupEngineReadOnly From, BackupFileEntry File)>(backup.Files.Count + backup.ExcludedFiles.Count);
+            var unownedBackups = new HashSet<string>(StringComparer.Ordinal);
             foreach (string excluded in backup.ExcludedFiles)
             {
                 bool found = false;
@@ -435,12 +459,59 @@ public class BackupEngineReadOnly : IDisposable
                 }
                 if (!found)
                 {
+                    // In kKeepLatestDbSessionIdFiles mode the backup file need not be available as long as the DB file
+                    // already in the destination has the db session id and size of this unowned backup file.
+                    if (options.Mode == RestoreMode.KeepLatestDbSessionIdFiles)
+                    {
+                        unownedBackups.Add(excluded);
+                        continue;
+                    }
                     ThrowHelper.InvalidArgument("Excluded file " + excluded + " not found in any of " + options.AlternateDirs.Count + " backup directories!");
                 }
             }
             foreach (BackupFileEntry f in backup.Files) restoreFiles.Add((this, f));
 
-            HashSet<ulong> filesToKeep = await InferDbFilesToRetainAsync(restoreFiles, dbDir, options.Mode, synchronous, ct).ConfigureAwait(false);
+            HashSet<ulong> filesToKeep = await InferDbFilesToRetainAsync(restoreFiles, unownedBackups, dbDir, options.Mode, synchronous, ct).ConfigureAwait(false);
+            if (unownedBackups.Count > 0)
+            {
+                string first = "";
+                foreach (string u in unownedBackups)
+                {
+                    if (first.Length == 0 || string.CompareOrdinal(u, first) < 0) first = u;
+                }
+                ThrowHelper.InvalidArgument("Excluded file " + first + " (one amongst " + unownedBackups.Count + ") not found in any of " +
+                    options.AlternateDirs.Count + " backup directories!");
+            }
+
+            // Where each file goes. Upstream parses the names in its copy loop, after the destination was emptied; a
+            // backup naming something that is not a DB file is refused here, before anything is deleted.
+            string? temporaryCurrent = null, finalCurrent = null;
+            bool syncDbDir = false, syncWalDir = false;
+            var copies = new List<(BackupEngineReadOnly From, BackupFileEntry File, string Dst)>(restoreFiles.Count);
+            foreach ((BackupEngineReadOnly from, BackupFileEntry f) in restoreFiles)
+            {
+                string dst = f.GetDbFileName();
+                if (!FileNames.TryParseFileName(dst, out ulong number, out FileType type)) ThrowHelper.Corruption("Backup corrupted: Fail to parse filename " + dst);
+                if (IsKept(filesToKeep, number, type)) continue; // already in the destination directory
+                if (type == FileType.WalFile)
+                {
+                    dst = walDir + "/" + dst;
+                    syncWalDir = _options.Sync;
+                }
+                else
+                {
+                    dst = dbDir + "/" + dst;
+                    syncDbDir = _options.Sync;
+                }
+                // For atomicity, initially restore CURRENT file to a temporary name.
+                if (type == FileType.CurrentFile)
+                {
+                    finalCurrent = dst;
+                    dst = temporaryCurrent = dst + ".tmp";
+                }
+                copies.Add((from, f, dst));
+            }
+
             if (options.KeepLogFiles)
             {
                 // Delete non-matching files in db_dir, but keep all the log files.
@@ -463,32 +534,6 @@ public class BackupEngineReadOnly : IDisposable
                 DeleteChildren(dbDir, filesToKeep, 0);
             }
 
-            string? temporaryCurrent = null, finalCurrent = null;
-            bool syncDbDir = false, syncWalDir = false;
-            var copies = new List<(BackupEngineReadOnly From, BackupFileEntry File, string Dst)>(restoreFiles.Count);
-            foreach ((BackupEngineReadOnly from, BackupFileEntry f) in restoreFiles)
-            {
-                string dst = f.GetDbFileName();
-                if (!FileNames.TryParseFileName(dst, out ulong number, out FileType type)) ThrowHelper.Corruption("Backup corrupted: Fail to parse filename " + dst);
-                if (filesToKeep.Contains(number)) continue; // already in the destination directory
-                if (type == FileType.WalFile)
-                {
-                    dst = walDir + "/" + dst;
-                    syncWalDir = _options.Sync;
-                }
-                else
-                {
-                    dst = dbDir + "/" + dst;
-                    syncDbDir = _options.Sync;
-                }
-                // For atomicity, initially restore CURRENT file to a temporary name.
-                if (type == FileType.CurrentFile)
-                {
-                    finalCurrent = dst;
-                    dst = temporaryCurrent = dst + ".tmp";
-                }
-                copies.Add((from, f, dst));
-            }
             // The copies run on up to max_background_operations workers (RestoreFileWorkItems on the copy engine).
             await RunParallelAsync(copies.Count, async (i, sync, token) =>
             {
@@ -515,7 +560,7 @@ public class BackupEngineReadOnly : IDisposable
         }
         finally
         {
-            _lock.Release();
+            while (locked > 0) engines[--locked]._lock.Release();
         }
     }
 
@@ -525,13 +570,21 @@ public class BackupEngineReadOnly : IDisposable
         catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException) { }
     }
 
-    /// <summary>Port of DeleteChildren: deletes the files of <paramref name="dir"/> except kept numbers and filtered types.</summary>
+    /// <summary>
+    /// files_to_keep holds the numbers of the destination's table / blob files that match the backup. Upstream tests
+    /// the number alone, which also keeps (and does not restore over) any other file of the destination carrying that
+    /// number, e.g. a stale 000012.log next to a kept 000012.sst, which the restored DB would replay.
+    /// </summary>
+    private static bool IsKept(HashSet<ulong> filesToKeep, ulong number, FileType type) =>
+        type is FileType.TableFile or FileType.BlobFile && filesToKeep.Contains(number);
+
+    /// <summary>Port of DeleteChildren: deletes the files of <paramref name="dir"/> except kept table / blob files and filtered types.</summary>
     private void DeleteChildren(string dir, HashSet<ulong> filesToKeep, int fileTypeFilter)
     {
         foreach (string f in TryGetChildren(_dbFs, dir) ?? [])
         {
             bool ok = FileNames.TryParseFileName(f, out ulong number, out FileType type);
-            if (ok && filesToKeep.Contains(number)) continue;
+            if (ok && IsKept(filesToKeep, number, type)) continue;
             if (ok && (fileTypeFilter & (1 << (int)type)) != 0) continue;
             string p = dir + "/" + f;
             if (_dbFs.DirectoryExistsSafe(p)) continue; // DeleteFile fails on directories upstream
@@ -543,8 +596,8 @@ public class BackupEngineReadOnly : IDisposable
     /// Port of InferDBFilesToRetainInRestore: in the incremental restore modes, table files (and blob files with
     /// kVerifyChecksum) of the destination identical to the backup's are kept.
     /// </summary>
-    private async ValueTask<HashSet<ulong>> InferDbFilesToRetainAsync(List<(BackupEngineReadOnly From, BackupFileEntry File)> files, string dbDir,
-        RestoreMode mode, bool synchronous, CancellationToken ct)
+    private async ValueTask<HashSet<ulong>> InferDbFilesToRetainAsync(List<(BackupEngineReadOnly From, BackupFileEntry File)> files,
+        HashSet<string> unownedBackups, string dbDir, RestoreMode mode, bool synchronous, CancellationToken ct)
     {
         var keep = new HashSet<ulong>();
         if (mode == RestoreMode.PurgeAllFiles) return keep;
@@ -559,8 +612,9 @@ public class BackupEngineReadOnly : IDisposable
             if (!FileNames.TryParseFileName(child, out ulong number, out FileType type)) continue;
             if (type != FileType.TableFile && type != FileType.BlobFile) continue;
             if (type == FileType.BlobFile && mode != RestoreMode.VerifyChecksum) continue;
-            if (!byNumber.TryGetValue(number, out (BackupEngineReadOnly From, BackupFileEntry File) entry)) continue;
-            BackupFileEntry bf = entry.File;
+            bool inBackup = byNumber.TryGetValue(number, out (BackupEngineReadOnly From, BackupFileEntry File) entry);
+            if (!inBackup && (mode != RestoreMode.KeepLatestDbSessionIdFiles || unownedBackups.Count == 0)) continue;
+            BackupFileEntry? bf = inBackup ? entry.File : null;
             string path = dbDir + "/" + child;
             ulong size;
             try { size = (ulong)_dbFs.GetFileSize(path); }
@@ -572,13 +626,15 @@ public class BackupEngineReadOnly : IDisposable
                 if (!TryGetFileDbIdentities(_dbFs, path, out _, out string sid)) continue;
                 int dot = child.LastIndexOf('.');
                 string shared = "shared_checksum/" + child[..dot] + "_s" + sid + "_" + size.ToString(System.Globalization.CultureInfo.InvariantCulture) + child[dot..];
-                if (bf.Filename == shared) keep.Add(number);
+                if (bf is not null && bf.Filename == shared) keep.Add(number);
+                // The DB file is the excluded backup file that no backup directory holds.
+                else if (type == FileType.TableFile && unownedBackups.Remove(shared)) keep.Add(number);
             }
             else
             {
                 // "Existing file is not present in the backup": same number under another name (000012.ldb, or a blob
                 // file against a table file).
-                if (bf.GetDbFileName() != child) continue;
+                if (bf is null || bf.GetDbFileName() != child) continue;
                 if (size != bf.Size) continue;
                 uint expected = bf.Crc32c ?? await ComputeChecksumAsync(entry.From._backupFs, entry.From.GetAbsolutePath(bf.Filename), 0,
                     _options.RestoreRateLimiter, synchronous, ct).ConfigureAwait(false);
@@ -854,6 +910,9 @@ public class BackupEngineReadOnly : IDisposable
         {
             corrupt.Meta.Delete(_backupFs, deleteMeta: true);
             _corruptBackups.Remove(backupId);
+            // Its files were never reference counted: only a garbage collection finds them.
+            _unloadedBackupFiles.Remove(backupId);
+            _mightNeedGarbageCollect = true;
         }
         else
         {
@@ -864,9 +923,10 @@ public class BackupEngineReadOnly : IDisposable
         foreach (KeyValuePair<string, BackupFileEntry> kv in _backupedFileInfos)
         {
             if (kv.Value.Refs != 0) continue;
+            unreferenced.Add(kv.Key);
+            if (IsNamedByUnloadedBackup(kv.Key)) continue;
             try { _backupFs.DeleteFile(GetAbsolutePath(kv.Key)); }
             catch (Exception e) when (e is IOException or RocksDbException) { _mightNeedGarbageCollect = true; }
-            unreferenced.Add(kv.Key);
         }
         foreach (string k in unreferenced) _backupedFileInfos.Remove(k);
         // Take care of private dirs -- GarbageCollect() will take care of them if they are not empty.
@@ -874,7 +934,28 @@ public class BackupEngineReadOnly : IDisposable
         catch (Exception e) when (e is IOException or RocksDbException) { _mightNeedGarbageCollect = true; }
     }
 
-    /// <summary>Port of BackupEngineImpl::GarbageCollect: deletes unreferenced shared files and private dirs of dead backups.</summary>
+    /// <summary>
+    /// Whether a backup that could not be loaded (corrupt_backups_: a damaged meta file, or one of a schema this version
+    /// does not support) names <paramref name="relativeFile"/>. Such a backup holds no reference counts, so upstream's
+    /// DeleteBackupNoGC and GarbageCollect delete its shared files and its private directory although its meta file
+    /// stays; a backup written by a newer version, or one whose meta file can be repaired, is destroyed that way. Here
+    /// what its meta file names is kept until the backup is deleted by id.
+    /// </summary>
+    private protected bool IsNamedByUnloadedBackup(string relativeFile)
+    {
+        foreach (HashSet<string> files in _unloadedBackupFiles.Values)
+        {
+            if (files.Contains(relativeFile)) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Port of BackupEngineImpl::GarbageCollect: deletes unreferenced shared files and private dirs of dead backups.
+    /// Beyond upstream: temporary meta files (<c>meta/.&lt;id&gt;.tmp</c>, left by a StoreToFile that failed; Initialize's
+    /// comment promises their collection, GarbageCollect never looks into meta/) are deleted, and the files of backups
+    /// that could not be loaded are kept (<see cref="IsNamedByUnloadedBackup"/>).
+    /// </summary>
     private protected void GarbageCollectLocked()
     {
         _mightNeedGarbageCollect = false;
@@ -886,6 +967,7 @@ public class BackupEngineReadOnly : IDisposable
             {
                 string rel = withChecksum ? GetSharedFileWithChecksumRel(child, false) : GetSharedFileRel(child, false);
                 if (_backupedFileInfos.TryGetValue(rel, out BackupFileEntry? e) && e.Refs != 0) continue;
+                if (IsNamedByUnloadedBackup(rel)) continue;
                 try { _backupFs.DeleteFile(GetAbsolutePath(rel)); }
                 catch (Exception ex) when (ex is IOException or RocksDbException) { _mightNeedGarbageCollect = true; }
                 _backupedFileInfos.Remove(rel);
@@ -896,6 +978,7 @@ public class BackupEngineReadOnly : IDisposable
             bool tmpDir = child.Contains(".tmp", StringComparison.Ordinal);
             uint.TryParse(LeadingDigits(child), NumberStyles.None, CultureInfo.InvariantCulture, out uint id);
             if (!tmpDir && (id == 0 || _backups.ContainsKey(id))) continue; // not a number, or still alive
+            if (!tmpDir && _corruptBackups.ContainsKey(id) && child == id.ToString(CultureInfo.InvariantCulture)) continue; // not loaded, not deleted
             string full = GetAbsolutePath(PrivateDirName + "/" + child);
             foreach (string sub in TryGetChildren(_backupFs, full) ?? [])
             {
@@ -903,6 +986,21 @@ public class BackupEngineReadOnly : IDisposable
                 catch (Exception ex) when (ex is IOException or RocksDbException) { _mightNeedGarbageCollect = true; }
             }
             try { _backupFs.DeleteDirectory(full); }
+            catch (Exception ex) when (ex is IOException or RocksDbException) { _mightNeedGarbageCollect = true; }
+        }
+        DeleteTemporaryMetaFiles();
+    }
+
+    /// <summary>Deletes <c>meta/.&lt;id&gt;.tmp</c> files (BackupMeta::StoreToFile's temporary name). REQUIRES: _lock.</summary>
+    private void DeleteTemporaryMetaFiles()
+    {
+        string metaPath = GetAbsolutePath(MetaDirName);
+        foreach (string child in TryGetChildren(_backupFs, metaPath) ?? [])
+        {
+            if (child.Length < 6 || child[0] != '.' || !child.EndsWith(".tmp", StringComparison.Ordinal)) continue;
+            string digits = child[1..^4];
+            if (LeadingDigits(digits).Length != digits.Length) continue;
+            try { _backupFs.DeleteFile(metaPath + "/" + child); }
             catch (Exception ex) when (ex is IOException or RocksDbException) { _mightNeedGarbageCollect = true; }
         }
     }
