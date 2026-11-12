@@ -212,6 +212,9 @@ internal sealed class ExternalSstFileIngestionJob
                 {
                     _fs.LinkFile(f.ExternalFilePath, pathInsideDb);
                     linked = true;
+                    // "It is unsafe to assume application had sync the file and file directory before ingest the file.
+                    // For integrity of RocksDB we need to sync the file." (fs_->SyncFile; NotSupported is ignored.)
+                    _fs.SyncFile(pathInsideDb);
                 }
                 catch (RocksDbException e) when (e.Code == StatusCode.NotSupported && _options.FailedMoveFallBackToCopy)
                 {

@@ -955,7 +955,11 @@ internal sealed partial class DbImpl
                 edit.BlobFileAdditions.AddRange(job.BlobFileAdditions);
                 edit.BlobFileGarbages.AddRange(job.BlobFileGarbages);
                 AddCompactCursorEdit(cfd, c, edit);
-                if (job.Outputs.Count + job.ProximalOutputs.Count > 0) FileSystem.SyncDirectory(DbPaths[(int)Math.Min(c.OutputPathId, (uint)(DbPaths.Count - 1))]);
+                // CompactionJob::SyncOutputDirectories: the output directory, then the blob directory (cf_paths.front())
+                // when new blob files were written and it is a different directory.
+                int outputPath = (int)Math.Min(c.OutputPathId, (uint)(DbPaths.Count - 1));
+                if (job.Outputs.Count + job.ProximalOutputs.Count > 0) FileSystem.SyncDirectory(DbPaths[outputPath]);
+                if (job.BlobFileAdditions.Count > 0 && (outputPath != 0 || job.Outputs.Count + job.ProximalOutputs.Count == 0)) FileSystem.SyncDirectory(DbPaths[0]);
                 }
             }
             lock (_mutex)

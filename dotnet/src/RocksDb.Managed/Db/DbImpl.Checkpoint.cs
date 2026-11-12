@@ -253,7 +253,9 @@ internal sealed partial class DbImpl
         }
 
         // FlushWAL is required to ensure we can physically copy everything logically written to the WAL.
-        if (!_readOnly) await FlushWalAsync(sync: false, synchronous, ct).ConfigureAwait(false);
+        // GetOpenWalSizes: the WALs this instance still holds open (not known to be fully synced).
+        HashSet<ulong>? openWals = _readOnly ? null : new HashSet<ulong>();
+        if (!_readOnly) await FlushWalAsync(sync: false, synchronous, openWals, ct).ConfigureAwait(false);
 
         // GetSortedWalFilesImpl(need_seqnos = false): empty WALs (e.g. the one created by the flush above) are live too.
         List<WalFileInfo> liveWalFiles = GetSortedWalFiles(includeArchived: false, needSeqnos: false);
@@ -263,8 +265,10 @@ internal sealed partial class DbImpl
             WalFileInfo w = liveWalFiles[i];
             if (w.Type == WalFileType.AliveLogFile && (!flushMemtable || w.LogNumber >= minLogNum) && w.LogNumber <= maxLogNum)
             {
-                // Recyclable WAL files must be copied instead of hard linked (their whole size, stale tail included).
-                bool trim = Options.RecycleLogFileNum > 0 || i + 1 == liveWalFiles.Count;
+                // Recyclable WAL files must be copied instead of hard linked (their whole size, stale tail included), and
+                // so must a WAL that is (possibly) still open: only a WAL "known fully synced and no future writes" is
+                // hard linked. The copy is synced (CopyFile), a hard link would share the WAL's unsynced data.
+                bool trim = Options.RecycleLogFileNum > 0 || i + 1 == liveWalFiles.Count || (openWals is not null && openWals.Contains(w.LogNumber));
                 results.Add(new LiveFileStorageInfo(WalDir, FileNames.LogFileName(w.LogNumber), w.LogNumber, FileType.WalFile, w.SizeBytes, trim, null));
             }
         }

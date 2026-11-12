@@ -59,6 +59,8 @@ internal sealed class BlobDirectWriteManager : IDisposable
         public ulong BlobCount;
         public ulong TotalBlobBytes;
         public bool SyncRequired;
+        /// <summary>The file's directory entry was made durable (a directory fsync since it was created).</summary>
+        public bool DirectoryEntrySynced;
         /// <summary>Checksum method / value of the sealed file (empty without a checksum factory).</summary>
         public string ChecksumMethod = "";
         public byte[] ChecksumValue = [];
@@ -284,12 +286,23 @@ internal sealed class BlobDirectWriteManager : IDisposable
     /// <summary>SyncAllOpenFiles: makes the open files durable before a sync WAL write. REQUIRES: write group leader.</summary>
     public void SyncAllOpenFiles()
     {
+        bool syncDirectory = false;
         foreach (OpenFile? f in _partitions)
         {
             if (f is null || !f.SyncRequired) continue;
             Sync(f.File);
             f.SyncRequired = false;
+            syncDirectory |= !f.DirectoryEntrySynced;
             _stats?.RecordTick(Ticker.BlobDbBlobFileSynced);
+        }
+        if (!syncDirectory) return;
+        // Stricter than upstream (BlobFilePartitionManager::SyncAllOpenFiles only syncs the files): a blob file created
+        // since the last directory fsync has no durable directory entry, and the sync write about to be acknowledged
+        // references it from the WAL. Once per blob file.
+        _fs.SyncDirectory(_blobDir);
+        foreach (OpenFile? f in _partitions)
+        {
+            if (f is not null) f.DirectoryEntrySynced = true;
         }
     }
 

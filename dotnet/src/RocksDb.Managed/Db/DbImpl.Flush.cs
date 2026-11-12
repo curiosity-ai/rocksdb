@@ -528,6 +528,9 @@ internal sealed partial class DbImpl
         if (directWrite is { } dw)
         {
             edit.BlobFileAdditions.AddRange(dw.Additions);
+            // FlushJob::WriteLevel0Table fsyncs the output directory whether or not a table was written: the sealed
+            // direct-write blob files this edit adds live there too.
+            if (meta is null && dw.Additions.Count > 0) FileSystem.SyncDirectory(DbPaths[0]);
             dw.Meter.AddGarbageTo(edit.BlobFileGarbages);
         }
         // FlushJob::MaybeIncreaseFullHistoryTsLowToAboveCutoffUDT (written in the flush's own edit instead of a separate

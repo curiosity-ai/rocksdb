@@ -710,13 +710,15 @@ internal sealed partial class DbImpl
                 var writer = new ManifestWriter(log);
                 await AwaitIo(writer.AddEditAsync(edit, 0, sync: true, ct), synchronous).ConfigureAwait(false);
             }
-            await AwaitIo(FileNames.SetCurrentFileAsync(FileSystem, DbName, manifestNumber, syncDirectory: true, ct), synchronous).ConfigureAwait(false);
         }
         catch
         {
             TryDeleteFile(manifest);
             throw;
         }
+        // Make "CURRENT" file that points to the new manifest file. The MANIFEST stays when this fails (NewDB only
+        // deletes it when writing it failed): CURRENT may already name it (renamed, directory fsync failed).
+        await AwaitIo(FileNames.SetCurrentFileAsync(FileSystem, DbName, manifestNumber, syncDirectory: true, ct), synchronous).ConfigureAwait(false);
     }
 
     private static ValueTask<T> AwaitIo2<T>(ValueTask<T> t, bool synchronous)

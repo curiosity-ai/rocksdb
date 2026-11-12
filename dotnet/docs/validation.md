@@ -1809,3 +1809,114 @@ dereferenced (dependency ordered), and the write path orders it through the writ
 - Not covered by a deterministic test in this pass: two write queues with sequence-per-batch transactions, the
   split insert of one large batch (`DbImpl.SplitInsert.cs`), and the interaction of error recovery with a write group
   in flight.
+
+## Audit #5: power-loss durability sweep (2026-11-12)
+
+Scope: every place in `src/RocksDb.Managed` (engine only, not `RocksDb.Managed.Replication*`) that creates, renames,
+links, deletes or truncates a persistent file, compared with what the C++ tree (`main`) syncs at the same point and in
+which order. A difference counts as a deviation when a power loss at the worst moment can lose acknowledged data,
+bring deleted data back, or leave a DB that does not open.
+
+Method. (1) Reading: each call of `CreateWritable`, `ReuseWritable`, `ReopenWritable`, `RenameFile`, `LinkFile`,
+`DeleteFile`, `DeleteDirectory`, `WriteAt`, `Truncate` and `SyncDirectory` outside `Env/` against the C++ function it
+ports. (2) Sweeps: `tests/RocksDb.Managed.Tests/Validation/Audit5DurabilityTests.cs` runs a deterministic scenario on a
+`FaultInjectionFileSystem`, records its file-system operations, and repeats it once per create / sync / rename / link /
+delete / directory-sync operation with a power loss at that operation (the operation fails, then
+`MemoryFileSystem.SimulateCrash` drops every unsynced byte and every directory entry created, renamed or deleted since
+the directory's last fsync). After each power loss the DB must open twice, hold every key recorded as durable before
+the loss (sync write, `SyncWal` / `FlushWal(sync)`, flush, ingestion, import, column family creation), not hold a
+key whose deletion was durable, and accept a sync write, a flush and a compaction. `AUDIT5_TRACE=<file>` writes each
+scenario's operation sequence, which is what the "port" column below was read from. 43 tests, 44 swept scenarios, about
+4 300 power-loss points. Scenarios a sweep cannot reach (a held-back flush, a process that dies without closing, an
+operation that fails without a crash) are single tests in the same file.
+
+### Points checked
+
+| Point | C++ (what is synced, in order) | Port | Verdict |
+|---|---|---|---|
+| New DB: IDENTITY | `SetIdentityFile` (`file/filename.cc`): temp file, sync, rename, directory fsync | `FileNames.SetIdentityFileAsync`: same | same |
+| New DB: first MANIFEST | `DBImpl::NewDB`: MANIFEST-000001 written and synced, then `SetCurrentFile`; the MANIFEST is deleted only when writing it failed | the MANIFEST was also deleted when `SetCurrentFile` failed | **deviation, fixed** (below) |
+| New DB / MANIFEST switch: CURRENT | `VersionSet::ProcessManifestWrites`: new MANIFEST written and synced (`SyncManifest`), then `SetCurrentFile`: `NNNNNN.dbtmp`, sync, rename over CURRENT, directory fsync; the old MANIFEST is deleted afterwards | `VersionSet.LogAndApplyAsync`, `FileNames.SetCurrentFileAsync`: same order; a MANIFEST whose CURRENT update failed is kept | same (`CoreWorkloadManifestRollOnEveryEdit`) |
+| MANIFEST append | record(s), `SyncManifest`; no directory fsync | `ManifestWriter.AddEditsAsync` syncs after each batch | same |
+| OPTIONS-N | `PersistRocksDBOptions` writes and fsyncs the temp file, `RenameTempFileToOptionsFile` renames it and fsyncs the directory | `OptionsFile.WriteToDbDirectoryAsync`: same | same |
+| LOCK | created, never synced | same | same |
+| First WAL of an open | `DBImpl::CreateWAL`: created, no directory fsync; the directory is fsynced by the first sync write (`WriteToWAL`, `need_wal_dir_sync = !wal_dir_synced_`) | `CreateWal`; `SyncWalDirIfNeeded` after the first synced record | same. Consequence shared with upstream: with `track_and_verify_wals` a power loss between the first CURRENT and the first sync write leaves "an existing DB with no WAL files" (Corruption on open); nothing was acknowledged (`CoreWorkloadPredecessorWalInfo` accepts exactly that case) |
+| Sync write, `SyncWAL`, `FlushWAL(sync)` | every `logs_` entry synced oldest first, then the WAL directory if a WAL was created since its last fsync | `SyncClosedWalsAsync`, `log.Sync`, `SyncWalDirIfNeeded` (write path, `FlushWalAsync`, second write queue) | same (`SyncWalAndFlushWalMakeEarlierWritesDurable`, with `wal_dir` and `manual_wal_flush`) |
+| Memtable switch | single column family: the old WAL's buffer is written, not synced; several column families / 2PC: `SyncClosedWals` before the flush (file sync, WAL directory fsync if needed) | single column family: same; otherwise the closed WAL is synced (and the WAL directory fsynced) at the switch, before its memtable can be flushed | same / earlier than upstream |
+| Pipelined writes, unordered writes, `two_write_queues` | same WAL sync and WAL directory fsync rules on each path | `DbImpl.Write.cs`, `DbImpl.UnorderedWrite.cs`, `DbImpl.TwoWriteQueues.cs`: same (read only; no change) | same (`CoreWorkloadOtherWritePaths`, each with a separate `wal_dir`) |
+| `allow_2pc` | WALs holding a prepared section are kept until the commit is flushed (`PrecomputeMinLogNumberToKeep2PC`); the commit marker is a sync write | `PrecomputeMinLogNumberToKeep2PC`, `MinLogNumberToKeepForDeletion` | same (`TwoPhaseCommitSurvivesPowerLoss`: a prepared transaction spans two flushes and a reopen) |
+| WAL recycling | `ReuseWritableFile` (rename + open without truncation); `wal_dir_synced_ = false` | `IFileSystem.ReuseWritable`; `_walDirSynced = false` for every new WAL | same (`CoreWorkloadRecycledWals`, `...SeparateWalDir`) |
+| `wal_dir` different from the DB directory | `directories_.GetWalDir()` is the directory fsynced for WALs | `SyncDirectory(WalDir)` | same (`CoreWorkloadSeparateWalDir`) |
+| WAL archive / deletion | `WalManager::ArchiveWALFile`: rename, no fsync; deletion after the MANIFEST edit that advances the log number is synced | `DeleteOrArchiveWal`: same; WALs are deleted after the MANIFEST sync | same (`CoreWorkloadArchivedWals`, `...SeparateWalDir`) |
+| `track_and_verify_wals_in_manifest` | a WAL's synced size is recorded after the file sync and the directory fsync (`MarkLogsSynced` after `SyncWalImpl`) | `NoteClosedWalSynced` after the sync; the MANIFEST record is written later | same (`CoreWorkloadWalsTrackedInManifest`, `...SeparateWalDir`) |
+| Recovered-sequence record at open | written to the new WAL and synced ("otherwise it might get lost after a power reset") | `WriteRecoveredSequenceRecord`: same | same |
+| Flush | `BuildTable`: table file synced; blob files synced by `BlobLogWriter`; `FlushJob::WriteLevel0Table` fsyncs the output directory; then the MANIFEST edit | `FlushJob.WriteLevel0TableAsync` syncs, `SyncDirectory(DbPaths[0])`, then the edit | same. Hardened: the directory is also fsynced when the flush only adds sealed direct-write blob files (upstream fsyncs unconditionally); no test, no way found to produce such a flush |
+| Recovery flush | `WriteLevel0TableForRecovery`: directory fsync before the recovery edit | same (`DbImpl.Open.cs`) | same |
+| Compaction | outputs synced (`CompactionOutputs::WriterSyncClose`), `CompactionJob::SyncOutputDirectories`: output directory, then the blob directory if new blob files were written and it differs | output directory only | **deviation, fixed** (below) |
+| Trivial copy (FIFO temperature change) | `CopyTrivialCompactionFiles`: copies synced, output directory fsynced | same | same |
+| Remote compaction | worker fsyncs its output directory; the primary renames the files in and fsyncs the output directory | same | same |
+| External file ingestion | `ExternalSstFileIngestionJob::Prepare`: copies synced by `CopyFile`; hard links synced by `FileSystem::SyncFile`; data directory fsynced; `write_global_seqno` rewrites and syncs the file; then the MANIFEST edit | hard links were not synced | **deviation, fixed** (below) |
+| `SstFileWriter::Finish` | file synced, no directory fsync | same | same |
+| Column family import | `ImportColumnFamilyJob::Prepare`: link or `CopyFile` (synced); no sync of linked files, no directory fsync | was the same | **upstream gap, hardened** (below) |
+| Column family export | links / synced copies into a staging directory, rename, fsync of the renamed directory | same | same |
+| Checkpoint | `GetLiveFilesStorageInfo` + `CreateCustomCheckpoint`: table / blob / OPTIONS files hard linked; MANIFEST copied to its captured size and synced; CURRENT created and synced; a WAL is hard linked only when "known fully synced and no future writes", any WAL still open (`GetOpenWalSizes`) is copied and synced; staging directory renamed, renamed directory fsynced | only the last WAL was copied | **deviation, fixed** (below); the port also fsyncs the parent directory |
+| Backup creation (write side) | shared files copied to a temp name, synced, renamed; private files copied and synced; meta file temp + sync + rename; then fsync of the private, `private/`, `meta/`, shared and backup directories (all with `sync`) | same order | same (`BackupSurvivesPowerLoss`) |
+| Obsolete table / blob / MANIFEST / OPTIONS files | deleted after the MANIFEST edit that drops them is synced; through the `SstFileManager` trash when rate limited (rename to `.trash`, delete, directory fsync) | same | same (`CoreWorkloadSstFileManagerTrash`, `ColumnFamilyCreateDropAndDeleteFilesInRange`) |
+| `db_paths` | each data directory fsynced by the job that wrote into it | flush / ingestion / import: first path; compaction: output path | same after the compaction fix (`CoreWorkloadTwoDbPaths*`, `CompactionToSecondDbPathSurvivesPowerLoss`) |
+| Blob direct write | sync write: `BlobFilePartitionManager::SyncAllOpenFiles` (files only), then the WAL | was the same | **upstream gap, hardened** (below) |
+| DestroyDB, RepairDB | deletions in directory order, no fsync; repair writes a new MANIFEST with `SetCurrentFile` | same (read only, no sweep) | same |
+
+### Deviations fixed
+
+| Where | Deviation | Consequence | Test (failed before the fix) |
+|---|---|---|---|
+| `Db/ExternalSstFileIngestionJob.cs` (`PrepareAsync`) | Files ingested with `move_files` / `link_files` were hard linked without the `FileSystem::SyncFile` upstream does ("It is unsafe to assume application had sync the file and file directory before ingest the file"). | An external file the application never fsynced: after the ingestion returned, a power loss left a table file with no data that the MANIFEST names; the DB failed to open (Corruption: file size mismatch). | `IngestWithLinkSyncsTheLinkedFile`, `IngestedFilesSurvivePowerLoss(true, false, true)` and the other unsynced-source rows |
+| `Db/DbImpl.Compaction.cs` | Only the compaction's output path was fsynced. With `db_paths` and blob files, a compaction to another path than the first writes its blob files to the first path (`cf_paths.front()`), which was not fsynced before the MANIFEST edit. | After a power loss the MANIFEST named blob files that did not exist: reads of the compacted keys failed with a missing blob file. | `CompactionToSecondDbPathSurvivesPowerLoss(true)` |
+| `Db/DbImpl.Open.cs` (`NewDbAsync`) | MANIFEST-000001 was deleted after any failure of the first open, including a `SetCurrentFile` that had already renamed CURRENT into place (its directory fsync failed). Upstream deletes it only when writing the MANIFEST failed. | A failed directory fsync during the creation of a DB left a CURRENT naming a MANIFEST that was gone: every later open failed (IOError, MANIFEST-000001 not found) until the directory was cleaned by hand. Not a power-loss case (after a power loss nothing can be deleted), found while reading the failure paths. | `FailedDirectoryFsyncOfTheFirstCurrentLeavesAnOpenableDb` |
+| `Db/DbImpl.Checkpoint.cs` (`GetLiveFilesStorageInfoAsync`), `Db/DbImpl.Replication.cs` (`FlushWalAsync`) | Every live WAL but the last was hard linked. Upstream copies every WAL still open in `logs_`; with one column family a closed WAL is not synced at the memtable switch. | A checkpoint taken without a flush shared the unsynced data of a closed WAL through the hard link: after a power loss the checkpoint missed writes it had captured. | `CheckpointCopiesClosedWalsThatWereNotSynced` |
+
+### Upstream gaps the port no longer shares (stricter than upstream)
+
+| Where | Gap (same in C++) | Consequence | Test (failed before the change) |
+|---|---|---|---|
+| `Db/ImportColumnFamilyJob.cs` (`PrepareAsync`) | `ImportColumnFamilyJob::Prepare` links or copies the files into the DB directory and `CreateColumnFamilyWithImport` writes the MANIFEST edit; nothing fsyncs the directory, and linked files are not synced. | After a power loss the MANIFEST named table files without a directory entry: the DB failed to open. The port now syncs linked files and fsyncs the directory before the edit. | `ImportedColumnFamilySurvivesPowerLoss(false / true)` |
+| `Db/Blob/BlobDirectWriteManager.cs` (`SyncAllOpenFiles`) | A sync write with `enable_blob_direct_write` syncs the open blob files and the WAL, never the directory of a blob file created since the last directory fsync. | The acknowledged sync write was in the WAL but its value could not be read after a power loss (missing blob file). The directory is now fsynced once per new blob file, before the WAL write. | `BlobDirectWriteSyncWriteSurvivesPowerLoss` |
+
+### Open
+
+- **Blob direct write and a crash between sealing and registration** (not a sync-order problem; found by the first
+  version of the blob direct write sweep, which was reduced to the case above). A flush seals the direct-write blob
+  files of its memtable (footer, sync) and registers them in its MANIFEST edit. If the process dies in between, the WAL
+  still holds the blob indexes, the recovery flush writes them into a table file, and the sealed file, which is in no
+  version, has a footer and is tracked by no manager, is deleted as obsolete on that open: the keys then fail with a
+  missing blob file. A process kill is enough, no power loss is needed. By reading, upstream does the same
+  (`ShouldKeepBlobFileDuringPurge` keeps only tracked or footer-less files; recovery registers nothing;
+  `db_impl.cc`: "Blob direct-write relies on clean shutdown flushes to register live blob files"); this was not run
+  against native RocksDB (the 11.12 package has no blob direct write). Fixing it means registering the blob files the
+  replayed WALs reference during recovery, which is a change of the recovery path, not of a sync.
+- A checkpoint also hard links live WALs written by an earlier process (kept alive by `avoid_flush_during_recovery`),
+  whose contents that process may never have synced. Upstream does the same: `GetOpenWalSizes` only knows the WALs of
+  the running instance.
+- `use_fsync` is accepted and ignored: file syncs are `fdatasync` on Linux and `RandomAccess.FlushToDisk` elsewhere
+  (`fsync`; `F_FULLFSYNC` on macOS). Upstream's default is `fdatasync` too.
+- A close does not sync the WAL, and a failed flush of `disableWAL` writes during close is not reported, as upstream
+  (`CancelAllBackgroundWork`: "What to do on error?").
+
+### Not expressible in the crash model
+
+- `MemoryFileSystem` makes a directory and a directory rename durable at once: the fsync of a renamed checkpoint /
+  export directory and of its parent cannot fail a test. Those were compared by reading only.
+- It drops all unsynced data of a file and nothing else. An in-place overwrite below the synced length (a recycled
+  WAL, `write_global_seqno`) survives as if synced, unsynced data never partially survives, and synced data is never
+  torn; `WriteAt` marks the whole file synced.
+- Nothing models `fsync` versus `fdatasync`, a lying device, or Windows (directory fsync is a no-op there, as in
+  upstream).
+
+Not covered by this sweep: the WritePrepared / WriteUnprepared transaction policies, the backup engine's restore,
+verify and garbage collection (under review elsewhere), tools, and `RocksDb.Managed.Replication*`.
+
+Seen once while running the suite: `AtomicReplaceRangeTests.UniversalPartialOverlapIngestsRangeTombstoneBelowNewFiles`
+failed in a full net10.0 run (level shape `0,0,0,0,1,0,1` instead of `0,0,0,0,1,1,2`) and passed in the net11.0 run and
+15 of 15 runs on its own. It asserts the level shape before `WaitForCompact` with automatic universal compactions on,
+so a background compaction can race the assertion under load. It does not use `move_files` / `link_files`, the only
+ingestion path this audit changed. Left as is (not in this audit's area).
