@@ -49,7 +49,15 @@ public sealed class ReplicationPrimary
 
     /// <summary>The WAL stream from <paramref name="startSeq"/> (a single resync message if those WALs are gone).</summary>
     public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken) =>
-        WalStreamSender.StreamAsync(_db, startSeq, Tag, static _ => 0, MaxChunkBytes, cancellationToken);
+        StreamUpdatesAsync(startSeq, WalStreamCapabilities.None, cancellationToken);
+
+    /// <summary>
+    /// The WAL stream for a replica that announced <paramref name="replicaCapabilities"/>: with
+    /// <see cref="WalStreamCapabilities.Fragments"/> a write batch larger than <see cref="MaxChunkBytes"/> is sent in
+    /// pieces (<see cref="WalStreamMessage.IsFragment"/>).
+    /// </summary>
+    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, WalStreamCapabilities replicaCapabilities, CancellationToken cancellationToken) =>
+        WalStreamSender.StreamAsync(_db, startSeq, Tag, static _ => 0, MaxChunkBytes, replicaCapabilities, null, cancellationToken);
 
     private bool Tag(out string sourceId, out long term)
     {
@@ -99,6 +107,44 @@ public interface IReplicationSourceClient
     IAsyncEnumerable<SnapshotChunk> StreamInitialStateAsync(CancellationToken cancellationToken);
     IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken);
     Task ReportProgressAsync(int replicaIndex, ulong appliedThrough, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// <see cref="StreamUpdatesAsync(ulong, CancellationToken)"/>, announcing what this replica can take
+    /// (<see cref="ReplicationPrimary.StreamUpdatesAsync(ulong, WalStreamCapabilities, CancellationToken)"/>). The default
+    /// implementation announces nothing: a transport that does not carry the announcement gets one message per chunk.
+    /// </summary>
+    IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, WalStreamCapabilities capabilities, CancellationToken cancellationToken) =>
+        StreamUpdatesAsync(startSeq, cancellationToken);
+}
+
+/// <summary>
+/// Thrown by <see cref="ReplicaFollower.FollowAsync(IReplicationSourceClient, RocksDatabase, int, ReplicaFollowerOptions, CancellationToken)"/>
+/// when the stream broke the fragment protocol (<see cref="WalAssemblyStatus.Invalid"/>). Nothing of the batch was
+/// applied. Follow again from the replica's position; if it happens again with the replica at the same
+/// <see cref="AppliedThrough"/>, the primary sends that batch wrongly every time - rebuild the replica from a snapshot
+/// (<see cref="FollowerResyncPolicy.ShouldRebuildAfterStreamFault"/> implements that rule).
+/// </summary>
+public sealed class WalStreamProtocolException(string message, ulong appliedThrough) : IOException(message)
+{
+    /// <summary>The replica's latest sequence number when the stream was dropped.</summary>
+    public ulong AppliedThrough { get; } = appliedThrough;
+}
+
+/// <summary>Options of <see cref="ReplicaFollower.FollowAsync(IReplicationSourceClient, RocksDatabase, int, ReplicaFollowerOptions, CancellationToken)"/>.</summary>
+public sealed class ReplicaFollowerOptions
+{
+    /// <summary>
+    /// The largest serialized write batch taken from the stream (<see cref="WalStreamAssembler.MaxBatchBytes"/>; default
+    /// 1 GiB). A larger one ends the stream with <see cref="ReplicationResyncRequiredException"/>: a snapshot carries
+    /// the same data as files.
+    /// </summary>
+    public int MaxBatchBytes { get; init; } = WalStreamAssembler.DefaultMaxBatchBytes;
+
+    /// <summary>
+    /// Whether the replica announces <see cref="WalStreamCapabilities.Fragments"/>, so that the primary sends a write
+    /// batch larger than its chunk size in pieces. True by default.
+    /// </summary>
+    public bool AcceptFragmentedBatches { get; init; } = true;
 }
 
 /// <summary>Thrown by <see cref="ReplicaFollower.FollowAsync"/> when the replica must be rebuilt from a snapshot.</summary>
@@ -121,18 +167,38 @@ public static class ReplicaFollower
     /// <see cref="ReplicationResyncRequiredException"/> when the primary no longer has the WAL needed or a chunk does not
     /// start at the replica's next sequence number. Returns the number of chunks applied.
     /// </summary>
-    public static async Task<long> FollowAsync(IReplicationSourceClient primary, RocksDatabase replica, int replicaIndex, CancellationToken cancellationToken)
+    public static Task<long> FollowAsync(IReplicationSourceClient primary, RocksDatabase replica, int replicaIndex, CancellationToken cancellationToken) =>
+        FollowAsync(primary, replica, replicaIndex, new ReplicaFollowerOptions(), cancellationToken);
+
+    /// <summary>
+    /// <see cref="FollowAsync(IReplicationSourceClient, RocksDatabase, int, CancellationToken)"/> with options. A write
+    /// batch the primary sends in fragments is applied (and reported) only once it is complete; one larger than
+    /// <see cref="ReplicaFollowerOptions.MaxBatchBytes"/> throws <see cref="ReplicationResyncRequiredException"/>, a
+    /// stream that breaks the fragment protocol throws <see cref="WalStreamProtocolException"/>. Whenever this method
+    /// ends, a partial batch is discarded; following again starts at the replica's latest sequence number + 1.
+    /// </summary>
+    public static async Task<long> FollowAsync(IReplicationSourceClient primary, RocksDatabase replica, int replicaIndex, ReplicaFollowerOptions options,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(primary);
         ArgumentNullException.ThrowIfNull(replica);
+        ArgumentNullException.ThrowIfNull(options);
         var consumer = new ReplicationConsumer(replica);
         await using var progress = new ProgressReporter((seq, ct) => primary.ReportProgressAsync(replicaIndex, seq, ct));
         long chunks = 0;
         ulong start = replica.GetLatestSequenceNumber() + 1;
-        await foreach (WalStreamMessage m in primary.StreamUpdatesAsync(start, cancellationToken).ConfigureAwait(false))
+        using var assembler = new WalStreamAssembler(options.MaxBatchBytes);
+        WalStreamCapabilities capabilities = options.AcceptFragmentedBatches ? WalStreamCapabilities.Fragments : WalStreamCapabilities.None;
+        await foreach (WalStreamMessage m in primary.StreamUpdatesAsync(start, capabilities, cancellationToken).ConfigureAwait(false))
         {
             if (m.ResyncRequired) throw new ReplicationResyncRequiredException("primary cannot stream from " + consumer.ExpectedNextSequence + ": " + m.Reason);
-            if (!await consumer.TryIngestChunkAsync(m.Data, cancellationToken).ConfigureAwait(false))
+            WalAssemblyStatus assembled = assembler.Accept(m, out ReadOnlyMemory<byte> chunk);
+            if (assembled == WalAssemblyStatus.Incomplete) continue;
+            if (assembled == WalAssemblyStatus.TooLarge)
+                throw new ReplicationResyncRequiredException("primary's stream cannot be followed from " + consumer.ExpectedNextSequence + ": " + assembler.LastError);
+            if (assembled == WalAssemblyStatus.Invalid)
+                throw new WalStreamProtocolException("stream from " + consumer.ExpectedNextSequence + " dropped: " + assembler.LastError, replica.GetLatestSequenceNumber());
+            if (!await consumer.TryIngestChunkAsync(chunk, cancellationToken).ConfigureAwait(false))
                 throw new ReplicationResyncRequiredException("stream mismatch: expected seq " + consumer.ExpectedNextSequence + ", got " + m.FirstSequence);
             chunks++;
             progress.Report(replica.GetLatestSequenceNumber());

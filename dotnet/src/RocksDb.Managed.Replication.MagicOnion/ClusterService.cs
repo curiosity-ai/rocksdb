@@ -34,6 +34,17 @@ public interface IClusterService : IService<IClusterService>
     /// <summary>Client write, acknowledged once committed (replicated to a quorum).</summary>
     UnaryResult<bool> WriteAsync(string key, string value);
     UnaryResult<DigestDto> ChecksumAsync();
+
+    /// <summary>
+    /// <see cref="WriteAsync"/> for a payload larger than one request should be: the key's UTF-8 bytes followed by the
+    /// value's, sent in pieces (<see cref="WriteFragmentDto"/>) and written as one log entry once the last piece
+    /// arrived - through the same host call, acknowledged once committed. Nothing is written when the upload ends
+    /// early, is malformed (InvalidArgument) or exceeds the node's limits (ResourceExhausted;
+    /// <see cref="FragmentedWriteOptions"/>). Declared last: a node built without it answers Unimplemented and the
+    /// client falls back to <see cref="WriteAsync"/>. Use
+    /// <see cref="GrpcClusterClient.WriteAsync(string, string, CancellationToken)"/>, which picks the RPC by size.
+    /// </summary>
+    Task<ClientStreamingResult<WriteFragmentDto, bool>> WriteFragmentsAsync();
 }
 
 /// <summary>Server side of <see cref="IClusterService"/>: delegates to the process's <see cref="ClusterNodeHost"/>.</summary>
@@ -69,7 +80,8 @@ public sealed class ClusterService(ClusterNodeHost host) : ServiceBase<IClusterS
         CancellationToken ct = linked.Token;
         try
         {
-            await foreach (WalStreamMessage m in host.StreamUpdatesAsync(followerId, startSeq, ct).ConfigureAwait(false))
+            WalStreamCapabilities capabilities = WalStreamCapabilityHeader.Read(Context.CallContext.RequestHeaders);
+            await foreach (WalStreamMessage m in host.StreamUpdatesAsync(followerId, startSeq, capabilities, ct).ConfigureAwait(false))
             {
                 await stream.WriteAsync(WalChunkDto.From(m)).WaitAsync(ct).ConfigureAwait(false);
             }
@@ -105,8 +117,20 @@ public sealed class ClusterService(ClusterNodeHost host) : ServiceBase<IClusterS
     public UnaryResult<string> GetRaftTermsAsync() => UnaryResult.FromResult(host.HandleGetTerms());
 
     public async UnaryResult<bool> WriteAsync(string key, string value) =>
-        await host.WriteCommittedAsync(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), TimeSpan.FromSeconds(10), Context.CallContext.CancellationToken)
-            .ConfigureAwait(false);
+        await ApplyAsync(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), Context.CallContext.CancellationToken).ConfigureAwait(false);
+
+    public async Task<ClientStreamingResult<WriteFragmentDto, bool>> WriteFragmentsAsync()
+    {
+        ClientStreamingContext<WriteFragmentDto, bool> stream = GetClientStreamingContext<WriteFragmentDto, bool>();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(Context.CallContext.CancellationToken, host.Stopping);
+        CancellationToken ct = Context.CallContext.CancellationToken;
+        return stream.Result(await FragmentedWriteReceiver.ReceiveAndApplyAsync(stream, Context.ServiceProvider, linked.Token,
+            (key, value) => ApplyAsync(key, value, ct)).ConfigureAwait(false));
+    }
+
+    /// <summary>The one way a client write reaches the host, whichever RPC carried it.</summary>
+    private ValueTask<bool> ApplyAsync(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, CancellationToken cancellationToken) =>
+        host.WriteCommittedAsync(key, value, TimeSpan.FromSeconds(10), cancellationToken);
 
     public UnaryResult<DigestDto> ChecksumAsync() => UnaryResult.FromResult(DigestDto.From(host.Checksum()));
 }
@@ -214,9 +238,15 @@ public sealed class GrpcClusterClient : IClusterNodeClient, IDisposable
         }
     }
 
-    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
+    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, CancellationToken cancellationToken) =>
+        StreamUpdatesAsync(followerId, startSeq, WalStreamCapabilities.None, cancellationToken);
+
+    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, WalStreamCapabilities capabilities,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        using ServerStreamingResult<WalChunkDto> call = await _client.WithCancellationToken(cancellationToken).SyncUpdatesAsync(followerId, startSeq);
+        using ServerStreamingResult<WalChunkDto> call = await _client
+            .WithOptions(new CallOptions(headers: WalStreamCapabilityHeader.Create(capabilities), cancellationToken: cancellationToken))
+            .SyncUpdatesAsync(followerId, startSeq);
         while (await call.ResponseStream.MoveNext(cancellationToken).ConfigureAwait(false))
         {
             yield return call.ResponseStream.Current.ToMessage();
@@ -250,6 +280,56 @@ public sealed class GrpcClusterClient : IClusterNodeClient, IDisposable
             return null;
         }
     }
+
+    /// <summary><see cref="WriteAsync(string, string, GrpcWriteOptions, CancellationToken)"/> with <see cref="GrpcWriteOptions.Default"/>.</summary>
+    public Task<bool> WriteAsync(string key, string value, CancellationToken cancellationToken) =>
+        WriteAsync(key, value, GrpcWriteOptions.Default, cancellationToken);
+
+    /// <summary>
+    /// A client write, true once committed. A payload (UTF-8 bytes of key and value) of at most
+    /// <see cref="GrpcWriteOptions.MaxChunkBytes"/> is the unary <see cref="IClusterService.WriteAsync"/>, exactly as
+    /// calling it on <see cref="Service"/>; a larger one is uploaded in pieces
+    /// (<see cref="IClusterService.WriteFragmentsAsync"/>) and written by the node as one log entry with the same
+    /// result. A node without that RPC gets the unary one; if it refuses the request for its size, this throws
+    /// <see cref="LargeWriteException"/> (<see cref="LargeWriteError.NotSupportedByServer"/>), as it does when the node
+    /// refuses the upload (too large, busy). Nothing was written then.
+    /// <para>
+    /// Retries are the caller's, as for the unary RPC, and the guarantee is the same: false, or a call that failed
+    /// without a result, may be a write that still commits, and sending it again writes it again - harmless for the
+    /// same key and value. This method sends a write a second time only after Unimplemented, which the node answers
+    /// without writing anything.
+    /// </para>
+    /// </summary>
+    public async Task<bool> WriteAsync(string key, string value, GrpcWriteOptions options, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        ArgumentNullException.ThrowIfNull(value);
+        ArgumentNullException.ThrowIfNull(options);
+        if (FragmentedWriteClient.IsSmall(key, value, options, out long bytes))
+            return await WriteCall(FragmentedWriteClient.Deadline(options, 0), cancellationToken).WriteAsync(key, value);
+        if (!_noFragmentedWrites)
+        {
+            try
+            {
+                return await FragmentedWriteClient.UploadAsync(
+                    () => WriteCall(FragmentedWriteClient.Deadline(options, bytes), cancellationToken).WriteFragmentsAsync(), key, value, bytes, options,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (RpcException e) when (e.StatusCode == Grpc.Core.StatusCode.Unimplemented)
+            {
+                // A node built before this RPC existed. It wrote nothing.
+                _noFragmentedWrites = true;
+            }
+        }
+        return await FragmentedWriteClient.UnaryToOldServerAsync(
+            () => WriteCall(FragmentedWriteClient.Deadline(options, bytes), cancellationToken).WriteAsync(key, value), bytes).ConfigureAwait(false);
+    }
+
+    // Set once the node answered Unimplemented to WriteFragmentsAsync.
+    private volatile bool _noFragmentedWrites;
+
+    private IClusterService WriteCall(DateTime deadline, CancellationToken ct) =>
+        _client.WithOptions(new CallOptions(deadline: deadline, cancellationToken: ct));
 
     public void Dispose() => _channel.Dispose();
 }

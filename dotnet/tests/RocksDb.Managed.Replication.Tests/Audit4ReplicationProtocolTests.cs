@@ -23,6 +23,13 @@ public sealed class Audit4ReplicationProtocolTests
     /// failed again - for good, while the primary went on acknowledging writes. The in-memory transport of the tests
     /// has no such limit. The channels of this library no longer limit received messages. Failed before: B never
     /// received the entry.
+    /// <para>
+    /// Since write batches larger than the chunk size are sent in fragments (Audit4ReplicationFragmentTests), a replica
+    /// of this version would no longer receive a 6 MB message here. The replica of this test therefore does not
+    /// announce fragments (<see cref="PairNodeHostOptions.AcceptFragmentedBatches"/> = false) - which is also what a
+    /// primary sees of a replica built before fragments existed - so the test still covers what it was written for: one
+    /// message above 4 MB passes the channel. The expectation is unchanged.
+    /// </para>
     /// </summary>
     [TestMethod]
     public async Task WalChunkLargerThanTheDefaultGrpcMessageLimitReachesTheReplica()
@@ -39,6 +46,7 @@ public sealed class Audit4ReplicationProtocolTests
             InitialRole = id == "A" ? ReplicationRole.Primary : ReplicationRole.Replica,
             DbOptionsFactory = static () => new DbOptions { WalTtlSeconds = 600 },
             RetryDelay = TimeSpan.FromMilliseconds(50),
+            AcceptFragmentedBatches = false,
         }, peer);
         PairNodeHost a = Host("A", toB), b = Host("B", toA);
         await using GrpcNodeServer serverA = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(a, System.Net.IPAddress.Loopback, portA, CancellationToken.None);

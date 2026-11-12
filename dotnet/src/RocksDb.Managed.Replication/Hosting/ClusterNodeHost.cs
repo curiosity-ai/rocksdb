@@ -47,6 +47,15 @@ public interface IClusterNodeClient
     Task<IReadOnlyDictionary<string, string>> GetFileHashesAsync(IReadOnlyList<ReplicationFileInfo> candidates, CancellationToken cancellationToken);
     IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(IReadOnlyList<ReplicationFileInfo> verifiedInventory, CancellationToken cancellationToken);
     Task<string?> GetTermsAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// <see cref="StreamUpdatesAsync(string, ulong, CancellationToken)"/>, announcing what this follower can take
+    /// (<see cref="ClusterNodeHost.StreamUpdatesAsync(string, ulong, WalStreamCapabilities, CancellationToken)"/>). The
+    /// default implementation announces nothing: a transport that does not carry the announcement gets one message per
+    /// chunk.
+    /// </summary>
+    IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, WalStreamCapabilities capabilities,
+        CancellationToken cancellationToken) => StreamUpdatesAsync(followerId, startSeq, cancellationToken);
 }
 
 /// <summary>Configuration of a <see cref="ClusterNodeHost"/>.</summary>
@@ -90,6 +99,23 @@ public sealed class ClusterNodeHostOptions
     /// whose consumer stopped reading holds it until its transport gives up) before it closes the database anyway.
     /// </summary>
     public TimeSpan DisposeDrainTimeout { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// The largest serialized write batch this node takes from a WAL stream while it follows
+    /// (<see cref="WalStreamAssembler.MaxBatchBytes"/>; default <see cref="WalStreamAssembler.DefaultMaxBatchBytes"/>,
+    /// 1 GiB). A follower holds a whole batch in memory before applying it, however it arrived; a batch announced
+    /// larger than this is refused before anything is allocated and the node rebuilds from a snapshot instead, which
+    /// carries the same data as files.
+    /// </summary>
+    public int MaxBatchBytes { get; init; } = WalStreamAssembler.DefaultMaxBatchBytes;
+
+    /// <summary>
+    /// Whether this node, when it follows, announces <see cref="WalStreamCapabilities.Fragments"/>: the source then
+    /// sends a write batch larger than its <c>MaxChunkBytes</c> in pieces of at most that size instead of one message
+    /// of the batch's size. True by default; false gets the stream of earlier versions (one message per chunk).
+    /// </summary>
+    public bool AcceptFragmentedBatches { get; init; } = true;
+
     public Action<string>? Log { get; init; }
 }
 
@@ -470,7 +496,16 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     }
 
     /// <summary>The WAL stream for a follower, while this node leads; it ends when leadership is lost.</summary>
-    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
+    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, CancellationToken cancellationToken) =>
+        StreamUpdatesAsync(followerId, startSeq, WalStreamCapabilities.None, cancellationToken);
+
+    /// <summary>
+    /// The WAL stream for a follower that announced <paramref name="followerCapabilities"/>: with
+    /// <see cref="WalStreamCapabilities.Fragments"/> a write batch larger than <see cref="ClusterNodeHostOptions.MaxChunkBytes"/>
+    /// is sent in pieces (<see cref="WalStreamMessage.IsFragment"/>).
+    /// </summary>
+    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, WalStreamCapabilities followerCapabilities,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         CancellationToken leadership;
         lock (_followerLock) leadership = _leadershipCts.Token;
@@ -480,7 +515,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, leadership, _cts.Token);
             Log("streaming to " + followerId + " from seq " + startSeq);
             RaftClusterNode node = _node;
-            await foreach (WalStreamMessage m in WalStreamSender.StreamAsync(_db, startSeq, Tag, node.GetTermForSeq, _cfg.MaxChunkBytes, OnWalStreamFault, cts.Token)
+            await foreach (WalStreamMessage m in WalStreamSender.StreamAsync(_db, startSeq, Tag, node.GetTermForSeq, _cfg.MaxChunkBytes, followerCapabilities, OnWalStreamFault, cts.Token)
                                .ConfigureAwait(false))
             {
                 yield return m;
@@ -618,7 +653,10 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                 await using var progress = new ProgressReporter((seq, c) =>
                     _node.CurrentTerm <= followTerm ? client.ReportProgressAsync(_cfg.NodeId, seq, followTerm, c) : Task.CompletedTask, _cfg.RetryDelay);
                 progress.Report(myLatest);
-                await foreach (WalStreamMessage m in client.StreamUpdatesAsync(_cfg.NodeId, myLatest + 1, ct).ConfigureAwait(false))
+                // Per attachment: a stream that ends or fails takes its partial batch with it.
+                using var assembler = new WalStreamAssembler(_cfg.MaxBatchBytes);
+                WalStreamCapabilities capabilities = _cfg.AcceptFragmentedBatches ? WalStreamCapabilities.Fragments : WalStreamCapabilities.None;
+                await foreach (WalStreamMessage m in client.StreamUpdatesAsync(_cfg.NodeId, myLatest + 1, capabilities, ct).ConfigureAwait(false))
                 {
                     if (m.ResyncRequired)
                     {
@@ -641,10 +679,25 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                     // comes from a different leadership of that node (it lost and regained the role in between, possibly
                     // rebuilding its log): check again before applying anything of it.
                     if (m.SourceTerm != followTerm) break;
+                    WalAssemblyStatus assembled = assembler.Accept(m, out ReadOnlyMemory<byte> chunk);
+                    if (assembled != WalAssemblyStatus.Complete)
+                    {
+                        // Nothing of an incomplete batch is applied, recorded in the term log or reported.
+                        if (assembled == WalAssemblyStatus.Incomplete) continue;
+                        ulong at = _db.GetLatestSequenceNumber();
+                        if (assembled == WalAssemblyStatus.TooLarge || _resyncPolicy.ShouldRebuildAfterStreamFault(at))
+                        {
+                            // The stream cannot get this node past the batch; a snapshot carries it as files.
+                            TriggerResync("the leader's stream cannot be followed from " + (at + 1) + ": " + assembler.LastError);
+                            return;
+                        }
+                        Log("dropping the stream from " + leaderId + " at " + (at + 1) + ": " + assembler.LastError);
+                        break;
+                    }
                     if (m.EntryTerm > 0) _state.RecordTermRange(m.FirstSequence, m.EntryTerm);
                     // A faithful replica ingests the leader's batches at exactly the same sequence numbers; a gap or an
                     // overlap diverges the copy.
-                    if (!await consumer.TryIngestChunkAsync(m.Data, ct).ConfigureAwait(false))
+                    if (!await consumer.TryIngestChunkAsync(chunk, ct).ConfigureAwait(false))
                     {
                         TriggerResync("WAL stream mismatch: expected seq " + consumer.ExpectedNextSequence + ", got " + m.FirstSequence);
                         return;

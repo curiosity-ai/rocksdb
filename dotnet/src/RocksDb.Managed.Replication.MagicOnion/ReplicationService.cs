@@ -34,7 +34,8 @@ public sealed class ReplicationService(ReplicationPrimary primary) : ServiceBase
         CancellationToken ct = Context.CallContext.CancellationToken;
         try
         {
-            await foreach (WalStreamMessage m in primary.StreamUpdatesAsync(startSeq, ct).ConfigureAwait(false))
+            WalStreamCapabilities capabilities = WalStreamCapabilityHeader.Read(Context.CallContext.RequestHeaders);
+            await foreach (WalStreamMessage m in primary.StreamUpdatesAsync(startSeq, capabilities, ct).ConfigureAwait(false))
             {
                 await stream.WriteAsync(WalChunkDto.From(m)).WaitAsync(ct).ConfigureAwait(false);
             }
@@ -65,9 +66,15 @@ public sealed class GrpcReplicationClient : IReplicationSourceClient, IDisposabl
 
     /// <param name="endpoint">The primary's address.</param>
     /// <param name="unaryTimeout">Deadline of a progress report (a report that misses it is sent again).</param>
-    public GrpcReplicationClient(string endpoint, TimeSpan unaryTimeout)
+    public GrpcReplicationClient(string endpoint, TimeSpan unaryTimeout) : this(endpoint, unaryTimeout, new GrpcChannelOptions())
     {
-        _channel = GrpcChannel.ForAddress(endpoint, GrpcTransportDefaults.CreateChannelOptions());
+    }
+
+    /// <summary>A client whose channel uses <paramref name="channelOptions"/>, completed with <see cref="GrpcTransportDefaults.Apply"/>.</summary>
+    public GrpcReplicationClient(string endpoint, TimeSpan unaryTimeout, GrpcChannelOptions channelOptions)
+    {
+        ArgumentNullException.ThrowIfNull(channelOptions);
+        _channel = GrpcChannel.ForAddress(endpoint, GrpcTransportDefaults.Apply(channelOptions));
         _client = MagicOnionClient.Create<IReplicationService>(_channel);
         _unaryTimeout = unaryTimeout;
     }
@@ -78,9 +85,15 @@ public sealed class GrpcReplicationClient : IReplicationSourceClient, IDisposabl
         while (await call.ResponseStream.MoveNext(cancellationToken).ConfigureAwait(false)) yield return call.ResponseStream.Current.ToChunk();
     }
 
-    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
+    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken) =>
+        StreamUpdatesAsync(startSeq, WalStreamCapabilities.None, cancellationToken);
+
+    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, WalStreamCapabilities capabilities,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        using ServerStreamingResult<WalChunkDto> call = await _client.WithCancellationToken(cancellationToken).SyncUpdatesAsync(startSeq);
+        using ServerStreamingResult<WalChunkDto> call = await _client
+            .WithOptions(new Grpc.Core.CallOptions(headers: WalStreamCapabilityHeader.Create(capabilities), cancellationToken: cancellationToken))
+            .SyncUpdatesAsync(startSeq);
         while (await call.ResponseStream.MoveNext(cancellationToken).ConfigureAwait(false)) yield return call.ResponseStream.Current.ToMessage();
     }
 

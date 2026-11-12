@@ -1519,7 +1519,19 @@ write gate's hold / drain order of a handoff (`HandoffPointIsTakenAfterTheAdmitt
 `RejectedEpochIsNeverPromotedByAPromoteRacingTheReject` no longer sleeps: it uses a seam of `SwitchoverNode` and
 fails on every run with the fix reverted.
 
+Large payloads (`Audit4ReplicationFragmentTests.cs`, 24 tests; README "Large write batches and large client writes"):
+
+| Where | What was wrong | Now |
+|---|---|---|
+| WAL stream (`WalStreamSender`, the hosts' follower loops) | A chunk is at least one whole write batch, so a large batch was one message of its size: unbounded, 2 GB at most, and only received at all since the channels' 4 MB limit was lifted. | A follower announces `WalStreamCapabilities.Fragments`; the source sends a batch larger than `MaxChunkBytes` as fragments (slices of the tailer's buffer) and the follower applies it once complete (`WalStreamAssembler`). The log never ends inside a batch; reports name applied batches only. A broken fragment sequence re-attaches once, then rebuilds from a snapshot; a batch above `MaxBatchBytes` (1 GiB) rebuilds at once. A follower that announced nothing gets one message per chunk, as before. |
+| `WalTailer.EnsureCapacity` | Doubled an `int` size: a chunk above 1 GiB overflowed and never left the loop. | Sized in 64 bits, capped at the array limit. |
+| Client write RPCs (`IPairService.WriteAsync`, `IClusterService.WriteAsync`) | One unary request; above the server's receive limit (4 MiB) refused with ResourceExhausted. | `GrpcPairClient.WriteAsync` / `GrpcClusterClient.WriteAsync` upload a payload above `MaxChunkBytes` through the client-streaming `WriteFragmentsAsync`; the node reassembles it (caps `MaxWriteBytes` 64 MiB, `MaxPendingBytes` 256 MiB, checked before allocating) and applies it through the same host call as the unary write. An old node answers Unimplemented and gets the unary RPC. The server's receive limit is an explicit option, default unchanged. |
+
 Design limits that remain:
+
+- Fragments bound the size of a message, not of a write: a follower holds one whole write batch in memory before it
+  applies it (up to `MaxBatchBytes`), a node one whole client write (up to `MaxWriteBytes`), each plus the engine's
+  copy while it is applied. The write RPCs carry one key and value; no RPC takes a whole `WriteBatch`.
 
 - Without `SyncWal`, an acknowledged pair write is lost when the primary loses power and the replica did not hold it,
   or cannot be reached while the primary restarts. Raft with `SyncWal = false` has the same property.

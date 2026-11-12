@@ -37,6 +37,9 @@ public sealed class ClusterHarness : IAsyncDisposable
     /// <summary>When false, obsolete WALs are deleted at once (no archive): a follower that falls behind needs a snapshot.</summary>
     public bool ArchiveWals { get; set; } = true;
 
+    /// <summary>Wraps the client a node uses for a peer (node id, peer id, client); null for none.</summary>
+    public Func<string, string, IClusterNodeClient, IClusterNodeClient>? WrapClient { get; set; }
+
     public ClusterNodeHost this[string id] => _hosts[id];
 
     public IEnumerable<ClusterNodeHost> Running => _hosts.Values;
@@ -65,7 +68,11 @@ public sealed class ClusterHarness : IAsyncDisposable
             SnapshotChunkBytes = 64 * 1024,
             RetryDelay = TimeSpan.FromMilliseconds(50),
             Log = _log.Enqueue,
-        }, m => new InMemoryClusterClient(Network, id, m.NodeId));
+        }, m =>
+        {
+            IClusterNodeClient client = new InMemoryClusterClient(Network, id, m.NodeId);
+            return WrapClient?.Invoke(id, m.NodeId, client) ?? client;
+        });
         // Registered before starting: a follower's first stream attach and the leader's first heartbeats must reach it.
         // Its handlers are only used once StartAsync has created the node (the in-memory client resolves lazily).
         await host.StartAsync(CancellationToken.None);

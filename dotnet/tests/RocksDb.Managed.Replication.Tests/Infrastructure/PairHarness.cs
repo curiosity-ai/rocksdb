@@ -43,6 +43,12 @@ public sealed class PairHarness : IAsyncDisposable
     public TimeSpan ReplicaAckTimeout { get; set; } = TimeSpan.FromSeconds(5);
     /// <summary><see cref="PairNodeHostOptions.YieldToReplicaAheadOnRestart"/> of the hosts started from now on.</summary>
     public bool YieldToReplicaAheadOnRestart { get; set; } = true;
+
+    /// <summary><see cref="PairNodeHostOptions.MaxBatchBytes"/> of the hosts started from now on.</summary>
+    public int MaxBatchBytes { get; set; } = WalStreamAssembler.DefaultMaxBatchBytes;
+
+    /// <summary><see cref="PairNodeHostOptions.AcceptFragmentedBatches"/> of the hosts started from now on.</summary>
+    public bool AcceptFragmentedBatches { get; set; } = true;
     public string DbPath(string id) => FileSystemOf is null ? _dir.Sub(id) : "/pair/" + id;
 
     /// <summary>
@@ -83,6 +89,8 @@ public sealed class PairHarness : IAsyncDisposable
             WriteAck = WriteAck,
             ReplicaAckTimeout = ReplicaAckTimeout,
             YieldToReplicaAheadOnRestart = YieldToReplicaAheadOnRestart,
+            MaxBatchBytes = MaxBatchBytes,
+            AcceptFragmentedBatches = AcceptFragmentedBatches,
             Switchover = Switchover,
             MaxChunkBytes = 16 * 1024,
             RetryDelay = TimeSpan.FromMilliseconds(50),

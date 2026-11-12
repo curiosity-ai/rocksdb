@@ -364,7 +364,7 @@ public sealed class SoakClusterService(ClusterNodeHost host, NodeContext ctx) : 
         CancellationToken ct = linked.Token;
         try
         {
-            await foreach (WalStreamMessage m in host.StreamUpdatesAsync(followerId, startSeq, ct).ConfigureAwait(false))
+            await foreach (WalStreamMessage m in host.StreamUpdatesAsync(followerId, startSeq, WalStreamCapabilityHeader.Read(Context.CallContext.RequestHeaders), ct).ConfigureAwait(false))
             {
                 await stream.WriteAsync(WalChunkDto.From(m)).WaitAsync(ct).ConfigureAwait(false);
             }
@@ -402,6 +402,15 @@ public sealed class SoakClusterService(ClusterNodeHost host, NodeContext ctx) : 
     public async UnaryResult<bool> WriteAsync(string key, string value) =>
         await host.WriteCommittedAsync(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), TimeSpan.FromSeconds(10), Context.CallContext.CancellationToken)
             .ConfigureAwait(false);
+
+    public async Task<ClientStreamingResult<WriteFragmentDto, bool>> WriteFragmentsAsync()
+    {
+        ClientStreamingContext<WriteFragmentDto, bool> stream = GetClientStreamingContext<WriteFragmentDto, bool>();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(Context.CallContext.CancellationToken, host.Stopping);
+        CancellationToken ct = Context.CallContext.CancellationToken;
+        return stream.Result(await FragmentedWriteReceiver.ReceiveAndApplyAsync(stream, Context.ServiceProvider, linked.Token,
+            (key, value) => host.WriteCommittedAsync(key, value, TimeSpan.FromSeconds(10), ct)).ConfigureAwait(false));
+    }
 
     public UnaryResult<DigestDto> ChecksumAsync() => UnaryResult.FromResult(DigestDto.From(host.Checksum()));
 }

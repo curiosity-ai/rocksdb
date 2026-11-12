@@ -18,8 +18,12 @@ namespace RocksDb.Managed.Replication.MagicOnion;
 /// <item>HTTP/2 keep-alive pings, also while no call is active. A replica reading a WAL stream sends nothing, so
 /// without pings it never learns that the primary is gone and waits on the dead connection for good; a server writing
 /// to a vanished replica keeps the stream's handler (and the database it uses) until the host stops.</item>
-/// <item>No limit on the size of a received message. gRPC's default of 4 MB is below what one write batch may hold:
-/// a WAL chunk is at least one whole batch, and a replica that cannot receive it retries the same chunk forever.</item>
+/// <item>No limit on the size of a message a channel receives. gRPC's default of 4 MB is below what one write batch
+/// may hold. A source of this version sends a batch larger than its chunk size in fragments to a follower that asked
+/// for them (<see cref="Hosting.WalStreamCapabilities.Fragments"/>), so no message exceeds the chunk size; but a source
+/// built before that - and a follower configured not to ask - still gets a chunk as one message, at least one whole
+/// batch, and a replica that cannot receive it retries the same chunk forever. The limit therefore stays lifted on
+/// channels. Servers keep gRPC's default (<see cref="GrpcNodeServerOptions.MaxReceiveMessageSize"/>).</item>
 /// </list>
 /// </summary>
 public static class GrpcTransportDefaults
@@ -62,6 +66,26 @@ public static class GrpcTransportDefaults
     private const int DefaultMaxReceiveMessageSize = 4 * 1024 * 1024;
 }
 
+/// <summary>Settings of a <see cref="GrpcNodeServer"/>.</summary>
+public sealed class GrpcNodeServerOptions
+{
+    /// <summary>gRPC's own default for the largest message a server receives: 4 MiB.</summary>
+    public const int DefaultMaxReceiveMessageSize = 4 * 1024 * 1024;
+
+    /// <summary>
+    /// The largest request message the server accepts (a larger one is refused with ResourceExhausted before the
+    /// service sees it); null for no limit. The default is gRPC's, 4 MiB, unchanged: nothing this library sends to a
+    /// server needs more - a client write above a chunk arrives in pieces (<c>WriteFragmentsAsync</c>,
+    /// <see cref="FragmentedWrites"/>) - and the limit is what bounds the memory one request of any client can take.
+    /// Raise it only for clients that cannot fragment (ones built before <c>WriteFragmentsAsync</c> sending large
+    /// unary writes).
+    /// </summary>
+    public int? MaxReceiveMessageSize { get; init; } = DefaultMaxReceiveMessageSize;
+
+    /// <summary>The limits of large client writes received in pieces.</summary>
+    public FragmentedWriteOptions FragmentedWrites { get; init; } = new();
+}
+
 /// <summary>
 /// A Kestrel (HTTP/2, plaintext, loopback by default) server exposing one MagicOnion service backed by a singleton -
 /// the StartServerAsync of rocksdb-sharp's sample hosts. Port 0 picks a free port; <see cref="Endpoint"/> is the bound
@@ -71,26 +95,40 @@ public sealed class GrpcNodeServer : IAsyncDisposable
 {
     private readonly WebApplication _app;
 
-    private GrpcNodeServer(WebApplication app, string endpoint)
+    private GrpcNodeServer(WebApplication app, string endpoint, FragmentedWriteBudget fragmentedWrites)
     {
         _app = app;
         Endpoint = endpoint;
+        FragmentedWrites = fragmentedWrites;
     }
+
+    /// <summary>The large client writes this server is receiving (<see cref="GrpcNodeServerOptions.FragmentedWrites"/>).</summary>
+    public FragmentedWriteBudget FragmentedWrites { get; }
 
     /// <summary>The bound address, e.g. "http://127.0.0.1:51234".</summary>
     public string Endpoint { get; }
 
     /// <summary>Starts a server for <typeparamref name="TService"/> whose constructor receives <paramref name="backend"/>.</summary>
-    public static async Task<GrpcNodeServer> StartAsync<TService, TBackend>(TBackend backend, IPAddress address, int port, CancellationToken cancellationToken)
+    public static Task<GrpcNodeServer> StartAsync<TService, TBackend>(TBackend backend, IPAddress address, int port, CancellationToken cancellationToken)
+        where TService : class, IServiceMarker
+        where TBackend : class =>
+        StartAsync<TService, TBackend>(backend, address, port, new GrpcNodeServerOptions(), cancellationToken);
+
+    /// <summary>Starts a server for <typeparamref name="TService"/> with <paramref name="options"/>.</summary>
+    public static async Task<GrpcNodeServer> StartAsync<TService, TBackend>(TBackend backend, IPAddress address, int port, GrpcNodeServerOptions options,
+        CancellationToken cancellationToken)
         where TService : class, IServiceMarker
         where TBackend : class
     {
         ArgumentNullException.ThrowIfNull(backend);
         ArgumentNullException.ThrowIfNull(address);
+        ArgumentNullException.ThrowIfNull(options);
+        var fragmentedWrites = new FragmentedWriteBudget(options.FragmentedWrites);
         WebApplicationBuilder builder = WebApplication.CreateSlimBuilder();
-        builder.Services.AddGrpc();
+        builder.Services.AddGrpc(o => o.MaxReceiveMessageSize = options.MaxReceiveMessageSize);
         builder.Services.AddMagicOnion();
         builder.Services.AddSingleton(backend);
+        builder.Services.AddSingleton(fragmentedWrites);
         builder.Logging.ClearProviders();
         builder.WebHost.ConfigureKestrel(o =>
         {
@@ -103,7 +141,7 @@ public sealed class GrpcNodeServer : IAsyncDisposable
         app.MapMagicOnionService<TService>();
         await app.StartAsync(cancellationToken).ConfigureAwait(false);
         string bound = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.First();
-        return new GrpcNodeServer(app, bound.Replace("[::]", "127.0.0.1", StringComparison.Ordinal));
+        return new GrpcNodeServer(app, bound.Replace("[::]", "127.0.0.1", StringComparison.Ordinal), fragmentedWrites);
     }
 
     /// <summary>

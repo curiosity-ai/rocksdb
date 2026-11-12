@@ -25,6 +25,14 @@ public interface IPairNodeClient : ISwitchoverPeer
     /// <see cref="PairWriteAck.Replica"/> (writes end as <see cref="PairWriteStatus.NotReplicated"/>).
     /// </summary>
     Task ReportProgressAsync(ulong appliedThrough, long epochAtApplied, CancellationToken cancellationToken) => Task.CompletedTask;
+
+    /// <summary>
+    /// <see cref="StreamUpdatesAsync(ulong, CancellationToken)"/>, announcing what this replica can take
+    /// (<see cref="PairNodeHost.StreamUpdatesAsync(ulong, WalStreamCapabilities, CancellationToken)"/>). The default
+    /// implementation announces nothing: a transport that does not carry the announcement gets one message per chunk.
+    /// </summary>
+    IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, WalStreamCapabilities capabilities, CancellationToken cancellationToken) =>
+        StreamUpdatesAsync(startSeq, cancellationToken);
 }
 
 /// <summary>When <see cref="PairNodeHost.WriteAsync"/> acknowledges a write (<see cref="PairNodeHostOptions.WriteAck"/>).</summary>
@@ -110,6 +118,22 @@ public sealed class PairNodeHostOptions
     /// during the restart is rebuilt later. Never needed with <see cref="SyncWal"/> (the replica is never ahead).
     /// </summary>
     public bool YieldToReplicaAheadOnRestart { get; init; } = true;
+
+    /// <summary>
+    /// The largest serialized write batch this node takes from a WAL stream while it follows
+    /// (<see cref="WalStreamAssembler.MaxBatchBytes"/>; default <see cref="WalStreamAssembler.DefaultMaxBatchBytes"/>,
+    /// 1 GiB). A follower holds a whole batch in memory before applying it, however it arrived; a batch announced
+    /// larger than this is refused before anything is allocated and the node rebuilds from a snapshot instead, which
+    /// carries the same data as files.
+    /// </summary>
+    public int MaxBatchBytes { get; init; } = WalStreamAssembler.DefaultMaxBatchBytes;
+
+    /// <summary>
+    /// Whether this node, when it follows, announces <see cref="WalStreamCapabilities.Fragments"/>: the source then
+    /// sends a write batch larger than its <c>MaxChunkBytes</c> in pieces of at most that size instead of one message
+    /// of the batch's size. True by default; false gets the stream of earlier versions (one message per chunk).
+    /// </summary>
+    public bool AcceptFragmentedBatches { get; init; } = true;
 
     public Action<string>? Log { get; init; }
 }
@@ -510,7 +534,16 @@ public sealed class PairNodeHost : IAsyncDisposable
     public string HandleGetEpochs() => _node.SerializeEpochs();
 
     /// <summary>The WAL stream for the replica while this node is primary (or handing off).</summary>
-    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
+    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken) =>
+        StreamUpdatesAsync(startSeq, WalStreamCapabilities.None, cancellationToken);
+
+    /// <summary>
+    /// The WAL stream for a replica that announced <paramref name="replicaCapabilities"/>: with
+    /// <see cref="WalStreamCapabilities.Fragments"/> a write batch larger than <see cref="PairNodeHostOptions.MaxChunkBytes"/>
+    /// is sent in pieces (<see cref="WalStreamMessage.IsFragment"/>).
+    /// </summary>
+    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, WalStreamCapabilities replicaCapabilities,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         CancellationToken primary;
         lock (_followerLock) primary = _primaryCts.Token;
@@ -519,7 +552,7 @@ public sealed class PairNodeHost : IAsyncDisposable
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token, primary);
             SwitchoverNode node = _node;
-            await foreach (WalStreamMessage m in WalStreamSender.StreamAsync(_db, startSeq, Tag, node.GetEpochForSeq, _cfg.MaxChunkBytes, OnWalStreamFault, cts.Token)
+            await foreach (WalStreamMessage m in WalStreamSender.StreamAsync(_db, startSeq, Tag, node.GetEpochForSeq, _cfg.MaxChunkBytes, replicaCapabilities, OnWalStreamFault, cts.Token)
                                .ConfigureAwait(false))
             {
                 yield return m;
@@ -662,7 +695,10 @@ public sealed class PairNodeHost : IAsyncDisposable
                     ? new ProgressReporter((seq, c) => _peer.ReportProgressAsync(seq, _node.GetEpochForSeq(seq), c), _cfg.RetryDelay)
                     : null;
                 progress?.Report(latest);
-                await foreach (WalStreamMessage m in _peer.StreamUpdatesAsync(latest + 1, ct).ConfigureAwait(false))
+                // Per attachment: a stream that ends or fails takes its partial batch with it.
+                using var assembler = new WalStreamAssembler(_cfg.MaxBatchBytes);
+                WalStreamCapabilities capabilities = _cfg.AcceptFragmentedBatches ? WalStreamCapabilities.Fragments : WalStreamCapabilities.None;
+                await foreach (WalStreamMessage m in _peer.StreamUpdatesAsync(latest + 1, capabilities, ct).ConfigureAwait(false))
                 {
                     if (m.ResyncRequired)
                     {
@@ -691,13 +727,28 @@ public sealed class PairNodeHost : IAsyncDisposable
                         if (epochs != null) _state.MergeEpochs(epochs);
                         seenEpoch = m.SourceTerm;
                     }
+                    WalAssemblyStatus assembled = assembler.Accept(m, out ReadOnlyMemory<byte> chunk);
+                    if (assembled != WalAssemblyStatus.Complete)
+                    {
+                        // Nothing of an incomplete batch is applied or reported.
+                        if (assembled == WalAssemblyStatus.Incomplete) continue;
+                        ulong at = _db.GetLatestSequenceNumber();
+                        if (assembled == WalAssemblyStatus.TooLarge || _resyncPolicy.ShouldRebuildAfterStreamFault(at))
+                        {
+                            // The stream cannot get this node past the batch; a snapshot carries it as files.
+                            TriggerResync(_cfg.PeerId + "'s stream cannot be followed from " + (at + 1) + ": " + assembler.LastError);
+                            return;
+                        }
+                        Log("dropping the stream from " + _cfg.PeerId + " at " + (at + 1) + ": " + assembler.LastError);
+                        break;
+                    }
                     await _ingestLock.WaitAsync(ct).ConfigureAwait(false);
                     try
                     {
                         if (ct.IsCancellationRequested) return;
                         // A replica applies the primary's entries at exactly the same sequence numbers - which is what
                         // lets it take over at the handoff point. Anything else diverges.
-                        if (!await consumer.TryIngestChunkAsync(m.Data, CancellationToken.None).ConfigureAwait(false))
+                        if (!await consumer.TryIngestChunkAsync(chunk, CancellationToken.None).ConfigureAwait(false))
                         {
                             TriggerResync("stream mismatch: expected seq " + consumer.ExpectedNextSequence + ", got " + m.FirstSequence);
                             return;

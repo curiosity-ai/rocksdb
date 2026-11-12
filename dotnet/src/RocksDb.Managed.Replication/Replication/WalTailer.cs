@@ -118,6 +118,15 @@ public sealed class WalTailer : IDisposable
 
     private bool _includeBatchContainingStart;
 
+    /// <summary>
+    /// How a write batch that does not fit into the rest of a chunk is handled. False (default): it is added anyway, so
+    /// a chunk overshoots the chunk size by at most one batch (of any size). True: the chunk ends before it, so a chunk
+    /// is larger than the chunk size only when it is one single write batch that is larger on its own - what a
+    /// transport that sends such a batch in pieces relies on (<see cref="Hosting.WalStreamSender"/>). Either way a chunk
+    /// holds whole batches. May be changed between reads.
+    /// </summary>
+    public bool StrictChunkLimit { get; set; }
+
     /// <summary>True when the database holds sequence numbers this tailer has not read yet.</summary>
     public bool HasUpdates => _nextSequenceNumber <= _db.GetLatestSequenceNumber();
 
@@ -133,7 +142,7 @@ public sealed class WalTailer : IDisposable
 
     /// <summary>
     /// Reads the run of write batches available now, up to the chunk size (a chunk overshoots it by at most one WAL
-    /// batch). Returns false when there is nothing newer; then await <see cref="WaitForUpdatesAsync"/>.
+    /// batch, see <see cref="StrictChunkLimit"/>). Returns false when there is nothing newer; then await <see cref="WaitForUpdatesAsync"/>.
     /// </summary>
     public bool TryReadChunk(out WalChunk chunk)
     {
@@ -185,7 +194,9 @@ public sealed class WalTailer : IDisposable
                     }
                 }
                 ReadOnlySpan<byte> body = batch.Span[HeaderSize..];
-                EnsureCapacity(length + body.Length);
+                // Left for the next chunk (the iterator stays on it).
+                if (StrictChunkLimit && entryCount > 0 && (long)length + body.Length > _maxChunkBytes) break;
+                EnsureCapacity((long)length + body.Length);
                 body.CopyTo(_buffer.AsSpan(length));
                 if (entryCount == 0) firstSequenceNumber = batchSeq;
                 length += body.Length;
@@ -272,12 +283,15 @@ public sealed class WalTailer : IDisposable
         _db.GetSortedWalFiles();
     }
 
-    private void EnsureCapacity(int length)
+    private void EnsureCapacity(long length)
     {
         if (_buffer.Length >= length) return;
-        int size = _buffer.Length;
+        // A serialized write batch is one array.
+        if (length > Array.MaxLength)
+            throw new RocksDbException(StatusCode.InvalidArgument, "Invalid argument: a WAL chunk of " + length + " bytes does not fit into one buffer");
+        long size = Math.Max(_buffer.Length, 1);
         while (size < length) size *= 2;
-        byte[] bigger = RocksArrayPool<byte>.Shared.Rent(size);
+        byte[] bigger = RocksArrayPool<byte>.Shared.Rent((int)Math.Min(size, Array.MaxLength));
         _buffer.AsSpan().CopyTo(bigger);
         RocksArrayPool<byte>.Shared.Return(_buffer);
         _buffer = bigger;
