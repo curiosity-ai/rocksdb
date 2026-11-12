@@ -209,7 +209,22 @@ internal sealed class VersionSet : IAsyncDisposable
             foreach (BlobFileState b in blobFiles) baseList.Add(new Blob.BlobFileMetaData(b.Addition, b.GarbageBlobCount, b.GarbageBlobBytes, []));
             blobs = Blob.BlobFileMetaData.Build(baseList, null, files ?? []);
         }
-        AccumulatedFileStats? stats = updateStats && files is not null ? LoadFileStats(cfd, files, default) : null;
+        AccumulatedFileStats? stats = null;
+        if (updateStats && files is not null)
+        {
+            // DB open: upstream has opened these tables already (VersionEditHandler::LoadTables with
+            // prefetch_index_and_filter_in_cache = false), so UpdateAccumulatedStats finds them open. Here the stats
+            // load is what opens them first, with the same setting.
+            cfd.TableCache.InitialLoad = true;
+            try
+            {
+                stats = LoadFileStats(cfd, files, default);
+            }
+            finally
+            {
+                cfd.TableCache.InitialLoad = false;
+            }
+        }
         var context = new VersionBuildContext
         {
             CompactCursors = compactCursors,

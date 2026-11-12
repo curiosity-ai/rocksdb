@@ -18,6 +18,8 @@ internal sealed class IndexCursor
     private readonly BlockIter _part = new();
     private BlockRef _topRef;
     private BlockRef _partRef;
+    /// <summary>Offset of the partition behind <see cref="_partRef"/> (prev_block_offset_ of PartitionedIndexIterator).</summary>
+    private ulong _partOffset;
     private bool _partitioned;
     private TableReadFlags _flags;
     // User-defined index routing (IndexFactoryReaderWrapper / IndexFactoryIteratorWrapper,
@@ -206,10 +208,17 @@ internal sealed class IndexCursor
         }
     }
 
+    /// <summary>
+    /// PartitionedIndexIterator::InitPartitionedIndexBlock: loads the partition the top level points to, unless it is
+    /// the one already loaded (no second lookup for a move that stays in the same partition).
+    /// </summary>
     private void LoadPartition()
     {
+        BlockHandle handle = _top.BlockHandle;
+        if (!_partRef.IsEmpty && handle.Offset == _partOffset) return;
         UnloadPartition();
-        _partRef = _reader.GetBlockRef(_top.BlockHandle, BlockKind.Index, _flags);
+        _partRef = _reader.GetIndexPartitionRef(handle, _flags);
+        _partOffset = handle.Offset;
         _reader.InitIndexIter(_part, _partRef.Block!, isPartition: true);
     }
 
@@ -284,8 +293,16 @@ internal sealed class IndexCursor
             UnloadPartition();
             return ValueTask.CompletedTask;
         }
+        BlockHandle handle = _top.BlockHandle;
+        if (!_partRef.IsEmpty && handle.Offset == _partOffset)
+        {
+            // InitPartitionedIndexBlock: the partition is already loaded.
+            PositionInLoadedPartition(op, target);
+            return SkipEmptyAsync(op != PartOp.Last, ct);
+        }
         UnloadPartition();
-        ValueTask<BlockRef> pending = _reader.GetBlockRefAsync(_top.BlockHandle, BlockKind.Index, _flags, ct);
+        _partOffset = handle.Offset;
+        ValueTask<BlockRef> pending = _reader.GetIndexPartitionRefAsync(handle, _flags, ct);
         if (!pending.IsCompletedSuccessfully) return LoadPartitionSlowAsync(pending, op, target, ct);
         PositionInPartition(pending.Result, op, target);
         return SkipEmptyAsync(op != PartOp.Last, ct);
@@ -302,6 +319,11 @@ internal sealed class IndexCursor
     {
         _partRef = partition;
         _reader.InitIndexIter(_part, _partRef.Block!, isPartition: true);
+        PositionInLoadedPartition(op, target);
+    }
+
+    private void PositionInLoadedPartition(PartOp op, ReadOnlyMemory<byte> target)
+    {
         switch (op)
         {
             case PartOp.Seek: _part.Seek(target.Span); break;

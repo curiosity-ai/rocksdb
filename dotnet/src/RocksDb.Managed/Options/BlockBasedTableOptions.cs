@@ -215,9 +215,9 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
 
     /// <summary>
     /// metadata_cache_options: per-tier pinning of metadata blocks in the block cache (MetadataCacheOptions,
-    /// include/rocksdb/table.h). Typed and persisted; the managed reader pins by
-    /// <see cref="PinL0FilterAndIndexBlocksInCache"/> / <see cref="PinTopLevelIndexAndFilter"/> (the kFallback behaviour)
-    /// whatever the tiers say (listed under "Not ported yet").
+    /// include/rocksdb/table.h). kFallback tiers follow <see cref="PinL0FilterAndIndexBlocksInCache"/> (unpartitioned
+    /// blocks and partitions) and <see cref="PinTopLevelIndexAndFilter"/> (top-level index of partitioned metadata),
+    /// as in BlockBasedTable::PrefetchIndexAndFilterBlocks.
     /// </summary>
     public MetadataCacheOptions MetadataCacheOptions { get; set; } = new();
 

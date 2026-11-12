@@ -1842,3 +1842,77 @@ with its predecessor, so it is a speed reference only.
 
 An earlier batch of 14 processes had the audit tree at +2.9% (forward), +0.7% (reverse) and -17.5% (TryGet). The
 lookups are faster since the audit for reasons outside the block decoder (not investigated).
+
+## Block cache pinning of index / filter blocks: read path with default options unchanged (2026-11-12)
+
+Audit #4 ported the pinning of the index and filter blocks in the block cache (`metadata_cache_options`,
+`Table/BlockBasedTableReader.MetadataPinning.cs`, docs/validation.md). With the defaults
+(`cache_index_and_filter_blocks = false`, binary search index, full filter) the reader owns its index and filter as
+before and `Get` / `Seek` take the same path: the owned and the pinned blocks sit in the same fields
+(`_indexBlock`, `_filter`), so a pinned block costs no lookup and no extra branch either.
+
+Base = `6cf5bbc` (the tree before the pinning work) in a second worktree, net10.0, Release, BenchmarkDotNet, shared
+4-vCPU VM with another agent building and testing at the same time: the same binary moves by up to 10% between runs
+(e.g. base `Table: Get (cached blocks)` 712 / 805 / 807 ns in three runs), so differences below that are noise.
+"Allocated" is `-` on every row of both trees, except `ManagedSeekForPrevPrev100Async` (72 B on both).
+
+`TableBenchmarks` and `TableMetadataCacheBenchmarks` (new; ZSTD table with a compression dictionary and a bloom
+filter, all blocks cached, HyperClockCache; Owned = `cache_index_and_filter_blocks` off, Cached = on and unpinned,
+CachedPinned = on with `unpartitioned_pinning = kAll`): three alternated runs per tree (new, base, new, base, ...),
+`--iterationCount 12 --warmupCount 6`, median of the three means, ns.
+
+| benchmark | base | new | diff |
+|---|---:|---:|---:|
+| Table: Get (cached blocks) | 805.0 | 780.8 | -3.0% |
+| Table: Get (cached, legacy IBlockCache seam) | 651.1 | 687.4 | +5.6% |
+| Index: Seek (top-level index, ~3k entries) | 172.1 | 182.8 | +6.2% |
+| Table: Get (block read+checksum per op) | 952.0 | 896.6 | -5.8% |
+| Table: Seek + 100 x Next (cached) | 3,530.0 | 3,624.6 | +2.7% |
+| Dict table: Get, Owned | 807.1 | 845.7 | +4.8% |
+| Dict table: Seek + 100 x Next, Owned | 3,448.8 | 3,464.8 | +0.5% |
+| Dict table: Get, Cached | 980.2 | 937.6 | -4.3% |
+| Dict table: Seek + 100 x Next, Cached | 3,602.6 | 3,655.3 | +1.5% |
+| Dict table: Get, CachedPinned | 875.0 | 876.3 | +0.1% |
+| Dict table: Seek + 100 x Next, CachedPinned | 3,423.0 | 3,489.9 | +2.0% |
+
+The per-run ranges of the two trees overlap on every row (legacy seam: base 645-701, new 646-712; Dict Get Owned:
+base 804-903, new 812-913). `Index: Seek` runs `BlockIter.Seek` on the owned index block, code the change does not
+touch (base 170 / 172 / 201, new 181 / 183 / 183). On the base tree CachedPinned is the same configuration as Cached
+(it never pinned an unpartitioned index or a full filter); on the new tree it reads like Owned. An unpinned cached
+index and filter cost one block cache lookup each per Get, as in native.
+
+`IteratorBenchmarks`, `DbGetBenchmarks` and `TableConcurrentGetBenchmarks`, default job, one run per tree (the
+`--job short` runs before them disagreed with each other by up to 40% in both directions, native rows included), ns.
+
+| benchmark | base | new | diff |
+|---|---:|---:|---:|
+| DB Get, memtable | 571.7 | 606.4 | +6.1% |
+| DB Get, SST cached | 1,097.6 | 1,027.7 | -6.4% |
+| DB Get, miss (filter) | 142.4 | 106.3 | -25.4% |
+| DB Get, SST uncached | 1,749.6 | 1,725.7 | -1.4% |
+| Table Get, 4 threads, HyperClock | 309.4 | 310.0 | +0.2% |
+| Table Get, 4 threads, LRU | 407.0 | 386.3 | -5.1% |
+| Table Get, 4 threads, legacy dictionary cache | 413.2 | 435.8 | +5.5% |
+| ManagedFullScan, 100 B (per key) | 97.20 | 93.82 | -3.5% |
+| ManagedForeachScan, 100 B | 99.01 | 101.83 | +2.8% |
+| ManagedAsyncScan, 100 B | 120.09 | 113.14 | -5.8% |
+| ManagedReverseScan, 100 B | 174.20 | 167.15 | -4.0% |
+| ManagedAsyncReverseScan, 100 B | 182.84 | 167.93 | -8.2% |
+| ManagedSeekForPrevPrev100, 100 B | 26,663 | 23,231 | -12.9% |
+| ManagedSeekForPrevPrev100Async, 100 B | 25,993 | 22,497 | -13.4% |
+| ManagedSeekNext100, 100 B | 14,523 | 13,036 | -10.2% |
+| ManagedFullScan, 1 KiB | 272.79 | 269.19 | -1.3% |
+| ManagedForeachScan, 1 KiB | 269.91 | 282.52 | +4.7% |
+| ManagedAsyncScan, 1 KiB | 346.85 | 374.68 | +8.0% |
+| ManagedReverseScan, 1 KiB | 483.12 | 457.86 | -5.2% |
+| ManagedAsyncReverseScan, 1 KiB | 384.11 | 363.27 | -5.4% |
+| ManagedSeekForPrevPrev100, 1 KiB | 57,163 | 54,476 | -4.7% |
+| ManagedSeekForPrevPrev100Async, 1 KiB | 51,746 | 46,836 | -9.5% |
+| ManagedSeekNext100, 1 KiB | 37,463 | 34,201 | -8.7% |
+
+The rows that are slower on the new tree are not on a path the change touches (memtable Get) or were faster in the
+short run of the same pair (`ManagedAsyncScan` 1 KiB: 399.9 base, 343.5 new; legacy dictionary cache within one
+standard deviation, 31 ns). No regression is confirmed; nothing was changed for performance.
+
+`TableBenchmarks.BlockSeek` indexed its key array with a signed counter that wraps on a long run (the default job
+threw IndexOutOfRangeException once); the index is unsigned now.

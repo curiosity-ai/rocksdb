@@ -494,8 +494,11 @@ internal sealed partial class DbImpl
             int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadFlushMicros);
             try
             {
-                using (cfd.TableCache.GetReader(meta))
+                using (TableReaderLease lease = cfd.TableCache.GetReader(meta))
+                using (lease.Reader.NewInternalIterator(Table.TableReadFlags.None, null, null))
                 {
+                    // The iterator is only created, as upstream: with the index in the block cache unpinned that is
+                    // one index lookup (BlockBasedTable::NewIterator -> NewIndexIterator -> GetOrReadIndexBlock).
                 }
             }
             finally

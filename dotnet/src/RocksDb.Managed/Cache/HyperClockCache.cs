@@ -291,6 +291,9 @@ internal sealed class ClockSlot : CacheEntry
     internal readonly ClockShard Shard;
     internal readonly bool Standalone;
 
+    // BaseClockTable::Insert returns Status::OkOverwritten for every insert that ended as a standalone entry.
+    internal override bool InsertedRedundantly => Standalone;
+
     internal ClockSlot(ClockShard shard, bool standalone)
     {
         Shard = shard;

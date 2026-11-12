@@ -131,6 +131,14 @@ internal abstract class CacheEntry
         (obj as IDisposable)?.Dispose();
     }
 
+    /// <summary>
+    /// True when the insert that created this entry reported Status::OkOverwritten (counted as a "redundant" block cache
+    /// insertion, BLOCK_CACHE_*_ADD_REDUNDANT): for <see cref="LruCache"/> the insert replaced an entry with the same
+    /// key, for <see cref="HyperClockCache"/> the entry did not go into the table (a standalone entry, because the key
+    /// was already present or the table had no room). Only meaningful on the handle an insert returned.
+    /// </summary>
+    internal virtual bool InsertedRedundantly => false;
+
     internal abstract void Release(int generation, bool eraseIfLastRef);
 
     internal abstract void AddRef(int generation);
@@ -203,6 +211,12 @@ public struct CachedBlock : IDisposable
     internal readonly CacheValue GetValue() => EntryOrThrow().GetValue();
 
     internal readonly CacheEntry? Entry => _entry;
+
+    /// <summary>
+    /// For the handle an insert returned: the insert was redundant (Cache::Insert returned Status::OkOverwritten). See
+    /// <see cref="CacheEntry.InsertedRedundantly"/>. Costs no lookup: the cache recorded it while inserting.
+    /// </summary>
+    internal readonly bool InsertedRedundantly => _entry is { } e && e.InsertedRedundantly;
 
     /// <summary>Takes an additional, independent reference (Cache::Ref). The returned handle must be released too.</summary>
     public readonly CachedBlock AddRef()

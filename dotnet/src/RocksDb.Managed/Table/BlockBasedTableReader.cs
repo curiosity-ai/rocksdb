@@ -49,10 +49,12 @@ public sealed record TableReaderOptions
     /// </summary>
     public IBlockCache BlockCache { get; init; } = NoBlockCache.Instance;
     /// <summary>
-    /// cache_index_and_filter_blocks: with a <see cref="Cache.BlockCache"/>, the top-level index block and the full
-    /// filter are kept in the block cache (inserted at open, looked up on each access and re-read after eviction)
-    /// instead of being pinned by the reader. Ignored without a <see cref="Cache.BlockCache"/> (as upstream, where
-    /// the table reader then owns them).
+    /// cache_index_and_filter_blocks: with a <see cref="Cache.BlockCache"/>, the (top-level) index block, the full
+    /// filter (or the top-level index of a partitioned filter) and the compression dictionary are block cache entries
+    /// instead of memory owned by the reader. Each is either pinned (the reader holds the cache entry for its
+    /// lifetime and uses it without a lookup) or not (looked up in the block cache on each use and re-read after
+    /// eviction), as decided by <see cref="UnpartitionedPinning"/> / <see cref="TopLevelIndexPinning"/> and their
+    /// fallbacks. Ignored without a <see cref="Cache.BlockCache"/> (as upstream, where the table reader then owns them).
     /// </summary>
     public bool CacheIndexAndFilterBlocks { get; init; }
     /// <summary>
@@ -67,8 +69,8 @@ public sealed record TableReaderOptions
     /// </summary>
     public string? DbSessionId { get; init; }
     /// <summary>
-    /// pin_top_level_index_and_filter: with <see cref="CacheIndexAndFilterBlocks"/>, the top-level block of a partitioned
-    /// index or filter is inserted into the block cache and also pinned by the reader for its lifetime. Default true.
+    /// pin_top_level_index_and_filter: the fallback of <see cref="TopLevelIndexPinning"/> (kAll when set, kNone
+    /// otherwise). Default true.
     /// </summary>
     public bool PinTopLevelIndexAndFilter { get; init; } = true;
     /// <summary>
@@ -117,17 +119,38 @@ public sealed record TableReaderOptions
     public ulong NumFileReadsForAutoReadahead { get; init; } = 2;
 
     /// <summary>
-    /// pin_l0_filter_and_index_blocks_in_cache: the fallback of <see cref="UnpartitionedPinning"/> (kFlushedAndSimilar
-    /// when set, kNone otherwise). Applied to the compression dictionary block (BlockBasedTable::PrefetchIndexAndFilterBlocks).
+    /// pin_l0_filter_and_index_blocks_in_cache: the fallback of <see cref="UnpartitionedPinning"/> and
+    /// <see cref="PartitionPinning"/> (kFlushedAndSimilar when set, kNone otherwise; BlockBasedTable::PrefetchIndexAndFilterBlocks).
     /// </summary>
     public bool PinL0FilterAndIndexBlocksInCache { get; init; }
     /// <summary>
-    /// metadata_cache_options.unpartitioned_pinning: which tables keep their unpartitioned metadata blocks pinned while
-    /// those live in the block cache (<see cref="CacheIndexAndFilterBlocks"/>). Applied to the compression dictionary
-    /// block: a pinned dictionary is looked up once at open and held for the reader's lifetime; an unpinned one is
-    /// looked up in the block cache for every data block retrieval and re-read after eviction.
+    /// metadata_cache_options.unpartitioned_pinning: which tables keep their unpartitioned metadata blocks (the index
+    /// of a binary-search / hash index, the full filter, the compression dictionary) pinned while those live in the
+    /// block cache (<see cref="CacheIndexAndFilterBlocks"/>). A pinned block is looked up once at open and held for
+    /// the reader's lifetime; an unpinned one is looked up in the block cache on each use (the index per Get / Seek,
+    /// the filter per filter probe, the dictionary per data block retrieval) and re-read after eviction.
     /// </summary>
     public PinningTier UnpartitionedPinning { get; init; } = PinningTier.Fallback;
+    /// <summary>
+    /// metadata_cache_options.top_level_index_pinning: which tables keep the top-level block of a partitioned index
+    /// or partitioned filter pinned while it lives in the block cache (<see cref="CacheIndexAndFilterBlocks"/>).
+    /// kFallback follows <see cref="PinTopLevelIndexAndFilter"/>.
+    /// </summary>
+    public PinningTier TopLevelIndexPinning { get; init; } = PinningTier.Fallback;
+    /// <summary>
+    /// metadata_cache_options.partition_pinning: which tables keep their index and filter partitions pinned. The
+    /// partitions always live in the block cache (whatever <see cref="CacheIndexAndFilterBlocks"/> says); pinned ones
+    /// are held for the reader's lifetime and used without a lookup. kFallback follows
+    /// <see cref="PinL0FilterAndIndexBlocksInCache"/>.
+    /// </summary>
+    public PinningTier PartitionPinning { get; init; } = PinningTier.Fallback;
+    /// <summary>
+    /// prefetch_index_and_filter_in_cache of BlockBasedTable::Open (prefetch_all): at open, the metadata blocks that
+    /// live in the block cache are looked up there and read and inserted on a miss, and the index / filter partitions
+    /// are loaded into the block cache. When false only the pinned ones are, except for a level-0 table, which always
+    /// prefetches (prefetch_all = prefetch_index_and_filter_in_cache || level == 0). Default true.
+    /// </summary>
+    public bool PrefetchIndexAndFilterInCache { get; init; } = true;
     /// <summary>
     /// TableReaderOptions::max_file_size_for_l0_meta_pin (MaxFileSizeForL0MetaPin: 1.5 times write_buffer_size): the
     /// largest level-0 file <see cref="PinningTier.FlushedAndSimilar"/> pins. Default 0, as upstream.
@@ -219,6 +242,9 @@ internal struct BlockRef
 
     public readonly bool IsEmpty => Block is null;
 
+    /// <summary>True for a block cache entry (CachableEntry::IsCached); false for an owned or reader-pinned block.</summary>
+    public readonly bool IsCacheHandle => _handle.HasValue;
+
     public void Release()
     {
         Block? b = Block;
@@ -256,9 +282,10 @@ internal struct BlockRef
 /// FindMetaBlock) and GetGlobalSequenceNumber.
 /// <para>
 /// The footer, metaindex, properties, (top-level) index, full filter and range-deletion blocks are read at open and
-/// pinned for the lifetime of the reader (the index and filter go to the block cache instead with
-/// <see cref="TableReaderOptions.CacheIndexAndFilterBlocks"/>). Data blocks (and index partitions) are fetched on demand
-/// through the block cache. Thread-safe for concurrent lookups and iterators.
+/// owned by the reader for its lifetime (the index, filter and compression dictionary go to the block cache instead
+/// with <see cref="TableReaderOptions.CacheIndexAndFilterBlocks"/>, pinned there or not: see
+/// BlockBasedTableReader.MetadataPinning.cs). Data blocks, index partitions and filter partitions are fetched on
+/// demand through the block cache. Thread-safe for concurrent lookups and iterators.
 /// </para>
 /// <para>
 /// Block cache (port of BlockBasedTable::RetrieveBlock / MaybeReadBlockAndLoadToCache / GetCacheKey): with a
@@ -279,15 +306,17 @@ public sealed partial class BlockBasedTableReader : TableReader
     /// <summary>User-defined timestamp size of the comparator (0 = none): filters are keyed by the user key without it.</summary>
     private readonly int _tsSize;
     private readonly Footer _footer;
-    private readonly Block? _indexBlock;          // null when the index lives in the block cache
+    // The fields below that describe pinned metadata blocks are set before the reader is published and never changed
+    // afterwards (some after the constructor, by the prefetch of BlockBasedTableReader.MetadataPinning.cs).
+    private Block? _indexBlock;                   // owned or pinned (top-level) index; null when looked up in the block cache per use
     private readonly Block? _rangeDelBlock;
-    private readonly IFilterBitsReader? _filter;  // pinned full filter (null when absent or cached)
-    private byte[]? _filterBuffer;
-    private readonly bool _hasFilter;
-    private readonly FilterKind _filterKind;
+    private IFilterBitsReader? _filter;           // owned or pinned full filter (null when absent or looked up per use)
+    private byte[]? _filterBuffer;                // buffer of an owned full filter
+    private bool _hasFilter;
+    private FilterKind _filterKind;
     private readonly BlockHandle _filterHandle;   // full filter / top-level partition index handle (for the block cache)
-    private readonly Block? _filterIndexBlock;    // pinned top-level filter partition index (null when absent or cached)
-    private readonly PinnedFilterPartitions? _pinnedFilterPartitions;
+    private Block? _filterIndexBlock;             // owned or pinned top-level filter partition index (null when absent or looked up per use)
+    private PinnedFilterPartitions? _pinnedFilterPartitions;
     private readonly SliceTransform? _tablePrefixExtractor;
     private readonly bool _prefixExtractorChanged; // relative to TableReaderOptions.PrefixExtractor
     // "rocksdb.compression_dict" (data blocks): the dictionary the reader owns or pins; null when the table has none or
@@ -319,8 +348,11 @@ public sealed partial class BlockBasedTableReader : TableReader
     public bool HasFilter => _hasFilter;
     /// <summary>Base block cache key of this file (see <see cref="SetupBaseCacheKey"/>).</summary>
     public OffsetableCacheKey BaseCacheKey => _baseCacheKey;
-    /// <summary>True when the top-level index and the filter live in the block cache rather than being pinned by the reader.</summary>
-    public bool IndexAndFilterInCache => _indexBlock is null;
+    /// <summary>
+    /// True when the top-level index, the filter and the compression dictionary are block cache entries (use_cache of
+    /// BlockBasedTable::PrefetchIndexAndFilterBlocks), pinned by the reader or not, rather than memory it owns.
+    /// </summary>
+    public bool IndexAndFilterInCache => _cache is not null && _options.CacheIndexAndFilterBlocks;
     /// <summary>Effective global sequence number (external files), or <see cref="BlockIter.DisableGlobalSequenceNumber"/>.</summary>
     public override ulong GlobalSequenceNumber { get; }
     /// <summary>
@@ -631,23 +663,20 @@ public sealed partial class BlockBasedTableReader : TableReader
 
         OffsetableCacheKey baseCacheKey = SetupBaseCacheKey(props, options.DbSessionId, options.FileNumber);
         // The index and filter go to the block cache only with a native cache (upstream: without a block cache the
-        // table reader always owns them).
-        BlockCache? metaCache = options.CacheIndexAndFilterBlocks ? options.BlockCache as BlockCache : null;
-        CachePriority metaPriority = MetaPriority(options);
+        // table reader always owns them). Index and filter partitions always go through the block cache.
+        BlockCache? blockCache = options.BlockCache as BlockCache;
+        BlockCache? metaCache = options.CacheIndexAndFilterBlocks ? blockCache : null;
+        MetadataPins pins = MetadataPins.Compute(options, fileSize);
+        // BlockBasedTable::Open: prefetch_all = prefetch_index_and_filter_in_cache || level == 0.
+        bool prefetchAll = options.PrefetchIndexAndFilterInCache || options.Level == 0;
 
-        // A pinned index and filter (not in the block cache) live as long as the reader: their buffers come from the table
-        // buffer pool, where the table builder has just returned its index and filter buffers (the same sizes) and where
-        // the builders of later flushes / compactions find them again once this reader is closed. Blocks that go to the
-        // block cache keep the block buffer pool's finer size classes (the cache is charged the buffer length).
-        BlockBufferSource pinnedSource = metaCache is null ? BlockBufferSource.TableBuffers : BlockBufferSource.BlockBufferPool;
-        // pin_top_level_index_and_filter (partitioned index / filter only; unpartitioned ones are not pinned when cached).
-        bool pinTopLevel = options.PinTopLevelIndexAndFilter;
-        // A cached index that is not pinned is looked up in the block cache (and its secondary tiers) once the reader
-        // exists, and read only on a miss (RetrieveBlock in IndexReaderCommon::ReadIndexBlock with prefetch).
-        bool prefetchIndexIntoCache = metaCache is not null && !(pinTopLevel && ReadIndexType(props) == IndexType.TwoLevelIndexSearch);
-        Block? indexBlock = prefetchIndexIntoCache ? null : Protect(BlockFetcher.ReadBlock(file, footer, indexHandle, verify, null, pinnedSource), options);
-        bool prefetchFilterIntoCache = false;
-        BlockHandle prefetchFilterHandle = default;
+        // An index and filter the reader owns (not in the block cache) live as long as the reader: their buffers come from
+        // the table buffer pool, where the table builder has just returned its index and filter buffers (the same sizes)
+        // and where the builders of later flushes / compactions find them again once this reader is closed. Blocks that go
+        // to the block cache keep the block buffer pool's finer size classes (the cache is charged the buffer length).
+        // An index in the block cache is looked up there (and its secondary tiers) once the reader exists, and read only
+        // on a miss (BinarySearchIndexReader / PartitionIndexReader::Create with use_cache).
+        Block? indexBlock = metaCache is not null ? null : Protect(BlockFetcher.ReadBlock(file, footer, indexHandle, verify, null, BlockBufferSource.TableBuffers), options);
         Block? rangeDel = null;
         byte[]? filterBuf = null;
         BlockBufferSource filterSource = BlockBufferSource.NotRented;
@@ -659,16 +688,6 @@ public sealed partial class BlockBasedTableReader : TableReader
         BlockBasedTableReader reader;
         try
         {
-            if (metaCache is not null && indexBlock is not null)
-            {
-                // PrefetchIndexAndFilterBlocks with prefetch_index_and_filter_in_cache and pin_top_level_index_and_filter:
-                // the pinned top level of a partitioned index is cached too.
-                Block b = indexBlock;
-                b.AddRef();
-                if (metaCache.Insert(baseCacheKey.WithOffsetForMinSizeRecord(indexHandle.Offset), CacheValue.FromObject(b).WithHelper(HelpersFor(options)[(int)BlockKind.Index]), b.Charge, metaPriority))
-                    RecordAdd(options.Statistics, BlockKind.Index, b.Charge);
-            }
-
             if (metaBlocks.TryGetValue(BlockBasedTableConstants.RangeDelBlockName, out BlockHandle rdHandle))
                 rangeDel = Protect(BlockFetcher.ReadBlock(file, footer, rdHandle, verify), options);
 
@@ -689,46 +708,40 @@ public sealed partial class BlockBasedTableReader : TableReader
                 && fh.Size > 0)
             {
                 filterKind = FilterKind.Partitioned;
-                Block? top = null;
-                try
+                // With cache_index_and_filter_blocks the top-level filter index is looked up in the block cache once the
+                // reader exists (PartitionedFilterBlockReader::Create with use_cache).
+                if (metaCache is null)
                 {
-                    top = BlockFetcher.ReadBlock(file, footer, fh, verify);
-                }
-                catch (Exception e) when (e is RocksDbException or IOException)
-                {
-                    // PartitionedFilterBlockReader::Create (partitioned_filter_block.cc): a top-level filter index that
-                    // cannot be read is ignored (IGNORE_STATUS_IF_ERROR) and the table is opened without a filter.
-                    filterKind = FilterKind.None;
-                }
-                filterIndex = top;
-                if (top is not null && (!options.CacheIndexAndFilterBlocks || metaCache is null))
-                {
-                    // Partition pinning (MetadataCacheOptions kFallback without cache_index_and_filter_blocks):
-                    // PartitionedFilterBlockReader::CacheDependencies loads all partitions up front and keeps them. Its
-                    // read errors fail the open, except without a block cache, where C++ loads nothing at open
-                    // (MaybeReadBlockAndLoadToCache is a no-op) and a lookup ignores an unreadable partition.
-                    pinnedParts = PinnedFilterPartitions.Load(file, footer, verify, ppolicy, top, props, options.Comparator,
-                        ignoreUnreadablePartitions: options.BlockCache is NoBlockCache);
-                }
-                if (top is not null && metaCache is not null)
-                {
-                    if (pinTopLevel) top.AddRef();
-                    else filterIndex = null;
-                    if (metaCache.Insert(baseCacheKey.WithOffsetForMinSizeRecord(fh.Offset), CacheValue.FromObject(top).WithHelper(HelpersFor(options)[(int)BlockKind.Filter]), top.Charge, metaPriority))
-                        RecordAdd(options.Statistics, BlockKind.Filter, top.Charge);
+                    Block? top = null;
+                    try
+                    {
+                        top = BlockFetcher.ReadBlock(file, footer, fh, verify);
+                    }
+                    catch (Exception e) when (e is RocksDbException or IOException)
+                    {
+                        // PartitionedFilterBlockReader::Create (partitioned_filter_block.cc): a top-level filter index that
+                        // cannot be read is ignored (IGNORE_STATUS_IF_ERROR) and the table is opened without a filter.
+                        filterKind = FilterKind.None;
+                    }
+                    filterIndex = top;
+                    if (top is not null && blockCache is null)
+                    {
+                        // Deviation: without a native block cache the reader loads all partitions up front and keeps
+                        // them. C++ loads nothing at open then (MaybeReadBlockAndLoadToCache is a no-op) and reads the
+                        // partition for every lookup. Read errors fail the open, except without any block cache, where a
+                        // lookup ignores an unreadable partition.
+                        pinnedParts = PinnedFilterPartitions.Load(file, footer, verify, ppolicy, top, props, options.Comparator,
+                            ignoreUnreadablePartitions: options.BlockCache is NoBlockCache);
+                    }
                 }
             }
             else if (options.FilterPolicy is { } policy
                 && metaBlocks.TryGetValue(BlockBasedTableConstants.FullFilterBlockPrefix + policy.CompatibilityName, out fh))
             {
                 filterKind = FilterKind.Full;
-                if (metaCache is not null)
-                {
-                    // Looked up in the block cache (and its secondary tiers) once the reader exists; read on a miss.
-                    prefetchFilterIntoCache = true;
-                    prefetchFilterHandle = fh;
-                }
-                else
+                // With cache_index_and_filter_blocks the filter is looked up in the block cache (and its secondary tiers)
+                // once the reader exists, and read on a miss (FullFilterBlockReader::Create with use_cache).
+                if (metaCache is null)
                 {
                     filterSource = BlockBufferSource.TableBuffers;
                     try
@@ -765,29 +778,13 @@ public sealed partial class BlockBasedTableReader : TableReader
             if (filterBuf is not null) TableBuilderBuffers.Return(filterSource, filterBuf);
             throw;
         }
-        bool dictIntoCache = hasDict && metaCache is not null;
-        if (prefetchIndexIntoCache || prefetchFilterIntoCache || dictIntoCache)
+        if (blockCache is not null)
         {
             try
             {
-                // PrefetchIndexAndFilterBlocks with prefetch_index_and_filter_in_cache: warm the block cache, reading through
+                // The rest of BlockBasedTable::PrefetchIndexAndFilterBlocks, through the block cache and reading through
                 // `file` (the tail prefetch buffer of an async open).
-                if (prefetchIndexIntoCache) reader.PrefetchIndexIntoCache(metaCache!, file);
-                if (prefetchFilterIntoCache)
-                {
-                    try
-                    {
-                        reader.PrefetchFilterIntoCache(metaCache!, file, prefetchFilterHandle);
-                    }
-                    catch (Exception e) when (e is RocksDbException or IOException)
-                    {
-                        // FullFilterBlockReader::Create: a failed prefetch of the filter is ignored; lookups retry the read
-                        // (and answer "may match" while it fails).
-                    }
-                }
-                // UncompressionDictReader::Create with use_cache: looked up (read and inserted on a miss) at open and
-                // kept only when pinned. Unlike the filter, a dictionary that cannot be read fails the open.
-                if (dictIntoCache) reader.PrefetchDictionaryIntoCache(file, PinUnpartitioned(options, fileSize));
+                reader.PrefetchMetadataIntoCache(blockCache, metaCache is not null, file, pins, prefetchAll);
             }
             catch
             {
@@ -798,55 +795,10 @@ public sealed partial class BlockBasedTableReader : TableReader
         return reader;
     }
 
-    /// <summary>
-    /// Looks the index block up in the block cache (with the secondary tiers, as RetrieveBlock does) and reads and inserts
-    /// it on a miss. Hits and misses are recorded like any index block lookup.
-    /// </summary>
-    private void PrefetchIndexIntoCache(BlockCache cache, IRandomAccessFile file)
-    {
-        CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(IndexHandle.Offset);
-        if (LookupCache(cache, key, BlockKind.Index, out CachedBlock h))
-        {
-            _stats?.RecordHit(HitCounter(BlockKind.Index), h.Charge);
-            h.Dispose();
-            return;
-        }
-        _stats?.Record(MissCounter(BlockKind.Index));
-        Block b = Protect(BlockFetcher.ReadBlock(file, _footer, IndexHandle, VerifyRead(TableReadFlags.None), null, BlockBufferSource.BlockBufferPool), BlockKind.Index);
-        InsertIntoCache(cache, key, b, BlockKind.Index).Release();
-    }
-
-    /// <summary>The full filter counterpart of <see cref="PrefetchIndexIntoCache"/>.</summary>
-    private void PrefetchFilterIntoCache(BlockCache cache, IRandomAccessFile file, BlockHandle handle)
-    {
-        CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
-        if (LookupFilterCache(cache, key, out CachedBlock h))
-        {
-            _stats?.RecordHit(BlockCacheCounter.FilterHit, h.Charge);
-            h.Dispose();
-            return;
-        }
-        _stats?.Record(BlockCacheCounter.FilterMiss);
-        // A cached filter's buffer is returned to RocksArrayPool.Shared by the cache entry (CacheValue).
-        byte[] buf = BlockFetcher.ReadRawPayload(file, _footer, handle, VerifyRead(TableReadFlags.None), BlockBufferSource.Shared, out int len);
-        IFilterBitsReader filter;
-        try
-        {
-            filter = CreateFilterReader(_options.FilterPolicy!, buf, len);
-        }
-        catch
-        {
-            RocksArrayPool<byte>.Shared.Return(buf);
-            throw;
-        }
-        if (cache.Insert(key, new CacheValue(buf, len, filter, true).WithHelper(FilterHelperFor(_options)), buf.Length, _metaPriority))
-            RecordAdd(_stats, BlockKind.Filter, buf.Length);
-    }
-
     private UserDefinedIndexReader? _udiReader;
 
     /// <summary>
-    /// Port of BlockBasedTable::ApproximateMemoryUsage: the blocks pinned by this reader outside the block cache (index,
+    /// Port of BlockBasedTable::ApproximateMemoryUsage: the blocks owned by this reader outside the block cache (index,
     /// full filter or filter partition index and partitions, range tombstones) and the user-defined index reader.
     /// Blocks held by the block cache are not counted (they are part of the cache's usage). Unlike upstream,
     /// sizeof(Rep) and the index/filter reader objects themselves are not included.
@@ -856,10 +808,12 @@ public sealed partial class BlockBasedTableReader : TableReader
         get
         {
             ulong usage = 0;
-            if (_indexBlock is not null) usage += (ulong)_indexBlock.Charge;
+            // IndexReaderCommon / FilterBlockReaderCommon::ApproximateMemoryUsage: only blocks the reader owns
+            // (GetOwnValue); one pinned in the block cache is part of the cache's usage.
+            if (_indexBlock is not null && !_indexRef.IsCacheHandle) usage += (ulong)_indexBlock.Charge;
             if (_rangeDelBlock is not null) usage += (ulong)_rangeDelBlock.Charge;
             if (_filter is not null && _filterBuffer is not null) usage += (ulong)_filterBuffer.Length;
-            if (_filterIndexBlock is not null) usage += (ulong)_filterIndexBlock.Charge;
+            if (_filterIndexBlock is not null && !_filterIndexRef.IsCacheHandle) usage += (ulong)_filterIndexBlock.Charge;
             if (_pinnedFilterPartitions is not null) usage += _pinnedFilterPartitions.MemoryUsage;
             if (_udiReader is not null) usage += _udiReader.ApproximateMemoryUsage;
             // UncompressionDictReader::ApproximateMemoryUsage: only a dictionary the reader owns (GetOwnValue); one held
@@ -1319,7 +1273,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         if (cache.TryInsert(key, CacheValue.FromObject(b).WithHelper(_helpers[(int)kind]), b.Charge, priority, serialized.AsSpan(0, size),
                 (Compression.CompressionType)serialized[size], out CachedBlock h))
         {
-            RecordAdd(_stats, kind, b.Charge);
+            RecordAdd(_stats, kind, b.Charge, h.InsertedRedundantly);
             return BlockRef.FromCache(b, h);
         }
         _stats?.Record(BlockCacheCounter.AddFailure);
@@ -1332,7 +1286,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         // On success the cache takes over our reference (released through Block's IDisposable when the entry is freed).
         if (cache.TryInsert(key, CacheValue.FromObject(b).WithHelper(_helpers[(int)kind]), b.Charge, priority, out CachedBlock h))
         {
-            RecordAdd(_stats, kind, b.Charge);
+            RecordAdd(_stats, kind, b.Charge, h.InsertedRedundantly);
             return BlockRef.FromCache(b, h);
         }
         // Strict capacity limit reached: we keep ownership and use the block uncached.
@@ -1449,10 +1403,13 @@ public sealed partial class BlockBasedTableReader : TableReader
         return b;
     }
 
-    /// <summary>The top-level index block: pinned by the reader, or looked up in (and if evicted re-read into) the block cache.</summary>
     /// <summary>The options the reader was opened with.</summary>
     internal TableReaderOptions Options => _options;
 
+    /// <summary>
+    /// Port of IndexReaderCommon::GetOrReadIndexBlock: the (top-level) index block the reader owns or pins, else a
+    /// block cache lookup (reading and inserting the block on a miss; Incomplete with <see cref="TableReadFlags.BlockCacheTier"/>).
+    /// </summary>
     internal BlockRef GetIndexBlockRef(TableReadFlags flags) =>
         _indexBlock is not null ? BlockRef.FromPinned(_indexBlock) : GetBlockRef(IndexHandle, BlockKind.Index, flags);
 
@@ -1472,9 +1429,23 @@ public sealed partial class BlockBasedTableReader : TableReader
         _ => BlockCacheCounter.FilterMiss,
     };
 
-    private static void RecordAdd(BlockCacheStatistics? stats, BlockKind kind, long charge)
+    /// <summary>
+    /// Port of BlockBasedTable::UpdateCacheInsertionMetrics: BLOCK_CACHE_{,kind_}ADD and the bytes inserted, plus
+    /// BLOCK_CACHE_{,kind_}ADD_REDUNDANT when the cache reported the insert as redundant (Status::OkOverwritten, see
+    /// <see cref="CachedBlock.InsertedRedundantly"/>).
+    /// </summary>
+    private static void RecordAdd(BlockCacheStatistics? stats, BlockKind kind, long charge, bool redundant)
     {
         if (stats is null) return;
+        if (redundant)
+        {
+            stats.Record(kind switch
+            {
+                BlockKind.Data => BlockCacheCounter.DataAddRedundant,
+                BlockKind.Index => BlockCacheCounter.IndexAddRedundant,
+                _ => BlockCacheCounter.FilterAddRedundant,
+            });
+        }
         stats.Record(kind switch
         {
             BlockKind.Data => BlockCacheCounter.DataAdd,
@@ -1516,10 +1487,10 @@ public sealed partial class BlockBasedTableReader : TableReader
         it.InitializeIndex(block, _icmp, IndexKeyIncludesSeq, IndexValueIsFull, false,
             BlockBasedTableConstants.FormatVersionUsesValueDeltaEscape(_footer.FormatVersion), BlockIter.DisableGlobalSequenceNumber, PadTimestampSize);
 
-    /// <summary>The pinned top-level index block (not available when <see cref="IndexAndFilterInCache"/>).</summary>
+    /// <summary>The top-level index block the reader owns or pins (not available when it is looked up in the block cache per use).</summary>
     internal Block IndexBlock => _indexBlock ?? throw new InvalidOperationException("The index block is held by the block cache (CacheIndexAndFilterBlocks).");
 
-    /// <summary>The buffer of the pinned full filter (null when absent or held by the block cache). Tests only.</summary>
+    /// <summary>The buffer of the full filter the reader owns (null when absent or held by the block cache). Tests only.</summary>
     internal byte[]? PinnedFilterBuffer => Volatile.Read(ref _filterBuffer);
     internal bool IsPartitionedIndex => IndexType == IndexType.TwoLevelIndexSearch;
 
@@ -1839,43 +1810,16 @@ public sealed partial class BlockBasedTableReader : TableReader
     /// </summary>
     private bool PartitionedFilterMayMatch(ReadOnlySpan<byte> entry, ReadOnlySpan<byte> internalKey, TableReadFlags flags)
     {
-        // kBlockCacheTier: the partition index would have to be read (conservatively "may match").
-        if (_filterIndexBlock is null && (flags & TableReadFlags.BlockCacheTier) != 0) return true;
         BlockRef top;
-        if (_filterIndexBlock is not null)
-        {
-            top = BlockRef.FromPinned(_filterIndexBlock);
-        }
-        else
-        {
-            try
-            {
-                top = GetBlockRef(_filterHandle, BlockKind.Filter, flags);
-            }
-            catch (Exception e) when (e is RocksDbException or IOException)
-            {
-                // PartitionedFilterBlockReader::MayMatch: GetOrReadFilterBlock failed (IGNORE_STATUS_IF_ERROR).
-                return true;
-            }
-        }
+        if (_filterIndexBlock is not null) top = BlockRef.FromPinned(_filterIndexBlock);
+        else if (!TryGetFilterIndexRef(flags, out top)) return true;
         BlockHandle partition;
-        BlockIter it = IterPool.Rent();
         try
         {
-            InitFilterIndexIter(it, top.Block!);
-            it.Seek(internalKey);
-            if (!it.Valid)
-            {
-                // entry is larger than all the keys. However its prefix might still be present in the last partition.
-                it.SeekToLast();
-            }
-            if (!it.Valid) return true;
-            partition = it.BlockHandle;
+            if (!TryFindFilterPartition(top.Block!, internalKey, out partition)) return true;
         }
         finally
         {
-            it.Clear();
-            IterPool.Return(it);
             top.Release();
         }
         if (partition.Size == 0) return false; // key is out of range
@@ -1884,10 +1828,111 @@ public sealed partial class BlockBasedTableReader : TableReader
     }
 
     /// <summary>
+    /// Port of FilterBlockReaderCommon::GetOrReadFilterBlock for a top-level filter index the reader does not hold: a
+    /// block cache lookup, and on a miss a read and an insert. False when the probe must answer "may match"
+    /// (IGNORE_STATUS_IF_ERROR): the block is not cached and the read is restricted to the block cache
+    /// (<see cref="TableReadFlags.BlockCacheTier"/>), or it cannot be read.
+    /// </summary>
+    private bool TryGetFilterIndexRef(TableReadFlags flags, out BlockRef top)
+    {
+        top = default;
+        if ((flags & TableReadFlags.BlockCacheTier) != 0)
+        {
+            // no_io: only the lookup, without the exception a miss would cost through GetBlockRef.
+            BlockCache? cache = _cache;
+            if (cache is null) return false;
+            CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(_filterHandle.Offset);
+            if (!LookupCache(cache, key, BlockKind.Filter, out CachedBlock h))
+            {
+                _stats?.Record(BlockCacheCounter.FilterMiss);
+                return false;
+            }
+            _stats?.RecordHit(BlockCacheCounter.FilterHit, h.Charge);
+            top = BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h);
+            return true;
+        }
+        try
+        {
+            top = GetBlockRef(_filterHandle, BlockKind.Filter, flags);
+            return true;
+        }
+        catch (Exception e) when (e is RocksDbException or IOException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// PartitionedFilterBlockReader::GetFilterPartitionHandle: the handle of the partition covering
+    /// <paramref name="internalKey"/> in the top-level filter index <paramref name="top"/> (the last partition if the
+    /// key is past all of them). False when the index has no entry (the key may match).
+    /// </summary>
+    private bool TryFindFilterPartition(Block top, ReadOnlySpan<byte> internalKey, out BlockHandle partition)
+    {
+        partition = default;
+        BlockIter it = IterPool.Rent();
+        try
+        {
+            InitFilterIndexIter(it, top);
+            it.Seek(internalKey);
+            if (!it.Valid)
+            {
+                // entry is larger than all the keys. However its prefix might still be present in the last partition.
+                it.SeekToLast();
+            }
+            if (!it.Valid) return false;
+            partition = it.BlockHandle;
+            return true;
+        }
+        finally
+        {
+            it.Clear();
+            IterPool.Return(it);
+        }
+    }
+
+    /// <summary>
+    /// A filter block held for one or more probes: a block cache handle, or a buffer the holder owns (a block read
+    /// with fill_cache = false, without a block cache, or that the cache rejected). Release once.
+    /// </summary>
+    private struct FilterBlockLease
+    {
+        public CachedBlock Handle;
+        public byte[]? OwnedBuffer;
+
+        public void Release()
+        {
+            if (Handle.HasValue) Handle.Dispose();
+            byte[]? buffer = OwnedBuffer;
+            if (buffer is not null)
+            {
+                OwnedBuffer = null;
+                RocksArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+    }
+
+    /// <summary>
     /// Filter lookup through the block cache (cache_index_and_filter_blocks, filter partitions). A miss is read
     /// synchronously; without a block cache the filter is read and discarded.
     /// </summary>
     private bool FilterBlockMayMatch(BlockHandle handle, ReadOnlySpan<byte> entry, TableReadFlags flags)
+    {
+        FilterBlockLease lease = default;
+        IFilterBitsReader? reader = AcquireFilterBlock(handle, flags, ref lease);
+        bool result = reader is null || reader.MayMatch(entry);
+        lease.Release();
+        return result;
+    }
+
+    /// <summary>
+    /// Port of FilterBlockReaderCommon::GetOrReadFilterBlock / PartitionedFilterBlockReader::GetFilterPartitionBlock
+    /// for a filter that is not pinned: a block cache lookup, and on a miss a read and an insert (not with
+    /// <see cref="TableReadFlags.DontFillCache"/>). Returns the filter, kept alive by <paramref name="lease"/> until it
+    /// is released; null when the probe must answer "may match": the filter is not cached and the read is restricted to
+    /// the block cache, or the block cannot be read (IGNORE_STATUS_IF_ERROR).
+    /// </summary>
+    private IFilterBitsReader? AcquireFilterBlock(BlockHandle handle, TableReadFlags flags, ref FilterBlockLease lease)
     {
         BlockCache? cache = _cache;
         CacheKey key = default;
@@ -1898,13 +1943,12 @@ public sealed partial class BlockBasedTableReader : TableReader
             {
                 _stats?.RecordHit(BlockCacheCounter.FilterHit, h.Charge);
                 if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, BlockKind.Filter, null, hit: true, flags, (ulong)handle.Size);
-                bool r = Unsafe.As<IFilterBitsReader>(h.Value)!.MayMatch(entry);
-                h.Dispose();
-                return r;
+                lease.Handle = h;
+                return Unsafe.As<IFilterBitsReader>(h.Value);
             }
         }
         _stats?.Record(BlockCacheCounter.FilterMiss);
-        if ((flags & TableReadFlags.BlockCacheTier) != 0) return true; // no I/O allowed: Incomplete -> may match
+        if ((flags & TableReadFlags.BlockCacheTier) != 0) return null; // no I/O allowed: Incomplete -> may match
         // FullFilterBlockReader::MayMatch / PartitionedFilterBlockReader::MayMatch: a filter block (or partition) that
         // cannot be read is ignored (IGNORE_STATUS_IF_ERROR) and the key may match.
         byte[] buf;
@@ -1915,7 +1959,7 @@ public sealed partial class BlockBasedTableReader : TableReader
         }
         catch (Exception e) when (e is RocksDbException or IOException)
         {
-            return true;
+            return null;
         }
         if (cache is not null && _bcTracer is { IsEnabled: true } tm) TraceAccess(tm, key, BlockKind.Filter, null, hit: false, flags, (ulong)len);
         IFilterBitsReader reader;
@@ -1926,23 +1970,29 @@ public sealed partial class BlockBasedTableReader : TableReader
         catch (RocksDbException)
         {
             RocksArrayPool<byte>.Shared.Return(buf);
-            return true;
+            return null;
         }
         catch
         {
             RocksArrayPool<byte>.Shared.Return(buf);
             throw;
         }
-        bool result = reader.MayMatch(entry);
         if (cache is null || (flags & TableReadFlags.DontFillCache) != 0)
         {
-            RocksArrayPool<byte>.Shared.Return(buf);
+            lease.OwnedBuffer = buf;
         }
-        else if (cache.Insert(key, new CacheValue(buf, len, reader, true).WithHelper(FilterHelperFor(_options)), buf.Length, _metaPriority))
+        else if (cache.TryInsert(key, new CacheValue(buf, len, reader, true).WithHelper(FilterHelperFor(_options)), buf.Length, _metaPriority, out CachedBlock inserted))
         {
-            RecordAdd(_stats, BlockKind.Filter, buf.Length);
+            RecordAdd(_stats, BlockKind.Filter, buf.Length, inserted.InsertedRedundantly);
+            lease.Handle = inserted;
         }
-        return result;
+        else
+        {
+            // Strict capacity limit reached: the filter is used uncached.
+            _stats?.Record(BlockCacheCounter.AddFailure);
+            lease.OwnedBuffer = buf;
+        }
+        return reader;
     }
 
     /// <summary>
@@ -2293,17 +2343,23 @@ public sealed partial class BlockBasedTableReader : TableReader
     public override void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        _indexBlock?.Release();
+        // A block pinned in the block cache (or owned after a rejected insert) is released through its reference.
+        if (!_indexRef.IsEmpty) _indexRef.Release();
+        else _indexBlock?.Release();
         _rangeDelBlock?.Release();
-        _filterIndexBlock?.Release();
+        if (!_filterIndexRef.IsEmpty) _filterIndexRef.Release();
+        else _filterIndexBlock?.Release();
         _pinnedFilterPartitions?.Dispose();
+        ReleasePinnedIndexPartitions();
+        _filterLease.Dispose();
         _dictLease.Release(); // the owned dictionary, or the block cache handle of a pinned one
         _udiReader?.Dispose();
 
 
         byte[]? fb = Interlocked.Exchange(ref _filterBuffer, null);
-        // The pinned full filter (never set when the filter is held by the block cache) is rented from the pinned table buffers.
-        if (fb is not null) TableBuilderBuffers.Return(BlockBufferSource.TableBuffers, fb);
+        // The owned full filter (never set when the filter is held by the block cache) is rented from the pinned table
+        // buffers, or from the shared pool when it is a filter the block cache rejected.
+        if (fb is not null) TableBuilderBuffers.Return(_filterBufferSource, fb);
         _file.Dispose();
     }
 

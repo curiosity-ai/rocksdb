@@ -53,6 +53,18 @@ public enum BlockCacheCounter
     CompressionDictAdd = 22,
     /// <summary>BLOCK_CACHE_COMPRESSION_DICT_BYTES_INSERT.</summary>
     CompressionDictBytesInsert = 23,
+    /// <summary>
+    /// BLOCK_CACHE_DATA_ADD_REDUNDANT: data block inserts the cache reported as redundant (Cache::Insert returning
+    /// Status::OkOverwritten: the key was already present; see <see cref="Cache.CacheEntry.InsertedRedundantly"/>).
+    /// Each is also counted in the block kind's ADD counter.
+    /// </summary>
+    DataAddRedundant = 24,
+    /// <summary>BLOCK_CACHE_INDEX_ADD_REDUNDANT.</summary>
+    IndexAddRedundant = 25,
+    /// <summary>BLOCK_CACHE_FILTER_ADD_REDUNDANT.</summary>
+    FilterAddRedundant = 26,
+    /// <summary>BLOCK_CACHE_COMPRESSION_DICT_ADD_REDUNDANT.</summary>
+    CompressionDictAddRedundant = 27,
 }
 
 /// <summary>
@@ -63,7 +75,7 @@ public enum BlockCacheCounter
 /// </summary>
 public sealed class BlockCacheStatistics
 {
-    private const int NumCounters = 24;     // 24 * 8 bytes = 192 bytes per stripe (three cache lines, no false sharing)
+    private const int NumCounters = 32;     // 32 * 8 bytes = 256 bytes per stripe (four cache lines, no false sharing)
     private const int NumStripes = 16;       // power of two
     private readonly long[] _counters = new long[NumStripes * NumCounters];
 
@@ -112,6 +124,10 @@ public sealed class BlockCacheStatistics
 
     /// <summary>Total misses over all block kinds (BLOCK_CACHE_MISS).</summary>
     public long Misses => DataMisses + IndexMisses + FilterMisses + Get(BlockCacheCounter.CompressionDictMiss);
+
+    /// <summary>Total redundant inserts over all block kinds (BLOCK_CACHE_ADD_REDUNDANT).</summary>
+    public long RedundantAdds => Get(BlockCacheCounter.DataAddRedundant) + Get(BlockCacheCounter.IndexAddRedundant)
+        + Get(BlockCacheCounter.FilterAddRedundant) + Get(BlockCacheCounter.CompressionDictAddRedundant);
 
     /// <summary>Resets all counters to zero (not atomic with respect to concurrent updates).</summary>
     public void Reset()

@@ -20,7 +20,7 @@ namespace RocksDb.Managed.Table;
 /// unpinned one is looked up again for every data block retrieval (GetOrReadUncompressionDictionary in
 /// NewDataBlockIterator, once per file in MultiGet) and re-read after eviction.</item>
 /// </list>
-/// Lookups record BLOCK_CACHE_COMPRESSION_DICT_{HIT,MISS,ADD,BYTES_INSERT} and the totals BLOCK_CACHE_{HIT,MISS,ADD,
+/// Lookups record BLOCK_CACHE_COMPRESSION_DICT_{HIT,MISS,ADD,ADD_REDUNDANT,BYTES_INSERT} and the totals BLOCK_CACHE_{HIT,MISS,ADD,
 /// BYTES_READ,BYTES_WRITE} (BlockBasedTable::UpdateCacheHitMetrics / UpdateCacheMissMetrics / UpdateCacheInsertionMetrics).
 /// </summary>
 public sealed partial class BlockBasedTableReader
@@ -120,22 +120,8 @@ public sealed partial class BlockBasedTableReader
     /// </summary>
     private bool DigestsDictionary => Properties.CompressionName == "ZSTD";
 
-    /// <summary>
-    /// Port of pin_unpartitioned in BlockBasedTable::PrefetchIndexAndFilterBlocks: metadata_cache_options.unpartitioned_pinning,
-    /// with kFallback meaning kFlushedAndSimilar under pin_l0_filter_and_index_blocks_in_cache and kNone otherwise.
-    /// kFlushedAndSimilar pins level-0 files of at most max_file_size_for_l0_meta_pin bytes (maybe_flushed).
-    /// </summary>
-    internal static bool PinUnpartitioned(TableReaderOptions options, long fileSize)
-    {
-        bool maybeFlushed = options.Level == 0 && fileSize <= options.MaxFileSizeForL0MetaPin;
-        return options.UnpartitionedPinning switch
-        {
-            PinningTier.All => true,
-            PinningTier.FlushedAndSimilar => maybeFlushed,
-            PinningTier.None => false,
-            _ => options.PinL0FilterAndIndexBlocksInCache && maybeFlushed,
-        };
-    }
+    /// <summary>Port of pin_unpartitioned in BlockBasedTable::PrefetchIndexAndFilterBlocks (see <see cref="MetadataPins"/>).</summary>
+    internal static bool PinUnpartitioned(TableReaderOptions options, long fileSize) => MetadataPins.Compute(options, fileSize).Unpartitioned;
 
     /// <summary>
     /// Reads the dictionary block from the file (the read of RetrieveBlock for BlockType::kCompressionDictionary):
@@ -161,12 +147,18 @@ public sealed partial class BlockBasedTableReader
     }
 
     /// <summary>
-    /// Port of UncompressionDictReader::Create with use_cache and prefetch: the dictionary is looked up in the block
-    /// cache, and read and inserted on a miss. With <paramref name="pin"/> the reader keeps the entry; otherwise the
-    /// entry is released again and every data block retrieval looks it up. Read errors fail the open.
+    /// Port of UncompressionDictReader::Create with use_cache: with <paramref name="prefetch"/> (prefetch_all || pin)
+    /// the dictionary is looked up in the block cache, and read and inserted on a miss. With <paramref name="pin"/> the
+    /// reader keeps the entry; otherwise the entry is released again and every data block retrieval looks it up. Read
+    /// errors fail the open.
     /// </summary>
-    private void PrefetchDictionaryIntoCache(IRandomAccessFile file, bool pin)
+    private void PrefetchDictionaryIntoCache(IRandomAccessFile file, bool prefetch, bool pin)
     {
+        if (!prefetch)
+        {
+            _dictLookupPerRead = true;
+            return;
+        }
         DictLease lease = GetOrReadDictionary(TableReadFlags.None, file);
         if (pin)
         {
@@ -217,6 +209,7 @@ public sealed partial class BlockBasedTableReader
             if (stats is not null)
             {
                 stats.Record(BlockCacheCounter.CompressionDictAdd);
+                if (h.InsertedRedundantly) stats.Record(BlockCacheCounter.CompressionDictAddRedundant);
                 stats.Add(BlockCacheCounter.BytesInserted, charge);
                 stats.Add(BlockCacheCounter.CompressionDictBytesInsert, charge);
             }

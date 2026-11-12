@@ -1447,11 +1447,97 @@ fails the open or the read. `BLOCK_CACHE_COMPRESSION_DICT_{MISS,HIT,ADD}` match 
 with flushes, Get, MultiGet, scans and a compaction, in four pinning modes (`Audit4CompressionDictCacheCompatTests`;
 unit tests in `Audit4CompressionDictCacheTests`). Differences that remain: `..._DICT_BYTES_INSERT` is recorded but the
 charge of a dictionary is engine-specific (dictionary bytes plus the digested ZSTD dictionary, within a factor of two
-of native in the test); `..._DICT_ADD_REDUNDANT` stays 0 because the port records no `*_ADD_REDUNDANT` ticker for any
-block kind; data blocks of a table whose dictionary is cached unpinned are not offered compressed to secondary cache
-tiers; and the unpartitioned pinning rules are applied to the dictionary only, the index and full filter of a table
-with `cache_index_and_filter_blocks` are still never pinned (`pin_l0_filter_and_index_blocks_in_cache` and
-`unpartitioned_pinning` have no effect on them).
+of native in the test); and data blocks of a table whose dictionary is cached unpinned are not offered compressed to
+secondary cache tiers.
+
+Ported after that (2026-11-12), the two gaps the dictionary work left open.
+
+`BLOCK_CACHE_*_ADD_REDUNDANT` (`BlockBasedTable::UpdateCacheInsertionMetrics` with `s.IsOkOverwritten()`): the
+handle an insert returns says whether the insert was redundant (`CachedBlock.InsertedRedundantly`), with the meaning
+each native cache gives `Status::OkOverwritten`: `LRUCacheShard::InsertItem` when the insert replaced an entry with
+the same key (a flag on the new entry, set under the shard mutex), `BaseClockTable::Insert` when the entry did not go
+into the table and was handed out standalone (the key was present, or the table had no room). No lookup and no
+allocation is added to the insert. Recorded for data, index, filter and dictionary blocks, partitions included; the
+filter inserts take a handle now, as native does. Not counted through the legacy `IBlockCache` seam, which has no
+such result.
+
+Pinning of the index and filter blocks (`BlockBasedTable::PrefetchIndexAndFilterBlocks`, the index / filter readers'
+`Create`, `GetOrReadIndexBlock` / `GetOrReadFilterBlock`, `CacheDependencies`; `Table/BlockBasedTableReader.MetadataPinning.cs`).
+Before, with `cache_index_and_filter_blocks` the port never pinned an unpartitioned index or a full filter (both were
+inserted at open and looked up on every use, whatever the pinning options said), pinned the top level of a
+partitioned index / filter under `pin_top_level_index_and_filter` as memory the reader owned next to a copy in the
+cache, never loaded index partitions at open, and kept every filter partition as reader-owned memory unless
+`cache_index_and_filter_blocks` was set. Now:
+
+- `pin_top_level_index`, `pin_partition` and `pin_unpartitioned` are computed as native (`MetadataPins`): the three
+  `metadata_cache_options` tiers, kFallback meaning kAll under `pin_top_level_index_and_filter` for the top level and
+  kFlushedAndSimilar under `pin_l0_filter_and_index_blocks_in_cache` for the other two; kFlushedAndSimilar is level 0
+  and at most 1.5 times `write_buffer_size`.
+- With `cache_index_and_filter_blocks` the (top-level) index and the full filter / top-level filter index are looked
+  up at open and read and inserted on a miss (`prefetch_all || pin`). A pinned one keeps its cache handle for the
+  reader's lifetime (charged to the cache, counted in its pinned usage, not in `ApproximateMemoryUsage`) and is used
+  without a lookup; an unpinned one is looked up on each use: the index once per Get and once per iterator, the
+  filter once per probe, and re-read after eviction. `read_tier = kBlockCacheTier` is Incomplete when an unpinned
+  index is not cached and "may match" for the filter. An index that cannot be read fails the open; a filter that
+  cannot be read at open leaves the table without a filter (`Create` returns no reader).
+- Index and filter partitions always live in the block cache. At open (`prefetch_all || pin_partition`) every
+  partition is loaded into it; with `pin_partition` the reader keeps the handles (`partition_map_` / `filter_map_`)
+  and reads use them without a lookup.
+- Found by the native differential and ported with it: MultiGet looks a full filter up once per batch and a filter
+  partition once per run of keys it covers (`FullFilterBlockReader::MayMatch(MultiGetRange*)`,
+  `PartitionedFilterBlockReader::MayMatchPartition`) instead of once per key; `PartitionedIndexIterator` keeps the
+  index partition it has loaded while a move stays in it; DB open loads tables without prefetch
+  (`VersionEditHandler::LoadTables`, `prefetch_index_and_filter_in_cache = false`), so below level 0 only pinned
+  blocks are read then; a flush and the output verification of a compaction create an iterator over the new table
+  (`table_cache->NewIterator`), which is one index lookup when the index is unpinned.
+
+`BLOCK_CACHE_{INDEX,FILTER}_{MISS,HIT,ADD}` and the five `*_ADD_REDUNDANT` tickers match native after every step of a
+workload with flushes, Get (present and absent keys), MultiGet, scans, a full compaction, a reopen on a shared
+cache and a reopen with a level-0 file, in 13 option combinations: unpartitioned (unpinned on LRU and HyperClock, pin_l0, kAll, kNone over pin_l0,
+not cached) and partitioned (defaults, cached top levels, `top_level_index_pinning = kNone`,
+`pin_top_level_index_and_filter = false`, `partition_pinning = kAll` with and without
+`cache_index_and_filter_blocks`, pin_l0) (`Audit4BlockCachePinningCompatTests`; unit tests in
+`Audit4BlockCachePinningTests`). With the defaults (`cache_index_and_filter_blocks` off, binary search index, full
+filter) a read takes the same path as before: no lookup, branch or allocation was added (docs/perf.md).
+
+Review of that work (same day, by a second reader of the diff against the C++ sources). Three fixes, each with a
+test:
+
+- `BlockBasedTable::Open` computes `prefetch_all = prefetch_index_and_filter_in_cache || level == 0`: a level-0
+  table warms the block cache at open whatever the caller passed. The port took the caller's flag alone, so a DB
+  reopened with level-0 files recorded one index and one filter hit less than native per file (found by adding a
+  reopen with a level-0 file to the native differential, which then failed in the unpinned modes; unit tests
+  `LevelZeroTablesAlwaysPrefetch`, `DatabaseOpenLoadsOnlyPinnedMetadataBlocksBelowLevelZero`).
+- `read_tier = kBlockCacheTier` with a top-level filter index that is not pinned: `GetOrReadFilterBlock` looks the
+  block cache up and only a miss answers "may match". The port answered "may match" without the lookup (Get and the
+  MultiGet batch probe), which disabled a partitioned filter for no-io reads under
+  `pin_top_level_index_and_filter = false` (`BlockCacheTierProbeUsesTheUnpinnedTopLevelFilterIndexFromTheCache`).
+- `PartitionIndexReader::CacheDependencies` pins all partitions or none (`map_in_progress` is dropped). The port
+  kept the handles of a partial set until the reader closed without using them; they are released at once now (not
+  reachable with a well-formed index; no test).
+
+Checked and left as they are: the pin / no-pin decision per tier and level (`MetadataPins`, table-driven test); a
+pinned handle is released by `Dispose` and an open that fails after pinning disposes the reader (the closed DB leaves
+`Usage` 0 after `EraseUnreferencedEntries`); an unpinned index is held by the index iterator for its lifetime as a
+cache handle, an unpinned filter only for the probe (or the MultiGet batch), neither across an await; without
+`cache_index_and_filter_blocks` and with the default binary search index and full filter nothing changed; with a
+partitioned index / filter and a block cache the partitions are block cache entries now, loaded at open and looked
+up per read unless `partition_pinning` pins them, as native (before, filter partitions were reader-owned and index
+partitions loaded on demand); the flush and compaction-output iterators and the per-batch filter lookup of MultiGet
+are what native does (`BuildTable`, `CompactionJob::VerifyOutputFiles`, `FullFilterBlockReader::MayMatch(MultiGetRange*)`).
+`TableCache.InitialLoad` is a flag on the table cache rather than a parameter; it is only set by the thread that
+opens the DB, before reads are served.
+
+Differences that remain: with more tables than DB open loads (16, or a quarter of the table cache) the stats load of
+DB open (`UpdateAccumulatedStats`) opens the remaining tables without prefetch, where C++ reads only their
+properties and prefetches when a read first opens the table (one index / filter hit more per such table in native);
+under `strict_capacity_limit` a metadata block the cache rejects is used uncached (owned by the reader when pinned),
+where C++ fails the read or the open with the insert's status, as for data blocks; without a native `BlockCache` (no block cache, or the legacy `IBlockCache` seam) the reader
+loads and owns every filter partition, where C++ loads none and reads the partition for each probe (one ignored
+test); `prefetch_index_and_filter_in_cache = false` is applied by DB open only, not by the other native callers that
+pass it (ingestion with `fill_cache = false`, `VerifySstFileChecksum`); `CacheDependencies` reads the partitions one
+by one rather than with one prefetch of their range; the user-defined index block is memory of the reader, not a block
+cache entry; `avoid_shared_metadata_cache` (C++ main, after 11.12) is not ported.
 
 `RocksDb.Managed.Replication` is a port of rocksdb-sharp, which is not in this repository. It was reviewed twice:
 first on its own terms, then side by side with the original (`csharp/src/Replication`, `Switchover`, `Cluster` and

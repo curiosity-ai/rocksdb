@@ -235,6 +235,10 @@ internal sealed class LruEntry : CacheEntry
     // Queued to be freed by an eviction (EvictFromLRU, insert-and-evict, replacement; upstream NotifyEvicted): reported
     // to the cache's eviction callback before the value is freed.
     internal const byte FlagNotifyEvicted = 64;
+    // The insert of this entry replaced an entry with the same key (LRUCacheShard::InsertItem: Status::OkOverwritten).
+    internal const byte FlagOverwrote = 128;
+
+    internal override bool InsertedRedundantly => (Flags & FlagOverwrote) != 0;
 
     internal readonly LruCacheShard? Shard;
     internal LruEntry? Next;
@@ -548,6 +552,8 @@ internal sealed class LruCacheShard
         _usage += e.TotalCharge;
         if (old is not null)
         {
+            // s = Status::OkOverwritten()
+            e.Flags |= LruEntry.FlagOverwrote;
             old.SetFlag(LruEntry.FlagInCache, false);
             if (old.Refs == 0)
             {

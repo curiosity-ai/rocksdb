@@ -8,16 +8,19 @@ namespace RocksDb.Managed.Table;
 /// <summary>
 /// Filter partitions loaded at table open and pinned for the reader's lifetime (port of the filter_map_ built by
 /// PartitionedFilterBlockReader::CacheDependencies with pinning, table/block_based/partitioned_filter_block.cc).
-/// Keyed by partition block offset. Thread-safe for concurrent lookups (immutable after <see cref="Load"/>).
+/// Keyed by partition block offset. The partitions are block cache entries the reader holds handles of
+/// (<see cref="TryAddCached"/>), or, for a reader without a block cache, buffers it owns (<see cref="Load"/>).
+/// Thread-safe for concurrent lookups (immutable once the reader is published).
 /// </summary>
 internal sealed class PinnedFilterPartitions : IDisposable
 {
     private readonly Dictionary<ulong, IFilterBitsReader> _readers = new();
     private readonly List<byte[]> _buffers = new();
+    private readonly List<Cache.CachedBlock> _handles = new();
 
     public int Count => _readers.Count;
 
-    /// <summary>Bytes of the pinned partition buffers.</summary>
+    /// <summary>Bytes of the partition buffers the reader owns (partitions pinned in the block cache are part of the cache's usage).</summary>
     public ulong MemoryUsage
     {
         get
@@ -29,6 +32,17 @@ internal sealed class PinnedFilterPartitions : IDisposable
     }
 
     public bool TryGet(ulong offset, out IFilterBitsReader reader) => _readers.TryGetValue(offset, out reader!);
+
+    /// <summary>
+    /// Pins a partition held by the block cache: takes over <paramref name="handle"/> (released by <see cref="Dispose"/>).
+    /// False when the partition is already pinned; the caller then releases the handle.
+    /// </summary>
+    public bool TryAddCached(ulong offset, Cache.CachedBlock handle)
+    {
+        if (!_readers.TryAdd(offset, System.Runtime.CompilerServices.Unsafe.As<IFilterBitsReader>(handle.Value)!)) return false;
+        _handles.Add(handle);
+        return true;
+    }
 
     /// <summary>Reads every partition listed in the top-level filter partition index <paramref name="top"/>.</summary>
     public static PinnedFilterPartitions Load(IRandomAccessFile file, in Footer footer, BlockFetcher.ChecksumVerification verifyChecksums, FilterPolicy policy, Block top,
@@ -82,6 +96,8 @@ internal sealed class PinnedFilterPartitions : IDisposable
     {
         foreach (byte[] b in _buffers) RocksArrayPool<byte>.Shared.Return(b);
         _buffers.Clear();
+        foreach (Cache.CachedBlock h in _handles) h.Dispose();
+        _handles.Clear();
         _readers.Clear();
     }
 }

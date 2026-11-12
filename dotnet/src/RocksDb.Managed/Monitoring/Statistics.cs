@@ -143,6 +143,11 @@ public sealed class Statistics
             Ticker.BlockCacheAdd => b.Get(BlockCacheCounter.DataAdd) + b.Get(BlockCacheCounter.IndexAdd) + b.Get(BlockCacheCounter.FilterAdd)
                 + b.Get(BlockCacheCounter.CompressionDictAdd),
             Ticker.BlockCacheAddFailures => b.Get(BlockCacheCounter.AddFailure),
+            Ticker.BlockCacheAddRedundant => b.RedundantAdds,
+            Ticker.BlockCacheIndexAddRedundant => b.Get(BlockCacheCounter.IndexAddRedundant),
+            Ticker.BlockCacheFilterAddRedundant => b.Get(BlockCacheCounter.FilterAddRedundant),
+            Ticker.BlockCacheDataAddRedundant => b.Get(BlockCacheCounter.DataAddRedundant),
+            Ticker.BlockCacheCompressionDictAddRedundant => b.Get(BlockCacheCounter.CompressionDictAddRedundant),
             Ticker.BlockCacheIndexMiss => b.IndexMisses,
             Ticker.BlockCacheIndexHit => b.IndexHits,
             Ticker.BlockCacheIndexAdd => b.Get(BlockCacheCounter.IndexAdd),

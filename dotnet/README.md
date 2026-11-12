@@ -1354,7 +1354,7 @@ Not ported yet (tracked in [todo.md](todo.md)):
   `memtable_op_scan_flush_trigger` / `memtable_avg_op_scan_flush_trigger`, `memtable_batch_lookup_optimization`,
   `min_tombstones_for_range_conversion`, `strict_max_successive_merges` (and `max_successive_merges` itself),
   `blob_compression_opts` (blob files use the codec's default settings), `compression_opts.auto_skip` /
-  `auto_skip_min_sample_every`, `metadata_cache_options` (pinning follows the kFallback booleans),
+  `auto_skip_min_sample_every`,
   `uncache_aggressiveness` (a cache hint; obsolete files' blocks are left to normal eviction), `compression_manager`
   (only `nullptr`; a named manager is NotSupported at open / SetOptions), `fast_sst_open`, `open_files_async`,
   `read_io_executor_threads`, `reuse_manifest_on_open`, `optimize_manifest_for_recovery`,

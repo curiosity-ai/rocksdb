@@ -971,13 +971,15 @@ internal sealed class CompactionJob
         bool verifyFileChecksum = (flags & VerifyOutputFlags.FileChecksum) != 0 && db.Options.FileChecksumGenFactory is not null;
         using (TableReaderLease lease = cfd.TableCache.GetReader(meta))
         {
+            // verify_table always creates the iterator (table_cache->NewIterator), read back or not: with the index in
+            // the block cache unpinned that is one index lookup.
+            using InternalIterator it = lease.Reader.NewInternalIterator(TableReadFlags.DontFillCache, null, null);
             if (verifyIteration || verifyBlockChecksum)
             {
                 ulong hash = 0;
                 var prev = new PooledBufferWriter(64);
                 try
                 {
-                    using InternalIterator it = lease.Reader.NewInternalIterator(TableReadFlags.DontFillCache, null, null);
                     for (it.SeekToFirst(); it.Valid; it.Next())
                     {
                         ReadOnlySpan<byte> k = it.Key;
