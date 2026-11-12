@@ -48,8 +48,16 @@ public sealed class SwitchoverNode
     private Task<PromoteResult>? _promotion;
     private CancellationTokenSource? _promotionCts;
     private bool _rejected;
+    // 0 or 1: the parity of the epochs this node starts on its own; -1 without a peer id (any epoch).
+    private readonly int _ownEpochParity = -1;
 
     public event EventHandler<ReplicationRoleChangedEventArgs>? RoleChanged;
+
+    /// <summary>
+    /// Test seam: called by <see cref="HandleRejectEpochAsync"/> after it found no promotion running and before it
+    /// promises the epoch - the point at which a promote request for that epoch must not be able to start.
+    /// </summary>
+    internal Action? RejectEpochAfterPromotionCheck;
 
     /// <param name="nodeId">This node's id.</param>
     /// <param name="state">Its persisted role state.</param>
@@ -59,8 +67,29 @@ public sealed class SwitchoverNode
     /// stream and return once nothing will ingest into the database any more.
     /// </param>
     public SwitchoverNode(string nodeId, ReplicationRoleState state, RocksDatabase db, Func<CancellationToken, Task> detachFromPrimaryAsync)
+        : this(nodeId, null, state, db, detachFromPrimaryAsync)
+    {
+    }
+
+    /// <summary>
+    /// As the other constructor, and with <paramref name="peerId"/> the epochs this node starts on its own - after a
+    /// restart, after an aborted handoff, by <see cref="ForcePromoteAsync"/> - never collide with the ones the other node
+    /// starts on its own: the node whose id sorts first (ordinal) takes even epochs, the other one odd epochs. Without
+    /// it both take "promised + 1", and a replica force-promoted while the primary restarts (or resumes after an
+    /// aborted handoff) out of its reach becomes primary in the very epoch the old primary continues in. Two primaries
+    /// are then the operator's doing, but one epoch with two histories is not: the attach check (same sequence number,
+    /// same epoch) would later take the loser's log for a prefix of the winner's. An epoch proposed in a handoff is
+    /// agreed by both nodes (both promise it) and needs no such rule.
+    /// </summary>
+    public SwitchoverNode(string nodeId, string? peerId, ReplicationRoleState state, RocksDatabase db, Func<CancellationToken, Task> detachFromPrimaryAsync)
     {
         ArgumentException.ThrowIfNullOrEmpty(nodeId);
+        if (peerId != null)
+        {
+            int order = string.CompareOrdinal(nodeId, peerId);
+            if (order == 0) throw new ArgumentException("the two nodes of a pair need different ids", nameof(peerId));
+            _ownEpochParity = order < 0 ? 0 : 1;
+        }
         ArgumentNullException.ThrowIfNull(state);
         ArgumentNullException.ThrowIfNull(db);
         ArgumentNullException.ThrowIfNull(detachFromPrimaryAsync);
@@ -82,6 +111,14 @@ public sealed class SwitchoverNode
         if (!state.IsFresh || state.Epoch != 0) return;
         state.StartEpoch(db.GetLatestSequenceNumber() + 1, 1);
         state.Set(1, ReplicationRole.Primary, nodeId);
+    }
+
+    /// <summary>The smallest epoch above <paramref name="after"/> that this node may start on its own.</summary>
+    private long NextOwnEpoch(long after)
+    {
+        long epoch = after + 1;
+        if (_ownEpochParity >= 0 && (epoch & 1) != _ownEpochParity) epoch++;
+        return epoch;
     }
 
     public string NodeId => _nodeId;
@@ -203,6 +240,107 @@ public sealed class SwitchoverNode
     }
 
     /// <summary>
+    /// For a node that restarted as primary and has not served a write or a stream yet: if the replica holds entries
+    /// past the end of the log this node recovered, and they are this node's own entries (written before the restart,
+    /// replicated, and lost here because they were not fsync'd), hands the primary role to the replica instead of
+    /// continuing - which would rebuild the replica from this node and lose them. Afterwards this node follows the new
+    /// primary and receives its lost tail from it.
+    /// <para>
+    /// Why this is safe. (1) The tail is this node's: <paramref name="getReplicaEpochsAsync"/> returns the replica's
+    /// epoch map, and the replica's last entry must carry the epoch this node's own (fsync'd) epoch map has for that
+    /// sequence number. An epoch has one primary and one history - a primary never writes in the epoch of an earlier
+    /// run (<see cref="StartNewEpochAfterRestart"/>) - so the replica's log is then a prefix of what this node had
+    /// written, and the log this node recovered is a shorter prefix of the same. A replica whose tail comes from
+    /// anywhere else (its own writes as a force-promoted primary) carries another epoch there and is refused.
+    /// (2) Never two primaries: it is the handoff protocol of <see cref="HandOffAsync"/> - the promise is persisted, this
+    /// node is durably <see cref="ReplicationRole.HandingOff"/> with writes held before the promote goes out, the replica
+    /// promotes only while it holds exactly the sequence number named, and a lost answer is settled with
+    /// <see cref="ISwitchoverPeer.RejectEpochAsync"/>. The only difference is the handoff point: the replica's log end
+    /// instead of this node's.
+    /// </para>
+    /// Returns <see cref="SwitchoverOutcome.Rejected"/> (nothing changed; the caller goes on as primary and must call
+    /// <see cref="StartNewEpochAfterRestart"/>) when the replica is unreachable, not ahead, not a replica of this node,
+    /// or its tail is not provably this node's; otherwise the outcomes of <see cref="HandOffAsync"/>.
+    /// </summary>
+    public async Task<SwitchoverResult> YieldToReplicaAheadAsync(ISwitchoverPeer target, Func<CancellationToken, Task<string?>> getReplicaEpochsAsync,
+        SwitchoverOptions options, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        ArgumentNullException.ThrowIfNull(getReplicaEpochsAsync);
+        ArgumentNullException.ThrowIfNull(options);
+        if (!await _handoff.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+            return SwitchoverResult.Rejected(_state.Epoch, "a handoff is already in progress");
+        try
+        {
+            if (_state.Role != ReplicationRole.Primary) return SwitchoverResult.Rejected(_state.Epoch, "this node is " + _state.Role + ", not Primary");
+            long epoch = _state.Epoch;
+            ulong latest = LatestSeq;
+
+            ReplicationNodeStatus? status = await GetStatusSafeAsync(target, cancellationToken).ConfigureAwait(false);
+            if (status == null) return SwitchoverResult.Rejected(epoch, target.NodeId + " is unreachable");
+            if (status.Role != ReplicationRole.Replica || status.PrimaryId != _nodeId || status.Promoting || status.Epoch > epoch)
+                return SwitchoverResult.Rejected(epoch, target.NodeId + " is not a replica of " + _nodeId + " in an epoch this node knows");
+            ulong replicaSeq = status.LatestSeq;
+            if (replicaSeq <= latest) return SwitchoverResult.Rejected(epoch, target.NodeId + " holds nothing past " + latest);
+
+            string? serialized;
+            try
+            {
+                serialized = await getReplicaEpochsAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            {
+                serialized = null;
+            }
+            if (serialized == null) return SwitchoverResult.Rejected(epoch, target.NodeId + " did not send its epoch map");
+            Cluster.RaftLogTerms replicaEpochs = Cluster.RaftLogTerms.Deserialize(serialized);
+            long tailEpoch = _state.GetEpochForSeq(replicaSeq);
+            if (tailEpoch == 0 || replicaEpochs.GetTermForSeq(replicaSeq) != tailEpoch
+                || (latest != 0 && replicaEpochs.GetTermForSeq(latest) != _state.GetEpochForSeq(latest)))
+            {
+                return SwitchoverResult.Rejected(epoch, target.NodeId + "'s entries past " + latest + " are not this node's (epoch "
+                    + replicaEpochs.GetTermForSeq(replicaSeq) + " at " + replicaSeq + ", expected " + tailEpoch + ")");
+            }
+
+            // As in HandOffAsync from here on: the outcome is no longer "nothing happened".
+            long proposedEpoch = Math.Max(_state.PromisedEpoch, status.PromisedEpoch) + 1;
+            _state.Promise(proposedEpoch);
+            _state.Set(epoch, ReplicationRole.HandingOff, _nodeId, target.NodeId);
+            RaiseRoleChanged();
+
+            Stopwatch held = Stopwatch.StartNew();
+            await Writes.HoldAsync(CancellationToken.None).ConfigureAwait(false);
+
+            PromoteResult? result;
+            using (var rpcTimeout = new CancellationTokenSource(options.CatchUpTimeout + options.RpcGrace))
+            {
+                try
+                {
+                    result = await target.PromoteAsync(new PromoteRequest(proposedEpoch, _nodeId, replicaSeq, (int)options.CatchUpTimeout.TotalMilliseconds),
+                        rpcTimeout.Token).ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                    result = null;
+                }
+            }
+
+            if (result is { Promoted: true })
+            {
+                CompleteDemotion(result.Epoch, target.NodeId);
+                return new SwitchoverResult(SwitchoverOutcome.Completed, result.Epoch, replicaSeq, held.Elapsed,
+                    target.NodeId + " held this node's log through " + replicaSeq + ", past the " + latest + " recovered here");
+            }
+            return await SettleHandoffAsync(target, proposedEpoch, replicaSeq, held, result?.Reason ?? "no answer to the promote request", options)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            _handoff.Release();
+        }
+    }
+
+    /// <summary>
     /// Settles a node that is <see cref="ReplicationRole.HandingOff"/> after a restart, or a primary that may have been
     /// replaced while it was down. Call it at startup and, while it returns <see cref="SwitchoverOutcome.Unresolved"/>,
     /// periodically. Returns null when there was nothing to settle.
@@ -301,7 +439,7 @@ public sealed class SwitchoverNode
         {
             // The target promised the proposed epoch and is not primary in it, so it never will be. Resume in an epoch
             // newer than its promise.
-            long resumeEpoch = Math.Max(status.PromisedEpoch, _state.PromisedEpoch) + 1;
+            long resumeEpoch = NextOwnEpoch(Math.Max(status.PromisedEpoch, _state.PromisedEpoch));
             ResumeAsPrimary(resumeEpoch);
             return new SwitchoverResult(SwitchoverOutcome.Aborted, resumeEpoch, handoffSeq, held.Elapsed, reason);
         }
@@ -347,7 +485,7 @@ public sealed class SwitchoverNode
         {
             if (_state.Role != ReplicationRole.Primary || _db == null)
                 throw new InvalidOperationException(_nodeId + " is " + _state.Role + ", not a primary with a database");
-            long epoch = _state.PromisedEpoch + 1;
+            long epoch = NextOwnEpoch(_state.PromisedEpoch);
             _state.BecomePrimary(_db.GetLatestSequenceNumber() + 1, epoch, _nodeId);
             return epoch;
         }
@@ -481,6 +619,7 @@ public sealed class SwitchoverNode
             {
                 if (_promotion == null)
                 {
+                    RejectEpochAfterPromotionCheck?.Invoke();
                     // The promise is made in the critical section that saw no promotion. Released in between (as
                     // rocksdb-sharp does), a promote for this epoch that was still on the wire could start here, and
                     // this call would then report "replica, epoch promised" - the old primary resumes on that - while
@@ -516,7 +655,7 @@ public sealed class SwitchoverNode
         {
             if (_state.Role != ReplicationRole.Replica || _db == null)
                 throw new InvalidOperationException(_nodeId + " is " + _state.Role + ", not a replica with a database");
-            epoch = _state.PromisedEpoch + 1;
+            epoch = NextOwnEpoch(_state.PromisedEpoch);
             _state.Promise(epoch);
         }
         await _detachFromPrimaryAsync(cancellationToken).ConfigureAwait(false);

@@ -269,12 +269,6 @@ public sealed class Audit4ReplicationOriginalTests
         public void DeleteDirectory(string path) => inner.DeleteDirectory(path);
     }
 
-    private static void WaitUntilBlocked(Thread thread)
-    {
-        var spin = new SpinWait();
-        while ((thread.ThreadState & ThreadState.WaitSleepJoin) == 0) spin.SpinOnce();
-    }
-
     /// <summary>
     /// Approach review (switchover: never two primaries), a bug of rocksdb-sharp (SwitchoverNode.cs:432-453) that the
     /// port copied: HandleRejectEpochAsync looked for a running promotion under the node's lock, released it, and took
@@ -283,64 +277,52 @@ public sealed class Audit4ReplicationOriginalTests
     /// promotion, the reject then found the epoch promised and reported "replica, epoch promised" - on which the old
     /// primary resumes writing - while the promotion ran to its end. Two primaries. The reject now makes its promise in
     /// the same critical section in which it saw no promotion.
-    /// <para>To get the promote between the reject's two critical sections, both requests are queued on the node's lock
-    /// while a third call holds it (blocked in its state write) for longer than the lock lets a releasing thread
-    /// overtake its waiters. Which of the two runs first is up to the lock, so the scenario is repeated; every round
-    /// checks the invariant "a reject that reports Replica means the promote for that epoch does not succeed".</para>
+    /// <para>Deterministic through the node's test seam (<c>RejectEpochAfterPromotionCheck</c>, called between the
+    /// reject's check for a running promotion and its promise): there the promote request for the same epoch arrives,
+    /// and the seam returns once that request either waits for the node's lock or has been taken. A promotion that got
+    /// started is held in its detach step until the reject has answered, so the outcome does not depend on timing: with
+    /// the fix the promote waits for the lock and is refused; without it the promote is taken, the reject answers
+    /// "replica, epoch promised", and the promotion then completes.</para>
     /// </summary>
     [TestMethod]
     public async Task RejectedEpochIsNeverPromotedByAPromoteRacingTheReject()
     {
         await using RocksDatabase db = await RocksDatabase.OpenAsync("/db", DbOpts(new MemoryFileSystem()));
         db.Put(U("k"), U("v"));
-        var fs = new HookedFileSystem(new MemoryFileSystem());
-        var state = new ReplicationRoleState(fs, "/role");
+        var state = new ReplicationRoleState(new MemoryFileSystem(), "/role");
         state.Set(0, ReplicationRole.Replica, "A");
-        var node = new SwitchoverNode("B", state, db, static _ => Task.CompletedTask);
+        var rejectAnswered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // A promotion that was started reaches its detach step and waits there for the reject's answer.
+        var node = new SwitchoverNode("B", state, db, _ => rejectAnswered.Task);
         ulong handoffSeq = db.GetLatestSequenceNumber();
-        for (int round = 0; round < 12; round++)
+        long epoch = state.PromisedEpoch + 2;
+
+        Task<PromoteResult>? promotion = null;
+        int taken = 0;
+        var promote = new Thread(() =>
         {
-            long epoch = state.PromisedEpoch + 2;
-            using var holding = new ManualResetEventSlim();
-            using var release = new ManualResetEventSlim();
-            fs.BeforeCreate = _ =>
-            {
-                fs.BeforeCreate = null;
-                holding.Set();
-                release.Wait();
-            };
-            // Holds the node's lock inside its state write (a stream message of the primary's next epoch).
-            var holder = new Thread(() => node.AcceptStream("A", epoch - 1));
-            holder.Start();
-            holding.Wait();
-            ReplicationNodeStatus? status = null;
-            PromoteResult? result = null;
-            var reject = new Thread(() => status = node.HandleRejectEpochAsync(epoch).GetAwaiter().GetResult());
-            reject.Start();
-            WaitUntilBlocked(reject);
-            var promote = new Thread(() => result = node.HandlePromoteAsync(new PromoteRequest(epoch, "A", handoffSeq, 1000)).GetAwaiter().GetResult());
+            promotion = node.HandlePromoteAsync(new PromoteRequest(epoch, "A", handoffSeq, 10_000));
+            Volatile.Write(ref taken, 1);
+        });
+        node.RejectEpochAfterPromotionCheck = () =>
+        {
+            node.RejectEpochAfterPromotionCheck = null;
             promote.Start();
-            WaitUntilBlocked(promote);
-            // Past the time after which the lock hands itself to its waiters in turn.
-            Thread.Sleep(150);
-            release.Set();
-            holder.Join();
-            reject.Join();
-            promote.Join();
-            if (status!.Role == ReplicationRole.Replica)
-            {
-                Assert.IsTrue(status.PromisedEpoch >= epoch, "a replica answers a reject with the epoch promised");
-                Assert.IsFalse(result!.Promoted, "round " + round + ": the reject of epoch " + epoch + " reported Replica, but the promote for it succeeded");
-                Assert.AreEqual(ReplicationRole.Replica, node.Role, "round " + round);
-            }
-            else
-            {
-                Assert.IsTrue(result!.Promoted);
-                Assert.AreEqual(epoch, status.Epoch);
-                // Back to a replica of A for the next round.
-                state.Set(state.Epoch, ReplicationRole.Replica, "A");
-            }
-        }
+            // Until the request waits for the node's lock (held by the reject) or was taken (the lock was free).
+            var spin = new SpinWait();
+            while (Volatile.Read(ref taken) == 0 && (promote.ThreadState & ThreadState.WaitSleepJoin) == 0) spin.SpinOnce();
+        };
+
+        ReplicationNodeStatus status = await node.HandleRejectEpochAsync(epoch).WaitAsync(TestUtil.Timeout);
+        rejectAnswered.SetResult();
+        promote.Join();
+        PromoteResult result = await promotion!.WaitAsync(TestUtil.Timeout);
+
+        Assert.AreEqual(ReplicationRole.Replica, status.Role, "no promotion was running when the reject arrived");
+        Assert.IsTrue(status.PromisedEpoch >= epoch, "a replica answers a reject with the epoch promised");
+        Assert.IsFalse(result.Promoted, "the reject of epoch " + epoch + " reported Replica, but the promote for it succeeded");
+        Assert.AreEqual(ReplicationRole.Replica, node.Role);
+        Assert.IsTrue(node.Writes.IsClosed);
     }
 
     /// <summary>Copies the database files of a pair node's directory; its "role" directory (fsync'd state) is left alone.</summary>

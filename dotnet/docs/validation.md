@@ -1484,17 +1484,54 @@ Comparison with the original, each fix with a test in `Audit4ReplicationOriginal
 | `PairNodeHost` | port only | No resolve loop: an unresolved handoff left the pair without a writable primary until `ResolveAsync` was called. |
 | `ReplicationSource` WAL retention | port only | Kept each replica's highest reported position; a replica restarting lower lost WAL it still needed. |
 
-Design limits that remain (same in the original):
+Third round (the limits the comparison left open, the code it had not read, and the rules it had only read). Tests in
+`Audit4ReplicationDurabilityTests.cs` and `Audit4ReplicationProtocolTests.cs`; a power loss there is a
+`MemoryFileSystem` that drops everything not fsync'd.
 
-- Pair client writes are not fsync'd. A power loss of the primary can lose acknowledged writes even when the replica
-  holds them, because the replica is then rebuilt from the primary. The new epoch only stops this from being silent.
-  Raft with `SyncWal = false` has the same property.
-- A two-node pair cannot tell a dead peer from an unreachable one; `ForcePromote` can create two primaries.
-- Snapshot delta reuse trusts name, size and a hash of the length plus the last 1 MiB of a file.
+Durability of a pair (`README.md` of the library, "Durability of a pair", has the table of modes):
 
-Validated by reading only, not by test: the Raft election restriction, the current-term-only commit rule, two
-candidates in one term; the write gate's hold / drain order; the tailer's chunk merging across batches. Not read:
-the MagicOnion service classes beyond their timeouts, `ReplicationSession.StreamSnapshotAsync`, the samples.
+| Where | Both implementations? | What was wrong / what changed |
+|---|---|---|
+| `PairNodeHost.WriteAsync` | both | Acknowledged without fsync and by the primary alone; after a power loss of the primary the replica, the only node still holding the writes, was rebuilt from it (`WithoutSyncWalAPrimaryPowerLossLosesAcknowledgedWritesTheReplicaHeld` shows the loss as it was and as it remains with the fix switched off or the replica unreachable). New: `PairNodeHostOptions.SyncWal` (client writes and replicated chunks are fsync'd before they count), `WriteAck = PairWriteAck.Replica` (acknowledged once the replica reported holding the entry; the report is checked under the attach rule; otherwise `PairWriteStatus.NotReplicated`). Defaults unchanged. |
+| `PairNodeHost` start | both | A primary that restarts behind its replica now hands the role to it (`SwitchoverNode.YieldToReplicaAheadAsync`) instead of rebuilding it, if the replica's last entry carries the epoch the primary's own fsync'd epoch map has for that sequence number. That makes the tail the primary's own log (one epoch, one history) and the handoff protocol keeps it to one primary. Also covers a node promoted by a handoff that loses the entries it took over with. Until this is settled the node answers no attach check and serves no stream (a replica that is ahead would rebuild itself on the answer). On by default (`YieldToReplicaAheadOnRestart`). |
+| `SwitchoverNode` epochs | port only (introduced by the new epoch after a restart; the original has the same collision between `ForcePromote` and an aborted handoff's resume) | Every node took "promised + 1" for an epoch it starts on its own. A replica force-promoted while the primary restarted out of reach ended in the same epoch as the primary, with a different log; the attach check would later take one for a prefix of the other. Own epochs are now even / odd by node id. |
+
+Transport and snapshot (`RocksDb.Managed.Replication.MagicOnion`, `StreamSnapshotAsync` / `SnapshotReceiver`, the
+samples and the original's `Tests/*/Program.cs`, `PairService.cs`, `RocksDbWalInspector.cs` read side by side):
+
+| Where | Both implementations? | What was wrong |
+|---|---|---|
+| gRPC channels | both | gRPC refuses a received message above 4 MB; a WAL chunk is at least one whole write batch. A replica could never receive a larger batch and retried the same chunk for good. No receive limit now (`GrpcTransportDefaults`). |
+| gRPC channels and servers | both | No HTTP/2 keep-alive. A replica reading a WAL stream sends nothing, so it never noticed a primary that vanished without closing the connection; a server kept the handler of a vanished replica until the host stopped. Pings on both sides now. |
+| `SnapshotChunkDto.ToChunk` | port only | A chunk of an unknown kind was read as file data. Refused. |
+| `SnapshotReceiver` | port only (the original has no plan) | Restore atomicity depended on the sender putting CURRENT last; CURRENT is now written under a temporary name and renamed after the end marker. A plan that keeps CURRENT, a MANIFEST, a WAL or a file the receiver does not hold is refused before anything is deleted. |
+| `RaftClusterNode` vote / heartbeat | both | A request of a node that is not in the member list was handled like a member's: it could get the vote and its term deposed the leader. Refused. |
+| `ReplicationDelta` | both | Reuse trusted name, size and a hash of the length plus the last 1 MiB. Enough for a table file (the properties block in its tail names the session and file number of one creation event), not for a blob file, which has no identity: blob files of two histories descending from one checkpoint can agree in name, size and tail (`BlobFileOfAnotherHistoryWithTheSameNameSizeAndTailIsNotReused`, with real blob files). Blob files are compared by a hash of the whole file. |
+
+Read and found sound: deadlines or caller tokens on every unary call (a progress report of plain replication got a
+deadline), DTO defaults (every flag defaults to the refusing answer; fields appended last), stream termination (a
+WAL stream that ends is re-attached with the attach check; a snapshot without its end marker is refused),
+back-pressure of server streams (each write awaited), disposal order in the samples (server, then host, then client).
+
+Now validated by test instead of by reading: the Raft election restriction, the current-term-only commit rule, two
+candidates in one term with the vote surviving a restart (three real `RaftClusterNode`s on manual clocks), and the
+write gate's hold / drain order of a handoff (`HandoffPointIsTakenAfterTheAdmittedWritesAndNoWriteIsAcceptedAfterIt`).
+`RejectedEpochIsNeverPromotedByAPromoteRacingTheReject` no longer sleeps: it uses a seam of `SwitchoverNode` and
+fails on every run with the fix reverted.
+
+Design limits that remain:
+
+- Without `SyncWal`, an acknowledged pair write is lost when the primary loses power and the replica did not hold it,
+  or cannot be reached while the primary restarts. Raft with `SyncWal = false` has the same property.
+- A two-node pair cannot tell a dead peer from an unreachable one; `ForcePromote` can create two primaries, and gives
+  up whatever the replica had not received.
+- The gRPC transport is plaintext and does not authenticate its peer: any process that can reach the port can send
+  the RPCs. Raft requests are checked against the member list, pair requests against the configured peer id, and
+  that is all; run it on a trusted network.
+- A node that yields to its replica after a restart may itself be rebuilt from it (a replica stores a received chunk
+  as one WAL batch, and a WAL stream cannot start inside a batch).
+- Not validated by test: the tailer's chunk merging across batches under faults; keep-alive against a real dead
+  connection (only the configuration is tested).
 
 Found while checking a suspicion of that comparison (port only; the original has no commit wait): the commit wait
 compared only the commit index with the write's sequence number. A leader that wrote an entry, lost the leadership

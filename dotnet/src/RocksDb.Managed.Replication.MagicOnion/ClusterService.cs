@@ -127,14 +127,16 @@ public sealed class GrpcClusterClient : IClusterNodeClient, IDisposable
 
     /// <summary>
     /// A client whose channel uses <paramref name="channelOptions"/> (e.g. a short <see cref="GrpcChannelOptions.MaxReconnectBackoff"/>
-    /// so a healed network partition is noticed quickly).
+    /// so a healed network partition is noticed quickly). What the options leave open is filled in with
+    /// <see cref="GrpcTransportDefaults.Apply"/>: keep-alive pings unless a handler or client is set, and no receive
+    /// size limit unless one other than gRPC's default is set.
     /// </summary>
     public GrpcClusterClient(ClusterMember peer, TimeSpan unaryTimeout, GrpcChannelOptions channelOptions)
     {
         ArgumentNullException.ThrowIfNull(peer);
         ArgumentNullException.ThrowIfNull(channelOptions);
         NodeId = peer.NodeId;
-        _channel = GrpcChannel.ForAddress(peer.Endpoint, channelOptions);
+        _channel = GrpcChannel.ForAddress(peer.Endpoint, GrpcTransportDefaults.Apply(channelOptions));
         _client = MagicOnionClient.Create<IClusterService>(_channel);
         _unaryTimeout = unaryTimeout;
     }

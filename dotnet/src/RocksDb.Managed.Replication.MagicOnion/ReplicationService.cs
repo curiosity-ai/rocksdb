@@ -57,11 +57,19 @@ public sealed class GrpcReplicationClient : IReplicationSourceClient, IDisposabl
 {
     private readonly GrpcChannel _channel;
     private readonly IReplicationService _client;
+    private readonly TimeSpan _unaryTimeout;
 
-    public GrpcReplicationClient(string endpoint)
+    public GrpcReplicationClient(string endpoint) : this(endpoint, TimeSpan.FromSeconds(10))
     {
-        _channel = GrpcChannel.ForAddress(endpoint);
+    }
+
+    /// <param name="endpoint">The primary's address.</param>
+    /// <param name="unaryTimeout">Deadline of a progress report (a report that misses it is sent again).</param>
+    public GrpcReplicationClient(string endpoint, TimeSpan unaryTimeout)
+    {
+        _channel = GrpcChannel.ForAddress(endpoint, GrpcTransportDefaults.CreateChannelOptions());
         _client = MagicOnionClient.Create<IReplicationService>(_channel);
+        _unaryTimeout = unaryTimeout;
     }
 
     public async IAsyncEnumerable<SnapshotChunk> StreamInitialStateAsync([EnumeratorCancellation] CancellationToken cancellationToken)
@@ -77,7 +85,8 @@ public sealed class GrpcReplicationClient : IReplicationSourceClient, IDisposabl
     }
 
     public async Task ReportProgressAsync(int replicaIndex, ulong appliedThrough, CancellationToken cancellationToken) =>
-        await _client.WithCancellationToken(cancellationToken).ReportLastSyncSequenceNumber(replicaIndex, appliedThrough);
+        await _client.WithOptions(new Grpc.Core.CallOptions(deadline: DateTime.UtcNow + _unaryTimeout, cancellationToken: cancellationToken))
+            .ReportLastSyncSequenceNumber(replicaIndex, appliedThrough);
 
     public void Dispose() => _channel.Dispose();
 }

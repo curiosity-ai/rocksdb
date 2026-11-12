@@ -204,6 +204,11 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             // granting a vote could help elect a candidate that lacks committed entries.
             if (_resyncing) return new RequestVoteResult(_state.CurrentTerm, false);
 
+            // Only a member can become leader of this cluster. A request from anyone else (a node configured for another
+            // cluster, a member list that was changed on one node only) must neither get a vote - a majority here does
+            // not overlap with a majority of its member list - nor move this node's term and depose its leader.
+            if (!_peers.ContainsKey(candidateId)) return new RequestVoteResult(_state.CurrentTerm, false);
+
             if (term > _state.CurrentTerm)
             {
                 // Elections can only be started by nodes already in Cluster mode, so a higher-term RequestVote proves the
@@ -245,7 +250,13 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         bool conflict = false;
         lock (_gate)
         {
+            // A heartbeat of a node that is not a member is not this cluster's leader speaking (see HandleRequestVote):
+            // it must not move the term, reset the election timer or set the commit index.
+            if (!_peers.ContainsKey(heartbeat.LeaderId))
+                return new AppendEntriesResult(_state.CurrentTerm, false, 0, AppendEntriesRejectReason.StaleTerm);
+
             if (heartbeat.Term > _state.CurrentTerm) _state.UpdateTermAndVote(heartbeat.Term, null);
+
 
             // The database is being rebuilt: answer before touching it.
             if (_resyncing) return new AppendEntriesResult(_state.CurrentTerm, false, 0, AppendEntriesRejectReason.Resyncing);

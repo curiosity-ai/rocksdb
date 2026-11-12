@@ -33,7 +33,36 @@ public sealed class PairHarness : IAsyncDisposable
     public TimeSpan DisposeDrainTimeout { get; set; } = TimeSpan.FromSeconds(10);
     /// <summary><see cref="PairNodeHostOptions.ResolveInterval"/> of the hosts started from now on.</summary>
     public TimeSpan ResolveInterval { get; set; } = TimeSpan.FromSeconds(1);
-    public string DbPath(string id) => _dir.Sub(id);
+    /// <summary>The file system of a node (null: the local one, under a temp directory). Set before the node first starts.</summary>
+    public Func<string, IFileSystem>? FileSystemOf { get; set; }
+    /// <summary><see cref="PairNodeHostOptions.SyncWal"/> of the hosts started from now on.</summary>
+    public bool SyncWal { get; set; }
+    /// <summary><see cref="PairNodeHostOptions.WriteAck"/> of the hosts started from now on.</summary>
+    public PairWriteAck WriteAck { get; set; } = PairWriteAck.Primary;
+    /// <summary><see cref="PairNodeHostOptions.ReplicaAckTimeout"/> of the hosts started from now on.</summary>
+    public TimeSpan ReplicaAckTimeout { get; set; } = TimeSpan.FromSeconds(5);
+    /// <summary><see cref="PairNodeHostOptions.YieldToReplicaAheadOnRestart"/> of the hosts started from now on.</summary>
+    public bool YieldToReplicaAheadOnRestart { get; set; } = true;
+    public string DbPath(string id) => FileSystemOf is null ? _dir.Sub(id) : "/pair/" + id;
+
+    /// <summary>
+    /// A power loss of one node on its <see cref="MemoryFileSystem"/>: the file system stops accepting writes (nothing
+    /// written while the host shuts down reaches it), the host is disposed, and everything not synced is dropped.
+    /// </summary>
+    public async Task PowerLossAsync(string id, MemoryFileSystem fs)
+    {
+        fs.SetFilesystemActive(false);
+        try
+        {
+            await StopAsync(id);
+        }
+        catch (RocksDbException)
+        {
+            // closing on an inactive file system fails; the crash below decides what survives
+        }
+        fs.SimulateCrash();
+        fs.SetFilesystemActive(true);
+    }
     /// <summary>Called (on the logging thread, synchronously) with the node id and every line a host logs.</summary>
     public Action<string, string>? OnLog { get; set; }
     public PairNodeHost this[string id] => _hosts[id];
@@ -42,13 +71,18 @@ public sealed class PairHarness : IAsyncDisposable
 
     public async Task<PairNodeHost> StartAsync(string id)
     {
+        IFileSystem fs = FileSystemOf?.Invoke(id) ?? LocalFileSystem.Instance;
         var host = new PairNodeHost(new PairNodeHostOptions
         {
             NodeId = id,
             PeerId = Peer(id),
-            DbPath = _dir.Sub(id),
+            DbPath = DbPath(id),
             InitialRole = id == "A" ? ReplicationRole.Primary : ReplicationRole.Replica,
-            DbOptionsFactory = static () => new DbOptions { WalTtlSeconds = 600 },
+            DbOptionsFactory = () => new DbOptions { WalTtlSeconds = 600, FileSystem = fs },
+            SyncWal = SyncWal,
+            WriteAck = WriteAck,
+            ReplicaAckTimeout = ReplicaAckTimeout,
+            YieldToReplicaAheadOnRestart = YieldToReplicaAheadOnRestart,
             Switchover = Switchover,
             MaxChunkBytes = 16 * 1024,
             RetryDelay = TimeSpan.FromMilliseconds(50),

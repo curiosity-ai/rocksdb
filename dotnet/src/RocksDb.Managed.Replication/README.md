@@ -72,12 +72,14 @@ if (!await consumer.TryIngestChunkAsync(chunkBytes, ct)) Resync();   // must sta
   chunks with merge operands, blob indexes, timed puts or 2PC markers are inserted serially.
 * When the WAL a replica needs was purged, the tailer throws `RocksDbException(NotFound)` (the hosts turn this into a
   "resync required" stream message) and the replica rebuilds from a new snapshot. `ReplicationDelta` keeps the
-  immutable SST/blob files both sides hold byte-identically (name + size + SHA-256 of length and last 1 MiB), so a
+  immutable SST/blob files both sides hold byte-identically (name + size + SHA-256 of the length and the last 1 MiB of a table file - its properties name the one creation event - or of the whole of a blob file, which carries no identity), so a
   rebuild only transfers what changed. A source that cannot read its own WAL (Corruption) also asks for a resync,
   marked `WalStreamMessage.SourceFault` and counted in the host's `WalStreamFaults`; a follower that has applied
   nothing since its last rebuild then retries the stream instead of rebuilding again (`FollowerResyncPolicy`).
 * A snapshot stream is: plan (files the consumer keeps), file chunks with CURRENT last, end marker.
-  `SnapshotReceiver` refuses a stream without plan or end marker, so a cut-off transfer is never opened as a database.
+  `SnapshotReceiver` refuses a stream without plan or end marker, so a cut-off transfer is never opened as a database;
+  it writes CURRENT under a temporary name until the end marker (whatever order the sender uses) and refuses a plan
+  that keeps anything but immutable files it holds.
 * WAL retention: with `DbOptions.WalTtlSeconds`/`WalSizeLimitMb` obsolete WALs are archived;
   `ReplicationSource.ReportReplicaProgress` + `RetireArchivedWals()` delete archived WALs once every replica applied
   them (nothing while a checkpoint session is in flight). Size the archive for the longest expected replica downtime.
@@ -101,9 +103,44 @@ an epoch map (`startSeq -> epoch`, a `RaftLogTerms`) lets a rejoining node prove
 a diverged node (after `ForcePromoteAsync`) is rebuilt from a snapshot. `PairNodeHost` wires this with the WAL stream,
 client writes with primary hints, snapshot resync and fault injection; while a node is `HandingOff` outside a running
 handoff (target unreachable, or a restart in the middle of one) it asks the other node every
-`PairNodeHostOptions.ResolveInterval` how the handoff ended. Client writes of a pair are not fsync'd: a power loss of the
-primary can lose acknowledged writes (the replica that still holds them is rebuilt from the restarted primary). See rocksdb-sharp's
-`Replication/Switchover/README.md` for the full protocol discussion; it applies unchanged.
+`PairNodeHostOptions.ResolveInterval` how the handoff ended. See rocksdb-sharp's
+`Replication/Switchover/README.md` for the protocol discussion; it applies except for the durability modes below.
+
+### Durability of a pair
+
+What `PairWriteStatus.Applied` promises is set by two options (set them alike on both nodes - either can be primary):
+
+| `SyncWal` | `WriteAck` | an acknowledged write is | lost when |
+|---|---|---|---|
+| false (default) | `Primary` (default) | in the primary's log, not fsync'd; streamed to the replica afterwards | the primary loses power and the replica had not received it; or had, but cannot be reached while the primary restarts (or `YieldToReplicaAheadOnRestart` is off); the primary is lost for good before the replica received it; a node promoted by a handoff loses power before the entries it took over with reached its disk and the other node is unreachable when it restarts |
+| true | `Primary` | on the primary's disk | the primary is lost for good (disk included) before the replica received it |
+| false | `Replica` | in both nodes' logs, not fsync'd | both nodes lose power; or the primary loses power and the replica is unreachable while it restarts |
+| true | `Replica` | on both disks | both disks are lost |
+
+* `SyncWal` (as `ClusterNodeHostOptions.SyncWal`): the primary fsyncs a client write before acknowledging it (group
+  commit: concurrent writes share one fsync) and before it becomes visible to the WAL stream, so the replica never holds
+  an entry the primary's disk does not; the replica fsyncs every chunk before its sequence number moves past it, so a
+  node promoted by a handoff holds the handoff point on disk.
+* `WriteAck = PairWriteAck.Replica`: the replica reports the position it holds after every chunk
+  (`IPairNodeClient.ReportProgressAsync`, repeated until it arrives) together with the epoch it has for that entry; the
+  primary counts a report only under the attach check's rule (it holds that entry in the same epoch) and acknowledges a
+  write once it is covered. Without a replica that follows, a write ends as `PairWriteStatus.NotReplicated` after
+  `ReplicaAckTimeout`: it is in the primary's log and not acknowledged (indeterminate, like a timeout). The wait is
+  inside the write gate, so a handoff starts only after the writes in flight were acknowledged or gave up.
+* `YieldToReplicaAheadOnRestart` (default true): a node that restarts as primary and finds the replica holding entries
+  past the end of its recovered log hands the role to the replica instead of rebuilding it
+  (`SwitchoverNode.YieldToReplicaAheadAsync`), and then follows it. It does so only if the replica's last entry carries
+  the epoch its own fsync'd epoch map has for that sequence number - an epoch has one primary and one history, so the
+  replica's log is then what this node had written - and it uses the handoff protocol (promise, durable `HandingOff`,
+  promote at an exact sequence number, `RejectEpoch` to settle), so it cannot make two primaries. Until the restarted
+  node has settled this it does not answer attach checks or serve streams. The restarted node itself may be rebuilt
+  from the new primary (a replica stores a chunk as one WAL batch and a stream cannot start inside one); the node that
+  holds the acknowledged writes never is.
+* One epoch, one history: the epochs a node starts on its own (after a restart, after an aborted handoff, by
+  `ForcePromoteAsync`) are even for the node whose id sorts first and odd for the other, so a forced promotion and a
+  primary restarting out of reach never end in the same epoch. Handoff epochs are agreed by both nodes.
+* `ForcePromoteAsync` is outside all of this: it gives up whatever the replica had not received, and with two nodes it
+  can make two primaries.
 
 ## Raft cluster
 
@@ -158,8 +195,14 @@ where noted below. Out of scope as before: pre-vote, membership changes, ReadInd
 | MagicOnion in the samples only | same: `RocksDb.Managed.Replication.MagicOnion` is optional | the core stays transport-agnostic |
 | hosts report follower progress on a 200 ms timer | one report per applied chunk (coalesced); a report whose send failed is repeated every `RetryDelay` until one arrives | no idle traffic, and the last report of a burst still cannot be lost (the leader could not commit a quorum-held entry without it) |
 | `HandleRejectEpochAsync` looks for a running promotion, releases the node's lock, takes it again to promise the epoch | one critical section | a promote for that epoch landing in between was promoted although the reject answered "replica, epoch promised": two primaries |
-| a pair primary that restarts continues in its epoch; a bootstrap primary that restarts continues in its term | a new epoch / term starts at the end of the recovered log (`SwitchoverNode.StartNewEpochAfterRestart`, `RaftPersistentState.StartTerm`) | after a power loss the recovered log may end before entries a replica holds (pair writes, and Raft with `SyncWal = false`, are not fsync'd); new entries at those sequence numbers in the same epoch / term let the replica's stale tail pass the attach check - silent divergence |
+| pair writes are never fsync'd and are acknowledged by the primary alone; after a power loss of the primary the replica is rebuilt from it | `PairNodeHostOptions.SyncWal`, `WriteAck = Replica`, and a restarted primary yields to a replica that holds its lost tail | acknowledged writes the replica still held were lost; see "Durability of a pair" |
+| every node allocates "promised + 1" for an epoch it starts on its own | even / odd by node id | a forced promotion and a primary restarting (or resuming after an aborted handoff) out of reach became primaries of the same epoch with different logs; the attach check then takes one log for a prefix of the other |
+| a pair primary that restarts continues in its epoch; a bootstrap primary that restarts continues in its term |
+ a new epoch / term starts at the end of the recovered log (`SwitchoverNode.StartNewEpochAfterRestart`, `RaftPersistentState.StartTerm`) | after a power loss the recovered log may end before entries a replica holds (pair writes, and Raft with `SyncWal = false`, are not fsync'd); new entries at those sequence numbers in the same epoch / term let the replica's stale tail pass the attach check - silent divergence |
 | a Raft state file that cannot be read starts the node "fresh" (term 0, no vote) | the read error is thrown | a node that forgot its vote can vote twice in one term |
+| a vote request or heartbeat of any node is handled | only of a member | a node configured for another cluster could get the vote, and its term deposed the leader |
+| gRPC channels with default settings | `GrpcTransportDefaults`: HTTP/2 keep-alive pings on channels and servers, no limit on received messages | a replica reading a stream never noticed a primary that vanished without closing the connection; a WAL chunk above gRPC's 4 MB default (one large write batch) never reached the replica |
+| snapshot delta reuse by name + size + hash of the last 1 MiB for every file | the whole file for blob files | a blob file has no identity; blob files of two histories can agree in name, size and tail |
 
 ## Switchover cost
 

@@ -65,11 +65,19 @@ public sealed class SnapshotChunkDto
         Content = c.Content,
     };
 
+    /// <summary>
+    /// Throws <see cref="InvalidDataException"/> for a kind this build does not know (a newer sender): taking it for
+    /// file data would write the message's content into the database directory - or, with an empty file name, fail
+    /// with a message about the name - where the restore must simply fail.
+    /// </summary>
     public SnapshotChunk ToChunk() => (SnapshotChunkKind)Kind switch
     {
-        SnapshotChunkKind.Plan => SnapshotChunk.Plan(SequenceNumber, KeepFiles),
-        SnapshotChunkKind.Complete => SnapshotChunk.Complete((int)FileSize),
-        _ => SnapshotChunk.FileData(FileName ?? "", FileSize, Offset, Content),
+        SnapshotChunkKind.Plan => SnapshotChunk.Plan(SequenceNumber, KeepFiles ?? []),
+        SnapshotChunkKind.Complete => FileSize is >= 0 and <= int.MaxValue
+            ? SnapshotChunk.Complete((int)FileSize)
+            : throw new InvalidDataException("snapshot end marker with file count " + FileSize),
+        SnapshotChunkKind.FileData => SnapshotChunk.FileData(FileName ?? "", FileSize, Offset, Content),
+        _ => throw new InvalidDataException("snapshot chunk of unknown kind " + Kind),
     };
 }
 
@@ -252,6 +260,14 @@ public sealed class PairWriteResultDto
     [Key(0)] public bool Applied { get; set; }
     [Key(1)] public string? PrimaryHint { get; set; }
     [Key(2)] public ulong Sequence { get; set; }
+    /// <summary>
+    /// The <see cref="PairWriteStatus"/>. Appended last: a sender built without it is read as 0, so use
+    /// <see cref="ToStatus"/>, which falls back to <see cref="Applied"/>.
+    /// </summary>
+    [Key(3)] public int Status { get; set; }
+
+    public PairWriteStatus ToStatus() =>
+        Applied ? PairWriteStatus.Applied : Status == (int)PairWriteStatus.NotReplicated ? PairWriteStatus.NotReplicated : PairWriteStatus.NotPrimary;
 }
 
 [MessagePackObject]

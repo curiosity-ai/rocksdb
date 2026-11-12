@@ -124,6 +124,13 @@ public sealed record SnapshotRestoreResult(ulong SequenceNumber, int ReusedFiles
 /// the WAL directory and every file the plan does not keep, except <c>preserveNames</c>), then writes each file. The
 /// sender transfers CURRENT last, so a receiver that dies mid-transfer leaves no CURRENT behind and the next attempt
 /// starts over cleanly; <see cref="CompleteAsync"/> also requires the stream's end marker. Ported from the snapshot pull of rocksdb-sharp's ClusterTest / SwitchoverTest hosts.
+/// <para>
+/// The receiver does not rely on the sender for what makes a restore atomic: CURRENT is written under a temporary name
+/// and renamed into place by <see cref="CompleteAsync"/>, after the end marker and after every other file was synced -
+/// so no order of files and no cut can leave a directory that opens as a database; and a plan may only keep immutable
+/// files (.sst / .blob) that exist here - a plan that keeps CURRENT, a MANIFEST or a WAL, or names a file this node
+/// does not hold, is refused before anything is deleted.
+/// </para>
 /// </summary>
 public sealed class SnapshotReceiver : IAsyncDisposable
 {
@@ -139,6 +146,11 @@ public sealed class SnapshotReceiver : IAsyncDisposable
     private IWritableFile? _current;
     private string? _currentName;
     private long _currentSize;
+    private bool _currentFileReceived;
+
+    private const string CurrentFileName = "CURRENT";
+    // Not a name RocksDB knows; a leftover is deleted by the next restore (it is never in a plan's keep list).
+    private const string PendingCurrentFileName = "CURRENT.restoring";
 
     public SnapshotReceiver(IFileSystem fileSystem, string dbPath, IEnumerable<string> preserveNames)
     {
@@ -167,6 +179,13 @@ public sealed class SnapshotReceiver : IAsyncDisposable
         if (chunk.Kind == SnapshotChunkKind.Plan)
         {
             if (_planApplied) throw new InvalidOperationException("snapshot stream sent two plans");
+            foreach (string keep in chunk.KeepFiles)
+            {
+                if (!ReplicationDelta.IsPlainFileName(keep) || !ReplicationDelta.IsImmutableFile(keep))
+                    throw new InvalidOperationException("snapshot plan keeps " + keep + ", which is not an immutable table or blob file");
+                if (!_fs.FileExists(FileSystemHelpers.Combine(_dbPath, keep)))
+                    throw new InvalidOperationException("snapshot plan keeps " + keep + ", which this node does not hold");
+            }
             ReplicationDelta.PrepareForRestore(_fs, _dbPath, chunk.KeepFiles, _preserve);
             _reused = chunk.KeepFiles.Count;
             _sequence = chunk.SequenceNumber;
@@ -182,12 +201,21 @@ public sealed class SnapshotReceiver : IAsyncDisposable
             _complete = true;
             return;
         }
-        if (!ReplicationDelta.IsPlainFileName(chunk.FileName)) throw new InvalidOperationException("snapshot stream sent an invalid file name: " + chunk.FileName);
+        if (chunk.Kind != SnapshotChunkKind.FileData) throw new InvalidOperationException("snapshot stream sent a chunk of unknown kind " + (int)chunk.Kind);
+        if (!ReplicationDelta.IsPlainFileName(chunk.FileName) || chunk.FileName == PendingCurrentFileName)
+            throw new InvalidOperationException("snapshot stream sent an invalid file name: " + chunk.FileName);
+        foreach (string preserved in _preserve)
+        {
+            if (string.Equals(preserved, chunk.FileName, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("snapshot stream sent " + chunk.FileName + ", which is this node's own state");
+        }
         if (_currentName != chunk.FileName)
         {
             await CloseCurrentAsync(cancellationToken).ConfigureAwait(false);
             _currentName = chunk.FileName;
-            _current = _fs.CreateWritable(FileSystemHelpers.Combine(_dbPath, chunk.FileName!), truncate: true);
+            bool isCurrent = chunk.FileName == CurrentFileName;
+            if (isCurrent) _currentFileReceived = true;
+            _current = _fs.CreateWritable(FileSystemHelpers.Combine(_dbPath, isCurrent ? PendingCurrentFileName : chunk.FileName!), truncate: true);
             _currentSize = chunk.FileSize;
             _files++;
         }
@@ -211,6 +239,12 @@ public sealed class SnapshotReceiver : IAsyncDisposable
         // Without the end marker the transfer was cut off; CURRENT goes last, but a partially written file before it
         // must not be taken for a complete restore either.
         if (!_complete) throw new InvalidOperationException("snapshot stream ended before its end marker");
+        if (_currentFileReceived)
+        {
+            // Everything else is in place and synced; only now does the directory become an openable database.
+            _fs.SyncDirectory(_dbPath);
+            _fs.RenameFile(FileSystemHelpers.Combine(_dbPath, PendingCurrentFileName), FileSystemHelpers.Combine(_dbPath, CurrentFileName));
+        }
         _fs.SyncDirectory(_dbPath);
         return new SnapshotRestoreResult(_sequence, _reused, _files, _bytes);
     }

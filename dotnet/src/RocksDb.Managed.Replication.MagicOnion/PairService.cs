@@ -27,6 +27,11 @@ public interface IPairService : IService<IPairService>
     /// <summary>Operator / coordinator: hand the primary role to the other node.</summary>
     UnaryResult<SwitchoverResultDto> HandOffAsync();
     UnaryResult<DigestDto> ChecksumAsync();
+    /// <summary>
+    /// Replica -> primary (<see cref="IPairNodeClient.ReportProgressAsync"/>). Declared last: a node built without it
+    /// answers Unimplemented, which the client treats as "this primary does not count reports".
+    /// </summary>
+    UnaryResult<bool> ReportProgressAsync(ulong appliedThrough, long epochAtApplied);
 }
 
 /// <summary>Server side of <see cref="IPairService"/>: delegates to the process's <see cref="PairNodeHost"/>.</summary>
@@ -88,7 +93,13 @@ public sealed class PairService(PairNodeHost host) : ServiceBase<IPairService>, 
         using var batch = new WriteBatch();
         batch.Put(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value));
         PairWriteResult r = await host.WriteAsync(batch, TimeSpan.FromSeconds(5), Context.CallContext.CancellationToken).ConfigureAwait(false);
-        return new PairWriteResultDto { Applied = r.Status == PairWriteStatus.Applied, PrimaryHint = r.PrimaryHint, Sequence = r.Sequence };
+        return new PairWriteResultDto { Applied = r.Status == PairWriteStatus.Applied, PrimaryHint = r.PrimaryHint, Sequence = r.Sequence, Status = (int)r.Status };
+    }
+
+    public UnaryResult<bool> ReportProgressAsync(ulong appliedThrough, long epochAtApplied)
+    {
+        host.HandleReportProgress(appliedThrough, epochAtApplied);
+        return UnaryResult.FromResult(true);
     }
 
     public async UnaryResult<SwitchoverResultDto> HandOffAsync() =>
@@ -107,7 +118,7 @@ public sealed class GrpcPairClient : IPairNodeClient, IDisposable
     public GrpcPairClient(string nodeId, string endpoint, TimeSpan statusTimeout)
     {
         NodeId = nodeId;
-        _channel = GrpcChannel.ForAddress(endpoint);
+        _channel = GrpcChannel.ForAddress(endpoint, GrpcTransportDefaults.CreateChannelOptions());
         _client = MagicOnionClient.Create<IPairService>(_channel);
         _statusTimeout = statusTimeout;
     }
@@ -199,6 +210,18 @@ public sealed class GrpcPairClient : IPairNodeClient, IDisposable
         while (await call.ResponseStream.MoveNext(cancellationToken).ConfigureAwait(false))
         {
             yield return call.ResponseStream.Current.ToChunk();
+        }
+    }
+
+    public async Task ReportProgressAsync(ulong appliedThrough, long epochAtApplied, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await CallWithDeadline(cancellationToken).ReportProgressAsync(appliedThrough, epochAtApplied);
+        }
+        catch (RpcException e) when (e.StatusCode == Grpc.Core.StatusCode.Unimplemented)
+        {
+            // A primary built before this call existed: it acknowledges writes on its own, nothing to report.
         }
     }
 

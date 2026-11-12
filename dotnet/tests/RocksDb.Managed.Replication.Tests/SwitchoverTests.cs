@@ -90,14 +90,15 @@ public sealed class SwitchoverTests
         Assert.AreEqual(SwitchoverOutcome.Aborted, aborted.Outcome, aborted.Reason + "\n" + h.LogText);
         Assert.AreEqual(ReplicationRole.Primary, h["A"].Node.Role);
         Assert.IsTrue(h["A"].Node.Writes.IsOpen);
-        Assert.AreEqual(3, h["A"].Node.Epoch, "resumes past the epoch B promised");
+        // Past the epoch B promised (2), and even: the epochs A starts on its own never collide with B's (odd).
+        Assert.AreEqual(4, h["A"].Node.Epoch, "resumes past the epoch B promised");
 
         h["B"].Faults.PauseIngest = false;
-        await WaitUntilAsync(() => h["B"].Node.Epoch == 3, "B to follow A's new epoch\n" + h.LogText);
+        await WaitUntilAsync(() => h["B"].Node.Epoch == 4, "B to follow A's new epoch\n" + h.LogText);
         h.Switchover.CatchUpTimeout = TimeSpan.FromSeconds(3);
         SwitchoverResult completed = await HandOffAsync(h, "A");
         Assert.AreEqual(SwitchoverOutcome.Completed, completed.Outcome, completed.Reason + "\n" + h.LogText);
-        Assert.AreEqual(4, completed.Epoch);
+        Assert.AreEqual(5, completed.Epoch);
 
         await stop.CancelAsync();
         await writers;
@@ -199,7 +200,8 @@ public sealed class SwitchoverTests
         h["B"].Faults.PauseIngest = false;
 
         long epoch = await h["B"].ForcePromoteAsync(CancellationToken.None);
-        Assert.AreEqual(2, epoch);
+        Assert.AreEqual(3, epoch, "the first epoch past 1 that B may start on its own (odd)");
+
         await WriteThroughAsync(h["B"], 1000, 1100);
 
         // A restarts as primary, learns B is primary in a newer epoch, steps down; its tail diverged -> snapshot.
