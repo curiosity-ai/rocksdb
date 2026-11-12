@@ -1944,3 +1944,35 @@ paranoid_file_checks off) memtables of Put / Delete entries take the unchanged c
 one predictable branch per memtable insert (the HasFlushResolvedEntries flag), one scan of the memtable list per
 HasPendingFlush call; flushes of memtables with merges / single deletes / range tombstones now run the CompactionIterator
 (virtual iterator calls per entry, a MergingIterator over several memtables) instead of the copy loop.
+
+## Audit #5: standalone range tombstones in universal compaction
+
+Read against `FileMetaData::FileIsStandAloneRangeTombstone` (`db/version_edit.h`), `UniversalCompactionBuilder`
+(`db/compaction/compaction_picker_universal.cc`: constructor, `CalculateSortedRuns`, `ShouldSkipMarkedFile`,
+`PickDeleteTriggeredCompaction`, `BuildCompactionToNextLevel`, and every reader of `level_has_marked_standalone_rangedel`),
+`CompactionPicker::PickFilesMarkedForCompaction` / `GetOverlappingL0Files` / `SetupOtherInputs` (`starting_l0_file`),
+`VersionStorageInfo::ComputeFilesMarkedForCompaction` / `RemoveFilesBeingCompactedFromCompactionCandidates`
+(`standalone_range_tombstone_files_mark_threshold_`) and the snapshot release path of `DBImpl`
+(`ReconcileOldestSnapshotForColumnFamily`, `UpdateSnapshotCompactionThresholds`). Unit tests:
+`Audit5StandaloneRangeTombstoneTests`; native differential: `Audit5StandaloneRangeTombstoneCompatTests` (native 11.12
+behaves the same; no gate).
+
+Found through `AtomicReplaceRangeTests.UniversalPartialOverlapIngestsRangeTombstoneBelowNewFiles`, which had dropped the
+upstream shape assertions (after `WaitForCompact` with the snapshot held, and after the release): with them restored it
+failed 40 of 40 runs, because the port compacted the ingested tombstone file (L5) into L6 while the snapshot was held
+(reason `FilesMarkedForCompaction`). The intermittent failure noted in the previous section was that compaction winning
+the race against the assertion taken right after the ingestion. Restored; 40 of 40 runs pass.
+
+| Item | What differed | Now |
+|---|---|---|
+| Standalone files not recognised | The picker header said the per-file entry counts were not kept; they are (`SetEntryStats`). | `FileMetaData.FileIsStandAloneRangeTombstone`. Ingested files get their entry stats from the properties read while validating them (upstream reads the same values in `MaybeInitializeFileMetaData`), so the picker does not depend on the capped stats load of the new version. |
+| Deferral while a snapshot is older | A marked standalone file was compacted at once. | `UniversalCompactionPicker` gets the live snapshots and the DB's snapshot checker (`PickCompaction(vstorage, snapshots, snapshotChecker, requireMaxOutputLevel)`; earliest snapshot only without user-defined timestamps). `ShouldSkipMarkedFile` defers the file until `DataIsDefinitelyInSnapshot(largest_seqno, earliest snapshot)`, and while the next older sorted run also has a marked standalone file. Used for the single-level path and, through a skip predicate, `PickFilesMarkedForCompaction`; the leveled picker passes a predicate that never skips, as upstream. The file's sorted run is found by a scan of the (short) run list instead of upstream's per-pick `std::map`. |
+| Other universal compactions | Size amp, size ratio, sorted-run count and periodic compactions could take the run holding the file. | `SortedRun.LevelHasMarkedStandaloneRangeDel`: those compactions stop at (or do not count) such a run, as upstream. |
+| Newer L0 files pulled in | An L0 standalone file was compacted with the newer L0 files it overlaps. | `starting_l0_file` for `GetOverlappingL0Files` / `SetupOtherInputs`. |
+| Rescheduling on snapshot release | Nothing re-examined the deferred file. | `VersionStorageInfo.StandaloneRangeTombstoneFilesMarkThreshold` (computed with the marked files); `DbImpl._standaloneRangeDeletionFilesMarkThreshold` (minimum over the column families, lowered when a version is installed); a snapshot release with the oldest snapshot at or past it schedules the column families whose threshold it passed and recomputes it over all of them, so a later release schedules another attempt while the file is still marked (as in `StandaloneRangeTombstoneSnapshotAdvanceRequeuesScheduling`). |
+| Ingestion notification poisoned the table cache | `NotifyOnExternalFileIngested` opened the ingested table through the table cache with a `FileMetaData` lacking its largest seqno; the cached reader had no global sequence number, so a later compaction read the file's range tombstones at seqno 0 and kept the keys they delete. It was hidden while the stats load of the new version opened the table first. | The notification reports the properties read during validation (upstream `info.table_properties = f.table_properties`). Covered by `StandaloneRangeDeletionEndKeyIsExclusive` (listener registered). |
+
+Left: `Compaction::FilterInputsForCompactionIterator` (input files fully covered by a standalone tombstone that the
+earliest snapshot sees are dropped without being read, with the `num_filtered_input_files_*` / `bytes_skipped_*`
+compaction statistics) is not ported: the port reads those files and drops their keys in the compaction iterator. The
+output and the resulting levels are the same; the I/O and those statistics differ (they stay 0).

@@ -65,6 +65,15 @@ internal sealed partial class VersionStorageInfo
 
     /// <summary>Files marked for compaction by a table property collector (FileMetaData::marked_for_compaction).</summary>
     public List<(int Level, FileMetaData File)> FilesMarkedForCompaction => _filesMarkedForCompaction;
+
+    /// <summary>
+    /// standalone_range_tombstone_files_mark_threshold(): the smallest seqno of a standalone range tombstone file marked
+    /// for compaction (not being compacted), or kMaxSequenceNumber. The universal picker defers such a file while a
+    /// snapshot older than it exists; once the oldest snapshot reaches this threshold, releasing a snapshot schedules a
+    /// compaction again (DBImpl::ReleaseSnapshot). Computed with the files marked for compaction (also after a compaction
+    /// is registered, RemoveFilesBeingCompactedFromCompactionCandidates). Guarded by the DB mutex.
+    /// </summary>
+    public ulong StandaloneRangeTombstoneFilesMarkThreshold { get; private set; } = DbFormat.MaxSequenceNumber;
     public List<(int Level, FileMetaData File)> ExpiredTtlFiles => _expiredTtlFiles;
     public List<(int Level, FileMetaData File)> FilesMarkedForPeriodicCompaction => _filesMarkedForPeriodicCompaction;
     /// <summary>Table files linked to the oldest blob files when their garbage ratio reaches the force threshold.</summary>
@@ -578,6 +587,7 @@ internal sealed partial class VersionStorageInfo
     {
         _filesMarkedForCompaction.Clear();
         int lastQualifyLevel = 0;
+        StandaloneRangeTombstoneFilesMarkThreshold = DbFormat.MaxSequenceNumber;
         // Do not include files from the last level with data. If table properties collector suggests a file on the
         // last level, we should not move it to a new level.
         for (int level = lastLevel; level >= 1; level--)
@@ -592,7 +602,14 @@ internal sealed partial class VersionStorageInfo
         {
             foreach (FileMetaData f in _files[level])
             {
-                if (f.MarkedForCompaction && !f.BeingCompacted) _filesMarkedForCompaction.Add((level, f));
+                if (f.MarkedForCompaction && !f.BeingCompacted)
+                {
+                    _filesMarkedForCompaction.Add((level, f));
+                    if (f.FileIsStandAloneRangeTombstone())
+                    {
+                        StandaloneRangeTombstoneFilesMarkThreshold = Math.Min(StandaloneRangeTombstoneFilesMarkThreshold, f.SmallestSeqno);
+                    }
+                }
             }
         }
     }

@@ -17,6 +17,11 @@ internal sealed class IngestedFileInfo
     public ulong GlobalSeqnoOffset;
     public ulong NumEntries;
     public ulong NumRangeDeletions;
+    /// <summary>
+    /// The file's table properties, read once while validating it. They give the file metadata its entry stats when it is
+    /// added (upstream loads the same values from the properties in Version::MaybeInitializeFileMetaData).
+    /// </summary>
+    public TableProperties? Properties;
     /// <summary>External SST version: 1, 2 (SstFileWriter) or 0 (a DB-generated file, allow_db_generated_files).</summary>
     public uint Version;
     public ulong TailSize;
@@ -490,6 +495,7 @@ internal sealed class ExternalSstFileIngestionJob
         SanityCheckTableProperties(props, info);
         info.NumEntries = props.NumEntries - props.NumRangeDeletions;
         info.NumRangeDeletions = props.NumRangeDeletions;
+        info.Properties = props;
         if (props.NumEntries == 0 && props.NumRangeDeletions == 0) ThrowHelper.InvalidArgument("File contain no entries");
         IReadOnlyDictionary<string, byte[]> uprops = props.UserCollectedProperties;
         if (uprops.TryGetValue(TablePropertiesNames.TimestampMin, out byte[]? tsMin)) info.MinTimestamp = tsMin;
@@ -1032,6 +1038,9 @@ internal sealed class ExternalSstFileIngestionJob
                 Temperature = f.Temperature,
             };
             meta.UniqueId = IngestedFileUniqueId(f.DbId, f.DbSessionId, f.OrigFileNumber);
+            // Known entry stats: FileIsStandAloneRangeTombstone (universal picker, ReleaseSnapshot) needs them without
+            // depending on the capped stats load of the new version.
+            if (f.Properties is not null) meta.SetEntryStats(f.Properties);
             edit.AddFile(f.PickedLevel, meta);
             batchUppermostLevel = Math.Min(batchUppermostLevel, f.PickedLevel);
         }

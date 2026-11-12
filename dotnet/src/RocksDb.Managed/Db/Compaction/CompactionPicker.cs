@@ -54,6 +54,14 @@ internal abstract partial class CompactionPicker
     public virtual Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots, bool requireMaxOutputLevel) =>
         PickCompaction(vstorage, snapshots);
 
+    /// <summary>
+    /// CompactionPicker::PickCompaction with the DB's snapshot checker (existing_snapshots + snapshot_checker): only the
+    /// universal picker uses them (standalone range tombstone files), like upstream.
+    /// </summary>
+    public virtual Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots, SnapshotChecker? snapshotChecker,
+        bool requireMaxOutputLevel) =>
+        PickCompaction(vstorage, snapshots, requireMaxOutputLevel);
+
     // ---------------------------------------------------------------------------------------------------------
     // registry
 
@@ -248,9 +256,10 @@ internal abstract partial class CompactionPicker
     /// <summary>
     /// Port of CompactionPicker::SetupOtherInputs: adds the overlapping output-level files and, when it doesn't pull in
     /// more output files, expands the start-level inputs. Returns false if parent-level files are being compacted.
+    /// A non-null <paramref name="startingL0File"/> restricts the L0 expansion to that file and older ones.
     /// </summary>
     public bool SetupOtherInputs(VersionStorageInfo vstorage, CompactionInputFiles inputs, CompactionInputFiles outputLevelInputs,
-        ref int parentIndex, int baseIndex, bool onlyExpandTowardsRight)
+        ref int parentIndex, int baseIndex, bool onlyExpandTowardsRight, FileMetaData? startingL0File)
     {
         int inputLevel = inputs.Level;
         int outputLevel = outputLevelInputs.Level;
@@ -273,7 +282,8 @@ internal abstract partial class CompactionPicker
             GetRange(inputs, outputLevelInputs, out byte[] allStart, out byte[] allLimit);
             bool tryOverlappingInputs = true;
             var tmp = new List<FileMetaData>();
-            vstorage.GetOverlappingInputs(inputLevel, onlyExpandTowardsRight ? smallest : allStart, allLimit, tmp, baseIndex, out _);
+            vstorage.GetOverlappingInputs(inputLevel, onlyExpandTowardsRight ? smallest : allStart, allLimit, tmp, baseIndex, out _,
+                expandRange: true, startingL0File);
             expandedInputs.Files = new List<FileMetaData>(tmp);
             ulong expandedInputsSize = TotalFileSize(expandedInputs.Files);
             if (!ExpandInputsToCleanCut(vstorage, expandedInputs)) tryOverlappingInputs = false;
@@ -322,25 +332,39 @@ internal abstract partial class CompactionPicker
         }
     }
 
-    /// <summary>Port of CompactionPicker::GetOverlappingL0Files.</summary>
-    public bool GetOverlappingL0Files(VersionStorageInfo vstorage, CompactionInputFiles startLevelInputs, int outputLevel, ref int parentIndex)
+    /// <summary>
+    /// Port of CompactionPicker::GetOverlappingL0Files. A non-null <paramref name="startingL0File"/> restricts the L0
+    /// files to that file and older ones (a standalone range tombstone file is not compacted with newer L0 files it does
+    /// not cover).
+    /// </summary>
+    public bool GetOverlappingL0Files(VersionStorageInfo vstorage, CompactionInputFiles startLevelInputs, int outputLevel, ref int parentIndex,
+        FileMetaData? startingL0File)
     {
         GetRange(startLevelInputs, out byte[] smallest, out byte[] largest);
         var files = new List<FileMetaData>();
-        vstorage.GetOverlappingInputs(0, smallest, largest, files, -1, out _, expandRange: true);
+        vstorage.GetOverlappingInputs(0, smallest, largest, files, -1, out _, expandRange: true, startingL0File);
         startLevelInputs.Files = files;
         GetRange(startLevelInputs, out smallest, out largest);
         return !IsRangeInCompaction(vstorage, smallest, largest, outputLevel, ref parentIndex);
     }
 
     /// <summary>Port of CompactionPicker::PickFilesMarkedForCompaction (the random first choice is the first file).</summary>
-    public bool PickFilesMarkedForCompaction(VersionStorageInfo vstorage, out int startLevel, out int outputLevel, CompactionInputFiles startLevelInputs)
+    public bool PickFilesMarkedForCompaction(VersionStorageInfo vstorage, out int startLevel, out int outputLevel, CompactionInputFiles startLevelInputs) =>
+        PickFilesMarkedForCompaction(vstorage, out startLevel, out outputLevel, startLevelInputs, (object?)null, static (_, _, _) => false);
+
+    /// <summary>
+    /// Port of CompactionPicker::PickFilesMarkedForCompaction with skip_marked_file (the random first choice is the first
+    /// file): a marked file for which <paramref name="skipMarkedFile"/>(state, level, file) returns true is passed over.
+    /// </summary>
+    public bool PickFilesMarkedForCompaction<TState>(VersionStorageInfo vstorage, out int startLevel, out int outputLevel,
+        CompactionInputFiles startLevelInputs, TState state, Func<TState, int, FileMetaData, bool> skipMarkedFile)
     {
         startLevel = -1;
         outputLevel = -1;
         foreach ((int level, FileMetaData file) in vstorage.FilesMarkedForCompaction)
         {
             if (file.BeingCompacted) continue;
+            if (skipMarkedFile(state, level, file)) continue;
             startLevel = level;
             outputLevel = level == 0 ? vstorage.BaseLevel : level + 1;
             if (level == 0 && IsLevel0CompactionInProgress) continue;
@@ -688,7 +712,7 @@ internal abstract partial class CompactionPicker
         if (inputLevel != outputLevel)
         {
             int parentIndex = -1;
-            if (!SetupOtherInputs(vstorage, inputs, outputLevelInputs, ref parentIndex, -1, false))
+            if (!SetupOtherInputs(vstorage, inputs, outputLevelInputs, ref parentIndex, -1, false, null))
             {
                 manualConflict = true;
                 return null;

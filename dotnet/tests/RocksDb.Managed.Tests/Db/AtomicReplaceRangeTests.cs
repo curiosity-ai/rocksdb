@@ -105,13 +105,17 @@ public sealed class AtomicReplaceRangeTests
         // {d} was replaced; the tombstone sits above the retained files, the replacement above the tombstone.
         Assert.AreEqual("0,0,0,0,1,1,2", FilesPerLevel(db, 7));
 
+        // The standalone tombstone file is not compacted while the snapshot does not see it.
         db.WaitForCompact();
+        Assert.AreEqual("0,0,0,0,1,1,2", FilesPerLevel(db, 7));
         // The snapshot still sees the retained data (the tombstone hides it only for newer reads).
         Assert.AreEqual("old-c", GetString(db, "c", snapshot));
         Assert.AreEqual("old-e", GetString(db, "e", snapshot));
 
+        // Releasing the snapshot schedules the delete-triggered compaction of the tombstone into L6.
         snapshot.Dispose();
-        db.CompactRange();
+        db.WaitForCompact();
+        Assert.AreEqual("0,0,0,0,1,0,1", FilesPerLevel(db, 7));
         Assert.IsNull(GetString(db, "c"));
         Assert.IsNull(GetString(db, "d"));
         Assert.AreEqual("new-e", GetString(db, "e"));
