@@ -11,5 +11,8 @@ facebook/rocksdb `main`.
 | [01-unordered-write-manual-wal-flush-deadlock.md](01-unordered-write-manual-wal-flush-deadlock.md) | `unordered_write` + `manual_wal_flush`: the first `Put` self-deadlocks on `wal_write_mutex_` |
 | [02-dbiter-blob-base-value-merge-use-after-free.md](02-dbiter-blob-base-value-merge-use-after-free.md) | An iterator returns freed memory when a merge result is the blob base value (`max` operator + blob files) |
 | [03-hash-index-hash-skiplist-out-of-domain-keys.md](03-hash-index-hash-skiplist-out-of-domain-keys.md) | The hash index and hash skip list call `Transform` on out-of-domain keys, so `Get` misses existing keys |
+| [04-blob-direct-write-sealed-file-deleted-after-crash.md](04-blob-direct-write-sealed-file-deleted-after-crash.md) | Blob direct write (`main` only): blob files sealed before a crash are purged on the next open and their keys fail. **Found by reading and in the port, not reproduced natively; the reproduction is a sketch** |
+
+Issues 01-03 were reproduced with the C API programs they contain; 04 concerns a feature the released library does not have yet.
 
 How the managed port handles each one is described in [validation.md](../validation.md), "Combinatorial round trips".

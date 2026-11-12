@@ -1893,7 +1893,7 @@ operation that fails without a crash) are single tests in the same file.
   (`ShouldKeepBlobFileDuringPurge` keeps only tracked or footer-less files; recovery registers nothing;
   `db_impl.cc`: "Blob direct-write relies on clean shutdown flushes to register live blob files"); this was not run
   against native RocksDB (the 11.12 package has no blob direct write). Fixing it means registering the blob files the
-  replayed WALs reference during recovery, which is a change of the recovery path, not of a sync.
+  replayed WALs reference during recovery, which is a change of the recovery path, not of a sync. Written up for upstream in `upstream-issues/04-blob-direct-write-sealed-file-deleted-after-crash.md`; reading the C++ for it showed the window is wider than a crash during a flush: `WriteBlob` also seals a partition's file when it reaches `blob_file_size`, and that file stays unregistered until its memtable's flush commits.
 - A checkpoint also hard links live WALs written by an earlier process (kept alive by `avoid_flush_during_recovery`),
   whose contents that process may never have synced. Upstream does the same: `GetOpenWalSizes` only knows the WALs of
   the running instance.
