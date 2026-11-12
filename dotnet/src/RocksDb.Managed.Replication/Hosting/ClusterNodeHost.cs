@@ -47,15 +47,6 @@ public interface IClusterNodeClient
     Task<IReadOnlyDictionary<string, string>> GetFileHashesAsync(IReadOnlyList<ReplicationFileInfo> candidates, CancellationToken cancellationToken);
     IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(IReadOnlyList<ReplicationFileInfo> verifiedInventory, CancellationToken cancellationToken);
     Task<string?> GetTermsAsync(CancellationToken cancellationToken);
-
-    /// <summary>
-    /// <see cref="StreamUpdatesAsync(string, ulong, CancellationToken)"/>, announcing what this follower can take
-    /// (<see cref="ClusterNodeHost.StreamUpdatesAsync(string, ulong, WalStreamCapabilities, CancellationToken)"/>). The
-    /// default implementation announces nothing: a transport that does not carry the announcement gets one message per
-    /// chunk.
-    /// </summary>
-    IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, WalStreamCapabilities capabilities,
-        CancellationToken cancellationToken) => StreamUpdatesAsync(followerId, startSeq, cancellationToken);
 }
 
 /// <summary>Configuration of a <see cref="ClusterNodeHost"/>.</summary>
@@ -108,13 +99,6 @@ public sealed class ClusterNodeHostOptions
     /// carries the same data as files.
     /// </summary>
     public int MaxBatchBytes { get; init; } = WalStreamAssembler.DefaultMaxBatchBytes;
-
-    /// <summary>
-    /// Whether this node, when it follows, announces <see cref="WalStreamCapabilities.Fragments"/>: the source then
-    /// sends a write batch larger than its <c>MaxChunkBytes</c> in pieces of at most that size instead of one message
-    /// of the batch's size. True by default; false gets the stream of earlier versions (one message per chunk).
-    /// </summary>
-    public bool AcceptFragmentedBatches { get; init; } = true;
 
     public Action<string>? Log { get; init; }
 }
@@ -417,8 +401,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     // ---------------------------------------------------------------------------------------------------
     // Incoming RPCs
 
-    public RequestVoteResult HandleRequestVote(RequestVotePayload request) =>
-        _node.HandleRequestVote(request.Term, request.CandidateId, request.LastLogSeq, request.LastLogTerm);
+    public RequestVoteResult HandleRequestVote(RequestVotePayload request) => _node.HandleRequestVote(request);
 
     public AppendEntriesResult HandleHeartbeat(HeartbeatPayload payload) => _node.HandleAppendEntries(payload);
 
@@ -495,16 +478,11 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         }
     }
 
-    /// <summary>The WAL stream for a follower, while this node leads; it ends when leadership is lost.</summary>
-    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, CancellationToken cancellationToken) =>
-        StreamUpdatesAsync(followerId, startSeq, WalStreamCapabilities.None, cancellationToken);
-
     /// <summary>
-    /// The WAL stream for a follower that announced <paramref name="followerCapabilities"/>: with
-    /// <see cref="WalStreamCapabilities.Fragments"/> a write batch larger than <see cref="ClusterNodeHostOptions.MaxChunkBytes"/>
-    /// is sent in pieces (<see cref="WalStreamMessage.IsFragment"/>).
+    /// The WAL stream for a follower, while this node leads; it ends when leadership is lost. A write batch larger than
+    /// <see cref="ClusterNodeHostOptions.MaxChunkBytes"/> is sent in pieces (<see cref="WalStreamMessage.IsFragment"/>).
     /// </summary>
-    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, WalStreamCapabilities followerCapabilities,
+    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         CancellationToken leadership;
@@ -515,7 +493,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, leadership, _cts.Token);
             Log("streaming to " + followerId + " from seq " + startSeq);
             RaftClusterNode node = _node;
-            await foreach (WalStreamMessage m in WalStreamSender.StreamAsync(_db, startSeq, Tag, node.GetTermForSeq, _cfg.MaxChunkBytes, followerCapabilities, OnWalStreamFault, cts.Token)
+            await foreach (WalStreamMessage m in WalStreamSender.StreamAsync(_db, startSeq, Tag, node.GetTermForSeq, _cfg.MaxChunkBytes, OnWalStreamFault, cts.Token)
                                .ConfigureAwait(false))
             {
                 yield return m;
@@ -655,8 +633,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                 progress.Report(myLatest);
                 // Per attachment: a stream that ends or fails takes its partial batch with it.
                 using var assembler = new WalStreamAssembler(_cfg.MaxBatchBytes);
-                WalStreamCapabilities capabilities = _cfg.AcceptFragmentedBatches ? WalStreamCapabilities.Fragments : WalStreamCapabilities.None;
-                await foreach (WalStreamMessage m in client.StreamUpdatesAsync(_cfg.NodeId, myLatest + 1, capabilities, ct).ConfigureAwait(false))
+                await foreach (WalStreamMessage m in client.StreamUpdatesAsync(_cfg.NodeId, myLatest + 1, ct).ConfigureAwait(false))
                 {
                     if (m.ResyncRequired)
                     {

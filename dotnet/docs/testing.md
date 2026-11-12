@@ -18,7 +18,7 @@ ships prebuilt libraries for Linux, macOS and Windows, so no C++ build is needed
 | `tests/RocksDb.Managed.Tests` | 2009 | none | formats, data structures, DB behavior, crash consistency, fault injection, concurrency, upstream test vectors |
 | `tests/RocksDb.Managed.CompatTests` | 490 | in process | byte-level and file-level compatibility with `librocksdb` |
 | `tests/RocksDb.Managed.RoundTrip` | 148 | child process | whole-DB managed and native alternation, option and crash matrices, 2PC, features |
-| `tests/RocksDb.Managed.Replication.Tests` | 107 | in process (one test) | replication, switchover, Raft cluster, gRPC transport, native replica |
+| `tests/RocksDb.Managed.Replication.Tests` | 128 | in process (one test) | replication, switchover, Raft cluster, gRPC transport, native replica |
 | `tools/RocksDb.Managed.Soak` (not a test project) | 14 self-test cases | child process (cross-check) | Jepsen-style soak for hours or days: kill, power loss, torn writes, I/O errors, pauses, crash during recovery, file corruption; history checked against a model; see [soak.md](soak.md) |
 | `tools/RocksDb.Managed.ClusterSoak` (not a test project) | 15 self-test cases | child process (cross-check) | Jepsen-style soak of the Raft cluster mode: 3 or 5 node processes over gRPC behind user-space TCP proxies; partitions (halves, leader isolation, bridge, ring, one-way), latency, SIGKILL, SIGSTOP, power loss, kill during catch-up, clock skew, rolling restarts; lost acks, phantoms, convergence, election safety, log matching, reads; see [cluster-soak.md](cluster-soak.md) |
 
@@ -306,7 +306,8 @@ These tests cover `src/RocksDb.Managed.Replication` and `src/RocksDb.Managed.Rep
   `MemoryFileSystem`.
 - `ReplicationTests`: initial sync through a checkpoint followed by WAL streaming, catch-up after restart, streaming
   under concurrent writes, WAL purge followed by a resync, gap and overlap rejection, archived-WAL retirement.
-- `SwitchoverTests`: rolling upgrade both ways, lagging replica, lost or late promote replies, an unreachable target,
+- `SwitchoverTests`: a rolling restart of the two nodes (the primary role handed off both ways; the same version of
+  the replication layer on both - there is no upgrade across versions of its protocol), lagging replica, lost or late promote replies, an unreachable target,
   forced failover and rebuild of a diverged log.
 - `ClusterTests`: bootstrap to cluster mode, re-election, quorum commit, a far-behind follower catching up through a
   snapshot, term-log persistence.

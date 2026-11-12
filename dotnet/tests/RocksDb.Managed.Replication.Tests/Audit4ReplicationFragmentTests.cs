@@ -10,9 +10,8 @@ using RocksDb.Managed.Replication.Switchover;
 namespace RocksDb.Managed.Replication.Tests;
 
 /// <summary>
-/// Audit #4, large payloads on the wire. Part A: a write batch larger than the WAL stream's chunk size is sent to a
-/// follower that announced <see cref="WalStreamCapabilities.Fragments"/> as fragments of at most the chunk size and
-/// applied only once it is complete. Part B: a client write larger than a chunk is uploaded to a node in fragments
+/// Audit #4, large payloads on the wire. Part A: a write batch larger than the WAL stream's chunk size is sent as
+/// fragments of at most the chunk size and applied only once it is complete. Part B: a client write larger than a chunk is uploaded to a node in fragments
 /// and applied as one write.
 /// </summary>
 [TestClass]
@@ -56,7 +55,7 @@ public sealed class Audit4ReplicationFragmentTests
     /// An in-process transport for plain replication: messages are copied (as serialization would), optionally
     /// rewritten, and recorded with the replica's position at the time they arrive.
     /// </summary>
-    private sealed class DirectClient(ReplicationPrimary primary, RocksDatabase replica, bool carriesCapabilities) : IReplicationSourceClient
+    private sealed class DirectClient(ReplicationPrimary primary, RocksDatabase replica) : IReplicationSourceClient
     {
         public readonly ConcurrentQueue<Seen> Messages = new();
         public readonly ConcurrentQueue<ulong> Reports = new();
@@ -65,15 +64,10 @@ public sealed class Audit4ReplicationFragmentTests
 
         public IAsyncEnumerable<SnapshotChunk> StreamInitialStateAsync(CancellationToken cancellationToken) => primary.StreamInitialStateAsync(cancellationToken);
 
-        public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken) =>
-            StreamUpdatesAsync(startSeq, WalStreamCapabilities.None, cancellationToken);
-
-        public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, WalStreamCapabilities capabilities,
-            [EnumeratorCancellation] CancellationToken cancellationToken)
+        public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref Streams);
-            if (!carriesCapabilities) capabilities = WalStreamCapabilities.None;
-            await foreach (WalStreamMessage m in primary.StreamUpdatesAsync(startSeq, capabilities, cancellationToken))
+            await foreach (WalStreamMessage m in primary.StreamUpdatesAsync(startSeq, cancellationToken))
             {
                 WalStreamMessage d = m.Detach();
                 if (Rewrite is not null) d = Rewrite(d);
@@ -88,28 +82,6 @@ public sealed class Audit4ReplicationFragmentTests
             primary.ReportProgress(replicaIndex, appliedThrough);
             return Task.CompletedTask;
         }
-    }
-
-    /// <summary>A transport written before capabilities existed: it implements only the old stream call.</summary>
-    private sealed class LegacyClient(ReplicationPrimary primary) : IReplicationSourceClient
-    {
-        public int LargestMessage;
-        public int Fragments;
-
-        public IAsyncEnumerable<SnapshotChunk> StreamInitialStateAsync(CancellationToken cancellationToken) => primary.StreamInitialStateAsync(cancellationToken);
-
-        public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
-        {
-            await foreach (WalStreamMessage m in primary.StreamUpdatesAsync(startSeq, cancellationToken))
-            {
-                WalStreamMessage d = m.Detach();
-                LargestMessage = Math.Max(LargestMessage, d.Data.Length);
-                if (d.IsFragment) Fragments++;
-                yield return d;
-            }
-        }
-
-        public Task ReportProgressAsync(int replicaIndex, ulong appliedThrough, CancellationToken cancellationToken) => Task.CompletedTask;
     }
 
     /// <summary>Follows until the replica reaches <paramref name="target"/> (signalled), then stops the stream. A failure of the follower fails the test.</summary>
@@ -182,7 +154,7 @@ public sealed class Audit4ReplicationFragmentTests
         await WriteWorkloadAsync(source, 120, 150, 2);
 
         var primary = new ReplicationPrimary(source, dir.Sub("checkpoints"), null) { MaxChunkBytes = Chunk };
-        var client = new DirectClient(primary, replica, carriesCapabilities: true);
+        var client = new DirectClient(primary, replica);
         await FollowUntilAsync(client, replica, new ReplicaFollowerOptions(), source.GetLatestSequenceNumber());
 
         AssertSameDatabase(source, replica, "after the stream");
@@ -201,11 +173,11 @@ public sealed class Audit4ReplicationFragmentTests
     }
 
     /// <summary>
-    /// With <see cref="WalTailer.StrictChunkLimit"/> a chunk is larger than the chunk size only when it is one single
-    /// batch; without it (the stream for followers that take no fragments) a large batch is merged with what precedes it.
+    /// A chunk of the tailer is larger than the chunk size only when it is one single batch: a batch that does not fit
+    /// into the rest of a chunk starts the next one (what sending it in fragments relies on).
     /// </summary>
     [TestMethod]
-    public async Task StrictChunkLimitKeepsALargeBatchOnItsOwn()
+    public async Task ChunkAboveTheChunkSizeIsOneBatchOnItsOwn()
     {
         using var dir = new TempDir("frag-tailer");
         (RocksDatabase source, RocksDatabase replica) = await OpenPlainAsync(dir);
@@ -214,22 +186,22 @@ public sealed class Audit4ReplicationFragmentTests
         await WriteLargeAsync(source, "t", 1, 50_000);
         await WriteWorkloadAsync(source, 20, 40, 0);
 
-        using (WalTailer strict = new ReplicationSource(source).TailWal(1, Chunk))
+        using WalTailer tailer = new ReplicationSource(source).TailWal(1, Chunk);
+        int large = 0, chunks = 0;
+        var consumer = new ReplicationConsumer(replica);
+        while (tailer.TryReadChunk(out WalChunk c))
         {
-            strict.StrictChunkLimit = true;
-            int large = 0;
-            while (strict.TryReadChunk(out WalChunk c))
-            {
-                if (c.Length <= Chunk) continue;
-                large++;
-                Assert.AreEqual(1, c.BatchCount, "a chunk above the limit is one batch");
-            }
-            Assert.AreEqual(1, large);
-            Assert.AreEqual(source.GetLatestSequenceNumber() + 1, strict.NextSequenceNumber);
+            chunks++;
+            // Whole batches either way: a chunk is applied as it is.
+            await consumer.IngestChunkAsync(c.Memory, CancellationToken.None);
+            if (c.Length <= Chunk) continue;
+            large++;
+            Assert.AreEqual(1, c.BatchCount, "a chunk above the limit is one batch");
         }
-        using WalTailer loose = new ReplicationSource(source).TailWal(1, Chunk);
-        Assert.IsTrue(loose.TryReadChunk(out WalChunk first));
-        Assert.IsTrue(first.Length > Chunk && first.BatchCount > 1, "the default tailer merges the large batch into the chunk it does not fit in");
+        Assert.AreEqual(1, large);
+        Assert.IsTrue(chunks >= 3, "small batches before and after the large one are merged into chunks of their own");
+        Assert.AreEqual(source.GetLatestSequenceNumber() + 1, tailer.NextSequenceNumber);
+        AssertSameDatabase(source, replica, "chunk by chunk");
     }
 
     /// <summary>
@@ -335,12 +307,10 @@ public sealed class Audit4ReplicationFragmentTests
         public Task<ClusterNodeStatus?> GetStatusAsync(CancellationToken cancellationToken) => inner.GetStatusAsync(cancellationToken);
         public Task<ClusterAttachResult?> CheckLogConsistencyAsync(string followerId, ulong latestSeq, long termAtLatest, CancellationToken cancellationToken) =>
             inner.CheckLogConsistencyAsync(followerId, latestSeq, termAtLatest, cancellationToken);
-        public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, CancellationToken cancellationToken) =>
-            StreamUpdatesAsync(followerId, startSeq, WalStreamCapabilities.None, cancellationToken);
-        public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, WalStreamCapabilities capabilities,
+        public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq,
             [EnumeratorCancellation] CancellationToken cancellationToken)
         {
-            await foreach (WalStreamMessage m in inner.StreamUpdatesAsync(followerId, startSeq, capabilities, cancellationToken))
+            await foreach (WalStreamMessage m in inner.StreamUpdatesAsync(followerId, startSeq, cancellationToken))
             {
                 onMessage(m);
                 yield return m;
@@ -559,17 +529,16 @@ public sealed class Audit4ReplicationFragmentTests
         ulong before = source.GetLatestSequenceNumber();
         await WriteLargeAsync(source, "cap", 1, 100_000);
         var primary = new ReplicationPrimary(source, dir.Sub("checkpoints"), null) { MaxChunkBytes = Chunk };
-        foreach (bool fragments in new[] { true, false })
+        using (var cts = new CancellationTokenSource(TestUtil.Timeout))
         {
-            using var cts = new CancellationTokenSource(TestUtil.Timeout);
             ReplicationResyncRequiredException e = await Assert.ThrowsExactlyAsync<ReplicationResyncRequiredException>(() => ReplicaFollower.FollowAsync(
-                new DirectClient(primary, replica, carriesCapabilities: true), replica, 0,
-                new ReplicaFollowerOptions { MaxBatchBytes = 64 * 1024, AcceptFragmentedBatches = fragments }, cts.Token));
+                new DirectClient(primary, replica), replica, 0, new ReplicaFollowerOptions { MaxBatchBytes = 64 * 1024 }, cts.Token));
             StringAssert.Contains(e.Message, "MaxBatchBytes = 65536");
             Assert.AreEqual(before, replica.GetLatestSequenceNumber(), "nothing of the refused batch was applied");
         }
 
         using var assembler = new WalStreamAssembler(64 * 1024);
+        Assert.AreEqual(WalAssemblyStatus.TooLarge, assembler.Accept(new WalStreamMessage(9, 1, new byte[64 * 1024 + 1], "A", 1, 1), out _), "an unfragmented message above the limit");
         Assert.AreEqual(WalAssemblyStatus.TooLarge, assembler.Accept(WalStreamMessage.Fragment(9, 0, 64 * 1024 + 1, 0, new byte[100], "A", 1, 1), out _));
         Assert.IsFalse(assembler.HasPartialBatch);
         Assert.AreEqual(WalAssemblyStatus.Incomplete, assembler.Accept(WalStreamMessage.Fragment(9, 0, 64 * 1024, 0, new byte[100], "A", 1, 1), out _), "the limit itself is accepted");
@@ -590,7 +559,7 @@ public sealed class Audit4ReplicationFragmentTests
         ulong before = source.GetLatestSequenceNumber();
         await WriteLargeAsync(source, "v", 1, 100_000);
         var primary = new ReplicationPrimary(source, dir.Sub("checkpoints"), null) { MaxChunkBytes = Chunk };
-        var client = new DirectClient(primary, replica, carriesCapabilities: true)
+        var client = new DirectClient(primary, replica)
         {
             Rewrite = m => m.IsFragment && m.FragmentOffset == 3 * Chunk
                 ? WalStreamMessage.Fragment(m.FirstSequence, m.FragmentOffset, m.TotalLength - 1, m.EntryCount, m.Data, m.SourceId, m.SourceTerm, m.EntryTerm)
@@ -610,195 +579,43 @@ public sealed class Audit4ReplicationFragmentTests
     }
 
     /// <summary>
-    /// Compatibility of the stream. A follower that announces nothing - one built before fragments existed, a host with
-    /// <see cref="PairNodeHostOptions.AcceptFragmentedBatches"/> off, a transport that implements only the old stream
-    /// call - is sent the large batch as one message, as before (it would apply a fragment as a whole batch). A new
-    /// follower on such a stream (an old sender) follows as before.
+    /// <see cref="WalChunkDto"/> carries every kind of stream message: an ordinary chunk, a fragment (offset and total
+    /// length), and both resync requests.
     /// </summary>
     [TestMethod]
-    public async Task AFollowerThatDidNotAnnounceFragmentsGetsOneLargeMessage()
-    {
-        using var dir = new TempDir("frag-compat");
-        (RocksDatabase source, RocksDatabase replica) = await OpenPlainAsync(dir);
-        await using RocksDatabase _s = source, _r = replica;
-        await WriteWorkloadAsync(source, 0, 30, 0);
-        await WriteLargeAsync(source, "old", 3, 50_000);
-        await WriteWorkloadAsync(source, 30, 60, 0);
-        var primary = new ReplicationPrimary(source, dir.Sub("checkpoints"), null) { MaxChunkBytes = Chunk };
-
-        // New sender, old replica: the stream call without capabilities.
-        using (var cts = new CancellationTokenSource(TestUtil.Timeout))
-        {
-            int largest = 0;
-            ulong next = 1;
-            await foreach (WalStreamMessage m in primary.StreamUpdatesAsync(1, cts.Token))
-            {
-                Assert.IsFalse(m.IsFragment, "a fragment was sent to a follower that did not ask for fragments");
-                Assert.AreEqual(next, m.FirstSequence);
-                next += (ulong)m.EntryCount;
-                largest = Math.Max(largest, m.Data.Length);
-                if (next > source.GetLatestSequenceNumber()) break;
-            }
-            Assert.IsTrue(largest > 150_000, "the large batch is one message of " + largest + " bytes");
-        }
-
-        // New replica, old sender / old transport: no fragments arrive, the replica follows.
-        var legacy = new LegacyClient(primary);
-        await FollowUntilAsync(legacy, replica, new ReplicaFollowerOptions(), source.GetLatestSequenceNumber());
-        AssertSameDatabase(source, replica, "over a transport without capabilities");
-        Assert.AreEqual(0, legacy.Fragments);
-        Assert.IsTrue(legacy.LargestMessage > 150_000);
-
-        // A host that does not announce fragments.
-        await using var h = new PairHarness { AcceptFragmentedBatches = false };
-        int fragments = 0, largestToB = 0;
-        h.BtoA.OnStreamMessage = m =>
-        {
-            if (m.IsFragment) Interlocked.Increment(ref fragments);
-            if (!m.ResyncRequired) largestToB = Math.Max(largestToB, m.Data.Length);
-        };
-        await h.StartAsync("A");
-        await h.StartAsync("B");
-        using (WriteBatch big = LargeBatch("host", 2, 60_000))
-            Assert.AreEqual(PairWriteStatus.Applied, (await h["A"].WriteAsync(big, TimeSpan.FromSeconds(2), CancellationToken.None)).Status);
-        await h.AssertConvergedAsync("A", "B");
-        Assert.AreEqual(0, fragments);
-        Assert.IsTrue(largestToB > 100_000);
-    }
-
-    /// <summary>The <see cref="WalChunkDto"/> of the version before fragments (keys 0..8).</summary>
-    [MessagePackObject]
-    public sealed class WalChunkDtoBeforeFragments
-    {
-        [Key(0)] public ulong FirstSequence { get; set; }
-        [Key(1)] public int EntryCount { get; set; }
-        [Key(2)] public ReadOnlyMemory<byte> Data { get; set; }
-        [Key(3)] public string SourceId { get; set; } = "";
-        [Key(4)] public long SourceTerm { get; set; }
-        [Key(5)] public long EntryTerm { get; set; }
-        [Key(6)] public bool ResyncRequired { get; set; }
-        [Key(7)] public string? Reason { get; set; }
-        [Key(8)] public bool SourceFault { get; set; }
-    }
-
-    /// <summary>
-    /// Wire compatibility of <see cref="WalChunkDto"/> in both directions: a message of the previous version reads as
-    /// "not a fragment"; the previous version reads a message of this version (the two appended fields are skipped) -
-    /// for an ordinary message with every field it knows unchanged. The capability header survives the round trip,
-    /// and an absent, unreadable or unknown one announces nothing.
-    /// </summary>
-    [TestMethod]
-    public void WalChunkDtoAndCapabilityHeaderAreCompatibleWithThePreviousVersion()
+    public void WalChunkDtoRoundTripsEveryKindOfMessage()
     {
         byte[] data = [1, 2, 3, 4, 5];
-        var old = new WalChunkDtoBeforeFragments { FirstSequence = 42, EntryCount = 3, Data = data, SourceId = "A", SourceTerm = 7, EntryTerm = 6 };
-        WalChunkDto read = MessagePackSerializer.Deserialize<WalChunkDto>(MessagePackSerializer.Serialize(old));
-        Assert.AreEqual(0, read.TotalLength);
-        Assert.AreEqual(0, read.FragmentOffset);
-        WalStreamMessage m = read.ToMessage();
-        Assert.IsFalse(m.IsFragment);
-        Assert.AreEqual(42UL, m.FirstSequence);
-        Assert.AreEqual(3, m.EntryCount);
-        Assert.IsTrue(m.Data.Span.SequenceEqual(data));
+        static WalStreamMessage RoundTrip(WalStreamMessage m) =>
+            MessagePackSerializer.Deserialize<WalChunkDto>(MessagePackSerializer.Serialize(WalChunkDto.From(m))).ToMessage();
 
-        var plain = new WalStreamMessage(42, 3, data, "A", 7, 6);
-        WalChunkDtoBeforeFragments byOld = MessagePackSerializer.Deserialize<WalChunkDtoBeforeFragments>(MessagePackSerializer.Serialize(WalChunkDto.From(plain)));
-        Assert.AreEqual(42UL, byOld.FirstSequence);
-        Assert.AreEqual(3, byOld.EntryCount);
-        Assert.IsTrue(byOld.Data.Span.SequenceEqual(data));
-        Assert.AreEqual("A", byOld.SourceId);
-        Assert.AreEqual(7, byOld.SourceTerm);
-        Assert.AreEqual(6, byOld.EntryTerm);
-        Assert.IsFalse(byOld.ResyncRequired);
+        WalStreamMessage plain = RoundTrip(new WalStreamMessage(42, 3, data, "A", 7, 6));
+        Assert.IsFalse(plain.IsFragment || plain.ResyncRequired);
+        Assert.AreEqual(42UL, plain.FirstSequence);
+        Assert.AreEqual(3, plain.EntryCount);
+        Assert.IsTrue(plain.Data.Span.SequenceEqual(data));
+        Assert.AreEqual("A", plain.SourceId);
+        Assert.AreEqual(7, plain.SourceTerm);
+        Assert.AreEqual(6, plain.EntryTerm);
 
-        WalStreamMessage resync = MessagePackSerializer.Deserialize<WalChunkDto>(MessagePackSerializer.Serialize(
-            new WalChunkDtoBeforeFragments { ResyncRequired = true, Reason = "gone", SourceFault = true, SourceId = "A" })).ToMessage();
-        Assert.IsTrue(resync.ResyncRequired && resync.SourceFault && !resync.IsFragment);
+        WalStreamMessage fragment = RoundTrip(WalStreamMessage.Fragment(42, 16, 100, 0, data, "A", 7, 6));
+        Assert.IsTrue(fragment.IsFragment && !fragment.IsLastFragment);
+        Assert.AreEqual(16, fragment.FragmentOffset);
+        Assert.AreEqual(100, fragment.TotalLength);
+        Assert.AreEqual(0, fragment.EntryCount);
+        Assert.IsTrue(fragment.Detach().IsFragment, "a copied message stays a fragment");
+        Assert.IsTrue(RoundTrip(WalStreamMessage.Fragment(42, 95, 100, 3, data, "A", 7, 6)).IsLastFragment);
 
-        WalStreamMessage fragment = WalStreamMessage.Fragment(42, 16, 100, 0, data, "A", 7, 6);
-        WalStreamMessage back = MessagePackSerializer.Deserialize<WalChunkDto>(MessagePackSerializer.Serialize(WalChunkDto.From(fragment))).ToMessage();
-        Assert.IsTrue(back.IsFragment && !back.IsLastFragment);
-        Assert.AreEqual(16, back.FragmentOffset);
-        Assert.AreEqual(100, back.TotalLength);
-        Assert.AreEqual(0, back.EntryCount);
-        Assert.IsTrue(back.Detach().IsFragment, "a copied message stays a fragment");
-        // What an old replica would make of a fragment: a whole batch - which is why it is never sent one.
-        Assert.AreEqual(5, MessagePackSerializer.Deserialize<WalChunkDtoBeforeFragments>(MessagePackSerializer.Serialize(WalChunkDto.From(fragment))).Data.Length);
-
-        Assert.IsNull(WalStreamCapabilityHeader.Create(WalStreamCapabilities.None), "an old follower's call carries no header");
-        Assert.AreEqual(WalStreamCapabilities.Fragments, WalStreamCapabilityHeader.Read(WalStreamCapabilityHeader.Create(WalStreamCapabilities.Fragments)));
-        Assert.AreEqual(WalStreamCapabilities.None, WalStreamCapabilityHeader.Read(null));
-        Assert.AreEqual(WalStreamCapabilities.None, WalStreamCapabilityHeader.Read([]));
-        Assert.AreEqual(WalStreamCapabilities.None, WalStreamCapabilityHeader.Read(new Grpc.Core.Metadata { { WalStreamCapabilityHeader.Name, "yes" } }));
-        Assert.AreEqual(WalStreamCapabilities.Fragments, WalStreamCapabilityHeader.Read(new Grpc.Core.Metadata { { WalStreamCapabilityHeader.Name, "255" } }),
-            "flags of a later version are dropped");
-    }
-
-    private static Grpc.Net.Client.GrpcChannelOptions DefaultReceiveLimit() =>
-        // One byte below gRPC's default of 4 MiB: GrpcTransportDefaults.Apply lifts the limit only while it is exactly the default.
-        new() { MaxReceiveMessageSize = 4 * 1024 * 1024 - 1 };
-
-    /// <summary>
-    /// Real gRPC, with the receive limit of gRPC's default forced back onto the replica's channel: a 6 MB batch reaches
-    /// the replica (in fragments of the default 256 KiB). The same replica without the announcement cannot receive it -
-    /// the situation before the limit was lifted and before fragments.
-    /// </summary>
-    [TestMethod]
-    [DataRow(true)]
-    [DataRow(false)]
-    public async Task BatchAboveFourMegabytesPassesAChannelWithTheDefaultReceiveLimit(bool acceptFragments)
-    {
-        using var dir = new TempDir("grpc-frag");
-        int portA = GrpcNodeServer.FindFreePort(), portB = GrpcNodeServer.FindFreePort();
-        using var toB = new GrpcPairClient("B", "http://127.0.0.1:" + portB, TimeSpan.FromSeconds(2), DefaultReceiveLimit());
-        using var toA = new GrpcPairClient("A", "http://127.0.0.1:" + portA, TimeSpan.FromSeconds(2), DefaultReceiveLimit());
-        var log = new ConcurrentQueue<string>();
-        PairNodeHost Host(string id, IPairNodeClient peer) => new(new PairNodeHostOptions
-        {
-            NodeId = id,
-            PeerId = id == "A" ? "B" : "A",
-            DbPath = dir.Sub(id),
-            InitialRole = id == "A" ? ReplicationRole.Primary : ReplicationRole.Replica,
-            DbOptionsFactory = static () => new DbOptions { WalTtlSeconds = 600 },
-            RetryDelay = TimeSpan.FromMilliseconds(50),
-            AcceptFragmentedBatches = acceptFragments,
-            Log = log.Enqueue,
-        }, peer);
-        PairNodeHost a = Host("A", toB), b = Host("B", toA);
-        await using GrpcNodeServer serverA = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(a, System.Net.IPAddress.Loopback, portA, CancellationToken.None);
-        await using GrpcNodeServer serverB = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(b, System.Net.IPAddress.Loopback, portB, CancellationToken.None);
-        try
-        {
-            await a.StartAsync(CancellationToken.None);
-            await b.StartAsync(CancellationToken.None);
-            await WaitUntilAsync(() => b.GetStatus().AttachedFromSeq > 0, "B following");
-            ulong before = a.Db.GetLatestSequenceNumber();
-            using (WriteBatch batch = LargeBatch("grpc", 3, 2 * 1024 * 1024))
-                Assert.AreEqual(PairWriteStatus.Applied, (await a.WriteAsync(batch, TimeSpan.FromSeconds(2), CancellationToken.None)).Status);
-            if (acceptFragments)
-            {
-                await WaitUntilAsync(() => b.Db.GetLatestSequenceNumber() == a.Db.GetLatestSequenceNumber(), "B to receive a 6 MB batch\n" + string.Join("\n", log));
-                Assert.AreEqual(a.Checksum(), b.Checksum());
-                Assert.AreEqual(0, b.Resyncs);
-            }
-            else
-            {
-                await WaitUntilAsync(() => log.Count(l => l.Contains("B: stream from A failed", StringComparison.Ordinal)) >= 2, "B to fail on the message twice");
-                Assert.AreEqual(before, b.Db.GetLatestSequenceNumber(), "one 6 MB message does not pass a 4 MB limit");
-                StringAssert.Contains(string.Join("\n", log), "ResourceExhausted");
-            }
-        }
-        finally
-        {
-            // The hosts first: a server waits for its open streams when it stops.
-            await b.DisposeAsync();
-            await a.DisposeAsync();
-        }
+        WalStreamMessage resync = RoundTrip(WalStreamMessage.Resync("A", 7, "gone"));
+        Assert.IsTrue(resync.ResyncRequired && !resync.SourceFault && !resync.IsFragment);
+        Assert.AreEqual("gone", resync.Reason);
+        WalStreamMessage fault = RoundTrip(WalStreamMessage.ResyncAfterSourceFault("A", 7, "unreadable"));
+        Assert.IsTrue(fault.ResyncRequired && fault.SourceFault);
     }
 
     /// <summary>
-    /// Plain replication over real gRPC with the default receive limit on the replica's channel: the capability header
-    /// reaches <see cref="ReplicationService"/> and a 5 MB batch arrives in fragments.
+    /// Plain replication over real gRPC with the default receive limit (4 MiB) on the replica's channel: a 5 MB batch
+    /// arrives in fragments.
     /// </summary>
     [TestMethod]
     public async Task PlainReplicationOverGrpcFragmentsABatchAboveTheReceiveLimit()
@@ -811,7 +628,7 @@ public sealed class Audit4ReplicationFragmentTests
         await WriteWorkloadAsync(source, 50, 100, 0);
         var primary = new ReplicationPrimary(source, dir.Sub("checkpoints"), null);
         await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(primary, CancellationToken.None);
-        using var client = new GrpcReplicationClient(server.Endpoint, TimeSpan.FromSeconds(5), DefaultReceiveLimit());
+        using var client = new GrpcReplicationClient(server.Endpoint, TimeSpan.FromSeconds(5));
 
         using var cts = new CancellationTokenSource(TestUtil.Timeout);
         Task<long> follow = ReplicaFollower.FollowAsync(client, replica, 0, cts.Token);
@@ -832,6 +649,46 @@ public sealed class Audit4ReplicationFragmentTests
         }
     }
 
+    /// <summary>
+    /// Lists of files stay below <see cref="GrpcTransportDefaults.MaxFileListBytes"/> per message however many files a
+    /// database has: candidates of a hash request are split into batches that cover every file once, and an inventory
+    /// that does not fit is cut to its largest files (the others are transferred again).
+    /// </summary>
+    [TestMethod]
+    public void FileListsAreBoundedPerMessage()
+    {
+        const string Hash = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+        var files = new List<ReplicationFileInfo>();
+        for (int i = 0; i < 100_000; i++) files.Add(new ReplicationFileInfo { FileName = i.ToString("D6") + ".sst", Size = 1000 + i, Hash = Hash });
+
+        int covered = 0, batches = 0;
+        while (covered < files.Count)
+        {
+            int n = FileListLimit.CountThatFits(files, covered);
+            Assert.IsTrue(n > 0);
+            byte[] wire = MessagePackSerializer.Serialize(FileInfoDto.From(files.GetRange(covered, n)));
+            Assert.IsTrue(wire.Length <= GrpcTransportDefaults.MaxFileListBytes, "a batch of " + n + " files takes " + wire.Length + " bytes");
+            covered += n;
+            batches++;
+        }
+        Assert.AreEqual(files.Count, covered);
+        Assert.IsTrue(batches > 1);
+        // One entry that is larger than the budget on its own still makes progress.
+        Assert.AreEqual(1, FileListLimit.CountThatFits([new ReplicationFileInfo { FileName = new string('x', 2 * GrpcTransportDefaults.MaxFileListBytes), Size = 1 }], 0));
+
+        IReadOnlyList<ReplicationFileInfo> offered = FileListLimit.LargestThatFit(files);
+        Assert.IsTrue(offered.Count > 1000 && offered.Count < files.Count, offered.Count + " files offered");
+        Assert.IsTrue(MessagePackSerializer.Serialize(FileInfoDto.From(offered)).Length <= GrpcTransportDefaults.MaxFileListBytes);
+        long smallestOffered = offered.Min(f => f.Size);
+        Assert.AreEqual(files.Count - offered.Count, files.Count(f => f.Size < smallestOffered), "the largest files are the ones offered");
+        // The plan a source answers with names a subset of the inventory by file name: smaller still.
+        Assert.IsTrue(MessagePackSerializer.Serialize(SnapshotChunkDto.From(SnapshotChunk.Plan(1, [.. offered.Select(f => f.FileName)]))).Length <= GrpcTransportDefaults.MaxFileListBytes);
+
+        List<ReplicationFileInfo> few = files.GetRange(0, 100);
+        Assert.AreSame(few, FileListLimit.LargestThatFit(few), "an inventory that fits is sent as it is");
+        Assert.AreEqual(100, FileListLimit.CountThatFits(few, 0));
+    }
+
     // ---------------------------------------------------------------------------------------------------
     // Part B: large client writes
 
@@ -848,9 +705,9 @@ public sealed class Audit4ReplicationFragmentTests
         {
             var p = new GrpcPair();
             int portA = GrpcNodeServer.FindFreePort(), portB = GrpcNodeServer.FindFreePort();
-            // The replica's channel keeps gRPC's default receive limit: the large write must also replicate in pieces.
-            p.ToB = new GrpcPairClient("B", "http://127.0.0.1:" + portB, TimeSpan.FromSeconds(2), DefaultReceiveLimit());
-            p.ToA = new GrpcPairClient("A", "http://127.0.0.1:" + portA, TimeSpan.FromSeconds(2), DefaultReceiveLimit());
+            // Every channel has gRPC's default receive limit: the large write must also replicate in pieces.
+            p.ToB = new GrpcPairClient("B", "http://127.0.0.1:" + portB, TimeSpan.FromSeconds(2));
+            p.ToA = new GrpcPairClient("A", "http://127.0.0.1:" + portA, TimeSpan.FromSeconds(2));
             PairNodeHost Host(string id, IPairNodeClient peer) => new(new PairNodeHostOptions
             {
                 NodeId = id,
@@ -908,8 +765,8 @@ public sealed class Audit4ReplicationFragmentTests
     }
 
     /// <summary>
-    /// What a client write above the server's receive limit did before: the unary RPC is refused by the server with
-    /// ResourceExhausted ("Received message exceeds the maximum configured message size.") and nothing is applied. Now:
+    /// A client write above the server's receive limit sent through the unary RPC directly is refused by the server
+    /// with ResourceExhausted ("Received message exceeds the maximum configured message size.") and nothing is applied.
     /// <see cref="GrpcPairClient.WriteAsync(string, string, CancellationToken)"/> uploads the 6 MB write in pieces to a
     /// server with the default 4 MiB limit; it is applied as one write, readable, and replicated (to a replica whose
     /// channel has the default limit too). A small write still is the unary RPC, and both RPCs give the same result.
@@ -920,7 +777,7 @@ public sealed class Audit4ReplicationFragmentTests
         await using GrpcPair p = await GrpcPair.StartAsync(new GrpcNodeServerOptions());
         string large = Letters(6 * 1024 * 1024, 1);
 
-        // Before (and still, for a client that uses the unary RPC): refused by the server, nothing applied.
+        // The unary RPC used directly: refused by the server, nothing applied.
         ulong before = p.A.Db.GetLatestSequenceNumber();
         Grpc.Core.RpcException refused = await Assert.ThrowsExactlyAsync<Grpc.Core.RpcException>(async () => await p.ToA.Service.WriteAsync("large", large));
         Assert.AreEqual(Grpc.Core.StatusCode.ResourceExhausted, refused.StatusCode);
@@ -929,7 +786,7 @@ public sealed class Audit4ReplicationFragmentTests
 
         PairWriteResultDto r = await p.ToA.WriteAsync("large", large, CancellationToken.None);
         Assert.IsTrue(r.Applied);
-        Assert.AreEqual(PairWriteStatus.Applied, r.ToStatus());
+        Assert.AreEqual(PairWriteStatus.Applied, r.Status);
         Assert.AreEqual(before + 1, r.Sequence, "one write, one sequence number");
         Assert.AreEqual(before + 1, p.A.Db.GetLatestSequenceNumber());
         Assert.AreEqual(large, p.Read(p.A, "large"));
@@ -966,7 +823,7 @@ public sealed class Audit4ReplicationFragmentTests
         PairWriteResultDto unary = await p.ToB.Service.WriteAsync("k", "v");
         PairWriteResultDto fragmented = await p.ToB.WriteAsync("k", Letters(600_000, 2), CancellationToken.None);
         Assert.IsFalse(fragmented.Applied);
-        Assert.AreEqual(PairWriteStatus.NotPrimary, fragmented.ToStatus());
+        Assert.AreEqual(PairWriteStatus.NotPrimary, fragmented.Status);
         Assert.AreEqual("A", fragmented.PrimaryHint);
         AssertSameResult(unary, fragmented, 0);
         Assert.AreEqual(before, p.B.Db.GetLatestSequenceNumber());
@@ -1128,55 +985,6 @@ public sealed class Audit4ReplicationFragmentTests
         Assert.AreEqual("value-0123456789", p.Read(p.A, "key"));
     }
 
-    /// <summary>A node as it was built before <c>WriteFragmentsAsync</c>: the same service name, only the unary write.</summary>
-    public sealed class OldPairBackend
-    {
-        public readonly ConcurrentDictionary<string, int> ValueLengths = new();
-        public int Writes;
-    }
-
-    /// <summary>
-    /// A client of this version against a node built before large writes: the fragment RPC is Unimplemented, so the
-    /// write goes out as the unary RPC - applied if it passes the node's receive limit, and otherwise a
-    /// <see cref="LargeWriteException"/> that says the server does not support large writes. The server's limit is an
-    /// option of <see cref="GrpcNodeServer"/> (default gRPC's 4 MiB): raised, the old node takes the large unary write.
-    /// </summary>
-    [TestMethod]
-    public async Task OldServerWithoutTheFragmentRpcGetsTheUnaryWrite()
-    {
-        var backend = new OldPairBackend();
-        await using (GrpcNodeServer old = await GrpcNodeServer.StartAsync<LegacyWire.OldPairService, OldPairBackend>(backend, CancellationToken.None))
-        {
-            using var client = new GrpcPairClient("old", old.Endpoint, TimeSpan.FromSeconds(2));
-            // Above a chunk, below the receive limit: falls back and is applied once.
-            PairWriteResultDto r = await client.WriteAsync("medium", Letters(1024 * 1024, 8), CancellationToken.None);
-            Assert.IsTrue(r.Applied);
-            Assert.AreEqual(1, backend.Writes);
-            Assert.AreEqual(1024 * 1024, backend.ValueLengths["medium"]);
-            // Remembered: the next large write is the unary RPC at once.
-            Assert.IsTrue((await client.WriteAsync("medium2", Letters(1024 * 1024, 9), CancellationToken.None)).Applied);
-            Assert.AreEqual(2, backend.Writes);
-
-            foreach (GrpcPairClient c in new[] { client, new GrpcPairClient("old", old.Endpoint, TimeSpan.FromSeconds(2)) })
-            {
-                LargeWriteException e = await Assert.ThrowsExactlyAsync<LargeWriteException>(() => c.WriteAsync("large", Letters(5 * 1024 * 1024, 10), CancellationToken.None));
-                Assert.AreEqual(LargeWriteError.NotSupportedByServer, e.Error);
-                StringAssert.Contains(e.Message, "the server does not support large writes");
-                StringAssert.Contains(e.Message, "Received message exceeds the maximum configured message size");
-                if (!ReferenceEquals(c, client)) c.Dispose();
-            }
-            Assert.AreEqual(2, backend.Writes, "nothing of the refused write was applied");
-            Assert.IsTrue((await client.WriteAsync("small", "v", CancellationToken.None)).Applied);
-        }
-
-        await using GrpcNodeServer unlimited = await GrpcNodeServer.StartAsync<LegacyWire.OldPairService, OldPairBackend>(backend, System.Net.IPAddress.Loopback, 0,
-            new GrpcNodeServerOptions { MaxReceiveMessageSize = null }, CancellationToken.None);
-        using var toUnlimited = new GrpcPairClient("old", unlimited.Endpoint, TimeSpan.FromSeconds(2));
-        Assert.IsTrue((await toUnlimited.WriteAsync("large", Letters(5 * 1024 * 1024, 10), CancellationToken.None)).Applied);
-        Assert.AreEqual(5 * 1024 * 1024, backend.ValueLengths["large"]);
-        Assert.AreEqual(GrpcNodeServerOptions.DefaultMaxReceiveMessageSize, new GrpcNodeServerOptions().MaxReceiveMessageSize, "the default is gRPC's");
-    }
-
     /// <summary>
     /// A Raft cluster over real gRPC (every channel with the default receive limit): a 5 MB write sent to the leader
     /// through <see cref="GrpcClusterClient.WriteAsync(string, string, CancellationToken)"/> is committed and reaches
@@ -1189,7 +997,7 @@ public sealed class Audit4ReplicationFragmentTests
         var members = new List<ClusterMember>();
         for (int i = 1; i <= 3; i++) members.Add(new ClusterMember("n" + i, "http://127.0.0.1:" + GrpcNodeServer.FindFreePort()));
         var clients = new Dictionary<string, GrpcClusterClient>();
-        foreach (ClusterMember m in members) clients[m.NodeId] = new GrpcClusterClient(m, TimeSpan.FromSeconds(1), DefaultReceiveLimit());
+        foreach (ClusterMember m in members) clients[m.NodeId] = new GrpcClusterClient(m, TimeSpan.FromSeconds(1));
         var hosts = new Dictionary<string, ClusterNodeHost>();
         var servers = new Dictionary<string, GrpcNodeServer>();
         var log = new ConcurrentQueue<string>();

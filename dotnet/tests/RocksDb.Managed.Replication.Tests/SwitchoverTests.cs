@@ -4,8 +4,9 @@ using RocksDb.Managed.Replication.Switchover;
 namespace RocksDb.Managed.Replication.Tests;
 
 /// <summary>
-/// The scenarios of rocksdb-sharp's Tests/SwitchoverTest in process, under live client writes: a rolling upgrade
-/// (A -> B handoff, restart A, B -> A handoff, restart B) with no snapshot, an aborted handoff, a lost promote reply, a
+/// The scenarios of rocksdb-sharp's Tests/SwitchoverTest in process, under live client writes: a rolling upgrade of
+/// the application (A -> B handoff, restart A, B -> A handoff, restart B; both nodes run the same version of the
+/// replication layer) with no snapshot, an aborted handoff, a lost promote reply, a
 /// late promote, and a forced failover where the old primary's divergent tail is detected and rebuilt.
 /// </summary>
 [TestClass]

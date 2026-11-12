@@ -18,24 +18,19 @@ public sealed class Audit4ReplicationProtocolTests
     // Transport
 
     /// <summary>
-    /// gRPC refuses a received message above 4 MB by default, and a WAL chunk is at least one whole write batch: a
-    /// replica could not receive a batch larger than that, failed the stream, attached again at the same position and
-    /// failed again - for good, while the primary went on acknowledging writes. The in-memory transport of the tests
-    /// has no such limit. The channels of this library no longer limit received messages. Failed before: B never
-    /// received the entry.
-    /// <para>
-    /// Since write batches larger than the chunk size are sent in fragments (Audit4ReplicationFragmentTests), a replica
-    /// of this version would no longer receive a 6 MB message here. The replica of this test therefore does not
-    /// announce fragments (<see cref="PairNodeHostOptions.AcceptFragmentedBatches"/> = false) - which is also what a
-    /// primary sees of a replica built before fragments existed - so the test still covers what it was written for: one
-    /// message above 4 MB passes the channel. The expectation is unchanged.
-    /// </para>
+    /// gRPC refuses a received message above 4 MiB by default, and the channels and servers of this library keep that
+    /// limit. A write batch larger than it still reaches the replica: the primary sends a batch above its chunk size
+    /// (256 KiB by default) in fragments and the replica applies it once it is whole. Without that the replica failed
+    /// the stream, attached again at the same position and failed again - for good, while the primary went on
+    /// acknowledging writes. The in-memory transport of the tests has no such limit, hence real gRPC here.
     /// </summary>
     [TestMethod]
     public async Task WalChunkLargerThanTheDefaultGrpcMessageLimitReachesTheReplica()
     {
         using var dir = new TempDir("grpc-large");
         int portA = GrpcNodeServer.FindFreePort(), portB = GrpcNodeServer.FindFreePort();
+        // Default options: gRPC's own receive limit on both channels and both servers.
+        Assert.AreEqual(4 * 1024 * 1024, GrpcTransportDefaults.CreateChannelOptions().MaxReceiveMessageSize);
         using var toB = new GrpcPairClient("B", "http://127.0.0.1:" + portB, TimeSpan.FromSeconds(2));
         using var toA = new GrpcPairClient("A", "http://127.0.0.1:" + portA, TimeSpan.FromSeconds(2));
         PairNodeHost Host(string id, IPairNodeClient peer) => new(new PairNodeHostOptions
@@ -46,7 +41,6 @@ public sealed class Audit4ReplicationProtocolTests
             InitialRole = id == "A" ? ReplicationRole.Primary : ReplicationRole.Replica,
             DbOptionsFactory = static () => new DbOptions { WalTtlSeconds = 600 },
             RetryDelay = TimeSpan.FromMilliseconds(50),
-            AcceptFragmentedBatches = false,
         }, peer);
         PairNodeHost a = Host("A", toB), b = Host("B", toA);
         await using GrpcNodeServer serverA = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(a, System.Net.IPAddress.Loopback, portA, CancellationToken.None);
@@ -66,6 +60,7 @@ public sealed class Audit4ReplicationProtocolTests
             }
             await WaitUntilAsync(() => b.Db.GetLatestSequenceNumber() == a.Db.GetLatestSequenceNumber(), "B to receive a 6 MB batch");
             Assert.AreEqual(a.Checksum(), b.Checksum());
+            Assert.AreEqual(0, b.Resyncs, "received through the stream, not as a snapshot");
         }
         finally
         {
@@ -81,14 +76,15 @@ public sealed class Audit4ReplicationProtocolTests
     /// loss) and waits on the dead stream for good. Failed before: no handler with pings was configured.
     /// </summary>
     [TestMethod]
-    public void GrpcChannelsSendKeepAlivePingsAndDoNotLimitReceivedMessages()
+    public void GrpcChannelsSendKeepAlivePingsAndKeepTheDefaultReceiveLimit()
     {
         Grpc.Net.Client.GrpcChannelOptions options = GrpcTransportDefaults.CreateChannelOptions();
         var handler = (System.Net.Http.SocketsHttpHandler)options.HttpHandler!;
         Assert.AreEqual(System.Net.Http.HttpKeepAlivePingPolicy.Always, handler.KeepAlivePingPolicy, "pings must flow while only a stream is open");
         Assert.AreEqual(GrpcTransportDefaults.KeepAlivePingDelay, handler.KeepAlivePingDelay);
         Assert.AreEqual(GrpcTransportDefaults.KeepAlivePingTimeout, handler.KeepAlivePingTimeout);
-        Assert.IsNull(options.MaxReceiveMessageSize);
+        Assert.AreEqual(GrpcTransportDefaults.MaxReceiveMessageSize, options.MaxReceiveMessageSize, "gRPC's default is left in place");
+        Assert.AreEqual(GrpcNodeServerOptions.DefaultMaxReceiveMessageSize, new GrpcNodeServerOptions().MaxReceiveMessageSize, "on servers too");
         handler.Dispose();
 
         // Options of the caller: only what they leave open is filled in.
@@ -100,21 +96,29 @@ public sealed class Audit4ReplicationProtocolTests
     }
 
     /// <summary>
-    /// A snapshot chunk of a kind this build does not know was taken for file data. It is refused; so is an end marker
-    /// with an impossible file count. The write status of a pair travels with its number, and a peer built before that
-    /// field existed is read through the old flag. Failed before: the unknown kind became a file data chunk.
+    /// A snapshot chunk of an unknown kind was taken for file data. It is refused; so is an end marker with an
+    /// impossible file count. The write status of a pair travels as the status itself, and a result without one is
+    /// not an acknowledgement. Failed before: the unknown kind became a file data chunk.
     /// </summary>
     [TestMethod]
-    public void UnknownSnapshotChunkKindIsRefusedAndWriteStatusSurvivesOldPeers()
+    public void UnknownSnapshotChunkKindIsRefusedAndWriteStatusRoundTrips()
     {
         Assert.ThrowsExactly<InvalidDataException>(() => new SnapshotChunkDto { Kind = 7, FileName = "000001.sst" }.ToChunk());
         Assert.ThrowsExactly<InvalidDataException>(() => new SnapshotChunkDto { Kind = (int)SnapshotChunkKind.Complete, FileSize = -1 }.ToChunk());
         Assert.AreEqual(SnapshotChunkKind.Plan, new SnapshotChunkDto { Kind = 0, KeepFiles = null! }.ToChunk().Kind, "a plan without a keep list keeps nothing");
         Assert.AreEqual(SnapshotChunkKind.FileData, SnapshotChunkDto.From(SnapshotChunk.FileData("a.sst", 1, 0, new byte[1])).ToChunk().Kind);
 
-        Assert.AreEqual(PairWriteStatus.NotReplicated, new PairWriteResultDto { Status = (int)PairWriteStatus.NotReplicated }.ToStatus());
-        Assert.AreEqual(PairWriteStatus.Applied, new PairWriteResultDto { Applied = true }.ToStatus(), "an old peer sends no status");
-        Assert.AreEqual(PairWriteStatus.NotPrimary, new PairWriteResultDto().ToStatus());
+        foreach (PairWriteStatus status in Enum.GetValues<PairWriteStatus>())
+        {
+            PairWriteResultDto back = MessagePack.MessagePackSerializer.Deserialize<PairWriteResultDto>(
+                MessagePack.MessagePackSerializer.Serialize(PairWriteResultDto.From(new PairWriteResult(status, "A", 9))));
+            Assert.AreEqual(status, back.Status);
+            Assert.AreEqual(status == PairWriteStatus.Applied, back.Applied);
+            Assert.AreEqual("A", back.PrimaryHint);
+            Assert.AreEqual(9UL, back.Sequence);
+        }
+        Assert.IsFalse(new PairWriteResultDto().Applied, "a result that names no status acknowledges nothing");
+        Assert.IsFalse(MessagePack.MessagePackSerializer.Deserialize<PairWriteResultDto>(MessagePack.MessagePackSerializer.Serialize(Array.Empty<object>())).Applied);
     }
 
     private static void CreateFile(IFileSystem fs, string path, string content)
@@ -334,7 +338,7 @@ public sealed class Audit4ReplicationProtocolTests
             lock (_held) _held.TryGetValue(request.CandidateId, out gate);
             lock (_voteAnswers) _voteRequests[request.CandidateId] = _voteRequests.GetValueOrDefault(request.CandidateId) + 1;
             if (gate != null) await gate.Task.WaitAsync(cancellationToken);
-            RequestVoteResult r = Nodes[peer.NodeId].HandleRequestVote(request.Term, request.CandidateId, request.LastLogSeq, request.LastLogTerm);
+            RequestVoteResult r = Nodes[peer.NodeId].HandleRequestVote(request);
             lock (_voteAnswers) _voteAnswers[request.CandidateId] = _voteAnswers.GetValueOrDefault(request.CandidateId) + 1;
             return r;
         }
@@ -404,10 +408,10 @@ public sealed class Audit4ReplicationProtocolTests
 
         // Directly: same last term but shorter is refused, at least as long is granted.
         long term = n1.CurrentTerm;
-        Assert.IsFalse(n1.HandleRequestVote(term, "n2", 4, 2).VoteGranted, "a shorter log of the same last term got the vote");
-        Assert.IsFalse(n1.HandleRequestVote(term, "n2", 100, 1).VoteGranted, "a longer log of an older last term got the vote");
-        Assert.IsTrue(n1.HandleRequestVote(term, "n2", 5, 2).VoteGranted);
-        Assert.IsFalse(n1.HandleRequestVote(term, "n3", 9, 3).VoteGranted, "a second vote in the same term");
+        Assert.IsFalse(n1.HandleRequestVote(new RequestVotePayload(term, "n2", 4, 2)).VoteGranted, "a shorter log of the same last term got the vote");
+        Assert.IsFalse(n1.HandleRequestVote(new RequestVotePayload(term, "n2", 100, 1)).VoteGranted, "a longer log of an older last term got the vote");
+        Assert.IsTrue(n1.HandleRequestVote(new RequestVotePayload(term, "n2", 5, 2)).VoteGranted);
+        Assert.IsFalse(n1.HandleRequestVote(new RequestVotePayload(term, "n3", 9, 3)).VoteGranted, "a second vote in the same term");
 
         trio.Time["n1"].ElapseElectionTimeout();
         await WaitUntilAsync(() => n1.Role == RaftRole.Leader, "n1 to be elected");
@@ -479,8 +483,8 @@ public sealed class Audit4ReplicationProtocolTests
 
         // n3 restarts: its vote of term 2 is on disk.
         await trio.RestartAsync("n3");
-        Assert.IsFalse(trio.Nodes["n3"].HandleRequestVote(2, "n2", 4, 1).VoteGranted, "a node voted twice in one term after a restart");
-        Assert.IsTrue(trio.Nodes["n3"].HandleRequestVote(2, "n1", 4, 1).VoteGranted, "the same candidate may be answered again");
+        Assert.IsFalse(trio.Nodes["n3"].HandleRequestVote(new RequestVotePayload(2, "n2", 4, 1)).VoteGranted, "a node voted twice in one term after a restart");
+        Assert.IsTrue(trio.Nodes["n3"].HandleRequestVote(new RequestVotePayload(2, "n1", 4, 1)).VoteGranted, "the same candidate may be answered again");
     }
 
     /// <summary>
@@ -498,10 +502,10 @@ public sealed class Audit4ReplicationProtocolTests
         long term = n1.CurrentTerm;
         ulong commit = n2.CommitSeq;
 
-        RequestVoteResult vote = n2.HandleRequestVote(term + 5, "stranger", 1000, term + 5);
+        RequestVoteResult vote = n2.HandleRequestVote(new RequestVotePayload(term + 5, "stranger", 1000, term + 5));
         Assert.IsFalse(vote.VoteGranted, "a node outside the member list got a vote");
         Assert.AreEqual(term, n2.CurrentTerm, "a node outside the member list moved the term");
-        Assert.AreEqual(term, n1.HandleRequestVote(term + 5, "stranger", 1000, term + 5).Term);
+        Assert.AreEqual(term, n1.HandleRequestVote(new RequestVotePayload(term + 5, "stranger", 1000, term + 5)).Term);
         Assert.AreEqual(RaftRole.Leader, n1.Role, "a node outside the member list deposed the leader");
 
         AppendEntriesResult beat = n2.HandleAppendEntries(new HeartbeatPayload(term + 5, "stranger", 0, 0, 1000, ClusterMode.Cluster));

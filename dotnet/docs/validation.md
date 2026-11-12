@@ -1501,7 +1501,7 @@ samples and the original's `Tests/*/Program.cs`, `PairService.cs`, `RocksDbWalIn
 
 | Where | Both implementations? | What was wrong |
 |---|---|---|
-| gRPC channels | both | gRPC refuses a received message above 4 MB; a WAL chunk is at least one whole write batch. A replica could never receive a larger batch and retried the same chunk for good. No receive limit now (`GrpcTransportDefaults`). |
+| gRPC channels | both | gRPC refuses a received message above 4 MB; a WAL chunk is at least one whole write batch. A replica could never receive a larger batch and retried the same chunk for good. A batch above the chunk size is now sent in fragments (below); the 4 MiB limit stays on channels and servers, and every message type is bounded below it (README "Message sizes over gRPC"). |
 | gRPC channels and servers | both | No HTTP/2 keep-alive. A replica reading a WAL stream sends nothing, so it never noticed a primary that vanished without closing the connection; a server kept the handler of a vanished replica until the host stopped. Pings on both sides now. |
 | `SnapshotChunkDto.ToChunk` | port only | A chunk of an unknown kind was read as file data. Refused. |
 | `SnapshotReceiver` | port only (the original has no plan) | Restore atomicity depended on the sender putting CURRENT last; CURRENT is now written under a temporary name and renamed after the end marker. A plan that keeps CURRENT, a MANIFEST, a WAL or a file the receiver does not hold is refused before anything is deleted. |
@@ -1509,7 +1509,7 @@ samples and the original's `Tests/*/Program.cs`, `PairService.cs`, `RocksDbWalIn
 | `ReplicationDelta` | both | Reuse trusted name, size and a hash of the length plus the last 1 MiB. Enough for a table file (the properties block in its tail names the session and file number of one creation event), not for a blob file, which has no identity: blob files of two histories descending from one checkpoint can agree in name, size and tail (`BlobFileOfAnotherHistoryWithTheSameNameSizeAndTailIsNotReused`, with real blob files). Blob files are compared by a hash of the whole file. |
 
 Read and found sound: deadlines or caller tokens on every unary call (a progress report of plain replication got a
-deadline), DTO defaults (every flag defaults to the refusing answer; fields appended last), stream termination (a
+deadline), DTO defaults (every flag defaults to the refusing answer), stream termination (a
 WAL stream that ends is re-attached with the attach check; a snapshot without its end marker is refused),
 back-pressure of server streams (each write awaited), disposal order in the samples (server, then host, then client).
 
@@ -1519,15 +1519,38 @@ write gate's hold / drain order of a handoff (`HandoffPointIsTakenAfterTheAdmitt
 `RejectedEpochIsNeverPromotedByAPromoteRacingTheReject` no longer sleeps: it uses a seam of `SwitchoverNode` and
 fails on every run with the fix reverted.
 
-Large payloads (`Audit4ReplicationFragmentTests.cs`, 24 tests; README "Large write batches and large client writes"):
+Large payloads (`Audit4ReplicationFragmentTests.cs`, 21 tests; README "Large write batches and large client writes"):
 
 | Where | What was wrong | Now |
 |---|---|---|
-| WAL stream (`WalStreamSender`, the hosts' follower loops) | A chunk is at least one whole write batch, so a large batch was one message of its size: unbounded, 2 GB at most, and only received at all since the channels' 4 MB limit was lifted. | A follower announces `WalStreamCapabilities.Fragments`; the source sends a batch larger than `MaxChunkBytes` as fragments (slices of the tailer's buffer) and the follower applies it once complete (`WalStreamAssembler`). The log never ends inside a batch; reports name applied batches only. A broken fragment sequence re-attaches once, then rebuilds from a snapshot; a batch above `MaxBatchBytes` (1 GiB) rebuilds at once. A follower that announced nothing gets one message per chunk, as before. |
+| WAL stream (`WalStreamSender`, the hosts' follower loops) | A chunk is at least one whole write batch, so a large batch was one message of its size: unbounded, 2 GB at most, and above gRPC's 4 MiB receive limit never received at all. | The source always sends a batch larger than `MaxChunkBytes` as fragments (slices of the tailer's buffer) and the follower applies it once complete (`WalStreamAssembler`). The log never ends inside a batch; reports name applied batches only. A broken fragment sequence re-attaches once, then rebuilds from a snapshot; a batch above `MaxBatchBytes` (1 GiB) rebuilds at once. |
 | `WalTailer.EnsureCapacity` | Doubled an `int` size: a chunk above 1 GiB overflowed and never left the loop. | Sized in 64 bits, capped at the array limit. |
-| Client write RPCs (`IPairService.WriteAsync`, `IClusterService.WriteAsync`) | One unary request; above the server's receive limit (4 MiB) refused with ResourceExhausted. | `GrpcPairClient.WriteAsync` / `GrpcClusterClient.WriteAsync` upload a payload above `MaxChunkBytes` through the client-streaming `WriteFragmentsAsync`; the node reassembles it (caps `MaxWriteBytes` 64 MiB, `MaxPendingBytes` 256 MiB, checked before allocating) and applies it through the same host call as the unary write. An old node answers Unimplemented and gets the unary RPC. The server's receive limit is an explicit option, default unchanged. |
+| Client write RPCs (`IPairService.WriteAsync`, `IClusterService.WriteAsync`) | One unary request; above the server's receive limit (4 MiB) refused with ResourceExhausted. | `GrpcPairClient.WriteAsync` / `GrpcClusterClient.WriteAsync` upload a payload above `MaxChunkBytes` through the client-streaming `WriteFragmentsAsync`; the node reassembles it (caps `MaxWriteBytes` 64 MiB, `MaxPendingBytes` 256 MiB, checked before allocating) and applies it through the same host call as the unary write. A smaller write stays the unary RPC (one request instead of a stream). The server's receive limit is an explicit option, default unchanged. |
+
+No compatibility between versions of the replication layer (it was never deployed; owner's decision): the
+capability announcement of the WAL stream (`WalStreamCapabilities`, the `rocksdb-wal-capabilities` header,
+`AcceptFragmentedBatches`, `WalTailer.StrictChunkLimit` as an option), the clients' fallback to the unary write RPC on
+Unimplemented (`LargeWriteError.NotSupportedByServer`), the `Applied` flag next to `PairWriteResultDto.Status`, the
+tolerance for a primary without `ReportProgressAsync`, default interface methods on the transport interfaces and the
+tests of old/new wire shapes are gone. All nodes of a deployment run the same version of this layer. Refusing
+malformed input is unchanged.
+
+Message sizes re-checked with the default receive limit back in place: WAL chunks and fragments (`MaxChunkBytes`),
+snapshot file data (`SnapshotChunkBytes`) and client writes were bounded. Lists of files were not: the hash request of
+a snapshot delta, its answer and the inventory of the snapshot request grow with the number of table files (about 25,
+90 and 100 bytes per file: 4 MiB at 40 000 to 160 000 files), and a follower with that many files could never ask for
+a snapshot again. `GrpcClusterClient` now asks for hashes in batches of at most 1 MiB and cuts the inventory to the
+largest files that fit into 1 MiB (the rest is transferred instead of reused); the plan names a subset of the
+inventory (`FileListsAreBoundedPerMessage`). The term / epoch map is the one message without a bound of its own: one
+line of at most 41 bytes per leadership change that wrote entries, 4 MiB after about 100 000 of them; documented, not
+chunked.
 
 Design limits that remain:
+
+- All nodes and clients of a deployment must run the same version of the replication layer; there is no rolling
+  upgrade across versions of its protocol.
+- A term / epoch map above the gRPC receive limit (about 100 000 leadership changes) cannot be sent; the limits of
+  the channels have to be raised then.
 
 - Fragments bound the size of a message, not of a write: a follower holds one whole write batch in memory before it
   applies it (up to `MaxBatchBytes`), a node one whole client write (up to `MaxWriteBytes`), each plus the engine's

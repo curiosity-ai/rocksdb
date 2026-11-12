@@ -49,7 +49,7 @@ public sealed class SwitchoverNode
     private CancellationTokenSource? _promotionCts;
     private bool _rejected;
     // 0 or 1: the parity of the epochs this node starts on its own; -1 without a peer id (any epoch).
-    private readonly int _ownEpochParity = -1;
+    private readonly int _ownEpochParity;
 
     public event EventHandler<ReplicationRoleChangedEventArgs>? RoleChanged;
 
@@ -60,36 +60,29 @@ public sealed class SwitchoverNode
     internal Action? RejectEpochAfterPromotionCheck;
 
     /// <param name="nodeId">This node's id.</param>
+    /// <param name="peerId">
+    /// The other node's id. It makes the epochs this node starts on its own - after a restart, after an aborted handoff,
+    /// by <see cref="ForcePromoteAsync"/> - never collide with the ones the other node starts on its own: the node whose
+    /// id sorts first (ordinal) takes even epochs, the other one odd epochs. If both took "promised + 1", a replica
+    /// force-promoted while the primary restarts (or resumes after an aborted handoff) out of its reach would become
+    /// primary in the very epoch the old primary continues in. Two primaries are then the operator's doing, but one
+    /// epoch with two histories is not: the attach check (same sequence number, same epoch) would later take the
+    /// loser's log for a prefix of the winner's. An epoch proposed in a handoff is agreed by both nodes (both promise
+    /// it) and needs no such rule.
+    /// </param>
     /// <param name="state">Its persisted role state.</param>
     /// <param name="db">Its database.</param>
     /// <param name="detachFromPrimaryAsync">
     /// Called on a replica that is about to become primary, after it caught up to the handoff point: stop the replication
     /// stream and return once nothing will ingest into the database any more.
     /// </param>
-    public SwitchoverNode(string nodeId, ReplicationRoleState state, RocksDatabase db, Func<CancellationToken, Task> detachFromPrimaryAsync)
-        : this(nodeId, null, state, db, detachFromPrimaryAsync)
-    {
-    }
-
-    /// <summary>
-    /// As the other constructor, and with <paramref name="peerId"/> the epochs this node starts on its own - after a
-    /// restart, after an aborted handoff, by <see cref="ForcePromoteAsync"/> - never collide with the ones the other node
-    /// starts on its own: the node whose id sorts first (ordinal) takes even epochs, the other one odd epochs. Without
-    /// it both take "promised + 1", and a replica force-promoted while the primary restarts (or resumes after an
-    /// aborted handoff) out of its reach becomes primary in the very epoch the old primary continues in. Two primaries
-    /// are then the operator's doing, but one epoch with two histories is not: the attach check (same sequence number,
-    /// same epoch) would later take the loser's log for a prefix of the winner's. An epoch proposed in a handoff is
-    /// agreed by both nodes (both promise it) and needs no such rule.
-    /// </summary>
-    public SwitchoverNode(string nodeId, string? peerId, ReplicationRoleState state, RocksDatabase db, Func<CancellationToken, Task> detachFromPrimaryAsync)
+    public SwitchoverNode(string nodeId, string peerId, ReplicationRoleState state, RocksDatabase db, Func<CancellationToken, Task> detachFromPrimaryAsync)
     {
         ArgumentException.ThrowIfNullOrEmpty(nodeId);
-        if (peerId != null)
-        {
-            int order = string.CompareOrdinal(nodeId, peerId);
-            if (order == 0) throw new ArgumentException("the two nodes of a pair need different ids", nameof(peerId));
-            _ownEpochParity = order < 0 ? 0 : 1;
-        }
+        ArgumentException.ThrowIfNullOrEmpty(peerId);
+        int order = string.CompareOrdinal(nodeId, peerId);
+        if (order == 0) throw new ArgumentException("the two nodes of a pair need different ids", nameof(peerId));
+        _ownEpochParity = order < 0 ? 0 : 1;
         ArgumentNullException.ThrowIfNull(state);
         ArgumentNullException.ThrowIfNull(db);
         ArgumentNullException.ThrowIfNull(detachFromPrimaryAsync);
@@ -117,7 +110,7 @@ public sealed class SwitchoverNode
     private long NextOwnEpoch(long after)
     {
         long epoch = after + 1;
-        if (_ownEpochParity >= 0 && (epoch & 1) != _ownEpochParity) epoch++;
+        if ((epoch & 1) != _ownEpochParity) epoch++;
         return epoch;
     }
 

@@ -47,17 +47,12 @@ public sealed class ReplicationPrimary
         await foreach (SnapshotChunk c in session.StreamSnapshotAsync([], SnapshotChunkBytes, cancellationToken).ConfigureAwait(false)) yield return c;
     }
 
-    /// <summary>The WAL stream from <paramref name="startSeq"/> (a single resync message if those WALs are gone).</summary>
-    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken) =>
-        StreamUpdatesAsync(startSeq, WalStreamCapabilities.None, cancellationToken);
-
     /// <summary>
-    /// The WAL stream for a replica that announced <paramref name="replicaCapabilities"/>: with
-    /// <see cref="WalStreamCapabilities.Fragments"/> a write batch larger than <see cref="MaxChunkBytes"/> is sent in
-    /// pieces (<see cref="WalStreamMessage.IsFragment"/>).
+    /// The WAL stream from <paramref name="startSeq"/> (a single resync message if those WALs are gone). A write batch
+    /// larger than <see cref="MaxChunkBytes"/> is sent in pieces (<see cref="WalStreamMessage.IsFragment"/>).
     /// </summary>
-    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, WalStreamCapabilities replicaCapabilities, CancellationToken cancellationToken) =>
-        WalStreamSender.StreamAsync(_db, startSeq, Tag, static _ => 0, MaxChunkBytes, replicaCapabilities, null, cancellationToken);
+    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken) =>
+        WalStreamSender.StreamAsync(_db, startSeq, Tag, static _ => 0, MaxChunkBytes, null, cancellationToken);
 
     private bool Tag(out string sourceId, out long term)
     {
@@ -107,14 +102,6 @@ public interface IReplicationSourceClient
     IAsyncEnumerable<SnapshotChunk> StreamInitialStateAsync(CancellationToken cancellationToken);
     IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken);
     Task ReportProgressAsync(int replicaIndex, ulong appliedThrough, CancellationToken cancellationToken);
-
-    /// <summary>
-    /// <see cref="StreamUpdatesAsync(ulong, CancellationToken)"/>, announcing what this replica can take
-    /// (<see cref="ReplicationPrimary.StreamUpdatesAsync(ulong, WalStreamCapabilities, CancellationToken)"/>). The default
-    /// implementation announces nothing: a transport that does not carry the announcement gets one message per chunk.
-    /// </summary>
-    IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, WalStreamCapabilities capabilities, CancellationToken cancellationToken) =>
-        StreamUpdatesAsync(startSeq, cancellationToken);
 }
 
 /// <summary>
@@ -139,12 +126,6 @@ public sealed class ReplicaFollowerOptions
     /// the same data as files.
     /// </summary>
     public int MaxBatchBytes { get; init; } = WalStreamAssembler.DefaultMaxBatchBytes;
-
-    /// <summary>
-    /// Whether the replica announces <see cref="WalStreamCapabilities.Fragments"/>, so that the primary sends a write
-    /// batch larger than its chunk size in pieces. True by default.
-    /// </summary>
-    public bool AcceptFragmentedBatches { get; init; } = true;
 }
 
 /// <summary>Thrown by <see cref="ReplicaFollower.FollowAsync"/> when the replica must be rebuilt from a snapshot.</summary>
@@ -188,8 +169,7 @@ public static class ReplicaFollower
         long chunks = 0;
         ulong start = replica.GetLatestSequenceNumber() + 1;
         using var assembler = new WalStreamAssembler(options.MaxBatchBytes);
-        WalStreamCapabilities capabilities = options.AcceptFragmentedBatches ? WalStreamCapabilities.Fragments : WalStreamCapabilities.None;
-        await foreach (WalStreamMessage m in primary.StreamUpdatesAsync(start, capabilities, cancellationToken).ConfigureAwait(false))
+        await foreach (WalStreamMessage m in primary.StreamUpdatesAsync(start, cancellationToken).ConfigureAwait(false))
         {
             if (m.ResyncRequired) throw new ReplicationResyncRequiredException("primary cannot stream from " + consumer.ExpectedNextSequence + ": " + m.Reason);
             WalAssemblyStatus assembled = assembler.Accept(m, out ReadOnlyMemory<byte> chunk);

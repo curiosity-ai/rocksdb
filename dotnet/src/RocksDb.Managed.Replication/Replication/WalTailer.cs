@@ -118,15 +118,6 @@ public sealed class WalTailer : IDisposable
 
     private bool _includeBatchContainingStart;
 
-    /// <summary>
-    /// How a write batch that does not fit into the rest of a chunk is handled. False (default): it is added anyway, so
-    /// a chunk overshoots the chunk size by at most one batch (of any size). True: the chunk ends before it, so a chunk
-    /// is larger than the chunk size only when it is one single write batch that is larger on its own - what a
-    /// transport that sends such a batch in pieces relies on (<see cref="Hosting.WalStreamSender"/>). Either way a chunk
-    /// holds whole batches. May be changed between reads.
-    /// </summary>
-    public bool StrictChunkLimit { get; set; }
-
     /// <summary>True when the database holds sequence numbers this tailer has not read yet.</summary>
     public bool HasUpdates => _nextSequenceNumber <= _db.GetLatestSequenceNumber();
 
@@ -141,8 +132,11 @@ public sealed class WalTailer : IDisposable
     }
 
     /// <summary>
-    /// Reads the run of write batches available now, up to the chunk size (a chunk overshoots it by at most one WAL
-    /// batch, see <see cref="StrictChunkLimit"/>). Returns false when there is nothing newer; then await <see cref="WaitForUpdatesAsync"/>.
+    /// Reads the run of whole write batches available now, up to the chunk size: the chunk ends before a batch that
+    /// does not fit into the rest of it, so a chunk is larger than the chunk size only when it is one single write
+    /// batch that is larger on its own - what a transport that sends such a batch in pieces relies on
+    /// (<see cref="Hosting.WalStreamSender"/>). Returns false when there is nothing newer; then await
+    /// <see cref="WaitForUpdatesAsync"/>.
     /// </summary>
     public bool TryReadChunk(out WalChunk chunk)
     {
@@ -195,7 +189,7 @@ public sealed class WalTailer : IDisposable
                 }
                 ReadOnlySpan<byte> body = batch.Span[HeaderSize..];
                 // Left for the next chunk (the iterator stays on it).
-                if (StrictChunkLimit && entryCount > 0 && (long)length + body.Length > _maxChunkBytes) break;
+                if (entryCount > 0 && (long)length + body.Length > _maxChunkBytes) break;
                 EnsureCapacity((long)length + body.Length);
                 body.CopyTo(_buffer.AsSpan(length));
                 if (entryCount == 0) firstSequenceNumber = batchSeq;

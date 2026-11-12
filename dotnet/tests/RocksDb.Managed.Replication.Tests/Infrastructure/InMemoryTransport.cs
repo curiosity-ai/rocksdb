@@ -187,10 +187,7 @@ public sealed class InMemoryClusterClient(InMemoryNetwork network, string from, 
         Task.FromResult(Target?.HandleCheckLogConsistency(latestSeq, termAtLatest));
 
     public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, CancellationToken cancellationToken) =>
-        StreamUpdatesAsync(followerId, startSeq, WalStreamCapabilities.None, cancellationToken);
-
-    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, WalStreamCapabilities capabilities, CancellationToken cancellationToken) =>
-        InMemoryNetwork.Pump(ct => network.Require<ClusterNodeHost>(from, to).StreamUpdatesAsync(followerId, startSeq, capabilities, ct), static m => m.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken);
+        InMemoryNetwork.Pump(ct => network.Require<ClusterNodeHost>(from, to).StreamUpdatesAsync(followerId, startSeq, ct), static m => m.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken);
 
     public Task ReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken)
     {
@@ -265,20 +262,16 @@ public sealed class InMemoryPairClient(InMemoryNetwork network, string from, str
     public Task<ReplicaLogCheck?> CheckReplicaLogAsync(ulong replicaLatestSeq, long replicaEpochAtLatest, CancellationToken cancellationToken) =>
         Task.FromResult(Target?.HandleCheckReplicaLog(replicaLatestSeq, replicaEpochAtLatest));
 
-    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken) =>
-        StreamUpdatesAsync(startSeq, WalStreamCapabilities.None, cancellationToken);
-
     /// <summary>Rewrites (or passes through) every message of the WAL streams opened from now on; null for none.</summary>
     public Func<WalStreamMessage, WalStreamMessage>? RewriteStream;
 
     /// <summary>Called with every message of a WAL stream as the replica receives it.</summary>
     public Action<WalStreamMessage>? OnStreamMessage;
 
-    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, WalStreamCapabilities capabilities,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         Func<WalStreamMessage, WalStreamMessage>? rewrite = RewriteStream;
-        await foreach (WalStreamMessage m in InMemoryNetwork.Pump(ct => network.Require<PairNodeHost>(from, to).StreamUpdatesAsync(startSeq, capabilities, ct),
+        await foreach (WalStreamMessage m in InMemoryNetwork.Pump(ct => network.Require<PairNodeHost>(from, to).StreamUpdatesAsync(startSeq, ct),
                            static m => m.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken))
         {
             WalStreamMessage r = rewrite is null ? m : rewrite(m);

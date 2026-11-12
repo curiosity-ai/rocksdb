@@ -10,8 +10,8 @@ namespace RocksDb.Managed.Replication.Hosting;
 /// <para><see cref="Data"/> may refer to the producer's buffer and is only valid until the producing enumeration moves
 /// on; transports that queue messages copy it (<see cref="Detach"/>).</para>
 /// <para>
-/// A chunk larger than the stream's chunk size (always one single write batch) is sent to a follower that announced
-/// <see cref="WalStreamCapabilities.Fragments"/> as consecutive fragments (<see cref="IsFragment"/>): every fragment
+/// A chunk larger than the stream's chunk size (always one single write batch) is sent as consecutive fragments
+/// (<see cref="IsFragment"/>), so no message carries more than the chunk size: every fragment
 /// carries the batch's <see cref="FirstSequence"/>, <see cref="SourceId"/>, <see cref="SourceTerm"/>,
 /// <see cref="EntryTerm"/> and <see cref="TotalLength"/>, its own <see cref="FragmentOffset"/> and its slice of the
 /// serialized batch in <see cref="Data"/>; <see cref="EntryCount"/> is 0 on every fragment but the last
@@ -103,23 +103,6 @@ public readonly struct WalStreamMessage
 }
 
 /// <summary>
-/// What a follower tells the source about itself when it opens a WAL stream. A follower that announces nothing (one
-/// built before a capability existed, or a transport that does not carry the announcement) gets the stream every
-/// follower understands.
-/// </summary>
-[Flags]
-public enum WalStreamCapabilities
-{
-    None = 0,
-    /// <summary>
-    /// The follower puts fragments together (<see cref="WalStreamAssembler"/>): the source may send a write batch larger
-    /// than its chunk size as several messages (<see cref="WalStreamMessage.IsFragment"/>) instead of one. Never sent
-    /// to a follower that did not announce it - it would apply each fragment as a batch of its own.
-    /// </summary>
-    Fragments = 1,
-}
-
-/// <summary>
 /// Follower-side rule that keeps a resync requested for a fault of the source's own WAL
 /// (<see cref="WalStreamMessage.SourceFault"/>) from repeating without end: a rebuild is only worth it if this node has
 /// applied something since its last one. Otherwise the snapshot it just restored did not get it past the fault, the next
@@ -166,6 +149,12 @@ public static class WalStreamSender
     /// <paramref name="entryTerm"/> maps a sequence number to its term. When the WAL for <paramref name="startSequence"/>
     /// is gone, or <paramref name="startSequence"/> is past the end of this database's log (the follower holds entries
     /// this database never wrote), a single <see cref="WalStreamMessage.Resync"/> message ends the stream.
+    /// <para>
+    /// No message carries more than <paramref name="maxChunkBytes"/> payload bytes: a write batch that does not fit is
+    /// never merged with other batches (<see cref="WalTailer.TryReadChunk"/>) and is sent as consecutive
+    /// <see cref="WalStreamMessage.Fragment"/>s, slices of the tailer's buffer (nothing is copied); the stream tag
+    /// (source id, term) is taken once per batch. The receiver puts them together with a <see cref="WalStreamAssembler"/>.
+    /// </para>
     /// </summary>
     public static IAsyncEnumerable<WalStreamMessage> StreamAsync(RocksDatabase db, ulong startSequence, StreamTagProvider tag,
         Func<ulong, long> entryTerm, int maxChunkBytes, CancellationToken cancellationToken) =>
@@ -185,23 +174,8 @@ public static class WalStreamSender
     /// would not help - the stream after it would fail the same way - so no resync is requested.</item>
     /// </list>
     /// </summary>
-    public static IAsyncEnumerable<WalStreamMessage> StreamAsync(RocksDatabase db, ulong startSequence, StreamTagProvider tag,
-        Func<ulong, long> entryTerm, int maxChunkBytes, Action<RocksDbException>? onSourceFault, CancellationToken cancellationToken) =>
-        StreamAsync(db, startSequence, tag, entryTerm, maxChunkBytes, WalStreamCapabilities.None, onSourceFault, cancellationToken);
-
-    /// <summary>
-    /// <see cref="StreamAsync(RocksDatabase, ulong, StreamTagProvider, Func{ulong, long}, int, Action{RocksDbException}, CancellationToken)"/>
-    /// for a follower that announced <paramref name="followerCapabilities"/>.
-    /// <para>
-    /// With <see cref="WalStreamCapabilities.Fragments"/> no message carries more than <paramref name="maxChunkBytes"/>
-    /// payload bytes: a write batch that does not fit is never merged with other batches
-    /// (<see cref="WalTailer.StrictChunkLimit"/>) and is sent as consecutive <see cref="WalStreamMessage.Fragment"/>s,
-    /// slices of the tailer's buffer (nothing is copied); the stream tag (source id, term) is taken once per batch.
-    /// Without it the stream is what it always was: a chunk is one message, however large its last batch.
-    /// </para>
-    /// </summary>
     public static async IAsyncEnumerable<WalStreamMessage> StreamAsync(RocksDatabase db, ulong startSequence, StreamTagProvider tag,
-        Func<ulong, long> entryTerm, int maxChunkBytes, WalStreamCapabilities followerCapabilities, Action<RocksDbException>? onSourceFault,
+        Func<ulong, long> entryTerm, int maxChunkBytes, Action<RocksDbException>? onSourceFault,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(db);
@@ -220,9 +194,7 @@ public static class WalStreamSender
             }
             yield break;
         }
-        bool fragment = (followerCapabilities & WalStreamCapabilities.Fragments) != 0;
         using WalTailer tailer = new ReplicationSource(db).TailWal(startSequence, maxChunkBytes);
-        tailer.StrictChunkLimit = fragment;
         while (!cancellationToken.IsCancellationRequested)
         {
             if (!tag(out string sourceId, out long term)) yield break;
@@ -260,10 +232,10 @@ public static class WalStreamSender
             }
             if (has)
             {
-                if (fragment && chunk.Length > maxChunkBytes)
+                if (chunk.Length > maxChunkBytes)
                 {
-                    // One write batch larger than a message may be (StrictChunkLimit): slices of the tailer's buffer,
-                    // which stays untouched until the next read.
+                    // One write batch larger than a message may be (the tailer never merges such a batch with
+                    // others): slices of the tailer's buffer, which stays untouched until the next read.
                     long batchTerm = entryTerm(chunk.FirstSequenceNumber);
                     ReadOnlyMemory<byte> all = chunk.Memory;
                     for (int offset = 0; offset < all.Length; offset += maxChunkBytes)

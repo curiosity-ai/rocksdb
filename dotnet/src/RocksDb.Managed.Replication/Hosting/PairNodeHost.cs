@@ -20,19 +20,9 @@ public interface IPairNodeClient : ISwitchoverPeer
     /// Tells the primary that this replica holds its log through <paramref name="appliedThrough"/> (fsync'd, with
     /// <see cref="PairNodeHostOptions.SyncWal"/>), and the epoch the replica has for that entry - the primary counts
     /// the report only if it holds the same entry in the same epoch. Sent by a replica configured with
-    /// <see cref="PairWriteAck.Replica"/>. Throws when the report did not arrive (it is then sent again). The default
-    /// implementation drops the report: a transport without this call cannot be used with
-    /// <see cref="PairWriteAck.Replica"/> (writes end as <see cref="PairWriteStatus.NotReplicated"/>).
+    /// <see cref="PairWriteAck.Replica"/>. Throws when the report did not arrive (it is then sent again).
     /// </summary>
-    Task ReportProgressAsync(ulong appliedThrough, long epochAtApplied, CancellationToken cancellationToken) => Task.CompletedTask;
-
-    /// <summary>
-    /// <see cref="StreamUpdatesAsync(ulong, CancellationToken)"/>, announcing what this replica can take
-    /// (<see cref="PairNodeHost.StreamUpdatesAsync(ulong, WalStreamCapabilities, CancellationToken)"/>). The default
-    /// implementation announces nothing: a transport that does not carry the announcement gets one message per chunk.
-    /// </summary>
-    IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, WalStreamCapabilities capabilities, CancellationToken cancellationToken) =>
-        StreamUpdatesAsync(startSeq, cancellationToken);
+    Task ReportProgressAsync(ulong appliedThrough, long epochAtApplied, CancellationToken cancellationToken);
 }
 
 /// <summary>When <see cref="PairNodeHost.WriteAsync"/> acknowledges a write (<see cref="PairNodeHostOptions.WriteAck"/>).</summary>
@@ -114,7 +104,7 @@ public sealed class PairNodeHostOptions
     /// its own writes, lost here in a power loss because they were not fsync'd. True (the default): it hands the primary
     /// role to the replica (<see cref="SwitchoverNode.YieldToReplicaAheadAsync"/>, the handoff protocol with the
     /// replica's log end as the handoff point) and follows it, so those writes survive. False: it continues as primary
-    /// and the replica is rebuilt from it, as before - they are lost. Either way a replica that cannot be reached
+    /// and the replica is rebuilt from it - they are lost. Either way a replica that cannot be reached
     /// during the restart is rebuilt later. Never needed with <see cref="SyncWal"/> (the replica is never ahead).
     /// </summary>
     public bool YieldToReplicaAheadOnRestart { get; init; } = true;
@@ -127,13 +117,6 @@ public sealed class PairNodeHostOptions
     /// carries the same data as files.
     /// </summary>
     public int MaxBatchBytes { get; init; } = WalStreamAssembler.DefaultMaxBatchBytes;
-
-    /// <summary>
-    /// Whether this node, when it follows, announces <see cref="WalStreamCapabilities.Fragments"/>: the source then
-    /// sends a write batch larger than its <c>MaxChunkBytes</c> in pieces of at most that size instead of one message
-    /// of the batch's size. True by default; false gets the stream of earlier versions (one message per chunk).
-    /// </summary>
-    public bool AcceptFragmentedBatches { get; init; } = true;
 
     public Action<string>? Log { get; init; }
 }
@@ -533,17 +516,11 @@ public sealed class PairNodeHost : IAsyncDisposable
 
     public string HandleGetEpochs() => _node.SerializeEpochs();
 
-    /// <summary>The WAL stream for the replica while this node is primary (or handing off).</summary>
-    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken) =>
-        StreamUpdatesAsync(startSeq, WalStreamCapabilities.None, cancellationToken);
-
     /// <summary>
-    /// The WAL stream for a replica that announced <paramref name="replicaCapabilities"/>: with
-    /// <see cref="WalStreamCapabilities.Fragments"/> a write batch larger than <see cref="PairNodeHostOptions.MaxChunkBytes"/>
-    /// is sent in pieces (<see cref="WalStreamMessage.IsFragment"/>).
+    /// The WAL stream for the replica while this node is primary (or handing off). A write batch larger than
+    /// <see cref="PairNodeHostOptions.MaxChunkBytes"/> is sent in pieces (<see cref="WalStreamMessage.IsFragment"/>).
     /// </summary>
-    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, WalStreamCapabilities replicaCapabilities,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         CancellationToken primary;
         lock (_followerLock) primary = _primaryCts.Token;
@@ -552,7 +529,7 @@ public sealed class PairNodeHost : IAsyncDisposable
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token, primary);
             SwitchoverNode node = _node;
-            await foreach (WalStreamMessage m in WalStreamSender.StreamAsync(_db, startSeq, Tag, node.GetEpochForSeq, _cfg.MaxChunkBytes, replicaCapabilities, OnWalStreamFault, cts.Token)
+            await foreach (WalStreamMessage m in WalStreamSender.StreamAsync(_db, startSeq, Tag, node.GetEpochForSeq, _cfg.MaxChunkBytes, OnWalStreamFault, cts.Token)
                                .ConfigureAwait(false))
             {
                 yield return m;
@@ -697,8 +674,7 @@ public sealed class PairNodeHost : IAsyncDisposable
                 progress?.Report(latest);
                 // Per attachment: a stream that ends or fails takes its partial batch with it.
                 using var assembler = new WalStreamAssembler(_cfg.MaxBatchBytes);
-                WalStreamCapabilities capabilities = _cfg.AcceptFragmentedBatches ? WalStreamCapabilities.Fragments : WalStreamCapabilities.None;
-                await foreach (WalStreamMessage m in _peer.StreamUpdatesAsync(latest + 1, capabilities, ct).ConfigureAwait(false))
+                await foreach (WalStreamMessage m in _peer.StreamUpdatesAsync(latest + 1, ct).ConfigureAwait(false))
                 {
                     if (m.ResyncRequired)
                     {

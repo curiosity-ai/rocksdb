@@ -18,19 +18,17 @@ public sealed class WalChunkDto
     [Key(3)] public string SourceId { get; set; } = "";
     [Key(4)] public long SourceTerm { get; set; }
     [Key(5)] public long EntryTerm { get; set; }
-    [Key(6)] public bool ResyncRequired { get; set; }
-    [Key(7)] public string? Reason { get; set; }
-    /// <summary>Appended last: a sender built without it is read as false (an ordinary resync request).</summary>
-    [Key(8)] public bool SourceFault { get; set; }
     /// <summary>
     /// For a fragment of a large write batch (<see cref="WalStreamMessage.IsFragment"/>): where <see cref="Data"/>
-    /// starts in the serialized batch. Appended with <see cref="TotalLength"/>: a sender built without them is read as
-    /// 0 / 0, "not a fragment"; a receiver built without them skips them - which is why a sender only fragments for a
-    /// receiver that announced <see cref="WalStreamCapabilities.Fragments"/>.
+    /// starts in the serialized batch.
     /// </summary>
-    [Key(9)] public int FragmentOffset { get; set; }
+    [Key(6)] public int FragmentOffset { get; set; }
     /// <summary>For a fragment: the length of the whole serialized batch. 0: an ordinary message.</summary>
-    [Key(10)] public int TotalLength { get; set; }
+    [Key(7)] public int TotalLength { get; set; }
+    [Key(8)] public bool ResyncRequired { get; set; }
+    /// <summary>With <see cref="ResyncRequired"/>: <see cref="WalStreamMessage.SourceFault"/>.</summary>
+    [Key(9)] public bool SourceFault { get; set; }
+    [Key(10)] public string? Reason { get; set; }
 
     public static WalChunkDto From(in WalStreamMessage m) => new()
     {
@@ -56,43 +54,6 @@ public sealed class WalChunkDto
             : new WalStreamMessage(FirstSequence, EntryCount, Data, SourceId, SourceTerm, EntryTerm);
 }
 
-/// <summary>
-/// How a follower announces <see cref="WalStreamCapabilities"/> over gRPC: a request header on the call that opens the
-/// WAL stream (<c>SyncUpdatesAsync</c>). A header changes neither the method nor its arguments, so it is compatible in
-/// both directions: a source built before it existed ignores it (and sends one message per chunk, as it always did),
-/// and a follower built before it existed sends none (and is sent one message per chunk). The arguments could not
-/// carry it: MagicOnion serializes a single argument as the bare value and several as an array, so adding one to
-/// <c>SyncUpdatesAsync(ulong)</c> changes what an old peer reads.
-/// </summary>
-public static class WalStreamCapabilityHeader
-{
-    /// <summary>The header's name; its value is the decimal number of the <see cref="WalStreamCapabilities"/> flags.</summary>
-    public const string Name = "rocksdb-wal-capabilities";
-
-    private const WalStreamCapabilities Known = WalStreamCapabilities.Fragments;
-
-    /// <summary>Call options headers announcing <paramref name="capabilities"/>; null for none (the call is then exactly an old follower's).</summary>
-    public static Grpc.Core.Metadata? Create(WalStreamCapabilities capabilities) =>
-        capabilities == WalStreamCapabilities.None
-            ? null
-            : new Grpc.Core.Metadata { { Name, ((int)capabilities).ToString(System.Globalization.CultureInfo.InvariantCulture) } };
-
-    /// <summary>What the caller announced; none when the header is missing or unreadable. Flags this build does not know are dropped.</summary>
-    public static WalStreamCapabilities Read(Grpc.Core.Metadata? requestHeaders)
-    {
-        if (requestHeaders is null) return WalStreamCapabilities.None;
-        foreach (Grpc.Core.Metadata.Entry e in requestHeaders)
-        {
-            if (!e.IsBinary && string.Equals(e.Key, Name, StringComparison.OrdinalIgnoreCase) &&
-                int.TryParse(e.Value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int flags))
-            {
-                return (WalStreamCapabilities)flags & Known;
-            }
-        }
-        return WalStreamCapabilities.None;
-    }
-}
-
 [MessagePackObject]
 public sealed class SnapshotChunkDto
 {
@@ -116,7 +77,7 @@ public sealed class SnapshotChunkDto
     };
 
     /// <summary>
-    /// Throws <see cref="InvalidDataException"/> for a kind this build does not know (a newer sender): taking it for
+    /// Throws <see cref="InvalidDataException"/> for an unknown kind: taking it for
     /// file data would write the message's content into the database directory - or, with an empty file name, fail
     /// with a message about the name - where the restore must simply fail.
     /// </summary>
@@ -307,17 +268,15 @@ public sealed class ReplicaLogCheckDto
 [MessagePackObject]
 public sealed class PairWriteResultDto
 {
-    [Key(0)] public bool Applied { get; set; }
+    /// <summary>A message without the field is not an acknowledgement.</summary>
+    [Key(0)] public PairWriteStatus Status { get; set; } = PairWriteStatus.NotPrimary;
     [Key(1)] public string? PrimaryHint { get; set; }
     [Key(2)] public ulong Sequence { get; set; }
-    /// <summary>
-    /// The <see cref="PairWriteStatus"/>. Appended last: a sender built without it is read as 0, so use
-    /// <see cref="ToStatus"/>, which falls back to <see cref="Applied"/>.
-    /// </summary>
-    [Key(3)] public int Status { get; set; }
 
-    public PairWriteStatus ToStatus() =>
-        Applied ? PairWriteStatus.Applied : Status == (int)PairWriteStatus.NotReplicated ? PairWriteStatus.NotReplicated : PairWriteStatus.NotPrimary;
+    /// <summary>Whether the write was acknowledged (<see cref="PairWriteStatus.Applied"/>). Not on the wire.</summary>
+    [IgnoreMember] public bool Applied => Status == PairWriteStatus.Applied;
+
+    public static PairWriteResultDto From(in PairWriteResult r) => new() { Status = r.Status, PrimaryHint = r.PrimaryHint, Sequence = r.Sequence };
 }
 
 [MessagePackObject]

@@ -293,7 +293,7 @@ public sealed class Audit4ReplicationOriginalTests
         state.Set(0, ReplicationRole.Replica, "A");
         var rejectAnswered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         // A promotion that was started reaches its detach step and waits there for the reject's answer.
-        var node = new SwitchoverNode("B", state, db, _ => rejectAnswered.Task);
+        var node = new SwitchoverNode("B", "A", state, db, _ => rejectAnswered.Task);
         ulong handoffSeq = db.GetLatestSequenceNumber();
         long epoch = state.PromisedEpoch + 2;
 
@@ -460,16 +460,15 @@ public sealed class Audit4ReplicationOriginalTests
         // n2 leads the next term. This node's log is rebuilt from it (simulated: the term map of the new leader says
         // the entry at seq is one of the new term), and the new leader commits that entry.
         long newTerm = writeTerm + 1;
-        node.HandleAppendEntries(newTerm, "n2", 0, 0, 0, ClusterMode.Bootstrap);
+        node.HandleAppendEntries(new HeartbeatPayload(newTerm, "n2", 0, 0, 0, ClusterMode.Bootstrap));
         Assert.AreEqual(RaftRole.Follower, node.Role);
         var terms = new RaftLogTerms();
         terms.Record(1, newTerm);
         state.ReplaceTerms(terms);
-        Assert.IsTrue(node.HandleAppendEntries(newTerm, "n2", seq, newTerm, seq, ClusterMode.Bootstrap).Success);
+        Assert.IsTrue(node.HandleAppendEntries(new HeartbeatPayload(newTerm, "n2", seq, newTerm, seq, ClusterMode.Bootstrap)).Success);
         Assert.IsTrue(node.CommitSeq >= seq);
 
         Assert.IsFalse(await node.WaitForCommitAsync(seq, writeTerm, CancellationToken.None), "a replaced entry was acknowledged as committed");
-        Assert.IsFalse(await node.WaitForCommitAsync(seq, CancellationToken.None), "a node that does not lead cannot tell whose entry is committed");
         // The entry that is there is the new leader's: a wait for that one succeeds, also on a follower.
         Assert.IsTrue(await node.WaitForCommitAsync(seq, newTerm, CancellationToken.None));
     }
@@ -489,7 +488,7 @@ public sealed class Audit4ReplicationOriginalTests
         state.SetMode(ClusterMode.Cluster);
         await using (var node = new RaftClusterNode(config, state, db, new NoTransport()))
         {
-            Assert.IsTrue(node.HandleRequestVote(7, "n2", 0, 0).VoteGranted);
+            Assert.IsTrue(node.HandleRequestVote(new RequestVotePayload(7, "n2", 0, 0)).VoteGranted);
         }
 
         // Restart; the state file cannot be read this time.
@@ -507,7 +506,7 @@ public sealed class Audit4ReplicationOriginalTests
         if (reloaded != null)
         {
             await using var again = new RaftClusterNode(config, reloaded, db, new NoTransport());
-            Assert.IsFalse(again.HandleRequestVote(7, "n3", 0, 0).VoteGranted, "a second vote in term 7, for another candidate");
+            Assert.IsFalse(again.HandleRequestVote(new RequestVotePayload(7, "n3", 0, 0)).VoteGranted, "a second vote in term 7, for another candidate");
         }
         Assert.AreEqual(StatusCode.IOError, code, "the read error is reported");
 
@@ -517,9 +516,9 @@ public sealed class Audit4ReplicationOriginalTests
         Assert.AreEqual(7, recovered.CurrentTerm);
         Assert.AreEqual("n2", recovered.VotedFor);
         await using var restarted = new RaftClusterNode(config, recovered, db, new NoTransport());
-        Assert.IsFalse(restarted.HandleRequestVote(7, "n3", 0, 0).VoteGranted);
-        Assert.IsTrue(restarted.HandleRequestVote(7, "n2", 0, 0).VoteGranted, "the candidate's repeated request (its first answer was lost)");
-        Assert.IsFalse(restarted.HandleRequestVote(6, "n3", 0, 0).VoteGranted, "a request of an older term");
+        Assert.IsFalse(restarted.HandleRequestVote(new RequestVotePayload(7, "n3", 0, 0)).VoteGranted);
+        Assert.IsTrue(restarted.HandleRequestVote(new RequestVotePayload(7, "n2", 0, 0)).VoteGranted, "the candidate's repeated request (its first answer was lost)");
+        Assert.IsFalse(restarted.HandleRequestVote(new RequestVotePayload(6, "n3", 0, 0)).VoteGranted, "a request of an older term");
     }
 
     /// <summary>
@@ -541,14 +540,14 @@ public sealed class Audit4ReplicationOriginalTests
         targetState.Set(1, ReplicationRole.Replica, "A");
         var detaching = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var never = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var crashed = new SwitchoverNode("B", targetState, db, _ =>
+        var crashed = new SwitchoverNode("B", "A", targetState, db, _ =>
         {
             detaching.TrySetResult();
             return never.Task;
         });
         _ = crashed.HandlePromoteAsync(new PromoteRequest(2, "A", seq, 5000));
         await detaching.Task;
-        var target = new SwitchoverNode("B", new ReplicationRoleState(targetFs, "/role"), db, static _ => Task.CompletedTask);
+        var target = new SwitchoverNode("B", "A", new ReplicationRoleState(targetFs, "/role"), db, static _ => Task.CompletedTask);
         Assert.AreEqual(ReplicationRole.Replica, target.Role);
         Assert.IsFalse(target.Writes.IsOpen);
         PromoteResult again = await target.HandlePromoteAsync(new PromoteRequest(2, "A", seq, 5000));
@@ -563,7 +562,7 @@ public sealed class Audit4ReplicationOriginalTests
         SwitchoverNode.BootstrapPrimary(primaryState, db, "A");
         primaryState.Promise(2);
         primaryState.Set(1, ReplicationRole.HandingOff, "A", "B");
-        var primary = new SwitchoverNode("A", new ReplicationRoleState(primaryFs, "/role"), db, static _ => Task.CompletedTask);
+        var primary = new SwitchoverNode("A", "B", new ReplicationRoleState(primaryFs, "/role"), db, static _ => Task.CompletedTask);
         Assert.AreEqual(ReplicationRole.HandingOff, primary.Role);
         Assert.IsFalse(primary.Writes.IsOpen, "a node that restarts while handing off accepts writes before it asked the target");
         Assert.IsFalse(await primary.Writes.TryEnterAsync(TimeSpan.Zero, CancellationToken.None));

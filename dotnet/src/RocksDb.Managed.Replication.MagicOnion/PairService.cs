@@ -27,10 +27,7 @@ public interface IPairService : IService<IPairService>
     /// <summary>Operator / coordinator: hand the primary role to the other node.</summary>
     UnaryResult<SwitchoverResultDto> HandOffAsync();
     UnaryResult<DigestDto> ChecksumAsync();
-    /// <summary>
-    /// Replica -> primary (<see cref="IPairNodeClient.ReportProgressAsync"/>). Declared last: a node built without it
-    /// answers Unimplemented, which the client treats as "this primary does not count reports".
-    /// </summary>
+    /// <summary>Replica -> primary (<see cref="IPairNodeClient.ReportProgressAsync"/>).</summary>
     UnaryResult<bool> ReportProgressAsync(ulong appliedThrough, long epochAtApplied);
 
     /// <summary>
@@ -38,7 +35,6 @@ public interface IPairService : IService<IPairService>
     /// value's, sent in pieces (<see cref="WriteFragmentDto"/>) and applied as one write once the last piece arrived -
     /// through the same host call, with the same result. Nothing is applied when the upload ends early, is malformed
     /// (InvalidArgument) or exceeds the node's limits (ResourceExhausted; <see cref="FragmentedWriteOptions"/>).
-    /// Declared last: a node built without it answers Unimplemented and the client falls back to <see cref="WriteAsync"/>.
     /// Use <see cref="GrpcPairClient.WriteAsync(string, string, CancellationToken)"/>, which picks the RPC by size.
     /// </summary>
     Task<ClientStreamingResult<WriteFragmentDto, PairWriteResultDto>> WriteFragmentsAsync();
@@ -73,8 +69,7 @@ public sealed class PairService(PairNodeHost host) : ServiceBase<IPairService>, 
         CancellationToken ct = linked.Token;
         try
         {
-            WalStreamCapabilities capabilities = WalStreamCapabilityHeader.Read(Context.CallContext.RequestHeaders);
-            await foreach (WalStreamMessage m in host.StreamUpdatesAsync(startSeq, capabilities, ct).ConfigureAwait(false))
+            await foreach (WalStreamMessage m in host.StreamUpdatesAsync(startSeq, ct).ConfigureAwait(false))
             {
                 await stream.WriteAsync(WalChunkDto.From(m)).WaitAsync(ct).ConfigureAwait(false);
             }
@@ -117,7 +112,7 @@ public sealed class PairService(PairNodeHost host) : ServiceBase<IPairService>, 
         using var batch = new WriteBatch();
         batch.Put(key.Span, value.Span);
         PairWriteResult r = await host.WriteAsync(batch, TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
-        return new PairWriteResultDto { Applied = r.Status == PairWriteStatus.Applied, PrimaryHint = r.PrimaryHint, Sequence = r.Sequence, Status = (int)r.Status };
+        return PairWriteResultDto.From(r);
     }
 
     public UnaryResult<bool> ReportProgressAsync(ulong appliedThrough, long epochAtApplied)
@@ -213,15 +208,9 @@ public sealed class GrpcPairClient : IPairNodeClient, IDisposable
         }
     }
 
-    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken) =>
-        StreamUpdatesAsync(startSeq, WalStreamCapabilities.None, cancellationToken);
-
-    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, WalStreamCapabilities capabilities,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        using ServerStreamingResult<WalChunkDto> call = await _client
-            .WithOptions(new CallOptions(headers: WalStreamCapabilityHeader.Create(capabilities), cancellationToken: cancellationToken).WithWaitForReady())
-            .SyncUpdatesAsync(startSeq);
+        using ServerStreamingResult<WalChunkDto> call = await Call(cancellationToken).SyncUpdatesAsync(startSeq);
         while (await call.ResponseStream.MoveNext(cancellationToken).ConfigureAwait(false))
         {
             yield return call.ResponseStream.Current.ToMessage();
@@ -249,17 +238,8 @@ public sealed class GrpcPairClient : IPairNodeClient, IDisposable
         }
     }
 
-    public async Task ReportProgressAsync(ulong appliedThrough, long epochAtApplied, CancellationToken cancellationToken)
-    {
-        try
-        {
-            await CallWithDeadline(cancellationToken).ReportProgressAsync(appliedThrough, epochAtApplied);
-        }
-        catch (RpcException e) when (e.StatusCode == Grpc.Core.StatusCode.Unimplemented)
-        {
-            // A primary built before this call existed: it acknowledges writes on its own, nothing to report.
-        }
-    }
+    public async Task ReportProgressAsync(ulong appliedThrough, long epochAtApplied, CancellationToken cancellationToken) =>
+        await CallWithDeadline(cancellationToken).ReportProgressAsync(appliedThrough, epochAtApplied);
 
     /// <summary><see cref="WriteAsync(string, string, GrpcWriteOptions, CancellationToken)"/> with <see cref="GrpcWriteOptions.Default"/>.</summary>
     public Task<PairWriteResultDto> WriteAsync(string key, string value, CancellationToken cancellationToken) =>
@@ -267,16 +247,14 @@ public sealed class GrpcPairClient : IPairNodeClient, IDisposable
 
     /// <summary>
     /// A client write. A payload (UTF-8 bytes of key and value) of at most <see cref="GrpcWriteOptions.MaxChunkBytes"/>
-    /// is the unary <see cref="IPairService.WriteAsync"/>, exactly as calling it on <see cref="Service"/>; a larger one
-    /// is uploaded in pieces (<see cref="IPairService.WriteFragmentsAsync"/>) and applied by the node as one write with
-    /// the same result. A node without that RPC gets the unary one; if it refuses the request for its size, this throws
-    /// <see cref="LargeWriteException"/> (<see cref="LargeWriteError.NotSupportedByServer"/>), as it does when the node
-    /// refuses the upload (too large, busy). Nothing was applied then.
+    /// is the unary <see cref="IPairService.WriteAsync"/> (one request, no stream to set up), exactly as calling it on
+    /// <see cref="Service"/>; a larger one is uploaded in pieces (<see cref="IPairService.WriteFragmentsAsync"/>) and
+    /// applied by the node as one write with the same result. Throws <see cref="LargeWriteException"/> when the node
+    /// refuses the upload (too large, busy, malformed). Nothing was applied then.
     /// <para>
-    /// Retries are the caller's, as for the unary RPC, and the guarantee is the same: a write whose call failed without
-    /// a result (connection, deadline) may or may not have been applied, and sending it again applies it again -
-    /// harmless for the same key and value. This method sends a write a second time only after Unimplemented, which
-    /// the node answers without applying anything.
+    /// Retries are the caller's, and the guarantee is the same for both RPCs: a write whose call failed without a
+    /// result (connection, deadline) may or may not have been applied, and sending it again applies it again -
+    /// harmless for the same key and value. This method never sends a write twice.
     /// </para>
     /// </summary>
     public async Task<PairWriteResultDto> WriteAsync(string key, string value, GrpcWriteOptions options, CancellationToken cancellationToken)
@@ -286,26 +264,10 @@ public sealed class GrpcPairClient : IPairNodeClient, IDisposable
         ArgumentNullException.ThrowIfNull(options);
         if (FragmentedWriteClient.IsSmall(key, value, options, out long bytes))
             return await WriteCall(FragmentedWriteClient.Deadline(options, 0), cancellationToken).WriteAsync(key, value);
-        if (!_noFragmentedWrites)
-        {
-            try
-            {
-                return await FragmentedWriteClient.UploadAsync(
-                    () => WriteCall(FragmentedWriteClient.Deadline(options, bytes), cancellationToken).WriteFragmentsAsync(), key, value, bytes, options,
-                    cancellationToken).ConfigureAwait(false);
-            }
-            catch (RpcException e) when (e.StatusCode == Grpc.Core.StatusCode.Unimplemented)
-            {
-                // A node built before this RPC existed. It applied nothing.
-                _noFragmentedWrites = true;
-            }
-        }
-        return await FragmentedWriteClient.UnaryToOldServerAsync(
-            () => WriteCall(FragmentedWriteClient.Deadline(options, bytes), cancellationToken).WriteAsync(key, value), bytes).ConfigureAwait(false);
+        return await FragmentedWriteClient.UploadAsync(
+            () => WriteCall(FragmentedWriteClient.Deadline(options, bytes), cancellationToken).WriteFragmentsAsync(), key, value, bytes, options,
+            cancellationToken).ConfigureAwait(false);
     }
-
-    // Set once the node answered Unimplemented to WriteFragmentsAsync.
-    private volatile bool _noFragmentedWrites;
 
     private IPairService WriteCall(DateTime deadline, CancellationToken ct) =>
         _client.WithOptions(new CallOptions(deadline: deadline, cancellationToken: ct).WithWaitForReady());

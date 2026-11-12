@@ -43,15 +43,10 @@ public enum LargeWriteError
     ServerBusy = 1,
     /// <summary>The node refused the upload as malformed (offsets, lengths) or as stalled.</summary>
     Rejected = 2,
-    /// <summary>
-    /// The node was built before large writes existed (it has no <c>WriteFragmentsAsync</c>) and refused the write as
-    /// one request because it exceeds its receive limit.
-    /// </summary>
-    NotSupportedByServer = 3,
 }
 
 /// <summary>
-/// A write larger than a chunk was refused by the node, or cannot be sent to it. Nothing was applied. Other failures
+/// A write larger than a chunk was refused by the node. Nothing was applied. Other failures
 /// of a large write (the connection, the deadline) surface as <see cref="RpcException"/> like those of a small one,
 /// and are indeterminate in the same way.
 /// </summary>
@@ -272,8 +267,9 @@ public sealed class GrpcWriteOptions
 
     /// <summary>
     /// A write whose payload (UTF-8 bytes of key and value) is larger than this is sent in pieces of at most this
-    /// size through <c>WriteFragmentsAsync</c>; a smaller one is the unary RPC, as always. 256 KiB by default, the
-    /// chunk size of the WAL stream (<see cref="WalTailer.DefaultMaxChunkBytes"/>).
+    /// size through <c>WriteFragmentsAsync</c>; a smaller one is the unary RPC, which costs one request instead of a
+    /// stream. 256 KiB by default, the chunk size of the WAL stream (<see cref="WalTailer.DefaultMaxChunkBytes"/>).
+    /// Keep it below the node's receive limit (<see cref="GrpcNodeServerOptions.MaxReceiveMessageSize"/>, 4 MiB).
     /// </summary>
     public int MaxChunkBytes { get; init; } = WalTailer.DefaultMaxChunkBytes;
 
@@ -310,8 +306,7 @@ internal static class FragmentedWriteClient
 
     /// <summary>
     /// Sends key + value through the opened client-streaming call. Throws <see cref="LargeWriteException"/> for a
-    /// refusal of the node and <see cref="RpcException"/> otherwise - with Unimplemented when
-    /// the node has no such RPC (nothing was applied; the caller falls back to the unary RPC).
+    /// refusal of the node and <see cref="RpcException"/> otherwise.
     /// </summary>
     public static async Task<TResult> UploadAsync<TResult>(Func<Task<ClientStreamingResult<WriteFragmentDto, TResult>>> open, string key, string value,
         long payloadBytes, GrpcWriteOptions options, CancellationToken cancellationToken)
@@ -377,23 +372,5 @@ internal static class FragmentedWriteClient
         if (detail.StartsWith(FragmentedWriteUpload.InvalidToken, StringComparison.Ordinal))
             return new LargeWriteException(LargeWriteError.Rejected, detail[FragmentedWriteUpload.InvalidToken.Length..], e);
         return null;
-    }
-
-    /// <summary>
-    /// The unary RPC for a write that is larger than a chunk, sent to a node without <c>WriteFragmentsAsync</c>: a
-    /// refusal for its size becomes <see cref="LargeWriteError.NotSupportedByServer"/>.
-    /// </summary>
-    public static async Task<TResult> UnaryToOldServerAsync<TResult>(Func<UnaryResult<TResult>> call, long payloadBytes)
-    {
-        try
-        {
-            return await call();
-        }
-        catch (RpcException e) when (e.StatusCode == Grpc.Core.StatusCode.ResourceExhausted)
-        {
-            throw new LargeWriteException(LargeWriteError.NotSupportedByServer,
-                "the server does not support large writes (it has no WriteFragmentsAsync) and refused the write of " + payloadBytes +
-                " bytes as one request: " + e.Status.Detail, e);
-        }
     }
 }

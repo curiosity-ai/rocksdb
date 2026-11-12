@@ -364,7 +364,7 @@ public sealed class SoakClusterService(ClusterNodeHost host, NodeContext ctx) : 
         CancellationToken ct = linked.Token;
         try
         {
-            await foreach (WalStreamMessage m in host.StreamUpdatesAsync(followerId, startSeq, WalStreamCapabilityHeader.Read(Context.CallContext.RequestHeaders), ct).ConfigureAwait(false))
+            await foreach (WalStreamMessage m in host.StreamUpdatesAsync(followerId, startSeq, ct).ConfigureAwait(false))
             {
                 await stream.WriteAsync(WalChunkDto.From(m)).WaitAsync(ct).ConfigureAwait(false);
             }

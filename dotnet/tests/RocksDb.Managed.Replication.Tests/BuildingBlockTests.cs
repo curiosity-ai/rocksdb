@@ -183,19 +183,19 @@ public sealed class BuildingBlockTests
         using var node = new RaftClusterNode(cfg, state, db, new NullPeerTransport());
 
         // New leader n2 (term 3) has entries 1..5 of term 1 followed by its own term-3 entries 6..7, committed up to 7.
-        AppendEntriesResult r = node.HandleAppendEntries(3, "n2", prevLogSeq: 5, prevLogTerm: 1, leaderCommit: 7, ClusterMode.Cluster);
+        AppendEntriesResult r = node.HandleAppendEntries(new HeartbeatPayload(3, "n2", 5, 1, 7, ClusterMode.Cluster));
         Assert.IsTrue(r.Success);
         Assert.AreEqual(5UL, node.CommitSeq, "the divergent tail past PrevLogSeq was marked committed");
 
         // Probing further back never lowers the commit index.
-        r = node.HandleAppendEntries(3, "n2", prevLogSeq: 3, prevLogTerm: 1, leaderCommit: 7, ClusterMode.Cluster);
+        r = node.HandleAppendEntries(new HeartbeatPayload(3, "n2", 3, 1, 7, ClusterMode.Cluster));
         Assert.IsTrue(r.Success);
         Assert.AreEqual(5UL, node.CommitSeq);
 
         // A heartbeat whose PrevLogSeq is inside the divergent tail fails the term check and asks for a resync.
         bool resync = false;
         node.ResyncRequired += (_, _) => resync = true;
-        r = node.HandleAppendEntries(3, "n2", prevLogSeq: 7, prevLogTerm: 3, leaderCommit: 7, ClusterMode.Cluster);
+        r = node.HandleAppendEntries(new HeartbeatPayload(3, "n2", 7, 3, 7, ClusterMode.Cluster));
         Assert.IsFalse(r.Success);
         Assert.AreEqual(AppendEntriesRejectReason.TermMismatch, r.Reason);
         Assert.IsTrue(resync);

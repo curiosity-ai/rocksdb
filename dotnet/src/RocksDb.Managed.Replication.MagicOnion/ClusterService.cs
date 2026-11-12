@@ -22,9 +22,8 @@ public interface IClusterService : IService<IClusterService>
     UnaryResult<AttachDto> CheckLogConsistencyAsync(string followerId, ulong latestSeq, long termAtLatest);
     Task<ServerStreamingResult<WalChunkDto>> SyncUpdatesAsync(string followerId, ulong startSeq);
     /// <summary>
-    /// <paramref name="leaderTerm"/> (appended last: a caller built against the two-argument contract sends none and is
-    /// read as term 0, which no leader accepts) is the term of the leadership the report is for. The result is false
-    /// when the report was ignored.
+    /// <paramref name="leaderTerm"/> is the term of the leadership the report is for. The result is false when the
+    /// report was ignored.
     /// </summary>
     UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seq, long leaderTerm);
     UnaryResult<Dictionary<string, string>> GetFileHashesAsync(List<FileInfoDto> candidates);
@@ -40,8 +39,7 @@ public interface IClusterService : IService<IClusterService>
     /// value's, sent in pieces (<see cref="WriteFragmentDto"/>) and written as one log entry once the last piece
     /// arrived - through the same host call, acknowledged once committed. Nothing is written when the upload ends
     /// early, is malformed (InvalidArgument) or exceeds the node's limits (ResourceExhausted;
-    /// <see cref="FragmentedWriteOptions"/>). Declared last: a node built without it answers Unimplemented and the
-    /// client falls back to <see cref="WriteAsync"/>. Use
+    /// <see cref="FragmentedWriteOptions"/>). Use
     /// <see cref="GrpcClusterClient.WriteAsync(string, string, CancellationToken)"/>, which picks the RPC by size.
     /// </summary>
     Task<ClientStreamingResult<WriteFragmentDto, bool>> WriteFragmentsAsync();
@@ -80,8 +78,7 @@ public sealed class ClusterService(ClusterNodeHost host) : ServiceBase<IClusterS
         CancellationToken ct = linked.Token;
         try
         {
-            WalStreamCapabilities capabilities = WalStreamCapabilityHeader.Read(Context.CallContext.RequestHeaders);
-            await foreach (WalStreamMessage m in host.StreamUpdatesAsync(followerId, startSeq, capabilities, ct).ConfigureAwait(false))
+            await foreach (WalStreamMessage m in host.StreamUpdatesAsync(followerId, startSeq, ct).ConfigureAwait(false))
             {
                 await stream.WriteAsync(WalChunkDto.From(m)).WaitAsync(ct).ConfigureAwait(false);
             }
@@ -152,8 +149,7 @@ public sealed class GrpcClusterClient : IClusterNodeClient, IDisposable
     /// <summary>
     /// A client whose channel uses <paramref name="channelOptions"/> (e.g. a short <see cref="GrpcChannelOptions.MaxReconnectBackoff"/>
     /// so a healed network partition is noticed quickly). What the options leave open is filled in with
-    /// <see cref="GrpcTransportDefaults.Apply"/>: keep-alive pings unless a handler or client is set, and no receive
-    /// size limit unless one other than gRPC's default is set.
+    /// <see cref="GrpcTransportDefaults.Apply"/>: keep-alive pings unless a handler or client is set.
     /// </summary>
     public GrpcClusterClient(ClusterMember peer, TimeSpan unaryTimeout, GrpcChannelOptions channelOptions)
     {
@@ -238,15 +234,10 @@ public sealed class GrpcClusterClient : IClusterNodeClient, IDisposable
         }
     }
 
-    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, CancellationToken cancellationToken) =>
-        StreamUpdatesAsync(followerId, startSeq, WalStreamCapabilities.None, cancellationToken);
-
-    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, WalStreamCapabilities capabilities,
+    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        using ServerStreamingResult<WalChunkDto> call = await _client
-            .WithOptions(new CallOptions(headers: WalStreamCapabilityHeader.Create(capabilities), cancellationToken: cancellationToken))
-            .SyncUpdatesAsync(followerId, startSeq);
+        using ServerStreamingResult<WalChunkDto> call = await _client.WithCancellationToken(cancellationToken).SyncUpdatesAsync(followerId, startSeq);
         while (await call.ResponseStream.MoveNext(cancellationToken).ConfigureAwait(false))
         {
             yield return call.ResponseStream.Current.ToMessage();
@@ -256,13 +247,36 @@ public sealed class GrpcClusterClient : IClusterNodeClient, IDisposable
     public async Task ReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken) =>
         await Unary(cancellationToken).ReportLastSyncSequenceNumber(followerId, appliedThrough, leaderTerm);
 
-    public async Task<IReadOnlyDictionary<string, string>> GetFileHashesAsync(IReadOnlyList<ReplicationFileInfo> candidates, CancellationToken cancellationToken) =>
-        await _client.WithCancellationToken(cancellationToken).GetFileHashesAsync(FileInfoDto.From(candidates));
+    /// <summary>
+    /// Asked in as many calls as it takes to keep every request and every answer below
+    /// <see cref="GrpcTransportDefaults.MaxFileListBytes"/>, however many files the database has.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<string, string>> GetFileHashesAsync(IReadOnlyList<ReplicationFileInfo> candidates, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(candidates);
+        var all = new Dictionary<string, string>(StringComparer.Ordinal);
+        for (int start = 0; start < candidates.Count;)
+        {
+            int count = FileListLimit.CountThatFits(candidates, start);
+            var batch = new List<FileInfoDto>(count);
+            for (int i = start; i < start + count; i++) batch.Add(new FileInfoDto { Name = candidates[i].FileName, Size = candidates[i].Size, Hash = candidates[i].Hash });
+            foreach (KeyValuePair<string, string> kv in await _client.WithCancellationToken(cancellationToken).GetFileHashesAsync(batch)) all[kv.Key] = kv.Value;
+            start += count;
+        }
+        return all;
+    }
 
+    /// <summary>
+    /// The inventory travels in the one request that opens the stream, so it is cut to what fits into
+    /// <see cref="GrpcTransportDefaults.MaxFileListBytes"/>, largest files first; the files left out are transferred
+    /// again instead of reused (the restore keeps exactly the files the source's plan names).
+    /// </summary>
     public async IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(IReadOnlyList<ReplicationFileInfo> verifiedInventory,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        using ServerStreamingResult<SnapshotChunkDto> call = await _client.WithCancellationToken(cancellationToken).SyncInitialStateAsync(FileInfoDto.From(verifiedInventory));
+        ArgumentNullException.ThrowIfNull(verifiedInventory);
+        using ServerStreamingResult<SnapshotChunkDto> call = await _client.WithCancellationToken(cancellationToken)
+            .SyncInitialStateAsync(FileInfoDto.From(FileListLimit.LargestThatFit(verifiedInventory)));
         while (await call.ResponseStream.MoveNext(cancellationToken).ConfigureAwait(false))
         {
             yield return call.ResponseStream.Current.ToChunk();
@@ -287,17 +301,15 @@ public sealed class GrpcClusterClient : IClusterNodeClient, IDisposable
 
     /// <summary>
     /// A client write, true once committed. A payload (UTF-8 bytes of key and value) of at most
-    /// <see cref="GrpcWriteOptions.MaxChunkBytes"/> is the unary <see cref="IClusterService.WriteAsync"/>, exactly as
-    /// calling it on <see cref="Service"/>; a larger one is uploaded in pieces
+    /// <see cref="GrpcWriteOptions.MaxChunkBytes"/> is the unary <see cref="IClusterService.WriteAsync"/> (one request,
+    /// no stream to set up), exactly as calling it on <see cref="Service"/>; a larger one is uploaded in pieces
     /// (<see cref="IClusterService.WriteFragmentsAsync"/>) and written by the node as one log entry with the same
-    /// result. A node without that RPC gets the unary one; if it refuses the request for its size, this throws
-    /// <see cref="LargeWriteException"/> (<see cref="LargeWriteError.NotSupportedByServer"/>), as it does when the node
-    /// refuses the upload (too large, busy). Nothing was written then.
+    /// result. Throws <see cref="LargeWriteException"/> when the node refuses the upload (too large, busy, malformed).
+    /// Nothing was written then.
     /// <para>
-    /// Retries are the caller's, as for the unary RPC, and the guarantee is the same: false, or a call that failed
-    /// without a result, may be a write that still commits, and sending it again writes it again - harmless for the
-    /// same key and value. This method sends a write a second time only after Unimplemented, which the node answers
-    /// without writing anything.
+    /// Retries are the caller's, and the guarantee is the same for both RPCs: false, or a call that failed without a
+    /// result, may be a write that still commits, and sending it again writes it again - harmless for the same key and
+    /// value. This method never sends a write twice.
     /// </para>
     /// </summary>
     public async Task<bool> WriteAsync(string key, string value, GrpcWriteOptions options, CancellationToken cancellationToken)
@@ -307,29 +319,54 @@ public sealed class GrpcClusterClient : IClusterNodeClient, IDisposable
         ArgumentNullException.ThrowIfNull(options);
         if (FragmentedWriteClient.IsSmall(key, value, options, out long bytes))
             return await WriteCall(FragmentedWriteClient.Deadline(options, 0), cancellationToken).WriteAsync(key, value);
-        if (!_noFragmentedWrites)
-        {
-            try
-            {
-                return await FragmentedWriteClient.UploadAsync(
-                    () => WriteCall(FragmentedWriteClient.Deadline(options, bytes), cancellationToken).WriteFragmentsAsync(), key, value, bytes, options,
-                    cancellationToken).ConfigureAwait(false);
-            }
-            catch (RpcException e) when (e.StatusCode == Grpc.Core.StatusCode.Unimplemented)
-            {
-                // A node built before this RPC existed. It wrote nothing.
-                _noFragmentedWrites = true;
-            }
-        }
-        return await FragmentedWriteClient.UnaryToOldServerAsync(
-            () => WriteCall(FragmentedWriteClient.Deadline(options, bytes), cancellationToken).WriteAsync(key, value), bytes).ConfigureAwait(false);
+        return await FragmentedWriteClient.UploadAsync(
+            () => WriteCall(FragmentedWriteClient.Deadline(options, bytes), cancellationToken).WriteFragmentsAsync(), key, value, bytes, options,
+            cancellationToken).ConfigureAwait(false);
     }
-
-    // Set once the node answered Unimplemented to WriteFragmentsAsync.
-    private volatile bool _noFragmentedWrites;
 
     private IClusterService WriteCall(DateTime deadline, CancellationToken ct) =>
         _client.WithOptions(new CallOptions(deadline: deadline, cancellationToken: ct));
 
     public void Dispose() => _channel.Dispose();
+}
+
+/// <summary>
+/// Keeps a list of files sent in one gRPC message below <see cref="GrpcTransportDefaults.MaxFileListBytes"/>. The size of
+/// an entry is estimated from above (name and hash as UTF-8, 16 bytes for the size and the MessagePack framing).
+/// </summary>
+internal static class FileListLimit
+{
+    // A SHA-256 signature as hex: what the answer to a hash request adds per file.
+    private const int HashChars = 64;
+
+    private static long EntryBytes(ReplicationFileInfo f) => 3L * (f.FileName?.Length ?? 0) + Math.Max(HashChars, 3L * (f.Hash?.Length ?? 0)) + 16;
+
+    /// <summary>How many of <paramref name="files"/> from <paramref name="start"/> fit into one message (at least one).</summary>
+    public static int CountThatFits(IReadOnlyList<ReplicationFileInfo> files, int start)
+    {
+        long bytes = 0;
+        int n = 0;
+        while (start + n < files.Count)
+        {
+            bytes += EntryBytes(files[start + n]);
+            if (n > 0 && bytes > GrpcTransportDefaults.MaxFileListBytes) break;
+            n++;
+        }
+        return n;
+    }
+
+    /// <summary><paramref name="files"/> when they fit into one message; otherwise the largest files that do.</summary>
+    public static IReadOnlyList<ReplicationFileInfo> LargestThatFit(IReadOnlyList<ReplicationFileInfo> files)
+    {
+        long bytes = 0;
+        foreach (ReplicationFileInfo f in files) bytes += EntryBytes(f);
+        if (bytes <= GrpcTransportDefaults.MaxFileListBytes) return files;
+        var bySize = new List<ReplicationFileInfo>(files);
+        bySize.Sort(static (a, b) => b.Size.CompareTo(a.Size));
+        bytes = 0;
+        int n = 0;
+        while (n < bySize.Count && (bytes += EntryBytes(bySize[n])) <= GrpcTransportDefaults.MaxFileListBytes) n++;
+        bySize.RemoveRange(n, bySize.Count - n);
+        return bySize;
+    }
 }

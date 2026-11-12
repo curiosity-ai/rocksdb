@@ -196,8 +196,10 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
 
     // ===== Incoming RPC handlers =====
 
-    public RequestVoteResult HandleRequestVote(long term, string candidateId, ulong lastLogSeq, long lastLogTerm)
+    public RequestVoteResult HandleRequestVote(RequestVotePayload request)
     {
+        ArgumentNullException.ThrowIfNull(request);
+        (long term, string candidateId, ulong lastLogSeq, long lastLogTerm) = request;
         lock (_gate)
         {
             // While our log is being rebuilt from a snapshot we have nothing to compare the candidate's log against;
@@ -238,10 +240,6 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             return new RequestVoteResult(_state.CurrentTerm, true);
         }
     }
-
-    /// <summary>The rocksdb-sharp signature of <see cref="HandleAppendEntries(HeartbeatPayload)"/>.</summary>
-    public AppendEntriesResult HandleAppendEntries(long term, string leaderId, ulong prevLogSeq, long prevLogTerm, ulong leaderCommit, ClusterMode leaderMode) =>
-        HandleAppendEntries(new HeartbeatPayload(term, leaderId, prevLogSeq, prevLogTerm, leaderCommit, leaderMode));
 
     public AppendEntriesResult HandleAppendEntries(HeartbeatPayload heartbeat)
     {
@@ -405,34 +403,14 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// For a leader acknowledging a client write: completes with true once <see cref="CommitSeq"/> reaches
-    /// <paramref name="sequence"/> (the write is replicated to a quorum), or with false as soon as this node is no longer
-    /// leader of the term it led when called (the write may never commit). Signalled, no polling; allocation-free in
-    /// steady state (pooled state machine and wait, cancellation included).
-    /// <para>
-    /// This overload takes the term at the time of the call. A caller that may have been delayed between its write and
-    /// this call must use <see cref="WaitForCommitAsync(ulong, long, CancellationToken)"/> with the term it read
-    /// before the write: after a step-down and a rebuild of this node's log, another entry can stand at
-    /// <paramref name="sequence"/>.
-    /// </para>
-    /// </summary>
-    public ValueTask<bool> WaitForCommitAsync(ulong sequence, CancellationToken cancellationToken)
-    {
-        long term;
-        lock (_gate)
-        {
-            if (_role != RaftRole.Leader) return new ValueTask<bool>(false);
-            term = _state.CurrentTerm;
-        }
-        return WaitForCommitAsync(sequence, term, cancellationToken);
-    }
-
-    /// <summary>
-    /// As <see cref="WaitForCommitAsync(ulong, CancellationToken)"/>, for an entry this node wrote as leader of
-    /// <paramref name="term"/> (read <see cref="CurrentTerm"/> before the write). True only when the entry at
-    /// <paramref name="sequence"/> is committed and still carries <paramref name="term"/> in this node's log: by the
-    /// log matching property that is the caller's entry. False once this node no longer leads <paramref name="term"/>
-    /// and the entry is not known to be committed.
+    /// For a leader acknowledging a client write it made as leader of <paramref name="term"/> (read
+    /// <see cref="CurrentTerm"/> before the write): completes with true once <see cref="CommitSeq"/> reaches
+    /// <paramref name="sequence"/> (the write is replicated to a quorum) and the entry there still carries
+    /// <paramref name="term"/> in this node's log - by the log matching property that is the caller's entry; after a
+    /// step-down and a rebuild of this node's log another entry can stand at <paramref name="sequence"/>. Completes
+    /// with false once this node no longer leads <paramref name="term"/> and the entry is not known to be committed
+    /// (the write may never commit). Signalled, no polling; allocation-free in steady state (pooled state machine and
+    /// wait, cancellation included).
     /// </summary>
     [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<bool> WaitForCommitAsync(ulong sequence, long term, CancellationToken cancellationToken)

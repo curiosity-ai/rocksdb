@@ -84,6 +84,12 @@ internal sealed class InProcessPairClient(string nodeId, Func<PairNodeHost> targ
 
     public Task<string?> GetEpochsAsync(CancellationToken cancellationToken) => Task.FromResult<string?>(target().HandleGetEpochs());
 
+    public Task ReportProgressAsync(ulong appliedThrough, long epochAtApplied, CancellationToken cancellationToken)
+    {
+        target().HandleReportProgress(appliedThrough, epochAtApplied);
+        return Task.CompletedTask;
+    }
+
     public IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(CancellationToken cancellationToken) =>
         InProcessTransport.Pump(ct => target().StreamSnapshotAsync(ct), static c => c.Detach(), cancellationToken);
 }
