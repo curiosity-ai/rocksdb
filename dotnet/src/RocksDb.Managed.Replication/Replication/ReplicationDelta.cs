@@ -24,7 +24,8 @@ public sealed class ReplicationDeltaPlan
 /// Granularity is whole files. Only immutable files (.sst / .blob) are ever reused. Matching requires name + size +
 /// identity signature, because two RocksDB instances allocate file numbers independently once they stop sharing a
 /// lineage - files with equal names (and even equal sizes) on different nodes are not guaranteed to hold the same
-/// content.
+/// content. The signature (<see cref="ComputeReuseSignatureAsync"/>) covers the tail of a table file, whose
+/// properties identify the creation event, and the whole of a blob file, which has no such identity.
 /// </para>
 /// Every method takes the <see cref="IFileSystem"/> the files live on; overloads without one use
 /// <see cref="LocalFileSystem"/>.
@@ -65,17 +66,43 @@ public static class ReplicationDelta
     /// Managed difference: the length prefix is always little-endian (rocksdb-sharp used the machine's
     /// <c>BitConverter</c> order), so signatures agree across architectures.
     /// </summary>
-    public static async ValueTask<string> ComputeFileSignatureAsync(IFileSystem fileSystem, string path, int tailBytes, CancellationToken cancellationToken)
+    public static ValueTask<string> ComputeFileSignatureAsync(IFileSystem fileSystem, string path, int tailBytes, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(fileSystem);
         ArgumentOutOfRangeException.ThrowIfNegative(tailBytes);
+        return ComputeSignatureCoreAsync(fileSystem, path, tailBytes, cancellationToken);
+    }
+
+    /// <summary>
+    /// The signature the hash exchange of a delta transfer compares (<see cref="TryHashCandidateAsync(IFileSystem, string, string, long, CancellationToken)"/>,
+    /// <see cref="VerifyCandidatesAsync"/>), by kind of file:
+    /// <list type="bullet">
+    /// <item>a table file (.sst): <see cref="ComputeFileSignatureAsync(IFileSystem, string, CancellationToken)"/>, length
+    /// plus the last <see cref="SignatureTailBytes"/> - the tail holds the identity of the one creation event;</item>
+    /// <item>anything else, in particular a blob file: length plus the whole content. A blob file is a header, records
+    /// (key, value, CRCs - no sequence number) and a footer with a count; nothing in it names the database, the session
+    /// or the history it was written in. Two nodes that descend from one checkpoint allocate the same file numbers, so
+    /// blob files of two histories can agree in name, size and tail and differ before it.</item>
+    /// </list>
+    /// For a file no longer than <see cref="SignatureTailBytes"/> the two are the same value.
+    /// </summary>
+    public static ValueTask<string> ComputeReuseSignatureAsync(IFileSystem fileSystem, string path, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        return ComputeSignatureCoreAsync(fileSystem, path, path.EndsWith(".sst", StringComparison.OrdinalIgnoreCase) ? SignatureTailBytes : long.MaxValue,
+            cancellationToken);
+    }
+
+    private static async ValueTask<string> ComputeSignatureCoreAsync(IFileSystem fileSystem, string path, long tailBytes, CancellationToken cancellationToken)
+    {
         using IncrementalHash sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         using IRandomAccessFile file = fileSystem.OpenRandomAccess(path);
         long length = file.Length;
         byte[] header = new byte[8];
         BinaryPrimitives.WriteInt64LittleEndian(header, length);
         sha.AppendData(header);
-        long offset = Math.Max(0, length - tailBytes);
+        long offset = tailBytes >= length ? 0 : length - tailBytes;
         byte[] buffer = RocksArrayPool<byte>.Shared.Rent(64 * 1024);
         try
         {
@@ -133,7 +160,7 @@ public static class ReplicationDelta
         if (!fileSystem.FileExists(path) || fileSystem.GetFileSize(path) != expectedSize) return null;
         try
         {
-            return await ComputeFileSignatureAsync(fileSystem, path, SignatureTailBytes, cancellationToken).ConfigureAwait(false);
+            return await ComputeReuseSignatureAsync(fileSystem, path, cancellationToken).ConfigureAwait(false);
         }
         catch (RocksDbException e) when (e.Code is StatusCode.NotFound or StatusCode.IOError)
         {
@@ -156,8 +183,8 @@ public static class ReplicationDelta
         foreach (ReplicationFileInfo local in localCandidates)
         {
             if (!sourceSignatures.TryGetValue(local.FileName, out string? sourceHash) || string.IsNullOrEmpty(sourceHash)) continue;
-            string localHash = await ComputeFileSignatureAsync(fileSystem, FileSystemHelpers.Combine(directory, local.FileName), SignatureTailBytes,
-                cancellationToken).ConfigureAwait(false);
+            string localHash = await ComputeReuseSignatureAsync(fileSystem, FileSystemHelpers.Combine(directory, local.FileName), cancellationToken)
+                .ConfigureAwait(false);
             if (string.Equals(localHash, sourceHash, StringComparison.OrdinalIgnoreCase))
                 verified.Add(new ReplicationFileInfo { FileName = local.FileName, Size = local.Size, Hash = localHash });
         }

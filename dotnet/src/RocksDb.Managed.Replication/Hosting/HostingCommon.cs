@@ -9,6 +9,16 @@ namespace RocksDb.Managed.Replication.Hosting;
 /// the WAL the follower asked for (it was purged) - the follower must then rebuild from a snapshot.
 /// <para><see cref="Data"/> may refer to the producer's buffer and is only valid until the producing enumeration moves
 /// on; transports that queue messages copy it (<see cref="Detach"/>).</para>
+/// <para>
+/// A chunk larger than the stream's chunk size (always one single write batch) is sent as consecutive fragments
+/// (<see cref="IsFragment"/>), so no message carries more than the chunk size: every fragment
+/// carries the batch's <see cref="FirstSequence"/>, <see cref="SourceId"/>, <see cref="SourceTerm"/>,
+/// <see cref="EntryTerm"/> and <see cref="TotalLength"/>, its own <see cref="FragmentOffset"/> and its slice of the
+/// serialized batch in <see cref="Data"/>; <see cref="EntryCount"/> is 0 on every fragment but the last
+/// (<see cref="IsLastFragment"/>). The follower puts them together with a <see cref="WalStreamAssembler"/> and applies
+/// the batch only once it is complete. The split exists on the wire only: the WAL, the sequence numbers and the
+/// atomicity of the batch are the same as for one message.
+/// </para>
 /// </summary>
 public readonly struct WalStreamMessage
 {
@@ -24,6 +34,24 @@ public readonly struct WalStreamMessage
         SourceFault = false;
         Reason = null;
     }
+
+    private WalStreamMessage(ulong firstSequence, int entryCount, ReadOnlyMemory<byte> data, string sourceId, long sourceTerm, long entryTerm,
+        int fragmentOffset, int totalLength)
+        : this(firstSequence, entryCount, data, sourceId, sourceTerm, entryTerm)
+    {
+        FragmentOffset = fragmentOffset;
+        TotalLength = totalLength;
+    }
+
+    /// <summary>
+    /// One fragment of a write batch of <paramref name="totalLength"/> serialized bytes that starts at
+    /// <paramref name="firstSequence"/>: <paramref name="data"/> is the batch's bytes from <paramref name="fragmentOffset"/>.
+    /// <paramref name="entryCount"/> is the batch's entry count on the last fragment and 0 on the others. A
+    /// <paramref name="totalLength"/> of 0 makes an ordinary (unfragmented) message.
+    /// </summary>
+    public static WalStreamMessage Fragment(ulong firstSequence, int fragmentOffset, int totalLength, int entryCount, ReadOnlyMemory<byte> data,
+        string sourceId, long sourceTerm, long entryTerm) =>
+        new(firstSequence, entryCount, data, sourceId, sourceTerm, entryTerm, fragmentOffset, totalLength);
 
     private WalStreamMessage(string sourceId, long sourceTerm, string reason, bool sourceFault)
     {
@@ -61,8 +89,17 @@ public readonly struct WalStreamMessage
     public bool SourceFault { get; }
     public string? Reason { get; }
 
+    /// <summary>For a fragment: where <see cref="Data"/> starts in the serialized batch. 0 otherwise.</summary>
+    public int FragmentOffset { get; }
+    /// <summary>For a fragment: the length of the whole serialized batch. 0 for an ordinary message.</summary>
+    public int TotalLength { get; }
+    /// <summary>Whether this message carries a part of a write batch (<see cref="Fragment"/>) instead of a whole chunk.</summary>
+    public bool IsFragment => TotalLength != 0;
+    /// <summary>Whether this fragment ends its batch.</summary>
+    public bool IsLastFragment => TotalLength != 0 && (long)FragmentOffset + Data.Length == TotalLength;
+
     public WalStreamMessage Detach() =>
-        ResyncRequired ? this : new WalStreamMessage(FirstSequence, EntryCount, Data.ToArray(), SourceId, SourceTerm, EntryTerm);
+        ResyncRequired ? this : new WalStreamMessage(FirstSequence, EntryCount, Data.ToArray(), SourceId, SourceTerm, EntryTerm, FragmentOffset, TotalLength);
 }
 
 /// <summary>
@@ -83,6 +120,23 @@ public sealed class FollowerResyncPolicy
     /// <summary>Whether a resync request <paramref name="message"/> should rebuild a node whose log ends at <paramref name="latestSeq"/>.</summary>
     public bool ShouldRebuild(in WalStreamMessage message, ulong latestSeq) =>
         !message.SourceFault || Volatile.Read(ref _rebuiltAtSeq) != unchecked((long)latestSeq);
+
+    // The log end at the latest stream that broke the fragment protocol, or None.
+    private long _streamFaultAtSeq = None;
+
+    /// <summary>
+    /// A stream broke the fragment protocol (<see cref="WalAssemblyStatus.Invalid"/>) while this node's log ended at
+    /// <paramref name="latestSeq"/>. False the first time at that position: the node drops the stream and attaches
+    /// again there (a fault of the connection does not repeat). True when the previous such fault happened at the same
+    /// position - nothing was applied in between, so the source sends that batch wrongly every time and attaching
+    /// again would repeat it without end: the node rebuilds from a snapshot, which contains the batch as files, and
+    /// follows from behind it.
+    /// </summary>
+    public bool ShouldRebuildAfterStreamFault(ulong latestSeq)
+    {
+        long at = unchecked((long)latestSeq);
+        return Interlocked.Exchange(ref _streamFaultAtSeq, at) == at;
+    }
 }
 
 /// <summary>Source-side producer of <see cref="WalStreamMessage"/>s over a <see cref="WalTailer"/>.</summary>
@@ -95,6 +149,12 @@ public static class WalStreamSender
     /// <paramref name="entryTerm"/> maps a sequence number to its term. When the WAL for <paramref name="startSequence"/>
     /// is gone, or <paramref name="startSequence"/> is past the end of this database's log (the follower holds entries
     /// this database never wrote), a single <see cref="WalStreamMessage.Resync"/> message ends the stream.
+    /// <para>
+    /// No message carries more than <paramref name="maxChunkBytes"/> payload bytes: a write batch that does not fit is
+    /// never merged with other batches (<see cref="WalTailer.TryReadChunk"/>) and is sent as consecutive
+    /// <see cref="WalStreamMessage.Fragment"/>s, slices of the tailer's buffer (nothing is copied); the stream tag
+    /// (source id, term) is taken once per batch. The receiver puts them together with a <see cref="WalStreamAssembler"/>.
+    /// </para>
     /// </summary>
     public static IAsyncEnumerable<WalStreamMessage> StreamAsync(RocksDatabase db, ulong startSequence, StreamTagProvider tag,
         Func<ulong, long> entryTerm, int maxChunkBytes, CancellationToken cancellationToken) =>
@@ -172,6 +232,21 @@ public static class WalStreamSender
             }
             if (has)
             {
+                if (chunk.Length > maxChunkBytes)
+                {
+                    // One write batch larger than a message may be (the tailer never merges such a batch with
+                    // others): slices of the tailer's buffer, which stays untouched until the next read.
+                    long batchTerm = entryTerm(chunk.FirstSequenceNumber);
+                    ReadOnlyMemory<byte> all = chunk.Memory;
+                    for (int offset = 0; offset < all.Length; offset += maxChunkBytes)
+                    {
+                        int n = Math.Min(maxChunkBytes, all.Length - offset);
+                        bool last = offset + n == all.Length;
+                        yield return WalStreamMessage.Fragment(chunk.FirstSequenceNumber, offset, all.Length, last ? chunk.EntryCount : 0,
+                            all.Slice(offset, n), sourceId, term, batchTerm);
+                    }
+                    continue;
+                }
                 yield return new WalStreamMessage(chunk.FirstSequenceNumber, chunk.EntryCount, chunk.Memory, sourceId, term, entryTerm(chunk.FirstSequenceNumber));
                 continue;
             }
@@ -194,7 +269,10 @@ public delegate bool StreamTagProvider(out string sourceId, out long term);
 
 /// <summary>
 /// Coalescing progress reporter for a follower: <see cref="Report"/> is cheap and never blocks the ingest loop; one
-/// background loop sends only the newest value through the callback (a lost report is superseded by the next).
+/// background loop sends only the newest value through the callback. A report whose send failed is sent again after
+/// <see cref="RetryDelay"/> (with the newest value) until one arrives: the last report of a burst is the only statement
+/// of the follower's position until the next write, and in a Raft cluster the leader cannot commit a quorum-held entry
+/// without it (rocksdb-sharp's hosts report on a 200 ms timer for the same reason).
 /// Allocation-free per report (beyond what the callback's transport allocates).
 /// </summary>
 public sealed class ProgressReporter : IAsyncDisposable
@@ -208,10 +286,19 @@ public sealed class ProgressReporter : IAsyncDisposable
     private int _pending;
     private volatile bool _completed;
 
-    public ProgressReporter(Func<ulong, CancellationToken, Task> send)
+    /// <summary>How long the loop waits before it sends a failed report again.</summary>
+    public TimeSpan RetryDelay { get; }
+
+    public ProgressReporter(Func<ulong, CancellationToken, Task> send) : this(send, TimeSpan.FromMilliseconds(200))
+    {
+    }
+
+    public ProgressReporter(Func<ulong, CancellationToken, Task> send, TimeSpan retryDelay)
     {
         ArgumentNullException.ThrowIfNull(send);
+        ArgumentOutOfRangeException.ThrowIfLessThan(retryDelay, TimeSpan.Zero);
         _send = send;
+        RetryDelay = retryDelay;
         _loop = Task.Run(RunAsync);
     }
 
@@ -231,7 +318,10 @@ public sealed class ProgressReporter : IAsyncDisposable
                     }
                     catch (Exception e) when (e is not OperationCanceledException)
                     {
-                        // Best effort: the next report carries newer progress.
+                        // Not delivered: send the newest value again (nothing may follow this report for a long time).
+                        if (_completed) return;
+                        Interlocked.Exchange(ref _pending, 1);
+                        await Task.Delay(RetryDelay, ct).ConfigureAwait(false);
                     }
                     continue;
                 }

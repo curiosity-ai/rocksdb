@@ -223,6 +223,7 @@ public sealed class InMemoryPairClient(InMemoryNetwork network, string from, str
     {
         // Faults apply to real promote requests, not to the warm-up probe sent before writes are held.
         if (request.IsProbe) return await network.Require<PairNodeHost>(from, to).HandlePromoteAsync(request);
+        LastPromote = request;
         TimeSpan delay = DelayNextPromote;
         DelayNextPromote = TimeSpan.Zero;
         if (delay > TimeSpan.Zero)
@@ -246,6 +247,9 @@ public sealed class InMemoryPairClient(InMemoryNetwork network, string from, str
         return r;
     }
 
+    /// <summary>The latest real (non-probe) promote request sent through this client.</summary>
+    public volatile PromoteRequest? LastPromote;
+
     /// <summary>The result of a delayed promote once it landed.</summary>
     public volatile PromoteResult? LateResult;
 
@@ -258,10 +262,35 @@ public sealed class InMemoryPairClient(InMemoryNetwork network, string from, str
     public Task<ReplicaLogCheck?> CheckReplicaLogAsync(ulong replicaLatestSeq, long replicaEpochAtLatest, CancellationToken cancellationToken) =>
         Task.FromResult(Target?.HandleCheckReplicaLog(replicaLatestSeq, replicaEpochAtLatest));
 
-    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken) =>
-        InMemoryNetwork.Pump(ct => network.Require<PairNodeHost>(from, to).StreamUpdatesAsync(startSeq, ct), static m => m.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken);
+    /// <summary>Rewrites (or passes through) every message of the WAL streams opened from now on; null for none.</summary>
+    public Func<WalStreamMessage, WalStreamMessage>? RewriteStream;
+
+    /// <summary>Called with every message of a WAL stream as the replica receives it.</summary>
+    public Action<WalStreamMessage>? OnStreamMessage;
+
+    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        Func<WalStreamMessage, WalStreamMessage>? rewrite = RewriteStream;
+        await foreach (WalStreamMessage m in InMemoryNetwork.Pump(ct => network.Require<PairNodeHost>(from, to).StreamUpdatesAsync(startSeq, ct),
+                           static m => m.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken))
+        {
+            WalStreamMessage r = rewrite is null ? m : rewrite(m);
+            OnStreamMessage?.Invoke(r);
+            yield return r;
+        }
+    }
 
     public Task<string?> GetEpochsAsync(CancellationToken cancellationToken) => Task.FromResult(Target?.HandleGetEpochs());
+
+    /// <summary>Drop the replica's progress reports (they fail, as on a broken connection).</summary>
+    public volatile bool DropProgressReports;
+
+    public Task ReportProgressAsync(ulong appliedThrough, long epochAtApplied, CancellationToken cancellationToken)
+    {
+        if (DropProgressReports) throw new IOException("progress report lost");
+        network.Require<PairNodeHost>(from, to).HandleReportProgress(appliedThrough, epochAtApplied);
+        return Task.CompletedTask;
+    }
 
     public IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(CancellationToken cancellationToken) =>
         InMemoryNetwork.Pump(ct => network.Require<PairNodeHost>(from, to).StreamSnapshotAsync(ct), static c => c.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken);

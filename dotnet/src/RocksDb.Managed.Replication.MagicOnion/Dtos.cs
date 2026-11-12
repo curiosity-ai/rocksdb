@@ -18,10 +18,17 @@ public sealed class WalChunkDto
     [Key(3)] public string SourceId { get; set; } = "";
     [Key(4)] public long SourceTerm { get; set; }
     [Key(5)] public long EntryTerm { get; set; }
-    [Key(6)] public bool ResyncRequired { get; set; }
-    [Key(7)] public string? Reason { get; set; }
-    /// <summary>Appended last: a sender built without it is read as false (an ordinary resync request).</summary>
-    [Key(8)] public bool SourceFault { get; set; }
+    /// <summary>
+    /// For a fragment of a large write batch (<see cref="WalStreamMessage.IsFragment"/>): where <see cref="Data"/>
+    /// starts in the serialized batch.
+    /// </summary>
+    [Key(6)] public int FragmentOffset { get; set; }
+    /// <summary>For a fragment: the length of the whole serialized batch. 0: an ordinary message.</summary>
+    [Key(7)] public int TotalLength { get; set; }
+    [Key(8)] public bool ResyncRequired { get; set; }
+    /// <summary>With <see cref="ResyncRequired"/>: <see cref="WalStreamMessage.SourceFault"/>.</summary>
+    [Key(9)] public bool SourceFault { get; set; }
+    [Key(10)] public string? Reason { get; set; }
 
     public static WalChunkDto From(in WalStreamMessage m) => new()
     {
@@ -34,13 +41,17 @@ public sealed class WalChunkDto
         ResyncRequired = m.ResyncRequired,
         Reason = m.Reason,
         SourceFault = m.SourceFault,
+        FragmentOffset = m.FragmentOffset,
+        TotalLength = m.TotalLength,
     };
 
     public WalStreamMessage ToMessage() => ResyncRequired
         ? SourceFault
             ? WalStreamMessage.ResyncAfterSourceFault(SourceId, SourceTerm, Reason ?? "resync required")
             : WalStreamMessage.Resync(SourceId, SourceTerm, Reason ?? "resync required")
-        : new WalStreamMessage(FirstSequence, EntryCount, Data, SourceId, SourceTerm, EntryTerm);
+        : TotalLength != 0
+            ? WalStreamMessage.Fragment(FirstSequence, FragmentOffset, TotalLength, EntryCount, Data, SourceId, SourceTerm, EntryTerm)
+            : new WalStreamMessage(FirstSequence, EntryCount, Data, SourceId, SourceTerm, EntryTerm);
 }
 
 [MessagePackObject]
@@ -65,11 +76,19 @@ public sealed class SnapshotChunkDto
         Content = c.Content,
     };
 
+    /// <summary>
+    /// Throws <see cref="InvalidDataException"/> for an unknown kind: taking it for
+    /// file data would write the message's content into the database directory - or, with an empty file name, fail
+    /// with a message about the name - where the restore must simply fail.
+    /// </summary>
     public SnapshotChunk ToChunk() => (SnapshotChunkKind)Kind switch
     {
-        SnapshotChunkKind.Plan => SnapshotChunk.Plan(SequenceNumber, KeepFiles),
-        SnapshotChunkKind.Complete => SnapshotChunk.Complete((int)FileSize),
-        _ => SnapshotChunk.FileData(FileName ?? "", FileSize, Offset, Content),
+        SnapshotChunkKind.Plan => SnapshotChunk.Plan(SequenceNumber, KeepFiles ?? []),
+        SnapshotChunkKind.Complete => FileSize is >= 0 and <= int.MaxValue
+            ? SnapshotChunk.Complete((int)FileSize)
+            : throw new InvalidDataException("snapshot end marker with file count " + FileSize),
+        SnapshotChunkKind.FileData => SnapshotChunk.FileData(FileName ?? "", FileSize, Offset, Content),
+        _ => throw new InvalidDataException("snapshot chunk of unknown kind " + Kind),
     };
 }
 
@@ -249,9 +268,15 @@ public sealed class ReplicaLogCheckDto
 [MessagePackObject]
 public sealed class PairWriteResultDto
 {
-    [Key(0)] public bool Applied { get; set; }
+    /// <summary>A message without the field is not an acknowledgement.</summary>
+    [Key(0)] public PairWriteStatus Status { get; set; } = PairWriteStatus.NotPrimary;
     [Key(1)] public string? PrimaryHint { get; set; }
     [Key(2)] public ulong Sequence { get; set; }
+
+    /// <summary>Whether the write was acknowledged (<see cref="PairWriteStatus.Applied"/>). Not on the wire.</summary>
+    [IgnoreMember] public bool Applied => Status == PairWriteStatus.Applied;
+
+    public static PairWriteResultDto From(in PairWriteResult r) => new() { Status = r.Status, PrimaryHint = r.PrimaryHint, Sequence = r.Sequence };
 }
 
 [MessagePackObject]

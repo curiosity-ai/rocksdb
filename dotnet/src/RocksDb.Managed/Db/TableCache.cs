@@ -380,6 +380,14 @@ internal sealed class TableCache : ITableCache, IDisposable
     /// <summary>Path of a table file (TableFileName with path id).</summary>
     public string TableFilePath(FileMetaData file) => FileNames.TableFileName(_dbPaths, file.FileNumber, file.PathId);
 
+    /// <summary>
+    /// True while DB::Open loads the tables of the recovered versions (VersionEditHandler::LoadTables with
+    /// prefetch_index_and_filter_in_cache = false): tables opened meanwhile do not warm the block cache with their
+    /// index, filter and partitions; only pinned metadata blocks are loaded. Set by the opening thread before the DB
+    /// serves reads.
+    /// </summary>
+    internal volatile bool InitialLoad;
+
     public TableReaderLease GetReader(FileMetaData file)
     {
         TableCacheStore.Handle h = _store.FindTable(this, file);
@@ -514,6 +522,7 @@ internal sealed class TableCache : ITableCache, IDisposable
             TableReaderOptions opts = ReaderOptions;
             if (file.LargestSeqno != opts.LargestSeqno || file.FileNumber != opts.FileNumber || file.LevelHint != opts.Level)
                 opts = opts with { LargestSeqno = file.LargestSeqno, FileNumber = file.FileNumber, Level = file.LevelHint };
+            if (InitialLoad) opts = opts with { PrefetchIndexAndFilterInCache = false };
             reader = TableReaderFactory.Open(f, opts);
         }
         catch

@@ -5,7 +5,7 @@
 //   SwitchoverTest node <id> <port> <dbPath> <primary|replica> <peerId> <peerPort>
 //
 // The coordinator starts A (primary) and B (replica), runs client writers that follow primary hints, then performs a
-// rolling upgrade: hand off A -> B, kill and restart A (rejoins from the WAL), hand off B -> A, kill and restart B. At the
+// rolling upgrade of the application (both nodes run the same version of the replication layer): hand off A -> B, kill and restart A (rejoins from the WAL), hand off B -> A, kill and restart B. At the
 // end every acknowledged write must be on both nodes and their digests must match.
 using System.Collections.Concurrent;
 using System.Diagnostics;

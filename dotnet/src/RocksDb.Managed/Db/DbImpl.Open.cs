@@ -503,7 +503,16 @@ internal sealed partial class DbImpl
                     if (!alwaysLoad && store.Count >= loadLimit) return;
                     try
                     {
-                        using TableReaderLease lease = cfd.TableCache.GetReader(f);
+                        // LoadTables(cfd, prefetch_index_and_filter_in_cache = false, is_initial_load = true).
+                        cfd.TableCache.InitialLoad = true;
+                        try
+                        {
+                            using TableReaderLease lease = cfd.TableCache.GetReader(f);
+                        }
+                        finally
+                        {
+                            cfd.TableCache.InitialLoad = false;
+                        }
                     }
                     catch (Exception e) when (e is RocksDbException or IOException or InvalidDataException)
                     {

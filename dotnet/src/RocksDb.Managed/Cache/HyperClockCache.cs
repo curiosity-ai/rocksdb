@@ -243,6 +243,8 @@ public sealed class HyperClockCache : BlockCache
         int aepl = Math.Max(averageEntriesPerLock, 1);
         Span<long> states = _shards.Length <= 64 ? stackalloc long[_shards.Length] : new long[_shards.Length];
         states.Clear();
+        // The table each shard's traversal started on (see ClockShard.ApplyToSomeEntries).
+        var tables = new ClockShard.Table?[_shards.Length];
         bool remainingWork;
         do
         {
@@ -250,7 +252,7 @@ public sealed class HyperClockCache : BlockCache
             for (int i = 0; i < _shards.Length; i++)
             {
                 if (states[i] == long.MaxValue) continue;
-                _shards[i].ApplyToSomeEntries(state, callback, aepl, ref states[i]);
+                _shards[i].ApplyToSomeEntries(state, callback, aepl, ref states[i], ref tables[i]);
                 remainingWork |= states[i] != long.MaxValue;
             }
         } while (remainingWork);
@@ -288,6 +290,9 @@ internal sealed class ClockSlot : CacheEntry
     internal ulong H1, H2;         // hashed key (probe base / increment)
     internal readonly ClockShard Shard;
     internal readonly bool Standalone;
+
+    // BaseClockTable::Insert returns Status::OkOverwritten for every insert that ended as a standalone entry.
+    internal override bool InsertedRedundantly => Standalone;
 
     internal ClockSlot(ClockShard shard, bool standalone)
     {
@@ -398,6 +403,13 @@ internal sealed class ClockShard
             _auto = true;
             _maxLengthBits = CalcHashBits(capacity, minAvgEntryCharge, policy);
             lengthBits = Math.Min(AutoInitialLengthBits, _maxLengthBits);
+            if (capacity > 0)
+            {
+                // GetStartingLength / CalcMaxUsableLength: the table starts with one page of slots (64), or with 4 slots
+                // when the shard's capacity is at most a page (4096 bytes), and can always grow to one page.
+                _maxLengthBits = Math.Max(_maxLengthBits, AutoInitialLengthBits);
+                lengthBits = capacity > 4096 ? AutoInitialLengthBits : 2;
+            }
         }
         else
         {
@@ -649,11 +661,17 @@ internal sealed class ClockShard
         ArgumentOutOfRangeException.ThrowIfNegative(charge);
         if (_auto)
         {
-            // Grow instead of evicting while entries are smaller than the table was sized for (within capacity).
+            // Grow instead of evicting while entries are smaller than the table was sized for (within capacity). At or
+            // over the capacity evictions normally keep the occupancy down; if it still reaches the occupancy limit
+            // (entries got smaller, or they are pinned), the table grows as well: an insert only evicts for occupancy
+            // once the table cannot grow (BaseClockTable::Insert, AutoHyperClockTable::GrowIfNeeded).
             while (true)
             {
                 Table t0 = Volatile.Read(ref _t);
-                if (Volatile.Read(ref _occupancy) + 1 <= t0.GrowLimit || Volatile.Read(ref _usage) + charge > Volatile.Read(ref _capacity)) break;
+                long newOccupancy = Volatile.Read(ref _occupancy) + 1;
+                if (newOccupancy <= t0.GrowLimit) break;
+                if (t0.GrowLimit == long.MaxValue
+                    || (newOccupancy <= t0.OccupancyLimit && Volatile.Read(ref _usage) + charge > Volatile.Read(ref _capacity))) break;
                 Grow(t0);
             }
         }
@@ -871,7 +889,9 @@ internal sealed class ClockShard
         // Cap the eviction effort at this thread (along with those operating in parallel) circling through the whole
         // structure kMaxCountdown times.
         Table t = Volatile.Read(ref _t);
-        ulong maxClockPointer = oldClockPointer + (ClockSlot.MaxCountdown << t.LengthBits);
+        // AutoHyperClockTable::Evict allows one more circle (kMaxCountdown + 1), so that an unreferenced entry at the
+        // highest countdown is freed on the last one; FixedHyperClockTable::Evict stops one step into the fourth.
+        ulong maxClockPointer = oldClockPointer + ((_auto ? ClockSlot.MaxCountdown + 1 : ClockSlot.MaxCountdown) << t.LengthBits);
         // EecAndScl::GetEffectiveEvictionEffortCap: strict_capacity_limit (the top bit) implies an infinite cap.
         ulong effectiveCap = Volatile.Read(ref _strict) ? _evictionEffortCap | 0x80000000u : _evictionEffortCap;
         CacheEvictionHandler? handler = _owner?.EvictionHandler;
@@ -891,7 +911,7 @@ internal sealed class ClockShard
                 }
             }
             if (freedCharge >= requestedCharge) return;
-            if (oldClockPointer >= maxClockPointer) return;
+            if (oldClockPointer + (_auto ? (ulong)stepSize : 0) >= maxClockPointer) return;
             // BaseClockTable::IsEvictionEffortExceeded: the ratio of useful effort to wasted effort is too low, with a
             // start-up allowance for wasted effort before any useful effort.
             if (((ulong)freedCount + 1) * effectiveCap <= seenPinnedCount)
@@ -1070,10 +1090,18 @@ internal sealed class ClockShard
     /// ClockCacheShard::ApplyToSomeEntries + ConstApplyToEntriesRange: the state is a slot index (long.MaxValue when done).
     /// Each visible slot is pinned with an optimistic acquire for the duration of the callback, then released like a
     /// handle (so an entry erased meanwhile is freed by this release, as by any last reference).
+    /// <para>
+    /// <paramref name="table"/> keeps the table the traversal started on (null on the first call). Upstream's automatic
+    /// table never moves an entry, so its slot index stays meaningful while the table grows; here a grow rehashes the
+    /// slot objects into a new array, where the index means nothing. The array the traversal started on still holds
+    /// every slot object that was occupied when it was replaced, each once, so walking it to its end reports every
+    /// entry that stays in the cache during the traversal exactly once.
+    /// </para>
     /// </summary>
-    public void ApplyToSomeEntries<TState>(TState state, CacheEntryVisitor<TState> callback, int averageEntriesPerLock, ref long position)
+    public void ApplyToSomeEntries<TState>(TState state, CacheEntryVisitor<TState> callback, int averageEntriesPerLock, ref long position,
+        ref Table? table)
     {
-        Table t = Volatile.Read(ref _t);
+        Table t = table ??= Volatile.Read(ref _t);
         long length = t.Array.Length;
         long indexBegin = position;
         long indexEnd = indexBegin + averageEntriesPerLock;

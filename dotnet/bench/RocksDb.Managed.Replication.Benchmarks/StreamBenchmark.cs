@@ -76,14 +76,19 @@ internal static class StreamBenchmark
         Task follower = Task.Run(async () =>
         {
             var consumer = new ReplicationConsumer(replica) { ApplyParallelism = config.ApplyParallelism };
+            // A write batch above the chunk size arrives in fragments, as in the hosts.
+            using var assembler = new WalStreamAssembler(WalStreamAssembler.DefaultMaxBatchBytes);
             try
             {
                 await foreach (WalStreamMessage m in client.StreamUpdatesAsync(1, stop.Token).ConfigureAwait(false))
                 {
                     long t0 = Stopwatch.GetTimestamp();
-                    if (m.ResyncRequired || !await consumer.TryIngestChunkAsync(m.Data, CancellationToken.None).ConfigureAwait(false))
+                    ReadOnlyMemory<byte> chunk = default;
+                    WalAssemblyStatus assembled = m.ResyncRequired ? WalAssemblyStatus.Invalid : assembler.Accept(m, out chunk);
+                    if (assembled == WalAssemblyStatus.Incomplete) continue;
+                    if (assembled != WalAssemblyStatus.Complete || !await consumer.TryIngestChunkAsync(chunk, CancellationToken.None).ConfigureAwait(false))
                     {
-                        reached.TrySetException(new InvalidOperationException("replica diverged: " + m.Reason));
+                        reached.TrySetException(new InvalidOperationException("replica diverged: " + (m.Reason ?? assembler.LastError)));
                         return;
                     }
                     long now = Stopwatch.GetTimestamp();

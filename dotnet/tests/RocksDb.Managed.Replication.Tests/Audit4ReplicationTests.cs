@@ -703,7 +703,7 @@ public sealed class Audit4ReplicationTests
         state.Set(0, ReplicationRole.Replica, "A");
         SwitchoverNode? node = null;
         bool detach = true;
-        node = new SwitchoverNode("B", state, db, _ =>
+        node = new SwitchoverNode("B", "A", state, db, _ =>
         {
             if (detach) node!.DetachDatabase();
             detach = false;

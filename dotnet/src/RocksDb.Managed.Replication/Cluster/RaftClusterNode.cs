@@ -103,6 +103,18 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
                 state.UpdateTermAndVote(1, config.NodeId);
                 state.RecordTermRange(db.GetLatestSequenceNumber() + 1, 1);
             }
+            else
+            {
+                // A restart. Leading again without an election must not continue the term of the previous run: if
+                // the recovered log ends before entries a follower already holds (log writes not fsync'd, see
+                // RaftConfig.SyncLogWrites, and a power loss), this node would write different entries at those
+                // sequence numbers in the same term, and (sequence, term) would no longer identify an entry - the
+                // follower's stale tail passes the attach check and the heartbeat check. A new term starting at the
+                // end of the recovered log keeps Raft's log matching property, as an election would.
+                long term = state.CurrentTerm + 1;
+                state.UpdateTermAndVote(term, config.NodeId);
+                state.StartTerm(db.GetLatestSequenceNumber() + 1, term);
+            }
         }
         else
         {
@@ -184,13 +196,20 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
 
     // ===== Incoming RPC handlers =====
 
-    public RequestVoteResult HandleRequestVote(long term, string candidateId, ulong lastLogSeq, long lastLogTerm)
+    public RequestVoteResult HandleRequestVote(RequestVotePayload request)
     {
+        ArgumentNullException.ThrowIfNull(request);
+        (long term, string candidateId, ulong lastLogSeq, long lastLogTerm) = request;
         lock (_gate)
         {
             // While our log is being rebuilt from a snapshot we have nothing to compare the candidate's log against;
             // granting a vote could help elect a candidate that lacks committed entries.
             if (_resyncing) return new RequestVoteResult(_state.CurrentTerm, false);
+
+            // Only a member can become leader of this cluster. A request from anyone else (a node configured for another
+            // cluster, a member list that was changed on one node only) must neither get a vote - a majority here does
+            // not overlap with a majority of its member list - nor move this node's term and depose its leader.
+            if (!_peers.ContainsKey(candidateId)) return new RequestVoteResult(_state.CurrentTerm, false);
 
             if (term > _state.CurrentTerm)
             {
@@ -222,10 +241,6 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         }
     }
 
-    /// <summary>The rocksdb-sharp signature of <see cref="HandleAppendEntries(HeartbeatPayload)"/>.</summary>
-    public AppendEntriesResult HandleAppendEntries(long term, string leaderId, ulong prevLogSeq, long prevLogTerm, ulong leaderCommit, ClusterMode leaderMode) =>
-        HandleAppendEntries(new HeartbeatPayload(term, leaderId, prevLogSeq, prevLogTerm, leaderCommit, leaderMode));
-
     public AppendEntriesResult HandleAppendEntries(HeartbeatPayload heartbeat)
     {
         ArgumentNullException.ThrowIfNull(heartbeat);
@@ -233,7 +248,13 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         bool conflict = false;
         lock (_gate)
         {
+            // A heartbeat of a node that is not a member is not this cluster's leader speaking (see HandleRequestVote):
+            // it must not move the term, reset the election timer or set the commit index.
+            if (!_peers.ContainsKey(heartbeat.LeaderId))
+                return new AppendEntriesResult(_state.CurrentTerm, false, 0, AppendEntriesRejectReason.StaleTerm);
+
             if (heartbeat.Term > _state.CurrentTerm) _state.UpdateTermAndVote(heartbeat.Term, null);
+
 
             // The database is being rebuilt: answer before touching it.
             if (_resyncing) return new AppendEntriesResult(_state.CurrentTerm, false, 0, AppendEntriesRejectReason.Resyncing);
@@ -382,27 +403,26 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// For a leader acknowledging a client write: completes with true once <see cref="CommitSeq"/> reaches
-    /// <paramref name="sequence"/> (the write is replicated to a quorum), or with false as soon as this node is no longer
-    /// leader of the term it led when called (the write may never commit). Signalled, no polling; allocation-free in
-    /// steady state (pooled state machine and wait, cancellation included).
+    /// For a leader acknowledging a client write it made as leader of <paramref name="term"/> (read
+    /// <see cref="CurrentTerm"/> before the write): completes with true once <see cref="CommitSeq"/> reaches
+    /// <paramref name="sequence"/> (the write is replicated to a quorum) and the entry there still carries
+    /// <paramref name="term"/> in this node's log - by the log matching property that is the caller's entry; after a
+    /// step-down and a rebuild of this node's log another entry can stand at <paramref name="sequence"/>. Completes
+    /// with false once this node no longer leads <paramref name="term"/> and the entry is not known to be committed
+    /// (the write may never commit). Signalled, no polling; allocation-free in steady state (pooled state machine and
+    /// wait, cancellation included).
     /// </summary>
     [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder<>))]
-    public async ValueTask<bool> WaitForCommitAsync(ulong sequence, CancellationToken cancellationToken)
+    public async ValueTask<bool> WaitForCommitAsync(ulong sequence, long term, CancellationToken cancellationToken)
     {
-        long term;
-        lock (_gate)
-        {
-            if (_role != RaftRole.Leader) return CommitSeq >= sequence;
-            term = _state.CurrentTerm;
-        }
         while (true)
         {
             RocksDb.Managed.Util.AsyncBroadcastSignal.Waiter changed;
             lock (_gate)
             {
-                if (CommitSeq >= sequence) return true;
-                if (_role != RaftRole.Leader || _state.CurrentTerm != term || _disposed != 0) return false;
+                bool leading = _role == RaftRole.Leader && _state.CurrentTerm == term && _disposed == 0;
+                if (CommitSeq >= sequence) return leading || _state.Terms.GetTermForSeq(sequence) == term;
+                if (!leading) return false;
                 // Registered under _gate, where every signal is raised: no wake-up can be missed.
                 changed = _commitChanged.Register();
             }
@@ -490,7 +510,7 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         ulong nextSeq = _db.GetLatestSequenceNumber() + 1;
         try
         {
-            _state.RecordTermRange(nextSeq, _state.CurrentTerm);
+            _state.StartTerm(nextSeq, _state.CurrentTerm);
             // Replicate one entry from the new term right away so the commit index can advance past entries inherited
             // from previous terms (§5.4.2).
             // Synced like every log entry: the leader counts its own latest sequence towards the quorum.

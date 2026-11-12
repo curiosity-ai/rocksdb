@@ -124,6 +124,30 @@ public sealed class RaftPersistentState
     }
 
     /// <summary>
+    /// Records that this node's own entries from <paramref name="startSeq"/> on belong to <paramref name="term"/>, for a
+    /// node that won the election of that term. Ranges starting at or after <paramref name="startSeq"/> are dropped
+    /// first: a follower adopts its leader's term map at attach (<see cref="AdoptTermsAfter"/>), including ranges for
+    /// entries it has not received yet, and its own entries take those sequence numbers now. Left in place they make
+    /// <see cref="RaftLogTerms.Record"/> ignore the new term (the range would start before the last one): the leader
+    /// then never commits (no entry of its log carries its term) and labels its entries past the stale range with the
+    /// old leader's term, so the old leader's divergent tail passes the attach check. The switchover counterpart is
+    /// <c>ReplicationRoleState.StartEpoch</c>.
+    /// </summary>
+    public void StartTerm(ulong startSeq, long term)
+    {
+        lock (_gate)
+        {
+            RaftLogTerms updated = _terms.Clone();
+            bool changed = startSeq > 0 && updated.TruncateAfter(startSeq - 1);
+            changed |= updated.Record(startSeq, term);
+            if (!changed) return;
+            // Durable first, see RecordTermRange.
+            FileSystemHelpers.AtomicWrite(_fs, _termsPath, updated.Serialize());
+            _terms = updated;
+        }
+    }
+
+    /// <summary>
     /// A follower attaching to a leader whose log matches ours up to <paramref name="lastLocalSeq"/>: the leader's term map
     /// is the truth for every entry after it. Our own ranges past that point describe entries we never received or lost
     /// (a deposed leader's discarded tail learned at an earlier attach, a range recorded just before a power loss) and
@@ -174,31 +198,18 @@ public sealed class RaftPersistentState
 
     private void Load()
     {
-        try
+        // A read error is thrown to the caller (rocksdb-sharp started "fresh" on any error): a node that forgets its
+        // term and vote can vote a second time in a term it already voted in - two leaders in one term - and one that
+        // forgets its term map compares logs with wrong terms. Both files are replaced atomically, so they are never
+        // half written; a node that cannot read them must not take part until it can.
+        string? state = FileSystemHelpers.TryReadAllText(_fs, _statePath);
+        if (state != null)
         {
-            string? state = FileSystemHelpers.TryReadAllText(_fs, _statePath);
-            if (state != null)
-            {
-                string[] lines = state.Split('\n');
-                if (lines.Length >= 1 && long.TryParse(lines[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out long t)) _currentTerm = t;
-                if (lines.Length >= 2) _votedFor = string.IsNullOrEmpty(lines[1]) ? null : lines[1];
-                if (lines.Length >= 3 && int.TryParse(lines[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out int m)) _mode = m;
-            }
+            string[] lines = state.Split('\n');
+            if (lines.Length >= 1 && long.TryParse(lines[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out long t)) _currentTerm = t;
+            if (lines.Length >= 2) _votedFor = string.IsNullOrEmpty(lines[1]) ? null : lines[1];
+            if (lines.Length >= 3 && int.TryParse(lines[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out int m)) _mode = m;
         }
-        catch (RocksDbException)
-        {
-            // Unreadable file: start fresh; the node re-snapshots from the current leader.
-            _currentTerm = 0;
-            _votedFor = null;
-            _mode = 0;
-        }
-        try
-        {
-            _terms = RaftLogTerms.Deserialize(FileSystemHelpers.TryReadAllText(_fs, _termsPath));
-        }
-        catch (RocksDbException)
-        {
-            _terms = new RaftLogTerms();
-        }
+        _terms = RaftLogTerms.Deserialize(FileSystemHelpers.TryReadAllText(_fs, _termsPath));
     }
 }

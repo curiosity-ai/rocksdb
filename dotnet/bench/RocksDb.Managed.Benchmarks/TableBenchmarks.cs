@@ -109,7 +109,7 @@ public class TableBenchmarks
     [Benchmark(Description = "Block: Seek")]
     public bool BlockSeek()
     {
-        _blockIter.Seek(_blockKeys[(_next++ * 7) % _blockKeys.Length]);
+        _blockIter.Seek(_blockKeys[(int)((uint)(_next++ * 7) % (uint)_blockKeys.Length)]); // unsigned: the counter wraps on long runs
         return _blockIter.Valid;
     }
 

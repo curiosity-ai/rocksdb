@@ -139,6 +139,11 @@ public sealed class SstCompatTests
             }
         }
         Assert.IsTrue(stats.DataHits > 0 && stats.DataMisses > 0 && stats.IndexHits > 0);
+        // pin_top_level_index_and_filter (default true): the top level of a partitioned index is a cache entry the open
+        // reader pins (PartitionIndexReader::Create with pin); nothing else stays pinned between reads.
+        if (indexType == (int)IndexType.TwoLevelIndexSearch) Assert.IsTrue(cache.PinnedUsage > 0, "the pinned top-level index");
+        else Assert.AreEqual(0, cache.PinnedUsage);
+        cached.Dispose();
         Assert.AreEqual(0, cache.PinnedUsage);
     }
 

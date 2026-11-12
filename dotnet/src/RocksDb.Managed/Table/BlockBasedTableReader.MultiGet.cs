@@ -61,9 +61,11 @@ public sealed partial class BlockBasedTableReader
         BlockRef current = default;
         ulong currentOffset = ulong.MaxValue;
         MultiGetCacheLookups? lookups = null;
+        // A dictionary in the block cache that the reader does not pin: looked up once per batch (see BatchDictionary).
+        BatchDictionary? batchDict = null;
         try
         {
-            if (_cache is { ExtendedLookup: true } extended)
+            if (_cache is { ExtendedLookup: true } extended && !_dictLookupPerRead)
             {
                 // Kept out of this method so that the state machine of the common path does not grow.
                 lookups = MultiGetCacheLookups.Rent(candidates);
@@ -97,7 +99,15 @@ public sealed partial class BlockBasedTableReader
                         if (!current.IsEmpty) current.Release();
                         current = default;
                         currentOffset = ulong.MaxValue;
-                        if (lookups is not null && lookups.TryTake(handle.Offset, out BlockRef prefetched))
+                        // The first block of a key uses the batch's dictionary; a key that continues into the next block
+                        // retrieves it like any single read (NewDataBlockIterator), with its own dictionary lookup.
+                        if (_dictLookupPerRead && first)
+                        {
+                            batchDict ??= RentBatchDictionary();
+                            ValueTask<BlockRef> pending = GetDataBlockRefForBatch(batchDict, handle, flags, synchronous, cancellationToken);
+                            current = pending.IsCompletedSuccessfully ? pending.Result : await pending.ConfigureAwait(false);
+                        }
+                        else if (lookups is not null && lookups.TryTake(handle.Offset, out BlockRef prefetched))
                         {
                             ValueTask<BlockRef> pending = prefetched.IsEmpty
                                 ? ReadMissedDataBlock(handle, flags, synchronous, cancellationToken)
@@ -140,6 +150,7 @@ public sealed partial class BlockBasedTableReader
         finally
         {
             if (!current.IsEmpty) current.Release();
+            if (batchDict is not null) ReturnBatchDictionary(batchDict);
             lookups?.Return();
             IterPool.Return(data);
             idx.Return();
@@ -293,17 +304,127 @@ public sealed partial class BlockBasedTableReader
         }
     }
 
+    /// <summary>
+    /// Port of BlockBasedTable::FullFilterKeysMayMatch for a MultiGet batch. A filter the reader owns or pins is probed
+    /// per key. One that lives in the block cache unpinned is looked up once for the whole batch
+    /// (FullFilterBlockReader::MayMatch(MultiGetRange*)); a partitioned filter looks its top level up once and each
+    /// partition once for the run of consecutive keys it covers (PartitionedFilterBlockReader::MayMatch(MultiGetRange*)
+    /// / MayMatchPartition), instead of once per key.
+    /// </summary>
     private int FilterBatch<TBatch>(TBatch batch, int[] keys, int count, bool[] mayMatch, TableReadFlags flags)
         where TBatch : class, ITableMultiGetBatch
     {
         int candidates = 0;
-        for (int i = 0; i < count; i++)
+        bool sharedLookups = (flags & TableReadFlags.SkipFilters) == 0
+            && (_filterKind == FilterKind.Partitioned || (_filterKind == FilterKind.Full && _filter is null));
+        if (!sharedLookups)
         {
-            bool m = InternalKeyMayMatch(batch.InternalKey(keys[i]), flags);
-            mayMatch[i] = m;
-            if (m) candidates++;
+            for (int i = 0; i < count; i++)
+            {
+                bool m = InternalKeyMayMatch(batch.InternalKey(keys[i]), flags);
+                mayMatch[i] = m;
+                if (m) candidates++;
+            }
+            return candidates;
+        }
+        FilterBatchState state = default;
+        try
+        {
+            for (int i = 0; i < count; i++)
+            {
+                bool m = InternalKeyMayMatch(batch.InternalKey(keys[i]), flags, ref state);
+                mayMatch[i] = m;
+                if (m) candidates++;
+            }
+        }
+        finally
+        {
+            state.Release();
         }
         return candidates;
+    }
+
+    /// <summary>The filter blocks one MultiGet batch holds while it probes its keys (sorted by internal key).</summary>
+    private struct FilterBatchState
+    {
+        /// <summary>The full filter, or the partition of the current run of keys.</summary>
+        public FilterBlockLease Lease;
+        /// <summary>The filter behind <see cref="Lease"/> (or a pinned partition); null: every key may match.</summary>
+        public Filters.IFilterBitsReader? Reader;
+        public bool HasCurrent;
+        /// <summary>Offset of the partition <see cref="Reader"/> belongs to.</summary>
+        public ulong PartitionOffset;
+        /// <summary>The top-level filter index looked up for this batch (when the reader does not hold it).</summary>
+        public BlockRef Top;
+        public bool TopResolved;
+
+        public void Release()
+        {
+            Lease.Release();
+            if (!Top.IsEmpty) Top.Release();
+        }
+    }
+
+    /// <summary><see cref="InternalKeyMayMatch(ReadOnlySpan{byte}, TableReadFlags)"/> for a key of a MultiGet batch, sharing the batch's filter lookups.</summary>
+    private bool InternalKeyMayMatch(ReadOnlySpan<byte> internalKey, TableReadFlags flags, ref FilterBatchState state)
+    {
+        ReadOnlySpan<byte> userKey = DbFormat.ExtractUserKeyAndStripTimestamp(internalKey, _tsSize);
+        if (WholeKeyFiltering)
+        {
+            bool mayMatch = FilterMayMatch(userKey, internalKey, flags, ref state);
+            _stats?.Record(mayMatch ? BlockCacheCounter.BloomFilterFullPositive : BlockCacheCounter.BloomFilterUseful);
+            PerfContext.Add(mayMatch ? PerfMetric.BloomSstHitCount : PerfMetric.BloomSstMissCount, 1);
+            return mayMatch;
+        }
+        SliceTransform? pe = _options.PrefixExtractor;
+        if (!_prefixExtractorChanged && pe!.InDomain(userKey))
+        {
+            bool mayMatch = FilterMayMatch(pe.Transform(userKey), internalKey, flags, ref state);
+            PerfContext.Add(mayMatch ? PerfMetric.BloomSstHitCount : PerfMetric.BloomSstMissCount, 1);
+            if (_stats is { } s)
+            {
+                s.Record(BlockCacheCounter.BloomFilterPrefixChecked);
+                if (!mayMatch) s.Record(BlockCacheCounter.BloomFilterPrefixUseful);
+            }
+            return mayMatch;
+        }
+        return true;
+    }
+
+    private bool FilterMayMatch(ReadOnlySpan<byte> entry, ReadOnlySpan<byte> internalKey, TableReadFlags flags, ref FilterBatchState state)
+    {
+        if (_filterKind == FilterKind.Full)
+        {
+            if (!state.HasCurrent)
+            {
+                state.HasCurrent = true;
+                state.Reader = AcquireFilterBlock(_filterHandle, flags, ref state.Lease);
+            }
+            return state.Reader is null || state.Reader.MayMatch(entry);
+        }
+        Block? top = _filterIndexBlock;
+        if (top is null)
+        {
+            if (!state.TopResolved)
+            {
+                state.TopResolved = true;
+                TryGetFilterIndexRef(flags, out state.Top);
+            }
+            top = state.Top.Block;
+            if (top is null) return true;
+        }
+        if (!TryFindFilterPartition(top, internalKey, out BlockHandle partition)) return true;
+        if (partition.Size == 0) return false; // key is out of range
+        if (!state.HasCurrent || state.PartitionOffset != partition.Offset)
+        {
+            state.Lease.Release();
+            state.HasCurrent = true;
+            state.PartitionOffset = partition.Offset;
+            state.Reader = _pinnedFilterPartitions is { } pinned && pinned.TryGet(partition.Offset, out Filters.IFilterBitsReader? r)
+                ? r
+                : AcquireFilterBlock(partition, flags, ref state.Lease);
+        }
+        return state.Reader is null || state.Reader.MayMatch(entry);
     }
 
     private static void SeekIndex<TBatch>(IndexCursor idx, TBatch batch, int key) where TBatch : class, ITableMultiGetBatch =>

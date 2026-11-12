@@ -22,6 +22,23 @@ RocksDb.Managed.Replication            namespace RocksDb.Managed.Replication    
 RocksDb.Managed.Replication.MagicOnion  IClusterService/IPairService/IReplicationService + gRPC clients + GrpcNodeServer
 ```
 
+## Versions: one version per deployment
+
+Every node of a deployment - both nodes of a pair, all members of a cluster, a primary and its replicas, and the
+clients that use the gRPC services - must run the **same version of this layer** (`RocksDb.Managed.Replication` and
+`RocksDb.Managed.Replication.MagicOnion`). The protocol between nodes (the transport interfaces, the gRPC contracts and
+their MessagePack DTOs, the role / Raft state files) is not versioned and nothing is negotiated: there is no
+compatibility between versions of it, and therefore **no rolling-upgrade guarantee across versions of this layer
+yet**. To change its version, stop every node and start them all on the new one.
+
+This is not about the data or about your application: the database directories are native RocksDB format (the core
+library's on-disk compatibility is untouched), and upgrading the *application* on top of an unchanged version of this
+layer needs no downtime - hand the primary role to the other node, restart, hand it back ("Planned switchover" below;
+the test `RollingUpgradeHandsOffBothWaysWithoutLosingWrites` and `samples/SwitchoverTest` do exactly that).
+
+A peer is still not trusted to be well-formed: malformed fragments, unknown snapshot chunk kinds, plans that keep
+mutable files, Raft requests of non-members, reports for another term or epoch are refused.
+
 ## File map (rocksdb-sharp -> managed)
 
 | rocksdb-sharp | managed |
@@ -62,7 +79,8 @@ if (!await consumer.TryIngestChunkAsync(chunkBytes, ct)) Resync();   // must sta
   points, Raft log indexes, attach checks) rests on that. Writes with `DisableWal`, `IngestExternalFiles` on the source
   and any write on a replica break it.
 * `WalTailer` merges consecutive WAL batches into one serialized write batch under a single 12-byte header (summed
-  count) - one message and one replica write per chunk. The bytes are a valid native `WriteBatch` (a test feeds them to a
+  count) - one message and one replica write per chunk. A chunk ends before a batch that does not fit into the rest of
+  it, so only a single batch that is larger than the chunk size on its own makes a larger chunk. The bytes are a valid native `WriteBatch` (a test feeds them to a
   native rocksdb-sharp replica).
 * The replica inserts a chunk into its memtable with up to `ReplicationConsumer.ApplyParallelism` threads (default:
   processor count, at most 4; `WriteOptions.MemtableInsertParallelism`). A primary's concurrent writers insert their
@@ -72,12 +90,14 @@ if (!await consumer.TryIngestChunkAsync(chunkBytes, ct)) Resync();   // must sta
   chunks with merge operands, blob indexes, timed puts or 2PC markers are inserted serially.
 * When the WAL a replica needs was purged, the tailer throws `RocksDbException(NotFound)` (the hosts turn this into a
   "resync required" stream message) and the replica rebuilds from a new snapshot. `ReplicationDelta` keeps the
-  immutable SST/blob files both sides hold byte-identically (name + size + SHA-256 of length and last 1 MiB), so a
+  immutable SST/blob files both sides hold byte-identically (name + size + SHA-256 of the length and the last 1 MiB of a table file - its properties name the one creation event - or of the whole of a blob file, which carries no identity), so a
   rebuild only transfers what changed. A source that cannot read its own WAL (Corruption) also asks for a resync,
   marked `WalStreamMessage.SourceFault` and counted in the host's `WalStreamFaults`; a follower that has applied
   nothing since its last rebuild then retries the stream instead of rebuilding again (`FollowerResyncPolicy`).
 * A snapshot stream is: plan (files the consumer keeps), file chunks with CURRENT last, end marker.
-  `SnapshotReceiver` refuses a stream without plan or end marker, so a cut-off transfer is never opened as a database.
+  `SnapshotReceiver` refuses a stream without plan or end marker, so a cut-off transfer is never opened as a database;
+  it writes CURRENT under a temporary name until the end marker (whatever order the sender uses) and refuses a plan
+  that keeps anything but immutable files it holds.
 * WAL retention: with `DbOptions.WalTtlSeconds`/`WalSizeLimitMb` obsolete WALs are archived;
   `ReplicationSource.ReportReplicaProgress` + `RetireArchivedWals()` delete archived WALs once every replica applied
   them (nothing while a checkpoint session is in flight). Size the archive for the longest expected replica downtime.
@@ -90,6 +110,119 @@ if (!await consumer.TryIngestChunkAsync(chunkBytes, ct)) Resync();   // must sta
 * Use the same column families on the replica (batches carry column family ids) and keep the WAL in the DB directory
   (`WalDir` empty) on replicas restored from a checkpoint (a checkpoint stores its WALs next to the tables).
 
+## Large write batches and large client writes
+
+A message on the wire is bounded; a write is not. Two places send a payload of the user's size, and both send it in
+pieces of at most `MaxChunkBytes` (256 KiB by default) that the receiver puts together before it applies anything.
+In both the split exists on the wire only: the WAL, the sequence numbers and the atomicity of the write are those of
+one message.
+
+**WAL stream** (`WalStreamMessage`, `WalStreamSender`, `WalStreamAssembler`). A chunk is at least one whole write
+batch, so one large batch would be one message of its size - above gRPC's 4 MiB receive limit, and without any bound.
+
+* The source always sends a batch larger than `MaxChunkBytes` as consecutive fragments, slices of the tailer's buffer
+  (the tailer never merges such a batch with others): each carries the batch's first sequence number, source id,
+  source term, entry term and total length, plus its own offset; the entry count is on the last fragment and 0 on the
+  others. A chunk that fits is one message. Every consumer of a stream reassembles with `WalStreamAssembler` (the
+  hosts and `ReplicaFollower` do).
+* The follower collects the fragments in one pooled buffer of the announced length and applies the batch through the
+  same path as an unfragmented chunk, once the last fragment arrived. Its log never ends inside a batch, and progress
+  reports / acknowledgements (`WriteAck = Replica`, Raft progress) only ever name applied batches.
+* A stream that ends or fails takes its partial batch with it; the follower attaches again at its last applied
+  sequence number and is sent the batch from offset 0.
+* A fragment that does not continue the stream - wrong offset, another first sequence / source id / source term /
+  entry term / total length, an ordinary message inside a batch, a fragment without the beginning of its batch, bytes
+  past the total, an empty fragment, an entry count before the end, a completed batch whose header disagrees with what
+  its fragments announced - discards the partial batch. The first time at a position the follower drops the stream and
+  attaches again (a fault of the connection does not repeat). If the next attempt fails at the same position - nothing
+  was applied in between, so the source sends that batch wrongly every time - the follower rebuilds from a snapshot,
+  which contains the batch as files, and follows from behind it (`FollowerResyncPolicy.ShouldRebuildAfterStreamFault`).
+  It never attaches again and again to the same broken batch. `ReplicaFollower.FollowAsync` throws
+  `WalStreamProtocolException` (with the replica's position) and leaves that decision to its caller.
+* `MaxBatchBytes` (`PairNodeHostOptions`, `ClusterNodeHostOptions`, `ReplicaFollowerOptions`; default 1 GiB): a batch
+  announced larger is refused before anything is allocated, and the follower rebuilds from a snapshot at once
+  (`ReplicaFollower`: `ReplicationResyncRequiredException`) - the stream cannot get it past the batch, a snapshot
+  carries the same data as files. The default is the largest array `RocksArrayPool` pools (a serialized batch is one
+  array, below 2 GiB, on both nodes); lower it to bound a follower's memory. It also applies to an unfragmented chunk.
+
+**Client writes over gRPC** (`IPairService` / `IClusterService`, `GrpcPairClient.WriteAsync` /
+`GrpcClusterClient.WriteAsync`). The write RPC (`WriteAsync(string key, string value)`) is one unary request, and a
+server refuses a request above its receive limit (gRPC's 4 MiB; `GrpcNodeServerOptions.MaxReceiveMessageSize`) with
+ResourceExhausted, "Received message exceeds the maximum configured message size." Plain replication has no write RPC,
+and no RPC takes a whole `WriteBatch`.
+
+* The clients' `WriteAsync(key, value, ct)` sends a payload (UTF-8 bytes of key + value) of at most
+  `GrpcWriteOptions.MaxChunkBytes` as the unary RPC (one request, no stream to set up - the cheaper path for the
+  common small write) and a larger one through the client-streaming RPC
+  `WriteFragmentsAsync`: pieces `WriteFragmentDto { TotalLength, KeyLength, Offset, Data }`, every one with the same
+  total and key length; the node answers once, with the unary RPC's result type.
+* The node checks the announced length against `FragmentedWriteOptions.MaxWriteBytes` (64 MiB) and against what it
+  already holds (`MaxPendingBytes`, 256 MiB over all uploads in flight) before it allocates, collects the pieces in a
+  pooled buffer, and applies the write through the same host call as the unary RPC (`PairNodeHost.WriteAsync` /
+  `ClusterNodeHost.WriteCommittedAsync`: same role check, `SyncWal`, `WriteAck`, commit wait and result) after the
+  last piece. An upload that is malformed (InvalidArgument), over a limit (ResourceExhausted), cancelled, cut off or
+  silent for `IdleTimeout` (30 s) applies nothing and gives its buffer back. The client turns the node's refusals into
+  `LargeWriteException` (`TooLarge`, `ServerBusy`, `Rejected`).
+* Deadline: `GrpcWriteOptions.Timeout` (30 s) plus the payload size at `MinBytesPerSecond` (1 MiB/s).
+* Retries are the caller's and the guarantee is the unary RPC's: a write whose call failed without a result may have
+  been applied, and sending it again applies it again (harmless for the same key and value).
+
+Limits of both: the receiver holds one whole batch / write in memory (the reassembly buffer, plus the engine's copy
+while it is applied) - fragments bound the size of a message, not of a write; the caps above bound the write.
+
+### Encryption and authentication over gRPC (`SharedSecretTls`)
+
+By default the gRPC transport is plaintext and a server accepts every caller: use that on a trusted network only.
+`SharedSecretTls` turns on TLS with authentication in both directions from one secret (a byte array of at least 16
+random bytes) that every node and client of the deployment holds:
+
+```csharp
+using var tls = new SharedSecretTls(secret);                       // one per process
+await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(
+    host, address, port, new GrpcNodeServerOptions { Tls = tls }, ct);
+using var peer = new GrpcPairClient("B", "https://10.0.0.2:5000", timeout, tls.CreateChannelOptions());
+```
+
+Each `SharedSecretTls` creates a random key pair and a self-signed certificate with an extension holding an HMAC of its
+public key, keyed with a key derived from the secret. Server and client both present their certificate and accept the
+other side only when that HMAC matches. Only a holder of the secret can make an accepted certificate; a copied
+certificate is useless without its private key; the secret itself is never sent.
+
+* Host names, validity dates, chains and revocation are not checked: the secret is the only identity, and every holder
+  is trusted as any node and any client (there are no roles).
+* All nodes and clients need the secret, including clients that only write.
+* To change the secret, restart the nodes with the new one; a node accepts one secret at a time.
+* A caller without the secret fails in the TLS handshake. `GrpcPairClient` and `GrpcClusterClient` wait for a
+  connection, so there a wrong secret looks like an unreachable peer (calls end at their deadline).
+* A host that runs the services in its own ASP.NET Core application uses `tls.ConfigureServer` in Kestrel's `UseHttps`
+  and `tls.ConfigureClient` on its own `SocketsHttpHandler`.
+* Dispose the `SharedSecretTls` after the servers and channels that use it.
+
+### Message sizes over gRPC
+
+Channels and servers keep gRPC's default receive limit of 4 MiB (`GrpcTransportDefaults.MaxReceiveMessageSize`,
+`GrpcNodeServerOptions.MaxReceiveMessageSize`); `GrpcTransportDefaults.Apply` only adds keep-alive pings. What the
+library sends stays below it whatever the size of the data:
+
+| message | bound |
+|---|---|
+| WAL chunk, fragment of a large batch (`WalChunkDto`) | `MaxChunkBytes` (256 KiB) + ids |
+| snapshot file data (`SnapshotChunkDto`) | `SnapshotChunkBytes` (1 MiB) + file name |
+| client write, unary / one piece of an upload | `GrpcWriteOptions.MaxChunkBytes` (256 KiB) |
+| hash request of a snapshot delta and its answer (`GetFileHashesAsync`) | asked in batches of at most `GrpcTransportDefaults.MaxFileListBytes` (1 MiB, about 10 000 files) each |
+| inventory of a snapshot request and the plan that answers it | cut to the largest files that fit into `MaxFileListBytes`; the rest is transferred instead of reused |
+| term map / epoch map (attach check, `GetRaftTermsAsync`, `GetEpochsAsync`) | not bounded by a setting: one line of at most 41 bytes per term (epoch) that wrote entries - 4 MiB after about 100 000 leadership (primary) changes |
+| votes, heartbeats, status, progress reports, digests | fixed size |
+
+The chunk sizes are options and are checked when a node starts. A host refuses a `MaxChunkBytes` of 12 bytes or less
+and a `SnapshotChunkBytes` below 1 (ArgumentOutOfRangeException from its constructor), and `GrpcNodeServer.StartAsync`
+refuses a host whose chunk sizes are above `GrpcNodeServerOptions.MaxStreamPayloadBytes` (ArgumentException;
+`GrpcTransportDefaults.MaxPayloadBytes` by default, 4 MiB less 64 KiB) - such a stream would be refused by the receiver
+with ResourceExhausted on every attempt. To use larger chunks, raise `MaxStreamPayloadBytes` together with the receive
+limit of every peer's channel. A host served by another ASP.NET Core application calls
+`GrpcTransportDefaults.EnsureChunkSizesFit` itself. A cluster whose term map has outgrown the
+limit (which takes a leader change per second for more than a day) needs the limits raised on its channels.
+
 ## Planned switchover (two nodes)
 
 `SwitchoverNode` hands the primary role to an up-to-date replica without losing an acknowledged write: lag check ->
@@ -99,8 +232,46 @@ replica promises the epoch, so a delayed promote can never succeed); an unreacha
 `Unresolved` with writes refused - two writable primaries are worse than none. Epochs are the Raft-term equivalent and
 an epoch map (`startSeq -> epoch`, a `RaftLogTerms`) lets a rejoining node prove its log is a prefix of the primary's;
 a diverged node (after `ForcePromoteAsync`) is rebuilt from a snapshot. `PairNodeHost` wires this with the WAL stream,
-client writes with primary hints, snapshot resync and fault injection. See rocksdb-sharp's
-`Replication/Switchover/README.md` for the full protocol discussion; it applies unchanged.
+client writes with primary hints, snapshot resync and fault injection; while a node is `HandingOff` outside a running
+handoff (target unreachable, or a restart in the middle of one) it asks the other node every
+`PairNodeHostOptions.ResolveInterval` how the handoff ended. See rocksdb-sharp's
+`Replication/Switchover/README.md` for the protocol discussion; it applies except for the durability modes below.
+
+### Durability of a pair
+
+What `PairWriteStatus.Applied` promises is set by two options (set them alike on both nodes - either can be primary):
+
+| `SyncWal` | `WriteAck` | an acknowledged write is | lost when |
+|---|---|---|---|
+| false (default) | `Primary` (default) | in the primary's log, not fsync'd; streamed to the replica afterwards | the primary loses power and the replica had not received it; or had, but cannot be reached while the primary restarts (or `YieldToReplicaAheadOnRestart` is off); the primary is lost for good before the replica received it; a node promoted by a handoff loses power before the entries it took over with reached its disk and the other node is unreachable when it restarts |
+| true | `Primary` | on the primary's disk | the primary is lost for good (disk included) before the replica received it |
+| false | `Replica` | in both nodes' logs, not fsync'd | both nodes lose power; or the primary loses power and the replica is unreachable while it restarts |
+| true | `Replica` | on both disks | both disks are lost |
+
+* `SyncWal` (as `ClusterNodeHostOptions.SyncWal`): the primary fsyncs a client write before acknowledging it (group
+  commit: concurrent writes share one fsync) and before it becomes visible to the WAL stream, so the replica never holds
+  an entry the primary's disk does not; the replica fsyncs every chunk before its sequence number moves past it, so a
+  node promoted by a handoff holds the handoff point on disk.
+* `WriteAck = PairWriteAck.Replica`: the replica reports the position it holds after every chunk
+  (`IPairNodeClient.ReportProgressAsync`, repeated until it arrives) together with the epoch it has for that entry; the
+  primary counts a report only under the attach check's rule (it holds that entry in the same epoch) and acknowledges a
+  write once it is covered. Without a replica that follows, a write ends as `PairWriteStatus.NotReplicated` after
+  `ReplicaAckTimeout`: it is in the primary's log and not acknowledged (indeterminate, like a timeout). The wait is
+  inside the write gate, so a handoff starts only after the writes in flight were acknowledged or gave up.
+* `YieldToReplicaAheadOnRestart` (default true): a node that restarts as primary and finds the replica holding entries
+  past the end of its recovered log hands the role to the replica instead of rebuilding it
+  (`SwitchoverNode.YieldToReplicaAheadAsync`), and then follows it. It does so only if the replica's last entry carries
+  the epoch its own fsync'd epoch map has for that sequence number - an epoch has one primary and one history, so the
+  replica's log is then what this node had written - and it uses the handoff protocol (promise, durable `HandingOff`,
+  promote at an exact sequence number, `RejectEpoch` to settle), so it cannot make two primaries. Until the restarted
+  node has settled this it does not answer attach checks or serve streams. The restarted node itself may be rebuilt
+  from the new primary (a replica stores a chunk as one WAL batch and a stream cannot start inside one); the node that
+  holds the acknowledged writes never is.
+* One epoch, one history: the epochs a node starts on its own (after a restart, after an aborted handoff, by
+  `ForcePromoteAsync`) are even for the node whose id sorts first and odd for the other, so a forced promotion and a
+  primary restarting out of reach never end in the same epoch. Handoff epochs are agreed by both nodes.
+* `ForcePromoteAsync` is outside all of this: it gives up whatever the replica had not received, and with two nodes it
+  can make two primaries.
 
 ## Raft cluster
 
@@ -153,6 +324,17 @@ where noted below. Out of scope as before: pre-vote, membership changes, ReadInd
 | signature length prefix in machine byte order | little-endian | identical signatures across architectures |
 | per-batch `EntryTerm` on the Raft stream | chunks merge batches, so a follower also merges the leader's term map at attach | a chunk may span a term boundary |
 | MagicOnion in the samples only | same: `RocksDb.Managed.Replication.MagicOnion` is optional | the core stays transport-agnostic |
+| hosts report follower progress on a 200 ms timer | one report per applied chunk (coalesced); a report whose send failed is repeated every `RetryDelay` until one arrives | no idle traffic, and the last report of a burst still cannot be lost (the leader could not commit a quorum-held entry without it) |
+| `HandleRejectEpochAsync` looks for a running promotion, releases the node's lock, takes it again to promise the epoch | one critical section | a promote for that epoch landing in between was promoted although the reject answered "replica, epoch promised": two primaries |
+| pair writes are never fsync'd and are acknowledged by the primary alone; after a power loss of the primary the replica is rebuilt from it | `PairNodeHostOptions.SyncWal`, `WriteAck = Replica`, and a restarted primary yields to a replica that holds its lost tail | acknowledged writes the replica still held were lost; see "Durability of a pair" |
+| every node allocates "promised + 1" for an epoch it starts on its own | even / odd by node id | a forced promotion and a primary restarting (or resuming after an aborted handoff) out of reach became primaries of the same epoch with different logs; the attach check then takes one log for a prefix of the other |
+| a pair primary that restarts continues in its epoch; a bootstrap primary that restarts continues in its term |
+ a new epoch / term starts at the end of the recovered log (`SwitchoverNode.StartNewEpochAfterRestart`, `RaftPersistentState.StartTerm`) | after a power loss the recovered log may end before entries a replica holds (pair writes, and Raft with `SyncWal = false`, are not fsync'd); new entries at those sequence numbers in the same epoch / term let the replica's stale tail pass the attach check - silent divergence |
+| a Raft state file that cannot be read starts the node "fresh" (term 0, no vote) | the read error is thrown | a node that forgot its vote can vote twice in one term |
+| a vote request or heartbeat of any node is handled | only of a member | a node configured for another cluster could get the vote, and its term deposed the leader |
+| gRPC channels with default settings | `GrpcTransportDefaults`: HTTP/2 keep-alive pings on channels and servers; the 4 MiB receive limit stays, and every message is bounded below it | a replica reading a stream never noticed a primary that vanished without closing the connection |
+| a write batch larger than the chunk size is one stream message of its size; a client write is one unary request | fragments of at most `MaxChunkBytes` on the WAL stream (always) and on the write RPC (`WriteFragmentsAsync`), reassembled before anything is applied; `MaxBatchBytes` / `MaxWriteBytes` caps | no message was bounded (2 GB at most): a WAL chunk above gRPC's 4 MiB receive limit never reached the replica, and a client write above it was refused; see "Large write batches and large client writes" |
+| snapshot delta reuse by name + size + hash of the last 1 MiB for every file | the whole file for blob files | a blob file has no identity; blob files of two histories can agree in name, size and tail |
 
 ## Switchover cost
 

@@ -283,7 +283,7 @@ public sealed class AllocationTests
         {
             db.Put(Key(k++), Value100);
             ulong latest = db.GetLatestSequenceNumber();
-            ValueTask<bool> committed = node.WaitForCommitAsync(latest, cts.Token);
+            ValueTask<bool> committed = node.WaitForCommitAsync(latest, node.CurrentTerm, cts.Token);
             node.RecordFollowerProgress("n2", latest, node.CurrentTerm);
             Assert.IsTrue(await committed);
         }, 300, 1000);
@@ -303,13 +303,13 @@ public sealed class AllocationTests
 
         using (var cts = new CancellationTokenSource())
         {
-            Task<bool> cancelled = node.WaitForCommitAsync(seq, cts.Token).AsTask();
+            Task<bool> cancelled = node.WaitForCommitAsync(seq, node.CurrentTerm, cts.Token).AsTask();
             await cts.CancelAsync();
             OperationCanceledException e = await Assert.ThrowsExactlyAsync<OperationCanceledException>(() => cancelled);
             Assert.AreEqual(cts.Token, e.CancellationToken);
         }
-        Task<bool> waiting = node.WaitForCommitAsync(seq, CancellationToken.None).AsTask();
-        Task<bool> waiting2 = node.WaitForCommitAsync(seq + 10, CancellationToken.None).AsTask();
+        Task<bool> waiting = node.WaitForCommitAsync(seq, node.CurrentTerm, CancellationToken.None).AsTask();
+        Task<bool> waiting2 = node.WaitForCommitAsync(seq + 10, node.CurrentTerm, CancellationToken.None).AsTask();
         Assert.IsFalse(waiting.IsCompleted);
         node.RecordFollowerProgress("n2", seq, node.CurrentTerm);
         Assert.IsTrue(await waiting.WaitAsync(TestUtil.Timeout));

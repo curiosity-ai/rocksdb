@@ -331,6 +331,12 @@ public static class TableFactory
             CacheIndexAndFilterBlocks = cache is not null && t.CacheIndexAndFilterBlocks,
             CacheIndexAndFilterBlocksWithHighPriority = t.CacheIndexAndFilterBlocksWithHighPriority,
             PinTopLevelIndexAndFilter = t.PinTopLevelIndexAndFilter,
+            PinL0FilterAndIndexBlocksInCache = t.PinL0FilterAndIndexBlocksInCache,
+            UnpartitionedPinning = t.MetadataCacheOptions.UnpartitionedPinning,
+            TopLevelIndexPinning = t.MetadataCacheOptions.TopLevelIndexPinning,
+            PartitionPinning = t.MetadataCacheOptions.PartitionPinning,
+            // MaxFileSizeForL0MetaPin (options/cf_options.cc): 1.5 times write_buffer_size.
+            MaxFileSizeForL0MetaPin = options.WriteBufferSize / 2 > long.MaxValue / 3 ? long.MaxValue : (long)(options.WriteBufferSize / 2 * 3),
             PrefixExtractor = options.PrefixExtractor,
             DbSessionId = dbSessionId,
             BlockProtectionBytesPerKey = (int)options.BlockProtectionBytesPerKey,

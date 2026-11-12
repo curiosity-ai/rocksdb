@@ -533,6 +533,12 @@ internal static partial class Scenarios
 
         public Task<string?> GetEpochsAsync(CancellationToken cancellationToken) => Task.FromResult(Target?.HandleGetEpochs());
 
+        public Task ReportProgressAsync(ulong appliedThrough, long epochAtApplied, CancellationToken cancellationToken)
+        {
+            Require.HandleReportProgress(appliedThrough, epochAtApplied);
+            return Task.CompletedTask;
+        }
+
         public IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(CancellationToken cancellationToken) => Require.StreamSnapshotAsync(cancellationToken);
     }
 
@@ -676,7 +682,7 @@ internal static partial class Scenarios
             list.Add(S(name, "replication", PathKind.Hot,
                 committed
                     ? "ClusterNodeHost.WriteCommittedAsync on the leader of 3 (waits for quorum commit; heartbeats every 50 ms)"
-                    : "TryWriteAsLeaderAsync x100 on the leader of 3, then WaitForCommitAsync(last)", async ctx =>
+                    : "TryWriteAsLeaderAsync x100 on the leader of 3, then WaitForCommitAsync(last, term)", async ctx =>
             {
                 var hosts = new ConcurrentDictionary<string, ClusterNodeHost>(StringComparer.Ordinal);
                 var started = new List<ClusterNodeHost>();
@@ -720,11 +726,12 @@ internal static partial class Scenarios
                     }
                     for (int i = 0; i < n; i += 100)
                     {
+                        long term = leader.Node.CurrentTerm;
                         for (int j = 0; j < 100; j++)
                         {
                             if (!await leader.TryWriteAsLeaderAsync(keys[c.Next()], v, CancellationToken.None)) throw new InvalidOperationException("not leader");
                         }
-                        if (!await leader.Node.WaitForCommitAsync(leader.Db.GetLatestSequenceNumber(), CancellationToken.None))
+                        if (!await leader.Node.WaitForCommitAsync(leader.Db.GetLatestSequenceNumber(), term, CancellationToken.None))
                             throw new InvalidOperationException("not committed");
                     }
                 });
@@ -784,7 +791,7 @@ internal static partial class Scenarios
             }));
         }));
         list.Add(S("raft.wait-commit", "raft", PathKind.Hot,
-            "leader: Put, pending WaitForCommitAsync(seq, ct), RecordFollowerProgress completes it", ctx =>
+            "leader: Put, pending WaitForCommitAsync(seq, term, ct), RecordFollowerProgress completes it", ctx =>
         {
             RocksDatabase db = ctx.OpenDb("db", ReplDbOptions(archive: false));
             RaftClusterNode node = NewRaftNode(ctx, db, "n1", bootstrapPrimary: true);
@@ -797,7 +804,7 @@ internal static partial class Scenarios
                 {
                     db.Put(keys[c.Next()], value);
                     ulong latest = db.GetLatestSequenceNumber();
-                    ValueTask<bool> committed = node.WaitForCommitAsync(latest, cts.Token);
+                    ValueTask<bool> committed = node.WaitForCommitAsync(latest, node.CurrentTerm, cts.Token);
                     node.RecordFollowerProgress("n2", latest, node.CurrentTerm);
                     if (!await committed) throw new InvalidOperationException("not committed");
                 }

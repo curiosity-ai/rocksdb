@@ -233,7 +233,7 @@ Tests: `tests/RocksDb.Managed.Tests/Db/WalTrackingTests.cs`, `SstFileManagerTest
 | `SstFileManager.cs`, `Db/DbImpl.SstFileManager.cs`, `Db/ErrorHandler.cs`, `Env/FileContracts.cs` (`GetFreeSpace`) | `file/sst_file_manager_impl.cc`, `file/delete_scheduler.cc`, `ErrorHandler::OverrideNoSpaceError` / `RecoverFromNoSpace` / `CancelErrorRecoveryForShutDown`, `SanitizeOptions`, `DBImpl::Open` (TrackExistingDataFiles, ReserveDiskBuffer, CleanupDirectory), `DeleteDBFile` | **ported.** Public `SstFileManager` (`DbOptions.SstFileManager`, shareable; every DB gets a private one by default like SanitizeOptions): tracks table and blob files (live files at open, files added by installed edits), max allowed space (after a flush / compaction the DB stops with SpaceLimit "Max allowed space was reached"; Flush() reports it like WaitForFlushMemTables), compaction buffer and reservation accounting, deletion rate limit through `*.trash` renames and a background deletion task (max_trash_db_ratio), trash cleanup at open, and out-of-space recovery: NoSpace / SpaceLimit background errors start ClearError, which polls the free space (`IFileSystem.GetFreeSpace`, statvfs for the local file system) every 5 s and resumes the DB once it exceeds the reserved disk buffer (hard errors) or the compaction trigger (soft errors); listeners can veto it; close cancels it. Automatically picked (non trivial-move) compactions reserve their input size and are cancelled (COMPACTION_CANCELLED) when the space limit with the compaction buffer, or after an out-of-space error the free space, does not allow them (EnoughRoomForCompaction / OnCompactionCompletion). Known deviations: manual compactions are not checked; the space limit is checked after a compaction installs (upstream fails the output file); files are always deleted whole (no bytes_max_delete_chunk truncation, no hard-link count check); ingested files are tracked when their edit installs; no DeleteScheduler statistics or trash buckets. |
 | `Env/GenericRateLimiter.cs`, `DbOptions.RateLimiter`, `Db/DbImpl.Flush.cs` (`TableFileWriteOptions`), `Db/Compaction/CompactionJob.cs` | `util/rate_limiter.cc` (GenericRateLimiter, NewGenericRateLimiter), `WritableFileWriter` rate limiting | **ported.** Token bucket refilled every refill period (default 100 ms; no carry-over), single burst bytes, priorities with IO_USER first and the fairness lottery (GeneratePriorityIterationOrderLocked), partial grants, auto-tuning (TuneLocked), SetBytesPerSecond / SetSingleBurstBytes, GetTotalBytesThrough / GetTotalRequests / GetTotalPendingRequests, modes. Waiters do not hold a thread: a one-shot timer performs the refill duty while requests are queued, and RequestAsync waits asynchronously. Flush (and recovery flush) table and blob files are charged at IO_HIGH, compaction outputs at IO_LOW, WAL / MANIFEST not at all (IO_TOTAL). Reads are charged and the RATE_LIMITER_* statistics recorded since the 2026-11-03 pass (see "Small gaps closed (2026-11-03)"). |
 | `Db/TableCache.cs` (`TableCacheStore`, per-CF `TableCache` view) | `db/table_cache.cc`, `DBImpl::table_cache_` (db/db_impl/db_impl.cc) | **ported.** One reader cache per DB shared by all column families (handles keyed by file number, each opened with its column family's reader options), bounded by max_open_files - 10 (max_open_files is clipped to at least 20 at open, like SanitizeOptions; unbounded with -1), resized by SetDBOptions(max_open_files); least recently used unreferenced readers are evicted by last-use stamps copied before sorting (lookups stamp them without the lock; `DbColumnFamilyAndConcurrencyTests.BoundedTableCacheEvictsUnderConcurrentLookups`). Blob file readers keep their own per-CF bound. |
-| `Cache/HyperClockCache.cs` (automatic table) | `cache/clock_cache.{h,cc}` AutoHyperClockTable | **partial (behavioral port).** estimated_entry_charge = 0 selects a table that starts at 64 slots per shard and doubles while it is more than 70 % occupied and the usage is below capacity, up to capacity / min_avg_entry_charge (default 450) slots; growth moves the slot objects to a new array under a mutator gate (inserts, evictions and erases wait; lookups stay lock-free and may miss during a move (no longer: since audit #4 a miss is only trusted when no grow is running)), and with full metadata charging the grown slots are charged. Not ported: upstream's lock-free linear-hashing chains (head pointers with shift, incremental splitting). Benchmarks: see docs/perf.md. |
+| `Cache/HyperClockCache.cs` (automatic table) | `cache/clock_cache.{h,cc}` AutoHyperClockTable | **partial (behavioral port).** estimated_entry_charge = 0 selects a table that starts at 64 slots per shard and doubles while it is more than 70 % occupied and the usage is below capacity, up to capacity / min_avg_entry_charge (default 450) slots (at least 64); growth moves the slot objects to a new array under a mutator gate (inserts, evictions and erases wait; lookups stay lock-free and may miss during a move (no longer: since audit #4 a miss is only trusted when no grow is running)), and with full metadata charging the grown slots are charged. Since audit #4 the table also grows at its occupancy limit when the usage is at or over the capacity, a shard starts with 4 slots when its capacity is at most 4096 bytes, and evictions circle kMaxCountdown + 1 times (see "Audit #4"). Not ported: upstream's lock-free linear-hashing chains (head pointers with shift, incremental splitting). Benchmarks: see docs/perf.md. |
 
 ## Transactions (utilities/transactions)
 
@@ -1131,7 +1131,7 @@ C++ reference: `main` (11.14); native comparisons use the 11.12 package. Unit te
 | `Db/DbImpl.Write.cs` (`ThrottleLowPriWritesAsync`), `Db/Compaction/WriteController.cs` (`LowPriRateLimiter`) | `DBImpl::ThrottleLowPriWritesIfNeeded`, `WriteController::low_pri_rate_limiter_`, `RecalculateWriteStallConditions` (delayed_write_rate / 4) | **ported.** WriteOptions.LowPri was ignored. While the write controller needs compaction to speed up (stop, delay or compaction pressure), a low_pri write with no_slowdown fails with Incomplete "Low priority write stall"; otherwise it is charged to a 1 MiB/s generic rate limiter (IO_HIGH, in chunks of at most the burst size; async writes wait asynchronously). With 2PC, batches with a commit or rollback marker are exempt. When a delay ends the limiter's rate becomes 1/4 of the delayed write rate. Like upstream, the condition is read outside the DB mutex. The limiter is created on first use. Test: `DbBasicTests.LowPriWritesAreThrottledUnderCompactionPressure`. Not ported: the PERF write_delay_time timer around the wait. |
 | `Options/ColumnFamilyOptions.cs` (`DisallowMemtableWrites`), `Db/DbImpl.Write.cs` (`CfForInsert`, `ValidateColumnFamilies`), `Db/DbImpl.Open.cs` | `advanced_options.h` disallow_memtable_writes, `MemTableInserter::SeekToColumnFamily`, `WriteBatchInternal::GetColumnFamilyIdAndTimestampSize`, `DBImpl::ValidateOptions` | **ported.** OPTIONS name `disallow_memtable_writes` (immutable). Writes to such a column family fail with InvalidArgument "This column family has disallow_memtable_writes=true"; WAL replay into one fails the open with the same error; the default column family cannot set it. Deviation: upstream rejects at WriteBatch::Put(handle); the managed WriteBatch records column family ids only, so the write path checks the batch before the WAL (only once some column family sets the option, one volatile read otherwise) and the whole batch is rejected; SeekToColumnFamily's check stays as the backstop. Not ported: SanitizeOptions' switch to the vector memtable (MarkReadOnly enforcement). Tests: `DbBasicTests.DisallowMemtableWrites` (port of DBBasicTest.DisallowMemtableWrite); compat `RecoveryWritePathCompatTests.DisallowMemtableWritesAgreesWithNative` (OPTIONS both ways, identical messages). |
 | `Db/WriteThread.cs` (`EnterAsBatchGroupLeader`) | `WriteThread::EnterAsBatchGroupLeader` (r_list) | **fixed (throughput).** The group stopped at the first incompatible writer. Incompatible writers now stay queued in order and the compatible ones behind them join (upstream's r_list grafted after the group). Criteria now include protection_bytes_per_key and the growth limit is max_write_batch_group_size_bytes / 8 (was a fixed 128 KiB, equal for the default 1 MiB). rate_limiter_priority (WAL writes are not rate limited) and WBWI ingestion are not ported, so those criteria never apply. Test: `DbColumnFamilyAndConcurrencyTests.WriteGroupTakesCompatibleWritersBehindIncompatibleOnes`. |
-| `Db/DbImpl.Write.cs` (`InsertGroupSerially`, `InsertWritersSerially`, `FinishParallelGroup`, `LeadMemTableGroup`, `HandleMemTableInsertFailure`) | `DBImpl::WriteImpl` / `PipelinedWriteImpl` ("Don't publish a partial batch write"), `HandleMemTableInsertFailure`, `WriteBatchInternal::InsertInto(write_group)` | **fixed.** A failed memtable insert used to be reported to its writer only: the group was still published and the DB kept accepting writes. Now the serial insert stops at the first failure (InsertInto returns it; the leader reports it too), the group's sequences are not published, and a fatal background error with reason kMemTable stops further writes; a reopen recovers the batch from the WAL. Deviation (stricter): upstream checks only the status of the writer that finishes a parallel group last (a TODO there); the port checks every writer of the group. unordered_write publishes before its inserts and, like upstream, does not call HandleMemTableInsertFailure. Deviation: once a column family was dropped, batches written without column family validation (writes through a dropped `ColumnFamily` handle) are checked before the WAL and fail with InvalidArgument "Invalid column family specified in write batch"; upstream lets them reach the memtable insert (SeekToColumnFamily), where the failure is a fatal background error. A drop that races with a write still ends that way. Not ported: SetAttemptTruncateSize of the failed group's WAL record. Test: `KvProtectionTests.ParallelMemtableInsertDetectsCorruptedEntry` (now asserts the background error, the unpublished group and recovery after reopen). |
+| `Db/DbImpl.Write.cs` (`InsertGroupSerially`, `InsertWritersSerially`, `FinishParallelGroup`, `LeadMemTableGroup`, `HandleMemTableInsertFailure`) | `DBImpl::WriteImpl` / `PipelinedWriteImpl` ("Don't publish a partial batch write"), `HandleMemTableInsertFailure`, `WriteBatchInternal::InsertInto(write_group)` | **fixed.** A failed memtable insert used to be reported to its writer only: the group was still published and the DB kept accepting writes. Now the serial insert stops at the first failure (InsertInto returns it; the leader reports it too), the group's sequences are not published, and a fatal background error with reason kMemTable stops further writes; a reopen recovers the batch from the WAL. Deviation (stricter): upstream checks only the status of the writer that finishes a parallel group last (a TODO there); the port checks every writer of the group. unordered_write publishes before its inserts and, like upstream, does not call HandleMemTableInsertFailure. Deviation: once a column family was dropped, batches written without column family validation (writes through a dropped `ColumnFamily` handle) are checked before the WAL and fail with InvalidArgument "Invalid column family specified in write batch"; upstream lets them reach the memtable insert (SeekToColumnFamily), where the failure is a fatal background error. A drop that races with a write still ends that way. Not ported: SetAttemptTruncateSize of the failed group's WAL record. Test: `KvProtectionTests.ParallelMemtableInsertDetectsCorruptedEntry` (now asserts the background error, the unpublished group and recovery after reopen). Superseded by audit #4 ("Failed memtable insert in a write group" under "Known deviations recorded by this audit"): upstream does propagate `write_group->status`, every writer of the group now fails, SetAttemptTruncateSize is ported, and unordered_write sets the background error of WriteStatusCheck. |
 
 ## Second review: DB API, properties, EVENT_LOG, PerfContext, Raft
 
@@ -1316,6 +1316,32 @@ dictionary block cache tickers (the dictionary is pinned by the reader, never ca
 - **Lock wait past a holder's expiration.** When the holder has expired but its locks cannot be stolen, upstream
   returns TimedOut at the holder's expiration (FIXME upstream); the built-in lock path keeps waiting until the
   requester's own deadline. The custom-mutex path follows upstream.
+- **Failed memtable insert in a write group** (`DBImpl::WriteImpl`, `PipelinedWriteImpl`,
+  `WriteThread::CompleteParallelMemTableWriter`, `ExitAsBatchGroupLeader`, `ExitAsMemTableWriter`). In the port every
+  writer of the group fails with the insert's status, the group is not published, the failure is a fatal background
+  error (kMemTable) and, without pipelined writes, the group's record is cut from the WAL when the DB closes; nothing
+  depends on which writer finishes last. A write that failed this way may still be in the WAL: a DB that is not closed
+  cleanly, a WAL that cannot be truncated, and every pipelined group replay it at the next open (the same caveat as
+  upstream's "indeterminate outcome" of a failed WAL write, `DB::Write` in db.h). Compared with upstream:
+  - *Parallel group, the leader finishes last*: same as upstream (the last writer takes `write_group->status`,
+    ExitAsBatchGroupLeader gives it to every follower and to the leader; SetAttemptTruncateSize).
+  - *Parallel group, a follower finishes last*: deviation. Upstream (release build; ExitAsBatchGroupFollower asserts
+    `write_group->status.ok()` in a debug build) still fails every follower, but the leader returns its own insert
+    status (OK unless its own insert failed) for a write that is not published, and the WAL truncate size is not set.
+    The port takes the leader-last outcome for every order.
+  - *Serial group (no concurrent memtable writes, merges, transactions)*: deviation. Upstream completes the followers
+    with the leader's WAL status (`write_group.status` is not set on this path), so they return OK, the failing
+    follower included, while the group is unpublished and its record is cut at close: acknowledged writes are lost.
+    The port fails every writer of the group.
+  - *Pipelined, parallel or serial memtable group*: same as upstream (ExitAsMemTableWriter gives
+    `write_group.status` to every writer; no truncation, a reopen recovers the group). As upstream, a later memtable
+    group whose WAL record was already written still publishes its last sequence, which is above the failed group's.
+  - *unordered_write*: same as upstream. Only the failed write fails, its sequence was published by the WAL stage,
+    its record is kept, and `WriteStatusCheck` makes it a background error (kWriteCallback) under paranoid_checks
+    (the port did not set a background error here before).
+
+  Pinned by `Audit4WritePathRaceTests` (each group shape, failing writer and finishing order) and
+  `KvProtectionTests.ParallelMemtableInsertDetectsCorruptedEntry`.
 - **Trie index holding only the empty user key.** Native finds the key by Get and forward iteration but not by
   SeekToLast / SeekForPrev (its reverse descent never looks at a label-less root's prefix key).
 - **Plain-write sub-batch counting** accepts PutEntity / TimedPut / DeleteRange in a WritePrepared DB (upstream's
@@ -1383,17 +1409,143 @@ Also read in the last pass: `backup_engine.cc` from its start, `repair.cc` in fu
 `PurgeObsoleteFiles`, the rest of `column_family.cc` (sanitization, write-stall conditions, range overlap helpers,
 ColumnFamilySet) and `threadpool_imp.cc`.
 
-Not read against the C++ (previous audits and the compat tests still apply): `AutoHyperClockTable`'s grow / chain
-logic (the port is a behavioural port without chains; only the lookup-during-grow path was checked),
+`AutoHyperClockTable` (`cache/clock_cache.cc`: Grow, SplitForGrow, ChainRewriteLock, PurgeImpl, DoInsert, Lookup,
+TryEraseHandle / Release / Erase / EraseUnRefEntries, Evict, CalcMaxUsableLength, with the shared `BaseClockTable`
+and `ClockCacheShard` code) was then read against `Cache/HyperClockCache.cs`. The port stays a behavioural port
+without chains (a doubling table behind a mutator gate); what a caller can observe was compared. Fixed
+(`Audit4AutoHyperClockTests`, `Audit4AutoHyperClockCompatTests`):
+
+| Automatic HyperClockCache table | C++ source | What was wrong (now fixed) |
+|---|---|---|
+| Eviction bound | `AutoHyperClockTable::Evict` (clock_cache.cc:3512-3526) | An eviction run circles the table kMaxCountdown + 1 times (the fixed table's kMaxCountdown and one step was used): with every entry at the highest countdown an insert into a full, unpinned cache evicted nothing, and failed under a strict capacity limit. |
+| Growth | `BaseClockTable::Insert` (591-594), `AutoHyperClockTable::GrowIfNeeded` (2128-2156) | The table also grows when the occupancy limit is reached while the usage is at or over the capacity (pinned entries, entries getting smaller); it used to stay small, and inserts became standalone entries no lookup finds (or were dropped). |
+| Traversal | `ClockCacheShard::ApplyToSomeEntries` (1172-1203) | ApplyToAllEntries walks the array it started on: a grow during the traversal no longer reports entries twice or skips them. |
+| Small shards | `GetStartingLength` (1711-1719), `CalcMaxUsableLength` (3535-3550) | A shard starts with 64 slots (4 when its capacity is at most 4096 bytes) and can always grow to 64, as native reports through rocksdb_cache_get_table_address_count. |
+
+Read and found equivalent: the meta word transitions of Lookup / Insert / Release / Erase / ClockUpdate (shared with
+the fixed table), usage and occupancy accounting on every failure path of the strict and non-strict charge, the
+eviction effort cap, erase-if-last-ref and invisible entries across a grow, the mutator gate against the grower
+(a bounded stress test checks that no value is freed twice or while referenced and that the counters end exact).
+Remaining differences of the automatic table, all consequences of the documented structure: it doubles (metadata is
+charged per doubling, not per slot), its maximum is a power of two derived with the fixed table's load factor, and
+inserts, erases and evictions wait for a running grow.
+
+Not read against the C++ (previous audits and the compat tests still apply):
 `PerKeyPointLockManager` (not ported), the restore / verify / garbage-collection bodies of the backup engine on the
 C# side beyond what the earlier slices compared.
 
-Not ported, found by the ticker comparison: the compression dictionary is not stored in the block cache, so the
-five `BLOCK_CACHE_COMPRESSION_DICT_*` tickers stay 0.
+Found by the ticker comparison and ported afterwards: the compression dictionary block in the block cache
+(`uncompression_dict_reader.cc`, `Table/BlockBasedTableReader.CompressionDict.cs`). Without
+`cache_index_and_filter_blocks` the table reader owns the dictionary, as before, and it now counts in
+`ApproximateMemoryUsage`. With it the dictionary is a block cache entry (role `OtherBlock`, the priority of the other
+metadata blocks): looked up at open and read and inserted on a miss, kept pinned when
+`metadata_cache_options.unpartitioned_pinning` / `pin_l0_filter_and_index_blocks_in_cache` say so
+(`pin_unpartitioned`, level 0 and at most 1.5 times `write_buffer_size`), otherwise looked up for every data block
+retrieval and once per file in MultiGet, and re-read after eviction. `read_tier = kBlockCacheTier` fails with
+Incomplete when the dictionary is not cached, `fill_cache = false` reads it without inserting it, and a read error
+fails the open or the read. `BLOCK_CACHE_COMPRESSION_DICT_{MISS,HIT,ADD}` match native step by step on a workload
+with flushes, Get, MultiGet, scans and a compaction, in four pinning modes (`Audit4CompressionDictCacheCompatTests`;
+unit tests in `Audit4CompressionDictCacheTests`). Differences that remain: `..._DICT_BYTES_INSERT` is recorded but the
+charge of a dictionary is engine-specific (dictionary bytes plus the digested ZSTD dictionary, within a factor of two
+of native in the test); and data blocks of a table whose dictionary is cached unpinned are not offered compressed to
+secondary cache tiers.
 
-`RocksDb.Managed.Replication` is a port of rocksdb-sharp, which is not in this repository, so it could not be
-compared with its original. It was reviewed on its own terms instead (Raft persistence and election rules, the
-switchover promise, WAL tailing, snapshot restore, host lifetime). Fixed there, each with a test in
+Ported after that (2026-11-12), the two gaps the dictionary work left open.
+
+`BLOCK_CACHE_*_ADD_REDUNDANT` (`BlockBasedTable::UpdateCacheInsertionMetrics` with `s.IsOkOverwritten()`): the
+handle an insert returns says whether the insert was redundant (`CachedBlock.InsertedRedundantly`), with the meaning
+each native cache gives `Status::OkOverwritten`: `LRUCacheShard::InsertItem` when the insert replaced an entry with
+the same key (a flag on the new entry, set under the shard mutex), `BaseClockTable::Insert` when the entry did not go
+into the table and was handed out standalone (the key was present, or the table had no room). No lookup and no
+allocation is added to the insert. Recorded for data, index, filter and dictionary blocks, partitions included; the
+filter inserts take a handle now, as native does. Not counted through the legacy `IBlockCache` seam, which has no
+such result.
+
+Pinning of the index and filter blocks (`BlockBasedTable::PrefetchIndexAndFilterBlocks`, the index / filter readers'
+`Create`, `GetOrReadIndexBlock` / `GetOrReadFilterBlock`, `CacheDependencies`; `Table/BlockBasedTableReader.MetadataPinning.cs`).
+Before, with `cache_index_and_filter_blocks` the port never pinned an unpartitioned index or a full filter (both were
+inserted at open and looked up on every use, whatever the pinning options said), pinned the top level of a
+partitioned index / filter under `pin_top_level_index_and_filter` as memory the reader owned next to a copy in the
+cache, never loaded index partitions at open, and kept every filter partition as reader-owned memory unless
+`cache_index_and_filter_blocks` was set. Now:
+
+- `pin_top_level_index`, `pin_partition` and `pin_unpartitioned` are computed as native (`MetadataPins`): the three
+  `metadata_cache_options` tiers, kFallback meaning kAll under `pin_top_level_index_and_filter` for the top level and
+  kFlushedAndSimilar under `pin_l0_filter_and_index_blocks_in_cache` for the other two; kFlushedAndSimilar is level 0
+  and at most 1.5 times `write_buffer_size`.
+- With `cache_index_and_filter_blocks` the (top-level) index and the full filter / top-level filter index are looked
+  up at open and read and inserted on a miss (`prefetch_all || pin`). A pinned one keeps its cache handle for the
+  reader's lifetime (charged to the cache, counted in its pinned usage, not in `ApproximateMemoryUsage`) and is used
+  without a lookup; an unpinned one is looked up on each use: the index once per Get and once per iterator, the
+  filter once per probe, and re-read after eviction. `read_tier = kBlockCacheTier` is Incomplete when an unpinned
+  index is not cached and "may match" for the filter. An index that cannot be read fails the open; a filter that
+  cannot be read at open leaves the table without a filter (`Create` returns no reader).
+- Index and filter partitions always live in the block cache. At open (`prefetch_all || pin_partition`) every
+  partition is loaded into it; with `pin_partition` the reader keeps the handles (`partition_map_` / `filter_map_`)
+  and reads use them without a lookup.
+- Found by the native differential and ported with it: MultiGet looks a full filter up once per batch and a filter
+  partition once per run of keys it covers (`FullFilterBlockReader::MayMatch(MultiGetRange*)`,
+  `PartitionedFilterBlockReader::MayMatchPartition`) instead of once per key; `PartitionedIndexIterator` keeps the
+  index partition it has loaded while a move stays in it; DB open loads tables without prefetch
+  (`VersionEditHandler::LoadTables`, `prefetch_index_and_filter_in_cache = false`), so below level 0 only pinned
+  blocks are read then; a flush and the output verification of a compaction create an iterator over the new table
+  (`table_cache->NewIterator`), which is one index lookup when the index is unpinned.
+
+`BLOCK_CACHE_{INDEX,FILTER}_{MISS,HIT,ADD}` and the five `*_ADD_REDUNDANT` tickers match native after every step of a
+workload with flushes, Get (present and absent keys), MultiGet, scans, a full compaction, a reopen on a shared
+cache and a reopen with a level-0 file, in 13 option combinations: unpartitioned (unpinned on LRU and HyperClock, pin_l0, kAll, kNone over pin_l0,
+not cached) and partitioned (defaults, cached top levels, `top_level_index_pinning = kNone`,
+`pin_top_level_index_and_filter = false`, `partition_pinning = kAll` with and without
+`cache_index_and_filter_blocks`, pin_l0) (`Audit4BlockCachePinningCompatTests`; unit tests in
+`Audit4BlockCachePinningTests`). With the defaults (`cache_index_and_filter_blocks` off, binary search index, full
+filter) a read takes the same path as before: no lookup, branch or allocation was added (docs/perf.md).
+
+Review of that work (same day, by a second reader of the diff against the C++ sources). Three fixes, each with a
+test:
+
+- `BlockBasedTable::Open` computes `prefetch_all = prefetch_index_and_filter_in_cache || level == 0`: a level-0
+  table warms the block cache at open whatever the caller passed. The port took the caller's flag alone, so a DB
+  reopened with level-0 files recorded one index and one filter hit less than native per file (found by adding a
+  reopen with a level-0 file to the native differential, which then failed in the unpinned modes; unit tests
+  `LevelZeroTablesAlwaysPrefetch`, `DatabaseOpenLoadsOnlyPinnedMetadataBlocksBelowLevelZero`).
+- `read_tier = kBlockCacheTier` with a top-level filter index that is not pinned: `GetOrReadFilterBlock` looks the
+  block cache up and only a miss answers "may match". The port answered "may match" without the lookup (Get and the
+  MultiGet batch probe), which disabled a partitioned filter for no-io reads under
+  `pin_top_level_index_and_filter = false` (`BlockCacheTierProbeUsesTheUnpinnedTopLevelFilterIndexFromTheCache`).
+- `PartitionIndexReader::CacheDependencies` pins all partitions or none (`map_in_progress` is dropped). The port
+  kept the handles of a partial set until the reader closed without using them; they are released at once now (not
+  reachable with a well-formed index; no test).
+
+Checked and left as they are: the pin / no-pin decision per tier and level (`MetadataPins`, table-driven test); a
+pinned handle is released by `Dispose` and an open that fails after pinning disposes the reader (the closed DB leaves
+`Usage` 0 after `EraseUnreferencedEntries`); an unpinned index is held by the index iterator for its lifetime as a
+cache handle, an unpinned filter only for the probe (or the MultiGet batch), neither across an await; without
+`cache_index_and_filter_blocks` and with the default binary search index and full filter nothing changed; with a
+partitioned index / filter and a block cache the partitions are block cache entries now, loaded at open and looked
+up per read unless `partition_pinning` pins them, as native (before, filter partitions were reader-owned and index
+partitions loaded on demand); the flush and compaction-output iterators and the per-batch filter lookup of MultiGet
+are what native does (`BuildTable`, `CompactionJob::VerifyOutputFiles`, `FullFilterBlockReader::MayMatch(MultiGetRange*)`).
+`TableCache.InitialLoad` is a flag on the table cache rather than a parameter; it is only set by the thread that
+opens the DB, before reads are served.
+
+Differences that remain: with more tables than DB open loads (16, or a quarter of the table cache) the stats load of
+DB open (`UpdateAccumulatedStats`) opens the remaining tables without prefetch, where C++ reads only their
+properties and prefetches when a read first opens the table (one index / filter hit more per such table in native);
+under `strict_capacity_limit` a metadata block the cache rejects is used uncached (owned by the reader when pinned),
+where C++ fails the read or the open with the insert's status, as for data blocks; without a native `BlockCache` (no block cache, or the legacy `IBlockCache` seam) the reader
+loads and owns every filter partition, where C++ loads none and reads the partition for each probe (one ignored
+test); `prefetch_index_and_filter_in_cache = false` is applied by DB open only, not by the other native callers that
+pass it (ingestion with `fill_cache = false`, `VerifySstFileChecksum`); `CacheDependencies` reads the partitions one
+by one rather than with one prefetch of their range; the user-defined index block is memory of the reader, not a block
+cache entry; `avoid_shared_metadata_cache` (C++ main, after 11.12) is not ported.
+
+`RocksDb.Managed.Replication` is a port of rocksdb-sharp, which is not in this repository. It was reviewed twice:
+first on its own terms, then side by side with the original (`csharp/src/Replication`, `Switchover`, `Cluster` and
+the hosts under `Tests/`). The original was treated as a second implementation, not as a reference: each difference
+was judged against the safety rules of the protocol, and the shared design was tested under faults.
+
+First review (Raft persistence and election rules, the switchover promise, WAL tailing, snapshot restore, host
+lifetime). Fixed there, each with a test in
 `tests/RocksDb.Managed.Replication.Tests/Audit4ReplicationTests.cs`:
 
 - The Raft vote / term and the switchover promise are written to disk before they are held in memory.
@@ -1404,3 +1556,107 @@ switchover promise, WAL tailing, snapshot restore, host lifetime). Fixed there, 
 - A source whose WAL is corrupt rebuilds the follower once, not in a loop.
 - `ForcePromote` with a detached database no longer throws `NullReferenceException`; host dispose is bounded; a
   snapshot whose size does not match its header is refused.
+
+Comparison with the original, each fix with a test in `Audit4ReplicationOriginalTests.cs`:
+
+| Where | Both implementations? | What was wrong |
+|---|---|---|
+| `SwitchoverNode.HandleRejectEpochAsync` | both | A promote racing a reject of the same epoch could be promoted while the reject answered "promised": two primaries. |
+| `PairNodeHost` start | both | A restarted primary kept its epoch. Pair writes are not fsync'd, so after a power loss it reused sequence numbers the replica already held and the attach check passed. It now starts a new epoch. |
+| `RaftClusterNode` bootstrap restart | both | Same for a bootstrap primary and its term. |
+| `RaftPersistentState.Load` | both | An unreadable `raft.state` started the node at term 0 without its vote; it could vote twice in a term. The read error is now thrown. |
+| `RaftClusterNode` election | port only | A leader elected before it received a term range adopted at attach did not record its own term for those entries. |
+| `ProgressReporter` | port only | A lost progress report was not sent again; a write held by a quorum stayed uncommitted until the next write. |
+| `PairNodeHost` | port only | No resolve loop: an unresolved handoff left the pair without a writable primary until `ResolveAsync` was called. |
+| `ReplicationSource` WAL retention | port only | Kept each replica's highest reported position; a replica restarting lower lost WAL it still needed. |
+
+Third round (the limits the comparison left open, the code it had not read, and the rules it had only read). Tests in
+`Audit4ReplicationDurabilityTests.cs` and `Audit4ReplicationProtocolTests.cs`; a power loss there is a
+`MemoryFileSystem` that drops everything not fsync'd.
+
+Durability of a pair (`README.md` of the library, "Durability of a pair", has the table of modes):
+
+| Where | Both implementations? | What was wrong / what changed |
+|---|---|---|
+| `PairNodeHost.WriteAsync` | both | Acknowledged without fsync and by the primary alone; after a power loss of the primary the replica, the only node still holding the writes, was rebuilt from it (`WithoutSyncWalAPrimaryPowerLossLosesAcknowledgedWritesTheReplicaHeld` shows the loss as it was and as it remains with the fix switched off or the replica unreachable). New: `PairNodeHostOptions.SyncWal` (client writes and replicated chunks are fsync'd before they count), `WriteAck = PairWriteAck.Replica` (acknowledged once the replica reported holding the entry; the report is checked under the attach rule; otherwise `PairWriteStatus.NotReplicated`). Defaults unchanged. |
+| `PairNodeHost` start | both | A primary that restarts behind its replica now hands the role to it (`SwitchoverNode.YieldToReplicaAheadAsync`) instead of rebuilding it, if the replica's last entry carries the epoch the primary's own fsync'd epoch map has for that sequence number. That makes the tail the primary's own log (one epoch, one history) and the handoff protocol keeps it to one primary. Also covers a node promoted by a handoff that loses the entries it took over with. Until this is settled the node answers no attach check and serves no stream (a replica that is ahead would rebuild itself on the answer). On by default (`YieldToReplicaAheadOnRestart`). |
+| `SwitchoverNode` epochs | port only (introduced by the new epoch after a restart; the original has the same collision between `ForcePromote` and an aborted handoff's resume) | Every node took "promised + 1" for an epoch it starts on its own. A replica force-promoted while the primary restarted out of reach ended in the same epoch as the primary, with a different log; the attach check would later take one for a prefix of the other. Own epochs are now even / odd by node id. |
+
+Transport and snapshot (`RocksDb.Managed.Replication.MagicOnion`, `StreamSnapshotAsync` / `SnapshotReceiver`, the
+samples and the original's `Tests/*/Program.cs`, `PairService.cs`, `RocksDbWalInspector.cs` read side by side):
+
+| Where | Both implementations? | What was wrong |
+|---|---|---|
+| gRPC channels | both | gRPC refuses a received message above 4 MB; a WAL chunk is at least one whole write batch. A replica could never receive a larger batch and retried the same chunk for good. A batch above the chunk size is now sent in fragments (below); the 4 MiB limit stays on channels and servers, and every message type is bounded below it (README "Message sizes over gRPC"). |
+| gRPC channels and servers | both | No HTTP/2 keep-alive. A replica reading a WAL stream sends nothing, so it never noticed a primary that vanished without closing the connection; a server kept the handler of a vanished replica until the host stopped. Pings on both sides now. |
+| `SnapshotChunkDto.ToChunk` | port only | A chunk of an unknown kind was read as file data. Refused. |
+| `SnapshotReceiver` | port only (the original has no plan) | Restore atomicity depended on the sender putting CURRENT last; CURRENT is now written under a temporary name and renamed after the end marker. A plan that keeps CURRENT, a MANIFEST, a WAL or a file the receiver does not hold is refused before anything is deleted. |
+| `RaftClusterNode` vote / heartbeat | both | A request of a node that is not in the member list was handled like a member's: it could get the vote and its term deposed the leader. Refused. |
+| `ReplicationDelta` | both | Reuse trusted name, size and a hash of the length plus the last 1 MiB. Enough for a table file (the properties block in its tail names the session and file number of one creation event), not for a blob file, which has no identity: blob files of two histories descending from one checkpoint can agree in name, size and tail (`BlobFileOfAnotherHistoryWithTheSameNameSizeAndTailIsNotReused`, with real blob files). Blob files are compared by a hash of the whole file. |
+
+Read and found sound: deadlines or caller tokens on every unary call (a progress report of plain replication got a
+deadline), DTO defaults (every flag defaults to the refusing answer), stream termination (a
+WAL stream that ends is re-attached with the attach check; a snapshot without its end marker is refused),
+back-pressure of server streams (each write awaited), disposal order in the samples (server, then host, then client).
+
+Now validated by test instead of by reading: the Raft election restriction, the current-term-only commit rule, two
+candidates in one term with the vote surviving a restart (three real `RaftClusterNode`s on manual clocks), and the
+write gate's hold / drain order of a handoff (`HandoffPointIsTakenAfterTheAdmittedWritesAndNoWriteIsAcceptedAfterIt`).
+`RejectedEpochIsNeverPromotedByAPromoteRacingTheReject` no longer sleeps: it uses a seam of `SwitchoverNode` and
+fails on every run with the fix reverted.
+
+Large payloads (`Audit4ReplicationFragmentTests.cs`, 21 tests; README "Large write batches and large client writes"):
+
+| Where | What was wrong | Now |
+|---|---|---|
+| WAL stream (`WalStreamSender`, the hosts' follower loops) | A chunk is at least one whole write batch, so a large batch was one message of its size: unbounded, 2 GB at most, and above gRPC's 4 MiB receive limit never received at all. | The source always sends a batch larger than `MaxChunkBytes` as fragments (slices of the tailer's buffer) and the follower applies it once complete (`WalStreamAssembler`). The log never ends inside a batch; reports name applied batches only. A broken fragment sequence re-attaches once, then rebuilds from a snapshot; a batch above `MaxBatchBytes` (1 GiB) rebuilds at once. |
+| `WalTailer.EnsureCapacity` | Doubled an `int` size: a chunk above 1 GiB overflowed and never left the loop. | Sized in 64 bits, capped at the array limit. |
+| Client write RPCs (`IPairService.WriteAsync`, `IClusterService.WriteAsync`) | One unary request; above the server's receive limit (4 MiB) refused with ResourceExhausted. | `GrpcPairClient.WriteAsync` / `GrpcClusterClient.WriteAsync` upload a payload above `MaxChunkBytes` through the client-streaming `WriteFragmentsAsync`; the node reassembles it (caps `MaxWriteBytes` 64 MiB, `MaxPendingBytes` 256 MiB, checked before allocating) and applies it through the same host call as the unary write. A smaller write stays the unary RPC (one request instead of a stream). The server's receive limit is an explicit option, default unchanged. |
+
+No compatibility between versions of the replication layer (it was never deployed; owner's decision): the
+capability announcement of the WAL stream (`WalStreamCapabilities`, the `rocksdb-wal-capabilities` header,
+`AcceptFragmentedBatches`, `WalTailer.StrictChunkLimit` as an option), the clients' fallback to the unary write RPC on
+Unimplemented (`LargeWriteError.NotSupportedByServer`), the `Applied` flag next to `PairWriteResultDto.Status`, the
+tolerance for a primary without `ReportProgressAsync`, default interface methods on the transport interfaces and the
+tests of old/new wire shapes are gone. All nodes of a deployment run the same version of this layer. Refusing
+malformed input is unchanged.
+
+Message sizes re-checked with the default receive limit back in place: WAL chunks and fragments (`MaxChunkBytes`),
+snapshot file data (`SnapshotChunkBytes`) and client writes were bounded. Lists of files were not: the hash request of
+a snapshot delta, its answer and the inventory of the snapshot request grow with the number of table files (about 25,
+90 and 100 bytes per file: 4 MiB at 40 000 to 160 000 files), and a follower with that many files could never ask for
+a snapshot again. `GrpcClusterClient` now asks for hashes in batches of at most 1 MiB and cuts the inventory to the
+largest files that fit into 1 MiB (the rest is transferred instead of reused); the plan names a subset of the
+inventory (`FileListsAreBoundedPerMessage`). The term / epoch map is the one message without a bound of its own: one
+line of at most 41 bytes per leadership change that wrote entries, 4 MiB after about 100 000 of them; documented, not
+chunked.
+
+Design limits that remain:
+
+- All nodes and clients of a deployment must run the same version of the replication layer; there is no rolling
+  upgrade across versions of its protocol.
+- A term / epoch map above the gRPC receive limit (about 100 000 leadership changes) cannot be sent; the limits of
+  the channels have to be raised then.
+
+- Fragments bound the size of a message, not of a write: a follower holds one whole write batch in memory before it
+  applies it (up to `MaxBatchBytes`), a node one whole client write (up to `MaxWriteBytes`), each plus the engine's
+  copy while it is applied. The write RPCs carry one key and value; no RPC takes a whole `WriteBatch`.
+
+- Without `SyncWal`, an acknowledged pair write is lost when the primary loses power and the replica did not hold it,
+  or cannot be reached while the primary restarts. Raft with `SyncWal = false` has the same property.
+- A two-node pair cannot tell a dead peer from an unreachable one; `ForcePromote` can create two primaries, and gives
+  up whatever the replica had not received.
+- The gRPC transport is plaintext and does not authenticate its peer: any process that can reach the port can send
+  the RPCs. Raft requests are checked against the member list, pair requests against the configured peer id, and
+  that is all; run it on a trusted network.
+- A node that yields to its replica after a restart may itself be rebuilt from it (a replica stores a received chunk
+  as one WAL batch, and a WAL stream cannot start inside a batch).
+- Not validated by test: the tailer's chunk merging across batches under faults; keep-alive against a real dead
+  connection (only the configuration is tested).
+
+Found while checking a suspicion of that comparison (port only; the original has no commit wait): the commit wait
+compared only the commit index with the write's sequence number. A leader that wrote an entry, lost the leadership
+and had its log rebuilt holds another entry at that number, and a delayed caller was told its lost write was
+committed. `RaftClusterNode.WaitForCommitAsync(sequence, term, ...)` now takes the term the entry was written in, and
+`ClusterNodeHost.WriteCommittedAsync` reads the term before the write
+(`CommitWaitDoesNotAcknowledgeAnEntryThatWasReplacedAfterAStepDown`).

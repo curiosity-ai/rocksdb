@@ -81,7 +81,13 @@ public sealed class ClusterNodeHostOptions
     public int HeartbeatIntervalMs { get; init; } = 300;
     public ulong BootstrapInSyncLagThreshold { get; init; } = 1000;
     public int BootstrapPromotionQuorum { get; init; }
+    /// <summary>
+    /// The most bytes of write batches one message of the WAL stream carries (a larger batch travels in fragments of
+    /// this size). Must be larger than a write batch header (12 bytes) and fit into one message of the transport: over
+    /// gRPC at most <c>GrpcTransportDefaults.MaxPayloadBytes</c>, which <c>GrpcNodeServer</c> checks at start.
+    /// </summary>
     public int MaxChunkBytes { get; init; } = WalTailer.DefaultMaxChunkBytes;
+    /// <summary>The most file bytes one message of a snapshot carries. At least 1; the same transport limit applies.</summary>
     public int SnapshotChunkBytes { get; init; } = 1024 * 1024;
     /// <summary>Back-off between attempts to reach a leader / retry a failed stream or snapshot.</summary>
     public TimeSpan RetryDelay { get; init; } = TimeSpan.FromMilliseconds(200);
@@ -90,6 +96,16 @@ public sealed class ClusterNodeHostOptions
     /// whose consumer stopped reading holds it until its transport gives up) before it closes the database anyway.
     /// </summary>
     public TimeSpan DisposeDrainTimeout { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// The largest serialized write batch this node takes from a WAL stream while it follows
+    /// (<see cref="WalStreamAssembler.MaxBatchBytes"/>; default <see cref="WalStreamAssembler.DefaultMaxBatchBytes"/>,
+    /// 1 GiB). A follower holds a whole batch in memory before applying it, however it arrived; a batch announced
+    /// larger than this is refused before anything is allocated and the node rebuilds from a snapshot instead, which
+    /// carries the same data as files.
+    /// </summary>
+    public int MaxBatchBytes { get; init; } = WalStreamAssembler.DefaultMaxBatchBytes;
+
     public Action<string>? Log { get; init; }
 }
 
@@ -99,7 +115,7 @@ public sealed class ClusterNodeHostOptions
 /// with the transport factored out (<see cref="IClusterNodeClient"/> for outgoing calls; incoming calls are the public
 /// <c>Handle*</c>/<c>Stream*</c> methods). See the README for the protocol.
 /// </summary>
-public sealed class ClusterNodeHost : IAsyncDisposable
+public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
 {
     private const string RaftDirName = "raft";
 
@@ -129,12 +145,15 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(clientFactory);
+        WalTailer.ValidateChunkSizes(options.MaxChunkBytes, options.SnapshotChunkBytes);
         _cfg = options;
         _clients = clientFactory;
         _fs = options.DbOptionsFactory().FileSystem;
     }
 
     public string NodeId => _cfg.NodeId;
+    public int MaxChunkBytes => _cfg.MaxChunkBytes;
+    public int SnapshotChunkBytes => _cfg.SnapshotChunkBytes;
     public RocksDatabase Db => _db;
     public RaftClusterNode Node => _node;
     public bool IsResyncing => _resyncing;
@@ -258,6 +277,8 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     {
         if (_resyncing || _node.Role != RaftRole.Leader || !_dbGate.TryEnter()) return false;
         ulong seq;
+        // Read before the write: the commit wait accepts the entry only as one of this term.
+        long term = _node.CurrentTerm;
         try
         {
             using WriteBatch b = _db.CreateWriteBatch();
@@ -269,7 +290,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         {
             _dbGate.Exit();
         }
-        return await WaitForCommitAsync(seq, timeout, cancellationToken).ConfigureAwait(false) == ClusterWriteStatus.Committed;
+        return await WaitForCommitAsync(seq, term, timeout, cancellationToken).ConfigureAwait(false) == ClusterWriteStatus.Committed;
     }
 
     /// <summary>
@@ -285,6 +306,8 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(batch);
         if (_resyncing || _node.Role != RaftRole.Leader || !_dbGate.TryEnter()) return ClusterWriteStatus.NotLeader;
         ulong seq;
+        // Read before the write: the commit wait accepts the entry only as one of this term.
+        long term = _node.CurrentTerm;
         try
         {
             await _db.WriteAsync(LogWriteOptions, batch, cancellationToken).ConfigureAwait(false);
@@ -294,19 +317,18 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         {
             _dbGate.Exit();
         }
-        return await WaitForCommitAsync(seq, timeout, cancellationToken).ConfigureAwait(false);
+        return await WaitForCommitAsync(seq, term, timeout, cancellationToken).ConfigureAwait(false);
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    private async ValueTask<ClusterWriteStatus> WaitForCommitAsync(ulong seq, TimeSpan timeout, CancellationToken cancellationToken)
+    private async ValueTask<ClusterWriteStatus> WaitForCommitAsync(ulong seq, long term, TimeSpan timeout, CancellationToken cancellationToken)
     {
-        if (_node.CommitSeq >= seq) return ClusterWriteStatus.Committed;
         bool linked = cancellationToken.CanBeCanceled;
         CancellationTokenSource cts = linked ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken) : RentTimeoutSource();
         try
         {
             cts.CancelAfter(timeout);
-            return await _node.WaitForCommitAsync(seq, cts.Token).ConfigureAwait(false) ? ClusterWriteStatus.Committed : ClusterWriteStatus.LeadershipLost;
+            return await _node.WaitForCommitAsync(seq, term, cts.Token).ConfigureAwait(false) ? ClusterWriteStatus.Committed : ClusterWriteStatus.LeadershipLost;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -388,8 +410,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     // ---------------------------------------------------------------------------------------------------
     // Incoming RPCs
 
-    public RequestVoteResult HandleRequestVote(RequestVotePayload request) =>
-        _node.HandleRequestVote(request.Term, request.CandidateId, request.LastLogSeq, request.LastLogTerm);
+    public RequestVoteResult HandleRequestVote(RequestVotePayload request) => _node.HandleRequestVote(request);
 
     public AppendEntriesResult HandleHeartbeat(HeartbeatPayload payload) => _node.HandleAppendEntries(payload);
 
@@ -466,8 +487,12 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         }
     }
 
-    /// <summary>The WAL stream for a follower, while this node leads; it ends when leadership is lost.</summary>
-    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
+    /// <summary>
+    /// The WAL stream for a follower, while this node leads; it ends when leadership is lost. A write batch larger than
+    /// <see cref="ClusterNodeHostOptions.MaxChunkBytes"/> is sent in pieces (<see cref="WalStreamMessage.IsFragment"/>).
+    /// </summary>
+    public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         CancellationToken leadership;
         lock (_followerLock) leadership = _leadershipCts.Token;
@@ -613,8 +638,10 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                 // The report names the leadership (term) it belongs to; the leader ignores it in any other term.
                 long followTerm = check.Term;
                 await using var progress = new ProgressReporter((seq, c) =>
-                    _node.CurrentTerm <= followTerm ? client.ReportProgressAsync(_cfg.NodeId, seq, followTerm, c) : Task.CompletedTask);
+                    _node.CurrentTerm <= followTerm ? client.ReportProgressAsync(_cfg.NodeId, seq, followTerm, c) : Task.CompletedTask, _cfg.RetryDelay);
                 progress.Report(myLatest);
+                // Per attachment: a stream that ends or fails takes its partial batch with it.
+                using var assembler = new WalStreamAssembler(_cfg.MaxBatchBytes);
                 await foreach (WalStreamMessage m in client.StreamUpdatesAsync(_cfg.NodeId, myLatest + 1, ct).ConfigureAwait(false))
                 {
                     if (m.ResyncRequired)
@@ -638,10 +665,25 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                     // comes from a different leadership of that node (it lost and regained the role in between, possibly
                     // rebuilding its log): check again before applying anything of it.
                     if (m.SourceTerm != followTerm) break;
+                    WalAssemblyStatus assembled = assembler.Accept(m, out ReadOnlyMemory<byte> chunk);
+                    if (assembled != WalAssemblyStatus.Complete)
+                    {
+                        // Nothing of an incomplete batch is applied, recorded in the term log or reported.
+                        if (assembled == WalAssemblyStatus.Incomplete) continue;
+                        ulong at = _db.GetLatestSequenceNumber();
+                        if (assembled == WalAssemblyStatus.TooLarge || _resyncPolicy.ShouldRebuildAfterStreamFault(at))
+                        {
+                            // The stream cannot get this node past the batch; a snapshot carries it as files.
+                            TriggerResync("the leader's stream cannot be followed from " + (at + 1) + ": " + assembler.LastError);
+                            return;
+                        }
+                        Log("dropping the stream from " + leaderId + " at " + (at + 1) + ": " + assembler.LastError);
+                        break;
+                    }
                     if (m.EntryTerm > 0) _state.RecordTermRange(m.FirstSequence, m.EntryTerm);
                     // A faithful replica ingests the leader's batches at exactly the same sequence numbers; a gap or an
                     // overlap diverges the copy.
-                    if (!await consumer.TryIngestChunkAsync(m.Data, ct).ConfigureAwait(false))
+                    if (!await consumer.TryIngestChunkAsync(chunk, ct).ConfigureAwait(false))
                     {
                         TriggerResync("WAL stream mismatch: expected seq " + consumer.ExpectedNextSequence + ", got " + m.FirstSequence);
                         return;
