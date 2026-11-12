@@ -102,10 +102,18 @@ public sealed class GrpcNodeServerOptions
 
     /// <summary>The limits of large client writes received in pieces.</summary>
     public FragmentedWriteOptions FragmentedWrites { get; init; } = new();
+
+    /// <summary>
+    /// Null (the default): plaintext HTTP/2 that accepts every caller - for a trusted network only. Otherwise the
+    /// server speaks TLS and accepts only clients that hold the same shared secret (<see cref="SharedSecretTls"/>);
+    /// <see cref="GrpcNodeServer.Endpoint"/> is then an <c>https://</c> address. The caller keeps ownership and
+    /// disposes it after the server.
+    /// </summary>
+    public SharedSecretTls? Tls { get; init; }
 }
 
 /// <summary>
-/// A Kestrel (HTTP/2, plaintext, loopback by default) server exposing one MagicOnion service backed by a singleton -
+/// A Kestrel (HTTP/2; plaintext unless <see cref="GrpcNodeServerOptions.Tls"/> is set; loopback by default) server exposing one MagicOnion service backed by a singleton -
 /// the StartServerAsync of rocksdb-sharp's sample hosts. Port 0 picks a free port; <see cref="Endpoint"/> is the bound
 /// address.
 /// </summary>
@@ -123,7 +131,7 @@ public sealed class GrpcNodeServer : IAsyncDisposable
     /// <summary>The large client writes this server is receiving (<see cref="GrpcNodeServerOptions.FragmentedWrites"/>).</summary>
     public FragmentedWriteBudget FragmentedWrites { get; }
 
-    /// <summary>The bound address, e.g. "http://127.0.0.1:51234".</summary>
+    /// <summary>The bound address, e.g. "http://127.0.0.1:51234" ("https://..." with <see cref="GrpcNodeServerOptions.Tls"/>).</summary>
     public string Endpoint { get; }
 
     /// <summary>Starts a server for <typeparamref name="TService"/> whose constructor receives <paramref name="backend"/>.</summary>
@@ -150,7 +158,14 @@ public sealed class GrpcNodeServer : IAsyncDisposable
         builder.Logging.ClearProviders();
         builder.WebHost.ConfigureKestrel(o =>
         {
-            o.Listen(address, port, lo => lo.Protocols = HttpProtocols.Http2);
+            o.Listen(address, port, lo =>
+            {
+                lo.Protocols = HttpProtocols.Http2;
+                if (options.Tls is { } tls)
+                {
+                    lo.UseHttps(tls.ConfigureServer);
+                }
+            });
             // A client that vanished without closing its connection is noticed (and its streams end) through pings.
             o.Limits.Http2.KeepAlivePingDelay = GrpcTransportDefaults.KeepAlivePingDelay;
             o.Limits.Http2.KeepAlivePingTimeout = GrpcTransportDefaults.KeepAlivePingTimeout;

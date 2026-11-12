@@ -170,6 +170,34 @@ and no RPC takes a whole `WriteBatch`.
 Limits of both: the receiver holds one whole batch / write in memory (the reassembly buffer, plus the engine's copy
 while it is applied) - fragments bound the size of a message, not of a write; the caps above bound the write.
 
+### Encryption and authentication over gRPC (`SharedSecretTls`)
+
+By default the gRPC transport is plaintext and a server accepts every caller: use that on a trusted network only.
+`SharedSecretTls` turns on TLS with authentication in both directions from one secret (a byte array of at least 16
+random bytes) that every node and client of the deployment holds:
+
+```csharp
+using var tls = new SharedSecretTls(secret);                       // one per process
+await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(
+    host, address, port, new GrpcNodeServerOptions { Tls = tls }, ct);
+using var peer = new GrpcPairClient("B", "https://10.0.0.2:5000", timeout, tls.CreateChannelOptions());
+```
+
+Each `SharedSecretTls` creates a random key pair and a self-signed certificate with an extension holding an HMAC of its
+public key, keyed with a key derived from the secret. Server and client both present their certificate and accept the
+other side only when that HMAC matches. Only a holder of the secret can make an accepted certificate; a copied
+certificate is useless without its private key; the secret itself is never sent.
+
+* Host names, validity dates, chains and revocation are not checked: the secret is the only identity, and every holder
+  is trusted as any node and any client (there are no roles).
+* All nodes and clients need the secret, including clients that only write.
+* To change the secret, restart the nodes with the new one; a node accepts one secret at a time.
+* A caller without the secret fails in the TLS handshake. `GrpcPairClient` and `GrpcClusterClient` wait for a
+  connection, so there a wrong secret looks like an unreachable peer (calls end at their deadline).
+* A host that runs the services in its own ASP.NET Core application uses `tls.ConfigureServer` in Kestrel's `UseHttps`
+  and `tls.ConfigureClient` on its own `SocketsHttpHandler`.
+* Dispose the `SharedSecretTls` after the servers and channels that use it.
+
 ### Message sizes over gRPC
 
 Channels and servers keep gRPC's default receive limit of 4 MiB (`GrpcTransportDefaults.MaxReceiveMessageSize`,
