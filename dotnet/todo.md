@@ -339,6 +339,7 @@ Still open from this round:
 - [x] TransactionDB::Write accepted SingleDelete (non-default CF), DeleteRange, TimedPut and blob indexes that upstream LockBatch rejects; fixed + `TransactionTests.WriteBatchWithUnsupportedRecordsIsRejected`
 - [ ] Multi-CF `Flush(FlushOptions, IReadOnlyList<ColumnFamily>)` overload (rocksdb_flush_cfs equivalent) (S)
 - [ ] Native 11.12 bugs found (same code on main; could be reported upstream): unordered_write + manual_wal_flush self-deadlock on wal_write_mutex_; DBIter::MergeWithBlobBaseValue returns freed memory; hash index / hash skiplist call Transform without InDomain (see docs/validation.md "Combinatorial round trips"; ready-to-file reports with C API repros in docs/upstream-issues/)
+- [ ] Upstream issue drafts 05-07 (backup engine, reproduced against native 11.12 with the C programs in them): garbage collection deletes backups it cannot load; a `private/<id>.tmp` makes it delete backup `<id>`; a failing restore deletes the destination first
 - [ ] Upstream issue draft 04 (`docs/upstream-issues/04-blob-direct-write-sealed-file-deleted-after-crash.md`): blob direct write on `main` deletes blob files sealed before a crash; not reproduced natively (no release has the feature), reproduction is an uncompiled sketch
 - [ ] Round-trip matrix not yet crossing: wide columns (no C API PutEntity in 11.12), preclude_last_level_data_seconds, separate_key_value_in_data_block, db_paths / cf_paths, last_level_temperature
 
