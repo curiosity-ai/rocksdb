@@ -1273,7 +1273,8 @@ internal sealed partial class DbImpl
             SeqnoToTimeMapping? seqnoToTime;
             lock (_mutex) seqnoToTime = CopySeqnoToTimeMapping(cfd);
             meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, TableFileWriteOptions(Env.IoPriority.High), cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, [],
-                    CurrentSnapshotChecker, blobBuilder, null, seqnoToTime, null /* BuildTable(version = nullptr) */, null, synchronous, ct)
+                    CurrentSnapshotChecker, blobBuilder, null, seqnoToTime, null /* BuildTable(version = nullptr) */, null,
+                    new FlushJobContext(TableFileCreationReason.Recovery, DbFormat.MaxSequenceNumber, Options.EnforceSingleDelContracts), synchronous, ct)
                 .ConfigureAwait(false);
         }
         catch

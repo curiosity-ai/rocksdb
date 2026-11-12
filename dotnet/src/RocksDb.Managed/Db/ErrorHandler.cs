@@ -835,6 +835,8 @@ internal sealed partial class DbImpl
             cut = _atomicCutCompleted;
             foreach (ColumnFamilyData cfd in cfds)
             {
+                // FlushAllColumnFamilies: cfd->imm()->FlushRequested() for every column family with sealed memtables.
+                if (!cfd.Dropped && cfd.Imm.Count > 0) cfd.FlushRequested = true;
                 if (cfd.Dropped || cfd.FlushRunning || !cfd.HasPendingFlushUpTo(cut)) continue;
                 cfd.FlushRunning = true;
                 _runningFlushes++;

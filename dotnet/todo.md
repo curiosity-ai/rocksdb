@@ -171,7 +171,7 @@ Final completeness wave (all merged):
 - [x] Fixed flaky `PrefixSameAsStartMatchesModel` (forced bottommost compaction for a deterministic LSM shape)
 - [x] Perf #3: flush WAL-on 2.31x → 1.19x native (WAL writeback during switch), no large per-file allocations (59.6 → 5.5 B/put, no gen2 GCs), first-run AggressiveOptimization on per-entry paths; steady-state flush/compaction ≤ native; compaction-heavy config managed 0.62x native geomean (`results/2026-11-02-vm-perf3*.md`)
 - [x] Compaction picking parity: root causes were flush keeping hidden versions (now applies upstream rule A per snapshot stripe) and max output size cap (2x target above bottommost). Lock-step harness: all 60 LSM shapes and compaction sequence identical to native; write-amp 4.321 vs 4.322. Compat test `CompactionPickerParityTests`
-- [ ] Under free-running load the faster managed writer piles L0 to ~10 files with 1 compaction thread (native 5–6) → more pending work at end; consider write-controller pacing parity
+- [x] Re-measured 2026-11-12 (compaction-heavy config, 5 reps, idle VM): waitforcompaction 0.70 s native / 0.79 s managed (medians), 0 pending compaction bytes at the end for both, write-amp 4.35 / 4.12 while managed fills 1.5x faster (`bench/results/2026-11-12-compaction-r5.md`); L0 count during the fill not sampled
 - [x] Fixed secondary/WAL tailing lag at block-aligned EOF (also likely cause of an intermittent replication-test failure: 15/15 clean runs after the fix) and missing-dir open error (InvalidArgument)
 - [x] Final verification (both TFMs): unit 886, compat 227, replication 30, round-trip 40 (+1 long), QuickStart 26/26, C bench builds. Fixed last flaky test (EventListenerTests: recorder used two unsynchronized queues; 20/20 after fix)
 - [x] Bench warm-up: `--warmup` (default on, all 3 legs) runs every workload + 64 flush/compaction cycles on a throwaway DB, waits for JIT quiescence; per-benchmark JIT counts in reports (managed: median 161 → 0 methods during measurement). Warm three-way geomean vs C: managed 0.50–0.81x, managed-async 0.48–0.73x, rocksdb-sharp 0.89–1.19x (`bench/results/2026-11-02-vm-warm*.md`)
@@ -181,7 +181,8 @@ Final completeness wave (all merged):
 - [x] (closed, see Remaining gaps) Features gaps: compaction filters on entities, blob columns/attribute groups/MultiGetEntity, per-SuperVersion options snapshot, mutable block-based table options, KeyMayExist doing filter I/O on cache miss, cfstats interval/file-read histograms, per-level GET_HIT stats, WBWI MultiGetFromBatchAndDB
 - [x] Flaky? `PrefixSeekTests.PrefixSameAsStartMatchesModel` failed once on net11.0 (sorted-run file count precondition); 10/10 reruns pass
 - [x] Perf #2: async fast paths (preadv2/pwritev2 RWF_NOWAIT, pooled builders) → async ≈ sync, 0 B/op reads/seeks; batched `MultiGetBatch` (+async, 0 B/op); BlockIter.Prev cache (~30% faster reverse); LevelIterator reuses table iterators (0 B/op seeks in multi-level LSM); managed overwrite under compaction now 3.4 vs C 5.1 µs. Three-way geomean vs C: managed 0.69–1.17×, async 0.64–1.17×, rocksdb-sharp 0.85–1.33× (`bench/results/2026-11-02-vm-perf2*.md`)
-- [ ] Flush/compaction per-entry cost still 1.4–2x native; background compaction lags under sustained writes (waitforcompaction 0.6–0.8 s vs 0.02–0.18 s); reverse iteration copies values (pin blocks instead)
+- [ ] Flush/compaction per-entry cost still 1.4–2x native; reverse iteration copies values (pin blocks instead)
+- [ ] Audit #5 open items: blob direct write loses a sealed blob file that a crash leaves out of the MANIFEST (recovery change, same in C++); `use_fsync` ignored; write cancellation only honoured while stalled; `two_write_queues` and split insert read only; flush CompactionIterator path not taken with a snapshot checker or memtable-only timestamps; `FlushOptions.AllowWriteStall` not ported; StopBackup does not abort restores; possibly flaky `AtomicReplaceRangeTests.UniversalPartialOverlapIngestsRangeTombstoneBelowNewFiles` (checks levels before WaitForCompact)
 - [x] Transactions: `OptimisticTransactionDatabase` (serial + parallel validation), `TransactionDatabase` (WriteCommitted, point locks, timeouts, deadlock detection, expiration, 2PC prepare/commit/rollback + recovery); 2PC WAL records byte-identical to native, prepared txns recover across engines; fixed recovery last-sequence bug for 2PC records; dbbench txnoptimistic/txnpessimistic on all engines
 - [ ] Transactions gaps: WritePrepared/WriteUnprepared, range locks, UDT; unify IndexedWriteBatch with public WriteBatchWithIndex; pool lock entries/tracked keys (~1.8–2.3 KB/txn)
 - [x] Replaced stringy enums: typed FilterPolicy/MergeOperator/CompactionFilter/SliceTransform options (persisted text preserved byte-for-byte), MemTableFactoryType/TableFactoryType/FlushBlockPolicyType, `DbProperties` constants, `AppendEntriesRejectReason`, bench EngineKind/DbBenchmark/CompressionType flags, round-trip FilterKind
@@ -282,7 +283,7 @@ Legend: S/M/L = rough size. [~] = agent working on it.
 - [ ] async MultiGet with block cache 2-4% slower after the batched secondary-cache lookups (consistent across runs, within one StdDev) (S)
 
 - [ ] `max_successive_merges` is accepted but ignored (upstream folds merge operands into a Put at write time once the limit is hit) (S)
-- [ ] `min_write_buffer_number_to_merge` is ignored: immutable memtables are flushed as soon as they are sealed (M)
+- [x] `min_write_buffer_number_to_merge`: sealed memtables wait like upstream `IsFlushPending` and are merged in one flush (audit #5)
 
 ## Second correctness review (2026-11-06; all items fixed 2026-11-06 with regression tests and native comparisons where observable; remaining deliberate deviations are listed in docs/validation.md (second-review sections) and README "Not ported yet"; 5 reviewers vs C++ 11.14 / native 11.12; evidence in each item's source refs)
 
@@ -328,8 +329,8 @@ Follow-up review: IsInSnapshot, RangeLockTree and the multi-CF iterator checked 
 
 Still open from this round:
 - [ ] `max_successive_merges` (and `strict_max_successive_merges`), `paranoid_memory_checks`, `memtable_op_scan_flush_trigger` and the other typed-only options listed in README "Not ported yet" (S-M each)
-- [ ] flush does not run the merge helper / compaction filter (TTL merge results are stamped at the first compaction, flush filtering not applied) (M)
-- [ ] paranoid_file_checks read-back of flush outputs; MANIFEST size check on close (S)
+- [x] flush runs the CompactionIterator (merge helper, single deletes, range tombstones, flush compaction filter) when a memtable needs it; default memtables keep the copy loop (audit #5)
+- [x] paranoid_file_checks read-back of flush outputs; MANIFEST size check on close (audit #5)
 
 ## Combinatorial round trips (2026-11-06)
 
@@ -358,7 +359,7 @@ Still open from this round:
 
 - [x] `readrandomwriterandom` + `--readwritepercent` on all four legs; 0-100% writes, 1 and 4 threads, 3 reps: managed 1.25-1.65x c-native ops/s, rocksdb-sharp 0.91-1.02x
 - [ ] Write-heavy cells JIT-compile up to ~630 methods during measurement (memtable switch / flush paths not covered by the warm-up)
-- [ ] Managed pure-write throughput drops from 1 to 4 threads (422k -> 369k ops/s; C 279k -> 289k)
+- [ ] Pure writes 1 / 2 / 4 threads, re-measured 2026-11-12 (5 reps, idle VM): native 235k / 185k / 195k, managed 319k / 240k / 240k ops/s; the per-group hand-off cost is the same as native, the larger relative drop comes from the faster 1-thread baseline. Candidates in validation.md "Audit #5: write path" (shared WriteBatch pool scanned per Put, three WriteThread lock acquisitions per group)
 - [ ] bench/README.md lists txnwriteprepared / txnwriteunprepared for the native legs, but native-c implements only txnoptimistic / txnpessimistic
 
 ## Jepsen-style soak (2026-11-07; tools/RocksDb.Managed.Soak, docs/soak.md)

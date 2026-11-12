@@ -78,6 +78,9 @@ public sealed unsafe class MemTable : IDisposable
     private long _oldestKeyTime;
     private int _flushState;
     private int _isRangeDelTableEmpty = 1;
+    // Set by the first Merge, SingleDelete or TimedPut entry: the flush then reads the memtable through a
+    // CompactionIterator (see FlushJob). Only ever written true, so concurrent inserts need no synchronization.
+    private volatile bool _hasFlushResolvedEntries;
     private bool _disposed;
 
     // Range tombstone cache: rebuilt lazily when _rangeDelVersion moves (see GetFragmentedRangeTombstones).
@@ -642,6 +645,7 @@ public sealed unsafe class MemTable : IDisposable
             if (observed == curEarliest) break;
             curEarliest = observed;
         }
+        if ((uint)type < 64 && ((1UL << (int)type) & FlushResolvedTypes) != 0 && !_hasFlushResolvedEntries) _hasFlushResolvedEntries = true;
         if (type == EntryType.RangeDeletion)
         {
             // Invalidate the fragmented tombstone cache. Readers that loaded the old cache are fine: the new
@@ -896,6 +900,15 @@ public sealed unsafe class MemTable : IDisposable
     public long NumEntries => Volatile.Read(ref _numEntries);
     public long NumDeletes => Volatile.Read(ref _numDeletes);
     public long NumRangeDeletes => Volatile.Read(ref _numRangeDeletes);
+
+    private const ulong FlushResolvedTypes = (1UL << (int)EntryType.Merge) | (1UL << (int)EntryType.SingleDeletion) | (1UL << (int)EntryType.ValuePreferredSeqno);
+
+    /// <summary>
+    /// True once the memtable holds a merge operand, a single delete or a TimedPut entry: entries a flush cannot copy
+    /// as they are (MergeHelper::MergeUntil, the SingleDelete branch of CompactionIterator::NextFromInput, the
+    /// preferred-seqno conversion of BuildTable).
+    /// </summary>
+    internal bool HasFlushResolvedEntries => _hasFlushResolvedEntries;
     /// <summary>Total encoded bytes of all entries.</summary>
     public long DataSize => Volatile.Read(ref _dataSize);
 

@@ -41,8 +41,10 @@ public sealed class DbApiWaveTests
         // Not found.
         Assert.IsFalse(db.TryGetMergeOperands(B("nope"), all, r));
         Assert.AreEqual(0, r.Count);
-        // Base + operands spread over two files and the memtable.
+        // Base + operands spread over three files and the memtable (one entry per flush: a flush merges the operands
+        // of its memtable with the base value it holds).
         db.Put(B("k"), B("a"));
+        db.Flush();
         db.Merge(B("k"), B("b"));
         db.Flush();
         db.Merge(B("k"), B("c"));

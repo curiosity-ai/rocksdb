@@ -1105,11 +1105,13 @@ internal sealed partial class DbImpl : IAsyncDisposable
             // VersionSet::Close: verify_manifest_content_on_close. A failure is reported once the close has finished
             // (DB::Close returns the status).
             RocksDbException? closeError = null;
-            if (Options.VerifyManifestContentOnClose && !_readOnly && Versions.GetColumnFamily(0) is { } defaultCfd)
+            if (!_readOnly && Versions.GetColumnFamily(0) is { } defaultCfd)
             {
                 try
                 {
-                    await Versions.VerifyManifestContentOnCloseAsync(defaultCfd).ConfigureAwait(false);
+                    // The size check runs on every close; the content check with verify_manifest_content_on_close.
+                    await Versions.VerifyManifestSizeOnCloseAsync(defaultCfd).ConfigureAwait(false);
+                    if (Options.VerifyManifestContentOnClose) await Versions.VerifyManifestContentOnCloseAsync(defaultCfd).ConfigureAwait(false);
                 }
                 catch (Exception e) when (e is IOException or RocksDbException)
                 {

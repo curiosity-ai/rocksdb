@@ -353,16 +353,27 @@ internal sealed class ColumnFamilyData
         return false;
     }
 
-    /// <summary>True if some immutable memtable is waiting for a flush to be picked (MemTableList::IsFlushPending).</summary>
+    /// <summary>
+    /// MemTableList::flush_requested_: a flush of every sealed memtable was asked for (manual flush, WAL or write
+    /// buffer manager limits, error recovery), so the flush does not wait for min_write_buffer_number_to_merge
+    /// memtables. Cleared when a flush picks the last memtable that was waiting. Guarded by the DB mutex.
+    /// </summary>
+    public bool FlushRequested { get; set; }
+
+    /// <summary>
+    /// Port of MemTableList::IsFlushPending: a flush can be picked when min_write_buffer_number_to_merge immutable
+    /// memtables wait for one, or when a flush was requested and at least one waits. REQUIRES: mutex.
+    /// </summary>
     public bool HasPendingFlush
     {
         get
         {
+            int notStarted = 0;
             foreach (ImmutableMemTable m in Imm)
             {
-                if (!m.FlushInProgress && !m.FlushCompleted) return true;
+                if (!m.FlushInProgress && !m.FlushCompleted) notStarted++;
             }
-            return false;
+            return (FlushRequested && notStarted > 0) || (notStarted > 0 && notStarted >= Options.MinWriteBufferNumberToMerge);
         }
     }
 

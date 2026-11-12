@@ -156,12 +156,11 @@ public sealed class Audit4LastTickersTests
 
     /// <summary>
     /// BuildTable runs the memtable through a CompactionIterator, which drops a SingleDelete together with the Put it
-    /// meets in the same snapshot stripe (compaction_iterator.cc, "the two cancel out"): upstream's flush of such a
-    /// memtable keeps no file. Documented deviation (docs/validation.md, FlushJob row): the managed flush only drops
-    /// hidden versions, writes both entries and leaves the pair to compaction. Reads are the same either way.
+    /// meets in the same snapshot stripe (compaction_iterator.cc, "the two cancel out"): the flush of such a memtable
+    /// keeps no file.
     /// </summary>
     [TestMethod]
-    public void FlushOfAPutAndItsSingleDeleteKeepsThePairForCompaction()
+    public void FlushOfAPutAndItsSingleDeleteKeepsNoFile()
     {
         (_, DbOptions options, Recorder l, _) = Setup();
         using RocksDatabase db = RocksDatabase.Open(DbPath, options);
@@ -169,12 +168,9 @@ public sealed class Audit4LastTickersTests
         db.SingleDelete(B("a"));
         db.Flush();
         Assert.IsTrue(SpinWait.SpinUntil(() => l.Count("FlushCompleted") == 1, s_timeout));
-        Assert.AreEqual("1", db.GetProperty("rocksdb.num-files-at-level0"), "managed flush keeps the pair (upstream: no file)");
+        Assert.AreEqual("0", db.GetProperty("rocksdb.num-files-at-level0"));
         Assert.IsNull(db.Get(B("a")));
-        // A plain CompactRange only moves the single file; a compaction that rewrites it drops the pair.
-        db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
-        Assert.IsNull(db.Get(B("a")));
-        Assert.AreEqual(0, db.GetLiveFilesMetadata().Count, "the compaction drops the pair");
+        Assert.AreEqual(0, db.GetLiveFilesMetadata().Count);
     }
 
     // ---- B2: shutdown guards ---------------------------------------------------------------------------------

@@ -394,7 +394,7 @@ public sealed class DbBasicTests
 
     /// <summary>
     /// The flush drops versions hidden by a newer version of the same key in the same snapshot stripe (rule (A) of the
-    /// flush-time CompactionIterator), keeps one version per stripe, and keeps single deletes with their puts.
+    /// flush-time CompactionIterator), keeps one version per stripe, and drops a single delete with the put it deletes.
     /// </summary>
     [TestMethod]
     public void FlushDropsVersionsHiddenInTheSameSnapshotStripe()
@@ -412,8 +412,7 @@ public sealed class DbBasicTests
         db.Put(B("c"), B("2"));
         db.Put(B("d"), B("1"));
         db.SingleDelete(B("d"));
-        // A single delete hidden by a newer put is kept: dropping it would let the next single delete (which cancels
-        // the newer put) resurface the older put.
+        // A single delete hidden by a newer put goes with the older put it deletes.
         db.Put(B("e"), B("1"));
         db.SingleDelete(B("e"));
         db.Put(B("e"), B("2"));
@@ -425,9 +424,10 @@ public sealed class DbBasicTests
             entries += p.NumEntries;
             deletions += p.NumDeletions;
         }
-        // a@2 (visible to the snapshot), a@4, the deletion of b, c@2, d's put and single delete, all three entries of e.
-        Assert.AreEqual(9UL, entries);
-        Assert.AreEqual(3UL, deletions);
+        // a@2 (visible to the snapshot), a@4, the deletion of b, c@2 and the newest put of e (same file as native writes:
+        // compat test Audit5FlushCompatTests.SingleDeletePairsMatchNative).
+        Assert.AreEqual(5UL, entries);
+        Assert.AreEqual(1UL, deletions);
         CollectionAssert.AreEqual(B("4"), db.Get(B("a")));
         CollectionAssert.AreEqual(B("2"), db.Get(new ReadOptions { Snapshot = snap }, B("a")));
         Assert.IsNull(db.Get(B("b")));
