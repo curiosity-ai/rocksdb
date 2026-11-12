@@ -1952,3 +1952,29 @@ fill ended between compactions, ~0.4-0.5 s otherwise) and `seekrandom` follows t
 end (0-3 in both trees), both timing effects. The JIT still compiled up to ~400 methods during some write measurements
 (warm-up gap already in `todo.md`), which is a large part of the spread; this setup cannot resolve differences below
 about 20% for the multi-threaded write rows or 10% elsewhere.
+
+### Re-run with the write-round warm-up (2026-11-12, later)
+
+Same comparison, with the benchmark runner of this tree for both engines (so both get the new warm-up write rounds;
+only the engine differs), 5 alternated repetitions, every run started at a 1-minute load average of at most 1.0. Raw
+rows: `bench/results/2026-11-12-audit5-ab-warm-*.csv`. Median µs/op (ms for flush / waitforcompaction), "slower" = pairs
+in which the tree after the audit was slower, and the most methods compiled during one measurement.
+
+| configuration | benchmark | before | after | diff | slower | jit before / after |
+|---|---|---:|---:|---:|---:|---:|
+| 2M x 100 B, 1 thread | fillrandom | 2.190 | 1.981 | -9.6% | 2 / 5 | 9 / 10 |
+| | readrandomwriterandom (writes) | 2.205 | 1.904 | -13.7% | 2 / 5 | 18 / 19 |
+| | flush (ms) | 223 | 136 | -39.0% | 2 / 5 | 6 / 19 |
+| 2M x 100 B, 4 threads | fillrandom | 2.301 | 2.460 | +6.9% | 2 / 5 | 11 / 11 |
+| | readrandomwriterandom (writes) | 2.604 | 2.797 | +7.4% | 1 / 5 | 103 / 17 |
+| | flush (ms) | 100 | 92 | -8.6% | 2 / 5 | 4 / 2 |
+| compaction-heavy | fillrandom | 1.093 | 1.162 | +6.3% | 4 / 5 | 11 / 10 |
+| | overwrite | 1.103 | 1.163 | +5.4% | 4 / 5 | 4 / 2 |
+| | waitforcompaction (ms) | 519 | 517 | -0.3% | 1 / 5 | 2 / 0 |
+| | readrandom | 3.091 | 2.966 | -4.0% | 1 / 5 | 2 / 3 |
+
+The JIT is out of the picture now (at most 19 methods per measurement, against up to 550 before), but the run-to-run
+spread is not: the same tree still varies by 20-50% between repetitions on this VM (e.g. 1-thread fillrandom
+1.81-2.71 µs), so it was not the JIT that made the earlier comparison noisy. No regression is confirmed. The one
+pattern worth a closer look is the compaction-heavy fill / overwrite, slower after the audit in 4 of 5 pairs by a
+median 5-6% (a sign test of 4 / 5 is far from significant, and the ranges overlap).
