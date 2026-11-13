@@ -214,7 +214,7 @@ internal sealed class LevelCompactionPicker : CompactionPicker
         {
             if (_startLevel == 0 && _outputLevel != 0 && !_isL0TrivialMove)
             {
-                return _picker.GetOverlappingL0Files(_vstorage, _startLevelInputs, _outputLevel, ref _parentIndex);
+                return _picker.GetOverlappingL0Files(_vstorage, _startLevelInputs, _outputLevel, ref _parentIndex, null);
             }
             return true;
         }
@@ -277,7 +277,7 @@ internal sealed class LevelCompactionPicker : CompactionPicker
                 bool roundRobinExpanding = _o.CompactionPri == CompactionPri.RoundRobin && _reason == CompactionReason.LevelMaxLevelSize;
                 if (roundRobinExpanding) SetupOtherFilesWithRoundRobinExpansion();
                 if (!_isL0TrivialMove
-                    && !_picker.SetupOtherInputs(_vstorage, _startLevelInputs, _outputLevelInputs, ref _parentIndex, _baseIndex, roundRobinExpanding))
+                    && !_picker.SetupOtherInputs(_vstorage, _startLevelInputs, _outputLevelInputs, ref _parentIndex, _baseIndex, roundRobinExpanding, null))
                 {
                     return false;
                 }

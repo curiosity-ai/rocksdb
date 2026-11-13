@@ -1,0 +1,11 @@
+label,engine,num,value_size,threads,compression,files_per_level,user_bytes,written_bytes,write_amp,pending_compaction_bytes,rep
+compaction,c-native,1000000,100,1,none,0 0 0 0 0 3 36,232000000,1009317315,4.35,0,1
+compaction,managed,1000000,100,1,none,0 0 0 0 0 3 33,232000000,955630223,4.12,0,1
+compaction,c-native,1000000,100,1,none,0 0 0 0 0 3 33,232000000,1009317315,4.35,0,2
+compaction,managed,1000000,100,1,none,0 0 0 0 0 5 31,232000000,923417969,3.98,0,2
+compaction,c-native,1000000,100,1,none,0 0 0 0 0 4 32,232000000,1009317315,4.35,0,3
+compaction,managed,1000000,100,1,none,0 0 0 0 0 4 33,232000000,955630223,4.12,0,3
+compaction,c-native,1000000,100,1,none,1 0 0 0 0 2 33,232000000,987842478,4.26,0,4
+compaction,managed,1000000,100,1,none,0 0 0 0 0 3 31,232000000,923417969,3.98,0,4
+compaction,c-native,1000000,100,1,none,1 0 0 0 0 3 31,232000000,998579896,4.30,0,5
+compaction,managed,1000000,100,1,none,0 0 0 0 0 3 30,232000000,966367642,4.17,0,5

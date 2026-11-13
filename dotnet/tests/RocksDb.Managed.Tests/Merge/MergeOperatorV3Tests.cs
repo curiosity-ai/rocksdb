@@ -146,7 +146,10 @@ public sealed class MergeOperatorV3Tests
     {
         MemoryFileSystem fs = NewFs();
         using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), Cf(new TestPutOperator()));
+        // Base and operand in different files: a flush of both would have to merge them and fail the same way
+        // (Audit5FlushTests.FlushFailsWhenTheMergeOperatorFails).
         db.Put(B("k"), B("base"));
+        db.Flush();
         db.Merge(B("k"), B(operand));
         db.Flush();
         AssertMergeFailed(() => db.Get(B("k")));

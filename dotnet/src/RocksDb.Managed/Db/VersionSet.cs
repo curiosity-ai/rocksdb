@@ -880,6 +880,60 @@ internal sealed class VersionSet : IAsyncDisposable
     }
 
     /// <summary>
+    /// The size check of VersionSet::Close: the MANIFEST writer is closed and the file's size compared with the bytes
+    /// written to it (manifest_file_size_). A different size (or a failed size query) is logged ("MANIFEST verification
+    /// on Close") and repaired by writing a new MANIFEST (LogAndApply of an empty edit). The OnIOError listener call
+    /// (FileOperationType::kVerify) is not ported. Called by close before the content check and <see cref="DisposeAsync"/>.
+    /// </summary>
+    internal async ValueTask VerifyManifestSizeOnCloseAsync(ColumnFamilyData defaultCfd)
+    {
+        string path;
+        long expected;
+        string? status = null;
+        await _manifestLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_manifestLog is null) return;
+            path = FileNames.DescriptorFileName(_dbname, ManifestFileNumber);
+            expected = _manifestLog.Log.File!.Size;
+            ManifestLogWriter log = _manifestLog;
+            _manifestLog = null;
+            _manifest = null;
+            try
+            {
+                await log.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception e) when (e is IOException or RocksDbException)
+            {
+                status = e.Message;
+            }
+        }
+        finally
+        {
+            _manifestLock.Release();
+        }
+        TestHooks.Invoke("VersionSet::Close:AfterClose");
+        long size = 0;
+        if (status is null)
+        {
+            try
+            {
+                size = _fs.GetFileSize(path);
+                if (size == expected) return;
+                // "This means the size is not as expected. So we treat it as a corruption".
+                status = "Corruption: ";
+            }
+            catch (Exception e) when (e is IOException or RocksDbException)
+            {
+                status = e.Message;
+            }
+        }
+        _db.LogError("MANIFEST verification on Close, filename " + path + ", expected size " + expected.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            + " failed with status " + status + " and actual size " + size.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        await LogAndApplyAsync(defaultCfd, new VersionEdit(), synchronous: false, CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// The content validation of VersionSet::Close (verify_manifest_content_on_close): reads the current MANIFEST back,
     /// checking every record's CRC and VersionEdit encoding. A corrupt MANIFEST is counted
     /// (MANIFEST_VALIDATION_FAILURE_COUNT) and rewritten once (a new compacted MANIFEST via an empty edit), then checked
@@ -895,7 +949,7 @@ internal sealed class VersionSet : IAsyncDisposable
             await _manifestLock.WaitAsync().ConfigureAwait(false);
             try
             {
-                if (_manifestLog is null) return;
+                if (ManifestFileNumber == 0) return;
                 // Re-read the manifest file name in case it was rotated by a rewrite.
                 path = FileNames.DescriptorFileName(_dbname, ManifestFileNumber);
             }

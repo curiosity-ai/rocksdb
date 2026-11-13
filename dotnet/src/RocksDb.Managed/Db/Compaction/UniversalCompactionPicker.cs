@@ -11,8 +11,19 @@ namespace RocksDb.Managed.Db;
 /// <para>
 /// Read-triggered compaction (PickReadTriggeredCompaction) picks the files marked from the sampled reads
 /// (monitoring/file_read_sample.h, VersionStorageInfo::ComputeFilesMarkedForReadTriggeredCompaction).
-/// Not ported: standalone range tombstone files (FileIsStandAloneRangeTombstone needs the
-/// per-file entry counts, which the port does not keep: such files are treated like other marked files).
+/// </para>
+/// <para>
+/// Standalone range tombstone files (FileMetaData::FileIsStandAloneRangeTombstone, e.g. the tombstone of an atomic
+/// replace ingestion) are marked for compaction. A sorted run holding one is left to the delete-triggered compaction
+/// (level_has_marked_standalone_rangedel: size amp, size ratio, sorted-run count and periodic compactions stop at it),
+/// which defers the file while the earliest snapshot does not see it (ShouldSkipMarkedFile; earliest_snapshot_ and
+/// snapshot_checker_ from the live snapshots, not with user-defined timestamps) and, from L0, does not pull newer L0 files
+/// into it (starting_l0_file). Releasing the snapshot reschedules the compaction (DBImpl::ReleaseSnapshot with
+/// standalone_range_deletion_files_mark_threshold_). Not ported: Compaction::FilterInputsForCompactionIterator (input
+/// files fully covered by the tombstone are still read by the compaction instead of being dropped unread; the output is
+/// the same, only the I/O differs).
+/// </para>
+/// <para>
 /// Outputs are placed on db_paths with GetUniversalPathId. require_max_output_level is used by the bottom-priority repick of
 /// reduce_file_locking (DBImpl::BackgroundCompaction). REQUIRES: DB mutex.
 /// </para>
@@ -21,7 +32,8 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
 {
     public UniversalCompactionPicker(ColumnFamilyOptions options, InternalKeyComparator icmp) : base(options, icmp) { }
 
-    private readonly struct SortedRun(int level, FileMetaData? file, ulong size, ulong compensatedSize, bool beingCompacted)
+    private readonly struct SortedRun(int level, FileMetaData? file, ulong size, ulong compensatedSize, bool beingCompacted,
+        bool levelHasMarkedStandaloneRangeDel)
     {
         public readonly int Level = level;
         /// <summary>The file for an L0 run, null for a level run.</summary>
@@ -29,6 +41,11 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         public readonly ulong Size = size;
         public readonly ulong CompensatedSize = compensatedSize;
         public readonly bool BeingCompacted = beingCompacted;
+        /// <summary>
+        /// level_has_marked_standalone_rangedel: the run has a standalone range tombstone file marked for compaction.
+        /// Best effort is made to make only deletion triggered compaction pick this type of file.
+        /// </summary>
+        public readonly bool LevelHasMarkedStandaloneRangeDel = levelHasMarkedStandaloneRangeDel;
     }
 
     /// <summary>Port of UniversalCompactionPicker::NeedsCompaction.</summary>
@@ -43,13 +60,15 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         var ret = new List<SortedRun>();
         foreach (FileMetaData f in vstorage.LevelFiles(0))
         {
-            ret.Add(new SortedRun(0, f, f.FileSize, VersionStorageInfo.CompensatedFileSize(f), f.BeingCompacted));
+            ret.Add(new SortedRun(0, f, f.FileSize, VersionStorageInfo.CompensatedFileSize(f), f.BeingCompacted,
+                f.MarkedForCompaction && f.FileIsStandAloneRangeTombstone()));
             maxRunSize = Math.Max(maxRunSize, f.FileSize);
         }
         for (int level = 1; level <= lastLevel && level < vstorage.NumLevels; level++)
         {
             ulong compensated = 0, total = 0;
             bool beingCompacted = false;
+            bool levelHasMarkedStandaloneRangeDel = false;
             foreach (FileMetaData f in vstorage.LevelFiles(level))
             {
                 compensated += VersionStorageInfo.CompensatedFileSize(f);
@@ -59,8 +78,9 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
                 // check all files in a sorted run and mark the entire run as being compacted if one or more files are
                 // being compacted.
                 if (f.BeingCompacted) beingCompacted = true;
+                levelHasMarkedStandaloneRangeDel = levelHasMarkedStandaloneRangeDel || (f.MarkedForCompaction && f.FileIsStandAloneRangeTombstone());
             }
-            if (compensated > 0) ret.Add(new SortedRun(level, null, total, compensated, beingCompacted));
+            if (compensated > 0) ret.Add(new SortedRun(level, null, total, compensated, beingCompacted, levelHasMarkedStandaloneRangeDel));
             maxRunSize = Math.Max(maxRunSize, total);
         }
         return ret;
@@ -75,6 +95,48 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         public double Score;
         /// <summary>require_max_output_level_: only compactions to the non-zero max output level (bottom-priority repick).</summary>
         public bool RequireMaxOutputLevel;
+        /// <summary>
+        /// earliest_snapshot_: the oldest live snapshot, kMaxSequenceNumber without snapshots; null with user-defined
+        /// timestamps (the parameters are only passed when they are not enabled).
+        /// </summary>
+        public ulong? EarliestSnapshot;
+        /// <summary>snapshot_checker_ (WritePrepared / WriteUnprepared transactions, sequence-per-batch DBs).</summary>
+        public SnapshotChecker? SnapshotChecker;
+
+        /// <summary>
+        /// Port of UniversalCompactionBuilder::ShouldSkipMarkedFile: a marked standalone range tombstone file waits until
+        /// the earliest snapshot sees it (DB::ReleaseSnapshot re-examines it then), and while the next older sorted run
+        /// has a marked standalone range tombstone file too (such a file is best used as the start input level, so that
+        /// compaction goes first). <paramref name="level"/> is the file's level: upstream looks the file's sorted run up
+        /// in file_marked_for_compaction_to_sorted_run_index_, filled by CalculateSortedRuns; the port finds it in the
+        /// (short) run list instead of building that map on every pick.
+        /// </summary>
+        public bool ShouldSkipMarkedFile(int level, FileMetaData file)
+        {
+            System.Diagnostics.Debug.Assert(file.MarkedForCompaction);
+            if (EarliestSnapshot is not { } earliestSnapshot) return false;
+            if (!file.FileIsStandAloneRangeTombstone()) return false;
+            // Skip until earliest snapshot advances at or above this standalone range tombstone file.
+            // `DB::ReleaseSnapshot` will re-examine and schedule compaction for it.
+            if (!SnapshotChecker.DataIsDefinitelyInSnapshot(file.LargestSeqno, earliestSnapshot, SnapshotChecker)) return true;
+            int idx = SortedRunIndexOf(level, file);
+            System.Diagnostics.Debug.Assert(idx >= 0);
+            // Marked standalone range tombstone file is best used if it's in the start input level. Skip to let that
+            // compaction happen first.
+            return idx >= 0 && idx < Runs.Count - 1 && Runs[idx + 1].LevelHasMarkedStandaloneRangeDel;
+        }
+
+        /// <summary>The sorted run holding <paramref name="file"/> of <paramref name="level"/>, or -1.</summary>
+        private int SortedRunIndexOf(int level, FileMetaData file)
+        {
+            List<SortedRun> runs = Runs;
+            for (int i = 0; i < runs.Count; i++)
+            {
+                SortedRun r = runs[i];
+                if (level == 0 ? ReferenceEquals(r.File, file) : r.Level == level) return i;
+            }
+            return -1;
+        }
 
         /// <summary>UniversalCompactionBuilder::MeetsOutputLevelRequirements.</summary>
         public bool MeetsOutputLevelRequirements(int outputLevel, int maxOutputLevel) =>
@@ -83,14 +145,20 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
 
     /// <summary>Port of UniversalCompactionBuilder::PickCompaction.</summary>
     public override Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots) =>
-        PickCompaction(vstorage, snapshots, requireMaxOutputLevel: false);
+        PickCompaction(vstorage, snapshots, null, requireMaxOutputLevel: false);
+
+    /// <summary>Port of UniversalCompactionBuilder::PickCompaction (no snapshot checker).</summary>
+    public override Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots, bool requireMaxOutputLevel) =>
+        PickCompaction(vstorage, snapshots, null, requireMaxOutputLevel);
 
     /// <summary>
     /// Port of UniversalCompactionBuilder::PickCompaction. With <paramref name="requireMaxOutputLevel"/> (a
     /// bottom-priority thread repicking a compaction forwarded with reduce_file_locking) only compactions that output to
-    /// the non-zero max output level are picked.
+    /// the non-zero max output level are picked. <paramref name="snapshots"/> (ascending) and
+    /// <paramref name="snapshotChecker"/> decide when a standalone range tombstone file may be compacted.
     /// </summary>
-    public override Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots, bool requireMaxOutputLevel)
+    public override Compaction? PickCompaction(VersionStorageInfo vstorage, IReadOnlyList<ulong> snapshots, SnapshotChecker? snapshotChecker,
+        bool requireMaxOutputLevel)
     {
         int maxOutputLevel = vstorage.MaxOutputLevel(Options.AllowIngestBehind);
         if (maxOutputLevel == 0 && requireMaxOutputLevel) return null; // !MeetsOutputLevelRequirements(0)
@@ -111,6 +179,12 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
             Score = vstorage.CompactionScore(0),
             RequireMaxOutputLevel = requireMaxOutputLevel,
         };
+        // These parameters are only passed when user-defined timestamp is not enabled.
+        if (Icmp.UserComparator.TimestampSize == 0)
+        {
+            b.EarliestSnapshot = snapshots.Count == 0 ? DbFormat.MaxSequenceNumber : snapshots[0];
+            b.SnapshotChecker = snapshotChecker;
+        }
 
         Compaction? c = null;
         // MaybePickPeriodicCompaction
@@ -176,7 +250,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         int notCompacted = 0;
         foreach (SortedRun r in b.Runs)
         {
-            if (!r.BeingCompacted) notCompacted++;
+            if (!r.BeingCompacted && !r.LevelHasMarkedStandaloneRangeDel) notCompacted++;
         }
         return notCompacted > maxNumRuns ? (uint)(notCompacted - maxNumRuns + 1) : 0;
     }
@@ -200,7 +274,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
             bool found = false;
             for (; loop < runs.Count; loop++)
             {
-                if (!runs[loop].BeingCompacted)
+                if (!runs[loop].BeingCompacted && !runs[loop].LevelHasMarkedStandaloneRangeDel)
                 {
                     candidateCount = 1;
                     found = true;
@@ -212,7 +286,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
             for (int i = loop + 1; candidateCount < maxFilesToCompact && i < runs.Count; i++)
             {
                 SortedRun succeeding = runs[i];
-                if (succeeding.BeingCompacted) break;
+                if (succeeding.BeingCompacted || succeeding.LevelHasMarkedStandaloneRangeDel) break;
                 // Pick files if the total/last candidate file size (increased by the specified ratio) is still larger
                 // than the next candidate file.
                 double sz = candidateSize * (100.0 + ratio) / 100.0;
@@ -295,7 +369,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         // ShouldSkipLastSortedRunForSizeAmpCompaction: with per-key placement the last sorted run (the last level) is
         // left out, the size amplification compaction then ends at the proximal level.
         int endIndex = ShouldSkipLastSortedRunForSizeAmpCompaction(runs) ? runs.Count - 2 : runs.Count - 1;
-        if (runs[endIndex].BeingCompacted) return null;
+        if (runs[endIndex].BeingCompacted || runs[endIndex].LevelHasMarkedStandaloneRangeDel) return null;
         ulong baseSrSize = runs[endIndex].Size;
         int startIndex = endIndex;
         ulong candidateSize = 0;
@@ -304,7 +378,8 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         while (startIndex > 0)
         {
             SortedRun sr = runs[startIndex - 1];
-            if (sr.BeingCompacted) break;
+            // Stop at a run undergoing compaction or with standalone range tombstone files marked for compaction.
+            if (sr.BeingCompacted || sr.LevelHasMarkedStandaloneRangeDel) break;
             candidateSize += sr.CompensatedSize;
             if (sr.Level == 0) numL0Files++;
             --startIndex;
@@ -462,7 +537,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         }
         if (!ExpandInputsToCleanCut(vstorage, secondLastLevelInputs)) return null;
         int parentIndex = -1;
-        if (!SetupOtherInputs(vstorage, secondLastLevelInputs, bottomLevelInputs, ref parentIndex, -1, false)) return null;
+        if (!SetupOtherInputs(vstorage, secondLastLevelInputs, bottomLevelInputs, ref parentIndex, -1, false, null)) return null;
 
         // Try to include files in upper levels if they fall into the range. We go from lower level up, the reverse of
         // the level order, so they are collected reversed first.
@@ -515,7 +590,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
             {
                 if (runs[loop].BeingCompacted) continue;
                 FileMetaData f = l0[loop];
-                if (f.MarkedForCompaction)
+                if (f.MarkedForCompaction && !b.ShouldSkipMarkedFile(0, f))
                 {
                     startLevelInputs.Files.Add(f);
                     startIndex = loop; // Consider this as the first candidate.
@@ -525,7 +600,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
             if (startIndex < 0) return null; // Either no file marked, or they're already being compacted.
             for (int loop = startIndex + 1; loop < runs.Count; loop++)
             {
-                if (runs[loop].BeingCompacted) break;
+                if (runs[loop].BeingCompacted || runs[loop].LevelHasMarkedStandaloneRangeDel) break;
                 startLevelInputs.Files.Add(l0[loop]);
             }
         }
@@ -533,7 +608,8 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         {
             // For multi-level universal, the strategy is to make this look more like leveled. We pick one of the files
             // marked for compaction and compact with overlapping files in the adjacent level.
-            PickFilesMarkedForCompaction(vstorage, out _, out _, startLevelInputs);
+            PickFilesMarkedForCompaction(vstorage, out _, out _, startLevelInputs, b,
+                static (Builder builder, int level, FileMetaData file) => builder.ShouldSkipMarkedFile(level, file));
             if (startLevelInputs.IsEmpty) return null;
         }
         return BuildCompactionToNextLevel(b, startLevelInputs, CompactionReason.FilesMarkedForCompaction);
@@ -564,7 +640,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         if (vstorage.NumLevels == 1 && startLevelInputs.Level == 0)
         {
             int unusedParentIndex = -1;
-            if (!GetOverlappingL0Files(vstorage, startLevelInputs, 0, ref unusedParentIndex)) return null;
+            if (!GetOverlappingL0Files(vstorage, startLevelInputs, 0, ref unusedParentIndex, null)) return null;
         }
         return BuildCompactionToNextLevel(b, startLevelInputs, CompactionReason.ReadTriggered);
     }
@@ -599,14 +675,18 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         if (outputLevel != 0)
         {
             if (!b.MeetsOutputLevelRequirements(outputLevel, maxOutputLevel)) return null;
+            // For standalone range deletion, we don't want to compact it with newer L0 files that it doesn't cover.
+            FileMetaData? startingL0File = startLevel == 0 && startLevelInputs.Count == 1 && startLevelInputs.Files[0].FileIsStandAloneRangeTombstone()
+                ? startLevelInputs.Files[0]
+                : null;
             if (startLevel == 0)
             {
                 int unusedParentIndex = -1;
-                if (!GetOverlappingL0Files(vstorage, startLevelInputs, outputLevel, ref unusedParentIndex)) return null;
+                if (!GetOverlappingL0Files(vstorage, startLevelInputs, outputLevel, ref unusedParentIndex, startingL0File)) return null;
             }
             var outputLevelInputs = new CompactionInputFiles(outputLevel);
             int parentIndex = -1;
-            if (!SetupOtherInputs(vstorage, startLevelInputs, outputLevelInputs, ref parentIndex, -1, false)) return null;
+            if (!SetupOtherInputs(vstorage, startLevelInputs, outputLevelInputs, ref parentIndex, -1, false, startingL0File)) return null;
             inputs.Add(startLevelInputs);
             if (!outputLevelInputs.IsEmpty) inputs.Add(outputLevelInputs);
             if (FilesRangeOverlapWithCompaction(b.Vstorage, inputs, outputLevel)) return null;
@@ -633,7 +713,7 @@ internal sealed class UniversalCompactionPicker : CompactionPicker
         // the problem, we just try to trigger a full compaction. We start from the oldest sorted run and include all
         // sorted runs, until we hit a sorted already being compacted.
         int startIndex = runs.Count;
-        while (startIndex > 0 && !runs[startIndex - 1].BeingCompacted) startIndex--;
+        while (startIndex > 0 && !runs[startIndex - 1].BeingCompacted && !runs[startIndex - 1].LevelHasMarkedStandaloneRangeDel) startIndex--;
         if (startIndex == runs.Count) return null;
         // There is a rare corner case where we can't pick up all the files because some files are being compacted and
         // we end up with picking files but none of them need periodic compaction. Unless we simply recompact the last

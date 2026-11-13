@@ -242,7 +242,9 @@ static void parse_flags(int argc, char** argv) {
     else if (FLAG("warmup")) FLAGS.warmup = parse_bool(value);
     else if (FLAG("warmup_ops")) FLAGS.warmup_ops = strtoll(value, NULL, 10);
     else if (FLAG("warmup_min_ms")) FLAGS.warmup_min_ms = atoi(value);
-    else if (FLAG("engine") || FLAG("async")) { /* accepted for runner parity */ }
+    else if (FLAG("engine") || FLAG("async") || FLAG("warmup_write_rounds") || FLAG("warmup_write_rounds_ms")) {
+      /* accepted for runner parity (the write rounds are .NET only: nothing to compile here) */
+    }
     else {
       fprintf(stderr, "unknown flag --%s\n", name);
       usage();

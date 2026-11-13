@@ -10,6 +10,17 @@ namespace RocksDb.Managed.Db;
 internal readonly record struct DbIdentity(string DbId, string SessionId, string HostId);
 
 /// <summary>
+/// What BuildTable (db/builder.cc) gets from the job that writes the table, besides the snapshot list.
+/// </summary>
+/// <param name="Reason">Flush or Recovery (WriteLevel0TableForRecovery).</param>
+/// <param name="EarliestWriteConflictSnapshot">
+/// earliest_write_conflict_snapshot: the oldest snapshot used for write-conflict checking (kMaxSequenceNumber if none);
+/// a single delete and its value in a newer stripe are not both dropped.
+/// </param>
+/// <param name="EnforceSingleDelContracts">DBOptions::enforce_single_del_contracts.</param>
+internal readonly record struct FlushJobContext(TableFileCreationReason Reason, ulong EarliestWriteConflictSnapshot, bool EnforceSingleDelContracts);
+
+/// <summary>
 /// Writes memtables to a level-0 table file. Port of FlushJob::WriteLevel0Table (db/flush_job.cc) and BuildTable
 /// (db/builder.cc): merges the point entries of the memtables in internal-key order, writes the fragmented range
 /// tombstones, finishes and syncs the file and fills in its <see cref="FileMetaData"/>.
@@ -45,7 +56,8 @@ internal static class FlushJob
     /// version the flush is based on (FlushJob's base_, which the caller keeps referenced; null for a recovery flush):
     /// with it the file's compensated_range_deletion_size is the approximate size of the data in that version its range
     /// tombstones cover. <paramref name="flushStatistics"/>: where the memtable payload and garbage bytes of the flush
-    /// are recorded (TableFileCreationReason::kFlush only), or null.
+    /// are recorded (TableFileCreationReason::kFlush only), or null. <paramref name="job"/>: what BuildTable gets from
+    /// the job besides the snapshot list.
     /// </summary>
     /// <remarks>
     /// <paramref name="snapshotChecker"/> is the DB's snapshot checker (WritePrepared / WriteUnprepared, or
@@ -56,10 +68,16 @@ internal static class FlushJob
     public static async ValueTask<FileMetaData?> WriteLevel0TableAsync(IFileSystem fs, string path, WritableFileOptions fileOptions, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
         ulong fileNumber, ulong epochNumber, DbIdentity identity, ulong[] snapshots, SnapshotChecker? snapshotChecker, Blob.BlobFileBuilder? blobBuilder,
         Blob.BlobGarbageMeter? blobOutflow, SeqnoToTimeMapping? seqnoToTimeMapping, VersionStorageInfo? baseVersion,
-        Statistics? flushStatistics, bool synchronous, CancellationToken cancellationToken)
+        Statistics? flushStatistics, FlushJobContext job, bool synchronous, CancellationToken cancellationToken)
     {
         bool stripTimestamps = cfd.TimestampsInMemtableOnly;
-        ValidateFlushCompactionFilter(cfd);
+        CompactionFilter? filter = CreateFlushCompactionFilter(cfd);
+        // BuildTable: OutputValidator(enable_hash = paranoid_file_checks); the read-back after the file is finished
+        // compares the hash. The hash is kept by the CompactionIterator path and the timestamp-stripping path; the plain
+        // copy loop has none (it is only taken with paranoid_file_checks when a snapshot checker is set).
+        bool paranoid = cfd.Options.ParanoidFileChecks;
+        bool paranoidHashKept = false;
+        ulong paranoidHash = 0;
         ulong now = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         // FlushJob::WriteLevel0Table: oldest_key_time = mems_.front()->ApproximateOldestKeyTime() (the oldest memtable,
         // whose first insert precedes every insert into the later ones: the minimum over all of them). It is not
@@ -111,7 +129,14 @@ internal static class FlushJob
                 FragmentedRangeTombstoneList? tombstones = FragmentRangeTombstones(cfd, mems, stripTimestamps);
                 if (stripTimestamps)
                 {
-                    AddPointEntriesWithMinTimestamp(builder, cfd, mems, meta, blobBuilder, snapshots, tombstones, ref inputPayloadBytes);
+                    AddPointEntriesWithMinTimestamp(builder, cfd, mems, meta, blobBuilder, snapshots, tombstones, ref inputPayloadBytes, ref paranoidHash);
+                    paranoidHashKept = true;
+                }
+                else if (snapshotChecker is null && (filter is not null || paranoid || NeedsCompactionIterator(cfd, mems, tombstones)))
+                {
+                    smallestPreferredSeqno = AddPointEntriesThroughCompactionIterator(builder, cfd, mems, meta, snapshots, job, tombstones, filter,
+                        blobBuilder, blobOutflow, seqnoToTimeMapping, baseVersion, ref inputPayloadBytes, ref paranoidHash);
+                    paranoidHashKept = true;
                 }
                 else
                 {
@@ -182,6 +207,8 @@ internal static class FlushJob
             }
         }
         if (!keep) return null;
+        TestHooks.Invoke("BuildTable:BeforeOutputValidation");
+        if (paranoid) VerifyParanoid(fs, path, cfd, meta, paranoidHashKept, paranoidHash);
         // BuildTable: GetSstInternalUniqueId(db_id, db_session_id, file number) (force = false).
         if (identity.DbId.Length > 0 && identity.SessionId.Length > 0)
         {
@@ -192,17 +219,171 @@ internal static class FlushJob
     }
 
     /// <summary>
-    /// BuildTable (db/builder.cc): a filter the CF's compaction filter factory creates for the flush
-    /// (ShouldFilterTableFileCreation(kFlush)) must ignore snapshots, else the flush fails with NotSupported. Flush-time
-    /// filtering itself is not ported: such a filter is not applied (see README "Not ported yet").
+    /// BuildTable (db/builder.cc) with paranoid_file_checks: the new table is opened through the table cache and every
+    /// point entry read back; the rolling NPHash64 of the keys and values read must equal the one of the entries added
+    /// (OutputValidator::CompareValidator), else the flush fails with Corruption "Paranoid checksums do not match" and
+    /// the file is deleted (and dropped from the table cache). Without a kept hash (snapshot checker) the read-back only
+    /// checks that every block reads. Cold path: once per flush.
     /// </summary>
-    private static void ValidateFlushCompactionFilter(ColumnFamilyData cfd)
+    private static void VerifyParanoid(IFileSystem fs, string path, ColumnFamilyData cfd, FileMetaData meta, bool compareHash, ulong expected)
     {
-        if (cfd.Options.CompactionFilterFactory is not { } factory || !factory.ShouldFilterTableFileCreation(isFlush: true)) return;
+        try
+        {
+            ulong hash = 0;
+            using (TableReaderLease lease = cfd.TableCache.GetReader(meta))
+            using (Iterators.InternalIterator it = lease.Reader.NewInternalIterator(TableReadFlags.None, null, null))
+            {
+                for (it.SeekToFirst(); it.Valid; it.Next()) hash = Hash.NPHash64(it.Value, Hash.NPHash64(it.Key, hash));
+            }
+            if (compareHash && hash != expected) ThrowHelper.Corruption("Paranoid checksums do not match");
+        }
+        catch (Exception e) when (e is RocksDbException or IOException)
+        {
+            cfd.TableCache.Evict(meta.FileNumber);
+            try { fs.DeleteFile(path); }
+            catch (IOException) { }
+            catch (RocksDbException) { }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// BuildTable (db/builder.cc): the filter the CF's compaction filter factory creates for this table file when
+    /// ShouldFilterTableFileCreation(reason) allows it (Context: not a full compaction, not manual, the CF's id, the
+    /// reason), or null. CompactionFilterFactory.ShouldFilterTableFileCreation takes "isFlush" rather than the reason, so
+    /// a recovery flush (kRecovery) asks the same question as a flush. The plain <c>compaction_filter</c> option is never
+    /// applied to flushes, like upstream (it is only ioptions.compaction_filter_factory there). A filter that does not
+    /// ignore snapshots fails the flush with NotSupported.
+    /// </summary>
+    private static CompactionFilter? CreateFlushCompactionFilter(ColumnFamilyData cfd)
+    {
+        if (cfd.Options.CompactionFilterFactory is not { } factory || !factory.ShouldFilterTableFileCreation(isFlush: true)) return null;
         CompactionFilter? filter = factory.CreateCompactionFilter(new CompactionFilterContext(false, false, cfd.Id, IsFlush: true));
         if (filter is not null && !filter.IgnoreSnapshots)
         {
             ThrowHelper.NotSupported(CompactionFilter.IgnoreSnapshotsFalseMessage);
+        }
+        return filter;
+    }
+
+    /// <summary>
+    /// Whether the point entries must be read through a <see cref="CompactionIterator"/>, as BuildTable always does.
+    /// The plain copy loop (AddPointEntries) writes what that iterator would write when the memtables hold only Put /
+    /// Delete / blob index / entity entries and nothing can remove one of them: no merge operand, single delete or
+    /// TimedPut entry (<see cref="MemTable.HasFlushResolvedEntries"/>) and no range tombstone that could cover a key
+    /// (with user-defined timestamps a tombstone covers nothing at flush: no full_history_ts_low is given to it).
+    /// </summary>
+    private static bool NeedsCompactionIterator(ColumnFamilyData cfd, IReadOnlyList<MemTable> mems, FragmentedRangeTombstoneList? tombstones)
+    {
+        if (tombstones is not null && cfd.TimestampSize == 0) return true;
+        for (int i = 0; i < mems.Count; i++)
+        {
+            if (mems[i].HasFlushResolvedEntries) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// The point entries as BuildTable (db/builder.cc) writes them: the memtables are read through a
+    /// <see cref="CompactionIterator"/> without a compaction (nothing is known about older data), so merge operands are
+    /// combined by <see cref="MergeHelper.MergeUntil"/> up to the next snapshot or base value, single deletes meet the
+    /// values they delete, versions hidden in their snapshot stripe and keys covered by a range tombstone of the same
+    /// stripe are dropped; <paramref name="filter"/> (the factory's flush filter) sees the newest version of each key
+    /// and the merge operands newer than every snapshot. TimedPut entries get their preferred seqno here, like in
+    /// BuildTable's loop. Returns the
+    /// smallest preferred seqno written (kMaxSequenceNumber if none). Allocates per flush, not per entry.
+    /// </summary>
+    private static ulong AddPointEntriesThroughCompactionIterator(TableBuilder builder, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
+        FileMetaData meta, ulong[] snapshots, FlushJobContext job, FragmentedRangeTombstoneList? tombstones, CompactionFilter? filter,
+        Blob.BlobFileBuilder? blobBuilder,
+        Blob.BlobGarbageMeter? blobOutflow, SeqnoToTimeMapping? seqnoToTimeMapping, VersionStorageInfo? baseVersion, ref ulong inputPayloadBytes,
+        ref ulong paranoidHash)
+    {
+        InternalKeyComparator icmp = cfd.Icmp;
+        bool hashOutput = cfd.Options.ParanoidFileChecks;
+        Iterators.InternalIterator input;
+        if (mems.Count == 1)
+        {
+            input = new Iterators.MemTableInternalIterator(mems[0]);
+        }
+        else
+        {
+            var children = new Iterators.InternalIterator[mems.Count];
+            for (int i = 0; i < children.Length; i++) children[i] = new Iterators.MemTableInternalIterator(mems[i]);
+            input = new Iterators.MergingIterator(icmp, children);
+        }
+        // BuildTable: CompactionRangeDelAggregator(icmp, snapshots, full_history_ts_low) over the memtables' tombstones.
+        RangeDelAggregator rangeDel = RangeDelAggregator.ForCompaction(icmp, snapshots, null);
+        if (tombstones is not null) rangeDel.AddTombstones(tombstones);
+        // BuildTable: MergeHelper(env, ucmp, merge_operator, compaction_filter, logger, true, snapshots.back(), checker);
+        // the level given to the filter is 0 (CompactionIterator without a compaction, MergeHelper's default level).
+        MergeOperator? mergeOperator = cfd.MergeOperator;
+        MergeHelper? merge = mergeOperator is null ? null : new MergeHelper(icmp, mergeOperator, filter, snapshots.Length == 0 ? 0 : snapshots[^1], 0);
+        // The flush's BlobFileBuilder (ExtractLargeValueIfNeeded / ExtractLargeColumnValuesIfNeeded in PrepareOutput) and
+        // c_iter.SetBlobFetcher(version, ...): blob base values of merges are read from the base version.
+        Blob.CompactionBlobProcessor? blob = baseVersion is not null || blobBuilder is not null
+            ? new Blob.CompactionBlobProcessor(blobBuilder, cfd.BlobSource, baseVersion ?? cfd.Current.Storage, enableGc: false, 0)
+            : null;
+        if (merge is not null) merge.BlobProcessor = blob;
+        var iter = new CompactionIterator(input, icmp, merge, snapshots, job.EarliestWriteConflictSnapshot, rangeDel, null, filter,
+            job.EnforceSingleDelContracts, CancellationToken.None)
+        {
+            BlobProcessor = blob,
+        };
+        var timed = new TimedPutRewriter(seqnoToTimeMapping);
+        var lastKey = new PooledBufferWriter(64);
+        try
+        {
+            bool first = true;
+            input.SeekToFirst();
+            for (iter.SeekToFirst(); iter.Valid; iter.Next())
+            {
+                ReadOnlySpan<byte> key = iter.Key;
+                ReadOnlySpan<byte> value = iter.Value;
+                EntryType type = iter.Type;
+                ulong seq = iter.Sequence;
+                if (type == EntryType.ValuePreferredSeqno)
+                {
+                    timed.Rewrite(key, seq, value, out key, out value, out type);
+                }
+                builder.Add(key, value);
+                // OutputValidator::Add(key_after_flush, value_after_flush)
+                if (hashOutput) paranoidHash = Hash.NPHash64(value, Hash.NPHash64(key, paranoidHash));
+                // meta->UpdateBoundaries(key_after_flush, value_after_flush, ikey.sequence, ikey.type)
+                if (type == EntryType.BlobIndex)
+                {
+                    UpdateOldestBlobFileNumber(meta, value);
+                    blobOutflow?.ProcessOutFlow(key, value);
+                }
+                else if (type == EntryType.WideColumnEntity)
+                {
+                    UpdateOldestBlobFileNumberForEntity(meta, value);
+                    blobOutflow?.ProcessOutFlow(key, value);
+                }
+                if (seq < meta.SmallestSeqno) meta.SmallestSeqno = seq;
+                if (seq > meta.LargestSeqno) meta.LargestSeqno = seq;
+                if (first)
+                {
+                    meta.Smallest = key.ToArray();
+                    first = false;
+                }
+                lastKey.Clear();
+                lastKey.Write(key);
+            }
+            if (!first) meta.Largest = lastKey.WrittenSpan.ToArray();
+            // BuildTable: ci_stats.total_input_raw_key_bytes + total_input_raw_value_bytes (the entries the iterator read
+            // itself; operands consumed inside MergeUntil are not counted, as upstream).
+            inputPayloadBytes += (ulong)(iter.Stats.TotalInputRawKeyBytes + iter.Stats.TotalInputRawValueBytes);
+            return timed.SmallestPreferredSeqno;
+        }
+        finally
+        {
+            lastKey.Dispose();
+            timed.Dispose();
+            iter.Dispose();
+            merge?.Dispose();
+            blob?.Dispose();
+            input.Dispose();
         }
     }
 
@@ -290,6 +471,39 @@ internal static class FlushJob
                 Util.Coding.EncodeFixed64(_key.WrittenSpanMutable[^DbFormat.InternalKeyFooterSize..], (seq << 8) | (byte)EntryType.Value);
                 builder.Add(_key.WrittenSpan, _value.WrittenSpan);
             }
+        }
+
+        /// <summary>
+        /// The key, value and type BuildTable writes for a TimedPut entry (key_after_flush / value_after_flush); the
+        /// spans stay valid until the next call.
+        /// </summary>
+        public void Rewrite(ReadOnlySpan<byte> key, ulong seq, ReadOnlySpan<byte> packedValue, out ReadOnlySpan<byte> keyAfterFlush,
+            out ReadOnlySpan<byte> valueAfterFlush, out EntryType typeAfterFlush)
+        {
+            _key ??= new Util.PooledBufferWriter(64);
+            _value ??= new Util.PooledBufferWriter(64);
+            ulong writeTime = Util.Coding.DecodeFixed64(packedValue[^8..]);
+            ulong preferred = mapping is not null ? mapping.GetProximalSeqnoBeforeTime(writeTime) : DbFormat.MaxSequenceNumber;
+            _value.Clear();
+            _value.Write(packedValue[..^8]);
+            _key.Clear();
+            _key.Write(key);
+            if (preferred < seq)
+            {
+                // PackValueAndSeqno
+                Util.Coding.EncodeFixed64(_value.GetSpan(8), preferred);
+                _value.Advance(8);
+                SmallestPreferredSeqno = Math.Min(SmallestPreferredSeqno, preferred);
+                typeAfterFlush = EntryType.ValuePreferredSeqno;
+            }
+            else
+            {
+                // Cannot get a useful preferred seqno, convert it to a kTypeValue.
+                Util.Coding.EncodeFixed64(_key.WrittenSpanMutable[^DbFormat.InternalKeyFooterSize..], (seq << 8) | (byte)EntryType.Value);
+                typeAfterFlush = EntryType.Value;
+            }
+            keyAfterFlush = _key.WrittenSpan;
+            valueAfterFlush = _value.WrittenSpan;
         }
 
         public void Dispose()
@@ -399,8 +613,10 @@ internal static class FlushJob
     /// <paramref name="snapshots"/> are the live snapshot sequence numbers, ascending. Cold path (allocates per flush).
     /// </summary>
     private static void AddPointEntriesWithMinTimestamp(TableBuilder builder, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
-        FileMetaData meta, Blob.BlobFileBuilder? blobBuilder, ulong[] snapshots, FragmentedRangeTombstoneList? tombstones, ref ulong inputPayloadBytes)
+        FileMetaData meta, Blob.BlobFileBuilder? blobBuilder, ulong[] snapshots, FragmentedRangeTombstoneList? tombstones, ref ulong inputPayloadBytes,
+        ref ulong paranoidHash)
     {
+        bool hashOutput = cfd.Options.ParanoidFileChecks;
         InternalKeyComparator icmp = cfd.Icmp;
         int ts = cfd.TimestampSize;
         int n = mems.Count;
@@ -465,14 +681,16 @@ internal static class FlushJob
                 its[best].Next();
                 continue;
             }
+            ReadOnlySpan<byte> written = value;
             if (blobBuilder is not null && type == EntryType.Value)
             {
                 blobIndex.Clear();
                 if (blobBuilder.Add(DbFormat.ExtractUserKey(key.WrittenSpan), value, blobIndex))
                 {
                     Util.Coding.EncodeFixed64(key.WrittenSpanMutable[^DbFormat.InternalKeyFooterSize..], (footer & ~0xFFUL) | (byte)EntryType.BlobIndex);
-                    builder.Add(key.WrittenSpan, blobIndex.WrittenSpan);
-                    UpdateOldestBlobFileNumber(meta, blobIndex.WrittenSpan);
+                    written = blobIndex.WrittenSpan;
+                    builder.Add(key.WrittenSpan, written);
+                    UpdateOldestBlobFileNumber(meta, written);
                 }
                 else
                 {
@@ -481,13 +699,14 @@ internal static class FlushJob
             }
             else if (type == EntryType.WideColumnEntity)
             {
-                AddEntity(builder, meta, key.WrittenSpan, value, blobBuilder, entities);
+                written = AddEntity(builder, meta, key.WrittenSpan, value, blobBuilder, entities);
             }
             else
             {
                 builder.Add(key.WrittenSpan, value);
                 if (type == EntryType.BlobIndex) UpdateOldestBlobFileNumber(meta, value);
             }
+            if (hashOutput) paranoidHash = Hash.NPHash64(written, Hash.NPHash64(key.WrittenSpan, paranoidHash));
             if (seq < meta.SmallestSeqno) meta.SmallestSeqno = seq;
             if (seq > meta.LargestSeqno) meta.LargestSeqno = seq;
             if (first)
@@ -551,12 +770,13 @@ internal static class FlushJob
     /// Adds an entity to the flush output: CompactionIterator::ExtractLargeColumnValuesIfNeeded when the output gets
     /// blob files (flush runs through a CompactionIterator upstream), then the blob part of UpdateBoundaries.
     /// </summary>
-    private static void AddEntity(TableBuilder builder, FileMetaData meta, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity,
+    private static ReadOnlySpan<byte> AddEntity(TableBuilder builder, FileMetaData meta, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity,
         Blob.BlobFileBuilder? blobBuilder, Blob.EntityBlobRewriter? entities)
     {
         if (blobBuilder is not null && entities!.TryExtract(blobBuilder, DbFormat.ExtractUserKey(key), entity)) entity = entities.Output;
         builder.Add(key, entity);
         UpdateOldestBlobFileNumberForEntity(meta, entity);
+        return entity;
     }
 
     /// <summary>

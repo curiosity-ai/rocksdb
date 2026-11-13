@@ -156,6 +156,7 @@ internal sealed partial class DbImpl
     {
         List<WriteThread.Writer> group = _nonmemGroup;
         _nonmemWriteThread!.EnterAsBatchGroupLeader(leader, group);
+        bool preprocessed = false;
         try
         {
             if (IsDisposed) ThrowDisposed();
@@ -167,6 +168,7 @@ internal sealed partial class DbImpl
                 await DelayWriteAsync(leader.NoSlowdown, synchronous, cancellationToken, countGroupBytes: false).ConfigureAwait(false);
                 RecordWriteStall(stallStart);
             }
+            preprocessed = true;
             int valid = 0;
             ulong seqInc = 0;
             bool needSync = false;
@@ -317,7 +319,8 @@ internal sealed partial class DbImpl
         }
         catch (Exception e)
         {
-            for (int i = 0; i < group.Count; i++) group[i].Error ??= e;
+            if (!preprocessed && IsLeaderCancellation(e, cancellationToken)) CancelStalledLeader(_nonmemWriteThread, group, leader, e);
+            else for (int i = 0; i < group.Count; i++) group[i].Error ??= e;
         }
         finally
         {

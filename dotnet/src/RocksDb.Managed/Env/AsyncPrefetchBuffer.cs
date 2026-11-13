@@ -47,9 +47,13 @@ public sealed class AsyncPrefetchBuffer : IDisposable
     private long _nextOffset = -1;
 
     // The pending prefetch: _hasPending while a read was issued and its result not consumed. A read that completed
-    // synchronously stores its outcome directly (_pendingDone); otherwise OnPrefetchCompleted stores it and sets _done.
+    // synchronously stores its outcome directly (_pendingSync); otherwise OnPrefetchCompleted stores it and sets _done,
+    // and the reader always waits on _done. Setting the event is the continuation's last access to this object, so once
+    // the reader's wait returns the buffer may be disposed or reused. (A completion flag written by the continuation
+    // before the event let the reader skip the wait and dispose the buffer while the continuation was still about to
+    // set the event: a NullReferenceException on a thread-pool thread, which ends the process.)
     private bool _hasPending;
-    private volatile bool _pendingDone;
+    private bool _pendingSync;
     private ValueTask<int> _pendingTask;
     private int _pendingResult;
     private Exception? _pendingError;
@@ -140,7 +144,7 @@ public sealed class AsyncPrefetchBuffer : IDisposable
     /// <summary>Moves to the prefetched chunk, keeping the tail of the current one from <paramref name="offset"/>.</summary>
     private bool TrySwap(long offset, int length, out ReadOnlySpan<byte> data)
     {
-        if (!_pendingDone) PrefetchWaits++;
+        if (!_pendingSync && !_done!.IsSet) PrefetchWaits++;
         int n = TakePending();
         int tail = (int)(_nextOffset - offset); // bytes of the requested range still in the current window
         if (tail > _nextStart)
@@ -209,10 +213,10 @@ public sealed class AsyncPrefetchBuffer : IDisposable
             {
                 _pendingError = e;
             }
-            _pendingDone = true;
+            _pendingSync = true;
             return;
         }
-        _pendingDone = false;
+        _pendingSync = false;
         _pendingTask = t;
         ManualResetEventSlim done = _done ??= new ManualResetEventSlim(false);
         done.Reset();
@@ -231,14 +235,13 @@ public sealed class AsyncPrefetchBuffer : IDisposable
             _pendingError = e;
         }
         _pendingTask = default;
-        _pendingDone = true;
         _done!.Set();
     }
 
     /// <summary>Waits for the pending prefetch and returns its byte count (rethrows its failure). PRE: one is pending.</summary>
     private int TakePending()
     {
-        if (!_pendingDone) _done!.Wait();
+        if (!_pendingSync) _done!.Wait();
         _hasPending = false;
         Exception? e = _pendingError;
         _pendingError = null;
@@ -275,7 +278,8 @@ public sealed class AsyncPrefetchBuffer : IDisposable
         if (_next.Length > 0) RocksArrayPool<byte>.Shared.Return(_next);
         _cur = [];
         _next = [];
-        _done?.Dispose();
+        // Not disposed: it never allocates a wait handle (WaitHandle is not used), and a Set still unwinding on the
+        // completing thread must not meet a disposed event.
         _done = null;
     }
 }

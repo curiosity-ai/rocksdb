@@ -211,8 +211,12 @@ public sealed class WideColumnApiTests
         var filter = new LazyFilter(true);
         var cf = new ColumnFamilyOptions { DisableAutoCompactions = true, MergeOperator = new RocksDb.Managed.Tests.Db.StringAppendMergeOperator(), CompactionFilter = filter };
         using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cf);
+        // One file per entry: a flush merges the operands of its memtable (without the column family's filter, which
+        // only a factory can apply to flushes), so the compaction would see a plain value.
         db.Put(B("m"), B("base"));
+        db.Flush();
         db.Merge(B("m"), B("keep"));
+        db.Flush();
         db.Merge(B("m"), B("drop"));
         db.Flush();
         db.CompactRange();

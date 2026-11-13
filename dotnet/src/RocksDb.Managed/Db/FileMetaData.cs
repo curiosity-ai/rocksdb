@@ -117,6 +117,18 @@ public sealed class FileMetaData
         EntryStatsKnown = true;
     }
 
+    /// <summary>
+    /// Port of FileMetaData::FileIsStandAloneRangeTombstone: the file holds exactly one entry, a range tombstone (an
+    /// ingested standalone range deletion file, e.g. the tombstone of an atomic replace). Such files are marked for
+    /// compaction. Needs the entry stats (<see cref="SetEntryStats"/>); false while they are not loaded.
+    /// </summary>
+    internal bool FileIsStandAloneRangeTombstone()
+    {
+        bool res = NumRangeDeletions == 1 && NumEntries == NumRangeDeletions;
+        System.Diagnostics.Debug.Assert(!res || SmallestSeqno == LargestSeqno);
+        return res;
+    }
+
     // FileSampledStats (db/version_edit.h), in memory only; updated with relaxed atomics by readers
     // (monitoring/file_read_sample.h). Shared by every version that contains this file.
     private long _numReadsSampled;

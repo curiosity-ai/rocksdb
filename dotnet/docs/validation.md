@@ -183,7 +183,7 @@ New test infrastructure:
 | `WriteThread` (pipelined writes) | `db/write_thread.cc` (LinkGroup, the pipelined branch of ExitAsBatchGroupLeader, EnterAsMemTableWriter, ExitAsMemTableWriter, WaitForMemTableWriters, newest_memtable_writer_), `db/db_impl/db_impl_write.cc` (PipelinedWriteImpl, WaitForPendingWrites) | **ported.** The memtable writer queue is a locked linked list like the batch queue (upstream: lock-free list). The WAL leader completes the writers that do not write to the memtables (failed callback, WAL-only prepares, WAL errors), links the others to the memtable queue and only then hands WAL leadership on, so memtable groups follow WAL order; memtable groups are bounded like upstream (size cap of max_write_batch_group_size_bytes / 8 without concurrent memtable writes; a batch with merge operands alone with them). Memtable groups of two or more plain writers insert in parallel, as in the non-pipelined path and upstream. Write stats are recorded by the WAL stage. The memtable stage is drained (WaitForMemTableWriters) before PreprocessWrite switches memtables or WALs (flush scheduler, max_total_wal_size), by every unbatched leader (flush, ingestion, column family changes, error recovery, close) and by a leader whose callback disallows batching. Rejections as upstream: two_write_queues ("pipelined_writes is not compatible with concurrent prepares") and seq_per_batch with NotSupported at write time; unordered_write, atomic_flush with InvalidArgument at open (DBImpl::ValidateOptions, also unordered_write with !allow_concurrent_memtable_write); blob direct write with NotSupported (column family validation). unordered_write has its own path (next row). Tests: overlap with a held memtable stage, concurrent sync/async writers (with and without parallel inserts), memtable / WAL switches with flushes, merges and per-key protection, WAL termination points, fault-injection sweeps (sequential, and concurrent writers with per-writer prefix checks), native recovery both ways (PipelinedWriteCompatTests). |
 | `DbImpl.UnorderedWrite.cs` (unordered_write) | `db/db_impl/db_impl_write.cc` (the unordered branch of WriteImpl, WriteImplWALOnly with kDoAssignOrder + kDoPublishLastSeq on write_thread_, UnorderedWriteMemtable), `db/db_impl/db_impl.h` (WaitForPendingWrites, pending_memtable_writes_, switch_cv_ / switch_mutex_), `db/column_family.cc` (max_successive_merges check), `utilities/transactions/pessimistic_transaction_db.cc` (TransactionDB::Open checks) | **ported.** The WAL group runs PreprocessWrite, write callbacks, sequence allocation and the merged WAL record (under the WAL write lock with two write queues), the pre-release callbacks, publishes the group's last sequence, then adds its memtable writers to pending_memtable_writes_ before handing leadership on; every writer inserts its own batch with concurrent memtable inserts (merge operands included, as upstream) and counts down; the writer reaching 0 completes the waiter (switch_cv_ -> a TaskCompletionSource with asynchronous continuations, so async leaders do not block a thread). WaitForPendingWrites runs before PreprocessWrite's WAL / memtable switches and in every EnterUnbatched (upstream: in the EnterUnbatched callers that touch memtables -- flush, ingestion, CF drop, error recovery, GetApproximateMemTableStats; waiting in all of them is stricter). Snapshot semantics as documented in DBOptions::unordered_write: a snapshot may change while earlier-sequence inserts land, writes after it stay invisible, read-your-own-write holds. Rejections with upstream's codes/messages: !allow_concurrent_memtable_write and enable_pipelined_write (InvalidArgument at open), max_successive_merges > 0 (InvalidArgument), blob direct write (NotSupported), TransactionDB with WriteCommitted / WriteUnprepared / WritePrepared without two_write_queues (NotSupported). Deviation: a failed memtable insert is reported to its writer but does not set a background error (consistent with the port's ordered path; upstream's WriteStatusCheck sets one with paranoid_checks). Tests: UnorderedWriteTests (option checks, concurrent writers with one/two write queues under memtable/WAL switches and flushes, held insert: published-before-insert, snapshot relaxation, read-your-own-write, flush drain; WritePrepared on two queues), DbCrashConsistencyTests (serial power-loss/process-kill sweeps and concurrent-writer sweeps), UnorderedWriteCompatTests (native WAL recovery both ways via rocksdb_options_set_unordered_write, native reads the option from a managed OPTIONS file). |
 | `WriteThread` | `db/write_thread.cc` | verified. Grouping rules match: no sync write under a non-sync leader, no mixing WAL-disabled or no_slowdown writers, size cap of leader size + 128 KiB. Leader handoff and pooled writers are correct. Known deviation: a leader that is cancelled while delayed by a write stall fails its whole group with OperationCanceledException (upstream has no cancellation). |
-| `FlushJob`, recovery flush | `flush_job.cc`, `builder.cc`, `WriteLevel0TableForRecovery` | verified. Like upstream's flush-time CompactionIterator, versions hidden by a newer Put / Delete / blob index / entity of the same key in the same snapshot stripe are dropped (rule (A); snapshots taken when the flush starts). Known deviations: merge operands are not merged, single-delete pairs and keys covered by range tombstones of the same flush are kept, and CFs with user-defined timestamps keep every version (all correct, left to compaction). Recovery writes the L0 file and the new log number in one edit per CF; a crash between CFs is handled because each CF skips WALs below its own log number. |
+| `FlushJob`, recovery flush | `flush_job.cc`, `builder.cc`, `WriteLevel0TableForRecovery` | verified. Like upstream's flush-time CompactionIterator, versions hidden by a newer Put / Delete / blob index / entity of the same key in the same snapshot stripe are dropped (rule (A); snapshots taken when the flush starts). Memtables with merge operands, single deletes, TimedPut entries or range tombstones, a flush compaction filter or paranoid_file_checks go through the CompactionIterator itself (see "Audit #5: flush behaviour"). Known deviation: CFs with persisted user-defined timestamps and only plain entries keep every version (correct, left to compaction). Recovery writes the L0 file and the new log number in one edit per CF; a crash between CFs is handled because each CF skips WALs below its own log number. |
 | `TableCache` | `db/table_cache.cc` | verified. Ref-counted handles: eviction and Evict on deletion close a reader only after the last lease is returned. Failed opens are not cached. |
 | `GetFromFile` unclipped tombstones | `TableCache::Get` | verified. Upstream also applies a file's tombstones unclipped for keys inside the file's range. Compaction outputs and the iterator/compaction aggregators truncate (`CompactionJob.CollectTruncated` at user-key granularity, which is equivalent for outputs because the point keys at the boundary are resolved by the seq-1 truncated aggregator). |
 | Compaction | `compaction_job.cc`, `compaction_outputs.cc`, `compaction_iterator.cc` | verified: snapshots captured at pick time, input version referenced, outputs pending until installed and deleted on failure, edits refused for dropped CFs (above). The CompactionIterator rules and ShouldStopBefore were compared line by line in audit #3. |
@@ -856,7 +856,7 @@ migrated database with the new options, native's LOG files are found).
 |---|---|---|---|
 | `Db/DbImpl.Debug.cs`, `Utilities/Debug/KeyVersions.cs`, `ColumnFamily.Debug.cs` | `utilities/debug.cc`, `include/rocksdb/utilities/debug.h`, `util/udt_util.cc` (MaybeAddTimestampsToRange) | **ported.** The internal iterator of the super version (all memtables and files, total order) from InternalKey::SetMinPossibleForUserKey(begin), stopping after user key `end` (inclusive), adding until `++num_keys >= max_num_ikeys` (so 0 returns one entry, as upstream); a malformed internal key is Corruption. With user-defined timestamps both bounds get the maximum timestamp (exclusive_end default), so versions of `end` itself are excluded, as upstream. `null` = no bound, an empty array = the empty key (upstream's OptSlice change). value_type_string_map copied as a name table (`KeyVersion.GetTypeName`). Results go to a reusable pooled `KeyVersionCollection` (struct enumerator) instead of `std::vector<KeyVersion>`. **Deviation:** keys covered by a range tombstone are skipped through a RangeDelAggregator (upstream's MergingIterator with range tombstones skips them the same way; its file-boundary sentinel keys never surface there either). | `DebugUtilitiesTests` (ports of DBBasicTest.GetAllKeyVersions / ValueTypeString; DBMergeOperatorTest.MaxSuccessiveMergesBaseValues adapted: the port does not implement max_successive_merges, so operands stay merges; bounds, limit, SST + memtable versions, range tombstones, UDT). |
 | `Utilities/OptionChangeMigration.cs` | `utilities/option_change_migration/option_change_migration.cc`, `include/rocksdb/utilities/option_change_migration.h` | **ported.** ValidateCFDescriptors (messages kept), DetermineBaseOptions, ApplySpecialSingleLevelSettings, GetNoCompactionOptions, the open with no-compaction options, MigrateToUniversal (ColumnFamilyMetaData::levels.back().level is num_levels - 1 of the open column family), MigrateToLevelBase (L1, or the last level with dynamic level bytes), MigrateToFIFO (L0 with kForce), CompactToLevel (change_level + target_level), and the reopen that rewrites the MANIFEST when the old options were used. Single-CF (Options) and multi-CF (descriptor lists) overloads; sync and async. | `OptionChangeMigrationTests` (Migrate1-4 over the 19 upstream parameter tuples, CompactedSrcToUniversal, BasicMultiCF, DifferentStylesPerCF, ValidationMismatched, FromFIFOMultiCF); compat `OptionChangeMigrationCompatTests` (a native leveled DB migrated to single-level universal opens in native with num_levels = 1; a managed universal DB migrated to FIFO and then to dynamic leveling opens in native). |
-| `Utilities/MemoryUtil.cs`, `Db/DbImpl.Properties.cs` (size-all-mem-tables, estimate-table-readers-mem), `Table/BlockBasedTableReader.cs` (ApproximateMemoryUsage) | `utilities/memory/memory_util.cc`, `include/rocksdb/utilities/memory_util.h`, `db/internal_stats.cc` (HandleSizeAllMemTables, HandleEstimateTableReadersMem), `db/version_set.cc` (GetMemoryUsageByTableReaders), `table/block_based/block_based_table_reader.cc` (ApproximateMemoryUsage) | **ported.** Aggregated kSizeAllMemTables / kCurSizeAllMemTables / kEstimateTableReadersMem over the databases and Cache::GetUsage over the distinct caches (a set upstream: duplicates counted once). Property fixes made for it: size-all-mem-tables now also counts flushed memtables still referenced (iterators' super versions, history), like MemTableList::current_memory_usage_ (it equalled cur-size-all-mem-tables before); estimate-table-readers-mem sums open readers' pinned index / filter / range-deletion blocks and UDI memory (it was always 0). **Deviations:** the reader estimate omits sizeof(Rep) and the reader objects; `MemoryUtil.GetCaches` (block and blob caches of every column family, like the test's TEST_GetAllBlockCaches) has no table-cache entry because the managed table cache is not a block cache. | `MemoryUtilTests` (SharedBlockCacheTotal; MemTableAndTableReadersTotal adapted: the port flushes immutable memtables without waiting for min_write_buffer_number_to_merge, so one larger write buffer per CF replaces upstream's one-memtable-per-KV; cache de-duplication, consistency with the properties); compat `MemoryUtilCompatTests` (same workload on native via rocksdb_approximate_memory_usage_*: same direction of every type, memtable usage within 2x). |
+| `Utilities/MemoryUtil.cs`, `Db/DbImpl.Properties.cs` (size-all-mem-tables, estimate-table-readers-mem), `Table/BlockBasedTableReader.cs` (ApproximateMemoryUsage) | `utilities/memory/memory_util.cc`, `include/rocksdb/utilities/memory_util.h`, `db/internal_stats.cc` (HandleSizeAllMemTables, HandleEstimateTableReadersMem), `db/version_set.cc` (GetMemoryUsageByTableReaders), `table/block_based/block_based_table_reader.cc` (ApproximateMemoryUsage) | **ported.** Aggregated kSizeAllMemTables / kCurSizeAllMemTables / kEstimateTableReadersMem over the databases and Cache::GetUsage over the distinct caches (a set upstream: duplicates counted once). Property fixes made for it: size-all-mem-tables now also counts flushed memtables still referenced (iterators' super versions, history), like MemTableList::current_memory_usage_ (it equalled cur-size-all-mem-tables before); estimate-table-readers-mem sums open readers' pinned index / filter / range-deletion blocks and UDI memory (it was always 0). **Deviations:** the reader estimate omits sizeof(Rep) and the reader objects; `MemoryUtil.GetCaches` (block and blob caches of every column family, like the test's TEST_GetAllBlockCaches) has no table-cache entry because the managed table cache is not a block cache. | `MemoryUtilTests` (SharedBlockCacheTotal; MemTableAndTableReadersTotal adapted: written when the port flushed immutable memtables without waiting for min_write_buffer_number_to_merge (ported since, "Audit #5: flush behaviour"): one larger write buffer per CF replaces upstream's one-memtable-per-KV; cache de-duplication, consistency with the properties); compat `MemoryUtilCompatTests` (same workload on native via rocksdb_approximate_memory_usage_*: same direction of every type, memtable usage within 2x). |
 | `Utilities/InfoLogFinder.cs` | `utilities/convenience/info_log_finder.cc`, `file/filename.cc` (GetInfoLogFiles, InfoLogPrefix, ParseFileName) | **ported.** Lists db_log_dir (or the DB directory) and keeps names ParseFileName reads as kInfoLogFile with the InfoLogPrefix ("LOG", or the escaped DB path + "_LOG"): LOG, LOG.old, LOG.old.N. **Deviation:** `GetInfoLogList(db)` computes the db_log_dir prefix from the absolute DB path, as the logger names the files; upstream passes DB::GetName() as given (differs only for relative paths). | `InfoLogFinderTests` (rolled logs and decoys in the DB directory; two databases sharing db_log_dir); compat `InfoLogFinderCompatTests` (native's LOG files in both layouts; a managed open continues native's series). |
 | `Utilities/Transactions/TransactionDbMutex.cs`, `Utilities/Transactions/PointLockManager.cs` (custom path), `TransactionOptions.cs` (CustomMutexFactory) | `include/rocksdb/utilities/transaction_db_mutex.h`, `utilities/transactions/transaction_db_mutex_impl.cc`, `utilities/transactions/lock/point/point_lock_manager.cc` (LockMapStripe, AcquireWithTimeout, UnLock, GetPointLockStatus) | **ported.** With custom_mutex_factory each stripe allocates a mutex and a condvar from the factory; AcquireWithTimeout follows upstream line by line (Lock for a negative timeout, else TryLockFor(timeout) with kMutexTimeout on failure; cv_end_time from the holder's expiration and the deadline; deadlock detection before each wait; Wait / WaitFor; one more AcquireLocked after a timeout; SetWaitingTxn on timeout); UnLock locks the stripe mutex, unlocks the key and NotifyAll()s. Status results map to `bool` (TimedOut) and thrown RocksDbExceptions (other failures, returned as the lock result like cv_wait_fail). `TransactionDbMutexFactory.Default` mirrors TransactionDBMutexFactoryImpl (TryLockFor honours its timeout instead of ignoring it; the condvar works with any TransactionDbMutex and never reports a timeout early). Without a factory the built-in path is unchanged: one null test per TryLock / UnLock, still allocation-free and asynchronous. **Deviation:** with a custom factory lock waits block the calling thread, also through the async APIs (upstream is synchronous throughout). | `TransactionDbMutexTests` (instrumented counting factory: allocation per stripe, call counts, lock timeout through WaitFor, infinite timeout through Wait woken by NotifyAll, deadlock detection, expired-lock stealing, TryLockFor timeout and Wait failures reported, a concurrent transfer workload); `PointLockBenchmarks` (perf.md). |
 | `Env/MirrorFileSystem.cs` | `utilities/env_mirror.cc`, `include/rocksdb/utilities/env_mirror.h` | **ported** as a public IFileSystem in the library (upstream ships EnvMirror in its public utilities). Every operation runs on both file systems; return values, GetChildren listings (sorted), file sizes, Read / sequential read bytes (B re-read until A's length, as SequentialFileMirror) must agree and both must succeed or both fail; results are A's. Upstream asserts (debug builds only); the port throws FileSystemMirrorMismatchException in every build. Not verified, as upstream: modification times, free space, readahead hints. | `MirrorFileSystemTests` (ports of env_mirror_test.cc Basics, ReadWrite, Locks, Misc, LargeWrite over two MemoryFileSystems; async I/O; divergence detection; a DB workload with flush, compaction and reopen over LocalFileSystem mirrored with MemoryFileSystem, whose files then compare byte for byte). |
@@ -1115,9 +1115,9 @@ C++ reference: `main` (11.14); native comparisons use the 11.12 package. Unit te
 | `CompactionFilter::IgnoreSnapshots() = false` | `CompactionJob::SetupAndValidateCompactionFilter`, `BuildTable` | **fixed.** Compactions fail with NotSupported "CompactionFilter::IgnoreSnapshots() = false is not supported anymore." before opening an input; a flush fails the same way when the factory filters flushes (ShouldFilterTableFileCreation(kFlush)). | filter, factory and flush-factory cases |
 | ReFitLevel / change_level | `DBImpl::ReFitLevel`, `DBImpl::CompactRange` (DisableManualCompaction + PauseBackgroundWork around it) | **fixed.** Aborted "Moving more than 1 file from non-L0 to L0 is not allowed ..."; NotSupported for ongoing compaction output in between levels and for a second refit; a kRefitLevel compaction is registered (files marked being compacted) while LogAndApply releases the mutex; manual compaction is disabled around the refit, so a concurrent CompactRange / CompactFiles fails with Incomplete(kManualCompactionPaused) like upstream. Deviation: flushes are not paused (PauseBackgroundWork also stops flushes upstream); they only add L0 files with newer epoch numbers, and the refit range is registered. | Aborted check; a CompactRange and a CompactFiles started at `DBImpl::ReFitLevel:PostRegisterCompaction` fail with Incomplete; 40 refits racing CompactRange loops: no background error, all keys readable |
 | VersionBuilder consistency checks | `VersionBuilder::CheckConsistency` / `CheckConsistencyDetails` (`force_consistency_checks`) | **fixed.** Checked before a LogAndApply edit is written and on the recovered version: L0 newest first (epoch number, or seqnos when an L0 file has no epoch: kMightMissing), no overlapping L0 files of one epoch, sorted non-overlapping L1+, no blob file that is entirely garbage; Corruption "force_consistency_checks: VersionBuilder: ...". The table/blob link check holds by construction (`BlobFileMetaData.Build` derives the links from the table files). Upstream always checks in debug builds; the managed port follows the option in all builds. | live edit with overlapping L1 files rejected (nothing written); MANIFEST with overlapping L1 files fails to open with Corruption (opens with the checks off); unsorted / same-epoch overlap unit cases. Native 11.12 opens the same MANIFEST without an error but does not present the overlapping files either (0 files at L1). |
-| Compaction output validation | `OutputValidator` (`db/output_validator.cc`), `CompactionOutputs::AddToOutput`, `CompactionJob::VerifyOutputFiles` (`verify_output_flags`, `paranoid_file_checks`) | **fixed.** Every output key is checked against the previous key of its output file (one comparison with the output's largest key, which the job keeps anyway): "Compaction sees out-of-order keys." / "Compaction tries to write a key without internal bytes." With paranoid_file_checks or kVerifyIteration the rolling NPHash64 of keys and values is kept per output and compared after reading the file back; kVerifyBlockChecksum reads every data block with checksum verification (meta blocks are verified when the reader opens the file, so the block pass and the iteration pass are one scan); kVerifyFileChecksum recomputes the file checksum. Outputs are verified at the end of each subcompaction. New typed option `ColumnFamilyOptions.VerifyOutputFlags` (`verify_output_flags`, mutable). Deviation: `paranoid_file_checks` does not verify flush outputs (BuildTable's read-back is not ported). Cost: compaction CPU within noise, see docs/perf.md. | comparator reordered after picking -> out-of-order Corruption; corrupted output detected for paranoid / each flag, unnoticed without; the two upstream regression tests (iteration without paranoid, all flags) |
+| Compaction output validation | `OutputValidator` (`db/output_validator.cc`), `CompactionOutputs::AddToOutput`, `CompactionJob::VerifyOutputFiles` (`verify_output_flags`, `paranoid_file_checks`) | **fixed.** Every output key is checked against the previous key of its output file (one comparison with the output's largest key, which the job keeps anyway): "Compaction sees out-of-order keys." / "Compaction tries to write a key without internal bytes." With paranoid_file_checks or kVerifyIteration the rolling NPHash64 of keys and values is kept per output and compared after reading the file back; kVerifyBlockChecksum reads every data block with checksum verification (meta blocks are verified when the reader opens the file, so the block pass and the iteration pass are one scan); kVerifyFileChecksum recomputes the file checksum. Outputs are verified at the end of each subcompaction. New typed option `ColumnFamilyOptions.VerifyOutputFlags` (`verify_output_flags`, mutable). `paranoid_file_checks` also verifies flush outputs (BuildTable's read-back, "Audit #5: flush behaviour"). Cost: compaction CPU within noise, see docs/perf.md. | comparator reordered after picking -> out-of-order Corruption; corrupted output detected for paranoid / each flag, unnoticed without; the two upstream regression tests (iteration without paranoid, all flags) |
 | oldest_ancestor_time of outputs | `CompactionJob::OpenCompactionOutputFile` / `FinishCompactionOutputFile`, `Compaction::MinInputFileOldestAncestorTime`, `FileMetaData::TryGetOldestAncestorTime` | **fixed.** The time comes from the inputs overlapping the subcompaction range, refined per finished output to the inputs overlapping its key range (MANIFEST value; the table property keeps the subcompaction value like upstream); a file without a MANIFEST value uses `rocksdb.creation.time` of an open table instead of its file creation time. | multi-output compaction of old and new data with ttl: outputs of new data are not TTL-expired |
-| MANIFEST size auto-tuning | `VersionSet::TuneMaxManifestFileSize`, `ProcessManifestWrites` (25% relaxation for `IsForegroundOperation` batches), `WriteCurrentStateToManifest` (kLastCompactedManifestFileSize), `VersionSet::Close` (verify_manifest_content_on_close) | **fixed.** Rotation at max(max_manifest_file_size, last compacted size * (100 + max_manifest_space_amp_pct) / 100), +25% for batches with ingestion, import, DeleteFilesInRanges or CF create/drop edits; new MANIFESTs end the snapshot with the kLastCompactedManifestFileSize record (before the managed writer's next-file-number record, which belongs to the batch edit upstream) and recovery reads it. verify_manifest_content_on_close re-reads the MANIFEST on close and rewrites it once when corrupt (MANIFEST_VALIDATION_FAILURE_COUNT); a second failure makes close throw Corruption after the close finished. New typed options `DbOptions.MaxManifestSpaceAmpPct` (500) and `VerifyManifestContentOnClose` (mutable). Deviations: the unconditional MANIFEST size check of `VersionSet::Close` (rewrite on a size mismatch) and the OnIOError listener calls are not ported. | rotation rule per write for pct 0 / 100 / 500; ingestion within the relaxed limit does not rotate, a flush does; record present; corrupted MANIFEST rewritten on close. Native writes the record (managed decodes it) and opens managed MANIFESTs with it. |
+| MANIFEST size auto-tuning | `VersionSet::TuneMaxManifestFileSize`, `ProcessManifestWrites` (25% relaxation for `IsForegroundOperation` batches), `WriteCurrentStateToManifest` (kLastCompactedManifestFileSize), `VersionSet::Close` (verify_manifest_content_on_close) | **fixed.** Rotation at max(max_manifest_file_size, last compacted size * (100 + max_manifest_space_amp_pct) / 100), +25% for batches with ingestion, import, DeleteFilesInRanges or CF create/drop edits; new MANIFESTs end the snapshot with the kLastCompactedManifestFileSize record (before the managed writer's next-file-number record, which belongs to the batch edit upstream) and recovery reads it. verify_manifest_content_on_close re-reads the MANIFEST on close and rewrites it once when corrupt (MANIFEST_VALIDATION_FAILURE_COUNT); a second failure makes close throw Corruption after the close finished. New typed options `DbOptions.MaxManifestSpaceAmpPct` (500) and `VerifyManifestContentOnClose` (mutable). The unconditional MANIFEST size check of `VersionSet::Close` (rewrite on a size mismatch) is ported since "Audit #5: flush behaviour". Deviation: the OnIOError listener calls are not ported. | rotation rule per write for pct 0 / 100 / 500; ingestion within the relaxed limit does not rotate, a flush does; record present; corrupted MANIFEST rewritten on close. Native writes the record (managed decodes it) and opens managed MANIFESTs with it. |
 | db_paths | `SanitizeOptions` (db_paths), `LevelCompactionBuilder::GetPathId`, `UniversalCompactionBuilder::GetPathId`, `CompactionPicker::CompactRange` (target_path_id) | **fixed.** Path id i names db_paths[i] (the DB directory is path 0 only when db_paths is empty; before, it was always path 0, shifting native path ids); manual compactions write to CompactRangeOptions.TargetPathId; automatic leveled / universal compactions place outputs with the upstream GetPathId (incremental universal size-amp compactions use path 0, as upstream); obsolete-file scans include the DB directory when db_paths does not name it. | GetPathId vectors (leveled, universal); flush to path 0 and CompactRange(target_path_id = 1) to path 1; native opens the DB with the same db_paths and finds every file, and vice versa |
 | Periodic obsolete-file scan | `DBImpl::FindObsoleteFiles` (doing_the_full_scan, delete_obsolete_files_period_micros) | **fixed.** After a purge a full scan runs when the period has elapsed (every purge with 0). Deviation: runtime scans keep temp files and MANIFESTs newer than the current one (in-flight writes the managed port does not register as pending outputs); the scans at open delete them as before. | orphan table file kept with the default period, deleted with 0 |
 | Round-robin cursor on trivial moves | `DBImpl::BackgroundCompaction` (trivial-move branch: AddCompactCursor for kLevelMaxLevelSize) | **fixed** (see the corrected row in "Compaction completeness" above). | lock step with ascending keys vs native: shapes, moves and persisted cursors identical (fails without the fix) |
@@ -1161,9 +1161,9 @@ Second correctness review, TTL / merge / transaction items. C++ reference: `main
 | `Utilities/Transactions/Transaction.cs`, `PessimisticTransaction.cs`, `OptimisticTransactionDatabase.cs`, `WriteUnpreparedTxn.cs`, `IndexedWriteBatch.cs`, `LockTracker.cs`, WBWI | `transaction_base.cc` (MultiGet, MultiGetForUpdate, Put/Merge/Delete/SingleDelete with assume_tracked, GetNumPuts/PutEntities/Deletes/Merges/Keys, GetElapsedTime, DisableIndexing / GetBatchForWrite, SavePoint counters, Reinitialize), `pessimistic_transaction.cc` (TryLock assume_tracked, SetLockTimeout), `optimistic_transaction.cc` (TryLock) | **ported.** MultiGet reads through WBWI MultiGetFromBatchAndDB with the transaction's DB reader (WriteUnprepared: one read callback for all keys); MultiGetForUpdate locks / tracks every key first and fails as a whole. assume_tracked writes skip validation and re-tracking; a pessimistic transaction rejects an untracked key with InvalidArgument "assume_tracked is set but it is not tracked yet" (deviation: the port releases the lock it took for that write; upstream keeps it without tracking it, so it is never released); optimistic transactions ignore it (upstream asserts). Counters are restored by RollbackToSavePoint and reset by Clear / Reinitialize; ElapsedTime is a TimeSpan. DisableIndexing appends without indexing (and without sub-batch counting, like upstream's plain WriteBatch); a rebuild of the index (RollbackToSavePoint) indexes everything. upstream's GetForUpdate has no assume_tracked (do_validate exists already). | `TransactionTests` on WriteCommitted, WritePrepared and WriteUnprepared: ports of AssumeExclusiveTracked, MultiGetBatchedTest, DisableIndexingTest (not WriteUnprepared, as upstream), the SavepointTest counters and the TimeoutTest SetLockTimeout part; `AssumeTrackedOnUntrackedKeyIsInvalidArgument`, `MultiGetForUpdateLocksAllKeys`; `OptimisticTransactionTests.MultiGetForUpdateTracksKeys` |
 | Transaction and WBWI reads over a DB merge chain | `WriteBatchWithIndex::GetFromBatchAndDB` (MergeAcrossBatchAndDB), `BaseDeltaIterator` | verified: batch operands over a DB value that is itself an unresolved chain (Put in one SST, operands in a second SST and in the memtable, and a chain without a base value) give the same values through GetFromBatchAndDB, MultiGetFromBatchAndDB, GetEntityFromBatchAndDB, the base-delta iterator in both directions, also at a snapshot inside the chain, and transaction Get / GetForUpdate / MultiGet / iterator on all write policies. | `WriteBatchWithIndexTests.BatchMergesOverDbMergeChainAcrossMemtableAndFiles`, `TransactionTests.BatchMergesOverDbMergeChainAcrossMemtableAndFiles` |
 
-Observation (not a TTL bug, flush is owned elsewhere): the port's flush does not run the merge helper (FlushJob keeps
-Put + operands; see FlushJob), so in a TTL database a merge result is stamped at the first compaction instead of at the
-flush, and expires correspondingly later than with native.
+Observation (fixed by "Audit #5: flush behaviour"): the port's flush did not run the merge helper, so in a TTL database a
+merge result was stamped at the first compaction instead of at the flush. The flush now merges operands onto a base
+value of the same memtables, as native does.
 
 Performance (BenchmarkDotNet, net10.0, `MergeBenchmarks.cs` / `ScanBenchmarks.cs`, a shared 4-core container with load
 average 11-23 from other jobs, so absolute numbers are noisy). The default merge path detects (once per operator type)
@@ -1432,7 +1432,8 @@ inserts, erases and evictions wait for a running grow.
 
 Not read against the C++ (previous audits and the compat tests still apply):
 `PerKeyPointLockManager` (not ported), the restore / verify / garbage-collection bodies of the backup engine on the
-C# side beyond what the earlier slices compared.
+C# side beyond what the earlier slices compared (read since: "Audit #5: backup engine restore / verify / garbage
+collection" below).
 
 Found by the ticker comparison and ported afterwards: the compression dictionary block in the block cache
 (`uncompression_dict_reader.cc`, `Table/BlockBasedTableReader.CompressionDict.cs`). Without
@@ -1660,3 +1661,318 @@ and had its log rebuilt holds another entry at that number, and a delayed caller
 committed. `RaftClusterNode.WaitForCommitAsync(sequence, term, ...)` now takes the term the entry was written in, and
 `ClusterNodeHost.WriteCommittedAsync` reads the term before the write
 (`CommitWaitDoesNotAcknowledgeAnEntryThatWasReplacedAfterAStepDown`).
+
+## Audit #5: backup engine restore / verify / garbage collection
+
+`Utilities/Backup/` read side by side with `utilities/backup/backup_engine.cc` (and `utilities/copy_engine/copy_engine.cc`
+for the copy loop), function by function. Tests: `Validation/Audit5BackupTests.cs` (14, on `MemoryFileSystem` and
+`FaultInjectionFileSystem`), `CompatTests/Audit5/Audit5BackupCompatTests.cs` (3, native 11.12).
+
+| C++ | Verdict |
+|---|---|
+| `Initialize` (directories, meta file names, `destroy_old_data`, `max_valid_backups_to_open`, corrupt backups, read-only) | matches; a read-only engine writes nothing (`OpenToleratesLeftoversOfInterruptedOperations`) |
+| `BackupMeta::LoadFromFile` (schema 1 / 2.x, sizes, checksums, ignorable and `ni::` fields, footer, counts) | matches (`MetaFileValidation`, 20 rows) |
+| `BackupMeta::AddFile` / `Delete` (reference counts) | matches |
+| `RestoreDBFromBackup` | deviations 2 to 5 below, fixed; otherwise matches: destination emptied first (WAL directory and archive too), `keep_log_files`, every copy checked against the meta file's crc32c, files and directories synced with `sync`, `CURRENT` restored as `CURRENT.tmp` and renamed last |
+| `InferDBFilesToRetainInRestore` (`kKeepLatestDbSessionIdFiles`, `kVerifyChecksum`, `kPurgeAllFiles`) | deviation 3 fixed; otherwise matches (`AnIncrementalRestoreReplacesFilesThatDiffer`) |
+| `DeleteChildren` | deliberately stricter than upstream (2) |
+| `VerifyBackup` | matches (id 0 is not the latest backup here either) |
+| `GarbageCollect`, `DeleteBackupNoGC`, `DeleteBackup`, `PurgeOldBackups` | deliberately different for backups that could not be loaded (1) and for temporary meta files (6); otherwise match |
+| `CreateNewBackupWithMetadata` failure path, `StopBackup` during a backup | matches: only the failed backup's files go (`AFailedOrStoppedBackupKeepsTheFilesOfEarlierBackups`) |
+| `BackupEngineImplThreadSafe::RestoreDBFromBackup` (locks of `alternate_dirs`) | deviation 4 fixed |
+| `GetFileFromChecksumFile` | deviation 5 fixed |
+
+Deviations found and fixed (each test failed before its fix unless noted):
+
+1. **Garbage collection deleted the data of backups that could not be loaded.** A backup whose meta file fails
+   `LoadFromFile` (damaged, or a schema / `ni::` field this version does not know) holds no reference counts and is not
+   in `backups_`. `GarbageCollect` deletes its private directory and the shared files only it uses, `DeleteBackupNoGC`
+   deletes a shared file it shares with a deleted backup, and the garbage collection runs by itself on the first
+   `DeleteBackup` / `PurgeOldBackups` of a writable engine. The port did the same. **This is upstream behaviour and we
+   believe it is wrong**: an older binary that merely purges destroys the backups of a newer one, and a repairable meta
+   file loses its data (`backup_engine_test.cc` says "make sure that no corrupt backups have actually been deleted" but
+   runs no garbage collection there; the compat test shows native 11.12 deleting them). The managed engine now keeps
+   every path the unloadable meta file names (the first word of each line under `shared/`, `shared_checksum/`,
+   `private/`) and that backup's private directory until the backup is deleted by id (`DeleteBackup(id)`, which then
+   garbage collects). `AddBackupFileWorkItem`'s "already present, but not referenced" case no longer deletes the file
+   before copying (the copy is renamed over it), for the same reason. Tests:
+   `GarbageCollectionSparesBackupsThatCouldNotBeLoaded`, `DeletingABackupThatCouldNotBeLoadedRemovesItsFiles` (passed
+   before), compat `BackupsThatCannotBeLoadedSurviveManagedGarbageCollection`. Not covered: a meta file so damaged that
+   its file names cannot be read.
+2. **An incremental restore kept every file carrying the number of a kept table file.** `files_to_keep` holds numbers;
+   `DeleteChildren` and the restore loop test the number alone, so a stale `000012.log` next to a kept `000012.sst`
+   survived the restore and would be replayed by the next open. Upstream does the same; only the table / blob file is
+   kept here. Tests: `AnIncrementalRestoreKeepsOnlyTheMatchingTableFileOfANumber`, compat
+   `ManagedIncrementalRestoreOverANativeRestore`.
+3. **`kKeepLatestDbSessionIdFiles` with excluded files** (`unowned_backups`): an excluded file that no alternate
+   directory holds is acceptable when the destination already has the table file with that session id and size. The
+   port failed with InvalidArgument first. Test: `KeepLatestDbSessionIdFilesAcceptsExcludedFilesTheDestinationHolds`.
+4. **A restore read the file tables of `alternate_dirs` engines without their locks** (upstream read-locks all of
+   them in a fixed order). Test: `RestoreWaitsForAnAlternateDirectoryThatIsBeingWritten`.
+5. **A backup naming something that is not a DB file** emptied the destination before failing with Corruption
+   (upstream too: the names are parsed in the copy loop), and a `shared_checksum` name with no '.' after its '_' threw
+   ArgumentOutOfRangeException. Names are parsed before anything is deleted. Test:
+   `ABackupListingAFileThatIsNotADbFileIsRefusedBeforeTheDestinationIsTouched`.
+6. **`meta/.<id>.tmp` of a failed `StoreToFile` was never removed** (upstream neither: `Initialize` says the auto-GC
+   deletes it, `GarbageCollect` never looks into `meta/`). The garbage collection removes them. Test:
+   `AFailedOrStoppedBackupKeepsTheFilesOfEarlierBackups` (rows "fail the meta file", "fail the meta file rename").
+
+Upstream behaviour seen and not copied (already so before this audit): `GarbageCollect` empties `private/<id>` when it
+meets a `private/<id>.tmp` directory (`GetPrivateFileRel(backup_id)` instead of the child's name), which deletes a
+live backup's private files; the port deletes the `.tmp` directory.
+
+Left as it was, on purpose:
+- `StopBackup` aborts only backups here; upstream's copy engine also aborts restores and checksum reads of that engine.
+- A restore does not check the number of bytes copied when the meta file has no crc32c for a file (never written by
+  either engine; schema 2 allows it). Upstream does not either.
+- `DeleteBackup` does not sync `meta/` between deleting the meta file and the data files (upstream neither); a crash
+  that persisted only the later deletions would leave a backup reported as corrupt, never a silently incomplete one.
+- An I/O error while reading for `VerifyBackup(verify_with_checksum)` surfaces as the I/O error; upstream wraps it in
+  Corruption.
+
+Not checked: case-insensitive file systems; a backup directory used by two engines at once (unsupported upstream as
+well); temperatures (not modelled); the write-side sync calls of a backup (another slice).
+
+## Audit #5: write path under concurrency
+
+Second pass over the write path, this time on the paths that do not fail: `Db/DbImpl.Write.cs`, `Db/WriteThread.cs`,
+`Db/DbImpl.UnorderedWrite.cs`, `Db/DbImpl.TwoWriteQueues.cs`, `Db/Compaction/WriteController.cs`, the stall code
+(`DelayWriteAsync`, `DbImpl.WriteBufferManager.cs`), `DbImpl.LockWal.cs`, `FlushWalAsync` and `CloseAsync`, read
+against `db/db_impl/db_impl_write.cc`, `db/write_thread.cc`, `db/write_batch.cc` (`WriteBatchInternal::InsertInto`),
+`db/write_controller.cc` and `DBImpl::FlushWAL` / `LockWAL` / `UnlockWAL` / `CloseHelper` in `db/db_impl/db_impl.cc`.
+Where the port is built differently (a lock around the writer queue instead of a lock-free list, value task sources
+and monitors instead of condition variables, cancellation, close as the last write leader) it was judged on its own
+invariants. Tests: `tests/RocksDb.Managed.Tests/Validation/Audit5WritePathTests.cs`.
+
+### Invariants checked, per write mode
+
+| Mode | Publication | Who may touch what |
+|---|---|---|
+| default, serial inserts | the leader inserts the group and then sets the last sequence; nothing is published for a group with a failed insert | WAL, `_group`, `_flushScheduler`: the leader only |
+| default, parallel inserts (`allow_concurrent_memtable_write`, group of 2+, no merge, no transaction) | the writer that counts `_parallelRemaining` down to 0 publishes, then completes the others and hands leadership on; the leader does not return before that | group state is written by the leader before it wakes the followers and read after the countdown; flush scheduling under the list's lock |
+| `enable_pipelined_write` | memtable groups run one at a time in WAL order (`_memLeaderActive`), each publishes its last sequence before the next starts; a memtable switch (WAL leader or unbatched leader) first drains the memtable queue with a marker | WAL stage: WAL leader; memtable stage: memtable leader; the marker is used by the WAL / unbatched leader only, which is also the only one that links writers |
+| `unordered_write` | the WAL stage publishes before the inserts (as upstream; snapshots are not immutable); `_pendingMemtableWrites` is raised before leadership is handed on and every switch, unbatched operation and close waits for 0 under `_switchLock` | inserts are concurrent inserts only; the flush scheduler is read by the leader after the drain |
+| `two_write_queues` | allocation and WAL append under the WAL write lock, so WAL order is sequence order; the published sequence only moves forward (CAS) | both queues stall on the write controller; unbatched operations hold both queues |
+
+For all modes: a writer is completed exactly once per wait (re-armed by its owner before it can be completed again:
+before it is linked to the memtable queue, before the parallel countdown); a follower's fields are written by its
+leader before the completion that publishes them (CAS, monitor or `SetResult`); a writer returns to its pool only
+after its last completion was consumed; `ManualResetValueTaskSourceCore` is reset only after its result was
+observed, which the runtime allows while `SetResult` is returning. Grouping rules match `EnterAsBatchGroupLeader`
+line by line (sync behind non-sync, `no_slowdown`, `disableWAL`, protection bytes, unbatched, non-batching callback,
+size; no rate limiter priority and no WBWI ingestion in the port). The stall barrier (`BeginWriteStall` /
+`EndWriteStall`) fails queued and arriving `no_slowdown` writers and nobody else. Lock-free reads were checked for
+ARM64: every cross-thread hand-off goes through a lock, an interlocked operation or a `Volatile` write on the
+publishing side; the plain read of `_cfById` in `CfForInsert` is a pointer published by a release store and then
+dereferenced (dependency ordered), and the write path orders it through the write queue anyway.
+
+### Fixed
+
+- **A canceled stalled leader failed its whole group.** Only write stalls observe a write's `CancellationToken`
+  (`DelayWriteAsync`, the write buffer manager stall). When it fired, the exception was given to every writer of the
+  group: writers that had not asked for a cancellation failed with `IOError: A task was canceled`, and so did the
+  canceled writer itself instead of `OperationCanceledException`. Now the cancellation is the leader's alone: nothing
+  was done for the group yet, so its followers go back to the front of the queue in order
+  (`WriteThread.RequeueFollowers`) and the first of them leads when the leader exits. Default, pipelined, unordered
+  and the WAL-only queue (`CanceledStalledLeaderDoesNotFailTheFollowersOfItsGroup`).
+- **A write stalled by the write buffer manager ignored its cancellation and spun.** The wait was
+  `Task.WhenAny(blocked, Task.Delay(n, token))`, which does not throw; with a canceled token the delay completes at
+  once, so the loop burned a core (and allocated) until the stall ended. It now throws, leaves the manager's stall
+  queue, and is handled like the case above (`CanceledLeaderStalledByWriteBufferManagerIsCanceledAlone`).
+- **FlushWAL / SyncWAL under LockWAL used the WAL unprotected.** While LockWAL is held, `FlushWalAsync` does not enter
+  the write queue (a write leader stalled by the lock holds it until UnlockWAL) and relied on the write stop alone.
+  That excludes write groups, but not a write issued right after UnlockWAL, the memtable switch of a flush (an
+  unbatched leader is not stalled; it writes out and replaces the WAL), a second FlushWAL / SyncWAL, or close: two
+  threads inside one WAL writer, which is a buffered file without synchronization. Upstream takes
+  `wal_write_mutex_` in all of them. The port now has a WAL I/O lock (`_walIoLock`) taken by FlushWAL, UnlockWAL, the
+  memtable switch and close, never by a write group (`FlushWalUnderLockWalExcludesOtherWalUsers`, three racers).
+- **Close waited for a stalled write.** Close becomes the last write leader, and set the shutdown flag only then; a
+  leader waiting for stopped writes holds the queue, so close waited for the stall (for as long as LockWAL was held).
+  Close now announces itself before it enters the queue, as upstream's `DelayWrite` stops waiting once
+  `shutting_down_` is set; the stalled writers fail with `ObjectDisposedException`, the port's error for a write that
+  races the close (upstream: `ShutdownInProgress`). A write that is only briefly stalled when close begins now fails
+  where it used to be committed first (`CloseReleasesAWriteStalledByStoppedWrites`).
+
+### Left open
+
+- A `CancellationToken` is observed only while the write leads a group in a stall. A token that fires while the
+  write is queued, is a follower, or is being committed is ignored and the write commits (by design: a group commit
+  cannot drop one member once its record is being written; a queued writer could be unlinked, but is not).
+- `FlushWalAsync` outside LockWAL goes through the write queue, so it waits behind a write leader that is stalled
+  (memtable or L0 stop). Upstream's FlushWAL only takes `wal_write_mutex_` and does not wait for stalls.
+- Asynchronous followers and hand-offs resume on the thread pool. If every pool thread is blocked in a synchronous
+  write queued behind them, the queue only moves when the pool adds a thread (a slowdown, not a deadlock). Not
+  reproduced; mixing blocking writes on pool threads with asynchronous writes is the precondition.
+- `UserWriteCallback.OnWriteEnqueued` runs after the writer is linked and outside the queue lock, so a fast leader
+  can call `OnWalWriteFinish` first, on another thread. Upstream has the same order (`LinkOne`, then
+  `CheckWriteEnqueuedCallback`).
+- Not covered by a deterministic test in this pass: two write queues with sequence-per-batch transactions, the
+  split insert of one large batch (`DbImpl.SplitInsert.cs`), and the interaction of error recovery with a write group
+  in flight.
+
+## Audit #5: power-loss durability sweep (2026-11-12)
+
+Scope: every place in `src/RocksDb.Managed` (engine only, not `RocksDb.Managed.Replication*`) that creates, renames,
+links, deletes or truncates a persistent file, compared with what the C++ tree (`main`) syncs at the same point and in
+which order. A difference counts as a deviation when a power loss at the worst moment can lose acknowledged data,
+bring deleted data back, or leave a DB that does not open.
+
+Method. (1) Reading: each call of `CreateWritable`, `ReuseWritable`, `ReopenWritable`, `RenameFile`, `LinkFile`,
+`DeleteFile`, `DeleteDirectory`, `WriteAt`, `Truncate` and `SyncDirectory` outside `Env/` against the C++ function it
+ports. (2) Sweeps: `tests/RocksDb.Managed.Tests/Validation/Audit5DurabilityTests.cs` runs a deterministic scenario on a
+`FaultInjectionFileSystem`, records its file-system operations, and repeats it once per create / sync / rename / link /
+delete / directory-sync operation with a power loss at that operation (the operation fails, then
+`MemoryFileSystem.SimulateCrash` drops every unsynced byte and every directory entry created, renamed or deleted since
+the directory's last fsync). After each power loss the DB must open twice, hold every key recorded as durable before
+the loss (sync write, `SyncWal` / `FlushWal(sync)`, flush, ingestion, import, column family creation), not hold a
+key whose deletion was durable, and accept a sync write, a flush and a compaction. `AUDIT5_TRACE=<file>` writes each
+scenario's operation sequence, which is what the "port" column below was read from. 43 tests, 44 swept scenarios, about
+4 300 power-loss points. Scenarios a sweep cannot reach (a held-back flush, a process that dies without closing, an
+operation that fails without a crash) are single tests in the same file.
+
+### Points checked
+
+| Point | C++ (what is synced, in order) | Port | Verdict |
+|---|---|---|---|
+| New DB: IDENTITY | `SetIdentityFile` (`file/filename.cc`): temp file, sync, rename, directory fsync | `FileNames.SetIdentityFileAsync`: same | same |
+| New DB: first MANIFEST | `DBImpl::NewDB`: MANIFEST-000001 written and synced, then `SetCurrentFile`; the MANIFEST is deleted only when writing it failed | the MANIFEST was also deleted when `SetCurrentFile` failed | **deviation, fixed** (below) |
+| New DB / MANIFEST switch: CURRENT | `VersionSet::ProcessManifestWrites`: new MANIFEST written and synced (`SyncManifest`), then `SetCurrentFile`: `NNNNNN.dbtmp`, sync, rename over CURRENT, directory fsync; the old MANIFEST is deleted afterwards | `VersionSet.LogAndApplyAsync`, `FileNames.SetCurrentFileAsync`: same order; a MANIFEST whose CURRENT update failed is kept | same (`CoreWorkloadManifestRollOnEveryEdit`) |
+| MANIFEST append | record(s), `SyncManifest`; no directory fsync | `ManifestWriter.AddEditsAsync` syncs after each batch | same |
+| OPTIONS-N | `PersistRocksDBOptions` writes and fsyncs the temp file, `RenameTempFileToOptionsFile` renames it and fsyncs the directory | `OptionsFile.WriteToDbDirectoryAsync`: same | same |
+| LOCK | created, never synced | same | same |
+| First WAL of an open | `DBImpl::CreateWAL`: created, no directory fsync; the directory is fsynced by the first sync write (`WriteToWAL`, `need_wal_dir_sync = !wal_dir_synced_`) | `CreateWal`; `SyncWalDirIfNeeded` after the first synced record | same. Consequence shared with upstream: with `track_and_verify_wals` a power loss between the first CURRENT and the first sync write leaves "an existing DB with no WAL files" (Corruption on open); nothing was acknowledged (`CoreWorkloadPredecessorWalInfo` accepts exactly that case) |
+| Sync write, `SyncWAL`, `FlushWAL(sync)` | every `logs_` entry synced oldest first, then the WAL directory if a WAL was created since its last fsync | `SyncClosedWalsAsync`, `log.Sync`, `SyncWalDirIfNeeded` (write path, `FlushWalAsync`, second write queue) | same (`SyncWalAndFlushWalMakeEarlierWritesDurable`, with `wal_dir` and `manual_wal_flush`) |
+| Memtable switch | single column family: the old WAL's buffer is written, not synced; several column families / 2PC: `SyncClosedWals` before the flush (file sync, WAL directory fsync if needed) | single column family: same; otherwise the closed WAL is synced (and the WAL directory fsynced) at the switch, before its memtable can be flushed | same / earlier than upstream |
+| Pipelined writes, unordered writes, `two_write_queues` | same WAL sync and WAL directory fsync rules on each path | `DbImpl.Write.cs`, `DbImpl.UnorderedWrite.cs`, `DbImpl.TwoWriteQueues.cs`: same (read only; no change) | same (`CoreWorkloadOtherWritePaths`, each with a separate `wal_dir`) |
+| `allow_2pc` | WALs holding a prepared section are kept until the commit is flushed (`PrecomputeMinLogNumberToKeep2PC`); the commit marker is a sync write | `PrecomputeMinLogNumberToKeep2PC`, `MinLogNumberToKeepForDeletion` | same (`TwoPhaseCommitSurvivesPowerLoss`: a prepared transaction spans two flushes and a reopen) |
+| WAL recycling | `ReuseWritableFile` (rename + open without truncation); `wal_dir_synced_ = false` | `IFileSystem.ReuseWritable`; `_walDirSynced = false` for every new WAL | same (`CoreWorkloadRecycledWals`, `...SeparateWalDir`) |
+| `wal_dir` different from the DB directory | `directories_.GetWalDir()` is the directory fsynced for WALs | `SyncDirectory(WalDir)` | same (`CoreWorkloadSeparateWalDir`) |
+| WAL archive / deletion | `WalManager::ArchiveWALFile`: rename, no fsync; deletion after the MANIFEST edit that advances the log number is synced | `DeleteOrArchiveWal`: same; WALs are deleted after the MANIFEST sync | same (`CoreWorkloadArchivedWals`, `...SeparateWalDir`) |
+| `track_and_verify_wals_in_manifest` | a WAL's synced size is recorded after the file sync and the directory fsync (`MarkLogsSynced` after `SyncWalImpl`) | `NoteClosedWalSynced` after the sync; the MANIFEST record is written later | same (`CoreWorkloadWalsTrackedInManifest`, `...SeparateWalDir`) |
+| Recovered-sequence record at open | written to the new WAL and synced ("otherwise it might get lost after a power reset") | `WriteRecoveredSequenceRecord`: same | same |
+| Flush | `BuildTable`: table file synced; blob files synced by `BlobLogWriter`; `FlushJob::WriteLevel0Table` fsyncs the output directory; then the MANIFEST edit | `FlushJob.WriteLevel0TableAsync` syncs, `SyncDirectory(DbPaths[0])`, then the edit | same. Hardened: the directory is also fsynced when the flush only adds sealed direct-write blob files (upstream fsyncs unconditionally); no test, no way found to produce such a flush |
+| Recovery flush | `WriteLevel0TableForRecovery`: directory fsync before the recovery edit | same (`DbImpl.Open.cs`) | same |
+| Compaction | outputs synced (`CompactionOutputs::WriterSyncClose`), `CompactionJob::SyncOutputDirectories`: output directory, then the blob directory if new blob files were written and it differs | output directory only | **deviation, fixed** (below) |
+| Trivial copy (FIFO temperature change) | `CopyTrivialCompactionFiles`: copies synced, output directory fsynced | same | same |
+| Remote compaction | worker fsyncs its output directory; the primary renames the files in and fsyncs the output directory | same | same |
+| External file ingestion | `ExternalSstFileIngestionJob::Prepare`: copies synced by `CopyFile`; hard links synced by `FileSystem::SyncFile`; data directory fsynced; `write_global_seqno` rewrites and syncs the file; then the MANIFEST edit | hard links were not synced | **deviation, fixed** (below) |
+| `SstFileWriter::Finish` | file synced, no directory fsync | same | same |
+| Column family import | `ImportColumnFamilyJob::Prepare`: link or `CopyFile` (synced); no sync of linked files, no directory fsync | was the same | **upstream gap, hardened** (below) |
+| Column family export | links / synced copies into a staging directory, rename, fsync of the renamed directory | same | same |
+| Checkpoint | `GetLiveFilesStorageInfo` + `CreateCustomCheckpoint`: table / blob / OPTIONS files hard linked; MANIFEST copied to its captured size and synced; CURRENT created and synced; a WAL is hard linked only when "known fully synced and no future writes", any WAL still open (`GetOpenWalSizes`) is copied and synced; staging directory renamed, renamed directory fsynced | only the last WAL was copied | **deviation, fixed** (below); the port also fsyncs the parent directory |
+| Backup creation (write side) | shared files copied to a temp name, synced, renamed; private files copied and synced; meta file temp + sync + rename; then fsync of the private, `private/`, `meta/`, shared and backup directories (all with `sync`) | same order | same (`BackupSurvivesPowerLoss`) |
+| Obsolete table / blob / MANIFEST / OPTIONS files | deleted after the MANIFEST edit that drops them is synced; through the `SstFileManager` trash when rate limited (rename to `.trash`, delete, directory fsync) | same | same (`CoreWorkloadSstFileManagerTrash`, `ColumnFamilyCreateDropAndDeleteFilesInRange`) |
+| `db_paths` | each data directory fsynced by the job that wrote into it | flush / ingestion / import: first path; compaction: output path | same after the compaction fix (`CoreWorkloadTwoDbPaths*`, `CompactionToSecondDbPathSurvivesPowerLoss`) |
+| Blob direct write | sync write: `BlobFilePartitionManager::SyncAllOpenFiles` (files only), then the WAL | was the same | **upstream gap, hardened** (below) |
+| DestroyDB, RepairDB | deletions in directory order, no fsync; repair writes a new MANIFEST with `SetCurrentFile` | same (read only, no sweep) | same |
+
+### Deviations fixed
+
+| Where | Deviation | Consequence | Test (failed before the fix) |
+|---|---|---|---|
+| `Db/ExternalSstFileIngestionJob.cs` (`PrepareAsync`) | Files ingested with `move_files` / `link_files` were hard linked without the `FileSystem::SyncFile` upstream does ("It is unsafe to assume application had sync the file and file directory before ingest the file"). | An external file the application never fsynced: after the ingestion returned, a power loss left a table file with no data that the MANIFEST names; the DB failed to open (Corruption: file size mismatch). | `IngestWithLinkSyncsTheLinkedFile`, `IngestedFilesSurvivePowerLoss(true, false, true)` and the other unsynced-source rows |
+| `Db/DbImpl.Compaction.cs` | Only the compaction's output path was fsynced. With `db_paths` and blob files, a compaction to another path than the first writes its blob files to the first path (`cf_paths.front()`), which was not fsynced before the MANIFEST edit. | After a power loss the MANIFEST named blob files that did not exist: reads of the compacted keys failed with a missing blob file. | `CompactionToSecondDbPathSurvivesPowerLoss(true)` |
+| `Db/DbImpl.Open.cs` (`NewDbAsync`) | MANIFEST-000001 was deleted after any failure of the first open, including a `SetCurrentFile` that had already renamed CURRENT into place (its directory fsync failed). Upstream deletes it only when writing the MANIFEST failed. | A failed directory fsync during the creation of a DB left a CURRENT naming a MANIFEST that was gone: every later open failed (IOError, MANIFEST-000001 not found) until the directory was cleaned by hand. Not a power-loss case (after a power loss nothing can be deleted), found while reading the failure paths. | `FailedDirectoryFsyncOfTheFirstCurrentLeavesAnOpenableDb` |
+| `Db/DbImpl.Checkpoint.cs` (`GetLiveFilesStorageInfoAsync`), `Db/DbImpl.Replication.cs` (`FlushWalAsync`) | Every live WAL but the last was hard linked. Upstream copies every WAL still open in `logs_`; with one column family a closed WAL is not synced at the memtable switch. | A checkpoint taken without a flush shared the unsynced data of a closed WAL through the hard link: after a power loss the checkpoint missed writes it had captured. | `CheckpointCopiesClosedWalsThatWereNotSynced` |
+
+### Upstream gaps the port no longer shares (stricter than upstream)
+
+| Where | Gap (same in C++) | Consequence | Test (failed before the change) |
+|---|---|---|---|
+| `Db/ImportColumnFamilyJob.cs` (`PrepareAsync`) | `ImportColumnFamilyJob::Prepare` links or copies the files into the DB directory and `CreateColumnFamilyWithImport` writes the MANIFEST edit; nothing fsyncs the directory, and linked files are not synced. | After a power loss the MANIFEST named table files without a directory entry: the DB failed to open. The port now syncs linked files and fsyncs the directory before the edit. | `ImportedColumnFamilySurvivesPowerLoss(false / true)` |
+| `Db/Blob/BlobDirectWriteManager.cs` (`SyncAllOpenFiles`) | A sync write with `enable_blob_direct_write` syncs the open blob files and the WAL, never the directory of a blob file created since the last directory fsync. | The acknowledged sync write was in the WAL but its value could not be read after a power loss (missing blob file). The directory is now fsynced once per new blob file, before the WAL write. | `BlobDirectWriteSyncWriteSurvivesPowerLoss` |
+
+### Open
+
+- **Blob direct write and a crash between sealing and registration** (not a sync-order problem; found by the first
+  version of the blob direct write sweep, which was reduced to the case above). A flush seals the direct-write blob
+  files of its memtable (footer, sync) and registers them in its MANIFEST edit. If the process dies in between, the WAL
+  still holds the blob indexes, the recovery flush writes them into a table file, and the sealed file, which is in no
+  version, has a footer and is tracked by no manager, is deleted as obsolete on that open: the keys then fail with a
+  missing blob file. A process kill is enough, no power loss is needed. By reading, upstream does the same
+  (`ShouldKeepBlobFileDuringPurge` keeps only tracked or footer-less files; recovery registers nothing;
+  `db_impl.cc`: "Blob direct-write relies on clean shutdown flushes to register live blob files"); this was not run
+  against native RocksDB (the 11.12 package has no blob direct write). Fixing it means registering the blob files the
+  replayed WALs reference during recovery, which is a change of the recovery path, not of a sync. Written up for upstream in `upstream-issues/04-blob-direct-write-sealed-file-deleted-after-crash.md`; reading the C++ for it showed the window is wider than a crash during a flush: `WriteBlob` also seals a partition's file when it reaches `blob_file_size`, and that file stays unregistered until its memtable's flush commits.
+- A checkpoint also hard links live WALs written by an earlier process (kept alive by `avoid_flush_during_recovery`),
+  whose contents that process may never have synced. Upstream does the same: `GetOpenWalSizes` only knows the WALs of
+  the running instance.
+- `use_fsync` is accepted and ignored: file syncs are `fdatasync` on Linux and `RandomAccess.FlushToDisk` elsewhere
+  (`fsync`; `F_FULLFSYNC` on macOS). Upstream's default is `fdatasync` too.
+- A close does not sync the WAL, and a failed flush of `disableWAL` writes during close is not reported, as upstream
+  (`CancelAllBackgroundWork`: "What to do on error?").
+
+### Not expressible in the crash model
+
+- `MemoryFileSystem` makes a directory and a directory rename durable at once: the fsync of a renamed checkpoint /
+  export directory and of its parent cannot fail a test. Those were compared by reading only.
+- It drops all unsynced data of a file and nothing else. An in-place overwrite below the synced length (a recycled
+  WAL, `write_global_seqno`) survives as if synced, unsynced data never partially survives, and synced data is never
+  torn; `WriteAt` marks the whole file synced.
+- Nothing models `fsync` versus `fdatasync`, a lying device, or Windows (directory fsync is a no-op there, as in
+  upstream).
+
+Not covered by this sweep: the WritePrepared / WriteUnprepared transaction policies, the backup engine's restore,
+verify and garbage collection (under review elsewhere), tools, and `RocksDb.Managed.Replication*`.
+
+Seen once while running the suite: `AtomicReplaceRangeTests.UniversalPartialOverlapIngestsRangeTombstoneBelowNewFiles`
+failed in a full net10.0 run (level shape `0,0,0,0,1,0,1` instead of `0,0,0,0,1,1,2`) and passed in the net11.0 run and
+15 of 15 runs on its own. It asserts the level shape before `WaitForCompact` with automatic universal compactions on,
+so a background compaction can race the assertion under load. It does not use `move_files` / `link_files`, the only
+ingestion path this audit changed. Left as is (not in this audit's area).
+
+## Audit #5: flush behaviour
+
+Read against `db/flush_job.cc` (WriteLevel0Table), `db/builder.cc` (BuildTable), `db/memtable_list.cc`
+(IsFlushPending, PickMemtablesToFlush, FlushRequested), `db/compaction/compaction_iterator.cc`, `db/merge_helper.cc`,
+`db/output_validator.cc`, `db/column_family.cc` (SanitizeCfOptions) and `VersionSet::Close`. Native differentials:
+`Audit5FlushCompatTests` (every level-0 file read entry by entry with the managed reader: user key, sequence number,
+type, value, range tombstones, entry counters, and the memtable payload / garbage tickers). Unit tests:
+`Audit5FlushTests`.
+
+| Item | What differed observably | Now | Left |
+|---|---|---|---|
+| Merge helper, single deletes and range tombstones at flush | BuildTable reads the memtables through a CompactionIterator; the port only applied rule (A). Differentials showed: merge operands written one by one (native: operands of a stripe partially merged into one operand, or fully merged onto a Put / Delete base into a value at the newest operand's seqno); a SingleDelete and the Put it deletes both written (native: both dropped; with a snapshot in between native keeps the SingleDelete and the Put); keys covered by a range tombstone of the same stripe written (native: dropped); different entry counts, raw key / value sizes and MEMTABLE_PAYLOAD / GARBAGE_BYTES_AT_FLUSH; a memtable of a Put + SingleDelete produced an L0 file where native produces none. A merge operator failure did not fail the flush (it does upstream). | `FlushJob.AddPointEntriesThroughCompactionIterator`: when a memtable holds a merge operand, single delete or TimedPut entry (`MemTable.HasFlushResolvedEntries`, set by the first such insert) or the flush has range tombstones, the memtables go through `CompactionIterator` (no compaction, the flush's snapshots, earliest write-conflict snapshot, enforce_single_del_contracts, a `MergeHelper` with snapshots.back(), blob extraction and blob base values from the base version) exactly as BuildTable; TimedPut entries get their preferred seqno after it. Same for the recovery flush. Memtables with only Put / Delete / blob index / entity entries keep the copy loop (its output equals the iterator's for them). Differentials: puts/deletes/snapshots, merges (no base, Put base, Delete base, operand hidden by a Put), merges stopped at snapshots, merges with range tombstones, covered keys, single-delete pairs, several flushes, recovery flushes, 4 seeded random op streams: identical files and tickers. | With a transaction snapshot checker the copy loop is kept (no version dropped, nothing merged; correct, left to compaction); persist_user_defined_timestamps = false keeps its own min-timestamp path (merges not collapsed there). |
+| Compaction filter at flush | The factory's flush filter was created and checked for IgnoreSnapshots but never applied. (Not observable against the 11.12 C API: its factory never asks for flushes.) | The filter (Context: not full, not manual, the CF id) goes to the CompactionIterator and the MergeHelper (level 0): Remove (Deletion at the value's seqno), ChangeValue, RemoveAndSkipUntil, Purge, merge operands newer than every snapshot; the plain `compaction_filter` option is not applied to flushes (as upstream). Recovery flushes ask `ShouldFilterTableFileCreation(isFlush: true)` too (the managed API has no reason enum). No ticker: upstream records no dropped-key ticker for flushes. | Same two exceptions as above (snapshot checker, timestamps in memtable only): the filter is not applied there. |
+| min_write_buffer_number_to_merge | Ignored: every sealed memtable was flushed into its own L0 file at once (native waits; differential `SealedMemtablesWaitForMinWriteBufferNumberToMergeLikeNative`: native 2 sealed memtables / 0 files, then 1 file of 8 entries after a manual flush). | `ColumnFamilyData.HasPendingFlush` is IsFlushPending: `FlushRequested && n > 0 \|\| n >= min_write_buffer_number_to_merge`. `FlushRequested` is set by manual flushes (also with an empty memtable), WAL-size (kWalFull) and write buffer manager switches and error recovery, not by a full memtable; cleared when a flush picks the last waiting memtable. The picked memtables are merged in one flush (rule (A) across memtables, merges across memtables through the CompactionIterator). Sanitizing (<= max_write_buffer_number - 1; 1 with atomic_flush) was already ported. | `FlushOptions.AllowWriteStall` (WaitUntilFlushWouldNotStallWrites, which also reads min_write_buffer_number_to_merge) is still not implemented. |
+| paranoid_file_checks for flush outputs | Not read back. | BuildTable's OutputValidator: the NPHash64 of every key / value added is kept and compared after reading the finished table back through the table cache; "Paranoid checksums do not match" (Corruption), the output deleted. With the option set the flush takes the CompactionIterator path (identical output), which keeps the hash. Test hook `BuildTable:BeforeOutputValidation`. | With a snapshot checker the read-back runs without the hash comparison. The order check of OutputValidator (one key comparison per entry) is not done in the plain copy loop (a memtable iterates in order). |
+| MANIFEST size check on close | Not done. | `VersionSet.VerifyManifestSizeOnCloseAsync` on every close of a writable DB: closes the writer, compares the file size with the bytes written, on a mismatch logs "MANIFEST verification on Close ..." and writes a new MANIFEST (empty edit); then the content check of verify_manifest_content_on_close. | OnIOError (kVerify) listener call. |
+
+Default flush output: with default options (no merge operator in use, no filter, min_write_buffer_number_to_merge = 1,
+paranoid_file_checks off) memtables of Put / Delete entries take the unchanged copy loop; the differential
+`PutsAndDeletesMatchNative` passed before and after these changes (no difference to native found there). Costs to measure:
+one predictable branch per memtable insert (the HasFlushResolvedEntries flag), one scan of the memtable list per
+HasPendingFlush call; flushes of memtables with merges / single deletes / range tombstones now run the CompactionIterator
+(virtual iterator calls per entry, a MergingIterator over several memtables) instead of the copy loop.
+
+## Audit #5: standalone range tombstones in universal compaction
+
+Read against `FileMetaData::FileIsStandAloneRangeTombstone` (`db/version_edit.h`), `UniversalCompactionBuilder`
+(`db/compaction/compaction_picker_universal.cc`: constructor, `CalculateSortedRuns`, `ShouldSkipMarkedFile`,
+`PickDeleteTriggeredCompaction`, `BuildCompactionToNextLevel`, and every reader of `level_has_marked_standalone_rangedel`),
+`CompactionPicker::PickFilesMarkedForCompaction` / `GetOverlappingL0Files` / `SetupOtherInputs` (`starting_l0_file`),
+`VersionStorageInfo::ComputeFilesMarkedForCompaction` / `RemoveFilesBeingCompactedFromCompactionCandidates`
+(`standalone_range_tombstone_files_mark_threshold_`) and the snapshot release path of `DBImpl`
+(`ReconcileOldestSnapshotForColumnFamily`, `UpdateSnapshotCompactionThresholds`). Unit tests:
+`Audit5StandaloneRangeTombstoneTests`; native differential: `Audit5StandaloneRangeTombstoneCompatTests` (native 11.12
+behaves the same; no gate).
+
+Found through `AtomicReplaceRangeTests.UniversalPartialOverlapIngestsRangeTombstoneBelowNewFiles`, which had dropped the
+upstream shape assertions (after `WaitForCompact` with the snapshot held, and after the release): with them restored it
+failed 40 of 40 runs, because the port compacted the ingested tombstone file (L5) into L6 while the snapshot was held
+(reason `FilesMarkedForCompaction`). The intermittent failure noted in the previous section was that compaction winning
+the race against the assertion taken right after the ingestion. Restored; 40 of 40 runs pass.
+
+| Item | What differed | Now |
+|---|---|---|
+| Standalone files not recognised | The picker header said the per-file entry counts were not kept; they are (`SetEntryStats`). | `FileMetaData.FileIsStandAloneRangeTombstone`. Ingested files get their entry stats from the properties read while validating them (upstream reads the same values in `MaybeInitializeFileMetaData`), so the picker does not depend on the capped stats load of the new version. |
+| Deferral while a snapshot is older | A marked standalone file was compacted at once. | `UniversalCompactionPicker` gets the live snapshots and the DB's snapshot checker (`PickCompaction(vstorage, snapshots, snapshotChecker, requireMaxOutputLevel)`; earliest snapshot only without user-defined timestamps). `ShouldSkipMarkedFile` defers the file until `DataIsDefinitelyInSnapshot(largest_seqno, earliest snapshot)`, and while the next older sorted run also has a marked standalone file. Used for the single-level path and, through a skip predicate, `PickFilesMarkedForCompaction`; the leveled picker passes a predicate that never skips, as upstream. The file's sorted run is found by a scan of the (short) run list instead of upstream's per-pick `std::map`. |
+| Other universal compactions | Size amp, size ratio, sorted-run count and periodic compactions could take the run holding the file. | `SortedRun.LevelHasMarkedStandaloneRangeDel`: those compactions stop at (or do not count) such a run, as upstream. |
+| Newer L0 files pulled in | An L0 standalone file was compacted with the newer L0 files it overlaps. | `starting_l0_file` for `GetOverlappingL0Files` / `SetupOtherInputs`. |
+| Rescheduling on snapshot release | Nothing re-examined the deferred file. | `VersionStorageInfo.StandaloneRangeTombstoneFilesMarkThreshold` (computed with the marked files); `DbImpl._standaloneRangeDeletionFilesMarkThreshold` (minimum over the column families, lowered when a version is installed); a snapshot release with the oldest snapshot at or past it schedules the column families whose threshold it passed and recomputes it over all of them, so a later release schedules another attempt while the file is still marked (as in `StandaloneRangeTombstoneSnapshotAdvanceRequeuesScheduling`). |
+| Ingestion notification poisoned the table cache | `NotifyOnExternalFileIngested` opened the ingested table through the table cache with a `FileMetaData` lacking its largest seqno; the cached reader had no global sequence number, so a later compaction read the file's range tombstones at seqno 0 and kept the keys they delete. It was hidden while the stats load of the new version opened the table first. | The notification reports the properties read during validation (upstream `info.table_properties = f.table_properties`). Covered by `StandaloneRangeDeletionEndKeyIsExclusive` (listener registered). |
+
+Left: `Compaction::FilterInputsForCompactionIterator` (input files fully covered by a standalone tombstone that the
+earliest snapshot sees are dropped without being read, with the `num_filtered_input_files_*` / `bytes_skipped_*`
+compaction statistics) is not ported: the port reads those files and drops their keys in the compaction iterator. The
+output and the resulting levels are the same; the I/O and those statistics differ (they stay 0).

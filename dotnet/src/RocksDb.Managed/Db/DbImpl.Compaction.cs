@@ -89,6 +89,9 @@ internal sealed partial class DbImpl
             {
                 _bottommostFilesMarkThreshold = Math.Min(_bottommostFilesMarkThreshold, current.Storage.BottommostFilesMarkThreshold);
             }
+            // standalone_range_deletion_files_mark_threshold_ (UpdateSnapshotCompactionThresholds).
+            _standaloneRangeDeletionFilesMarkThreshold = Math.Min(_standaloneRangeDeletionFilesMarkThreshold,
+                current.Storage.StandaloneRangeTombstoneFilesMarkThreshold);
         }
         if (versionOrMemTablesChanged) RecalculateWriteStall(cfd);
         if (_compactionsEnabled)
@@ -109,22 +112,67 @@ internal sealed partial class DbImpl
     private ulong _bottommostFilesMarkThreshold = DbFormat.MaxSequenceNumber;
 
     /// <summary>
-    /// The bottommost-file part of DBImpl::ReleaseSnapshot: with the oldest snapshot (or the last sequence when none is
-    /// left) past the mark threshold, every column family's current version re-marks its bottommost files
-    /// (VersionStorageInfo::UpdateOldestSnapshot) and those with marked files are scheduled; the threshold is
-    /// recomputed over the others. REQUIRES: mutex.
+    /// standalone_range_deletion_files_mark_threshold_: the minimum over the column families of the smallest seqno of a
+    /// standalone range tombstone file marked for compaction. The universal picker defers such a file while an older
+    /// snapshot exists; a snapshot release that brings the oldest snapshot to it schedules the compaction again.
+    /// Guarded by the mutex.
+    /// </summary>
+    private ulong _standaloneRangeDeletionFilesMarkThreshold = DbFormat.MaxSequenceNumber;
+
+    /// <summary>
+    /// The compaction part of DBImpl::ReleaseSnapshot. With the oldest snapshot (or the last sequence when none is left)
+    /// past the bottommost mark threshold, every column family's current version re-marks its bottommost files
+    /// (VersionStorageInfo::UpdateOldestSnapshot) and those with marked files are scheduled; the threshold is recomputed
+    /// over the others. With the oldest snapshot at or past the standalone range deletion threshold, the column families
+    /// whose deferred standalone range tombstone files the oldest snapshot now sees are scheduled again
+    /// (ReconcileOldestSnapshotForColumnFamily), and that threshold is recomputed over all of them: a file stays marked
+    /// until it is compacted, so a later release schedules another attempt. REQUIRES: mutex.
     /// </summary>
     internal void OnSnapshotReleased()
     {
         if (_readOnly) return;
+        bool scheduled = MaybeScheduleStandaloneRangeDeletionCompactions(_snapshots.OldestSequence(Versions.LastSequence));
+        OnSnapshotReleasedBottommost(scheduled);
+    }
+
+    /// <summary>
+    /// The standalone range tombstone part of DBImpl::ReleaseSnapshot (see <see cref="OnSnapshotReleased"/>). Returns
+    /// whether a column family was scheduled. REQUIRES: mutex.
+    /// </summary>
+    private bool MaybeScheduleStandaloneRangeDeletionCompactions(ulong oldestSnapshot)
+    {
+        if (oldestSnapshot < _standaloneRangeDeletionFilesMarkThreshold) return false;
+        bool scheduled = false;
+        ulong newThreshold = DbFormat.MaxSequenceNumber;
+        foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
+        {
+            if (cfd.Dropped || cfd.Current is null) continue;
+            ulong threshold = cfd.Current.Storage.StandaloneRangeTombstoneFilesMarkThreshold;
+            if (oldestSnapshot >= threshold)
+            {
+                if (_compactionsEnabled) SchedulePendingCompaction(cfd);
+                scheduled = true;
+            }
+            newThreshold = Math.Min(newThreshold, threshold);
+        }
+        _standaloneRangeDeletionFilesMarkThreshold = newThreshold;
+        return scheduled;
+    }
+
+    /// <summary>The bottommost-file part of DBImpl::ReleaseSnapshot (see <see cref="OnSnapshotReleased"/>). REQUIRES: mutex.</summary>
+    private void OnSnapshotReleasedBottommost(bool scheduled)
+    {
         ulong oldestSnapshot = _snapshots.OldestSequence(Versions.LastSequence);
         // Managed safeguard (upstream relies on the transaction layer's snapshots): with a snapshot checker, entries
         // that may still be uncommitted cannot be zeroed, so the oldest snapshot used for marking stays below them.
         if (CurrentSnapshotChecker is { } checker) oldestSnapshot = checker.BoundOldestSnapshotForBottommostMarking(oldestSnapshot);
         // Avoid to go through every column family by checking a global threshold first.
-        if (oldestSnapshot <= _bottommostFilesMarkThreshold) return;
+        if (oldestSnapshot <= _bottommostFilesMarkThreshold)
+        {
+            if (scheduled && _compactionsEnabled) MaybeScheduleCompaction();
+            return;
+        }
         ulong newThreshold = DbFormat.MaxSequenceNumber;
-        bool scheduled = false;
         foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
         {
             if (cfd.Dropped || cfd.Current is null) continue;
@@ -415,6 +463,8 @@ internal sealed partial class DbImpl
                 if (IsDbStopped && ErrorHandler.BgError is { } e) ThrowBackgroundError(e);
                 if (!wc.IsStopped) return;
                 if (_shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
+                // Close waits for the write queue this leader holds: the write fails like one that queued behind the close.
+                if (_closing) ThrowDisposed();
                 wait = _bgSignal.Task;
             }
             if (noSlowdown) throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Write stall");
@@ -496,7 +546,7 @@ internal sealed partial class DbImpl
             cfd.CompactionState.QueuedForCompaction = false;
             if (cfd.Dropped || cfd.Options.DisableAutoCompactions) continue;
             ulong[] snapshots = SnapshotsForCompaction();
-            Compaction? c = cfd.CompactionState.Picker.PickCompaction(cfd.Current.Storage, snapshots);
+            Compaction? c = cfd.CompactionState.Picker.PickCompaction(cfd.Current.Storage, snapshots, CurrentSnapshotChecker, requireMaxOutputLevel: false);
             if (c is null) continue;
             if (!EnoughRoomForCompaction(cfd, c))
             {
@@ -740,7 +790,7 @@ internal sealed partial class DbImpl
                     {
                         TestHooks.Invoke("DBImpl::BackgroundCompaction():BeforePickCompaction");
                         snapshots = SnapshotsForCompaction();
-                        c = picker.PickCompaction(cfd.Current.Storage, snapshots, requireMaxOutputLevel: true);
+                        c = picker.PickCompaction(cfd.Current.Storage, snapshots, CurrentSnapshotChecker, requireMaxOutputLevel: true);
                         if (c is not null)
                         {
                             c.InputVersion = cfd.Current;
@@ -953,7 +1003,11 @@ internal sealed partial class DbImpl
                 edit.BlobFileAdditions.AddRange(job.BlobFileAdditions);
                 edit.BlobFileGarbages.AddRange(job.BlobFileGarbages);
                 AddCompactCursorEdit(cfd, c, edit);
-                if (job.Outputs.Count + job.ProximalOutputs.Count > 0) FileSystem.SyncDirectory(DbPaths[(int)Math.Min(c.OutputPathId, (uint)(DbPaths.Count - 1))]);
+                // CompactionJob::SyncOutputDirectories: the output directory, then the blob directory (cf_paths.front())
+                // when new blob files were written and it is a different directory.
+                int outputPath = (int)Math.Min(c.OutputPathId, (uint)(DbPaths.Count - 1));
+                if (job.Outputs.Count + job.ProximalOutputs.Count > 0) FileSystem.SyncDirectory(DbPaths[outputPath]);
+                if (job.BlobFileAdditions.Count > 0 && (outputPath != 0 || job.Outputs.Count + job.ProximalOutputs.Count == 0)) FileSystem.SyncDirectory(DbPaths[0]);
                 }
             }
             lock (_mutex)

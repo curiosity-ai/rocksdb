@@ -445,6 +445,32 @@ internal sealed class WriteThread
     }
 
     /// <summary>
+    /// The leader of <paramref name="group"/> gives up before anything was done for the group (its asynchronous write was
+    /// canceled while it waited for a write stall): the followers go back to the front of the queue in their order, ahead
+    /// of the writers that stayed queued, and <paramref name="group"/> keeps the leader only. They were never woken, so
+    /// they still wait; the leader's exit (<see cref="ExitAsLeader"/> through one of the ExitAs... methods) hands the
+    /// leadership to the first of them. No upstream counterpart (a blocking write cannot be canceled). REQUIRES: the
+    /// caller leads the group, and no follower was touched yet (callbacks, sequence numbers, WAL). Cancellation path only.
+    /// </summary>
+    public void RequeueFollowers(List<Writer> group)
+    {
+        if (group.Count < 2) return;
+        lock (_lock)
+        {
+            Writer? head = _head;
+            for (int i = group.Count - 1; i >= 1; i--)
+            {
+                Writer w = group[i];
+                w.Next = head;
+                head = w;
+            }
+            if (_tail is null) _tail = group[^1];
+            _head = head;
+        }
+        group.RemoveRange(1, group.Count - 1);
+    }
+
+    /// <summary>
     /// Port of ExitAsBatchGroupLeader: completes the followers of the group (not the leader itself) and hands
     /// leadership to the next queued writer, if any.
     /// </summary>

@@ -181,6 +181,7 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
             _writeThread.BeginWriteStall();
             try
             {
+            TestHooks.Invoke("DBImpl::WriteBufferManagerStallWrites:Wait");
             if (wbm.FlushPolicy == WriteBufferFlushPolicy.FlushLargestAcrossDbs)
             {
                 while (true)
@@ -188,6 +189,8 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
                     if (synchronous) blocked.Wait(20, cancellationToken);
                     else await Task.WhenAny(blocked, Task.Delay(20, cancellationToken)).ConfigureAwait(false);
                     if (blocked.IsCompleted) break;
+                    // Task.WhenAny does not observe the canceled delay: without this the loop would spin until the stall ends.
+                    cancellationToken.ThrowIfCancellationRequested();
                     if (wbm.TryAcquireLocalFlush(stall))
                     {
                         wbm.RemoveDbFromQueue(stall);
@@ -204,8 +207,15 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
                 {
                     if (synchronous) blocked.Wait(100, cancellationToken);
                     else await Task.WhenAny(blocked, Task.Delay(100, cancellationToken)).ConfigureAwait(false);
+                    if (!blocked.IsCompleted) cancellationToken.ThrowIfCancellationRequested();
                 }
             }
+            }
+            catch (OperationCanceledException)
+            {
+                // The canceled write leaves the stall: the manager must not keep a waiter that is gone in its queue.
+                wbm.RemoveDbFromQueue(stall);
+                throw;
             }
             finally
             {

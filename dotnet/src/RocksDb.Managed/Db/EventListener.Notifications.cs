@@ -350,14 +350,16 @@ internal sealed partial class DbImpl
         if (!HasListeners) return;
         foreach (IngestedFileInfo f in job.Files)
         {
-            var meta = new FileMetaData { FileNumber = f.FileNumber, FileSize = f.FileSize };
+            // info.table_properties = f.table_properties: the properties read while validating the file. (Opening the
+            // table through the table cache here with a FileMetaData lacking the file's largest seqno cached a reader
+            // without the global sequence number, which a later compaction then read the range tombstones from.)
             var info = new ExternalFileIngestionInfo
             {
                 ColumnFamilyName = cfd.Name,
                 ExternalFilePath = f.ExternalFilePath,
                 InternalFilePath = f.InternalFilePath,
                 GlobalSeqno = f.AssignedSeqno,
-                TableProperties = TryGetTableProperties(cfd, meta),
+                TableProperties = f.Properties,
             };
             InvokeListeners(info, static (l, db, i) => l.OnExternalFileIngested(db, i), nameof(EventListener.OnExternalFileIngested));
         }

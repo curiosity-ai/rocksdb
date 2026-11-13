@@ -69,6 +69,13 @@ internal abstract class SnapshotChecker
     /// compaction's snapshots, so their sequence numbers cannot be zeroed and the rewrite would be repeated forever.
     /// </summary>
     public virtual ulong BoundOldestSnapshotForBottommostMarking(ulong oldestSnapshot) => oldestSnapshot;
+
+    /// <summary>
+    /// DataIsDefinitelyInSnapshot (db/snapshot_checker.h, utilities/transactions/snapshot_checker.cc):
+    /// <paramref name="seqno"/> is visible to <paramref name="snapshot"/> and, with a checker, known to be committed in it.
+    /// </summary>
+    public static bool DataIsDefinitelyInSnapshot(ulong seqno, ulong snapshot, SnapshotChecker? snapshotChecker) =>
+        seqno <= snapshot && (snapshotChecker is null || snapshotChecker.CheckInSnapshot(seqno, snapshot) == SnapshotCheckerResult.InSnapshot);
 }
 
 /// <summary>

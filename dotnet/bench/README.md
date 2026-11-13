@@ -129,12 +129,27 @@ workload (no JIT there, but the page cache, allocator and file system then start
    compaction compiles fewer than 10 methods (at most 16 cycles). The methods that run once per compaction output file
    or subcompaction need ~60 calls to reach tier 1; with small target files or subcompactions the fixed cycles create too
    few output files and the measured `compact` used to tier up 200 - 400 methods.
-5. The warm-up DB (and its `-txn*` siblings) is deleted; C rebuilds its options, so the measured DB starts with a fresh
+5. .NET only: **write rounds**. Every round starts on a fresh warm-up DB and replays the write benchmarks of the list
+   (fills, overwrite, deleterandom, readwhilewriting, readrandomwriterandom with writes) with the measured `--num`,
+   `--threads` and options, then waits for the background work; rounds repeat until one compiles fewer than 10 methods
+   (at most `--warmup_write_rounds` rounds, default 8, 0 = none, and `--warmup_write_rounds_ms`, default 90000). The
+   steps above write `--warmup_ops` keys, which with the default 64 MiB write buffer never fill a memtable, so the
+   measured fill used to run the process's first automatic memtable switches, flushes, multi-level compactions and
+   trivial moves: 210 - 550 methods compiled or tiered up while it was timed. With the rounds: 6 - 12 (2026-11-12,
+   `bench/results/2026-11-12-warmup-jit.md`). They cost time: 2,000,000 x 100 B took 6 rounds, 77 s at 1 thread and
+   102 s at 4 threads instead of ~6 s for the whole warm-up; pass `--warmup_write_rounds 0` (in `EXTRA_ARGS` for
+   `run-all.sh`) for a quick run. Read benchmarks are not affected (they ran warm before).
+6. The warm-up DB (and its `-txn*` siblings) is deleted; C rebuilds its options, so the measured DB starts with a fresh
    block cache in every leg. .NET: a full blocking GC, then the runner waits until
    `JitInfo.GetCompiledMethodCount` has been stable for 200 ms.
-6. Every **measured** benchmark starts after a settle pause: the .NET runner waits until the JIT has been quiet for
+7. Every **measured** benchmark starts after a settle pause: the .NET runner waits until the JIT has been quiet for
    200 ms (methods that reached their call count during the DB open or the previous benchmark are compiled then), the
    C leg sleeps 200 ms.
+
+`DBBENCH_JIT_METHODS=1` (or `=N` for the first N) names the methods compiled while each measured benchmark ran, with
+their tier (`JIT,<benchmark>,<tier>,<type>::<method>` rows; `QuickJitted` = a path the warm-up never ran,
+`OptimizedTier1*` = one it ran too few times). The tracer's own event-payload reflection adds ~140 `System.*` rows to
+the first measured benchmark; the `jit` column of a run without it is the reference.
 
 The .NET runner prints the JIT statistics of the warm-up (`warmup : done in ... s; JIT during warm-up N methods X ms,
 while quiescing ...`) and, for every measured benchmark, the methods compiled while it was being timed (all threads,

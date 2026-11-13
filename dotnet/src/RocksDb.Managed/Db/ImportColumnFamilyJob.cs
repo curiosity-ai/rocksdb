@@ -108,6 +108,9 @@ internal sealed class ImportColumnFamilyJob
                     {
                         _fs.LinkFile(f.ExternalPath, inside);
                         f.InternalPath = inside;
+                        // Stricter than upstream (which neither syncs the linked file nor the directory here): as in
+                        // ExternalSstFileIngestionJob::Prepare, the exporter may never have synced the file.
+                        _fs.SyncFile(inside);
                         continue;
                     }
                     catch (RocksDbException e) when (e.Code == StatusCode.NotSupported)
@@ -119,6 +122,10 @@ internal sealed class ImportColumnFamilyJob
                 await _db.CopyFileAsync(f.ExternalPath, inside, 0, synchronous, ct).ConfigureAwait(false);
             }
         }
+        // Stricter than upstream: the directory entries of the new files are made durable before the MANIFEST edit that
+        // adds them (ImportColumnFamilyJob::Prepare has no directory fsync, so after a power loss the MANIFEST can name
+        // table files that do not exist and the DB does not open).
+        _fs.SyncDirectory(_db.DbPaths[0]);
     }
 
     /// <summary>

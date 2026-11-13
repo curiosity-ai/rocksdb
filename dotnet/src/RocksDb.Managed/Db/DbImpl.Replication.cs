@@ -547,14 +547,37 @@ internal sealed partial class DbImpl
     // ---- WAL flush / sync ------------------------------------------------------------------------------
 
     /// <summary>Port of DBImpl::FlushWAL: pushes buffered WAL data to the OS (manual_wal_flush) and optionally syncs it.</summary>
-    public async ValueTask FlushWalAsync(bool sync, bool synchronous, CancellationToken ct)
+    public ValueTask FlushWalAsync(bool sync, bool synchronous, CancellationToken ct) => FlushWalAsync(sync, synchronous, null, ct);
+
+    /// <summary>
+    /// <see cref="FlushWalAsync(bool, bool, CancellationToken)"/> that also reports, in <paramref name="openWals"/>, the
+    /// numbers of the WALs this instance still holds open after the flush (DBImpl::GetOpenWalSizes: the logs_ entries
+    /// with a file, i.e. the current WAL and the closed WALs that were not synced yet).
+    /// </summary>
+    internal async ValueTask FlushWalAsync(bool sync, bool synchronous, HashSet<ulong>? openWals, CancellationToken ct)
     {
         ThrowIfDisposed();
         if (_readOnly) ThrowHelper.NotSupported("FlushWAL is not supported in read-only mode");
-        // While LockWAL holds a write stop no write can be inside the WAL stage (a stalled leader waits before it), so the
-        // WAL is flushed without entering the write thread: a stalled leader holds it until UnlockWAL (upstream's
-        // FlushWAL only takes log_write_mutex_).
-        WriteThread.Writer? w = IsWalLocked ? null : await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
+        // While LockWAL holds a write stop no write group can be inside the WAL stage (a stalled leader waits before it),
+        // and the WAL is flushed without entering the write thread: a stalled leader holds it until UnlockWAL (upstream's
+        // FlushWAL only takes wal_write_mutex_). The WAL I/O lock excludes the other users of the WAL, and UnlockWAL
+        // takes it too: the write stop is still held if the WAL is still locked once this call has the lock.
+        WriteThread.Writer? w = null;
+        while (true)
+        {
+            if (IsWalLocked)
+            {
+                await AcquireWalIoLockAsync(synchronous).ConfigureAwait(false);
+                if (IsWalLocked) break;
+                ReleaseWalIoLock(); // unlocked meanwhile: go through the write thread
+            }
+            else
+            {
+                w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
+                await AcquireWalIoLockAsync(synchronous).ConfigureAwait(false);
+                break;
+            }
+        }
         try
         {
             LogWriter? log = _log;
@@ -580,6 +603,11 @@ internal sealed partial class DbImpl
                     SyncWalDirIfNeeded();
                 }
             }
+            if (openWals is not null)
+            {
+                foreach (LogWriter closed in _closedWalsToSync) openWals.Add(closed.LogNumber);
+                openWals.Add(log.LogNumber);
+            }
         }
         catch (Exception e) when (e is not OperationCanceledException && e is not RocksDbException { Code: StatusCode.NotSupported })
         {
@@ -589,6 +617,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
+            ReleaseWalIoLock();
             if (w is not null) ExitUnbatched(w, synchronous);
         }
     }
@@ -596,6 +625,25 @@ internal sealed partial class DbImpl
 
 internal static class FileSystemReplicationExtensions
 {
+    /// <summary>
+    /// FileSystem::SyncFile (env/file_system.cc): makes the contents of an existing file durable by reopening it for
+    /// writing and syncing it. Used for files the DB adopts without having written them (hard-linked external files).
+    /// Like the callers upstream, a file system without ReopenWritable (NotSupported) is taken not to need it.
+    /// </summary>
+    public static void SyncFile(this Env.IFileSystem fs, string path)
+    {
+        Env.IWritableFile file;
+        try
+        {
+            file = fs.ReopenWritable(path, Env.WritableFileOptions.Default);
+        }
+        catch (RocksDbException e) when (e.Code == StatusCode.NotSupported)
+        {
+            return;
+        }
+        using (file) file.Sync();
+    }
+
     /// <summary>DirectoryExists for file systems that may not implement it (falls back to listing).</summary>
     public static bool DirectoryExistsSafe(this Env.IFileSystem fs, string path)
     {

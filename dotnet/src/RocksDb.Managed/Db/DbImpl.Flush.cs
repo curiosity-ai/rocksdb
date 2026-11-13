@@ -119,8 +119,34 @@ internal sealed partial class DbImpl
         {
             EndAtomicSwitch();
         }
+        // MemTableList::FlushRequested: every switch made for a flush request (WAL full, write buffer manager, the manual
+        // flushes) flushes what is sealed without waiting for min_write_buffer_number_to_merge memtables; a full memtable
+        // (ScheduleFlushes) does not request one.
+        if (reason != FlushReason.WriteBufferFull)
+        {
+            lock (_mutex)
+            {
+                RequestFlush(cfds);
+                MaybeScheduleFlush();
+            }
+        }
         // DBImpl::EnqueuePendingFlush: one atomic FlushRequest records its reason ticker.
         if (switched && Options.AtomicFlush) RecordAtomicFlushRequestReason(reason);
+    }
+
+    /// <summary>
+    /// MemTableList::FlushRequested for <paramref name="cfds"/> and SchedulePendingFlush of those that now have a flush
+    /// pending. REQUIRES: mutex.
+    /// </summary>
+    private void RequestFlush(IReadOnlyList<ColumnFamilyData> cfds)
+    {
+        for (int i = 0; i < cfds.Count; i++)
+        {
+            ColumnFamilyData c = cfds[i];
+            if (c.Dropped) continue;
+            c.FlushRequested = true;
+            EnqueueFlush(c);
+        }
     }
 
     /// <summary>True if an atomic flush is running or could be started (sealed memtables of a completed switch). REQUIRES: mutex.</summary>
@@ -303,6 +329,14 @@ internal sealed partial class DbImpl
                 m.Mem.Ref();
                 picked.Add(m);
             }
+            // PickMemtablesToFlush: "The flush request is complete only after every unstarted immutable memtable has
+            // been picked."
+            bool anyNotStarted = false;
+            foreach (ImmutableMemTable m in cfd.Imm)
+            {
+                if (!m.FlushInProgress && !m.FlushCompleted) anyNotStarted = true;
+            }
+            if (!anyNotStarted) cfd.FlushRequested = false;
             fileNumber = Versions.NewFileNumber();
             epoch = cfd.NewEpochNumber();
             _pendingOutputs.Add(fileNumber);
@@ -453,11 +487,14 @@ internal sealed partial class DbImpl
         FlushReason reason, AtomicFlushGroup? group)
     {
         ulong[] snapshots;
+        ulong earliestWriteConflict;
         SeqnoToTimeMapping? seqnoToTime;
         DbVersion baseVersion;
         lock (_mutex)
         {
+            // FlushJob: existing_snapshots_ and earliest_write_conflict_snapshot_ (SnapshotList::GetAll).
             snapshots = SnapshotsForCompaction();
+            earliestWriteConflict = OldestWriteConflictSnapshot();
             seqnoToTime = CopySeqnoToTimeMapping(cfd);
             // FlushJob::PickMemTable: base_ = cfd_->current(); base_->Ref(). BuildTable estimates the data covered by
             // the flushed range tombstones in it (compensated_range_deletion_size).
@@ -471,7 +508,8 @@ internal sealed partial class DbImpl
         try
         {
             meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, TableFileWriteOptions(Env.IoPriority.High), cfd, mems, fileNumber, epoch, Identity, snapshots, CurrentSnapshotChecker, blobBuilder,
-                    directWrite?.Meter, seqnoToTime, baseVersion.Storage, Options.Statistics, synchronous, CancellationToken.None)
+                    directWrite?.Meter, seqnoToTime, baseVersion.Storage, Options.Statistics,
+                    new FlushJobContext(TableFileCreationReason.Flush, earliestWriteConflict, Options.EnforceSingleDelContracts), synchronous, CancellationToken.None)
                 .ConfigureAwait(false);
         }
         catch (Exception e)
@@ -528,6 +566,9 @@ internal sealed partial class DbImpl
         if (directWrite is { } dw)
         {
             edit.BlobFileAdditions.AddRange(dw.Additions);
+            // FlushJob::WriteLevel0Table fsyncs the output directory whether or not a table was written: the sealed
+            // direct-write blob files this edit adds live there too.
+            if (meta is null && dw.Additions.Count > 0) FileSystem.SyncDirectory(DbPaths[0]);
             dw.Meter.AddGarbageTo(edit.BlobFileGarbages);
         }
         // FlushJob::MaybeIncreaseFullHistoryTsLowToAboveCutoffUDT (written in the flush's own edit instead of a separate
@@ -639,6 +680,19 @@ internal sealed partial class DbImpl
             await SwitchMemtablesForFlushAsync([cfd], reason, synchronous, cancellationToken).ConfigureAwait(false);
             lock (_mutex)
             {
+                // DBImpl::FlushMemTable: the column families with sealed memtables get FlushRequested, also when nothing
+                // was switched (the memtables waiting for min_write_buffer_number_to_merge are flushed).
+                if (Options.AtomicFlush)
+                {
+                    foreach (ColumnFamilyData c in Versions.ColumnFamilies)
+                    {
+                        if (!c.Dropped && c.Imm.Count > 0) c.FlushRequested = true;
+                    }
+                }
+                else if (cfd.Imm.Count > 0)
+                {
+                    cfd.FlushRequested = true;
+                }
                 if (Options.AtomicFlush)
                 {
                     foreach (ColumnFamilyData c in Versions.ColumnFamilies)
