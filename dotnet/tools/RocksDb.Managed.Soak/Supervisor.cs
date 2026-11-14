@@ -456,9 +456,27 @@ internal sealed class Supervisor
             ? "online check violation in the worker:\n" + w.Tail
             : $"worker ended unexpectedly with {(code is null ? "no exit" : Child.Describe(code.Value))}:\n{w.Tail}";
 
+    /// <summary>
+    /// Removes what earlier workers left in the run's tmp directory: the fault file system's graveyard (deleted files kept
+    /// for a simulated power loss; only a simulated crash removes it, and power loss is not modelled across cycles) and
+    /// checkpoints of a worker killed during its checkpoint check. No worker is running when this is called.
+    /// </summary>
+    private void RemoveDeadWorkerScratch()
+    {
+        foreach (string pattern in new[] { "graveyard-*", "ckpt-*" })
+        {
+            foreach (string d in Directory.GetDirectories(_paths.Tmp, pattern))
+            {
+                try { Directory.Delete(d, recursive: true); }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log($"could not remove {d}: {e.Message}"); }
+            }
+        }
+    }
+
     /// <summary>Runs the worker and ends it with the cycle's fault. Returns a failure description or null.</summary>
     private string? RunPhase(CyclePlan plan)
     {
+        RemoveDeadWorkerScratch();
         var r = new Random((int)(Keys.Mix(plan.CycleSeed ^ 0xFA) & 0x7FFFFFFF));
         using ChildProcess w = ChildProcess.Start(["worker", "--run-dir", _paths.Root, "--part", "0"], _paths.LogFile(plan.Cycle, "worker"));
         if (!w.Opened.Wait(TimeSpan.FromMinutes(5)))
