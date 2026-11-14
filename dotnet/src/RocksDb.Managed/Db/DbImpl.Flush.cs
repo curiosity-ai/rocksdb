@@ -36,7 +36,10 @@ internal sealed partial class DbImpl
 
     /// <summary>
     /// Port of MaybeScheduleFlushOrCompaction (flush part): starts background flush jobs up to the flush limit
-    /// (GetBGJobLimits). Flushes of one column family are serialized; different CFs flush in parallel. REQUIRES: mutex.
+    /// (GetBGJobLimits). Like upstream, a column family with a flush pending gets another flush job even while earlier
+    /// ones run: each job picks the memtables nobody picked yet (PickMemtablesToFlush) and the results are committed in
+    /// memtable order (<see cref="CommitCompletedFlushesAsync"/>). Only an atomic or error recovery flush group has a
+    /// column family to itself. REQUIRES: mutex.
     /// </summary>
     private void MaybeScheduleFlush()
     {
@@ -51,8 +54,8 @@ internal sealed partial class DbImpl
         {
             cfd.QueuedForFlush = false;
             if (cfd.Dropped || !cfd.IsFlushPending) continue;
-            if (cfd.FlushRunning) continue; // re-enqueued when the running flush finishes
-            cfd.FlushRunning = true;
+            if (cfd.ExclusiveFlushRunning) continue; // re-enqueued when the atomic / recovery flush finishes
+            cfd.RunningFlushes++;
             _runningFlushes++;
             _backgroundJobs++;
             BackgroundThreadPool.High.Schedule(new FlushRun(this, cfd));
@@ -178,13 +181,14 @@ internal sealed partial class DbImpl
         foreach (ColumnFamilyData c in Versions.ColumnFamilies)
         {
             if (c.Dropped || !c.HasPendingFlushUpTo(cut)) continue;
-            if (c.FlushRunning) return; // an error recovery flush owns it; rescheduled when recovery ends
+            if (c.IsFlushRunning) return; // an error recovery flush owns it; rescheduled when recovery ends
             (members ??= new List<ColumnFamilyData>()).Add(c);
         }
         if (members is null) return;
         foreach (ColumnFamilyData c in members)
         {
-            c.FlushRunning = true;
+            c.RunningFlushes++;
+            c.ExclusiveFlushRunning = true;
             _runningFlushes++;
             _backgroundJobs++;
         }
@@ -308,6 +312,8 @@ internal sealed partial class DbImpl
         Exception? failure = null;
         bool cfDropped = false;
         var picked = new List<ImmutableMemTable>();
+        var job = new FlushJobState();
+        List<PendingFlushResult>? discarded = null;
         ulong fileNumber;
         ulong epoch;
         lock (_mutex)
@@ -321,9 +327,16 @@ internal sealed partial class DbImpl
             }
             foreach (ImmutableMemTable m in cfd.Imm)
             {
-                if (m.FlushInProgress || m.FlushCompleted) continue;
+                if (m.FlushInProgress || m.FlushCompleted)
+                {
+                    // PickMemtablesToFlush: only consecutive memtables, never across one another flush picked (after a
+                    // rollback of parallel flushes, picked memtables can sit between unpicked ones).
+                    if (picked.Count > 0) break;
+                    continue;
+                }
                 if (m.AtomicCut > maxCut) break;
                 m.FlushInProgress = true;
+                m.FlushOwner = job;
                 // The flush reads the memtable without the mutex: keep it alive even if the CF is dropped meanwhile
                 // (DropColumnFamily releases the CF's memtable references).
                 m.Mem.Ref();
@@ -345,17 +358,17 @@ internal sealed partial class DbImpl
         {
             // SyncClosedWals + ApplyWALToManifest (FlushMemTableToOutputFile): record the synced sizes of closed WALs.
             await TrackClosedWalsAsync(synchronous).ConfigureAwait(false);
-            if (picked.Count > 0) await FlushMemTablesAsync(cfd, picked, fileNumber, epoch, synchronous, group).ConfigureAwait(false);
+            if (picked.Count > 0) await FlushMemTablesAsync(cfd, picked, fileNumber, epoch, synchronous, group, job).ConfigureAwait(false);
         }
         catch (RocksDbException e) when (e.Code == StatusCode.ColumnFamilyDropped || cfd.Dropped)
         {
             failure = e;
             cfDropped = true;
-            lock (_mutex)
+            if (!job.HandedOver)
             {
-                foreach (ImmutableMemTable m in picked) m.FlushInProgress = false;
+                lock (_mutex) discarded = RollbackMemtableFlush(cfd, picked, job, rollbackSucceedingMemtables: group is null);
+                TryDeleteFile(FileNames.TableFileName(DbPaths, fileNumber, 0));
             }
-            TryDeleteFile(FileNames.TableFileName(DbPaths, fileNumber, 0));
         }
         catch (FlushSkippedSinceBgErrorException e)
         {
@@ -363,19 +376,20 @@ internal sealed partial class DbImpl
             // error; FlushMemTableToOutputFile does not set it again (skip_set_bg_error). Nothing was written to the
             // MANIFEST: the output is dropped from the table cache and deleted.
             failure = e.BackgroundError;
-            lock (_mutex)
-            {
-                foreach (ImmutableMemTable m in picked) m.FlushInProgress = false;
-            }
+            lock (_mutex) discarded = RollbackMemtableFlush(cfd, picked, job, rollbackSucceedingMemtables: group is null);
             cfd.TableCache.Evict(fileNumber);
             TryDeleteFile(FileNames.TableFileName(DbPaths, fileNumber, 0));
         }
         catch (Exception e)
         {
             failure = e;
-            lock (_mutex)
+            // FlushJob::Run: a failed flush rolls its memtables back (and with them the later flushes completed meanwhile:
+            // they cannot be committed before these). A failure of the commit itself (MemTableList::
+            // RemoveMemTablesOrRestoreFlags) already restored the memtables it tried to commit, and leaves this job's
+            // completed memtables to be committed after the older ones.
+            if (!job.HandedOver)
             {
-                foreach (ImmutableMemTable m in picked) m.FlushInProgress = false;
+                lock (_mutex) discarded = RollbackMemtableFlush(cfd, picked, job, rollbackSucceedingMemtables: group is null);
             }
             // The output is left for the full scan at the next open: after a failed MANIFEST write it may already be
             // referenced by a MANIFEST that CURRENT names (upstream quarantines such files). An atomic flush that
@@ -408,12 +422,13 @@ internal sealed partial class DbImpl
                         m.Mem.FlushedPinnedSet = cfd.FlushedPinnedMemTables;
                     }
                 }
-                _pendingOutputs.Remove(fileNumber);
+                // A result handed to the commit queue keeps its file a pending output until it is committed or discarded.
+                if (!job.HandedOver) _pendingOutputs.Remove(fileNumber);
                 // The flush itself is done: let the next flush of this CF start before the (slow) obsolete-file purge.
                 // Waiters (FlushAsync, write stalls) are signalled after the purge, like upstream's WaitForFlushMemTables
                 // woken by the bg_cv_ signal at the end of BackgroundCallFlush: a Flush(wait) that returns has the WAL
                 // it made obsolete archived or deleted, and the obsolete table files deleted.
-                cfd.FlushRunning = false;
+                if (--cfd.RunningFlushes == 0) cfd.ExclusiveFlushRunning = false;
                 _runningFlushes--;
                 // BackgroundCallFlush: "!s.ok() && !s.IsShutdownInProgress() && !s.IsColumnFamilyDropped() && reason !=
                 // FlushReason::kErrorRecovery" waits before the next flush. When the error stopped background work nothing
@@ -431,6 +446,7 @@ internal sealed partial class DbImpl
                     MaybeScheduleFlush();
                 }
             }
+            if (discarded is not null) DeleteDiscardedFlushOutputs(cfd, discarded);
             try
             {
                 // Before the job is accounted as finished (like BackgroundCallFlush: bg_flush_scheduled_-- after
@@ -451,6 +467,16 @@ internal sealed partial class DbImpl
         return atomicBackoff;
     }
 
+    /// <summary>
+    /// One flush job: the owner of the memtables it picked, and whether its result was handed to the column family's
+    /// commit queue (<see cref="ImmutableMemTable.FlushResult"/>). From then on whoever commits or rolls back the result
+    /// releases its file numbers (upstream protects them by the job's pending output, which covers every later file).
+    /// </summary>
+    private sealed class FlushJobState
+    {
+        public bool HandedOver;
+    }
+
     /// <summary>Thrown by a flush that built its table but must not install it (skipped_since_bg_error of FlushJob::Run).</summary>
     private sealed class FlushSkippedSinceBgErrorException(RocksDbException backgroundError) : Exception
     {
@@ -459,7 +485,7 @@ internal sealed partial class DbImpl
 
     /// <summary>Builds the L0 file for <paramref name="picked"/> and installs the result (FlushJob::Run + install).</summary>
     private async ValueTask FlushMemTablesAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch,
-        bool synchronous, AtomicFlushGroup? group)
+        bool synchronous, AtomicFlushGroup? group, FlushJobState job)
     {
         TestHooks.Invoke("DBImpl::FlushMemTables:Start");
         long flushStart = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -473,18 +499,20 @@ internal sealed partial class DbImpl
         using Blob.BlobFileBuilder? blobBuilder = CreateBlobFileBuilder(cfd, outputLevel: 0, Blob.BlobFileCreationReason.Flush);
         try
         {
-            await FlushAndInstallAsync(cfd, picked, fileNumber, epoch, synchronous, jobId, flushStart, mems, path, blobBuilder, reason, group)
+            await FlushAndInstallAsync(cfd, picked, fileNumber, epoch, synchronous, jobId, flushStart, mems, path, blobBuilder, reason, group, job)
                 .ConfigureAwait(false);
         }
         finally
         {
-            if (blobBuilder is not null) ReleaseBlobOutputs(blobBuilder);
+            // A result handed to the commit queue is released by whoever commits or discards it.
+            if (blobBuilder is not null && !job.HandedOver) ReleaseBlobOutputs(blobBuilder);
+            TestHooks.Invoke("DBImpl::FlushMemTableToOutputFile:Finish");
         }
     }
 
     private async ValueTask FlushAndInstallAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, ulong fileNumber, ulong epoch,
         bool synchronous, int jobId, long flushStart, List<MemTable> mems, string path, Blob.BlobFileBuilder? blobBuilder,
-        FlushReason reason, AtomicFlushGroup? group)
+        FlushReason reason, AtomicFlushGroup? group, FlushJobState job)
     {
         ulong[] snapshots;
         ulong earliestWriteConflict;
@@ -574,56 +602,75 @@ internal sealed partial class DbImpl
         // FlushJob::MaybeIncreaseFullHistoryTsLowToAboveCutoffUDT (written in the flush's own edit instead of a separate
         // MANIFEST record before it; recovery applies both the same way).
         if (GetFullHistoryTsLowAboveCutoffUdt(cfd, mems) is { } newTsLow) edit.FullHistoryTsLow = newTsLow;
-        VersionEdit? walDeletion = null;
+        TestHooks.Invoke("DBImpl::FlushMemTables:BeforeLogAndApply");
+        if (group is not null)
+        {
+            bool dropped = await CommitAtomicFlushMemberAsync(cfd, picked, edit, blobBuilder, group).ConfigureAwait(false);
+            if (meta is not null) MaybeReportMaxAllowedSpaceReached(BackgroundErrorReason.Flush);
+            if (dropped) return;
+            if (blobBuilder is not null && meta is not null) LogBlobFileCreationEvents(cfd, jobId, blobBuilder.Additions);
+            OnFlushCompleted(cfd, jobId, meta, BlobBytesWritten(blobBuilder), edit.ManifestBytesWritten, flushStart);
+            NotifyOnFlushCompleted(cfd, jobId, fileNumber, meta, path, mems, reason);
+            return;
+        }
+        var result = new PendingFlushResult(edit, picked, fileNumber, meta, blobBuilder, jobId, flushStart, mems, path, reason);
         lock (_mutex)
         {
             if (cfd.Dropped) ThrowDropped(cfd);
-            ulong minWalToKeep;
-            if (Options.Allow2Pc)
+            if (reason != FlushReason.ErrorRecovery && reason != FlushReason.ErrorRecoveryRetryFlush)
             {
-                // In 2PC mode the WALs holding outstanding prepared sections (or prepared sections of committed data
-                // still in memtables) must survive (PrecomputeMinLogNumberToKeep2PC).
-                minWalToKeep = PrecomputeMinLogNumberToKeep2PC(cfd, edit.LogNumber.Value, picked);
-                if (group is not null) edit.MinLogNumberToKeep = minWalToKeep;
-            }
-            else
-            {
-                // PrecomputeMinLogNumberToKeepNon2PC: minimum of the other CFs' log numbers and this edit's (an atomic
-                // flush computes it over all its members when it commits).
-                minWalToKeep = Math.Min(Versions.MinLogNumberWithUnflushedData(cfd), edit.LogNumber.Value);
-            }
-            // GetDBRecoveryEditForObsoletingMemTables (db/memtable_list.cc), appended to the flush's edit list by
-            // TryInstallMemtableFlushResults: a separate edit of the same MANIFEST write records min_log_number_to_keep
-            // for every flush (also with a single column family; it keeps versions_->min_log_number_to_keep,
-            // "rocksdb.min-log-number-to-keep", current) and, with track_and_verify_wals_in_manifest, the WALs the flush
-            // makes obsolete as deleted.
-            if (group is null)
-            {
-                // LogAndApplyHelper: "if (!edit->HasPrevLogNumber()) edit->SetPrevLogNumber(prev_log_number_)".
-                walDeletion = new VersionEdit { MinLogNumberToKeep = minWalToKeep, PrevLogNumber = Versions.PrevLogNumber };
-                if (Options.TrackAndVerifyWalsInManifest && minWalToKeep > Versions.MinWalNumberToKeep) walDeletion.WalDeletionBefore = minWalToKeep;
-            }
-        }
-        TestHooks.Invoke("DBImpl::FlushMemTables:BeforeLogAndApply");
-        if (group is null && reason != FlushReason.ErrorRecovery && reason != FlushReason.ErrorRecoveryRetryFlush)
-        {
-            // FlushJob::Run: a flush that is not an error recovery flush does not install its result once a background
-            // error stopped background work ("!error_handler->GetBGError().ok() && error_handler->IsBGWorkStopped()").
-            // (A flush running for an error recovery in progress is not skipped either: the recovery flushes every
-            // sealed memtable, whatever the reason it was sealed for.)
-            lock (_mutex)
-            {
+                // FlushJob::Run: a flush that is not an error recovery flush does not install its result once a background
+                // error stopped background work ("!error_handler->GetBGError().ok() && error_handler->IsBGWorkStopped()").
+                // (A flush running for an error recovery in progress is not skipped either: the recovery flushes every
+                // sealed memtable, whatever the reason it was sealed for.)
                 if (IsBgWorkStopped && !ErrorHandler.IsRecoveryInProgress && ErrorHandler.BgError is { } bgError)
                     throw new FlushSkippedSinceBgErrorException(bgError);
             }
+            // TryInstallMemtableFlushResults: the result is recorded on the memtables; either this job or a concurrent one
+            // (the one flushing older memtables) writes it to the MANIFEST, in memtable order.
+            foreach (ImmutableMemTable m in picked)
+            {
+                m.FlushCompleted = true;
+                m.FlushFileNumber = fileNumber;
+            }
+            picked[0].FlushResult = result;
+            job.HandedOver = true;
+            if (!cfd.FlushCommitInProgress)
+            {
+                cfd.FlushCommitInProgress = true;
+                result = null;
+            }
+        }
+        if (result is not null)
+        {
+            // "if some other thread is already committing, then return".
+            TestHooks.Invoke("MemTableList::TryInstallMemtableFlushResults:InProgress");
+            return;
+        }
+        await CommitCompletedFlushesAsync(cfd, synchronous).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Commits the result of one member of an atomic flush (or of an error recovery flush group) together with the other
+    /// members' (MemTableList::InstallMemtableAtomicFlushResults). The members have their column families to themselves
+    /// (<see cref="ColumnFamilyData.ExclusiveFlushRunning"/>), so the picked memtables are the oldest ones. Returns true
+    /// when the column family was dropped right after the MANIFEST write.
+    /// </summary>
+    private async ValueTask<bool> CommitAtomicFlushMemberAsync(ColumnFamilyData cfd, List<ImmutableMemTable> picked, VersionEdit edit,
+        Blob.BlobFileBuilder? blobBuilder, AtomicFlushGroup group)
+    {
+        lock (_mutex)
+        {
+            if (cfd.Dropped) ThrowDropped(cfd);
+            // In 2PC mode the WALs holding outstanding prepared sections (or prepared sections of committed data still in
+            // memtables) must survive (PrecomputeMinLogNumberToKeep2PC). Without 2PC the atomic flush computes the minimum
+            // over all its members when it commits.
+            if (Options.Allow2Pc) edit.MinLogNumberToKeep = PrecomputeMinLogNumberToKeep2PC(cfd, edit.LogNumber!.Value, picked);
         }
         // From here on a failure may still have made the edit durable: leave the blob files to the obsolete-file scan.
         if (blobBuilder is not null) blobBuilder.Committed = true;
-        // Removes the flushed memtables and installs the super version (which recalculates the write stall); runs in the
-        // critical section that installs the new version, like upstream's TryInstallMemtableFlushResults followed by
-        // InstallSuperVersionAndScheduleWork under one mutex hold. REQUIRES: mutex.
-        bool dropped = false;
-        void InstallFlushResults()
+        await group.CommitAsync(cfd, edit).ConfigureAwait(false);
+        lock (_mutex)
         {
             foreach (ImmutableMemTable m in picked)
             {
@@ -631,33 +678,170 @@ internal sealed partial class DbImpl
                 // A drop that committed right after our MANIFEST write already released the list's references.
                 if (cfd.Imm.Remove(m)) RetireFlushedMemTable(cfd, m.Mem);
             }
-            if (cfd.Dropped)
-            {
-                dropped = true;
-                return;
-            }
+            if (cfd.Dropped) return true;
             InstallSuperVersion(cfd);
             _maybeStalled = IsWriteStalled();
         }
-        if (group is not null)
+        return false;
+    }
+
+    /// <summary>
+    /// The commit loop of MemTableList::TryInstallMemtableFlushResults: while the oldest immutable memtable has a completed
+    /// flush, writes that flush's edit (plus the min-log-number / WAL deletion edit of
+    /// GetDBRecoveryEditForObsoletingMemTables) to the MANIFEST and removes its memtables, then notifies its completion.
+    /// Flushes that complete while the MANIFEST is written are committed by the next round. Managed difference: one
+    /// MANIFEST write per completed flush instead of one for all of them (the port's LogAndApply applies one file edit per
+    /// column family per write); the order, and the state after each write, are the same. A failed write restores the
+    /// flags of the memtables it tried to commit (RemoveMemTablesOrRestoreFlags) and is thrown to the committing job.
+    /// REQUIRES: the caller set <see cref="ColumnFamilyData.FlushCommitInProgress"/>; it is cleared on return.
+    /// </summary>
+    private async ValueTask CommitCompletedFlushesAsync(ColumnFamilyData cfd, bool synchronous)
+    {
+        while (true)
         {
-            await group.CommitAsync(cfd, edit).ConfigureAwait(false);
-            lock (_mutex) InstallFlushResults();
+            PendingFlushResult batch;
+            VersionEdit walDeletion;
+            lock (_mutex)
+            {
+                // "The back is the oldest; if flush_completed_ is not set to it, it means that we were assigned a more
+                // recent memtable. The memtables' flushes must be recorded in manifest in order."
+                List<ImmutableMemTable> imm = cfd.Imm;
+                if (imm.Count == 0 || !imm[0].FlushCompleted)
+                {
+                    cfd.FlushCommitInProgress = false;
+                    return;
+                }
+                batch = imm[0].FlushResult!;
+                System.Diagnostics.Debug.Assert(ReferenceEquals(batch.Picked[0], imm[0]) && imm.Count >= batch.Picked.Count);
+                ulong logNumber = batch.Edit.LogNumber!.Value;
+                ulong minWalToKeep = Options.Allow2Pc
+                    // PrecomputeMinLogNumberToKeep2PC: the WALs holding outstanding prepared sections (or prepared sections of
+                    // committed data still in memtables) must survive.
+                    ? PrecomputeMinLogNumberToKeep2PC(cfd, logNumber, batch.Picked)
+                    // PrecomputeMinLogNumberToKeepNon2PC: minimum of the other CFs' log numbers and this edit's.
+                    : Math.Min(Versions.MinLogNumberWithUnflushedData(cfd), logNumber);
+                // GetDBRecoveryEditForObsoletingMemTables (db/memtable_list.cc): a separate edit of the same MANIFEST write
+                // records min_log_number_to_keep for every flush (also with a single column family; it keeps
+                // versions_->min_log_number_to_keep, "rocksdb.min-log-number-to-keep", current) and, with
+                // track_and_verify_wals_in_manifest, the WALs the flush makes obsolete as deleted.
+                // LogAndApplyHelper: "if (!edit->HasPrevLogNumber()) edit->SetPrevLogNumber(prev_log_number_)".
+                walDeletion = new VersionEdit { MinLogNumberToKeep = minWalToKeep, PrevLogNumber = Versions.PrevLogNumber };
+                if (Options.TrackAndVerifyWalsInManifest && minWalToKeep > Versions.MinWalNumberToKeep) walDeletion.WalDeletionBefore = minWalToKeep;
+                // From here on a failure may still have made the edit durable: leave the blob files to the obsolete-file scan.
+                if (batch.BlobBuilder is not null) batch.BlobBuilder.Committed = true;
+            }
+            // Removes the flushed memtables and installs the super version (which recalculates the write stall); runs in the
+            // critical section that installs the new version, like upstream's RemoveMemTablesOrRestoreFlags (the
+            // LogAndApply callback) followed by InstallSuperVersionAndScheduleWork under one mutex hold. REQUIRES: mutex.
+            bool dropped = false;
+            void InstallFlushResults()
+            {
+                foreach (ImmutableMemTable m in batch.Picked)
+                {
+                    m.FlushResult = null;
+                    // A drop that committed right after our MANIFEST write already released the list's references.
+                    if (cfd.Imm.Remove(m)) RetireFlushedMemTable(cfd, m.Mem);
+                }
+                if (cfd.Dropped)
+                {
+                    dropped = true;
+                    return;
+                }
+                InstallSuperVersion(cfd);
+                _maybeStalled = IsWriteStalled();
+            }
+            try
+            {
+                await Versions.LogAndApplyAsync([new ManifestEditEntry(cfd, batch.Edit), new ManifestEditEntry(null, walDeletion)], atomicGroup: false,
+                    synchronous, InstallFlushResults, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                lock (_mutex)
+                {
+                    // RemoveMemTablesOrRestoreFlags, commit failed: "setup state so that we can flush again". The table may
+                    // already be referenced by a MANIFEST that CURRENT names: it is left to the obsolete-file scan.
+                    foreach (ImmutableMemTable m in batch.Picked) ResetFlushState(m);
+                    _pendingOutputs.Remove(batch.FileNumber);
+                    cfd.FlushCommitInProgress = false;
+                }
+                // FlushJob::Run: "If BuildTable succeeded ... but the flush failed to install, evict the cached entry".
+                cfd.TableCache.Evict(batch.FileNumber);
+                if (batch.BlobBuilder is not null) ReleaseBlobOutputs(batch.BlobBuilder);
+                throw;
+            }
+            lock (_mutex) _pendingOutputs.Remove(batch.FileNumber);
+            if (batch.BlobBuilder is not null) ReleaseBlobOutputs(batch.BlobBuilder);
+            // The committing job reports the flushes it committed (FlushJob::GetCommittedFlushJobsInfo).
+            if (batch.Meta is not null) MaybeReportMaxAllowedSpaceReached(BackgroundErrorReason.Flush);
+            if (dropped) continue;
+            if (batch.BlobBuilder is not null && batch.Meta is not null) LogBlobFileCreationEvents(cfd, batch.JobId, batch.BlobBuilder.Additions);
+            OnFlushCompleted(cfd, batch.JobId, batch.Meta, BlobBytesWritten(batch.BlobBuilder), batch.Edit.ManifestBytesWritten, batch.FlushStart);
+            NotifyOnFlushCompleted(cfd, batch.JobId, batch.FileNumber, batch.Meta, batch.Path, batch.Mems, batch.Reason);
         }
-        else if (walDeletion is not null)
+    }
+
+    /// <summary>Clears the flush state of a memtable so that it can be picked again. REQUIRES: mutex.</summary>
+    private static void ResetFlushState(ImmutableMemTable m)
+    {
+        m.FlushInProgress = false;
+        m.FlushCompleted = false;
+        m.FlushFileNumber = 0;
+        m.FlushOwner = null;
+        m.FlushResult = null;
+    }
+
+    /// <summary>
+    /// Port of MemTableList::RollbackMemtableFlush: the memtables <paramref name="job"/> picked can be flushed again. With
+    /// <paramref name="rollbackSucceedingMemtables"/> (not an atomic flush) the completed flushes of the memtables right
+    /// after the first one are rolled back too ("Only rollback complete, not in-progress"): their results could only be
+    /// committed after these memtables. Returns those discarded results, whose outputs the caller deletes
+    /// (<see cref="DeleteDiscardedFlushOutputs"/>). REQUIRES: mutex.
+    /// </summary>
+    private List<PendingFlushResult>? RollbackMemtableFlush(ColumnFamilyData cfd, List<ImmutableMemTable> mems, FlushJobState job,
+        bool rollbackSucceedingMemtables)
+    {
+        List<PendingFlushResult>? discarded = null;
+        if (rollbackSucceedingMemtables && mems.Count > 0)
         {
-            await Versions.LogAndApplyAsync([new ManifestEditEntry(cfd, edit), new ManifestEditEntry(null, walDeletion)], atomicGroup: false, synchronous,
-                InstallFlushResults, CancellationToken.None).ConfigureAwait(false);
+            List<ImmutableMemTable> imm = cfd.Imm;
+            int i = imm.IndexOf(mems[0]);
+            if (i >= 0)
+            {
+                for (i++; i < imm.Count; i++)
+                {
+                    ImmutableMemTable m = imm[i];
+                    if (!m.FlushCompleted) break;
+                    if (m.FlushResult is { } r)
+                    {
+                        (discarded ??= new()).Add(r);
+                        _pendingOutputs.Remove(r.FileNumber);
+                    }
+                    ResetFlushState(m);
+                }
+            }
         }
-        else
+        foreach (ImmutableMemTable m in mems)
         {
-            await Versions.LogAndApplyAsync(cfd, edit, synchronous, InstallFlushResults, CancellationToken.None).ConfigureAwait(false);
+            // Only memtables this job still holds: a commit failure (or the rollback of an older flush) may have reset
+            // them already, and another job may have picked them since.
+            if (m.FlushInProgress && ReferenceEquals(m.FlushOwner, job)) ResetFlushState(m);
         }
-        if (meta is not null) MaybeReportMaxAllowedSpaceReached(BackgroundErrorReason.Flush);
-        if (dropped) return;
-        if (blobBuilder is not null && meta is not null) LogBlobFileCreationEvents(cfd, jobId, blobBuilder.Additions);
-        OnFlushCompleted(cfd, jobId, meta, BlobBytesWritten(blobBuilder), edit.ManifestBytesWritten, flushStart);
-        NotifyOnFlushCompleted(cfd, jobId, fileNumber, meta, path, mems, reason);
+        return discarded;
+    }
+
+    /// <summary>
+    /// Deletes the outputs of flushes rolled back after they completed (never written to the MANIFEST): upstream leaves
+    /// them to the next obsolete-file scan.
+    /// </summary>
+    private void DeleteDiscardedFlushOutputs(ColumnFamilyData cfd, List<PendingFlushResult> discarded)
+    {
+        foreach (PendingFlushResult r in discarded)
+        {
+            cfd.TableCache.Evict(r.FileNumber);
+            TryDeleteFile(r.Path);
+            if (r.BlobBuilder is not null) ReleaseBlobOutputs(r.BlobBuilder);
+        }
     }
 
     /// <summary>
@@ -729,7 +913,9 @@ internal sealed partial class DbImpl
                 bool done = true;
                 foreach ((ColumnFamilyData c, ImmutableMemTable target) in targets)
                 {
-                    if (!target.FlushCompleted && !c.Dropped && c.Imm.Contains(target)) done = false;
+                    // WaitForFlushMemTables: until the memtable's flush is committed (a completed flush can wait for an
+                    // older one, and be rolled back with it).
+                    if (!c.Dropped && c.Imm.Contains(target)) done = false;
                 }
                 if (done)
                 {
@@ -786,7 +972,7 @@ internal sealed partial class DbImpl
     private void RescheduleFlushToRetainUdt(ColumnFamilyData cfd)
     {
         // Release the flush slot now; the delayed retry stays a background job (shutdown waits for it).
-        cfd.FlushRunning = false;
+        if (--cfd.RunningFlushes == 0) cfd.ExclusiveFlushRunning = false;
         _runningFlushes--;
         _ = RetryAsync(cfd);
 
@@ -924,4 +1110,25 @@ internal sealed partial class DbImpl
             foreach (ulong n in builder.CreatedFileNumbers) _pendingOutputs.Remove(n);
         }
     }
+}
+
+/// <summary>
+/// A completed flush waiting to be committed to the MANIFEST in memtable order: the edit (MemTable::edit_ of the oldest
+/// memtable of the flush) and what is reported when it is committed (the FlushJobInfo kept by
+/// ReadOnlyMemTable::SetFlushJobInfo). Its table and blob files stay pending outputs until it is committed or discarded.
+/// </summary>
+internal sealed class PendingFlushResult(VersionEdit edit, List<ImmutableMemTable> picked, ulong fileNumber, FileMetaData? meta,
+    Blob.BlobFileBuilder? blobBuilder, int jobId, long flushStart, List<MemTable> mems, string path, FlushReason reason)
+{
+    public VersionEdit Edit { get; } = edit;
+    /// <summary>The flushed memtables, oldest first (consecutive in the immutable list).</summary>
+    public List<ImmutableMemTable> Picked { get; } = picked;
+    public ulong FileNumber { get; } = fileNumber;
+    public FileMetaData? Meta { get; } = meta;
+    public Blob.BlobFileBuilder? BlobBuilder { get; } = blobBuilder;
+    public int JobId { get; } = jobId;
+    public long FlushStart { get; } = flushStart;
+    public List<MemTable> Mems { get; } = mems;
+    public string Path { get; } = path;
+    public FlushReason Reason { get; } = reason;
 }

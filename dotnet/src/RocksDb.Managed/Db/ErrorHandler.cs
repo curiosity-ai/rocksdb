@@ -838,8 +838,11 @@ internal sealed partial class DbImpl
             {
                 // FlushAllColumnFamilies: cfd->imm()->FlushRequested() for every column family with sealed memtables.
                 if (!cfd.Dropped && cfd.Imm.Count > 0) cfd.FlushRequested = true;
-                if (cfd.Dropped || cfd.FlushRunning || !cfd.HasPendingFlushUpTo(cut)) continue;
-                cfd.FlushRunning = true;
+                // A column family with a flush running (or a flush result waiting for an older one) is left to it: the
+                // recovery group commits its members' results as one atomic group and must not overtake them.
+                if (cfd.Dropped || cfd.IsFlushRunning || !cfd.HasPendingFlushUpTo(cut)) continue;
+                cfd.RunningFlushes++;
+                cfd.ExclusiveFlushRunning = true;
                 _runningFlushes++;
                 _backgroundJobs++;
                 members.Add(cfd);

@@ -73,7 +73,8 @@ internal sealed partial class DbImpl
             {
                 foreach (ImmutableMemTable m in cfd.Imm)
                 {
-                    if (m.BlobGeneration is { IsEmpty: false } && !m.FlushCompleted) return true;
+                    // In the list until its flush is committed (a completed flush may wait for an older one).
+                    if (m.BlobGeneration is { IsEmpty: false }) return true;
                 }
             }
         }
