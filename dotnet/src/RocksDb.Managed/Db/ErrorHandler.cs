@@ -834,13 +834,30 @@ internal sealed partial class DbImpl
                     members.Add(cfd);
                 }
             }
-            foreach (ColumnFamilyData cfd in members)
+            for (int i = 0; i < members.Count; i++)
             {
-                await BackgroundFlushAsync(cfd).ConfigureAwait(false);
+                // BackgroundFlushAsync releases the accounting taken above for its column family.
+                await BackgroundFlushAsync(members[i]).ConfigureAwait(false);
                 lock (_mutex)
                 {
-                    if (ErrorHandler.RecoveryError is { } re) return re;
-                    if (_shuttingDown) return new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
+                    RocksDbException? stop = ErrorHandler.RecoveryError
+                        ?? (_shuttingDown ? new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress") : null);
+                    if (stop is null) continue;
+                    // WaitForFlushMemTables stops waiting at a recovery error, but upstream's scheduled flushes still end
+                    // and release their background job. Release the accounting of the flushes that will not run here, or
+                    // the next recovery attempt waits for them forever (WaitForBackgroundWork), and keep them queued for
+                    // the next attempt (their memtables stay FlushRequested).
+                    for (int j = i + 1; j < members.Count; j++)
+                    {
+                        ColumnFamilyData skipped = members[j];
+                        skipped.RunningFlushes--;
+                        _runningFlushes--;
+                        _backgroundJobs--;
+                        EnqueueFlush(skipped);
+                    }
+                    MaybeScheduleFlush();
+                    SignalBackgroundWork();
+                    return stop;
                 }
             }
             return null;

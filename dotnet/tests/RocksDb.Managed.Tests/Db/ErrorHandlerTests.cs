@@ -136,6 +136,60 @@ public sealed class ErrorHandlerTests
         }
     }
 
+    /// <summary>
+    /// Found by the soak (IoError cycle, retryable): the retry-only recovery flush (kErrorRecoveryRetryFlush) takes the
+    /// flush accounting of every column family with sealed memtables up front, then flushes them one after the other.
+    /// When one of them failed it returned without releasing the accounting of the ones it had not flushed, so the next
+    /// recovery attempt waited for those background jobs forever (WaitForBackgroundWork) and every Resume was Busy.
+    /// </summary>
+    [TestMethod]
+    public void RetryFlushRecoveryThatFailsPartwayIsRetried()
+    {
+        (FaultInjectionFileSystem fs, DbOptions options, ErrorListener listener) = Setup();
+        using var gate = new ManualResetEventSlim(false);
+        TestHooks.Set("RecoverFromRetryableBGIOError:BeforeResume", () => gate.Wait(Timeout));
+        try
+        {
+            using RocksDatabase db = RocksDatabase.Open(DbPath, options);
+            ColumnFamily c1 = db.CreateColumnFamily("c1", new ColumnFamilyOptions());
+            ColumnFamily c2 = db.CreateColumnFamily("c2", new ColumnFamilyOptions());
+            Put(db, "a");
+            c1.Put(B("a"), B("v-c1"));
+            c2.Put(B("a"), B("v-c2"));
+
+            // A retryable SST error during a flush: soft error, background work stops, the recovery waits at the gate.
+            fs.FailMatching(".sst", FaultOps.Append, 1, InjectedFaultKind.Retryable);
+            RocksDbException ex = Assert.ThrowsExactly<RocksDbException>(() => db.Flush());
+            Assert.AreEqual(ErrorSeverity.SoftError, ex.Severity);
+            Assert.IsTrue(db.DefaultColumnFamily.Db.ErrorHandler.RetryFlushOnly);
+            // Seal the memtables of the other column families too (their flushes cannot run while background work is
+            // stopped), so the recovery has several column families to flush.
+            foreach (ColumnFamily cf in new[] { c1, c2 })
+            {
+                RocksDbException f = Assert.ThrowsExactly<RocksDbException>(() => cf.Flush());
+                Assert.AreEqual(StatusCode.IOError, f.Code, f.ToString());
+            }
+
+            // The first flush of the first recovery attempt fails again (retryable): the recovery must retry and succeed.
+            fs.FailMatching(".sst", FaultOps.Append, 1, InjectedFaultKind.Retryable);
+            gate.Set();
+            BackgroundErrorRecoveryInfo end = listener.WaitForRecoveryEnd();
+            Assert.IsNull(end.NewBackgroundError, end.NewBackgroundError?.ToString());
+            Assert.AreEqual(2, fs.TargetedFaults);
+            Assert.IsNull(db.BackgroundError);
+            Put(db, "b");
+            db.Flush();
+            Assert.AreEqual("v-a", GetString(db, "a"));
+            Assert.AreEqual("v-c1", S(c1.Get(B("a"))));
+            Assert.AreEqual("v-c2", S(c2.Get(B("a"))));
+        }
+        finally
+        {
+            gate.Set();
+            TestHooks.ClearAll();
+        }
+    }
+
     [TestMethod]
     public void FlushRetryableErrorWithoutAutoResumeIsHardUntilResume()
     {

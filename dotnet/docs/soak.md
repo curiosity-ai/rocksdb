@@ -412,6 +412,11 @@ supervisor, run `fusermount3 -uz <dir>/db` yourself and check `pgrep lazyfs`.
   WAL write error (upstream's `SyncWalImpl` skips it with `paranoid_checks`), and a failed sync of a closed WAL or of
   the WAL directory during a flush was reported as a memtable switch error (always fatal) instead of a flush error.
   Fixed, with the regression tests `WalSyncErrorClassificationTests`; the soak now fails such a cycle.
+- Engine: the automatic recovery from a retryable flush error (retry-only recovery flush, kErrorRecoveryRetryFlush)
+  could hang for good: it took the flush accounting of every column family with sealed memtables, then flushed them
+  one by one and returned at the first failure without releasing the accounting of the others, so the next attempt
+  waited for those background jobs forever (every `Resume` was Busy, and closing the DB hung). Found by the new
+  check above; fixed, with the regression test `ErrorHandlerTests.RetryFlushRecoveryThatFailsPartwayIsRetried`.
 - Usage: optimistic transactions with `ValidateParallel` lose plain (non-transactional) writes to the same keys that
   land between validation and commit, as upstream does (see "The workload" above).
 
