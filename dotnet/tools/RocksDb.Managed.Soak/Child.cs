@@ -25,6 +25,11 @@ internal sealed class ChildProcess : IDisposable
     /// <summary>Completes with the open time (ms) when the worker prints "OPENED ms".</summary>
     public Task<double> Opened => _opened.Task;
 
+    private readonly TaskCompletionSource _resumeFinished = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Completes when the worker's Resume after an I/O error window ended ("RESUME ok" or "RESUME gave up").</summary>
+    public Task ResumeFinished => _resumeFinished.Task;
+
     public bool HasExited => _p.HasExited;
 
     public string Tail
@@ -79,6 +84,8 @@ internal sealed class ChildProcess : IDisposable
             _tail.Enqueue(line);
             while (_tail.Count > 40) _tail.Dequeue();
         }
+        if (line.Contains(" RESUME ok", StringComparison.Ordinal) || line.Contains(" RESUME gave up", StringComparison.Ordinal))
+            _resumeFinished.TrySetResult();
         if (line.StartsWith("OPENED ", StringComparison.Ordinal) &&
             double.TryParse(line.AsSpan(7), System.Globalization.CultureInfo.InvariantCulture, out double ms))
             _opened.TrySetResult(ms);

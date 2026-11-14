@@ -552,6 +552,20 @@ internal sealed class Supervisor
                 if (!Wait(run / 3, w)) return Unexpected(w, w.WaitAsync(TimeSpan.FromSeconds(10)).Result);
                 w.Send("ioerr-off");
                 if (!Wait(run / 3 + TimeSpan.FromSeconds(1), w)) return Unexpected(w, w.WaitAsync(TimeSpan.FromSeconds(10)).Result);
+                // The cycle ends only once the worker's Resume has finished (it retries while an automatic recovery is
+                // busy, for up to about a minute); a Resume that never returns is a failure.
+                var resumeWait = Stopwatch.StartNew();
+                while (!w.ResumeFinished.IsCompleted && resumeWait.Elapsed < TimeSpan.FromSeconds(90) && !_stopRequested)
+                {
+                    if (!Wait(TimeSpan.FromMilliseconds(100), w)) return Unexpected(w, w.WaitAsync(TimeSpan.FromSeconds(10)).Result);
+                }
+                if (!w.ResumeFinished.IsCompleted && !_stopRequested)
+                {
+                    w.Kill();
+                    w.WaitAsync(TimeSpan.FromSeconds(60)).Wait();
+                    CountIoErrorNotes(plan, kind, recoverable: false);
+                    return "Resume did not finish within 90 s after the I/O errors stopped\n" + w.Tail;
+                }
                 // After retryable and NoSpace errors the DB must be back to normal: Resume succeeds once the errors
                 // stop, and a clean stop closes without error. Only plain IOErrors may leave it stopped until a reopen.
                 bool recoverable = kind != "plain";
@@ -573,7 +587,7 @@ internal sealed class Supervisor
 
     /// <summary>
     /// Background errors and Resume after an I/O error window, from the worker log. Returns a failure when the errors
-    /// were <paramref name="recoverable"/> (retryable or NoSpace) and the worker tried to resume but never succeeded.
+    /// were <paramref name="recoverable"/> (retryable or NoSpace) and the worker gave up resuming without success.
     /// </summary>
     private string? CountIoErrorNotes(CyclePlan plan, string kind, bool recoverable)
     {
@@ -581,14 +595,14 @@ internal sealed class Supervisor
         if (!File.Exists(log)) return null;
         long injected = 0;
         int resumeOk = 0, resumeFailed = 0;
-        bool resumeAttempted = false;
+        bool gaveUp = false;
         string? lastResumeError = null;
         foreach (string line in File.ReadLines(log))
         {
+            if (line.Contains(" RESUME gave up", StringComparison.Ordinal)) gaveUp = true;
             int i = line.IndexOf("I/O errors off (", StringComparison.Ordinal);
             if (i >= 0)
             {
-                resumeAttempted = true;
                 string n = line[(i + 16)..];
                 n = n[..n.IndexOf(' ')];
                 injected += long.Parse(n, System.Globalization.CultureInfo.InvariantCulture);
@@ -605,7 +619,7 @@ internal sealed class Supervisor
         Bump(_status.Notes, "resume-ok", resumeOk);
         if (resumeFailed > 0) Bump(_status.Notes, "resume-attempts-failed", resumeFailed);
         Log($"cycle {plan.Cycle}: {injected} I/O errors injected; Resume ok {resumeOk}, failed attempts {resumeFailed}");
-        if (recoverable && resumeAttempted && resumeOk == 0)
+        if (recoverable && gaveUp && resumeOk == 0)
         {
             return $"Resume never succeeded after {kind} I/O errors stopped ({resumeFailed} attempts; a {kind} background " +
                 $"error must be recoverable); last: {lastResumeError}\n(worker log: {log})";

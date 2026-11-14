@@ -238,7 +238,8 @@ internal sealed class Worker
     /// <summary>
     /// Resume after the I/O error window: up to 20 failed attempts, 200 ms apart. While an automatic recovery runs
     /// (Busy) the attempt is not counted and Resume is retried for up to 60 s, so that a slow recovery is not reported
-    /// as a failure to resume (the supervisor fails the cycle when retryable or NoSpace errors never resume).
+    /// as a failure to resume (the supervisor fails the cycle when retryable or NoSpace errors never resume). Ends with
+    /// "RESUME ok" or "RESUME gave up", which the supervisor waits for before it ends the cycle.
     /// </summary>
     private void TryResume()
     {
@@ -262,6 +263,7 @@ internal sealed class Worker
                 Thread.Sleep(200);
             }
         }
+        Log("RESUME gave up");
     }
 
     private async Task OnError(Exception e)
