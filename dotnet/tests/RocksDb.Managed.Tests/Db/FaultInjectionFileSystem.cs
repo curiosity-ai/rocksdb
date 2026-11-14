@@ -253,8 +253,12 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
 
     public IRandomAccessFile OpenRandomAccess(string path) => OpenRandomAccess(path, RandomAccessFileOptions.Default);
 
+    /// <summary>Called with the path before every random access open (it may throw to fail the open).</summary>
+    public Action<string>? BeforeOpenRandomAccess { get; set; }
+
     public IRandomAccessFile OpenRandomAccess(string path, RandomAccessFileOptions options)
     {
+        BeforeOpenRandomAccess?.Invoke(path);
         IRandomAccessFile f = Inner.OpenRandomAccess(path, options);
         Interlocked.Increment(ref _openFiles);
         return new RandomAccess(this, f);
