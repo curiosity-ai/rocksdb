@@ -98,7 +98,16 @@ internal sealed class SuperVersion
 /// </summary>
 internal sealed class ColumnFamilyData
 {
-    public ColumnFamilyData(uint id, string name, ColumnFamilyOptions options, DbImpl db)
+    public ColumnFamilyData(uint id, string name, ColumnFamilyOptions options, DbImpl db) : this(id, name, options, db, null)
+    {
+    }
+
+    /// <param name="recoveredTableCache">The column family's table cache view created by best-efforts recovery
+    /// (<see cref="NewTableCache"/>), whose readers stay cached for this column family: upstream creates the
+    /// ColumnFamilyData, and its table cache, when the MANIFEST replay meets the column family
+    /// (VersionEditHandler::CreateCfAndInit, db/version_edit_handler.cc), so the tables opened while the point-in-time
+    /// versions are verified are the ones the DB reads afterwards. Null: a new view.</param>
+    public ColumnFamilyData(uint id, string name, ColumnFamilyOptions options, DbImpl db, TableCache? recoveredTableCache)
     {
         Id = id;
         Name = name;
@@ -128,14 +137,19 @@ internal sealed class ColumnFamilyData
             WriteBufferManager = db.WriteBufferManager,
         };
         MemOptions.ApplyColumnFamilyOptions(options);
-        TableCache = new TableCache(db.SharedTableCache, db.FileSystem, db.DbPaths, ReaderOptions)
+        if (recoveredTableCache is null)
         {
-            Statistics = db.Options.Statistics,
-            VerifyUniqueIdInManifest = db.Options.VerifySstUniqueIdInManifest,
-            RowCache = db.Options.RowCache,
-        };
+            TableCache = NewTableCache(db, ReaderOptions, NumLevels);
+        }
+        else
+        {
+            // Built from the same options (NewTableCache); tables opened from now on use this column family's reader options.
+            System.Diagnostics.Debug.Assert(recoveredTableCache.NumLevels == NumLevels && recoveredTableCache.LevelStats is not null);
+            TableCache = recoveredTableCache;
+            TableCache.ReaderOptions = ReaderOptions;
+        }
         // Blob files live in cf_paths.front() (the first DB path); readers and the optional blob cache are per CF.
-        Stats = new InternalStats(NumLevels);
+        Stats = TableCache.LevelStats!;
         BlobSource = new Blob.BlobSource(db.FileSystem, db.DbPaths[0], id, options.BlobCache, db.Identity.DbId, db.Identity.SessionId, db.Options.Statistics,
             db.Options.MaxOpenFiles)
         {
@@ -144,8 +158,6 @@ internal sealed class ColumnFamilyData
         CompactionState = new ColumnFamilyCompactionState(options, Icmp);
         // ioptions.cf_paths (= db_paths): GetPathId of the leveled and universal pickers.
         CompactionState.Picker.PathTargetSizes = db.DbPathTargetSizes;
-        TableCache.LevelStats = Stats;
-        TableCache.NumLevels = NumLevels;
         if (options.EnableBlobDirectWrite && options.EnableBlobFiles && !db.IsReadOnly)
         {
             // DBImpl::MaybeInitBlobDirectWriteColumnFamily.
@@ -284,7 +296,22 @@ internal sealed class ColumnFamilyData
         TableCache.ReaderOptions = reader;
     }
 
-    private static TableReaderOptions CreateReaderOptions(ColumnFamilyOptions options, TableFormatOptions format, DbImpl db)
+    /// <summary>
+    /// The column family's view of the DB-wide table cache (TableCache, created with the ColumnFamilyData upstream), with
+    /// its internal stats (the per-level read histograms of the readers it opens). Used by the constructor and by
+    /// best-efforts recovery, which opens the tables before the column family exists here (see the constructor).
+    /// </summary>
+    internal static TableCache NewTableCache(DbImpl db, TableReaderOptions readerOptions, int numLevels) =>
+        new(db.SharedTableCache, db.FileSystem, db.DbPaths, readerOptions)
+        {
+            Statistics = db.Options.Statistics,
+            VerifyUniqueIdInManifest = db.Options.VerifySstUniqueIdInManifest,
+            RowCache = db.Options.RowCache,
+            LevelStats = new InternalStats(numLevels),
+            NumLevels = numLevels,
+        };
+
+    internal static TableReaderOptions CreateReaderOptions(ColumnFamilyOptions options, TableFormatOptions format, DbImpl db)
     {
         TableReaderOptions r = TableFactory.CreateReaderOptions(options, format, db.GetDefaultBlockCache(options.TableOptions), db.Identity.SessionId);
         if (db.Options.Statistics is { } statistics) r = r with { Statistics = statistics.BlockCacheCounters };

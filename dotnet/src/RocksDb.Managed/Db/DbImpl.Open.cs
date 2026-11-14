@@ -223,10 +223,24 @@ internal sealed partial class DbImpl
         SetComparatorResolver(descriptors);
         RecoveredVersionState state;
         ulong manifestNumber;
+        // Best-efforts recovery opens the tables of the point-in-time versions through the column families' table caches
+        // while it replays; the views are handed to the column families below (closed by SharedTableCache on failure).
+        RecoveryFileVerifier? pointInTimeVerifier = null;
         if (Options.BestEffortsRecovery)
         {
-            state = ManifestReader.TryRecoverPointInTime(FileSystem, DbName, _comparatorResolver, new RecoveryFileVerifier(this, descriptors), out manifestNumber,
-                out bool hasMissingFiles);
+            pointInTimeVerifier = new RecoveryFileVerifier(this, descriptors);
+            // TryRecoverFromOneManifest reads with Env::IOActivity::kDBOpen (FILE_READ_DB_OPEN_MICROS).
+            int replayActivity = Monitoring.FileReadActivity.Enter(Histogram.FileReadDbOpenMicros);
+            bool hasMissingFiles;
+            try
+            {
+                state = ManifestReader.TryRecoverPointInTime(FileSystem, DbName, _comparatorResolver, pointInTimeVerifier, out manifestNumber,
+                    out hasMissingFiles);
+            }
+            finally
+            {
+                Monitoring.FileReadActivity.Exit(replayActivity);
+            }
             if (hasMissingFiles) LogWarn("Best-efforts recovery: some table or blob files are missing or corrupted; recovered to the latest consistent point in time");
         }
         else
@@ -275,7 +289,11 @@ internal sealed partial class DbImpl
                 {
                     ColumnFamilyOptions opts = PrepareCfOptions(descriptors[cf.Name]);
                     ValidateRecoveredColumnFamily(cf, opts);
-                    var cfd = new ColumnFamilyData(cf.Id, cf.Name, opts, this) { LogNumber = cf.LogNumber, FullHistoryTsLow = cf.FullHistoryTsLow };
+                    var cfd = new ColumnFamilyData(cf.Id, cf.Name, opts, this, pointInTimeVerifier?.TakeTableCache(cf.Id, cf.Name))
+                    {
+                        LogNumber = cf.LogNumber,
+                        FullHistoryTsLow = cf.FullHistoryTsLow,
+                    };
                     var files = new FileMetaData[cf.NumLevels][];
                     for (int l = 0; l < cf.NumLevels; l++)
                     {
@@ -284,6 +302,7 @@ internal sealed partial class DbImpl
                     }
                     recovered.Add((cf, cfd, files));
                 }
+                pointInTimeVerifier?.Dispose();
                 // VersionEditHandler::CheckIterationResult: LoadTables of every column family, then their versions (whose
                 // stats find the tables open). Before anything is written: a failure leaves the MANIFEST untouched.
                 if (!Options.BestEffortsRecovery)
@@ -544,14 +563,21 @@ internal sealed partial class DbImpl
     /// </summary>
     private ColumnFamilyOptions PrepareCfOptions(ColumnFamilyOptions options)
     {
+        ColumnFamilyOptions o = SanitizedCfOptions(options);
+        // ColumnFamilyData::ValidateOptions (DB::Open / CreateColumnFamily).
+        ValidateCfOptions(Options, o);
+        o.DbOffpeakTime = OffpeakTime;
+        return o;
+    }
+
+    /// <summary>A sanitized copy of a CF's options (the SanitizeOptions part of <see cref="PrepareCfOptions"/>, without validation).</summary>
+    private ColumnFamilyOptions SanitizedCfOptions(ColumnFamilyOptions options)
+    {
         ColumnFamilyOptions o = options.Clone();
         SanitizeCfOptions(o, Options.AllowIngestBehind, DbPaths.Count);
         // SanitizeCfOptions: with atomic_flush an internal flush covers all column families even with fewer memtables
         // than min_write_buffer_number_to_merge, so the option is sanitized to 1.
         if (Options.AtomicFlush && o.MinWriteBufferNumberToMerge > 1) o.MinWriteBufferNumberToMerge = 1;
-        // ColumnFamilyData::ValidateOptions (DB::Open / CreateColumnFamily).
-        ValidateCfOptions(Options, o);
-        o.DbOffpeakTime = OffpeakTime;
         return o;
     }
 
