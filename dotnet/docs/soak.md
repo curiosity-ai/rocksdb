@@ -98,7 +98,7 @@ levels deep.
 | `FsyncTrigger` (8) | `clear-cache` right after the N-th fsync of a WAL (N 1..39), MANIFEST or SST file (N 1..11) completes, before the engine sees it return | as `PowerLoss` |
 | `RecoveryKill` (8) | SIGKILL; then a second worker is started and SIGKILLed after a random delay in [0, 1.5 x the last open time + 100 ms] (during or right after recovery); a third process verifies | every acknowledged write survives |
 | `Pause` (6) | SIGSTOP / SIGCONT for 0.1..5 s every 0.3..3 s during the RUN phase, then a clean stop or SIGKILL | every acknowledged write survives; online checks keep holding after each pause |
-| `IoError` (8) | the fault file system fails appends, fsyncs (and directory fsyncs, creates, renames, deletes) and reads at random (200..5000 per million) for a third of the RUN phase, with one error kind per cycle: plain IOError, retryable IOError or NoSpace; then it stops failing and the worker calls `Resume`; then a clean stop or SIGKILL. As upstream, a plain IOError in a flush or WAL write is a fatal background error that `Resume` refuses until a reopen, while retryable and NoSpace errors recover (counted as `resume-ok`) | failed writes are `:info` (or `:fail` for a transaction conflict), never `:ok`; every acknowledged write survives; a close that fails after unrecovered background errors is counted (`close-failed-after-io-errors`), not a failure |
+| `IoError` (8) | the fault file system fails appends, fsyncs (and directory fsyncs, creates, renames, deletes) and reads at random (200..5000 per million) for a third of the RUN phase, with one error kind per cycle: plain IOError, retryable IOError or NoSpace; then it stops failing and the worker calls `Resume`; then a clean stop or SIGKILL. As upstream, a plain IOError in a flush or WAL write is a fatal background error that `Resume` refuses until a reopen, while retryable and NoSpace errors recover (counted as `resume-ok`). `Resume` is retried up to 20 times, 200 ms apart (while an automatic recovery is in progress, up to 60 s without counting the attempt) | failed writes are `:info` (or `:fail` for a transaction conflict), never `:ok`; every acknowledged write survives; after retryable or NoSpace errors `Resume` must succeed and a clean stop must close without error (a failure otherwise); after plain IOErrors a close that fails is counted (`close-failed-after-io-errors`), not a failure |
 | `LazyFsClear` (0; only with LazyFS) | SIGKILL, then `lazyfs::clear-cache` through the LazyFS FIFO (see "Real LazyFS mode") | as `PowerLoss` |
 
 ### The in-process fault file system
@@ -196,7 +196,10 @@ compaction, so wall-clock jumps cannot change the result).
 Disk: the DB stays small (bounded key spaces: about 10..50 MB with the defaults). The histories take about
 50..60 MB per minute of RUN time with the defaults (every write, sync and transfer, and one in eight reads, is
 recorded); only the last `--keep-history` cycles (default 20, about 40 s each on average) are kept, so plan for about
-1..2 GB in the run directory plus the failure copies (each about the DB size plus one history). Memory: about 300 MB
+1..2 GB in the run directory plus the failure copies (each about the DB size plus one history). The fault file
+system's graveyard (`tmp/graveyard-<pid>`: deleted files kept for a simulated power loss) drops files once a
+directory fsync makes their deletion durable, and the supervisor removes the graveyards and checkpoints of earlier
+workers before each cycle. Memory: about 300 MB
 per worker.
 
 ```bash
@@ -403,6 +406,17 @@ supervisor, run `fusermount3 -uz <dir>/db` yourself and check `pgrep lazyfs`.
   a power loss could drop the closed WAL while the flushed column family kept its half of a cross-column-family
   batch. The fault file system's diagnostics showed a synced WAL without a durable directory entry; fixed, with the
   regression test `DbCrashConsistencyTests.MemtableSwitchMakesTheClosedWalDurableIncludingItsDirectoryEntry`.
+- Engine: retryable and NoSpace I/O errors sometimes never recovered (`resume-ok` 0 in an IoError cycle, which the
+  soak only counted then). Two deviations from upstream turned them into fatal errors: a `SyncWAL` /
+  `FlushWAL(sync)` that only saw its writer's previous error ("Writer has previous error.") was classified as a new
+  WAL write error (upstream's `SyncWalImpl` skips it with `paranoid_checks`), and a failed sync of a closed WAL or of
+  the WAL directory during a flush was reported as a memtable switch error (always fatal) instead of a flush error.
+  Fixed, with the regression tests `WalSyncErrorClassificationTests`; the soak now fails such a cycle.
+- Engine: the automatic recovery from a retryable flush error (retry-only recovery flush, kErrorRecoveryRetryFlush)
+  could hang for good: it took the flush accounting of every column family with sealed memtables, then flushed them
+  one by one and returned at the first failure without releasing the accounting of the others, so the next attempt
+  waited for those background jobs forever (every `Resume` was Busy, and closing the DB hung). Found by the new
+  check above; fixed, with the regression test `ErrorHandlerTests.RetryFlushRecoveryThatFailsPartwayIsRetried`.
 - Usage: optimistic transactions with `ValidateParallel` lose plain (non-transactional) writes to the same keys that
   land between validation and commit, as upstream does (see "The workload" above).
 

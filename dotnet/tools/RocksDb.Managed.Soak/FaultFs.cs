@@ -69,6 +69,8 @@ internal sealed class LazyFaultFileSystem : IFileSystem
     private readonly Lock _meta = new();
     private readonly Dictionary<string, Tracked> _current = new(StringComparer.Ordinal);
     private Dictionary<string, Tracked> _durable = new(StringComparer.Ordinal);
+    /// <summary>The files with a copy or link in the graveyard (guarded by <see cref="_meta"/>).</summary>
+    private readonly List<Tracked> _buried = [];
     private long _nextId;
     private int _inflight;
     private volatile bool _frozen;
@@ -245,6 +247,7 @@ internal sealed class LazyFaultFileSystem : IFileSystem
             string g = Path.Combine(_graveyard, t.Id.ToString(System.Globalization.CultureInfo.InvariantCulture));
             _inner.LinkFile(Path.Combine(_root, name), g);
             t.GraveyardPath = g;
+            _buried.Add(t);
         }
     }
 
@@ -272,6 +275,7 @@ internal sealed class LazyFaultFileSystem : IFileSystem
                             string g = Path.Combine(_graveyard, existing.Id.ToString(System.Globalization.CultureInfo.InvariantCulture));
                             File.Copy(Path.Combine(_root, name), g);
                             existing.GraveyardPath = g;
+                            _buried.Add(existing);
                         }
                         t = new Tracked(++_nextId);
                         _current[name] = t;
@@ -415,9 +419,29 @@ internal sealed class LazyFaultFileSystem : IFileSystem
             if (Roll(_syncErrorPpm)) throw Injected("directory sync", path);
             if (!SkipRealSync) _inner.SyncDirectory(path);
             if (SkipSync) return;
+            List<string>? released = null;
             lock (_meta)
             {
                 _durable = new Dictionary<string, Tracked>(_current, StringComparer.Ordinal);
+                // A buried file that the new durable listing does not name can no longer come back after a crash: drop
+                // its graveyard copy, or the graveyard keeps every file deleted during the worker's life.
+                for (int i = _buried.Count - 1; i >= 0; i--)
+                {
+                    Tracked t = _buried[i];
+                    if (IsDurablyReferenced(t)) continue;
+                    (released ??= []).Add(t.GraveyardPath!);
+                    t.GraveyardPath = null;
+                    _buried.RemoveAt(i);
+                }
+            }
+            // Still inside Enter/Exit: a crash waits for this operation, so it never stages a file deleted here.
+            if (released is not null)
+            {
+                foreach (string g in released)
+                {
+                    try { File.Delete(g); }
+                    catch (IOException) { }
+                }
             }
         }
         finally { Exit(); }

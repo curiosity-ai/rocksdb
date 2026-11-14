@@ -99,6 +99,14 @@ public class RocksDbException : Exception
     /// </summary>
     public ErrorSeverity Severity { get; init; }
 
+    /// <summary>
+    /// The operation never reached the file: its writer had already failed ("Writer has previous error.";
+    /// WritableFileWriter's failed_with_previous_error). The status says nothing about the original failure (its scope,
+    /// retryable flag or subcode are lost), so it must not be classified as a new background error. Not carried over by
+    /// <see cref="Rethrowable"/> / <see cref="WithSeverity"/>.
+    /// </summary>
+    internal bool WriterHasPreviousError { get; init; }
+
     /// <summary>A new exception object for the same status (flags and severity kept), with this one as inner exception.</summary>
     internal RocksDbException Rethrowable() =>
         new(Code, Message, SubCode, this) { Retryable = Retryable, DataLoss = DataLoss, Scope = Scope, Severity = Severity };
