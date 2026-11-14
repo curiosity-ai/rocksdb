@@ -19,7 +19,8 @@ public enum FilterAllocatorKind
 
 /// <summary>
 /// Model of the allocator's usable size used by optimize_filters_for_memory (port of the <c>malloc_usable_size</c> call
-/// in XXPH3FilterBitsBuilder::AllocateMaybeRounding, table/block_based/filter_policy.cc).
+/// in XXPH3FilterBitsBuilder::AllocateMaybeRounding, table/block_based/filter_policy.cc). The table reader's memory
+/// estimate uses it the same way for the malloc_usable_size(this) of upstream's ApproximateMemoryUsage functions.
 /// <para>
 /// Upstream sizes filters to what the allocator actually hands out, so the bytes native RocksDB writes depend on its
 /// allocator and, for filters of 128 KiB and more, on the state of the native heap (glibc serves large requests from

@@ -153,6 +153,35 @@ public sealed class TableProperties
     /// <summary>Offset of the external-SST global seqno value inside the file, or 0 if absent (set by the reader).</summary>
     public ulong ExternalSstFileGlobalSeqnoOffset { get; set; }
 
+    /// <summary>
+    /// sizeof(TableProperties) of native RocksDB on x86-64 / libstdc++ (main 11.14, measured with g++ against
+    /// include/rocksdb/table_properties.h), the stand-in for the object in <see cref="ApproximateMemoryUsage"/>.
+    /// </summary>
+    internal const int NativeObjectSize = 792;
+
+    /// <summary>
+    /// Port of TableProperties::ApproximateMemoryUsage (table/table_properties.cc): the object (malloc_usable_size, or
+    /// sizeof without ROCKSDB_MALLOC_USABLE_SIZE; see <see cref="Filters.FilterAllocationModel"/>), the bytes of its
+    /// string properties and of every user-collected name and value. The seqno-to-time mapping is not counted, as
+    /// upstream.
+    /// </summary>
+    public ulong ApproximateMemoryUsage
+    {
+        get
+        {
+            ulong usage = Filters.FilterAllocationModel.UsableSize(NativeObjectSize);
+            usage += StringSize(DbId) + StringSize(DbSessionId) + StringSize(DbHostId) + StringSize(ColumnFamilyName)
+                + StringSize(FilterPolicyName) + StringSize(ComparatorName) + StringSize(MergeOperatorName)
+                + StringSize(PrefixExtractorName) + StringSize(PropertyCollectorsNames) + StringSize(CompressionName)
+                + StringSize(CompressionOptions);
+            foreach (KeyValuePair<string, byte[]> kv in UserCollectedProperties) usage += StringSize(kv.Key) + (ulong)kv.Value.Length;
+            return usage;
+
+            // std::string::size(): the UTF-8 bytes the property was decoded from.
+            static ulong StringSize(string s) => (ulong)Encoding.UTF8.GetByteCount(s);
+        }
+    }
+
     /// <summary>Port of PropertyBlockBuilder::AddTableProperty (table/meta_blocks.cc).</summary>
     internal void AddTo(PropertyBlockBuilder b)
     {
