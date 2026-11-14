@@ -296,6 +296,8 @@ internal sealed class IteratorGraph : IDisposable
                         if (slot < _l0.Count) _l0[slot] = child;
                         else _l0.Add(child);
                         _l0Count++;
+                        // read_options_.iterate_upper_bound of the table iterator (a recycled one was cleared).
+                        child.SetIterateUpperBound(options?.IterateUpperBound);
                         if (child is TableInternalIterator t)
                         {
                             if (readahead > 0) t.SetUserReadahead(readahead);

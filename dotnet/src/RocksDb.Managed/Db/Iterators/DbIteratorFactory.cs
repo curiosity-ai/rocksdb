@@ -160,6 +160,7 @@ public static class DbIteratorFactory
                         InternalIterator child = sources.PrefixExtractor is null
                             ? readFlags == TableReadFlags.None ? tc.NewIterator(f) : TableInternalIterator.Create(tc.GetReader(f), readFlags, null, null)
                             : TableInternalIterator.Create(tc.GetReader(f), readFlags, sources.ReadOptions, sources.PrefixExtractor);
+                        child.SetIterateUpperBound(sources.ReadOptions?.IterateUpperBound);
                         if (sources.ReadOptions is { ReadaheadSize: > 0 } ro && child is TableInternalIterator rt) rt.SetUserReadahead(ro.ReadaheadSize);
                         children.Add(child);
                         // Lets DbIter skip ranges covered by newer range tombstones (SkipCoveredForward / Backward).

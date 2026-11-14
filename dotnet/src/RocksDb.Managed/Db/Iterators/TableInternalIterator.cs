@@ -46,6 +46,7 @@ public sealed class TableInternalIterator : InternalIterator
         {
             BlockBasedTableReader r = Bbt(lease);
             _it = r.NewIterator(flags, r.GetPrefixOptions(readOptions, prefixExtractor));
+            _it.SetUpperBound(readOptions?.IterateUpperBound);
             _embedded = r.HasEmbeddedBlobRecords;
         }
         catch
@@ -153,6 +154,8 @@ public sealed class TableInternalIterator : InternalIterator
     }
 
     public override void SetPinnedItersMgr(PinnedIteratorsManager? manager) => _it.SetPinnedItersMgr(manager);
+    public override IterBoundCheck UpperBoundCheckResult => _it.UpperBoundCheckResult;
+    internal override void SetIterateUpperBound(ReadOnlyMemory<byte>? upperBound) => _it.SetUpperBound(upperBound);
     public override bool TryGetPinnedValue(out PinnedSlice value)
     {
         if (_embedded && ResolveEmbedded())
@@ -323,6 +326,7 @@ public sealed class TableInternalIterator : InternalIterator
                 ? default
                 : r.GetPrefixOptions(readOptions, prefixExtractor);
             _it.Retarget(r, prefix);
+            _it.SetUpperBound(readOptions?.IterateUpperBound);
             _embedded = r.HasEmbeddedBlobRecords;
             _stale = true;
             _smallestSeqno = DbFormat.MaxSequenceNumber;
@@ -387,7 +391,7 @@ internal sealed class LeasedTableIterator : InternalIterator
     public override void SeekForPrev(ReadOnlySpan<byte> target) => _it.SeekForPrev(target);
     public override void Next() => _it.Next();
     public override void Prev() => _it.Prev();
-    public override bool MayBeOutOfUpperBound => _it.MayBeOutOfUpperBound;
+    public override IterBoundCheck UpperBoundCheckResult => _it.UpperBoundCheckResult;
 
     protected override void Dispose(bool disposing)
     {
