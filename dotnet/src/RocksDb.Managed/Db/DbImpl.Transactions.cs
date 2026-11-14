@@ -201,7 +201,9 @@ internal sealed partial class DbImpl
             if (c.Dropped) continue;
             foreach (ImmutableMemTable m in c.Imm)
             {
-                if (m.FlushCompleted || (beingFlushed is not null && beingFlushed.Contains(m))) continue;
+                // MemTableList::PrecomputeMinLogContainingPrepSection: every memtable still in the list, a completed flush
+                // waiting to be committed included.
+                if (beingFlushed is not null && beingFlushed.Contains(m)) continue;
                 ulong log = m.Mem.MinLogContainingPrepSection;
                 if (log > 0 && (min == 0 || log < min)) min = log;
             }

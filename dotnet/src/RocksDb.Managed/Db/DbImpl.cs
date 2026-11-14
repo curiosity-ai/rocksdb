@@ -1174,6 +1174,17 @@ internal sealed partial class DbImpl : IAsyncDisposable
         if (cfd.Mem is not null && cfd.Mem.Unref()) cfd.Mem.Dispose();
         foreach (ImmutableMemTable m in cfd.Imm)
         {
+            // A completed flush still waiting for an older one is never committed now: its outputs are left to the
+            // obsolete-file scan.
+            if (m.FlushResult is { } r)
+            {
+                _pendingOutputs.Remove(r.FileNumber);
+                if (r.BlobBuilder is not null)
+                {
+                    foreach (ulong n in r.BlobBuilder.CreatedFileNumbers) _pendingOutputs.Remove(n);
+                }
+                m.FlushResult = null;
+            }
             if (m.Mem.Unref()) m.Mem.Dispose();
         }
         cfd.Imm.Clear();

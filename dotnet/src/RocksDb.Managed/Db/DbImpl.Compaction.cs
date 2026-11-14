@@ -1165,7 +1165,7 @@ internal sealed partial class DbImpl
         if (failure is not null && isManual)
         {
             if (failure is RocksDbException r) throw r.Rethrowable();
-            throw RocksDbException.IOError(failure.Message, failure);
+            throw RocksDbException.FromException(failure);
         }
     }
 

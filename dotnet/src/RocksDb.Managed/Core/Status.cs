@@ -124,33 +124,107 @@ public class RocksDbException : Exception
     public static RocksDbException SpaceLimit(string message) =>
         new(StatusCode.IOError, "IO error: Space limit reached: " + message, StatusSubCode.SpaceLimit);
 
-    // errno / HRESULT values of "no space left on device" (ENOSPC on Linux/macOS, EDQUOT, ERROR_DISK_FULL,
-    // ERROR_HANDLE_DISK_FULL).
-    private const int EnospcLinux = 28;
-    private const int EdquotLinux = 122;
-    private const int EdquotDarwin = 69;
-    private const int ErrorDiskFull = unchecked((int)0x80070070);
-    private const int ErrorHandleDiskFull = unchecked((int)0x80070027);
+    /// <summary>IOStatus::PathNotFound: the file or directory does not exist.</summary>
+    public static RocksDbException PathNotFound(string message, Exception? inner = null) =>
+        new(StatusCode.IOError, "IO error: No such file or directory: " + message, StatusSubCode.PathNotFound, inner);
+
+    // Error numbers mapped by the native environments. Unix (errno): ENOENT and ENOSPC have the same value on Linux and
+    // macOS, ESTALE and EDQUOT differ. Windows: Win32 error codes (winerror.h).
+    private const int ENOENT = 2;
+    private const int ENOSPC = 28;
+    private const int ESTALE_LINUX = 116;
+    private const int ESTALE_DARWIN = 70;
+    private const int EDQUOT_LINUX = 122;
+    private const int EDQUOT_DARWIN = 69;
+    private const int ERROR_FILE_NOT_FOUND = 2;
+    private const int ERROR_PATH_NOT_FOUND = 3;
+    private const int ERROR_HANDLE_DISK_FULL = 39;
+    private const int ERROR_DISK_FULL = 112;
+    // An IOException raised for a Win32 error carries HRESULT_FROM_WIN32(error) = 0x8007xxxx as its HResult.
+    private const int FACILITY_WIN32_MASK = unchecked((int)0xFFFF0000);
+    private const int FACILITY_WIN32 = unchecked((int)0x80070000);
+
+    private static bool IsEstale(int errno) => errno == (OperatingSystem.IsMacOS() || OperatingSystem.IsIOS() ? ESTALE_DARWIN : ESTALE_LINUX);
+
+    // EDQUOT is not mapped by io_posix.cc (it becomes a plain IOError there). A quota is exhausted the way a device is
+    // filled, and is cleared the same way (by freeing space), so it gets the out-of-space handling as well.
+    private static bool IsEdquot(int errno) => errno == (OperatingSystem.IsMacOS() || OperatingSystem.IsIOS() ? EDQUOT_DARWIN : EDQUOT_LINUX);
+
+    private static string Join(string? context, string? path, string? detail)
+    {
+        string m = context ?? "";
+        if (!string.IsNullOrEmpty(path)) m = m.Length == 0 ? path : m + ": " + path; // IOErrorMsg
+        if (!string.IsNullOrEmpty(detail)) m = m.Length == 0 ? detail : m + ": " + detail;
+        return m;
+    }
 
     /// <summary>
-    /// Maps an exception from a file system or a background job to a status (the IOStatus a posix Env would return):
-    /// <see cref="RocksDbException"/> is returned as is, an out-of-space <see cref="IOException"/> becomes
-    /// <see cref="NoSpace"/>, other I/O and access errors become plain IOErrors.
+    /// Port of IOError(context, file_name, err_number) of env/io_posix.cc:69-87: ENOSPC becomes a retryable
+    /// <see cref="NoSpace"/>, ESTALE an IOError with <see cref="StatusSubCode.StaleFile"/>, ENOENT
+    /// <see cref="PathNotFound"/>, anything else a plain IOError. <paramref name="detail"/> is errnoStr(err_number).
+    /// </summary>
+    internal static RocksDbException FromErrno(string? context, string? path, int errno, string? detail, Exception? inner = null)
+    {
+        string m = Join(context, path, detail);
+        if (errno == ENOSPC || IsEdquot(errno))
+        {
+            return new(StatusCode.IOError, "IO error: No space left on device: " + m, StatusSubCode.NoSpace, inner) { Retryable = true };
+        }
+        if (IsEstale(errno)) return new(StatusCode.IOError, "IO error: Stale file handle: " + m, StatusSubCode.StaleFile, inner);
+        if (errno == ENOENT) return PathNotFound(m, inner);
+        return IOError(m, inner);
+    }
+
+    /// <summary>
+    /// Port of port::IOErrorFromWindowsError (port/win/io_win.h): ERROR_HANDLE_DISK_FULL / ERROR_DISK_FULL become
+    /// <see cref="NoSpace"/> (not retryable, unlike the posix mapping), ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
+    /// <see cref="PathNotFound"/>, anything else a plain IOError.
+    /// </summary>
+    internal static RocksDbException FromWin32Error(string? context, string? path, int error, string? detail, Exception? inner = null)
+    {
+        string m = Join(context, path, detail);
+        if (error is ERROR_HANDLE_DISK_FULL or ERROR_DISK_FULL) return NoSpace(m, inner);
+        if (error is ERROR_FILE_NOT_FOUND or ERROR_PATH_NOT_FOUND) return PathNotFound(m, inner);
+        return IOError(m, inner);
+    }
+
+    /// <summary>
+    /// Maps an exception thrown by the .NET file APIs to the IOStatus the native environment returns for the same
+    /// failure (<see cref="FromErrno"/> on Unix, where .NET carries the errno as the exception's HResult;
+    /// <see cref="FromWin32Error"/> on Windows, where it carries HRESULT_FROM_WIN32). A <see cref="RocksDbException"/> is
+    /// returned unchanged. Every file system error path goes through here, so the subcode (and with it the background
+    /// error severity and the out-of-space recovery) does not depend on which API failed.
+    /// </summary>
+    internal static RocksDbException FromIOException(string? context, string? path, Exception e)
+    {
+        if (e is RocksDbException r) return r;
+        if (e is AggregateException { InnerExceptions.Count: 1 } a) return FromIOException(context, path, a.InnerExceptions[0]);
+        string detail = e.Message;
+        if (e is FileNotFoundException or DirectoryNotFoundException) return PathNotFound(Join(context, path, detail), e);
+        if (e is IOException io)
+        {
+            int h = io.HResult;
+            if (OperatingSystem.IsWindows())
+            {
+                if ((h & FACILITY_WIN32_MASK) == FACILITY_WIN32) return FromWin32Error(context, path, h & 0xFFFF, detail, e);
+            }
+            else if (h > 0)
+            {
+                return FromErrno(context, path, h, detail, e);
+            }
+        }
+        return IOError(Join(context, path, detail), e);
+    }
+
+    /// <summary>
+    /// Maps an exception from a file system or a background job to a status (the IOStatus a native Env would return,
+    /// see <see cref="FromIOException"/>): <see cref="RocksDbException"/> is returned as is, an out-of-space
+    /// <see cref="IOException"/> becomes <see cref="NoSpace"/>, other I/O and access errors become IOErrors.
     /// </summary>
     public static RocksDbException FromException(Exception e)
     {
         ArgumentNullException.ThrowIfNull(e);
-        if (e is RocksDbException r) return r;
-        if (e is AggregateException { InnerExceptions.Count: 1 } a) return FromException(a.InnerExceptions[0]);
-        if (e is IOException io)
-        {
-            int h = io.HResult;
-            if (h is EnospcLinux or EdquotLinux or ErrorDiskFull or ErrorHandleDiskFull || (h == EdquotDarwin && OperatingSystem.IsMacOS()))
-            {
-                return NoSpace(io.Message, io);
-            }
-        }
-        return IOError(e.Message, e);
+        return FromIOException(null, null, e);
     }
 }
 

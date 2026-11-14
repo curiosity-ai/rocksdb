@@ -113,9 +113,9 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
     }
 
     /// <summary>
-    /// CollectFlushableCFs: the column family with the largest flushable memory (mutable memtable, plus immutable ones not
-    /// yet flushing with <paramref name="includeWaitingImmutable"/>) and the one with the oldest mutable memtable, among
-    /// those not already flushing. REQUIRES: mutex.
+    /// CollectFlushableCFs (db/db_impl/db_impl_compaction_flush.cc): the column family with the largest flushable memory
+    /// (mutable memtable, plus the immutable ones with <paramref name="includeWaitingImmutable"/>) and the one with the
+    /// oldest mutable memtable, among those with no flush pending or running. REQUIRES: mutex.
     /// </summary>
     private ColumnFamilyData? CollectFlushableColumnFamilies(bool includeWaitingImmutable, out ColumnFamilyData? oldest, out long largestMem)
     {
@@ -126,18 +126,17 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
         foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
         {
             if (cfd.Dropped || cfd.Mem is null) continue;
+            // Non-atomic flushes skip CFs already flushing, or with a sealed memtable still waiting for its flush
+            // (IsFlushPendingOrRunning): switching such a CF again only adds an immutable memtable behind the pending one.
+            if (cfd.IsFlushPendingOrRunning) continue;
             long mutableMem = cfd.Mem.IsEmpty ? 0 : MemUsageForWbm(cfd.Mem);
-            bool flushPendingOrRunning = false;
             long waiting = 0;
-            foreach (ImmutableMemTable m in cfd.Imm)
+            if (includeWaitingImmutable)
             {
-                if (m.FlushInProgress) flushPendingOrRunning = true;
-                else if (m.FlushCompleted) continue;
-                else waiting += MemUsageForWbm(m.Mem);
+                // WBMTrackedUnflushedMemTablesMemoryUsage: no flush is pending or running, so every immutable memtable waits.
+                foreach (ImmutableMemTable m in cfd.Imm) waiting += MemUsageForWbm(m.Mem);
             }
-            // Non-atomic flushes skip CFs already flushing.
-            if (flushPendingOrRunning) continue;
-            long mem = mutableMem + (includeWaitingImmutable ? waiting : 0);
+            long mem = mutableMem + waiting;
             if (mem == 0) continue;
             if (largest is null || mem > largestMem)
             {

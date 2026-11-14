@@ -19,8 +19,19 @@ internal sealed class ImmutableMemTable
     public ulong NextLogNumber { get; }
     /// <summary>Why the memtable was switched out (reported to listeners).</summary>
     public FlushReason FlushReason { get; init; }
+    /// <summary>flush_in_progress_: a flush picked this memtable (it stays set once the flush completed).</summary>
     public bool FlushInProgress { get; set; }
+    /// <summary>flush_completed_: the flush wrote its table; the memtable leaves the list when the result is committed.</summary>
     public bool FlushCompleted { get; set; }
+    /// <summary>file_number_: the table file of the completed flush (the memtables of one flush share it). 0 until completed.</summary>
+    public ulong FlushFileNumber { get; set; }
+    /// <summary>The flush job that picked this memtable (identifies its memtables when it rolls them back).</summary>
+    public object? FlushOwner { get; set; }
+    /// <summary>
+    /// edit_ and the flush job info of the completed flush whose oldest memtable this is, waiting to be committed in
+    /// memtable order (MemTableList::TryInstallMemtableFlushResults); null on the other memtables of the flush.
+    /// </summary>
+    public PendingFlushResult? FlushResult { get; set; }
     /// <summary>
     /// The memtable switch this memtable was sealed by (<see cref="DbImpl.BeginAtomicSwitch"/>): memtables of different
     /// column families switched together share it. An atomic flush picks the memtables of every column family up to one
@@ -325,23 +336,40 @@ internal sealed class ColumnFamilyData
     /// <summary>WALs with numbers below this have been flushed for this CF (ColumnFamilyData::GetLogNumber).</summary>
     public ulong LogNumber { get; set; }
     public bool Dropped { get; set; }
-    public bool FlushRunning { get; set; }
+    /// <summary>
+    /// Flush jobs scheduled or running on this column family. Like upstream, several flushes of one column family may
+    /// run at once, each on memtables the others did not pick; their results are committed in memtable order
+    /// (<see cref="FlushCommitInProgress"/>). Guarded by the DB mutex.
+    /// </summary>
+    public int RunningFlushes { get; set; }
+    /// <summary>
+    /// The running flush is an atomic flush or an error recovery flush group (one MANIFEST atomic group for several
+    /// column families): it has the column family's memtables to itself, no other flush is started meanwhile. Guarded
+    /// by the DB mutex.
+    /// </summary>
+    public bool ExclusiveFlushRunning { get; set; }
+    /// <summary>MemTableList::commit_in_progress_: a flush is writing completed flush results to the MANIFEST. Guarded by the DB mutex.</summary>
+    public bool FlushCommitInProgress { get; set; }
+
+    /// <summary>A flush job is scheduled, running, or has a result not committed yet. REQUIRES: mutex.</summary>
+    public bool IsFlushRunning
+    {
+        get
+        {
+            if (RunningFlushes > 0) return true;
+            foreach (ImmutableMemTable m in Imm)
+            {
+                if (m.FlushInProgress) return true;
+            }
+            return false;
+        }
+    }
     public bool QueuedForFlush { get; set; }
     /// <summary>Next epoch number for L0 files (ColumnFamilyData::NewEpochNumber).</summary>
     public ulong NextEpochNumber { get; set; } = 1;
 
-    public int NumNotFlushed
-    {
-        get
-        {
-            int n = 0;
-            foreach (ImmutableMemTable m in Imm)
-            {
-                if (!m.FlushCompleted) n++;
-            }
-            return n;
-        }
-    }
+    /// <summary>MemTableList::NumNotFlushed: the immutable memtables whose flush result is not committed yet.</summary>
+    public int NumNotFlushed => Imm.Count;
 
     /// <summary>True if some immutable memtable sealed by a switch up to <paramref name="cut"/> is waiting for a flush to be picked.</summary>
     public bool HasPendingFlushUpTo(ulong cut)
@@ -364,7 +392,7 @@ internal sealed class ColumnFamilyData
     /// Port of MemTableList::IsFlushPending: a flush can be picked when min_write_buffer_number_to_merge immutable
     /// memtables wait for one, or when a flush was requested and at least one waits. REQUIRES: mutex.
     /// </summary>
-    public bool HasPendingFlush
+    public bool IsFlushPending
     {
         get
         {
@@ -374,6 +402,24 @@ internal sealed class ColumnFamilyData
                 if (!m.FlushInProgress && !m.FlushCompleted) notStarted++;
             }
             return (FlushRequested && notStarted > 0) || (notStarted > 0 && notStarted >= Options.MinWriteBufferNumberToMerge);
+        }
+    }
+
+    /// <summary>
+    /// Port of MemTableList::IsFlushPendingOrRunning (db/memtable_list.cc:486-491): a flush is running on at least one
+    /// immutable memtable (picked by a flush, or written and waiting to be installed: memlist_.size() -
+    /// num_flush_not_started_ &gt; 0), or <see cref="IsFlushPending"/>: a sealed memtable is waiting for a flush to pick
+    /// it. REQUIRES: mutex.
+    /// </summary>
+    public bool IsFlushPendingOrRunning
+    {
+        get
+        {
+            foreach (ImmutableMemTable m in Imm)
+            {
+                if (m.FlushInProgress || m.FlushCompleted) return true;
+            }
+            return IsFlushPending;
         }
     }
 

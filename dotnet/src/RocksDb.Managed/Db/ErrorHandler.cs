@@ -17,8 +17,9 @@ namespace RocksDb.Managed.Db;
 /// Retryable compaction errors are not recorded (the compaction is retried). Automatic recovery
 /// (RecoverFromRetryableBGIOError) runs on a separate task, up to <see cref="DbOptions.MaxBgErrorResumeCount"/> times,
 /// <see cref="DbOptions.BgErrorResumeRetryInterval"/> apart. Recovery itself (DBImpl::ResumeImpl) is
-/// <see cref="DbImpl.ResumeImplAsync"/>. Not ported: SstFileManager (no automatic recovery from out-of-space errors;
-/// <see cref="RocksDatabase.Resume"/> recovers once space is available), file quarantine, AsyncFileOpen.
+/// <see cref="DbImpl.ResumeImplAsync"/>. Out-of-space errors (NoSpace / SpaceLimit) are recovered by the DB's
+/// SstFileManager once enough space is free (RecoverFromNoSpace; every DB has one, see SanitizeOptions), or by
+/// <see cref="RocksDatabase.Resume"/>. Not ported: file quarantine, AsyncFileOpen.
 /// </para>
 /// <para>
 /// <b>Synchronization</b>: all state is guarded by the DB mutex, except <see cref="IsDbStopped"/> which is also
@@ -837,8 +838,11 @@ internal sealed partial class DbImpl
             {
                 // FlushAllColumnFamilies: cfd->imm()->FlushRequested() for every column family with sealed memtables.
                 if (!cfd.Dropped && cfd.Imm.Count > 0) cfd.FlushRequested = true;
-                if (cfd.Dropped || cfd.FlushRunning || !cfd.HasPendingFlushUpTo(cut)) continue;
-                cfd.FlushRunning = true;
+                // A column family with a flush running (or a flush result waiting for an older one) is left to it: the
+                // recovery group commits its members' results as one atomic group and must not overtake them.
+                if (cfd.Dropped || cfd.IsFlushRunning || !cfd.HasPendingFlushUpTo(cut)) continue;
+                cfd.RunningFlushes++;
+                cfd.ExclusiveFlushRunning = true;
                 _runningFlushes++;
                 _backgroundJobs++;
                 members.Add(cfd);
