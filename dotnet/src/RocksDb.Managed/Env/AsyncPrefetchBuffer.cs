@@ -3,6 +3,19 @@ using System.Buffers;
 namespace RocksDb.Managed.Env;
 
 /// <summary>
+/// The readahead-size callback of FilePrefetchBuffer (readaheadsize_cb_, file/file_prefetch_buffer.h): called before a
+/// read with the window [<paramref name="startOffset"/>, <paramref name="endOffset"/>) it is about to read, it may move
+/// both (BlockBasedTableIterator::BlockCacheLookupForReadAheadSize trims the window to the blocks that are not cached
+/// and within the iterate_upper_bound / the seek key's prefix).
+/// </summary>
+internal interface IReadaheadSizeCallback
+{
+    /// <param name="readCurrBlock">True when the read is for a block the caller missed in the cache and reads now;
+    /// false for a prefetch of further data into the second buffer.</param>
+    void TuneReadaheadSize(bool readCurrBlock, ref long startOffset, ref long endOffset);
+}
+
+/// <summary>
 /// Sequential readahead with the next chunk read asynchronously while the current one is consumed: a port of the
 /// async_io mode of FilePrefetchBuffer (file/file_prefetch_buffer.{h,cc}: two buffers, PrefetchAsync of the second
 /// while the first serves reads, PollIfNeeded / swap on a miss), as BlockPrefetcher uses it for compaction inputs with
@@ -46,16 +59,24 @@ public sealed class AsyncPrefetchBuffer : IDisposable
     private long _fileLength;
     private int _reserve = MinReserve;
 
+    // readaheadsize_cb_ and stats_ (READAHEAD_TRIMMED) of FilePrefetchBuffer.
+    private IReadaheadSizeCallback? _readaheadSizeCallback;
+    private Statistics? _statistics;
+
     // Current window: _cur[_curStart .. _curStart + _curLen) holds the file bytes [_curOffset, _curOffset + _curLen).
+    // _curInitialEnd is the end of the window before the readahead-size callback trimmed it (BufferInfo::
+    // initial_end_offset_): the next prefetch starts there.
     private byte[] _cur = [];
     private int _curStart;
     private int _curLen;
     private long _curOffset;
+    private long _curInitialEnd;
 
-    // Prefetch: _next[_nextStart ..] receives the file bytes from _nextOffset.
+    // Prefetch: _next[_nextStart ..] receives the file bytes from _nextOffset (untrimmed end: _nextInitialEnd).
     private byte[] _next = [];
     private int _nextStart;
     private long _nextOffset = -1;
+    private long _nextInitialEnd;
 
     // The pending prefetch: _hasPending while a read was issued and its result not consumed. A read that completed
     // synchronously stores its outcome directly (_pendingSync); otherwise OnPrefetchCompleted stores it and sets _done,
@@ -109,6 +130,24 @@ public sealed class AsyncPrefetchBuffer : IDisposable
     /// readahead window for every block).
     /// </summary>
     public bool IsBeforeBuffer(long offset) => _singleBuffer && offset < _curOffset;
+
+    /// <summary>
+    /// readaheadsize_cb_: tunes the window of every read and prefetch while the readahead size is not 0
+    /// (ReadAheadSizeTuning). Set by BlockPrefetcher when it creates the buffer (CreateFilePrefetchBufferIfNotExists),
+    /// null for compaction inputs.
+    /// </summary>
+    internal IReadaheadSizeCallback? ReadaheadSizeCallback
+    {
+        get => _readaheadSizeCallback;
+        set => _readaheadSizeCallback = value;
+    }
+
+    /// <summary>The statistics READAHEAD_TRIMMED is recorded to (FilePrefetchBuffer::stats_), or null.</summary>
+    internal Statistics? Statistics
+    {
+        get => _statistics;
+        set => _statistics = value;
+    }
 
     /// <summary>Bytes currently held by the buffers (tests / diagnostics).</summary>
     public long BufferBytes => (long)_cur.Length + _next.Length;
@@ -182,7 +221,9 @@ public sealed class AsyncPrefetchBuffer : IDisposable
         if (!_pendingSync && !_done!.IsSet) PrefetchWaits++;
         int n = TakePending();
         int tail = (int)(_nextOffset - offset); // bytes of the requested range still in the current window
-        if (tail > _nextStart)
+        // A trimmed prefetch can start past the current window (the blocks in between were cached): the bytes before it
+        // are then in neither buffer.
+        if (tail > _nextStart || (tail > 0 && _nextOffset > _curOffset + _curLen))
         {
             data = default;
             return false;
@@ -192,6 +233,7 @@ public sealed class AsyncPrefetchBuffer : IDisposable
         _curStart = _nextStart - tail;
         _curLen = tail + n;
         _curOffset = offset;
+        _curInitialEnd = _nextInitialEnd;
         StartPrefetch();
         return TryGetBuffered(offset, length, out data);
     }
@@ -206,7 +248,12 @@ public sealed class AsyncPrefetchBuffer : IDisposable
             data = default;
             return false;
         }
-        int want = (int)Math.Min(Math.Max(length, _readahead), remaining);
+        // ReadAheadSizeTuning(read_curr_block = true) on this buffer's window (the block, or the readahead if larger): the
+        // callback may only shorten it to the blocks after the requested one that are worth reading.
+        long end = offset + Math.Max(length, _readahead);
+        long initialEnd = end;
+        TuneReadahead(offset, length, ref end);
+        int want = (int)Math.Min(Math.Max(end - offset, length), remaining);
         if (_cur.Length < want) Rent(ref _cur, want);
         int got = _file!.Read(offset, _cur.AsSpan(0, want));
         SyncReads++;
@@ -214,6 +261,7 @@ public sealed class AsyncPrefetchBuffer : IDisposable
         _curStart = 0;
         _curLen = got;
         _curOffset = offset;
+        _curInitialEnd = initialEnd;
         if (got < length)
         {
             data = default;
@@ -239,7 +287,10 @@ public sealed class AsyncPrefetchBuffer : IDisposable
             data = default;
             return false;
         }
-        int want = (int)Math.Min((long)length + _readahead, remaining);
+        // ReadAheadSizeTuning(read_curr_block = true): [offset, offset + length + readahead_size), trimmed by the callback.
+        long end = offset + length + _readahead;
+        TuneReadahead(offset, length, ref end);
+        int want = (int)Math.Min(Math.Max(end - offset, length), remaining);
         long rel = offset - _curOffset;
         int keep = _curLen > 0 && rel >= 0 && rel < _curLen ? _curLen - (int)rel : 0;
         int keepFrom = _curStart + (int)Math.Max(rel, 0);
@@ -254,7 +305,7 @@ public sealed class AsyncPrefetchBuffer : IDisposable
         {
             Array.Copy(_cur, keepFrom, _cur, 0, keep);
         }
-        int got = keep + _file!.Read(offset + keep, _cur.AsSpan(keep, want - keep));
+        int got = keep + (want > keep ? _file!.Read(offset + keep, _cur.AsSpan(keep, want - keep)) : 0);
         SyncReads++;
         GrowReadahead();
         _curStart = 0;
@@ -271,10 +322,30 @@ public sealed class AsyncPrefetchBuffer : IDisposable
 
     private void StartPrefetch()
     {
-        long start = _curOffset + _curLen;
+        long prevEnd = _curOffset + _curLen;
+        long start = prevEnd;
+        long end = start + _readahead;
+        if (_readaheadSizeCallback is not null)
+        {
+            // PrefetchRemBuffers / HandleOverlappingAsyncData: the prefetch starts at the current buffer's untrimmed end
+            // and the callback (read_curr_block = false) moves it past the cached blocks.
+            start = _curInitialEnd;
+            end = start + _readahead;
+            long initialEnd = end;
+            if (!TunePrefetch(prevEnd, ref start, ref end))
+            {
+                _nextOffset = -1;
+                return;
+            }
+            _nextInitialEnd = initialEnd;
+        }
+        else
+        {
+            _nextInitialEnd = end;
+        }
         _nextOffset = start;
         if (start >= _fileLength) return;
-        int len = (int)Math.Min(_readahead, _fileLength - start);
+        int len = (int)Math.Min(end - start, _fileLength - start);
         _nextStart = _reserve;
         if (_next.Length < _reserve + len) Rent(ref _next, _reserve + len);
         Prefetches++;
@@ -327,6 +398,57 @@ public sealed class AsyncPrefetchBuffer : IDisposable
         _pendingError = null;
         if (e is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(e);
         return _pendingResult;
+    }
+
+    /// <summary>
+    /// FilePrefetchBuffer::ReadAheadSizeTuning for a read of the block at <paramref name="offset"/> (read_curr_block):
+    /// hands [offset, <paramref name="end"/>) to the callback, which keeps the start at the block and may move the end.
+    /// Deviation: upstream rounds the window to the file's GetRequiredBufferAlignment() (the logical sector size of a
+    /// POSIX file, 4 KiB, with or without direct I/O); the buffer reads it unaligned.
+    /// </summary>
+    private void TuneReadahead(long offset, int length, ref long end)
+    {
+        if (_readaheadSizeCallback is null || _readahead <= 0) return;
+        long initialStart = offset;
+        long initialEnd = end;
+        long start = offset;
+        _readaheadSizeCallback.TuneReadaheadSize(readCurrBlock: true, ref start, ref end);
+        // The block being read is the first one the callback queues (InitializeStartAndEndOffsets, scenarios 1 and 2).
+        System.Diagnostics.Debug.Assert(start == offset && end >= offset + length);
+        UpdateReadAheadTrimmedStat(initialEnd - initialStart, end - start);
+    }
+
+    /// <summary>
+    /// FilePrefetchBuffer::ReadAheadSizeTuning for the prefetch into the second buffer (read_curr_block = false,
+    /// prev_buf_end_offset = <paramref name="prevEnd"/>). False when nothing is left to prefetch.
+    /// </summary>
+    private bool TunePrefetch(long prevEnd, ref long start, ref long end)
+    {
+        long initialStart = start;
+        long initialEnd = end;
+        if (_readahead > 0) _readaheadSizeCallback!.TuneReadaheadSize(readCurrBlock: false, ref start, ref end);
+        // read_len will be 0 and there is nothing to read/prefetch.
+        if (start == end)
+        {
+            UpdateReadAheadTrimmedStat(initialEnd - initialStart, 0);
+            return false;
+        }
+        // The callback added block handles which are already prefetched: nothing new needs to be prefetched.
+        if (end <= prevEnd)
+        {
+            UpdateReadAheadTrimmedStat(initialEnd - initialStart, 0);
+            return false;
+        }
+        // The previous buffer already contains the data till prev_buf_end_offset.
+        if (start < prevEnd) start = prevEnd;
+        UpdateReadAheadTrimmedStat(initialEnd - initialStart, end - start);
+        return true;
+    }
+
+    /// <summary>FilePrefetchBuffer::UpdateReadAheadTrimmedStat: READAHEAD_TRIMMED when the callback changed the window's length.</summary>
+    private void UpdateReadAheadTrimmedStat(long initialLength, long updatedLength)
+    {
+        if (initialLength != updatedLength) _statistics?.RecordTick(Ticker.ReadaheadTrimmed);
     }
 
     private static void Rent(ref byte[] buffer, int size)

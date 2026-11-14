@@ -1155,6 +1155,71 @@ public sealed partial class BlockBasedTableReader : TableReader
         return cache is null || (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
 
+    /// <summary>table_options.block_cache is set (a <see cref="Cache.BlockCache"/>; the legacy seam does not count).</summary>
+    internal bool HasBlockCache => _cache is not null;
+
+    /// <summary>The DB statistics of this table's reads (ioptions.stats), or null.</summary>
+    internal Managed.Statistics? DbStatistics => _stats?.Owner;
+
+    /// <summary>
+    /// Port of BlockBasedTable::LookupAndPinBlocksInCache&lt;Block_kData&gt; (block_based_table_reader.cc:2318): looks the
+    /// data block at <paramref name="handle"/> up in the block cache without reading the file, recording the hit or miss
+    /// (UpdateCacheHitMetrics / UpdateCacheMissMetrics). A hit returns the pinned entry in <paramref name="entry"/>, which
+    /// the caller releases. Without a block cache: a miss, nothing recorded.
+    /// </summary>
+    internal bool LookupAndPinDataBlockInCache(BlockHandle handle, out BlockRef entry)
+    {
+        entry = default;
+        BlockCache? cache = _cache;
+        if (cache is null) return false;
+        CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
+        if (!LookupCache(cache, key, BlockKind.Data, out CachedBlock h))
+        {
+            _stats?.Record(BlockCacheCounter.DataMiss);
+            return false;
+        }
+        _stats?.RecordHit(BlockCacheCounter.DataHit, h.Charge);
+        PerfContext.Add(PerfMetric.BlockCacheHitCount, 1);
+        entry = BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h);
+        return true;
+    }
+
+    /// <summary>
+    /// RetrieveBlock with use_block_cache_for_lookup = false (BlockBasedTableIterator::InitDataBlock for a block whose
+    /// cache lookup <see cref="LookupAndPinDataBlockInCache"/> already missed): reads the data block, through
+    /// <paramref name="prefetch"/> when given, and inserts it into the cache like any miss, without a second lookup or
+    /// miss count. Only called with a block cache (the lookup needs one).
+    /// </summary>
+    internal BlockRef GetDataBlockRefWithoutCacheLookup(BlockHandle handle, TableReadFlags flags, AsyncPrefetchBuffer? prefetch)
+    {
+        BlockCache cache = _cache!;
+        CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
+        if (!_dictLookupPerRead && prefetch is null) return ReadAndInsertAfterMiss(cache, key, handle, BlockKind.Data, flags);
+        ChargeRateLimiter(handle, flags);
+        ThrowIfNoIo(flags);
+        Block b;
+        if (_dictLookupPerRead)
+        {
+            DictLease lease = GetOrReadDictionary(flags, _file);
+            try
+            {
+                b = Protect(prefetch is null
+                    ? ReadBlockFromFile(handle, BlockKind.Data, flags, lease.Dict!)
+                    : BlockFetcher.ReadBlock(prefetch, _footer, handle, VerifyRead(flags), lease.Dict!), BlockKind.Data);
+            }
+            finally
+            {
+                lease.Release();
+            }
+        }
+        else
+        {
+            b = Protect(BlockFetcher.ReadBlock(prefetch!, _footer, handle, VerifyRead(flags), DictFor(BlockKind.Data)), BlockKind.Data);
+        }
+        if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, BlockKind.Data, b, hit: false, flags);
+        return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, BlockKind.Data);
+    }
+
     /// <summary>
     /// Port of RandomAccessFileReader::ChargeRateLimiterForRead: charges the bytes of a block read from the file
     /// (block + trailer) to the rate limiter at the priority in <paramref name="flags"/>, in chunks of at most the
@@ -1230,6 +1295,12 @@ public sealed partial class BlockBasedTableReader : TableReader
     private BlockRef ReadAndInsert(BlockCache cache, in CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
         _stats?.Record(MissCounter(kind));
+        return ReadAndInsertAfterMiss(cache, key, handle, kind, flags);
+    }
+
+    /// <summary>MaybeReadBlockAndLoadToCache after the cache missed: reads the block from the file and inserts it.</summary>
+    private BlockRef ReadAndInsertAfterMiss(BlockCache cache, in CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags)
+    {
         ThrowIfNoIo(flags);
         ChargeRateLimiter(handle, flags);
         if (cache.AdmitsCompressedBlocks && OffersCompressed(kind, flags)) return ReadAndInsertOfferingCompressed(cache, key, handle, kind, flags);

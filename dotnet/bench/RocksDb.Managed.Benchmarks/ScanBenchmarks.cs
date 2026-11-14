@@ -183,6 +183,94 @@ public class BoundedScanBenchmarks
     }
 }
 
+/// <summary>
+/// Long bounded scans with an explicit 16 MiB readahead (Mosaik's RocksDbDataStorage scans: iterate bounds +
+/// readahead_size) over a compacted DB whose data mostly misses a 1 MiB block cache. With
+/// <see cref="ReadOptions.AutoReadaheadSize"/> the readahead buffer is trimmed to the blocks below the upper bound
+/// (BlockCacheLookupForReadAheadSize); without it every scan reads its 16 MiB window. <c>FreshIterator</c>: a new
+/// iterator per scan (Mosaik), else one iterator re-bounded with <see cref="Iterator.SetBounds"/> ("Allocated" must be "-").
+/// </summary>
+[MemoryDiagnoser, MinColumn, MedianColumn]
+[BenchmarkCategory("Scan")]
+public class ReadaheadBoundedScanBenchmarks
+{
+    private const int Keys = 200_000;
+    private const int Ranges = 32;
+    private const int RangeRows = 1000;
+
+    [Params(false, true)]
+    public bool AutoReadaheadSize { get; set; }
+
+    [Params(false, true)]
+    public bool FreshIterator { get; set; }
+
+    private string _dir = "";
+    private RocksDatabase _db = null!;
+    private Iterator _it = null!;
+    private ReadOptions[] _options = [];
+    private byte[][] _lower = [];
+    private byte[][] _upper = [];
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        _dir = Path.Combine(Path.GetTempPath(), "rocksdb-managed-rascan-" + Guid.NewGuid().ToString("N"));
+        var value = new byte[100];
+        new Random(3).NextBytes(value);
+        var cf = new ColumnFamilyOptions { DisableAutoCompactions = true, Compression = Compression.CompressionType.None };
+        cf.TableOptions.BlockCache = Cache.BlockCache.CreateLru(1 << 20);
+        _db = RocksDatabase.Open(_dir, new DbOptions { CreateIfMissing = true }, cf);
+        for (int i = 0; i < Keys; i++) _db.Put(ScanKeys.Key(i), value);
+        _db.Flush();
+        _db.CompactRange();
+        var rnd = new Random(5);
+        _lower = new byte[Ranges][];
+        _upper = new byte[Ranges][];
+        _options = new ReadOptions[Ranges];
+        for (int r = 0; r < Ranges; r++)
+        {
+            int start = rnd.Next(Keys - RangeRows);
+            _lower[r] = ScanKeys.Key(start);
+            _upper[r] = ScanKeys.Key(start + RangeRows);
+            _options[r] = new ReadOptions
+            {
+                IterateLowerBound = _lower[r], IterateUpperBound = _upper[r], ReadaheadSize = 16UL << 20, AutoReadaheadSize = AutoReadaheadSize,
+            };
+        }
+        _it = _db.NewIterator(new ReadOptions { ReadaheadSize = 16UL << 20, AutoReadaheadSize = AutoReadaheadSize });
+        Scan();
+    }
+
+    /// <summary>One operation = <see cref="Ranges"/> bounded scans of <see cref="RangeRows"/> rows.</summary>
+    [Benchmark]
+    public long Scan()
+    {
+        long n = 0;
+        for (int r = 0; r < Ranges; r++)
+        {
+            if (FreshIterator)
+            {
+                using Iterator it = _db.NewIterator(_options[r]);
+                for (it.Seek(_lower[r]); it.Valid; it.Next()) n += it.Value.Length;
+            }
+            else
+            {
+                _it.SetBounds(_lower[r], _upper[r]);
+                for (_it.Seek(_lower[r]); _it.Valid; _it.Next()) n += _it.Value.Length;
+            }
+        }
+        return n;
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _it.Dispose();
+        _db.Dispose();
+        ScanKeys.DeleteDirectory(_dir);
+    }
+}
+
 internal static class ScanKeys
 {
     public static byte[] Key(int i) => System.Text.Encoding.ASCII.GetBytes("key" + i.ToString("D10", System.Globalization.CultureInfo.InvariantCulture));
