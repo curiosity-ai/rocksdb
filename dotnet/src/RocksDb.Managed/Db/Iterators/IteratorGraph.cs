@@ -30,6 +30,7 @@ internal sealed class IteratorGraph : IDisposable
     private readonly List<InternalIterator> _children = [];
     private MergingIterator? _merging;
     private ulong _readahead; // ReadOptions::readahead_size the table iterators were configured with
+    private bool _readaheadAsyncIo; // and ReadOptions::async_io (one or two readahead buffers)
 
     // The view (null when released).
     private SuperVersion? _sv;
@@ -244,7 +245,8 @@ internal sealed class IteratorGraph : IDisposable
         ITableCache tc = _cfd.TableCache;
         InternalKeyComparator icmp = _cfd.Icmp;
         ulong readahead = options?.ReadaheadSize ?? 0;
-        if (readahead != _readahead)
+        bool asyncIo = readahead > 0 && options!.AsyncIo;
+        if (readahead != _readahead || asyncIo != _readaheadAsyncIo)
         {
             // Table iterators keep a fixed readahead once configured: do not recycle them across that setting.
             for (int i = 0; i < _l0.Count; i++)
@@ -254,6 +256,7 @@ internal sealed class IteratorGraph : IDisposable
             }
             foreach (LevelIterator li in _levels) li.DiscardSpare();
             _readahead = readahead;
+            _readaheadAsyncIo = asyncIo;
         }
         bool ignoreRangeDel = options?.IgnoreRangeDeletions == true;
         RangeDelAggregator? rangeDel = null;
@@ -300,7 +303,7 @@ internal sealed class IteratorGraph : IDisposable
                         child.SetIterateUpperBound(options?.IterateUpperBound);
                         if (child is TableInternalIterator t)
                         {
-                            if (readahead > 0) t.SetUserReadahead(readahead);
+                            if (readahead > 0) t.SetUserReadahead(readahead, asyncIo);
                             // Lets DbIter skip ranges covered by newer range tombstones (SkipCoveredForward / Backward).
                             t.SetSeqnoRange(f.SmallestSeqno, f.LargestSeqno);
                         }

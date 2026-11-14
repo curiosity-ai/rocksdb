@@ -437,7 +437,7 @@ public sealed class LevelIterator : InternalIterator
         InternalIterator it = NewFileIteratorCore(index, reuse);
         it.SetIterateUpperBound(_upper);
         // ReadOptions::readahead_size: explicit readahead instead of the automatic one.
-        if (_readOptions is { ReadaheadSize: > 0 } ro && it is TableInternalIterator t) t.SetUserReadahead(ro.ReadaheadSize);
+        if (_readOptions is { ReadaheadSize: > 0 } ro && it is TableInternalIterator t) t.SetUserReadahead(ro.ReadaheadSize, ro.AsyncIo);
         return it;
     }
 

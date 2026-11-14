@@ -301,8 +301,8 @@ public sealed class TableInternalIterator : InternalIterator
     /// <summary>Reads uncached data blocks with sequential async readahead (see <see cref="BlockBasedTableIterator.EnableReadahead"/>).</summary>
     internal void EnableReadahead(int readaheadSize) => _it.EnableReadahead(readaheadSize);
 
-    /// <summary>ReadOptions::readahead_size (see <see cref="BlockBasedTableIterator.SetUserReadahead"/>).</summary>
-    internal void SetUserReadahead(ulong readaheadSize) => _it.SetUserReadahead(readaheadSize);
+    /// <summary>ReadOptions::readahead_size and async_io (see <see cref="BlockBasedTableIterator.SetUserReadahead"/>).</summary>
+    internal void SetUserReadahead(ulong readaheadSize, bool asyncIo) => _it.SetUserReadahead(readaheadSize, asyncIo);
 
     /// <summary>The readahead buffer (tests / diagnostics), or null.</summary>
     internal Env.AsyncPrefetchBuffer? Readahead => _it.Readahead;

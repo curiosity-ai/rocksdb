@@ -728,7 +728,9 @@ public sealed class BlockBasedTableIterator : IDisposable
         if ((_flags & TableReadFlags.BlockCacheTier) != 0) return null;
         if (_readaheadMode != ReadaheadMode.Auto)
         {
-            return _readaheadMode == ReadaheadMode.Compaction ? PrefetchForCompaction(h) : _prefetch;
+            if (_readaheadMode == ReadaheadMode.Compaction) return PrefetchForCompaction(h);
+            // FilePrefetchBuffer::TryReadFromCache: a block before the buffered range is read from the file directly.
+            return _prefetch is null || _prefetch.IsBeforeBuffer((long)h.Offset) ? null : _prefetch;
         }
         TableReaderOptions o = _reader.Options;
         long max = o.MaxAutoReadaheadSize;
@@ -1111,14 +1113,18 @@ public sealed class BlockBasedTableIterator : IDisposable
 
     /// <summary>
     /// ReadOptions::readahead_size: an explicit readahead for a user iterator (BlockPrefetcher's "explicit user requested
-    /// readahead": always the readahead buffer); without it, iterators use the automatic readahead.
+    /// readahead": always the readahead buffer, initial = max readahead size); without it, iterators use the automatic
+    /// readahead. Like upstream (num_buffers = async_io ? 2 : 1), one synchronous buffer
+    /// (<see cref="Env.AsyncPrefetchBuffer.CreateSingleBuffer"/>), or with <paramref name="asyncIo"/> two buffers that
+    /// read half the readahead each, the second asynchronously (TryReadFromCacheUntracked: readahead_size_ / 2).
     /// </summary>
-    internal void SetUserReadahead(ulong readaheadSize)
+    internal void SetUserReadahead(ulong readaheadSize, bool asyncIo)
     {
         if (readaheadSize == 0 || _readaheadMode == ReadaheadMode.Fixed) return;
         _readaheadMode = ReadaheadMode.Fixed;
         _prefetch?.Dispose();
-        _prefetch = new Env.AsyncPrefetchBuffer((int)Math.Min(readaheadSize, 256UL << 20));
+        int size = (int)Math.Min(readaheadSize, 256UL << 20);
+        _prefetch = asyncIo ? new Env.AsyncPrefetchBuffer(Math.Max(1, size / 2)) : Env.AsyncPrefetchBuffer.CreateSingleBuffer(size);
         _prefetch.Reset(_reader.File);
     }
 

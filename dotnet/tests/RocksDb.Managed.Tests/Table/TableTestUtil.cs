@@ -31,12 +31,14 @@ internal sealed class MemWritableFile : IWritableFile
 internal sealed class MemRandomAccessFile(byte[] data) : IRandomAccessFile
 {
     public int Reads;
+    public long BytesRead;
     public long Length => data.Length;
     public int Read(long offset, Span<byte> destination)
     {
         Interlocked.Increment(ref Reads);
         if (offset >= data.Length) return 0;
         int n = (int)Math.Min(destination.Length, data.Length - offset);
+        Interlocked.Add(ref BytesRead, n);
         data.AsSpan((int)offset, n).CopyTo(destination);
         return n;
     }
