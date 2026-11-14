@@ -816,41 +816,24 @@ internal sealed partial class DbImpl
                 ExitUnbatched(w, synchronous: false);
             }
         }
-        // atomic_flush: a background atomic flush still running (it will fail or finish) owns some of the memtables;
-        // flushing the others now would install a partial result.
-        while (true)
-        {
-            Task signal;
-            lock (_mutex)
-            {
-                if (!_atomicFlushRunning) break;
-                signal = _bgSignal.Task;
-            }
-            await signal.ConfigureAwait(false);
-        }
-        var members = new List<ColumnFamilyData>();
-        ulong cut;
-        lock (_mutex)
-        {
-            // Memtables of a switch still in progress (soft errors do not stop writes) are left to the next flush.
-            cut = _atomicCutCompleted;
-            foreach (ColumnFamilyData cfd in cfds)
-            {
-                // FlushAllColumnFamilies: cfd->imm()->FlushRequested() for every column family with sealed memtables.
-                if (!cfd.Dropped && cfd.Imm.Count > 0) cfd.FlushRequested = true;
-                // A column family with a flush running (or a flush result waiting for an older one) is left to it: the
-                // recovery group commits its members' results as one atomic group and must not overtake them.
-                if (cfd.Dropped || cfd.IsFlushRunning || !cfd.HasPendingFlushUpTo(cut)) continue;
-                cfd.RunningFlushes++;
-                cfd.ExclusiveFlushRunning = true;
-                _runningFlushes++;
-                _backgroundJobs++;
-                members.Add(cfd);
-            }
-        }
-        // RetryFlushesForErrorRecovery: with atomic_flush the retry is an atomic flush too.
+        // RetryFlushesForErrorRecovery without atomic_flush: a flush request per column family with sealed memtables.
         if (retryOnly && !Options.AtomicFlush)
         {
+            var members = new List<ColumnFamilyData>();
+            lock (_mutex)
+            {
+                foreach (ColumnFamilyData cfd in cfds)
+                {
+                    if (cfd.Dropped || cfd.Imm.Count == 0) continue;
+                    cfd.FlushRequested = true;
+                    // A column family whose sealed memtables are all picked already is left to the flush that picked them.
+                    if (!cfd.HasPendingFlushUpTo(ulong.MaxValue)) continue;
+                    cfd.RunningFlushes++;
+                    _runningFlushes++;
+                    _backgroundJobs++;
+                    members.Add(cfd);
+                }
+            }
             foreach (ColumnFamilyData cfd in members)
             {
                 await BackgroundFlushAsync(cfd).ConfigureAwait(false);
@@ -862,19 +845,24 @@ internal sealed partial class DbImpl
             }
             return null;
         }
-        // FlushAllColumnFamilies with force_atomic_flush: the per-CF flush results (and with them the WAL replay
-        // boundaries) are committed as one MANIFEST atomic group, so a crash in between cannot recover only part of a
-        // write batch that spans column families.
-        var group = new AtomicFlushGroup(this, members);
-        var tasks = new Task[members.Count];
-        for (int i = 0; i < members.Count; i++) tasks[i] = BackgroundFlushAsync(members[i], group, synchronous: false, cut);
-        await Task.WhenAll(tasks).ConfigureAwait(false);
+        lock (_mutex)
+        {
+            // FlushAllColumnFamilies: cfd->imm()->FlushRequested() for every column family with sealed memtables.
+            foreach (ColumnFamilyData cfd in cfds)
+            {
+                if (!cfd.Dropped && cfd.Imm.Count > 0) cfd.FlushRequested = true;
+            }
+        }
+        // FlushAllColumnFamilies with force_atomic_flush (and RetryFlushesForErrorRecovery with atomic_flush): one atomic
+        // flush of every column family, so the per-CF flush results (and with them the WAL replay boundaries) are committed
+        // as one MANIFEST atomic group and a crash in between cannot recover only part of a write batch that spans column
+        // families. Like any atomic flush it is installed after the older flushes of its column families.
+        RocksDbException? s = await AtomicFlushMemTablesToOutputFilesAsync(synchronous: false, forRecovery: true).ConfigureAwait(false);
         lock (_mutex)
         {
             if (ErrorHandler.RecoveryError is { } re) return re;
             if (_shuttingDown) return new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
         }
-        if (group.Completion.IsFaulted) return RocksDbException.FromException(group.Completion.Exception!.InnerException!);
-        return null;
+        return s;
     }
 }

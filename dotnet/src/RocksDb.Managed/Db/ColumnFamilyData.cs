@@ -337,33 +337,15 @@ internal sealed class ColumnFamilyData
     public ulong LogNumber { get; set; }
     public bool Dropped { get; set; }
     /// <summary>
-    /// Flush jobs scheduled or running on this column family. Like upstream, several flushes of one column family may
-    /// run at once, each on memtables the others did not pick; their results are committed in memtable order
-    /// (<see cref="FlushCommitInProgress"/>). Guarded by the DB mutex.
+    /// Non-atomic flush jobs scheduled or running on this column family. Like upstream, several flushes of one column
+    /// family may run at once, each on memtables the others did not pick; their results are committed in memtable order
+    /// (<see cref="FlushCommitInProgress"/>). (Atomic flushes are counted by the DB, they are installed in memtable order
+    /// too.) Guarded by the DB mutex.
     /// </summary>
     public int RunningFlushes { get; set; }
-    /// <summary>
-    /// The running flush is an atomic flush or an error recovery flush group (one MANIFEST atomic group for several
-    /// column families): it has the column family's memtables to itself, no other flush is started meanwhile. Guarded
-    /// by the DB mutex.
-    /// </summary>
-    public bool ExclusiveFlushRunning { get; set; }
     /// <summary>MemTableList::commit_in_progress_: a flush is writing completed flush results to the MANIFEST. Guarded by the DB mutex.</summary>
     public bool FlushCommitInProgress { get; set; }
 
-    /// <summary>A flush job is scheduled, running, or has a result not committed yet. REQUIRES: mutex.</summary>
-    public bool IsFlushRunning
-    {
-        get
-        {
-            if (RunningFlushes > 0) return true;
-            foreach (ImmutableMemTable m in Imm)
-            {
-                if (m.FlushInProgress) return true;
-            }
-            return false;
-        }
-    }
     public bool QueuedForFlush { get; set; }
     /// <summary>Next epoch number for L0 files (ColumnFamilyData::NewEpochNumber).</summary>
     public ulong NextEpochNumber { get; set; } = 1;
