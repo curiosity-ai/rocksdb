@@ -187,7 +187,7 @@ internal static class DestroyDb
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
-            result ??= RocksDbException.IOError(e.Message);
+            result ??= RocksDbException.FromException(e);
         }
     }
 

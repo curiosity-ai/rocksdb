@@ -178,7 +178,7 @@ internal sealed class TableCacheStore : IDisposable
                 catch (Exception e) when (e is IOException or RocksDbException)
                 {
                     // Don't cache failures (like upstream, a failed open is retried on the next lookup).
-                    throw e is RocksDbException ? e : RocksDbException.IOError("While open table file " + owner.TableFilePath(file) + ": " + e.Message, e);
+                    throw RocksDbException.FromIOException("While open table file", owner.TableFilePath(file), e);
                 }
                 h.MarkOpen();
                 h.LastUse = Interlocked.Increment(ref _openSequence);
