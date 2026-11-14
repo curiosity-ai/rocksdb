@@ -1999,3 +1999,17 @@ scans). The variant that also skipped `DbIter`'s bound comparison on kInbound wa
 Explicit readahead: one buffer bounded by the file instead of two pooled power-of-two windows; a 256 MB readahead over a
 7 MB file holds about 7 MB per table iterator, released with the iterator (buffers over 4 MiB are not pooled).
 
+## auto_readahead_size (2026-11-14)
+
+`ReadaheadBoundedScanBenchmarks` (BenchmarkDotNet `--inProcess --job short`, net11.0, 4 shared cores; 32 bounded scans of
+1,000 rows, 16 MiB readahead_size, 1 MiB LRU cache, compacted 22 MB file):
+
+| Iterator | Before | After | Allocated |
+|---|---|---|---|
+| New iterator per scan (Mosaik's pattern) | 30.9 ms | 2.86 ms | ~1.8 KB per op (the iterators) |
+| One reused iterator (`SetBounds`) | 2.8 ms | 2.8 ms | - |
+
+File bytes read per scan go from ~16 MiB (the whole window) to the range's blocks. `BoundedScanBenchmarks` and
+`ColdScanBenchmarks` unchanged within noise (min times equal or better, Allocated `-`). BenchmarkDotNet's default toolchain
+fails on net11 (`GetRuntimeVersion not implemented`); `--inProcess` works.
+

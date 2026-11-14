@@ -419,3 +419,15 @@ Still open from this round:
 - [ ] Replication: no rolling upgrade across versions of the replication protocol (all nodes of a deployment run the same version; nothing is versioned or negotiated); a term / epoch map above 4 MiB (about 100 000 leadership changes) cannot be sent over gRPC with the default limits
 - [x] Replication: gRPC transport encrypted and mutually authenticated from a shared secret (`SharedSecretTls`, `GrpcNodeServerOptions.Tls`; off by default); not done: rotating the secret without a restart, the Windows key import path is untested (Linux only here)
 - [ ] Replication: without `SyncWal` a pair still loses acknowledged writes when the replica is unreachable while the primary restarts after a power loss (documented contract)
+
+## Audit #6 (2026-11-14; docs/validation.md "Audit #6" and "Audit #6 follow-ups")
+
+- [x] The methods and options Mosaik uses traced into the port and the C++ (read path, write path, WAL archive / replication, properties); no wrong read result
+- [x] Full disk: NoSpace / PathNotFound mapping for every file-system error, recovered like native (`OutOfSpaceTests`)
+- [x] Write buffer manager skips column families with a pending flush; concurrent flushes of one column family; concurrent atomic flushes
+- [x] Per-data-block upper bound check, L0 prefix filters on iterators, one exact readahead buffer, `auto_readahead_size`
+- [x] Memory properties, `estimate-table-readers-mem`, default cache's auto table, parallel table open at DB open, in LogAndApply and in best-efforts recovery
+- [ ] `ArenaSlabPool` keeps up to 256 MiB of freed arena blocks, reported by no metric (kept by decision)
+- [ ] Readahead: 4 KiB window alignment; readahead on the async positioning paths (would give async_io real trimming)
+- [ ] Atomic flush job ids per column family (upstream: one per flush); a failed non-atomic commit leaves later completed results of that column family to its next flush (same as upstream)
+- [ ] Best-efforts recovery verifies blob files by a direct open (BlobSource needs the DbId); loaded readers are not pinned; ingestion's file_opening_threads not ported
