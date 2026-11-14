@@ -29,7 +29,7 @@ internal sealed partial class DbImpl
         // atomic_flush: there is no per column family request; MaybeScheduleFlush starts one flush for every column
         // family with sealed memtables.
         if (Options.AtomicFlush) return;
-        if (cfd.QueuedForFlush || cfd.Dropped || !cfd.HasPendingFlush) return;
+        if (cfd.QueuedForFlush || cfd.Dropped || !cfd.IsFlushPending) return;
         cfd.QueuedForFlush = true;
         _flushQueue.Enqueue(cfd);
     }
@@ -50,7 +50,7 @@ internal sealed partial class DbImpl
         while (_runningFlushes < _maxBackgroundFlushes && attempts-- > 0 && _flushQueue.TryDequeue(out ColumnFamilyData? cfd))
         {
             cfd.QueuedForFlush = false;
-            if (cfd.Dropped || !cfd.HasPendingFlush) continue;
+            if (cfd.Dropped || !cfd.IsFlushPending) continue;
             if (cfd.FlushRunning) continue; // re-enqueued when the running flush finishes
             cfd.FlushRunning = true;
             _runningFlushes++;
@@ -705,7 +705,7 @@ internal sealed partial class DbImpl
                     targets.Add((cfd, cfd.Imm[^1]));
                 }
                 // DBImpl::FlushMemTable: a manual flush is never postponed to retain user-defined timestamps.
-                if (cfd.TimestampsInMemtableOnly && cfd.HasPendingFlush) cfd.FlushSkipReschedule = true;
+                if (cfd.TimestampsInMemtableOnly && cfd.IsFlushPending) cfd.FlushSkipReschedule = true;
                 EnqueueFlush(cfd);
                 MaybeScheduleFlush();
             }

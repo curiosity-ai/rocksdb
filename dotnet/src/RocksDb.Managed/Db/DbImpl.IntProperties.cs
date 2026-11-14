@@ -130,7 +130,7 @@ internal sealed partial class DbImpl
                 lock (_mutex) value = IntPropertyValue.Of((long)cfd.History.Count);
                 return IntPropertyResult.Value;
             case DbProperties.MemTableFlushPending:
-                lock (_mutex) value = IntPropertyValue.Of(cfd.HasPendingFlush ? 1UL : 0UL);
+                lock (_mutex) value = IntPropertyValue.Of(cfd.IsFlushPending ? 1UL : 0UL);
                 return IntPropertyResult.Value;
 
             // ---- keys, files and sizes

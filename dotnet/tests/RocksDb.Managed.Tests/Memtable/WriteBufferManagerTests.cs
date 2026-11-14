@@ -1,4 +1,5 @@
 using RocksDb.Managed.Cache;
+using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Tests.Db;
 
@@ -351,5 +352,58 @@ public sealed class WriteBufferManagerTests
         cf.Flush();
         Assert.AreEqual(41 * (long)Memory.Arena.InlineSize, wbm.MemoryUsage);
         Assert.IsTrue(cf.GetIntProperty(DbProperties.CurSizeActiveMemTable) <= (ulong)Memory.Arena.InlineSize);
+    }
+
+    /// <summary>
+    /// DBImpl::CollectFlushableCFs (db/db_impl/db_impl_compaction_flush.cc:4705) skips a column family for which
+    /// imm()->IsFlushPendingOrRunning(): also a sealed memtable that no flush has picked yet (IsFlushPending,
+    /// db/memtable_list.cc:486-491). While "a" holds the only flush slot, "b" is switched once by the manager and then
+    /// waits for its pending flush instead of being switched again on every write.
+    /// </summary>
+    [TestMethod]
+    public void WriteBufferManagerDoesNotReswitchColumnFamilyWithPendingFlush()
+    {
+        MemoryFileSystem fs = DbTestUtil.NewFs();
+        var wbm = new WriteBufferManager(4 * Mib, null, allowStall: false);
+        DbOptions o = DbTestUtil.NewOptions(fs);
+        o.WriteBufferManager = wbm;
+        o.MaxBackgroundJobs = 2; // one flush slot
+        o.CreateMissingColumnFamilies = true;
+        var cfo = new ColumnFamilyOptions { WriteBufferSize = 64UL * Mib, MaxWriteBufferNumber = 64 };
+        using var gate = new ManualResetEventSlim(false);
+        using var entered = new ManualResetEventSlim(false);
+        int first = 0;
+        TestHooks.Set("DBImpl::FlushMemTables:Start", () =>
+        {
+            if (Interlocked.Exchange(ref first, 1) != 0) return;
+            entered.Set();
+            gate.Wait(TimeSpan.FromSeconds(30));
+        });
+        try
+        {
+            using RocksDatabase db = RocksDatabase.Open(DbTestUtil.DbPath, o,
+            [
+                new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, cfo),
+                new ColumnFamilyDescriptor("a", cfo),
+                new ColumnFamilyDescriptor("b", cfo),
+            ]);
+            ColumnFamily a = db.GetColumnFamily("a")!;
+            ColumnFamily b = db.GetColumnFamily("b")!;
+            byte[] v = new byte[1024];
+            for (int i = 0; i < 8000 && !entered.IsSet; i++) a.Put(DbTestUtil.Key(i), v);
+            Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10)), "a's flush did not start");
+            // a's flush holds the only flush slot: b is switched by the manager once, then keeps its pending flush.
+            for (int i = 0; i < 40; i++) b.Put(DbTestUtil.Key(i), v);
+            Assert.AreEqual(1UL, b.GetIntProperty(DbProperties.NumImmutableMemTable));
+            Assert.AreEqual(1UL, a.GetIntProperty(DbProperties.NumImmutableMemTable));
+            gate.Set();
+            db.Flush();
+            for (int i = 0; i < 40; i++) Assert.AreEqual(1024, b.Get(DbTestUtil.Key(i))!.Length);
+        }
+        finally
+        {
+            gate.Set();
+            TestHooks.ClearAll();
+        }
     }
 }

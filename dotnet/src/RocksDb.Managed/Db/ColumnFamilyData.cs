@@ -364,7 +364,7 @@ internal sealed class ColumnFamilyData
     /// Port of MemTableList::IsFlushPending: a flush can be picked when min_write_buffer_number_to_merge immutable
     /// memtables wait for one, or when a flush was requested and at least one waits. REQUIRES: mutex.
     /// </summary>
-    public bool HasPendingFlush
+    public bool IsFlushPending
     {
         get
         {
@@ -374,6 +374,24 @@ internal sealed class ColumnFamilyData
                 if (!m.FlushInProgress && !m.FlushCompleted) notStarted++;
             }
             return (FlushRequested && notStarted > 0) || (notStarted > 0 && notStarted >= Options.MinWriteBufferNumberToMerge);
+        }
+    }
+
+    /// <summary>
+    /// Port of MemTableList::IsFlushPendingOrRunning (db/memtable_list.cc:486-491): a flush is running on at least one
+    /// immutable memtable (picked by a flush, or written and waiting to be installed: memlist_.size() -
+    /// num_flush_not_started_ &gt; 0), or <see cref="IsFlushPending"/>: a sealed memtable is waiting for a flush to pick
+    /// it. REQUIRES: mutex.
+    /// </summary>
+    public bool IsFlushPendingOrRunning
+    {
+        get
+        {
+            foreach (ImmutableMemTable m in Imm)
+            {
+                if (m.FlushInProgress || m.FlushCompleted) return true;
+            }
+            return IsFlushPending;
         }
     }
 
