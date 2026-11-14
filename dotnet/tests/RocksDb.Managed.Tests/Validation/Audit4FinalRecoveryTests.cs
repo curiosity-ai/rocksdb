@@ -51,10 +51,14 @@ public sealed class Audit4FinalRecoveryTests
         public bool VerifyTableFile(ColumnFamilyVersion cf, int level, FileMetaData meta) => Array.IndexOf(missing, meta.FileNumber) < 0;
         public bool VerifyBlobFile(ColumnFamilyVersion cf, BlobFileAddition addition) => true;
 
-        public bool LoadTableFile(ColumnFamilyVersion cf, int level, FileMetaData meta)
+        public bool LoadTables(ColumnFamilyVersion version)
         {
-            Loaded.Add(meta.FileNumber);
-            return Array.IndexOf(corrupt, meta.FileNumber) < 0;
+            foreach ((_, FileMetaData meta) in version.AllFiles())
+            {
+                Loaded.Add(meta.FileNumber);
+                if (Array.IndexOf(corrupt, meta.FileNumber) >= 0) return false;
+            }
+            return true;
         }
     }
 

@@ -1978,3 +1978,38 @@ spread is not: the same tree still varies by 20-50% between repetitions on this 
 1.81-2.71 µs), so it was not the JIT that made the earlier comparison noisy. No regression is confirmed. The one
 pattern worth a closer look is the compaction-heavy fill / overwrite, slower after the audit in 4 of 5 pairs by a
 median 5-6% (a sign test of 4 / 5 is far from significant, and the ranges overlap).
+
+## Audit #6: bounded scans and explicit readahead (2026-11-14)
+
+`BoundedScanBenchmarks` (`ScanBenchmarks.cs`; 256 ranges per operation, one reused iterator with `SetBounds`,
+`--inProcess --job short`, warm, net11.0). Load 8-9 on 4 cores, so base and new ran alternately; best times, three runs each:
+
+| Range rows / cache | Base (us) | With the per-block bound check (us) | Allocated |
+|---|---|---|---|
+| 16 rows, 256 MiB | 402.6 / 431.4 / 400.2 | 429.9 / 438.7 / 434.9 | - |
+| 16 rows, 1 MiB | 733 / 738 / 683 | 731 / 739 / 736 | - |
+| 256 rows, 256 MiB | 4356 / 4196 / 4161 | 4269 / 4211 / 4488 | - |
+| 256 rows, 1 MiB | ~5.6-5.7 ms | ~5.7-5.85 ms | - |
+
+16-row hot scans may be 3-7% slower (one or two comparisons per seek), unresolved at this load; the rest is noise. The
+benchmark rarely hits the saved block; the saving shows in the compat ticker (320 vs 352 data block misses over 32 prefix
+scans). The variant that also skipped `DbIter`'s bound comparison on kInbound was slower (256-row hot 4614 / 4233 vs
+4131 / 4143) and was dropped.
+
+Explicit readahead: one buffer bounded by the file instead of two pooled power-of-two windows; a 256 MB readahead over a
+7 MB file holds about 7 MB per table iterator, released with the iterator (buffers over 4 MiB are not pooled).
+
+## auto_readahead_size (2026-11-14)
+
+`ReadaheadBoundedScanBenchmarks` (BenchmarkDotNet `--inProcess --job short`, net11.0, 4 shared cores; 32 bounded scans of
+1,000 rows, 16 MiB readahead_size, 1 MiB LRU cache, compacted 22 MB file):
+
+| Iterator | Before | After | Allocated |
+|---|---|---|---|
+| New iterator per scan (Mosaik's pattern) | 30.9 ms | 2.86 ms | ~1.8 KB per op (the iterators) |
+| One reused iterator (`SetBounds`) | 2.8 ms | 2.8 ms | - |
+
+File bytes read per scan go from ~16 MiB (the whole window) to the range's blocks. `BoundedScanBenchmarks` and
+`ColdScanBenchmarks` unchanged within noise (min times equal or better, Allocated `-`). BenchmarkDotNet's default toolchain
+fails on net11 (`GetRuntimeVersion not implemented`); `--inProcess` works.
+

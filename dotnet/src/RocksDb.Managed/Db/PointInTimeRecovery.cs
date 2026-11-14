@@ -14,11 +14,12 @@ public interface IRecoveryFileVerifier
     bool VerifyBlobFile(ColumnFamilyVersion cf, BlobFileAddition addition);
 
     /// <summary>
-    /// Opens a table file of a point-in-time version about to be created (VersionBuilder::LoadTableHandlers called by
-    /// VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit). False when the file is corrupt, which skips
-    /// that point in time; any other failure is thrown and fails the recovery.
+    /// Opens the table files of a point-in-time version about to be created (VersionBuilder::LoadTableHandlers called by
+    /// VersionEditHandlerPointInTime::MaybeCreateVersionBeforeApplyEdit, db/version_edit_handler.cc). False when a file is
+    /// corrupt or no longer exists (Corruption / PathNotFound), which skips that point in time; any other failure is
+    /// thrown and fails the recovery from this MANIFEST.
     /// </summary>
-    bool LoadTableFile(ColumnFamilyVersion cf, int level, FileMetaData meta) => true;
+    bool LoadTables(ColumnFamilyVersion version) => true;
 }
 
 /// <summary>
@@ -142,16 +143,9 @@ internal sealed class PointInTimeTracker
 
     /// <summary>
     /// LoadTableHandlers on the version about to be created: false (the point in time is skipped) when one of its table
-    /// files is corrupt.
+    /// files is corrupt or gone.
     /// </summary>
-    private bool LoadTables(ColumnFamilyVersion v)
-    {
-        foreach ((int level, FileMetaData f) in v.AllFiles())
-        {
-            if (!_verifier.LoadTableFile(v, level, f)) return false;
-        }
-        return true;
-    }
+    private bool LoadTables(ColumnFamilyVersion v) => _verifier.LoadTables(v);
 
     /// <summary>OnAtomicGroupReplayBegin: saves the valid states of all column families first.</summary>
     public void OnAtomicGroupBegin(RecoveredVersionState state)

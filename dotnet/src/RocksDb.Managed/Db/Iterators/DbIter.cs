@@ -292,6 +292,8 @@ public sealed class DbIter : IDisposable
         _lower = lower.GetValueOrDefault();
         _hasUpper = upper.HasValue;
         _upper = upper.GetValueOrDefault();
+        // The table iterators check the upper bound too (they read upstream's read_options_.iterate_upper_bound).
+        _iter.SetIterateUpperBound(upper);
         if (_pinThruLifetime) _pinMgr.StartPinning();
     }
 

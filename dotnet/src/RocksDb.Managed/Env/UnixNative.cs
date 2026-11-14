@@ -156,7 +156,7 @@ internal static partial class UnixNative
         }
         catch (IOException e)
         {
-            throw RocksDbException.IOError("While fsync: " + path + ": " + e.Message, e);
+            throw RocksDbException.FromIOException("While fsync", path, e);
         }
     }
 
@@ -359,7 +359,6 @@ internal static partial class UnixNative
     private const int EOPNOTSUPP_LINUX = 95;
     private const int EOPNOTSUPP_MAC = 45;
     private const int EEXIST = 17;
-    private const int ENOENT = 2;
     // Windows error codes for CreateHardLink.
     private const int ERROR_FILE_NOT_FOUND = 2;
     private const int ERROR_PATH_NOT_FOUND = 3;
@@ -380,8 +379,7 @@ internal static partial class UnixNative
             {
                 case ERROR_FILE_NOT_FOUND:
                 case ERROR_PATH_NOT_FOUND:
-                    throw new RocksDbException(StatusCode.IOError, "IO error: while link file to " + target + ": " + source + ": No such file or directory",
-                        StatusSubCode.PathNotFound);
+                    throw RocksDbException.FromWin32Error("while link file to " + target, source, err, Marshal.GetPInvokeErrorMessage(err));
                 case ERROR_ALREADY_EXISTS:
                 case ERROR_FILE_EXISTS:
                     throw RocksDbException.IOError("while link file to " + target + ": " + source + ": file exists");
@@ -405,11 +403,6 @@ internal static partial class UnixNative
         {
             // PosixFileSystem::LinkFile: EXDEV / ENOTSUP -> NotSupported("No cross FS links allowed").
             throw RocksDbException.NotSupported("No cross FS links allowed: " + Marshal.GetPInvokeErrorMessage(errno));
-        }
-        if (errno == ENOENT)
-        {
-            throw new RocksDbException(StatusCode.IOError, "IO error: while link file to " + target + ": " + source + ": No such file or directory",
-                StatusSubCode.PathNotFound);
         }
         throw IOErrorFromErrno("while link file to " + target, source, errno);
     }
@@ -513,6 +506,7 @@ internal static partial class UnixNative
         }
     }
 
+    /// <summary>IOError(context, file_name, err_number) of env/io_posix.cc:69-87 (ENOSPC -> NoSpace, ENOENT -> PathNotFound).</summary>
     public static RocksDbException IOErrorFromErrno(string context, string path, int errno) =>
-        RocksDbException.IOError(context + ": " + path + ": " + Marshal.GetPInvokeErrorMessage(errno) + " (errno " + errno + ")");
+        RocksDbException.FromErrno(context, path, errno, Marshal.GetPInvokeErrorMessage(errno) + " (errno " + errno + ")");
 }

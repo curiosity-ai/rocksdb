@@ -19,8 +19,19 @@ internal sealed class ImmutableMemTable
     public ulong NextLogNumber { get; }
     /// <summary>Why the memtable was switched out (reported to listeners).</summary>
     public FlushReason FlushReason { get; init; }
+    /// <summary>flush_in_progress_: a flush picked this memtable (it stays set once the flush completed).</summary>
     public bool FlushInProgress { get; set; }
+    /// <summary>flush_completed_: the flush wrote its table; the memtable leaves the list when the result is committed.</summary>
     public bool FlushCompleted { get; set; }
+    /// <summary>file_number_: the table file of the completed flush (the memtables of one flush share it). 0 until completed.</summary>
+    public ulong FlushFileNumber { get; set; }
+    /// <summary>The flush job that picked this memtable (identifies its memtables when it rolls them back).</summary>
+    public object? FlushOwner { get; set; }
+    /// <summary>
+    /// edit_ and the flush job info of the completed flush whose oldest memtable this is, waiting to be committed in
+    /// memtable order (MemTableList::TryInstallMemtableFlushResults); null on the other memtables of the flush.
+    /// </summary>
+    public PendingFlushResult? FlushResult { get; set; }
     /// <summary>
     /// The memtable switch this memtable was sealed by (<see cref="DbImpl.BeginAtomicSwitch"/>): memtables of different
     /// column families switched together share it. An atomic flush picks the memtables of every column family up to one
@@ -87,7 +98,16 @@ internal sealed class SuperVersion
 /// </summary>
 internal sealed class ColumnFamilyData
 {
-    public ColumnFamilyData(uint id, string name, ColumnFamilyOptions options, DbImpl db)
+    public ColumnFamilyData(uint id, string name, ColumnFamilyOptions options, DbImpl db) : this(id, name, options, db, null)
+    {
+    }
+
+    /// <param name="recoveredTableCache">The column family's table cache view created by best-efforts recovery
+    /// (<see cref="NewTableCache"/>), whose readers stay cached for this column family: upstream creates the
+    /// ColumnFamilyData, and its table cache, when the MANIFEST replay meets the column family
+    /// (VersionEditHandler::CreateCfAndInit, db/version_edit_handler.cc), so the tables opened while the point-in-time
+    /// versions are verified are the ones the DB reads afterwards. Null: a new view.</param>
+    public ColumnFamilyData(uint id, string name, ColumnFamilyOptions options, DbImpl db, TableCache? recoveredTableCache)
     {
         Id = id;
         Name = name;
@@ -117,14 +137,19 @@ internal sealed class ColumnFamilyData
             WriteBufferManager = db.WriteBufferManager,
         };
         MemOptions.ApplyColumnFamilyOptions(options);
-        TableCache = new TableCache(db.SharedTableCache, db.FileSystem, db.DbPaths, ReaderOptions)
+        if (recoveredTableCache is null)
         {
-            Statistics = db.Options.Statistics,
-            VerifyUniqueIdInManifest = db.Options.VerifySstUniqueIdInManifest,
-            RowCache = db.Options.RowCache,
-        };
+            TableCache = NewTableCache(db, ReaderOptions, NumLevels);
+        }
+        else
+        {
+            // Built from the same options (NewTableCache); tables opened from now on use this column family's reader options.
+            System.Diagnostics.Debug.Assert(recoveredTableCache.NumLevels == NumLevels && recoveredTableCache.LevelStats is not null);
+            TableCache = recoveredTableCache;
+            TableCache.ReaderOptions = ReaderOptions;
+        }
         // Blob files live in cf_paths.front() (the first DB path); readers and the optional blob cache are per CF.
-        Stats = new InternalStats(NumLevels);
+        Stats = TableCache.LevelStats!;
         BlobSource = new Blob.BlobSource(db.FileSystem, db.DbPaths[0], id, options.BlobCache, db.Identity.DbId, db.Identity.SessionId, db.Options.Statistics,
             db.Options.MaxOpenFiles)
         {
@@ -133,8 +158,6 @@ internal sealed class ColumnFamilyData
         CompactionState = new ColumnFamilyCompactionState(options, Icmp);
         // ioptions.cf_paths (= db_paths): GetPathId of the leveled and universal pickers.
         CompactionState.Picker.PathTargetSizes = db.DbPathTargetSizes;
-        TableCache.LevelStats = Stats;
-        TableCache.NumLevels = NumLevels;
         if (options.EnableBlobDirectWrite && options.EnableBlobFiles && !db.IsReadOnly)
         {
             // DBImpl::MaybeInitBlobDirectWriteColumnFamily.
@@ -273,7 +296,22 @@ internal sealed class ColumnFamilyData
         TableCache.ReaderOptions = reader;
     }
 
-    private static TableReaderOptions CreateReaderOptions(ColumnFamilyOptions options, TableFormatOptions format, DbImpl db)
+    /// <summary>
+    /// The column family's view of the DB-wide table cache (TableCache, created with the ColumnFamilyData upstream), with
+    /// its internal stats (the per-level read histograms of the readers it opens). Used by the constructor and by
+    /// best-efforts recovery, which opens the tables before the column family exists here (see the constructor).
+    /// </summary>
+    internal static TableCache NewTableCache(DbImpl db, TableReaderOptions readerOptions, int numLevels) =>
+        new(db.SharedTableCache, db.FileSystem, db.DbPaths, readerOptions)
+        {
+            Statistics = db.Options.Statistics,
+            VerifyUniqueIdInManifest = db.Options.VerifySstUniqueIdInManifest,
+            RowCache = db.Options.RowCache,
+            LevelStats = new InternalStats(numLevels),
+            NumLevels = numLevels,
+        };
+
+    internal static TableReaderOptions CreateReaderOptions(ColumnFamilyOptions options, TableFormatOptions format, DbImpl db)
     {
         TableReaderOptions r = TableFactory.CreateReaderOptions(options, format, db.GetDefaultBlockCache(options.TableOptions), db.Identity.SessionId);
         if (db.Options.Statistics is { } statistics) r = r with { Statistics = statistics.BlockCacheCounters };
@@ -325,23 +363,22 @@ internal sealed class ColumnFamilyData
     /// <summary>WALs with numbers below this have been flushed for this CF (ColumnFamilyData::GetLogNumber).</summary>
     public ulong LogNumber { get; set; }
     public bool Dropped { get; set; }
-    public bool FlushRunning { get; set; }
+    /// <summary>
+    /// Non-atomic flush jobs scheduled or running on this column family. Like upstream, several flushes of one column
+    /// family may run at once, each on memtables the others did not pick; their results are committed in memtable order
+    /// (<see cref="FlushCommitInProgress"/>). (Atomic flushes are counted by the DB, they are installed in memtable order
+    /// too.) Guarded by the DB mutex.
+    /// </summary>
+    public int RunningFlushes { get; set; }
+    /// <summary>MemTableList::commit_in_progress_: a flush is writing completed flush results to the MANIFEST. Guarded by the DB mutex.</summary>
+    public bool FlushCommitInProgress { get; set; }
+
     public bool QueuedForFlush { get; set; }
     /// <summary>Next epoch number for L0 files (ColumnFamilyData::NewEpochNumber).</summary>
     public ulong NextEpochNumber { get; set; } = 1;
 
-    public int NumNotFlushed
-    {
-        get
-        {
-            int n = 0;
-            foreach (ImmutableMemTable m in Imm)
-            {
-                if (!m.FlushCompleted) n++;
-            }
-            return n;
-        }
-    }
+    /// <summary>MemTableList::NumNotFlushed: the immutable memtables whose flush result is not committed yet.</summary>
+    public int NumNotFlushed => Imm.Count;
 
     /// <summary>True if some immutable memtable sealed by a switch up to <paramref name="cut"/> is waiting for a flush to be picked.</summary>
     public bool HasPendingFlushUpTo(ulong cut)
@@ -364,7 +401,7 @@ internal sealed class ColumnFamilyData
     /// Port of MemTableList::IsFlushPending: a flush can be picked when min_write_buffer_number_to_merge immutable
     /// memtables wait for one, or when a flush was requested and at least one waits. REQUIRES: mutex.
     /// </summary>
-    public bool HasPendingFlush
+    public bool IsFlushPending
     {
         get
         {
@@ -374,6 +411,24 @@ internal sealed class ColumnFamilyData
                 if (!m.FlushInProgress && !m.FlushCompleted) notStarted++;
             }
             return (FlushRequested && notStarted > 0) || (notStarted > 0 && notStarted >= Options.MinWriteBufferNumberToMerge);
+        }
+    }
+
+    /// <summary>
+    /// Port of MemTableList::IsFlushPendingOrRunning (db/memtable_list.cc:486-491): a flush is running on at least one
+    /// immutable memtable (picked by a flush, or written and waiting to be installed: memlist_.size() -
+    /// num_flush_not_started_ &gt; 0), or <see cref="IsFlushPending"/>: a sealed memtable is waiting for a flush to pick
+    /// it. REQUIRES: mutex.
+    /// </summary>
+    public bool IsFlushPendingOrRunning
+    {
+        get
+        {
+            foreach (ImmutableMemTable m in Imm)
+            {
+                if (m.FlushInProgress || m.FlushCompleted) return true;
+            }
+            return IsFlushPending;
         }
     }
 

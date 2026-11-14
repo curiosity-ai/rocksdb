@@ -1,94 +1,6 @@
 namespace RocksDb.Managed.Db;
 
 /// <summary>
-/// The flushes of one atomic flush (DBImpl::AtomicFlushMemTablesToOutputFiles / InstallMemtableAtomicFlushResults,
-/// db/db_impl/db_impl_compaction_flush.cc, db/memtable_list.cc): every member writes its L0 file independently, then the
-/// edits of all members are committed to the MANIFEST as one atomic group, so recovery sees all of them or none. Used by
-/// every flush with atomic_flush and by error recovery (ResumeImpl flushes with force_atomic_flush). A member that fails before committing fails the group;
-/// a member with nothing to flush leaves it.
-/// <para><b>Synchronization</b>: all state is guarded by the instance lock.</para>
-/// </summary>
-internal sealed class AtomicFlushGroup
-{
-    private readonly DbImpl _db;
-    private readonly HashSet<ColumnFamilyData> _pending;
-    private readonly List<ManifestEditEntry> _edits = new();
-    private readonly TaskCompletionSource _done = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly Lock _lock = new();
-    private Exception? _failure;
-    private volatile bool _manifestWriteAttempted;
-
-    /// <summary>True once the group started its MANIFEST write: a failure after that may have made the edits durable.</summary>
-    public bool ManifestWriteAttempted => _manifestWriteAttempted;
-
-    public AtomicFlushGroup(DbImpl db, IEnumerable<ColumnFamilyData> members)
-    {
-        _db = db;
-        _pending = new HashSet<ColumnFamilyData>(members);
-        if (_pending.Count == 0) _done.TrySetResult();
-    }
-
-    /// <summary>Completes when the group's MANIFEST write finished (or failed).</summary>
-    public Task Completion => _done.Task;
-
-    /// <summary>
-    /// Adds the member's flush edit and waits until the whole group is committed. The member that arrives last writes
-    /// the group. Throws if the group failed.
-    /// </summary>
-    public async ValueTask CommitAsync(ColumnFamilyData cfd, VersionEdit edit)
-    {
-        bool last;
-        lock (_lock)
-        {
-            if (!_pending.Remove(cfd)) throw new InvalidOperationException("not a pending member of the atomic flush");
-            _edits.Add(new ManifestEditEntry(cfd, edit));
-            last = _pending.Count == 0;
-        }
-        if (last) await WriteAsync().ConfigureAwait(false);
-        await _done.Task.ConfigureAwait(false);
-    }
-
-    /// <summary>A member leaves without an edit (nothing to flush, or <paramref name="error"/>). No-op after it committed.</summary>
-    public void Leave(ColumnFamilyData cfd, Exception? error)
-    {
-        bool last;
-        lock (_lock)
-        {
-            if (!_pending.Remove(cfd)) return;
-            if (error is not null) _failure ??= error;
-            last = _pending.Count == 0;
-        }
-        if (last) _ = Task.Run(async () => await WriteAsync().ConfigureAwait(false));
-    }
-
-    private async ValueTask WriteAsync()
-    {
-        Exception? failure;
-        lock (_lock) failure = _failure;
-        if (failure is not null)
-        {
-            _done.TrySetException(failure);
-            return;
-        }
-        if (_edits.Count == 0)
-        {
-            _done.TrySetResult();
-            return;
-        }
-        try
-        {
-            _manifestWriteAttempted = true;
-            await _db.CommitAtomicFlushAsync(_edits).ConfigureAwait(false);
-            _done.TrySetResult();
-        }
-        catch (Exception e)
-        {
-            _done.TrySetException(e);
-        }
-    }
-}
-
-/// <summary>
 /// WAL tracking in the MANIFEST (track_and_verify_wals_in_manifest) and the commit of atomic flushes. Ports
 /// DBImpl::SyncClosedWals / ApplyWALToManifest / MarkLogsSynced (db/db_impl/db_impl.cc), the WAL deletion records of
 /// GetDBRecoveryEditForObsoletingMemTables (db/db_impl/db_impl_files.cc) and DBImpl::SwitchMemtable
@@ -211,9 +123,10 @@ internal sealed partial class DbImpl
     /// <summary>
     /// Writes the edits of an atomic flush as one atomic group (InstallMemtableAtomicFlushResults), followed by the
     /// group's min_log_number_to_keep / WAL deletion edit (PrecomputeMinLogNumberToKeepNon2PC over all members, appended
-    /// to the last column family's edits, inside the group), then installs the versions.
+    /// to the last column family's edits, inside the group); <paramref name="installedUnderMutex"/> runs in the critical
+    /// section that installs the new versions.
     /// </summary>
-    internal async ValueTask CommitAtomicFlushAsync(List<ManifestEditEntry> edits)
+    internal async ValueTask CommitAtomicFlushAsync(List<ManifestEditEntry> edits, bool synchronous, Action installedUnderMutex)
     {
         var all = new List<ManifestEditEntry>(edits.Count + 1);
         all.AddRange(edits);
@@ -242,6 +155,6 @@ internal sealed partial class DbImpl
             }
         }
         TestHooks.Invoke("DBImpl::AtomicFlush:BeforeLogAndApply");
-        await Versions.LogAndApplyAsync(all, atomicGroup: true, synchronous: false, CancellationToken.None).ConfigureAwait(false);
+        await Versions.LogAndApplyAsync(all, atomicGroup: true, synchronous, installedUnderMutex, CancellationToken.None).ConfigureAwait(false);
     }
 }

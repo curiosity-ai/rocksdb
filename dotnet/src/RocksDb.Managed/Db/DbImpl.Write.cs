@@ -372,7 +372,7 @@ internal sealed partial class DbImpl
         if (e is ObjectDisposedException) ThrowDisposed();
         // The writer's own cancellation (see CancelStalledLeader): only the canceled leader carries it.
         if (e is OperationCanceledException c) throw new OperationCanceledException(c.Message, c, c.CancellationToken);
-        throw RocksDbException.IOError(e.Message, e);
+        throw RocksDbException.FromException(e);
     }
 
     /// <summary>

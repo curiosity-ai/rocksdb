@@ -797,31 +797,76 @@ public sealed partial class BlockBasedTableReader : TableReader
 
     private UserDefinedIndexReader? _udiReader;
 
+    // sizeof of the native objects BlockBasedTable::ApproximateMemoryUsage charges (x86-64 / libstdc++, main 11.14,
+    // measured with g++ against the headers): the managed reader keeps the same state in differently shaped objects,
+    // so the native sizes stand in for them, as LruCache.EntryMetadataCharge does for cache handles.
+    private const int NativeRepSize = 944;                          // BlockBasedTable::Rep (block_based_table_reader.h)
+    private const int NativePartitionIndexReaderSize = 104;         // PartitionIndexReader (partitioned_index_reader.h)
+    private const int NativeBinarySearchIndexReaderSize = 48;       // BinarySearchIndexReader (binary_search_index_reader.h)
+    private const int NativeHashIndexReaderSize = 56;               // HashIndexReader (hash_index_reader.h)
+    private const int NativeFullFilterBlockReaderSize = 64;         // FullFilterBlockReader (full_filter_block.h)
+    private const int NativePartitionedFilterBlockReaderSize = 120; // PartitionedFilterBlockReader (partitioned_filter_block.h)
+    private const int NativeUncompressionDictReaderSize = 40;       // UncompressionDictReader (uncompression_dict_reader.h)
+
     /// <summary>
-    /// Port of BlockBasedTable::ApproximateMemoryUsage: the blocks owned by this reader outside the block cache (index,
-    /// full filter or filter partition index and partitions, range tombstones) and the user-defined index reader.
-    /// Blocks held by the block cache are not counted (they are part of the cache's usage). Unlike upstream,
-    /// sizeof(Rep) and the index/filter reader objects themselves are not included.
+    /// Port of BlockBasedTable::ApproximateMemoryUsage (table/block_based/block_based_table_reader.cc): Rep, the filter
+    /// reader, the index reader and the uncompression dictionary reader (each the object, malloc_usable_size or sizeof
+    /// without ROCKSDB_MALLOC_USABLE_SIZE, see <see cref="FilterAllocationModel"/>, plus the block it owns outside the
+    /// block cache), the table properties (TableProperties::ApproximateMemoryUsage) and the user-defined index. Blocks
+    /// held by the block cache, pinned or not, are part of the cache's usage. As upstream, the range tombstones
+    /// (Rep::fragmented_range_dels) and pinned index partitions (partition_map_) are not counted; the filter partitions
+    /// the port owns without a block cache (a deviation: upstream keeps none, see PinnedFilterPartitions) are.
     /// </summary>
     public override ulong ApproximateMemoryUsage
     {
         get
         {
-            ulong usage = 0;
-            // IndexReaderCommon / FilterBlockReaderCommon::ApproximateMemoryUsage: only blocks the reader owns
-            // (GetOwnValue); one pinned in the block cache is part of the cache's usage.
+            // Rep::ApproximateMemoryUsage.
+            ulong usage = FilterAllocationModel.UsableSize(NativeRepSize);
+            // FullFilterBlockReader / PartitionedFilterBlockReader::ApproximateMemoryUsage: the reader object and the
+            // filter block it owns (FilterBlockReaderCommon::ApproximateFilterBlockMemoryUsage, GetOwnValue only).
+            switch (_filterKind)
+            {
+                case FilterKind.Full:
+                    usage += FilterAllocationModel.UsableSize(NativeFullFilterBlockReaderSize);
+                    if (_filter is not null && _filterBuffer is not null) usage += (ulong)_filterBuffer.Length;
+                    break;
+                case FilterKind.Partitioned:
+                    usage += FilterAllocationModel.UsableSize(NativePartitionedFilterBlockReaderSize);
+                    if (_filterIndexBlock is not null && !_filterIndexRef.IsCacheHandle) usage += (ulong)_filterIndexBlock.Charge;
+                    if (_pinnedFilterPartitions is not null) usage += _pinnedFilterPartitions.MemoryUsage;
+                    break;
+            }
+            // The index reader of BlockBasedTable::CreateIndexReader (a hash index without the table's prefix extractor
+            // falls back to binary search) and IndexReaderCommon::ApproximateIndexBlockMemoryUsage.
+            usage += IndexType switch
+            {
+                IndexType.TwoLevelIndexSearch => FilterAllocationModel.UsableSize(NativePartitionIndexReaderSize),
+                IndexType.HashSearch when _tablePrefixExtractor is not null => HashIndexReaderSize(),
+                _ => FilterAllocationModel.UsableSize(NativeBinarySearchIndexReaderSize),
+            };
             if (_indexBlock is not null && !_indexRef.IsCacheHandle) usage += (ulong)_indexBlock.Charge;
-            if (_rangeDelBlock is not null) usage += (ulong)_rangeDelBlock.Charge;
-            if (_filter is not null && _filterBuffer is not null) usage += (ulong)_filterBuffer.Length;
-            if (_filterIndexBlock is not null && !_filterIndexRef.IsCacheHandle) usage += (ulong)_filterIndexBlock.Charge;
-            if (_pinnedFilterPartitions is not null) usage += _pinnedFilterPartitions.MemoryUsage;
+            // UncompressionDictReader::ApproximateMemoryUsage: the reader exists when the table has a dictionary block;
+            // only a dictionary it owns (GetOwnValue) is counted.
+            if (_dictHandle.Size > 0)
+            {
+                usage += FilterAllocationModel.UsableSize(NativeUncompressionDictReaderSize);
+                if (_compressionDict is not null && _dictLease.IsOwned) usage += (ulong)_compressionDict.ApproximateMemoryUsage;
+            }
+            usage += Properties.ApproximateMemoryUsage;
             if (_udiReader is not null) usage += _udiReader.ApproximateMemoryUsage;
-            // UncompressionDictReader::ApproximateMemoryUsage: only a dictionary the reader owns (GetOwnValue); one held
-            // by the block cache, pinned or not, is part of the cache's usage.
-            if (_compressionDict is not null && _dictLease.IsOwned) usage += (ulong)_compressionDict.ApproximateMemoryUsage;
             return usage;
         }
     }
+
+    /// <summary>
+    /// HashIndexReader::ApproximateMemoryUsage: with ROCKSDB_MALLOC_USABLE_SIZE the object only, without it sizeof plus
+    /// BlockPrefixIndex::ApproximateMemoryUsage (upstream counts the prefix index only in that branch).
+    /// </summary>
+    private ulong HashIndexReaderSize() => FilterAllocationModel.IsActive
+        ? FilterAllocationModel.UsableSize(NativeHashIndexReaderSize)
+        : NativeHashIndexReaderSize + (_prefixIndex?.ApproximateMemoryUsage ?? 0);
+
     private bool _udiStub;
     private bool _udiPrimary;
 
@@ -1110,6 +1155,71 @@ public sealed partial class BlockBasedTableReader : TableReader
         return cache is null || (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, kind);
     }
 
+    /// <summary>table_options.block_cache is set (a <see cref="Cache.BlockCache"/>; the legacy seam does not count).</summary>
+    internal bool HasBlockCache => _cache is not null;
+
+    /// <summary>The DB statistics of this table's reads (ioptions.stats), or null.</summary>
+    internal Managed.Statistics? DbStatistics => _stats?.Owner;
+
+    /// <summary>
+    /// Port of BlockBasedTable::LookupAndPinBlocksInCache&lt;Block_kData&gt; (block_based_table_reader.cc:2318): looks the
+    /// data block at <paramref name="handle"/> up in the block cache without reading the file, recording the hit or miss
+    /// (UpdateCacheHitMetrics / UpdateCacheMissMetrics). A hit returns the pinned entry in <paramref name="entry"/>, which
+    /// the caller releases. Without a block cache: a miss, nothing recorded.
+    /// </summary>
+    internal bool LookupAndPinDataBlockInCache(BlockHandle handle, out BlockRef entry)
+    {
+        entry = default;
+        BlockCache? cache = _cache;
+        if (cache is null) return false;
+        CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
+        if (!LookupCache(cache, key, BlockKind.Data, out CachedBlock h))
+        {
+            _stats?.Record(BlockCacheCounter.DataMiss);
+            return false;
+        }
+        _stats?.RecordHit(BlockCacheCounter.DataHit, h.Charge);
+        PerfContext.Add(PerfMetric.BlockCacheHitCount, 1);
+        entry = BlockRef.FromCache(Unsafe.As<Block>(h.Value)!, h);
+        return true;
+    }
+
+    /// <summary>
+    /// RetrieveBlock with use_block_cache_for_lookup = false (BlockBasedTableIterator::InitDataBlock for a block whose
+    /// cache lookup <see cref="LookupAndPinDataBlockInCache"/> already missed): reads the data block, through
+    /// <paramref name="prefetch"/> when given, and inserts it into the cache like any miss, without a second lookup or
+    /// miss count. Only called with a block cache (the lookup needs one).
+    /// </summary>
+    internal BlockRef GetDataBlockRefWithoutCacheLookup(BlockHandle handle, TableReadFlags flags, AsyncPrefetchBuffer? prefetch)
+    {
+        BlockCache cache = _cache!;
+        CacheKey key = _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset);
+        if (!_dictLookupPerRead && prefetch is null) return ReadAndInsertAfterMiss(cache, key, handle, BlockKind.Data, flags);
+        ChargeRateLimiter(handle, flags);
+        ThrowIfNoIo(flags);
+        Block b;
+        if (_dictLookupPerRead)
+        {
+            DictLease lease = GetOrReadDictionary(flags, _file);
+            try
+            {
+                b = Protect(prefetch is null
+                    ? ReadBlockFromFile(handle, BlockKind.Data, flags, lease.Dict!)
+                    : BlockFetcher.ReadBlock(prefetch, _footer, handle, VerifyRead(flags), lease.Dict!), BlockKind.Data);
+            }
+            finally
+            {
+                lease.Release();
+            }
+        }
+        else
+        {
+            b = Protect(BlockFetcher.ReadBlock(prefetch!, _footer, handle, VerifyRead(flags), DictFor(BlockKind.Data)), BlockKind.Data);
+        }
+        if (_bcTracer is { IsEnabled: true } t) TraceAccess(t, key, BlockKind.Data, b, hit: false, flags);
+        return (flags & TableReadFlags.DontFillCache) != 0 ? BlockRef.FromOwned(b) : InsertIntoCache(cache, key, b, BlockKind.Data);
+    }
+
     /// <summary>
     /// Port of RandomAccessFileReader::ChargeRateLimiterForRead: charges the bytes of a block read from the file
     /// (block + trailer) to the rate limiter at the priority in <paramref name="flags"/>, in chunks of at most the
@@ -1185,6 +1295,12 @@ public sealed partial class BlockBasedTableReader : TableReader
     private BlockRef ReadAndInsert(BlockCache cache, in CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags)
     {
         _stats?.Record(MissCounter(kind));
+        return ReadAndInsertAfterMiss(cache, key, handle, kind, flags);
+    }
+
+    /// <summary>MaybeReadBlockAndLoadToCache after the cache missed: reads the block from the file and inserts it.</summary>
+    private BlockRef ReadAndInsertAfterMiss(BlockCache cache, in CacheKey key, BlockHandle handle, BlockKind kind, TableReadFlags flags)
+    {
         ThrowIfNoIo(flags);
         ChargeRateLimiter(handle, flags);
         if (cache.AdmitsCompressedBlocks && OffersCompressed(kind, flags)) return ReadAndInsertOfferingCompressed(cache, key, handle, kind, flags);

@@ -31,6 +31,12 @@ public sealed class BlockPrefixIndex
     /// <summary>Number of hash buckets (number of prefixes + 1).</summary>
     public int NumBuckets => (int)_numBuckets;
 
+    /// <summary>
+    /// Port of BlockPrefixIndex::ApproximateMemoryUsage (table/block_based/block_prefix_index.h): sizeof(BlockPrefixIndex)
+    /// (64 on x86-64 / libstdc++, main 11.14) plus the bucket and block array entries.
+    /// </summary>
+    public ulong ApproximateMemoryUsage => 64 + ((ulong)_blockArrayBuffer.Length + _numBuckets) * sizeof(uint);
+
     private static uint PrefixToBucket(ReadOnlySpan<byte> prefix, uint numBuckets) => Hash.Hash32(prefix, 0) % numBuckets;
 
     private sealed class PrefixRecord

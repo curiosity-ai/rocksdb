@@ -17,14 +17,19 @@ namespace RocksDb.Managed.Db;
 /// (TableCache::kInfiniteCapacity). Changed by SetDBOptions(max_open_files) like upstream's SetCapacity.
 /// </para>
 /// <para>
-/// <b>Synchronization</b>: lookups of open readers are lock-free (ConcurrentDictionary + CAS reference counts); opening
-/// and eviction are serialized by <c>_openLock</c>.
+/// <b>Synchronization</b>: lookups of open readers are lock-free (ConcurrentDictionary + CAS reference counts). Opening a
+/// table holds the striped loader lock of its file number (TableCache::loader_mutex_, kLoadConcurency = 128 stripes), so
+/// different files open in parallel (LoadTableHandlers with max_file_opening_threads) and one file is opened once;
+/// inserting an opened reader and eviction are serialized by <c>_openLock</c>.
 /// </para>
 /// </summary>
 internal sealed class TableCacheStore : IDisposable
 {
     private readonly ConcurrentDictionary<ulong, Handle> _handles = new();
     private readonly Lock _openLock = new();
+    /// <summary>kLoadConcurency (db/table_cache.cc).</summary>
+    private const int LoadConcurrency = 128;
+    private readonly Lock[] _loaderLocks = CreateLoaderLocks();
     private long _openSequence;
     private int _capacity;
     private bool _disposed;
@@ -132,6 +137,9 @@ internal sealed class TableCacheStore : IDisposable
         return true;
     }
 
+    /// <summary>True when the handle of <paramref name="fileNumber"/> holds a pin reference (see <see cref="TryGetPinned"/>).</summary>
+    internal bool IsPinned(ulong fileNumber) => _handles.TryGetValue(fileNumber, out Handle? h) && Volatile.Read(ref h.Pinned) != 0;
+
     /// <summary>A referenced handle if the table is already open (FindTable with no_io), else false.</summary>
     internal bool TryGetOpen(ulong fileNumber, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out Handle? handle)
     {
@@ -145,8 +153,22 @@ internal sealed class TableCacheStore : IDisposable
         return false;
     }
 
-    /// <summary>Port of TableCache::FindTable: returns a referenced, opened handle.</summary>
-    internal Handle FindTable(TableCache owner, FileMetaData file)
+    private static Lock[] CreateLoaderLocks()
+    {
+        var locks = new Lock[LoadConcurrency];
+        for (int i = 0; i < locks.Length; i++) locks[i] = new Lock();
+        return locks;
+    }
+
+    /// <summary>loader_mutex_.Get(key): the stripe of a file number (Fibonacci hashing of the key to 7 bits).</summary>
+    private Lock LoaderLock(ulong fileNumber) => _loaderLocks[(int)((fileNumber * 0x9E3779B97F4A7C15UL) >> 57)];
+
+    /// <summary>
+    /// Port of TableCache::FindTable: returns a referenced, opened handle. A table that is not open is opened under the
+    /// loader lock of its file number with <paramref name="prefetchIndexAndFilterInCache"/> (FindTable's
+    /// prefetch_index_and_filter_in_cache: false lets the open warm the block cache with pinned metadata only).
+    /// </summary>
+    internal Handle FindTable(TableCache owner, FileMetaData file, bool prefetchIndexAndFilterInCache)
     {
         ulong number = file.FileNumber;
         while (true)
@@ -158,9 +180,9 @@ internal sealed class TableCacheStore : IDisposable
                 return h;
             }
             ObjectDisposedException.ThrowIf(_disposed || owner.IsDisposed, owner);
-            lock (_openLock)
+            lock (LoaderLock(number))
             {
-                // Re-check under the lock: someone may have opened it meanwhile.
+                // We check the cache again under the loading mutex: someone may have opened it meanwhile.
                 if (_handles.TryGetValue(number, out h) && h.IsOpen)
                 {
                     if (h.TryRef())
@@ -173,19 +195,22 @@ internal sealed class TableCacheStore : IDisposable
                 h = new Handle(number, owner);
                 try
                 {
-                    owner.Open(h, file);
+                    owner.Open(h, file, prefetchIndexAndFilterInCache);
                 }
                 catch (Exception e) when (e is IOException or RocksDbException)
                 {
                     // Don't cache failures (like upstream, a failed open is retried on the next lookup).
-                    throw e is RocksDbException ? e : RocksDbException.IOError("While open table file " + owner.TableFilePath(file) + ": " + e.Message, e);
+                    throw RocksDbException.FromIOException("While open table file", owner.TableFilePath(file), e);
                 }
                 h.MarkOpen();
-                h.LastUse = Interlocked.Increment(ref _openSequence);
-                _handles[number] = h;
-                bool referenced = h.TryRef();
-                System.Diagnostics.Debug.Assert(referenced);
-                if (_handles.Count > _capacity) EvictUnreferenced();
+                lock (_openLock)
+                {
+                    h.LastUse = Interlocked.Increment(ref _openSequence);
+                    _handles[number] = h;
+                    bool referenced = h.TryRef();
+                    System.Diagnostics.Debug.Assert(referenced);
+                    if (_handles.Count > _capacity) EvictUnreferenced();
+                }
                 return h;
             }
         }
@@ -380,19 +405,27 @@ internal sealed class TableCache : ITableCache, IDisposable
     /// <summary>Path of a table file (TableFileName with path id).</summary>
     public string TableFilePath(FileMetaData file) => FileNames.TableFileName(_dbPaths, file.FileNumber, file.PathId);
 
-    /// <summary>
-    /// True while DB::Open loads the tables of the recovered versions (VersionEditHandler::LoadTables with
-    /// prefetch_index_and_filter_in_cache = false): tables opened meanwhile do not warm the block cache with their
-    /// index, filter and partitions; only pinned metadata blocks are loaded. Set by the opening thread before the DB
-    /// serves reads.
-    /// </summary>
-    internal volatile bool InitialLoad;
+    public TableReaderLease GetReader(FileMetaData file) => GetReader(file, prefetchIndexAndFilterInCache: true);
 
-    public TableReaderLease GetReader(FileMetaData file)
+    /// <summary>
+    /// <see cref="GetReader(FileMetaData)"/> with FindTable's prefetch_index_and_filter_in_cache: false when DB::Open loads
+    /// the tables of the recovered versions (VersionEditHandler::LoadTables): a table opened by this call does not warm
+    /// the block cache with its index, filter and partitions; only pinned metadata blocks are loaded.
+    /// </summary>
+    public TableReaderLease GetReader(FileMetaData file, bool prefetchIndexAndFilterInCache)
     {
-        TableCacheStore.Handle h = _store.FindTable(this, file);
+        TableCacheStore.Handle h = _store.FindTable(this, file, prefetchIndexAndFilterInCache);
         return new TableReaderLease(h.Reader!, TableCacheStore.s_release, h);
     }
+
+    /// <summary>The DB-wide store's capacity (the table cache's GetCapacity; int.MaxValue is kInfiniteCapacity).</summary>
+    internal int StoreCapacity => _store.Capacity;
+
+    /// <summary>Number of readers in the DB-wide store (the table cache's GetUsage: each reader is charged 1).</summary>
+    internal int StoreUsage => _store.Count;
+
+    /// <summary>The reader of <paramref name="file"/> is pinned (FileDescriptor::pinned_reader is set).</summary>
+    internal bool IsPinned(FileMetaData file) => _store.IsPinned(file.FileNumber);
 
     public ValueTask<TableReaderLease> GetReaderAsync(FileMetaData file, CancellationToken cancellationToken = default)
     {
@@ -422,7 +455,7 @@ internal sealed class TableCache : ITableCache, IDisposable
     /// </summary>
     public TableReaderLease GetReader(FileMetaData file, out FragmentedRangeTombstoneList? rangeTombstones)
     {
-        TableCacheStore.Handle h = _store.FindTable(this, file);
+        TableCacheStore.Handle h = _store.FindTable(this, file, prefetchIndexAndFilterInCache: true);
         rangeTombstones = h.RangeDels;
         return new TableReaderLease(h.Reader!, TableCacheStore.s_release, h);
     }
@@ -501,7 +534,7 @@ internal sealed class TableCache : ITableCache, IDisposable
     }
 
     /// <summary>Opens the reader of <paramref name="h"/> with this column family's options (called by the store).</summary>
-    internal void Open(TableCacheStore.Handle h, FileMetaData file)
+    internal void Open(TableCacheStore.Handle h, FileMetaData file, bool prefetchIndexAndFilterInCache)
     {
         string path = TableFilePath(file);
         IRandomAccessFile f = _fs.OpenRandomAccess(path);
@@ -522,7 +555,7 @@ internal sealed class TableCache : ITableCache, IDisposable
             TableReaderOptions opts = ReaderOptions;
             if (file.LargestSeqno != opts.LargestSeqno || file.FileNumber != opts.FileNumber || file.LevelHint != opts.Level)
                 opts = opts with { LargestSeqno = file.LargestSeqno, FileNumber = file.FileNumber, Level = file.LevelHint };
-            if (InitialLoad) opts = opts with { PrefetchIndexAndFilterInCache = false };
+            if (!prefetchIndexAndFilterInCache) opts = opts with { PrefetchIndexAndFilterInCache = false };
             reader = TableReaderFactory.Open(f, opts);
         }
         catch

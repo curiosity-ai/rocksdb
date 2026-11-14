@@ -239,11 +239,8 @@ public sealed class LocalFileSystem : IFileSystem
         return new DateTimeOffset(File.GetLastWriteTimeUtc(path), TimeSpan.Zero);
     }
 
-    internal static RocksDbException MapException(string context, string path, Exception e)
-    {
-        StatusSubCode sub = e is FileNotFoundException or DirectoryNotFoundException ? StatusSubCode.PathNotFound : StatusSubCode.None;
-        return new RocksDbException(StatusCode.IOError, "IO error: " + context + ": " + path + ": " + e.Message, sub, e);
-    }
+    /// <summary>IOError(context, file_name, errno) of env/io_posix.cc, see <see cref="RocksDbException.FromIOException"/>.</summary>
+    internal static RocksDbException MapException(string context, string path, Exception e) => RocksDbException.FromIOException(context, path, e);
 
     internal static SafeFileHandle OpenHandle(string path, FileMode mode, FileAccess access, FileShare share, FileOptions options)
     {

@@ -111,8 +111,26 @@ public sealed class LevelIterator : InternalIterator
     internal void SetBounds(ReadOnlyMemory<byte>? lower, ReadOnlyMemory<byte>? upper)
     {
         _lower = lower;
-        _upper = upper;
+        SetIterateUpperBound(upper);
     }
+
+    /// <summary>The upper bound, also for the file iterators (which stop at the data block holding it).</summary>
+    internal override void SetIterateUpperBound(ReadOnlyMemory<byte>? upperBound)
+    {
+        _upper = upperBound;
+        _fileIter?.SetIterateUpperBound(upperBound);
+        _spare?.SetIterateUpperBound(upperBound);
+    }
+
+    /// <summary>Port of LevelIterator::UpperBoundCheckResult: the file iterator's while valid.</summary>
+    public override IterBoundCheck UpperBoundCheckResult => Valid ? _fileIter!.UpperBoundCheckResult : IterBoundCheck.Unknown;
+
+    /// <summary>
+    /// The file iterator stopped at iterate_upper_bound (UpperBoundCheckResult() == kOutOfBound): SkipEmptyFileForward
+    /// does not move on to the next file.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool FileIterOutOfBound() => _fileIter!.UpperBoundCheckResult == IterBoundCheck.OutOfBound;
 
     /// <summary>
     /// Drops the parked file iterator when it was configured differently (readahead), so that the next file
@@ -275,7 +293,7 @@ public sealed class LevelIterator : InternalIterator
     private bool SkipEmptyFileForward()
     {
         bool seenEmptyFile = false;
-        while (_fileIter is null || !_fileIter.Valid)
+        while (_fileIter is null || (!_fileIter.Valid && !FileIterOutOfBound()))
         {
             seenEmptyFile = true;
             // Move to next file
@@ -417,8 +435,9 @@ public sealed class LevelIterator : InternalIterator
     private InternalIterator NewFileIterator(int index, InternalIterator? reuse)
     {
         InternalIterator it = NewFileIteratorCore(index, reuse);
+        it.SetIterateUpperBound(_upper);
         // ReadOptions::readahead_size: explicit readahead instead of the automatic one.
-        if (_readOptions is { ReadaheadSize: > 0 } ro && it is TableInternalIterator t) t.SetUserReadahead(ro.ReadaheadSize);
+        if (_readOptions is { ReadaheadSize: > 0 } ro && it is TableInternalIterator t) t.SetUserReadahead(ro.ReadaheadSize, ro.AsyncIo);
         return it;
     }
 
@@ -486,7 +505,7 @@ public sealed class LevelIterator : InternalIterator
         ValueTask t = _fileIter!.NextAsync(cancellationToken);
         if (!t.IsCompletedSuccessfully) return NextSlowAsync(t, cancellationToken);
         t.GetAwaiter().GetResult();
-        if (_fileIter.Valid)
+        if (_fileIter.Valid || FileIterOutOfBound())
         {
             SampleRead(isSeek: false);
             return ValueTask.CompletedTask;
@@ -502,7 +521,7 @@ public sealed class LevelIterator : InternalIterator
     private async ValueTask NextSlowAsync(ValueTask pending, CancellationToken ct)
     {
         await pending.ConfigureAwait(false);
-        if (!_fileIter!.Valid) await AdvanceFileAsync(ct).ConfigureAwait(false);
+        if (!_fileIter!.Valid && !FileIterOutOfBound()) await AdvanceFileAsync(ct).ConfigureAwait(false);
         SampleRead(isSeek: false);
     }
 
@@ -541,7 +560,7 @@ public sealed class LevelIterator : InternalIterator
             InternalIterator it = _fileIter!;
             if (op == Op.Seek) await it.SeekAsync(target, ct).ConfigureAwait(false);
             else await it.SeekToFirstAsync(ct).ConfigureAwait(false);
-            if (it.Valid) return;
+            if (it.Valid || it.UpperBoundCheckResult == IterBoundCheck.OutOfBound) return;
             index++;
             op = Op.First;
             if (index >= _files.Length || FileStartsAtOrAfterUpperBound(index))

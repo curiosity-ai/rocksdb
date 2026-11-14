@@ -33,8 +33,21 @@ public abstract class InternalIterator : IDisposable
     public virtual ValueTask NextAsync(CancellationToken cancellationToken = default) { Next(); return default; }
     public virtual ValueTask PrevAsync(CancellationToken cancellationToken = default) { Prev(); return default; }
 
-    /// <summary>Upper-level hint for iterate_upper_bound checks (port of IsKeyPinned/UpperBoundCheckResult is optional).</summary>
-    public virtual bool MayBeOutOfUpperBound => true;
+    /// <summary>
+    /// Port of InternalIterator::UpperBoundCheckResult (table/internal_iterator.h): if the iterator has checked the
+    /// current key against iterate_upper_bound, the result, so that its user can skip its own check. While
+    /// <see cref="Valid"/>, <see cref="IterBoundCheck.Unknown"/> is always a correct answer; when not valid,
+    /// <see cref="IterBoundCheck.OutOfBound"/> says the iterator stopped at the upper bound (rather than at its end).
+    /// </summary>
+    public virtual IterBoundCheck UpperBoundCheckResult => IterBoundCheck.Unknown;
+
+    /// <summary>
+    /// Re-binds ReadOptions::iterate_upper_bound for iterators that check it themselves (block-based table iterators,
+    /// and the composites holding them), after the DB iterator's bounds were replaced. Upstream table iterators read the
+    /// bound through the DB iterator's ReadOptions, so a new bound reaches them at the next positioning call; this is
+    /// the same. Default: the iterator does not check the bound.
+    /// </summary>
+    internal virtual void SetIterateUpperBound(ReadOnlyMemory<byte>? upperBound) { }
 
     /// <summary>
     /// Port of InternalIterator::SetPinnedItersMgr: iterators that hold data blocks hand the blocks they leave to
@@ -85,4 +98,15 @@ public abstract class InternalIterator : IDisposable
         Dispose(true);
         GC.SuppressFinalize(this);
     }
+}
+
+/// <summary>Port of IterBoundCheck (table/internal_iterator.h).</summary>
+public enum IterBoundCheck : byte
+{
+    /// <summary>kUnknown: the iterator did not check the key against the upper bound.</summary>
+    Unknown,
+    /// <summary>kOutOfBound: the iterator stopped at the upper bound (it is not valid).</summary>
+    OutOfBound,
+    /// <summary>kInbound: the current key is below the upper bound.</summary>
+    Inbound,
 }

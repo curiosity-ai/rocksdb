@@ -209,8 +209,11 @@ internal sealed class BlobDirectWriteManager : IDisposable
     /// <summary>FinalizeBlobFile: footer, sync, close.</summary>
     private void Seal(OpenFile f)
     {
-        BlobLogFormat.EncodeFooter(_header, f.BlobCount, 0, 0);
-        Append(f.File, _header.AsSpan(0, BlobLogFormat.FooterSize));
+        // Sealed by flush threads (several at once, also of this column family) while the write leader may be writing a
+        // new file's header: the footer is encoded into a buffer of its own.
+        Span<byte> footer = stackalloc byte[BlobLogFormat.FooterSize];
+        BlobLogFormat.EncodeFooter(footer, f.BlobCount, 0, 0);
+        Append(f.File, footer);
         Sync(f.File);
         // BlobLogWriter::AppendFooter: checksum method/value from the writer (empty without a checksum factory).
         (byte[] checksum, string method) = FileChecksumHelper.GetChecksum(f.File);

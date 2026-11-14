@@ -58,6 +58,9 @@ public sealed class LruCache : BlockCache
     private readonly uint _shardMask;
     private long _capacity;
     private bool _strict;
+    // config_mutex_ (cache/sharded_cache.h): serializes SetCapacity / SetStrictCapacityLimit, so the cache-wide value
+    // and the shards' values always come from the same call. Readers read the single fields without it.
+    private readonly Lock _configLock = new();
     private readonly CacheMetadataChargePolicy _metadataChargePolicy;
 
     public LruCache(LruCacheOptions options)
@@ -101,15 +104,21 @@ public sealed class LruCache : BlockCache
     public override void SetCapacity(long capacity)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(capacity);
-        Volatile.Write(ref _capacity, capacity);
-        long perShard = PerShardCapacity(capacity, _shards.Length);
-        foreach (LruCacheShard s in _shards) s.SetCapacity(perShard);
+        lock (_configLock)
+        {
+            Volatile.Write(ref _capacity, capacity);
+            long perShard = PerShardCapacity(capacity, _shards.Length);
+            foreach (LruCacheShard s in _shards) s.SetCapacity(perShard);
+        }
     }
 
     public override void SetStrictCapacityLimit(bool strictCapacityLimit)
     {
-        Volatile.Write(ref _strict, strictCapacityLimit);
-        foreach (LruCacheShard s in _shards) s.SetStrictCapacityLimit(strictCapacityLimit);
+        lock (_configLock)
+        {
+            Volatile.Write(ref _strict, strictCapacityLimit);
+            foreach (LruCacheShard s in _shards) s.SetStrictCapacityLimit(strictCapacityLimit);
+        }
     }
 
     public void SetHighPriorityPoolRatio(double ratio)

@@ -6,7 +6,7 @@ namespace RocksDb.Managed.Tests.Features;
 
 /// <summary>
 /// Port of utilities/memory/memory_test.cc (MemoryUtil::GetApproximateMemoryUsageByType): SharedBlockCacheTotal and
-/// MemTableAndTableReadersTotal (adapted, see there), plus cache de-duplication and consistency with the DB properties.
+/// MemTableAndTableReadersTotal, plus cache de-duplication and consistency with the DB properties.
 /// </summary>
 [TestClass]
 public sealed class MemoryUtilTests
@@ -84,13 +84,11 @@ public sealed class MemoryUtilTests
     {
         MemoryFileSystem fs = NewFs();
         var dbs = new List<RocksDatabase>();
-        // Upstream gives each KV its own memtable and relies on min_write_buffer_number_to_merge = 10 to keep the
-        // immutable memtables unflushed; the managed port flushes an immutable memtable as soon as it exists, so here
-        // the write buffer holds all the KVs of the first phase instead (one growing memtable per column family).
+        // These key/value sizes ensure each KV has its own memtable. Note that the minimum write_buffer_size allowed is 64 KB.
         const int kKeySize = 100, kValueSize = 1 << 16;
         var cfo = new ColumnFamilyOptions
         {
-            WriteBufferSize = 4 << 20, MaxWriteBufferNumber = 10, MinWriteBufferNumberToMerge = 10, DisableAutoCompactions = true,
+            WriteBufferSize = kKeySize + kValueSize, MaxWriteBufferNumber = 10, MinWriteBufferNumberToMerge = 10, DisableAutoCompactions = true,
         };
         ColumnFamilyDescriptor[] cfDescs =
         [
