@@ -268,7 +268,11 @@ internal sealed class IteratorGraph : IDisposable
         if (options?.ReadTier != ReadTier.MemtableTier)
         {
             int numNonEmpty = s.NumNonEmptyLevels;
-            bool optimizeForHits = _cfd.Options.OptimizeFiltersForHits;
+            // Version::IsFilterSkipped(level) with is_file_last_in_level = false (version_set.cc AddIteratorsForLevel):
+            // only the last non-empty level > 0 skips its filters; L0 table iterators always pass skip_filters = false,
+            // and so does a tailing ForwardIterator for every level (forward_iterator.cc). The last-L0-file case is
+            // for Get / MultiGet only.
+            bool optimizeForHits = _cfd.Options.OptimizeFiltersForHits && options?.Tailing != true;
             for (int level = 0; level < s.NumLevels; level++)
             {
                 FileMetaData[] files = s.LevelFilesArray(level);
@@ -285,7 +289,6 @@ internal sealed class IteratorGraph : IDisposable
                     {
                         FileMetaData f = files[fi];
                         TableReadFlags readFlags = TableReadFlagsExtensions.FromReadOptions(options);
-                        if (optimizeForHits && fi == files.Length - 1 && numNonEmpty == 1) readFlags |= TableReadFlags.SkipFilters;
                         int slot = _l0Count;
                         InternalIterator? reuse = slot < _l0.Count ? _l0[slot] : null;
                         if (slot < _l0.Count) _l0[slot] = null;
