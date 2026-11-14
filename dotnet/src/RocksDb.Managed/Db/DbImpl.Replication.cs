@@ -578,6 +578,8 @@ internal sealed partial class DbImpl
                 break;
             }
         }
+        // Which step failed decides how the failure is classified (see the catch below).
+        FlushWalStage stage = FlushWalStage.WriteBuffer;
         try
         {
             LogWriter? log = _log;
@@ -588,8 +590,10 @@ internal sealed partial class DbImpl
                 if (sync)
                 {
                     // SyncWAL: every WAL in logs_, oldest first.
+                    stage = FlushWalStage.SyncWals;
                     if (_closedWalsToSync.Count > 0) SyncClosedWalsAsync(synchronous: true).GetAwaiter().GetResult();
                     log.Sync();
+                    stage = FlushWalStage.SyncWalDir;
                     SyncWalDirIfNeeded();
                 }
             }
@@ -598,8 +602,10 @@ internal sealed partial class DbImpl
                 await log.WriteBufferAsync(CancellationToken.None).ConfigureAwait(false);
                 if (sync)
                 {
+                    stage = FlushWalStage.SyncWals;
                     if (_closedWalsToSync.Count > 0) await SyncClosedWalsAsync(synchronous: false).ConfigureAwait(false);
                     await log.SyncAsync(CancellationToken.None).ConfigureAwait(false);
+                    stage = FlushWalStage.SyncWalDir;
                     SyncWalDirIfNeeded();
                 }
             }
@@ -611,8 +617,18 @@ internal sealed partial class DbImpl
         }
         catch (Exception e) when (e is not OperationCanceledException && e is not RocksDbException { Code: StatusCode.NotSupported })
         {
-            // DBImpl::FlushWAL / SyncWAL: WALIOStatusCheck.
-            if (WalErrorStopsWrites(e)) SetBackgroundError(e, BackgroundErrorReason.WriteCallback, walRelated: true);
+            switch (stage)
+            {
+                case FlushWalStage.WriteBuffer:
+                    // DBImpl::FlushWAL: a failed WriteBuffer goes through WALIOStatusCheck.
+                    if (WalErrorStopsWrites(e)) SetBackgroundError(e, BackgroundErrorReason.WriteCallback, walRelated: true);
+                    break;
+                case FlushWalStage.SyncWals:
+                    // DBImpl::SyncWalImpl: WALIOStatusCheck unless the sync only saw its writer's previous error.
+                    OnWalSyncFailed(e);
+                    break;
+                // FlushWalStage.SyncWalDir: SyncWalImpl returns a failed WAL directory fsync without classifying it.
+            }
             throw;
         }
         finally
@@ -621,6 +637,17 @@ internal sealed partial class DbImpl
             if (w is not null) ExitUnbatched(w, synchronous);
         }
     }
+}
+
+/// <summary>The step of <see cref="DbImpl.FlushWalAsync(bool, bool, HashSet{ulong}?, CancellationToken)"/> that failed.</summary>
+internal enum FlushWalStage : byte
+{
+    /// <summary>Pushing the current WAL's buffer to the file (FlushWAL's WriteBuffer).</summary>
+    WriteBuffer,
+    /// <summary>Syncing the closed WALs and the current one (SyncWalImpl's WAL syncs).</summary>
+    SyncWals,
+    /// <summary>Syncing the WAL directory (SyncWalImpl's need_wal_dir_sync).</summary>
+    SyncWalDir,
 }
 
 internal static class FileSystemReplicationExtensions

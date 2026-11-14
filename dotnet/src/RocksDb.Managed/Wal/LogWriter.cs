@@ -439,7 +439,7 @@ public sealed class LogWriter : IDisposable, IAsyncDisposable
 
     private void ThrowIfSeenError()
     {
-        if (_seenError) throw new RocksDbException(StatusCode.IOError, "IO error: Writer has previous error.");
+        if (_seenError) throw new RocksDbException(StatusCode.IOError, "IO error: Writer has previous error.") { WriterHasPreviousError = true };
     }
 
     /// <summary>Pushes buffered data to the OS (<c>Writer::WriteBuffer</c>).</summary>

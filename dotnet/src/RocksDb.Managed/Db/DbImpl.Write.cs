@@ -863,6 +863,19 @@ internal sealed partial class DbImpl
         return false;
     }
 
+    /// <summary>
+    /// The error handling of a failed WAL sync in DBImpl::SyncWalImpl (SyncWAL / FlushWAL(sync) and SyncClosedWals):
+    /// WALIOStatusCheck, except for a sync that only saw its writer's previous error with paranoid_checks. That status
+    /// lost the original failure's scope and retryable flag, and the operation that first saw the failure has already
+    /// classified it; classifying it again would turn a recoverable error into a fatal one. Not used for the WAL
+    /// directory fsync, whose failure SyncWalImpl returns without classifying it.
+    /// </summary>
+    private void OnWalSyncFailed(Exception e)
+    {
+        if (e is RocksDbException { WriterHasPreviousError: true } && Options.ParanoidChecks) return;
+        if (WalErrorStopsWrites(e)) SetBackgroundError(e, BackgroundErrorReason.WriteCallback, walRelated: true);
+    }
+
     // wal_context.prev_size / LogWriterNumber::attempt_truncate_size (db_impl.h). Written by the write leader (the
     // truncate size also by the writer of a parallel group that finishes last, while the group holds leadership); the
     // truncate size is read when the DB closes (no writer is active then).
@@ -1247,6 +1260,7 @@ internal sealed partial class DbImpl
             // like a deletion) or it is still open (IsWalInLogs).
             if (Options.RecycleLogFileNum > 0) recycleLogNumber = PickRecycledWal();
             newLogNumber = Versions.NewFileNumber();
+            bool closedWalSync = false;
             try
             {
                 LogWriter? old = _log;
@@ -1290,10 +1304,21 @@ internal sealed partial class DbImpl
                     // (FlushMemTableToOutputFile -> SyncClosedWals) so that a flushed SST never holds data of write
                     // batches whose updates to other column families are not durable. The port syncs the closed WAL
                     // here instead, right before its memtable can be flushed (at least as durable as upstream).
-                    // Earlier closed WALs still waiting for a sync go first.
-                    if (_closedWalsToSync.Count > 0) await SyncClosedWalsAsync(synchronous).ConfigureAwait(false);
-                    if (synchronous) old.Sync();
-                    else await old.SyncAsync(CancellationToken.None).ConfigureAwait(false);
+                    // Earlier closed WALs still waiting for a sync go first. A failure is handled as upstream handles a
+                    // failed SyncClosedWals in the flush job (see the catch below), not as a failed memtable switch.
+                    closedWalSync = true;
+                    try
+                    {
+                        if (_closedWalsToSync.Count > 0) await SyncClosedWalsAsync(synchronous).ConfigureAwait(false);
+                        if (synchronous) old.Sync();
+                        else await old.SyncAsync(CancellationToken.None).ConfigureAwait(false);
+                    }
+                    catch (Exception e) when (e is not OutOfMemoryException)
+                    {
+                        // SyncWalImpl: WALIOStatusCheck for the WAL syncs (not for the directory fsync below).
+                        OnWalSyncFailed(e);
+                        throw;
+                    }
                     // SyncWalImpl (via SyncClosedWals) also fsyncs the WAL directory when it was not synced since the
                     // closed WAL was created (need_wal_dir_sync = !wal_dir_synced_): a synced WAL whose directory entry
                     // can vanish is not durable. With a separate wal_dir the flush's DB directory fsync does not cover it.
@@ -1305,14 +1330,28 @@ internal sealed partial class DbImpl
             }
             catch (Exception e)
             {
-                // SwitchMemtable: a failure to create the new WAL or to make the old one durable stops writes (bg error).
                 if (newLog is not null)
                 {
                     try { newLog.Dispose(); }
                     catch (Exception de) when (de is IOException or RocksDbException) { }
                     TryDeleteFile(FileNames.LogFileName(WalDir, newLogNumber));
                 }
-                SetBackgroundError(e, BackgroundErrorReason.MemTable, walRelated: true);
+                if (closedWalSync)
+                {
+                    // FlushMemTableToOutputFile / AtomicFlushMemTablesToOutputFiles: a failed SyncClosedWals is a flush
+                    // error, SetBGError(log_io_s, kFlush), or kFlushNoWAL in the atomic flush when wals_total_size_ is 0.
+                    // With NoSpace or a retryable error this is a recoverable hard error, not a fatal one.
+                    BackgroundErrorReason flushReason = Options.AtomicFlush && Volatile.Read(ref _walsTotalSize) == 0
+                        ? BackgroundErrorReason.FlushNoWal
+                        : BackgroundErrorReason.Flush;
+                    SetBackgroundError(e, flushReason, walRelated: false);
+                }
+                else
+                {
+                    // SwitchMemtable: a failure to create the new WAL or to write out the old one's buffer stops writes
+                    // (SetBGError(s, kMemTable)).
+                    SetBackgroundError(e, BackgroundErrorReason.MemTable, walRelated: true);
+                }
                 throw;
             }
         }

@@ -235,9 +235,15 @@ internal sealed class Worker
         }
     }
 
+    /// <summary>
+    /// Resume after the I/O error window: up to 20 failed attempts, 200 ms apart. While an automatic recovery runs
+    /// (Busy) the attempt is not counted and Resume is retried for up to 60 s, so that a slow recovery is not reported
+    /// as a failure to resume (the supervisor fails the cycle when retryable or NoSpace errors never resume).
+    /// </summary>
     private void TryResume()
     {
-        for (int i = 0; i < 20; i++)
+        var busy = Stopwatch.StartNew();
+        for (int failed = 0; failed < 20;)
         {
             try
             {
@@ -245,9 +251,14 @@ internal sealed class Worker
                 Log("RESUME ok");
                 return;
             }
+            catch (RocksDbException e) when (e.Code == StatusCode.Busy && busy.Elapsed < TimeSpan.FromSeconds(60))
+            {
+                Thread.Sleep(200);
+            }
             catch (Exception e)
             {
                 Log("RESUME failed: " + e.Message);
+                failed++;
                 Thread.Sleep(200);
             }
         }
