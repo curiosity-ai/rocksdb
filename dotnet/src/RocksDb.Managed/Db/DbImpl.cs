@@ -144,14 +144,17 @@ internal sealed partial class DbImpl : IAsyncDisposable
 
     /// <summary>
     /// The DB-wide default block cache (HyperClock, 32 MiB) used by column families that don't configure their own;
-    /// created lazily and shared so that all column families compete for one budget.
+    /// created lazily and shared so that all column families compete for one budget. Like
+    /// BlockBasedTableFactory::InitializeOptions (table/block_based/block_based_table_factory.cc), it is
+    /// HyperClockCacheOptions(32 MiB) with its defaults: estimated_entry_charge = 0, the automatically resizing table
+    /// (AutoHyperClockTable), which starts with one page of slots instead of charging a table sized for the capacity.
     /// </summary>
     internal Cache.BlockCache? GetDefaultBlockCache(BlockBasedTableOptions tableOptions)
     {
         if (tableOptions.NoBlockCache || tableOptions.BlockCache is not null) return null;
         lock (_defaultBlockCacheLock)
         {
-            return _defaultBlockCache ??= Cache.BlockCache.CreateDefault(DefaultBlockCacheCapacity, (int)Math.Min(tableOptions.BlockSize, int.MaxValue));
+            return _defaultBlockCache ??= Cache.BlockCache.CreateHyperClock(new Cache.HyperClockCacheOptions { Capacity = DefaultBlockCacheCapacity });
         }
     }
 
