@@ -365,7 +365,9 @@ internal sealed class IndexCursor
 /// Two-level iterator over a block-based table: index → data blocks. Port of BlockBasedTableIterator
 /// (table/block_based/block_based_table_iterator.cc), including its iterate_upper_bound checks
 /// (<see cref="SetUpperBound"/>: a data block entirely past the bound is not read, and the iterator reports
-/// <see cref="UpperBoundCheckResult"/>). With prefix options
+/// <see cref="UpperBoundCheckResult"/>) and ReadOptions::auto_readahead_size (<see cref="SetReadaheadOptions"/>: a
+/// forward scan's readahead buffer is trimmed to the blocks within the bound / the seek key's prefix that are not
+/// cached). With prefix options
 /// (<see cref="TableIteratorPrefixOptions.CheckFilter"/>), Seek and SeekForPrev first consult the prefix filter
 /// (CheckPrefixMayMatch) and leave the iterator invalid without reading any data block when it excludes the prefix.
 /// <para>
@@ -374,7 +376,7 @@ internal sealed class IndexCursor
 /// file (cache hits complete synchronously). Not thread-safe; dispose to release the current block.
 /// </para>
 /// </summary>
-public sealed class BlockBasedTableIterator : IDisposable
+public sealed class BlockBasedTableIterator : IDisposable, Env.IReadaheadSizeCallback
 {
     private BlockBasedTableReader _reader;
     private readonly IndexCursor _index = new();
@@ -442,6 +444,38 @@ public sealed class BlockBasedTableIterator : IDisposable
     private byte _seekStat;
     /// <summary>The iterator reads a compaction input (lookup_context_.caller == kCompaction): no seek tickers.</summary>
     private bool _forCompaction;
+
+    // ReadOptions::auto_readahead_size (block_based_table_iterator.h "APIs relevant to auto tuning of readahead_size"):
+    // read_options_.auto_readahead_size / prefix_same_as_start, prefix_extractor_, readahead_cache_lookup_,
+    // is_index_out_of_bound_, is_index_at_curr_block_, direction_ (kBackward disables the lookup until the next file),
+    // block_handles_ (a ring buffer, power-of-two capacity) and seek_key_prefix_for_readahead_trimming_.
+    private bool _autoReadaheadSize;
+    private bool _prefixSameAsStart;
+    private SliceTransform? _prefixExtractor;
+    private bool _readaheadCacheLookup;
+    private bool _isIndexOutOfBound;
+    private bool _isIndexAtCurrBlock = true;
+    private bool _backward;
+    /// <summary>The readahead buffer's callback was bound (CreateFilePrefetchBufferIfNotExists runs once per file).</summary>
+    private bool _readaheadCallbackBound;
+    private BlockHandleInfo[] _blockHandles = [];
+    private int _blockHandlesHead;
+    private int _blockHandlesCount;
+    private byte[] _seekKeyPrefix = [];
+    private int _seekKeyPrefixLength;
+    /// <summary>The current key, copied for the index reseek of <see cref="PrevAsync"/>.</summary>
+    private byte[] _reseekKey = [];
+
+    /// <summary>
+    /// BlockHandleInfo: a data block the readahead lookup passed, with its block cache entry pinned when it was cached
+    /// (moved to the iterator when the block becomes current).
+    /// </summary>
+    private struct BlockHandleInfo
+    {
+        public BlockHandle Handle;
+        public BlockRef Entry;
+        public bool IsCacheHit;
+    }
 
     internal BlockBasedTableIterator(BlockBasedTableReader reader, TableReadFlags flags, in TableIteratorPrefixOptions prefixOptions)
     {
@@ -530,7 +564,8 @@ public sealed class BlockBasedTableIterator : IDisposable
     /// </summary>
     private void CheckDataBlockWithinUpperBound()
     {
-        if (!_hasUpperBound || _block.IsEmpty) return;
+        // The readahead lookup may have moved the index past the current block (IsIndexAtCurr()).
+        if (!_isIndexAtCurrBlock || !_hasUpperBound || _block.IsEmpty) return;
         _blockUpperBoundCheck = CompareUpperBound(_index.UserKey) > 0 ? BlockUpperBound.BeyondCurBlock : BlockUpperBound.InCurBlock;
     }
 
@@ -544,19 +579,6 @@ public sealed class BlockBasedTableIterator : IDisposable
         return _tsSize == 0
             ? _icmp.CompareUserKey(_upperBound.Span, userKey)
             : _icmp.UserComparator.CompareWithoutTimestamp(_upperBound.Span, false, userKey, true);
-    }
-
-    /// <summary>
-    /// FindBlockForward's next_block_is_out_of_bound: the bound lies in the block just finished, so the next block is not
-    /// read. Unless the block was the file's last one (its index key can be larger than the smallest key of the next
-    /// file of the level), the iterator stops out of bound.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private void StopBeforeNextBlock()
-    {
-        ReleaseBlock();
-        _index.Next();
-        _isOutOfBound = _index.Valid;
     }
 
     /// <summary>Current internal key.</summary>
@@ -596,9 +618,11 @@ public sealed class BlockBasedTableIterator : IDisposable
 
     public void SeekToFirst()
     {
-        _seekStat = 0;
-        _isOutOfBound = false;
+        // No seek key, so no prefix to trim the readahead against.
+        _seekKeyPrefixLength = 0;
+        BeginForwardSeek();
         _index.SeekToFirst();
+        _isIndexAtCurrBlock = true;
         if (!LoadCurrentBlock()) return;
         _data.SeekToFirst();
         FindKeyForward();
@@ -607,9 +631,9 @@ public sealed class BlockBasedTableIterator : IDisposable
 
     public void SeekToLast()
     {
-        _seekStat = 0;
-        _isOutOfBound = false;
+        BeginBackwardSeek();
         _index.SeekToLast();
+        _isIndexAtCurrBlock = true;
         if (!LoadCurrentBlock()) return;
         _data.SeekToLast();
         FindKeyBackward();
@@ -618,14 +642,15 @@ public sealed class BlockBasedTableIterator : IDisposable
     /// <summary>Positions at the first entry with internal key &gt;= <paramref name="target"/>.</summary>
     public void Seek(ReadOnlySpan<byte> target)
     {
-        _seekStat = 0;
-        _isOutOfBound = false;
+        SetSeekKeyPrefix(target);
+        BeginForwardSeek();
         if (_prefix.CheckFilter && !CheckPrefixMayMatch(target, backward: false))
         {
             ReleaseBlock();
             return;
         }
         _index.Seek(target);
+        _isIndexAtCurrBlock = true;
         if (!LoadCurrentBlock()) return;
         _data.Seek(target);
         FindKeyForward();
@@ -635,14 +660,14 @@ public sealed class BlockBasedTableIterator : IDisposable
     /// <summary>Positions at the last entry with internal key &lt;= <paramref name="target"/>.</summary>
     public void SeekForPrev(ReadOnlySpan<byte> target)
     {
-        _seekStat = 0;
-        _isOutOfBound = false;
+        BeginBackwardSeek();
         if (_prefix.CheckFilter && !CheckPrefixMayMatch(target, backward: true))
         {
             ReleaseBlock();
             return;
         }
         _index.Seek(target);
+        _isIndexAtCurrBlock = true;
         if (!_index.Valid) _index.SeekToLast();
         if (!LoadCurrentBlock()) return;
         _data.SeekForPrev(target);
@@ -661,6 +686,20 @@ public sealed class BlockBasedTableIterator : IDisposable
     public void Prev()
     {
         System.Diagnostics.Debug.Assert(Valid);
+        if (_readaheadCacheLookup && !_isIndexAtCurrBlock)
+        {
+            // The readahead lookup moved the index forward: reseek it to the current block with the current key.
+            ResetBlockCacheLookupVar();
+            _backward = true;
+            _index.Seek(_data.Key);
+            _isIndexAtCurrBlock = true;
+            if (!_index.Valid)
+            {
+                ReleaseBlock();
+                return;
+            }
+        }
+        ResetBlockCacheLookupVar();
         _data.Prev();
         FindKeyBackward();
     }
@@ -668,18 +707,55 @@ public sealed class BlockBasedTableIterator : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void FindKeyForward()
     {
-        while (!_data.Valid)
+        if (!_data.Valid) FindBlockForward();
+    }
+
+    /// <summary>
+    /// Port of FindBlockForward: moves to the next data block that has a key. With the readahead lookup, the next block
+    /// is the next queued handle, or the one the index already points to once the queue is empty. A block is not read
+    /// when the bound lies in the block just finished (next_block_is_out_of_bound) or the lookup found the next block
+    /// past the bound / the seek key's prefix (is_index_out_of_bound_): then, unless the finished block was the file's
+    /// last (its index key can be larger than the smallest key of the next file of the level), the iterator stops out of
+    /// bound.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void FindBlockForward()
+    {
+        do
         {
-            // FindBlockForward: next_block_is_out_of_bound (the state is kUnknown without a bound or a current block).
-            if (_blockUpperBoundCheck == BlockUpperBound.InCurBlock)
+            // block_upper_bound_check_ is kUnknown without a bound or a current block.
+            bool nextBlockIsOutOfBound = _isIndexAtCurrBlock && _blockUpperBoundCheck == BlockUpperBound.InCurBlock;
+            ReleaseBlock();
+            // Advance to the next block handle, making it current.
+            if (_blockHandlesCount != 0) PopFrontBlockHandle();
+            if (_blockHandlesCount == 0)
             {
-                StopBeforeNextBlock();
-                return;
+                // Without queued handles, the index is moved unless the lookup already left it on the next block; the
+                // last block the lookup reached may be out of bound, which is decided here.
+                if (_isIndexAtCurrBlock || _isIndexOutOfBound)
+                {
+                    _index.Next();
+                    if (_isIndexOutOfBound)
+                    {
+                        nextBlockIsOutOfBound = true;
+                        _isIndexOutOfBound = false;
+                    }
+                }
+                else
+                {
+                    _isIndexAtCurrBlock = true;
+                }
+                if (nextBlockIsOutOfBound)
+                {
+                    _isOutOfBound = _index.Valid;
+                    return;
+                }
+                if (!_index.Valid) return;
             }
-            _index.Next();
-            if (!LoadCurrentBlock()) return;
+            LoadCurrentBlock();
             _data.SeekToFirst();
         }
+        while (!_data.Valid);
     }
 
     private void FindKeyBackward()
@@ -692,16 +768,28 @@ public sealed class BlockBasedTableIterator : IDisposable
         }
     }
 
-    /// <summary>Loads the data block at the index position (keeps the current one if unchanged). False when the index is exhausted.</summary>
+    /// <summary>
+    /// Port of InitDataBlock: loads the data block at the index position, or the first queued handle of the readahead
+    /// lookup (from its pinned cache entry, or read without a second cache lookup), keeping the current one if unchanged.
+    /// False when the index is exhausted.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private bool LoadCurrentBlock()
     {
-        if (!_index.Valid)
+        BlockHandle h;
+        if (_blockHandlesCount != 0)
         {
-            ReleaseBlock();
-            return false;
+            h = _blockHandles[_blockHandlesHead].Handle;
         }
-        BlockHandle h = _index.Handle;
+        else
+        {
+            if (!_index.Valid)
+            {
+                ReleaseBlock();
+                return false;
+            }
+            h = _index.Handle;
+        }
         if (!_block.IsEmpty && h == _blockHandle)
         {
             // A reseek into the current block: the bound may have changed (SeekImpl's same_block case).
@@ -709,8 +797,31 @@ public sealed class BlockBasedTableIterator : IDisposable
             return true;
         }
         ReleaseBlock();
+        if (_blockHandlesCount != 0)
+        {
+            LoadQueuedBlock(h);
+            return true;
+        }
         SetBlock(_reader.GetBlockRef(h, BlockKind.Data, _flags, PrefetchIfNeeded(h)), h);
         return true;
+    }
+
+    /// <summary>
+    /// InitDataBlock for the first queued handle: a cached block from the entry the lookup pinned, otherwise read
+    /// (through the readahead buffer) with use_block_cache_for_lookup = false, its miss having been counted by the lookup.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void LoadQueuedBlock(BlockHandle h)
+    {
+        ref BlockHandleInfo front = ref _blockHandles[_blockHandlesHead];
+        if (front.IsCacheHit)
+        {
+            BlockRef entry = front.Entry;
+            front.Entry = default;
+            SetBlock(entry, h);
+            return;
+        }
+        SetBlock(_reader.GetDataBlockRefWithoutCacheLookup(h, _flags, PrefetchIfNeeded(h)), h);
     }
 
     /// <summary>
@@ -729,8 +840,10 @@ public sealed class BlockBasedTableIterator : IDisposable
         if (_readaheadMode != ReadaheadMode.Auto)
         {
             if (_readaheadMode == ReadaheadMode.Compaction) return PrefetchForCompaction(h);
+            if (_prefetch is null) return null;
+            BindReadaheadCallback(_prefetch);
             // FilePrefetchBuffer::TryReadFromCache: a block before the buffered range is read from the file directly.
-            return _prefetch is null || _prefetch.IsBeforeBuffer((long)h.Offset) ? null : _prefetch;
+            return _prefetch.IsBeforeBuffer((long)h.Offset) ? null : _prefetch;
         }
         TableReaderOptions o = _reader.Options;
         long max = o.MaxAutoReadaheadSize;
@@ -781,7 +894,268 @@ public sealed class BlockBasedTableIterator : IDisposable
         else _prefetch.ResetReadahead();
         _prefetch.Reset(_reader.File);
         _autoPrefetching = true;
+        BindReadaheadCallback(_prefetch);
         return _prefetch;
+    }
+
+    /// <summary>
+    /// The readaheadsize_cb_ BlockPrefetcher hands to the buffer it creates for a user scan
+    /// (CreateFilePrefetchBufferIfNotExists, once per table iterator): this iterator's
+    /// <see cref="Env.IReadaheadSizeCallback.TuneReadaheadSize"/> when readahead_cache_lookup_ is set at that point,
+    /// else none.
+    /// </summary>
+    private void BindReadaheadCallback(Env.AsyncPrefetchBuffer prefetch)
+    {
+        if (_readaheadCallbackBound) return;
+        _readaheadCallbackBound = true;
+        prefetch.ReadaheadSizeCallback = _readaheadCacheLookup ? this : null;
+        prefetch.Statistics = _reader.DbStatistics;
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ReadOptions::auto_readahead_size: BlockCacheLookupForReadAheadSize and its state.
+
+    /// <summary>
+    /// ReadOptions::auto_readahead_size and prefix_same_as_start, and the column family's prefix extractor (from
+    /// <paramref name="readOptions"/>; null: the defaults, which never trim without a bound or prefix_same_as_start).
+    /// Honoured from the next forward seek.
+    /// </summary>
+    internal void SetReadaheadOptions(ReadOptions? readOptions, SliceTransform? prefixExtractor)
+    {
+        _autoReadaheadSize = readOptions?.AutoReadaheadSize ?? true;
+        _prefixSameAsStart = readOptions?.PrefixSameAsStart == true;
+        _prefixExtractor = prefixExtractor;
+    }
+
+    /// <summary>
+    /// The start of SeekImpl's first pass: forgets the current block when the readahead lookup moved the index past it
+    /// (SavePrevIndexValue only records it with IsIndexAtCurr(), the lookup resets prev_block_offset_), resets the lookup
+    /// and enables it for a forward scan with a block cache and iterate_upper_bound or prefix_same_as_start
+    /// (autotune_readaheadsize).
+    /// </summary>
+    private void BeginForwardSeek()
+    {
+        if (!_isIndexAtCurrBlock) _blockHandle = default;
+        ResetBlockCacheLookupVar();
+        if (_autoReadaheadSize && (_hasUpperBound || _prefixSameAsStart) && !_backward && _reader.HasBlockCache) _readaheadCacheLookup = true;
+        _seekStat = 0;
+        _isOutOfBound = false;
+    }
+
+    /// <summary>SeekForPrev / SeekToLast: direction_ = kBackward, which keeps the lookup disabled for this file.</summary>
+    private void BeginBackwardSeek()
+    {
+        _backward = true;
+        if (!_isIndexAtCurrBlock) _blockHandle = default;
+        ResetBlockCacheLookupVar();
+        _seekStat = 0;
+        _isOutOfBound = false;
+    }
+
+    /// <summary>
+    /// SeekImpl: under prefix_same_as_start, the prefix of the seek key (empty when out of the extractor's domain) the
+    /// readahead is trimmed to; without an extractor or prefix_same_as_start the previous one stays (unused then).
+    /// </summary>
+    private void SetSeekKeyPrefix(ReadOnlySpan<byte> target)
+    {
+        if (_prefixExtractor is null || !_prefixSameAsStart) return;
+        SetSeekKeyPrefixSlow(target);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void SetSeekKeyPrefixSlow(ReadOnlySpan<byte> target)
+    {
+        ReadOnlySpan<byte> userKey = Db.DbFormat.ExtractUserKey(target);
+        if (!_prefixExtractor!.InDomain(userKey))
+        {
+            _seekKeyPrefixLength = 0;
+            return;
+        }
+        ReadOnlySpan<byte> prefix = _prefixExtractor.Transform(userKey);
+        if (_seekKeyPrefix.Length < prefix.Length) _seekKeyPrefix = new byte[Math.Max(prefix.Length, 16)];
+        prefix.CopyTo(_seekKeyPrefix);
+        _seekKeyPrefixLength = prefix.Length;
+    }
+
+    /// <summary>Port of ResetBlockCacheLookupVar.</summary>
+    private void ResetBlockCacheLookupVar()
+    {
+        _isIndexOutOfBound = false;
+        _readaheadCacheLookup = false;
+        if (_blockHandlesCount != 0) ClearBlockHandles();
+    }
+
+    /// <summary>ClearBlockHandles: drops the queued handles, unpinning the cache entries the lookup pinned.</summary>
+    private void ClearBlockHandles()
+    {
+        BlockHandleInfo[] q = _blockHandles;
+        int mask = q.Length - 1;
+        for (int i = 0; i < _blockHandlesCount; i++)
+        {
+            ref BlockHandleInfo e = ref q[(_blockHandlesHead + i) & mask];
+            if (!e.Entry.IsEmpty) e.Entry.Release();
+            e = default;
+        }
+        _blockHandlesHead = 0;
+        _blockHandlesCount = 0;
+    }
+
+    private void PopFrontBlockHandle()
+    {
+        ref BlockHandleInfo e = ref _blockHandles[_blockHandlesHead];
+        if (!e.Entry.IsEmpty) e.Entry.Release();
+        e = default;
+        _blockHandlesHead = (_blockHandlesHead + 1) & (_blockHandles.Length - 1);
+        _blockHandlesCount--;
+    }
+
+    private void PushBackBlockHandle(BlockHandle handle, BlockRef entry, bool isCacheHit)
+    {
+        if (_blockHandlesCount == _blockHandles.Length) GrowBlockHandles();
+        ref BlockHandleInfo e = ref _blockHandles[(_blockHandlesHead + _blockHandlesCount) & (_blockHandles.Length - 1)];
+        e.Handle = handle;
+        e.Entry = entry;
+        e.IsCacheHit = isCacheHit;
+        _blockHandlesCount++;
+    }
+
+    private void GrowBlockHandles()
+    {
+        BlockHandleInfo[] old = _blockHandles;
+        var q = new BlockHandleInfo[Math.Max(16, old.Length * 2)];
+        for (int i = 0; i < _blockHandlesCount; i++) q[i] = old[(_blockHandlesHead + i) & (old.Length - 1)];
+        _blockHandles = q;
+        _blockHandlesHead = 0;
+    }
+
+    /// <summary>The <paramref name="fromBack"/>-th queued handle counted from the back (0: the last one).</summary>
+    private ref BlockHandleInfo QueuedFromBack(int fromBack) =>
+        ref _blockHandles[(_blockHandlesHead + _blockHandlesCount - 1 - fromBack) & (_blockHandles.Length - 1)];
+
+    /// <summary>
+    /// Port of IsNextBlockOutOfReadaheadBound: the index key of the block the index points to is at or past
+    /// iterate_upper_bound, or (prefix_same_as_start) has another prefix than the seek key (or, out of the extractor's
+    /// domain, sorts after it), so no key of the following blocks is in the scan.
+    /// </summary>
+    private bool IsNextBlockOutOfReadaheadBound()
+    {
+        ReadOnlySpan<byte> indexUserKey = _index.UserKey;
+        if (_hasUpperBound && CompareUpperBound(indexUserKey) <= 0) return true;
+        if (_prefixSameAsStart && _seekKeyPrefixLength != 0)
+        {
+            ReadOnlySpan<byte> seekPrefix = _seekKeyPrefix.AsSpan(0, _seekKeyPrefixLength);
+            return _prefixExtractor!.InDomain(indexUserKey)
+                ? !_prefixExtractor.Transform(indexUserKey).SequenceEqual(seekPrefix)
+                : _icmp.UserComparator.CompareWithoutTimestamp(indexUserKey, true, seekPrefix, false) > 0;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Port of BlockCacheLookupForReadAheadSize (block_based_table_iterator.cc:857), the readahead buffer's
+    /// readaheadsize_cb_: looks the data blocks of [<paramref name="startOffset"/>, <paramref name="endOffset"/>) up in
+    /// the block cache, from the index position on, queueing every handle (cached ones with their entry pinned), and
+    /// stops at the first block whose index key is out of the bound / prefix (is_index_out_of_bound_). The window is
+    /// then trimmed to the first and last block that missed the cache. The index is left after the last queued block
+    /// (is_index_at_curr_block_ = false), so it does not follow the current block until the queue is consumed.
+    /// </summary>
+    void Env.IReadaheadSizeCallback.TuneReadaheadSize(bool readCurrBlock, ref long startOffset, ref long endOffset)
+    {
+        // readahead_cache_lookup_ is false after a backward operation.
+        if (!_readaheadCacheLookup) return;
+        // The lookup may have moved the index to the end of the file while the current block is still consumed.
+        if (!_index.Valid) return;
+        const int footer = BlockBasedTableConstants.BlockTrailerSize;
+        if (readCurrBlock && _blockHandlesCount == 0 && IsNextBlockOutOfReadaheadBound())
+        {
+            BlockHandle cur = _index.Handle;
+            endOffset = (long)(cur.Offset + cur.Size) + footer;
+            return;
+        }
+        long startUpdatedOffset = startOffset;
+        long endUpdatedOffset = startUpdatedOffset;
+        bool foundFirstMissBlock = false;
+        int prevHandlesSize = _blockHandlesCount;
+
+        // InitializeStartAndEndOffsets.
+        if (readCurrBlock)
+        {
+            if (_blockHandlesCount == 0)
+            {
+                // Scenario 1: the block the caller misses and reads is the index's; it is queued without a lookup.
+                BlockHandle cur = _index.Handle;
+                endUpdatedOffset = (long)(cur.Offset + cur.Size) + footer;
+                PushBackBlockHandle(cur, default, isCacheHit: false);
+                _index.Next();
+                _isIndexAtCurrBlock = false;
+                foundFirstMissBlock = true;
+            }
+            else
+            {
+                // Scenario 2: the queued handles are read again (a failed or dropped read of the second buffer).
+                foundFirstMissBlock = true;
+                prevHandlesSize = 0;
+                BlockHandle front = _blockHandles[_blockHandlesHead].Handle;
+                BlockHandle back = QueuedFromBack(0).Handle;
+                startUpdatedOffset = (long)front.Offset;
+                endUpdatedOffset = (long)(back.Offset + back.Size) + footer;
+            }
+        }
+        else if (_blockHandlesCount != 0)
+        {
+            // Scenario 3: a prefetch into the second buffer continues after the queued handles.
+            BlockHandle back = QueuedFromBack(0).Handle;
+            startUpdatedOffset = (long)(back.Offset + back.Size) + footer;
+            endUpdatedOffset = startUpdatedOffset;
+        }
+        else
+        {
+            // Scenario 4: a prefetch with no queued handle (a reseek served from the block cache): from the index on.
+            startUpdatedOffset = (long)_index.Handle.Offset;
+            endUpdatedOffset = startUpdatedOffset;
+        }
+
+        while (_index.Valid && !_isIndexOutOfBound)
+        {
+            BlockHandle h = _index.Handle;
+            // The block would exceed the window. The window can be smaller than one block when the readahead was trimmed
+            // to the bound: the block is then read rather than skipped.
+            if (startUpdatedOffset != endUpdatedOffset && endUpdatedOffset + (long)h.Size + footer > endOffset) break;
+            endUpdatedOffset += footer + (long)h.Size;
+            bool hit = _reader.LookupAndPinDataBlockInCache(h, out BlockRef entry);
+            if (!foundFirstMissBlock && !hit)
+            {
+                foundFirstMissBlock = true;
+                startUpdatedOffset = (long)h.Offset;
+            }
+            PushBackBlockHandle(h, entry, hit);
+            // The current block's keys may be in bound, but if its index key is at or past the bound, the next one's are not.
+            if (IsNextBlockOutOfReadaheadBound())
+            {
+                _isIndexOutOfBound = true;
+                break;
+            }
+            _index.Next();
+            _isIndexAtCurrBlock = false;
+        }
+
+        if (foundFirstMissBlock)
+        {
+            // Trim the end to the last block that missed, skipping the cached ones after it.
+            int added = _blockHandlesCount - prevHandlesSize;
+            int k = 0;
+            while (k < added - 1 && QueuedFromBack(k).IsCacheHit && startUpdatedOffset != (long)QueuedFromBack(k).Handle.Offset) k++;
+            BlockHandle last = QueuedFromBack(k).Handle;
+            endUpdatedOffset = (long)(last.Offset + last.Size) + footer;
+        }
+        else
+        {
+            // Nothing to read: every block in the window is cached, or the bound was reached.
+            endUpdatedOffset = startUpdatedOffset;
+        }
+        endOffset = endUpdatedOffset;
+        startOffset = startUpdatedOffset;
+        // ResetPreviousBlockOffset: a reseek forgets the current block while the index is not at it (BeginForwardSeek).
     }
 
     /// <summary>
@@ -868,20 +1242,22 @@ public sealed class BlockBasedTableIterator : IDisposable
 
     public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default)
     {
-        _seekStat = 0;
-        _isOutOfBound = false;
+        _seekKeyPrefixLength = 0;
+        BeginForwardSeek();
+        _isIndexAtCurrBlock = true;
         return ThenPositionAsync(_index.SeekToFirstAsync(cancellationToken), Op.First, default, backward: false, cancellationToken);
     }
 
     public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
-        _seekStat = 0;
-        _isOutOfBound = false;
+        SetSeekKeyPrefix(target.Span);
+        BeginForwardSeek();
         if (_prefix.CheckFilter && !CheckPrefixMayMatch(target.Span, backward: false))
         {
             ReleaseBlock();
             return ValueTask.CompletedTask;
         }
+        _isIndexAtCurrBlock = true;
         return ThenPositionAsync(_index.SeekAsync(target, cancellationToken), Op.Seek, target, backward: false, cancellationToken);
     }
 
@@ -890,6 +1266,13 @@ public sealed class BlockBasedTableIterator : IDisposable
     {
         _data.Next();
         if (_data.Valid) return ValueTask.CompletedTask;
+        if (_blockHandlesCount != 0 || !_isIndexAtCurrBlock || _isIndexOutOfBound)
+        {
+            // Readahead lookup state left by a synchronous move: the async moves read no readahead buffer and never queue
+            // handles, so they consume the queue synchronously (cached blocks, or blocks in the readahead buffer).
+            FindBlockForward();
+            return ValueTask.CompletedTask;
+        }
         if (_blockUpperBoundCheck == BlockUpperBound.InCurBlock) return StopBeforeNextBlockAsync(cancellationToken);
         return ThenPositionAsync(_index.NextAsync(cancellationToken), Op.First, default, backward: false, cancellationToken);
     }
@@ -988,21 +1371,21 @@ public sealed class BlockBasedTableIterator : IDisposable
 
     public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default)
     {
-        _seekStat = 0;
-        _isOutOfBound = false;
+        BeginBackwardSeek();
+        _isIndexAtCurrBlock = true;
         return ThenPositionAsync(_index.SeekToLastAsync(cancellationToken), Op.First, default, backward: true, cancellationToken);
     }
 
     /// <summary>Async <see cref="SeekForPrev"/>: completes synchronously unless a data block or index partition must be read from the file.</summary>
     public ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
-        _seekStat = 0;
-        _isOutOfBound = false;
+        BeginBackwardSeek();
         if (_prefix.CheckFilter && !CheckPrefixMayMatch(target.Span, backward: true))
         {
             ReleaseBlock();
             return ValueTask.CompletedTask;
         }
+        _isIndexAtCurrBlock = true;
         ValueTask seek = _index.SeekAsync(target, cancellationToken);
         if (!seek.IsCompletedSuccessfully) return SeekForPrevSlowAsync(seek, target, cancellationToken);
         seek.GetAwaiter().GetResult();
@@ -1022,9 +1405,52 @@ public sealed class BlockBasedTableIterator : IDisposable
     public ValueTask PrevAsync(CancellationToken cancellationToken = default)
     {
         System.Diagnostics.Debug.Assert(Valid);
+        if (_readaheadCacheLookup && !_isIndexAtCurrBlock) return ReseekIndexThenPrevAsync(cancellationToken);
+        ResetBlockCacheLookupVar();
+        return PrevInBlockAsync(cancellationToken);
+    }
+
+    private ValueTask PrevInBlockAsync(CancellationToken ct)
+    {
         _data.Prev();
         if (_data.Valid) return ValueTask.CompletedTask;
-        return ThenPositionAsync(_index.PrevAsync(cancellationToken), Op.First, default, backward: true, cancellationToken);
+        return ThenPositionAsync(_index.PrevAsync(ct), Op.First, default, backward: true, ct);
+    }
+
+    /// <summary>
+    /// <see cref="Prev"/>'s index reseek (the readahead lookup moved the index forward) with the index partition read
+    /// asynchronously: the current key is copied, as the reseek may complete after an await.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private ValueTask ReseekIndexThenPrevAsync(CancellationToken ct)
+    {
+        ReadOnlySpan<byte> key = _data.Key;
+        if (_reseekKey.Length < key.Length) _reseekKey = new byte[Math.Max(key.Length, 64)];
+        key.CopyTo(_reseekKey);
+        ResetBlockCacheLookupVar();
+        _backward = true;
+        ValueTask seek = _index.SeekAsync(_reseekKey.AsMemory(0, key.Length), ct);
+        if (!seek.IsCompletedSuccessfully) return ReseekIndexThenPrevSlowAsync(seek, ct);
+        seek.GetAwaiter().GetResult();
+        return AfterIndexReseek(ct);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask ReseekIndexThenPrevSlowAsync(ValueTask seek, CancellationToken ct)
+    {
+        await seek.ConfigureAwait(false);
+        await AfterIndexReseek(ct).ConfigureAwait(false);
+    }
+
+    private ValueTask AfterIndexReseek(CancellationToken ct)
+    {
+        _isIndexAtCurrBlock = true;
+        if (!_index.Valid)
+        {
+            ReleaseBlock();
+            return ValueTask.CompletedTask;
+        }
+        return PrevInBlockAsync(ct);
     }
 
     /// <summary>
@@ -1082,6 +1508,8 @@ public sealed class BlockBasedTableIterator : IDisposable
     internal void Detach()
     {
         ReleaseBlock();
+        ResetBlockCacheLookupVar();
+        _isIndexAtCurrBlock = true;
         _isOutOfBound = false;
         _index.Reset();
         _prefetch?.Reset(null);
@@ -1123,6 +1551,7 @@ public sealed class BlockBasedTableIterator : IDisposable
         if (readaheadSize == 0 || _readaheadMode == ReadaheadMode.Fixed) return;
         _readaheadMode = ReadaheadMode.Fixed;
         _prefetch?.Dispose();
+        _readaheadCallbackBound = false;
         int size = (int)Math.Min(readaheadSize, 256UL << 20);
         _prefetch = asyncIo ? new Env.AsyncPrefetchBuffer(Math.Max(1, size / 2)) : Env.AsyncPrefetchBuffer.CreateSingleBuffer(size);
         _prefetch.Reset(_reader.File);
@@ -1135,6 +1564,13 @@ public sealed class BlockBasedTableIterator : IDisposable
     internal void Retarget(BlockBasedTableReader reader, in TableIteratorPrefixOptions prefixOptions)
     {
         ReleaseBlock();
+        // A new table iterator upstream (LevelIterator::NewFileIterator): forward, no lookup state, no seek key prefix,
+        // and the readahead buffer's callback bound again at its first read.
+        ResetBlockCacheLookupVar();
+        _isIndexAtCurrBlock = true;
+        _backward = false;
+        _seekKeyPrefixLength = 0;
+        _readaheadCallbackBound = false;
         _isOutOfBound = false;
         _hasUpperBound = false;
         _upperBound = default;
@@ -1151,6 +1587,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     public void Dispose()
     {
         ReleaseBlock();
+        ResetBlockCacheLookupVar();
         _index.Dispose();
         _data.Dispose();
         _prefetch?.Dispose();

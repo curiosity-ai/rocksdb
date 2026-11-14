@@ -62,6 +62,13 @@ public sealed class ReadOptions
     public bool PinData { get; set; }
     public bool AdaptiveReadahead { get; set; }
     public bool BackgroundPurgeOnIteratorCleanup { get; set; }
+    /// <summary>
+    /// ReadOptions::auto_readahead_size: with a block cache and <see cref="IterateUpperBound"/> set or
+    /// <see cref="PrefixSameAsStart"/>, a forward scan that reads through a readahead buffer (<see cref="ReadaheadSize"/>,
+    /// <see cref="AsyncIo"/>, or the implicit auto readahead where the file has no OS prefetch) trims each readahead to the
+    /// data blocks below the bound / within the seek key's prefix and leaves out the cached blocks at its end
+    /// (READAHEAD_TRIMMED counts the trimmed reads). A backward move turns it off for the table files it reached.
+    /// </summary>
     public bool AutoReadaheadSize { get; set; } = true;
     public bool AllowUnpreparedValue { get; set; }
     /// <summary>

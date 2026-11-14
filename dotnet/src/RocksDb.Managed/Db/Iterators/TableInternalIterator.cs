@@ -47,6 +47,7 @@ public sealed class TableInternalIterator : InternalIterator
             BlockBasedTableReader r = Bbt(lease);
             _it = r.NewIterator(flags, r.GetPrefixOptions(readOptions, prefixExtractor));
             _it.SetUpperBound(readOptions?.IterateUpperBound);
+            _it.SetReadaheadOptions(readOptions, prefixExtractor);
             _embedded = r.HasEmbeddedBlobRecords;
         }
         catch
@@ -99,9 +100,12 @@ public sealed class TableInternalIterator : InternalIterator
     {
         if (prefixExtractor is null)
         {
-            return flags == TableReadFlags.None
+            InternalIterator it = flags == TableReadFlags.None
                 ? tableCache.NewIterator(file, reuse)
                 : TableCache.Recycle(reuse, tableCache.GetReader(file), flags);
+            // The read options still decide the readahead trimming (auto_readahead_size with iterate_upper_bound).
+            if (it is TableInternalIterator table) table.SetReadaheadOptions(readOptions, null);
+            return it;
         }
         TableReaderLease lease = tableCache.GetReader(file);
         if (reuse is TableInternalIterator t && t.Flags == flags && lease.Reader is BlockBasedTableReader)
@@ -304,6 +308,9 @@ public sealed class TableInternalIterator : InternalIterator
     /// <summary>ReadOptions::readahead_size and async_io (see <see cref="BlockBasedTableIterator.SetUserReadahead"/>).</summary>
     internal void SetUserReadahead(ulong readaheadSize, bool asyncIo) => _it.SetUserReadahead(readaheadSize, asyncIo);
 
+    /// <summary>ReadOptions::auto_readahead_size / prefix_same_as_start (see <see cref="BlockBasedTableIterator.SetReadaheadOptions"/>).</summary>
+    internal void SetReadaheadOptions(ReadOptions? readOptions, SliceTransform? prefixExtractor) => _it.SetReadaheadOptions(readOptions, prefixExtractor);
+
     /// <summary>The readahead buffer (tests / diagnostics), or null.</summary>
     internal Env.AsyncPrefetchBuffer? Readahead => _it.Readahead;
 
@@ -327,6 +334,7 @@ public sealed class TableInternalIterator : InternalIterator
                 : r.GetPrefixOptions(readOptions, prefixExtractor);
             _it.Retarget(r, prefix);
             _it.SetUpperBound(readOptions?.IterateUpperBound);
+            _it.SetReadaheadOptions(readOptions, prefixExtractor);
             _embedded = r.HasEmbeddedBlobRecords;
             _stale = true;
             _smallestSeqno = DbFormat.MaxSequenceNumber;
