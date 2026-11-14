@@ -193,10 +193,12 @@ compaction, so wall-clock jumps cannot change the result).
 
 ## Running for days
 
-Disk: the DB stays small (bounded key spaces: about 10..50 MB with the defaults). The histories take about
-50..60 MB per minute of RUN time with the defaults (every write, sync and transfer, and one in eight reads, is
-recorded); only the last `--keep-history` cycles (default 20, about 40 s each on average) are kept, so plan for about
-1..2 GB in the run directory plus the failure copies (each about the DB size plus one history). The fault file
+Disk: the DB stays small (bounded key spaces: about 10..50 MB of table and blob files with the defaults, plus the
+last 20 info LOG files, `keep_log_file_num = 20`, typically 1..50 MB each). The histories grow with the workload's
+throughput (every write, sync and transfer, and one in eight reads, is recorded): about 50..400 MB per minute of RUN
+time, depending on the machine. Only the last `--keep-history` cycles (default 20, about 40 s each on average, but up
+to `--max-run`) are kept, so plan for about 2..5 GB in the run directory plus the failure copies (each about the DB
+size plus one history). The fault file
 system's graveyard (`tmp/graveyard-<pid>`: deleted files kept for a simulated power loss) drops files once a
 directory fsync makes their deletion durable, and the supervisor removes the graveyards and checkpoints of earlier
 workers before each cycle. Memory: about 300 MB

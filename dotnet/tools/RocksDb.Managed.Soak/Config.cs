@@ -264,6 +264,10 @@ internal static class DbSetup
             MaxSubcompactions = c.MaxSubcompactions,
             FileChecksumGenFactory = FileChecksumGenCrc32cFactory.Instance,
             ParanoidChecks = true,
+            // Every worker, verifier and corruption check opens the DB and rolls the info LOG. The default
+            // (keep_log_file_num = 1000) lets old LOG files reach gigabytes in a multi-day run; 20 cover the last
+            // several cycles, which is what a failure investigation needs (the failure copy takes the DB directory).
+            KeepLogFileNum = 20,
         };
     }
 
