@@ -91,6 +91,14 @@ public sealed class MergingIterator : InternalIterator
 
     public override bool TryGetPinnedValue(out PinnedSlice value) => _children[_current].TryGetPinnedValue(out value);
 
+    /// <summary>Port of MergingIterator::UpperBoundCheckResult: the current child's.</summary>
+    public override IterBoundCheck UpperBoundCheckResult => _current >= 0 ? _children[_current].UpperBoundCheckResult : IterBoundCheck.Unknown;
+
+    internal override void SetIterateUpperBound(ReadOnlyMemory<byte>? upperBound)
+    {
+        foreach (InternalIterator c in _children) c.SetIterateUpperBound(upperBound);
+    }
+
     /// <summary>Range-deletion skip: only the child providing the current entry moves (see the base method).</summary>
     public override bool SkipCoveredForward(ReadOnlySpan<byte> target, ulong tombstoneSeq)
     {

@@ -111,6 +111,78 @@ public class ColdScanBenchmarks
     }
 }
 
+/// <summary>
+/// Short bounded scans (iterate_upper_bound through <see cref="Iterator.SetBounds"/>, one reused iterator) over a compacted
+/// DB: the table iterator stops at the data block holding the upper bound instead of reading the next one
+/// (BlockBasedTableIterator::FindBlockForward next_block_is_out_of_bound). <c>CacheMiB</c> 1 makes most data blocks
+/// miss. "Allocated" must be "-".
+/// </summary>
+[MemoryDiagnoser, MinColumn, MedianColumn]
+[BenchmarkCategory("Scan")]
+public class BoundedScanBenchmarks
+{
+    private const int Keys = 200_000;
+    private const int Ranges = 256;
+
+    [Params(16, 256)]
+    public int RangeRows { get; set; }
+
+    [Params(1, 256)]
+    public int CacheMiB { get; set; }
+
+    private string _dir = "";
+    private RocksDatabase _db = null!;
+    private Iterator _it = null!;
+    private byte[][] _lower = [];
+    private byte[][] _upper = [];
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        _dir = Path.Combine(Path.GetTempPath(), "rocksdb-managed-boundedscan-" + Guid.NewGuid().ToString("N"));
+        var value = new byte[100];
+        new Random(3).NextBytes(value);
+        var cf = new ColumnFamilyOptions { DisableAutoCompactions = true, Compression = Compression.CompressionType.None };
+        cf.TableOptions.BlockCache = Cache.BlockCache.CreateLru((long)CacheMiB << 20);
+        _db = RocksDatabase.Open(_dir, new DbOptions { CreateIfMissing = true }, cf);
+        for (int i = 0; i < Keys; i++) _db.Put(ScanKeys.Key(i), value);
+        _db.Flush();
+        _db.CompactRange();
+        var rnd = new Random(5);
+        _lower = new byte[Ranges][];
+        _upper = new byte[Ranges][];
+        for (int r = 0; r < Ranges; r++)
+        {
+            int start = rnd.Next(Keys - RangeRows);
+            _lower[r] = ScanKeys.Key(start);
+            _upper[r] = ScanKeys.Key(start + RangeRows);
+        }
+        _it = _db.NewIterator(new ReadOptions { FillCache = CacheMiB > 1 });
+        Scan();
+    }
+
+    /// <summary>One operation = <see cref="Ranges"/> bounded scans.</summary>
+    [Benchmark]
+    public long Scan()
+    {
+        long n = 0;
+        for (int r = 0; r < Ranges; r++)
+        {
+            _it.SetBounds(_lower[r], _upper[r]);
+            for (_it.SeekToFirst(); _it.Valid; _it.Next()) n += _it.Value.Length;
+        }
+        return n;
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _it.Dispose();
+        _db.Dispose();
+        ScanKeys.DeleteDirectory(_dir);
+    }
+}
+
 internal static class ScanKeys
 {
     public static byte[] Key(int i) => System.Text.Encoding.ASCII.GetBytes("key" + i.ToString("D10", System.Globalization.CultureInfo.InvariantCulture));

@@ -17,7 +17,6 @@ public sealed class EmptyInternalIterator : InternalIterator
     public override void SeekForPrev(ReadOnlySpan<byte> target) { }
     public override void Next() => ThrowHelper.InvalidArgument("Next on an invalid iterator");
     public override void Prev() => ThrowHelper.InvalidArgument("Prev on an invalid iterator");
-    public override bool MayBeOutOfUpperBound => false;
 }
 
 /// <summary>

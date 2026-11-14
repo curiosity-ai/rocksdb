@@ -17,7 +17,13 @@ namespace RocksDb.Managed.Env;
 /// <para>The prefetch target is chunk-aligned to the previous read's end, so a block may straddle two chunks: the
 /// prefetch lands behind a reserved gap at the start of its buffer and the straddling tail of the current chunk is
 /// copied into that gap on the swap (no re-read). Blocks larger than the gap are read directly.</para>
-/// <para>Not thread-safe (one per iterator). Buffers come from <see cref="RocksArrayPool{T}.Shared"/>; dispose (or
+/// <para>With one buffer (<see cref="CreateSingleBuffer"/>: FilePrefetchBuffer with num_buffers = 1, the explicit
+/// ReadOptions::readahead_size of a user iterator without async_io) there is no prefetch: a miss reads the block plus
+/// readahead_size bytes synchronously into the one buffer, keeping the requested bytes already buffered, and a read
+/// before the buffered range is not served (<see cref="IsBeforeBuffer"/>).</para>
+/// <para>Not thread-safe (one per iterator). Buffers up to <see cref="MaxPooledBufferSize"/> come from
+/// <see cref="RocksArrayPool{T}.Shared"/>; larger ones are allocated at their exact size and dropped with the buffer,
+/// so that a large readahead (hundreds of MB) is not kept by the shared pool after the iterator is gone. Dispose (or
 /// <see cref="Reset"/>) waits for a pending prefetch before reusing them.</para>
 /// <para>Allocation-free in steady state: the pending read is kept as its <see cref="ValueTask{TResult}"/> (no
 /// <c>AsTask</c> / <c>Task.FromResult</c> per prefetch); one that has not completed when it is started gets a cached
@@ -28,6 +34,11 @@ public sealed class AsyncPrefetchBuffer : IDisposable
 {
     private const int MinReserve = 64 * 1024;
 
+    /// <summary>The largest buffer rented from <see cref="RocksArrayPool{T}.Shared"/>; larger ones are not pooled.</summary>
+    public const int MaxPooledBufferSize = 4 << 20;
+
+    /// <summary>num_buffers_ == 1: synchronous reads into one buffer, no prefetch.</summary>
+    private readonly bool _singleBuffer;
     private int _readahead;
     private readonly int _initialReadahead;
     private readonly int _maxReadahead;
@@ -70,14 +81,37 @@ public sealed class AsyncPrefetchBuffer : IDisposable
     /// <paramref name="maxReadaheadSize"/> (FilePrefetchBuffer with implicit auto readahead: initial_auto_readahead_size,
     /// max_auto_readahead_size).
     /// </summary>
-    public AsyncPrefetchBuffer(int initialReadaheadSize, int maxReadaheadSize)
+    public AsyncPrefetchBuffer(int initialReadaheadSize, int maxReadaheadSize) : this(initialReadaheadSize, maxReadaheadSize, singleBuffer: false)
+    {
+    }
+
+    private AsyncPrefetchBuffer(int initialReadaheadSize, int maxReadaheadSize, bool singleBuffer)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(initialReadaheadSize, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(maxReadaheadSize, initialReadaheadSize);
         _readahead = initialReadaheadSize;
         _initialReadahead = initialReadaheadSize;
         _maxReadahead = maxReadaheadSize;
+        _singleBuffer = singleBuffer;
     }
+
+    /// <summary>
+    /// A synchronous buffer with a fixed readahead (FilePrefetchBuffer with num_buffers = 1 and initial = max readahead
+    /// size, as BlockPrefetcher creates it for an explicit ReadOptions::readahead_size without async_io,
+    /// table/block_based/block_prefetcher.cc): each miss reads the requested bytes plus
+    /// <paramref name="readaheadSize"/> (ReadAheadSizeTuning), at most up to the end of the file.
+    /// </summary>
+    public static AsyncPrefetchBuffer CreateSingleBuffer(int readaheadSize) => new(readaheadSize, readaheadSize, singleBuffer: true);
+
+    /// <summary>
+    /// A one-buffer prefetch buffer does not serve a read before its buffered range: TryReadFromCache returns false for
+    /// <c>offset &lt; buf-&gt;offset_</c> and the block is read from the file directly (a reverse scan does not re-read a
+    /// readahead window for every block).
+    /// </summary>
+    public bool IsBeforeBuffer(long offset) => _singleBuffer && offset < _curOffset;
+
+    /// <summary>Bytes currently held by the buffers (tests / diagnostics).</summary>
+    public long BufferBytes => (long)_cur.Length + _next.Length;
 
     /// <summary>The size of the next read.</summary>
     public int ReadaheadSize => _readahead;
@@ -125,6 +159,7 @@ public sealed class AsyncPrefetchBuffer : IDisposable
     public bool TryRead(long offset, int length, out ReadOnlySpan<byte> data)
     {
         if (TryGetBuffered(offset, length, out data)) return true;
+        if (_singleBuffer) return ReadMissSingleBuffer(offset, length, out data);
         if (_hasPending && offset >= _curOffset && offset <= _nextOffset && TrySwap(offset, length, out data)) return true;
         return ReadMiss(offset, length, out data);
     }
@@ -185,6 +220,51 @@ public sealed class AsyncPrefetchBuffer : IDisposable
             return false;
         }
         StartPrefetch();
+        data = new ReadOnlySpan<byte>(_cur, 0, length);
+        return true;
+    }
+
+    /// <summary>
+    /// PrefetchInternal with num_buffers_ = 1 (file/file_prefetch_buffer.cc): reads [offset, offset + length +
+    /// readahead_size) into the buffer (ReadAheadSizeTuning), keeping the requested bytes it already holds at its start
+    /// (PrepareBufferForRead: RefitTail, or a new buffer that they are copied into when the capacity is too small).
+    /// Upstream sizes the buffer for the full window and the read stops at the end of the file; the buffer here stops
+    /// there too, so a readahead larger than the file costs the file's size, not the readahead size.
+    /// </summary>
+    private bool ReadMissSingleBuffer(long offset, int length, out ReadOnlySpan<byte> data)
+    {
+        long remaining = _fileLength - offset;
+        if (remaining < length)
+        {
+            data = default;
+            return false;
+        }
+        int want = (int)Math.Min((long)length + _readahead, remaining);
+        long rel = offset - _curOffset;
+        int keep = _curLen > 0 && rel >= 0 && rel < _curLen ? _curLen - (int)rel : 0;
+        int keepFrom = _curStart + (int)Math.Max(rel, 0);
+        if (_cur.Length < want)
+        {
+            byte[] old = _cur;
+            _cur = AllocateBuffer(want);
+            if (keep > 0) Array.Copy(old, keepFrom, _cur, 0, keep);
+            ReturnBuffer(old);
+        }
+        else if (keep > 0)
+        {
+            Array.Copy(_cur, keepFrom, _cur, 0, keep);
+        }
+        int got = keep + _file!.Read(offset + keep, _cur.AsSpan(keep, want - keep));
+        SyncReads++;
+        GrowReadahead();
+        _curStart = 0;
+        _curLen = got;
+        _curOffset = offset;
+        if (got < length)
+        {
+            data = default;
+            return false;
+        }
         data = new ReadOnlySpan<byte>(_cur, 0, length);
         return true;
     }
@@ -252,8 +332,21 @@ public sealed class AsyncPrefetchBuffer : IDisposable
     private static void Rent(ref byte[] buffer, int size)
     {
         byte[] old = buffer;
-        buffer = RocksArrayPool<byte>.Shared.Rent(size);
-        if (old.Length > 0) RocksArrayPool<byte>.Shared.Return(old);
+        buffer = AllocateBuffer(size);
+        ReturnBuffer(old);
+    }
+
+    /// <summary>
+    /// A buffer of at least <paramref name="size"/> bytes: rented up to <see cref="MaxPooledBufferSize"/>, else allocated
+    /// at the exact size, uninitialized (reads fill what is used).
+    /// </summary>
+    private static byte[] AllocateBuffer(int size) =>
+        size <= MaxPooledBufferSize ? RocksArrayPool<byte>.Shared.Rent(size) : GC.AllocateUninitializedArray<byte>(size);
+
+    /// <summary>Returns a buffer of <see cref="AllocateBuffer"/> to the pool when it came from there.</summary>
+    private static void ReturnBuffer(byte[] buffer)
+    {
+        if (buffer.Length > 0 && buffer.Length <= MaxPooledBufferSize) RocksArrayPool<byte>.Shared.Return(buffer);
     }
 
     private void WaitPendingIgnoringErrors()
@@ -274,8 +367,8 @@ public sealed class AsyncPrefetchBuffer : IDisposable
         WaitPendingIgnoringErrors();
         _file = null;
         _curLen = 0;
-        if (_cur.Length > 0) RocksArrayPool<byte>.Shared.Return(_cur);
-        if (_next.Length > 0) RocksArrayPool<byte>.Shared.Return(_next);
+        ReturnBuffer(_cur);
+        ReturnBuffer(_next);
         _cur = [];
         _next = [];
         // Not disposed: it never allocates a wait handle (WaitHandle is not used), and a Set still unwinding on the

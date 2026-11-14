@@ -30,6 +30,7 @@ internal sealed class IteratorGraph : IDisposable
     private readonly List<InternalIterator> _children = [];
     private MergingIterator? _merging;
     private ulong _readahead; // ReadOptions::readahead_size the table iterators were configured with
+    private bool _readaheadAsyncIo; // and ReadOptions::async_io (one or two readahead buffers)
 
     // The view (null when released).
     private SuperVersion? _sv;
@@ -244,7 +245,8 @@ internal sealed class IteratorGraph : IDisposable
         ITableCache tc = _cfd.TableCache;
         InternalKeyComparator icmp = _cfd.Icmp;
         ulong readahead = options?.ReadaheadSize ?? 0;
-        if (readahead != _readahead)
+        bool asyncIo = readahead > 0 && options!.AsyncIo;
+        if (readahead != _readahead || asyncIo != _readaheadAsyncIo)
         {
             // Table iterators keep a fixed readahead once configured: do not recycle them across that setting.
             for (int i = 0; i < _l0.Count; i++)
@@ -254,6 +256,7 @@ internal sealed class IteratorGraph : IDisposable
             }
             foreach (LevelIterator li in _levels) li.DiscardSpare();
             _readahead = readahead;
+            _readaheadAsyncIo = asyncIo;
         }
         bool ignoreRangeDel = options?.IgnoreRangeDeletions == true;
         RangeDelAggregator? rangeDel = null;
@@ -268,7 +271,11 @@ internal sealed class IteratorGraph : IDisposable
         if (options?.ReadTier != ReadTier.MemtableTier)
         {
             int numNonEmpty = s.NumNonEmptyLevels;
-            bool optimizeForHits = _cfd.Options.OptimizeFiltersForHits;
+            // Version::IsFilterSkipped(level) with is_file_last_in_level = false (version_set.cc AddIteratorsForLevel):
+            // only the last non-empty level > 0 skips its filters; L0 table iterators always pass skip_filters = false,
+            // and so does a tailing ForwardIterator for every level (forward_iterator.cc). The last-L0-file case is
+            // for Get / MultiGet only.
+            bool optimizeForHits = _cfd.Options.OptimizeFiltersForHits && options?.Tailing != true;
             for (int level = 0; level < s.NumLevels; level++)
             {
                 FileMetaData[] files = s.LevelFilesArray(level);
@@ -285,7 +292,6 @@ internal sealed class IteratorGraph : IDisposable
                     {
                         FileMetaData f = files[fi];
                         TableReadFlags readFlags = TableReadFlagsExtensions.FromReadOptions(options);
-                        if (optimizeForHits && fi == files.Length - 1 && numNonEmpty == 1) readFlags |= TableReadFlags.SkipFilters;
                         int slot = _l0Count;
                         InternalIterator? reuse = slot < _l0.Count ? _l0[slot] : null;
                         if (slot < _l0.Count) _l0[slot] = null;
@@ -293,9 +299,11 @@ internal sealed class IteratorGraph : IDisposable
                         if (slot < _l0.Count) _l0[slot] = child;
                         else _l0.Add(child);
                         _l0Count++;
+                        // read_options_.iterate_upper_bound of the table iterator (a recycled one was cleared).
+                        child.SetIterateUpperBound(options?.IterateUpperBound);
                         if (child is TableInternalIterator t)
                         {
-                            if (readahead > 0) t.SetUserReadahead(readahead);
+                            if (readahead > 0) t.SetUserReadahead(readahead, asyncIo);
                             // Lets DbIter skip ranges covered by newer range tombstones (SkipCoveredForward / Backward).
                             t.SetSeqnoRange(f.SmallestSeqno, f.LargestSeqno);
                         }

@@ -459,7 +459,7 @@ public sealed class BlockBasedTableTests
             BlockBasedTableReader reader = BlockBasedTableReader.Open(file, options);
             int before = file.Reads;
             BlockBasedTableIterator it = reader.NewIterator();
-            it.SetUserReadahead(userReadahead);
+            it.SetUserReadahead(userReadahead, asyncIo: false);
             int n = 0;
             for (it.SeekToFirst(); it.Valid; it.Next()) CollectionAssert.AreEqual(entries[n++].Key, it.Key.ToArray());
             Assert.AreEqual(entries.Count, n);
@@ -488,6 +488,62 @@ public sealed class BlockBasedTableTests
         Assert.IsTrue(fixedReads * 5 < none, "readahead_size: " + fixedReads);
         Assert.AreEqual(64 * 1024, fixedIt!.Readahead!.ReadaheadSize);
         fixedIt.Dispose();
+    }
+
+    /// <summary>
+    /// ReadOptions::readahead_size without async_io (BlockPrefetcher: FilePrefetchBuffer with num_buffers = 1): one
+    /// synchronous buffer. A readahead larger than the file (Mosaik: 256 MB) holds the bytes up to the end of the file,
+    /// allocated at that exact size (above AsyncPrefetchBuffer.MaxPooledBufferSize, not rented from the shared pool), with
+    /// no second window; a block before the buffered range is read from the file directly (TryReadFromCache), so a
+    /// reverse scan does not re-read a readahead window per block. Results are those of a scan without readahead.
+    /// </summary>
+    [TestMethod]
+    public void IteratorExplicitReadaheadUsesOneBufferBoundedByTheFile()
+    {
+        List<(byte[] Key, byte[] Value)> entries = MakeEntries(60000, 12, 300);
+        byte[] data = BuildTable(entries, new TableFormatOptions { BlockSize = 4096 });
+        Assert.IsTrue(data.Length > Managed.Env.AsyncPrefetchBuffer.MaxPooledBufferSize, "table size " + data.Length);
+        var file = new MemRandomAccessFile(data);
+        using BlockBasedTableReader reader = BlockBasedTableReader.Open(file, TableReaderOptions.Default);
+        BlockBasedTableIterator it = reader.NewIterator();
+        it.SetUserReadahead(256UL << 20, asyncIo: false);
+        int before = file.Reads;
+        int n = 0;
+        for (it.SeekToFirst(); it.Valid; it.Next()) CollectionAssert.AreEqual(entries[n++].Key, it.Key.ToArray());
+        Assert.AreEqual(entries.Count, n);
+        Assert.AreEqual(1, file.Reads - before, "the first block plus the readahead, up to the end of the file");
+        Managed.Env.AsyncPrefetchBuffer ra = it.Readahead!;
+        Assert.AreEqual(0, ra.Prefetches, "no second buffer");
+        Assert.AreEqual(data.Length, ra.BufferBytes, "one buffer of the file's size (the data blocks start at offset 0)");
+        // Reverse from the end: everything is buffered.
+        before = file.Reads;
+        n = entries.Count;
+        for (it.SeekToLast(); it.Valid; it.Prev()) CollectionAssert.AreEqual(entries[--n].Key, it.Key.ToArray());
+        Assert.AreEqual(0, n);
+        Assert.AreEqual(0, file.Reads - before);
+        it.Dispose();
+        Assert.AreEqual(0, ra.BufferBytes, "released with the iterator");
+
+        // A small readahead: a seek fills the buffer from its block; the blocks before it are read directly.
+        it = reader.NewIterator();
+        it.SetUserReadahead(64 * 1024, asyncIo: false);
+        it.Seek(entries[20000].Key);
+        Assert.IsTrue(it.Valid);
+        ra = it.Readahead!;
+        Assert.IsTrue(ra.BufferBytes <= 128 * 1024, "one pooled buffer for the block plus 64 KiB: " + ra.BufferBytes);
+        before = file.Reads;
+        long bytesBefore = file.BytesRead;
+        n = 20000;
+        for (int i = 0; i < 2000; i++)
+        {
+            it.Prev();
+            CollectionAssert.AreEqual(entries[--n].Key, it.Key.ToArray());
+        }
+        int reads = file.Reads - before;
+        long bytes = file.BytesRead - bytesBefore;
+        Assert.IsTrue(reads > 50, "blocks read one by one: " + reads);
+        Assert.IsTrue(bytes < reads * 8192L, "no readahead window per block: " + bytes + " bytes in " + reads + " reads");
+        it.Dispose();
     }
 
     /// <summary>

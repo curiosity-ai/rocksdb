@@ -120,6 +120,19 @@ internal sealed class IndexCursor
         get => _udi is not null ? _udiKey.AsSpan(0, _udiKeyLength) : _partitioned ? _part.Key : _top.Key;
     }
 
+    /// <summary>
+    /// IndexBlockIter::user_key() / PartitionedIndexIterator::user_key(): the user key of the separator (the index key
+    /// without its sequence footer when the index keys include it).
+    /// </summary>
+    public ReadOnlySpan<byte> UserKey
+    {
+        get
+        {
+            ReadOnlySpan<byte> k = Key;
+            return _reader.IndexKeyIncludesSeq ? k[..^Db.DbFormat.InternalKeyFooterSize] : k;
+        }
+    }
+
     public void Seek(ReadOnlySpan<byte> target)
     {
         if (_udi is not null) { UdiSeek(target); return; }
@@ -350,7 +363,9 @@ internal sealed class IndexCursor
 
 /// <summary>
 /// Two-level iterator over a block-based table: index → data blocks. Port of BlockBasedTableIterator
-/// (table/block_based/block_based_table_iterator.cc) without readahead or bounds checks. With prefix options
+/// (table/block_based/block_based_table_iterator.cc), including its iterate_upper_bound checks
+/// (<see cref="SetUpperBound"/>: a data block entirely past the bound is not read, and the iterator reports
+/// <see cref="UpperBoundCheckResult"/>). With prefix options
 /// (<see cref="TableIteratorPrefixOptions.CheckFilter"/>), Seek and SeekForPrev first consult the prefix filter
 /// (CheckPrefixMayMatch) and leave the iterator invalid without reading any data block when it excludes the prefix.
 /// <para>
@@ -370,6 +385,26 @@ public sealed class BlockBasedTableIterator : IDisposable
     private BlockHandle _blockHandle;
     private Db.Iterators.PinnedIteratorsManager? _pinMgr;
     private Env.AsyncPrefetchBuffer? _prefetch;
+
+    /// <summary>block_based_table_iterator.h BlockUpperBound: where iterate_upper_bound lies relative to the current data block.</summary>
+    private enum BlockUpperBound : byte
+    {
+        /// <summary>kUnknown: not checked (no bound, or no current data block).</summary>
+        Unknown,
+        /// <summary>kUpperBoundInCurBlock: the bound is &lt;= the block's index key, so the next block is out of bound.</summary>
+        InCurBlock,
+        /// <summary>kUpperBoundBeyondCurBlock: every key of the block is below the bound.</summary>
+        BeyondCurBlock,
+    }
+
+    // ReadOptions::iterate_upper_bound (read_options_.iterate_upper_bound), block_upper_bound_check_ and is_out_of_bound_.
+    private ReadOnlyMemory<byte> _upperBound;
+    private bool _hasUpperBound;
+    // The table's comparator and its timestamp size (cached: both are virtual reads).
+    private Db.InternalKeyComparator _icmp;
+    private int _tsSize;
+    private bool _isOutOfBound;
+    private BlockUpperBound _blockUpperBoundCheck;
 
     /// <summary>How data blocks that are not cached are read (BlockPrefetcher).</summary>
     private enum ReadaheadMode : byte
@@ -413,6 +448,8 @@ public sealed class BlockBasedTableIterator : IDisposable
         _reader = reader;
         _flags = flags;
         _prefix = prefixOptions;
+        _icmp = reader.InternalComparator;
+        _tsSize = _icmp.UserComparator.TimestampSize;
         _index.Init(reader, flags);
     }
 
@@ -446,7 +483,80 @@ public sealed class BlockBasedTableIterator : IDisposable
     public bool Valid
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => !_block.IsEmpty && _data.Valid;
+        get => !_isOutOfBound && !_block.IsEmpty && _data.Valid;
+    }
+
+    /// <summary>Port of BlockBasedTableIterator::UpperBoundCheckResult (block_based_table_iterator.h).</summary>
+    public Db.Iterators.IterBoundCheck UpperBoundCheckResult =>
+        _isOutOfBound ? Db.Iterators.IterBoundCheck.OutOfBound
+        : _blockUpperBoundCheck == BlockUpperBound.BeyondCurBlock ? Db.Iterators.IterBoundCheck.Inbound
+        : Db.Iterators.IterBoundCheck.Unknown;
+
+    /// <summary>
+    /// Sets ReadOptions::iterate_upper_bound (exclusive user key; null: none), honoured from the next positioning call.
+    /// The memory must stay unchanged while the iterator uses it (upstream keeps a pointer to the read options' slice).
+    /// </summary>
+    internal void SetUpperBound(ReadOnlyMemory<byte>? upperBound)
+    {
+        _hasUpperBound = upperBound.HasValue;
+        _upperBound = upperBound.GetValueOrDefault();
+        // The block check was made against the previous bound; every positioning call recomputes it (upstream's
+        // next_block_is_out_of_bound also requires a bound, so a stale state there is never read).
+        _blockUpperBoundCheck = BlockUpperBound.Unknown;
+    }
+
+    /// <summary>
+    /// Port of CheckOutOfBound: once the bound may lie in the current block, compares the current key with it
+    /// (is_out_of_bound_ makes the iterator invalid, so a merging iterator leaves it out of its heap). Called after the
+    /// forward seeks, like upstream, but not on every <see cref="Next"/> within a block (upstream does): the DB iterator
+    /// compares each key with the bound itself, and does not consult UpperBoundCheckResult to skip that comparison
+    /// (upstream's IteratorWrapper caches the result of NextAndGetResult; here it would be a chain of virtual calls per
+    /// key, measured slower than the comparison it saves), so a second comparison per key would only cost time (5-7% on
+    /// short bounded scans, BoundedScanBenchmarks) without changing what any caller observes: a table iterator left on a
+    /// key at or past the bound is never stepped again before the next seek. The block-level check, which saves the
+    /// read of the data block after the bound, is done at every block transition (<see cref="FindKeyForward"/>).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void CheckOutOfBound()
+    {
+        if (_hasUpperBound && _blockUpperBoundCheck != BlockUpperBound.BeyondCurBlock && Valid)
+            _isOutOfBound = CompareUpperBound(_data.Key[..^Db.DbFormat.InternalKeyFooterSize]) <= 0;
+    }
+
+    /// <summary>
+    /// Port of CheckDataBlockWithinUpperBound: whether every key of the current block (all &lt;= its index key) is below
+    /// the bound. Called whenever a data block becomes current, and on a reseek that stays in the current block (the
+    /// bound may have changed since).
+    /// </summary>
+    private void CheckDataBlockWithinUpperBound()
+    {
+        if (!_hasUpperBound || _block.IsEmpty) return;
+        _blockUpperBoundCheck = CompareUpperBound(_index.UserKey) > 0 ? BlockUpperBound.BeyondCurBlock : BlockUpperBound.InCurBlock;
+    }
+
+    /// <summary>
+    /// user_comparator_.CompareWithoutTimestamp(iterate_upper_bound, false, <paramref name="userKey"/>, true): the bound
+    /// carries no timestamp, the table's user keys do (if the comparator has them).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int CompareUpperBound(ReadOnlySpan<byte> userKey)
+    {
+        return _tsSize == 0
+            ? _icmp.CompareUserKey(_upperBound.Span, userKey)
+            : _icmp.UserComparator.CompareWithoutTimestamp(_upperBound.Span, false, userKey, true);
+    }
+
+    /// <summary>
+    /// FindBlockForward's next_block_is_out_of_bound: the bound lies in the block just finished, so the next block is not
+    /// read. Unless the block was the file's last one (its index key can be larger than the smallest key of the next
+    /// file of the level), the iterator stops out of bound.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void StopBeforeNextBlock()
+    {
+        ReleaseBlock();
+        _index.Next();
+        _isOutOfBound = _index.Valid;
     }
 
     /// <summary>Current internal key.</summary>
@@ -487,15 +597,18 @@ public sealed class BlockBasedTableIterator : IDisposable
     public void SeekToFirst()
     {
         _seekStat = 0;
+        _isOutOfBound = false;
         _index.SeekToFirst();
         if (!LoadCurrentBlock()) return;
         _data.SeekToFirst();
         FindKeyForward();
+        CheckOutOfBound();
     }
 
     public void SeekToLast()
     {
         _seekStat = 0;
+        _isOutOfBound = false;
         _index.SeekToLast();
         if (!LoadCurrentBlock()) return;
         _data.SeekToLast();
@@ -506,6 +619,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     public void Seek(ReadOnlySpan<byte> target)
     {
         _seekStat = 0;
+        _isOutOfBound = false;
         if (_prefix.CheckFilter && !CheckPrefixMayMatch(target, backward: false))
         {
             ReleaseBlock();
@@ -515,12 +629,14 @@ public sealed class BlockBasedTableIterator : IDisposable
         if (!LoadCurrentBlock()) return;
         _data.Seek(target);
         FindKeyForward();
+        CheckOutOfBound();
     }
 
     /// <summary>Positions at the last entry with internal key &lt;= <paramref name="target"/>.</summary>
     public void SeekForPrev(ReadOnlySpan<byte> target)
     {
         _seekStat = 0;
+        _isOutOfBound = false;
         if (_prefix.CheckFilter && !CheckPrefixMayMatch(target, backward: true))
         {
             ReleaseBlock();
@@ -538,6 +654,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     {
         System.Diagnostics.Debug.Assert(Valid);
         _data.Next();
+        // Upstream Next() also calls CheckOutOfBound(): not here. See CheckOutOfBound.
         FindKeyForward();
     }
 
@@ -553,6 +670,12 @@ public sealed class BlockBasedTableIterator : IDisposable
     {
         while (!_data.Valid)
         {
+            // FindBlockForward: next_block_is_out_of_bound (the state is kUnknown without a bound or a current block).
+            if (_blockUpperBoundCheck == BlockUpperBound.InCurBlock)
+            {
+                StopBeforeNextBlock();
+                return;
+            }
             _index.Next();
             if (!LoadCurrentBlock()) return;
             _data.SeekToFirst();
@@ -579,7 +702,12 @@ public sealed class BlockBasedTableIterator : IDisposable
             return false;
         }
         BlockHandle h = _index.Handle;
-        if (!_block.IsEmpty && h == _blockHandle) return true;
+        if (!_block.IsEmpty && h == _blockHandle)
+        {
+            // A reseek into the current block: the bound may have changed (SeekImpl's same_block case).
+            CheckDataBlockWithinUpperBound();
+            return true;
+        }
         ReleaseBlock();
         SetBlock(_reader.GetBlockRef(h, BlockKind.Data, _flags, PrefetchIfNeeded(h)), h);
         return true;
@@ -600,7 +728,9 @@ public sealed class BlockBasedTableIterator : IDisposable
         if ((_flags & TableReadFlags.BlockCacheTier) != 0) return null;
         if (_readaheadMode != ReadaheadMode.Auto)
         {
-            return _readaheadMode == ReadaheadMode.Compaction ? PrefetchForCompaction(h) : _prefetch;
+            if (_readaheadMode == ReadaheadMode.Compaction) return PrefetchForCompaction(h);
+            // FilePrefetchBuffer::TryReadFromCache: a block before the buffered range is read from the file directly.
+            return _prefetch is null || _prefetch.IsBeforeBuffer((long)h.Offset) ? null : _prefetch;
         }
         TableReaderOptions o = _reader.Options;
         long max = o.MaxAutoReadaheadSize;
@@ -694,10 +824,13 @@ public sealed class BlockBasedTableIterator : IDisposable
         _blockHandle = h;
         if ((_seekStat & SeekStatDataBlockRead) == 0) RecordSeekDataBlockRead();
         _data.InitializeData(b.Block!, _reader.InternalComparator, _reader.GlobalSequenceNumber, _reader.PadTimestampSize);
+        CheckDataBlockWithinUpperBound();
     }
 
+    /// <summary>Port of ResetDataIter: drops the current data block (block_upper_bound_check_ back to kUnknown).</summary>
     private void ReleaseBlock()
     {
+        _blockUpperBoundCheck = BlockUpperBound.Unknown;
         _data.Clear();
         if (_block.IsEmpty) return;
         Db.Iterators.PinnedIteratorsManager? mgr = _pinMgr;
@@ -736,12 +869,14 @@ public sealed class BlockBasedTableIterator : IDisposable
     public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default)
     {
         _seekStat = 0;
+        _isOutOfBound = false;
         return ThenPositionAsync(_index.SeekToFirstAsync(cancellationToken), Op.First, default, backward: false, cancellationToken);
     }
 
     public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
         _seekStat = 0;
+        _isOutOfBound = false;
         if (_prefix.CheckFilter && !CheckPrefixMayMatch(target.Span, backward: false))
         {
             ReleaseBlock();
@@ -755,6 +890,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     {
         _data.Next();
         if (_data.Valid) return ValueTask.CompletedTask;
+        if (_blockUpperBoundCheck == BlockUpperBound.InCurBlock) return StopBeforeNextBlockAsync(cancellationToken);
         return ThenPositionAsync(_index.NextAsync(cancellationToken), Op.First, default, backward: false, cancellationToken);
     }
 
@@ -793,9 +929,18 @@ public sealed class BlockBasedTableIterator : IDisposable
                 if (!pending.IsCompletedSuccessfully) return PositionSlowAsync(pending, h, op, target, ct);
                 SetBlock(pending.Result, h);
             }
+            else
+            {
+                CheckDataBlockWithinUpperBound();
+            }
             if (op == Op.Seek) _data.Seek(target.Span);
             else _data.SeekToFirst();
-            if (_data.Valid) return ValueTask.CompletedTask;
+            if (_data.Valid)
+            {
+                CheckOutOfBound();
+                return ValueTask.CompletedTask;
+            }
+            if (_blockUpperBoundCheck == BlockUpperBound.InCurBlock) return StopBeforeNextBlockAsync(ct);
             op = Op.First;
             ValueTask next = _index.NextAsync(ct);
             if (!next.IsCompletedSuccessfully) return ThenPositionSlowAsync(next, Op.First, default, backward: false, ct);
@@ -809,14 +954,42 @@ public sealed class BlockBasedTableIterator : IDisposable
         SetBlock(await pending.ConfigureAwait(false), h);
         if (op == Op.Seek) _data.Seek(target.Span);
         else _data.SeekToFirst();
-        if (_data.Valid) return;
+        if (_data.Valid)
+        {
+            CheckOutOfBound();
+            return;
+        }
+        if (_blockUpperBoundCheck == BlockUpperBound.InCurBlock)
+        {
+            await StopBeforeNextBlockAsync(ct).ConfigureAwait(false);
+            return;
+        }
         await _index.NextAsync(ct).ConfigureAwait(false);
         await PositionAsync(Op.First, default, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Async <see cref="StopBeforeNextBlock"/> (the index may have to read its next partition).</summary>
+    private ValueTask StopBeforeNextBlockAsync(CancellationToken ct)
+    {
+        ReleaseBlock();
+        ValueTask next = _index.NextAsync(ct);
+        if (!next.IsCompletedSuccessfully) return StopBeforeNextBlockSlowAsync(next);
+        next.GetAwaiter().GetResult();
+        _isOutOfBound = _index.Valid;
+        return ValueTask.CompletedTask;
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask StopBeforeNextBlockSlowAsync(ValueTask next)
+    {
+        await next.ConfigureAwait(false);
+        _isOutOfBound = _index.Valid;
     }
 
     public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default)
     {
         _seekStat = 0;
+        _isOutOfBound = false;
         return ThenPositionAsync(_index.SeekToLastAsync(cancellationToken), Op.First, default, backward: true, cancellationToken);
     }
 
@@ -824,6 +997,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     public ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default)
     {
         _seekStat = 0;
+        _isOutOfBound = false;
         if (_prefix.CheckFilter && !CheckPrefixMayMatch(target.Span, backward: true))
         {
             ReleaseBlock();
@@ -875,6 +1049,10 @@ public sealed class BlockBasedTableIterator : IDisposable
                 if (!pending.IsCompletedSuccessfully) return PositionBackwardSlowAsync(pending, h, op, target, ct);
                 SetBlock(pending.Result, h);
             }
+            else
+            {
+                CheckDataBlockWithinUpperBound();
+            }
             if (op == Op.Seek) _data.SeekForPrev(target.Span);
             else _data.SeekToLast();
             if (_data.Valid) return ValueTask.CompletedTask;
@@ -904,6 +1082,7 @@ public sealed class BlockBasedTableIterator : IDisposable
     internal void Detach()
     {
         ReleaseBlock();
+        _isOutOfBound = false;
         _index.Reset();
         _prefetch?.Reset(null);
     }
@@ -934,24 +1113,34 @@ public sealed class BlockBasedTableIterator : IDisposable
 
     /// <summary>
     /// ReadOptions::readahead_size: an explicit readahead for a user iterator (BlockPrefetcher's "explicit user requested
-    /// readahead": always the readahead buffer); without it, iterators use the automatic readahead.
+    /// readahead": always the readahead buffer, initial = max readahead size); without it, iterators use the automatic
+    /// readahead. Like upstream (num_buffers = async_io ? 2 : 1), one synchronous buffer
+    /// (<see cref="Env.AsyncPrefetchBuffer.CreateSingleBuffer"/>), or with <paramref name="asyncIo"/> two buffers that
+    /// read half the readahead each, the second asynchronously (TryReadFromCacheUntracked: readahead_size_ / 2).
     /// </summary>
-    internal void SetUserReadahead(ulong readaheadSize)
+    internal void SetUserReadahead(ulong readaheadSize, bool asyncIo)
     {
         if (readaheadSize == 0 || _readaheadMode == ReadaheadMode.Fixed) return;
         _readaheadMode = ReadaheadMode.Fixed;
         _prefetch?.Dispose();
-        _prefetch = new Env.AsyncPrefetchBuffer((int)Math.Min(readaheadSize, 256UL << 20));
+        int size = (int)Math.Min(readaheadSize, 256UL << 20);
+        _prefetch = asyncIo ? new Env.AsyncPrefetchBuffer(Math.Max(1, size / 2)) : Env.AsyncPrefetchBuffer.CreateSingleBuffer(size);
         _prefetch.Reset(_reader.File);
     }
 
     /// <summary>The readahead buffer (tests / diagnostics), or null.</summary>
     internal Env.AsyncPrefetchBuffer? Readahead => _prefetch;
 
+    /// <remarks>The upper bound is cleared: the owner sets the bound of the new file's iterator (<see cref="SetUpperBound"/>).</remarks>
     internal void Retarget(BlockBasedTableReader reader, in TableIteratorPrefixOptions prefixOptions)
     {
         ReleaseBlock();
+        _isOutOfBound = false;
+        _hasUpperBound = false;
+        _upperBound = default;
         _reader = reader;
+        _icmp = reader.InternalComparator;
+        _tsSize = _icmp.UserComparator.TimestampSize;
         _prefix = prefixOptions;
         _seekStat = 0;
         _index.Init(reader, _flags);

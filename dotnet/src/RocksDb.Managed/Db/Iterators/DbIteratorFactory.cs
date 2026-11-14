@@ -56,8 +56,8 @@ public sealed class DbIteratorSources
     internal VersionStorageInfo? BlobVersion { get; init; }
 
     /// <summary>
-    /// optimize_filters_for_hits of the column family: table iterators of the last non-empty level do not consult
-    /// prefix filters (Version::IsFilterSkipped, the skip_filters argument of AddIteratorsForLevel).
+    /// optimize_filters_for_hits of the column family: table iterators of the last non-empty level, when it is not L0, do
+    /// not consult prefix filters (Version::IsFilterSkipped(level), the skip_filters argument of AddIteratorsForLevel).
     /// </summary>
     internal bool OptimizeFiltersForHits { get; init; }
 
@@ -157,11 +157,11 @@ public static class DbIteratorFactory
                     {
                         FileMetaData f = files[fi];
                         TableReadFlags readFlags = TableReadFlagsExtensions.FromReadOptions(sources.ReadOptions);
-                        if (sources.OptimizeFiltersForHits && fi == files.Count - 1 && sources.NumNonEmptyLevels == 1) readFlags |= TableReadFlags.SkipFilters;
                         InternalIterator child = sources.PrefixExtractor is null
                             ? readFlags == TableReadFlags.None ? tc.NewIterator(f) : TableInternalIterator.Create(tc.GetReader(f), readFlags, null, null)
                             : TableInternalIterator.Create(tc.GetReader(f), readFlags, sources.ReadOptions, sources.PrefixExtractor);
-                        if (sources.ReadOptions is { ReadaheadSize: > 0 } ro && child is TableInternalIterator rt) rt.SetUserReadahead(ro.ReadaheadSize);
+                        child.SetIterateUpperBound(sources.ReadOptions?.IterateUpperBound);
+                        if (sources.ReadOptions is { ReadaheadSize: > 0 } ro && child is TableInternalIterator rt) rt.SetUserReadahead(ro.ReadaheadSize, ro.AsyncIo);
                         children.Add(child);
                         // Lets DbIter skip ranges covered by newer range tombstones (SkipCoveredForward / Backward).
                         if (child is TableInternalIterator t) t.SetSeqnoRange(f.SmallestSeqno, f.LargestSeqno);
@@ -173,7 +173,8 @@ public static class DbIteratorFactory
                 else
                 {
                     // For levels > 0, we can use a concatenating iterator that sequentially walks through the
-                    // non-overlapping files in the level, opening them lazily.
+                    // non-overlapping files in the level, opening them lazily. Only here does IsFilterSkipped(level)
+                    // apply: L0 table iterators pass skip_filters = false (version_set.cc AddIteratorsForLevel).
                     var levelIter = new LevelIterator(tc, sources.Comparator, files, sources.ReadOptions, sources.PrefixExtractor);
                     if (sources.OptimizeFiltersForHits && level == sources.NumNonEmptyLevels - 1) levelIter.AddReadFlags(TableReadFlags.SkipFilters);
                     children.Add(levelIter);
