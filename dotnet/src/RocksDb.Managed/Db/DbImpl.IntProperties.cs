@@ -113,12 +113,14 @@ internal sealed partial class DbImpl
                 value = IntPropertyValue.Of((long)sv.Imm.Length);
                 return IntPropertyResult.Value;
             case DbProperties.CurSizeActiveMemTable:
-                value = IntPropertyValue.Of(sv.Mem.ApproximateMemoryUsage);
+                // HandleCurSizeActiveMemTable (db/internal_stats.cc): the cached value, refreshed by ShouldFlushNow on
+                // every write (arena MemoryAllocatedBytes), "to avoid the need for synchronization".
+                value = IntPropertyValue.Of(sv.Mem.ApproximateMemoryUsageFast);
                 return IntPropertyResult.Value;
             case DbProperties.CurSizeAllMemTables:
                 {
-                    // Active + unflushed immutable memtables.
-                    long n = sv.Mem.ApproximateMemoryUsage;
+                    // HandleCurSizeAllMemTables: mem()->ApproximateMemoryUsageFast() + the unflushed immutable memtables.
+                    long n = sv.Mem.ApproximateMemoryUsageFast;
                     foreach (MemTable m in sv.Imm) n += m.ApproximateMemoryUsage;
                     value = IntPropertyValue.Of(n);
                     return IntPropertyResult.Value;
@@ -331,14 +333,14 @@ internal sealed partial class DbImpl
 
     /// <summary>
     /// HandleSizeAllMemTables: active, immutable and flushed-but-still-referenced memtables (pinned by iterators or kept
-    /// as history), like upstream's mem()->ApproximateMemoryUsage() + imm()->ApproximateMemoryUsage(). Each memtable is
+    /// as history), like upstream's mem()->ApproximateMemoryUsageFast() + imm()->ApproximateMemoryUsage(). Each memtable is
     /// counted once (the lists are a handful of entries, so the duplicate checks are linear scans, not a set).
     /// </summary>
     private long SizeAllMemTables(ColumnFamilyData cfd, SuperVersion sv)
     {
         MemTable mem = sv.Mem;
         MemTable[] imm = sv.Imm;
-        long n = mem.ApproximateMemoryUsage;
+        long n = mem.ApproximateMemoryUsageFast;
         for (int i = 0; i < imm.Length; i++)
         {
             if (!InSuperVersion(imm[i], mem, imm, i)) n += imm[i].ApproximateMemoryUsage;
