@@ -172,4 +172,146 @@ public sealed class DbOpenErrorTests
             using RocksDb.Managed.Db.TableReaderLease ok = cache.GetReader(meta);
         }
     }
+    // ---- max_file_opening_threads (VersionBuilder::Rep::LoadTableHandlers / LoadTableHandlersHelper) ------------------
+
+    /// <summary>
+    /// Runs <paramref name="open"/> with a BeforeFindTable hook that records the thread of every table open; the first
+    /// opens wait (up to 10 s) until <paramref name="expectedThreads"/> distinct threads are inside the loader, so with
+    /// fewer workers the count stays below and the test fails instead of depending on timing.
+    /// </summary>
+    private static HashSet<int> ThreadsOpeningTables(int expectedThreads, Action open)
+    {
+        var threads = new HashSet<int>();
+        using var allArrived = new ManualResetEventSlim(expectedThreads <= 1);
+        RocksDb.Managed.Db.TestHooks.Set("VersionBuilder::Rep::LoadTableHandlers::BeforeFindTable", () =>
+        {
+            lock (threads)
+            {
+                threads.Add(Environment.CurrentManagedThreadId);
+                if (threads.Count >= expectedThreads) allArrived.Set();
+            }
+            allArrived.Wait(TimeSpan.FromSeconds(10));
+        });
+        try
+        {
+            open();
+        }
+        finally
+        {
+            RocksDb.Managed.Db.TestHooks.Set("VersionBuilder::Rep::LoadTableHandlers::BeforeFindTable", null);
+        }
+        return threads;
+    }
+
+    /// <summary>
+    /// DB::Open loads the tables with max_file_opening_threads threads (the opening thread and n - 1 more), every table
+    /// once, and the DB reads the same contents.
+    /// </summary>
+    [TestMethod]
+    [DataRow(1)]
+    [DataRow(4)]
+    [DoNotParallelize]
+    public void OpenLoadsTablesWithMaxFileOpeningThreads(int threads)
+    {
+        var fs = DbTestUtil.NewFs();
+        List<string> tables = BuildTables(fs, 24);
+        DbOptions o = DbTestUtil.NewOptions(fs);
+        o.MaxFileOpeningThreads = threads;
+        o.SkipStatsUpdateOnDbOpen = true;
+        RocksDatabase? db = null;
+        HashSet<int> used = ThreadsOpeningTables(threads, () => db = RocksDatabase.Open(DbTestUtil.DbPath, o));
+        using (db)
+        {
+            Assert.AreEqual(threads, used.Count, "threads that opened tables");
+            Assert.AreEqual(tables.Count, db!.DefaultColumnFamily.Data.TableCache.Count, "every table is open");
+            for (int f = 0; f < tables.Count; f++)
+            {
+                for (int i = 0; i < 20; i += 7) Assert.AreEqual("v" + f, DbTestUtil.GetString(db, "f" + f + "-" + i));
+            }
+        }
+    }
+
+    /// <summary>
+    /// A damaged table among many, loaded by several threads: the first error wins and fails the open exactly as with
+    /// one thread (Corruption naming the MANIFEST, nothing written); without paranoid_checks the other tables read.
+    /// </summary>
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void DamagedTableFailsParallelOpen(bool delete)
+    {
+        var fs = DbTestUtil.NewFs();
+        List<string> tables = BuildTables(fs, 24);
+        if (delete) fs.DeleteFile(tables[11]);
+        else Truncate(fs, tables[11], 3);
+        string[] before = Listing(fs);
+        foreach (int threads in new[] { 1, 8 })
+        {
+            DbOptions o = DbTestUtil.NewOptions(fs);
+            o.MaxFileOpeningThreads = threads;
+            var ex = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbTestUtil.DbPath, o).Dispose());
+            Assert.AreEqual(StatusCode.Corruption, ex.Code, ex.Message);
+            StringAssert.Contains(ex.Message, delete ? "Corruption: " : "Sst file size mismatch");
+            StringAssert.Contains(ex.Message, "may be corrupted.");
+            CollectionAssert.AreEqual(before, Listing(fs), "the failed open wrote nothing");
+        }
+        DbOptions lax = DbTestUtil.NewOptions(fs);
+        lax.MaxFileOpeningThreads = 8;
+        lax.ParanoidChecks = false;
+        lax.SkipStatsUpdateOnDbOpen = true;
+        using RocksDatabase db = RocksDatabase.Open(DbTestUtil.DbPath, lax);
+        Assert.AreEqual("v23", DbTestUtil.GetString(db, "f23-3"));
+        Assert.AreEqual("v0", DbTestUtil.GetString(db, "f0-3"));
+        Assert.ThrowsExactly<RocksDbException>(() => db.Get(DbTestUtil.B("f11-3")));
+    }
+
+    /// <summary>
+    /// ProcessManifestWrites: LoadTableHandlers opens the tables an edit adds before the MANIFEST is written. An ingested
+    /// table (not opened through the table cache before) that cannot be opened fails the ingestion with paranoid_checks,
+    /// and the version does not name it; without paranoid_checks the error is ignored and the table is installed.
+    /// </summary>
+    [TestMethod]
+    [DataRow(true)]
+    [DataRow(false)]
+    [DoNotParallelize]
+    public void IngestedTableThatCannotBeOpenedFailsTheIngestion(bool paranoid)
+    {
+        var fs = DbTestUtil.NewFs();
+        fs.CreateDirectoryIfMissing("/ext");
+        using (var w = new SstFileWriter(new ColumnFamilyOptions(), fs))
+        {
+            w.Open("/ext/1.sst");
+            for (int i = 0; i < 10; i++) w.Put(DbTestUtil.Key(i), DbTestUtil.B("x" + i));
+            w.Finish();
+        }
+        DbOptions o = DbTestUtil.NewOptions(fs);
+        o.ParanoidChecks = paranoid;
+        using RocksDatabase db = RocksDatabase.Open(DbTestUtil.DbPath, o, new ColumnFamilyOptions { DisableAutoCompactions = true });
+        RocksDb.Managed.Db.TestHooks.Set("VersionBuilder::Rep::LoadTableHandlers::BeforeFindTable", () =>
+        {
+            // The ingested table is the only table file of the DB: damage it before it is opened.
+            string table = fs.GetChildren(DbTestUtil.DbPath)
+                .Single(static n => RocksDb.Managed.Db.FileNames.TryParseFileName(n, out _, out RocksDb.Managed.Db.FileType t) && t == RocksDb.Managed.Db.FileType.TableFile);
+            Truncate(fs, DbTestUtil.DbPath + "/" + table, 3);
+        });
+        try
+        {
+            if (paranoid)
+            {
+                var ex = Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles(["/ext/1.sst"], new IngestExternalFileOptions()));
+                Assert.AreEqual(StatusCode.Corruption, ex.Code, ex.Message);
+                StringAssert.Contains(ex.Message, "Sst file size mismatch");
+                Assert.AreEqual(0, db.GetLiveFilesMetadata().Count, "the table was not installed");
+            }
+            else
+            {
+                db.IngestExternalFiles(["/ext/1.sst"], new IngestExternalFileOptions());
+                Assert.AreEqual(1, db.GetLiveFilesMetadata().Count, "the table was installed");
+            }
+        }
+        finally
+        {
+            RocksDb.Managed.Db.TestHooks.Set("VersionBuilder::Rep::LoadTableHandlers::BeforeFindTable", null);
+        }
+    }
 }

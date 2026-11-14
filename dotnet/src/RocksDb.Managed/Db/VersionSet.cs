@@ -212,18 +212,10 @@ internal sealed class VersionSet : IAsyncDisposable
         AccumulatedFileStats? stats = null;
         if (updateStats && files is not null)
         {
-            // DB open: upstream has opened these tables already (VersionEditHandler::LoadTables with
-            // prefetch_index_and_filter_in_cache = false), so UpdateAccumulatedStats finds them open. Here the stats
-            // load is what opens them first, with the same setting.
-            cfd.TableCache.InitialLoad = true;
-            try
-            {
-                stats = LoadFileStats(cfd, files, default);
-            }
-            finally
-            {
-                cfd.TableCache.InitialLoad = false;
-            }
+            // DB open: VersionEditHandler::LoadTables (DbImpl.LoadTables) has opened these tables already, so
+            // UpdateAccumulatedStats finds them open. Those it did not load (a bounded table cache, paranoid_checks off)
+            // are opened here with the same prefetch_index_and_filter_in_cache = false.
+            stats = LoadFileStats(cfd, files, default, prefetchIndexAndFilterInCache: false);
         }
         var context = new VersionBuildContext
         {
@@ -239,27 +231,38 @@ internal sealed class VersionSet : IAsyncDisposable
         InstallVersion(cfd, v);
     }
 
+    /// <summary>The files <paramref name="edit"/> adds, per level (VersionBuilder::Rep::levels_[level].added_files).</summary>
+    private static FileMetaData[][] AddedFilesByLevel(VersionEdit edit, int numLevels)
+    {
+        var byLevel = new List<FileMetaData>?[numLevels];
+        foreach (NewFileEntry nf in edit.NewFiles) (byLevel[nf.Level] ??= new List<FileMetaData>()).Add(nf.Meta);
+        var result = new FileMetaData[numLevels][];
+        for (int l = 0; l < numLevels; l++) result[l] = byLevel[l]?.ToArray() ?? [];
+        return result;
+    }
+
     private bool AllowIngestBehind(ColumnFamilyData cfd) => _db.Options.AllowIngestBehind || cfd.Options.CfAllowIngestBehind;
 
     /// <summary>
     /// Version::UpdateAccumulatedStats for a version about to be built from <paramref name="files"/>: loads the entry
     /// stats of new files through the table cache (no I/O when the table is open or the stats came from the builder).
     /// </summary>
-    private AccumulatedFileStats LoadFileStats(ColumnFamilyData cfd, FileMetaData[][] files, AccumulatedFileStats accumulated)
+    private AccumulatedFileStats LoadFileStats(ColumnFamilyData cfd, FileMetaData[][] files, AccumulatedFileStats accumulated,
+        bool prefetchIndexAndFilterInCache)
     {
         // The readers opened here record their reads in the histogram of the file's level (file_read_hist).
         for (int l = 0; l < files.Length; l++)
         {
             foreach (FileMetaData f in files[l]) f.LevelHint = l;
         }
-        return VersionStorageInfo.UpdateAccumulatedStats(files, accumulated, _db.Options.MaxOpenFiles == -1, f => ReadTableProperties(cfd, f));
+        return VersionStorageInfo.UpdateAccumulatedStats(files, accumulated, _db.Options.MaxOpenFiles == -1, f => ReadTableProperties(cfd, f, prefetchIndexAndFilterInCache));
     }
 
-    private Table.TableProperties? ReadTableProperties(ColumnFamilyData cfd, FileMetaData f)
+    private Table.TableProperties? ReadTableProperties(ColumnFamilyData cfd, FileMetaData f, bool prefetchIndexAndFilterInCache)
     {
         try
         {
-            using TableReaderLease lease = cfd.TableCache.GetReader(f);
+            using TableReaderLease lease = cfd.TableCache.GetReader(f, prefetchIndexAndFilterInCache);
             return lease.Reader.Properties;
         }
         catch (Exception e) when (e is RocksDbException or IOException)
@@ -502,6 +505,7 @@ internal sealed class VersionSet : IAsyncDisposable
         {
             RecoveredVersionState? snapshot = null;
             var newFiles = new FileMetaData[n][][];
+            var addedFiles = new FileMetaData[n][][];
             var newBlobFiles = new Blob.BlobFileMetaData[n][];
             var editList = new VersionEdit[n];
             var tsSizes = new int[n];
@@ -544,6 +548,7 @@ internal sealed class VersionSet : IAsyncDisposable
                         VersionStorageInfo cur = cfd.Current.Storage;
                         CheckFileAdditions(cur, edit);
                         newFiles[i] = cur.ApplyEdit(edit, cfd.NumLevels);
+                        addedFiles[i] = AddedFilesByLevel(edit, newFiles[i].Length);
                         newBlobFiles[i] = Blob.BlobFileMetaData.Build(cur.BlobFiles, edit, newFiles[i]);
                         // VersionBuilder::SaveTo -> CheckConsistency, before the edit is written.
                         VersionStorageInfo.CheckConsistency(cfd.Icmp, newFiles[i], newBlobFiles[i], cfd.Options.ForceConsistencyChecks);
@@ -585,12 +590,25 @@ internal sealed class VersionSet : IAsyncDisposable
                 _descriptorLastSequence = lastSeq;
             }
 
-            // Version::PrepareAppend(update_stats): load the entry stats of the new files before the versions are built
-            // (outside the DB mutex; the new FileMetaData objects are not visible to anyone else yet).
+            // ProcessManifestWrites: VersionBuilder::LoadTableHandlers of the files each edit adds (one thread: only a
+            // batched external file ingestion asks for more, and the port's ingestion has no file_opening_threads),
+            // with prefetch_index_and_filter_in_cache. An error fails the LogAndApply with paranoid_checks, before
+            // anything is written; without it, it is ignored. Outside the DB mutex: the new FileMetaData objects are not
+            // visible to anyone else yet.
+            for (int i = 0; i < n; i++)
+            {
+                if (addedFiles[i] is null) continue;
+                Exception? loadError = TableHandlerLoader.LoadTableHandlers(edits[i].Cfd!.TableCache, addedFiles[i], maxThreads: 1,
+                    prefetchIndexAndFilterInCache: true, isInitialLoad: false);
+                TableHandlerLoader.ThrowIfNotStatus(loadError);
+                if (loadError is not null && _db.Options.ParanoidChecks) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(loadError).Throw();
+            }
+
+            // Version::PrepareAppend(update_stats): load the entry stats of the new files before the versions are built.
             var newStats = new AccumulatedFileStats?[n];
             for (int i = 0; i < n; i++)
             {
-                if (newFiles[i] is not null) newStats[i] = LoadFileStats(edits[i].Cfd!, newFiles[i], baseStats[i]);
+                if (newFiles[i] is not null) newStats[i] = LoadFileStats(edits[i].Cfd!, newFiles[i], baseStats[i], prefetchIndexAndFilterInCache: true);
             }
 
             TestHooks.Invoke("VersionSet::LogAndApply:BeforeManifestWrite");

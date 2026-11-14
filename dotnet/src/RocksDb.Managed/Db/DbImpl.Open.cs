@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.ExceptionServices;
 using RocksDb.Managed.Wal;
 
 namespace RocksDb.Managed.Db;
@@ -269,6 +270,7 @@ internal sealed partial class DbImpl
         {
             lock (_mutex)
             {
+                var recovered = new List<(ColumnFamilyVersion Cf, ColumnFamilyData Cfd, FileMetaData[][] Files)>(state.ColumnFamilies.Count);
                 foreach (ColumnFamilyVersion cf in state.ColumnFamilies.Values)
                 {
                     ColumnFamilyOptions opts = PrepareCfOptions(descriptors[cf.Name]);
@@ -280,6 +282,31 @@ internal sealed partial class DbImpl
                         var list = new List<FileMetaData>(cf.Levels[l]);
                         files[l] = list.ToArray();
                     }
+                    recovered.Add((cf, cfd, files));
+                }
+                // VersionEditHandler::CheckIterationResult: LoadTables of every column family, then their versions (whose
+                // stats find the tables open). Before anything is written: a failure leaves the MANIFEST untouched.
+                if (!Options.BestEffortsRecovery)
+                {
+                    string manifestPath = FileNames.DescriptorFileName(DbName, manifestNumber);
+                    try
+                    {
+                        foreach ((_, ColumnFamilyData cfd, FileMetaData[][] files) in recovered) LoadTables(cfd, files, manifestPath);
+                    }
+                    catch
+                    {
+                        // The column families are not registered yet, so the failed open's cleanup does not see them.
+                        foreach ((_, ColumnFamilyData cfd, _) in recovered)
+                        {
+                            cfd.TableCache.Dispose();
+                            cfd.BlobSource.Dispose();
+                            cfd.BlobDirectWrite?.Dispose();
+                        }
+                        throw;
+                    }
+                }
+                foreach ((ColumnFamilyVersion cf, ColumnFamilyData cfd, FileMetaData[][] files) in recovered)
+                {
                     var cursors = new List<CompactCursor>(cf.CompactCursors.Count);
                     foreach (KeyValuePair<int, byte[]> c in cf.CompactCursors) cursors.Add(new CompactCursor(c.Key, c.Value));
                     Versions.AddColumnFamily(cfd, files, cf.BlobFiles.Values, cursors, updateStats: !Options.SkipStatsUpdateOnDbOpen);
@@ -289,8 +316,6 @@ internal sealed partial class DbImpl
                     RegisterCfForWrite(cfd);
                 }
             }
-            // LoadTables (before anything is written: a failure leaves the MANIFEST untouched).
-            if (!Options.BestEffortsRecovery) LoadTableHandlers(FileNames.DescriptorFileName(DbName, manifestNumber));
             foreach (ColumnFamilyData cfd in GetColumnFamilies())
             {
                 VersionStorageInfo s = cfd.Current.Storage;
@@ -478,60 +503,38 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
-    /// Port of VersionEditHandler::LoadTables / VersionBuilder::LoadTableHandlers for DB::Open: opens the table readers of
-    /// the recovered versions into the table cache: all of them with an unbounded table cache (max_open_files = -1, the
-    /// default), else at most min(16, capacity / 4) (kInitialLoadLimit). Opening a table checks that the file exists,
-    /// that its size matches the MANIFEST, its footer and meta blocks, and (verify_sst_unique_id_in_manifest) its unique
-    /// id, so a missing or truncated table fails the open here with paranoid_checks (the default), before the recovery
-    /// writes a new MANIFEST; without paranoid_checks errors are ignored (and surface when the file is read). Tables not
-    /// loaded at open are checked the same way when first opened. Errors are reported like VersionEditHandler: a missing
-    /// file (PathNotFound) becomes Corruption, and Corruption messages name the MANIFEST.
+    /// Port of VersionEditHandler::LoadTables (prefetch_index_and_filter_in_cache = false, is_initial_load = true) for
+    /// DB::Open: VersionBuilder::LoadTableHandlers opens the table readers of the recovered version of
+    /// <paramref name="cfd"/> into the table cache with max_file_opening_threads threads: all of them with an unbounded
+    /// table cache (max_open_files = -1, the default), else at most min(16, capacity / 4) cached readers
+    /// (kInitialLoadLimit). Opening a table checks that the file exists, that its size matches the MANIFEST, its footer
+    /// and meta blocks, and (verify_sst_unique_id_in_manifest) its unique id, so a missing or truncated table fails the
+    /// open here with paranoid_checks (the default), before the recovery writes a new MANIFEST; the first error stops the
+    /// loading. Without paranoid_checks the error is ignored (and surfaces when the file is read); tables not loaded at
+    /// open are checked the same way when first opened. Errors are reported like VersionEditHandler: a missing file
+    /// (PathNotFound) becomes Corruption, and Corruption messages name the MANIFEST.
     /// </summary>
-    private void LoadTableHandlers(string manifestPath)
+    private void LoadTables(ColumnFamilyData cfd, FileMetaData[][] files, string manifestPath)
     {
-        TableCacheStore store = SharedTableCache;
-        bool alwaysLoad = store.Capacity == int.MaxValue;
-        // kInitialLoadLimit = 16, capped at a quarter of the table cache.
-        int loadLimit = alwaysLoad ? int.MaxValue : Math.Min(16, store.Capacity / 4);
-        foreach (ColumnFamilyData cfd in GetColumnFamilies())
+        Exception? error = TableHandlerLoader.LoadTableHandlers(cfd.TableCache, files, Options.MaxFileOpeningThreads,
+            prefetchIndexAndFilterInCache: false, isInitialLoad: true);
+        if (error is null) return;
+        TableHandlerLoader.ThrowIfNotStatus(error);
+        if (!Options.ParanoidChecks)
         {
-            VersionStorageInfo s = cfd.Current.Storage;
-            for (int l = 0; l < s.NumLevels; l++)
-            {
-                foreach (FileMetaData f in s.LevelFiles(l))
-                {
-                    if (!alwaysLoad && store.Count >= loadLimit) return;
-                    try
-                    {
-                        // LoadTables(cfd, prefetch_index_and_filter_in_cache = false, is_initial_load = true).
-                        cfd.TableCache.InitialLoad = true;
-                        try
-                        {
-                            using TableReaderLease lease = cfd.TableCache.GetReader(f);
-                        }
-                        finally
-                        {
-                            cfd.TableCache.InitialLoad = false;
-                        }
-                    }
-                    catch (Exception e) when (e is RocksDbException or IOException or InvalidDataException)
-                    {
-                        if (Options.ParanoidChecks)
-                        {
-                            if (e is not RocksDbException re) throw;
-                            // VersionEditHandler::CheckIterationResult: PathNotFound marks the DB as corrupted.
-                            if (re.SubCode == StatusSubCode.PathNotFound)
-                                throw new RocksDbException(StatusCode.Corruption, "Corruption: " + re.Message + "  The file " + manifestPath + " may be corrupted.", StatusSubCode.None, re);
-                            // VersionEditHandlerBase::Iterate appends the MANIFEST name to Corruption messages.
-                            if (re.Code == StatusCode.Corruption)
-                                throw new RocksDbException(StatusCode.Corruption, re.Message + "  The file " + manifestPath + " may be corrupted.", StatusSubCode.None, re);
-                            throw;
-                        }
-                        LogWarn("LoadTableHandlers: ignoring table file " + f.FileNumber.ToString(CultureInfo.InvariantCulture)
-                            + " that failed to open (paranoid_checks = false): " + e.Message);
-                    }
-                }
-            }
+            LogWarn("LoadTableHandlers: ignoring a table file that failed to open (paranoid_checks = false): " + error.Message);
+            return;
+        }
+        if (error is not RocksDbException re) ExceptionDispatchInfo.Capture(error).Throw();
+        else
+        {
+            // VersionEditHandler::CheckIterationResult: PathNotFound marks the DB as corrupted.
+            if (re.SubCode == StatusSubCode.PathNotFound)
+                throw new RocksDbException(StatusCode.Corruption, "Corruption: " + re.Message + "  The file " + manifestPath + " may be corrupted.", StatusSubCode.None, re);
+            // VersionEditHandlerBase::Iterate appends the MANIFEST name to Corruption messages.
+            if (re.Code == StatusCode.Corruption)
+                throw new RocksDbException(StatusCode.Corruption, re.Message + "  The file " + manifestPath + " may be corrupted.", StatusSubCode.None, re);
+            ExceptionDispatchInfo.Capture(re).Throw();
         }
     }
 
