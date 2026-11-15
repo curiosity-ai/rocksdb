@@ -97,6 +97,20 @@ internal static class Program
     private static int RunCommand(Dictionary<string, string> o)
     {
         var paths = new RunPaths(o["dir"]);
+        // One supervisor per run directory: a second one would run workers on the same DB (its LOCK makes them fail)
+        // and overwrite the model and the cycle plan of the first. The lock is held until the process exits.
+        Directory.CreateDirectory(paths.Root);
+        FileStream runLock;
+        try
+        {
+            runLock = new FileStream(Path.Combine(paths.Root, "supervisor.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        }
+        catch (IOException)
+        {
+            Console.Error.WriteLine($"another supervisor is running in {paths.Root} (supervisor.lock is held); stop it first");
+            return 2;
+        }
+        using FileStream heldLock = runLock; // released when the supervisor returns
         bool smoke = o.ContainsKey("smoke");
         TimeSpan duration = ParseDuration(o.GetValueOrDefault("duration", smoke ? "2m" : "72h"));
         RunConfig cfg;
