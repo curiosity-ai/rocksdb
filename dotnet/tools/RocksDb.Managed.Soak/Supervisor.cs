@@ -523,7 +523,12 @@ internal sealed class Supervisor
     {
         RemoveDeadWorkerScratch();
         var r = new Random((int)(Keys.Mix(plan.CycleSeed ^ 0xFA) & 0x7FFFFFFF));
-        using ChildProcess w = ChildProcess.Start(["worker", "--run-dir", _paths.Root, "--part", "0"], _paths.LogFile(plan.Cycle, "worker"));
+        // A cycle redone after the run was resumed (stopped or failed after its RUN phase) has the history of the earlier
+        // attempt, whose writes are in the DB: the worker continues it as the next part (reading the earlier parts for
+        // the versions they used), like a worker started after a crash during recovery.
+        int firstPart = _paths.HistoryParts(plan.Cycle).Count;
+        if (firstPart > 0) Log($"cycle {plan.Cycle}: continuing the history of an earlier attempt ({firstPart} part(s))");
+        using ChildProcess w = ChildProcess.Start(["worker", "--run-dir", _paths.Root, "--part", firstPart.ToString(System.Globalization.CultureInfo.InvariantCulture)], _paths.LogFile(plan.Cycle, "worker"));
         if (!w.Opened.Wait(TimeSpan.FromMinutes(5)))
         {
             w.Kill();
@@ -574,7 +579,7 @@ internal sealed class Supervisor
                 w.Kill();
                 w.WaitAsync(TimeSpan.FromSeconds(60)).Wait();
                 double delay = r.NextDouble() * (_lastOpenMs * 1.5 + 100);
-                using ChildProcess w2 = ChildProcess.Start(["worker", "--run-dir", _paths.Root, "--part", "1"], _paths.LogFile(plan.Cycle, "worker-recovery"));
+                using ChildProcess w2 = ChildProcess.Start(["worker", "--run-dir", _paths.Root, "--part", (firstPart + 1).ToString(System.Globalization.CultureInfo.InvariantCulture)], _paths.LogFile(plan.Cycle, "worker-recovery"));
                 Thread.Sleep(TimeSpan.FromMilliseconds(delay));
                 bool opened = w2.Opened.IsCompleted;
                 if (w2.HasExited) return "the recovering worker exited by itself:\n" + w2.Tail;

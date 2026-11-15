@@ -427,6 +427,10 @@ supervisor, run `fusermount3 -uz <dir>/db` yourself and check `pgrep lazyfs`.
   `File.ReadAllBytes`, crashed (files over 2 GB are not supported). The reader now streams the file, and the RUN phase
   ends early once a cycle's history reaches `--max-history-mb`, because the verifier needed 8 GB of memory for that
   history. Re-verifying the preserved state of that cycle passed every check.
+- Harness: resuming a run after a cycle that did not finish (a failure, or the supervisor killed) redid the cycle with
+  a worker that appended to the earlier attempt's history file without reading it, so it reused register and
+  range-delete versions that the earlier attempt may already have written to the DB. The redone cycle now continues as
+  the next history part, which a worker reads like the parts of a crash during recovery.
 - Usage: optimistic transactions with `ValidateParallel` lose plain (non-transactional) writes to the same keys that
   land between validation and commit, as upstream does (see "The workload" above).
 
