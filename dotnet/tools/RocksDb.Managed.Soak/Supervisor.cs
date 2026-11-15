@@ -637,8 +637,9 @@ internal sealed class Supervisor
                 // After retryable and NoSpace errors the DB must be back to normal: Resume succeeds once the errors
                 // stop, and a clean stop closes without error. Only plain IOErrors may leave it stopped until a reopen.
                 bool recoverable = kind != "plain";
+                bool mayStayStopped = !recoverable || NoSpaceFatalAsUpstream(_paths.LogFile(plan.Cycle, "worker"), kind);
                 string? result;
-                if (r.Next(2) == 0) result = Stop(w, TimeSpan.Zero, allowCloseFailure: !recoverable);
+                if (r.Next(2) == 0) result = Stop(w, TimeSpan.Zero, allowCloseFailure: mayStayStopped);
                 else
                 {
                     w.Kill();
@@ -654,6 +655,23 @@ internal sealed class Supervisor
     }
 
     /// <summary>
+    /// Upstream too makes a NoSpace error during a memtable switch (reason kMemTable: creating the new WAL, or writing
+    /// out the old one's buffer) fatal: NoSpace skips the retryable path (error_handler.cc, "all the NoSpace error should
+    /// be handled by the SstFileManager") and kMemTable maps to kFatalError. True when the worker logged such an error.
+    /// </summary>
+    private static bool NoSpaceFatalAsUpstream(string workerLog, string kind)
+    {
+        if (kind != "nospace" || !File.Exists(workerLog)) return false;
+        foreach (string line in File.ReadLines(workerLog))
+        {
+            if (line.Contains(" BGERROR reason=MemTable severity=FatalError", StringComparison.Ordinal)
+                && line.Contains("No space left on device", StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
     /// Background errors and Resume after an I/O error window, from the worker log. Returns a failure when the errors
     /// were <paramref name="recoverable"/> (retryable or NoSpace) and the worker gave up resuming without success.
     /// </summary>
@@ -664,6 +682,7 @@ internal sealed class Supervisor
         long injected = 0;
         int resumeOk = 0, resumeFailed = 0;
         bool gaveUp = false;
+        bool fatalUpstream = NoSpaceFatalAsUpstream(log, kind);
         string? lastResumeError = null;
         foreach (string line in File.ReadLines(log))
         {
@@ -687,6 +706,12 @@ internal sealed class Supervisor
         Bump(_status.Notes, "resume-ok", resumeOk);
         if (resumeFailed > 0) Bump(_status.Notes, "resume-attempts-failed", resumeFailed);
         Log($"cycle {plan.Cycle}: {injected} I/O errors injected; Resume ok {resumeOk}, failed attempts {resumeFailed}");
+        if (recoverable && gaveUp && resumeOk == 0 && fatalUpstream)
+        {
+            Bump(_status.Notes, "nospace-fatal-memtable-switch");
+            Log($"cycle {plan.Cycle}: NoSpace during a memtable switch is fatal (as upstream); Resume refused until a reopen");
+            return null;
+        }
         if (recoverable && gaveUp && resumeOk == 0)
         {
             return $"Resume never succeeded after {kind} I/O errors stopped ({resumeFailed} attempts; a {kind} background " +
